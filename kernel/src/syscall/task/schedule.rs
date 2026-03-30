@@ -149,7 +149,10 @@ pub fn sys_sched_setscheduler(_pid: i32, _policy: i32, _param: *const ()) -> AxR
     Ok(0)
 }
 
-pub fn sys_sched_getparam(_pid: i32, _param: *mut ()) -> AxResult<isize> {
+pub fn sys_sched_getparam(_pid: i32, param: *mut i32) -> AxResult<isize> {
+    // struct sched_param { int sched_priority; }
+    // Write default priority 0 (SCHED_OTHER default)
+    param.vm_write(0i32)?;
     Ok(0)
 }
 
