@@ -1,0 +1,23 @@
+TheKernel
+---------
+
+Copyright 2026 陈天意 <hi@tychen.cc>
+
+TheKernel is licensed under the Apache License, Version 2.0. See LICENSE for
+the full license text.
+
+This repository includes and modifies code derived from StarryOS, ArceOS, and
+other third-party components. Third-party files retain their upstream copyright
+notices and license terms.
+
+Original Project Contributors:
+ - "Azure-stars <Azure_stars@126.com>"
+ - "Yuekai Jia <equation618@gmail.com>"
+
+Modifications and additional work:
+ - KylinSoft Co., Ltd. <https://www.kylinos.cn>
+
+
+Copyright (C) 2025 Azure-stars <Azure_stars@126.com>
+Copyright (C) 2025 Yuekai Jia <equation618@gmail.com>
+Copyright (C) 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn>
