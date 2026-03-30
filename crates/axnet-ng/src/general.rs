@@ -70,7 +70,9 @@ impl GeneralOptions {
     }
 
     pub fn register_waker(&self, stack: &NetStack, waker: &Waker) {
-        stack.get_service().register_waker(self.device_mask(), waker);
+        stack
+            .get_service()
+            .register_waker(self.device_mask(), waker);
     }
 
     pub fn send_poller<P: Pollable, F: FnMut() -> AxResult<T>, T>(

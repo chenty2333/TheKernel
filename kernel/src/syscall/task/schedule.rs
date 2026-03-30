@@ -7,8 +7,8 @@ use axtask::{
     future::{block_on, interruptible},
 };
 use linux_raw_sys::general::{
-    __kernel_clockid_t, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, PRIO_PGRP,
-    PRIO_PROCESS, PRIO_USER, SCHED_RR, TIMER_ABSTIME, timespec,
+    __kernel_clockid_t, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, PRIO_PGRP, PRIO_PROCESS,
+    PRIO_USER, SCHED_RR, TIMER_ABSTIME, timespec,
 };
 use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
@@ -29,7 +29,10 @@ fn sleep_relative(dur: TimeValue) -> TimeValue {
     let deadline = start.checked_add(dur).unwrap_or(Duration::MAX);
 
     // We detect EINTR manually if the slept time is not enough.
-    let _ = block_on(interruptible(sleep_until_clock(AlarmClock::Monotonic, deadline)));
+    let _ = block_on(interruptible(sleep_until_clock(
+        AlarmClock::Monotonic,
+        deadline,
+    )));
 
     AlarmClock::Monotonic.now() - start
 }

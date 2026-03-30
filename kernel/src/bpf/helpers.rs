@@ -121,7 +121,12 @@ impl<'a> HelperContext<'a> {
         self.maps.get(map_idx as usize)
     }
 
-    pub fn read_bytes(&mut self, ptr: u64, len: usize, allowed: HelperMemMask) -> AxResult<Vec<u8>> {
+    pub fn read_bytes(
+        &mut self,
+        ptr: u64,
+        len: usize,
+        allowed: HelperMemMask,
+    ) -> AxResult<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
         }

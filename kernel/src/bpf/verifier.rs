@@ -161,10 +161,7 @@ macro_rules! try_with_log {
         match $expr {
             Ok(value) => value,
             Err(err) => {
-                return Err(VerifierFailure {
-                    err,
-                    log: $log.buf,
-                });
+                return Err(VerifierFailure { err, log: $log.buf });
             }
         }
     };
@@ -1006,7 +1003,9 @@ fn verify_atomic(
 ) -> AxResult<()> {
     let src = insn.src_reg() as usize;
     if regs[src].ty != RegType::Scalar {
-        log.log(&alloc::format!("insn {insn_idx}: atomic src R{src} must be scalar"));
+        log.log(&alloc::format!(
+            "insn {insn_idx}: atomic src R{src} must be scalar"
+        ));
         return Err(AxError::InvalidInput);
     }
 

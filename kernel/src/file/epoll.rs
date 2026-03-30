@@ -277,7 +277,10 @@ impl Epoll {
         }));
 
         let mut context = Context::from_waker(&waker);
-        interest.key.get_file().register(&mut context, interest.event.events);
+        interest
+            .key
+            .get_file()
+            .register(&mut context, interest.event.events);
     }
 
     // for add/modify

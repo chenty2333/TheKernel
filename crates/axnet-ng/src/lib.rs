@@ -46,10 +46,6 @@ use axdriver::{AxDeviceContainer, prelude::*};
 use smoltcp::wire::{EthernetAddress, Ipv4Address, Ipv4Cidr};
 use spin::Once;
 
-pub use self::net_stack::NetStack;
-pub use self::router::Rule;
-pub use self::socket::*;
-pub use self::device::VethEnd;
 use self::{
     consts::{GATEWAY, IP, IP_PREFIX},
     device::{EthernetDevice, LoopbackDevice},
@@ -58,6 +54,7 @@ use self::{
     service::Service,
     wrapper::SocketSetWrapper,
 };
+pub use self::{device::VethEnd, net_stack::NetStack, router::Rule, socket::*};
 
 static DEFAULT_STACK: Once<Arc<NetStack>> = Once::new();
 

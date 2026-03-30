@@ -289,8 +289,7 @@ fn write_verifier_log(
     } else {
         log.len().saturating_add(1).min(u32::MAX as usize) as u32
     };
-    let log_true_size_end =
-        offset_of!(BpfAttrProgLoad, log_true_size) + size_of::<u32>();
+    let log_true_size_end = offset_of!(BpfAttrProgLoad, log_true_size) + size_of::<u32>();
     if (attr_size as usize) >= log_true_size_end {
         write_bpf_attr_value::<BpfAttrProgLoad, _>(
             attr_ptr,
@@ -305,7 +304,9 @@ fn write_verifier_log(
     }
 
     let log_bytes = log.as_bytes();
-    let copy_len = log_bytes.len().min(attr.log_size.saturating_sub(1) as usize);
+    let copy_len = log_bytes
+        .len()
+        .min(attr.log_size.saturating_sub(1) as usize);
     if copy_len > 0 {
         starry_vm::vm_write_slice(attr.log_buf as *mut u8, &log_bytes[..copy_len])
             .map_err(|_| AxError::BadAddress)?;
@@ -324,8 +325,8 @@ fn load_bpf_license(ptr: *const u8) -> AxResult<Vec<u8>> {
     let mut license = Vec::new();
 
     for idx in 0..(BPF_PROG_LICENSE_MAX_LEN - 1) {
-        let byte = starry_vm::vm_load(ptr.wrapping_add(idx), 1)
-            .map_err(|_| AxError::BadAddress)?[0];
+        let byte =
+            starry_vm::vm_load(ptr.wrapping_add(idx), 1).map_err(|_| AxError::BadAddress)?[0];
         if byte == 0 {
             break;
         }

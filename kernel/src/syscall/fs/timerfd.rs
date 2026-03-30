@@ -3,8 +3,8 @@ use core::time::Duration;
 use axerrno::{AxError, AxResult};
 use bitflags::bitflags;
 use linux_raw_sys::general::{
-    CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, TFD_CLOEXEC, TFD_NONBLOCK,
-    TFD_TIMER_ABSTIME, itimerspec, timespec,
+    CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, TFD_CLOEXEC, TFD_NONBLOCK, TFD_TIMER_ABSTIME,
+    itimerspec, timespec,
 };
 use starry_vm::{VmMutPtr, VmPtr};
 

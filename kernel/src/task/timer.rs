@@ -16,10 +16,7 @@ use core::{
 
 use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time_nanos, wall_time};
 use axpoll::PollSet;
-use axtask::{
-    WeakAxTaskRef, current, register_timer_callback,
-    future::block_on,
-};
+use axtask::{WeakAxTaskRef, current, future::block_on, register_timer_callback};
 use event_listener::{Event, listener};
 use kspin::SpinNoIrq;
 use lazy_static::lazy_static;
