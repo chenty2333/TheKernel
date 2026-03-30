@@ -8,7 +8,8 @@ use axtask::{
 };
 use linux_raw_sys::general::{
     __kernel_clockid_t, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, PRIO_PGRP, PRIO_PROCESS,
-    PRIO_USER, SCHED_RR, TIMER_ABSTIME, timespec,
+    PRIO_USER, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_IDLE, SCHED_NORMAL,
+    SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
 };
 use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
@@ -146,18 +147,30 @@ pub fn sys_sched_setaffinity(
     Ok(0)
 }
 
-pub fn sys_sched_getscheduler(_pid: i32) -> AxResult<isize> {
-    Ok(SCHED_RR as _)
+pub fn sys_sched_getscheduler(pid: i32) -> AxResult<isize> {
+    let task = get_task(pid as u32)?;
+    Ok(task.as_thread().sched_policy() as _)
 }
 
-pub fn sys_sched_setscheduler(_pid: i32, _policy: i32, _param: *const ()) -> AxResult<isize> {
+pub fn sys_sched_setscheduler(pid: i32, policy: i32, param: *const i32) -> AxResult<isize> {
+    let policy = policy & !(SCHED_RESET_ON_FORK as i32);
+    match policy as u32 {
+        SCHED_NORMAL | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => {}
+        _ => return Err(AxError::InvalidInput),
+    }
+
+    let priority = unsafe { param.vm_read_uninit()?.assume_init() };
+    let task = get_task(pid as u32)?;
+    let thread = task.as_thread();
+    thread.set_sched_policy(policy);
+    thread.set_sched_priority(priority);
     Ok(0)
 }
 
-pub fn sys_sched_getparam(_pid: i32, param: *mut i32) -> AxResult<isize> {
+pub fn sys_sched_getparam(pid: i32, param: *mut i32) -> AxResult<isize> {
     // struct sched_param { int sched_priority; }
-    // Write default priority 0 (SCHED_OTHER default)
-    param.vm_write(0i32)?;
+    let task = get_task(pid as u32)?;
+    param.vm_write(task.as_thread().sched_priority())?;
     Ok(0)
 }
 

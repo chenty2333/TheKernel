@@ -88,6 +88,12 @@ pub struct Thread {
     /// signal whose handler just returned.
     block_next_signal_check: AtomicBool,
 
+    /// Scheduling policy (e.g. SCHED_OTHER, SCHED_FIFO, SCHED_RR).
+    sched_policy: AtomicI32,
+
+    /// Scheduling priority (sched_param.sched_priority).
+    sched_priority: AtomicI32,
+
     /// Self exit event
     pub exit_event: Arc<PollSet>,
 }
@@ -106,6 +112,8 @@ impl Thread {
             oom_score_adj: AtomicI32::new(200),
             accessing_user_memory: AtomicBool::new(false),
             block_next_signal_check: AtomicBool::new(false),
+            sched_policy: AtomicI32::new(0), // SCHED_OTHER
+            sched_priority: AtomicI32::new(0),
             exit_event: Arc::default(),
         })
     }
@@ -150,6 +158,26 @@ impl Thread {
     /// Set the oom score adjustment value.
     pub fn set_oom_score_adj(&self, value: i32) {
         self.oom_score_adj.store(value, Ordering::SeqCst);
+    }
+
+    /// Get the scheduling policy.
+    pub fn sched_policy(&self) -> i32 {
+        self.sched_policy.load(Ordering::Relaxed)
+    }
+
+    /// Set the scheduling policy.
+    pub fn set_sched_policy(&self, policy: i32) {
+        self.sched_policy.store(policy, Ordering::Relaxed);
+    }
+
+    /// Get the scheduling priority.
+    pub fn sched_priority(&self) -> i32 {
+        self.sched_priority.load(Ordering::Relaxed)
+    }
+
+    /// Set the scheduling priority.
+    pub fn set_sched_priority(&self, priority: i32) {
+        self.sched_priority.store(priority, Ordering::Relaxed);
     }
 
     /// Check if the thread is ready to exit.
