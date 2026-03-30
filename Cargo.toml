@@ -89,3 +89,5 @@ all-features = true
 # selection stays consistent across axruntime and the kernel.
 [patch.crates-io]
 axnet-ng = { path = "crates/axnet-ng" }
+axio = { path = "third_party/rust-patches/axio" }
+starry-vm = { path = "third_party/rust-patches/starry-vm" }

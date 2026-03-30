@@ -657,8 +657,6 @@ dependencies = [
 [[package]]
 name = "axio"
 version = "0.3.0-pre.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6ce41624ae4e7ef942ebe3ac3aa3ce5d64340e8f23fb29bbd0007e9765544b4"
 dependencies = [
  "autocfg",
  "axerrno 0.2.2",
@@ -3105,8 +3103,6 @@ dependencies = [
 [[package]]
 name = "starry-vm"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3596dd192ef0b8c6790c5d3d1c69746c3f94afef46907a5314f1a478917daf53"
 dependencies = [
  "axerrno 0.2.2",
  "bytemuck",
