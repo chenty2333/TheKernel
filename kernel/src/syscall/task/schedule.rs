@@ -13,7 +13,7 @@ use linux_raw_sys::general::{
 use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use crate::{
-    task::{AlarmClock, get_process_data, get_process_group, sleep_until_clock},
+    task::{AlarmClock, get_process_data, get_process_group, get_task, sleep_until_clock},
     time::TimeValueLike,
 };
 
@@ -107,12 +107,11 @@ pub fn sys_sched_getaffinity(pid: i32, cpusetsize: usize, user_mask: *mut u8) ->
         return Err(AxError::InvalidInput);
     }
 
-    // TODO: support other threads
-    if pid != 0 {
-        return Err(AxError::OperationNotPermitted);
-    }
-
-    let mask = current().cpumask();
+    let mask = if pid == 0 {
+        current().cpumask()
+    } else {
+        get_task(pid as u32)?.cpumask()
+    };
     let mask_bytes = mask.as_bytes();
 
     vm_write_slice(user_mask, mask_bytes)?;
@@ -121,7 +120,7 @@ pub fn sys_sched_getaffinity(pid: i32, cpusetsize: usize, user_mask: *mut u8) ->
 }
 
 pub fn sys_sched_setaffinity(
-    _pid: i32,
+    pid: i32,
     cpusetsize: usize,
     user_mask: *const u8,
 ) -> AxResult<isize> {
@@ -135,8 +134,14 @@ pub fn sys_sched_setaffinity(
         }
     }
 
-    // TODO: support other threads
-    axtask::set_current_affinity(cpu_mask);
+    if pid == 0 {
+        axtask::set_current_affinity(cpu_mask);
+    } else {
+        if cpu_mask.is_empty() {
+            return Err(AxError::InvalidInput);
+        }
+        get_task(pid as u32)?.set_cpumask(cpu_mask);
+    }
 
     Ok(0)
 }
