@@ -1,5 +1,5 @@
 use core::{
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     task::Waker,
     time::Duration,
 };
@@ -9,6 +9,7 @@ use axpoll::{IoEvents, Pollable};
 use axtask::future::{block_on, poll_io, timeout};
 
 use crate::{
+    consts::{TCP_RX_BUF_LEN, TCP_TX_BUF_LEN},
     net_stack::NetStack,
     options::{Configurable, GetSocketOption, SetSocketOption},
 };
@@ -22,6 +23,9 @@ pub(crate) struct GeneralOptions {
 
     send_timeout_nanos: AtomicU64,
     recv_timeout_nanos: AtomicU64,
+
+    send_buffer: AtomicUsize,
+    recv_buffer: AtomicUsize,
 
     device_mask: AtomicU64,
 }
@@ -38,6 +42,9 @@ impl GeneralOptions {
 
             send_timeout_nanos: AtomicU64::new(0),
             recv_timeout_nanos: AtomicU64::new(0),
+
+            send_buffer: AtomicUsize::new(TCP_TX_BUF_LEN),
+            recv_buffer: AtomicUsize::new(TCP_RX_BUF_LEN),
 
             device_mask: AtomicU64::new(0),
         }
@@ -117,6 +124,12 @@ impl Configurable for GeneralOptions {
             O::ReceiveTimeout(timeout) => {
                 **timeout = Duration::from_nanos(self.recv_timeout_nanos.load(Ordering::Relaxed));
             }
+            O::SendBuffer(size) => {
+                **size = self.send_buffer.load(Ordering::Relaxed);
+            }
+            O::ReceiveBuffer(size) => {
+                **size = self.recv_buffer.load(Ordering::Relaxed);
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -140,8 +153,11 @@ impl Configurable for GeneralOptions {
                 self.recv_timeout_nanos
                     .store(timeout.as_nanos() as u64, Ordering::Relaxed);
             }
-            O::SendBuffer(_) | O::ReceiveBuffer(_) => {
-                // TODO(mivik): implement buffer size options
+            O::SendBuffer(size) | O::SendBufferForce(size) => {
+                self.send_buffer.store(*size, Ordering::Relaxed);
+            }
+            O::ReceiveBuffer(size) => {
+                self.recv_buffer.store(*size, Ordering::Relaxed);
             }
             _ => return Ok(false),
         }
