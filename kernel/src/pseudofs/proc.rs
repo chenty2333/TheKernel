@@ -103,6 +103,7 @@ impl SimpleDirOps for ProcessTaskDir {
             Arc::new(ThreadDir {
                 fs: self.fs.clone(),
                 task: Arc::downgrade(&task),
+                show_task_dir: false,
             }),
         )))
     }
@@ -173,24 +174,26 @@ impl SimpleDirOps for ThreadFdDir {
 struct ThreadDir {
     fs: Arc<SimpleFs>,
     task: WeakAxTaskRef,
+    show_task_dir: bool,
 }
 
 impl SimpleDirOps for ThreadDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
         Box::new(
             [
-                "stat",
-                "status",
-                "oom_score_adj",
-                "task",
-                "maps",
-                "mounts",
-                "cmdline",
-                "comm",
-                "exe",
-                "fd",
+                Some("stat"),
+                Some("status"),
+                Some("oom_score_adj"),
+                self.show_task_dir.then_some("task"),
+                Some("maps"),
+                Some("mounts"),
+                Some("cmdline"),
+                Some("comm"),
+                Some("exe"),
+                Some("fd"),
             ]
             .into_iter()
+            .flatten()
             .map(Cow::Borrowed),
         )
     }
@@ -223,7 +226,7 @@ impl SimpleDirOps for ThreadDir {
                 }),
             )
             .into(),
-            "task" => SimpleDir::new_maker(
+            "task" if self.show_task_dir => SimpleDir::new_maker(
                 fs.clone(),
                 Arc::new(ProcessTaskDir {
                     fs,
@@ -361,6 +364,7 @@ impl SimpleDirOps for ProcFsHandler {
             Arc::new(ThreadDir {
                 fs: self.0.clone(),
                 task: Arc::downgrade(&task),
+                show_task_dir: true,
             }),
         ));
         Ok(node)
