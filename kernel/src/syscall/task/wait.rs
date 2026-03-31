@@ -10,7 +10,7 @@ use linux_raw_sys::general::{
 use starry_process::{Pid, Process};
 use starry_vm::{VmMutPtr, VmPtr};
 
-use crate::task::{AsThread, get_process_data};
+use crate::task::{AsThread, get_cached_exit_signal, get_process_data, remove_cached_exit_signal};
 
 bitflags! {
     #[derive(Debug)]
@@ -57,6 +57,27 @@ impl WaitPid {
     }
 }
 
+/// Determines whether a child should be included in wait based on WALL/WCLONE flags.
+///
+/// Without WALL: default behavior excludes clone children (those created with clone()
+/// using a non-SIGCHLD or no exit signal).
+/// With WCLONE: only wait for clone children.
+/// With WALL: wait for all children regardless of type.
+fn should_wait_for_child(child: &Process, options: &WaitOptions) -> bool {
+    if options.contains(WaitOptions::WALL) {
+        return true;
+    }
+    // Use the exit_signal cache which survives ProcessData drop for zombie children.
+    let is_clone = get_cached_exit_signal(child.pid())
+        .map(|sig| sig != Some(starry_signal::Signo::SIGCHLD))
+        .unwrap_or(false);
+    if options.contains(WaitOptions::WCLONE) {
+        is_clone
+    } else {
+        !is_clone
+    }
+}
+
 pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isize> {
     let options = WaitOptions::from_bits_truncate(options);
     info!("sys_waitpid <= pid: {pid:?}, options: {options:?}");
@@ -79,12 +100,10 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
         WaitPid::Pgid(-pid as _)
     };
 
-    // FIXME: add back support for WALL & WCLONE, since ProcessData may drop before
-    // Process now.
     let children = proc
         .children()
         .into_iter()
-        .filter(|child| pid.apply(child))
+        .filter(|child| pid.apply(child) && should_wait_for_child(child, &options))
         .collect::<Vec<_>>();
     if children.is_empty() {
         return Err(AxError::from(LinuxError::ECHILD));
@@ -123,6 +142,7 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
         // Check for exited (zombie) children.
         if let Some(child) = children.iter().find(|child| child.is_zombie()) {
             child.free();
+            remove_cached_exit_signal(child.pid());
             if let Some(exit_code) = exit_code.nullable() {
                 exit_code.vm_write(child.exit_code())?;
             }

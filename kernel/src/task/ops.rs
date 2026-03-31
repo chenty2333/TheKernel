@@ -1,4 +1,5 @@
 use alloc::{
+    collections::BTreeMap,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -26,6 +27,12 @@ static TASK_ALIAS_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakM
 
 static PROCESS_TABLE: RwLock<WeakMap<Pid, Weak<ProcessData>>> = RwLock::new(WeakMap::new());
 
+/// Caches each process's exit_signal, independent of ProcessData lifetime.
+/// Populated when a process is added to the table, removed when reaped by waitpid.
+/// This allows WALL/WCLONE filtering to work even after ProcessData is dropped
+/// for zombie children.
+static EXIT_SIGNAL_CACHE: RwLock<BTreeMap<Pid, Option<Signo>>> = RwLock::new(BTreeMap::new());
+
 static PROCESS_GROUP_TABLE: RwLock<WeakMap<Pid, Weak<ProcessGroup>>> = RwLock::new(WeakMap::new());
 
 static SESSION_TABLE: RwLock<WeakMap<Pid, Weak<Session>>> = RwLock::new(WeakMap::new());
@@ -40,6 +47,17 @@ pub fn cleanup_task_tables() {
     PROCESS_TABLE.write().cleanup();
     PROCESS_GROUP_TABLE.write().cleanup();
     SESSION_TABLE.write().cleanup();
+    EXIT_SIGNAL_CACHE.write().clear();
+}
+
+/// Gets the cached exit_signal for a process (survives ProcessData drop).
+pub fn get_cached_exit_signal(pid: Pid) -> Option<Option<Signo>> {
+    EXIT_SIGNAL_CACHE.read().get(&pid).copied()
+}
+
+/// Removes the cached exit_signal when a zombie is reaped.
+pub fn remove_cached_exit_signal(pid: Pid) {
+    EXIT_SIGNAL_CACHE.write().remove(&pid);
 }
 
 /// Add the task, the thread and possibly its process, process group and session
@@ -58,6 +76,7 @@ pub fn add_task_to_table(task: &AxTaskRef) {
         return;
     }
     proc_table.insert(pid, proc_data);
+    EXIT_SIGNAL_CACHE.write().insert(pid, proc_data.exit_signal);
 
     let pg = proc.group();
     let mut pg_table = PROCESS_GROUP_TABLE.write();
