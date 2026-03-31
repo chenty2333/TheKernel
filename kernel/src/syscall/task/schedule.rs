@@ -8,15 +8,45 @@ use axtask::{
 };
 use linux_raw_sys::general::{
     __kernel_clockid_t, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, PRIO_PGRP, PRIO_PROCESS,
-    PRIO_USER, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_IDLE, SCHED_NORMAL,
-    SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
+    PRIO_USER, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE,
+    SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
 };
 use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use crate::{
-    task::{AlarmClock, get_process_data, get_process_group, get_task, sleep_until_clock},
+    task::{AlarmClock, AsThread, get_process_data, get_process_group, get_task, sleep_until_clock},
     time::TimeValueLike,
 };
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub(crate) struct SchedParam {
+    sched_priority: i32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub(crate) struct SchedAttr {
+    size: u32,
+    sched_policy: u32,
+    sched_flags: u64,
+    sched_nice: i32,
+    sched_priority: u32,
+    sched_runtime: u64,
+    sched_deadline: u64,
+    sched_period: u64,
+    sched_util_min: u32,
+    sched_util_max: u32,
+}
+
+fn validate_sched_policy(policy: i32) -> AxResult<i32> {
+    match policy as u32 {
+        SCHED_NORMAL | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => {
+            Ok(policy)
+        }
+        _ => Err(AxError::InvalidInput),
+    }
+}
 
 pub fn sys_sched_yield() -> AxResult<isize> {
     axtask::yield_now();
@@ -152,14 +182,14 @@ pub fn sys_sched_getscheduler(pid: i32) -> AxResult<isize> {
     Ok(task.as_thread().sched_policy() as _)
 }
 
-pub fn sys_sched_setscheduler(pid: i32, policy: i32, param: *const i32) -> AxResult<isize> {
-    let policy = policy & !(SCHED_RESET_ON_FORK as i32);
-    match policy as u32 {
-        SCHED_NORMAL | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => {}
-        _ => return Err(AxError::InvalidInput),
-    }
+pub fn sys_sched_setscheduler(
+    pid: i32,
+    policy: i32,
+    param: *const SchedParam,
+) -> AxResult<isize> {
+    let policy = validate_sched_policy(policy & !(SCHED_RESET_ON_FORK as i32))?;
 
-    let priority = unsafe { param.vm_read_uninit()?.assume_init() };
+    let priority = unsafe { param.vm_read_uninit()?.assume_init() }.sched_priority;
     let task = get_task(pid as u32)?;
     let thread = task.as_thread();
     thread.set_sched_policy(policy);
@@ -167,10 +197,80 @@ pub fn sys_sched_setscheduler(pid: i32, policy: i32, param: *const i32) -> AxRes
     Ok(0)
 }
 
-pub fn sys_sched_getparam(pid: i32, param: *mut i32) -> AxResult<isize> {
-    // struct sched_param { int sched_priority; }
+pub fn sys_sched_getparam(pid: i32, param: *mut SchedParam) -> AxResult<isize> {
     let task = get_task(pid as u32)?;
-    param.vm_write(task.as_thread().sched_priority())?;
+    param.vm_write(SchedParam {
+        sched_priority: task.as_thread().sched_priority(),
+    })?;
+    Ok(0)
+}
+
+pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResult<isize> {
+    if flags != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let attr = unsafe { attr.vm_read_uninit()?.assume_init() };
+    let policy = validate_sched_policy(attr.sched_policy as i32)?;
+    let reset_on_fork = attr.sched_flags & SCHED_FLAG_RESET_ON_FORK as u64 != 0;
+
+    let task = get_task(pid as u32)?;
+    let thread = task.as_thread();
+    thread.set_sched_policy(if reset_on_fork {
+        policy | SCHED_RESET_ON_FORK as i32
+    } else {
+        policy
+    });
+    thread.set_sched_priority(attr.sched_priority as i32);
+    Ok(0)
+}
+
+pub fn sys_sched_getattr(
+    pid: i32,
+    attr: *mut SchedAttr,
+    size: u32,
+    flags: u32,
+) -> AxResult<isize> {
+    if flags != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let out_size = size as usize;
+    if out_size < size_of::<u32>() {
+        return Err(AxError::InvalidInput);
+    }
+
+    let task = get_task(pid as u32)?;
+    let thread = task.as_thread();
+    let policy = thread.sched_policy();
+    let out = SchedAttr {
+        size: size_of::<SchedAttr>() as u32,
+        sched_policy: (policy & !(SCHED_RESET_ON_FORK as i32)) as u32,
+        sched_flags: if policy & SCHED_RESET_ON_FORK as i32 != 0 {
+            SCHED_FLAG_RESET_ON_FORK as u64
+        } else {
+            0
+        },
+        sched_nice: 0,
+        sched_priority: thread.sched_priority() as u32,
+        sched_runtime: 0,
+        sched_deadline: 0,
+        sched_period: 0,
+        sched_util_min: 0,
+        sched_util_max: 0,
+    };
+
+    let copy_size = out_size.min(size_of::<SchedAttr>());
+    vm_write_slice(
+        attr.cast::<u8>(),
+        &unsafe {
+            core::slice::from_raw_parts(
+                (&out as *const SchedAttr).cast::<u8>(),
+                copy_size,
+            )
+        },
+    )?;
+
     Ok(0)
 }
 

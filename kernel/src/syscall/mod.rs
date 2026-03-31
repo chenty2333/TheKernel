@@ -389,6 +389,15 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             sys_sched_setscheduler(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
         }
         Sysno::sched_getparam => sys_sched_getparam(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::sched_setattr => {
+            sys_sched_setattr(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
+        }
+        Sysno::sched_getattr => sys_sched_getattr(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
         Sysno::getpriority => sys_getpriority(uctx.arg0() as _, uctx.arg1() as _),
 
         // task ops
