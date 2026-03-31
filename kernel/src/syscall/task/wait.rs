@@ -100,16 +100,16 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
         WaitPid::Pgid(-pid as _)
     };
 
-    let children = proc
-        .children()
-        .into_iter()
-        .filter(|child| pid.apply(child) && should_wait_for_child(child, &options))
-        .collect::<Vec<_>>();
-    if children.is_empty() {
-        return Err(AxError::from(LinuxError::ECHILD));
-    }
-
     let check_children = || {
+        let children = proc
+            .children()
+            .into_iter()
+            .filter(|child| pid.apply(child) && should_wait_for_child(child, &options))
+            .collect::<Vec<_>>();
+        if children.is_empty() {
+            return Err(AxError::from(LinuxError::ECHILD));
+        }
+
         // Check for stopped children (WUNTRACED).
         if options.contains(WaitOptions::WUNTRACED) {
             for child in children.iter() {
