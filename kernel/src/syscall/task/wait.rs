@@ -2,10 +2,7 @@ use alloc::vec::Vec;
 use core::{future::poll_fn, task::Poll};
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axtask::{
-    current,
-    future::{block_on, interruptible},
-};
+use axtask::{current, future::block_on};
 use bitflags::bitflags;
 use linux_raw_sys::general::{
     __WALL, __WCLONE, __WNOTHREAD, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WUNTRACED,
@@ -137,13 +134,30 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
         }
     };
 
-    block_on(interruptible(poll_fn(|cx| {
-        match check_children().transpose() {
-            Some(res) => Poll::Ready(res),
-            None => {
-                proc_data.child_exit_event.register(cx.waker());
-                Poll::Pending
-            }
+    block_on(poll_fn(|cx| {
+        // 1. Always check children first — prioritize child status over signals.
+        if let Some(res) = check_children().transpose() {
+            return Poll::Ready(res);
         }
-    })))?
+
+        // 2. Check for signal interruption — only after confirming no child status.
+        //    poll_interrupt also registers a waker for future interrupts when returning
+        //    Pending, so the task will be woken by either signals or child events.
+        if curr.poll_interrupt(cx).is_ready() {
+            // Re-check after consuming the signal flag (race between signal and status).
+            if let Some(res) = check_children().transpose() {
+                return Poll::Ready(res);
+            }
+            return Poll::Ready(Err(AxError::Interrupted));
+        }
+
+        // 3. Register waker for child events and re-check (prevent race between
+        //    the check above and the waker registration).
+        proc_data.child_exit_event.register(cx.waker());
+        if let Some(res) = check_children().transpose() {
+            Poll::Ready(res)
+        } else {
+            Poll::Pending
+        }
+    }))
 }
