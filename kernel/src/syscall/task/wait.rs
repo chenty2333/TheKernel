@@ -82,13 +82,10 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
     let options = WaitOptions::from_bits_truncate(options);
     info!("sys_waitpid <= pid: {pid:?}, options: {options:?}");
 
-    if options.contains(WaitOptions::WNOWAIT) {
-        return Err(AxError::InvalidInput);
-    }
-
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let proc = &proc_data.proc;
+    let nowait = options.contains(WaitOptions::WNOWAIT);
 
     let pid = if pid == -1 {
         WaitPid::Any
@@ -114,7 +111,12 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
         if options.contains(WaitOptions::WUNTRACED) {
             for child in children.iter() {
                 if let Ok(data) = get_process_data(child.pid()) {
-                    if let Some(stop_signal) = data.take_stop_status() {
+                    let stop_signal = if nowait {
+                        data.peek_stop_status()
+                    } else {
+                        data.take_stop_status()
+                    };
+                    if let Some(stop_signal) = stop_signal {
                         let status = ((stop_signal as i32) << 8) | 0x7f;
                         if let Some(exit_code) = exit_code.nullable() {
                             exit_code.vm_write(status)?;
@@ -129,7 +131,12 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
         if options.contains(WaitOptions::WCONTINUED) {
             for child in children.iter() {
                 if let Ok(data) = get_process_data(child.pid()) {
-                    if data.take_continued() {
+                    let continued = if nowait {
+                        data.peek_continued()
+                    } else {
+                        data.take_continued()
+                    };
+                    if continued {
                         if let Some(exit_code) = exit_code.nullable() {
                             exit_code.vm_write(0xffffi32)?;
                         }
@@ -141,8 +148,10 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
 
         // Check for exited (zombie) children.
         if let Some(child) = children.iter().find(|child| child.is_zombie()) {
-            child.free();
-            remove_cached_exit_signal(child.pid());
+            if !nowait {
+                child.free();
+                remove_cached_exit_signal(child.pid());
+            }
             if let Some(exit_code) = exit_code.nullable() {
                 exit_code.vm_write(child.exit_code())?;
             }
