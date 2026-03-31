@@ -498,6 +498,21 @@ impl ProcessData {
         }
     }
 
+    /// Peeks at the stopped status without consuming it (for WNOWAIT).
+    pub fn peek_stop_status(&self) -> Option<u8> {
+        let job_ctl = self.job_ctl.lock();
+        if job_ctl.state == StopState::Stopped && !job_ctl.stop_reported {
+            Some(job_ctl.stop_signal)
+        } else {
+            None
+        }
+    }
+
+    /// Peeks at the continued flag without consuming it (for WNOWAIT).
+    pub fn peek_continued(&self) -> bool {
+        self.job_ctl.lock().continued
+    }
+
     /// Begins a multi-thread exec de-threading phase.
     pub fn begin_exec(&self, owner: Pid) -> bool {
         let mut exec_ctl = self.exec_ctl.lock();
