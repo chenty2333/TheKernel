@@ -5,7 +5,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axtask::{current, future::block_on};
 use bitflags::bitflags;
 use linux_raw_sys::general::{
-    __WALL, __WCLONE, __WNOTHREAD, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WUNTRACED,
+    __WALL, __WCLONE, __WNOTHREAD, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WUNTRACED, rusage,
 };
 use starry_process::{Pid, Process};
 use starry_vm::{VmMutPtr, VmPtr};
@@ -78,7 +78,7 @@ fn should_wait_for_child(child: &Process, options: &WaitOptions) -> bool {
     }
 }
 
-pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isize> {
+pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32, rusage_ptr: *mut rusage) -> AxResult<isize> {
     let options = WaitOptions::from_bits_truncate(options);
     info!("sys_waitpid <= pid: {pid:?}, options: {options:?}");
 
@@ -154,6 +154,11 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
             }
             if let Some(exit_code) = exit_code.nullable() {
                 exit_code.vm_write(child.exit_code())?;
+            }
+            // Write zeroed rusage for now — zombie thread data is already released.
+            // TODO: accumulate rusage in ProcessData during do_exit for proper accounting.
+            if let Some(rusage_ptr) = rusage_ptr.nullable() {
+                rusage_ptr.vm_write(unsafe { core::mem::zeroed::<rusage>() })?;
             }
             Ok(Some(child.pid() as _))
         } else if options.contains(WaitOptions::WNOHANG) {

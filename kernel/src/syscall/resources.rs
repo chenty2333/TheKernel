@@ -52,18 +52,18 @@ pub fn sys_prlimit64(
 }
 
 #[derive(Default)]
-struct Rusage {
+pub(crate) struct Rusage {
     utime: TimeValue,
     stime: TimeValue,
 }
 
 impl Rusage {
-    fn from_thread(thread: &Thread) -> Self {
+    pub(crate) fn from_thread(thread: &Thread) -> Self {
         let (utime, stime) = thread.time.borrow().output();
         Self { utime, stime }
     }
 
-    fn collate(mut self, other: Rusage) -> Self {
+    pub(crate) fn collate(mut self, other: Rusage) -> Self {
         self.utime += other.utime;
         self.stime += other.stime;
         self
@@ -105,16 +105,16 @@ pub fn sys_getrusage(who: i32, usage: *mut rusage) -> AxResult<isize> {
         RUSAGE_CHILDREN => {
             thr.proc_data
                 .proc
-                .threads()
+                .children()
                 .into_iter()
                 .fold(Rusage::default(), |acc, child| {
-                    if let Ok(task) = get_task(child)
-                        && !curr.ptr_eq(&task)
-                    {
-                        acc.collate(Rusage::from_thread(task.as_thread()))
-                    } else {
-                        acc
-                    }
+                    child.threads().into_iter().fold(acc, |acc, tid| {
+                        if let Ok(task) = get_task(tid) {
+                            acc.collate(Rusage::from_thread(task.as_thread()))
+                        } else {
+                            acc
+                        }
+                    })
                 })
         }
         RUSAGE_THREAD => Rusage::from_thread(thr),
