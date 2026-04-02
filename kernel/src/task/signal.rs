@@ -26,6 +26,7 @@ pub fn check_signals(
     };
 
     let signo = sig.signo();
+    thr.finish_signal_delivery(signo, os_action);
     match os_action {
         SignalOSAction::Terminate => {
             do_exit(signo as i32, true);
@@ -47,6 +48,36 @@ pub fn check_signals(
         }
     }
     true
+}
+
+pub(crate) fn has_pending_syscall_signal(thr: &Thread) -> bool {
+    let pending = thr.signal.pending();
+    if pending.is_empty() {
+        return false;
+    }
+
+    let blocked = thr.signal.blocked();
+    let actions = thr.proc_data.signal.actions.lock();
+    for raw in 1..=64u8 {
+        let Some(signo) = Signo::from_repr(raw) else {
+            continue;
+        };
+        if !pending.has(signo) || blocked.has(signo) {
+            continue;
+        }
+
+        let ignored = match actions[signo].disposition {
+            SignalDisposition::Ignore => true,
+            SignalDisposition::Default => {
+                matches!(signo.default_action(), DefaultSignalAction::Ignore)
+            }
+            SignalDisposition::Handler(_) => false,
+        };
+        if !ignored {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn has_pending_fatal_signal(thr: &Thread) -> bool {

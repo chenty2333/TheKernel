@@ -14,12 +14,14 @@ mod time;
 
 use axerrno::{AxError, LinuxError};
 use axhal::uspace::UserContext;
+use axtask::current;
 use syscalls::Sysno;
 
 pub use self::{
     fs::*, io_mpx::*, ipc::*, mm::*, net::*, resources::*, signal::*, sync::*, sys::*, task::*,
     time::*,
 };
+use crate::task::AsThread;
 
 pub fn handle_syscall(uctx: &mut UserContext) {
     let Some(sysno) = Sysno::new(uctx.sysno()) else {
@@ -29,6 +31,12 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     };
 
     trace!("Syscall {sysno:?}");
+    let curr = current();
+    let thr = curr.as_thread();
+    thr.enter_syscall(
+        uctx,
+        matches!(sysno, Sysno::rt_sigreturn) || thr.in_signal_handler(),
+    );
 
     let result = match sysno {
         // fs ctl
@@ -450,8 +458,19 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::fork => sys_fork(uctx),
         Sysno::exit => sys_exit(uctx.arg0() as _),
         Sysno::exit_group => sys_exit_group(uctx.arg0() as _),
-        Sysno::wait4 => sys_waitpid(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _, uctx.arg3() as _),
-        Sysno::waitid => sys_waitid(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _, uctx.arg3() as _, uctx.arg4() as _),
+        Sysno::wait4 => sys_waitpid(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
+        Sysno::waitid => sys_waitid(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+            uctx.arg4() as _,
+        ),
         Sysno::getsid => sys_getsid(uctx.arg0() as _),
         Sysno::setsid => sys_setsid(),
         Sysno::getpgid => sys_getpgid(uctx.arg0() as _),
@@ -661,5 +680,11 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     };
     debug!("Syscall {sysno} return {result:?}");
 
+    if thr.take_resume_restored_context() {
+        thr.clear_saved_syscall();
+        return;
+    }
+
     uctx.set_retval(result.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
+    thr.clear_saved_syscall();
 }

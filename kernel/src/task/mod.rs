@@ -5,6 +5,7 @@ pub(crate) mod coredump;
 mod futex;
 mod ops;
 mod resources;
+mod restart;
 mod signal;
 mod stat;
 mod timer;
@@ -29,6 +30,7 @@ use starry_signal::{
     api::{ProcessSignalManager, SignalActions, ThreadSignalManager},
 };
 
+pub(crate) use self::restart::*;
 pub use self::{
     accounting::*, futex::*, ops::*, resources::*, signal::*, stat::*, timer::*, user::*,
 };
@@ -91,6 +93,19 @@ pub struct Thread {
     /// signal whose handler just returned.
     block_next_signal_check: AtomicBool,
 
+    /// Nesting depth of active user signal handlers.
+    signal_handler_depth: AtomicUsize,
+
+    /// Saved register state for the syscall currently being handled.
+    current_syscall: SpinNoIrq<Option<SavedSyscall>>,
+
+    /// Restart metadata for syscalls interrupted by nested signal delivery.
+    restart_states: SpinNoIrq<Vec<RestartState>>,
+
+    /// When set, syscall return handling must preserve the user context that
+    /// was restored by `rt_sigreturn()` instead of writing a fresh retval.
+    resume_restored_context: AtomicBool,
+
     /// Self exit event
     pub exit_event: Arc<PollSet>,
 }
@@ -109,6 +124,10 @@ impl Thread {
             oom_score_adj: AtomicI32::new(200),
             accessing_user_memory: AtomicBool::new(false),
             block_next_signal_check: AtomicBool::new(false),
+            signal_handler_depth: AtomicUsize::new(0),
+            current_syscall: SpinNoIrq::new(None),
+            restart_states: SpinNoIrq::new(Vec::new()),
+            resume_restored_context: AtomicBool::new(false),
             exit_event: Arc::default(),
         })
     }
