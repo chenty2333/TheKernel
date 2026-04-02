@@ -1,4 +1,4 @@
-use core::sync::atomic::Ordering;
+use alloc::vec::Vec;
 
 use axhal::uspace::UserContext;
 use starry_signal::{SignalOSAction, Signo};
@@ -14,7 +14,7 @@ pub(crate) enum RestartClass {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SavedSyscall {
+struct SavedSyscall {
     sysno: usize,
     args: [usize; 6],
     return_ip: usize,
@@ -29,10 +29,18 @@ enum RestartDecision {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RestartState {
+struct RestartState {
     syscall: SavedSyscall,
     class: RestartClass,
     decision: RestartDecision,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RestartTracker {
+    signal_handler_depth: usize,
+    current_syscall: Option<SavedSyscall>,
+    restart_states: Vec<RestartState>,
+    preserve_restored_context: bool,
 }
 
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
@@ -41,7 +49,7 @@ const SYSCALL_INSN_LEN: usize = 4;
 const SYSCALL_INSN_LEN: usize = 2;
 
 impl SavedSyscall {
-    pub(crate) fn capture(uctx: &UserContext) -> Self {
+    fn capture(uctx: &UserContext) -> Self {
         let return_ip = uctx.ip();
         Self {
             sysno: uctx.sysno(),
@@ -88,76 +96,92 @@ impl RestartClass {
             RestartClass::NoHand => RestartDecision::ReturnEintr,
         }
     }
+
+    fn restart_without_handler(self) -> bool {
+        matches!(
+            self,
+            RestartClass::Sys | RestartClass::NoIntr | RestartClass::NoHand
+        )
+    }
 }
 
 impl Thread {
     pub(crate) fn enter_syscall(&self, uctx: &UserContext, preserve_restart_state: bool) {
-        *self.current_syscall.lock() = Some(SavedSyscall::capture(uctx));
-        if !preserve_restart_state && !self.in_signal_handler() {
-            self.restart_states.lock().clear();
+        let mut restart = self.restart.lock();
+        restart.current_syscall = Some(SavedSyscall::capture(uctx));
+        restart.preserve_restored_context = false;
+        if !preserve_restart_state && restart.signal_handler_depth == 0 {
+            restart.restart_states.clear();
         }
     }
 
-    pub(crate) fn in_signal_handler(&self) -> bool {
-        self.signal_handler_depth.load(Ordering::SeqCst) > 0
-    }
-
     pub(crate) fn request_syscall_restart(&self, class: RestartClass) {
-        let Some(syscall) = *self.current_syscall.lock() else {
+        let mut restart = self.restart.lock();
+        let Some(syscall) = restart.current_syscall else {
             return;
         };
-        self.restart_states.lock().push(RestartState {
+        restart.restart_states.push(RestartState {
             syscall,
             class,
             decision: RestartDecision::Pending,
         });
     }
 
-    pub(crate) fn finish_signal_delivery(&self, signo: Signo, os_action: SignalOSAction) {
+    pub(crate) fn finish_signal_delivery(
+        &self,
+        signo: Signo,
+        os_action: SignalOSAction,
+        uctx: &mut UserContext,
+    ) {
+        let mut restart = self.restart.lock();
         match os_action {
             SignalOSAction::Handler => {
-                self.signal_handler_depth.fetch_add(1, Ordering::SeqCst);
-                let mut restart_states = self.restart_states.lock();
-                if let Some(state) = restart_states.last_mut()
+                restart.signal_handler_depth += 1;
+                if let Some(state) = restart.restart_states.last_mut()
                     && state.decision == RestartDecision::Pending
                 {
                     state.decision = state.class.decide(self.proc_data.signal.can_restart(signo));
                 }
             }
             _ => {
-                self.restart_states.lock().pop();
+                if let Some(state) = restart.restart_states.pop()
+                    && state.class.restart_without_handler()
+                {
+                    state.syscall.restore(uctx);
+                }
             }
         }
     }
 
     pub(crate) fn complete_sigreturn(&self, uctx: &mut UserContext) {
-        let depth = self.signal_handler_depth.load(Ordering::SeqCst);
-        debug_assert!(depth > 0, "sigreturn without an active signal handler");
-        if depth > 0 {
-            self.signal_handler_depth.fetch_sub(1, Ordering::SeqCst);
+        let mut restart = self.restart.lock();
+        if restart.signal_handler_depth == 0 {
+            return;
         }
-        let state = {
-            let mut restart_states = self.restart_states.lock();
-            let Some(state) = restart_states.last().copied() else {
-                return;
-            };
-            if !state.syscall.matches_return_context(uctx) {
-                return;
-            }
-            restart_states.pop().unwrap()
-        };
+        restart.signal_handler_depth -= 1;
 
+        let Some(state) = restart.restart_states.last().copied() else {
+            return;
+        };
+        if !state.syscall.matches_return_context(uctx) {
+            return;
+        }
+
+        let state = restart.restart_states.pop().unwrap();
         if state.decision == RestartDecision::Restart {
             state.syscall.restore(uctx);
-            self.resume_restored_context.store(true, Ordering::SeqCst);
+            restart.preserve_restored_context = true;
         }
     }
 
     pub(crate) fn take_resume_restored_context(&self) -> bool {
-        self.resume_restored_context.swap(false, Ordering::SeqCst)
+        let mut restart = self.restart.lock();
+        let preserve = restart.preserve_restored_context;
+        restart.preserve_restored_context = false;
+        preserve
     }
 
     pub(crate) fn clear_saved_syscall(&self) {
-        *self.current_syscall.lock() = None;
+        self.restart.lock().current_syscall = None;
     }
 }

@@ -26,7 +26,7 @@ pub fn check_signals(
     };
 
     let signo = sig.signo();
-    thr.finish_signal_delivery(signo, os_action);
+    thr.finish_signal_delivery(signo, os_action, uctx);
     match os_action {
         SignalOSAction::Terminate => {
             do_exit(signo as i32, true);
