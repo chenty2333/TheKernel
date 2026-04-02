@@ -3,8 +3,13 @@ use core::{future::poll_fn, task::Poll};
 
 use axerrno::{AxError, AxResult};
 use axpoll::PollSet;
-use axtask::future::{block_on, interruptible};
+use axtask::{
+    current,
+    future::{block_on, interruptible},
+};
 use spin::Mutex;
+
+use crate::task::{AsThread, RestartClass, has_pending_syscall_signal};
 
 /// Inode identity: (device, inode number).
 pub(crate) type InodeId = (u64, u64);
@@ -137,7 +142,7 @@ pub fn release_owner(owner: FlockOwner) {
 
 /// Acquire a shared lock, blocking if necessary.
 fn lock_shared_blocking(id: InodeId, owner: FlockOwner) -> AxResult<()> {
-    block_on(interruptible(poll_fn(|cx| {
+    match block_on(interruptible(poll_fn(|cx| {
         if try_lock_shared(id, owner) {
             Poll::Ready(Ok(()))
         } else {
@@ -148,12 +153,22 @@ fn lock_shared_blocking(id: InodeId, owner: FlockOwner) -> AxResult<()> {
                 Poll::Pending
             }
         }
-    })))?
+    }))) {
+        Ok(res) => res,
+        Err(err) => {
+            let curr = current();
+            let thr = curr.as_thread();
+            if has_pending_syscall_signal(thr) {
+                thr.request_syscall_restart(RestartClass::Sys);
+            }
+            Err(err.into())
+        }
+    }
 }
 
 /// Acquire an exclusive lock, blocking if necessary.
 fn lock_exclusive_blocking(id: InodeId, owner: FlockOwner) -> AxResult<()> {
-    block_on(interruptible(poll_fn(|cx| {
+    match block_on(interruptible(poll_fn(|cx| {
         if try_lock_exclusive(id, owner) {
             Poll::Ready(Ok(()))
         } else {
@@ -164,7 +179,17 @@ fn lock_exclusive_blocking(id: InodeId, owner: FlockOwner) -> AxResult<()> {
                 Poll::Pending
             }
         }
-    })))?
+    }))) {
+        Ok(res) => res,
+        Err(err) => {
+            let curr = current();
+            let thr = curr.as_thread();
+            if has_pending_syscall_signal(thr) {
+                thr.request_syscall_restart(RestartClass::Sys);
+            }
+            Err(err.into())
+        }
+    }
 }
 
 /// Perform a flock operation on the given inode identity.

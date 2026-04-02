@@ -117,6 +117,7 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                     }
                 }
 
+                thr.finish_signal_resume(&mut uctx);
                 set_timer_state(&curr, TimerState::User);
                 curr.clear_interrupt();
             }

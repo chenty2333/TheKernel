@@ -33,7 +33,8 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     trace!("Syscall {sysno:?}");
     let curr = current();
     let thr = curr.as_thread();
-    thr.enter_syscall(uctx, matches!(sysno, Sysno::rt_sigreturn));
+    let preserve_restart_state = matches!(sysno, Sysno::rt_sigreturn) || thr.in_signal_handler();
+    thr.enter_syscall(uctx, preserve_restart_state);
 
     let result = match sysno {
         // fs ctl
