@@ -6,7 +6,7 @@ use alloc::{
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
 use axsync::Mutex;
-use axtask::{AxTaskExt, spawn_task};
+use axtask::{AxTaskExt, SchedState, spawn_task_with_sched};
 use starry_process::{Pid, Process};
 
 use crate::{
@@ -69,7 +69,7 @@ pub fn init(args: &[String], envs: &[String]) {
     let thr = Thread::new(pid, proc);
     *task.task_ext_mut() = Some(AxTaskExt::from_impl(thr));
 
-    let task = spawn_task(task);
+    let task = spawn_task_with_sched(task, SchedState::default());
     add_task_to_table(&task);
 
     // TODO: wait for all processes to finish

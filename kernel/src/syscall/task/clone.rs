@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
-use axtask::{AxTaskExt, current, spawn_task};
+use axtask::{AxTaskExt, current, sched_state, spawn_task_with_sched};
 use bitflags::bitflags;
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::*;
@@ -192,6 +192,14 @@ impl CloneArgs {
             return Err(AxError::Interrupted);
         }
 
+        let mut child_sched_state = sched_state(&curr);
+        if !flags.contains(CloneFlags::THREAD) && child_sched_state.reset_on_fork {
+            child_sched_state.reset_on_fork = false;
+            if child_sched_state.nice < 0 {
+                child_sched_state.nice = 0;
+            }
+        }
+
         let mut new_task = new_user_task(&curr.name(), new_uctx, set_child_tid);
 
         let tid = new_task.id().as_u64() as Pid;
@@ -300,7 +308,7 @@ impl CloneArgs {
         }
         *new_task.task_ext_mut() = Some(AxTaskExt::from_impl(thr));
 
-        let task = spawn_task(new_task);
+        let task = spawn_task_with_sched(new_task, child_sched_state);
         add_task_to_table(&task);
 
         Ok(tid as _)
