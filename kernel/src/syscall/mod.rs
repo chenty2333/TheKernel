@@ -12,16 +12,99 @@ mod sys;
 mod task;
 mod time;
 
+use core::time::Duration;
+
 use axerrno::{AxError, LinuxError};
 use axhal::uspace::UserContext;
+use axnet::options::{Configurable, GetSocketOption};
 use axtask::current;
+use linux_raw_sys::general::{FUTEX_CMD_MASK, FUTEX_WAIT, FUTEX_WAIT_BITSET};
 use syscalls::Sysno;
 
 pub use self::{
     fs::*, io_mpx::*, ipc::*, mm::*, net::*, resources::*, signal::*, sync::*, sys::*, task::*,
     time::*,
 };
-use crate::task::AsThread;
+use crate::{
+    file::{FileLike, Socket},
+    task::{AsThread, RestartClass, Thread, has_pending_syscall_signal},
+};
+
+#[derive(Clone, Copy)]
+enum SocketIoDirection {
+    Read,
+    Write,
+}
+
+fn socket_timeout_configured(fd: i32, direction: SocketIoDirection) -> bool {
+    let Ok(socket) = Socket::from_fd(fd) else {
+        return false;
+    };
+
+    let mut timeout = Duration::ZERO;
+    let result = match direction {
+        SocketIoDirection::Read => socket
+            .0
+            .get_option(GetSocketOption::ReceiveTimeout(&mut timeout)),
+        SocketIoDirection::Write => socket
+            .0
+            .get_option(GetSocketOption::SendTimeout(&mut timeout)),
+    };
+    result.is_ok() && timeout != Duration::ZERO
+}
+
+fn restart_class_for_fd_io(fd: i32, direction: SocketIoDirection) -> Option<RestartClass> {
+    (!socket_timeout_configured(fd, direction)).then_some(RestartClass::Sys)
+}
+
+fn restart_class_for_futex(uctx: &UserContext) -> Option<RestartClass> {
+    let futex_op = uctx.arg1() as u32 & FUTEX_CMD_MASK as u32;
+    if matches!(futex_op, FUTEX_WAIT | FUTEX_WAIT_BITSET) && uctx.arg3() == 0 {
+        Some(RestartClass::Sys)
+    } else {
+        None
+    }
+}
+
+fn restart_class_for_syscall(sysno: Sysno, uctx: &UserContext) -> Option<RestartClass> {
+    match sysno {
+        Sysno::ioctl
+        | Sysno::open
+        | Sysno::openat
+        | Sysno::wait4
+        | Sysno::waitid
+        | Sysno::flock => Some(RestartClass::Sys),
+        Sysno::read | Sysno::readv => {
+            restart_class_for_fd_io(uctx.arg0() as i32, SocketIoDirection::Read)
+        }
+        Sysno::write | Sysno::writev => {
+            restart_class_for_fd_io(uctx.arg0() as i32, SocketIoDirection::Write)
+        }
+        Sysno::accept | Sysno::accept4 | Sysno::recvfrom | Sysno::recvmsg => {
+            restart_class_for_fd_io(uctx.arg0() as i32, SocketIoDirection::Read)
+        }
+        Sysno::connect | Sysno::sendto | Sysno::sendmsg => {
+            restart_class_for_fd_io(uctx.arg0() as i32, SocketIoDirection::Write)
+        }
+        Sysno::futex => restart_class_for_futex(uctx),
+        _ => None,
+    }
+}
+
+fn maybe_request_syscall_restart(
+    thr: &Thread,
+    sysno: Sysno,
+    uctx: &UserContext,
+    result: &Result<isize, AxError>,
+) {
+    if !matches!(result, Err(AxError::Interrupted)) || !has_pending_syscall_signal(thr) {
+        return;
+    }
+
+    if let Some(class) = restart_class_for_syscall(sysno, uctx) {
+        thr.request_syscall_restart(class);
+    }
+}
 
 pub fn handle_syscall(uctx: &mut UserContext) {
     let Some(sysno) = Sysno::new(uctx.sysno()) else {
@@ -676,6 +759,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             Err(AxError::Unsupported)
         }
     };
+    maybe_request_syscall_restart(thr, sysno, uctx, &result);
     debug!("Syscall {sysno} return {result:?}");
 
     if thr.take_resume_restored_context() {

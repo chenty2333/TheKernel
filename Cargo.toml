@@ -92,5 +92,6 @@ axnet-ng = { path = "crates/axnet-ng" }
 axio = { path = "third_party/rust-patches/axio" }
 starry-vm = { path = "third_party/rust-patches/starry-vm" }
 starry-process = { path = "third_party/rust-patches/starry-process" }
+starry-signal = { path = "third_party/rust-patches/starry-signal" }
 axsched = { path = "third_party/rust-patches/axsched" }
 axtask = { path = "third_party/rust-patches/axtask" }

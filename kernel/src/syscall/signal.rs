@@ -207,7 +207,6 @@ pub fn sys_rt_tgsigqueueinfo(
 pub fn sys_rt_sigreturn(uctx: &mut UserContext) -> AxResult<isize> {
     let curr = current();
     let thr = curr.as_thread();
-    thr.block_next_signal_check();
     thr.signal.restore(uctx);
     thr.complete_sigreturn(uctx);
     Ok(uctx.retval() as isize)

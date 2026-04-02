@@ -101,9 +101,7 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                     }
                 }
 
-                if !thr.take_block_next_signal_check() {
-                    while check_signals(thr, &mut uctx, None) {}
-                }
+                while check_signals(thr, &mut uctx, None) {}
 
                 // Block if the process has been stopped (by this or another thread).
                 wait_if_stopped(thr, &mut uctx);

@@ -88,11 +88,6 @@ pub struct Thread {
     /// Indicates whether the thread is currently accessing user memory.
     accessing_user_memory: AtomicBool,
 
-    /// When set, the next signal check after returning from a syscall is
-    /// skipped. Used by `sys_rt_sigreturn` to prevent re-delivery of the
-    /// signal whose handler just returned.
-    block_next_signal_check: AtomicBool,
-
     /// Syscall restart bookkeeping shared across normal execution and signal handlers.
     restart: SpinNoIrq<RestartTracker>,
 
@@ -113,7 +108,6 @@ impl Thread {
             exit: Arc::new(AtomicBool::new(false)),
             oom_score_adj: AtomicI32::new(200),
             accessing_user_memory: AtomicBool::new(false),
-            block_next_signal_check: AtomicBool::new(false),
             restart: SpinNoIrq::new(RestartTracker::default()),
             exit_event: Arc::default(),
         })
@@ -180,19 +174,6 @@ impl Thread {
     pub fn set_accessing_user_memory(&self, accessing: bool) {
         self.accessing_user_memory
             .store(accessing, Ordering::Release);
-    }
-
-    /// Marks that the next signal check should be skipped (called by
-    /// `sys_rt_sigreturn`).
-    pub fn block_next_signal_check(&self) {
-        self.block_next_signal_check.store(true, Ordering::SeqCst);
-    }
-
-    /// Atomically clears the block-next-signal-check flag, returning the
-    /// previous value. Returns `true` if the flag was set (meaning the
-    /// current signal check should be skipped).
-    pub fn take_block_next_signal_check(&self) -> bool {
-        self.block_next_signal_check.swap(false, Ordering::SeqCst)
     }
 }
 

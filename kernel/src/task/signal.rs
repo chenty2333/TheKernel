@@ -21,13 +21,13 @@ pub fn check_signals(
     uctx: &mut UserContext,
     restore_blocked: Option<SignalSet>,
 ) -> bool {
-    let Some((sig, os_action)) = thr.signal.check_signals(uctx, restore_blocked) else {
+    let Some(delivered) = thr.signal.check_signals(uctx, restore_blocked) else {
         return false;
     };
 
-    let signo = sig.signo();
-    thr.finish_signal_delivery(os_action, thr.proc_data.signal.can_restart(signo));
-    match os_action {
+    let signo = delivered.info.signo();
+    thr.finish_signal_delivery(delivered.os_action, delivered.restartable_handler);
+    match delivered.os_action {
         SignalOSAction::Terminate => {
             do_exit(signo as i32, true);
         }

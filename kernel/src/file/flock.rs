@@ -3,13 +3,8 @@ use core::{future::poll_fn, task::Poll};
 
 use axerrno::{AxError, AxResult};
 use axpoll::PollSet;
-use axtask::{
-    current,
-    future::{block_on, interruptible},
-};
+use axtask::future::{block_on, interruptible};
 use spin::Mutex;
-
-use crate::task::{AsThread, RestartClass, has_pending_syscall_signal};
 
 /// Inode identity: (device, inode number).
 pub(crate) type InodeId = (u64, u64);
@@ -155,14 +150,7 @@ fn lock_shared_blocking(id: InodeId, owner: FlockOwner) -> AxResult<()> {
         }
     }))) {
         Ok(res) => res,
-        Err(err) => {
-            let curr = current();
-            let thr = curr.as_thread();
-            if has_pending_syscall_signal(thr) {
-                thr.request_syscall_restart(RestartClass::Sys);
-            }
-            Err(err.into())
-        }
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -181,14 +169,7 @@ fn lock_exclusive_blocking(id: InodeId, owner: FlockOwner) -> AxResult<()> {
         }
     }))) {
         Ok(res) => res,
-        Err(err) => {
-            let curr = current();
-            let thr = curr.as_thread();
-            if has_pending_syscall_signal(thr) {
-                thr.request_syscall_restart(RestartClass::Sys);
-            }
-            Err(err.into())
-        }
+        Err(err) => Err(err.into()),
     }
 }
 

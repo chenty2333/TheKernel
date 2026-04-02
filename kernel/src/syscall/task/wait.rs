@@ -12,9 +12,7 @@ use linux_raw_sys::general::{
 use starry_process::{Pid, Process, ZombieSnapshot};
 use starry_vm::{VmMutPtr, VmPtr};
 
-use crate::task::{
-    AsThread, ProcessData, RestartClass, TaskUsage, get_process_data, has_pending_syscall_signal,
-};
+use crate::task::{AsThread, ProcessData, TaskUsage, get_process_data, has_pending_syscall_signal};
 
 const WAITPID_ALLOWED_BITS: u32 =
     WNOHANG | WUNTRACED | WCONTINUED | __WNOTHREAD | __WALL | __WCLONE;
@@ -349,7 +347,6 @@ pub fn sys_waitpid(
                 return Poll::Ready(res);
             }
             if has_pending_syscall_signal(curr.as_thread()) {
-                curr.as_thread().request_syscall_restart(RestartClass::Sys);
                 return Poll::Ready(Err(AxError::Interrupted));
             }
         }
@@ -496,7 +493,6 @@ pub fn sys_waitid(
                 return Poll::Ready(res);
             }
             if has_pending_syscall_signal(curr.as_thread()) {
-                curr.as_thread().request_syscall_restart(RestartClass::Sys);
                 return Poll::Ready(Err(AxError::Interrupted));
             }
         }

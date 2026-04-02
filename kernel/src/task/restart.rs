@@ -109,7 +109,7 @@ impl RestartClass {
 impl RestartTracker {
     fn enter_syscall(&mut self, uctx: &UserContext, preserve_restart_state: bool) {
         self.current_syscall = Some(SavedSyscall::capture(uctx));
-        if !preserve_restart_state {
+        if !preserve_restart_state && self.signal_handler_depth == 0 {
             self.restart_states.clear();
             self.resume_restored_context = false;
         }
@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(tracker.restart_states.len(), 1);
 
         let handler_syscall = make_uctx(0x20, 0x25, 0x4000);
-        tracker.enter_syscall(&handler_syscall, true);
+        tracker.enter_syscall(&handler_syscall, false);
         assert_eq!(tracker.restart_states.len(), 1);
 
         let mut restored = outer;
