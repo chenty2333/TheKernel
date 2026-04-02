@@ -45,7 +45,7 @@ pub fn init(args: &[String], envs: &[String]) {
     task.ctx_mut().set_page_table_root(uspace.page_table_root());
 
     let pid = task.id().as_u64() as Pid;
-    let proc = Process::new_init(pid);
+    let proc = Process::new_init(pid, None);
     proc.add_thread(pid);
 
     N_TTY.bind_to(&proc).expect("Failed to bind ntty");

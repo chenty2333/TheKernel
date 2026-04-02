@@ -1,18 +1,23 @@
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use core::{future::poll_fn, task::Poll};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axtask::{current, future::block_on};
 use bitflags::bitflags;
 use linux_raw_sys::general::{
-    __WALL, __WCLONE, __WNOTHREAD, CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED,
-    CLD_STOPPED, P_ALL, P_PGID, P_PID, SIGCHLD, SIGCONT, WCONTINUED, WEXITED, WNOHANG, WNOWAIT,
-    WUNTRACED, rusage, siginfo,
+    __WALL, __WCLONE, __WNOTHREAD, CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED,
+    P_ALL, P_PGID, P_PID, SIGCHLD, SIGCONT, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WUNTRACED,
+    rusage, siginfo,
 };
-use starry_process::{Pid, Process};
+use starry_process::{Pid, Process, ZombieSnapshot};
 use starry_vm::{VmMutPtr, VmPtr};
 
-use crate::task::{AsThread, get_cached_exit_signal, get_process_data, remove_cached_exit_signal};
+use crate::task::{AsThread, ProcessData, TaskUsage, get_process_data};
+
+const WAITPID_ALLOWED_BITS: u32 =
+    WNOHANG | WUNTRACED | WCONTINUED | __WNOTHREAD | __WALL | __WCLONE;
+const WAITID_ALLOWED_BITS: u32 =
+    WNOHANG | WEXITED | WUNTRACED | WCONTINUED | WNOWAIT | __WNOTHREAD | __WALL | __WCLONE;
 
 bitflags! {
     #[derive(Debug)]
@@ -30,9 +35,9 @@ bitflags! {
         /// Don't reap, just poll status.
         const WNOWAIT = WNOWAIT;
 
-        /// Don't wait on children of other threads in this group
+        /// Don't wait on children of other threads in this group.
         const WNOTHREAD = __WNOTHREAD;
-        /// Wait on all children, regardless of type
+        /// Wait on all children, regardless of type.
         const WALL = __WALL;
         /// Wait for "clone" children only.
         const WCLONE = __WCLONE;
@@ -41,7 +46,7 @@ bitflags! {
 
 #[derive(Debug, Clone, Copy)]
 enum WaitPid {
-    /// Wait for any child process
+    /// Wait for any child process.
     Any,
     /// Wait for the child whose process ID is equal to the value.
     Pid(Pid),
@@ -59,20 +64,83 @@ impl WaitPid {
     }
 }
 
+#[derive(Clone)]
+enum WaitEvent {
+    Stopped {
+        pid: Pid,
+        stop_signal: u8,
+        proc_data: Arc<ProcessData>,
+    },
+    Continued {
+        pid: Pid,
+        proc_data: Arc<ProcessData>,
+    },
+    Exited {
+        child: Arc<Process>,
+        snapshot: ZombieSnapshot,
+    },
+}
+
+impl WaitEvent {
+    fn pid(&self) -> Pid {
+        match self {
+            WaitEvent::Stopped { pid, .. } | WaitEvent::Continued { pid, .. } => *pid,
+            WaitEvent::Exited { child, .. } => child.pid(),
+        }
+    }
+
+    fn waitpid_status(&self) -> i32 {
+        match self {
+            WaitEvent::Stopped { stop_signal, .. } => ((*stop_signal as i32) << 8) | 0x7f,
+            WaitEvent::Continued { .. } => 0xffff,
+            WaitEvent::Exited { snapshot, .. } => snapshot.wait_status,
+        }
+    }
+
+    fn waitid_siginfo(&self) -> siginfo {
+        match self {
+            WaitEvent::Stopped {
+                pid, stop_signal, ..
+            } => fill_siginfo(*pid, 0, CLD_STOPPED, *stop_signal as i32),
+            WaitEvent::Continued { pid, .. } => {
+                fill_siginfo(*pid, 0, CLD_CONTINUED, SIGCONT as i32)
+            }
+            WaitEvent::Exited { child, snapshot } => {
+                let (si_code, si_status) = decode_exit_code(snapshot.wait_status);
+                fill_siginfo(child.pid(), snapshot.uid, si_code, si_status)
+            }
+        }
+    }
+
+    fn exited_usage(&self) -> Option<TaskUsage> {
+        match self {
+            WaitEvent::Exited { snapshot, .. } => Some(snapshot.total_usage().into()),
+            _ => None,
+        }
+    }
+}
+
+fn validate_waitpid_options(options: u32) -> AxResult<WaitOptions> {
+    if options & !WAITPID_ALLOWED_BITS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(WaitOptions::from_bits_truncate(options))
+}
+
+fn validate_waitid_options(options: u32) -> AxResult<WaitOptions> {
+    if options & !WAITID_ALLOWED_BITS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(WaitOptions::from_bits_truncate(options))
+}
+
 /// Determines whether a child should be included in wait based on WALL/WCLONE flags.
-///
-/// Without WALL: default behavior excludes clone children (those created with clone()
-/// using a non-SIGCHLD or no exit signal).
-/// With WCLONE: only wait for clone children.
-/// With WALL: wait for all children regardless of type.
 fn should_wait_for_child(child: &Process, options: &WaitOptions) -> bool {
     if options.contains(WaitOptions::WALL) {
         return true;
     }
-    // Use the exit_signal cache which survives ProcessData drop for zombie children.
-    let is_clone = get_cached_exit_signal(child.pid())
-        .map(|sig| sig != Some(starry_signal::Signo::SIGCHLD))
-        .unwrap_or(false);
+
+    let is_clone = child.exit_signal() != Some(starry_signal::Signo::SIGCHLD as u8);
     if options.contains(WaitOptions::WCLONE) {
         is_clone
     } else {
@@ -80,14 +148,128 @@ fn should_wait_for_child(child: &Process, options: &WaitOptions) -> bool {
     }
 }
 
-pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32, rusage_ptr: *mut rusage) -> AxResult<isize> {
-    let options = WaitOptions::from_bits_truncate(options);
+fn matching_children(
+    proc: &Process,
+    pid: WaitPid,
+    options: &WaitOptions,
+) -> AxResult<Vec<Arc<Process>>> {
+    let children = proc
+        .children()
+        .into_iter()
+        .filter(|child| pid.apply(child) && should_wait_for_child(child, options))
+        .collect::<Vec<_>>();
+
+    if children.is_empty() {
+        Err(AxError::from(LinuxError::ECHILD))
+    } else {
+        Ok(children)
+    }
+}
+
+fn select_wait_event(
+    children: &[Arc<Process>],
+    options: &WaitOptions,
+    wait_exited: bool,
+) -> Option<WaitEvent> {
+    if options.contains(WaitOptions::WUNTRACED) {
+        for child in children {
+            if let Ok(proc_data) = get_process_data(child.pid())
+                && let Some(stop_signal) = proc_data.peek_stop_status()
+            {
+                return Some(WaitEvent::Stopped {
+                    pid: child.pid(),
+                    stop_signal,
+                    proc_data,
+                });
+            }
+        }
+    }
+
+    if options.contains(WaitOptions::WCONTINUED) {
+        for child in children {
+            if let Ok(proc_data) = get_process_data(child.pid())
+                && proc_data.peek_continued()
+            {
+                return Some(WaitEvent::Continued {
+                    pid: child.pid(),
+                    proc_data,
+                });
+            }
+        }
+    }
+
+    if wait_exited {
+        for child in children {
+            if child.is_zombie()
+                && let Some(snapshot) = child.zombie_snapshot()
+            {
+                return Some(WaitEvent::Exited {
+                    child: child.clone(),
+                    snapshot,
+                });
+            }
+        }
+    }
+
+    None
+}
+
+fn write_waitpid_event(
+    event: &WaitEvent,
+    exit_code: *mut i32,
+    rusage_ptr: *mut rusage,
+) -> AxResult<()> {
+    if let Some(exit_code) = exit_code.nullable() {
+        exit_code.vm_write(event.waitpid_status())?;
+    }
+    if let Some(usage) = event.exited_usage()
+        && let Some(rusage_ptr) = rusage_ptr.nullable()
+    {
+        rusage_ptr.vm_write(usage.into())?;
+    }
+    Ok(())
+}
+
+fn write_waitid_event(
+    event: &WaitEvent,
+    infop: *mut siginfo,
+    rusage_ptr: *mut rusage,
+) -> AxResult<()> {
+    if let Some(infop) = infop.nullable() {
+        infop.vm_write(event.waitid_siginfo())?;
+    }
+    if let Some(usage) = event.exited_usage()
+        && let Some(rusage_ptr) = rusage_ptr.nullable()
+    {
+        rusage_ptr.vm_write(usage.into())?;
+    }
+    Ok(())
+}
+
+fn restore_wait_event(event: &WaitEvent) {
+    match event {
+        WaitEvent::Stopped {
+            stop_signal,
+            proc_data,
+            ..
+        } => proc_data.restore_stop_status(*stop_signal),
+        WaitEvent::Continued { proc_data, .. } => proc_data.restore_continued(),
+        WaitEvent::Exited { .. } => {}
+    }
+}
+
+pub fn sys_waitpid(
+    pid: i32,
+    exit_code: *mut i32,
+    options: u32,
+    rusage_ptr: *mut rusage,
+) -> AxResult<isize> {
+    let options = validate_waitpid_options(options)?;
     info!("sys_waitpid <= pid: {pid:?}, options: {options:?}");
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let proc = &proc_data.proc;
-    let nowait = options.contains(WaitOptions::WNOWAIT);
 
     let pid = if pid == -1 {
         WaitPid::Any
@@ -100,70 +282,55 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32, rusage_ptr: *mut
     };
 
     let check_children = || {
-        let children = proc
-            .children()
-            .into_iter()
-            .filter(|child| pid.apply(child) && should_wait_for_child(child, &options))
-            .collect::<Vec<_>>();
-        if children.is_empty() {
-            return Err(AxError::from(LinuxError::ECHILD));
-        }
+        let _wait_guard = proc_data.wait_lock.lock();
+        let children = matching_children(proc, pid, &options)?;
 
-        // Check for stopped children (WUNTRACED).
-        if options.contains(WaitOptions::WUNTRACED) {
-            for child in children.iter() {
-                if let Ok(data) = get_process_data(child.pid()) {
-                    let stop_signal = if nowait {
-                        data.peek_stop_status()
-                    } else {
-                        data.take_stop_status()
+        if let Some(event) = select_wait_event(&children, &options, true) {
+            let claimed_event = match &event {
+                WaitEvent::Stopped {
+                    stop_signal,
+                    proc_data,
+                    ..
+                } => {
+                    let Some(claimed_signal) = proc_data.claim_stop_status() else {
+                        return Ok(None);
                     };
-                    if let Some(stop_signal) = stop_signal {
-                        let status = ((stop_signal as i32) << 8) | 0x7f;
-                        if let Some(exit_code) = exit_code.nullable() {
-                            exit_code.vm_write(status)?;
-                        }
-                        return Ok(Some(child.pid() as _));
+                    if claimed_signal != *stop_signal {
+                        proc_data.restore_stop_status(claimed_signal);
+                        return Ok(None);
                     }
+                    Some(event.clone())
                 }
+                WaitEvent::Continued { proc_data, .. } => {
+                    if !proc_data.claim_continued() {
+                        return Ok(None);
+                    }
+                    Some(event.clone())
+                }
+                WaitEvent::Exited { .. } => None,
+            };
+
+            if let Err(err) = write_waitpid_event(&event, exit_code, rusage_ptr) {
+                if let Some(claimed_event) = &claimed_event {
+                    restore_wait_event(claimed_event);
+                }
+                return Err(err);
             }
+
+            match &event {
+                WaitEvent::Exited { child, snapshot } => {
+                    if !child.reap() {
+                        return Ok(None);
+                    }
+                    proc_data.account_waited_child(snapshot.total_usage().into());
+                }
+                _ => {}
+            }
+
+            return Ok(Some(event.pid() as isize));
         }
 
-        // Check for continued children (WCONTINUED).
-        if options.contains(WaitOptions::WCONTINUED) {
-            for child in children.iter() {
-                if let Ok(data) = get_process_data(child.pid()) {
-                    let continued = if nowait {
-                        data.peek_continued()
-                    } else {
-                        data.take_continued()
-                    };
-                    if continued {
-                        if let Some(exit_code) = exit_code.nullable() {
-                            exit_code.vm_write(0xffffi32)?;
-                        }
-                        return Ok(Some(child.pid() as _));
-                    }
-                }
-            }
-        }
-
-        // Check for exited (zombie) children.
-        if let Some(child) = children.iter().find(|child| child.is_zombie()) {
-            if !nowait {
-                child.free();
-                remove_cached_exit_signal(child.pid());
-            }
-            if let Some(exit_code) = exit_code.nullable() {
-                exit_code.vm_write(child.exit_code())?;
-            }
-            // Write zeroed rusage for now — zombie thread data is already released.
-            // TODO: accumulate rusage in ProcessData during do_exit for proper accounting.
-            if let Some(rusage_ptr) = rusage_ptr.nullable() {
-                rusage_ptr.vm_write(unsafe { core::mem::zeroed::<rusage>() })?;
-            }
-            Ok(Some(child.pid() as _))
-        } else if options.contains(WaitOptions::WNOHANG) {
+        if options.contains(WaitOptions::WNOHANG) {
             Ok(Some(0))
         } else {
             Ok(None)
@@ -171,24 +338,17 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32, rusage_ptr: *mut
     };
 
     block_on(poll_fn(|cx| {
-        // 1. Always check children first — prioritize child status over signals.
         if let Some(res) = check_children().transpose() {
             return Poll::Ready(res);
         }
 
-        // 2. Check for signal interruption — only after confirming no child status.
-        //    poll_interrupt also registers a waker for future interrupts when returning
-        //    Pending, so the task will be woken by either signals or child events.
         if curr.poll_interrupt(cx).is_ready() {
-            // Re-check after consuming the signal flag (race between signal and status).
             if let Some(res) = check_children().transpose() {
                 return Poll::Ready(res);
             }
             return Poll::Ready(Err(AxError::Interrupted));
         }
 
-        // 3. Register waker for child events and re-check (prevent race between
-        //    the check above and the waker registration).
         proc_data.child_exit_event.register(cx.waker());
         if let Some(res) = check_children().transpose() {
             Poll::Ready(res)
@@ -201,26 +361,23 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32, rusage_ptr: *mut
 /// Decodes a Linux-style wait status into (CLD_* code, si_status) for waitid.
 fn decode_exit_code(exit_code: i32) -> (u32, i32) {
     if exit_code & 0x7f == 0 {
-        // Normal exit: status in upper byte.
         (CLD_EXITED, (exit_code >> 8) & 0xff)
     } else if exit_code & 0x80 != 0 {
-        // Core dump: signal in low 7 bits.
         (CLD_DUMPED, exit_code & 0x7f)
     } else {
-        // Killed by signal: signal in low 7 bits.
         (CLD_KILLED, exit_code & 0x7f)
     }
 }
 
 /// Fills a siginfo_t struct for waitid.
-fn fill_siginfo(pid: Pid, si_code: u32, si_status: i32) -> siginfo {
+fn fill_siginfo(pid: Pid, uid: u32, si_code: u32, si_status: i32) -> siginfo {
     let mut info: siginfo = unsafe { core::mem::zeroed() };
     unsafe {
         let inner = &mut info.__bindgen_anon_1.__bindgen_anon_1;
         inner.si_signo = SIGCHLD as i32;
         inner.si_code = si_code as i32;
         inner._sifields._sigchld._pid = pid as _;
-        inner._sifields._sigchld._uid = 0;
+        inner._sifields._sigchld._uid = uid;
         inner._sifields._sigchld._status = si_status;
     }
     info
@@ -233,13 +390,11 @@ pub fn sys_waitid(
     options: u32,
     rusage_ptr: *mut rusage,
 ) -> AxResult<isize> {
-    let options = WaitOptions::from_bits_truncate(options);
+    let options = validate_waitid_options(options)?;
     info!("sys_waitid <= idtype: {idtype}, id: {id}, options: {options:?}");
 
-    // waitid requires at least one of WEXITED, WSTOPPED (WUNTRACED), or WCONTINUED.
-    if !options.intersects(
-        WaitOptions::WEXITED | WaitOptions::WUNTRACED | WaitOptions::WCONTINUED,
-    ) {
+    if !options.intersects(WaitOptions::WEXITED | WaitOptions::WUNTRACED | WaitOptions::WCONTINUED)
+    {
         return Err(AxError::InvalidInput);
     }
 
@@ -258,80 +413,65 @@ pub fn sys_waitid(
                 WaitPid::Pgid(id as _)
             }
         }
-        _ => return Err(AxError::InvalidInput), // P_PIDFD not supported
+        _ => return Err(AxError::InvalidInput),
     };
 
     let check_children = || -> AxResult<Option<isize>> {
-        let children = proc
-            .children()
-            .into_iter()
-            .filter(|child| pid.apply(child) && should_wait_for_child(child, &options))
-            .collect::<Vec<_>>();
-        if children.is_empty() {
-            return Err(AxError::from(LinuxError::ECHILD));
-        }
+        let _wait_guard = proc_data.wait_lock.lock();
+        let children = matching_children(proc, pid, &options)?;
 
-        // Check for stopped children (WUNTRACED / WSTOPPED).
-        if options.contains(WaitOptions::WUNTRACED) {
-            for child in children.iter() {
-                if let Ok(data) = get_process_data(child.pid()) {
-                    let stop_signal = if nowait {
-                        data.peek_stop_status()
-                    } else {
-                        data.take_stop_status()
-                    };
-                    if let Some(stop_signal) = stop_signal {
-                        let info = fill_siginfo(child.pid(), CLD_STOPPED, stop_signal as i32);
-                        if let Some(infop) = infop.nullable() {
-                            infop.vm_write(info)?;
+        if let Some(event) =
+            select_wait_event(&children, &options, options.contains(WaitOptions::WEXITED))
+        {
+            let claimed_event = if nowait {
+                None
+            } else {
+                match &event {
+                    WaitEvent::Stopped {
+                        stop_signal,
+                        proc_data,
+                        ..
+                    } => {
+                        let Some(claimed_signal) = proc_data.claim_stop_status() else {
+                            return Ok(None);
+                        };
+                        if claimed_signal != *stop_signal {
+                            proc_data.restore_stop_status(claimed_signal);
+                            return Ok(None);
                         }
-                        return Ok(Some(0));
+                        Some(event.clone())
                     }
-                }
-            }
-        }
-
-        // Check for continued children (WCONTINUED).
-        if options.contains(WaitOptions::WCONTINUED) {
-            for child in children.iter() {
-                if let Ok(data) = get_process_data(child.pid()) {
-                    let continued = if nowait {
-                        data.peek_continued()
-                    } else {
-                        data.take_continued()
-                    };
-                    if continued {
-                        let info = fill_siginfo(child.pid(), CLD_CONTINUED, SIGCONT as i32);
-                        if let Some(infop) = infop.nullable() {
-                            infop.vm_write(info)?;
+                    WaitEvent::Continued { proc_data, .. } => {
+                        if !proc_data.claim_continued() {
+                            return Ok(None);
                         }
-                        return Ok(Some(0));
+                        Some(event.clone())
                     }
+                    WaitEvent::Exited { .. } => None,
                 }
-            }
-        }
+            };
 
-        // Check for exited (zombie) children (WEXITED).
-        if options.contains(WaitOptions::WEXITED) {
-            if let Some(child) = children.iter().find(|child| child.is_zombie()) {
-                let (si_code, si_status) = decode_exit_code(child.exit_code());
-                let info = fill_siginfo(child.pid(), si_code, si_status);
-                if !nowait {
-                    child.free();
-                    remove_cached_exit_signal(child.pid());
+            if let Err(err) = write_waitid_event(&event, infop, rusage_ptr) {
+                if let Some(claimed_event) = &claimed_event {
+                    restore_wait_event(claimed_event);
                 }
-                if let Some(infop) = infop.nullable() {
-                    infop.vm_write(info)?;
-                }
-                if let Some(rusage_ptr) = rusage_ptr.nullable() {
-                    rusage_ptr.vm_write(unsafe { core::mem::zeroed::<rusage>() })?;
-                }
-                return Ok(Some(0));
+                return Err(err);
             }
+
+            match &event {
+                WaitEvent::Exited { child, snapshot } if !nowait => {
+                    if !child.reap() {
+                        return Ok(None);
+                    }
+                    proc_data.account_waited_child(snapshot.total_usage().into());
+                }
+                _ => {}
+            }
+
+            return Ok(Some(0));
         }
 
         if options.contains(WaitOptions::WNOHANG) {
-            // WNOHANG with no status: zero out siginfo and return 0.
             if let Some(infop) = infop.nullable() {
                 infop.vm_write(unsafe { core::mem::zeroed::<siginfo>() })?;
             }

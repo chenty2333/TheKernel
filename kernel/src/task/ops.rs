@@ -1,5 +1,4 @@
 use alloc::{
-    collections::BTreeMap,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -12,26 +11,20 @@ use kernel_guard::NoPreemptIrqSave;
 use linux_raw_sys::general::ROBUST_LIST_LIMIT;
 use memory_addr::PhysAddr;
 use spin::RwLock;
-use starry_process::{Pid, ProcessGroup, Session};
+use starry_process::{Pid, ProcessGroup, Session, ZombieSnapshot};
 use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 use weak_map::WeakMap;
 
 use super::{
-    AsThread, FutexKey, ProcessData, TimerState, futex_table_for, send_signal_thread_inner,
-    send_signal_to_process, send_signal_to_thread,
+    AsThread, FutexKey, ProcessData, TaskUsage, TimerState, futex_table_for,
+    send_signal_thread_inner, send_signal_to_process, send_signal_to_thread,
 };
 
 static TASK_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
 static TASK_ALIAS_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
 
 static PROCESS_TABLE: RwLock<WeakMap<Pid, Weak<ProcessData>>> = RwLock::new(WeakMap::new());
-
-/// Caches each process's exit_signal, independent of ProcessData lifetime.
-/// Populated when a process is added to the table, removed when reaped by waitpid.
-/// This allows WALL/WCLONE filtering to work even after ProcessData is dropped
-/// for zombie children.
-static EXIT_SIGNAL_CACHE: RwLock<BTreeMap<Pid, Option<Signo>>> = RwLock::new(BTreeMap::new());
 
 static PROCESS_GROUP_TABLE: RwLock<WeakMap<Pid, Weak<ProcessGroup>>> = RwLock::new(WeakMap::new());
 
@@ -47,17 +40,6 @@ pub fn cleanup_task_tables() {
     PROCESS_TABLE.write().cleanup();
     PROCESS_GROUP_TABLE.write().cleanup();
     SESSION_TABLE.write().cleanup();
-    EXIT_SIGNAL_CACHE.write().clear();
-}
-
-/// Gets the cached exit_signal for a process (survives ProcessData drop).
-pub fn get_cached_exit_signal(pid: Pid) -> Option<Option<Signo>> {
-    EXIT_SIGNAL_CACHE.read().get(&pid).copied()
-}
-
-/// Removes the cached exit_signal when a zombie is reaped.
-pub fn remove_cached_exit_signal(pid: Pid) {
-    EXIT_SIGNAL_CACHE.write().remove(&pid);
 }
 
 /// Add the task, the thread and possibly its process, process group and session
@@ -76,7 +58,6 @@ pub fn add_task_to_table(task: &AxTaskRef) {
         return;
     }
     proc_table.insert(pid, proc_data);
-    EXIT_SIGNAL_CACHE.write().insert(pid, proc_data.exit_signal);
 
     let pg = proc.group();
     let mut pg_table = PROCESS_GROUP_TABLE.write();
@@ -294,11 +275,20 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     }
 
     let process = &thr.proc_data.proc;
+    set_timer_state(&curr, TimerState::Kernel);
+    thr.proc_data
+        .account_exited_thread(TaskUsage::from_thread(thr));
     if visible_tid != tid {
         remove_task_alias(visible_tid);
     }
     thr.proc_data.end_exec(tid);
     if process.exit_thread(tid, exit_code) {
+        process.publish_zombie_snapshot(ZombieSnapshot {
+            wait_status: process.exit_code(),
+            self_usage: thr.proc_data.self_usage().into(),
+            child_usage: thr.proc_data.children_usage().into(),
+            uid: 0,
+        });
         process.exit();
         if let Some(parent) = process.parent() {
             if let Some(signo) = thr.proc_data.exit_signal {

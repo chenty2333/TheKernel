@@ -19,7 +19,11 @@ pub fn sys_clock_gettime(clock_id: __kernel_clockid_t, ts: *mut timespec) -> AxR
         CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
             monotonic_time()
         }
-        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
+        CLOCK_PROCESS_CPUTIME_ID => {
+            let usage = current().as_thread().proc_data.self_usage();
+            usage.utime() + usage.stime()
+        }
+        CLOCK_THREAD_CPUTIME_ID => {
             let (utime, stime) = current().as_thread().time.borrow().output();
             utime + stime
         }
@@ -61,14 +65,15 @@ pub struct Tms {
 }
 
 pub fn sys_times(tms: *mut Tms) -> AxResult<isize> {
-    let (utime, stime) = current().as_thread().time.borrow().output();
-    let utime = utime.as_micros() as usize;
-    let stime = stime.as_micros() as usize;
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let self_usage = proc_data.self_usage();
+    let child_usage = proc_data.children_usage();
     tms.vm_write(Tms {
-        tms_utime: utime,
-        tms_stime: stime,
-        tms_cutime: utime,
-        tms_cstime: stime,
+        tms_utime: self_usage.utime_ticks() as usize,
+        tms_stime: self_usage.stime_ticks() as usize,
+        tms_cutime: child_usage.utime_ticks() as usize,
+        tms_cstime: child_usage.stime_ticks() as usize,
     })?;
     Ok(nanos_to_ticks(monotonic_time_nanos()) as _)
 }

@@ -1,7 +1,8 @@
 use alloc::{borrow::ToOwned, fmt, string::String};
 
 use axerrno::AxResult;
-use axtask::{TaskInner, TaskState};
+use axtask::{AxTaskRef, TaskState, sched_state};
+use linux_raw_sys::general::{SCHED_BATCH, SCHED_IDLE, SCHED_NORMAL};
 use starry_signal::Signo;
 
 use crate::task::AsThread;
@@ -29,8 +30,8 @@ pub struct TaskStat {
     pub stime: u64,
     pub cutime: u64,
     pub cstime: u64,
-    pub priority: u32,
-    pub nice: u32,
+    pub priority: i32,
+    pub nice: i32,
     pub num_threads: u32,
     pub itrealvalue: u32,
     pub starttime: u64,
@@ -67,8 +68,8 @@ pub struct TaskStat {
 }
 
 impl TaskStat {
-    /// Create a new [`TaskStat`] from a [`AxTaskRef`].
-    pub fn from_thread(task: &TaskInner) -> AxResult<Self> {
+    /// Create a new [`TaskStat`] from a task reference.
+    pub fn from_task(task: &AxTaskRef) -> AxResult<Self> {
         let thread = task.as_thread();
         let proc_data = &thread.proc_data;
         let proc = &proc_data.proc;
@@ -88,6 +89,14 @@ impl TaskStat {
         let ppid = proc.parent().map_or(0, |p| p.pid());
         let pgrp = proc.group().pgid();
         let session = proc.group().session().sid();
+        let self_usage = proc_data.self_usage();
+        let child_usage = proc_data.children_usage();
+        let sched = sched_state(task);
+        let policy = match sched.class {
+            axtask::SchedClass::Normal => SCHED_NORMAL as u32,
+            axtask::SchedClass::Batch => SCHED_BATCH as u32,
+            axtask::SchedClass::Idle => SCHED_IDLE as u32,
+        };
         Ok(Self {
             pid,
             comm: comm.to_owned(),
@@ -95,8 +104,15 @@ impl TaskStat {
             ppid,
             pgrp,
             session,
+            utime: self_usage.utime_ticks(),
+            stime: self_usage.stime_ticks(),
+            cutime: child_usage.utime_ticks(),
+            cstime: child_usage.stime_ticks(),
+            priority: sched.nice as i32 + 20,
+            nice: sched.nice as i32,
             num_threads: proc.threads().len() as u32,
-            exit_signal: proc_data.exit_signal.unwrap_or(Signo::SIGCHLD) as u8,
+            exit_signal: proc.exit_signal().unwrap_or(Signo::SIGCHLD as u8),
+            policy,
             exit_code: proc.exit_code(),
             ..Default::default()
         })

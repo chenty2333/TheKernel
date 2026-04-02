@@ -218,7 +218,7 @@ impl CloneArgs {
             } else {
                 old_proc_data.proc.clone()
             }
-            .fork(tid);
+            .fork(tid, exit_signal.map(|signo| signo as u8));
 
             let aspace = if flags.contains(CloneFlags::VM) {
                 old_proc_data.aspace.clone()

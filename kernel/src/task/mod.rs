@@ -1,5 +1,6 @@
 //! User task management.
 
+mod accounting;
 pub(crate) mod coredump;
 mod futex;
 mod ops;
@@ -28,7 +29,9 @@ use starry_signal::{
     api::{ProcessSignalManager, SignalActions, ThreadSignalManager},
 };
 
-pub use self::{futex::*, ops::*, resources::*, signal::*, stat::*, timer::*, user::*};
+pub use self::{
+    accounting::*, futex::*, ops::*, resources::*, signal::*, stat::*, timer::*, user::*,
+};
 use crate::mm::AddrSpace;
 
 ///  A wrapper type that assumes the inner type is `Sync`.
@@ -306,6 +309,14 @@ pub struct ProcessData {
     /// The default mask for file permissions.
     umask: AtomicU32,
 
+    /// CPU time accumulated from sibling threads that have already exited.
+    exited_threads_usage: AtomicTaskUsage,
+    /// CPU time accumulated from waited-for child subtrees.
+    waited_children_usage: AtomicTaskUsage,
+
+    /// Serializes wait* selection and consumption for this process.
+    pub wait_lock: Mutex<()>,
+
     /// Job-control stop state shared by all threads in the process.
     job_ctl: SpinNoIrq<JobControlState>,
     /// Multi-thread exec coordination state.
@@ -351,6 +362,9 @@ impl ProcessData {
             futex_table: Arc::new(FutexTable::new()),
 
             umask: AtomicU32::new(0o022),
+            exited_threads_usage: AtomicTaskUsage::new(),
+            waited_children_usage: AtomicTaskUsage::new(),
+            wait_lock: Mutex::new(()),
 
             job_ctl: SpinNoIrq::new(JobControlState::default()),
             exec_ctl: SpinNoIrq::new(ExecControlState::default()),
@@ -374,6 +388,31 @@ impl ProcessData {
     /// signal other than SIGCHLD to its parent upon termination.
     pub fn is_clone_child(&self) -> bool {
         self.exit_signal != Some(Signo::SIGCHLD)
+    }
+
+    /// Returns process CPU usage, including live threads and exited siblings.
+    pub fn self_usage(&self) -> TaskUsage {
+        live_process_usage(self)
+    }
+
+    /// Returns waited-for child CPU usage accumulated for this process.
+    pub fn children_usage(&self) -> TaskUsage {
+        self.waited_children_usage.snapshot()
+    }
+
+    /// Returns the total usage that should be published when this process exits.
+    pub fn total_usage(&self) -> TaskUsage {
+        self.self_usage().saturating_add(self.children_usage())
+    }
+
+    /// Records the final CPU usage of a thread that is exiting.
+    pub fn account_exited_thread(&self, usage: TaskUsage) {
+        self.exited_threads_usage.add(usage);
+    }
+
+    /// Records a waited-for child subtree into the process's child ledger.
+    pub fn account_waited_child(&self, usage: TaskUsage) {
+        self.waited_children_usage.add(usage);
     }
 
     /// Get the umask.
@@ -480,9 +519,33 @@ impl ProcessData {
         }
     }
 
+    /// Claims the pending stop report so a waiter can complete userspace copies first.
+    pub fn claim_stop_status(&self) -> Option<u8> {
+        self.take_stop_status()
+    }
+
+    /// Restores a previously claimed stop report after a failed userspace copy.
+    pub fn restore_stop_status(&self, stop_signal: u8) {
+        let mut job_ctl = self.job_ctl.lock();
+        if job_ctl.state == StopState::Stopped && job_ctl.stop_signal == stop_signal {
+            job_ctl.stop_reported = false;
+        }
+    }
+
     /// Peeks at the continued flag without consuming it (for WNOWAIT).
     pub fn peek_continued(&self) -> bool {
         self.job_ctl.lock().continued
+    }
+
+    /// Claims the pending continued report so a waiter can complete userspace copies first.
+    pub fn claim_continued(&self) -> bool {
+        self.take_continued()
+    }
+
+    /// Restores a previously claimed continued report after a failed userspace copy.
+    pub fn restore_continued(&self) {
+        let mut job_ctl = self.job_ctl.lock();
+        job_ctl.continued = true;
     }
 
     /// Begins a multi-thread exec de-threading phase.

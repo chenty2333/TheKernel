@@ -203,7 +203,7 @@ impl SimpleDirOps for ThreadDir {
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
         Ok(match name {
             "stat" => SimpleFile::new_regular(fs, move || {
-                Ok(format!("{}", TaskStat::from_thread(&task)?).into_bytes())
+                Ok(format!("{}", TaskStat::from_task(&task)?).into_bytes())
             })
             .into(),
             "status" => SimpleFile::new_regular(fs, move || Ok(task_status(&task))).into(),

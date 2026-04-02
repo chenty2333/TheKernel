@@ -3055,8 +3055,6 @@ dependencies = [
 [[package]]
 name = "starry-process"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88fa031a95c25b7bcfe8883f9f53238c9053a2a89f790bb1a7c35d080c6d3b65"
 dependencies = [
  "kspin",
  "lazyinit",
