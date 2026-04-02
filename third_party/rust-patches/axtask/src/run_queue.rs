@@ -467,15 +467,21 @@ impl AxRunQueue {
         match task.state() {
             TaskState::Ready => {
                 let mut scheduler = self.scheduler.lock();
-                let Some(task) = scheduler.remove_task(task) else {
-                    return false;
-                };
-                if !scheduler.set_task_params(&task, sched_state) {
+                if let Some(task) = scheduler.remove_task(task) {
+                    if !scheduler.set_task_params(&task, sched_state) {
+                        scheduler.enqueue_task(task, EnqueueReason::Wakeup);
+                        return false;
+                    }
                     scheduler.enqueue_task(task, EnqueueReason::Wakeup);
-                    return false;
+                    true
+                } else {
+                    match task.state() {
+                        TaskState::Exited => false,
+                        TaskState::Ready | TaskState::Running | TaskState::Blocked => {
+                            scheduler.set_task_params(task, sched_state)
+                        }
+                    }
                 }
-                scheduler.enqueue_task(task, EnqueueReason::Wakeup);
-                true
             }
             TaskState::Running | TaskState::Blocked => self.scheduler.lock().set_task_params(task, sched_state),
             TaskState::Exited => false,
@@ -681,7 +687,9 @@ fn poll_gc(cx: &mut Context<'_>) -> Poll<()> {
 /// then puts the task to the scheduler of target run queue.
 #[cfg(feature = "smp")]
 pub(crate) fn migrate_entry(migrated_task: AxTaskRef) {
-    select_run_queue::<kernel_guard::NoPreemptIrqSave>(&migrated_task)
+    let mut target = select_run_queue::<kernel_guard::NoPreemptIrqSave>(&migrated_task);
+    migrated_task.set_cpu_id(target.inner.cpu_id as _);
+    target
         .inner
         .scheduler
         .lock()

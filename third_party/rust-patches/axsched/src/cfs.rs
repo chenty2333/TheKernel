@@ -31,6 +31,15 @@ impl Default for CfsTaskParams {
     }
 }
 
+impl CfsTaskParams {
+    fn canonicalize(mut self) -> Self {
+        if matches!(self.class, CfsTaskClass::Idle) {
+            self.nice = NICE_RANGE_POS as i8;
+        }
+        self
+    }
+}
+
 /// task for CFS
 pub struct CFSTask<T> {
     inner: T,
@@ -138,13 +147,14 @@ impl<T> CFSTask<T> {
     pub fn sched_params(&self) -> CfsTaskParams {
         CfsTaskParams {
             class: self.class(),
-            nice: self.nice.load(Ordering::Acquire) as i8,
+            nice: self.effective_nice() as i8,
             reset_on_fork: self.reset_on_fork.load(Ordering::Acquire),
         }
     }
 
     /// Applies the given scheduling parameters to the task.
     pub fn configure(&self, params: CfsTaskParams) -> bool {
+        let params = params.canonicalize();
         if !(-20..=19).contains(&(params.nice as isize)) {
             return false;
         }
