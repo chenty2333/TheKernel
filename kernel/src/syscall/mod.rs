@@ -68,12 +68,11 @@ fn restart_class_for_futex(uctx: &UserContext) -> Option<RestartClass> {
 
 fn restart_class_for_syscall(sysno: Sysno, uctx: &UserContext) -> Option<RestartClass> {
     match sysno {
-        Sysno::ioctl
-        | Sysno::open
-        | Sysno::openat
-        | Sysno::wait4
-        | Sysno::waitid
-        | Sysno::flock => Some(RestartClass::Sys),
+        Sysno::ioctl | Sysno::openat | Sysno::wait4 | Sysno::waitid | Sysno::flock => {
+            Some(RestartClass::Sys)
+        }
+        #[cfg(target_arch = "x86_64")]
+        Sysno::open => Some(RestartClass::Sys),
         Sysno::read | Sysno::readv => {
             restart_class_for_fd_io(uctx.arg0() as i32, SocketIoDirection::Read)
         }
@@ -312,6 +311,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         #[cfg(target_arch = "x86_64")]
         Sysno::poll => sys_poll(uctx.arg0().into(), uctx.arg1() as _, uctx.arg2() as _),
         Sysno::ppoll => sys_ppoll(
+            uctx,
             uctx.arg0().into(),
             uctx.arg1() as _,
             uctx.arg2().into(),
@@ -327,6 +327,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg4().into(),
         ),
         Sysno::pselect6 => sys_pselect6(
+            uctx,
             uctx.arg0() as _,
             uctx.arg1().into(),
             uctx.arg2().into(),
@@ -342,6 +343,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg3().into(),
         ),
         Sysno::epoll_pwait => sys_epoll_pwait(
+            uctx,
             uctx.arg0() as _,
             uctx.arg1().into(),
             uctx.arg2() as _,
@@ -350,6 +352,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg5() as _,
         ),
         Sysno::epoll_pwait2 => sys_epoll_pwait2(
+            uctx,
             uctx.arg0() as _,
             uctx.arg1().into(),
             uctx.arg2() as _,

@@ -2,8 +2,12 @@ use alloc::vec::Vec;
 use core::{fmt, time::Duration};
 
 use axerrno::{AxError, AxResult};
+use axhal::uspace::UserContext;
 use axpoll::IoEvents;
-use axtask::future::{self, block_on, poll_io};
+use axtask::{
+    current,
+    future::{self, block_on, poll_io},
+};
 use bitmaps::Bitmap;
 use linux_raw_sys::{
     general::*,
@@ -16,7 +20,7 @@ use crate::{
     file::get_file_like,
     mm::{UserConstPtr, UserPtr, nullable},
     syscall::signal::check_sigset_size,
-    task::with_blocked_signals,
+    task::{AsThread, check_signals},
     time::TimeValueLike,
 };
 
@@ -43,6 +47,7 @@ impl fmt::Debug for FdSet {
 }
 
 fn do_select(
+    uctx: Option<&mut UserContext>,
     nfds: u32,
     readfds: UserPtr<__kernel_fd_set>,
     writefds: UserPtr<__kernel_fd_set>,
@@ -101,9 +106,10 @@ fn do_select(
     if let Some(exceptfds) = exceptfds.as_deref_mut() {
         unsafe { FD_ZERO(exceptfds) };
     }
-    with_blocked_signals(sigmask.copied(), || {
-        match block_on(future::timeout(
-            timeout,
+    let deadline = timeout.map(|dur| axhal::time::wall_time().saturating_add(dur));
+    let mut select_once = || {
+        block_on(future::timeout(
+            deadline.map(|end| end.saturating_sub(axhal::time::wall_time())),
             poll_io(&fds, IoEvents::empty(), false, || {
                 let mut res = 0usize;
                 for ((fd, interested), index) in fds.0.iter().zip(fd_indices.iter().copied()) {
@@ -133,11 +139,42 @@ fn do_select(
 
                 Err(AxError::WouldBlock)
             }),
-        )) {
+        ))
+    };
+
+    let Some(sigmask) = sigmask.copied() else {
+        return match select_once() {
             Ok(r) => r,
             Err(_) => Ok(0),
+        };
+    };
+    let Some(uctx) = uctx else {
+        return Err(AxError::InvalidInput);
+    };
+
+    let curr = current();
+    let thr = curr.as_thread();
+    let old_blocked = thr.signal.set_blocked(sigmask);
+    let result = loop {
+        match select_once() {
+            Ok(Ok(res)) => break Ok(res),
+            Ok(Err(AxError::Interrupted)) => {
+                let handler_depth = thr.signal_handler_depth();
+                if check_signals(thr, uctx, Some(old_blocked)) {
+                    if thr.signal_handler_depth() == handler_depth {
+                        thr.signal.set_blocked(old_blocked);
+                    }
+                    break Err(AxError::Interrupted);
+                }
+            }
+            Ok(Err(err)) => break Err(err),
+            Err(_) => break Ok(0),
         }
-    })
+    };
+    if !matches!(result, Err(AxError::Interrupted)) {
+        thr.signal.set_blocked(old_blocked);
+    }
+    result
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -149,6 +186,7 @@ pub fn sys_select(
     timeout: UserConstPtr<timeval>,
 ) -> AxResult<isize> {
     do_select(
+        None,
         nfds,
         readfds,
         writefds,
@@ -168,6 +206,7 @@ pub struct SignalSetWithSize {
 }
 
 pub fn sys_pselect6(
+    uctx: &mut UserContext,
     nfds: u32,
     readfds: UserPtr<__kernel_fd_set>,
     writefds: UserPtr<__kernel_fd_set>,
@@ -176,6 +215,7 @@ pub fn sys_pselect6(
     sigmask: UserConstPtr<SignalSetWithSize>,
 ) -> AxResult<isize> {
     do_select(
+        Some(uctx),
         nfds,
         readfds,
         writefds,

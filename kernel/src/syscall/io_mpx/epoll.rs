@@ -1,8 +1,12 @@
 use core::time::Duration;
 
 use axerrno::{AxError, AxResult};
+use axhal::uspace::UserContext;
 use axpoll::IoEvents;
-use axtask::future::{self, block_on, poll_io};
+use axtask::{
+    current,
+    future::{self, block_on, poll_io},
+};
 use bitflags::bitflags;
 use linux_raw_sys::general::{
     EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, epoll_event, timespec,
@@ -16,7 +20,7 @@ use crate::{
     },
     mm::{UserConstPtr, UserPtr, nullable},
     syscall::signal::check_sigset_size,
-    task::with_blocked_signals,
+    task::{AsThread, check_signals},
     time::TimeValueLike,
 };
 
@@ -76,6 +80,7 @@ pub fn sys_epoll_ctl(
 }
 
 fn do_epoll_wait(
+    uctx: Option<&mut UserContext>,
     epfd: i32,
     events: UserPtr<epoll_event>,
     maxevents: i32,
@@ -92,22 +97,54 @@ fn do_epoll_wait(
         return Err(AxError::InvalidInput);
     }
     let events = events.get_as_mut_slice(maxevents as usize)?;
-
-    with_blocked_signals(
-        nullable!(sigmask.get_as_ref())?.copied(),
-        || match block_on(future::timeout(
-            timeout,
+    let sigmask = nullable!(sigmask.get_as_ref())?.copied();
+    let deadline = timeout.map(|dur| axhal::time::wall_time().saturating_add(dur));
+    let mut wait_once = || {
+        block_on(future::timeout(
+            deadline.map(|end| end.saturating_sub(axhal::time::wall_time())),
             poll_io(epoll.as_ref(), IoEvents::IN, false, || {
                 epoll.poll_events(events)
             }),
-        )) {
+        ))
+    };
+
+    let Some(sigmask) = sigmask else {
+        return match wait_once() {
             Ok(r) => r.map(|n| n as _),
             Err(_) => Ok(0),
-        },
-    )
+        };
+    };
+    let Some(uctx) = uctx else {
+        return Err(AxError::InvalidInput);
+    };
+
+    let curr = current();
+    let thr = curr.as_thread();
+    let old_blocked = thr.signal.set_blocked(sigmask);
+    let result = loop {
+        match wait_once() {
+            Ok(Ok(res)) => break Ok(res as _),
+            Ok(Err(AxError::Interrupted)) => {
+                let handler_depth = thr.signal_handler_depth();
+                if check_signals(thr, uctx, Some(old_blocked)) {
+                    if thr.signal_handler_depth() == handler_depth {
+                        thr.signal.set_blocked(old_blocked);
+                    }
+                    break Err(AxError::Interrupted);
+                }
+            }
+            Ok(Err(err)) => break Err(err),
+            Err(_) => break Ok(0),
+        }
+    };
+    if !matches!(result, Err(AxError::Interrupted)) {
+        thr.signal.set_blocked(old_blocked);
+    }
+    result
 }
 
 pub fn sys_epoll_pwait(
+    uctx: &mut UserContext,
     epfd: i32,
     events: UserPtr<epoll_event>,
     maxevents: i32,
@@ -120,10 +157,19 @@ pub fn sys_epoll_pwait(
         t if t >= 0 => Some(Duration::from_millis(t as u64)),
         _ => return Err(AxError::InvalidInput),
     };
-    do_epoll_wait(epfd, events, maxevents, timeout, sigmask, sigsetsize)
+    do_epoll_wait(
+        Some(uctx),
+        epfd,
+        events,
+        maxevents,
+        timeout,
+        sigmask,
+        sigsetsize,
+    )
 }
 
 pub fn sys_epoll_pwait2(
+    uctx: &mut UserContext,
     epfd: i32,
     events: UserPtr<epoll_event>,
     maxevents: i32,
@@ -134,5 +180,13 @@ pub fn sys_epoll_pwait2(
     let timeout = nullable!(timeout.get_as_ref())?
         .map(|ts| ts.try_into_time_value())
         .transpose()?;
-    do_epoll_wait(epfd, events, maxevents, timeout, sigmask, sigsetsize)
+    do_epoll_wait(
+        Some(uctx),
+        epfd,
+        events,
+        maxevents,
+        timeout,
+        sigmask,
+        sigsetsize,
+    )
 }

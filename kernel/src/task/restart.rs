@@ -119,6 +119,10 @@ impl RestartTracker {
         self.signal_handler_depth > 0
     }
 
+    fn signal_handler_depth(&self) -> usize {
+        self.signal_handler_depth
+    }
+
     fn request_syscall_restart(&mut self, class: RestartClass) {
         let Some(syscall) = self.current_syscall else {
             return;
@@ -209,6 +213,10 @@ impl Thread {
 
     pub(crate) fn in_signal_handler(&self) -> bool {
         self.restart.lock().in_signal_handler()
+    }
+
+    pub(crate) fn signal_handler_depth(&self) -> usize {
+        self.restart.lock().signal_handler_depth()
     }
 
     pub(crate) fn request_syscall_restart(&self, class: RestartClass) {
