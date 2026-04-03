@@ -920,8 +920,6 @@ dependencies = [
 [[package]]
 name = "axruntime"
 version = "0.3.0-preview.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce5c658dc9a0e283dafb99317ade2bb191d3881b2133ac58da251d03f589f83f"
 dependencies = [
  "axalloc",
  "axbacktrace",
@@ -944,6 +942,7 @@ dependencies = [
  "crate_interface 0.1.4",
  "ctor_bare",
  "indoc",
+ "kernel_guard",
  "percpu",
 ]
 

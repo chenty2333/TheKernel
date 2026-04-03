@@ -104,6 +104,10 @@ impl ClockTimerRuntime {
         Some(key)
     }
 
+    fn next_deadline(&self) -> Option<Duration> {
+        self.wheel.first_key_value().map(|(key, _)| key.deadline)
+    }
+
     fn poll(&mut self, key: &TimerKey, cx: &mut Context<'_>) -> Poll<()> {
         if let Some(waker) = self.wheel.get_mut(key) {
             *waker = cx.waker().clone();
@@ -149,6 +153,9 @@ impl Future for ClockTimerFuture {
 impl Drop for ClockTimerFuture {
     fn drop(&mut self) {
         timer_runtime(self.clock).lock().cancel(&self.key);
+        if self.clock == AlarmClock::Monotonic {
+            update_monotonic_timer_deadline();
+        }
     }
 }
 
@@ -415,6 +422,14 @@ fn ensure_clock_timer_runtime() {
 
 fn wake_clock_timers(clock: AlarmClock) {
     timer_runtime(clock).lock().wake(clock.now());
+    if clock == AlarmClock::Monotonic {
+        update_monotonic_timer_deadline();
+    }
+}
+
+fn update_monotonic_timer_deadline() {
+    let deadline = MONOTONIC_TIMER_RUNTIME.lock().next_deadline();
+    axruntime::set_early_timer_deadline(deadline);
 }
 
 fn register_alarm(clock: AlarmClock, deadline: Duration, action: AlarmAction) {
@@ -490,6 +505,9 @@ where
 pub async fn sleep_until_clock(clock: AlarmClock, deadline: Duration) {
     ensure_clock_timer_runtime();
     let key = timer_runtime(clock).lock().add(clock.now(), deadline);
+    if clock == AlarmClock::Monotonic {
+        update_monotonic_timer_deadline();
+    }
     if let Some(key) = key {
         ClockTimerFuture { clock, key }.await;
     }

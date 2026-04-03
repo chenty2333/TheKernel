@@ -118,9 +118,18 @@ pub fn init_scheduler_secondary() {
 /// For example, advance scheduler states, checks timed events, etc.
 #[cfg(feature = "irq")]
 #[doc(cfg(feature = "irq"))]
+pub fn on_timer_event() {
+    crate::timers::check_events();
+}
+
+/// Handles periodic timer ticks for the task manager.
+///
+/// For example, advance scheduler states, checks timed events, etc.
+#[cfg(feature = "irq")]
+#[doc(cfg(feature = "irq"))]
 pub fn on_timer_tick() {
     use kernel_guard::NoOp;
-    crate::timers::check_events();
+    on_timer_event();
     // Since irq and preemption are both disabled here,
     // we can get current run queue with the default `kernel_guard::NoOp`.
     current_run_queue::<NoOp>().scheduler_timer_tick();
