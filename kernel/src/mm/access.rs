@@ -1,6 +1,7 @@
 use alloc::string::String;
 use core::{
     alloc::Layout,
+    cmp::min,
     ffi::c_char,
     hint::unlikely,
     mem::{MaybeUninit, transmute},
@@ -290,7 +291,33 @@ pub fn vm_load_string(ptr: *const c_char) -> AxResult<String> {
 }
 
 #[allow(dead_code)]
-struct Vm(IrqSave);
+struct Vm;
+
+/// Bound the duration of a single IRQ-masked user-copy operation.
+const USER_COPY_CHUNK: usize = 16 * 1024;
+
+fn copy_user_bytes(mut dst: *mut u8, mut src: *const u8, mut len: usize) -> VmResult {
+    while len != 0 {
+        let chunk = min(len, USER_COPY_CHUNK);
+        let failed_at = {
+            let _irq = IrqSave::new();
+            access_user_memory(|| unsafe { user_copy(dst, src, chunk) })
+        };
+        if unlikely(failed_at != 0) {
+            return Err(VmError::AccessDenied);
+        }
+
+        // SAFETY: `chunk <= len`, and the caller validated the entire range up
+        // front before entering this helper.
+        unsafe {
+            dst = dst.add(chunk);
+            src = src.add(chunk);
+        }
+        len -= chunk;
+    }
+
+    Ok(())
+}
 
 /// Briefly checks if the given memory region is valid user memory.
 pub fn check_access(start: usize, len: usize) -> VmResult {
@@ -306,31 +333,17 @@ pub fn check_access(start: usize, len: usize) -> VmResult {
 #[extern_trait]
 unsafe impl VmIo for Vm {
     fn new() -> Self {
-        Self(IrqSave::new())
+        Self
     }
 
     fn read(&mut self, start: usize, buf: &mut [MaybeUninit<u8>]) -> VmResult {
         check_access(start, buf.len())?;
-        let failed_at = access_user_memory(|| unsafe {
-            user_copy(buf.as_mut_ptr() as *mut _, start as _, buf.len())
-        });
-        if unlikely(failed_at != 0) {
-            Err(VmError::AccessDenied)
-        } else {
-            Ok(())
-        }
+        copy_user_bytes(buf.as_mut_ptr() as *mut _, start as _, buf.len())
     }
 
     fn write(&mut self, start: usize, buf: &[u8]) -> VmResult {
         check_access(start, buf.len())?;
-        let failed_at = access_user_memory(|| unsafe {
-            user_copy(start as _, buf.as_ptr() as *const _, buf.len())
-        });
-        if unlikely(failed_at != 0) {
-            Err(VmError::AccessDenied)
-        } else {
-            Ok(())
-        }
+        copy_user_bytes(start as _, buf.as_ptr() as *const _, buf.len())
     }
 }
 
