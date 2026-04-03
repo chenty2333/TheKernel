@@ -499,6 +499,18 @@ impl AxRunQueue {
         .into_arc();
         // gc task should be pinned to the current CPU.
         gc_task.set_cpumask(AxCpuMask::one_shot(cpu_id));
+        #[cfg(feature = "sched-cfs")]
+        assert!(
+            gc_task.configure(axsched::CfsTaskParams {
+                // GC must preempt fair user threads so exited stacks are reclaimed promptly,
+                // but it should stay below any explicit userspace RT work.
+                class: axsched::CfsTaskClass::Fifo,
+                nice: 0,
+                rt_priority: axsched::RT_PRIORITY_MIN,
+                reset_on_fork: false,
+            }),
+            "invalid gc scheduling state"
+        );
 
         let mut scheduler = Scheduler::new();
         scheduler.add_task(gc_task);
