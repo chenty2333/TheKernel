@@ -663,10 +663,6 @@ fn poll_gc(cx: &mut Context<'_>) -> Poll<()> {
             else {
                 continue;
             };
-            // Exited tasks never run again, so release their kernel stacks as
-            // soon as the GC task sees them rather than waiting for the final
-            // `Arc` to disappear.
-            task.reclaim_exited_kernel_stack();
             match Arc::try_unwrap(task) {
                 Ok(task) => {
                     // If I'm the last holder of the task, drop it immediately.

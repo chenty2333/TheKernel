@@ -408,14 +408,6 @@ impl TaskInner {
         self.ctx.get()
     }
 
-    /// Releases the exited task's kernel stack so it can be reused promptly
-    /// even if the task object itself remains temporarily referenced.
-    pub(crate) fn reclaim_exited_kernel_stack(&self) {
-        debug_assert_eq!(self.state(), TaskState::Exited);
-        let stack = self.kstack.lock().take();
-        drop(stack);
-    }
-
     /// Set the CPU ID where the task is running or will run.
     #[cfg(feature = "smp")]
     #[inline]
