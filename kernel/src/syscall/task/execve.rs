@@ -150,11 +150,9 @@ pub fn sys_execve(
         }
     }
 
-    let new_root = new_aspace.page_table_root();
-    let old_aspace = {
-        let mut aspace = proc_data.aspace.lock();
-        core::mem::replace(&mut *aspace, new_aspace)
-    };
+    let new_aspace = Arc::new(axsync::Mutex::new(new_aspace));
+    let new_root = new_aspace.lock().page_table_root();
+    let old_aspace = proc_data.replace_aspace(new_aspace);
     set_current_user_page_table_root(new_root);
     drop(old_aspace);
     curr.as_thread().set_tid(proc_data.proc.pid());
@@ -189,6 +187,8 @@ pub fn sys_execve(
         fd_table.remove(fd);
     }
     drop(fd_table);
+
+    proc_data.release_vfork();
 
     uctx.set_ip(entry_point.as_usize());
     uctx.set_sp(user_stack_base.as_usize());

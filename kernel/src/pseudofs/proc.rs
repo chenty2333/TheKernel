@@ -236,7 +236,8 @@ impl SimpleDirOps for ThreadDir {
             .into(),
             "maps" => SimpleFile::new_regular(fs, move || {
                 let thr = task.as_thread();
-                let aspace = thr.proc_data.aspace.lock();
+                let aspace_handle = thr.proc_data.aspace();
+                let aspace = aspace_handle.lock();
                 let mut out = String::new();
                 for area in aspace.areas() {
                     if !area.flags().contains(MappingFlags::USER) {

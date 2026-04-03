@@ -259,6 +259,11 @@ struct ExecControlState {
     owner: Option<Pid>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct VforkControlState {
+    parent_tid: Option<Pid>,
+}
+
 /// [`Process`]-shared data.
 pub struct ProcessData {
     /// The process.
@@ -269,7 +274,7 @@ pub struct ProcessData {
     pub cmdline: RwLock<Arc<Vec<String>>>,
     /// The virtual memory address space.
     // TODO: scopify
-    pub aspace: Arc<Mutex<AddrSpace>>,
+    aspace_handle: RwLock<Arc<Mutex<AddrSpace>>>,
     /// The resource scope
     pub scope: RwLock<Scope>,
     /// The user heap top
@@ -308,8 +313,12 @@ pub struct ProcessData {
     job_ctl: SpinNoIrq<JobControlState>,
     /// Multi-thread exec coordination state.
     exec_ctl: SpinNoIrq<ExecControlState>,
+    /// CLONE_VFORK coordination state.
+    vfork_ctl: SpinNoIrq<VforkControlState>,
     /// Woken when threads should resume from stopped state.
     pub stop_event: Arc<PollSet>,
+    /// Woken when a vfork child releases the parent.
+    pub vfork_event: Arc<PollSet>,
 
     /// The network namespace (network stack) for this process.
     pub net_ns: Arc<axnet::NetStack>,
@@ -330,7 +339,7 @@ impl ProcessData {
             proc,
             exe_path: RwLock::new(exe_path),
             cmdline: RwLock::new(cmdline),
-            aspace,
+            aspace_handle: RwLock::new(aspace),
             scope: RwLock::new(Scope::new()),
             heap_top: AtomicUsize::new(crate::config::USER_HEAP_BASE),
 
@@ -355,7 +364,9 @@ impl ProcessData {
 
             job_ctl: SpinNoIrq::new(JobControlState::default()),
             exec_ctl: SpinNoIrq::new(ExecControlState::default()),
+            vfork_ctl: SpinNoIrq::new(VforkControlState::default()),
             stop_event: Arc::default(),
+            vfork_event: Arc::default(),
 
             net_ns,
         })
@@ -364,6 +375,16 @@ impl ProcessData {
     /// Get the top address of the user heap.
     pub fn get_heap_top(&self) -> usize {
         self.heap_top.load(Ordering::Acquire)
+    }
+
+    /// Returns the current address-space handle for this process.
+    pub fn aspace(&self) -> Arc<Mutex<AddrSpace>> {
+        self.aspace_handle.read().clone()
+    }
+
+    /// Rebinds the process to a new address-space handle and returns the old one.
+    pub fn replace_aspace(&self, aspace: Arc<Mutex<AddrSpace>>) -> Arc<Mutex<AddrSpace>> {
+        core::mem::replace(&mut *self.aspace_handle.write(), aspace)
     }
 
     /// Set the top address of the user heap.
@@ -585,6 +606,25 @@ impl ProcessData {
             exec_ctl.owner = None;
             drop(exec_ctl);
             self.exec_event.wake();
+        }
+    }
+
+    /// Marks the process as a vfork child whose parent thread must remain blocked.
+    pub fn begin_vfork(&self, parent_tid: Pid) {
+        self.vfork_ctl.lock().parent_tid = Some(parent_tid);
+    }
+
+    /// Returns whether an active CLONE_VFORK relationship is still blocking the parent.
+    pub fn vfork_in_progress(&self) -> bool {
+        self.vfork_ctl.lock().parent_tid.is_some()
+    }
+
+    /// Releases a blocked vfork parent after execve commits or the last thread exits.
+    pub fn release_vfork(&self) {
+        let mut vfork_ctl = self.vfork_ctl.lock();
+        if vfork_ctl.parent_tid.take().is_some() {
+            drop(vfork_ctl);
+            self.vfork_event.wake();
         }
     }
 }

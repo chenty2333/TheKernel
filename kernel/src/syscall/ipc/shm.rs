@@ -435,7 +435,8 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let pid = proc_data.proc.pid();
-    let mut aspace = proc_data.aspace.lock();
+    let aspace_handle = proc_data.aspace();
+    let mut aspace = aspace_handle.lock();
 
     let start_aligned = memory_addr::align_down_4k(addr);
     let length = shm_inner.page_num * PAGE_SIZE_4K;
@@ -553,7 +554,8 @@ pub fn sys_shmdt(shmaddr: usize) -> AxResult<isize> {
     let mut shm_inner = shm_inner.lock();
     let va_range = shm_inner.get_addr_range(pid).ok_or(AxError::InvalidInput)?;
 
-    let mut aspace = proc_data.aspace.lock();
+    let aspace_handle = proc_data.aspace();
+    let mut aspace = aspace_handle.lock();
     aspace.unmap(va_range.start, va_range.size())?;
 
     let mut shm_manager = SHM_MANAGER.lock();

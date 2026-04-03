@@ -1,9 +1,10 @@
 use alloc::sync::Arc;
+use core::{future::poll_fn, task::Poll};
 
 use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
-use axtask::{AxTaskExt, current, sched_state, spawn_task_with_sched};
+use axtask::{AxTaskExt, current, future::block_on, sched_state, spawn_task_with_sched};
 use bitflags::bitflags;
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::*;
@@ -93,6 +94,20 @@ pub struct CloneArgs {
 }
 
 impl CloneArgs {
+    fn wait_for_vfork(proc_data: &ProcessData) {
+        block_on(poll_fn(|cx| {
+            if !proc_data.vfork_in_progress() {
+                return Poll::Ready(());
+            }
+            proc_data.vfork_event.register(cx.waker());
+            if !proc_data.vfork_in_progress() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }));
+    }
+
     fn validate(&self) -> AxResult<()> {
         let Self {
             flags, exit_signal, ..
@@ -146,7 +161,7 @@ impl CloneArgs {
         self.validate()?;
 
         let Self {
-            mut flags,
+            flags,
             exit_signal,
             stack,
             tls,
@@ -154,11 +169,6 @@ impl CloneArgs {
             child_tid,
             pidfd,
         } = self;
-
-        if flags.contains(CloneFlags::VFORK) {
-            debug!("do_clone: CLONE_VFORK slow path");
-            flags.remove(CloneFlags::VM);
-        }
 
         debug!(
             "do_clone <= flags: {:?}, exit_signal: {}, stack: {:#x}, tls: {:#x}",
@@ -210,7 +220,7 @@ impl CloneArgs {
         let new_proc_data = if flags.contains(CloneFlags::THREAD) {
             new_task
                 .ctx_mut()
-                .set_page_table_root(old_proc_data.aspace.lock().page_table_root());
+                .set_page_table_root(old_proc_data.aspace().lock().page_table_root());
             old_proc_data.clone()
         } else {
             let proc = if flags.contains(CloneFlags::PARENT) {
@@ -221,9 +231,10 @@ impl CloneArgs {
             .fork(tid, exit_signal.map(|signo| signo as u8));
 
             let aspace = if flags.contains(CloneFlags::VM) {
-                old_proc_data.aspace.clone()
+                old_proc_data.aspace()
             } else {
-                let mut aspace = old_proc_data.aspace.lock();
+                let parent_aspace = old_proc_data.aspace();
+                let mut aspace = parent_aspace.lock();
                 let aspace = aspace.try_clone()?;
                 copy_from_kernel(&mut aspace.lock())?;
                 aspace
@@ -308,8 +319,16 @@ impl CloneArgs {
         }
         *new_task.task_ext_mut() = Some(AxTaskExt::from_impl(thr));
 
+        if flags.contains(CloneFlags::VFORK) {
+            new_proc_data.begin_vfork(curr.id().as_u64() as Pid);
+        }
+
         let task = spawn_task_with_sched(new_task, child_sched_state);
         add_task_to_table(&task);
+
+        if flags.contains(CloneFlags::VFORK) {
+            Self::wait_for_vfork(&new_proc_data);
+        }
 
         Ok(tid as _)
     }

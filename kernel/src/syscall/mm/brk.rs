@@ -33,10 +33,10 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
     if new_top_aligned > current_top_aligned {
         let expand_start = VirtAddr::from(initial_heap_end.max(current_top_aligned));
         let expand_size = new_top_aligned.saturating_sub(expand_start.as_usize());
+        let aspace_handle = proc_data.aspace();
 
         if expand_size > 0
-            && proc_data
-                .aspace
+            && aspace_handle
                 .lock()
                 .map(
                     expand_start,
@@ -53,13 +53,10 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
         // Only unmap pages beyond the initially mapped heap region.
         let shrink_start = VirtAddr::from(initial_heap_end.max(new_top_aligned));
         let shrink_size = current_top_aligned.saturating_sub(shrink_start.as_usize());
+        let aspace_handle = proc_data.aspace();
 
         if shrink_size > 0
-            && proc_data
-                .aspace
-                .lock()
-                .unmap(shrink_start, shrink_size)
-                .is_err()
+            && aspace_handle.lock().unmap(shrink_start, shrink_size).is_err()
         {
             return Ok(current_top as isize);
         }

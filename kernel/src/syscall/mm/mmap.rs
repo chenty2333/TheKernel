@@ -226,7 +226,8 @@ pub fn sys_mmap(
     }
 
     let curr = current();
-    let mut aspace = curr.as_thread().proc_data.aspace.lock();
+    let aspace_handle = curr.as_thread().proc_data.aspace();
+    let mut aspace = aspace_handle.lock();
     let permission_flags = MmapProt::from_bits_truncate(prot);
     // TODO: check illegal flags for mmap
     let map_flags = match MmapFlags::from_bits(flags) {
@@ -312,13 +313,7 @@ pub fn sys_mmap(
                 match file.backend()?.clone() {
                     FileBackend::Cached(cache) => {
                         // TODO(mivik): file mmap page size
-                        Backend::new_file(
-                            start,
-                            cache,
-                            file.flags(),
-                            offset,
-                            &curr.as_thread().proc_data.aspace,
-                        )
+                        Backend::new_file(start, cache, file.flags(), offset, &aspace_handle)
                     }
                     FileBackend::Direct(loc) => {
                         let device = loc
@@ -347,7 +342,7 @@ pub fn sys_mmap(
                                 cache,
                                 file.flags(),
                                 offset,
-                                &curr.as_thread().proc_data.aspace,
+                                &aspace_handle,
                             ),
                         }
                     }
@@ -377,7 +372,8 @@ pub fn sys_mmap(
 pub fn sys_munmap(addr: usize, length: usize) -> AxResult<isize> {
     debug!("sys_munmap <= addr: {addr:#x}, length: {length:x}");
     let curr = current();
-    let mut aspace = curr.as_thread().proc_data.aspace.lock();
+    let aspace_handle = curr.as_thread().proc_data.aspace();
+    let mut aspace = aspace_handle.lock();
     let length = align_up_4k(length);
     let start_addr = VirtAddr::from(addr);
     aspace.unmap(start_addr, length)?;
@@ -396,7 +392,8 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> AxResult<isize> {
     }
 
     let curr = current();
-    let mut aspace = curr.as_thread().proc_data.aspace.lock();
+    let aspace_handle = curr.as_thread().proc_data.aspace();
+    let mut aspace = aspace_handle.lock();
     let length = align_up_4k(length);
     let start_addr = VirtAddr::from(addr);
     aspace.protect(start_addr, length, permission_flags.into())?;
@@ -437,7 +434,7 @@ pub fn sys_mremap(
     let old_size = align_up_4k(old_size);
     let new_size = align_up_4k(new_size);
     let curr = current();
-    let aspace_handle = curr.as_thread().proc_data.aspace.clone();
+    let aspace_handle = curr.as_thread().proc_data.aspace();
     let mut aspace = aspace_handle.lock();
 
     if old_size == 0 {
@@ -613,7 +610,8 @@ pub fn sys_msync(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
 
     // Validate the range is mapped.
     let curr = current();
-    let aspace = curr.as_thread().proc_data.aspace.lock();
+    let aspace_handle = curr.as_thread().proc_data.aspace();
+    let aspace = aspace_handle.lock();
     let length = align_up_4k(length);
     if length > 0 && !aspace.can_access_range(VirtAddr::from(addr), length, MappingFlags::empty()) {
         return Err(AxError::NoMemory);
@@ -636,7 +634,8 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
 
     // Validate the range is mapped.
     let curr = current();
-    let aspace = curr.as_thread().proc_data.aspace.lock();
+    let aspace_handle = curr.as_thread().proc_data.aspace();
+    let aspace = aspace_handle.lock();
     let start = VirtAddr::from(addr).align_down_4k();
     let end = VirtAddr::from(addr)
         .checked_add(length)

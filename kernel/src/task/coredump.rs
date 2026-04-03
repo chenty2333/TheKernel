@@ -235,7 +235,8 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
     };
     let path = format!("/tmp/core.{}", pid);
 
-    let aspace = proc_data.aspace.lock();
+    let aspace_handle = proc_data.aspace();
+    let aspace = aspace_handle.lock();
 
     // Collect user-accessible memory areas.
     let areas: alloc::vec::Vec<_> = aspace

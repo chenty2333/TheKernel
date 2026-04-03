@@ -299,6 +299,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
             }
         }
         thr.proc_data.exit_event.wake();
+        thr.proc_data.release_vfork();
 
         crate::syscall::SHM_MANAGER
             .lock()
