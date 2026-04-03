@@ -74,7 +74,7 @@ fn do_futex_wait(
     if !futex
         .wq
         .wait_if(bitset, timeout.map(|it| (it.clock, it.deadline)), || {
-            uaddr.vm_read() == Ok(value)
+            Ok(uaddr.vm_read()? == value)
         })?
     {
         return Err(AxError::WouldBlock);

@@ -15,10 +15,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axsync::Mutex;
-use axtask::{
-    current,
-    future::{block_on, interruptible},
-};
+use axtask::{current, future::block_on};
 use hashbrown::HashMap;
 use kspin::SpinNoIrq;
 use memory_addr::VirtAddr;
@@ -31,12 +28,14 @@ use crate::{
 /// Wait queue used by futex.
 #[derive(Default)]
 pub struct WaitQueue {
+    gate: Mutex<()>,
     queue: SpinNoIrq<VecDeque<Arc<SpinNoIrq<WaiterEntry>>>>,
 }
 
 struct WaiterEntry {
     bitset: u32,
     awakened: bool,
+    queue: usize,
     waker: Option<Waker>,
 }
 
@@ -53,12 +52,17 @@ impl<F> Unpin for WaitFuture<'_, F> {}
 impl<F> Drop for WaitFuture<'_, F> {
     fn drop(&mut self) {
         if let Some(waiter) = self.waiter.take() {
-            self.queue.remove_waiter(&waiter);
+            let queue = waiter.lock().queue;
+            // SAFETY: the waiter's owner is always the live wait queue that
+            // currently contains it. Requeue updates this pointer before
+            // moving the waiter, and a futex entry is not dropped while its
+            // queue still holds waiters.
+            unsafe { &*(queue as *const WaitQueue) }.remove_waiter(&waiter);
         }
     }
 }
 
-impl<F: FnOnce() -> bool> Future for WaitFuture<'_, F> {
+impl<F: FnOnce() -> AxResult<bool>> Future for WaitFuture<'_, F> {
     type Output = AxResult<bool>;
 
     fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -74,7 +78,8 @@ impl<F: FnOnce() -> bool> Future for WaitFuture<'_, F> {
         let Some(condition) = self.condition.take() else {
             return Poll::Pending;
         };
-        if !condition() {
+        let _gate = self.queue.gate.lock();
+        if !condition()? {
             return Poll::Ready(Ok(false));
         }
         if self
@@ -87,6 +92,7 @@ impl<F: FnOnce() -> bool> Future for WaitFuture<'_, F> {
         let waiter = Arc::new(SpinNoIrq::new(WaiterEntry {
             bitset: self.bitset,
             awakened: false,
+            queue: self.queue as *const WaitQueue as usize,
             waker: Some(cx.waker().clone()),
         }));
         self.queue.queue.lock().push_back(waiter.clone());
@@ -101,7 +107,14 @@ impl WaitQueue {
     }
 
     fn remove_waiter(&self, target: &Arc<SpinNoIrq<WaiterEntry>>) {
-        self.queue.lock().retain(|waiter| !Arc::ptr_eq(waiter, target));
+        let _gate = self.gate.lock();
+        self.remove_waiter_locked(target);
+    }
+
+    fn remove_waiter_locked(&self, target: &Arc<SpinNoIrq<WaiterEntry>>) {
+        self.queue
+            .lock()
+            .retain(|waiter| !Arc::ptr_eq(waiter, target));
     }
 
     /// Waits if the given condition is met.
@@ -112,7 +125,7 @@ impl WaitQueue {
         &self,
         bitset: u32,
         timeout: Option<(AlarmClock, Duration)>,
-        condition: impl FnOnce() -> bool,
+        condition: impl FnOnce() -> AxResult<bool>,
     ) -> AxResult<bool> {
         let wait = WaitFuture {
             queue: self,
@@ -139,12 +152,26 @@ impl WaitQueue {
                 wait.await
             }
         };
-        block_on(interruptible(wait))?
+        let curr = current();
+        let mut wait = core::pin::pin!(wait);
+        block_on(poll_fn(|cx| {
+            if let Poll::Ready(result) = wait.as_mut().poll(cx) {
+                return Poll::Ready(result);
+            }
+            if curr.poll_interrupt(cx).is_ready() {
+                return Poll::Ready(Err(AxError::Interrupted));
+            }
+            if let Poll::Ready(result) = wait.as_mut().poll(cx) {
+                return Poll::Ready(result);
+            }
+            Poll::Pending
+        }))
     }
 
     /// Wakes up at most `count` tasks whose bitset intersects with the given
     /// bitmask.
     pub fn wake(&self, count: usize, mask: u32) -> usize {
+        let _gate = self.gate.lock();
         let mut woke = 0;
         self.queue.lock().retain(|waiter| {
             let mut waiter = waiter.lock();
@@ -169,16 +196,80 @@ impl WaitQueue {
 
     /// Requeue at most `count` tasks to the target wait queue.
     pub fn requeue(&self, mut count: usize, target: &WaitQueue) -> usize {
-        let tasks: Vec<_> = {
+        let tasks: Vec<_>;
+        if core::ptr::eq(self, target) {
+            let _gate = self.gate.lock();
             let mut wq = self.queue.lock();
             count = count.min(wq.len());
-            wq.drain(..count).collect()
-        };
+            tasks = wq.drain(..count).collect();
+            for waiter in &tasks {
+                waiter.lock().queue = target as *const WaitQueue as usize;
+            }
+        } else if (self as *const Self as usize) < (target as *const Self as usize) {
+            let _self_gate = self.gate.lock();
+            let _target_gate = target.gate.lock();
+            let mut wq = self.queue.lock();
+            count = count.min(wq.len());
+            tasks = wq.drain(..count).collect();
+            for waiter in &tasks {
+                waiter.lock().queue = target as *const WaitQueue as usize;
+            }
+        } else {
+            let _target_gate = target.gate.lock();
+            let _self_gate = self.gate.lock();
+            let mut wq = self.queue.lock();
+            count = count.min(wq.len());
+            tasks = wq.drain(..count).collect();
+            for waiter in &tasks {
+                waiter.lock().queue = target as *const WaitQueue as usize;
+            }
+        }
         if !tasks.is_empty() {
             let mut wq = target.queue.lock();
             wq.extend(tasks);
         }
         count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::task::{Context, Poll, Waker};
+    use std::sync::Once;
+
+    use super::*;
+
+    static INIT: Once = Once::new();
+
+    fn init_scheduler() {
+        INIT.call_once(axtask::init_scheduler);
+    }
+
+    #[test]
+    fn dropping_requeued_waiter_cleans_target_queue() {
+        init_scheduler();
+
+        let src = WaitQueue::new();
+        let dst = WaitQueue::new();
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut wait = core::pin::pin!(WaitFuture {
+            queue: &src,
+            bitset: u32::MAX,
+            timeout: None,
+            condition: Some(|| Ok(true)),
+            waiter: None,
+        });
+
+        assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(!src.is_empty());
+
+        assert_eq!(src.requeue(1, &dst), 1);
+        assert!(src.is_empty());
+        assert!(!dst.is_empty());
+
+        drop(wait);
+        assert!(dst.is_empty());
     }
 }
 
