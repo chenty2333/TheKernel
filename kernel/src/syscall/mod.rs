@@ -59,7 +59,7 @@ fn restart_class_for_fd_io(fd: i32, direction: SocketIoDirection) -> Option<Rest
 
 fn restart_class_for_futex(uctx: &UserContext) -> Option<RestartClass> {
     let futex_op = uctx.arg1() as u32 & FUTEX_CMD_MASK as u32;
-    if matches!(futex_op, FUTEX_WAIT | FUTEX_WAIT_BITSET) && uctx.arg3() == 0 {
+    if futex_op == FUTEX_WAIT_BITSET || (futex_op == FUTEX_WAIT && uctx.arg3() == 0) {
         Some(RestartClass::Sys)
     } else {
         None
@@ -90,19 +90,11 @@ fn restart_class_for_syscall(sysno: Sysno, uctx: &UserContext) -> Option<Restart
     }
 }
 
-fn maybe_request_syscall_restart(
-    thr: &Thread,
-    sysno: Sysno,
-    uctx: &UserContext,
-    result: &Result<isize, AxError>,
-) {
+fn maybe_request_syscall_restart(thr: &Thread, result: &Result<isize, AxError>) {
     if !matches!(result, Err(AxError::Interrupted)) || !has_pending_syscall_signal(thr) {
         return;
     }
-
-    if let Some(class) = restart_class_for_syscall(sysno, uctx) {
-        thr.request_syscall_restart(class);
-    }
+    thr.request_syscall_restart();
 }
 
 pub fn handle_syscall(uctx: &mut UserContext) {
@@ -115,8 +107,9 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     trace!("Syscall {sysno:?}");
     let curr = current();
     let thr = curr.as_thread();
+    let restart_class = restart_class_for_syscall(sysno, uctx);
     let preserve_restart_state = matches!(sysno, Sysno::rt_sigreturn) || thr.in_signal_handler();
-    thr.enter_syscall(uctx, preserve_restart_state);
+    thr.enter_syscall(uctx, preserve_restart_state, restart_class);
 
     let result = match sysno {
         // fs ctl
@@ -762,7 +755,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             Err(AxError::Unsupported)
         }
     };
-    maybe_request_syscall_restart(thr, sysno, uctx, &result);
+    maybe_request_syscall_restart(thr, &result);
     debug!("Syscall {sysno} return {result:?}");
 
     if thr.take_resume_restored_context() {

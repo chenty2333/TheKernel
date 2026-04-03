@@ -39,6 +39,7 @@ struct RestartState {
 pub(crate) struct RestartTracker {
     signal_handler_depth: usize,
     current_syscall: Option<SavedSyscall>,
+    current_restart_class: Option<RestartClass>,
     restart_states: Vec<RestartState>,
     resume_restored_context: bool,
 }
@@ -107,8 +108,14 @@ impl RestartClass {
 }
 
 impl RestartTracker {
-    fn enter_syscall(&mut self, uctx: &UserContext, preserve_restart_state: bool) {
+    fn enter_syscall(
+        &mut self,
+        uctx: &UserContext,
+        preserve_restart_state: bool,
+        restart_class: Option<RestartClass>,
+    ) {
         self.current_syscall = Some(SavedSyscall::capture(uctx));
+        self.current_restart_class = restart_class;
         if !preserve_restart_state && self.signal_handler_depth == 0 {
             self.restart_states.clear();
             self.resume_restored_context = false;
@@ -123,8 +130,11 @@ impl RestartTracker {
         self.signal_handler_depth
     }
 
-    fn request_syscall_restart(&mut self, class: RestartClass) {
+    fn request_syscall_restart(&mut self) {
         let Some(syscall) = self.current_syscall else {
+            return;
+        };
+        let Some(class) = self.current_restart_class else {
             return;
         };
         self.restart_states.push(RestartState {
@@ -201,14 +211,20 @@ impl RestartTracker {
 
     fn clear_saved_syscall(&mut self) {
         self.current_syscall = None;
+        self.current_restart_class = None;
     }
 }
 
 impl Thread {
-    pub(crate) fn enter_syscall(&self, uctx: &UserContext, preserve_restart_state: bool) {
+    pub(crate) fn enter_syscall(
+        &self,
+        uctx: &UserContext,
+        preserve_restart_state: bool,
+        restart_class: Option<RestartClass>,
+    ) {
         self.restart
             .lock()
-            .enter_syscall(uctx, preserve_restart_state);
+            .enter_syscall(uctx, preserve_restart_state, restart_class);
     }
 
     pub(crate) fn in_signal_handler(&self) -> bool {
@@ -219,8 +235,8 @@ impl Thread {
         self.restart.lock().signal_handler_depth()
     }
 
-    pub(crate) fn request_syscall_restart(&self, class: RestartClass) {
-        self.restart.lock().request_syscall_restart(class);
+    pub(crate) fn request_syscall_restart(&self) {
+        self.restart.lock().request_syscall_restart();
     }
 
     pub(crate) fn finish_signal_delivery(
@@ -299,14 +315,14 @@ mod tests {
         let mut tracker = RestartTracker::default();
         let outer = make_uctx(0x11, 0x3d, 0x1000);
 
-        tracker.enter_syscall(&outer, false);
-        tracker.request_syscall_restart(RestartClass::Sys);
+        tracker.enter_syscall(&outer, false, Some(RestartClass::Sys));
+        tracker.request_syscall_restart();
         tracker.finish_signal_delivery(SignalOSAction::Handler, true);
         assert!(tracker.in_signal_handler());
         assert_eq!(tracker.restart_states.len(), 1);
 
         let handler_syscall = make_uctx(0x20, 0x25, 0x4000);
-        tracker.enter_syscall(&handler_syscall, false);
+        tracker.enter_syscall(&handler_syscall, false, Some(RestartClass::Sys));
         assert_eq!(tracker.restart_states.len(), 1);
 
         let mut restored = outer;
@@ -325,8 +341,8 @@ mod tests {
         let mut tracker = RestartTracker::default();
         let outer = make_uctx(0x11, 0x3d, 0x1000);
 
-        tracker.enter_syscall(&outer, false);
-        tracker.request_syscall_restart(RestartClass::Sys);
+        tracker.enter_syscall(&outer, false, Some(RestartClass::Sys));
+        tracker.request_syscall_restart();
         tracker.finish_signal_delivery(SignalOSAction::Handler, false);
 
         let mut restored = outer;
@@ -344,8 +360,8 @@ mod tests {
         let mut tracker = RestartTracker::default();
         let outer = make_uctx(0x11, 0x3d, 0x1000);
 
-        tracker.enter_syscall(&outer, false);
-        tracker.request_syscall_restart(RestartClass::Sys);
+        tracker.enter_syscall(&outer, false, Some(RestartClass::Sys));
+        tracker.request_syscall_restart();
         tracker.finish_signal_delivery(SignalOSAction::Continue, false);
 
         let mut resumed = outer;
