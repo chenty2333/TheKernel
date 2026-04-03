@@ -1,9 +1,11 @@
 use alloc::vec::Vec;
+use core::time::Duration;
 
 use axhal::uspace::UserContext;
 use starry_signal::SignalOSAction;
+use syscalls::Sysno;
 
-use super::Thread;
+use super::{AlarmClock, Thread};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -22,6 +24,38 @@ struct SavedSyscall {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct FutexWaitRestart {
+    pub uaddr: usize,
+    pub expected: u32,
+    pub bitset: u32,
+    pub deadline: Duration,
+    pub clock: AlarmClock,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum RestartBlock {
+    FutexWait(FutexWaitRestart),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RestartActionKind {
+    Replay,
+    RestartBlock(RestartBlock),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RestartAction {
+    syscall: SavedSyscall,
+    kind: RestartActionKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingRestart {
+    class: RestartClass,
+    action: RestartAction,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum RestartDecision {
     Pending,
     Restart,
@@ -30,7 +64,7 @@ enum RestartDecision {
 
 #[derive(Debug, Clone, Copy)]
 struct RestartState {
-    syscall: SavedSyscall,
+    action: RestartAction,
     class: RestartClass,
     decision: RestartDecision,
 }
@@ -38,8 +72,8 @@ struct RestartState {
 #[derive(Debug, Default)]
 pub(crate) struct RestartTracker {
     signal_handler_depth: usize,
-    current_syscall: Option<SavedSyscall>,
-    current_restart_class: Option<RestartClass>,
+    current_restart: Option<PendingRestart>,
+    armed_restart_block: Option<RestartBlock>,
     restart_states: Vec<RestartState>,
     resume_restored_context: bool,
 }
@@ -78,8 +112,35 @@ impl SavedSyscall {
         uctx.set_ip(self.restart_ip);
     }
 
+    fn restore_restart_syscall(self, uctx: &mut UserContext) {
+        uctx.set_sysno(Sysno::restart_syscall as usize);
+        uctx.set_arg0(0);
+        uctx.set_arg1(0);
+        uctx.set_arg2(0);
+        uctx.set_arg3(0);
+        uctx.set_arg4(0);
+        uctx.set_arg5(0);
+        uctx.set_ip(self.restart_ip);
+    }
+
     fn matches_return_context(self, uctx: &UserContext) -> bool {
         uctx.ip() == self.return_ip
+    }
+}
+
+impl RestartAction {
+    fn matches_return_context(self, uctx: &UserContext) -> bool {
+        self.syscall.matches_return_context(uctx)
+    }
+
+    fn restore(self, tracker: &mut RestartTracker, uctx: &mut UserContext) {
+        match self.kind {
+            RestartActionKind::Replay => self.syscall.restore(uctx),
+            RestartActionKind::RestartBlock(block) => {
+                tracker.armed_restart_block = Some(block);
+                self.syscall.restore_restart_syscall(uctx);
+            }
+        }
     }
 }
 
@@ -114,8 +175,17 @@ impl RestartTracker {
         preserve_restart_state: bool,
         restart_class: Option<RestartClass>,
     ) {
-        self.current_syscall = Some(SavedSyscall::capture(uctx));
-        self.current_restart_class = restart_class;
+        let syscall = SavedSyscall::capture(uctx);
+        self.current_restart = restart_class.map(|class| PendingRestart {
+            class,
+            action: RestartAction {
+                syscall,
+                kind: RestartActionKind::Replay,
+            },
+        });
+        if uctx.sysno() != Sysno::restart_syscall as usize {
+            self.armed_restart_block = None;
+        }
         if !preserve_restart_state && self.signal_handler_depth == 0 {
             self.restart_states.clear();
             self.resume_restored_context = false;
@@ -130,16 +200,32 @@ impl RestartTracker {
         self.signal_handler_depth
     }
 
-    fn request_syscall_restart(&mut self) {
-        let Some(syscall) = self.current_syscall else {
+    fn install_restart_block(&mut self, block: RestartBlock) {
+        let Some(restart) = self.current_restart.as_mut() else {
             return;
         };
-        let Some(class) = self.current_restart_class else {
+        restart.action.kind = RestartActionKind::RestartBlock(block);
+    }
+
+    fn begin_restart_syscall(&mut self, uctx: &UserContext) -> Option<RestartBlock> {
+        let block = self.armed_restart_block.take()?;
+        self.current_restart = Some(PendingRestart {
+            class: RestartClass::Sys,
+            action: RestartAction {
+                syscall: SavedSyscall::capture(uctx),
+                kind: RestartActionKind::RestartBlock(block),
+            },
+        });
+        Some(block)
+    }
+
+    fn request_syscall_restart(&mut self) {
+        let Some(restart) = self.current_restart else {
             return;
         };
         self.restart_states.push(RestartState {
-            syscall,
-            class,
+            action: restart.action,
+            class: restart.class,
             decision: RestartDecision::Pending,
         });
     }
@@ -172,13 +258,13 @@ impl RestartTracker {
         let Some(state) = self.restart_states.last().copied() else {
             return;
         };
-        if !state.syscall.matches_return_context(uctx) {
+        if !state.action.matches_return_context(uctx) {
             return;
         }
 
         let state = self.restart_states.pop().unwrap();
         if state.decision == RestartDecision::Restart {
-            state.syscall.restore(uctx);
+            state.action.restore(self, uctx);
         }
     }
 
@@ -194,13 +280,13 @@ impl RestartTracker {
         let Some(state) = self.restart_states.last().copied() else {
             return;
         };
-        if !state.syscall.matches_return_context(uctx) {
+        if !state.action.matches_return_context(uctx) {
             return;
         }
 
         let state = self.restart_states.pop().unwrap();
         if state.decision == RestartDecision::Restart {
-            state.syscall.restore(uctx);
+            state.action.restore(self, uctx);
             self.resume_restored_context = true;
         }
     }
@@ -210,8 +296,7 @@ impl RestartTracker {
     }
 
     fn clear_saved_syscall(&mut self) {
-        self.current_syscall = None;
-        self.current_restart_class = None;
+        self.current_restart = None;
     }
 }
 
@@ -237,6 +322,14 @@ impl Thread {
 
     pub(crate) fn request_syscall_restart(&self) {
         self.restart.lock().request_syscall_restart();
+    }
+
+    pub(crate) fn install_restart_block(&self, block: RestartBlock) {
+        self.restart.lock().install_restart_block(block);
+    }
+
+    pub(crate) fn begin_restart_syscall(&self, uctx: &UserContext) -> Option<RestartBlock> {
+        self.restart.lock().begin_restart_syscall(uctx)
     }
 
     pub(crate) fn finish_signal_delivery(
@@ -270,6 +363,7 @@ impl Thread {
 mod tests {
     use axhal::uspace::UserContext;
     use memory_addr::VirtAddr;
+    use syscalls::Sysno;
 
     use super::*;
 
@@ -372,5 +466,56 @@ mod tests {
         assert_eq!(resumed.arg1(), 0x22);
         assert_eq!(resumed.ip(), 0x1000 - SYSCALL_INSN_LEN);
         assert!(tracker.restart_states.is_empty());
+    }
+
+    #[test]
+    fn restart_block_sigreturn_restores_restart_syscall_and_arms_block() {
+        let mut tracker = RestartTracker::default();
+        let outer = make_uctx(0x11, Sysno::futex as usize, 0x1000);
+        let block = RestartBlock::FutexWait(FutexWaitRestart {
+            uaddr: 0x1234,
+            expected: 7,
+            bitset: u32::MAX,
+            deadline: Duration::from_millis(200),
+            clock: AlarmClock::Monotonic,
+        });
+
+        tracker.enter_syscall(&outer, false, Some(RestartClass::Sys));
+        tracker.install_restart_block(block);
+        tracker.request_syscall_restart();
+        tracker.finish_signal_delivery(SignalOSAction::Handler, true);
+
+        let mut restored = outer;
+        tracker.complete_sigreturn(&mut restored);
+
+        assert_eq!(restored.sysno(), Sysno::restart_syscall as usize);
+        assert_eq!(restored.ip(), 0x1000 - SYSCALL_INSN_LEN);
+        assert_eq!(tracker.armed_restart_block, Some(block));
+        assert!(tracker.take_resume_restored_context());
+    }
+
+    #[test]
+    fn begin_restart_syscall_rearms_restart_block_after_another_interrupt() {
+        let mut tracker = RestartTracker::default();
+        let block = RestartBlock::FutexWait(FutexWaitRestart {
+            uaddr: 0x1234,
+            expected: 7,
+            bitset: u32::MAX,
+            deadline: Duration::from_millis(200),
+            clock: AlarmClock::Monotonic,
+        });
+        tracker.armed_restart_block = Some(block);
+
+        let restart = make_uctx(0, Sysno::restart_syscall as usize, 0x2000);
+        assert_eq!(tracker.begin_restart_syscall(&restart), Some(block));
+        tracker.request_syscall_restart();
+        tracker.finish_signal_delivery(SignalOSAction::Continue, false);
+
+        let mut resumed = restart;
+        tracker.finish_signal_resume(&mut resumed);
+
+        assert_eq!(resumed.sysno(), Sysno::restart_syscall as usize);
+        assert_eq!(resumed.ip(), 0x2000 - SYSCALL_INSN_LEN);
+        assert_eq!(tracker.armed_restart_block, Some(block));
     }
 }

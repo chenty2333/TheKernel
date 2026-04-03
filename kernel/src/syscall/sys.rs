@@ -4,13 +4,19 @@ use core::ffi::c_char;
 use axconfig::ARCH;
 use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
+use axhal::uspace::UserContext;
+use axtask::current;
 use linux_raw_sys::{
     general::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM},
     system::{new_utsname, sysinfo},
 };
 use starry_vm::{VmMutPtr, vm_write_slice};
 
-use crate::{mm::system_memory_stats, task::processes};
+use super::sync::restart_futex_wait;
+use crate::{
+    mm::system_memory_stats,
+    task::{AsThread, RestartBlock, processes},
+};
 
 pub fn sys_getuid() -> AxResult<isize> {
     Ok(0)
@@ -127,6 +133,17 @@ pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> AxResult<isize> {
 pub fn sys_seccomp(_op: u32, _flags: u32, _args: *const ()) -> AxResult<isize> {
     warn!("dummy sys_seccomp");
     Ok(0)
+}
+
+pub fn sys_restart_syscall(uctx: &UserContext) -> AxResult<isize> {
+    let curr = current();
+    let thr = curr.as_thread();
+    let Some(block) = thr.begin_restart_syscall(uctx) else {
+        return Err(AxError::InvalidInput);
+    };
+    match block {
+        RestartBlock::FutexWait(block) => restart_futex_wait(block),
+    }
 }
 
 #[cfg(target_arch = "riscv64")]

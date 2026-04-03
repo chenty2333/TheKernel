@@ -6,18 +6,19 @@ use alloc::{
     vec::Vec,
 };
 use core::{
-    future::poll_fn,
+    future::{Future, poll_fn},
     ops::Deref,
+    pin::Pin,
     sync::atomic::AtomicBool,
     task::{Poll, Waker},
     time::Duration,
 };
 
-use axerrno::AxResult;
+use axerrno::{AxError, AxResult};
 use axsync::Mutex;
 use axtask::{
     current,
-    future::{self, block_on, interruptible},
+    future::{block_on, interruptible},
 };
 use hashbrown::HashMap;
 use kspin::SpinNoIrq;
@@ -25,7 +26,7 @@ use memory_addr::VirtAddr;
 
 use crate::{
     mm::{AddrSpace, Backend, SharedPages},
-    task::AsThread,
+    task::{AlarmClock, AsThread, sleep_until_clock},
 };
 
 /// Wait queue used by futex.
@@ -46,26 +47,44 @@ impl WaitQueue {
     pub fn wait_if(
         &self,
         bitset: u32,
-        timeout: Option<Duration>,
+        timeout: Option<(AlarmClock, Duration)>,
         condition: impl FnOnce() -> bool,
     ) -> AxResult<bool> {
         let mut condition = Some(condition);
-        block_on(interruptible(future::timeout(
-            timeout,
-            poll_fn(|cx| {
-                if let Some(cond) = condition.take() {
-                    let mut queue = self.queue.lock();
-                    if !cond() {
-                        Poll::Ready(Ok(false))
-                    } else {
-                        queue.push_back((cx.waker().clone(), bitset));
-                        Poll::Pending
-                    }
+        let wait = poll_fn(|cx| {
+            if let Some(cond) = condition.take() {
+                let mut queue = self.queue.lock();
+                if !cond() {
+                    Poll::Ready(Ok(false))
+                } else if timeout.is_some_and(|(clock, deadline)| clock.now() >= deadline) {
+                    Poll::Ready(Err(AxError::TimedOut))
                 } else {
-                    Poll::Ready(Ok(true))
+                    queue.push_back((cx.waker().clone(), bitset));
+                    Poll::Pending
                 }
-            }),
-        )))??
+            } else {
+                Poll::Ready(Ok(true))
+            }
+        });
+        let wait = async {
+            if let Some((clock, deadline)) = timeout {
+                let mut wait = core::pin::pin!(wait);
+                let mut sleeper = core::pin::pin!(sleep_until_clock(clock, deadline));
+                poll_fn(|cx| {
+                    if let Poll::Ready(result) = Pin::new(&mut wait).poll(cx) {
+                        return Poll::Ready(result);
+                    }
+                    if Pin::new(&mut sleeper).poll(cx).is_ready() {
+                        return Poll::Ready(Err(AxError::TimedOut));
+                    }
+                    Poll::Pending
+                })
+                .await
+            } else {
+                wait.await
+            }
+        };
+        block_on(interruptible(wait))?
     }
 
     /// Wakes up at most `count` tasks whose bitset intersects with the given

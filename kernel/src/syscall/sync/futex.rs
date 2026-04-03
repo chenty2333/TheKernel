@@ -1,7 +1,6 @@
-use core::sync::atomic::Ordering;
+use core::{sync::atomic::Ordering, time::Duration};
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axhal::time::{monotonic_time, wall_time};
 use axtask::current;
 use linux_raw_sys::general::{
     FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_REQUEUE, FUTEX_WAIT,
@@ -10,9 +9,18 @@ use linux_raw_sys::general::{
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
-    task::{AsThread, FutexKey, futex_table_for, get_visible_task},
+    task::{
+        AlarmClock, AsThread, FutexKey, FutexWaitRestart, RestartBlock, futex_table_for,
+        get_visible_task,
+    },
     time::TimeValueLike,
 };
+
+#[derive(Clone, Copy)]
+struct FutexWaitDeadline {
+    clock: AlarmClock,
+    deadline: Duration,
+}
 
 fn assert_unsigned(value: u32) -> AxResult<u32> {
     if (value as i32) < 0 {
@@ -20,6 +28,75 @@ fn assert_unsigned(value: u32) -> AxResult<u32> {
     } else {
         Ok(value)
     }
+}
+
+fn futex_wait_clock(futex_op: u32) -> AlarmClock {
+    if futex_op & FUTEX_CLOCK_REALTIME != 0 {
+        AlarmClock::Realtime
+    } else {
+        AlarmClock::Monotonic
+    }
+}
+
+fn futex_wait_deadline(
+    command: u32,
+    futex_op: u32,
+    timeout: *const timespec,
+) -> AxResult<Option<FutexWaitDeadline>> {
+    let Some(ts) = timeout.nullable() else {
+        return Ok(None);
+    };
+    // FIXME: AnyBitPattern
+    let ts = unsafe { ts.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
+    let clock = futex_wait_clock(futex_op);
+    let deadline = if command == FUTEX_WAIT_BITSET {
+        ts
+    } else {
+        clock.now().checked_add(ts).unwrap_or(Duration::MAX)
+    };
+    Ok(Some(FutexWaitDeadline { clock, deadline }))
+}
+
+fn do_futex_wait(
+    uaddr: *const u32,
+    value: u32,
+    bitset: u32,
+    timeout: Option<FutexWaitDeadline>,
+) -> AxResult<isize> {
+    if uaddr.vm_read()? != value {
+        return Err(AxError::WouldBlock);
+    }
+
+    let key = FutexKey::new_current(uaddr.addr());
+    let futex_table = futex_table_for(&key);
+    let futex = futex_table.get_or_insert(&key);
+
+    if !futex
+        .wq
+        .wait_if(bitset, timeout.map(|it| (it.clock, it.deadline)), || {
+            uaddr.vm_read() == Ok(value)
+        })?
+    {
+        return Err(AxError::WouldBlock);
+    }
+
+    if futex.owner_dead.swap(false, Ordering::SeqCst) {
+        Err(AxError::from(LinuxError::EOWNERDEAD))
+    } else {
+        Ok(0)
+    }
+}
+
+pub(crate) fn restart_futex_wait(block: FutexWaitRestart) -> AxResult<isize> {
+    do_futex_wait(
+        block.uaddr as *const u32,
+        block.expected,
+        block.bitset,
+        Some(FutexWaitDeadline {
+            clock: block.clock,
+            deadline: block.deadline,
+        }),
+    )
 }
 
 pub fn sys_futex(
@@ -37,57 +114,30 @@ pub fn sys_futex(
 
     let key = FutexKey::new_current(uaddr.addr());
 
-    let futex_table = futex_table_for(&key);
-
     let command = futex_op & (FUTEX_CMD_MASK as u32);
     match command {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
-            // Fast path
-            if uaddr.vm_read()? != value {
-                return Err(AxError::WouldBlock);
-            }
-
-            let timeout = if let Some(ts) = timeout.nullable() {
-                // FIXME: AnyBitPattern
-                let ts = unsafe { ts.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
-                Some(if command == FUTEX_WAIT_BITSET {
-                    // FUTEX_WAIT_BITSET timeouts are absolute against CLOCK_MONOTONIC
-                    // unless FUTEX_CLOCK_REALTIME is requested.
-                    let now = if futex_op & FUTEX_CLOCK_REALTIME != 0 {
-                        wall_time()
-                    } else {
-                        monotonic_time()
-                    };
-                    ts.saturating_sub(now)
-                } else {
-                    ts
-                })
-            } else {
-                None
-            };
-
-            let futex = futex_table.get_or_insert(&key);
-
             let bitset = if command == FUTEX_WAIT_BITSET {
                 value3
             } else {
                 u32::MAX
             };
-
-            if !futex
-                .wq
-                .wait_if(bitset, timeout, || uaddr.vm_read() == Ok(value))?
-            {
-                return Err(AxError::WouldBlock);
+            let timeout = futex_wait_deadline(command, futex_op, timeout)?;
+            if let Some(timeout) = timeout {
+                current()
+                    .as_thread()
+                    .install_restart_block(RestartBlock::FutexWait(FutexWaitRestart {
+                        uaddr: uaddr.addr(),
+                        expected: value,
+                        bitset,
+                        deadline: timeout.deadline,
+                        clock: timeout.clock,
+                    }));
             }
-
-            if futex.owner_dead.swap(false, Ordering::SeqCst) {
-                Err(AxError::from(LinuxError::EOWNERDEAD))
-            } else {
-                Ok(0)
-            }
+            do_futex_wait(uaddr, value, bitset, timeout)
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            let futex_table = futex_table_for(&key);
             let futex = futex_table.get(&key);
             let mut count = 0;
             if let Some(futex) = futex {
@@ -108,6 +158,7 @@ pub fn sys_futex(
             }
             let value2 = assert_unsigned(timeout.addr() as u32)?;
 
+            let futex_table = futex_table_for(&key);
             let futex = futex_table.get(&key);
             let key2 = FutexKey::new_current(uaddr2.addr());
             let table2 = futex_table_for(&key2);
