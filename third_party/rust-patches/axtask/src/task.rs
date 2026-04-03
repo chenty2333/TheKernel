@@ -483,7 +483,6 @@ impl StackCache {
 static STACK_CACHE: SpinNoIrq<StackCache> = SpinNoIrq::new(StackCache::new());
 
 impl TaskStack {
-    const MAX_CACHED_STACKS_PER_LAYOUT: usize = 16;
     const MAX_CACHED_STACK_BYTES: usize = 16 * 1024 * 1024;
 
     pub fn alloc(size: usize) -> Self {
@@ -526,7 +525,10 @@ impl TaskStack {
         let over_budget =
             cache.cached_bytes > Self::MAX_CACHED_STACK_BYTES.saturating_sub(layout.size());
         let stacks = cache.stacks.entry(key).or_default();
-        if stacks.len() >= Self::MAX_CACHED_STACKS_PER_LAYOUT || over_budget {
+        // The byte budget is the real bound; a small per-layout count cap only
+        // forces allocator churn for bursty workloads that repeatedly create
+        // many same-sized tasks (for example, short-lived thread pools).
+        if over_budget {
             return Err(TaskStack { ptr, layout });
         }
         stacks.push(CachedStackPtr(ptr));
