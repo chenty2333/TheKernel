@@ -59,7 +59,7 @@ fn restart_class_for_fd_io(fd: i32, direction: SocketIoDirection) -> Option<Rest
 
 fn restart_class_for_futex(uctx: &UserContext) -> Option<RestartClass> {
     let futex_op = uctx.arg1() as u32 & FUTEX_CMD_MASK as u32;
-    if futex_op == FUTEX_WAIT_BITSET || (futex_op == FUTEX_WAIT && uctx.arg3() == 0) {
+    if matches!(futex_op, FUTEX_WAIT | FUTEX_WAIT_BITSET) {
         Some(RestartClass::Sys)
     } else {
         None
@@ -112,6 +112,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     thr.enter_syscall(uctx, preserve_restart_state, restart_class);
 
     let result = match sysno {
+        Sysno::restart_syscall => sys_restart_syscall(uctx),
         // fs ctl
         Sysno::ioctl => sys_ioctl(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         Sysno::chdir => sys_chdir(uctx.arg0() as _),
