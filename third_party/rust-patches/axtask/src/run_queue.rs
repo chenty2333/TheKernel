@@ -502,11 +502,12 @@ impl AxRunQueue {
         #[cfg(feature = "sched-cfs")]
         assert!(
             gc_task.configure(axsched::CfsTaskParams {
-                // GC must preempt fair user threads so exited stacks are reclaimed promptly,
-                // but it should stay below any explicit userspace RT work.
-                class: axsched::CfsTaskClass::Fifo,
-                nice: 0,
-                rt_priority: axsched::RT_PRIORITY_MIN,
+                // Keep GC in the fair queue so thread-exit wakeups can hand control
+                // straight back to the joiner. The stack cache already bounds the
+                // short-term reclamation cost, so GC does not need RT priority.
+                class: axsched::CfsTaskClass::Batch,
+                nice: 19,
+                rt_priority: 0,
                 reset_on_fork: false,
             }),
             "invalid gc scheduling state"
