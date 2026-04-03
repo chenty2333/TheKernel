@@ -2,7 +2,7 @@ use alloc::{borrow::ToOwned, fmt, string::String};
 
 use axerrno::AxResult;
 use axtask::{AxTaskRef, TaskState, sched_state};
-use linux_raw_sys::general::{SCHED_BATCH, SCHED_IDLE, SCHED_NORMAL};
+use linux_raw_sys::general::{SCHED_BATCH, SCHED_FIFO, SCHED_IDLE, SCHED_NORMAL, SCHED_RR};
 use starry_signal::Signo;
 
 use crate::task::AsThread;
@@ -92,10 +92,22 @@ impl TaskStat {
         let self_usage = proc_data.self_usage();
         let child_usage = proc_data.children_usage();
         let sched = sched_state(task);
-        let policy = match sched.class {
-            axtask::SchedClass::Normal => SCHED_NORMAL as u32,
-            axtask::SchedClass::Batch => SCHED_BATCH as u32,
-            axtask::SchedClass::Idle => SCHED_IDLE as u32,
+        let (policy, priority, nice, rt_priority) = match sched.class {
+            axtask::SchedClass::Normal => (SCHED_NORMAL as u32, sched.nice as i32 + 20, sched.nice as i32, 0),
+            axtask::SchedClass::Batch => (SCHED_BATCH as u32, sched.nice as i32 + 20, sched.nice as i32, 0),
+            axtask::SchedClass::Idle => (SCHED_IDLE as u32, sched.nice as i32 + 20, sched.nice as i32, 0),
+            axtask::SchedClass::Fifo => (
+                SCHED_FIFO as u32,
+                -(sched.rt_priority as i32) - 1,
+                0,
+                sched.rt_priority as u32,
+            ),
+            axtask::SchedClass::RoundRobin => (
+                SCHED_RR as u32,
+                -(sched.rt_priority as i32) - 1,
+                0,
+                sched.rt_priority as u32,
+            ),
         };
         Ok(Self {
             pid,
@@ -108,10 +120,11 @@ impl TaskStat {
             stime: self_usage.stime_ticks(),
             cutime: child_usage.utime_ticks(),
             cstime: child_usage.stime_ticks(),
-            priority: sched.nice as i32 + 20,
-            nice: sched.nice as i32,
+            priority,
+            nice,
             num_threads: proc.threads().len() as u32,
             exit_signal: proc.exit_signal().unwrap_or(Signo::SIGCHLD as u8),
+            rt_priority,
             policy,
             exit_code: proc.exit_code(),
             ..Default::default()

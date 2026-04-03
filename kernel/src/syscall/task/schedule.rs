@@ -1,9 +1,10 @@
 use core::{mem::size_of, time::Duration};
 
 use axerrno::{AxError, AxResult};
-use axhal::time::TimeValue;
+use axhal::time::{NANOS_PER_SEC, TimeValue};
 use axtask::{
-    AxCpuMask, AxTaskRef, SchedClass, SchedState, current,
+    AxCpuMask, AxTaskRef, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN, SchedClass,
+    SchedState, current,
     future::{block_on, interruptible},
     sched_state, set_sched_state,
 };
@@ -55,14 +56,20 @@ fn sched_class_from_policy(policy: i32) -> AxResult<SchedClass> {
         SCHED_NORMAL => Ok(SchedClass::Normal),
         SCHED_BATCH => Ok(SchedClass::Batch),
         SCHED_IDLE => Ok(SchedClass::Idle),
-        SCHED_FIFO | SCHED_RR | SCHED_DEADLINE => Err(AxError::InvalidInput),
+        SCHED_FIFO => Ok(SchedClass::Fifo),
+        SCHED_RR => Ok(SchedClass::RoundRobin),
+        SCHED_DEADLINE => Err(AxError::InvalidInput),
         _ => Err(AxError::InvalidInput),
     }
 }
 
-fn validate_static_priority(priority: i32) -> AxResult<()> {
-    if priority == 0 {
-        Ok(())
+fn validate_static_priority(priority: i32) -> AxResult<u8> {
+    if priority == 0 { Ok(0) } else { Err(AxError::InvalidInput) }
+}
+
+fn validate_rt_priority(priority: i32) -> AxResult<u8> {
+    if (RT_PRIORITY_MIN as i32..=RT_PRIORITY_MAX as i32).contains(&priority) {
+        Ok(priority as u8)
     } else {
         Err(AxError::InvalidInput)
     }
@@ -81,12 +88,28 @@ fn linux_policy_from_state(state: SchedState) -> i32 {
         SchedClass::Normal => SCHED_NORMAL as i32,
         SchedClass::Batch => SCHED_BATCH as i32,
         SchedClass::Idle => SCHED_IDLE as i32,
+        SchedClass::Fifo => SCHED_FIFO as i32,
+        SchedClass::RoundRobin => SCHED_RR as i32,
     };
 
     if state.reset_on_fork {
         base | SCHED_RESET_ON_FORK as i32
     } else {
         base
+    }
+}
+
+fn state_static_priority(state: SchedState) -> i32 {
+    match state.class {
+        SchedClass::Fifo | SchedClass::RoundRobin => state.rt_priority as i32,
+        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => 0,
+    }
+}
+
+fn state_nice(state: SchedState) -> i32 {
+    match state.class {
+        SchedClass::Fifo | SchedClass::RoundRobin => 0,
+        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => state.nice as i32,
     }
 }
 
@@ -105,12 +128,44 @@ fn apply_sched_state(task: &AxTaskRef, state: SchedState) -> AxResult<isize> {
 fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult<isize> {
     let reset_on_fork = policy & SCHED_RESET_ON_FORK as i32 != 0;
     let class = sched_class_from_policy(policy & !(SCHED_RESET_ON_FORK as i32))?;
-    validate_static_priority(priority)?;
-
     let mut state = sched_state(task);
     state.class = class;
+    match class {
+        SchedClass::Fifo | SchedClass::RoundRobin => {
+            state.rt_priority = validate_rt_priority(priority)?;
+            state.nice = 0;
+        }
+        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
+            state.rt_priority = validate_static_priority(priority)?;
+            if matches!(class, SchedClass::Idle) {
+                state.nice = 19;
+            }
+        }
+    }
     state.reset_on_fork = reset_on_fork;
     apply_sched_state(task, state)
+}
+
+fn update_sched_param(task: &AxTaskRef, priority: i32) -> AxResult<isize> {
+    let mut state = sched_state(task);
+    match state.class {
+        SchedClass::Fifo | SchedClass::RoundRobin => {
+            state.rt_priority = validate_rt_priority(priority)?;
+        }
+        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
+            validate_static_priority(priority)?;
+            state.rt_priority = 0;
+        }
+    }
+    apply_sched_state(task, state)
+}
+
+fn linux_priority_bounds(policy: i32) -> AxResult<(isize, isize)> {
+    match policy as u32 {
+        SCHED_FIFO | SCHED_RR => Ok((RT_PRIORITY_MIN as isize, RT_PRIORITY_MAX as isize)),
+        SCHED_NORMAL | SCHED_BATCH | SCHED_IDLE => Ok((0, 0)),
+        _ => Err(AxError::InvalidInput),
+    }
 }
 
 fn min_nice_for_threads<I>(threads: I) -> AxResult<i8>
@@ -260,6 +315,12 @@ pub fn sys_sched_getscheduler(pid: i32) -> AxResult<isize> {
     Ok(linux_policy_from_state(sched_state(&task)) as isize)
 }
 
+pub fn sys_sched_setparam(pid: i32, param: *const SchedParam) -> AxResult<isize> {
+    let priority = unsafe { param.vm_read_uninit()?.assume_init() }.sched_priority;
+    let task = sched_target(pid)?;
+    update_sched_param(&task, priority)
+}
+
 pub fn sys_sched_setscheduler(pid: i32, policy: i32, param: *const SchedParam) -> AxResult<isize> {
     let priority = unsafe { param.vm_read_uninit()?.assume_init() }.sched_priority;
     let task = sched_target(pid)?;
@@ -267,8 +328,27 @@ pub fn sys_sched_setscheduler(pid: i32, policy: i32, param: *const SchedParam) -
 }
 
 pub fn sys_sched_getparam(pid: i32, param: *mut SchedParam) -> AxResult<isize> {
+    let task = sched_target(pid)?;
+    param.vm_write(SchedParam {
+        sched_priority: state_static_priority(sched_state(&task)),
+    })?;
+    Ok(0)
+}
+
+pub fn sys_sched_get_priority_max(policy: i32) -> AxResult<isize> {
+    Ok(linux_priority_bounds(policy)?.1)
+}
+
+pub fn sys_sched_get_priority_min(policy: i32) -> AxResult<isize> {
+    Ok(linux_priority_bounds(policy)?.0)
+}
+
+pub fn sys_sched_rr_get_interval(pid: i32, interval: *mut timespec) -> AxResult<isize> {
     let _ = sched_target(pid)?;
-    param.vm_write(SchedParam { sched_priority: 0 })?;
+    let rr_quantum = Duration::from_nanos(
+        RR_TIMESLICE_TICKS as u64 * (NANOS_PER_SEC / axconfig::TICKS_PER_SEC as u64),
+    );
+    interval.vm_write(timespec::from_time_value(rr_quantum))?;
     Ok(0)
 }
 
@@ -291,12 +371,19 @@ pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResu
     }
 
     let class = sched_class_from_policy(attr.sched_policy as i32)?;
-    validate_static_priority(attr.sched_priority as i32)?;
-
     let task = sched_target(pid)?;
     let mut state = sched_state(&task);
     state.class = class;
-    state.nice = validate_nice(attr.sched_nice)?;
+    match class {
+        SchedClass::Fifo | SchedClass::RoundRobin => {
+            state.rt_priority = validate_rt_priority(attr.sched_priority as i32)?;
+            state.nice = 0;
+        }
+        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
+            state.rt_priority = validate_static_priority(attr.sched_priority as i32)?;
+            state.nice = validate_nice(attr.sched_nice)?;
+        }
+    }
     state.reset_on_fork = attr.sched_flags & SUPPORTED_SCHED_ATTR_FLAGS != 0;
     apply_sched_state(&task, state)
 }
@@ -321,8 +408,8 @@ pub fn sys_sched_getattr(pid: i32, attr: *mut SchedAttr, size: u32, flags: u32) 
         } else {
             0
         },
-        sched_nice: state.nice as i32,
-        sched_priority: 0,
+        sched_nice: state_nice(state),
+        sched_priority: state_static_priority(state) as u32,
         sched_runtime: 0,
         sched_deadline: 0,
         sched_period: 0,

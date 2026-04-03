@@ -4,7 +4,7 @@ use core::{future::poll_fn, task::Poll};
 use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
-use axtask::{AxTaskExt, current, future::block_on, sched_state, spawn_task_with_sched};
+use axtask::{AxTaskExt, SchedClass, current, future::block_on, sched_state, spawn_task_with_sched};
 use bitflags::bitflags;
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::*;
@@ -205,8 +205,18 @@ impl CloneArgs {
         let mut child_sched_state = sched_state(&curr);
         if !flags.contains(CloneFlags::THREAD) && child_sched_state.reset_on_fork {
             child_sched_state.reset_on_fork = false;
-            if child_sched_state.nice < 0 {
-                child_sched_state.nice = 0;
+            match child_sched_state.class {
+                SchedClass::Fifo | SchedClass::RoundRobin => {
+                    child_sched_state.class = SchedClass::Normal;
+                    child_sched_state.nice = 0;
+                    child_sched_state.rt_priority = 0;
+                }
+                SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
+                    if child_sched_state.nice < 0 {
+                        child_sched_state.nice = 0;
+                    }
+                    child_sched_state.rt_priority = 0;
+                }
             }
         }
 

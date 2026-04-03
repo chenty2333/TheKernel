@@ -12,7 +12,10 @@ pub(crate) use crate::run_queue::{current_run_queue, select_run_queue};
 #[cfg(feature = "task-ext")]
 pub use crate::task::{AxTaskExt, TaskExt};
 #[cfg(feature = "sched-cfs")]
-pub use axsched::{CfsTaskClass as SchedClass, CfsTaskParams as SchedState};
+pub use axsched::{
+    CfsTaskClass as SchedClass, CfsTaskParams as SchedState, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX,
+    RT_PRIORITY_MIN,
+};
 #[doc(cfg(all(feature = "multitask", feature = "irq")))]
 #[cfg(feature = "irq")]
 pub use crate::timers::register_timer_callback;

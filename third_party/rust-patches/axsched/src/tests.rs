@@ -82,3 +82,103 @@ macro_rules! def_test_sched {
 def_test_sched!(fifo, FifoScheduler::<usize>, FifoTask::<usize>);
 def_test_sched!(rr, RRScheduler::<usize, 5>, RRTask::<usize, 5>);
 def_test_sched!(cfs, CFScheduler::<usize>, CFSTask::<usize>);
+
+mod cfs_rt {
+    use crate::*;
+    use alloc::sync::Arc;
+
+    #[test]
+    fn rt_tasks_preempt_fair_tasks() {
+        let mut scheduler = CFScheduler::<usize>::new();
+        let fair = Arc::new(CFSTask::new(1));
+        let rt = Arc::new(CFSTask::new(2));
+        assert!(rt.configure(CfsTaskParams {
+            class: CfsTaskClass::Fifo,
+            nice: 0,
+            rt_priority: 10,
+            reset_on_fork: false,
+        }));
+        scheduler.add_task(fair.clone());
+        scheduler.add_task(rt.clone());
+
+        let first = scheduler.pick_next_task().unwrap();
+        assert_eq!(*first.inner(), 2);
+        scheduler.put_prev_task(first, false);
+
+        let second = scheduler.pick_next_task().unwrap();
+        assert_eq!(*second.inner(), 2);
+    }
+
+    #[test]
+    fn ready_rt_task_preempts_running_fair_task() {
+        let mut scheduler = CFScheduler::<usize>::new();
+        let fair = Arc::new(CFSTask::new(1));
+        let rt = Arc::new(CFSTask::new(2));
+        assert!(rt.configure(CfsTaskParams {
+            class: CfsTaskClass::Fifo,
+            nice: 0,
+            rt_priority: 50,
+            reset_on_fork: false,
+        }));
+
+        scheduler.add_task(fair.clone());
+        let running = scheduler.pick_next_task().unwrap();
+        assert_eq!(*running.inner(), 1);
+        scheduler.enqueue_task(rt, EnqueueReason::Wakeup);
+
+        assert!(scheduler.task_tick(&running));
+    }
+
+    #[test]
+    fn higher_rt_priority_runs_first() {
+        let mut scheduler = CFScheduler::<usize>::new();
+        let low = Arc::new(CFSTask::new(1));
+        let high = Arc::new(CFSTask::new(2));
+        assert!(low.configure(CfsTaskParams {
+            class: CfsTaskClass::Fifo,
+            nice: 0,
+            rt_priority: 10,
+            reset_on_fork: false,
+        }));
+        assert!(high.configure(CfsTaskParams {
+            class: CfsTaskClass::Fifo,
+            nice: 0,
+            rt_priority: 20,
+            reset_on_fork: false,
+        }));
+        scheduler.add_task(low);
+        scheduler.add_task(high);
+
+        let first = scheduler.pick_next_task().unwrap();
+        assert_eq!(*first.inner(), 2);
+    }
+
+    #[test]
+    fn rr_rotates_between_equal_priority_tasks() {
+        let mut scheduler = CFScheduler::<usize>::new();
+        let a = Arc::new(CFSTask::new(1));
+        let b = Arc::new(CFSTask::new(2));
+        for task in [&a, &b] {
+            assert!(task.configure(CfsTaskParams {
+                class: CfsTaskClass::RoundRobin,
+                nice: 0,
+                rt_priority: 42,
+                reset_on_fork: false,
+            }));
+            scheduler.add_task(task.clone());
+        }
+
+        let first = scheduler.pick_next_task().unwrap();
+        assert_eq!(*first.inner(), 1);
+        for tick in 0..RR_TIMESLICE_TICKS {
+            assert_eq!(
+                scheduler.task_tick(&first),
+                tick + 1 == RR_TIMESLICE_TICKS
+            );
+        }
+        scheduler.put_prev_task(first, false);
+
+        let second = scheduler.pick_next_task().unwrap();
+        assert_eq!(*second.inner(), 2);
+    }
+}

@@ -10,7 +10,10 @@ mod tests;
 
 extern crate alloc;
 
-pub use cfs::{CFSTask, CFScheduler, CfsTaskClass, CfsTaskParams};
+pub use cfs::{
+    CFSTask, CFScheduler, CfsTaskClass, CfsTaskParams, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX,
+    RT_PRIORITY_MIN,
+};
 pub use fifo::{FifoScheduler, FifoTask};
 pub use round_robin::{RRScheduler, RRTask};
 
