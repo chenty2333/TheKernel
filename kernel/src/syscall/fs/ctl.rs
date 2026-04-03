@@ -506,9 +506,31 @@ pub fn sys_renameat2(
          new_path: {new_path}, flags: {flags}"
     );
 
-    let (old_dir, old_name) = with_fs(old_dirfd, |fs| fs.resolve_parent(Path::new(&old_path)))?;
-    let (new_dir, new_name) =
-        with_fs(new_dirfd, |fs| fs.resolve_nonexistent(Path::new(&new_path)))?;
+    let old_path = Path::new(&old_path);
+    let new_path = Path::new(&new_path);
+    let old_is_root = with_fs(old_dirfd, |fs| Ok(fs.path_refers_to_root(old_path)))?;
+    let new_is_root = with_fs(new_dirfd, |fs| Ok(fs.path_refers_to_root(new_path)))?;
+
+    if old_is_root {
+        if new_is_root {
+            return Err(AxError::ResourceBusy);
+        }
+        with_fs(new_dirfd, |fs| {
+            fs.resolve_parent(new_path)?;
+            Err(AxError::ResourceBusy)
+        })?;
+    }
+
+    if new_is_root {
+        with_fs(old_dirfd, |fs| {
+            fs.resolve_no_follow(old_path)?;
+            Ok(())
+        })?;
+        return Err(AxError::ResourceBusy);
+    }
+
+    let (old_dir, old_name) = with_fs(old_dirfd, |fs| fs.resolve_parent(old_path))?;
+    let (new_dir, new_name) = with_fs(new_dirfd, |fs| fs.resolve_nonexistent(new_path))?;
 
     old_dir.rename(&old_name, &new_dir, new_name)?;
     Ok(0)

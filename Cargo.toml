@@ -90,6 +90,7 @@ all-features = true
 [patch.crates-io]
 axnet-ng = { path = "crates/axnet-ng" }
 axio = { path = "third_party/rust-patches/axio" }
+axfs-ng = { path = "third_party/rust-patches/axfs-ng" }
 starry-vm = { path = "third_party/rust-patches/starry-vm" }
 starry-process = { path = "third_party/rust-patches/starry-process" }
 starry-signal = { path = "third_party/rust-patches/starry-signal" }

@@ -541,8 +541,6 @@ dependencies = [
 [[package]]
 name = "axfs-ng"
 version = "0.3.0-preview.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cda01a3d5334aef9764462e9e06639de220490f897a85749444bac4517d6edd4"
 dependencies = [
  "axalloc",
  "axdriver",
