@@ -8,9 +8,8 @@ use alloc::{
 use core::{
     future::{Future, poll_fn},
     ops::Deref,
-    pin::Pin,
     sync::atomic::AtomicBool,
-    task::{Poll, Waker},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -32,12 +31,77 @@ use crate::{
 /// Wait queue used by futex.
 #[derive(Default)]
 pub struct WaitQueue {
-    queue: SpinNoIrq<VecDeque<(Waker, u32)>>,
+    queue: SpinNoIrq<VecDeque<Arc<SpinNoIrq<WaiterEntry>>>>,
+}
+
+struct WaiterEntry {
+    bitset: u32,
+    awakened: bool,
+    waker: Option<Waker>,
+}
+
+struct WaitFuture<'a, F> {
+    queue: &'a WaitQueue,
+    bitset: u32,
+    timeout: Option<(AlarmClock, Duration)>,
+    condition: Option<F>,
+    waiter: Option<Arc<SpinNoIrq<WaiterEntry>>>,
+}
+
+impl<F> Unpin for WaitFuture<'_, F> {}
+
+impl<F> Drop for WaitFuture<'_, F> {
+    fn drop(&mut self) {
+        if let Some(waiter) = self.waiter.take() {
+            self.queue.remove_waiter(&waiter);
+        }
+    }
+}
+
+impl<F: FnOnce() -> bool> Future for WaitFuture<'_, F> {
+    type Output = AxResult<bool>;
+
+    fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(waiter) = self.waiter.as_ref() {
+            let mut waiter = waiter.lock();
+            if waiter.awakened {
+                return Poll::Ready(Ok(true));
+            }
+            waiter.waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+
+        let Some(condition) = self.condition.take() else {
+            return Poll::Pending;
+        };
+        if !condition() {
+            return Poll::Ready(Ok(false));
+        }
+        if self
+            .timeout
+            .is_some_and(|(clock, deadline)| clock.now() >= deadline)
+        {
+            return Poll::Ready(Err(AxError::TimedOut));
+        }
+
+        let waiter = Arc::new(SpinNoIrq::new(WaiterEntry {
+            bitset: self.bitset,
+            awakened: false,
+            waker: Some(cx.waker().clone()),
+        }));
+        self.queue.queue.lock().push_back(waiter.clone());
+        self.waiter = Some(waiter);
+        Poll::Pending
+    }
 }
 impl WaitQueue {
     /// Creates a new `WaitQueue`.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn remove_waiter(&self, target: &Arc<SpinNoIrq<WaiterEntry>>) {
+        self.queue.lock().retain(|waiter| !Arc::ptr_eq(waiter, target));
     }
 
     /// Waits if the given condition is met.
@@ -50,31 +114,22 @@ impl WaitQueue {
         timeout: Option<(AlarmClock, Duration)>,
         condition: impl FnOnce() -> bool,
     ) -> AxResult<bool> {
-        let mut condition = Some(condition);
-        let wait = poll_fn(|cx| {
-            if let Some(cond) = condition.take() {
-                let mut queue = self.queue.lock();
-                if !cond() {
-                    Poll::Ready(Ok(false))
-                } else if timeout.is_some_and(|(clock, deadline)| clock.now() >= deadline) {
-                    Poll::Ready(Err(AxError::TimedOut))
-                } else {
-                    queue.push_back((cx.waker().clone(), bitset));
-                    Poll::Pending
-                }
-            } else {
-                Poll::Ready(Ok(true))
-            }
-        });
+        let wait = WaitFuture {
+            queue: self,
+            bitset,
+            timeout,
+            condition: Some(condition),
+            waiter: None,
+        };
         let wait = async {
             if let Some((clock, deadline)) = timeout {
                 let mut wait = core::pin::pin!(wait);
                 let mut sleeper = core::pin::pin!(sleep_until_clock(clock, deadline));
                 poll_fn(|cx| {
-                    if let Poll::Ready(result) = Pin::new(&mut wait).poll(cx) {
+                    if let Poll::Ready(result) = wait.as_mut().poll(cx) {
                         return Poll::Ready(result);
                     }
-                    if Pin::new(&mut sleeper).poll(cx).is_ready() {
+                    if sleeper.as_mut().poll(cx).is_ready() {
                         return Poll::Ready(Err(AxError::TimedOut));
                     }
                     Poll::Pending
@@ -91,11 +146,15 @@ impl WaitQueue {
     /// bitmask.
     pub fn wake(&self, count: usize, mask: u32) -> usize {
         let mut woke = 0;
-        self.queue.lock().retain(|(waker, bitset)| {
-            if woke >= count || (bitset & mask) == 0 {
+        self.queue.lock().retain(|waiter| {
+            let mut waiter = waiter.lock();
+            if woke >= count || (waiter.bitset & mask) == 0 {
                 true
             } else {
-                waker.wake_by_ref();
+                waiter.awakened = true;
+                if let Some(waker) = waiter.waker.take() {
+                    waker.wake();
+                }
                 woke += 1;
                 false
             }
