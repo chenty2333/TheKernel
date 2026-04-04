@@ -364,13 +364,15 @@ type EvictListenerFn = Box<dyn Fn(u32, &PageCache) + Send + Sync>;
 
 fn per_file_page_cache_capacity() -> NonZeroUsize {
     const MIB: usize = 1024 * 1024;
+    const GIB: usize = 1024 * MIB;
     let ram = total_ram_size();
     let pages = if ram <= 512 * MIB {
         64
-    } else if ram <= 2 * 1024 * MIB {
+    } else if ram <= 2 * GIB {
         256
     } else {
-        512
+        let extra_gib = (ram - 2 * GIB) / GIB;
+        512usize.saturating_add(extra_gib.saturating_mul(128))
     };
     NonZeroUsize::new(pages).unwrap()
 }
