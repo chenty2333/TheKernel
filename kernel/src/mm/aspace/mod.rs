@@ -316,8 +316,14 @@ impl AddrSpace {
             let flags = area.flags();
             if flags.contains(access_flags) {
                 let page_size = area.backend().page_size();
+                let start = vaddr.align_down(page_size);
+                let fault_around = area.backend().fault_around_size(access_flags);
+                let len = area
+                    .end()
+                    .sub_addr(start)
+                    .min(fault_around.max(page_size as usize));
                 let populate_result = area.backend().populate(
-                    VirtAddrRange::from_start_size(vaddr.align_down(page_size), page_size as _),
+                    VirtAddrRange::from_start_size(start, len),
                     flags,
                     access_flags,
                     &mut self.pt.cursor(),

@@ -153,6 +153,10 @@ impl MappingBackend for Backend {
         }
         cursor.protect_region(start, size, new_flags).is_ok()
     }
+
+    fn can_merge(&self, other: &Self) -> bool {
+        self.mergeable_with(other)
+    }
 }
 
 impl Backend {
@@ -236,6 +240,23 @@ impl Backend {
             (Backend::Shared(lhs), Backend::Shared(rhs)) => lhs.compatible_with(rhs),
             (Backend::File(lhs), Backend::File(rhs)) => lhs.compatible_with(rhs),
             _ => false,
+        }
+    }
+
+    pub fn mergeable_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Backend::Linear(lhs), Backend::Linear(rhs)) => lhs.compatible_with(rhs),
+            (Backend::Cow(lhs), Backend::Cow(rhs)) => lhs.mergeable_with(rhs),
+            (Backend::Shared(lhs), Backend::Shared(rhs)) => lhs.compatible_with(rhs),
+            (Backend::File(lhs), Backend::File(rhs)) => lhs.compatible_with(rhs),
+            _ => false,
+        }
+    }
+
+    pub fn fault_around_size(&self, access_flags: MappingFlags) -> usize {
+        match self {
+            Backend::Cow(backend) => backend.fault_around_size(access_flags),
+            _ => self.page_size() as usize,
         }
     }
 }

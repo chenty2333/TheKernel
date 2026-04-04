@@ -85,6 +85,8 @@ pub struct CowBackend {
 }
 
 impl CowBackend {
+    const ANON_FAULT_AROUND_PAGES: usize = 16;
+
     fn alloc_new_frame(&self, zeroed: bool) -> AxResult<PhysAddr> {
         let frame = alloc_frame(zeroed, self.size)?;
         FRAME_TABLE.lock().init_frame(frame);
@@ -203,6 +205,27 @@ impl CowBackend {
                     }
             }
             _ => false,
+        }
+    }
+
+    pub(crate) fn mergeable_with(&self, other: &Self) -> bool {
+        if self.size != other.size {
+            return false;
+        }
+        match (&self.file, &other.file) {
+            (None, None) => true,
+            _ => self.compatible_with(other),
+        }
+    }
+
+    pub(crate) fn fault_around_size(&self, access_flags: MappingFlags) -> usize {
+        if self.file.is_none()
+            && self.size == PageSize::Size4K
+            && access_flags.contains(MappingFlags::WRITE)
+        {
+            self.size as usize * Self::ANON_FAULT_AROUND_PAGES
+        } else {
+            self.size as usize
         }
     }
 
