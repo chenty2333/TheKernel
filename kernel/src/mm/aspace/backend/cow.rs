@@ -1,5 +1,8 @@
 use alloc::{collections::BTreeMap, sync::Arc};
-use core::slice;
+use core::{
+    slice,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use axerrno::{AxError, AxResult};
 use axfs::FileBackend;
@@ -82,15 +85,34 @@ pub struct CowBackend {
     size: PageSize,
     file: Option<(FileBackend, u64, Option<u64>)>,
     map_id: Arc<()>,
+    materialized: Arc<AtomicBool>,
 }
 
 impl CowBackend {
     const ANON_FAULT_AROUND_PAGES: usize = 16;
 
     fn alloc_new_frame(&self, zeroed: bool) -> AxResult<PhysAddr> {
-        let frame = alloc_frame(zeroed, self.size)?;
-        FRAME_TABLE.lock().init_frame(frame);
-        Ok(frame)
+        alloc_frame(zeroed, self.size)
+    }
+
+    fn is_materialized(&self) -> bool {
+        self.materialized.load(Ordering::Relaxed)
+    }
+
+    fn mark_materialized(&self) {
+        self.materialized.store(true, Ordering::Relaxed);
+    }
+
+    fn get_or_track_frame_ref(&self, paddr: PhysAddr) -> Arc<SpinNoIrq<FrameRefCnt>> {
+        let mut frame_table = FRAME_TABLE.lock();
+        if let Some(frame_ref) = frame_table.get_frame_ref(paddr) {
+            return frame_ref;
+        }
+
+        frame_table.init_frame(paddr);
+        frame_table
+            .get_frame_ref(paddr)
+            .expect("tracked frame must exist after initialization")
     }
 
     fn alloc_new_at(
@@ -119,6 +141,7 @@ impl CowBackend {
             file.read_at(&mut &mut buf[start..start + max_read], file_start)?;
         }
         pt.map(vaddr, frame, self.size, flags)?;
+        self.mark_materialized();
         Ok(())
     }
 
@@ -129,17 +152,18 @@ impl CowBackend {
         flags: MappingFlags,
         pt: &mut PageTableCursor,
     ) -> AxResult {
-        let mut frame_table = FRAME_TABLE.lock();
-        let frame = frame_table
-            .get_frame_ref(paddr)
-            .ok_or(AxError::BadAddress)?;
-        drop(frame_table);
+        let Some(frame) = FRAME_TABLE.lock().get_frame_ref(paddr) else {
+            pt.protect(vaddr, flags)?;
+            self.mark_materialized();
+            return Ok(());
+        };
         let mut frame = frame.lock();
         assert!(frame.0 > 0, "invalid frame reference count");
         match frame.0 {
             1 => {
                 // Only one reference, just upgrade the permissions.
                 pt.protect(vaddr, flags)?;
+                self.mark_materialized();
                 return Ok(());
             }
             _ => {
@@ -157,6 +181,7 @@ impl CowBackend {
             }
         }
 
+        self.mark_materialized();
         Ok(())
     }
 
@@ -172,6 +197,7 @@ impl CowBackend {
             size: self.size,
             file: self.file.clone(),
             map_id,
+            materialized: self.materialized.clone(),
         }
     }
 
@@ -213,7 +239,10 @@ impl CowBackend {
             return false;
         }
         match (&self.file, &other.file) {
-            (None, None) => true,
+            (None, None) => {
+                (!self.is_materialized() && !other.is_materialized())
+                    || Arc::ptr_eq(&self.materialized, &other.materialized)
+            }
             _ => self.compatible_with(other),
         }
     }
@@ -239,20 +268,25 @@ impl CowBackend {
         pages_in(VirtAddrRange::from_start_size(old_start, size), self.size)?;
         pages_in(VirtAddrRange::from_start_size(new_start, size), self.size)?;
         let materialized = pt.collect_present_leaves(old_start, size)?;
+        if !materialized.is_empty() {
+            self.mark_materialized();
+        }
         for (old_addr, paddr, flags, page_size) in materialized {
             assert_eq!(page_size, self.size);
             let new_addr = new_start + old_addr.sub_addr(old_start);
-            let frame = FRAME_TABLE
-                .lock()
-                .get_frame_ref(paddr)
-                .ok_or(AxError::BadAddress)?;
+            let frame = self.get_or_track_frame_ref(paddr);
             let mut frame = frame.lock();
             if frame.0 == u8::MAX {
                 return Err(AxError::BadAddress);
             }
             frame.0 += 1;
             drop(frame);
-            pt.map(new_addr, paddr, self.size, flags)?;
+            if let Err(err) = pt.map(new_addr, paddr, self.size, flags) {
+                let frame = self.get_or_track_frame_ref(paddr);
+                let mut frame = frame.lock();
+                frame.drop_frame(paddr, self.size);
+                return Err(err.into());
+            }
         }
         Ok(())
     }
@@ -276,17 +310,20 @@ impl BackendOps for CowBackend {
     fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult {
         debug!("Cow::unmap: {range:?}");
         pages_in(range, self.size)?;
+        if !self.is_materialized() {
+            return Ok(());
+        }
         let materialized = pt.collect_present_leaves(range.start, range.size())?;
         for (addr, _, _, page_size) in materialized {
             let (frame, _flags, unmapped_size) = pt.unmap(addr).map_err(AxError::from)?;
             assert_eq!(page_size, unmapped_size);
             assert_eq!(page_size, self.size);
-            let frame_ref = FRAME_TABLE
-                .lock()
-                .get_frame_ref(frame)
-                .ok_or(AxError::BadAddress)?;
-            let mut frame_ref = frame_ref.lock();
-            frame_ref.drop_frame(frame, self.size);
+            if let Some(frame_ref) = FRAME_TABLE.lock().get_frame_ref(frame) {
+                let mut frame_ref = frame_ref.lock();
+                frame_ref.drop_frame(frame, self.size);
+            } else {
+                dealloc_frame(frame, self.size);
+            }
         }
         Ok(())
     }
@@ -334,25 +371,37 @@ impl BackendOps for CowBackend {
         let cow_flags = flags - MappingFlags::WRITE;
         pages_in(range, self.size)?;
         let materialized = old_pt.collect_present_leaves(range.start, range.size())?;
+        if !materialized.is_empty() {
+            self.mark_materialized();
+        }
         for (vaddr, paddr, _, page_size) in materialized {
             assert_eq!(page_size, self.size);
             // If the page is mapped in the old page table:
             // - Update its permissions in the old page table using `flags`.
             // - Map the same physical page into the new page table at the same
             // virtual address, with the same page size and `flags`.
-            let frame = FRAME_TABLE
-                .lock()
-                .get_frame_ref(paddr)
-                .ok_or(AxError::BadAddress)?;
+            let frame = self.get_or_track_frame_ref(paddr);
             let mut frame = frame.lock();
-            assert!(frame.0 > 0, "referencing unreferenced frame");
-            frame.0 += 1;
             if frame.0 == u8::MAX {
                 warn!("frame reference count overflow");
                 return Err(AxError::BadAddress);
             }
-            old_pt.protect(vaddr, cow_flags)?;
-            new_pt.map(vaddr, paddr, self.size, cow_flags)?;
+            assert!(frame.0 > 0, "referencing unreferenced frame");
+            frame.0 += 1;
+            drop(frame);
+            if let Err(err) = old_pt.protect(vaddr, cow_flags) {
+                let frame = self.get_or_track_frame_ref(paddr);
+                let mut frame = frame.lock();
+                frame.drop_frame(paddr, self.size);
+                return Err(err.into());
+            }
+            if let Err(err) = new_pt.map(vaddr, paddr, self.size, cow_flags) {
+                let _ = old_pt.protect(vaddr, flags);
+                let frame = self.get_or_track_frame_ref(paddr);
+                let mut frame = frame.lock();
+                frame.drop_frame(paddr, self.size);
+                return Err(err.into());
+            }
         }
 
         Ok(Backend::Cow(self.clone()))
@@ -372,6 +421,7 @@ impl Backend {
             size,
             file: Some((file, file_start, file_end)),
             map_id: Arc::new(()),
+            materialized: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -381,6 +431,7 @@ impl Backend {
             size,
             file: None,
             map_id: Arc::new(()),
+            materialized: Arc::new(AtomicBool::new(false)),
         })
     }
 }
