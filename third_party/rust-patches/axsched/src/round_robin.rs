@@ -37,6 +37,11 @@ impl<T, const S: usize> RRTask<T, S> {
     pub const fn inner(&self) -> &T {
         &self.inner
     }
+
+    /// Consumes the scheduler wrapper and returns the inner task.
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
 }
 
 impl<T, const MAX_TIME_SLICE: usize> GetLinks for RRTask<T, MAX_TIME_SLICE> {

@@ -1,13 +1,13 @@
 #[cfg(feature = "smp")]
 use alloc::sync::Weak;
-use alloc::{collections::VecDeque, sync::Arc};
+use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::{
     future::poll_fn,
     mem::MaybeUninit,
     task::{Context, Poll},
 };
 
-use axhal::percpu::this_cpu_id;
+use axhal::{mem::total_ram_size, percpu::this_cpu_id};
 use axsched::{BaseScheduler, EnqueueReason};
 use futures_util::task::AtomicWaker;
 use kernel_guard::BaseGuard;
@@ -17,7 +17,7 @@ use lazyinit::LazyInit;
 use crate::{
     AxCpuMask, AxTaskRef, Scheduler, TaskInner,
     future::block_on,
-    task::{CurrentTask, TaskState},
+    task::{CurrentTask, TaskStack, TaskState},
 };
 
 macro_rules! percpu_static {
@@ -37,10 +37,110 @@ percpu_static! {
     RUN_QUEUE: LazyInit<AxRunQueue> = LazyInit::new(),
     EXITED_TASKS: VecDeque<AxTaskRef> = VecDeque::new(),
     WAIT_FOR_EXIT: AtomicWaker = AtomicWaker::new(),
+    STACK_CACHE: kspin::SpinNoIrq<PerCpuStackCache> = kspin::SpinNoIrq::new(PerCpuStackCache::new()),
     IDLE_TASK: LazyInit<AxTaskRef> = LazyInit::new(),
     /// Stores the weak reference to the previous task that is running on this CPU.
     #[cfg(feature = "smp")]
     PREV_TASK: Weak<crate::AxTask> = Weak::new(),
+}
+
+const MIB: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct StackCacheKey {
+    size: usize,
+    align: usize,
+}
+
+struct StackCacheBucket {
+    key: StackCacheKey,
+    stacks: Vec<TaskStack>,
+}
+
+struct PerCpuStackCache {
+    cached_bytes: usize,
+    budget_bytes: usize,
+    buckets: Vec<StackCacheBucket>,
+}
+
+impl PerCpuStackCache {
+    const fn new() -> Self {
+        Self {
+            cached_bytes: 0,
+            budget_bytes: 0,
+            buckets: Vec::new(),
+        }
+    }
+
+    fn take(&mut self, size: usize, align: usize) -> Option<TaskStack> {
+        let key = StackCacheKey { size, align };
+        let index = self.buckets.iter().position(|bucket| bucket.key == key)?;
+        let bucket = &mut self.buckets[index];
+        let stack = bucket.stacks.pop();
+        if stack.is_some() {
+            self.cached_bytes = self.cached_bytes.saturating_sub(size);
+        }
+        if bucket.stacks.is_empty() {
+            self.buckets.swap_remove(index);
+        }
+        stack
+    }
+
+    fn recycle(&mut self, mut stack: TaskStack) {
+        let size = stack.layout_size();
+        let align = stack.layout_align();
+        let budget = self.budget_bytes();
+        if size == 0 || budget < size || self.cached_bytes > budget.saturating_sub(size) {
+            return;
+        }
+
+        stack.scrub_for_cache();
+        let key = StackCacheKey { size, align };
+        if let Some(bucket) = self.buckets.iter_mut().find(|bucket| bucket.key == key) {
+            bucket.stacks.push(stack);
+        } else {
+            self.buckets.push(StackCacheBucket {
+                key,
+                stacks: vec![stack],
+            });
+        }
+        self.cached_bytes += size;
+    }
+
+    fn budget_bytes(&mut self) -> usize {
+        if self.budget_bytes == 0 {
+            self.budget_bytes = per_cpu_stack_cache_budget_bytes();
+        }
+        self.budget_bytes
+    }
+}
+
+fn system_stack_cache_budget_bytes() -> usize {
+    let ram = total_ram_size();
+    if ram <= 512 * MIB {
+        16 * MIB
+    } else if ram <= 2 * 1024 * MIB {
+        64 * MIB
+    } else {
+        128 * MIB
+    }
+}
+
+fn per_cpu_stack_cache_budget_bytes() -> usize {
+    // Keep the historical 16/64/128 MiB system budget, but split it across
+    // CPUs so stack reuse stays lock-local instead of contending globally.
+    let cpu_num = axhal::cpu_num().max(1);
+    system_stack_cache_budget_bytes() / cpu_num
+}
+
+pub(crate) fn take_cached_task_stack(size: usize, align: usize) -> Option<TaskStack> {
+    STACK_CACHE.with_current(|cache| cache.lock().take(size, align))
+}
+
+fn recycle_task_stack(stack: TaskStack) {
+    STACK_CACHE.with_current(|cache| {
+        cache.lock().recycle(stack);
+    });
 }
 
 /// An array of references to run queues, one for each CPU, indexed by cpu_id.
@@ -666,7 +766,13 @@ fn poll_gc(cx: &mut Context<'_>) -> Poll<()> {
             };
             match Arc::try_unwrap(task) {
                 Ok(task) => {
-                    // If I'm the last holder of the task, drop it immediately.
+                    // Only recycle the stack after the final strong reference is
+                    // gone; before this point, joiners or scheduler handoff may
+                    // still legitimately hold the task alive.
+                    let mut task = task.into_inner();
+                    if let Some(stack) = task.take_kernel_stack() {
+                        recycle_task_stack(stack);
+                    }
                     drop(task);
                 }
                 Err(task) => {

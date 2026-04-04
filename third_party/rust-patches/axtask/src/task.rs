@@ -411,6 +411,11 @@ impl TaskInner {
         self.ctx.get()
     }
 
+    /// Remove and return the kernel stack owned by this task, if any.
+    pub(crate) fn take_kernel_stack(&mut self) -> Option<TaskStack> {
+        self.kstack.take()
+    }
+
     /// Set the CPU ID where the task is running or will run.
     #[cfg(feature = "smp")]
     #[inline]
@@ -454,7 +459,7 @@ impl Drop for TaskInner {
     }
 }
 
-struct TaskStack {
+pub(crate) struct TaskStack {
     ptr: NonNull<u8>,
     layout: Layout,
 }
@@ -462,6 +467,9 @@ struct TaskStack {
 impl TaskStack {
     pub fn alloc(size: usize) -> Self {
         let layout = Layout::from_size_align(size, 16).unwrap();
+        if let Some(stack) = crate::run_queue::take_cached_task_stack(layout.size(), layout.align()) {
+            return stack;
+        }
         Self {
             ptr: NonNull::new(unsafe { alloc::alloc::alloc(layout) }).unwrap(),
             layout,
@@ -470,6 +478,21 @@ impl TaskStack {
 
     pub const fn top(&self) -> VirtAddr {
         unsafe { core::mem::transmute(self.ptr.as_ptr().add(self.layout.size())) }
+    }
+
+    pub(crate) const fn layout_size(&self) -> usize {
+        self.layout.size()
+    }
+
+    pub(crate) const fn layout_align(&self) -> usize {
+        self.layout.align()
+    }
+
+    pub(crate) fn scrub_for_cache(&mut self) {
+        let fill = if cfg!(debug_assertions) { 0xA5 } else { 0x00 };
+        unsafe {
+            core::ptr::write_bytes(self.ptr.as_ptr(), fill, self.layout.size());
+        }
     }
 
 }

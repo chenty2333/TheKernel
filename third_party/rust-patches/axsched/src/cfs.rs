@@ -115,6 +115,11 @@ impl<T> CFSTask<T> {
         matches!(self.class(), CfsTaskClass::RoundRobin | CfsTaskClass::Fifo)
     }
 
+    /// Consumes the scheduler wrapper and returns the inner task.
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+
     fn effective_nice(&self) -> isize {
         match self.class() {
             CfsTaskClass::Idle => NICE_RANGE_POS as isize,
