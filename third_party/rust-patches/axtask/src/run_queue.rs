@@ -503,8 +503,8 @@ impl AxRunQueue {
         assert!(
             gc_task.configure(axsched::CfsTaskParams {
                 // Keep GC in the fair queue so thread-exit wakeups can hand control
-                // straight back to the joiner. The stack cache already bounds the
-                // short-term reclamation cost, so GC does not need RT priority.
+                // straight back to the joiner. Exited-task cleanup does not need
+                // RT priority.
                 class: axsched::CfsTaskClass::Batch,
                 nice: 19,
                 rt_priority: 0,
