@@ -284,18 +284,12 @@ pub fn sys_mmap(
     } else {
         let align = page_size as usize;
         aspace
-            .find_free_area(
+            .find_kernel_area(
                 VirtAddr::from(start),
                 length,
                 VirtAddrRange::new(aspace.base(), aspace.end()),
                 align,
             )
-            .or(aspace.find_free_area(
-                aspace.base(),
-                length,
-                VirtAddrRange::new(aspace.base(), aspace.end()),
-                align,
-            ))
             .ok_or(AxError::NoMemory)?
     };
 
@@ -458,18 +452,12 @@ pub fn sys_mremap(
             dst
         } else {
             aspace
-                .find_free_area(
+                .find_kernel_area(
                     addr,
                     new_size,
                     VirtAddrRange::new(aspace.base(), aspace.end()),
                     page_size as usize,
                 )
-                .or(aspace.find_free_area(
-                    aspace.base(),
-                    new_size,
-                    VirtAddrRange::new(aspace.base(), aspace.end()),
-                    page_size as usize,
-                ))
                 .ok_or(AxError::NoMemory)?
         };
 
@@ -526,18 +514,12 @@ pub fn sys_mremap(
         dst
     } else {
         aspace
-            .find_free_area(
+            .find_kernel_area(
                 addr,
                 new_size,
                 VirtAddrRange::new(aspace.base(), aspace.end()),
                 page_size as usize,
             )
-            .or(aspace.find_free_area(
-                aspace.base(),
-                new_size,
-                VirtAddrRange::new(aspace.base(), aspace.end()),
-                page_size as usize,
-            ))
             .ok_or(AxError::NoMemory)?
     };
 

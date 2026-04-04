@@ -177,6 +177,37 @@ impl<B: MappingBackend> MemorySet<B> {
         }
     }
 
+    /// Finds an append-biased free area at or after the highest occupied end
+    /// within the given limit.
+    ///
+    /// This is intended for kernel-chosen placements that grow upward, not for
+    /// exact first-fit semantics. Callers should still fall back to
+    /// [`Self::find_free_area`] when this returns [`None`].
+    pub fn find_append_area(
+        &self,
+        size: usize,
+        limit: AddrRange<B::Addr>,
+        align: usize,
+    ) -> Option<B::Addr> {
+        if size % align != 0 {
+            return None;
+        }
+
+        let candidate = self
+            .areas
+            .range(..limit.end)
+            .next_back()
+            .map(|(_, area)| area.end())
+            .unwrap_or(limit.start)
+            .max(limit.start)
+            .align_up(align);
+
+        candidate
+            .checked_add(size)
+            .filter(|&end| end <= limit.end)
+            .map(|_| candidate)
+    }
+
     /// Add a new memory mapping.
     ///
     /// The mapping is represented by a [`MemoryArea`].

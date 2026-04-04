@@ -96,6 +96,31 @@ impl AddrSpace {
         self.areas.find_free_area(hint, size, limit, align)
     }
 
+    /// Finds a free area for kernel-chosen placement.
+    ///
+    /// If the caller provides an explicit hint above the base, that hint is
+    /// still tried first. Otherwise, or if the explicit hint fails, the search
+    /// first tries an append-biased placement near the current high-water mark
+    /// before falling back to the full first-fit scan from the address-space
+    /// base.
+    pub fn find_kernel_area(
+        &self,
+        hint: VirtAddr,
+        size: usize,
+        limit: VirtAddrRange,
+        align: usize,
+    ) -> Option<VirtAddr> {
+        if hint > limit.start {
+            self.find_free_area(hint, size, limit, align)
+                .or_else(|| self.areas.find_append_area(size, limit, align))
+                .or_else(|| self.find_free_area(limit.start, size, limit, align))
+        } else {
+            self.areas
+                .find_append_area(size, limit, align)
+                .or_else(|| self.find_free_area(limit.start, size, limit, align))
+        }
+    }
+
     pub fn find_area(&self, vaddr: VirtAddr) -> Option<&MemoryArea<Backend>> {
         self.areas.find(vaddr)
     }

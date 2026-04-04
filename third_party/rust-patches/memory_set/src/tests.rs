@@ -424,3 +424,31 @@ fn test_find_free_area() {
     let addr = set.find_free_area(0xf001.into(), 0x1000, va_range!(0..MAX_ADDR), 0x1000);
     assert_eq!(addr, None);
 }
+
+#[test]
+fn test_find_append_area() {
+    let mut set = MockMemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+
+    assert_eq!(
+        set.find_append_area(0x1000, va_range!(0x4000..0x8000), 0x1000),
+        Some(0x4000.into())
+    );
+
+    for start in (0..MAX_ADDR).step_by(0x2000) {
+        assert_ok!(set.map(
+            MemoryArea::new(start.into(), 0x1000, 1, MockBackend),
+            &mut pt,
+            false,
+        ));
+    }
+
+    assert_eq!(
+        set.find_append_area(0x1000, va_range!(0..MAX_ADDR), 0x1000),
+        Some(0xf000.into())
+    );
+    assert_eq!(
+        set.find_append_area(0x1000, va_range!(0..0xf000), 0x1000),
+        None
+    );
+}

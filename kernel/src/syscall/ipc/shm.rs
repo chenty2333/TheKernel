@@ -444,20 +444,12 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
     // alloc the virtual address range
     assert!(shm_inner.get_addr_range(pid).is_none());
     let start_addr = aspace
-        .find_free_area(
+        .find_kernel_area(
             VirtAddr::from(start_aligned),
             length,
             VirtAddrRange::new(aspace.base(), aspace.end()),
             PAGE_SIZE_4K,
         )
-        .or_else(|| {
-            aspace.find_free_area(
-                aspace.base(),
-                length,
-                VirtAddrRange::new(aspace.base(), aspace.end()),
-                PAGE_SIZE_4K,
-            )
-        })
         .ok_or(AxError::NoMemory)?;
     let end_addr = VirtAddr::from(start_addr.as_usize() + length);
     let va_range = VirtAddrRange::new(start_addr, end_addr);
