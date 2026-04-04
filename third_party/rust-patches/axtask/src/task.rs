@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc};
 #[cfg(feature = "preempt")]
 use core::sync::atomic::AtomicUsize;
 use core::{
@@ -13,7 +13,7 @@ use core::{
     task::{Context, Poll},
 };
 
-use axhal::{context::TaskContext, mem::total_ram_size};
+use axhal::context::TaskContext;
 #[cfg(feature = "tls")]
 use axhal::tls::TlsArea;
 use futures_util::task::AtomicWaker;
@@ -84,7 +84,7 @@ pub struct TaskInner {
     exit_code: AtomicI32,
     wait_for_exit: AtomicWaker,
 
-    kstack: SpinNoIrq<Option<TaskStack>>,
+    kstack: Option<TaskStack>,
     ctx: UnsafeCell<TaskContext>,
 
     #[cfg(feature = "task-ext")]
@@ -140,7 +140,7 @@ impl TaskInner {
         t.entry = Cell::new(Some(Box::new(entry)));
         t.ctx_mut()
             .init(task_entry as *const () as usize, kstack.top(), tls);
-        *t.kstack.lock() = Some(kstack);
+        t.kstack = Some(kstack);
         if t.name() == "idle" {
             t.is_idle = true;
         }
@@ -200,8 +200,11 @@ impl TaskInner {
 
     /// Returns the top address of the kernel stack.
     #[inline]
-    pub fn kernel_stack_top(&self) -> Option<VirtAddr> {
-        self.kstack.lock().as_ref().map(TaskStack::top)
+    pub const fn kernel_stack_top(&self) -> Option<VirtAddr> {
+        match &self.kstack {
+            Some(s) => Some(s.top()),
+            None => None,
+        }
     }
 
     /// Returns the CPU ID where the task is running or will run.
@@ -277,7 +280,7 @@ impl TaskInner {
             interrupt_waker: AtomicWaker::new(),
             exit_code: AtomicI32::new(0),
             wait_for_exit: AtomicWaker::new(),
-            kstack: SpinNoIrq::new(None),
+            kstack: None,
             ctx: UnsafeCell::new(TaskContext::new()),
             #[cfg(feature = "task-ext")]
             task_ext: None,
@@ -456,51 +459,9 @@ struct TaskStack {
     layout: Layout,
 }
 
-type StackCacheKey = (usize, usize);
-
-#[derive(Clone, Copy)]
-struct CachedStackPtr(NonNull<u8>);
-
-// SAFETY: cached stack pointers refer to allocator-owned kernel memory blocks
-// that are only handed out while the global cache lock is held.
-unsafe impl Send for CachedStackPtr {}
-unsafe impl Sync for CachedStackPtr {}
-
-struct StackCache {
-    cached_bytes: usize,
-    stacks: BTreeMap<StackCacheKey, Vec<CachedStackPtr>>,
-}
-
-impl StackCache {
-    const fn new() -> Self {
-        Self {
-            cached_bytes: 0,
-            stacks: BTreeMap::new(),
-        }
-    }
-}
-
-static STACK_CACHE: SpinNoIrq<StackCache> = SpinNoIrq::new(StackCache::new());
-
 impl TaskStack {
-    const MIB: usize = 1024 * 1024;
-
-    fn max_cached_stack_bytes() -> usize {
-        let ram = total_ram_size();
-        if ram <= 512 * Self::MIB {
-            16 * Self::MIB
-        } else if ram <= 2 * 1024 * Self::MIB {
-            64 * Self::MIB
-        } else {
-            128 * Self::MIB
-        }
-    }
-
     pub fn alloc(size: usize) -> Self {
         let layout = Layout::from_size_align(size, 16).unwrap();
-        if let Some(ptr) = Self::take_cached(layout) {
-            return Self { ptr, layout };
-        }
         Self {
             ptr: NonNull::new(unsafe { alloc::alloc::alloc(layout) }).unwrap(),
             layout,
@@ -511,52 +472,11 @@ impl TaskStack {
         unsafe { core::mem::transmute(self.ptr.as_ptr().add(self.layout.size())) }
     }
 
-    fn cache_key(layout: Layout) -> StackCacheKey {
-        (layout.size(), layout.align())
-    }
-
-    fn take_cached(layout: Layout) -> Option<NonNull<u8>> {
-        let mut cache = STACK_CACHE.lock();
-        let key = Self::cache_key(layout);
-        let stacks = cache.stacks.get_mut(&key)?;
-        let ptr = stacks.pop().map(|cached| cached.0);
-        if stacks.is_empty() {
-            cache.stacks.remove(&key);
-        }
-        if ptr.is_some() {
-            cache.cached_bytes = cache.cached_bytes.saturating_sub(layout.size());
-        }
-        ptr
-    }
-
-    fn cache(self) -> Result<(), Self> {
-        let TaskStack { ptr, layout } = self;
-        let mut cache = STACK_CACHE.lock();
-        let key = Self::cache_key(layout);
-        let over_budget =
-            cache.cached_bytes > Self::max_cached_stack_bytes().saturating_sub(layout.size());
-        let stacks = cache.stacks.entry(key).or_default();
-        // The byte budget is the real bound; a small per-layout count cap only
-        // forces allocator churn for bursty workloads that repeatedly create
-        // many same-sized tasks (for example, short-lived thread pools).
-        if over_budget {
-            return Err(TaskStack { ptr, layout });
-        }
-        stacks.push(CachedStackPtr(ptr));
-        cache.cached_bytes += layout.size();
-        Ok(())
-    }
 }
 
 impl Drop for TaskStack {
     fn drop(&mut self) {
-        let stack = TaskStack {
-            ptr: self.ptr,
-            layout: self.layout,
-        };
-        if let Err(stack) = stack.cache() {
-            unsafe { alloc::alloc::dealloc(stack.ptr.as_ptr(), stack.layout) }
-        }
+        unsafe { alloc::alloc::dealloc(self.ptr.as_ptr(), self.layout) }
     }
 }
 
