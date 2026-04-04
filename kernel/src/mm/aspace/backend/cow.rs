@@ -313,10 +313,8 @@ impl BackendOps for CowBackend {
         if !self.is_materialized() {
             return Ok(());
         }
-        let materialized = pt.collect_present_leaves(range.start, range.size())?;
-        for (addr, _, _, page_size) in materialized {
-            let (frame, _flags, unmapped_size) = pt.unmap(addr).map_err(AxError::from)?;
-            assert_eq!(page_size, unmapped_size);
+        let materialized = pt.drain_present_leaves(range.start, range.size())?;
+        for (_addr, frame, _flags, page_size) in materialized {
             assert_eq!(page_size, self.size);
             if let Some(frame_ref) = FRAME_TABLE.lock().get_frame_ref(frame) {
                 let mut frame_ref = frame_ref.lock();

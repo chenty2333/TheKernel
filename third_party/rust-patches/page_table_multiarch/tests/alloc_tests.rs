@@ -281,6 +281,127 @@ fn test_collect_present_leaves_x86() -> PagingResult<()> {
 }
 
 #[test]
+#[cfg(any(target_arch = "x86_64", docsrs))]
+fn test_drain_present_leaves_x86() -> PagingResult<()> {
+    type Meta = page_table_multiarch::x86_64::X64PagingMetaData;
+    type Pte = page_table_entry::x86_64::X64PTE;
+
+    ALLOCATED.with_borrow_mut(|it| it.clear());
+
+    let mut table = PageTable64::<Meta, Pte, TrackPagingHandler<Meta>>::try_new()?;
+    {
+        let mut cursor = table.cursor();
+        cursor.map(
+            VirtAddr::from_usize(0x1000),
+            PhysAddr::from_usize(0x2000),
+            PageSize::Size4K,
+            MappingFlags::READ | MappingFlags::WRITE,
+        )?;
+        cursor.map(
+            VirtAddr::from_usize(0x9000),
+            PhysAddr::from_usize(0xa000),
+            PageSize::Size4K,
+            MappingFlags::READ,
+        )?;
+    }
+
+    let drained = {
+        let mut cursor = table.cursor();
+        cursor.drain_present_leaves(VirtAddr::from_usize(0), 0x20_000)?
+    };
+    assert_eq!(
+        drained,
+        vec![
+            (
+                VirtAddr::from_usize(0x1000),
+                PhysAddr::from_usize(0x2000),
+                MappingFlags::READ | MappingFlags::WRITE,
+                PageSize::Size4K,
+            ),
+            (
+                VirtAddr::from_usize(0x9000),
+                PhysAddr::from_usize(0xa000),
+                MappingFlags::READ,
+                PageSize::Size4K,
+            ),
+        ]
+    );
+    assert_eq!(
+        table.collect_present_leaves(VirtAddr::from_usize(0), 0x20_000)?,
+        Vec::new()
+    );
+
+    {
+        let mut cursor = table.cursor();
+        cursor.map(
+            VirtAddr::from_usize(0x20_0000),
+            PhysAddr::from_usize(0x40_0000),
+            PageSize::Size2M,
+            MappingFlags::READ,
+        )?;
+    }
+    assert!(matches!(
+        {
+            let mut cursor = table.cursor();
+            cursor.drain_present_leaves(VirtAddr::from_usize(0x20_1000), 0x1000)
+        },
+        Err(PagingError::NotAligned)
+    ));
+    assert_eq!(
+        table.collect_present_leaves(VirtAddr::from_usize(0x20_0000), 0x20_0000)?,
+        vec![(
+            VirtAddr::from_usize(0x20_0000),
+            PhysAddr::from_usize(0x40_0000),
+            MappingFlags::READ,
+            PageSize::Size2M,
+        )]
+    );
+
+    {
+        let mut cursor = table.cursor();
+        cursor.map(
+            VirtAddr::from_usize(0x10_0000),
+            PhysAddr::from_usize(0x50_0000),
+            PageSize::Size4K,
+            MappingFlags::READ | MappingFlags::WRITE,
+        )?;
+    }
+    assert!(matches!(
+        {
+            let mut cursor = table.cursor();
+            cursor.drain_present_leaves(VirtAddr::from_usize(0x10_0000), 0x101000)
+        },
+        Err(PagingError::NotAligned)
+    ));
+    assert_eq!(
+        table.collect_present_leaves(VirtAddr::from_usize(0x10_0000), 0x30_0000)?,
+        vec![
+            (
+                VirtAddr::from_usize(0x10_0000),
+                PhysAddr::from_usize(0x50_0000),
+                MappingFlags::READ | MappingFlags::WRITE,
+                PageSize::Size4K,
+            ),
+            (
+                VirtAddr::from_usize(0x20_0000),
+                PhysAddr::from_usize(0x40_0000),
+                MappingFlags::READ,
+                PageSize::Size2M,
+            ),
+        ]
+    );
+
+    drop(table);
+    assert_eq!(
+        ALLOCATED.with_borrow(|it| it.len()),
+        0,
+        "Some frames were not deallocated"
+    );
+
+    Ok(())
+}
+
+#[test]
 #[cfg(any(target_arch = "riscv32", target_arch = "riscv64", docsrs))]
 fn test_dealloc_riscv() -> PagingResult<()> {
     run_test_for::<

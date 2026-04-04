@@ -366,6 +366,51 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
         Ok(())
     }
 
+    fn validate_drain_range_recursive(
+        &self,
+        table: &[PTE],
+        level: usize,
+        table_start: usize,
+        range_start: usize,
+        range_end: usize,
+    ) -> PagingResult {
+        let shift = 12 + (M::LEVELS - 1 - level) * 9;
+        let span = 1usize << shift;
+
+        for (index, entry) in table.iter().enumerate() {
+            if !entry.is_present() {
+                continue;
+            }
+
+            let entry_start = table_start + (index << shift);
+            let Some(entry_end) = entry_start.checked_add(span) else {
+                return Err(PagingError::NotAligned);
+            };
+            if entry_end <= range_start || entry_start >= range_end {
+                continue;
+            }
+
+            let is_leaf = level == M::LEVELS - 1 || entry.is_huge();
+            if is_leaf {
+                if range_start > entry_start || range_end < entry_end {
+                    return Err(PagingError::NotAligned);
+                }
+                continue;
+            }
+
+            let child = self.next_table(entry)?;
+            self.validate_drain_range_recursive(
+                child,
+                level + 1,
+                entry_start,
+                range_start,
+                range_end,
+            )?;
+        }
+
+        Ok(())
+    }
+
     fn dealloc_tree(&self, table_paddr: PhysAddr, level: usize) {
         // don't free the entries in last level, they are not array.
         if level < M::LEVELS - 1 {
@@ -434,6 +479,83 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
             }
             TlbFlusher::Full => {}
         }
+    }
+
+    fn drain_present_leaves_recursive(
+        &mut self,
+        table_paddr: PhysAddr,
+        level: usize,
+        table_start: usize,
+        range_start: usize,
+        range_end: usize,
+        out: &mut Vec<(M::VirtAddr, PhysAddr, MappingFlags, PageSize)>,
+    ) -> PagingResult {
+        let shift = 12 + (M::LEVELS - 1 - level) * 9;
+        let span = 1usize << shift;
+
+        for index in 0..ENTRY_COUNT {
+            let entry_start = table_start + (index << shift);
+            let Some(entry_end) = entry_start.checked_add(span) else {
+                return Err(PagingError::NotAligned);
+            };
+
+            enum DrainStep {
+                Skip,
+                Preserve,
+                Leaf(PhysAddr, MappingFlags, PageSize),
+                Child(PhysAddr),
+            }
+
+            let step = {
+                let table = self.inner.table_of_mut(table_paddr);
+                let entry = &mut table[index];
+                if !entry.is_present() {
+                    DrainStep::Skip
+                } else if entry_end <= range_start || entry_start >= range_end {
+                    DrainStep::Preserve
+                } else {
+                    let is_leaf = level == M::LEVELS - 1 || entry.is_huge();
+                    if is_leaf {
+                        if range_start > entry_start || range_end < entry_end {
+                            return Err(PagingError::NotAligned);
+                        }
+                        let page_size = match span {
+                            x if x == PageSize::Size4K as usize => PageSize::Size4K,
+                            x if x == PageSize::Size2M as usize => PageSize::Size2M,
+                            x if x == PageSize::Size1G as usize => PageSize::Size1G,
+                            x if x == PageSize::Size1M as usize => PageSize::Size1M,
+                            _ => return Err(PagingError::NotAligned),
+                        };
+                        let leaf = DrainStep::Leaf(entry.paddr(), entry.flags(), page_size);
+                        entry.clear();
+                        leaf
+                    } else {
+                        DrainStep::Child(entry.paddr())
+                    }
+                }
+            };
+
+            match step {
+                DrainStep::Skip => {}
+                DrainStep::Preserve => {}
+                DrainStep::Leaf(paddr, flags, page_size) => {
+                    out.push((entry_start.into(), paddr, flags, page_size));
+                    self.push(entry_start.into());
+                }
+                DrainStep::Child(child_paddr) => {
+                    self.drain_present_leaves_recursive(
+                        child_paddr,
+                        level + 1,
+                        entry_start,
+                        range_start,
+                        range_end,
+                        out,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Maps a virtual page to a physical frame with the given `page_size`
@@ -607,6 +729,39 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
             size -= page_size as usize;
         }
         Ok(())
+    }
+
+    /// Removes and returns the present leaf mappings fully contained in the
+    /// given range.
+    ///
+    /// This is a destructive counterpart to `collect_present_leaves()`: it
+    /// first validates that the requested range does not partially overlap any
+    /// present leaf, then clears matching leaves in place and returns them.
+    pub fn drain_present_leaves(
+        &mut self,
+        start: M::VirtAddr,
+        size: usize,
+    ) -> PagingResult<Vec<(M::VirtAddr, PhysAddr, MappingFlags, PageSize)>> {
+        let start_usize: usize = start.into();
+        let end_usize = start_usize.checked_add(size).ok_or(PagingError::NotAligned)?;
+        if !PageSize::Size4K.is_aligned(start_usize) || !PageSize::Size4K.is_aligned(size) {
+            return Err(PagingError::NotAligned);
+        }
+
+        let root = self.inner.table_of(self.inner.root_paddr());
+        self.inner
+            .validate_drain_range_recursive(root, 0, 0, start_usize, end_usize)?;
+
+        let mut leaves = Vec::new();
+        self.drain_present_leaves_recursive(
+            self.inner.root_paddr(),
+            0,
+            0,
+            start_usize,
+            end_usize,
+            &mut leaves,
+        )?;
+        Ok(leaves)
     }
 
     /// Updates mapping flags of a contiguous virtual memory region.
