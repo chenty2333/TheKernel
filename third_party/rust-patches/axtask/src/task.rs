@@ -13,7 +13,7 @@ use core::{
     task::{Context, Poll},
 };
 
-use axhal::context::TaskContext;
+use axhal::{context::TaskContext, mem::total_ram_size};
 #[cfg(feature = "tls")]
 use axhal::tls::TlsArea;
 use futures_util::task::AtomicWaker;
@@ -483,7 +483,18 @@ impl StackCache {
 static STACK_CACHE: SpinNoIrq<StackCache> = SpinNoIrq::new(StackCache::new());
 
 impl TaskStack {
-    const MAX_CACHED_STACK_BYTES: usize = 16 * 1024 * 1024;
+    const MIB: usize = 1024 * 1024;
+
+    fn max_cached_stack_bytes() -> usize {
+        let ram = total_ram_size();
+        if ram <= 512 * Self::MIB {
+            16 * Self::MIB
+        } else if ram <= 2 * 1024 * Self::MIB {
+            64 * Self::MIB
+        } else {
+            128 * Self::MIB
+        }
+    }
 
     pub fn alloc(size: usize) -> Self {
         let layout = Layout::from_size_align(size, 16).unwrap();
@@ -523,7 +534,7 @@ impl TaskStack {
         let mut cache = STACK_CACHE.lock();
         let key = Self::cache_key(layout);
         let over_budget =
-            cache.cached_bytes > Self::MAX_CACHED_STACK_BYTES.saturating_sub(layout.size());
+            cache.cached_bytes > Self::max_cached_stack_bytes().saturating_sub(layout.size());
         let stacks = cache.stacks.entry(key).or_default();
         // The byte budget is the real bound; a small per-layout count cap only
         // forces allocator churn for bursty workloads that repeatedly create

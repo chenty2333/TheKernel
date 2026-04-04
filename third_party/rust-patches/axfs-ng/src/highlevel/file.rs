@@ -11,7 +11,7 @@ use axalloc::{UsageKind, global_allocator};
 use axfs_ng_vfs::{
     FileNode, Location, NodeFlags, NodePermission, NodeType, VfsError, VfsResult, path::Path,
 };
-use axhal::mem::{PhysAddr, VirtAddr, virt_to_phys};
+use axhal::mem::{PhysAddr, VirtAddr, total_ram_size, virt_to_phys};
 use axio::{SeekFrom, prelude::*};
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
@@ -362,6 +362,19 @@ impl Drop for PageCache {
 
 type EvictListenerFn = Box<dyn Fn(u32, &PageCache) + Send + Sync>;
 
+fn per_file_page_cache_capacity() -> NonZeroUsize {
+    const MIB: usize = 1024 * 1024;
+    let ram = total_ram_size();
+    let pages = if ram <= 512 * MIB {
+        64
+    } else if ram <= 2 * 1024 * MIB {
+        256
+    } else {
+        512
+    };
+    NonZeroUsize::new(pages).unwrap()
+}
+
 struct EvictListener {
     listener: EvictListenerFn,
     link: LinkedListAtomicLink,
@@ -377,7 +390,7 @@ struct CachedFileShared {
 impl CachedFileShared {
     pub fn new() -> Self {
         Self {
-            page_cache: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
+            page_cache: Mutex::new(LruCache::new(per_file_page_cache_capacity())),
             evict_listeners: Mutex::new(LinkedList::default()),
         }
     }
