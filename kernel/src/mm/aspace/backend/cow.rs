@@ -236,27 +236,23 @@ impl CowBackend {
         size: usize,
         pt: &mut PageTableCursor,
     ) -> AxResult {
-        let old_range = VirtAddrRange::from_start_size(old_start, size);
-        let new_pages = pages_in(VirtAddrRange::from_start_size(new_start, size), self.size)?;
-        for (old_addr, new_addr) in pages_in(old_range, self.size)?.zip(new_pages) {
-            match pt.query(old_addr) {
-                Ok((paddr, flags, page_size)) => {
-                    assert_eq!(page_size, self.size);
-                    let frame = FRAME_TABLE
-                        .lock()
-                        .get_frame_ref(paddr)
-                        .ok_or(AxError::BadAddress)?;
-                    let mut frame = frame.lock();
-                    if frame.0 == u8::MAX {
-                        return Err(AxError::BadAddress);
-                    }
-                    frame.0 += 1;
-                    drop(frame);
-                    pt.map(new_addr, paddr, self.size, flags)?;
-                }
-                Err(PagingError::NotMapped) => {}
-                Err(_) => return Err(AxError::BadAddress),
+        pages_in(VirtAddrRange::from_start_size(old_start, size), self.size)?;
+        pages_in(VirtAddrRange::from_start_size(new_start, size), self.size)?;
+        let materialized = pt.collect_present_leaves(old_start, size)?;
+        for (old_addr, paddr, flags, page_size) in materialized {
+            assert_eq!(page_size, self.size);
+            let new_addr = new_start + old_addr.sub_addr(old_start);
+            let frame = FRAME_TABLE
+                .lock()
+                .get_frame_ref(paddr)
+                .ok_or(AxError::BadAddress)?;
+            let mut frame = frame.lock();
+            if frame.0 == u8::MAX {
+                return Err(AxError::BadAddress);
             }
+            frame.0 += 1;
+            drop(frame);
+            pt.map(new_addr, paddr, self.size, flags)?;
         }
         Ok(())
     }
@@ -279,18 +275,18 @@ impl BackendOps for CowBackend {
 
     fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult {
         debug!("Cow::unmap: {range:?}");
-        for addr in pages_in(range, self.size)? {
-            if let Ok((frame, _flags, page_size)) = pt.unmap(addr) {
-                assert_eq!(page_size, self.size);
-                let frame_ref = FRAME_TABLE
-                    .lock()
-                    .get_frame_ref(frame)
-                    .ok_or(AxError::BadAddress)?;
-                let mut frame_ref = frame_ref.lock();
-                frame_ref.drop_frame(frame, self.size);
-            } else {
-                // Deallocation is needn't if the page is not allocated.
-            }
+        pages_in(range, self.size)?;
+        let materialized = pt.collect_present_leaves(range.start, range.size())?;
+        for (addr, _, _, page_size) in materialized {
+            let (frame, _flags, unmapped_size) = pt.unmap(addr).map_err(AxError::from)?;
+            assert_eq!(page_size, unmapped_size);
+            assert_eq!(page_size, self.size);
+            let frame_ref = FRAME_TABLE
+                .lock()
+                .get_frame_ref(frame)
+                .ok_or(AxError::BadAddress)?;
+            let mut frame_ref = frame_ref.lock();
+            frame_ref.drop_frame(frame, self.size);
         }
         Ok(())
     }
@@ -336,34 +332,27 @@ impl BackendOps for CowBackend {
         _new_aspace: &Arc<Mutex<AddrSpace>>,
     ) -> AxResult<Backend> {
         let cow_flags = flags - MappingFlags::WRITE;
-
-        for vaddr in pages_in(range, self.size)? {
-            // Copy data from old memory area to new memory area.
-            match old_pt.query(vaddr) {
-                Ok((paddr, _, page_size)) => {
-                    assert_eq!(page_size, self.size);
-                    // If the page is mapped in the old page table:
-                    // - Update its permissions in the old page table using `flags`.
-                    // - Map the same physical page into the new page table at the same
-                    // virtual address, with the same page size and `flags`.
-                    let frame = FRAME_TABLE
-                        .lock()
-                        .get_frame_ref(paddr)
-                        .ok_or(AxError::BadAddress)?;
-                    let mut frame = frame.lock();
-                    assert!(frame.0 > 0, "referencing unreferenced frame");
-                    frame.0 += 1;
-                    if frame.0 == u8::MAX {
-                        warn!("frame reference count overflow");
-                        return Err(AxError::BadAddress);
-                    }
-                    old_pt.protect(vaddr, cow_flags)?;
-                    new_pt.map(vaddr, paddr, self.size, cow_flags)?;
-                }
-                // If the page is not mapped, skip it.
-                Err(PagingError::NotMapped) => {}
-                Err(_) => return Err(AxError::BadAddress),
-            };
+        pages_in(range, self.size)?;
+        let materialized = old_pt.collect_present_leaves(range.start, range.size())?;
+        for (vaddr, paddr, _, page_size) in materialized {
+            assert_eq!(page_size, self.size);
+            // If the page is mapped in the old page table:
+            // - Update its permissions in the old page table using `flags`.
+            // - Map the same physical page into the new page table at the same
+            // virtual address, with the same page size and `flags`.
+            let frame = FRAME_TABLE
+                .lock()
+                .get_frame_ref(paddr)
+                .ok_or(AxError::BadAddress)?;
+            let mut frame = frame.lock();
+            assert!(frame.0 > 0, "referencing unreferenced frame");
+            frame.0 += 1;
+            if frame.0 == u8::MAX {
+                warn!("frame reference count overflow");
+                return Err(AxError::BadAddress);
+            }
+            old_pt.protect(vaddr, cow_flags)?;
+            new_pt.map(vaddr, paddr, self.size, cow_flags)?;
         }
 
         Ok(Backend::Cow(self.clone()))

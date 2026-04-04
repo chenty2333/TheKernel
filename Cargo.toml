@@ -99,3 +99,4 @@ axsched = { path = "third_party/rust-patches/axsched" }
 axtask = { path = "third_party/rust-patches/axtask" }
 axruntime = { path = "third_party/rust-patches/axruntime" }
 memory_set = { path = "third_party/rust-patches/memory_set" }
+page_table_multiarch = { path = "third_party/rust-patches/page_table_multiarch" }
