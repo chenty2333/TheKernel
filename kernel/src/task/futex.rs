@@ -34,6 +34,7 @@ pub struct WaitQueue {
 struct WaiterEntry {
     bitset: u32,
     awakened: bool,
+    cancelled: bool,
     owner: Weak<FutexEntry>,
     waker: Option<Waker>,
 }
@@ -52,30 +53,34 @@ impl<F> Unpin for WaitFuture<'_, F> {}
 impl<F> Drop for WaitFuture<'_, F> {
     fn drop(&mut self) {
         if let Some(waiter) = self.waiter.take() {
+            // Mark the waiter as cancelled first so future requeues can no
+            // longer keep moving it between futex queues.
+            let mut owner = {
+                let mut waiter = waiter.lock();
+                if waiter.awakened {
+                    return;
+                }
+                waiter.cancelled = true;
+                waiter.owner.clone()
+            };
+
             loop {
-                let owner = {
-                    let waiter = waiter.lock();
-                    if waiter.awakened {
-                        return;
-                    }
-                    waiter.owner.clone()
-                };
-                let Some(owner) = owner.upgrade() else {
+                let Some(owner_entry) = owner.upgrade() else {
                     return;
                 };
 
-                let _gate = owner.wq.gate.lock();
-                let still_owned = {
-                    let waiter = waiter.lock();
-                    if waiter.awakened {
+                let _gate = owner_entry.wq.gate.lock();
+                owner = {
+                    let waiter_entry = waiter.lock();
+                    if waiter_entry.awakened {
                         return;
                     }
-                    Weak::ptr_eq(&waiter.owner, &Arc::downgrade(&owner))
+                    if Weak::ptr_eq(&waiter_entry.owner, &Arc::downgrade(&owner_entry)) {
+                        owner_entry.wq.remove_waiter_locked(&waiter);
+                        return;
+                    }
+                    waiter_entry.owner.clone()
                 };
-                if still_owned {
-                    owner.wq.remove_waiter_locked(&waiter);
-                    return;
-                }
             }
         }
     }
@@ -111,6 +116,7 @@ impl<F: FnOnce() -> AxResult<bool>> Future for WaitFuture<'_, F> {
         let waiter = Arc::new(SpinNoIrq::new(WaiterEntry {
             bitset: self.bitset,
             awakened: false,
+            cancelled: false,
             owner: self.owner.clone(),
             waker: Some(cx.waker().clone()),
         }));
@@ -191,7 +197,9 @@ impl WaitQueue {
         let mut woke = 0;
         self.queue.lock().retain(|waiter| {
             let mut waiter = waiter.lock();
-            if woke >= count || (waiter.bitset & mask) == 0 {
+            if waiter.cancelled {
+                false
+            } else if woke >= count || (waiter.bitset & mask) == 0 {
                 true
             } else {
                 waiter.awakened = true;
@@ -219,7 +227,9 @@ impl WaitQueue {
     ) -> usize {
         if core::ptr::eq(self, target) {
             let _gate = self.gate.lock();
-            count = count.min(self.queue.lock().len());
+            let mut queue = self.queue.lock();
+            queue.retain(|waiter| !waiter.lock().cancelled);
+            count = count.min(queue.len());
             return count;
         } else if (self as *const Self as usize) < (target as *const Self as usize) {
             let _self_gate = self.gate.lock();
@@ -228,11 +238,23 @@ impl WaitQueue {
             let mut dst = target.queue.lock();
             count = count.min(src.len());
             let tasks: Vec<_> = src.drain(..count).collect();
-            for waiter in &tasks {
-                waiter.lock().owner = target_owner.clone();
+            let mut moved = 0;
+            for waiter in tasks {
+                let move_waiter = {
+                    let mut waiter = waiter.lock();
+                    if waiter.cancelled || waiter.awakened {
+                        false
+                    } else {
+                        waiter.owner = target_owner.clone();
+                        true
+                    }
+                };
+                if move_waiter {
+                    dst.push_back(waiter);
+                    moved += 1;
+                }
             }
-            dst.extend(tasks);
-            return count;
+            return moved;
         } else {
             let _target_gate = target.gate.lock();
             let _self_gate = self.gate.lock();
@@ -240,11 +262,23 @@ impl WaitQueue {
             let mut dst = target.queue.lock();
             count = count.min(src.len());
             let tasks: Vec<_> = src.drain(..count).collect();
-            for waiter in &tasks {
-                waiter.lock().owner = target_owner.clone();
+            let mut moved = 0;
+            for waiter in tasks {
+                let move_waiter = {
+                    let mut waiter = waiter.lock();
+                    if waiter.cancelled || waiter.awakened {
+                        false
+                    } else {
+                        waiter.owner = target_owner.clone();
+                        true
+                    }
+                };
+                if move_waiter {
+                    dst.push_back(waiter);
+                    moved += 1;
+                }
             }
-            dst.extend(tasks);
-            return count;
+            return moved;
         }
     }
 }
@@ -291,6 +325,38 @@ mod tests {
 
         drop(wait);
         assert!(dst.wq.is_empty());
+    }
+
+    #[test]
+    fn requeue_skips_cancelled_waiters() {
+        let src = Arc::new(FutexEntry::new());
+        let dst = Arc::new(FutexEntry::new());
+        src.wq.queue.lock().push_back(Arc::new(SpinNoIrq::new(WaiterEntry {
+            bitset: u32::MAX,
+            awakened: false,
+            cancelled: true,
+            owner: Arc::downgrade(&src),
+            waker: None,
+        })));
+
+        assert_eq!(src.wq.requeue(1, &dst.wq, Arc::downgrade(&dst)), 0);
+        assert!(src.wq.is_empty());
+        assert!(dst.wq.is_empty());
+    }
+
+    #[test]
+    fn wake_discards_cancelled_waiters() {
+        let src = Arc::new(FutexEntry::new());
+        src.wq.queue.lock().push_back(Arc::new(SpinNoIrq::new(WaiterEntry {
+            bitset: u32::MAX,
+            awakened: false,
+            cancelled: true,
+            owner: Arc::downgrade(&src),
+            waker: None,
+        })));
+
+        assert_eq!(src.wq.wake(1, u32::MAX), 0);
+        assert!(src.wq.is_empty());
     }
 }
 
