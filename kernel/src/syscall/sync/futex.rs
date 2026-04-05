@@ -1,6 +1,7 @@
-use core::{sync::atomic::Ordering, time::Duration};
+use alloc::sync::Arc;
+use core::time::Duration;
 
-use axerrno::{AxError, AxResult, LinuxError};
+use axerrno::{AxError, AxResult};
 use axtask::current;
 use linux_raw_sys::general::{
     FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_REQUEUE, FUTEX_WAIT,
@@ -71,20 +72,16 @@ fn do_futex_wait(
     let futex_table = futex_table_for(&key);
     let futex = futex_table.get_or_insert(&key);
 
-    if !futex
-        .wq
-        .wait_if(bitset, timeout.map(|it| (it.clock, it.deadline)), || {
-            Ok(uaddr.vm_read()? == value)
-        })?
-    {
+    if !futex.wq.wait_if(
+        Arc::downgrade(&futex),
+        bitset,
+        timeout.map(|it| (it.clock, it.deadline)),
+        || Ok(uaddr.vm_read()? == value),
+    )? {
         return Err(AxError::WouldBlock);
     }
 
-    if futex.owner_dead.swap(false, Ordering::SeqCst) {
-        Err(AxError::from(LinuxError::EOWNERDEAD))
-    } else {
-        Ok(0)
-    }
+    Ok(0)
 }
 
 pub(crate) fn restart_futex_wait(block: FutexWaitRestart) -> AxResult<isize> {
@@ -168,7 +165,10 @@ pub fn sys_futex(
             if let Some(futex) = futex {
                 count = futex.wq.wake(value as _, u32::MAX);
                 if count == value as usize {
-                    count += futex.wq.requeue(value2 as _, &futex2.wq) as usize;
+                    count += futex
+                        .wq
+                        .requeue(value2 as _, &futex2.wq, Arc::downgrade(&futex2))
+                        as usize;
                 }
             }
             Ok(count as _)
@@ -182,7 +182,11 @@ pub fn sys_get_robust_list(
     head: *mut *const robust_list_head,
     size: *mut usize,
 ) -> AxResult<isize> {
-    let task = get_visible_task(tid)?;
+    let task = if tid == 0 {
+        current().clone()
+    } else {
+        get_visible_task(tid)?
+    };
     head.vm_write(task.as_thread().robust_list_head() as _)?;
     size.vm_write(size_of::<robust_list_head>())?;
 

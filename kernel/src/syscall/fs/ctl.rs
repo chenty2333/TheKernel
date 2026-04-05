@@ -1,4 +1,4 @@
-use alloc::{ffi::CString, vec, vec::Vec};
+use alloc::{ffi::CString, sync::Arc, vec, vec::Vec};
 use core::{
     ffi::{c_char, c_int},
     mem::offset_of,
@@ -7,7 +7,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axfs::{FS_CONTEXT, FsContext};
-use axfs_ng_vfs::{MetadataUpdate, NodePermission, NodeType, path::Path};
+use axfs_ng_vfs::{Location, MetadataUpdate, NodePermission, NodeType, path::Path};
 use axhal::time::wall_time;
 use axtask::current;
 use linux_raw_sys::{
@@ -22,6 +22,31 @@ use crate::{
     task::AsThread,
     time::TimeValueLike,
 };
+
+const SUPPORTED_RENAMEAT2_FLAGS: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
+
+fn resolve_existing_at(dirfd: i32, path: &Path) -> AxResult<Option<Location>> {
+    with_fs(dirfd, |fs| match fs.resolve_no_follow(path) {
+        Ok(loc) => Ok(Some(loc)),
+        Err(AxError::NotFound) => Ok(None),
+        Err(err) => Err(err),
+    })
+}
+
+fn same_entry_at(
+    old_dirfd: i32,
+    old_path: &Path,
+    new_dirfd: i32,
+    new_path: &Path,
+) -> AxResult<bool> {
+    let Some(old) = resolve_existing_at(old_dirfd, old_path)? else {
+        return Ok(false);
+    };
+    let Some(new) = resolve_existing_at(new_dirfd, new_path)? else {
+        return Ok(false);
+    };
+    Ok(old.inode() == new.inode() && Arc::ptr_eq(old.mountpoint(), new.mountpoint()))
+}
 
 /// The ioctl() system call manipulates the underlying device parameters
 /// of special files.
@@ -506,6 +531,19 @@ pub fn sys_renameat2(
          new_path: {new_path}, flags: {flags}"
     );
 
+    if flags & !SUPPORTED_RENAMEAT2_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & RENAME_EXCHANGE != 0 && flags & RENAME_NOREPLACE != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & RENAME_EXCHANGE != 0 {
+        return Err(AxError::Unsupported);
+    }
+    if flags & RENAME_WHITEOUT != 0 {
+        return Err(AxError::Unsupported);
+    }
+
     let old_path = Path::new(&old_path);
     let new_path = Path::new(&new_path);
     let old_is_root = with_fs(old_dirfd, |fs| Ok(fs.path_refers_to_root(old_path)))?;
@@ -529,10 +567,18 @@ pub fn sys_renameat2(
         return Err(AxError::ResourceBusy);
     }
 
-    let (old_dir, old_name) = with_fs(old_dirfd, |fs| fs.resolve_parent(old_path))?;
-    let (new_dir, new_name) = with_fs(new_dirfd, |fs| fs.resolve_nonexistent(new_path))?;
+    if same_entry_at(old_dirfd, old_path, new_dirfd, new_path)? {
+        return Ok(0);
+    }
 
-    old_dir.rename(&old_name, &new_dir, new_name)?;
+    let (old_dir, old_name) = with_fs(old_dirfd, |fs| fs.resolve_parent(old_path))?;
+    let (new_dir, new_name) = with_fs(new_dirfd, |fs| fs.resolve_parent(new_path))?;
+
+    if flags & RENAME_NOREPLACE != 0 && resolve_existing_at(new_dirfd, new_path)?.is_some() {
+        return Err(AxError::AlreadyExists);
+    }
+
+    old_dir.rename(&old_name, &new_dir, &new_name)?;
     Ok(0)
 }
 

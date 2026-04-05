@@ -251,6 +251,44 @@ impl ElfLoader {
 
 static ELF_LOADER: Mutex<ElfLoader> = Mutex::new(ElfLoader::new());
 
+const SCRIPT_INTERPRETERS: &[&str] =
+    &["/musl/busybox", "/glibc/busybox", "/busybox", "/bin/busybox", "/bin/sh"];
+
+fn script_interpreter_args(shell: &str, path: &str, args: &[String]) -> Vec<String> {
+    let mut new_args = vec![shell.to_owned()];
+    if shell.ends_with("busybox") {
+        new_args.push("sh".to_owned());
+    }
+    new_args.extend(iter::once(path.to_owned()).chain(args.iter().skip(1).cloned()));
+    new_args
+}
+
+fn try_load_script_with_fallback(
+    uspace: &mut AddrSpace,
+    path: &str,
+    args: &[String],
+    envs: &[String],
+) -> AxResult<(VirtAddr, VirtAddr)> {
+    let mut last_err = AxError::NotFound;
+
+    for shell in SCRIPT_INTERPRETERS.iter().copied() {
+        if FS_CONTEXT.lock().resolve(shell).is_err() {
+            continue;
+        }
+
+        let new_args = script_interpreter_args(shell, path, args);
+        match load_user_app(uspace, None, &new_args, envs) {
+            Ok(result) => return Ok(result),
+            Err(err @ (AxError::NotFound | AxError::InvalidExecutable | AxError::InvalidInput)) => {
+                last_err = err
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_err)
+}
+
 /// Clear the ELF cache.
 ///
 /// Useful for removing noises during memory leak detect.
@@ -279,14 +317,6 @@ pub fn load_user_app(
         .or_else(|| args.first().map(String::as_str))
         .ok_or(AxError::InvalidInput)?;
 
-    // FIXME: impl `/proc/self/exe` to let busybox retry running
-    if path.ends_with(".sh") {
-        let new_args: Vec<String> = iter::once("/bin/sh".to_owned())
-            .chain(args.iter().cloned())
-            .collect();
-        return load_user_app(uspace, None, &new_args, envs);
-    }
-
     let (entry, auxv) = match { ELF_LOADER.lock().load(uspace, path)? } {
         Ok((entry, auxv)) => (entry, auxv),
         Err(data) => {
@@ -303,6 +333,11 @@ pub fn load_user_app(
                     .chain(args.iter().skip(1).cloned())
                     .collect();
                 return load_user_app(uspace, None, &new_args, envs);
+            }
+            // Keep `.sh` fallback for scripts without a shebang while still
+            // allowing shebang-based interpreters such as `/musl/busybox sh`.
+            if path.ends_with(".sh") {
+                return try_load_script_with_fallback(uspace, path, args, envs);
             }
             return Err(AxError::InvalidExecutable);
         }

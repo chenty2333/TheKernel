@@ -8,7 +8,6 @@ use alloc::{
 use core::{
     future::{Future, poll_fn},
     ops::Deref,
-    sync::atomic::AtomicBool,
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -35,12 +34,13 @@ pub struct WaitQueue {
 struct WaiterEntry {
     bitset: u32,
     awakened: bool,
-    queue: usize,
+    owner: Weak<FutexEntry>,
     waker: Option<Waker>,
 }
 
 struct WaitFuture<'a, F> {
     queue: &'a WaitQueue,
+    owner: Weak<FutexEntry>,
     bitset: u32,
     timeout: Option<(AlarmClock, Duration)>,
     condition: Option<F>,
@@ -52,12 +52,31 @@ impl<F> Unpin for WaitFuture<'_, F> {}
 impl<F> Drop for WaitFuture<'_, F> {
     fn drop(&mut self) {
         if let Some(waiter) = self.waiter.take() {
-            let queue = waiter.lock().queue;
-            // SAFETY: the waiter's owner is always the live wait queue that
-            // currently contains it. Requeue updates this pointer before
-            // moving the waiter, and a futex entry is not dropped while its
-            // queue still holds waiters.
-            unsafe { &*(queue as *const WaitQueue) }.remove_waiter(&waiter);
+            loop {
+                let owner = {
+                    let waiter = waiter.lock();
+                    if waiter.awakened {
+                        return;
+                    }
+                    waiter.owner.clone()
+                };
+                let Some(owner) = owner.upgrade() else {
+                    return;
+                };
+
+                let _gate = owner.wq.gate.lock();
+                let still_owned = {
+                    let waiter = waiter.lock();
+                    if waiter.awakened {
+                        return;
+                    }
+                    Weak::ptr_eq(&waiter.owner, &Arc::downgrade(&owner))
+                };
+                if still_owned {
+                    owner.wq.remove_waiter_locked(&waiter);
+                    return;
+                }
+            }
         }
     }
 }
@@ -92,7 +111,7 @@ impl<F: FnOnce() -> AxResult<bool>> Future for WaitFuture<'_, F> {
         let waiter = Arc::new(SpinNoIrq::new(WaiterEntry {
             bitset: self.bitset,
             awakened: false,
-            queue: self.queue as *const WaitQueue as usize,
+            owner: self.owner.clone(),
             waker: Some(cx.waker().clone()),
         }));
         self.queue.queue.lock().push_back(waiter.clone());
@@ -104,11 +123,6 @@ impl WaitQueue {
     /// Creates a new `WaitQueue`.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    fn remove_waiter(&self, target: &Arc<SpinNoIrq<WaiterEntry>>) {
-        let _gate = self.gate.lock();
-        self.remove_waiter_locked(target);
     }
 
     fn remove_waiter_locked(&self, target: &Arc<SpinNoIrq<WaiterEntry>>) {
@@ -123,12 +137,14 @@ impl WaitQueue {
     /// occurs.
     pub fn wait_if(
         &self,
+        owner: Weak<FutexEntry>,
         bitset: u32,
         timeout: Option<(AlarmClock, Duration)>,
         condition: impl FnOnce() -> AxResult<bool>,
     ) -> AxResult<bool> {
         let wait = WaitFuture {
             queue: self,
+            owner,
             bitset,
             timeout,
             condition: Some(condition),
@@ -195,66 +211,71 @@ impl WaitQueue {
     }
 
     /// Requeue at most `count` tasks to the target wait queue.
-    pub fn requeue(&self, mut count: usize, target: &WaitQueue) -> usize {
-        let tasks: Vec<_>;
+    pub fn requeue(
+        &self,
+        mut count: usize,
+        target: &WaitQueue,
+        target_owner: Weak<FutexEntry>,
+    ) -> usize {
         if core::ptr::eq(self, target) {
             let _gate = self.gate.lock();
-            let mut wq = self.queue.lock();
-            count = count.min(wq.len());
-            tasks = wq.drain(..count).collect();
-            for waiter in &tasks {
-                waiter.lock().queue = target as *const WaitQueue as usize;
-            }
+            count = count.min(self.queue.lock().len());
+            return count;
         } else if (self as *const Self as usize) < (target as *const Self as usize) {
             let _self_gate = self.gate.lock();
             let _target_gate = target.gate.lock();
-            let mut wq = self.queue.lock();
-            count = count.min(wq.len());
-            tasks = wq.drain(..count).collect();
+            let mut src = self.queue.lock();
+            let mut dst = target.queue.lock();
+            count = count.min(src.len());
+            let tasks: Vec<_> = src.drain(..count).collect();
             for waiter in &tasks {
-                waiter.lock().queue = target as *const WaitQueue as usize;
+                waiter.lock().owner = target_owner.clone();
             }
+            dst.extend(tasks);
+            return count;
         } else {
             let _target_gate = target.gate.lock();
             let _self_gate = self.gate.lock();
-            let mut wq = self.queue.lock();
-            count = count.min(wq.len());
-            tasks = wq.drain(..count).collect();
+            let mut src = self.queue.lock();
+            let mut dst = target.queue.lock();
+            count = count.min(src.len());
+            let tasks: Vec<_> = src.drain(..count).collect();
             for waiter in &tasks {
-                waiter.lock().queue = target as *const WaitQueue as usize;
+                waiter.lock().owner = target_owner.clone();
             }
+            dst.extend(tasks);
+            return count;
         }
-        if !tasks.is_empty() {
-            let mut wq = target.queue.lock();
-            wq.extend(tasks);
-        }
-        count
     }
 }
 
 #[cfg(test)]
 mod tests {
     use core::task::{Context, Poll, Waker};
-    use std::sync::Once;
+
+    use spin::Once;
 
     use super::*;
 
-    static INIT: Once = Once::new();
+    static INIT: Once<()> = Once::new();
 
     fn init_scheduler() {
-        INIT.call_once(axtask::init_scheduler);
+        INIT.call_once(|| {
+            axtask::init_scheduler();
+        });
     }
 
     #[test]
     fn dropping_requeued_waiter_cleans_target_queue() {
         init_scheduler();
 
-        let src = WaitQueue::new();
-        let dst = WaitQueue::new();
+        let src = Arc::new(FutexEntry::new());
+        let dst = Arc::new(FutexEntry::new());
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         let mut wait = core::pin::pin!(WaitFuture {
-            queue: &src,
+            queue: &src.wq,
+            owner: Arc::downgrade(&src),
             bitset: u32::MAX,
             timeout: None,
             condition: Some(|| Ok(true)),
@@ -262,14 +283,14 @@ mod tests {
         });
 
         assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Pending));
-        assert!(!src.is_empty());
+        assert!(!src.wq.is_empty());
 
-        assert_eq!(src.requeue(1, &dst), 1);
-        assert!(src.is_empty());
-        assert!(!dst.is_empty());
+        assert_eq!(src.wq.requeue(1, &dst.wq, Arc::downgrade(&dst)), 1);
+        assert!(src.wq.is_empty());
+        assert!(!dst.wq.is_empty());
 
         drop(wait);
-        assert!(dst.is_empty());
+        assert!(dst.wq.is_empty());
     }
 }
 
@@ -331,16 +352,12 @@ impl FutexKey {
 pub struct FutexEntry {
     /// The wait queue associated with this futex.
     pub wq: WaitQueue,
-
-    /// Used by robust list, indicates if the owner of this futex is dead.
-    pub owner_dead: AtomicBool,
 }
 
 impl FutexEntry {
     fn new() -> Self {
         Self {
             wq: WaitQueue::new(),
-            owner_dead: AtomicBool::new(false),
         }
     }
 }

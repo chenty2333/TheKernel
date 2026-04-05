@@ -5,17 +5,17 @@ use alloc::{
     sync::{Arc, Weak},
 };
 
+#[cfg(feature = "sched-cfs")]
+pub use axsched::{
+    CfsTaskClass as SchedClass, CfsTaskParams as SchedState, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX,
+    RT_PRIORITY_MIN,
+};
 use kernel_guard::NoPreemptIrqSave;
 
 pub(crate) use crate::run_queue::{current_run_queue, select_run_queue};
 #[doc(cfg(all(feature = "multitask", feature = "task-ext")))]
 #[cfg(feature = "task-ext")]
 pub use crate::task::{AxTaskExt, TaskExt};
-#[cfg(feature = "sched-cfs")]
-pub use axsched::{
-    CfsTaskClass as SchedClass, CfsTaskParams as SchedState, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX,
-    RT_PRIORITY_MIN,
-};
 #[doc(cfg(all(feature = "multitask", feature = "irq")))]
 #[cfg(feature = "irq")]
 pub use crate::timers::register_timer_callback;
@@ -146,7 +146,10 @@ pub fn spawn_task(task: TaskInner) -> AxTaskRef {
 #[cfg(feature = "sched-cfs")]
 pub fn spawn_task_with_sched(task: TaskInner, sched_state: SchedState) -> AxTaskRef {
     let task_ref = task.into_arc();
-    assert!(task_ref.configure(sched_state), "invalid initial scheduling state");
+    assert!(
+        task_ref.configure(sched_state),
+        "invalid initial scheduling state"
+    );
     select_run_queue::<NoPreemptIrqSave>(&task_ref).add_task(task_ref.clone());
     task_ref
 }
@@ -220,14 +223,13 @@ pub fn sched_state(task: &AxTaskRef) -> SchedState {
 /// Applies the runtime scheduling state of a task.
 #[cfg(feature = "sched-cfs")]
 pub fn set_sched_state(task: &AxTaskRef, sched_state: SchedState) -> bool {
-    crate::run_queue::task_run_queue::<NoPreemptIrqSave>(task).set_task_sched_state(task, sched_state)
+    crate::run_queue::task_run_queue::<NoPreemptIrqSave>(task)
+        .set_task_sched_state(task, sched_state)
 }
 
 /// Set the affinity for the current task.
 /// [`AxCpuMask`] is used to specify the CPU affinity.
 /// Returns `true` if the affinity is set successfully.
-///
-/// TODO: support set the affinity for other tasks.
 pub fn set_current_affinity(cpumask: AxCpuMask) -> bool {
     if cpumask.is_empty() {
         false
@@ -257,6 +259,53 @@ pub fn set_current_affinity(cpumask: AxCpuMask) -> bool {
             );
         }
         true
+    }
+}
+
+/// Sets the affinity for an arbitrary task.
+///
+/// For the current task this follows the existing migrate-current path. For a
+/// remote ready task, the task is moved onto a run queue allowed by the new
+/// mask immediately. For a remote running task, the new mask is recorded and
+/// the task is nudged so it can self-migrate at its next scheduling point.
+pub fn set_task_affinity(task: &AxTaskRef, cpumask: AxCpuMask) -> bool {
+    if cpumask.is_empty() {
+        return false;
+    }
+
+    if current().ptr_eq(task) {
+        return set_current_affinity(cpumask);
+    }
+
+    task.set_cpumask(cpumask);
+
+    #[cfg(feature = "smp")]
+    match task.state() {
+        TaskState::Ready => {
+            let _ =
+                crate::run_queue::task_run_queue::<NoPreemptIrqSave>(task).migrate_ready_task(task);
+            !matches!(task.state(), TaskState::Exited)
+        }
+        TaskState::Running => {
+            if !cpumask.get(task.cpu_id() as usize) {
+                #[cfg(feature = "preempt")]
+                task.set_preempt_pending(true);
+                task.interrupt();
+            }
+            true
+        }
+        TaskState::Blocked => {
+            if !cpumask.get(task.cpu_id() as usize) {
+                task.set_cpu_id(crate::run_queue::select_run_queue_index(cpumask) as _);
+            }
+            true
+        }
+        TaskState::Exited => false,
+    }
+
+    #[cfg(not(feature = "smp"))]
+    {
+        !matches!(task.state(), TaskState::Exited)
     }
 }
 

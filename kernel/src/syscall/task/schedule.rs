@@ -6,7 +6,7 @@ use axtask::{
     AxCpuMask, AxTaskRef, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN, SchedClass,
     SchedState, current,
     future::{block_on, interruptible},
-    sched_state, set_sched_state,
+    sched_state, set_sched_state, set_task_affinity,
 };
 use linux_raw_sys::general::{
     __kernel_clockid_t, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, PRIO_PGRP, PRIO_PROCESS,
@@ -48,7 +48,11 @@ fn sched_target(pid: i32) -> AxResult<AxTaskRef> {
     if pid < 0 {
         return Err(AxError::InvalidInput);
     }
-    get_task(pid as Pid)
+    if pid == 0 {
+        Ok(current().clone())
+    } else {
+        get_task(pid as Pid)
+    }
 }
 
 fn sched_class_from_policy(policy: i32) -> AxResult<SchedClass> {
@@ -64,7 +68,11 @@ fn sched_class_from_policy(policy: i32) -> AxResult<SchedClass> {
 }
 
 fn validate_static_priority(priority: i32) -> AxResult<u8> {
-    if priority == 0 { Ok(0) } else { Err(AxError::InvalidInput) }
+    if priority == 0 {
+        Ok(0)
+    } else {
+        Err(AxError::InvalidInput)
+    }
 }
 
 fn validate_rt_priority(priority: i32) -> AxResult<u8> {
@@ -115,6 +123,16 @@ fn state_nice(state: SchedState) -> i32 {
 
 fn raw_priority_from_nice(nice: i8) -> isize {
     20 - nice as isize
+}
+
+fn rr_interval_for_state(state: SchedState) -> Duration {
+    if matches!(state.class, SchedClass::RoundRobin) {
+        Duration::from_nanos(
+            RR_TIMESLICE_TICKS as u64 * (NANOS_PER_SEC / axconfig::TICKS_PER_SEC as u64),
+        )
+    } else {
+        Duration::ZERO
+    }
 }
 
 fn apply_sched_state(task: &AxTaskRef, state: SchedState) -> AxResult<isize> {
@@ -275,11 +293,7 @@ pub fn sys_sched_getaffinity(pid: i32, cpusetsize: usize, user_mask: *mut u8) ->
         return Err(AxError::InvalidInput);
     }
 
-    let mask = if pid == 0 {
-        current().cpumask()
-    } else {
-        sched_target(pid)?.cpumask()
-    };
+    let mask = sched_target(pid)?.cpumask();
     let mask_bytes = mask.as_bytes();
 
     vm_write_slice(user_mask, mask_bytes)?;
@@ -299,12 +313,14 @@ pub fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, user_mask: *const u8) 
     }
 
     if pid == 0 {
-        axtask::set_current_affinity(cpu_mask);
-    } else {
-        if cpu_mask.is_empty() {
+        if !axtask::set_current_affinity(cpu_mask) {
             return Err(AxError::InvalidInput);
         }
-        sched_target(pid)?.set_cpumask(cpu_mask);
+    } else {
+        let task = sched_target(pid)?;
+        if !set_task_affinity(&task, cpu_mask) {
+            return Err(AxError::InvalidInput);
+        }
     }
 
     Ok(0)
@@ -344,11 +360,10 @@ pub fn sys_sched_get_priority_min(policy: i32) -> AxResult<isize> {
 }
 
 pub fn sys_sched_rr_get_interval(pid: i32, interval: *mut timespec) -> AxResult<isize> {
-    let _ = sched_target(pid)?;
-    let rr_quantum = Duration::from_nanos(
-        RR_TIMESLICE_TICKS as u64 * (NANOS_PER_SEC / axconfig::TICKS_PER_SEC as u64),
-    );
-    interval.vm_write(timespec::from_time_value(rr_quantum))?;
+    let task = sched_target(pid)?;
+    interval.vm_write(timespec::from_time_value(rr_interval_for_state(
+        sched_state(&task),
+    )))?;
     Ok(0)
 }
 

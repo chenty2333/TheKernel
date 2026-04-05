@@ -84,7 +84,9 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
         size: usize,
     ) -> PagingResult<Vec<(M::VirtAddr, PhysAddr, MappingFlags, PageSize)>> {
         let start_usize: usize = start.into();
-        let end_usize = start_usize.checked_add(size).ok_or(PagingError::NotAligned)?;
+        let end_usize = start_usize
+            .checked_add(size)
+            .ok_or(PagingError::NotAligned)?;
         if !PageSize::Size4K.is_aligned(start_usize) || !PageSize::Size4K.is_aligned(size) {
             return Err(PagingError::NotAligned);
         }
@@ -288,24 +290,23 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
         for (i, entry) in table.iter().enumerate() {
             let vaddr_usize = start_vaddr_usize + (i << (12 + (M::LEVELS - 1 - level) * 9));
             let vaddr = vaddr_usize.into();
+            let is_leaf = level == M::LEVELS - 1 || entry.is_huge();
 
-            if entry.is_present() {
-                if let Some(func) = pre_func {
-                    func(level, i, vaddr, entry);
-                }
-                if level < M::LEVELS - 1
-                    && !entry.is_huge()
-                    && let Ok(table) = self.next_table(entry)
-                {
-                    self.walk_recursive(table, level + 1, vaddr, limit, pre_func, post_func);
-                }
-                if let Some(func) = post_func {
-                    func(level, i, vaddr, entry);
-                }
-                n += 1;
-                if n >= limit {
-                    break;
-                }
+            if entry.is_unused() || (is_leaf && !entry.is_present()) {
+                continue;
+            }
+            if let Some(func) = pre_func {
+                func(level, i, vaddr, entry);
+            }
+            if !is_leaf && let Ok(table) = self.next_table(entry) {
+                self.walk_recursive(table, level + 1, vaddr, limit, pre_func, post_func);
+            }
+            if let Some(func) = post_func {
+                func(level, i, vaddr, entry);
+            }
+            n += 1;
+            if n >= limit {
+                break;
             }
         }
     }
@@ -323,7 +324,8 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
         let span = 1usize << shift;
 
         for (index, entry) in table.iter().enumerate() {
-            if !entry.is_present() {
+            let is_leaf = level == M::LEVELS - 1 || entry.is_huge();
+            if entry.is_unused() || (is_leaf && !entry.is_present()) {
                 continue;
             }
 
@@ -335,7 +337,6 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
                 continue;
             }
 
-            let is_leaf = level == M::LEVELS - 1 || entry.is_huge();
             if !is_leaf {
                 let child = self.next_table(entry)?;
                 self.collect_present_leaves_recursive(
@@ -378,7 +379,8 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
         let span = 1usize << shift;
 
         for (index, entry) in table.iter().enumerate() {
-            if !entry.is_present() {
+            let is_leaf = level == M::LEVELS - 1 || entry.is_huge();
+            if entry.is_unused() || (is_leaf && !entry.is_present()) {
                 continue;
             }
 
@@ -390,7 +392,6 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
                 continue;
             }
 
-            let is_leaf = level == M::LEVELS - 1 || entry.is_huge();
             if is_leaf {
                 if range_start > entry_start || range_end < entry_end {
                     return Err(PagingError::NotAligned);
@@ -509,12 +510,12 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
             let step = {
                 let table = self.inner.table_of_mut(table_paddr);
                 let entry = &mut table[index];
-                if !entry.is_present() {
+                let is_leaf = level == M::LEVELS - 1 || entry.is_huge();
+                if entry.is_unused() || (is_leaf && !entry.is_present()) {
                     DrainStep::Skip
                 } else if entry_end <= range_start || entry_start >= range_end {
                     DrainStep::Preserve
                 } else {
-                    let is_leaf = level == M::LEVELS - 1 || entry.is_huge();
                     if is_leaf {
                         if range_start > entry_start || range_end < entry_end {
                             return Err(PagingError::NotAligned);
@@ -743,7 +744,9 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
         size: usize,
     ) -> PagingResult<Vec<(M::VirtAddr, PhysAddr, MappingFlags, PageSize)>> {
         let start_usize: usize = start.into();
-        let end_usize = start_usize.checked_add(size).ok_or(PagingError::NotAligned)?;
+        let end_usize = start_usize
+            .checked_add(size)
+            .ok_or(PagingError::NotAligned)?;
         if !PageSize::Size4K.is_aligned(start_usize) || !PageSize::Size4K.is_aligned(size) {
             return Err(PagingError::NotAligned);
         }

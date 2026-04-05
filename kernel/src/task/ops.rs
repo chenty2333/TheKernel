@@ -2,13 +2,16 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{ffi::c_long, sync::atomic::Ordering};
+use core::{
+    ffi::c_long,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use axerrno::{AxError, AxResult};
 use axtask::{AxTaskRef, TaskInner, WeakAxTaskRef, current};
 use bytemuck::AnyBitPattern;
 use kernel_guard::NoPreemptIrqSave;
-use linux_raw_sys::general::ROBUST_LIST_LIMIT;
+use linux_raw_sys::general::{FUTEX_OWNER_DIED, FUTEX_TID_MASK, FUTEX_WAITERS, ROBUST_LIST_LIMIT};
 use memory_addr::PhysAddr;
 use spin::RwLock;
 use starry_process::{Pid, ProcessGroup, Session, ZombieSnapshot};
@@ -16,13 +19,13 @@ use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 use weak_map::WeakMap;
 
-use crate::{
-    config::USER_HEAP_BASE,
-    mm::{copy_from_kernel, new_user_aspace_empty},
-};
 use super::{
     AsThread, FutexKey, ProcessData, TaskUsage, TimerState, futex_table_for,
     send_signal_thread_inner, send_signal_to_process, send_signal_to_thread,
+};
+use crate::{
+    config::USER_HEAP_BASE,
+    mm::{UserPtr, access_user_memory, copy_from_kernel, new_user_aspace_empty},
 };
 
 static TASK_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
@@ -227,16 +230,44 @@ fn handle_futex_death(entry: *mut RobustList, offset: i64) -> AxResult<()> {
         .checked_add_signed(offset)
         .ok_or(AxError::InvalidInput)?;
     let address: usize = address.try_into().map_err(|_| AxError::InvalidInput)?;
-    let key = FutexKey::new_current(address);
-
-    let futex_table = futex_table_for(&key);
-
-    let Some(futex) = futex_table.get(&key) else {
+    let uaddr = address as *mut u32;
+    if !mark_robust_owner_died(uaddr, current().as_thread().tid())? {
         return Ok(());
-    };
-    futex.owner_dead.store(true, Ordering::SeqCst);
-    futex.wq.wake(1, u32::MAX);
+    }
+
+    let key = FutexKey::new_current(address);
+    let futex_table = futex_table_for(&key);
+    if let Some(futex) = futex_table.get(&key) {
+        futex.wq.wake(1, u32::MAX);
+    }
     Ok(())
+}
+
+fn robust_owner_died_word(value: u32, tid: Pid) -> Option<u32> {
+    if value & FUTEX_TID_MASK != tid {
+        return None;
+    }
+    Some((value & FUTEX_WAITERS) | FUTEX_OWNER_DIED)
+}
+
+fn user_atomic_u32(uaddr: *mut u32) -> AxResult<&'static AtomicU32> {
+    Ok(UserPtr::<AtomicU32>::from(uaddr.cast()).get_as_mut()?)
+}
+
+fn mark_robust_owner_died(uaddr: *mut u32, tid: Pid) -> AxResult<bool> {
+    let word = user_atomic_u32(uaddr)?;
+    let mut value = access_user_memory(|| word.load(Ordering::Acquire));
+    loop {
+        let Some(next_value) = robust_owner_died_word(value, tid) else {
+            return Ok(false);
+        };
+        match access_user_memory(|| {
+            word.compare_exchange(value, next_value, Ordering::AcqRel, Ordering::Acquire)
+        }) {
+            Ok(_) => return Ok(true),
+            Err(observed) => value = observed,
+        }
+    }
 }
 
 pub fn exit_robust_list(head: *const RobustListHead) -> AxResult<()> {
@@ -262,6 +293,10 @@ pub fn exit_robust_list(head: *const RobustListHead) -> AxResult<()> {
             return Err(AxError::FilesystemLoop);
         }
         axtask::yield_now();
+    }
+
+    if !pending.is_null() {
+        handle_futex_death(pending, offset)?;
     }
 
     Ok(())
@@ -336,4 +371,23 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
         }
     }
     thr.set_exit();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn robust_owner_died_marks_matching_tid() {
+        let tid = 42;
+        assert_eq!(
+            robust_owner_died_word(FUTEX_WAITERS | tid, tid),
+            Some(FUTEX_WAITERS | FUTEX_OWNER_DIED)
+        );
+    }
+
+    #[test]
+    fn robust_owner_died_ignores_other_owner() {
+        assert_eq!(robust_owner_died_word(7, 42), None);
+    }
 }

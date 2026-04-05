@@ -200,7 +200,7 @@ pub(crate) fn current_run_queue<G: BaseGuard>() -> CurrentRunQueueRef<'static, G
 // The modulo operation is safe here because `axconfig::plat::MAX_CPU_NUM` is always greater than 1 with "smp" enabled.
 #[allow(clippy::modulo_one)]
 #[inline]
-fn select_run_queue_index(cpumask: AxCpuMask) -> usize {
+pub(crate) fn select_run_queue_index(cpumask: AxCpuMask) -> usize {
     use core::sync::atomic::{AtomicUsize, Ordering};
     static RUN_QUEUE_INDEX: AtomicUsize = AtomicUsize::new(0);
 
@@ -405,13 +405,43 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
     ) -> bool {
         self.inner.set_task_sched_state(task, sched_state)
     }
+
+    #[cfg(feature = "smp")]
+    pub fn migrate_ready_task(&mut self, task: &AxTaskRef) -> bool {
+        self.inner.migrate_ready_task(task)
+    }
 }
 
 /// Core functions of run queue.
 impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
+    #[cfg(feature = "smp")]
+    fn maybe_migrate_current(&mut self) -> bool {
+        let curr = &self.current_task;
+        if curr.cpumask().get(self.inner.cpu_id) {
+            return false;
+        }
+
+        const MIGRATION_TASK_STACK_SIZE: usize = 4096;
+        let migrated_task = curr.clone();
+        let migration_task = TaskInner::new(
+            move || crate::run_queue::migrate_entry(migrated_task),
+            "migration-task".into(),
+            MIGRATION_TASK_STACK_SIZE,
+        )
+        .into_arc();
+        self.migrate_current(migration_task);
+        true
+    }
+
     #[cfg(feature = "irq")]
     pub fn scheduler_timer_tick(&mut self) {
         let curr = &self.current_task;
+        #[cfg(feature = "smp")]
+        if !curr.cpumask().get(self.inner.cpu_id) {
+            #[cfg(feature = "preempt")]
+            curr.set_preempt_pending(true);
+            return;
+        }
         if !curr.is_idle() && self.inner.scheduler.lock().task_tick(curr) {
             #[cfg(feature = "preempt")]
             curr.set_preempt_pending(true);
@@ -425,6 +455,11 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         let curr = &self.current_task;
         trace!("task yield: {}", curr.id_name());
         assert!(curr.is_running());
+
+        #[cfg(feature = "smp")]
+        if self.maybe_migrate_current() {
+            return;
+        }
 
         self.inner
             .put_task_with_state(curr.clone(), TaskState::Running, false);
@@ -481,6 +516,10 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
             can_preempt
         );
         if can_preempt {
+            #[cfg(feature = "smp")]
+            if self.maybe_migrate_current() {
+                return;
+            }
             self.inner
                 .put_task_with_state(curr.clone(), TaskState::Running, true);
             self.inner.resched();
@@ -538,6 +577,11 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         #[cfg(feature = "preempt")]
         assert!(curr.can_preempt(2));
 
+        #[cfg(feature = "smp")]
+        if !curr.cpumask().get(self.inner.cpu_id) {
+            curr.set_cpu_id(select_run_queue_index(curr.cpumask()) as _);
+        }
+
         // Mark the task as blocked, this has to be done before adding it to the wait queue
         // while holding the lock of the wait queue.
         curr.set_state(TaskState::Blocked);
@@ -558,12 +602,39 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
             .lock()
             .set_priority(&self.current_task, prio)
     }
-
 }
 
 impl AxRunQueue {
+    #[cfg(feature = "smp")]
+    fn migrate_ready_task(&mut self, task: &AxTaskRef) -> bool {
+        if !matches!(task.state(), TaskState::Ready) {
+            return false;
+        }
+
+        let target_index = select_run_queue_index(task.cpumask());
+        if target_index == self.cpu_id {
+            return true;
+        }
+
+        let Some(task) = self.scheduler.lock().remove_task(task) else {
+            return false;
+        };
+
+        let target = get_run_queue(target_index);
+        task.set_cpu_id(target.cpu_id as _);
+        target
+            .scheduler
+            .lock()
+            .enqueue_task(task, EnqueueReason::Wakeup);
+        true
+    }
+
     #[cfg(feature = "sched-cfs")]
-    fn set_task_sched_state(&mut self, task: &AxTaskRef, sched_state: axsched::CfsTaskParams) -> bool {
+    fn set_task_sched_state(
+        &mut self,
+        task: &AxTaskRef,
+        sched_state: axsched::CfsTaskParams,
+    ) -> bool {
         match task.state() {
             TaskState::Ready => {
                 let mut scheduler = self.scheduler.lock();
@@ -583,7 +654,9 @@ impl AxRunQueue {
                     }
                 }
             }
-            TaskState::Running | TaskState::Blocked => self.scheduler.lock().set_task_params(task, sched_state),
+            TaskState::Running | TaskState::Blocked => {
+                self.scheduler.lock().set_task_params(task, sched_state)
+            }
             TaskState::Exited => false,
         }
     }
@@ -602,11 +675,11 @@ impl AxRunQueue {
         #[cfg(feature = "sched-cfs")]
         assert!(
             gc_task.configure(axsched::CfsTaskParams {
-                // Keep GC in the fair queue so thread-exit wakeups can hand control
-                // straight back to the joiner. Exited-task cleanup does not need
-                // RT priority.
-                class: axsched::CfsTaskClass::Batch,
-                nice: 19,
+                // Exited-task stacks are only recycled after the GC task runs.
+                // Keep it in the normal fair class so join-heavy thread bursts
+                // cannot outrun cleanup and exhaust kernel stack memory.
+                class: axsched::CfsTaskClass::Normal,
+                nice: 0,
                 rt_priority: 0,
                 reset_on_fork: false,
             }),

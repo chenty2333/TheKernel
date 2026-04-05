@@ -96,6 +96,134 @@ impl<M: PagingMetaData> PagingHandler for TrackPagingHandler<M> {
     }
 }
 
+struct TablePtrMeta;
+
+impl PagingMetaData for TablePtrMeta {
+    const LEVELS: usize = 4;
+    const PA_MAX_BITS: usize = 48;
+    const VA_MAX_BITS: usize = 48;
+
+    type VirtAddr = VirtAddr;
+
+    fn flush_tlb(_vaddr: Option<Self::VirtAddr>) {}
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TablePtrPte(u64);
+
+impl TablePtrPte {
+    const PRESENT: u64 = 1 << 0;
+    const HUGE: u64 = 1 << 1;
+    const READ: u64 = 1 << 2;
+    const WRITE: u64 = 1 << 3;
+    const EXECUTE: u64 = 1 << 4;
+    const USER: u64 = 1 << 5;
+    const DEVICE: u64 = 1 << 6;
+    const UNCACHED: u64 = 1 << 7;
+    const PHYS_ADDR_MASK: u64 = !0xfff;
+
+    fn flags_from_bits(bits: u64) -> MappingFlags {
+        let mut flags = MappingFlags::empty();
+        if bits & Self::READ != 0 {
+            flags |= MappingFlags::READ;
+        }
+        if bits & Self::WRITE != 0 {
+            flags |= MappingFlags::WRITE;
+        }
+        if bits & Self::EXECUTE != 0 {
+            flags |= MappingFlags::EXECUTE;
+        }
+        if bits & Self::USER != 0 {
+            flags |= MappingFlags::USER;
+        }
+        if bits & Self::DEVICE != 0 {
+            flags |= MappingFlags::DEVICE;
+        }
+        if bits & Self::UNCACHED != 0 {
+            flags |= MappingFlags::UNCACHED;
+        }
+        flags
+    }
+
+    fn bits_from_flags(flags: MappingFlags) -> u64 {
+        let mut bits = 0;
+        if flags.contains(MappingFlags::READ) {
+            bits |= Self::READ;
+        }
+        if flags.contains(MappingFlags::WRITE) {
+            bits |= Self::WRITE;
+        }
+        if flags.contains(MappingFlags::EXECUTE) {
+            bits |= Self::EXECUTE;
+        }
+        if flags.contains(MappingFlags::USER) {
+            bits |= Self::USER;
+        }
+        if flags.contains(MappingFlags::DEVICE) {
+            bits |= Self::DEVICE;
+        }
+        if flags.contains(MappingFlags::UNCACHED) {
+            bits |= Self::UNCACHED;
+        }
+        bits
+    }
+}
+
+impl GenericPTE for TablePtrPte {
+    fn new_page(paddr: PhysAddr, flags: MappingFlags, is_huge: bool) -> Self {
+        let mut bits = Self::PRESENT | Self::bits_from_flags(flags);
+        if is_huge {
+            bits |= Self::HUGE;
+        }
+        Self(bits | ((paddr.as_usize() as u64) & Self::PHYS_ADDR_MASK))
+    }
+
+    fn new_table(paddr: PhysAddr) -> Self {
+        Self((paddr.as_usize() as u64) & Self::PHYS_ADDR_MASK)
+    }
+
+    fn paddr(&self) -> PhysAddr {
+        PhysAddr::from_usize((self.0 & Self::PHYS_ADDR_MASK) as usize)
+    }
+
+    fn flags(&self) -> MappingFlags {
+        Self::flags_from_bits(self.0)
+    }
+
+    fn set_paddr(&mut self, paddr: PhysAddr) {
+        self.0 =
+            (self.0 & !Self::PHYS_ADDR_MASK) | ((paddr.as_usize() as u64) & Self::PHYS_ADDR_MASK);
+    }
+
+    fn set_flags(&mut self, flags: MappingFlags, is_huge: bool) {
+        let mut bits = Self::PRESENT | Self::bits_from_flags(flags);
+        if is_huge {
+            bits |= Self::HUGE;
+        }
+        self.0 = (self.0 & Self::PHYS_ADDR_MASK) | bits;
+    }
+
+    fn bits(self) -> usize {
+        self.0 as usize
+    }
+
+    fn is_unused(&self) -> bool {
+        self.0 == 0
+    }
+
+    fn is_present(&self) -> bool {
+        self.0 & Self::PRESENT != 0
+    }
+
+    fn is_huge(&self) -> bool {
+        self.0 & Self::HUGE != 0
+    }
+
+    fn clear(&mut self) {
+        self.0 = 0;
+    }
+}
+
 fn run_test_for<M: PagingMetaData<VirtAddr = VirtAddr>, PTE: GenericPTE>() -> PagingResult<()> {
     ALLOCATED.with_borrow_mut(|it| {
         it.clear();
@@ -281,6 +409,57 @@ fn test_collect_present_leaves_x86() -> PagingResult<()> {
 }
 
 #[test]
+fn test_collect_present_leaves_nonpresent_tables() -> PagingResult<()> {
+    ALLOCATED.with_borrow_mut(|it| it.clear());
+
+    let mut table =
+        PageTable64::<TablePtrMeta, TablePtrPte, TrackPagingHandler<TablePtrMeta>>::try_new()?;
+    {
+        let mut cursor = table.cursor();
+        cursor.map(
+            VirtAddr::from_usize(0x3fff_9000),
+            PhysAddr::from_usize(0x2000_0000),
+            PageSize::Size4K,
+            MappingFlags::READ | MappingFlags::WRITE,
+        )?;
+        cursor.map(
+            VirtAddr::from_usize(0x3fff_a000),
+            PhysAddr::from_usize(0x2000_1000),
+            PageSize::Size4K,
+            MappingFlags::READ,
+        )?;
+    }
+
+    let sparse = table.collect_present_leaves(VirtAddr::from_usize(0x3fff_9000), 0x3000)?;
+    assert_eq!(
+        sparse,
+        vec![
+            (
+                VirtAddr::from_usize(0x3fff_9000),
+                PhysAddr::from_usize(0x2000_0000),
+                MappingFlags::READ | MappingFlags::WRITE,
+                PageSize::Size4K,
+            ),
+            (
+                VirtAddr::from_usize(0x3fff_a000),
+                PhysAddr::from_usize(0x2000_1000),
+                MappingFlags::READ,
+                PageSize::Size4K,
+            ),
+        ]
+    );
+
+    drop(table);
+    assert_eq!(
+        ALLOCATED.with_borrow(|it| it.len()),
+        0,
+        "Some frames were not deallocated"
+    );
+
+    Ok(())
+}
+
+#[test]
 #[cfg(any(target_arch = "x86_64", docsrs))]
 fn test_drain_present_leaves_x86() -> PagingResult<()> {
     type Meta = page_table_multiarch::x86_64::X64PagingMetaData;
@@ -389,6 +568,64 @@ fn test_drain_present_leaves_x86() -> PagingResult<()> {
                 PageSize::Size2M,
             ),
         ]
+    );
+
+    drop(table);
+    assert_eq!(
+        ALLOCATED.with_borrow(|it| it.len()),
+        0,
+        "Some frames were not deallocated"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_drain_present_leaves_nonpresent_tables() -> PagingResult<()> {
+    ALLOCATED.with_borrow_mut(|it| it.clear());
+
+    let mut table =
+        PageTable64::<TablePtrMeta, TablePtrPte, TrackPagingHandler<TablePtrMeta>>::try_new()?;
+    {
+        let mut cursor = table.cursor();
+        cursor.map(
+            VirtAddr::from_usize(0x3fff_9000),
+            PhysAddr::from_usize(0x2000_0000),
+            PageSize::Size4K,
+            MappingFlags::READ | MappingFlags::WRITE,
+        )?;
+        cursor.map(
+            VirtAddr::from_usize(0x3fff_a000),
+            PhysAddr::from_usize(0x2000_1000),
+            PageSize::Size4K,
+            MappingFlags::READ,
+        )?;
+    }
+
+    let drained = {
+        let mut cursor = table.cursor();
+        cursor.drain_present_leaves(VirtAddr::from_usize(0x3fff_9000), 0x3000)?
+    };
+    assert_eq!(
+        drained,
+        vec![
+            (
+                VirtAddr::from_usize(0x3fff_9000),
+                PhysAddr::from_usize(0x2000_0000),
+                MappingFlags::READ | MappingFlags::WRITE,
+                PageSize::Size4K,
+            ),
+            (
+                VirtAddr::from_usize(0x3fff_a000),
+                PhysAddr::from_usize(0x2000_1000),
+                MappingFlags::READ,
+                PageSize::Size4K,
+            ),
+        ]
+    );
+    assert_eq!(
+        table.collect_present_leaves(VirtAddr::from_usize(0x3fff_9000), 0x3000)?,
+        vec![]
     );
 
     drop(table);
