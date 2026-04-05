@@ -158,6 +158,18 @@ impl TcpSocket {
         );
         events
     }
+
+    fn wait_for_close_handshake(&self) {
+        for _ in 0..8 {
+            self.stack.poll_interfaces();
+            let closed = self.with_smol_socket(|socket| {
+                !socket.is_active() && !socket.may_recv() && !socket.may_send()
+            });
+            if closed {
+                break;
+            }
+        }
+    }
 }
 
 impl Configurable for TcpSocket {
@@ -508,8 +520,10 @@ impl Drop for TcpSocket {
         if let Err(err) = self.shutdown(Shutdown::Both) {
             warn!("TCP socket {}: shutdown failed: {}", self.handle, err);
         }
+        // Give loopback peers a short chance to observe a graceful close
+        // before we tear the socket out of the set.
+        self.wait_for_close_handshake();
         self.stack.socket_set.remove(self.handle);
-        // This is crucial for the close messages to be sent.
         self.stack.poll_interfaces();
     }
 }
