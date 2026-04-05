@@ -23,7 +23,7 @@ use crate::{
 
 // Keep the upfront footprint small: process-heavy workloads such as hackbench
 // create many socketpairs before any payload is exchanged.
-const BUF_SIZE: usize = 8 * 1024;
+const BUF_SIZE: usize = 4 * 1024;
 
 fn new_uni_channel() -> (HeapProd<u8>, HeapCons<u8>) {
     let rb = HeapRb::new(BUF_SIZE);
