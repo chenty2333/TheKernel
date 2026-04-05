@@ -21,7 +21,9 @@ use crate::{
     unix::{Transport, TransportOps, UnixSocketAddr},
 };
 
-const BUF_SIZE: usize = 64 * 1024;
+// Keep the upfront footprint small: process-heavy workloads such as hackbench
+// create many socketpairs before any payload is exchanged.
+const BUF_SIZE: usize = 8 * 1024;
 
 fn new_uni_channel() -> (HeapProd<u8>, HeapCons<u8>) {
     let rb = HeapRb::new(BUF_SIZE);
@@ -235,10 +237,12 @@ impl TransportOps for StreamTransport {
                 let (left, right) = chan.tx.vacant_slices_mut();
                 // The ring buffer guarantees these vacant slices are fully
                 // writable byte ranges.
-                let left =
-                    unsafe { core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len()) };
-                let right =
-                    unsafe { core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len()) };
+                let left = unsafe {
+                    core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
+                };
+                let right = unsafe {
+                    core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len())
+                };
                 let mut count = src.read(left)?;
                 if count >= left.len() {
                     count += src.read(right)?;

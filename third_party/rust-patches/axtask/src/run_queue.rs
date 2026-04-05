@@ -117,18 +117,20 @@ impl PerCpuStackCache {
 
 fn system_stack_cache_budget_bytes() -> usize {
     let ram = total_ram_size();
-    if ram <= 512 * MIB {
-        16 * MIB
+    if ram <= 256 * MIB {
+        0
+    } else if ram <= 512 * MIB {
+        4 * MIB
     } else if ram <= 2 * 1024 * MIB {
-        64 * MIB
+        32 * MIB
     } else {
-        128 * MIB
+        64 * MIB
     }
 }
 
 fn per_cpu_stack_cache_budget_bytes() -> usize {
-    // Keep the historical 16/64/128 MiB system budget, but split it across
-    // CPUs so stack reuse stays lock-local instead of contending globally.
+    // Keep stack reuse lock-local, but avoid hoarding exited-task stacks on
+    // low-memory guests where short-lived process bursts are common.
     let cpu_num = axhal::cpu_num().max(1);
     system_stack_cache_budget_bytes() / cpu_num
 }
