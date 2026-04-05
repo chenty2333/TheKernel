@@ -372,7 +372,7 @@ impl BackendOps for CowBackend {
         if !materialized.is_empty() {
             self.mark_materialized();
         }
-        for (vaddr, paddr, _, page_size) in materialized {
+        for (vaddr, paddr, page_flags, page_size) in materialized {
             assert_eq!(page_size, self.size);
             // If the page is mapped in the old page table:
             // - Update its permissions in the old page table using `flags`.
@@ -387,14 +387,19 @@ impl BackendOps for CowBackend {
             assert!(frame.0 > 0, "referencing unreferenced frame");
             frame.0 += 1;
             drop(frame);
-            if let Err(err) = old_pt.protect(vaddr, cow_flags) {
-                let frame = self.get_or_track_frame_ref(paddr);
-                let mut frame = frame.lock();
-                frame.drop_frame(paddr, self.size);
-                return Err(err.into());
+            let protected_parent = page_flags.contains(MappingFlags::WRITE);
+            if protected_parent {
+                if let Err(err) = old_pt.protect(vaddr, cow_flags) {
+                    let frame = self.get_or_track_frame_ref(paddr);
+                    let mut frame = frame.lock();
+                    frame.drop_frame(paddr, self.size);
+                    return Err(err.into());
+                }
             }
             if let Err(err) = new_pt.map(vaddr, paddr, self.size, cow_flags) {
-                let _ = old_pt.protect(vaddr, flags);
+                if protected_parent {
+                    let _ = old_pt.protect(vaddr, flags);
+                }
                 let frame = self.get_or_track_frame_ref(paddr);
                 let mut frame = frame.lock();
                 frame.drop_frame(paddr, self.size);
