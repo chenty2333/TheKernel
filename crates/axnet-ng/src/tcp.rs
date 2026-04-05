@@ -389,12 +389,15 @@ impl SocketOps for TcpSocket {
         if self.rx_closed.load(Ordering::Acquire) {
             return Err(AxError::NotConnected);
         }
+        match self.state() {
+            State::Idle | State::Connecting => return Err(AxError::NotConnected),
+            State::Listening => ax_bail!(InvalidInput, "not connected"),
+            State::Connected | State::Closed | State::Busy => {}
+        }
         self.general.recv_poller(self, || {
             self.stack.poll_interfaces();
             self.with_smol_socket(|socket| {
-                if !socket.is_active() {
-                    Err(AxError::NotConnected)
-                } else if !socket.may_recv() {
+                if !socket.may_recv() {
                     Ok(0)
                 } else if socket.recv_queue() == 0 {
                     Err(AxError::WouldBlock)
