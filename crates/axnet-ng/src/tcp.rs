@@ -160,7 +160,7 @@ impl TcpSocket {
     }
 
     fn wait_for_close_handshake(&self) {
-        for _ in 0..8 {
+        for _ in 0..16 {
             self.stack.poll_interfaces();
             let closed = self.with_smol_socket(|socket| {
                 !socket.is_active() && !socket.may_recv() && !socket.may_send()
@@ -168,6 +168,7 @@ impl TcpSocket {
             if closed {
                 break;
             }
+            axtask::yield_now();
         }
     }
 }
