@@ -35,7 +35,7 @@ pub fn copy_from_kernel(_aspace: &mut AddrSpace) -> AxResult {
         // (aarch64: TTBR0_EL1, LoongArch64: PGDL), so there is no need to copy the
         // kernel portion to the user page table.
         let kspace = axmm::kernel_aspace().lock();
-        _aspace.page_table_mut().cursor().copy_from(
+        _aspace.page_table_mut().cursor_no_flush().copy_from(
             kspace.page_table(),
             kspace.base(),
             kspace.size(),

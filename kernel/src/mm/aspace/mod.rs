@@ -388,13 +388,16 @@ impl AddrSpace {
 
         let mut self_modify = self.pt.cursor();
         for area in self.areas.iter() {
-            let new_backend = area.backend().clone_map(
-                area.va_range(),
-                area.flags(),
-                &mut self_modify,
-                &mut guard.pt.cursor(),
-                &new_aspace_clone,
-            )?;
+            let new_backend = {
+                let mut new_modify = guard.pt.cursor_no_flush();
+                area.backend().clone_map(
+                    area.va_range(),
+                    area.flags(),
+                    &mut self_modify,
+                    &mut new_modify,
+                    &new_aspace_clone,
+                )?
+            };
 
             let new_area = MemoryArea::new(area.start(), area.size(), area.flags(), new_backend);
             let aspace = guard.deref_mut();

@@ -135,6 +135,14 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
     pub fn cursor(&mut self) -> PageTable64Cursor<'_, M, PTE, H> {
         PageTable64Cursor::new(self)
     }
+
+    /// Gets a cursor to modify an inactive page table.
+    ///
+    /// Callers must ensure the page table is not active on any CPU while the
+    /// cursor exists; otherwise required TLB invalidations may be skipped.
+    pub fn cursor_no_flush(&mut self) -> PageTable64Cursor<'_, M, PTE, H> {
+        PageTable64Cursor::new_no_flush(self)
+    }
 }
 
 // Private implements.
@@ -446,6 +454,7 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> Drop for PageTable64<
 pub struct PageTable64Cursor<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> {
     inner: &'a mut PageTable64<M, PTE, H>,
     flusher: TlbFlusher<M>,
+    flush_on_drop: bool,
 }
 
 impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> Deref
@@ -463,6 +472,15 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
         Self {
             inner,
             flusher: TlbFlusher::None,
+            flush_on_drop: true,
+        }
+    }
+
+    fn new_no_flush(inner: &'a mut PageTable64<M, PTE, H>) -> Self {
+        Self {
+            inner,
+            flusher: TlbFlusher::None,
+            flush_on_drop: false,
         }
     }
 
@@ -867,6 +885,8 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> Drop
     for PageTable64Cursor<'_, M, PTE, H>
 {
     fn drop(&mut self) {
-        self.flush();
+        if self.flush_on_drop {
+            self.flush();
+        }
     }
 }
