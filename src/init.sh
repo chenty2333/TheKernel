@@ -98,17 +98,6 @@ install_runtime_alias() {
     return 1
 }
 
-mirror_dir_entries_to_dir() {
-    src_dir="$1"
-    dst_dir="$2"
-    [ -d "$src_dir" ] || return 0
-
-    for src in "$src_dir"/*; do
-        [ -e "$src" ] || continue
-        install_runtime_alias "$src" "$dst_dir/${src##*/}" || true
-    done
-}
-
 clear_dir_contents() {
     dir_path="$1"
     bb mkdir -p "$dir_path" 2>/dev/null || true
@@ -277,7 +266,6 @@ run_pre2025_init_sequence() {
     fi
     install_runtime_alias "$PICK_BUSYBOX_FOR_ROOT_RESULT" /bin/busybox || true
     /bin/busybox --install -s /bin >/dev/null 2>&1 || true
-    [ -e /busybox ] || bb ln -sf /bin/busybox /busybox 2>/dev/null || true
     [ -e /bin/sh ] || bb ln -sf /bin/busybox /bin/sh 2>/dev/null || true
     [ -e /bin/ash ] || bb ln -sf /bin/busybox /bin/ash 2>/dev/null || true
     [ -e /bin/bash ] || bb ln -sf /bin/sh /bin/bash 2>/dev/null || true
@@ -287,9 +275,13 @@ run_pre2025_init_sequence() {
     fi
 
     bb mkdir -p /lib 2>/dev/null || true
-    mirror_dir_entries_to_dir /musl/lib /lib
     install_runtime_alias /glibc/lib/libc.so.6 /lib/libc.so.6 || true
     install_runtime_alias /glibc/lib/libm.so.6 /lib/libm.so.6 || true
+    install_runtime_alias /musl/lib/libc.so /lib/libc.so || true
+    install_runtime_alias /musl/lib/dlopen_dso.so /lib/dlopen_dso.so || true
+    install_runtime_alias /musl/lib/tls_align_dso.so /lib/tls_align_dso.so || true
+    install_runtime_alias /musl/lib/tls_init_dso.so /lib/tls_init_dso.so || true
+    install_runtime_alias /musl/lib/tls_get_new-dtv_dso.so /lib/tls_get_new-dtv_dso.so || true
     install_runtime_alias /musl/lib/libc.so /lib/ld-musl-loongarch-lp64d.so.1 || true
     install_runtime_alias /glibc/lib/ld-linux-loongarch-lp64d.so.1 /lib/ld-linux-loongarch-lp64d.so.1 || true
     install_runtime_alias /musl/lib/libc.so /lib/ld-musl-riscv64.so.1 || true

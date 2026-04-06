@@ -15,13 +15,13 @@ pub fn sys_mount(
     let source = vm_load_string(source)?;
     let target = vm_load_string(target)?;
     let fs_type = vm_load_string(fs_type)?;
-    warn!("sys_mount <= source: {source:?}, target: {target:?}, fs_type: {fs_type:?}");
+    debug!("sys_mount <= source: {source:?}, target: {target:?}, fs_type: {fs_type:?}");
 
-    let fs = if fs_type == "tmpfs" || fs_type.starts_with("vfat") {
-        MemoryFs::new()
-    } else {
+    if fs_type != "tmpfs" {
         return Err(AxError::NoSuchDevice);
-    };
+    }
+
+    let fs = MemoryFs::new();
 
     let target = FS_CONTEXT.lock().resolve(target)?;
     target.mount(&fs)?;

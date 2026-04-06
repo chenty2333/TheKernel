@@ -185,7 +185,7 @@ state_dirs:
 
 clean_build_state:
 	rm -rf $(TARGET_DIR) $(OUT_DIR)
-	rm -f $(QEMU_LOG_FILE) $(NET_DUMP_FILE)
+	rm -f $(OUT_CONFIG) $(QEMU_LOG_FILE) $(NET_DUMP_FILE)
 
 runtime_clean:
 	rm -f $(QEMU_LOG_FILE) $(NET_DUMP_FILE)
@@ -206,9 +206,9 @@ defconfig:
 oldconfig:
 	$(call oldconfig)
 
-build: clean_build_state state_dirs $(FINAL_IMG)
+build: $(FINAL_IMG)
 
-$(FINAL_IMG): | state_dirs
+$(FINAL_IMG): | clean_build_state state_dirs
 
 disasm:
 	$(OBJDUMP) $(OUT_ELF) | less
@@ -237,7 +237,6 @@ clean: $(clean_prereqs)
 	rm -rf $(STATE_ARCH_DIR)
 
 .PHONY: all defconfig oldconfig \
-	state_dirs clean_build_state runtime_clean \
 	build disasm run justrun debug \
 	clippy doc doc_check_missing fmt fmt_c unittest unittest_no_fail_fast \
 	disk_img clean

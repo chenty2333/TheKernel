@@ -3,7 +3,6 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nixpkgs-qemu.url = "github:NixOS/nixpkgs/nixos-25.05";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay.url = "github:oxalica/rust-overlay";
 
@@ -14,7 +13,6 @@
     {
       self,
       nixpkgs,
-      nixpkgs-qemu,
       flake-utils,
       rust-overlay,
     }:
@@ -24,10 +22,6 @@
         pkgs = import nixpkgs {
           inherit system;
           overlays = [ (import rust-overlay) ];
-        };
-
-        pkgsQemu = import nixpkgs-qemu {
-          inherit system;
         };
 
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
@@ -91,7 +85,7 @@
             cargo-binutils
             crossCompatTools
             cmake
-            pkgsQemu.qemu
+            qemu
             ubootTools
             dosfstools
             gdb

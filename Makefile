@@ -70,25 +70,17 @@ build disasm: defconfig
 run:
 	@./scripts/oscomp.sh run --arch $(ARCH) $(OSCOMP_ARGS)
 
-eval-rv: kernel-rv
-	@./scripts/oscomp.sh run --arch rv --skip-kernel-build $(OSCOMP_ARGS)
-
-eval-la: kernel-la
-	@./scripts/oscomp.sh run --arch la --skip-kernel-build $(OSCOMP_ARGS)
-
 debug:
 	@printf '%s\n' 'debug is not wired to the official pre-2025 evaluator flow; use scripts/oscomp.sh run instead.' >&2
 	@exit 1
 
 kernel-rv:
-	@$(MAKE) -C make ARCH=riscv64 BUS=mmio defconfig
-	@$(MAKE) -C make ARCH=riscv64 BUS=mmio build
-	@kernel="$$(find "$(STATE_DIR)/riscv64/out" -maxdepth 1 -name '*.bin' | head -n 1)"; \
+	@$(MAKE) -C make ARCH=riscv64 build
+	@kernel="$$(find "$(STATE_DIR)/riscv64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
 	test -n "$$kernel"; \
 	cp -f "$$kernel" "$@"
 
 kernel-la:
-	@$(MAKE) -C make ARCH=loongarch64 defconfig
 	@$(MAKE) -C make ARCH=loongarch64 build
 	@kernel="$$(find "$(STATE_DIR)/loongarch64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
 	test -n "$$kernel"; \
@@ -107,4 +99,4 @@ la:
 vf2:
 	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 MYPLAT=axplat-riscv64-visionfive2 BUS=mmio build
 
-.PHONY: all build run eval-rv eval-la justrun docker-shell debug disasm clean legacy-clean kernel-rv kernel-la
+.PHONY: all build run justrun docker-shell debug disasm clean legacy-clean kernel-rv kernel-la
