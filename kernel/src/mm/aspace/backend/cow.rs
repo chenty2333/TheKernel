@@ -18,7 +18,7 @@ use super::{
     AddrSpace, Backend, BackendOps, PopulateCallback, alloc_frame, dealloc_frame, pages_in,
 };
 
-struct FrameRefCnt(u8);
+struct FrameRefCnt(u32);
 
 impl FrameRefCnt {
     // This function may lock FRAME_TABLE again, so the caller should drop the lock first.
@@ -42,7 +42,7 @@ struct FrameTableRefCount {
 }
 
 impl FrameTableRefCount {
-    const INITIAL_CNT: u8 = 1;
+    const INITIAL_CNT: u32 = 1;
 
     const fn new() -> Self {
         Self {
@@ -276,10 +276,10 @@ impl CowBackend {
             let new_addr = new_start + old_addr.sub_addr(old_start);
             let frame = self.get_or_track_frame_ref(paddr);
             let mut frame = frame.lock();
-            if frame.0 == u8::MAX {
+            let Some(next_refcnt) = frame.0.checked_add(1) else {
                 return Err(AxError::BadAddress);
-            }
-            frame.0 += 1;
+            };
+            frame.0 = next_refcnt;
             drop(frame);
             if let Err(err) = pt.map(new_addr, paddr, self.size, flags) {
                 let frame = self.get_or_track_frame_ref(paddr);
@@ -380,12 +380,12 @@ impl BackendOps for CowBackend {
             // virtual address, with the same page size and `flags`.
             let frame = self.get_or_track_frame_ref(paddr);
             let mut frame = frame.lock();
-            if frame.0 == u8::MAX {
+            let Some(next_refcnt) = frame.0.checked_add(1) else {
                 warn!("frame reference count overflow");
                 return Err(AxError::BadAddress);
-            }
+            };
             assert!(frame.0 > 0, "referencing unreferenced frame");
-            frame.0 += 1;
+            frame.0 = next_refcnt;
             drop(frame);
             let protected_parent = page_flags.contains(MappingFlags::WRITE);
             if protected_parent {

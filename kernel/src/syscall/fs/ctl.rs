@@ -587,8 +587,17 @@ pub fn sys_sync() -> AxResult<isize> {
     Ok(0)
 }
 
-pub fn sys_syncfs(_fd: i32) -> AxResult<isize> {
-    sys_sync()
+pub fn sys_syncfs(fd: i32) -> AxResult<isize> {
+    let file = get_file_like(fd)?;
+    if let Some(file) = file.downcast_ref::<crate::file::File>() {
+        file.inner().location().filesystem().flush()?;
+        return Ok(0);
+    }
+    if let Some(dir) = file.downcast_ref::<Directory>() {
+        dir.inner().filesystem().flush()?;
+        return Ok(0);
+    }
+    Err(AxError::InvalidInput)
 }
 
 pub fn sys_reboot(magic1: i32, magic2: i32, cmd: i32, _arg: *const c_void) -> AxResult<isize> {

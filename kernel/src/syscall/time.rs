@@ -1,7 +1,7 @@
 use axerrno::{AxError, AxResult};
 use axhal::time::{
-    NANOS_PER_SEC, TimeValue, monotonic_time, monotonic_time_nanos, nanos_to_ticks,
-    ticks_to_nanos, wall_time, wall_time_nanos,
+    NANOS_PER_SEC, TimeValue, monotonic_time, monotonic_time_nanos, nanos_to_ticks, wall_time,
+    wall_time_nanos,
 };
 use axtask::current;
 use linux_raw_sys::general::{
@@ -46,7 +46,9 @@ fn clock_domain(clock_id: __kernel_clockid_t) -> AxResult<ClockDomain> {
 }
 
 fn fine_clock_resolution() -> TimeValue {
-    TimeValue::from_nanos(ticks_to_nanos(1).max(1))
+    // Linux reports 1ns resolution for high-resolution realtime/monotonic
+    // clocks even when the underlying timer tick is coarser.
+    TimeValue::from_nanos(1)
 }
 
 fn clock_now(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {

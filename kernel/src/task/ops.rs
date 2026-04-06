@@ -24,8 +24,7 @@ use super::{
     send_signal_thread_inner, send_signal_to_process, send_signal_to_thread,
 };
 use crate::{
-    config::USER_HEAP_BASE,
-    mm::{UserPtr, access_user_memory, copy_from_kernel, new_user_aspace_empty},
+    mm::{UserPtr, access_user_memory},
 };
 
 static TASK_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
@@ -166,20 +165,6 @@ pub fn set_current_user_page_table_root(root: PhysAddr) {
     }
     #[cfg(not(target_arch = "x86_64"))]
     axhal::asm::flush_tlb(None);
-}
-
-fn detach_exiting_process_aspace(proc_data: &ProcessData) -> AxResult<()> {
-    // Rebind the exiting task onto a minimal user page table so the old mm can
-    // be torn down before the parent observes the zombie.
-    let mut empty_aspace = new_user_aspace_empty()?;
-    copy_from_kernel(&mut empty_aspace)?;
-    let empty_aspace = Arc::new(axsync::Mutex::new(empty_aspace));
-    let new_root = empty_aspace.lock().page_table_root();
-    let old_aspace = proc_data.replace_aspace(empty_aspace);
-    proc_data.set_heap_top(USER_HEAP_BASE);
-    set_current_user_page_table_root(new_root);
-    drop(old_aspace);
-    Ok(())
 }
 
 /// Poll the timer
@@ -341,9 +326,6 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
             child_usage: thr.proc_data.children_usage().into(),
             uid: 0,
         });
-        if let Err(err) = detach_exiting_process_aspace(&thr.proc_data) {
-            warn!("failed to detach exiting process address space: {err:?}");
-        }
         process.exit();
         if let Some(parent) = process.parent() {
             if let Some(signo) = thr.proc_data.exit_signal {

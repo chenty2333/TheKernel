@@ -45,7 +45,7 @@ else ifneq ($(filter $(or $(MAKECMDGOALS), $(.DEFAULT_GOAL)), all build run just
   endif
 endif
 
-_cargo_build: oldconfig
+_cargo_build: oldconfig | prepare_build_state
 	@printf "    $(GREEN_C)Building$(END_C) App: $(APP_NAME), Arch: $(ARCH), Platform: $(PLAT_NAME), App type: $(APP_TYPE)\n"
 ifeq ($(APP_TYPE), rust)
 	$(call cargo_build,$(APP),$(AX_FEAT) $(LIB_FEAT) $(APP_FEAT))
