@@ -37,6 +37,9 @@
 #     - `GW`: Gateway IPv4 address (default is 10.0.2.2 for QEMU user netdev)
 
 # General options
+ROOT_DIR ?= $(abspath $(CURDIR)/..)
+STATE_DIR ?= $(ROOT_DIR)/.state
+STATE_ARCH_DIR ?= $(STATE_DIR)/$(ARCH)
 ARCH ?= x86_64
 MYPLAT ?=
 PLAT_CONFIG ?=
@@ -46,9 +49,9 @@ LOG ?= warn
 V ?=
 DWARF ?=
 LTO ?=
-TARGET_DIR ?= $(PWD)/target
+TARGET_DIR ?= $(STATE_ARCH_DIR)/target
 EXTRA_CONFIG ?=
-OUT_CONFIG ?= $(PWD)/.axconfig.toml
+OUT_CONFIG ?= $(STATE_ARCH_DIR)/.axconfig.toml
 UIMAGE ?= n
 
 # App options
@@ -70,9 +73,12 @@ ACCEL ?=
 ICOUNT ?= n
 QEMU_ARGS ?=
 
-DISK_IMG ?= disk.img
+LOG_DIR ?= $(STATE_ARCH_DIR)/logs
+DISK_IMG ?= $(STATE_ARCH_DIR)/disk.img
 QEMU_LOG ?= n
+QEMU_LOG_FILE ?= $(LOG_DIR)/qemu.log
 NET_DUMP ?= n
+NET_DUMP_FILE ?= $(LOG_DIR)/netdump.pcap
 NET_DEV ?= user
 VFIO_PCI ?=
 VHOST ?= n
@@ -159,7 +165,7 @@ else
 endif
 
 # Paths
-OUT_DIR ?= $(APP)
+OUT_DIR ?= $(STATE_ARCH_DIR)/out
 LD_SCRIPT ?= $(TARGET_DIR)/$(TARGET)/$(MODE)/linker_$(PLAT_NAME).lds
 
 APP_NAME := $(shell basename $(APP))
@@ -174,6 +180,22 @@ endif
 
 all: build
 
+state_dirs:
+	mkdir -p $(TARGET_DIR) $(OUT_DIR) $(LOG_DIR) $(dir $(DISK_IMG))
+
+clean_build_state:
+	rm -rf $(TARGET_DIR) $(OUT_DIR)
+	rm -f $(OUT_CONFIG) $(QEMU_LOG_FILE) $(NET_DUMP_FILE)
+
+runtime_clean:
+	rm -f $(QEMU_LOG_FILE) $(NET_DUMP_FILE)
+
+ifeq ($(APP_TYPE), c)
+  clean_prereqs := clean_c
+else
+  clean_prereqs :=
+endif
+
 include utils.mk
 include build.mk
 include qemu.mk
@@ -184,17 +206,19 @@ defconfig:
 oldconfig:
 	$(call oldconfig)
 
-build: $(OUT_DIR) $(FINAL_IMG)
+build: $(FINAL_IMG)
+
+$(FINAL_IMG): | clean_build_state state_dirs
 
 disasm:
 	$(OBJDUMP) $(OUT_ELF) | less
 
 run: build justrun
 
-justrun:
+justrun: | state_dirs runtime_clean
 	$(call run_qemu)
 
-debug: build
+debug: build | state_dirs runtime_clean
 	$(call run_qemu_debug) &
 	$(GDB) $(OUT_ELF) \
 	  -ex 'target remote localhost:1234' \
@@ -209,9 +233,8 @@ else
 	$(call make_disk_image,fat32,$(DISK_IMG))
 endif
 
-clean: clean_c
-	rm -rf $(APP)/*.bin $(APP)/*.elf $(OUT_CONFIG)
-	cargo clean
+clean: $(clean_prereqs)
+	rm -rf $(STATE_ARCH_DIR)
 
 .PHONY: all defconfig oldconfig \
 	build disasm run justrun debug \

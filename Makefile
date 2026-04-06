@@ -3,6 +3,7 @@ export ARCH := riscv64
 export LOG := warn
 export DWARF := y
 export MEMTRACK := n
+export OSKERNEL_DEV_IMAGE ?= oskernel-dev:local
 
 # QEMU Options
 export BLK := y
@@ -16,33 +17,74 @@ export A := $(PWD)
 export NO_AXSTD := y
 export AX_LIB := axfeat
 export APP_FEATURES := qemu
+export ROOT_DIR := $(PWD)
+export STATE_DIR ?= $(ROOT_DIR)/.state
+export STATE_ARCH_DIR ?= $(STATE_DIR)/$(ARCH)
+export TARGET_DIR ?= $(STATE_ARCH_DIR)/target
+export OUT_DIR ?= $(STATE_ARCH_DIR)/out
+export OUT_CONFIG ?= $(STATE_ARCH_DIR)/.axconfig.toml
+export LOG_DIR ?= $(STATE_ARCH_DIR)/logs
+export QEMU_LOG_FILE ?= $(LOG_DIR)/qemu.log
+export NET_DUMP_FILE ?= $(LOG_DIR)/netdump.pcap
+export DISK_IMG ?= $(STATE_ARCH_DIR)/disk.img
 
 ifeq ($(MEMTRACK), y)
 	APP_FEATURES += starry-api/memtrack
 endif
 
 default: build
+all: legacy-clean kernel-rv kernel-la
 
-ROOTFS_URL = https://github.com/Starry-OS/rootfs/releases/download/20260214
-ROOTFS_IMG = rootfs-$(ARCH).img
+legacy-clean:
+	@rm -rf \
+		$(ROOT_DIR)/target
+	@rm -f \
+		$(ROOT_DIR)/*.bin \
+		$(ROOT_DIR)/*.elf \
+		$(ROOT_DIR)/kernel-rv \
+		$(ROOT_DIR)/kernel-la \
+		$(ROOT_DIR)/qemu.log \
+		$(ROOT_DIR)/netdump.pcap \
+		$(ROOT_DIR)/.axconfig.toml \
+		$(ROOT_DIR)/.axconfig.old.toml \
+		$(ROOT_DIR)/make/disk.img \
+		$(ROOT_DIR)/make/disk-*.img
 
-rootfs:
-	@if [ ! -f $(ROOTFS_IMG) ]; then \
-		echo "Image not found, downloading..."; \
-		curl -f -L $(ROOTFS_URL)/$(ROOTFS_IMG).xz -O; \
-		xz -d $(ROOTFS_IMG).xz; \
-	fi
-	@cp $(ROOTFS_IMG) make/disk.img
-
-img:
-	@echo -e "\033[33mWARN: The 'img' target is deprecated. Please use 'rootfs' instead.\033[0m"
-	@$(MAKE) --no-print-directory rootfs
-
-defconfig justrun clean:
+defconfig:
 	@$(MAKE) -C make $@
 
-build run debug disasm: defconfig
+justrun:
+	@./scripts/oscomp.sh run --arch $(ARCH) --skip-kernel-build $(OSCOMP_ARGS)
+
+docker-shell:
+	@OSKERNEL_DEV_IMAGE="$(OSKERNEL_DEV_IMAGE)" ./scripts/docker-shell.sh
+
+clean:
+	@$(MAKE) -C make clean
+	@rm -rf $(STATE_DIR)
+	@$(MAKE) --no-print-directory legacy-clean
+
+build disasm: defconfig
 	@$(MAKE) -C make $@
+
+run:
+	@./scripts/oscomp.sh run --arch $(ARCH) $(OSCOMP_ARGS)
+
+debug:
+	@printf '%s\n' 'debug is not wired to the official pre-2025 evaluator flow; use scripts/oscomp.sh run instead.' >&2
+	@exit 1
+
+kernel-rv:
+	@$(MAKE) -C make ARCH=riscv64 build
+	@kernel="$$(find "$(STATE_DIR)/riscv64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
+	test -n "$$kernel"; \
+	cp -f "$$kernel" "$@"
+
+kernel-la:
+	@$(MAKE) -C make ARCH=loongarch64 build
+	@kernel="$$(find "$(STATE_DIR)/loongarch64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
+	test -n "$$kernel"; \
+	cp -f "$$kernel" "$@"
 
 ci-test:
 	./scripts/ci-test.py $(ARCH)
@@ -57,4 +99,4 @@ la:
 vf2:
 	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 MYPLAT=axplat-riscv64-visionfive2 BUS=mmio build
 
-.PHONY: build run justrun debug disasm clean
+.PHONY: all build run justrun docker-shell debug disasm clean legacy-clean kernel-rv kernel-la

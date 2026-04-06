@@ -1,5 +1,5 @@
 #!/bin/bash
-# StarryOS test script – mirrors the structure of app-helloworld/scripts/test.sh.
+# StarryOS test script for the official pre-2025 OS contest workflow.
 #
 # Usage:
 #   ./scripts/test.sh [STEP]
@@ -7,21 +7,21 @@
 # STEP (optional): run only the specified step (1–5). Omit to run all steps.
 #   1  – check required tools
 #   2  – code format check  (cargo fmt --all)
-#   3  – per-architecture rootfs download + kernel build + QEMU boot test
+#   3  – per-architecture kernel build + official evaluator-image replay
 #   4  – publish readiness check (cargo publish --dry-run)
 #   5  – print test summary
 #
 # Environment variables:
-#   SKIP_QEMU=true   skip QEMU boot tests in step 3 (build only)
+#   SKIP_QEMU=true   skip official-image replays in step 3 (build only)
 #
 # Examples:
 #   ./scripts/test.sh          # run all five steps
 #   ./scripts/test.sh 1        # tool check only
-#   ./scripts/test.sh 3        # build + QEMU boot tests only
+#   ./scripts/test.sh 3        # build + official-image replay only
 #   ./scripts/test.sh 4        # publish dry-run only
-#   SKIP_QEMU=true ./scripts/test.sh 3   # build only, no QEMU
+#   SKIP_QEMU=true ./scripts/test.sh 3   # build only, no QEMU replay
 
-ARCHS=("riscv64" "aarch64" "loongarch64" "x86_64")
+ARCHS=("riscv64" "loongarch64")
 
 # --------------------------------------------------------------------------
 # Step 1 – Check required tools
@@ -31,7 +31,7 @@ step1_check_tools() {
 
     local missing=false
 
-    for tool in make cargo python3; do
+    for tool in make cargo python3 xz debugfs; do
         if ! command -v "$tool" &> /dev/null; then
             echo "  ERROR: '$tool' is not installed"
             missing=true
@@ -40,7 +40,7 @@ step1_check_tools() {
 
     for arch in "${ARCHS[@]}"; do
         if ! command -v "qemu-system-${arch}" &> /dev/null; then
-            echo "  WARNING: 'qemu-system-${arch}' not found (QEMU test for ${arch} will be skipped)"
+            echo "  WARNING: 'qemu-system-${arch}' not found (official replay for ${arch} will be skipped)"
         fi
     done
 
@@ -64,13 +64,13 @@ step2_check_format() {
 }
 
 # --------------------------------------------------------------------------
-# Step 3 – Per-architecture: rootfs + build + QEMU boot test
+# Step 3 – Per-architecture: official image replay
 # --------------------------------------------------------------------------
 step3_arch_tests() {
     local skip_qemu="${SKIP_QEMU:-false}"
-    echo "[3/5] Running architecture-specific build and boot tests..."
+    echo "[3/5] Running architecture-specific official-image replays..."
     if [ "$skip_qemu" = "true" ]; then
-        echo "  NOTE: SKIP_QEMU=true – QEMU boot tests will be skipped"
+        echo "  NOTE: SKIP_QEMU=true – official-image replays will be skipped"
     fi
 
     local all_passed=true
@@ -79,30 +79,29 @@ step3_arch_tests() {
         echo ""
         echo "  --- Architecture: ${arch} ---"
 
-        # Rootfs download (skipped by Makefile if image already exists)
-        echo "  [${arch}] Downloading rootfs..."
-        make ARCH="${arch}" rootfs
-
-        # Kernel build
-        echo "  [${arch}] Building kernel..."
-        make ARCH="${arch}" build
-
-        # QEMU boot test
         if [ "$skip_qemu" = "true" ]; then
-            echo "  [${arch}] Skipping QEMU boot test (SKIP_QEMU=true)"
+            case "$arch" in
+                riscv64)
+                    make kernel-rv
+                    ;;
+                loongarch64)
+                    make kernel-la
+                    ;;
+            esac
+            echo "  [${arch}] Skipping official-image replay (SKIP_QEMU=true)"
             continue
         fi
 
         if ! command -v "qemu-system-${arch}" &> /dev/null; then
-            echo "  [${arch}] WARNING: qemu-system-${arch} not found, skipping boot test"
+            echo "  [${arch}] WARNING: qemu-system-${arch} not found, skipping replay"
             continue
         fi
 
-        echo "  [${arch}] Running QEMU boot test..."
+        echo "  [${arch}] Running official evaluator-image replay..."
         if make ARCH="${arch}" ci-test; then
-            echo "  [${arch}] OK: boot test passed"
+            echo "  [${arch}] OK: replay completed"
         else
-            echo "  [${arch}] ERROR: boot test FAILED"
+            echo "  [${arch}] ERROR: replay FAILED"
             all_passed=false
         fi
     done
@@ -155,7 +154,7 @@ step5_summary() {
     echo "  Steps available in this script:"
     echo "    1 – tool availability check  (make, cargo, python3, qemu-system-*)"
     echo "    2 – code format check        (cargo fmt --all)"
-    echo "    3 – per-arch build + boot    (riscv64, aarch64, loongarch64, x86_64)"
+    echo "    3 – official-image replay    (riscv64, loongarch64)"
     echo "    4 – publish readiness check  (cargo publish --dry-run)"
     echo "    5 – summary"
     echo ""
@@ -204,7 +203,7 @@ main() {
             step2_check_format
             ;;
         3)
-            echo "=== StarryOS Test Script (step 3: arch build + boot tests) ==="
+            echo "=== StarryOS Test Script (step 3: official-image replays) ==="
             echo ""
             step3_arch_tests
             ;;

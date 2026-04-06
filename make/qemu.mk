@@ -69,7 +69,7 @@ ifneq ($(VFIO_PCI),)
 endif
 
 ifeq ($(NET_DUMP), y)
-  qemu_args-$(NET) += -object filter-dump,id=dump0,netdev=net0,file=netdump.pcap
+  qemu_args-$(NET) += -object filter-dump,id=dump0,netdev=net0,file=$(NET_DUMP_FILE)
 endif
 
 qemu_args-$(GRAPHIC) += \
@@ -87,7 +87,7 @@ qemu_args-$(VSOCK) += \
   -device vhost-vsock-pci,id=virtiosocket0,guest-cid=103
 
 ifeq ($(QEMU_LOG), y)
-  qemu_args-y += -D qemu.log -d in_asm,int,mmu,pcall,cpu_reset,guest_errors
+  qemu_args-y += -D $(QEMU_LOG_FILE) -d in_asm,int,mmu,pcall,cpu_reset,guest_errors
 endif
 
 qemu_args-$(ICOUNT) += -icount shift=1
