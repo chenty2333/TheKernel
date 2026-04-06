@@ -5,7 +5,9 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 STATE_DIR=${OSCOMP_STATE_DIR:-$REPO_ROOT/.state}
 WORKDIR_BASE=${OSCOMP_WORKDIR_BASE:-$STATE_DIR/oscomp-replay}
+IMAGE_CACHE_DIR=${OSCOMP_IMAGE_CACHE_DIR:-$STATE_DIR/oscomp-images}
 TESTSUITE_DIR=${OSCOMP_TESTSUITE_DIR:-$HOME/testsuits-for-oskernel}
+JUDGE_DIR=${OSCOMP_JUDGE_DIR:-$HOME/oskernel-testsuits-cooperation/judge}
 
 ARCH=""
 IMAGE_PATH=""
@@ -122,15 +124,31 @@ prepare_image() {
     local mode=${3:-reuse}
     case "$source" in
         *.xz)
-            local target="$WORKDIR/$target_name"
-            log "decompressing $(basename -- "$source")"
-            xz -dc "$source" >"$target"
-            printf '%s\n' "$target"
+            local cache_key
+            local cache_dir
+            local cached
+            cache_key=$(stat -c '%s-%Y' "$source")
+            cache_dir="$IMAGE_CACHE_DIR/$ARCH"
+            cached="$cache_dir/${target_name}.${cache_key}"
+            mkdir -p "$cache_dir"
+            if [ ! -f "$cached" ]; then
+                log "decompressing $(basename -- "$source")" >&2
+                xz -dc "$source" >"$cached.tmp"
+                mv "$cached.tmp" "$cached"
+            fi
+            if [ "$mode" = "copy" ]; then
+                local target="$WORKDIR/$target_name"
+                log "copying cached $(basename -- "$cached")" >&2
+                cp "$cached" "$target"
+                printf '%s\n' "$target"
+            else
+                printf '%s\n' "$cached"
+            fi
             ;;
         *)
             if [ "$mode" = "copy" ]; then
                 local target="$WORKDIR/$target_name"
-                log "copying $(basename -- "$source")"
+                log "copying $(basename -- "$source")" >&2
                 cp "$source" "$target"
                 printf '%s\n' "$target"
             else
@@ -138,6 +156,40 @@ prepare_image() {
             fi
             ;;
     esac
+}
+
+maybe_judge_group() {
+    local qemu_log=$1
+    local groups=${GROUP_FILTERS:-}
+    local root=${ROOT_FILTER:-}
+    local judge_json
+    local group_name=""
+
+    case "$root" in
+        musl|glibc)
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
+    case "$groups" in
+        ""|*","*|*" "*)
+            return 0
+            ;;
+        *)
+            group_name=$groups
+            ;;
+    esac
+
+    [ -d "$JUDGE_DIR" ] || return 0
+    judge_json="$WORKDIR/judge-${group_name}-${root}.json"
+    python3 "$SCRIPT_DIR/judge-oscomp.py" \
+        --log "$qemu_log" \
+        --group "$group_name" \
+        --root "$root" \
+        --judge-dir "$JUDGE_DIR" \
+        --json-out "$judge_json" || true
 }
 
 inject_debugfs_file() {
@@ -269,4 +321,5 @@ set -e
 if [ "$status" -eq 124 ]; then
     die "QEMU timed out after ${TIMEOUT_SECS}s"
 fi
+maybe_judge_group "$QEMU_LOG"
 exit "$status"
