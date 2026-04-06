@@ -54,6 +54,8 @@ else ifeq ($(APP_TYPE), c)
 	$(call cargo_build,ulib/axlibc,$(AX_FEAT) $(LIB_FEAT))
 endif
 
+$(OUT_ELF): _cargo_build
+
 $(OUT_DIR):
 	$(call run_cmd,mkdir,-p $@)
 
@@ -62,7 +64,7 @@ ifeq ($(DWARF), y)
 	$(call run_cmd,./dwarf.sh,$(OUT_ELF) $(OBJCOPY))
 endif
 
-$(OUT_BIN): _cargo_build $(OUT_ELF) _dwarf
+$(OUT_BIN): $(OUT_ELF) _dwarf
 	$(call run_cmd,$(OBJCOPY),$(OUT_ELF) --strip-all -O binary $@)
 	@if [ ! -s $(OUT_BIN) ]; then \
 		echo 'Empty kernel image "$(notdir $(FINAL_IMG))" is built, please check your build configuration'; \

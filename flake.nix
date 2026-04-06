@@ -119,10 +119,12 @@
             export RANLIB_aarch64_unknown_none_softfloat=aarch64-linux-musl-ranlib
             export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_none_softfloat="--target=aarch64-unknown-linux-musl -isystem ${pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc.libc.dev}/include -isystem $aarch64_gcc_include"
 
-            export CC_loongarch64_unknown_none_softfloat=loongarch64-linux-musl-gcc
-            export AR_loongarch64_unknown_none_softfloat=loongarch64-linux-musl-ar
-            export RANLIB_loongarch64_unknown_none_softfloat=loongarch64-linux-musl-ranlib
-            export BINDGEN_EXTRA_CLANG_ARGS_loongarch64_unknown_none_softfloat="--target=loongarch64-unknown-linux-gnu -isystem ${pkgs.pkgsCross.loongarch64-linux.stdenv.cc.libc.dev}/include -isystem $loongarch64_gcc_include"
+            loongarch64_sys_include="${pkgs.pkgsCross.loongarch64-linux.stdenv.cc}/loongarch64-unknown-linux-gnu/sys-include"
+
+            export CC_loongarch64_unknown_none=loongarch64-linux-musl-gcc
+            export AR_loongarch64_unknown_none=loongarch64-linux-musl-ar
+            export RANLIB_loongarch64_unknown_none=loongarch64-linux-musl-ranlib
+            export BINDGEN_EXTRA_CLANG_ARGS_loongarch64_unknown_none="--target=loongarch64-unknown-linux-gnu -isystem $loongarch64_sys_include -isystem $loongarch64_gcc_include"
 
             export CC_x86_64_unknown_none=x86_64-linux-musl-gcc
             export AR_x86_64_unknown_none=x86_64-linux-musl-ar

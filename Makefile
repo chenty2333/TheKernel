@@ -1,8 +1,12 @@
 # Build Options
-export ARCH := riscv64
-export LOG := warn
-export DWARF := y
-export MEMTRACK := n
+ARCH ?= riscv64
+export ARCH
+LOG ?= warn
+export LOG
+DWARF ?= y
+export DWARF
+MEMTRACK ?= n
+export MEMTRACK
 export OSKERNEL_DEV_IMAGE ?= oskernel-dev:local
 
 # QEMU Options
@@ -18,15 +22,15 @@ export NO_AXSTD := y
 export AX_LIB := axfeat
 export APP_FEATURES := qemu
 export ROOT_DIR := $(PWD)
-export STATE_DIR ?= $(ROOT_DIR)/.state
-export STATE_ARCH_DIR ?= $(STATE_DIR)/$(ARCH)
-export TARGET_DIR ?= $(STATE_ARCH_DIR)/target
-export OUT_DIR ?= $(STATE_ARCH_DIR)/out
-export OUT_CONFIG ?= $(STATE_ARCH_DIR)/.axconfig.toml
-export LOG_DIR ?= $(STATE_ARCH_DIR)/logs
-export QEMU_LOG_FILE ?= $(LOG_DIR)/qemu.log
-export NET_DUMP_FILE ?= $(LOG_DIR)/netdump.pcap
-export DISK_IMG ?= $(STATE_ARCH_DIR)/disk.img
+STATE_DIR ?= $(ROOT_DIR)/.state
+STATE_ARCH_DIR ?= $(STATE_DIR)/$(ARCH)
+TARGET_DIR ?= $(STATE_ARCH_DIR)/target
+OUT_DIR ?= $(STATE_ARCH_DIR)/out
+OUT_CONFIG ?= $(STATE_ARCH_DIR)/.axconfig.toml
+LOG_DIR ?= $(STATE_ARCH_DIR)/logs
+QEMU_LOG_FILE ?= $(LOG_DIR)/qemu.log
+NET_DUMP_FILE ?= $(LOG_DIR)/netdump.pcap
+DISK_IMG ?= $(STATE_ARCH_DIR)/disk.img
 
 ifeq ($(MEMTRACK), y)
 	APP_FEATURES += starry-api/memtrack
@@ -75,16 +79,18 @@ debug:
 	@exit 1
 
 kernel-rv:
-	@$(MAKE) -C make ARCH=riscv64 build
+	@$(MAKE) -C make ARCH=riscv64 BUS=mmio defconfig
+	@$(MAKE) -C make ARCH=riscv64 BUS=mmio build
 	@kernel="$$(find "$(STATE_DIR)/riscv64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
 	test -n "$$kernel"; \
 	cp -f "$$kernel" "$@"
 
 kernel-la:
+	@$(MAKE) -C make ARCH=loongarch64 defconfig
 	@$(MAKE) -C make ARCH=loongarch64 build
 	@kernel="$$(find "$(STATE_DIR)/loongarch64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
 	test -n "$$kernel"; \
-	cp -f "$$kernel" "$@"
+	python3 scripts/patch-loongarch-kernel-elf.py "$$kernel" "$@"
 
 ci-test:
 	./scripts/ci-test.py $(ARCH)

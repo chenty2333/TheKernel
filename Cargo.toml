@@ -82,7 +82,7 @@ features = ["fp-simd", "irq", "rtc"]
 optional = true
 
 [package.metadata.vendor-filter]
-platforms = ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none-softfloat"]
+platforms = ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none"]
 all-features = true
 
 # Force all direct and transitive users onto the vendored axnet-ng so feature
@@ -101,3 +101,4 @@ axruntime = { path = "third_party/rust-patches/axruntime" }
 memory_set = { path = "third_party/rust-patches/memory_set" }
 page_table_multiarch = { path = "third_party/rust-patches/page_table_multiarch" }
 kernel-elf-parser = { path = "third_party/rust-patches/kernel-elf-parser" }
+lwext4_rust = { path = "third_party/rust-patches/lwext4_rust" }
