@@ -158,6 +158,12 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         ),
         Sysno::sync => sys_sync(),
         Sysno::syncfs => sys_syncfs(uctx.arg0() as _),
+        Sysno::reboot => sys_reboot(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
 
         // file ops
         #[cfg(target_arch = "x86_64")]

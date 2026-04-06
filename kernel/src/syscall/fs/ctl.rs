@@ -1,6 +1,6 @@
 use alloc::{ffi::CString, sync::Arc, vec, vec::Vec};
 use core::{
-    ffi::{c_char, c_int},
+    ffi::{c_char, c_int, c_void},
     mem::offset_of,
     time::Duration,
 };
@@ -8,7 +8,7 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axfs::{FS_CONTEXT, FsContext};
 use axfs_ng_vfs::{Location, MetadataUpdate, NodePermission, NodeType, path::Path};
-use axhal::time::wall_time;
+use axhal::{power::system_off, time::wall_time};
 use axtask::current;
 use linux_raw_sys::{
     general::*,
@@ -583,11 +583,31 @@ pub fn sys_renameat2(
 }
 
 pub fn sys_sync() -> AxResult<isize> {
-    warn!("dummy sys_sync");
+    FS_CONTEXT.lock().root_dir().filesystem().flush()?;
     Ok(0)
 }
 
 pub fn sys_syncfs(_fd: i32) -> AxResult<isize> {
-    warn!("dummy sys_syncfs");
-    Ok(0)
+    sys_sync()
+}
+
+pub fn sys_reboot(magic1: i32, magic2: i32, cmd: i32, _arg: *const c_void) -> AxResult<isize> {
+    if magic1 as u32 != LINUX_REBOOT_MAGIC1 {
+        return Err(AxError::InvalidInput);
+    }
+    match magic2 as u32 {
+        LINUX_REBOOT_MAGIC2 | LINUX_REBOOT_MAGIC2A | LINUX_REBOOT_MAGIC2B | LINUX_REBOOT_MAGIC2C => {}
+        _ => return Err(AxError::InvalidInput),
+    }
+
+    match cmd as u32 {
+        LINUX_REBOOT_CMD_RESTART
+        | LINUX_REBOOT_CMD_HALT
+        | LINUX_REBOOT_CMD_POWER_OFF
+        | LINUX_REBOOT_CMD_RESTART2 => {
+            sys_sync()?;
+            system_off();
+        }
+        _ => Err(AxError::Unsupported),
+    }
 }
