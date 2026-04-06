@@ -100,3 +100,4 @@ axtask = { path = "third_party/rust-patches/axtask" }
 axruntime = { path = "third_party/rust-patches/axruntime" }
 memory_set = { path = "third_party/rust-patches/memory_set" }
 page_table_multiarch = { path = "third_party/rust-patches/page_table_multiarch" }
+kernel-elf-parser = { path = "third_party/rust-patches/kernel-elf-parser" }
