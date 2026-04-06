@@ -1,4 +1,4 @@
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::{
     slice,
     sync::atomic::{AtomicBool, Ordering},
@@ -105,6 +105,13 @@ impl CowBackend {
 
     fn get_or_track_frame_ref(&self, paddr: PhysAddr) -> Arc<SpinNoIrq<FrameRefCnt>> {
         let mut frame_table = FRAME_TABLE.lock();
+        Self::get_or_track_frame_ref_locked(&mut frame_table, paddr)
+    }
+
+    fn get_or_track_frame_ref_locked(
+        frame_table: &mut FrameTableRefCount,
+        paddr: PhysAddr,
+    ) -> Arc<SpinNoIrq<FrameRefCnt>> {
         if let Some(frame_ref) = frame_table.get_frame_ref(paddr) {
             return frame_ref;
         }
@@ -372,13 +379,20 @@ impl BackendOps for CowBackend {
         if !materialized.is_empty() {
             self.mark_materialized();
         }
-        for (vaddr, paddr, page_flags, page_size) in materialized {
+        let frame_refs = {
+            let mut frame_table = FRAME_TABLE.lock();
+            materialized
+                .iter()
+                .map(|(_, paddr, _, _)| Self::get_or_track_frame_ref_locked(&mut frame_table, *paddr))
+                .collect::<Vec<_>>()
+        };
+
+        for ((vaddr, paddr, page_flags, page_size), frame) in materialized.into_iter().zip(frame_refs) {
             assert_eq!(page_size, self.size);
             // If the page is mapped in the old page table:
             // - Update its permissions in the old page table using `flags`.
             // - Map the same physical page into the new page table at the same
             // virtual address, with the same page size and `flags`.
-            let frame = self.get_or_track_frame_ref(paddr);
             let mut frame = frame.lock();
             if frame.0 == u8::MAX {
                 warn!("frame reference count overflow");
