@@ -547,7 +547,12 @@ impl CachedFile {
         if self.in_memory {
             page.data().fill(0);
         } else {
-            file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64)?;
+            let data = page.data();
+            data.fill(0);
+            let read = file.read_at(data, pn as u64 * PAGE_SIZE as u64)?;
+            if read < PAGE_SIZE {
+                data[read..].fill(0);
+            }
         }
         cache.put(pn, page);
         Ok((cache.get_mut(&pn).unwrap(), evicted))
