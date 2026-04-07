@@ -15,6 +15,7 @@ export NET := y
 export VSOCK := n
 export MEM := 1G
 export ICOUNT := n
+MAX_EVAL_KERNEL_BYTES ?= 838860800
 
 # Generated Options
 export A := $(PWD)
@@ -37,7 +38,7 @@ ifeq ($(MEMTRACK), y)
 endif
 
 default: build
-all: legacy-clean kernel-rv kernel-la
+all: legacy-clean kernel-rv kernel-la disk.img disk-la.img
 
 legacy-clean:
 	@rm -rf \
@@ -47,6 +48,8 @@ legacy-clean:
 		$(ROOT_DIR)/*.elf \
 		$(ROOT_DIR)/kernel-rv \
 		$(ROOT_DIR)/kernel-la \
+		$(ROOT_DIR)/disk.img \
+		$(ROOT_DIR)/disk-la.img \
 		$(ROOT_DIR)/qemu.log \
 		$(ROOT_DIR)/netdump.pcap \
 		$(ROOT_DIR)/.axconfig.toml \
@@ -74,6 +77,12 @@ build disasm: defconfig
 run:
 	@./scripts/oscomp.sh run --arch $(ARCH) $(OSCOMP_ARGS)
 
+eval-rv: kernel-rv
+	@./scripts/oscomp.sh run --arch rv --skip-kernel-build $(OSCOMP_ARGS)
+
+eval-la: kernel-la
+	@./scripts/oscomp.sh run --arch la --skip-kernel-build $(OSCOMP_ARGS)
+
 debug:
 	@printf '%s\n' 'debug is not wired to the official pre-2025 evaluator flow; use scripts/oscomp.sh run instead.' >&2
 	@exit 1
@@ -84,6 +93,7 @@ kernel-rv:
 	@kernel="$$(find "$(STATE_DIR)/riscv64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
 	test -n "$$kernel"; \
 	python3 scripts/patch-riscv-kernel-elf.py "$$kernel" "$@"
+	@$(MAKE) --no-print-directory check-eval-kernel-size
 
 kernel-la:
 	@$(MAKE) -C make ARCH=loongarch64 defconfig
@@ -91,6 +101,13 @@ kernel-la:
 	@kernel="$$(find "$(STATE_DIR)/loongarch64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
 	test -n "$$kernel"; \
 	python3 scripts/patch-loongarch-kernel-elf.py "$$kernel" "$@"
+	@$(MAKE) --no-print-directory check-eval-kernel-size
+
+disk.img:
+	@bash ./scripts/build-oscomp-support-disk.sh --arch rv --out-dir "$(ROOT_DIR)"
+
+disk-la.img:
+	@bash ./scripts/build-oscomp-support-disk.sh --arch la --out-dir "$(ROOT_DIR)"
 
 ci-test:
 	./scripts/ci-test.py $(ARCH)
@@ -105,4 +122,13 @@ la:
 vf2:
 	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 MYPLAT=axplat-riscv64-visionfive2 BUS=mmio build
 
-.PHONY: all build run justrun docker-shell debug disasm clean legacy-clean kernel-rv kernel-la
+.PHONY: all build run eval-rv eval-la justrun docker-shell debug disasm clean legacy-clean check-eval-kernel-size kernel-rv kernel-la disk.img disk-la.img
+check-eval-kernel-size:
+	@for kernel in $(ROOT_DIR)/kernel-rv $(ROOT_DIR)/kernel-la; do \
+		[ -f "$$kernel" ] || continue; \
+		size="$$(stat -c '%s' "$$kernel")"; \
+		if [ "$$size" -gt "$(MAX_EVAL_KERNEL_BYTES)" ]; then \
+			printf 'kernel artifact too large for evaluator: %s (%s bytes > %s)\n' "$$kernel" "$$size" "$(MAX_EVAL_KERNEL_BYTES)" >&2; \
+			exit 1; \
+		fi; \
+	done
