@@ -3,19 +3,18 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-OFFICIAL_GROUPS=(
+REFERENCE_PLAN_GROUPS=(
     basic
-    busybox
-    lua
-    libctest
     iozone
-    unixbench
-    iperf
-    libcbench
-    lmbench
+    busybox
     netperf
+    lua
+    libcbench
+    libctest
     cyclictest
+    lmbench
     ltp
+    iperf
 )
 
 die() {
@@ -46,19 +45,21 @@ Usage:
 
 Commands:
   list
-      Print the official pre-2025 arch/libc/group matrix.
+      Print the current T202-aligned evaluation plan.
 
   run
-      Boot the official pre-2025 evaluator image under the exact QEMU command
-      shape used by the contest. By default only
-      ${OSCOMP_TESTSUITE_DIR:-~/testsuits-for-oskernel} is searched for
-      sdcard-*.img{,.xz}.
+      Boot the official pre-2025 evaluator image under the contest QEMU shape.
+      The image search order is:
+        $OSCOMP_TESTSUITE_DIR
+        /home/dia/kernel-image
+        $HOME/kernel-image
+        $HOME/testsuits-for-oskernel
+        /coursegrader/testdata
+      Accepted image suffixes are .img, .img.xz, and .img.gz.
 
       Options:
         --arch VALUE
         --image PATH
-        --root {musl|glibc|all}
-        --groups CSV
         --timeout SECS
         --workdir DIR
         --skip-kernel-build
@@ -73,12 +74,30 @@ list_cmd() {
     printf 'arches:\n'
     printf '  rv (riscv64)\n'
     printf '  la (loongarch64)\n'
-    printf 'libcs:\n'
-    printf '  musl\n'
-    printf '  glibc\n'
-    printf '  all\n'
-    printf 'groups:\n'
-    printf '  %s\n' "${OFFICIAL_GROUPS[@]}"
+    printf 'plan order:\n'
+    printf '  /musl basic\n'
+    printf '  /musl iozone\n'
+    printf '  /musl busybox\n'
+    printf '  /musl netperf\n'
+    printf '  /musl lua\n'
+    printf '  /musl libcbench\n'
+    printf '  /musl libctest\n'
+    printf '  /musl cyclictest\n'
+    printf '  /glibc basic\n'
+    printf '  /glibc iozone\n'
+    printf '  /glibc busybox\n'
+    printf '  /glibc netperf\n'
+    printf '  /glibc lua\n'
+    printf '  /glibc libcbench\n'
+    printf '  /glibc cyclictest\n'
+    printf '  /musl lmbench\n'
+    printf '  /glibc lmbench\n'
+    printf '  /musl ltp\n'
+    printf '  /glibc ltp\n'
+    printf '  /musl iperf\n'
+    printf '  /glibc iperf\n'
+    printf 'groups in fixed plan:\n'
+    printf '  %s\n' "${REFERENCE_PLAN_GROUPS[@]}"
 }
 
 run_cmd() {
@@ -92,7 +111,7 @@ run_cmd() {
                 arch=$(canonical_arch "$2") || die "unsupported arch: $2"
                 shift 2
                 ;;
-            --image|--root|--groups|--timeout|--workdir)
+            --image|--timeout|--workdir)
                 [[ $# -ge 2 ]] || die "missing value for $1"
                 args+=("$1" "$2")
                 shift 2

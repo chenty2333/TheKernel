@@ -21,6 +21,8 @@ use crate::{
         has_pending_fatal_signal, set_current_user_page_table_root,
     },
 };
+#[cfg(target_arch = "loongarch64")]
+use crate::task::reset_current_user_fpu_state;
 
 fn interrupt_exec_siblings(sibling_tids: &[Pid]) {
     for &tid in sibling_tids {
@@ -166,10 +168,27 @@ pub fn sys_execve(
 
     curr.set_name(&task_name);
 
-    *proc_data.exe_path.write() = abs_path;
-    *proc_data.cmdline.write() = Arc::new(args);
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let mut exe_path_guard = proc_data.exe_path.write();
+        let old_exe_path = core::mem::replace(&mut *exe_path_guard, abs_path);
+        core::mem::forget(old_exe_path);
+        drop(exe_path_guard);
+
+        let mut cmdline_guard = proc_data.cmdline.write();
+        let old_cmdline = core::mem::replace(&mut *cmdline_guard, Arc::new(args));
+        core::mem::forget(old_cmdline);
+    }
+    #[cfg(not(target_arch = "loongarch64"))]
+    {
+        *proc_data.exe_path.write() = abs_path;
+        *proc_data.cmdline.write() = Arc::new(args);
+    }
 
     proc_data.set_heap_top(USER_HEAP_BASE);
+
+    #[cfg(target_arch = "loongarch64")]
+    reset_current_user_fpu_state();
 
     reset_exec_signal_state(thr);
 

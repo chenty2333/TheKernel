@@ -49,7 +49,6 @@ legacy-clean:
 		$(ROOT_DIR)/kernel-rv \
 		$(ROOT_DIR)/kernel-la \
 		$(ROOT_DIR)/disk.img \
-		$(ROOT_DIR)/disk-la.img \
 		$(ROOT_DIR)/qemu.log \
 		$(ROOT_DIR)/netdump.pcap \
 		$(ROOT_DIR)/.axconfig.toml \
@@ -106,9 +105,6 @@ kernel-la:
 disk.img:
 	@bash ./scripts/build-oscomp-support-disk.sh --arch both --output "$@"
 
-disk-la.img: disk.img
-	@cp disk.img $@
-
 ci-test:
 	./scripts/ci-test.py $(ARCH)
 
@@ -122,7 +118,7 @@ la:
 vf2:
 	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 MYPLAT=axplat-riscv64-visionfive2 BUS=mmio build
 
-.PHONY: all build run eval-rv eval-la justrun docker-shell debug disasm clean legacy-clean check-eval-kernel-size kernel-rv kernel-la disk.img disk-la.img
+.PHONY: all build run eval-rv eval-la justrun docker-shell debug disasm clean legacy-clean check-eval-kernel-size kernel-rv kernel-la disk.img
 check-eval-kernel-size:
 	@for kernel in $(ROOT_DIR)/kernel-rv $(ROOT_DIR)/kernel-la; do \
 		[ -f "$$kernel" ] || continue; \

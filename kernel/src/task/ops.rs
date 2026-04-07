@@ -165,6 +165,39 @@ pub fn set_current_user_page_table_root(root: PhysAddr) {
     axhal::asm::flush_tlb(None);
 }
 
+#[cfg(target_arch = "loongarch64")]
+fn with_current_task_ctx_mut<R>(f: impl FnOnce(&mut axhal::context::TaskContext) -> R) -> R {
+    let _guard = NoPreemptIrqSave::new();
+    let curr = current();
+    let curr_ptr = (&***curr) as *const TaskInner as *mut TaskInner;
+    unsafe { f((*curr_ptr).ctx_mut()) }
+}
+
+/// Restores the current task's saved user FPU state to the CPU.
+#[cfg(target_arch = "loongarch64")]
+pub fn restore_current_user_fpu_state() {
+    with_current_task_ctx_mut(|ctx| {
+        ctx.fpu.restore();
+    });
+}
+
+/// Saves the CPU's current FPU state into the current task's saved context.
+#[cfg(target_arch = "loongarch64")]
+pub fn save_current_user_fpu_state() {
+    with_current_task_ctx_mut(|ctx| {
+        ctx.fpu.save();
+    });
+}
+
+/// Resets the current task's saved FPU state and restores the reset state to the CPU.
+#[cfg(target_arch = "loongarch64")]
+pub fn reset_current_user_fpu_state() {
+    with_current_task_ctx_mut(|ctx| {
+        ctx.fpu = Default::default();
+        ctx.fpu.restore();
+    });
+}
+
 /// Poll the timer
 pub fn poll_timer(task: &TaskInner) {
     let Some(thr) = task.try_as_thread() else {

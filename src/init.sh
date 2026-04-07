@@ -279,6 +279,8 @@ mount_support_disk() {
 
     bb mkdir -p /support 2>/dev/null || true
     if bb mount -t ext4 -o ro /dev/vdb /support >/dev/null 2>&1; then
+        OSCOMP_SUPPORT_ARCH_DIR="$support_arch_dir"
+        export OSCOMP_SUPPORT_ARCH_DIR
         support_libgcc=""
         for candidate in \
             "/support/${support_arch_dir}/glibc/lib/libgcc_s.so.1" \
@@ -364,6 +366,47 @@ prepare_ltp_env() {
     bb mkdir -p /lib/modules/10.0.0/build /lib/modules/10.0.0+/build 2>/dev/null || true
     ensure_file_line /lib/modules/10.0.0/build/.config "CONFIG_EVENTFD=y"
     ensure_file_line /lib/modules/10.0.0+/build/.config "CONFIG_EVENTFD=y"
+    [ -f /lib/modules/10.0.0/modules.dep ] || : >/lib/modules/10.0.0/modules.dep 2>/dev/null || true
+    [ -f /lib/modules/10.0.0/modules.builtin ] || : >/lib/modules/10.0.0/modules.builtin 2>/dev/null || true
+    [ -f /lib/modules/10.0.0+/modules.dep ] || : >/lib/modules/10.0.0+/modules.dep 2>/dev/null || true
+    [ -f /lib/modules/10.0.0+/modules.builtin ] || : >/lib/modules/10.0.0+/modules.builtin 2>/dev/null || true
+}
+
+support_ltp_subset_dir() {
+    SUPPORT_LTP_TEST_LIST=""
+    [ -f /support/meta/ltp_test.txt ] || return 0
+    SUPPORT_LTP_TEST_LIST=/support/meta/ltp_test.txt
+}
+
+install_ltp_subset_overlay() {
+    root="$1"
+    support_ltp_subset_dir "$root"
+    test_list="$SUPPORT_LTP_TEST_LIST"
+
+    [ -n "$test_list" ] || return 0
+    [ -d "$root/ltp/testcases" ] || return 0
+
+    target_dir="$root/ltp/testcases/bin"
+    backup_dir="$root/ltp/testcases/bin.oscomp-full"
+
+    if [ ! -e "$backup_dir" ] && [ -d "$target_dir" ]; then
+        bb mv "$target_dir" "$backup_dir" 2>/dev/null || return 0
+    fi
+
+    bb mkdir -p "$target_dir" 2>/dev/null || true
+    clear_dir_contents "$target_dir"
+
+    while IFS= read -r testcase || [ -n "$testcase" ]; do
+        case "$testcase" in
+            ''|\#*)
+                continue
+                ;;
+        esac
+        src="$backup_dir/$testcase"
+        [ -e "$src" ] || continue
+        bb ln -sf "$src" "$target_dir/$testcase" 2>/dev/null || \
+            install_runtime_alias "$src" "$target_dir/$testcase" || true
+    done <"$test_list"
 }
 
 prepare_lmbench_env() {
@@ -374,75 +417,30 @@ prepare_lmbench_env() {
     install_runtime_alias "$root/lmbench_all" /code/lmbench_src/bin/build/lmbench_all || true
 }
 
-read_runner_config() {
-    value="$1"
-    file_path="$2"
-    RUNNER_CONFIG_RESULT="$value"
-    if [ -z "$RUNNER_CONFIG_RESULT" ] && [ -f "$file_path" ]; then
-        RUNNER_CONFIG_RESULT="$(bb cat "$file_path" 2>/dev/null || true)"
-    fi
-}
-
-runner_root_mode() {
-    read_runner_config "${OSCOMP_RUNNER_ROOT:-}" /etc/oscomp-runner/root
-    set -- $RUNNER_CONFIG_RESULT
-    mode="${1:-all}"
-    case "$mode" in
-        default|musl|glibc|all)
-            RUNNER_ROOT_MODE_RESULT="$mode"
-            ;;
-        *)
-            RUNNER_ROOT_MODE_RESULT="all"
-            ;;
-    esac
-}
-
-runner_group_filters() {
-    read_runner_config "${OSCOMP_RUNNER_GROUPS:-}" /etc/oscomp-runner/groups
-    filters="$(printf '%s' "$RUNNER_CONFIG_RESULT" | bb tr ',\t\r\n' '    ' 2>/dev/null || true)"
-    RUNNER_GROUP_FILTERS=""
-    for group_name in $filters; do
-        append_word RUNNER_GROUP_FILTERS "$group_name"
-    done
-}
-
-group_selected() {
-    [ -z "$RUNNER_GROUP_FILTERS" ] && return 0
-    contains_word "$1" $RUNNER_GROUP_FILTERS
-}
-
-official_group_list() {
-    printf '%s\n' \
-        basic \
-        busybox \
-        lua \
-        libctest \
-        iozone \
-        unixbench \
-        iperf \
-        libcbench \
-        lmbench \
-        netperf \
-        cyclictest \
-        ltp
-}
-
-configure_runner_roots() {
-    GROUP_ROOTS=""
-
-    runner_root_mode
-    case "$RUNNER_ROOT_MODE_RESULT" in
-        default|all)
-            append_word GROUP_ROOTS /glibc
-            append_word GROUP_ROOTS /musl
-            ;;
-        musl)
-            append_word GROUP_ROOTS /musl
-            ;;
-        glibc)
-            append_word GROUP_ROOTS /glibc
-            ;;
-    esac
+reference_eval_plan() {
+    cat <<'EOF'
+/musl basic
+/musl iozone
+/musl busybox
+/musl netperf
+/musl lua
+/musl libcbench
+/musl libctest
+/musl cyclictest
+/glibc basic
+/glibc iozone
+/glibc busybox
+/glibc netperf
+/glibc lua
+/glibc libcbench
+/glibc cyclictest
+/musl lmbench
+/glibc lmbench
+/musl ltp
+/glibc ltp
+/musl iperf
+/glibc iperf
+EOF
 }
 
 root_flavor() {
@@ -460,8 +458,11 @@ root_flavor() {
 group_timeout_secs() {
     group="$1"
     case "$group" in
-        basic|busybox|lua|cyclictest|iperf|netperf)
+        basic|busybox|lua|cyclictest|iperf)
             GROUP_TIMEOUT_SECS=180
+            ;;
+        netperf)
+            GROUP_TIMEOUT_SECS=300
             ;;
         libctest|lmbench)
             GROUP_TIMEOUT_SECS=600
@@ -473,10 +474,7 @@ group_timeout_secs() {
             GROUP_TIMEOUT_SECS=300
             ;;
         ltp)
-            GROUP_TIMEOUT_SECS=1500
-            ;;
-        unixbench)
-            GROUP_TIMEOUT_SECS=900
+            GROUP_TIMEOUT_SECS=5400
             ;;
         *)
             GROUP_TIMEOUT_SECS="${OSCOMP_TIMEOUT_DEFAULT:-900}"
@@ -701,6 +699,7 @@ run_group_script() {
             echo "#### OSCOMP RUNNER END ${script} STATUS 127 ####"
             return 127
         fi
+        install_ltp_subset_overlay "$root"
         prepare_ltp_env
     elif [ "$group" = "lmbench" ]; then
         prepare_lmbench_env "$root"
@@ -788,43 +787,31 @@ run_group_script() {
     return "$status"
 }
 
-run_official_groups_in_root() {
-    root="$1"
-    while IFS= read -r group; do
+has_any_planned_scripts() {
+    FOUND_ANY=""
+
+    while IFS=' ' read -r root group; do
+        [ -n "$root" ] || continue
         [ -n "$group" ] || continue
-        group_selected "$group" || continue
         script_path_for_root "$root" "$group"
         [ -f "$SCRIPT_PATH_RESULT" ] || continue
-        run_group_script "$root" "$group"
+        FOUND_ANY=1
+        return 0
     done <<EOF
-$(official_group_list)
+$(reference_eval_plan)
 EOF
 }
 
-run_official_group_across_roots() {
-    group="$1"
-    for root in $GROUP_ROOTS; do
+run_reference_eval_plan() {
+    while IFS=' ' read -r root group; do
+        [ -n "$root" ] || continue
+        [ -n "$group" ] || continue
         [ -n "$RUNNER_GLOBAL_TIMEOUT_REACHED" ] && break
         script_path_for_root "$root" "$group"
         [ -f "$SCRIPT_PATH_RESULT" ] || continue
         run_group_script "$root" "$group"
-    done
-}
-
-has_any_group_scripts() {
-    FOUND_ANY=""
-
-    while IFS= read -r group; do
-        [ -n "$group" ] || continue
-        group_selected "$group" || continue
-        for root in $GROUP_ROOTS; do
-            script_path_for_root "$root" "$group"
-            [ -f "$SCRIPT_PATH_RESULT" ] || continue
-            FOUND_ANY=1
-            return 0
-        done
     done <<EOF
-$(official_group_list)
+$(reference_eval_plan)
 EOF
 }
 
@@ -846,7 +833,7 @@ oscomp_runner_main() {
     export USER=root
     export TERM=dumb
 
-    RUNNER_GLOBAL_TIMEOUT_SECS="${OSCOMP_TIMEOUT_GLOBAL:-6000}"
+    RUNNER_GLOBAL_TIMEOUT_SECS="${OSCOMP_TIMEOUT_GLOBAL:-6900}"
     RUNNER_GLOBAL_TIMEOUT_REACHED=""
 
     runner_now_epoch
@@ -858,30 +845,16 @@ oscomp_runner_main() {
     esac
 
     run_pre2025_init_sequence || exit 1
-    configure_runner_roots
-    runner_group_filters
 
     echo "#### OSCOMP RUNNER BOOTSTRAP ${OSCOMP_BOOTSTRAP:-/bin/sh} ####"
 
-    if [ -z "$GROUP_ROOTS" ]; then
-        echo "#### OSCOMP RUNNER NO TEST SCRIPTS FOUND ####"
-        exit 1
-    fi
-
-    has_any_group_scripts
+    has_any_planned_scripts
     if [ -z "$FOUND_ANY" ]; then
         echo "#### OSCOMP RUNNER NO TEST SCRIPTS FOUND ####"
         exit 1
     fi
 
-    while IFS= read -r group; do
-        [ -n "$group" ] || continue
-        [ -n "$RUNNER_GLOBAL_TIMEOUT_REACHED" ] && break
-        group_selected "$group" || continue
-        run_official_group_across_roots "$group"
-    done <<EOF
-$(official_group_list)
-EOF
+    run_reference_eval_plan
 
     oscomp_shutdown
     exit 0

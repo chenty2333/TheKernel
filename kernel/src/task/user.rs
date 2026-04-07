@@ -52,7 +52,11 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
             let thr = curr.as_thread();
             let tid = curr.id().as_u64() as Pid;
             while !thr.pending_exit() {
+                #[cfg(target_arch = "loongarch64")]
+                super::restore_current_user_fpu_state();
                 let reason = uctx.run();
+                #[cfg(target_arch = "loongarch64")]
+                super::save_current_user_fpu_state();
 
                 set_timer_state(&curr, TimerState::Kernel);
 

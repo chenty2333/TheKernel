@@ -8,7 +8,7 @@ ARCH=""
 IMAGE_PATH=""
 STATE_DIR=${OSCOMP_STATE_DIR:-$REPO_ROOT/.state}
 VERIFY_WORKDIR_BASE=${OSCOMP_VERIFY_WORKDIR_BASE:-$STATE_DIR/verify-pre2025-layout}
-TESTSUITE_DIR=${OSCOMP_TESTSUITE_DIR:-$HOME/testsuits-for-oskernel}
+TESTSUITE_DIR=${OSCOMP_TESTSUITE_DIR:-}
 
 die() {
     printf '[verify-pre2025-layout] error: %s\n' "$*" >&2
@@ -61,6 +61,31 @@ esac
 
 command -v debugfs >/dev/null 2>&1 || die "required command not found: debugfs"
 command -v xz >/dev/null 2>&1 || die "required command not found: xz"
+command -v gzip >/dev/null 2>&1 || die "required command not found: gzip"
+
+collect_testsuite_roots() {
+    TESTSUITE_ROOTS=""
+
+    add_root() {
+        local candidate=$1
+        [ -n "$candidate" ] || return 0
+        [ -d "$candidate" ] || return 0
+        case " $TESTSUITE_ROOTS " in
+            *" $candidate "*) return 0 ;;
+        esac
+        if [ -n "$TESTSUITE_ROOTS" ]; then
+            TESTSUITE_ROOTS="$TESTSUITE_ROOTS $candidate"
+        else
+            TESTSUITE_ROOTS="$candidate"
+        fi
+    }
+
+    add_root "$TESTSUITE_DIR"
+    add_root /home/dia/kernel-image
+    add_root "$HOME/kernel-image"
+    add_root "$HOME/testsuits-for-oskernel"
+    add_root /coursegrader/testdata
+}
 
 find_first_existing() {
     for candidate in "$@"; do
@@ -73,8 +98,19 @@ find_first_existing() {
     return 1
 }
 
-IMAGE_SOURCE=${IMAGE_PATH:-$(find_first_existing "$DEFAULT_IMAGE" "$DEFAULT_IMAGE_XZ" || true)}
-[ -n "$IMAGE_SOURCE" ] || die "official image not found under $TESTSUITE_DIR"
+find_official_image() {
+    collect_testsuite_roots
+    for root in $TESTSUITE_ROOTS; do
+        find_first_existing \
+            "$root/$(basename -- "$DEFAULT_IMAGE")" \
+            "$root/$(basename -- "$DEFAULT_IMAGE_XZ")" \
+            "$root/$(basename -- "$DEFAULT_IMAGE").gz" && return 0
+    done
+    return 1
+}
+
+IMAGE_SOURCE=${IMAGE_PATH:-$(find_official_image || true)}
+[ -n "$IMAGE_SOURCE" ] || die "official image not found in configured search roots"
 [ -f "$IMAGE_SOURCE" ] || die "image does not exist: $IMAGE_SOURCE"
 
 TEMP_IMAGE=""
@@ -94,6 +130,12 @@ if [[ "$IMAGE_SOURCE" == *.xz ]]; then
     TEMP_DIR=$(mktemp -d "$VERIFY_WORKDIR_BASE/run.XXXXXX")
     TEMP_IMAGE="$TEMP_DIR/$(basename -- "${IMAGE_SOURCE%.xz}")"
     xz -dc "$IMAGE_SOURCE" >"$TEMP_IMAGE"
+    IMAGE="$TEMP_IMAGE"
+elif [[ "$IMAGE_SOURCE" == *.gz ]]; then
+    mkdir -p "$VERIFY_WORKDIR_BASE"
+    TEMP_DIR=$(mktemp -d "$VERIFY_WORKDIR_BASE/run.XXXXXX")
+    TEMP_IMAGE="$TEMP_DIR/$(basename -- "${IMAGE_SOURCE%.gz}")"
+    gzip -dc "$IMAGE_SOURCE" >"$TEMP_IMAGE"
     IMAGE="$TEMP_IMAGE"
 else
     IMAGE="$IMAGE_SOURCE"

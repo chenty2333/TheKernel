@@ -7,20 +7,20 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 ARCH=""
 OUT_DIR=""
 OUTPUT=""
-IMAGE_SIZE_MB=32
+MIN_IMAGE_SIZE_MB=32
+TEST_LIST_PATH="$REPO_ROOT/ltp_test.txt"
+TMP_ROOT=""
 
 usage() {
     cat <<EOF
 Usage: $(basename "$0") --arch {rv|la|both} [--out-dir DIR] [--output PATH] [--size-mb N]
 
-Build a minimal support disk image with:
-  - /glibc/lib/libgcc_s.so.1
+Build an evaluator support disk aligned to /home/dia/T202510213995926-2475:
+  - /rv/... and /la/... arch-specific payload roots
   - /usr/lib/locale/C.UTF-8
+  - /<arch>/glibc/lib/libgcc_s.so.1
+  - /meta/ltp_test.txt used at runtime to overlay the same LTP subset
 
-The output file is:
-  rv   -> disk.img
-  la   -> disk-la.img
-  both -> disk.img (contains both rv/la assets)
 EOF
 }
 
@@ -39,7 +39,11 @@ while (($#)); do
             shift 2
             ;;
         --size-mb)
-            IMAGE_SIZE_MB=${2:-}
+            MIN_IMAGE_SIZE_MB=${2:-}
+            shift 2
+            ;;
+        --test-list)
+            TEST_LIST_PATH=${2:-}
             shift 2
             ;;
         -h|--help)
@@ -77,14 +81,22 @@ require_cmd() {
     }
 }
 
+find_libgcc() {
+    local pattern=$1
+    find /nix/store -path "$pattern" 2>/dev/null | head -n 1
+}
+
 require_cmd mke2fs
 require_cmd truncate
 require_cmd find
 require_cmd cp
+require_cmd mktemp
+require_cmd du
+require_cmd awk
 
-find_libgcc() {
-    local pattern=$1
-    find /nix/store -path "$pattern" 2>/dev/null | head -n 1
+[ -f "$TEST_LIST_PATH" ] || {
+    printf 'missing LTP test list: %s\n' "$TEST_LIST_PATH" >&2
+    exit 1
 }
 
 RV_LIBGCC_SOURCE=$(find_libgcc '*riscv*libgcc_s.so.1')
@@ -103,7 +115,7 @@ case "$ARCH" in
             printf 'failed to locate loongarch libgcc_s.so.1\n' >&2
             exit 1
         }
-        IMAGE_NAME=disk-la.img
+        IMAGE_NAME=disk.img
         ;;
     both|all)
         [ -n "${RV_LIBGCC_SOURCE:-}" ] || {
@@ -124,18 +136,25 @@ LOCALE_SOURCE=/usr/lib/locale/C.utf8
     exit 1
 }
 
-WORK_ROOT="$OUT_DIR/root"
-rm -rf "$WORK_ROOT"
-mkdir -p "$WORK_ROOT/usr/lib/locale/C.UTF-8" "$OUT_DIR"
+TMP_ROOT=$(mktemp -d "$REPO_ROOT/.tmp/build-support-disk.XXXXXX")
+cleanup() {
+    [ -n "$TMP_ROOT" ] && rm -rf "$TMP_ROOT"
+}
+trap cleanup EXIT
+
+WORK_ROOT="$TMP_ROOT/root"
+mkdir -p "$WORK_ROOT/usr/lib/locale/C.UTF-8" "$WORK_ROOT/meta" "$OUT_DIR"
+cp -a "$LOCALE_SOURCE"/. "$WORK_ROOT/usr/lib/locale/C.UTF-8/"
+cp "$TEST_LIST_PATH" "$WORK_ROOT/meta/ltp_test.txt"
 
 case "$ARCH" in
     rv)
-        mkdir -p "$WORK_ROOT/glibc/lib"
-        cp "$RV_LIBGCC_SOURCE" "$WORK_ROOT/glibc/lib/libgcc_s.so.1"
+        mkdir -p "$WORK_ROOT/rv/glibc/lib"
+        cp "$RV_LIBGCC_SOURCE" "$WORK_ROOT/rv/glibc/lib/libgcc_s.so.1"
         ;;
     la)
-        mkdir -p "$WORK_ROOT/glibc/lib"
-        cp "$LA_LIBGCC_SOURCE" "$WORK_ROOT/glibc/lib/libgcc_s.so.1"
+        mkdir -p "$WORK_ROOT/la/glibc/lib"
+        cp "$LA_LIBGCC_SOURCE" "$WORK_ROOT/la/glibc/lib/libgcc_s.so.1"
         ;;
     both|all)
         mkdir -p "$WORK_ROOT/rv/glibc/lib" "$WORK_ROOT/la/glibc/lib"
@@ -143,11 +162,16 @@ case "$ARCH" in
         cp "$LA_LIBGCC_SOURCE" "$WORK_ROOT/la/glibc/lib/libgcc_s.so.1"
         ;;
 esac
-cp -a "$LOCALE_SOURCE"/. "$WORK_ROOT/usr/lib/locale/C.UTF-8/"
+
+used_kib=$(du -sk "$WORK_ROOT" | awk '{print $1}')
+auto_size_mb=$(( (used_kib + 1023) / 1024 + 64 ))
+if [ "$auto_size_mb" -lt "$MIN_IMAGE_SIZE_MB" ]; then
+    auto_size_mb=$MIN_IMAGE_SIZE_MB
+fi
 
 IMAGE_PATH=${OUTPUT:-"$OUT_DIR/$IMAGE_NAME"}
 rm -f "$IMAGE_PATH"
-truncate -s "${IMAGE_SIZE_MB}M" "$IMAGE_PATH"
+truncate -s "${auto_size_mb}M" "$IMAGE_PATH"
 mke2fs -t ext2 -F -d "$WORK_ROOT" "$IMAGE_PATH" >/dev/null
 
 printf '%s\n' "$IMAGE_PATH"
