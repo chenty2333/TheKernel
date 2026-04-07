@@ -340,9 +340,10 @@ read_runner_config() {
 runner_root_mode() {
     read_runner_config "${OSCOMP_RUNNER_ROOT:-}" /etc/oscomp-runner/root
     set -- $RUNNER_CONFIG_RESULT
-    case "${1:-all}" in
+    mode="${1:-all}"
+    case "$mode" in
         default|musl|glibc|all)
-            RUNNER_ROOT_MODE_RESULT="$1"
+            RUNNER_ROOT_MODE_RESULT="$mode"
             ;;
         *)
             RUNNER_ROOT_MODE_RESULT="all"

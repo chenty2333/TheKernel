@@ -83,7 +83,7 @@ kernel-rv:
 	@$(MAKE) -C make ARCH=riscv64 BUS=mmio build
 	@kernel="$$(find "$(STATE_DIR)/riscv64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
 	test -n "$$kernel"; \
-	cp -f "$$kernel" "$@"
+	python3 scripts/patch-riscv-kernel-elf.py "$$kernel" "$@"
 
 kernel-la:
 	@$(MAKE) -C make ARCH=loongarch64 defconfig
