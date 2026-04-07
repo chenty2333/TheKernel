@@ -182,9 +182,15 @@ pub fn sys_get_robust_list(
     head: *mut *const robust_list_head,
     size: *mut usize,
 ) -> AxResult<isize> {
-    let task = if tid == 0 {
-        current().clone()
+    let current_task = current();
+    let current_thread = current_task.as_thread();
+    let current_tid = current_thread.tid();
+    let task = if tid == 0 || tid == current_tid {
+        current_task.clone()
     } else {
+        if current_thread.proc_data.euid() != 0 {
+            return Err(AxError::OperationNotPermitted);
+        }
         get_visible_task(tid)?
     };
     head.vm_write(task.as_thread().robust_list_head() as _)?;

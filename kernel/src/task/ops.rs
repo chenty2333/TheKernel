@@ -253,36 +253,53 @@ fn mark_robust_owner_died(uaddr: *mut u32, tid: Pid) -> AxResult<bool> {
     }
 }
 
-pub fn exit_robust_list(head: *const RobustListHead) -> AxResult<()> {
+fn is_robust_list_error(err: AxError) -> bool {
+    matches!(
+        err,
+        AxError::BadAddress | AxError::InvalidInput | AxError::FilesystemLoop
+    )
+}
+
+pub fn exit_robust_list(head: *const RobustListHead) {
     // Reference: https://elixir.bootlin.com/linux/v6.13.6/source/kernel/futex/core.c#L777
 
     let mut limit = ROBUST_LIST_LIMIT;
 
     let end_ptr = unsafe { &raw const (*head).list };
-    let head = head.vm_read()?;
+    let head = match head.vm_read() {
+        Ok(head) => head,
+        Err(err) if is_robust_list_error(err.into()) => return,
+        Err(_) => return,
+    };
     let mut entry = head.list.next;
     let offset = head.futex_offset;
     let pending = head.list_op_pending;
 
     while !core::ptr::eq(entry, end_ptr) {
-        let next_entry = entry.vm_read()?.next;
+        let next_entry = match entry.vm_read() {
+            Ok(next) => next.next,
+            Err(err) if is_robust_list_error(err.into()) => break,
+            Err(_) => break,
+        };
         if entry != pending {
-            handle_futex_death(entry, offset)?;
+            match handle_futex_death(entry, offset) {
+                Ok(()) => {}
+                Err(err) if is_robust_list_error(err) => break,
+                Err(_) => break,
+            }
         }
         entry = next_entry;
 
         limit -= 1;
         if limit == 0 {
-            return Err(AxError::FilesystemLoop);
+            break;
         }
         axtask::yield_now();
     }
 
     if !pending.is_null() {
-        handle_futex_death(pending, offset)?;
+        let _ = handle_futex_death(pending, offset);
     }
-
-    Ok(())
 }
 
 pub fn do_exit(exit_code: i32, group_exit: bool) {
@@ -303,10 +320,8 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
         }
     }
     let head = thr.robust_list_head() as *const RobustListHead;
-    if !head.is_null()
-        && let Err(err) = exit_robust_list(head)
-    {
-        warn!("exit robust list failed: {err:?}");
+    if !head.is_null() {
+        exit_robust_list(head);
     }
 
     let process = &thr.proc_data.proc;
