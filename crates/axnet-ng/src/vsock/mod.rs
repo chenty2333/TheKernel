@@ -3,6 +3,7 @@
 pub(crate) mod connection_manager;
 pub(crate) mod stream;
 
+use alloc::sync::Arc;
 use core::task::Context;
 
 pub use axdriver::prelude::{VsockAddr, VsockConnId};
@@ -75,6 +76,10 @@ impl VsockSocket {
         Self {
             transport: transport.into(),
         }
+    }
+
+    pub fn set_filter(&self, _filter: Option<Arc<dyn crate::SocketFilter>>) -> AxResult<()> {
+        Ok(())
     }
 }
 

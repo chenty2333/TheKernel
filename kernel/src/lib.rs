@@ -21,6 +21,7 @@ pub mod bpf;
 mod config;
 mod file;
 mod mm;
+mod mounts;
 mod pseudofs;
 mod syscall;
 mod task;

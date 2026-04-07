@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     any::Any,
     fmt::{self, Debug},
@@ -22,6 +22,10 @@ use crate::{
     udp::UdpSocket,
     unix::{UnixSocket, UnixSocketAddr},
 };
+
+pub trait SocketFilter: Send + Sync {
+    fn filter(&self, data: &mut Vec<u8>) -> AxResult<usize>;
+}
 
 /// Extended socket address supporting IP, Unix, and vsock address families.
 #[derive(Clone, Debug)]
@@ -213,6 +217,18 @@ impl Pollable for Socket {
             Socket::Unix(unix) => unix.register(context, events),
             #[cfg(feature = "vsock")]
             Socket::Vsock(vsock) => vsock.register(context, events),
+        }
+    }
+}
+
+impl Socket {
+    pub fn set_filter(&self, filter: Option<Arc<dyn SocketFilter>>) -> AxResult<()> {
+        match self {
+            Socket::Unix(unix) => unix.set_filter(filter),
+            Socket::Udp(udp) => udp.set_filter(filter),
+            Socket::Tcp(tcp) => tcp.set_filter(filter),
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(vsock) => vsock.set_filter(filter),
         }
     }
 }

@@ -7,7 +7,6 @@ use axdriver::prelude::{
 };
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{DeviceId, NodeFlags, NodeType, VfsResult};
-use axhal::time::wall_time;
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
 use bitmaps::Bitmap;
@@ -20,6 +19,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 use crate::{
     mm::UserPtr,
     pseudofs::{Device, DeviceOps, DirMapping, SimpleFs},
+    time::wall_time,
 };
 const KEY_CNT: usize = EventType::Key.bits_count();
 

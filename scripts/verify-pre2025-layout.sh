@@ -74,7 +74,9 @@ IMAGE_SOURCE=${IMAGE_PATH:-$(find_first_existing "$DEFAULT_IMAGE" "$DEFAULT_IMAG
 
 TEMP_IMAGE=""
 cleanup() {
-    [ -n "$TEMP_IMAGE" ] && rm -f "$TEMP_IMAGE"
+    if [ -n "$TEMP_IMAGE" ]; then
+        rm -f "$TEMP_IMAGE"
+    fi
 }
 trap cleanup EXIT
 

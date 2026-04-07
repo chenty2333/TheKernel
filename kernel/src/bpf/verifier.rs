@@ -32,6 +32,10 @@ enum RegType {
     MapValuePtr,
     /// Register holds a nullable pointer returned by map_lookup_elem.
     MapValueOrNull,
+    /// Register holds a pointer returned by ringbuf_reserve().
+    RingBufMemPtr,
+    /// Register holds a nullable pointer returned by ringbuf_reserve().
+    RingBufMemOrNull,
     /// Register holds a map pointer (used as argument to helpers).
     MapPtr,
 }
@@ -39,12 +43,16 @@ enum RegType {
 #[derive(Debug, Clone, Copy)]
 struct RegState {
     ty: RegType,
+    scalar_const: Option<i64>,
+    fixed_off: Option<i32>,
 }
 
 impl Default for RegState {
     fn default() -> Self {
         Self {
             ty: RegType::Uninit,
+            scalar_const: None,
+            fixed_off: None,
         }
     }
 }
@@ -53,36 +61,72 @@ impl RegState {
     fn scalar() -> Self {
         Self {
             ty: RegType::Scalar,
+            scalar_const: None,
+            fixed_off: None,
+        }
+    }
+
+    fn scalar_const(value: i64) -> Self {
+        Self {
+            ty: RegType::Scalar,
+            scalar_const: Some(value),
+            fixed_off: None,
         }
     }
 
     fn ctx() -> Self {
         Self {
             ty: RegType::CtxPtr,
+            scalar_const: None,
+            fixed_off: Some(0),
         }
     }
 
     fn stack() -> Self {
         Self {
             ty: RegType::StackPtr,
+            scalar_const: None,
+            fixed_off: Some(0),
         }
     }
 
     fn map_value() -> Self {
         Self {
             ty: RegType::MapValuePtr,
+            scalar_const: None,
+            fixed_off: Some(0),
         }
     }
 
     fn map_value_or_null() -> Self {
         Self {
             ty: RegType::MapValueOrNull,
+            scalar_const: None,
+            fixed_off: Some(0),
+        }
+    }
+
+    fn ringbuf_mem() -> Self {
+        Self {
+            ty: RegType::RingBufMemPtr,
+            scalar_const: None,
+            fixed_off: Some(0),
+        }
+    }
+
+    fn ringbuf_mem_or_null() -> Self {
+        Self {
+            ty: RegType::RingBufMemOrNull,
+            scalar_const: None,
+            fixed_off: Some(0),
         }
     }
 
     fn map_ptr() -> Self {
         Self {
             ty: RegType::MapPtr,
+            scalar_const: None,
+            fixed_off: None,
         }
     }
 
@@ -97,6 +141,8 @@ impl RegState {
                 | RegType::CtxPtr
                 | RegType::MapValuePtr
                 | RegType::MapValueOrNull
+                | RegType::RingBufMemPtr
+                | RegType::RingBufMemOrNull
                 | RegType::MapPtr
         )
     }
@@ -483,26 +529,30 @@ fn pass_abstract_interp(
                 if op == BPF_OP_MOV {
                     if insn.code & BPF_SRC_X != 0 {
                         check_reg_init(&regs, src, i, log)?;
-                        regs[dst] = if regs[src].is_ptr() {
-                            regs[src]
-                        } else {
-                            RegState::scalar()
-                        };
+                        regs[dst] = regs[src];
                     } else {
-                        regs[dst] = RegState::scalar();
+                        regs[dst] = scalar_imm_state(insn);
                     }
                 } else if op == BPF_OP_NEG {
                     check_reg_init(&regs, dst, i, log)?;
-                    regs[dst] = RegState::scalar();
+                    regs[dst] = if let Some(value) = regs[dst].scalar_const {
+                        RegState::scalar_const(value.wrapping_neg())
+                    } else {
+                        RegState::scalar()
+                    };
                 } else {
                     check_reg_init(&regs, dst, i, log)?;
                     if insn.code & BPF_SRC_X != 0 {
                         check_reg_init(&regs, src, i, log)?;
                     }
-                    if preserves_mem_ptr(insn, regs[dst].ty) {
-                        // Preserve pointer provenance for 64-bit add/sub by
-                        // an immediate. Runtime bounds checks still validate
-                        // the resulting address before any memory access.
+                    if preserves_mem_ptr(
+                        insn,
+                        regs[dst].ty,
+                        ((insn.code & BPF_SRC_X) != 0).then_some(regs[src].ty),
+                    ) {
+                        regs[dst] = adjust_mem_ptr_state(regs[dst], insn, regs.get(src).copied());
+                    } else if regs[dst].ty == RegType::Scalar {
+                        regs[dst] = eval_scalar_alu_state(regs[dst], insn, regs.get(src).copied());
                     } else {
                         regs[dst] = RegState::scalar();
                     }
@@ -514,6 +564,7 @@ fn pass_abstract_interp(
                     log.log(&alloc::format!("insn {i}: LDX src R{src} is not a pointer"));
                     return Err(AxError::InvalidInput);
                 }
+                verify_mem_access(regs[src], insn.off, mem_access_size(insn), i, log)?;
                 regs[dst] = RegState::scalar();
             }
             BPF_CLASS_STX => {
@@ -527,6 +578,7 @@ fn pass_abstract_interp(
                     log.log(&alloc::format!("insn {i}: STX dst R{dst} is not writable"));
                     return Err(AxError::InvalidInput);
                 }
+                verify_mem_access(regs[dst], insn.off, mem_access_size(insn), i, log)?;
                 if (insn.code & 0xe0) == BPF_MODE_ATOMIC {
                     verify_atomic(&mut regs, insn, i, log)?;
                 }
@@ -541,6 +593,7 @@ fn pass_abstract_interp(
                     log.log(&alloc::format!("insn {i}: ST dst R{dst} is not writable"));
                     return Err(AxError::InvalidInput);
                 }
+                verify_mem_access(regs[dst], insn.off, mem_access_size(insn), i, log)?;
             }
             BPF_CLASS_LD => match decoded[i] {
                 BpfInsnAux::LdImm64Head(BpfLdImm64Data::Immediate(_)) => {
@@ -631,13 +684,34 @@ fn merge_state(
 
 fn join_reg_state(lhs: RegState, rhs: RegState) -> RegState {
     if lhs.ty == rhs.ty {
-        lhs
+        let mut merged = lhs;
+        if lhs.ty == RegType::Scalar && lhs.scalar_const != rhs.scalar_const {
+            merged.scalar_const = None;
+        }
+        if lhs.ty != RegType::Scalar && lhs.fixed_off != rhs.fixed_off {
+            merged.fixed_off = None;
+        }
+        merged
     } else if matches!(
         (lhs.ty, rhs.ty),
         (RegType::MapValuePtr, RegType::MapValueOrNull)
             | (RegType::MapValueOrNull, RegType::MapValuePtr)
     ) {
-        RegState::map_value_or_null()
+        let mut merged = RegState::map_value_or_null();
+        if lhs.fixed_off != rhs.fixed_off {
+            merged.fixed_off = None;
+        }
+        merged
+    } else if matches!(
+        (lhs.ty, rhs.ty),
+        (RegType::RingBufMemPtr, RegType::RingBufMemOrNull)
+            | (RegType::RingBufMemOrNull, RegType::RingBufMemPtr)
+    ) {
+        let mut merged = RegState::ringbuf_mem_or_null();
+        if lhs.fixed_off != rhs.fixed_off {
+            merged.fixed_off = None;
+        }
+        merged
     } else if !lhs.is_init() || !rhs.is_init() {
         RegState::default()
     } else {
@@ -674,6 +748,15 @@ fn verify_call(
                     return Err(AxError::InvalidInput);
                 }
             }
+            HelperArgKind::RingBufPtr => {
+                check_reg_init(regs, reg, insn_idx, log)?;
+                if regs[reg].ty != RegType::RingBufMemPtr {
+                    log.log(&alloc::format!(
+                        "insn {insn_idx}: helper arg R{reg} must be a ringbuf reservation pointer"
+                    ));
+                    return Err(AxError::InvalidInput);
+                }
+            }
             HelperArgKind::MapPtr => {
                 check_reg_init(regs, reg, insn_idx, log)?;
                 if regs[reg].ty != RegType::MapPtr {
@@ -703,6 +786,8 @@ fn verify_call(
         HelperReturnKind::Scalar => RegState::scalar(),
         HelperReturnKind::MapValuePtr => RegState::map_value(),
         HelperReturnKind::MapValueOrNull => RegState::map_value_or_null(),
+        HelperReturnKind::RingBufMemPtr => RegState::ringbuf_mem(),
+        HelperReturnKind::RingBufMemOrNull => RegState::ringbuf_mem_or_null(),
     };
     Ok(())
 }
@@ -712,6 +797,7 @@ enum HelperArgKind {
     Unused,
     Init,
     Scalar,
+    RingBufPtr,
     MapPtr,
     Mem(HelperMemMask),
 }
@@ -721,6 +807,8 @@ enum HelperReturnKind {
     Scalar,
     MapValuePtr,
     MapValueOrNull,
+    RingBufMemPtr,
+    RingBufMemOrNull,
 }
 
 #[derive(Clone, Copy)]
@@ -764,6 +852,39 @@ fn helper_proto(helper_id: u32) -> Option<HelperProto> {
             ],
             ret: HelperReturnKind::Scalar,
             invalidates_map_value_ptrs: true,
+        },
+        BPF_FUNC_RINGBUF_OUTPUT => HelperProto {
+            args: [
+                HelperArgKind::MapPtr,
+                HelperArgKind::Mem(HelperMemMask::READABLE),
+                HelperArgKind::Scalar,
+                HelperArgKind::Scalar,
+                HelperArgKind::Unused,
+            ],
+            ret: HelperReturnKind::Scalar,
+            invalidates_map_value_ptrs: false,
+        },
+        BPF_FUNC_RINGBUF_RESERVE => HelperProto {
+            args: [
+                HelperArgKind::MapPtr,
+                HelperArgKind::Scalar,
+                HelperArgKind::Scalar,
+                HelperArgKind::Unused,
+                HelperArgKind::Unused,
+            ],
+            ret: HelperReturnKind::RingBufMemOrNull,
+            invalidates_map_value_ptrs: false,
+        },
+        BPF_FUNC_RINGBUF_SUBMIT | BPF_FUNC_RINGBUF_DISCARD => HelperProto {
+            args: [
+                HelperArgKind::RingBufPtr,
+                HelperArgKind::Scalar,
+                HelperArgKind::Unused,
+                HelperArgKind::Unused,
+                HelperArgKind::Unused,
+            ],
+            ret: HelperReturnKind::Scalar,
+            invalidates_map_value_ptrs: false,
         },
         BPF_FUNC_KTIME_GET_NS
         | BPF_FUNC_GET_PRANDOM_U32
@@ -820,14 +941,155 @@ fn mem_ptr_writable(reg_ty: RegType) -> bool {
     !matches!(reg_ty, RegType::CtxPtr)
 }
 
-fn preserves_mem_ptr(insn: &BpfInsn, reg_ty: RegType) -> bool {
+fn scalar_imm_state(insn: &BpfInsn) -> RegState {
+    match insn.class() {
+        BPF_CLASS_ALU64 => RegState::scalar_const(insn.imm as i64),
+        BPF_CLASS_ALU => RegState::scalar_const((insn.imm as u32) as i64),
+        _ => RegState::scalar(),
+    }
+}
+
+fn eval_scalar_alu_state(dst: RegState, insn: &BpfInsn, src: Option<RegState>) -> RegState {
+    let lhs = dst.scalar_const;
+    let rhs = if (insn.code & BPF_SRC_X) != 0 {
+        src.and_then(|state| state.scalar_const)
+    } else {
+        scalar_imm_state(insn).scalar_const
+    };
+
+    let Some(lhs) = lhs else {
+        return RegState::scalar();
+    };
+    let Some(rhs) = rhs else {
+        return RegState::scalar();
+    };
+
+    let value = match (insn.class(), insn.op()) {
+        (BPF_CLASS_ALU64, BPF_OP_ADD) => lhs.wrapping_add(rhs),
+        (BPF_CLASS_ALU64, BPF_OP_SUB) => lhs.wrapping_sub(rhs),
+        (BPF_CLASS_ALU64, BPF_OP_MUL) => lhs.wrapping_mul(rhs),
+        (BPF_CLASS_ALU64, BPF_OP_OR) => lhs | rhs,
+        (BPF_CLASS_ALU64, BPF_OP_AND) => lhs & rhs,
+        (BPF_CLASS_ALU64, BPF_OP_XOR) => lhs ^ rhs,
+        (BPF_CLASS_ALU64, BPF_OP_LSH) => lhs.wrapping_shl((rhs as u64 & 63) as u32),
+        (BPF_CLASS_ALU64, BPF_OP_RSH) => ((lhs as u64) >> (rhs as u64 & 63)) as i64,
+        (BPF_CLASS_ALU64, BPF_OP_ARSH) => lhs >> (rhs as u64 & 63),
+        (BPF_CLASS_ALU64, BPF_OP_MOV) => rhs,
+        (BPF_CLASS_ALU, BPF_OP_ADD) => ((lhs as u32).wrapping_add(rhs as u32)) as i64,
+        (BPF_CLASS_ALU, BPF_OP_SUB) => ((lhs as u32).wrapping_sub(rhs as u32)) as i64,
+        (BPF_CLASS_ALU, BPF_OP_MUL) => ((lhs as u32).wrapping_mul(rhs as u32)) as i64,
+        (BPF_CLASS_ALU, BPF_OP_OR) => ((lhs as u32) | (rhs as u32)) as i64,
+        (BPF_CLASS_ALU, BPF_OP_AND) => ((lhs as u32) & (rhs as u32)) as i64,
+        (BPF_CLASS_ALU, BPF_OP_XOR) => ((lhs as u32) ^ (rhs as u32)) as i64,
+        (BPF_CLASS_ALU, BPF_OP_LSH) => ((lhs as u32) << ((rhs as u32) & 31)) as i64,
+        (BPF_CLASS_ALU, BPF_OP_RSH) => ((lhs as u32) >> ((rhs as u32) & 31)) as i64,
+        (BPF_CLASS_ALU, BPF_OP_ARSH) => (((lhs as u32) as i32) >> ((rhs as u32) & 31)) as i64,
+        (BPF_CLASS_ALU, BPF_OP_MOV) => (rhs as u32) as i64,
+        _ => return RegState::scalar(),
+    };
+
+    RegState::scalar_const(value)
+}
+
+fn adjust_mem_ptr_state(dst: RegState, insn: &BpfInsn, src: Option<RegState>) -> RegState {
+    let Some(base_off) = dst.fixed_off else {
+        return RegState {
+            fixed_off: None,
+            ..dst
+        };
+    };
+
+    let delta = if (insn.code & BPF_SRC_X) != 0 {
+        src.and_then(|state| state.scalar_const)
+            .and_then(|value| i32::try_from(value).ok())
+    } else {
+        Some(insn.imm)
+    };
+
+    let Some(delta) = delta else {
+        return RegState {
+            fixed_off: None,
+            ..dst
+        };
+    };
+
+    let signed_delta = if insn.op() == BPF_OP_SUB {
+        delta.checked_neg()
+    } else {
+        Some(delta)
+    };
+    let Some(signed_delta) = signed_delta else {
+        return RegState {
+            fixed_off: None,
+            ..dst
+        };
+    };
+    let Some(fixed_off) = base_off.checked_add(signed_delta) else {
+        return RegState {
+            fixed_off: None,
+            ..dst
+        };
+    };
+
+    RegState { fixed_off: Some(fixed_off), ..dst }
+}
+
+fn mem_access_size(insn: &BpfInsn) -> usize {
+    match insn.code & 0x18 {
+        BPF_SIZE_B => 1,
+        BPF_SIZE_H => 2,
+        BPF_SIZE_W => 4,
+        BPF_SIZE_DW => 8,
+        _ => 0,
+    }
+}
+
+fn verify_mem_access(
+    reg: RegState,
+    off: i16,
+    size: usize,
+    insn_idx: usize,
+    log: &mut VerifierLog,
+) -> AxResult<()> {
+    if reg.ty != RegType::StackPtr {
+        return Ok(());
+    }
+    let Some(base_off) = reg.fixed_off else {
+        log.log(&alloc::format!(
+            "insn {insn_idx}: stack access uses pointer with unknown offset"
+        ));
+        return Err(AxError::InvalidInput);
+    };
+    let Some(start) = base_off.checked_add(off as i32) else {
+        log.log(&alloc::format!("insn {insn_idx}: stack access offset overflow"));
+        return Err(AxError::InvalidInput);
+    };
+    let Some(end) = start.checked_add(size as i32) else {
+        log.log(&alloc::format!("insn {insn_idx}: stack access size overflow"));
+        return Err(AxError::InvalidInput);
+    };
+
+    if start < -(BPF_STACK_SIZE as i32) || end > 0 {
+        log.log(&alloc::format!(
+            "insn {insn_idx}: invalid stack access off={start} size={size}"
+        ));
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn preserves_mem_ptr(insn: &BpfInsn, reg_ty: RegType, src_ty: Option<RegType>) -> bool {
     insn.class() == BPF_CLASS_ALU64
-        && (insn.code & BPF_SRC_X) == 0
         && matches!(insn.op(), BPF_OP_ADD | BPF_OP_SUB)
-        && matches!(
-            reg_ty,
-            RegType::StackPtr | RegType::CtxPtr | RegType::MapValuePtr
-        )
+        && if (insn.code & BPF_SRC_X) != 0 {
+            matches!(
+                reg_ty,
+                RegType::StackPtr | RegType::CtxPtr | RegType::MapValuePtr
+            ) && matches!(src_ty, Some(RegType::Scalar))
+        } else {
+            true
+        }
+        && matches!(reg_ty, RegType::StackPtr | RegType::CtxPtr | RegType::MapValuePtr)
 }
 
 fn clobber_caller_saved(regs: &mut [RegState; BPF_MAX_REGS]) {
@@ -1114,15 +1376,19 @@ fn successor_states(
     }
 
     let dst = insn.dst_reg() as usize;
-    if regs[dst].ty != RegType::MapValueOrNull {
+    if !matches!(regs[dst].ty, RegType::MapValueOrNull | RegType::RingBufMemOrNull) {
         return Ok(succs.into_iter().map(|succ| (succ, *regs)).collect());
     }
 
     let target = calc_jump_target(pc, insn) as usize;
     let fallthrough = pc + 1;
-    let mut null_regs = *regs;
+    let null_regs = *regs;
     let mut nonnull_regs = *regs;
-    nonnull_regs[dst] = RegState::map_value();
+    nonnull_regs[dst] = match regs[dst].ty {
+        RegType::MapValueOrNull => RegState::map_value(),
+        RegType::RingBufMemOrNull => RegState::ringbuf_mem(),
+        _ => unreachable!(),
+    };
 
     match insn.op() {
         BPF_OP_JEQ => Ok(succs

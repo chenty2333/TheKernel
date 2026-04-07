@@ -8,7 +8,7 @@ use linux_raw_sys::general::*;
 use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange, align_up_4k};
 
 use crate::{
-    file::{File, FileLike},
+    file::{File, FileLike, get_typed_file, io_uring::IoUringFile},
     mm::{AddrSpace, Backend, BackendOps, SharedPages},
     pseudofs::{Device, DeviceMmap},
     task::AsThread,
@@ -293,7 +293,13 @@ pub fn sys_mmap(
             .ok_or(AxError::NoMemory)?
     };
 
-    let file = if fd > 0 {
+    let io_uring = if fd > 0 {
+        get_typed_file::<IoUringFile>(fd).ok()
+    } else {
+        None
+    };
+
+    let file = if fd > 0 && io_uring.is_none() {
         Some(File::from_fd(fd)?)
     } else {
         None
@@ -301,7 +307,13 @@ pub fn sys_mmap(
 
     let backend = match map_type {
         MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE => {
-            if let Some(file) = file {
+            if let Some(io_uring) = io_uring {
+                let Some((pages, max_size)) = io_uring.map_region(offset) else {
+                    return Err(AxError::InvalidInput);
+                };
+                length = length.min(max_size);
+                Backend::new_shared(start, pages)
+            } else if let Some(file) = file {
                 let file = file.inner();
                 let backend = file.backend()?.clone();
                 match file.backend()?.clone() {

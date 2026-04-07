@@ -164,6 +164,22 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
+        Sysno::fsopen => sys_fsopen(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::fsconfig => sys_fsconfig(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+            uctx.arg4() as _,
+        ),
+        Sysno::fsmount => sys_fsmount(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::move_mount => sys_move_mount(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+            uctx.arg4() as _,
+        ),
 
         // file ops
         #[cfg(target_arch = "x86_64")]
@@ -634,6 +650,14 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::getrandom => sys_getrandom(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         Sysno::seccomp => sys_seccomp(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         #[cfg(target_arch = "riscv64")]
+        Sysno::riscv_hwprobe => sys_riscv_hwprobe(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+            uctx.arg4() as _,
+        ),
+        #[cfg(target_arch = "riscv64")]
         Sysno::riscv_flush_icache => sys_riscv_flush_icache(),
 
         // sync
@@ -641,6 +665,10 @@ pub fn handle_syscall(uctx: &mut UserContext) {
 
         // time
         Sysno::gettimeofday => sys_gettimeofday(uctx.arg0() as _),
+        Sysno::clock_settime => sys_clock_settime(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::settimeofday => sys_settimeofday(uctx.arg0() as _),
+        Sysno::adjtimex => sys_adjtimex(uctx.arg0() as _),
+        Sysno::clock_adjtime => sys_clock_adjtime(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::times => sys_times(uctx.arg0() as _),
         Sysno::clock_gettime => sys_clock_gettime(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::clock_getres => sys_clock_getres(uctx.arg0() as _, uctx.arg1() as _),
@@ -745,6 +773,23 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg3() as _,
         ),
         Sysno::timerfd_gettime => sys_timerfd_gettime(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::userfaultfd => sys_userfaultfd(uctx.arg0() as _),
+        Sysno::io_uring_setup => sys_io_uring_setup(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::io_uring_enter => sys_io_uring_enter(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+            uctx.arg4() as _,
+        ),
+        Sysno::io_uring_register => {
+            sys_io_uring_register(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2(), uctx.arg3() as _)
+        }
+        Sysno::inotify_init1 => sys_inotify_init1(uctx.arg0() as _),
+        Sysno::inotify_add_watch => {
+            sys_inotify_add_watch(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
+        }
+        Sysno::inotify_rm_watch => sys_inotify_rm_watch(uctx.arg0() as _, uctx.arg1() as _),
 
         // bpf
         #[cfg(feature = "bpf")]
@@ -752,11 +797,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
 
         // dummy fds
         Sysno::fanotify_init
-        | Sysno::inotify_init1
-        | Sysno::userfaultfd
         | Sysno::perf_event_open
-        | Sysno::io_uring_setup
-        | Sysno::fsopen
         | Sysno::fspick
         | Sysno::open_tree
         | Sysno::memfd_secret => sys_dummy_fd(sysno),

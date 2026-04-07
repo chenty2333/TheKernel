@@ -255,6 +255,22 @@ fi'
     fi
 }
 
+mount_support_disk() {
+    bb mkdir -p /support 2>/dev/null || true
+    if bb mount -t ext4 /dev/vdb /support >/dev/null 2>&1; then
+        if [ -f /support/glibc/lib/libgcc_s.so.1 ]; then
+            install_runtime_alias /support/glibc/lib/libgcc_s.so.1 /glibc/lib/libgcc_s.so.1 || true
+            install_runtime_alias /support/glibc/lib/libgcc_s.so.1 /lib/libgcc_s.so.1 || true
+        fi
+        if [ -d /support/usr/lib/locale/C.UTF-8 ]; then
+            OSCOMP_SUPPORT_LOCPATH=/support/usr/lib/locale
+            export OSCOMP_SUPPORT_LOCPATH
+        fi
+    else
+        bb rmdir /support >/dev/null 2>&1 || true
+    fi
+}
+
 run_pre2025_init_sequence() {
     # Mirror the visible setup order of the official pre-2025 testcase layout.
     cd / || return 0
@@ -311,6 +327,7 @@ run_pre2025_init_sequence() {
 
     install_locale_tool
     install_useradd_tool
+    mount_support_disk
 }
 
 prepare_ltp_env() {
@@ -681,6 +698,14 @@ run_group_script() {
         if [ -n "$BUILT_LD_LIBRARY_PATH" ]; then
             export LD_LIBRARY_PATH="$BUILT_LD_LIBRARY_PATH"
         fi
+        if [ "$root" = /glibc ]; then
+            export LANG=C.UTF-8
+            export LC_ALL=C.UTF-8
+            export LC_CTYPE=C.UTF-8
+            if [ -n "${OSCOMP_SUPPORT_LOCPATH:-}" ]; then
+                export LOCPATH="$OSCOMP_SUPPORT_LOCPATH"
+            fi
+        fi
         export TMPDIR=/var/tmp
         export TMP=/var/tmp
         export TEMP=/var/tmp
@@ -749,6 +774,16 @@ $(official_group_list)
 EOF
 }
 
+run_official_group_across_roots() {
+    group="$1"
+    for root in $GROUP_ROOTS; do
+        [ -n "$RUNNER_GLOBAL_TIMEOUT_REACHED" ] && break
+        script_path_for_root "$root" "$group"
+        [ -f "$SCRIPT_PATH_RESULT" ] || continue
+        run_group_script "$root" "$group"
+    done
+}
+
 has_any_group_scripts() {
     FOUND_ANY=""
 
@@ -812,10 +847,14 @@ oscomp_runner_main() {
         exit 1
     fi
 
-    for root in $GROUP_ROOTS; do
+    while IFS= read -r group; do
+        [ -n "$group" ] || continue
         [ -n "$RUNNER_GLOBAL_TIMEOUT_REACHED" ] && break
-        run_official_groups_in_root "$root"
-    done
+        group_selected "$group" || continue
+        run_official_group_across_roots "$group"
+    done <<EOF
+$(official_group_list)
+EOF
 
     oscomp_shutdown
     exit 0

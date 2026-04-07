@@ -5,7 +5,7 @@ use chrono::{Datelike, Timelike};
 use linux_raw_sys::ioctl::RTC_RD_TIME;
 use starry_vm::VmMutPtr;
 
-use crate::pseudofs::DeviceOps;
+use crate::{pseudofs::DeviceOps, time::wall_time_nanos};
 
 /// The device ID for /dev/rtc0
 pub const RTC0_DEVICE_ID: DeviceId = DeviceId::new(250, 0);
@@ -39,8 +39,7 @@ impl DeviceOps for Rtc {
     fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
             RTC_RD_TIME => {
-                let wall =
-                    chrono::DateTime::from_timestamp_nanos(axhal::time::wall_time_nanos() as _);
+                let wall = chrono::DateTime::from_timestamp_nanos(wall_time_nanos() as _);
                 (arg as *mut rtc_time).vm_write(rtc_time {
                     tm_sec: wall.second() as _,
                     tm_min: wall.minute() as _,

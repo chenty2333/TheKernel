@@ -21,3 +21,17 @@ cfg_if::cfg_if! {
 pub fn new_default(dev: AxBlockDevice) -> VfsResult<Filesystem> {
     DefaultFilesystem::new(dev)
 }
+
+pub fn new_named(fs_type: &str, dev: AxBlockDevice) -> VfsResult<Filesystem> {
+    #[cfg(feature = "ext4")]
+    if fs_type == "ext4" {
+        return ext4::Ext4Filesystem::new(dev);
+    }
+
+    #[cfg(feature = "fat")]
+    if matches!(fs_type, "vfat" | "fat" | "msdos") {
+        return fat::FatFilesystem::new(dev);
+    }
+
+    Err(axfs_ng_vfs::VfsError::InvalidInput)
+}

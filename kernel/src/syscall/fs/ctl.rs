@@ -1,4 +1,4 @@
-use alloc::{ffi::CString, sync::Arc, vec, vec::Vec};
+use alloc::{ffi::CString, string::ToString, sync::Arc, vec, vec::Vec};
 use core::{
     ffi::{c_char, c_int, c_void},
     mem::offset_of,
@@ -8,7 +8,7 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axfs::{FS_CONTEXT, FsContext};
 use axfs_ng_vfs::{Location, MetadataUpdate, NodePermission, NodeType, path::Path};
-use axhal::{power::system_off, time::wall_time};
+use axhal::power::system_off;
 use axtask::current;
 use linux_raw_sys::{
     general::*,
@@ -20,7 +20,7 @@ use crate::{
     file::{Directory, FileLike, get_file_like, resolve_at, with_fs},
     mm::vm_load_string,
     task::AsThread,
-    time::TimeValueLike,
+    time::{TimeValueLike, wall_time},
 };
 
 const SUPPORTED_RENAMEAT2_FLAGS: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
@@ -118,10 +118,12 @@ pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize
     let mode = mode & !current().as_thread().proc_data.umask();
     let mode = NodePermission::from_bits_truncate(mode as u16);
 
-    with_fs(dirfd, |fs| {
-        fs.create_dir(path, mode)?;
-        Ok(0)
-    })
+    let loc = with_fs(dirfd, |fs| fs.create_dir(path, mode))?;
+    if let Some(parent) = loc.parent() {
+        let _ =
+            crate::file::inotify::notify_parent_with_name(&parent, loc.name(), IN_CREATE, true, 0);
+    }
+    Ok(0)
 }
 
 // Directory buffer for getdents64 syscall
@@ -253,6 +255,11 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
 
     debug!("sys_unlinkat <= dirfd: {dirfd}, path: {path:?}, flags: {flags}");
 
+    let loc = with_fs(dirfd, |fs| fs.resolve_no_follow(&path))?;
+    let parent = loc.parent();
+    let name = loc.name().to_string();
+    let is_dir = loc.is_dir();
+
     with_fs(dirfd, |fs| {
         if flags == AT_REMOVEDIR as _ {
             fs.remove_dir(path)?;
@@ -260,7 +267,12 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
             fs.remove_file(path)?;
         }
         Ok(0)
-    })
+    })?;
+    if let Some(parent) = parent {
+        let _ = crate::file::inotify::notify_parent_with_name(&parent, &name, IN_DELETE, is_dir, 0);
+    }
+    let _ = crate::file::inotify::notify_exact(&loc, IN_DELETE_SELF);
+    Ok(0)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -395,13 +407,15 @@ pub fn sys_fchmod(fd: i32, mode: u32) -> AxResult<isize> {
 
 pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> AxResult<isize> {
     let path = path.nullable().map(vm_load_string).transpose()?;
-    resolve_at(dirfd, path.as_deref(), flags)?
+    let loc = resolve_at(dirfd, path.as_deref(), flags)?
         .into_file()
-        .ok_or(AxError::BadFileDescriptor)?
-        .update_metadata(MetadataUpdate {
-            mode: Some(NodePermission::from_bits_truncate(mode as u16)),
-            ..Default::default()
-        })?;
+        .ok_or(AxError::BadFileDescriptor)?;
+    loc.update_metadata(MetadataUpdate {
+        mode: Some(NodePermission::from_bits_truncate(mode as u16)),
+        ..Default::default()
+    })?;
+    let _ = crate::file::inotify::notify_parent(&loc, IN_ATTRIB);
+    let _ = crate::file::inotify::notify_exact(&loc, IN_ATTRIB);
     Ok(0)
 }
 
@@ -544,6 +558,8 @@ pub fn sys_renameat2(
         return Err(AxError::Unsupported);
     }
 
+    let old_loc = with_fs(old_dirfd, |fs| fs.resolve_no_follow(&old_path))?;
+    let old_is_dir = old_loc.is_dir();
     let old_path = Path::new(&old_path);
     let new_path = Path::new(&new_path);
     let old_is_root = with_fs(old_dirfd, |fs| Ok(fs.path_refers_to_root(old_path)))?;
@@ -579,6 +595,22 @@ pub fn sys_renameat2(
     }
 
     old_dir.rename(&old_name, &new_dir, &new_name)?;
+    let cookie = crate::file::inotify::next_rename_cookie();
+    let _ = crate::file::inotify::notify_parent_with_name(
+        &old_dir,
+        &old_name,
+        IN_MOVED_FROM,
+        old_is_dir,
+        cookie,
+    );
+    let _ = crate::file::inotify::notify_parent_with_name(
+        &new_dir,
+        &new_name,
+        IN_MOVED_TO,
+        old_is_dir,
+        cookie,
+    );
+    let _ = crate::file::inotify::notify_exact(&old_loc, IN_MOVE_SELF);
     Ok(0)
 }
 
@@ -605,7 +637,8 @@ pub fn sys_reboot(magic1: i32, magic2: i32, cmd: i32, _arg: *const c_void) -> Ax
         return Err(AxError::InvalidInput);
     }
     match magic2 as u32 {
-        LINUX_REBOOT_MAGIC2 | LINUX_REBOOT_MAGIC2A | LINUX_REBOOT_MAGIC2B | LINUX_REBOOT_MAGIC2C => {}
+        LINUX_REBOOT_MAGIC2 | LINUX_REBOOT_MAGIC2A | LINUX_REBOOT_MAGIC2B
+        | LINUX_REBOOT_MAGIC2C => {}
         _ => return Err(AxError::InvalidInput),
     }
 

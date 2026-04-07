@@ -63,6 +63,61 @@ impl SharedPages {
         Ok(())
     }
 
+    pub fn total_bytes(&self) -> usize {
+        self.len() * self.size as usize
+    }
+
+    pub fn read_bytes(&self, offset: usize, mut buf: &mut [u8]) -> AxResult {
+        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)? > self.total_bytes() {
+            return Err(AxError::InvalidInput);
+        }
+
+        let page_bytes = self.size as usize;
+        let pages = self.phys_pages.lock();
+        let mut page_index = offset / page_bytes;
+        let mut page_offset = offset % page_bytes;
+
+        while !buf.is_empty() {
+            let phys = pages[page_index];
+            let src = axhal::mem::phys_to_virt(phys).as_usize() + page_offset;
+            let chunk_len = (page_bytes - page_offset).min(buf.len());
+            unsafe {
+                core::ptr::copy_nonoverlapping(src as *const u8, buf.as_mut_ptr(), chunk_len);
+            }
+            let (_, rest) = buf.split_at_mut(chunk_len);
+            buf = rest;
+            page_index += 1;
+            page_offset = 0;
+        }
+
+        Ok(())
+    }
+
+    pub fn write_bytes(&self, offset: usize, mut buf: &[u8]) -> AxResult {
+        if offset.checked_add(buf.len()).ok_or(AxError::InvalidInput)? > self.total_bytes() {
+            return Err(AxError::InvalidInput);
+        }
+
+        let page_bytes = self.size as usize;
+        let pages = self.phys_pages.lock();
+        let mut page_index = offset / page_bytes;
+        let mut page_offset = offset % page_bytes;
+
+        while !buf.is_empty() {
+            let phys = pages[page_index];
+            let dst = axhal::mem::phys_to_virt(phys).as_usize() + page_offset;
+            let chunk_len = (page_bytes - page_offset).min(buf.len());
+            unsafe {
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), dst as *mut u8, chunk_len);
+            }
+            buf = &buf[chunk_len..];
+            page_index += 1;
+            page_offset = 0;
+        }
+
+        Ok(())
+    }
+
     fn pages_range(&self, start_index: usize, count: usize) -> AxResult<Vec<PhysAddr>> {
         let pages = self.phys_pages.lock();
         let end = start_index

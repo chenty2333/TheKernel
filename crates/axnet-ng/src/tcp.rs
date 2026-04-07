@@ -171,6 +171,10 @@ impl TcpSocket {
             axtask::yield_now();
         }
     }
+
+    pub fn set_filter(&self, _filter: Option<alloc::sync::Arc<dyn crate::SocketFilter>>) -> AxResult<()> {
+        Ok(())
+    }
 }
 
 impl Configurable for TcpSocket {

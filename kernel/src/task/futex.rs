@@ -331,13 +331,16 @@ mod tests {
     fn requeue_skips_cancelled_waiters() {
         let src = Arc::new(FutexEntry::new());
         let dst = Arc::new(FutexEntry::new());
-        src.wq.queue.lock().push_back(Arc::new(SpinNoIrq::new(WaiterEntry {
-            bitset: u32::MAX,
-            awakened: false,
-            cancelled: true,
-            owner: Arc::downgrade(&src),
-            waker: None,
-        })));
+        src.wq
+            .queue
+            .lock()
+            .push_back(Arc::new(SpinNoIrq::new(WaiterEntry {
+                bitset: u32::MAX,
+                awakened: false,
+                cancelled: true,
+                owner: Arc::downgrade(&src),
+                waker: None,
+            })));
 
         assert_eq!(src.wq.requeue(1, &dst.wq, Arc::downgrade(&dst)), 0);
         assert!(src.wq.is_empty());
@@ -347,13 +350,16 @@ mod tests {
     #[test]
     fn wake_discards_cancelled_waiters() {
         let src = Arc::new(FutexEntry::new());
-        src.wq.queue.lock().push_back(Arc::new(SpinNoIrq::new(WaiterEntry {
-            bitset: u32::MAX,
-            awakened: false,
-            cancelled: true,
-            owner: Arc::downgrade(&src),
-            waker: None,
-        })));
+        src.wq
+            .queue
+            .lock()
+            .push_back(Arc::new(SpinNoIrq::new(WaiterEntry {
+                bitset: u32::MAX,
+                awakened: false,
+                cancelled: true,
+                owner: Arc::downgrade(&src),
+                waker: None,
+            })));
 
         assert_eq!(src.wq.wake(1, u32::MAX), 0);
         assert!(src.wq.is_empty());

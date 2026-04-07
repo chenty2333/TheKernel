@@ -1,6 +1,6 @@
 //! BPF map implementations (ArrayMap, HashMap).
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use axerrno::{AxError, AxResult};
@@ -22,6 +22,22 @@ pub trait BpfMap: Send + Sync {
     fn update(&self, key: &[u8], value: &[u8], flags: u64) -> AxResult<()>;
     fn delete(&self, key: &[u8]) -> AxResult<()>;
     fn get_next_key(&self, key: Option<&[u8]>) -> Option<Vec<u8>>;
+
+    fn ringbuf_reserve(&self, _size: usize, _flags: u64) -> AxResult<()> {
+        Err(AxError::InvalidInput)
+    }
+
+    fn ringbuf_submit(&self, _data: Vec<u8>, _flags: u64) -> AxResult<()> {
+        Err(AxError::InvalidInput)
+    }
+
+    fn ringbuf_discard(&self, _size: usize, _flags: u64) -> AxResult<()> {
+        Err(AxError::InvalidInput)
+    }
+
+    fn ringbuf_output(&self, _data: &[u8], _flags: u64) -> AxResult<()> {
+        Err(AxError::InvalidInput)
+    }
 }
 
 /// Create a map of the given type.
@@ -48,6 +64,14 @@ pub fn create_map(
             id,
         )?)),
         BPF_MAP_TYPE_HASH => Ok(Arc::new(BpfHashMap::new(
+            key_size,
+            value_size,
+            max_entries,
+            flags,
+            name,
+            id,
+        )?)),
+        BPF_MAP_TYPE_RINGBUF => Ok(Arc::new(RingBufMap::new(
             key_size,
             value_size,
             max_entries,
@@ -324,5 +348,162 @@ impl BpfMap for BpfHashMap {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RingBufMap (minimal create-only support for verifier-focused tests)
+// ---------------------------------------------------------------------------
+
+pub struct RingBufMap {
+    max_entries: u32,
+    map_flags: u32,
+    name: [u8; BPF_OBJ_NAME_LEN],
+    id: u32,
+    frozen: AtomicBool,
+    state: spin::Mutex<RingBufState>,
+}
+
+#[derive(Default)]
+struct RingBufState {
+    reserved_bytes: usize,
+    records: VecDeque<Vec<u8>>,
+    committed_bytes: usize,
+}
+
+impl RingBufMap {
+    fn new(
+        key_size: u32,
+        value_size: u32,
+        max_entries: u32,
+        map_flags: u32,
+        name: [u8; BPF_OBJ_NAME_LEN],
+        id: u32,
+    ) -> AxResult<Self> {
+        if key_size != 0 || value_size != 0 || max_entries == 0 {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(Self {
+            max_entries,
+            map_flags,
+            name,
+            id,
+            frozen: AtomicBool::new(false),
+            state: spin::Mutex::new(RingBufState::default()),
+        })
+    }
+
+    fn validate_ringbuf_flags(flags: u64) -> AxResult<()> {
+        if flags & !(BPF_RB_NO_WAKEUP | BPF_RB_FORCE_WAKEUP) != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(())
+    }
+}
+
+impl BpfMap for RingBufMap {
+    fn map_type(&self) -> u32 {
+        BPF_MAP_TYPE_RINGBUF
+    }
+
+    fn key_size(&self) -> u32 {
+        0
+    }
+
+    fn value_size(&self) -> u32 {
+        0
+    }
+
+    fn max_entries(&self) -> u32 {
+        self.max_entries
+    }
+
+    fn name(&self) -> [u8; BPF_OBJ_NAME_LEN] {
+        self.name
+    }
+
+    fn id(&self) -> u32 {
+        self.id
+    }
+
+    fn map_flags(&self) -> u32 {
+        self.map_flags
+    }
+
+    fn freeze(&self) -> AxResult<()> {
+        self.frozen.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn lookup(&self, _key: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn update(&self, _key: &[u8], _value: &[u8], _flags: u64) -> AxResult<()> {
+        Err(AxError::InvalidInput)
+    }
+
+    fn delete(&self, _key: &[u8]) -> AxResult<()> {
+        Err(AxError::InvalidInput)
+    }
+
+    fn get_next_key(&self, _key: Option<&[u8]>) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn ringbuf_reserve(&self, size: usize, flags: u64) -> AxResult<()> {
+        Self::validate_ringbuf_flags(flags)?;
+        if size == 0 || size > self.max_entries as usize {
+            return Err(AxError::InvalidInput);
+        }
+        let mut state = self.state.lock();
+        if state
+            .reserved_bytes
+            .saturating_add(state.committed_bytes)
+            .saturating_add(size)
+            > self.max_entries as usize
+        {
+            return Err(AxError::NoMemory);
+        }
+        state.reserved_bytes += size;
+        Ok(())
+    }
+
+    fn ringbuf_submit(&self, data: Vec<u8>, flags: u64) -> AxResult<()> {
+        Self::validate_ringbuf_flags(flags)?;
+        let size = data.len();
+        let mut state = self.state.lock();
+        if state.reserved_bytes < size {
+            return Err(AxError::InvalidInput);
+        }
+        state.reserved_bytes -= size;
+        state.committed_bytes = state.committed_bytes.saturating_add(size);
+        state.records.push_back(data);
+        while state.committed_bytes > self.max_entries as usize {
+            if let Some(old) = state.records.pop_front() {
+                state.committed_bytes = state.committed_bytes.saturating_sub(old.len());
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn ringbuf_discard(&self, size: usize, flags: u64) -> AxResult<()> {
+        Self::validate_ringbuf_flags(flags)?;
+        let mut state = self.state.lock();
+        if state.reserved_bytes < size {
+            return Err(AxError::InvalidInput);
+        }
+        state.reserved_bytes -= size;
+        Ok(())
+    }
+
+    fn ringbuf_output(&self, data: &[u8], flags: u64) -> AxResult<()> {
+        Self::validate_ringbuf_flags(flags)?;
+        if data.len() > self.max_entries as usize {
+            return Err(AxError::NoMemory);
+        }
+        self.ringbuf_submit(data.to_vec(), flags)
     }
 }

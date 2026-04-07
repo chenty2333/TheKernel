@@ -1,6 +1,6 @@
 use axerrno::{AxError, AxResult, LinuxError};
 use axnet::options::{Configurable, GetSocketOption, SetSocketOption};
-use linux_raw_sys::net::socklen_t;
+use linux_raw_sys::net::{SO_ATTACH_BPF, SO_DETACH_BPF, SOL_SOCKET, socklen_t};
 
 use crate::{
     file::{FileLike, Socket},
@@ -177,6 +177,24 @@ pub fn sys_setsockopt(
     }
 
     let socket = Socket::from_fd(fd)?;
+    if level == SOL_SOCKET {
+        match optname {
+            SO_ATTACH_BPF => {
+                let prog_fd = *get::<i32>(optval, optlen)?;
+                let prog_fd = crate::file::bpf::BpfProgFd::from_fd(prog_fd)?;
+                if prog_fd.prog.prog_type != crate::bpf::defs::BPF_PROG_TYPE_SOCKET_FILTER {
+                    return Err(AxError::InvalidInput);
+                }
+                socket.set_bpf_filter(Some(prog_fd.prog.clone()))?;
+                return Ok(0);
+            }
+            SO_DETACH_BPF => {
+                socket.set_bpf_filter(None)?;
+                return Ok(0);
+            }
+            _ => {}
+        }
+    }
     macro_rules! dispatch {
         ($which:ident) => {
             socket.set_option(SetSocketOption::$which(get(optval, optlen)?))?;

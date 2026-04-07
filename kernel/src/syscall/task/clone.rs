@@ -4,7 +4,9 @@ use core::{future::poll_fn, task::Poll};
 use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
-use axtask::{AxTaskExt, SchedClass, current, future::block_on, sched_state, spawn_task_with_sched};
+use axtask::{
+    AxTaskExt, SchedClass, current, future::block_on, sched_state, spawn_task_with_sched,
+};
 use bitflags::bitflags;
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::*;
@@ -277,6 +279,7 @@ impl CloneArgs {
                 net_ns,
             );
             proc_data.set_umask(old_proc_data.umask());
+            proc_data.set_credentials(old_proc_data.credentials());
             proc_data.set_heap_top(old_proc_data.get_heap_top());
 
             {

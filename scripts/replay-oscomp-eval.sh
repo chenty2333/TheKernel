@@ -9,6 +9,7 @@ TESTSUITE_DIR=${OSCOMP_TESTSUITE_DIR:-$HOME/testsuits-for-oskernel}
 
 ARCH=""
 IMAGE_PATH=""
+SUPPORT_IMAGE_SOURCE=""
 ROOT_FILTER="all"
 GROUP_FILTERS=""
 TIMEOUT_SECS=7200
@@ -123,14 +124,14 @@ prepare_image() {
     case "$source" in
         *.xz)
             local target="$WORKDIR/$target_name"
-            log "decompressing $(basename -- "$source")"
+            log "decompressing $(basename -- "$source")" >&2
             xz -dc "$source" >"$target"
             printf '%s\n' "$target"
             ;;
         *)
             if [ "$mode" = "copy" ]; then
                 local target="$WORKDIR/$target_name"
-                log "copying $(basename -- "$source")"
+                log "copying $(basename -- "$source")" >&2
                 cp "$source" "$target"
                 printf '%s\n' "$target"
             else
@@ -177,12 +178,22 @@ if [ "$ARCH" = "rv" ]; then
     DEFAULT_IMAGE=$(find_first_existing \
         "$TESTSUITE_DIR/sdcard-rv.img" \
         "$TESTSUITE_DIR/sdcard-rv.img.xz" || true)
+    SUPPORT_IMAGE_SOURCE=$(find_first_existing \
+        "$TESTSUITE_DIR/disk.img" \
+        "$TESTSUITE_DIR/disk.img.xz" \
+        "$REPO_ROOT/disk.img" \
+        "$REPO_ROOT/disk.img.xz" || true)
 else
     require_cmd qemu-system-loongarch64
     KERNEL_NAME=kernel-la
     DEFAULT_IMAGE=$(find_first_existing \
         "$TESTSUITE_DIR/sdcard-la.img" \
         "$TESTSUITE_DIR/sdcard-la.img.xz" || true)
+    SUPPORT_IMAGE_SOURCE=$(find_first_existing \
+        "$TESTSUITE_DIR/disk-la.img" \
+        "$TESTSUITE_DIR/disk-la.img.xz" \
+        "$REPO_ROOT/disk-la.img" \
+        "$REPO_ROOT/disk-la.img.xz" || true)
 fi
 
 if [ "$SKIP_KERNEL_BUILD" -eq 0 ]; then
@@ -220,6 +231,13 @@ if [ "$ROOT_FILTER" != "all" ] || [ -n "$GROUP_FILTERS" ]; then
     IMAGE_MODE=copy
 fi
 IMAGE_RUNTIME=$(prepare_image "$IMAGE_SOURCE" "$(basename -- "${IMAGE_SOURCE%.xz}")" "$IMAGE_MODE")
+SUPPORT_IMAGE_RUNTIME=""
+if [ -n "$SUPPORT_IMAGE_SOURCE" ]; then
+    SUPPORT_IMAGE_RUNTIME=$(prepare_image \
+        "$SUPPORT_IMAGE_SOURCE" \
+        "$(basename -- "${SUPPORT_IMAGE_SOURCE%.xz}")" \
+        copy)
+fi
 if [ "$ROOT_FILTER" != "all" ] || [ -n "$GROUP_FILTERS" ]; then
     inject_runner_config "$IMAGE_RUNTIME"
 fi
@@ -244,6 +262,12 @@ if [ "$ARCH" = "rv" ]; then
         -netdev user,id=net
         -rtc base=utc
     )
+    if [ -n "$SUPPORT_IMAGE_RUNTIME" ]; then
+        QEMU_CMD+=(
+            -drive "file=$SUPPORT_IMAGE_RUNTIME,if=none,format=raw,id=x1"
+            -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
+        )
+    fi
 else
     QEMU_CMD=(
         qemu-system-loongarch64
@@ -258,6 +282,12 @@ else
         -netdev user,id=net0
         -rtc base=utc
     )
+    if [ -n "$SUPPORT_IMAGE_RUNTIME" ]; then
+        QEMU_CMD+=(
+            -drive "file=$SUPPORT_IMAGE_RUNTIME,if=none,format=raw,id=x1"
+            -device virtio-blk-pci,drive=x1
+        )
+    fi
 fi
 
 log "qemu command: ${QEMU_CMD[*]}"

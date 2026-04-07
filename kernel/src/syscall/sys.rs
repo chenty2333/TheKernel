@@ -6,10 +6,14 @@ use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
 use axtask::current;
+#[cfg(target_arch = "riscv64")]
+use bytemuck::AnyBitPattern;
 use linux_raw_sys::{
     general::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM},
     system::{new_utsname, sysinfo},
 };
+#[cfg(target_arch = "riscv64")]
+use starry_vm::VmPtr;
 use starry_vm::{VmMutPtr, vm_write_slice};
 
 use super::sync::restart_futex_wait;
@@ -19,28 +23,30 @@ use crate::{
 };
 
 pub fn sys_getuid() -> AxResult<isize> {
-    Ok(0)
+    Ok(current().as_thread().proc_data.uid() as isize)
 }
 
 pub fn sys_geteuid() -> AxResult<isize> {
-    Ok(0)
+    Ok(current().as_thread().proc_data.euid() as isize)
 }
 
 pub fn sys_getgid() -> AxResult<isize> {
-    Ok(0)
+    Ok(current().as_thread().proc_data.gid() as isize)
 }
 
 pub fn sys_getegid() -> AxResult<isize> {
+    Ok(current().as_thread().proc_data.egid() as isize)
+}
+
+pub fn sys_setuid(uid: u32) -> AxResult<isize> {
+    debug!("sys_setuid <= uid: {uid}");
+    current().as_thread().proc_data.setuid(uid)?;
     Ok(0)
 }
 
-pub fn sys_setuid(_uid: u32) -> AxResult<isize> {
-    debug!("sys_setuid <= uid: {_uid}");
-    Ok(0)
-}
-
-pub fn sys_setgid(_gid: u32) -> AxResult<isize> {
-    debug!("sys_setgid <= gid: {_gid}");
+pub fn sys_setgid(gid: u32) -> AxResult<isize> {
+    debug!("sys_setgid <= gid: {gid}");
+    current().as_thread().proc_data.setgid(gid)?;
     Ok(0)
 }
 
@@ -49,7 +55,7 @@ pub fn sys_getgroups(size: usize, list: *mut u32) -> AxResult<isize> {
     if size < 1 {
         return Err(AxError::InvalidInput);
     }
-    vm_write_slice(list, &[0])?;
+    vm_write_slice(list, &[current().as_thread().proc_data.gid()])?;
     Ok(1)
 }
 
@@ -144,6 +150,68 @@ pub fn sys_restart_syscall(uctx: &UserContext) -> AxResult<isize> {
     match block {
         RestartBlock::FutexWait(block) => restart_futex_wait(block),
     }
+}
+
+#[cfg(target_arch = "riscv64")]
+#[repr(C)]
+#[derive(Clone, Copy, AnyBitPattern)]
+pub struct RiscvHwprobe {
+    key: i64,
+    value: u64,
+}
+
+#[cfg(target_arch = "riscv64")]
+const RISCV_HWPROBE_KEY_BASE_BEHAVIOR: i64 = 3;
+#[cfg(target_arch = "riscv64")]
+const RISCV_HWPROBE_BASE_BEHAVIOR_IMA: u64 = 1 << 0;
+#[cfg(target_arch = "riscv64")]
+const RISCV_HWPROBE_KEY_IMA_EXT_0: i64 = 4;
+
+#[cfg(target_arch = "riscv64")]
+pub fn sys_riscv_hwprobe(
+    pairs: *mut RiscvHwprobe,
+    pair_count: usize,
+    cpu_set_size: usize,
+    cpus: *mut usize,
+    flags: u32,
+) -> AxResult<isize> {
+    debug!(
+        "sys_riscv_hwprobe <= pairs: {pairs:p}, pair_count: {pair_count}, cpu_set_size: \
+         {cpu_set_size}, cpus: {cpus:p}, flags: {flags:#x}"
+    );
+
+    if flags != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if cpu_set_size != 0 || !cpus.is_null() {
+        return Err(AxError::Unsupported);
+    }
+    if pair_count == 0 {
+        return Ok(0);
+    }
+    if pairs.is_null() {
+        return Err(AxError::BadAddress);
+    }
+
+    for index in 0..pair_count {
+        let ptr = pairs.wrapping_add(index);
+        let mut pair = ptr.vm_read()?;
+        match pair.key {
+            RISCV_HWPROBE_KEY_BASE_BEHAVIOR => {
+                pair.value = RISCV_HWPROBE_BASE_BEHAVIOR_IMA;
+            }
+            RISCV_HWPROBE_KEY_IMA_EXT_0 => {
+                pair.value = 0;
+            }
+            _ => {
+                pair.key = -1;
+                pair.value = 0;
+            }
+        }
+        ptr.vm_write(pair)?;
+    }
+
+    Ok(0)
 }
 
 #[cfg(target_arch = "riscv64")]

@@ -11,6 +11,7 @@ use crate::{
 };
 
 const CAPABILITY_VERSION_3: u32 = 0x20080522;
+const NO_ID_CHANGE: u32 = u32::MAX;
 
 fn validate_cap_header(header_ptr: *mut __user_cap_header_struct) -> AxResult<()> {
     // FIXME: AnyBitPattern
@@ -53,15 +54,29 @@ pub fn sys_umask(mask: u32) -> AxResult<isize> {
     Ok(old as isize)
 }
 
-pub fn sys_setreuid(_ruid: u32, _euid: u32) -> AxResult<isize> {
+pub fn sys_setreuid(ruid: u32, euid: u32) -> AxResult<isize> {
+    current().as_thread().proc_data.setreuid(
+        (ruid != NO_ID_CHANGE).then_some(ruid),
+        (euid != NO_ID_CHANGE).then_some(euid),
+    )?;
     Ok(0)
 }
 
-pub fn sys_setresuid(_ruid: u32, _euid: u32, _suid: u32) -> AxResult<isize> {
+pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> AxResult<isize> {
+    current().as_thread().proc_data.setresuid(
+        (ruid != NO_ID_CHANGE).then_some(ruid),
+        (euid != NO_ID_CHANGE).then_some(euid),
+        (suid != NO_ID_CHANGE).then_some(suid),
+    )?;
     Ok(0)
 }
 
-pub fn sys_setresgid(_rgid: u32, _egid: u32, _sgid: u32) -> AxResult<isize> {
+pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> AxResult<isize> {
+    current().as_thread().proc_data.setresgid(
+        (rgid != NO_ID_CHANGE).then_some(rgid),
+        (egid != NO_ID_CHANGE).then_some(egid),
+        (sgid != NO_ID_CHANGE).then_some(sgid),
+    )?;
     Ok(0)
 }
 

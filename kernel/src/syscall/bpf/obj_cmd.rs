@@ -7,7 +7,6 @@ use axerrno::{AxError, AxResult};
 use crate::{
     bpf::{defs::*, read_bpf_attr, require_bpf_attr_range, write_bpf_attr_value},
     file::{
-        FileLike,
         bpf::{BpfMapFd, BpfProgFd},
         get_file_like,
     },

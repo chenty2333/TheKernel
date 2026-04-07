@@ -19,6 +19,7 @@ use lazy_static::lazy_static;
 pub use self::{dgram::DgramTransport, stream::StreamTransport};
 use crate::{
     RecvOptions, SendOptions, Shutdown, Socket, SocketAddrEx, SocketOps,
+    SocketFilter,
     options::{Configurable, GetSocketOption, SetSocketOption},
 };
 
@@ -160,6 +161,13 @@ impl UnixSocket {
             transport: transport.into(),
             local_addr: Mutex::new(UnixSocketAddr::Unnamed),
             remote_addr: Mutex::new(UnixSocketAddr::Unnamed),
+        }
+    }
+
+    pub fn set_filter(&self, filter: Option<Arc<dyn SocketFilter>>) -> AxResult<()> {
+        match &self.transport {
+            Transport::Stream(stream) => stream.set_filter(filter),
+            Transport::Dgram(dgram) => dgram.set_filter(filter),
         }
     }
 }

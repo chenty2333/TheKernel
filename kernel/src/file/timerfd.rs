@@ -7,7 +7,7 @@ use core::{
 };
 
 use axerrno::AxError;
-use axhal::time::{monotonic_time, wall_time};
+use axhal::time::monotonic_time;
 use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::future::{block_on, poll_io};
 use spin::Mutex;
@@ -15,6 +15,7 @@ use spin::Mutex;
 use crate::{
     file::{FileLike, IoDst, IoSrc},
     task::{AlarmClock, register_pollset_alarm},
+    time::wall_time,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

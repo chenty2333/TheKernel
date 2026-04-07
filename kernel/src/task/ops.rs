@@ -23,9 +23,7 @@ use super::{
     AsThread, FutexKey, ProcessData, TaskUsage, TimerState, futex_table_for,
     send_signal_thread_inner, send_signal_to_process, send_signal_to_thread,
 };
-use crate::{
-    mm::{UserPtr, access_user_memory},
-};
+use crate::mm::{UserPtr, access_user_memory};
 
 static TASK_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
 static TASK_ALIAS_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
@@ -324,7 +322,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
             wait_status: process.exit_code(),
             self_usage: thr.proc_data.self_usage().into(),
             child_usage: thr.proc_data.children_usage().into(),
-            uid: 0,
+            uid: thr.proc_data.uid(),
         });
         process.exit();
         if let Some(parent) = process.parent() {

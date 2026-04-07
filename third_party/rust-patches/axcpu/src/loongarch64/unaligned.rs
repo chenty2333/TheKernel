@@ -563,20 +563,20 @@ impl TrapFrame {
         };
 
         if (badi >> 22) == LDD_OP || (badi >> 24) == LDPTRD_OP || (badi >> 15) == LDXD_OP {
-            unaligned_read(badv, &mut value, 8, true)?;
+            unaligned_read(badv, &mut value, 8, false)?;
             regs[rd] = value as usize;
         } else if (badi >> 22) == LDW_OP || (badi >> 24) == LDPTRW_OP || (badi >> 15) == LDXW_OP {
-            unaligned_read(badv, &mut value, 4, true)?;
-            regs[rd] = value as usize;
+            unaligned_read(badv, &mut value, 4, false)?;
+            regs[rd] = (value as u32 as i32 as isize) as usize;
         } else if (badi >> 22) == LDWU_OP || (badi >> 15) == LDXWU_OP {
             unaligned_read(badv, &mut value, 4, false)?;
-            regs[rd] = value as usize;
+            regs[rd] = value as u32 as usize;
         } else if (badi >> 22) == LDH_OP || (badi >> 15) == LDXH_OP {
-            unaligned_read(badv, &mut value, 2, true)?;
-            regs[rd] = value as usize;
+            unaligned_read(badv, &mut value, 2, false)?;
+            regs[rd] = (value as u16 as i16 as isize) as usize;
         } else if (badi >> 22) == LDHU_OP || (badi >> 15) == LDXHU_OP {
             unaligned_read(badv, &mut value, 2, false)?;
-            regs[rd] = value as usize;
+            regs[rd] = value as u16 as usize;
         } else if (badi >> 22) == STD_OP || (badi >> 24) == STPTRD_OP || (badi >> 15) == STXD_OP {
             value = regs[rd] as u64;
             unaligned_write(badv, value, 8)?;
@@ -587,10 +587,10 @@ impl TrapFrame {
             value = regs[rd] as u64;
             unaligned_write(badv, value, 2)?;
         } else if (badi >> 22) == FLDD_OP || (badi >> 15) == FLDXD_OP {
-            unaligned_read(badv, &mut value, 8, true)?;
+            unaligned_read(badv, &mut value, 8, false)?;
             write_fpr(rd, value);
         } else if (badi >> 22) == FLDS_OP || (badi >> 15) == FLDXS_OP {
-            unaligned_read(badv, &mut value, 4, true)?;
+            unaligned_read(badv, &mut value, 4, false)?;
             write_fpr(rd, value);
         } else if (badi >> 22) == FSTD_OP || (badi >> 15) == FSTXD_OP {
             value = read_fpr(rd);

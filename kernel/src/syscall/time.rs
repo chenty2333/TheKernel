@@ -1,9 +1,7 @@
 use axerrno::{AxError, AxResult};
-use axhal::time::{
-    NANOS_PER_SEC, TimeValue, monotonic_time, monotonic_time_nanos, nanos_to_ticks, wall_time,
-    wall_time_nanos,
-};
+use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time, monotonic_time_nanos, nanos_to_ticks};
 use axtask::current;
+use kspin::SpinNoIrq;
 use linux_raw_sys::general::{
     __kernel_clockid_t, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC,
     CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
@@ -14,7 +12,7 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     task::{AsThread, ITimerType},
-    time::TimeValueLike,
+    time::{TimeValueLike, set_wall_time, wall_time, wall_time_nanos},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +27,50 @@ enum ClockDomain {
 }
 
 const DEFAULT_TAI_OFFSET_SECS: u64 = 37;
+const ADJ_OFFSET: u32 = 0x0001;
+const ADJ_FREQUENCY: u32 = 0x0002;
+const ADJ_MAXERROR: u32 = 0x0004;
+const ADJ_ESTERROR: u32 = 0x0008;
+const ADJ_STATUS: u32 = 0x0010;
+const ADJ_TIMECONST: u32 = 0x0020;
+const ADJ_MICRO: u32 = 0x1000;
+const ADJ_NANO: u32 = 0x2000;
+const ADJ_TICK: u32 = 0x4000;
+const ADJ_OFFSET_SINGLESHOT: u32 = 0x8001;
+const ADJ_OFFSET_SS_READ: u32 = 0xa001;
+const ADJ_ALL: u32 = ADJ_OFFSET
+    | ADJ_FREQUENCY
+    | ADJ_MAXERROR
+    | ADJ_ESTERROR
+    | ADJ_STATUS
+    | ADJ_TIMECONST
+    | ADJ_TICK;
+
+const STA_PLL: i32 = 0x0001;
+const STA_PPSFREQ: i32 = 0x0002;
+const STA_PPSTIME: i32 = 0x0004;
+const STA_FLL: i32 = 0x0008;
+const STA_INS: i32 = 0x0010;
+const STA_DEL: i32 = 0x0020;
+const STA_UNSYNC: i32 = 0x0040;
+const STA_FREQHOLD: i32 = 0x0080;
+const STA_NANO: i32 = 0x2000;
+const STA_MODE: i32 = 0x4000;
+
+const TIME_OK: isize = 0;
+const TIME_ERROR: isize = 5;
+
+const TIMEX_SETTABLE_STATUS_BITS: i32 = STA_PLL
+    | STA_PPSFREQ
+    | STA_PPSTIME
+    | STA_FLL
+    | STA_INS
+    | STA_DEL
+    | STA_UNSYNC
+    | STA_FREQHOLD
+    | STA_MODE;
+const TIMEX_SETTABLE_MODES: u32 =
+    ADJ_ALL | ADJ_OFFSET_SINGLESHOT | ADJ_OFFSET_SS_READ | ADJ_MICRO | ADJ_NANO;
 
 fn clock_domain(clock_id: __kernel_clockid_t) -> AxResult<ClockDomain> {
     match clock_id as u32 {
@@ -98,6 +140,210 @@ fn clock_resolution(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct KernelOldTimex {
+    modes: u32,
+    offset: i64,
+    freq: i64,
+    maxerror: i64,
+    esterror: i64,
+    status: i32,
+    constant: i64,
+    precision: i64,
+    tolerance: i64,
+    time: timeval,
+    tick: i64,
+    ppsfreq: i64,
+    jitter: i64,
+    shift: i32,
+    stabil: i64,
+    jitcnt: i64,
+    calcnt: i64,
+    errcnt: i64,
+    stbcnt: i64,
+    tai: i32,
+    _padding: [i32; 11],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimexState {
+    offset: i64,
+    freq: i64,
+    maxerror: i64,
+    esterror: i64,
+    status: i32,
+    constant: i64,
+    precision: i64,
+    tolerance: i64,
+    tick: i64,
+    tai: i32,
+}
+
+impl TimexState {
+    const fn new() -> Self {
+        Self {
+            offset: 0,
+            freq: 0,
+            maxerror: 0,
+            esterror: 0,
+            status: 0,
+            constant: 0,
+            precision: 1,
+            tolerance: 0,
+            tick: (1_000_000 / axconfig::TICKS_PER_SEC as u64) as i64,
+            tai: DEFAULT_TAI_OFFSET_SECS as i32,
+        }
+    }
+
+    fn resolution_mode(self) -> u32 {
+        if self.status & STA_NANO != 0 {
+            ADJ_NANO
+        } else {
+            ADJ_MICRO
+        }
+    }
+
+    fn time_state(self) -> isize {
+        if self.status & STA_UNSYNC != 0 {
+            TIME_ERROR
+        } else {
+            TIME_OK
+        }
+    }
+}
+
+static TIMEX_STATE: SpinNoIrq<TimexState> = SpinNoIrq::new(TimexState::new());
+
+fn timex_tick_bounds() -> (i64, i64) {
+    let hz = axconfig::TICKS_PER_SEC as i64;
+    (900_000 / hz, 1_100_000 / hz)
+}
+
+fn timex_resolution_is_nanos(modes: u32, state: TimexState) -> bool {
+    if modes & ADJ_NANO != 0 {
+        true
+    } else if modes & ADJ_MICRO != 0 {
+        false
+    } else {
+        state.status & STA_NANO != 0
+    }
+}
+
+fn fill_timex_output(timex: &mut KernelOldTimex, state: TimexState) {
+    timex.modes = state.resolution_mode();
+    timex.offset = state.offset;
+    timex.freq = state.freq;
+    timex.maxerror = state.maxerror;
+    timex.esterror = state.esterror;
+    timex.status = state.status;
+    timex.constant = state.constant;
+    timex.precision = state.precision;
+    timex.tolerance = state.tolerance;
+    timex.time = timeval::from_time_value(wall_time());
+    timex.tick = state.tick;
+    timex.ppsfreq = 0;
+    timex.jitter = 0;
+    timex.shift = 0;
+    timex.stabil = 0;
+    timex.jitcnt = 0;
+    timex.calcnt = 0;
+    timex.errcnt = 0;
+    timex.stbcnt = 0;
+    timex.tai = state.tai;
+}
+
+fn update_timex_state(state: &mut TimexState, timex: &KernelOldTimex) -> AxResult<()> {
+    let modes = timex.modes;
+
+    if modes & !TIMEX_SETTABLE_MODES != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    if modes & ADJ_MICRO != 0 {
+        state.status &= !STA_NANO;
+    }
+    if modes & ADJ_NANO != 0 {
+        state.status |= STA_NANO;
+    }
+
+    if modes & ADJ_STATUS != 0 {
+        if timex.status & !TIMEX_SETTABLE_STATUS_BITS != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        state.status = (state.status & !TIMEX_SETTABLE_STATUS_BITS)
+            | (timex.status & TIMEX_SETTABLE_STATUS_BITS);
+    }
+
+    if modes & ADJ_OFFSET != 0 {
+        let limit = if timex_resolution_is_nanos(modes, *state) {
+            500_000_i64 * 1000
+        } else {
+            500_000_i64
+        };
+        if timex.offset <= -limit || timex.offset >= limit {
+            return Err(AxError::InvalidInput);
+        }
+        state.offset = timex.offset;
+    }
+
+    if modes & ADJ_FREQUENCY != 0 {
+        state.freq = timex.freq.clamp(-32_768_000, 32_768_000);
+    }
+
+    if modes & ADJ_MAXERROR != 0 {
+        state.maxerror = timex.maxerror;
+    }
+
+    if modes & ADJ_ESTERROR != 0 {
+        state.esterror = timex.esterror;
+    }
+
+    if modes & ADJ_TIMECONST != 0 {
+        state.constant = timex.constant;
+    }
+
+    if modes & ADJ_TICK != 0 {
+        let (min_tick, max_tick) = timex_tick_bounds();
+        if timex.tick < min_tick || timex.tick > max_tick {
+            return Err(AxError::InvalidInput);
+        }
+        state.tick = timex.tick;
+    }
+
+    if modes == ADJ_OFFSET_SINGLESHOT {
+        state.offset = timex.offset;
+    }
+
+    Ok(())
+}
+
+fn sys_do_clock_adjtime(
+    clock_id: __kernel_clockid_t,
+    timex_ptr: *mut KernelOldTimex,
+) -> AxResult<isize> {
+    if clock_id as u32 != CLOCK_REALTIME {
+        return Err(AxError::InvalidInput);
+    }
+
+    let mut timex = unsafe { timex_ptr.vm_read_uninit()?.assume_init() };
+    let modes = timex.modes;
+    let privileged = super::sys_geteuid()? == 0;
+
+    if !privileged && modes != 0 && modes != ADJ_OFFSET_SS_READ {
+        return Err(AxError::OperationNotPermitted);
+    }
+
+    let mut state = TIMEX_STATE.lock();
+    if modes != 0 && modes != ADJ_OFFSET_SS_READ {
+        update_timex_state(&mut state, &timex)?;
+    }
+
+    fill_timex_output(&mut timex, *state);
+    timex_ptr.vm_write(timex)?;
+    Ok(state.time_state())
+}
+
 pub fn sys_clock_gettime(clock_id: __kernel_clockid_t, ts: *mut timespec) -> AxResult<isize> {
     let now = clock_now(clock_id)?;
     ts.vm_write(timespec::from_time_value(now))?;
@@ -109,12 +355,40 @@ pub fn sys_gettimeofday(ts: *mut timeval) -> AxResult<isize> {
     Ok(0)
 }
 
+pub fn sys_settimeofday(ts: *const timeval) -> AxResult<isize> {
+    let ts = unsafe { ts.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
+    set_wall_time(ts);
+    Ok(0)
+}
+
 pub fn sys_clock_getres(clock_id: __kernel_clockid_t, res: *mut timespec) -> AxResult<isize> {
     let resolution = clock_resolution(clock_id)?;
     if let Some(res) = res.nullable() {
         res.vm_write(timespec::from_time_value(resolution))?;
     }
     Ok(0)
+}
+
+pub fn sys_clock_settime(clock_id: __kernel_clockid_t, ts: *const timespec) -> AxResult<isize> {
+    let ts = unsafe { ts.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
+    match clock_id as u32 {
+        CLOCK_REALTIME => {
+            set_wall_time(ts);
+            Ok(0)
+        }
+        _ => Err(AxError::InvalidInput),
+    }
+}
+
+pub fn sys_clock_adjtime(
+    clock_id: __kernel_clockid_t,
+    timex_ptr: *mut KernelOldTimex,
+) -> AxResult<isize> {
+    sys_do_clock_adjtime(clock_id, timex_ptr)
+}
+
+pub fn sys_adjtimex(timex_ptr: *mut KernelOldTimex) -> AxResult<isize> {
+    sys_do_clock_adjtime(CLOCK_REALTIME as _, timex_ptr)
 }
 
 #[cfg(test)]
@@ -193,7 +467,10 @@ mod tests {
     #[test]
     fn quantized_clock_readings_snap_to_resolution() {
         assert_eq!(
-            quantize_clock_reading(TimeValue::from_nanos(123_456_789), TimeValue::from_nanos(10)),
+            quantize_clock_reading(
+                TimeValue::from_nanos(123_456_789),
+                TimeValue::from_nanos(10)
+            ),
             TimeValue::from_nanos(123_456_780)
         );
         assert_eq!(

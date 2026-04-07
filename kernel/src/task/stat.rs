@@ -93,9 +93,24 @@ impl TaskStat {
         let child_usage = proc_data.children_usage();
         let sched = sched_state(task);
         let (policy, priority, nice, rt_priority) = match sched.class {
-            axtask::SchedClass::Normal => (SCHED_NORMAL as u32, sched.nice as i32 + 20, sched.nice as i32, 0),
-            axtask::SchedClass::Batch => (SCHED_BATCH as u32, sched.nice as i32 + 20, sched.nice as i32, 0),
-            axtask::SchedClass::Idle => (SCHED_IDLE as u32, sched.nice as i32 + 20, sched.nice as i32, 0),
+            axtask::SchedClass::Normal => (
+                SCHED_NORMAL as u32,
+                sched.nice as i32 + 20,
+                sched.nice as i32,
+                0,
+            ),
+            axtask::SchedClass::Batch => (
+                SCHED_BATCH as u32,
+                sched.nice as i32 + 20,
+                sched.nice as i32,
+                0,
+            ),
+            axtask::SchedClass::Idle => (
+                SCHED_IDLE as u32,
+                sched.nice as i32 + 20,
+                sched.nice as i32,
+                0,
+            ),
             axtask::SchedClass::Fifo => (
                 SCHED_FIFO as u32,
                 -(sched.rt_priority as i32) - 1,

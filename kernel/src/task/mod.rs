@@ -18,6 +18,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering},
 };
 
+use axerrno::{AxError, AxResult};
 use axpoll::PollSet;
 use axsync::{Mutex, spin::SpinNoIrq};
 use axtask::{TaskExt, TaskInner};
@@ -264,6 +265,16 @@ struct VforkControlState {
     parent_tid: Option<Pid>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Credentials {
+    ruid: u32,
+    euid: u32,
+    suid: u32,
+    rgid: u32,
+    egid: u32,
+    sgid: u32,
+}
+
 /// [`Process`]-shared data.
 pub struct ProcessData {
     /// The process.
@@ -300,6 +311,8 @@ pub struct ProcessData {
 
     /// The default mask for file permissions.
     umask: AtomicU32,
+    /// Process credentials shared by all threads.
+    creds: SpinNoIrq<Credentials>,
 
     /// CPU time accumulated from sibling threads that have already exited.
     exited_threads_usage: AtomicTaskUsage,
@@ -358,6 +371,7 @@ impl ProcessData {
             futex_table: Arc::new(FutexTable::new()),
 
             umask: AtomicU32::new(0o022),
+            creds: SpinNoIrq::new(Credentials::default()),
             exited_threads_usage: AtomicTaskUsage::new(),
             waited_children_usage: AtomicTaskUsage::new(),
             wait_lock: Mutex::new(()),
@@ -436,6 +450,137 @@ impl ProcessData {
     /// Set the umask and return the old value.
     pub fn replace_umask(&self, umask: u32) -> u32 {
         self.umask.swap(umask, Ordering::SeqCst)
+    }
+
+    pub(crate) fn credentials(&self) -> Credentials {
+        *self.creds.lock()
+    }
+
+    pub(crate) fn set_credentials(&self, creds: Credentials) {
+        *self.creds.lock() = creds;
+    }
+
+    pub fn uid(&self) -> u32 {
+        self.creds.lock().ruid
+    }
+
+    pub fn euid(&self) -> u32 {
+        self.creds.lock().euid
+    }
+
+    pub fn gid(&self) -> u32 {
+        self.creds.lock().rgid
+    }
+
+    pub fn egid(&self) -> u32 {
+        self.creds.lock().egid
+    }
+
+    pub fn setuid(&self, uid: u32) -> AxResult<()> {
+        let mut creds = self.creds.lock();
+        if creds.euid == 0 {
+            creds.ruid = uid;
+            creds.euid = uid;
+            creds.suid = uid;
+            return Ok(());
+        }
+        if uid == creds.ruid || uid == creds.suid {
+            creds.euid = uid;
+            return Ok(());
+        }
+        Err(AxError::OperationNotPermitted)
+    }
+
+    pub fn setgid(&self, gid: u32) -> AxResult<()> {
+        let mut creds = self.creds.lock();
+        if creds.egid == 0 {
+            creds.rgid = gid;
+            creds.egid = gid;
+            creds.sgid = gid;
+            return Ok(());
+        }
+        if gid == creds.rgid || gid == creds.sgid {
+            creds.egid = gid;
+            return Ok(());
+        }
+        Err(AxError::OperationNotPermitted)
+    }
+
+    pub fn setreuid(&self, ruid: Option<u32>, euid: Option<u32>) -> AxResult<()> {
+        let mut creds = self.creds.lock();
+        let old = *creds;
+        if old.euid != 0 {
+            for id in [ruid, euid].into_iter().flatten() {
+                if id != old.ruid && id != old.euid && id != old.suid {
+                    return Err(AxError::OperationNotPermitted);
+                }
+            }
+        }
+
+        let new_ruid = ruid.unwrap_or(old.ruid);
+        let new_euid = euid.unwrap_or(old.euid);
+        creds.ruid = new_ruid;
+        creds.euid = new_euid;
+        if ruid.is_some() || euid.is_some_and(|id| id != old.ruid) {
+            creds.suid = new_euid;
+        }
+        Ok(())
+    }
+
+    pub fn setresuid(
+        &self,
+        ruid: Option<u32>,
+        euid: Option<u32>,
+        suid: Option<u32>,
+    ) -> AxResult<()> {
+        let mut creds = self.creds.lock();
+        let old = *creds;
+        if old.euid != 0 {
+            for id in [ruid, euid, suid].into_iter().flatten() {
+                if id != old.ruid && id != old.euid && id != old.suid {
+                    return Err(AxError::OperationNotPermitted);
+                }
+            }
+        }
+
+        if let Some(id) = ruid {
+            creds.ruid = id;
+        }
+        if let Some(id) = euid {
+            creds.euid = id;
+        }
+        if let Some(id) = suid {
+            creds.suid = id;
+        }
+        Ok(())
+    }
+
+    pub fn setresgid(
+        &self,
+        rgid: Option<u32>,
+        egid: Option<u32>,
+        sgid: Option<u32>,
+    ) -> AxResult<()> {
+        let mut creds = self.creds.lock();
+        let old = *creds;
+        if old.egid != 0 {
+            for id in [rgid, egid, sgid].into_iter().flatten() {
+                if id != old.rgid && id != old.egid && id != old.sgid {
+                    return Err(AxError::OperationNotPermitted);
+                }
+            }
+        }
+
+        if let Some(id) = rgid {
+            creds.rgid = id;
+        }
+        if let Some(id) = egid {
+            creds.egid = id;
+        }
+        if let Some(id) = sgid {
+            creds.sgid = id;
+        }
+        Ok(())
     }
 
     fn stop_state(&self) -> StopState {

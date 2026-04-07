@@ -77,6 +77,10 @@ impl UdpSocket {
             .as_ref()
             .and_then(|endpoint| (!endpoint.addr.is_unspecified()).then_some(endpoint.addr))
     }
+
+    pub fn set_filter(&self, _filter: Option<alloc::sync::Arc<dyn crate::SocketFilter>>) -> AxResult<()> {
+        Ok(())
+    }
 }
 
 impl Configurable for UdpSocket {

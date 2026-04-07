@@ -1,45 +1,25 @@
-use alloc::{borrow::Cow, vec};
-use core::{
-    ffi::{c_char, c_int},
-    task::Context,
-};
+use alloc::vec;
+use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult};
 use axfs::{FS_CONTEXT, FileFlags, OpenOptions};
 use axio::{Seek, SeekFrom};
 use axpoll::{IoEvents, Pollable};
-use axtask::current;
 use linux_raw_sys::general::__kernel_off_t;
 use starry_vm::{VmMutPtr, VmPtr};
 use syscalls::Sysno;
 
 use crate::{
-    file::{File, FileHandle, FileLike, Pipe, get_file_like},
+    file::{
+        File, FileHandle, FileLike, Pipe, get_file_like,
+        inotify::{notify_read, notify_write},
+    },
     mm::{IoVec, IoVectorBuf, UserConstPtr, VmBytes, VmBytesMut},
 };
 
-struct DummyFd;
-impl FileLike for DummyFd {
-    fn path(&self) -> Cow<'_, str> {
-        "anon_inode:[dummy]".into()
-    }
-}
-impl Pollable for DummyFd {
-    fn poll(&self) -> IoEvents {
-        IoEvents::empty()
-    }
-
-    fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
-}
-
 pub fn sys_dummy_fd(sysno: Sysno) -> AxResult<isize> {
-    if current().name().starts_with("qemu-") {
-        // We need to be honest to qemu, since it can automatically fallback to
-        // other strategies.
-        return Err(AxError::Unsupported);
-    }
-    warn!("Dummy fd created: {sysno}");
-    DummyFd.add_to_fd_table(false).map(|fd| fd as isize)
+    warn!("Unimplemented fd syscall: {sysno}");
+    Err(AxError::Unsupported)
 }
 
 /// Read data from the file indicated by `fd`.
@@ -47,14 +27,21 @@ pub fn sys_dummy_fd(sysno: Sysno) -> AxResult<isize> {
 /// Return the read size if success.
 pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     debug!("sys_read <= fd: {fd}, buf: {buf:p}, len: {len}");
-    Ok(get_file_like(fd)?.read(&mut VmBytesMut::new(buf, len))? as _)
+    let read = get_file_like(fd)?.read(&mut VmBytesMut::new(buf, len))? as isize;
+    if read > 0 {
+        notify_read(fd);
+    }
+    Ok(read)
 }
 
 pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     debug!("sys_readv <= fd: {fd}, iovcnt: {iovcnt}");
     let f = get_file_like(fd)?;
-    f.read(&mut IoVectorBuf::new(iov, iovcnt)?.into_io())
-        .map(|n| n as _)
+    let read = f.read(&mut IoVectorBuf::new(iov, iovcnt)?.into_io())? as isize;
+    if read > 0 {
+        notify_read(fd);
+    }
+    Ok(read)
 }
 
 /// Write data to the file indicated by `fd`.
@@ -62,14 +49,21 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
 /// Return the written size if success.
 pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     debug!("sys_write <= fd: {fd}, buf: {buf:p}, len: {len}");
-    Ok(get_file_like(fd)?.write(&mut VmBytes::new(buf, len))? as _)
+    let written = get_file_like(fd)?.write(&mut VmBytes::new(buf, len))? as isize;
+    if written > 0 {
+        notify_write(fd);
+    }
+    Ok(written)
 }
 
 pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     debug!("sys_writev <= fd: {fd}, iovcnt: {iovcnt}");
     let f = get_file_like(fd)?;
-    f.write(&mut IoVectorBuf::new(iov, iovcnt)?.into_io())
-        .map(|n| n as _)
+    let written = f.write(&mut IoVectorBuf::new(iov, iovcnt)?.into_io())? as isize;
+    if written > 0 {
+        notify_write(fd);
+    }
+    Ok(written)
 }
 
 pub fn sys_lseek(fd: c_int, offset: __kernel_off_t, whence: c_int) -> AxResult<isize> {
@@ -102,6 +96,7 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     debug!("sys_ftruncate <= {fd} {length}");
     let f = File::from_fd(fd)?;
     f.inner().access(FileFlags::WRITE)?.set_len(length as _)?;
+    notify_write(fd);
     Ok(0)
 }
 
@@ -158,6 +153,9 @@ pub fn sys_pread64(fd: c_int, buf: *mut u8, len: usize, offset: __kernel_off_t) 
         return Err(AxError::InvalidInput);
     }
     let read = f.inner().read_at(VmBytesMut::new(buf, len), offset as _)?;
+    if read > 0 {
+        notify_read(fd);
+    }
     Ok(read as _)
 }
 
@@ -172,6 +170,9 @@ pub fn sys_pwrite64(
     }
     let f = File::from_fd(fd)?;
     let write = f.inner().write_at(VmBytes::new(buf, len), offset as _)?;
+    if write > 0 {
+        notify_write(fd);
+    }
     Ok(write as _)
 }
 
@@ -202,9 +203,13 @@ pub fn sys_preadv2(
 ) -> AxResult<isize> {
     debug!("sys_preadv2 <= fd: {fd}, iovcnt: {iovcnt}, offset: {offset}, flags: {_flags}");
     let f = File::from_fd(fd)?;
-    f.inner()
-        .read_at(IoVectorBuf::new(iov, iovcnt)?.into_io(), offset as _)
-        .map(|n| n as _)
+    let read = f
+        .inner()
+        .read_at(IoVectorBuf::new(iov, iovcnt)?.into_io(), offset as _)? as isize;
+    if read > 0 {
+        notify_read(fd);
+    }
+    Ok(read)
 }
 
 pub fn sys_pwritev2(
@@ -216,9 +221,13 @@ pub fn sys_pwritev2(
 ) -> AxResult<isize> {
     debug!("sys_pwritev2 <= fd: {fd}, iovcnt: {iovcnt}, offset: {offset}, flags: {_flags}");
     let f = File::from_fd(fd)?;
-    f.inner()
-        .write_at(IoVectorBuf::new(iov, iovcnt)?.into_io(), offset as _)
-        .map(|n| n as _)
+    let written =
+        f.inner()
+            .write_at(IoVectorBuf::new(iov, iovcnt)?.into_io(), offset as _)? as isize;
+    if written > 0 {
+        notify_write(fd);
+    }
+    Ok(written)
 }
 
 enum SendFile {
@@ -370,10 +379,6 @@ pub fn sys_splice(
     );
 
     let mut has_pipe = false;
-
-    if DummyFd::from_fd(fd_in).is_ok() || DummyFd::from_fd(fd_out).is_ok() {
-        return Err(AxError::BadFileDescriptor);
-    }
 
     let src = if !off_in.is_null() {
         if off_in.vm_read()? < 0 {

@@ -7,7 +7,7 @@ use super::{defs::*, map::BpfMap};
 pub fn uses_raw_ctx_prog_type(prog_type: u32) -> bool {
     matches!(
         prog_type,
-        BPF_PROG_TYPE_TRACEPOINT | BPF_PROG_TYPE_RAW_TRACEPOINT
+        BPF_PROG_TYPE_SOCKET_FILTER | BPF_PROG_TYPE_TRACEPOINT | BPF_PROG_TYPE_RAW_TRACEPOINT
     )
 }
 

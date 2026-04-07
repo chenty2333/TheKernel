@@ -122,6 +122,26 @@ impl DeviceOps for Full {
     }
 }
 
+struct BlockDevice;
+
+impl DeviceOps for BlockDevice {
+    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
+        Err(AxError::InvalidInput)
+    }
+
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        Err(AxError::InvalidInput)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn flags(&self) -> NodeFlags {
+        NodeFlags::NON_CACHEABLE
+    }
+}
+
 struct CpuDmaLatency;
 
 impl DeviceOps for CpuDmaLatency {
@@ -285,6 +305,18 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 NodeType::BlockDevice,
                 dev_id,
                 Arc::new(r#loop::LoopDevice::new(i, dev_id)),
+            ),
+        );
+    }
+
+    for (index, name) in axfs::block_device_names().into_iter().enumerate() {
+        root.add(
+            name,
+            Device::new(
+                fs.clone(),
+                NodeType::BlockDevice,
+                DeviceId::new(8, 16 + index as u32),
+                Arc::new(BlockDevice),
             ),
         );
     }

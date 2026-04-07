@@ -7,7 +7,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axfs::{FS_CONTEXT, FileBackend, OpenOptions, OpenResult};
-use axfs_ng_vfs::{DirEntry, FileNode, Location, NodePermission, NodeType, Reference};
+use axfs_ng_vfs::{DirEntry, FileNode, Location, NodePermission, NodeType, Reference, path::Path};
 use axtask::current;
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
@@ -15,7 +15,11 @@ use linux_raw_sys::general::*;
 use crate::{
     file::{
         Directory, FD_TABLE, File, FileLike, Pipe, add_file_description, add_file_like,
-        close_file_like, get_file_description, get_file_like, with_fs,
+        close_file_like, get_file_description, get_file_like,
+        inotify::{
+            location_for_fd, notify_close, notify_exact, notify_parent, notify_parent_with_name,
+        },
+        with_fs,
     },
     mm::{UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
@@ -124,11 +128,33 @@ pub fn sys_openat(
     debug!("sys_openat <= {dirfd} {path:?} {flags:#o} {mode:#o}");
 
     let mode = mode & !current().as_thread().proc_data.umask();
+    let created_parent = if (flags as u32) & O_CREAT != 0 {
+        with_fs(dirfd, |fs| match fs.resolve_no_follow(&path) {
+            Ok(_) => Ok(None),
+            Err(AxError::NotFound) => {
+                let (parent, name) = fs.resolve_nonexistent(Path::new(&path))?;
+                Ok(Some((parent, name.to_string())))
+            }
+            Err(err) => Err(err),
+        })?
+    } else {
+        None
+    };
 
     let options = flags_to_options(flags, mode, (sys_geteuid()? as _, sys_getegid()? as _));
-    with_fs(dirfd, |fs| options.open(fs, path))
+    let fd = with_fs(dirfd, |fs| options.open(fs, path))
         .and_then(|it| add_to_fd(it, flags as _))
-        .map(|fd| fd as isize)
+        .map(|fd| fd as isize)?;
+
+    if let Some(loc) = location_for_fd(fd as i32) {
+        if let Some((parent, name)) = created_parent {
+            let _ = notify_parent_with_name(&parent, &name, IN_CREATE, loc.is_dir(), 0);
+        }
+        let _ = notify_parent(&loc, IN_OPEN);
+        let _ = notify_exact(&loc, IN_OPEN);
+    }
+
+    Ok(fd)
 }
 
 /// Open a file by `filename` and insert it into the file descriptor table.
@@ -142,6 +168,7 @@ pub fn sys_open(path: *const c_char, flags: i32, mode: __kernel_mode_t) -> AxRes
 
 pub fn sys_close(fd: c_int) -> AxResult<isize> {
     debug!("sys_close <= {fd}");
+    notify_close(fd);
     close_file_like(fd)?;
     Ok(0)
 }

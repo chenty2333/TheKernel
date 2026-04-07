@@ -163,10 +163,12 @@ impl FileLike for Pipe {
                 let mut prod = self.shared.buffer.lock();
                 let (left, right) = prod.vacant_slices_mut();
                 // The ring buffer exposes valid writable byte slices here.
-                let left =
-                    unsafe { core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len()) };
-                let right =
-                    unsafe { core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len()) };
+                let left = unsafe {
+                    core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
+                };
+                let right = unsafe {
+                    core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len())
+                };
                 let mut count = src.read(left)?;
                 if count >= left.len() {
                     count += src.read(right)?;

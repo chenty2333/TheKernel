@@ -22,12 +22,25 @@ use starry_process::Process;
 use crate::{
     file::FD_TABLE,
     mm::{Backend, system_memory_stats},
+    mounts,
     pseudofs::{
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
         SimpleFileOperation, SimpleFs,
     },
     task::{AsThread, TaskStat, get_task, get_visible_task, tasks},
 };
+
+fn render_mounts() -> String {
+    let mut out = String::from("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n");
+    for record in mounts::snapshot() {
+        let _ = writeln!(
+            out,
+            "{} {} {} rw,relatime 0 0",
+            record.source, record.target, record.fs_type
+        );
+    }
+    out
+}
 
 fn real_meminfo() -> String {
     let stats = system_memory_stats();
@@ -276,10 +289,7 @@ impl SimpleDirOps for ThreadDir {
                 Ok(out)
             })
             .into(),
-            "mounts" => SimpleFile::new_regular(fs, move || {
-                Ok("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n")
-            })
-            .into(),
+            "mounts" => SimpleFile::new_regular(fs, move || Ok(render_mounts())).into(),
             "cmdline" => SimpleFile::new_regular(fs, move || {
                 let cmdline = task.as_thread().proc_data.cmdline.read();
                 let mut buf = Vec::new();
@@ -380,9 +390,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     let mut root = DirMapping::new();
     root.add(
         "mounts",
-        SimpleFile::new_regular(fs.clone(), || {
-            Ok("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n")
-        }),
+        SimpleFile::new_regular(fs.clone(), || Ok(render_mounts())),
     );
     root.add(
         "meminfo",
@@ -506,10 +514,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 "pid_max",
                 SimpleFile::new_regular(fs.clone(), || Ok("32768\n")),
             );
-            kernel.add(
-                "tainted",
-                SimpleFile::new_regular(fs.clone(), || Ok("0\n")),
-            );
+            kernel.add("tainted", SimpleFile::new_regular(fs.clone(), || Ok("0\n")));
 
             SimpleDir::new_maker(fs.clone(), Arc::new(kernel))
         });

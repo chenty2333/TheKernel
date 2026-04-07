@@ -1,14 +1,15 @@
 use axhal::uspace::{ExceptionInfo, ExceptionKind, ReturnReason, UserContext};
 use axtask::TaskInner;
+use memory_addr::MemoryAddr;
 use starry_process::Pid;
 use starry_signal::{SignalInfo, Signo};
-use starry_vm::{VmMutPtr, VmPtr};
+use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
 
 use super::{
     AsThread, TimerState, check_signals, do_exit, has_pending_fatal_signal, raise_signal_fatal,
     set_timer_state, wait_if_stopped,
 };
-use crate::syscall::handle_syscall;
+use crate::{file::userfaultfd::wait_missing_page_for_current, syscall::handle_syscall};
 
 /// Maps an `ExceptionKind::Other` exception to the correct POSIX signal using
 /// arch-specific exception information.
@@ -59,7 +60,21 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                     ReturnReason::Syscall => handle_syscall(&mut uctx),
                     ReturnReason::PageFault(addr, flags) => {
                         let aspace_handle = thr.proc_data.aspace();
-                        if !aspace_handle.lock().handle_page_fault(addr, flags) {
+                        let handled = if let Some(data) = wait_missing_page_for_current(
+                            thr.proc_data.proc.pid(),
+                            addr,
+                            flags.contains(axhal::trap::PageFaultFlags::WRITE),
+                        ) {
+                            let page = addr.align_down_4k();
+                            if !aspace_handle.lock().handle_page_fault(addr, flags) {
+                                false
+                            } else {
+                                vm_write_slice(page.as_usize() as *mut u8, &data).is_ok()
+                            }
+                        } else {
+                            aspace_handle.lock().handle_page_fault(addr, flags)
+                        };
+                        if !handled {
                             info!(
                                 "{:?}: segmentation fault at {:#x} {:?}",
                                 thr.proc_data.proc, addr, flags

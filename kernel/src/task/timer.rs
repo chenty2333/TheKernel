@@ -14,7 +14,7 @@ use core::{
     time::Duration,
 };
 
-use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time_nanos, wall_time};
+use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time_nanos};
 use axpoll::PollSet;
 use axtask::{WeakAxTaskRef, current, future::block_on, register_timer_callback};
 use event_listener::{Event, listener};
@@ -24,7 +24,7 @@ use spin::Mutex;
 use starry_signal::Signo;
 use strum::FromRepr;
 
-use crate::task::poll_timer;
+use crate::{task::poll_timer, time::wall_time};
 
 fn time_value_from_nanos(nanos: usize) -> TimeValue {
     let secs = nanos as u64 / NANOS_PER_SEC;

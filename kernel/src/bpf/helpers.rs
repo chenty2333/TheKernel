@@ -4,7 +4,7 @@
 //! `CALL` instruction. Each helper has a numeric ID matching the Linux kernel's
 //! `bpf_func_id` enum.
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::ops::Range;
 
 use axerrno::{AxError, AxResult};
@@ -44,6 +44,36 @@ pub struct MapValueRegion {
     map: Arc<dyn BpfMap>,
     key: Vec<u8>,
     data: Box<[u8]>,
+}
+
+pub struct RingBufReservation {
+    map: Arc<dyn BpfMap>,
+    data: Box<[u8]>,
+}
+
+impl RingBufReservation {
+    pub fn new(map: Arc<dyn BpfMap>, size: usize) -> Self {
+        Self {
+            map,
+            data: vec![0u8; size].into_boxed_slice(),
+        }
+    }
+
+    fn base(&self) -> usize {
+        self.data.as_ptr() as usize
+    }
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn matches_base(&self, ptr: usize) -> bool {
+        self.base() == ptr
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.data
+    }
 }
 
 impl MapValueRegion {
@@ -106,6 +136,8 @@ pub struct HelperContext<'a> {
     pub maps: &'a [Arc<dyn BpfMap>],
     /// Stable regions for map values returned by lookup helpers.
     pub map_value_regions: &'a mut Vec<MapValueRegion>,
+    /// In-flight ringbuf reservations returned by reserve helper.
+    pub ringbuf_reservations: &'a mut Vec<RingBufReservation>,
     /// VM stack backing storage.
     pub stack: &'a mut [u8; BPF_STACK_SIZE],
     /// Base address of the context buffer.
@@ -201,6 +233,23 @@ impl<'a> HelperContext<'a> {
         self.map_value_regions.clear();
     }
 
+    pub fn push_ringbuf_reservation(&mut self, map: Arc<dyn BpfMap>, size: usize) -> u64 {
+        self.ringbuf_reservations
+            .push(RingBufReservation::new(map, size));
+        self.ringbuf_reservations.last().unwrap().base() as u64
+    }
+
+    pub fn find_ringbuf_reservation(&self, ptr: usize) -> Option<usize> {
+        self.ringbuf_reservations
+            .iter()
+            .position(|reservation| reservation.matches_base(ptr))
+    }
+
+    pub fn take_ringbuf_reservation(&mut self, ptr: usize) -> Option<RingBufReservation> {
+        let index = self.find_ringbuf_reservation(ptr)?;
+        Some(self.ringbuf_reservations.remove(index))
+    }
+
     fn read_stack_bytes(&self, ptr: usize, len: usize) -> Option<Vec<u8>> {
         let base = self.stack.as_ptr() as usize;
         let range = checked_region(ptr, len, base, self.stack.len())?;
@@ -270,6 +319,10 @@ pub fn call_helper(
         BPF_FUNC_GET_CURRENT_PID_TGID => Ok(helper_get_current_pid_tgid()),
         BPF_FUNC_GET_CURRENT_UID_GID => Ok(helper_get_current_uid_gid()),
         BPF_FUNC_GET_CURRENT_COMM => helper_get_current_comm(r1, r2, hctx),
+        BPF_FUNC_RINGBUF_OUTPUT => helper_ringbuf_output(r1, r2, r3, r4, hctx),
+        BPF_FUNC_RINGBUF_RESERVE => helper_ringbuf_reserve(r1, r2, r3, hctx),
+        BPF_FUNC_RINGBUF_SUBMIT => helper_ringbuf_submit(r1, r2, hctx),
+        BPF_FUNC_RINGBUF_DISCARD => helper_ringbuf_discard(r1, r2, hctx),
         BPF_FUNC_TRACE_PRINTK => helper_trace_printk(r1, r2, r3, r4, r5, hctx),
         BPF_FUNC_GET_PRANDOM_U32 => Ok(helper_get_prandom_u32()),
         BPF_FUNC_GET_SMP_PROCESSOR_ID => Ok(0), // unikernel: always CPU 0
@@ -307,7 +360,7 @@ fn helper_map_update_elem(
     flags: u64,
     hctx: &mut HelperContext,
 ) -> AxResult<u64> {
-    let Some(map) = hctx.map(map_idx) else {
+    let Some(map) = hctx.map(map_idx).cloned() else {
         return Ok(helper_error());
     };
 
@@ -331,7 +384,7 @@ fn helper_map_update_elem(
 }
 
 fn helper_map_delete_elem(map_idx: u64, key_ptr: u64, hctx: &mut HelperContext) -> AxResult<u64> {
-    let Some(map) = hctx.map(map_idx) else {
+    let Some(map) = hctx.map(map_idx).cloned() else {
         return Ok(helper_error());
     };
 
@@ -345,6 +398,63 @@ fn helper_map_delete_elem(map_idx: u64, key_ptr: u64, hctx: &mut HelperContext) 
             hctx.invalidate_all_map_value_regions();
             Ok(0)
         }
+        Err(_) => Ok(helper_error()),
+    }
+}
+
+fn helper_ringbuf_reserve(
+    map_idx: u64,
+    size: u64,
+    flags: u64,
+    hctx: &mut HelperContext,
+) -> AxResult<u64> {
+    let Some(map) = hctx.map(map_idx).cloned() else {
+        return Ok(0);
+    };
+    let size = size as usize;
+    charge_aux_budget(hctx.aux_budget_remaining, size)?;
+    if map.ringbuf_reserve(size, flags).is_err() {
+        return Ok(0);
+    }
+    Ok(hctx.push_ringbuf_reservation(map, size))
+}
+
+fn helper_ringbuf_submit(data_ptr: u64, flags: u64, hctx: &mut HelperContext) -> AxResult<u64> {
+    let Some(reservation) = hctx.take_ringbuf_reservation(data_ptr as usize) else {
+        return Ok(helper_error());
+    };
+    match reservation.map.ringbuf_submit(reservation.as_slice().to_vec(), flags) {
+        Ok(()) => Ok(0),
+        Err(_) => Ok(helper_error()),
+    }
+}
+
+fn helper_ringbuf_discard(data_ptr: u64, flags: u64, hctx: &mut HelperContext) -> AxResult<u64> {
+    let Some(reservation) = hctx.take_ringbuf_reservation(data_ptr as usize) else {
+        return Ok(helper_error());
+    };
+    match reservation.map.ringbuf_discard(reservation.len(), flags) {
+        Ok(()) => Ok(0),
+        Err(_) => Ok(helper_error()),
+    }
+}
+
+fn helper_ringbuf_output(
+    map_idx: u64,
+    data_ptr: u64,
+    size: u64,
+    flags: u64,
+    hctx: &mut HelperContext,
+) -> AxResult<u64> {
+    let Some(map) = hctx.map(map_idx).cloned() else {
+        return Ok(helper_error());
+    };
+    let Ok(data) = hctx.read_bytes(data_ptr, size as usize, HelperMemMask::READABLE) else {
+        return Ok(helper_error());
+    };
+    charge_aux_budget(hctx.aux_budget_remaining, data.len())?;
+    match map.ringbuf_output(&data, flags) {
+        Ok(()) => Ok(0),
         Err(_) => Ok(helper_error()),
     }
 }

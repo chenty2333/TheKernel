@@ -18,6 +18,7 @@ use crate::{
     RecvOptions, SendOptions, Shutdown,
     general::GeneralOptions,
     options::{Configurable, GetSocketOption, SetSocketOption, UnixCredentials},
+    socket::SocketFilter,
     unix::{Transport, TransportOps, UnixSocketAddr},
 };
 
@@ -112,6 +113,10 @@ impl StreamTransport {
             rx_closed: AtomicBool::new(false),
             tx_closed: AtomicBool::new(false),
         }
+    }
+
+    pub fn set_filter(&self, _filter: Option<Arc<dyn SocketFilter>>) -> AxResult<()> {
+        Ok(())
     }
 
     /// Create a connected pair of stream transports.

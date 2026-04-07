@@ -251,8 +251,13 @@ impl ElfLoader {
 
 static ELF_LOADER: Mutex<ElfLoader> = Mutex::new(ElfLoader::new());
 
-const SCRIPT_INTERPRETERS: &[&str] =
-    &["/musl/busybox", "/glibc/busybox", "/busybox", "/bin/busybox", "/bin/sh"];
+const SCRIPT_INTERPRETERS: &[&str] = &[
+    "/musl/busybox",
+    "/glibc/busybox",
+    "/busybox",
+    "/bin/busybox",
+    "/bin/sh",
+];
 
 fn script_interpreter_args(shell: &str, path: &str, args: &[String]) -> Vec<String> {
     let mut new_args = vec![shell.to_owned()];

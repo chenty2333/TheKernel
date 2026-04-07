@@ -56,7 +56,10 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
         let aspace_handle = proc_data.aspace();
 
         if shrink_size > 0
-            && aspace_handle.lock().unmap(shrink_start, shrink_size).is_err()
+            && aspace_handle
+                .lock()
+                .unmap(shrink_start, shrink_size)
+                .is_err()
         {
             return Ok(current_top as isize);
         }

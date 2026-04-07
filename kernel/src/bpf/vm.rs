@@ -4,7 +4,7 @@
 //! loop. Implements the full eBPF ISA including ALU32/ALU64, JMP/JMP32,
 //! LDX/STX/ST, and 64-bit immediate loads.
 
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 
 use axerrno::{AxError, AxResult};
 
@@ -24,6 +24,8 @@ pub struct BpfVm<'a> {
     maps: &'a [Arc<dyn BpfMap>],
     /// Stable regions backing pointers returned by map lookup helpers.
     map_value_regions: Vec<MapValueRegion>,
+    /// In-flight ringbuf reservations returned by reserve helper.
+    ringbuf_reservations: Vec<helpers::RingBufReservation>,
     /// Context buffer base address and size.
     ctx_base: u64,
     ctx_size: usize,
@@ -45,6 +47,7 @@ impl<'a> BpfVm<'a> {
             pc: 0,
             maps,
             map_value_regions: Vec::new(),
+            ringbuf_reservations: Vec::new(),
             ctx_base: 0,
             ctx_size: 0,
             aux_budget_remaining: u64::MAX,
@@ -74,6 +77,7 @@ impl<'a> BpfVm<'a> {
         self.regs = [0; BPF_MAX_REGS];
         self.pc = 0;
         self.map_value_regions.clear();
+        self.ringbuf_reservations.clear();
 
         let stack_top = self.stack.as_ptr() as u64 + BPF_STACK_SIZE as u64;
         self.regs[1] = ctx.as_ptr() as u64; // R1 = context pointer
@@ -266,8 +270,9 @@ impl<'a> BpfVm<'a> {
             let helper_id = insn.imm as u32;
             let mut hctx = HelperContext {
                 maps: self.maps,
-                map_value_regions: &mut self.map_value_regions,
-                stack: &mut self.stack,
+            map_value_regions: &mut self.map_value_regions,
+            ringbuf_reservations: &mut self.ringbuf_reservations,
+            stack: &mut self.stack,
                 ctx_base: self.ctx_base,
                 ctx_size: self.ctx_size,
                 aux_budget_remaining: &mut self.aux_budget_remaining,
@@ -498,7 +503,7 @@ impl<'a> BpfVm<'a> {
     // Memory access helpers
     // -----------------------------------------------------------------------
 
-    fn mem_read<T: Copy>(&self, addr: u64) -> AxResult<T> {
+    fn mem_read<T: Copy>(&mut self, addr: u64) -> AxResult<T> {
         let size = core::mem::size_of::<T>();
         let ptr = addr as usize;
 

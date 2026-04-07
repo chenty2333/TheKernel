@@ -12,6 +12,7 @@ use spin::RwLock;
 use crate::{
     CMsgData, RecvFlags, RecvOptions, SendOptions, SocketAddrEx,
     general::GeneralOptions,
+    socket::SocketFilter,
     options::{Configurable, GetSocketOption, SetSocketOption, UnixCredentials},
     unix::{Transport, TransportOps, UnixSocketAddr, with_slot},
 };
@@ -25,11 +26,13 @@ struct Packet {
 struct Channel {
     data_tx: async_channel::Sender<Packet>,
     poll_update: Arc<PollSet>,
+    filter: Arc<RwLock<Option<Arc<dyn SocketFilter>>>>,
 }
 
 pub struct Bind {
     data_tx: async_channel::Sender<Packet>,
     poll_update: Arc<PollSet>,
+    filter: Arc<RwLock<Option<Arc<dyn SocketFilter>>>>,
 }
 impl Bind {
     fn connect(&self) -> Channel {
@@ -37,6 +40,7 @@ impl Bind {
         Channel {
             data_tx: tx,
             poll_update: self.poll_update.clone(),
+            filter: self.filter.clone(),
         }
     }
 }
@@ -47,6 +51,7 @@ pub struct DgramTransport {
     connected: RwLock<Option<Channel>>,
     local_addr: RwLock<UnixSocketAddr>,
     poll_state: Arc<PollSet>,
+    filter: Arc<RwLock<Option<Arc<dyn SocketFilter>>>>,
     general: GeneralOptions,
     pid: u32,
 }
@@ -58,6 +63,7 @@ impl DgramTransport {
             connected: RwLock::new(None),
             local_addr: RwLock::new(UnixSocketAddr::Unnamed),
             poll_state: Arc::default(),
+            filter: Arc::new(RwLock::new(None)),
             general: GeneralOptions::default(),
             pid,
         }
@@ -66,6 +72,7 @@ impl DgramTransport {
     fn new_connected(
         data_rx: (async_channel::Receiver<Packet>, Arc<PollSet>),
         connected: Channel,
+        filter: Arc<RwLock<Option<Arc<dyn SocketFilter>>>>,
         pid: u32,
     ) -> Self {
         DgramTransport {
@@ -73,6 +80,7 @@ impl DgramTransport {
             connected: RwLock::new(Some(connected)),
             local_addr: RwLock::new(UnixSocketAddr::Unnamed),
             poll_state: Arc::default(),
+            filter,
             general: GeneralOptions::default(),
             pid,
         }
@@ -84,12 +92,16 @@ impl DgramTransport {
         let (tx2, rx2) = async_channel::unbounded();
         let poll1 = Arc::new(PollSet::new());
         let poll2 = Arc::new(PollSet::new());
+        let filter1 = Arc::new(RwLock::new(None));
+        let filter2 = Arc::new(RwLock::new(None));
         let transport1 = DgramTransport::new_connected(
             (rx1, poll1.clone()),
             Channel {
                 data_tx: tx2,
                 poll_update: poll2.clone(),
+                filter: filter2.clone(),
             },
+            filter1.clone(),
             pid,
         );
         let transport2 = DgramTransport::new_connected(
@@ -97,10 +109,17 @@ impl DgramTransport {
             Channel {
                 data_tx: tx1,
                 poll_update: poll1.clone(),
+                filter: filter1.clone(),
             },
+            filter2.clone(),
             pid,
         );
         (transport1, transport2)
+    }
+
+    pub fn set_filter(&self, filter: Option<Arc<dyn SocketFilter>>) -> AxResult<()> {
+        *self.filter.write() = filter;
+        Ok(())
     }
 }
 
@@ -155,6 +174,7 @@ impl TransportOps for DgramTransport {
         *slot = Some(Bind {
             data_tx: tx,
             poll_update: poll_update.clone(),
+            filter: self.filter.clone(),
         });
         *guard = Some((rx, poll_update));
         self.local_addr.write().clone_from(local_addr);
@@ -186,7 +206,7 @@ impl TransportOps for DgramTransport {
         let mut message = Vec::new();
         src.read_to_end(&mut message)?;
         let len = message.len();
-        let packet = Packet {
+        let mut packet = Packet {
             data: message,
             cmsg: options.cmsg,
             sender: self.local_addr.read().clone(),
@@ -197,6 +217,13 @@ impl TransportOps for DgramTransport {
             let addr = addr.into_unix()?;
             with_slot(&addr, |slot| {
                 if let Some(bind) = slot.dgram.lock().as_ref() {
+                    if let Some(filter) = bind.filter.read().as_ref() {
+                        let keep = filter.filter(&mut packet.data)?;
+                        if keep == 0 {
+                            return Ok(());
+                        }
+                        packet.data.truncate(keep.min(packet.data.len()));
+                    }
                     bind.data_tx
                         .try_send(packet)
                         .map_err(|_| AxError::BrokenPipe)?;
@@ -207,6 +234,13 @@ impl TransportOps for DgramTransport {
                 }
             })?;
         } else if let Some(chan) = connected.as_ref() {
+            if let Some(filter) = chan.filter.read().as_ref() {
+                let keep = filter.filter(&mut packet.data)?;
+                if keep == 0 {
+                    return Ok(len);
+                }
+                packet.data.truncate(keep.min(packet.data.len()));
+            }
             chan.data_tx
                 .try_send(packet)
                 .map_err(|_| AxError::BrokenPipe)?;

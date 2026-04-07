@@ -1,9 +1,33 @@
+use core::sync::atomic::{AtomicI64, Ordering};
+
 use axerrno::{AxError, AxResult};
 use axhal::time::TimeValue;
 use linux_raw_sys::general::{
     __kernel_old_timespec, __kernel_old_timeval, __kernel_sock_timeval, __kernel_timespec,
     timespec, timeval,
 };
+
+static WALL_TIME_OFFSET_NANOS: AtomicI64 = AtomicI64::new(0);
+
+fn apply_wall_time_offset(base_nanos: u64) -> u64 {
+    let adjusted = base_nanos as i128 + WALL_TIME_OFFSET_NANOS.load(Ordering::Relaxed) as i128;
+    adjusted.clamp(0, u64::MAX as i128) as u64
+}
+
+pub fn wall_time_nanos() -> u64 {
+    apply_wall_time_offset(axhal::time::wall_time_nanos())
+}
+
+pub fn wall_time() -> TimeValue {
+    TimeValue::from_nanos(wall_time_nanos())
+}
+
+pub fn set_wall_time(new_time: TimeValue) {
+    let base_nanos = axhal::time::wall_time_nanos() as i128;
+    let target_nanos = new_time.as_nanos().min(u64::MAX as u128) as i128;
+    let offset = (target_nanos - base_nanos).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    WALL_TIME_OFFSET_NANOS.store(offset, Ordering::Relaxed);
+}
 
 /// A helper trait for converting from and to `TimeValue`.
 pub trait TimeValueLike {

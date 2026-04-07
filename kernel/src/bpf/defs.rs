@@ -151,6 +151,13 @@ pub const BPF_FUNC_GET_SMP_PROCESSOR_ID: u32 = 8;
 pub const BPF_FUNC_GET_CURRENT_PID_TGID: u32 = 14;
 pub const BPF_FUNC_GET_CURRENT_UID_GID: u32 = 15;
 pub const BPF_FUNC_GET_CURRENT_COMM: u32 = 16;
+pub const BPF_FUNC_RINGBUF_OUTPUT: u32 = 130;
+pub const BPF_FUNC_RINGBUF_RESERVE: u32 = 131;
+pub const BPF_FUNC_RINGBUF_SUBMIT: u32 = 132;
+pub const BPF_FUNC_RINGBUF_DISCARD: u32 = 133;
+
+pub const BPF_RB_NO_WAKEUP: u64 = 1;
+pub const BPF_RB_FORCE_WAKEUP: u64 = 2;
 
 // ---------------------------------------------------------------------------
 // eBPF ISA: Instruction class (3 LSBs of opcode)
@@ -265,7 +272,7 @@ pub const BPF_MAX_EXEC_INSNS: usize = 1_000_000;
 
 /// Attribute for `BPF_MAP_CREATE`.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, AnyBitPattern, NoUninit)]
+#[derive(Debug, Clone, Copy, AnyBitPattern)]
 pub struct BpfAttrMapCreate {
     pub map_type: u32,
     pub key_size: u32,
@@ -291,7 +298,7 @@ pub struct BpfAttrMapCreate {
 /// `BPF_MAP_DELETE_ELEM`, `BPF_MAP_GET_NEXT_KEY`,
 /// `BPF_MAP_LOOKUP_AND_DELETE_ELEM`.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, AnyBitPattern, NoUninit)]
+#[derive(Debug, Clone, Copy, AnyBitPattern)]
 pub struct BpfAttrMapElem {
     pub map_fd: u32,
     pub _pad0: u32,
@@ -302,7 +309,7 @@ pub struct BpfAttrMapElem {
 
 /// Attribute for `BPF_PROG_LOAD`.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, AnyBitPattern, NoUninit)]
+#[derive(Debug, Clone, Copy, AnyBitPattern)]
 pub struct BpfAttrProgLoad {
     pub prog_type: u32,
     pub insn_cnt: u32,
@@ -339,7 +346,7 @@ pub struct BpfAttrProgLoad {
 
 /// Attribute for `BPF_PROG_TEST_RUN`.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, AnyBitPattern, NoUninit)]
+#[derive(Debug, Clone, Copy, AnyBitPattern)]
 pub struct BpfAttrTestRun {
     pub prog_fd: u32,
     pub retval: u32,
@@ -361,7 +368,7 @@ pub struct BpfAttrTestRun {
 
 /// Attribute for `BPF_OBJ_GET_INFO_BY_FD`.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, AnyBitPattern, NoUninit)]
+#[derive(Debug, Clone, Copy, AnyBitPattern)]
 pub struct BpfAttrGetInfoByFd {
     pub bpf_fd: u32,
     pub info_len: u32,

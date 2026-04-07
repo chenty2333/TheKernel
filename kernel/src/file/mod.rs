@@ -4,11 +4,14 @@ pub mod epoll;
 pub mod event;
 pub mod flock;
 mod fs;
+pub mod io_uring;
+pub mod inotify;
 mod net;
 mod pidfd;
 mod pipe;
 pub mod signalfd;
 pub mod timerfd;
+pub mod userfaultfd;
 
 use alloc::{borrow::Cow, sync::Arc};
 use core::{
