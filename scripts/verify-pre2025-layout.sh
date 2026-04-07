@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+
 ARCH=""
 IMAGE_PATH=""
+STATE_DIR=${OSCOMP_STATE_DIR:-$REPO_ROOT/.state}
+VERIFY_WORKDIR_BASE=${OSCOMP_VERIFY_WORKDIR_BASE:-$STATE_DIR/verify-pre2025-layout}
 TESTSUITE_DIR=${OSCOMP_TESTSUITE_DIR:-$HOME/testsuits-for-oskernel}
 
 die() {
@@ -73,7 +78,11 @@ IMAGE_SOURCE=${IMAGE_PATH:-$(find_first_existing "$DEFAULT_IMAGE" "$DEFAULT_IMAG
 [ -f "$IMAGE_SOURCE" ] || die "image does not exist: $IMAGE_SOURCE"
 
 TEMP_IMAGE=""
+TEMP_DIR=""
 cleanup() {
+    if [ -n "$TEMP_DIR" ]; then
+        rm -rf "$TEMP_DIR"
+    fi
     if [ -n "$TEMP_IMAGE" ]; then
         rm -f "$TEMP_IMAGE"
     fi
@@ -81,7 +90,9 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ "$IMAGE_SOURCE" == *.xz ]]; then
-    TEMP_IMAGE=$(mktemp "${TMPDIR:-/tmp}/pre2025-image.XXXXXX.img")
+    mkdir -p "$VERIFY_WORKDIR_BASE"
+    TEMP_DIR=$(mktemp -d "$VERIFY_WORKDIR_BASE/run.XXXXXX")
+    TEMP_IMAGE="$TEMP_DIR/$(basename -- "${IMAGE_SOURCE%.xz}")"
     xz -dc "$IMAGE_SOURCE" >"$TEMP_IMAGE"
     IMAGE="$TEMP_IMAGE"
 else
@@ -114,11 +125,15 @@ assert_path /musl/busybox
 assert_path /glibc/busybox
 assert_path /musl/lib/libc.so
 assert_path /musl/lib/dlopen_dso.so
+assert_path /musl/lib/tls_align_dso.so
+assert_path /musl/lib/tls_init_dso.so
 assert_path /musl/lib/tls_get_new-dtv_dso.so
 assert_path /musl/dlopen_dso.so
 assert_path /musl/tls_get_new-dtv_dso.so
 assert_path /glibc/lib/libc.so
 assert_path /glibc/lib/dlopen_dso.so
+assert_path /glibc/lib/tls_align_dso.so
+assert_path /glibc/lib/tls_init_dso.so
 assert_path /glibc/lib/tls_get_new-dtv_dso.so
 assert_path /glibc/dlopen_dso.so
 assert_path /glibc/tls_get_new-dtv_dso.so

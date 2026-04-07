@@ -179,8 +179,6 @@ if [ "$ARCH" = "rv" ]; then
         "$TESTSUITE_DIR/sdcard-rv.img" \
         "$TESTSUITE_DIR/sdcard-rv.img.xz" || true)
     SUPPORT_IMAGE_SOURCE=$(find_first_existing \
-        "$TESTSUITE_DIR/disk.img" \
-        "$TESTSUITE_DIR/disk.img.xz" \
         "$REPO_ROOT/disk.img" \
         "$REPO_ROOT/disk.img.xz" || true)
 else
@@ -190,8 +188,6 @@ else
         "$TESTSUITE_DIR/sdcard-la.img" \
         "$TESTSUITE_DIR/sdcard-la.img.xz" || true)
     SUPPORT_IMAGE_SOURCE=$(find_first_existing \
-        "$TESTSUITE_DIR/disk-la.img" \
-        "$TESTSUITE_DIR/disk-la.img.xz" \
         "$REPO_ROOT/disk-la.img" \
         "$REPO_ROOT/disk-la.img.xz" || true)
 fi
