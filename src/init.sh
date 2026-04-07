@@ -267,11 +267,32 @@ fi'
 }
 
 mount_support_disk() {
+    support_arch_dir=""
+    case "$(bb uname -m 2>/dev/null || true)" in
+        riscv64)
+            support_arch_dir=rv
+            ;;
+        loongarch64)
+            support_arch_dir=la
+            ;;
+    esac
+
     bb mkdir -p /support 2>/dev/null || true
-    if bb mount -t ext4 /dev/vdb /support >/dev/null 2>&1; then
-        if [ -f /support/glibc/lib/libgcc_s.so.1 ]; then
-            install_runtime_alias /support/glibc/lib/libgcc_s.so.1 /glibc/lib/libgcc_s.so.1 || true
-            install_runtime_alias /support/glibc/lib/libgcc_s.so.1 /lib/libgcc_s.so.1 || true
+    if bb mount -t ext4 -o ro /dev/vdb /support >/dev/null 2>&1; then
+        support_libgcc=""
+        for candidate in \
+            "/support/${support_arch_dir}/glibc/lib/libgcc_s.so.1" \
+            "/support/glibc/lib/libgcc_s.so.1"
+        do
+            [ -n "$candidate" ] || continue
+            if [ -f "$candidate" ]; then
+                support_libgcc="$candidate"
+                break
+            fi
+        done
+        if [ -n "$support_libgcc" ]; then
+            install_runtime_alias "$support_libgcc" /glibc/lib/libgcc_s.so.1 || true
+            install_runtime_alias "$support_libgcc" /lib/libgcc_s.so.1 || true
         fi
         if [ -d /support/usr/lib/locale/C.UTF-8 ]; then
             OSCOMP_SUPPORT_LOCPATH=/support/usr/lib/locale

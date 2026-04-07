@@ -188,6 +188,8 @@ else
         "$TESTSUITE_DIR/sdcard-la.img" \
         "$TESTSUITE_DIR/sdcard-la.img.xz" || true)
     SUPPORT_IMAGE_SOURCE=$(find_first_existing \
+        "$REPO_ROOT/disk.img" \
+        "$REPO_ROOT/disk.img.xz" \
         "$REPO_ROOT/disk-la.img" \
         "$REPO_ROOT/disk-la.img.xz" || true)
 fi

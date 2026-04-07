@@ -38,7 +38,7 @@ ifeq ($(MEMTRACK), y)
 endif
 
 default: build
-all: legacy-clean kernel-rv kernel-la disk.img disk-la.img
+all: legacy-clean kernel-rv kernel-la disk.img
 
 legacy-clean:
 	@rm -rf \
@@ -104,10 +104,10 @@ kernel-la:
 	@$(MAKE) --no-print-directory check-eval-kernel-size
 
 disk.img:
-	@bash ./scripts/build-oscomp-support-disk.sh --arch rv --out-dir "$(ROOT_DIR)"
+	@bash ./scripts/build-oscomp-support-disk.sh --arch both --output "$@"
 
-disk-la.img:
-	@bash ./scripts/build-oscomp-support-disk.sh --arch la --out-dir "$(ROOT_DIR)"
+disk-la.img: disk.img
+	@cp disk.img $@
 
 ci-test:
 	./scripts/ci-test.py $(ARCH)
