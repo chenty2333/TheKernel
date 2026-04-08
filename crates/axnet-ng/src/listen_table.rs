@@ -151,7 +151,13 @@ impl ListenTable {
         sockets: &mut SocketSet<'_>,
     ) {
         if let Some(entry) = self.listen_entry(dst.port).lock().deref_mut() {
-            // TODO(mivik): accept address check
+            if entry
+                .listen_endpoint
+                .addr
+                .is_some_and(|addr| addr != dst.addr)
+            {
+                return;
+            }
             if entry.syn_queue.len() >= LISTEN_QUEUE_SIZE {
                 // SYN queue is full, drop the packet
                 warn!("SYN queue overflow!");
@@ -162,10 +168,7 @@ impl ListenTable {
                 SocketBuffer::new(vec![0; TCP_RX_BUF_LEN]),
                 SocketBuffer::new(vec![0; TCP_TX_BUF_LEN]),
             );
-            if let Err(err) = socket.listen(IpListenEndpoint {
-                addr: None,
-                port: dst.port,
-            }) {
+            if let Err(err) = socket.listen(entry.listen_endpoint) {
                 warn!("Failed to listen on {}: {:?}", entry.listen_endpoint, err);
                 return;
             }

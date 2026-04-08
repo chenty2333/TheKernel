@@ -10,6 +10,7 @@ OUTPUT=""
 MIN_IMAGE_SIZE_MB=32
 TEST_LIST_PATH="$REPO_ROOT/ltp_test.txt"
 TMP_ROOT=""
+TMP_BASE="$REPO_ROOT/.tmp"
 
 usage() {
     cat <<EOF
@@ -221,14 +222,16 @@ LOCALE_SOURCE=$(find_locale_source || true)
     exit 1
 }
 
-TMP_ROOT=$(mktemp -d "$REPO_ROOT/.tmp/build-support-disk.XXXXXX")
+mkdir -p "$TMP_BASE" "$OUT_DIR"
+
+TMP_ROOT=$(mktemp -d "$TMP_BASE/build-support-disk.XXXXXX")
 cleanup() {
     [ -n "$TMP_ROOT" ] && rm -rf "$TMP_ROOT"
 }
 trap cleanup EXIT
 
 WORK_ROOT="$TMP_ROOT/root"
-mkdir -p "$WORK_ROOT/usr/lib/locale/C.UTF-8" "$WORK_ROOT/meta" "$OUT_DIR"
+mkdir -p "$WORK_ROOT/usr/lib/locale/C.UTF-8" "$WORK_ROOT/meta"
 cp -a "$LOCALE_SOURCE"/. "$WORK_ROOT/usr/lib/locale/C.UTF-8/"
 cp "$TEST_LIST_PATH" "$WORK_ROOT/meta/ltp_test.txt"
 

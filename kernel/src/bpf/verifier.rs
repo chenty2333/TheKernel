@@ -1082,14 +1082,12 @@ fn preserves_mem_ptr(insn: &BpfInsn, reg_ty: RegType, src_ty: Option<RegType>) -
     insn.class() == BPF_CLASS_ALU64
         && matches!(insn.op(), BPF_OP_ADD | BPF_OP_SUB)
         && if (insn.code & BPF_SRC_X) != 0 {
-            matches!(
-                reg_ty,
-                RegType::StackPtr | RegType::CtxPtr | RegType::MapValuePtr
-            ) && matches!(src_ty, Some(RegType::Scalar))
+            matches!(reg_ty, RegType::StackPtr | RegType::CtxPtr)
+                && matches!(src_ty, Some(RegType::Scalar))
         } else {
             true
         }
-        && matches!(reg_ty, RegType::StackPtr | RegType::CtxPtr | RegType::MapValuePtr)
+        && matches!(reg_ty, RegType::StackPtr | RegType::CtxPtr)
 }
 
 fn clobber_caller_saved(regs: &mut [RegState; BPF_MAX_REGS]) {

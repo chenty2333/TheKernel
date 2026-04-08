@@ -47,8 +47,7 @@ impl RouteTable {
     pub fn add_rule(&mut self, rule: Rule) {
         let idx = self
             .rules
-            .binary_search_by(|it| rule.filter.prefix_len().cmp(&it.filter.prefix_len()))
-            .unwrap_or_else(|idx| idx);
+            .partition_point(|it| it.filter.prefix_len() >= rule.filter.prefix_len());
         self.rules.insert(idx, rule);
     }
 

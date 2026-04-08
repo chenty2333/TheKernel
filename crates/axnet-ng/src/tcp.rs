@@ -297,7 +297,14 @@ impl SocketOps for TcpSocket {
                     bound_endpoint.addr = Some(outbound.src_addr);
                 }
                 if bound_endpoint.port == 0 {
-                    bound_endpoint.port = self.stack.tcp_ephemeral_port()?;
+                    loop {
+                        bound_endpoint.port = self.stack.tcp_ephemeral_port()?;
+                        if bound_endpoint.port != remote_endpoint.port {
+                            break;
+                        }
+                    }
+                } else if bound_endpoint.port == remote_endpoint.port {
+                    ax_bail!(ConnectionRefused, "same local/remote port");
                 }
                 info!(
                     "TCP connection from {} to {}",

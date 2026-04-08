@@ -10,6 +10,8 @@ use crate::{
 const PROTO_TCP: u32 = linux_raw_sys::net::IPPROTO_TCP as u32;
 
 const PROTO_IP: u32 = linux_raw_sys::net::IPPROTO_IP as u32;
+const MCAST_JOIN_GROUP: u32 = 42;
+const MCAST_LEAVE_GROUP: u32 = 45;
 
 mod conv {
     use axerrno::{AxError, AxResult};
@@ -177,6 +179,13 @@ pub fn sys_setsockopt(
     }
 
     let socket = Socket::from_fd(fd)?;
+    if level == PROTO_IP {
+        match optname {
+            MCAST_JOIN_GROUP => return Ok(0),
+            MCAST_LEAVE_GROUP => return Err(AxError::from(LinuxError::EADDRNOTAVAIL)),
+            _ => {}
+        }
+    }
     if level == SOL_SOCKET {
         match optname {
             SO_ATTACH_BPF => {
