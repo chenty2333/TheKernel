@@ -269,10 +269,28 @@ impl CloneArgs {
                 old_proc_data.net_ns.clone()
             };
 
-            let proc_data = ProcessData::new(
-                proc,
+            #[cfg(target_arch = "loongarch64")]
+            let (child_exe_path, child_cmdline) = {
+                // On LoongArch, process-shared exec metadata can be transiently
+                // inconsistent during early shell-heavy bootstrap. Seed the child
+                // from the scheduler-visible task name; execve installs the final
+                // path/cmdline as soon as the child replaces its image.
+                let fallback_name = curr.name();
+                (
+                    fallback_name.clone(),
+                    Arc::new(alloc::vec![fallback_name]),
+                )
+            };
+            #[cfg(not(target_arch = "loongarch64"))]
+            let (child_exe_path, child_cmdline) = (
                 old_proc_data.exe_path.read().clone(),
                 old_proc_data.cmdline.read().clone(),
+            );
+
+            let proc_data = ProcessData::new(
+                proc,
+                child_exe_path,
+                child_cmdline,
                 aspace,
                 signal_actions,
                 exit_signal,

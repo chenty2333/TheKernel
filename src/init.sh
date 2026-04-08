@@ -410,11 +410,7 @@ install_ltp_subset_overlay() {
 }
 
 prepare_lmbench_env() {
-    root="$1"
-    [ -n "$root" ] || return 0
-    [ "$root" = / ] && return 0
-    [ -x "$root/lmbench_all" ] || return 0
-    install_runtime_alias "$root/lmbench_all" /code/lmbench_src/bin/build/lmbench_all || true
+    return 0
 }
 
 reference_eval_plan() {

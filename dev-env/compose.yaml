@@ -6,6 +6,8 @@ x-common-env: &common-env
   RUSTUP_HOME: /usr/local/rustup
   OSCOMP_TESTSUITE_DIR: /opt/oskernel/testsuites
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  LOCAL_UID: "${LOCAL_UID:-1000}"
+  LOCAL_GID: "${LOCAL_GID:-1000}"
 
 x-common-volumes: &common-volumes
   - type: bind
@@ -14,12 +16,6 @@ x-common-volumes: &common-volumes
   - type: volume
     source: thekernel-home
     target: /home/oskernel
-  - type: volume
-    source: thekernel-cargo
-    target: /usr/local/cargo
-  - type: volume
-    source: thekernel-rustup
-    target: /usr/local/rustup
   - type: bind
     source: ${OSCOMP_TESTSUITE_HOST_DIR}
     target: /opt/oskernel/testsuites
@@ -35,10 +31,10 @@ services:
         DEBIAN_IMAGE: ${DEBIAN_IMAGE}
         RUST_TOOLCHAIN: ${RUST_TOOLCHAIN}
         QEMU_VERSION: ${QEMU_VERSION}
-        RISCV64_MUSL_TOOLCHAIN_URL: ${RISCV64_MUSL_TOOLCHAIN_URL}
+        QEMU_SHA256: ${QEMU_SHA256}
         LOONGARCH64_MUSL_TOOLCHAIN_URL: ${LOONGARCH64_MUSL_TOOLCHAIN_URL}
+        LOONGARCH64_MUSL_TOOLCHAIN_SHA256: ${LOONGARCH64_MUSL_TOOLCHAIN_SHA256}
     working_dir: /workspace
-    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     stdin_open: true
     tty: true
     init: true
@@ -54,10 +50,10 @@ services:
         DEBIAN_IMAGE: ${DEBIAN_IMAGE}
         RUST_TOOLCHAIN: ${RUST_TOOLCHAIN}
         QEMU_VERSION: ${QEMU_VERSION}
-        RISCV64_MUSL_TOOLCHAIN_URL: ${RISCV64_MUSL_TOOLCHAIN_URL}
+        QEMU_SHA256: ${QEMU_SHA256}
         LOONGARCH64_MUSL_TOOLCHAIN_URL: ${LOONGARCH64_MUSL_TOOLCHAIN_URL}
+        LOONGARCH64_MUSL_TOOLCHAIN_SHA256: ${LOONGARCH64_MUSL_TOOLCHAIN_SHA256}
     working_dir: /workspace
-    user: "0:0"
     privileged: true
     stdin_open: true
     tty: true
@@ -68,5 +64,3 @@ services:
 
 volumes:
   thekernel-home:
-  thekernel-cargo:
-  thekernel-rustup:

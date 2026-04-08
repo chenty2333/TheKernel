@@ -59,11 +59,39 @@ fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
 }
 
+fn command_succeeds(cmd: &str, args: &[&str]) -> bool {
+    Command::new(cmd)
+        .args(args)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn generates_bindings_to_rust(arch: &str, cc: &str, mpath: &str, out_dir: &Path) {
     let target = env::var("TARGET").unwrap();
+    let host = env::var("HOST").unwrap_or_else(|_| "x86_64-unknown-linux-gnu".to_string());
+    let mut bindgen_target = if target.ends_with("-softfloat") {
+        target.replace("-softfloat", "")
+    } else {
+        target.clone()
+    };
     if target.ends_with("-softfloat") {
         // Clang does not recognize the `-softfloat` suffix
-        unsafe { env::set_var("TARGET", target.replace("-softfloat", "")) };
+        unsafe { env::set_var("TARGET", &bindgen_target) };
+    }
+
+    if arch == "loongarch64"
+        && let Some(triple) = command_stdout(cc, &["-dumpmachine"])
+        && !command_succeeds(
+            "clang",
+            &[&format!("--target={triple}"), "-dM", "-E", "-x", "c", "-"],
+        )
+    {
+        println!(
+            "cargo:warning=clang does not support target triple {triple}; generating lwext4 bindings with fallback host target {host}"
+        );
+        bindgen_target = host.clone();
+        unsafe { env::set_var("TARGET", &bindgen_target) };
     }
 
     let mut builder = bindgen::Builder::default()
@@ -83,7 +111,19 @@ fn generates_bindings_to_rust(arch: &str, cc: &str, mpath: &str, out_dir: &Path)
 
     if arch == "loongarch64" {
         if let Some(triple) = command_stdout(cc, &["-dumpmachine"]) {
-            builder = builder.clang_arg(format!("--target={triple}"));
+            if command_succeeds(
+                "clang",
+                &[
+                    &format!("--target={triple}"),
+                    "-dM",
+                    "-E",
+                    "-x",
+                    "c",
+                    "-",
+                ],
+            ) {
+                builder = builder.clang_arg(format!("--target={triple}"));
+            }
 
             if let Some(gcc_include) = command_stdout(cc, &["-print-file-name=include"]) {
                 builder = builder.clang_arg(format!("-isystem{gcc_include}"));
