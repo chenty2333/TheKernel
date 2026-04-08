@@ -35,10 +35,10 @@ elseif (ARCH STREQUAL "riscv64")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=rv64gc -mabi=lp64d -mcmodel=medany")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv64gc -mabi=lp64d -mcmodel=medany")
 elseif (ARCH STREQUAL "loongarch64")
-    # Nix currently exposes LoongArch through a GNU hard-float cross toolchain
-    # wrapper under the musl-compatible name. For lwext4's freestanding C code
-    # we avoid forcing the soft-float ABI here so the headers and sysroot stay
-    # consistent with the available toolchain.
+    # Some environments expose LoongArch through a GNU hard-float cross
+    # toolchain wrapper under the musl-compatible name. For lwext4's
+    # freestanding C code we avoid forcing the soft-float ABI here so the
+    # headers and sysroot stay consistent with the available toolchain.
 endif()
 
 set(CMAKE_C_FLAGS "-fPIC -fno-builtin -ffreestanding -fno-omit-frame-pointer ${CMAKE_C_FLAGS}")

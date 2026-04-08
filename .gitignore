@@ -10,7 +10,13 @@
 /kernel-la
 /.cargo
 /.crates*
+/.state
+/.tmp
 /.direnv
 /mnt
 *.swp
 *.swo
+*.log
+*.pcap
+score.txt
+*out

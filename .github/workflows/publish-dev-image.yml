@@ -1,0 +1,79 @@
+name: Publish Dev Image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "dev-env/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Load Image Versions
+        shell: bash
+        run: |
+          set -a
+          source dev-env/versions.env
+          set +a
+
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          repo="${repo,,}"
+
+          {
+            echo "DEBIAN_IMAGE=${DEBIAN_IMAGE}"
+            echo "RUST_TOOLCHAIN=${RUST_TOOLCHAIN}"
+            echo "QEMU_VERSION=${QEMU_VERSION}"
+            echo "RISCV64_MUSL_TOOLCHAIN_URL=${RISCV64_MUSL_TOOLCHAIN_URL}"
+            echo "LOONGARCH64_MUSL_TOOLCHAIN_URL=${LOONGARCH64_MUSL_TOOLCHAIN_URL}"
+            echo "IMAGE_NAME=ghcr.io/${owner}/${repo}-dev"
+          } >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-
+
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./dev-env
+          file: ./dev-env/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            DEBIAN_IMAGE=${{ env.DEBIAN_IMAGE }}
+            RUST_TOOLCHAIN=${{ env.RUST_TOOLCHAIN }}
+            QEMU_VERSION=${{ env.QEMU_VERSION }}
+            RISCV64_MUSL_TOOLCHAIN_URL=${{ env.RISCV64_MUSL_TOOLCHAIN_URL }}
+            LOONGARCH64_MUSL_TOOLCHAIN_URL=${{ env.LOONGARCH64_MUSL_TOOLCHAIN_URL }}

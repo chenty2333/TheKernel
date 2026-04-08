@@ -149,7 +149,6 @@ find_libgcc_for_arch() {
             ;;
     esac
 
-    find /nix/store -path "$search_hint" 2>/dev/null | head -n 1 && return 0
     find /usr /lib /lib64 -path "$search_hint" 2>/dev/null | head -n 1 && return 0
 
     return 1

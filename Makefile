@@ -7,7 +7,9 @@ DWARF ?= y
 export DWARF
 MEMTRACK ?= n
 export MEMTRACK
-export OSKERNEL_DEV_IMAGE ?= oskernel-dev:local
+export OSKERNEL_DEV_IMAGE ?= thekernel-dev:local
+DEV_ENV_DIR ?= $(ROOT_DIR)/dev-env
+EMPTY_TESTSUITE_DIR ?= $(ROOT_DIR)/.state/empty-testsuites
 
 # QEMU Options
 export BLK := y
@@ -59,11 +61,19 @@ legacy-clean:
 defconfig:
 	@$(MAKE) -C make $@
 
-justrun:
-	@./scripts/oscomp.sh run --arch $(ARCH) --skip-kernel-build $(OSCOMP_ARGS)
+dev-image:
+	@mkdir -p "$(EMPTY_TESTSUITE_DIR)"
+	@OSCOMP_TESTSUITE_HOST_DIR="$(EMPTY_TESTSUITE_DIR)" docker compose --env-file "$(DEV_ENV_DIR)/versions.env" -f "$(DEV_ENV_DIR)/compose.yaml" build dev
 
-docker-shell:
-	@OSKERNEL_DEV_IMAGE="$(OSKERNEL_DEV_IMAGE)" ./scripts/docker-shell.sh
+dev-check:
+	@mkdir -p "$(EMPTY_TESTSUITE_DIR)"
+	@OSCOMP_TESTSUITE_HOST_DIR="$(EMPTY_TESTSUITE_DIR)" docker compose --env-file "$(DEV_ENV_DIR)/versions.env" -f "$(DEV_ENV_DIR)/compose.yaml" run --rm dev oskernel-image-check
+
+dev-shell:
+	@OSKERNEL_DEV_IMAGE="$(OSKERNEL_DEV_IMAGE)" ./scripts/dev-shell.sh
+
+dev-shell-root:
+	@OSKERNEL_DEV_IMAGE="$(OSKERNEL_DEV_IMAGE)" ./scripts/dev-shell.sh --service builder -- bash
 
 clean:
 	@$(MAKE) -C make clean
@@ -105,9 +115,6 @@ kernel-la:
 disk.img:
 	@bash ./scripts/build-oscomp-support-disk.sh --arch both --output "$@"
 
-ci-test:
-	./scripts/ci-test.py $(ARCH)
-
 # Aliases
 rv:
 	$(MAKE) ARCH=riscv64 run
@@ -115,10 +122,7 @@ rv:
 la:
 	$(MAKE) ARCH=loongarch64 run
 
-vf2:
-	$(MAKE) ARCH=riscv64 APP_FEATURES=vf2 MYPLAT=axplat-riscv64-visionfive2 BUS=mmio build
-
-.PHONY: all build run eval-rv eval-la justrun docker-shell debug disasm clean legacy-clean check-eval-kernel-size kernel-rv kernel-la disk.img
+.PHONY: all build run eval-rv eval-la dev-image dev-check dev-shell dev-shell-root debug disasm clean legacy-clean check-eval-kernel-size kernel-rv kernel-la disk.img
 check-eval-kernel-size:
 	@for kernel in $(ROOT_DIR)/kernel-rv $(ROOT_DIR)/kernel-la; do \
 		[ -f "$$kernel" ] || continue; \
