@@ -289,7 +289,9 @@ impl AddrSpace {
 
     /// Removes all mappings in the address space.
     pub fn clear(&mut self) {
-        self.areas.clear(&mut self.pt).unwrap();
+        if let Err(err) = self.areas.clear(&mut self.pt) {
+            warn!("AddrSpace::clear: failed to unmap all areas: {err:?}");
+        }
     }
 
     /// Checks whether an access to the specified memory region is valid.

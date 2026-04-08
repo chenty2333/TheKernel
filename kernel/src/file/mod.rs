@@ -34,7 +34,7 @@ use linux_raw_sys::general::{RLIMIT_NOFILE, stat, statx, statx_timestamp};
 use spin::RwLock;
 
 pub use self::{
-    fs::{Directory, File, resolve_at, with_fs},
+    fs::{Directory, File, ResolveAtResult, resolve_at, with_fs},
     net::Socket,
     pidfd::PidFd,
     pipe::Pipe,

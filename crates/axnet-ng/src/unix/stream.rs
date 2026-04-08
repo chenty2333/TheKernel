@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use axerrno::{AxError, AxResult};
 use axio::{IoBuf, Read, Write};
 use axpoll::{IoEvents, PollSet, Pollable};
-use axsync::Mutex;
+use axsync::spin::SpinNoIrq as Mutex;
 use ringbuf::{
     HeapCons, HeapProd, HeapRb,
     traits::{Consumer, Observer, Producer, Split},

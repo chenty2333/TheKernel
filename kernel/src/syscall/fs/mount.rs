@@ -194,6 +194,7 @@ pub fn sys_move_mount(
         mount_fd.source.clone(),
         target_path,
         mount_fd.fs_type.clone(),
+        0,
     );
     Ok(0)
 }
@@ -202,7 +203,7 @@ pub fn sys_mount(
     source: *const c_char,
     target: *const c_char,
     fs_type: *const c_char,
-    _flags: i32,
+    flags: i32,
     _data: *const c_void,
 ) -> AxResult<isize> {
     let source = vm_load_string(source)?;
@@ -252,7 +253,7 @@ pub fn sys_mount(
         .absolute_path()
         .map_err(|_| AxError::InvalidInput)?
         .to_string();
-    mounts::record(source, target_path, normalized_fs.to_string());
+    mounts::record(source, target_path, normalized_fs.to_string(), flags as u32);
 
     Ok(0)
 }

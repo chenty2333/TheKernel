@@ -81,9 +81,94 @@ require_cmd() {
     }
 }
 
-find_libgcc() {
-    local pattern=$1
-    find /nix/store -path "$pattern" 2>/dev/null | head -n 1
+find_first_existing() {
+    for candidate in "$@"; do
+        [ -n "$candidate" ] || continue
+        [ -f "$candidate" ] && {
+            printf '%s\n' "$candidate"
+            return 0
+        }
+    done
+    return 1
+}
+
+compiler_reported_libgcc() {
+    local compiler=$1
+    command -v "$compiler" >/dev/null 2>&1 || return 1
+
+    local reported
+    reported=$("$compiler" -print-file-name=libgcc_s.so.1 2>/dev/null || true)
+    case "$reported" in
+        ''|libgcc_s.so.1)
+            ;;
+        *)
+            [ -f "$reported" ] && {
+                printf '%s\n' "$reported"
+                return 0
+            }
+            ;;
+    esac
+
+    local sysroot
+    sysroot=$("$compiler" -print-sysroot 2>/dev/null || true)
+    if [ -n "$sysroot" ] && [ -d "$sysroot" ]; then
+        find_first_existing \
+            "$sysroot/lib/libgcc_s.so.1" \
+            "$sysroot/lib64/libgcc_s.so.1" \
+            "$sysroot/usr/lib/libgcc_s.so.1" \
+            "$sysroot/usr/lib64/libgcc_s.so.1" && return 0
+        find "$sysroot" -name 'libgcc_s.so.1' 2>/dev/null | head -n 1 && return 0
+    fi
+
+    return 1
+}
+
+find_libgcc_for_arch() {
+    local arch=$1
+    local env_override=""
+    local search_hint=""
+
+    case "$arch" in
+        rv)
+            env_override=${OSCOMP_RV_LIBGCC:-}
+            search_hint='*riscv*libgcc_s.so.1'
+            find_first_existing "$env_override" && return 0
+            compiler_reported_libgcc riscv64-linux-musl-gcc && return 0
+            compiler_reported_libgcc riscv64-linux-gnu-gcc && return 0
+            ;;
+        la)
+            env_override=${OSCOMP_LA_LIBGCC:-}
+            search_hint='*loongarch*libgcc_s.so.1'
+            find_first_existing "$env_override" && return 0
+            compiler_reported_libgcc loongarch64-linux-musl-gcc && return 0
+            compiler_reported_libgcc loongarch64-linux-gnu-gcc && return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    find /nix/store -path "$search_hint" 2>/dev/null | head -n 1 && return 0
+    find /usr /lib /lib64 -path "$search_hint" 2>/dev/null | head -n 1 && return 0
+
+    return 1
+}
+
+find_locale_source() {
+    find_first_existing \
+        /usr/lib/locale/C.utf8/LC_CTYPE \
+        /usr/lib/locale/C.UTF-8/LC_CTYPE >/dev/null 2>&1 || return 1
+
+    if [ -d /usr/lib/locale/C.utf8 ]; then
+        printf '%s\n' /usr/lib/locale/C.utf8
+        return 0
+    fi
+    if [ -d /usr/lib/locale/C.UTF-8 ]; then
+        printf '%s\n' /usr/lib/locale/C.UTF-8
+        return 0
+    fi
+
+    return 1
 }
 
 require_cmd mke2fs
@@ -99,8 +184,8 @@ require_cmd awk
     exit 1
 }
 
-RV_LIBGCC_SOURCE=$(find_libgcc '*riscv*libgcc_s.so.1')
-LA_LIBGCC_SOURCE=$(find_libgcc '*loongarch*libgcc_s.so.1')
+RV_LIBGCC_SOURCE=$(find_libgcc_for_arch rv || true)
+LA_LIBGCC_SOURCE=$(find_libgcc_for_arch la || true)
 
 case "$ARCH" in
     rv)
@@ -130,9 +215,9 @@ case "$ARCH" in
         ;;
 esac
 
-LOCALE_SOURCE=/usr/lib/locale/C.utf8
-[ -d "$LOCALE_SOURCE" ] || {
-    printf 'missing locale directory: %s\n' "$LOCALE_SOURCE" >&2
+LOCALE_SOURCE=$(find_locale_source || true)
+[ -n "$LOCALE_SOURCE" ] || {
+    printf 'missing locale directory: expected /usr/lib/locale/C.utf8 or /usr/lib/locale/C.UTF-8\n' >&2
     exit 1
 }
 

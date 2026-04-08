@@ -1,12 +1,9 @@
 use alloc::vec::Vec;
 
 use axerrno::{AxError, AxResult};
-use axhal::{time::TimeValue, uspace::UserContext};
+use axhal::{time::{TimeValue, wall_time}, uspace::UserContext};
 use axpoll::IoEvents;
-use axtask::{
-    current,
-    future::{self, block_on, poll_io},
-};
+use axtask::current;
 use linux_raw_sys::general::{POLLNVAL, pollfd, timespec};
 use starry_signal::SignalSet;
 
@@ -55,41 +52,46 @@ fn do_poll(
         return Ok(res);
     }
     let fds = FdPollSet(fds);
-    let deadline = timeout.map(|dur| axhal::time::wall_time().saturating_add(dur));
+    let deadline = timeout.map(|dur| wall_time().saturating_add(dur));
     let mut poll_once = || {
-        block_on(future::timeout(
-            deadline.map(|end| end.saturating_sub(axhal::time::wall_time())),
-            poll_io(&fds, IoEvents::empty(), false, || {
-                let mut res = 0usize;
-                for ((fd, events), revents) in fds.0.iter().zip(revents.iter_mut()) {
-                    let mut result = fd.poll();
-                    if result.contains(IoEvents::IN) {
-                        result |= IoEvents::RDNORM;
-                    }
-                    if result.contains(IoEvents::OUT) {
-                        result |= IoEvents::WRNORM;
-                    }
-                    result &= *events;
+        let mut res = 0usize;
+        for ((fd, events), revents) in fds.0.iter().zip(revents.iter_mut()) {
+            let mut result = fd.poll();
+            if result.contains(IoEvents::IN) {
+                result |= IoEvents::RDNORM;
+            }
+            if result.contains(IoEvents::OUT) {
+                result |= IoEvents::WRNORM;
+            }
+            result &= *events;
 
-                    **revents = result.bits() as _;
-                    if **revents != 0 {
-                        res += 1;
-                    }
-                }
-                if res > 0 {
-                    Ok(res as _)
-                } else {
-                    Err(AxError::WouldBlock)
-                }
-            }),
-        ))
+            **revents = result.bits() as _;
+            if **revents != 0 {
+                res += 1;
+            }
+        }
+
+        if res > 0 {
+            Ok(res as isize)
+        } else {
+            Err(AxError::WouldBlock)
+        }
     };
 
     let Some(sigmask) = sigmask else {
-        return match poll_once() {
-            Ok(r) => r,
-            Err(_) => Ok(0),
-        };
+        loop {
+            match poll_once() {
+                Ok(r) => return Ok(r),
+                Err(AxError::WouldBlock) => {}
+                Err(err) => return Err(err),
+            }
+
+            if deadline.is_some_and(|end| wall_time() >= end) {
+                return Ok(0);
+            }
+
+            axtask::yield_now();
+        }
     };
     let Some(uctx) = uctx else {
         return Err(AxError::InvalidInput);
@@ -100,19 +102,24 @@ fn do_poll(
     let old_blocked = thr.signal.set_blocked(sigmask);
     let result = loop {
         match poll_once() {
-            Ok(Ok(res)) => break Ok(res),
-            Ok(Err(AxError::Interrupted)) => {
-                let handler_depth = thr.signal_handler_depth();
-                if check_signals(thr, uctx, Some(old_blocked)) {
-                    if thr.signal_handler_depth() == handler_depth {
-                        thr.signal.set_blocked(old_blocked);
-                    }
-                    break Err(AxError::Interrupted);
-                }
-            }
-            Ok(Err(err)) => break Err(err),
-            Err(_) => break Ok(0),
+            Ok(res) => break Ok(res),
+            Err(AxError::WouldBlock) => {}
+            Err(err) => break Err(err),
         }
+
+        let handler_depth = thr.signal_handler_depth();
+        if check_signals(thr, uctx, Some(old_blocked)) {
+            if thr.signal_handler_depth() == handler_depth {
+                thr.signal.set_blocked(old_blocked);
+            }
+            break Err(AxError::Interrupted);
+        }
+
+        if deadline.is_some_and(|end| wall_time() >= end) {
+            break Ok(0);
+        }
+
+        axtask::yield_now();
     };
     if !matches!(result, Err(AxError::Interrupted)) {
         thr.signal.set_blocked(old_blocked);

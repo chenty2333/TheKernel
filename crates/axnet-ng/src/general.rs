@@ -4,9 +4,9 @@ use core::{
     time::Duration,
 };
 
-use axerrno::AxResult;
+use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, Pollable};
-use axtask::future::{block_on, poll_io, timeout};
+use axtask::yield_now;
 
 use crate::{
     consts::{TCP_RX_BUF_LEN, TCP_TX_BUF_LEN},
@@ -87,10 +87,7 @@ impl GeneralOptions {
         pollable: &P,
         f: F,
     ) -> AxResult<T> {
-        block_on(timeout(
-            self.send_timeout(),
-            poll_io(pollable, IoEvents::OUT, self.nonblocking(), f),
-        ))?
+        self.run_poller(pollable, IoEvents::OUT, self.send_timeout(), f)
     }
 
     pub fn recv_poller<P: Pollable, F: FnMut() -> AxResult<T>, T>(
@@ -98,10 +95,35 @@ impl GeneralOptions {
         pollable: &P,
         f: F,
     ) -> AxResult<T> {
-        block_on(timeout(
-            self.recv_timeout(),
-            poll_io(pollable, IoEvents::IN, self.nonblocking(), f),
-        ))?
+        self.run_poller(pollable, IoEvents::IN, self.recv_timeout(), f)
+    }
+
+    fn run_poller<P: Pollable, F: FnMut() -> AxResult<T>, T>(
+        &self,
+        pollable: &P,
+        interest: IoEvents,
+        timeout: Option<Duration>,
+        mut f: F,
+    ) -> AxResult<T> {
+        let deadline = timeout.map(|dur| axhal::time::wall_time().saturating_add(dur));
+
+        loop {
+            match f() {
+                Err(AxError::WouldBlock) if !self.nonblocking() => {}
+                other => return other,
+            }
+
+            let events = pollable.poll();
+            if events.intersects(interest | IoEvents::ALWAYS_POLL) {
+                continue;
+            }
+
+            if deadline.is_some_and(|end| axhal::time::wall_time() >= end) {
+                return Err(AxError::TimedOut);
+            }
+
+            yield_now();
+        }
     }
 }
 impl Configurable for GeneralOptions {
