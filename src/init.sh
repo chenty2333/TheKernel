@@ -152,6 +152,16 @@ EOF
     chmod +x "$file_path" 2>/dev/null || true
 }
 
+install_bash_compat() {
+    if /bin/bash -c 'exit 0' >/dev/null 2>&1; then
+        return 0
+    fi
+
+    bb rm -f /bin/bash 2>/dev/null || true
+    ensure_executable_script /bin/bash '#!/bin/sh
+exec /bin/sh "$@"'
+}
+
 install_locale_tool() {
     [ -x /usr/bin/locale ] && return 0
     ensure_executable_script /usr/bin/locale '#!/bin/sh
@@ -177,6 +187,18 @@ case "$cmd" in
         echo "${LC_ALL:-${LANG:-C}}"
         ;;
 esac'
+}
+
+install_systemd_detect_virt_tool() {
+    [ -x /usr/bin/systemd-detect-virt ] && return 0
+    ensure_executable_script /usr/bin/systemd-detect-virt '#!/bin/sh
+case "${1:-}" in
+    --quiet|-q)
+        exit 0
+        ;;
+esac
+echo qemu
+'
 }
 
 install_useradd_tool() {
@@ -293,13 +315,25 @@ mount_support_disk() {
             fi
         done
         if [ -n "$support_libgcc" ]; then
-            install_runtime_alias "$support_libgcc" /glibc/lib/libgcc_s.so.1 || true
-            install_runtime_alias "$support_libgcc" /lib/libgcc_s.so.1 || true
+            bb mkdir -p /glibc/lib /lib 2>/dev/null || true
+            bb cp "$support_libgcc" /glibc/lib/libgcc_s.so.1 2>/dev/null || true
+            bb cp "$support_libgcc" /lib/libgcc_s.so.1 2>/dev/null || true
         fi
         if [ -d /support/usr/lib/locale/C.UTF-8 ]; then
-            OSCOMP_SUPPORT_LOCPATH=/support/usr/lib/locale
+            bb mkdir -p /usr/lib/locale/C.UTF-8 2>/dev/null || true
+            bb cp -a /support/usr/lib/locale/C.UTF-8/. /usr/lib/locale/C.UTF-8/ 2>/dev/null || true
+            OSCOMP_SUPPORT_LOCPATH=/usr/lib/locale
             export OSCOMP_SUPPORT_LOCPATH
         fi
+        if [ -f /support/meta/ltp_test.txt ]; then
+            bb mkdir -p /etc/oscomp-ltp 2>/dev/null || true
+            bb cp /support/meta/ltp_test.txt /etc/oscomp-ltp/ltp_test.txt 2>/dev/null || true
+        fi
+        if [ -f /support/meta/oscomp_plan.txt ]; then
+            bb cp /support/meta/oscomp_plan.txt /etc/oscomp-plan.txt 2>/dev/null || true
+        fi
+        bb umount /support >/dev/null 2>&1 || true
+        bb rmdir /support >/dev/null 2>&1 || true
     else
         bb rmdir /support >/dev/null 2>&1 || true
     fi
@@ -319,7 +353,7 @@ run_pre2025_init_sequence() {
     [ -e /busybox ] || bb ln -sf /bin/busybox /busybox 2>/dev/null || true
     [ -e /bin/sh ] || bb ln -sf /bin/busybox /bin/sh 2>/dev/null || true
     [ -e /bin/ash ] || bb ln -sf /bin/busybox /bin/ash 2>/dev/null || true
-    [ -e /bin/bash ] || bb ln -sf /bin/sh /bin/bash 2>/dev/null || true
+    install_bash_compat
     if [ ! -e /usr/bin/env ]; then
         bb mkdir -p /usr/bin 2>/dev/null || true
         bb ln -sf /bin/env /usr/bin/env 2>/dev/null || true
@@ -347,6 +381,8 @@ run_pre2025_init_sequence() {
         "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin"
     write_file_lines /etc/group \
         "root:x:0:" \
+        "daemon:x:1:" \
+        "users:x:100:" \
         "nobody:x:65534:"
     if [ ! -s /etc/resolv.conf ]; then
         write_file_lines /etc/resolv.conf "nameserver 8.8.8.8"
@@ -357,6 +393,7 @@ run_pre2025_init_sequence() {
     bb mkdir -p /tmp/memfd 2>/dev/null || true
 
     install_locale_tool
+    install_systemd_detect_virt_tool
     install_useradd_tool
     mount_support_disk
 }
@@ -374,46 +411,161 @@ prepare_ltp_env() {
 
 support_ltp_subset_dir() {
     SUPPORT_LTP_TEST_LIST=""
-    [ -f /support/meta/ltp_test.txt ] || return 0
-    SUPPORT_LTP_TEST_LIST=/support/meta/ltp_test.txt
+    for candidate in /etc/oscomp-ltp/ltp_test.txt /support/meta/ltp_test.txt; do
+        [ -f "$candidate" ] || continue
+        SUPPORT_LTP_TEST_LIST="$candidate"
+        return 0
+    done
+    return 1
 }
 
-install_ltp_subset_overlay() {
+run_ltp_group() {
     root="$1"
-    support_ltp_subset_dir "$root"
+    support_ltp_subset_dir || {
+        echo "#### OSCOMP RUNNER MISSING LTP SUBSET LIST ####"
+        return 127
+    }
     test_list="$SUPPORT_LTP_TEST_LIST"
 
-    [ -n "$test_list" ] || return 0
-    [ -d "$root/ltp/testcases" ] || return 0
+    [ -d "$root/ltp/testcases" ] || {
+        echo "#### OSCOMP RUNNER MISSING LTP TESTCASES ${root}/ltp/testcases ####"
+        return 127
+    }
 
-    target_dir="$root/ltp/testcases/bin"
-    backup_dir="$root/ltp/testcases/bin.oscomp-full"
-
-    if [ ! -e "$backup_dir" ] && [ -d "$target_dir" ]; then
-        bb mv "$target_dir" "$backup_dir" 2>/dev/null || return 0
+    if ! cd "$root"; then
+        return 125
     fi
 
-    bb mkdir -p "$target_dir" 2>/dev/null || true
-    clear_dir_contents "$target_dir"
+    echo "#### OS COMP TEST GROUP START ltp ####"
 
+    ran_cases=0
     while IFS= read -r testcase || [ -n "$testcase" ]; do
         case "$testcase" in
             ''|\#*)
                 continue
                 ;;
         esac
-        src="$backup_dir/$testcase"
-        [ -e "$src" ] || continue
-        bb ln -sf "$src" "$target_dir/$testcase" 2>/dev/null || \
-            install_runtime_alias "$src" "$target_dir/$testcase" || true
+        testcase_path="ltp/testcases/bin/$testcase"
+        [ -f "$testcase_path" ] || {
+            echo "#### OSCOMP RUNNER MISSING LTP CASE ${root}/${testcase_path} ####"
+            return 127
+        }
+
+        ran_cases=$((ran_cases + 1))
+        echo "RUN LTP CASE $testcase"
+        "./$testcase_path"
+        ret=$?
+        echo "FAIL LTP CASE $testcase : $ret"
     done <"$test_list"
+
+    [ "$ran_cases" -gt 0 ] || {
+        echo "#### OSCOMP RUNNER EMPTY LTP SUBSET ${test_list} ####"
+        return 127
+    }
+
+    echo "#### OS COMP TEST GROUP END ltp ####"
+    return 0
 }
 
 prepare_lmbench_env() {
+    root="$1"
+    compat_dir=/code/lmbench_src/bin/build
+    compat_bin="$compat_dir/lmbench_all"
+    root_bin="$root/lmbench_all"
+
+    [ -x "$root_bin" ] || {
+        echo "#### OSCOMP RUNNER MISSING LMBENCH BIN ${root_bin} ####"
+        return 1
+    }
+
+    bb mkdir -p "$compat_dir" 2>/dev/null || true
+    bb rm -f "$compat_bin" 2>/dev/null || true
+    bb ln -sf "$root_bin" "$compat_bin" 2>/dev/null || \
+        bb cp "$root_bin" "$compat_bin" 2>/dev/null || {
+            echo "#### OSCOMP RUNNER FAILED TO PREPARE LMBENCH BIN ${compat_bin} ####"
+            return 1
+        }
+    chmod +x "$compat_bin" 2>/dev/null || true
+    return 0
+}
+
+prepare_iozone_stage() {
+    root="$1"
+    flavor="$2"
+    stage_dir="/var/tmp/oscomp-iozone-${flavor}"
+
+    bb rm -rf "$stage_dir" 2>/dev/null || true
+    bb mkdir -p "$stage_dir" 2>/dev/null || return 1
+
+    for entry in iozone_testcode.sh iozone busybox; do
+        [ -e "$root/$entry" ] || continue
+        bb cp "$root/$entry" "$stage_dir/$entry" 2>/dev/null || return 1
+        chmod +x "$stage_dir/$entry" 2>/dev/null || true
+    done
+
+    IOZONE_STAGE_DIR="$stage_dir"
+    export IOZONE_STAGE_DIR
+    return 0
+}
+
+cleanup_iozone_stage() {
+    if [ -n "${IOZONE_STAGE_DIR:-}" ] && [ -d "$IOZONE_STAGE_DIR" ]; then
+        bb rm -rf "$IOZONE_STAGE_DIR" 2>/dev/null || true
+    fi
+    IOZONE_STAGE_DIR=""
+    export IOZONE_STAGE_DIR
+}
+
+run_iozone_group() {
+    root="$1"
+    flavor="$2"
+    run_dir="$3"
+
+    if ! cd "$run_dir"; then
+        return 125
+    fi
+
+    iozone_busybox="./busybox"
+    [ -x "$iozone_busybox" ] || iozone_busybox="/bin/busybox"
+    iozone_bin="./iozone"
+    [ -x "$iozone_bin" ] || iozone_bin="$root/iozone"
+
+    [ -x "$iozone_busybox" ] || {
+        echo "#### OSCOMP RUNNER MISSING IOZONE BUSYBOX ${run_dir}/busybox ####"
+        return 127
+    }
+    [ -x "$iozone_bin" ] || {
+        echo "#### OSCOMP RUNNER MISSING IOZONE BIN ${root}/iozone ####"
+        return 127
+    }
+
+    "$iozone_busybox" echo "#### OS COMP TEST GROUP START iozone-${flavor} ####" || return $?
+    "$iozone_busybox" echo iozone automatic measurements || return $?
+    "$iozone_bin" -a -r 1k -s 4m || return $?
+    "$iozone_busybox" echo iozone throughput write/read measurements || return $?
+    "$iozone_bin" -t 4 -i 0 -i 1 -r 1k -s 1m || return $?
+    "$iozone_busybox" echo iozone throughput random-read measurements || return $?
+    "$iozone_bin" -t 4 -i 0 -i 2 -r 1k -s 1m || return $?
+    "$iozone_busybox" echo iozone throughput read-backwards measurements || return $?
+    "$iozone_bin" -t 4 -i 0 -i 3 -r 1k -s 1m || return $?
+    "$iozone_busybox" echo iozone throughput stride-read measurements || return $?
+    "$iozone_bin" -t 4 -i 0 -i 5 -r 1k -s 1m || return $?
+    "$iozone_busybox" echo iozone throughput fwrite/fread measurements || return $?
+    "$iozone_bin" -t 4 -i 6 -i 7 -r 1k -s 1m || return $?
+    "$iozone_busybox" echo iozone throughput pwrite/pread measurements || return $?
+    "$iozone_bin" -t 4 -i 9 -i 10 -r 1k -s 1m || return $?
+    "$iozone_busybox" echo iozone throughtput pwritev/preadv measurements || return $?
+    "$iozone_bin" -t 4 -i 11 -i 12 -r 1k -s 1m || return $?
+    "$iozone_busybox" echo "#### OS COMP TEST GROUP END iozone-${flavor} ####" || return $?
     return 0
 }
 
 reference_eval_plan() {
+    if [ -s /etc/oscomp-plan.txt ]; then
+        cat /etc/oscomp-plan.txt
+        return 0
+    fi
+
     cat <<'EOF'
 /musl basic
 /musl iozone
@@ -659,13 +811,108 @@ kill_process_group() {
         bb kill "-$sig" "$leader_pid" 2>/dev/null || true
 }
 
-print_group_output_filtered() {
+capture_process_snapshot() {
+    PROCESS_SNAPSHOT_PIDS=""
+
+    for proc_dir in /proc/[0-9]*; do
+        [ -d "$proc_dir" ] || continue
+        pid="${proc_dir#/proc/}"
+        append_word PROCESS_SNAPSHOT_PIDS "$pid"
+    done
+}
+
+process_in_snapshot() {
+    contains_word "$1" $PROCESS_SNAPSHOT_PIDS
+}
+
+dump_leaked_process_sample() {
+    sample_limit=12
+    sample_count=0
+
+    for pid in "$@"; do
+        [ "$sample_count" -lt "$sample_limit" ] || break
+        [ -r "/proc/${pid}/stat" ] || continue
+
+        stat_fields="$(bb awk '{ print $1, $3, $4, $20, $32 }' "/proc/${pid}/stat" 2>/dev/null || true)"
+        stat_pid="$(echo "$stat_fields" | bb awk '{ print $1 }' 2>/dev/null || true)"
+        state="$(echo "$stat_fields" | bb awk '{ print $2 }' 2>/dev/null || true)"
+        ppid="$(echo "$stat_fields" | bb awk '{ print $3 }' 2>/dev/null || true)"
+        num_threads="$(echo "$stat_fields" | bb awk '{ print $4 }' 2>/dev/null || true)"
+        blocked_mask="$(echo "$stat_fields" | bb awk '{ print $5 }' 2>/dev/null || true)"
+        comm="$(cat "/proc/${pid}/comm" 2>/dev/null || true)"
+        tgid="$(bb awk '/^Tgid:/ { print $2 }' "/proc/${pid}/status" 2>/dev/null || true)"
+        [ -n "$comm" ] || comm="?"
+
+        echo "#### OSCOMP RUNNER LEAK SAMPLE PID ${pid} STATPID ${stat_pid:-?} TGID ${tgid:-?} STATE ${state:-?} PPID ${ppid:-?} THREADS ${num_threads:-?} SIGBLK ${blocked_mask:-?} COMM ${comm} ####"
+        sample_count=$((sample_count + 1))
+    done
+}
+
+cleanup_new_processes_since_snapshot() {
+    cleanup_round=1
+    last_leaked_pids=""
+
+    while [ "$cleanup_round" -le 5 ]; do
+        leaked_pids=""
+
+        for proc_dir in /proc/[0-9]*; do
+            [ -d "$proc_dir" ] || continue
+            pid="${proc_dir#/proc/}"
+            case "$pid" in
+                ''|*[!0-9]*)
+                    continue
+                    ;;
+                1|$$)
+                    continue
+                    ;;
+            esac
+            process_in_snapshot "$pid" && continue
+            append_word leaked_pids "$pid"
+        done
+
+        [ -n "$leaked_pids" ] || return 0
+        last_leaked_pids="$leaked_pids"
+
+        echo "#### OSCOMP RUNNER CLEANUP LEAKED PIDS ROUND $cleanup_round ${leaked_pids} ####"
+        for pid in $leaked_pids; do
+            kill_process_tree TERM "$pid"
+        done
+        bb sleep 1
+        for pid in $leaked_pids; do
+            kill_process_tree KILL "$pid"
+        done
+        # Stray grandchildren are reparented to pid 1 when the group shell exits.
+        # Reap any adopted zombies here so they stop accumulating across groups.
+        for pid in $leaked_pids; do
+            wait "$pid" 2>/dev/null || true
+        done
+        bb sleep 1
+        cleanup_round=$((cleanup_round + 1))
+    done
+
+    dump_leaked_process_sample $last_leaked_pids
+    return 0
+}
+
+stream_group_output_incremental() {
     output_file="$1"
+    streamed_bytes="$2"
+    STREAM_GROUP_OUTPUT_BYTES="$streamed_bytes"
+
     [ -f "$output_file" ] || return 0
 
-    while IFS= read -r line || [ -n "$line" ]; do
-        printf '%s\n' "$line"
-    done < "$output_file"
+    current_size="$(wc -c < "$output_file" 2>/dev/null || echo "$streamed_bytes")"
+    case "$current_size" in
+        ''|*[!0-9]*)
+            return 0
+            ;;
+    esac
+    [ "$current_size" -gt "$streamed_bytes" ] || return 0
+
+    start_byte=$((streamed_bytes + 1))
+    bytes_to_emit=$((current_size - streamed_bytes))
+    bb tail -c +"$start_byte" "$output_file" | bb head -c "$bytes_to_emit"
+    STREAM_GROUP_OUTPUT_BYTES="$current_size"
 }
 
 run_group_script() {
@@ -688,6 +935,9 @@ run_group_script() {
     timeout_secs="$RUNNER_GROUP_TIMEOUT_SECS"
     output_file="/tmp/oscomp-${group}-${flavor}.log"
     : > "$output_file"
+    capture_process_snapshot
+    run_dir="$root"
+    run_script_name="${script##*/}"
 
     if [ "$group" = "ltp" ]; then
         if [ ! -d "$root/ltp" ]; then
@@ -695,14 +945,22 @@ run_group_script() {
             echo "#### OSCOMP RUNNER END ${script} STATUS 127 ####"
             return 127
         fi
-        install_ltp_subset_overlay "$root"
         prepare_ltp_env
     elif [ "$group" = "lmbench" ]; then
-        prepare_lmbench_env "$root"
+        prepare_lmbench_env "$root" || {
+            echo "#### OSCOMP RUNNER END ${script} STATUS 127 ####"
+            return 127
+        }
+    elif [ "$group" = "iozone" ]; then
+        prepare_iozone_stage "$root" "$flavor" || true
+        if [ -n "${IOZONE_STAGE_DIR:-}" ] && [ -d "$IOZONE_STAGE_DIR" ]; then
+            run_dir="$IOZONE_STAGE_DIR"
+            run_script_name="iozone_testcode.sh"
+        fi
     fi
 
     (
-        cd "$root" || exit 125
+        cd "$run_dir" || exit 125
         build_group_path "$root"
         if [ "$group" = "ltp" ] && [ -d "$root/ltp" ]; then
             export LTPROOT="$root/ltp"
@@ -735,9 +993,10 @@ run_group_script() {
             export ENOUGH="${OSCOMP_LMBENCH_ENOUGH:-10000}"
         fi
 
-        script_name="${script##*/}"
         script_shell=""
-        if pick_busybox_for_root "$root"; then
+        if [ "$group" = "iozone" ] && [ -x "$run_dir/busybox" ]; then
+            script_shell="$run_dir/busybox"
+        elif pick_busybox_for_root "$root"; then
             script_shell="$PICK_BUSYBOX_FOR_ROOT_RESULT"
         elif [ -x /bin/sh ]; then
             script_shell=/bin/sh
@@ -748,15 +1007,27 @@ run_group_script() {
             exit 127
         fi
 
-        if [ "${script_shell##*/}" = "busybox" ]; then
-            exec "$script_shell" sh "./$script_name" </dev/null
+        if [ "$group" = "iozone" ]; then
+            run_iozone_group "$root" "$flavor" "$run_dir"
+            exit $?
         fi
-        exec "$script_shell" "./$script_name" </dev/null
+        if [ "$group" = "ltp" ]; then
+            run_ltp_group "$root"
+            exit $?
+        fi
+
+        if [ "${script_shell##*/}" = "busybox" ]; then
+            exec "$script_shell" sh "./$run_script_name" </dev/null
+        fi
+        exec "$script_shell" "./$run_script_name" </dev/null
     ) >"$output_file" 2>&1 &
     runner_pid=$!
     timed_out=""
     elapsed=0
+    streamed_bytes=0
     while kill -0 "$runner_pid" 2>/dev/null; do
+        stream_group_output_incremental "$output_file" "$streamed_bytes"
+        streamed_bytes="$STREAM_GROUP_OUTPUT_BYTES"
         if [ "$elapsed" -ge "$timeout_secs" ]; then
             timed_out=1
             echo "#### OSCOMP RUNNER TIMEOUT ${script} AFTER ${timeout_secs}s ####"
@@ -777,7 +1048,9 @@ run_group_script() {
         status=124
     fi
     refresh_runner_timeout_state
-    print_group_output_filtered "$output_file"
+    stream_group_output_incremental "$output_file" "$streamed_bytes"
+    cleanup_new_processes_since_snapshot
+    cleanup_iozone_stage
     echo "#### OSCOMP RUNNER END ${script} STATUS ${status} ####"
     bb rm -f "$output_file" 2>/dev/null || true
     return "$status"

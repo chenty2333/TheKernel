@@ -69,8 +69,8 @@ const TIMEX_SETTABLE_STATUS_BITS: i32 = STA_PLL
     | STA_UNSYNC
     | STA_FREQHOLD
     | STA_MODE;
-const TIMEX_SETTABLE_MODES: u32 =
-    ADJ_ALL | ADJ_OFFSET_SINGLESHOT | ADJ_OFFSET_SS_READ | ADJ_MICRO | ADJ_NANO;
+const TIMEX_SETTABLE_BIT_MODES: u32 = ADJ_ALL | ADJ_MICRO | ADJ_NANO;
+const ADJ_SINGLESHOT_FLAG: u32 = ADJ_OFFSET_SINGLESHOT & !ADJ_OFFSET;
 
 fn clock_domain(clock_id: __kernel_clockid_t) -> AxResult<ClockDomain> {
     match clock_id as u32 {
@@ -230,6 +230,14 @@ fn timex_resolution_is_nanos(modes: u32, state: TimexState) -> bool {
     }
 }
 
+fn timex_modes_supported(modes: u32) -> bool {
+    match modes {
+        0 | ADJ_OFFSET_SINGLESHOT | ADJ_OFFSET_SS_READ => true,
+        _ if modes & ADJ_SINGLESHOT_FLAG != 0 => false,
+        _ => modes & !TIMEX_SETTABLE_BIT_MODES == 0,
+    }
+}
+
 fn fill_timex_output(timex: &mut KernelOldTimex, state: TimexState) {
     timex.modes = state.resolution_mode();
     timex.offset = state.offset;
@@ -256,7 +264,7 @@ fn fill_timex_output(timex: &mut KernelOldTimex, state: TimexState) {
 fn update_timex_state(state: &mut TimexState, timex: &KernelOldTimex) -> AxResult<()> {
     let modes = timex.modes;
 
-    if modes & !TIMEX_SETTABLE_MODES != 0 {
+    if !timex_modes_supported(modes) {
         return Err(AxError::InvalidInput);
     }
 
@@ -477,6 +485,14 @@ mod tests {
             quantize_clock_reading(TimeValue::from_nanos(123_456_789), TimeValue::from_nanos(1)),
             TimeValue::from_nanos(123_456_789)
         );
+    }
+
+    #[test]
+    fn timex_modes_reject_invalid_singleshot_marker() {
+        assert!(timex_modes_supported(0));
+        assert!(timex_modes_supported(ADJ_OFFSET_SINGLESHOT));
+        assert!(timex_modes_supported(ADJ_OFFSET_SS_READ));
+        assert!(!timex_modes_supported(ADJ_SINGLESHOT_FLAG));
     }
 }
 

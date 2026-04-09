@@ -1,12 +1,13 @@
 use core::{
+    future::poll_fn,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    task::Waker,
+    task::{Poll, Waker},
     time::Duration,
 };
 
 use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, Pollable};
-use axtask::yield_now;
+use axtask::future::{block_on, interruptible, timeout_at};
 
 use crate::{
     consts::{TCP_RX_BUF_LEN, TCP_TX_BUF_LEN},
@@ -122,7 +123,25 @@ impl GeneralOptions {
                 return Err(AxError::TimedOut);
             }
 
-            yield_now();
+            match block_on(timeout_at(
+                deadline,
+                interruptible(poll_fn(|cx| {
+                    if pollable.poll().intersects(interest | IoEvents::ALWAYS_POLL) {
+                        return Poll::Ready(());
+                    }
+
+                    pollable.register(cx, interest);
+                    if pollable.poll().intersects(interest | IoEvents::ALWAYS_POLL) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })),
+            )) {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(AxError::Interrupted),
+                Err(_) => return Err(AxError::TimedOut),
+            }
         }
     }
 }

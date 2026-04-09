@@ -18,6 +18,7 @@ use uluru::LRUCache;
 
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
+    file::permission::check_current_execute_permissions,
     mm::aspace::{AddrSpace, Backend},
 };
 
@@ -180,6 +181,7 @@ impl ElfLoader {
 
     fn load(&mut self, uspace: &mut AddrSpace, path: &str) -> AxResult<LoadResult> {
         let loc = FS_CONTEXT.lock().resolve(path)?;
+        check_current_execute_permissions(&loc)?;
 
         if !self.0.touch(|e| e.borrow_cache().location().ptr_eq(&loc)) {
             match ElfCacheEntry::load(loc)? {
@@ -368,7 +370,7 @@ pub fn load_user_app(
         Backend::new_alloc(ustack_start, PageSize::Size4K),
     )?;
 
-    let stack_data = app_stack_region(args, envs, &auxv, ustack_top.into());
+    let stack_data = app_stack_region(args, envs, &auxv, path, ustack_top.into());
     let user_sp = ustack_top - stack_data.len();
     let user_sp_aligned = user_sp.align_down_4k();
     uspace.populate_area(

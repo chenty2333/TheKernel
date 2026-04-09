@@ -27,7 +27,7 @@
 //!
 //! More details can be found in the link: <https://articles.manugarg.com/aboutelfauxiliaryvectors.html>
 
-use alloc::{collections::VecDeque, string::String, vec::Vec};
+use alloc::{borrow::Cow, collections::VecDeque, string::String, vec, vec::Vec};
 
 use zerocopy::IntoBytes;
 
@@ -40,6 +40,7 @@ use crate::auxv::{AuxEntry, AuxType};
 /// * `args` - Arguments of the application
 /// * `envs` - Environment variables of the application
 /// * `auxv` - Auxiliary vectors of the application
+/// * `execfn` - Executable path used for AT_EXECFN
 /// * `sp`   - Highest address of the stack
 ///
 /// # Return
@@ -49,7 +50,18 @@ use crate::auxv::{AuxEntry, AuxType};
 /// # Notes
 ///
 /// The detailed format is described in <https://articles.manugarg.com/aboutelfauxiliaryvectors.html>
-pub fn app_stack_region(args: &[String], envs: &[String], auxv: &[AuxEntry], sp: usize) -> Vec<u8> {
+pub fn app_stack_region(
+    args: &[String],
+    envs: &[String],
+    auxv: &[AuxEntry],
+    execfn: &str,
+    sp: usize,
+) -> Vec<u8> {
+    let args: Cow<'_, [String]> = if args.is_empty() {
+        Cow::Owned(vec![String::new()])
+    } else {
+        Cow::Borrowed(args)
+    };
     let mut data = VecDeque::new();
     let mut push = |src: &[u8]| -> usize {
         data.extend(src.iter().cloned());
@@ -59,6 +71,8 @@ pub fn app_stack_region(args: &[String], envs: &[String], auxv: &[AuxEntry], sp:
 
     // define a random string with 16 bytes
     let random_str_pos = push("0123456789abcdef".as_bytes());
+    push(b"\0");
+    let execfn_pos = push(execfn.as_bytes());
     // Push arguments and environment variables
     let envs_slice: Vec<_> = envs
         .iter()
@@ -109,7 +123,7 @@ pub fn app_stack_region(args: &[String], envs: &[String], auxv: &[AuxEntry], sp:
     }
     push(AuxEntry::new(AuxType::NULL, 0).as_bytes());
     if !has_execfn {
-        push(AuxEntry::new(AuxType::EXECFN, argv_slice[0]).as_bytes());
+        push(AuxEntry::new(AuxType::EXECFN, execfn_pos).as_bytes());
     }
     if !has_random {
         push(AuxEntry::new(AuxType::RANDOM, random_str_pos).as_bytes());
@@ -131,4 +145,24 @@ pub fn app_stack_region(args: &[String], envs: &[String], auxv: &[AuxEntry], sp:
     result.extend_from_slice(first);
     result.extend_from_slice(second);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::app_stack_region;
+
+    #[test]
+    fn app_stack_region_normalizes_empty_argv() {
+        let stack = app_stack_region(&[], &[], &[], "/bin/true", 0x10000);
+        assert!(!stack.is_empty());
+        let argc = usize::from_ne_bytes(stack[..core::mem::size_of::<usize>()].try_into().unwrap());
+        let argv0 = usize::from_ne_bytes(
+            stack[core::mem::size_of::<usize>()..2 * core::mem::size_of::<usize>()]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(argc, 1);
+        assert_ne!(argv0, 0);
+        assert!(stack.windows("/bin/true".len()).any(|w| w == b"/bin/true"));
+    }
 }

@@ -1,8 +1,7 @@
 use alloc::{format, string::ToString, sync::Arc};
 use core::{
     ffi::{c_char, c_int},
-    mem,
-    ops::{Deref, DerefMut},
+    ops::Deref,
 };
 
 use axerrno::{AxError, AxResult};
@@ -11,6 +10,7 @@ use axfs_ng_vfs::{DirEntry, FileNode, Location, NodePermission, NodeType, Refere
 use axtask::current;
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
+use spin::RwLock;
 
 use crate::{
     file::{
@@ -181,25 +181,28 @@ bitflags! {
     }
 }
 
-pub fn sys_close_range(first: i32, last: i32, flags: u32) -> AxResult<isize> {
-    if first < 0 || last < first {
+pub fn sys_close_range(first: u32, last: u32, flags: u32) -> AxResult<isize> {
+    if last < first {
         return Err(AxError::InvalidInput);
     }
     let flags = CloseRangeFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
     debug!("sys_close_range <= fds: [{first}, {last}], flags: {flags:?}");
     if flags.contains(CloseRangeFlags::UNSHARE) {
-        // TODO: optimize
         let curr = current();
-        let mut scope = curr.as_thread().proc_data.scope.write();
-        let mut guard = FD_TABLE.scope_mut(&mut scope);
-        let old_files = mem::take(guard.deref_mut());
-        old_files.write().clone_from(old_files.read().deref());
+        curr.as_thread().with_mut_scope(|scope| {
+            let mut guard = FD_TABLE.scope_mut(scope);
+            if Arc::strong_count(guard.deref()) > 1 {
+                let cloned = guard.read().clone();
+                *guard = Arc::new(RwLock::new(cloned));
+            }
+        });
     }
 
     let cloexec = flags.contains(CloseRangeFlags::CLOEXEC);
     let mut fd_table = FD_TABLE.write();
     if let Some(max_index) = fd_table.ids().next_back() {
-        for fd in first..=last.min(max_index as i32) {
+        let last = last.min(max_index as u32);
+        for fd in first..=last {
             if cloexec {
                 if let Some(f) = fd_table.get_mut(fd as _) {
                     f.cloexec = true;

@@ -172,7 +172,10 @@ impl TcpSocket {
         }
     }
 
-    pub fn set_filter(&self, _filter: Option<alloc::sync::Arc<dyn crate::SocketFilter>>) -> AxResult<()> {
+    pub fn set_filter(
+        &self,
+        _filter: Option<alloc::sync::Arc<dyn crate::SocketFilter>>,
+    ) -> AxResult<()> {
         Ok(())
     }
 }
@@ -240,10 +243,12 @@ impl SocketOps for TcpSocket {
             .lock(State::Idle)
             .map_err(|_| ax_err_type!(InvalidInput, "already bound"))?
             .transit(State::Idle, || {
-                // TODO: check addr is available
                 if local_addr.port() == 0 {
                     local_addr.set_port(self.stack.tcp_ephemeral_port()?);
                 }
+                self.stack
+                    .get_service()
+                    .validate_bind_addr(local_addr.ip().into())?;
                 if !self.general.reuse_address() {
                     self.stack
                         .socket_set

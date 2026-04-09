@@ -215,6 +215,11 @@ impl Process {
         self.tg.lock().threads.insert(tid);
     }
 
+    /// Removes a thread from this [`Process`] without updating the exit state.
+    pub fn remove_thread(&self, tid: Pid) {
+        self.tg.lock().threads.remove(&tid);
+    }
+
     /// Removes a thread from this [`Process`] and sets the exit code if the
     /// group has not exited.
     ///
@@ -295,6 +300,18 @@ impl Process {
             parent.children.lock().remove(&self.pid);
         }
         true
+    }
+
+    /// Drops a forked-but-never-started child from its parent and process
+    /// group. This is used to roll back clone failures that happen after the
+    /// child process object has been created but before the task becomes
+    /// runnable.
+    pub fn abort_fork(self: &Arc<Self>) {
+        self.remove_thread(self.pid);
+        if let Some(parent) = self.parent() {
+            parent.children.lock().remove(&self.pid);
+        }
+        self.group.lock().processes.lock().remove(&self.pid);
     }
 }
 

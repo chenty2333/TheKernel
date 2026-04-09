@@ -365,7 +365,8 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
         remove_task_alias(visible_tid);
     }
     thr.proc_data.end_exec(tid);
-    if process.exit_thread(tid, exit_code) {
+    let process_exited = process.exit_thread(tid, exit_code);
+    if process_exited {
         process.publish_zombie_snapshot(ZombieSnapshot {
             wait_status: process.exit_code(),
             self_usage: thr.proc_data.self_usage().into(),

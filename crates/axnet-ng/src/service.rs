@@ -87,6 +87,13 @@ impl Service {
         })
     }
 
+    pub(crate) fn validate_bind_addr(&self, addr: IpAddress) -> AxResult<()> {
+        if addr.is_unspecified() {
+            return Ok(());
+        }
+        self.resolve_outbound(&addr, Some(addr)).map(|_| ())
+    }
+
     pub fn device_mask_for(&self, endpoint: &IpListenEndpoint) -> u64 {
         match endpoint.addr {
             Some(addr) => self
@@ -166,5 +173,23 @@ mod tests {
             .resolve_outbound(&IpAddress::Ipv4(Ipv4Address::new(8, 8, 8, 8)), None)
             .unwrap_err();
         assert_eq!(err, AxError::from(LinuxError::ENETUNREACH));
+    }
+
+    #[test]
+    fn validate_bind_addr_accepts_local_source() {
+        let service = test_service();
+        assert_eq!(
+            service.validate_bind_addr(IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 15))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_bind_addr_rejects_nonlocal_source() {
+        let service = test_service();
+        let err = service
+            .validate_bind_addr(IpAddress::Ipv4(Ipv4Address::LOCALHOST))
+            .unwrap_err();
+        assert_eq!(err, AxError::from(LinuxError::EADDRNOTAVAIL));
     }
 }

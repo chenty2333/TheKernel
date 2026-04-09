@@ -23,6 +23,23 @@ use crate::{
     task::AsThread,
 };
 
+const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
+
+fn require_bind_permissions(addr: &SocketAddrEx) -> AxResult<()> {
+    let SocketAddrEx::Ip(ip_addr) = addr else {
+        return Ok(());
+    };
+
+    if ip_addr.port() != 0
+        && ip_addr.port() < FIRST_UNPRIVILEGED_PORT
+        && current().as_thread().proc_data.euid() != 0
+    {
+        return Err(AxError::from(LinuxError::EACCES));
+    }
+
+    Ok(())
+}
+
 pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     debug!("sys_socket <= domain: {domain}, ty: {raw_ty}, proto: {proto}");
     let ty = raw_ty & 0xFF;
@@ -70,6 +87,7 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
     let addr = SocketAddrEx::read_from_user(addr, addrlen)?;
     debug!("sys_bind <= fd: {fd}, addr: {addr:?}");
 
+    require_bind_permissions(&addr)?;
     Socket::from_fd(fd)?.bind(addr)?;
 
     Ok(0)

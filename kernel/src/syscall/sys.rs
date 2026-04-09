@@ -9,12 +9,12 @@ use axtask::current;
 #[cfg(target_arch = "riscv64")]
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::{
-    general::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM},
+    general::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, NGROUPS_MAX},
     system::{new_utsname, sysinfo},
 };
 #[cfg(target_arch = "riscv64")]
 use starry_vm::VmPtr;
-use starry_vm::{VmMutPtr, vm_write_slice};
+use starry_vm::{VmMutPtr, vm_load, vm_write_slice};
 
 use super::sync::restart_futex_wait;
 use crate::{
@@ -52,14 +52,34 @@ pub fn sys_setgid(gid: u32) -> AxResult<isize> {
 
 pub fn sys_getgroups(size: usize, list: *mut u32) -> AxResult<isize> {
     debug!("sys_getgroups <= size: {size}");
-    if size < 1 {
+    let groups = current().as_thread().proc_data.supplementary_groups();
+    if size == 0 {
+        return Ok(groups.len() as isize);
+    }
+    if size < groups.len() {
         return Err(AxError::InvalidInput);
     }
-    vm_write_slice(list, &[current().as_thread().proc_data.gid()])?;
-    Ok(1)
+    if !groups.is_empty() {
+        vm_write_slice(list, &groups)?;
+    }
+    Ok(groups.len() as isize)
 }
 
-pub fn sys_setgroups(_size: usize, _list: *const u32) -> AxResult<isize> {
+pub fn sys_setgroups(size: usize, list: *const u32) -> AxResult<isize> {
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    if proc_data.euid() != 0 {
+        return Err(AxError::OperationNotPermitted);
+    }
+    if size > NGROUPS_MAX as usize {
+        return Err(AxError::InvalidInput);
+    }
+    let groups = if size == 0 {
+        vec![]
+    } else {
+        vm_load(list, size)?
+    };
+    proc_data.set_supplementary_groups(groups);
     Ok(0)
 }
 

@@ -43,6 +43,13 @@ pub struct StatFs {
     pub block_size: u32,
 }
 
+fn inode_needs_truncate_on_unlink(ty: InodeType) -> bool {
+    matches!(
+        ty,
+        InodeType::RegularFile | InodeType::Directory | InodeType::Symlink
+    )
+}
+
 pub struct Ext4Filesystem<Hal: SystemHal, Dev: BlockDevice> {
     inner: Box<ext4_fs>,
     bdev: Ext4BlockDevice<Dev>,
@@ -202,11 +209,12 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         let mut dir_ref = self.inode_ref(dir)?;
         let child = self.clone_ref(&dir_ref).lookup(name)?.entry().ino();
         let mut child_ref = self.inode_ref(child)?;
+        let inode_type = child_ref.inode_type();
 
         if self.clone_ref(&child_ref).has_children()? {
             return Err(Ext4Error::new(ENOTEMPTY as _, None));
         }
-        if child_ref.inode_type() == InodeType::Directory {
+        if inode_type == InodeType::Directory {
             // According to `ext4_trunc_dir`
             let bs = get_block_size(&self.inner.as_mut().sb);
             child_ref.truncate(bs as _)?;
@@ -219,7 +227,11 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             child_ref.dec_nlink();
         }
         if child_ref.nlink() == 0 {
-            child_ref.truncate(0)?;
+            // Special inodes such as sockets and device nodes have no data
+            // payload, and lwext4 rejects truncating them with EINVAL.
+            if inode_needs_truncate_on_unlink(inode_type) {
+                child_ref.truncate(0)?;
+            }
             unsafe {
                 ext4_inode_set_del_time(child_ref.inner.inode, u32::MAX);
                 child_ref.mark_dirty();
@@ -247,6 +259,22 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             ext4_block_cache_flush(self.bdev.inner.as_mut()).context("ext4_cache_flush")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn special_inodes_skip_truncate_during_unlink() {
+        assert!(inode_needs_truncate_on_unlink(InodeType::RegularFile));
+        assert!(inode_needs_truncate_on_unlink(InodeType::Directory));
+        assert!(inode_needs_truncate_on_unlink(InodeType::Symlink));
+        assert!(!inode_needs_truncate_on_unlink(InodeType::Socket));
+        assert!(!inode_needs_truncate_on_unlink(InodeType::Fifo));
+        assert!(!inode_needs_truncate_on_unlink(InodeType::CharacterDevice));
+        assert!(!inode_needs_truncate_on_unlink(InodeType::BlockDevice));
     }
 }
 

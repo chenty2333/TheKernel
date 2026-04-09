@@ -17,7 +17,7 @@ use linux_raw_sys::{
 use starry_vm::{VmPtr, vm_write_slice};
 
 use crate::{
-    file::{Directory, FileLike, get_file_like, resolve_at, with_fs},
+    file::{Directory, FileLike, get_file_like, permission::check_search_permissions, resolve_at, with_fs},
     mm::vm_load_string,
     task::AsThread,
     time::{TimeValueLike, wall_time},
@@ -79,8 +79,20 @@ pub fn sys_chdir(path: *const c_char) -> AxResult<isize> {
     let path = vm_load_string(path)?;
     debug!("sys_chdir <= path: {path}");
 
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let supplementary_groups = proc_data.supplementary_groups();
     let mut fs = FS_CONTEXT.lock();
     let entry = fs.resolve(path)?;
+    if entry.node_type() != NodeType::Directory {
+        return Err(AxError::NotADirectory);
+    }
+    check_search_permissions(
+        &entry,
+        proc_data.euid(),
+        proc_data.egid(),
+        &supplementary_groups,
+    )?;
     fs.set_current_dir(entry)?;
     Ok(0)
 }
@@ -89,6 +101,18 @@ pub fn sys_fchdir(dirfd: i32) -> AxResult<isize> {
     debug!("sys_fchdir <= dirfd: {dirfd}");
 
     let entry = with_fs(dirfd, |fs| Ok(fs.current_dir().clone()))?;
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let supplementary_groups = proc_data.supplementary_groups();
+    if entry.node_type() != NodeType::Directory {
+        return Err(AxError::NotADirectory);
+    }
+    check_search_permissions(
+        &entry,
+        proc_data.euid(),
+        proc_data.egid(),
+        &supplementary_groups,
+    )?;
     FS_CONTEXT.lock().set_current_dir(entry)?;
     Ok(0)
 }
@@ -102,10 +126,22 @@ pub fn sys_chroot(path: *const c_char) -> AxResult<isize> {
     let path = vm_load_string(path)?;
     debug!("sys_chroot <= path: {path}");
 
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let supplementary_groups = proc_data.supplementary_groups();
     let mut fs = FS_CONTEXT.lock();
     let loc = fs.resolve(path)?;
     if loc.node_type() != NodeType::Directory {
         return Err(AxError::NotADirectory);
+    }
+    check_search_permissions(
+        &loc,
+        proc_data.euid(),
+        proc_data.egid(),
+        &supplementary_groups,
+    )?;
+    if proc_data.euid() != 0 {
+        return Err(AxError::OperationNotPermitted);
     }
     *fs = FsContext::new(loc);
     Ok(0)
@@ -115,10 +151,29 @@ pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize
     let path = vm_load_string(path)?;
     debug!("sys_mkdirat <= dirfd: {dirfd}, path: {path}, mode: {mode}");
 
-    let mode = mode & !current().as_thread().proc_data.umask();
-    let mode = NodePermission::from_bits_truncate(mode as u16);
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let requested_mode = NodePermission::from_bits_truncate((mode & !proc_data.umask()) as u16);
 
-    let loc = with_fs(dirfd, |fs| fs.create_dir(path, mode))?;
+    let loc = with_fs(dirfd, |fs| fs.create_dir(path, requested_mode))?;
+    let mut final_mode = requested_mode;
+    let mut owner_gid = proc_data.egid();
+
+    if let Some(parent) = loc.parent() {
+        let parent_meta = parent.metadata()?;
+        if parent_meta.mode.contains(NodePermission::SET_GID) {
+            owner_gid = parent_meta.gid;
+            final_mode.insert(NodePermission::SET_GID);
+        }
+    }
+    if proc_data.euid() != 0 && !proc_data.is_in_group(owner_gid) {
+        final_mode.remove(NodePermission::SET_GID);
+    }
+    loc.update_metadata(MetadataUpdate {
+        owner: Some((proc_data.euid(), owner_gid)),
+        mode: Some(final_mode),
+        ..Default::default()
+    })?;
     if let Some(parent) = loc.parent() {
         let _ =
             crate::file::inotify::notify_parent_with_name(&parent, loc.name(), IN_CREATE, true, 0);
@@ -259,12 +314,11 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
     let parent = loc.parent();
     let name = loc.name().to_string();
     let is_dir = loc.is_dir();
-
     with_fs(dirfd, |fs| {
         if flags == AT_REMOVEDIR as _ {
-            fs.remove_dir(path)?;
+            fs.remove_dir(&path)?;
         } else {
-            fs.remove_file(path)?;
+            fs.remove_file(&path)?;
         }
         Ok(0)
     })?;
@@ -410,8 +464,18 @@ pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> A
     let loc = resolve_at(dirfd, path.as_deref(), flags)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
+    let meta = loc.metadata()?;
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    if proc_data.euid() != 0 && proc_data.euid() != meta.uid {
+        return Err(AxError::OperationNotPermitted);
+    }
+    let mut mode = NodePermission::from_bits_truncate(mode as u16);
+    if proc_data.euid() != 0 && !proc_data.is_in_group(meta.gid) {
+        mode.remove(NodePermission::SET_GID);
+    }
     loc.update_metadata(MetadataUpdate {
-        mode: Some(NodePermission::from_bits_truncate(mode as u16)),
+        mode: Some(mode),
         ..Default::default()
     })?;
     let _ = crate::file::inotify::notify_parent(&loc, IN_ATTRIB);

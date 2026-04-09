@@ -1,4 +1,4 @@
-use alloc::{string::ToString, sync::Arc, vec::Vec};
+use alloc::{string::{String, ToString}, sync::Arc, vec, vec::Vec};
 use core::{ffi::c_char, future::poll_fn, task::Poll};
 
 use axerrno::{AxError, AxResult};
@@ -12,6 +12,8 @@ use starry_process::Pid;
 use starry_signal::{SignalAction, SignalDisposition, Signo};
 use starry_vm::vm_load_until_nul;
 
+#[cfg(target_arch = "loongarch64")]
+use crate::task::reset_current_user_fpu_state;
 use crate::{
     config::USER_HEAP_BASE,
     file::FD_TABLE,
@@ -21,8 +23,6 @@ use crate::{
         has_pending_fatal_signal, set_current_user_page_table_root,
     },
 };
-#[cfg(target_arch = "loongarch64")]
-use crate::task::reset_current_user_fpu_state;
 
 fn interrupt_exec_siblings(sibling_tids: &[Pid]) {
     for &tid in sibling_tids {
@@ -105,6 +105,11 @@ pub fn sys_execve(
             .into_iter()
             .map(vm_load_string)
             .collect::<Result<Vec<_>, _>>()?
+    };
+    let args = if args.is_empty() {
+        vec![String::new()]
+    } else {
+        args
     };
 
     let envs = if envp.is_null() {

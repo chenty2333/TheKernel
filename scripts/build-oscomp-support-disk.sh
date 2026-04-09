@@ -9,6 +9,7 @@ OUT_DIR=""
 OUTPUT=""
 MIN_IMAGE_SIZE_MB=32
 TEST_LIST_PATH="$REPO_ROOT/ltp_test.txt"
+PLAN_OVERRIDE_PATH="$REPO_ROOT/oscomp_plan.txt"
 TMP_ROOT=""
 TMP_BASE="$REPO_ROOT/.tmp"
 
@@ -21,6 +22,7 @@ Build an evaluator support disk aligned to /home/dia/T202510213995926-2475:
   - /usr/lib/locale/C.UTF-8
   - /<arch>/glibc/lib/libgcc_s.so.1
   - /meta/ltp_test.txt used at runtime to overlay the same LTP subset
+  - /meta/oscomp_plan.txt when $REPO_ROOT/oscomp_plan.txt exists
 
 EOF
 }
@@ -233,6 +235,9 @@ WORK_ROOT="$TMP_ROOT/root"
 mkdir -p "$WORK_ROOT/usr/lib/locale/C.UTF-8" "$WORK_ROOT/meta"
 cp -a "$LOCALE_SOURCE"/. "$WORK_ROOT/usr/lib/locale/C.UTF-8/"
 cp "$TEST_LIST_PATH" "$WORK_ROOT/meta/ltp_test.txt"
+if [ -f "$PLAN_OVERRIDE_PATH" ]; then
+    cp "$PLAN_OVERRIDE_PATH" "$WORK_ROOT/meta/oscomp_plan.txt"
+fi
 
 case "$ARCH" in
     rv)

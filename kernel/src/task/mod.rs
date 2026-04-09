@@ -135,6 +135,29 @@ impl Thread {
         self.visible_tid.store(tid, Ordering::Release);
     }
 
+    /// Temporarily releases the active-scope read lock so the current thread
+    /// can mutate its process scope, then restores the active scope binding.
+    pub fn with_mut_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
+        ActiveScope::set_global();
+        // SAFETY: on_enter() permanently holds one read lock for the currently
+        // running task; release it here so we can take the matching write lock.
+        unsafe { self.proc_data.scope.force_read_decrement() };
+
+        let result = {
+            let mut scope = self.proc_data.scope.write();
+            f(&mut scope)
+        };
+
+        let scope = self.proc_data.scope.read();
+        // SAFETY: rebind the task-local active scope to the freshly updated
+        // process scope and intentionally keep the read guard alive until
+        // on_leave() forcefully decrements it.
+        unsafe { ActiveScope::set(&scope) };
+        core::mem::forget(scope);
+
+        result
+    }
+
     /// Get the robust list head.
     pub fn robust_list_head(&self) -> usize {
         self.robust_list_head.load(Ordering::SeqCst)
@@ -313,6 +336,8 @@ pub struct ProcessData {
     umask: AtomicU32,
     /// Process credentials shared by all threads.
     creds: SpinNoIrq<Credentials>,
+    /// Supplementary group IDs shared by all threads in the process.
+    supplementary_groups: SpinNoIrq<Vec<u32>>,
 
     /// CPU time accumulated from sibling threads that have already exited.
     exited_threads_usage: AtomicTaskUsage,
@@ -372,6 +397,7 @@ impl ProcessData {
 
             umask: AtomicU32::new(0o022),
             creds: SpinNoIrq::new(Credentials::default()),
+            supplementary_groups: SpinNoIrq::new(Vec::new()),
             exited_threads_usage: AtomicTaskUsage::new(),
             waited_children_usage: AtomicTaskUsage::new(),
             wait_lock: Mutex::new(()),
@@ -460,6 +486,14 @@ impl ProcessData {
         *self.creds.lock() = creds;
     }
 
+    pub fn supplementary_groups(&self) -> Vec<u32> {
+        self.supplementary_groups.lock().clone()
+    }
+
+    pub fn set_supplementary_groups(&self, groups: Vec<u32>) {
+        *self.supplementary_groups.lock() = groups;
+    }
+
     pub fn uid(&self) -> u32 {
         self.creds.lock().ruid
     }
@@ -474,6 +508,10 @@ impl ProcessData {
 
     pub fn egid(&self) -> u32 {
         self.creds.lock().egid
+    }
+
+    pub fn is_in_group(&self, gid: u32) -> bool {
+        self.egid() == gid || self.supplementary_groups.lock().contains(&gid)
     }
 
     pub fn setuid(&self, uid: u32) -> AxResult<()> {

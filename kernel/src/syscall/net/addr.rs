@@ -41,6 +41,7 @@ fn read_family(addr: UserConstPtr<sockaddr>, addrlen: socklen_t) -> AxResult<u16
 unsafe fn cast_to_slice<T>(value: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) }
 }
+
 fn fill_addr(addr: UserPtr<sockaddr>, addrlen: &mut socklen_t, data: &[u8]) -> AxResult<()> {
     let len = (*addrlen as usize).min(data.len());
     addr.cast::<u8>()
@@ -48,6 +49,28 @@ fn fill_addr(addr: UserPtr<sockaddr>, addrlen: &mut socklen_t, data: &[u8]) -> A
         .copy_from_slice(&data[..len]);
     *addrlen = data.len() as _;
     Ok(())
+}
+
+fn serialize_unix_socket_addr(addr: &UnixSocketAddr) -> Vec<u8> {
+    let data_len = match addr {
+        UnixSocketAddr::Unnamed => 0,
+        UnixSocketAddr::Abstract(name) => name.len() + 1,
+        UnixSocketAddr::Path(path) => path.len() + 1,
+    };
+    let mut buf = Vec::with_capacity(size_of::<__kernel_sa_family_t>() + data_len);
+    buf.extend_from_slice(&(AF_UNIX as __kernel_sa_family_t).to_ne_bytes());
+    match addr {
+        UnixSocketAddr::Unnamed => {}
+        UnixSocketAddr::Abstract(name) => {
+            buf.push(0);
+            buf.extend_from_slice(name);
+        }
+        UnixSocketAddr::Path(path) => {
+            buf.extend_from_slice(path.as_bytes());
+            buf.push(0);
+        }
+    }
+    buf
 }
 
 impl SocketAddrExt for SocketAddr {
@@ -168,26 +191,7 @@ impl SocketAddrExt for UnixSocketAddr {
     }
 
     fn write_to_user(&self, addr: UserPtr<sockaddr>, addrlen: &mut socklen_t) -> AxResult<()> {
-        let data_len = match self {
-            UnixSocketAddr::Unnamed => 0,
-            UnixSocketAddr::Abstract(name) => name.len() + 1,
-            UnixSocketAddr::Path(path) => 1 + path.len(),
-        };
-        let mut buf = Vec::with_capacity(size_of::<__kernel_sa_family_t>() + data_len);
-        buf.extend_from_slice(&AF_UNIX.to_ne_bytes());
-        match self {
-            UnixSocketAddr::Unnamed => {}
-            UnixSocketAddr::Abstract(name) => {
-                buf.push(0);
-                buf.extend_from_slice(name);
-            }
-            UnixSocketAddr::Path(path) => {
-                buf.extend_from_slice(path.as_bytes());
-                buf.push(0);
-            }
-        }
-
-        fill_addr(addr, addrlen, &buf)
+        fill_addr(addr, addrlen, &serialize_unix_socket_addr(self))
     }
 
     fn family(&self) -> u16 {
@@ -264,5 +268,33 @@ impl SocketAddrExt for SocketAddrEx {
 
     fn family(&self) -> u16 {
         AF_INET as u16
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_path_sockaddr_uses_two_byte_family_prefix() {
+        let encoded = serialize_unix_socket_addr(&UnixSocketAddr::Path("test.sock".into()));
+        assert_eq!(
+            encoded[..2],
+            (AF_UNIX as __kernel_sa_family_t).to_ne_bytes()
+        );
+        assert_eq!(&encoded[2..11], b"test.sock");
+        assert_eq!(encoded[11], 0);
+    }
+
+    #[test]
+    fn unix_abstract_sockaddr_keeps_leading_nul_after_family() {
+        let encoded =
+            serialize_unix_socket_addr(&UnixSocketAddr::Abstract(b"name".as_slice().into()));
+        assert_eq!(
+            encoded[..2],
+            (AF_UNIX as __kernel_sa_family_t).to_ne_bytes()
+        );
+        assert_eq!(encoded[2], 0);
+        assert_eq!(&encoded[3..], b"name");
     }
 }

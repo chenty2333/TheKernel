@@ -3,14 +3,18 @@ use core::ffi::{c_char, c_int};
 use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axfs_ng_vfs::{Location, NodePermission};
+use axtask::current;
 use linux_raw_sys::general::{
     __kernel_fsid_t, AT_EACCESS, AT_EMPTY_PATH, R_OK, W_OK, X_OK, stat, statfs, statx,
 };
 use starry_vm::{VmMutPtr, VmPtr};
-use axtask::current;
 
 use crate::{
-    file::{File, FileLike, resolve_at},
+    file::{
+        File, FileLike,
+        permission::{check_parent_search_permissions, granted_access_bits},
+        resolve_at,
+    },
     mm::vm_load_string,
     task::AsThread,
 };
@@ -107,30 +111,6 @@ pub fn sys_access(path: *const c_char, mode: u32) -> AxResult<isize> {
     sys_faccessat2(AT_FDCWD, path, mode, 0)
 }
 
-fn granted_access_bits(perm: u32, owner_uid: u32, owner_gid: u32, uid: u32, gid: u32) -> u32 {
-    let mut granted = perm & 0o7;
-    if gid == owner_gid {
-        granted |= (perm >> 3) & 0o7;
-    }
-    if uid == owner_uid {
-        granted |= (perm >> 6) & 0o7;
-    }
-    granted
-}
-
-fn check_parent_search_permissions(loc: &Location, uid: u32, gid: u32) -> AxResult {
-    let mut parent = loc.parent();
-    while let Some(dir) = parent {
-        let stat = dir.metadata()?;
-        if granted_access_bits(stat.mode.bits() as u32, stat.uid, stat.gid, uid, gid) & X_OK == 0
-        {
-            return Err(AxError::PermissionDenied);
-        }
-        parent = dir.parent();
-    }
-    Ok(())
-}
-
 fn check_readonly_write_access(loc: &Location) -> AxResult {
     let path = loc.absolute_path().map_err(|_| AxError::InvalidInput)?;
     if crate::mounts::is_readonly(path.as_ref()) {
@@ -150,6 +130,7 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
+    let supplementary_groups = proc_data.supplementary_groups();
     let (uid, gid) = if flags & AT_EACCESS as u32 != 0 {
         (proc_data.euid(), proc_data.egid())
     } else {
@@ -165,7 +146,7 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
         crate::file::ResolveAtResult::Other(_) => None,
     } {
         if uid != 0 {
-            check_parent_search_permissions(loc, uid, gid)?;
+            check_parent_search_permissions(loc, uid, gid, &supplementary_groups)?;
         }
         if mode & W_OK != 0 {
             check_readonly_write_access(loc)?;
@@ -183,7 +164,7 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
         return Ok(0);
     }
 
-    let granted = granted_access_bits(perm, stat.uid, stat.gid, uid, gid);
+    let granted = granted_access_bits(perm, stat.uid, stat.gid, uid, gid, &supplementary_groups);
 
     let requested = mode & 0o7;
     if requested & granted != requested {

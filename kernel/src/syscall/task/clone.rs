@@ -95,6 +95,12 @@ pub struct CloneArgs {
     pub pidfd: usize,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum CloneApi {
+    Clone,
+    Clone3,
+}
+
 impl CloneArgs {
     fn wait_for_vfork(proc_data: &ProcessData) {
         block_on(poll_fn(|cx| {
@@ -110,14 +116,9 @@ impl CloneArgs {
         }));
     }
 
-    fn validate(&self) -> AxResult<()> {
-        let Self {
-            flags, exit_signal, ..
-        } = self;
+    pub(super) fn validate_for(&self, api: CloneApi) -> AxResult<()> {
+        let Self { flags, .. } = self;
 
-        if *exit_signal > 0 && flags.intersects(CloneFlags::THREAD | CloneFlags::PARENT) {
-            return Err(AxError::InvalidInput);
-        }
         if flags.contains(CloneFlags::THREAD)
             && !flags.contains(CloneFlags::VM | CloneFlags::SIGHAND)
         {
@@ -129,26 +130,21 @@ impl CloneArgs {
         if flags.contains(CloneFlags::VFORK | CloneFlags::THREAD) {
             return Err(AxError::InvalidInput);
         }
-        if flags.contains(CloneFlags::PIDFD | CloneFlags::DETACHED) {
+        if flags.contains(CloneFlags::DETACHED) {
+            match api {
+                CloneApi::Clone if !flags.contains(CloneFlags::PIDFD) => {}
+                CloneApi::Clone | CloneApi::Clone3 => return Err(AxError::InvalidInput),
+            }
+        }
+        if flags.contains(CloneFlags::PIDFD | CloneFlags::THREAD) {
             return Err(AxError::InvalidInput);
         }
         if flags.contains(CloneFlags::THREAD | CloneFlags::NEWNET) {
             return Err(AxError::InvalidInput);
         }
 
-        let unsupported_ns_flags = CloneFlags::NEWIPC
-            | CloneFlags::NEWNS
-            | CloneFlags::NEWPID
-            | CloneFlags::NEWUSER
-            | CloneFlags::NEWUTS
-            | CloneFlags::NEWCGROUP;
-
-        if flags.intersects(unsupported_ns_flags) {
-            warn!(
-                "sys_clone/sys_clone3: unsupported namespace flags: {:?}",
-                *flags & unsupported_ns_flags
-            );
-            return Err(AxError::OperationNotSupported);
+        if flags.contains(CloneFlags::FS | CloneFlags::NEWNS) {
+            return Err(AxError::InvalidInput);
         }
 
         if flags.contains(CloneFlags::INTO_CGROUP) {
@@ -159,8 +155,8 @@ impl CloneArgs {
         Ok(())
     }
 
-    pub fn do_clone(self, uctx: &UserContext) -> AxResult<isize> {
-        self.validate()?;
+    pub(super) fn do_clone(self, uctx: &UserContext, api: CloneApi) -> AxResult<isize> {
+        self.validate_for(api)?;
 
         let Self {
             flags,
@@ -276,10 +272,7 @@ impl CloneArgs {
                 // from the scheduler-visible task name; execve installs the final
                 // path/cmdline as soon as the child replaces its image.
                 let fallback_name = curr.name();
-                (
-                    fallback_name.clone(),
-                    Arc::new(alloc::vec![fallback_name]),
-                )
+                (fallback_name.clone(), Arc::new(alloc::vec![fallback_name]))
             };
             #[cfg(not(target_arch = "loongarch64"))]
             let (child_exe_path, child_cmdline) = (
@@ -298,6 +291,7 @@ impl CloneArgs {
             );
             proc_data.set_umask(old_proc_data.umask());
             proc_data.set_credentials(old_proc_data.credentials());
+            proc_data.set_supplementary_groups(old_proc_data.supplementary_groups());
             proc_data.set_heap_top(old_proc_data.get_heap_top());
 
             {
@@ -336,15 +330,29 @@ impl CloneArgs {
         if flags.contains(CloneFlags::CHILD_CLEARTID) {
             thr.set_clear_child_tid(child_tid);
         }
+        let rollback_clone_setup = || {
+            if flags.contains(CloneFlags::THREAD) {
+                old_proc_data.proc.remove_thread(tid);
+            } else {
+                new_proc_data.proc.abort_fork();
+            }
+        };
         if flags.contains(CloneFlags::PIDFD) && pidfd != 0 {
             let pidfd_obj = if flags.contains(CloneFlags::THREAD) {
                 PidFd::new_thread(&thr)
             } else {
                 PidFd::new_process(&new_proc_data)
             };
-            let fd = pidfd_obj.add_to_fd_table(true)?;
+            let fd = match pidfd_obj.add_to_fd_table(true) {
+                Ok(fd) => fd,
+                Err(err) => {
+                    rollback_clone_setup();
+                    return Err(err);
+                }
+            };
             if let Err(err) = (pidfd as *mut i32).vm_write(fd) {
                 let _ = close_file_like(fd);
+                rollback_clone_setup();
                 return Err(err.into());
             }
         }
@@ -397,10 +405,36 @@ pub fn sys_clone(
         },
     };
 
-    args.do_clone(uctx)
+    args.do_clone(uctx, CloneApi::Clone)
 }
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_fork(uctx: &UserContext) -> AxResult<isize> {
     sys_clone(uctx, SIGCHLD, 0, 0, 0, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use axerrno::AxError;
+    use linux_raw_sys::general::{CLONE_DETACHED, CLONE_PIDFD};
+
+    use super::{CloneApi, CloneArgs, CloneFlags};
+
+    #[test]
+    fn clone_validate_allows_detached_without_pidfd() {
+        let args = CloneArgs {
+            flags: CloneFlags::from_bits_retain(CLONE_DETACHED as u64),
+            ..Default::default()
+        };
+        assert_eq!(args.validate_for(CloneApi::Clone), Ok(()));
+    }
+
+    #[test]
+    fn clone_validate_rejects_detached_with_pidfd() {
+        let args = CloneArgs {
+            flags: CloneFlags::from_bits_retain((CLONE_DETACHED | CLONE_PIDFD) as u64),
+            ..Default::default()
+        };
+        assert_eq!(args.validate_for(CloneApi::Clone), Err(AxError::InvalidInput));
+    }
 }

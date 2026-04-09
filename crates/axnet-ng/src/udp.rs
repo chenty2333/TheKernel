@@ -78,7 +78,10 @@ impl UdpSocket {
             .and_then(|endpoint| (!endpoint.addr.is_unspecified()).then_some(endpoint.addr))
     }
 
-    pub fn set_filter(&self, _filter: Option<alloc::sync::Arc<dyn crate::SocketFilter>>) -> AxResult<()> {
+    pub fn set_filter(
+        &self,
+        _filter: Option<alloc::sync::Arc<dyn crate::SocketFilter>>,
+    ) -> AxResult<()> {
         Ok(())
     }
 }
@@ -137,6 +140,9 @@ impl SocketOps for UdpSocket {
         }
 
         let local_endpoint = IpEndpoint::from(local_addr);
+        self.stack
+            .get_service()
+            .validate_bind_addr(local_endpoint.addr)?;
         let endpoint = IpListenEndpoint {
             addr: (!local_endpoint.addr.is_unspecified()).then_some(local_endpoint.addr),
             port: local_endpoint.port,
