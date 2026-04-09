@@ -18,7 +18,7 @@ else ifneq ($(filter $(MAKECMDGOALS),unittest unittest_no_fail_fast),)
   # run `make unittest`
   $(if $(V), $(info RUSTFLAGS: "$(RUSTFLAGS)"))
   export RUSTFLAGS
-else ifneq ($(filter $(or $(MAKECMDGOALS), $(.DEFAULT_GOAL)), all build run justrun debug),)
+else ifneq ($(filter $(or $(MAKECMDGOALS), $(.DEFAULT_GOAL)), all build build-elf run justrun debug),)
   # run `make build` and other above goals
   ifneq ($(V),)
     $(info APP: "$(APP)")
