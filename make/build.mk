@@ -54,6 +54,8 @@ else ifeq ($(APP_TYPE), c)
 	$(call cargo_build,ulib/axlibc,$(AX_FEAT) $(LIB_FEAT))
 endif
 
+build-elf: prepare_build_state $(OUT_ELF)
+
 $(OUT_ELF): _cargo_build
 
 $(OUT_DIR):
@@ -82,7 +84,7 @@ endif
 $(OUT_UIMG): $(OUT_BIN)
 	$(call run_cmd,mkimage,\
 		-A $(uimg_arch) -O linux -T kernel -C none \
-		-a $(subst _,,$(shell axconfig-gen "$(OUT_CONFIG)" -r plat.kernel-base-paddr)) \
+		-a $(subst _,,$(shell $(AXCONFIG_GEN) "$(OUT_CONFIG)" -r plat.kernel-base-paddr)) \
 		-d $(OUT_BIN) $@)
 
-.PHONY: _cargo_build _dwarf
+.PHONY: build-elf _cargo_build _dwarf

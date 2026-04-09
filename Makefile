@@ -98,7 +98,7 @@ debug:
 
 kernel-rv:
 	@$(MAKE) -C make ARCH=riscv64 BUS=mmio defconfig
-	@$(MAKE) -C make ARCH=riscv64 BUS=mmio build
+	@$(MAKE) -C make ARCH=riscv64 BUS=mmio build-elf
 	@kernel="$$(find "$(STATE_DIR)/riscv64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
 	test -n "$$kernel"; \
 	python3 scripts/patch-riscv-kernel-elf.py "$$kernel" "$@"
@@ -106,7 +106,7 @@ kernel-rv:
 
 kernel-la:
 	@$(MAKE) -C make ARCH=loongarch64 defconfig
-	@$(MAKE) -C make ARCH=loongarch64 build
+	@$(MAKE) -C make ARCH=loongarch64 build-elf
 	@kernel="$$(find "$(STATE_DIR)/loongarch64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
 	test -n "$$kernel"; \
 	python3 scripts/patch-loongarch-kernel-elf.py "$$kernel" "$@"
