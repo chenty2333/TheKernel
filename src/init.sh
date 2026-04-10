@@ -1023,6 +1023,19 @@ emit_group_end() {
     echo "#### OS COMP TEST GROUP END $1 ####"
 }
 
+group_marker_name() {
+    group="$1"
+    flavor="$2"
+    case "$flavor" in
+        musl|glibc)
+            printf '%s-%s\n' "$group" "$flavor"
+            ;;
+        *)
+            printf '%s\n' "$group"
+            ;;
+    esac
+}
+
 should_suppress_group_marker_line() {
     case "$1" in
         '#### OS COMP TEST GROUP START '*|'#### OS COMP TEST GROUP END '*)
@@ -1098,6 +1111,7 @@ run_group_script() {
 
     root_flavor "$root"
     flavor="$ROOT_FLAVOR_RESULT"
+    group_marker="$(group_marker_name "$group" "$flavor")"
 
     runner_debug "#### OSCOMP RUNNER START ${script} ####"
 
@@ -1135,7 +1149,7 @@ run_group_script() {
 
     prime_group_output_stream
     STREAM_GROUP_OUTPUT_FRAGMENT=""
-    emit_group_start "$group"
+    emit_group_start "$group_marker"
 
     (
         cd "$run_dir" || exit 125
@@ -1247,7 +1261,7 @@ run_group_script() {
     cleanup_iozone_stage
     runner_debug "#### OSCOMP RUNNER END ${script} STATUS ${status} ####"
     bb rm -f "$output_file" 2>/dev/null || true
-    [ "$status" -eq 124 ] || emit_group_end "$group"
+    [ "$status" -eq 124 ] || emit_group_end "$group_marker"
     return "$status"
 }
 
