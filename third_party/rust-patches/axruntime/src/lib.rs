@@ -110,6 +110,13 @@ fn is_init_ok() -> bool {
     INITED_CPUS.load(Ordering::Acquire) == axhal::cpu_num()
 }
 
+fn build_flag_enabled(value: Option<&'static str>) -> bool {
+    matches!(
+        value,
+        Some("1" | "y" | "Y" | "yes" | "YES" | "true" | "TRUE")
+    )
+}
+
 #[cfg(feature = "irq")]
 const PERIODIC_INTERVAL_NANOS: u64 = axhal::time::NANOS_PER_SEC / axconfig::TICKS_PER_SEC as u64;
 
@@ -202,32 +209,38 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     axhal::percpu::init_primary(cpu_id);
     axhal::init_early(cpu_id, arg);
     let log_level = option_env!("AX_LOG").unwrap_or("info");
+    let show_banner = build_flag_enabled(option_env!("AX_START_BANNER"));
+    let enable_backtrace = build_flag_enabled(option_env!("AX_BACKTRACE"));
 
-    ax_println!("{}", LOGO);
-    ax_println!(
-        indoc::indoc! {"
-            arch = {}
-            platform = {}
-            target = {}
-            build_mode = {}
-            log_level = {}
-            backtrace = {}
-            smp = {}
-        "},
-        axconfig::ARCH,
-        axconfig::PLATFORM,
-        option_env!("AX_TARGET").unwrap_or(""),
-        option_env!("AX_MODE").unwrap_or(""),
-        log_level,
-        axbacktrace::is_enabled(),
-        axhal::cpu_num()
-    );
+    if show_banner {
+        ax_println!("{}", LOGO);
+        ax_println!(
+            indoc::indoc! {"
+                arch = {}
+                platform = {}
+                target = {}
+                build_mode = {}
+                log_level = {}
+                backtrace = {}
+                smp = {}
+            "},
+            axconfig::ARCH,
+            axconfig::PLATFORM,
+            option_env!("AX_TARGET").unwrap_or(""),
+            option_env!("AX_MODE").unwrap_or(""),
+            log_level,
+            enable_backtrace,
+            axhal::cpu_num()
+        );
+    }
 
     #[cfg(feature = "rtc")]
-    ax_println!(
-        "Boot at {}\n",
-        chrono::DateTime::from_timestamp_nanos(axhal::time::wall_time_nanos() as _),
-    );
+    if show_banner {
+        ax_println!(
+            "Boot at {}\n",
+            chrono::DateTime::from_timestamp_nanos(axhal::time::wall_time_nanos() as _),
+        );
+    }
 
     axlog::init();
     axlog::set_max_level(log_level); // no effect if set `log-level-*` features
@@ -248,7 +261,7 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     #[cfg(feature = "alloc")]
     init_allocator();
 
-    {
+    if enable_backtrace {
         use core::ops::Range;
 
         unsafe extern "C" {

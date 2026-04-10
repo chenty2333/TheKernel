@@ -465,8 +465,6 @@ run_ltp_group() {
         return 125
     fi
 
-    echo "#### OS COMP TEST GROUP START ltp ####"
-
     ran_cases=0
     group_failed=0
     while IFS= read -r testcase || [ -n "$testcase" ]; do
@@ -524,10 +522,8 @@ run_ltp_group() {
             fi
         fi
         ret=$?
-        if [ "$ret" -eq 0 ]; then
-            echo "PASS LTP CASE $testcase"
-        else
-            echo "FAIL LTP CASE $testcase : $ret"
+        echo "FAIL LTP CASE $testcase : $ret"
+        if [ "$ret" -ne 0 ]; then
             group_failed=1
         fi
     done <"$test_list"
@@ -537,7 +533,6 @@ run_ltp_group() {
         return 127
     }
 
-    echo "#### OS COMP TEST GROUP END ltp ####"
     return "$group_failed"
 }
 
@@ -558,7 +553,6 @@ run_basic_group() {
         return 125
     fi
 
-    echo "#### OS COMP TEST GROUP START basic ####"
     if [ -n "$shell_path" ] && [ "${shell_path##*/}" = "busybox" ]; then
         "$shell_path" sh ./run-all.sh
         ret=$?
@@ -569,7 +563,6 @@ run_basic_group() {
         sh ./run-all.sh
         ret=$?
     fi
-    echo "#### OS COMP TEST GROUP END basic ####"
     return "$ret"
 }
 
@@ -645,7 +638,6 @@ run_iozone_group() {
         return 127
     }
 
-    "$iozone_busybox" echo "#### OS COMP TEST GROUP START iozone ####" || return $?
     "$iozone_busybox" echo iozone automatic measurements || return $?
     "$iozone_bin" -a -r 1k -s 4m || return $?
     "$iozone_busybox" echo iozone throughput write/read measurements || return $?
@@ -662,7 +654,6 @@ run_iozone_group() {
     "$iozone_bin" -t 4 -i 9 -i 10 -r 1k -s 1m || return $?
     "$iozone_busybox" echo iozone throughtput pwritev/preadv measurements || return $?
     "$iozone_bin" -t 4 -i 11 -i 12 -r 1k -s 1m || return $?
-    "$iozone_busybox" echo "#### OS COMP TEST GROUP END iozone ####" || return $?
     return 0
 }
 
@@ -1017,8 +1008,85 @@ stream_group_output_incremental() {
 
     start_byte=$((streamed_bytes + 1))
     bytes_to_emit=$((current_size - streamed_bytes))
-    bb tail -c +"$start_byte" "$output_file" | bb head -c "$bytes_to_emit"
+    chunk_file="/tmp/oscomp-stream-${group:-group}-${flavor:-default}-$$.chunk"
+    bb tail -c +"$start_byte" "$output_file" | bb head -c "$bytes_to_emit" >"$chunk_file"
+    normalize_group_output_chunk <"$chunk_file"
+    bb rm -f "$chunk_file" 2>/dev/null || true
     STREAM_GROUP_OUTPUT_BYTES="$current_size"
+}
+
+emit_group_start() {
+    echo "#### OS COMP TEST GROUP START $1 ####"
+}
+
+emit_group_end() {
+    echo "#### OS COMP TEST GROUP END $1 ####"
+}
+
+should_suppress_group_marker_line() {
+    case "$1" in
+        '#### OS COMP TEST GROUP START '*|'#### OS COMP TEST GROUP END '*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+emit_normalized_group_line() {
+    line="$1"
+    if [ -n "${RUNNER_CR:-}" ]; then
+        case "$line" in
+            *"$RUNNER_CR")
+                line=${line%"$RUNNER_CR"}
+                ;;
+        esac
+    fi
+    case "$line" in
+        *'#### OS COMP TEST GROUP '*)
+            line="$(printf '%s\n' "$line" | bb sed -E 's/#### OS COMP TEST GROUP (START|END) [^#]+ ####//g')"
+            ;;
+    esac
+    [ -n "$line" ] || return 0
+    should_suppress_group_marker_line "$line" && return 0
+    printf '%s\n' "$line"
+}
+
+normalize_group_output_chunk() {
+    if [ -z "${RUNNER_CHUNK_SENTINEL:-}" ]; then
+        RUNNER_CHUNK_SENTINEL="$(printf '\001')"
+    fi
+    chunk="$(cat; printf '%s' "$RUNNER_CHUNK_SENTINEL")"
+    chunk="${chunk%"$RUNNER_CHUNK_SENTINEL"}"
+
+    [ -n "$chunk" ] || return 0
+
+    if [ -n "${STREAM_GROUP_OUTPUT_FRAGMENT:-}" ]; then
+        chunk="${STREAM_GROUP_OUTPUT_FRAGMENT}${chunk}"
+    fi
+    STREAM_GROUP_OUTPUT_FRAGMENT=""
+
+    while :; do
+        case "$chunk" in
+            *'
+'*)
+                line=${chunk%%'
+'*}
+                chunk=${chunk#*'
+'}
+                emit_normalized_group_line "$line"
+                ;;
+            *)
+                STREAM_GROUP_OUTPUT_FRAGMENT="$chunk"
+                break
+                ;;
+        esac
+    done
+}
+
+flush_group_output_fragment() {
+    [ -n "${STREAM_GROUP_OUTPUT_FRAGMENT:-}" ] || return 0
+    emit_normalized_group_line "$STREAM_GROUP_OUTPUT_FRAGMENT"
+    STREAM_GROUP_OUTPUT_FRAGMENT=""
 }
 
 run_group_script() {
@@ -1066,6 +1134,8 @@ run_group_script() {
     fi
 
     prime_group_output_stream
+    STREAM_GROUP_OUTPUT_FRAGMENT=""
+    emit_group_start "$group"
 
     (
         cd "$run_dir" || exit 125
@@ -1172,10 +1242,12 @@ run_group_script() {
     fi
     refresh_runner_timeout_state
     stream_group_output_incremental "$output_file" "$streamed_bytes"
+    flush_group_output_fragment
     cleanup_new_processes_since_snapshot
     cleanup_iozone_stage
     runner_debug "#### OSCOMP RUNNER END ${script} STATUS ${status} ####"
     bb rm -f "$output_file" 2>/dev/null || true
+    [ "$status" -eq 124 ] || emit_group_end "$group"
     return "$status"
 }
 

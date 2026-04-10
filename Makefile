@@ -1,7 +1,7 @@
 # Build Options
 ARCH ?= riscv64
 export ARCH
-LOG ?= error
+LOG ?= off
 export LOG
 BANNER ?= n
 export BANNER
