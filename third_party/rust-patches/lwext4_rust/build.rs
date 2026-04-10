@@ -2,6 +2,16 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+struct CrossToolchain {
+    cc: String,
+    cxx: String,
+    ar: String,
+    as_: String,
+    objcopy: String,
+    objdump: String,
+    size: String,
+}
+
 fn main() {
     let c_path = PathBuf::from("c/lwext4")
         .canonicalize()
@@ -9,6 +19,7 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let toolchain = discover_cross_toolchain(&arch);
     let lwext4_lib = &format!("lwext4-{arch}");
     {
         let status = Command::new("make")
@@ -17,6 +28,13 @@ fn main() {
                 "-C",
                 c_path.to_str().expect("invalid path of lwext4"),
             ])
+            .env("CC", &toolchain.cc)
+            .env("CXX", &toolchain.cxx)
+            .env("AR", &toolchain.ar)
+            .env("AS", &toolchain.as_)
+            .env("OBJCOPY", &toolchain.objcopy)
+            .env("OBJDUMP", &toolchain.objdump)
+            .env("SIZE", &toolchain.size)
             .arg(format!("ARCH={arch}"))
             .arg(format!(
                 "ULIBC={}",
@@ -32,8 +50,7 @@ fn main() {
         assert!(status.success());
     }
     {
-        let cc = &format!("{arch}-linux-musl-gcc");
-        let output = Command::new(cc)
+        let output = Command::new(&toolchain.cc)
             .args(["-print-sysroot"])
             .output()
             .expect("failed to execute process: gcc -print-sysroot");
@@ -42,13 +59,70 @@ fn main() {
         let sysroot = sysroot.trim_end();
         let sysroot_inc = &format!("-I{sysroot}/include/");
 
-        generates_bindings_to_rust(arch.as_str(), cc.as_str(), sysroot_inc, &out_dir);
+        generates_bindings_to_rust(arch.as_str(), &toolchain.cc, sysroot_inc, &out_dir);
     }
 
     println!("cargo:rustc-link-lib=static={lwext4_lib}");
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rerun-if-changed=c/wrapper.h");
     println!("cargo:rerun-if-changed={}/src", c_path.to_str().unwrap());
+}
+
+fn find_in_path(cmd: &str) -> Option<String> {
+    let path = env::var_os("PATH")?;
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join(cmd);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+fn find_tool(candidates: &[String]) -> Option<String> {
+    for candidate in candidates {
+        if let Some(found) = find_in_path(candidate) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn discover_cross_toolchain(arch: &str) -> CrossToolchain {
+    for family in [
+        format!("{arch}-linux-musl"),
+        format!("{arch}-linux-gnu"),
+    ] {
+        let cc = find_tool(&[format!("{family}-gcc"), format!("{family}-cc")]);
+        let ar = find_tool(&[format!("{family}-ar")]);
+        let as_ = find_tool(&[format!("{family}-as")]);
+        let objcopy = find_tool(&[format!("{family}-objcopy")]);
+        let objdump = find_tool(&[format!("{family}-objdump")]);
+        let size = find_tool(&[format!("{family}-size")]);
+
+        if let (Some(cc), Some(ar), Some(as_), Some(objcopy), Some(objdump), Some(size)) =
+            (cc, ar, as_, objcopy, objdump, size)
+        {
+            let cxx = find_tool(&[format!("{family}-g++"), format!("{family}-c++")])
+                .unwrap_or_else(|| cc.clone());
+            if family.ends_with("-linux-gnu") {
+                println!(
+                    "cargo:warning=lwext4_rust falling back to GNU cross toolchain family {family}"
+                );
+            }
+            return CrossToolchain {
+                cc,
+                cxx,
+                ar,
+                as_,
+                objcopy,
+                objdump,
+                size,
+            };
+        }
+    }
+
+    panic!("no usable cross toolchain found for architecture {arch}");
 }
 
 fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
