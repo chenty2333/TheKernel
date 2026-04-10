@@ -10,7 +10,7 @@ use alloc::{
 use core::{
     ffi::CStr,
     fmt::Write as _,
-    iter,
+    iter, str,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -20,14 +20,14 @@ use axtask::{AxTaskRef, TaskState, WeakAxTaskRef, current};
 use starry_process::Process;
 
 use crate::{
-    file::FD_TABLE,
+    file::{FD_TABLE, lease, pipe},
     mm::{Backend, system_memory_stats},
     mounts,
     pseudofs::{
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
         SimpleFileOperation, SimpleFs,
     },
-    task::{AsThread, TaskStat, get_task, get_visible_task, tasks},
+    task::{AsThread, get_task, get_visible_task, render_task_stat, tasks},
 };
 
 fn render_mounts() -> String {
@@ -216,7 +216,7 @@ impl SimpleDirOps for ThreadDir {
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
         Ok(match name {
             "stat" => SimpleFile::new_regular(fs, move || {
-                Ok(format!("{}", TaskStat::from_task(&task)?).into_bytes())
+                Ok(render_task_stat(&task)?.into_bytes())
             })
             .into(),
             "status" => SimpleFile::new_regular(fs, move || Ok(task_status(&task))).into(),
@@ -387,6 +387,18 @@ impl SimpleDirOps for ProcFsHandler {
 }
 
 fn builder(fs: Arc<SimpleFs>) -> DirMaker {
+    fn write_proc_u32(data: &[u8]) -> VfsResult<u32> {
+        str::from_utf8(data)
+            .ok()
+            .map(str::trim)
+            .and_then(|it| it.parse::<u32>().ok())
+            .ok_or(VfsError::InvalidInput)
+    }
+
+    fn is_proc_truncate_write(data: &[u8]) -> bool {
+        data.iter().all(|byte| byte.is_ascii_whitespace())
+    }
+
     let mut root = DirMapping::new();
     root.add(
         "mounts",
@@ -506,6 +518,54 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
 
     root.add("sys", {
         let mut sys = DirMapping::new();
+
+        sys.add("fs", {
+            let mut fs_dir = DirMapping::new();
+
+            fs_dir.add(
+                "pipe-max-size",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => {
+                            Ok(Some(format!("{}\n", pipe::pipe_max_size()).into_bytes()))
+                        }
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let value = write_proc_u32(data)? as usize;
+                            pipe::set_pipe_max_size(value);
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            fs_dir.add(
+                "lease-break-time",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => {
+                            Ok(Some(lease::formatted_lease_break_time().into_bytes()))
+                        }
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let value = write_proc_u32(data)?;
+                            if value == 0 {
+                                return Err(VfsError::InvalidInput);
+                            }
+                            lease::set_lease_break_time_secs(value);
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+
+            SimpleDir::new_maker(fs.clone(), Arc::new(fs_dir))
+        });
 
         sys.add("kernel", {
             let mut kernel = DirMapping::new();

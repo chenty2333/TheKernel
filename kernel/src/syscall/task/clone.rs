@@ -5,7 +5,7 @@ use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
 use axtask::{
-    AxTaskExt, SchedClass, current, future::block_on, sched_state, spawn_task_with_sched,
+    AxTaskExt, SchedClass, current, future::block_on, sched_state, spawn_task_with_sched_from,
 };
 use bitflags::bitflags;
 use kspin::SpinNoIrq;
@@ -17,7 +17,7 @@ use starry_vm::VmMutPtr;
 use crate::{
     file::{FD_TABLE, FileLike, PidFd, close_file_like},
     mm::copy_from_kernel,
-    task::{AsThread, ProcessData, Thread, add_task_to_table, new_user_task},
+    task::{AsThread, ProcessData, Thread, add_task_to_table, new_user_task, vm_write_in_aspace},
 };
 
 bitflags! {
@@ -172,7 +172,6 @@ impl CloneArgs {
             "do_clone <= flags: {:?}, exit_signal: {}, stack: {:#x}, tls: {:#x}",
             flags, exit_signal, stack, tls
         );
-
         let exit_signal = if exit_signal > 0 {
             Some(Signo::from_repr(exit_signal as u8).ok_or(AxError::InvalidInput)?)
         } else {
@@ -187,12 +186,6 @@ impl CloneArgs {
             new_uctx.set_tls(tls);
         }
         new_uctx.set_retval(0);
-
-        let set_child_tid = if flags.contains(CloneFlags::CHILD_SETTID) {
-            child_tid
-        } else {
-            0
-        };
 
         let curr = current();
         let old_proc_data = &curr.as_thread().proc_data;
@@ -218,7 +211,7 @@ impl CloneArgs {
             }
         }
 
-        let mut new_task = new_user_task(&curr.name(), new_uctx, set_child_tid);
+        let mut new_task = new_user_task(&curr.name(), new_uctx);
 
         let tid = new_task.id().as_u64() as Pid;
         if flags.contains(CloneFlags::PARENT_SETTID) && parent_tid != 0 {
@@ -242,8 +235,10 @@ impl CloneArgs {
                 old_proc_data.aspace()
             } else {
                 let parent_aspace = old_proc_data.aspace();
-                let mut aspace = parent_aspace.lock();
-                let aspace = aspace.try_clone()?;
+                let aspace = {
+                    let mut parent_guard = parent_aspace.lock();
+                    parent_guard.try_clone()?
+                };
                 copy_from_kernel(&mut aspace.lock())?;
                 aspace
             };
@@ -326,10 +321,6 @@ impl CloneArgs {
             new_proc_data.proc.add_thread(tid);
         }
 
-        let thr = Thread::new(tid, new_proc_data.clone());
-        if flags.contains(CloneFlags::CHILD_CLEARTID) {
-            thr.set_clear_child_tid(child_tid);
-        }
         let rollback_clone_setup = || {
             if flags.contains(CloneFlags::THREAD) {
                 old_proc_data.proc.remove_thread(tid);
@@ -337,6 +328,17 @@ impl CloneArgs {
                 new_proc_data.proc.abort_fork();
             }
         };
+        let thr = Thread::new(tid, new_proc_data.clone());
+        let child_aspace = new_proc_data.aspace();
+        if flags.contains(CloneFlags::CHILD_SETTID) && child_tid != 0 {
+            if let Err(err) = vm_write_in_aspace(&child_aspace, child_tid as *mut Pid, tid) {
+                rollback_clone_setup();
+                return Err(err);
+            }
+        }
+        if flags.contains(CloneFlags::CHILD_CLEARTID) {
+            thr.set_clear_child_tid(child_tid);
+        }
         if flags.contains(CloneFlags::PIDFD) && pidfd != 0 {
             let pidfd_obj = if flags.contains(CloneFlags::THREAD) {
                 PidFd::new_thread(&thr)
@@ -362,7 +364,7 @@ impl CloneArgs {
             new_proc_data.begin_vfork(curr.id().as_u64() as Pid);
         }
 
-        let task = spawn_task_with_sched(new_task, child_sched_state);
+        let task = spawn_task_with_sched_from(new_task, child_sched_state, &curr);
         add_task_to_table(&task);
 
         if flags.contains(CloneFlags::VFORK) {
@@ -435,6 +437,9 @@ mod tests {
             flags: CloneFlags::from_bits_retain((CLONE_DETACHED | CLONE_PIDFD) as u64),
             ..Default::default()
         };
-        assert_eq!(args.validate_for(CloneApi::Clone), Err(AxError::InvalidInput));
+        assert_eq!(
+            args.validate_for(CloneApi::Clone),
+            Err(AxError::InvalidInput)
+        );
     }
 }

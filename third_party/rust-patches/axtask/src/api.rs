@@ -154,6 +154,24 @@ pub fn spawn_task_with_sched(task: TaskInner, sched_state: SchedState) -> AxTask
     task_ref
 }
 
+/// Adds the given task to the run queue with the specified scheduling state,
+/// inheriting the parent's fair vruntime when applicable.
+#[cfg(feature = "sched-cfs")]
+pub fn spawn_task_with_sched_from(
+    task: TaskInner,
+    sched_state: SchedState,
+    parent: &AxTaskRef,
+) -> AxTaskRef {
+    let task_ref = task.into_arc();
+    assert!(
+        task_ref.configure(sched_state),
+        "invalid initial scheduling state"
+    );
+    task_ref.inherit_fair_vruntime_from(parent);
+    select_run_queue::<NoPreemptIrqSave>(&task_ref).add_task(task_ref.clone());
+    task_ref
+}
+
 /// Spawns a new task with the given parameters.
 ///
 /// Returns the task reference.
@@ -225,6 +243,16 @@ pub fn sched_state(task: &AxTaskRef) -> SchedState {
 pub fn set_sched_state(task: &AxTaskRef, sched_state: SchedState) -> bool {
     crate::run_queue::task_run_queue::<NoPreemptIrqSave>(task)
         .set_task_sched_state(task, sched_state)
+}
+
+/// Opportunistically reclaims exited tasks queued on the current CPU.
+///
+/// This complements the dedicated GC task for workloads that reap large child
+/// bursts and immediately continue with more forks, where waiting for the GC
+/// task to run can retain many dead task stacks and address spaces longer than
+/// necessary.
+pub fn reclaim_exited_tasks() {
+    crate::run_queue::reclaim_exited_tasks_current_cpu();
 }
 
 /// Set the affinity for the current task.

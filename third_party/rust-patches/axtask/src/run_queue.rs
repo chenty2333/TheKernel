@@ -831,32 +831,7 @@ impl AxRunQueue {
 
 fn poll_gc(cx: &mut Context<'_>) -> Poll<()> {
     loop {
-        // Drop all exited tasks and recycle resources.
-        let n = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.len());
-        for _ in 0..n {
-            // Do not do the slow drops in the critical section.
-            let Some(task) = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.pop_front())
-            else {
-                continue;
-            };
-            match Arc::try_unwrap(task) {
-                Ok(task) => {
-                    // Only recycle the stack after the final strong reference is
-                    // gone; before this point, joiners or scheduler handoff may
-                    // still legitimately hold the task alive.
-                    let mut task = task.into_inner();
-                    if let Some(stack) = task.take_kernel_stack() {
-                        recycle_task_stack(stack);
-                    }
-                    drop(task);
-                }
-                Err(task) => {
-                    // Otherwise (e.g, `switch_to` is not compeleted, held by the
-                    // joiner, etc), push it back and wait for them to drop first.
-                    EXITED_TASKS.with_current(|exited_tasks| exited_tasks.push_back(task));
-                }
-            }
-        }
+        reclaim_exited_tasks_current_cpu();
         // Note: we cannot block current task with preemption disabled,
         // use `current_ref_raw` to get the `WAIT_FOR_EXIT`'s reference here to avoid
         // the use of `NoPreemptGuard`. Since gc task is pinned to the current
@@ -873,6 +848,34 @@ fn poll_gc(cx: &mut Context<'_>) -> Poll<()> {
     }
 
     Poll::Pending
+}
+
+pub(crate) fn reclaim_exited_tasks_current_cpu() {
+    // Drop all exited tasks and recycle resources.
+    let n = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.len());
+    for _ in 0..n {
+        // Do not do the slow drops in the critical section.
+        let Some(task) = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.pop_front()) else {
+            continue;
+        };
+        match Arc::try_unwrap(task) {
+            Ok(task) => {
+                // Only recycle the stack after the final strong reference is
+                // gone; before this point, joiners or scheduler handoff may
+                // still legitimately hold the task alive.
+                let mut task = task.into_inner();
+                if let Some(stack) = task.take_kernel_stack() {
+                    recycle_task_stack(stack);
+                }
+                drop(task);
+            }
+            Err(task) => {
+                // Otherwise (e.g, `switch_to` is not compeleted, held by the
+                // joiner, etc), push it back and wait for them to drop first.
+                EXITED_TASKS.with_current(|exited_tasks| exited_tasks.push_back(task));
+            }
+        }
+    }
 }
 
 /// The task routine for migrating the current task to the correct CPU.

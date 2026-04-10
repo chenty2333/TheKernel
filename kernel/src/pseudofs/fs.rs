@@ -1,10 +1,11 @@
 use alloc::{string::String, sync::Arc};
-use core::{any::Any, time::Duration};
+use core::any::Any;
 
 use axfs_ng_vfs::{
     DeviceId, DirEntry, DirNode, Filesystem, FilesystemOps, Metadata, MetadataUpdate, NodeOps,
     NodePermission, NodeType, Reference, StatFs, VfsResult, path::MAX_NAME_LEN,
 };
+use axhal::time::wall_time;
 use axsync::Mutex;
 use slab::Slab;
 
@@ -95,6 +96,7 @@ impl SimpleFsNode {
     /// Creates a new filesystem node.
     pub fn new(fs: Arc<SimpleFs>, node_type: NodeType, mode: NodePermission) -> Self {
         let ino = fs.alloc_inode();
+        let now = wall_time();
         let metadata = Metadata {
             device: 0,
             inode: ino,
@@ -107,9 +109,9 @@ impl SimpleFsNode {
             block_size: 0,
             blocks: 0,
             rdev: DeviceId::default(),
-            atime: Duration::default(),
-            mtime: Duration::default(),
-            ctime: Duration::default(),
+            atime: now,
+            mtime: now,
+            ctime: now,
         };
         Self {
             fs,

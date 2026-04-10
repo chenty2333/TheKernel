@@ -6,7 +6,7 @@ mod dir;
 mod file;
 mod fs;
 mod proc;
-mod tmp;
+pub(crate) mod tmp;
 
 use alloc::sync::Arc;
 

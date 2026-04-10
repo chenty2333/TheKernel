@@ -10,7 +10,7 @@ use linux_raw_sys::net::{
 
 use super::addr::SocketAddrExt;
 use crate::{
-    file::{FileLike, Socket, add_file_description},
+    file::{AfAlgSocket, FileLike, Socket, add_file_description},
     mm::{IoVec, IoVectorBuf, UserConstPtr, UserPtr, VmBytes, VmBytesMut},
     syscall::net::{CMsg, CMsgBuilder},
 };
@@ -57,6 +57,11 @@ pub fn sys_sendto(
 
 pub fn sys_sendmsg(fd: i32, msg: UserConstPtr<msghdr>, flags: u32) -> AxResult<isize> {
     let msg = msg.get_as_ref()?;
+    if let Ok(socket) = AfAlgSocket::from_fd(fd) {
+        debug!("sys_sendmsg <= fd: {fd}, flags: {flags}, af_alg");
+        return socket.sendmsg(msg).map(|sent| sent as isize);
+    }
+
     let mut cmsg = Vec::new();
     if !msg.msg_control.is_null() {
         let mut ptr = msg.msg_control as usize;

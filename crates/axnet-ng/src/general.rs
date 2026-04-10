@@ -69,6 +69,14 @@ impl GeneralOptions {
         (nanos > 0).then(|| Duration::from_nanos(nanos))
     }
 
+    pub fn send_buffer(&self) -> usize {
+        self.send_buffer.load(Ordering::Relaxed)
+    }
+
+    pub fn recv_buffer(&self) -> usize {
+        self.recv_buffer.load(Ordering::Relaxed)
+    }
+
     pub fn set_device_mask(&self, mask: u64) {
         self.device_mask.store(mask, Ordering::Release);
     }

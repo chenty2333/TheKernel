@@ -95,7 +95,19 @@ impl SimpleFile {
 impl NodeOps for SimpleFile {
     fn inode(&self) -> u64;
 
-    fn metadata(&self) -> VfsResult<Metadata>;
+    fn metadata(&self) -> VfsResult<Metadata> {
+        // Dynamic pseudo-files are looked up via metadata() before every open.
+        // Recomputing size there would force read_all() during lookup and then
+        // again during the actual read, which is prohibitively expensive for
+        // hot procfs paths such as /proc/[pid]/stat.
+        Ok(self.node.metadata.lock().clone())
+    }
+
+    fn len(&self) -> VfsResult<u64> {
+        let len = self.ops.read_all()?.len() as u64;
+        self.node.metadata.lock().size = len;
+        Ok(len)
+    }
 
     fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()>;
 
@@ -107,10 +119,6 @@ impl NodeOps for SimpleFile {
         self
     }
 
-    fn len(&self) -> VfsResult<u64> {
-        Ok(self.ops.read_all()?.len() as u64)
-    }
-
     fn flags(&self) -> NodeFlags {
         NodeFlags::NON_CACHEABLE
     }
@@ -119,6 +127,7 @@ impl NodeOps for SimpleFile {
 impl FileNodeOps for SimpleFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         let data = self.ops.read_all()?;
+        self.node.metadata.lock().size = data.len() as u64;
         if offset >= data.len() as u64 {
             return Ok(0);
         }
@@ -129,11 +138,14 @@ impl FileNodeOps for SimpleFile {
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
-        let data = self.ops.read_all()?;
-        if offset == 0 && buf.len() >= data.len() {
+        // Proc-style control files treat each write from offset 0 as a full
+        // value replacement instead of patching the previous text contents.
+        if offset == 0 {
             self.ops.write_all(buf)?;
+            self.node.metadata.lock().size = buf.len() as u64;
             return Ok(buf.len());
         }
+        let data = self.ops.read_all()?;
         let mut data = data.to_vec();
         let end_pos = offset + buf.len() as u64;
         if end_pos > data.len() as u64 {
@@ -141,6 +153,7 @@ impl FileNodeOps for SimpleFile {
         }
         data[offset as usize..end_pos as usize].copy_from_slice(buf);
         self.ops.write_all(&data)?;
+        self.node.metadata.lock().size = data.len() as u64;
         Ok(buf.len())
     }
 
@@ -148,19 +161,29 @@ impl FileNodeOps for SimpleFile {
         let mut data = self.ops.read_all()?.to_vec();
         data.extend_from_slice(buf);
         self.ops.write_all(&data)?;
+        self.node.metadata.lock().size = data.len() as u64;
         Ok((buf.len(), data.len() as u64))
     }
 
     fn set_len(&self, len: u64) -> VfsResult<()> {
         let data = self.ops.read_all()?;
         match len.cmp(&(data.len() as u64)) {
-            Ordering::Less => self.ops.write_all(&data[..len as usize]),
+            Ordering::Less => {
+                self.ops.write_all(&data[..len as usize])?;
+                self.node.metadata.lock().size = len;
+                Ok(())
+            }
             Ordering::Greater => {
                 let mut data = data.to_vec();
                 data.resize(len as usize, 0);
-                self.ops.write_all(&data)
+                self.ops.write_all(&data)?;
+                self.node.metadata.lock().size = len;
+                Ok(())
             }
-            _ => Ok(()),
+            _ => {
+                self.node.metadata.lock().size = len;
+                Ok(())
+            }
         }
     }
 

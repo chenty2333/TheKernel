@@ -14,14 +14,14 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axsync::Mutex;
-use axtask::{current, future::block_on};
+use axtask::{WeakAxTaskRef, current, future::block_on};
 use hashbrown::HashMap;
 use kspin::SpinNoIrq;
 use memory_addr::VirtAddr;
 
 use crate::{
     mm::{AddrSpace, Backend, SharedPages},
-    task::{AlarmClock, AsThread, sleep_until_clock},
+    task::{AlarmClock, AsThread, ProcStateHint, sleep_until_clock},
 };
 
 /// Wait queue used by futex.
@@ -36,6 +36,7 @@ struct WaiterEntry {
     awakened: bool,
     cancelled: bool,
     owner: Weak<FutexEntry>,
+    task: WeakAxTaskRef,
     waker: Option<Waker>,
 }
 
@@ -61,6 +62,7 @@ impl<F> Drop for WaitFuture<'_, F> {
                     return;
                 }
                 waiter.cancelled = true;
+                clear_waiter_proc_state(&waiter);
                 waiter.owner.clone()
             };
 
@@ -118,13 +120,28 @@ impl<F: FnOnce() -> AxResult<bool>> Future for WaitFuture<'_, F> {
             awakened: false,
             cancelled: false,
             owner: self.owner.clone(),
+            task: Arc::downgrade(&current()),
             waker: Some(cx.waker().clone()),
         }));
         self.queue.queue.lock().push_back(waiter.clone());
+        if let Some(task) = waiter.lock().task.upgrade()
+            && let Some(thread) = task.try_as_thread()
+        {
+            thread.set_proc_state_hint(ProcStateHint::Interruptible);
+        }
         self.waiter = Some(waiter);
         Poll::Pending
     }
 }
+
+fn clear_waiter_proc_state(waiter: &WaiterEntry) {
+    if let Some(task) = waiter.task.upgrade()
+        && let Some(thread) = task.try_as_thread()
+    {
+        thread.set_proc_state_hint(ProcStateHint::None);
+    }
+}
+
 impl WaitQueue {
     /// Creates a new `WaitQueue`.
     pub fn new() -> Self {
@@ -198,11 +215,13 @@ impl WaitQueue {
         self.queue.lock().retain(|waiter| {
             let mut waiter = waiter.lock();
             if waiter.cancelled {
+                clear_waiter_proc_state(&waiter);
                 false
             } else if woke >= count || (waiter.bitset & mask) == 0 {
                 true
             } else {
                 waiter.awakened = true;
+                clear_waiter_proc_state(&waiter);
                 if let Some(waker) = waiter.waker.take() {
                     waker.wake();
                 }
@@ -339,6 +358,7 @@ mod tests {
                 awakened: false,
                 cancelled: true,
                 owner: Arc::downgrade(&src),
+                task: WeakAxTaskRef::new(),
                 waker: None,
             })));
 
@@ -358,6 +378,7 @@ mod tests {
                 awakened: false,
                 cancelled: true,
                 owner: Arc::downgrade(&src),
+                task: WeakAxTaskRef::new(),
                 waker: None,
             })));
 

@@ -368,6 +368,16 @@ impl BackendOps for CowBackend {
     ) -> AxResult<Backend> {
         let cow_flags = flags - MappingFlags::WRITE;
         pages_in(range, self.size)?;
+        if self.file.is_some() && flags.contains(MappingFlags::WRITE) {
+            // Fork must snapshot the parent's current private data image, not the
+            // original ELF file contents. Populate writable file-backed pages in
+            // the parent before sharing them read-only with the child.
+            for vaddr in pages_in(range, self.size)? {
+                if matches!(old_pt.query(vaddr), Err(PagingError::NotMapped)) {
+                    self.alloc_new_at(vaddr, cow_flags, old_pt)?;
+                }
+            }
+        }
         let materialized = old_pt.collect_present_leaves(range.start, range.size())?;
         if !materialized.is_empty() {
             self.mark_materialized();

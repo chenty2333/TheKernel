@@ -3,7 +3,7 @@ use axtask::TaskInner;
 use memory_addr::MemoryAddr;
 use starry_process::Pid;
 use starry_signal::{SignalInfo, Signo};
-use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
+use starry_vm::vm_write_slice;
 
 use super::{
     AsThread, TimerState, check_signals, do_exit, has_pending_fatal_signal, raise_signal_fatal,
@@ -38,15 +38,10 @@ fn map_other_exception(exc_info: &ExceptionInfo) -> Signo {
 }
 
 /// Create a new user task.
-pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) -> TaskInner {
+pub fn new_user_task(name: &str, mut uctx: UserContext) -> TaskInner {
     TaskInner::new(
         move || {
             let curr = axtask::current();
-
-            if let Some(tid) = (set_child_tid as *mut Pid).nullable() {
-                tid.vm_write(curr.id().as_u64() as Pid).ok();
-            }
-
             info!("Enter user space: ip={:#x}, sp={:#x}", uctx.ip(), uctx.sp());
 
             let thr = curr.as_thread();
@@ -79,9 +74,27 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                             aspace_handle.lock().handle_page_fault(addr, flags)
                         };
                         if !handled {
+                            #[cfg(target_arch = "riscv64")]
                             info!(
-                                "{:?}: segmentation fault at {:#x} {:?}",
-                                thr.proc_data.proc, addr, flags
+                                "{:?}: segmentation fault at {:#x} {:?}, pc={:#x}, ra={:#x}, sp={:#x}, a0={:#x}, a1={:#x}, tp={:#x}",
+                                thr.proc_data.proc,
+                                addr,
+                                flags,
+                                uctx.ip(),
+                                uctx.regs.ra,
+                                uctx.sp(),
+                                uctx.regs.a0,
+                                uctx.regs.a1,
+                                uctx.regs.tp,
+                            );
+                            #[cfg(not(target_arch = "riscv64"))]
+                            info!(
+                                "{:?}: segmentation fault at {:#x} {:?}, pc={:#x}, sp={:#x}",
+                                thr.proc_data.proc,
+                                addr,
+                                flags,
+                                uctx.ip(),
+                                uctx.sp(),
                             );
                             raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGSEGV))
                                 .expect("Failed to send SIGSEGV");

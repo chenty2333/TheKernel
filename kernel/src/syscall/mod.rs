@@ -197,12 +197,58 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         #[cfg(target_arch = "x86_64")]
         Sysno::chmod => sys_chmod(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::fchmod => sys_fchmod(uctx.arg0() as _, uctx.arg1() as _),
-        Sysno::fchmodat | Sysno::fchmodat2 => sys_fchmodat(
+        Sysno::fchmodat => sys_fchmodat(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _, 0),
+        Sysno::fchmodat2 => sys_fchmodat(
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
+        Sysno::setxattr => sys_setxattr(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+            uctx.arg4() as _,
+        ),
+        Sysno::lsetxattr => sys_lsetxattr(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+            uctx.arg4() as _,
+        ),
+        Sysno::fsetxattr => sys_fsetxattr(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+            uctx.arg4() as _,
+        ),
+        Sysno::getxattr => sys_getxattr(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
+        Sysno::lgetxattr => sys_lgetxattr(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
+        Sysno::fgetxattr => sys_fgetxattr(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
+        Sysno::listxattr => sys_listxattr(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::llistxattr => sys_llistxattr(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::flistxattr => sys_flistxattr(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::removexattr => sys_removexattr(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::lremovexattr => sys_lremovexattr(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::fremovexattr => sys_fremovexattr(uctx.arg0() as _, uctx.arg1() as _),
         #[cfg(target_arch = "x86_64")]
         Sysno::readlink => sys_readlink(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         Sysno::readlinkat => sys_readlinkat(
@@ -216,6 +262,12 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         #[cfg(target_arch = "x86_64")]
         Sysno::utimes => sys_utimes(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::utimensat => sys_utimensat(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
+        Sysno::mknodat => sys_mknodat(
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -292,6 +344,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg2() as _,
             uctx.arg3() as _,
             uctx.arg4() as _,
+            uctx.arg5() as _,
         ),
         Sysno::pwritev2 => sys_pwritev2(
             uctx.arg0() as _,
@@ -299,6 +352,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg2() as _,
             uctx.arg3() as _,
             uctx.arg4() as _,
+            uctx.arg5() as _,
         ),
         Sysno::sendfile => sys_sendfile(
             uctx.arg0() as _,
@@ -437,7 +491,8 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         ),
         #[cfg(target_arch = "x86_64")]
         Sysno::access => sys_access(uctx.arg0() as _, uctx.arg1() as _),
-        Sysno::faccessat | Sysno::faccessat2 => sys_faccessat2(
+        Sysno::faccessat => sys_faccessat(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::faccessat2 => sys_faccessat2(
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
@@ -513,9 +568,18 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg3() as _,
         ),
         Sysno::getpriority => sys_getpriority(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::setpriority => sys_setpriority(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
 
         // task ops
         Sysno::execve => sys_execve(uctx, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::execveat => sys_execveat(
+            uctx,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+            uctx.arg4() as _,
+        ),
         Sysno::set_tid_address => sys_set_tid_address(uctx.arg0()),
         #[cfg(target_arch = "x86_64")]
         Sysno::arch_prctl => sys_arch_prctl(uctx, uctx.arg0() as _, uctx.arg1() as _),
@@ -532,6 +596,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
+        Sysno::getrlimit => sys_getrlimit(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::capget => sys_capget(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::capset => sys_capset(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::umask => sys_umask(uctx.arg0() as _),
@@ -782,9 +847,12 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg3() as _,
             uctx.arg4() as _,
         ),
-        Sysno::io_uring_register => {
-            sys_io_uring_register(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2(), uctx.arg3() as _)
-        }
+        Sysno::io_uring_register => sys_io_uring_register(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2(),
+            uctx.arg3() as _,
+        ),
         Sysno::inotify_init1 => sys_inotify_init1(uctx.arg0() as _),
         Sysno::inotify_add_watch => {
             sys_inotify_add_watch(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
@@ -805,7 +873,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::timer_create | Sysno::timer_gettime | Sysno::timer_settime => Ok(0),
 
         _ => {
-            warn!("Unimplemented syscall: {sysno}");
+            debug!("Unimplemented syscall: {sysno}");
             Err(AxError::Unsupported)
         }
     };

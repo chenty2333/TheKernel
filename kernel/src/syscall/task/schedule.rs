@@ -1,3 +1,4 @@
+use alloc::{vec, vec::Vec};
 use core::{mem::size_of, time::Duration};
 
 use axerrno::{AxError, AxResult};
@@ -18,7 +19,10 @@ use starry_process::Pid;
 use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use crate::{
-    task::{AlarmClock, AsThread, get_process_group, get_task, processes, sleep_until_clock},
+    task::{
+        AlarmClock, AsThread, ProcStateHint, get_process_group, get_task, processes,
+        sleep_until_clock, with_proc_state_hint,
+    },
     time::TimeValueLike,
 };
 
@@ -204,6 +208,38 @@ where
     best.ok_or(AxError::NoSuchProcess)
 }
 
+fn clamp_nice(prio: i32) -> i8 {
+    prio.clamp(-20, 19) as i8
+}
+
+fn can_adjust_task_nice(task: &AxTaskRef, new_nice: i8) -> AxResult<()> {
+    let actor = current();
+    let actor_thread = actor.as_thread();
+    let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+
+    if actor_thread.proc_data.euid() != 0
+        && actor_thread.proc_data.euid() != target_thread.proc_data.uid()
+        && actor_thread.proc_data.euid() != target_thread.proc_data.euid()
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
+
+    let current_nice = sched_state(task).nice;
+    if actor_thread.proc_data.euid() != 0 && new_nice < current_nice {
+        return Err(AxError::PermissionDenied);
+    }
+
+    Ok(())
+}
+
+fn set_task_nice(task: &AxTaskRef, new_nice: i8) -> AxResult<()> {
+    can_adjust_task_nice(task, new_nice)?;
+
+    let mut state = sched_state(task);
+    state.nice = new_nice;
+    apply_sched_state(task, state).map(|_| ())
+}
+
 pub fn sys_sched_yield() -> AxResult<isize> {
     axtask::yield_now();
     Ok(0)
@@ -216,10 +252,9 @@ fn sleep_relative(dur: TimeValue) -> TimeValue {
     let deadline = start.checked_add(dur).unwrap_or(Duration::MAX);
 
     // We detect EINTR manually if the slept time is not enough.
-    let _ = block_on(interruptible(sleep_until_clock(
-        AlarmClock::Monotonic,
-        deadline,
-    )));
+    let _ = with_proc_state_hint(ProcStateHint::Interruptible, || {
+        block_on(interruptible(sleep_until_clock(AlarmClock::Monotonic, deadline)))
+    });
 
     AlarmClock::Monotonic.now() - start
 }
@@ -227,7 +262,9 @@ fn sleep_relative(dur: TimeValue) -> TimeValue {
 fn sleep_absolute(clock: AlarmClock, deadline: TimeValue) -> bool {
     debug!("sleep_absolute <= clock: {clock:?}, deadline: {deadline:?}");
 
-    let _ = block_on(interruptible(sleep_until_clock(clock, deadline)));
+    let _ = with_proc_state_hint(ProcStateHint::Interruptible, || {
+        block_on(interruptible(sleep_until_clock(clock, deadline)))
+    });
     clock.now() >= deadline
 }
 
@@ -472,15 +509,71 @@ pub fn sys_getpriority(which: u32, who: u32) -> AxResult<isize> {
             )?))
         }
         PRIO_USER => {
-            if who != 0 {
-                return Err(AxError::NoSuchProcess);
-            }
+            let uid = if who == 0 {
+                current().as_thread().proc_data.uid()
+            } else {
+                who
+            };
             Ok(raw_priority_from_nice(min_nice_for_threads(
                 processes()
                     .into_iter()
+                    .filter(|proc_data| proc_data.uid() == uid || proc_data.euid() == uid)
                     .flat_map(|proc_data| proc_data.proc.threads()),
             )?))
         }
         _ => Err(AxError::InvalidInput),
     }
+}
+
+pub fn sys_setpriority(which: u32, who: u32, prio: i32) -> AxResult<isize> {
+    debug!("sys_setpriority <= which: {which}, who: {who}, prio: {prio}");
+
+    let new_nice = clamp_nice(prio);
+    let targets: Vec<AxTaskRef> = match which {
+        PRIO_PROCESS => {
+            if who == 0 {
+                vec![current().clone()]
+            } else {
+                vec![get_task(who)?]
+            }
+        }
+        PRIO_PGRP => {
+            let pgid = if who == 0 {
+                current().as_thread().proc_data.proc.group().pgid()
+            } else {
+                who
+            };
+            let group = get_process_group(pgid)?;
+            group
+                .processes()
+                .into_iter()
+                .flat_map(|proc| proc.threads())
+                .filter_map(|tid| get_task(tid).ok())
+                .collect()
+        }
+        PRIO_USER => {
+            let uid = if who == 0 {
+                current().as_thread().proc_data.uid()
+            } else {
+                who
+            };
+            processes()
+                .into_iter()
+                .filter(|proc_data| proc_data.uid() == uid || proc_data.euid() == uid)
+                .flat_map(|proc_data| proc_data.proc.threads())
+                .filter_map(|tid| get_task(tid).ok())
+                .collect()
+        }
+        _ => return Err(AxError::InvalidInput),
+    };
+
+    if targets.is_empty() {
+        return Err(AxError::NoSuchProcess);
+    }
+
+    for task in &targets {
+        set_task_nice(task, new_nice)?;
+    }
+
+    Ok(0)
 }

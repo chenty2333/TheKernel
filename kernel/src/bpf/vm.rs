@@ -270,9 +270,9 @@ impl<'a> BpfVm<'a> {
             let helper_id = insn.imm as u32;
             let mut hctx = HelperContext {
                 maps: self.maps,
-            map_value_regions: &mut self.map_value_regions,
-            ringbuf_reservations: &mut self.ringbuf_reservations,
-            stack: &mut self.stack,
+                map_value_regions: &mut self.map_value_regions,
+                ringbuf_reservations: &mut self.ringbuf_reservations,
+                stack: &mut self.stack,
                 ctx_base: self.ctx_base,
                 ctx_size: self.ctx_size,
                 aux_budget_remaining: &mut self.aux_budget_remaining,

@@ -12,7 +12,10 @@ use linux_raw_sys::general::{
 use starry_process::{Pid, Process, ZombieSnapshot};
 use starry_vm::{VmMutPtr, VmPtr};
 
-use crate::task::{AsThread, ProcessData, TaskUsage, get_process_data, has_pending_syscall_signal};
+use crate::task::{
+    AsThread, ProcessData, TaskUsage, cleanup_task_tables, get_process_data,
+    has_pending_syscall_signal,
+};
 
 const WAITPID_ALLOWED_BITS: u32 =
     WNOHANG | WUNTRACED | WCONTINUED | __WNOTHREAD | __WALL | __WCLONE;
@@ -337,7 +340,7 @@ pub fn sys_waitpid(
         }
     };
 
-    block_on(poll_fn(|cx| {
+    let result = block_on(poll_fn(|cx| {
         if let Some(res) = check_children().transpose() {
             return Poll::Ready(res);
         }
@@ -357,7 +360,10 @@ pub fn sys_waitpid(
         } else {
             Poll::Pending
         }
-    }))
+    }))?;
+    axtask::reclaim_exited_tasks();
+    cleanup_task_tables();
+    Ok(result)
 }
 
 /// Decodes a Linux-style wait status into (CLD_* code, si_status) for waitid.
@@ -483,7 +489,7 @@ pub fn sys_waitid(
         }
     };
 
-    block_on(poll_fn(|cx| {
+    let result = block_on(poll_fn(|cx| {
         if let Some(res) = check_children().transpose() {
             return Poll::Ready(res);
         }
@@ -503,5 +509,8 @@ pub fn sys_waitid(
         } else {
             Poll::Pending
         }
-    }))
+    }))?;
+    axtask::reclaim_exited_tasks();
+    cleanup_task_tables();
+    Ok(result)
 }

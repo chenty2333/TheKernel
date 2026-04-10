@@ -2,7 +2,10 @@ use axerrno::{AxError, AxResult};
 use axtask::current;
 use linux_raw_sys::general::{O_CLOEXEC, O_NONBLOCK};
 
-use crate::{file::{add_file_like, userfaultfd::UserfaultFile}, task::AsThread};
+use crate::{
+    file::{add_file_like, userfaultfd::UserfaultFile},
+    task::AsThread,
+};
 
 pub fn sys_userfaultfd(flags: i32) -> AxResult<isize> {
     let allowed = (O_CLOEXEC | O_NONBLOCK) as i32;

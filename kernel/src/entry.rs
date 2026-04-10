@@ -18,8 +18,9 @@ use crate::{
 
 /// Initialize and run initproc.
 pub fn init(args: &[String], envs: &[String]) {
+    const INIT_PID: Pid = 1;
+
     pseudofs::mount_all().expect("Failed to mount pseudofs");
-    spawn_alarm_task();
 
     let loc = FS_CONTEXT
         .lock()
@@ -41,12 +42,12 @@ pub fn init(args: &[String], envs: &[String]) {
         .unwrap_or_else(|e| panic!("Failed to load user app: {}", e));
 
     let uctx = UserContext::new(entry_vaddr.into(), ustack_top, 0);
-    let mut task = new_user_task(name, uctx, 0);
+    let mut task = new_user_task(name, uctx);
     task.ctx_mut().set_page_table_root(uspace.page_table_root());
 
-    let pid = task.id().as_u64() as Pid;
-    let proc = Process::new_init(pid, None);
-    proc.add_thread(pid);
+    let tid = task.id().as_u64() as Pid;
+    let proc = Process::new_init(INIT_PID, None);
+    proc.add_thread(tid);
 
     N_TTY.bind_to(&proc).expect("Failed to bind ntty");
 
@@ -66,8 +67,15 @@ pub fn init(args: &[String], envs: &[String]) {
             .expect("Failed to add stdio");
     }
 
-    let thr = Thread::new(pid, proc);
+    let thr = Thread::new(tid, proc);
+    if INIT_PID != tid {
+        thr.set_tid(INIT_PID);
+    }
     *task.task_ext_mut() = Some(AxTaskExt::from_impl(thr));
+
+    // Keep the init process user-visible as PID 1. Kernel-only alarm workers can
+    // consume later scheduler task IDs without changing that ABI.
+    spawn_alarm_task();
 
     let task = spawn_task_with_sched(task, SchedState::default());
     add_task_to_table(&task);

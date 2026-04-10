@@ -15,7 +15,7 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{
     cell::RefCell,
     ops::Deref,
-    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering},
 };
 
 use axerrno::{AxError, AxResult};
@@ -79,6 +79,11 @@ pub struct Thread {
     /// This is assumed to be `Sync` because it's only borrowed mutably during
     /// context switches, which is exclusive to the current thread.
     pub time: AssumeSync<RefCell<TimeManager>>,
+    /// Best-effort CPU usage snapshot that can be sampled without touching
+    /// the live time manager.
+    live_usage: AtomicTaskUsage,
+    /// Best-effort user-visible blocking state used by procfs.
+    proc_state_hint: AtomicU8,
 
     /// The OOM score adjustment value.
     oom_score_adj: AtomicI32,
@@ -106,6 +111,8 @@ impl Thread {
             visible_tid: AtomicU32::new(tid),
             robust_list_head: AtomicUsize::new(0),
             time: AssumeSync(RefCell::new(TimeManager::new())),
+            live_usage: AtomicTaskUsage::new(),
+            proc_state_hint: AtomicU8::new(ProcStateHint::None as u8),
             exit: Arc::new(AtomicBool::new(false)),
             oom_score_adj: AtomicI32::new(200),
             accessing_user_memory: AtomicBool::new(false),
@@ -198,6 +205,50 @@ impl Thread {
     pub fn set_accessing_user_memory(&self, accessing: bool) {
         self.accessing_user_memory
             .store(accessing, Ordering::Release);
+    }
+
+    /// Returns the last published CPU usage snapshot for this thread.
+    pub fn usage_snapshot(&self) -> TaskUsage {
+        self.live_usage.snapshot()
+    }
+
+    /// Publishes a CPU usage snapshot for lock-free readers such as procfs.
+    pub fn store_usage_snapshot(&self, usage: TaskUsage) {
+        self.live_usage.store(usage);
+    }
+
+    /// Returns the current procfs state hint.
+    pub(crate) fn proc_state_hint(&self) -> ProcStateHint {
+        ProcStateHint::from(self.proc_state_hint.load(Ordering::Acquire))
+    }
+
+    /// Replaces the current procfs state hint and returns the previous value.
+    pub(crate) fn swap_proc_state_hint(&self, hint: ProcStateHint) -> ProcStateHint {
+        ProcStateHint::from(self.proc_state_hint.swap(hint as u8, Ordering::AcqRel))
+    }
+
+    /// Restores the procfs state hint.
+    pub(crate) fn set_proc_state_hint(&self, hint: ProcStateHint) {
+        self.proc_state_hint.store(hint as u8, Ordering::Release);
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ProcStateHint {
+    None = 0,
+    Interruptible = 1,
+    Uninterruptible = 2,
+}
+
+impl From<u8> for ProcStateHint {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::None,
+            1 => Self::Interruptible,
+            2 => Self::Uninterruptible,
+            _ => Self::None,
+        }
     }
 }
 

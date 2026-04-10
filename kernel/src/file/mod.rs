@@ -1,3 +1,4 @@
+pub(crate) mod af_alg;
 #[cfg(feature = "bpf")]
 pub mod bpf;
 pub mod epoll;
@@ -6,10 +7,11 @@ pub mod flock;
 mod fs;
 pub mod inotify;
 pub mod io_uring;
+pub(crate) mod lease;
 mod net;
 pub(crate) mod permission;
 mod pidfd;
-mod pipe;
+pub(crate) mod pipe;
 pub mod signalfd;
 pub mod timerfd;
 pub mod userfaultfd;
@@ -31,11 +33,14 @@ use axpoll::{IoEvents, Pollable};
 use axtask::current;
 use downcast_rs::{DowncastSync, impl_downcast};
 use flatten_objects::FlattenObjects;
-use linux_raw_sys::general::{RLIMIT_NOFILE, stat, statx, statx_timestamp};
+use linux_raw_sys::general::{
+    RLIMIT_NOFILE, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, stat, statx, statx_timestamp,
+};
 use spin::RwLock;
 
 pub use self::{
-    fs::{Directory, File, ResolveAtResult, resolve_at, with_fs},
+    af_alg::AfAlgSocket,
+    fs::{Directory, File, ResolveAtResult, resolve_at, with_fs, with_path_fs},
     net::Socket,
     pidfd::PidFd,
     pipe::Pipe,
@@ -191,6 +196,33 @@ pub trait FileLike: Pollable + DowncastSync {
 }
 impl_downcast!(sync FileLike);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileLikeKind {
+    Regular,
+    Directory,
+    Fifo,
+    Socket,
+    Other,
+}
+
+impl FileLikeKind {
+    pub fn from_mode(mode: u32) -> Self {
+        match mode & S_IFMT {
+            S_IFREG => Self::Regular,
+            S_IFDIR => Self::Directory,
+            S_IFIFO => Self::Fifo,
+            S_IFSOCK => Self::Socket,
+            _ => Self::Other,
+        }
+    }
+
+    pub fn from_file_like(file: &dyn FileLike) -> Self {
+        file.stat()
+            .map(|stat| Self::from_mode(stat.mode))
+            .unwrap_or(Self::Other)
+    }
+}
+
 static FILE_DESCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct FileDescription {
@@ -214,6 +246,7 @@ impl FileDescription {
 impl Drop for FileDescription {
     fn drop(&mut self) {
         flock::release_owner(self.flock_owner);
+        lease::release_owner(self.flock_owner);
     }
 }
 

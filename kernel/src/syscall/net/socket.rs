@@ -18,7 +18,7 @@ use linux_raw_sys::{
 
 use super::addr::SocketAddrExt;
 use crate::{
-    file::{FileLike, Socket},
+    file::{AfAlgSocket, FileLike, Socket, af_alg},
     mm::{UserConstPtr, UserPtr},
     task::AsThread,
 };
@@ -43,6 +43,16 @@ fn require_bind_permissions(addr: &SocketAddrEx) -> AxResult<()> {
 pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     debug!("sys_socket <= domain: {domain}, ty: {raw_ty}, proto: {proto}");
     let ty = raw_ty & 0xFF;
+
+    if domain == af_alg::AF_ALG {
+        AfAlgSocket::validate_socket_type(ty, proto)?;
+        let socket = AfAlgSocket::new_listener();
+        if raw_ty & O_NONBLOCK != 0 {
+            socket.set_nonblocking(true)?;
+        }
+        let cloexec = raw_ty & O_CLOEXEC != 0;
+        return socket.add_to_fd_table(cloexec).map(|fd| fd as isize);
+    }
 
     let pid = current().as_thread().proc_data.proc.pid();
     let net_ns = current().as_thread().proc_data.net_ns.clone();
@@ -84,6 +94,13 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
 }
 
 pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult<isize> {
+    if let Ok(socket) = AfAlgSocket::from_fd(fd) {
+        let addr = af_alg::SockAddrAlg::read_from_user(addr, addrlen)?;
+        debug!("sys_bind <= fd: {fd}, af_alg: {addr:?}");
+        socket.bind(addr)?;
+        return Ok(0);
+    }
+
     let addr = SocketAddrEx::read_from_user(addr, addrlen)?;
     debug!("sys_bind <= fd: {fd}, addr: {addr:?}");
 
@@ -137,6 +154,17 @@ pub fn sys_accept4(
     debug!("sys_accept <= fd: {fd}, flags: {flags}");
 
     let cloexec = flags & O_CLOEXEC != 0;
+
+    if let Ok(socket) = AfAlgSocket::from_fd(fd) {
+        let request = socket.accept_request()?;
+        if flags & O_NONBLOCK != 0 {
+            request.set_nonblocking(true)?;
+        }
+        if !addr.is_null() {
+            *addrlen.get_as_mut()? = 0;
+        }
+        return request.add_to_fd_table(cloexec).map(|fd| fd as isize);
+    }
 
     let socket = Socket::from_fd(fd)?;
     let socket = Socket(socket.accept()?);

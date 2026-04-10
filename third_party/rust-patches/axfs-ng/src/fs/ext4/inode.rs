@@ -6,6 +6,7 @@ use axfs_ng_vfs::{
     Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission, NodeType, Reference, VfsError,
     VfsResult, WeakDirEntry,
 };
+use axhal::time::wall_time;
 use axpoll::{IoEvents, Pollable};
 use lwext4_rust::{FileAttr, InodeType};
 
@@ -228,6 +229,14 @@ impl DirNodeOps for Inode {
         let ino = fs
             .create(self.ino, name, inode_type, permission.bits() as _)
             .map_err(into_vfs_err)?;
+        let now = wall_time();
+        fs.with_inode_ref(ino, |inode| {
+            inode.set_atime(&now);
+            inode.set_mtime(&now);
+            inode.update_ctime();
+            Ok(())
+        })
+        .map_err(into_vfs_err)?;
         self.update_ctime_locked(&mut fs, ino)?;
 
         let reference = Reference::new(

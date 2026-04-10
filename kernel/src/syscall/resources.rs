@@ -1,6 +1,6 @@
 use axerrno::{AxError, AxResult};
 use axtask::current;
-use linux_raw_sys::general::{RLIM_NLIMITS, rlimit64, rusage};
+use linux_raw_sys::general::{RLIM_NLIMITS, rlimit, rlimit64, rusage};
 use starry_process::Pid;
 use starry_vm::{VmMutPtr, VmPtr};
 
@@ -42,6 +42,23 @@ pub fn sys_prlimit64(
         }
 
         limit.current = new_limit.rlim_cur;
+    }
+
+    Ok(0)
+}
+
+pub fn sys_getrlimit(resource: u32, old_limit: *mut rlimit) -> AxResult<isize> {
+    if resource >= RLIM_NLIMITS {
+        return Err(AxError::InvalidInput);
+    }
+
+    let proc_data = current().as_thread().proc_data.clone();
+    if let Some(old_limit) = old_limit.nullable() {
+        let limit = &proc_data.rlim.read()[resource];
+        old_limit.vm_write(rlimit {
+            rlim_cur: limit.current as _,
+            rlim_max: limit.max as _,
+        })?;
     }
 
     Ok(0)

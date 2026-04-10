@@ -1,13 +1,20 @@
-use alloc::{string::{String, ToString}, sync::Arc, vec, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
 use core::{ffi::c_char, future::poll_fn, task::Poll};
 
 use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
+use axfs_ng_vfs::NodeType;
 use axhal::uspace::UserContext;
 use axtask::{
     current,
     future::{block_on, interruptible},
 };
+use linux_raw_sys::general::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
 use starry_process::Pid;
 use starry_signal::{SignalAction, SignalDisposition, Signo};
 use starry_vm::vm_load_until_nul;
@@ -16,7 +23,7 @@ use starry_vm::vm_load_until_nul;
 use crate::task::reset_current_user_fpu_state;
 use crate::{
     config::USER_HEAP_BASE,
-    file::FD_TABLE,
+    file::{FD_TABLE, ResolveAtResult, resolve_at},
     mm::{copy_from_kernel, load_user_app, new_user_aspace_empty, vm_load_string},
     task::{
         AsThread, ProcessData, Thread, add_task_alias, check_signals, get_task,
@@ -89,16 +96,13 @@ fn wait_for_exec_group(
     }
 }
 
-pub fn sys_execve(
-    uctx: &mut UserContext,
-    path: *const c_char,
+const SUPPORTED_EXECVEAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+
+fn load_exec_args_env(
     argv: *const *const c_char,
     envp: *const *const c_char,
-) -> AxResult<isize> {
-    let path = vm_load_string(path)?;
-
+) -> AxResult<(Vec<String>, Vec<String>)> {
     let args = if argv.is_null() {
-        // Handle NULL argv (treat as empty array)
         Vec::new()
     } else {
         vm_load_until_nul(argv)?
@@ -113,7 +117,6 @@ pub fn sys_execve(
     };
 
     let envs = if envp.is_null() {
-        // Handle NULL envp (treat as empty array)
         Vec::new()
     } else {
         vm_load_until_nul(envp)?
@@ -122,21 +125,27 @@ pub fn sys_execve(
             .collect::<Result<Vec<_>, _>>()?
     };
 
-    debug!("sys_execve <= path: {path:?}, args: {args:?}, envs: {envs:?}");
+    Ok((args, envs))
+}
 
-    let curr = current();
-    let thr = curr.as_thread();
-    let proc_data = &thr.proc_data;
-    let curr_tid = curr.id().as_u64() as Pid;
-
-    let loc = FS_CONTEXT.lock().resolve(&path)?;
+fn do_execve(
+    uctx: &mut UserContext,
+    loc: axfs_ng_vfs::Location,
+    args: Vec<String>,
+    envs: Vec<String>,
+) -> AxResult<isize> {
     let abs_path = loc.absolute_path()?.to_string();
     let task_name = loc.name().to_string();
 
     let mut new_aspace = new_user_aspace_empty()?;
     copy_from_kernel(&mut new_aspace)?;
     let (entry_point, user_stack_base) =
-        load_user_app(&mut new_aspace, Some(path.as_str()), &args, &envs)?;
+        load_user_app(&mut new_aspace, Some(abs_path.as_str()), &args, &envs)?;
+
+    let curr = current();
+    let thr = curr.as_thread();
+    let proc_data = &thr.proc_data;
+    let curr_tid = curr.id().as_u64() as Pid;
 
     let mut exec_started = false;
     if proc_data.proc.threads().len() > 1 {
@@ -217,4 +226,58 @@ pub fn sys_execve(
     uctx.set_ip(entry_point.as_usize());
     uctx.set_sp(user_stack_base.as_usize());
     Ok(0)
+}
+
+pub fn sys_execve(
+    uctx: &mut UserContext,
+    path: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> AxResult<isize> {
+    let path = vm_load_string(path)?;
+    let (args, envs) = load_exec_args_env(argv, envp)?;
+
+    debug!("sys_execve <= path: {path:?}, args: {args:?}, envs: {envs:?}");
+
+    let loc = FS_CONTEXT.lock().resolve(&path)?;
+    do_execve(uctx, loc, args, envs)
+}
+
+pub fn sys_execveat(
+    uctx: &mut UserContext,
+    dirfd: i32,
+    path: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+    flags: i32,
+) -> AxResult<isize> {
+    if flags < 0 || (flags as u32) & !SUPPORTED_EXECVEAT_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let path = vm_load_string(path)?;
+    let (args, envs) = load_exec_args_env(argv, envp)?;
+    debug!(
+        "sys_execveat <= dirfd: {dirfd}, path: {path:?}, args: {args:?}, envs: {envs:?}, flags: \
+         {flags:#x}"
+    );
+
+    let resolved = if path.is_empty() {
+        if (flags as u32) & AT_EMPTY_PATH == 0 {
+            return Err(AxError::NotFound);
+        }
+        resolve_at(dirfd, None, flags as u32)?
+    } else {
+        resolve_at(dirfd, Some(path.as_str()), flags as u32)?
+    };
+
+    let loc = match resolved {
+        ResolveAtResult::File(loc) => loc,
+        ResolveAtResult::Other(_) => return Err(AxError::InvalidInput),
+    };
+    if (flags as u32) & AT_SYMLINK_NOFOLLOW != 0 && loc.node_type() == NodeType::Symlink {
+        return Err(axerrno::LinuxError::ELOOP.into());
+    }
+
+    do_execve(uctx, loc, args, envs)
 }

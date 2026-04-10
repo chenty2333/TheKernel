@@ -3,16 +3,19 @@ use alloc::{
     vec::Vec,
 };
 use core::{
+    alloc::Layout,
     ffi::c_long,
     sync::atomic::{AtomicU32, Ordering},
 };
 
 use axerrno::{AxError, AxResult};
+use axhal::paging::MappingFlags;
+use axsync::Mutex;
 use axtask::{AxTaskRef, TaskInner, WeakAxTaskRef, current};
 use bytemuck::AnyBitPattern;
 use kernel_guard::NoPreemptIrqSave;
 use linux_raw_sys::general::{FUTEX_OWNER_DIED, FUTEX_TID_MASK, FUTEX_WAITERS, ROBUST_LIST_LIMIT};
-use memory_addr::PhysAddr;
+use memory_addr::{MemoryAddr, PhysAddr, VirtAddr};
 use spin::RwLock;
 use starry_process::{Pid, ProcessGroup, Session, ZombieSnapshot};
 use starry_signal::{SignalInfo, Signo};
@@ -20,10 +23,10 @@ use starry_vm::{VmMutPtr, VmPtr};
 use weak_map::WeakMap;
 
 use super::{
-    AsThread, FutexKey, ProcessData, TaskUsage, TimerState, futex_table_for,
+    AsThread, FutexKey, ProcStateHint, ProcessData, TaskUsage, TimerState, futex_table_for,
     send_signal_thread_inner, send_signal_to_process, send_signal_to_thread,
 };
-use crate::mm::{UserPtr, access_user_memory};
+use crate::mm::{AddrSpace, UserPtr, access_user_memory};
 
 static TASK_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
 static TASK_ALIAS_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
@@ -33,6 +36,15 @@ static PROCESS_TABLE: RwLock<WeakMap<Pid, Weak<ProcessData>>> = RwLock::new(Weak
 static PROCESS_GROUP_TABLE: RwLock<WeakMap<Pid, Weak<ProcessGroup>>> = RwLock::new(WeakMap::new());
 
 static SESSION_TABLE: RwLock<WeakMap<Pid, Weak<Session>>> = RwLock::new(WeakMap::new());
+
+fn install_current_user_page_table_root(curr_ptr: *mut TaskInner, root: PhysAddr) {
+    unsafe {
+        (*curr_ptr).ctx_mut().set_page_table_root(root);
+        axhal::asm::write_user_page_table(root);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    axhal::asm::flush_tlb(None);
+}
 
 /// Cleanup expired entries in the task tables.
 ///
@@ -50,9 +62,15 @@ pub fn cleanup_task_tables() {
 /// to the corresponding tables.
 pub fn add_task_to_table(task: &AxTaskRef) {
     let tid = task.id().as_u64() as Pid;
+    let visible_tid = task.as_thread().tid();
 
     let mut task_table = TASK_TABLE.write();
     task_table.insert(tid, task);
+    drop(task_table);
+
+    if visible_tid != tid {
+        TASK_ALIAS_TABLE.write().insert(visible_tid, task);
+    }
 
     let proc_data = &task.as_thread().proc_data;
     let proc = &proc_data.proc;
@@ -119,6 +137,38 @@ pub fn get_visible_task(tid: Pid) -> AxResult<AxTaskRef> {
     Err(AxError::NoSuchProcess)
 }
 
+struct ProcStateHintGuard<'a> {
+    thread: Option<&'a super::Thread>,
+    prev: ProcStateHint,
+}
+
+impl Drop for ProcStateHintGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread {
+            thread.set_proc_state_hint(self.prev);
+        }
+    }
+}
+
+/// Temporarily publishes a procfs-visible blocking state for the current task.
+pub fn with_proc_state_hint<R>(hint: ProcStateHint, f: impl FnOnce() -> R) -> R {
+    let curr = current();
+    let guard = if let Some(thread) = curr.try_as_thread() {
+        ProcStateHintGuard {
+            thread: Some(thread),
+            prev: thread.swap_proc_state_hint(hint),
+        }
+    } else {
+        ProcStateHintGuard {
+            thread: None,
+            prev: ProcStateHint::None,
+        }
+    };
+    let result = f();
+    drop(guard);
+    result
+}
+
 /// Removes a task alias lookup key.
 pub fn remove_task_alias(alias: Pid) {
     TASK_ALIAS_TABLE.write().remove(&alias);
@@ -139,15 +189,32 @@ pub fn get_process_data(pid: Pid) -> AxResult<Arc<ProcessData>> {
 
 /// Finds the process group with the given PGID.
 pub fn get_process_group(pgid: Pid) -> AxResult<Arc<ProcessGroup>> {
-    PROCESS_GROUP_TABLE
-        .read()
-        .get(&pgid)
-        .ok_or(AxError::NoSuchProcess)
+    if let Some(group) = PROCESS_GROUP_TABLE.read().get(&pgid) {
+        return Ok(group);
+    }
+
+    let group = processes()
+        .into_iter()
+        .find_map(|proc_data| {
+            let group = proc_data.proc.group();
+            (group.pgid() == pgid).then_some(group)
+        })
+        .ok_or(AxError::NoSuchProcess)?;
+
+    remember_process_group(&group);
+    Ok(group)
 }
 
 /// Finds the session with the given SID.
 pub fn get_session(sid: Pid) -> AxResult<Arc<Session>> {
     SESSION_TABLE.read().get(&sid).ok_or(AxError::NoSuchProcess)
+}
+
+/// Publishes a process group and its session in the lookup tables.
+pub fn remember_process_group(group: &Arc<ProcessGroup>) {
+    PROCESS_GROUP_TABLE.write().insert(group.pgid(), group);
+    let session = group.session();
+    SESSION_TABLE.write().insert(session.sid(), &session);
 }
 
 /// Updates the current task's saved and active user page table root.
@@ -157,12 +224,48 @@ pub fn set_current_user_page_table_root(root: PhysAddr) {
     // SAFETY: this only mutates the current task's saved TaskContext while the task
     // is running on the current CPU, so no other code can access it concurrently.
     let curr_ptr = (&***curr) as *const TaskInner as *mut TaskInner;
-    unsafe {
-        (*curr_ptr).ctx_mut().set_page_table_root(root);
-        axhal::asm::write_user_page_table(root);
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    axhal::asm::flush_tlb(None);
+    install_current_user_page_table_root(curr_ptr, root);
+}
+
+/// Executes `f` with the current task temporarily bound to `root`.
+///
+/// Some kernel paths need to touch user memory on behalf of a freshly cloned or
+/// exiting task. Those writes must target the intended user page table instead
+/// of whichever root happens to be active at the moment.
+pub fn with_current_user_page_table_root<R>(root: PhysAddr, f: impl FnOnce() -> R) -> R {
+    let _guard = NoPreemptIrqSave::new();
+    let curr = current();
+    let curr_ptr = (&***curr) as *const TaskInner as *mut TaskInner;
+    let old_root = axhal::asm::read_user_page_table();
+    install_current_user_page_table_root(curr_ptr, root);
+    let result = f();
+    install_current_user_page_table_root(curr_ptr, old_root);
+    result
+}
+
+/// Writes `value` into `ptr` within `aspace_handle`.
+///
+/// The caller may target a different process or a not-yet-running child, so we
+/// must both pre-populate the destination pages in that address space and then
+/// execute the copy under the matching user page table root.
+pub fn vm_write_in_aspace<T: Copy>(
+    aspace_handle: &Arc<Mutex<AddrSpace>>,
+    ptr: *mut T,
+    value: T,
+) -> AxResult<()> {
+    let layout = Layout::new::<T>();
+    let start = VirtAddr::from_usize(ptr.addr());
+    let root = {
+        let mut aspace = aspace_handle.lock();
+        if !aspace.can_access_range(start, layout.size(), MappingFlags::WRITE) {
+            return Err(AxError::BadAddress);
+        }
+        let page_start = start.align_down_4k();
+        let page_end = (start + layout.size()).align_up_4k();
+        aspace.populate_area(page_start, page_end - page_start, MappingFlags::WRITE)?;
+        aspace.page_table_root()
+    };
+    with_current_user_page_table_root(root, || ptr.vm_write(value)).map_err(Into::into)
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -210,6 +313,8 @@ pub fn poll_timer(task: &TaskInner) {
     time.poll(|signo| {
         send_signal_thread_inner(task, thr, SignalInfo::new_kernel(signo));
     });
+    let (utime, stime) = time.output();
+    thr.store_usage_snapshot(TaskUsage::from_time_values(utime, stime));
 }
 
 /// Sets the timer state.
@@ -225,6 +330,8 @@ pub fn set_timer_state(task: &TaskInner, state: TimerState) {
         send_signal_thread_inner(task, thr, SignalInfo::new_kernel(signo));
     });
     time.set_state(state);
+    let (utime, stime) = time.output();
+    thr.store_usage_snapshot(TaskUsage::from_time_values(utime, stime));
 }
 
 #[repr(C)]
@@ -344,7 +451,13 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     info!("{} exit with code: {}", curr.id_name(), exit_code);
 
     let clear_child_tid = thr.clear_child_tid() as *mut u32;
-    if clear_child_tid.vm_write(0).is_ok() {
+    let aspace = thr.proc_data.aspace();
+    let clear_result = if clear_child_tid.is_null() {
+        Ok(())
+    } else {
+        vm_write_in_aspace(&aspace, clear_child_tid, 0u32)
+    };
+    if !clear_child_tid.is_null() && clear_result.is_ok() {
         let key = FutexKey::new_current(clear_child_tid as usize);
         let table = futex_table_for(&key);
         let guard = table.get(&key);

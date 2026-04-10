@@ -423,7 +423,10 @@ fn helper_ringbuf_submit(data_ptr: u64, flags: u64, hctx: &mut HelperContext) ->
     let Some(reservation) = hctx.take_ringbuf_reservation(data_ptr as usize) else {
         return Ok(helper_error());
     };
-    match reservation.map.ringbuf_submit(reservation.as_slice().to_vec(), flags) {
+    match reservation
+        .map
+        .ringbuf_submit(reservation.as_slice().to_vec(), flags)
+    {
         Ok(()) => Ok(0),
         Err(_) => Ok(helper_error()),
     }

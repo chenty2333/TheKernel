@@ -10,16 +10,15 @@ use axfs_ng::{FS_CONTEXT, OpenOptions};
 use axfs_ng_vfs::NodeType;
 use axio::{IoBuf, Read, Write};
 use axpoll::{IoEvents, Pollable};
+use axsync::spin::SpinNoIrq as Mutex;
 use axtask::future::{block_on, interruptible};
 use enum_dispatch::enum_dispatch;
 use hashbrown::HashMap;
 use lazy_static::lazy_static;
-use axsync::spin::SpinNoIrq as Mutex;
 
 pub use self::{dgram::DgramTransport, stream::StreamTransport};
 use crate::{
-    RecvOptions, SendOptions, Shutdown, Socket, SocketAddrEx, SocketOps,
-    SocketFilter,
+    RecvOptions, SendOptions, Shutdown, Socket, SocketAddrEx, SocketFilter, SocketOps,
     options::{Configurable, GetSocketOption, SetSocketOption},
 };
 

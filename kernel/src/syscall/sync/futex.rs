@@ -145,7 +145,6 @@ pub fn sys_futex(
                 };
                 count = futex.wq.wake(value as _, bitset);
             }
-            axtask::yield_now();
             Ok(count as _)
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
@@ -153,7 +152,7 @@ pub fn sys_futex(
             if command == FUTEX_CMP_REQUEUE && uaddr.vm_read()? != value3 {
                 return Err(AxError::WouldBlock);
             }
-            let value2 = assert_unsigned(timeout.addr() as u32)?;
+            let value2 = assert_unsigned(timeout.addr() as u32)? as usize;
 
             let futex_table = futex_table_for(&key);
             let futex = futex_table.get(&key);
@@ -164,10 +163,10 @@ pub fn sys_futex(
             let mut count = 0;
             if let Some(futex) = futex {
                 count = futex.wq.wake(value as _, u32::MAX);
-                if count == value as usize {
+                if value2 != 0 && Arc::as_ptr(&*futex) != Arc::as_ptr(&*futex2) {
                     count += futex
                         .wq
-                        .requeue(value2 as _, &futex2.wq, Arc::downgrade(&futex2))
+                        .requeue(value2, &futex2.wq, Arc::downgrade(&futex2))
                         as usize;
                 }
             }

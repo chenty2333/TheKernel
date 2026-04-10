@@ -3,7 +3,7 @@ use axnet::options::{Configurable, GetSocketOption, SetSocketOption};
 use linux_raw_sys::net::{SO_ATTACH_BPF, SO_DETACH_BPF, SOL_SOCKET, socklen_t};
 
 use crate::{
-    file::{FileLike, Socket},
+    file::{AfAlgSocket, FileLike, Socket, af_alg},
     mm::{UserConstPtr, UserPtr},
 };
 
@@ -176,6 +176,18 @@ pub fn sys_setsockopt(
             return Err(AxError::InvalidInput);
         }
         val.cast().get_as_ref()
+    }
+
+    if let Ok(socket) = AfAlgSocket::from_fd(fd) {
+        if level != af_alg::SOL_ALG {
+            return Err(AxError::from(LinuxError::ENOPROTOOPT));
+        }
+        if optname != af_alg::ALG_SET_KEY {
+            return Err(AxError::from(LinuxError::ENOPROTOOPT));
+        }
+        let key = optval.get_as_slice(optlen as usize)?;
+        socket.set_alg_key(key)?;
+        return Ok(0);
     }
 
     let socket = Socket::from_fd(fd)?;

@@ -7,6 +7,7 @@ use crate::{BaseScheduler, EnqueueReason};
 pub const RR_TIMESLICE_TICKS: usize = 5;
 pub const RT_PRIORITY_MIN: u8 = 1;
 pub const RT_PRIORITY_MAX: u8 = 99;
+const FAIR_PREEMPT_GRANULARITY_TICKS: isize = 2;
 
 /// Runtime scheduling class for CFS tasks.
 #[repr(u8)]
@@ -62,6 +63,7 @@ pub struct CFSTask<T> {
     inner: T,
     init_vruntime: AtomicIsize,
     delta: AtomicIsize,
+    seeded_vruntime: AtomicBool,
     nice: AtomicIsize,
     class: AtomicU8,
     rt_priority: AtomicU8,
@@ -74,7 +76,6 @@ pub struct CFSTask<T> {
 
 const NICE_RANGE_POS: usize = 19; // MAX_NICE in Linux
 const NICE_RANGE_NEG: usize = 20; // -MIN_NICE in Linux, the range of nice is [MIN_NICE, MAX_NICE]
-
 // https://elixir.bootlin.com/linux/latest/source/kernel/sched/core.c
 
 const NICE2WEIGHT_POS: [isize; NICE_RANGE_POS + 1] = [
@@ -92,6 +93,7 @@ impl<T> CFSTask<T> {
             inner,
             init_vruntime: AtomicIsize::new(0_isize),
             delta: AtomicIsize::new(0_isize),
+            seeded_vruntime: AtomicBool::new(false),
             nice: AtomicIsize::new(0_isize),
             class: AtomicU8::new(CfsTaskClass::Normal as u8),
             rt_priority: AtomicU8::new(0),
@@ -153,6 +155,10 @@ impl<T> CFSTask<T> {
     fn rebase_vruntime(&self, v: isize) {
         self.init_vruntime.store(v, Ordering::Release);
         self.delta.store(0, Ordering::Release);
+    }
+
+    fn take_seeded_vruntime(&self) -> bool {
+        self.seeded_vruntime.swap(false, Ordering::AcqRel)
     }
 
     fn rt_priority(&self) -> u8 {
@@ -237,6 +243,20 @@ impl<T> CFSTask<T> {
             params.reset_on_fork,
         );
         true
+    }
+
+    /// Seeds a freshly forked fair task just behind its parent so fork bursts
+    /// do not unfairly jump ahead of the running parent.
+    pub fn inherit_fair_vruntime_from(&self, parent: &Self) {
+        if self.is_rt() || parent.is_rt() {
+            return;
+        }
+        self.rebase_vruntime(
+            parent
+                .get_vruntime()
+                .saturating_add(FAIR_PREEMPT_GRANULARITY_TICKS),
+        );
+        self.seeded_vruntime.store(true, Ordering::Release);
     }
 }
 
@@ -387,7 +407,12 @@ impl<T> BaseScheduler for CFScheduler<T> {
             }
             self.insert_rt_task(task, false);
         } else {
-            task.rebase_vruntime(self.queue_floor());
+            let vruntime = if task.take_seeded_vruntime() {
+                task.get_vruntime().max(self.queue_floor())
+            } else {
+                self.queue_floor()
+            };
+            task.rebase_vruntime(vruntime);
             self.insert_task(task);
         }
     }
@@ -494,7 +519,12 @@ impl<T> BaseScheduler for CFScheduler<T> {
         self.refresh_min_vruntime(Some(current_vruntime));
 
         match self.min_ready_vruntime() {
-            Some(ready_min) => current_vruntime > ready_min,
+            // Keep the current fair task running for a small vruntime window
+            // after a wakeup burst so it can complete short follow-up work
+            // instead of being displaced immediately by freshly woken peers.
+            Some(ready_min) => {
+                current_vruntime > ready_min.saturating_add(FAIR_PREEMPT_GRANULARITY_TICKS)
+            }
             None => false,
         }
     }

@@ -15,15 +15,16 @@ use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::future::{block_on, poll_io};
 use bytemuck::AnyBitPattern;
-use linux_raw_sys::{general::{O_CLOEXEC, O_NONBLOCK}, ioctl::{UFFDIO_API, UFFDIO_COPY, UFFDIO_REGISTER}};
-use memory_addr::{MemoryAddr, VirtAddr, PAGE_SIZE_4K};
+use linux_raw_sys::{
+    general::{O_CLOEXEC, O_NONBLOCK},
+    ioctl::{UFFDIO_API, UFFDIO_COPY, UFFDIO_REGISTER},
+};
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use spin::Mutex;
 use starry_process::Pid;
 use starry_vm::{VmMutPtr, VmPtr, vm_read_slice};
 
-use crate::{
-    file::{FileLike, IoDst},
-};
+use crate::file::{FileLike, IoDst};
 
 const UFFD_API_VERSION: u64 = 0xAA;
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
@@ -164,7 +165,10 @@ impl UserfaultFile {
             return Err(AxError::BadAddress);
         };
         let mut copy = arg.vm_read()?;
-        if copy.len == 0 || !(copy.dst as usize).is_aligned_4k() || !(copy.len as usize).is_aligned_4k() {
+        if copy.len == 0
+            || !(copy.dst as usize).is_aligned_4k()
+            || !(copy.len as usize).is_aligned_4k()
+        {
             return Err(AxError::InvalidInput);
         }
         if copy.mode & !UFFDIO_COPY_MODE_DONTWAKE != 0 {
@@ -240,7 +244,11 @@ impl UserfaultFile {
     }
 
     fn still_pending(&self, page: usize) -> bool {
-        self.state.lock().pending.iter().any(|pending| pending.page == page)
+        self.state
+            .lock()
+            .pending
+            .iter()
+            .any(|pending| pending.page == page)
     }
 }
 
@@ -252,7 +260,10 @@ impl FileLike for UserfaultFile {
                 return Err(AxError::WouldBlock);
             };
             let bytes = unsafe {
-                core::slice::from_raw_parts((&msg as *const UffdMsg).cast::<u8>(), size_of::<UffdMsg>())
+                core::slice::from_raw_parts(
+                    (&msg as *const UffdMsg).cast::<u8>(),
+                    size_of::<UffdMsg>(),
+                )
             };
             if dst.remaining_mut() < bytes.len() {
                 return Err(AxError::InvalidInput);

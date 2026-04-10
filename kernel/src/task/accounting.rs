@@ -24,8 +24,15 @@ impl TaskUsage {
 
     /// Collects usage from a live thread.
     pub fn from_thread(thread: &Thread) -> Self {
-        let (utime, stime) = thread.time.borrow().output();
-        Self::from_time_values(utime, stime)
+        let usage = match thread.time.try_borrow() {
+            Ok(time) => {
+                let (utime, stime) = time.output();
+                Self::from_time_values(utime, stime)
+            }
+            Err(_) => thread.usage_snapshot(),
+        };
+        thread.store_usage_snapshot(usage);
+        usage
     }
 
     /// Creates usage from [`TimeValue`]s.
@@ -103,6 +110,12 @@ impl AtomicTaskUsage {
     pub fn add(&self, usage: TaskUsage) {
         self.utime_ns.fetch_add(usage.utime_ns, Ordering::AcqRel);
         self.stime_ns.fetch_add(usage.stime_ns, Ordering::AcqRel);
+    }
+
+    /// Replaces the accumulated totals with the provided snapshot.
+    pub fn store(&self, usage: TaskUsage) {
+        self.utime_ns.store(usage.utime_ns, Ordering::Release);
+        self.stime_ns.store(usage.stime_ns, Ordering::Release);
     }
 
     /// Returns a snapshot of the accumulated usage.

@@ -1,7 +1,7 @@
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{Location, NodePermission, NodeType};
 use axtask::current_may_uninit;
-use linux_raw_sys::general::X_OK;
+use linux_raw_sys::general::{W_OK, X_OK};
 
 use crate::task::AsThread;
 
@@ -72,6 +72,64 @@ pub(crate) fn check_search_permissions(
     ) & X_OK
         == 0
     {
+        return Err(AxError::PermissionDenied);
+    }
+
+    Ok(())
+}
+
+pub(crate) fn check_create_permissions(
+    dir: &Location,
+    uid: u32,
+    gid: u32,
+    supplementary_groups: &[u32],
+) -> AxResult {
+    if uid == 0 {
+        return Ok(());
+    }
+
+    check_search_permissions(dir, uid, gid, supplementary_groups)?;
+
+    let stat = dir.metadata()?;
+    if granted_access_bits(
+        stat.mode.bits() as u32,
+        stat.uid,
+        stat.gid,
+        uid,
+        gid,
+        supplementary_groups,
+    ) & W_OK
+        == 0
+    {
+        return Err(AxError::PermissionDenied);
+    }
+
+    Ok(())
+}
+
+pub(crate) fn check_open_permissions(
+    loc: &Location,
+    mask: u32,
+    uid: u32,
+    gid: u32,
+    supplementary_groups: &[u32],
+) -> AxResult {
+    if uid == 0 || mask == 0 {
+        return Ok(());
+    }
+
+    check_parent_search_permissions(loc, uid, gid, supplementary_groups)?;
+
+    let stat = loc.metadata()?;
+    let granted = granted_access_bits(
+        stat.mode.bits() as u32,
+        stat.uid,
+        stat.gid,
+        uid,
+        gid,
+        supplementary_groups,
+    );
+    if granted & mask != mask {
         return Err(AxError::PermissionDenied);
     }
 

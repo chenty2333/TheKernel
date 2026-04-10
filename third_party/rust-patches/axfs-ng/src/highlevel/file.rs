@@ -1,6 +1,7 @@
 use alloc::{
     boxed::Box,
     sync::{Arc, Weak},
+    vec,
     vec::Vec,
 };
 #[cfg(feature = "times")]
@@ -9,7 +10,8 @@ use core::{num::NonZeroUsize, ops::Range, task::Context};
 
 use axalloc::{UsageKind, global_allocator};
 use axfs_ng_vfs::{
-    FileNode, Location, NodeFlags, NodePermission, NodeType, VfsError, VfsResult, path::Path,
+    FileNode, Location, MetadataUpdate, NodeFlags, NodePermission, NodeType, VfsError, VfsResult,
+    path::Path,
 };
 use axhal::mem::{PhysAddr, VirtAddr, total_ram_size, virt_to_phys};
 use axio::{SeekFrom, prelude::*};
@@ -203,10 +205,10 @@ impl OpenOptions {
             }
             loc.check_is_dir()?;
         }
-        if self.truncate {
-            loc.entry().as_file()?.set_len(0)?;
+        if loc.is_dir() && (self.write || self.append || self.truncate || self.create || self.create_new)
+        {
+            return Err(VfsError::IsADirectory);
         }
-
         Ok(if loc.is_dir() {
             OpenResult::Dir(loc)
         } else {
@@ -225,6 +227,9 @@ impl OpenOptions {
             } else {
                 FileBackend::new_direct(loc)
             };
+            if self.truncate {
+                backend.set_len(0)?;
+            }
             OpenResult::File(File::new(backend, flags))
         })
     }
@@ -272,6 +277,9 @@ impl OpenOptions {
     }
 
     pub(crate) fn to_flags(&self) -> VfsResult<FileFlags> {
+        if self.path {
+            return Ok(FileFlags::PATH);
+        }
         Ok(match (self.read, self.write, self.append) {
             (true, false, false) => FileFlags::READ,
             (false, true, false) => FileFlags::WRITE,
@@ -279,29 +287,23 @@ impl OpenOptions {
             (false, _, true) => FileFlags::WRITE | FileFlags::APPEND,
             (true, _, true) => FileFlags::READ | FileFlags::WRITE | FileFlags::APPEND,
             (false, false, false) => return Err(VfsError::InvalidInput),
-        } | if self.path {
-            FileFlags::PATH
-        } else {
-            FileFlags::empty()
         })
     }
 
     pub(crate) fn is_valid(&self) -> bool {
-        if !self.read && !self.write && !self.append {
-            return true;
+        if self.path {
+            return !self.read
+                && !self.write
+                && !self.append
+                && !self.truncate
+                && !self.create
+                && !self.create_new;
         }
-        match (self.write, self.append) {
-            (true, false) => {}
-            (false, false) => {
-                if self.truncate || self.create || self.create_new {
-                    return false;
-                }
-            }
-            (_, true) => {
-                if self.truncate && !self.create_new {
-                    return false;
-                }
-            }
+        if !self.read && !self.write && !self.append {
+            return false;
+        }
+        if self.append && self.truncate && !self.create_new {
+            return false;
         }
         true
     }
@@ -581,7 +583,7 @@ impl CachedFile {
         &self,
         range: Range<u64>,
         page_initial: impl FnOnce(&FileNode) -> VfsResult<T>,
-        mut page_each: impl FnMut(T, &mut PageCache, Range<usize>) -> VfsResult<T>,
+        mut page_each: impl FnMut(T, &mut PageCache, u64, Range<usize>) -> VfsResult<T>,
     ) -> VfsResult<T> {
         let file = self.inner.entry().as_file()?;
         let mut initial = page_initial(file)?;
@@ -597,6 +599,7 @@ impl CachedFile {
             initial = page_each(
                 initial,
                 page,
+                page_start,
                 page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
             )?;
             page_offset = 0;
@@ -615,7 +618,7 @@ impl CachedFile {
         self.with_pages(
             offset..end,
             |_| Ok(0),
-            |read, page, range| {
+            |read, page, _page_start, range| {
                 let len = range.end - range.start;
                 dst.write(&page.data()[range.start..range.end])?;
                 Ok(read + len)
@@ -633,11 +636,15 @@ impl CachedFile {
                 }
                 Ok(0)
             },
-            |written, page, range| {
+            |written, page, page_start, range| {
                 let len = range.end - range.start;
                 buf.read(&mut page.data()[range.start..range.end])?;
                 if !self.in_memory {
-                    page.dirty = true;
+                    let start = page_start + range.start as u64;
+                    self.inner
+                        .entry()
+                        .as_file()?
+                        .write_at(&page.data()[range.start..range.end], start)?;
                 }
                 Ok(written + len)
             },
@@ -680,6 +687,12 @@ impl CachedFile {
             // new length
             // TODO(mivik): can this be more efficient?
             let mut guard = self.shared.page_cache.lock();
+            if let Some(page) = guard.get_mut(&new_last_page) {
+                let page_start = new_last_page as u64 * PAGE_SIZE as u64;
+                let new_page_offset = len.saturating_sub(page_start).min(PAGE_SIZE as u64) as usize;
+                page.data()[new_page_offset..].fill(0);
+                page.dirty = false;
+            }
             let keys = guard
                 .iter()
                 .map(|(k, _)| *k)
@@ -693,6 +706,14 @@ impl CachedFile {
                     page.dirty = false;
                     self.evict_cache(file, pn, &mut page)?;
                 }
+            }
+        } else if old_len > len {
+            let mut guard = self.shared.page_cache.lock();
+            if let Some(page) = guard.get_mut(&new_last_page) {
+                let page_start = new_last_page as u64 * PAGE_SIZE as u64;
+                let new_page_offset = len.saturating_sub(page_start).min(PAGE_SIZE as u64) as usize;
+                page.data()[new_page_offset..].fill(0);
+                page.dirty = false;
             }
         }
         Ok(())
@@ -741,6 +762,8 @@ pub enum FileBackend {
 }
 
 impl FileBackend {
+    const DIRECT_IO_CHUNK: usize = 64 * 1024;
+
     pub(crate) fn new_direct(location: Location) -> Self {
         Self::Direct(location)
     }
@@ -753,11 +776,30 @@ impl FileBackend {
     pub fn read_at(&self, mut dst: impl Write + IoBufMut, mut offset: u64) -> VfsResult<usize> {
         match self {
             Self::Cached(cached) => cached.read_at(dst, offset),
-            Self::Direct(loc) => dst.read_from(&mut axio::read_fn(|buf| {
-                loc.entry().as_file()?.read_at(buf, offset).inspect(|read| {
-                    offset += *read as u64;
-                })
-            })),
+            Self::Direct(loc) => {
+                let file = loc.entry().as_file()?;
+                let mut total = 0;
+                let mut chunk = vec![0_u8; Self::DIRECT_IO_CHUNK];
+
+                while dst.remaining_mut() > 0 {
+                    let limit = dst.remaining_mut().min(chunk.len());
+                    let read = file.read_at(&mut chunk[..limit], offset)?;
+                    if read == 0 {
+                        break;
+                    }
+                    let written = dst.write(&chunk[..read])?;
+                    if written == 0 {
+                        break;
+                    }
+                    offset += written as u64;
+                    total += written;
+                    if written < read || read < limit {
+                        break;
+                    }
+                }
+
+                Ok(total)
+            }
         }
     }
 
@@ -765,14 +807,30 @@ impl FileBackend {
     pub fn write_at(&self, mut src: impl Read + IoBuf, mut offset: u64) -> VfsResult<usize> {
         match self {
             Self::Cached(cached) => cached.write_at(src, offset),
-            Self::Direct(loc) => src.write_to(&mut axio::write_fn(|buf| {
-                loc.entry()
-                    .as_file()?
-                    .write_at(buf, offset)
-                    .inspect(|written| {
-                        offset += *written as u64;
-                    })
-            })),
+            Self::Direct(loc) => {
+                let file = loc.entry().as_file()?;
+                let mut total = 0;
+                let mut chunk = vec![0_u8; Self::DIRECT_IO_CHUNK];
+
+                while src.remaining() > 0 {
+                    let limit = src.remaining().min(chunk.len());
+                    let read = src.read(&mut chunk[..limit])?;
+                    if read == 0 {
+                        break;
+                    }
+                    let written = file.write_at(&chunk[..read], offset)?;
+                    if written == 0 {
+                        break;
+                    }
+                    offset += written as u64;
+                    total += written;
+                    if written < read {
+                        break;
+                    }
+                }
+
+                Ok(total)
+            }
         }
     }
 
@@ -781,14 +839,29 @@ impl FileBackend {
         match self {
             Self::Cached(cached) => cached.append(src),
             Self::Direct(loc) => {
-                let mut end = 0;
-                src.write_to(&mut axio::write_fn(|buf| {
-                    loc.entry().as_file()?.append(buf).map(|(n, offset)| {
-                        end = offset;
-                        n
-                    })
-                }))
-                .map(|n| (n, end))
+                let file = loc.entry().as_file()?;
+                let mut total = 0;
+                let mut end = file.len()?;
+                let mut chunk = vec![0_u8; Self::DIRECT_IO_CHUNK];
+
+                while src.remaining() > 0 {
+                    let limit = src.remaining().min(chunk.len());
+                    let read = src.read(&mut chunk[..limit])?;
+                    if read == 0 {
+                        break;
+                    }
+                    let (written, new_end) = file.append(&chunk[..read])?;
+                    if written == 0 {
+                        break;
+                    }
+                    total += written;
+                    end = new_end;
+                    if written < read {
+                        break;
+                    }
+                }
+
+                Ok((total, end))
             }
         }
     }
@@ -828,6 +901,32 @@ pub struct File {
 }
 
 impl File {
+    #[cfg(feature = "times")]
+    fn record_time_flags(&self, flags: u8) {
+        self.access_flags.fetch_or(flags, Ordering::AcqRel);
+    }
+
+    #[cfg(feature = "times")]
+    fn flush_times(&self) {
+        let flags = self.access_flags.swap(0, Ordering::AcqRel);
+        if flags == 0 {
+            return;
+        }
+
+        let now = axhal::time::wall_time();
+        let mut update = MetadataUpdate::default();
+        if flags & 1 != 0 {
+            update.atime = Some(now);
+        }
+        if flags & 2 != 0 {
+            update.mtime = Some(now);
+        }
+        if let Err(err) = self.inner.location().update_metadata(update) {
+            warn!("Failed to update file times: {err:?}");
+            self.access_flags.fetch_or(flags, Ordering::AcqRel);
+        }
+    }
+
     /// Creates a new [`File`] from a [`FileBackend`] and access flags.
     pub fn new(inner: FileBackend, flags: FileFlags) -> Self {
         let position = if inner.location().flags().contains(NodeFlags::STREAM) {
@@ -899,12 +998,24 @@ impl File {
 
     /// Reads a number of bytes starting from a given offset.
     pub fn read_at(&self, dst: impl Write + IoBufMut, offset: u64) -> VfsResult<usize> {
-        self.access(FileFlags::READ)?.read_at(dst, offset)
+        let read = self.access(FileFlags::READ)?.read_at(dst, offset)?;
+        #[cfg(feature = "times")]
+        if read > 0 {
+            self.record_time_flags(1);
+            self.flush_times();
+        }
+        Ok(read)
     }
 
     /// Writes a number of bytes starting from a given offset.
     pub fn write_at(&self, src: impl Read + IoBuf, offset: u64) -> VfsResult<usize> {
-        self.access(FileFlags::WRITE)?.write_at(src, offset)
+        let written = self.access(FileFlags::WRITE)?.write_at(src, offset)?;
+        #[cfg(feature = "times")]
+        if written > 0 {
+            self.record_time_flags(3);
+            self.flush_times();
+        }
+        Ok(written)
     }
 
     /// Attempts to sync OS-internal file content and metadata to disk.
@@ -918,10 +1029,6 @@ impl File {
 
     /// Reads data from the current position, advancing the cursor.
     pub fn read(&self, dst: impl Write + IoBufMut) -> axio::Result<usize> {
-        #[cfg(feature = "times")]
-        {
-            self.access_flags.fetch_or(1, Ordering::AcqRel);
-        }
         if let Some(pos) = self.position.as_ref() {
             let mut pos = pos.lock();
             self.read_at(dst, *pos).inspect(|n| {
@@ -934,14 +1041,16 @@ impl File {
 
     /// Writes data at the current position (or appends), advancing the cursor.
     pub fn write(&self, src: impl Read + IoBuf) -> axio::Result<usize> {
-        #[cfg(feature = "times")]
-        {
-            self.access_flags.fetch_or(3, Ordering::AcqRel);
-        }
         if let Some(pos) = self.position.as_ref() {
             let mut pos = pos.lock();
             if let Ok(f) = self.access(FileFlags::APPEND) {
-                f.append(src).map(|(written, new_size)| {
+                f.append(src).inspect(|(written, _)| {
+                    #[cfg(feature = "times")]
+                    if *written > 0 {
+                        self.record_time_flags(3);
+                        self.flush_times();
+                    }
+                }).map(|(written, new_size)| {
                     *pos = new_size;
                     written
                 })
@@ -1015,18 +1124,6 @@ impl Pollable for File {
 #[cfg(feature = "times")]
 impl Drop for File {
     fn drop(&mut self) {
-        let flags = self.access_flags.load(Ordering::Acquire);
-        if flags != 0 {
-            let mut update = axfs_ng_vfs::MetadataUpdate::default();
-            if flags & 1 != 0 {
-                update.atime = Some(axhal::time::wall_time());
-            }
-            if flags & 2 != 0 {
-                update.mtime = Some(axhal::time::wall_time());
-            }
-            if let Err(err) = self.inner.location().update_metadata(update) {
-                warn!("Failed to update file times on drop: {err:?}");
-            }
-        }
+        self.flush_times();
     }
 }

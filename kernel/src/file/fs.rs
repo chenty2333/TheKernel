@@ -8,7 +8,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axfs::{FS_CONTEXT, FsContext};
-use axfs_ng_vfs::{Location, Metadata, NodeFlags};
+use axfs_ng_vfs::{Location, Metadata, NodeFlags, path::Path};
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
 use axtask::future::{block_on, poll_io};
@@ -20,6 +20,20 @@ use crate::file::{IoDst, IoSrc};
 pub fn with_fs<R>(dirfd: c_int, f: impl FnOnce(&mut FsContext) -> AxResult<R>) -> AxResult<R> {
     let mut fs = FS_CONTEXT.lock();
     if dirfd == AT_FDCWD {
+        f(&mut fs)
+    } else {
+        let dir = Directory::from_fd(dirfd)?.inner.clone();
+        f(&mut fs.with_current_dir(dir)?)
+    }
+}
+
+pub fn with_path_fs<R>(
+    dirfd: c_int,
+    path: &Path,
+    f: impl FnOnce(&mut FsContext) -> AxResult<R>,
+) -> AxResult<R> {
+    let mut fs = FS_CONTEXT.lock();
+    if dirfd == AT_FDCWD || path.is_absolute() {
         f(&mut fs)
     } else {
         let dir = Directory::from_fd(dirfd)?.inner.clone();
@@ -57,14 +71,14 @@ pub fn resolve_at(dirfd: c_int, path: Option<&str>, flags: u32) -> AxResult<Reso
             let file_like = get_file_like(dirfd)?;
             let f = file_like.clone();
             Ok(if let Some(file) = f.downcast_ref::<File>() {
-                ResolveAtResult::File(file.inner().backend()?.location().clone())
+                ResolveAtResult::File(file.inner().location().clone())
             } else if let Some(dir) = f.downcast_ref::<Directory>() {
                 ResolveAtResult::File(dir.inner().clone())
             } else {
                 ResolveAtResult::Other(file_like)
             })
         }
-        Some(path) => with_fs(dirfd, |fs| {
+        Some(path) => with_path_fs(dirfd, Path::new(path), |fs| {
             if flags & AT_SYMLINK_NOFOLLOW != 0 {
                 fs.resolve_no_follow(path)
             } else {
@@ -218,7 +232,7 @@ impl Directory {
 
 impl FileLike for Directory {
     fn read(&self, _dst: &mut IoDst) -> AxResult<usize> {
-        Err(AxError::BadFileDescriptor)
+        Err(AxError::IsADirectory)
     }
 
     fn write(&self, _src: &mut IoSrc) -> AxResult<usize> {

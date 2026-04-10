@@ -282,16 +282,21 @@ impl<Hal: SystemHal> InodeRef<Hal> {
                 self.write_bytes(fblock * block_size as u64, &EMPTY[..block_size as usize])?;
             }
 
-            // Clear the last block extended part
+            // Only clear the previously partial tail block. When the old size
+            // is zero or already block-aligned, there is no stale tail region
+            // to zero and `init_inode_fblock()` may legitimately report no
+            // initialized mapping yet for that block.
             let old_last_block = (cur_len / block_size as u64) as u32;
             let old_block_start = (cur_len - (old_last_block as u64 * block_size as u64)) as usize;
-            let fblock = self.init_inode_fblock(old_last_block)?;
-            assert!(fblock != 0, "fblock should not be zero");
-            let length = block_size as usize - old_block_start;
-            self.write_bytes(
-                fblock * block_size as u64 + old_block_start as u64,
-                &EMPTY[..length],
-            )?;
+            if old_block_start > 0 {
+                let fblock = self.init_inode_fblock(old_last_block)?;
+                assert!(fblock != 0, "fblock should not be zero");
+                let length = block_size as usize - old_block_start;
+                self.write_bytes(
+                    fblock * block_size as u64 + old_block_start as u64,
+                    &EMPTY[..length],
+                )?;
+            }
 
             unsafe {
                 ext4_inode_set_size(self.inner.inode, len);

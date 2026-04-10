@@ -181,10 +181,18 @@ pub fn send_signal_to_process(pid: Pid, sig: Option<SignalInfo>) -> AxResult<()>
         }
 
         info!("Send signal {signo:?} to process {pid}");
-        if let Some(tid) = proc_data.signal.send_signal(sig)
-            && let Ok(task) = get_task(tid)
-        {
-            task.interrupt();
+        if proc_data.signal.send_signal(sig).is_some() {
+            for tid in proc_data.proc.threads() {
+                let Ok(task) = get_task(tid) else {
+                    continue;
+                };
+                let Some(thread) = task.try_as_thread() else {
+                    continue;
+                };
+                if !thread.signal.signal_blocked(signo) {
+                    task.interrupt();
+                }
+            }
         }
     }
 

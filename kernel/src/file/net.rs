@@ -44,7 +44,8 @@ impl Deref for Socket {
 
 impl Socket {
     pub fn set_bpf_filter(&self, prog: Option<Arc<BpfProgram>>) -> AxResult<()> {
-        let filter = prog.map(|prog| Arc::new(AttachedSocketFilter { prog }) as Arc<dyn axnet::SocketFilter>);
+        let filter = prog
+            .map(|prog| Arc::new(AttachedSocketFilter { prog }) as Arc<dyn axnet::SocketFilter>);
         self.0.set_filter(filter)
     }
 }

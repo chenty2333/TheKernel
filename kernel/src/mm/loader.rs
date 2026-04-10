@@ -11,7 +11,10 @@ use axhal::{
     paging::{MappingFlags, PageSize},
 };
 use axsync::Mutex;
-use kernel_elf_parser::{AuxEntry, ELFHeaders, ELFHeadersBuilder, ELFParser, app_stack_region};
+use axtask::current;
+use kernel_elf_parser::{
+    AuxEntry, AuxType, ELFHeaders, ELFHeadersBuilder, ELFParser, app_stack_region,
+};
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use ouroboros::self_referencing;
 use uluru::LRUCache;
@@ -20,6 +23,7 @@ use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
     file::permission::check_current_execute_permissions,
     mm::aspace::{AddrSpace, Backend},
+    task::AsThread,
 };
 
 /// Creates a new empty user address space.
@@ -243,9 +247,32 @@ impl ElfLoader {
             ldso.as_ref()
                 .map_or_else(|| elf.entry(), |ldso| ldso.entry()),
         );
-        let auxv = elf
+        let (uid, euid, gid, egid) = if let Some(thread) = current().try_as_thread() {
+            let proc_data = &thread.proc_data;
+            (
+                proc_data.uid() as usize,
+                proc_data.euid() as usize,
+                proc_data.gid() as usize,
+                proc_data.egid() as usize,
+            )
+        } else {
+            (0, 0, 0, 0)
+        };
+        let secure = usize::from(uid != euid || gid != egid);
+        let mut auxv = elf
             .aux_vector(PAGE_SIZE_4K, ldso.map(|elf| elf.base()))
             .collect::<Vec<_>>();
+        auxv.extend([
+            AuxEntry::new(AuxType::FLAGS, 0),
+            AuxEntry::new(AuxType::HWCAP, 0),
+            AuxEntry::new(AuxType::CLKTCK, 100),
+            AuxEntry::new(AuxType::PLATFORM, 0),
+            AuxEntry::new(AuxType::UID, uid),
+            AuxEntry::new(AuxType::EUID, euid),
+            AuxEntry::new(AuxType::GID, gid),
+            AuxEntry::new(AuxType::EGID, egid),
+            AuxEntry::new(AuxType::SECURE, secure),
+        ]);
 
         Ok(Ok((entry, auxv)))
     }

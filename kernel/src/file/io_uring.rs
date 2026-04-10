@@ -1,5 +1,9 @@
 use alloc::{borrow::Cow, sync::Arc, vec::Vec};
-use core::{mem::size_of, sync::atomic::{AtomicBool, Ordering}, task::Context};
+use core::{
+    mem::size_of,
+    sync::atomic::{AtomicBool, Ordering},
+    task::Context,
+};
 
 use axerrno::{AxError, AxResult};
 use axhal::paging::PageSize;
@@ -11,7 +15,7 @@ use starry_vm::VmPtr;
 use crate::{
     file::{File, FileLike},
     mm::{IoVec, SharedPages, UserConstPtr, VmBytesMut},
-    syscall::{sys_sendmsg},
+    syscall::sys_sendmsg,
 };
 
 const IORING_OFF_SQ_RING: usize = 0;
@@ -165,9 +169,12 @@ impl IoUringState {
             ..IoUringParams::default()
         };
 
-        let sq_ring_len = (SQ_RING_ARRAY_OFFSET + entries as usize * size_of::<u32>()).next_multiple_of(PageSize::Size4K as usize);
-        let cq_ring_len = (CQ_RING_CQES_OFFSET + entries as usize * size_of::<IoUringCqe>()).next_multiple_of(PageSize::Size4K as usize);
-        let sqes_len = (entries as usize * size_of::<IoUringSqe>()).next_multiple_of(PageSize::Size4K as usize);
+        let sq_ring_len = (SQ_RING_ARRAY_OFFSET + entries as usize * size_of::<u32>())
+            .next_multiple_of(PageSize::Size4K as usize);
+        let cq_ring_len = (CQ_RING_CQES_OFFSET + entries as usize * size_of::<IoUringCqe>())
+            .next_multiple_of(PageSize::Size4K as usize);
+        let sqes_len = (entries as usize * size_of::<IoUringSqe>())
+            .next_multiple_of(PageSize::Size4K as usize);
 
         let sq_ring = Arc::new(SharedPages::new(sq_ring_len, PageSize::Size4K)?);
         let cq_ring = Arc::new(SharedPages::new(cq_ring_len, PageSize::Size4K)?);
@@ -229,7 +236,10 @@ impl IoUringState {
     fn write_cqe(&self, index: u32, cqe: IoUringCqe) -> AxResult {
         let offset = self.params.cq_off.cqes as usize + index as usize * size_of::<IoUringCqe>();
         let bytes = unsafe {
-            core::slice::from_raw_parts((&cqe as *const IoUringCqe).cast::<u8>(), size_of::<IoUringCqe>())
+            core::slice::from_raw_parts(
+                (&cqe as *const IoUringCqe).cast::<u8>(),
+                size_of::<IoUringCqe>(),
+            )
         };
         self.cq_ring.write_bytes(offset, bytes)
     }
@@ -318,14 +328,18 @@ impl IoUringFile {
 
         for idx in 0..submit {
             let array_slot = ((sq_head + idx) & sq_mask) as usize;
-            let sqe_index = state.read_sq_u32(state.params.sq_off.array as usize + array_slot * size_of::<u32>())?;
+            let sqe_index = state
+                .read_sq_u32(state.params.sq_off.array as usize + array_slot * size_of::<u32>())?;
             let sqe = state.read_sqe(sqe_index)?;
             let cqe = state.submit_one(&sqe);
             state.write_cqe(cq_tail & cq_mask, cqe)?;
             cq_tail = cq_tail.wrapping_add(1);
         }
 
-        state.write_sq_u32(state.params.sq_off.head as usize, sq_head.wrapping_add(submit))?;
+        state.write_sq_u32(
+            state.params.sq_off.head as usize,
+            sq_head.wrapping_add(submit),
+        )?;
         state.write_cq_u32(state.params.cq_off.tail as usize, cq_tail)?;
 
         Ok(submit as isize)

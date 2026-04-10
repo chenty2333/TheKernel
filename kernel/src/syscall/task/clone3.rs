@@ -108,7 +108,9 @@ pub fn sys_clone3(uctx: &UserContext, args: *const u8, size: usize) -> AxResult<
 #[cfg(test)]
 mod tests {
     use axerrno::AxError;
-    use linux_raw_sys::general::{CLONE_DETACHED, CLONE_FS, CLONE_NEWNS, CLONE_NEWPID, CLONE_PIDFD};
+    use linux_raw_sys::general::{
+        CLONE_DETACHED, CLONE_FS, CLONE_NEWNS, CLONE_NEWPID, CLONE_PIDFD,
+    };
 
     use super::{Clone3Args, CloneApi, CloneArgs, CloneFlags};
 
@@ -135,7 +137,10 @@ mod tests {
             flags: CloneFlags::from_bits_retain((CLONE_FS | CLONE_NEWNS) as u64),
             ..Default::default()
         };
-        assert_eq!(args.validate_for(CloneApi::Clone), Err(AxError::InvalidInput));
+        assert_eq!(
+            args.validate_for(CloneApi::Clone),
+            Err(AxError::InvalidInput)
+        );
     }
 
     #[test]

@@ -12,10 +12,9 @@ mod signalfd;
 mod stat;
 mod timerfd;
 mod userfaultfd;
+mod xattr;
 
 pub use self::{
     ctl::*, event::*, fd_ops::*, inotify::*, io::*, io_uring::*, memfd::*, mount::*, pidfd::*,
-    pipe::*,
-    signalfd::*, stat::*, timerfd::*,
-    userfaultfd::*,
+    pipe::*, signalfd::*, stat::*, timerfd::*, userfaultfd::*, xattr::*,
 };

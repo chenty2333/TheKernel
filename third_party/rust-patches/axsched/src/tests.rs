@@ -182,3 +182,31 @@ mod cfs_rt {
         assert_eq!(*second.inner(), 2);
     }
 }
+
+mod cfs_fork {
+    use crate::*;
+    use alloc::sync::Arc;
+
+    #[test]
+    fn forked_fair_task_does_not_immediately_preempt_parent() {
+        let mut scheduler = CFScheduler::<usize>::new();
+        let parent = Arc::new(CFSTask::new(1));
+
+        scheduler.add_task(parent.clone());
+        let running = scheduler.pick_next_task().unwrap();
+        assert_eq!(*running.inner(), 1);
+
+        for _ in 0..(RR_TIMESLICE_TICKS * 2) {
+            assert!(!scheduler.task_tick(&running));
+        }
+
+        let child = Arc::new(CFSTask::new(2));
+        child.inherit_fair_vruntime_from(&running);
+        scheduler.add_task(child);
+
+        assert!(
+            !scheduler.task_tick(&running),
+            "forked child should inherit the parent's vruntime instead of cutting to the floor",
+        );
+    }
+}

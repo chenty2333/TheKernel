@@ -1,7 +1,7 @@
 use alloc::vec;
 use core::ffi::{c_char, c_int};
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FileFlags, OpenOptions};
 use axio::{Seek, SeekFrom};
 use axpoll::{IoEvents, Pollable};
@@ -11,11 +11,58 @@ use syscalls::Sysno;
 
 use crate::{
     file::{
-        File, FileHandle, FileLike, Pipe, get_file_like,
+        Directory, File, FileHandle, FileLike, FileLikeKind, Pipe, get_file_like, get_typed_file,
         inotify::{notify_read, notify_write},
+        lease,
     },
     mm::{IoVec, IoVectorBuf, UserConstPtr, VmBytes, VmBytesMut},
+    pseudofs::tmp,
 };
+
+const SEEK_DATA: c_int = 3;
+const SEEK_HOLE: c_int = 4;
+const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
+const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+const TMPFS_FALLOC_BLOCK_SIZE: u64 = 4096;
+const FALLOC_IO_CHUNK: usize = 64 * 1024;
+
+fn write_zero_range(file: &axfs::File, offset: u64, len: u64) -> AxResult<()> {
+    if len == 0 {
+        return Ok(());
+    }
+
+    let backend = file.backend()?;
+    let zero = vec![0u8; FALLOC_IO_CHUNK];
+    let mut written = 0u64;
+    while written < len {
+        let chunk = (len - written).min(zero.len() as u64) as usize;
+        backend.write_at(&zero[..chunk], offset + written)?;
+        written += chunk as u64;
+    }
+    Ok(())
+}
+
+fn copy_within_file(file: &axfs::File, src: u64, dst: u64, len: u64) -> AxResult<()> {
+    if len == 0 || src == dst {
+        return Ok(());
+    }
+
+    let backend = file.backend()?;
+    let mut buf = vec![0u8; FALLOC_IO_CHUNK];
+    let mut done = 0u64;
+    while done < len {
+        let chunk = (len - done).min(buf.len() as u64) as usize;
+        let read = backend.read_at(&mut buf[..chunk], src + done)?;
+        if read == 0 {
+            break;
+        }
+        backend.write_at(&buf[..read], dst + done)?;
+        done += read as u64;
+    }
+    Ok(())
+}
 
 pub fn sys_dummy_fd(sysno: Sysno) -> AxResult<isize> {
     warn!("Unimplemented fd syscall: {sysno}");
@@ -66,16 +113,145 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> 
     Ok(written)
 }
 
+fn positioned_file(fd: c_int, access: FileFlags) -> AxResult<FileHandle<File>> {
+    let file_like = get_file_like(fd)?;
+    match FileLikeKind::from_file_like(file_like.as_ref()) {
+        FileLikeKind::Directory => return Err(AxError::IsADirectory),
+        FileLikeKind::Fifo | FileLikeKind::Socket => return Err(AxError::from(LinuxError::ESPIPE)),
+        FileLikeKind::Regular | FileLikeKind::Other => {}
+    }
+
+    let file = get_typed_file::<File>(fd)?;
+    file.inner().access(access)?;
+    Ok(file)
+}
+
+fn positioned_write_file(fd: c_int) -> AxResult<FileHandle<File>> {
+    positioned_file(fd, FileFlags::WRITE)
+}
+
+fn seekable_fd(fd: c_int) -> AxResult<FileHandle<dyn FileLike>> {
+    let file_like = get_file_like(fd)?;
+    match FileLikeKind::from_file_like(file_like.as_ref()) {
+        FileLikeKind::Fifo | FileLikeKind::Socket => Err(AxError::from(LinuxError::ESPIPE)),
+        FileLikeKind::Regular | FileLikeKind::Directory | FileLikeKind::Other => Ok(file_like),
+    }
+}
+
+fn seek_file_like(
+    file_like: &FileHandle<dyn FileLike>,
+    offset: __kernel_off_t,
+    whence: c_int,
+) -> AxResult<isize> {
+    if whence == 0 && offset < 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    if let Some(file) = file_like.downcast_ref::<File>() {
+        let pos = match whence {
+            0 => SeekFrom::Start(offset as _),
+            1 => SeekFrom::Current(offset as _),
+            2 => SeekFrom::End(offset as _),
+            _ => unreachable!(),
+        };
+        return file.inner().seek(pos).map(|off| off as isize);
+    }
+
+    if let Some(dir) = file_like.downcast_ref::<Directory>() {
+        let mut current = dir.offset.lock();
+        let new_pos = match whence {
+            0 => offset as u64,
+            1 => current
+                .checked_add_signed(offset)
+                .ok_or(AxError::InvalidInput)?,
+            2 => dir
+                .inner()
+                .len()?
+                .checked_add_signed(offset)
+                .ok_or(AxError::InvalidInput)?,
+            _ => unreachable!(),
+        };
+        *current = new_pos;
+        return Ok(new_pos as isize);
+    }
+
+    Err(AxError::from(LinuxError::ESPIPE))
+}
+
+fn do_preadv(
+    fd: c_int,
+    iov: *const IoVec,
+    iovcnt: usize,
+    offset: __kernel_off_t,
+    flags: u32,
+    allow_current_offset: bool,
+) -> AxResult<isize> {
+    if flags != 0 {
+        return Err(AxError::OperationNotSupported);
+    }
+    if offset < 0 && !(allow_current_offset && offset == -1) {
+        return Err(AxError::InvalidInput);
+    }
+
+    let file = positioned_file(fd, FileFlags::READ)?;
+    let mut io = IoVectorBuf::new(iov, iovcnt)?.into_io();
+    let read = if offset == -1 {
+        file.read(&mut io)?
+    } else {
+        file.inner().read_at(io, offset as u64)?
+    } as isize;
+    if read > 0 {
+        notify_read(fd);
+    }
+    Ok(read)
+}
+
+fn do_pwritev(
+    fd: c_int,
+    iov: *const IoVec,
+    iovcnt: usize,
+    offset: __kernel_off_t,
+    flags: u32,
+    allow_current_offset: bool,
+) -> AxResult<isize> {
+    if flags != 0 {
+        return Err(AxError::OperationNotSupported);
+    }
+    if offset < 0 && !(allow_current_offset && offset == -1) {
+        return Err(AxError::InvalidInput);
+    }
+
+    let file = positioned_write_file(fd)?;
+    let mut io = IoVectorBuf::new(iov, iovcnt)?.into_io();
+    let written = if offset == -1 {
+        file.write(&mut io)?
+    } else {
+        file.inner().write_at(io, offset as u64)?
+    } as isize;
+    if written > 0 {
+        notify_write(fd);
+    }
+    Ok(written)
+}
+
 pub fn sys_lseek(fd: c_int, offset: __kernel_off_t, whence: c_int) -> AxResult<isize> {
     debug!("sys_lseek <= {fd} {offset} {whence}");
-    let pos = match whence {
-        0 => SeekFrom::Start(offset as _),
-        1 => SeekFrom::Current(offset as _),
-        2 => SeekFrom::End(offset as _),
-        _ => return Err(AxError::InvalidInput),
-    };
-    let off = File::from_fd(fd)?.inner().seek(pos)?;
-    Ok(off as _)
+    match whence {
+        0..=2 => seek_file_like(&seekable_fd(fd)?, offset, whence),
+        SEEK_DATA | SEEK_HOLE => {
+            if offset < 0 {
+                return Err(AxError::InvalidInput);
+            }
+            let file = positioned_file(fd, FileFlags::empty())?;
+            if let Some(result) =
+                tmp::seek_data_or_hole(file.inner().location(), offset as u64, whence == SEEK_HOLE)
+            {
+                return result.map(|off| off as isize);
+            }
+            Err(AxError::Unsupported)
+        }
+        _ => Err(AxError::InvalidInput),
+    }
 }
 
 pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxResult<isize> {
@@ -84,6 +260,8 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
     if length < 0 {
         return Err(AxError::InvalidInput);
     }
+    let loc = FS_CONTEXT.lock().resolve(path)?;
+    lease::wait_for_truncate(&loc)?;
     let file = OpenOptions::new()
         .write(true)
         .open(&FS_CONTEXT.lock(), path)?
@@ -94,8 +272,27 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
 
 pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     debug!("sys_ftruncate <= {fd} {length}");
-    let f = File::from_fd(fd)?;
-    f.inner().access(FileFlags::WRITE)?.set_len(length as _)?;
+    if length < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let file_like = get_file_like(fd)?;
+    let kind = FileLikeKind::from_file_like(file_like.as_ref());
+    match kind {
+        FileLikeKind::Fifo => return Err(AxError::from(LinuxError::ESPIPE)),
+        FileLikeKind::Socket => return Err(AxError::InvalidInput),
+        FileLikeKind::Directory => return Err(AxError::IsADirectory),
+        FileLikeKind::Regular | FileLikeKind::Other => {}
+    }
+    let f = get_typed_file::<File>(fd)?;
+    let backend = f
+        .inner()
+        .access(FileFlags::WRITE)
+        .map_err(|err| match err {
+            AxError::BadFileDescriptor => AxError::InvalidInput,
+            other => other,
+        })?;
+    lease::wait_for_truncate(f.inner().location())?;
+    backend.set_len(length as _)?;
     notify_write(fd);
     Ok(0)
 }
@@ -107,26 +304,101 @@ pub fn sys_fallocate(
     len: __kernel_off_t,
 ) -> AxResult<isize> {
     debug!("sys_fallocate <= fd: {fd}, mode: {mode}, offset: {offset}, len: {len}");
-    if mode != 0 {
+    if offset < 0 || len < 0 {
         return Err(AxError::InvalidInput);
     }
+
     let f = File::from_fd(fd)?;
-    let inner = f.inner();
-    let file = inner.access(FileFlags::WRITE)?;
-    file.set_len(file.location().len()?.max(offset as u64 + len as u64))?;
+    f.inner().access(FileFlags::WRITE)?;
+
+    let file = f.inner();
+    let backend = file.backend()?;
+    let loc = backend.location().clone();
+    let offset = offset as u64;
+    let len = len as u64;
+    let end = offset.checked_add(len).ok_or(AxError::InvalidInput)?;
+    let size = loc.len()?;
+    let supported_modes = FALLOC_FL_KEEP_SIZE
+        | FALLOC_FL_PUNCH_HOLE
+        | FALLOC_FL_COLLAPSE_RANGE
+        | FALLOC_FL_ZERO_RANGE;
+
+    if mode & !supported_modes != 0 {
+        return Err(AxError::OperationNotSupported);
+    }
+
+    match mode {
+        0 => {
+            backend.set_len(size.max(end))?;
+            let _ = tmp::reserve_fallocate_range(&loc, offset, len, false);
+        }
+        FALLOC_FL_KEEP_SIZE => {
+            let _ = tmp::reserve_fallocate_range(&loc, offset, len, false);
+        }
+        mode if mode == (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE) => {
+            let hole_len = end.min(size).saturating_sub(offset);
+            write_zero_range(file, offset, hole_len)?;
+            if let Some(result) = tmp::punch_hole_fallocate_range(&loc, offset, len) {
+                result?;
+            } else {
+                return Err(AxError::OperationNotSupported);
+            }
+        }
+        mode if mode == FALLOC_FL_ZERO_RANGE
+            || mode == (FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE) =>
+        {
+            let zero_end = if mode & FALLOC_FL_KEEP_SIZE != 0 {
+                end.min(size)
+            } else {
+                backend.set_len(size.max(end))?;
+                end
+            };
+            let zero_len = zero_end.saturating_sub(offset);
+            write_zero_range(file, offset, zero_len)?;
+            let _ = tmp::reserve_fallocate_range(&loc, offset, zero_len, false);
+        }
+        FALLOC_FL_COLLAPSE_RANGE => {
+            if len == 0
+                || offset % TMPFS_FALLOC_BLOCK_SIZE != 0
+                || len % TMPFS_FALLOC_BLOCK_SIZE != 0
+                || end > size
+            {
+                return Err(AxError::InvalidInput);
+            }
+            copy_within_file(file, end, offset, size - end)?;
+            if let Some(result) = tmp::collapse_fallocate_range(&loc, offset, len) {
+                result?;
+            } else {
+                return Err(AxError::OperationNotSupported);
+            }
+            backend.set_len(size - len)?;
+        }
+        _ => return Err(AxError::InvalidInput),
+    }
+
     Ok(0)
 }
 
 pub fn sys_fsync(fd: c_int) -> AxResult<isize> {
     debug!("sys_fsync <= {fd}");
-    let f = File::from_fd(fd)?;
+    let f = get_file_like(fd)?;
+    match FileLikeKind::from_file_like(f.as_ref()) {
+        FileLikeKind::Fifo | FileLikeKind::Socket => return Err(AxError::InvalidInput),
+        FileLikeKind::Regular | FileLikeKind::Directory | FileLikeKind::Other => {}
+    }
+    let f = get_typed_file::<File>(fd)?;
     f.inner().sync(false)?;
     Ok(0)
 }
 
 pub fn sys_fdatasync(fd: c_int) -> AxResult<isize> {
     debug!("sys_fdatasync <= {fd}");
-    let f = File::from_fd(fd)?;
+    let f = get_file_like(fd)?;
+    match FileLikeKind::from_file_like(f.as_ref()) {
+        FileLikeKind::Fifo | FileLikeKind::Socket => return Err(AxError::InvalidInput),
+        FileLikeKind::Regular | FileLikeKind::Directory | FileLikeKind::Other => {}
+    }
+    let f = get_typed_file::<File>(fd)?;
     f.inner().sync(true)?;
     Ok(0)
 }
@@ -148,10 +420,10 @@ pub fn sys_fadvise64(
 }
 
 pub fn sys_pread64(fd: c_int, buf: *mut u8, len: usize, offset: __kernel_off_t) -> AxResult<isize> {
-    let f = File::from_fd(fd)?;
     if offset < 0 {
         return Err(AxError::InvalidInput);
     }
+    let f = positioned_file(fd, FileFlags::READ)?;
     let read = f.inner().read_at(VmBytesMut::new(buf, len), offset as _)?;
     if read > 0 {
         notify_read(fd);
@@ -168,7 +440,10 @@ pub fn sys_pwrite64(
     if len == 0 {
         return Ok(0);
     }
-    let f = File::from_fd(fd)?;
+    if offset < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let f = positioned_write_file(fd)?;
     let write = f.inner().write_at(VmBytes::new(buf, len), offset as _)?;
     if write > 0 {
         notify_write(fd);
@@ -182,7 +457,7 @@ pub fn sys_preadv(
     iovcnt: usize,
     offset: __kernel_off_t,
 ) -> AxResult<isize> {
-    sys_preadv2(fd, iov, iovcnt, offset, 0)
+    do_preadv(fd, iov, iovcnt, offset, 0, false)
 }
 
 pub fn sys_pwritev(
@@ -191,43 +466,39 @@ pub fn sys_pwritev(
     iovcnt: usize,
     offset: __kernel_off_t,
 ) -> AxResult<isize> {
-    sys_pwritev2(fd, iov, iovcnt, offset, 0)
+    do_pwritev(fd, iov, iovcnt, offset, 0, false)
 }
 
 pub fn sys_preadv2(
     fd: c_int,
     iov: *const IoVec,
     iovcnt: usize,
-    offset: __kernel_off_t,
+    offset_low: i32,
+    offset_high: i32,
     _flags: u32,
 ) -> AxResult<isize> {
-    debug!("sys_preadv2 <= fd: {fd}, iovcnt: {iovcnt}, offset: {offset}, flags: {_flags}");
-    let f = File::from_fd(fd)?;
-    let read = f
-        .inner()
-        .read_at(IoVectorBuf::new(iov, iovcnt)?.into_io(), offset as _)? as isize;
-    if read > 0 {
-        notify_read(fd);
-    }
-    Ok(read)
+    let offset = ((offset_high as i64) << 32) | (offset_low as u32 as i64);
+    debug!(
+        "sys_preadv2 <= fd: {fd}, iovcnt: {iovcnt}, offset_low: {offset_low}, offset_high: \
+         {offset_high}, flags: {_flags}"
+    );
+    do_preadv(fd, iov, iovcnt, offset, _flags, true)
 }
 
 pub fn sys_pwritev2(
     fd: c_int,
     iov: *const IoVec,
     iovcnt: usize,
-    offset: __kernel_off_t,
+    offset_low: i32,
+    offset_high: i32,
     _flags: u32,
 ) -> AxResult<isize> {
-    debug!("sys_pwritev2 <= fd: {fd}, iovcnt: {iovcnt}, offset: {offset}, flags: {_flags}");
-    let f = File::from_fd(fd)?;
-    let written =
-        f.inner()
-            .write_at(IoVectorBuf::new(iov, iovcnt)?.into_io(), offset as _)? as isize;
-    if written > 0 {
-        notify_write(fd);
-    }
-    Ok(written)
+    let offset = ((offset_high as i64) << 32) | (offset_low as u32 as i64);
+    debug!(
+        "sys_pwritev2 <= fd: {fd}, iovcnt: {iovcnt}, offset_low: {offset_low}, offset_high: \
+         {offset_high}, flags: {_flags}"
+    );
+    do_pwritev(fd, iov, iovcnt, offset, _flags, true)
 }
 
 enum SendFile {

@@ -2,22 +2,28 @@ use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
-use axfs_ng_vfs::{Location, NodePermission};
+use axfs_ng_vfs::{Location, NodePermission, path::Path};
 use axtask::current;
 use linux_raw_sys::general::{
-    __kernel_fsid_t, AT_EACCESS, AT_EMPTY_PATH, R_OK, W_OK, X_OK, stat, statfs, statx,
+    __kernel_fsid_t, AT_EACCESS, AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, R_OK, W_OK, X_OK, stat,
+    statfs, statx,
 };
 use starry_vm::{VmMutPtr, VmPtr};
 
+use super::ctl::validate_pathname;
 use crate::{
     file::{
-        File, FileLike,
+        Directory, File, FileLike, Pipe, Socket, get_file_like,
         permission::{check_parent_search_permissions, granted_access_bits},
         resolve_at,
     },
     mm::vm_load_string,
     task::AsThread,
 };
+
+const SUPPORTED_FACCESSAT_FLAGS: u32 = AT_EACCESS as u32 | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+const PIPEFS_MAGIC: i64 = 0x5049_5045;
+const SOCKFS_MAGIC: i64 = 0x534f_434b;
 
 /// Get the file metadata by `path` and write into `statbuf`.
 ///
@@ -111,6 +117,10 @@ pub fn sys_access(path: *const c_char, mode: u32) -> AxResult<isize> {
     sys_faccessat2(AT_FDCWD, path, mode, 0)
 }
 
+pub fn sys_faccessat(dirfd: c_int, path: *const c_char, mode: u32) -> AxResult<isize> {
+    sys_faccessat2(dirfd, path, mode, 0)
+}
+
 fn check_readonly_write_access(loc: &Location) -> AxResult {
     let path = loc.absolute_path().map_err(|_| AxError::InvalidInput)?;
     if crate::mounts::is_readonly(path.as_ref()) {
@@ -126,6 +136,15 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
 
     if mode & !(R_OK | W_OK | X_OK) != 0 {
         return Err(AxError::InvalidInput);
+    }
+    if flags & !SUPPORTED_FACCESSAT_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if let Some(path) = path.as_deref() {
+        if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
+            return Err(AxError::NotFound);
+        }
+        validate_pathname(Path::new(path))?;
     }
 
     let curr = current();
@@ -195,6 +214,28 @@ fn statfs(loc: &Location) -> AxResult<statfs> {
     Ok(result)
 }
 
+fn special_fd_statfs(fd: &dyn FileLike) -> Option<AxResult<statfs>> {
+    let mut result: statfs = unsafe { core::mem::zeroed() };
+
+    if fd.downcast_ref::<Pipe>().is_some() {
+        result.f_type = PIPEFS_MAGIC;
+        result.f_bsize = 4096;
+        result.f_namelen = 255;
+        result.f_frsize = 4096;
+        return Some(Ok(result));
+    }
+
+    if fd.downcast_ref::<Socket>().is_some() {
+        result.f_type = SOCKFS_MAGIC;
+        result.f_bsize = 4096;
+        result.f_namelen = 255;
+        result.f_frsize = 4096;
+        return Some(Ok(result));
+    }
+
+    None
+}
+
 pub fn sys_statfs(path: *const c_char, buf: *mut statfs) -> AxResult<isize> {
     let path = vm_load_string(path)?;
     debug!("sys_statfs <= path: {path:?}");
@@ -212,6 +253,15 @@ pub fn sys_statfs(path: *const c_char, buf: *mut statfs) -> AxResult<isize> {
 pub fn sys_fstatfs(fd: i32, buf: *mut statfs) -> AxResult<isize> {
     debug!("sys_fstatfs <= fd: {fd}");
 
-    buf.vm_write(statfs(File::from_fd(fd)?.inner().location())?)?;
+    let file = get_file_like(fd)?;
+    if let Some(file) = file.downcast_ref::<File>() {
+        buf.vm_write(statfs(file.inner().location())?)?;
+    } else if let Some(dir) = file.downcast_ref::<Directory>() {
+        buf.vm_write(statfs(dir.inner())?)?;
+    } else if let Some(result) = special_fd_statfs(file.as_ref()) {
+        buf.vm_write(result?)?;
+    } else {
+        return Err(AxError::InvalidInput);
+    }
     Ok(0)
 }

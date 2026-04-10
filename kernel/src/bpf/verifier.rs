@@ -1031,7 +1031,10 @@ fn adjust_mem_ptr_state(dst: RegState, insn: &BpfInsn, src: Option<RegState>) ->
         };
     };
 
-    RegState { fixed_off: Some(fixed_off), ..dst }
+    RegState {
+        fixed_off: Some(fixed_off),
+        ..dst
+    }
 }
 
 fn mem_access_size(insn: &BpfInsn) -> usize {
@@ -1061,11 +1064,15 @@ fn verify_mem_access(
         return Err(AxError::InvalidInput);
     };
     let Some(start) = base_off.checked_add(off as i32) else {
-        log.log(&alloc::format!("insn {insn_idx}: stack access offset overflow"));
+        log.log(&alloc::format!(
+            "insn {insn_idx}: stack access offset overflow"
+        ));
         return Err(AxError::InvalidInput);
     };
     let Some(end) = start.checked_add(size as i32) else {
-        log.log(&alloc::format!("insn {insn_idx}: stack access size overflow"));
+        log.log(&alloc::format!(
+            "insn {insn_idx}: stack access size overflow"
+        ));
         return Err(AxError::InvalidInput);
     };
 
@@ -1374,7 +1381,10 @@ fn successor_states(
     }
 
     let dst = insn.dst_reg() as usize;
-    if !matches!(regs[dst].ty, RegType::MapValueOrNull | RegType::RingBufMemOrNull) {
+    if !matches!(
+        regs[dst].ty,
+        RegType::MapValueOrNull | RegType::RingBufMemOrNull
+    ) {
         return Ok(succs.into_iter().map(|succ| (succ, *regs)).collect());
     }
 
