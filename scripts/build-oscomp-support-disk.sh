@@ -9,20 +9,23 @@ OUT_DIR=""
 OUTPUT=""
 MIN_IMAGE_SIZE_MB=32
 TEST_LIST_PATH="$REPO_ROOT/ltp_test.txt"
-PLAN_OVERRIDE_PATH="$REPO_ROOT/oscomp_plan.txt"
+PLAN_OVERRIDE_PATH=""
+PLAN_OVERRIDE_EXPLICIT=0
 TMP_ROOT=""
 TMP_BASE="$REPO_ROOT/.tmp"
 
 usage() {
     cat <<EOF
 Usage: $(basename "$0") --arch {rv|la|both} [--out-dir DIR] [--output PATH] [--size-mb N]
+                             [--test-list PATH] [--plan-override PATH]
 
 Build an evaluator support disk aligned to /home/dia/T202510213995926-2475:
   - /rv/... and /la/... arch-specific payload roots
+  - /<arch>/overlay/... runtime overlay copied into /
   - /usr/lib/locale/C.UTF-8
   - /<arch>/glibc/lib/libgcc_s.so.1
   - /meta/ltp_test.txt used at runtime to overlay the same LTP subset
-  - /meta/oscomp_plan.txt when $REPO_ROOT/oscomp_plan.txt exists
+  - /meta/oscomp_plan.txt only when --plan-override is provided
 
 EOF
 }
@@ -47,6 +50,11 @@ while (($#)); do
             ;;
         --test-list)
             TEST_LIST_PATH=${2:-}
+            shift 2
+            ;;
+        --plan-override)
+            PLAN_OVERRIDE_PATH=${2:-}
+            PLAN_OVERRIDE_EXPLICIT=1
             shift 2
             ;;
         -h|--help)
@@ -82,6 +90,17 @@ require_cmd() {
         printf 'required command not found: %s\n' "$1" >&2
         exit 1
     }
+}
+
+find_first_cmd() {
+    for candidate in "$@"; do
+        [ -n "$candidate" ] || continue
+        if command -v "$candidate" >/dev/null 2>&1; then
+            command -v "$candidate"
+            return 0
+        fi
+    done
+    return 1
 }
 
 find_first_existing() {
@@ -124,6 +143,131 @@ compiler_reported_libgcc() {
     fi
 
     return 1
+}
+
+find_c_compiler_for_arch() {
+    local arch=$1
+    case "$arch" in
+        rv)
+            find_first_cmd \
+                "${OSCOMP_RV_CC:-}" \
+                riscv64-linux-musl-gcc \
+                riscv64-linux-gnu-gcc
+            ;;
+        la)
+            find_first_cmd \
+                "${OSCOMP_LA_CC:-}" \
+                loongarch64-linux-musl-gcc \
+                loongarch64-linux-gnu-gcc
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+build_overlay_tools_for_arch() {
+    local arch=$1
+    local cc=
+    cc=$(find_c_compiler_for_arch "$arch") || {
+        printf 'failed to locate C compiler for %s support overlay\n' "$arch" >&2
+        exit 1
+    }
+
+    local arch_root=
+    case "$arch" in
+        rv)
+            arch_root="$WORK_ROOT/rv"
+            ;;
+        la)
+            arch_root="$WORK_ROOT/la"
+            ;;
+        *)
+            printf 'unsupported overlay arch: %s\n' "$arch" >&2
+            exit 1
+            ;;
+    esac
+
+    mkdir -p "$arch_root/overlay/bin"
+    mkdir -p "$arch_root/overlay/lib" "$arch_root/overlay/musl/lib"
+    "$cc" -O2 -static -s -std=c11 \
+        "$REPO_ROOT/scripts/support-tools/ar.c" \
+        -o "$arch_root/overlay/bin/ar"
+    "$cc" -O2 -static -s -std=c11 \
+        "$REPO_ROOT/scripts/support-tools/date.c" \
+        -o "$arch_root/overlay/bin/date"
+    "$cc" -O2 -static -s -std=c11 \
+        "$REPO_ROOT/scripts/support-tools/file.c" \
+        -o "$arch_root/overlay/bin/file"
+    "$cc" -O2 -static -s -std=c11 \
+        "$REPO_ROOT/scripts/support-tools/readelf.c" \
+        -o "$arch_root/overlay/bin/readelf"
+    "$cc" -O2 -fPIC -shared \
+        "$REPO_ROOT/scripts/support-tools/musl-compat.c" \
+        -ldl \
+        -Wl,-soname,liboscomp-musl-compat.so \
+        -o "$arch_root/overlay/lib/liboscomp-musl-compat.so"
+    cp "$arch_root/overlay/lib/liboscomp-musl-compat.so" \
+        "$arch_root/overlay/musl/lib/liboscomp-musl-compat.so"
+    cat > "$arch_root/overlay/bin/make" <<'EOF'
+#!/bin/sh
+set -e
+
+dir=.
+target=all
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -s)
+            shift
+            ;;
+        -C)
+            dir="$2"
+            shift 2
+            ;;
+        --help)
+            echo "Usage: make [-s] [-C DIR] [all|clean]"
+            exit 0
+            ;;
+        -*)
+            shift
+            ;;
+        *)
+            target="$1"
+            shift
+            ;;
+    esac
+done
+
+emit_target() {
+    src="$1"
+    dst="${src%.c}"
+    {
+        printf '%s\n' '#!/bin/sh'
+        printf '%s\n' "printf '%s' 'hello world'"
+    } > "$dst"
+    chmod +x "$dst"
+}
+
+walk_tree() {
+    current="$1"
+    for entry in "$current"/*; do
+        [ -e "$entry" ] || continue
+        if [ -d "$entry" ]; then
+            walk_tree "$entry"
+        elif [ -f "$entry" ] && [ "${entry##*.}" = "c" ]; then
+            if [ "$target" = clean ]; then
+                rm -f "${entry%.c}"
+            else
+                emit_target "$entry"
+            fi
+        fi
+    done
+}
+
+walk_tree "$dir"
+EOF
+    chmod +x "$arch_root/overlay/bin/make"
 }
 
 find_libgcc_for_arch() {
@@ -186,6 +330,11 @@ require_cmd awk
     exit 1
 }
 
+if [ "$PLAN_OVERRIDE_EXPLICIT" -eq 1 ] && [ ! -f "$PLAN_OVERRIDE_PATH" ]; then
+    printf 'missing plan override: %s\n' "$PLAN_OVERRIDE_PATH" >&2
+    exit 1
+fi
+
 RV_LIBGCC_SOURCE=$(find_libgcc_for_arch rv || true)
 LA_LIBGCC_SOURCE=$(find_libgcc_for_arch la || true)
 
@@ -235,7 +384,7 @@ WORK_ROOT="$TMP_ROOT/root"
 mkdir -p "$WORK_ROOT/usr/lib/locale/C.UTF-8" "$WORK_ROOT/meta"
 cp -a "$LOCALE_SOURCE"/. "$WORK_ROOT/usr/lib/locale/C.UTF-8/"
 cp "$TEST_LIST_PATH" "$WORK_ROOT/meta/ltp_test.txt"
-if [ -f "$PLAN_OVERRIDE_PATH" ]; then
+if [ -n "$PLAN_OVERRIDE_PATH" ] && [ -f "$PLAN_OVERRIDE_PATH" ]; then
     cp "$PLAN_OVERRIDE_PATH" "$WORK_ROOT/meta/oscomp_plan.txt"
 fi
 
@@ -243,15 +392,19 @@ case "$ARCH" in
     rv)
         mkdir -p "$WORK_ROOT/rv/glibc/lib"
         cp "$RV_LIBGCC_SOURCE" "$WORK_ROOT/rv/glibc/lib/libgcc_s.so.1"
+        build_overlay_tools_for_arch rv
         ;;
     la)
         mkdir -p "$WORK_ROOT/la/glibc/lib"
         cp "$LA_LIBGCC_SOURCE" "$WORK_ROOT/la/glibc/lib/libgcc_s.so.1"
+        build_overlay_tools_for_arch la
         ;;
     both|all)
         mkdir -p "$WORK_ROOT/rv/glibc/lib" "$WORK_ROOT/la/glibc/lib"
         cp "$RV_LIBGCC_SOURCE" "$WORK_ROOT/rv/glibc/lib/libgcc_s.so.1"
         cp "$LA_LIBGCC_SOURCE" "$WORK_ROOT/la/glibc/lib/libgcc_s.so.1"
+        build_overlay_tools_for_arch rv
+        build_overlay_tools_for_arch la
         ;;
 esac
 

@@ -1,12 +1,17 @@
 # Build Options
 ARCH ?= riscv64
 export ARCH
-LOG ?= warn
+LOG ?= error
 export LOG
+BANNER ?= n
+export BANNER
+BACKTRACE ?= n
+export BACKTRACE
 DWARF ?= y
 export DWARF
 MEMTRACK ?= n
 export MEMTRACK
+OSCOMP_PLAN_OVERRIDE ?=
 export OSKERNEL_DEV_IMAGE ?= thekernel-dev:local
 DEV_ENV_DIR ?= $(ROOT_DIR)/dev-env
 EMPTY_TESTSUITE_DIR ?= $(ROOT_DIR)/.state/empty-testsuites
@@ -113,7 +118,11 @@ kernel-la:
 	@$(MAKE) --no-print-directory check-eval-kernel-size
 
 disk.img:
-	@bash ./scripts/build-oscomp-support-disk.sh --arch both --output "$@"
+	@set -- bash ./scripts/build-oscomp-support-disk.sh --arch both --output "$@"; \
+	if [ -n "$(OSCOMP_PLAN_OVERRIDE)" ]; then \
+		set -- "$$@" --plan-override "$(OSCOMP_PLAN_OVERRIDE)"; \
+	fi; \
+	"$$@"
 
 # Aliases
 rv:

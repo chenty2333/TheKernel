@@ -18,6 +18,21 @@ bb() {
     fi
 }
 
+runner_debug() {
+    case "${OSCOMP_RUNNER_DEBUG:-0}" in
+        1|y|Y|yes|YES|true|TRUE)
+            printf '%s\n' "$*"
+            ;;
+    esac
+}
+
+prime_group_output_stream() {
+    if [ -z "${RUNNER_OUTPUT_PRIMED:-}" ]; then
+        printf '\n'
+        RUNNER_OUTPUT_PRIMED=1
+    fi
+}
+
 append_word() {
     list_name="$1"
     word="$2"
@@ -201,6 +216,13 @@ echo qemu
 '
 }
 
+install_musl_loader_paths() {
+    bb mkdir -p /etc 2>/dev/null || true
+    write_file_lines /etc/ld-musl-riscv64.path /lib /usr/lib /musl/lib
+    write_file_lines /etc/ld-musl-riscv64-sf.path /lib /usr/lib /musl/lib
+    write_file_lines /etc/ld-musl-loongarch-lp64d.path /lib /usr/lib /musl/lib
+}
+
 install_useradd_tool() {
     [ -x /usr/sbin/useradd ] && return 0
     ensure_executable_script /usr/sbin/useradd '#!/bin/sh
@@ -332,6 +354,11 @@ mount_support_disk() {
         if [ -f /support/meta/oscomp_plan.txt ]; then
             bb cp /support/meta/oscomp_plan.txt /etc/oscomp-plan.txt 2>/dev/null || true
         fi
+        if [ -n "$support_arch_dir" ] && [ -d "/support/${support_arch_dir}/overlay" ]; then
+            bb cp -a "/support/${support_arch_dir}/overlay/." / 2>/dev/null || true
+        elif [ -d /support/overlay ]; then
+            bb cp -a /support/overlay/. / 2>/dev/null || true
+        fi
         bb umount /support >/dev/null 2>&1 || true
         bb rmdir /support >/dev/null 2>&1 || true
     else
@@ -345,7 +372,7 @@ run_pre2025_init_sequence() {
 
     bb mkdir -p /bin 2>/dev/null || true
     if ! pick_busybox_for_root /musl; then
-        echo "#### OSCOMP RUNNER MISSING SHELL /musl/busybox ####"
+        runner_debug "#### OSCOMP RUNNER MISSING SHELL /musl/busybox ####"
         return 1
     fi
     install_runtime_alias "$PICK_BUSYBOX_FOR_ROOT_RESULT" /bin/busybox || true
@@ -394,6 +421,7 @@ run_pre2025_init_sequence() {
 
     install_locale_tool
     install_systemd_detect_virt_tool
+    install_musl_loader_paths
     install_useradd_tool
     mount_support_disk
 }
@@ -421,14 +449,15 @@ support_ltp_subset_dir() {
 
 run_ltp_group() {
     root="$1"
+    shell_path="$2"
     support_ltp_subset_dir || {
-        echo "#### OSCOMP RUNNER MISSING LTP SUBSET LIST ####"
+        runner_debug "#### OSCOMP RUNNER MISSING LTP SUBSET LIST ####"
         return 127
     }
     test_list="$SUPPORT_LTP_TEST_LIST"
 
     [ -d "$root/ltp/testcases" ] || {
-        echo "#### OSCOMP RUNNER MISSING LTP TESTCASES ${root}/ltp/testcases ####"
+        runner_debug "#### OSCOMP RUNNER MISSING LTP TESTCASES ${root}/ltp/testcases ####"
         return 127
     }
 
@@ -439,32 +468,109 @@ run_ltp_group() {
     echo "#### OS COMP TEST GROUP START ltp ####"
 
     ran_cases=0
+    group_failed=0
     while IFS= read -r testcase || [ -n "$testcase" ]; do
         case "$testcase" in
             ''|\#*)
                 continue
                 ;;
         esac
-        testcase_path="ltp/testcases/bin/$testcase"
-        [ -f "$testcase_path" ] || {
-            echo "#### OSCOMP RUNNER MISSING LTP CASE ${root}/${testcase_path} ####"
+
+        set -f
+        # shellcheck disable=SC2086
+        set -- $testcase
+        set +f
+        [ "$#" -gt 0 ] || continue
+
+        testcase="$1"
+        shift
+
+        testcase_path=""
+        if [ -f "ltp/testcases/bin/$testcase" ]; then
+            testcase_path="./ltp/testcases/bin/$testcase"
+        elif [ -f "ltp/testscripts/$testcase" ]; then
+            testcase_path="./ltp/testscripts/$testcase"
+        else
+            testcase_matches=0
+            for candidate in $(bb find ltp/testcases -type f -name "$testcase" 2>/dev/null || true); do
+                testcase_matches=$((testcase_matches + 1))
+                testcase_path="./$candidate"
+                [ "$testcase_matches" -le 1 ] || break
+            done
+            if [ "$testcase_matches" -gt 1 ]; then
+                runner_debug "#### OSCOMP RUNNER AMBIGUOUS LTP CASE ${testcase} ####"
+                return 127
+            fi
+        fi
+
+        [ -n "$testcase_path" ] || {
+            runner_debug "#### OSCOMP RUNNER MISSING LTP CASE ${testcase} ####"
             return 127
         }
 
         ran_cases=$((ran_cases + 1))
         echo "RUN LTP CASE $testcase"
-        "./$testcase_path"
+        if [ "$#" -gt 0 ]; then
+            if [ -n "$shell_path" ] && [ "${testcase_path##*.}" = "sh" ]; then
+                "$shell_path" "$testcase_path" "$@"
+            else
+                "$testcase_path" "$@"
+            fi
+        else
+            if [ -n "$shell_path" ] && [ "${testcase_path##*.}" = "sh" ]; then
+                "$shell_path" "$testcase_path"
+            else
+                "$testcase_path"
+            fi
+        fi
         ret=$?
-        echo "FAIL LTP CASE $testcase : $ret"
+        if [ "$ret" -eq 0 ]; then
+            echo "PASS LTP CASE $testcase"
+        else
+            echo "FAIL LTP CASE $testcase : $ret"
+            group_failed=1
+        fi
     done <"$test_list"
 
     [ "$ran_cases" -gt 0 ] || {
-        echo "#### OSCOMP RUNNER EMPTY LTP SUBSET ${test_list} ####"
+        runner_debug "#### OSCOMP RUNNER EMPTY LTP SUBSET ${test_list} ####"
         return 127
     }
 
     echo "#### OS COMP TEST GROUP END ltp ####"
-    return 0
+    return "$group_failed"
+}
+
+run_basic_group() {
+    root="$1"
+    shell_path="$2"
+
+    [ -d "$root/basic" ] || {
+        runner_debug "#### OSCOMP RUNNER MISSING BASIC ROOT ${root}/basic ####"
+        return 127
+    }
+    [ -f "$root/basic/run-all.sh" ] || {
+        runner_debug "#### OSCOMP RUNNER MISSING BASIC SCRIPT ${root}/basic/run-all.sh ####"
+        return 127
+    }
+
+    if ! cd "$root/basic"; then
+        return 125
+    fi
+
+    echo "#### OS COMP TEST GROUP START basic ####"
+    if [ -n "$shell_path" ] && [ "${shell_path##*/}" = "busybox" ]; then
+        "$shell_path" sh ./run-all.sh
+        ret=$?
+    elif [ -n "$shell_path" ]; then
+        "$shell_path" ./run-all.sh
+        ret=$?
+    else
+        sh ./run-all.sh
+        ret=$?
+    fi
+    echo "#### OS COMP TEST GROUP END basic ####"
+    return "$ret"
 }
 
 prepare_lmbench_env() {
@@ -474,7 +580,7 @@ prepare_lmbench_env() {
     root_bin="$root/lmbench_all"
 
     [ -x "$root_bin" ] || {
-        echo "#### OSCOMP RUNNER MISSING LMBENCH BIN ${root_bin} ####"
+        runner_debug "#### OSCOMP RUNNER MISSING LMBENCH BIN ${root_bin} ####"
         return 1
     }
 
@@ -482,7 +588,7 @@ prepare_lmbench_env() {
     bb rm -f "$compat_bin" 2>/dev/null || true
     bb ln -sf "$root_bin" "$compat_bin" 2>/dev/null || \
         bb cp "$root_bin" "$compat_bin" 2>/dev/null || {
-            echo "#### OSCOMP RUNNER FAILED TO PREPARE LMBENCH BIN ${compat_bin} ####"
+            runner_debug "#### OSCOMP RUNNER FAILED TO PREPARE LMBENCH BIN ${compat_bin} ####"
             return 1
         }
     chmod +x "$compat_bin" 2>/dev/null || true
@@ -531,15 +637,15 @@ run_iozone_group() {
     [ -x "$iozone_bin" ] || iozone_bin="$root/iozone"
 
     [ -x "$iozone_busybox" ] || {
-        echo "#### OSCOMP RUNNER MISSING IOZONE BUSYBOX ${run_dir}/busybox ####"
+        runner_debug "#### OSCOMP RUNNER MISSING IOZONE BUSYBOX ${run_dir}/busybox ####"
         return 127
     }
     [ -x "$iozone_bin" ] || {
-        echo "#### OSCOMP RUNNER MISSING IOZONE BIN ${root}/iozone ####"
+        runner_debug "#### OSCOMP RUNNER MISSING IOZONE BIN ${root}/iozone ####"
         return 127
     }
 
-    "$iozone_busybox" echo "#### OS COMP TEST GROUP START iozone-${flavor} ####" || return $?
+    "$iozone_busybox" echo "#### OS COMP TEST GROUP START iozone ####" || return $?
     "$iozone_busybox" echo iozone automatic measurements || return $?
     "$iozone_bin" -a -r 1k -s 4m || return $?
     "$iozone_busybox" echo iozone throughput write/read measurements || return $?
@@ -556,7 +662,7 @@ run_iozone_group() {
     "$iozone_bin" -t 4 -i 9 -i 10 -r 1k -s 1m || return $?
     "$iozone_busybox" echo iozone throughtput pwritev/preadv measurements || return $?
     "$iozone_bin" -t 4 -i 11 -i 12 -r 1k -s 1m || return $?
-    "$iozone_busybox" echo "#### OS COMP TEST GROUP END iozone-${flavor} ####" || return $?
+    "$iozone_busybox" echo "#### OS COMP TEST GROUP END iozone ####" || return $?
     return 0
 }
 
@@ -686,7 +792,7 @@ prepare_group_timeout_secs() {
 
     if [ "$RUNNER_REMAINING_SECS" -le 0 ]; then
         RUNNER_GLOBAL_TIMEOUT_REACHED=1
-        echo "#### OSCOMP RUNNER GLOBAL TIMEOUT ${RUNNER_GLOBAL_TIMEOUT_SECS}s BEFORE ${script} ####"
+        runner_debug "#### OSCOMP RUNNER GLOBAL TIMEOUT ${RUNNER_GLOBAL_TIMEOUT_SECS}s BEFORE ${script} ####"
         RUNNER_GROUP_TIMEOUT_SECS=0
         return 1
     fi
@@ -843,7 +949,7 @@ dump_leaked_process_sample() {
         tgid="$(bb awk '/^Tgid:/ { print $2 }' "/proc/${pid}/status" 2>/dev/null || true)"
         [ -n "$comm" ] || comm="?"
 
-        echo "#### OSCOMP RUNNER LEAK SAMPLE PID ${pid} STATPID ${stat_pid:-?} TGID ${tgid:-?} STATE ${state:-?} PPID ${ppid:-?} THREADS ${num_threads:-?} SIGBLK ${blocked_mask:-?} COMM ${comm} ####"
+        runner_debug "#### OSCOMP RUNNER LEAK SAMPLE PID ${pid} STATPID ${stat_pid:-?} TGID ${tgid:-?} STATE ${state:-?} PPID ${ppid:-?} THREADS ${num_threads:-?} SIGBLK ${blocked_mask:-?} COMM ${comm} ####"
         sample_count=$((sample_count + 1))
     done
 }
@@ -873,7 +979,7 @@ cleanup_new_processes_since_snapshot() {
         [ -n "$leaked_pids" ] || return 0
         last_leaked_pids="$leaked_pids"
 
-        echo "#### OSCOMP RUNNER CLEANUP LEAKED PIDS ROUND $cleanup_round ${leaked_pids} ####"
+        runner_debug "#### OSCOMP RUNNER CLEANUP LEAKED PIDS ROUND $cleanup_round ${leaked_pids} ####"
         for pid in $leaked_pids; do
             kill_process_tree TERM "$pid"
         done
@@ -925,10 +1031,10 @@ run_group_script() {
     root_flavor "$root"
     flavor="$ROOT_FLAVOR_RESULT"
 
-    echo "#### OSCOMP RUNNER START ${script} ####"
+    runner_debug "#### OSCOMP RUNNER START ${script} ####"
 
     if ! prepare_group_timeout_secs "$root" "$group" "$script"; then
-        echo "#### OSCOMP RUNNER END ${script} STATUS 124 ####"
+        runner_debug "#### OSCOMP RUNNER END ${script} STATUS 124 ####"
         return 124
     fi
 
@@ -941,14 +1047,14 @@ run_group_script() {
 
     if [ "$group" = "ltp" ]; then
         if [ ! -d "$root/ltp" ]; then
-            echo "#### OSCOMP RUNNER MISSING LTP ROOT ${root}/ltp ####"
-            echo "#### OSCOMP RUNNER END ${script} STATUS 127 ####"
+            runner_debug "#### OSCOMP RUNNER MISSING LTP ROOT ${root}/ltp ####"
+            runner_debug "#### OSCOMP RUNNER END ${script} STATUS 127 ####"
             return 127
         fi
         prepare_ltp_env
     elif [ "$group" = "lmbench" ]; then
         prepare_lmbench_env "$root" || {
-            echo "#### OSCOMP RUNNER END ${script} STATUS 127 ####"
+            runner_debug "#### OSCOMP RUNNER END ${script} STATUS 127 ####"
             return 127
         }
     elif [ "$group" = "iozone" ]; then
@@ -958,6 +1064,8 @@ run_group_script() {
             run_script_name="iozone_testcode.sh"
         fi
     fi
+
+    prime_group_output_stream
 
     (
         cd "$run_dir" || exit 125
@@ -974,11 +1082,22 @@ run_group_script() {
             export LTP_SINGLE_FS_TYPE=tmpfs
         fi
         if [ -n "$BUILT_GROUP_PATH" ]; then
-            export PATH="$BUILT_GROUP_PATH"
+            if [ -n "${PATH:-}" ]; then
+                export PATH="$BUILT_GROUP_PATH:/bin:/usr/bin:/sbin:/usr/sbin:$PATH"
+            else
+                export PATH="$BUILT_GROUP_PATH:/bin:/usr/bin:/sbin:/usr/sbin"
+            fi
         fi
         build_ld_library_path "$root"
         if [ -n "$BUILT_LD_LIBRARY_PATH" ]; then
             export LD_LIBRARY_PATH="$BUILT_LD_LIBRARY_PATH"
+        fi
+        if [ "$root" = /musl ] && [ "$group" = "ltp" ] && [ -f /lib/liboscomp-musl-compat.so ]; then
+            if [ -n "${LD_PRELOAD:-}" ]; then
+                export LD_PRELOAD="liboscomp-musl-compat.so:$LD_PRELOAD"
+            else
+                export LD_PRELOAD="liboscomp-musl-compat.so"
+            fi
         fi
         if [ "$root" = /glibc ] && [ -n "${OSCOMP_SUPPORT_LOCPATH:-}" ]; then
             export LANG=C.UTF-8
@@ -1003,16 +1122,20 @@ run_group_script() {
         fi
 
         if [ -z "$script_shell" ]; then
-            echo "#### OSCOMP RUNNER MISSING SHELL ${root}/busybox ####"
+            runner_debug "#### OSCOMP RUNNER MISSING SHELL ${root}/busybox ####"
             exit 127
         fi
 
+        if [ "$group" = "basic" ]; then
+            run_basic_group "$root" "$script_shell"
+            exit $?
+        fi
         if [ "$group" = "iozone" ]; then
             run_iozone_group "$root" "$flavor" "$run_dir"
             exit $?
         fi
         if [ "$group" = "ltp" ]; then
-            run_ltp_group "$root"
+            run_ltp_group "$root" "$script_shell"
             exit $?
         fi
 
@@ -1030,7 +1153,7 @@ run_group_script() {
         streamed_bytes="$STREAM_GROUP_OUTPUT_BYTES"
         if [ "$elapsed" -ge "$timeout_secs" ]; then
             timed_out=1
-            echo "#### OSCOMP RUNNER TIMEOUT ${script} AFTER ${timeout_secs}s ####"
+            runner_debug "#### OSCOMP RUNNER TIMEOUT ${script} AFTER ${timeout_secs}s ####"
             kill_process_group TERM "$runner_pid"
             bb sleep 2
             kill_process_group KILL "$runner_pid"
@@ -1051,7 +1174,7 @@ run_group_script() {
     stream_group_output_incremental "$output_file" "$streamed_bytes"
     cleanup_new_processes_since_snapshot
     cleanup_iozone_stage
-    echo "#### OSCOMP RUNNER END ${script} STATUS ${status} ####"
+    runner_debug "#### OSCOMP RUNNER END ${script} STATUS ${status} ####"
     bb rm -f "$output_file" 2>/dev/null || true
     return "$status"
 }
@@ -1115,11 +1238,11 @@ oscomp_runner_main() {
 
     run_pre2025_init_sequence || exit 1
 
-    echo "#### OSCOMP RUNNER BOOTSTRAP ${OSCOMP_BOOTSTRAP:-/bin/sh} ####"
+    runner_debug "#### OSCOMP RUNNER BOOTSTRAP ${OSCOMP_BOOTSTRAP:-/bin/sh} ####"
 
     has_any_planned_scripts
     if [ -z "$FOUND_ANY" ]; then
-        echo "#### OSCOMP RUNNER NO TEST SCRIPTS FOUND ####"
+        runner_debug "#### OSCOMP RUNNER NO TEST SCRIPTS FOUND ####"
         exit 1
     fi
 

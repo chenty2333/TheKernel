@@ -14,8 +14,16 @@ TIMEOUT_SECS=7000
 WORKDIR=""
 KEEP_WORKDIR=0
 SKIP_KERNEL_BUILD=0
+REPLAY_VERBOSE=${OSCOMP_REPLAY_VERBOSE:-0}
 
 log() {
+    case "$REPLAY_VERBOSE" in
+        1|y|Y|yes|YES|true|TRUE)
+            ;;
+        *)
+            return 0
+            ;;
+    esac
     printf '[replay-oscomp] %s\n' "$*"
 }
 
@@ -231,9 +239,20 @@ if [ -n "$SUPPORT_IMAGE_SOURCE" ]; then
         1)
 fi
 
-"$SCRIPT_DIR/verify-pre2025-layout.sh" --arch "$ARCH" --image "$IMAGE_RUNTIME"
+if [ "$REPLAY_VERBOSE" = 1 ] || [ "$REPLAY_VERBOSE" = y ] || [ "$REPLAY_VERBOSE" = Y ] || \
+    [ "$REPLAY_VERBOSE" = yes ] || [ "$REPLAY_VERBOSE" = YES ] || \
+    [ "$REPLAY_VERBOSE" = true ] || [ "$REPLAY_VERBOSE" = TRUE ]; then
+    "$SCRIPT_DIR/verify-pre2025-layout.sh" --arch "$ARCH" --image "$IMAGE_RUNTIME"
+else
+    "$SCRIPT_DIR/verify-pre2025-layout.sh" --arch "$ARCH" --image "$IMAGE_RUNTIME" >/dev/null
+fi
 
 QEMU_LOG="$WORKDIR/qemu.log"
+QEMU_DEBUG_FLAGS=${OSCOMP_QEMU_DEBUG:-}
+QEMU_DEBUG_FILE=${OSCOMP_QEMU_DEBUG_FILE:-}
+if [ -n "$QEMU_DEBUG_FLAGS" ] && [ -z "$QEMU_DEBUG_FILE" ]; then
+    QEMU_DEBUG_FILE="$WORKDIR/qemu-debug.log"
+fi
 
 if [ "$ARCH" = "rv" ]; then
     QEMU_CMD=(
@@ -279,9 +298,15 @@ else
     fi
 fi
 
-log "qemu command: ${QEMU_CMD[*]}"
+if [ -n "$QEMU_DEBUG_FLAGS" ]; then
+    QEMU_CMD+=(-d "$QEMU_DEBUG_FLAGS")
+fi
+if [ -n "$QEMU_DEBUG_FILE" ]; then
+    QEMU_CMD+=(-D "$QEMU_DEBUG_FILE")
+fi
+
 set +e
-timeout --foreground "$TIMEOUT_SECS" "${QEMU_CMD[@]}" 2>&1 | tee "$QEMU_LOG"
+timeout --foreground "$TIMEOUT_SECS" "${QEMU_CMD[@]}" </dev/null 2>&1 | tee "$QEMU_LOG"
 status=${PIPESTATUS[0]}
 set -e
 
