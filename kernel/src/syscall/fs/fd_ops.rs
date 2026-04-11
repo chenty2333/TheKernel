@@ -10,7 +10,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs::{FS_CONTEXT, FileBackend, OpenOptions, OpenResult};
+use axfs::{FS_CONTEXT, FileBackend, FileFlags, OpenOptions, OpenResult};
 use axfs_ng_vfs::{
     DirEntry, FileNode, Location, MetadataUpdate, NodePermission, NodeType, Reference, path::Path,
 };
@@ -22,11 +22,12 @@ use spin::RwLock;
 use crate::{
     file::{
         Directory, FD_TABLE, File, FileDescriptor, FileLike, Pipe, add_file_like, close_file_like,
-        get_file_description, get_file_like,
+        get_file_description, get_file_like, get_typed_file,
         inotify::{
             location_for_fd, notify_close, notify_exact, notify_parent, notify_parent_with_name,
         },
         lease,
+        memfd,
         permission::{check_create_permissions, check_open_permissions},
         with_path_fs,
     },
@@ -107,6 +108,9 @@ fn enforce_special_open_rules(loc: &Location, flags: c_int, uid: u32) -> AxResul
     if flags & O_NOFOLLOW != 0 && flags & O_PATH == 0 && metadata.node_type == NodeType::Symlink {
         return Err(AxError::from(LinuxError::ELOOP));
     }
+    if flags & O_TRUNC != 0 {
+        memfd::check_resize(loc, 0)?;
+    }
 
     Ok(())
 }
@@ -186,7 +190,12 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
 /// flags: open flags
 /// mode: see man 7 inode
 /// return new file descriptor if succeed, or return -1.
-fn openat_inner(dirfd: c_int, path: &str, flags: i32, mode: __kernel_mode_t) -> AxResult<isize> {
+pub(super) fn openat_inner(
+    dirfd: c_int,
+    path: &str,
+    flags: i32,
+    mode: __kernel_mode_t,
+) -> AxResult<isize> {
     validate_pathname(Path::new(path))?;
     debug!("sys_openat <= {dirfd} {path:?} {flags:#o} {mode:#o}");
 
@@ -545,6 +554,16 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
             pipe.resize(arg)?;
             Ok(0)
         }
+        F_ADD_SEALS => {
+            let file = get_typed_file::<File>(fd)?;
+            memfd::add_seals(
+                file.inner().location(),
+                file.inner().flags().contains(FileFlags::WRITE),
+                arg as u32,
+            )?;
+            Ok(0)
+        }
+        F_GET_SEALS => Ok(memfd::get_seals(get_typed_file::<File>(fd)?.inner().location())? as _),
         _ => Err(AxError::InvalidInput),
     }
 }

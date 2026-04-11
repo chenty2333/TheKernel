@@ -12,6 +12,7 @@ use axsync::Mutex;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 
 use super::{AddrSpace, Backend, BackendOps, PopulateCallback, pages_in};
+use crate::file::memfd;
 
 #[doc(hidden)]
 pub struct FileBackendInner {
@@ -23,6 +24,7 @@ pub struct FileBackendInner {
     handle: AtomicUsize,
     map_id: Arc<()>,
     futex_handle: Arc<()>,
+    writable_mapping: Option<Arc<memfd::WritableMappingRegistration>>,
 }
 impl Drop for FileBackendInner {
     fn drop(&mut self) {
@@ -100,6 +102,9 @@ impl FileBackend {
         if !self.0.flags.contains(required_flags) {
             return Err(AxError::PermissionDenied);
         }
+        if flags.contains(MappingFlags::WRITE) {
+            memfd::check_writable_shared_mapping(self.0.cache.location())?;
+        }
         Ok(())
     }
 
@@ -144,6 +149,7 @@ impl FileBackend {
             handle: AtomicUsize::new(0),
             map_id,
             futex_handle: self.0.futex_handle.clone(),
+            writable_mapping: self.0.writable_mapping.clone(),
         });
         inner.register_listener(aspace);
         Self(inner)
@@ -204,7 +210,11 @@ impl BackendOps for FileBackend {
         flags: MappingFlags,
         _pt: &mut PageTableCursor,
     ) -> AxResult {
-        self.check_flags(flags)
+        self.check_flags(flags)?;
+        if let Some(registration) = &self.0.writable_mapping {
+            registration.set_active(flags.contains(MappingFlags::WRITE));
+        }
+        Ok(())
     }
 
     fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult {
@@ -226,7 +236,11 @@ impl BackendOps for FileBackend {
         new_flags: MappingFlags,
         _pt: &mut PageTableCursor,
     ) -> AxResult {
-        self.check_flags(new_flags)
+        self.check_flags(new_flags)?;
+        if let Some(registration) = &self.0.writable_mapping {
+            registration.set_active(new_flags.contains(MappingFlags::WRITE));
+        }
+        Ok(())
     }
 
     fn populate(
@@ -313,6 +327,7 @@ impl BackendOps for FileBackend {
             handle: AtomicUsize::new(0),
             map_id: self.0.map_id.clone(),
             futex_handle: self.0.futex_handle.clone(),
+            writable_mapping: self.0.writable_mapping.clone(),
         });
         inner.register_listener(new_aspace);
         Ok(Backend::File(FileBackend(inner)))
@@ -329,6 +344,7 @@ impl Backend {
         aspace: &Arc<Mutex<AddrSpace>>,
     ) -> Self {
         let offset_page = (offset / PAGE_SIZE_4K) as u32;
+        let writable_mapping = memfd::new_writable_mapping_registration(cache.location());
         let inner = Arc::new(FileBackendInner {
             start,
             cache,
@@ -338,6 +354,7 @@ impl Backend {
             handle: AtomicUsize::new(0),
             map_id: Arc::new(()),
             futex_handle: Arc::new(()),
+            writable_mapping,
         });
         inner.register_listener(aspace);
         Self::File(FileBackend(inner))

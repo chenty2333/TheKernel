@@ -8,6 +8,7 @@ mod fs;
 pub mod inotify;
 pub mod io_uring;
 pub(crate) mod lease;
+pub(crate) mod memfd;
 mod net;
 pub(crate) mod permission;
 mod pidfd;

@@ -202,7 +202,11 @@ impl From<MmapProt> for MappingFlags {
             flags |= MappingFlags::READ;
         }
         if value.contains(MmapProt::WRITE) {
-            flags |= MappingFlags::WRITE;
+            // RISC-V leaf PTEs cannot encode writable-without-readable pages,
+            // and Linux effectively treats PROT_WRITE mappings as readable on
+            // such hardware. Normalize here so VMA flags match the installed
+            // page-table permissions.
+            flags |= MappingFlags::READ | MappingFlags::WRITE;
         }
         if value.contains(MmapProt::EXEC) {
             flags |= MappingFlags::EXECUTE;

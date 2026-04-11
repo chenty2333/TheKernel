@@ -3,7 +3,7 @@ use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FileFlags, OpenOptions};
-use axio::{Seek, SeekFrom};
+use axio::{IoBuf, Seek, SeekFrom};
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::general::__kernel_off_t;
 use starry_vm::{VmMutPtr, VmPtr};
@@ -14,6 +14,7 @@ use crate::{
         Directory, File, FileHandle, FileLike, FileLikeKind, Pipe, get_file_like, get_typed_file,
         inotify::{notify_read, notify_write},
         lease,
+        memfd,
     },
     mm::{IoVec, IoVectorBuf, UserConstPtr, VmBytes, VmBytesMut},
     pseudofs::tmp,
@@ -226,6 +227,7 @@ fn do_pwritev(
     let written = if offset == -1 {
         file.write(&mut io)?
     } else {
+        memfd::check_write(file.inner().location(), offset as u64, io.remaining())?;
         file.inner().write_at(io, offset as u64)?
     } as isize;
     if written > 0 {
@@ -262,6 +264,7 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
     }
     let loc = FS_CONTEXT.lock().resolve(path)?;
     lease::wait_for_truncate(&loc)?;
+    memfd::check_resize(&loc, length as u64)?;
     let file = OpenOptions::new()
         .write(true)
         .open(&FS_CONTEXT.lock(), path)?
@@ -292,6 +295,7 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
             other => other,
         })?;
     lease::wait_for_truncate(f.inner().location())?;
+    memfd::check_resize(f.inner().location(), length as u64)?;
     backend.set_len(length as _)?;
     notify_write(fd);
     Ok(0)
@@ -318,6 +322,7 @@ pub fn sys_fallocate(
     let len = len as u64;
     let end = offset.checked_add(len).ok_or(AxError::InvalidInput)?;
     let size = loc.len()?;
+    let seals = memfd::current_seals(&loc).unwrap_or(0);
     let supported_modes = FALLOC_FL_KEEP_SIZE
         | FALLOC_FL_PUNCH_HOLE
         | FALLOC_FL_COLLAPSE_RANGE
@@ -329,6 +334,7 @@ pub fn sys_fallocate(
 
     match mode {
         0 => {
+            memfd::check_resize(&loc, size.max(end))?;
             backend.set_len(size.max(end))?;
             let _ = tmp::reserve_fallocate_range(&loc, offset, len, false);
         }
@@ -336,6 +342,9 @@ pub fn sys_fallocate(
             let _ = tmp::reserve_fallocate_range(&loc, offset, len, false);
         }
         mode if mode == (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE) => {
+            if seals & linux_raw_sys::general::F_SEAL_WRITE != 0 {
+                return Err(AxError::OperationNotPermitted);
+            }
             let hole_len = end.min(size).saturating_sub(offset);
             write_zero_range(file, offset, hole_len)?;
             if let Some(result) = tmp::punch_hole_fallocate_range(&loc, offset, len) {
@@ -347,9 +356,13 @@ pub fn sys_fallocate(
         mode if mode == FALLOC_FL_ZERO_RANGE
             || mode == (FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE) =>
         {
+            if seals & linux_raw_sys::general::F_SEAL_WRITE != 0 {
+                return Err(AxError::OperationNotPermitted);
+            }
             let zero_end = if mode & FALLOC_FL_KEEP_SIZE != 0 {
                 end.min(size)
             } else {
+                memfd::check_resize(&loc, size.max(end))?;
                 backend.set_len(size.max(end))?;
                 end
             };
@@ -365,6 +378,10 @@ pub fn sys_fallocate(
             {
                 return Err(AxError::InvalidInput);
             }
+            if seals & linux_raw_sys::general::F_SEAL_WRITE != 0 {
+                return Err(AxError::OperationNotPermitted);
+            }
+            memfd::check_resize(&loc, size - len)?;
             copy_within_file(file, end, offset, size - end)?;
             if let Some(result) = tmp::collapse_fallocate_range(&loc, offset, len) {
                 result?;
@@ -444,6 +461,7 @@ pub fn sys_pwrite64(
         return Err(AxError::InvalidInput);
     }
     let f = positioned_write_file(fd)?;
+    memfd::check_write(f.inner().location(), offset as u64, len)?;
     let write = f.inner().write_at(VmBytes::new(buf, len), offset as _)?;
     if write > 0 {
         notify_write(fd);

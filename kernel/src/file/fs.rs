@@ -9,13 +9,14 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axfs::{FS_CONTEXT, FsContext};
 use axfs_ng_vfs::{Location, Metadata, NodeFlags, path::Path};
+use axio::{IoBuf, Seek, SeekFrom};
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
 use axtask::future::{block_on, poll_io};
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 
 use super::{FileHandle, FileLike, Kstat, get_file_like, get_typed_file};
-use crate::file::{IoDst, IoSrc};
+use crate::file::{IoDst, IoSrc, memfd};
 
 pub fn with_fs<R>(dirfd: c_int, f: impl FnOnce(&mut FsContext) -> AxResult<R>) -> AxResult<R> {
     let mut fs = FS_CONTEXT.lock();
@@ -152,6 +153,16 @@ impl FileLike for File {
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
         let inner = self.inner();
+        let len = src.remaining();
+        if len != 0 {
+            let offset = if inner.flags().contains(axfs::FileFlags::APPEND) {
+                inner.location().len()?
+            } else {
+                let mut file = inner;
+                file.seek(SeekFrom::Current(0))?
+            };
+            memfd::check_write(inner.location(), offset, len)?;
+        }
         if likely(self.is_blocking()) {
             inner.write(src)
         } else {
