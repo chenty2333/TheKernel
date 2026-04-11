@@ -8,6 +8,14 @@ use crate::{
     mm::UserPtr,
 };
 
+fn checked_socklen_mut(addrlen: UserPtr<socklen_t>) -> AxResult<&'static mut socklen_t> {
+    let addrlen = addrlen.get_as_mut()?;
+    if *addrlen > i32::MAX as socklen_t {
+        return Err(axerrno::AxError::InvalidInput);
+    }
+    Ok(addrlen)
+}
+
 pub fn sys_getsockname(
     fd: i32,
     addr: UserPtr<sockaddr>,
@@ -17,7 +25,7 @@ pub fn sys_getsockname(
     let local_addr = socket.local_addr()?;
     debug!("sys_getsockname <= fd: {fd}, addr: {local_addr:?}");
 
-    local_addr.write_to_user(addr, addrlen.get_as_mut()?)?;
+    local_addr.write_to_user(addr, checked_socklen_mut(addrlen)?)?;
     Ok(0)
 }
 
@@ -30,6 +38,6 @@ pub fn sys_getpeername(
     let peer_addr = socket.peer_addr()?;
     debug!("sys_getpeername <= fd: {fd}, addr: {peer_addr:?}");
 
-    peer_addr.write_to_user(addr, addrlen.get_as_mut()?)?;
+    peer_addr.write_to_user(addr, checked_socklen_mut(addrlen)?)?;
     Ok(0)
 }

@@ -30,6 +30,8 @@ use crate::{
     task::{AsThread, get_task, get_visible_task, render_task_stat, tasks},
 };
 
+const PROC_PID_MAX: u32 = 4_194_304;
+
 fn render_mounts() -> String {
     let mut out = String::from("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n");
     for record in mounts::snapshot() {
@@ -572,7 +574,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
 
             kernel.add(
                 "pid_max",
-                SimpleFile::new_regular(fs.clone(), || Ok("32768\n")),
+                SimpleFile::new_regular(fs.clone(), || Ok(alloc::format!("{PROC_PID_MAX}\n"))),
             );
             kernel.add("tainted", SimpleFile::new_regular(fs.clone(), || Ok("0\n")));
 

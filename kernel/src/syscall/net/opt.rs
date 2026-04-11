@@ -1,6 +1,6 @@
 use axerrno::{AxError, AxResult, LinuxError};
 use axnet::options::{Configurable, GetSocketOption, SetSocketOption};
-use linux_raw_sys::net::{SO_ATTACH_BPF, SO_DETACH_BPF, SOL_SOCKET, socklen_t};
+use linux_raw_sys::net::{SO_ATTACH_BPF, SO_DETACH_BPF, SO_OOBINLINE, SOL_SOCKET, socklen_t};
 
 use crate::{
     file::{AfAlgSocket, FileLike, Socket, af_alg},
@@ -131,6 +131,10 @@ pub fn sys_getsockopt(
         optlen,
     );
 
+    if *optlen > i32::MAX as socklen_t {
+        return Err(AxError::InvalidInput);
+    }
+
     fn get<'a, T: 'static>(val: UserPtr<u8>, len: &mut socklen_t) -> AxResult<&'a mut T> {
         if (*len as usize) < size_of::<T>() {
             return Err(AxError::InvalidInput);
@@ -140,6 +144,10 @@ pub fn sys_getsockopt(
     }
 
     let socket = Socket::from_fd(fd)?;
+    if level == SOL_SOCKET && optname == SO_OOBINLINE {
+        *get::<i32>(optval, optlen)? = 0;
+        return Ok(0);
+    }
     macro_rules! dispatch {
         ($which:ident) => {
             socket.get_option(GetSocketOption::$which(get(optval, optlen)?))?;
@@ -150,7 +158,10 @@ pub fn sys_getsockopt(
             *get(optval, optlen)? = <$conv>::rust_to_sys(val)?;
         };
     }
-    call_dispatch!(dispatch, (level, optname));
+    match level {
+        SOL_SOCKET | PROTO_TCP | PROTO_IP => call_dispatch!(dispatch, (level, optname)),
+        _ => return Err(AxError::from(LinuxError::EOPNOTSUPP)),
+    }
 
     Ok(0)
 }
@@ -191,6 +202,10 @@ pub fn sys_setsockopt(
     }
 
     let socket = Socket::from_fd(fd)?;
+    if level == SOL_SOCKET && optname == SO_OOBINLINE {
+        let _ = get::<i32>(optval, optlen)?;
+        return Ok(0);
+    }
     if level == PROTO_IP {
         match optname {
             MCAST_JOIN_GROUP => return Ok(0),
@@ -225,7 +240,10 @@ pub fn sys_setsockopt(
             socket.set_option(SetSocketOption::$which(&mut val))?;
         };
     }
-    call_dispatch!(dispatch, (level, optname));
+    match level {
+        SOL_SOCKET | PROTO_TCP | PROTO_IP => call_dispatch!(dispatch, (level, optname)),
+        _ => return Err(AxError::from(LinuxError::ENOPROTOOPT)),
+    }
 
     Ok(0)
 }

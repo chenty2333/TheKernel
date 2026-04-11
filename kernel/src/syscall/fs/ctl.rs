@@ -309,9 +309,12 @@ impl DirBuffer {
 pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     debug!("sys_getdents64 <= fd: {fd}, buf: {buf:?}, len: {len}");
 
-    let mut buffer = DirBuffer::new(len);
-
     let dir = Directory::from_fd(fd)?;
+    if dir.inner().metadata()?.nlink == 0 {
+        return Err(AxError::NotFound);
+    }
+
+    let mut buffer = DirBuffer::new(len);
     let mut dir_offset = dir.offset.lock();
 
     let mut has_remaining = false;
@@ -420,25 +423,23 @@ pub fn sys_unlink(path: *const c_char) -> AxResult<isize> {
     sys_unlinkat(AT_FDCWD, path, 0)
 }
 
-pub fn sys_getcwd(buf: *mut u8, size: isize) -> AxResult<isize> {
-    let size: usize = size.try_into().map_err(|_| AxError::BadAddress)?;
-    if buf.is_null() {
-        return Ok(0);
-    }
-
+pub fn sys_getcwd(buf: *mut u8, size: usize) -> AxResult<isize> {
     let cwd = FS_CONTEXT.lock().current_dir().absolute_path()?;
     debug!("sys_getcwd => cwd: {cwd}");
 
     let cwd = CString::new(cwd.as_str()).map_err(|_| AxError::InvalidInput)?;
     let cwd = cwd.as_bytes_with_nul();
 
-    if cwd.len() <= size {
-        vm_write_slice(buf, cwd)?;
-        // FIXME: it is said that this should return 0
-        Ok(buf.as_ptr() as _)
-    } else {
-        Err(AxError::OutOfRange)
+    if cwd.len() > size {
+        return Err(AxError::OutOfRange);
     }
+
+    if buf.is_null() {
+        return Err(AxError::BadAddress);
+    }
+
+    vm_write_slice(buf, cwd)?;
+    Ok(cwd.len() as isize)
 }
 
 #[cfg(target_arch = "x86_64")]

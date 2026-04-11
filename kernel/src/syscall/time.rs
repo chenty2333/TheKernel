@@ -6,7 +6,7 @@ use linux_raw_sys::general::{
     __kernel_clockid_t, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC,
     CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
     CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, itimerval,
-    timespec, timeval,
+    timespec, timeval, timezone,
 };
 use starry_vm::{VmMutPtr, VmPtr};
 
@@ -358,12 +358,23 @@ pub fn sys_clock_gettime(clock_id: __kernel_clockid_t, ts: *mut timespec) -> AxR
     Ok(0)
 }
 
-pub fn sys_gettimeofday(ts: *mut timeval) -> AxResult<isize> {
-    ts.vm_write(timeval::from_time_value(wall_time()))?;
+pub fn sys_gettimeofday(ts: *mut timeval, tz: *mut timezone) -> AxResult<isize> {
+    if let Some(ts) = ts.nullable() {
+        ts.vm_write(timeval::from_time_value(wall_time()))?;
+    }
+    if let Some(tz) = tz.nullable() {
+        tz.vm_write(timezone {
+            tz_minuteswest: 0,
+            tz_dsttime: 0,
+        })?;
+    }
     Ok(0)
 }
 
-pub fn sys_settimeofday(ts: *const timeval) -> AxResult<isize> {
+pub fn sys_settimeofday(ts: *const timeval, tz: *const timezone) -> AxResult<isize> {
+    if let Some(tz) = tz.nullable() {
+        let _ = unsafe { tz.vm_read_uninit()?.assume_init() };
+    }
     let ts = unsafe { ts.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
     set_wall_time(ts);
     Ok(0)

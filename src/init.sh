@@ -510,13 +510,21 @@ run_ltp_group() {
         echo "RUN LTP CASE $testcase"
         if [ "$#" -gt 0 ]; then
             if [ -n "$shell_path" ] && [ "${testcase_path##*.}" = "sh" ]; then
-                "$shell_path" "$testcase_path" "$@"
+                if [ "${shell_path##*/}" = "busybox" ]; then
+                    "$shell_path" sh "$testcase_path" "$@"
+                else
+                    "$shell_path" "$testcase_path" "$@"
+                fi
             else
                 "$testcase_path" "$@"
             fi
         else
             if [ -n "$shell_path" ] && [ "${testcase_path##*.}" = "sh" ]; then
-                "$shell_path" "$testcase_path"
+                if [ "${shell_path##*/}" = "busybox" ]; then
+                    "$shell_path" sh "$testcase_path"
+                else
+                    "$shell_path" "$testcase_path"
+                fi
             else
                 "$testcase_path"
             fi

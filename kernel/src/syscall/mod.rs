@@ -729,9 +729,9 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::membarrier => sys_membarrier(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
 
         // time
-        Sysno::gettimeofday => sys_gettimeofday(uctx.arg0() as _),
+        Sysno::gettimeofday => sys_gettimeofday(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::clock_settime => sys_clock_settime(uctx.arg0() as _, uctx.arg1() as _),
-        Sysno::settimeofday => sys_settimeofday(uctx.arg0() as _),
+        Sysno::settimeofday => sys_settimeofday(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::adjtimex => sys_adjtimex(uctx.arg0() as _),
         Sysno::clock_adjtime => sys_clock_adjtime(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::times => sys_times(uctx.arg0() as _),
