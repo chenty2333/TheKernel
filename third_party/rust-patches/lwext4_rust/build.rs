@@ -57,9 +57,8 @@ fn main() {
 
         let sysroot = core::str::from_utf8(&output.stdout).unwrap();
         let sysroot = sysroot.trim_end();
-        let sysroot_inc = &format!("-I{sysroot}/include/");
 
-        generates_bindings_to_rust(arch.as_str(), &toolchain.cc, sysroot_inc, &out_dir);
+        generates_bindings_to_rust(arch.as_str(), &toolchain.cc, sysroot, &out_dir);
     }
 
     println!("cargo:rustc-link-lib=static={lwext4_lib}");
@@ -141,7 +140,15 @@ fn command_succeeds(cmd: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-fn generates_bindings_to_rust(arch: &str, cc: &str, mpath: &str, out_dir: &Path) {
+fn add_existing_include_dir(builder: bindgen::Builder, path: PathBuf) -> bindgen::Builder {
+    if path.is_dir() {
+        builder.clang_arg(format!("-isystem{}", path.display()))
+    } else {
+        builder
+    }
+}
+
+fn generates_bindings_to_rust(arch: &str, cc: &str, sysroot: &str, out_dir: &Path) {
     let target = env::var("TARGET").unwrap();
     let host = env::var("HOST").unwrap_or_else(|_| "x86_64-unknown-linux-gnu".to_string());
     let mut bindgen_target = if target.ends_with("-softfloat") {
@@ -180,38 +187,49 @@ fn generates_bindings_to_rust(arch: &str, cc: &str, mpath: &str, out_dir: &Path)
         ))
         .layout_tests(false)
         // Tell cargo to invalidate the built crate whenever any of the included header files changed.
-        .parse_callbacks(Box::new(CustomCargoCallbacks))
-        .clang_arg(mpath);
+        .parse_callbacks(Box::new(CustomCargoCallbacks));
 
-    if arch == "loongarch64" {
-        if let Some(triple) = command_stdout(cc, &["-dumpmachine"]) {
-            if command_succeeds(
-                "clang",
-                &[
-                    &format!("--target={triple}"),
-                    "-dM",
-                    "-E",
-                    "-x",
-                    "c",
-                    "-",
-                ],
-            ) {
-                builder = builder.clang_arg(format!("--target={triple}"));
+    if let Some(triple) = command_stdout(cc, &["-dumpmachine"]) {
+        if command_succeeds(
+            "clang",
+            &[
+                &format!("--target={triple}"),
+                "-dM",
+                "-E",
+                "-x",
+                "c",
+                "-",
+            ],
+        ) {
+            builder = builder.clang_arg(format!("--target={triple}"));
+            if !sysroot.is_empty() {
+                builder = builder.clang_arg(format!("--sysroot={sysroot}"));
             }
+        } else if arch == "loongarch64" {
+            println!(
+                "cargo:warning=clang does not support target triple {triple}; generating lwext4 bindings with fallback host target {host}"
+            );
+            bindgen_target = host.clone();
+            unsafe { env::set_var("TARGET", &bindgen_target) };
+        }
 
-            if let Some(gcc_include) = command_stdout(cc, &["-print-file-name=include"]) {
-                builder = builder.clang_arg(format!("-isystem{gcc_include}"));
+        if let Some(gcc_include) = command_stdout(cc, &["-print-file-name=include"]) {
+            builder = builder.clang_arg(format!("-isystem{gcc_include}"));
 
-                let gcc_include_path = PathBuf::from(&gcc_include);
-                if let Some(toolchain_root) = gcc_include_path.ancestors().nth(5) {
-                    let sys_include = toolchain_root.join(&triple).join("sys-include");
-                    if sys_include.is_dir() {
-                        builder =
-                            builder.clang_arg(format!("-isystem{}", sys_include.display()));
-                    }
-                }
+            let gcc_include_path = PathBuf::from(&gcc_include);
+            if let Some(toolchain_root) = gcc_include_path.ancestors().nth(5) {
+                builder = add_existing_include_dir(
+                    builder,
+                    toolchain_root.join(&triple).join("sys-include"),
+                );
             }
         }
+
+        let sysroot_path = PathBuf::from(if sysroot.is_empty() { "/" } else { sysroot });
+        builder = add_existing_include_dir(builder, sysroot_path.join("include"));
+        builder = add_existing_include_dir(builder, sysroot_path.join("usr").join("include"));
+        builder =
+            add_existing_include_dir(builder, sysroot_path.join("usr").join("include").join(&triple));
     }
 
     let bindings = builder.generate().expect("Unable to generate bindings");

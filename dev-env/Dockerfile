@@ -158,10 +158,10 @@ ENV CARGO_HOME=${CARGO_HOME}
 ENV RUSTUP_TOOLCHAIN=${RUST_TOOLCHAIN}
 ENV OSKERNEL_QEMU_VERSION=${QEMU_VERSION}
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
-ENV PATH=${CARGO_HOME}/bin:/usr/local/cross-compat/bin:/opt/loongarch64-linux-musl-cross/bin:/opt/qemu-${QEMU_VERSION}/bin:${PATH}
+ENV PATH=${CARGO_HOME}/bin:/usr/local/cross-compat/bin:/opt/loongarch64-linux-musl-cross/bin:/opt/qemu-${QEMU_VERSION}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN printf '%s\n' \
-    'export PATH=/usr/local/cargo/bin:/usr/local/cross-compat/bin:/opt/loongarch64-linux-musl-cross/bin:/opt/qemu-'${QEMU_VERSION}'/bin:$PATH' \
+    'export PATH=/usr/local/cargo/bin:/usr/local/cross-compat/bin:/opt/loongarch64-linux-musl-cross/bin:/opt/qemu-'${QEMU_VERSION}'/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
     > /etc/profile.d/thekernel-dev-path.sh
 
 COPY entrypoint.sh /usr/local/bin/thekernel-dev-entrypoint
