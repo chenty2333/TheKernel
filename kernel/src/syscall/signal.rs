@@ -16,8 +16,8 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     task::{
-        AsThread, check_signals, processes, send_signal_to_process, send_signal_to_process_group,
-        send_signal_to_visible_thread,
+        AsThread, check_signals, get_process_data, processes, send_signal_to_process,
+        send_signal_to_process_group, send_signal_to_visible_thread,
     },
     time::TimeValueLike,
 };
@@ -110,12 +110,31 @@ fn make_siginfo(signo: u32, code: i32) -> AxResult<Option<SignalInfo>> {
     )))
 }
 
+fn check_signal_permission(pid: Pid) -> AxResult<()> {
+    let actor = current();
+    let actor_proc = &actor.as_thread().proc_data;
+    if actor_proc.euid() == 0 {
+        return Ok(());
+    }
+
+    let target = get_process_data(pid)?;
+    let allowed = [actor_proc.uid(), actor_proc.euid()]
+        .into_iter()
+        .any(|id| id == target.uid() || id == target.euid() || id == target.suid());
+    if allowed {
+        Ok(())
+    } else {
+        Err(AxError::OperationNotPermitted)
+    }
+}
+
 pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
     debug!("sys_kill: pid = {pid}, signo = {signo}");
     let sig = make_siginfo(signo, SI_USER as _)?;
 
     match pid {
         1.. => {
+            check_signal_permission(pid as Pid)?;
             send_signal_to_process(pid as _, sig)?;
         }
         0 => {

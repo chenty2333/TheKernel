@@ -3,7 +3,7 @@ use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time, monotonic_time_nanos
 use axtask::current;
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::{
-    __kernel_clockid_t, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC,
+    __kernel_clockid_t, CAP_SYS_TIME, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC,
     CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
     CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, itimerval,
     timespec, timeval, timezone,
@@ -336,7 +336,10 @@ fn sys_do_clock_adjtime(
 
     let mut timex = unsafe { timex_ptr.vm_read_uninit()?.assume_init() };
     let modes = timex.modes;
-    let privileged = super::sys_geteuid()? == 0;
+    let privileged = current()
+        .as_thread()
+        .proc_data
+        .has_effective_capability(CAP_SYS_TIME);
 
     if !privileged && modes != 0 && modes != ADJ_OFFSET_SS_READ {
         return Err(AxError::OperationNotPermitted);
@@ -376,6 +379,13 @@ pub fn sys_settimeofday(ts: *const timeval, tz: *const timezone) -> AxResult<isi
         let _ = unsafe { tz.vm_read_uninit()?.assume_init() };
     }
     let ts = unsafe { ts.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
+    if !current()
+        .as_thread()
+        .proc_data
+        .has_effective_capability(CAP_SYS_TIME)
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
     set_wall_time(ts);
     Ok(0)
 }
@@ -392,6 +402,13 @@ pub fn sys_clock_settime(clock_id: __kernel_clockid_t, ts: *const timespec) -> A
     let ts = unsafe { ts.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
     match clock_id as u32 {
         CLOCK_REALTIME => {
+            if !current()
+                .as_thread()
+                .proc_data
+                .has_effective_capability(CAP_SYS_TIME)
+            {
+                return Err(AxError::OperationNotPermitted);
+            }
             set_wall_time(ts);
             Ok(0)
         }

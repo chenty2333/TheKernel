@@ -85,6 +85,15 @@ fn collect_remap_segments(
     Ok(segments)
 }
 
+fn validate_page_aligned_range(addr: usize, length: usize) -> AxResult<(VirtAddr, usize)> {
+    let start = VirtAddr::from(addr).align_down_4k();
+    let end = VirtAddr::from(addr)
+        .checked_add(length)
+        .ok_or(AxError::InvalidInput)?
+        .align_up_4k();
+    Ok((start, end.sub_addr(start)))
+}
+
 fn prefix_segments(segments: &[RemapSegment], size: usize) -> Vec<RemapSegment> {
     let mut remaining = size;
     let mut prefix = Vec::new();
@@ -626,20 +635,39 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
 
-    // Validate the range is mapped.
     let curr = current();
-    let aspace_handle = curr.as_thread().proc_data.aspace();
+    let proc_data = &curr.as_thread().proc_data;
+    let aspace_handle = proc_data.aspace();
     let aspace = aspace_handle.lock();
-    let start = VirtAddr::from(addr).align_down_4k();
-    let end = VirtAddr::from(addr)
-        .checked_add(length)
-        .ok_or(AxError::InvalidInput)?
-        .align_up_4k();
-    let length = end.sub_addr(start);
+    let (start, length) = validate_page_aligned_range(addr, length)?;
     if length > 0 && !aspace.can_access_range(start, length, MappingFlags::empty()) {
         return Err(AxError::NoMemory);
     }
 
-    // No swap — all pages are always resident. Nothing to do.
+    if length > 0 && !proc_data.has_effective_capability(CAP_IPC_LOCK) {
+        let limit = proc_data.rlim.read()[RLIMIT_MEMLOCK].current;
+        if limit == 0 {
+            return Err(AxError::OperationNotPermitted);
+        }
+        if (length as u64) > limit {
+            return Err(AxError::NoMemory);
+        }
+    }
+
+    Ok(0)
+}
+
+pub fn sys_munlock(addr: usize, length: usize) -> AxResult<isize> {
+    debug!("sys_munlock <= addr: {addr:#x}, length: {length:x}");
+
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let aspace_handle = proc_data.aspace();
+    let aspace = aspace_handle.lock();
+    let (start, length) = validate_page_aligned_range(addr, length)?;
+    if length > 0 && !aspace.can_access_range(start, length, MappingFlags::empty()) {
+        return Err(AxError::NoMemory);
+    }
+
     Ok(0)
 }

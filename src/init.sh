@@ -465,6 +465,34 @@ run_ltp_group() {
         return 125
     fi
 
+    run_ltp_case_command() {
+        shell_path="$1"
+        testcase_path="$2"
+        shift 2
+
+        if [ "$#" -gt 0 ]; then
+            if [ -n "$shell_path" ] && [ "${testcase_path##*.}" = "sh" ]; then
+                if [ "${shell_path##*/}" = "busybox" ]; then
+                    "$shell_path" sh "$testcase_path" "$@"
+                else
+                    "$shell_path" "$testcase_path" "$@"
+                fi
+            else
+                "$testcase_path" "$@"
+            fi
+        else
+            if [ -n "$shell_path" ] && [ "${testcase_path##*.}" = "sh" ]; then
+                if [ "${shell_path##*/}" = "busybox" ]; then
+                    "$shell_path" sh "$testcase_path"
+                else
+                    "$shell_path" "$testcase_path"
+                fi
+            else
+                "$testcase_path"
+            fi
+        fi
+    }
+
     ran_cases=0
     group_failed=0
     while IFS= read -r testcase || [ -n "$testcase" ]; do
@@ -508,30 +536,35 @@ run_ltp_group() {
 
         ran_cases=$((ran_cases + 1))
         echo "RUN LTP CASE $testcase"
-        if [ "$#" -gt 0 ]; then
-            if [ -n "$shell_path" ] && [ "${testcase_path##*.}" = "sh" ]; then
-                if [ "${shell_path##*/}" = "busybox" ]; then
-                    "$shell_path" sh "$testcase_path" "$@"
-                else
-                    "$shell_path" "$testcase_path" "$@"
-                fi
-            else
-                "$testcase_path" "$@"
-            fi
+        case_log=""
+        if [ "${OSCOMP_STREAM_LTP_CASE_OUTPUT:-0}" = "1" ]; then
+            run_ltp_case_command "$shell_path" "$testcase_path" "$@"
+            ret=$?
         else
-            if [ -n "$shell_path" ] && [ "${testcase_path##*.}" = "sh" ]; then
-                if [ "${shell_path##*/}" = "busybox" ]; then
-                    "$shell_path" sh "$testcase_path"
-                else
-                    "$shell_path" "$testcase_path"
-                fi
+            case_log="/var/tmp/oscomp-ltp-case-${testcase}.$$.$ran_cases.log"
+            bb rm -f "$case_log" 2>/dev/null || true
+            if run_ltp_case_command "$shell_path" "$testcase_path" "$@" >"$case_log" 2>&1; then
+                ret=0
             else
-                "$testcase_path"
+                ret=$?
+            fi
+
+            if [ "${OSCOMP_KEEP_LTP_CASE_LOGS:-0}" = "1" ]; then
+                runner_debug "#### OSCOMP RUNNER LTP CASE LOG ${case_log} ####"
+            else
+                if [ "$ret" -ne 0 ] && [ -s "$case_log" ]; then
+                    cat "$case_log"
+                fi
+                bb rm -f "$case_log" 2>/dev/null || true
+                case_log=""
             fi
         fi
-        ret=$?
+
         echo "FAIL LTP CASE $testcase : $ret"
         if [ "$ret" -ne 0 ]; then
+            if [ -n "$case_log" ] && [ -s "$case_log" ]; then
+                cat "$case_log"
+            fi
             group_failed=1
         fi
     done <"$test_list"

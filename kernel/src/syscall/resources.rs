@@ -1,6 +1,6 @@
 use axerrno::{AxError, AxResult};
 use axtask::current;
-use linux_raw_sys::general::{RLIM_NLIMITS, rlimit, rlimit64, rusage};
+use linux_raw_sys::general::{CAP_SYS_RESOURCE, RLIM_NLIMITS, rlimit, rlimit64, rusage};
 use starry_process::Pid;
 use starry_vm::{VmMutPtr, VmPtr};
 
@@ -32,13 +32,15 @@ pub fn sys_prlimit64(
             return Err(AxError::InvalidInput);
         }
 
+        let curr = current();
+        let curr_proc = &curr.as_thread().proc_data;
         let limit = &mut proc_data.rlim.write()[resource];
         if new_limit.rlim_max <= limit.max {
             limit.max = new_limit.rlim_max;
+        } else if curr_proc.has_effective_capability(CAP_SYS_RESOURCE) || curr_proc.euid() == 0 {
+            limit.max = new_limit.rlim_max;
         } else {
-            // TODO: patch resources
-            // return Err(AxError::OperationNotPermitted);
-            return Ok(0);
+            return Err(AxError::OperationNotPermitted);
         }
 
         limit.current = new_limit.rlim_cur;

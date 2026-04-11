@@ -236,8 +236,8 @@ impl Thread {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ProcStateHint {
-    None = 0,
-    Interruptible = 1,
+    None            = 0,
+    Interruptible   = 1,
     Uninterruptible = 2,
 }
 
@@ -349,6 +349,56 @@ pub(crate) struct Credentials {
     sgid: u32,
 }
 
+const CAPABILITY_WORDS: usize = 2;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CapabilityState {
+    pub(crate) effective: [u32; CAPABILITY_WORDS],
+    pub(crate) permitted: [u32; CAPABILITY_WORDS],
+    pub(crate) inheritable: [u32; CAPABILITY_WORDS],
+    pub(crate) bounding: [u32; CAPABILITY_WORDS],
+    pub(crate) securebits: u32,
+}
+
+impl CapabilityState {
+    const fn full() -> Self {
+        Self {
+            effective: [u32::MAX; CAPABILITY_WORDS],
+            permitted: [u32::MAX; CAPABILITY_WORDS],
+            inheritable: [0; CAPABILITY_WORDS],
+            bounding: [u32::MAX; CAPABILITY_WORDS],
+            securebits: 0,
+        }
+    }
+
+    fn cap_mask(cap: u32) -> Option<(usize, u32)> {
+        let word = cap as usize / u32::BITS as usize;
+        (word < CAPABILITY_WORDS).then_some((word, 1_u32 << (cap % u32::BITS)))
+    }
+
+    pub(crate) fn has_effective(self, cap: u32) -> bool {
+        let Some((word, mask)) = Self::cap_mask(cap) else {
+            return false;
+        };
+        self.effective[word] & mask != 0
+    }
+
+    pub(crate) fn bounding_contains(self, cap: u32) -> bool {
+        let Some((word, mask)) = Self::cap_mask(cap) else {
+            return false;
+        };
+        self.bounding[word] & mask != 0
+    }
+
+    pub(crate) fn drop_bounding(&mut self, cap: u32) -> AxResult<()> {
+        let Some((word, mask)) = Self::cap_mask(cap) else {
+            return Err(AxError::InvalidInput);
+        };
+        self.bounding[word] &= !mask;
+        Ok(())
+    }
+}
+
 /// [`Process`]-shared data.
 pub struct ProcessData {
     /// The process.
@@ -387,8 +437,12 @@ pub struct ProcessData {
     umask: AtomicU32,
     /// Process credentials shared by all threads.
     creds: SpinNoIrq<Credentials>,
+    /// Process capabilities shared by all threads.
+    caps: SpinNoIrq<CapabilityState>,
     /// Supplementary group IDs shared by all threads in the process.
     supplementary_groups: SpinNoIrq<Vec<u32>>,
+    /// Process-scoped membarrier registration state.
+    membarrier_state: AtomicU32,
 
     /// CPU time accumulated from sibling threads that have already exited.
     exited_threads_usage: AtomicTaskUsage,
@@ -448,7 +502,9 @@ impl ProcessData {
 
             umask: AtomicU32::new(0o022),
             creds: SpinNoIrq::new(Credentials::default()),
+            caps: SpinNoIrq::new(CapabilityState::full()),
             supplementary_groups: SpinNoIrq::new(Vec::new()),
+            membarrier_state: AtomicU32::new(0),
             exited_threads_usage: AtomicTaskUsage::new(),
             waited_children_usage: AtomicTaskUsage::new(),
             wait_lock: Mutex::new(()),
@@ -537,6 +593,14 @@ impl ProcessData {
         *self.creds.lock() = creds;
     }
 
+    pub(crate) fn capability_state(&self) -> CapabilityState {
+        *self.caps.lock()
+    }
+
+    pub(crate) fn set_capability_state(&self, caps: CapabilityState) {
+        *self.caps.lock() = caps;
+    }
+
     pub fn supplementary_groups(&self) -> Vec<u32> {
         self.supplementary_groups.lock().clone()
     }
@@ -561,20 +625,76 @@ impl ProcessData {
         self.creds.lock().egid
     }
 
+    pub fn suid(&self) -> u32 {
+        self.creds.lock().suid
+    }
+
+    pub fn sgid(&self) -> u32 {
+        self.creds.lock().sgid
+    }
+
     pub fn is_in_group(&self, gid: u32) -> bool {
         self.egid() == gid || self.supplementary_groups.lock().contains(&gid)
     }
 
+    pub fn has_effective_capability(&self, cap: u32) -> bool {
+        self.capability_state().has_effective(cap)
+    }
+
+    pub fn register_membarrier(&self, flags: u32) {
+        self.membarrier_state.fetch_or(flags, Ordering::Relaxed);
+    }
+
+    pub fn membarrier_registered(&self, flags: u32) -> bool {
+        self.membarrier_state.load(Ordering::Relaxed) & flags == flags
+    }
+
+    pub fn bounding_capability_enabled(&self, cap: u32) -> bool {
+        self.capability_state().bounding_contains(cap)
+    }
+
+    pub fn drop_bounding_capability(&self, cap: u32) -> AxResult<()> {
+        self.caps.lock().drop_bounding(cap)
+    }
+
+    pub fn securebits(&self) -> u32 {
+        self.caps.lock().securebits
+    }
+
+    pub fn set_securebits(&self, securebits: u32) {
+        self.caps.lock().securebits = securebits;
+    }
+
+    fn fixup_capabilities_for_euid_change(&self, old_euid: u32, new_euid: u32) {
+        if old_euid == new_euid {
+            return;
+        }
+
+        let mut caps = self.caps.lock();
+        if old_euid == 0 && new_euid != 0 {
+            caps.effective = [0; CAPABILITY_WORDS];
+        } else if old_euid != 0 && new_euid == 0 {
+            caps.effective = caps.permitted;
+        }
+    }
+
     pub fn setuid(&self, uid: u32) -> AxResult<()> {
         let mut creds = self.creds.lock();
+        let old_euid = creds.euid;
         if creds.euid == 0 {
             creds.ruid = uid;
             creds.euid = uid;
             creds.suid = uid;
+            let new_euid = creds.euid;
+            drop(creds);
+            self.fixup_capabilities_for_euid_change(old_euid, new_euid);
             return Ok(());
         }
         if uid == creds.ruid || uid == creds.suid {
             creds.euid = uid;
+            let new_euid = creds.euid;
+            drop(creds);
+            self.fixup_capabilities_for_euid_change(old_euid, new_euid);
             return Ok(());
         }
         Err(AxError::OperationNotPermitted)
@@ -613,6 +733,29 @@ impl ProcessData {
         if ruid.is_some() || euid.is_some_and(|id| id != old.ruid) {
             creds.suid = new_euid;
         }
+        drop(creds);
+        self.fixup_capabilities_for_euid_change(old.euid, new_euid);
+        Ok(())
+    }
+
+    pub fn setregid(&self, rgid: Option<u32>, egid: Option<u32>) -> AxResult<()> {
+        let mut creds = self.creds.lock();
+        let old = *creds;
+        if old.egid != 0 {
+            for id in [rgid, egid].into_iter().flatten() {
+                if id != old.rgid && id != old.egid && id != old.sgid {
+                    return Err(AxError::OperationNotPermitted);
+                }
+            }
+        }
+
+        let new_rgid = rgid.unwrap_or(old.rgid);
+        let new_egid = egid.unwrap_or(old.egid);
+        creds.rgid = new_rgid;
+        creds.egid = new_egid;
+        if rgid.is_some() || egid.is_some_and(|id| id != old.rgid) {
+            creds.sgid = new_egid;
+        }
         Ok(())
     }
 
@@ -641,6 +784,9 @@ impl ProcessData {
         if let Some(id) = suid {
             creds.suid = id;
         }
+        let new_euid = creds.euid;
+        drop(creds);
+        self.fixup_capabilities_for_euid_change(old.euid, new_euid);
         Ok(())
     }
 

@@ -6,9 +6,11 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 #include <sys/epoll.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 typedef int (*clone_fn_t)(int (*)(void *), void *, int, void *, pid_t *, void *, pid_t *);
@@ -97,4 +99,24 @@ int nice(int inc)
         errno = EPERM;
     }
     return ret;
+}
+
+int gethostname(char *name, size_t len)
+{
+    struct utsname uts;
+    size_t host_len;
+
+    if (uname(&uts) < 0) {
+        return -1;
+    }
+
+    host_len = strnlen(uts.nodename, sizeof(uts.nodename));
+    if (len <= host_len) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    memcpy(name, uts.nodename, host_len);
+    name[host_len] = '\0';
+    return 0;
 }

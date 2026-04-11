@@ -170,36 +170,40 @@ pub fn sys_chroot(path: *const c_char) -> AxResult<isize> {
 pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize> {
     let path = vm_load_string(path)?;
     debug!("sys_mkdirat <= dirfd: {dirfd}, path: {path}, mode: {mode}");
+    if path.is_empty() {
+        return Err(AxError::NotFound);
+    }
+    validate_pathname(Path::new(&path))?;
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let requested_mode = NodePermission::from_bits_truncate((mode & !proc_data.umask()) as u16);
-
-    let loc = with_path_fs(dirfd, Path::new(&path), |fs| {
-        fs.create_dir(path.as_str(), requested_mode)
+    let supplementary_groups = proc_data.supplementary_groups();
+    let path_ref = Path::new(&path);
+    let (parent, name) = with_path_fs(dirfd, path_ref, |fs| {
+        let (parent, name) = fs.resolve_nonexistent(path_ref)?;
+        check_create_permissions(
+            &parent,
+            proc_data.euid(),
+            proc_data.egid(),
+            &supplementary_groups,
+        )?;
+        Ok((parent, name.to_string()))
     })?;
+    let parent_meta = parent.metadata()?;
+    let loc = parent.create(&name, NodeType::Directory, requested_mode)?;
     let mut final_mode = requested_mode;
     let mut owner_gid = proc_data.egid();
-
-    if let Some(parent) = loc.parent() {
-        let parent_meta = parent.metadata()?;
-        if parent_meta.mode.contains(NodePermission::SET_GID) {
-            owner_gid = parent_meta.gid;
-            final_mode.insert(NodePermission::SET_GID);
-        }
-    }
-    if proc_data.euid() != 0 && !proc_data.is_in_group(owner_gid) {
-        final_mode.remove(NodePermission::SET_GID);
+    if parent_meta.mode.contains(NodePermission::SET_GID) {
+        owner_gid = parent_meta.gid;
+        final_mode.insert(NodePermission::SET_GID);
     }
     loc.update_metadata(MetadataUpdate {
         owner: Some((proc_data.euid(), owner_gid)),
         mode: Some(final_mode),
         ..Default::default()
     })?;
-    if let Some(parent) = loc.parent() {
-        let _ =
-            crate::file::inotify::notify_parent_with_name(&parent, loc.name(), IN_CREATE, true, 0);
-    }
+    let _ = crate::file::inotify::notify_parent_with_name(&parent, loc.name(), IN_CREATE, true, 0);
     Ok(0)
 }
 
@@ -358,17 +362,40 @@ pub fn sys_linkat(
     );
 
     if flags != 0 {
-        warn!("Unsupported flags: {flags}");
+        return Err(AxError::InvalidInput);
     }
+    if new_path.is_empty() {
+        return Err(AxError::NotFound);
+    }
+    validate_pathname(Path::new(&new_path))?;
 
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let supplementary_groups = proc_data.supplementary_groups();
     let old = resolve_at(old_dirfd, old_path.as_deref(), flags)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
     if old.is_dir() {
         return Err(AxError::OperationNotPermitted);
     }
+    check_search_permissions(
+        &old,
+        proc_data.euid(),
+        proc_data.egid(),
+        &supplementary_groups,
+    )?;
     let (new_dir, new_name) = with_path_fs(new_dirfd, Path::new(&new_path), |fs| {
-        fs.resolve_nonexistent(Path::new(&new_path))
+        if fs.resolve(Path::new(&new_path)).is_ok() {
+            return Err(AxError::AlreadyExists);
+        }
+        let (new_dir, new_name) = fs.resolve_nonexistent(Path::new(&new_path))?;
+        check_create_permissions(
+            &new_dir,
+            proc_data.euid(),
+            proc_data.egid(),
+            &supplementary_groups,
+        )?;
+        Ok((new_dir, new_name))
     })?;
 
     new_dir.link(new_name, &old)?;
@@ -515,11 +542,15 @@ pub fn sys_fchownat(
     let meta = loc.metadata()?;
 
     let mut mode = meta.mode;
-    // chown always clears the setuid bits
-    mode.remove(NodePermission::SET_UID);
-    // chown also removes the setgid bits if group-executable
-    if mode.contains(NodePermission::GROUP_EXEC) {
-        mode.remove(NodePermission::SET_GID);
+    if meta.node_type == NodeType::RegularFile
+        && mode.intersects(
+            NodePermission::OWNER_EXEC | NodePermission::GROUP_EXEC | NodePermission::OTHER_EXEC,
+        )
+    {
+        mode.remove(NodePermission::SET_UID);
+        if mode.contains(NodePermission::GROUP_EXEC) {
+            mode.remove(NodePermission::SET_GID);
+        }
     }
 
     let uid = if uid == -1 { meta.uid } else { uid as _ };

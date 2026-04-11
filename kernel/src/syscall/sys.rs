@@ -8,6 +8,7 @@ use axhal::uspace::UserContext;
 use axtask::current;
 #[cfg(target_arch = "riscv64")]
 use bytemuck::AnyBitPattern;
+use kspin::SpinNoIrq;
 use linux_raw_sys::{
     general::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, NGROUPS_MAX},
     system::{new_utsname, sysinfo},
@@ -93,17 +94,119 @@ const fn pad_str(info: &str) -> [c_char; 65] {
     data
 }
 
-const UTSNAME: new_utsname = new_utsname {
-    sysname: pad_str("Linux"),
-    nodename: pad_str("starry"),
-    release: pad_str("10.0.0"),
-    version: pad_str("10.0.0"),
-    machine: pad_str(ARCH),
-    domainname: pad_str("https://github.com/Starry-OS/StarryOS"),
-};
+const UTS_FIELD_LEN: usize = 64;
+
+#[derive(Clone, Copy)]
+struct UtsState {
+    nodename: [u8; UTS_FIELD_LEN],
+    nodename_len: usize,
+    domainname: [u8; UTS_FIELD_LEN],
+    domainname_len: usize,
+}
+
+const fn copy_uts_field(dst: &mut [u8; UTS_FIELD_LEN], src: &[u8]) -> usize {
+    let len = if src.len() < UTS_FIELD_LEN {
+        src.len()
+    } else {
+        UTS_FIELD_LEN
+    };
+    let mut index = 0;
+    while index < len {
+        dst[index] = src[index];
+        index += 1;
+    }
+    len
+}
+
+const fn init_uts_state() -> UtsState {
+    let mut state = UtsState {
+        nodename: [0; UTS_FIELD_LEN],
+        nodename_len: 0,
+        domainname: [0; UTS_FIELD_LEN],
+        domainname_len: 0,
+    };
+    state.nodename_len = copy_uts_field(&mut state.nodename, b"starry");
+    state.domainname_len = copy_uts_field(
+        &mut state.domainname,
+        b"https://github.com/Starry-OS/StarryOS",
+    );
+    state
+}
+
+impl UtsState {
+    fn set_nodename(&mut self, value: &[u8]) {
+        self.nodename = [0; UTS_FIELD_LEN];
+        self.nodename_len = copy_uts_field(&mut self.nodename, value);
+    }
+
+    fn set_domainname(&mut self, value: &[u8]) {
+        self.domainname = [0; UTS_FIELD_LEN];
+        self.domainname_len = copy_uts_field(&mut self.domainname, value);
+    }
+}
+
+static UTS_STATE: SpinNoIrq<UtsState> = SpinNoIrq::new(init_uts_state());
+
+fn fill_uts_field(dst: &mut [c_char; 65], src: &[u8]) {
+    for (dst, byte) in dst.iter_mut().zip(src.iter()) {
+        *dst = *byte as c_char;
+    }
+}
+
+fn current_utsname() -> new_utsname {
+    let mut utsname = new_utsname {
+        sysname: pad_str("Linux"),
+        nodename: [0; 65],
+        release: pad_str("10.0.0"),
+        version: pad_str("10.0.0"),
+        machine: pad_str(ARCH),
+        domainname: [0; 65],
+    };
+    let state = UTS_STATE.lock();
+    fill_uts_field(&mut utsname.nodename, &state.nodename[..state.nodename_len]);
+    fill_uts_field(
+        &mut utsname.domainname,
+        &state.domainname[..state.domainname_len],
+    );
+    utsname
+}
 
 pub fn sys_uname(name: *mut new_utsname) -> AxResult<isize> {
-    name.vm_write(UTSNAME)?;
+    name.vm_write(current_utsname())?;
+    Ok(0)
+}
+
+pub fn sys_sethostname(name: *const u8, len: usize) -> AxResult<isize> {
+    if len > UTS_FIELD_LEN {
+        return Err(AxError::InvalidInput);
+    }
+    if name.is_null() {
+        return Err(AxError::BadAddress);
+    }
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    if !proc_data.has_effective_capability(linux_raw_sys::general::CAP_SYS_ADMIN) {
+        return Err(AxError::OperationNotPermitted);
+    }
+    let hostname = vm_load(name, len)?;
+    UTS_STATE.lock().set_nodename(&hostname);
+    Ok(0)
+}
+
+pub fn sys_setdomainname(name: *const u8, len: usize) -> AxResult<isize> {
+    if len > UTS_FIELD_LEN {
+        return Err(AxError::InvalidInput);
+    }
+    if name.is_null() {
+        return Err(AxError::BadAddress);
+    }
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    if !proc_data.has_effective_capability(linux_raw_sys::general::CAP_SYS_ADMIN) {
+        return Err(AxError::OperationNotPermitted);
+    }
+    let domainname = vm_load(name, len)?;
+    UTS_STATE.lock().set_domainname(&domainname);
     Ok(0)
 }
 
@@ -137,7 +240,7 @@ pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> AxResult<isize> {
     if len == 0 {
         return Ok(0);
     }
-    let flags = GetRandomFlags::from_bits_retain(flags);
+    let flags = GetRandomFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
 
     debug!("sys_getrandom <= buf: {buf:p}, len: {len}, flags: {flags:?}");
 

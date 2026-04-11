@@ -286,6 +286,7 @@ impl CloneArgs {
             );
             proc_data.set_umask(old_proc_data.umask());
             proc_data.set_credentials(old_proc_data.credentials());
+            proc_data.set_capability_state(old_proc_data.capability_state());
             proc_data.set_supplementary_groups(old_proc_data.supplementary_groups());
             proc_data.set_heap_top(old_proc_data.get_heap_top());
 
