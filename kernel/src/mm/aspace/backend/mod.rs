@@ -175,6 +175,14 @@ impl Backend {
         }
     }
 
+    pub fn faults_with_sigbus(&self, vaddr: VirtAddr) -> bool {
+        match self {
+            Backend::Cow(backend) => backend.faults_with_sigbus(vaddr),
+            Backend::File(backend) => backend.faults_with_sigbus(vaddr),
+            Backend::Linear(_) | Backend::Shared(_) => false,
+        }
+    }
+
     pub fn relocate(
         &self,
         old_start: VirtAddr,

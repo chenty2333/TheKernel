@@ -9,7 +9,9 @@ use super::{
     AsThread, TimerState, check_signals, do_exit, has_pending_fatal_signal, raise_signal_fatal,
     set_timer_state, wait_if_stopped,
 };
-use crate::{file::userfaultfd::wait_missing_page_for_current, syscall::handle_syscall};
+use crate::{
+    file::userfaultfd::wait_missing_page_for_current, mm::PageFaultResult, syscall::handle_syscall,
+};
 
 /// Maps an `ExceptionKind::Other` exception to the correct POSIX signal using
 /// arch-specific exception information.
@@ -59,24 +61,30 @@ pub fn new_user_task(name: &str, mut uctx: UserContext) -> TaskInner {
                     ReturnReason::Syscall => handle_syscall(&mut uctx),
                     ReturnReason::PageFault(addr, flags) => {
                         let aspace_handle = thr.proc_data.aspace();
-                        let handled = if let Some(data) = wait_missing_page_for_current(
+                        let result = if let Some(data) = wait_missing_page_for_current(
                             thr.proc_data.proc.pid(),
                             addr,
                             flags.contains(axhal::trap::PageFaultFlags::WRITE),
                         ) {
                             let page = addr.align_down_4k();
-                            if !aspace_handle.lock().handle_page_fault(addr, flags) {
-                                false
-                            } else {
-                                vm_write_slice(page.as_usize() as *mut u8, &data).is_ok()
+                            match aspace_handle.lock().handle_page_fault_result(addr, flags) {
+                                PageFaultResult::Handled => {
+                                    if vm_write_slice(page.as_usize() as *mut u8, &data).is_ok() {
+                                        PageFaultResult::Handled
+                                    } else {
+                                        PageFaultResult::Unhandled
+                                    }
+                                }
+                                outcome => outcome,
                             }
                         } else {
-                            aspace_handle.lock().handle_page_fault(addr, flags)
+                            aspace_handle.lock().handle_page_fault_result(addr, flags)
                         };
-                        if !handled {
+                        if result != PageFaultResult::Handled {
                             #[cfg(target_arch = "riscv64")]
                             info!(
-                                "{:?}: segmentation fault at {:#x} {:?}, pc={:#x}, ra={:#x}, sp={:#x}, a0={:#x}, a1={:#x}, tp={:#x}",
+                                "{:?}: segmentation fault at {:#x} {:?}, pc={:#x}, ra={:#x}, \
+                                 sp={:#x}, a0={:#x}, a1={:#x}, tp={:#x}",
                                 thr.proc_data.proc,
                                 addr,
                                 flags,
@@ -96,8 +104,13 @@ pub fn new_user_task(name: &str, mut uctx: UserContext) -> TaskInner {
                                 uctx.ip(),
                                 uctx.sp(),
                             );
-                            raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGSEGV))
-                                .expect("Failed to send SIGSEGV");
+                            let signo = if result == PageFaultResult::SigBus {
+                                Signo::SIGBUS
+                            } else {
+                                Signo::SIGSEGV
+                            };
+                            raise_signal_fatal(SignalInfo::new_kernel(signo))
+                                .expect("Failed to send page-fault signal");
                         }
                     }
                     ReturnReason::Interrupt => {}

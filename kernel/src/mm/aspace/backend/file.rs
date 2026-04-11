@@ -19,6 +19,7 @@ pub struct FileBackendInner {
     cache: CachedFile,
     flags: FileFlags,
     offset_page: u32,
+    file_end: Option<u64>,
     handle: AtomicUsize,
     map_id: Arc<()>,
     futex_handle: Arc<()>,
@@ -110,8 +111,19 @@ impl FileBackend {
         Arc::ptr_eq(&self.0.map_id, &other.0.map_id)
             && self.0.start == other.0.start
             && self.0.offset_page == other.0.offset_page
+            && self.0.file_end == other.0.file_end
             && self.0.flags.bits() == other.0.flags.bits()
             && self.0.cache.ptr_eq(&other.0.cache)
+    }
+
+    pub(crate) fn faults_with_sigbus(&self, vaddr: VirtAddr) -> bool {
+        let Some(file_end) = self.0.file_end else {
+            return false;
+        };
+        let page_start = vaddr.align_down_4k();
+        let file_offset = self.0.offset_page as u64 * PAGE_SIZE_4K as u64
+            + page_start.sub_addr(self.0.start) as u64;
+        file_offset >= file_end
     }
 
     fn clone_for_range_with_id(
@@ -128,6 +140,7 @@ impl FileBackend {
             cache: self.0.cache.clone(),
             flags: self.0.flags,
             offset_page: self.0.offset_page,
+            file_end: self.0.file_end,
             handle: AtomicUsize::new(0),
             map_id,
             futex_handle: self.0.futex_handle.clone(),
@@ -296,6 +309,7 @@ impl BackendOps for FileBackend {
             cache: self.0.cache.clone(),
             flags: self.0.flags,
             offset_page: self.0.offset_page,
+            file_end: self.0.file_end,
             handle: AtomicUsize::new(0),
             map_id: self.0.map_id.clone(),
             futex_handle: self.0.futex_handle.clone(),
@@ -311,6 +325,7 @@ impl Backend {
         cache: CachedFile,
         flags: FileFlags,
         offset: usize,
+        file_end: Option<u64>,
         aspace: &Arc<Mutex<AddrSpace>>,
     ) -> Self {
         let offset_page = (offset / PAGE_SIZE_4K) as u32;
@@ -319,6 +334,7 @@ impl Backend {
             cache,
             flags,
             offset_page,
+            file_end,
             handle: AtomicUsize::new(0),
             map_id: Arc::new(()),
             futex_handle: Arc::new(()),

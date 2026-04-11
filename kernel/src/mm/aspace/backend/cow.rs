@@ -83,7 +83,7 @@ static FRAME_TABLE: SpinNoIrq<FrameTableRefCount> = SpinNoIrq::new(FrameTableRef
 pub struct CowBackend {
     start: VirtAddr,
     size: PageSize,
-    file: Option<(FileBackend, u64, Option<u64>)>,
+    file: Option<(FileBackend, u64, Option<u64>, bool)>,
     map_id: Arc<()>,
     materialized: Arc<AtomicBool>,
 }
@@ -123,7 +123,7 @@ impl CowBackend {
     ) -> AxResult {
         let frame = self.alloc_new_frame(true)?;
 
-        if let Some((file, file_start, file_end)) = &self.file {
+        if let Some((file, file_start, file_end, _)) = &self.file {
             let buf = unsafe {
                 slice::from_raw_parts_mut(phys_to_virt(frame).as_mut_ptr(), self.size as _)
             };
@@ -201,6 +201,15 @@ impl CowBackend {
         }
     }
 
+    pub(crate) fn faults_with_sigbus(&self, vaddr: VirtAddr) -> bool {
+        let Some((_, file_start, Some(file_end), true)) = &self.file else {
+            return false;
+        };
+        let page_start = vaddr.align_down(self.size);
+        let page_file_start = *file_start + page_start.sub_addr(self.start) as u64;
+        page_file_start >= *file_end
+    }
+
     pub(crate) fn clone_for_range(&self, old_start: VirtAddr, new_start: VirtAddr) -> Self {
         self.clone_for_range_with_id(old_start, new_start, self.map_id.clone())
     }
@@ -221,9 +230,13 @@ impl CowBackend {
         }
         match (&self.file, &other.file) {
             (None, None) => true,
-            (Some((lhs_backend, lhs_start, lhs_end)), Some((rhs_backend, rhs_start, rhs_end))) => {
+            (
+                Some((lhs_backend, lhs_start, lhs_end, lhs_sigbus)),
+                Some((rhs_backend, rhs_start, rhs_end, rhs_sigbus)),
+            ) => {
                 lhs_start == rhs_start
                     && lhs_end == rhs_end
+                    && lhs_sigbus == rhs_sigbus
                     && match (lhs_backend, rhs_backend) {
                         (FileBackend::Cached(lhs), FileBackend::Cached(rhs)) => lhs.ptr_eq(rhs),
                         (FileBackend::Direct(lhs), FileBackend::Direct(rhs)) => lhs.ptr_eq(rhs),
@@ -428,11 +441,12 @@ impl Backend {
         file: FileBackend,
         file_start: u64,
         file_end: Option<u64>,
+        sigbus_on_eof: bool,
     ) -> Self {
         Self::Cow(CowBackend {
             start,
             size,
-            file: Some((file, file_start, file_end)),
+            file: Some((file, file_start, file_end, sigbus_on_eof)),
             map_id: Arc::new(()),
             materialized: Arc::new(AtomicBool::new(false)),
         })

@@ -1,7 +1,7 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use axerrno::{AxError, AxResult};
-use axfs::FileBackend;
+use axfs::{FileBackend, FileFlags};
 use axhal::paging::{MappingFlags, PageSize};
 use axtask::current;
 use linux_raw_sys::general::*;
@@ -92,6 +92,32 @@ fn validate_page_aligned_range(addr: usize, length: usize) -> AxResult<(VirtAddr
         .ok_or(AxError::InvalidInput)?
         .align_up_4k();
     Ok((start, end.sub_addr(start)))
+}
+
+fn validate_file_mmap_access(
+    file: &axfs::File,
+    backend: &FileBackend,
+    map_type: MmapFlags,
+    permission_flags: MmapProt,
+) -> AxResult {
+    let open_flags = file.flags();
+    let is_device = matches!(
+        backend,
+        FileBackend::Direct(loc) if loc.entry().downcast::<Device>().is_ok()
+    );
+
+    if !is_device && !open_flags.contains(FileFlags::READ) {
+        return Err(AxError::PermissionDenied);
+    }
+
+    if (map_type == MmapFlags::SHARED || map_type == MmapFlags::SHARED_VALIDATE)
+        && permission_flags.contains(MmapProt::WRITE)
+        && (!open_flags.contains(FileFlags::WRITE) || open_flags.contains(FileFlags::APPEND))
+    {
+        return Err(AxError::PermissionDenied);
+    }
+
+    Ok(())
 }
 
 fn prefix_segments(segments: &[RemapSegment], size: usize) -> Vec<RemapSegment> {
@@ -325,10 +351,19 @@ pub fn sys_mmap(
             } else if let Some(file) = file {
                 let file = file.inner();
                 let backend = file.backend()?.clone();
+                validate_file_mmap_access(file, &backend, map_type, permission_flags)?;
                 match file.backend()?.clone() {
                     FileBackend::Cached(cache) => {
+                        let file_end = file.location().len()?;
                         // TODO(mivik): file mmap page size
-                        Backend::new_file(start, cache, file.flags(), offset, &aspace_handle)
+                        Backend::new_file(
+                            start,
+                            cache,
+                            file.flags(),
+                            offset,
+                            Some(file_end),
+                            &aspace_handle,
+                        )
                     }
                     FileBackend::Direct(loc) => {
                         let device = loc
@@ -340,9 +375,14 @@ pub fn sys_mmap(
                             DeviceMmap::None => {
                                 return Err(AxError::NoSuchDevice);
                             }
-                            DeviceMmap::ReadOnly => {
-                                Backend::new_cow(start, page_size, backend, offset as u64, None)
-                            }
+                            DeviceMmap::ReadOnly => Backend::new_cow(
+                                start,
+                                page_size,
+                                backend,
+                                offset as u64,
+                                None,
+                                false,
+                            ),
                             DeviceMmap::Physical(mut range) => {
                                 range.start += offset;
                                 if range.is_empty() {
@@ -352,13 +392,17 @@ pub fn sys_mmap(
                                 length = length.min(max_size);
                                 Backend::new_linear(start, range.start, max_size)
                             }
-                            DeviceMmap::Cache(cache) => Backend::new_file(
-                                start,
-                                cache,
-                                file.flags(),
-                                offset,
-                                &aspace_handle,
-                            ),
+                            DeviceMmap::Cache(cache) => {
+                                let file_end = file.location().len()?;
+                                Backend::new_file(
+                                    start,
+                                    cache,
+                                    file.flags(),
+                                    offset,
+                                    Some(file_end),
+                                    &aspace_handle,
+                                )
+                            }
                         }
                     }
                 }
@@ -370,7 +414,16 @@ pub fn sys_mmap(
             if let Some(file) = file {
                 // Private mapping from a file
                 let backend = file.inner().backend()?.clone();
-                Backend::new_cow(start, page_size, backend, offset as u64, None)
+                validate_file_mmap_access(file.inner(), &backend, map_type, permission_flags)?;
+                let file_end = file.inner().location().len()?;
+                Backend::new_cow(
+                    start,
+                    page_size,
+                    backend,
+                    offset as u64,
+                    Some(file_end),
+                    true,
+                )
             } else {
                 Backend::new_alloc(start, page_size)
             }

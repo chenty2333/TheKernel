@@ -8,15 +8,23 @@ use alloc::{
     vec::Vec,
 };
 use core::{
+    any::Any,
     ffi::CStr,
     fmt::Write as _,
     iter, str,
     sync::atomic::{AtomicUsize, Ordering},
+    task::Context,
 };
 
-use axfs_ng_vfs::{Filesystem, NodeType, VfsError, VfsResult};
+use axfs_ng_vfs::{
+    FileNodeOps, Filesystem, FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps,
+    NodePermission, NodeType, VfsError, VfsResult,
+};
 use axhal::paging::MappingFlags;
+use axpoll::{IoEvents, Pollable};
 use axtask::{AxTaskRef, TaskState, WeakAxTaskRef, current};
+use inherit_methods_macro::inherit_methods;
+use memory_addr::{PAGE_SIZE_4K, VirtAddr};
 use starry_process::Process;
 
 use crate::{
@@ -25,12 +33,13 @@ use crate::{
     mounts,
     pseudofs::{
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
-        SimpleFileOperation, SimpleFs,
+        SimpleFileOperation, SimpleFs, SimpleFsNode,
     },
     task::{AsThread, get_task, get_visible_task, render_task_stat, tasks},
 };
 
 const PROC_PID_MAX: u32 = 4_194_304;
+const PROC_PAGEMAP_ENTRY_BYTES: u64 = 8;
 
 fn render_mounts() -> String {
     let mut out = String::from("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n");
@@ -192,6 +201,115 @@ struct ThreadDir {
     show_task_dir: bool,
 }
 
+struct ProcPagemapFile {
+    node: SimpleFsNode,
+    task: WeakAxTaskRef,
+}
+
+impl ProcPagemapFile {
+    fn new(fs: Arc<SimpleFs>, task: WeakAxTaskRef) -> Arc<Self> {
+        Arc::new(Self {
+            node: SimpleFsNode::new(
+                fs,
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o444),
+            ),
+            task,
+        })
+    }
+
+    fn pagemap_entry(&self, vpn: u64) -> u64 {
+        let Some(task) = self.task.upgrade() else {
+            return 0;
+        };
+        let Some(vaddr) = vpn
+            .checked_mul(PAGE_SIZE_4K as u64)
+            .and_then(|addr| usize::try_from(addr).ok())
+            .map(VirtAddr::from)
+        else {
+            return 0;
+        };
+        let aspace_handle = task.as_thread().proc_data.aspace();
+        let aspace = aspace_handle.lock();
+        match aspace.page_table().query(vaddr) {
+            Ok((paddr, ..)) => (1u64 << 63) | (paddr.as_usize() as u64 / PAGE_SIZE_4K as u64),
+            Err(_) => 0,
+        }
+    }
+}
+
+#[inherit_methods(from = "self.node")]
+impl NodeOps for ProcPagemapFile {
+    fn inode(&self) -> u64;
+
+    fn metadata(&self) -> VfsResult<Metadata>;
+
+    fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()>;
+
+    fn filesystem(&self) -> &dyn FilesystemOps;
+
+    fn sync(&self, _data_only: bool) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+
+    fn len(&self) -> VfsResult<u64> {
+        Ok(0)
+    }
+
+    fn flags(&self) -> NodeFlags {
+        NodeFlags::NON_CACHEABLE
+    }
+}
+
+impl FileNodeOps for ProcPagemapFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        let mut written = 0;
+        let mut entry_index = offset / PROC_PAGEMAP_ENTRY_BYTES;
+        let mut entry_offset = (offset % PROC_PAGEMAP_ENTRY_BYTES) as usize;
+
+        while written < buf.len() {
+            let entry = self.pagemap_entry(entry_index).to_le_bytes();
+            let copy_len =
+                (PROC_PAGEMAP_ENTRY_BYTES as usize - entry_offset).min(buf.len() - written);
+            buf[written..written + copy_len]
+                .copy_from_slice(&entry[entry_offset..entry_offset + copy_len]);
+            written += copy_len;
+            entry_index += 1;
+            entry_offset = 0;
+        }
+
+        Ok(written)
+    }
+
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        Err(VfsError::BadFileDescriptor)
+    }
+
+    fn append(&self, _buf: &[u8]) -> VfsResult<(usize, u64)> {
+        Err(VfsError::BadFileDescriptor)
+    }
+
+    fn set_len(&self, _len: u64) -> VfsResult<()> {
+        Err(VfsError::BadFileDescriptor)
+    }
+
+    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+        Err(VfsError::BadFileDescriptor)
+    }
+}
+
+impl Pollable for ProcPagemapFile {
+    fn poll(&self) -> IoEvents {
+        IoEvents::IN | IoEvents::OUT
+    }
+
+    fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+}
+
 impl SimpleDirOps for ThreadDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
         Box::new(
@@ -201,6 +319,7 @@ impl SimpleDirOps for ThreadDir {
                 Some("oom_score_adj"),
                 self.show_task_dir.then_some("task"),
                 Some("maps"),
+                Some("pagemap"),
                 Some("mounts"),
                 Some("cmdline"),
                 Some("comm"),
@@ -217,10 +336,10 @@ impl SimpleDirOps for ThreadDir {
         let fs = self.fs.clone();
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
         Ok(match name {
-            "stat" => SimpleFile::new_regular(fs, move || {
-                Ok(render_task_stat(&task)?.into_bytes())
-            })
-            .into(),
+            "stat" => {
+                SimpleFile::new_regular(fs, move || Ok(render_task_stat(&task)?.into_bytes()))
+                    .into()
+            }
             "status" => SimpleFile::new_regular(fs, move || Ok(task_status(&task))).into(),
             "oom_score_adj" => SimpleFile::new_regular(
                 fs,
@@ -291,6 +410,7 @@ impl SimpleDirOps for ThreadDir {
                 Ok(out)
             })
             .into(),
+            "pagemap" => ProcPagemapFile::new(fs, Arc::downgrade(&task)).into(),
             "mounts" => SimpleFile::new_regular(fs, move || Ok(render_mounts())).into(),
             "cmdline" => SimpleFile::new_regular(fs, move || {
                 let cmdline = task.as_thread().proc_data.cmdline.read();

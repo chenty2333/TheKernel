@@ -120,6 +120,7 @@ fn map_elf<'a>(
             FileBackend::Cached(cache.clone()),
             ph.offset,
             Some(ph.offset + ph.file_size),
+            false,
         );
         uspace.map(
             seg_start.align_down_4k(),

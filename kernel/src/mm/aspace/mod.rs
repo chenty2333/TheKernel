@@ -17,6 +17,13 @@ mod backend;
 
 pub use self::backend::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageFaultResult {
+    Handled,
+    SigBus,
+    Unhandled,
+}
+
 /// The virtual memory address space.
 pub struct AddrSpace {
     va_range: VirtAddrRange,
@@ -333,17 +340,23 @@ impl AddrSpace {
     ///
     /// `access_flags` indicates the access type that caused the page fault.
     ///
-    /// Returns `true` if the page fault is handled successfully (not a real
-    /// fault).
-    pub fn handle_page_fault(&mut self, vaddr: VirtAddr, access_flags: PageFaultFlags) -> bool {
+    /// Returns the outcome of the page fault handling.
+    pub fn handle_page_fault_result(
+        &mut self,
+        vaddr: VirtAddr,
+        access_flags: PageFaultFlags,
+    ) -> PageFaultResult {
         if !self.va_range.contains(vaddr) {
-            return false;
+            return PageFaultResult::Unhandled;
         }
         if let Some(area) = self.areas.find(vaddr) {
             let flags = area.flags();
             if flags.contains(access_flags) {
                 let page_size = area.backend().page_size();
                 let start = vaddr.align_down(page_size);
+                if area.backend().faults_with_sigbus(start) {
+                    return PageFaultResult::SigBus;
+                }
                 let fault_around = area.backend().fault_around_size(access_flags);
                 let len = area
                     .end()
@@ -362,19 +375,28 @@ impl AddrSpace {
                         }
                         if n == 0 {
                             warn!("No pages populated for {vaddr:?} ({flags:?})");
-                            false
+                            PageFaultResult::Unhandled
                         } else {
-                            true
+                            PageFaultResult::Handled
                         }
                     }
                     Err(err) => {
                         warn!("Failed to populate pages for {vaddr:?} ({flags:?}): {err}");
-                        false
+                        PageFaultResult::Unhandled
                     }
                 };
             }
         }
-        false
+        PageFaultResult::Unhandled
+    }
+
+    /// Returns `true` if the page fault is handled successfully (not a real
+    /// fault).
+    pub fn handle_page_fault(&mut self, vaddr: VirtAddr, access_flags: PageFaultFlags) -> bool {
+        matches!(
+            self.handle_page_fault_result(vaddr, access_flags),
+            PageFaultResult::Handled
+        )
     }
 
     /// Attempts to clone the current address space into a new one.
