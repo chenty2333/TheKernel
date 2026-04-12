@@ -26,6 +26,51 @@ runner_debug() {
     esac
 }
 
+runner_truthy() {
+    case "${1:-}" in
+        1|y|Y|yes|YES|true|TRUE|on|ON)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+runner_falsy() {
+    case "${1:-}" in
+        0|n|N|no|NO|false|FALSE|off|OFF)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+ltp_case_output_mode() {
+    LTP_CASE_OUTPUT_MODE=stream
+
+    case "${OSCOMP_LTP_CASE_OUTPUT_MODE:-}" in
+        ""|stream|full|verbose)
+            ;;
+        buffered|capture|quiet)
+            LTP_CASE_OUTPUT_MODE=buffered
+            ;;
+        *)
+            runner_debug "#### OSCOMP RUNNER UNKNOWN LTP OUTPUT MODE ${OSCOMP_LTP_CASE_OUTPUT_MODE} ####"
+            ;;
+    esac
+
+    if runner_truthy "${OSCOMP_LTP_BUFFER_OUTPUT:-0}"; then
+        LTP_CASE_OUTPUT_MODE=buffered
+    fi
+
+    if [ -n "${OSCOMP_STREAM_LTP_CASE_OUTPUT:-}" ]; then
+        if runner_falsy "${OSCOMP_STREAM_LTP_CASE_OUTPUT}"; then
+            LTP_CASE_OUTPUT_MODE=buffered
+        else
+            LTP_CASE_OUTPUT_MODE=stream
+        fi
+    fi
+}
+
 prime_group_output_stream() {
     if [ -z "${RUNNER_OUTPUT_PRIMED:-}" ]; then
         printf '\n'
@@ -465,6 +510,11 @@ run_ltp_group() {
         return 125
     fi
 
+    # Match the visible pre-2025 runner protocol by default: each case keeps
+    # its native stdout/stderr on the console. Buffered capture is opt-in for
+    # local debugging only.
+    ltp_case_output_mode
+
     run_ltp_case_command() {
         shell_path="$1"
         testcase_path="$2"
@@ -537,7 +587,7 @@ run_ltp_group() {
         ran_cases=$((ran_cases + 1))
         echo "RUN LTP CASE $testcase"
         case_log=""
-        if [ "${OSCOMP_STREAM_LTP_CASE_OUTPUT:-0}" = "1" ]; then
+        if [ "$LTP_CASE_OUTPUT_MODE" = "stream" ]; then
             run_ltp_case_command "$shell_path" "$testcase_path" "$@"
             ret=$?
         else
