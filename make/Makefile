@@ -86,6 +86,7 @@ VHOST ?= n
 # Network options
 IP ?= 10.0.2.15
 GW ?= 10.0.2.2
+SMOLTCP_IFACE_MAX_ADDR_COUNT ?= 4
 
 # App type
 ifeq ($(wildcard $(APP)),)
@@ -135,6 +136,7 @@ export AX_IP=$(IP)
 export AX_GW=$(GW)
 export AX_START_BANNER=$(BANNER)
 export AX_BACKTRACE=$(BACKTRACE)
+export SMOLTCP_IFACE_MAX_ADDR_COUNT
 
 ifneq ($(filter $(MAKECMDGOALS),unittest unittest_no_fail_fast clippy doc doc_check_missing),)
   # When running unit tests or other tests unrelated to a specific platform,
