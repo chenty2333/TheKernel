@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::{collections::BTreeSet, sync::Arc, vec::Vec};
 use core::{fmt, ops::DerefMut};
 
 use axerrno::{AxError, AxResult, ax_bail};
@@ -28,10 +28,13 @@ pub enum PageFaultResult {
 pub struct AddrSpace {
     va_range: VirtAddrRange,
     areas: MemorySet<Backend>,
+    growdown_starts: BTreeSet<VirtAddr>,
     pt: PageTable,
 }
 
 impl AddrSpace {
+    const STACK_GUARD_GAP_PAGES: usize = 256;
+
     /// Returns the address space base.
     pub const fn base(&self) -> VirtAddr {
         self.va_range.start
@@ -72,8 +75,34 @@ impl AddrSpace {
         Ok(Self {
             va_range: VirtAddrRange::from_start_size(base, size),
             areas: MemorySet::new(),
+            growdown_starts: BTreeSet::new(),
             pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,
         })
+    }
+
+    fn refresh_growdown_starts(&mut self) {
+        let starts: Vec<_> = self.growdown_starts.iter().copied().collect();
+        self.growdown_starts.clear();
+        for start in starts {
+            if self
+                .areas
+                .find(start)
+                .is_some_and(|area| area.start() == start)
+            {
+                self.growdown_starts.insert(start);
+            }
+        }
+    }
+
+    pub fn mark_growdown(&mut self, start: VirtAddr) {
+        self.growdown_starts.insert(start);
+        self.refresh_growdown_starts();
+    }
+
+    fn move_growdown_start(&mut self, old_start: VirtAddr, new_start: VirtAddr) {
+        if self.growdown_starts.remove(&old_start) {
+            self.growdown_starts.insert(new_start);
+        }
     }
 
     fn validate_region(&self, start: VirtAddr, size: usize) -> AxResult {
@@ -220,6 +249,7 @@ impl AddrSpace {
         self.validate_region(start, size)?;
 
         self.areas.unmap(start, size, &mut self.pt)?;
+        self.refresh_growdown_starts();
         Ok(())
     }
 
@@ -290,6 +320,7 @@ impl AddrSpace {
 
         self.areas
             .protect(start, size, |_| Some(flags), &mut self.pt)?;
+        self.refresh_growdown_starts();
 
         Ok(())
     }
@@ -299,6 +330,78 @@ impl AddrSpace {
         if let Err(err) = self.areas.clear(&mut self.pt) {
             warn!("AddrSpace::clear: failed to unmap all areas: {err:?}");
         }
+        self.growdown_starts.clear();
+    }
+
+    fn try_handle_growdown_fault(
+        &mut self,
+        vaddr: VirtAddr,
+        access_flags: PageFaultFlags,
+        user_sp: Option<VirtAddr>,
+    ) -> PageFaultResult {
+        let Some(user_sp) = user_sp else {
+            return PageFaultResult::Unhandled;
+        };
+
+        // Linux grows MAP_GROWSDOWN mappings when the fault lands on the guard
+        // page immediately below the current lowest mapped page and SP is still
+        // within that guard page.
+        let Some((current_start, fault_page, page_size, flags)) = self
+            .growdown_starts
+            .iter()
+            .copied()
+            .find_map(|current_start| {
+                let area = self.areas.find(current_start)?;
+                if area.start() != current_start {
+                    return None;
+                }
+                let page_size = area.backend().page_size();
+                let fault_page = vaddr.align_down(page_size);
+                if fault_page.checked_add(page_size as usize)? != current_start {
+                    return None;
+                }
+                if !(user_sp >= fault_page && user_sp < current_start) {
+                    return None;
+                }
+                if !area.flags().contains(access_flags) {
+                    return None;
+                }
+                match area.backend() {
+                    Backend::Cow(_) => Some((current_start, fault_page, page_size, area.flags())),
+                    Backend::Linear(_) | Backend::Shared(_) | Backend::File(_) => None,
+                }
+            })
+        else {
+            return PageFaultResult::Unhandled;
+        };
+
+        let Some(gap_start) =
+            current_start.checked_sub(page_size as usize * Self::STACK_GUARD_GAP_PAGES)
+        else {
+            return PageFaultResult::Unhandled;
+        };
+        if self.areas.overlaps(VirtAddrRange::from_start_size(
+            gap_start,
+            current_start.sub_addr(gap_start),
+        )) {
+            return PageFaultResult::Unhandled;
+        }
+
+        if let Err(err) = self.map(
+            fault_page,
+            page_size as usize,
+            flags,
+            false,
+            Backend::new_alloc(fault_page, page_size),
+        ) {
+            warn!(
+                "Failed to extend MAP_GROWSDOWN mapping from {current_start:?} to {fault_page:?}: \
+                 {err}"
+            );
+            return PageFaultResult::Unhandled;
+        }
+        self.move_growdown_start(current_start, fault_page);
+        self.handle_page_fault_result(vaddr, access_flags, Some(user_sp))
     }
 
     /// Checks whether an access to the specified memory region is valid.
@@ -345,6 +448,7 @@ impl AddrSpace {
         &mut self,
         vaddr: VirtAddr,
         access_flags: PageFaultFlags,
+        user_sp: Option<VirtAddr>,
     ) -> PageFaultResult {
         if !self.va_range.contains(vaddr) {
             return PageFaultResult::Unhandled;
@@ -387,14 +491,14 @@ impl AddrSpace {
                 };
             }
         }
-        PageFaultResult::Unhandled
+        self.try_handle_growdown_fault(vaddr, access_flags, user_sp)
     }
 
     /// Returns `true` if the page fault is handled successfully (not a real
     /// fault).
     pub fn handle_page_fault(&mut self, vaddr: VirtAddr, access_flags: PageFaultFlags) -> bool {
         matches!(
-            self.handle_page_fault_result(vaddr, access_flags),
+            self.handle_page_fault_result(vaddr, access_flags, None),
             PageFaultResult::Handled
         )
     }
@@ -409,6 +513,7 @@ impl AddrSpace {
         let new_aspace_clone = new_aspace.clone();
 
         let mut guard = new_aspace.lock();
+        guard.growdown_starts = self.growdown_starts.clone();
 
         let mut self_modify = self.pt.cursor();
         for area in self.areas.iter() {

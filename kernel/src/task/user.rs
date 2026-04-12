@@ -67,7 +67,11 @@ pub fn new_user_task(name: &str, mut uctx: UserContext) -> TaskInner {
                             flags.contains(axhal::trap::PageFaultFlags::WRITE),
                         ) {
                             let page = addr.align_down_4k();
-                            match aspace_handle.lock().handle_page_fault_result(addr, flags) {
+                            match aspace_handle.lock().handle_page_fault_result(
+                                addr,
+                                flags,
+                                Some(uctx.sp().into()),
+                            ) {
                                 PageFaultResult::Handled => {
                                     if vm_write_slice(page.as_usize() as *mut u8, &data).is_ok() {
                                         PageFaultResult::Handled
@@ -78,7 +82,11 @@ pub fn new_user_task(name: &str, mut uctx: UserContext) -> TaskInner {
                                 outcome => outcome,
                             }
                         } else {
-                            aspace_handle.lock().handle_page_fault_result(addr, flags)
+                            aspace_handle.lock().handle_page_fault_result(
+                                addr,
+                                flags,
+                                Some(uctx.sp().into()),
+                            )
                         };
                         if result != PageFaultResult::Handled {
                             #[cfg(target_arch = "riscv64")]

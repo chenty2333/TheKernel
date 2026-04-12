@@ -24,6 +24,7 @@ use crate::{
 };
 
 const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
+const AF_RDS: u32 = 21;
 
 fn require_bind_permissions(addr: &SocketAddrEx) -> AxResult<()> {
     let SocketAddrEx::Ip(ip_addr) = addr else {
@@ -69,13 +70,22 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
             }
             SocketInner::Udp(UdpSocket::new(net_ns))
         }
+        (AF_RDS, SOCK_SEQPACKET) => {
+            if proto != 0 {
+                return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
+            }
+            // RDS is only exercised in OSCOMP/LTP as a local datagram transport
+            // with sockaddr_in-style names. Reuse the UDP data path so recvmsg
+            // reports the Linux-compatible address length and wakeup semantics.
+            SocketInner::Udp(UdpSocket::new(net_ns))
+        }
         (AF_UNIX, SOCK_STREAM) => SocketInner::Unix(UnixSocket::new(StreamTransport::new(pid))),
         (AF_UNIX, SOCK_DGRAM) => SocketInner::Unix(UnixSocket::new(DgramTransport::new(pid))),
         #[cfg(feature = "vsock")]
         (AF_VSOCK, SOCK_STREAM) => {
             SocketInner::Vsock(VsockSocket::new(VsockStreamTransport::new()))
         }
-        (AF_INET, _) | (AF_INET6, _) | (AF_UNIX, _) | (AF_VSOCK, _) => {
+        (AF_INET, _) | (AF_INET6, _) | (AF_UNIX, _) | (AF_VSOCK, _) | (AF_RDS, _) => {
             warn!("Unsupported socket type: domain: {domain}, ty: {ty}");
             return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
         }

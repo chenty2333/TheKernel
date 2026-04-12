@@ -227,6 +227,8 @@ bitflags::bitflags! {
         const SHARED_VALIDATE = MAP_SHARED_VALIDATE;
         /// Changes private; copy pages on write.
         const PRIVATE = MAP_PRIVATE;
+        /// Stack-like mapping that may expand downward on demand.
+        const GROWDOWN = MAP_GROWSDOWN;
         /// Map address must be exactly as requested, no matter whether it is available.
         const FIXED = MAP_FIXED;
         /// Same as `FIXED`, but if the requested address overlaps an existing
@@ -343,6 +345,10 @@ pub fn sys_mmap(
     } else {
         None
     };
+    let is_anonymous_mapping = file.is_none();
+    let growdown_private_anon = map_flags.contains(MmapFlags::GROWDOWN)
+        && map_type == MmapFlags::PRIVATE
+        && is_anonymous_mapping;
 
     let backend = match map_type {
         MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE => {
@@ -437,6 +443,9 @@ pub fn sys_mmap(
 
     let populate = map_flags.contains(MmapFlags::POPULATE);
     aspace.map(start, length, permission_flags.into(), populate, backend)?;
+    if growdown_private_anon {
+        aspace.mark_growdown(start);
+    }
 
     Ok(start.as_usize() as _)
 }

@@ -212,7 +212,7 @@ impl SocketOps for UdpSocket {
                 0,
             )))?;
         }
-        self.general.send_poller(self, || {
+        let sent = self.general.send_poller(self, || {
             self.stack.poll_interfaces();
             self.with_smol_socket(|socket| {
                 if !socket.is_open() {
@@ -241,7 +241,12 @@ impl SocketOps for UdpSocket {
                     Ok(read)
                 }
             })
-        })
+        })?;
+
+        // Push freshly queued datagrams through the interface/router path so
+        // loopback receivers observe readiness immediately.
+        self.stack.poll_interfaces();
+        Ok(sent)
     }
 
     fn recv(&self, mut dst: impl Write, options: RecvOptions) -> AxResult<usize> {
