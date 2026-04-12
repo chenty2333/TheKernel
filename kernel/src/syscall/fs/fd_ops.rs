@@ -5,14 +5,16 @@ use alloc::{
 };
 use core::{
     ffi::{c_char, c_int},
+    mem::size_of,
     ops::Deref,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs::{FS_CONTEXT, FileBackend, FileFlags, OpenOptions, OpenResult};
+use axfs::{FS_CONTEXT, FileBackend, FileFlags, FsContext, OpenOptions, OpenResult};
 use axfs_ng_vfs::{
-    DirEntry, FileNode, Location, MetadataUpdate, NodePermission, NodeType, Reference, path::Path,
+    DirEntry, FileNode, Location, MetadataUpdate, NodePermission, NodeType, Reference,
+    path::{Component, Path},
 };
 use axtask::current;
 use bitflags::bitflags;
@@ -26,8 +28,7 @@ use crate::{
         inotify::{
             location_for_fd, notify_close, notify_exact, notify_parent, notify_parent_with_name,
         },
-        lease,
-        memfd,
+        lease, memfd,
         permission::{check_create_permissions, check_open_permissions},
         with_path_fs,
     },
@@ -116,6 +117,31 @@ fn enforce_special_open_rules(loc: &Location, flags: c_int, uid: u32) -> AxResul
 }
 
 static TMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const OPENAT2_HOW_SIZE: usize = size_of::<open_how>();
+const OPENAT2_ALLOWED_FLAGS: u64 = (O_ACCMODE
+    | O_APPEND
+    | FASYNC
+    | O_CLOEXEC
+    | O_CREAT
+    | O_DIRECT
+    | O_DIRECTORY
+    | O_DSYNC
+    | O_EXCL
+    | O_LARGEFILE
+    | O_NOATIME
+    | O_NOCTTY
+    | O_NOFOLLOW
+    | O_NONBLOCK
+    | O_PATH
+    | O_SYNC
+    | O_TMPFILE
+    | O_TRUNC) as u64;
+const OPENAT2_ALLOWED_RESOLVE: u64 = (RESOLVE_NO_XDEV
+    | RESOLVE_NO_MAGICLINKS
+    | RESOLVE_NO_SYMLINKS
+    | RESOLVE_BENEATH
+    | RESOLVE_IN_ROOT
+    | RESOLVE_CACHED) as u64;
 
 fn next_tmpfile_path(dir: &str) -> String {
     let counter = TMPFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -129,6 +155,66 @@ fn next_tmpfile_path(dir: &str) -> String {
     }
 }
 
+fn current_dir_location() -> Location {
+    FS_CONTEXT.lock().current_dir().clone()
+}
+
+fn openat_base_dir(dirfd: c_int, path: &str, resolve: u64) -> AxResult<Location> {
+    if resolve & RESOLVE_IN_ROOT as u64 != 0 {
+        return if dirfd == AT_FDCWD {
+            Ok(current_dir_location())
+        } else {
+            Ok(Directory::from_fd(dirfd)?.inner().clone())
+        };
+    }
+    if dirfd == AT_FDCWD || Path::new(path).is_absolute() {
+        Ok(current_dir_location())
+    } else {
+        Ok(Directory::from_fd(dirfd)?.inner().clone())
+    }
+}
+
+fn adjust_openat2_path(path: &str, resolve: u64) -> String {
+    if resolve & RESOLVE_IN_ROOT as u64 == 0 || !path.starts_with('/') {
+        return path.to_string();
+    }
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        ".".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn escapes_beneath(path: &Path) -> bool {
+    let mut depth = 0usize;
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir => {
+                if depth == 0 {
+                    return true;
+                }
+                depth -= 1;
+            }
+            Component::RootDir => return true,
+        }
+    }
+    false
+}
+
+fn is_magic_proc_link(loc: &Location) -> bool {
+    if loc.node_type() != NodeType::Symlink {
+        return false;
+    }
+    let Ok(path) = loc.absolute_path() else {
+        return false;
+    };
+    let path = path.as_str();
+    path.starts_with("/proc/") && (path.ends_with("/exe") || path.contains("/fd/"))
+}
+
 fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
     let f: Arc<dyn FileLike> = match result {
         OpenResult::File(mut file) => {
@@ -138,7 +224,7 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
                     flags,
                 )?)
             } else {
-            // /dev/xx handling
+                // /dev/xx handling
                 if let Ok(device) = file.location().entry().downcast::<Device>() {
                     let inner = device.inner().as_any();
                     if let Some(ptmx) = inner.downcast_ref::<tty::Ptmx>() {
@@ -184,20 +270,14 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
     add_file_like(f, flags & O_CLOEXEC != 0)
 }
 
-/// Open or create a file.
-/// fd: file descriptor
-/// filename: file path to be opened or created
-/// flags: open flags
-/// mode: see man 7 inode
-/// return new file descriptor if succeed, or return -1.
-pub(super) fn openat_inner(
-    dirfd: c_int,
+fn open_in_fs(
+    fs: &mut FsContext,
     path: &str,
     flags: i32,
     mode: __kernel_mode_t,
 ) -> AxResult<isize> {
     validate_pathname(Path::new(path))?;
-    debug!("sys_openat <= {dirfd} {path:?} {flags:#o} {mode:#o}");
+    debug!("sys_openat <= {path:?} {flags:#o} {mode:#o}");
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
@@ -206,67 +286,78 @@ pub(super) fn openat_inner(
     let gid = proc_data.egid();
     let mode = mode & !current().as_thread().proc_data.umask();
     let created_parent = if (flags as u32) & O_CREAT != 0 {
-        with_path_fs(dirfd, Path::new(path), |fs| {
-            match fs.resolve_no_follow(path) {
-                Ok(loc) => {
-                    enforce_special_open_rules(&loc, flags, uid)?;
-                    if loc.is_dir() && invalid_directory_open(flags) {
-                        return Err(AxError::IsADirectory);
-                    }
-                    check_open_permissions(
-                        &loc,
-                        open_access_mask(flags),
-                        uid,
-                        gid,
-                        &supplementary_groups,
-                    )?;
-                    Ok(None)
+        match fs.resolve_no_follow(path) {
+            Ok(loc) => {
+                enforce_special_open_rules(&loc, flags, uid)?;
+                if loc.is_dir() && invalid_directory_open(flags) {
+                    return Err(AxError::IsADirectory);
                 }
-                Err(AxError::NotFound) => {
-                    let (parent, name) = fs.resolve_nonexistent(Path::new(path))?;
-                    check_create_permissions(&parent, uid, gid, &supplementary_groups)?;
-                    Ok(Some((parent, name.to_string())))
-                }
-                Err(err) => Err(err),
+                check_open_permissions(
+                    &loc,
+                    open_access_mask(flags),
+                    uid,
+                    gid,
+                    &supplementary_groups,
+                )?;
+                None
             }
-        })?
+            Err(AxError::NotFound) => {
+                let (parent, name) = fs.resolve_nonexistent(Path::new(path))?;
+                check_create_permissions(&parent, uid, gid, &supplementary_groups)?;
+                Some((parent, name.to_string()))
+            }
+            Err(err) => return Err(err),
+        }
     } else {
-        with_path_fs(dirfd, Path::new(path), |fs| {
-            let loc = if (flags as u32) & O_NOFOLLOW != 0 {
-                fs.resolve_no_follow(path)?
-            } else {
-                fs.resolve(path)?
-            };
-            enforce_special_open_rules(&loc, flags, uid)?;
-            if loc.is_dir() && invalid_directory_open(flags) {
-                return Err(AxError::IsADirectory);
-            }
-            check_open_permissions(
-                &loc,
-                open_access_mask(flags),
-                uid,
-                gid,
-                &supplementary_groups,
-            )
-        })?;
+        let loc = if (flags as u32) & O_NOFOLLOW != 0 {
+            fs.resolve_no_follow(path)?
+        } else {
+            fs.resolve(path)?
+        };
+        enforce_special_open_rules(&loc, flags, uid)?;
+        if loc.is_dir() && invalid_directory_open(flags) {
+            return Err(AxError::IsADirectory);
+        }
+        check_open_permissions(
+            &loc,
+            open_access_mask(flags),
+            uid,
+            gid,
+            &supplementary_groups,
+        )?;
         None
     };
 
-    if created_parent.is_none() {
-        let existing = with_path_fs(dirfd, Path::new(path), |fs| {
-            if (flags as u32) & O_NOFOLLOW != 0 {
-                fs.resolve_no_follow(path)
-            } else {
-                fs.resolve(path)
-            }
-        })?;
+    let existing_loc = if created_parent.is_none() {
+        let existing = if (flags as u32) & O_NOFOLLOW != 0 {
+            fs.resolve_no_follow(path)
+        } else {
+            fs.resolve(path)
+        }?;
         enforce_special_open_rules(&existing, flags, uid)?;
         lease::wait_for_open(&existing, flags)?;
+        Some(existing)
+    } else {
+        None
+    };
+
+    let mut effective_flags = flags;
+    if created_parent.is_none() && (flags as u32) & O_CREAT != 0 && (flags as u32) & O_EXCL == 0 {
+        effective_flags &= !(O_CREAT as i32);
     }
 
-    let options = flags_to_options(flags, mode, (sys_geteuid()? as _, sys_getegid()? as _));
-    let fd = with_path_fs(dirfd, Path::new(path), |fs| options.open(fs, path))
-        .and_then(|it| add_to_fd(it, flags as _))
+    let options = flags_to_options(
+        effective_flags,
+        mode,
+        (sys_geteuid()? as _, sys_getegid()? as _),
+    );
+    let open_result = if let Some(loc) = existing_loc {
+        options.open_loc(loc)
+    } else {
+        options.open(fs, path)
+    };
+    let fd = open_result
+        .and_then(|it| add_to_fd(it, effective_flags as _))
         .map(|fd| fd as isize)?;
 
     if let Some(loc) = location_for_fd(fd as i32) {
@@ -294,6 +385,23 @@ pub(super) fn openat_inner(
     Ok(fd)
 }
 
+/// Open or create a file.
+/// fd: file descriptor
+/// filename: file path to be opened or created
+/// flags: open flags
+/// mode: see man 7 inode
+/// return new file descriptor if succeed, or return -1.
+pub(super) fn openat_inner(
+    dirfd: c_int,
+    path: &str,
+    flags: i32,
+    mode: __kernel_mode_t,
+) -> AxResult<isize> {
+    with_path_fs(dirfd, Path::new(path), |fs| {
+        open_in_fs(fs, path, flags, mode)
+    })
+}
+
 pub fn sys_openat(
     dirfd: c_int,
     path: *const c_char,
@@ -319,6 +427,85 @@ pub fn sys_openat(
     }
 
     openat_inner(dirfd, &path, flags, mode)
+}
+
+pub fn sys_openat2(
+    dirfd: c_int,
+    path: *const c_char,
+    how_ptr: UserConstPtr<u8>,
+    size: usize,
+) -> AxResult<isize> {
+    let path = vm_load_string(path)?;
+    if size < OPENAT2_HOW_SIZE {
+        return Err(AxError::InvalidInput);
+    }
+    let raw = how_ptr.get_as_slice(size)?;
+    if size > OPENAT2_HOW_SIZE && raw[OPENAT2_HOW_SIZE..].iter().any(|&byte| byte != 0) {
+        return Err(AxError::from(LinuxError::E2BIG));
+    }
+    let how = unsafe { (raw.as_ptr() as *const open_how).read_unaligned() };
+    if how.flags >> 32 != 0
+        || how.flags & !OPENAT2_ALLOWED_FLAGS != 0
+        || how.resolve & !OPENAT2_ALLOWED_RESOLVE != 0
+    {
+        return Err(AxError::InvalidInput);
+    }
+    if how.resolve & RESOLVE_CACHED as u64 != 0 {
+        return Err(AxError::from(LinuxError::EAGAIN));
+    }
+    if how.mode > 0o777 {
+        return Err(AxError::InvalidInput);
+    }
+    let flags = how.flags as i32;
+    let creating = (how.flags & (O_CREAT | O_TMPFILE) as u64) != 0;
+    if !creating && how.mode != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let adjusted_path = adjust_openat2_path(&path, how.resolve);
+    let adjusted_ref = Path::new(&adjusted_path);
+    if how.resolve & RESOLVE_BENEATH as u64 != 0 && escapes_beneath(adjusted_ref) {
+        return Err(AxError::from(LinuxError::EXDEV));
+    }
+
+    let base_dir = openat_base_dir(dirfd, &path, how.resolve)?;
+    match with_path_fs(dirfd, adjusted_ref, |fs| {
+        fs.resolve_no_follow(&adjusted_path)
+    }) {
+        Ok(loc) => {
+            if how.resolve & RESOLVE_NO_XDEV as u64 != 0
+                && !Arc::ptr_eq(loc.mountpoint(), base_dir.mountpoint())
+            {
+                return Err(AxError::from(LinuxError::EXDEV));
+            }
+            if how.resolve & RESOLVE_NO_SYMLINKS as u64 != 0 && loc.node_type() == NodeType::Symlink
+            {
+                return Err(AxError::from(LinuxError::ELOOP));
+            }
+            if how.resolve & RESOLVE_NO_MAGICLINKS as u64 != 0 && is_magic_proc_link(&loc) {
+                return Err(AxError::from(LinuxError::ELOOP));
+            }
+        }
+        Err(AxError::NotFound) if creating => {
+            let parent = with_path_fs(dirfd, adjusted_ref, |fs| {
+                let (parent, _) = fs.resolve_nonexistent(adjusted_ref)?;
+                Ok(parent)
+            })?;
+            if how.resolve & RESOLVE_NO_XDEV as u64 != 0
+                && !Arc::ptr_eq(parent.mountpoint(), base_dir.mountpoint())
+            {
+                return Err(AxError::from(LinuxError::EXDEV));
+            }
+        }
+        Err(err) => return Err(err),
+    }
+
+    if how.resolve & RESOLVE_IN_ROOT as u64 != 0 && Path::new(&path).is_absolute() {
+        let mut fs = FsContext::new(base_dir);
+        return open_in_fs(&mut fs, &adjusted_path, flags, how.mode as __kernel_mode_t);
+    }
+
+    openat_inner(dirfd, &adjusted_path, flags, how.mode as __kernel_mode_t)
 }
 
 /// Open a file by `filename` and insert it into the file descriptor table.

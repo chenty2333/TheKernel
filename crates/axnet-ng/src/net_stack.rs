@@ -5,7 +5,7 @@ use axsync::Mutex;
 use smoltcp::{
     iface::SocketHandle,
     socket::AnySocket,
-    wire::{IpCidr, Ipv4Address, Ipv4Cidr},
+    wire::{IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr},
 };
 
 use crate::{
@@ -65,18 +65,34 @@ impl NetStack {
         let lo_dev = router.add_device(Box::new(LoopbackDevice::new()));
 
         let lo_ip = Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8);
+        let lo_ip6 = Ipv6Cidr::new(Ipv6Address::LOCALHOST, 128);
         router.add_rule(Rule::new(
             lo_ip.into(),
             None,
             lo_dev,
             lo_ip.address().into(),
         ));
+        router.add_rule(Rule::new(
+            lo_ip6.into(),
+            None,
+            lo_dev,
+            lo_ip6.address().into(),
+        ));
 
         let mut service = Service::new(router, socket_set.clone());
         service.iface.update_ip_addrs(|addrs| {
-            addrs
-                .push(lo_ip.into())
-                .expect("loopback address insertion should succeed");
+            let lo_ip = lo_ip.into();
+            if !addrs.iter().any(|existing| *existing == lo_ip) {
+                addrs
+                    .push(lo_ip)
+                    .expect("loopback address insertion should succeed");
+            }
+            let lo_ip6 = lo_ip6.into();
+            if !addrs.iter().any(|existing| *existing == lo_ip6) {
+                addrs
+                    .push(lo_ip6)
+                    .expect("loopback IPv6 address insertion should succeed");
+            }
         });
 
         Self::new(listen_table, socket_set, service)

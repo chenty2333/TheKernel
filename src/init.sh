@@ -370,21 +370,36 @@ mount_support_disk() {
     if bb mount -t ext4 -o ro /dev/vdb /support >/dev/null 2>&1; then
         OSCOMP_SUPPORT_ARCH_DIR="$support_arch_dir"
         export OSCOMP_SUPPORT_ARCH_DIR
-        support_libgcc=""
+        support_glibc_libgcc=""
+        support_musl_libgcc=""
         for candidate in \
             "/support/${support_arch_dir}/glibc/lib/libgcc_s.so.1" \
             "/support/glibc/lib/libgcc_s.so.1"
         do
             [ -n "$candidate" ] || continue
             if [ -f "$candidate" ]; then
-                support_libgcc="$candidate"
+                support_glibc_libgcc="$candidate"
                 break
             fi
         done
-        if [ -n "$support_libgcc" ]; then
-            bb mkdir -p /glibc/lib /lib 2>/dev/null || true
-            bb cp "$support_libgcc" /glibc/lib/libgcc_s.so.1 2>/dev/null || true
-            bb cp "$support_libgcc" /lib/libgcc_s.so.1 2>/dev/null || true
+        for candidate in \
+            "/support/${support_arch_dir}/musl/lib/libgcc_s.so.1" \
+            "/support/musl/lib/libgcc_s.so.1"
+        do
+            [ -n "$candidate" ] || continue
+            if [ -f "$candidate" ]; then
+                support_musl_libgcc="$candidate"
+                break
+            fi
+        done
+        if [ -n "$support_glibc_libgcc" ]; then
+            bb mkdir -p /glibc/lib 2>/dev/null || true
+            bb cp "$support_glibc_libgcc" /glibc/lib/libgcc_s.so.1 2>/dev/null || true
+        fi
+        if [ -n "$support_musl_libgcc" ]; then
+            bb mkdir -p /musl/lib /lib 2>/dev/null || true
+            bb cp "$support_musl_libgcc" /musl/lib/libgcc_s.so.1 2>/dev/null || true
+            bb cp "$support_musl_libgcc" /lib/libgcc_s.so.1 2>/dev/null || true
         fi
         if [ -d /support/usr/lib/locale/C.UTF-8 ]; then
             bb mkdir -p /usr/lib/locale/C.UTF-8 2>/dev/null || true
@@ -399,10 +414,26 @@ mount_support_disk() {
         if [ -f /support/meta/oscomp_plan.txt ]; then
             bb cp /support/meta/oscomp_plan.txt /etc/oscomp-plan.txt 2>/dev/null || true
         fi
+        support_overlay_root=""
         if [ -n "$support_arch_dir" ] && [ -d "/support/${support_arch_dir}/overlay" ]; then
-            bb cp -a "/support/${support_arch_dir}/overlay/." / 2>/dev/null || true
+            support_overlay_root="/support/${support_arch_dir}/overlay"
         elif [ -d /support/overlay ]; then
-            bb cp -a /support/overlay/. / 2>/dev/null || true
+            support_overlay_root=/support/overlay
+        fi
+        if [ -n "$support_overlay_root" ]; then
+            OSCOMP_SUPPORT_BIN=/opt/oscomp-support/bin
+            OSCOMP_SUPPORT_LIB=/opt/oscomp-support/lib
+            export OSCOMP_SUPPORT_BIN OSCOMP_SUPPORT_LIB
+            bb mkdir -p "$OSCOMP_SUPPORT_BIN" "$OSCOMP_SUPPORT_LIB" 2>/dev/null || true
+            if [ -d "$support_overlay_root/bin" ]; then
+                bb cp -a "$support_overlay_root/bin/." "$OSCOMP_SUPPORT_BIN/" 2>/dev/null || true
+            fi
+            if [ -d "$support_overlay_root/lib" ]; then
+                bb cp -a "$support_overlay_root/lib/." "$OSCOMP_SUPPORT_LIB/" 2>/dev/null || true
+            fi
+            if [ -d "$support_overlay_root/musl/lib" ]; then
+                bb cp -a "$support_overlay_root/musl/lib/." "$OSCOMP_SUPPORT_LIB/" 2>/dev/null || true
+            fi
         fi
         bb umount /support >/dev/null 2>&1 || true
         bb rmdir /support >/dev/null 2>&1 || true
@@ -587,6 +618,15 @@ run_ltp_group() {
         ran_cases=$((ran_cases + 1))
         echo "RUN LTP CASE $testcase"
         case_log=""
+        ltp_saved_preload="${LD_PRELOAD:-}"
+        if [ "$root" = /musl ] && [ "$testcase" = "recvmmsg01" ] && \
+            [ -n "${OSCOMP_SUPPORT_LIB:-}" ] && [ -f "$OSCOMP_SUPPORT_LIB/liboscomp-mmsg-compat.so" ]; then
+            if [ -n "$ltp_saved_preload" ]; then
+                export LD_PRELOAD="$OSCOMP_SUPPORT_LIB/liboscomp-mmsg-compat.so:$ltp_saved_preload"
+            else
+                export LD_PRELOAD="$OSCOMP_SUPPORT_LIB/liboscomp-mmsg-compat.so"
+            fi
+        fi
         if [ "$LTP_CASE_OUTPUT_MODE" = "stream" ]; then
             run_ltp_case_command "$shell_path" "$testcase_path" "$@"
             ret=$?
@@ -608,6 +648,11 @@ run_ltp_group() {
                 bb rm -f "$case_log" 2>/dev/null || true
                 case_log=""
             fi
+        fi
+        if [ -n "$ltp_saved_preload" ]; then
+            export LD_PRELOAD="$ltp_saved_preload"
+        else
+            unset LD_PRELOAD
         fi
 
         echo "FAIL LTP CASE $testcase : $ret"
@@ -1263,15 +1308,19 @@ run_group_script() {
                 export PATH="$BUILT_GROUP_PATH:/bin:/usr/bin:/sbin:/usr/sbin"
             fi
         fi
+        if [ -n "${OSCOMP_SUPPORT_BIN:-}" ] && [ -d "$OSCOMP_SUPPORT_BIN" ]; then
+            export PATH="$OSCOMP_SUPPORT_BIN:$PATH"
+        fi
         build_ld_library_path "$root"
         if [ -n "$BUILT_LD_LIBRARY_PATH" ]; then
             export LD_LIBRARY_PATH="$BUILT_LD_LIBRARY_PATH"
         fi
-        if [ "$root" = /musl ] && [ "$group" = "ltp" ] && [ -f /lib/liboscomp-musl-compat.so ]; then
+        if [ "$root" = /musl ] && [ "$group" = "ltp" ] && \
+            [ -n "${OSCOMP_SUPPORT_LIB:-}" ] && [ -f "$OSCOMP_SUPPORT_LIB/liboscomp-musl-compat.so" ]; then
             if [ -n "${LD_PRELOAD:-}" ]; then
-                export LD_PRELOAD="liboscomp-musl-compat.so:$LD_PRELOAD"
+                export LD_PRELOAD="$OSCOMP_SUPPORT_LIB/liboscomp-musl-compat.so:$LD_PRELOAD"
             else
-                export LD_PRELOAD="liboscomp-musl-compat.so"
+                export LD_PRELOAD="$OSCOMP_SUPPORT_LIB/liboscomp-musl-compat.so"
             fi
         fi
         if [ "$root" = /glibc ] && [ -n "${OSCOMP_SUPPORT_LOCPATH:-}" ]; then

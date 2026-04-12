@@ -43,7 +43,7 @@ mod wrapper;
 use alloc::{borrow::ToOwned, boxed::Box, sync::Arc};
 
 use axdriver::{AxDeviceContainer, prelude::*};
-use smoltcp::wire::{EthernetAddress, Ipv4Address, Ipv4Cidr};
+use smoltcp::wire::{EthernetAddress, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr};
 use spin::Once;
 
 use self::{
@@ -81,11 +81,18 @@ pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) -> Arc<NetStac
     let lo_dev = router.add_device(Box::new(LoopbackDevice::new()));
 
     let lo_ip = Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8);
+    let lo_ip6 = Ipv6Cidr::new(Ipv6Address::LOCALHOST, 128);
     router.add_rule(Rule::new(
         lo_ip.into(),
         None,
         lo_dev,
         lo_ip.address().into(),
+    ));
+    router.add_rule(Rule::new(
+        lo_ip6.into(),
+        None,
+        lo_dev,
+        lo_ip6.address().into(),
     ));
 
     let eth0_ip = if let Some(dev) = net_devs.take_one() {
@@ -123,13 +130,25 @@ pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) -> Arc<NetStac
 
     let mut service = Service::new(router, socket_set.clone());
     service.iface.update_ip_addrs(|ip_addrs| {
-        ip_addrs
-            .push(lo_ip.into())
-            .expect("loopback address insertion should succeed");
-        if let Some(eth0_ip) = eth0_ip {
+        let lo_ip = lo_ip.into();
+        if !ip_addrs.iter().any(|existing| *existing == lo_ip) {
             ip_addrs
-                .push(eth0_ip.into())
-                .expect("eth0 address insertion should succeed");
+                .push(lo_ip)
+                .expect("loopback address insertion should succeed");
+        }
+        let lo_ip6 = lo_ip6.into();
+        if !ip_addrs.iter().any(|existing| *existing == lo_ip6) {
+            ip_addrs
+                .push(lo_ip6)
+                .expect("loopback IPv6 address insertion should succeed");
+        }
+        if let Some(eth0_ip) = eth0_ip {
+            let eth0_ip = eth0_ip.into();
+            if !ip_addrs.iter().any(|existing| *existing == eth0_ip) {
+                ip_addrs
+                    .push(eth0_ip)
+                    .expect("eth0 address insertion should succeed");
+            }
         }
     });
 

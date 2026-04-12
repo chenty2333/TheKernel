@@ -68,9 +68,12 @@ fn restart_class_for_futex(uctx: &UserContext) -> Option<RestartClass> {
 
 fn restart_class_for_syscall(sysno: Sysno, uctx: &UserContext) -> Option<RestartClass> {
     match sysno {
-        Sysno::ioctl | Sysno::openat | Sysno::wait4 | Sysno::waitid | Sysno::flock => {
-            Some(RestartClass::Sys)
-        }
+        Sysno::ioctl
+        | Sysno::openat
+        | Sysno::openat2
+        | Sysno::wait4
+        | Sysno::waitid
+        | Sysno::flock => Some(RestartClass::Sys),
         #[cfg(target_arch = "x86_64")]
         Sysno::open => Some(RestartClass::Sys),
         Sysno::read | Sysno::readv => {
@@ -79,10 +82,10 @@ fn restart_class_for_syscall(sysno: Sysno, uctx: &UserContext) -> Option<Restart
         Sysno::write | Sysno::writev => {
             restart_class_for_fd_io(uctx.arg0() as i32, SocketIoDirection::Write)
         }
-        Sysno::accept | Sysno::accept4 | Sysno::recvfrom | Sysno::recvmsg => {
+        Sysno::accept | Sysno::accept4 | Sysno::recvfrom | Sysno::recvmsg | Sysno::recvmmsg => {
             restart_class_for_fd_io(uctx.arg0() as i32, SocketIoDirection::Read)
         }
-        Sysno::connect | Sysno::sendto | Sysno::sendmsg => {
+        Sysno::connect | Sysno::sendto | Sysno::sendmsg | Sysno::sendmmsg => {
             restart_class_for_fd_io(uctx.arg0() as i32, SocketIoDirection::Write)
         }
         Sysno::futex => restart_class_for_futex(uctx),
@@ -202,6 +205,12 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
+        Sysno::openat2 => sys_openat2(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2().into(),
             uctx.arg3() as _,
         ),
         Sysno::setxattr => sys_setxattr(
@@ -810,6 +819,19 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         ),
         Sysno::sendmsg => sys_sendmsg(uctx.arg0() as _, uctx.arg1().into(), uctx.arg2() as _),
         Sysno::recvmsg => sys_recvmsg(uctx.arg0() as _, uctx.arg1().into(), uctx.arg2() as _),
+        Sysno::sendmmsg => sys_sendmmsg(
+            uctx.arg0() as _,
+            uctx.arg1().into(),
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
+        Sysno::recvmmsg => sys_recvmmsg(
+            uctx.arg0() as _,
+            uctx.arg1().into(),
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+            uctx.arg4().into(),
+        ),
         Sysno::getsockopt => sys_getsockopt(
             uctx.arg0() as _,
             uctx.arg1() as _,

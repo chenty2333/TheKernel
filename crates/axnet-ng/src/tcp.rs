@@ -1,6 +1,6 @@
 use alloc::{sync::Arc, vec};
 use core::{
-    net::{Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::atomic::{AtomicBool, Ordering},
     task::Context,
 };
@@ -278,7 +278,15 @@ impl SocketOps for TcpSocket {
     }
 
     fn connect(&self, remote_addr: SocketAddrEx) -> AxResult {
-        let remote_addr = remote_addr.into_ip()?;
+        let remote_addr = match remote_addr.into_ip()? {
+            SocketAddr::V4(addr) if addr.ip().is_unspecified() => {
+                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), addr.port())
+            }
+            SocketAddr::V6(addr) if addr.ip().is_unspecified() => {
+                SocketAddr::new(Ipv6Addr::LOCALHOST.into(), addr.port())
+            }
+            addr => addr,
+        };
         self.state
             .lock(State::Idle)
             .map_err(|state| {

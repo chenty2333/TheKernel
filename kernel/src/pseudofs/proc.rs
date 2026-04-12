@@ -35,6 +35,7 @@ use crate::{
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
         SimpleFileOperation, SimpleFs, SimpleFsNode,
     },
+    syscall::proc_version_string,
     task::{AsThread, get_task, get_visible_task, render_task_stat, tasks},
 };
 
@@ -603,6 +604,10 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             }
             Ok(out)
         }),
+    );
+    root.add(
+        "version",
+        SimpleFile::new_regular(fs.clone(), || Ok(proc_version_string())),
     );
     root.add(
         "uptime",

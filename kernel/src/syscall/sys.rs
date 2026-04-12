@@ -1,4 +1,4 @@
-use alloc::vec;
+use alloc::{format, string::String, vec, vec::Vec};
 use core::ffi::c_char;
 
 use axconfig::ARCH;
@@ -153,7 +153,7 @@ fn fill_uts_field(dst: &mut [c_char; 65], src: &[u8]) {
     }
 }
 
-fn current_utsname() -> new_utsname {
+pub(crate) fn current_utsname() -> new_utsname {
     let mut utsname = new_utsname {
         sysname: pad_str("Linux"),
         nodename: [0; 65],
@@ -169,6 +169,29 @@ fn current_utsname() -> new_utsname {
         &state.domainname[..state.domainname_len],
     );
     utsname
+}
+
+pub(crate) fn proc_version_string() -> String {
+    let utsname = current_utsname();
+    let sysname = cstr_field_to_string(&utsname.sysname);
+    let release = cstr_field_to_string(&utsname.release);
+    let version = cstr_field_to_string(&utsname.version);
+    let machine = cstr_field_to_string(&utsname.machine);
+    format!("{sysname} version {release} ({machine}) {version}\n")
+}
+
+fn cstr_field_to_string(field: &[c_char; 65]) -> String {
+    let len = field
+        .iter()
+        .position(|&ch| ch == 0)
+        .unwrap_or(field.len());
+    field[..len]
+        .iter()
+        .map(|&ch| ch as u8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(char::from)
+        .collect()
 }
 
 pub fn sys_uname(name: *mut new_utsname) -> AxResult<isize> {

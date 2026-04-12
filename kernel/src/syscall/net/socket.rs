@@ -11,8 +11,8 @@ use axtask::current;
 use linux_raw_sys::{
     general::{O_CLOEXEC, O_NONBLOCK},
     net::{
-        AF_INET, AF_UNIX, AF_VSOCK, IPPROTO_TCP, IPPROTO_UDP, SHUT_RD, SHUT_RDWR, SHUT_WR,
-        SOCK_DGRAM, SOCK_SEQPACKET, SOCK_STREAM, sockaddr, socklen_t,
+        AF_INET, AF_INET6, AF_UNIX, AF_VSOCK, IPPROTO_TCP, IPPROTO_UDP, SHUT_RD, SHUT_RDWR,
+        SHUT_WR, SOCK_DGRAM, SOCK_SEQPACKET, SOCK_STREAM, sockaddr, socklen_t,
     },
 };
 
@@ -57,13 +57,13 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     let pid = current().as_thread().proc_data.proc.pid();
     let net_ns = current().as_thread().proc_data.net_ns.clone();
     let socket = match (domain, ty) {
-        (AF_INET, SOCK_STREAM) => {
+        (AF_INET | AF_INET6, SOCK_STREAM) => {
             if proto != 0 && proto != IPPROTO_TCP as _ {
                 return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
             }
             SocketInner::Tcp(TcpSocket::new(net_ns))
         }
-        (AF_INET, SOCK_DGRAM) => {
+        (AF_INET | AF_INET6, SOCK_DGRAM) => {
             if proto != 0 && proto != IPPROTO_UDP as _ {
                 return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
             }
@@ -75,7 +75,7 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
         (AF_VSOCK, SOCK_STREAM) => {
             SocketInner::Vsock(VsockSocket::new(VsockStreamTransport::new()))
         }
-        (AF_INET, _) | (AF_UNIX, _) | (AF_VSOCK, _) => {
+        (AF_INET, _) | (AF_INET6, _) | (AF_UNIX, _) | (AF_VSOCK, _) => {
             warn!("Unsupported socket type: domain: {domain}, ty: {ty}");
             return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
         }

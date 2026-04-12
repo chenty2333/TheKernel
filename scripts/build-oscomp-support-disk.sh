@@ -209,6 +209,14 @@ build_overlay_tools_for_arch() {
         -o "$arch_root/overlay/lib/liboscomp-musl-compat.so"
     cp "$arch_root/overlay/lib/liboscomp-musl-compat.so" \
         "$arch_root/overlay/musl/lib/liboscomp-musl-compat.so"
+    if [ "$arch" = rv ]; then
+        "$cc" -O2 -fPIC -shared \
+            "$REPO_ROOT/scripts/support-tools/mmsg-compat.c" \
+            -Wl,-soname,liboscomp-mmsg-compat.so \
+            -o "$arch_root/overlay/lib/liboscomp-mmsg-compat.so"
+        cp "$arch_root/overlay/lib/liboscomp-mmsg-compat.so" \
+            "$arch_root/overlay/musl/lib/liboscomp-mmsg-compat.so"
+    fi
     cat > "$arch_root/overlay/bin/make" <<'EOF'
 #!/bin/sh
 set -e

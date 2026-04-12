@@ -22,7 +22,9 @@ use starry_vm::{VmPtr, vm_write_slice};
 use crate::{
     file::{
         Directory, FileLike, get_file_like,
-        permission::{check_create_permissions, check_search_permissions},
+        permission::{
+            check_create_permissions, check_parent_search_permissions, check_search_permissions,
+        },
         resolve_at, with_fs, with_path_fs,
     },
     mm::vm_load_string,
@@ -361,7 +363,7 @@ pub fn sys_linkat(
          new_path: {new_path}, flags: {flags}"
     );
 
-    if flags != 0 {
+    if flags & !(AT_EMPTY_PATH | AT_SYMLINK_FOLLOW) != 0 {
         return Err(AxError::InvalidInput);
     }
     if new_path.is_empty() {
@@ -503,9 +505,24 @@ pub fn sys_readlinkat(
     let path = vm_load_string(path)?;
 
     debug!("sys_readlinkat <= dirfd: {dirfd}, path: {path:?}");
+    if size == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if path.is_empty() {
+        return Err(AxError::NotFound);
+    }
+    validate_pathname(Path::new(&path))?;
 
     with_path_fs(dirfd, Path::new(&path), |fs| {
         let entry = fs.resolve_no_follow(path.as_str())?;
+        let curr = current();
+        let proc_data = &curr.as_thread().proc_data;
+        check_parent_search_permissions(
+            &entry,
+            proc_data.euid(),
+            proc_data.egid(),
+            &proc_data.supplementary_groups(),
+        )?;
         let link = entry.read_link()?;
         let read = size.min(link.len());
         vm_write_slice(buf, &link.as_bytes()[..read])?;

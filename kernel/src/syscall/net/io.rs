@@ -1,12 +1,20 @@
 use alloc::{boxed::Box, vec::Vec};
-use core::net::Ipv4Addr;
+use core::{
+    mem::{MaybeUninit, size_of},
+    net::Ipv4Addr,
+};
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axio::prelude::*;
 use axnet::{CMsgData, RecvFlags, RecvOptions, SendFlags, SendOptions, SocketAddrEx, SocketOps};
-use linux_raw_sys::net::{
-    MSG_PEEK, MSG_TRUNC, SCM_RIGHTS, SOL_SOCKET, cmsghdr, msghdr, sockaddr, socklen_t,
+use linux_raw_sys::{
+    general::timespec,
+    net::{
+        MSG_CMSG_CLOEXEC, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL,
+        SCM_RIGHTS, SOL_SOCKET, cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t,
+    },
 };
+use starry_vm::{vm_read_slice, vm_write_slice};
 
 use super::addr::SocketAddrExt;
 use crate::{
@@ -14,6 +22,49 @@ use crate::{
     mm::{IoVec, IoVectorBuf, UserConstPtr, UserPtr, VmBytes, VmBytesMut},
     syscall::net::{CMsg, CMsgBuilder},
 };
+
+const MAX_RECVMSG_IOVCNT: usize = 1024;
+const SUPPORTED_RECVMSG_FLAGS: u32 =
+    MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_WAITALL | MSG_CMSG_CLOEXEC | MSG_ERRQUEUE | MSG_OOB;
+
+fn read_user_copy<T: Copy>(ptr: UserConstPtr<T>) -> AxResult<T> {
+    let mut value = MaybeUninit::<T>::uninit();
+    vm_read_slice(ptr.address().as_usize() as *const u8, unsafe {
+        core::slice::from_raw_parts_mut(
+            value.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+            size_of::<T>(),
+        )
+    })?;
+    Ok(unsafe { value.assume_init() })
+}
+
+fn write_user_copy<T: Copy>(ptr: UserPtr<T>, value: T) -> AxResult {
+    Ok(vm_write_slice(
+        ptr.address().as_usize() as *mut u8,
+        unsafe { core::slice::from_raw_parts((&value as *const T).cast::<u8>(), size_of::<T>()) },
+    )?)
+}
+
+fn validate_recvmsg_flags(flags: u32) -> AxResult<RecvFlags> {
+    if flags & !SUPPORTED_RECVMSG_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & MSG_OOB != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & MSG_ERRQUEUE != 0 {
+        return Err(AxError::from(LinuxError::EAGAIN));
+    }
+
+    let mut recv_flags = RecvFlags::empty();
+    if flags & MSG_PEEK != 0 {
+        recv_flags |= RecvFlags::PEEK;
+    }
+    if flags & MSG_TRUNC != 0 {
+        recv_flags |= RecvFlags::TRUNCATE;
+    }
+    Ok(recv_flags)
+}
 
 fn send_impl(
     fd: i32,
@@ -56,10 +107,10 @@ pub fn sys_sendto(
 }
 
 pub fn sys_sendmsg(fd: i32, msg: UserConstPtr<msghdr>, flags: u32) -> AxResult<isize> {
-    let msg = msg.get_as_ref()?;
+    let msg = read_user_copy(msg)?;
     if let Ok(socket) = AfAlgSocket::from_fd(fd) {
         debug!("sys_sendmsg <= fd: {fd}, flags: {flags}, af_alg");
-        return socket.sendmsg(msg).map(|sent| sent as isize);
+        return socket.sendmsg(&msg).map(|sent| sent as isize);
     }
 
     let mut cmsg = Vec::new();
@@ -77,7 +128,7 @@ pub fn sys_sendmsg(fd: i32, msg: UserConstPtr<msghdr>, flags: u32) -> AxResult<i
     }
     send_impl(
         fd,
-        IoVectorBuf::new(msg.msg_iov as *const IoVec, msg.msg_iovlen)?.into_io(),
+        IoVectorBuf::new(msg.msg_iov.cast::<IoVec>(), msg.msg_iovlen)?.into_io(),
         flags,
         UserConstPtr::from(msg.msg_name as usize),
         msg.msg_namelen as socklen_t,
@@ -88,22 +139,15 @@ pub fn sys_sendmsg(fd: i32, msg: UserConstPtr<msghdr>, flags: u32) -> AxResult<i
 fn recv_impl(
     fd: i32,
     mut dst: impl Write + IoBufMut,
-    flags: u32,
+    recv_flags: RecvFlags,
     addr: UserPtr<sockaddr>,
-    addrlen: UserPtr<socklen_t>,
+    addrlen: Option<&mut socklen_t>,
     cmsg_builder: Option<CMsgBuilder>,
+    cloexec_rights: bool,
 ) -> AxResult<isize> {
-    debug!("sys_recv <= fd: {fd}, flags: {flags}");
+    debug!("sys_recv <= fd: {fd}, flags: {recv_flags:?}");
 
     let socket = Socket::from_fd(fd)?;
-    let mut recv_flags = RecvFlags::empty();
-    if flags & MSG_PEEK != 0 {
-        recv_flags |= RecvFlags::PEEK;
-    }
-    if flags & MSG_TRUNC != 0 {
-        recv_flags |= RecvFlags::TRUNCATE;
-    }
-
     let mut cmsg = Vec::new();
 
     let mut remote_addr =
@@ -117,8 +161,8 @@ fn recv_impl(
         },
     )?;
 
-    if let Some(remote_addr) = remote_addr {
-        remote_addr.write_to_user(addr, addrlen.get_as_mut()?)?;
+    if let (Some(remote_addr), Some(addrlen)) = (remote_addr, addrlen) {
+        remote_addr.write_to_user(addr, addrlen)?;
     }
 
     if let Some(mut builder) = cmsg_builder {
@@ -132,7 +176,7 @@ fn recv_impl(
                 CMsg::Rights { fds } => builder.push(SOL_SOCKET, SCM_RIGHTS, |data| {
                     let mut written = 0;
                     for (f, chunk) in fds.into_iter().zip(data.chunks_exact_mut(size_of::<i32>())) {
-                        let fd = add_file_description(f, false)?;
+                        let fd = add_file_description(f, cloexec_rights)?;
                         chunk.copy_from_slice(&fd.to_ne_bytes());
                         written += size_of::<i32>();
                     }
@@ -157,22 +201,128 @@ pub fn sys_recvfrom(
     addr: UserPtr<sockaddr>,
     addrlen: UserPtr<socklen_t>,
 ) -> AxResult<isize> {
-    recv_impl(fd, VmBytesMut::new(buf, len), flags, addr, addrlen, None)
+    let recv_flags = validate_recvmsg_flags(flags)?;
+    let addrlen_ptr = addrlen;
+    let mut user_addrlen = if addr.is_null() {
+        None
+    } else {
+        Some(read_user_copy(UserConstPtr::<socklen_t>::from(
+            addrlen_ptr.address().as_usize(),
+        ))?)
+    };
+    let recv = recv_impl(
+        fd,
+        VmBytesMut::new(buf, len),
+        recv_flags,
+        addr,
+        user_addrlen.as_mut(),
+        None,
+        flags & MSG_CMSG_CLOEXEC != 0,
+    )?;
+    if let Some(new_addrlen) = user_addrlen {
+        write_user_copy(addrlen_ptr, new_addrlen)?;
+    }
+    Ok(recv)
 }
 
 pub fn sys_recvmsg(fd: i32, msg: UserPtr<msghdr>, flags: u32) -> AxResult<isize> {
-    let msg = msg.get_as_mut()?;
-    recv_impl(
+    let recv_flags = validate_recvmsg_flags(flags)?;
+    let mut msg_hdr = read_user_copy(UserConstPtr::<msghdr>::from(msg.address().as_usize()))?;
+    if (msg_hdr.msg_namelen as i32) < 0 || (msg_hdr.msg_controllen as isize) < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if msg_hdr.msg_iovlen == 0 || msg_hdr.msg_iovlen > MAX_RECVMSG_IOVCNT {
+        return Err(AxError::from(LinuxError::EMSGSIZE));
+    }
+
+    let mut name_len = msg_hdr.msg_namelen as socklen_t;
+    let recv = recv_impl(
         fd,
-        IoVectorBuf::new(msg.msg_iov as *mut IoVec, msg.msg_iovlen)?.into_io(),
-        flags,
-        UserPtr::from(msg.msg_name as usize),
-        UserPtr::from(&mut msg.msg_namelen as *mut _ as *mut socklen_t),
-        (!msg.msg_control.is_null()).then(|| {
+        IoVectorBuf::new(msg_hdr.msg_iov.cast::<IoVec>(), msg_hdr.msg_iovlen)?.into_io(),
+        recv_flags,
+        UserPtr::from(msg_hdr.msg_name as usize),
+        (!msg_hdr.msg_name.is_null()).then_some(&mut name_len),
+        (!msg_hdr.msg_control.is_null()).then(|| {
             CMsgBuilder::new(
-                UserPtr::from(msg.msg_control as *mut cmsghdr),
-                &mut msg.msg_controllen,
+                UserPtr::from(msg_hdr.msg_control.cast::<cmsghdr>()),
+                &mut msg_hdr.msg_controllen,
             )
         }),
-    )
+        flags & MSG_CMSG_CLOEXEC != 0,
+    )?;
+    msg_hdr.msg_namelen = name_len as _;
+    write_user_copy(msg, msg_hdr)?;
+    Ok(recv)
+}
+
+pub fn sys_sendmmsg(fd: i32, msgvec: UserPtr<mmsghdr>, vlen: u32, flags: u32) -> AxResult<isize> {
+    if vlen == 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let mut sent = 0usize;
+    let base = msgvec.address().as_usize();
+    for idx in 0..vlen as usize {
+        let ptr = base + idx * size_of::<mmsghdr>();
+        let msg = UserConstPtr::<mmsghdr>::from(ptr).cast::<msghdr>();
+        match sys_sendmsg(fd, msg, flags) {
+            Ok(len) => {
+                let mut header = read_user_copy(UserConstPtr::<mmsghdr>::from(ptr))?;
+                header.msg_len = len as u32;
+                write_user_copy(UserPtr::<mmsghdr>::from(ptr), header)?;
+                sent += 1;
+            }
+            Err(_err) if sent != 0 => return Ok(sent as isize),
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(sent as isize)
+}
+
+fn validate_recvmmsg_timeout(timeout: UserConstPtr<timespec>) -> AxResult {
+    if timeout.is_null() {
+        return Ok(());
+    }
+    let timeout = read_user_copy(timeout)?;
+    if timeout.tv_sec < 0 || !(0..1_000_000_000).contains(&timeout.tv_nsec) {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
+pub fn sys_recvmmsg(
+    fd: i32,
+    msgvec: UserPtr<mmsghdr>,
+    vlen: u32,
+    flags: u32,
+    timeout: UserConstPtr<timespec>,
+) -> AxResult<isize> {
+    if vlen == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    validate_recvmmsg_timeout(timeout)?;
+
+    let mut received = 0usize;
+    let base = msgvec.address().as_usize();
+    for idx in 0..vlen as usize {
+        let ptr = base + idx * size_of::<mmsghdr>();
+        let msg = UserPtr::<mmsghdr>::from(ptr).cast::<msghdr>();
+        match sys_recvmsg(fd, msg, flags) {
+            Ok(len) => {
+                let mut header = read_user_copy(UserConstPtr::<mmsghdr>::from(ptr))?;
+                header.msg_len = len as u32;
+                write_user_copy(UserPtr::<mmsghdr>::from(ptr), header)?;
+                received += 1;
+                if len == 0 {
+                    break;
+                }
+            }
+            Err(_err) if received != 0 => return Ok(received as isize),
+            Err(AxError::OperationNotSupported) => {
+                return Err(AxError::from(LinuxError::ENOSYS));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(received as isize)
 }
