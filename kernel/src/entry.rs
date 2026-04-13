@@ -20,6 +20,7 @@ use crate::{
 pub fn init(args: &[String], envs: &[String]) {
     const INIT_PID: Pid = 1;
 
+    axfs::set_symlink_follow_policy(crate::mounts::should_follow_symlink);
     pseudofs::mount_all().expect("Failed to mount pseudofs");
 
     let loc = FS_CONTEXT

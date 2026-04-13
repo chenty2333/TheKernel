@@ -449,7 +449,6 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     let visible_tid = thr.tid();
 
     info!("{} exit with code: {}", curr.id_name(), exit_code);
-
     let clear_child_tid = thr.clear_child_tid() as *mut u32;
     let aspace = thr.proc_data.aspace();
     let clear_result = if clear_child_tid.is_null() {

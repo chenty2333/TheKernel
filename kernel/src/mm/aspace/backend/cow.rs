@@ -303,6 +303,10 @@ impl CowBackend {
         }
         Ok(())
     }
+
+    pub(crate) fn is_private_anonymous(&self) -> bool {
+        self.file.is_none()
+    }
 }
 
 impl BackendOps for CowBackend {

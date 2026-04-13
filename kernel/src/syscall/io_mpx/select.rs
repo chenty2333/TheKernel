@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::{fmt, time::Duration};
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axhal::uspace::UserContext;
 use axpoll::IoEvents;
 use axtask::{
@@ -155,6 +155,9 @@ fn do_select(
     let curr = current();
     let thr = curr.as_thread();
     let old_blocked = thr.signal.set_blocked(sigmask);
+    // pselect6() shares ppoll()/sigsuspend() semantics: if a handler runs,
+    // the saved userspace return register must already contain -EINTR.
+    uctx.set_retval(-LinuxError::EINTR.code() as usize);
     let result = loop {
         match select_once() {
             Ok(Ok(res)) => break Ok(res),

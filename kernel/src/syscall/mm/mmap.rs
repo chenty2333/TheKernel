@@ -650,12 +650,41 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
 
+    let curr = current();
+    let aspace_handle = curr.as_thread().proc_data.aspace();
+    let mut aspace = aspace_handle.lock();
+    let length = align_up_4k(length);
+
     match advice {
         // Hints the kernel may safely ignore.
         MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_FREE | MADV_DONTNEED
         | MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_HUGEPAGE
-        | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP | MADV_WIPEONFORK | MADV_KEEPONFORK
+        | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP
         | MADV_COLD | MADV_PAGEOUT | MADV_POPULATE_READ | MADV_POPULATE_WRITE | MADV_COLLAPSE => {
+            Ok(0)
+        }
+        MADV_WIPEONFORK | MADV_KEEPONFORK => {
+            if length == 0 {
+                return Ok(0);
+            }
+
+            let start = VirtAddr::from(addr);
+            let end = start + length;
+            let mut cursor = start;
+            while cursor < end {
+                let Some(area) = aspace.find_area(cursor) else {
+                    return Err(AxError::NoMemory);
+                };
+                if area.start() > cursor {
+                    return Err(AxError::NoMemory);
+                }
+                if !area.backend().is_private_anonymous() {
+                    return Err(AxError::InvalidInput);
+                }
+                cursor = area.end().min(end);
+            }
+
+            aspace.set_wipe_on_fork(start, length, advice == MADV_WIPEONFORK)?;
             Ok(0)
         }
         _ => Err(AxError::InvalidInput),

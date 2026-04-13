@@ -197,6 +197,9 @@ build_overlay_tools_for_arch() {
         "$REPO_ROOT/scripts/support-tools/date.c" \
         -o "$arch_root/overlay/bin/date"
     "$cc" -O2 -static -s -std=c11 \
+        "$REPO_ROOT/scripts/support-tools/default-signals.c" \
+        -o "$arch_root/overlay/bin/oscomp-default-signals"
+    "$cc" -O2 -static -s -std=c11 \
         "$REPO_ROOT/scripts/support-tools/file.c" \
         -o "$arch_root/overlay/bin/file"
     "$cc" -O2 -static -s -std=c11 \

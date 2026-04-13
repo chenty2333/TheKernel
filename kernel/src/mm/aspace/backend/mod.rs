@@ -183,6 +183,10 @@ impl Backend {
         }
     }
 
+    pub fn is_private_anonymous(&self) -> bool {
+        matches!(self, Backend::Cow(backend) if backend.is_private_anonymous())
+    }
+
     pub fn relocate(
         &self,
         old_start: VirtAddr,

@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axhal::{
     time::{TimeValue, wall_time},
     uspace::UserContext,
@@ -104,6 +104,10 @@ fn do_poll(
     let curr = current();
     let thr = curr.as_thread();
     let old_blocked = thr.signal.set_blocked(sigmask);
+    // Like sigsuspend(), ppoll() may enter a user signal handler instead of
+    // returning directly. Seed the saved return context with -EINTR so the
+    // handler-resume path cannot leak a stale success value back to userspace.
+    uctx.set_retval(-LinuxError::EINTR.code() as usize);
     let result = loop {
         match wait_once() {
             Ok(Ok(res)) => break Ok(res),

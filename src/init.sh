@@ -44,6 +44,14 @@ runner_falsy() {
     return 1
 }
 
+run_clean_exec() {
+    if [ -n "${OSCOMP_SUPPORT_BIN:-}" ] && [ -x "$OSCOMP_SUPPORT_BIN/oscomp-default-signals" ]; then
+        "$OSCOMP_SUPPORT_BIN/oscomp-default-signals" "$@"
+    else
+        "$@"
+    fi
+}
+
 ltp_case_output_mode() {
     LTP_CASE_OUTPUT_MODE=stream
 
@@ -554,22 +562,22 @@ run_ltp_group() {
         if [ "$#" -gt 0 ]; then
             if [ -n "$shell_path" ] && [ "${testcase_path##*.}" = "sh" ]; then
                 if [ "${shell_path##*/}" = "busybox" ]; then
-                    "$shell_path" sh "$testcase_path" "$@"
+                    run_clean_exec "$shell_path" sh "$testcase_path" "$@"
                 else
-                    "$shell_path" "$testcase_path" "$@"
+                    run_clean_exec "$shell_path" "$testcase_path" "$@"
                 fi
             else
-                "$testcase_path" "$@"
+                run_clean_exec "$testcase_path" "$@"
             fi
         else
             if [ -n "$shell_path" ] && [ "${testcase_path##*.}" = "sh" ]; then
                 if [ "${shell_path##*/}" = "busybox" ]; then
-                    "$shell_path" sh "$testcase_path"
+                    run_clean_exec "$shell_path" sh "$testcase_path"
                 else
-                    "$shell_path" "$testcase_path"
+                    run_clean_exec "$shell_path" "$testcase_path"
                 fi
             else
-                "$testcase_path"
+                run_clean_exec "$testcase_path"
             fi
         fi
     }
@@ -690,13 +698,13 @@ run_basic_group() {
     fi
 
     if [ -n "$shell_path" ] && [ "${shell_path##*/}" = "busybox" ]; then
-        "$shell_path" sh ./run-all.sh
+        run_clean_exec "$shell_path" sh ./run-all.sh
         ret=$?
     elif [ -n "$shell_path" ]; then
-        "$shell_path" ./run-all.sh
+        run_clean_exec "$shell_path" ./run-all.sh
         ret=$?
     else
-        sh ./run-all.sh
+        run_clean_exec sh ./run-all.sh
         ret=$?
     fi
     return "$ret"
@@ -775,21 +783,21 @@ run_iozone_group() {
     }
 
     "$iozone_busybox" echo iozone automatic measurements || return $?
-    "$iozone_bin" -a -r 1k -s 4m || return $?
+    run_clean_exec "$iozone_bin" -a -r 1k -s 4m || return $?
     "$iozone_busybox" echo iozone throughput write/read measurements || return $?
-    "$iozone_bin" -t 4 -i 0 -i 1 -r 1k -s 1m || return $?
+    run_clean_exec "$iozone_bin" -t 4 -i 0 -i 1 -r 1k -s 1m || return $?
     "$iozone_busybox" echo iozone throughput random-read measurements || return $?
-    "$iozone_bin" -t 4 -i 0 -i 2 -r 1k -s 1m || return $?
+    run_clean_exec "$iozone_bin" -t 4 -i 0 -i 2 -r 1k -s 1m || return $?
     "$iozone_busybox" echo iozone throughput read-backwards measurements || return $?
-    "$iozone_bin" -t 4 -i 0 -i 3 -r 1k -s 1m || return $?
+    run_clean_exec "$iozone_bin" -t 4 -i 0 -i 3 -r 1k -s 1m || return $?
     "$iozone_busybox" echo iozone throughput stride-read measurements || return $?
-    "$iozone_bin" -t 4 -i 0 -i 5 -r 1k -s 1m || return $?
+    run_clean_exec "$iozone_bin" -t 4 -i 0 -i 5 -r 1k -s 1m || return $?
     "$iozone_busybox" echo iozone throughput fwrite/fread measurements || return $?
-    "$iozone_bin" -t 4 -i 6 -i 7 -r 1k -s 1m || return $?
+    run_clean_exec "$iozone_bin" -t 4 -i 6 -i 7 -r 1k -s 1m || return $?
     "$iozone_busybox" echo iozone throughput pwrite/pread measurements || return $?
-    "$iozone_bin" -t 4 -i 9 -i 10 -r 1k -s 1m || return $?
+    run_clean_exec "$iozone_bin" -t 4 -i 9 -i 10 -r 1k -s 1m || return $?
     "$iozone_busybox" echo iozone throughtput pwritev/preadv measurements || return $?
-    "$iozone_bin" -t 4 -i 11 -i 12 -r 1k -s 1m || return $?
+    run_clean_exec "$iozone_bin" -t 4 -i 11 -i 12 -r 1k -s 1m || return $?
     return 0
 }
 
@@ -1364,9 +1372,11 @@ run_group_script() {
         fi
 
         if [ "${script_shell##*/}" = "busybox" ]; then
-            exec "$script_shell" sh "./$run_script_name" </dev/null
+            run_clean_exec "$script_shell" sh "./$run_script_name" </dev/null
+            exit $?
         fi
-        exec "$script_shell" "./$run_script_name" </dev/null
+        run_clean_exec "$script_shell" "./$run_script_name" </dev/null
+        exit $?
     ) >"$output_file" 2>&1 &
     runner_pid=$!
     timed_out=""

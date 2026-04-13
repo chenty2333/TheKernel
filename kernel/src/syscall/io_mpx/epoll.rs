@@ -1,6 +1,6 @@
 use core::time::Duration;
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axhal::uspace::UserContext;
 use axpoll::IoEvents;
 use axtask::{
@@ -121,6 +121,10 @@ fn do_epoll_wait(
     let curr = current();
     let thr = curr.as_thread();
     let old_blocked = thr.signal.set_blocked(sigmask);
+    // epoll_pwait() also resumes through a signal frame when a handler runs;
+    // pre-install -EINTR so interrupted waits cannot return stale register
+    // contents after sigreturn.
+    uctx.set_retval(-LinuxError::EINTR.code() as usize);
     let result = loop {
         match wait_once() {
             Ok(Ok(res)) => break Ok(res as _),

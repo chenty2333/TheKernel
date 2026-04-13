@@ -21,6 +21,7 @@ pub const SYMLINKS_MAX: usize = 40;
 
 /// Global root filesystem context, initialized once during [`init_filesystems`](crate::init_filesystems).
 pub static ROOT_FS_CONTEXT: Once<FsContext> = Once::new();
+static SYMLINK_FOLLOW_POLICY: Once<fn(&Location) -> bool> = Once::new();
 
 scope_local::scope_local! {
     /// Task-local filesystem context, defaulting to a clone of [`ROOT_FS_CONTEXT`].
@@ -53,6 +54,10 @@ pub struct FsContext {
 }
 
 impl FsContext {
+    fn may_follow_symlink(loc: &Location) -> bool {
+        SYMLINK_FOLLOW_POLICY.get().is_none_or(|policy| policy(loc))
+    }
+
     /// Returns whether an absolute path resolves to this context's root entry.
     pub fn path_refers_to_root(&self, path: impl AsRef<Path>) -> bool {
         let path = path.as_ref();
@@ -106,6 +111,9 @@ impl FsContext {
     ) -> VfsResult<Location> {
         if loc.node_type() != NodeType::Symlink {
             return Ok(loc);
+        }
+        if !Self::may_follow_symlink(&loc) {
+            return Err(VfsError::FilesystemLoop);
         }
         if *follow_count >= SYMLINKS_MAX {
             return Err(VfsError::FilesystemLoop);
@@ -333,6 +341,14 @@ impl FsContext {
     pub fn canonicalize(&self, path: impl AsRef<Path>) -> VfsResult<PathBuf> {
         self.resolve(path.as_ref())?.absolute_path()
     }
+}
+
+/// Installs an optional symlink-follow policy used by path resolution.
+///
+/// The policy is evaluated only when the resolver is about to follow a
+/// symlink. Returning `false` turns that lookup into `ELOOP`.
+pub fn set_symlink_follow_policy(policy: fn(&Location) -> bool) {
+    SYMLINK_FOLLOW_POLICY.call_once(|| policy);
 }
 
 /// Iterator returned by [`FsContext::read_dir`].

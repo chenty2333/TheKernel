@@ -210,7 +210,12 @@ fn statfs(loc: &Location) -> AxResult<statfs> {
     };
     result.f_namelen = stat.name_length as _;
     result.f_frsize = stat.fragment_size as _;
-    result.f_flags = stat.mount_flags as _;
+    result.f_flags = crate::mounts::statfs_mount_flags(
+        loc.absolute_path()
+            .map_err(|_| AxError::InvalidInput)?
+            .as_ref(),
+        stat.mount_flags,
+    ) as _;
     Ok(result)
 }
 

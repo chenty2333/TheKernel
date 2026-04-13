@@ -1,4 +1,8 @@
-use alloc::{collections::BTreeSet, sync::Arc, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    vec::Vec,
+};
 use core::{fmt, ops::DerefMut};
 
 use axerrno::{AxError, AxResult, ax_bail};
@@ -29,6 +33,7 @@ pub struct AddrSpace {
     va_range: VirtAddrRange,
     areas: MemorySet<Backend>,
     growdown_starts: BTreeSet<VirtAddr>,
+    wipe_on_fork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     pt: PageTable,
 }
 
@@ -76,6 +81,7 @@ impl AddrSpace {
             va_range: VirtAddrRange::from_start_size(base, size),
             areas: MemorySet::new(),
             growdown_starts: BTreeSet::new(),
+            wipe_on_fork_ranges: BTreeMap::new(),
             pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,
         })
     }
@@ -103,6 +109,60 @@ impl AddrSpace {
         if self.growdown_starts.remove(&old_start) {
             self.growdown_starts.insert(new_start);
         }
+    }
+
+    fn insert_wipe_on_fork_range(&mut self, start: VirtAddr, end: VirtAddr) {
+        if start >= end {
+            return;
+        }
+
+        let mut new_start = start;
+        let mut new_end = end;
+        let overlaps: Vec<_> = self
+            .wipe_on_fork_ranges
+            .range(..=end)
+            .filter_map(|(&range_start, &range_end)| {
+                (range_end >= start && range_start <= end).then_some((range_start, range_end))
+            })
+            .collect();
+        for (range_start, range_end) in overlaps {
+            self.wipe_on_fork_ranges.remove(&range_start);
+            new_start = new_start.min(range_start);
+            new_end = new_end.max(range_end);
+        }
+        self.wipe_on_fork_ranges.insert(new_start, new_end);
+    }
+
+    fn clear_wipe_on_fork_range(&mut self, start: VirtAddr, size: usize) {
+        if size == 0 {
+            return;
+        }
+        let end = start + size;
+        let overlaps: Vec<_> = self
+            .wipe_on_fork_ranges
+            .range(..end)
+            .filter_map(|(&range_start, &range_end)| {
+                (range_end > start).then_some((range_start, range_end))
+            })
+            .collect();
+        for (range_start, range_end) in overlaps {
+            self.wipe_on_fork_ranges.remove(&range_start);
+            if range_start < start {
+                self.wipe_on_fork_ranges.insert(range_start, start);
+            }
+            if range_end > end {
+                self.wipe_on_fork_ranges.insert(end, range_end);
+            }
+        }
+    }
+
+    pub fn set_wipe_on_fork(&mut self, start: VirtAddr, size: usize, enabled: bool) -> AxResult {
+        self.validate_region(start, size)?;
+        self.clear_wipe_on_fork_range(start, size);
+        if enabled {
+            self.insert_wipe_on_fork_range(start, start + size);
+        }
+        Ok(())
     }
 
     fn validate_region(&self, start: VirtAddr, size: usize) -> AxResult {
@@ -250,6 +310,7 @@ impl AddrSpace {
 
         self.areas.unmap(start, size, &mut self.pt)?;
         self.refresh_growdown_starts();
+        self.clear_wipe_on_fork_range(start, size);
         Ok(())
     }
 
@@ -331,6 +392,7 @@ impl AddrSpace {
             warn!("AddrSpace::clear: failed to unmap all areas: {err:?}");
         }
         self.growdown_starts.clear();
+        self.wipe_on_fork_ranges.clear();
     }
 
     fn try_handle_growdown_fault(
@@ -514,23 +576,93 @@ impl AddrSpace {
 
         let mut guard = new_aspace.lock();
         guard.growdown_starts = self.growdown_starts.clone();
+        guard.wipe_on_fork_ranges = self.wipe_on_fork_ranges.clone();
 
+        let wipe_on_fork_ranges = self.wipe_on_fork_ranges.clone();
         let mut self_modify = self.pt.cursor();
         for area in self.areas.iter() {
-            let new_backend = {
-                let mut new_modify = guard.pt.cursor_no_flush();
-                area.backend().clone_map(
-                    area.va_range(),
-                    area.flags(),
-                    &mut self_modify,
-                    &mut new_modify,
-                    &new_aspace_clone,
-                )?
-            };
+            let wipe_segments: Vec<_> = wipe_on_fork_ranges
+                .range(..area.end())
+                .filter_map(|(&start, &end)| {
+                    if end <= area.start() {
+                        return None;
+                    }
+                    let seg_start = start.max(area.start());
+                    let seg_end = end.min(area.end());
+                    (seg_start < seg_end).then_some(VirtAddrRange::new(seg_start, seg_end))
+                })
+                .collect();
+            if wipe_segments.is_empty() {
+                let new_backend = {
+                    let mut new_modify = guard.pt.cursor_no_flush();
+                    area.backend().clone_map(
+                        area.va_range(),
+                        area.flags(),
+                        &mut self_modify,
+                        &mut new_modify,
+                        &new_aspace_clone,
+                    )?
+                };
 
-            let new_area = MemoryArea::new(area.start(), area.size(), area.flags(), new_backend);
-            let aspace = guard.deref_mut();
-            aspace.areas.map(new_area, &mut aspace.pt, false)?;
+                let new_area = MemoryArea::new(area.start(), area.size(), area.flags(), new_backend);
+                let aspace = guard.deref_mut();
+                aspace.areas.map(new_area, &mut aspace.pt, false)?;
+                continue;
+            }
+
+            let page_size = area.backend().page_size();
+            let mut cursor = area.start();
+            for wipe_range in wipe_segments {
+                if cursor < wipe_range.start {
+                    let segment_size = wipe_range.start.sub_addr(cursor);
+                    let new_backend = {
+                        let mut new_modify = guard.pt.cursor_no_flush();
+                        area.backend().clone_map(
+                            VirtAddrRange::from_start_size(cursor, segment_size),
+                            area.flags(),
+                            &mut self_modify,
+                            &mut new_modify,
+                            &new_aspace_clone,
+                        )?
+                    };
+                    let new_backend =
+                        new_backend.relocate(area.start(), cursor, &new_aspace_clone)?;
+                    let new_area =
+                        MemoryArea::new(cursor, segment_size, area.flags(), new_backend);
+                    let aspace = guard.deref_mut();
+                    aspace.areas.map(new_area, &mut aspace.pt, false)?;
+                }
+
+                let wipe_size = wipe_range.size();
+                debug_assert!(page_size.is_aligned(wipe_size));
+                let new_area = MemoryArea::new(
+                    wipe_range.start,
+                    wipe_size,
+                    area.flags(),
+                    Backend::new_alloc(wipe_range.start, page_size),
+                );
+                let aspace = guard.deref_mut();
+                aspace.areas.map(new_area, &mut aspace.pt, false)?;
+                cursor = wipe_range.end;
+            }
+
+            if cursor < area.end() {
+                let segment_size = area.end().sub_addr(cursor);
+                let new_backend = {
+                    let mut new_modify = guard.pt.cursor_no_flush();
+                    area.backend().clone_map(
+                        VirtAddrRange::from_start_size(cursor, segment_size),
+                        area.flags(),
+                        &mut self_modify,
+                        &mut new_modify,
+                        &new_aspace_clone,
+                    )?
+                };
+                let new_backend = new_backend.relocate(area.start(), cursor, &new_aspace_clone)?;
+                let new_area = MemoryArea::new(cursor, segment_size, area.flags(), new_backend);
+                let aspace = guard.deref_mut();
+                aspace.areas.map(new_area, &mut aspace.pt, false)?;
+            }
         }
         drop(guard);
 

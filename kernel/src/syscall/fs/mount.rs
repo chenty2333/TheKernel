@@ -26,6 +26,7 @@ const FSOPEN_CLOEXEC: u32 = 0x00000001;
 const FSCONFIG_SET_STRING: u32 = 1;
 const FSCONFIG_CMD_CREATE: u32 = 6;
 const FSMOUNT_CLOEXEC: u32 = 0x00000001;
+const MS_REMOUNT: u32 = 0x20;
 const MOVE_MOUNT_F_EMPTY_PATH: u32 = 0x00000004;
 const MOVE_MOUNT__MASK: u32 = 0x00000077;
 
@@ -211,6 +212,20 @@ pub fn sys_mount(
     let fs_type = vm_load_string(fs_type)?;
     debug!("sys_mount <= source: {source:?}, target: {target:?}, fs_type: {fs_type:?}");
 
+    let target = FS_CONTEXT.lock().resolve(&target)?;
+    let target_path = target
+        .absolute_path()
+        .map_err(|_| AxError::InvalidInput)?
+        .to_string();
+
+    if flags as u32 & MS_REMOUNT != 0 {
+        if !target.is_root_of_mount() && !target.is_root() {
+            return Err(AxError::InvalidInput);
+        }
+        mounts::record(source, target_path, fs_type, flags as u32);
+        return Ok(0);
+    }
+
     let normalized_fs = if fs_type.starts_with("vfat") {
         "vfat"
     } else {
@@ -247,12 +262,7 @@ pub fn sys_mount(
         return Err(AxError::NoSuchDevice);
     };
 
-    let target = FS_CONTEXT.lock().resolve(target)?;
     target.mount(&fs)?;
-    let target_path = target
-        .absolute_path()
-        .map_err(|_| AxError::InvalidInput)?
-        .to_string();
     mounts::record(source, target_path, normalized_fs.to_string(), flags as u32);
 
     Ok(0)
