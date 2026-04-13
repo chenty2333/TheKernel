@@ -169,6 +169,13 @@ impl UnixSocket {
             Transport::Dgram(dgram) => dgram.set_filter(filter),
         }
     }
+
+    pub fn is_connected(&self) -> bool {
+        match &self.transport {
+            Transport::Stream(stream) => stream.is_connected(),
+            Transport::Dgram(dgram) => dgram.is_connected(),
+        }
+    }
 }
 impl Configurable for UnixSocket {
     fn get_option_inner(&self, opt: &mut GetSocketOption) -> AxResult<bool> {

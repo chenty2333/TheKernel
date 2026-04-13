@@ -35,7 +35,7 @@ use crate::{
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
         SimpleFileOperation, SimpleFs, SimpleFsNode,
     },
-    syscall::proc_version_string,
+    syscall::{current_domainname_string, proc_version_string, set_domainname_bytes},
     task::{AsThread, get_task, get_visible_task, render_task_stat, tasks},
 };
 
@@ -697,6 +697,28 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         sys.add("kernel", {
             let mut kernel = DirMapping::new();
 
+            kernel.add(
+                "domainname",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            format!("{}\n", current_domainname_string()).into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let len = data
+                                .iter()
+                                .position(|&b| b == b'\n' || b == 0)
+                                .unwrap_or(data.len());
+                            set_domainname_bytes(&data[..len]);
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
             kernel.add(
                 "pid_max",
                 SimpleFile::new_regular(fs.clone(), || Ok(alloc::format!("{PROC_PID_MAX}\n"))),

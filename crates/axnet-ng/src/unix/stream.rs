@@ -16,15 +16,16 @@ use ringbuf::{
 
 use crate::{
     RecvOptions, SendOptions, Shutdown,
+    consts::TCP_TX_BUF_LEN,
     general::GeneralOptions,
     options::{Configurable, GetSocketOption, SetSocketOption, UnixCredentials},
     socket::SocketFilter,
     unix::{Transport, TransportOps, UnixSocketAddr},
 };
 
-// Keep the upfront footprint small: process-heavy workloads such as hackbench
-// create many socketpairs before any payload is exchanged.
-const BUF_SIZE: usize = 4 * 1024;
+// Match the default socket send buffer so large splice/socketpair transfers do
+// not deadlock behind an unrealistically tiny in-kernel Unix stream queue.
+const BUF_SIZE: usize = TCP_TX_BUF_LEN;
 
 fn new_uni_channel() -> (HeapProd<u8>, HeapCons<u8>) {
     let rb = HeapRb::new(BUF_SIZE);
@@ -117,6 +118,10 @@ impl StreamTransport {
 
     pub fn set_filter(&self, _filter: Option<Arc<dyn SocketFilter>>) -> AxResult<()> {
         Ok(())
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.channel.lock().is_some()
     }
 
     /// Create a connected pair of stream transports.

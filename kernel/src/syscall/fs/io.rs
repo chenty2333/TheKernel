@@ -11,10 +11,10 @@ use syscalls::Sysno;
 
 use crate::{
     file::{
-        Directory, File, FileHandle, FileLike, FileLikeKind, Pipe, get_file_like, get_typed_file,
+        Directory, File, FileHandle, FileLike, FileLikeKind, Pipe, Socket, get_file_like,
+        get_typed_file,
         inotify::{notify_read, notify_write},
-        lease,
-        memfd,
+        lease, memfd,
     },
     mm::{IoVec, IoVectorBuf, UserConstPtr, VmBytes, VmBytesMut},
     pseudofs::tmp,
@@ -589,6 +589,68 @@ fn do_send(mut src: SendFile, mut dst: SendFile, len: usize) -> AxResult<usize> 
     Ok(total_written)
 }
 
+fn validate_sendfile_source(fd: c_int) -> AxResult<()> {
+    let file = positioned_file(fd, FileFlags::READ)?;
+    file.inner().access(FileFlags::READ)?;
+    Ok(())
+}
+
+fn validate_sendfile_destination(fd: c_int) -> AxResult<()> {
+    let file_like = get_file_like(fd)?;
+    if let Some(file) = file_like.downcast_ref::<File>() {
+        file.inner().access(FileFlags::WRITE)?;
+    } else if matches!(
+        FileLikeKind::from_file_like(file_like.as_ref()),
+        FileLikeKind::Directory
+    ) {
+        return Err(AxError::IsADirectory);
+    }
+    Ok(())
+}
+
+fn validate_splice_endpoint(fd: c_int, input: bool) -> AxResult<()> {
+    let file_like = get_file_like(fd)?;
+
+    if let Some(pipe) = file_like.downcast_ref::<Pipe>() {
+        return if input {
+            if pipe.is_read() {
+                Ok(())
+            } else {
+                Err(AxError::BadFileDescriptor)
+            }
+        } else if pipe.is_write() {
+            Ok(())
+        } else {
+            Err(AxError::BadFileDescriptor)
+        };
+    }
+
+    if let Some(socket) = file_like.downcast_ref::<Socket>() {
+        if matches!(&socket.0, axnet::Socket::Unix(unix) if !unix.is_connected()) {
+            return Err(AxError::InvalidInput);
+        }
+        return Ok(());
+    }
+
+    if let Some(file) = file_like.downcast_ref::<File>() {
+        if input {
+            file.inner().access(FileFlags::READ)?;
+        } else {
+            if file.inner().access(FileFlags::APPEND).is_ok() {
+                return Err(AxError::InvalidInput);
+            }
+            file.inner().access(FileFlags::WRITE)?;
+        }
+        return Ok(());
+    }
+
+    if file_like.downcast_ref::<Directory>().is_some() {
+        return Err(AxError::InvalidInput);
+    }
+
+    Err(AxError::InvalidInput)
+}
+
 pub fn sys_sendfile(out_fd: c_int, in_fd: c_int, offset: *mut u64, len: usize) -> AxResult<isize> {
     debug!(
         "sys_sendfile <= out_fd: {}, in_fd: {}, offset: {}, len: {}",
@@ -597,6 +659,9 @@ pub fn sys_sendfile(out_fd: c_int, in_fd: c_int, offset: *mut u64, len: usize) -
         !offset.is_null(),
         len
     );
+
+    validate_sendfile_source(in_fd)?;
+    validate_sendfile_destination(out_fd)?;
 
     let src = if !offset.is_null() {
         if offset.vm_read()? > u32::MAX as u64 {
@@ -669,7 +734,16 @@ pub fn sys_splice(
 
     let mut has_pipe = false;
 
+    validate_splice_endpoint(fd_in, true)?;
+    validate_splice_endpoint(fd_out, false)?;
+
     let src = if !off_in.is_null() {
+        if let Ok(pipe) = Pipe::from_fd(fd_in) {
+            if !pipe.is_read() {
+                return Err(AxError::BadFileDescriptor);
+            }
+            return Err(AxError::from(LinuxError::ESPIPE));
+        }
         if off_in.vm_read()? < 0 {
             return Err(AxError::InvalidInput);
         }
@@ -690,6 +764,12 @@ pub fn sys_splice(
     };
 
     let dst = if !off_out.is_null() {
+        if let Ok(pipe) = Pipe::from_fd(fd_out) {
+            if !pipe.is_write() {
+                return Err(AxError::BadFileDescriptor);
+            }
+            return Err(AxError::from(LinuxError::ESPIPE));
+        }
         if off_out.vm_read()? < 0 {
             return Err(AxError::InvalidInput);
         }
@@ -706,9 +786,7 @@ pub fn sys_splice(
         {
             return Err(AxError::InvalidInput);
         }
-        let f = get_file_like(fd_out)?;
-        f.write(&mut b"".as_slice())?;
-        SendFile::Direct(f)
+        SendFile::Direct(get_file_like(fd_out)?)
     };
 
     if !has_pipe {

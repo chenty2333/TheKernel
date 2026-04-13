@@ -218,11 +218,21 @@ pub(crate) fn proc_version_string() -> String {
     format!("{sysname} version {release} ({machine}) {version}\n")
 }
 
-fn cstr_field_to_string(field: &[c_char; 65]) -> String {
-    let len = field
+pub(crate) fn current_domainname_string() -> String {
+    let state = UTS_STATE.lock();
+    state.domainname[..state.domainname_len]
         .iter()
-        .position(|&ch| ch == 0)
-        .unwrap_or(field.len());
+        .copied()
+        .map(char::from)
+        .collect()
+}
+
+pub(crate) fn set_domainname_bytes(domainname: &[u8]) {
+    UTS_STATE.lock().set_domainname(domainname);
+}
+
+fn cstr_field_to_string(field: &[c_char; 65]) -> String {
+    let len = field.iter().position(|&ch| ch == 0).unwrap_or(field.len());
     field[..len]
         .iter()
         .map(|&ch| ch as u8)
@@ -267,7 +277,7 @@ pub fn sys_setdomainname(name: *const u8, len: usize) -> AxResult<isize> {
         return Err(AxError::OperationNotPermitted);
     }
     let domainname = vm_load(name, len)?;
-    UTS_STATE.lock().set_domainname(&domainname);
+    set_domainname_bytes(&domainname);
     Ok(0)
 }
 

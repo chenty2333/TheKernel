@@ -59,12 +59,7 @@ impl Channel {
             }
             if self
                 .queued_bytes
-                .compare_exchange(
-                    queued,
-                    queued + charge,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange(queued, queued + charge, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 break;
@@ -107,7 +102,13 @@ impl Bind {
 
 /// Datagram transport for Unix domain sockets.
 pub struct DgramTransport {
-    data_rx: Mutex<Option<(async_channel::Receiver<Packet>, Arc<PollSet>, Arc<AtomicUsize>)>>,
+    data_rx: Mutex<
+        Option<(
+            async_channel::Receiver<Packet>,
+            Arc<PollSet>,
+            Arc<AtomicUsize>,
+        )>,
+    >,
     connected: RwLock<Option<Channel>>,
     local_addr: RwLock<UnixSocketAddr>,
     poll_state: Arc<PollSet>,
@@ -195,6 +196,10 @@ impl DgramTransport {
     pub fn set_filter(&self, filter: Option<Arc<dyn SocketFilter>>) -> AxResult<()> {
         *self.filter.write() = filter;
         Ok(())
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.connected.read().is_some()
     }
 }
 
@@ -376,7 +381,7 @@ impl TransportOps for DgramTransport {
 impl Pollable for DgramTransport {
     fn poll(&self) -> IoEvents {
         let mut events = IoEvents::empty();
-        if let Some((rx, _, _)) = self.data_rx.lock().as_ref() {
+        if let Some((rx, ..)) = self.data_rx.lock().as_ref() {
             events.set(IoEvents::IN, !rx.is_empty());
         }
         events.set(
