@@ -177,8 +177,8 @@ pub(crate) fn check_current_execute_permissions(loc: &Location) -> AxResult {
     let proc_data = &thr.proc_data;
     check_execute_permissions(
         loc,
-        proc_data.euid(),
-        proc_data.egid(),
+        proc_data.fsuid(),
+        proc_data.fsgid(),
         &proc_data.supplementary_groups(),
     )
 }

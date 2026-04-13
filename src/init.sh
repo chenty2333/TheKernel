@@ -363,6 +363,66 @@ fi'
     fi
 }
 
+install_userdel_tool() {
+    [ -x /usr/sbin/userdel ] && return 0
+    ensure_executable_script /usr/sbin/userdel '#!/bin/sh
+set -e
+
+remove_home=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -r)
+            remove_home=1
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "userdel: unsupported option $1" >&2
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+name="$1"
+[ -n "$name" ] || {
+    echo "userdel: missing username" >&2
+    exit 1
+}
+
+entry="$(grep "^${name}:" /etc/passwd 2>/dev/null | tail -n 1 || true)"
+[ -n "$entry" ] || exit 0
+
+home="$(printf "%s\n" "$entry" | awk -F: "{ print \$6 }")"
+tmp_passwd="/tmp/passwd.$$"
+tmp_group="/tmp/group.$$"
+
+if [ -f /etc/passwd ]; then
+    grep -v "^${name}:" /etc/passwd > "$tmp_passwd" || true
+    cat "$tmp_passwd" > /etc/passwd
+    rm -f "$tmp_passwd"
+fi
+
+if [ -f /etc/group ]; then
+    grep -v "^${name}:" /etc/group > "$tmp_group" || true
+    cat "$tmp_group" > /etc/group
+    rm -f "$tmp_group"
+fi
+
+if [ "$remove_home" -eq 1 ] && [ -n "$home" ] && [ "$home" != "/" ]; then
+    bb rm -rf "$home" 2>/dev/null || true
+fi'
+    if [ ! -e /usr/bin/userdel ]; then
+        bb ln -sf /usr/sbin/userdel /usr/bin/userdel 2>/dev/null || true
+    fi
+}
+
 mount_support_disk() {
     support_arch_dir=""
     case "$(bb uname -m 2>/dev/null || true)" in
@@ -507,6 +567,7 @@ run_pre2025_init_sequence() {
     install_systemd_detect_virt_tool
     install_musl_loader_paths
     install_useradd_tool
+    install_userdel_tool
     mount_support_disk
 }
 

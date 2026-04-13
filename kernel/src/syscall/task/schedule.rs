@@ -10,10 +10,10 @@ use axtask::{
     sched_state, set_sched_state, set_task_affinity,
 };
 use linux_raw_sys::general::{
-    __kernel_clockid_t, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
-    CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, SCHED_BATCH, SCHED_DEADLINE,
-    SCHED_FIFO, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE, SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR,
-    TIMER_ABSTIME, timespec,
+    __kernel_clockid_t, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC,
+    CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP, PRIO_PROCESS,
+    PRIO_USER, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE,
+    SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
 };
 use starry_process::Pid;
 use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
@@ -69,6 +69,31 @@ fn sched_class_from_policy(policy: i32) -> AxResult<SchedClass> {
         SCHED_RR => Ok(SchedClass::RoundRobin),
         SCHED_DEADLINE => Err(AxError::InvalidInput),
         _ => Err(AxError::InvalidInput),
+    }
+}
+
+fn has_sched_admin_capability() -> bool {
+    current()
+        .as_thread()
+        .proc_data
+        .has_effective_capability(CAP_SYS_NICE)
+}
+
+fn can_manage_sched_target(task: &AxTaskRef) -> AxResult<()> {
+    if has_sched_admin_capability() {
+        return Ok(());
+    }
+
+    let actor = current();
+    let actor_thread = actor.as_thread();
+    let actor_euid = actor_thread.proc_data.euid();
+    let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+    let target_proc = &target_thread.proc_data;
+
+    if actor_euid == target_proc.uid() || actor_euid == target_proc.euid() {
+        Ok(())
+    } else {
+        Err(AxError::OperationNotPermitted)
     }
 }
 
@@ -151,10 +176,14 @@ fn apply_sched_state(task: &AxTaskRef, state: SchedState) -> AxResult<isize> {
 fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult<isize> {
     let reset_on_fork = policy & SCHED_RESET_ON_FORK as i32 != 0;
     let class = sched_class_from_policy(policy & !(SCHED_RESET_ON_FORK as i32))?;
+    can_manage_sched_target(task)?;
     let mut state = sched_state(task);
     state.class = class;
     match class {
         SchedClass::Fifo | SchedClass::RoundRobin => {
+            if !has_sched_admin_capability() {
+                return Err(AxError::OperationNotPermitted);
+            }
             state.rt_priority = validate_rt_priority(priority)?;
             state.nice = 0;
         }
@@ -170,9 +199,13 @@ fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult
 }
 
 fn update_sched_param(task: &AxTaskRef, priority: i32) -> AxResult<isize> {
+    can_manage_sched_target(task)?;
     let mut state = sched_state(task);
     match state.class {
         SchedClass::Fifo | SchedClass::RoundRobin => {
+            if !has_sched_admin_capability() {
+                return Err(AxError::OperationNotPermitted);
+            }
             state.rt_priority = validate_rt_priority(priority)?;
         }
         SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
@@ -186,7 +219,7 @@ fn update_sched_param(task: &AxTaskRef, priority: i32) -> AxResult<isize> {
 fn linux_priority_bounds(policy: i32) -> AxResult<(isize, isize)> {
     match policy as u32 {
         SCHED_FIFO | SCHED_RR => Ok((RT_PRIORITY_MIN as isize, RT_PRIORITY_MAX as isize)),
-        SCHED_NORMAL | SCHED_BATCH | SCHED_IDLE => Ok((0, 0)),
+        SCHED_NORMAL | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => Ok((0, 0)),
         _ => Err(AxError::InvalidInput),
     }
 }
@@ -359,6 +392,7 @@ pub fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, user_mask: *const u8) 
         }
     } else {
         let task = sched_target(pid)?;
+        can_manage_sched_target(&task)?;
         if !set_task_affinity(&task, cpu_mask) {
             return Err(AxError::InvalidInput);
         }
@@ -373,18 +407,27 @@ pub fn sys_sched_getscheduler(pid: i32) -> AxResult<isize> {
 }
 
 pub fn sys_sched_setparam(pid: i32, param: *const SchedParam) -> AxResult<isize> {
+    if param.is_null() {
+        return Err(AxError::InvalidInput);
+    }
     let priority = unsafe { param.vm_read_uninit()?.assume_init() }.sched_priority;
     let task = sched_target(pid)?;
     update_sched_param(&task, priority)
 }
 
 pub fn sys_sched_setscheduler(pid: i32, policy: i32, param: *const SchedParam) -> AxResult<isize> {
+    if param.is_null() {
+        return Err(AxError::InvalidInput);
+    }
     let priority = unsafe { param.vm_read_uninit()?.assume_init() }.sched_priority;
     let task = sched_target(pid)?;
     update_sched_policy(&task, policy, priority)
 }
 
 pub fn sys_sched_getparam(pid: i32, param: *mut SchedParam) -> AxResult<isize> {
+    if param.is_null() {
+        return Err(AxError::InvalidInput);
+    }
     let task = sched_target(pid)?;
     param.vm_write(SchedParam {
         sched_priority: state_static_priority(sched_state(&task)),

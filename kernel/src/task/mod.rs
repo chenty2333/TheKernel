@@ -344,9 +344,11 @@ pub(crate) struct Credentials {
     ruid: u32,
     euid: u32,
     suid: u32,
+    fsuid: u32,
     rgid: u32,
     egid: u32,
     sgid: u32,
+    fsgid: u32,
 }
 
 const CAPABILITY_WORDS: usize = 2;
@@ -629,12 +631,24 @@ impl ProcessData {
         self.creds.lock().suid
     }
 
+    pub fn fsuid(&self) -> u32 {
+        self.creds.lock().fsuid
+    }
+
     pub fn sgid(&self) -> u32 {
         self.creds.lock().sgid
     }
 
+    pub fn fsgid(&self) -> u32 {
+        self.creds.lock().fsgid
+    }
+
     pub fn is_in_group(&self, gid: u32) -> bool {
         self.egid() == gid || self.supplementary_groups.lock().contains(&gid)
+    }
+
+    pub fn is_in_fs_group(&self, gid: u32) -> bool {
+        self.fsgid() == gid || self.supplementary_groups.lock().contains(&gid)
     }
 
     pub fn has_effective_capability(&self, cap: u32) -> bool {
@@ -679,12 +693,14 @@ impl ProcessData {
     }
 
     pub fn setuid(&self, uid: u32) -> AxResult<()> {
+        let can_setuid = self.has_effective_capability(linux_raw_sys::general::CAP_SETUID);
         let mut creds = self.creds.lock();
         let old_euid = creds.euid;
-        if creds.euid == 0 {
+        if can_setuid {
             creds.ruid = uid;
             creds.euid = uid;
             creds.suid = uid;
+            creds.fsuid = uid;
             let new_euid = creds.euid;
             drop(creds);
             self.fixup_capabilities_for_euid_change(old_euid, new_euid);
@@ -692,6 +708,7 @@ impl ProcessData {
         }
         if uid == creds.ruid || uid == creds.suid {
             creds.euid = uid;
+            creds.fsuid = uid;
             let new_euid = creds.euid;
             drop(creds);
             self.fixup_capabilities_for_euid_change(old_euid, new_euid);
@@ -701,24 +718,28 @@ impl ProcessData {
     }
 
     pub fn setgid(&self, gid: u32) -> AxResult<()> {
+        let can_setgid = self.has_effective_capability(linux_raw_sys::general::CAP_SETGID);
         let mut creds = self.creds.lock();
-        if creds.egid == 0 {
+        if can_setgid {
             creds.rgid = gid;
             creds.egid = gid;
             creds.sgid = gid;
+            creds.fsgid = gid;
             return Ok(());
         }
         if gid == creds.rgid || gid == creds.sgid {
             creds.egid = gid;
+            creds.fsgid = gid;
             return Ok(());
         }
         Err(AxError::OperationNotPermitted)
     }
 
     pub fn setreuid(&self, ruid: Option<u32>, euid: Option<u32>) -> AxResult<()> {
+        let can_setuid = self.has_effective_capability(linux_raw_sys::general::CAP_SETUID);
         let mut creds = self.creds.lock();
         let old = *creds;
-        if old.euid != 0 {
+        if !can_setuid {
             for id in [ruid, euid].into_iter().flatten() {
                 if id != old.ruid && id != old.euid && id != old.suid {
                     return Err(AxError::OperationNotPermitted);
@@ -730,6 +751,7 @@ impl ProcessData {
         let new_euid = euid.unwrap_or(old.euid);
         creds.ruid = new_ruid;
         creds.euid = new_euid;
+        creds.fsuid = new_euid;
         if ruid.is_some() || euid.is_some_and(|id| id != old.ruid) {
             creds.suid = new_euid;
         }
@@ -739,9 +761,10 @@ impl ProcessData {
     }
 
     pub fn setregid(&self, rgid: Option<u32>, egid: Option<u32>) -> AxResult<()> {
+        let can_setgid = self.has_effective_capability(linux_raw_sys::general::CAP_SETGID);
         let mut creds = self.creds.lock();
         let old = *creds;
-        if old.egid != 0 {
+        if !can_setgid {
             for id in [rgid, egid].into_iter().flatten() {
                 if id != old.rgid && id != old.egid && id != old.sgid {
                     return Err(AxError::OperationNotPermitted);
@@ -753,6 +776,7 @@ impl ProcessData {
         let new_egid = egid.unwrap_or(old.egid);
         creds.rgid = new_rgid;
         creds.egid = new_egid;
+        creds.fsgid = new_egid;
         if rgid.is_some() || egid.is_some_and(|id| id != old.rgid) {
             creds.sgid = new_egid;
         }
@@ -765,9 +789,10 @@ impl ProcessData {
         euid: Option<u32>,
         suid: Option<u32>,
     ) -> AxResult<()> {
+        let can_setuid = self.has_effective_capability(linux_raw_sys::general::CAP_SETUID);
         let mut creds = self.creds.lock();
         let old = *creds;
-        if old.euid != 0 {
+        if !can_setuid {
             for id in [ruid, euid, suid].into_iter().flatten() {
                 if id != old.ruid && id != old.euid && id != old.suid {
                     return Err(AxError::OperationNotPermitted);
@@ -784,6 +809,7 @@ impl ProcessData {
         if let Some(id) = suid {
             creds.suid = id;
         }
+        creds.fsuid = creds.euid;
         let new_euid = creds.euid;
         drop(creds);
         self.fixup_capabilities_for_euid_change(old.euid, new_euid);
@@ -796,9 +822,10 @@ impl ProcessData {
         egid: Option<u32>,
         sgid: Option<u32>,
     ) -> AxResult<()> {
+        let can_setgid = self.has_effective_capability(linux_raw_sys::general::CAP_SETGID);
         let mut creds = self.creds.lock();
         let old = *creds;
-        if old.egid != 0 {
+        if !can_setgid {
             for id in [rgid, egid, sgid].into_iter().flatten() {
                 if id != old.rgid && id != old.egid && id != old.sgid {
                     return Err(AxError::OperationNotPermitted);
@@ -815,7 +842,44 @@ impl ProcessData {
         if let Some(id) = sgid {
             creds.sgid = id;
         }
+        creds.fsgid = creds.egid;
         Ok(())
+    }
+
+    pub fn setfsuid(&self, fsuid: u32) -> u32 {
+        let can_setuid = self.has_effective_capability(linux_raw_sys::general::CAP_SETUID);
+        let mut creds = self.creds.lock();
+        let old_fsuid = creds.fsuid;
+        if fsuid == u32::MAX {
+            return old_fsuid;
+        }
+        if can_setuid
+            || fsuid == creds.ruid
+            || fsuid == creds.euid
+            || fsuid == creds.suid
+            || fsuid == creds.fsuid
+        {
+            creds.fsuid = fsuid;
+        }
+        old_fsuid
+    }
+
+    pub fn setfsgid(&self, fsgid: u32) -> u32 {
+        let can_setgid = self.has_effective_capability(linux_raw_sys::general::CAP_SETGID);
+        let mut creds = self.creds.lock();
+        let old_fsgid = creds.fsgid;
+        if fsgid == u32::MAX {
+            return old_fsgid;
+        }
+        if can_setgid
+            || fsgid == creds.rgid
+            || fsgid == creds.egid
+            || fsgid == creds.sgid
+            || fsgid == creds.fsgid
+        {
+            creds.fsgid = fsgid;
+        }
+        old_fsgid
     }
 
     fn stop_state(&self) -> StopState {

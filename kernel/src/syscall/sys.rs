@@ -31,12 +31,42 @@ pub fn sys_geteuid() -> AxResult<isize> {
     Ok(current().as_thread().proc_data.euid() as isize)
 }
 
+pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> AxResult<isize> {
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    if !ruid.is_null() {
+        ruid.vm_write(proc_data.uid())?;
+    }
+    if !euid.is_null() {
+        euid.vm_write(proc_data.euid())?;
+    }
+    if !suid.is_null() {
+        suid.vm_write(proc_data.suid())?;
+    }
+    Ok(0)
+}
+
 pub fn sys_getgid() -> AxResult<isize> {
     Ok(current().as_thread().proc_data.gid() as isize)
 }
 
 pub fn sys_getegid() -> AxResult<isize> {
     Ok(current().as_thread().proc_data.egid() as isize)
+}
+
+pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> AxResult<isize> {
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    if !rgid.is_null() {
+        rgid.vm_write(proc_data.gid())?;
+    }
+    if !egid.is_null() {
+        egid.vm_write(proc_data.egid())?;
+    }
+    if !sgid.is_null() {
+        sgid.vm_write(proc_data.sgid())?;
+    }
+    Ok(0)
 }
 
 pub fn sys_setuid(uid: u32) -> AxResult<isize> {
@@ -49,6 +79,14 @@ pub fn sys_setgid(gid: u32) -> AxResult<isize> {
     debug!("sys_setgid <= gid: {gid}");
     current().as_thread().proc_data.setgid(gid)?;
     Ok(0)
+}
+
+pub fn sys_setfsuid(fsuid: u32) -> AxResult<isize> {
+    Ok(current().as_thread().proc_data.setfsuid(fsuid) as isize)
+}
+
+pub fn sys_setfsgid(fsgid: u32) -> AxResult<isize> {
+    Ok(current().as_thread().proc_data.setfsgid(fsgid) as isize)
 }
 
 pub fn sys_getgroups(size: usize, list: *mut u32) -> AxResult<isize> {
@@ -69,7 +107,7 @@ pub fn sys_getgroups(size: usize, list: *mut u32) -> AxResult<isize> {
 pub fn sys_setgroups(size: usize, list: *const u32) -> AxResult<isize> {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    if proc_data.euid() != 0 {
+    if !proc_data.has_effective_capability(linux_raw_sys::general::CAP_SETGID) {
         return Err(AxError::OperationNotPermitted);
     }
     if size > NGROUPS_MAX as usize {

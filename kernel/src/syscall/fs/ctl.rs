@@ -111,8 +111,8 @@ pub fn sys_chdir(path: *const c_char) -> AxResult<isize> {
     }
     check_search_permissions(
         &entry,
-        proc_data.euid(),
-        proc_data.egid(),
+        proc_data.fsuid(),
+        proc_data.fsgid(),
         &supplementary_groups,
     )?;
     fs.set_current_dir(entry)?;
@@ -131,8 +131,8 @@ pub fn sys_fchdir(dirfd: i32) -> AxResult<isize> {
     }
     check_search_permissions(
         &entry,
-        proc_data.euid(),
-        proc_data.egid(),
+        proc_data.fsuid(),
+        proc_data.fsgid(),
         &supplementary_groups,
     )?;
     FS_CONTEXT.lock().set_current_dir(entry)?;
@@ -158,8 +158,8 @@ pub fn sys_chroot(path: *const c_char) -> AxResult<isize> {
     }
     check_search_permissions(
         &loc,
-        proc_data.euid(),
-        proc_data.egid(),
+        proc_data.fsuid(),
+        proc_data.fsgid(),
         &supplementary_groups,
     )?;
     if proc_data.euid() != 0 {
@@ -186,8 +186,8 @@ pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize
         let (parent, name) = fs.resolve_nonexistent(path_ref)?;
         check_create_permissions(
             &parent,
-            proc_data.euid(),
-            proc_data.egid(),
+            proc_data.fsuid(),
+            proc_data.fsgid(),
             &supplementary_groups,
         )?;
         Ok((parent, name.to_string()))
@@ -195,13 +195,13 @@ pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize
     let parent_meta = parent.metadata()?;
     let loc = parent.create(&name, NodeType::Directory, requested_mode)?;
     let mut final_mode = requested_mode;
-    let mut owner_gid = proc_data.egid();
+    let mut owner_gid = proc_data.fsgid();
     if parent_meta.mode.contains(NodePermission::SET_GID) {
         owner_gid = parent_meta.gid;
         final_mode.insert(NodePermission::SET_GID);
     }
     loc.update_metadata(MetadataUpdate {
-        owner: Some((proc_data.euid(), owner_gid)),
+        owner: Some((proc_data.fsuid(), owner_gid)),
         mode: Some(final_mode),
         ..Default::default()
     })?;
@@ -237,8 +237,8 @@ pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, _dev: u64) -> AxR
         let (parent, name) = fs.resolve_nonexistent(path_ref)?;
         check_create_permissions(
             &parent,
-            proc_data.euid(),
-            proc_data.egid(),
+            proc_data.fsuid(),
+            proc_data.fsgid(),
             &proc_data.supplementary_groups(),
         )?;
         Ok((parent, name.to_string()))
@@ -246,16 +246,16 @@ pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, _dev: u64) -> AxR
 
     let loc = parent.create(&name, node_type, requested_mode)?;
     let mut final_mode = requested_mode;
-    let mut owner_gid = proc_data.egid();
+    let mut owner_gid = proc_data.fsgid();
     let parent_meta = parent.metadata()?;
     if parent_meta.mode.contains(NodePermission::SET_GID) {
         owner_gid = parent_meta.gid;
     }
-    if proc_data.euid() != 0 && !proc_data.is_in_group(owner_gid) {
+    if proc_data.fsuid() != 0 && !proc_data.is_in_fs_group(owner_gid) {
         final_mode.remove(NodePermission::SET_GID);
     }
     loc.update_metadata(MetadataUpdate {
-        owner: Some((proc_data.euid(), owner_gid)),
+        owner: Some((proc_data.fsuid(), owner_gid)),
         mode: Some(final_mode),
         ..Default::default()
     })?;
@@ -382,8 +382,8 @@ pub fn sys_linkat(
     }
     check_search_permissions(
         &old,
-        proc_data.euid(),
-        proc_data.egid(),
+        proc_data.fsuid(),
+        proc_data.fsgid(),
         &supplementary_groups,
     )?;
     let (new_dir, new_name) = with_path_fs(new_dirfd, Path::new(&new_path), |fs| {
@@ -393,8 +393,8 @@ pub fn sys_linkat(
         let (new_dir, new_name) = fs.resolve_nonexistent(Path::new(&new_path))?;
         check_create_permissions(
             &new_dir,
-            proc_data.euid(),
-            proc_data.egid(),
+            proc_data.fsuid(),
+            proc_data.fsgid(),
             &supplementary_groups,
         )?;
         Ok((new_dir, new_name))
@@ -519,8 +519,8 @@ pub fn sys_readlinkat(
         let proc_data = &curr.as_thread().proc_data;
         check_parent_search_permissions(
             &entry,
-            proc_data.euid(),
-            proc_data.egid(),
+            proc_data.fsuid(),
+            proc_data.fsgid(),
             &proc_data.supplementary_groups(),
         )?;
         let link = entry.read_link()?;
@@ -606,11 +606,11 @@ pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> A
     let meta = loc.metadata()?;
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    if proc_data.euid() != 0 && proc_data.euid() != meta.uid {
+    if proc_data.fsuid() != 0 && proc_data.fsuid() != meta.uid {
         return Err(AxError::OperationNotPermitted);
     }
     let mut mode = NodePermission::from_bits_truncate(mode as u16);
-    if proc_data.euid() != 0 && !proc_data.is_in_group(meta.gid) {
+    if proc_data.fsuid() != 0 && !proc_data.is_in_fs_group(meta.gid) {
         mode.remove(NodePermission::SET_GID);
     }
     loc.update_metadata(MetadataUpdate {

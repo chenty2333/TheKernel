@@ -36,7 +36,6 @@ use crate::{
     pseudofs::{Device, dev::tty},
     syscall::{
         fs::ctl::validate_pathname,
-        sys::{sys_getegid, sys_geteuid},
     },
     task::{AX_FILE_LIMIT, AsThread},
 };
@@ -282,8 +281,8 @@ fn open_in_fs(
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let supplementary_groups = proc_data.supplementary_groups();
-    let uid = proc_data.euid();
-    let gid = proc_data.egid();
+    let uid = proc_data.fsuid();
+    let gid = proc_data.fsgid();
     let mode = mode & !current().as_thread().proc_data.umask();
     let created_parent = if (flags as u32) & O_CREAT != 0 {
         match fs.resolve_no_follow(path) {
@@ -349,7 +348,7 @@ fn open_in_fs(
     let options = flags_to_options(
         effective_flags,
         mode,
-        (sys_geteuid()? as _, sys_getegid()? as _),
+        (uid, gid),
     );
     let open_result = if let Some(loc) = existing_loc {
         options.open_loc(loc)
@@ -363,16 +362,16 @@ fn open_in_fs(
     if let Some(loc) = location_for_fd(fd as i32) {
         if let Some((parent, name)) = created_parent {
             let mut final_mode = NodePermission::from_bits_truncate(mode as u16);
-            let mut owner_gid = proc_data.egid();
+            let mut owner_gid = proc_data.fsgid();
             let parent_meta = parent.metadata()?;
             if parent_meta.mode.contains(NodePermission::SET_GID) {
                 owner_gid = parent_meta.gid;
             }
-            if proc_data.euid() != 0 && !proc_data.is_in_group(owner_gid) {
+            if proc_data.fsuid() != 0 && !proc_data.is_in_fs_group(owner_gid) {
                 final_mode.remove(NodePermission::SET_GID);
             }
             loc.update_metadata(MetadataUpdate {
-                owner: Some((proc_data.euid(), owner_gid)),
+                owner: Some((proc_data.fsuid(), owner_gid)),
                 mode: Some(final_mode),
                 ..Default::default()
             })?;
