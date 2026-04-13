@@ -10,6 +10,7 @@ pub mod io_uring;
 pub(crate) mod lease;
 pub(crate) mod memfd;
 mod net;
+pub(crate) mod packet;
 pub(crate) mod permission;
 mod pidfd;
 pub(crate) mod pipe;
@@ -43,6 +44,7 @@ pub use self::{
     af_alg::AfAlgSocket,
     fs::{Directory, File, ResolveAtResult, resolve_at, with_fs, with_path_fs},
     net::Socket,
+    packet::PacketSocket,
     pidfd::PidFd,
     pipe::Pipe,
 };

@@ -11,14 +11,14 @@ use axtask::current;
 use linux_raw_sys::{
     general::{O_CLOEXEC, O_NONBLOCK},
     net::{
-        AF_INET, AF_INET6, AF_UNIX, AF_VSOCK, IPPROTO_TCP, IPPROTO_UDP, SHUT_RD, SHUT_RDWR,
-        SHUT_WR, SOCK_DGRAM, SOCK_SEQPACKET, SOCK_STREAM, sockaddr, socklen_t,
+        AF_INET, AF_INET6, AF_PACKET, AF_UNIX, AF_VSOCK, IPPROTO_TCP, IPPROTO_UDP, SHUT_RD,
+        SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, sockaddr, socklen_t,
     },
 };
 
 use super::addr::SocketAddrExt;
 use crate::{
-    file::{AfAlgSocket, FileLike, Socket, af_alg},
+    file::{AfAlgSocket, FileLike, PacketSocket, Socket, af_alg},
     mm::{UserConstPtr, UserPtr},
     task::AsThread,
 };
@@ -41,13 +41,53 @@ fn require_bind_permissions(addr: &SocketAddrEx) -> AxResult<()> {
     Ok(())
 }
 
+fn validate_socket_type(ty: u32) -> AxResult<u32> {
+    match ty {
+        SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET | SOCK_RAW => Ok(ty),
+        _ => Err(AxError::InvalidInput),
+    }
+}
+
+fn inet_socketpair_error(ty: u32, proto: u32) -> AxError {
+    match ty {
+        SOCK_RAW => AxError::from(LinuxError::EPROTONOSUPPORT),
+        SOCK_DGRAM => {
+            if proto == 0 || proto == IPPROTO_UDP as _ {
+                AxError::from(LinuxError::EOPNOTSUPP)
+            } else {
+                AxError::from(LinuxError::EPROTONOSUPPORT)
+            }
+        }
+        SOCK_STREAM => {
+            if proto == 0 || proto == IPPROTO_TCP as _ {
+                AxError::from(LinuxError::EOPNOTSUPP)
+            } else {
+                AxError::from(LinuxError::EPROTONOSUPPORT)
+            }
+        }
+        _ => AxError::InvalidInput,
+    }
+}
+
 pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     debug!("sys_socket <= domain: {domain}, ty: {raw_ty}, proto: {proto}");
-    let ty = raw_ty & 0xFF;
+    let ty = validate_socket_type(raw_ty & 0xFF)?;
 
     if domain == af_alg::AF_ALG {
         AfAlgSocket::validate_socket_type(ty, proto)?;
         let socket = AfAlgSocket::new_listener();
+        if raw_ty & O_NONBLOCK != 0 {
+            socket.set_nonblocking(true)?;
+        }
+        let cloexec = raw_ty & O_CLOEXEC != 0;
+        return socket.add_to_fd_table(cloexec).map(|fd| fd as isize);
+    }
+
+    if domain == AF_PACKET {
+        if ty != SOCK_RAW {
+            return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
+        }
+        let socket = PacketSocket::new(u16::from_be(proto as u16));
         if raw_ty & O_NONBLOCK != 0 {
             socket.set_nonblocking(true)?;
         }
@@ -69,6 +109,9 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
                 return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
             }
             SocketInner::Udp(UdpSocket::new(net_ns))
+        }
+        (AF_INET | AF_INET6, SOCK_RAW) => {
+            return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
         }
         (AF_RDS, SOCK_SEQPACKET) => {
             if proto != 0 {
@@ -213,7 +256,11 @@ pub fn sys_socketpair(
     fds: UserPtr<[i32; 2]>,
 ) -> AxResult<isize> {
     debug!("sys_socketpair <= domain: {domain}, ty: {raw_ty}, proto: {proto}");
-    let ty = raw_ty & 0xFF;
+    let ty = validate_socket_type(raw_ty & 0xFF)?;
+
+    if matches!(domain, AF_INET | AF_INET6) {
+        return Err(inet_socketpair_error(ty, proto));
+    }
 
     if domain != AF_UNIX {
         return Err(AxError::from(LinuxError::EAFNOSUPPORT));
@@ -229,9 +276,12 @@ pub fn sys_socketpair(
             let (sock1, sock2) = DgramTransport::new_pair(pid);
             (UnixSocket::new(sock1), UnixSocket::new(sock2))
         }
+        SOCK_RAW => {
+            return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
+        }
         _ => {
             warn!("Unsupported socketpair type: {ty}");
-            return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
+            return Err(AxError::InvalidInput);
         }
     };
     let sock1 = Socket(SocketInner::Unix(sock1));

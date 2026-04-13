@@ -1,9 +1,14 @@
 use axerrno::{AxError, AxResult, LinuxError};
 use axnet::options::{Configurable, GetSocketOption, SetSocketOption};
-use linux_raw_sys::net::{SO_ATTACH_BPF, SO_DETACH_BPF, SO_OOBINLINE, SOL_SOCKET, socklen_t};
+use linux_raw_sys::net::{
+    SO_ATTACH_BPF, SO_DETACH_BPF, SO_OOBINLINE, SO_SNDBUFFORCE, SOL_SOCKET, socklen_t,
+};
 
 use crate::{
-    file::{AfAlgSocket, FileLike, Socket, af_alg},
+    file::{
+        AfAlgSocket, FileLike, PacketSocket, Socket, af_alg,
+        packet::{PACKET_RX_RING, PACKET_VERSION, SOL_PACKET, TpacketReq3},
+    },
     mm::{UserConstPtr, UserPtr},
 };
 
@@ -201,6 +206,25 @@ pub fn sys_setsockopt(
         return Ok(0);
     }
 
+    if let Ok(socket) = PacketSocket::from_fd(fd) {
+        if level != SOL_PACKET {
+            return Err(AxError::from(LinuxError::ENOPROTOOPT));
+        }
+
+        match optname {
+            PACKET_VERSION => {
+                let version = *get::<i32>(optval, optlen)?;
+                socket.set_packet_version(version)?;
+            }
+            PACKET_RX_RING => {
+                let req = *get::<TpacketReq3>(optval, optlen)?;
+                socket.set_rx_ring(req)?;
+            }
+            _ => return Err(AxError::from(LinuxError::ENOPROTOOPT)),
+        }
+        return Ok(0);
+    }
+
     let socket = Socket::from_fd(fd)?;
     if level == SOL_SOCKET && optname == SO_OOBINLINE {
         let _ = get::<i32>(optval, optlen)?;
@@ -215,6 +239,11 @@ pub fn sys_setsockopt(
     }
     if level == SOL_SOCKET {
         match optname {
+            SO_SNDBUFFORCE => {
+                let size = (*get::<u32>(optval, optlen)? as usize).min(i32::MAX as usize);
+                socket.set_option(SetSocketOption::SendBufferForce(&size))?;
+                return Ok(0);
+            }
             SO_ATTACH_BPF => {
                 let prog_fd = *get::<i32>(optval, optlen)?;
                 let prog_fd = crate::file::bpf::BpfProgFd::from_fd(prog_fd)?;

@@ -156,6 +156,11 @@ impl GeneralOptions {
 impl Configurable for GeneralOptions {
     fn get_option_inner(&self, option: &mut GetSocketOption) -> AxResult<bool> {
         use GetSocketOption as O;
+
+        fn clamp_sockbuf(size: usize) -> usize {
+            size.min(i32::MAX as usize)
+        }
+
         match option {
             O::Error(error) => {
                 // TODO(mivik): actual logic
@@ -174,10 +179,10 @@ impl Configurable for GeneralOptions {
                 **timeout = Duration::from_nanos(self.recv_timeout_nanos.load(Ordering::Relaxed));
             }
             O::SendBuffer(size) => {
-                **size = self.send_buffer.load(Ordering::Relaxed);
+                **size = clamp_sockbuf(self.send_buffer.load(Ordering::Relaxed));
             }
             O::ReceiveBuffer(size) => {
-                **size = self.recv_buffer.load(Ordering::Relaxed);
+                **size = clamp_sockbuf(self.recv_buffer.load(Ordering::Relaxed));
             }
             _ => return Ok(false),
         }
@@ -186,6 +191,10 @@ impl Configurable for GeneralOptions {
 
     fn set_option_inner(&self, option: SetSocketOption) -> AxResult<bool> {
         use SetSocketOption as O;
+
+        fn clamp_sockbuf(size: usize) -> usize {
+            size.min(i32::MAX as usize)
+        }
 
         match option {
             O::NonBlocking(nonblock) => {
@@ -202,11 +211,17 @@ impl Configurable for GeneralOptions {
                 self.recv_timeout_nanos
                     .store(timeout.as_nanos() as u64, Ordering::Relaxed);
             }
-            O::SendBuffer(size) | O::SendBufferForce(size) => {
-                self.send_buffer.store(*size, Ordering::Relaxed);
+            O::SendBuffer(size) => {
+                self.send_buffer
+                    .store(clamp_sockbuf(*size), Ordering::Relaxed);
+            }
+            O::SendBufferForce(size) => {
+                self.send_buffer
+                    .store(clamp_sockbuf(*size), Ordering::Relaxed);
             }
             O::ReceiveBuffer(size) => {
-                self.recv_buffer.store(*size, Ordering::Relaxed);
+                self.recv_buffer
+                    .store(clamp_sockbuf(*size), Ordering::Relaxed);
             }
             _ => return Ok(false),
         }
