@@ -249,6 +249,12 @@ impl TaskInner {
         self.interrupted.store(false, Ordering::Release);
     }
 
+    /// Returns whether the task has a pending interrupt wakeup.
+    #[inline]
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Acquire)
+    }
+
     /// Interrupts the task.
     #[inline]
     pub fn interrupt(&self) {

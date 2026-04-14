@@ -1,17 +1,24 @@
+use core::time::Duration;
+
 use axerrno::{AxError, AxResult};
-use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time, monotonic_time_nanos, nanos_to_ticks};
+use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time, monotonic_time_nanos};
 use axtask::current;
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::{
     __kernel_clockid_t, CAP_SYS_TIME, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC,
     CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
-    CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, itimerval,
-    timespec, timeval, timezone,
+    CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, SIGEV_NONE,
+    SIGEV_SIGNAL, SIGEV_THREAD_ID, TIMER_ABSTIME, itimerval, itimerspec, sigevent, timespec,
+    timeval, timezone,
 };
+use starry_signal::Signo;
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
-    task::{AsThread, ITimerType},
+    task::{
+        AlarmClock, AsThread, ITimerType, PosixTimer, PosixTimerClock, PosixTimerNotify,
+        nanos_to_clock_ticks, register_posix_timer_alarm,
+    },
     time::{TimeValueLike, set_wall_time, wall_time, wall_time_nanos},
 };
 
@@ -357,6 +364,264 @@ fn sys_do_clock_adjtime(
     Ok(state.time_state())
 }
 
+fn posix_timer_clock(clock_id: __kernel_clockid_t) -> AxResult<PosixTimerClock> {
+    match clock_domain(clock_id)? {
+        ClockDomain::Realtime | ClockDomain::RealtimeCoarse => Ok(PosixTimerClock::Realtime),
+        ClockDomain::Monotonic | ClockDomain::MonotonicCoarse => Ok(PosixTimerClock::Monotonic),
+        ClockDomain::ProcessCpu => Ok(PosixTimerClock::ProcessCpu),
+        ClockDomain::ThreadCpu => Ok(PosixTimerClock::ThreadCpu),
+        ClockDomain::Tai => Ok(PosixTimerClock::Tai),
+    }
+}
+
+fn duration_to_timespec(d: Duration) -> timespec {
+    timespec {
+        tv_sec: d.as_secs() as _,
+        tv_nsec: d.subsec_nanos() as _,
+    }
+}
+
+fn itimerspec_to_durations(its: &itimerspec) -> AxResult<(Duration, Duration)> {
+    let interval = its.it_interval.try_into_time_value()?;
+    let value = its.it_value.try_into_time_value()?;
+    Ok((
+        Duration::new(interval.as_secs(), interval.subsec_nanos()),
+        Duration::new(value.as_secs(), value.subsec_nanos()),
+    ))
+}
+
+fn duration_from_secs(secs: u64) -> Duration {
+    Duration::from_secs(secs)
+}
+
+fn saturating_add_duration(lhs: Duration, rhs: Duration) -> Duration {
+    lhs.checked_add(rhs).unwrap_or(Duration::MAX)
+}
+
+fn saturating_sub_duration(lhs: Duration, rhs: Duration) -> Duration {
+    lhs.checked_sub(rhs).unwrap_or(Duration::ZERO)
+}
+
+fn decode_timer_notify(event: Option<sigevent>) -> AxResult<PosixTimerNotify> {
+    let Some(event) = event else {
+        return Ok(PosixTimerNotify::Signal {
+            signo: Signo::SIGALRM,
+            target_tid: None,
+        });
+    };
+
+    match event.sigev_notify as u32 {
+        SIGEV_NONE => Ok(PosixTimerNotify::None),
+        SIGEV_SIGNAL => {
+            let signo = Signo::from_repr(event.sigev_signo as u8).ok_or(AxError::InvalidInput)?;
+            Ok(PosixTimerNotify::Signal {
+                signo,
+                target_tid: None,
+            })
+        }
+        SIGEV_THREAD_ID => {
+            let signo = Signo::from_repr(event.sigev_signo as u8).ok_or(AxError::InvalidInput)?;
+            let tid = unsafe { event._sigev_un._tid };
+            if tid <= 0 {
+                return Err(AxError::InvalidInput);
+            }
+            Ok(PosixTimerNotify::Signal {
+                signo,
+                target_tid: Some(tid as _),
+            })
+        }
+        _ => Err(AxError::InvalidInput),
+    }
+}
+
+fn timer_absolute_deadline(clock: PosixTimerClock, clock_id: __kernel_clockid_t, value: Duration) -> AxResult<Duration> {
+    Ok(match clock {
+        PosixTimerClock::Realtime => value,
+        PosixTimerClock::Tai => saturating_sub_duration(
+            value,
+            duration_from_secs(DEFAULT_TAI_OFFSET_SECS),
+        ),
+        PosixTimerClock::Monotonic => value,
+        PosixTimerClock::ProcessCpu | PosixTimerClock::ThreadCpu => {
+            let now_clock = clock_now(clock_id)?;
+            let delta = saturating_sub_duration(value, now_clock);
+            saturating_add_duration(AlarmClock::Monotonic.now(), delta)
+        }
+    })
+}
+
+fn timer_relative_deadline(clock: PosixTimerClock, value: Duration) -> Duration {
+    saturating_add_duration(clock.alarm_clock().now(), value)
+}
+
+fn timer_remaining(timer: &PosixTimer) -> Duration {
+    timer.deadline
+        .map(|deadline| saturating_sub_duration(deadline, timer.clock.alarm_clock().now()))
+        .unwrap_or(Duration::ZERO)
+}
+
+pub fn sys_timer_create(
+    clock_id: __kernel_clockid_t,
+    sigevent_ptr: *const sigevent,
+    timerid_ptr: *mut i32,
+) -> AxResult<isize> {
+    if timerid_ptr.is_null() {
+        return Err(AxError::BadAddress);
+    }
+
+    let clock = posix_timer_clock(clock_id)?;
+    let notify = if let Some(ptr) = sigevent_ptr.nullable() {
+        decode_timer_notify(Some(unsafe { ptr.vm_read_uninit()?.assume_init() }))?
+    } else {
+        decode_timer_notify(None)?
+    };
+
+    let proc_data = current().as_thread().proc_data.clone();
+    let timerid = {
+        let mut timers = proc_data.posix_timers.lock();
+        if let Some((idx, slot)) = timers.iter_mut().enumerate().find(|(_, slot)| slot.is_none()) {
+            *slot = Some(PosixTimer::new(clock, notify));
+            idx
+        } else {
+            timers.push(Some(PosixTimer::new(clock, notify)));
+            timers.len() - 1
+        }
+    };
+
+    timerid_ptr.vm_write(timerid as i32)?;
+    Ok(0)
+}
+
+pub fn sys_timer_settime(
+    timerid: i32,
+    flags: i32,
+    new_value: *const itimerspec,
+    old_value: *mut itimerspec,
+) -> AxResult<isize> {
+    if timerid < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if new_value.is_null() {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & !TIMER_ABSTIME as i32 != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let new_value = unsafe { new_value.vm_read_uninit()?.assume_init() };
+    let (interval, value) = itimerspec_to_durations(&new_value)?;
+    let absolute = (flags & TIMER_ABSTIME as i32) != 0;
+    let curr = current();
+    let thr = curr.as_thread();
+    let proc_data = thr.proc_data.clone();
+
+    let (old_interval, old_remaining) = {
+        let mut timers = proc_data.posix_timers.lock();
+        let timer = timers
+            .get_mut(timerid as usize)
+            .and_then(Option::as_mut)
+            .ok_or(AxError::InvalidInput)?;
+        let old_interval = timer.interval;
+        let old_remaining = timer_remaining(timer);
+
+        timer.interval = interval;
+        timer.overrun = 0;
+        timer.sequence = timer.sequence.wrapping_add(1);
+        timer.deadline = if value.is_zero() {
+            None
+        } else if absolute {
+            Some(timer_absolute_deadline(timer.clock, clock_id_for_timer(timer.clock), value)?)
+        } else {
+            Some(timer_relative_deadline(timer.clock, value))
+        };
+
+        if let Some(deadline) = timer.deadline {
+            register_posix_timer_alarm(
+                &proc_data,
+                timerid as usize,
+                timer.clock.alarm_clock(),
+                deadline,
+                timer.sequence,
+            );
+        }
+
+        (old_interval, old_remaining)
+    };
+
+    if let Some(old_value) = old_value.nullable() {
+        old_value.vm_write(itimerspec {
+            it_interval: duration_to_timespec(old_interval),
+            it_value: duration_to_timespec(old_remaining),
+        })?;
+    }
+
+    Ok(0)
+}
+
+pub fn sys_timer_gettime(timerid: i32, curr_value: *mut itimerspec) -> AxResult<isize> {
+    if timerid < 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let proc_data = current().as_thread().proc_data.clone();
+    let (interval, remaining) = {
+        let timers = proc_data.posix_timers.lock();
+        let timer = timers
+            .get(timerid as usize)
+            .and_then(Option::as_ref)
+            .ok_or(AxError::InvalidInput)?;
+        (timer.interval, timer_remaining(timer))
+    };
+
+    curr_value.vm_write(itimerspec {
+        it_interval: duration_to_timespec(interval),
+        it_value: duration_to_timespec(remaining),
+    })?;
+    Ok(0)
+}
+
+pub fn sys_timer_getoverrun(timerid: i32) -> AxResult<isize> {
+    if timerid < 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let proc_data = current().as_thread().proc_data.clone();
+    let overrun = {
+        let timers = proc_data.posix_timers.lock();
+        timers
+            .get(timerid as usize)
+            .and_then(Option::as_ref)
+            .ok_or(AxError::InvalidInput)?
+            .overrun
+    };
+    Ok(overrun as isize)
+}
+
+pub fn sys_timer_delete(timerid: i32) -> AxResult<isize> {
+    if timerid < 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let proc_data = current().as_thread().proc_data.clone();
+    let mut timers = proc_data.posix_timers.lock();
+    let slot = timers.get_mut(timerid as usize).ok_or(AxError::InvalidInput)?;
+    if slot.is_none() {
+        return Err(AxError::InvalidInput);
+    }
+    *slot = None;
+    Ok(0)
+}
+
+fn clock_id_for_timer(clock: PosixTimerClock) -> __kernel_clockid_t {
+    match clock {
+        PosixTimerClock::Realtime => CLOCK_REALTIME as _,
+        PosixTimerClock::Monotonic => CLOCK_MONOTONIC as _,
+        PosixTimerClock::Tai => CLOCK_TAI as _,
+        PosixTimerClock::ProcessCpu => CLOCK_PROCESS_CPUTIME_ID as _,
+        PosixTimerClock::ThreadCpu => CLOCK_THREAD_CPUTIME_ID as _,
+    }
+}
+
 pub fn sys_clock_gettime(clock_id: __kernel_clockid_t, ts: *mut timespec) -> AxResult<isize> {
     let now = clock_now(clock_id)?;
     ts.vm_write(timespec::from_time_value(now))?;
@@ -549,7 +814,7 @@ pub fn sys_times(tms: *mut Tms) -> AxResult<isize> {
         tms_cutime: child_usage.utime_ticks() as usize,
         tms_cstime: child_usage.stime_ticks() as usize,
     })?;
-    Ok(nanos_to_ticks(monotonic_time_nanos()) as _)
+    Ok(nanos_to_clock_ticks(monotonic_time_nanos()) as _)
 }
 
 pub fn sys_getitimer(which: i32, value: *mut itimerval) -> AxResult<isize> {

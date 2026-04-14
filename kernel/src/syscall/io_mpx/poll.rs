@@ -1,24 +1,21 @@
 use alloc::vec::Vec;
+use core::time::Duration;
 
-use axerrno::{AxError, AxResult, LinuxError};
+use axerrno::{AxError, AxResult};
 use axhal::{
     time::{TimeValue, wall_time},
     uspace::UserContext,
 };
 use axpoll::IoEvents;
-use axtask::{
-    current,
-    future::{self, block_on, poll_io},
-};
+use axtask::future::{self, block_on, poll_io};
 use linux_raw_sys::general::{POLLNVAL, pollfd, timespec};
 use starry_signal::SignalSet;
 
-use super::FdPollSet;
+use super::{FdPollSet, wait_io_result, wait_signal_only};
 use crate::{
     file::get_file_like,
     mm::{UserConstPtr, UserPtr, nullable},
     syscall::signal::check_sigset_size,
-    task::{AsThread, check_signals},
     time::TimeValueLike,
 };
 
@@ -58,6 +55,9 @@ fn do_poll(
         return Ok(res);
     }
     let fds = FdPollSet(fds);
+    if fds.0.is_empty() {
+        return wait_signal_only(uctx, timeout.map(Duration::from), sigmask);
+    }
     let deadline = timeout.map(|dur| wall_time().saturating_add(dur));
     let mut poll_once = || {
         let mut res = 0usize;
@@ -91,48 +91,16 @@ fn do_poll(
         ))
     };
 
-    let Some(sigmask) = sigmask else {
-        return match wait_once() {
-            Ok(r) => r,
-            Err(_) => Ok(0),
-        };
-    };
-    let Some(uctx) = uctx else {
-        return Err(AxError::InvalidInput);
-    };
-
-    let curr = current();
-    let thr = curr.as_thread();
-    let old_blocked = thr.signal.set_blocked(sigmask);
-    // Like sigsuspend(), ppoll() may enter a user signal handler instead of
-    // returning directly. Seed the saved return context with -EINTR so the
-    // handler-resume path cannot leak a stale success value back to userspace.
-    uctx.set_retval(-LinuxError::EINTR.code() as usize);
-    let result = loop {
-        match wait_once() {
-            Ok(Ok(res)) => break Ok(res),
-            Ok(Err(AxError::Interrupted)) => {
-                let handler_depth = thr.signal_handler_depth();
-                if check_signals(thr, uctx, Some(old_blocked)) {
-                    if thr.signal_handler_depth() == handler_depth {
-                        thr.signal.set_blocked(old_blocked);
-                    }
-                    break Err(AxError::Interrupted);
-                }
-            }
-            Ok(Err(err)) => break Err(err),
-            Err(_) => break Ok(0),
-        }
-    };
-    if !matches!(result, Err(AxError::Interrupted)) {
-        thr.signal.set_blocked(old_blocked);
-    }
-    result
+    wait_io_result(uctx, sigmask, &mut wait_once)
 }
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_poll(fds: UserPtr<pollfd>, nfds: u32, timeout: i32) -> AxResult<isize> {
-    let fds = fds.get_as_mut_slice(nfds as usize)?;
+    let fds: &mut [pollfd] = if nfds == 0 {
+        &mut []
+    } else {
+        fds.get_as_mut_slice(nfds as usize)?
+    };
     let timeout = if timeout < 0 {
         None
     } else {
@@ -149,8 +117,17 @@ pub fn sys_ppoll(
     sigmask: UserConstPtr<SignalSet>,
     sigsetsize: usize,
 ) -> AxResult<isize> {
-    check_sigset_size(sigsetsize)?;
-    let fds = fds.get_as_mut_slice(nfds.try_into().map_err(|_| AxError::InvalidInput)?)?;
+    let sigmask = if let Some(sigmask) = nullable!(sigmask.get_as_ref())? {
+        check_sigset_size(sigsetsize)?;
+        Some(*sigmask)
+    } else {
+        None
+    };
+    let fds: &mut [pollfd] = if nfds == 0 {
+        &mut []
+    } else {
+        fds.get_as_mut_slice(nfds.try_into().map_err(|_| AxError::InvalidInput)?)?
+    };
     let timeout = nullable!(timeout.get_as_ref())?
         .map(|ts| ts.try_into_time_value())
         .transpose()?;
@@ -158,6 +135,6 @@ pub fn sys_ppoll(
         Some(uctx),
         fds,
         timeout,
-        nullable!(sigmask.get_as_ref())?.copied(),
+        sigmask,
     )
 }

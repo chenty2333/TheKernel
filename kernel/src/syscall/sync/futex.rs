@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use core::time::Duration;
 
 use axerrno::{AxError, AxResult};
-use axtask::current;
+use axtask::{current, yield_now};
 use linux_raw_sys::general::{
     FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_REQUEUE, FUTEX_WAIT,
     FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, robust_list_head, timespec,
@@ -145,6 +145,9 @@ pub fn sys_futex(
                 };
                 count = futex.wq.wake(value as _, bitset);
             }
+            if count != 0 {
+                yield_now();
+            }
             Ok(count as _)
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
@@ -169,6 +172,9 @@ pub fn sys_futex(
                         .requeue(value2, &futex2.wq, Arc::downgrade(&futex2))
                         as usize;
                 }
+            }
+            if count != 0 {
+                yield_now();
             }
             Ok(count as _)
         }

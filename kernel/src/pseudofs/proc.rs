@@ -35,8 +35,11 @@ use crate::{
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
         SimpleFileOperation, SimpleFs, SimpleFsNode,
     },
-    syscall::{current_domainname_string, proc_version_string, set_domainname_bytes},
-    task::{AsThread, get_task, get_visible_task, render_task_stat, tasks},
+    syscall::{
+        current_domainname_string, proc_version_string, set_domainname_bytes, shmall_limit,
+        shmmax_limit, shmmni_limit, set_shmmax_limit,
+    },
+    task::{AsThread, get_task, get_visible_task_including_exiting, render_task_stat, tasks},
 };
 
 const PROC_PID_MAX: u32 = 4_194_304;
@@ -118,7 +121,7 @@ impl SimpleDirOps for ProcessTaskDir {
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         let process = self.process.upgrade().ok_or(VfsError::NotFound)?;
         let tid = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-        let task = get_visible_task(tid).map_err(|_| VfsError::NotFound)?;
+        let task = get_visible_task_including_exiting(tid).map_err(|_| VfsError::NotFound)?;
         if task.as_thread().proc_data.proc.pid() != process.pid() {
             return Err(VfsError::NotFound);
         }
@@ -491,7 +494,7 @@ impl SimpleDirOps for ProcFsHandler {
             current().clone()
         } else {
             let tid = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-            get_visible_task(tid).map_err(|_| VfsError::NotFound)?
+            get_visible_task_including_exiting(tid).map_err(|_| VfsError::NotFound)?
         };
         let node = NodeOpsMux::Dir(SimpleDir::new_maker(
             self.0.clone(),
@@ -515,6 +518,14 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             .ok()
             .map(str::trim)
             .and_then(|it| it.parse::<u32>().ok())
+            .ok_or(VfsError::InvalidInput)
+    }
+
+    fn write_proc_usize(data: &[u8]) -> VfsResult<usize> {
+        str::from_utf8(data)
+            .ok()
+            .map(str::trim)
+            .and_then(|it| it.parse::<usize>().ok())
             .ok_or(VfsError::InvalidInput)
     }
 
@@ -722,6 +733,33 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             kernel.add(
                 "pid_max",
                 SimpleFile::new_regular(fs.clone(), || Ok(alloc::format!("{PROC_PID_MAX}\n"))),
+            );
+            kernel.add(
+                "shmall",
+                SimpleFile::new_regular(fs.clone(), || Ok(alloc::format!("{}\n", shmall_limit()))),
+            );
+            kernel.add(
+                "shmmax",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => {
+                            Ok(Some(alloc::format!("{}\n", shmmax_limit()).into_bytes()))
+                        }
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let value = write_proc_usize(data)?;
+                            set_shmmax_limit(value);
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            kernel.add(
+                "shmmni",
+                SimpleFile::new_regular(fs.clone(), || Ok(alloc::format!("{}\n", shmmni_limit()))),
             );
             kernel.add("tainted", SimpleFile::new_regular(fs.clone(), || Ok("0\n")));
 

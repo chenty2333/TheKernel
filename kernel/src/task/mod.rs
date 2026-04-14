@@ -447,6 +447,8 @@ pub struct ProcessData {
     personality: AtomicU32,
     /// Process-scoped membarrier registration state.
     membarrier_state: AtomicU32,
+    /// POSIX interval timers created by this process.
+    pub(crate) posix_timers: SpinNoIrq<Vec<Option<PosixTimer>>>,
 
     /// CPU time accumulated from sibling threads that have already exited.
     exited_threads_usage: AtomicTaskUsage,
@@ -510,6 +512,7 @@ impl ProcessData {
             supplementary_groups: SpinNoIrq::new(Vec::new()),
             personality: AtomicU32::new(0),
             membarrier_state: AtomicU32::new(0),
+            posix_timers: SpinNoIrq::new(Vec::new()),
             exited_threads_usage: AtomicTaskUsage::new(),
             waited_children_usage: AtomicTaskUsage::new(),
             wait_lock: Mutex::new(()),

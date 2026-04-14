@@ -128,4 +128,8 @@ impl ProcessSignalManager {
     pub fn pending(&self) -> SignalSet {
         self.pending.lock().set
     }
+
+    pub fn pending_realtime_count(&self) -> usize {
+        self.pending.lock().realtime_count()
+    }
 }

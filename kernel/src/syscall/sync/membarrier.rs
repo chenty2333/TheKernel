@@ -54,9 +54,8 @@ pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> AxResult<isize> {
         }
         MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => {
             let proc_data = axtask::current().as_thread().proc_data.clone();
-            proc_data.register_membarrier(
-                MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE as u32,
-            );
+            proc_data
+                .register_membarrier(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE as u32);
             Ok(0)
         }
         MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE => {

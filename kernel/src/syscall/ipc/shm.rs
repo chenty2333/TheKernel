@@ -1,21 +1,63 @@
 use alloc::{collections::btree_map::BTreeMap, sync::Arc, vec::Vec};
 
-use axerrno::{AxError, AxResult};
-use axhal::{
-    paging::{MappingFlags, PageSize},
-    time::monotonic_time_nanos,
-};
+use axerrno::{AxError, AxResult, LinuxError};
+use axhal::paging::{MappingFlags, PageSize};
 use axsync::Mutex;
 use axtask::current;
-use linux_raw_sys::{ctypes::c_ushort, general::*};
+use linux_raw_sys::{
+    ctypes::{c_ulong, c_ushort},
+    general::*,
+};
 use memory_addr::{PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 use starry_process::Pid;
 
-use super::{IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcPerm, next_ipc_id};
+use super::{
+    IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, SHM_DEST,
+    SHM_LOCK, SHM_LOCKED, SHM_INFO, SHM_STAT, SHM_UNLOCK, SHMMIN, IpcPerm, next_ipc_id,
+    shmall_limit, shmmax_limit, shmmni_limit, shmseg_limit,
+};
 use crate::{
     mm::{Backend, SharedPages, UserPtr, nullable},
     task::AsThread,
+    time::wall_time,
 };
+
+const IPC_MODE_MASK: __kernel_mode_t = 0o777;
+const SHM_HUGETLB_FLAG: usize = 0o4000;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IpcInfo {
+    shmmax: c_ulong,
+    shmmin: c_ulong,
+    shmmni: c_ulong,
+    shmseg: c_ulong,
+    shmall: c_ulong,
+    reserved1: c_ulong,
+    reserved2: c_ulong,
+    reserved3: c_ulong,
+    reserved4: c_ulong,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ShmUsageInfo {
+    used_ids: i32,
+    shm_tot: c_ulong,
+    shm_rss: c_ulong,
+    shm_swp: c_ulong,
+    swap_attempts: c_ulong,
+    swap_successes: c_ulong,
+}
+
+fn admin_ipc_permission(perm: &IpcPerm, uid: u32) -> bool {
+    uid == 0 || perm.uid == uid || perm.cuid == uid
+}
+
+fn can_attach_shm(perm: &IpcPerm, uid: u32, gid: u32, read_only: bool) -> bool {
+    super::has_ipc_permission(perm, uid, gid, false)
+        && (read_only || super::has_ipc_permission(perm, uid, gid, true))
+}
 
 bitflags::bitflags! {
     /// flags for sys_shmat
@@ -49,31 +91,43 @@ pub struct ShmidDs {
     /// pid of last shmop
     shm_lpid: __kernel_pid_t,
     /// number of current attaches
-    shm_nattch: c_ushort,
+    shm_nattch: c_ulong,
+    unused4: c_ulong,
+    unused5: c_ulong,
 }
 
 impl ShmidDs {
-    fn new(key: i32, size: usize, mode: __kernel_mode_t, pid: __kernel_pid_t) -> Self {
+    fn new(
+        key: i32,
+        size: usize,
+        mode: __kernel_mode_t,
+        pid: __kernel_pid_t,
+        uid: __kernel_uid_t,
+        gid: __kernel_gid_t,
+    ) -> Self {
         Self {
             shm_perm: IpcPerm {
                 key,
-                uid: 0,
-                gid: 0,
-                cuid: 0,
-                cgid: 0,
-                mode,
+                uid,
+                gid,
+                cuid: uid,
+                cgid: gid,
+                mode: (mode & IPC_MODE_MASK) as _,
+                pad1: 0,
                 seq: 0,
-                pad: 0,
+                pad2: 0,
                 unused0: 0,
                 unused1: 0,
             },
             shm_segsz: size as __kernel_size_t,
             shm_atime: 0,
             shm_dtime: 0,
-            shm_ctime: 0,
+            shm_ctime: wall_time().as_secs() as __kernel_time_t,
             shm_cpid: pid,
             shm_lpid: pid,
             shm_nattch: 0,
+            unused4: 0,
+            unused5: 0,
         }
     }
 }
@@ -97,7 +151,16 @@ pub struct ShmInner {
 
 impl ShmInner {
     /// Creates a new [`ShmInner`].
-    pub fn new(key: i32, shmid: i32, size: usize, mapping_flags: MappingFlags, pid: Pid) -> Self {
+    pub fn new(
+        key: i32,
+        shmid: i32,
+        size: usize,
+        mapping_flags: MappingFlags,
+        perm_mode: __kernel_mode_t,
+        pid: Pid,
+        uid: __kernel_uid_t,
+        gid: __kernel_gid_t,
+    ) -> Self {
         ShmInner {
             shmid,
             page_num: memory_addr::align_up_4k(size) / PAGE_SIZE_4K,
@@ -105,29 +168,29 @@ impl ShmInner {
             phys_pages: None,
             rmid: false,
             mapping_flags,
-            shmid_ds: ShmidDs::new(
-                key,
-                size,
-                mapping_flags.bits() as __kernel_mode_t,
-                pid as __kernel_pid_t,
-            ),
+            shmid_ds: ShmidDs::new(key, size, perm_mode, pid as __kernel_pid_t, uid, gid),
         }
     }
 
     /// Updates the pid of last shmop and checks if the size and mapping flags
     /// match.
-    pub fn try_update(
-        &mut self,
-        size: usize,
-        mapping_flags: MappingFlags,
-        pid: Pid,
-    ) -> AxResult<isize> {
-        if size as __kernel_size_t != self.shmid_ds.shm_segsz
-            || mapping_flags.bits() as __kernel_mode_t != self.shmid_ds.shm_perm.mode
-        {
+    pub fn try_update(&mut self, size: usize, requested_mode: __kernel_mode_t) -> AxResult<isize> {
+        if size > self.shmid_ds.shm_segsz as usize {
             return Err(AxError::InvalidInput);
         }
-        self.shmid_ds.shm_lpid = pid as i32;
+
+        let curr = current();
+        let proc_data = &curr.as_thread().proc_data;
+        let uid = proc_data.euid();
+        let gid = proc_data.egid();
+        let wants_read = requested_mode & 0o444 != 0;
+        let wants_write = requested_mode & 0o222 != 0;
+        if wants_read && !super::has_ipc_permission(&self.shmid_ds.shm_perm, uid, gid, false) {
+            return Err(AxError::PermissionDenied);
+        }
+        if wants_write && !super::has_ipc_permission(&self.shmid_ds.shm_perm, uid, gid, true) {
+            return Err(AxError::PermissionDenied);
+        }
         Ok(self.shmid as isize)
     }
 
@@ -153,7 +216,13 @@ impl ShmInner {
         self.va_range.insert(pid, va_range);
         self.shmid_ds.shm_nattch += 1;
         self.shmid_ds.shm_lpid = pid as __kernel_pid_t;
-        self.shmid_ds.shm_atime = monotonic_time_nanos() as __kernel_time_t;
+        self.shmid_ds.shm_atime = wall_time().as_secs() as __kernel_time_t;
+    }
+
+    pub fn inherit_process(&mut self, pid: Pid, va_range: VirtAddrRange) {
+        assert!(self.get_addr_range(pid).is_none());
+        self.va_range.insert(pid, va_range);
+        self.shmid_ds.shm_nattch += 1;
     }
 
     /// Called by sys_shmdt
@@ -162,7 +231,24 @@ impl ShmInner {
         self.va_range.remove(&pid);
         self.shmid_ds.shm_nattch -= 1;
         self.shmid_ds.shm_lpid = pid as __kernel_pid_t;
-        self.shmid_ds.shm_dtime = monotonic_time_nanos() as __kernel_time_t;
+        self.shmid_ds.shm_dtime = wall_time().as_secs() as __kernel_time_t;
+    }
+
+    pub fn set_removed(&mut self, removed: bool) {
+        self.rmid = removed;
+        if removed {
+            self.shmid_ds.shm_perm.mode |= SHM_DEST as c_ushort;
+        } else {
+            self.shmid_ds.shm_perm.mode &= !(SHM_DEST as c_ushort);
+        }
+    }
+
+    pub fn set_locked(&mut self, locked: bool) {
+        if locked {
+            self.shmid_ds.shm_perm.mode |= SHM_LOCKED as c_ushort;
+        } else {
+            self.shmid_ds.shm_perm.mode &= !(SHM_LOCKED as c_ushort);
+        }
     }
 }
 
@@ -277,6 +363,17 @@ impl ShmManager {
         self.shmid_inner.get(&shmid).cloned()
     }
 
+    pub fn active_segment_count(&self) -> usize {
+        self.shmid_inner.len()
+    }
+
+    pub fn nth_active(&self, index: usize) -> Option<(i32, Arc<Mutex<ShmInner>>)> {
+        self.shmid_inner
+            .iter()
+            .nth(index)
+            .map(|(&shmid, inner)| (shmid, inner.clone()))
+    }
+
     /// Returns the shared memory ID associated with the given pid and virtual
     /// address.
     pub fn get_shmid_by_vaddr(&self, pid: Pid, vaddr: VirtAddr) -> Option<i32> {
@@ -366,40 +463,93 @@ impl ShmManager {
         }
         self.remove_pid(pid);
     }
+
+    pub fn inherit_proc_shm(&mut self, parent_pid: Pid, child_pid: Pid) {
+        let Some(parent_map) = self.pid_shmid_vaddr.get(&parent_pid) else {
+            return;
+        };
+        let inherited: Vec<_> = parent_map
+            .forward
+            .iter()
+            .map(|(&shmid, &vaddr)| (shmid, vaddr))
+            .collect();
+
+        for (shmid, vaddr) in inherited {
+            let Some(shm_inner) = self.get_inner_by_shmid(shmid) else {
+                continue;
+            };
+            let mut shm_inner = shm_inner.lock();
+            let Some(va_range) = shm_inner.get_addr_range(parent_pid) else {
+                continue;
+            };
+            let inherited_range = VirtAddrRange::new(vaddr, va_range.end);
+            self.insert_shmid_vaddr(child_pid, shmid, vaddr);
+            shm_inner.inherit_process(child_pid, inherited_range);
+        }
+    }
 }
 
 /// Global shared memory manager.
 pub static SHM_MANAGER: Mutex<ShmManager> = Mutex::new(ShmManager::new());
 
+pub fn inherit_proc_shm(parent_pid: Pid, child_pid: Pid) {
+    SHM_MANAGER.lock().inherit_proc_shm(parent_pid, child_pid);
+}
+
 pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
-    let page_num = memory_addr::align_up_4k(size) / PAGE_SIZE_4K;
-    if page_num == 0 {
-        return Err(AxError::InvalidInput);
-    }
+    let perm_mode = (shmflg as __kernel_mode_t) & IPC_MODE_MASK;
+    let create = shmflg & IPC_CREAT as usize != 0;
+    let excl = shmflg & IPC_EXCL as usize != 0;
+    let huge = shmflg & SHM_HUGETLB_FLAG != 0;
 
     let mut mapping_flags = MappingFlags::from_name("USER").unwrap();
-    if shmflg & 0o400 != 0 {
+    if perm_mode & 0o444 != 0 {
         mapping_flags.insert(MappingFlags::READ);
     }
-    if shmflg & 0o200 != 0 {
+    if perm_mode & 0o222 != 0 {
         mapping_flags.insert(MappingFlags::WRITE);
     }
-    if shmflg & 0o100 != 0 {
+    if perm_mode & 0o111 != 0 {
         mapping_flags.insert(MappingFlags::EXECUTE);
     }
 
-    let cur_pid = current().as_thread().proc_data.proc.pid();
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let cur_pid = proc_data.proc.pid();
+    let euid = proc_data.euid();
+    let egid = proc_data.egid();
+
+    if huge {
+        return Err(AxError::from(LinuxError::EINVAL));
+    }
+
     let mut shm_manager = SHM_MANAGER.lock();
 
     if key != IPC_PRIVATE {
-        // This process has already created a shared memory segment with the same key
         if let Some(shmid) = shm_manager.get_shmid_by_key(key) {
+            if create && excl {
+                return Err(AxError::from(LinuxError::EEXIST));
+            }
             let shm_inner = shm_manager
                 .get_inner_by_shmid(shmid)
                 .ok_or(AxError::InvalidInput)?;
             let mut shm_inner = shm_inner.lock();
-            return shm_inner.try_update(size, mapping_flags, cur_pid);
+            return shm_inner.try_update(size, perm_mode);
         }
+        if !create {
+            return Err(AxError::from(LinuxError::ENOENT));
+        }
+    }
+
+    if size < SHMMIN || size > shmmax_limit() {
+        return Err(AxError::InvalidInput);
+    }
+    let page_num = memory_addr::align_up_4k(size) / PAGE_SIZE_4K;
+    if page_num == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if shm_manager.active_segment_count() >= shmmni_limit() {
+        return Err(AxError::from(LinuxError::ENOSPC));
     }
 
     // Create a new shm_inner
@@ -409,7 +559,10 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
         shmid,
         size,
         mapping_flags,
+        perm_mode,
         cur_pid,
+        euid,
+        egid,
     )));
     shm_manager.insert_key_shmid(key, shmid);
     shm_manager.insert_shmid_inner(shmid, shm_inner);
@@ -420,37 +573,56 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
 pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
     let shm_inner = {
         let shm_manager = SHM_MANAGER.lock();
-        shm_manager.get_inner_by_shmid(shmid).unwrap()
+        shm_manager
+            .get_inner_by_shmid(shmid)
+            .ok_or(AxError::InvalidInput)?
     };
     let mut shm_inner = shm_inner.lock();
+    if shm_inner.rmid {
+        return Err(AxError::from(LinuxError::EIDRM));
+    }
     let mut mapping_flags = shm_inner.mapping_flags;
     let shm_flg = ShmAtFlags::from_bits_truncate(shmflg);
+    let read_only = shm_flg.contains(ShmAtFlags::SHM_RDONLY);
 
-    if shm_flg.contains(ShmAtFlags::SHM_RDONLY) {
+    if read_only {
         mapping_flags.remove(MappingFlags::WRITE);
     }
-
-    // TODO: solve shmflg: SHM_RND and SHM_REMAP
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let pid = proc_data.proc.pid();
+    if !can_attach_shm(&shm_inner.shmid_ds.shm_perm, proc_data.euid(), proc_data.egid(), read_only)
+    {
+        return Err(AxError::from(LinuxError::EACCES));
+    }
     let aspace_handle = proc_data.aspace();
     let mut aspace = aspace_handle.lock();
-
-    let start_aligned = memory_addr::align_down_4k(addr);
     let length = shm_inner.page_num * PAGE_SIZE_4K;
+    let limit = VirtAddrRange::new(aspace.base(), aspace.end());
 
-    // alloc the virtual address range
-    assert!(shm_inner.get_addr_range(pid).is_none());
-    let start_addr = aspace
-        .find_kernel_area(
-            VirtAddr::from(start_aligned),
-            length,
-            VirtAddrRange::new(aspace.base(), aspace.end()),
-            PAGE_SIZE_4K,
-        )
-        .ok_or(AxError::NoMemory)?;
+    let start_addr = if addr == 0 {
+        aspace
+            .find_kernel_area(aspace.base(), length, limit, PAGE_SIZE_4K)
+            .ok_or(AxError::NoMemory)?
+    } else {
+        if !memory_addr::is_aligned_4k(addr) && !shm_flg.contains(ShmAtFlags::SHM_RND) {
+            return Err(AxError::InvalidInput);
+        }
+        let candidate = VirtAddr::from(memory_addr::align_down_4k(addr));
+        let found = aspace.find_free_area(candidate, length, limit, PAGE_SIZE_4K);
+        if found != Some(candidate) {
+            if shm_flg.contains(ShmAtFlags::SHM_REMAP) {
+                return Err(AxError::InvalidInput);
+            }
+            return Err(AxError::InvalidInput);
+        }
+        candidate
+    };
+
+    if shm_inner.get_addr_range(pid).is_some() {
+        return Err(AxError::InvalidInput);
+    }
     let end_addr = VirtAddr::from(start_addr.as_usize() + length);
     let va_range = VirtAddrRange::new(start_addr, end_addr);
 
@@ -484,28 +656,104 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
 }
 
 pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize> {
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let current_uid = proc_data.euid();
+    let current_gid = proc_data.egid();
     let shm_inner = {
         let shm_manager = SHM_MANAGER.lock();
+        let cmd = cmd as i32;
+        if cmd == IPC_INFO {
+            let info = IpcInfo {
+                shmmax: shmmax_limit() as c_ulong,
+                shmmin: SHMMIN as c_ulong,
+                shmmni: shmmni_limit() as c_ulong,
+                shmseg: shmseg_limit() as c_ulong,
+                shmall: shmall_limit() as c_ulong,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+                reserved4: 0,
+            };
+            *buf.cast::<IpcInfo>().get_as_mut()? = info;
+            return Ok(shm_manager.active_segment_count().saturating_sub(1) as isize);
+        }
+        if cmd == SHM_INFO {
+            let mut info = ShmUsageInfo {
+                used_ids: shm_manager.active_segment_count() as i32,
+                shm_tot: 0,
+                shm_rss: 0,
+                shm_swp: 0,
+                swap_attempts: 0,
+                swap_successes: 0,
+            };
+            for shm_inner in shm_manager.shmid_inner.values() {
+                let shm_inner = shm_inner.lock();
+                info.shm_tot = info.shm_tot.saturating_add(shm_inner.page_num as c_ulong);
+                info.shm_rss = info.shm_rss.saturating_add(shm_inner.page_num as c_ulong);
+            }
+            *buf.cast::<ShmUsageInfo>().get_as_mut()? = info;
+            return Ok(shm_manager.active_segment_count().saturating_sub(1) as isize);
+        }
+        if cmd == SHM_STAT {
+            let (actual_shmid, shm_inner) = shm_manager
+                .nth_active(shmid as usize)
+                .ok_or(AxError::InvalidInput)?;
+            let shm_inner = shm_inner.lock();
+            if !super::has_ipc_permission(&shm_inner.shmid_ds.shm_perm, current_uid, current_gid, false)
+            {
+                return Err(AxError::from(LinuxError::EACCES));
+            }
+            *buf.get_as_mut()? = shm_inner.shmid_ds;
+            return Ok(actual_shmid as isize);
+        }
         shm_manager
             .get_inner_by_shmid(shmid)
             .ok_or(AxError::InvalidInput)?
     };
     let mut shm_inner = shm_inner.lock();
-
     let cmd = cmd as i32;
+
     if cmd == IPC_SET {
-        shm_inner.shmid_ds = *buf.get_as_mut()?;
+        if !admin_ipc_permission(&shm_inner.shmid_ds.shm_perm, current_uid) {
+            return Err(AxError::from(LinuxError::EPERM));
+        }
+        let user_ds = *buf.get_as_mut()?;
+        shm_inner.shmid_ds.shm_perm.uid = user_ds.shm_perm.uid;
+        shm_inner.shmid_ds.shm_perm.gid = user_ds.shm_perm.gid;
+        shm_inner.shmid_ds.shm_perm.mode = (shm_inner.shmid_ds.shm_perm.mode
+            & !(IPC_MODE_MASK as c_ushort))
+            | (user_ds.shm_perm.mode & IPC_MODE_MASK as c_ushort);
+        shm_inner.shmid_ds.shm_ctime = wall_time().as_secs() as __kernel_time_t;
     } else if cmd == IPC_STAT {
+        if !super::has_ipc_permission(&shm_inner.shmid_ds.shm_perm, current_uid, current_gid, false)
+        {
+            return Err(AxError::from(LinuxError::EACCES));
+        }
         if let Some(shmid_ds) = nullable!(buf.get_as_mut())? {
             *shmid_ds = shm_inner.shmid_ds;
         }
     } else if cmd == IPC_RMID {
-        shm_inner.rmid = true;
+        if !admin_ipc_permission(&shm_inner.shmid_ds.shm_perm, current_uid) {
+            return Err(AxError::from(LinuxError::EPERM));
+        }
+        shm_inner.set_removed(true);
+        if shm_inner.attach_count() == 0 {
+            SHM_MANAGER.lock().remove_shmid(shmid);
+        }
+    } else if cmd == SHM_LOCK {
+        if !admin_ipc_permission(&shm_inner.shmid_ds.shm_perm, current_uid) {
+            return Err(AxError::from(LinuxError::EPERM));
+        }
+        shm_inner.set_locked(true);
+    } else if cmd == SHM_UNLOCK {
+        if !admin_ipc_permission(&shm_inner.shmid_ds.shm_perm, current_uid) {
+            return Err(AxError::from(LinuxError::EPERM));
+        }
+        shm_inner.set_locked(false);
     } else {
         return Err(AxError::InvalidInput);
     }
-
-    shm_inner.shmid_ds.shm_ctime = monotonic_time_nanos() as __kernel_time_t;
     Ok(0)
 }
 

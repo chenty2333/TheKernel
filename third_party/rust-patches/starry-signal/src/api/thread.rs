@@ -263,4 +263,8 @@ impl ThreadSignalManager {
     pub fn pending(&self) -> SignalSet {
         self.pending.lock().set | self.proc.pending()
     }
+
+    pub fn pending_realtime_count(&self) -> usize {
+        self.pending.lock().realtime_count() + self.proc.pending_realtime_count()
+    }
 }

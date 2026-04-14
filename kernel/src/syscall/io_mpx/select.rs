@@ -1,13 +1,10 @@
 use alloc::vec::Vec;
 use core::{fmt, time::Duration};
 
-use axerrno::{AxError, AxResult, LinuxError};
+use axerrno::{AxError, AxResult};
 use axhal::uspace::UserContext;
 use axpoll::IoEvents;
-use axtask::{
-    current,
-    future::{self, block_on, poll_io},
-};
+use axtask::future::{self, block_on, poll_io};
 use bitmaps::Bitmap;
 use linux_raw_sys::{
     general::*,
@@ -15,12 +12,11 @@ use linux_raw_sys::{
 };
 use starry_signal::SignalSet;
 
-use super::FdPollSet;
+use super::{FdPollSet, wait_io_result, wait_signal_only};
 use crate::{
     file::get_file_like,
     mm::{UserConstPtr, UserPtr, nullable},
     syscall::signal::check_sigset_size,
-    task::{AsThread, check_signals},
     time::TimeValueLike,
 };
 
@@ -59,16 +55,32 @@ fn do_select(
         return Err(AxError::InvalidInput);
     }
     let sigmask = if let Some(sigmask) = nullable!(sigmask.get_as_ref())? {
-        check_sigset_size(sigmask.sigsetsize)?;
         let set = sigmask.set;
-        nullable!(set.get_as_ref())?
+        if let Some(set) = nullable!(set.get_as_ref())? {
+            check_sigset_size(sigmask.sigsetsize)?;
+            Some(set)
+        } else {
+            None
+        }
     } else {
         None
     };
 
-    let mut readfds = nullable!(readfds.get_as_mut())?;
-    let mut writefds = nullable!(writefds.get_as_mut())?;
-    let mut exceptfds = nullable!(exceptfds.get_as_mut())?;
+    let mut readfds = if nfds == 0 {
+        None
+    } else {
+        nullable!(readfds.get_as_mut())?
+    };
+    let mut writefds = if nfds == 0 {
+        None
+    } else {
+        nullable!(writefds.get_as_mut())?
+    };
+    let mut exceptfds = if nfds == 0 {
+        None
+    } else {
+        nullable!(exceptfds.get_as_mut())?
+    };
 
     let read_set = FdSet::new(nfds as _, readfds.as_deref());
     let write_set = FdSet::new(nfds as _, writefds.as_deref());
@@ -96,6 +108,9 @@ fn do_select(
     }
 
     let fds = FdPollSet(fds);
+    if fds.0.is_empty() {
+        return wait_signal_only(uctx, timeout, sigmask.copied());
+    }
 
     if let Some(readfds) = readfds.as_deref_mut() {
         unsafe { FD_ZERO(readfds) };
@@ -142,42 +157,7 @@ fn do_select(
         ))
     };
 
-    let Some(sigmask) = sigmask.copied() else {
-        return match select_once() {
-            Ok(r) => r,
-            Err(_) => Ok(0),
-        };
-    };
-    let Some(uctx) = uctx else {
-        return Err(AxError::InvalidInput);
-    };
-
-    let curr = current();
-    let thr = curr.as_thread();
-    let old_blocked = thr.signal.set_blocked(sigmask);
-    // pselect6() shares ppoll()/sigsuspend() semantics: if a handler runs,
-    // the saved userspace return register must already contain -EINTR.
-    uctx.set_retval(-LinuxError::EINTR.code() as usize);
-    let result = loop {
-        match select_once() {
-            Ok(Ok(res)) => break Ok(res),
-            Ok(Err(AxError::Interrupted)) => {
-                let handler_depth = thr.signal_handler_depth();
-                if check_signals(thr, uctx, Some(old_blocked)) {
-                    if thr.signal_handler_depth() == handler_depth {
-                        thr.signal.set_blocked(old_blocked);
-                    }
-                    break Err(AxError::Interrupted);
-                }
-            }
-            Ok(Err(err)) => break Err(err),
-            Err(_) => break Ok(0),
-        }
-    };
-    if !matches!(result, Err(AxError::Interrupted)) {
-        thr.signal.set_blocked(old_blocked);
-    }
-    result
+    wait_io_result(uctx, sigmask.copied(), &mut select_once)
 }
 
 #[cfg(target_arch = "x86_64")]

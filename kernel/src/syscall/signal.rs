@@ -7,9 +7,8 @@ use axtask::{
     future::{self, block_on},
 };
 use linux_raw_sys::general::{
-    MINSIGSTKSZ, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SS_DISABLE, SS_ONSTACK,
-    kernel_sigaction, siginfo,
-    timespec,
+    MINSIGSTKSZ, RLIMIT_SIGPENDING, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK,
+    SS_DISABLE, SS_ONSTACK, kernel_sigaction, siginfo, timespec,
 };
 use starry_process::Pid;
 use starry_signal::{SignalInfo, SignalSet, SignalStack, Signo};
@@ -17,8 +16,8 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     task::{
-        AsThread, check_signals, get_process_data, processes, send_signal_to_process,
-        send_signal_to_process_group, send_signal_to_visible_thread,
+        AsThread, check_signals, get_process_data, get_visible_task, processes,
+        send_signal_to_process, send_signal_to_process_group, send_signal_to_visible_thread,
     },
     time::TimeValueLike,
 };
@@ -111,6 +110,31 @@ fn make_siginfo(signo: u32, code: i32) -> AxResult<Option<SignalInfo>> {
     )))
 }
 
+fn ensure_realtime_signal_queue_capacity_for_thread(tgid: Option<Pid>, tid: Pid) -> AxResult<()> {
+    let task = get_visible_task(tid)?;
+    let thread = task
+        .try_as_thread()
+        .ok_or(AxError::OperationNotPermitted)?;
+    if tgid.is_some_and(|tgid| thread.proc_data.proc.pid() != tgid) {
+        return Err(AxError::NoSuchProcess);
+    }
+
+    let limit = thread.proc_data.rlim.read()[RLIMIT_SIGPENDING].current as usize;
+    if thread.signal.pending_realtime_count() >= limit {
+        return Err(AxError::WouldBlock);
+    }
+    Ok(())
+}
+
+fn ensure_realtime_signal_queue_capacity_for_process(pid: Pid) -> AxResult<()> {
+    let proc_data = get_process_data(pid)?;
+    let limit = proc_data.rlim.read()[RLIMIT_SIGPENDING].current as usize;
+    if proc_data.signal.pending_realtime_count() >= limit {
+        return Err(AxError::WouldBlock);
+    }
+    Ok(())
+}
+
 fn check_signal_permission(pid: Pid) -> AxResult<()> {
     let actor = current();
     let actor_proc = &actor.as_thread().proc_data;
@@ -165,20 +189,29 @@ pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
     Ok(0)
 }
 
-pub fn sys_tkill(tid: Pid, signo: u32) -> AxResult<isize> {
+pub fn sys_tkill(tid: i32, signo: u32) -> AxResult<isize> {
+    if tid <= 0 {
+        return Err(AxError::InvalidInput);
+    }
     let sig = make_siginfo(signo, SI_TKILL)?;
-    send_signal_to_visible_thread(None, tid, sig)?;
+    send_signal_to_visible_thread(None, tid as Pid, sig)?;
     Ok(0)
 }
 
-pub fn sys_tgkill(tgid: Pid, tid: Pid, signo: u32) -> AxResult<isize> {
+pub fn sys_tgkill(tgid: i32, tid: i32, signo: u32) -> AxResult<isize> {
+    if tgid <= 0 || tid <= 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if signo != 0 && parse_signo(signo)?.is_realtime() {
+        ensure_realtime_signal_queue_capacity_for_thread(Some(tgid as Pid), tid as Pid)?;
+    }
     let sig = make_siginfo(signo, SI_TKILL)?;
-    send_signal_to_visible_thread(Some(tgid), tid, sig)?;
+    send_signal_to_visible_thread(Some(tgid as Pid), tid as Pid, sig)?;
     Ok(0)
 }
 
 pub(crate) fn make_queue_signal_info(
-    tgid: Pid,
+    target_pid: Pid,
     signo: u32,
     sig: *const SignalInfo,
 ) -> AxResult<Option<SignalInfo>> {
@@ -189,7 +222,7 @@ pub(crate) fn make_queue_signal_info(
     let signo = parse_signo(signo)?;
     let mut sig = unsafe { sig.vm_read_uninit()?.assume_init() };
     sig.set_signo(signo);
-    if current().as_thread().proc_data.proc.pid() != tgid
+    if current().as_thread().proc_data.proc.pid() != target_pid
         && (sig.code() >= 0 || sig.code() == SI_TKILL)
     {
         return Err(AxError::OperationNotPermitted);
@@ -198,29 +231,55 @@ pub(crate) fn make_queue_signal_info(
 }
 
 pub fn sys_rt_sigqueueinfo(
-    tgid: Pid,
+    pid: Pid,
     signo: u32,
     sig: *const SignalInfo,
     sigsetsize: usize,
 ) -> AxResult<isize> {
     check_sigset_size(sigsetsize)?;
 
-    let sig = make_queue_signal_info(tgid, signo, sig)?;
-    send_signal_to_process(tgid, sig)?;
+    let sig = make_queue_signal_info(pid, signo, sig)?;
+    if let Ok(task) = get_visible_task(pid) {
+        let thread = task
+            .try_as_thread()
+            .ok_or(AxError::OperationNotPermitted)?;
+        if thread.proc_data.proc.pid() == pid {
+            if signo != 0 && parse_signo(signo)?.is_realtime() {
+                ensure_realtime_signal_queue_capacity_for_process(pid)?;
+            }
+            send_signal_to_process(pid, sig)?;
+        } else {
+            if signo != 0 && parse_signo(signo)?.is_realtime() {
+                ensure_realtime_signal_queue_capacity_for_thread(None, pid)?;
+            }
+            send_signal_to_visible_thread(None, pid, sig)?;
+        }
+    } else {
+        if signo != 0 && parse_signo(signo)?.is_realtime() {
+            ensure_realtime_signal_queue_capacity_for_process(pid)?;
+        }
+        send_signal_to_process(pid, sig)?;
+    }
     Ok(0)
 }
 
 pub fn sys_rt_tgsigqueueinfo(
-    tgid: Pid,
-    tid: Pid,
+    tgid: i32,
+    tid: i32,
     signo: u32,
     sig: *const SignalInfo,
     sigsetsize: usize,
 ) -> AxResult<isize> {
     check_sigset_size(sigsetsize)?;
+    if tgid <= 0 || tid <= 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if signo != 0 && parse_signo(signo)?.is_realtime() {
+        ensure_realtime_signal_queue_capacity_for_thread(Some(tgid as Pid), tid as Pid)?;
+    }
 
-    let sig = make_queue_signal_info(tgid, signo, sig)?;
-    send_signal_to_visible_thread(Some(tgid), tid, sig)?;
+    let sig = make_queue_signal_info(tgid as Pid, signo, sig)?;
+    send_signal_to_visible_thread(Some(tgid as Pid), tid as Pid, sig)?;
     Ok(0)
 }
 

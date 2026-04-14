@@ -1,11 +1,22 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use axhal::time::{TimeValue, nanos_to_ticks};
+use axhal::time::{NANOS_PER_SEC, TimeValue};
 use linux_raw_sys::general::{__kernel_old_timeval, rusage};
 use starry_process::ProcessUsage;
 
 use super::{AsThread, Thread, get_task};
 use crate::time::TimeValueLike;
+
+/// Linux exposes process CPU accounting in `clock_t` units, not raw platform
+/// timer ticks. Keep this conversion centralized so `/proc` and `times()`
+/// report the same scale.
+pub const CLOCK_TICKS_PER_SEC: u64 = 100;
+
+pub fn nanos_to_clock_ticks(nanos: u64) -> u64 {
+    nanos
+        .saturating_mul(CLOCK_TICKS_PER_SEC)
+        .saturating_div(NANOS_PER_SEC)
+}
 
 /// Durable CPU usage totals stored in nanoseconds.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -60,12 +71,12 @@ impl TaskUsage {
 
     /// User CPU time in clock ticks.
     pub fn utime_ticks(self) -> u64 {
-        nanos_to_ticks(self.utime_ns)
+        nanos_to_clock_ticks(self.utime_ns)
     }
 
     /// System CPU time in clock ticks.
     pub fn stime_ticks(self) -> u64 {
-        nanos_to_ticks(self.stime_ns)
+        nanos_to_clock_ticks(self.stime_ns)
     }
 }
 

@@ -209,4 +209,27 @@ mod cfs_fork {
             "forked child should inherit the parent's vruntime instead of cutting to the floor",
         );
     }
+
+    #[test]
+    fn yielding_parent_lets_forked_child_run() {
+        let mut scheduler = CFScheduler::<usize>::new();
+        let parent = Arc::new(CFSTask::new(1));
+
+        scheduler.add_task(parent.clone());
+        let running = scheduler.pick_next_task().unwrap();
+        assert_eq!(*running.inner(), 1);
+
+        let child = Arc::new(CFSTask::new(2));
+        child.inherit_fair_vruntime_from(&running);
+        scheduler.add_task(child);
+
+        scheduler.enqueue_task(running, EnqueueReason::Yield);
+
+        let next = scheduler.pick_next_task().unwrap();
+        assert_eq!(
+            *next.inner(),
+            2,
+            "a yielding parent should let its freshly forked child run first",
+        );
+    }
 }

@@ -137,6 +137,24 @@ pub fn get_visible_task(tid: Pid) -> AxResult<AxTaskRef> {
     Err(AxError::NoSuchProcess)
 }
 
+/// Finds the task with the given user-visible TID, including tasks that have
+/// begun exiting but are still published in the task tables.
+pub fn get_visible_task_including_exiting(tid: Pid) -> AxResult<AxTaskRef> {
+    if let Some(task) = TASK_ALIAS_TABLE.read().get(&tid)
+        && task.as_thread().tid() == tid
+    {
+        return Ok(task);
+    }
+
+    if let Some(task) = TASK_TABLE.read().get(&tid)
+        && task.as_thread().tid() == tid
+    {
+        return Ok(task);
+    }
+
+    Err(AxError::NoSuchProcess)
+}
+
 struct ProcStateHintGuard<'a> {
     thread: Option<&'a super::Thread>,
     prev: ProcStateHint,

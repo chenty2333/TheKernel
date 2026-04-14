@@ -3,7 +3,7 @@
 use alloc::{
     borrow::ToOwned,
     collections::{BTreeMap, binary_heap::BinaryHeap},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 use core::{
     future::{Future, poll_fn},
@@ -14,17 +14,21 @@ use core::{
     time::Duration,
 };
 
+use axerrno::LinuxError;
 use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time_nanos};
 use axpoll::PollSet;
 use axtask::{WeakAxTaskRef, current, future::block_on, register_timer_callback};
 use event_listener::{Event, listener};
 use kspin::SpinNoIrq;
 use lazy_static::lazy_static;
+use linux_raw_sys::general::SI_TIMER;
 use spin::Mutex;
-use starry_signal::Signo;
+use starry_process::Pid;
+use starry_signal::{SignalInfo, Signo};
 use strum::FromRepr;
 
-use crate::{task::poll_timer, time::wall_time};
+use super::{ProcessData, poll_timer, send_signal_to_process, send_signal_to_visible_thread};
+use crate::time::wall_time;
 
 fn time_value_from_nanos(nanos: usize) -> TimeValue {
     let secs = nanos as u64 / NANOS_PER_SEC;
@@ -48,12 +52,68 @@ impl AlarmClock {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum PosixTimerClock {
+    Realtime,
+    Monotonic,
+    Tai,
+    ProcessCpu,
+    ThreadCpu,
+}
+
+impl PosixTimerClock {
+    pub(crate) fn alarm_clock(self) -> AlarmClock {
+        match self {
+            Self::Realtime | Self::Tai => AlarmClock::Realtime,
+            Self::Monotonic | Self::ProcessCpu | Self::ThreadCpu => AlarmClock::Monotonic,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum PosixTimerNotify {
+    None,
+    Signal {
+        signo: Signo,
+        target_tid: Option<Pid>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PosixTimer {
+    pub clock: PosixTimerClock,
+    pub notify: PosixTimerNotify,
+    pub interval: Duration,
+    pub deadline: Option<Duration>,
+    pub sequence: u64,
+    pub overrun: i32,
+}
+
+impl PosixTimer {
+    pub(crate) fn new(clock: PosixTimerClock, notify: PosixTimerNotify) -> Self {
+        Self {
+            clock,
+            notify,
+            interval: Duration::ZERO,
+            deadline: None,
+            sequence: 0,
+            overrun: 0,
+        }
+    }
+}
+
 /// The action to take when an alarm fires.
 enum AlarmAction {
     /// Interrupt a task and poll its itimers.
     PollTask(WeakAxTaskRef),
     /// Wake a PollSet (used by timerfd).
     WakePollSet(Arc<PollSet>),
+    /// Deliver a POSIX timer event.
+    PosixTimer {
+        proc: Weak<ProcessData>,
+        timerid: usize,
+        sequence: u64,
+    },
 }
 
 struct Entry {
@@ -450,6 +510,114 @@ pub fn register_pollset_alarm(clock: AlarmClock, deadline: Duration, poll_set: A
     register_alarm(clock, deadline, AlarmAction::WakePollSet(poll_set));
 }
 
+pub(crate) fn register_posix_timer_alarm(
+    proc_data: &Arc<ProcessData>,
+    timerid: usize,
+    clock: AlarmClock,
+    deadline: Duration,
+    sequence: u64,
+) {
+    register_alarm(
+        clock,
+        deadline,
+        AlarmAction::PosixTimer {
+            proc: Arc::downgrade(proc_data),
+            timerid,
+            sequence,
+        },
+    );
+}
+
+fn saturating_duration_mul(duration: Duration, count: u128) -> Duration {
+    let nanos = duration.as_nanos().saturating_mul(count).min(u64::MAX as u128) as u64;
+    Duration::from_nanos(nanos)
+}
+
+fn posix_timer_signal_info(signo: Signo, timerid: usize, overrun: i32) -> SignalInfo {
+    let mut info = SignalInfo::new_kernel(signo);
+    info.set_code(SI_TIMER);
+    info.0
+        .__bindgen_anon_1
+        .__bindgen_anon_1
+        ._sifields
+        ._timer
+        ._tid = timerid as _;
+    info.0
+        .__bindgen_anon_1
+        .__bindgen_anon_1
+        ._sifields
+        ._timer
+        ._overrun = overrun;
+    info
+}
+
+fn fire_posix_timer(proc_data: Arc<ProcessData>, timerid: usize, sequence: u64) {
+    let (notify, overrun, next) = {
+        let mut timers = proc_data.posix_timers.lock();
+        let Some(Some(timer)) = timers.get_mut(timerid) else {
+            return;
+        };
+        if timer.sequence != sequence {
+            return;
+        }
+        let Some(deadline) = timer.deadline else {
+            return;
+        };
+
+        let now = timer.clock.alarm_clock().now();
+        if now < deadline {
+            return;
+        }
+
+        let overrun = if timer.interval.is_zero() {
+            0
+        } else {
+            let elapsed = now.saturating_sub(deadline).as_nanos();
+            let interval = timer.interval.as_nanos().max(1);
+            (elapsed / interval).min(i32::MAX as u128) as i32
+        };
+        timer.overrun = overrun;
+
+        let notify = timer.notify;
+        let next = if timer.interval.is_zero() {
+            timer.deadline = None;
+            timer.sequence = timer.sequence.wrapping_add(1);
+            None
+        } else {
+            let steps = 1_u128.saturating_add(overrun as u128);
+            let next_deadline = deadline
+                .checked_add(saturating_duration_mul(timer.interval, steps))
+                .unwrap_or(Duration::MAX);
+            timer.deadline = Some(next_deadline);
+            timer.sequence = timer.sequence.wrapping_add(1);
+            Some((timer.clock.alarm_clock(), next_deadline, timer.sequence))
+        };
+        (notify, overrun, next)
+    };
+
+    if let Some((clock, deadline, next_sequence)) = next {
+        register_posix_timer_alarm(&proc_data, timerid, clock, deadline, next_sequence);
+    }
+
+    let (signo, target_tid) = match notify {
+        PosixTimerNotify::None => return,
+        PosixTimerNotify::Signal { signo, target_tid } => (signo, target_tid),
+    };
+
+    let siginfo = posix_timer_signal_info(signo, timerid, overrun);
+    let result = if let Some(tid) = target_tid {
+        send_signal_to_visible_thread(Some(proc_data.proc.pid()), tid, Some(siginfo))
+    } else {
+        send_signal_to_process(proc_data.proc.pid(), Some(siginfo))
+    };
+
+    if let Err(err) = result
+        && LinuxError::from(err) != LinuxError::ESRCH
+    {
+        warn!("failed to deliver POSIX timer signal: {err:?}");
+    }
+}
+
 fn queue_deadline(clock: AlarmClock) -> Option<Duration> {
     let list = alarm_list(clock);
     let guard = list.lock();
@@ -479,6 +647,15 @@ fn process_due(clock: AlarmClock) -> bool {
             }
             AlarmAction::WakePollSet(poll_set) => {
                 poll_set.wake();
+            }
+            AlarmAction::PosixTimer {
+                proc,
+                timerid,
+                sequence,
+            } => {
+                if let Some(proc_data) = proc.upgrade() {
+                    fire_posix_timer(proc_data, timerid, sequence);
+                }
             }
         }
     }

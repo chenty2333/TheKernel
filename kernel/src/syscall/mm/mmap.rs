@@ -168,6 +168,48 @@ fn validate_fixed_remap_dst(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct MadviseRangeInfo {
+    all_private_anonymous: bool,
+    has_shared_mapping: bool,
+}
+
+fn inspect_madvise_range(
+    aspace: &AddrSpace,
+    start: VirtAddr,
+    size: usize,
+) -> AxResult<MadviseRangeInfo> {
+    let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+    let mut cursor = start;
+    let mut info = MadviseRangeInfo {
+        all_private_anonymous: true,
+        has_shared_mapping: false,
+    };
+
+    while cursor < end {
+        let Some(area) = aspace.find_area(cursor) else {
+            return Err(AxError::NoMemory);
+        };
+        if area.start() > cursor {
+            return Err(AxError::NoMemory);
+        }
+
+        match area.backend() {
+            Backend::Cow(backend) => {
+                info.all_private_anonymous &= backend.is_private_anonymous();
+            }
+            Backend::Linear(_) | Backend::Shared(_) | Backend::File(_) => {
+                info.all_private_anonymous = false;
+                info.has_shared_mapping = true;
+            }
+        }
+
+        cursor = area.end().min(end);
+    }
+
+    Ok(info)
+}
+
 fn map_relocated_segments(
     aspace: &mut AddrSpace,
     aspace_handle: &Arc<axsync::Mutex<AddrSpace>>,
@@ -649,26 +691,49 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
     if !addr.is_multiple_of(PageSize::Size4K as usize) {
         return Err(AxError::InvalidInput);
     }
+    if length == 0 {
+        return Ok(0);
+    }
 
     let curr = current();
     let aspace_handle = curr.as_thread().proc_data.aspace();
     let mut aspace = aspace_handle.lock();
-    let length = align_up_4k(length);
+    let (start, length) = validate_page_aligned_range(addr, length)?;
 
     match advice {
-        // Hints the kernel may safely ignore.
-        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_FREE | MADV_DONTNEED
-        | MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_HUGEPAGE
-        | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP
-        | MADV_COLD | MADV_PAGEOUT | MADV_POPULATE_READ | MADV_POPULATE_WRITE | MADV_COLLAPSE => {
+        // Hints the kernel may safely ignore once the range is known-valid.
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTFORK
+        | MADV_DOFORK | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP
+        | MADV_COLD | MADV_PAGEOUT | MADV_COLLAPSE => {
+            inspect_madvise_range(&aspace, start, length)?;
             Ok(0)
         }
-        MADV_WIPEONFORK | MADV_KEEPONFORK => {
-            if length == 0 {
-                return Ok(0);
+        MADV_POPULATE_READ => {
+            inspect_madvise_range(&aspace, start, length)?;
+            aspace.populate_area(start, length, MappingFlags::READ)?;
+            Ok(0)
+        }
+        MADV_POPULATE_WRITE => {
+            inspect_madvise_range(&aspace, start, length)?;
+            aspace.populate_area(start, length, MappingFlags::WRITE)?;
+            Ok(0)
+        }
+        MADV_DONTNEED => {
+            let info = inspect_madvise_range(&aspace, start, length)?;
+            if info.has_shared_mapping || aspace.range_is_locked(start, length) {
+                return Err(AxError::InvalidInput);
             }
-
-            let start = VirtAddr::from(addr);
+            Ok(0)
+        }
+        MADV_FREE => {
+            let info = inspect_madvise_range(&aspace, start, length)?;
+            if !info.all_private_anonymous {
+                return Err(AxError::InvalidInput);
+            }
+            Ok(0)
+        }
+        MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_REMOVE => Err(AxError::InvalidInput),
+        MADV_WIPEONFORK | MADV_KEEPONFORK => {
             let end = start + length;
             let mut cursor = start;
             while cursor < end {
@@ -683,7 +748,6 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
                 }
                 cursor = area.end().min(end);
             }
-
             aspace.set_wipe_on_fork(start, length, advice == MADV_WIPEONFORK)?;
             Ok(0)
         }
@@ -733,7 +797,7 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let aspace_handle = proc_data.aspace();
-    let aspace = aspace_handle.lock();
+    let mut aspace = aspace_handle.lock();
     let (start, length) = validate_page_aligned_range(addr, length)?;
     if length > 0 && !aspace.can_access_range(start, length, MappingFlags::empty()) {
         return Err(AxError::NoMemory);
@@ -749,6 +813,7 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
         }
     }
 
+    aspace.set_locked(start, length, true)?;
     Ok(0)
 }
 
@@ -758,11 +823,12 @@ pub fn sys_munlock(addr: usize, length: usize) -> AxResult<isize> {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let aspace_handle = proc_data.aspace();
-    let aspace = aspace_handle.lock();
+    let mut aspace = aspace_handle.lock();
     let (start, length) = validate_page_aligned_range(addr, length)?;
     if length > 0 && !aspace.can_access_range(start, length, MappingFlags::empty()) {
         return Err(AxError::NoMemory);
     }
 
+    aspace.set_locked(start, length, false)?;
     Ok(0)
 }

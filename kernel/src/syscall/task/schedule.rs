@@ -10,10 +10,10 @@ use axtask::{
     sched_state, set_sched_state, set_task_affinity,
 };
 use linux_raw_sys::general::{
-    __kernel_clockid_t, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC,
-    CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP, PRIO_PROCESS,
-    PRIO_USER, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE,
-    SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
+    __kernel_clockid_t, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID,
+    CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, SCHED_BATCH,
+    SCHED_DEADLINE, SCHED_FIFO, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE, SCHED_NORMAL,
+    SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
 };
 use starry_process::Pid;
 use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
@@ -286,7 +286,10 @@ fn sleep_relative(dur: TimeValue) -> TimeValue {
 
     // We detect EINTR manually if the slept time is not enough.
     let _ = with_proc_state_hint(ProcStateHint::Interruptible, || {
-        block_on(interruptible(sleep_until_clock(AlarmClock::Monotonic, deadline)))
+        block_on(interruptible(sleep_until_clock(
+            AlarmClock::Monotonic,
+            deadline,
+        )))
     });
 
     AlarmClock::Monotonic.now() - start

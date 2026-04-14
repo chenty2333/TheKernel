@@ -1,12 +1,14 @@
 use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult};
-use axfs::FS_CONTEXT;
 use axfs_ng_vfs::{Location, NodePermission, path::Path};
 use axtask::current;
 use linux_raw_sys::general::{
-    __kernel_fsid_t, AT_EACCESS, AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, R_OK, W_OK, X_OK, stat,
-    statfs, statx,
+    __kernel_fsid_t, AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT,
+    AT_STATX_SYNC_TYPE, AT_SYMLINK_NOFOLLOW, R_OK, STATX_ALL, STATX_ATIME, STATX_BLOCKS,
+    STATX_BTIME, STATX_CTIME, STATX_DIOALIGN, STATX_GID, STATX_INO, STATX_MODE, STATX_MNT_ID,
+    STATX_MNT_ID_UNIQUE, STATX_MTIME, STATX_NLINK, STATX_SIZE, STATX_SUBVOL, STATX_TYPE,
+    STATX_UID, STATX_WRITE_ATOMIC, W_OK, X_OK, stat, statfs, statx,
 };
 use starry_vm::{VmMutPtr, VmPtr};
 
@@ -14,14 +16,38 @@ use super::ctl::validate_pathname;
 use crate::{
     file::{
         Directory, File, FileLike, Pipe, Socket, get_file_like,
-        permission::{check_parent_search_permissions, granted_access_bits},
-        resolve_at,
+        permission::{
+            check_parent_search_permissions, check_path_prefix_search_permissions,
+            granted_access_bits,
+        },
+        resolve_at, with_path_fs,
     },
     mm::vm_load_string,
     task::AsThread,
 };
 
 const SUPPORTED_FACCESSAT_FLAGS: u32 = AT_EACCESS as u32 | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+const SUPPORTED_FSTATAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+const SUPPORTED_STATX_FLAGS: u32 =
+    AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE;
+const VALID_STATX_MASK: u32 = STATX_TYPE
+    | STATX_MODE
+    | STATX_NLINK
+    | STATX_UID
+    | STATX_GID
+    | STATX_ATIME
+    | STATX_MTIME
+    | STATX_CTIME
+    | STATX_INO
+    | STATX_SIZE
+    | STATX_BLOCKS
+    | STATX_BTIME
+    | STATX_MNT_ID
+    | STATX_DIOALIGN
+    | STATX_MNT_ID_UNIQUE
+    | STATX_SUBVOL
+    | STATX_WRITE_ATOMIC
+    | STATX_ALL;
 const PIPEFS_MAGIC: i64 = 0x5049_5045;
 const SOCKFS_MAGIC: i64 = 0x534f_434b;
 
@@ -58,11 +84,35 @@ pub fn sys_fstatat(
     statbuf: *mut stat,
     flags: u32,
 ) -> AxResult<isize> {
+    if flags & !SUPPORTED_FSTATAT_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if path.is_null() && flags & AT_EMPTY_PATH == 0 {
+        return Err(AxError::BadAddress);
+    }
     let path = path.nullable().map(vm_load_string).transpose()?;
+    if let Some(path) = path.as_deref() {
+        if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
+            return Err(AxError::NotFound);
+        }
+        validate_pathname(Path::new(path))?;
+    }
 
     debug!("sys_fstatat <= dirfd: {dirfd}, path: {path:?}, flags: {flags}");
 
     let loc = resolve_at(dirfd, path.as_deref(), flags)?;
+    if let crate::file::ResolveAtResult::File(file) = &loc {
+        let curr = current();
+        let proc_data = &curr.as_thread().proc_data;
+        if proc_data.fsuid() != 0 {
+            check_parent_search_permissions(
+                file,
+                proc_data.fsuid(),
+                proc_data.fsgid(),
+                &proc_data.supplementary_groups(),
+            )?;
+        }
+    }
     statbuf.vm_write(loc.stat()?.into())?;
 
     Ok(0)
@@ -72,7 +122,7 @@ pub fn sys_statx(
     dirfd: c_int,
     path: *const c_char,
     flags: u32,
-    _mask: u32,
+    mask: u32,
     statxbuf: *mut statx,
 ) -> AxResult<isize> {
     // `statx()` uses pathname, dirfd, and flags to identify the target
@@ -104,8 +154,36 @@ pub fn sys_statx(
 
     let path = path.nullable().map(vm_load_string).transpose()?;
     debug!("sys_statx <= dirfd: {dirfd}, path: {path:?}, flags: {flags}");
+    if flags & !SUPPORTED_STATX_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if mask & !VALID_STATX_MASK != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if path.is_none() && flags & AT_EMPTY_PATH == 0 {
+        return Err(AxError::BadAddress);
+    }
+    if let Some(path) = path.as_deref() {
+        if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
+            return Err(AxError::NotFound);
+        }
+        validate_pathname(Path::new(path))?;
+    }
 
-    statxbuf.vm_write(resolve_at(dirfd, path.as_deref(), flags)?.stat()?.into())?;
+    let loc = resolve_at(dirfd, path.as_deref(), flags)?;
+    if let crate::file::ResolveAtResult::File(file) = &loc {
+        let curr = current();
+        let proc_data = &curr.as_thread().proc_data;
+        if proc_data.fsuid() != 0 {
+            check_parent_search_permissions(
+                file,
+                proc_data.fsuid(),
+                proc_data.fsgid(),
+                &proc_data.supplementary_groups(),
+            )?;
+        }
+    }
+    statxbuf.vm_write(loc.stat()?.into())?;
 
     Ok(0)
 }
@@ -244,14 +322,26 @@ fn special_fd_statfs(fd: &dyn FileLike) -> Option<AxResult<statfs>> {
 pub fn sys_statfs(path: *const c_char, buf: *mut statfs) -> AxResult<isize> {
     let path = vm_load_string(path)?;
     debug!("sys_statfs <= path: {path:?}");
+    if path.is_empty() {
+        return Err(AxError::NotFound);
+    }
+    let path_ref = Path::new(&path);
+    validate_pathname(path_ref)?;
 
-    buf.vm_write(statfs(
-        &FS_CONTEXT
-            .lock()
-            .resolve(path)?
-            .mountpoint()
-            .root_location(),
-    )?)?;
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let loc = with_path_fs(AT_FDCWD, path_ref, |fs| {
+        check_path_prefix_search_permissions(
+            fs,
+            path_ref,
+            proc_data.fsuid(),
+            proc_data.fsgid(),
+            &proc_data.supplementary_groups(),
+        )?;
+        fs.resolve(path_ref).map_err(Into::into)
+    })?;
+
+    buf.vm_write(statfs(&loc.mountpoint().root_location())?)?;
     Ok(0)
 }
 

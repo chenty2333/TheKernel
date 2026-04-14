@@ -23,7 +23,8 @@ use crate::{
     file::{
         Directory, FileLike, get_file_like,
         permission::{
-            check_create_permissions, check_parent_search_permissions, check_search_permissions,
+            check_create_permissions, check_parent_search_permissions, check_remove_permissions,
+            check_rename_permissions, check_search_permissions,
         },
         resolve_at, with_fs, with_path_fs,
     },
@@ -35,6 +36,7 @@ use crate::{
 const SUPPORTED_RENAMEAT2_FLAGS: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
 const PATH_MAX: usize = 4096;
 const SUPPORTED_FCHMODAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+const SUPPORTED_UNLINKAT_FLAGS: u32 = AT_REMOVEDIR;
 
 pub(super) fn validate_pathname(path: &Path) -> AxResult {
     if path.as_str().len() >= PATH_MAX
@@ -165,7 +167,7 @@ pub fn sys_chroot(path: *const c_char) -> AxResult<isize> {
     if proc_data.euid() != 0 {
         return Err(AxError::OperationNotPermitted);
     }
-    *fs = FsContext::new(loc);
+    fs.set_root_dir(loc)?;
     Ok(0)
 }
 
@@ -415,15 +417,35 @@ pub fn sys_link(old_path: *const c_char, new_path: *const c_char) -> AxResult<is
 /// flags: can be 0 or AT_REMOVEDIR
 /// return 0 when success, else return -1
 pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<isize> {
+    if (flags as u32) & !SUPPORTED_UNLINKAT_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
     let path = vm_load_string(path)?;
+    let path_ref = Path::new(&path);
+    if path.is_empty() {
+        return Err(AxError::NotFound);
+    }
+    validate_pathname(path_ref)?;
 
     debug!("sys_unlinkat <= dirfd: {dirfd}, path: {path:?}, flags: {flags}");
 
-    let loc = with_path_fs(dirfd, Path::new(&path), |fs| fs.resolve_no_follow(&path))?;
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let supplementary_groups = proc_data.supplementary_groups();
+    let loc = with_path_fs(dirfd, path_ref, |fs| fs.resolve_no_follow(path_ref))?;
     let parent = loc.parent();
     let name = loc.name().to_string();
     let is_dir = loc.is_dir();
     let clear_xattrs = is_dir || loc.metadata()?.nlink <= 1;
+    if let Some(parent) = parent.as_ref() {
+        check_remove_permissions(
+            parent,
+            &loc,
+            proc_data.fsuid(),
+            proc_data.fsgid(),
+            &supplementary_groups,
+        )?;
+    }
     with_path_fs(dirfd, Path::new(&path), |fs| {
         if flags == AT_REMOVEDIR as _ {
             fs.remove_dir(&path)?;
@@ -743,6 +765,8 @@ pub fn sys_renameat2(
 ) -> AxResult<isize> {
     let old_path = vm_load_string(old_path)?;
     let new_path = vm_load_string(new_path)?;
+    let old_path_ref = Path::new(&old_path);
+    let new_path_ref = Path::new(&new_path);
     debug!(
         "sys_renameat2 <= old_dirfd: {old_dirfd}, old_path: {old_path:?}, new_dirfd: {new_dirfd}, \
          new_path: {new_path}, flags: {flags}"
@@ -760,46 +784,65 @@ pub fn sys_renameat2(
     if flags & RENAME_WHITEOUT != 0 {
         return Err(AxError::Unsupported);
     }
+    if old_path.is_empty() || new_path.is_empty() {
+        return Err(AxError::NotFound);
+    }
+    validate_pathname(old_path_ref)?;
+    validate_pathname(new_path_ref)?;
 
-    let old_loc = with_path_fs(old_dirfd, Path::new(&old_path), |fs| {
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let supplementary_groups = proc_data.supplementary_groups();
+    let old_loc = with_path_fs(old_dirfd, old_path_ref, |fs| {
         fs.resolve_no_follow(&old_path)
     })?;
     let old_is_dir = old_loc.is_dir();
-    let old_path = Path::new(&old_path);
-    let new_path = Path::new(&new_path);
-    let old_is_root = with_path_fs(old_dirfd, old_path, |fs| {
-        Ok(fs.path_refers_to_root(old_path))
+    let old_is_root = with_path_fs(old_dirfd, old_path_ref, |fs| {
+        Ok(fs.path_refers_to_root(old_path_ref))
     })?;
-    let new_is_root = with_path_fs(new_dirfd, new_path, |fs| {
-        Ok(fs.path_refers_to_root(new_path))
+    let new_is_root = with_path_fs(new_dirfd, new_path_ref, |fs| {
+        Ok(fs.path_refers_to_root(new_path_ref))
     })?;
 
     if old_is_root {
         if new_is_root {
             return Err(AxError::ResourceBusy);
         }
-        with_path_fs(new_dirfd, new_path, |fs| {
-            fs.resolve_parent(new_path)?;
+        with_path_fs(new_dirfd, new_path_ref, |fs| {
+            fs.resolve_parent(new_path_ref)?;
             Err(AxError::ResourceBusy)
         })?;
     }
 
     if new_is_root {
-        with_path_fs(old_dirfd, old_path, |fs| {
-            fs.resolve_no_follow(old_path)?;
+        with_path_fs(old_dirfd, old_path_ref, |fs| {
+            fs.resolve_no_follow(old_path_ref)?;
             Ok(())
         })?;
         return Err(AxError::ResourceBusy);
     }
 
-    if same_entry_at(old_dirfd, old_path, new_dirfd, new_path)? {
+    if same_entry_at(old_dirfd, old_path_ref, new_dirfd, new_path_ref)? {
         return Ok(0);
     }
 
-    let (old_dir, old_name) = with_path_fs(old_dirfd, old_path, |fs| fs.resolve_parent(old_path))?;
-    let (new_dir, new_name) = with_path_fs(new_dirfd, new_path, |fs| fs.resolve_parent(new_path))?;
+    let (old_dir, old_name) =
+        with_path_fs(old_dirfd, old_path_ref, |fs| fs.resolve_parent(old_path_ref))?;
+    let (new_dir, new_name) =
+        with_path_fs(new_dirfd, new_path_ref, |fs| fs.resolve_parent(new_path_ref))?;
+    let new_existing = resolve_existing_at(new_dirfd, new_path_ref)?;
 
-    if flags & RENAME_NOREPLACE != 0 && resolve_existing_at(new_dirfd, new_path)?.is_some() {
+    check_rename_permissions(
+        &old_dir,
+        &old_loc,
+        &new_dir,
+        new_existing.as_ref(),
+        proc_data.fsuid(),
+        proc_data.fsgid(),
+        &supplementary_groups,
+    )?;
+
+    if flags & RENAME_NOREPLACE != 0 && new_existing.is_some() {
         return Err(AxError::AlreadyExists);
     }
 

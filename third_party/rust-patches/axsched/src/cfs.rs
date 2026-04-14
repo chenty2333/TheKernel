@@ -484,7 +484,20 @@ impl<T> BaseScheduler for CFScheduler<T> {
                 task.rebase_vruntime(vruntime);
                 self.insert_fair_task(task);
             }
-            EnqueueReason::Yield | EnqueueReason::Preempt => self.put_prev_task(task, false),
+            EnqueueReason::Yield => {
+                // A cooperative yield should put a fair task behind peers that
+                // are already ready, otherwise fork storms keep rescheduling
+                // the yielding parent and freshly forked children never reach
+                // their first blocking syscall.
+                let floor = self
+                    .min_ready_vruntime()
+                    .unwrap_or_else(|| self.queue_floor())
+                    .saturating_add(FAIR_PREEMPT_GRANULARITY_TICKS);
+                let vruntime = task.get_vruntime().max(floor);
+                task.rebase_vruntime(vruntime);
+                self.insert_fair_task(task);
+            }
+            EnqueueReason::Preempt => self.put_prev_task(task, false),
         }
     }
 

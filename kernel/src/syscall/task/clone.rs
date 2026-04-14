@@ -5,7 +5,8 @@ use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
 use axtask::{
-    AxTaskExt, SchedClass, current, future::block_on, sched_state, spawn_task_with_sched_from,
+    AxTaskExt, SchedClass, current, future::block_on, sched_state, spawn_task_with_sched,
+    yield_now,
 };
 use bitflags::bitflags;
 use kspin::SpinNoIrq;
@@ -17,6 +18,7 @@ use starry_vm::VmMutPtr;
 use crate::{
     file::{FD_TABLE, FileLike, PidFd, close_file_like},
     mm::copy_from_kernel,
+    syscall::inherit_proc_shm,
     task::{AsThread, ProcessData, Thread, add_task_to_table, new_user_task, vm_write_in_aspace},
 };
 
@@ -329,6 +331,7 @@ impl CloneArgs {
             }
         } else {
             new_proc_data.proc.add_thread(tid);
+            inherit_proc_shm(old_proc_data.proc.pid(), new_proc_data.proc.pid());
         }
 
         let rollback_clone_setup = || {
@@ -374,8 +377,18 @@ impl CloneArgs {
             new_proc_data.begin_vfork(curr.id().as_u64() as Pid);
         }
 
-        let task = spawn_task_with_sched_from(new_task, child_sched_state, &curr);
+        // Freshly forked user tasks need to run once promptly so they can
+        // establish their first blocking point before the parent starts
+        // /proc-based synchronization loops. Seeding them behind the parent's
+        // fair vruntime leaves large fork storms stuck in runnable state long
+        // enough for LTP children to hit their own futex timeouts first.
+        let task = spawn_task_with_sched(new_task, child_sched_state);
         add_task_to_table(&task);
+        // Give the freshly cloned task a chance to enter its first blocking
+        // syscall before the parent spins in /proc-based synchronization
+        // loops. Large LTP fork storms otherwise leave children runnable long
+        // enough to trip their own timeouts on the single-CPU contest shape.
+        yield_now();
 
         if flags.contains(CloneFlags::VFORK) {
             Self::wait_for_vfork(&new_proc_data);

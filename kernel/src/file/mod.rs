@@ -48,6 +48,7 @@ pub use self::{
     pidfd::PidFd,
     pipe::Pipe,
 };
+pub(crate) use self::fs::{allowed_write_len, check_resize_limit};
 use crate::task::{AX_FILE_LIMIT, AsThread};
 
 #[derive(Debug, Clone, Copy)]

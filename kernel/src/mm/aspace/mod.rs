@@ -34,6 +34,7 @@ pub struct AddrSpace {
     areas: MemorySet<Backend>,
     growdown_starts: BTreeSet<VirtAddr>,
     wipe_on_fork_ranges: BTreeMap<VirtAddr, VirtAddr>,
+    locked_ranges: BTreeMap<VirtAddr, VirtAddr>,
     pt: PageTable,
 }
 
@@ -82,6 +83,7 @@ impl AddrSpace {
             areas: MemorySet::new(),
             growdown_starts: BTreeSet::new(),
             wipe_on_fork_ranges: BTreeMap::new(),
+            locked_ranges: BTreeMap::new(),
             pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,
         })
     }
@@ -163,6 +165,70 @@ impl AddrSpace {
             self.insert_wipe_on_fork_range(start, start + size);
         }
         Ok(())
+    }
+
+    fn insert_locked_range(&mut self, start: VirtAddr, end: VirtAddr) {
+        if start >= end {
+            return;
+        }
+
+        let mut new_start = start;
+        let mut new_end = end;
+        let overlaps: Vec<_> = self
+            .locked_ranges
+            .range(..=end)
+            .filter_map(|(&range_start, &range_end)| {
+                (range_end >= start && range_start <= end).then_some((range_start, range_end))
+            })
+            .collect();
+        for (range_start, range_end) in overlaps {
+            self.locked_ranges.remove(&range_start);
+            new_start = new_start.min(range_start);
+            new_end = new_end.max(range_end);
+        }
+        self.locked_ranges.insert(new_start, new_end);
+    }
+
+    fn clear_locked_range(&mut self, start: VirtAddr, size: usize) {
+        if size == 0 {
+            return;
+        }
+        let end = start + size;
+        let overlaps: Vec<_> = self
+            .locked_ranges
+            .range(..end)
+            .filter_map(|(&range_start, &range_end)| {
+                (range_end > start).then_some((range_start, range_end))
+            })
+            .collect();
+        for (range_start, range_end) in overlaps {
+            self.locked_ranges.remove(&range_start);
+            if range_start < start {
+                self.locked_ranges.insert(range_start, start);
+            }
+            if range_end > end {
+                self.locked_ranges.insert(end, range_end);
+            }
+        }
+    }
+
+    pub fn set_locked(&mut self, start: VirtAddr, size: usize, enabled: bool) -> AxResult {
+        self.validate_region(start, size)?;
+        self.clear_locked_range(start, size);
+        if enabled {
+            self.insert_locked_range(start, start + size);
+        }
+        Ok(())
+    }
+
+    pub fn range_is_locked(&self, start: VirtAddr, size: usize) -> bool {
+        if size == 0 {
+            return false;
+        }
+        let end = start + size;
+        self.locked_ranges
+            .range(..end)
+            .any(|(&range_start, &range_end)| range_end > start && range_start < end)
     }
 
     fn validate_region(&self, start: VirtAddr, size: usize) -> AxResult {
@@ -311,6 +377,7 @@ impl AddrSpace {
         self.areas.unmap(start, size, &mut self.pt)?;
         self.refresh_growdown_starts();
         self.clear_wipe_on_fork_range(start, size);
+        self.clear_locked_range(start, size);
         Ok(())
     }
 
@@ -393,6 +460,7 @@ impl AddrSpace {
         }
         self.growdown_starts.clear();
         self.wipe_on_fork_ranges.clear();
+        self.locked_ranges.clear();
     }
 
     fn try_handle_growdown_fault(
@@ -604,7 +672,8 @@ impl AddrSpace {
                     )?
                 };
 
-                let new_area = MemoryArea::new(area.start(), area.size(), area.flags(), new_backend);
+                let new_area =
+                    MemoryArea::new(area.start(), area.size(), area.flags(), new_backend);
                 let aspace = guard.deref_mut();
                 aspace.areas.map(new_area, &mut aspace.pt, false)?;
                 continue;
@@ -627,8 +696,7 @@ impl AddrSpace {
                     };
                     let new_backend =
                         new_backend.relocate(area.start(), cursor, &new_aspace_clone)?;
-                    let new_area =
-                        MemoryArea::new(cursor, segment_size, area.flags(), new_backend);
+                    let new_area = MemoryArea::new(cursor, segment_size, area.flags(), new_backend);
                     let aspace = guard.deref_mut();
                     aspace.areas.map(new_area, &mut aspace.pt, false)?;
                 }

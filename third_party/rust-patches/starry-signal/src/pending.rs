@@ -65,4 +65,8 @@ impl PendingSignals {
             }
         })
     }
+
+    pub fn realtime_count(&self) -> usize {
+        self.info_rt.iter().map(VecDeque::len).sum()
+    }
 }

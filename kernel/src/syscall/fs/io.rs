@@ -3,9 +3,9 @@ use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FileFlags, OpenOptions};
-use axio::{IoBuf, Seek, SeekFrom};
+use axio::{Cursor, Seek, SeekFrom};
 use axpoll::{IoEvents, Pollable};
-use linux_raw_sys::general::__kernel_off_t;
+use linux_raw_sys::general::{__kernel_off_t, W_OK};
 use starry_vm::{VmMutPtr, VmPtr};
 use syscalls::Sysno;
 
@@ -15,10 +15,13 @@ use crate::{
         get_typed_file,
         inotify::{notify_read, notify_write},
         lease, memfd,
+        permission::check_open_permissions,
     },
     mm::{IoVec, IoVectorBuf, UserConstPtr, VmBytes, VmBytesMut},
     pseudofs::tmp,
 };
+use crate::file::{allowed_write_len, check_resize_limit};
+use crate::task::AsThread;
 
 const SEEK_DATA: c_int = 3;
 const SEEK_HOLE: c_int = 4;
@@ -28,6 +31,7 @@ const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
 const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
 const TMPFS_FALLOC_BLOCK_SIZE: u64 = 4096;
 const FALLOC_IO_CHUNK: usize = 64 * 1024;
+const SPLICE_F_NONBLOCK: u32 = 0x02;
 const SYNC_FILE_RANGE_WAIT_BEFORE: u32 = 0x01;
 const SYNC_FILE_RANGE_WRITE: u32 = 0x02;
 const SYNC_FILE_RANGE_WAIT_AFTER: u32 = 0x04;
@@ -109,8 +113,15 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
 
 pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     debug!("sys_writev <= fd: {fd}, iovcnt: {iovcnt}");
-    let f = get_file_like(fd)?;
-    let written = f.write(&mut IoVectorBuf::new(iov, iovcnt)?.into_io())? as isize;
+    let iov = IoVectorBuf::new(iov, iovcnt)?;
+    let written = if let Ok(file) = get_typed_file::<File>(fd) {
+        let data = iov.read_all()?;
+        let mut cursor = Cursor::new(data.as_slice());
+        file.write(&mut cursor)?
+    } else {
+        let f = get_file_like(fd)?;
+        f.write(&mut iov.into_io())?
+    } as isize;
     if written > 0 {
         notify_write(fd);
     }
@@ -226,12 +237,27 @@ fn do_pwritev(
     }
 
     let file = positioned_write_file(fd)?;
-    let mut io = IoVectorBuf::new(iov, iovcnt)?.into_io();
+    let io = IoVectorBuf::new(iov, iovcnt)?;
     let written = if offset == -1 {
-        file.write(&mut io)?
+        let data = io.read_all()?;
+        let mut cursor = Cursor::new(data.as_slice());
+        file.write(&mut cursor)?
     } else {
-        memfd::check_write(file.inner().location(), offset as u64, io.remaining())?;
-        file.inner().write_at(io, offset as u64)?
+        let data = io.read_all()?;
+        if file.inner().flags().contains(FileFlags::APPEND) {
+            let append_offset = file.inner().location().len()?;
+            let allowed = allowed_write_len(append_offset, data.len())?;
+            memfd::check_write(file.inner().location(), append_offset, allowed)?;
+            file.inner()
+                .access(FileFlags::APPEND)?
+                .append(Cursor::new(&data[..allowed]))?
+                .0
+        } else {
+            let allowed = allowed_write_len(offset as u64, data.len())?;
+            memfd::check_write(file.inner().location(), offset as u64, allowed)?;
+            file.inner()
+                .write_at(Cursor::new(&data[..allowed]), offset as u64)?
+        }
     } as isize;
     if written > 0 {
         notify_write(fd);
@@ -251,21 +277,83 @@ pub fn sys_lseek(fd: c_int, offset: __kernel_off_t, whence: c_int) -> AxResult<i
             if let Some(result) =
                 tmp::seek_data_or_hole(file.inner().location(), offset as u64, whence == SEEK_HOLE)
             {
-                return result.map(|off| off as isize);
+                let off = result?;
+                seek_file_like(&seekable_fd(fd)?, off as __kernel_off_t, 0)?;
+                return Ok(off as isize);
             }
-            Err(AxError::Unsupported)
+            let off = generic_seek_data_or_hole(file.inner(), offset as u64, whence == SEEK_HOLE)?;
+            seek_file_like(&seekable_fd(fd)?, off as __kernel_off_t, 0)?;
+            Ok(off as isize)
         }
         _ => Err(AxError::InvalidInput),
+    }
+}
+
+fn generic_seek_data_or_hole(file: &axfs::File, offset: u64, seek_hole: bool) -> AxResult<u64> {
+    let metadata = file.location().metadata()?;
+    let size = metadata.size;
+    if offset > size {
+        return Err(AxError::InvalidInput);
+    }
+    if offset == size {
+        return if seek_hole {
+            Ok(size)
+        } else {
+            Err(AxError::NotFound)
+        };
+    }
+
+    let block_size = metadata.block_size.max(1) as usize;
+    let mut buf = vec![0u8; block_size];
+    let mut block = offset / block_size as u64;
+    let last_block = size.div_ceil(block_size as u64);
+    let mut result = offset;
+
+    while block < last_block {
+        let block_start = block * block_size as u64;
+        let block_end = (block_start + block_size as u64).min(size);
+        let valid = (block_end - block_start) as usize;
+        let read = file.read_at(&mut buf[..valid], block_start)?;
+        if read < valid {
+            buf[read..valid].fill(0);
+        }
+        let is_data = buf[..valid].iter().any(|&byte| byte != 0);
+        if seek_hole != is_data {
+            return Ok(result.min(size));
+        }
+
+        block += 1;
+        result = block * block_size as u64;
+    }
+
+    if seek_hole {
+        Ok(size)
+    } else {
+        Err(AxError::NotFound)
     }
 }
 
 pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxResult<isize> {
     let path = path.get_as_str()?;
     debug!("sys_truncate <= {path:?} {length}");
+    if path.is_empty() {
+        return Err(AxError::NotFound);
+    }
     if length < 0 {
         return Err(AxError::InvalidInput);
     }
+    let curr = axtask::current();
+    let proc_data = &curr.as_thread().proc_data;
+    let supplementary_groups = proc_data.supplementary_groups();
     let loc = FS_CONTEXT.lock().resolve(path)?;
+    check_open_permissions(
+        &loc,
+        W_OK as u32,
+        proc_data.fsuid(),
+        proc_data.fsgid(),
+        &supplementary_groups,
+    )?;
+    check_resize_limit(length as u64)?;
     lease::wait_for_truncate(&loc)?;
     memfd::check_resize(&loc, length as u64)?;
     let file = OpenOptions::new()
@@ -281,6 +369,7 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     if length < 0 {
         return Err(AxError::InvalidInput);
     }
+    check_resize_limit(length as u64)?;
     let file_like = get_file_like(fd)?;
     let kind = FileLikeKind::from_file_like(file_like.as_ref());
     match kind {
@@ -337,6 +426,7 @@ pub fn sys_fallocate(
 
     match mode {
         0 => {
+            check_resize_limit(size.max(end))?;
             memfd::check_resize(&loc, size.max(end))?;
             backend.set_len(size.max(end))?;
             let _ = tmp::reserve_fallocate_range(&loc, offset, len, false);
@@ -365,6 +455,7 @@ pub fn sys_fallocate(
             let zero_end = if mode & FALLOC_FL_KEEP_SIZE != 0 {
                 end.min(size)
             } else {
+                check_resize_limit(size.max(end))?;
                 memfd::check_resize(&loc, size.max(end))?;
                 backend.set_len(size.max(end))?;
                 end
@@ -457,11 +548,21 @@ pub fn sys_fadvise64(
     advice: u32,
 ) -> AxResult<isize> {
     debug!("sys_fadvise64 <= fd: {fd}, offset: {offset}, len: {len}, advice: {advice}");
-    if Pipe::from_fd(fd).is_ok() {
-        return Err(AxError::BrokenPipe);
+    if offset < 0 || len < 0 {
+        return Err(AxError::InvalidInput);
     }
     if advice > 5 {
         return Err(AxError::InvalidInput);
+    }
+    let file_like = get_file_like(fd)?;
+    match FileLikeKind::from_file_like(file_like.as_ref()) {
+        FileLikeKind::Fifo | FileLikeKind::Socket => {
+            return Err(AxError::from(LinuxError::ESPIPE));
+        }
+        FileLikeKind::Regular | FileLikeKind::Directory | FileLikeKind::Other => {}
+    }
+    if let Some(file) = file_like.downcast_ref::<File>() {
+        file.inner().access(FileFlags::empty())?;
     }
     Ok(0)
 }
@@ -484,15 +585,26 @@ pub fn sys_pwrite64(
     len: usize,
     offset: __kernel_off_t,
 ) -> AxResult<isize> {
-    if len == 0 {
-        return Ok(0);
-    }
     if offset < 0 {
         return Err(AxError::InvalidInput);
     }
+    if len == 0 {
+        return Ok(0);
+    }
     let f = positioned_write_file(fd)?;
-    memfd::check_write(f.inner().location(), offset as u64, len)?;
-    let write = f.inner().write_at(VmBytes::new(buf, len), offset as _)?;
+    let write = if f.inner().flags().contains(FileFlags::APPEND) {
+        let append_offset = f.inner().location().len()?;
+        let allowed = allowed_write_len(append_offset, len)?;
+        memfd::check_write(f.inner().location(), append_offset, allowed)?;
+        f.inner()
+            .access(FileFlags::APPEND)?
+            .append(VmBytes::new(buf, allowed))?
+            .0
+    } else {
+        let allowed = allowed_write_len(offset as u64, len)?;
+        memfd::check_write(f.inner().location(), offset as u64, allowed)?;
+        f.inner().write_at(VmBytes::new(buf, allowed), offset as _)?
+    };
     if write > 0 {
         notify_write(fd);
     }
@@ -681,6 +793,14 @@ fn validate_splice_endpoint(fd: c_int, input: bool) -> AxResult<()> {
     Err(AxError::InvalidInput)
 }
 
+fn pipe_from_fd(fd: c_int, non_pipe_error: AxError) -> AxResult<FileHandle<Pipe>> {
+    let file = get_file_like(fd).map_err(|_| AxError::BadFileDescriptor)?;
+    if file.downcast_ref::<Pipe>().is_none() {
+        return Err(non_pipe_error);
+    }
+    get_typed_file(fd)
+}
+
 pub fn sys_sendfile(out_fd: c_int, in_fd: c_int, offset: *mut u64, len: usize) -> AxResult<isize> {
     debug!(
         "sys_sendfile <= out_fd: {}, in_fd: {}, offset: {}, len: {}",
@@ -824,4 +944,29 @@ pub fn sys_splice(
     }
 
     do_send(src, dst, len).map(|n| n as _)
+}
+
+pub fn sys_tee(fd_in: c_int, fd_out: c_int, len: usize, flags: u32) -> AxResult<isize> {
+    debug!("sys_tee <= fd_in: {fd_in}, fd_out: {fd_out}, len: {len}, flags: {flags:#x}");
+
+    let src = pipe_from_fd(fd_in, AxError::InvalidInput)?;
+    let dst = pipe_from_fd(fd_out, AxError::InvalidInput)?;
+    src.tee_to(&dst, len, flags & SPLICE_F_NONBLOCK != 0)
+        .map(|n| n as _)
+}
+
+pub fn sys_vmsplice(fd: c_int, iov: *const IoVec, nr_segs: usize, flags: u32) -> AxResult<isize> {
+    debug!("sys_vmsplice <= fd: {fd}, iov: {iov:p}, nr_segs: {nr_segs}, flags: {flags:#x}");
+
+    let pipe = pipe_from_fd(fd, AxError::BadFileDescriptor)?;
+    let mut io = IoVectorBuf::new(iov, nr_segs)?.into_io();
+    let nonblocking = flags & SPLICE_F_NONBLOCK != 0 || pipe.nonblocking();
+
+    let result = if pipe.is_write() {
+        pipe.vmsplice_write(&mut io, nonblocking)
+    } else {
+        pipe.vmsplice_read(&mut io, nonblocking)
+    };
+
+    result.map(|n| n as _)
 }

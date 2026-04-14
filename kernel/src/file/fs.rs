@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, string::ToString};
+use alloc::{borrow::Cow, string::ToString, vec};
 use core::{
     ffi::c_int,
     hint::likely,
@@ -6,17 +6,63 @@ use core::{
     task::Context,
 };
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FsContext};
 use axfs_ng_vfs::{Location, Metadata, NodeFlags, path::Path};
-use axio::{IoBuf, Seek, SeekFrom};
+use axio::{Cursor, IoBuf, Seek, SeekFrom};
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
+use axtask::current;
 use axtask::future::{block_on, poll_io};
-use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
+use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, RLIM_INFINITY, RLIMIT_FSIZE};
+use starry_signal::{SignalInfo, Signo};
 
 use super::{FileHandle, FileLike, Kstat, get_file_like, get_typed_file};
-use crate::file::{IoDst, IoSrc, memfd};
+use crate::{
+    file::{IoDst, IoSrc, memfd},
+    task::{AsThread, send_signal_to_process},
+};
+
+fn fsize_limit() -> Option<u64> {
+    let limit = current().as_thread().proc_data.rlim.read()[RLIMIT_FSIZE].current;
+    (limit != RLIM_INFINITY as i64 as u64).then_some(limit)
+}
+
+fn raise_sigxfsz() {
+    let curr = current();
+    let pid = curr.as_thread().proc_data.proc.pid();
+    let _ = send_signal_to_process(pid, Some(SignalInfo::new_kernel(Signo::SIGXFSZ)));
+}
+
+pub(crate) fn allowed_write_len(offset: u64, len: usize) -> AxResult<usize> {
+    if len == 0 {
+        return Ok(0);
+    }
+
+    let Some(limit) = fsize_limit() else {
+        return Ok(len);
+    };
+
+    if offset >= limit {
+        raise_sigxfsz();
+        return Err(AxError::from(LinuxError::EFBIG));
+    }
+
+    Ok(len.min(limit.saturating_sub(offset) as usize))
+}
+
+pub(crate) fn check_resize_limit(new_len: u64) -> AxResult<()> {
+    let Some(limit) = fsize_limit() else {
+        return Ok(());
+    };
+
+    if new_len > limit {
+        raise_sigxfsz();
+        return Err(AxError::from(LinuxError::EFBIG));
+    }
+
+    Ok(())
+}
 
 pub fn with_fs<R>(dirfd: c_int, f: impl FnOnce(&mut FsContext) -> AxResult<R>) -> AxResult<R> {
     let mut fs = FS_CONTEXT.lock();
@@ -154,6 +200,7 @@ impl FileLike for File {
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
         let inner = self.inner();
         let len = src.remaining();
+        let mut limited = None;
         if len != 0 {
             let offset = if inner.flags().contains(axfs::FileFlags::APPEND) {
                 inner.location().len()?
@@ -161,9 +208,28 @@ impl FileLike for File {
                 let mut file = inner;
                 file.seek(SeekFrom::Current(0))?
             };
-            memfd::check_write(inner.location(), offset, len)?;
+            let allowed = allowed_write_len(offset, len)?;
+            if allowed == 0 {
+                return Ok(0);
+            }
+            memfd::check_write(inner.location(), offset, allowed)?;
+            if allowed < len {
+                let mut buf = vec![0u8; allowed];
+                let read = src.read(&mut buf)?;
+                limited = Some(buf[..read].to_vec());
+            }
         }
-        if likely(self.is_blocking()) {
+
+        if let Some(buf) = limited {
+            let mut cursor = Cursor::new(buf.as_slice());
+            if likely(self.is_blocking()) {
+                inner.write(&mut cursor)
+            } else {
+                block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
+                    inner.write(&mut cursor)
+                }))
+            }
+        } else if likely(self.is_blocking()) {
             inner.write(src)
         } else {
             block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {

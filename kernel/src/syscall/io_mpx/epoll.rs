@@ -1,18 +1,16 @@
 use core::time::Duration;
 
-use axerrno::{AxError, AxResult, LinuxError};
+use axerrno::{AxError, AxResult};
 use axhal::uspace::UserContext;
 use axpoll::IoEvents;
-use axtask::{
-    current,
-    future::{self, block_on, poll_io},
-};
+use axtask::future::{self, block_on, poll_io};
 use bitflags::bitflags;
 use linux_raw_sys::general::{
     EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, epoll_event, timespec,
 };
 use starry_signal::SignalSet;
 
+use super::wait_io_result;
 use crate::{
     file::{
         FileLike,
@@ -20,7 +18,6 @@ use crate::{
     },
     mm::{UserConstPtr, UserPtr, nullable},
     syscall::signal::check_sigset_size,
-    task::{AsThread, check_signals},
     time::TimeValueLike,
 };
 
@@ -102,49 +99,17 @@ fn do_epoll_wait(
     let mut wait_once = || {
         block_on(future::timeout(
             deadline.map(|end| end.saturating_sub(axhal::time::wall_time())),
-            poll_io(epoll.as_ref(), IoEvents::IN, false, || {
-                epoll.poll_events(events)
-            }),
+            async {
+                poll_io(epoll.as_ref(), IoEvents::IN, false, || {
+                    epoll.poll_events(events)
+                })
+                .await
+                .map(|n| n as isize)
+            },
         ))
     };
 
-    let Some(sigmask) = sigmask else {
-        return match wait_once() {
-            Ok(r) => r.map(|n| n as _),
-            Err(_) => Ok(0),
-        };
-    };
-    let Some(uctx) = uctx else {
-        return Err(AxError::InvalidInput);
-    };
-
-    let curr = current();
-    let thr = curr.as_thread();
-    let old_blocked = thr.signal.set_blocked(sigmask);
-    // epoll_pwait() also resumes through a signal frame when a handler runs;
-    // pre-install -EINTR so interrupted waits cannot return stale register
-    // contents after sigreturn.
-    uctx.set_retval(-LinuxError::EINTR.code() as usize);
-    let result = loop {
-        match wait_once() {
-            Ok(Ok(res)) => break Ok(res as _),
-            Ok(Err(AxError::Interrupted)) => {
-                let handler_depth = thr.signal_handler_depth();
-                if check_signals(thr, uctx, Some(old_blocked)) {
-                    if thr.signal_handler_depth() == handler_depth {
-                        thr.signal.set_blocked(old_blocked);
-                    }
-                    break Err(AxError::Interrupted);
-                }
-            }
-            Ok(Err(err)) => break Err(err),
-            Err(_) => break Ok(0),
-        }
-    };
-    if !matches!(result, Err(AxError::Interrupted)) {
-        thr.signal.set_blocked(old_blocked);
-    }
-    result
+    wait_io_result(uctx, sigmask, &mut wait_once)
 }
 
 pub fn sys_epoll_pwait(

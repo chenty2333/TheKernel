@@ -102,6 +102,14 @@ impl FsContext {
         })
     }
 
+    /// Changes the root directory while preserving the current working
+    /// directory, matching Linux `chroot(2)` semantics.
+    pub fn set_root_dir(&mut self, root_dir: Location) -> VfsResult<()> {
+        root_dir.check_is_dir()?;
+        self.root_dir = root_dir;
+        Ok(())
+    }
+
     /// Attempts to resolve a possible symlink, at the current location (this
     /// assumes that `loc` is a child of current directory).
     pub fn try_resolve_symlink(

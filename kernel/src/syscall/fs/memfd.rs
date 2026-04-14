@@ -9,12 +9,11 @@ use axfs::FS_CONTEXT;
 use axfs_ng_vfs::NodePermission;
 use linux_raw_sys::general::{AT_FDCWD, MFD_CLOEXEC, O_CLOEXEC, O_CREAT, O_EXCL, O_RDWR};
 
+use super::fd_ops::openat_inner;
 use crate::{
     file::{File, memfd},
     mm::UserConstPtr,
 };
-
-use super::fd_ops::openat_inner;
 
 const MEMFD_NAME_MAX: usize = 249;
 const MEMFD_DIR: &str = "/tmp/memfd";

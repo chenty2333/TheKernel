@@ -14,6 +14,14 @@ fn task_state(task: &AxTaskRef) -> char {
         return 'T';
     }
 
+    // A task in an interruptible sleep with a pending wakeup from signal
+    // delivery should be reported as runnable. LTP polls /proc/[pid]/stat to
+    // synchronize signal-driven children and expects the state to stop being
+    // `S` once the signal has been sent.
+    if task.is_interrupted() {
+        return 'R';
+    }
+
     match task.state() {
         TaskState::Exited => 'Z',
         _ => match thread.proc_state_hint() {

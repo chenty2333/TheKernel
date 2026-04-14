@@ -1,3 +1,4 @@
+use alloc::{vec, vec::Vec};
 use core::mem::{self, MaybeUninit};
 
 use axerrno::{AxError, AxResult};
@@ -24,15 +25,34 @@ impl IoVectorBuf {
         if iovcnt > 1024 {
             return Err(AxError::InvalidInput);
         }
-        let mut len = 0;
+        let mut len: usize = 0;
         for i in 0..iovcnt {
             let iov = iovs.wrapping_add(i).vm_read()?;
             if iov.iov_len < 0 {
                 return Err(AxError::InvalidInput);
             }
-            len += iov.iov_len as usize;
+            len = len.checked_add(iov.iov_len as usize).ok_or(AxError::InvalidInput)?;
         }
         Ok(Self { iovs, iovcnt, len })
+    }
+
+    pub fn read_all(self) -> AxResult<Vec<u8>> {
+        let mut data = vec![0u8; self.len];
+        let mut offset = 0;
+        for i in 0..self.iovcnt {
+            let iov = self.iovs.wrapping_add(i).vm_read()?;
+            let len = iov.iov_len as usize;
+            if len == 0 {
+                continue;
+            }
+            vm_read_slice(iov.iov_base, unsafe {
+                mem::transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(
+                    &mut data[offset..offset + len],
+                )
+            })?;
+            offset += len;
+        }
+        Ok(data)
     }
 
     pub fn read_with(

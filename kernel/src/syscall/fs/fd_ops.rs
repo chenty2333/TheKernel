@@ -29,14 +29,14 @@ use crate::{
             location_for_fd, notify_close, notify_exact, notify_parent, notify_parent_with_name,
         },
         lease, memfd,
-        permission::{check_create_permissions, check_open_permissions},
+        permission::{
+            check_create_permissions, check_open_permissions, check_path_prefix_search_permissions,
+        },
         with_path_fs,
     },
     mm::{UserConstPtr, UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
-    syscall::{
-        fs::ctl::validate_pathname,
-    },
+    syscall::fs::ctl::validate_pathname,
     task::{AX_FILE_LIMIT, AsThread},
 };
 
@@ -284,6 +284,8 @@ fn open_in_fs(
     let uid = proc_data.fsuid();
     let gid = proc_data.fsgid();
     let mode = mode & !current().as_thread().proc_data.umask();
+    let path_ref = Path::new(path);
+    check_path_prefix_search_permissions(fs, path_ref, uid, gid, &supplementary_groups)?;
     let created_parent = if (flags as u32) & O_CREAT != 0 {
         match fs.resolve_no_follow(path) {
             Ok(loc) => {
@@ -345,11 +347,7 @@ fn open_in_fs(
         effective_flags &= !(O_CREAT as i32);
     }
 
-    let options = flags_to_options(
-        effective_flags,
-        mode,
-        (uid, gid),
-    );
+    let options = flags_to_options(effective_flags, mode, (uid, gid));
     let open_result = if let Some(loc) = existing_loc {
         options.open_loc(loc)
     } else {

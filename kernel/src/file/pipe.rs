@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, format, string::ToString, sync::Arc};
+use alloc::{borrow::Cow, format, string::ToString, sync::Arc, vec};
 use core::{
     mem,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -236,6 +236,187 @@ impl Pipe {
         buffer.push_slice(left);
         buffer.push_slice(right);
         Ok(())
+    }
+
+    pub fn vmsplice_read(&self, dst: &mut IoDst, nonblocking: bool) -> AxResult<usize> {
+        if !self.is_read() {
+            return Err(AxError::BadFileDescriptor);
+        }
+        if dst.is_full() {
+            return Ok(0);
+        }
+
+        block_on(poll_io(self, IoEvents::IN, nonblocking, || {
+            let read = {
+                let cons = self.shared.buffer.lock();
+                let (left, right) = cons.as_slices();
+                let mut count = dst.write(left)?;
+                if count >= left.len() {
+                    count += dst.write(right)?;
+                }
+                unsafe { cons.advance_read_index(count) };
+                count
+            };
+            if read > 0 {
+                self.shared.poll_tx.wake();
+                Ok(read)
+            } else if self.closed() {
+                Ok(0)
+            } else {
+                Err(AxError::WouldBlock)
+            }
+        }))
+    }
+
+    pub fn vmsplice_write(&self, src: &mut IoSrc, nonblocking: bool) -> AxResult<usize> {
+        if !self.is_write() {
+            return Err(AxError::BadFileDescriptor);
+        }
+        if src.remaining() == 0 {
+            return Ok(0);
+        }
+
+        block_on(poll_io(self, IoEvents::OUT, nonblocking, || {
+            if self.closed() {
+                raise_pipe();
+                return Err(AxError::BrokenPipe);
+            }
+
+            let written = {
+                let mut prod = self.shared.buffer.lock();
+                let (left, right) = prod.vacant_slices_mut();
+                let left = unsafe {
+                    core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
+                };
+                let right = unsafe {
+                    core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len())
+                };
+                let mut count = src.read(left)?;
+                if count >= left.len() {
+                    count += src.read(right)?;
+                }
+                unsafe { prod.advance_write_index(count) };
+                count
+            };
+            if written > 0 {
+                self.shared.poll_rx.wake();
+                Ok(written)
+            } else {
+                Err(AxError::WouldBlock)
+            }
+        }))
+    }
+
+    pub fn tee_to(&self, out: &Self, len: usize, nonblocking: bool) -> AxResult<usize> {
+        if !self.is_read() || !out.is_write() {
+            return Err(AxError::BadFileDescriptor);
+        }
+        if len == 0 {
+            return Ok(0);
+        }
+        if Arc::ptr_eq(&self.shared, &out.shared) {
+            return Err(AxError::InvalidInput);
+        }
+
+        struct TeePoll<'a> {
+            src: &'a Pipe,
+            dst: &'a Pipe,
+        }
+
+        impl Pollable for TeePoll<'_> {
+            fn poll(&self) -> IoEvents {
+                let mut events = IoEvents::empty();
+                let src = self.src.shared.buffer.lock();
+                events.set(IoEvents::IN, src.occupied_len() > 0);
+                drop(src);
+                let dst = self.dst.shared.buffer.lock();
+                events.set(IoEvents::OUT, dst.vacant_len() > 0);
+                events
+            }
+
+            fn register(&self, context: &mut Context<'_>, events: IoEvents) {
+                if events.contains(IoEvents::IN) {
+                    self.src.shared.poll_rx.register(context.waker());
+                }
+                if events.contains(IoEvents::OUT) {
+                    self.dst.shared.poll_tx.register(context.waker());
+                }
+                self.src.shared.poll_close.register(context.waker());
+                self.dst.shared.poll_close.register(context.waker());
+            }
+        }
+
+        let poller = TeePoll { src: self, dst: out };
+        let mut total_copied = 0usize;
+        block_on(poll_io(
+            &poller,
+            IoEvents::IN | IoEvents::OUT,
+            nonblocking,
+            || {
+                if out.closed() {
+                    raise_pipe();
+                    return Err(AxError::BrokenPipe);
+                }
+                let remaining = len - total_copied;
+                if remaining == 0 {
+                    return Ok(total_copied);
+                }
+
+                let src_available = self.shared.buffer.lock().occupied_len();
+                if src_available == 0 {
+                    return if self.closed() {
+                        Ok(total_copied)
+                    } else {
+                        Err(AxError::WouldBlock)
+                    };
+                }
+
+                let dst_space = out.shared.buffer.lock().vacant_len();
+                if dst_space == 0 {
+                    return Err(AxError::WouldBlock);
+                }
+
+                let to_copy = remaining.min(src_available).min(dst_space);
+                let mut tmp = vec![0u8; to_copy];
+                {
+                    let src = self.shared.buffer.lock();
+                    let (left, right) = src.as_slices();
+                    let first = left.len().min(to_copy);
+                    tmp[..first].copy_from_slice(&left[..first]);
+                    let second = to_copy - first;
+                    if second > 0 {
+                        tmp[first..].copy_from_slice(&right[..second]);
+                    }
+                }
+                {
+                    let mut dst = out.shared.buffer.lock();
+                    let (left, right) = dst.vacant_slices_mut();
+                    let left = unsafe {
+                        core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
+                    };
+                    let right = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            right.as_mut_ptr().cast::<u8>(),
+                            right.len(),
+                        )
+                    };
+                    let first = left.len().min(to_copy);
+                    left[..first].copy_from_slice(&tmp[..first]);
+                    let second = to_copy - first;
+                    if second > 0 {
+                        right[..second].copy_from_slice(&tmp[first..]);
+                    }
+                    unsafe { dst.advance_write_index(to_copy) };
+                }
+                out.shared.poll_rx.wake();
+                total_copied += to_copy;
+                if total_copied == len || nonblocking {
+                    Ok(total_copied)
+                } else {
+                    Err(AxError::WouldBlock)
+                }
+            },
+        ))
     }
 }
 

@@ -392,6 +392,18 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg4() as _,
             uctx.arg5() as _,
         ),
+        Sysno::tee => sys_tee(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
+        Sysno::vmsplice => sys_vmsplice(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
 
         // io mpx
         #[cfg(target_arch = "x86_64")]
@@ -689,8 +701,8 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         ),
         Sysno::rt_sigsuspend => sys_rt_sigsuspend(uctx, uctx.arg0() as _, uctx.arg1() as _),
         Sysno::kill => sys_kill(uctx.arg0() as _, uctx.arg1() as _),
-        Sysno::tkill => sys_tkill(uctx.arg0() as _, uctx.arg1() as _),
-        Sysno::tgkill => sys_tgkill(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::tkill => sys_tkill(uctx.arg0() as i32, uctx.arg1() as _),
+        Sysno::tgkill => sys_tgkill(uctx.arg0() as i32, uctx.arg1() as i32, uctx.arg2() as _),
         Sysno::rt_sigqueueinfo => sys_rt_sigqueueinfo(
             uctx.arg0() as _,
             uctx.arg1() as _,
@@ -698,8 +710,8 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg3() as _,
         ),
         Sysno::rt_tgsigqueueinfo => sys_rt_tgsigqueueinfo(
-            uctx.arg0() as _,
-            uctx.arg1() as _,
+            uctx.arg0() as i32,
+            uctx.arg1() as i32,
             uctx.arg2() as _,
             uctx.arg3() as _,
             uctx.arg4() as _,
@@ -908,7 +920,18 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         | Sysno::open_tree
         | Sysno::memfd_secret => sys_dummy_fd(sysno),
 
-        Sysno::timer_create | Sysno::timer_gettime | Sysno::timer_settime => Ok(0),
+        Sysno::timer_create => {
+            sys_timer_create(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
+        }
+        Sysno::timer_gettime => sys_timer_gettime(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::timer_getoverrun => sys_timer_getoverrun(uctx.arg0() as _),
+        Sysno::timer_settime => sys_timer_settime(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
+        Sysno::timer_delete => sys_timer_delete(uctx.arg0() as _),
 
         _ => {
             debug!("Unimplemented syscall: {sysno}");
