@@ -270,6 +270,10 @@ pub fn sys_waitpid(
     let options = validate_waitpid_options(options)?;
     info!("sys_waitpid <= pid: {pid:?}, options: {options:?}");
 
+    if pid == i32::MIN {
+        return Err(AxError::from(LinuxError::ESRCH));
+    }
+
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let proc = &proc_data.proc;

@@ -443,6 +443,8 @@ pub struct ProcessData {
     caps: SpinNoIrq<CapabilityState>,
     /// Supplementary group IDs shared by all threads in the process.
     supplementary_groups: SpinNoIrq<Vec<u32>>,
+    /// Linux personality flags shared by all threads in the process.
+    personality: AtomicU32,
     /// Process-scoped membarrier registration state.
     membarrier_state: AtomicU32,
 
@@ -506,6 +508,7 @@ impl ProcessData {
             creds: SpinNoIrq::new(Credentials::default()),
             caps: SpinNoIrq::new(CapabilityState::full()),
             supplementary_groups: SpinNoIrq::new(Vec::new()),
+            personality: AtomicU32::new(0),
             membarrier_state: AtomicU32::new(0),
             exited_threads_usage: AtomicTaskUsage::new(),
             waited_children_usage: AtomicTaskUsage::new(),
@@ -609,6 +612,14 @@ impl ProcessData {
 
     pub fn set_supplementary_groups(&self, groups: Vec<u32>) {
         *self.supplementary_groups.lock() = groups;
+    }
+
+    pub fn personality(&self) -> u32 {
+        self.personality.load(Ordering::Acquire)
+    }
+
+    pub fn set_personality(&self, personality: u32) {
+        self.personality.store(personality, Ordering::Release);
     }
 
     pub fn uid(&self) -> u32 {

@@ -110,6 +110,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     trace!("Syscall {sysno:?}");
     let curr = current();
     let thr = curr.as_thread();
+    let signal_handler_depth = thr.signal_handler_depth();
     let restart_class = restart_class_for_syscall(sysno, uctx);
     let preserve_restart_state = matches!(sysno, Sysno::rt_sigreturn) || thr.in_signal_handler();
     thr.enter_syscall(uctx, preserve_restart_state, restart_class);
@@ -317,6 +318,12 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         ),
         Sysno::fsync => sys_fsync(uctx.arg0() as _),
         Sysno::fdatasync => sys_fdatasync(uctx.arg0() as _),
+        Sysno::sync_file_range => sys_sync_file_range(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
         Sysno::fadvise64 => sys_fadvise64(
             uctx.arg0() as _,
             uctx.arg1() as _,
@@ -656,7 +663,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::getsid => sys_getsid(uctx.arg0() as _),
         Sysno::setsid => sys_setsid(),
         Sysno::getpgid => sys_getpgid(uctx.arg0() as _),
-        Sysno::setpgid => sys_setpgid(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::setpgid => sys_setpgid(uctx.arg0() as i32, uctx.arg1() as i32),
 
         // signal
         Sysno::rt_sigprocmask => sys_rt_sigprocmask(
@@ -727,8 +734,9 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::sethostname => sys_sethostname(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::setdomainname => sys_setdomainname(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::uname => sys_uname(uctx.arg0() as _),
+        Sysno::personality => sys_personality(uctx.arg0() as _),
         Sysno::sysinfo => sys_sysinfo(uctx.arg0() as _),
-        Sysno::syslog => sys_syslog(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::syslog => sys_syslog(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as isize),
         Sysno::getrandom => sys_getrandom(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         Sysno::seccomp => sys_seccomp(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         #[cfg(target_arch = "riscv64")]
@@ -915,6 +923,8 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         return;
     }
 
-    uctx.set_retval(result.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
+    if thr.signal_handler_depth() == signal_handler_depth {
+        uctx.set_retval(result.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
+    }
     thr.clear_saved_syscall();
 }

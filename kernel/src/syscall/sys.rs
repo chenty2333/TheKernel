@@ -10,7 +10,7 @@ use axtask::current;
 use bytemuck::AnyBitPattern;
 use kspin::SpinNoIrq;
 use linux_raw_sys::{
-    general::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, NGROUPS_MAX},
+    general::{CAP_SYS_ADMIN, CAP_SYSLOG, GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, NGROUPS_MAX},
     system::{new_utsname, sysinfo},
 };
 #[cfg(target_arch = "riscv64")]
@@ -184,6 +184,10 @@ impl UtsState {
 }
 
 static UTS_STATE: SpinNoIrq<UtsState> = SpinNoIrq::new(init_uts_state());
+const PER_LINUX: u32 = 0;
+const PER_MASK: u32 = 0xff;
+const UNAME26: u32 = 0x0020_000;
+const UNAME26_RELEASE: &[u8] = b"2.6.60";
 
 fn fill_uts_field(dst: &mut [c_char; 65], src: &[u8]) {
     for (dst, byte) in dst.iter_mut().zip(src.iter()) {
@@ -243,7 +247,12 @@ fn cstr_field_to_string(field: &[c_char; 65]) -> String {
 }
 
 pub fn sys_uname(name: *mut new_utsname) -> AxResult<isize> {
-    name.vm_write(current_utsname())?;
+    let mut uts = current_utsname();
+    if current().as_thread().proc_data.personality() & UNAME26 != 0 {
+        uts.release = [0; 65];
+        fill_uts_field(&mut uts.release, UNAME26_RELEASE);
+    }
+    name.vm_write(uts)?;
     Ok(0)
 }
 
@@ -294,7 +303,56 @@ pub fn sys_sysinfo(info: *mut sysinfo) -> AxResult<isize> {
     Ok(0)
 }
 
-pub fn sys_syslog(_type: i32, _buf: *mut c_char, _len: usize) -> AxResult<isize> {
+pub fn sys_personality(persona: u32) -> AxResult<isize> {
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let old = proc_data.personality();
+
+    if persona == u32::MAX {
+        return Ok(old as isize);
+    }
+
+    if persona & !(PER_MASK | UNAME26) != 0 || (persona & PER_MASK) != PER_LINUX {
+        return Err(AxError::InvalidInput);
+    }
+
+    proc_data.set_personality(persona);
+    Ok(old as isize)
+}
+
+pub fn sys_syslog(kind: i32, buf: *mut c_char, len: isize) -> AxResult<isize> {
+    if !(0..=10).contains(&kind) {
+        return Err(AxError::InvalidInput);
+    }
+    if len < 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let privileged =
+        proc_data.has_effective_capability(CAP_SYSLOG) || proc_data.has_effective_capability(CAP_SYS_ADMIN);
+
+    match kind {
+        2 | 3 | 4 => {
+            if !privileged {
+                return Err(AxError::OperationNotPermitted);
+            }
+            if buf.is_null() {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        8 => {
+            if !privileged {
+                return Err(AxError::OperationNotPermitted);
+            }
+            if len > 8 {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        _ => {}
+    }
+
     Ok(0)
 }
 

@@ -147,6 +147,15 @@ impl CloneArgs {
             return Err(AxError::InvalidInput);
         }
 
+        if flags.contains(CloneFlags::NEWUTS)
+            && !current()
+                .as_thread()
+                .proc_data
+                .has_effective_capability(CAP_SYS_ADMIN)
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+
         if flags.contains(CloneFlags::INTO_CGROUP) {
             warn!("sys_clone3: CLONE_INTO_CGROUP not supported");
             return Err(AxError::OperationNotSupported);

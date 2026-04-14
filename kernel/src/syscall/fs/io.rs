@@ -28,6 +28,9 @@ const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
 const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
 const TMPFS_FALLOC_BLOCK_SIZE: u64 = 4096;
 const FALLOC_IO_CHUNK: usize = 64 * 1024;
+const SYNC_FILE_RANGE_WAIT_BEFORE: u32 = 0x01;
+const SYNC_FILE_RANGE_WRITE: u32 = 0x02;
+const SYNC_FILE_RANGE_WAIT_AFTER: u32 = 0x04;
 
 fn write_zero_range(file: &axfs::File, offset: u64, len: u64) -> AxResult<()> {
     if len == 0 {
@@ -415,6 +418,33 @@ pub fn sys_fdatasync(fd: c_int) -> AxResult<isize> {
         FileLikeKind::Fifo | FileLikeKind::Socket => return Err(AxError::InvalidInput),
         FileLikeKind::Regular | FileLikeKind::Directory | FileLikeKind::Other => {}
     }
+    let f = get_typed_file::<File>(fd)?;
+    f.inner().sync(true)?;
+    Ok(0)
+}
+
+pub fn sys_sync_file_range(
+    fd: c_int,
+    offset: __kernel_off_t,
+    nbytes: __kernel_off_t,
+    flags: u32,
+) -> AxResult<isize> {
+    debug!("sys_sync_file_range <= fd: {fd}, offset: {offset}, nbytes: {nbytes}, flags: {flags:#x}");
+
+    if offset < 0 || nbytes < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let valid_flags =
+        SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER;
+    if flags & !valid_flags != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let file_like = get_file_like(fd)?;
+    if !matches!(FileLikeKind::from_file_like(file_like.as_ref()), FileLikeKind::Regular) {
+        return Err(AxError::from(LinuxError::ESPIPE));
+    }
+
     let f = get_typed_file::<File>(fd)?;
     f.inner().sync(true)?;
     Ok(0)
