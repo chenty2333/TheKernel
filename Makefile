@@ -15,6 +15,9 @@ OSCOMP_PLAN_OVERRIDE ?=
 export OSKERNEL_DEV_IMAGE ?= thekernel-dev:local
 DEV_ENV_DIR ?= $(ROOT_DIR)/dev-env
 EMPTY_TESTSUITE_DIR ?= $(ROOT_DIR)/.state/empty-testsuites
+AUTOSCRUB_DIRS ?= \
+	$(ROOT_DIR)/.tmp \
+	$(STATE_DIR)
 
 # QEMU Options
 export BLK := y
@@ -45,7 +48,11 @@ ifeq ($(MEMTRACK), y)
 endif
 
 default: build
-all: legacy-clean kernel-rv kernel-la disk.img
+all: prebuild-scrub legacy-clean kernel-rv kernel-la disk.img
+
+prebuild-scrub:
+	@rm -rf $(AUTOSCRUB_DIRS)
+	@mkdir -p $(STATE_DIR)
 
 legacy-clean:
 	@rm -rf \
@@ -101,7 +108,7 @@ debug:
 	@printf '%s\n' 'debug is not wired to the official pre-2025 evaluator flow; use scripts/oscomp.sh run instead.' >&2
 	@exit 1
 
-kernel-rv:
+kernel-rv: prebuild-scrub
 	@$(MAKE) -C make ARCH=riscv64 BUS=mmio defconfig
 	@$(MAKE) -C make ARCH=riscv64 BUS=mmio build-elf
 	@kernel="$$(find "$(STATE_DIR)/riscv64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
@@ -109,7 +116,7 @@ kernel-rv:
 	python3 scripts/patch-riscv-kernel-elf.py "$$kernel" "$@"
 	@$(MAKE) --no-print-directory check-eval-kernel-size
 
-kernel-la:
+kernel-la: prebuild-scrub
 	@$(MAKE) -C make ARCH=loongarch64 defconfig
 	@$(MAKE) -C make ARCH=loongarch64 build-elf
 	@kernel="$$(find "$(STATE_DIR)/loongarch64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
@@ -117,7 +124,7 @@ kernel-la:
 	python3 scripts/patch-loongarch-kernel-elf.py "$$kernel" "$@"
 	@$(MAKE) --no-print-directory check-eval-kernel-size
 
-disk.img:
+disk.img: prebuild-scrub
 	@set -- bash ./scripts/build-oscomp-support-disk.sh --arch both --output "$@"; \
 	if [ -n "$(OSCOMP_PLAN_OVERRIDE)" ]; then \
 		set -- "$$@" --plan-override "$(OSCOMP_PLAN_OVERRIDE)"; \
@@ -131,7 +138,7 @@ rv:
 la:
 	$(MAKE) ARCH=loongarch64 run
 
-.PHONY: all build run eval-rv eval-la dev-image dev-check dev-shell dev-shell-root debug disasm clean legacy-clean check-eval-kernel-size kernel-rv kernel-la disk.img
+.PHONY: all build run eval-rv eval-la dev-image dev-check dev-shell dev-shell-root debug disasm clean legacy-clean prebuild-scrub check-eval-kernel-size kernel-rv kernel-la disk.img
 check-eval-kernel-size:
 	@for kernel in $(ROOT_DIR)/kernel-rv $(ROOT_DIR)/kernel-la; do \
 		[ -f "$$kernel" ] || continue; \
