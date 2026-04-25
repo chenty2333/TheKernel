@@ -1699,6 +1699,47 @@ status=$?
 exit "$status"'
 }
 
+support_disk_has_payload() {
+    support_mount="$1"
+    support_arch_dir="$2"
+
+    [ -f "$support_mount/meta/ltp_test.txt" ] && return 0
+    [ -f "$support_mount/meta/oscomp.env" ] && return 0
+    [ -f "$support_mount/meta/oscomp_plan.txt" ] && return 0
+    [ -d "$support_mount/usr/lib/locale/C.UTF-8" ] && return 0
+    [ -d "$support_mount/overlay" ] && return 0
+    if [ -n "$support_arch_dir" ]; then
+        [ -d "$support_mount/$support_arch_dir/overlay" ] && return 0
+        [ -f "$support_mount/$support_arch_dir/glibc/lib/libgcc_s.so.1" ] && return 0
+        [ -f "$support_mount/$support_arch_dir/musl/lib/libgcc_s.so.1" ] && return 0
+    fi
+    return 1
+}
+
+try_mount_support_disk() {
+    support_arch_dir="$1"
+    SUPPORT_DISK_DEVICE=""
+
+    for dev in \
+        /dev/vdb /dev/vdc /dev/vdd /dev/vde \
+        /dev/sdb /dev/sdc /dev/sdd /dev/sde \
+        /dev/hdb /dev/hdc /dev/hdd /dev/hde \
+        /dev/vda /dev/sda /dev/hda
+    do
+        [ -e "$dev" ] || continue
+        if ! bb mount -t ext4 -o ro "$dev" /support >/dev/null 2>&1; then
+            continue
+        fi
+        if support_disk_has_payload /support "$support_arch_dir"; then
+            SUPPORT_DISK_DEVICE="$dev"
+            return 0
+        fi
+        bb umount /support >/dev/null 2>&1 || true
+    done
+
+    return 1
+}
+
 mount_support_disk() {
     support_arch_dir=""
     case "$(bb uname -m 2>/dev/null || true)" in
@@ -1711,7 +1752,7 @@ mount_support_disk() {
     esac
 
     bb mkdir -p /support 2>/dev/null || true
-    if bb mount -t ext4 -o ro /dev/vdb /support >/dev/null 2>&1; then
+    if try_mount_support_disk "$support_arch_dir"; then
         OSCOMP_SUPPORT_ARCH_DIR="$support_arch_dir"
         export OSCOMP_SUPPORT_ARCH_DIR
         if [ -f /support/meta/ltp_test.txt ]; then
@@ -1962,7 +2003,7 @@ ensure_support_runtime_payload() {
 
     runner_debug "#### OSCOMP RUNNER SUPPORT PAYLOAD MOUNT TRY ${root}/${group} ARCH ${support_arch_dir:-} ####"
     bb mkdir -p /support 2>/dev/null || true
-    if ! bb mount -t ext4 -o ro /dev/vdb /support >/dev/null 2>&1; then
+    if ! try_mount_support_disk "$support_arch_dir"; then
         runner_debug "#### OSCOMP RUNNER SUPPORT PAYLOAD MOUNT FAILED ${root}/${group} ####"
         bb rmdir /support >/dev/null 2>&1 || true
         return 0
@@ -2280,14 +2321,32 @@ support_ltp_subset_dir() {
     return 1
 }
 
+build_ltp_fallback_test_list() {
+    fallback_list="/var/tmp/oscomp-ltp-autolist.$$"
+    bb rm -f "$fallback_list" 2>/dev/null || true
+    : > "$fallback_list" || return 1
+
+    for testcase_path in ltp/testcases/bin/*; do
+        [ -f "$testcase_path" ] || continue
+        bb basename "$testcase_path" >> "$fallback_list"
+    done
+
+    if [ -s "$fallback_list" ]; then
+        SUPPORT_LTP_TEST_LIST="$fallback_list"
+        return 0
+    fi
+
+    bb rm -f "$fallback_list" 2>/dev/null || true
+    SUPPORT_LTP_TEST_LIST=""
+    return 1
+}
+
 run_ltp_group() {
     root="$1"
     shell_path="$2"
-    support_ltp_subset_dir || {
-        runner_debug "#### OSCOMP RUNNER MISSING LTP SUBSET LIST ####"
-        return 127
-    }
+    support_ltp_subset_dir || true
     test_list="$SUPPORT_LTP_TEST_LIST"
+    generated_test_list=""
 
     [ -d "$root/ltp/testcases" ] || {
         runner_debug "#### OSCOMP RUNNER MISSING LTP TESTCASES ${root}/ltp/testcases ####"
@@ -2296,6 +2355,16 @@ run_ltp_group() {
 
     if ! cd "$root"; then
         return 125
+    fi
+
+    if [ -z "$test_list" ]; then
+        if build_ltp_fallback_test_list; then
+            test_list="$SUPPORT_LTP_TEST_LIST"
+            generated_test_list="$test_list"
+        else
+            runner_debug "#### OSCOMP RUNNER MISSING LTP SUBSET LIST ####"
+            return 127
+        fi
     fi
 
     # Match the visible pre-2025 runner protocol by default: each case keeps
@@ -2438,6 +2507,7 @@ run_ltp_group() {
             group_failed=1
         fi
     done <"$test_list"
+    [ -z "$generated_test_list" ] || bb rm -f "$generated_test_list" 2>/dev/null || true
 
     [ "$ran_cases" -gt 0 ] || {
         runner_debug "#### OSCOMP RUNNER EMPTY LTP SUBSET ${test_list} ####"

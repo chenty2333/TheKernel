@@ -204,9 +204,17 @@ if [ -n "$SUPPORT_IMAGE_OVERRIDE" ]; then
     [ -f "$SUPPORT_IMAGE_OVERRIDE" ] || die "support image does not exist: $SUPPORT_IMAGE_OVERRIDE"
     SUPPORT_IMAGE_SOURCE="$SUPPORT_IMAGE_OVERRIDE"
 else
-    SUPPORT_IMAGE_SOURCE=$(find_first_existing \
-        "$REPO_ROOT/disk.img" \
-        "$REPO_ROOT/disk.img.xz" || true)
+    if [ "$ARCH" = "la" ]; then
+        SUPPORT_IMAGE_SOURCE=$(find_first_existing \
+            "$REPO_ROOT/disk-la.img" \
+            "$REPO_ROOT/disk-la.img.xz" \
+            "$REPO_ROOT/disk.img" \
+            "$REPO_ROOT/disk.img.xz" || true)
+    else
+        SUPPORT_IMAGE_SOURCE=$(find_first_existing \
+            "$REPO_ROOT/disk.img" \
+            "$REPO_ROOT/disk.img.xz" || true)
+    fi
 fi
 
 if [ "$SKIP_KERNEL_BUILD" -eq 0 ]; then

@@ -48,7 +48,7 @@ ifeq ($(MEMTRACK), y)
 endif
 
 default: build
-all: prebuild-scrub legacy-clean kernel-rv kernel-la disk.img
+all: prebuild-scrub legacy-clean kernel-rv kernel-la disk.img disk-la.img
 
 prebuild-scrub:
 	@rm -rf $(AUTOSCRUB_DIRS)
@@ -63,6 +63,7 @@ legacy-clean:
 		$(ROOT_DIR)/kernel-rv \
 		$(ROOT_DIR)/kernel-la \
 		$(ROOT_DIR)/disk.img \
+		$(ROOT_DIR)/disk-la.img \
 		$(ROOT_DIR)/qemu.log \
 		$(ROOT_DIR)/netdump.pcap \
 		$(ROOT_DIR)/.axconfig.toml \
@@ -126,10 +127,13 @@ kernel-la: prebuild-scrub
 
 disk.img: prebuild-scrub
 	@set -- bash ./scripts/build-oscomp-support-disk.sh --arch both --output "$@"; \
-	if [ -n "$(OSCOMP_PLAN_OVERRIDE)" ]; then \
-		set -- "$$@" --plan-override "$(OSCOMP_PLAN_OVERRIDE)"; \
-	fi; \
-	"$$@"
+		if [ -n "$(OSCOMP_PLAN_OVERRIDE)" ]; then \
+			set -- "$$@" --plan-override "$(OSCOMP_PLAN_OVERRIDE)"; \
+		fi; \
+		"$$@"
+
+disk-la.img: disk.img
+	@cp "$<" "$@"
 
 # Aliases
 rv:
@@ -138,7 +142,7 @@ rv:
 la:
 	$(MAKE) ARCH=loongarch64 run
 
-.PHONY: all build run eval-rv eval-la dev-image dev-check dev-shell dev-shell-root debug disasm clean legacy-clean prebuild-scrub check-eval-kernel-size kernel-rv kernel-la disk.img
+.PHONY: all build run eval-rv eval-la dev-image dev-check dev-shell dev-shell-root debug disasm clean legacy-clean prebuild-scrub check-eval-kernel-size kernel-rv kernel-la disk.img disk-la.img
 check-eval-kernel-size:
 	@for kernel in $(ROOT_DIR)/kernel-rv $(ROOT_DIR)/kernel-la; do \
 		[ -f "$$kernel" ] || continue; \
