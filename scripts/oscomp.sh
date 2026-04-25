@@ -60,6 +60,7 @@ Commands:
       Options:
         --arch VALUE
         --image PATH
+        --support-image PATH
         --timeout SECS
         --workdir DIR
         --skip-kernel-build
@@ -111,7 +112,7 @@ run_cmd() {
                 arch=$(canonical_arch "$2") || die "unsupported arch: $2"
                 shift 2
                 ;;
-            --image|--timeout|--workdir)
+            --image|--support-image|--timeout|--workdir)
                 [[ $# -ge 2 ]] || die "missing value for $1"
                 args+=("$1" "$2")
                 shift 2

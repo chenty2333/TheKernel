@@ -4,9 +4,9 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::{ffi::c_char, future::poll_fn, task::Poll};
+use core::{ffi::c_char, future::poll_fn, mem::size_of, task::Poll};
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axfs::FS_CONTEXT;
 use axfs_ng_vfs::NodeType;
 use axhal::uspace::UserContext;
@@ -15,9 +15,10 @@ use axtask::{
     future::{block_on, interruptible},
 };
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
+use memory_addr::PAGE_SIZE_4K;
 use starry_process::Pid;
 use starry_signal::{SignalAction, SignalDisposition, Signo};
-use starry_vm::vm_load_until_nul;
+use starry_vm::{VmError, vm_load_until_nul};
 
 #[cfg(target_arch = "loongarch64")]
 use crate::task::reset_current_user_fpu_state;
@@ -97,20 +98,98 @@ fn wait_for_exec_group(
 }
 
 const SUPPORTED_EXECVEAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+const EXEC_MAX_ARG_STRLEN: usize = 32 * PAGE_SIZE_4K;
+const EXEC_ARG_MAX: usize = 2 * 1024 * 1024;
+const EXEC_STACK_SAFETY_MARGIN: usize = 4 * PAGE_SIZE_4K;
+
+fn exec_arg_limit() -> usize {
+    EXEC_ARG_MAX.min(crate::config::USER_STACK_SIZE.saturating_sub(EXEC_STACK_SAFETY_MARGIN))
+}
+
+fn exec_arg_too_big() -> AxError {
+    LinuxError::E2BIG.into()
+}
+
+fn map_exec_vm_error(err: VmError) -> AxError {
+    match err {
+        VmError::TooLong => exec_arg_too_big(),
+        _ => err.into(),
+    }
+}
+
+fn vm_load_exec_string(ptr: *const c_char) -> AxResult<String> {
+    #[allow(clippy::unnecessary_cast)]
+    let bytes = vm_load_until_nul(ptr as *const u8).map_err(map_exec_vm_error)?;
+    String::from_utf8(bytes).map_err(|_| AxError::IllegalBytes)
+}
+
+struct ExecArgSizer {
+    bytes: usize,
+    limit: usize,
+}
+
+impl ExecArgSizer {
+    fn new() -> AxResult<Self> {
+        let bytes = 3usize
+            .checked_mul(size_of::<usize>())
+            .ok_or_else(exec_arg_too_big)?;
+        let this = Self {
+            bytes,
+            limit: exec_arg_limit(),
+        };
+        if this.bytes > this.limit {
+            Err(exec_arg_too_big())
+        } else {
+            Ok(this)
+        }
+    }
+
+    fn push_str(&mut self, value: &str) -> AxResult {
+        let string_bytes = value.len().checked_add(1).ok_or_else(exec_arg_too_big)?;
+        if string_bytes > EXEC_MAX_ARG_STRLEN {
+            return Err(exec_arg_too_big());
+        }
+
+        let entry_bytes = string_bytes
+            .checked_add(size_of::<usize>())
+            .ok_or_else(exec_arg_too_big)?;
+        self.bytes = self
+            .bytes
+            .checked_add(entry_bytes)
+            .ok_or_else(exec_arg_too_big)?;
+        if self.bytes > self.limit {
+            return Err(exec_arg_too_big());
+        }
+        Ok(())
+    }
+}
+
+fn load_exec_string_vec(
+    ptr: *const *const c_char,
+    sizer: &mut ExecArgSizer,
+) -> AxResult<Vec<String>> {
+    let ptrs = vm_load_until_nul(ptr).map_err(map_exec_vm_error)?;
+    let mut values = Vec::with_capacity(ptrs.len());
+    for ptr in ptrs {
+        let value = vm_load_exec_string(ptr)?;
+        sizer.push_str(&value)?;
+        values.push(value);
+    }
+    Ok(values)
+}
 
 fn load_exec_args_env(
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> AxResult<(Vec<String>, Vec<String>)> {
+    let mut sizer = ExecArgSizer::new()?;
     let args = if argv.is_null() {
         Vec::new()
     } else {
-        vm_load_until_nul(argv)?
-            .into_iter()
-            .map(vm_load_string)
-            .collect::<Result<Vec<_>, _>>()?
+        load_exec_string_vec(argv, &mut sizer)?
     };
     let args = if args.is_empty() {
+        sizer.push_str("")?;
         vec![String::new()]
     } else {
         args
@@ -119,10 +198,7 @@ fn load_exec_args_env(
     let envs = if envp.is_null() {
         Vec::new()
     } else {
-        vm_load_until_nul(envp)?
-            .into_iter()
-            .map(vm_load_string)
-            .collect::<Result<Vec<_>, _>>()?
+        load_exec_string_vec(envp, &mut sizer)?
     };
 
     Ok((args, envs))

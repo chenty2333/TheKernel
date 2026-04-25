@@ -5,7 +5,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
-use axfs::FileBackend;
+use axfs_ng_vfs::Location;
 use axhal::{
     mem::phys_to_virt,
     paging::{MappingFlags, PageSize, PageTableCursor, PagingError},
@@ -15,7 +15,8 @@ use kspin::SpinNoIrq;
 use memory_addr::{MemoryAddr, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, PopulateCallback, alloc_frame, dealloc_frame, pages_in,
+    AddrSpace, Backend, BackendOps, PopulateCallback, alloc_frame, dealloc_frame, page_table_flags,
+    pages_in,
 };
 
 struct FrameRefCnt(u32);
@@ -83,7 +84,7 @@ static FRAME_TABLE: SpinNoIrq<FrameTableRefCount> = SpinNoIrq::new(FrameTableRef
 pub struct CowBackend {
     start: VirtAddr,
     size: PageSize,
-    file: Option<(FileBackend, u64, Option<u64>, bool)>,
+    file: Option<(Location, u64, Option<u64>, bool)>,
     map_id: Arc<()>,
     materialized: Arc<AtomicBool>,
 }
@@ -123,7 +124,8 @@ impl CowBackend {
     ) -> AxResult {
         let frame = self.alloc_new_frame(true)?;
 
-        if let Some((file, file_start, file_end, _)) = &self.file {
+        if let Some((location, file_start, file_end, _)) = &self.file {
+            let file = location.entry().as_file()?;
             let buf = unsafe {
                 slice::from_raw_parts_mut(phys_to_virt(frame).as_mut_ptr(), self.size as _)
             };
@@ -140,7 +142,7 @@ impl CowBackend {
 
             file.read_at(&mut &mut buf[start..start + max_read], file_start)?;
         }
-        pt.map(vaddr, frame, self.size, flags)?;
+        pt.map(vaddr, frame, self.size, page_table_flags(flags))?;
         self.mark_materialized();
         Ok(())
     }
@@ -153,7 +155,7 @@ impl CowBackend {
         pt: &mut PageTableCursor,
     ) -> AxResult {
         let Some(frame) = FRAME_TABLE.lock().get_frame_ref(paddr) else {
-            pt.protect(vaddr, flags)?;
+            pt.protect(vaddr, page_table_flags(flags))?;
             self.mark_materialized();
             return Ok(());
         };
@@ -162,7 +164,7 @@ impl CowBackend {
         match frame.0 {
             1 => {
                 // Only one reference, just upgrade the permissions.
-                pt.protect(vaddr, flags)?;
+                pt.protect(vaddr, page_table_flags(flags))?;
                 self.mark_materialized();
                 return Ok(());
             }
@@ -176,7 +178,7 @@ impl CowBackend {
                         self.size as _,
                     );
                 }
-                pt.remap(vaddr, new_frame, flags)?;
+                pt.remap(vaddr, new_frame, page_table_flags(flags))?;
                 frame.drop_frame(paddr, self.size);
             }
         }
@@ -237,11 +239,7 @@ impl CowBackend {
                 lhs_start == rhs_start
                     && lhs_end == rhs_end
                     && lhs_sigbus == rhs_sigbus
-                    && match (lhs_backend, rhs_backend) {
-                        (FileBackend::Cached(lhs), FileBackend::Cached(rhs)) => lhs.ptr_eq(rhs),
-                        (FileBackend::Direct(lhs), FileBackend::Direct(rhs)) => lhs.ptr_eq(rhs),
-                        _ => false,
-                    }
+                    && lhs_backend.ptr_eq(rhs_backend)
             }
             _ => false,
         }
@@ -294,7 +292,7 @@ impl CowBackend {
             };
             frame.0 = next_refcnt;
             drop(frame);
-            if let Err(err) = pt.map(new_addr, paddr, self.size, flags) {
+            if let Err(err) = pt.map(new_addr, paddr, self.size, page_table_flags(flags)) {
                 let frame = self.get_or_track_frame_ref(paddr);
                 let mut frame = frame.lock();
                 frame.drop_frame(paddr, self.size);
@@ -383,7 +381,7 @@ impl BackendOps for CowBackend {
         new_pt: &mut PageTableCursor,
         _new_aspace: &Arc<Mutex<AddrSpace>>,
     ) -> AxResult<Backend> {
-        let cow_flags = flags - MappingFlags::WRITE;
+        let cow_flags = page_table_flags(flags) - MappingFlags::WRITE;
         pages_in(range, self.size)?;
         if self.file.is_some() && flags.contains(MappingFlags::WRITE) {
             // Fork must snapshot the parent's current private data image, not the
@@ -425,7 +423,7 @@ impl BackendOps for CowBackend {
             }
             if let Err(err) = new_pt.map(vaddr, paddr, self.size, cow_flags) {
                 if protected_parent {
-                    let _ = old_pt.protect(vaddr, flags);
+                    let _ = old_pt.protect(vaddr, page_table_flags(flags));
                 }
                 let frame = self.get_or_track_frame_ref(paddr);
                 let mut frame = frame.lock();
@@ -442,7 +440,7 @@ impl Backend {
     pub fn new_cow(
         start: VirtAddr,
         size: PageSize,
-        file: FileBackend,
+        file: Location,
         file_start: u64,
         file_end: Option<u64>,
         sigbus_on_eof: bool,

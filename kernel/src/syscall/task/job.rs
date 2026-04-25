@@ -44,7 +44,9 @@ pub fn sys_setpgid(pid: i32, pgid: i32) -> AxResult<isize> {
     };
 
     if proc.pid() != caller.pid() {
-        let is_child = proc.parent().is_some_and(|parent| parent.pid() == caller.pid());
+        let is_child = proc
+            .parent()
+            .is_some_and(|parent| parent.pid() == caller.pid());
         if !is_child {
             return Err(AxError::from(LinuxError::ESRCH));
         }

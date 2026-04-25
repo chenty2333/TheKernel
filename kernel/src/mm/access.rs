@@ -6,6 +6,7 @@ use core::{
     hint::unlikely,
     mem::{MaybeUninit, transmute},
     ptr, slice, str,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use axerrno::{AxError, AxResult};
@@ -15,7 +16,7 @@ use axhal::{
     trap::{PAGE_FAULT, register_trap_handler},
 };
 use axio::prelude::*;
-use axtask::current;
+use axtask::{current, current_may_uninit};
 use extern_trait::extern_trait;
 use kernel_guard::IrqSave;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
@@ -29,6 +30,12 @@ use crate::{
 /// RAII guard that resets the `accessing_user_memory` flag on drop, ensuring
 /// cleanup even if the closure panics.
 struct UserMemoryAccessGuard<'a>(&'a Thread);
+
+static PAGE_FAULT_THREAD_CONTEXT_READY: AtomicBool = AtomicBool::new(false);
+
+pub fn mark_page_fault_thread_context_ready() {
+    PAGE_FAULT_THREAD_CONTEXT_READY.store(true, Ordering::Release);
+}
 
 impl Drop for UserMemoryAccessGuard<'_> {
     fn drop(&mut self) {
@@ -269,9 +276,13 @@ pub(crate) use nullable;
 
 #[register_trap_handler(PAGE_FAULT)]
 fn handle_page_fault(vaddr: VirtAddr, access_flags: MappingFlags) -> bool {
-    debug!("Page fault at {vaddr:#x}, access_flags: {access_flags:#x?}");
+    if !PAGE_FAULT_THREAD_CONTEXT_READY.load(Ordering::Acquire) {
+        return false;
+    }
 
-    let curr = current();
+    let Some(curr) = current_may_uninit() else {
+        return false;
+    };
     let Some(thr) = curr.try_as_thread() else {
         return false;
     };
@@ -279,6 +290,8 @@ fn handle_page_fault(vaddr: VirtAddr, access_flags: MappingFlags) -> bool {
     if unlikely(!thr.is_accessing_user_memory()) {
         return false;
     }
+
+    debug!("Page fault at {vaddr:#x}, access_flags: {access_flags:#x?}");
 
     let aspace_handle = thr.proc_data.aspace();
     aspace_handle.lock().handle_page_fault(vaddr, access_flags)
@@ -330,6 +343,32 @@ pub fn check_access(start: usize, len: usize) -> VmResult {
     }
 }
 
+fn populate_user_range(start: usize, len: usize, access_flags: MappingFlags) -> VmResult {
+    check_access(start, len)?;
+    if len == 0 {
+        return Ok(());
+    }
+
+    let Some(curr) = current_may_uninit() else {
+        return Err(VmError::AccessDenied);
+    };
+    let Some(thr) = curr.try_as_thread() else {
+        return Err(VmError::AccessDenied);
+    };
+
+    let start = VirtAddr::from(start);
+    let page_start = start.align_down_4k();
+    let page_end = (start + len).align_up_4k();
+    let aspace_handle = thr.proc_data.aspace();
+    let mut aspace = aspace_handle.lock();
+    if !aspace.can_access_range(start, len, access_flags) {
+        return Err(VmError::AccessDenied);
+    }
+    aspace
+        .populate_area(page_start, page_end - page_start, access_flags)
+        .map_err(|_| VmError::AccessDenied)
+}
+
 #[extern_trait]
 unsafe impl VmIo for Vm {
     fn new() -> Self {
@@ -337,12 +376,12 @@ unsafe impl VmIo for Vm {
     }
 
     fn read(&mut self, start: usize, buf: &mut [MaybeUninit<u8>]) -> VmResult {
-        check_access(start, buf.len())?;
+        populate_user_range(start, buf.len(), MappingFlags::READ)?;
         copy_user_bytes(buf.as_mut_ptr() as *mut _, start as _, buf.len())
     }
 
     fn write(&mut self, start: usize, buf: &[u8]) -> VmResult {
-        check_access(start, buf.len())?;
+        populate_user_range(start, buf.len(), MappingFlags::WRITE)?;
         copy_user_bytes(start as _, buf.as_ptr() as *const _, buf.len())
     }
 }

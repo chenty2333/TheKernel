@@ -132,8 +132,12 @@ static EARLY_DEADLINE: u64 = u64::MAX;
 fn periodic_deadline(now_ns: u64) -> u64 {
     // Safety: callers either run in the timer IRQ path or hold the IRQ-save guard.
     let deadline = unsafe { NEXT_PERIODIC_DEADLINE.read_current_raw() };
-    if deadline == 0 {
-        now_ns.saturating_add(PERIODIC_INTERVAL_NANOS)
+    if deadline == 0 || deadline <= now_ns {
+        let next = now_ns.saturating_add(PERIODIC_INTERVAL_NANOS);
+        // Task-context rearming can observe a stale periodic deadline after a delayed
+        // IRQ delivery. Never reprogram the hardware with an already-expired deadline.
+        unsafe { NEXT_PERIODIC_DEADLINE.write_current_raw(next) };
+        next
     } else {
         deadline
     }
@@ -318,6 +322,10 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
 
         cfg_if::cfg_if! {
             if #[cfg(feature = "net-ng")] {
+                #[cfg(target_arch = "loongarch64")]
+                axnet_ng::init_network_loopback_only();
+
+                #[cfg(not(target_arch = "loongarch64"))]
                 axnet_ng::init_network(all_devices.net);
 
                 #[cfg(feature = "vsock")]
@@ -452,6 +460,10 @@ fn init_interrupt() {
     axhal::irq::register(axhal::irq::IPI_IRQ, || {
         axipi::ipi_handler();
     });
+
+    // Kick the per-CPU timer chain explicitly instead of depending on platform
+    // reset state to generate the first interrupt.
+    rearm_timer(axhal::time::monotonic_time_nanos());
 
     // Enable IRQs before starting app
     axhal::asm::enable_irqs();

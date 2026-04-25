@@ -36,8 +36,8 @@ use crate::{
         SimpleFileOperation, SimpleFs, SimpleFsNode,
     },
     syscall::{
-        current_domainname_string, proc_version_string, set_domainname_bytes, shmall_limit,
-        shmmax_limit, shmmni_limit, set_shmmax_limit,
+        current_domainname_string, proc_version_string, set_domainname_bytes, set_shmmax_limit,
+        shmall_limit, shmmax_limit, shmmni_limit,
     },
     task::{AsThread, get_task, get_visible_task_including_exiting, render_task_stat, tasks},
 };

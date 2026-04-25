@@ -83,13 +83,19 @@ features = ["fp-simd", "irq", "rtc"]
 optional = true
 
 [package.metadata.vendor-filter]
-platforms = ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none"]
+platforms = [
+    "riscv64gc-unknown-none-elf",
+    "loongarch64-unknown-none",
+]
 all-features = true
 
 # Force all direct and transitive users onto the vendored axnet-ng so feature
 # selection stays consistent across axruntime and the kernel.
 [patch.crates-io]
+axfeat = { path = "third_party/rust-patches/axfeat" }
 axnet-ng = { path = "crates/axnet-ng" }
+axdriver = { path = "third_party/rust-patches/axdriver" }
+axdriver_virtio = { path = "third_party/rust-patches/axdriver_virtio" }
 axio = { path = "third_party/rust-patches/axio" }
 axcpu = { path = "third_party/rust-patches/axcpu" }
 axfs-ng = { path = "third_party/rust-patches/axfs-ng" }
@@ -99,7 +105,10 @@ starry-signal = { path = "third_party/rust-patches/starry-signal" }
 axsched = { path = "third_party/rust-patches/axsched" }
 axtask = { path = "third_party/rust-patches/axtask" }
 axruntime = { path = "third_party/rust-patches/axruntime" }
+axplat-loongarch64-qemu-virt = { path = "third_party/rust-patches/axplat-loongarch64-qemu-virt" }
 memory_set = { path = "third_party/rust-patches/memory_set" }
 page_table_multiarch = { path = "third_party/rust-patches/page_table_multiarch" }
 kernel-elf-parser = { path = "third_party/rust-patches/kernel-elf-parser" }
 lwext4_rust = { path = "third_party/rust-patches/lwext4_rust" }
+starry-smoltcp = { path = "third_party/rust-patches/starry-smoltcp" }
+virtio-drivers = { path = "third_party/rust-patches/virtio-drivers" }

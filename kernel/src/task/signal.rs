@@ -12,8 +12,8 @@ use starry_signal::{
 };
 
 use super::{
-    AsThread, ContinueResult, ProcessData, Thread, do_exit, get_process_data, get_process_group,
-    get_task, get_visible_task,
+    AsThread, ContinueResult, ProcessData, Thread, acknowledge_posix_timer_signal, do_exit,
+    get_process_data, get_process_group, get_task, get_visible_task,
 };
 
 pub fn check_signals(
@@ -24,6 +24,7 @@ pub fn check_signals(
     let Some(delivered) = thr.signal.check_signals(uctx, restore_blocked) else {
         return false;
     };
+    acknowledge_posix_timer_signal(&thr.proc_data, &delivered.info);
 
     let signo = delivered.info.signo();
     thr.finish_signal_delivery(delivered.os_action, delivered.restartable_handler);
@@ -206,6 +207,9 @@ pub fn send_signal_to_process_group(pgid: Pid, sig: Option<SignalInfo>) -> AxRes
     if let Some(sig) = sig {
         info!("Send signal {:?} to process group {}", sig.signo(), pgid);
         for proc in pg.processes() {
+            if proc.is_zombie() {
+                continue;
+            }
             send_signal_to_process(proc.pid(), Some(sig.clone()))?;
         }
     }

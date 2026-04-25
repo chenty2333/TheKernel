@@ -49,6 +49,17 @@ fn pages_in(range: VirtAddrRange, align: PageSize) -> AxResult<DynPageIter<VirtA
     DynPageIter::new(range.start, range.end, align as usize).ok_or(AxError::InvalidInput)
 }
 
+fn page_table_flags(flags: MappingFlags) -> MappingFlags {
+    // RISC-V and LoongArch PTEs cannot represent writable-without-readable.
+    // Keep VMA flags exact for /proc/maps and mprotect, but normalize the
+    // hardware permissions when touching page tables.
+    if flags.contains(MappingFlags::WRITE) && !flags.contains(MappingFlags::READ) {
+        flags | MappingFlags::READ
+    } else {
+        flags
+    }
+}
+
 type PopulateCallback = Box<dyn FnOnce(&mut AddrSpace)>;
 
 #[enum_dispatch]
@@ -151,7 +162,9 @@ impl MappingBackend for Backend {
             warn!("Failed to protect area: {:?}", err);
             return false;
         }
-        cursor.protect_region(start, size, new_flags).is_ok()
+        cursor
+            .protect_region(start, size, page_table_flags(new_flags))
+            .is_ok()
     }
 
     fn can_merge(&self, other: &Self) -> bool {

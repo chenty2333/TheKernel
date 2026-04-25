@@ -113,12 +113,10 @@ pub(crate) fn add_seals(loc: &Location, writable: bool, seals: u32) -> AxResult<
             return Err(AxError::OperationNotPermitted);
         }
         let updated = current | seals;
-        match state.seals.compare_exchange(
-            current,
-            updated,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match state
+            .seals
+            .compare_exchange(current, updated, Ordering::AcqRel, Ordering::Acquire)
+        {
             Ok(_) => return Ok(updated),
             Err(observed) => current = observed,
         }

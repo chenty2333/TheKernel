@@ -145,7 +145,7 @@ RUN export RUSTUP_HOME="${RUSTUP_HOME}" CARGO_HOME="${CARGO_HOME}"; \
       x86_64-unknown-none \
       riscv64gc-unknown-none-elf \
       aarch64-unknown-none-softfloat \
-      loongarch64-unknown-none \
+      loongarch64-unknown-none-softfloat \
       --toolchain "${RUST_TOOLCHAIN}" \
  && "${CARGO_HOME}/bin/cargo" install --locked cargo-binutils cargo-axplat axconfig-gen \
  && chmod -R a+rX "${RUSTUP_HOME}" "${CARGO_HOME}"

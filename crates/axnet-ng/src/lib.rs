@@ -157,6 +157,17 @@ pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) -> Arc<NetStac
     stack
 }
 
+/// Initializes the default network stack in loopback-only mode.
+///
+/// This keeps the full socket stack available for localhost-based tests while
+/// intentionally ignoring any discovered NIC devices.
+pub fn init_network_loopback_only() -> Arc<NetStack> {
+    info!("Initialize network subsystem (loopback-only)...");
+    let stack = NetStack::new_loopback_only();
+    DEFAULT_STACK.call_once(|| stack.clone());
+    stack
+}
+
 /// Init vsock subsystem by vsock devices.
 #[cfg(feature = "vsock")]
 pub fn init_vsock(mut vsock_devs: AxDeviceContainer<AxVsockDevice>) {

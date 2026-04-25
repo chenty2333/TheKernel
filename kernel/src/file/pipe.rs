@@ -346,7 +346,10 @@ impl Pipe {
             }
         }
 
-        let poller = TeePoll { src: self, dst: out };
+        let poller = TeePoll {
+            src: self,
+            dst: out,
+        };
         let mut total_copied = 0usize;
         block_on(poll_io(
             &poller,
@@ -737,7 +740,10 @@ impl Pollable for NamedPipe {
             events.set(IoEvents::HUP, self.state.writer_count() == 0);
         }
         if self.access.can_write() {
-            events.set(IoEvents::OUT, self.state.reader_count() > 0 && buf.vacant_len() > 0);
+            events.set(
+                IoEvents::OUT,
+                self.state.reader_count() > 0 && buf.vacant_len() > 0,
+            );
         }
         events
     }

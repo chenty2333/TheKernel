@@ -31,7 +31,6 @@ axfeat = { workspace = true, features = [
     "rtc",
 
     "fs-ng-ext4",
-    "net-ng",
 ] }
 
 axalloc.workspace = true
@@ -86,7 +85,7 @@ memory_addr = "0.4"
 memory_set = "0.4"
 num_enum = { version = "0.7", default-features = false }
 ouroboros = { version = "0.18", default-features = false }
-percpu = "0.2.3-preview.1"
+percpu = { version = "0.2.3-preview.1", features = ["non-zero-vma"] }
 rand = { version = "0.10", default-features = false, features = ["alloc"] }
 ringbuf = { version = "0.4.8", default-features = false, features = ["alloc"] }
 scope-local = "0.1"
@@ -107,6 +106,12 @@ x86 = "0.52"
 
 [target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
 riscv = "0.16"
+
+[target.'cfg(target_arch = "loongarch64")'.dependencies]
+axfeat = { workspace = true, features = ["net-ng-loopback"] }
+
+[target.'cfg(not(target_arch = "loongarch64"))'.dependencies]
+axfeat = { workspace = true, features = ["net-ng"] }
 
 [target.'cfg(not(any(target_arch = "aarch64", target_arch = "loongarch64")))'.dependencies]
 page_table_multiarch = { version = "0.6", features = ["copy-from"] }

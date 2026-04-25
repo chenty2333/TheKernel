@@ -330,8 +330,8 @@ pub fn sys_syslog(kind: i32, buf: *mut c_char, len: isize) -> AxResult<isize> {
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    let privileged =
-        proc_data.has_effective_capability(CAP_SYSLOG) || proc_data.has_effective_capability(CAP_SYS_ADMIN);
+    let privileged = proc_data.has_effective_capability(CAP_SYSLOG)
+        || proc_data.has_effective_capability(CAP_SYS_ADMIN);
 
     match kind {
         2 | 3 | 4 => {

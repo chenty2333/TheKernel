@@ -38,8 +38,8 @@ kernel-base-vaddr = "0xffff_8000_0020_0000"     # uint
 kernel-aspace-base = "0xffff_8000_0000_0000"    # uint
 # Kernel address space size.
 kernel-aspace-size = "0x0000_7fff_ffff_f000"    # uint
-# Stack size on bootstrapping. (256K)
-boot-stack-size = 0x40000                       # uint
+# Stack size on bootstrapping. (1M)
+boot-stack-size = 0x100000                      # uint
 
 #
 # Device specifications

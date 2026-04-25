@@ -11,7 +11,7 @@ use axhal::paging::{MappingFlags, PageSize, PageTableCursor, PagingError};
 use axsync::Mutex;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 
-use super::{AddrSpace, Backend, BackendOps, PopulateCallback, pages_in};
+use super::{AddrSpace, Backend, BackendOps, PopulateCallback, page_table_flags, pages_in};
 use crate::file::memfd;
 
 #[doc(hidden)]
@@ -189,7 +189,7 @@ impl FileBackend {
             match pt.query(old_addr) {
                 Ok((paddr, flags, page_size)) => {
                     assert_eq!(page_size, PageSize::Size4K);
-                    pt.map(new_addr, paddr, PageSize::Size4K, flags)?;
+                    pt.map(new_addr, paddr, PageSize::Size4K, page_table_flags(flags))?;
                 }
                 Err(PagingError::NotMapped) => {}
                 Err(_) => return Err(AxError::BadAddress),
@@ -265,7 +265,7 @@ impl BackendOps for FileBackend {
                             if !in_memory {
                                 page.expect("page should be present").mark_dirty();
                             }
-                            pt.remap(addr, paddr, flags)?;
+                            pt.remap(addr, paddr, page_table_flags(flags))?;
                             pages += 1;
                             AxResult::Ok(())
                         })?;
@@ -287,7 +287,12 @@ impl BackendOps for FileBackend {
                         if let Some((pn, _)) = evicted {
                             to_be_evicted.push(pn);
                         }
-                        pt.map(addr, page.paddr(), PageSize::Size4K, map_flags)?;
+                        pt.map(
+                            addr,
+                            page.paddr(),
+                            PageSize::Size4K,
+                            page_table_flags(map_flags),
+                        )?;
                         pages += 1;
                         Ok(())
                     })?;

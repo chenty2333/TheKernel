@@ -9,6 +9,7 @@ TESTSUITE_DIR=${OSCOMP_TESTSUITE_DIR:-}
 
 ARCH=""
 IMAGE_PATH=""
+SUPPORT_IMAGE_OVERRIDE=""
 SUPPORT_IMAGE_SOURCE=""
 TIMEOUT_SECS=7000
 WORKDIR=""
@@ -39,6 +40,7 @@ Usage: $(basename "$0") --arch {rv|la} [options]
 Options:
   --arch {rv|la}        Target architecture
   --image IMG[.xz|.gz]  Override the official testsuite image
+  --support-image IMG    Override the support disk image (default: disk.img)
   --timeout SECS        Whole-QEMU timeout in seconds (default: $TIMEOUT_SECS)
   --workdir DIR         Working directory for decompressed/copied images
   --skip-kernel-build   Reuse existing kernel-rv/kernel-la
@@ -54,6 +56,10 @@ while (($#)); do
             ;;
         --image)
             IMAGE_PATH=${2:-}
+            shift 2
+            ;;
+        --support-image)
+            SUPPORT_IMAGE_OVERRIDE=${2:-}
             shift 2
             ;;
         --timeout)
@@ -188,13 +194,16 @@ if [ "$ARCH" = "rv" ]; then
     require_cmd qemu-system-riscv64
     KERNEL_NAME=kernel-rv
     DEFAULT_IMAGE=$(find_official_image rv || true)
-    SUPPORT_IMAGE_SOURCE=$(find_first_existing \
-        "$REPO_ROOT/disk.img" \
-        "$REPO_ROOT/disk.img.xz" || true)
 else
     require_cmd qemu-system-loongarch64
     KERNEL_NAME=kernel-la
     DEFAULT_IMAGE=$(find_official_image la || true)
+fi
+
+if [ -n "$SUPPORT_IMAGE_OVERRIDE" ]; then
+    [ -f "$SUPPORT_IMAGE_OVERRIDE" ] || die "support image does not exist: $SUPPORT_IMAGE_OVERRIDE"
+    SUPPORT_IMAGE_SOURCE="$SUPPORT_IMAGE_OVERRIDE"
+else
     SUPPORT_IMAGE_SOURCE=$(find_first_existing \
         "$REPO_ROOT/disk.img" \
         "$REPO_ROOT/disk.img.xz" || true)
@@ -279,6 +288,7 @@ if [ "$ARCH" = "rv" ]; then
 else
     QEMU_CMD=(
         qemu-system-loongarch64
+        -machine virt
         -kernel "$KERNEL_PATH"
         -m 1G
         -nographic

@@ -4,7 +4,7 @@ use alloc::{borrow::ToOwned, string::String, vec, vec::Vec};
 use core::{ffi::CStr, iter};
 
 use axerrno::{AxError, AxResult};
-use axfs::{CachedFile, FS_CONTEXT, FileBackend};
+use axfs::{CachedFile, FS_CONTEXT};
 use axfs_ng_vfs::Location;
 use axhal::{
     mem::virt_to_phys,
@@ -117,7 +117,7 @@ fn map_elf<'a>(
         let backend = Backend::new_cow(
             seg_start,
             PageSize::Size4K,
-            FileBackend::Cached(cache.clone()),
+            cache.location().clone(),
             ph.offset,
             Some(ph.offset + ph.file_size),
             false,

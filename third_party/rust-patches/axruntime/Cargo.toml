@@ -175,3 +175,4 @@ version = "0.1"
 [dependencies.percpu]
 version = "0.2.3-preview.1"
 optional = true
+features = ["non-zero-vma"]

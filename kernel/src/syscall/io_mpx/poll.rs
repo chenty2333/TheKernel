@@ -131,10 +131,5 @@ pub fn sys_ppoll(
     let timeout = nullable!(timeout.get_as_ref())?
         .map(|ts| ts.try_into_time_value())
         .transpose()?;
-    do_poll(
-        Some(uctx),
-        fds,
-        timeout,
-        sigmask,
-    )
+    do_poll(Some(uctx), fds, timeout, sigmask)
 }

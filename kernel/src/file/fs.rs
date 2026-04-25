@@ -12,9 +12,13 @@ use axfs_ng_vfs::{Location, Metadata, NodeFlags, path::Path};
 use axio::{Cursor, IoBuf, Seek, SeekFrom};
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
-use axtask::current;
-use axtask::future::{block_on, poll_io};
-use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, RLIM_INFINITY, RLIMIT_FSIZE};
+use axtask::{
+    current,
+    future::{block_on, poll_io},
+};
+use linux_raw_sys::general::{
+    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, RLIM_INFINITY, RLIMIT_FSIZE,
+};
 use starry_signal::{SignalInfo, Signo};
 
 use super::{FileHandle, FileLike, Kstat, get_file_like, get_typed_file};

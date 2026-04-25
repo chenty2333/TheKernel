@@ -1,6 +1,8 @@
 use alloc::{collections::BTreeMap, sync::Arc};
-use core::ops::Deref;
-use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
+use core::{
+    ops::Deref,
+    sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering},
+};
 
 use crate::{BaseScheduler, EnqueueReason};
 
@@ -8,16 +10,17 @@ pub const RR_TIMESLICE_TICKS: usize = 5;
 pub const RT_PRIORITY_MIN: u8 = 1;
 pub const RT_PRIORITY_MAX: u8 = 99;
 const FAIR_PREEMPT_GRANULARITY_TICKS: isize = 2;
+const RT_FAIR_BUDGET_TICKS: isize = 2;
 
 /// Runtime scheduling class for CFS tasks.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CfsTaskClass {
-    Normal      = 0,
-    Batch       = 1,
-    Idle        = 2,
-    RoundRobin  = 3,
-    Fifo        = 4,
+    Normal     = 0,
+    Batch      = 1,
+    Idle       = 2,
+    RoundRobin = 3,
+    Fifo       = 4,
 }
 
 /// Runtime scheduling parameters for a CFS task.
@@ -191,7 +194,7 @@ impl<T> CFSTask<T> {
         self.class.store(class as u8, Ordering::Release);
         self.rt_priority.store(rt_priority, Ordering::Release);
         self.reset_on_fork.store(reset_on_fork, Ordering::Release);
-        if matches!(class, CfsTaskClass::RoundRobin) {
+        if matches!(class, CfsTaskClass::RoundRobin | CfsTaskClass::Fifo) {
             self.reset_rr_time_slice();
         } else {
             self.rr_time_slice.store(0, Ordering::Release);
@@ -272,11 +275,12 @@ impl<T> Deref for CFSTask<T> {
 /// [1]: https://en.wikipedia.org/wiki/Completely_Fair_Scheduler
 pub struct CFScheduler<T> {
     ready_fair_queue: BTreeMap<(isize, isize), Arc<CFSTask<T>>>, // (vruntime, taskid)
-    ready_rt_queue: BTreeMap<(u8, isize), Arc<CFSTask<T>>>, // (priority key, queue seq)
+    ready_rt_queue: BTreeMap<(u8, isize), Arc<CFSTask<T>>>,      // (priority key, queue seq)
     min_vruntime: Option<isize>,
     id_pool: AtomicIsize,
     rt_front_seq: isize,
     rt_back_seq: isize,
+    rt_fair_budget: isize,
 }
 
 impl<T> CFScheduler<T> {
@@ -289,6 +293,7 @@ impl<T> CFScheduler<T> {
             id_pool: AtomicIsize::new(0_isize),
             rt_front_seq: 0,
             rt_back_seq: 0,
+            rt_fair_budget: 0,
         }
     }
 
@@ -345,9 +350,12 @@ impl<T> CFScheduler<T> {
     fn wakeup_floor(&self, task: &CFSTask<T>) -> isize {
         let floor = self.queue_floor();
         match task.class() {
-            CfsTaskClass::Normal => floor,
-            CfsTaskClass::Batch => floor.saturating_add(1),
-            CfsTaskClass::Idle => floor.saturating_add(2),
+            // Keep freshly woken fair tasks slightly behind the current floor
+            // so a wakeup burst does not immediately displace the task that is
+            // doing the wakeup-side follow-up work.
+            CfsTaskClass::Normal => floor.saturating_add(FAIR_PREEMPT_GRANULARITY_TICKS),
+            CfsTaskClass::Batch => floor.saturating_add(FAIR_PREEMPT_GRANULARITY_TICKS + 1),
+            CfsTaskClass::Idle => floor.saturating_add(FAIR_PREEMPT_GRANULARITY_TICKS + 2),
             CfsTaskClass::RoundRobin | CfsTaskClass::Fifo => floor,
         }
     }
@@ -387,6 +395,14 @@ impl<T> CFScheduler<T> {
             .range((key, isize::MIN)..=(key, isize::MAX))
             .next()
             .is_some()
+    }
+
+    fn arm_rt_fair_budget(&mut self) -> bool {
+        if self.ready_fair_queue.is_empty() {
+            return false;
+        }
+        self.rt_fair_budget = self.rt_fair_budget.max(RT_FAIR_BUDGET_TICKS);
+        true
     }
 
     /// Updates runtime scheduling parameters for a task.
@@ -433,6 +449,17 @@ impl<T> BaseScheduler for CFScheduler<T> {
     }
 
     fn pick_next_task(&mut self) -> Option<Self::SchedItem> {
+        if self.rt_fair_budget > 0 {
+            let next = self.ready_fair_queue.pop_first().map(|(_, task)| task);
+            match &next {
+                Some(task) => self.refresh_min_vruntime(Some(task.get_vruntime())),
+                None => {
+                    self.rt_fair_budget = 0;
+                    self.refresh_min_vruntime(None);
+                }
+            }
+            return next;
+        }
         if let Some((_, task)) = self.ready_rt_queue.pop_first() {
             return Some(task);
         }
@@ -446,7 +473,14 @@ impl<T> BaseScheduler for CFScheduler<T> {
 
     fn put_prev_task(&mut self, prev: Self::SchedItem, preempt: bool) {
         match prev.class() {
-            CfsTaskClass::Fifo => self.insert_rt_task(prev, preempt),
+            CfsTaskClass::Fifo => {
+                if preempt && prev.rr_time_slice() > 0 {
+                    self.insert_rt_task(prev, true);
+                } else {
+                    prev.reset_rr_time_slice();
+                    self.insert_rt_task(prev, false);
+                }
+            }
             CfsTaskClass::RoundRobin => {
                 if preempt && prev.rr_time_slice() > 0 {
                     self.insert_rt_task(prev, true);
@@ -509,23 +543,47 @@ impl<T> BaseScheduler for CFScheduler<T> {
             }
 
             return match current.class() {
-                CfsTaskClass::Fifo => false,
+                CfsTaskClass::Fifo => {
+                    let old_slice = current.task_tick_rr();
+                    if old_slice <= 1 {
+                        if self.arm_rt_fair_budget() {
+                            return true;
+                        }
+                        if self.has_ready_rt_with_same_priority(current_priority) {
+                            return true;
+                        }
+                        current.reset_rr_time_slice();
+                    }
+                    false
+                }
                 CfsTaskClass::RoundRobin => {
                     let old_slice = current.task_tick_rr();
                     if old_slice <= 1 {
+                        if self.arm_rt_fair_budget() {
+                            return true;
+                        }
+                        if self.has_ready_rt_with_same_priority(current_priority) {
+                            return true;
+                        }
                         current.reset_rr_time_slice();
-                        self.has_ready_rt_with_same_priority(current_priority)
-                    } else {
-                        false
                     }
+                    false
                 }
                 CfsTaskClass::Normal | CfsTaskClass::Batch | CfsTaskClass::Idle => false,
             };
         }
 
         if !self.ready_rt_queue.is_empty() {
+            if self.rt_fair_budget > 0 {
+                current.task_tick();
+                let current_vruntime = current.get_vruntime();
+                self.refresh_min_vruntime(Some(current_vruntime));
+                self.rt_fair_budget -= 1;
+                return self.rt_fair_budget <= 0;
+            }
             return true;
         }
+        self.rt_fair_budget = 0;
 
         current.task_tick();
         let current_vruntime = current.get_vruntime();

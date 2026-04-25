@@ -205,7 +205,8 @@ impl OpenOptions {
             }
             loc.check_is_dir()?;
         }
-        if loc.is_dir() && (self.write || self.append || self.truncate || self.create || self.create_new)
+        if loc.is_dir()
+            && (self.write || self.append || self.truncate || self.create || self.create_new)
         {
             return Err(VfsError::IsADirectory);
         }
@@ -394,17 +395,37 @@ struct CachedFileShared {
 impl CachedFileShared {
     pub fn new() -> Self {
         Self {
-            page_cache: Mutex::new(LruCache::new(per_file_page_cache_capacity())),
+            page_cache: Mutex::new(new_bounded_page_cache_store()),
             evict_listeners: Mutex::new(LinkedList::default()),
         }
     }
 
     pub fn new_unbounded() -> Self {
         Self {
-            page_cache: Mutex::new(LruCache::unbounded()),
+            page_cache: Mutex::new(new_unbounded_page_cache_store()),
             evict_listeners: Mutex::new(LinkedList::default()),
         }
     }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn new_bounded_page_cache_store() -> LruCache<u32, PageCache> {
+    LruCache::unbounded()
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn new_bounded_page_cache_store() -> LruCache<u32, PageCache> {
+    LruCache::new(per_file_page_cache_capacity())
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn new_unbounded_page_cache_store() -> LruCache<u32, PageCache> {
+    LruCache::unbounded()
+}
+
+#[cfg(not(target_arch = "loongarch64"))]
+fn new_unbounded_page_cache_store() -> LruCache<u32, PageCache> {
+    LruCache::unbounded()
 }
 
 /// A file handle with an LRU page cache for buffered I/O.
@@ -447,22 +468,29 @@ impl CachedFile {
     pub fn get_or_create(location: Location) -> Self {
         let in_memory = location.filesystem().name() == "tmpfs";
 
-        let mut guard = location.user_data();
-        let shared = if let Some(shared) = guard.get::<FileUserData>().and_then(|it| it.get()) {
+        let shared = if in_memory {
+            let mut guard = location.user_data();
+            let shared = if let Some(shared) = guard.get::<FileUserData>().and_then(|it| it.get()) {
+                shared
+            } else {
+                let shared = Arc::new(CachedFileShared::new_unbounded());
+                guard.insert(FileUserData::Strong(shared.clone()));
+                shared
+            };
+            drop(guard);
             shared
         } else {
-            let (shared, user_data) = if in_memory {
-                let shared = Arc::new(CachedFileShared::new_unbounded());
-                (shared.clone(), FileUserData::Strong(shared))
+            let mut guard = location.user_data();
+            let shared = if let Some(shared) = guard.get::<FileUserData>().and_then(|it| it.get()) {
+                shared
             } else {
                 let shared = Arc::new(CachedFileShared::new());
-                let user_data = FileUserData::Weak(Arc::downgrade(&shared));
-                (shared, user_data)
+                guard.insert(FileUserData::Weak(Arc::downgrade(&shared)));
+                shared
             };
-            guard.insert(user_data);
+            drop(guard);
             shared
         };
-        drop(guard);
 
         Self {
             inner: location,
@@ -524,16 +552,29 @@ impl CachedFile {
         Ok(())
     }
 
-    fn page_or_insert<'a>(
+    fn pop_lru_page(&self) -> Option<(u32, PageCache)> {
+        self.shared.page_cache.lock().pop_lru()
+    }
+
+    fn pop_cached_page(&self, pn: u32) -> Option<PageCache> {
+        self.shared.page_cache.lock().pop(&pn)
+    }
+
+    fn drain_cache(&self, file: &FileNode) -> VfsResult<()> {
+        while let Some((pn, mut page)) = self.pop_lru_page() {
+            self.evict_cache(file, pn, &mut page)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_page_cached(
         &self,
         file: &FileNode,
-        cache: &'a mut LruCache<u32, PageCache>,
+        cache: &mut LruCache<u32, PageCache>,
         pn: u32,
-    ) -> VfsResult<(&'a mut PageCache, Option<(u32, PageCache)>)> {
-        // TODO: Matching the result of `get_mut` confuses compiler. See
-        // https://users.rust-lang.org/t/return-do-not-release-mutable-borrow/55757.
+    ) -> VfsResult<Option<(u32, PageCache)>> {
         if cache.contains(&pn) {
-            return Ok((cache.get_mut(&pn).unwrap(), None));
+            return Ok(None);
         }
         let mut evicted = None;
         if cache.len() == cache.cap().get() {
@@ -557,7 +598,7 @@ impl CachedFile {
             }
         }
         cache.put(pn, page);
-        Ok((cache.get_mut(&pn).unwrap(), evicted))
+        Ok(evicted)
     }
 
     /// Invokes `f` with the cached page at `pn`, or `None` if it is not cached.
@@ -575,7 +616,8 @@ impl CachedFile {
         f: impl FnOnce(&mut PageCache, Option<(u32, PageCache)>) -> VfsResult<R>,
     ) -> VfsResult<R> {
         let mut guard = self.shared.page_cache.lock();
-        let (page, evicted) = self.page_or_insert(self.inner.entry().as_file()?, &mut guard, pn)?;
+        let evicted = self.ensure_page_cached(self.inner.entry().as_file()?, &mut guard, pn)?;
+        let page = guard.get_mut(&pn).unwrap();
         f(page, evicted)
     }
 
@@ -594,7 +636,8 @@ impl CachedFile {
             let page_start = pn as u64 * PAGE_SIZE as u64;
 
             let mut guard = self.shared.page_cache.lock();
-            let page = self.page_or_insert(file, &mut guard, pn)?.0;
+            self.ensure_page_cached(file, &mut guard, pn)?;
+            let page = guard.get_mut(&pn).unwrap();
 
             initial = page_each(
                 initial,
@@ -686,23 +729,26 @@ impl CachedFile {
             // For truncating, we need to remove all pages that are beyond the
             // new length
             // TODO(mivik): can this be more efficient?
-            let mut guard = self.shared.page_cache.lock();
-            if let Some(page) = guard.get_mut(&new_last_page) {
-                let page_start = new_last_page as u64 * PAGE_SIZE as u64;
-                let new_page_offset = len.saturating_sub(page_start).min(PAGE_SIZE as u64) as usize;
-                page.data()[new_page_offset..].fill(0);
-                page.dirty = false;
-            }
-            let keys = guard
-                .iter()
-                .map(|(k, _)| *k)
-                .filter(|it| *it > new_last_page)
-                .collect::<Vec<_>>();
+            let keys = {
+                let mut guard = self.shared.page_cache.lock();
+                if let Some(page) = guard.get_mut(&new_last_page) {
+                    let page_start = new_last_page as u64 * PAGE_SIZE as u64;
+                    let new_page_offset =
+                        len.saturating_sub(page_start).min(PAGE_SIZE as u64) as usize;
+                    page.data()[new_page_offset..].fill(0);
+                    page.dirty = false;
+                }
+                guard
+                    .iter()
+                    .map(|(k, _)| *k)
+                    .filter(|it| *it > new_last_page)
+                    .collect::<Vec<_>>()
+            };
             for pn in keys {
-                if let Some(mut page) = guard.pop(&pn)
+                if let Some(mut page) = self.pop_cached_page(pn)
                     && !self.in_memory
                 {
-                    // Don't write back pages since they're discarded
+                    // Don't write back pages since they're discarded.
                     page.dirty = false;
                     self.evict_cache(file, pn, &mut page)?;
                 }
@@ -725,10 +771,7 @@ impl CachedFile {
             return Ok(());
         }
         let file = self.inner.entry().as_file()?;
-        let mut guard = self.shared.page_cache.lock();
-        while let Some((pn, mut page)) = guard.pop_lru() {
-            self.evict_cache(file, pn, &mut page)?;
-        }
+        self.drain_cache(file)?;
         file.sync(data_only)?;
         Ok(())
     }
@@ -746,8 +789,21 @@ impl Drop for CachedFile {
             // need to drop it.
             return;
         }
-        if let Err(err) = self.sync(false) {
-            warn!("Failed to sync file on drop: {err:?}");
+        if self.in_memory {
+            return;
+        }
+        let file = match self.inner.entry().as_file() {
+            Ok(file) => file,
+            Err(err) => {
+                warn!("Failed to access file for cache drop: {err:?}");
+                return;
+            }
+        };
+        if let Err(err) = self.drain_cache(file) {
+            // `close(2)` is not required to persist data to the device. Keep
+            // the explicit flush path on `fsync`/`fdatasync`, and only make
+            // dirty cached pages visible to the inode here.
+            warn!("Failed to drain cached file pages on drop: {err:?}");
         }
     }
 }
@@ -1044,16 +1100,18 @@ impl File {
         if let Some(pos) = self.position.as_ref() {
             let mut pos = pos.lock();
             if let Ok(f) = self.access(FileFlags::APPEND) {
-                f.append(src).inspect(|(written, _)| {
-                    #[cfg(feature = "times")]
-                    if *written > 0 {
-                        self.record_time_flags(3);
-                        self.flush_times();
-                    }
-                }).map(|(written, new_size)| {
-                    *pos = new_size;
-                    written
-                })
+                f.append(src)
+                    .inspect(|(written, _)| {
+                        #[cfg(feature = "times")]
+                        if *written > 0 {
+                            self.record_time_flags(3);
+                            self.flush_times();
+                        }
+                    })
+                    .map(|(written, new_size)| {
+                        *pos = new_size;
+                        written
+                    })
             } else {
                 self.write_at(src, *pos).inspect(|n| {
                     *pos += *n as u64;

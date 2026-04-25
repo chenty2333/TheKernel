@@ -16,8 +16,9 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     task::{
-        AsThread, check_signals, get_process_data, get_visible_task, processes,
-        send_signal_to_process, send_signal_to_process_group, send_signal_to_visible_thread,
+        AsThread, acknowledge_posix_timer_signal, check_signals, get_process_data,
+        get_process_including_zombie, get_visible_task, processes, send_signal_to_process,
+        send_signal_to_process_group, send_signal_to_visible_thread,
     },
     time::TimeValueLike,
 };
@@ -112,9 +113,7 @@ fn make_siginfo(signo: u32, code: i32) -> AxResult<Option<SignalInfo>> {
 
 fn ensure_realtime_signal_queue_capacity_for_thread(tgid: Option<Pid>, tid: Pid) -> AxResult<()> {
     let task = get_visible_task(tid)?;
-    let thread = task
-        .try_as_thread()
-        .ok_or(AxError::OperationNotPermitted)?;
+    let thread = task.try_as_thread().ok_or(AxError::OperationNotPermitted)?;
     if tgid.is_some_and(|tgid| thread.proc_data.proc.pid() != tgid) {
         return Err(AxError::NoSuchProcess);
     }
@@ -153,14 +152,49 @@ fn check_signal_permission(pid: Pid) -> AxResult<()> {
     }
 }
 
+fn check_zombie_signal_permission(pid: Pid) -> AxResult<bool> {
+    let process = get_process_including_zombie(pid)?;
+    if !process.is_zombie() {
+        return Ok(false);
+    }
+
+    let actor = current();
+    let actor_proc = &actor.as_thread().proc_data;
+    if actor_proc.euid() == 0 {
+        return Ok(true);
+    }
+
+    let snapshot = process.zombie_snapshot().ok_or(AxError::NoSuchProcess)?;
+    let allowed = [actor_proc.uid(), actor_proc.euid()]
+        .into_iter()
+        .any(|id| id == snapshot.uid);
+    if allowed {
+        Ok(true)
+    } else {
+        Err(AxError::OperationNotPermitted)
+    }
+}
+
+fn zombie_signal_succeeds(pid: Pid) -> AxResult<bool> {
+    check_zombie_signal_permission(pid)
+}
+
 pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
     debug!("sys_kill: pid = {pid}, signo = {signo}");
     let sig = make_siginfo(signo, SI_USER as _)?;
 
     match pid {
         1.. => {
-            check_signal_permission(pid as Pid)?;
-            send_signal_to_process(pid as _, sig)?;
+            let target = pid as Pid;
+            match check_signal_permission(target) {
+                Ok(()) => match send_signal_to_process(target, sig) {
+                    Ok(()) => {}
+                    Err(AxError::NoSuchProcess) if zombie_signal_succeeds(target)? => {}
+                    Err(err) => return Err(err),
+                },
+                Err(AxError::NoSuchProcess) if zombie_signal_succeeds(target)? => {}
+                Err(err) => return Err(err),
+            }
         }
         0 => {
             let pgid = current().as_thread().proc_data.proc.group().pgid();
@@ -222,7 +256,14 @@ pub(crate) fn make_queue_signal_info(
     let signo = parse_signo(signo)?;
     let mut sig = unsafe { sig.vm_read_uninit()?.assume_init() };
     sig.set_signo(signo);
-    if current().as_thread().proc_data.proc.pid() != target_pid
+    let target_process_pid = get_visible_task(target_pid)
+        .ok()
+        .and_then(|task| {
+            task.try_as_thread()
+                .map(|thread| thread.proc_data.proc.pid())
+        })
+        .unwrap_or(target_pid);
+    if current().as_thread().proc_data.proc.pid() != target_process_pid
         && (sig.code() >= 0 || sig.code() == SI_TKILL)
     {
         return Err(AxError::OperationNotPermitted);
@@ -230,19 +271,10 @@ pub(crate) fn make_queue_signal_info(
     Ok(Some(sig))
 }
 
-pub fn sys_rt_sigqueueinfo(
-    pid: Pid,
-    signo: u32,
-    sig: *const SignalInfo,
-    sigsetsize: usize,
-) -> AxResult<isize> {
-    check_sigset_size(sigsetsize)?;
-
+pub fn sys_rt_sigqueueinfo(pid: Pid, signo: u32, sig: *const SignalInfo) -> AxResult<isize> {
     let sig = make_queue_signal_info(pid, signo, sig)?;
     if let Ok(task) = get_visible_task(pid) {
-        let thread = task
-            .try_as_thread()
-            .ok_or(AxError::OperationNotPermitted)?;
+        let thread = task.try_as_thread().ok_or(AxError::OperationNotPermitted)?;
         if thread.proc_data.proc.pid() == pid {
             if signo != 0 && parse_signo(signo)?.is_realtime() {
                 ensure_realtime_signal_queue_capacity_for_process(pid)?;
@@ -268,9 +300,7 @@ pub fn sys_rt_tgsigqueueinfo(
     tid: i32,
     signo: u32,
     sig: *const SignalInfo,
-    sigsetsize: usize,
 ) -> AxResult<isize> {
-    check_sigset_size(sigsetsize)?;
     if tgid <= 0 || tid <= 0 {
         return Err(AxError::InvalidInput);
     }
@@ -340,6 +370,7 @@ pub fn sys_rt_sigtimedwait(
         // Interrupted
         return Ok(0);
     };
+    acknowledge_posix_timer_signal(&thr.proc_data, &sig);
 
     if let Some(info) = info.nullable() {
         info.vm_write(sig.0)?;

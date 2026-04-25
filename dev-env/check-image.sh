@@ -40,7 +40,7 @@ rustup show active-toolchain | grep -q "^${RUST_TOOLCHAIN_EXPECTED}"
 expect_target x86_64-unknown-none
 expect_target riscv64gc-unknown-none-elf
 expect_target aarch64-unknown-none-softfloat
-expect_target loongarch64-unknown-none
+expect_target loongarch64-unknown-none-softfloat
 
 riscv64-linux-musl-gcc -print-sysroot >/dev/null
 loongarch64-linux-musl-gcc -print-sysroot >/dev/null

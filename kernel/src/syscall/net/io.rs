@@ -301,6 +301,7 @@ pub fn sys_recvmmsg(
         return Err(AxError::InvalidInput);
     }
     validate_recvmmsg_timeout(timeout)?;
+    UserConstPtr::<mmsghdr>::from(msgvec.address().as_usize()).get_as_slice(vlen as usize)?;
 
     let mut received = 0usize;
     let base = msgvec.address().as_usize();

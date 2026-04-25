@@ -1,6 +1,10 @@
-use std::env;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 
 struct CrossToolchain {
     cc: String,
@@ -19,7 +23,7 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
-    let toolchain = discover_cross_toolchain(&arch);
+    let toolchain = discover_cross_toolchain(&arch, &out_dir);
     let lwext4_lib = &format!("lwext4-{arch}");
     {
         let status = Command::new("make")
@@ -87,11 +91,323 @@ fn find_tool(candidates: &[String]) -> Option<String> {
     None
 }
 
-fn discover_cross_toolchain(arch: &str) -> CrossToolchain {
-    for family in [
-        format!("{arch}-linux-musl"),
-        format!("{arch}-linux-gnu"),
-    ] {
+fn env_tool(name: &str) -> Option<String> {
+    match env::var(name) {
+        Ok(value) if !value.is_empty() => Some(value),
+        _ => None,
+    }
+}
+
+fn discover_env_toolchain() -> Option<CrossToolchain> {
+    let cc = env_tool("CC")?;
+    let ar = env_tool("AR")?;
+    let as_ = env_tool("AS").unwrap_or_else(|| cc.clone());
+    let objcopy = env_tool("OBJCOPY")?;
+    let objdump = env_tool("OBJDUMP")?;
+    let size = env_tool("SIZE")?;
+    let cxx = env_tool("CXX").unwrap_or_else(|| cc.clone());
+
+    Some(CrossToolchain {
+        cc,
+        cxx,
+        ar,
+        as_,
+        objcopy,
+        objdump,
+        size,
+    })
+}
+
+fn find_tool_by_names(candidates: &[&str]) -> Option<String> {
+    find_tool(
+        &candidates
+            .iter()
+            .map(|candidate| candidate.to_string())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn write_tool_wrapper(wrapper_dir: &Path, name: &str, tool: &str, args: &[&str]) -> Option<String> {
+    fs::create_dir_all(wrapper_dir).ok()?;
+    let path = wrapper_dir.join(name);
+    let mut script = String::from("#!/bin/sh\nexec ");
+    script.push_str(&shell_quote(tool));
+    for arg in args {
+        script.push(' ');
+        script.push_str(&shell_quote(arg));
+    }
+    script.push_str(" \"$@\"\n");
+    fs::write(&path, script).ok()?;
+
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&path).ok()?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).ok()?;
+    }
+
+    Some(path.to_string_lossy().into_owned())
+}
+
+fn write_compat_header(include_dir: &Path, name: &str, content: &str) -> Option<()> {
+    fs::write(include_dir.join(name), content).ok()
+}
+
+fn write_freestanding_headers(include_dir: &Path) -> Option<()> {
+    fs::create_dir_all(include_dir).ok()?;
+    write_compat_header(
+        include_dir,
+        "inttypes.h",
+        r#"#ifndef LWEXT4_FREESTANDING_INTTYPES_H
+#define LWEXT4_FREESTANDING_INTTYPES_H
+#include <stdint.h>
+#define PRId8 "d"
+#define PRIi8 "i"
+#define PRIo8 "o"
+#define PRIu8 "u"
+#define PRIx8 "x"
+#define PRIX8 "X"
+#define PRId16 "d"
+#define PRIi16 "i"
+#define PRIo16 "o"
+#define PRIu16 "u"
+#define PRIx16 "x"
+#define PRIX16 "X"
+#define PRId32 "d"
+#define PRIi32 "i"
+#define PRIo32 "o"
+#define PRIu32 "u"
+#define PRIx32 "x"
+#define PRIX32 "X"
+#define PRId64 "lld"
+#define PRIi64 "lli"
+#define PRIo64 "llo"
+#define PRIu64 "llu"
+#define PRIx64 "llx"
+#define PRIX64 "llX"
+#endif
+"#,
+    )?;
+    write_compat_header(
+        include_dir,
+        "string.h",
+        r#"#ifndef LWEXT4_FREESTANDING_STRING_H
+#define LWEXT4_FREESTANDING_STRING_H
+#include <stddef.h>
+void *memcpy(void *restrict dest, const void *restrict src, size_t n);
+void *memmove(void *dest, const void *src, size_t n);
+void *memset(void *s, int c, size_t n);
+int memcmp(const void *s1, const void *s2, size_t n);
+size_t strlen(const char *s);
+int strcmp(const char *s1, const char *s2);
+int strncmp(const char *s1, const char *s2, size_t n);
+char *strcpy(char *restrict dest, const char *restrict src);
+char *strncpy(char *restrict dest, const char *restrict src, size_t n);
+#endif
+"#,
+    )?;
+    write_compat_header(
+        include_dir,
+        "stdlib.h",
+        r#"#ifndef LWEXT4_FREESTANDING_STDLIB_H
+#define LWEXT4_FREESTANDING_STDLIB_H
+#include <stddef.h>
+#ifndef NULL
+#define NULL ((void *)0)
+#endif
+typedef int (*__compar_fn_t)(const void *, const void *);
+void qsort(void *base, size_t nel, size_t width, __compar_fn_t compar);
+void *malloc(size_t size);
+void *calloc(size_t nmemb, size_t size);
+void *realloc(void *ptr, size_t size);
+void free(void *ptr);
+#endif
+"#,
+    )?;
+    write_compat_header(
+        include_dir,
+        "errno.h",
+        r#"#ifndef LWEXT4_FREESTANDING_ERRNO_H
+#define LWEXT4_FREESTANDING_ERRNO_H
+#define EPERM 1
+#define ENOENT 2
+#define EIO 5
+#define ENXIO 6
+#define E2BIG 7
+#define ENOMEM 12
+#define EACCES 13
+#define EFAULT 14
+#define EEXIST 17
+#define ENODEV 19
+#define ENOTDIR 20
+#define EISDIR 21
+#define EINVAL 22
+#define EFBIG 27
+#define ENOSPC 28
+#define EROFS 30
+#define EMLINK 31
+#define ERANGE 34
+#define ENOTEMPTY 39
+#define ENODATA 61
+#define ENOTSUP 95
+#endif
+"#,
+    )?;
+    write_compat_header(
+        include_dir,
+        "assert.h",
+        r#"#ifndef LWEXT4_FREESTANDING_ASSERT_H
+#define LWEXT4_FREESTANDING_ASSERT_H
+#define assert(expr) ((void)(expr))
+#endif
+"#,
+    )?;
+    write_compat_header(
+        include_dir,
+        "stdio.h",
+        r#"#ifndef LWEXT4_FREESTANDING_STDIO_H
+#define LWEXT4_FREESTANDING_STDIO_H
+typedef struct FILE FILE;
+extern FILE *stdout;
+int printf(const char *restrict format, ...);
+int fflush(FILE *stream);
+#endif
+"#,
+    )
+}
+
+fn discover_llvm_loongarch_toolchain(arch: &str, out_dir: &Path) -> Option<CrossToolchain> {
+    if arch != "loongarch64" {
+        return None;
+    }
+
+    let clang = find_tool_by_names(&["clang"])?;
+    let clangxx = find_tool_by_names(&["clang++"]).unwrap_or_else(|| clang.clone());
+    let ar = find_tool_by_names(&["llvm-ar"])?;
+    let objcopy = find_tool_by_names(&["llvm-objcopy"])?;
+    let objdump = find_tool_by_names(&["llvm-objdump"])?;
+    let size = find_tool_by_names(&["llvm-size"])?;
+    let resource_include =
+        PathBuf::from(command_stdout(&clang, &["-print-resource-dir"])?).join("include");
+
+    let target = env::var("TARGET").unwrap_or_else(|_| "loongarch64-unknown-none".to_string());
+    let clang_target = target.strip_suffix("-softfloat").unwrap_or(&target);
+    let mut common_args = vec![format!("--target={clang_target}")];
+    if target.ends_with("-softfloat") {
+        common_args.push("-mabi=lp64s".to_string());
+    }
+
+    let wrapper_dir = out_dir.join("llvm-loongarch-toolchain");
+    let include_dir = wrapper_dir.join("include");
+    write_freestanding_headers(&include_dir)?;
+    common_args.extend([
+        "-ffreestanding".to_string(),
+        "-nostdinc".to_string(),
+        format!("-I{}", include_dir.display()),
+        format!("-isystem{}", resource_include.display()),
+    ]);
+    let common_arg_refs = common_args.iter().map(String::as_str).collect::<Vec<_>>();
+
+    let cc = write_tool_wrapper(
+        &wrapper_dir,
+        "loongarch64-clang-cc",
+        &clang,
+        &common_arg_refs,
+    )?;
+    let cxx = write_tool_wrapper(
+        &wrapper_dir,
+        "loongarch64-clang-cxx",
+        &clangxx,
+        &common_arg_refs,
+    )?;
+    let as_ = write_tool_wrapper(
+        &wrapper_dir,
+        "loongarch64-clang-as",
+        &clang,
+        &common_arg_refs,
+    )?;
+
+    println!(
+        "cargo:warning=lwext4_rust falling back to LLVM LoongArch toolchain wrappers in {}",
+        wrapper_dir.display()
+    );
+
+    Some(CrossToolchain {
+        cc,
+        cxx,
+        ar,
+        as_,
+        objcopy,
+        objdump,
+        size,
+    })
+}
+
+fn target_needs_loongarch_softfloat_abi(arch: &str) -> bool {
+    arch == "loongarch64"
+        && env::var("TARGET")
+            .map(|target| target.ends_with("-softfloat"))
+            .unwrap_or(false)
+}
+
+fn wrap_loongarch_softfloat_toolchain(
+    arch: &str,
+    out_dir: &Path,
+    toolchain: CrossToolchain,
+) -> CrossToolchain {
+    if !target_needs_loongarch_softfloat_abi(arch) {
+        return toolchain;
+    }
+
+    let wrapper_dir = out_dir.join("loongarch-softfloat-toolchain");
+    let cc = write_tool_wrapper(
+        &wrapper_dir,
+        "loongarch64-softfloat-cc",
+        &toolchain.cc,
+        &["-mabi=lp64s"],
+    )
+    .expect("failed to write LoongArch soft-float C compiler wrapper");
+    let cxx = write_tool_wrapper(
+        &wrapper_dir,
+        "loongarch64-softfloat-cxx",
+        &toolchain.cxx,
+        &["-mabi=lp64s"],
+    )
+    .expect("failed to write LoongArch soft-float C++ compiler wrapper");
+    let as_ = write_tool_wrapper(
+        &wrapper_dir,
+        "loongarch64-softfloat-as",
+        &toolchain.as_,
+        &["-mabi=lp64s"],
+    )
+    .expect("failed to write LoongArch soft-float assembler wrapper");
+
+    println!(
+        "cargo:warning=lwext4_rust forcing LoongArch soft-float ABI wrappers in {}",
+        wrapper_dir.display()
+    );
+
+    CrossToolchain {
+        cc,
+        cxx,
+        ar: toolchain.ar,
+        as_,
+        objcopy: toolchain.objcopy,
+        objdump: toolchain.objdump,
+        size: toolchain.size,
+    }
+}
+
+fn discover_cross_toolchain(arch: &str, out_dir: &Path) -> CrossToolchain {
+    if let Some(toolchain) = discover_env_toolchain() {
+        return wrap_loongarch_softfloat_toolchain(arch, out_dir, toolchain);
+    }
+
+    for family in [format!("{arch}-linux-musl"), format!("{arch}-linux-gnu")] {
         let cc = find_tool(&[format!("{family}-gcc"), format!("{family}-cc")]);
         let ar = find_tool(&[format!("{family}-ar")]);
         let as_ = find_tool(&[format!("{family}-as")]);
@@ -109,7 +425,7 @@ fn discover_cross_toolchain(arch: &str) -> CrossToolchain {
                     "cargo:warning=lwext4_rust falling back to GNU cross toolchain family {family}"
                 );
             }
-            return CrossToolchain {
+            let toolchain = CrossToolchain {
                 cc,
                 cxx,
                 ar,
@@ -118,7 +434,12 @@ fn discover_cross_toolchain(arch: &str) -> CrossToolchain {
                 objdump,
                 size,
             };
+            return wrap_loongarch_softfloat_toolchain(arch, out_dir, toolchain);
         }
+    }
+
+    if let Some(toolchain) = discover_llvm_loongarch_toolchain(arch, out_dir) {
+        return toolchain;
     }
 
     panic!("no usable cross toolchain found for architecture {arch}");
@@ -129,12 +450,18 @@ fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_string(),
+    )
 }
 
 fn command_succeeds(cmd: &str, args: &[&str]) -> bool {
     Command::new(cmd)
         .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -151,6 +478,9 @@ fn add_existing_include_dir(builder: bindgen::Builder, path: PathBuf) -> bindgen
 fn generates_bindings_to_rust(arch: &str, cc: &str, sysroot: &str, out_dir: &Path) {
     let target = env::var("TARGET").unwrap();
     let host = env::var("HOST").unwrap_or_else(|_| "x86_64-unknown-linux-gnu".to_string());
+    let llvm_loongarch_wrapper_dir = out_dir.join("llvm-loongarch-toolchain");
+    let using_llvm_loongarch_wrapper =
+        arch == "loongarch64" && Path::new(cc).starts_with(&llvm_loongarch_wrapper_dir);
     let mut bindgen_target = if target.ends_with("-softfloat") {
         target.replace("-softfloat", "")
     } else {
@@ -169,7 +499,8 @@ fn generates_bindings_to_rust(arch: &str, cc: &str, sysroot: &str, out_dir: &Pat
         )
     {
         println!(
-            "cargo:warning=clang does not support target triple {triple}; generating lwext4 bindings with fallback host target {host}"
+            "cargo:warning=clang does not support target triple {triple}; generating lwext4 \
+             bindings with fallback host target {host}"
         );
         bindgen_target = host.clone();
         unsafe { env::set_var("TARGET", &bindgen_target) };
@@ -192,28 +523,34 @@ fn generates_bindings_to_rust(arch: &str, cc: &str, sysroot: &str, out_dir: &Pat
     if let Some(triple) = command_stdout(cc, &["-dumpmachine"]) {
         if command_succeeds(
             "clang",
-            &[
-                &format!("--target={triple}"),
-                "-dM",
-                "-E",
-                "-x",
-                "c",
-                "-",
-            ],
+            &[&format!("--target={triple}"), "-dM", "-E", "-x", "c", "-"],
         ) {
             builder = builder.clang_arg(format!("--target={triple}"));
+            if arch == "loongarch64" && target.ends_with("-softfloat") {
+                builder = builder.clang_arg("-mabi=lp64s");
+            }
             if !sysroot.is_empty() {
                 builder = builder.clang_arg(format!("--sysroot={sysroot}"));
             }
         } else if arch == "loongarch64" {
             println!(
-                "cargo:warning=clang does not support target triple {triple}; generating lwext4 bindings with fallback host target {host}"
+                "cargo:warning=clang does not support target triple {triple}; generating lwext4 \
+                 bindings with fallback host target {host}"
             );
             bindgen_target = host.clone();
             unsafe { env::set_var("TARGET", &bindgen_target) };
         }
 
-        if let Some(gcc_include) = command_stdout(cc, &["-print-file-name=include"]) {
+        if using_llvm_loongarch_wrapper {
+            let include_dir = llvm_loongarch_wrapper_dir.join("include");
+            if let Some(resource_dir) = command_stdout(cc, &["-print-resource-dir"]) {
+                builder = builder
+                    .clang_arg("-ffreestanding")
+                    .clang_arg("-nostdinc")
+                    .clang_arg(format!("-I{}", include_dir.display()))
+                    .clang_arg(format!("-isystem{}/include", resource_dir));
+            }
+        } else if let Some(gcc_include) = command_stdout(cc, &["-print-file-name=include"]) {
             builder = builder.clang_arg(format!("-isystem{gcc_include}"));
 
             let gcc_include_path = PathBuf::from(&gcc_include);
@@ -225,11 +562,15 @@ fn generates_bindings_to_rust(arch: &str, cc: &str, sysroot: &str, out_dir: &Pat
             }
         }
 
-        let sysroot_path = PathBuf::from(if sysroot.is_empty() { "/" } else { sysroot });
-        builder = add_existing_include_dir(builder, sysroot_path.join("include"));
-        builder = add_existing_include_dir(builder, sysroot_path.join("usr").join("include"));
-        builder =
-            add_existing_include_dir(builder, sysroot_path.join("usr").join("include").join(&triple));
+        if !sysroot.is_empty() {
+            let sysroot_path = PathBuf::from(sysroot);
+            builder = add_existing_include_dir(builder, sysroot_path.join("include"));
+            builder = add_existing_include_dir(builder, sysroot_path.join("usr").join("include"));
+            builder = add_existing_include_dir(
+                builder,
+                sysroot_path.join("usr").join("include").join(&triple),
+            );
+        }
     }
 
     let bindings = builder.generate().expect("Unable to generate bindings");

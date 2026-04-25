@@ -8,7 +8,7 @@ use linux_raw_sys::general::{
     __kernel_clockid_t, CAP_SYS_TIME, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC,
     CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
     CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, SIGEV_NONE,
-    SIGEV_SIGNAL, SIGEV_THREAD_ID, TIMER_ABSTIME, itimerval, itimerspec, sigevent, timespec,
+    SIGEV_SIGNAL, SIGEV_THREAD_ID, TIMER_ABSTIME, itimerspec, itimerval, sigevent, timespec,
     timeval, timezone,
 };
 use starry_signal::Signo;
@@ -434,13 +434,16 @@ fn decode_timer_notify(event: Option<sigevent>) -> AxResult<PosixTimerNotify> {
     }
 }
 
-fn timer_absolute_deadline(clock: PosixTimerClock, clock_id: __kernel_clockid_t, value: Duration) -> AxResult<Duration> {
+fn timer_absolute_deadline(
+    clock: PosixTimerClock,
+    clock_id: __kernel_clockid_t,
+    value: Duration,
+) -> AxResult<Duration> {
     Ok(match clock {
         PosixTimerClock::Realtime => value,
-        PosixTimerClock::Tai => saturating_sub_duration(
-            value,
-            duration_from_secs(DEFAULT_TAI_OFFSET_SECS),
-        ),
+        PosixTimerClock::Tai => {
+            saturating_sub_duration(value, duration_from_secs(DEFAULT_TAI_OFFSET_SECS))
+        }
         PosixTimerClock::Monotonic => value,
         PosixTimerClock::ProcessCpu | PosixTimerClock::ThreadCpu => {
             let now_clock = clock_now(clock_id)?;
@@ -455,7 +458,8 @@ fn timer_relative_deadline(clock: PosixTimerClock, value: Duration) -> Duration 
 }
 
 fn timer_remaining(timer: &PosixTimer) -> Duration {
-    timer.deadline
+    timer
+        .deadline
         .map(|deadline| saturating_sub_duration(deadline, timer.clock.alarm_clock().now()))
         .unwrap_or(Duration::ZERO)
 }
@@ -479,7 +483,11 @@ pub fn sys_timer_create(
     let proc_data = current().as_thread().proc_data.clone();
     let timerid = {
         let mut timers = proc_data.posix_timers.lock();
-        if let Some((idx, slot)) = timers.iter_mut().enumerate().find(|(_, slot)| slot.is_none()) {
+        if let Some((idx, slot)) = timers
+            .iter_mut()
+            .enumerate()
+            .find(|(_, slot)| slot.is_none())
+        {
             *slot = Some(PosixTimer::new(clock, notify));
             idx
         } else {
@@ -526,11 +534,16 @@ pub fn sys_timer_settime(
 
         timer.interval = interval;
         timer.overrun = 0;
+        timer.signal_pending = false;
         timer.sequence = timer.sequence.wrapping_add(1);
         timer.deadline = if value.is_zero() {
             None
         } else if absolute {
-            Some(timer_absolute_deadline(timer.clock, clock_id_for_timer(timer.clock), value)?)
+            Some(timer_absolute_deadline(
+                timer.clock,
+                clock_id_for_timer(timer.clock),
+                value,
+            )?)
         } else {
             Some(timer_relative_deadline(timer.clock, value))
         };
@@ -604,7 +617,9 @@ pub fn sys_timer_delete(timerid: i32) -> AxResult<isize> {
 
     let proc_data = current().as_thread().proc_data.clone();
     let mut timers = proc_data.posix_timers.lock();
-    let slot = timers.get_mut(timerid as usize).ok_or(AxError::InvalidInput)?;
+    let slot = timers
+        .get_mut(timerid as usize)
+        .ok_or(AxError::InvalidInput)?;
     if slot.is_none() {
         return Err(AxError::InvalidInput);
     }
@@ -629,8 +644,9 @@ pub fn sys_clock_gettime(clock_id: __kernel_clockid_t, ts: *mut timespec) -> AxR
 }
 
 pub fn sys_gettimeofday(ts: *mut timeval, tz: *mut timezone) -> AxResult<isize> {
+    let now = wall_time();
     if let Some(ts) = ts.nullable() {
-        ts.vm_write(timeval::from_time_value(wall_time()))?;
+        ts.vm_write(timeval::from_time_value(now))?;
     }
     if let Some(tz) = tz.nullable() {
         tz.vm_write(timezone {

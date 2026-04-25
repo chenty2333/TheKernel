@@ -2,7 +2,9 @@
 
 use core::ops::{Index, IndexMut};
 
-use linux_raw_sys::general::{RLIM_INFINITY, RLIM_NLIMITS, RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_STACK};
+use linux_raw_sys::general::{
+    RLIM_INFINITY, RLIM_NLIMITS, RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_STACK,
+};
 
 /// The maximum number of open files
 pub const AX_FILE_LIMIT: usize = 1024;
@@ -40,10 +42,9 @@ pub struct Rlimits([Rlimit; RLIM_NLIMITS as usize]);
 
 impl Default for Rlimits {
     fn default() -> Self {
-        let mut result = Self(core::array::from_fn(|_| Rlimit::new(
-            RLIM_INFINITY as i64 as u64,
-            RLIM_INFINITY as i64 as u64,
-        )));
+        let mut result = Self(core::array::from_fn(|_| {
+            Rlimit::new(RLIM_INFINITY as i64 as u64, RLIM_INFINITY as i64 as u64)
+        }));
         result[RLIMIT_STACK] = Rlimit::new(
             crate::config::USER_STACK_SIZE as u64,
             RLIM_INFINITY as i64 as u64,

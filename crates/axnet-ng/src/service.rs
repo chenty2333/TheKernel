@@ -91,7 +91,16 @@ impl Service {
         if addr.is_unspecified() {
             return Ok(());
         }
-        self.resolve_outbound(&addr, Some(addr)).map(|_| ())
+        self.resolve_outbound(&addr, Some(addr)).map_or_else(
+            |err| {
+                if err == AxError::from(LinuxError::ENETUNREACH) {
+                    Err(AxError::from(LinuxError::EADDRNOTAVAIL))
+                } else {
+                    Err(err)
+                }
+            },
+            |_| Ok(()),
+        )
     }
 
     pub fn device_mask_for(&self, endpoint: &IpListenEndpoint) -> u64 {
@@ -189,6 +198,17 @@ mod tests {
         let service = test_service();
         let err = service
             .validate_bind_addr(IpAddress::Ipv4(Ipv4Address::LOCALHOST))
+            .unwrap_err();
+        assert_eq!(err, AxError::from(LinuxError::EADDRNOTAVAIL));
+    }
+
+    #[test]
+    fn validate_bind_addr_maps_missing_route_to_not_available() {
+        let socket_set = Arc::new(SocketSetWrapper::new());
+        let listen_table = Arc::new(ListenTable::new());
+        let service = Service::new(Router::new(listen_table), socket_set);
+        let err = service
+            .validate_bind_addr(IpAddress::Ipv4(Ipv4Address::new(10, 255, 254, 253)))
             .unwrap_err();
         assert_eq!(err, AxError::from(LinuxError::EADDRNOTAVAIL));
     }

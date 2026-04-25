@@ -87,6 +87,7 @@ pub(crate) struct PosixTimer {
     pub deadline: Option<Duration>,
     pub sequence: u64,
     pub overrun: i32,
+    pub signal_pending: bool,
 }
 
 impl PosixTimer {
@@ -98,6 +99,7 @@ impl PosixTimer {
             deadline: None,
             sequence: 0,
             overrun: 0,
+            signal_pending: false,
         }
     }
 }
@@ -529,7 +531,10 @@ pub(crate) fn register_posix_timer_alarm(
 }
 
 fn saturating_duration_mul(duration: Duration, count: u128) -> Duration {
-    let nanos = duration.as_nanos().saturating_mul(count).min(u64::MAX as u128) as u64;
+    let nanos = duration
+        .as_nanos()
+        .saturating_mul(count)
+        .min(u64::MAX as u128) as u64;
     Duration::from_nanos(nanos)
 }
 
@@ -551,8 +556,36 @@ fn posix_timer_signal_info(signo: Signo, timerid: usize, overrun: i32) -> Signal
     info
 }
 
+fn timer_signal_id(sig: &SignalInfo) -> Option<usize> {
+    if sig.code() != SI_TIMER {
+        return None;
+    }
+
+    let raw_timerid = unsafe {
+        sig.0
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            ._sifields
+            ._timer
+            ._tid
+    };
+    usize::try_from(raw_timerid).ok()
+}
+
+pub(crate) fn acknowledge_posix_timer_signal(proc_data: &ProcessData, sig: &SignalInfo) {
+    let Some(timerid) = timer_signal_id(sig) else {
+        return;
+    };
+
+    let mut timers = proc_data.posix_timers.lock();
+    let Some(Some(timer)) = timers.get_mut(timerid) else {
+        return;
+    };
+    timer.signal_pending = false;
+}
+
 fn fire_posix_timer(proc_data: Arc<ProcessData>, timerid: usize, sequence: u64) {
-    let (notify, overrun, next) = {
+    let (notify, overrun, should_deliver, next) = {
         let mut timers = proc_data.posix_timers.lock();
         let Some(Some(timer)) = timers.get_mut(timerid) else {
             return;
@@ -569,14 +602,22 @@ fn fire_posix_timer(proc_data: Arc<ProcessData>, timerid: usize, sequence: u64) 
             return;
         }
 
-        let overrun = if timer.interval.is_zero() {
-            0
+        let expirations = if timer.interval.is_zero() {
+            1_u128
         } else {
             let elapsed = now.saturating_sub(deadline).as_nanos();
             let interval = timer.interval.as_nanos().max(1);
-            (elapsed / interval).min(i32::MAX as u128) as i32
+            1_u128.saturating_add(elapsed / interval)
         };
-        timer.overrun = overrun;
+        let should_deliver = !timer.signal_pending;
+        if should_deliver {
+            timer.overrun = expirations.saturating_sub(1).min(i32::MAX as u128) as i32;
+            timer.signal_pending = true;
+        } else {
+            let extra = expirations.min(i32::MAX as u128) as i32;
+            timer.overrun = timer.overrun.saturating_add(extra);
+        }
+        let overrun = timer.overrun;
 
         let notify = timer.notify;
         let next = if timer.interval.is_zero() {
@@ -584,19 +625,22 @@ fn fire_posix_timer(proc_data: Arc<ProcessData>, timerid: usize, sequence: u64) 
             timer.sequence = timer.sequence.wrapping_add(1);
             None
         } else {
-            let steps = 1_u128.saturating_add(overrun as u128);
             let next_deadline = deadline
-                .checked_add(saturating_duration_mul(timer.interval, steps))
+                .checked_add(saturating_duration_mul(timer.interval, expirations))
                 .unwrap_or(Duration::MAX);
             timer.deadline = Some(next_deadline);
             timer.sequence = timer.sequence.wrapping_add(1);
             Some((timer.clock.alarm_clock(), next_deadline, timer.sequence))
         };
-        (notify, overrun, next)
+        (notify, overrun, should_deliver, next)
     };
 
     if let Some((clock, deadline, next_sequence)) = next {
         register_posix_timer_alarm(&proc_data, timerid, clock, deadline, next_sequence);
+    }
+
+    if !should_deliver {
+        return;
     }
 
     let (signo, target_tid) = match notify {

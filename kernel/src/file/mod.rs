@@ -40,6 +40,7 @@ use linux_raw_sys::general::{
 };
 use spin::RwLock;
 
+pub(crate) use self::fs::{allowed_write_len, check_resize_limit};
 pub use self::{
     af_alg::AfAlgSocket,
     fs::{Directory, File, ResolveAtResult, resolve_at, with_fs, with_path_fs},
@@ -48,7 +49,6 @@ pub use self::{
     pidfd::PidFd,
     pipe::Pipe,
 };
-pub(crate) use self::fs::{allowed_write_len, check_resize_limit};
 use crate::task::{AX_FILE_LIMIT, AsThread};
 
 #[derive(Debug, Clone, Copy)]

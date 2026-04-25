@@ -5,8 +5,8 @@ use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
 use axtask::{
-    AxTaskExt, SchedClass, current, future::block_on, sched_state, spawn_task_with_sched,
-    yield_now,
+    AxTaskExt, SchedClass, current, future::block_on, reclaim_exited_tasks, sched_state,
+    spawn_task_with_sched, yield_now,
 };
 use bitflags::bitflags;
 use kspin::SpinNoIrq;
@@ -15,6 +15,8 @@ use starry_process::Pid;
 use starry_signal::Signo;
 use starry_vm::VmMutPtr;
 
+#[cfg(target_arch = "loongarch64")]
+use crate::task::copy_current_user_fpu_state_to;
 use crate::{
     file::{FD_TABLE, FileLike, PidFd, close_file_like},
     mm::copy_from_kernel,
@@ -204,6 +206,13 @@ impl CloneArgs {
             return Err(AxError::Interrupted);
         }
 
+        // Thread-heavy user workloads such as libcbench can accumulate a large
+        // batch of already-joined dead tasks on the local CPU between clone
+        // bursts. Reclaim them before allocating and queueing the next child so
+        // post-join fork/create phases do not inherit the previous burst's
+        // stack and task-structure pressure.
+        reclaim_exited_tasks();
+
         let mut child_sched_state = sched_state(&curr);
         if !flags.contains(CloneFlags::THREAD) && child_sched_state.reset_on_fork {
             child_sched_state.reset_on_fork = false;
@@ -223,6 +232,10 @@ impl CloneArgs {
         }
 
         let mut new_task = new_user_task(&curr.name(), new_uctx);
+        #[cfg(target_arch = "loongarch64")]
+        {
+            copy_current_user_fpu_state_to(new_task.ctx_mut());
+        }
 
         let tid = new_task.id().as_u64() as Pid;
         if flags.contains(CloneFlags::PARENT_SETTID) && parent_tid != 0 {

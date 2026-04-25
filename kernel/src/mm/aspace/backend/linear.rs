@@ -5,7 +5,7 @@ use axhal::paging::{MappingFlags, PageSize, PageTableCursor};
 use axsync::Mutex;
 use memory_addr::{PhysAddr, PhysAddrRange, VirtAddr, VirtAddrRange};
 
-use super::{AddrSpace, Backend, BackendOps};
+use super::{AddrSpace, Backend, BackendOps, page_table_flags};
 
 /// Linear mapping backend.
 ///
@@ -98,7 +98,13 @@ impl BackendOps for LinearBackend {
         self.check_range(range)?;
         let pa_range = PhysAddrRange::from_start_size(self.pa(range.start), range.size());
         debug!("Linear::map: {range:?} -> {pa_range:?} {flags:?}");
-        pt.map_region(range.start, |va| self.pa(va), range.size(), flags, false)?;
+        pt.map_region(
+            range.start,
+            |va| self.pa(va),
+            range.size(),
+            page_table_flags(flags),
+            false,
+        )?;
         Ok(())
     }
 

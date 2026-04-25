@@ -12,7 +12,7 @@ use axerrno::AxError;
 use kernel_guard::NoPreemptIrqSave;
 use kspin::SpinNoIrq;
 
-use crate::{AxTaskRef, WeakAxTaskRef, current, current_run_queue, select_run_queue};
+use crate::{AxTaskRef, SchedClass, WeakAxTaskRef, current, current_run_queue, select_run_queue};
 
 mod poll;
 pub use poll::*;
@@ -43,7 +43,11 @@ impl Wake for AxWaker {
         if let Some(task) = self.task.upgrade() {
             let mut rq = select_run_queue::<NoPreemptIrqSave>(&task);
             *self.woke.lock() = true;
-            rq.unblock_task(task, false);
+            let needs_resched = matches!(
+                task.sched_params().class,
+                SchedClass::Fifo | SchedClass::RoundRobin
+            );
+            rq.unblock_task(task, needs_resched);
         }
     }
 }

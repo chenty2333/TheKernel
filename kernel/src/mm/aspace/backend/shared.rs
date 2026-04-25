@@ -5,7 +5,10 @@ use axhal::paging::{MappingFlags, PageSize, PageTableCursor};
 use axsync::Mutex;
 use memory_addr::{MemoryAddr, PhysAddr, VirtAddr, VirtAddrRange};
 
-use super::{AddrSpace, Backend, BackendOps, alloc_frame, dealloc_frame, divide_page, pages_in};
+use super::{
+    AddrSpace, Backend, BackendOps, alloc_frame, dealloc_frame, divide_page, page_table_flags,
+    pages_in,
+};
 
 pub struct SharedPages {
     phys_pages: Mutex<Vec<PhysAddr>>,
@@ -197,7 +200,7 @@ impl BackendOps for SharedBackend {
         let count = divide_page(range.size(), self.pages.size);
         let pages = self.pages.pages_range(start_index, count)?;
         for (vaddr, paddr) in pages_in(range, self.pages.size)?.zip(pages.into_iter()) {
-            pt.map(vaddr, paddr, self.pages.size, flags)?;
+            pt.map(vaddr, paddr, self.pages.size, page_table_flags(flags))?;
         }
         Ok(())
     }

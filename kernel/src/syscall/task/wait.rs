@@ -12,15 +12,13 @@ use linux_raw_sys::general::{
 use starry_process::{Pid, Process, ZombieSnapshot};
 use starry_vm::{VmMutPtr, VmPtr};
 
-use crate::task::{
-    AsThread, ProcessData, TaskUsage, cleanup_task_tables, get_process_data,
-    has_pending_syscall_signal,
-};
+use crate::task::{AsThread, ProcessData, TaskUsage, get_process_data, has_pending_syscall_signal};
 
 const WAITPID_ALLOWED_BITS: u32 =
     WNOHANG | WUNTRACED | WCONTINUED | __WNOTHREAD | __WALL | __WCLONE;
 const WAITID_ALLOWED_BITS: u32 =
     WNOHANG | WEXITED | WUNTRACED | WCONTINUED | WNOWAIT | __WNOTHREAD | __WALL | __WCLONE;
+const POST_WAIT_RECLAIM_ROUNDS: usize = 8;
 
 bitflags! {
     #[derive(Debug)]
@@ -268,7 +266,6 @@ pub fn sys_waitpid(
     rusage_ptr: *mut rusage,
 ) -> AxResult<isize> {
     let options = validate_waitpid_options(options)?;
-    info!("sys_waitpid <= pid: {pid:?}, options: {options:?}");
 
     if pid == i32::MIN {
         return Err(AxError::from(LinuxError::ESRCH));
@@ -290,7 +287,10 @@ pub fn sys_waitpid(
 
     let check_children = || {
         let _wait_guard = proc_data.wait_lock.lock();
-        let children = matching_children(proc, pid, &options)?;
+        let children = match matching_children(proc, pid, &options) {
+            Ok(children) => children,
+            Err(err) => return Err(err),
+        };
 
         if let Some(event) = select_wait_event(&children, &options, true) {
             let claimed_event = match &event {
@@ -365,8 +365,16 @@ pub fn sys_waitpid(
             Poll::Pending
         }
     }))?;
+    if result > 0 {
+        // A just-reaped process may still have sibling threads queued in the
+        // per-CPU exited-task list. Let the scheduler/GC observe the transition
+        // before the shell immediately starts another thread-heavy program.
+        for _ in 0..POST_WAIT_RECLAIM_ROUNDS {
+            axtask::reclaim_exited_tasks();
+            axtask::yield_now();
+        }
+    }
     axtask::reclaim_exited_tasks();
-    cleanup_task_tables();
     Ok(result)
 }
 
@@ -403,7 +411,6 @@ pub fn sys_waitid(
     rusage_ptr: *mut rusage,
 ) -> AxResult<isize> {
     let options = validate_waitid_options(options)?;
-    info!("sys_waitid <= idtype: {idtype}, id: {id}, options: {options:?}");
 
     if !options.intersects(WaitOptions::WEXITED | WaitOptions::WUNTRACED | WaitOptions::WCONTINUED)
     {
@@ -515,6 +522,5 @@ pub fn sys_waitid(
         }
     }))?;
     axtask::reclaim_exited_tasks();
-    cleanup_task_tables();
     Ok(result)
 }

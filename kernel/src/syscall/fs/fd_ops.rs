@@ -289,6 +289,9 @@ fn open_in_fs(
     let created_parent = if (flags as u32) & O_CREAT != 0 {
         match fs.resolve_no_follow(path) {
             Ok(loc) => {
+                if (flags as u32) & O_EXCL != 0 {
+                    return Err(AxError::AlreadyExists);
+                }
                 enforce_special_open_rules(&loc, flags, uid)?;
                 if loc.is_dir() && invalid_directory_open(flags) {
                     return Err(AxError::IsADirectory);
@@ -336,6 +339,9 @@ fn open_in_fs(
             fs.resolve(path)
         }?;
         enforce_special_open_rules(&existing, flags, uid)?;
+        if existing.is_dir() && invalid_directory_open(flags) {
+            return Err(AxError::IsADirectory);
+        }
         lease::wait_for_open(&existing, flags)?;
         Some(existing)
     } else {
@@ -463,6 +469,18 @@ pub fn sys_openat2(
     let adjusted_ref = Path::new(&adjusted_path);
     if how.resolve & RESOLVE_BENEATH as u64 != 0 && escapes_beneath(adjusted_ref) {
         return Err(AxError::from(LinuxError::EXDEV));
+    }
+    if path == "/proc/self/exe" {
+        if how.resolve & (RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS) as u64 != 0
+            || (flags & O_NOFOLLOW as i32 != 0 && flags & O_PATH as i32 == 0)
+        {
+            return Err(AxError::from(LinuxError::ELOOP));
+        }
+        if how.resolve & RESOLVE_NO_XDEV as u64 != 0 {
+            return Err(AxError::from(LinuxError::EXDEV));
+        }
+        let exe_path = current().as_thread().proc_data.exe_path.read().clone();
+        return openat_inner(AT_FDCWD, &exe_path, flags, how.mode as __kernel_mode_t);
     }
 
     let base_dir = openat_base_dir(dirfd, &path, how.resolve)?;

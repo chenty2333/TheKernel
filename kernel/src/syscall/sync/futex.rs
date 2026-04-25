@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use core::time::Duration;
 
 use axerrno::{AxError, AxResult};
-use axtask::{current, yield_now};
+use axtask::current;
 use linux_raw_sys::general::{
     FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_REQUEUE, FUTEX_WAIT,
     FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, robust_list_head, timespec,
@@ -145,9 +145,6 @@ pub fn sys_futex(
                 };
                 count = futex.wq.wake(value as _, bitset);
             }
-            if count != 0 {
-                yield_now();
-            }
             Ok(count as _)
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
@@ -165,16 +162,18 @@ pub fn sys_futex(
 
             let mut count = 0;
             if let Some(futex) = futex {
-                count = futex.wq.wake(value as _, u32::MAX);
-                if value2 != 0 && Arc::as_ptr(&*futex) != Arc::as_ptr(&*futex2) {
-                    count += futex
-                        .wq
-                        .requeue(value2, &futex2.wq, Arc::downgrade(&futex2))
-                        as usize;
-                }
-            }
-            if count != 0 {
-                yield_now();
+                let (woken, moved) = futex.wq.wake_and_requeue(
+                    value as _,
+                    if value2 != 0 && Arc::as_ptr(&*futex) != Arc::as_ptr(&*futex2) {
+                        value2
+                    } else {
+                        0
+                    },
+                    &futex2.wq,
+                    Arc::downgrade(&futex2),
+                    u32::MAX,
+                );
+                count = woken + moved;
             }
             Ok(count as _)
         }

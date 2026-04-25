@@ -17,7 +17,7 @@ use zerocopy::{Immutable, IntoBytes};
 
 use crate::{
     file::{FileLike, IoDst, IoSrc},
-    task::AsThread,
+    task::{AsThread, acknowledge_posix_timer_signal},
 };
 
 /// The size of signalfd_siginfo structure (128 bytes as per Linux
@@ -126,9 +126,11 @@ impl FileLike for Signalfd {
         if dst.remaining_mut() < SIGNALFD_SIGINFO_SIZE {
             return Err(AxError::InvalidInput);
         }
+        let proc_data = current().as_thread().proc_data.clone();
 
         block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
             if let Some(sig_info) = self.dequeue_signal() {
+                acknowledge_posix_timer_signal(&proc_data, &sig_info);
                 // Convert SignalInfo to SignalfdSiginfo
                 let sfd_info = SignalfdSiginfo::from_signal_info(&sig_info);
 

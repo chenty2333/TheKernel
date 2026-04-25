@@ -22,6 +22,7 @@ use crate::{
     general::GeneralOptions,
     net_stack::NetStack,
     options::{Configurable, GetSocketOption, SetSocketOption},
+    wrapper::Transport,
 };
 
 pub(crate) fn new_udp_socket() -> smol::Socket<'static> {
@@ -37,6 +38,7 @@ pub struct UdpSocket {
     stack: Arc<NetStack>,
     handle: SocketHandle,
     local_addr: RwLock<Option<IpEndpoint>>,
+    reported_local_addr: RwLock<Option<IpEndpoint>>,
     peer_addr: RwLock<Option<(IpEndpoint, IpAddress)>>,
 
     general: GeneralOptions,
@@ -52,6 +54,7 @@ impl UdpSocket {
             stack,
             handle,
             local_addr: RwLock::new(None),
+            reported_local_addr: RwLock::new(None),
             peer_addr: RwLock::new(None),
 
             general: GeneralOptions::new(),
@@ -76,6 +79,28 @@ impl UdpSocket {
             .read()
             .as_ref()
             .and_then(|endpoint| (!endpoint.addr.is_unspecified()).then_some(endpoint.addr))
+    }
+
+    fn effective_local_addr(&self) -> Option<IpEndpoint> {
+        self.reported_local_addr
+            .read()
+            .as_ref()
+            .copied()
+            .or_else(|| self.local_addr.read().as_ref().copied())
+    }
+
+    fn remember_reported_local_addr(&self, addr: IpAddress) {
+        let Some(bound) = self.local_addr.read().as_ref().copied() else {
+            return;
+        };
+        if !bound.addr.is_unspecified() {
+            return;
+        }
+        let mut reported = self.reported_local_addr.write();
+        *reported = Some(IpEndpoint {
+            addr,
+            port: bound.port,
+        });
     }
 
     pub fn set_filter(
@@ -150,9 +175,11 @@ impl SocketOps for UdpSocket {
 
         if !self.general.reuse_address() {
             // Check if the address is already in use
-            self.stack
-                .socket_set
-                .bind_check(local_endpoint.addr, local_endpoint.port)?;
+            self.stack.socket_set.bind_check(
+                Transport::Udp,
+                (!local_endpoint.addr.is_unspecified()).then_some(local_endpoint.addr),
+                local_endpoint.port,
+            )?;
         }
 
         self.with_smol_socket(|socket| {
@@ -165,6 +192,7 @@ impl SocketOps for UdpSocket {
             .set_device_mask(self.stack.get_service().device_mask_for(&endpoint));
 
         *guard = Some(local_endpoint);
+        *self.reported_local_addr.write() = None;
         info!("UDP socket {}: bound on {}", self.handle, endpoint);
         Ok(())
     }
@@ -185,6 +213,12 @@ impl SocketOps for UdpSocket {
             .get_service()
             .resolve_outbound(&remote_addr.addr, self.bound_source_addr())?;
         self.general.set_device_mask(outbound.device_mask);
+        // Linux reports the selected source address after a connected UDP
+        // socket resolves its route. Keep the wildcard bind semantics in the
+        // actual socket state, but surface the concrete source address through
+        // getsockname/local_addr so user space can advertise a usable reply
+        // endpoint (for example, netperf's UDP_RR control path).
+        self.remember_reported_local_addr(outbound.src_addr);
         *guard = Some((remote_addr, outbound.src_addr));
         debug!("UDP socket {}: connected to {}", self.handle, remote_addr);
         Ok(())
@@ -198,6 +232,7 @@ impl SocketOps for UdpSocket {
                     .stack
                     .get_service()
                     .resolve_outbound(&addr.addr, self.bound_source_addr())?;
+                self.general.set_device_mask(outbound.device_mask);
                 (addr, outbound.src_addr)
             }
             None => self.remote_endpoint()?,
@@ -212,6 +247,7 @@ impl SocketOps for UdpSocket {
                 0,
             )))?;
         }
+        self.remember_reported_local_addr(source_addr);
         let sent = self.general.send_poller(self, || {
             self.stack.poll_interfaces();
             self.with_smol_socket(|socket| {
@@ -316,11 +352,8 @@ impl SocketOps for UdpSocket {
     }
 
     fn local_addr(&self) -> AxResult<SocketAddrEx> {
-        match self.local_addr.try_read() {
-            Some(addr) => addr
-                .map(Into::into)
-                .map(SocketAddrEx::Ip)
-                .ok_or(AxError::NotConnected),
+        match self.effective_local_addr() {
+            Some(addr) => Ok(SocketAddrEx::Ip(addr.into())),
             None => Err(AxError::NotConnected),
         }
     }
@@ -339,6 +372,7 @@ impl SocketOps for UdpSocket {
             debug!("UDP socket {}: shutting down", self.handle);
             socket.close();
         });
+        *self.reported_local_addr.write() = None;
         Ok(())
     }
 }

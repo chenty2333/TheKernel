@@ -1,4 +1,10 @@
-use alloc::{ffi::CString, string::ToString, sync::Arc, vec, vec::Vec};
+use alloc::{
+    ffi::CString,
+    string::{String, ToString},
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
 use core::{
     ffi::{c_char, c_int, c_void},
     mem::offset_of,
@@ -6,7 +12,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
-use axfs::{FS_CONTEXT, FsContext};
+use axfs::FS_CONTEXT;
 use axfs_ng_vfs::{
     Location, MetadataUpdate, NodePermission, NodeType,
     path::{MAX_NAME_LEN, Path},
@@ -70,6 +76,33 @@ fn same_entry_at(
         return Ok(false);
     };
     Ok(old.inode() == new.inode() && Arc::ptr_eq(old.mountpoint(), new.mountpoint()))
+}
+
+fn path_from_root(mut loc: Location, root: &Location) -> AxResult<String> {
+    let mut components: Vec<String> = Vec::new();
+    loop {
+        if loc.ptr_eq(root) {
+            if components.is_empty() {
+                return Ok("/".to_string());
+            }
+
+            let mut path = String::from("/");
+            for (index, component) in components.iter().rev().enumerate() {
+                if index > 0 {
+                    path.push('/');
+                }
+                path.push_str(component.as_str());
+            }
+            return Ok(path);
+        }
+
+        let name = loc.name().to_string();
+        let Some(parent) = loc.parent() else {
+            return Err(AxError::NotFound);
+        };
+        components.push(name);
+        loc = parent;
+    }
 }
 
 /// The ioctl() system call manipulates the underlying device parameters
@@ -475,7 +508,10 @@ pub fn sys_unlink(path: *const c_char) -> AxResult<isize> {
 }
 
 pub fn sys_getcwd(buf: *mut u8, size: usize) -> AxResult<isize> {
-    let cwd = FS_CONTEXT.lock().current_dir().absolute_path()?;
+    let cwd = {
+        let fs = FS_CONTEXT.lock();
+        path_from_root(fs.current_dir().clone(), fs.root_dir())?
+    };
     debug!("sys_getcwd => cwd: {cwd}");
 
     let cwd = CString::new(cwd.as_str()).map_err(|_| AxError::InvalidInput)?;
@@ -826,10 +862,12 @@ pub fn sys_renameat2(
         return Ok(0);
     }
 
-    let (old_dir, old_name) =
-        with_path_fs(old_dirfd, old_path_ref, |fs| fs.resolve_parent(old_path_ref))?;
-    let (new_dir, new_name) =
-        with_path_fs(new_dirfd, new_path_ref, |fs| fs.resolve_parent(new_path_ref))?;
+    let (old_dir, old_name) = with_path_fs(old_dirfd, old_path_ref, |fs| {
+        fs.resolve_parent(old_path_ref)
+    })?;
+    let (new_dir, new_name) = with_path_fs(new_dirfd, new_path_ref, |fs| {
+        fs.resolve_parent(new_path_ref)
+    })?;
     let new_existing = resolve_existing_at(new_dirfd, new_path_ref)?;
 
     check_rename_permissions(

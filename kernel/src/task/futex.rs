@@ -148,6 +148,66 @@ impl WaitQueue {
         Self::default()
     }
 
+    fn wake_and_requeue_locked(
+        src: &mut VecDeque<Arc<SpinNoIrq<WaiterEntry>>>,
+        wake_count: usize,
+        mask: u32,
+        mut requeue: Option<(
+            &mut VecDeque<Arc<SpinNoIrq<WaiterEntry>>>,
+            usize,
+            Weak<FutexEntry>,
+        )>,
+        pending_wakers: &mut Vec<Waker>,
+    ) -> (usize, usize) {
+        let mut woke = 0;
+        let mut moved = 0;
+        let mut keep = VecDeque::with_capacity(src.len());
+
+        while let Some(waiter) = src.pop_front() {
+            enum Action {
+                Drop,
+                Keep,
+                Requeue,
+            }
+
+            let action = {
+                let mut waiter = waiter.lock();
+                if waiter.cancelled {
+                    clear_waiter_proc_state(&waiter);
+                    Action::Drop
+                } else if woke < wake_count && (waiter.bitset & mask) != 0 {
+                    waiter.awakened = true;
+                    clear_waiter_proc_state(&waiter);
+                    if let Some(waker) = waiter.waker.take() {
+                        pending_wakers.push(waker);
+                    }
+                    woke += 1;
+                    Action::Drop
+                } else if let Some((_, limit, target_owner)) = requeue.as_mut()
+                    && moved < *limit
+                {
+                    waiter.owner = target_owner.clone();
+                    moved += 1;
+                    Action::Requeue
+                } else {
+                    Action::Keep
+                }
+            };
+
+            match action {
+                Action::Drop => {}
+                Action::Keep => keep.push_back(waiter),
+                Action::Requeue => {
+                    let (dst, ..) = requeue.as_mut().unwrap();
+                    dst.push_back(waiter);
+                }
+            }
+        }
+
+        *src = keep;
+        (woke, moved)
+    }
+
     fn remove_waiter_locked(&self, target: &Arc<SpinNoIrq<WaiterEntry>>) {
         self.queue
             .lock()
@@ -211,24 +271,15 @@ impl WaitQueue {
     /// bitmask.
     pub fn wake(&self, count: usize, mask: u32) -> usize {
         let _gate = self.gate.lock();
-        let mut woke = 0;
-        self.queue.lock().retain(|waiter| {
-            let mut waiter = waiter.lock();
-            if waiter.cancelled {
-                clear_waiter_proc_state(&waiter);
-                false
-            } else if woke >= count || (waiter.bitset & mask) == 0 {
-                true
-            } else {
-                waiter.awakened = true;
-                clear_waiter_proc_state(&waiter);
-                if let Some(waker) = waiter.waker.take() {
-                    waker.wake();
-                }
-                woke += 1;
-                false
-            }
-        });
+        let mut pending_wakers = Vec::new();
+        let woke = {
+            let mut queue = self.queue.lock();
+            Self::wake_and_requeue_locked(&mut queue, count, mask, None, &mut pending_wakers).0
+        };
+        drop(_gate);
+        for waker in pending_wakers {
+            waker.wake();
+        }
         woke
     }
 
@@ -255,50 +306,75 @@ impl WaitQueue {
             let _target_gate = target.gate.lock();
             let mut src = self.queue.lock();
             let mut dst = target.queue.lock();
-            count = count.min(src.len());
-            let tasks: Vec<_> = src.drain(..count).collect();
-            let mut moved = 0;
-            for waiter in tasks {
-                let move_waiter = {
-                    let mut waiter = waiter.lock();
-                    if waiter.cancelled || waiter.awakened {
-                        false
-                    } else {
-                        waiter.owner = target_owner.clone();
-                        true
-                    }
-                };
-                if move_waiter {
-                    dst.push_back(waiter);
-                    moved += 1;
-                }
-            }
-            return moved;
+            return Self::wake_and_requeue_locked(
+                &mut src,
+                0,
+                u32::MAX,
+                Some((&mut dst, count, target_owner)),
+                &mut Vec::new(),
+            )
+            .1;
         } else {
             let _target_gate = target.gate.lock();
             let _self_gate = self.gate.lock();
             let mut src = self.queue.lock();
             let mut dst = target.queue.lock();
-            count = count.min(src.len());
-            let tasks: Vec<_> = src.drain(..count).collect();
-            let mut moved = 0;
-            for waiter in tasks {
-                let move_waiter = {
-                    let mut waiter = waiter.lock();
-                    if waiter.cancelled || waiter.awakened {
-                        false
-                    } else {
-                        waiter.owner = target_owner.clone();
-                        true
-                    }
-                };
-                if move_waiter {
-                    dst.push_back(waiter);
-                    moved += 1;
-                }
-            }
-            return moved;
+            return Self::wake_and_requeue_locked(
+                &mut src,
+                0,
+                u32::MAX,
+                Some((&mut dst, count, target_owner)),
+                &mut Vec::new(),
+            )
+            .1;
         }
+    }
+
+    /// Wakes up at most `wake_count` tasks and requeues up to
+    /// `requeue_count` remaining waiters to the target queue atomically.
+    pub fn wake_and_requeue(
+        &self,
+        wake_count: usize,
+        requeue_count: usize,
+        target: &WaitQueue,
+        target_owner: Weak<FutexEntry>,
+        mask: u32,
+    ) -> (usize, usize) {
+        let mut pending_wakers = Vec::new();
+        let result = if core::ptr::eq(self, target) {
+            let _gate = self.gate.lock();
+            let mut queue = self.queue.lock();
+            Self::wake_and_requeue_locked(&mut queue, wake_count, mask, None, &mut pending_wakers)
+        } else if (self as *const Self as usize) < (target as *const Self as usize) {
+            let _self_gate = self.gate.lock();
+            let _target_gate = target.gate.lock();
+            let mut src = self.queue.lock();
+            let mut dst = target.queue.lock();
+            Self::wake_and_requeue_locked(
+                &mut src,
+                wake_count,
+                mask,
+                Some((&mut dst, requeue_count, target_owner)),
+                &mut pending_wakers,
+            )
+        } else {
+            let _target_gate = target.gate.lock();
+            let _self_gate = self.gate.lock();
+            let mut src = self.queue.lock();
+            let mut dst = target.queue.lock();
+            Self::wake_and_requeue_locked(
+                &mut src,
+                wake_count,
+                mask,
+                Some((&mut dst, requeue_count, target_owner)),
+                &mut pending_wakers,
+            )
+        };
+
+        for waker in pending_wakers {
+            waker.wake();
+        }
+        result
     }
 }
 
@@ -384,6 +460,37 @@ mod tests {
 
         assert_eq!(src.wq.wake(1, u32::MAX), 0);
         assert!(src.wq.is_empty());
+    }
+
+    #[test]
+    fn wake_and_requeue_keeps_remaining_waiters() {
+        let src = Arc::new(FutexEntry::new());
+        let dst = Arc::new(FutexEntry::new());
+
+        for _ in 0..1000 {
+            src.wq
+                .queue
+                .lock()
+                .push_back(Arc::new(SpinNoIrq::new(WaiterEntry {
+                    bitset: u32::MAX,
+                    awakened: false,
+                    cancelled: false,
+                    owner: Arc::downgrade(&src),
+                    task: WeakAxTaskRef::new(),
+                    waker: None,
+                })));
+        }
+
+        let (woke, moved) =
+            src.wq
+                .wake_and_requeue(300, 500, &dst.wq, Arc::downgrade(&dst), u32::MAX);
+
+        assert_eq!(woke, 300);
+        assert_eq!(moved, 500);
+        assert_eq!(src.wq.wake(usize::MAX, u32::MAX), 200);
+        assert!(src.wq.is_empty());
+        assert_eq!(dst.wq.wake(usize::MAX, u32::MAX), 500);
+        assert!(dst.wq.is_empty());
     }
 }
 

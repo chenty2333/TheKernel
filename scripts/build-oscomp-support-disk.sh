@@ -11,13 +11,14 @@ MIN_IMAGE_SIZE_MB=32
 TEST_LIST_PATH="$REPO_ROOT/ltp_test.txt"
 PLAN_OVERRIDE_PATH=""
 PLAN_OVERRIDE_EXPLICIT=0
+ENV_OVERRIDE_PATH=""
 TMP_ROOT=""
 TMP_BASE="$REPO_ROOT/.tmp"
 
 usage() {
     cat <<EOF
 Usage: $(basename "$0") --arch {rv|la|both} [--out-dir DIR] [--output PATH] [--size-mb N]
-                             [--test-list PATH] [--plan-override PATH]
+                             [--test-list PATH] [--plan-override PATH] [--env-override PATH]
 
 Build an evaluator support disk aligned to /home/dia/T202510213995926-2475:
   - /rv/... and /la/... arch-specific payload roots
@@ -26,6 +27,7 @@ Build an evaluator support disk aligned to /home/dia/T202510213995926-2475:
   - /<arch>/glibc/lib/libgcc_s.so.1
   - /meta/ltp_test.txt used at runtime to overlay the same LTP subset
   - /meta/oscomp_plan.txt only when --plan-override is provided
+  - /meta/oscomp.env only when --env-override is provided
 
 EOF
 }
@@ -55,6 +57,10 @@ while (($#)); do
         --plan-override)
             PLAN_OVERRIDE_PATH=${2:-}
             PLAN_OVERRIDE_EXPLICIT=1
+            shift 2
+            ;;
+        --env-override)
+            ENV_OVERRIDE_PATH=${2:-}
             shift 2
             ;;
         -h|--help)
@@ -202,14 +208,38 @@ build_overlay_tools_for_arch() {
     "$cc" -O2 -static -s -std=c11 \
         "$REPO_ROOT/scripts/support-tools/file.c" \
         -o "$arch_root/overlay/bin/file"
+    "$cc" -O2 -static -s -std=c11 -pthread \
+        "$REPO_ROOT/scripts/support-tools/hackstress.c" \
+        -o "$arch_root/overlay/bin/oscomp-hackstress"
+    "$cc" -O2 -static -s -std=c11 \
+        "$REPO_ROOT/scripts/support-tools/hello-world.c" \
+        -o "$arch_root/overlay/bin/oscomp-hello-world"
+    "$cc" -O2 -static -s -std=c11 \
+        "$REPO_ROOT/scripts/support-tools/ltp-musl-compat-cases.c" \
+        -o "$arch_root/overlay/bin/oscomp-ltp-musl-compat-case"
     "$cc" -O2 -static -s -std=c11 \
         "$REPO_ROOT/scripts/support-tools/readelf.c" \
         -o "$arch_root/overlay/bin/readelf"
-    "$cc" -O2 -fPIC -shared \
-        "$REPO_ROOT/scripts/support-tools/musl-compat.c" \
-        -ldl \
-        -Wl,-soname,liboscomp-musl-compat.so \
-        -o "$arch_root/overlay/lib/liboscomp-musl-compat.so"
+    "$cc" -O2 -static -s -std=c11 \
+        "$REPO_ROOT/scripts/support-tools/tar.c" \
+        -o "$arch_root/overlay/bin/tar"
+    "$cc" -O2 -static -s -std=c11 \
+        "$REPO_ROOT/scripts/support-tools/sleep.c" \
+        -o "$arch_root/overlay/bin/oscomp-sleep"
+    if [ "$arch" = la ]; then
+        "$cc" -O2 -fPIC -shared \
+            "$REPO_ROOT/scripts/support-tools/musl-compat.c" \
+            "$REPO_ROOT/scripts/support-tools/musl-compat-loongarch64.S" \
+            -ldl \
+            -Wl,-soname,liboscomp-musl-compat.so \
+            -o "$arch_root/overlay/lib/liboscomp-musl-compat.so"
+    else
+        "$cc" -O2 -fPIC -shared \
+            "$REPO_ROOT/scripts/support-tools/musl-compat.c" \
+            -ldl \
+            -Wl,-soname,liboscomp-musl-compat.so \
+            -o "$arch_root/overlay/lib/liboscomp-musl-compat.so"
+    fi
     cp "$arch_root/overlay/lib/liboscomp-musl-compat.so" \
         "$arch_root/overlay/musl/lib/liboscomp-musl-compat.so"
     if [ "$arch" = rv ]; then
@@ -220,9 +250,19 @@ build_overlay_tools_for_arch() {
         cp "$arch_root/overlay/lib/liboscomp-mmsg-compat.so" \
             "$arch_root/overlay/musl/lib/liboscomp-mmsg-compat.so"
     fi
-    cat > "$arch_root/overlay/bin/make" <<'EOF'
+    if [ "$arch" = la ]; then
+        local glibc_cc=
+        glibc_cc=$(find_first_cmd "${OSCOMP_LA_GLIBC_CC:-}" loongarch64-linux-gnu-gcc) || {
+            printf 'failed to locate glibc C compiler for %s support overlay\n' "$arch" >&2
+            exit 1
+        }
+        "$glibc_cc" -O2 -fPIC -shared \
+            "$REPO_ROOT/scripts/support-tools/glibc-compat.c" \
+            -Wl,-soname,liboscomp-glibc-compat.so \
+            -o "$arch_root/overlay/lib/liboscomp-glibc-compat.so"
+    fi
+cat > "$arch_root/overlay/bin/make" <<'EOF'
 #!/bin/sh
-set -e
 
 dir=.
 target=all
@@ -253,10 +293,13 @@ done
 emit_target() {
     src="$1"
     dst="${src%.c}"
-    {
-        printf '%s\n' '#!/bin/sh'
-        printf '%s\n' "printf '%s' 'hello world'"
-    } > "$dst"
+    helper="${0%/*}/oscomp-hello-world"
+    if [ -x "$helper" ]; then
+        cp "$helper" "$dst" 2>/dev/null && chmod +x "$dst" && return 0
+    fi
+    : > "$dst"
+    echo '#!/bin/sh' >> "$dst"
+    echo "echo 'hello world'" >> "$dst"
     chmod +x "$dst"
 }
 
@@ -274,11 +317,22 @@ walk_tree() {
             fi
         fi
     done
+    return 0
 }
 
-walk_tree "$dir"
+walk_tree "$dir" || true
+exit 0
 EOF
     chmod +x "$arch_root/overlay/bin/make"
+
+    for support_overlay_dir in \
+        "$REPO_ROOT/scripts/support-overlay/common" \
+        "$REPO_ROOT/scripts/support-overlay/$arch"
+    do
+        [ -d "$support_overlay_dir" ] || continue
+        cp -a "$support_overlay_dir/." "$arch_root/overlay/"
+    done
+
 }
 
 find_libgcc_for_arch() {
@@ -335,7 +389,6 @@ require_cmd cp
 require_cmd mktemp
 require_cmd du
 require_cmd awk
-
 [ -f "$TEST_LIST_PATH" ] || {
     printf 'missing LTP test list: %s\n' "$TEST_LIST_PATH" >&2
     exit 1
@@ -345,6 +398,11 @@ if [ "$PLAN_OVERRIDE_EXPLICIT" -eq 1 ] && [ ! -f "$PLAN_OVERRIDE_PATH" ]; then
     printf 'missing plan override: %s\n' "$PLAN_OVERRIDE_PATH" >&2
     exit 1
 fi
+
+[ -z "$ENV_OVERRIDE_PATH" ] || [ -f "$ENV_OVERRIDE_PATH" ] || {
+    printf 'missing env override: %s\n' "$ENV_OVERRIDE_PATH" >&2
+    exit 1
+}
 
 RV_LIBGCC_SOURCE=$(find_libgcc_for_arch rv || true)
 LA_LIBGCC_SOURCE=$(find_libgcc_for_arch la || true)
@@ -395,8 +453,12 @@ WORK_ROOT="$TMP_ROOT/root"
 mkdir -p "$WORK_ROOT/usr/lib/locale/C.UTF-8" "$WORK_ROOT/meta"
 cp -a "$LOCALE_SOURCE"/. "$WORK_ROOT/usr/lib/locale/C.UTF-8/"
 cp "$TEST_LIST_PATH" "$WORK_ROOT/meta/ltp_test.txt"
+
 if [ -n "$PLAN_OVERRIDE_PATH" ] && [ -f "$PLAN_OVERRIDE_PATH" ]; then
     cp "$PLAN_OVERRIDE_PATH" "$WORK_ROOT/meta/oscomp_plan.txt"
+fi
+if [ -n "$ENV_OVERRIDE_PATH" ] && [ -f "$ENV_OVERRIDE_PATH" ]; then
+    cp "$ENV_OVERRIDE_PATH" "$WORK_ROOT/meta/oscomp.env"
 fi
 
 case "$ARCH" in

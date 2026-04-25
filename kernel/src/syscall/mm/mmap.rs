@@ -244,11 +244,7 @@ impl From<MmapProt> for MappingFlags {
             flags |= MappingFlags::READ;
         }
         if value.contains(MmapProt::WRITE) {
-            // RISC-V leaf PTEs cannot encode writable-without-readable pages,
-            // and Linux effectively treats PROT_WRITE mappings as readable on
-            // such hardware. Normalize here so VMA flags match the installed
-            // page-table permissions.
-            flags |= MappingFlags::READ | MappingFlags::WRITE;
+            flags |= MappingFlags::WRITE;
         }
         if value.contains(MmapProt::EXEC) {
             flags |= MappingFlags::EXECUTE;
@@ -430,7 +426,7 @@ pub fn sys_mmap(
                             DeviceMmap::ReadOnly => Backend::new_cow(
                                 start,
                                 page_size,
-                                backend,
+                                loc.clone(),
                                 offset as u64,
                                 None,
                                 false,
@@ -471,7 +467,7 @@ pub fn sys_mmap(
                 Backend::new_cow(
                     start,
                     page_size,
-                    backend,
+                    file.inner().location().clone(),
                     offset as u64,
                     Some(file_end),
                     true,

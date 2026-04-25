@@ -136,6 +136,7 @@ optional = true
 [dependencies.percpu]
 version = "0.2.3-preview.1"
 optional = true
+features = ["non-zero-vma"]
 
 [dependencies.spin]
 version = "0.10"

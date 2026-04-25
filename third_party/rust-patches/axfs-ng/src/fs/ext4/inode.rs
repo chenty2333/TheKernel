@@ -123,7 +123,11 @@ impl NodeOps for Inode {
     }
 
     fn sync(&self, _data_only: bool) -> VfsResult<()> {
-        Ok(())
+        // lwext4 exposes writeback at the filesystem level. Reopen-heavy
+        // workloads such as iozone rely on sync/fsync making previous updates
+        // visible before the next phase starts, so route inode sync through the
+        // ext4-wide flush path.
+        self.fs.lock().flush().map_err(into_vfs_err)
     }
 
     fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {

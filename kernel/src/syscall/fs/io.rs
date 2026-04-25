@@ -11,17 +11,16 @@ use syscalls::Sysno;
 
 use crate::{
     file::{
-        Directory, File, FileHandle, FileLike, FileLikeKind, Pipe, Socket, get_file_like,
-        get_typed_file,
+        Directory, File, FileHandle, FileLike, FileLikeKind, Pipe, Socket, allowed_write_len,
+        check_resize_limit, get_file_like, get_typed_file,
         inotify::{notify_read, notify_write},
         lease, memfd,
         permission::check_open_permissions,
     },
     mm::{IoVec, IoVectorBuf, UserConstPtr, VmBytes, VmBytesMut},
     pseudofs::tmp,
+    task::AsThread,
 };
-use crate::file::{allowed_write_len, check_resize_limit};
-use crate::task::AsThread;
 
 const SEEK_DATA: c_int = 3;
 const SEEK_HOLE: c_int = 4;
@@ -520,7 +519,9 @@ pub fn sys_sync_file_range(
     nbytes: __kernel_off_t,
     flags: u32,
 ) -> AxResult<isize> {
-    debug!("sys_sync_file_range <= fd: {fd}, offset: {offset}, nbytes: {nbytes}, flags: {flags:#x}");
+    debug!(
+        "sys_sync_file_range <= fd: {fd}, offset: {offset}, nbytes: {nbytes}, flags: {flags:#x}"
+    );
 
     if offset < 0 || nbytes < 0 {
         return Err(AxError::InvalidInput);
@@ -532,7 +533,10 @@ pub fn sys_sync_file_range(
     }
 
     let file_like = get_file_like(fd)?;
-    if !matches!(FileLikeKind::from_file_like(file_like.as_ref()), FileLikeKind::Regular) {
+    if !matches!(
+        FileLikeKind::from_file_like(file_like.as_ref()),
+        FileLikeKind::Regular
+    ) {
         return Err(AxError::from(LinuxError::ESPIPE));
     }
 
@@ -603,7 +607,8 @@ pub fn sys_pwrite64(
     } else {
         let allowed = allowed_write_len(offset as u64, len)?;
         memfd::check_write(f.inner().location(), offset as u64, allowed)?;
-        f.inner().write_at(VmBytes::new(buf, allowed), offset as _)?
+        f.inner()
+            .write_at(VmBytes::new(buf, allowed), offset as _)?
     };
     if write > 0 {
         notify_write(fd);

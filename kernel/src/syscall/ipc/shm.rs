@@ -12,9 +12,9 @@ use memory_addr::{PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 use starry_process::Pid;
 
 use super::{
-    IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, SHM_DEST,
-    SHM_LOCK, SHM_LOCKED, SHM_INFO, SHM_STAT, SHM_UNLOCK, SHMMIN, IpcPerm, next_ipc_id,
-    shmall_limit, shmmax_limit, shmmni_limit, shmseg_limit,
+    IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcPerm, SHM_DEST,
+    SHM_INFO, SHM_LOCK, SHM_LOCKED, SHM_STAT, SHM_UNLOCK, SHMMIN, next_ipc_id, shmall_limit,
+    shmmax_limit, shmmni_limit, shmseg_limit,
 };
 use crate::{
     mm::{Backend, SharedPages, UserPtr, nullable},
@@ -24,6 +24,14 @@ use crate::{
 
 const IPC_MODE_MASK: __kernel_mode_t = 0o777;
 const SHM_HUGETLB_FLAG: usize = 0o4000;
+#[cfg(target_arch = "loongarch64")]
+const SHMLBA: usize = 0x10000;
+#[cfg(not(target_arch = "loongarch64"))]
+const SHMLBA: usize = PAGE_SIZE_4K;
+
+fn align_down_to(value: usize, align: usize) -> usize {
+    value / align * align
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -592,8 +600,12 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let pid = proc_data.proc.pid();
-    if !can_attach_shm(&shm_inner.shmid_ds.shm_perm, proc_data.euid(), proc_data.egid(), read_only)
-    {
+    if !can_attach_shm(
+        &shm_inner.shmid_ds.shm_perm,
+        proc_data.euid(),
+        proc_data.egid(),
+        read_only,
+    ) {
         return Err(AxError::from(LinuxError::EACCES));
     }
     let aspace_handle = proc_data.aspace();
@@ -609,8 +621,31 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
         if !memory_addr::is_aligned_4k(addr) && !shm_flg.contains(ShmAtFlags::SHM_RND) {
             return Err(AxError::InvalidInput);
         }
-        let candidate = VirtAddr::from(memory_addr::align_down_4k(addr));
+        let candidate_addr = if shm_flg.contains(ShmAtFlags::SHM_RND) {
+            align_down_to(addr, SHMLBA)
+        } else {
+            addr
+        };
+        let candidate = VirtAddr::from(candidate_addr);
         let found = aspace.find_free_area(candidate, length, limit, PAGE_SIZE_4K);
+
+        #[cfg(target_arch = "loongarch64")]
+        let (candidate, found) = {
+            let mut candidate = candidate;
+            let mut found = found;
+            if shm_flg.contains(ShmAtFlags::SHM_RND) && found != Some(candidate) {
+                let compat_addr = memory_addr::align_down_4k(addr);
+                let compat = VirtAddr::from(compat_addr);
+                if compat_addr != candidate_addr
+                    && aspace.find_free_area(compat, length, limit, PAGE_SIZE_4K) == Some(compat)
+                {
+                    candidate = compat;
+                    found = Some(compat);
+                }
+            }
+            (candidate, found)
+        };
+
         if found != Some(candidate) {
             if shm_flg.contains(ShmAtFlags::SHM_REMAP) {
                 return Err(AxError::InvalidInput);
@@ -628,13 +663,6 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
 
     let mut shm_manager = SHM_MANAGER.lock();
     shm_manager.insert_shmid_vaddr(pid, shm_inner.shmid, start_addr);
-    info!(
-        "Process {} alloc shm virt addr start: {:#x}, size: {}, mapping_flags: {:#x?}",
-        pid,
-        start_addr.as_usize(),
-        length,
-        mapping_flags
-    );
 
     // map the virtual address range to the physical address
     if let Some(phys_pages) = shm_inner.phys_pages.clone() {
@@ -700,8 +728,12 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
                 .nth_active(shmid as usize)
                 .ok_or(AxError::InvalidInput)?;
             let shm_inner = shm_inner.lock();
-            if !super::has_ipc_permission(&shm_inner.shmid_ds.shm_perm, current_uid, current_gid, false)
-            {
+            if !super::has_ipc_permission(
+                &shm_inner.shmid_ds.shm_perm,
+                current_uid,
+                current_gid,
+                false,
+            ) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
             *buf.get_as_mut()? = shm_inner.shmid_ds;
@@ -726,8 +758,12 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
             | (user_ds.shm_perm.mode & IPC_MODE_MASK as c_ushort);
         shm_inner.shmid_ds.shm_ctime = wall_time().as_secs() as __kernel_time_t;
     } else if cmd == IPC_STAT {
-        if !super::has_ipc_permission(&shm_inner.shmid_ds.shm_perm, current_uid, current_gid, false)
-        {
+        if !super::has_ipc_permission(
+            &shm_inner.shmid_ds.shm_perm,
+            current_uid,
+            current_gid,
+            false,
+        ) {
             return Err(AxError::from(LinuxError::EACCES));
         }
         if let Some(shmid_ds) = nullable!(buf.get_as_mut())? {

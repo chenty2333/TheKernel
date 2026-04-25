@@ -239,7 +239,11 @@ impl TaskInner {
             Poll::Ready(())
         } else {
             self.interrupt_waker.register(cx.waker());
-            Poll::Pending
+            if self.interrupted.swap(false, Ordering::AcqRel) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
         }
     }
 

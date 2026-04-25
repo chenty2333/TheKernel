@@ -22,6 +22,7 @@ use crate::{
     net_stack::NetStack,
     options::{Configurable, GetSocketOption, SetSocketOption},
     state::*,
+    wrapper::Transport,
 };
 
 pub(crate) fn new_tcp_socket() -> smol::Socket<'static> {
@@ -116,7 +117,18 @@ impl TcpSocket {
         let mut events = IoEvents::empty();
         let writable = self.with_smol_socket(|socket| match socket.state() {
             smol::State::SynSent => false, // wait for connection
-            smol::State::Established => {
+            smol::State::Established
+            | smol::State::FinWait1
+            | smol::State::FinWait2
+            | smol::State::CloseWait
+            | smol::State::Closing
+            | smol::State::LastAck
+            | smol::State::TimeWait => {
+                // Linux connect() succeeds once the handshake completed, even
+                // if the peer closes immediately afterwards. LTP accept02
+                // hits this race by accept()ing and closing the server-side
+                // socket right away, so treat post-handshake terminal states
+                // as a successful connect.
                 self.state.set(State::Connected); // connected
                 debug!(
                     "TCP socket {}: connected to {}",
@@ -250,9 +262,11 @@ impl SocketOps for TcpSocket {
                     .get_service()
                     .validate_bind_addr(local_addr.ip().into())?;
                 if !self.general.reuse_address() {
-                    self.stack
-                        .socket_set
-                        .bind_check(local_addr.ip().into(), local_addr.port())?;
+                    self.stack.socket_set.bind_check(
+                        Transport::Tcp,
+                        (!local_addr.ip().is_unspecified()).then_some(local_addr.ip().into()),
+                        local_addr.port(),
+                    )?;
                 }
                 let endpoint = IpListenEndpoint {
                     addr: if local_addr.ip().is_unspecified() {

@@ -4,14 +4,17 @@ use alloc::{
 };
 
 use axfs::FS_CONTEXT;
-use axhal::uspace::UserContext;
+use axhal::{power::system_off, uspace::UserContext};
 use axsync::Mutex;
 use axtask::{AxTaskExt, SchedState, spawn_task_with_sched};
 use starry_process::{Pid, Process};
 
 use crate::{
     file::FD_TABLE,
-    mm::{copy_from_kernel, load_user_app, new_user_aspace_empty},
+    mm::{
+        copy_from_kernel, load_user_app, mark_page_fault_thread_context_ready,
+        new_user_aspace_empty,
+    },
     pseudofs::{self, dev::tty::N_TTY},
     task::{ProcessData, Thread, add_task_to_table, new_user_task, spawn_alarm_task},
 };
@@ -19,6 +22,8 @@ use crate::{
 /// Initialize and run initproc.
 pub fn init(args: &[String], envs: &[String]) {
     const INIT_PID: Pid = 1;
+
+    mark_page_fault_thread_context_ready();
 
     axfs::set_symlink_follow_policy(crate::mounts::should_follow_symlink);
     pseudofs::mount_all().expect("Failed to mount pseudofs");
@@ -93,4 +98,6 @@ pub fn init(args: &[String], envs: &[String]) {
         .filesystem()
         .flush()
         .expect("Failed to flush rootfs");
+
+    system_off();
 }

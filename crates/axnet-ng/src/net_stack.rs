@@ -13,7 +13,7 @@ use crate::{
     listen_table::ListenTable,
     router::{Router, Rule},
     service::Service,
-    wrapper::SocketSetWrapper,
+    wrapper::{SocketSetWrapper, Transport},
 };
 
 /// A self-contained network stack instance.
@@ -157,7 +157,7 @@ impl NetStack {
             } else {
                 *curr += 1;
             }
-            if self.listen_table.can_listen(port) {
+            if !self.socket_set.port_in_use(Transport::Tcp, port) {
                 return Ok(port);
             }
             tries += 1;
@@ -168,12 +168,19 @@ impl NetStack {
     /// Allocate a UDP ephemeral port.
     pub(crate) fn udp_ephemeral_port(&self) -> AxResult<u16> {
         let mut curr = self.udp_ephemeral_port.lock();
-        let port = *curr;
-        if *curr == PORT_END {
-            *curr = PORT_START;
-        } else {
-            *curr += 1;
+        let mut tries = 0;
+        while tries <= PORT_END - PORT_START {
+            let port = *curr;
+            if *curr == PORT_END {
+                *curr = PORT_START;
+            } else {
+                *curr += 1;
+            }
+            if !self.socket_set.port_in_use(Transport::Udp, port) {
+                return Ok(port);
+            }
+            tries += 1;
         }
-        Ok(port)
+        ax_bail!(AddrInUse, "no available ports");
     }
 }

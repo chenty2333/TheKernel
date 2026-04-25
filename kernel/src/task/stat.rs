@@ -9,6 +9,7 @@ use crate::task::{AsThread, ProcStateHint, TaskUsage};
 fn task_state(task: &AxTaskRef) -> char {
     let thread = task.as_thread();
     let proc_data = &thread.proc_data;
+    let state = task.state();
 
     if proc_data.is_stopped() {
         return 'T';
@@ -22,16 +23,16 @@ fn task_state(task: &AxTaskRef) -> char {
         return 'R';
     }
 
-    match task.state() {
+    match state {
+        TaskState::Running | TaskState::Ready => 'R',
         TaskState::Exited => 'Z',
-        _ => match thread.proc_state_hint() {
+        TaskState::Blocked => match thread.proc_state_hint() {
+            // Only publish sleep-class hints once the scheduler has actually
+            // committed the task to `Blocked`; otherwise procfs pollers like
+            // LTP can observe `S` before the waiter is truly sleeping.
             ProcStateHint::Interruptible => 'S',
             ProcStateHint::Uninterruptible => 'D',
-            ProcStateHint::None => match task.state() {
-                TaskState::Running | TaskState::Ready => 'R',
-                TaskState::Blocked => 'S',
-                TaskState::Exited => 'Z',
-            },
+            ProcStateHint::None => 'S',
         },
     }
 }
@@ -69,8 +70,8 @@ pub fn render_task_stat(task: &AxTaskRef) -> AxResult<String> {
 
     Ok(format!(
         "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 0 0 0 0 0 0 {} {} {} {} 20 0 \
-         {num_threads} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {exit_signal} 0 0 0 0 0 0 0 0 0 0 \
-         0 {exit_code}\n",
+         {num_threads} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {exit_signal} 0 0 0 0 0 0 0 0 0 0 0 \
+         {exit_code}\n",
         self_usage.utime_ticks(),
         self_usage.stime_ticks(),
         child_usage.utime_ticks(),

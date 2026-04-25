@@ -7,6 +7,7 @@ endif()
 # Name of the target
 set(CMAKE_SYSTEM_NAME "Linux")
 set(CMAKE_SYSTEM_PROCESSOR ${ARCH})
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 
 # Toolchain settings
 set(TOOLCHAIN_PREFIX ${ARCH}-linux-musl)

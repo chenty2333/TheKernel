@@ -31,7 +31,9 @@ impl IoVectorBuf {
             if iov.iov_len < 0 {
                 return Err(AxError::InvalidInput);
             }
-            len = len.checked_add(iov.iov_len as usize).ok_or(AxError::InvalidInput)?;
+            len = len
+                .checked_add(iov.iov_len as usize)
+                .ok_or(AxError::InvalidInput)?;
         }
         Ok(Self { iovs, iovcnt, len })
     }
@@ -46,9 +48,7 @@ impl IoVectorBuf {
                 continue;
             }
             vm_read_slice(iov.iov_base, unsafe {
-                mem::transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(
-                    &mut data[offset..offset + len],
-                )
+                mem::transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(&mut data[offset..offset + len])
             })?;
             offset += len;
         }

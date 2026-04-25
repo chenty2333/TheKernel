@@ -17,7 +17,7 @@ use kernel_guard::NoPreemptIrqSave;
 use linux_raw_sys::general::{FUTEX_OWNER_DIED, FUTEX_TID_MASK, FUTEX_WAITERS, ROBUST_LIST_LIMIT};
 use memory_addr::{MemoryAddr, PhysAddr, VirtAddr};
 use spin::RwLock;
-use starry_process::{Pid, ProcessGroup, Session, ZombieSnapshot};
+use starry_process::{Pid, Process, ProcessGroup, Session, ZombieSnapshot};
 use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 use weak_map::WeakMap;
@@ -205,6 +205,28 @@ pub fn get_process_data(pid: Pid) -> AxResult<Arc<ProcessData>> {
     PROCESS_TABLE.read().get(&pid).ok_or(AxError::NoSuchProcess)
 }
 
+/// Finds a process by PID even after its runtime [`ProcessData`] has been
+/// dropped. Zombie processes remain owned by their parent until wait reaps
+/// them, so PID-existence checks such as kill(2) must still see them.
+pub fn get_process_including_zombie(pid: Pid) -> AxResult<Arc<Process>> {
+    if pid == 0 {
+        return Ok(current().as_thread().proc_data.proc.clone());
+    }
+    if let Some(proc_data) = PROCESS_TABLE.read().get(&pid) {
+        return Ok(proc_data.proc.clone());
+    }
+
+    for group in PROCESS_GROUP_TABLE.read().values() {
+        for process in group.processes() {
+            if process.pid() == pid {
+                return Ok(process);
+            }
+        }
+    }
+
+    Err(AxError::NoSuchProcess)
+}
+
 /// Finds the process group with the given PGID.
 pub fn get_process_group(pgid: Pid) -> AxResult<Arc<ProcessGroup>> {
     if let Some(group) = PROCESS_GROUP_TABLE.read().get(&pgid) {
@@ -292,6 +314,14 @@ fn with_current_task_ctx_mut<R>(f: impl FnOnce(&mut axhal::context::TaskContext)
     let curr = current();
     let curr_ptr = (&***curr) as *const TaskInner as *mut TaskInner;
     unsafe { f((*curr_ptr).ctx_mut()) }
+}
+
+/// Copies the current task's saved user FPU state into another task context.
+#[cfg(target_arch = "loongarch64")]
+pub fn copy_current_user_fpu_state_to(dst: &mut axhal::context::TaskContext) {
+    with_current_task_ctx_mut(|ctx| {
+        dst.fpu = ctx.fpu;
+    });
 }
 
 /// Restores the current task's saved user FPU state to the CPU.
