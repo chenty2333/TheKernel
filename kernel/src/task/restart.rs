@@ -30,6 +30,7 @@ pub(crate) struct FutexWaitRestart {
     pub bitset: u32,
     pub deadline: Duration,
     pub clock: AlarmClock,
+    pub private: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -478,6 +479,7 @@ mod tests {
             bitset: u32::MAX,
             deadline: Duration::from_millis(200),
             clock: AlarmClock::Monotonic,
+            private: false,
         });
 
         tracker.enter_syscall(&outer, false, Some(RestartClass::Sys));
@@ -503,6 +505,7 @@ mod tests {
             bitset: u32::MAX,
             deadline: Duration::from_millis(200),
             clock: AlarmClock::Monotonic,
+            private: false,
         });
         tracker.armed_restart_block = Some(block);
 

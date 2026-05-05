@@ -56,6 +56,40 @@ impl FileDescription {
     pub fn flock_owner(&self) -> u64 {
         self.flock_owner
     }
+
+    /// Fast-path read that dispatches through the cached `FileFast` tag
+    /// instead of the `dyn FileLike` vtable.
+    pub(crate) fn fast_read(
+        &self,
+        dst: &mut (impl axio::Write + axio::IoBufMut),
+    ) -> AxResult<usize> {
+        match &self.fast {
+            FileFast::Pipe(pipe) => pipe.read_fast(dst),
+            FileFast::Regular(file) => file.read_fast(dst),
+            FileFast::Socket(sock) => sock.read_fast(dst),
+            FileFast::Other => self.inner.read(dst),
+        }
+    }
+
+    /// Returns true if the fast tag indicates a regular file (used by
+    /// `sys_writev` for `check_readable` pre-validation).
+    pub(crate) fn is_regular_fast(&self) -> bool {
+        matches!(&self.fast, FileFast::Regular(_))
+    }
+
+    /// Fast-path write that dispatches through the cached `FileFast` tag
+    /// instead of the `dyn FileLike` vtable.
+    pub(crate) fn fast_write(
+        &self,
+        src: &mut (impl axio::Read + axio::IoBuf),
+    ) -> AxResult<usize> {
+        match &self.fast {
+            FileFast::Pipe(pipe) => pipe.write_fast(src),
+            FileFast::Regular(file) => file.write_fast(src),
+            FileFast::Socket(sock) => sock.write_fast(src),
+            FileFast::Other => self.inner.write(src),
+        }
+    }
 }
 
 impl Drop for FileDescription {

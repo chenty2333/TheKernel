@@ -57,6 +57,10 @@ impl IoVectorBuf {
         Ok(data)
     }
 
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
     pub fn check_readable(&self) -> AxResult<()> {
         for i in 0..self.iovcnt {
             let iov = self.iovs.wrapping_add(i).vm_read()?;

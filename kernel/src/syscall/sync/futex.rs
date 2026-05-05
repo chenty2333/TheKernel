@@ -106,7 +106,7 @@ pub(crate) fn restart_futex_wait(block: FutexWaitRestart) -> AxResult<isize> {
             clock: block.clock,
             deadline: block.deadline,
         }),
-        false,
+        block.private,
     )
 }
 
@@ -142,6 +142,7 @@ pub fn sys_futex(
                         bitset,
                         deadline: timeout.deadline,
                         clock: timeout.clock,
+                        private,
                     }));
             }
             do_futex_wait(uaddr, value, bitset, timeout, private)

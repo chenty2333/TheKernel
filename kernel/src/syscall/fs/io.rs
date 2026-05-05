@@ -11,9 +11,8 @@ use syscalls::Sysno;
 
 use crate::{
     file::{
-        Directory, File, FileDescription, FileFast, FileHandle, FileLike, FileLikeKind, Pipe,
-        Socket, allowed_write_len, check_resize_limit, get_file_description, get_file_like,
-        get_typed_file,
+        Directory, File, FileHandle, FileLike, FileLikeKind, Pipe, Socket, allowed_write_len,
+        check_resize_limit, get_file_description, get_file_like, get_typed_file,
         inotify::{notify_read, notify_write},
         lease, memfd,
         permission::check_open_permissions,
@@ -83,7 +82,7 @@ pub fn sys_dummy_fd(sysno: Sysno) -> AxResult<isize> {
 pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     debug!("sys_read <= fd: {fd}, buf: {buf:p}, len: {len}");
     let desc = get_file_description(fd)?;
-    let read = fast_read(&desc, &mut VmBytesMut::new(buf, len))? as isize;
+    let read = desc.fast_read(&mut VmBytesMut::new(buf, len))? as isize;
     if read > 0 {
         notify_read(fd);
     }
@@ -93,7 +92,7 @@ pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
 pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     debug!("sys_readv <= fd: {fd}, iovcnt: {iovcnt}");
     let desc = get_file_description(fd)?;
-    let read = fast_read(&desc, &mut IoVectorBuf::new(iov, iovcnt)?.into_io())? as isize;
+    let read = desc.fast_read(&mut IoVectorBuf::new(iov, iovcnt)?.into_io())? as isize;
     if read > 0 {
         notify_read(fd);
     }
@@ -106,7 +105,7 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
 pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     debug!("sys_write <= fd: {fd}, buf: {buf:p}, len: {len}");
     let desc = get_file_description(fd)?;
-    let written = fast_write(&desc, &mut VmBytes::new(buf, len))? as isize;
+    let written = desc.fast_write(&mut VmBytes::new(buf, len))? as isize;
     if written > 0 {
         notify_write(fd);
     }
@@ -117,32 +116,14 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> 
     debug!("sys_writev <= fd: {fd}, iovcnt: {iovcnt}");
     let desc = get_file_description(fd)?;
     let iov = IoVectorBuf::new(iov, iovcnt)?;
-    if let FileFast::Regular(_) = &desc.fast {
+    if desc.is_regular_fast() {
         iov.check_readable()?;
     }
-    let written = fast_write(&desc, &mut iov.into_io())? as isize;
+    let written = desc.fast_write(&mut iov.into_io())? as isize;
     if written > 0 {
         notify_write(fd);
     }
     Ok(written)
-}
-
-fn fast_read(desc: &Arc<FileDescription>, dst: &mut impl axio::Write + axio::IoBufMut) -> AxResult<usize> {
-    match &desc.fast {
-        FileFast::Pipe(pipe) => pipe.read_fast(dst),
-        FileFast::Regular(file) => file.read_fast(dst),
-        FileFast::Socket(sock) => sock.read_fast(dst),
-        FileFast::Other => desc.inner.read(dst),
-    }
-}
-
-fn fast_write(desc: &Arc<FileDescription>, src: &mut impl axio::Read + axio::IoBuf) -> AxResult<usize> {
-    match &desc.fast {
-        FileFast::Pipe(pipe) => pipe.write_fast(src),
-        FileFast::Regular(file) => file.write_fast(src),
-        FileFast::Socket(sock) => sock.write_fast(src),
-        FileFast::Other => desc.inner.write(src),
-    }
 }
 
 fn positioned_file(fd: c_int, access: FileFlags) -> AxResult<FileHandle<File>> {
