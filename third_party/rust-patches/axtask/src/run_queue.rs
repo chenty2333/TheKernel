@@ -859,6 +859,10 @@ pub(crate) fn has_exited_tasks() -> bool {
     EXITED_TASKS_COUNT.with_current(|c| c.load(core::sync::atomic::Ordering::Relaxed)) > 0
 }
 
+pub(crate) fn exited_tasks_count() -> usize {
+    EXITED_TASKS_COUNT.with_current(|c| c.load(core::sync::atomic::Ordering::Relaxed))
+}
+
 pub(crate) fn reclaim_exited_tasks_current_cpu() {
     // Snapshot the current queue depth so that tasks re-pushed because
     // Arc::try_unwrap failed are deferred to a later round rather than

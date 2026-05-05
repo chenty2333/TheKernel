@@ -5,7 +5,8 @@ use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
 use axtask::{
-    AxTaskExt, SchedClass, current, future::block_on, reclaim_exited_tasks, sched_state,
+    AxTaskExt, SchedClass, current, future::block_on, reclaim_exited_tasks_if_many,
+    sched_state,
     spawn_task_with_sched, yield_now,
 };
 use bitflags::bitflags;
@@ -211,7 +212,9 @@ impl CloneArgs {
         // bursts. Reclaim them before allocating and queueing the next child so
         // post-join fork/create phases do not inherit the previous burst's
         // stack and task-structure pressure.
-        reclaim_exited_tasks();
+        // Only reclaim when enough exited tasks have accumulated to avoid
+        // reclaim-churn (one create, one reclaim, one create, ...).
+        reclaim_exited_tasks_if_many(16);
 
         let mut child_sched_state = sched_state(&curr);
         if !flags.contains(CloneFlags::THREAD) && child_sched_state.reset_on_fork {
