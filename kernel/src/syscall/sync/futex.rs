@@ -4,8 +4,8 @@ use core::time::Duration;
 use axerrno::{AxError, AxResult};
 use axtask::current;
 use linux_raw_sys::general::{
-    FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_REQUEUE, FUTEX_WAIT,
-    FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, robust_list_head, timespec,
+    FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE,
+    FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, robust_list_head, timespec,
 };
 use starry_vm::{VmMutPtr, VmPtr};
 
@@ -28,6 +28,14 @@ fn assert_unsigned(value: u32) -> AxResult<u32> {
         Err(AxError::InvalidInput)
     } else {
         Ok(value)
+    }
+}
+
+fn futex_key_from(address: usize, private: bool) -> FutexKey {
+    if private {
+        FutexKey::new_private(address)
+    } else {
+        FutexKey::new_current(address)
     }
 }
 
@@ -63,12 +71,17 @@ fn do_futex_wait(
     value: u32,
     bitset: u32,
     timeout: Option<FutexWaitDeadline>,
+    private: bool,
 ) -> AxResult<isize> {
     if uaddr.vm_read()? != value {
         return Err(AxError::WouldBlock);
     }
 
-    let key = FutexKey::new_current(uaddr.addr());
+    let key = if private {
+        FutexKey::new_private(uaddr.addr())
+    } else {
+        FutexKey::new_current(uaddr.addr())
+    };
     let futex_table = futex_table_for(&key);
     let futex = futex_table.get_or_insert(&key);
 
@@ -93,6 +106,7 @@ pub(crate) fn restart_futex_wait(block: FutexWaitRestart) -> AxResult<isize> {
             clock: block.clock,
             deadline: block.deadline,
         }),
+        false,
     )
 }
 
@@ -109,8 +123,7 @@ pub fn sys_futex(
          value3: {value3}",
     );
 
-    let key = FutexKey::new_current(uaddr.addr());
-
+    let private = futex_op & FUTEX_PRIVATE_FLAG != 0;
     let command = futex_op & (FUTEX_CMD_MASK as u32);
     match command {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
@@ -131,9 +144,10 @@ pub fn sys_futex(
                         clock: timeout.clock,
                     }));
             }
-            do_futex_wait(uaddr, value, bitset, timeout)
+            do_futex_wait(uaddr, value, bitset, timeout, private)
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            let key = futex_key_from(uaddr.addr(), private);
             let futex_table = futex_table_for(&key);
             let futex = futex_table.get(&key);
             let mut count = 0;
@@ -154,9 +168,10 @@ pub fn sys_futex(
             }
             let value2 = assert_unsigned(timeout.addr() as u32)? as usize;
 
+            let key = futex_key_from(uaddr.addr(), private);
             let futex_table = futex_table_for(&key);
             let futex = futex_table.get(&key);
-            let key2 = FutexKey::new_current(uaddr2.addr());
+            let key2 = futex_key_from(uaddr2.addr(), private);
             let table2 = futex_table_for(&key2);
             let futex2 = table2.get_or_insert(&key2);
 

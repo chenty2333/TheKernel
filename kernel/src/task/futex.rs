@@ -540,6 +540,14 @@ impl FutexKey {
         Self::new(&aspace_handle.lock(), address)
     }
 
+    /// Creates a `FutexKey` for a private futex, skipping the aspace lock and
+    /// VMA walk that `new_current` performs. Only valid when the caller has
+    /// already determined the futex is process-private (e.g. via
+    /// `FUTEX_PRIVATE_FLAG`).
+    pub fn new_private(address: usize) -> Self {
+        Self::Private { address }
+    }
+
     fn as_usize(&self) -> usize {
         match self {
             FutexKey::Private { address } => *address,
