@@ -33,7 +33,8 @@ impl FrameRefCnt {
             // physical frame before we remove the table entry. This function assumes
             // the caller is not holding the FRAME_TABLE lock, so it is safe to lock
             // FRAME_TABLE here and perform the removal.
-            FRAME_TABLE.lock().remove_frame(paddr);
+            let idx = frame_shard(paddr);
+            FRAME_TABLE[idx].lock().remove_frame(paddr);
             dealloc_frame(paddr, page_size);
         }
     }
@@ -76,7 +77,78 @@ impl FrameTableRefCount {
     }
 }
 
-static FRAME_TABLE: SpinNoIrq<FrameTableRefCount> = SpinNoIrq::new(FrameTableRefCount::new());
+const FRAME_TABLE_SHARDS: usize = 64;
+
+fn frame_shard(paddr: PhysAddr) -> usize {
+    (paddr.as_usize() >> 12) as usize % FRAME_TABLE_SHARDS
+}
+
+static FRAME_TABLE: [SpinNoIrq<FrameTableRefCount>; FRAME_TABLE_SHARDS] = [
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+    SpinNoIrq::new(FrameTableRefCount::new()),
+];
 
 /// Copy-on-write mapping backend.
 ///
@@ -132,7 +204,7 @@ impl CowBackend {
     }
 
     fn get_or_track_frame_ref(&self, paddr: PhysAddr) -> Arc<SpinNoIrq<FrameRefCnt>> {
-        let mut frame_table = FRAME_TABLE.lock();
+        let mut frame_table = FRAME_TABLE[frame_shard(paddr)].lock();
         if let Some(frame_ref) = frame_table.get_frame_ref(paddr) {
             return frame_ref;
         }
@@ -180,7 +252,7 @@ impl CowBackend {
         flags: MappingFlags,
         pt: &mut PageTableCursor,
     ) -> AxResult {
-        let Some(frame) = FRAME_TABLE.lock().get_frame_ref(paddr) else {
+        let Some(frame) = FRAME_TABLE[frame_shard(paddr)].lock().get_frame_ref(paddr) else {
             pt.protect(vaddr, page_table_flags(flags))?;
             self.mark_materialized();
             return Ok(());
@@ -357,7 +429,7 @@ impl BackendOps for CowBackend {
         let materialized = pt.drain_present_leaves(range.start, range.size())?;
         for (_addr, frame, _flags, page_size) in materialized {
             assert_eq!(page_size, self.size);
-            if let Some(frame_ref) = FRAME_TABLE.lock().get_frame_ref(frame) {
+            if let Some(frame_ref) = FRAME_TABLE[frame_shard(frame)].lock().get_frame_ref(frame) {
                 let mut frame_ref = frame_ref.lock();
                 frame_ref.drop_frame(frame, self.size);
             } else {
