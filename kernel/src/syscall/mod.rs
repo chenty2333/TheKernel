@@ -89,11 +89,32 @@ fn restart_class_for_syscall(sysno: Sysno, uctx: &UserContext) -> Option<Restart
     }
 }
 
-fn maybe_request_syscall_restart(thr: &Thread, result: &Result<isize, AxError>) {
+fn maybe_request_syscall_restart(
+    thr: &Thread,
+    sysno: Sysno,
+    fd: i32,
+    result: &Result<isize, AxError>,
+) {
     if !matches!(result, Err(AxError::Interrupted)) || !has_pending_syscall_signal(thr) {
         return;
     }
+    // Socket I/O with SO_RCVTIMEO / SO_SNDTIMEO should not be auto-restarted
+    // on signal interruption. Check lazily here so the prologue fast path is
+    // unaffected.
+    if let Some(dir) = socket_io_direction(sysno) {
+        if socket_timeout_configured(fd, dir) {
+            return;
+        }
+    }
     thr.request_syscall_restart();
+}
+
+fn socket_io_direction(sysno: Sysno) -> Option<SocketIoDirection> {
+    match sysno {
+        Sysno::read | Sysno::readv => Some(SocketIoDirection::Read),
+        Sysno::write | Sysno::writev => Some(SocketIoDirection::Write),
+        _ => None,
+    }
 }
 
 pub fn handle_syscall(uctx: &mut UserContext) {
@@ -930,7 +951,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             Err(AxError::Unsupported)
         }
     };
-    maybe_request_syscall_restart(thr, &result);
+    maybe_request_syscall_restart(thr, sysno, uctx.arg0() as i32, &result);
     debug!("Syscall {sysno} return {result:?}");
 
     // Pthread-heavy user workloads frequently reap threads via futex-based
