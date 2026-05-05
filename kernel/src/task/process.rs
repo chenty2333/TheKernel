@@ -5,9 +5,7 @@ use axerrno::{AxError, AxResult};
 use axnet::NetStack;
 use axpoll::PollSet;
 use axsync::{Mutex, spin::SpinNoIrq};
-use linux_raw_sys::general::{
-    CAP_SETGID, CAP_SETUID, CAP_SYSLOG, CAP_SYS_ADMIN, RLIMIT_NOFILE,
-};
+use linux_raw_sys::general::{CAP_SETGID, CAP_SETUID};
 use scope_local::Scope;
 use spin::RwLock;
 use starry_process::{Pid, Process};
@@ -60,7 +58,7 @@ pub struct ProcessData {
     pub signal: Arc<ProcessSignalManager>,
 
     /// The futex table.
-    futex_table: Arc<FutexTable>,
+    pub(in crate::task) futex_table: Arc<FutexTable>,
 
     /// The default mask for file permissions.
     umask: AtomicU32,
@@ -78,7 +76,7 @@ pub struct ProcessData {
     pub(crate) posix_timers: SpinNoIrq<Vec<Option<PosixTimer>>>,
 
     /// CPU time accumulated from sibling threads that have already exited.
-    exited_threads_usage: AtomicTaskUsage,
+    pub(in crate::task) exited_threads_usage: AtomicTaskUsage,
     /// CPU time accumulated from waited-for child subtrees.
     waited_children_usage: AtomicTaskUsage,
 

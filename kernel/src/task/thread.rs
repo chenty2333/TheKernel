@@ -14,8 +14,9 @@ use starry_process::Pid;
 use starry_signal::api::ThreadSignalManager;
 
 use super::{
-    accounting::{AtomicTaskUsage, TimeManager, TaskUsage},
+    accounting::{AtomicTaskUsage, TaskUsage},
     restart::RestartTracker,
+    timer::TimeManager,
     ProcessData,
 };
 
@@ -77,7 +78,7 @@ pub struct Thread {
     accessing_user_memory: AtomicBool,
 
     /// Syscall restart bookkeeping shared across normal execution and signal handlers.
-    restart: SpinNoIrq<RestartTracker>,
+    pub(in crate::task) restart: SpinNoIrq<RestartTracker>,
 
     /// Self exit event
     pub exit_event: Arc<PollSet>,

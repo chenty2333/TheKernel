@@ -1,18 +1,17 @@
 use axerrno::{AxError, AxResult};
-use axsync::spin::SpinNoIrq;
 
 pub(in crate::task) const CAPABILITY_WORDS: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(in crate::task) struct Credentials {
-    ruid: u32,
-    euid: u32,
-    suid: u32,
-    fsuid: u32,
-    rgid: u32,
-    egid: u32,
-    sgid: u32,
-    fsgid: u32,
+pub(crate) struct Credentials {
+    pub(in crate::task) ruid: u32,
+    pub(in crate::task) euid: u32,
+    pub(in crate::task) suid: u32,
+    pub(in crate::task) fsuid: u32,
+    pub(in crate::task) rgid: u32,
+    pub(in crate::task) egid: u32,
+    pub(in crate::task) sgid: u32,
+    pub(in crate::task) fsgid: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -25,7 +24,7 @@ pub(crate) struct CapabilityState {
 }
 
 impl CapabilityState {
-    const fn full() -> Self {
+    pub(in crate::task) const fn full() -> Self {
         Self {
             effective: [u32::MAX; CAPABILITY_WORDS],
             permitted: [u32::MAX; CAPABILITY_WORDS],

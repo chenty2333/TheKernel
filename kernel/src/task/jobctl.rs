@@ -20,7 +20,7 @@ impl From<u8> for StopState {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(in crate::task) enum ContinueResult {
+pub(crate) enum ContinueResult {
     None,
     CanceledStopping,
     ResumedStopped,
@@ -28,10 +28,10 @@ pub(in crate::task) enum ContinueResult {
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::task) struct JobControlState {
-    state: StopState,
-    stop_signal: u8,
-    continued: bool,
-    stop_reported: bool,
+    pub(in crate::task) state: StopState,
+    pub(in crate::task) stop_signal: u8,
+    pub(in crate::task) continued: bool,
+    pub(in crate::task) stop_reported: bool,
 }
 
 impl Default for JobControlState {
@@ -47,10 +47,10 @@ impl Default for JobControlState {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(in crate::task) struct ExecControlState {
-    owner: Option<Pid>,
+    pub(in crate::task) owner: Option<Pid>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(in crate::task) struct VforkControlState {
-    parent_tid: Option<Pid>,
+    pub(in crate::task) parent_tid: Option<Pid>,
 }

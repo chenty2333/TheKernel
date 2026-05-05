@@ -2374,7 +2374,7 @@ run_ltp_group() {
     if [ "${LTP_VIRT_OVERRIDE+x}" != "x" ]; then
         export LTP_VIRT_OVERRIDE=kvm
     fi
-    if [ "${LTP_TIMEOUT_MUL+x}" != "x" ] && [ "$root" = /glibc ]; then
+    if [ "${LTP_TIMEOUT_MUL+x}" != "x" ]; then
         case "$(runner_machine_quiet)" in
             loongarch64)
                 export LTP_TIMEOUT_MUL=2
