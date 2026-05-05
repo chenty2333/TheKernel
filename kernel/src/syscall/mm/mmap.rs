@@ -464,14 +464,24 @@ pub fn sys_mmap(
                 let backend = file.inner().backend()?.clone();
                 validate_file_mmap_access(file.inner(), &backend, map_type, permission_flags)?;
                 let file_end = file.inner().location().len()?;
-                Backend::new_cow(
-                    start,
-                    page_size,
-                    file.inner().location().clone(),
-                    offset as u64,
-                    Some(file_end),
-                    true,
-                )
+                match backend {
+                    FileBackend::Cached(cache) => Backend::new_cow_cached(
+                        start,
+                        page_size,
+                        cache,
+                        offset as u64,
+                        Some(file_end),
+                        true,
+                    ),
+                    FileBackend::Direct(_) => Backend::new_cow(
+                        start,
+                        page_size,
+                        file.inner().location().clone(),
+                        offset as u64,
+                        Some(file_end),
+                        true,
+                    ),
+                }
             } else {
                 Backend::new_alloc(start, page_size)
             }

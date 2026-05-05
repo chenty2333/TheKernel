@@ -5,6 +5,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
+use axfs::CachedFile;
 use axfs_ng_vfs::Location;
 use axhal::{
     mem::phys_to_virt,
@@ -84,9 +85,35 @@ static FRAME_TABLE: SpinNoIrq<FrameTableRefCount> = SpinNoIrq::new(FrameTableRef
 pub struct CowBackend {
     start: VirtAddr,
     size: PageSize,
-    file: Option<(Location, u64, Option<u64>, bool)>,
+    file: Option<(CowFileSource, u64, Option<u64>, bool)>,
     map_id: Arc<()>,
     materialized: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+enum CowFileSource {
+    Direct(Location),
+    Cached(CachedFile),
+}
+
+impl CowFileSource {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> AxResult<usize> {
+        Ok(match self {
+            CowFileSource::Direct(location) => location.entry().as_file()?.read_at(buf, offset)?,
+            CowFileSource::Cached(cache) => cache.read_at(buf, offset)?,
+        })
+    }
+
+    fn ptr_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (CowFileSource::Direct(lhs), CowFileSource::Direct(rhs)) => lhs.ptr_eq(rhs),
+            (CowFileSource::Cached(lhs), CowFileSource::Cached(rhs)) => lhs.ptr_eq(rhs),
+            (CowFileSource::Direct(lhs), CowFileSource::Cached(rhs))
+            | (CowFileSource::Cached(rhs), CowFileSource::Direct(lhs)) => {
+                lhs.ptr_eq(rhs.location())
+            }
+        }
+    }
 }
 
 impl CowBackend {
@@ -124,8 +151,7 @@ impl CowBackend {
     ) -> AxResult {
         let frame = self.alloc_new_frame(true)?;
 
-        if let Some((location, file_start, file_end, _)) = &self.file {
-            let file = location.entry().as_file()?;
+        if let Some((source, file_start, file_end, _)) = &self.file {
             let buf = unsafe {
                 slice::from_raw_parts_mut(phys_to_virt(frame).as_mut_ptr(), self.size as _)
             };
@@ -140,7 +166,7 @@ impl CowBackend {
                 .map_or(u64::MAX, |end| end.saturating_sub(file_start))
                 .min((buf.len() - start) as u64) as usize;
 
-            file.read_at(&mut &mut buf[start..start + max_read], file_start)?;
+            source.read_at(&mut buf[start..start + max_read], file_start)?;
         }
         pt.map(vaddr, frame, self.size, page_table_flags(flags))?;
         self.mark_materialized();
@@ -233,13 +259,13 @@ impl CowBackend {
         match (&self.file, &other.file) {
             (None, None) => true,
             (
-                Some((lhs_backend, lhs_start, lhs_end, lhs_sigbus)),
-                Some((rhs_backend, rhs_start, rhs_end, rhs_sigbus)),
+                Some((lhs_source, lhs_start, lhs_end, lhs_sigbus)),
+                Some((rhs_source, rhs_start, rhs_end, rhs_sigbus)),
             ) => {
                 lhs_start == rhs_start
                     && lhs_end == rhs_end
                     && lhs_sigbus == rhs_sigbus
-                    && lhs_backend.ptr_eq(rhs_backend)
+                    && lhs_source.ptr_eq(rhs_source)
             }
             _ => false,
         }
@@ -448,7 +474,34 @@ impl Backend {
         Self::Cow(CowBackend {
             start,
             size,
-            file: Some((file, file_start, file_end, sigbus_on_eof)),
+            file: Some((
+                CowFileSource::Direct(file),
+                file_start,
+                file_end,
+                sigbus_on_eof,
+            )),
+            map_id: Arc::new(()),
+            materialized: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    pub fn new_cow_cached(
+        start: VirtAddr,
+        size: PageSize,
+        cache: CachedFile,
+        file_start: u64,
+        file_end: Option<u64>,
+        sigbus_on_eof: bool,
+    ) -> Self {
+        Self::Cow(CowBackend {
+            start,
+            size,
+            file: Some((
+                CowFileSource::Cached(cache),
+                file_start,
+                file_end,
+                sigbus_on_eof,
+            )),
             map_id: Arc::new(()),
             materialized: Arc::new(AtomicBool::new(false)),
         })

@@ -114,10 +114,10 @@ fn map_elf<'a>(
 
         // Note that `offset` might not be aligned to 4K here, and it's
         // backend's responsibility to properly handle it.
-        let backend = Backend::new_cow(
+        let backend = Backend::new_cow_cached(
             seg_start,
             PageSize::Size4K,
-            cache.location().clone(),
+            cache.clone(),
             ph.offset,
             Some(ph.offset + ph.file_size),
             false,

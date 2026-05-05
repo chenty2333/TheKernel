@@ -1,9 +1,4 @@
-use alloc::{
-    boxed::Box,
-    sync::{Arc, Weak},
-    vec,
-    vec::Vec,
-};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 #[cfg(feature = "times")]
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::{num::NonZeroUsize, ops::Range, task::Context};
@@ -449,17 +444,11 @@ impl Clone for CachedFile {
     }
 }
 
-enum FileUserData {
-    Weak(Weak<CachedFileShared>),
-    Strong(Arc<CachedFileShared>),
-}
+struct FileUserData(Arc<CachedFileShared>);
 
 impl FileUserData {
-    pub fn get(&self) -> Option<Arc<CachedFileShared>> {
-        match self {
-            FileUserData::Weak(weak) => weak.upgrade(),
-            FileUserData::Strong(strong) => Some(strong.clone()),
-        }
+    pub fn get(&self) -> Arc<CachedFileShared> {
+        self.0.clone()
     }
 }
 
@@ -470,22 +459,22 @@ impl CachedFile {
 
         let shared = if in_memory {
             let mut guard = location.user_data();
-            let shared = if let Some(shared) = guard.get::<FileUserData>().and_then(|it| it.get()) {
+            let shared = if let Some(shared) = guard.get::<FileUserData>().map(|it| it.get()) {
                 shared
             } else {
                 let shared = Arc::new(CachedFileShared::new_unbounded());
-                guard.insert(FileUserData::Strong(shared.clone()));
+                guard.insert(FileUserData(shared.clone()));
                 shared
             };
             drop(guard);
             shared
         } else {
             let mut guard = location.user_data();
-            let shared = if let Some(shared) = guard.get::<FileUserData>().and_then(|it| it.get()) {
+            let shared = if let Some(shared) = guard.get::<FileUserData>().map(|it| it.get()) {
                 shared
             } else {
                 let shared = Arc::new(CachedFileShared::new());
-                guard.insert(FileUserData::Weak(Arc::downgrade(&shared)));
+                guard.insert(FileUserData(shared.clone()));
                 shared
             };
             drop(guard);
@@ -679,15 +668,11 @@ impl CachedFile {
                 }
                 Ok(0)
             },
-            |written, page, page_start, range| {
+            |written, page, _page_start, range| {
                 let len = range.end - range.start;
                 buf.read(&mut page.data()[range.start..range.end])?;
                 if !self.in_memory {
-                    let start = page_start + range.start as u64;
-                    self.inner
-                        .entry()
-                        .as_file()?
-                        .write_at(&page.data()[range.start..range.end], start)?;
+                    page.mark_dirty();
                 }
                 Ok(written + len)
             },
