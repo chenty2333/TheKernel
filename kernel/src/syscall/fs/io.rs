@@ -3,7 +3,7 @@ use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FileFlags, OpenOptions};
-use axio::{Cursor, Seek, SeekFrom};
+use axio::{Read, Seek, SeekFrom};
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::general::{__kernel_off_t, W_OK};
 use starry_vm::{VmMutPtr, VmPtr};
@@ -11,8 +11,9 @@ use syscalls::Sysno;
 
 use crate::{
     file::{
-        Directory, File, FileHandle, FileLike, FileLikeKind, Pipe, Socket, allowed_write_len,
-        check_resize_limit, get_file_like, get_typed_file,
+        Directory, File, FileDescription, FileFast, FileHandle, FileLike, FileLikeKind, Pipe,
+        Socket, allowed_write_len, check_resize_limit, get_file_description, get_file_like,
+        get_typed_file,
         inotify::{notify_read, notify_write},
         lease, memfd,
         permission::check_open_permissions,
@@ -81,7 +82,8 @@ pub fn sys_dummy_fd(sysno: Sysno) -> AxResult<isize> {
 /// Return the read size if success.
 pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     debug!("sys_read <= fd: {fd}, buf: {buf:p}, len: {len}");
-    let read = get_file_like(fd)?.read(&mut VmBytesMut::new(buf, len))? as isize;
+    let desc = get_file_description(fd)?;
+    let read = fast_read(&desc, &mut VmBytesMut::new(buf, len))? as isize;
     if read > 0 {
         notify_read(fd);
     }
@@ -90,8 +92,8 @@ pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
 
 pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     debug!("sys_readv <= fd: {fd}, iovcnt: {iovcnt}");
-    let f = get_file_like(fd)?;
-    let read = f.read(&mut IoVectorBuf::new(iov, iovcnt)?.into_io())? as isize;
+    let desc = get_file_description(fd)?;
+    let read = fast_read(&desc, &mut IoVectorBuf::new(iov, iovcnt)?.into_io())? as isize;
     if read > 0 {
         notify_read(fd);
     }
@@ -103,7 +105,8 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
 /// Return the written size if success.
 pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     debug!("sys_write <= fd: {fd}, buf: {buf:p}, len: {len}");
-    let written = get_file_like(fd)?.write(&mut VmBytes::new(buf, len))? as isize;
+    let desc = get_file_description(fd)?;
+    let written = fast_write(&desc, &mut VmBytes::new(buf, len))? as isize;
     if written > 0 {
         notify_write(fd);
     }
@@ -112,18 +115,34 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
 
 pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     debug!("sys_writev <= fd: {fd}, iovcnt: {iovcnt}");
+    let desc = get_file_description(fd)?;
     let iov = IoVectorBuf::new(iov, iovcnt)?;
-    let written = if let Ok(file) = get_typed_file::<File>(fd) {
+    if let FileFast::Regular(_) = &desc.fast {
         iov.check_readable()?;
-        file.write(&mut iov.into_io())?
-    } else {
-        let f = get_file_like(fd)?;
-        f.write(&mut iov.into_io())?
-    } as isize;
+    }
+    let written = fast_write(&desc, &mut iov.into_io())? as isize;
     if written > 0 {
         notify_write(fd);
     }
     Ok(written)
+}
+
+fn fast_read(desc: &Arc<FileDescription>, dst: &mut impl axio::Write + axio::IoBufMut) -> AxResult<usize> {
+    match &desc.fast {
+        FileFast::Pipe(pipe) => pipe.read_fast(dst),
+        FileFast::Regular(file) => file.read_fast(dst),
+        FileFast::Socket(sock) => sock.read_fast(dst),
+        FileFast::Other => desc.inner.read(dst),
+    }
+}
+
+fn fast_write(desc: &Arc<FileDescription>, src: &mut impl axio::Read + axio::IoBuf) -> AxResult<usize> {
+    match &desc.fast {
+        FileFast::Pipe(pipe) => pipe.write_fast(src),
+        FileFast::Regular(file) => file.write_fast(src),
+        FileFast::Socket(sock) => sock.write_fast(src),
+        FileFast::Other => desc.inner.write(src),
+    }
 }
 
 fn positioned_file(fd: c_int, access: FileFlags) -> AxResult<FileHandle<File>> {
@@ -236,25 +255,24 @@ fn do_pwritev(
 
     let file = positioned_write_file(fd)?;
     let io = IoVectorBuf::new(iov, iovcnt)?;
+    io.check_readable()?;
+    let len = io.len();
     let written = if offset == -1 {
-        let data = io.read_all()?;
-        let mut cursor = Cursor::new(data.as_slice());
-        file.write(&mut cursor)?
+        file.write(&mut io.into_io())?
     } else {
-        let data = io.read_all()?;
         if file.inner().flags().contains(FileFlags::APPEND) {
             let append_offset = file.inner().location().len()?;
-            let allowed = allowed_write_len(append_offset, data.len())?;
+            let allowed = allowed_write_len(append_offset, len)?;
             memfd::check_write(file.inner().location(), append_offset, allowed)?;
             file.inner()
                 .access(FileFlags::APPEND)?
-                .append(Cursor::new(&data[..allowed]))?
+                .append(io.into_io().take(allowed as u64))?
                 .0
         } else {
-            let allowed = allowed_write_len(offset as u64, data.len())?;
+            let allowed = allowed_write_len(offset as u64, len)?;
             memfd::check_write(file.inner().location(), offset as u64, allowed)?;
             file.inner()
-                .write_at(Cursor::new(&data[..allowed]), offset as u64)?
+                .write_at(io.into_io().take(allowed as u64), offset as u64)?
         }
     } as isize;
     if written > 0 {

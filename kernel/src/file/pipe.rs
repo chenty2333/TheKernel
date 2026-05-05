@@ -421,6 +421,86 @@ impl Pipe {
             },
         ))
     }
+
+    /// Fast-path read that bypasses `FileDescription` and `FileLike` vtable
+    /// dispatch. Called directly from `sys_read` when the fd table indicates
+    /// a pipe.
+    pub fn read_fast(&self, dst: &mut super::types::IoDst) -> AxResult<usize> {
+        if !self.is_read() {
+            return Err(AxError::BadFileDescriptor);
+        }
+        if dst.is_full() {
+            return Ok(0);
+        }
+
+        block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
+            let read = {
+                let cons = self.shared.buffer.lock();
+                let (left, right) = cons.as_slices();
+                let mut count = dst.write(left)?;
+                if count >= left.len() {
+                    count += dst.write(right)?;
+                }
+                unsafe { cons.advance_read_index(count) };
+                count
+            };
+            if read > 0 {
+                self.shared.poll_tx.wake();
+                Ok(read)
+            } else if self.closed() {
+                Ok(0)
+            } else {
+                Err(AxError::WouldBlock)
+            }
+        }))
+    }
+
+    /// Fast-path write that bypasses `FileDescription` and `FileLike` vtable
+    /// dispatch. Called directly from `sys_write` when the fd table indicates
+    /// a pipe.
+    pub fn write_fast(&self, src: &mut super::types::IoSrc) -> AxResult<usize> {
+        if !self.is_write() {
+            return Err(AxError::BadFileDescriptor);
+        }
+        let size = src.remaining();
+        if size == 0 {
+            return Ok(0);
+        }
+
+        let mut total_written = 0;
+
+        block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
+            if self.closed() {
+                raise_pipe();
+                return Err(AxError::BrokenPipe);
+            }
+
+            let written = {
+                let mut prod = self.shared.buffer.lock();
+                let (left, right) = prod.vacant_slices_mut();
+                let left = unsafe {
+                    core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
+                };
+                let right = unsafe {
+                    core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len())
+                };
+                let mut count = src.read(left)?;
+                if count >= left.len() {
+                    count += src.read(right)?;
+                }
+                unsafe { prod.advance_write_index(count) };
+                count
+            };
+            if written > 0 {
+                self.shared.poll_rx.wake();
+                total_written += written;
+                if total_written == size || self.nonblocking() {
+                    return Ok(total_written);
+                }
+            }
+            Err(AxError::WouldBlock)
+        }))
+    }
 }
 
 pub(crate) fn pipe_max_size() -> usize {
@@ -500,78 +580,11 @@ impl NamedPipe {
 
 impl FileLike for Pipe {
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
-        if !self.is_read() {
-            return Err(AxError::BadFileDescriptor);
-        }
-        if dst.is_full() {
-            return Ok(0);
-        }
-
-        block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
-            let read = {
-                let cons = self.shared.buffer.lock();
-                let (left, right) = cons.as_slices();
-                let mut count = dst.write(left)?;
-                if count >= left.len() {
-                    count += dst.write(right)?;
-                }
-                unsafe { cons.advance_read_index(count) };
-                count
-            };
-            if read > 0 {
-                self.shared.poll_tx.wake();
-                Ok(read)
-            } else if self.closed() {
-                Ok(0)
-            } else {
-                Err(AxError::WouldBlock)
-            }
-        }))
+        self.read_fast(dst)
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
-        if !self.is_write() {
-            return Err(AxError::BadFileDescriptor);
-        }
-        let size = src.remaining();
-        if size == 0 {
-            return Ok(0);
-        }
-
-        let mut total_written = 0;
-
-        block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
-            if self.closed() {
-                raise_pipe();
-                return Err(AxError::BrokenPipe);
-            }
-
-            let written = {
-                let mut prod = self.shared.buffer.lock();
-                let (left, right) = prod.vacant_slices_mut();
-                // The ring buffer exposes valid writable byte slices here.
-                let left = unsafe {
-                    core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
-                };
-                let right = unsafe {
-                    core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len())
-                };
-                let mut count = src.read(left)?;
-                if count >= left.len() {
-                    count += src.read(right)?;
-                }
-                unsafe { prod.advance_write_index(count) };
-                count
-            };
-            if written > 0 {
-                self.shared.poll_rx.wake();
-                total_written += written;
-                if total_written == size || self.nonblocking() {
-                    return Ok(total_written);
-                }
-            }
-            Err(AxError::WouldBlock)
-        }))
+        self.write_fast(src)
     }
 
     fn stat(&self) -> AxResult<Kstat> {

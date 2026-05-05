@@ -11,15 +11,44 @@ use super::{
 
 static FILE_DESCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Cached type tag used by `sys_read`/`sys_write` to skip vtable dispatch on
+/// the most common fd types (regular file, pipe, socket). Falls back to
+/// `Arc<dyn FileLike>` for everything else.
+pub enum FileFast {
+    Regular(Arc<super::fs::File>),
+    Pipe(Arc<super::pipe::Pipe>),
+    Socket(Arc<super::net::Socket>),
+    Other,
+}
+
 pub struct FileDescription {
     pub inner: Arc<dyn FileLike>,
+    pub(super) fast: FileFast,
     flock_owner: u64,
 }
 
 impl FileDescription {
     pub(in crate::file) fn new(inner: Arc<dyn FileLike>) -> Arc<Self> {
+        use downcast_rs::DowncastSync;
+
+        let fast = {
+            // Each downcast_arc call consumes the Arc, so clone first.
+            // Only one branch succeeds; the others return the original Arc
+            // which is then dropped.
+            let tmp = inner.clone();
+            if let Ok(pipe) = tmp.downcast_arc::<super::pipe::Pipe>() {
+                FileFast::Pipe(pipe)
+            } else if let Ok(file) = inner.clone().downcast_arc::<super::fs::File>() {
+                FileFast::Regular(file)
+            } else if let Ok(sock) = inner.clone().downcast_arc::<super::net::Socket>() {
+                FileFast::Socket(sock)
+            } else {
+                FileFast::Other
+            }
+        };
         Arc::new(Self {
             inner,
+            fast,
             flock_owner: FILE_DESCRIPTION_ID.fetch_add(1, Ordering::Relaxed),
         })
     }

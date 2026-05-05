@@ -43,6 +43,20 @@ impl Deref for Socket {
 }
 
 impl Socket {
+    /// Fast-path read that bypasses `FileDescription` and `FileLike` vtable
+    /// dispatch. Called directly from `sys_read` when the fd table indicates
+    /// a socket.
+    pub fn read_fast(&self, dst: &mut IoDst) -> AxResult<usize> {
+        self.recv(dst, RecvOptions::default())
+    }
+
+    /// Fast-path write that bypasses `FileDescription` and `FileLike` vtable
+    /// dispatch. Called directly from `sys_write` when the fd table indicates
+    /// a socket.
+    pub fn write_fast(&self, src: &mut IoSrc) -> AxResult<usize> {
+        self.send(src, SendOptions::default())
+    }
+
     pub fn set_bpf_filter(&self, prog: Option<Arc<BpfProgram>>) -> AxResult<()> {
         let filter = prog
             .map(|prog| Arc::new(AttachedSocketFilter { prog }) as Arc<dyn axnet::SocketFilter>);
@@ -52,11 +66,11 @@ impl Socket {
 
 impl FileLike for Socket {
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
-        self.recv(dst, RecvOptions::default())
+        self.read_fast(dst)
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
-        self.send(src, SendOptions::default())
+        self.write_fast(src)
     }
 
     fn stat(&self) -> AxResult<Kstat> {
