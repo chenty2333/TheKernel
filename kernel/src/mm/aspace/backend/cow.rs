@@ -486,7 +486,9 @@ impl BackendOps for CowBackend {
             // original ELF file contents. Populate writable file-backed pages in
             // the parent before sharing them read-only with the child.
             for vaddr in pages_in(range, self.size)? {
-                if matches!(old_pt.query(vaddr), Err(PagingError::NotMapped)) {
+                if matches!(old_pt.query(vaddr), Err(PagingError::NotMapped))
+                    && !self.faults_with_sigbus(vaddr)
+                {
                     self.alloc_new_at(vaddr, cow_flags, old_pt)?;
                 }
             }

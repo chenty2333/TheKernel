@@ -721,7 +721,6 @@ impl CachedFile {
                     let new_page_offset =
                         len.saturating_sub(page_start).min(PAGE_SIZE as u64) as usize;
                     page.data()[new_page_offset..].fill(0);
-                    page.dirty = false;
                 }
                 guard
                     .iter()
@@ -744,7 +743,6 @@ impl CachedFile {
                 let page_start = new_last_page as u64 * PAGE_SIZE as u64;
                 let new_page_offset = len.saturating_sub(page_start).min(PAGE_SIZE as u64) as usize;
                 page.data()[new_page_offset..].fill(0);
-                page.dirty = false;
             }
         }
         Ok(())
