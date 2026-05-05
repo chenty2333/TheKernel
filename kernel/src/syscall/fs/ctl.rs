@@ -905,21 +905,29 @@ pub fn sys_renameat2(
 }
 
 pub fn sys_sync() -> AxResult<isize> {
+    // Flush all dirty page caches before the filesystem flush so that
+    // writeback data reaches the VFS layer.
+    axfs::sync_all_page_caches().map_err(|_| AxError::Io)?;
     FS_CONTEXT.lock().root_dir().filesystem().flush()?;
     Ok(0)
 }
 
 pub fn sys_syncfs(fd: i32) -> AxResult<isize> {
     let file = get_file_like(fd)?;
-    if let Some(file) = file.downcast_ref::<crate::file::File>() {
-        file.inner().location().filesystem().flush()?;
-        return Ok(0);
+    if let Some(f) = file.downcast_ref::<crate::file::File>() {
+        let loc = f.inner().location();
+        axfs::sync_page_caches_for_fs(loc.filesystem().name())
+            .map_err(|_| AxError::Io)?;
+        loc.filesystem().flush()?;
+        Ok(0)
+    } else if let Some(dir) = file.downcast_ref::<Directory>() {
+        let fs = dir.inner().filesystem();
+        axfs::sync_page_caches_for_fs(fs.name()).map_err(|_| AxError::Io)?;
+        fs.flush()?;
+        Ok(0)
+    } else {
+        Err(AxError::InvalidInput)
     }
-    if let Some(dir) = file.downcast_ref::<Directory>() {
-        dir.inner().filesystem().flush()?;
-        return Ok(0);
-    }
-    Err(AxError::InvalidInput)
 }
 
 pub fn sys_reboot(magic1: i32, magic2: i32, cmd: i32, _arg: *const c_void) -> AxResult<isize> {

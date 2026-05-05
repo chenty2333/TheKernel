@@ -99,6 +99,11 @@ pub fn init(args: &[String], envs: &[String]) {
         .filesystem()
         .flush()
         .expect("Failed to flush rootfs");
+    drop(cx);
+
+    // Flush all dirty page caches before power-off so that writeback
+    // data is not lost.
+    let _ = axfs::sync_all_page_caches();
 
     system_off();
 }

@@ -385,21 +385,28 @@ intrusive_adapter!(EvictListenerAdapter = Box<EvictListener>: EvictListener { li
 struct CachedFileShared {
     page_cache: Mutex<LruCache<u32, PageCache>>,
     evict_listeners: Mutex<LinkedList<EvictListenerAdapter>>,
+    fs_name: String,
 }
 
 impl CachedFileShared {
-    pub fn new() -> Self {
+    pub fn new(fs_name: &str) -> Self {
         Self {
             page_cache: Mutex::new(new_bounded_page_cache_store()),
             evict_listeners: Mutex::new(LinkedList::default()),
+            fs_name: fs_name.into(),
         }
     }
 
-    pub fn new_unbounded() -> Self {
+    pub fn new_unbounded(fs_name: &str) -> Self {
         Self {
             page_cache: Mutex::new(new_unbounded_page_cache_store()),
             evict_listeners: Mutex::new(LinkedList::default()),
+            fs_name: fs_name.into(),
         }
+    }
+
+    fn fs_name(&self) -> &str {
+        &self.fs_name
     }
 }
 
@@ -452,18 +459,73 @@ impl FileUserData {
     }
 }
 
+// ---- Page cache registry ----
+//
+// Every CachedFileShared is tracked here so that sync / syncfs can find
+// dirty caches that outlive the last fd (held alive by FileUserData on
+// the inode's Location).
+
+use axsync::Mutex as RegistryMutex;
+
+static PAGE_CACHE_REGISTRY: RegistryMutex<Vec<alloc::sync::Weak<CachedFileShared>>> =
+    RegistryMutex::new(Vec::new());
+
+fn register_cache(cache: &Arc<CachedFileShared>) {
+    let mut reg = PAGE_CACHE_REGISTRY.lock();
+    reg.retain(|w| w.upgrade().is_some());
+    reg.push(Arc::downgrade(cache));
+}
+
+/// Walk all registered page caches and flush dirty pages.
+/// Called by `sync()` and at shutdown.
+pub fn sync_all_page_caches() -> VfsResult<()> {
+    let mut reg = PAGE_CACHE_REGISTRY.lock();
+    reg.retain(|w| w.upgrade().is_some());
+    for weak in reg.iter() {
+        if let Some(cache) = weak.upgrade() {
+            flush_cache_dirty(&cache)?;
+        }
+    }
+    Ok(())
+}
+
+/// Flush dirty pages whose filesystem matches `fs_name`.
+/// Called by `syncfs(fd)`.
+pub fn sync_page_caches_for_fs(fs_name: &str) -> VfsResult<()> {
+    let mut reg = PAGE_CACHE_REGISTRY.lock();
+    reg.retain(|w| w.upgrade().is_some());
+    for weak in reg.iter() {
+        if let Some(cache) = weak.upgrade() {
+            if cache.fs_name() == fs_name {
+                flush_cache_dirty(&cache)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn flush_cache_dirty(cache: &CachedFileShared) -> VfsResult<()> {
+    // Step 1 keeps write-through, so there are no dirty pages yet.
+    // When Step 2 enables write-back, this will iterate dirty pages
+    // and write them back to the filesystem.
+    let _ = cache;
+    Ok(())
+}
+
 impl CachedFile {
     /// Returns an existing cached file for `location`, or creates a new one.
     pub fn get_or_create(location: Location) -> Self {
-        let in_memory = location.filesystem().name() == "tmpfs";
+        let fs_name = location.filesystem().name();
+        let in_memory = fs_name == "tmpfs";
 
         let shared = if in_memory {
             let mut guard = location.user_data();
             let shared = if let Some(shared) = guard.get::<FileUserData>().map(|it| it.get()) {
                 shared
             } else {
-                let shared = Arc::new(CachedFileShared::new_unbounded());
+                let shared = Arc::new(CachedFileShared::new_unbounded(fs_name));
                 guard.insert(FileUserData(shared.clone()));
+                register_cache(&shared);
                 shared
             };
             drop(guard);
@@ -473,8 +535,9 @@ impl CachedFile {
             let shared = if let Some(shared) = guard.get::<FileUserData>().map(|it| it.get()) {
                 shared
             } else {
-                let shared = Arc::new(CachedFileShared::new());
+                let shared = Arc::new(CachedFileShared::new(fs_name));
                 guard.insert(FileUserData(shared.clone()));
+                register_cache(&shared);
                 shared
             };
             drop(guard);
