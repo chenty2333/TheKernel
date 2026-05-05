@@ -6,6 +6,8 @@ use axio::prelude::*;
 use bytemuck::AnyBitPattern;
 use starry_vm::{VmPtr, vm_read_slice, vm_write_slice};
 
+use super::check_user_readable;
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone, AnyBitPattern)]
 pub struct IoVec {
@@ -53,6 +55,21 @@ impl IoVectorBuf {
             offset += len;
         }
         Ok(data)
+    }
+
+    pub fn check_readable(&self) -> AxResult<()> {
+        for i in 0..self.iovcnt {
+            let iov = self.iovs.wrapping_add(i).vm_read()?;
+            if iov.iov_len < 0 {
+                return Err(AxError::InvalidInput);
+            }
+            let len = iov.iov_len as usize;
+            if len == 0 {
+                continue;
+            }
+            check_user_readable(iov.iov_base as usize, len)?;
+        }
+        Ok(())
     }
 
     pub fn read_with(

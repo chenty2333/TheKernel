@@ -114,6 +114,7 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> 
     debug!("sys_writev <= fd: {fd}, iovcnt: {iovcnt}");
     let iov = IoVectorBuf::new(iov, iovcnt)?;
     let written = if let Ok(file) = get_typed_file::<File>(fd) {
+        iov.check_readable()?;
         file.write(&mut iov.into_io())?
     } else {
         let f = get_file_like(fd)?;

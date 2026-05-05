@@ -369,6 +369,10 @@ fn populate_user_range(start: usize, len: usize, access_flags: MappingFlags) -> 
         .map_err(|_| VmError::AccessDenied)
 }
 
+pub fn check_user_readable(start: usize, len: usize) -> VmResult {
+    populate_user_range(start, len, MappingFlags::READ)
+}
+
 #[extern_trait]
 unsafe impl VmIo for Vm {
     fn new() -> Self {
