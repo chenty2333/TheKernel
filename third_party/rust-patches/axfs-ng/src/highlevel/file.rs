@@ -386,22 +386,25 @@ struct CachedFileShared {
     page_cache: Mutex<LruCache<u32, PageCache>>,
     evict_listeners: Mutex<LinkedList<EvictListenerAdapter>>,
     fs_name: String,
+    inner: Location,
 }
 
 impl CachedFileShared {
-    pub fn new(fs_name: &str) -> Self {
+    pub fn new(fs_name: &str, location: &Location) -> Self {
         Self {
             page_cache: Mutex::new(new_bounded_page_cache_store()),
             evict_listeners: Mutex::new(LinkedList::default()),
             fs_name: fs_name.into(),
+            inner: location.clone(),
         }
     }
 
-    pub fn new_unbounded(fs_name: &str) -> Self {
+    pub fn new_unbounded(fs_name: &str, location: &Location) -> Self {
         Self {
             page_cache: Mutex::new(new_unbounded_page_cache_store()),
             evict_listeners: Mutex::new(LinkedList::default()),
             fs_name: fs_name.into(),
+            inner: location.clone(),
         }
     }
 
@@ -505,10 +508,25 @@ pub fn sync_page_caches_for_fs(fs_name: &str) -> VfsResult<()> {
 }
 
 fn flush_cache_dirty(cache: &CachedFileShared) -> VfsResult<()> {
-    // Step 1 keeps write-through, so there are no dirty pages yet.
-    // When Step 2 enables write-back, this will iterate dirty pages
-    // and write them back to the filesystem.
-    let _ = cache;
+    let file = cache.inner.entry().as_file()?;
+    let mut guard = cache.page_cache.lock();
+    let dirty_pages: Vec<u32> = guard
+        .iter()
+        .filter_map(|(pn, page)| if page.dirty { Some(*pn) } else { None })
+        .collect();
+    for pn in dirty_pages {
+        if let Some(page) = guard.get_mut(&pn) {
+            if page.dirty {
+                let page_start = pn as u64 * PAGE_SIZE as u64;
+                let len =
+                    (file.len()?.saturating_sub(page_start)).min(PAGE_SIZE as u64) as usize;
+                if len > 0 {
+                    file.write_at(&page.data()[..len], page_start)?;
+                }
+                page.dirty = false;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -523,7 +541,7 @@ impl CachedFile {
             let shared = if let Some(shared) = guard.get::<FileUserData>().map(|it| it.get()) {
                 shared
             } else {
-                let shared = Arc::new(CachedFileShared::new_unbounded(fs_name));
+                let shared = Arc::new(CachedFileShared::new_unbounded(fs_name, &location));
                 guard.insert(FileUserData(shared.clone()));
                 register_cache(&shared);
                 shared
@@ -535,7 +553,7 @@ impl CachedFile {
             let shared = if let Some(shared) = guard.get::<FileUserData>().map(|it| it.get()) {
                 shared
             } else {
-                let shared = Arc::new(CachedFileShared::new(fs_name));
+                let shared = Arc::new(CachedFileShared::new(fs_name, &location));
                 guard.insert(FileUserData(shared.clone()));
                 register_cache(&shared);
                 shared
