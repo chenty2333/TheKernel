@@ -505,7 +505,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
         vm_write_in_aspace(&aspace, clear_child_tid, 0u32)
     };
     if !clear_child_tid.is_null() && clear_result.is_ok() {
-        let key = FutexKey::new_current(clear_child_tid as usize);
+        let key = FutexKey::new_private(clear_child_tid as usize);
         let table = futex_table_for(&key);
         let guard = table.get(&key);
         if let Some(futex) = guard {
