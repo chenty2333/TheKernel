@@ -252,7 +252,9 @@ pub fn set_sched_state(task: &AxTaskRef, sched_state: SchedState) -> bool {
 /// task to run can retain many dead task stacks and address spaces longer than
 /// necessary.
 pub fn reclaim_exited_tasks() {
-    crate::run_queue::reclaim_exited_tasks_current_cpu();
+    if crate::run_queue::has_exited_tasks() {
+        crate::run_queue::reclaim_exited_tasks_current_cpu();
+    }
 }
 
 /// Set the affinity for the current task.

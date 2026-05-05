@@ -36,6 +36,7 @@ macro_rules! percpu_static {
 percpu_static! {
     RUN_QUEUE: LazyInit<AxRunQueue> = LazyInit::new(),
     EXITED_TASKS: VecDeque<AxTaskRef> = VecDeque::new(),
+    EXITED_TASKS_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0),
     WAIT_FOR_EXIT: AtomicWaker = AtomicWaker::new(),
     STACK_CACHE: kspin::SpinNoIrq<PerCpuStackCache> = kspin::SpinNoIrq::new(PerCpuStackCache::new()),
     IDLE_TASK: LazyInit<AxTaskRef> = LazyInit::new(),
@@ -538,24 +539,15 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         assert!(curr.is_running(), "task is not running: {:?}", curr.state());
         assert!(!curr.is_idle());
         if curr.is_init() {
-            // Safety: it is called from `current_run_queue::<NoPreemptIrqSave>().exit_current(exit_code)`,
-            // which disabled IRQs and preemption.
-            unsafe {
-                EXITED_TASKS.current_ref_mut_raw().clear();
-            }
+            clear_exited_tasks();
             axhal::power::system_off();
         } else {
             // Notify the joiner task.
             curr.notify_exit(exit_code);
 
-            // Safety: it is called from `current_run_queue::<NoPreemptIrqSave>().exit_current(exit_code)`,
-            // which disabled IRQs and preemption.
-            unsafe {
-                // Push current task to the `EXITED_TASKS` list, which will be consumed by the GC task.
-                EXITED_TASKS.current_ref_mut_raw().push_back(curr.clone());
-                // Wake up the GC task to drop the exited tasks.
-                WAIT_FOR_EXIT.current_ref_mut_raw().wake();
-            }
+            // Push current task to the `EXITED_TASKS` list, which will be
+            // consumed by the GC task.
+            push_exited_task(curr.clone());
 
             // Schedule to next task.
             self.inner.resched();
@@ -840,7 +832,7 @@ fn poll_gc(cx: &mut Context<'_>) -> Poll<()> {
 
         // New tasks might be added during the above section, recheck it to
         // prevent us from sleeping indefinitely.
-        if EXITED_TASKS.with_current(|exited_tasks| exited_tasks.is_empty()) {
+        if EXITED_TASKS_COUNT.with_current(|c| c.load(core::sync::atomic::Ordering::Relaxed)) == 0 {
             break;
         }
 
@@ -850,19 +842,35 @@ fn poll_gc(cx: &mut Context<'_>) -> Poll<()> {
     Poll::Pending
 }
 
+fn push_exited_task(task: AxTaskRef) {
+    EXITED_TASKS_COUNT.with_current(|c| c.fetch_add(1, core::sync::atomic::Ordering::Relaxed));
+    EXITED_TASKS.with_current(|exited_tasks| exited_tasks.push_back(task));
+    // Safety: exit_current runs with IRQs + preemption disabled. Re-push
+    // from the reclaim loop runs under the same percpu context.
+    unsafe { WAIT_FOR_EXIT.current_ref_mut_raw().wake() };
+}
+
+fn clear_exited_tasks() {
+    EXITED_TASKS.with_current(|exited_tasks| exited_tasks.clear());
+    EXITED_TASKS_COUNT.with_current(|c| c.store(0, core::sync::atomic::Ordering::Relaxed));
+}
+
+pub(crate) fn has_exited_tasks() -> bool {
+    EXITED_TASKS_COUNT.with_current(|c| c.load(core::sync::atomic::Ordering::Relaxed)) > 0
+}
+
 pub(crate) fn reclaim_exited_tasks_current_cpu() {
-    // Drop all exited tasks and recycle resources.
-    let n = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.len());
+    // Snapshot the current queue depth so that tasks re-pushed because
+    // Arc::try_unwrap failed are deferred to a later round rather than
+    // keeping this loop spinning forever.
+    let n = EXITED_TASKS_COUNT.with_current(|c| c.load(core::sync::atomic::Ordering::Relaxed));
     for _ in 0..n {
-        // Do not do the slow drops in the critical section.
         let Some(task) = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.pop_front()) else {
-            continue;
+            break;
         };
+        EXITED_TASKS_COUNT.with_current(|c| c.fetch_sub(1, core::sync::atomic::Ordering::Relaxed));
         match Arc::try_unwrap(task) {
             Ok(task) => {
-                // Only recycle the stack after the final strong reference is
-                // gone; before this point, joiners or scheduler handoff may
-                // still legitimately hold the task alive.
                 let mut task = task.into_inner();
                 if let Some(stack) = task.take_kernel_stack() {
                     recycle_task_stack(stack);
@@ -870,9 +878,9 @@ pub(crate) fn reclaim_exited_tasks_current_cpu() {
                 drop(task);
             }
             Err(task) => {
-                // Otherwise (e.g, `switch_to` is not compeleted, held by the
-                // joiner, etc), push it back and wait for them to drop first.
-                EXITED_TASKS.with_current(|exited_tasks| exited_tasks.push_back(task));
+                // Still held by a joiner or scheduler handoff; push back for a
+                // later round.
+                push_exited_task(task);
             }
         }
     }
