@@ -876,6 +876,10 @@ pub(crate) fn reclaim_exited_tasks_current_cpu() {
         match Arc::try_unwrap(task) {
             Ok(task) => {
                 let mut task = task.into_inner();
+                #[cfg(feature = "task-ext")]
+                if let Some(ext) = task.task_ext.take() {
+                    crate::task::try_recycle_ext(ext);
+                }
                 if let Some(stack) = task.take_kernel_stack() {
                     recycle_task_stack(stack);
                 }

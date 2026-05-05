@@ -24,6 +24,7 @@ pub fn init(args: &[String], envs: &[String]) {
     const INIT_PID: Pid = 1;
 
     mark_page_fault_thread_context_ready();
+    crate::task::thread::init_thread_cache();
 
     axfs::set_symlink_follow_policy(crate::mounts::should_follow_symlink);
     pseudofs::mount_all().expect("Failed to mount pseudofs");

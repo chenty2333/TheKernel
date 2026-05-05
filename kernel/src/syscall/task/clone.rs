@@ -357,7 +357,7 @@ impl CloneArgs {
                 new_proc_data.proc.abort_fork();
             }
         };
-        let thr = Thread::new(tid, new_proc_data.clone());
+        let thr = Thread::new_cached(tid, new_proc_data.clone());
         let child_aspace = new_proc_data.aspace();
         if flags.contains(CloneFlags::CHILD_SETTID) && child_tid != 0 {
             if let Err(err) = vm_write_in_aspace(&child_aspace, child_tid as *mut Pid, tid) {

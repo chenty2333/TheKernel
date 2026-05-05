@@ -1,4 +1,5 @@
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use axsync::Mutex;
 use core::{
     cell::RefCell,
     ops::Deref,
@@ -258,6 +259,83 @@ pub trait AsThread {
     fn as_thread(&self) -> &Thread {
         self.try_as_thread().expect("kernel task")
     }
+}
+
+// ---- Thread object cache ----
+//
+// Box<Thread> allocations are recycled through a small Mutex-guarded cache
+// so that pthread-create-heavy workloads (libcbench) skip the allocator on
+// the hot path.  The cache is populated in the task reclamation path via
+// the axtask hook registered at init.
+
+struct ThreadCache {
+    free: Vec<Box<Thread>>,
+    max_cached: usize,
+}
+
+static THREAD_CACHE: Mutex<ThreadCache> = Mutex::new(ThreadCache::new());
+
+impl ThreadCache {
+    const fn new() -> Self {
+        Self {
+            free: Vec::new(),
+            max_cached: 32,
+        }
+    }
+
+    fn take(&mut self, tid: u32, proc_data: Arc<ProcessData>) -> Box<Thread> {
+        if let Some(mut thr) = self.free.pop() {
+            thr.reset_for_reuse(tid, proc_data);
+            thr
+        } else {
+            Thread::new(tid, proc_data)
+        }
+    }
+
+    fn recycle(&mut self, thr: Box<Thread>) {
+        if self.free.len() < self.max_cached {
+            self.free.push(thr);
+        }
+    }
+}
+
+impl Thread {
+    /// Create a new Thread, reusing a cached allocation when possible.
+    pub fn new_cached(tid: u32, proc_data: Arc<ProcessData>) -> Box<Self> {
+        THREAD_CACHE.lock().take(tid, proc_data)
+    }
+
+    /// Reinitialize a recycled Thread for reuse with a new identity.
+    fn reset_for_reuse(&mut self, tid: u32, proc_data: Arc<ProcessData>) {
+        // Drop old signal manager (releases reference to old ProcessData).
+        self.proc_data = proc_data;
+        self.signal = ThreadSignalManager::new(tid, self.proc_data.signal.clone());
+        self.visible_tid.store(tid, Ordering::Release);
+        self.clear_child_tid.store(0, Ordering::Relaxed);
+        self.robust_list_head.store(0, Ordering::Relaxed);
+        *self.time.0.borrow_mut() = TimeManager::new();
+        self.live_usage = AtomicTaskUsage::new();
+        self.proc_state_hint.store(ProcStateHint::None as u8, Ordering::Relaxed);
+        self.oom_score_adj.store(200, Ordering::Relaxed);
+        self.exit = Arc::new(AtomicBool::new(false));
+        self.accessing_user_memory.store(false, Ordering::Relaxed);
+        *self.restart.lock() = RestartTracker::default();
+        self.exit_event = Arc::default();
+    }
+}
+
+/// Recycle a Thread box into the global cache.  Called from the axtask
+/// reclamation hook so that Box memory is reused instead of freed.
+fn recycle_thread_box(ext: axtask::AxTaskExt) {
+    if let Ok(thr) = ext.into_impl::<Box<Thread>>() {
+        THREAD_CACHE.lock().recycle(thr);
+    }
+}
+
+/// Register the Thread recycling hook with axtask.  Must be called once
+/// before any user tasks are created.
+pub fn init_thread_cache() {
+    axtask::set_task_ext_recycle_hook(recycle_thread_box);
 }
 
 impl AsThread for TaskInner {

@@ -54,6 +54,24 @@ pub trait TaskExt {
     fn on_leave(&self) {}
 }
 
+#[cfg(feature = "task-ext")]
+static TASK_EXT_RECYCLE: axsync::Mutex<Option<fn(AxTaskExt)>> = axsync::Mutex::new(None);
+
+/// Set a hook that is called with each `AxTaskExt` just before it would be
+/// dropped during task reclamation.  The hook receives ownership and may
+/// recycle (cache) the extension object instead of dropping it.
+#[cfg(feature = "task-ext")]
+pub fn set_task_ext_recycle_hook(f: fn(AxTaskExt)) {
+    *TASK_EXT_RECYCLE.lock() = Some(f);
+}
+
+#[cfg(feature = "task-ext")]
+pub(crate) fn try_recycle_ext(ext: AxTaskExt) {
+    if let Some(hook) = *TASK_EXT_RECYCLE.lock() {
+        hook(ext);
+    }
+}
+
 /// The inner task structure.
 pub struct TaskInner {
     id: TaskId,
