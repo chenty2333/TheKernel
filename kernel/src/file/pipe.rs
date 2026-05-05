@@ -433,7 +433,33 @@ impl Pipe {
             return Ok(0);
         }
 
-        block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
+        // Fast synchronous path: grab the ring buffer directly. If data is
+        // available, copy it and return without the async poll/park overhead.
+        {
+            let cons = self.shared.buffer.lock();
+            let (left, right) = cons.as_slices();
+            if !left.is_empty() || !right.is_empty() {
+                let mut count = dst.write(left)?;
+                if count >= left.len() {
+                    count += dst.write(right)?;
+                }
+                unsafe { cons.advance_read_index(count) };
+                drop(cons);
+                if count > 0 {
+                    self.shared.poll_tx.wake();
+                }
+                return Ok(count);
+            }
+        }
+        if self.closed() {
+            return Ok(0);
+        }
+        if self.nonblocking() {
+            return Err(AxError::WouldBlock);
+        }
+
+        // Slow path: nothing available right now, wait via async poll.
+        block_on(poll_io(self, IoEvents::IN, false, || {
             let read = {
                 let cons = self.shared.buffer.lock();
                 let (left, right) = cons.as_slices();
@@ -467,9 +493,43 @@ impl Pipe {
             return Ok(0);
         }
 
+        // Fast synchronous path: try to write immediately into the ring buffer
+        // without entering the async poll/park machinery.
         let mut total_written = 0;
+        {
+            let mut prod = self.shared.buffer.lock();
+            let (left, right) = prod.vacant_slices_mut();
+            let left = unsafe {
+                core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
+            };
+            let right = unsafe {
+                core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len())
+            };
+            let mut count = src.read(left)?;
+            if count >= left.len() {
+                count += src.read(right)?;
+            }
+            if count > 0 {
+                unsafe { prod.advance_write_index(count) };
+                total_written = count;
+            }
+        }
+        if total_written > 0 {
+            self.shared.poll_rx.wake();
+            if total_written == size || self.nonblocking() {
+                return Ok(total_written);
+            }
+        }
+        if self.closed() {
+            raise_pipe();
+            return Err(AxError::BrokenPipe);
+        }
+        if self.nonblocking() {
+            return Err(AxError::WouldBlock);
+        }
 
-        block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
+        // Slow path: ring buffer full or partial write, wait for space.
+        block_on(poll_io(self, IoEvents::OUT, false, || {
             if self.closed() {
                 raise_pipe();
                 return Err(AxError::BrokenPipe);
