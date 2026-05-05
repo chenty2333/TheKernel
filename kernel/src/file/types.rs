@@ -1,0 +1,187 @@
+use alloc::{borrow::Cow, sync::Arc};
+use core::{ffi::c_int, time::Duration};
+
+use axerrno::{AxError, AxResult};
+use axfs_ng_vfs::DeviceId;
+use axio::prelude::*;
+use axpoll::{IoEvents, Pollable};
+use downcast_rs::{DowncastSync, impl_downcast};
+use linux_raw_sys::general::{S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, stat, statx, statx_timestamp};
+
+use super::{FileHandle, add_file_like, get_typed_file};
+
+#[derive(Debug, Clone, Copy)]
+pub struct Kstat {
+    pub dev: u64,
+    pub ino: u64,
+    pub nlink: u32,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub blksize: u32,
+    pub blocks: u64,
+    pub rdev: DeviceId,
+    pub atime: Duration,
+    pub mtime: Duration,
+    pub ctime: Duration,
+}
+
+impl Default for Kstat {
+    fn default() -> Self {
+        Self {
+            dev: 0,
+            ino: 1,
+            nlink: 1,
+            mode: 0,
+            uid: 1,
+            gid: 1,
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            rdev: DeviceId::default(),
+            atime: Duration::default(),
+            mtime: Duration::default(),
+            ctime: Duration::default(),
+        }
+    }
+}
+
+impl From<Kstat> for stat {
+    fn from(value: Kstat) -> Self {
+        // SAFETY: valid for stat
+        let mut stat: stat = unsafe { core::mem::zeroed() };
+        stat.st_dev = value.dev as _;
+        stat.st_ino = value.ino as _;
+        stat.st_nlink = value.nlink as _;
+        stat.st_mode = value.mode as _;
+        stat.st_uid = value.uid as _;
+        stat.st_gid = value.gid as _;
+        stat.st_size = value.size as _;
+        stat.st_blksize = value.blksize as _;
+        stat.st_blocks = value.blocks as _;
+        stat.st_rdev = value.rdev.0 as _;
+
+        stat.st_atime = value.atime.as_secs() as _;
+        stat.st_atime_nsec = value.atime.subsec_nanos() as _;
+        stat.st_mtime = value.mtime.as_secs() as _;
+        stat.st_mtime_nsec = value.mtime.subsec_nanos() as _;
+        stat.st_ctime = value.ctime.as_secs() as _;
+        stat.st_ctime_nsec = value.ctime.subsec_nanos() as _;
+
+        stat
+    }
+}
+
+impl From<Kstat> for statx {
+    fn from(value: Kstat) -> Self {
+        // SAFETY: valid for statx
+        let mut statx: statx = unsafe { core::mem::zeroed() };
+        statx.stx_blksize = value.blksize as _;
+        statx.stx_attributes = value.mode as _;
+        statx.stx_nlink = value.nlink as _;
+        statx.stx_uid = value.uid as _;
+        statx.stx_gid = value.gid as _;
+        statx.stx_mode = value.mode as _;
+        statx.stx_ino = value.ino as _;
+        statx.stx_size = value.size as _;
+        statx.stx_blocks = value.blocks as _;
+        statx.stx_rdev_major = value.rdev.major();
+        statx.stx_rdev_minor = value.rdev.minor();
+
+        fn time_to_statx(time: &Duration) -> statx_timestamp {
+            statx_timestamp {
+                tv_sec: time.as_secs() as _,
+                tv_nsec: time.subsec_nanos() as _,
+                __reserved: 0,
+            }
+        }
+        statx.stx_atime = time_to_statx(&value.atime);
+        statx.stx_ctime = time_to_statx(&value.ctime);
+        statx.stx_mtime = time_to_statx(&value.mtime);
+
+        statx.stx_dev_major = (value.dev >> 32) as _;
+        statx.stx_dev_minor = value.dev as _;
+
+        statx
+    }
+}
+
+pub trait WriteBuf: Write + IoBufMut {}
+impl<T: Write + IoBufMut> WriteBuf for T {}
+pub type IoDst<'a> = dyn WriteBuf + 'a;
+
+pub trait ReadBuf: Read + IoBuf {}
+impl<T: Read + IoBuf> ReadBuf for T {}
+pub type IoSrc<'a> = dyn ReadBuf + 'a;
+
+#[allow(dead_code)]
+pub trait FileLike: Pollable + DowncastSync {
+    fn read(&self, _dst: &mut IoDst) -> AxResult<usize> {
+        Err(AxError::InvalidInput)
+    }
+
+    fn write(&self, _src: &mut IoSrc) -> AxResult<usize> {
+        Err(AxError::InvalidInput)
+    }
+
+    fn stat(&self) -> AxResult<Kstat> {
+        Ok(Kstat::default())
+    }
+
+    fn path(&self) -> Cow<'_, str>;
+
+    fn ioctl(&self, _cmd: u32, _arg: usize) -> AxResult<usize> {
+        Err(AxError::NotATty)
+    }
+
+    fn nonblocking(&self) -> bool {
+        false
+    }
+
+    fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+        Ok(())
+    }
+
+    fn from_fd(fd: c_int) -> AxResult<FileHandle<Self>>
+    where
+        Self: Sized + 'static,
+    {
+        get_typed_file(fd)
+    }
+
+    fn add_to_fd_table(self, cloexec: bool) -> AxResult<c_int>
+    where
+        Self: Sized + 'static,
+    {
+        add_file_like(Arc::new(self), cloexec)
+    }
+}
+impl_downcast!(sync FileLike);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileLikeKind {
+    Regular,
+    Directory,
+    Fifo,
+    Socket,
+    Other,
+}
+
+impl FileLikeKind {
+    pub fn from_mode(mode: u32) -> Self {
+        match mode & S_IFMT {
+            S_IFREG => Self::Regular,
+            S_IFDIR => Self::Directory,
+            S_IFIFO => Self::Fifo,
+            S_IFSOCK => Self::Socket,
+            _ => Self::Other,
+        }
+    }
+
+    pub fn from_file_like(file: &dyn FileLike) -> Self {
+        file.stat()
+            .map(|stat| Self::from_mode(stat.mode))
+            .unwrap_or(Self::Other)
+    }
+}
