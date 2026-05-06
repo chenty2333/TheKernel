@@ -2606,6 +2606,40 @@ run_basic_group() {
     return "$ret"
 }
 
+run_busybox_group() {
+    root="$1"
+
+    [ -x "$root/busybox" ] || {
+        runner_debug "#### OSCOMP RUNNER MISSING BUSYBOX BIN ${root}/busybox ####"
+        return 127
+    }
+    [ -f "$root/busybox_cmd.txt" ] || {
+        runner_debug "#### OSCOMP RUNNER MISSING BUSYBOX CMD ${root}/busybox_cmd.txt ####"
+        return 127
+    }
+
+    if ! cd "$root"; then
+        return 125
+    fi
+
+    ./busybox cat ./busybox_cmd.txt | while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            more\ *)
+                eval "./busybox $line | ./busybox cat"
+                ;;
+            *)
+                eval "./busybox $line"
+                ;;
+        esac
+        ret=$?
+        if [ "$ret" -ne 0 ] && [ "$line" != "false" ]; then
+            echo "testcase busybox $line fail"
+        else
+            echo "testcase busybox $line success"
+        fi
+    done
+}
+
 prepare_lmbench_env() {
     root="$1"
     compat_dir=/code/lmbench_src/bin/build
@@ -2881,7 +2915,9 @@ group_timeout_secs() {
 runner_now_epoch() {
     RUNNER_NOW_EPOCH=""
     if [ -r /proc/uptime ]; then
-        now_epoch="$(bb awk '{print int($1)}' /proc/uptime 2>/dev/null || true)"
+        now_uptime=""
+        IFS=' ' read -r now_uptime _ </proc/uptime || now_uptime=""
+        now_epoch="${now_uptime%%.*}"
     else
         now_epoch=""
     fi
@@ -3379,6 +3415,11 @@ run_group_script() {
     if [ "$group" = "ltp" ]; then
         direct_group_output=1
     fi
+    case "$(runner_machine_quiet)" in
+        loongarch64)
+            direct_group_output=1
+            ;;
+    esac
 
     output_file="/tmp/oscomp-${group}-${flavor}.log"
     if [ "$direct_group_output" -eq 0 ]; then
@@ -3523,6 +3564,13 @@ run_group_script() {
             if [ "$group" = "basic" ]; then
                 emit_group_start "$group_marker"
                 run_basic_group "$root" "$script_shell"
+                group_status=$?
+                emit_group_end "$group_marker"
+                exit "$group_status"
+            fi
+            if [ "$group" = "busybox" ] && [ "$(runner_machine_quiet)" = "loongarch64" ]; then
+                emit_group_start "$group_marker"
+                run_busybox_group "$root"
                 group_status=$?
                 emit_group_end "$group_marker"
                 exit "$group_status"
