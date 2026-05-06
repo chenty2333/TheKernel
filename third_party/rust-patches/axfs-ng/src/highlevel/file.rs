@@ -1219,7 +1219,19 @@ impl FileBackend {
     pub fn set_len(&self, len: u64) -> VfsResult<()> {
         match self {
             Self::Cached(cached) => cached.set_len(len),
-            Self::Direct(loc) => loc.entry().as_file()?.set_len(len),
+            Self::Direct(loc) => {
+                let old_len = loc.entry().as_file()?.len()?;
+                loc.entry().as_file()?.set_len(len)?;
+                // If we shortened the file, invalidate cached pages beyond
+                // the new length so subsequent cached reads don't see stale
+                // data from before the truncation.
+                if len < old_len {
+                    if let Some(cached) = Self::get_cached_for(loc) {
+                        cached.invalidate_range(len, old_len - len);
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }
