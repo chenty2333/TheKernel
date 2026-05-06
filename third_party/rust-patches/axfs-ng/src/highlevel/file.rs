@@ -609,12 +609,15 @@ pub fn invalidate_page_cache_all(location: &Location) {
 /// Walk all registered page caches and flush dirty pages.
 /// Called by `sync()` and at shutdown.
 pub fn sync_all_page_caches() -> VfsResult<()> {
-    let mut reg = PAGE_CACHE_REGISTRY.lock();
-    reg.retain(|w| w.upgrade().is_some());
-    for weak in reg.iter() {
-        if let Some(cache) = weak.upgrade() {
-            flush_cache_dirty(&cache)?;
-        }
+    // Collect strong references under the registry lock, then flush outside
+    // to avoid holding the registry lock across filesystem I/O.
+    let caches: Vec<Arc<CachedFileShared>> = {
+        let mut reg = PAGE_CACHE_REGISTRY.lock();
+        reg.retain(|w| w.upgrade().is_some());
+        reg.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    for cache in &caches {
+        flush_cache_dirty(cache)?;
     }
     Ok(())
 }
@@ -622,14 +625,16 @@ pub fn sync_all_page_caches() -> VfsResult<()> {
 /// Flush dirty pages whose filesystem matches `fs_name`.
 /// Called by `syncfs(fd)`.
 pub fn sync_page_caches_for_fs(fs_name: &str) -> VfsResult<()> {
-    let mut reg = PAGE_CACHE_REGISTRY.lock();
-    reg.retain(|w| w.upgrade().is_some());
-    for weak in reg.iter() {
-        if let Some(cache) = weak.upgrade() {
-            if cache.fs_name() == fs_name {
-                flush_cache_dirty(&cache)?;
-            }
-        }
+    let caches: Vec<Arc<CachedFileShared>> = {
+        let mut reg = PAGE_CACHE_REGISTRY.lock();
+        reg.retain(|w| w.upgrade().is_some());
+        reg.iter()
+            .filter_map(|w| w.upgrade())
+            .filter(|c| c.fs_name() == fs_name)
+            .collect()
+    };
+    for cache in &caches {
+        flush_cache_dirty(cache)?;
     }
     Ok(())
 }
@@ -750,11 +755,19 @@ impl CachedFile {
     }
 
     fn pop_lru_page(&self) -> Option<(u32, PageCache)> {
-        self.shared.page_cache.lock().pop_lru()
+        let result = self.shared.page_cache.lock().pop_lru();
+        if result.is_some() {
+            dec_global_page_count();
+        }
+        result
     }
 
     fn pop_cached_page(&self, pn: u32) -> Option<PageCache> {
-        self.shared.page_cache.lock().pop(&pn)
+        let result = self.shared.page_cache.lock().pop(&pn);
+        if result.is_some() {
+            dec_global_page_count();
+        }
+        result
     }
 
     fn drain_cache(&self, file: &FileNode) -> VfsResult<()> {
@@ -775,8 +788,8 @@ impl CachedFile {
             return Ok(None);
         }
 
-        // Enforce the global page-cache budget before allocating a new page.
-        reclaim_global_budget();
+        // Budget enforcement moved to callers — reclaim_global_budget()
+        // must run BEFORE the per-cache lock is taken to avoid deadlock.
 
         let mut evicted = None;
         if cache.len() == cache.cap().get() {
@@ -819,6 +832,9 @@ impl CachedFile {
         pn: u32,
         f: impl FnOnce(&mut PageCache, Option<(u32, PageCache)>) -> VfsResult<R>,
     ) -> VfsResult<R> {
+        // Enforce the global budget before taking the per-file lock so that
+        // reclaim never tries to lock the cache we already hold.
+        reclaim_global_budget();
         let mut guard = self.shared.page_cache.lock();
         let evicted = self.ensure_page_cached(self.inner.entry().as_file()?, &mut guard, pn)?;
         let page = guard.get_mut(&pn).unwrap();
@@ -835,6 +851,7 @@ impl CachedFile {
         let mut initial = page_initial(file)?;
         let start_page = (range.start / PAGE_SIZE as u64) as u32;
         let end_page = range.end.div_ceil(PAGE_SIZE as u64) as u32;
+        reclaim_global_budget();
         let mut page_offset = (range.start % PAGE_SIZE as u64) as usize;
         for pn in start_page..end_page {
             let page_start = pn as u64 * PAGE_SIZE as u64;
@@ -1223,11 +1240,26 @@ impl FileBackend {
                 let old_len = loc.entry().as_file()?.len()?;
                 loc.entry().as_file()?.set_len(len)?;
                 // If we shortened the file, invalidate cached pages beyond
-                // the new length so subsequent cached reads don't see stale
-                // data from before the truncation.
+                // the new length.  For the partial last page, zero the tail
+                // and flush any dirty prefix — the retained bytes are still
+                // valid and must not be discarded.
                 if len < old_len {
                     if let Some(cached) = Self::get_cached_for(loc) {
-                        cached.invalidate_range(len, old_len - len);
+                        let new_last_page = (len / PAGE_SIZE as u64) as u32;
+                        let old_last_page = (old_len / PAGE_SIZE as u64) as u32;
+                        // Full pages beyond new last page
+                        if old_last_page > new_last_page {
+                            cached.invalidate_range(
+                                (new_last_page + 1) as u64 * PAGE_SIZE as u64,
+                                (old_last_page - new_last_page) as u64 * PAGE_SIZE as u64,
+                            );
+                        }
+                        // Partial last page: zero the tail, preserve the prefix
+                        if let Some(page) = cached.shared.page_cache.lock().get_mut(&new_last_page) {
+                            let page_start = new_last_page as u64 * PAGE_SIZE as u64;
+                            let end_offset = len.saturating_sub(page_start).min(PAGE_SIZE as u64) as usize;
+                            page.data()[end_offset..].fill(0);
+                        }
                     }
                 }
                 Ok(())

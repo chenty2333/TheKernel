@@ -494,9 +494,11 @@ impl Pipe {
         }
 
         // Fast synchronous path: try to write immediately into the ring buffer
-        // without entering the async poll/park machinery.
+        // without entering the async poll/park machinery.  Only attempt when
+        // a reader is still attached — writing into a closed pipe must fail
+        // with EPIPE (and SIGPIPE), not buffer unreadable bytes.
         let mut total_written = 0;
-        {
+        if !self.closed() {
             let mut prod = self.shared.buffer.lock();
             let (left, right) = prod.vacant_slices_mut();
             let left = unsafe {

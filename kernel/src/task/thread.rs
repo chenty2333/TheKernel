@@ -293,9 +293,17 @@ impl ThreadCache {
     }
 
     fn recycle(&mut self, thr: Box<Thread>) {
-        if self.free.len() < self.max_cached {
-            self.free.push(thr);
+        if self.free.len() >= self.max_cached {
+            return;
         }
+        // Only cache threads whose process is still alive (the ProcessData
+        // Arc has other owners).  If this was the last thread of a process,
+        // caching would keep the dead process's fd table and address space
+        // alive indefinitely.
+        if Arc::strong_count(&thr.proc_data) <= 1 {
+            return;
+        }
+        self.free.push(thr);
     }
 }
 

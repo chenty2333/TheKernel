@@ -91,6 +91,10 @@ pub fn init(args: &[String], envs: &[String]) {
     let exit_code = task.join();
     info!("Init process exited with code: {exit_code:?}");
 
+    // Flush dirty page caches before unmount so that writeback can still
+    // reach the filesystem.
+    let _ = axfs::sync_all_page_caches();
+
     let cx = FS_CONTEXT.lock();
     cx.root_dir()
         .unmount_all()
@@ -100,10 +104,6 @@ pub fn init(args: &[String], envs: &[String]) {
         .flush()
         .expect("Failed to flush rootfs");
     drop(cx);
-
-    // Flush all dirty page caches before power-off so that writeback
-    // data is not lost.
-    let _ = axfs::sync_all_page_caches();
 
     system_off();
 }
