@@ -300,7 +300,6 @@ impl ThreadCache {
         // naturally recycle the memory for the next Box<Thread> allocation.
         drop(thr);
     }
-    }
 }
 
 impl Thread {
@@ -332,8 +331,7 @@ impl Thread {
 /// reclamation hook so that Box memory is reused instead of freed.
 fn recycle_thread_box(ext: axtask::AxTaskExt) {
     let thr = ext.into_impl::<Box<Thread>>();
-        THREAD_CACHE.lock().recycle(thr);
-    }
+    THREAD_CACHE.lock().recycle(thr);
 }
 
 /// Register the Thread recycling hook with axtask.  Must be called once

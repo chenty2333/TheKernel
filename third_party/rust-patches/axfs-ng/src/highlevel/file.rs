@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use core::{num::NonZeroUsize, ops::Range, task::Context};
 
@@ -418,7 +418,7 @@ fn reclaim_global_budget() {
         }
         // Pop clean (non-dirty) pages from the LRU tail.
         loop {
-            let Some((pn, mut page)) = cache.pop_lru_if_clean() else {
+            let Some((pn, page)) = cache.pop_lru_if_clean() else {
                 break;
             };
             // Notify evict listeners before dropping the page so that mmap
@@ -511,7 +511,7 @@ impl CachedFileShared {
         let lru = guard.iter().find_map(|(pn, page)| {
             (!page.dirty).then_some(*pn)
         })?;
-        guard.pop(&lru)
+        guard.pop(&lru).map(|page| (lru, page))
     }
 }
 
@@ -585,6 +585,9 @@ fn register_cache(cache: &Arc<CachedFileShared>) {
 /// flushing dirty data.  For use after fallocate / truncate operations that
 /// have already modified the backing store.
 pub fn discard_page_cache(location: &Location, offset: u64, len: u64) {
+    if location.filesystem().name() == "tmpfs" {
+        return;
+    }
     let guard = location.user_data();
     if let Some(ud) = guard.get::<FileUserData>() {
         let shared = ud.get();
@@ -1058,7 +1061,7 @@ impl CachedFile {
         let end_pn = offset.saturating_add(len).div_ceil(PAGE_SIZE as u64) as u32;
         let mut guard = self.shared.page_cache.lock();
         for pn in start_pn..end_pn {
-            if let Some(mut page) = guard.pop(&pn) {
+            if let Some(page) = guard.pop(&pn) {
                 // Notify evict listeners (mmap backends) before dropping so
                 // they can unmap their PTEs that reference this physical page.
                 drop(guard);
