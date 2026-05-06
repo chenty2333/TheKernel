@@ -1,6 +1,7 @@
 use alloc::{borrow::Cow, format, string::ToString, sync::Arc, vec};
 use core::{
-    mem,
+    cell::UnsafeCell,
+    hint::spin_loop,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::Context,
 };
@@ -35,6 +36,179 @@ const RING_BUFFER_INIT_SIZE: usize = 65536; // 64 KiB
 
 static PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(RING_BUFFER_INIT_SIZE);
 
+struct AtomicGateGuard<'a>(&'a AtomicBool);
+
+impl Drop for AtomicGateGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn acquire_gate(gate: &AtomicBool) -> AtomicGateGuard<'_> {
+    while gate
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        spin_loop();
+    }
+    AtomicGateGuard(gate)
+}
+
+struct PipeBuffer {
+    buf: UnsafeCell<alloc::boxed::Box<[u8]>>,
+    capacity: AtomicUsize,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    read_gate: AtomicBool,
+    write_gate: AtomicBool,
+}
+
+unsafe impl Sync for PipeBuffer {}
+
+impl PipeBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            buf: UnsafeCell::new(vec![0; capacity].into_boxed_slice()),
+            capacity: AtomicUsize::new(capacity),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            read_gate: AtomicBool::new(false),
+            write_gate: AtomicBool::new(false),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity.load(Ordering::Acquire)
+    }
+
+    fn occupied_len(&self) -> usize {
+        self.tail
+            .load(Ordering::Acquire)
+            .saturating_sub(self.head.load(Ordering::Acquire))
+    }
+
+    fn vacant_len(&self) -> usize {
+        self.capacity().saturating_sub(self.occupied_len())
+    }
+
+    fn resize(&self, new_size: usize) -> AxResult<()> {
+        let _write = acquire_gate(&self.write_gate);
+        let _read = acquire_gate(&self.read_gate);
+
+        let old_cap = self.capacity();
+        if new_size == old_cap {
+            return Ok(());
+        }
+
+        let head = self.head.load(Ordering::Acquire);
+        let occupied = self.tail.load(Ordering::Acquire).saturating_sub(head);
+        if new_size < occupied {
+            return Err(AxError::ResourceBusy);
+        }
+
+        let old = unsafe { &*self.buf.get() };
+        let mut new = vec![0; new_size].into_boxed_slice();
+        let first = occupied.min(old_cap - head % old_cap);
+        new[..first].copy_from_slice(&old[head % old_cap..head % old_cap + first]);
+        if occupied > first {
+            new[first..occupied].copy_from_slice(&old[..occupied - first]);
+        }
+
+        unsafe { *self.buf.get() = new };
+        self.head.store(0, Ordering::Release);
+        self.tail.store(occupied, Ordering::Release);
+        self.capacity.store(new_size, Ordering::Release);
+        Ok(())
+    }
+
+    fn read_into(&self, dst: &mut IoDst) -> AxResult<usize> {
+        let _read = acquire_gate(&self.read_gate);
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+        let available = tail.saturating_sub(head);
+        if available == 0 || dst.is_full() {
+            return Ok(0);
+        }
+
+        let cap = self.capacity();
+        let count = available.min(dst.remaining_mut());
+        let start = head % cap;
+        let first = count.min(cap - start);
+        let buf = unsafe { &*self.buf.get() };
+        let mut copied = dst.write(&buf[start..start + first])?;
+        if copied == first && copied < count {
+            copied += dst.write(&buf[..count - first])?;
+        }
+        if copied > 0 {
+            self.head.store(head + copied, Ordering::Release);
+        }
+        Ok(copied)
+    }
+
+    fn write_from(&self, src: &mut IoSrc) -> AxResult<usize> {
+        let _write = acquire_gate(&self.write_gate);
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+        let vacant = self.capacity().saturating_sub(tail.saturating_sub(head));
+        if vacant == 0 || src.is_empty() {
+            return Ok(0);
+        }
+
+        let cap = self.capacity();
+        let count = vacant.min(src.remaining());
+        let start = tail % cap;
+        let first = count.min(cap - start);
+        let buf = unsafe { &mut *self.buf.get() };
+        let mut copied = src.read(&mut buf[start..start + first])?;
+        if copied == first && copied < count {
+            copied += src.read(&mut buf[..count - first])?;
+        }
+        if copied > 0 {
+            self.tail.store(tail + copied, Ordering::Release);
+        }
+        Ok(copied)
+    }
+
+    fn peek_vec(&self, len: usize) -> alloc::vec::Vec<u8> {
+        let _read = acquire_gate(&self.read_gate);
+        let head = self.head.load(Ordering::Acquire);
+        let available = self.tail.load(Ordering::Acquire).saturating_sub(head);
+        let count = len.min(available);
+        let cap = self.capacity();
+        let start = head % cap;
+        let first = count.min(cap - start);
+        let buf = unsafe { &*self.buf.get() };
+        let mut out = vec![0; count];
+        out[..first].copy_from_slice(&buf[start..start + first]);
+        if count > first {
+            out[first..].copy_from_slice(&buf[..count - first]);
+        }
+        out
+    }
+
+    fn write_slice(&self, src: &[u8]) -> usize {
+        let _write = acquire_gate(&self.write_gate);
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+        let vacant = self.capacity().saturating_sub(tail.saturating_sub(head));
+        let count = vacant.min(src.len());
+        if count == 0 {
+            return 0;
+        }
+
+        let cap = self.capacity();
+        let start = tail % cap;
+        let first = count.min(cap - start);
+        let buf = unsafe { &mut *self.buf.get() };
+        buf[start..start + first].copy_from_slice(&src[..first]);
+        if count > first {
+            buf[..count - first].copy_from_slice(&src[first..count]);
+        }
+        self.tail.store(tail + count, Ordering::Release);
+        count
+    }
+}
+
 fn pipe_capacity_limit() -> usize {
     PIPE_MAX_SIZE.load(Ordering::Relaxed).max(PAGE_SIZE_4K)
 }
@@ -47,7 +221,7 @@ fn default_pipe_capacity() -> usize {
 }
 
 struct Shared {
-    buffer: Mutex<HeapRb<u8>>,
+    buffer: PipeBuffer,
     poll_rx: PollSet,
     poll_tx: PollSet,
     poll_close: PollSet,
@@ -181,7 +355,7 @@ impl Drop for Pipe {
 impl Pipe {
     pub fn new() -> (Pipe, Pipe) {
         let shared = Arc::new(Shared {
-            buffer: Mutex::new(HeapRb::new(default_pipe_capacity())),
+            buffer: PipeBuffer::new(default_pipe_capacity()),
             poll_rx: PollSet::new(),
             poll_tx: PollSet::new(),
             poll_close: PollSet::new(),
@@ -212,7 +386,7 @@ impl Pipe {
     }
 
     pub fn capacity(&self) -> usize {
-        self.shared.buffer.lock().capacity().get()
+        self.shared.buffer.capacity()
     }
 
     pub fn resize(&self, new_size: usize) -> AxResult<()> {
@@ -224,18 +398,7 @@ impl Pipe {
             return Err(AxError::OperationNotPermitted);
         }
 
-        let mut buffer = self.shared.buffer.lock();
-        if new_size == buffer.capacity().get() {
-            return Ok(());
-        }
-        if new_size < buffer.occupied_len() {
-            return Err(AxError::ResourceBusy);
-        }
-        let old_buffer = mem::replace(&mut *buffer, HeapRb::new(new_size));
-        let (left, right) = old_buffer.as_slices();
-        buffer.push_slice(left);
-        buffer.push_slice(right);
-        Ok(())
+        self.shared.buffer.resize(new_size)
     }
 
     pub fn vmsplice_read(&self, dst: &mut IoDst, nonblocking: bool) -> AxResult<usize> {
@@ -247,16 +410,7 @@ impl Pipe {
         }
 
         block_on(poll_io(self, IoEvents::IN, nonblocking, || {
-            let read = {
-                let cons = self.shared.buffer.lock();
-                let (left, right) = cons.as_slices();
-                let mut count = dst.write(left)?;
-                if count >= left.len() {
-                    count += dst.write(right)?;
-                }
-                unsafe { cons.advance_read_index(count) };
-                count
-            };
+            let read = self.shared.buffer.read_into(dst)?;
             if read > 0 {
                 self.shared.poll_tx.wake();
                 Ok(read)
@@ -282,22 +436,7 @@ impl Pipe {
                 return Err(AxError::BrokenPipe);
             }
 
-            let written = {
-                let mut prod = self.shared.buffer.lock();
-                let (left, right) = prod.vacant_slices_mut();
-                let left = unsafe {
-                    core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
-                };
-                let right = unsafe {
-                    core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len())
-                };
-                let mut count = src.read(left)?;
-                if count >= left.len() {
-                    count += src.read(right)?;
-                }
-                unsafe { prod.advance_write_index(count) };
-                count
-            };
+            let written = self.shared.buffer.write_from(src)?;
             if written > 0 {
                 self.shared.poll_rx.wake();
                 Ok(written)
@@ -326,11 +465,8 @@ impl Pipe {
         impl Pollable for TeePoll<'_> {
             fn poll(&self) -> IoEvents {
                 let mut events = IoEvents::empty();
-                let src = self.src.shared.buffer.lock();
-                events.set(IoEvents::IN, src.occupied_len() > 0);
-                drop(src);
-                let dst = self.dst.shared.buffer.lock();
-                events.set(IoEvents::OUT, dst.vacant_len() > 0);
+                events.set(IoEvents::IN, self.src.shared.buffer.occupied_len() > 0);
+                events.set(IoEvents::OUT, self.dst.shared.buffer.vacant_len() > 0);
                 events
             }
 
@@ -365,7 +501,7 @@ impl Pipe {
                     return Ok(total_copied);
                 }
 
-                let src_available = self.shared.buffer.lock().occupied_len();
+                let src_available = self.shared.buffer.occupied_len();
                 if src_available == 0 {
                     return if self.closed() {
                         Ok(total_copied)
@@ -374,45 +510,19 @@ impl Pipe {
                     };
                 }
 
-                let dst_space = out.shared.buffer.lock().vacant_len();
+                let dst_space = out.shared.buffer.vacant_len();
                 if dst_space == 0 {
                     return Err(AxError::WouldBlock);
                 }
 
                 let to_copy = remaining.min(src_available).min(dst_space);
-                let mut tmp = vec![0u8; to_copy];
-                {
-                    let src = self.shared.buffer.lock();
-                    let (left, right) = src.as_slices();
-                    let first = left.len().min(to_copy);
-                    tmp[..first].copy_from_slice(&left[..first]);
-                    let second = to_copy - first;
-                    if second > 0 {
-                        tmp[first..].copy_from_slice(&right[..second]);
-                    }
-                }
-                {
-                    let mut dst = out.shared.buffer.lock();
-                    let (left, right) = dst.vacant_slices_mut();
-                    let left = unsafe {
-                        core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
-                    };
-                    let right = unsafe {
-                        core::slice::from_raw_parts_mut(
-                            right.as_mut_ptr().cast::<u8>(),
-                            right.len(),
-                        )
-                    };
-                    let first = left.len().min(to_copy);
-                    left[..first].copy_from_slice(&tmp[..first]);
-                    let second = to_copy - first;
-                    if second > 0 {
-                        right[..second].copy_from_slice(&tmp[first..]);
-                    }
-                    unsafe { dst.advance_write_index(to_copy) };
+                let tmp = self.shared.buffer.peek_vec(to_copy);
+                let copied = out.shared.buffer.write_slice(&tmp);
+                if copied == 0 {
+                    return Err(AxError::WouldBlock);
                 }
                 out.shared.poll_rx.wake();
-                total_copied += to_copy;
+                total_copied += copied;
                 if total_copied == len || nonblocking {
                     Ok(total_copied)
                 } else {
@@ -433,23 +543,12 @@ impl Pipe {
             return Ok(0);
         }
 
-        // Fast synchronous path: grab the ring buffer directly. If data is
-        // available, copy it and return without the async poll/park overhead.
-        {
-            let cons = self.shared.buffer.lock();
-            let (left, right) = cons.as_slices();
-            if !left.is_empty() || !right.is_empty() {
-                let mut count = dst.write(left)?;
-                if count >= left.len() {
-                    count += dst.write(right)?;
-                }
-                unsafe { cons.advance_read_index(count) };
-                drop(cons);
-                if count > 0 {
-                    self.shared.poll_tx.wake();
-                }
-                return Ok(count);
-            }
+        // Fast synchronous path: copy immediately without entering the async
+        // poll/park machinery.
+        let count = self.shared.buffer.read_into(dst)?;
+        if count > 0 {
+            self.shared.poll_tx.wake();
+            return Ok(count);
         }
         if self.closed() {
             return Ok(0);
@@ -460,16 +559,7 @@ impl Pipe {
 
         // Slow path: nothing available right now, wait via async poll.
         block_on(poll_io(self, IoEvents::IN, false, || {
-            let read = {
-                let cons = self.shared.buffer.lock();
-                let (left, right) = cons.as_slices();
-                let mut count = dst.write(left)?;
-                if count >= left.len() {
-                    count += dst.write(right)?;
-                }
-                unsafe { cons.advance_read_index(count) };
-                count
-            };
+            let read = self.shared.buffer.read_into(dst)?;
             if read > 0 {
                 self.shared.poll_tx.wake();
                 Ok(read)
@@ -499,22 +589,7 @@ impl Pipe {
         // with EPIPE (and SIGPIPE), not buffer unreadable bytes.
         let mut total_written = 0;
         if !self.closed() {
-            let mut prod = self.shared.buffer.lock();
-            let (left, right) = prod.vacant_slices_mut();
-            let left = unsafe {
-                core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
-            };
-            let right = unsafe {
-                core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len())
-            };
-            let mut count = src.read(left)?;
-            if count >= left.len() {
-                count += src.read(right)?;
-            }
-            if count > 0 {
-                unsafe { prod.advance_write_index(count) };
-                total_written = count;
-            }
+            total_written = self.shared.buffer.write_from(src)?;
         }
         if total_written > 0 {
             self.shared.poll_rx.wake();
@@ -537,22 +612,7 @@ impl Pipe {
                 return Err(AxError::BrokenPipe);
             }
 
-            let written = {
-                let mut prod = self.shared.buffer.lock();
-                let (left, right) = prod.vacant_slices_mut();
-                let left = unsafe {
-                    core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
-                };
-                let right = unsafe {
-                    core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len())
-                };
-                let mut count = src.read(left)?;
-                if count >= left.len() {
-                    count += src.read(right)?;
-                }
-                unsafe { prod.advance_write_index(count) };
-                count
-            };
+            let written = self.shared.buffer.write_from(src)?;
             if written > 0 {
                 self.shared.poll_rx.wake();
                 total_written += written;
@@ -672,7 +732,7 @@ impl FileLike for Pipe {
     fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
         match cmd {
             FIONREAD => {
-                (arg as *mut u32).vm_write(self.shared.buffer.lock().occupied_len() as u32)?;
+                (arg as *mut u32).vm_write(self.shared.buffer.occupied_len() as u32)?;
                 Ok(0)
             }
             _ => Err(AxError::NotATty),
@@ -683,12 +743,11 @@ impl FileLike for Pipe {
 impl Pollable for Pipe {
     fn poll(&self) -> IoEvents {
         let mut events = IoEvents::empty();
-        let buf = self.shared.buffer.lock();
         if self.read_side {
-            events.set(IoEvents::IN, buf.occupied_len() > 0);
+            events.set(IoEvents::IN, self.shared.buffer.occupied_len() > 0);
             events.set(IoEvents::HUP, self.closed());
         } else {
-            events.set(IoEvents::OUT, buf.vacant_len() > 0);
+            events.set(IoEvents::OUT, self.shared.buffer.vacant_len() > 0);
         }
         events
     }
