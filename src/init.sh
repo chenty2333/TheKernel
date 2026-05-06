@@ -3367,8 +3367,15 @@ run_group_script() {
     fi
 
     timeout_secs="$RUNNER_GROUP_TIMEOUT_SECS"
+    direct_group_output=0
+    if [ "$group" = "ltp" ]; then
+        direct_group_output=1
+    fi
+
     output_file="/tmp/oscomp-${group}-${flavor}.log"
-    : > "$output_file"
+    if [ "$direct_group_output" -eq 0 ]; then
+        : > "$output_file"
+    fi
     capture_process_snapshot
     run_dir="$root"
     run_script_name="${script##*/}"
@@ -3395,6 +3402,14 @@ run_group_script() {
 
     prime_group_output_stream
     STREAM_GROUP_OUTPUT_FRAGMENT=""
+
+    if [ "$direct_group_output" -eq 1 ]; then
+        exec 3>&1
+        exec 4>&2
+    else
+        exec 3>"$output_file"
+        exec 4>&3
+    fi
 
     (
         cd "$run_dir" || exit 125
@@ -3522,14 +3537,18 @@ run_group_script() {
 
         run_clean_shell_script "$exec_shell" "$exec_script" </dev/null
         exit $?
-    ) </dev/null >"$output_file" 2>&1 &
+    ) </dev/null >&3 2>&4 &
     runner_pid=$!
+    exec 3>&-
+    exec 4>&-
     timed_out=""
     elapsed=0
     streamed_bytes=0
     while kill -0 "$runner_pid" 2>/dev/null; do
-        stream_group_output_incremental "$output_file" "$streamed_bytes"
-        streamed_bytes="$STREAM_GROUP_OUTPUT_BYTES"
+        if [ "$direct_group_output" -eq 0 ]; then
+            stream_group_output_incremental "$output_file" "$streamed_bytes"
+            streamed_bytes="$STREAM_GROUP_OUTPUT_BYTES"
+        fi
         if [ "$elapsed" -ge "$timeout_secs" ]; then
             timed_out=1
             runner_debug "#### OSCOMP RUNNER TIMEOUT ${script} AFTER ${timeout_secs}s ####"
@@ -3551,8 +3570,10 @@ run_group_script() {
     fi
     runner_debug "#### OSCOMP RUNNER GROUP WAIT DONE ${script} STATUS ${status} ####"
     refresh_runner_timeout_state
-    stream_group_output_incremental "$output_file" "$streamed_bytes"
-    flush_group_output_fragment
+    if [ "$direct_group_output" -eq 0 ]; then
+        stream_group_output_incremental "$output_file" "$streamed_bytes"
+        flush_group_output_fragment
+    fi
     runner_debug "#### OSCOMP RUNNER POST GROUP QUIESCE BEGIN ${script} ####"
     runner_quiesce_rounds "${OSCOMP_POST_GROUP_QUIESCE_ROUNDS:-128}"
     runner_debug "#### OSCOMP RUNNER POST GROUP QUIESCE END ${script} ####"
@@ -3581,7 +3602,9 @@ run_group_script() {
         runner_debug "#### OSCOMP RUNNER SETTLE IOZONE END ${script} ####"
     fi
     runner_debug "#### OSCOMP RUNNER END ${script} STATUS ${status} ####"
-    bb rm -f "$output_file" 2>/dev/null || true
+    if [ "$direct_group_output" -eq 0 ]; then
+        bb rm -f "$output_file" 2>/dev/null || true
+    fi
     return "$status"
 }
 
