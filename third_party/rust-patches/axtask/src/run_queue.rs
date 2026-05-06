@@ -877,13 +877,11 @@ pub(crate) fn reclaim_exited_tasks_current_cpu() {
             Ok(task) => {
                 let mut task = task.into_inner();
                 #[cfg(feature = "task-ext")]
-                if let Some(ext) = task.task_ext_mut().take() {
-                    crate::task::try_recycle_ext(ext);
-                }
+                let _ = task.task_ext_mut().take();
                 if let Some(stack) = task.take_kernel_stack() {
                     recycle_task_stack(stack);
                 }
-                drop(task);
+                task.recycle_for_cache();
             }
             Err(task) => {
                 // Still held by a joiner or scheduler handoff; push back for a

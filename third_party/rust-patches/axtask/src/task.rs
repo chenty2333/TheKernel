@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, string::String, sync::Arc};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 #[cfg(feature = "preempt")]
 use core::sync::atomic::AtomicUsize;
 use core::{
@@ -52,24 +52,6 @@ pub trait TaskExt {
     fn on_enter(&self) {}
     /// Called when the task is switched out.
     fn on_leave(&self) {}
-}
-
-#[cfg(feature = "task-ext")]
-static TASK_EXT_RECYCLE: spin::Mutex<Option<fn(AxTaskExt)>> = spin::Mutex::new(None);
-
-/// Set a hook that is called with each `AxTaskExt` just before it would be
-/// dropped during task reclamation.  The hook receives ownership and may
-/// recycle (cache) the extension object instead of dropping it.
-#[cfg(feature = "task-ext")]
-pub fn set_task_ext_recycle_hook(f: fn(AxTaskExt)) {
-    *TASK_EXT_RECYCLE.lock() = Some(f);
-}
-
-#[cfg(feature = "task-ext")]
-pub(crate) fn try_recycle_ext(ext: AxTaskExt) {
-    if let Some(hook) = *TASK_EXT_RECYCLE.lock() {
-        hook(ext);
-    }
 }
 
 /// The inner task structure.
@@ -139,6 +121,39 @@ impl From<u8> for TaskState {
 
 unsafe impl Send for TaskInner {}
 unsafe impl Sync for TaskInner {}
+
+#[cfg(not(feature = "tls"))]
+struct TaskInnerCache {
+    free: Vec<TaskInner>,
+    max_cached: usize,
+}
+
+#[cfg(not(feature = "tls"))]
+static TASK_INNER_CACHE: spin::Mutex<TaskInnerCache> = spin::Mutex::new(TaskInnerCache::new());
+
+#[cfg(not(feature = "tls"))]
+impl TaskInnerCache {
+    const fn new() -> Self {
+        Self {
+            free: Vec::new(),
+            max_cached: 128,
+        }
+    }
+
+    fn take(&mut self, id: TaskId, name: String) -> Result<TaskInner, String> {
+        let Some(mut task) = self.free.pop() else {
+            return Err(name);
+        };
+        task.reset_common(id, name);
+        Ok(task)
+    }
+
+    fn recycle(&mut self, task: TaskInner) {
+        if self.free.len() < self.max_cached {
+            self.free.push(task);
+        }
+    }
+}
 
 impl TaskInner {
     /// Create a new task with the given entry function and stack size.
@@ -288,6 +303,12 @@ impl TaskInner {
 // private methods
 impl TaskInner {
     fn new_common(id: TaskId, name: String) -> Self {
+        #[cfg(not(feature = "tls"))]
+        let name = match TASK_INNER_CACHE.lock().take(id, name) {
+            Ok(task) => return task,
+            Err(name) => name,
+        };
+
         Self {
             id,
             name: SpinNoIrq::new(name),
@@ -317,6 +338,34 @@ impl TaskInner {
         }
     }
 
+    #[cfg(not(feature = "tls"))]
+    fn reset_common(&mut self, id: TaskId, name: String) {
+        self.id = id;
+        *self.name.lock() = name;
+        self.is_idle = false;
+        self.is_init = false;
+        self.entry = Cell::new(None);
+        self.state.store(TaskState::Ready as u8, Ordering::Release);
+        *self.cpumask.lock() = crate::api::cpu_mask_full();
+        self.cpu_id.store(0, Ordering::Release);
+        #[cfg(feature = "smp")]
+        self.on_cpu.store(false, Ordering::Release);
+        #[cfg(feature = "preempt")]
+        self.need_resched.store(false, Ordering::Release);
+        #[cfg(feature = "preempt")]
+        self.preempt_disable_count.store(0, Ordering::Release);
+        self.interrupted.store(false, Ordering::Release);
+        self.interrupt_waker = AtomicWaker::new();
+        self.exit_code.store(0, Ordering::Release);
+        self.wait_for_exit = AtomicWaker::new();
+        self.kstack = None;
+        self.ctx = UnsafeCell::new(TaskContext::new());
+        #[cfg(feature = "task-ext")]
+        {
+            self.task_ext = None;
+        }
+    }
+
     /// Creates an "init task" using the current CPU states, to use as the
     /// current task.
     ///
@@ -338,6 +387,29 @@ impl TaskInner {
 
     pub(crate) fn into_arc(self) -> AxTaskRef {
         Arc::new(AxTask::new(self))
+    }
+
+    #[cfg(not(feature = "tls"))]
+    pub(crate) fn recycle_for_cache(self) {
+        if self.is_idle || self.is_init {
+            return;
+        }
+        if self.kstack.is_some() {
+            return;
+        }
+        if self.entry.take().is_some() {
+            return;
+        }
+        #[cfg(feature = "task-ext")]
+        if self.task_ext.is_some() {
+            return;
+        }
+        TASK_INNER_CACHE.lock().recycle(self);
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) fn recycle_for_cache(self) {
+        drop(self);
     }
 
     /// Returns the current state of the task.

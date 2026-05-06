@@ -22,7 +22,6 @@ pub use self::{
 
 // Re-exports from split sub-modules — keep the old `crate::task::*` paths unchanged.
 pub use self::thread::{AsThread, AssumeSync, Thread};
-pub(crate) use self::thread::init_thread_cache;
 pub(crate) use self::thread::ProcStateHint;
 pub(crate) use self::creds::{CapabilityState, Credentials};
 pub(crate) use self::jobctl::ContinueResult;
