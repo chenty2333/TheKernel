@@ -293,17 +293,13 @@ impl ThreadCache {
     }
 
     fn recycle(&mut self, thr: Box<Thread>) {
-        if self.free.len() >= self.max_cached {
-            return;
-        }
-        // Only cache threads whose process is still alive (the ProcessData
-        // Arc has other owners).  If this was the last thread of a process,
-        // caching would keep the dead process's fd table and address space
-        // alive indefinitely.
-        if Arc::strong_count(&thr.proc_data) <= 1 {
-            return;
-        }
-        self.free.push(thr);
+        // Thread objects carry Arc references to ProcessData and signal
+        // state that would keep dead processes alive if cached.  Instead
+        // of caching full Threads, we only cache the Box allocation memory
+        // by dropping the Thread now — the allocator's free list will
+        // naturally recycle the memory for the next Box<Thread> allocation.
+        drop(thr);
+    }
     }
 }
 
@@ -335,7 +331,7 @@ impl Thread {
 /// Recycle a Thread box into the global cache.  Called from the axtask
 /// reclamation hook so that Box memory is reused instead of freed.
 fn recycle_thread_box(ext: axtask::AxTaskExt) {
-    if let Ok(thr) = ext.into_impl::<Box<Thread>>() {
+    let thr = ext.into_impl::<Box<Thread>>();
         THREAD_CACHE.lock().recycle(thr);
     }
 }

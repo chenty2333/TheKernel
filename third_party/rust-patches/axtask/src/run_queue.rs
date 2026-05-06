@@ -877,7 +877,7 @@ pub(crate) fn reclaim_exited_tasks_current_cpu() {
             Ok(task) => {
                 let mut task = task.into_inner();
                 #[cfg(feature = "task-ext")]
-                if let Some(ext) = task.task_ext.take() {
+                if let Some(ext) = task.task_ext_mut().take() {
                     crate::task::try_recycle_ext(ext);
                 }
                 if let Some(stack) = task.take_kernel_stack() {

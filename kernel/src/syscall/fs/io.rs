@@ -443,8 +443,9 @@ pub fn sys_fallocate(
                 return Err(AxError::OperationNotSupported);
             }
             // The hole punch modifies on-disk state directly — discard any
-            // cached pages in the range to keep the cache coherent.
-            let _ = axfs::invalidate_page_cache(&loc, offset, len);
+            // cached pages in the range without flushing (old dirty data
+            // must not overwrite the punched hole).
+            axfs::discard_page_cache(&loc, offset, len);
         }
         mode if mode == FALLOC_FL_ZERO_RANGE
             || mode == (FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE) =>
@@ -463,9 +464,9 @@ pub fn sys_fallocate(
             let zero_len = zero_end.saturating_sub(offset);
             write_zero_range(file, offset, zero_len)?;
             let _ = tmp::reserve_fallocate_range(&loc, offset, zero_len, false);
-            // Zero range modifies on-disk data — invalidate cached pages
-            // in the range so the cache stays coherent.
-            let _ = axfs::invalidate_page_cache(&loc, offset, zero_len);
+            // Discard cached pages in the zeroed range without flushing
+            // (the backing store already has the correct zeros).
+            axfs::discard_page_cache(&loc, offset, zero_len);
         }
         FALLOC_FL_COLLAPSE_RANGE => {
             if len == 0
@@ -486,9 +487,8 @@ pub fn sys_fallocate(
                 return Err(AxError::OperationNotSupported);
             }
             backend.set_len(size - len)?;
-            // Collapse shifts data within the file — invalidate the entire
-            // affected range so the cache doesn't serve stale pages.
-            let _ = axfs::invalidate_page_cache(&loc, offset, size - offset);
+            // Collapse shifts data — discard cache without flushing.
+            axfs::discard_page_cache(&loc, offset, size - offset);
         }
         _ => return Err(AxError::InvalidInput),
     }

@@ -418,9 +418,14 @@ fn reclaim_global_budget() {
         }
         // Pop clean (non-dirty) pages from the LRU tail.
         loop {
-            let Some((pn, page)) = cache.pop_lru_if_clean() else {
+            let Some((pn, mut page)) = cache.pop_lru_if_clean() else {
                 break;
             };
+            // Notify evict listeners before dropping the page so that mmap
+            // backends can unmap PTEs pointing to this physical page.
+            for listener in cache.evict_listeners.lock().iter() {
+                (listener.listener)(pn, &page);
+            }
             dec_global_page_count();
             drop(page);
             freed += 1;
@@ -459,6 +464,7 @@ struct CachedFileShared {
     fs_name: String,
     inner: Location,
     last_access_tick: AtomicU64,
+    in_memory: bool,
 }
 
 impl CachedFileShared {
@@ -469,6 +475,7 @@ impl CachedFileShared {
             fs_name: fs_name.into(),
             inner: location.clone(),
             last_access_tick: AtomicU64::new(0),
+            in_memory: fs_name == "tmpfs",
         }
     }
 
@@ -479,6 +486,7 @@ impl CachedFileShared {
             fs_name: fs_name.into(),
             inner: location.clone(),
             last_access_tick: AtomicU64::new(0),
+            in_memory: fs_name == "tmpfs",
         }
     }
 
@@ -573,6 +581,23 @@ fn register_cache(cache: &Arc<CachedFileShared>) {
     reg.push(Arc::downgrade(cache));
 }
 
+/// Discard cached pages for `location` in `[offset, offset+len)` without
+/// flushing dirty data.  For use after fallocate / truncate operations that
+/// have already modified the backing store.
+pub fn discard_page_cache(location: &Location, offset: u64, len: u64) {
+    let guard = location.user_data();
+    if let Some(ud) = guard.get::<FileUserData>() {
+        let shared = ud.get();
+        let cached = CachedFile {
+            inner: location.clone(),
+            shared,
+            in_memory: location.filesystem().name() == "tmpfs",
+            append_lock: RwLock::new(()),
+        };
+        cached.invalidate_range(offset, len);
+    }
+}
+
 /// Flush dirty pages for `location` and discard the affected cache range.
 /// Called by O_DIRECT writes and external truncate operations to keep the
 /// page cache coherent with the on-disk state.
@@ -640,6 +665,9 @@ pub fn sync_page_caches_for_fs(fs_name: &str) -> VfsResult<()> {
 }
 
 fn flush_cache_dirty(cache: &CachedFileShared) -> VfsResult<()> {
+    if cache.in_memory {
+        return Ok(());
+    }
     let file = cache.inner.entry().as_file()?;
     let mut guard = cache.page_cache.lock();
     let dirty_pages: Vec<u32> = guard
@@ -754,25 +782,27 @@ impl CachedFile {
         Ok(())
     }
 
+    /// Remove and drop a page from the cache, notifying evict listeners and
+    /// maintaining the global page counter.  This is the single path through
+    /// which all page removals should flow.
+    fn remove_page(&self, file: &FileNode, pn: u32, page: &mut PageCache) -> VfsResult<()> {
+        self.evict_cache(file, pn, page)?;
+        dec_global_page_count();
+        // Page is consumed by the caller who already removed it from the LRU.
+        Ok(())
+    }
+
     fn pop_lru_page(&self) -> Option<(u32, PageCache)> {
-        let result = self.shared.page_cache.lock().pop_lru();
-        if result.is_some() {
-            dec_global_page_count();
-        }
-        result
+        self.shared.page_cache.lock().pop_lru()
     }
 
     fn pop_cached_page(&self, pn: u32) -> Option<PageCache> {
-        let result = self.shared.page_cache.lock().pop(&pn);
-        if result.is_some() {
-            dec_global_page_count();
-        }
-        result
+        self.shared.page_cache.lock().pop(&pn)
     }
 
     fn drain_cache(&self, file: &FileNode) -> VfsResult<()> {
         while let Some((pn, mut page)) = self.pop_lru_page() {
-            self.evict_cache(file, pn, &mut page)?;
+            self.remove_page(file, pn, &mut page)?;
         }
         Ok(())
     }
@@ -875,7 +905,7 @@ impl CachedFile {
     /// Reads data from the file at `offset` into `dst`.
     pub fn read_at(&self, mut dst: impl Write + IoBufMut, offset: u64) -> VfsResult<usize> {
         let len = self.inner.len()?;
-        let end = (offset + dst.remaining_mut() as u64).min(len);
+        let end = (offset.saturating_add(dst.remaining_mut() as u64)).min(len);
         if end <= offset {
             return Ok(0);
         }
@@ -891,7 +921,7 @@ impl CachedFile {
     }
 
     fn write_at_locked(&self, mut buf: impl Read + IoBuf, offset: u64) -> VfsResult<usize> {
-        let end = offset + buf.remaining() as u64;
+        let end = offset.saturating_add(buf.remaining() as u64);
         self.with_pages(
             offset..end,
             |file| {
@@ -1000,7 +1030,7 @@ impl CachedFile {
         }
         let file = self.inner.entry().as_file()?;
         let start_pn = (offset / PAGE_SIZE as u64) as u32;
-        let end_pn = (offset + len).div_ceil(PAGE_SIZE as u64) as u32;
+        let end_pn = offset.saturating_add(len).div_ceil(PAGE_SIZE as u64) as u32;
         let mut guard = self.shared.page_cache.lock();
         for pn in start_pn..end_pn {
             if let Some(page) = guard.get_mut(&pn) {
@@ -1025,12 +1055,19 @@ impl CachedFile {
             return;
         }
         let start_pn = (offset / PAGE_SIZE as u64) as u32;
-        let end_pn = (offset + len).div_ceil(PAGE_SIZE as u64) as u32;
+        let end_pn = offset.saturating_add(len).div_ceil(PAGE_SIZE as u64) as u32;
         let mut guard = self.shared.page_cache.lock();
         for pn in start_pn..end_pn {
-            if let Some(page) = guard.pop(&pn) {
+            if let Some(mut page) = guard.pop(&pn) {
+                // Notify evict listeners (mmap backends) before dropping so
+                // they can unmap their PTEs that reference this physical page.
+                drop(guard);
+                for listener in self.shared.evict_listeners.lock().iter() {
+                    (listener.listener)(pn, &page);
+                }
                 dec_global_page_count();
                 drop(page);
+                guard = self.shared.page_cache.lock();
             }
         }
     }
@@ -1189,6 +1226,14 @@ impl FileBackend {
         match self {
             Self::Cached(cached) => cached.append(src),
             Self::Direct(loc) => {
+                let old_len = loc.entry().as_file()?.len()?;
+                // Flush dirty cached pages that overlap the old EOF page
+                // before appending beyond it through the direct backend.
+                let data_len = src.remaining() as u64;
+                if let Some(cached) = Self::get_cached_for(loc) {
+                    cached.flush_and_invalidate_range(old_len, data_len)?;
+                }
+
                 let file = loc.entry().as_file()?;
                 let mut total = 0;
                 let mut end = file.len()?;

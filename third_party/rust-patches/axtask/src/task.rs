@@ -55,7 +55,7 @@ pub trait TaskExt {
 }
 
 #[cfg(feature = "task-ext")]
-static TASK_EXT_RECYCLE: axsync::Mutex<Option<fn(AxTaskExt)>> = axsync::Mutex::new(None);
+static TASK_EXT_RECYCLE: spin::Mutex<Option<fn(AxTaskExt)>> = spin::Mutex::new(None);
 
 /// Set a hook that is called with each `AxTaskExt` just before it would be
 /// dropped during task reclamation.  The hook receives ownership and may

@@ -429,7 +429,13 @@ impl BackendOps for CowBackend {
         let materialized = pt.drain_present_leaves(range.start, range.size())?;
         for (_addr, frame, _flags, page_size) in materialized {
             assert_eq!(page_size, self.size);
-            if let Some(frame_ref) = FRAME_TABLE[frame_shard(frame)].lock().get_frame_ref(frame) {
+            // Extract the frame reference into a local so the FRAME_TABLE
+            // shard lock is released before drop_frame potentially re-locks
+            // the same shard when the refcount hits zero.
+            let frame_ref = {
+                FRAME_TABLE[frame_shard(frame)].lock().get_frame_ref(frame)
+            };
+            if let Some(frame_ref) = frame_ref {
                 let mut frame_ref = frame_ref.lock();
                 frame_ref.drop_frame(frame, self.size);
             } else {
