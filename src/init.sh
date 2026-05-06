@@ -128,13 +128,18 @@ run_clean_shell_script() {
 }
 
 ltp_case_output_mode() {
-    LTP_CASE_OUTPUT_MODE=stream
+    LTP_CASE_OUTPUT_MODE=quiet
 
     case "${OSCOMP_LTP_CASE_OUTPUT_MODE:-}" in
-        ""|stream|full|verbose)
+        "")
             ;;
-        buffered|capture|quiet)
+        stream|full|verbose)
+            LTP_CASE_OUTPUT_MODE=stream
+            ;;
+        buffered|capture)
             LTP_CASE_OUTPUT_MODE=buffered
+            ;;
+        quiet)
             ;;
         *)
             runner_debug "#### OSCOMP RUNNER UNKNOWN LTP OUTPUT MODE ${OSCOMP_LTP_CASE_OUTPUT_MODE} ####"
@@ -2474,7 +2479,7 @@ run_ltp_group() {
         if [ "$LTP_CASE_OUTPUT_MODE" = "stream" ]; then
             run_ltp_case_command "$shell_path" "$testcase_path" "$@"
             ret=$?
-        else
+        elif [ "$LTP_CASE_OUTPUT_MODE" = "buffered" ]; then
             case_log="/var/tmp/oscomp-ltp-case-${testcase}.$$.$ran_cases.log"
             bb rm -f "$case_log" 2>/dev/null || true
             if run_ltp_case_command "$shell_path" "$testcase_path" "$@" >"$case_log" 2>&1; then
@@ -2492,6 +2497,9 @@ run_ltp_group() {
                 bb rm -f "$case_log" 2>/dev/null || true
                 case_log=""
             fi
+        else
+            run_ltp_case_command "$shell_path" "$testcase_path" "$@" >/dev/null 2>&1
+            ret=$?
         fi
         if [ -n "$ltp_saved_preload" ]; then
             export LD_PRELOAD="$ltp_saved_preload"
