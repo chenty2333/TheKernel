@@ -150,6 +150,12 @@ static FRAME_TABLE: [SpinNoIrq<FrameTableRefCount>; FRAME_TABLE_SHARDS] = [
     SpinNoIrq::new(FrameTableRefCount::new()),
 ];
 
+fn warn_size_mismatch(op: &str, vaddr: VirtAddr, expected: PageSize, actual: PageSize) {
+    warn!(
+        "Cow::{op}: ignore page-size mismatch at {vaddr:?}: expected {expected:?}, got {actual:?}"
+    );
+}
+
 /// Copy-on-write mapping backend.
 ///
 /// This corresponds to the `MAP_PRIVATE` flag.
@@ -381,7 +387,10 @@ impl CowBackend {
             self.mark_materialized();
         }
         for (old_addr, paddr, flags, page_size) in materialized {
-            assert_eq!(page_size, self.size);
+            if page_size != self.size {
+                warn_size_mismatch("clone_materialized_pages", old_addr, self.size, page_size);
+                continue;
+            }
             let new_addr = new_start + old_addr.sub_addr(old_start);
             let frame = self.get_or_track_frame_ref(paddr);
             let mut frame = frame.lock();
@@ -427,8 +436,11 @@ impl BackendOps for CowBackend {
             return Ok(());
         }
         let materialized = pt.drain_present_leaves(range.start, range.size())?;
-        for (_addr, frame, _flags, page_size) in materialized {
-            assert_eq!(page_size, self.size);
+        for (addr, frame, _flags, page_size) in materialized {
+            if page_size != self.size {
+                warn_size_mismatch("unmap", addr, self.size, page_size);
+                continue;
+            }
             // Extract the frame reference into a local so the FRAME_TABLE
             // shard lock is released before drop_frame potentially re-locks
             // the same shard when the refcount hits zero.
@@ -456,7 +468,10 @@ impl BackendOps for CowBackend {
         for addr in pages_in(range, self.size)? {
             match pt.query(addr) {
                 Ok((paddr, page_flags, page_size)) => {
-                    assert_eq!(self.size, page_size);
+                    if page_size != self.size {
+                        warn_size_mismatch("populate", addr, self.size, page_size);
+                        return Err(AxError::BadAddress);
+                    }
                     if access_flags.contains(MappingFlags::WRITE)
                         && !page_flags.contains(MappingFlags::WRITE)
                     {
@@ -504,7 +519,10 @@ impl BackendOps for CowBackend {
             self.mark_materialized();
         }
         for (vaddr, paddr, page_flags, page_size) in materialized {
-            assert_eq!(page_size, self.size);
+            if page_size != self.size {
+                warn_size_mismatch("clone_map", vaddr, self.size, page_size);
+                continue;
+            }
             // If the page is mapped in the old page table:
             // - Update its permissions in the old page table using `flags`.
             // - Map the same physical page into the new page table at the same
