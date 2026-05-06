@@ -1,35 +1,55 @@
-use core::cell::Cell;
+use alloc::vec::Vec;
+use core::cell::{Cell, RefCell};
 
-use memory_addr::VirtAddr;
-use memory_set::{MemoryArea, MemorySet};
+use axhal::paging::MappingFlags;
+use memory_addr::{VirtAddr, VirtAddrRange};
+use memory_set::MemorySet;
 
 use super::Backend;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
+pub struct VmaSnapshot {
+    start: VirtAddr,
+    end: VirtAddr,
+    flags: MappingFlags,
+    backend: Backend,
+}
+
+impl VmaSnapshot {
+    pub const fn start(&self) -> VirtAddr {
+        self.start
+    }
+
+    pub const fn end(&self) -> VirtAddr {
+        self.end
+    }
+
+    pub const fn flags(&self) -> MappingFlags {
+        self.flags
+    }
+
+    pub const fn backend(&self) -> &Backend {
+        &self.backend
+    }
+}
+
+#[derive(Clone)]
 struct VmaCacheSlot {
     generation: usize,
-    start: usize,
-    end: usize,
-    ptr: usize,
+    range: VirtAddrRange,
+    snapshot: VmaSnapshot,
 }
 
 impl VmaCacheSlot {
-    const EMPTY: Self = Self {
-        generation: 0,
-        start: 0,
-        end: 0,
-        ptr: 0,
-    };
-
-    fn contains(self, generation: usize, addr: usize) -> bool {
-        self.ptr != 0 && self.generation == generation && self.start <= addr && addr < self.end
+    fn matches(&self, generation: usize, vaddr: VirtAddr) -> bool {
+        self.generation == generation && self.range.contains(vaddr)
     }
 }
 
 pub struct VmaRangeCache<const N: usize> {
     generation: Cell<usize>,
     clock: Cell<usize>,
-    slots: Cell<[VmaCacheSlot; N]>,
+    slots: RefCell<Vec<VmaCacheSlot>>,
 }
 
 impl<const N: usize> VmaRangeCache<N> {
@@ -37,58 +57,53 @@ impl<const N: usize> VmaRangeCache<N> {
         Self {
             generation: Cell::new(1),
             clock: Cell::new(0),
-            slots: Cell::new([VmaCacheSlot::EMPTY; N]),
+            slots: RefCell::new(Vec::new()),
         }
     }
 
     pub fn invalidate(&self) {
         self.generation.set(self.generation.get().wrapping_add(1));
         self.clock.set(0);
-        self.slots.set([VmaCacheSlot::EMPTY; N]);
+        self.slots.borrow_mut().clear();
     }
 
-    pub fn find<'a>(
-        &self,
-        areas: &'a MemorySet<Backend>,
-        vaddr: VirtAddr,
-    ) -> Option<&'a MemoryArea<Backend>> {
+    pub fn find_snapshot(&self, areas: &MemorySet<Backend>, vaddr: VirtAddr) -> Option<VmaSnapshot> {
         let generation = self.generation.get();
-        let addr = vaddr.as_usize();
-        for slot in self.slots.get() {
-            if slot.contains(generation, addr) {
-                // SAFETY: cached pointers are inserted from `areas` while the
-                // address space is locked. Every AddrSpace operation that can
-                // mutate the MemorySet invalidates this cache before mutating,
-                // so a matching generation means the BTreeMap nodes have not
-                // been inserted, removed, split, merged, or rebalanced since
-                // this pointer was captured.
-                let area = unsafe { &*(slot.ptr as *const MemoryArea<Backend>) };
-                debug_assert_eq!(area.start().as_usize(), slot.start);
-                debug_assert_eq!(area.end().as_usize(), slot.end);
-                debug_assert!(area.va_range().contains(vaddr));
-                return Some(area);
+        {
+            let slots = self.slots.borrow();
+            if let Some(slot) = slots.iter().find(|slot| slot.matches(generation, vaddr)) {
+                return Some(slot.snapshot.clone());
             }
         }
 
         let area = areas.find(vaddr)?;
-        self.insert(generation, area);
-        Some(area)
+        let snapshot = VmaSnapshot {
+            start: area.start(),
+            end: area.end(),
+            flags: area.flags(),
+            backend: area.backend().clone(),
+        };
+        self.insert(generation, snapshot.clone());
+        Some(snapshot)
     }
 
-    fn insert(&self, generation: usize, area: &MemoryArea<Backend>) {
+    fn insert(&self, generation: usize, snapshot: VmaSnapshot) {
         if N == 0 {
             return;
         }
 
-        let mut slots = self.slots.get();
-        let idx = self.clock.get() % N;
-        slots[idx] = VmaCacheSlot {
+        let mut slots = self.slots.borrow_mut();
+        let slot = VmaCacheSlot {
             generation,
-            start: area.start().as_usize(),
-            end: area.end().as_usize(),
-            ptr: area as *const MemoryArea<Backend> as usize,
+            range: VirtAddrRange::new(snapshot.start, snapshot.end),
+            snapshot,
         };
-        self.slots.set(slots);
+        if slots.len() < N {
+            slots.push(slot);
+        } else {
+            let idx = self.clock.get() % N;
+            slots[idx] = slot;
+        }
         self.clock.set(self.clock.get().wrapping_add(1));
     }
 }

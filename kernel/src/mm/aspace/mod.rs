@@ -37,7 +37,6 @@ pub struct AddrSpace {
     growdown_starts: BTreeSet<VirtAddr>,
     wipe_on_fork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     locked_ranges: BTreeMap<VirtAddr, VirtAddr>,
-    vma_cache: VmaRangeCache<8>,
     fault_cache: VmaRangeCache<4>,
     pt: PageTable,
 }
@@ -88,14 +87,12 @@ impl AddrSpace {
             growdown_starts: BTreeSet::new(),
             wipe_on_fork_ranges: BTreeMap::new(),
             locked_ranges: BTreeMap::new(),
-            vma_cache: VmaRangeCache::new(),
             fault_cache: VmaRangeCache::new(),
             pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,
         })
     }
 
     fn invalidate_vma_caches(&self) {
-        self.vma_cache.invalidate();
         self.fault_cache.invalidate();
     }
 
@@ -295,7 +292,7 @@ impl AddrSpace {
     }
 
     pub fn find_area(&self, vaddr: VirtAddr) -> Option<&MemoryArea<Backend>> {
-        self.vma_cache.find(&self.areas, vaddr)
+        self.areas.find(vaddr)
     }
 
     /// Add a new linear mapping.
@@ -599,7 +596,7 @@ impl AddrSpace {
         if !self.va_range.contains(vaddr) {
             return PageFaultResult::Unhandled;
         }
-        if let Some(area) = self.fault_cache.find(&self.areas, vaddr) {
+        if let Some(area) = self.fault_cache.find_snapshot(&self.areas, vaddr) {
             let flags = area.flags();
             if flags.contains(access_flags) {
                 let page_size = area.backend().page_size();
