@@ -1,6 +1,5 @@
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
-#[cfg(feature = "times")]
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use core::{num::NonZeroUsize, ops::Range, task::Context};
 
 use axalloc::{UsageKind, global_allocator};
@@ -360,6 +359,78 @@ impl Drop for PageCache {
 
 type EvictListenerFn = Box<dyn Fn(u32, &PageCache) + Send + Sync>;
 
+// ---- Global page cache budget ----
+//
+// Tracks the total number of cached pages across all CachedFileShared
+// instances.  When the budget is exceeded, clean pages are evicted from
+// the least-recently-used caches.
+
+static GLOBAL_PAGE_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn global_page_cache_budget_pages() -> usize {
+    const MIB: usize = 1024 * 1024;
+    let ram = total_ram_size();
+    if ram <= 256 * MIB {
+        1024                          // 4 MiB
+    } else if ram <= 512 * MIB {
+        8192                          // 32 MiB
+    } else if ram <= 1024 * MIB {
+        32768                         // 128 MiB
+    } else {
+        65536                         // 256 MiB
+    }
+}
+
+fn inc_global_page_count() {
+    GLOBAL_PAGE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn dec_global_page_count() {
+    GLOBAL_PAGE_COUNT.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn global_page_count() -> usize {
+    GLOBAL_PAGE_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Evict clean pages from the least-recently-used registered cache until
+/// the global budget is met.  Called when a new page allocation would
+/// exceed the budget.
+fn reclaim_global_budget() {
+    let budget = global_page_cache_budget_pages();
+    if global_page_count() <= budget {
+        return;
+    }
+
+    let mut reg = PAGE_CACHE_REGISTRY.lock();
+    reg.retain(|w| w.upgrade().is_some());
+
+    // Sort caches by last_access_tick so we reclaim from the coldest ones.
+    let mut caches: Vec<_> = reg.iter().filter_map(|w| w.upgrade()).collect();
+    caches.sort_by_key(|c| c.last_access_tick());
+
+    let to_free = global_page_count().saturating_sub(budget);
+    let mut freed = 0;
+
+    for cache in &caches {
+        if freed >= to_free {
+            break;
+        }
+        // Pop clean (non-dirty) pages from the LRU tail.
+        loop {
+            let Some((pn, page)) = cache.pop_lru_if_clean() else {
+                break;
+            };
+            dec_global_page_count();
+            drop(page);
+            freed += 1;
+            if freed >= to_free {
+                break;
+            }
+        }
+    }
+}
+
 fn per_file_page_cache_capacity() -> NonZeroUsize {
     const MIB: usize = 1024 * 1024;
     const GIB: usize = 1024 * MIB;
@@ -387,6 +458,7 @@ struct CachedFileShared {
     evict_listeners: Mutex<LinkedList<EvictListenerAdapter>>,
     fs_name: String,
     inner: Location,
+    last_access_tick: AtomicU64,
 }
 
 impl CachedFileShared {
@@ -396,6 +468,7 @@ impl CachedFileShared {
             evict_listeners: Mutex::new(LinkedList::default()),
             fs_name: fs_name.into(),
             inner: location.clone(),
+            last_access_tick: AtomicU64::new(0),
         }
     }
 
@@ -405,11 +478,32 @@ impl CachedFileShared {
             evict_listeners: Mutex::new(LinkedList::default()),
             fs_name: fs_name.into(),
             inner: location.clone(),
+            last_access_tick: AtomicU64::new(0),
         }
     }
 
     fn fs_name(&self) -> &str {
         &self.fs_name
+    }
+
+    fn last_access_tick(&self) -> u64 {
+        self.last_access_tick.load(Ordering::Relaxed)
+    }
+
+    fn touch(&self) {
+        // A simple monotonically increasing tick for LRU ordering.
+        static TICK: AtomicU64 = AtomicU64::new(0);
+        self.last_access_tick
+            .store(TICK.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+    }
+
+    /// Pop the least-recently-used page from the cache ONLY if it is clean.
+    fn pop_lru_if_clean(&self) -> Option<(u32, PageCache)> {
+        let mut guard = self.page_cache.lock();
+        let lru = guard.iter().find_map(|(pn, page)| {
+            (!page.dirty).then_some(*pn)
+        })?;
+        guard.pop(&lru)
     }
 }
 
@@ -477,6 +571,39 @@ fn register_cache(cache: &Arc<CachedFileShared>) {
     let mut reg = PAGE_CACHE_REGISTRY.lock();
     reg.retain(|w| w.upgrade().is_some());
     reg.push(Arc::downgrade(cache));
+}
+
+/// Flush dirty pages for `location` and discard the affected cache range.
+/// Called by O_DIRECT writes and external truncate operations to keep the
+/// page cache coherent with the on-disk state.
+pub fn invalidate_page_cache(location: &Location, offset: u64, len: u64) -> VfsResult<()> {
+    let guard = location.user_data();
+    if let Some(ud) = guard.get::<FileUserData>() {
+        let shared = ud.get();
+        let cached = CachedFile {
+            inner: location.clone(),
+            shared,
+            in_memory: location.filesystem().name() == "tmpfs",
+            append_lock: RwLock::new(()),
+        };
+        cached.flush_and_invalidate_range(offset, len)?;
+    }
+    Ok(())
+}
+
+/// Discard all cached pages for `location` (e.g. when a file is unlinked
+/// or its inode is replaced).
+pub fn invalidate_page_cache_all(location: &Location) {
+    let guard = location.user_data();
+    if let Some(ud) = guard.get::<FileUserData>() {
+        let shared = ud.get();
+        let mut guard = shared.page_cache.lock();
+        let count = guard.iter().count();
+        guard.clear();
+        if count > 0 {
+            GLOBAL_PAGE_COUNT.fetch_sub(count, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Walk all registered page caches and flush dirty pages.
@@ -644,19 +771,26 @@ impl CachedFile {
         pn: u32,
     ) -> VfsResult<Option<(u32, PageCache)>> {
         if cache.contains(&pn) {
+            self.shared.touch();
             return Ok(None);
         }
+
+        // Enforce the global page-cache budget before allocating a new page.
+        reclaim_global_budget();
+
         let mut evicted = None;
         if cache.len() == cache.cap().get() {
             // Cache is full, remove the least recently used page
             if let Some((pn, mut page)) = cache.pop_lru() {
                 self.evict_cache(file, pn, &mut page)?;
+                dec_global_page_count();
                 evicted = Some((pn, page));
             }
         }
 
         // Page not in cache, read it
         let mut page = PageCache::new()?;
+        inc_global_page_count();
         if self.in_memory {
             page.data().fill(0);
         } else {
@@ -840,6 +974,60 @@ impl CachedFile {
         Ok(())
     }
 
+    /// Write back dirty pages overlapping `[offset, offset + len)` without
+    /// evicting them from the cache.  Used before Direct I/O reads to ensure
+    /// that the read sees the latest data.
+    pub fn flush_dirty_range(&self, offset: u64, len: u64) -> VfsResult<()> {
+        if self.in_memory || len == 0 {
+            return Ok(());
+        }
+        let file = self.inner.entry().as_file()?;
+        let start_pn = (offset / PAGE_SIZE as u64) as u32;
+        let end_pn = (offset + len).div_ceil(PAGE_SIZE as u64) as u32;
+        let mut guard = self.shared.page_cache.lock();
+        for pn in start_pn..end_pn {
+            if let Some(page) = guard.get_mut(&pn) {
+                if page.dirty {
+                    let page_start = pn as u64 * PAGE_SIZE as u64;
+                    let page_len =
+                        (file.len()?.saturating_sub(page_start)).min(PAGE_SIZE as u64) as usize;
+                    if page_len > 0 {
+                        file.write_at(&page.data()[..page_len], page_start)?;
+                    }
+                    page.dirty = false;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Discard cached pages overlapping `[offset, offset + len)`.
+    /// Used after Direct I/O writes to prevent stale-cache reads.
+    pub fn invalidate_range(&self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let start_pn = (offset / PAGE_SIZE as u64) as u32;
+        let end_pn = (offset + len).div_ceil(PAGE_SIZE as u64) as u32;
+        let mut guard = self.shared.page_cache.lock();
+        for pn in start_pn..end_pn {
+            if let Some(page) = guard.pop(&pn) {
+                dec_global_page_count();
+                drop(page);
+            }
+        }
+    }
+
+    /// Write back and discard the range.  Used before Direct I/O writes
+    /// to preserve coherence: flush any dirty data that's newer than what
+    /// was written directly, then invalidate so that the next cached read
+    /// goes to disk.
+    pub fn flush_and_invalidate_range(&self, offset: u64, len: u64) -> VfsResult<()> {
+        self.flush_dirty_range(offset, len)?;
+        self.invalidate_range(offset, len);
+        Ok(())
+    }
+
     /// Returns a reference to the underlying [`Location`].
     pub fn location(&self) -> &Location {
         &self.inner
@@ -892,11 +1080,29 @@ impl FileBackend {
         Self::Cached(CachedFile::get_or_create(location))
     }
 
+    fn get_cached_for(loc: &Location) -> Option<CachedFile> {
+        let guard = loc.user_data();
+        guard
+            .get::<FileUserData>()
+            .map(|ud| CachedFile {
+                inner: loc.clone(),
+                shared: ud.get(),
+                in_memory: loc.filesystem().name() == "tmpfs",
+                append_lock: RwLock::new(()),
+            })
+    }
+
     /// Reads data from the file at `offset` into `dst`.
     pub fn read_at(&self, mut dst: impl Write + IoBufMut, mut offset: u64) -> VfsResult<usize> {
         match self {
             Self::Cached(cached) => cached.read_at(dst, offset),
             Self::Direct(loc) => {
+                // Flush dirty cached pages in the read range so the direct
+                // read sees the latest writeback data.
+                if let Some(cached) = Self::get_cached_for(loc) {
+                    cached.flush_dirty_range(offset, dst.remaining_mut() as u64)?;
+                }
+
                 let file = loc.entry().as_file()?;
                 let mut total = 0;
                 let mut chunk = vec![0_u8; Self::DIRECT_IO_CHUNK];
@@ -928,6 +1134,13 @@ impl FileBackend {
         match self {
             Self::Cached(cached) => cached.write_at(src, offset),
             Self::Direct(loc) => {
+                // Flush any dirty cached pages overlapping the write range,
+                // then invalidate them so the next cached read goes to disk.
+                let data_len = src.remaining() as u64;
+                if let Some(cached) = Self::get_cached_for(loc) {
+                    cached.flush_and_invalidate_range(offset, data_len)?;
+                }
+
                 let file = loc.entry().as_file()?;
                 let mut total = 0;
                 let mut chunk = vec![0_u8; Self::DIRECT_IO_CHUNK];
