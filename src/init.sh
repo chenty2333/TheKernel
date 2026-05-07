@@ -348,6 +348,42 @@ ltp_score_emit_case() {
     printf '\n'
 }
 
+ltp_cleanup_tmp_state() {
+    # LTP cases are intended to be independent, but some failure paths leave
+    # tmpdirs behind. A later libc flavor can otherwise inherit stale state.
+    if [ -r /proc/mounts ]; then
+        # Remove any stale LTP mounts before deleting their mountpoints.  Run a
+        # few passes because /proc/mounts is parent-first on some systems.
+        ltp_umount_pass=0
+        while [ "$ltp_umount_pass" -lt 3 ]; do
+            while IFS=' ' read -r _ ltp_mountpoint _; do
+                case "$ltp_mountpoint" in
+                    /tmp/LTP_*|/tmp/ltp-*|/tmp/ltp_*|/tmp/tst_*|/tmp/tmp.*)
+                        bb umount -l "$ltp_mountpoint" 2>/dev/null || \
+                            bb umount "$ltp_mountpoint" 2>/dev/null || true
+                        ;;
+                    /var/tmp/LTP_*|/var/tmp/ltp-*|/var/tmp/ltp_*|/var/tmp/tst_*|/var/tmp/tmp.*)
+                        bb umount -l "$ltp_mountpoint" 2>/dev/null || \
+                            bb umount "$ltp_mountpoint" 2>/dev/null || true
+                        ;;
+                esac
+            done </proc/mounts
+            ltp_umount_pass=$((ltp_umount_pass + 1))
+        done
+    fi
+
+    for dir in /tmp /var/tmp; do
+        [ -d "$dir" ] || continue
+        bb rm -rf \
+            "$dir"/LTP_* \
+            "$dir"/ltp-* \
+            "$dir"/ltp_* \
+            "$dir"/tst_* \
+            "$dir"/tmp.* \
+            2>/dev/null || true
+    done
+}
+
 prime_group_output_stream() {
     if [ -n "${OSCOMP_GROUP_OUTPUT_PRIMED:-}" ]; then
         return 0
@@ -2629,12 +2665,10 @@ run_ltp_group() {
         export LTP_VIRT_OVERRIDE=kvm
     fi
     if [ "${LTP_TIMEOUT_MUL+x}" != "x" ]; then
-        case "$(runner_machine_quiet)" in
-            loongarch64)
-                export LTP_TIMEOUT_MUL=2
-                ;;
-        esac
+        export LTP_TIMEOUT_MUL="${OSCOMP_LTP_TIMEOUT_MUL_DEFAULT:-2}"
     fi
+
+    ltp_cleanup_tmp_state
 
     run_ltp_case_command() {
         shell_path="$1"
@@ -2711,6 +2745,7 @@ run_ltp_group() {
         }
 
         ran_cases=$((ran_cases + 1))
+        ltp_cleanup_tmp_state
         echo "RUN LTP CASE $testcase"
         if runner_truthy "${OSCOMP_RUNNER_DEBUG:-0}" && [ "${testcase_path##*.}" = "sh" ]; then
             runner_debug "#### OSCOMP RUNNER LTP SHELL CASE ${testcase} PATH ${testcase_path} SHELL ${shell_path} TST_TEST_SH $(command -v tst_test.sh 2>/dev/null || true) ####"
@@ -2784,6 +2819,7 @@ run_ltp_group() {
             fi
             group_failed=1
         fi
+        ltp_cleanup_tmp_state
     done <"$test_list"
     [ -z "$generated_test_list" ] || bb rm -f "$generated_test_list" 2>/dev/null || true
 
@@ -3120,26 +3156,26 @@ reference_eval_plan() {
 
     cat <<'EOF'
 /musl basic
-/musl iozone
-/musl busybox
-/musl netperf
-/musl lua
-/musl libcbench
-/musl libctest
-/musl cyclictest
 /glibc basic
-/glibc iozone
+/musl busybox
 /glibc busybox
+/musl iozone
+/glibc iozone
+/musl libctest
+/musl iperf
+/glibc iperf
+/glibc ltp
+/musl ltp
+/musl netperf
 /glibc netperf
+/musl lua
 /glibc lua
+/musl libcbench
 /glibc libcbench
+/musl cyclictest
 /glibc cyclictest
 /musl lmbench
 /glibc lmbench
-/musl ltp
-/glibc ltp
-/musl iperf
-/glibc iperf
 EOF
 }
 
@@ -3204,7 +3240,7 @@ runner_remaining_secs() {
     RUNNER_REMAINING_SECS=""
 
     case "$RUNNER_GLOBAL_TIMEOUT_SECS:$RUNNER_START_EPOCH" in
-        *[!0-9:]*|:|''|*:)
+        :*|*[!0-9:]*|:|''|*:)
             return 0
             ;;
     esac
@@ -3986,13 +4022,13 @@ oscomp_runner_main() {
     export USER=root
     export TERM=dumb
 
-    RUNNER_GLOBAL_TIMEOUT_SECS="${OSCOMP_TIMEOUT_GLOBAL:-6900}"
+    RUNNER_GLOBAL_TIMEOUT_SECS="${OSCOMP_TIMEOUT_GLOBAL:-}"
     RUNNER_GLOBAL_TIMEOUT_REACHED=""
 
     runner_now_epoch
     RUNNER_START_EPOCH="$RUNNER_NOW_EPOCH"
     case "$RUNNER_GLOBAL_TIMEOUT_SECS:$RUNNER_START_EPOCH" in
-        *[!0-9:]*|:|''|*:)
+        :*|*[!0-9:]*|:|''|*:)
             RUNNER_GLOBAL_TIMEOUT_SECS=""
             ;;
     esac
