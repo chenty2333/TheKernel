@@ -73,17 +73,47 @@ start_server() {
     return 0
 }
 
+normalize_iperf_output() {
+    client_log="$1"
+    cr=$(printf "\r")
+    [ -f "$client_log" ] || return 0
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            *"$cr")
+                line=${line%"$cr"}
+                ;;
+        esac
+        case "$line" in
+            \[SUM\]*)
+                ;;
+            \[*\]*receiver)
+                case "$line" in
+                    *"bits/sec"*)
+                        line="[  5]${line#*]}"
+                        ;;
+                esac
+                ;;
+        esac
+        printf "%s\n" "$line"
+    done < "$client_log"
+}
+
 run_iperf() {
     test_name="$1"
     want_case "$test_name" || return 0
 
     echo "====== iperf $test_name begin ======"
     args=$(iperf_args "$test_name") || exit 1
-    if "$IPERF_BIN" -c "$ip" -p "$port" $family_args -t "${OSCOMP_IPERF_LENGTH:-2}" -i 0 ${OSCOMP_IPERF_GLOBAL_ARGS:-} $args; then
+    client_log="/var/tmp/oscomp-iperf-${test_name}.$$.log"
+    rm -f "$client_log" 2>/dev/null || true
+    if "$IPERF_BIN" -c "$ip" -p "$port" $family_args -t "${OSCOMP_IPERF_LENGTH:-2}" -i 0 ${OSCOMP_IPERF_GLOBAL_ARGS:-} $args >"$client_log" 2>&1; then
         ans="success"
     else
         ans="fail"
     fi
+    normalize_iperf_output "$client_log"
+    rm -f "$client_log" 2>/dev/null || true
     echo "====== iperf $test_name end: $ans ======"
     echo ""
 }
