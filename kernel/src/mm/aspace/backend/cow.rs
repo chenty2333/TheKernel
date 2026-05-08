@@ -5,7 +5,6 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
-use axfs::CachedFile;
 use axfs_ng_vfs::Location;
 use axhal::{
     mem::phys_to_virt,
@@ -33,8 +32,7 @@ impl FrameRefCnt {
             // physical frame before we remove the table entry. This function assumes
             // the caller is not holding the FRAME_TABLE lock, so it is safe to lock
             // FRAME_TABLE here and perform the removal.
-            let idx = frame_shard(paddr);
-            FRAME_TABLE[idx].lock().remove_frame(paddr);
+            FRAME_TABLE.lock().remove_frame(paddr);
             dealloc_frame(paddr, page_size);
         }
     }
@@ -77,84 +75,7 @@ impl FrameTableRefCount {
     }
 }
 
-const FRAME_TABLE_SHARDS: usize = 64;
-
-fn frame_shard(paddr: PhysAddr) -> usize {
-    (paddr.as_usize() >> 12) as usize % FRAME_TABLE_SHARDS
-}
-
-static FRAME_TABLE: [SpinNoIrq<FrameTableRefCount>; FRAME_TABLE_SHARDS] = [
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-    SpinNoIrq::new(FrameTableRefCount::new()),
-];
-
-fn warn_size_mismatch(op: &str, vaddr: VirtAddr, expected: PageSize, actual: PageSize) {
-    warn!(
-        "Cow::{op}: ignore page-size mismatch at {vaddr:?}: expected {expected:?}, got {actual:?}"
-    );
-}
+static FRAME_TABLE: SpinNoIrq<FrameTableRefCount> = SpinNoIrq::new(FrameTableRefCount::new());
 
 /// Copy-on-write mapping backend.
 ///
@@ -163,35 +84,9 @@ fn warn_size_mismatch(op: &str, vaddr: VirtAddr, expected: PageSize, actual: Pag
 pub struct CowBackend {
     start: VirtAddr,
     size: PageSize,
-    file: Option<(CowFileSource, u64, Option<u64>, bool)>,
+    file: Option<(Location, u64, Option<u64>, bool)>,
     map_id: Arc<()>,
     materialized: Arc<AtomicBool>,
-}
-
-#[derive(Clone)]
-enum CowFileSource {
-    Direct(Location),
-    Cached(CachedFile),
-}
-
-impl CowFileSource {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> AxResult<usize> {
-        Ok(match self {
-            CowFileSource::Direct(location) => location.entry().as_file()?.read_at(buf, offset)?,
-            CowFileSource::Cached(cache) => cache.read_at(buf, offset)?,
-        })
-    }
-
-    fn ptr_eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (CowFileSource::Direct(lhs), CowFileSource::Direct(rhs)) => lhs.ptr_eq(rhs),
-            (CowFileSource::Cached(lhs), CowFileSource::Cached(rhs)) => lhs.ptr_eq(rhs),
-            (CowFileSource::Direct(lhs), CowFileSource::Cached(rhs))
-            | (CowFileSource::Cached(rhs), CowFileSource::Direct(lhs)) => {
-                lhs.ptr_eq(rhs.location())
-            }
-        }
-    }
 }
 
 impl CowBackend {
@@ -210,7 +105,7 @@ impl CowBackend {
     }
 
     fn get_or_track_frame_ref(&self, paddr: PhysAddr) -> Arc<SpinNoIrq<FrameRefCnt>> {
-        let mut frame_table = FRAME_TABLE[frame_shard(paddr)].lock();
+        let mut frame_table = FRAME_TABLE.lock();
         if let Some(frame_ref) = frame_table.get_frame_ref(paddr) {
             return frame_ref;
         }
@@ -229,7 +124,8 @@ impl CowBackend {
     ) -> AxResult {
         let frame = self.alloc_new_frame(true)?;
 
-        if let Some((source, file_start, file_end, _)) = &self.file {
+        if let Some((location, file_start, file_end, _)) = &self.file {
+            let file = location.entry().as_file()?;
             let buf = unsafe {
                 slice::from_raw_parts_mut(phys_to_virt(frame).as_mut_ptr(), self.size as _)
             };
@@ -244,7 +140,7 @@ impl CowBackend {
                 .map_or(u64::MAX, |end| end.saturating_sub(file_start))
                 .min((buf.len() - start) as u64) as usize;
 
-            source.read_at(&mut buf[start..start + max_read], file_start)?;
+            file.read_at(&mut &mut buf[start..start + max_read], file_start)?;
         }
         pt.map(vaddr, frame, self.size, page_table_flags(flags))?;
         self.mark_materialized();
@@ -258,7 +154,7 @@ impl CowBackend {
         flags: MappingFlags,
         pt: &mut PageTableCursor,
     ) -> AxResult {
-        let Some(frame) = FRAME_TABLE[frame_shard(paddr)].lock().get_frame_ref(paddr) else {
+        let Some(frame) = FRAME_TABLE.lock().get_frame_ref(paddr) else {
             pt.protect(vaddr, page_table_flags(flags))?;
             self.mark_materialized();
             return Ok(());
@@ -337,13 +233,13 @@ impl CowBackend {
         match (&self.file, &other.file) {
             (None, None) => true,
             (
-                Some((lhs_source, lhs_start, lhs_end, lhs_sigbus)),
-                Some((rhs_source, rhs_start, rhs_end, rhs_sigbus)),
+                Some((lhs_backend, lhs_start, lhs_end, lhs_sigbus)),
+                Some((rhs_backend, rhs_start, rhs_end, rhs_sigbus)),
             ) => {
                 lhs_start == rhs_start
                     && lhs_end == rhs_end
                     && lhs_sigbus == rhs_sigbus
-                    && lhs_source.ptr_eq(rhs_source)
+                    && lhs_backend.ptr_eq(rhs_backend)
             }
             _ => false,
         }
@@ -387,10 +283,7 @@ impl CowBackend {
             self.mark_materialized();
         }
         for (old_addr, paddr, flags, page_size) in materialized {
-            if page_size != self.size {
-                warn_size_mismatch("clone_materialized_pages", old_addr, self.size, page_size);
-                continue;
-            }
+            assert_eq!(page_size, self.size);
             let new_addr = new_start + old_addr.sub_addr(old_start);
             let frame = self.get_or_track_frame_ref(paddr);
             let mut frame = frame.lock();
@@ -436,18 +329,9 @@ impl BackendOps for CowBackend {
             return Ok(());
         }
         let materialized = pt.drain_present_leaves(range.start, range.size())?;
-        for (addr, frame, _flags, page_size) in materialized {
-            if page_size != self.size {
-                warn_size_mismatch("unmap", addr, self.size, page_size);
-                continue;
-            }
-            // Extract the frame reference into a local so the FRAME_TABLE
-            // shard lock is released before drop_frame potentially re-locks
-            // the same shard when the refcount hits zero.
-            let frame_ref = {
-                FRAME_TABLE[frame_shard(frame)].lock().get_frame_ref(frame)
-            };
-            if let Some(frame_ref) = frame_ref {
+        for (_addr, frame, _flags, page_size) in materialized {
+            assert_eq!(page_size, self.size);
+            if let Some(frame_ref) = FRAME_TABLE.lock().get_frame_ref(frame) {
                 let mut frame_ref = frame_ref.lock();
                 frame_ref.drop_frame(frame, self.size);
             } else {
@@ -468,10 +352,7 @@ impl BackendOps for CowBackend {
         for addr in pages_in(range, self.size)? {
             match pt.query(addr) {
                 Ok((paddr, page_flags, page_size)) => {
-                    if page_size != self.size {
-                        warn_size_mismatch("populate", addr, self.size, page_size);
-                        return Err(AxError::BadAddress);
-                    }
+                    assert_eq!(self.size, page_size);
                     if access_flags.contains(MappingFlags::WRITE)
                         && !page_flags.contains(MappingFlags::WRITE)
                     {
@@ -507,9 +388,7 @@ impl BackendOps for CowBackend {
             // original ELF file contents. Populate writable file-backed pages in
             // the parent before sharing them read-only with the child.
             for vaddr in pages_in(range, self.size)? {
-                if matches!(old_pt.query(vaddr), Err(PagingError::NotMapped))
-                    && !self.faults_with_sigbus(vaddr)
-                {
+                if matches!(old_pt.query(vaddr), Err(PagingError::NotMapped)) {
                     self.alloc_new_at(vaddr, cow_flags, old_pt)?;
                 }
             }
@@ -519,10 +398,7 @@ impl BackendOps for CowBackend {
             self.mark_materialized();
         }
         for (vaddr, paddr, page_flags, page_size) in materialized {
-            if page_size != self.size {
-                warn_size_mismatch("clone_map", vaddr, self.size, page_size);
-                continue;
-            }
+            assert_eq!(page_size, self.size);
             // If the page is mapped in the old page table:
             // - Update its permissions in the old page table using `flags`.
             // - Map the same physical page into the new page table at the same
@@ -572,34 +448,7 @@ impl Backend {
         Self::Cow(CowBackend {
             start,
             size,
-            file: Some((
-                CowFileSource::Direct(file),
-                file_start,
-                file_end,
-                sigbus_on_eof,
-            )),
-            map_id: Arc::new(()),
-            materialized: Arc::new(AtomicBool::new(false)),
-        })
-    }
-
-    pub fn new_cow_cached(
-        start: VirtAddr,
-        size: PageSize,
-        cache: CachedFile,
-        file_start: u64,
-        file_end: Option<u64>,
-        sigbus_on_eof: bool,
-    ) -> Self {
-        Self::Cow(CowBackend {
-            start,
-            size,
-            file: Some((
-                CowFileSource::Cached(cache),
-                file_start,
-                file_end,
-                sigbus_on_eof,
-            )),
+            file: Some((file, file_start, file_end, sigbus_on_eof)),
             map_id: Arc::new(()),
             materialized: Arc::new(AtomicBool::new(false)),
         })

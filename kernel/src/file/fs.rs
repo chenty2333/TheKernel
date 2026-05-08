@@ -182,11 +182,15 @@ impl File {
     fn is_blocking(&self) -> bool {
         self.inner.location().flags().contains(NodeFlags::BLOCKING)
     }
+}
 
-    /// Fast-path read that bypasses `FileDescription` and `FileLike` vtable
-    /// dispatch. Called directly from `sys_read` when the fd table indicates
-    /// a regular file.
-    pub fn read_fast(&self, dst: &mut super::types::IoDst) -> AxResult<usize> {
+fn path_for(loc: &Location) -> Cow<'static, str> {
+    loc.absolute_path()
+        .map_or_else(|_| "<error>".into(), |f| Cow::Owned(f.to_string()))
+}
+
+impl FileLike for File {
+    fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
         let inner = self.inner();
         if likely(self.is_blocking()) {
             inner.read(dst)
@@ -197,10 +201,7 @@ impl File {
         }
     }
 
-    /// Fast-path write that bypasses `FileDescription` and `FileLike` vtable
-    /// dispatch. Called directly from `sys_write` when the fd table indicates
-    /// a regular file.
-    pub fn write_fast(&self, src: &mut super::types::IoSrc) -> AxResult<usize> {
+    fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
         let inner = self.inner();
         let len = src.remaining();
         let mut limited = None;
@@ -239,21 +240,6 @@ impl File {
                 inner.write(&mut *src)
             }))
         }
-    }
-}
-
-fn path_for(loc: &Location) -> Cow<'static, str> {
-    loc.absolute_path()
-        .map_or_else(|_| "<error>".into(), |f| Cow::Owned(f.to_string()))
-}
-
-impl FileLike for File {
-    fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
-        self.read_fast(dst)
-    }
-
-    fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
-        self.write_fast(src)
     }
 
     fn stat(&self) -> AxResult<Kstat> {

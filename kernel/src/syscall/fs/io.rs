@@ -3,7 +3,7 @@ use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FileFlags, OpenOptions};
-use axio::{Read, Seek, SeekFrom};
+use axio::{Cursor, Seek, SeekFrom};
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::general::{__kernel_off_t, W_OK};
 use starry_vm::{VmMutPtr, VmPtr};
@@ -12,7 +12,7 @@ use syscalls::Sysno;
 use crate::{
     file::{
         Directory, File, FileHandle, FileLike, FileLikeKind, Pipe, Socket, allowed_write_len,
-        check_resize_limit, get_file_description, get_file_like, get_typed_file,
+        check_resize_limit, get_file_like, get_typed_file,
         inotify::{notify_read, notify_write},
         lease, memfd,
         permission::check_open_permissions,
@@ -81,8 +81,7 @@ pub fn sys_dummy_fd(sysno: Sysno) -> AxResult<isize> {
 /// Return the read size if success.
 pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     debug!("sys_read <= fd: {fd}, buf: {buf:p}, len: {len}");
-    let desc = get_file_description(fd)?;
-    let read = desc.fast_read(&mut VmBytesMut::new(buf, len))? as isize;
+    let read = get_file_like(fd)?.read(&mut VmBytesMut::new(buf, len))? as isize;
     if read > 0 {
         notify_read(fd);
     }
@@ -91,8 +90,8 @@ pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
 
 pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     debug!("sys_readv <= fd: {fd}, iovcnt: {iovcnt}");
-    let desc = get_file_description(fd)?;
-    let read = desc.fast_read(&mut IoVectorBuf::new(iov, iovcnt)?.into_io())? as isize;
+    let f = get_file_like(fd)?;
+    let read = f.read(&mut IoVectorBuf::new(iov, iovcnt)?.into_io())? as isize;
     if read > 0 {
         notify_read(fd);
     }
@@ -104,8 +103,7 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
 /// Return the written size if success.
 pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     debug!("sys_write <= fd: {fd}, buf: {buf:p}, len: {len}");
-    let desc = get_file_description(fd)?;
-    let written = desc.fast_write(&mut VmBytes::new(buf, len))? as isize;
+    let written = get_file_like(fd)?.write(&mut VmBytes::new(buf, len))? as isize;
     if written > 0 {
         notify_write(fd);
     }
@@ -114,12 +112,14 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
 
 pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     debug!("sys_writev <= fd: {fd}, iovcnt: {iovcnt}");
-    let desc = get_file_description(fd)?;
     let iov = IoVectorBuf::new(iov, iovcnt)?;
-    if desc.is_regular_fast() {
+    let written = if let Ok(file) = get_typed_file::<File>(fd) {
         iov.check_readable()?;
-    }
-    let written = desc.fast_write(&mut iov.into_io())? as isize;
+        file.write(&mut iov.into_io())?
+    } else {
+        let f = get_file_like(fd)?;
+        f.write(&mut iov.into_io())?
+    } as isize;
     if written > 0 {
         notify_write(fd);
     }
@@ -236,24 +236,25 @@ fn do_pwritev(
 
     let file = positioned_write_file(fd)?;
     let io = IoVectorBuf::new(iov, iovcnt)?;
-    io.check_readable()?;
-    let len = io.len();
     let written = if offset == -1 {
-        file.write(&mut io.into_io())?
+        let data = io.read_all()?;
+        let mut cursor = Cursor::new(data.as_slice());
+        file.write(&mut cursor)?
     } else {
+        let data = io.read_all()?;
         if file.inner().flags().contains(FileFlags::APPEND) {
             let append_offset = file.inner().location().len()?;
-            let allowed = allowed_write_len(append_offset, len)?;
+            let allowed = allowed_write_len(append_offset, data.len())?;
             memfd::check_write(file.inner().location(), append_offset, allowed)?;
             file.inner()
                 .access(FileFlags::APPEND)?
-                .append(io.into_io().take(allowed as u64))?
+                .append(Cursor::new(&data[..allowed]))?
                 .0
         } else {
-            let allowed = allowed_write_len(offset as u64, len)?;
+            let allowed = allowed_write_len(offset as u64, data.len())?;
             memfd::check_write(file.inner().location(), offset as u64, allowed)?;
             file.inner()
-                .write_at(io.into_io().take(allowed as u64), offset as u64)?
+                .write_at(Cursor::new(&data[..allowed]), offset as u64)?
         }
     } as isize;
     if written > 0 {
@@ -442,10 +443,6 @@ pub fn sys_fallocate(
             } else {
                 return Err(AxError::OperationNotSupported);
             }
-            // The hole punch modifies on-disk state directly — discard any
-            // cached pages in the range without flushing (old dirty data
-            // must not overwrite the punched hole).
-            axfs::discard_page_cache(&loc, offset, len);
         }
         mode if mode == FALLOC_FL_ZERO_RANGE
             || mode == (FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE) =>
@@ -464,9 +461,6 @@ pub fn sys_fallocate(
             let zero_len = zero_end.saturating_sub(offset);
             write_zero_range(file, offset, zero_len)?;
             let _ = tmp::reserve_fallocate_range(&loc, offset, zero_len, false);
-            // Discard cached pages in the zeroed range without flushing
-            // (the backing store already has the correct zeros).
-            axfs::discard_page_cache(&loc, offset, zero_len);
         }
         FALLOC_FL_COLLAPSE_RANGE => {
             if len == 0
@@ -487,8 +481,6 @@ pub fn sys_fallocate(
                 return Err(AxError::OperationNotSupported);
             }
             backend.set_len(size - len)?;
-            // Collapse shifts data — discard cache without flushing.
-            axfs::discard_page_cache(&loc, offset, size - offset);
         }
         _ => return Err(AxError::InvalidInput),
     }

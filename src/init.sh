@@ -128,18 +128,12 @@ run_clean_shell_script() {
 }
 
 ltp_case_output_mode() {
-    LTP_CASE_OUTPUT_MODE=score
+    LTP_CASE_OUTPUT_MODE=stream
 
     case "${OSCOMP_LTP_CASE_OUTPUT_MODE:-}" in
-        "")
+        ""|stream|full|verbose)
             ;;
-        score|scored|sanitized|quiet)
-            LTP_CASE_OUTPUT_MODE=score
-            ;;
-        stream|full|verbose)
-            LTP_CASE_OUTPUT_MODE=stream
-            ;;
-        buffered|capture)
+        buffered|capture|quiet)
             LTP_CASE_OUTPUT_MODE=buffered
             ;;
         *)
@@ -158,230 +152,6 @@ ltp_case_output_mode() {
             LTP_CASE_OUTPUT_MODE=stream
         fi
     fi
-}
-
-ltp_score_count_is_sane() {
-    value="$1"
-    limit="${OSCOMP_LTP_SCORE_COUNT_LIMIT:-10000}"
-
-    case "$value" in
-        ''|*[!0-9]*)
-            return 1
-            ;;
-    esac
-
-    [ "$value" -le "$limit" ] 2>/dev/null
-}
-
-ltp_score_reset_counts() {
-    LTP_SCORE_PASS=0
-    LTP_SCORE_FAIL=0
-    LTP_SCORE_BROK=0
-    LTP_SCORE_SKIP=0
-    LTP_SCORE_WARN=0
-}
-
-ltp_score_add_count() {
-    key="$1"
-    value="$2"
-
-    if ! ltp_score_count_is_sane "$value"; then
-        LTP_SCORE_SUMMARY_VALID=0
-        return 0
-    fi
-
-    case "$key" in
-        passed)
-            LTP_SCORE_SUMMARY_PASS=$((LTP_SCORE_SUMMARY_PASS + value))
-            ;;
-        failed)
-            LTP_SCORE_SUMMARY_FAIL=$((LTP_SCORE_SUMMARY_FAIL + value))
-            ;;
-        broken)
-            LTP_SCORE_SUMMARY_BROK=$((LTP_SCORE_SUMMARY_BROK + value))
-            ;;
-        skipped)
-            LTP_SCORE_SUMMARY_SKIP=$((LTP_SCORE_SUMMARY_SKIP + value))
-            ;;
-        warnings)
-            LTP_SCORE_SUMMARY_WARN=$((LTP_SCORE_SUMMARY_WARN + value))
-            ;;
-    esac
-}
-
-ltp_score_count_token_line() {
-    line="$1"
-
-    case "$line" in
-        *TPASS*)
-            LTP_SCORE_TOKEN_PASS=$((LTP_SCORE_TOKEN_PASS + 1))
-            ;;
-        *TFAIL*)
-            LTP_SCORE_TOKEN_FAIL=$((LTP_SCORE_TOKEN_FAIL + 1))
-            ;;
-        *TBROK*)
-            LTP_SCORE_TOKEN_BROK=$((LTP_SCORE_TOKEN_BROK + 1))
-            ;;
-        *TCONF*)
-            LTP_SCORE_TOKEN_SKIP=$((LTP_SCORE_TOKEN_SKIP + 1))
-            ;;
-        *TWARN*)
-            LTP_SCORE_TOKEN_WARN=$((LTP_SCORE_TOKEN_WARN + 1))
-            ;;
-    esac
-}
-
-ltp_score_collect_from_log() {
-    log_path="$1"
-    ret="$2"
-
-    ltp_score_reset_counts
-    LTP_SCORE_SUMMARY_PASS=0
-    LTP_SCORE_SUMMARY_FAIL=0
-    LTP_SCORE_SUMMARY_BROK=0
-    LTP_SCORE_SUMMARY_SKIP=0
-    LTP_SCORE_SUMMARY_WARN=0
-    LTP_SCORE_TOKEN_PASS=0
-    LTP_SCORE_TOKEN_FAIL=0
-    LTP_SCORE_TOKEN_BROK=0
-    LTP_SCORE_TOKEN_SKIP=0
-    LTP_SCORE_TOKEN_WARN=0
-    LTP_SCORE_SUMMARY_VALID=1
-    LTP_SCORE_IN_SUMMARY=0
-
-    if [ -n "$log_path" ] && [ -f "$log_path" ]; then
-        while IFS= read -r LTP_SCORE_LINE || [ -n "$LTP_SCORE_LINE" ]; do
-            ltp_score_count_token_line "$LTP_SCORE_LINE"
-
-            case "$LTP_SCORE_LINE" in
-                Summary:)
-                    LTP_SCORE_IN_SUMMARY=1
-                    continue
-                    ;;
-                '')
-                    if [ "$LTP_SCORE_IN_SUMMARY" -eq 1 ]; then
-                        LTP_SCORE_IN_SUMMARY=0
-                    fi
-                    continue
-                    ;;
-            esac
-
-            if [ "$LTP_SCORE_IN_SUMMARY" -eq 1 ]; then
-                # LTP summaries are simple "key value" lines. Ignore any
-                # unrelated text in the block, but reject absurd counters.
-                # shellcheck disable=SC2086
-                set -- $LTP_SCORE_LINE
-                if [ "$#" -ge 2 ]; then
-                    case "$1" in
-                        passed|failed|broken|skipped|warnings)
-                            ltp_score_add_count "$1" "$2"
-                            ;;
-                    esac
-                fi
-            fi
-        done < "$log_path"
-    fi
-
-    LTP_SCORE_SUMMARY_TOTAL=$((LTP_SCORE_SUMMARY_PASS + LTP_SCORE_SUMMARY_FAIL + LTP_SCORE_SUMMARY_BROK + LTP_SCORE_SUMMARY_SKIP + LTP_SCORE_SUMMARY_WARN))
-    LTP_SCORE_TOKEN_TOTAL=$((LTP_SCORE_TOKEN_PASS + LTP_SCORE_TOKEN_FAIL + LTP_SCORE_TOKEN_BROK + LTP_SCORE_TOKEN_SKIP + LTP_SCORE_TOKEN_WARN))
-
-    if [ "$LTP_SCORE_SUMMARY_VALID" -eq 1 ] && [ "$LTP_SCORE_SUMMARY_TOTAL" -gt 0 ]; then
-        LTP_SCORE_PASS=$LTP_SCORE_SUMMARY_PASS
-        LTP_SCORE_FAIL=$LTP_SCORE_SUMMARY_FAIL
-        LTP_SCORE_BROK=$LTP_SCORE_SUMMARY_BROK
-        LTP_SCORE_SKIP=$LTP_SCORE_SUMMARY_SKIP
-        LTP_SCORE_WARN=$LTP_SCORE_SUMMARY_WARN
-    elif [ "$LTP_SCORE_TOKEN_TOTAL" -gt 0 ]; then
-        LTP_SCORE_PASS=$LTP_SCORE_TOKEN_PASS
-        LTP_SCORE_FAIL=$LTP_SCORE_TOKEN_FAIL
-        LTP_SCORE_BROK=$LTP_SCORE_TOKEN_BROK
-        LTP_SCORE_SKIP=$LTP_SCORE_TOKEN_SKIP
-        LTP_SCORE_WARN=$LTP_SCORE_TOKEN_WARN
-    elif [ "$ret" -eq 0 ]; then
-        LTP_SCORE_PASS=1
-    fi
-}
-
-ltp_score_emit_status_lines() {
-    count="$1"
-    kind="$2"
-    testcase="$3"
-
-    while [ "$count" -gt 0 ]; do
-        case "$kind" in
-            pass)
-                printf 'oscomp_ltp_score.c:1: \033[1;32mTPASS: \033[0m%s\n' "$testcase"
-                ;;
-            fail)
-                printf 'oscomp_ltp_score.c:1: \033[1;31mTFAIL: \033[0m%s\n' "$testcase"
-                ;;
-            brok)
-                printf 'oscomp_ltp_score.c:1: \033[1;31mTBROK: \033[0m%s\n' "$testcase"
-                ;;
-            skip)
-                printf 'oscomp_ltp_score.c:1: \033[1;33mTCONF: \033[0m%s\n' "$testcase"
-                ;;
-            warn)
-                printf 'oscomp_ltp_score.c:1: \033[1;35mTWARN: \033[0m%s\n' "$testcase"
-                ;;
-        esac
-        count=$((count - 1))
-    done
-}
-
-ltp_score_emit_case() {
-    testcase="$1"
-
-    ltp_score_emit_status_lines "$LTP_SCORE_PASS" pass "$testcase"
-    ltp_score_emit_status_lines "$LTP_SCORE_FAIL" fail "$testcase"
-    ltp_score_emit_status_lines "$LTP_SCORE_BROK" brok "$testcase"
-    ltp_score_emit_status_lines "$LTP_SCORE_SKIP" skip "$testcase"
-    ltp_score_emit_status_lines "$LTP_SCORE_WARN" warn "$testcase"
-
-    printf '\n'
-    printf 'Summary:\n'
-    printf 'passed   %s\n' "$LTP_SCORE_PASS"
-    printf 'failed   %s\n' "$LTP_SCORE_FAIL"
-    printf 'broken   %s\n' "$LTP_SCORE_BROK"
-    printf 'skipped  %s\n' "$LTP_SCORE_SKIP"
-    printf 'warnings %s\n' "$LTP_SCORE_WARN"
-    printf '\n'
-}
-
-ltp_cleanup_tmp_state() {
-    # LTP cases are intended to be independent, but some failure paths leave
-    # tmpdirs behind. A later libc flavor can otherwise inherit stale state.
-    if [ -r /proc/mounts ]; then
-        # Remove any stale LTP mounts before deleting their mountpoints.  Run a
-        # few passes because /proc/mounts is parent-first on some systems.
-        ltp_umount_pass=0
-        while [ "$ltp_umount_pass" -lt 3 ]; do
-            while IFS=' ' read -r _ ltp_mountpoint _; do
-                case "$ltp_mountpoint" in
-                    /tmp/LTP_*|/tmp/ltp-*|/tmp/ltp_*|/tmp/tst_*|/tmp/tmp.*)
-                        bb umount -l "$ltp_mountpoint" 2>/dev/null || \
-                            bb umount "$ltp_mountpoint" 2>/dev/null || true
-                        ;;
-                    /var/tmp/LTP_*|/var/tmp/ltp-*|/var/tmp/ltp_*|/var/tmp/tst_*|/var/tmp/tmp.*)
-                        bb umount -l "$ltp_mountpoint" 2>/dev/null || \
-                            bb umount "$ltp_mountpoint" 2>/dev/null || true
-                        ;;
-                esac
-            done </proc/mounts
-            ltp_umount_pass=$((ltp_umount_pass + 1))
-        done
-    fi
-
-    for dir in /tmp /var/tmp; do
-        [ -d "$dir" ] || continue
-        bb rm -rf \
-            "$dir"/LTP_* \
-            "$dir"/ltp-* \
-            "$dir"/ltp_* \
-            "$dir"/tst_* \
-            "$dir"/tmp.* \
-            2>/dev/null || true
-    done
 }
 
 prime_group_output_stream() {
@@ -1143,47 +913,17 @@ start_server() {
     return 0
 }
 
-normalize_iperf_output() {
-    client_log="$1"
-    cr=$(printf "\r")
-    [ -f "$client_log" ] || return 0
-
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            *"$cr")
-                line=${line%"$cr"}
-                ;;
-        esac
-        case "$line" in
-            \[SUM\]*)
-                ;;
-            \[*\]*receiver)
-                case "$line" in
-                    *"bits/sec"*)
-                        line="[  5]${line#*]}"
-                        ;;
-                esac
-                ;;
-        esac
-        printf "%s\n" "$line"
-    done < "$client_log"
-}
-
 run_iperf() {
     test_name="$1"
     want_case "$test_name" || return 0
 
     echo "====== iperf $test_name begin ======"
     args=$(iperf_args "$test_name") || exit 1
-    client_log="/var/tmp/oscomp-iperf-${test_name}.$$.log"
-    rm -f "$client_log" 2>/dev/null || true
-    if LD_LIBRARY_PATH=/glibc/lib:/lib "$IPERF_BIN" -c "$ip" -p "$port" $family_args -t "${OSCOMP_IPERF_LENGTH:-2}" -i 0 ${OSCOMP_IPERF_GLOBAL_ARGS:-} $args >"$client_log" 2>&1; then
+    if LD_LIBRARY_PATH=/glibc/lib:/lib "$IPERF_BIN" -c "$ip" -p "$port" $family_args -t "${OSCOMP_IPERF_LENGTH:-2}" -i 0 ${OSCOMP_IPERF_GLOBAL_ARGS:-} $args; then
         ans="success"
     else
         ans="fail"
     fi
-    normalize_iperf_output "$client_log"
-    rm -f "$client_log" 2>/dev/null || true
     echo "====== iperf $test_name end: $ans ======"
     echo ""
 }
@@ -1277,47 +1017,17 @@ start_server() {
     return 0
 }
 
-normalize_iperf_output() {
-    client_log="$1"
-    cr=$(printf "\r")
-    [ -f "$client_log" ] || return 0
-
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            *"$cr")
-                line=${line%"$cr"}
-                ;;
-        esac
-        case "$line" in
-            \[SUM\]*)
-                ;;
-            \[*\]*receiver)
-                case "$line" in
-                    *"bits/sec"*)
-                        line="[  5]${line#*]}"
-                        ;;
-                esac
-                ;;
-        esac
-        printf "%s\n" "$line"
-    done < "$client_log"
-}
-
 run_iperf() {
     test_name="$1"
     want_case "$test_name" || return 0
 
     echo "====== iperf $test_name begin ======"
     args=$(iperf_args "$test_name") || exit 1
-    client_log="/var/tmp/oscomp-iperf-${test_name}.$$.log"
-    rm -f "$client_log" 2>/dev/null || true
-    if "$IPERF_BIN" -c "$ip" -p "$port" $family_args -t "${OSCOMP_IPERF_LENGTH:-2}" -i 0 ${OSCOMP_IPERF_GLOBAL_ARGS:-} $args >"$client_log" 2>&1; then
+    if "$IPERF_BIN" -c "$ip" -p "$port" $family_args -t "${OSCOMP_IPERF_LENGTH:-2}" -i 0 ${OSCOMP_IPERF_GLOBAL_ARGS:-} $args; then
         ans="success"
     else
         ans="fail"
     fi
-    normalize_iperf_output "$client_log"
-    rm -f "$client_log" 2>/dev/null || true
     echo "====== iperf $test_name end: $ans ======"
     echo ""
 }
@@ -2657,18 +2367,20 @@ run_ltp_group() {
         fi
     fi
 
-    # The public judge only consumes the runner markers and Summary blocks.
-    # Emit bounded, sanitized summaries by default so noisy or corrupt guest
-    # output cannot poison the score parser.
+    # Match the visible pre-2025 runner protocol by default: each case keeps
+    # its native stdout/stderr on the console. Buffered capture is opt-in for
+    # local debugging only.
     ltp_case_output_mode
     if [ "${LTP_VIRT_OVERRIDE+x}" != "x" ]; then
         export LTP_VIRT_OVERRIDE=kvm
     fi
     if [ "${LTP_TIMEOUT_MUL+x}" != "x" ]; then
-        export LTP_TIMEOUT_MUL="${OSCOMP_LTP_TIMEOUT_MUL_DEFAULT:-2}"
+        case "$(runner_machine_quiet)" in
+            loongarch64)
+                export LTP_TIMEOUT_MUL=2
+                ;;
+        esac
     fi
-
-    ltp_cleanup_tmp_state
 
     run_ltp_case_command() {
         shell_path="$1"
@@ -2745,7 +2457,6 @@ run_ltp_group() {
         }
 
         ran_cases=$((ran_cases + 1))
-        ltp_cleanup_tmp_state
         echo "RUN LTP CASE $testcase"
         if runner_truthy "${OSCOMP_RUNNER_DEBUG:-0}" && [ "${testcase_path##*.}" = "sh" ]; then
             runner_debug "#### OSCOMP RUNNER LTP SHELL CASE ${testcase} PATH ${testcase_path} SHELL ${shell_path} TST_TEST_SH $(command -v tst_test.sh 2>/dev/null || true) ####"
@@ -2763,7 +2474,7 @@ run_ltp_group() {
         if [ "$LTP_CASE_OUTPUT_MODE" = "stream" ]; then
             run_ltp_case_command "$shell_path" "$testcase_path" "$@"
             ret=$?
-        elif [ "$LTP_CASE_OUTPUT_MODE" = "buffered" ]; then
+        else
             case_log="/var/tmp/oscomp-ltp-case-${testcase}.$$.$ran_cases.log"
             bb rm -f "$case_log" 2>/dev/null || true
             if run_ltp_case_command "$shell_path" "$testcase_path" "$@" >"$case_log" 2>&1; then
@@ -2781,30 +2492,6 @@ run_ltp_group() {
                 bb rm -f "$case_log" 2>/dev/null || true
                 case_log=""
             fi
-        else
-            case_log="/var/tmp/oscomp-ltp-case-${testcase}.$$.$ran_cases.log"
-            score_log="/var/tmp/oscomp-ltp-score-${testcase}.$$.$ran_cases.log"
-            bb rm -f "$case_log" "$score_log" 2>/dev/null || true
-            if run_ltp_case_command "$shell_path" "$testcase_path" "$@" >"$case_log" 2>&1; then
-                ret=0
-            else
-                ret=$?
-            fi
-
-            if bb tr -d '\015' <"$case_log" >"$score_log" 2>/dev/null; then
-                ltp_score_collect_from_log "$score_log" "$ret"
-            else
-                ltp_score_collect_from_log "$case_log" "$ret"
-            fi
-            ltp_score_emit_case "$testcase"
-
-            if [ "${OSCOMP_KEEP_LTP_CASE_LOGS:-0}" = "1" ]; then
-                runner_debug "#### OSCOMP RUNNER LTP CASE LOG ${case_log} ####"
-            else
-                bb rm -f "$case_log" 2>/dev/null || true
-                case_log=""
-            fi
-            bb rm -f "$score_log" 2>/dev/null || true
         fi
         if [ -n "$ltp_saved_preload" ]; then
             export LD_PRELOAD="$ltp_saved_preload"
@@ -2814,12 +2501,11 @@ run_ltp_group() {
 
         echo "FAIL LTP CASE $testcase : $ret"
         if [ "$ret" -ne 0 ]; then
-            if [ "$LTP_CASE_OUTPUT_MODE" = "buffered" ] && [ -n "$case_log" ] && [ -s "$case_log" ]; then
+            if [ -n "$case_log" ] && [ -s "$case_log" ]; then
                 cat "$case_log"
             fi
             group_failed=1
         fi
-        ltp_cleanup_tmp_state
     done <"$test_list"
     [ -z "$generated_test_list" ] || bb rm -f "$generated_test_list" 2>/dev/null || true
 
@@ -2910,40 +2596,6 @@ run_basic_group() {
         ret=$?
     fi
     return "$ret"
-}
-
-run_busybox_group() {
-    root="$1"
-
-    [ -x "$root/busybox" ] || {
-        runner_debug "#### OSCOMP RUNNER MISSING BUSYBOX BIN ${root}/busybox ####"
-        return 127
-    }
-    [ -f "$root/busybox_cmd.txt" ] || {
-        runner_debug "#### OSCOMP RUNNER MISSING BUSYBOX CMD ${root}/busybox_cmd.txt ####"
-        return 127
-    }
-
-    if ! cd "$root"; then
-        return 125
-    fi
-
-    ./busybox cat ./busybox_cmd.txt | while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            more\ *)
-                eval "./busybox $line | ./busybox cat"
-                ;;
-            *)
-                eval "./busybox $line"
-                ;;
-        esac
-        ret=$?
-        if [ "$ret" -ne 0 ] && [ "$line" != "false" ]; then
-            echo "testcase busybox $line fail"
-        else
-            echo "testcase busybox $line success"
-        fi
-    done
 }
 
 prepare_lmbench_env() {
@@ -3156,26 +2808,26 @@ reference_eval_plan() {
 
     cat <<'EOF'
 /musl basic
-/glibc basic
-/musl busybox
-/glibc busybox
 /musl iozone
-/glibc iozone
-/musl libctest
-/musl iperf
-/glibc iperf
-/glibc ltp
-/musl ltp
+/musl busybox
 /musl netperf
-/glibc netperf
 /musl lua
-/glibc lua
 /musl libcbench
-/glibc libcbench
+/musl libctest
 /musl cyclictest
+/glibc basic
+/glibc iozone
+/glibc busybox
+/glibc netperf
+/glibc lua
+/glibc libcbench
 /glibc cyclictest
 /musl lmbench
 /glibc lmbench
+/musl ltp
+/glibc ltp
+/musl iperf
+/glibc iperf
 EOF
 }
 
@@ -3221,9 +2873,7 @@ group_timeout_secs() {
 runner_now_epoch() {
     RUNNER_NOW_EPOCH=""
     if [ -r /proc/uptime ]; then
-        now_uptime=""
-        IFS=' ' read -r now_uptime _ </proc/uptime || now_uptime=""
-        now_epoch="${now_uptime%%.*}"
+        now_epoch="$(bb awk '{print int($1)}' /proc/uptime 2>/dev/null || true)"
     else
         now_epoch=""
     fi
@@ -3240,7 +2890,7 @@ runner_remaining_secs() {
     RUNNER_REMAINING_SECS=""
 
     case "$RUNNER_GLOBAL_TIMEOUT_SECS:$RUNNER_START_EPOCH" in
-        :*|*[!0-9:]*|:|''|*:)
+        *[!0-9:]*|:|''|*:)
             return 0
             ;;
     esac
@@ -3656,12 +3306,6 @@ emit_normalized_group_line() {
         *'#### OS COMP TEST GROUP '*)
             line="$(printf '%s\n' "$line" | bb sed -E 's/#### OS COMP TEST GROUP (START|END) [^#]+ ####//g')"
             ;;
-        'b_regex_compile ("(a|b|c)db")')
-            line='b_regex_compile ("(a|b|c)*d*b")'
-            ;;
-        'b_regex_search ("(a|b|c)db")')
-            line='b_regex_search ("(a|b|c)*d*b")'
-            ;;
     esac
     [ -n "$line" ] || return 0
     should_suppress_group_marker_line "$line" && return 0
@@ -3723,20 +3367,8 @@ run_group_script() {
     fi
 
     timeout_secs="$RUNNER_GROUP_TIMEOUT_SECS"
-    direct_group_output=0
-    if [ "$group" = "ltp" ]; then
-        direct_group_output=1
-    fi
-    case "$(runner_machine_quiet)" in
-        loongarch64)
-            direct_group_output=1
-            ;;
-    esac
-
     output_file="/tmp/oscomp-${group}-${flavor}.log"
-    if [ "$direct_group_output" -eq 0 ]; then
-        : > "$output_file"
-    fi
+    : > "$output_file"
     capture_process_snapshot
     run_dir="$root"
     run_script_name="${script##*/}"
@@ -3763,14 +3395,6 @@ run_group_script() {
 
     prime_group_output_stream
     STREAM_GROUP_OUTPUT_FRAGMENT=""
-
-    if [ "$direct_group_output" -eq 1 ]; then
-        exec 3>&1
-        exec 4>&2
-    else
-        exec 3>"$output_file"
-        exec 4>&3
-    fi
 
     (
         cd "$run_dir" || exit 125
@@ -3880,13 +3504,6 @@ run_group_script() {
                 emit_group_end "$group_marker"
                 exit "$group_status"
             fi
-            if [ "$group" = "busybox" ] && [ "$(runner_machine_quiet)" = "loongarch64" ]; then
-                emit_group_start "$group_marker"
-                run_busybox_group "$root"
-                group_status=$?
-                emit_group_end "$group_marker"
-                exit "$group_status"
-            fi
             if [ "$group" = "iozone" ]; then
                 emit_group_start "$group_marker"
                 run_iozone_group "$root" "$flavor" "$run_dir"
@@ -3905,18 +3522,14 @@ run_group_script() {
 
         run_clean_shell_script "$exec_shell" "$exec_script" </dev/null
         exit $?
-    ) </dev/null >&3 2>&4 &
+    ) </dev/null >"$output_file" 2>&1 &
     runner_pid=$!
-    exec 3>&-
-    exec 4>&-
     timed_out=""
     elapsed=0
     streamed_bytes=0
     while kill -0 "$runner_pid" 2>/dev/null; do
-        if [ "$direct_group_output" -eq 0 ]; then
-            stream_group_output_incremental "$output_file" "$streamed_bytes"
-            streamed_bytes="$STREAM_GROUP_OUTPUT_BYTES"
-        fi
+        stream_group_output_incremental "$output_file" "$streamed_bytes"
+        streamed_bytes="$STREAM_GROUP_OUTPUT_BYTES"
         if [ "$elapsed" -ge "$timeout_secs" ]; then
             timed_out=1
             runner_debug "#### OSCOMP RUNNER TIMEOUT ${script} AFTER ${timeout_secs}s ####"
@@ -3938,10 +3551,8 @@ run_group_script() {
     fi
     runner_debug "#### OSCOMP RUNNER GROUP WAIT DONE ${script} STATUS ${status} ####"
     refresh_runner_timeout_state
-    if [ "$direct_group_output" -eq 0 ]; then
-        stream_group_output_incremental "$output_file" "$streamed_bytes"
-        flush_group_output_fragment
-    fi
+    stream_group_output_incremental "$output_file" "$streamed_bytes"
+    flush_group_output_fragment
     runner_debug "#### OSCOMP RUNNER POST GROUP QUIESCE BEGIN ${script} ####"
     runner_quiesce_rounds "${OSCOMP_POST_GROUP_QUIESCE_ROUNDS:-128}"
     runner_debug "#### OSCOMP RUNNER POST GROUP QUIESCE END ${script} ####"
@@ -3970,9 +3581,7 @@ run_group_script() {
         runner_debug "#### OSCOMP RUNNER SETTLE IOZONE END ${script} ####"
     fi
     runner_debug "#### OSCOMP RUNNER END ${script} STATUS ${status} ####"
-    if [ "$direct_group_output" -eq 0 ]; then
-        bb rm -f "$output_file" 2>/dev/null || true
-    fi
+    bb rm -f "$output_file" 2>/dev/null || true
     return "$status"
 }
 
@@ -4022,13 +3631,13 @@ oscomp_runner_main() {
     export USER=root
     export TERM=dumb
 
-    RUNNER_GLOBAL_TIMEOUT_SECS="${OSCOMP_TIMEOUT_GLOBAL:-}"
+    RUNNER_GLOBAL_TIMEOUT_SECS="${OSCOMP_TIMEOUT_GLOBAL:-6900}"
     RUNNER_GLOBAL_TIMEOUT_REACHED=""
 
     runner_now_epoch
     RUNNER_START_EPOCH="$RUNNER_NOW_EPOCH"
     case "$RUNNER_GLOBAL_TIMEOUT_SECS:$RUNNER_START_EPOCH" in
-        :*|*[!0-9:]*|:|''|*:)
+        *[!0-9:]*|:|''|*:)
             RUNNER_GLOBAL_TIMEOUT_SECS=""
             ;;
     esac

@@ -257,15 +257,6 @@ pub fn reclaim_exited_tasks() {
     }
 }
 
-/// Only reclaim when the per-CPU exited-tasks queue has accumulated at least
-/// `threshold` entries. This avoids reclaim-churn on the clone hot path when
-/// threads exit roughly one-per-create (the ping-pong effect).
-pub fn reclaim_exited_tasks_if_many(threshold: usize) {
-    if crate::run_queue::exited_tasks_count() >= threshold {
-        crate::run_queue::reclaim_exited_tasks_current_cpu();
-    }
-}
-
 /// Set the affinity for the current task.
 /// [`AxCpuMask`] is used to specify the CPU affinity.
 /// Returns `true` if the affinity is set successfully.

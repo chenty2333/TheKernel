@@ -260,15 +260,6 @@ pub trait AsThread {
     }
 }
 
-impl Thread {
-    /// Create a new Thread.  Full Thread objects are not cached because they
-    /// own ProcessData references and signal state; axtask caches the safe
-    /// TaskInner shell instead.
-    pub fn new_cached(tid: u32, proc_data: Arc<ProcessData>) -> Box<Self> {
-        Thread::new(tid, proc_data)
-    }
-}
-
 impl AsThread for TaskInner {
     fn try_as_thread(&self) -> Option<&Thread> {
         self.task_ext()

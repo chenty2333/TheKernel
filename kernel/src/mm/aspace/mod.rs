@@ -18,10 +18,8 @@ use memory_addr::{
 use memory_set::{MemoryArea, MemorySet};
 
 mod backend;
-mod vma_cache;
 
 pub use self::backend::*;
-use self::vma_cache::VmaRangeCache;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PageFaultResult {
@@ -37,7 +35,6 @@ pub struct AddrSpace {
     growdown_starts: BTreeSet<VirtAddr>,
     wipe_on_fork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     locked_ranges: BTreeMap<VirtAddr, VirtAddr>,
-    fault_cache: VmaRangeCache<4>,
     pt: PageTable,
 }
 
@@ -87,13 +84,8 @@ impl AddrSpace {
             growdown_starts: BTreeSet::new(),
             wipe_on_fork_ranges: BTreeMap::new(),
             locked_ranges: BTreeMap::new(),
-            fault_cache: VmaRangeCache::new(),
             pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,
         })
-    }
-
-    fn invalidate_vma_caches(&self) {
-        self.fault_cache.invalidate();
     }
 
     fn refresh_growdown_starts(&mut self) {
@@ -322,7 +314,6 @@ impl AddrSpace {
             flags,
             Backend::new_linear(start_vaddr, start_paddr, size),
         );
-        self.invalidate_vma_caches();
         self.areas.map(area, &mut self.pt, false)?;
         Ok(())
     }
@@ -338,7 +329,6 @@ impl AddrSpace {
         self.validate_region(start, size)?;
 
         let area = MemoryArea::new(start, size, flags, backend);
-        self.invalidate_vma_caches();
         self.areas.map(area, &mut self.pt, false)?;
         if populate {
             self.populate_area(start, size, flags)?;
@@ -384,7 +374,6 @@ impl AddrSpace {
     pub fn unmap(&mut self, start: VirtAddr, size: usize) -> AxResult {
         self.validate_region(start, size)?;
 
-        self.invalidate_vma_caches();
         self.areas.unmap(start, size, &mut self.pt)?;
         self.refresh_growdown_starts();
         self.clear_wipe_on_fork_range(start, size);
@@ -457,7 +446,6 @@ impl AddrSpace {
     pub fn protect(&mut self, start: VirtAddr, size: usize, flags: MappingFlags) -> AxResult {
         self.validate_region(start, size)?;
 
-        self.invalidate_vma_caches();
         self.areas
             .protect(start, size, |_| Some(flags), &mut self.pt)?;
         self.refresh_growdown_starts();
@@ -467,7 +455,6 @@ impl AddrSpace {
 
     /// Removes all mappings in the address space.
     pub fn clear(&mut self) {
-        self.invalidate_vma_caches();
         if let Err(err) = self.areas.clear(&mut self.pt) {
             warn!("AddrSpace::clear: failed to unmap all areas: {err:?}");
         }
@@ -596,7 +583,7 @@ impl AddrSpace {
         if !self.va_range.contains(vaddr) {
             return PageFaultResult::Unhandled;
         }
-        if let Some(area) = self.fault_cache.find_snapshot(&self.areas, vaddr) {
+        if let Some(area) = self.areas.find(vaddr) {
             let flags = area.flags();
             if flags.contains(access_flags) {
                 let page_size = area.backend().page_size();
