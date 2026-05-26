@@ -3412,6 +3412,7 @@ run_group_script() {
             if [ -d "$root/ltp/testscripts" ]; then
                 BUILT_GROUP_PATH="$root/ltp/testscripts${BUILT_GROUP_PATH:+:$BUILT_GROUP_PATH}"
             fi
+            export LTP_COLORIZE_OUTPUT="${OSCOMP_LTP_COLORIZE_OUTPUT:-y}"
             export LTP_DEV_FS_TYPE=tmpfs
             export LTP_SINGLE_FS_TYPE=tmpfs
         fi
