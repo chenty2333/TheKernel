@@ -154,6 +154,154 @@ ltp_case_output_mode() {
     fi
 }
 
+ltp_output_normalize_enabled() {
+    if runner_falsy "${OSCOMP_LTP_NORMALIZE_OUTPUT:-y}"; then
+        return 1
+    fi
+    return 0
+}
+
+ltp_normalize_trim_result_rest() {
+    LTP_NORMALIZE_RESULT_REST="$1"
+
+    while :; do
+        case "$LTP_NORMALIZE_RESULT_REST" in
+            " "*)
+                LTP_NORMALIZE_RESULT_REST=${LTP_NORMALIZE_RESULT_REST# }
+                ;;
+            "	"*)
+                LTP_NORMALIZE_RESULT_REST=${LTP_NORMALIZE_RESULT_REST#	}
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    case "$LTP_NORMALIZE_RESULT_REST" in
+        :*)
+            LTP_NORMALIZE_RESULT_REST=${LTP_NORMALIZE_RESULT_REST#:}
+            ;;
+    esac
+
+    while :; do
+        case "$LTP_NORMALIZE_RESULT_REST" in
+            " "*)
+                LTP_NORMALIZE_RESULT_REST=${LTP_NORMALIZE_RESULT_REST# }
+                ;;
+            "	"*)
+                LTP_NORMALIZE_RESULT_REST=${LTP_NORMALIZE_RESULT_REST#	}
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+}
+
+ltp_normalize_emit_old_result_line() {
+    ltp_normalize_line="$1"
+    ltp_normalize_kind="$2"
+    ltp_normalize_color="$3"
+    ltp_normalize_esc="$4"
+    ltp_normalize_token="${ltp_normalize_esc}[${ltp_normalize_color}m${ltp_normalize_kind}${ltp_normalize_esc}[0m"
+    ltp_normalize_prefix=${ltp_normalize_line%%"$ltp_normalize_token"*}
+    ltp_normalize_suffix=${ltp_normalize_line#*"$ltp_normalize_token"}
+
+    ltp_normalize_trim_result_rest "$ltp_normalize_suffix"
+    printf '%s%s[%sm%s: %s[0m%s\n' \
+        "$ltp_normalize_prefix" "$ltp_normalize_esc" "$ltp_normalize_color" \
+        "$ltp_normalize_kind" "$ltp_normalize_esc" "$LTP_NORMALIZE_RESULT_REST"
+}
+
+ltp_normalize_case_output() {
+    ltp_normalize_log="$1"
+    ltp_normalize_esc=$(printf '\033')
+    ltp_normalize_saw_summary=0
+    ltp_normalize_result_seen=0
+    ltp_normalize_passed=0
+    ltp_normalize_failed=0
+    ltp_normalize_broken=0
+    ltp_normalize_skipped=0
+    ltp_normalize_warnings=0
+
+    while IFS= read -r ltp_normalize_line || [ -n "$ltp_normalize_line" ]; do
+        case "$ltp_normalize_line" in
+            Summary:)
+                ltp_normalize_saw_summary=1
+                printf '%s\n' "$ltp_normalize_line"
+                continue
+                ;;
+        esac
+
+        if [ "${ltp_normalize_line#*"${ltp_normalize_esc}[1;32mTPASS${ltp_normalize_esc}[0m"}" != "$ltp_normalize_line" ]; then
+            ltp_normalize_passed=$((ltp_normalize_passed + 1))
+            ltp_normalize_result_seen=1
+            ltp_normalize_emit_old_result_line "$ltp_normalize_line" TPASS "1;32" "$ltp_normalize_esc"
+            continue
+        fi
+        if [ "${ltp_normalize_line#*"${ltp_normalize_esc}[1;31mTFAIL${ltp_normalize_esc}[0m"}" != "$ltp_normalize_line" ]; then
+            ltp_normalize_failed=$((ltp_normalize_failed + 1))
+            ltp_normalize_result_seen=1
+            ltp_normalize_emit_old_result_line "$ltp_normalize_line" TFAIL "1;31" "$ltp_normalize_esc"
+            continue
+        fi
+        if [ "${ltp_normalize_line#*"${ltp_normalize_esc}[1;31mTBROK${ltp_normalize_esc}[0m"}" != "$ltp_normalize_line" ]; then
+            ltp_normalize_broken=$((ltp_normalize_broken + 1))
+            ltp_normalize_result_seen=1
+            ltp_normalize_emit_old_result_line "$ltp_normalize_line" TBROK "1;31" "$ltp_normalize_esc"
+            continue
+        fi
+        if [ "${ltp_normalize_line#*"${ltp_normalize_esc}[1;33mTCONF${ltp_normalize_esc}[0m"}" != "$ltp_normalize_line" ]; then
+            ltp_normalize_skipped=$((ltp_normalize_skipped + 1))
+            ltp_normalize_result_seen=1
+            ltp_normalize_emit_old_result_line "$ltp_normalize_line" TCONF "1;33" "$ltp_normalize_esc"
+            continue
+        fi
+        if [ "${ltp_normalize_line#*"${ltp_normalize_esc}[1;35mTWARN${ltp_normalize_esc}[0m"}" != "$ltp_normalize_line" ]; then
+            ltp_normalize_warnings=$((ltp_normalize_warnings + 1))
+            ltp_normalize_result_seen=1
+            ltp_normalize_emit_old_result_line "$ltp_normalize_line" TWARN "1;35" "$ltp_normalize_esc"
+            continue
+        fi
+
+        case "$ltp_normalize_line" in
+            *"${ltp_normalize_esc}[1;32mTPASS: ${ltp_normalize_esc}[0m"*)
+                ltp_normalize_passed=$((ltp_normalize_passed + 1))
+                ltp_normalize_result_seen=1
+                ;;
+            *"${ltp_normalize_esc}[1;31mTFAIL: ${ltp_normalize_esc}[0m"*)
+                ltp_normalize_failed=$((ltp_normalize_failed + 1))
+                ltp_normalize_result_seen=1
+                ;;
+            *"${ltp_normalize_esc}[1;31mTBROK: ${ltp_normalize_esc}[0m"*)
+                ltp_normalize_broken=$((ltp_normalize_broken + 1))
+                ltp_normalize_result_seen=1
+                ;;
+            *"${ltp_normalize_esc}[1;33mTCONF: ${ltp_normalize_esc}[0m"*)
+                ltp_normalize_skipped=$((ltp_normalize_skipped + 1))
+                ltp_normalize_result_seen=1
+                ;;
+            *"${ltp_normalize_esc}[1;35mTWARN: ${ltp_normalize_esc}[0m"*)
+                ltp_normalize_warnings=$((ltp_normalize_warnings + 1))
+                ltp_normalize_result_seen=1
+                ;;
+        esac
+
+        printf '%s\n' "$ltp_normalize_line"
+    done <"$ltp_normalize_log"
+
+    if [ "$ltp_normalize_saw_summary" -eq 0 ] && [ "$ltp_normalize_result_seen" -eq 1 ]; then
+        printf '\n'
+        printf 'Summary:\n'
+        printf 'passed   %d\n' "$ltp_normalize_passed"
+        printf 'failed   %d\n' "$ltp_normalize_failed"
+        printf 'broken   %d\n' "$ltp_normalize_broken"
+        printf 'skipped  %d\n' "$ltp_normalize_skipped"
+        printf 'warnings %d\n' "$ltp_normalize_warnings"
+    fi
+}
+
 prime_group_output_stream() {
     if [ -n "${OSCOMP_GROUP_OUTPUT_PRIMED:-}" ]; then
         return 0
@@ -2276,14 +2424,14 @@ patch_ltp_shell_harness() {
 }
 
 find_ltp_case_override() {
-    root="$1"
-    testcase="$2"
+    ltp_override_root="$1"
+    ltp_override_case="$2"
     LTP_CASE_OVERRIDE_PATH=""
 
     [ -n "${OSCOMP_SUPPORT_LTP_ROOT:-}" ] || return 1
     [ -d "$OSCOMP_SUPPORT_LTP_ROOT" ] || return 1
 
-    case "$root" in
+    case "$ltp_override_root" in
         /musl)
             ltp_flavor=musl
             ;;
@@ -2297,10 +2445,10 @@ find_ltp_case_override() {
 
     ltp_machine="$(runner_machine_quiet)"
     for candidate in \
-        "$OSCOMP_SUPPORT_LTP_ROOT/$ltp_machine/$ltp_flavor/$testcase" \
-        "$OSCOMP_SUPPORT_LTP_ROOT/$ltp_flavor/$testcase" \
-        "$OSCOMP_SUPPORT_LTP_ROOT/$ltp_machine/$testcase" \
-        "$OSCOMP_SUPPORT_LTP_ROOT/$testcase"
+        "$OSCOMP_SUPPORT_LTP_ROOT/$ltp_machine/$ltp_flavor/$ltp_override_case" \
+        "$OSCOMP_SUPPORT_LTP_ROOT/$ltp_flavor/$ltp_override_case" \
+        "$OSCOMP_SUPPORT_LTP_ROOT/$ltp_machine/$ltp_override_case" \
+        "$OSCOMP_SUPPORT_LTP_ROOT/$ltp_override_case"
     do
         [ -f "$candidate" ] || continue
         [ -x "$candidate" ] || continue
@@ -2410,6 +2558,35 @@ run_ltp_group() {
         fi
     }
 
+    resolve_ltp_case_path() {
+        resolve_name="$1"
+        LTP_CASE_PATH_RESULT=""
+
+        if [ -f "ltp/testcases/bin/$resolve_name" ]; then
+            LTP_CASE_PATH_RESULT="./ltp/testcases/bin/$resolve_name"
+            return 0
+        fi
+        if [ -f "ltp/testscripts/$resolve_name" ]; then
+            LTP_CASE_PATH_RESULT="./ltp/testscripts/$resolve_name"
+            return 0
+        fi
+
+        resolve_matches=0
+        for resolve_candidate in $(bb find ltp/testcases -type f -name "$resolve_name" 2>/dev/null || true); do
+            resolve_matches=$((resolve_matches + 1))
+            LTP_CASE_PATH_RESULT="./$resolve_candidate"
+            [ "$resolve_matches" -le 1 ] || break
+        done
+        if [ "$resolve_matches" -gt 1 ]; then
+            runner_debug "#### OSCOMP RUNNER AMBIGUOUS LTP CASE ${resolve_name} ####"
+            return 2
+        fi
+        if [ -n "$LTP_CASE_PATH_RESULT" ]; then
+            return 0
+        fi
+        return 1
+    }
+
     ran_cases=0
     group_failed=0
     while IFS= read -r testcase || [ -n "$testcase" ]; do
@@ -2428,31 +2605,37 @@ run_ltp_group() {
 
         testcase="$1"
         shift
+        ltp_exec_name="$testcase"
 
-        testcase_path=""
-        if [ -f "ltp/testcases/bin/$testcase" ]; then
-            testcase_path="./ltp/testcases/bin/$testcase"
-        elif [ -f "ltp/testscripts/$testcase" ]; then
-            testcase_path="./ltp/testscripts/$testcase"
-        else
-            testcase_matches=0
-            for candidate in $(bb find ltp/testcases -type f -name "$testcase" 2>/dev/null || true); do
-                testcase_matches=$((testcase_matches + 1))
-                testcase_path="./$candidate"
-                [ "$testcase_matches" -le 1 ] || break
-            done
-            if [ "$testcase_matches" -gt 1 ]; then
-                runner_debug "#### OSCOMP RUNNER AMBIGUOUS LTP CASE ${testcase} ####"
+        if [ "$#" -gt 0 ]; then
+            ltp_maybe_exec="$1"
+            resolve_ltp_case_path "$ltp_maybe_exec"
+            ltp_resolve_status=$?
+            if [ "$ltp_resolve_status" -eq 0 ]; then
+                ltp_exec_name="$ltp_maybe_exec"
+                shift
+            elif [ "$ltp_resolve_status" -eq 2 ]; then
                 return 127
             fi
         fi
 
+        testcase_path=""
+        resolve_ltp_case_path "$ltp_exec_name"
+        ltp_resolve_status=$?
+        if [ "$ltp_resolve_status" -eq 0 ]; then
+            testcase_path="$LTP_CASE_PATH_RESULT"
+        elif [ "$ltp_resolve_status" -eq 2 ]; then
+            return 127
+        fi
+
         if find_ltp_case_override "$root" "$testcase"; then
+            testcase_path="$LTP_CASE_OVERRIDE_PATH"
+        elif [ "$ltp_exec_name" != "$testcase" ] && find_ltp_case_override "$root" "$ltp_exec_name"; then
             testcase_path="$LTP_CASE_OVERRIDE_PATH"
         fi
 
         [ -n "$testcase_path" ] || {
-            runner_debug "#### OSCOMP RUNNER MISSING LTP CASE ${testcase} ####"
+            runner_debug "#### OSCOMP RUNNER MISSING LTP CASE ${testcase} EXEC ${ltp_exec_name} ####"
             return 127
         }
 
@@ -2471,7 +2654,22 @@ run_ltp_group() {
                 export LD_PRELOAD="$OSCOMP_SUPPORT_LIB/liboscomp-mmsg-compat.so"
             fi
         fi
-        if [ "$LTP_CASE_OUTPUT_MODE" = "stream" ]; then
+        if ltp_output_normalize_enabled; then
+            case_log="/var/tmp/oscomp-ltp-case-${testcase}.$$.$ran_cases.log"
+            bb rm -f "$case_log" 2>/dev/null || true
+            if run_ltp_case_command "$shell_path" "$testcase_path" "$@" >"$case_log" 2>&1; then
+                ret=0
+            else
+                ret=$?
+            fi
+            ltp_normalize_case_output "$case_log"
+            if [ "${OSCOMP_KEEP_LTP_CASE_LOGS:-0}" = "1" ]; then
+                runner_debug "#### OSCOMP RUNNER LTP CASE LOG ${case_log} ####"
+            else
+                bb rm -f "$case_log" 2>/dev/null || true
+                case_log=""
+            fi
+        elif [ "$LTP_CASE_OUTPUT_MODE" = "stream" ]; then
             run_ltp_case_command "$shell_path" "$testcase_path" "$@"
             ret=$?
         else

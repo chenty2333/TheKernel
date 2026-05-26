@@ -664,3 +664,112 @@ write05
 write06
 writev01
 writev07
+abs01 abs01
+access04
+bind05
+bpf_map01
+bpf_prog02
+bpf_prog03
+bpf_prog04
+bpf_prog05
+bpf_prog06
+bpf_prog07
+capget01
+capget02
+capset01
+capset02
+capset03
+capset04
+chdir01A symlink01 -T chdir01
+chmod06
+clock_settime01
+clock_settime03
+close_range01
+copy_file_range02
+cp01_sh cp_tests.sh
+cpio01_sh cpio_tests.sh
+creat06
+du01_sh du01.sh
+epoll_create01
+epoll_create1_01
+epoll_create1_02
+epoll_ctl01
+epoll_ctl02
+epoll_ctl03
+epoll_pwait01
+epoll_pwait02
+epoll_pwait03
+epoll_pwait04
+epoll_pwait05
+epoll_wait01
+epoll_wait02
+epoll_wait03
+epoll_wait04
+epoll_wait05
+epoll_wait06
+epoll_wait07
+eventfd01
+eventfd02
+eventfd03
+eventfd04
+eventfd05
+file01_sh file01.sh
+getgroups01
+getgroups03
+getresgid01
+getresgid02
+getresgid03
+getresuid01
+getresuid02
+getresuid03
+getsid01
+getsid02
+getxattr03
+inotify01
+inotify02
+inotify04
+inotify10
+kill02 kill02
+kill07 kill07
+kill08 kill08
+kill09 kill09
+kill10 kill10
+kill12 kill12
+link05 link05
+link08 link08
+linkat01 linkat01
+listen01 listen01
+ln01_sh ln_tests.sh
+mkdir01_sh mkdir_tests.sh
+mkdir03 mkdir03
+mkdirat01 mkdirat01
+mkdirat02 mkdirat02
+mknod01 mknod01
+mknod03 mknod03
+mknod04 mknod04
+mknod05 mknod05
+mknod06 mknod06
+mknod07 mknod07
+mknod08 mknod08
+mknod09 mknod09
+mknodat01 mknodat01
+mknodat02 mknodat02
+mlock202 mlock202
+mmap01 mmap01
+mprotect01 mprotect01
+mprotect02 mprotect02
+mprotect03 mprotect03
+mprotect04 mprotect04
+msync01 msync01
+msync02 msync02
+msync03 msync03
+munmap01 munmap01
+munmap02 munmap02
+munmap03 munmap03
+mv01_sh mv_tests.sh
+open01A symlink01 -T open01
+open13 open13
+tar01_sh  tar_tests.sh
+unzip01_sh unzip01.sh
+wc01_sh wc01.sh
+which01_sh which01.sh
