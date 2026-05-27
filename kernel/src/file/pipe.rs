@@ -25,10 +25,13 @@ use ringbuf::{
 use starry_signal::{SignalInfo, Signo};
 use starry_vm::VmMutPtr;
 
-use super::{FileLike, Kstat, fs::metadata_to_kstat};
+use super::{AsyncIoOwner, AsyncIoState, FileLike, Kstat, fs::metadata_to_kstat};
 use crate::{
     file::{IoDst, IoSrc},
-    task::{AsThread, send_signal_to_process},
+    task::{
+        AsThread, send_signal_to_process, send_signal_to_process_group,
+        send_signal_to_visible_thread,
+    },
 };
 
 const RING_BUFFER_INIT_SIZE: usize = 65536; // 64 KiB
@@ -52,6 +55,13 @@ struct Shared {
     poll_rx: PollSet,
     poll_tx: PollSet,
     poll_close: PollSet,
+    async_io: Mutex<PipeAsyncIo>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PipeAsyncIo {
+    enabled: bool,
+    state: AsyncIoState,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,6 +102,7 @@ struct NamedPipeState {
     poll_rx: PollSet,
     poll_tx: PollSet,
     poll_open: PollSet,
+    async_io: Mutex<PipeAsyncIo>,
     readers: AtomicUsize,
     writers: AtomicUsize,
 }
@@ -103,6 +114,7 @@ impl NamedPipeState {
             poll_rx: PollSet::new(),
             poll_tx: PollSet::new(),
             poll_open: PollSet::new(),
+            async_io: Mutex::new(PipeAsyncIo::default()),
             readers: AtomicUsize::new(0),
             writers: AtomicUsize::new(0),
         }
@@ -186,6 +198,7 @@ impl Pipe {
             poll_rx: PollSet::new(),
             poll_tx: PollSet::new(),
             poll_close: PollSet::new(),
+            async_io: Mutex::new(PipeAsyncIo::default()),
         });
         let read_end = Pipe {
             read_side: true,
@@ -251,6 +264,12 @@ impl Pipe {
         Ok(new_size)
     }
 
+    pub(crate) fn set_async_io(&self, enabled: bool, state: AsyncIoState) {
+        if self.is_read() {
+            *self.shared.async_io.lock() = PipeAsyncIo { enabled, state };
+        }
+    }
+
     pub fn vmsplice_read(&self, dst: &mut IoDst, nonblocking: bool) -> AxResult<usize> {
         if !self.is_read() {
             return Err(AxError::BadFileDescriptor);
@@ -313,6 +332,7 @@ impl Pipe {
             };
             if written > 0 {
                 self.shared.poll_rx.wake();
+                notify_async_readable(&self.shared.async_io);
                 Ok(written)
             } else {
                 Err(AxError::WouldBlock)
@@ -453,6 +473,33 @@ fn raise_pipe() {
     .expect("Failed to send SIGPIPE");
 }
 
+fn notify_async_readable(async_io: &Mutex<PipeAsyncIo>) {
+    let async_io = *async_io.lock();
+    if !async_io.enabled {
+        return;
+    }
+
+    let signo = if async_io.state.signal == 0 {
+        Signo::SIGIO
+    } else {
+        Signo::from_repr(async_io.state.signal).unwrap_or(Signo::SIGIO)
+    };
+    let signal = Some(SignalInfo::new_kernel(signo));
+
+    match async_io.state.owner {
+        AsyncIoOwner::Tid(tid) if tid > 0 => {
+            let _ = send_signal_to_visible_thread(None, tid, signal);
+        }
+        AsyncIoOwner::Pid(pid) if pid > 0 => {
+            let _ = send_signal_to_process(pid, signal);
+        }
+        AsyncIoOwner::Pgrp(pgid) if pgid > 0 => {
+            let _ = send_signal_to_process_group(pgid, signal);
+        }
+        _ => {}
+    }
+}
+
 impl NamedPipe {
     pub(crate) fn open(location: Location, flags: u32) -> AxResult<Self> {
         let access = PipeAccess::from_flags(flags);
@@ -508,6 +555,12 @@ impl NamedPipe {
         self.location
             .absolute_path()
             .map_or_else(|_| "<error>".into(), |path| Cow::Owned(path.to_string()))
+    }
+
+    pub(crate) fn set_async_io(&self, enabled: bool, state: AsyncIoState) {
+        if self.access.can_read() {
+            *self.state.async_io.lock() = PipeAsyncIo { enabled, state };
+        }
     }
 }
 
@@ -578,6 +631,7 @@ impl FileLike for Pipe {
             };
             if written > 0 {
                 self.shared.poll_rx.wake();
+                notify_async_readable(&self.shared.async_io);
                 total_written += written;
                 if total_written == size || self.nonblocking() {
                     return Ok(total_written);
@@ -707,6 +761,7 @@ impl FileLike for NamedPipe {
             };
             if written > 0 {
                 self.state.poll_rx.wake();
+                notify_async_readable(&self.state.async_io);
                 total_written += written;
                 if total_written == size || self.nonblocking() {
                     return Ok(total_written);

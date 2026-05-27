@@ -21,11 +21,12 @@ use axtask::current;
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
 use spin::RwLock;
+use starry_signal::Signo;
 
 use crate::{
     file::{
-        Directory, FD_TABLE, File, FileDescriptor, FileLike, Pipe, ResolveAtResult,
-        add_file_like_with_flags, close_file_like,
+        AsyncIoOwner, Directory, FD_TABLE, File, FileDescription, FileDescriptor, FileLike, Pipe,
+        ResolveAtResult, add_file_like_with_flags, close_file_like,
         flock::{self, RecordLockOwner},
         get_file_description, get_file_like, get_typed_file,
         inotify::{
@@ -35,6 +36,7 @@ use crate::{
         permission::{
             check_create_permissions, check_open_permissions, check_path_prefix_search_permissions,
         },
+        pipe::NamedPipe,
         release_posix_locks_on_close, resolve_at, with_path_fs,
     },
     mm::{UserConstPtr, UserPtr, vm_load_string},
@@ -83,11 +85,33 @@ fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32))
 
 fn open_status_flags(flags: u32) -> u32 {
     let mut status = flags & O_ACCMODE;
-    status |= flags & (O_APPEND | O_NONBLOCK);
+    status |= flags & (O_APPEND | O_NONBLOCK | FASYNC);
     status
 }
 
-const FCNTL_SETFL_MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK;
+const FCNTL_SETFL_MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK | FASYNC;
+
+fn validate_async_signal(sig: c_int) -> AxResult<u8> {
+    if sig == 0 {
+        return Ok(0);
+    }
+    if sig < 0 || sig > Signo::SIGRT32 as c_int {
+        return Err(AxError::InvalidInput);
+    }
+    Signo::from_repr(sig as u8)
+        .map(|_| sig as u8)
+        .ok_or(AxError::InvalidInput)
+}
+
+fn sync_async_io_to_file(description: &FileDescription) {
+    let enabled = description.status_flags() & FASYNC != 0;
+    let state = description.async_io_state();
+    if let Some(pipe) = description.inner.downcast_ref::<Pipe>() {
+        pipe.set_async_io(enabled, state);
+    } else if let Some(pipe) = description.inner.downcast_ref::<NamedPipe>() {
+        pipe.set_async_io(enabled, state);
+    }
+}
 
 fn open_access_mask(flags: c_int) -> u32 {
     if flags as u32 & O_PATH != 0 {
@@ -920,6 +944,71 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
             let file = File::from_fd(fd)?;
             Ok(lease::get_lease(file.as_ref()) as isize)
         }
+        F_SETOWN => {
+            let description = get_file_description(fd)?;
+            let owner = arg as c_int;
+            let owner = if owner < 0 {
+                AsyncIoOwner::Pgrp(owner.checked_neg().ok_or(AxError::InvalidInput)? as _)
+            } else {
+                AsyncIoOwner::Pid(owner as _)
+            };
+            description.set_async_io_owner(owner);
+            sync_async_io_to_file(&description);
+            Ok(0)
+        }
+        F_GETOWN => {
+            let description = get_file_description(fd)?;
+            let owner = match description.async_io_state().owner {
+                AsyncIoOwner::Tid(pid) | AsyncIoOwner::Pid(pid) => pid as c_int,
+                AsyncIoOwner::Pgrp(pgid) => -(pgid as c_int),
+            };
+            Ok(owner as isize)
+        }
+        F_SETOWN_EX => {
+            let description = get_file_description(fd)?;
+            let owner = *UserConstPtr::<f_owner_ex>::from(arg as *const f_owner_ex).get_as_ref()?;
+            if owner.pid < 0 {
+                return Err(AxError::InvalidInput);
+            }
+            let owner = match owner.type_ as u32 {
+                F_OWNER_TID => AsyncIoOwner::Tid(owner.pid as _),
+                F_OWNER_PID => AsyncIoOwner::Pid(owner.pid as _),
+                F_OWNER_PGRP => AsyncIoOwner::Pgrp(owner.pid as _),
+                _ => return Err(AxError::InvalidInput),
+            };
+            description.set_async_io_owner(owner);
+            sync_async_io_to_file(&description);
+            Ok(0)
+        }
+        F_GETOWN_EX => {
+            let description = get_file_description(fd)?;
+            let owner = UserPtr::<f_owner_ex>::from(arg).get_as_mut()?;
+            match description.async_io_state().owner {
+                AsyncIoOwner::Tid(pid) => {
+                    owner.type_ = F_OWNER_TID as _;
+                    owner.pid = pid as _;
+                }
+                AsyncIoOwner::Pid(pid) => {
+                    owner.type_ = F_OWNER_PID as _;
+                    owner.pid = pid as _;
+                }
+                AsyncIoOwner::Pgrp(pgid) => {
+                    owner.type_ = F_OWNER_PGRP as _;
+                    owner.pid = pgid as _;
+                }
+            }
+            Ok(0)
+        }
+        F_SETSIG => {
+            let description = get_file_description(fd)?;
+            description.set_async_io_signal(validate_async_signal(arg as c_int)?);
+            sync_async_io_to_file(&description);
+            Ok(0)
+        }
+        F_GETSIG => {
+            let description = get_file_description(fd)?;
+            Ok(description.async_io_state().signal as isize)
+        }
         F_SETFL => {
             let description = get_file_description(fd)?;
             let new_flags = (description.status_flags() & !FCNTL_SETFL_MUTABLE_FLAGS)
@@ -928,6 +1017,7 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
                 .inner
                 .set_nonblocking(new_flags & O_NONBLOCK != 0)?;
             description.set_status_flags(new_flags);
+            sync_async_io_to_file(&description);
             Ok(0)
         }
         F_GETFL => {

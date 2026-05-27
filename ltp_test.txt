@@ -912,6 +912,8 @@ fcntl26 fcntl26
 fcntl26_64 fcntl26_64
 fcntl27 fcntl27
 fcntl27_64 fcntl27_64
+fcntl31 fcntl31
+fcntl31_64 fcntl31_64
 fcntl32 fcntl32
 fcntl32_64 fcntl32_64
 fcntl33 fcntl33

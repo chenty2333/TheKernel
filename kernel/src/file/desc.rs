@@ -7,6 +7,8 @@ use core::{
 
 use axerrno::AxResult;
 use axpoll::{IoEvents, Pollable};
+use spin::Mutex;
+use starry_process::Pid;
 
 use super::{
     flock, lease,
@@ -15,10 +17,33 @@ use super::{
 
 static FILE_DESCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy)]
+pub enum AsyncIoOwner {
+    Tid(Pid),
+    Pid(Pid),
+    Pgrp(Pid),
+}
+
+#[derive(Clone, Copy)]
+pub struct AsyncIoState {
+    pub owner: AsyncIoOwner,
+    pub signal: u8,
+}
+
+impl Default for AsyncIoState {
+    fn default() -> Self {
+        Self {
+            owner: AsyncIoOwner::Pid(0),
+            signal: 0,
+        }
+    }
+}
+
 pub struct FileDescription {
     pub inner: Arc<dyn FileLike>,
     flock_owner: u64,
     status_flags: AtomicU32,
+    async_io: Mutex<AsyncIoState>,
 }
 
 impl FileDescription {
@@ -34,6 +59,7 @@ impl FileDescription {
             inner,
             flock_owner: FILE_DESCRIPTION_ID.fetch_add(1, Ordering::Relaxed),
             status_flags: AtomicU32::new(status_flags),
+            async_io: Mutex::new(AsyncIoState::default()),
         })
     }
 
@@ -47,6 +73,18 @@ impl FileDescription {
 
     pub fn set_status_flags(&self, flags: u32) {
         self.status_flags.store(flags, Ordering::Relaxed);
+    }
+
+    pub fn async_io_state(&self) -> AsyncIoState {
+        *self.async_io.lock()
+    }
+
+    pub fn set_async_io_owner(&self, owner: AsyncIoOwner) {
+        self.async_io.lock().owner = owner;
+    }
+
+    pub fn set_async_io_signal(&self, signal: u8) {
+        self.async_io.lock().signal = signal;
     }
 }
 
