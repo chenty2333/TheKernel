@@ -168,6 +168,7 @@ flock06
 fork01
 fork03
 fork04
+fork05
 fork07
 fork08
 fork10
@@ -711,6 +712,8 @@ epoll_create1_02
 epoll_ctl01
 epoll_ctl02
 epoll_ctl03
+epoll_ctl04
+epoll_ctl05
 epoll_pwait01
 epoll_pwait02
 epoll_pwait03
@@ -905,6 +908,7 @@ fcntl33 fcntl33
 fcntl34 fcntl34
 fcntl34_64 fcntl34_64
 fcntl36 fcntl36
+fcntl36_64
 fcntl37
 fcntl37_64
 fdatasync01 fdatasync01

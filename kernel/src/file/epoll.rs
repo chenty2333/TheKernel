@@ -11,6 +11,7 @@ use alloc::{
     collections::vec_deque::VecDeque,
     sync::{Arc, Weak},
     task::Wake,
+    vec::Vec,
 };
 use core::{
     hash::{Hash, Hasher},
@@ -18,14 +19,16 @@ use core::{
     task::{Context, Waker},
 };
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axpoll::{IoEvents, PollSet, Pollable};
 use bitflags::bitflags;
 use hashbrown::HashMap;
 use kspin::SpinNoPreempt;
 use linux_raw_sys::general::{EPOLLET, EPOLLONESHOT, epoll_event};
 
-use crate::file::{FileDescription, FileLike, get_file_description};
+use crate::file::{FileDescription, FileLike, FileLikeKind, get_file_description};
+
+const EPOLL_MAX_NESTS: usize = 5;
 
 pub struct EpollEvent {
     pub events: IoEvents,
@@ -265,6 +268,88 @@ impl Epoll {
         Self::default()
     }
 
+    #[inline]
+    fn id(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
+    fn child_descriptions(&self) -> Vec<Arc<FileDescription>> {
+        self.inner
+            .interests
+            .lock()
+            .keys()
+            .map(|key| Arc::clone(&key.file))
+            .collect()
+    }
+
+    fn reaches_epoll_id(&self, target_id: usize, stack: &mut Vec<usize>) -> bool {
+        let id = self.id();
+        if id == target_id {
+            return true;
+        }
+        if stack.contains(&id) {
+            return false;
+        }
+
+        stack.push(id);
+        let mut found = false;
+        for child in self.child_descriptions() {
+            if let Some(epoll) = child.inner.downcast_ref::<Epoll>()
+                && epoll.reaches_epoll_id(target_id, stack)
+            {
+                found = true;
+                break;
+            }
+        }
+        stack.pop();
+        found
+    }
+
+    fn max_nested_depth(&self, stack: &mut Vec<usize>) -> usize {
+        let id = self.id();
+        if stack.contains(&id) {
+            return EPOLL_MAX_NESTS;
+        }
+
+        stack.push(id);
+        let mut max_depth = 0;
+        for child in self.child_descriptions() {
+            let depth = if let Some(epoll) = child.inner.downcast_ref::<Epoll>() {
+                1 + epoll.max_nested_depth(stack)
+            } else {
+                1
+            };
+            max_depth = max_depth.max(depth);
+        }
+        stack.pop();
+        max_depth
+    }
+
+    fn validate_add_target(&self, key: &EntryKey) -> AxResult<()> {
+        match FileLikeKind::from_file_like(key.get_file()) {
+            FileLikeKind::Regular | FileLikeKind::Directory => {
+                return Err(LinuxError::EPERM.into());
+            }
+            FileLikeKind::Fifo | FileLikeKind::Socket | FileLikeKind::Other => {}
+        }
+
+        let Some(epoll) = key.get_file().inner.downcast_ref::<Epoll>() else {
+            return Ok(());
+        };
+
+        if epoll.id() == self.id() {
+            return Err(AxError::InvalidInput);
+        }
+        if epoll.reaches_epoll_id(self.id(), &mut Vec::new()) {
+            return Err(LinuxError::ELOOP.into());
+        }
+        if 1 + epoll.max_nested_depth(&mut Vec::new()) > EPOLL_MAX_NESTS {
+            return Err(AxError::InvalidInput);
+        }
+
+        Ok(())
+    }
+
     // only register waker, not add to ready queue
     fn register_waker_only(&self, interest: &Arc<EpollInterest>) {
         if !interest.is_enabled() {
@@ -312,6 +397,7 @@ impl Epoll {
 
     pub fn add(&self, fd: i32, event: EpollEvent, flags: EpollFlags) -> AxResult<()> {
         let key = EntryKey::new(fd)?;
+        self.validate_add_target(&key)?;
         let interest = Arc::new(EpollInterest::new(key.clone(), event, flags));
         let mut guard = self.inner.interests.lock();
         if guard.contains_key(&key) {
