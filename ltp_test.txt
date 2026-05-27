@@ -1011,3 +1011,4 @@ inotify06 inotify06
 prctl01 prctl01
 prctl08 prctl08
 pipe15 pipe15
+pidfd_send_signal01 pidfd_send_signal01

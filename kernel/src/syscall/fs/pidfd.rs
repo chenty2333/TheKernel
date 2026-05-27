@@ -1,12 +1,37 @@
 use axerrno::{AxError, AxResult};
+use axtask::current;
 use bitflags::bitflags;
 use starry_signal::SignalInfo;
 
 use crate::{
-    file::{FD_TABLE, FileLike, PidFd, add_file_description},
+    file::{Directory, FD_TABLE, FileLike, PidFd, add_file_description},
     syscall::signal::make_queue_signal_info,
     task::{AsThread, get_process_data, get_visible_task, send_signal_to_process},
 };
+
+fn process_data_from_proc_dir_fd(fd: i32) -> AxResult<alloc::sync::Arc<crate::task::ProcessData>> {
+    let dir = Directory::from_fd(fd)?;
+    let path = dir.path();
+    let proc_path = path.strip_prefix("/proc/").ok_or(AxError::InvalidInput)?;
+    let pid = if proc_path == "self" {
+        current().as_thread().proc_data.proc.pid()
+    } else {
+        proc_path
+            .split('/')
+            .next()
+            .and_then(|it| it.parse::<u32>().ok())
+            .ok_or(AxError::InvalidInput)?
+    };
+    get_process_data(pid)
+}
+
+fn process_data_from_signal_fd(fd: i32) -> AxResult<alloc::sync::Arc<crate::task::ProcessData>> {
+    match PidFd::from_fd(fd) {
+        Ok(pidfd) => pidfd.process_data(),
+        Err(AxError::InvalidInput) => process_data_from_proc_dir_fd(fd),
+        Err(err) => Err(err),
+    }
+}
 
 bitflags! {
     #[derive(Debug, Clone, Copy, Default)]
@@ -59,8 +84,7 @@ pub fn sys_pidfd_send_signal(
         return Err(AxError::InvalidInput);
     }
 
-    let pidfd = PidFd::from_fd(pidfd)?;
-    let pid = pidfd.process_data()?.proc.pid();
+    let pid = process_data_from_signal_fd(pidfd)?.proc.pid();
 
     let sig = make_queue_signal_info(pid, signo, sig)?;
     send_signal_to_process(pid, sig)?;
