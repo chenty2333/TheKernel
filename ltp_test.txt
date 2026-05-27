@@ -991,3 +991,4 @@ pidfd_send_signal02 pidfd_send_signal02
 pidfd_getfd02 pidfd_getfd02
 prctl02 prctl02
 prctl05 prctl05
+epoll01 epoll-ltp
