@@ -214,6 +214,36 @@ pub fn sys_prctl(
             buf[..len].copy_from_slice(&name.as_bytes()[..len]);
             vm_write_slice(arg2 as _, &buf)?;
         }
+        PR_SET_PDEATHSIG => {
+            if arg2 > 64 {
+                return Err(AxError::InvalidInput);
+            }
+            current()
+                .as_thread()
+                .proc_data
+                .set_pdeath_signal(arg2 as u32);
+        }
+        PR_GET_PDEATHSIG => {
+            (arg2 as *mut i32).vm_write(current().as_thread().proc_data.pdeath_signal() as i32)?;
+        }
+        PR_SET_TIMERSLACK => {
+            current().as_thread().proc_data.set_timerslack_ns(arg2);
+        }
+        PR_GET_TIMERSLACK => {
+            return Ok(current().as_thread().proc_data.timerslack_ns() as isize);
+        }
+        PR_SET_NO_NEW_PRIVS => {
+            if arg2 != 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            current().as_thread().proc_data.set_no_new_privs();
+        }
+        PR_GET_NO_NEW_PRIVS => {
+            if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            return Ok(current().as_thread().proc_data.no_new_privs() as isize);
+        }
         PR_SET_SECCOMP => {}
         PR_MCE_KILL => {}
         PR_CAPBSET_DROP => {

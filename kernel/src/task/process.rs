@@ -70,6 +70,14 @@ pub struct ProcessData {
     supplementary_groups: SpinNoIrq<Vec<u32>>,
     /// Linux personality flags shared by all threads in the process.
     personality: AtomicU32,
+    /// Parent-death signal configured through prctl(PR_SET_PDEATHSIG).
+    pdeath_signal: AtomicU32,
+    /// Current timer slack in nanoseconds.
+    timerslack_current_ns: AtomicUsize,
+    /// Default timer slack in nanoseconds, used when PR_SET_TIMERSLACK is 0.
+    timerslack_default_ns: AtomicUsize,
+    /// no_new_privs state configured through prctl(PR_SET_NO_NEW_PRIVS).
+    no_new_privs: AtomicU32,
     /// Process-scoped membarrier registration state.
     membarrier_state: AtomicU32,
     /// POSIX interval timers created by this process.
@@ -136,6 +144,10 @@ impl ProcessData {
             caps: SpinNoIrq::new(CapabilityState::full()),
             supplementary_groups: SpinNoIrq::new(Vec::new()),
             personality: AtomicU32::new(0),
+            pdeath_signal: AtomicU32::new(0),
+            timerslack_current_ns: AtomicUsize::new(50_000),
+            timerslack_default_ns: AtomicUsize::new(50_000),
+            no_new_privs: AtomicU32::new(0),
             membarrier_state: AtomicU32::new(0),
             posix_timers: SpinNoIrq::new(Vec::new()),
             exited_threads_usage: AtomicTaskUsage::new(),
@@ -170,6 +182,41 @@ impl ProcessData {
     /// Set the top address of the user heap.
     pub fn set_heap_top(&self, top: usize) {
         self.heap_top.store(top, Ordering::Release)
+    }
+
+    pub fn pdeath_signal(&self) -> u32 {
+        self.pdeath_signal.load(Ordering::Acquire)
+    }
+
+    pub fn set_pdeath_signal(&self, signo: u32) {
+        self.pdeath_signal.store(signo, Ordering::Release)
+    }
+
+    pub fn timerslack_ns(&self) -> usize {
+        self.timerslack_current_ns.load(Ordering::Acquire)
+    }
+
+    pub fn set_timerslack_ns(&self, value: usize) {
+        let value = if value == 0 {
+            self.timerslack_default_ns.load(Ordering::Acquire)
+        } else {
+            value
+        };
+        self.timerslack_current_ns.store(value, Ordering::Release)
+    }
+
+    pub fn inherit_timerslack_from(&self, parent: &Self) {
+        let value = parent.timerslack_ns();
+        self.timerslack_current_ns.store(value, Ordering::Release);
+        self.timerslack_default_ns.store(value, Ordering::Release);
+    }
+
+    pub fn no_new_privs(&self) -> bool {
+        self.no_new_privs.load(Ordering::Acquire) != 0
+    }
+
+    pub fn set_no_new_privs(&self) {
+        self.no_new_privs.store(1, Ordering::Release)
     }
 
     /// Linux manual: A "clone" child is one which delivers no signal, or a

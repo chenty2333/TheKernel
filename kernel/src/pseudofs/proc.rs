@@ -155,12 +155,15 @@ fn task_status(task: &AxTaskRef) -> String {
         Pid:\t{}\n\
         Uid:\t0 0 0 0\n\
         Gid:\t0 0 0 0\n\
+        VmSwap:\t0 kB\n\
+        NoNewPrivs:\t{}\n\
         Cpus_allowed:\t1\n\
         Cpus_allowed_list:\t0\n\
         Mems_allowed:\t1\n\
         Mems_allowed_list:\t0",
         task.as_thread().proc_data.proc.pid(),
-        task.as_thread().tid()
+        task.as_thread().tid(),
+        task.as_thread().proc_data.no_new_privs() as u8
     )
 }
 
@@ -334,6 +337,7 @@ impl SimpleDirOps for ThreadDir {
                 Some("mounts"),
                 Some("cmdline"),
                 Some("coredump_filter"),
+                Some("timerslack_ns"),
                 Some("comm"),
                 Some("exe"),
                 Some("fd"),
@@ -435,6 +439,26 @@ impl SimpleDirOps for ThreadDir {
             })
             .into(),
             "coredump_filter" => SimpleFile::new_regular(fs, rw_static_file("33\n")).into(),
+            "timerslack_ns" => SimpleFile::new_regular(
+                fs,
+                RwFile::new(move |req| match req {
+                    SimpleFileOperation::Read => Ok(Some(
+                        format!("{}\n", task.as_thread().proc_data.timerslack_ns()).into_bytes(),
+                    )),
+                    SimpleFileOperation::Write(data) => {
+                        if !data.is_empty() {
+                            let value = str::from_utf8(data)
+                                .ok()
+                                .map(str::trim)
+                                .and_then(|it| it.parse::<usize>().ok())
+                                .ok_or(VfsError::InvalidInput)?;
+                            task.as_thread().proc_data.set_timerslack_ns(value);
+                        }
+                        Ok(None)
+                    }
+                }),
+            )
+            .into(),
             "comm" => SimpleFile::new_regular(
                 fs,
                 RwFile::new(move |req| match req {

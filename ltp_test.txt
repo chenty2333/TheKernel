@@ -1008,3 +1008,5 @@ stime02 stime02
 waitid10 waitid10
 syslog11 syslog11
 inotify06 inotify06
+prctl01 prctl01
+prctl08 prctl08
