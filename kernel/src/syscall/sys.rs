@@ -131,9 +131,30 @@ const fn pad_str(info: &str) -> [c_char; 65] {
     data
 }
 
-const PER_LINUX: u32 = 0;
 const PER_MASK: u32 = 0xff;
 const UNAME26: u32 = 0x0020_000;
+const ADDR_NO_RANDOMIZE: u32 = 0x0040_000;
+const FDPIC_FUNCPTRS: u32 = 0x0080_000;
+const MMAP_PAGE_ZERO: u32 = 0x0100_000;
+const ADDR_COMPAT_LAYOUT: u32 = 0x0200_000;
+const READ_IMPLIES_EXEC: u32 = 0x0400_000;
+const ADDR_LIMIT_32BIT: u32 = 0x0800_000;
+const SHORT_INODE: u32 = 0x1000_000;
+const WHOLE_SECONDS: u32 = 0x2000_000;
+const STICKY_TIMEOUTS: u32 = 0x4000_000;
+const ADDR_LIMIT_3GB: u32 = 0x8000_000;
+const SUPPORTED_PERSONALITY: u32 = PER_MASK
+    | UNAME26
+    | ADDR_NO_RANDOMIZE
+    | FDPIC_FUNCPTRS
+    | MMAP_PAGE_ZERO
+    | ADDR_COMPAT_LAYOUT
+    | READ_IMPLIES_EXEC
+    | ADDR_LIMIT_32BIT
+    | SHORT_INODE
+    | WHOLE_SECONDS
+    | STICKY_TIMEOUTS
+    | ADDR_LIMIT_3GB;
 const UNAME26_RELEASE: &[u8] = b"2.6.60";
 
 fn fill_uts_field(dst: &mut [c_char; 65], src: &[u8]) {
@@ -263,7 +284,7 @@ pub fn sys_personality(persona: u32) -> AxResult<isize> {
         return Ok(old as isize);
     }
 
-    if persona & !(PER_MASK | UNAME26) != 0 || (persona & PER_MASK) != PER_LINUX {
+    if persona & !SUPPORTED_PERSONALITY != 0 {
         return Err(AxError::InvalidInput);
     }
 

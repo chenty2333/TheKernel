@@ -905,6 +905,7 @@ newuname01 newuname01
 open12 open12
 openat02 openat02
 personality01 personality01
+personality02
 renameat201 renameat201
 timer_gettime01 timer_gettime01
 timer_settime03 timer_settime03
