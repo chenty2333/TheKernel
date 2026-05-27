@@ -329,6 +329,8 @@ mtest01
 nanosleep01
 nanosleep02
 nanosleep04
+name_to_handle_at01
+name_to_handle_at02
 nfs05_make_tree -d 5 -f 20 -t 5
 nice01
 nice02
@@ -349,6 +351,8 @@ openat04
 openat201
 openat202
 openat203
+open_by_handle_at01
+open_by_handle_at02
 pathconf01
 pathconf02
 pause01

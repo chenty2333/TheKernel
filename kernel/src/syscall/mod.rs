@@ -293,6 +293,16 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
+        Sysno::name_to_handle_at => sys_name_to_handle_at(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2().into(),
+            uctx.arg3().into(),
+            uctx.arg4() as _,
+        ),
+        Sysno::open_by_handle_at => {
+            sys_open_by_handle_at(uctx.arg0() as _, uctx.arg1().into(), uctx.arg2() as _)
+        }
         Sysno::close => sys_close(uctx.arg0() as _),
         Sysno::close_range => sys_close_range(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         Sysno::dup => sys_dup(uctx.arg0() as _),

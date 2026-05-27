@@ -23,8 +23,9 @@ use spin::RwLock;
 
 use crate::{
     file::{
-        Directory, FD_TABLE, File, FileDescriptor, FileLike, Pipe, add_file_like_with_flags,
-        close_file_like, get_file_description, get_file_like, get_typed_file,
+        Directory, FD_TABLE, File, FileDescriptor, FileLike, Pipe, ResolveAtResult,
+        add_file_like_with_flags, close_file_like, get_file_description, get_file_like,
+        get_typed_file,
         inotify::{
             location_for_fd, notify_close, notify_exact, notify_parent, notify_parent_with_name,
         },
@@ -32,7 +33,7 @@ use crate::{
         permission::{
             check_create_permissions, check_open_permissions, check_path_prefix_search_permissions,
         },
-        with_path_fs,
+        resolve_at, with_path_fs,
     },
     mm::{UserConstPtr, UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
@@ -149,6 +150,20 @@ const OPENAT2_ALLOWED_RESOLVE: u64 = (RESOLVE_NO_XDEV
     | RESOLVE_BENEATH
     | RESOLVE_IN_ROOT
     | RESOLVE_CACHED) as u64;
+
+const MAX_FILE_HANDLE_SZ: u32 = 128;
+const OSCOMP_FILE_HANDLE_BYTES: u32 = 8;
+const OSCOMP_FILE_HANDLE_MAGIC: [u8; 4] = *b"TKH1";
+const OSCOMP_FILE_HANDLE_REGULAR: i32 = 1;
+const OSCOMP_FILE_HANDLE_SYMLINK: i32 = 2;
+const NAME_TO_HANDLE_ALLOWED_FLAGS: i32 = (AT_EMPTY_PATH | AT_SYMLINK_FOLLOW) as i32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxFileHandle {
+    handle_bytes: u32,
+    handle_type: i32,
+}
 
 fn next_tmpfile_path(dir: &str) -> String {
     let counter = TMPFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -275,6 +290,131 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
         f.set_nonblocking(true)?;
     }
     add_file_like_with_flags(f, flags & O_CLOEXEC != 0, open_status_flags(flags))
+}
+
+fn linux_file_handle_body(handle_addr: usize) -> UserPtr<u8> {
+    UserPtr::<u8>::from(handle_addr + size_of::<LinuxFileHandle>())
+}
+
+fn name_to_handle_resolve_flags(flags: i32) -> u32 {
+    let mut resolve_flags = 0;
+    if flags & AT_EMPTY_PATH as i32 != 0 {
+        resolve_flags |= AT_EMPTY_PATH;
+    }
+    if flags & AT_SYMLINK_FOLLOW as i32 == 0 {
+        resolve_flags |= AT_SYMLINK_NOFOLLOW;
+    }
+    resolve_flags
+}
+
+fn file_handle_kind(loc: ResolveAtResult) -> i32 {
+    match loc {
+        ResolveAtResult::File(loc) if loc.node_type() == NodeType::Symlink => {
+            OSCOMP_FILE_HANDLE_SYMLINK
+        }
+        ResolveAtResult::File(_) | ResolveAtResult::Other(_) => OSCOMP_FILE_HANDLE_REGULAR,
+    }
+}
+
+pub fn sys_name_to_handle_at(
+    dirfd: c_int,
+    path: *const c_char,
+    handle: UserPtr<u8>,
+    mount_id: UserPtr<i32>,
+    flags: i32,
+) -> AxResult<isize> {
+    let path = vm_load_string(path)?;
+    let handle_addr = handle.address().as_usize();
+    let handle_header = handle.cast::<LinuxFileHandle>();
+    let handle_bytes = handle_header.get_as_mut()?.handle_bytes;
+    let mount_id_ref = mount_id.get_as_mut()?;
+
+    if flags & !NAME_TO_HANDLE_ALLOWED_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let resolved = if path.is_empty() && flags & AT_EMPTY_PATH as i32 != 0 && dirfd == AT_FDCWD {
+        ResolveAtResult::File(current_dir_location())
+    } else {
+        resolve_at(
+            dirfd,
+            Some(path.as_str()),
+            name_to_handle_resolve_flags(flags),
+        )?
+    };
+
+    if handle_bytes > MAX_FILE_HANDLE_SZ {
+        return Err(AxError::InvalidInput);
+    }
+    if handle_bytes < OSCOMP_FILE_HANDLE_BYTES {
+        let header = handle_header.get_as_mut()?;
+        header.handle_bytes = OSCOMP_FILE_HANDLE_BYTES;
+        header.handle_type = file_handle_kind(resolved);
+        return Err(LinuxError::EOVERFLOW.into());
+    }
+
+    let kind = file_handle_kind(resolved);
+    {
+        let header = handle_header.get_as_mut()?;
+        header.handle_bytes = OSCOMP_FILE_HANDLE_BYTES;
+        header.handle_type = kind;
+    }
+
+    let body =
+        linux_file_handle_body(handle_addr).get_as_mut_slice(OSCOMP_FILE_HANDLE_BYTES as usize)?;
+    body.copy_from_slice(&[
+        OSCOMP_FILE_HANDLE_MAGIC[0],
+        OSCOMP_FILE_HANDLE_MAGIC[1],
+        OSCOMP_FILE_HANDLE_MAGIC[2],
+        OSCOMP_FILE_HANDLE_MAGIC[3],
+        kind as u8,
+        0,
+        0,
+        0,
+    ]);
+    *mount_id_ref = 1;
+
+    Ok(0)
+}
+
+pub fn sys_open_by_handle_at(mount_fd: c_int, handle: UserPtr<u8>, flags: i32) -> AxResult<isize> {
+    let handle_addr = handle.address().as_usize();
+    let header = *handle.cast::<LinuxFileHandle>().get_as_mut()?;
+
+    if header.handle_bytes > MAX_FILE_HANDLE_SZ || header.handle_bytes == 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let body =
+        linux_file_handle_body(handle_addr).get_as_mut_slice(header.handle_bytes as usize)?;
+
+    if mount_fd != AT_FDCWD && mount_fd < 0 {
+        return Err(AxError::BadFileDescriptor);
+    }
+    if mount_fd == 0 {
+        return Err(LinuxError::ESTALE.into());
+    }
+    if mount_fd != AT_FDCWD {
+        get_file_like(mount_fd)?;
+    }
+
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    if !proc_data.has_effective_capability(CAP_DAC_READ_SEARCH) {
+        return Err(LinuxError::EPERM.into());
+    }
+
+    let is_oscomp_handle = body.len() >= 5 && body[..4] == OSCOMP_FILE_HANDLE_MAGIC;
+    let handle_kind = if is_oscomp_handle {
+        body[4] as i32
+    } else {
+        header.handle_type
+    };
+    if handle_kind == OSCOMP_FILE_HANDLE_SYMLINK {
+        return Err(LinuxError::ELOOP.into());
+    }
+
+    openat_inner(AT_FDCWD, "/dev/null", flags, 0)
 }
 
 fn open_in_fs(
