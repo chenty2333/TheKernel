@@ -214,6 +214,21 @@ ltp_normalize_emit_old_result_line() {
         "$ltp_normalize_kind" "$ltp_normalize_esc" "$LTP_NORMALIZE_RESULT_REST"
 }
 
+ltp_normalize_emit_plain_result_line() {
+    ltp_normalize_line="$1"
+    ltp_normalize_kind="$2"
+    ltp_normalize_color="$3"
+    ltp_normalize_esc="$4"
+    ltp_normalize_token="${ltp_normalize_kind}:"
+    ltp_normalize_prefix=${ltp_normalize_line%%"$ltp_normalize_token"*}
+    ltp_normalize_suffix=${ltp_normalize_line#*"$ltp_normalize_token"}
+
+    ltp_normalize_trim_result_rest "$ltp_normalize_suffix"
+    printf '%s%s[%sm%s: %s[0m%s\n' \
+        "$ltp_normalize_prefix" "$ltp_normalize_esc" "$ltp_normalize_color" \
+        "$ltp_normalize_kind" "$ltp_normalize_esc" "$LTP_NORMALIZE_RESULT_REST"
+}
+
 ltp_normalize_case_output() {
     ltp_normalize_log="$1"
     ltp_normalize_esc=$(printf '\033')
@@ -287,6 +302,41 @@ ltp_normalize_case_output() {
                 ltp_normalize_result_seen=1
                 ;;
         esac
+
+        if [ "${ltp_normalize_line#*"$ltp_normalize_esc"}" = "$ltp_normalize_line" ]; then
+            case "$ltp_normalize_line" in
+                *"TPASS:"*)
+                    ltp_normalize_passed=$((ltp_normalize_passed + 1))
+                    ltp_normalize_result_seen=1
+                    ltp_normalize_emit_plain_result_line "$ltp_normalize_line" TPASS "1;32" "$ltp_normalize_esc"
+                    continue
+                    ;;
+                *"TFAIL:"*)
+                    ltp_normalize_failed=$((ltp_normalize_failed + 1))
+                    ltp_normalize_result_seen=1
+                    ltp_normalize_emit_plain_result_line "$ltp_normalize_line" TFAIL "1;31" "$ltp_normalize_esc"
+                    continue
+                    ;;
+                *"TBROK:"*)
+                    ltp_normalize_broken=$((ltp_normalize_broken + 1))
+                    ltp_normalize_result_seen=1
+                    ltp_normalize_emit_plain_result_line "$ltp_normalize_line" TBROK "1;31" "$ltp_normalize_esc"
+                    continue
+                    ;;
+                *"TCONF:"*)
+                    ltp_normalize_skipped=$((ltp_normalize_skipped + 1))
+                    ltp_normalize_result_seen=1
+                    ltp_normalize_emit_plain_result_line "$ltp_normalize_line" TCONF "1;33" "$ltp_normalize_esc"
+                    continue
+                    ;;
+                *"TWARN:"*)
+                    ltp_normalize_warnings=$((ltp_normalize_warnings + 1))
+                    ltp_normalize_result_seen=1
+                    ltp_normalize_emit_plain_result_line "$ltp_normalize_line" TWARN "1;35" "$ltp_normalize_esc"
+                    continue
+                    ;;
+            esac
+        fi
 
         printf '%s\n' "$ltp_normalize_line"
     done <"$ltp_normalize_log"
