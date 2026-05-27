@@ -738,6 +738,10 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                     }),
                 ),
             );
+            fs_dir.add(
+                "pipe-user-pages-soft",
+                SimpleFile::new_regular(fs.clone(), rw_static_file("16\n")),
+            );
             fs_dir.add("inotify", {
                 let mut inotify = DirMapping::new();
                 inotify.add(

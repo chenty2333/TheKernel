@@ -1010,3 +1010,4 @@ syslog11 syslog11
 inotify06 inotify06
 prctl01 prctl01
 prctl08 prctl08
+pipe15 pipe15
