@@ -309,6 +309,7 @@ mlock02
 mlock03
 mlock04
 mmap02
+mmap03
 mmap04
 mmap05
 mmap06
