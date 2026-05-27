@@ -71,6 +71,15 @@ pub fn add_file_like(f: Arc<dyn FileLike>, cloexec: bool) -> AxResult<c_int> {
     add_file_description(FileDescription::new(f), cloexec)
 }
 
+/// Add a file with initial file status flags to the file descriptor table.
+pub fn add_file_like_with_flags(
+    f: Arc<dyn FileLike>,
+    cloexec: bool,
+    status_flags: u32,
+) -> AxResult<c_int> {
+    add_file_description(FileDescription::new_with_flags(f, status_flags), cloexec)
+}
+
 /// Close a file by `fd`.
 pub fn close_file_like(fd: c_int) -> AxResult {
     let f = FD_TABLE

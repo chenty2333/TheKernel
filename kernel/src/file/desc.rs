@@ -1,5 +1,9 @@
 use alloc::{borrow::Cow, sync::Arc};
-use core::{ops::Deref, sync::atomic::{AtomicU64, Ordering}, task::Context};
+use core::{
+    ops::Deref,
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    task::Context,
+};
 
 use axerrno::AxResult;
 use axpoll::{IoEvents, Pollable};
@@ -14,18 +18,35 @@ static FILE_DESCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 pub struct FileDescription {
     pub inner: Arc<dyn FileLike>,
     flock_owner: u64,
+    status_flags: AtomicU32,
 }
 
 impl FileDescription {
     pub(in crate::file) fn new(inner: Arc<dyn FileLike>) -> Arc<Self> {
+        Self::new_with_flags(inner, 0)
+    }
+
+    pub(in crate::file) fn new_with_flags(
+        inner: Arc<dyn FileLike>,
+        status_flags: u32,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner,
             flock_owner: FILE_DESCRIPTION_ID.fetch_add(1, Ordering::Relaxed),
+            status_flags: AtomicU32::new(status_flags),
         })
     }
 
     pub fn flock_owner(&self) -> u64 {
         self.flock_owner
+    }
+
+    pub fn status_flags(&self) -> u32 {
+        self.status_flags.load(Ordering::Relaxed)
+    }
+
+    pub fn set_status_flags(&self, flags: u32) {
+        self.status_flags.store(flags, Ordering::Relaxed);
     }
 }
 

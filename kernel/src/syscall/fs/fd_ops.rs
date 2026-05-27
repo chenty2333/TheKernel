@@ -23,8 +23,8 @@ use spin::RwLock;
 
 use crate::{
     file::{
-        Directory, FD_TABLE, File, FileDescriptor, FileLike, Pipe, add_file_like, close_file_like,
-        get_file_description, get_file_like, get_typed_file,
+        Directory, FD_TABLE, File, FileDescriptor, FileLike, Pipe, add_file_like_with_flags,
+        close_file_like, get_file_description, get_file_like, get_typed_file,
         inotify::{
             location_for_fd, notify_close, notify_exact, notify_parent, notify_parent_with_name,
         },
@@ -77,6 +77,14 @@ fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32))
     }
     options
 }
+
+fn open_status_flags(flags: u32) -> u32 {
+    let mut status = flags & O_ACCMODE;
+    status |= flags & (O_APPEND | O_NONBLOCK);
+    status
+}
+
+const FCNTL_SETFL_MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK;
 
 fn open_access_mask(flags: c_int) -> u32 {
     if flags as u32 & O_PATH != 0 {
@@ -266,7 +274,7 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
     if flags & O_NONBLOCK != 0 {
         f.set_nonblocking(true)?;
     }
-    add_file_like(f, flags & O_CLOEXEC != 0)
+    add_file_like_with_flags(f, flags & O_CLOEXEC != 0, open_status_flags(flags))
 }
 
 fn open_in_fs(
@@ -708,24 +716,20 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
             Ok(lease::get_lease(file.as_ref()) as isize)
         }
         F_SETFL => {
-            get_file_like(fd)?.set_nonblocking(arg & (O_NONBLOCK as usize) > 0)?;
+            let description = get_file_description(fd)?;
+            let new_flags = (description.status_flags() & !FCNTL_SETFL_MUTABLE_FLAGS)
+                | ((arg as u32) & FCNTL_SETFL_MUTABLE_FLAGS);
+            description
+                .inner
+                .set_nonblocking(new_flags & O_NONBLOCK != 0)?;
+            description.set_status_flags(new_flags);
             Ok(0)
         }
         F_GETFL => {
-            let f = get_file_like(fd)?;
-
-            let mut ret = 0;
-            if f.nonblocking() {
+            let description = get_file_description(fd)?;
+            let mut ret = description.status_flags();
+            if description.inner.nonblocking() {
                 ret |= O_NONBLOCK;
-            }
-
-            let perm = NodePermission::from_bits_truncate(f.stat()?.mode as _);
-            if perm.contains(NodePermission::OWNER_WRITE) {
-                if perm.contains(NodePermission::OWNER_READ) {
-                    ret |= O_RDWR;
-                } else {
-                    ret |= O_WRONLY;
-                }
             }
 
             Ok(ret as _)

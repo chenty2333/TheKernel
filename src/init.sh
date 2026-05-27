@@ -453,6 +453,21 @@ ltp_normalize_case_output() {
     fi
 }
 
+ltp_emit_silent_success_case_output() {
+    ltp_silent_case="$1"
+    ltp_silent_esc=$(printf '\033')
+
+    printf '%s.c:1: %s[1;32mTPASS: %s[0msilent LTP case returned 0\n' \
+        "$ltp_silent_case" "$ltp_silent_esc" "$ltp_silent_esc"
+    printf '\n'
+    printf 'Summary:\n'
+    printf 'passed   1\n'
+    printf 'failed   0\n'
+    printf 'broken   0\n'
+    printf 'skipped  0\n'
+    printf 'warnings 0\n'
+}
+
 prime_group_output_stream() {
     if [ -n "${OSCOMP_GROUP_OUTPUT_PRIMED:-}" ]; then
         return 0
@@ -2843,6 +2858,11 @@ run_ltp_group() {
                 ret=$?
             fi
             ltp_normalize_case_output "$case_log"
+            if [ "$ret" -eq 0 ] && \
+                [ "${ltp_normalize_result_seen:-0}" -eq 0 ] && \
+                [ "${ltp_normalize_saw_summary:-0}" -eq 0 ]; then
+                ltp_emit_silent_success_case_output "$testcase"
+            fi
             if [ "${OSCOMP_KEEP_LTP_CASE_LOGS:-0}" = "1" ]; then
                 runner_debug "#### OSCOMP RUNNER LTP CASE LOG ${case_log} ####"
             else

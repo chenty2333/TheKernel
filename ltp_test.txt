@@ -130,6 +130,8 @@ fchown01
 fchown02
 fchown03
 fchown05
+fcntl01 fcntl01
+fcntl01_64 fcntl01_64
 fcntl02
 fcntl02_64
 fcntl03
