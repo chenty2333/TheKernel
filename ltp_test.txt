@@ -983,3 +983,11 @@ pause03 pause03
 settimeofday01 settimeofday01
 set_robust_list01 set_robust_list01
 set_tid_address01 set_tid_address01
+pidfd_open01 pidfd_open01
+pidfd_open02 pidfd_open02
+pidfd_open03 pidfd_open03
+pidfd_open04 pidfd_open04
+pidfd_send_signal02 pidfd_send_signal02
+pidfd_getfd02 pidfd_getfd02
+prctl02 prctl02
+prctl05 prctl05
