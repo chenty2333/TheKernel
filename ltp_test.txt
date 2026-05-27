@@ -942,3 +942,14 @@ ftest05 ftest05
 ftest06 ftest06
 ftest07 ftest07
 ftest08 ftest08
+connect01 connect01
+fallocate01 fallocate01
+fallocate02 fallocate02
+get_robust_list01 get_robust_list01
+lchown01 lchown01
+lchown02 lchown02
+lchown03 lchown03
+removexattr01 removexattr01
+removexattr02 removexattr02
+fcntl16 fcntl16
+fcntl16_64 fcntl16_64
