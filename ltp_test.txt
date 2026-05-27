@@ -964,3 +964,10 @@ sendto01 sendto01
 sockioctl01 sockioctl01
 fcntl14 fcntl14
 fcntl14_64 fcntl14_64
+mremap02 mremap02
+mremap03 mremap03
+munlock01 munlock01
+munlock02 munlock02
+pipe04 pipe04
+pipe05 pipe05
+pipe09 pipe09
