@@ -16,7 +16,7 @@ use crate::{
         new_user_aspace_empty,
     },
     pseudofs::{self, dev::tty::N_TTY},
-    task::{ProcessData, Thread, add_task_to_table, new_user_task, spawn_alarm_task},
+    task::{ProcessData, Thread, UtsNamespace, add_task_to_table, new_user_task, spawn_alarm_task},
 };
 
 /// Initialize and run initproc.
@@ -65,6 +65,7 @@ pub fn init(args: &[String], envs: &[String]) {
         Arc::default(),
         None,
         axnet::default_stack().clone(),
+        Arc::new(UtsNamespace::new_default()),
     );
 
     {

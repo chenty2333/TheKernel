@@ -18,13 +18,98 @@ use super::{
     accounting::{AtomicTaskUsage, live_process_usage},
     creds::{CAPABILITY_WORDS, CapabilityState, Credentials},
     futex::FutexTable,
-    jobctl::{
-        ContinueResult, ExecControlState, JobControlState, StopState, VforkControlState,
-    },
+    jobctl::{ContinueResult, ExecControlState, JobControlState, StopState, VforkControlState},
     resources::Rlimits,
     timer::PosixTimer,
 };
 use crate::mm::AddrSpace;
+
+pub(crate) const UTS_FIELD_LEN: usize = 64;
+
+#[derive(Clone, Copy)]
+struct UtsState {
+    nodename: [u8; UTS_FIELD_LEN],
+    nodename_len: usize,
+    domainname: [u8; UTS_FIELD_LEN],
+    domainname_len: usize,
+}
+
+const fn copy_uts_field(dst: &mut [u8; UTS_FIELD_LEN], src: &[u8]) -> usize {
+    let len = if src.len() < UTS_FIELD_LEN {
+        src.len()
+    } else {
+        UTS_FIELD_LEN
+    };
+    let mut index = 0;
+    while index < len {
+        dst[index] = src[index];
+        index += 1;
+    }
+    len
+}
+
+const fn init_uts_state() -> UtsState {
+    let mut state = UtsState {
+        nodename: [0; UTS_FIELD_LEN],
+        nodename_len: 0,
+        domainname: [0; UTS_FIELD_LEN],
+        domainname_len: 0,
+    };
+    state.nodename_len = copy_uts_field(&mut state.nodename, b"starry");
+    state.domainname_len = copy_uts_field(
+        &mut state.domainname,
+        b"https://github.com/Starry-OS/StarryOS",
+    );
+    state
+}
+
+impl UtsState {
+    fn set_nodename(&mut self, value: &[u8]) {
+        self.nodename = [0; UTS_FIELD_LEN];
+        self.nodename_len = copy_uts_field(&mut self.nodename, value);
+    }
+
+    fn set_domainname(&mut self, value: &[u8]) {
+        self.domainname = [0; UTS_FIELD_LEN];
+        self.domainname_len = copy_uts_field(&mut self.domainname, value);
+    }
+}
+
+pub(crate) struct UtsNamespace {
+    state: SpinNoIrq<UtsState>,
+}
+
+impl UtsNamespace {
+    pub(crate) fn new_default() -> Self {
+        Self {
+            state: SpinNoIrq::new(init_uts_state()),
+        }
+    }
+
+    pub(crate) fn fork(&self) -> Arc<Self> {
+        Arc::new(Self {
+            state: SpinNoIrq::new(*self.state.lock()),
+        })
+    }
+
+    pub(crate) fn nodename(&self) -> Vec<u8> {
+        let state = self.state.lock();
+        state.nodename[..state.nodename_len].to_vec()
+    }
+
+    pub(crate) fn domainname(&self) -> Vec<u8> {
+        let state = self.state.lock();
+        state.domainname[..state.domainname_len].to_vec()
+    }
+
+    pub(crate) fn set_nodename(&self, value: &[u8]) {
+        self.state.lock().set_nodename(value);
+    }
+
+    pub(crate) fn set_domainname(&self, value: &[u8]) {
+        self.state.lock().set_domainname(value);
+    }
+}
 
 /// [`Process`]-shared data.
 pub struct ProcessData {
@@ -104,11 +189,13 @@ pub struct ProcessData {
 
     /// The network namespace (network stack) for this process.
     pub net_ns: Arc<NetStack>,
+    /// The UTS namespace for this process.
+    pub(crate) uts_ns: Arc<UtsNamespace>,
 }
 
 impl ProcessData {
     /// Create a new [`ProcessData`].
-    pub fn new(
+    pub(crate) fn new(
         proc: Arc<Process>,
         exe_path: String,
         cmdline: Arc<Vec<String>>,
@@ -116,6 +203,7 @@ impl ProcessData {
         signal_actions: Arc<SpinNoIrq<SignalActions>>,
         exit_signal: Option<Signo>,
         net_ns: Arc<NetStack>,
+        uts_ns: Arc<UtsNamespace>,
     ) -> Arc<Self> {
         Arc::new(Self {
             proc,
@@ -161,6 +249,7 @@ impl ProcessData {
             vfork_event: Arc::default(),
 
             net_ns,
+            uts_ns,
         })
     }
 

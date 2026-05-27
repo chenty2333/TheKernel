@@ -630,6 +630,7 @@ utime04
 utime05
 utime07
 utsname01
+utsname03
 utsname04
 vmsplice01
 vmsplice02

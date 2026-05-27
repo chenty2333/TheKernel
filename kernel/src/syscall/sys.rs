@@ -8,7 +8,6 @@ use axhal::uspace::UserContext;
 use axtask::current;
 #[cfg(target_arch = "riscv64")]
 use bytemuck::AnyBitPattern;
-use kspin::SpinNoIrq;
 use linux_raw_sys::{
     general::{CAP_SYS_ADMIN, CAP_SYSLOG, GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, NGROUPS_MAX},
     system::{new_utsname, sysinfo},
@@ -20,7 +19,7 @@ use starry_vm::{VmMutPtr, vm_load, vm_write_slice};
 use super::sync::restart_futex_wait;
 use crate::{
     mm::system_memory_stats,
-    task::{AsThread, RestartBlock, processes},
+    task::{AsThread, RestartBlock, UTS_FIELD_LEN, processes},
 };
 
 pub fn sys_getuid() -> AxResult<isize> {
@@ -132,58 +131,6 @@ const fn pad_str(info: &str) -> [c_char; 65] {
     data
 }
 
-const UTS_FIELD_LEN: usize = 64;
-
-#[derive(Clone, Copy)]
-struct UtsState {
-    nodename: [u8; UTS_FIELD_LEN],
-    nodename_len: usize,
-    domainname: [u8; UTS_FIELD_LEN],
-    domainname_len: usize,
-}
-
-const fn copy_uts_field(dst: &mut [u8; UTS_FIELD_LEN], src: &[u8]) -> usize {
-    let len = if src.len() < UTS_FIELD_LEN {
-        src.len()
-    } else {
-        UTS_FIELD_LEN
-    };
-    let mut index = 0;
-    while index < len {
-        dst[index] = src[index];
-        index += 1;
-    }
-    len
-}
-
-const fn init_uts_state() -> UtsState {
-    let mut state = UtsState {
-        nodename: [0; UTS_FIELD_LEN],
-        nodename_len: 0,
-        domainname: [0; UTS_FIELD_LEN],
-        domainname_len: 0,
-    };
-    state.nodename_len = copy_uts_field(&mut state.nodename, b"starry");
-    state.domainname_len = copy_uts_field(
-        &mut state.domainname,
-        b"https://github.com/Starry-OS/StarryOS",
-    );
-    state
-}
-
-impl UtsState {
-    fn set_nodename(&mut self, value: &[u8]) {
-        self.nodename = [0; UTS_FIELD_LEN];
-        self.nodename_len = copy_uts_field(&mut self.nodename, value);
-    }
-
-    fn set_domainname(&mut self, value: &[u8]) {
-        self.domainname = [0; UTS_FIELD_LEN];
-        self.domainname_len = copy_uts_field(&mut self.domainname, value);
-    }
-}
-
-static UTS_STATE: SpinNoIrq<UtsState> = SpinNoIrq::new(init_uts_state());
 const PER_LINUX: u32 = 0;
 const PER_MASK: u32 = 0xff;
 const UNAME26: u32 = 0x0020_000;
@@ -204,12 +151,10 @@ pub(crate) fn current_utsname() -> new_utsname {
         machine: pad_str(ARCH),
         domainname: [0; 65],
     };
-    let state = UTS_STATE.lock();
-    fill_uts_field(&mut utsname.nodename, &state.nodename[..state.nodename_len]);
-    fill_uts_field(
-        &mut utsname.domainname,
-        &state.domainname[..state.domainname_len],
-    );
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    fill_uts_field(&mut utsname.nodename, &proc_data.uts_ns.nodename());
+    fill_uts_field(&mut utsname.domainname, &proc_data.uts_ns.domainname());
     utsname
 }
 
@@ -223,16 +168,22 @@ pub(crate) fn proc_version_string() -> String {
 }
 
 pub(crate) fn current_domainname_string() -> String {
-    let state = UTS_STATE.lock();
-    state.domainname[..state.domainname_len]
-        .iter()
-        .copied()
+    current()
+        .as_thread()
+        .proc_data
+        .uts_ns
+        .domainname()
+        .into_iter()
         .map(char::from)
         .collect()
 }
 
 pub(crate) fn set_domainname_bytes(domainname: &[u8]) {
-    UTS_STATE.lock().set_domainname(domainname);
+    current()
+        .as_thread()
+        .proc_data
+        .uts_ns
+        .set_domainname(domainname);
 }
 
 fn cstr_field_to_string(field: &[c_char; 65]) -> String {
@@ -269,7 +220,7 @@ pub fn sys_sethostname(name: *const u8, len: usize) -> AxResult<isize> {
         return Err(AxError::OperationNotPermitted);
     }
     let hostname = vm_load(name, len)?;
-    UTS_STATE.lock().set_nodename(&hostname);
+    proc_data.uts_ns.set_nodename(&hostname);
     Ok(0)
 }
 

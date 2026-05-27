@@ -283,6 +283,11 @@ impl CloneArgs {
             } else {
                 old_proc_data.net_ns.clone()
             };
+            let uts_ns = if flags.contains(CloneFlags::NEWUTS) {
+                old_proc_data.uts_ns.fork()
+            } else {
+                old_proc_data.uts_ns.clone()
+            };
 
             #[cfg(target_arch = "loongarch64")]
             let (child_exe_path, child_cmdline) = {
@@ -307,6 +312,7 @@ impl CloneArgs {
                 signal_actions,
                 exit_signal,
                 net_ns,
+                uts_ns,
             );
             proc_data.set_umask(old_proc_data.umask());
             proc_data.set_credentials(old_proc_data.credentials());

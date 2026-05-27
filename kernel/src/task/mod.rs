@@ -15,14 +15,23 @@ mod thread;
 mod timer;
 mod user;
 
-pub(crate) use self::restart::*;
-pub use self::{
-    accounting::*, futex::*, ops::*, resources::*, signal::*, stat::*, timer::*, user::*,
-};
-
 // Re-exports from split sub-modules — keep the old `crate::task::*` paths unchanged.
-pub use self::thread::{AsThread, AssumeSync, Thread};
-pub(crate) use self::thread::ProcStateHint;
-pub(crate) use self::creds::{CapabilityState, Credentials};
-pub(crate) use self::jobctl::ContinueResult;
-pub use self::process::ProcessData;
+pub use self::{
+    accounting::*,
+    futex::*,
+    ops::*,
+    process::ProcessData,
+    resources::*,
+    signal::*,
+    stat::*,
+    thread::{AsThread, AssumeSync, Thread},
+    timer::*,
+    user::*,
+};
+pub(crate) use self::{
+    creds::{CapabilityState, Credentials},
+    jobctl::ContinueResult,
+    process::{UTS_FIELD_LEN, UtsNamespace},
+    restart::*,
+    thread::ProcStateHint,
+};
