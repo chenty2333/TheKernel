@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{
+    cmp::min,
     ffi::{c_char, c_int, c_void},
     mem::offset_of,
     time::Duration,
@@ -27,7 +28,8 @@ use starry_vm::{VmPtr, vm_write_slice};
 
 use crate::{
     file::{
-        Directory, FileLike, get_file_like,
+        Directory, FileLike, get_file_like, has_tmpfile_state,
+        inotify::location_for_fd,
         permission::{
             check_create_permissions, check_parent_search_permissions, check_remove_permissions,
             check_rename_permissions, check_search_permissions,
@@ -61,6 +63,68 @@ fn resolve_existing_at(dirfd: i32, path: &Path) -> AxResult<Option<Location>> {
         Err(AxError::NotFound) => Ok(None),
         Err(err) => Err(err),
     })
+}
+
+fn proc_self_fd_location(path: &str) -> Option<AxResult<Location>> {
+    let fd = path.strip_prefix("/proc/self/fd/")?;
+    if fd.is_empty() || fd.as_bytes().iter().any(|byte| !byte.is_ascii_digit()) {
+        return Some(Err(AxError::NotFound));
+    }
+
+    Some(
+        fd.parse::<i32>()
+            .ok()
+            .and_then(location_for_fd)
+            .ok_or(AxError::BadFileDescriptor),
+    )
+}
+
+fn materialize_tmpfile_link(old: &Location, new_dir: &Location, new_name: &str) -> AxResult<()> {
+    if !Arc::ptr_eq(old.mountpoint(), new_dir.mountpoint()) {
+        return Err(AxError::CrossesDevices);
+    }
+
+    let metadata = old.metadata()?;
+    let new = new_dir.create(new_name, NodeType::RegularFile, metadata.mode)?;
+    let result = (|| {
+        new.update_metadata(MetadataUpdate {
+            owner: Some((metadata.uid, metadata.gid)),
+            mode: Some(metadata.mode),
+            atime: Some(metadata.atime),
+            mtime: Some(metadata.mtime),
+        })?;
+
+        let old_file = old.entry().as_file()?;
+        let new_file = new.entry().as_file()?;
+        let mut offset = 0;
+        let mut buf = vec![0u8; 4096];
+
+        while offset < metadata.size {
+            let len = min(buf.len(), (metadata.size - offset) as usize);
+            let read = old_file.read_at(&mut buf[..len], offset)?;
+            if read == 0 {
+                break;
+            }
+
+            let mut written = 0;
+            while written < read {
+                let count = new_file.write_at(&buf[written..read], offset + written as u64)?;
+                if count == 0 {
+                    return Err(AxError::WriteZero);
+                }
+                written += count;
+            }
+
+            offset += read as u64;
+        }
+
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = new_dir.unlink(new_name, false);
+    }
+    result
 }
 
 fn same_entry_at(
@@ -409,9 +473,17 @@ pub fn sys_linkat(
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let supplementary_groups = proc_data.supplementary_groups();
-    let old = resolve_at(old_dirfd, old_path.as_deref(), flags)?
-        .into_file()
-        .ok_or(AxError::BadFileDescriptor)?;
+    let old = match old_path.as_deref() {
+        Some(path) if flags & AT_SYMLINK_FOLLOW != 0 => proc_self_fd_location(path)
+            .unwrap_or_else(|| {
+                resolve_at(old_dirfd, Some(path), flags)?
+                    .into_file()
+                    .ok_or(AxError::BadFileDescriptor)
+            })?,
+        _ => resolve_at(old_dirfd, old_path.as_deref(), flags)?
+            .into_file()
+            .ok_or(AxError::BadFileDescriptor)?,
+    };
     if old.is_dir() {
         return Err(AxError::OperationNotPermitted);
     }
@@ -435,7 +507,11 @@ pub fn sys_linkat(
         Ok((new_dir, new_name))
     })?;
 
-    new_dir.link(new_name, &old)?;
+    if has_tmpfile_state(&old) && old.filesystem().name() != "tmpfs" {
+        materialize_tmpfile_link(&old, &new_dir, new_name)?;
+    } else {
+        new_dir.link(new_name, &old)?;
+    }
     Ok(0)
 }
 
@@ -870,6 +946,17 @@ pub fn sys_renameat2(
     })?;
     let new_existing = resolve_existing_at(new_dirfd, new_path_ref)?;
 
+    if flags & RENAME_NOREPLACE != 0 && new_existing.is_some() {
+        return Err(AxError::AlreadyExists);
+    }
+    if let Some(existing) = new_existing.as_ref() {
+        match (old_is_dir, existing.is_dir()) {
+            (true, false) => return Err(AxError::NotADirectory),
+            (false, true) => return Err(AxError::IsADirectory),
+            _ => {}
+        }
+    }
+
     check_rename_permissions(
         &old_dir,
         &old_loc,
@@ -879,10 +966,6 @@ pub fn sys_renameat2(
         proc_data.fsgid(),
         &supplementary_groups,
     )?;
-
-    if flags & RENAME_NOREPLACE != 0 && new_existing.is_some() {
-        return Err(AxError::AlreadyExists);
-    }
 
     old_dir.rename(&old_name, &new_dir, &new_name)?;
     let cookie = crate::file::inotify::next_rename_cookie();

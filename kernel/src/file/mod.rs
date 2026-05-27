@@ -23,18 +23,19 @@ mod fd_table;
 mod stdio;
 mod types;
 
-pub(crate) use self::fs::{allowed_write_len, check_resize_limit};
+// Re-exports from split sub-modules — keep the old `crate::file::*` paths unchanged.
+pub(crate) use self::fs::{
+    allowed_write_len, check_resize_limit, has_tmpfile_state, install_tmpfile_state,
+};
 pub use self::{
     af_alg::AfAlgSocket,
+    desc::*,
+    fd_table::*,
     fs::{Directory, File, ResolveAtResult, resolve_at, with_fs, with_path_fs},
     net::Socket,
     packet::PacketSocket,
     pidfd::PidFd,
     pipe::Pipe,
+    stdio::add_stdio,
+    types::*,
 };
-
-// Re-exports from split sub-modules — keep the old `crate::file::*` paths unchanged.
-pub use self::desc::*;
-pub use self::fd_table::*;
-pub use self::stdio::add_stdio;
-pub use self::types::*;

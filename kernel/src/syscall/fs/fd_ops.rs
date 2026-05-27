@@ -29,7 +29,7 @@ use crate::{
         inotify::{
             location_for_fd, notify_close, notify_exact, notify_parent, notify_parent_with_name,
         },
-        lease, memfd,
+        install_tmpfile_state, lease, memfd,
         permission::{
             check_create_permissions, check_open_permissions, check_path_prefix_search_permissions,
         },
@@ -548,9 +548,49 @@ pub(super) fn openat_inner(
     flags: i32,
     mode: __kernel_mode_t,
 ) -> AxResult<isize> {
+    if (flags as u32 & O_TMPFILE) == O_TMPFILE {
+        return open_tmpfile(dirfd, path, flags, mode);
+    }
+
     with_path_fs(dirfd, Path::new(path), |fs| {
         open_in_fs(fs, path, flags, mode)
     })
+}
+
+fn unlink_tmpfile_backing(fd: c_int) -> AxResult<()> {
+    let loc = location_for_fd(fd).ok_or(AxError::BadFileDescriptor)?;
+    install_tmpfile_state(&loc);
+    let parent = loc.parent().ok_or(AxError::OperationNotSupported)?;
+    parent.unlink(loc.name(), false)
+}
+
+fn open_tmpfile(dirfd: c_int, path: &str, flags: i32, mode: __kernel_mode_t) -> AxResult<isize> {
+    if (flags as u32 & O_ACCMODE) == O_RDONLY {
+        return Err(AxError::InvalidInput);
+    }
+
+    let path_ref = Path::new(path);
+    validate_pathname(path_ref)?;
+    let dir_loc = with_path_fs(dirfd, path_ref, |fs| fs.resolve(path_ref))?;
+    dir_loc.check_is_dir()?;
+
+    let tmp_flags = ((flags as u32) & !(O_TMPFILE | O_DIRECTORY)) | O_CREAT | O_EXCL;
+    for _ in 0..64 {
+        let tmp_path = next_tmpfile_path(path);
+        match openat_inner(dirfd, &tmp_path, tmp_flags as i32, mode) {
+            Ok(fd) => {
+                if let Err(err) = unlink_tmpfile_backing(fd as c_int) {
+                    let _ = close_file_like(fd as c_int);
+                    return Err(err);
+                }
+                return Ok(fd);
+            }
+            Err(AxError::AlreadyExists) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(AxError::AlreadyExists)
 }
 
 pub fn sys_openat(
@@ -560,23 +600,6 @@ pub fn sys_openat(
     mode: __kernel_mode_t,
 ) -> AxResult<isize> {
     let path = vm_load_string(path)?;
-
-    if (flags as u32 & O_TMPFILE) == O_TMPFILE {
-        if (flags as u32 & O_ACCMODE) == O_RDONLY {
-            return Err(AxError::InvalidInput);
-        }
-        let tmp_flags = ((flags as u32) & !(O_TMPFILE | O_DIRECTORY)) | O_CREAT | O_EXCL;
-        for _ in 0..64 {
-            let tmp_path = next_tmpfile_path(&path);
-            match openat_inner(dirfd, &tmp_path, tmp_flags as i32, mode) {
-                Ok(fd) => return Ok(fd),
-                Err(AxError::AlreadyExists) => continue,
-                Err(err) => return Err(err),
-            }
-        }
-        return Err(AxError::AlreadyExists);
-    }
-
     openat_inner(dirfd, &path, flags, mode)
 }
 
