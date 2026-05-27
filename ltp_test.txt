@@ -953,3 +953,14 @@ removexattr01 removexattr01
 removexattr02 removexattr02
 fcntl16 fcntl16
 fcntl16_64 fcntl16_64
+chown04 chown04
+mremap04 mremap04
+msgrcv02 msgrcv02
+nextafter01 nextafter01
+recv01 recv01
+recvfrom01 recvfrom01
+send01 send01
+sendto01 sendto01
+sockioctl01 sockioctl01
+fcntl14 fcntl14
+fcntl14_64 fcntl14_64
