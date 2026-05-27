@@ -350,7 +350,9 @@ open08
 open09
 open10
 open11
+open14
 openat01
+openat03
 openat04
 openat201
 openat202
@@ -437,6 +439,7 @@ recvmsg03
 rename01
 rename03
 rename06
+rename07
 rename08
 rename09
 rename10
