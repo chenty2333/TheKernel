@@ -971,3 +971,15 @@ munlock02 munlock02
 pipe04 pipe04
 pipe05 pipe05
 pipe09 pipe09
+setfsuid04 setfsuid04
+setfsgid03 setfsgid03
+setpgid01 setpgid01
+setpgid03 setpgid03
+setpgrp01 setpgrp01
+sethostname01 sethostname01
+setdomainname01 setdomainname01
+pause02 pause02
+pause03 pause03
+settimeofday01 settimeofday01
+set_robust_list01 set_robust_list01
+set_tid_address01 set_tid_address01

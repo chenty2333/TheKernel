@@ -354,6 +354,22 @@ ltp_normalize_case_output() {
                     continue
                 fi
                 ;;
+            *"${ltp_normalize_esc}[1;34mTINFO${ltp_normalize_esc}[0m"*"returned TPASS"*)
+                if [ "$ltp_normalize_has_native_summary" -eq 0 ]; then
+                    ltp_normalize_passed=$((ltp_normalize_passed + 1))
+                    ltp_normalize_result_seen=1
+                    ltp_normalize_emit_info_result_line "$ltp_normalize_line" TPASS "1;32" "$ltp_normalize_esc"
+                    continue
+                fi
+                ;;
+            *"${ltp_normalize_esc}[1;34mTINFO${ltp_normalize_esc}[0m"*"returned TFAIL"*)
+                if [ "$ltp_normalize_has_native_summary" -eq 0 ]; then
+                    ltp_normalize_failed=$((ltp_normalize_failed + 1))
+                    ltp_normalize_result_seen=1
+                    ltp_normalize_emit_info_result_line "$ltp_normalize_line" TFAIL "1;31" "$ltp_normalize_esc"
+                    continue
+                fi
+                ;;
         esac
 
         if [ "${ltp_normalize_line#*"$ltp_normalize_esc"}" = "$ltp_normalize_line" ]; then
@@ -397,6 +413,22 @@ ltp_normalize_case_output() {
                     fi
                     ;;
                 *"TINFO"*"FAILED"*)
+                    if [ "$ltp_normalize_has_native_summary" -eq 0 ]; then
+                        ltp_normalize_failed=$((ltp_normalize_failed + 1))
+                        ltp_normalize_result_seen=1
+                        ltp_normalize_emit_plain_info_result_line "$ltp_normalize_line" TFAIL "1;31" "$ltp_normalize_esc"
+                        continue
+                    fi
+                    ;;
+                *"TINFO"*"returned TPASS"*)
+                    if [ "$ltp_normalize_has_native_summary" -eq 0 ]; then
+                        ltp_normalize_passed=$((ltp_normalize_passed + 1))
+                        ltp_normalize_result_seen=1
+                        ltp_normalize_emit_plain_info_result_line "$ltp_normalize_line" TPASS "1;32" "$ltp_normalize_esc"
+                        continue
+                    fi
+                    ;;
+                *"TINFO"*"returned TFAIL"*)
                     if [ "$ltp_normalize_has_native_summary" -eq 0 ]; then
                         ltp_normalize_failed=$((ltp_normalize_failed + 1))
                         ltp_normalize_result_seen=1
