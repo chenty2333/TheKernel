@@ -999,3 +999,9 @@ leapsec01 leapsec01
 mremap05 mremap05
 ioctl04 ioctl04
 ioctl05 ioctl05
+string01 string01
+ulimit01 ulimit01
+vfork01 vfork01
+vfork02 vfork02
+stime01 stime01
+stime02 stime02
