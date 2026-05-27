@@ -897,8 +897,7 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
         }
         F_SETPIPE_SZ => {
             let pipe = Pipe::from_fd(fd)?;
-            pipe.resize(arg)?;
-            Ok(0)
+            Ok(pipe.resize(arg)? as _)
         }
         F_ADD_SEALS => {
             let file = get_typed_file::<File>(fd)?;

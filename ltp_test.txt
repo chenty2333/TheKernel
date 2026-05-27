@@ -304,6 +304,10 @@ mkdir05
 mkdir09
 mkdir_tests.sh
 mknod02
+mincore01
+mincore02
+mincore03
+mincore04
 mlock01
 mlock02
 mlock03
@@ -898,6 +902,8 @@ fcntl33 fcntl33
 fcntl34 fcntl34
 fcntl34_64 fcntl34_64
 fcntl36 fcntl36
+fcntl37
+fcntl37_64
 fdatasync01 fdatasync01
 fdatasync02 fdatasync02
 fork09 fork09

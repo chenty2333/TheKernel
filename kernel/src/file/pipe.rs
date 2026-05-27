@@ -14,7 +14,7 @@ use axtask::{
     future::{block_on, poll_io},
 };
 use linux_raw_sys::{
-    general::{O_ACCMODE, O_NONBLOCK, O_RDONLY, O_WRONLY, S_IFIFO},
+    general::{CAP_SYS_RESOURCE, O_ACCMODE, O_NONBLOCK, O_RDONLY, O_WRONLY, S_IFIFO},
     ioctl::FIONREAD,
 };
 use memory_addr::PAGE_SIZE_4K;
@@ -32,6 +32,7 @@ use crate::{
 };
 
 const RING_BUFFER_INIT_SIZE: usize = 65536; // 64 KiB
+const PIPE_MAX_CAPACITY_ARG: usize = 1 << 31;
 
 static PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(RING_BUFFER_INIT_SIZE);
 
@@ -215,18 +216,30 @@ impl Pipe {
         self.shared.buffer.lock().capacity().get()
     }
 
-    pub fn resize(&self, new_size: usize) -> AxResult<()> {
-        let new_size = new_size.div_ceil(PAGE_SIZE_4K).max(1) * PAGE_SIZE_4K;
-        if current()
-            .try_as_thread()
-            .is_some_and(|thr| thr.proc_data.euid() != 0 && new_size > pipe_capacity_limit())
-        {
+    pub fn resize(&self, requested_size: usize) -> AxResult<usize> {
+        if requested_size > PIPE_MAX_CAPACITY_ARG {
+            return Err(AxError::InvalidInput);
+        }
+
+        let pages = requested_size
+            .checked_add(PAGE_SIZE_4K - 1)
+            .ok_or(AxError::InvalidInput)?
+            / PAGE_SIZE_4K;
+        let new_size = pages
+            .max(1)
+            .checked_mul(PAGE_SIZE_4K)
+            .ok_or(AxError::InvalidInput)?;
+
+        if current().try_as_thread().is_some_and(|thr| {
+            !thr.proc_data.has_effective_capability(CAP_SYS_RESOURCE)
+                && new_size > pipe_capacity_limit()
+        }) {
             return Err(AxError::OperationNotPermitted);
         }
 
         let mut buffer = self.shared.buffer.lock();
         if new_size == buffer.capacity().get() {
-            return Ok(());
+            return Ok(new_size);
         }
         if new_size < buffer.occupied_len() {
             return Err(AxError::ResourceBusy);
@@ -235,7 +248,7 @@ impl Pipe {
         let (left, right) = old_buffer.as_slices();
         buffer.push_slice(left);
         buffer.push_slice(right);
-        Ok(())
+        Ok(new_size)
     }
 
     pub fn vmsplice_read(&self, dst: &mut IoDst, nonblocking: bool) -> AxResult<usize> {
