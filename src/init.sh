@@ -2548,7 +2548,9 @@ prepare_ltp_env() {
     bb mkdir -p /etc/oscomp-ltp 2>/dev/null || true
     bb mkdir -p /lib/modules/10.0.0/build /lib/modules/10.0.0+/build 2>/dev/null || true
     ensure_file_line /lib/modules/10.0.0/build/.config "CONFIG_EVENTFD=y"
+    ensure_file_line /lib/modules/10.0.0/build/.config "CONFIG_DNOTIFY=y"
     ensure_file_line /lib/modules/10.0.0+/build/.config "CONFIG_EVENTFD=y"
+    ensure_file_line /lib/modules/10.0.0+/build/.config "CONFIG_DNOTIFY=y"
     [ -f /lib/modules/10.0.0/modules.dep ] || : >/lib/modules/10.0.0/modules.dep 2>/dev/null || true
     [ -f /lib/modules/10.0.0/modules.builtin ] || : >/lib/modules/10.0.0/modules.builtin 2>/dev/null || true
     [ -f /lib/modules/10.0.0+/modules.dep ] || : >/lib/modules/10.0.0+/modules.dep 2>/dev/null || true

@@ -14,14 +14,23 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::Location;
 use axpoll::{IoEvents, PollSet, Pollable};
-use axtask::future::{block_on, poll_io};
+use axtask::{
+    current,
+    future::{block_on, poll_io},
+};
 use linux_raw_sys::general::{
-    IN_ACCESS, IN_ALL_EVENTS, IN_CLOSE_NOWRITE, IN_CLOSE_WRITE, IN_DELETE_SELF, IN_ISDIR,
-    IN_MODIFY, IN_MOVE_SELF, inotify_event,
+    DN_ATTRIB, DN_MULTISHOT, DN_RENAME, IN_ACCESS, IN_ALL_EVENTS, IN_ATTRIB, IN_CLOSE_NOWRITE,
+    IN_CLOSE_WRITE, IN_DELETE_SELF, IN_ISDIR, IN_MODIFY, IN_MOVE_SELF, POLL_MSG, SI_SIGIO,
+    inotify_event,
 };
 use spin::Mutex;
+use starry_process::Pid;
+use starry_signal::{SignalInfo, Signo};
 
-use crate::file::{Directory, File, FileLike, IoDst, get_file_like};
+use crate::{
+    file::{Directory, File, FileLike, IoDst, get_file_like},
+    task::{AsThread, send_signal_to_process},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WatchKey {
@@ -81,6 +90,17 @@ pub struct InotifyFile {
 
 static INOTIFY_FILES: Mutex<Vec<Weak<InotifyFile>>> = Mutex::new(Vec::new());
 static NEXT_COOKIE: AtomicU32 = AtomicU32::new(1);
+
+#[derive(Clone)]
+struct DnotifyWatch {
+    key: WatchKey,
+    fd: i32,
+    owner: Pid,
+    signal: u8,
+    mask: u32,
+}
+
+static DNOTIFY_WATCHES: Mutex<Vec<DnotifyWatch>> = Mutex::new(Vec::new());
 
 impl InotifyFile {
     pub fn new(non_blocking: bool) -> Arc<Self> {
@@ -230,6 +250,68 @@ fn each_inotify_file(mut f: impl FnMut(&Arc<InotifyFile>)) {
     });
 }
 
+pub(crate) fn set_dnotify_watch(fd: i32, loc: &Location, mask: u32, signal: u8) -> AxResult<()> {
+    if !loc.is_dir() {
+        return Err(AxError::InvalidInput);
+    }
+
+    let owner = current().as_thread().proc_data.proc.pid();
+    let key = WatchKey::from_location(loc)?;
+    let mut watches = DNOTIFY_WATCHES.lock();
+    watches.retain(|watch| watch.owner != owner || watch.fd != fd);
+    if mask != 0 {
+        watches.push(DnotifyWatch {
+            key,
+            fd,
+            owner,
+            signal,
+            mask,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_dnotify_watch(fd: i32) {
+    let owner = current().as_thread().proc_data.proc.pid();
+    DNOTIFY_WATCHES
+        .lock()
+        .retain(|watch| watch.owner != owner || watch.fd != fd);
+}
+
+fn dnotify_siginfo(signal: u8, fd: i32) -> SignalInfo {
+    let signo = if signal == 0 {
+        Signo::SIGIO
+    } else {
+        Signo::from_repr(signal).unwrap_or(Signo::SIGIO)
+    };
+    let mut info = SignalInfo::new_kernel(signo);
+    info.set_code(SI_SIGIO);
+    unsafe {
+        let sigpoll = &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._sigpoll;
+        sigpoll._fd = fd;
+        sigpoll._band = POLL_MSG as _;
+    }
+    info
+}
+
+fn emit_dnotify(key: WatchKey, event: u32) {
+    let mut signals = Vec::new();
+    {
+        let mut watches = DNOTIFY_WATCHES.lock();
+        watches.retain(|watch| {
+            if watch.key != key || watch.mask & event == 0 {
+                return true;
+            }
+            signals.push((watch.owner, dnotify_siginfo(watch.signal, watch.fd)));
+            watch.mask & DN_MULTISHOT != 0
+        });
+    }
+
+    for (pid, signal) in signals {
+        let _ = send_signal_to_process(pid, Some(signal));
+    }
+}
+
 fn emit_to_matching_watches(key: WatchKey, mask: u32, cookie: u32, name: &[u8], require_dir: bool) {
     let interest = mask & IN_ALL_EVENTS;
     each_inotify_file(|file| {
@@ -268,7 +350,11 @@ pub(crate) fn next_rename_cookie() -> u32 {
 
 pub(crate) fn notify_exact(loc: &Location, mut mask: u32) -> AxResult<()> {
     mask = exact_dir_mask(mask, loc.is_dir());
-    emit_to_matching_watches(WatchKey::from_location(loc)?, mask, 0, &[], false);
+    let key = WatchKey::from_location(loc)?;
+    emit_to_matching_watches(key, mask, 0, &[], false);
+    if mask & IN_ATTRIB != 0 {
+        emit_dnotify(key, DN_ATTRIB);
+    }
     Ok(())
 }
 
@@ -285,13 +371,11 @@ pub(crate) fn notify_parent(loc: &Location, mut mask: u32) -> AxResult<()> {
     if loc.is_dir() {
         mask |= IN_ISDIR;
     }
-    emit_to_matching_watches(
-        WatchKey::from_location(&parent)?,
-        mask,
-        0,
-        loc.name().as_bytes(),
-        true,
-    );
+    let key = WatchKey::from_location(&parent)?;
+    emit_to_matching_watches(key, mask, 0, loc.name().as_bytes(), true);
+    if mask & IN_ATTRIB != 0 {
+        emit_dnotify(key, DN_ATTRIB);
+    }
     Ok(())
 }
 
@@ -312,6 +396,14 @@ pub(crate) fn notify_parent_with_name(
         child_name.as_bytes(),
         true,
     );
+    Ok(())
+}
+
+pub(crate) fn notify_dnotify_rename(old_parent: &Location, new_parent: &Location) -> AxResult<()> {
+    let old_key = WatchKey::from_location(old_parent)?;
+    if old_key == WatchKey::from_location(new_parent)? {
+        emit_dnotify(old_key, DN_RENAME);
+    }
     Ok(())
 }
 

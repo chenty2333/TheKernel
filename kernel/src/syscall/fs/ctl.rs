@@ -1,5 +1,6 @@
 use alloc::{
     ffi::CString,
+    format,
     string::{String, ToString},
     sync::Arc,
     vec,
@@ -140,6 +141,40 @@ fn same_entry_at(
         return Ok(false);
     };
     Ok(old.inode() == new.inode() && Arc::ptr_eq(old.mountpoint(), new.mountpoint()))
+}
+
+fn exchange_rename_entries(
+    old_dir: &Location,
+    old_name: &str,
+    new_dir: &Location,
+    new_name: &str,
+) -> AxResult<()> {
+    if old_dir.ptr_eq(new_dir) && old_name == new_name {
+        return Ok(());
+    }
+
+    let curr = current();
+    let pid = curr.as_thread().proc_data.proc.pid();
+    for attempt in 0..64 {
+        let tmp_name = format!(".renameat2-exchange-{pid}-{attempt}");
+        match old_dir.lookup_no_follow(&tmp_name) {
+            Ok(_) => continue,
+            Err(AxError::NotFound) => {}
+            Err(err) => return Err(err),
+        }
+
+        old_dir.rename(old_name, old_dir, &tmp_name)?;
+        if let Err(err) = new_dir.rename(new_name, old_dir, old_name) {
+            let _ = old_dir.rename(&tmp_name, old_dir, old_name);
+            return Err(err);
+        }
+        if let Err(err) = old_dir.rename(&tmp_name, new_dir, new_name) {
+            return Err(err);
+        }
+        return Ok(());
+    }
+
+    Err(AxError::AlreadyExists)
 }
 
 fn path_from_root(mut loc: Location, root: &Location) -> AxResult<String> {
@@ -887,11 +922,8 @@ pub fn sys_renameat2(
     if flags & !SUPPORTED_RENAMEAT2_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }
-    if flags & RENAME_EXCHANGE != 0 && flags & RENAME_NOREPLACE != 0 {
+    if flags & RENAME_EXCHANGE != 0 && flags & (RENAME_NOREPLACE | RENAME_WHITEOUT) != 0 {
         return Err(AxError::InvalidInput);
-    }
-    if flags & RENAME_EXCHANGE != 0 {
-        return Err(AxError::Unsupported);
     }
     if flags & RENAME_WHITEOUT != 0 {
         return Err(AxError::Unsupported);
@@ -949,6 +981,31 @@ pub fn sys_renameat2(
     if flags & RENAME_NOREPLACE != 0 && new_existing.is_some() {
         return Err(AxError::AlreadyExists);
     }
+
+    if flags & RENAME_EXCHANGE != 0 {
+        let new_loc = new_existing.as_ref().ok_or(AxError::NotFound)?;
+        check_rename_permissions(
+            &old_dir,
+            &old_loc,
+            &new_dir,
+            Some(new_loc),
+            proc_data.fsuid(),
+            proc_data.fsgid(),
+            &supplementary_groups,
+        )?;
+        check_rename_permissions(
+            &new_dir,
+            new_loc,
+            &old_dir,
+            Some(&old_loc),
+            proc_data.fsuid(),
+            proc_data.fsgid(),
+            &supplementary_groups,
+        )?;
+        exchange_rename_entries(&old_dir, &old_name, &new_dir, &new_name)?;
+        return Ok(0);
+    }
+
     if let Some(existing) = new_existing.as_ref() {
         match (old_is_dir, existing.is_dir()) {
             (true, false) => return Err(AxError::NotADirectory),
@@ -984,6 +1041,7 @@ pub fn sys_renameat2(
         cookie,
     );
     let _ = crate::file::inotify::notify_exact(&old_loc, IN_MOVE_SELF);
+    let _ = crate::file::inotify::notify_dnotify_rename(&old_dir, &new_dir);
     Ok(0)
 }
 

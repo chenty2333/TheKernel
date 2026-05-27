@@ -31,6 +31,7 @@ use crate::{
         get_file_description, get_file_like, get_typed_file,
         inotify::{
             location_for_fd, notify_close, notify_exact, notify_parent, notify_parent_with_name,
+            remove_dnotify_watch, set_dnotify_watch,
         },
         install_tmpfile_state, lease, memfd,
         permission::{
@@ -732,6 +733,7 @@ pub fn sys_open(path: *const c_char, flags: i32, mode: __kernel_mode_t) -> AxRes
 pub fn sys_close(fd: c_int) -> AxResult<isize> {
     debug!("sys_close <= {fd}");
     notify_close(fd);
+    remove_dnotify_watch(fd);
     close_file_like(fd)?;
     Ok(0)
 }
@@ -772,6 +774,7 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> AxResult<isize> {
                 }
             } else {
                 if let Some(removed) = fd_table.remove(fd as _) {
+                    remove_dnotify_watch(fd as _);
                     release_posix_locks_on_close(&removed.description);
                 }
             }
@@ -876,6 +879,7 @@ pub fn sys_dup3(old_fd: c_int, new_fd: c_int, flags: c_int) -> AxResult<isize> {
     f.cloexec = flags.contains(Dup3Flags::O_CLOEXEC);
 
     if let Some(removed) = fd_table.remove(new_fd as _) {
+        remove_dnotify_watch(new_fd);
         release_posix_locks_on_close(&removed.description);
     }
     fd_table
@@ -1008,6 +1012,12 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
         F_GETSIG => {
             let description = get_file_description(fd)?;
             Ok(description.async_io_state().signal as isize)
+        }
+        F_NOTIFY => {
+            let description = get_file_description(fd)?;
+            let loc = location_for_fd(fd).ok_or(AxError::BadFileDescriptor)?;
+            set_dnotify_watch(fd, &loc, arg as u32, description.async_io_state().signal)?;
+            Ok(0)
         }
         F_SETFL => {
             let description = get_file_description(fd)?;

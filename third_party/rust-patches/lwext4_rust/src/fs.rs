@@ -1,6 +1,5 @@
-use core::{marker::PhantomData, mem, time::Duration};
-
 use alloc::boxed::Box;
+use core::{marker::PhantomData, mem, time::Duration};
 
 use crate::{
     DirLookupResult, DirReader, Ext4Error, Ext4Result, FileAttr, InodeRef, InodeType,
@@ -190,8 +189,8 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             src_dir_ref.dec_nlink();
             dst_dir_ref.inc_nlink();
         }
-        src_dir_ref.remove_entry(src_name, &mut src_ref)?;
         dst_dir_ref.add_entry(dst_name, &mut src_ref)?;
+        src_dir_ref.remove_entry(src_name, &mut src_ref)?;
 
         Ok(())
     }

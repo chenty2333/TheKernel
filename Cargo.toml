@@ -99,6 +99,7 @@ axdriver_virtio = { path = "third_party/rust-patches/axdriver_virtio" }
 axio = { path = "third_party/rust-patches/axio" }
 axcpu = { path = "third_party/rust-patches/axcpu" }
 axfs-ng = { path = "third_party/rust-patches/axfs-ng" }
+axfs-ng-vfs = { path = "third_party/rust-patches/axfs-ng-vfs" }
 starry-vm = { path = "third_party/rust-patches/starry-vm" }
 starry-process = { path = "third_party/rust-patches/starry-process" }
 starry-signal = { path = "third_party/rust-patches/starry-signal" }
