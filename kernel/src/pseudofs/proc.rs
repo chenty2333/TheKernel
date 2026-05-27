@@ -91,6 +91,13 @@ fn real_meminfo() -> String {
     )
 }
 
+fn rw_static_file(content: &'static str) -> impl crate::pseudofs::SimpleFileOps {
+    RwFile::new(move |req| match req {
+        SimpleFileOperation::Read => Ok(Some(content.as_bytes().to_vec())),
+        SimpleFileOperation::Write(_) => Ok(None),
+    })
+}
+
 fn is_shared_user_mapping(backend: &Backend) -> bool {
     matches!(
         backend,
@@ -326,6 +333,7 @@ impl SimpleDirOps for ThreadDir {
                 Some("pagemap"),
                 Some("mounts"),
                 Some("cmdline"),
+                Some("coredump_filter"),
                 Some("comm"),
                 Some("exe"),
                 Some("fd"),
@@ -426,6 +434,7 @@ impl SimpleDirOps for ThreadDir {
                 Ok(buf)
             })
             .into(),
+            "coredump_filter" => SimpleFile::new_regular(fs, rw_static_file("33\n")).into(),
             "comm" => SimpleFile::new_regular(
                 fs,
                 RwFile::new(move |req| match req {
@@ -653,6 +662,10 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             ))
         }),
     );
+    root.add(
+        "cmdline",
+        SimpleFile::new_regular(fs.clone(), || Ok("console=ttyS0\n")),
+    );
 
     root.add("sys", {
         let mut sys = DirMapping::new();
@@ -701,6 +714,23 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                     }),
                 ),
             );
+            fs_dir.add("inotify", {
+                let mut inotify = DirMapping::new();
+                inotify.add(
+                    "max_queued_events",
+                    SimpleFile::new_regular(fs.clone(), rw_static_file("16384\n")),
+                );
+                inotify.add(
+                    "max_user_instances",
+                    SimpleFile::new_regular(fs.clone(), rw_static_file("1024\n")),
+                );
+                inotify.add(
+                    "max_user_watches",
+                    SimpleFile::new_regular(fs.clone(), rw_static_file("1048576\n")),
+                );
+
+                SimpleDir::new_maker(fs.clone(), Arc::new(inotify))
+            });
 
             SimpleDir::new_maker(fs.clone(), Arc::new(fs_dir))
         });
@@ -762,6 +792,14 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 SimpleFile::new_regular(fs.clone(), || Ok(alloc::format!("{}\n", shmmni_limit()))),
             );
             kernel.add("tainted", SimpleFile::new_regular(fs.clone(), || Ok("0\n")));
+            kernel.add(
+                "core_pattern",
+                SimpleFile::new_regular(fs.clone(), rw_static_file("core\n")),
+            );
+            kernel.add(
+                "printk",
+                SimpleFile::new_regular(fs.clone(), rw_static_file("4 4 1 7\n")),
+            );
 
             SimpleDir::new_maker(fs.clone(), Arc::new(kernel))
         });

@@ -1005,3 +1005,5 @@ vfork01 vfork01
 vfork02 vfork02
 stime01 stime01
 stime02 stime02
+waitid10 waitid10
+syslog11 syslog11
