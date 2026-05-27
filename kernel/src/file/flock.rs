@@ -1,14 +1,21 @@
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    vec::Vec,
+};
 use core::{future::poll_fn, task::Poll};
 
 use axerrno::{AxError, AxResult};
 use axpoll::PollSet;
 use axtask::future::{block_on, interruptible};
+use linux_raw_sys::general::{F_RDLCK, F_UNLCK, F_WRLCK, SEEK_CUR, SEEK_END, SEEK_SET, flock64};
 use spin::Mutex;
+use starry_process::Pid;
 
 /// Inode identity: (device, inode number).
 pub(crate) type InodeId = (u64, u64);
 type FlockOwner = u64;
+
+const RECORD_EOF: u64 = u64::MAX;
 
 enum FlockState {
     /// One or more open file descriptions hold shared locks.
@@ -29,6 +36,309 @@ static FLOCK_TABLE: Mutex<FlockTableInner> = Mutex::new(FlockTableInner {
     owners: BTreeMap::new(),
     waiters: PollSet::new(),
 });
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RecordLockOwner {
+    Posix(Pid),
+    Ofd(u64),
+}
+
+#[derive(Clone, Copy)]
+struct RecordRange {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Clone, Copy)]
+struct RecordLockRequest {
+    ty: i16,
+    range: RecordRange,
+}
+
+#[derive(Clone)]
+struct RecordLock {
+    owner: RecordLockOwner,
+    ty: i16,
+    range: RecordRange,
+}
+
+struct RecordLockTableInner {
+    locks: BTreeMap<InodeId, Vec<RecordLock>>,
+    /// Woken whenever any record lock changes, so blocked acquirers can retry.
+    waiters: PollSet,
+}
+
+static RECORD_LOCK_TABLE: Mutex<RecordLockTableInner> = Mutex::new(RecordLockTableInner {
+    locks: BTreeMap::new(),
+    waiters: PollSet::new(),
+});
+
+impl RecordRange {
+    fn overlaps(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+}
+
+impl RecordLockRequest {
+    fn from_flock(lock: &flock64, file_size: u64, current_offset: u64) -> AxResult<Self> {
+        let ty = lock.l_type;
+        if ty != F_RDLCK as i16 && ty != F_WRLCK as i16 && ty != F_UNLCK as i16 {
+            return Err(AxError::InvalidInput);
+        }
+
+        let base = match lock.l_whence as u32 {
+            SEEK_SET => 0,
+            SEEK_CUR => current_offset as i128,
+            SEEK_END => file_size as i128,
+            _ => return Err(AxError::InvalidInput),
+        };
+        let start = base + lock.l_start as i128;
+        let len = lock.l_len as i128;
+
+        let (start, end) = if len == 0 {
+            (start, RECORD_EOF)
+        } else if len > 0 {
+            let end = start.checked_add(len).ok_or(AxError::InvalidInput)?;
+            (start, end.try_into().map_err(|_| AxError::InvalidInput)?)
+        } else {
+            let new_start = start.checked_add(len).ok_or(AxError::InvalidInput)?;
+            (
+                new_start,
+                start.try_into().map_err(|_| AxError::InvalidInput)?,
+            )
+        };
+
+        if start < 0 {
+            return Err(AxError::InvalidInput);
+        }
+        let start = start.try_into().map_err(|_| AxError::InvalidInput)?;
+        Ok(Self {
+            ty,
+            range: RecordRange { start, end },
+        })
+    }
+}
+
+fn record_lock_conflicts(
+    lock: &RecordLock,
+    owner: RecordLockOwner,
+    req: RecordLockRequest,
+) -> bool {
+    if lock.owner == owner || !lock.range.overlaps(req.range) {
+        return false;
+    }
+    lock.ty == F_WRLCK as i16 || req.ty == F_WRLCK as i16
+}
+
+fn split_out_range(lock: &RecordLock, range: RecordRange, out: &mut Vec<RecordLock>) {
+    if !lock.range.overlaps(range) {
+        out.push(lock.clone());
+        return;
+    }
+    if lock.range.start < range.start {
+        let mut left = lock.clone();
+        left.range.end = range.start;
+        out.push(left);
+    }
+    if range.end < lock.range.end {
+        let mut right = lock.clone();
+        right.range.start = range.end;
+        out.push(right);
+    }
+}
+
+fn insert_record_lock(locks: &mut Vec<RecordLock>, new_lock: RecordLock) {
+    let mut updated = Vec::new();
+    for lock in locks.iter() {
+        if lock.owner == new_lock.owner {
+            split_out_range(lock, new_lock.range, &mut updated);
+        } else {
+            updated.push(lock.clone());
+        }
+    }
+    updated.push(new_lock);
+    updated.sort_by_key(|lock| (lock.range.start, lock.range.end, lock.owner, lock.ty));
+
+    let mut merged: Vec<RecordLock> = Vec::new();
+    for lock in updated {
+        if let Some(last) = merged.last_mut()
+            && last.owner == lock.owner
+            && last.ty == lock.ty
+            && last.range.end >= lock.range.start
+        {
+            last.range.end = last.range.end.max(lock.range.end);
+            continue;
+        }
+        merged.push(lock);
+    }
+    *locks = merged;
+}
+
+fn unlock_record_range(locks: &mut Vec<RecordLock>, owner: RecordLockOwner, range: RecordRange) {
+    let mut updated = Vec::new();
+    for lock in locks.iter() {
+        if lock.owner == owner {
+            split_out_range(lock, range, &mut updated);
+        } else {
+            updated.push(lock.clone());
+        }
+    }
+    *locks = updated;
+}
+
+fn try_set_record_lock_inner(
+    table: &mut RecordLockTableInner,
+    id: InodeId,
+    owner: RecordLockOwner,
+    req: RecordLockRequest,
+) -> bool {
+    if req.ty != F_UNLCK as i16
+        && table.locks.get(&id).is_some_and(|locks| {
+            locks
+                .iter()
+                .any(|lock| record_lock_conflicts(lock, owner, req))
+        })
+    {
+        return false;
+    }
+
+    let locks = table.locks.entry(id).or_default();
+    if req.ty == F_UNLCK as i16 {
+        unlock_record_range(locks, owner, req.range);
+    } else {
+        insert_record_lock(
+            locks,
+            RecordLock {
+                owner,
+                ty: req.ty,
+                range: req.range,
+            },
+        );
+    }
+
+    if locks.is_empty() {
+        table.locks.remove(&id);
+    }
+    table.waiters.wake();
+    true
+}
+
+fn try_set_record_lock(id: InodeId, owner: RecordLockOwner, req: RecordLockRequest) -> bool {
+    let mut table = RECORD_LOCK_TABLE.lock();
+    try_set_record_lock_inner(&mut table, id, owner, req)
+}
+
+fn record_lock_blocking(
+    id: InodeId,
+    owner: RecordLockOwner,
+    req: RecordLockRequest,
+) -> AxResult<()> {
+    match block_on(interruptible(poll_fn(|cx| {
+        if try_set_record_lock(id, owner, req) {
+            Poll::Ready(Ok(()))
+        } else {
+            RECORD_LOCK_TABLE.lock().waiters.register(cx.waker());
+            if try_set_record_lock(id, owner, req) {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+    }))) {
+        Ok(res) => res,
+        Err(err) => Err(err.into()),
+    }
+}
+
+pub fn set_record_lock(
+    id: InodeId,
+    owner: RecordLockOwner,
+    file_size: u64,
+    current_offset: u64,
+    lock: &flock64,
+    blocking: bool,
+) -> AxResult<()> {
+    let req = RecordLockRequest::from_flock(lock, file_size, current_offset)?;
+    if blocking {
+        record_lock_blocking(id, owner, req)
+    } else if try_set_record_lock(id, owner, req) {
+        Ok(())
+    } else {
+        Err(AxError::WouldBlock)
+    }
+}
+
+pub fn get_record_lock(
+    id: InodeId,
+    owner: RecordLockOwner,
+    file_size: u64,
+    current_offset: u64,
+    lock: &mut flock64,
+) -> AxResult<()> {
+    let req = RecordLockRequest::from_flock(lock, file_size, current_offset)?;
+    let table = RECORD_LOCK_TABLE.lock();
+    let conflict = table.locks.get(&id).and_then(|locks| {
+        locks
+            .iter()
+            .filter(|record| record_lock_conflicts(record, owner, req))
+            .min_by_key(|record| (record.range.start, record.range.end))
+    });
+
+    if let Some(conflict) = conflict {
+        lock.l_type = conflict.ty;
+        lock.l_whence = SEEK_SET as _;
+        lock.l_start = conflict.range.start as _;
+        lock.l_len = if conflict.range.end == RECORD_EOF {
+            0
+        } else {
+            (conflict.range.end - conflict.range.start) as _
+        };
+        lock.l_pid = match conflict.owner {
+            RecordLockOwner::Posix(pid) => pid as _,
+            RecordLockOwner::Ofd(_) => -1,
+        };
+    } else {
+        lock.l_type = F_UNLCK as _;
+    }
+    Ok(())
+}
+
+pub fn release_posix_owner(pid: Pid) {
+    release_record_owner(RecordLockOwner::Posix(pid), None);
+}
+
+pub fn release_posix_owner_on_inode(pid: Pid, id: InodeId) {
+    release_record_owner(RecordLockOwner::Posix(pid), Some(id));
+}
+
+pub fn release_ofd_owner(owner: u64) {
+    release_record_owner(RecordLockOwner::Ofd(owner), None);
+}
+
+fn release_record_owner(owner: RecordLockOwner, only_id: Option<InodeId>) {
+    let mut table = RECORD_LOCK_TABLE.lock();
+    let ids: Vec<InodeId> = if let Some(id) = only_id {
+        Vec::from([id])
+    } else {
+        table.locks.keys().copied().collect()
+    };
+
+    let mut changed = false;
+    for id in ids {
+        let Some(locks) = table.locks.get_mut(&id) else {
+            continue;
+        };
+        let before = locks.len();
+        locks.retain(|lock| lock.owner != owner);
+        changed |= locks.len() != before;
+        if locks.is_empty() {
+            table.locks.remove(&id);
+        }
+    }
+    if changed {
+        table.waiters.wake();
+    }
+}
 
 fn remember_owner_lock(table: &mut FlockTableInner, owner: FlockOwner, id: InodeId) {
     table.owners.entry(owner).or_default().insert(id);

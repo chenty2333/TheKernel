@@ -9,8 +9,8 @@ use axerrno::AxResult;
 use axpoll::{IoEvents, Pollable};
 
 use super::{
-    types::{FileLike, IoDst, IoSrc, Kstat},
     flock, lease,
+    types::{FileLike, IoDst, IoSrc, Kstat},
 };
 
 static FILE_DESCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -53,6 +53,7 @@ impl FileDescription {
 impl Drop for FileDescription {
     fn drop(&mut self) {
         flock::release_owner(self.flock_owner);
+        flock::release_ofd_owner(self.flock_owner);
         lease::release_owner(self.flock_owner);
     }
 }

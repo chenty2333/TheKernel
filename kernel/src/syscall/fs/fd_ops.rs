@@ -16,6 +16,7 @@ use axfs_ng_vfs::{
     DirEntry, FileNode, Location, MetadataUpdate, NodePermission, NodeType, Reference,
     path::{Component, Path},
 };
+use axio::{Seek, SeekFrom};
 use axtask::current;
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
@@ -24,8 +25,9 @@ use spin::RwLock;
 use crate::{
     file::{
         Directory, FD_TABLE, File, FileDescriptor, FileLike, Pipe, ResolveAtResult,
-        add_file_like_with_flags, close_file_like, get_file_description, get_file_like,
-        get_typed_file,
+        add_file_like_with_flags, close_file_like,
+        flock::{self, RecordLockOwner},
+        get_file_description, get_file_like, get_typed_file,
         inotify::{
             location_for_fd, notify_close, notify_exact, notify_parent, notify_parent_with_name,
         },
@@ -33,7 +35,7 @@ use crate::{
         permission::{
             check_create_permissions, check_open_permissions, check_path_prefix_search_permissions,
         },
-        resolve_at, with_path_fs,
+        release_posix_locks_on_close, resolve_at, with_path_fs,
     },
     mm::{UserConstPtr, UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
@@ -745,7 +747,9 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> AxResult<isize> {
                     f.cloexec = true;
                 }
             } else {
-                fd_table.remove(fd as _);
+                if let Some(removed) = fd_table.remove(fd as _) {
+                    release_posix_locks_on_close(&removed.description);
+                }
             }
         }
     }
@@ -796,6 +800,21 @@ fn validate_flock(lock: &flock64) -> AxResult<()> {
     }
 }
 
+fn record_lock_current_offset(
+    description: &crate::file::FileDescription,
+    lock: &flock64,
+) -> AxResult<u64> {
+    if lock.l_whence as u32 != SEEK_CUR {
+        return Ok(0);
+    }
+
+    let Some(file) = description.inner.as_ref().downcast_ref::<File>() else {
+        return Ok(0);
+    };
+    let mut inner = file.inner();
+    inner.seek(SeekFrom::Current(0))
+}
+
 pub fn sys_dup(old_fd: c_int) -> AxResult<isize> {
     debug!("sys_dup <= {old_fd}");
     dup_fd(old_fd, false)
@@ -832,7 +851,9 @@ pub fn sys_dup3(old_fd: c_int, new_fd: c_int, flags: c_int) -> AxResult<isize> {
         .ok_or(AxError::BadFileDescriptor)?;
     f.cloexec = flags.contains(Dup3Flags::O_CLOEXEC);
 
-    fd_table.remove(new_fd as _);
+    if let Some(removed) = fd_table.remove(new_fd as _) {
+        release_posix_locks_on_close(&removed.description);
+    }
     fd_table
         .add_at(new_fd as _, f)
         .map_err(|_| AxError::BadFileDescriptor)?;
@@ -853,16 +874,37 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
             dup_fd_at_least(description, arg as c_int, true)
         }
         F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => {
-            let _ = get_file_like(fd)?;
-            let lock = UserConstPtr::<flock64>::from(arg as *const flock64).get_as_ref()?;
-            validate_flock(lock)?;
+            let description = get_file_description(fd)?;
+            let stat = description.inner.stat()?;
+            let lock = *UserConstPtr::<flock64>::from(arg as *const flock64).get_as_ref()?;
+            validate_flock(&lock)?;
+            let current_offset = record_lock_current_offset(&description, &lock)?;
+            let owner = match cmd as u32 {
+                F_OFD_SETLK | F_OFD_SETLKW => RecordLockOwner::Ofd(description.flock_owner()),
+                _ => RecordLockOwner::Posix(current().as_thread().proc_data.proc.pid()),
+            };
+            flock::set_record_lock(
+                (stat.dev, stat.ino),
+                owner,
+                stat.size,
+                current_offset,
+                &lock,
+                matches!(cmd as u32, F_SETLKW | F_OFD_SETLKW),
+            )?;
             Ok(0)
         }
         F_GETLK | F_OFD_GETLK => {
-            let _ = get_file_like(fd)?;
+            let description = get_file_description(fd)?;
+            let stat = description.inner.stat()?;
             let lock = UserPtr::<flock64>::from(arg).get_as_mut()?;
             validate_flock(lock)?;
-            lock.l_type = F_UNLCK as _;
+            let current_offset = record_lock_current_offset(&description, lock)?;
+            let owner = if cmd as u32 == F_OFD_GETLK {
+                RecordLockOwner::Ofd(description.flock_owner())
+            } else {
+                RecordLockOwner::Posix(current().as_thread().proc_data.proc.pid())
+            };
+            flock::get_record_lock((stat.dev, stat.ino), owner, stat.size, current_offset, lock)?;
             Ok(0)
         }
         F_SETLEASE => {

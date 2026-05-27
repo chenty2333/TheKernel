@@ -9,6 +9,7 @@ use spin::RwLock;
 
 use super::{
     desc::{FileDescription, FileDescriptor, FileHandle},
+    flock,
     types::FileLike,
 };
 use crate::task::{AX_FILE_LIMIT, AsThread};
@@ -80,12 +81,20 @@ pub fn add_file_like_with_flags(
     add_file_description(FileDescription::new_with_flags(f, status_flags), cloexec)
 }
 
+pub(crate) fn release_posix_locks_on_close(description: &FileDescription) {
+    if let Ok(stat) = description.inner.stat() {
+        let pid = current().as_thread().proc_data.proc.pid();
+        flock::release_posix_owner_on_inode(pid, (stat.dev, stat.ino));
+    }
+}
+
 /// Close a file by `fd`.
 pub fn close_file_like(fd: c_int) -> AxResult {
     let f = FD_TABLE
         .write()
         .remove(fd as usize)
         .ok_or(AxError::BadFileDescriptor)?;
+    release_posix_locks_on_close(&f.description);
     debug!(
         "close_file_like <= description refs: {}",
         Arc::strong_count(&f.description)
