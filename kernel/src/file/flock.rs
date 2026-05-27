@@ -4,7 +4,7 @@ use alloc::{
 };
 use core::{future::poll_fn, task::Poll};
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axpoll::PollSet;
 use axtask::future::{block_on, interruptible};
 use linux_raw_sys::general::{F_RDLCK, F_UNLCK, F_WRLCK, SEEK_CUR, SEEK_END, SEEK_SET, flock64};
@@ -62,14 +62,22 @@ struct RecordLock {
     range: RecordRange,
 }
 
+#[derive(Clone, Copy)]
+struct RecordLockWait {
+    id: InodeId,
+    req: RecordLockRequest,
+}
+
 struct RecordLockTableInner {
     locks: BTreeMap<InodeId, Vec<RecordLock>>,
+    wait_requests: BTreeMap<RecordLockOwner, RecordLockWait>,
     /// Woken whenever any record lock changes, so blocked acquirers can retry.
     waiters: PollSet,
 }
 
 static RECORD_LOCK_TABLE: Mutex<RecordLockTableInner> = Mutex::new(RecordLockTableInner {
     locks: BTreeMap::new(),
+    wait_requests: BTreeMap::new(),
     waiters: PollSet::new(),
 });
 
@@ -128,6 +136,51 @@ fn record_lock_conflicts(
         return false;
     }
     lock.ty == F_WRLCK as i16 || req.ty == F_WRLCK as i16
+}
+
+fn record_lock_conflict_owners(
+    table: &RecordLockTableInner,
+    id: InodeId,
+    owner: RecordLockOwner,
+    req: RecordLockRequest,
+) -> BTreeSet<RecordLockOwner> {
+    table
+        .locks
+        .get(&id)
+        .into_iter()
+        .flat_map(|locks| locks.iter())
+        .filter(|lock| record_lock_conflicts(lock, owner, req))
+        .map(|lock| lock.owner)
+        .collect()
+}
+
+fn record_lock_would_deadlock(
+    table: &RecordLockTableInner,
+    owner: RecordLockOwner,
+    blockers: &BTreeSet<RecordLockOwner>,
+) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut stack: Vec<RecordLockOwner> = blockers.iter().copied().collect();
+
+    while let Some(blocker) = stack.pop() {
+        if blocker == owner {
+            return true;
+        }
+        if !matches!(blocker, RecordLockOwner::Posix(_)) {
+            continue;
+        }
+        if !seen.insert(blocker) {
+            continue;
+        }
+        let Some(wait) = table.wait_requests.get(&blocker) else {
+            continue;
+        };
+        stack.extend(record_lock_conflict_owners(
+            table, wait.id, blocker, wait.req,
+        ));
+    }
+
+    false
 }
 
 fn split_out_range(lock: &RecordLock, range: RecordRange, out: &mut Vec<RecordLock>) {
@@ -192,16 +245,11 @@ fn try_set_record_lock_inner(
     owner: RecordLockOwner,
     req: RecordLockRequest,
 ) -> bool {
-    if req.ty != F_UNLCK as i16
-        && table.locks.get(&id).is_some_and(|locks| {
-            locks
-                .iter()
-                .any(|lock| record_lock_conflicts(lock, owner, req))
-        })
-    {
+    if req.ty != F_UNLCK as i16 && !record_lock_conflict_owners(table, id, owner, req).is_empty() {
         return false;
     }
 
+    table.wait_requests.remove(&owner);
     let locks = table.locks.entry(id).or_default();
     if req.ty == F_UNLCK as i16 {
         unlock_record_range(locks, owner, req.range);
@@ -234,11 +282,23 @@ fn record_lock_blocking(
     req: RecordLockRequest,
 ) -> AxResult<()> {
     match block_on(interruptible(poll_fn(|cx| {
-        if try_set_record_lock(id, owner, req) {
+        let mut table = RECORD_LOCK_TABLE.lock();
+        if try_set_record_lock_inner(&mut table, id, owner, req) {
             Poll::Ready(Ok(()))
         } else {
-            RECORD_LOCK_TABLE.lock().waiters.register(cx.waker());
-            if try_set_record_lock(id, owner, req) {
+            let blockers = record_lock_conflict_owners(&table, id, owner, req);
+            if matches!(owner, RecordLockOwner::Posix(_))
+                && record_lock_would_deadlock(&table, owner, &blockers)
+            {
+                table.wait_requests.remove(&owner);
+                return Poll::Ready(Err(LinuxError::EDEADLK.into()));
+            }
+
+            table
+                .wait_requests
+                .insert(owner, RecordLockWait { id, req });
+            table.waiters.register(cx.waker());
+            if try_set_record_lock_inner(&mut table, id, owner, req) {
                 Poll::Ready(Ok(()))
             } else {
                 Poll::Pending
@@ -246,7 +306,10 @@ fn record_lock_blocking(
         }
     }))) {
         Ok(res) => res,
-        Err(err) => Err(err.into()),
+        Err(err) => {
+            RECORD_LOCK_TABLE.lock().wait_requests.remove(&owner);
+            Err(err.into())
+        }
     }
 }
 
@@ -317,6 +380,7 @@ pub fn release_ofd_owner(owner: u64) {
 
 fn release_record_owner(owner: RecordLockOwner, only_id: Option<InodeId>) {
     let mut table = RECORD_LOCK_TABLE.lock();
+    table.wait_requests.remove(&owner);
     let ids: Vec<InodeId> = if let Some(id) = only_id {
         Vec::from([id])
     } else {

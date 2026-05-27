@@ -985,6 +985,8 @@ removexattr01 removexattr01
 removexattr02 removexattr02
 fcntl16 fcntl16
 fcntl16_64 fcntl16_64
+fcntl17 fcntl17
+fcntl17_64 fcntl17_64
 chown04 chown04
 mremap04 mremap04
 msgrcv02 msgrcv02
