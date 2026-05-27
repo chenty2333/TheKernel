@@ -2740,7 +2740,36 @@ run_ltp_group() {
 
     ran_cases=0
     group_failed=0
-    while IFS= read -r testcase || [ -n "$testcase" ]; do
+    iter_test_list="/var/tmp/oscomp-ltp-list.$$"
+    bb rm -f "$iter_test_list" 2>/dev/null || true
+    if ! bb cp "$test_list" "$iter_test_list" 2>/dev/null; then
+        runner_debug "#### OSCOMP RUNNER LTP LIST COPY FAILED ${test_list} ####"
+        [ -z "$generated_test_list" ] || bb rm -f "$generated_test_list" 2>/dev/null || true
+        return 127
+    fi
+    iter_line_count="$(bb awk 'END { print NR }' "$iter_test_list" 2>/dev/null || echo 0)"
+    case "$iter_line_count" in
+        ''|*[!0-9]*)
+            iter_line_count=0
+            ;;
+    esac
+    runner_debug "#### OSCOMP RUNNER LTP LIST ${test_list} COPIED ${iter_test_list} LINES ${iter_line_count} ####"
+    if runner_truthy "${OSCOMP_RUNNER_DEBUG:-0}"; then
+        iter_debug_line_no=1
+        while [ "$iter_debug_line_no" -le "$iter_line_count" ] 2>/dev/null && \
+            [ "$iter_debug_line_no" -le 12 ] 2>/dev/null; do
+            iter_debug_line="$(bb sed -n "${iter_debug_line_no}p" "$iter_test_list" 2>/dev/null || true)"
+            runner_debug "#### OSCOMP RUNNER LTP LIST LINE ${iter_debug_line_no} ${iter_debug_line} ####"
+            iter_debug_line_no=$((iter_debug_line_no + 1))
+        done
+    fi
+    iter_line_no=1
+
+    while [ "$iter_line_no" -le "$iter_line_count" ] 2>/dev/null; do
+        testcase="$(bb sed -n "${iter_line_no}p" "$iter_test_list" 2>/dev/null || true)"
+        iter_line_no=$((iter_line_no + 1))
+        runner_debug "#### OSCOMP RUNNER LTP ITER LINE $((iter_line_no - 1)) CASE ${testcase} ####"
+
         case "$testcase" in
             ''|\#*)
                 continue
@@ -2808,7 +2837,7 @@ run_ltp_group() {
         if ltp_output_normalize_enabled; then
             case_log="/var/tmp/oscomp-ltp-case-${testcase}.$$.$ran_cases.log"
             bb rm -f "$case_log" 2>/dev/null || true
-            if run_ltp_case_command "$shell_path" "$testcase_path" "$@" >"$case_log" 2>&1; then
+            if run_ltp_case_command "$shell_path" "$testcase_path" "$@" </dev/null >"$case_log" 2>&1; then
                 ret=0
             else
                 ret=$?
@@ -2821,12 +2850,12 @@ run_ltp_group() {
                 case_log=""
             fi
         elif [ "$LTP_CASE_OUTPUT_MODE" = "stream" ]; then
-            run_ltp_case_command "$shell_path" "$testcase_path" "$@"
+            run_ltp_case_command "$shell_path" "$testcase_path" "$@" </dev/null
             ret=$?
         else
             case_log="/var/tmp/oscomp-ltp-case-${testcase}.$$.$ran_cases.log"
             bb rm -f "$case_log" 2>/dev/null || true
-            if run_ltp_case_command "$shell_path" "$testcase_path" "$@" >"$case_log" 2>&1; then
+            if run_ltp_case_command "$shell_path" "$testcase_path" "$@" </dev/null >"$case_log" 2>&1; then
                 ret=0
             else
                 ret=$?
@@ -2855,7 +2884,9 @@ run_ltp_group() {
             fi
             group_failed=1
         fi
-    done <"$test_list"
+    done
+    runner_debug "#### OSCOMP RUNNER LTP RAN CASES ${ran_cases} ####"
+    bb rm -f "$iter_test_list" 2>/dev/null || true
     [ -z "$generated_test_list" ] || bb rm -f "$generated_test_list" 2>/dev/null || true
 
     [ "$ran_cases" -gt 0 ] || {
