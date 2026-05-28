@@ -783,6 +783,22 @@ pub fn sys_mlock(addr: usize, length: usize) -> AxResult<isize> {
     sys_mlock2(addr, length, 0)
 }
 
+fn check_memlock_limit(proc_data: &crate::task::ProcessData, length: usize) -> AxResult {
+    if length == 0 || proc_data.has_effective_capability(CAP_IPC_LOCK) {
+        return Ok(());
+    }
+
+    let limit = proc_data.rlim.read()[RLIMIT_MEMLOCK].current;
+    if limit == 0 {
+        return Err(AxError::OperationNotPermitted);
+    }
+    if (length as u64) > limit {
+        return Err(AxError::NoMemory);
+    }
+
+    Ok(())
+}
+
 pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     debug!("sys_mlock2 <= addr: {addr:#x}, length: {length:x}, flags: {flags:#x}");
 
@@ -799,15 +815,7 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
         return Err(AxError::NoMemory);
     }
 
-    if length > 0 && !proc_data.has_effective_capability(CAP_IPC_LOCK) {
-        let limit = proc_data.rlim.read()[RLIMIT_MEMLOCK].current;
-        if limit == 0 {
-            return Err(AxError::OperationNotPermitted);
-        }
-        if (length as u64) > limit {
-            return Err(AxError::NoMemory);
-        }
-    }
+    check_memlock_limit(proc_data, length)?;
 
     aspace.set_locked(start, length, true)?;
     Ok(0)
@@ -826,5 +834,46 @@ pub fn sys_munlock(addr: usize, length: usize) -> AxResult<isize> {
     }
 
     aspace.set_locked(start, length, false)?;
+    Ok(0)
+}
+
+pub fn sys_mlockall(flags: u32) -> AxResult<isize> {
+    debug!("sys_mlockall <= flags: {flags:#x}");
+
+    const MCL_LOCK_FLAGS: u32 = MCL_CURRENT | MCL_FUTURE;
+    const MCL_SUPPORTED_FLAGS: u32 = MCL_LOCK_FLAGS | MCL_ONFAULT;
+
+    if flags & !MCL_SUPPORTED_FLAGS != 0 || flags & MCL_LOCK_FLAGS == 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let aspace_handle = proc_data.aspace();
+    let mut aspace = aspace_handle.lock();
+
+    if flags & MCL_CURRENT != 0 {
+        let length = aspace.current_mapping_bytes();
+        check_memlock_limit(proc_data, length)?;
+        aspace.lock_current_mappings();
+    } else {
+        check_memlock_limit(proc_data, 1)?;
+    }
+
+    if flags & MCL_FUTURE != 0 {
+        aspace.set_lock_future_mappings(true);
+    }
+
+    Ok(0)
+}
+
+pub fn sys_munlockall() -> AxResult<isize> {
+    debug!("sys_munlockall");
+
+    let curr = current();
+    let aspace_handle = curr.as_thread().proc_data.aspace();
+    let mut aspace = aspace_handle.lock();
+    aspace.clear_locked_mappings();
+
     Ok(0)
 }

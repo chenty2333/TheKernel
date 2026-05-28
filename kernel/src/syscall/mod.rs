@@ -564,6 +564,8 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::mlock => sys_mlock(uctx.arg0(), uctx.arg1() as _),
         Sysno::mlock2 => sys_mlock2(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
         Sysno::munlock => sys_munlock(uctx.arg0(), uctx.arg1() as _),
+        Sysno::mlockall => sys_mlockall(uctx.arg0() as _),
+        Sysno::munlockall => sys_munlockall(),
 
         // task info
         Sysno::getpid => sys_getpid(),

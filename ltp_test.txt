@@ -313,6 +313,9 @@ mlock01
 mlock02
 mlock03
 mlock04
+mlock203
+mlockall01
+mlockall02
 mmap02
 mmap03
 mmap04
@@ -331,6 +334,7 @@ mount07
 mprotect05
 mremap06
 mtest01
+munlockall01
 nanosleep01
 nanosleep02
 nanosleep04

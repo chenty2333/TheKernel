@@ -35,6 +35,7 @@ pub struct AddrSpace {
     growdown_starts: BTreeSet<VirtAddr>,
     wipe_on_fork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     locked_ranges: BTreeMap<VirtAddr, VirtAddr>,
+    lock_future_mappings: bool,
     pt: PageTable,
 }
 
@@ -84,6 +85,7 @@ impl AddrSpace {
             growdown_starts: BTreeSet::new(),
             wipe_on_fork_ranges: BTreeMap::new(),
             locked_ranges: BTreeMap::new(),
+            lock_future_mappings: false,
             pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,
         })
     }
@@ -231,6 +233,37 @@ impl AddrSpace {
             .any(|(&range_start, &range_end)| range_end > start && range_start < end)
     }
 
+    pub fn locked_bytes(&self) -> usize {
+        self.locked_ranges
+            .iter()
+            .map(|(start, end)| end.sub_addr(*start))
+            .sum()
+    }
+
+    pub fn current_mapping_bytes(&self) -> usize {
+        self.areas.iter().map(MemoryArea::size).sum()
+    }
+
+    pub fn lock_current_mappings(&mut self) {
+        let ranges: Vec<_> = self
+            .areas
+            .iter()
+            .map(|area| (area.start(), area.end()))
+            .collect();
+        for (start, end) in ranges {
+            self.insert_locked_range(start, end);
+        }
+    }
+
+    pub fn set_lock_future_mappings(&mut self, enabled: bool) {
+        self.lock_future_mappings = enabled;
+    }
+
+    pub fn clear_locked_mappings(&mut self) {
+        self.locked_ranges.clear();
+        self.lock_future_mappings = false;
+    }
+
     fn validate_region(&self, start: VirtAddr, size: usize) -> AxResult {
         if !self.contains_range(start, size) {
             ax_bail!(NoMemory, "address out of range");
@@ -330,6 +363,9 @@ impl AddrSpace {
 
         let area = MemoryArea::new(start, size, flags, backend);
         self.areas.map(area, &mut self.pt, false)?;
+        if self.lock_future_mappings {
+            self.insert_locked_range(start, start + size);
+        }
         if populate {
             self.populate_area(start, size, flags)?;
         }

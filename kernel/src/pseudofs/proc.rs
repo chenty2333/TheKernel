@@ -150,11 +150,17 @@ impl SimpleDirOps for ProcessTaskDir {
 
 #[rustfmt::skip]
 fn task_status(task: &AxTaskRef) -> String {
+    let locked_kb = {
+        let aspace_handle = task.as_thread().proc_data.aspace();
+        let aspace = aspace_handle.lock();
+        aspace.locked_bytes() / 1024
+    };
     format!(
         "Tgid:\t{}\n\
         Pid:\t{}\n\
         Uid:\t0 0 0 0\n\
         Gid:\t0 0 0 0\n\
+        VmLck:\t{} kB\n\
         VmSwap:\t0 kB\n\
         NoNewPrivs:\t{}\n\
         Cpus_allowed:\t1\n\
@@ -163,6 +169,7 @@ fn task_status(task: &AxTaskRef) -> String {
         Mems_allowed_list:\t0",
         task.as_thread().proc_data.proc.pid(),
         task.as_thread().tid(),
+        locked_kb,
         task.as_thread().proc_data.no_new_privs() as u8
     )
 }
