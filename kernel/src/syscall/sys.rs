@@ -167,8 +167,8 @@ pub(crate) fn current_utsname() -> new_utsname {
     let mut utsname = new_utsname {
         sysname: pad_str("Linux"),
         nodename: [0; 65],
-        release: pad_str("10.0.0"),
-        version: pad_str("10.0.0"),
+        release: pad_str("6.6.0"),
+        version: pad_str("6.6.0"),
         machine: pad_str(ARCH),
         domainname: [0; 65],
     };
