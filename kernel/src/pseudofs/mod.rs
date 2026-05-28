@@ -6,16 +6,14 @@ mod dir;
 mod file;
 mod fs;
 mod proc;
+mod sys;
 pub(crate) mod tmp;
 
 use alloc::sync::Arc;
 
 use axerrno::LinuxResult;
 use axfs::{FS_CONTEXT, FsContext};
-use axfs_ng_vfs::{
-    DirNodeOps, FileNodeOps, Filesystem, NodePermission, WeakDirEntry,
-    path::{Path, PathBuf},
-};
+use axfs_ng_vfs::{DirNodeOps, FileNodeOps, Filesystem, NodePermission, WeakDirEntry};
 pub use tmp::MemoryFs;
 
 pub use self::{device::*, dir::*, file::*, fs::*};
@@ -67,16 +65,7 @@ pub fn mount_all() -> LinuxResult<()> {
     mount_at(&fs, "/tmp", tmp::MemoryFs::new())?;
     mount_at(&fs, "/proc", proc::new_procfs())?;
 
-    mount_at(&fs, "/sys", tmp::MemoryFs::new())?;
-    let mut path = PathBuf::new();
-    for comp in Path::new("/sys/class/graphics/fb0/device").components() {
-        path.push(comp.as_str());
-        if fs.resolve(&path).is_err() {
-            fs.create_dir(&path, DIR_PERMISSION)?;
-        }
-    }
-    path.push("subsystem");
-    fs.symlink("whatever", &path)?;
+    mount_at(&fs, "/sys", sys::new_sysfs())?;
     drop(fs);
 
     #[cfg(feature = "dev-log")]

@@ -929,9 +929,11 @@ fcntl39 fcntl39
 fcntl39_64 fcntl39_64
 fdatasync01 fdatasync01
 fdatasync02 fdatasync02
+fdatasync03 fdatasync03
 fork09 fork09
 fstatat01 fstatat01
 fsync02 fsync02
+fsync04 fsync04
 lstat01A symlink01 -T lstat01
 lstat01A_64 symlink01 -T lstat01_64
 newuname01 newuname01
