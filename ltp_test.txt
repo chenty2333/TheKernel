@@ -398,6 +398,8 @@ preadv01
 preadv01_64
 preadv02
 preadv02_64
+preadv03
+preadv03_64
 preadv201
 preadv201_64
 preadv202
@@ -420,6 +422,8 @@ pwritev01
 pwritev01_64
 pwritev02
 pwritev02_64
+pwritev03
+pwritev03_64
 pwritev201
 pwritev201_64
 pwritev202

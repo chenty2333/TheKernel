@@ -8,7 +8,7 @@ use axfs::FileBackend;
 use axfs_ng_vfs::{DeviceId, NodeFlags, VfsResult};
 use axsync::Mutex;
 use linux_raw_sys::{
-    ioctl::{BLKGETSIZE, BLKGETSIZE64, BLKRAGET, BLKRASET, BLKROGET, BLKROSET},
+    ioctl::{BLKGETSIZE, BLKGETSIZE64, BLKRAGET, BLKRASET, BLKROGET, BLKROSET, BLKSSZGET},
     loop_device::{LOOP_CLR_FD, LOOP_GET_STATUS, LOOP_SET_FD, LOOP_SET_STATUS, loop_info},
 };
 use starry_vm::{VmMutPtr, VmPtr};
@@ -122,6 +122,9 @@ impl DeviceOps for LoopDevice {
                 } else {
                     (arg as *mut u64).vm_write(sectors * 512)?;
                 }
+            }
+            BLKSSZGET => {
+                (arg as *mut u32).vm_write(512)?;
             }
             BLKROGET => {
                 (arg as *mut u32).vm_write(self.ro.load(Ordering::Relaxed) as u32)?;
