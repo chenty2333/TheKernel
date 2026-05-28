@@ -647,7 +647,8 @@ impl DirNodeOps for MemoryNode {
 
 impl Drop for MemoryNode {
     fn drop(&mut self) {
-        if let NodeContent::Dir(dir) = &self.inode.content {
+        let is_unlinked_dir = self.inode.metadata.lock().nlink <= 1;
+        if is_unlinked_dir && let NodeContent::Dir(dir) = &self.inode.content {
             dir.entries.lock().clear();
         }
         release_inode(&self.fs, &self.inode, 0);
