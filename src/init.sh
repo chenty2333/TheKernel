@@ -2660,6 +2660,13 @@ build_ltp_fallback_test_list() {
 run_ltp_group() {
     root="$1"
     shell_path="$2"
+    ltp_group_budget_secs_for_root "$root"
+    ltp_budget_secs="$LTP_GROUP_BUDGET_SECS_RESULT"
+    ltp_budget_start_epoch=""
+    if [ "$ltp_budget_secs" -gt 0 ] 2>/dev/null; then
+        runner_now_epoch
+        ltp_budget_start_epoch="$RUNNER_NOW_EPOCH"
+    fi
     support_ltp_subset_dir || true
     test_list="$SUPPORT_LTP_TEST_LIST"
     generated_test_list=""
@@ -2799,6 +2806,17 @@ run_ltp_group() {
         # shellcheck disable=SC2086
         set -- $testcase
         [ "$#" -gt 0 ] || continue
+
+        if [ -n "$ltp_budget_start_epoch" ]; then
+            runner_now_epoch
+            if [ -n "$RUNNER_NOW_EPOCH" ]; then
+                ltp_budget_elapsed=$((RUNNER_NOW_EPOCH - ltp_budget_start_epoch))
+                if [ "$ltp_budget_elapsed" -ge "$ltp_budget_secs" ] 2>/dev/null; then
+                    runner_debug "#### OSCOMP RUNNER LTP BUDGET ${ltp_budget_secs}s REACHED AFTER ${ran_cases} CASES ####"
+                    break
+                fi
+            fi
+        fi
 
         testcase="$1"
         shift
@@ -3226,10 +3244,10 @@ reference_eval_plan() {
 /glibc cyclictest
 /musl lmbench
 /glibc lmbench
-/musl ltp
-/glibc ltp
 /musl iperf
 /glibc iperf
+/glibc ltp
+/musl ltp
 EOF
 }
 
@@ -3270,6 +3288,29 @@ group_timeout_secs() {
             GROUP_TIMEOUT_SECS="${OSCOMP_TIMEOUT_DEFAULT:-900}"
             ;;
     esac
+}
+
+ltp_group_budget_secs_for_root() {
+    root="$1"
+    root_flavor "$root"
+    case "$ROOT_FLAVOR_RESULT" in
+        musl)
+            budget_secs="${OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS:-${OSCOMP_LTP_GROUP_BUDGET_SECS:-2700}}"
+            ;;
+        glibc)
+            budget_secs="${OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS:-${OSCOMP_LTP_GROUP_BUDGET_SECS:-2700}}"
+            ;;
+        *)
+            budget_secs="${OSCOMP_LTP_GROUP_BUDGET_SECS:-2700}"
+            ;;
+    esac
+
+    case "$budget_secs" in
+        ''|*[!0-9]*)
+            budget_secs=2700
+            ;;
+    esac
+    LTP_GROUP_BUDGET_SECS_RESULT="$budget_secs"
 }
 
 runner_now_epoch() {
@@ -3317,6 +3358,22 @@ prepare_group_timeout_secs() {
 
     group_timeout_secs "$group"
     timeout_secs="$GROUP_TIMEOUT_SECS"
+    if [ "$group" = "ltp" ]; then
+        ltp_group_budget_secs_for_root "$root"
+        ltp_budget_secs="$LTP_GROUP_BUDGET_SECS_RESULT"
+        if [ "$ltp_budget_secs" -gt 0 ] 2>/dev/null; then
+            ltp_timeout_grace_secs="${OSCOMP_LTP_GROUP_TIMEOUT_GRACE_SECS:-120}"
+            case "$ltp_timeout_grace_secs" in
+                ''|*[!0-9]*)
+                    ltp_timeout_grace_secs=120
+                    ;;
+            esac
+            ltp_timeout_secs=$((ltp_budget_secs + ltp_timeout_grace_secs))
+            if [ "$timeout_secs" -gt "$ltp_timeout_secs" ]; then
+                timeout_secs="$ltp_timeout_secs"
+            fi
+        fi
+    fi
 
     runner_remaining_secs
     case "$RUNNER_REMAINING_SECS" in

@@ -13,8 +13,8 @@ REFERENCE_PLAN_GROUPS=(
     libctest
     cyclictest
     lmbench
-    ltp
     iperf
+    ltp
 )
 
 die() {
@@ -93,10 +93,10 @@ list_cmd() {
     printf '  /glibc cyclictest\n'
     printf '  /musl lmbench\n'
     printf '  /glibc lmbench\n'
-    printf '  /musl ltp\n'
-    printf '  /glibc ltp\n'
     printf '  /musl iperf\n'
     printf '  /glibc iperf\n'
+    printf '  /glibc ltp\n'
+    printf '  /musl ltp\n'
     printf 'groups in fixed plan:\n'
     printf '  %s\n' "${REFERENCE_PLAN_GROUPS[@]}"
 }
