@@ -24,12 +24,12 @@ use axhal::paging::MappingFlags;
 use axpoll::{IoEvents, Pollable};
 use axtask::{AxTaskRef, TaskState, WeakAxTaskRef, current};
 use inherit_methods_macro::inherit_methods;
-use memory_addr::{PAGE_SIZE_4K, VirtAddr};
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use starry_process::Process;
 
 use crate::{
     file::{FD_TABLE, lease, pipe},
-    mm::{Backend, system_memory_stats},
+    mm::{Backend, BackendOps, system_memory_stats},
     mounts,
     pseudofs::{
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
@@ -172,6 +172,67 @@ fn task_status(task: &AxTaskRef) -> String {
         locked_kb,
         task.as_thread().proc_data.no_new_privs() as u8
     )
+}
+
+fn render_task_maps(task: &AxTaskRef, include_smaps: bool) -> String {
+    let thr = task.as_thread();
+    let aspace_handle = thr.proc_data.aspace();
+    let aspace = aspace_handle.lock();
+    let mut out = String::new();
+
+    for area in aspace.areas() {
+        if !area.flags().contains(MappingFlags::USER) {
+            continue;
+        }
+        let start = area.start().as_usize();
+        let end = start + area.size();
+        let flags = area.flags();
+        let r = if flags.contains(MappingFlags::READ) {
+            'r'
+        } else {
+            '-'
+        };
+        let w = if flags.contains(MappingFlags::WRITE) {
+            'w'
+        } else {
+            '-'
+        };
+        let x = if flags.contains(MappingFlags::EXECUTE) {
+            'x'
+        } else {
+            '-'
+        };
+        let shared = is_shared_user_mapping(area.backend());
+        let p = if shared { 's' } else { 'p' };
+        let name = match area.backend() {
+            Backend::Shared(_) => " [shared]",
+            Backend::Linear(_) => "",
+            Backend::Cow(_) | Backend::File(_) => "",
+        };
+        let _ = writeln!(
+            out,
+            "{start:08x}-{end:08x} {r}{w}{x}{p} 00000000 00:00 0{name:>10}",
+        );
+
+        if include_smaps {
+            let page_size = area.backend().page_size() as usize;
+            let mut resident_bytes = 0;
+            let mut cursor = area.start();
+            while cursor < area.end() {
+                let step = page_size.min(area.end().sub_addr(cursor));
+                if aspace.page_table().query(cursor).is_ok() {
+                    resident_bytes += step;
+                }
+                cursor += page_size;
+            }
+            let locked_bytes = aspace.locked_bytes_in_range(area.start(), area.size());
+            let _ = writeln!(out, "Size:           {:>8} kB", area.size() / 1024);
+            let _ = writeln!(out, "Rss:            {:>8} kB", resident_bytes / 1024);
+            let _ = writeln!(out, "Locked:         {:>8} kB", locked_bytes / 1024);
+        }
+    }
+
+    out
 }
 
 /// The /proc/[pid]/fd directory
@@ -340,6 +401,7 @@ impl SimpleDirOps for ThreadDir {
                 Some("oom_score_adj"),
                 self.show_task_dir.then_some("task"),
                 Some("maps"),
+                Some("smaps"),
                 Some("pagemap"),
                 Some("mounts"),
                 Some("cmdline"),
@@ -391,48 +453,12 @@ impl SimpleDirOps for ThreadDir {
                 }),
             )
             .into(),
-            "maps" => SimpleFile::new_regular(fs, move || {
-                let thr = task.as_thread();
-                let aspace_handle = thr.proc_data.aspace();
-                let aspace = aspace_handle.lock();
-                let mut out = String::new();
-                for area in aspace.areas() {
-                    if !area.flags().contains(MappingFlags::USER) {
-                        continue;
-                    }
-                    let start = area.start().as_usize();
-                    let end = start + area.size();
-                    let flags = area.flags();
-                    let r = if flags.contains(MappingFlags::READ) {
-                        'r'
-                    } else {
-                        '-'
-                    };
-                    let w = if flags.contains(MappingFlags::WRITE) {
-                        'w'
-                    } else {
-                        '-'
-                    };
-                    let x = if flags.contains(MappingFlags::EXECUTE) {
-                        'x'
-                    } else {
-                        '-'
-                    };
-                    let shared = is_shared_user_mapping(area.backend());
-                    let p = if shared { 's' } else { 'p' };
-                    let name = match area.backend() {
-                        Backend::Shared(_) => " [shared]",
-                        Backend::Linear(_) => "",
-                        Backend::Cow(_) | Backend::File(_) => "",
-                    };
-                    let _ = writeln!(
-                        out,
-                        "{start:08x}-{end:08x} {r}{w}{x}{p} 00000000 00:00 0{name:>10}",
-                    );
-                }
-                Ok(out)
-            })
-            .into(),
+            "maps" => {
+                SimpleFile::new_regular(fs, move || Ok(render_task_maps(&task, false))).into()
+            }
+            "smaps" => {
+                SimpleFile::new_regular(fs, move || Ok(render_task_maps(&task, true))).into()
+            }
             "pagemap" => ProcPagemapFile::new(fs, Arc::downgrade(&task)).into(),
             "mounts" => SimpleFile::new_regular(fs, move || Ok(render_mounts())).into(),
             "cmdline" => SimpleFile::new_regular(fs, move || {

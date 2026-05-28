@@ -276,6 +276,8 @@ bitflags::bitflags! {
         const ANONYMOUS = MAP_ANONYMOUS;
         /// Populate the mapping.
         const POPULATE = MAP_POPULATE;
+        /// Lock the mapped pages, as with mlock(2).
+        const LOCKED = MAP_LOCKED;
         /// Don't check for reservations.
         const NORESERVE = MAP_NORESERVE;
         /// Allocation is for a stack.
@@ -326,10 +328,8 @@ pub fn sys_mmap(
     ) {
         return Err(AxError::InvalidInput);
     }
-    if map_flags.contains(MmapFlags::ANONYMOUS) != (fd <= 0) {
-        return Err(AxError::InvalidInput);
-    }
-    if fd <= 0 && offset != 0 {
+    let is_anonymous_mapping = map_flags.contains(MmapFlags::ANONYMOUS);
+    if is_anonymous_mapping && offset != 0 {
         return Err(AxError::InvalidInput);
     }
     let offset: usize = offset.try_into().map_err(|_| AxError::InvalidInput)?;
@@ -372,18 +372,21 @@ pub fn sys_mmap(
             .ok_or(AxError::NoMemory)?
     };
 
-    let io_uring = if fd > 0 {
+    if !is_anonymous_mapping && fd < 0 {
+        return Err(AxError::BadFileDescriptor);
+    }
+
+    let io_uring = if !is_anonymous_mapping && fd >= 0 {
         get_typed_file::<IoUringFile>(fd).ok()
     } else {
         None
     };
 
-    let file = if fd > 0 && io_uring.is_none() {
+    let file = if !is_anonymous_mapping && io_uring.is_none() {
         Some(File::from_fd(fd)?)
     } else {
         None
     };
-    let is_anonymous_mapping = file.is_none();
     let growdown_private_anon = map_flags.contains(MmapFlags::GROWDOWN)
         && map_type == MmapFlags::PRIVATE
         && is_anonymous_mapping;
@@ -479,8 +482,15 @@ pub fn sys_mmap(
         _ => return Err(AxError::InvalidInput),
     };
 
-    let populate = map_flags.contains(MmapFlags::POPULATE);
+    if map_flags.contains(MmapFlags::LOCKED) {
+        check_memlock_limit(&curr.as_thread().proc_data, length)?;
+    }
+
+    let populate = map_flags.intersects(MmapFlags::POPULATE | MmapFlags::LOCKED);
     aspace.map(start, length, permission_flags.into(), populate, backend)?;
+    if map_flags.contains(MmapFlags::LOCKED) {
+        aspace.set_locked(start, length, true)?;
+    }
     if growdown_private_anon {
         aspace.mark_growdown(start);
     }
@@ -719,6 +729,7 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
             if info.has_shared_mapping || aspace.range_is_locked(start, length) {
                 return Err(AxError::InvalidInput);
             }
+            aspace.discard_pages(start, length)?;
             Ok(0)
         }
         MADV_FREE => {

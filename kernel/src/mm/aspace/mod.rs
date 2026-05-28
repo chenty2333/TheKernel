@@ -240,6 +240,24 @@ impl AddrSpace {
             .sum()
     }
 
+    pub fn locked_bytes_in_range(&self, start: VirtAddr, size: usize) -> usize {
+        if size == 0 {
+            return 0;
+        }
+        let end = start + size;
+        self.locked_ranges
+            .range(..end)
+            .filter_map(|(&range_start, &range_end)| {
+                if range_end <= start {
+                    return None;
+                }
+                let overlap_start = range_start.max(start);
+                let overlap_end = range_end.min(end);
+                (overlap_start < overlap_end).then_some(overlap_end.sub_addr(overlap_start))
+            })
+            .sum()
+    }
+
     pub fn current_mapping_bytes(&self) -> usize {
         self.areas.iter().map(MemoryArea::size).sum()
     }
@@ -397,6 +415,31 @@ impl AddrSpace {
 
         if start < end {
             // If the area is not fully mapped, we return ENOMEM.
+            ax_bail!(NoMemory);
+        }
+
+        Ok(())
+    }
+
+    pub fn discard_pages(&mut self, mut start: VirtAddr, size: usize) -> AxResult {
+        self.validate_region(start, size)?;
+        let end = start + size;
+
+        let mut modify = self.pt.cursor();
+        while let Some(area) = self.areas.find(start) {
+            if area.start() > start {
+                break;
+            }
+
+            let range = VirtAddrRange::new(start, area.end().min(end));
+            area.backend().unmap(range, &mut modify)?;
+            start = range.end;
+            if start >= end {
+                break;
+            }
+        }
+
+        if start < end {
             ax_bail!(NoMemory);
         }
 

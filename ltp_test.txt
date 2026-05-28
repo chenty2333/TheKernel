@@ -287,6 +287,7 @@ lstat02
 lstat02_64
 madvise01
 madvise02
+madvise03
 madvise05
 madvise10
 mallinfo01
@@ -313,11 +314,13 @@ mlock01
 mlock02
 mlock03
 mlock04
+mlock05
 mlock201
 mlock203
 mlockall01
 mlockall02
 mlockall03
+mmap001
 mmap02
 mmap03
 mmap04
@@ -326,6 +329,7 @@ mmap06
 mmap09
 mmap12
 mmap13
+mmap14
 mmap15
 mmap17
 mmap18
