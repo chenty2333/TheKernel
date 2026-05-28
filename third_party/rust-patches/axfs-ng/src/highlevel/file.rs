@@ -466,7 +466,8 @@ impl FileUserData {
 impl CachedFile {
     /// Returns an existing cached file for `location`, or creates a new one.
     pub fn get_or_create(location: Location) -> Self {
-        let in_memory = location.filesystem().name() == "tmpfs";
+        let in_memory = location.flags().contains(NodeFlags::ALWAYS_CACHE)
+            || location.filesystem().name() == "tmpfs";
 
         let shared = if in_memory {
             let mut guard = location.user_data();

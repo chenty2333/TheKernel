@@ -1,13 +1,13 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use axerrno::{AxError, AxResult};
-use axhal::paging::{MappingFlags, PageSize, PageTableCursor};
+use axhal::paging::{MappingFlags, PageSize, PageTableCursor, PagingError};
 use axsync::Mutex;
 use memory_addr::{MemoryAddr, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, alloc_frame, dealloc_frame, divide_page, page_table_flags,
-    pages_in,
+    AddrSpace, Backend, BackendOps, PopulateCallback, alloc_frame, dealloc_frame, divide_page,
+    page_table_flags, pages_in,
 };
 
 pub struct SharedPages {
@@ -194,23 +194,63 @@ impl BackendOps for SharedBackend {
         self.pages.size
     }
 
-    fn map(&self, range: VirtAddrRange, flags: MappingFlags, pt: &mut PageTableCursor) -> AxResult {
+    fn map(
+        &self,
+        range: VirtAddrRange,
+        flags: MappingFlags,
+        _pt: &mut PageTableCursor,
+    ) -> AxResult {
         debug!("Shared::map: {:?} {:?}", range, flags);
-        let start_index = divide_page(range.start - self.start, self.pages.size);
-        let count = divide_page(range.size(), self.pages.size);
-        let pages = self.pages.pages_range(start_index, count)?;
-        for (vaddr, paddr) in pages_in(range, self.pages.size)?.zip(pages.into_iter()) {
-            pt.map(vaddr, paddr, self.pages.size, page_table_flags(flags))?;
-        }
+        pages_in(range, self.pages.size)?;
         Ok(())
     }
 
     fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult {
         debug!("Shared::unmap: {:?}", range);
         for vaddr in pages_in(range, self.pages.size)? {
-            pt.unmap(vaddr)?;
+            match pt.unmap(vaddr) {
+                Ok(_) | Err(PagingError::NotMapped) => {}
+                Err(err) => return Err(err.into()),
+            }
         }
         Ok(())
+    }
+
+    fn populate(
+        &self,
+        range: VirtAddrRange,
+        flags: MappingFlags,
+        access_flags: MappingFlags,
+        pt: &mut PageTableCursor,
+    ) -> AxResult<(usize, Option<PopulateCallback>)> {
+        let start_index = divide_page(range.start - self.start, self.pages.size);
+        let count = divide_page(range.size(), self.pages.size);
+        let pages = self.pages.pages_range(start_index, count)?;
+        let mut populated = 0;
+
+        for (vaddr, paddr) in pages_in(range, self.pages.size)?.zip(pages.into_iter()) {
+            match pt.query(vaddr) {
+                Ok((mapped_paddr, page_flags, page_size)) => {
+                    assert_eq!(page_size, self.pages.size);
+                    assert_eq!(mapped_paddr, paddr);
+                    if access_flags.contains(MappingFlags::WRITE)
+                        && !page_flags.contains(MappingFlags::WRITE)
+                    {
+                        pt.remap(vaddr, paddr, page_table_flags(flags))?;
+                        populated += 1;
+                    } else if page_flags.contains(access_flags) {
+                        populated += 1;
+                    }
+                }
+                Err(PagingError::NotMapped) => {
+                    pt.map(vaddr, paddr, self.pages.size, page_table_flags(flags))?;
+                    populated += 1;
+                }
+                Err(_) => return Err(AxError::BadAddress),
+            }
+        }
+
+        Ok((populated, None))
     }
 
     fn clone_map(

@@ -96,22 +96,15 @@ pub fn sys_mincore(addr: usize, length: usize, vec: *mut u8) -> AxResult<isize> 
                 return Err(AxError::NoMemory);
             }
 
-            let (is_resident, size) = if aspace.range_is_locked(addr, PAGE_SIZE_4K) {
-                (true, PAGE_SIZE_4K)
-            } else {
-                // Query page table with batch awareness
-                match aspace.page_table().query(addr) {
-                    Ok((_, _, size)) => {
-                        // Physical page exists and is resident
-                        // page_size tells us how many contiguous pages have the same status
-                        (true, size as _)
-                    }
-                    Err(_) => {
-                        // Page is mapped but not populated (lazy allocation)
-                        // We need to determine how many contiguous pages are also not populated
-                        // For safety, we check the next page or use PAGE_SIZE_4K as minimum step
-                        (false, PAGE_SIZE_4K)
-                    }
+            // Query page table with batch awareness.
+            let (is_resident, size) = match aspace.page_table().query(addr) {
+                Ok((_, _, size)) => {
+                    // Physical page exists and is resident.
+                    (true, size as _)
+                }
+                Err(_) => {
+                    // Page is mapped but not populated.
+                    (false, PAGE_SIZE_4K)
                 }
             };
             let n = size / PAGE_SIZE_4K;

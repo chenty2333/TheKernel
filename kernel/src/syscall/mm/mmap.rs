@@ -816,6 +816,9 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     }
 
     check_memlock_limit(proc_data, length)?;
+    if flags & MLOCK_ONFAULT == 0 {
+        aspace.populate_area(start, length, MappingFlags::empty())?;
+    }
 
     aspace.set_locked(start, length, true)?;
     Ok(0)
@@ -855,6 +858,15 @@ pub fn sys_mlockall(flags: u32) -> AxResult<isize> {
     if flags & MCL_CURRENT != 0 {
         let length = aspace.current_mapping_bytes();
         check_memlock_limit(proc_data, length)?;
+        if flags & MCL_ONFAULT == 0 {
+            let ranges: Vec<_> = aspace
+                .areas()
+                .map(|area| (area.start(), area.size()))
+                .collect();
+            for (start, size) in ranges {
+                aspace.populate_area(start, size, MappingFlags::empty())?;
+            }
+        }
         aspace.lock_current_mappings();
     } else {
         check_memlock_limit(proc_data, 1)?;

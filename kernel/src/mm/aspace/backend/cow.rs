@@ -5,6 +5,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
+use axfs::CachedFile;
 use axfs_ng_vfs::Location;
 use axhal::{
     mem::phys_to_virt,
@@ -84,7 +85,7 @@ static FRAME_TABLE: SpinNoIrq<FrameTableRefCount> = SpinNoIrq::new(FrameTableRef
 pub struct CowBackend {
     start: VirtAddr,
     size: PageSize,
-    file: Option<(Location, u64, Option<u64>, bool)>,
+    file: Option<(CachedFile, u64, Option<u64>, bool)>,
     map_id: Arc<()>,
     materialized: Arc<AtomicBool>,
 }
@@ -124,8 +125,7 @@ impl CowBackend {
     ) -> AxResult {
         let frame = self.alloc_new_frame(true)?;
 
-        if let Some((location, file_start, file_end, _)) = &self.file {
-            let file = location.entry().as_file()?;
+        if let Some((file, file_start, file_end, _)) = &self.file {
             let buf = unsafe {
                 slice::from_raw_parts_mut(phys_to_virt(frame).as_mut_ptr(), self.size as _)
             };
@@ -448,7 +448,12 @@ impl Backend {
         Self::Cow(CowBackend {
             start,
             size,
-            file: Some((file, file_start, file_end, sigbus_on_eof)),
+            file: Some((
+                CachedFile::get_or_create(file),
+                file_start,
+                file_end,
+                sigbus_on_eof,
+            )),
             map_id: Arc::new(()),
             materialized: Arc::new(AtomicBool::new(false)),
         })
