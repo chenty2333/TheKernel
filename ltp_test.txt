@@ -264,6 +264,7 @@ kill06
 kill11
 lgetxattr01
 lgetxattr02
+link01 symlink01 -T link01
 link02
 link04
 listxattr01
@@ -616,6 +617,7 @@ statvfs02
 statx02
 statx03
 symlink02
+symlink03 symlink03
 symlink04
 sync01 sync01
 sync_file_range01

@@ -515,6 +515,9 @@ pub fn sys_linkat(
                     .into_file()
                     .ok_or(AxError::BadFileDescriptor)
             })?,
+        Some(path) if !path.is_empty() => {
+            with_path_fs(old_dirfd, Path::new(path), |fs| fs.resolve_no_follow(path))?
+        }
         _ => resolve_at(old_dirfd, old_path.as_deref(), flags)?
             .into_file()
             .ok_or(AxError::BadFileDescriptor)?,
@@ -654,7 +657,23 @@ pub fn sys_symlinkat(
     let linkpath = vm_load_string(linkpath)?;
     debug!("sys_symlinkat <= target: {target:?}, new_dirfd: {new_dirfd}, linkpath: {linkpath:?}");
 
-    with_path_fs(new_dirfd, Path::new(&linkpath), |fs| {
+    if linkpath.is_empty() {
+        return Err(AxError::NotFound);
+    }
+    let linkpath_ref = Path::new(&linkpath);
+    validate_pathname(linkpath_ref)?;
+
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let supplementary_groups = proc_data.supplementary_groups();
+    with_path_fs(new_dirfd, linkpath_ref, |fs| {
+        let (parent, _) = fs.resolve_nonexistent(linkpath_ref)?;
+        check_create_permissions(
+            &parent,
+            proc_data.fsuid(),
+            proc_data.fsgid(),
+            &supplementary_groups,
+        )?;
         fs.symlink(target.as_str(), linkpath.as_str())?;
         Ok(0)
     })
