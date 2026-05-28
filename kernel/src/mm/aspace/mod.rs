@@ -446,6 +446,29 @@ impl AddrSpace {
         Ok(())
     }
 
+    pub fn sync_backends_in_range(
+        &self,
+        mut start: VirtAddr,
+        size: usize,
+    ) -> AxResult<Vec<Backend>> {
+        self.validate_region(start, size)?;
+        let end = start + size;
+        let mut backends = Vec::new();
+
+        while start < end {
+            let Some(area) = self.areas.find(start) else {
+                ax_bail!(NoMemory);
+            };
+            if area.start() > start {
+                ax_bail!(NoMemory);
+            }
+            backends.push(area.backend().clone());
+            start = area.end().min(end);
+        }
+
+        Ok(backends)
+    }
+
     /// Removes mappings within the specified virtual address range.
     ///
     /// Returns an error if the address range is out of the address space or not

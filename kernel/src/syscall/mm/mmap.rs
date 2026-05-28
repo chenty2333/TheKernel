@@ -1,6 +1,6 @@
 use alloc::{sync::Arc, vec::Vec};
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FileBackend, FileFlags};
 use axhal::paging::{MappingFlags, PageSize};
 use axtask::current;
@@ -813,16 +813,31 @@ pub fn sys_msync(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
 
-    // Validate the range is mapped.
+    // Validate the range while holding the address-space lock, then sync
+    // outside the lock so page-cache eviction callbacks can unmap old PTEs.
     let curr = current();
     let aspace_handle = curr.as_thread().proc_data.aspace();
-    let aspace = aspace_handle.lock();
     let length = align_up_4k(length);
-    if length > 0 && !aspace.can_access_range(VirtAddr::from(addr), length, MappingFlags::empty()) {
-        return Err(AxError::NoMemory);
+    let backends = {
+        let aspace = aspace_handle.lock();
+        if length > 0 {
+            let start = VirtAddr::from(addr);
+            let backends = aspace.sync_backends_in_range(start, length)?;
+            if flags & MS_INVALIDATE != 0 && aspace.range_is_locked(start, length) {
+                return Err(LinuxError::EBUSY.into());
+            }
+            backends
+        } else {
+            Vec::new()
+        }
+    };
+
+    if flags & MS_SYNC != 0 {
+        for backend in backends {
+            backend.sync(false)?;
+        }
     }
 
-    // No persistent backing store — sync is a no-op.
     Ok(0)
 }
 

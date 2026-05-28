@@ -198,6 +198,11 @@ impl FileBackend {
         }
         Ok(())
     }
+
+    pub(crate) fn sync(&self, data_only: bool) -> AxResult {
+        self.0.cache.sync(data_only)?;
+        Ok(())
+    }
 }
 
 impl BackendOps for FileBackend {
@@ -261,11 +266,8 @@ impl BackendOps for FileBackend {
                     if access_flags.contains(MappingFlags::WRITE)
                         && !page_flags.contains(MappingFlags::WRITE)
                     {
-                        let in_memory = self.0.cache.in_memory();
                         self.0.cache.with_page(pn, |page| {
-                            if !in_memory {
-                                page.expect("page should be present").mark_dirty();
-                            }
+                            page.expect("page should be present").mark_dirty();
                             pt.remap(addr, paddr, page_table_flags(flags))?;
                             pages += 1;
                             AxResult::Ok(())
@@ -276,14 +278,7 @@ impl BackendOps for FileBackend {
                 }
                 // If the page is not mapped, try map it.
                 Err(PagingError::NotMapped) => {
-                    let map_flags = if self.0.cache.in_memory() {
-                        // For in memory files, we don't need to (and also
-                        // musn't) mark them dirty, so we can use the original
-                        // flags.
-                        flags
-                    } else {
-                        flags - MappingFlags::WRITE
-                    };
+                    let map_flags = flags - MappingFlags::WRITE;
                     self.0.cache.with_page_or_insert(pn, |page, evicted| {
                         if let Some((pn, _)) = evicted {
                             to_be_evicted.push(pn);

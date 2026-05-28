@@ -1,5 +1,6 @@
 use alloc::{
     boxed::Box,
+    collections::BTreeSet,
     sync::{Arc, Weak},
     vec,
     vec::Vec,
@@ -19,7 +20,7 @@ use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
 use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter};
 use lru::LruCache;
-use spin::RwLock;
+use spin::{Once, RwLock};
 
 use super::FsContext;
 
@@ -317,6 +318,16 @@ impl Default for OpenOptions {
 }
 
 const PAGE_SIZE: usize = 4096;
+static DIRTY_PAGE_CACHE_PFNS: Once<Mutex<BTreeSet<usize>>> = Once::new();
+
+fn dirty_page_cache_pfns() -> &'static Mutex<BTreeSet<usize>> {
+    DIRTY_PAGE_CACHE_PFNS.call_once(|| Mutex::new(BTreeSet::new()))
+}
+
+/// Returns whether the page-cache page with the given PFN is currently dirty.
+pub fn page_cache_pfn_is_dirty(pfn: usize) -> bool {
+    dirty_page_cache_pfns().lock().contains(&pfn)
+}
 
 /// A single page-sized cache entry backed by a physical page.
 #[derive(Debug)]
@@ -343,9 +354,27 @@ impl PageCache {
         virt_to_phys(self.addr)
     }
 
+    fn pfn(&self) -> usize {
+        self.paddr().as_usize() / PAGE_SIZE
+    }
+
     /// Marks this page as dirty so it will be flushed on eviction.
     pub fn mark_dirty(&mut self) {
+        if !self.dirty {
+            dirty_page_cache_pfns().lock().insert(self.pfn());
+        }
         self.dirty = true;
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    fn clear_dirty(&mut self) {
+        if self.dirty {
+            dirty_page_cache_pfns().lock().remove(&self.pfn());
+        }
+        self.dirty = false;
     }
 
     /// Returns a mutable slice over the page data.
@@ -358,6 +387,7 @@ impl Drop for PageCache {
     fn drop(&mut self) {
         if self.dirty {
             warn!("dirty page dropped without flushing");
+            dirty_page_cache_pfns().lock().remove(&self.pfn());
         }
         global_allocator().dealloc_pages(self.addr.as_usize(), 1, UsageKind::PageCache);
     }
@@ -548,7 +578,7 @@ impl CachedFile {
             if len > 0 {
                 file.write_at(&page.data()[..len], page_start)?;
             }
-            page.dirty = false;
+            page.clear_dirty();
         }
         Ok(())
     }
@@ -566,6 +596,19 @@ impl CachedFile {
             self.evict_cache(file, pn, &mut page)?;
         }
         Ok(())
+    }
+
+    fn sync_in_memory_cache(&self) {
+        let mut guard = self.shared.page_cache.lock();
+        for (pn, page) in guard.iter_mut() {
+            if !page.is_dirty() {
+                continue;
+            }
+            for listener in self.shared.evict_listeners.lock().iter() {
+                (listener.listener)(*pn, page);
+            }
+            page.clear_dirty();
+        }
     }
 
     fn ensure_page_cached(
@@ -737,7 +780,7 @@ impl CachedFile {
                     let new_page_offset =
                         len.saturating_sub(page_start).min(PAGE_SIZE as u64) as usize;
                     page.data()[new_page_offset..].fill(0);
-                    page.dirty = false;
+                    page.clear_dirty();
                 }
                 guard
                     .iter()
@@ -750,7 +793,7 @@ impl CachedFile {
                     && !self.in_memory
                 {
                     // Don't write back pages since they're discarded.
-                    page.dirty = false;
+                    page.clear_dirty();
                     self.evict_cache(file, pn, &mut page)?;
                 }
             }
@@ -760,7 +803,7 @@ impl CachedFile {
                 let page_start = new_last_page as u64 * PAGE_SIZE as u64;
                 let new_page_offset = len.saturating_sub(page_start).min(PAGE_SIZE as u64) as usize;
                 page.data()[new_page_offset..].fill(0);
-                page.dirty = false;
+                page.clear_dirty();
             }
         }
         Ok(())
@@ -769,6 +812,7 @@ impl CachedFile {
     /// Flushes all cached pages back to disk.
     pub fn sync(&self, data_only: bool) -> VfsResult<()> {
         if self.in_memory {
+            self.sync_in_memory_cache();
             return Ok(());
         }
         let file = self.inner.entry().as_file()?;

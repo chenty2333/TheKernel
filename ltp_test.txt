@@ -800,6 +800,7 @@ mprotect04 mprotect04
 msync01 msync01
 msync02 msync02
 msync03 msync03
+msync04 msync04
 munmap01 munmap01
 munmap02 munmap02
 munmap03 munmap03

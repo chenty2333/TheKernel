@@ -16,6 +16,7 @@ use core::{
     task::Context,
 };
 
+use axfs::page_cache_pfn_is_dirty;
 use axfs_ng_vfs::{
     FileNodeOps, Filesystem, FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps,
     NodePermission, NodeType, VfsError, VfsResult,
@@ -44,6 +45,8 @@ use crate::{
 
 const PROC_PID_MAX: u32 = 4_194_304;
 const PROC_PAGEMAP_ENTRY_BYTES: u64 = 8;
+const PROC_KPAGEFLAGS_ENTRY_BYTES: u64 = 8;
+const KPF_DIRTY: u64 = 1 << 4;
 
 fn render_mounts() -> String {
     let mut out = String::from("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n");
@@ -392,6 +395,101 @@ impl Pollable for ProcPagemapFile {
     fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
 }
 
+struct ProcKpageflagsFile {
+    node: SimpleFsNode,
+}
+
+impl ProcKpageflagsFile {
+    fn new(fs: Arc<SimpleFs>) -> Arc<Self> {
+        Arc::new(Self {
+            node: SimpleFsNode::new(
+                fs,
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o444),
+            ),
+        })
+    }
+
+    fn kpageflags_entry(&self, pfn: u64) -> u64 {
+        usize::try_from(pfn)
+            .ok()
+            .filter(|pfn| page_cache_pfn_is_dirty(*pfn))
+            .map_or(0, |_| KPF_DIRTY)
+    }
+}
+
+#[inherit_methods(from = "self.node")]
+impl NodeOps for ProcKpageflagsFile {
+    fn inode(&self) -> u64;
+
+    fn metadata(&self) -> VfsResult<Metadata>;
+
+    fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()>;
+
+    fn filesystem(&self) -> &dyn FilesystemOps;
+
+    fn sync(&self, _data_only: bool) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+
+    fn len(&self) -> VfsResult<u64> {
+        Ok(0)
+    }
+
+    fn flags(&self) -> NodeFlags {
+        NodeFlags::NON_CACHEABLE
+    }
+}
+
+impl FileNodeOps for ProcKpageflagsFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        let mut written = 0;
+        let mut entry_index = offset / PROC_KPAGEFLAGS_ENTRY_BYTES;
+        let mut entry_offset = (offset % PROC_KPAGEFLAGS_ENTRY_BYTES) as usize;
+
+        while written < buf.len() {
+            let entry = self.kpageflags_entry(entry_index).to_le_bytes();
+            let copy_len =
+                (PROC_KPAGEFLAGS_ENTRY_BYTES as usize - entry_offset).min(buf.len() - written);
+            buf[written..written + copy_len]
+                .copy_from_slice(&entry[entry_offset..entry_offset + copy_len]);
+            written += copy_len;
+            entry_index += 1;
+            entry_offset = 0;
+        }
+
+        Ok(written)
+    }
+
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        Err(VfsError::BadFileDescriptor)
+    }
+
+    fn append(&self, _buf: &[u8]) -> VfsResult<(usize, u64)> {
+        Err(VfsError::BadFileDescriptor)
+    }
+
+    fn set_len(&self, _len: u64) -> VfsResult<()> {
+        Err(VfsError::BadFileDescriptor)
+    }
+
+    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+        Err(VfsError::BadFileDescriptor)
+    }
+}
+
+impl Pollable for ProcKpageflagsFile {
+    fn poll(&self) -> IoEvents {
+        IoEvents::IN | IoEvents::OUT
+    }
+
+    fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+}
+
 impl SimpleDirOps for ThreadDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
         Box::new(
@@ -615,6 +713,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             Ok(format!("{:?}\n", allocator.usages()))
         }),
     );
+    root.add("kpageflags", ProcKpageflagsFile::new(fs.clone()));
     root.add(
         "instret",
         SimpleFile::new_regular(fs.clone(), || {

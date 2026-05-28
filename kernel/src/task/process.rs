@@ -211,7 +211,9 @@ impl ProcessData {
             cmdline: RwLock::new(cmdline),
             aspace_handle: RwLock::new(aspace),
             scope: RwLock::new(Scope::new()),
-            heap_top: AtomicUsize::new(crate::config::USER_HEAP_BASE),
+            heap_top: AtomicUsize::new(
+                crate::config::USER_HEAP_BASE + crate::config::USER_HEAP_SIZE,
+            ),
 
             rlim: RwLock::default(),
 

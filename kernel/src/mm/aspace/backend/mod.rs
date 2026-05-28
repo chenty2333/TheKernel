@@ -284,4 +284,11 @@ impl Backend {
             _ => self.page_size() as usize,
         }
     }
+
+    pub fn sync(&self, data_only: bool) -> AxResult {
+        match self {
+            Backend::File(backend) => backend.sync(data_only),
+            Backend::Linear(_) | Backend::Cow(_) | Backend::Shared(_) => Ok(()),
+        }
+    }
 }

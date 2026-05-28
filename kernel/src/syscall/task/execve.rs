@@ -275,7 +275,7 @@ fn do_execve(
         *proc_data.cmdline.write() = Arc::new(args);
     }
 
-    proc_data.set_heap_top(USER_HEAP_BASE);
+    proc_data.set_heap_top(USER_HEAP_BASE + crate::config::USER_HEAP_SIZE);
 
     #[cfg(target_arch = "loongarch64")]
     reset_current_user_fpu_state();
