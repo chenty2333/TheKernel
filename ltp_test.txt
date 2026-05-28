@@ -617,7 +617,10 @@ statx02
 statx03
 symlink02
 symlink04
+sync01 sync01
 sync_file_range01
+sync_file_range02 sync_file_range02
+syncfs01 syncfs01
 syscall01
 syslog12
 tar_tests.sh
