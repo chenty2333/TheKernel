@@ -522,9 +522,6 @@ pub fn sys_linkat(
             .into_file()
             .ok_or(AxError::BadFileDescriptor)?,
     };
-    if old.is_dir() {
-        return Err(AxError::OperationNotPermitted);
-    }
     check_search_permissions(
         &old,
         proc_data.fsuid(),
@@ -545,6 +542,9 @@ pub fn sys_linkat(
         Ok((new_dir, new_name))
     })?;
 
+    if old.is_dir() {
+        return Err(AxError::OperationNotPermitted);
+    }
     if has_tmpfile_state(&old) && old.filesystem().name() != "tmpfs" {
         materialize_tmpfile_link(&old, &new_dir, new_name)?;
     } else {

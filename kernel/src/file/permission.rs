@@ -11,6 +11,15 @@ use crate::task::AsThread;
 
 const STICKY_MODE_BIT: u32 = 0o1000;
 
+fn check_writable_mount(dir: &Location) -> AxResult {
+    let path = dir.absolute_path().map_err(|_| AxError::InvalidInput)?;
+    if crate::mounts::is_readonly(path.as_ref()) {
+        Err(AxError::ReadOnlyFilesystem)
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) fn granted_access_bits(
     perm: u32,
     owner_uid: u32,
@@ -130,6 +139,8 @@ pub(crate) fn check_create_permissions(
     gid: u32,
     supplementary_groups: &[u32],
 ) -> AxResult {
+    check_writable_mount(dir)?;
+
     if uid == 0 {
         return Ok(());
     }
@@ -159,6 +170,8 @@ fn check_directory_write_search_permissions(
     gid: u32,
     supplementary_groups: &[u32],
 ) -> AxResult {
+    check_writable_mount(dir)?;
+
     if uid == 0 {
         return Ok(());
     }

@@ -464,6 +464,7 @@ rename07
 rename08
 rename09
 rename10
+rename11 rename11
 rename13
 rmdir01
 rmdir03
@@ -780,6 +781,7 @@ kill12 kill12
 link05 link05
 link08 link08
 linkat01 linkat01
+linkat02 linkat02
 listen01 listen01
 ln01_sh ln_tests.sh
 mkdir01_sh mkdir_tests.sh
@@ -966,6 +968,7 @@ open12 open12
 openat02 openat02
 personality01 personality01
 personality02
+renameat01 renameat01
 renameat201 renameat201
 renameat202 renameat202 -i 10
 timer_gettime01 timer_gettime01
