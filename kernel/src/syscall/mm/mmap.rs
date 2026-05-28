@@ -8,7 +8,7 @@ use linux_raw_sys::general::*;
 use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange, align_up_4k};
 
 use crate::{
-    file::{File, FileLike, get_typed_file, io_uring::IoUringFile},
+    file::{File, FileLike, get_file_description, get_typed_file, io_uring::IoUringFile},
     mm::{AddrSpace, Backend, BackendOps, SharedPages},
     pseudofs::{Device, DeviceMmap},
     task::AsThread,
@@ -302,13 +302,6 @@ pub fn sys_mmap(
     fd: i32,
     offset: isize,
 ) -> AxResult<isize> {
-    if length == 0 {
-        return Err(AxError::InvalidInput);
-    }
-
-    let curr = current();
-    let aspace_handle = curr.as_thread().proc_data.aspace();
-    let mut aspace = aspace_handle.lock();
     let permission_flags = MmapProt::from_bits_truncate(prot);
     // TODO: check illegal flags for mmap
     let map_flags = match MmapFlags::from_bits(flags) {
@@ -332,6 +325,15 @@ pub fn sys_mmap(
     if is_anonymous_mapping && offset != 0 {
         return Err(AxError::InvalidInput);
     }
+    if !is_anonymous_mapping {
+        if fd < 0 {
+            return Err(AxError::BadFileDescriptor);
+        }
+        get_file_description(fd).map_err(|_| AxError::BadFileDescriptor)?;
+    }
+    if length == 0 {
+        return Err(AxError::InvalidInput);
+    }
     let offset: usize = offset.try_into().map_err(|_| AxError::InvalidInput)?;
     if !PageSize::Size4K.is_aligned(offset) {
         return Err(AxError::InvalidInput);
@@ -350,6 +352,9 @@ pub fn sys_mmap(
         PageSize::Size4K
     };
 
+    let curr = current();
+    let aspace_handle = curr.as_thread().proc_data.aspace();
+    let mut aspace = aspace_handle.lock();
     let start = addr.align_down(page_size);
     let end = (addr + length).align_up(page_size);
     let mut length = end - start;
@@ -371,10 +376,6 @@ pub fn sys_mmap(
             )
             .ok_or(AxError::NoMemory)?
     };
-
-    if !is_anonymous_mapping && fd < 0 {
-        return Err(AxError::BadFileDescriptor);
-    }
 
     let io_uring = if !is_anonymous_mapping && fd >= 0 {
         get_typed_file::<IoUringFile>(fd).ok()
