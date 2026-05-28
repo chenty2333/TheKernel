@@ -128,7 +128,8 @@ impl FileBackend {
         let page_start = vaddr.align_down_4k();
         let file_offset = self.0.offset_page as u64 * PAGE_SIZE_4K as u64
             + page_start.sub_addr(self.0.start) as u64;
-        file_offset >= file_end
+        let current_end = self.0.cache.location().len().unwrap_or(file_end);
+        file_offset >= current_end
     }
 
     fn clone_for_range_with_id(

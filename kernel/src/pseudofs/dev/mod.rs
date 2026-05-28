@@ -21,7 +21,7 @@ use axsync::Mutex;
 pub use log::bind_dev_log;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
-use crate::pseudofs::{Device, DeviceOps, DirMaker, DirMapping, SimpleDir, SimpleFs};
+use crate::pseudofs::{Device, DeviceMmap, DeviceOps, DirMaker, DirMapping, SimpleDir, SimpleFs};
 
 const RANDOM_SEED: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
 
@@ -63,6 +63,10 @@ impl DeviceOps for Zero {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn mmap(&self) -> DeviceMmap {
+        DeviceMmap::Anonymous
     }
 
     fn flags(&self) -> NodeFlags {

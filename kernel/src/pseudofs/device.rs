@@ -16,6 +16,8 @@ use super::{SimpleFs, SimpleFsNode};
 pub enum DeviceMmap {
     /// The device is not mappable.
     None,
+    /// Maps to anonymous zero-filled pages.
+    Anonymous,
     /// Maps to a physical address range.
     Physical(PhysAddrRange),
     /// The device is read-only and will be mapped as CoW.

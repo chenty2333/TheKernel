@@ -426,6 +426,10 @@ pub fn sys_mmap(
                             DeviceMmap::None => {
                                 return Err(AxError::NoSuchDevice);
                             }
+                            DeviceMmap::Anonymous => Backend::new_shared(
+                                start,
+                                Arc::new(SharedPages::new(length, PageSize::Size4K)?),
+                            ),
                             DeviceMmap::ReadOnly => Backend::new_cow(
                                 start,
                                 page_size,
@@ -466,15 +470,46 @@ pub fn sys_mmap(
                 // Private mapping from a file
                 let backend = file.inner().backend()?.clone();
                 validate_file_mmap_access(file.inner(), &backend, map_type, permission_flags)?;
-                let file_end = file.inner().location().len()?;
-                Backend::new_cow(
-                    start,
-                    page_size,
-                    file.inner().location().clone(),
-                    offset as u64,
-                    Some(file_end),
-                    true,
-                )
+                match backend {
+                    FileBackend::Direct(loc) => {
+                        let device_mmap = loc.entry().downcast::<Device>().ok().map(|it| it.mmap());
+                        match device_mmap {
+                            Some(DeviceMmap::None) => return Err(AxError::NoSuchDevice),
+                            Some(DeviceMmap::Anonymous) => Backend::new_alloc(start, page_size),
+                            Some(DeviceMmap::Physical(mut range)) => {
+                                range.start += offset;
+                                if range.is_empty() {
+                                    return Err(AxError::InvalidInput);
+                                }
+                                let max_size = range.size().align_down(page_size);
+                                length = length.min(max_size);
+                                Backend::new_linear(start, range.start, max_size)
+                            }
+                            Some(DeviceMmap::ReadOnly | DeviceMmap::Cache(_)) | None => {
+                                let file_end = file.inner().location().len()?;
+                                Backend::new_cow(
+                                    start,
+                                    page_size,
+                                    file.inner().location().clone(),
+                                    offset as u64,
+                                    Some(file_end),
+                                    true,
+                                )
+                            }
+                        }
+                    }
+                    FileBackend::Cached(_) => {
+                        let file_end = file.inner().location().len()?;
+                        Backend::new_cow(
+                            start,
+                            page_size,
+                            file.inner().location().clone(),
+                            offset as u64,
+                            Some(file_end),
+                            true,
+                        )
+                    }
+                }
             } else {
                 Backend::new_alloc(start, page_size)
             }

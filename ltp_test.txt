@@ -327,6 +327,7 @@ mmap04
 mmap05
 mmap06
 mmap09
+mmap10
 mmap12
 mmap13
 mmap14
@@ -338,6 +339,7 @@ mmap20
 mount01
 mount07
 mprotect05
+mremap01
 mremap06
 mtest01
 munlockall01
