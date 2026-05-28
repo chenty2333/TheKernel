@@ -72,16 +72,16 @@ impl MemoryFs {
     /// Creates a new empty memory filesystem.
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> Filesystem {
+        Self::new_with_permission(NodePermission::from_bits_truncate(0o755))
+    }
+
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new_with_permission(permission: NodePermission) -> Filesystem {
         let fs = Arc::new(Self {
             inodes: Mutex::new(Slab::new()),
             root: Mutex::default(),
         });
-        let root_ino = Inode::new(
-            &fs,
-            None,
-            NodeType::Directory,
-            NodePermission::from_bits_truncate(0o755),
-        );
+        let root_ino = Inode::new(&fs, None, NodeType::Directory, permission);
         *fs.root.lock() = Some(DirEntry::new_dir(
             |this| DirNode::new(MemoryNode::new(fs.clone(), root_ino, Some(this))),
             Reference::root(),

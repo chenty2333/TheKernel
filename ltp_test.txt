@@ -337,6 +337,8 @@ nanosleep04
 name_to_handle_at01
 name_to_handle_at02
 nfs05_make_tree -d 5 -f 20 -t 5
+nftw01
+nftw6401
 nice01
 nice02
 nice03

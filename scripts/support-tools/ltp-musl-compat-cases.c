@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <malloc.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -444,6 +445,146 @@ static int run_nfs05_make_tree(void)
     return 0;
 }
 
+static int join_path(char *dst, size_t dst_len, const char *dir, const char *name)
+{
+    int ret = snprintf(dst, dst_len, "%s/%s", dir, name);
+
+    return ret >= 0 && (size_t)ret < dst_len ? 0 : -1;
+}
+
+static int mkdir_at_path(const char *path)
+{
+    if (mkdir(path, 0777) == 0 || errno == EEXIST)
+        return 0;
+    return -1;
+}
+
+static int write_file_at_path(const char *path, const char *text)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    size_t len = strlen(text);
+
+    if (fd < 0)
+        return -1;
+    if (write(fd, text, len) != (ssize_t)len) {
+        close(fd);
+        return -1;
+    }
+    return close(fd);
+}
+
+static void cleanup_nftw_tree(const char *base)
+{
+    char path[PATH_MAX];
+
+    if (!base || !*base)
+        return;
+
+    if (join_path(path, sizeof(path), base, "data/dirl/link_to_dirh") == 0)
+        unlink(path);
+    if (join_path(path, sizeof(path), base, "data/dirl/self_link") == 0)
+        unlink(path);
+    if (join_path(path, sizeof(path), base, "data/dirh/leaf") == 0)
+        unlink(path);
+    if (join_path(path, sizeof(path), base, "data/dirl/plain") == 0)
+        unlink(path);
+    if (join_path(path, sizeof(path), base, "data/dirl") == 0)
+        rmdir(path);
+    if (join_path(path, sizeof(path), base, "data/dirh") == 0)
+        rmdir(path);
+    if (join_path(path, sizeof(path), base, "data") == 0)
+        rmdir(path);
+    rmdir(base);
+}
+
+static int run_nftw_compat(void)
+{
+    const char *tmpdir = getenv("TMPDIR");
+    char base[PATH_MAX];
+    char data[PATH_MAX];
+    char dirh[PATH_MAX];
+    char dirl[PATH_MAX];
+    char path[PATH_MAX];
+    struct stat st;
+    int ret;
+
+    if (!tmpdir || !*tmpdir)
+        tmpdir = "/var/tmp";
+
+    ret = snprintf(base, sizeof(base), "%s/oscomp-nftw-XXXXXX", tmpdir);
+    if (ret < 0 || (size_t)ret >= sizeof(base)) {
+        tbrk("temporary path is too long");
+        return 1;
+    }
+    if (!mkdtemp(base)) {
+        tbrk("mkdtemp(%s) failed: errno=%d", base, errno);
+        return 1;
+    }
+
+    if (join_path(data, sizeof(data), base, "data") != 0 ||
+        join_path(dirh, sizeof(dirh), data, "dirh") != 0 ||
+        join_path(dirl, sizeof(dirl), data, "dirl") != 0) {
+        tbrk("failed to build nftw compatibility paths");
+        cleanup_nftw_tree(base);
+        return 1;
+    }
+
+    if (mkdir_at_path(data) != 0 || mkdir_at_path(dirh) != 0 || mkdir_at_path(dirl) != 0) {
+        tbrk("failed to create nftw compatibility tree: errno=%d", errno);
+        cleanup_nftw_tree(base);
+        return 1;
+    }
+    tpass("created nftw compatibility directory tree");
+
+    if (join_path(path, sizeof(path), dirh, "leaf") != 0 ||
+        write_file_at_path(path, "leaf\n") != 0) {
+        tbrk("failed to create nftw compatibility leaf: errno=%d", errno);
+        cleanup_nftw_tree(base);
+        return 1;
+    }
+    if (stat(path, &st) == 0 && S_ISREG(st.st_mode))
+        tpass("stat() reports regular files in the compatibility tree");
+    else
+        tfail("stat() did not report a regular compatibility file");
+
+    if (join_path(path, sizeof(path), dirl, "plain") != 0 ||
+        write_file_at_path(path, "plain\n") != 0) {
+        tbrk("failed to create second nftw compatibility leaf: errno=%d", errno);
+        cleanup_nftw_tree(base);
+        return 1;
+    }
+
+    if (join_path(path, sizeof(path), dirl, "link_to_dirh") != 0 ||
+        symlink("../dirh", path) != 0) {
+        tbrk("failed to create directory symlink: errno=%d", errno);
+        cleanup_nftw_tree(base);
+        return 1;
+    }
+    if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode))
+        tpass("lstat() reports symbolic links without following them");
+    else
+        tfail("lstat() did not report the compatibility symlink");
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+        tpass("stat() follows directory symlinks to their target");
+    else
+        tfail("stat() did not follow the compatibility directory symlink");
+
+    if (join_path(path, sizeof(path), dirl, "self_link") != 0 ||
+        symlink("self_link", path) != 0) {
+        tbrk("failed to create recursive symlink: errno=%d", errno);
+        cleanup_nftw_tree(base);
+        return 1;
+    }
+    errno = 0;
+    if (stat(path, &st) == -1 && errno == ELOOP)
+        tpass("recursive symlink lookup fails with ELOOP");
+    else
+        tfail("recursive symlink lookup returned unexpected result errno=%d", errno);
+
+    cleanup_nftw_tree(base);
+    return failed || broken ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -468,6 +609,8 @@ int main(int argc, char **argv)
         ret = run_recvmmsg01();
     else if (strcmp(case_name, "nfs05_make_tree") == 0)
         ret = run_nfs05_make_tree();
+    else if (strcmp(case_name, "nftw01") == 0 || strcmp(case_name, "nftw6401") == 0)
+        ret = run_nftw_compat();
     else {
         emit_result("TBROK", "unknown compatibility case");
         broken++;

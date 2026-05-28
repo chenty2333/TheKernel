@@ -61,8 +61,13 @@ pub fn mount_all() -> LinuxResult<()> {
 
     let fs = FS_CONTEXT.lock();
     mount_at(&fs, "/dev", dev::new_devfs())?;
-    mount_at(&fs, "/dev/shm", tmp::MemoryFs::new())?;
-    mount_at(&fs, "/tmp", tmp::MemoryFs::new())?;
+    let tmp_permission = NodePermission::from_bits_truncate(0o1777);
+    mount_at(&fs, "/dev/shm", tmp::MemoryFs::new_with_permission(tmp_permission))?;
+    mount_at(&fs, "/tmp", tmp::MemoryFs::new_with_permission(tmp_permission))?;
+    if fs.resolve("/var").is_err() {
+        fs.create_dir("/var", DIR_PERMISSION)?;
+    }
+    mount_at(&fs, "/var/tmp", tmp::MemoryFs::new_with_permission(tmp_permission))?;
     mount_at(&fs, "/proc", proc::new_procfs())?;
 
     mount_at(&fs, "/sys", sys::new_sysfs())?;
