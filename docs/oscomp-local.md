@@ -90,7 +90,7 @@ Main replay entrypoints:
 - `/glibc ltp`
 - `/musl ltp`
 
-The built-in full plan runs iperf before LTP so that long LTP coverage cannot starve the network throughput groups. LTP groups have a default per-libc case budget of 2700 seconds (`OSCOMP_LTP_GROUP_BUDGET_SECS`, or the libc-specific `OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS` / `OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS`), keeping the combined default LTP budget at the previous 5400-second ceiling; set the budget to `0` to disable that internal stop.
+The built-in full plan runs iperf before LTP so that long LTP coverage cannot starve the network throughput groups. LTP groups have default case budgets of 2400 seconds for glibc and 3000 seconds for musl (`OSCOMP_LTP_GROUP_BUDGET_SECS`, or the libc-specific `OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS` / `OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS`), keeping the combined default LTP budget at the previous 5400-second ceiling while giving the later musl group more room; set the budget to `0` to disable that internal stop.
 
 [`scripts/replay-oscomp-eval.sh`](/home/dia/TheKernel/scripts/replay-oscomp-eval.sh) replays the official pre-2025 flow with:
 

@@ -3295,10 +3295,10 @@ ltp_group_budget_secs_for_root() {
     root_flavor "$root"
     case "$ROOT_FLAVOR_RESULT" in
         musl)
-            budget_secs="${OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS:-${OSCOMP_LTP_GROUP_BUDGET_SECS:-2700}}"
+            budget_secs="${OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS:-${OSCOMP_LTP_GROUP_BUDGET_SECS:-3000}}"
             ;;
         glibc)
-            budget_secs="${OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS:-${OSCOMP_LTP_GROUP_BUDGET_SECS:-2700}}"
+            budget_secs="${OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS:-${OSCOMP_LTP_GROUP_BUDGET_SECS:-2400}}"
             ;;
         *)
             budget_secs="${OSCOMP_LTP_GROUP_BUDGET_SECS:-2700}"
