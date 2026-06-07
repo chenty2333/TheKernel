@@ -63,4 +63,4 @@ cd "$REPO_ROOT"
 exec docker compose \
     --env-file "$DEV_ENV_DIR/versions.env" \
     -f "$DEV_ENV_DIR/compose.yaml" \
-    run --rm "$service" "$@"
+    run --rm --remove-orphans "$service" "$@"

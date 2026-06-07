@@ -28,6 +28,12 @@ If official images are not under `~/kernel-image` or `~/testsuits-for-oskernel`,
 OSCOMP_TESTSUITE_HOST_DIR=/abs/path/to/kernel-image make dev-shell
 ```
 
+Run a command directly inside the dev container:
+
+```bash
+make dev-shell DEV_CMD="./scripts/oscomp.sh lab audit"
+```
+
 ## Build Artifacts
 
 Evaluator-facing artifacts are:
@@ -42,6 +48,7 @@ Main commands:
 make kernel-rv
 make kernel-la
 make disk.img
+make disk-la.img
 make all
 ```
 
@@ -59,6 +66,7 @@ The lower-level `make -C make disk_img` target also overwrites an existing disk 
 Main replay entrypoints:
 
 - `./scripts/oscomp.sh list`
+- `./scripts/oscomp.sh lab ...`
 - `./scripts/oscomp.sh run --arch rv`
 - `./scripts/oscomp.sh run --arch la`
 - `./scripts/oscomp.sh verify --arch rv`
@@ -141,7 +149,8 @@ At boot, [`src/init.sh`](/home/dia/TheKernel/src/init.sh) mounts the support dis
 
 ## Focused Replay And Overrides
 
-The local framework already supports focused replay instead of only full-matrix runs.
+The local framework supports focused replay instead of only full-matrix runs.
+Use [`docs/ltp-lab.md`](./ltp-lab.md) for the current LTP experiment workflow.
 
 Support-disk build options:
 
@@ -159,6 +168,16 @@ This allows:
 - focused LTP subsets
 - custom evaluation plans
 - targeted regression checks without editing the default guest runner
+
+The preferred high-level entrypoint is:
+
+```bash
+./scripts/oscomp.sh lab ...
+```
+
+It generates focused `ltp_test.txt` files, generates plan overrides, builds a
+matching support disk, replays QEMU, parses logs, and stores results under
+`.state/ltp-lab`.
 
 ## Output And Debugging
 
@@ -187,6 +206,9 @@ What this framework is good at now:
 - validating official image layout before replay
 - injecting support payloads through `disk.img`
 - running full or focused LTP subsets
+- indexing official LTP payloads and source runtest entries
+- storing focused LTP experiment results in `.state/ltp-lab`
+- cleaning generated lab state without deleting evaluator artifacts
 - keeping evaluator output format stable while still allowing explicit debug modes
 
 What it does not try to do:

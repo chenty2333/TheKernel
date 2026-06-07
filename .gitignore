@@ -20,3 +20,5 @@
 *.pcap
 score.txt
 *out
+__pycache__/
+*.pyc

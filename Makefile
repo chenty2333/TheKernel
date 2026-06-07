@@ -64,6 +64,9 @@ legacy-clean:
 		$(ROOT_DIR)/kernel-la \
 		$(ROOT_DIR)/disk.img \
 		$(ROOT_DIR)/disk-la.img \
+		$(ROOT_DIR)/rv_.out \
+		$(ROOT_DIR)/la_.out \
+		$(ROOT_DIR)/score.txt \
 		$(ROOT_DIR)/qemu.log \
 		$(ROOT_DIR)/netdump.pcap \
 		$(ROOT_DIR)/.axconfig.toml \
@@ -80,10 +83,10 @@ dev-image:
 
 dev-check:
 	@mkdir -p "$(EMPTY_TESTSUITE_DIR)"
-	@OSCOMP_TESTSUITE_HOST_DIR="$(EMPTY_TESTSUITE_DIR)" docker compose --env-file "$(DEV_ENV_DIR)/versions.env" -f "$(DEV_ENV_DIR)/compose.yaml" run --rm dev oskernel-image-check
+	@OSCOMP_TESTSUITE_HOST_DIR="$(EMPTY_TESTSUITE_DIR)" docker compose --env-file "$(DEV_ENV_DIR)/versions.env" -f "$(DEV_ENV_DIR)/compose.yaml" run --rm --remove-orphans dev oskernel-image-check
 
 dev-shell:
-	@OSKERNEL_DEV_IMAGE="$(OSKERNEL_DEV_IMAGE)" ./scripts/dev-shell.sh
+	@OSKERNEL_DEV_IMAGE="$(OSKERNEL_DEV_IMAGE)" ./scripts/dev-shell.sh $(if $(DEV_CMD),-- $(DEV_CMD),)
 
 dev-shell-root:
 	@OSKERNEL_DEV_IMAGE="$(OSKERNEL_DEV_IMAGE)" ./scripts/dev-shell.sh --service builder -- bash
@@ -104,6 +107,33 @@ eval-rv: kernel-rv
 
 eval-la: kernel-la
 	@./scripts/oscomp.sh run --arch la --skip-kernel-build $(OSCOMP_ARGS)
+
+lab-check:
+	@./scripts/oscomp.sh lab bootstrap
+
+lab-inventory:
+	@./scripts/oscomp.sh lab inventory
+
+lab-plan:
+	@./scripts/oscomp.sh lab plan $(LAB_ARGS)
+
+lab-list:
+	@./scripts/oscomp.sh lab generate $(LAB_ARGS)
+
+lab-run:
+	@./scripts/oscomp.sh lab run $(LAB_ARGS)
+
+lab-parse:
+	@./scripts/oscomp.sh lab parse $(LAB_ARGS)
+
+lab-summary:
+	@./scripts/oscomp.sh lab summarize $(LAB_ARGS)
+
+lab-promote:
+	@./scripts/oscomp.sh lab promote $(LAB_ARGS)
+
+lab-clean:
+	@./scripts/oscomp.sh lab clean --generated --legacy-root $(LAB_CLEAN_ARGS)
 
 debug:
 	@printf '%s\n' 'debug is not wired to the official pre-2025 evaluator flow; use scripts/oscomp.sh run instead.' >&2
@@ -142,7 +172,7 @@ rv:
 la:
 	$(MAKE) ARCH=loongarch64 run
 
-.PHONY: all build run eval-rv eval-la dev-image dev-check dev-shell dev-shell-root debug disasm clean legacy-clean prebuild-scrub check-eval-kernel-size kernel-rv kernel-la disk.img disk-la.img
+.PHONY: all build run eval-rv eval-la lab-check lab-inventory lab-plan lab-list lab-run lab-parse lab-summary lab-promote lab-clean dev-image dev-check dev-shell dev-shell-root debug disasm clean legacy-clean prebuild-scrub check-eval-kernel-size kernel-rv kernel-la disk.img disk-la.img
 check-eval-kernel-size:
 	@for kernel in $(ROOT_DIR)/kernel-rv $(ROOT_DIR)/kernel-la; do \
 		[ -f "$$kernel" ] || continue; \

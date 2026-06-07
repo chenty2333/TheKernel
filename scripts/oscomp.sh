@@ -40,12 +40,17 @@ usage() {
     cat <<'EOF'
 Usage:
   scripts/oscomp.sh list
+  scripts/oscomp.sh lab ...
   scripts/oscomp.sh run --arch {rv|la|riscv64|loongarch64} [options]
   scripts/oscomp.sh verify --arch {rv|la|riscv64|loongarch64} [--image PATH]
 
 Commands:
   list
       Print the current T202-aligned evaluation plan.
+
+  lab
+      Forward to scripts/ltp-lab.py for LTP inventory, focused list
+      generation, replay orchestration, log parsing, and cleanup.
 
   run
       Boot the official pre-2025 evaluator image under the contest QEMU shape.
@@ -178,6 +183,10 @@ main() {
         verify)
             shift
             verify_cmd "$@"
+            ;;
+        lab)
+            shift
+            exec "$SCRIPT_DIR/ltp-lab.py" "$@"
             ;;
         ""|-h|--help|help)
             usage
