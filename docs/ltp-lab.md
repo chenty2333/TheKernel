@@ -145,6 +145,19 @@ groups run.
 
 ## Run Experiments
 
+Prepare evaluator artifacts with the high-frequency path during normal
+iteration:
+
+```bash
+make kernels
+make artifacts
+```
+
+Use `make all` only when a clean evaluator build is needed. It preserves
+`.state/ltp-lab`, but it is slower than the high-frequency artifact targets.
+Use `make kernels` for kernel-only work and `make artifacts` when the support
+disk should also be refreshed.
+
 Run a generated list on RV only, reusing existing `kernel-rv`:
 
 ```bash

@@ -17,7 +17,9 @@ DEV_ENV_DIR ?= $(ROOT_DIR)/dev-env
 EMPTY_TESTSUITE_DIR ?= $(ROOT_DIR)/.state/empty-testsuites
 AUTOSCRUB_DIRS ?= \
 	$(ROOT_DIR)/.tmp \
-	$(STATE_DIR)
+	$(STATE_DIR)/riscv64 \
+	$(STATE_DIR)/loongarch64 \
+	$(STATE_DIR)/oscomp-replay
 
 # QEMU Options
 export BLK := y
@@ -48,11 +50,45 @@ ifeq ($(MEMTRACK), y)
 endif
 
 default: build
-all: prebuild-scrub legacy-clean kernel-rv kernel-la disk.img disk-la.img
+
+help:
+	@printf '%s\n' \
+		'Build commands:' \
+		'  make all          clean evaluator build; remote-submission entrypoint, not high-frequency' \
+		'  make artifacts    refresh kernel-rv/kernel-la/disk.img/disk-la.img without clean-eval' \
+		'  make kernels      high-frequency build of kernel-rv and kernel-la only' \
+		'  make kernel-rv    high-frequency RISC-V evaluator kernel; keeps Cargo target cache' \
+		'  make kernel-la    high-frequency LoongArch evaluator kernel; keeps Cargo target cache' \
+		'  make disk.img     rebuild support disk only' \
+		'  make clean-eval   remove evaluator artifacts and build/replay state; keep .state/ltp-lab' \
+		'  make clean        full local clean, including .state' \
+		'' \
+		'Replay commands:' \
+		'  make eval-rv      rebuild kernel-rv, then replay rv official image' \
+		'  make eval-la      rebuild kernel-la, then replay la official image' \
+		'  make replay-rv    reuse existing artifacts, then replay rv official image' \
+		'  make replay-la    reuse existing artifacts, then replay la official image' \
+		'' \
+		'Lab commands:' \
+		'  make lab-check' \
+		'  make lab-inventory' \
+		'  make lab-list LAB_ARGS="..."' \
+		'  make lab-run LAB_ARGS="..."' \
+		'  make lab-clean LAB_CLEAN_ARGS="..."'
+
+all:
+	@$(MAKE) --no-print-directory clean-eval
+	@$(MAKE) --no-print-directory artifacts
+
+artifacts: kernels disk.img disk-la.img
+
+kernels: kernel-rv kernel-la
 
 prebuild-scrub:
 	@rm -rf $(AUTOSCRUB_DIRS)
 	@mkdir -p $(STATE_DIR)
+
+clean-eval: prebuild-scrub legacy-clean
 
 legacy-clean:
 	@rm -rf \
@@ -108,6 +144,12 @@ eval-rv: kernel-rv
 eval-la: kernel-la
 	@./scripts/oscomp.sh run --arch la --skip-kernel-build $(OSCOMP_ARGS)
 
+replay-rv:
+	@./scripts/oscomp.sh run --arch rv --skip-kernel-build $(OSCOMP_ARGS)
+
+replay-la:
+	@./scripts/oscomp.sh run --arch la --skip-kernel-build $(OSCOMP_ARGS)
+
 lab-check:
 	@./scripts/oscomp.sh lab bootstrap
 
@@ -139,23 +181,23 @@ debug:
 	@printf '%s\n' 'debug is not wired to the official pre-2025 evaluator flow; use scripts/oscomp.sh run instead.' >&2
 	@exit 1
 
-kernel-rv: prebuild-scrub
+kernel-rv:
 	@$(MAKE) -C make ARCH=riscv64 BUS=mmio defconfig
-	@$(MAKE) -C make ARCH=riscv64 BUS=mmio build-elf
+	@$(MAKE) -C make ARCH=riscv64 BUS=mmio build-elf-fast
 	@kernel="$$(find "$(STATE_DIR)/riscv64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
 	test -n "$$kernel"; \
 	python3 scripts/patch-riscv-kernel-elf.py "$$kernel" "$@"
 	@$(MAKE) --no-print-directory check-eval-kernel-size
 
-kernel-la: prebuild-scrub
+kernel-la:
 	@$(MAKE) -C make ARCH=loongarch64 defconfig
-	@$(MAKE) -C make ARCH=loongarch64 build-elf
+	@$(MAKE) -C make ARCH=loongarch64 build-elf-fast
 	@kernel="$$(find "$(STATE_DIR)/loongarch64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
 	test -n "$$kernel"; \
 	python3 scripts/patch-loongarch-kernel-elf.py "$$kernel" "$@"
 	@$(MAKE) --no-print-directory check-eval-kernel-size
 
-disk.img: prebuild-scrub
+disk.img:
 	@set -- bash ./scripts/build-oscomp-support-disk.sh --arch both --output "$@"; \
 		if [ -n "$(OSCOMP_PLAN_OVERRIDE)" ]; then \
 			set -- "$$@" --plan-override "$(OSCOMP_PLAN_OVERRIDE)"; \
@@ -172,7 +214,7 @@ rv:
 la:
 	$(MAKE) ARCH=loongarch64 run
 
-.PHONY: all build run eval-rv eval-la lab-check lab-inventory lab-plan lab-list lab-run lab-parse lab-summary lab-promote lab-clean dev-image dev-check dev-shell dev-shell-root debug disasm clean legacy-clean prebuild-scrub check-eval-kernel-size kernel-rv kernel-la disk.img disk-la.img
+.PHONY: help all artifacts kernels build run eval-rv eval-la replay-rv replay-la lab-check lab-inventory lab-plan lab-list lab-run lab-parse lab-summary lab-promote lab-clean dev-image dev-check dev-shell dev-shell-root debug disasm clean clean-eval legacy-clean prebuild-scrub check-eval-kernel-size kernel-rv kernel-la disk.img disk-la.img
 check-eval-kernel-size:
 	@for kernel in $(ROOT_DIR)/kernel-rv $(ROOT_DIR)/kernel-la; do \
 		[ -f "$$kernel" ] || continue; \

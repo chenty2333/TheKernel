@@ -18,7 +18,7 @@ else ifneq ($(filter $(MAKECMDGOALS),unittest unittest_no_fail_fast),)
   # run `make unittest`
   $(if $(V), $(info RUSTFLAGS: "$(RUSTFLAGS)"))
   export RUSTFLAGS
-else ifneq ($(filter $(or $(MAKECMDGOALS), $(.DEFAULT_GOAL)), all build build-elf run justrun debug),)
+else ifneq ($(filter $(or $(MAKECMDGOALS), $(.DEFAULT_GOAL)), all build build-elf build-elf-fast run justrun debug),)
   # run `make build` and other above goals
   ifneq ($(V),)
     $(info APP: "$(APP)")
@@ -69,6 +69,15 @@ build-elf: prepare_build_state $(OUT_ELF)
 
 $(OUT_ELF): _cargo_build
 
+build-elf-fast: oldconfig | state_dirs
+	@printf "    $(GREEN_C)Building$(END_C) App: $(APP_NAME), Arch: $(ARCH), Platform: $(PLAT_NAME), App type: $(APP_TYPE)\n"
+ifeq ($(APP_TYPE), rust)
+	$(call cargo_build,$(APP),$(AX_FEAT) $(LIB_FEAT) $(APP_FEAT))
+	@cp $(rust_elf) $(OUT_ELF)
+else ifeq ($(APP_TYPE), c)
+	$(call cargo_build,ulib/axlibc,$(AX_FEAT) $(LIB_FEAT))
+endif
+
 $(OUT_DIR):
 	$(call run_cmd,mkdir,-p $@)
 
@@ -98,4 +107,4 @@ $(OUT_UIMG): $(OUT_BIN)
 		-a $(subst _,,$(shell $(AXCONFIG_GEN) "$(OUT_CONFIG)" -r plat.kernel-base-paddr)) \
 		-d $(OUT_BIN) $@)
 
-.PHONY: build-elf _cargo_build _dwarf
+.PHONY: build-elf build-elf-fast _cargo_build _dwarf

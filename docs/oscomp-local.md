@@ -45,19 +45,44 @@ Evaluator-facing artifacts are:
 Main commands:
 
 ```bash
+make all
+make artifacts
+make kernels
 make kernel-rv
 make kernel-la
 make disk.img
 make disk-la.img
-make all
 ```
 
-Top-level artifact builds now scrub repository-local build garbage before starting:
+Command intent:
+
+- `make all`: clean evaluator build. This is the remote-submission contract and
+  final local confirmation path, not the normal edit/test loop.
+- `make artifacts`: refresh all evaluator artifacts without `clean-eval`; it
+  keeps arch Cargo target caches but rebuilds the support disk.
+- `make kernels`: high-frequency build of both evaluator kernels only.
+- `make kernel-rv` and `make kernel-la`: high-frequency single-kernel artifacts
+  that preserve `.state/<arch>/target`.
+- `make disk.img`: support-disk refresh only.
+- `make clean-eval`: remove evaluator artifacts and build/replay state while
+  keeping `.state/ltp-lab`.
+- `make clean`: full local cleanup, including `.state`.
+
+`make all` scrubs evaluator build/replay state before rebuilding:
 
 - `.tmp`
-- `.state`
+- `.state/riscv64`
+- `.state/loongarch64`
+- `.state/oscomp-replay`
 
-This means a fresh top-level build replaces stale replay workdirs, old state trees, and previous support-disk temp roots automatically.
+It also removes stale root-level evaluator artifacts before rebuilding. It keeps
+`.state/ltp-lab` so that inventory, cached official images, generated lists, and
+run records survive a clean evaluator build.
+
+This means a fresh top-level build replaces stale replay workdirs, old arch build
+state, and previous support-disk temp roots automatically without deleting lab
+evidence. Use it for submission parity and clean confirmation; use the
+high-frequency artifact commands for the inner edit/test loop.
 
 The lower-level `make -C make disk_img` target also overwrites an existing disk image instead of warning and keeping the stale one.
 
@@ -73,6 +98,10 @@ Main replay entrypoints:
 - `./scripts/oscomp.sh verify --arch la`
 - `./scripts/replay-oscomp-eval.sh --arch rv`
 - `./scripts/replay-oscomp-eval.sh --arch la`
+- `make eval-rv`
+- `make eval-la`
+- `make replay-rv`
+- `make replay-la`
 
 [`scripts/oscomp.sh`](/home/dia/TheKernel/scripts/oscomp.sh) exposes the current fixed reference plan:
 
@@ -107,6 +136,10 @@ The built-in full plan runs iperf before LTP so that long LTP coverage cannot st
 - contest QEMU shape for `rv` and `la`
 - whole-QEMU timeout protection
 - optional `--workdir` and `--keep-workdir`
+
+Use `make eval-rv` or `make eval-la` when the selected kernel should be rebuilt
+before replay. Use `make replay-rv` or `make replay-la` when the existing root
+artifacts are known-current and should be reused.
 
 Official image search order is:
 

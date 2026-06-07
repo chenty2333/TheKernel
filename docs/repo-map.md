@@ -54,10 +54,21 @@ directories instead of adding case-specific behavior in the runner.
 - `third_party/rust-patches/`: local patched Rust crates used by the kernel.
 - `Cargo.toml` and `Cargo.lock`: workspace dependencies.
 
-Top-level build targets scrub stale root artifacts and local build state before
-building evaluator artifacts. Lower-level `make/` targets remain available for
-single-arch development, but remote submissions should rely on top-level
-`make all`.
+Build command roles:
+
+- `make all`: clean evaluator build and remote-submission entrypoint.
+- `make artifacts`: refresh all evaluator artifacts without `clean-eval`; it
+  keeps arch Cargo target caches but rebuilds the support disk.
+- `make kernels`: high-frequency build of both evaluator kernels only.
+- `make kernel-rv` / `make kernel-la`: high-frequency single-kernel artifacts.
+- `make disk.img`: support-disk refresh only.
+- `make clean-eval`: remove root evaluator artifacts and build/replay state while
+  preserving `.state/ltp-lab`.
+- `make clean`: full local cleanup, including `.state`.
+
+Remote submissions should rely on top-level `make all`. Day-to-day test-case
+work should use the high-frequency commands unless a clean evaluator build is
+needed to rule out stale build state.
 
 ## Development Environment
 
