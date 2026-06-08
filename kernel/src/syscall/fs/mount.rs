@@ -11,12 +11,13 @@ use axerrno::{AxError, AxResult};
 use axfs::{
     FS_CONTEXT, OpenBlockDeviceError, block_device_names, new_block_filesystem, open_block_device,
 };
-use axfs_ng_vfs::Filesystem;
+use axfs_ng_vfs::{Filesystem, path::Path};
 use axpoll::{IoEvents, Pollable};
+use linux_raw_sys::general::O_CLOEXEC;
 use spin::Mutex;
 
 use crate::{
-    file::{FileLike, get_file_like},
+    file::{FileLike, get_file_like, with_path_fs},
     mm::vm_load_string,
     mounts,
     pseudofs::MemoryFs,
@@ -26,6 +27,9 @@ const FSOPEN_CLOEXEC: u32 = 0x00000001;
 const FSCONFIG_SET_STRING: u32 = 1;
 const FSCONFIG_CMD_CREATE: u32 = 6;
 const FSMOUNT_CLOEXEC: u32 = 0x00000001;
+const OPEN_TREE_CLONE: u32 = 0x00000001;
+const OPEN_TREE_CLOEXEC: u32 = O_CLOEXEC;
+const OPEN_TREE__MASK: u32 = OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC;
 const BASIC_COMPAT_VFAT_SOURCE: &str = "/dev/vda2";
 const BASIC_COMPAT_MOUNT_TARGET: &str = "./mnt";
 const BASIC_COMPAT_MUSL_MOUNT_TARGET: &str = "/musl/basic/mnt";
@@ -177,6 +181,34 @@ pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
         attached: AtomicBool::new(false),
     }
     .add_to_fd_table(flags & FSMOUNT_CLOEXEC != 0)
+    .map(|new_fd| new_fd as isize)
+}
+
+pub fn sys_open_tree(dirfd: i32, pathname: *const c_char, flags: u32) -> AxResult<isize> {
+    let path = vm_load_string(pathname)?;
+    debug!("sys_open_tree <= dirfd: {dirfd}, path: {path:?}, flags: {flags:#x}");
+
+    if flags & !OPEN_TREE__MASK != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & OPEN_TREE_CLONE == 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let path_ref = Path::new(&path);
+    let loc = with_path_fs(dirfd, path_ref, |fs| fs.resolve(path_ref))?;
+    loc.check_is_dir()?;
+
+    FsMountFd {
+        fs: MemoryFs::new(),
+        source: loc
+            .absolute_path()
+            .map(|path| path.to_string())
+            .unwrap_or_else(|_| path.clone()),
+        fs_type: loc.filesystem().name().to_string(),
+        attached: AtomicBool::new(false),
+    }
+    .add_to_fd_table(flags & OPEN_TREE_CLOEXEC != 0)
     .map(|new_fd| new_fd as isize)
 }
 
