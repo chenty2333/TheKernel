@@ -307,6 +307,7 @@ impl CloneArgs {
             let proc_data = ProcessData::new(
                 proc,
                 child_exe_path,
+                old_proc_data.retain_executable(),
                 child_cmdline,
                 aspace,
                 signal_actions,

@@ -523,9 +523,10 @@ impl FutexKey {
                     };
                 }
                 Backend::File(file) => {
+                    let (handle, offset) = file.futex_key(address);
                     return Self::Shared {
-                        offset: address - area.start().as_usize(),
-                        region: Err(file.futex_handle()),
+                        offset,
+                        region: Err(handle),
                     };
                 }
                 _ => {}

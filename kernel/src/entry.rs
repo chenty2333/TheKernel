@@ -10,7 +10,7 @@ use axtask::{AxTaskExt, SchedState, spawn_task_with_sched};
 use starry_process::{Pid, Process};
 
 use crate::{
-    file::FD_TABLE,
+    file::{FD_TABLE, executable},
     mm::{
         copy_from_kernel, load_user_app, mark_page_fault_thread_context_ready,
         new_user_aspace_empty,
@@ -60,6 +60,7 @@ pub fn init(args: &[String], envs: &[String]) {
     let proc = ProcessData::new(
         proc,
         path.to_string(),
+        executable::acquire(&loc),
         Arc::new(args.to_vec()),
         Arc::new(Mutex::new(uspace)),
         Arc::default(),

@@ -1105,3 +1105,4 @@ setxattr03 setxattr03
 statx04 statx04
 statx08 statx08
 unlink09 unlink09
+creat07 creat07

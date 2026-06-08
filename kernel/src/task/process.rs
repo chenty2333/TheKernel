@@ -14,6 +14,7 @@ use starry_signal::{
     api::{ProcessSignalManager, SignalActions},
 };
 
+use crate::file::executable::{self, ExecutableKey};
 use super::{
     accounting::{AtomicTaskUsage, live_process_usage},
     creds::{CAPABILITY_WORDS, CapabilityState, Credentials},
@@ -117,6 +118,8 @@ pub struct ProcessData {
     pub proc: Arc<Process>,
     /// The executable path
     pub exe_path: RwLock<String>,
+    /// The inode currently held busy as this process image.
+    pub(crate) executable: SpinNoIrq<Option<ExecutableKey>>,
     /// The command line arguments
     pub cmdline: RwLock<Arc<Vec<String>>>,
     /// The virtual memory address space.
@@ -198,6 +201,7 @@ impl ProcessData {
     pub(crate) fn new(
         proc: Arc<Process>,
         exe_path: String,
+        executable: Option<ExecutableKey>,
         cmdline: Arc<Vec<String>>,
         aspace: Arc<Mutex<AddrSpace>>,
         signal_actions: Arc<SpinNoIrq<SignalActions>>,
@@ -208,6 +212,7 @@ impl ProcessData {
         Arc::new(Self {
             proc,
             exe_path: RwLock::new(exe_path),
+            executable: SpinNoIrq::new(executable),
             cmdline: RwLock::new(cmdline),
             aspace_handle: RwLock::new(aspace),
             scope: RwLock::new(Scope::new()),
@@ -268,6 +273,23 @@ impl ProcessData {
     /// Rebinds the process to a new address-space handle and returns the old one.
     pub fn replace_aspace(&self, aspace: Arc<Mutex<AddrSpace>>) -> Arc<Mutex<AddrSpace>> {
         core::mem::replace(&mut *self.aspace_handle.write(), aspace)
+    }
+
+    pub(crate) fn executable(&self) -> Option<ExecutableKey> {
+        *self.executable.lock()
+    }
+
+    pub(crate) fn retain_executable(&self) -> Option<ExecutableKey> {
+        executable::retain(self.executable())
+    }
+
+    pub(crate) fn replace_executable(&self, new_executable: Option<ExecutableKey>) {
+        let old_executable = core::mem::replace(&mut *self.executable.lock(), new_executable);
+        executable::release(old_executable);
+    }
+
+    pub(crate) fn release_executable(&self) {
+        self.replace_executable(None);
     }
 
     /// Set the top address of the user heap.
@@ -847,5 +869,11 @@ impl ProcessData {
             drop(vfork_ctl);
             self.vfork_event.wake();
         }
+    }
+}
+
+impl Drop for ProcessData {
+    fn drop(&mut self) {
+        executable::release(*self.executable.lock());
     }
 }

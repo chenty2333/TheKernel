@@ -233,6 +233,7 @@ impl FileLike for File {
                 let mut file = inner;
                 file.seek(SeekFrom::Current(0))?
             };
+            super::executable::check_not_active(inner.location())?;
             super::inode_flags::check_write(inner.location(), appending)?;
             let allowed = allowed_write_len(offset, len)?;
             if allowed == 0 {

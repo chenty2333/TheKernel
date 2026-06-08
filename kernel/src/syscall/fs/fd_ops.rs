@@ -33,7 +33,7 @@ use crate::{
             location_for_fd, notify_close, notify_exact, notify_parent, notify_parent_with_name,
             remove_dnotify_watch, set_dnotify_watch,
         },
-        inode_flags, install_tmpfile_state, lease, memfd,
+        executable, inode_flags, install_tmpfile_state, lease, memfd,
         permission::{
             check_create_permissions, check_open_permissions, check_path_prefix_search_permissions,
         },
@@ -133,6 +133,9 @@ fn check_inode_flags_for_open(loc: &Location, flags: c_int) -> AxResult<()> {
     let flags = flags as u32;
     if flags & O_PATH != 0 {
         return Ok(());
+    }
+    if flags & O_TRUNC != 0 || flags & O_ACCMODE != O_RDONLY {
+        executable::check_not_active(loc)?;
     }
     if flags & O_TRUNC != 0 {
         inode_flags::check_resize(loc)?;

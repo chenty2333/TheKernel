@@ -527,6 +527,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     thr.proc_data.end_exec(tid);
     let process_exited = process.exit_thread(tid, exit_code);
     if process_exited {
+        thr.proc_data.release_executable();
         crate::file::flock::release_posix_owner(process.pid());
         process.publish_zombie_snapshot(ZombieSnapshot {
             wait_status: process.exit_code(),

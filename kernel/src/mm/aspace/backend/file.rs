@@ -1,5 +1,6 @@
 use alloc::{
     boxed::Box,
+    collections::BTreeMap,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -13,6 +14,31 @@ use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 
 use super::{AddrSpace, Backend, BackendOps, PopulateCallback, page_table_flags, pages_in};
 use crate::file::memfd;
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+struct FileFutexKey {
+    device: u64,
+    inode: u64,
+}
+
+static FILE_FUTEX_HANDLES: Mutex<BTreeMap<FileFutexKey, Weak<()>>> =
+    Mutex::new(BTreeMap::new());
+
+fn file_futex_handle(cache: &CachedFile) -> Arc<()> {
+    let loc = cache.location();
+    let key = FileFutexKey {
+        device: loc.mountpoint().device(),
+        inode: loc.inode(),
+    };
+    let mut handles = FILE_FUTEX_HANDLES.lock();
+    if let Some(handle) = handles.get(&key).and_then(Weak::upgrade) {
+        return handle;
+    }
+
+    let handle = Arc::new(());
+    handles.insert(key, Arc::downgrade(&handle));
+    handle
+}
 
 #[doc(hidden)]
 pub struct FileBackendInner {
@@ -110,6 +136,12 @@ impl FileBackend {
 
     pub fn futex_handle(&self) -> Weak<()> {
         Arc::downgrade(&self.0.futex_handle)
+    }
+
+    pub fn futex_key(&self, address: usize) -> (Weak<()>, usize) {
+        let offset = self.0.offset_page as usize * PAGE_SIZE_4K
+            + address.saturating_sub(self.0.start.as_usize());
+        (self.futex_handle(), offset)
     }
 
     pub(crate) fn compatible_with(&self, other: &Self) -> bool {
@@ -346,6 +378,7 @@ impl Backend {
     ) -> Self {
         let offset_page = (offset / PAGE_SIZE_4K) as u32;
         let writable_mapping = memfd::new_writable_mapping_registration(cache.location());
+        let futex_handle = file_futex_handle(&cache);
         let inner = Arc::new(FileBackendInner {
             start,
             cache,
@@ -354,7 +387,7 @@ impl Backend {
             file_end,
             handle: AtomicUsize::new(0),
             map_id: Arc::new(()),
-            futex_handle: Arc::new(()),
+            futex_handle,
             writable_mapping,
         });
         inner.register_listener(aspace);

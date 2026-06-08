@@ -24,7 +24,7 @@ use starry_vm::{VmError, vm_load_until_nul};
 use crate::task::reset_current_user_fpu_state;
 use crate::{
     config::USER_HEAP_BASE,
-    file::{FD_TABLE, ResolveAtResult, resolve_at},
+    file::{FD_TABLE, ResolveAtResult, executable, resolve_at},
     mm::{copy_from_kernel, load_user_app, new_user_aspace_empty, vm_load_string},
     task::{
         AsThread, ProcessData, Thread, add_task_alias, check_signals, get_task,
@@ -217,6 +217,7 @@ fn do_execve(
     copy_from_kernel(&mut new_aspace)?;
     let (entry_point, user_stack_base) =
         load_user_app(&mut new_aspace, Some(abs_path.as_str()), &args, &envs)?;
+    let executable_key = executable::acquire(&loc);
 
     let curr = current();
     let thr = curr.as_thread();
@@ -226,6 +227,7 @@ fn do_execve(
     let mut exec_started = false;
     if proc_data.proc.threads().len() > 1 {
         if !proc_data.begin_exec(curr_tid) {
+            executable::release(executable_key);
             return Err(AxError::Interrupted);
         }
         exec_started = true;
@@ -238,6 +240,7 @@ fn do_execve(
         interrupt_exec_siblings(&sibling_tids);
         if let Err(err) = wait_for_exec_group(proc_data, thr, uctx, curr_tid, &sibling_tids) {
             proc_data.end_exec(curr_tid);
+            executable::release(executable_key);
             return Err(err);
         }
     }
@@ -255,6 +258,7 @@ fn do_execve(
     if exec_started {
         proc_data.end_exec(curr_tid);
     }
+    proc_data.replace_executable(executable_key);
 
     curr.set_name(&task_name);
 

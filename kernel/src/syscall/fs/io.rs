@@ -14,7 +14,7 @@ use crate::{
         Directory, File, FileHandle, FileLike, FileLikeKind, Pipe, Socket, allowed_write_len,
         check_resize_limit, get_file_like, get_typed_file,
         inotify::{notify_read, notify_write},
-        inode_flags, lease, memfd,
+        executable, inode_flags, lease, memfd,
         permission::check_open_permissions,
     },
     mm::{IoVec, IoVectorBuf, UserConstPtr, VmBytes, VmBytesMut},
@@ -141,7 +141,9 @@ fn positioned_file(fd: c_int, access: FileFlags) -> AxResult<FileHandle<File>> {
 }
 
 fn positioned_write_file(fd: c_int) -> AxResult<FileHandle<File>> {
-    positioned_file(fd, FileFlags::WRITE)
+    let file = positioned_file(fd, FileFlags::WRITE)?;
+    executable::check_not_active(file.inner().location())?;
+    Ok(file)
 }
 
 fn regular_copy_file(fd: c_int, write: bool) -> AxResult<FileHandle<File>> {
@@ -160,6 +162,7 @@ fn regular_copy_file(fd: c_int, write: bool) -> AxResult<FileHandle<File>> {
             return Err(AxError::BadFileDescriptor);
         }
         file.inner().access(FileFlags::WRITE)?;
+        executable::check_not_active(file.inner().location())?;
         inode_flags::check_write(file.inner().location(), false)?;
     } else {
         file.inner().access(FileFlags::READ)?;
@@ -412,6 +415,7 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
         &supplementary_groups,
     )?;
     check_resize_limit(length as u64)?;
+    executable::check_not_active(&loc)?;
     inode_flags::check_resize(&loc)?;
     lease::wait_for_truncate(&loc)?;
     memfd::check_resize(&loc, length as u64)?;
@@ -445,6 +449,7 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
             AxError::BadFileDescriptor => AxError::InvalidInput,
             other => other,
         })?;
+    executable::check_not_active(f.inner().location())?;
     inode_flags::check_resize(f.inner().location())?;
     lease::wait_for_truncate(f.inner().location())?;
     memfd::check_resize(f.inner().location(), length as u64)?;
@@ -479,6 +484,7 @@ pub fn sys_fallocate(
     let file = f.inner();
     let backend = file.backend()?;
     let loc = backend.location().clone();
+    executable::check_not_active(&loc)?;
     inode_flags::check_resize(&loc)?;
     let offset = offset as u64;
     let len = len as u64;
@@ -775,6 +781,7 @@ impl SendFile {
             SendFile::Direct(file) => file.write(&mut buf),
             SendFile::Offset(file, offset) => {
                 let off = offset.vm_read()?;
+                executable::check_not_active(file.inner().location())?;
                 inode_flags::check_write(file.inner().location(), false)?;
                 let bytes_written = file.inner().write_at(buf, off)?;
                 offset.vm_write(off + bytes_written as u64)?;
@@ -825,6 +832,7 @@ fn validate_sendfile_destination(fd: c_int) -> AxResult<()> {
     let file_like = get_file_like(fd)?;
     if let Some(file) = file_like.downcast_ref::<File>() {
         file.inner().access(FileFlags::WRITE)?;
+        executable::check_not_active(file.inner().location())?;
     } else if matches!(
         FileLikeKind::from_file_like(file_like.as_ref()),
         FileLikeKind::Directory
@@ -866,6 +874,7 @@ fn validate_splice_endpoint(fd: c_int, input: bool) -> AxResult<()> {
                 return Err(AxError::InvalidInput);
             }
             file.inner().access(FileFlags::WRITE)?;
+            executable::check_not_active(file.inner().location())?;
         }
         return Ok(());
     }

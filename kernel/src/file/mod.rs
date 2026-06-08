@@ -3,6 +3,7 @@ pub(crate) mod af_alg;
 pub mod bpf;
 pub mod epoll;
 pub mod event;
+pub(crate) mod executable;
 pub mod flock;
 mod fs;
 pub mod inotify;
