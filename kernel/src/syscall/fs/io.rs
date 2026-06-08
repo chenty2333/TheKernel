@@ -127,6 +127,27 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> 
     Ok(written)
 }
 
+pub fn sys_readahead(fd: c_int, offset: __kernel_off_t, count: usize) -> AxResult<isize> {
+    debug!("sys_readahead <= fd: {fd}, offset: {offset}, count: {count}");
+    if offset < 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let file_like = get_file_like(fd)?;
+    match FileLikeKind::from_file_like(file_like.as_ref()) {
+        FileLikeKind::Regular => {
+            let file = file_like
+                .downcast_ref::<File>()
+                .ok_or(AxError::InvalidInput)?;
+            file.inner().access(FileFlags::READ)?;
+            Ok(0)
+        }
+        FileLikeKind::Fifo => Err(AxError::from(LinuxError::ESPIPE)),
+        FileLikeKind::Socket => Err(AxError::InvalidInput),
+        FileLikeKind::Directory | FileLikeKind::Other => Err(AxError::InvalidInput),
+    }
+}
+
 fn positioned_file(fd: c_int, access: FileFlags) -> AxResult<FileHandle<File>> {
     let file_like = get_file_like(fd)?;
     match FileLikeKind::from_file_like(file_like.as_ref()) {

@@ -79,6 +79,7 @@ fn restart_class_for_syscall(sysno: Sysno, uctx: &UserContext) -> Option<Restart
         Sysno::read | Sysno::readv => {
             restart_class_for_fd_io(uctx.arg0() as i32, SocketIoDirection::Read)
         }
+        Sysno::readahead => Some(RestartClass::Sys),
         Sysno::write | Sysno::writev => {
             restart_class_for_fd_io(uctx.arg0() as i32, SocketIoDirection::Write)
         }
@@ -316,6 +317,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         // io
         Sysno::read => sys_read(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         Sysno::readv => sys_readv(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::readahead => sys_readahead(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         Sysno::write => sys_write(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         Sysno::writev => sys_writev(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         Sysno::lseek => sys_lseek(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
