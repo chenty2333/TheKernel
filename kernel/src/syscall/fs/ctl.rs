@@ -731,6 +731,21 @@ pub fn sys_readlinkat(
     buf: *mut u8,
     size: usize,
 ) -> AxResult<isize> {
+    fn write_readlink_result(loc: &Location, buf: *mut u8, size: usize) -> AxResult<isize> {
+        let curr = current();
+        let proc_data = &curr.as_thread().proc_data;
+        check_parent_search_permissions(
+            loc,
+            proc_data.fsuid(),
+            proc_data.fsgid(),
+            &proc_data.supplementary_groups(),
+        )?;
+        let link = loc.read_link()?;
+        let read = size.min(link.len());
+        vm_write_slice(buf, &link.as_bytes()[..read])?;
+        Ok(read as isize)
+    }
+
     let path = vm_load_string(path)?;
 
     debug!("sys_readlinkat <= dirfd: {dirfd}, path: {path:?}");
@@ -738,24 +753,16 @@ pub fn sys_readlinkat(
         return Err(AxError::InvalidInput);
     }
     if path.is_empty() {
-        return Err(AxError::NotFound);
+        let loc = resolve_at(dirfd, Some(path.as_str()), AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW)?
+            .into_file()
+            .ok_or(AxError::BadFileDescriptor)?;
+        return write_readlink_result(&loc, buf, size);
     }
     validate_pathname(Path::new(&path))?;
 
     with_path_fs(dirfd, Path::new(&path), |fs| {
         let entry = fs.resolve_no_follow(path.as_str())?;
-        let curr = current();
-        let proc_data = &curr.as_thread().proc_data;
-        check_parent_search_permissions(
-            &entry,
-            proc_data.fsuid(),
-            proc_data.fsgid(),
-            &proc_data.supplementary_groups(),
-        )?;
-        let link = entry.read_link()?;
-        let read = size.min(link.len());
-        vm_write_slice(buf, &link.as_bytes()[..read])?;
-        Ok(read as isize)
+        write_readlink_result(&entry, buf, size)
     })
 }
 
