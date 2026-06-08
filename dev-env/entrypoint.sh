@@ -24,7 +24,13 @@ if [[ "$(id -u)" == "0" ]]; then
         useradd -m -u "$LOCAL_UID" -g "$LOCAL_GID" -s /bin/bash oskernel
     fi
 
-    chown -R "$LOCAL_UID:$LOCAL_GID" "$HOME" "$CARGO_HOME" "$RUSTUP_HOME" /workspace/.state >/dev/null 2>&1 || true
+    chown -R "$LOCAL_UID:$LOCAL_GID" "$HOME" "$CARGO_HOME" "$RUSTUP_HOME" >/dev/null 2>&1 || true
+    if [[ -d /workspace/.state ]]; then
+        chown "$LOCAL_UID:$LOCAL_GID" /workspace/.state >/dev/null 2>&1 || true
+        if [[ "${THEKERNEL_DEV_RECURSIVE_CHOWN_STATE:-n}" == "y" ]]; then
+            chown -R "$LOCAL_UID:$LOCAL_GID" /workspace/.state >/dev/null 2>&1 || true
+        fi
+    fi
 
     if command -v git >/dev/null 2>&1 && [[ -d /workspace/.git ]]; then
         gosu "$LOCAL_UID:$LOCAL_GID" git config --global --add safe.directory /workspace >/dev/null 2>&1 || true

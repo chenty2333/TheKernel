@@ -1078,6 +1078,9 @@ def read_cases_jsonl(path: Path) -> list[dict[str, Any]]:
 def promote_cmd(args: argparse.Namespace) -> None:
     run_dirs = [Path(item).expanduser() for item in args.run_dir]
     required = split_csv(args.require) or [f"{arch}/{libc}" for arch in ARCHES for libc in LIBCS]
+    passing_statuses = {"pass"}
+    if args.allow_silent_pass:
+        passing_statuses.add("silent-pass")
     pass_sets: dict[str, set[str]] = {key: set() for key in required}
     line_by_case: dict[str, str] = {}
     for run_dir in run_dirs:
@@ -1087,7 +1090,7 @@ def promote_cmd(args: argparse.Namespace) -> None:
         for arch in ARCHES:
             for case in read_cases_jsonl(run_dir / arch / "cases.jsonl"):
                 key = f"{arch}/{case.get('libc') or 'unknown'}"
-                if key in pass_sets and case.get("status") in ("pass", "silent-pass"):
+                if key in pass_sets and case.get("status") in passing_statuses:
                     pass_sets[key].add(case["case"])
     if not pass_sets:
         die("no required combos selected")
@@ -1271,6 +1274,7 @@ def clean_cmd(args: argparse.Namespace) -> None:
             args.cache,
             args.refs,
             args.support_images,
+            args.workdirs,
             args.smoke,
             args.legacy_root,
             args.all,
@@ -1331,8 +1335,19 @@ def clean_cmd(args: argparse.Namespace) -> None:
                     if newest_mtime(image) >= cutoff:
                         continue
                 add_cleanup_target(targets, image)
+    if args.workdirs:
+        for run_dir in children_for_cleanup(RUN_DIR, dirs_only=True):
+            for arch in ARCHES:
+                workdir = run_dir / arch / "work"
+                if not workdir.exists():
+                    continue
+                if args.older_than:
+                    cutoff = _dt.datetime.now().timestamp() - parse_duration(args.older_than)
+                    if newest_mtime(workdir) >= cutoff:
+                        continue
+                add_cleanup_target(targets, workdir)
     if args.smoke:
-        for base in (LIST_DIR, PLAN_DIR, RUN_DIR, STATE_DIR):
+        for base in (LIST_DIR, PLAN_DIR, RUN_DIR):
             for item in children_for_cleanup(base):
                 if "smoke" in item.name.lower():
                     add_cleanup_target(targets, item)
@@ -1389,11 +1404,16 @@ def audit_cmd(args: argparse.Namespace) -> None:
     checks.append(("stale_docs", ",".join(stale_docs) if stale_docs else "absent"))
     smoke_state: list[str] = []
     if STATE_DIR.exists():
-        for item in STATE_DIR.rglob("*"):
-            if "smoke" in item.name.lower():
-                smoke_state.append(str(item))
-                if len(smoke_state) >= 5:
-                    break
+        for base in (LIST_DIR, PLAN_DIR, RUN_DIR):
+            if not base.exists():
+                continue
+            for item in base.rglob("*"):
+                if "smoke" in item.name.lower():
+                    smoke_state.append(str(item))
+                    if len(smoke_state) >= 5:
+                        break
+            if len(smoke_state) >= 5:
+                break
     checks.append(("smoke_state", ",".join(smoke_state) if smoke_state else "absent"))
     if args.json:
         print(json.dumps(dict(checks), indent=2, sort_keys=True))
@@ -1498,6 +1518,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--require", action="append", help="required combo such as rv/glibc, default all four")
     p.add_argument("--base", help="base list, default ltp_test.txt")
     p.add_argument("--output", required=True)
+    p.add_argument("--allow-silent-pass", action="store_true", help="also promote silent-pass/TCONF-only cases")
     p.set_defaults(func=promote_cmd)
 
     p = sub.add_parser("clean", help="remove lab state or old root artifacts")
@@ -1515,6 +1536,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cache", action="store_true", help="remove cacheable lab data such as cached images")
     p.add_argument("--refs", action="store_true", help="remove optional reference checkouts under .state/ltp-lab/refs")
     p.add_argument("--support-images", action="store_true", help="remove per-run support.img files while keeping logs")
+    p.add_argument("--workdirs", action="store_true", help="remove per-run QEMU workdirs while keeping parsed logs")
     p.add_argument("--smoke", action="store_true", help="remove lab entries whose names contain 'smoke'")
     p.add_argument("--older-than", help="only remove matching items older than a duration like 12h, 7d, or 2w")
     p.add_argument("--legacy-root", action="store_true", help="remove stale root score artifacts rv_.out/la_.out/score.txt")

@@ -1004,6 +1004,16 @@ dio12 diotest6 -b 65536
 dio13 diotest1 -b 65536 -n 2000
 dio14 diotest2 -b 65536 -i 1000
 dio15 diotest3 -b 65536 -i 1000
+dio16 diotest5 -b 65536 -i 1000
+dio17 diotest6 -b 65536 -i 1000
+dio18 diotest2 -b 65536 -i 1000 -o 1024000
+dio19 diotest3 -b 65536 -i 1000 -o 1024000
+dio20 diotest5 -b 65536 -i 1000 -o 1024000
+dio21 diotest6 -b 65536 -i 1000 -o 1024000
+dio26 diotest6 -b 8192 -v 100
+dio27 diotest6 -b 8192 -o 1024000 -i 1000 -v 100
+dio28 diotest6 -b 8192 -o 1024000 -i 1000 -v 200
+dio29 diotest3 -b 65536 -n 100 -i 100 -o 1024000
 ftest02 ftest02
 ftest03 ftest03
 ftest04 ftest04

@@ -63,6 +63,28 @@ Optional shallow references:
 
 Use Linux as a behavior reference only. Do not copy code into this kernel.
 
+When running inside Docker and the official images are mounted at
+`/opt/oskernel/testsuites`, keep the testsuite source metadata inside the
+repository state so both image and runtest data are visible to the container:
+
+```bash
+./scripts/oscomp.sh lab bootstrap \
+  --testsuits-ref .state/ltp-lab/refs/testsuits-for-oskernel \
+  --fetch
+./scripts/oscomp.sh lab inventory \
+  --image-root /opt/oskernel/testsuites \
+  --testsuite-source .state/ltp-lab/refs/testsuits-for-oskernel
+```
+
+`dev-env/entrypoint.sh` does not recursively chown `.state` by default. This
+keeps large cached images, baseline workdirs, and run logs from making every
+`dev-shell` startup slow. If a historical root-owned `.state` subtree must be
+repaired, run one explicit Docker shell with:
+
+```bash
+THEKERNEL_DEV_RECURSIVE_CHOWN_STATE=y ./scripts/dev-shell.sh -- true
+```
+
 `inventory` searches for `testsuits-for-oskernel` runtest metadata in this order:
 
 - explicit `--testsuite-source`
@@ -243,6 +265,10 @@ By default promotion requires all four combinations:
 
 Override with `--require rv/glibc --require la/glibc` for narrower experiments.
 
+Promotion uses real parser `pass` status by default. It does not promote
+`silent-pass` or TCONF-only cases unless `--allow-silent-pass` is passed
+explicitly.
+
 Review promoted lists before replacing the repository root `ltp_test.txt`.
 
 ## Cleanup
@@ -258,6 +284,10 @@ Pass extra cleanup flags through `LAB_CLEAN_ARGS`:
 ```bash
 make lab-clean LAB_CLEAN_ARGS="--cache --dry-run"
 ```
+
+Baseline replay directories under `.state/baseline/` are intentionally not part
+of `make lab-clean`; remove old baseline runs manually after their evidence has
+been superseded.
 
 `make lab-clean` keeps cached official image decompressions and optional
 reference checkouts. Remove those explicitly when needed:
@@ -278,6 +308,9 @@ Useful cleanup modes:
 
 # Keep only the newest 10 run directories.
 ./scripts/oscomp.sh lab clean --runs --keep-runs 10
+
+# Remove large per-run QEMU workdirs while preserving console logs and parsed summaries.
+./scripts/oscomp.sh lab clean --workdirs --dry-run
 
 # Remove run support images older than one week while preserving logs.
 ./scripts/oscomp.sh lab clean --support-images --older-than 7d
