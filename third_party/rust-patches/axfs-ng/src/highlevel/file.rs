@@ -1,6 +1,6 @@
 use alloc::{
     boxed::Box,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Weak},
     vec,
     vec::Vec,
@@ -334,9 +334,14 @@ impl Default for OpenOptions {
 
 const PAGE_SIZE: usize = 4096;
 static DIRTY_PAGE_CACHE_PFNS: Once<Mutex<BTreeSet<usize>>> = Once::new();
+static FILE_CACHE_REGISTRY: Once<Mutex<BTreeMap<(u64, u64), FileUserData>>> = Once::new();
 
 fn dirty_page_cache_pfns() -> &'static Mutex<BTreeSet<usize>> {
     DIRTY_PAGE_CACHE_PFNS.call_once(|| Mutex::new(BTreeSet::new()))
+}
+
+fn file_cache_registry() -> &'static Mutex<BTreeMap<(u64, u64), FileUserData>> {
+    FILE_CACHE_REGISTRY.call_once(|| Mutex::new(BTreeMap::new()))
 }
 
 /// Returns whether the page-cache page with the given PFN is currently dirty.
@@ -514,29 +519,36 @@ impl CachedFile {
         let in_memory = location.flags().contains(NodeFlags::ALWAYS_CACHE)
             || location.filesystem().name() == "tmpfs";
 
-        let shared = if in_memory {
-            let mut guard = location.user_data();
-            let shared = if let Some(shared) = guard.get::<FileUserData>().and_then(|it| it.get()) {
-                shared
+        let metadata = location.metadata().ok();
+        let key = metadata
+            .as_ref()
+            .map(|metadata| (metadata.device, metadata.inode));
+        let shared = key
+            .and_then(|key| file_cache_registry().lock().get(&key).and_then(|it| it.get()))
+            .or_else(|| location.user_data().get::<FileUserData>().and_then(|it| it.get()))
+            .unwrap_or_else(|| {
+                if in_memory {
+                    Arc::new(CachedFileShared::new_unbounded())
+                } else {
+                    Arc::new(CachedFileShared::new())
+                }
+            });
+
+        if let Some(key) = key {
+            let registry_value = if in_memory {
+                FileUserData::Strong(shared.clone())
             } else {
-                let shared = Arc::new(CachedFileShared::new_unbounded());
-                guard.insert(FileUserData::Strong(shared.clone()));
-                shared
+                FileUserData::Weak(Arc::downgrade(&shared))
             };
-            drop(guard);
-            shared
+            file_cache_registry().lock().insert(key, registry_value);
+        }
+
+        let local_value = if in_memory {
+            FileUserData::Strong(shared.clone())
         } else {
-            let mut guard = location.user_data();
-            let shared = if let Some(shared) = guard.get::<FileUserData>().and_then(|it| it.get()) {
-                shared
-            } else {
-                let shared = Arc::new(CachedFileShared::new());
-                guard.insert(FileUserData::Weak(Arc::downgrade(&shared)));
-                shared
-            };
-            drop(guard);
-            shared
+            FileUserData::Weak(Arc::downgrade(&shared))
         };
+        location.user_data().insert(local_value);
 
         Self {
             inner: location,

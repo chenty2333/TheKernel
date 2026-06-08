@@ -608,13 +608,18 @@ impl DirNodeOps for MemoryNode {
         let dir = self.inode.as_dir()?;
         let mut entries = dir.entries.lock();
 
-        let Some(entry) = entries.get(name) else {
+        let Some(inode) = entries.get(name).map(InodeRef::get) else {
             return Err(VfsError::NotFound);
         };
-        if let NodeContent::Dir(DirContent { entries }) = &entry.get().content
-            && entries.lock().len() > 2
+        if let NodeContent::Dir(DirContent {
+            entries: child_entries,
+        }) = &inode.content
         {
-            return Err(VfsError::DirectoryNotEmpty);
+            let mut child_entries = child_entries.lock();
+            if child_entries.len() > 2 {
+                return Err(VfsError::DirectoryNotEmpty);
+            }
+            child_entries.clear();
         }
         entries.remove(name);
 

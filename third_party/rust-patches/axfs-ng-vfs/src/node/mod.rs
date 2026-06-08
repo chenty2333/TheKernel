@@ -157,7 +157,13 @@ impl TypeMap {
     }
 
     pub fn insert<T: Any + Send + Sync>(&mut self, value: T) {
-        self.0.push((TypeId::of::<T>(), Arc::new(value)));
+        let id = TypeId::of::<T>();
+        let value: Arc<dyn Any + Send + Sync> = Arc::new(value);
+        if let Some((_, slot)) = self.0.iter_mut().find(|(existing, _)| *existing == id) {
+            *slot = value;
+        } else {
+            self.0.push((id, value));
+        }
     }
 
     pub fn get<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
