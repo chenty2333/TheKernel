@@ -33,7 +33,7 @@ use crate::{
             location_for_fd, notify_close, notify_exact, notify_parent, notify_parent_with_name,
             remove_dnotify_watch, set_dnotify_watch,
         },
-        install_tmpfile_state, lease, memfd,
+        inode_flags, install_tmpfile_state, lease, memfd,
         permission::{
             check_create_permissions, check_open_permissions, check_path_prefix_search_permissions,
         },
@@ -127,6 +127,20 @@ fn open_access_mask(flags: c_int) -> u32 {
         mask |= W_OK;
     }
     mask
+}
+
+fn check_inode_flags_for_open(loc: &Location, flags: c_int) -> AxResult<()> {
+    let flags = flags as u32;
+    if flags & O_PATH != 0 {
+        return Ok(());
+    }
+    if flags & O_TRUNC != 0 {
+        inode_flags::check_resize(loc)?;
+    }
+    if flags & O_ACCMODE != O_RDONLY {
+        inode_flags::check_write(loc, flags & O_APPEND != 0)?;
+    }
+    Ok(())
 }
 
 fn invalid_directory_open(flags: c_int) -> bool {
@@ -279,8 +293,11 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
                     if let Some(ptmx) = inner.downcast_ref::<tty::Ptmx>() {
                         // Opening /dev/ptmx creates a new pseudo-terminal
                         let (master, pty_number) = ptmx.create_pty()?;
-                        // TODO: this is cursed
-                        let pts = FS_CONTEXT.lock().resolve("/dev/pts")?;
+                        let pts = file
+                            .location()
+                            .parent()
+                            .ok_or(AxError::NotFound)?
+                            .lookup_no_follow("pts")?;
                         let entry = DirEntry::new_file(
                             FileNode::new(master),
                             NodeType::CharacterDevice,
@@ -297,14 +314,16 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
                             .session()
                             .terminal()
                             .ok_or(AxError::NotFound)?;
-                        let path = if term.is::<tty::NTtyDriver>() {
-                            "/dev/console".to_string()
+                        let dev_dir = file.location().parent().ok_or(AxError::NotFound)?;
+                        let loc = if term.is::<tty::NTtyDriver>() {
+                            dev_dir.lookup_no_follow("console")?
                         } else if let Some(pts) = term.downcast_ref::<tty::PtyDriver>() {
-                            format!("/dev/pts/{}", pts.pty_number())
+                            dev_dir
+                                .lookup_no_follow("pts")?
+                                .lookup_no_follow(&pts.pty_number().to_string())?
                         } else {
                             panic!("unknown terminal type")
                         };
-                        let loc = FS_CONTEXT.lock().resolve(&path)?;
                         file = axfs::File::new(FileBackend::Direct(loc), file.flags());
                     }
                 }
@@ -514,6 +533,7 @@ fn open_in_fs(
             fs.resolve(path)
         }?;
         enforce_special_open_rules(&existing, flags, uid)?;
+        check_inode_flags_for_open(&existing, flags)?;
         if existing.is_dir() && invalid_directory_open(flags) {
             return Err(AxError::IsADirectory);
         }

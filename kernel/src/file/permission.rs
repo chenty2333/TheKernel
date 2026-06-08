@@ -11,7 +11,7 @@ use crate::task::AsThread;
 
 const STICKY_MODE_BIT: u32 = 0o1000;
 
-fn check_writable_mount(dir: &Location) -> AxResult {
+pub(crate) fn check_writable_mount(dir: &Location) -> AxResult {
     let path = dir.absolute_path().map_err(|_| AxError::InvalidInput)?;
     if crate::mounts::is_readonly(path.as_ref()) {
         Err(AxError::ReadOnlyFilesystem)

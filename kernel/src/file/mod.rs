@@ -6,6 +6,7 @@ pub mod event;
 pub mod flock;
 mod fs;
 pub mod inotify;
+pub(crate) mod inode_flags;
 pub mod io_uring;
 pub(crate) mod lease;
 pub(crate) mod memfd;

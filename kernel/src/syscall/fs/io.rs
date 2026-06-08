@@ -14,7 +14,7 @@ use crate::{
         Directory, File, FileHandle, FileLike, FileLikeKind, Pipe, Socket, allowed_write_len,
         check_resize_limit, get_file_like, get_typed_file,
         inotify::{notify_read, notify_write},
-        lease, memfd,
+        inode_flags, lease, memfd,
         permission::check_open_permissions,
     },
     mm::{IoVec, IoVectorBuf, UserConstPtr, VmBytes, VmBytesMut},
@@ -30,6 +30,7 @@ const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
 const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
 const TMPFS_FALLOC_BLOCK_SIZE: u64 = 4096;
 const FALLOC_IO_CHUNK: usize = 64 * 1024;
+const MAX_FILE_OFFSET: u64 = i64::MAX as u64;
 const SPLICE_F_NONBLOCK: u32 = 0x02;
 const SYNC_FILE_RANGE_WAIT_BEFORE: u32 = 0x01;
 const SYNC_FILE_RANGE_WRITE: u32 = 0x02;
@@ -143,6 +144,63 @@ fn positioned_write_file(fd: c_int) -> AxResult<FileHandle<File>> {
     positioned_file(fd, FileFlags::WRITE)
 }
 
+fn regular_copy_file(fd: c_int, write: bool) -> AxResult<FileHandle<File>> {
+    let file_like = get_file_like(fd)?;
+    match FileLikeKind::from_file_like(file_like.as_ref()) {
+        FileLikeKind::Regular => {}
+        FileLikeKind::Directory => return Err(AxError::IsADirectory),
+        FileLikeKind::Fifo | FileLikeKind::Socket | FileLikeKind::Other => {
+            return Err(AxError::InvalidInput);
+        }
+    }
+
+    let file = get_typed_file::<File>(fd)?;
+    if write {
+        if file.inner().flags().contains(FileFlags::APPEND) {
+            return Err(AxError::BadFileDescriptor);
+        }
+        file.inner().access(FileFlags::WRITE)?;
+        inode_flags::check_write(file.inner().location(), false)?;
+    } else {
+        file.inner().access(FileFlags::READ)?;
+    }
+    Ok(file)
+}
+
+fn current_file_offset(file: &axfs::File) -> AxResult<u64> {
+    let mut file = file;
+    file.seek(SeekFrom::Current(0))
+}
+
+fn checked_user_file_offset(ptr: *mut u64) -> AxResult<u64> {
+    let value = ptr.vm_read()?;
+    if value > MAX_FILE_OFFSET {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(value)
+}
+
+fn copy_file_range_offset(file: &File, ptr: *mut u64) -> AxResult<u64> {
+    if ptr.is_null() {
+        current_file_offset(file.inner())
+    } else {
+        checked_user_file_offset(ptr)
+    }
+}
+
+fn ranges_overlap(left_start: u64, right_start: u64, len: u64) -> AxResult<bool> {
+    if len == 0 {
+        return Ok(false);
+    }
+    let left_end = left_start
+        .checked_add(len)
+        .ok_or_else(|| AxError::from(LinuxError::EOVERFLOW))?;
+    let right_end = right_start
+        .checked_add(len)
+        .ok_or_else(|| AxError::from(LinuxError::EFBIG))?;
+    Ok(left_start < right_end && right_start < left_end)
+}
+
 fn seekable_fd(fd: c_int) -> AxResult<FileHandle<dyn FileLike>> {
     let file_like = get_file_like(fd)?;
     match FileLikeKind::from_file_like(file_like.as_ref()) {
@@ -245,6 +303,7 @@ fn do_pwritev(
         if file.inner().flags().contains(FileFlags::APPEND) {
             let append_offset = file.inner().location().len()?;
             let allowed = allowed_write_len(append_offset, data.len())?;
+            inode_flags::check_write(file.inner().location(), true)?;
             memfd::check_write(file.inner().location(), append_offset, allowed)?;
             file.inner()
                 .access(FileFlags::APPEND)?
@@ -252,6 +311,7 @@ fn do_pwritev(
                 .0
         } else {
             let allowed = allowed_write_len(offset as u64, data.len())?;
+            inode_flags::check_write(file.inner().location(), false)?;
             memfd::check_write(file.inner().location(), offset as u64, allowed)?;
             file.inner()
                 .write_at(Cursor::new(&data[..allowed]), offset as u64)?
@@ -352,6 +412,7 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
         &supplementary_groups,
     )?;
     check_resize_limit(length as u64)?;
+    inode_flags::check_resize(&loc)?;
     lease::wait_for_truncate(&loc)?;
     memfd::check_resize(&loc, length as u64)?;
     let file = OpenOptions::new()
@@ -384,6 +445,7 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
             AxError::BadFileDescriptor => AxError::InvalidInput,
             other => other,
         })?;
+    inode_flags::check_resize(f.inner().location())?;
     lease::wait_for_truncate(f.inner().location())?;
     memfd::check_resize(f.inner().location(), length as u64)?;
     backend.set_len(length as _)?;
@@ -398,19 +460,34 @@ pub fn sys_fallocate(
     len: __kernel_off_t,
 ) -> AxResult<isize> {
     debug!("sys_fallocate <= fd: {fd}, mode: {mode}, offset: {offset}, len: {len}");
-    if offset < 0 || len < 0 {
+    if offset < 0 || len <= 0 {
         return Err(AxError::InvalidInput);
     }
 
-    let f = File::from_fd(fd)?;
+    let file_like = get_file_like(fd)?;
+    match FileLikeKind::from_file_like(file_like.as_ref()) {
+        FileLikeKind::Regular => {}
+        FileLikeKind::Directory => return Err(AxError::IsADirectory),
+        FileLikeKind::Fifo | FileLikeKind::Socket | FileLikeKind::Other => {
+            return Err(AxError::InvalidInput);
+        }
+    }
+
+    let f = get_typed_file::<File>(fd)?;
     f.inner().access(FileFlags::WRITE)?;
 
     let file = f.inner();
     let backend = file.backend()?;
     let loc = backend.location().clone();
+    inode_flags::check_resize(&loc)?;
     let offset = offset as u64;
     let len = len as u64;
-    let end = offset.checked_add(len).ok_or(AxError::InvalidInput)?;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| AxError::from(LinuxError::EFBIG))?;
+    if end > MAX_FILE_OFFSET {
+        return Err(AxError::from(LinuxError::EFBIG));
+    }
     let size = loc.len()?;
     let seals = memfd::current_seals(&loc).unwrap_or(0);
     let supported_modes = FALLOC_FL_KEEP_SIZE
@@ -598,6 +675,7 @@ pub fn sys_pwrite64(
     let write = if f.inner().flags().contains(FileFlags::APPEND) {
         let append_offset = f.inner().location().len()?;
         let allowed = allowed_write_len(append_offset, len)?;
+        inode_flags::check_write(f.inner().location(), true)?;
         memfd::check_write(f.inner().location(), append_offset, allowed)?;
         f.inner()
             .access(FileFlags::APPEND)?
@@ -605,6 +683,7 @@ pub fn sys_pwrite64(
             .0
     } else {
         let allowed = allowed_write_len(offset as u64, len)?;
+        inode_flags::check_write(f.inner().location(), false)?;
         memfd::check_write(f.inner().location(), offset as u64, allowed)?;
         f.inner()
             .write_at(VmBytes::new(buf, allowed), offset as _)?
@@ -696,6 +775,7 @@ impl SendFile {
             SendFile::Direct(file) => file.write(&mut buf),
             SendFile::Offset(file, offset) => {
                 let off = offset.vm_read()?;
+                inode_flags::check_write(file.inner().location(), false)?;
                 let bytes_written = file.inner().write_at(buf, off)?;
                 offset.vm_write(off + bytes_written as u64)?;
                 Ok(bytes_written)
@@ -849,18 +929,45 @@ pub fn sys_copy_file_range(
         _flags
     );
 
-    // TODO: check flags
-    // TODO: check both regular files
-    // TODO: check same file and overlap
+    if _flags != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if len as u64 > MAX_FILE_OFFSET {
+        return Err(AxError::from(LinuxError::EOVERFLOW));
+    }
+
+    let src_file = regular_copy_file(fd_in, false)?;
+    let dst_file = regular_copy_file(fd_out, true)?;
+    let len64 = len as u64;
+    let src_offset = copy_file_range_offset(&src_file, off_in)?;
+    let dst_offset = copy_file_range_offset(&dst_file, off_out)?;
+
+    if src_offset
+        .checked_add(len64)
+        .is_none_or(|end| end > MAX_FILE_OFFSET)
+    {
+        return Err(AxError::from(LinuxError::EOVERFLOW));
+    }
+    if dst_offset
+        .checked_add(len64)
+        .is_none_or(|end| end > MAX_FILE_OFFSET)
+    {
+        return Err(AxError::from(LinuxError::EFBIG));
+    }
+    if inode_flags::same_inode(src_file.inner().location(), dst_file.inner().location())
+        && ranges_overlap(src_offset, dst_offset, len64)?
+    {
+        return Err(AxError::InvalidInput);
+    }
 
     let src = if !off_in.is_null() {
-        SendFile::Offset(File::from_fd(fd_in)?, off_in)
+        SendFile::Offset(src_file, off_in)
     } else {
         SendFile::Direct(get_file_like(fd_in)?)
     };
 
     let dst = if !off_out.is_null() {
-        SendFile::Offset(File::from_fd(fd_out)?, off_out)
+        SendFile::Offset(dst_file, off_out)
     } else {
         SendFile::Direct(get_file_like(fd_out)?)
     };

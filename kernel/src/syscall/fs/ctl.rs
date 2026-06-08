@@ -16,7 +16,7 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
 use axfs_ng_vfs::{
-    Location, MetadataUpdate, NodePermission, NodeType,
+    DeviceId, Location, MetadataUpdate, NodePermission, NodeType,
     path::{MAX_NAME_LEN, Path},
 };
 use axhal::power::system_off;
@@ -30,10 +30,11 @@ use starry_vm::{VmPtr, vm_write_slice};
 use crate::{
     file::{
         Directory, FileLike, get_file_like, has_tmpfile_state,
+        inode_flags::{self, TimeUpdate},
         inotify::location_for_fd,
         permission::{
             check_create_permissions, check_parent_search_permissions, check_remove_permissions,
-            check_rename_permissions, check_search_permissions,
+            check_rename_permissions, check_search_permissions, check_writable_mount,
         },
         resolve_at, with_fs, with_path_fs,
     },
@@ -93,6 +94,7 @@ fn materialize_tmpfile_link(old: &Location, new_dir: &Location, new_name: &str) 
             mode: Some(metadata.mode),
             atime: Some(metadata.atime),
             mtime: Some(metadata.mtime),
+            ..Default::default()
         })?;
 
         let old_file = old.entry().as_file()?;
@@ -343,11 +345,11 @@ pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize
     Ok(0)
 }
 
-pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, _dev: u64) -> AxResult<isize> {
+pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, dev: u64) -> AxResult<isize> {
     let path = vm_load_string(path)?;
     let path_ref = Path::new(&path);
     validate_pathname(path_ref)?;
-    debug!("sys_mknodat <= dirfd: {dirfd}, path: {path}, mode: {mode:#o}, dev: {_dev}");
+    debug!("sys_mknodat <= dirfd: {dirfd}, path: {path}, mode: {mode:#o}, dev: {dev}");
 
     let node_type = match mode & S_IFMT {
         S_IFREG => NodeType::RegularFile,
@@ -391,6 +393,8 @@ pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, _dev: u64) -> AxR
     loc.update_metadata(MetadataUpdate {
         owner: Some((proc_data.fsuid(), owner_gid)),
         mode: Some(final_mode),
+        rdev: matches!(node_type, NodeType::CharacterDevice | NodeType::BlockDevice)
+            .then_some(DeviceId(dev)),
         ..Default::default()
     })?;
     let _ = crate::file::inotify::notify_parent_with_name(&parent, &name, IN_CREATE, false, 0);
@@ -579,11 +583,17 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let supplementary_groups = proc_data.supplementary_groups();
-    let loc = with_path_fs(dirfd, path_ref, |fs| fs.resolve_no_follow(path_ref))?;
+    let (parent_hint, name_hint) = with_path_fs(dirfd, path_ref, |fs| {
+        let (parent, name) = fs.resolve_nonexistent(path_ref)?;
+        check_writable_mount(&parent)?;
+        Ok((parent, name.to_string()))
+    })?;
+    let loc = parent_hint.lookup_no_follow(&name_hint)?;
     let parent = loc.parent();
     let name = loc.name().to_string();
     let is_dir = loc.is_dir();
     let clear_xattrs = is_dir || loc.metadata()?.nlink <= 1;
+    inode_flags::check_remove(&loc)?;
     if let Some(parent) = parent.as_ref() {
         check_remove_permissions(
             parent,
@@ -603,6 +613,7 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
     })?;
     if clear_xattrs {
         super::clear_location_xattrs(&loc);
+        inode_flags::clear(&loc);
     }
     if let Some(parent) = parent {
         let _ = crate::file::inotify::notify_parent_with_name(&parent, &name, IN_DELETE, is_dir, 0);
@@ -760,6 +771,7 @@ pub fn sys_fchownat(
 
     let uid = if uid == -1 { meta.uid } else { uid as _ };
     let gid = if gid == -1 { meta.gid } else { gid as _ };
+    inode_flags::check_metadata_update(&loc)?;
     loc.update_metadata(MetadataUpdate {
         owner: Some((uid, gid)),
         mode: Some(mode),
@@ -801,6 +813,7 @@ pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> A
     if proc_data.fsuid() != 0 && !proc_data.is_in_fs_group(meta.gid) {
         mode.remove(NodePermission::SET_GID);
     }
+    inode_flags::check_metadata_update(&loc)?;
     loc.update_metadata(MetadataUpdate {
         mode: Some(mode),
         ..Default::default()
@@ -815,17 +828,20 @@ fn update_times(
     path: *const c_char,
     atime: Option<Duration>,
     mtime: Option<Duration>,
+    atime_intent: TimeUpdate,
+    mtime_intent: TimeUpdate,
     flags: u32,
 ) -> AxResult<()> {
     let path = path.nullable().map(vm_load_string).transpose()?;
-    resolve_at(dirfd, path.as_deref(), flags)?
+    let loc = resolve_at(dirfd, path.as_deref(), flags)?
         .into_file()
-        .ok_or(AxError::BadFileDescriptor)?
-        .update_metadata(MetadataUpdate {
-            atime,
-            mtime,
-            ..Default::default()
-        })?;
+        .ok_or(AxError::BadFileDescriptor)?;
+    inode_flags::check_time_update(&loc, atime_intent, mtime_intent)?;
+    loc.update_metadata(MetadataUpdate {
+        atime,
+        mtime,
+        ..Default::default()
+    })?;
     Ok(())
 }
 
@@ -850,7 +866,12 @@ pub fn sys_utime(path: *const c_char, times: *const utimbuf) -> AxResult<isize> 
         let time = wall_time();
         (time, time)
     };
-    update_times(AT_FDCWD, path, Some(atime), Some(mtime), 0)?;
+    let intent = if times.is_null() {
+        TimeUpdate::Now
+    } else {
+        TimeUpdate::Explicit
+    };
+    update_times(AT_FDCWD, path, Some(atime), Some(mtime), intent, intent, 0)?;
     Ok(0)
 }
 
@@ -867,7 +888,12 @@ pub fn sys_utimes(
         let time = wall_time();
         (time, time)
     };
-    update_times(AT_FDCWD, path, Some(atime), Some(mtime), 0)?;
+    let intent = if times.is_null() {
+        TimeUpdate::Now
+    } else {
+        TimeUpdate::Explicit
+    };
+    update_times(AT_FDCWD, path, Some(atime), Some(mtime), intent, intent, 0)?;
     Ok(0)
 }
 
@@ -878,32 +904,47 @@ pub fn sys_utimensat(
     mut flags: u32,
 ) -> AxResult<isize> {
     if path.is_null() {
+        if flags != 0 {
+            return Err(AxError::InvalidInput);
+        }
         flags |= AT_EMPTY_PATH;
     }
-    fn utime_to_duration(time: &timespec) -> Option<AxResult<Duration>> {
+    fn utime_to_duration(time: &timespec) -> (Option<AxResult<Duration>>, TimeUpdate) {
         match time.tv_nsec {
-            val if val == UTIME_OMIT as _ => None,
-            val if val == UTIME_NOW as _ => Some(Ok(wall_time())),
-            _ => Some(time.try_into_time_value()),
+            val if val == UTIME_OMIT as _ => (None, TimeUpdate::Omit),
+            val if val == UTIME_NOW as _ => (Some(Ok(wall_time())), TimeUpdate::Now),
+            _ => (Some(time.try_into_time_value()), TimeUpdate::Explicit),
         }
     }
 
-    let (atime, mtime) = if let Some(times) = times.nullable() {
+    let (atime, mtime, atime_intent, mtime_intent) = if let Some(times) = times.nullable() {
         // FIXME: AnyBitPattern
         let [atime, mtime] = unsafe { times.vm_read_uninit()?.assume_init() };
+        let (atime, atime_intent) = utime_to_duration(&atime);
+        let (mtime, mtime_intent) = utime_to_duration(&mtime);
         (
-            utime_to_duration(&atime).transpose()?,
-            utime_to_duration(&mtime).transpose()?,
+            atime.transpose()?,
+            mtime.transpose()?,
+            atime_intent,
+            mtime_intent,
         )
     } else {
         let time = wall_time();
-        (Some(time), Some(time))
+        (Some(time), Some(time), TimeUpdate::Now, TimeUpdate::Now)
     };
     if atime.is_none() && mtime.is_none() {
         return Ok(0);
     }
 
-    update_times(dirfd, path, atime, mtime, flags)?;
+    update_times(
+        dirfd,
+        path,
+        atime,
+        mtime,
+        atime_intent,
+        mtime_intent,
+        flags,
+    )?;
     Ok(0)
 }
 
@@ -999,6 +1040,10 @@ pub fn sys_renameat2(
 
     if flags & RENAME_NOREPLACE != 0 && new_existing.is_some() {
         return Err(AxError::AlreadyExists);
+    }
+    inode_flags::check_remove(&old_loc)?;
+    if let Some(existing) = new_existing.as_ref() {
+        inode_flags::check_remove(existing)?;
     }
 
     if flags & RENAME_EXCHANGE != 0 {

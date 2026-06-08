@@ -231,7 +231,11 @@ pub fn sys_mount(
     flags: i32,
     _data: *const c_void,
 ) -> AxResult<isize> {
-    let source = vm_load_string(source)?;
+    let source = if source.is_null() {
+        String::new()
+    } else {
+        vm_load_string(source)?
+    };
     let target = vm_load_string(target)?;
     let fs_type = vm_load_string(fs_type)?;
     debug!("sys_mount <= source: {source:?}, target: {target:?}, fs_type: {fs_type:?}");

@@ -27,6 +27,8 @@ pub struct FileAttr {
     pub block_size: u64,
     /// Number of 512B blocks allocated
     pub blocks: u64,
+    /// Device ID for special files
+    pub rdev: u64,
 
     /// Time of last access
     pub atime: Duration,
@@ -93,6 +95,17 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         self.mark_dirty();
     }
 
+    pub fn rdev(&self) -> u64 {
+        unsafe { ext4_inode_get_dev(self.inner.inode) as u64 }
+    }
+
+    pub fn set_rdev(&mut self, rdev: u64) {
+        unsafe {
+            ext4_inode_set_dev(self.inner.inode, rdev as u32);
+            self.mark_dirty();
+        }
+    }
+
     pub fn set_atime(&mut self, dur: &Duration) {
         let (time, extra) = encode_time(dur);
         let inode = self.raw_inode_mut();
@@ -144,6 +157,7 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         attr.blocks = unsafe {
             ext4_inode_get_blocks_count(self.superblock() as *const _ as _, self.inner.inode)
         };
+        attr.rdev = self.rdev();
 
         let inode = self.raw_inode();
         attr.atime = decode_time(inode.access_time, inode.atime_extra);

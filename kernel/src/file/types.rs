@@ -22,6 +22,8 @@ pub struct Kstat {
     pub blksize: u32,
     pub blocks: u64,
     pub rdev: DeviceId,
+    pub attributes: u64,
+    pub attributes_mask: u64,
     pub atime: Duration,
     pub mtime: Duration,
     pub ctime: Duration,
@@ -40,6 +42,8 @@ impl Default for Kstat {
             blksize: 4096,
             blocks: 0,
             rdev: DeviceId::default(),
+            attributes: 0,
+            attributes_mask: 0,
             atime: Duration::default(),
             mtime: Duration::default(),
             ctime: Duration::default(),
@@ -78,7 +82,8 @@ impl From<Kstat> for statx {
         // SAFETY: valid for statx
         let mut statx: statx = unsafe { core::mem::zeroed() };
         statx.stx_blksize = value.blksize as _;
-        statx.stx_attributes = value.mode as _;
+        statx.stx_attributes = value.attributes;
+        statx.stx_attributes_mask = value.attributes_mask;
         statx.stx_nlink = value.nlink as _;
         statx.stx_uid = value.uid as _;
         statx.stx_gid = value.gid as _;

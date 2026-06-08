@@ -33,6 +33,7 @@ use crate::{
     mm::{Backend, BackendOps, system_memory_stats},
     mounts,
     pseudofs::{
+        dev::RANDOM_ENTROPY_BITS,
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
         SimpleFileOperation, SimpleFs, SimpleFsNode,
     },
@@ -977,6 +978,17 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 "printk",
                 SimpleFile::new_regular(fs.clone(), rw_static_file("4 4 1 7\n")),
             );
+            kernel.add("random", {
+                let mut random = DirMapping::new();
+                random.add(
+                    "entropy_avail",
+                    SimpleFile::new_regular(fs.clone(), || {
+                        Ok(format!("{RANDOM_ENTROPY_BITS}\n"))
+                    }),
+                );
+
+                SimpleDir::new_maker(fs.clone(), Arc::new(random))
+            });
 
             SimpleDir::new_maker(fs.clone(), Arc::new(kernel))
         });

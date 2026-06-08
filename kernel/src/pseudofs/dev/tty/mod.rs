@@ -21,7 +21,7 @@ use starry_vm::{VmMutPtr, VmPtr};
 use self::terminal::{
     Terminal, WindowSize,
     ldisc::{LineDiscipline, ProcessMode, TtyConfig, TtyRead, TtyWrite},
-    termios::{Termios, Termios2},
+    termios::{Termio, Termios, Termios2},
 };
 pub use self::{
     ntty::{N_TTY, NTtyDriver},
@@ -108,11 +108,24 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
     fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
         use linux_raw_sys::ioctl::*;
         match cmd {
+            TCGETA => {
+                (arg as *mut Termio).vm_write(self.terminal.termios.lock().as_termio())?;
+            }
             TCGETS => {
                 (arg as *mut Termios).vm_write(*self.terminal.termios.lock().as_ref().deref())?;
             }
             TCGETS2 => {
                 (arg as *mut Termios2).vm_write(*self.terminal.termios.lock().as_ref())?;
+            }
+            TCSETA | TCSETAF | TCSETAW => {
+                let termio = (arg as *const Termio).vm_read()?;
+                let current = self.terminal.termios.lock();
+                let next = Termios2::from_termio(termio, current.as_ref());
+                drop(current);
+                *self.terminal.termios.lock() = Arc::new(next);
+                if cmd == TCSETAF {
+                    self.ldisc.lock().drain_input();
+                }
             }
             TCSETS | TCSETSF | TCSETSW => {
                 // TODO: drain output?

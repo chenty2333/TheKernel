@@ -82,7 +82,7 @@ impl NodeOps for Inode {
             size: attr.size,
             block_size: attr.block_size,
             blocks: attr.blocks,
-            rdev: DeviceId::default(),
+            rdev: DeviceId(attr.rdev),
             atime: attr.atime,
             mtime: attr.mtime,
             ctime: attr.ctime,
@@ -97,6 +97,9 @@ impl NodeOps for Inode {
             }
             if let Some((uid, gid)) = update.owner {
                 inode.set_owner(uid as _, gid as _);
+            }
+            if let Some(rdev) = update.rdev {
+                inode.set_rdev(rdev.0);
             }
             if let Some(atime) = update.atime {
                 inode.set_atime(&atime);

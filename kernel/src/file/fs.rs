@@ -117,7 +117,7 @@ impl ResolveAtResult {
 
     pub fn stat(&self) -> AxResult<Kstat> {
         match self {
-            Self::File(file) => file.metadata().map(|it| metadata_to_kstat(&it)),
+            Self::File(file) => location_to_kstat(file),
             Self::Other(file_like) => file_like.stat(),
         }
     }
@@ -165,10 +165,20 @@ pub fn metadata_to_kstat(metadata: &Metadata) -> Kstat {
         blksize: metadata.block_size as _,
         blocks: metadata.blocks,
         rdev: metadata.rdev,
+        attributes: 0,
+        attributes_mask: 0,
         atime: metadata.atime,
         mtime: metadata.mtime,
         ctime: metadata.ctime,
     }
+}
+
+pub fn location_to_kstat(loc: &Location) -> AxResult<Kstat> {
+    let mut stat = metadata_to_kstat(&loc.metadata()?);
+    let (attributes, attributes_mask) = super::inode_flags::statx_attributes(loc);
+    stat.attributes = attributes;
+    stat.attributes_mask = attributes_mask;
+    Ok(stat)
 }
 
 /// File wrapper for `axfs::fops::File`.
@@ -216,12 +226,14 @@ impl FileLike for File {
         let len = src.remaining();
         let mut limited = None;
         if len != 0 {
-            let offset = if inner.flags().contains(axfs::FileFlags::APPEND) {
+            let appending = inner.flags().contains(axfs::FileFlags::APPEND);
+            let offset = if appending {
                 inner.location().len()?
             } else {
                 let mut file = inner;
                 file.seek(SeekFrom::Current(0))?
             };
+            super::inode_flags::check_write(inner.location(), appending)?;
             let allowed = allowed_write_len(offset, len)?;
             if allowed == 0 {
                 return Ok(0);
@@ -253,10 +265,13 @@ impl FileLike for File {
     }
 
     fn stat(&self) -> AxResult<Kstat> {
-        Ok(metadata_to_kstat(&self.inner().location().metadata()?))
+        location_to_kstat(self.inner().location())
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+        if let Some(result) = super::inode_flags::ioctl(self.inner().location(), cmd, arg) {
+            return result;
+        }
         self.inner().backend()?.location().ioctl(cmd, arg)
     }
 
@@ -331,7 +346,11 @@ impl FileLike for Directory {
     }
 
     fn stat(&self) -> AxResult<Kstat> {
-        Ok(metadata_to_kstat(&self.inner.metadata()?))
+        location_to_kstat(&self.inner)
+    }
+
+    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+        super::inode_flags::ioctl(&self.inner, cmd, arg).unwrap_or(Err(AxError::NotATty))
     }
 
     fn path(&self) -> Cow<'_, str> {

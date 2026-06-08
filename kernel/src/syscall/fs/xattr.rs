@@ -9,7 +9,7 @@ use starry_vm::vm_write_slice;
 
 use super::ctl::validate_pathname;
 use crate::{
-    file::{ResolveAtResult, resolve_at},
+    file::{ResolveAtResult, inode_flags, resolve_at},
     mm::{UserConstPtr, vm_load_string},
     pseudofs::tmp,
 };
@@ -137,6 +137,7 @@ fn list_map_xattrs(map: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
 
 fn set_location_xattr(loc: &Location, name: &str, value: Vec<u8>, flags: u32) -> AxResult<()> {
     namespace_allows_set(loc, name)?;
+    inode_flags::check_xattr_update(loc)?;
 
     if let Some(store) = tmp::xattr_store(loc) {
         let mut map = store.lock();
@@ -187,6 +188,8 @@ fn list_location_xattrs(loc: &Location) -> Vec<u8> {
 }
 
 fn remove_location_xattr(loc: &Location, name: &str) -> AxResult<()> {
+    inode_flags::check_xattr_update(loc)?;
+
     if let Some(store) = tmp::xattr_store(loc) {
         let mut map = store.lock();
         if map.remove(name).is_none() {

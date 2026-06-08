@@ -137,11 +137,10 @@ impl DeviceOps for LoopDevice {
                 self.ro.store(ro != 0, Ordering::Relaxed);
             }
             BLKRAGET => {
-                (arg as *mut u32).vm_write(self.ra.load(Ordering::Relaxed))?;
+                (arg as *mut usize).vm_write(self.ra.load(Ordering::Relaxed) as usize)?;
             }
             BLKRASET => {
-                self.ra
-                    .store((arg as *const u32).vm_read()? as _, Ordering::Relaxed);
+                self.ra.store(arg as u32, Ordering::Relaxed);
             }
             _ => {
                 warn!("unknown ioctl for loop device: {cmd}");

@@ -151,6 +151,9 @@ impl NodeOps for SimpleFsNode {
             metadata.uid = uid;
             metadata.gid = gid;
         }
+        if let Some(rdev) = update.rdev {
+            metadata.rdev = rdev;
+        }
         if let Some(atime) = update.atime {
             metadata.atime = atime;
         }

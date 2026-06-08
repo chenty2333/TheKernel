@@ -19,11 +19,14 @@ use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodeType, VfsResult};
 use axsync::Mutex;
 #[cfg(feature = "dev-log")]
 pub use log::bind_dev_log;
+use linux_raw_sys::ioctl::RNDGETENTCNT;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
+use starry_vm::VmMutPtr;
 
 use crate::pseudofs::{Device, DeviceMmap, DeviceOps, DirMaker, DirMapping, SimpleDir, SimpleFs};
 
 const RANDOM_SEED: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
+pub(crate) const RANDOM_ENTROPY_BITS: i32 = 256;
 
 pub(crate) fn new_devfs() -> Filesystem {
     SimpleFs::new_with("devfs".into(), 0x01021994, builder)
@@ -94,6 +97,16 @@ impl DeviceOps for Random {
 
     fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
         Ok(buf.len())
+    }
+
+    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+        match cmd {
+            RNDGETENTCNT => {
+                (arg as *mut i32).vm_write(RANDOM_ENTROPY_BITS)?;
+                Ok(0)
+            }
+            _ => Err(AxError::NotATty),
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -301,7 +314,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
 
     // Loop devices
     for i in 0..16 {
-        let dev_id = DeviceId::new(7, 0);
+        let dev_id = DeviceId::new(7, i);
         root.add(
             format!("loop{i}"),
             Device::new(
