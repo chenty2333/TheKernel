@@ -74,6 +74,9 @@ fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32))
         if flags & O_DIRECT != 0 {
             options.direct(true);
         }
+        if flags & O_NOATIME != 0 {
+            options.no_atime(true);
+        }
     }
     if flags & O_DIRECTORY != 0 {
         options.directory(true);
@@ -86,7 +89,7 @@ fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32))
 
 fn open_status_flags(flags: u32) -> u32 {
     let mut status = flags & O_ACCMODE;
-    status |= flags & (O_APPEND | O_NONBLOCK | FASYNC | O_PATH);
+    status |= flags & (O_APPEND | O_NONBLOCK | FASYNC | O_NOATIME | O_PATH);
     status
 }
 

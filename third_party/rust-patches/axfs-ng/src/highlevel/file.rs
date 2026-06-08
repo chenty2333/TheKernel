@@ -38,6 +38,8 @@ bitflags::bitflags! {
         const APPEND = 8;
         /// Path-only handle, no actual I/O is permitted.
         const PATH = 16;
+        /// Suppress access-time updates on successful reads.
+        const NOATIME = 32;
     }
 }
 
@@ -88,6 +90,7 @@ pub struct OpenOptions {
     directory: bool,
     no_follow: bool,
     direct: bool,
+    no_atime: bool,
     user: Option<(u32, u32)>,
     path: bool,
     node_type: NodeType,
@@ -109,6 +112,7 @@ impl OpenOptions {
             directory: false,
             no_follow: false,
             direct: false,
+            no_atime: false,
             user: None,
             path: false,
             node_type: NodeType::RegularFile,
@@ -168,6 +172,12 @@ impl OpenOptions {
     /// Sets the option to open the file with direct I/O.\
     pub fn direct(&mut self, direct: bool) -> &mut Self {
         self.direct = direct;
+        self
+    }
+
+    /// Sets the option to suppress access time updates on read.
+    pub fn no_atime(&mut self, no_atime: bool) -> &mut Self {
+        self.no_atime = no_atime;
         self
     }
 
@@ -282,14 +292,18 @@ impl OpenOptions {
         if self.path {
             return Ok(FileFlags::PATH);
         }
-        Ok(match (self.read, self.write, self.append) {
+        let mut flags = match (self.read, self.write, self.append) {
             (true, false, false) => FileFlags::READ,
             (false, true, false) => FileFlags::WRITE,
             (true, true, false) => FileFlags::READ | FileFlags::WRITE,
             (false, _, true) => FileFlags::WRITE | FileFlags::APPEND,
             (true, _, true) => FileFlags::READ | FileFlags::WRITE | FileFlags::APPEND,
             (false, false, false) => return Err(VfsError::InvalidInput),
-        })
+        };
+        if self.no_atime {
+            flags |= FileFlags::NOATIME;
+        }
+        Ok(flags)
     }
 
     pub(crate) fn is_valid(&self) -> bool {
@@ -299,7 +313,8 @@ impl OpenOptions {
                 && !self.append
                 && !self.truncate
                 && !self.create
-                && !self.create_new;
+                && !self.create_new
+                && !self.no_atime;
         }
         if !self.read && !self.write && !self.append {
             return false;
@@ -1101,7 +1116,7 @@ impl File {
     pub fn read_at(&self, dst: impl Write + IoBufMut, offset: u64) -> VfsResult<usize> {
         let read = self.access(FileFlags::READ)?.read_at(dst, offset)?;
         #[cfg(feature = "times")]
-        if read > 0 {
+        if read > 0 && !self.flags.contains(FileFlags::NOATIME) {
             self.record_time_flags(1);
             self.flush_times();
         }
