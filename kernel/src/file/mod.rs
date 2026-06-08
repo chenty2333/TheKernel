@@ -33,7 +33,7 @@ pub use self::{
     af_alg::AfAlgSocket,
     desc::*,
     fd_table::*,
-    fs::{Directory, File, ResolveAtResult, resolve_at, with_fs, with_path_fs},
+    fs::{Directory, File, ResolveAtResult, is_path_only_fd, resolve_at, with_fs, with_path_fs},
     net::Socket,
     packet::PacketSocket,
     pidfd::PidFd,

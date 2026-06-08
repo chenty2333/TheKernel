@@ -86,7 +86,7 @@ fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32))
 
 fn open_status_flags(flags: u32) -> u32 {
     let mut status = flags & O_ACCMODE;
-    status |= flags & (O_APPEND | O_NONBLOCK | FASYNC);
+    status |= flags & (O_APPEND | O_NONBLOCK | FASYNC | O_PATH);
     status
 }
 

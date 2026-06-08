@@ -29,7 +29,7 @@ use starry_vm::{VmPtr, vm_write_slice};
 
 use crate::{
     file::{
-        Directory, FileLike, get_file_like, has_tmpfile_state,
+        Directory, FileLike, get_file_like, has_tmpfile_state, is_path_only_fd,
         inode_flags::{self, TimeUpdate},
         inotify::location_for_fd,
         permission::{
@@ -46,6 +46,7 @@ use crate::{
 const SUPPORTED_RENAMEAT2_FLAGS: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
 const PATH_MAX: usize = 4096;
 const SUPPORTED_FCHMODAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+const SUPPORTED_FCHOWNAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
 const SUPPORTED_UNLINKAT_FLAGS: u32 = AT_REMOVEDIR;
 
 pub(super) fn validate_pathname(path: &Path) -> AxResult {
@@ -79,6 +80,15 @@ fn proc_self_fd_location(path: &str) -> Option<AxResult<Location>> {
             .and_then(location_for_fd)
             .ok_or(AxError::BadFileDescriptor),
     )
+}
+
+fn proc_self_fd_number(path: &str) -> Option<AxResult<i32>> {
+    let fd = path.strip_prefix("/proc/self/fd/")?;
+    if fd.is_empty() || fd.as_bytes().iter().any(|byte| !byte.is_ascii_digit()) {
+        return Some(Err(AxError::NotFound));
+    }
+
+    Some(fd.parse::<i32>().map_err(|_| AxError::NotFound))
 }
 
 fn materialize_tmpfile_link(old: &Location, new_dir: &Location, new_name: &str) -> AxResult<()> {
@@ -128,6 +138,26 @@ fn materialize_tmpfile_link(old: &Location, new_dir: &Location, new_name: &str) 
         let _ = new_dir.unlink(new_name, false);
     }
     result
+}
+
+fn check_empty_fd_metadata_access(dirfd: i32, path: Option<&str>, flags: u32) -> AxResult<()> {
+    if matches!(path, None | Some("")) && flags & AT_EMPTY_PATH != 0 && is_path_only_fd(dirfd)? {
+        return Err(AxError::BadFileDescriptor);
+    }
+    Ok(())
+}
+
+fn check_proc_fd_metadata_access(path: Option<&str>) -> AxResult<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if let Some(fd) = proc_self_fd_number(path) {
+        let fd = fd?;
+        if is_path_only_fd(fd)? {
+            return Err(AxError::BadFileDescriptor);
+        }
+    }
+    Ok(())
 }
 
 fn same_entry_at(
@@ -752,6 +782,17 @@ pub fn sys_fchownat(
     flags: u32,
 ) -> AxResult<isize> {
     let path = path.nullable().map(vm_load_string).transpose()?;
+    if flags & !SUPPORTED_FCHOWNAT_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if let Some(path) = path.as_deref() {
+        if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
+            return Err(AxError::NotFound);
+        }
+        validate_pathname(Path::new(path))?;
+    }
+    check_empty_fd_metadata_access(dirfd, path.as_deref(), flags)?;
+    check_proc_fd_metadata_access(path.as_deref())?;
     let loc = resolve_at(dirfd, path.as_deref(), flags)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
@@ -771,7 +812,17 @@ pub fn sys_fchownat(
 
     let uid = if uid == -1 { meta.uid } else { uid as _ };
     let gid = if gid == -1 { meta.gid } else { gid as _ };
+    check_writable_mount(&loc)?;
     inode_flags::check_metadata_update(&loc)?;
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    if proc_data.fsuid() != 0
+        && (proc_data.fsuid() != meta.uid
+            || uid != meta.uid
+            || (gid != meta.gid && !proc_data.is_in_fs_group(gid)))
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
     loc.update_metadata(MetadataUpdate {
         owner: Some((uid, gid)),
         mode: Some(mode),
@@ -800,12 +851,15 @@ pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> A
         }
         validate_pathname(Path::new(path))?;
     }
+    check_empty_fd_metadata_access(dirfd, path.as_deref(), flags)?;
+    check_proc_fd_metadata_access(path.as_deref())?;
     let loc = resolve_at(dirfd, path.as_deref(), flags)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
     let meta = loc.metadata()?;
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
+    check_writable_mount(&loc)?;
     if proc_data.fsuid() != 0 && proc_data.fsuid() != meta.uid {
         return Err(AxError::OperationNotPermitted);
     }

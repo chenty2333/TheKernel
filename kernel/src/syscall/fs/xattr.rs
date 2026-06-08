@@ -9,7 +9,7 @@ use starry_vm::vm_write_slice;
 
 use super::ctl::validate_pathname;
 use crate::{
-    file::{ResolveAtResult, inode_flags, resolve_at},
+    file::{ResolveAtResult, inode_flags, is_path_only_fd, resolve_at},
     mm::{UserConstPtr, vm_load_string},
     pseudofs::tmp,
 };
@@ -83,6 +83,13 @@ fn resolve_xattr_path(path: *const c_char, no_follow: bool) -> AxResult<Location
 
 fn resolve_xattr_fd(fd: i32) -> AxResult<ResolveAtResult> {
     resolve_at(fd, None, AT_EMPTY_PATH)
+}
+
+fn check_fd_xattr_access(fd: i32) -> AxResult<()> {
+    if is_path_only_fd(fd)? {
+        return Err(AxError::BadFileDescriptor);
+    }
+    Ok(())
 }
 
 fn namespace_allows_set(loc: &Location, name: &str) -> AxResult<()> {
@@ -276,6 +283,7 @@ fn xattr_set_by_fd(
     size: usize,
     flags: u32,
 ) -> AxResult<isize> {
+    check_fd_xattr_access(fd)?;
     validate_xattr_flags(flags)?;
     let name = read_xattr_name(name)?;
     let value = read_xattr_value(value, size)?;
@@ -310,6 +318,7 @@ fn xattr_get_by_path(
 }
 
 fn xattr_get_by_fd(fd: i32, name: *const c_char, value: *mut u8, size: usize) -> AxResult<isize> {
+    check_fd_xattr_access(fd)?;
     let name = read_xattr_name(name)?;
     let value_bytes = match resolve_xattr_fd(fd)? {
         ResolveAtResult::File(loc) => get_location_xattr(&loc, &name)?,
@@ -330,6 +339,7 @@ fn xattr_list_by_path(
 }
 
 fn xattr_list_by_fd(fd: i32, list: *mut c_char, size: usize) -> AxResult<isize> {
+    check_fd_xattr_access(fd)?;
     let names = match resolve_xattr_fd(fd)? {
         ResolveAtResult::File(loc) => list_location_xattrs(&loc),
         ResolveAtResult::Other(_) => Vec::new(),
@@ -349,6 +359,7 @@ fn xattr_remove_by_path(
 }
 
 fn xattr_remove_by_fd(fd: i32, name: *const c_char) -> AxResult<isize> {
+    check_fd_xattr_access(fd)?;
     let name = read_xattr_name(name)?;
     match resolve_xattr_fd(fd)? {
         ResolveAtResult::File(loc) => {

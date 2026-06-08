@@ -21,11 +21,13 @@ use linux_raw_sys::general::{
 };
 use starry_signal::{SignalInfo, Signo};
 
-use super::{FileHandle, FileLike, Kstat, get_file_like, get_typed_file};
+use super::{FileHandle, FileLike, Kstat, get_file_description, get_file_like, get_typed_file};
 use crate::{
     file::{IoDst, IoSrc, memfd},
     task::{AsThread, send_signal_to_process},
 };
+
+const O_PATH_STATUS_FLAG: u32 = linux_raw_sys::general::O_PATH;
 
 fn fsize_limit() -> Option<u64> {
     let limit = current().as_thread().proc_data.rlim.read()[RLIMIT_FSIZE].current;
@@ -148,6 +150,18 @@ pub fn resolve_at(dirfd: c_int, path: Option<&str>, flags: u32) -> AxResult<Reso
             .map(ResolveAtResult::File)
         }),
     }
+}
+
+pub fn is_path_only_fd(fd: c_int) -> AxResult<bool> {
+    if get_file_description(fd)?.status_flags() & O_PATH_STATUS_FLAG != 0 {
+        return Ok(true);
+    }
+
+    if let Ok(file) = get_typed_file::<File>(fd) {
+        return Ok(file.inner().flags().contains(axfs::FileFlags::PATH));
+    }
+
+    Ok(false)
 }
 
 pub fn metadata_to_kstat(metadata: &Metadata) -> Kstat {
