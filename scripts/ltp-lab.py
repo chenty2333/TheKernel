@@ -344,6 +344,22 @@ def parse_test_list(path: Path) -> list[dict[str, Any]]:
     return items
 
 
+def inventory_repo_path(inv: dict[str, Any], value: str | None, default: Path) -> Path:
+    if not value:
+        return default
+    path = Path(value).expanduser()
+    inv_root_text = inv.get("repo_root")
+    if path.is_absolute() and inv_root_text:
+        inv_root = Path(inv_root_text).expanduser()
+        try:
+            rel = path.relative_to(inv_root)
+        except ValueError:
+            pass
+        else:
+            return REPO_ROOT / rel
+    return path
+
+
 def parse_runtest_dir(path: Path) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     if not path.is_dir():
@@ -596,12 +612,16 @@ def generate_list(args: argparse.Namespace) -> Path:
     arches = canonical_arches(args.arch)
     libcs = canonical_libcs(args.libc)
     mode = args.mode
-    current_markers = {item["marker"] for item in inv["current"]["items"]}
+    current_list_path = inventory_repo_path(inv, inv.get("current_list"), DEFAULT_TEST_LIST)
+    current_items = parse_test_list(current_list_path)
+    if not current_items:
+        current_items = inv["current"]["items"]
+    current_markers = {item["marker"] for item in current_items}
     available = selected_available_names(inv, arches, libcs)
     lines: list[str]
 
     if mode == "current":
-        lines = [item["line"].strip() for item in inv["current"]["items"]]
+        lines = [item["line"].strip() for item in current_items]
     elif mode == "cases":
         raw_cases = split_csv(args.case)
         if not raw_cases:
