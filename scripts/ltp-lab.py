@@ -1201,6 +1201,42 @@ def aggregate_split_combo_results(run_path: Path, tasks: list[ReplayTask]) -> No
             (arch_dir / "exit_code.txt").write_text(f"{aggregate_exit}\n", encoding="utf-8")
 
 
+def refresh_split_combo_aggregate(run_path: Path, manifest: dict[str, Any]) -> None:
+    parallel = manifest.get("parallel") if isinstance(manifest.get("parallel"), dict) else {}
+    if not parallel.get("split_combos"):
+        return
+    task_defs = manifest.get("tasks") if isinstance(manifest.get("tasks"), dict) else {}
+    if not isinstance(task_defs, dict) or not task_defs:
+        return
+
+    for arch in ARCHES:
+        cases: list[dict[str, Any]] = []
+        exit_codes: list[int] = []
+        for task_id, task_def in sorted(task_defs.items()):
+            if not isinstance(task_def, dict):
+                continue
+            task_arch = str(task_def.get("arch") or "")
+            if task_arch not in ARCHES:
+                task_arch, _ = task_arch_libcs_from_id(str(task_id))
+            if task_arch != arch:
+                continue
+            task_dir = run_path / str(task_def.get("task_dir") or f"tasks/{task_id}")
+            cases.extend(read_cases_jsonl(task_dir / "cases.jsonl"))
+            code = read_exit_code(task_dir / "exit_code.txt")
+            if code is not None:
+                exit_codes.append(code)
+        if not cases and not exit_codes:
+            continue
+        arch_dir = run_path / arch
+        arch_dir.mkdir(exist_ok=True)
+        if cases:
+            write_cases_jsonl(arch_dir / "cases.jsonl", cases)
+            write_json(arch_dir / "summary.json", summary_from_cases(cases, arch=arch))
+        if exit_codes:
+            aggregate_exit = next((code for code in exit_codes if code != 0), 0)
+            (arch_dir / "exit_code.txt").write_text(f"{aggregate_exit}\n", encoding="utf-8")
+
+
 def run_tasks(tasks: list[ReplayTask], jobs: int, fail_fast: bool) -> list[ReplayResult]:
     cancel_event = threading.Event()
     results: list[ReplayResult] = []
@@ -1367,6 +1403,9 @@ def classify_case(case: dict[str, Any]) -> str:
     summary = case.get("summary", {})
     failed = results.get("TFAIL", 0) + results.get("TBROK", 0) + int(summary.get("failed", 0)) + int(summary.get("broken", 0))
     passed = results.get("TPASS", 0) + int(summary.get("passed", 0))
+    skipped = results.get("TCONF", 0) + int(summary.get("skipped", 0))
+    if failed == 0 and passed == 0 and skipped > 0:
+        return "silent-pass"
     if ret == 0 and failed == 0:
         return "pass" if passed > 0 or not results else "silent-pass"
     if ret is None:
@@ -1525,6 +1564,7 @@ def summarize_run(run_path: Path) -> dict[str, Any]:
             manifest = read_json(manifest_path)
         except json.JSONDecodeError:
             manifest = {}
+    refresh_split_combo_aggregate(run_path, manifest)
 
     arch_summaries: dict[str, Any] = {}
     exit_codes: dict[str, int] = {}
