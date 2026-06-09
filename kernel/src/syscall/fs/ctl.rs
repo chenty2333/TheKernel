@@ -29,9 +29,10 @@ use starry_vm::{VmPtr, vm_write_slice};
 
 use crate::{
     file::{
-        Directory, FileLike, get_file_like, has_tmpfile_state, is_path_only_fd,
+        Directory, FileLike, get_file_like, has_tmpfile_state,
         inode_flags::{self, TimeUpdate},
         inotify::location_for_fd,
+        is_path_only_fd,
         permission::{
             check_create_permissions, check_parent_search_permissions, check_remove_permissions,
             check_rename_permissions, check_search_permissions, check_writable_mount,
@@ -49,6 +50,7 @@ const PATH_MAX: usize = 4096;
 const SUPPORTED_FCHMODAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
 const SUPPORTED_FCHOWNAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
 const SUPPORTED_UNLINKAT_FLAGS: u32 = AT_REMOVEDIR;
+const GETDENTS64_MAX_BUFFER: usize = 16 * 1024;
 
 pub(super) fn validate_pathname(path: &Path) -> AxResult {
     if path.as_str().len() >= PATH_MAX
@@ -440,6 +442,7 @@ struct DirBuffer {
 
 impl DirBuffer {
     fn new(len: usize) -> Self {
+        let len = len.min(GETDENTS64_MAX_BUFFER);
         Self {
             buf: vec![0; len],
             offset: 0,
@@ -514,7 +517,7 @@ pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
         })?;
     }
 
-    vm_write_slice(buf, &buffer.buf)?;
+    vm_write_slice(buf, &buffer.buf[..buffer.offset])?;
 
     Ok(buffer.offset as _)
 }
@@ -1003,15 +1006,7 @@ pub fn sys_utimensat(
         return Ok(0);
     }
 
-    update_times(
-        dirfd,
-        path,
-        atime,
-        mtime,
-        atime_intent,
-        mtime_intent,
-        flags,
-    )?;
+    update_times(dirfd, path, atime, mtime, atime_intent, mtime_intent, flags)?;
     Ok(0)
 }
 
