@@ -760,9 +760,7 @@ pub fn sys_readlinkat(
         return Err(AxError::InvalidInput);
     }
     if path.is_empty() {
-        let loc = resolve_at(dirfd, Some(path.as_str()), AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW)?
-            .into_file()
-            .ok_or(AxError::BadFileDescriptor)?;
+        let loc = location_for_fd(dirfd).ok_or(AxError::BadFileDescriptor)?;
         return write_readlink_result(&loc, buf, size);
     }
     validate_pathname(Path::new(&path))?;
