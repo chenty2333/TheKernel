@@ -39,6 +39,7 @@ use crate::{
         resolve_at, with_fs, with_path_fs,
     },
     mm::vm_load_string,
+    mounts,
     task::AsThread,
     time::{TimeValueLike, wall_time},
 };
@@ -505,6 +506,12 @@ pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
 
     if has_remaining && buffer.offset == 0 {
         return Err(AxError::InvalidInput);
+    }
+    if buffer.offset > 0 && mounts::should_update_atime(dir.inner()) {
+        dir.inner().update_metadata(MetadataUpdate {
+            atime: Some(wall_time()),
+            ..Default::default()
+        })?;
     }
 
     vm_write_slice(buf, &buffer.buf)?;

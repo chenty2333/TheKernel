@@ -276,6 +276,11 @@ pub(crate) fn check_execute_permissions(
     gid: u32,
     supplementary_groups: &[u32],
 ) -> AxResult {
+    let path = loc.absolute_path().map_err(|_| AxError::InvalidInput)?;
+    if crate::mounts::is_noexec(path.as_ref()) {
+        return Err(AxError::PermissionDenied);
+    }
+
     if uid != 0 {
         check_parent_search_permissions(loc, uid, gid, supplementary_groups)?;
     }

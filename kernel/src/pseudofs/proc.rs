@@ -62,8 +62,11 @@ fn render_mounts() -> String {
     for record in mounts::snapshot() {
         let _ = writeln!(
             out,
-            "{} {} {} rw,relatime 0 0",
-            record.source, record.target, record.fs_type
+            "{} {} {} {} 0 0",
+            record.source,
+            record.target,
+            record.fs_type,
+            mounts::mount_options(record.flags)
         );
     }
     out

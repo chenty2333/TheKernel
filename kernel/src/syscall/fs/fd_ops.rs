@@ -164,6 +164,17 @@ fn enforce_special_open_rules(loc: &Location, flags: c_int, uid: u32) -> AxResul
     if flags & O_NOFOLLOW != 0 && flags & O_PATH == 0 && metadata.node_type == NodeType::Symlink {
         return Err(AxError::from(LinuxError::ELOOP));
     }
+    if flags & O_PATH == 0
+        && matches!(
+            metadata.node_type,
+            NodeType::CharacterDevice | NodeType::BlockDevice
+        )
+    {
+        let path = loc.absolute_path().map_err(|_| AxError::InvalidInput)?;
+        if crate::mounts::is_nodev(path.as_ref()) {
+            return Err(AxError::PermissionDenied);
+        }
+    }
     if flags & O_TRUNC != 0 {
         memfd::check_resize(loc, 0)?;
     }

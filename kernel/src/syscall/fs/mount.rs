@@ -292,7 +292,7 @@ pub fn sys_mount(
         if !target.is_root_of_mount() && !target.is_root() {
             return Err(AxError::InvalidInput);
         }
-        mounts::record(source, target_path, fs_type, flags as u32);
+        mounts::remount(source, target_path, fs_type, flags as u32);
         return Ok(0);
     }
 

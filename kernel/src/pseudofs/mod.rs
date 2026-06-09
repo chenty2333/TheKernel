@@ -9,7 +9,7 @@ mod proc;
 mod sys;
 pub(crate) mod tmp;
 
-use alloc::sync::Arc;
+use alloc::{string::ToString, sync::Arc};
 
 use axerrno::LinuxResult;
 use axfs::{FS_CONTEXT, FsContext};
@@ -17,6 +17,7 @@ use axfs_ng_vfs::{DirNodeOps, FileNodeOps, Filesystem, NodePermission, WeakDirEn
 pub use tmp::MemoryFs;
 
 pub use self::{device::*, dir::*, file::*, fs::*};
+use crate::mounts;
 
 /// A callback that builds a `Arc<dyn DirNodeOps>` for a given
 /// `WeakDirEntry`.
@@ -51,6 +52,10 @@ fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> LinuxResult<()>
         fs.create_dir(path, DIR_PERMISSION)?;
     }
     fs.resolve(path)?.mount(&mount_fs)?;
+    if path != "/proc" {
+        let fs_type = mount_fs.name().to_string();
+        mounts::record(fs_type.clone(), path.to_string(), fs_type, 0);
+    }
     info!("Mounted {} at {}", mount_fs.name(), path);
     Ok(())
 }

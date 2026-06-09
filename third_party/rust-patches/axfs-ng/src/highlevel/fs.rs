@@ -22,6 +22,7 @@ pub const SYMLINKS_MAX: usize = 40;
 /// Global root filesystem context, initialized once during [`init_filesystems`](crate::init_filesystems).
 pub static ROOT_FS_CONTEXT: Once<FsContext> = Once::new();
 static SYMLINK_FOLLOW_POLICY: Once<fn(&Location) -> bool> = Once::new();
+static ATIME_UPDATE_POLICY: Once<fn(&Location) -> bool> = Once::new();
 
 scope_local::scope_local! {
     /// Task-local filesystem context, defaulting to a clone of [`ROOT_FS_CONTEXT`].
@@ -56,6 +57,10 @@ pub struct FsContext {
 impl FsContext {
     fn may_follow_symlink(loc: &Location) -> bool {
         SYMLINK_FOLLOW_POLICY.get().is_none_or(|policy| policy(loc))
+    }
+
+    pub(crate) fn should_update_atime(loc: &Location) -> bool {
+        ATIME_UPDATE_POLICY.get().is_none_or(|policy| policy(loc))
     }
 
     /// Returns whether an absolute path resolves to this context's root entry.
@@ -357,6 +362,11 @@ impl FsContext {
 /// symlink. Returning `false` turns that lookup into `ELOOP`.
 pub fn set_symlink_follow_policy(policy: fn(&Location) -> bool) {
     SYMLINK_FOLLOW_POLICY.call_once(|| policy);
+}
+
+/// Installs an optional access-time update policy used by high-level file I/O.
+pub fn set_atime_update_policy(policy: fn(&Location) -> bool) {
+    ATIME_UPDATE_POLICY.call_once(|| policy);
 }
 
 /// Iterator returned by [`FsContext::read_dir`].

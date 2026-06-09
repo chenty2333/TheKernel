@@ -1140,9 +1140,13 @@ impl File {
 
     /// Reads a number of bytes starting from a given offset.
     pub fn read_at(&self, dst: impl Write + IoBufMut, offset: u64) -> VfsResult<usize> {
+        let requested = dst.remaining_mut();
         let read = self.access(FileFlags::READ)?.read_at(dst, offset)?;
         #[cfg(feature = "times")]
-        if read > 0 && !self.flags.contains(FileFlags::NOATIME) {
+        if requested > 0
+            && !self.flags.contains(FileFlags::NOATIME)
+            && FsContext::should_update_atime(self.location())
+        {
             self.record_time_flags(1);
             self.flush_times();
         }
@@ -1154,7 +1158,7 @@ impl File {
         let written = self.access(FileFlags::WRITE)?.write_at(src, offset)?;
         #[cfg(feature = "times")]
         if written > 0 {
-            self.record_time_flags(3);
+            self.record_time_flags(2);
             self.flush_times();
         }
         Ok(written)
@@ -1190,7 +1194,7 @@ impl File {
                     .inspect(|(written, _)| {
                         #[cfg(feature = "times")]
                         if *written > 0 {
-                            self.record_time_flags(3);
+                            self.record_time_flags(2);
                             self.flush_times();
                         }
                     })
