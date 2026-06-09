@@ -18,6 +18,7 @@ use axsync::Mutex;
 use spin::Once;
 
 use alloc::{format, string::String, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 mod fs;
 
@@ -27,11 +28,25 @@ pub use highlevel::*;
 struct RegisteredBlockDevice {
     name: String,
     device: Option<AxBlockDevice>,
+    info: BlockDeviceInfo,
+    read_only: AtomicBool,
 }
 
 pub enum OpenBlockDeviceError {
     NotFound,
     Busy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockDeviceInfo {
+    pub num_blocks: u64,
+    pub block_size: usize,
+}
+
+impl BlockDeviceInfo {
+    pub fn byte_len(self) -> u64 {
+        self.num_blocks.saturating_mul(self.block_size as u64)
+    }
 }
 
 static EXTRA_BLOCK_DEVICES: Once<Mutex<Vec<RegisteredBlockDevice>>> = Once::new();
@@ -52,6 +67,37 @@ pub fn block_device_names() -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+pub fn block_device_info(name: &str) -> Option<BlockDeviceInfo> {
+    let devices = EXTRA_BLOCK_DEVICES.get()?;
+    devices
+        .lock()
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.info)
+}
+
+pub fn block_device_is_read_only(name: &str) -> Option<bool> {
+    let devices = EXTRA_BLOCK_DEVICES.get()?;
+    devices
+        .lock()
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.read_only.load(Ordering::Relaxed))
+}
+
+pub fn set_block_device_read_only(name: &str, read_only: bool) -> Result<(), OpenBlockDeviceError> {
+    let devices = EXTRA_BLOCK_DEVICES
+        .get()
+        .ok_or(OpenBlockDeviceError::NotFound)?;
+    let devices = devices.lock();
+    let entry = devices
+        .iter()
+        .find(|entry| entry.name == name)
+        .ok_or(OpenBlockDeviceError::NotFound)?;
+    entry.read_only.store(read_only, Ordering::Relaxed);
+    Ok(())
 }
 
 pub fn open_block_device(name: &str) -> Result<AxBlockDevice, OpenBlockDeviceError> {
@@ -116,6 +162,11 @@ pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
         );
         extras.push(RegisteredBlockDevice {
             name: extra_device_name(index),
+            info: BlockDeviceInfo {
+                num_blocks: dev.num_blocks(),
+                block_size: dev.block_size(),
+            },
+            read_only: AtomicBool::new(false),
             device: Some(dev),
         });
         index += 1;

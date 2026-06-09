@@ -50,6 +50,11 @@ pub trait DeviceOps: Send + Sync {
         DeviceMmap::None
     }
 
+    /// Returns the byte length of the device, if it has a finite size.
+    fn len(&self) -> VfsResult<u64> {
+        Ok(0)
+    }
+
     /// Returns the flags for the device node.
     fn flags(&self) -> NodeFlags {
         NodeFlags::empty()
@@ -110,7 +115,7 @@ impl NodeOps for Device {
     }
 
     fn len(&self) -> VfsResult<u64> {
-        Ok(0)
+        self.ops.len()
     }
 
     fn flags(&self) -> NodeFlags {

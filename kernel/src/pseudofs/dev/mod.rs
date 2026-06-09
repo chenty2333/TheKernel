@@ -11,17 +11,23 @@ mod memtrack;
 mod rtc;
 pub mod tty;
 
-use alloc::{format, sync::Arc};
-use core::any::Any;
+use alloc::{format, string::String, sync::Arc};
+use core::{
+    any::Any,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use axerrno::AxError;
+use axfs::BlockDeviceInfo;
 use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodeType, VfsResult};
 use axsync::Mutex;
 #[cfg(feature = "dev-log")]
 pub use log::bind_dev_log;
-use linux_raw_sys::ioctl::RNDGETENTCNT;
+use linux_raw_sys::ioctl::{
+    BLKGETSIZE, BLKGETSIZE64, BLKRAGET, BLKRASET, BLKROGET, BLKROSET, BLKSSZGET, RNDGETENTCNT,
+};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
-use starry_vm::VmMutPtr;
+use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::pseudofs::{Device, DeviceMmap, DeviceOps, DirMaker, DirMapping, SimpleDir, SimpleFs};
 
@@ -139,19 +145,81 @@ impl DeviceOps for Full {
     }
 }
 
-struct BlockDevice;
+struct BlockDevice {
+    name: String,
+    info: BlockDeviceInfo,
+    ra: AtomicU32,
+}
+
+impl BlockDevice {
+    fn new(name: String, info: BlockDeviceInfo) -> Self {
+        Self {
+            name,
+            info,
+            ra: AtomicU32::new(512),
+        }
+    }
+
+    fn read_only(&self) -> bool {
+        axfs::block_device_is_read_only(&self.name).unwrap_or(false)
+    }
+}
 
 impl DeviceOps for BlockDevice {
-    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        if buf.is_empty() || offset >= self.info.byte_len() {
+            return Ok(0);
+        }
         Err(AxError::InvalidInput)
     }
 
     fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        if self.read_only() {
+            return Err(AxError::ReadOnlyFilesystem);
+        }
         Err(AxError::InvalidInput)
+    }
+
+    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+        match cmd {
+            BLKGETSIZE => {
+                let sectors = self.info.byte_len() / 512;
+                (arg as *mut u32).vm_write(sectors as u32)?;
+            }
+            BLKGETSIZE64 => {
+                (arg as *mut u64).vm_write(self.info.byte_len())?;
+            }
+            BLKSSZGET => {
+                (arg as *mut u32).vm_write(self.info.block_size as u32)?;
+            }
+            BLKROGET => {
+                (arg as *mut u32).vm_write(self.read_only() as u32)?;
+            }
+            BLKROSET => {
+                let ro = (arg as *const u32).vm_read()?;
+                if ro != 0 && ro != 1 {
+                    return Err(AxError::InvalidInput);
+                }
+                axfs::set_block_device_read_only(&self.name, ro != 0)
+                    .map_err(|_| AxError::NoSuchDevice)?;
+            }
+            BLKRAGET => {
+                (arg as *mut usize).vm_write(self.ra.load(Ordering::Relaxed) as usize)?;
+            }
+            BLKRASET => {
+                self.ra.store(arg as u32, Ordering::Relaxed);
+            }
+            _ => return Err(AxError::NotATty),
+        }
+        Ok(0)
     }
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn len(&self) -> VfsResult<u64> {
+        Ok(self.info.byte_len())
     }
 
     fn flags(&self) -> NodeFlags {
@@ -327,13 +395,16 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     }
 
     for (index, name) in axfs::block_device_names().into_iter().enumerate() {
+        let Some(info) = axfs::block_device_info(&name) else {
+            continue;
+        };
         root.add(
-            name,
+            name.clone(),
             Device::new(
                 fs.clone(),
                 NodeType::BlockDevice,
                 DeviceId::new(8, 16 + index as u32),
-                Arc::new(BlockDevice),
+                Arc::new(BlockDevice::new(name, info)),
             ),
         );
     }

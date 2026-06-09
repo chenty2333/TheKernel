@@ -9,7 +9,8 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axfs::{
-    FS_CONTEXT, OpenBlockDeviceError, block_device_names, new_block_filesystem, open_block_device,
+    FS_CONTEXT, OpenBlockDeviceError, block_device_is_read_only, block_device_names,
+    new_block_filesystem, open_block_device,
 };
 use axfs_ng_vfs::{Filesystem, path::Path};
 use axpoll::{IoEvents, Pollable};
@@ -34,6 +35,7 @@ const BASIC_COMPAT_VFAT_SOURCE: &str = "/dev/vda2";
 const BASIC_COMPAT_MOUNT_TARGET: &str = "./mnt";
 const BASIC_COMPAT_MUSL_MOUNT_TARGET: &str = "/musl/basic/mnt";
 const BASIC_COMPAT_GLIBC_MOUNT_TARGET: &str = "/glibc/basic/mnt";
+const MS_RDONLY: u32 = 0x1;
 const MS_REMOUNT: u32 = 0x20;
 const MOVE_MOUNT_F_EMPTY_PATH: u32 = 0x00000004;
 const MOVE_MOUNT__MASK: u32 = 0x00000077;
@@ -307,6 +309,9 @@ pub fn sys_mount(
     } else if let Some(dev_name) = source.strip_prefix("/dev/") {
         let device_names = block_device_names();
         debug!("sys_mount: available extra block devices = {device_names:?}");
+        if block_device_is_read_only(dev_name).unwrap_or(false) && flags as u32 & MS_RDONLY == 0 {
+            return Err(AxError::PermissionDenied);
+        }
         match open_block_device(dev_name) {
             Ok(dev) => {
                 debug!("sys_mount: opening block device {dev_name}");
