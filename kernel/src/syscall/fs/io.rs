@@ -14,9 +14,10 @@ use crate::{
         Directory, File, FileHandle, FileLike, FileLikeKind, Pipe, Socket, allowed_write_len,
         check_resize_limit, get_file_like, get_typed_file,
         inotify::{notify_read, notify_write},
-        executable, inode_flags, lease, memfd,
+        executable, flock, inode_flags, lease, memfd,
         permission::check_open_permissions,
     },
+    mounts,
     mm::{IoVec, IoVectorBuf, UserConstPtr, VmBytes, VmBytesMut},
     pseudofs::tmp,
     task::AsThread,
@@ -219,6 +220,38 @@ fn regular_copy_file(fd: c_int, write: bool) -> AxResult<FileHandle<File>> {
 fn current_file_offset(file: &axfs::File) -> AxResult<u64> {
     let mut file = file;
     file.seek(SeekFrom::Current(0))
+}
+
+fn has_mandatory_lock_mode(loc: &axfs_ng_vfs::Location) -> AxResult<bool> {
+    let metadata = loc.metadata()?;
+    let mode = metadata.mode.bits();
+    Ok(metadata.node_type == axfs_ng_vfs::NodeType::RegularFile
+        && mode & 0o2000 != 0
+        && mode & 0o010 == 0)
+}
+
+fn check_mandatory_truncate_lock(
+    loc: &axfs_ng_vfs::Location,
+    new_len: u64,
+    owner: flock::RecordLockOwner,
+) -> AxResult<()> {
+    let Ok(path) = loc.absolute_path() else {
+        return Ok(());
+    };
+    if !mounts::has_mandatory_locking(path.as_ref()) || !has_mandatory_lock_mode(loc)? {
+        return Ok(());
+    }
+
+    let size = loc.len()?;
+    if new_len >= size {
+        return Ok(());
+    }
+    let metadata = loc.metadata()?;
+    let id = (metadata.device, metadata.inode);
+    if flock::mandatory_write_lock_conflicts(id, owner, new_len, size - new_len) {
+        return Err(AxError::WouldBlock);
+    }
+    Ok(())
 }
 
 fn checked_user_file_offset(ptr: *mut u64) -> AxResult<u64> {
@@ -477,6 +510,11 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
     inode_flags::check_resize(&loc)?;
     lease::wait_for_truncate(&loc)?;
     memfd::check_resize(&loc, length as u64)?;
+    check_mandatory_truncate_lock(
+        &loc,
+        length as u64,
+        flock::RecordLockOwner::Posix(proc_data.proc.pid()),
+    )?;
     let file = OpenOptions::new()
         .write(true)
         .open(&FS_CONTEXT.lock(), path)?
@@ -511,6 +549,11 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     inode_flags::check_resize(f.inner().location())?;
     lease::wait_for_truncate(f.inner().location())?;
     memfd::check_resize(f.inner().location(), length as u64)?;
+    check_mandatory_truncate_lock(
+        f.inner().location(),
+        length as u64,
+        flock::RecordLockOwner::Posix(axtask::current().as_thread().proc_data.proc.pid()),
+    )?;
     backend.set_len(length as _)?;
     notify_write(fd);
     Ok(0)

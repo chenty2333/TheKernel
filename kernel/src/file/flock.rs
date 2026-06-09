@@ -366,6 +366,31 @@ pub fn get_record_lock(
     Ok(())
 }
 
+pub fn mandatory_write_lock_conflicts(
+    id: InodeId,
+    requester: RecordLockOwner,
+    start: u64,
+    len: u64,
+) -> bool {
+    let range = if len == 0 {
+        RecordRange {
+            start,
+            end: RECORD_EOF,
+        }
+    } else {
+        let Some(end) = start.checked_add(len) else {
+            return true;
+        };
+        RecordRange { start, end }
+    };
+    let req = RecordLockRequest {
+        ty: F_WRLCK as i16,
+        range,
+    };
+    let table = RECORD_LOCK_TABLE.lock();
+    !record_lock_conflict_owners(&table, id, requester, req).is_empty()
+}
+
 pub fn release_posix_owner(pid: Pid) {
     release_record_owner(RecordLockOwner::Posix(pid), None);
 }

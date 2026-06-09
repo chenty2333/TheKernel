@@ -14,6 +14,7 @@ pub struct MountRecord {
 static MOUNT_RECORDS: Mutex<Vec<MountRecord>> = Mutex::new(Vec::new());
 
 const MS_RDONLY: u32 = 0x1;
+const MS_MANDLOCK: u32 = 0x40;
 const MS_NOSYMFOLLOW: u32 = 0x100;
 const ST_NOSYMFOLLOW: u32 = 0x2000;
 
@@ -57,6 +58,10 @@ pub fn effective_flags(path: &str) -> u32 {
 
 pub fn is_readonly(path: &str) -> bool {
     effective_flags(path) & MS_RDONLY != 0
+}
+
+pub fn has_mandatory_locking(path: &str) -> bool {
+    effective_flags(path) & MS_MANDLOCK != 0
 }
 
 pub fn should_follow_symlink(loc: &Location) -> bool {

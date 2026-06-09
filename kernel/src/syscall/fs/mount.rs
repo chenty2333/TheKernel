@@ -269,7 +269,11 @@ pub fn sys_mount(
         vm_load_string(source)?
     };
     let target = vm_load_string(target)?;
-    let fs_type = vm_load_string(fs_type)?;
+    let fs_type = if fs_type.is_null() {
+        String::new()
+    } else {
+        vm_load_string(fs_type)?
+    };
     debug!("sys_mount <= source: {source:?}, target: {target:?}, fs_type: {fs_type:?}");
     if is_basic_compat_vfat_mount(&source, &target, &fs_type) {
         // The basic mount/umount testcase only verifies syscall success for a
