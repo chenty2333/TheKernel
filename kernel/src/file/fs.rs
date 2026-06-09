@@ -182,6 +182,7 @@ pub fn metadata_to_kstat(metadata: &Metadata) -> Kstat {
         attributes: 0,
         attributes_mask: 0,
         atime: metadata.atime,
+        btime: metadata.btime,
         mtime: metadata.mtime,
         ctime: metadata.ctime,
     }

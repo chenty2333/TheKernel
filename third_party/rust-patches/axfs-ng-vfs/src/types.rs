@@ -97,6 +97,8 @@ pub struct Metadata {
 
     /// Time of last access
     pub atime: Duration,
+    /// Time of creation
+    pub btime: Duration,
     /// Time of last modification
     pub mtime: Duration,
     /// Time of last status change

@@ -4,9 +4,12 @@ use core::{ffi::c_int, time::Duration};
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::DeviceId;
 use axio::prelude::*;
-use axpoll::{IoEvents, Pollable};
+use axpoll::Pollable;
 use downcast_rs::{DowncastSync, impl_downcast};
-use linux_raw_sys::general::{S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, stat, statx, statx_timestamp};
+use linux_raw_sys::general::{
+    S_IFBLK, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, STATX_BASIC_STATS, STATX_BTIME,
+    STATX_DIOALIGN, stat, statx, statx_timestamp,
+};
 
 use super::{FileHandle, add_file_like, get_typed_file};
 
@@ -25,6 +28,7 @@ pub struct Kstat {
     pub attributes: u64,
     pub attributes_mask: u64,
     pub atime: Duration,
+    pub btime: Duration,
     pub mtime: Duration,
     pub ctime: Duration,
 }
@@ -45,6 +49,7 @@ impl Default for Kstat {
             attributes: 0,
             attributes_mask: 0,
             atime: Duration::default(),
+            btime: Duration::default(),
             mtime: Duration::default(),
             ctime: Duration::default(),
         }
@@ -81,6 +86,7 @@ impl From<Kstat> for statx {
     fn from(value: Kstat) -> Self {
         // SAFETY: valid for statx
         let mut statx: statx = unsafe { core::mem::zeroed() };
+        statx.stx_mask = STATX_BASIC_STATS | STATX_BTIME;
         statx.stx_blksize = value.blksize as _;
         statx.stx_attributes = value.attributes;
         statx.stx_attributes_mask = value.attributes_mask;
@@ -102,11 +108,17 @@ impl From<Kstat> for statx {
             }
         }
         statx.stx_atime = time_to_statx(&value.atime);
+        statx.stx_btime = time_to_statx(&value.btime);
         statx.stx_ctime = time_to_statx(&value.ctime);
         statx.stx_mtime = time_to_statx(&value.mtime);
 
         statx.stx_dev_major = (value.dev >> 32) as _;
         statx.stx_dev_minor = value.dev as _;
+        if value.mode & S_IFMT == S_IFBLK {
+            statx.stx_mask |= STATX_DIOALIGN;
+            statx.stx_dio_mem_align = 1;
+            statx.stx_dio_offset_align = value.blksize.max(512);
+        }
 
         statx
     }

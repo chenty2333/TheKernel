@@ -7,6 +7,8 @@ use crate::pseudofs::{DirMapping, SimpleDir, SimpleFile, SimpleFs};
 
 const LOOP_MAJOR: u32 = 7;
 const VIRTIO_BLOCK_MAJOR: u32 = 8;
+const BLOCK_LOGICAL_BLOCK_SIZE: u32 = 512;
+const BLOCK_DMA_ALIGNMENT: u32 = 0;
 const FAKE_WRITE_SECTORS_PER_READ: u64 = 131_072;
 
 static FAKE_BLOCK_WRITE_SECTORS: AtomicU64 = AtomicU64::new(0);
@@ -102,7 +104,17 @@ fn block_device_dir(
     dev_id: DeviceId,
 ) -> crate::pseudofs::DirMaker {
     let mut dir = DirMapping::new();
+    let mut queue = DirMapping::new();
+    queue.add(
+        "logical_block_size",
+        SimpleFile::new_regular(fs.clone(), || Ok(format!("{BLOCK_LOGICAL_BLOCK_SIZE}\n"))),
+    );
+    queue.add(
+        "dma_alignment",
+        SimpleFile::new_regular(fs.clone(), || Ok(format!("{BLOCK_DMA_ALIGNMENT}\n"))),
+    );
     dir.add("stat", block_stat_file(fs.clone()));
+    dir.add("queue", SimpleDir::new_maker(fs.clone(), Arc::new(queue)));
     dir.add("uevent", uevent_file(fs.clone(), dev_name, dev_id));
     SimpleDir::new_maker(fs, Arc::new(dir))
 }

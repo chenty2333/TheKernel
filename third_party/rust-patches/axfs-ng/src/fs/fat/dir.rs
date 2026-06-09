@@ -79,6 +79,7 @@ impl NodeOps for FatDirNode {
             blocks: 1,
             rdev: DeviceId::default(),
             atime: Duration::default(),
+            btime: Duration::default(),
             mtime: Duration::default(),
             ctime: Duration::default(),
         })

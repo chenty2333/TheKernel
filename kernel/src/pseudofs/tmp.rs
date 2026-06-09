@@ -515,6 +515,7 @@ impl Inode {
             blocks: 0,
             rdev: DeviceId::default(),
             atime: now,
+            btime: now,
             mtime: now,
             ctime: now,
         };

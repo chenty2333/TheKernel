@@ -67,6 +67,7 @@ pub fn file_metadata(fs: &FatFilesystemInner, file: &ff::File, node_type: NodeTy
             file.accessed(),
             fatfs::Time::new(0, 0, 0, 0),
         )),
+        btime: dos_to_unix(file.created()),
         mtime: dos_to_unix(file.modified()),
         ctime: dos_to_unix(file.created()),
     }

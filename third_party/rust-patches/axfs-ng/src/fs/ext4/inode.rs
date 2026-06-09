@@ -84,6 +84,7 @@ impl NodeOps for Inode {
             blocks: attr.blocks,
             rdev: DeviceId(attr.rdev),
             atime: attr.atime,
+            btime: attr.btime,
             mtime: attr.mtime,
             ctime: attr.ctime,
         })
@@ -248,6 +249,7 @@ impl DirNodeOps for Inode {
         let now = wall_time();
         fs.with_inode_ref(ino, |inode| {
             inode.set_atime(&now);
+            inode.set_btime(&now);
             inode.set_mtime(&now);
             inode.update_ctime();
             Ok(())

@@ -532,6 +532,7 @@ mod tests {
                 blocks: 0,
                 rdev: Default::default(),
                 atime: Duration::ZERO,
+                btime: Duration::ZERO,
                 mtime: Duration::ZERO,
                 ctime: Duration::ZERO,
             })
