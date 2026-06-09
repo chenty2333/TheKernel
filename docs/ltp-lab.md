@@ -18,6 +18,7 @@ Repository-owned entrypoints:
 - `scripts/oscomp.sh lab ...`
 - `make lab-check`
 - `make lab-inventory`
+- `make lab-campaign`
 - `make lab-list`
 - `make lab-plan`
 - `make lab-clean`
@@ -29,7 +30,8 @@ Generated local state:
 - `.state/ltp-lab/lists/` stores generated `ltp_test.txt` variants
 - `.state/ltp-lab/plans/` stores focused evaluator plans
 - `.state/ltp-lab/runs/<run-id>/` stores support images, replay logs, parsed cases, and summaries
-- `.state/ltp-lab/refs/` is available for optional shallow reference checkouts
+- `.state/ltp-lab/campaigns/<name>/` stores fixed candidate batches, semantic prompts, implementation ledgers, analysis, taxonomy, and promotion outputs
+- `.state/ltp-lab/refs/` is available for optional reference source trees
 
 All of `.state` is ignored by git. Recreate it on a new machine with the commands
 below.
@@ -52,7 +54,7 @@ The host may not have both QEMU binaries. The normal development path is to run
 the same commands inside `make dev-shell`, where the Docker image contract should
 provide the evaluator toolchain.
 
-Optional shallow references:
+Optional references:
 
 ```bash
 ./scripts/oscomp.sh lab bootstrap \
@@ -61,7 +63,9 @@ Optional shallow references:
   --fetch
 ```
 
-Use Linux as a behavior reference only. Do not copy code into this kernel.
+`--fetch` clones missing references shallowly. A no-history Linux source tree
+from a release tarball is also fine under `.state/ltp-lab/refs/linux`. Use Linux
+as a behavior reference only; do not copy code into this kernel.
 
 When running inside Docker and the official images are mounted at
 `/opt/oskernel/testsuites`, keep the testsuite source metadata inside the
@@ -108,15 +112,112 @@ The inventory records:
 - source `runtest` entries from `testsuits-for-oskernel`
 - current `ltp_test.txt` entries and whether they resolve on all four combos
 
-Print the current summary without rebuilding it:
+Print the cached summary without rebuilding it:
 
 ```bash
 ./scripts/oscomp.sh lab summary
 ```
 
-## Generate Lists
+If `ltp_test.txt`, official images, runtest metadata, or support-disk plumbing
+changed, run `make lab-inventory` before using the summary as current evidence.
 
-Generate a small unopened syscall batch:
+## Campaign Workflow
+
+Campaigns are the preferred workflow for real LTP expansion. They keep each
+large batch fixed, connect candidates to testcase sources and Linux reference
+paths, and leave a compact audit trail for later agents.
+
+Create a broad 100-150 case batch for a subsystem:
+
+```bash
+./scripts/oscomp.sh lab campaign create goal3-fs-vfs-0001 \
+  --mode unopened-runtest \
+  --runtest fs \
+  --runtest syscalls \
+  --limit 120 \
+  --goal 'FS/VFS/file-IO semantic expansion'
+```
+
+Use `--include` filters for narrower debug campaigns. Before treating a filtered
+campaign as a large batch, check the generated candidate count with
+`campaign status`; heavily filtered FS/VFS patterns may produce only a handful of
+currently unopened cases.
+
+The campaign directory contains:
+
+```text
+.state/ltp-lab/campaigns/<name>/
+  manifest.json
+  README.md
+  candidates.txt
+  cases.jsonl
+  semantics/
+    fs-open-permission.md
+    fs-link-rename-unlink.md
+    ...
+  implementation.md
+  taxonomy.md
+```
+
+Read `semantics/*.md` before editing kernel code. Each card lists selected cases,
+test source pointers, Linux reference paths, expected semantics, and local kernel
+paths to inspect. Use `implementation.md` to record the semantic behavior you
+implemented and the testcase/Linux cross-checks. Do not add or remove candidates
+inside a campaign after implementation starts; create another campaign for the
+next batch.
+
+Run the campaign through Docker after building current kernels:
+
+```bash
+make kernels
+make dev-shell DEV_CMD='./scripts/oscomp.sh lab campaign run goal3-fs-vfs-0001 --arch both --libc both --skip-kernel-build --case-timeout 90'
+```
+
+Analyze results and inspect promotion eligibility:
+
+```bash
+./scripts/oscomp.sh lab campaign analyze goal3-fs-vfs-0001
+./scripts/oscomp.sh lab campaign promote goal3-fs-vfs-0001 --dry-run --explain
+```
+
+`campaign analyze` writes:
+
+- `analysis.json`: per-case status matrix, semantic bucket, and promotion flag
+- `taxonomy.md`: grouped failure taxonomy
+- `promotable.txt`: candidate lines with all required pass evidence
+
+Apply promotions only after reviewing the generated list:
+
+```bash
+./scripts/oscomp.sh lab campaign promote goal3-fs-vfs-0001 \
+  --output .state/ltp-lab/campaigns/goal3-fs-vfs-0001/promoted-ltp_test.txt
+```
+
+If the list is correct, update root `ltp_test.txt` deliberately, usually with a
+small reviewed patch or `campaign promote --apply-root` when the generated diff
+has already been inspected.
+
+Finish a campaign after the batch is handled:
+
+```bash
+./scripts/oscomp.sh lab campaign finish goal3-fs-vfs-0001
+```
+
+Finish keeps compact evidence (`console.log`, `cases.jsonl`, `summary.json`,
+`combined-summary.json`, campaign metadata, semantic cards, taxonomy, and
+promotion outputs) while removing heavy per-run `support.img` and QEMU `work/`
+directories. Use `--no-clean` for forensic runs and `--dry-run` to preview.
+
+Use direct `lab generate`, `lab run`, `lab failures`, and `lab promote` for
+small debugging runs, missing-combo repair, or one-off evidence checks. Use
+campaigns for the main 50-150 case expansion path.
+
+## Direct List And Run Commands
+
+Use these lower-level commands for debugging, missing-combo repair, or one-off
+evidence checks. Main LTP expansion should use campaigns.
+
+Generate an unopened batch:
 
 ```bash
 ./scripts/oscomp.sh lab generate \
@@ -126,8 +227,7 @@ Generate a small unopened syscall batch:
   --name syscalls-0001
 ```
 
-Generate all currently unopened runtest entries available on all selected
-arch/libc combinations:
+Generate all unopened runtest entries available on the selected matrix:
 
 ```bash
 ./scripts/oscomp.sh lab generate --mode unopened-runtest --name unopened-all
@@ -147,9 +247,7 @@ Useful filters:
 Generated lists are written under `.state/ltp-lab/lists/` unless `--output` is
 provided.
 
-## Focused Plans
-
-Generate an LTP-only plan:
+Generate focused plans when needed:
 
 ```bash
 ./scripts/oscomp.sh lab plan --libc both --name ltp-both
@@ -162,13 +260,7 @@ Single-libc focused plans:
 ./scripts/oscomp.sh lab plan --libc musl --name ltp-musl
 ```
 
-The guest runner still owns the output protocol. Plans only choose which official
-groups run.
-
-## Run Experiments
-
-Prepare evaluator artifacts with the high-frequency path during normal
-iteration:
+Prepare evaluator artifacts during normal iteration:
 
 ```bash
 make kernels
@@ -177,28 +269,30 @@ make artifacts
 
 Use `make all` only when a clean evaluator build is needed. It preserves
 `.state/ltp-lab`, but it is slower than the high-frequency artifact targets.
-Use `make kernels` for kernel-only work and `make artifacts` when the support
-disk should also be refreshed.
 
-Run a generated list on RV only, reusing existing `kernel-rv`:
+Run a generated list, reusing existing kernels:
 
 ```bash
 make dev-shell DEV_CMD='./scripts/oscomp.sh lab run --name rv-syscalls-0001 --arch rv --libc both --test-list .state/ltp-lab/lists/syscalls-0001.txt --skip-kernel-build'
 ```
 
-Run a newly generated batch on both arches:
+`lab run` defaults to `--parallel arch --jobs auto`, so `--arch both` launches
+RV and LA concurrently. For a stronger machine, use `--split-combos --jobs auto`
+to split by `arch/libc`.
 
-```bash
-make dev-shell DEV_CMD='./scripts/oscomp.sh lab run --name matrix-syscalls-0001 --arch both --libc both --mode unopened-runtest --runtest syscalls --limit 50 --skip-kernel-build'
-```
+Useful execution controls:
 
-The run command:
+- `--parallel arch`: default; one task per selected arch.
+- `--split-combos` or `--parallel combo`: one task per selected `arch/libc`.
+- `--no-parallel`: serial replay for debugging.
+- `--jobs auto`: use the selected task count.
+- `--case-timeout SECS`: timeout one LTP case in the guest and continue.
+- `--task-timeout SECS`: timeout one QEMU replay task.
 
-1. writes `ltp_test.txt` and `plan.txt` into the run directory,
-2. builds a support image with those files,
-3. replays `rv` and/or `la` through `scripts/replay-oscomp-eval.sh`,
-4. stores console logs and QEMU workdirs,
-5. parses LTP case results into `cases.jsonl` and `summary.json`.
+The run command writes `ltp_test.txt`, `plan.txt`, support images, console logs,
+`cases.jsonl`, `summary.json`, and `combined-summary.json` under
+`.state/ltp-lab/runs/<run>/`. Split-combo runs also keep per-combo logs under
+`tasks/`, then aggregate evidence back to `rv/` and `la/` for promotion.
 
 If replay fails before LTP starts, the run still writes logs, exit codes, and
 summaries, but `lab run` exits nonzero. Treat `cases=0` with a nonzero
@@ -211,12 +305,11 @@ Budget knobs are injected into the guest support disk:
 --ltp-budget 0
 --glibc-budget 2400
 --musl-budget 3000
+--case-timeout 60
 --env KEY=VALUE
 ```
 
-## Parse And Summarize
-
-Parse an existing replay log:
+Parse, summarize, or inspect failures:
 
 ```bash
 ./scripts/oscomp.sh lab parse --arch rv --log .state/ltp-lab/runs/<run>/rv/console.log
@@ -228,14 +321,6 @@ Summarize a run:
 ./scripts/oscomp.sh lab summarize .state/ltp-lab/runs/<run>
 ```
 
-The combined summary records per-arch replay exit codes and failed arches.
-
-Group failed or incomplete cases:
-
-```bash
-./scripts/oscomp.sh lab failures .state/ltp-lab/runs/<run>
-```
-
 Case records include:
 
 - case marker
@@ -243,10 +328,9 @@ Case records include:
 - return code
 - TPASS/TFAIL/TBROK/TCONF/TWARN counts
 - summary counts
+- duration in seconds when the guest emitted timing evidence
 - timeout and panic flags
 - status: `pass`, `silent-pass`, `fail`, `nonzero`, `timeout`, `panic`, or `incomplete`
-
-## Promote Passing Cases
 
 Merge cases that passed the required combo set into a new list:
 
@@ -256,20 +340,53 @@ Merge cases that passed the required combo set into a new list:
   --output .state/ltp-lab/lists/promoted.txt
 ```
 
-By default promotion requires all four combinations:
+By default promotion requires real parser `pass` on all four combos. Override
+with `--require` for narrower experiments. `silent-pass` and TCONF-only cases
+are not promoted unless `--allow-silent-pass` is passed explicitly.
 
-- `rv/glibc`
-- `rv/musl`
-- `la/glibc`
-- `la/musl`
+Promotion can merge evidence from multiple run directories. Use `--dry-run` and
+`--explain` to see why a case is or is not promotable:
 
-Override with `--require rv/glibc --require la/glibc` for narrower experiments.
+```bash
+./scripts/oscomp.sh lab promote \
+  .state/ltp-lab/runs/run-a \
+  .state/ltp-lab/runs/run-b \
+  --dry-run \
+  --explain \
+  --output .state/ltp-lab/lists/promoted.txt
+```
 
-Promotion uses real parser `pass` status by default. It does not promote
-`silent-pass` or TCONF-only cases unless `--allow-silent-pass` is passed
-explicitly.
+Inspect a candidate list or generate rerun lists for missing/nonpassing combos:
+
+```bash
+./scripts/oscomp.sh lab matrix-status \
+  .state/ltp-lab/runs/run-a \
+  --test-list .state/ltp-lab/lists/candidates.txt
+
+./scripts/oscomp.sh lab missing-combos \
+  .state/ltp-lab/runs/run-a \
+  .state/ltp-lab/runs/run-b \
+  --test-list .state/ltp-lab/lists/candidates.txt \
+  --output .state/ltp-lab/lists/missing
+```
 
 Review promoted lists before replacing the repository root `ltp_test.txt`.
+
+## Reorder For Evaluator Budget
+
+Local parallelism speeds development, but the official evaluator still runs its
+fixed flow under a two-hour wall clock. Use timing evidence to produce a reviewed
+candidate order:
+
+```bash
+./scripts/oscomp.sh lab reorder \
+  --base ltp_test.txt \
+  --evidence .state/ltp-lab/runs/matrix-syscalls-0001 \
+  --output .state/ltp-lab/lists/reordered.txt
+```
+
+The command keeps stable fast passes earlier, pushes known timeout/panic cases
+later, and writes a new list instead of editing root `ltp_test.txt`.
 
 ## Cleanup
 
@@ -303,6 +420,12 @@ Useful cleanup modes:
 # Preview all generated run/list/plan removals.
 ./scripts/oscomp.sh lab clean --generated --dry-run
 
+# Preview campaign removals.
+./scripts/oscomp.sh lab clean --campaigns --dry-run
+
+# Preview finish analysis and heavy per-run artifact cleanup.
+./scripts/oscomp.sh lab campaign finish goal3-fs-vfs-0001 --dry-run
+
 # Remove failed or zero-case runs after an experiment pass.
 ./scripts/oscomp.sh lab clean --failed-runs --empty-runs
 
@@ -322,21 +445,7 @@ Useful cleanup modes:
 ./scripts/oscomp.sh lab clean --all --dry-run
 ```
 
-`make legacy-clean` removes old root-level `rv_.out`, `la_.out`, and `score.txt`
-files. It does not remove evaluator artifacts such as `kernel-rv`, `kernel-la`,
-`disk.img`, or `disk-la.img`.
-
-## Scoring Strategy
-
-Use this framework to grow LTP in controlled batches:
-
-1. choose a category, usually `syscalls`, `fs`, `ipc`, `mm`, `sched`, or `signal`,
-2. generate a small unopened batch,
-3. run RV and LA with glibc/musl,
-4. classify failures by kernel subsystem,
-5. fix real kernel behavior,
-6. promote stable passing cases.
-
-For non-LTP scores, keep the same evidence discipline: optimize kernel fast paths
-for the benchmark workloads, but preserve observable Linux ABI behavior so that
-new LTP cases do not regress.
+`./scripts/oscomp.sh lab clean --legacy-root` removes old root-level `rv_.out`,
+`la_.out`, and `score.txt` files without removing evaluator artifacts such as
+`kernel-rv`, `kernel-la`, `disk.img`, or `disk-la.img`. The Makefile
+`legacy-clean` target is broader and is part of evaluator artifact cleanup.

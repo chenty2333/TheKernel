@@ -72,6 +72,7 @@ help:
 		'Lab commands:' \
 		'  make lab-check' \
 		'  make lab-inventory' \
+		'  make lab-campaign LAB_ARGS="create goal3-fs-vfs-0001 --runtest fs --runtest syscalls --limit 120"' \
 		'  make lab-list LAB_ARGS="..."' \
 		'  make lab-run LAB_ARGS="..."' \
 		'  make lab-clean LAB_CLEAN_ARGS="..."'
@@ -174,6 +175,9 @@ lab-summary:
 lab-promote:
 	@./scripts/oscomp.sh lab promote $(LAB_ARGS)
 
+lab-campaign:
+	@./scripts/oscomp.sh lab campaign $(LAB_ARGS)
+
 lab-clean:
 	@./scripts/oscomp.sh lab clean --generated --legacy-root $(LAB_CLEAN_ARGS)
 
@@ -214,7 +218,7 @@ rv:
 la:
 	$(MAKE) ARCH=loongarch64 run
 
-.PHONY: help all artifacts kernels build run eval-rv eval-la replay-rv replay-la lab-check lab-inventory lab-plan lab-list lab-run lab-parse lab-summary lab-promote lab-clean dev-image dev-check dev-shell dev-shell-root debug disasm clean clean-eval legacy-clean prebuild-scrub check-eval-kernel-size kernel-rv kernel-la disk.img disk-la.img
+.PHONY: help all artifacts kernels build run eval-rv eval-la replay-rv replay-la lab-check lab-inventory lab-plan lab-list lab-run lab-parse lab-summary lab-promote lab-campaign lab-clean dev-image dev-check dev-shell dev-shell-root debug disasm clean clean-eval legacy-clean prebuild-scrub check-eval-kernel-size kernel-rv kernel-la disk.img disk-la.img
 check-eval-kernel-size:
 	@for kernel in $(ROOT_DIR)/kernel-rv $(ROOT_DIR)/kernel-la; do \
 		[ -f "$$kernel" ] || continue; \

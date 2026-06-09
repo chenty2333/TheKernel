@@ -61,7 +61,7 @@ Build command roles:
   keeps arch Cargo target caches but rebuilds the support disk.
 - `make kernels`: high-frequency build of both evaluator kernels only.
 - `make kernel-rv` / `make kernel-la`: high-frequency single-kernel artifacts.
-- `make disk.img`: support-disk refresh only.
+- `make disk.img`: support-disk refresh only; `disk-la.img` is copied from it.
 - `make clean-eval`: remove root evaluator artifacts and build/replay state while
   preserving `.state/ltp-lab`.
 - `make clean`: full local cleanup, including `.state`.
@@ -101,8 +101,8 @@ make dev-shell DEV_CMD="./scripts/oscomp.sh lab audit"
 - `scripts/verify-pre2025-layout.sh`: checks the official image layout.
 - `scripts/build-oscomp-support-disk.sh`: builds the support disk consumed by
   the guest runner.
-- `scripts/ltp-lab.py`: LTP inventory, focused list generation, focused replay,
-  parsing, promotion, cleanup, and audit tooling.
+- `scripts/ltp-lab.py`: LTP inventory, campaign creation, semantic batch
+  records, focused replay, parsing, promotion, cleanup, and audit tooling.
 - `scripts/support-tools/`: small helper binaries built into the support disk.
 - `scripts/support-overlay/`: runtime overlays and group overrides copied into
   the support disk.
@@ -117,6 +117,8 @@ make dev-shell DEV_CMD="./scripts/oscomp.sh lab audit"
 - `.state/ltp-lab/plans/`: generated focused evaluation plans.
 - `.state/ltp-lab/runs/`: per-run logs, parsed case records, summaries, support
   images, and QEMU workdirs.
+- `.state/ltp-lab/campaigns/`: per-batch candidate lists, semantic cards,
+  implementation ledgers, taxonomy, and promotion evidence.
 
 `.state/ltp-lab` is local and ignored by git. Recreate it with:
 
@@ -145,6 +147,13 @@ or another ignored path:
 
 - Linux source for behavior reference
 - `testsuits-for-oskernel` source for test source and runtest metadata
+
+## LTP Campaigns
+
+The main LTP expansion path is campaign-based. Campaign directories under
+`.state/ltp-lab/campaigns/` are local, ignored state for fixed candidate
+batches, semantic prompts, implementation notes, run analysis, taxonomy, and
+cleanup status. See `docs/ltp-lab.md` for commands.
 
 ## Current Documentation
 

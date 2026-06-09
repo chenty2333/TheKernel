@@ -935,7 +935,7 @@ pub enum FileBackend {
 }
 
 impl FileBackend {
-    const DIRECT_IO_CHUNK: usize = 64 * 1024;
+    const DIRECT_IO_CHUNK: usize = PAGE_SIZE;
 
     pub(crate) fn new_direct(location: Location) -> Self {
         Self::Direct(location)

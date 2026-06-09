@@ -106,7 +106,7 @@ Runs: `harvest-dio-0001`, `harvest-dio-0002`, `harvest-dio-0003`,
 
 After promotion and Docker inventory refresh at `2026-06-08T05:50:37`:
 
-- current `ltp_test.txt`: 1099 entries
+- post-harvest `ltp_test.txt`: 1099 entries
 - all 1099 entries resolve on rv/la x glibc/musl
 - remaining unopened available lines: 2724
 

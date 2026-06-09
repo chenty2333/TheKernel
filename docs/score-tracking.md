@@ -27,12 +27,13 @@ Summary:
 - RV parsed LTP cases: pass=960, fail=41, nonzero=13, timeout=1, panic=1
 - LA completed musl groups through `cyclictest-musl` and `basic-glibc`, then
   timed out in `iozone-glibc` stride-read before reaching LTP
-- Docker inventory resolved all 1089 current LTP entries on all four
+- Docker inventory resolved the 1089-entry pre-harvest LTP list on all four
   arch/libc combinations
 - unopened available runtest frontier: 2734 unique lines
 
-Use this replay as the current local baseline until a newer Docker replay or
-official submission replaces it.
+Use this replay as the pre-harvest local baseline until a newer Docker replay or
+official submission replaces it. Do not treat its LTP list count as current if
+`ltp_test.txt` has changed.
 
 ## Local LTP Harvest 2026-06-08
 
@@ -43,14 +44,20 @@ Summary:
 - promoted 10 official unopened DIO cases with all-four `pass` evidence
 - promoted cases: `dio16`, `dio17`, `dio18`, `dio19`, `dio20`, `dio21`,
   `dio26`, `dio27`, `dio28`, `dio29`
-- post-promotion `ltp_test.txt`: 1099 entries, all resolving on all four
+- 2026-06-08 post-promotion `ltp_test.txt`: 1099 entries, all resolving on all four
   arch/libc combinations
 - remaining unopened available runtest frontier: 2724 unique lines
 - attempted non-promoted taxonomy: command/toolchain failures, missing syscalls,
   eventfd panic, libc-sensitive permission behavior, and one DIO long-run case
 
-Use the harvest document for post-promotion LTP frontier planning; use the
+Use the harvest document for 2026-06-08 post-promotion frontier context; use the
 baseline document for the pre-harvest full replay blockers.
+
+Live repo note on 2026-06-10: `ltp_test.txt` contains 1122 non-comment entries
+with no duplicate lines or duplicate markers. The cached
+`.state/ltp-lab/inventory.json` still reports 1099 entries from
+`2026-06-08T05:50:37`, so refresh inventory before claiming all-four resolution
+or unopened frontier counts for the live list.
 
 ## Protected Groups
 
@@ -88,17 +95,19 @@ The largest known functionality gap is LTP:
 | --- | ---: | ---: | --- |
 | LTP | 2545-6091 per combo | 72000 per combo | expand real kernel compatibility; do not fake output |
 
-Current known payload layers:
+Known payload layers:
 
 - repository-open subset: `ltp_test.txt`
 - official packaged glibc binaries: 2840 per arch image
 - official packaged musl binaries: 2820 per arch image
-- Docker recomputed current list: 1089 entries, all resolving on all four
+- Docker recomputed pre-harvest list: 1089 entries, all resolving on all four
   combinations as of `docs/baseline-2026-06-08.md`
 - Docker recomputed unopened runtest frontier: 2734 unique available lines as
   of `docs/baseline-2026-06-08.md`
-- after `docs/ltp-harvest-2026-06-08.md`: current list is 1099 entries and the
+- after `docs/ltp-harvest-2026-06-08.md`: list was 1099 entries and the
   unopened frontier is 2724 unique available lines
+- live repo check on 2026-06-10: `ltp_test.txt` has 1122 entries, but all-four
+  resolution has not been refreshed in inventory
 
 Recompute these from official images and support-disk plumbing when the images,
 runner, or `ltp_test.txt` change.

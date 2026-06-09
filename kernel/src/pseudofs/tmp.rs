@@ -829,12 +829,13 @@ impl DirNodeOps for MemoryNode {
             .lock()
             .remove(src_name)
             .ok_or(VfsError::NotFound)?;
-        dst_node
+        let old_dst = dst_node
             .inode
             .as_dir()?
             .entries
             .lock()
             .insert(dst_name.into(), src_entry);
+        drop(old_dst);
         Ok(())
     }
 }

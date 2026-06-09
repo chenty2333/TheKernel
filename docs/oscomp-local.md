@@ -34,6 +34,10 @@ Run a command directly inside the dev container:
 make dev-shell DEV_CMD="./scripts/oscomp.sh lab audit"
 ```
 
+`make dev-shell-root` starts the privileged `builder` compose service for cases
+that need extra container capabilities. The entrypoint still runs commands as
+the local user id, not as a persistent root-owned workspace shell.
+
 ## Build Artifacts
 
 Evaluator-facing artifacts are:
@@ -41,6 +45,7 @@ Evaluator-facing artifacts are:
 - `kernel-rv`
 - `kernel-la`
 - `disk.img`
+- `disk-la.img`
 
 Main commands:
 
@@ -63,7 +68,8 @@ Command intent:
 - `make kernels`: high-frequency build of both evaluator kernels only.
 - `make kernel-rv` and `make kernel-la`: high-frequency single-kernel artifacts
   that preserve `.state/<arch>/target`.
-- `make disk.img`: support-disk refresh only.
+- `make disk.img`: support-disk refresh only; `make disk-la.img` copies it for
+  the LA artifact name.
 - `make clean-eval`: remove evaluator artifacts and build/replay state while
   keeping `.state/ltp-lab`.
 - `make clean`: full local cleanup, including `.state`.
@@ -84,7 +90,8 @@ state, and previous support-disk temp roots automatically without deleting lab
 evidence. Use it for submission parity and clean confirmation; use the
 high-frequency artifact commands for the inner edit/test loop.
 
-The lower-level `make -C make disk_img` target also overwrites an existing disk image instead of warning and keeping the stale one.
+The lower-level `make -C make disk_img` target also overwrites an existing disk
+image instead of warning and keeping the stale one.
 
 ## Local Replay
 
@@ -103,36 +110,16 @@ Main replay entrypoints:
 - `make replay-rv`
 - `make replay-la`
 
-[`scripts/oscomp.sh`](/home/dia/TheKernel/scripts/oscomp.sh) exposes the current fixed reference plan:
-
-- `/musl basic`
-- `/musl iozone`
-- `/musl busybox`
-- `/musl netperf`
-- `/musl lua`
-- `/musl libcbench`
-- `/musl libctest`
-- `/musl cyclictest`
-- `/glibc basic`
-- `/glibc iozone`
-- `/glibc busybox`
-- `/glibc netperf`
-- `/glibc lua`
-- `/glibc libcbench`
-- `/glibc cyclictest`
-- `/musl lmbench`
-- `/glibc lmbench`
-- `/musl iperf`
-- `/glibc iperf`
-- `/glibc ltp`
-- `/musl ltp`
-
-The built-in full plan runs iperf before LTP so that long LTP coverage cannot starve the network throughput groups. LTP groups have default case budgets of 2400 seconds for glibc and 3000 seconds for musl (`OSCOMP_LTP_GROUP_BUDGET_SECS`, or the libc-specific `OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS` / `OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS`), keeping the combined default LTP budget at the previous 5400-second ceiling while giving the later musl group more room; set the budget to `0` to disable that internal stop.
+[`scripts/oscomp.sh`](/home/dia/TheKernel/scripts/oscomp.sh) exposes the fixed
+reference plan with `./scripts/oscomp.sh list`. The built-in full plan runs
+iperf before LTP so long LTP coverage cannot starve network throughput groups.
+LTP groups default to bounded libc-specific budgets; set the budget to `0` to
+disable the internal stop.
 
 [`scripts/replay-oscomp-eval.sh`](/home/dia/TheKernel/scripts/replay-oscomp-eval.sh) replays the official pre-2025 flow with:
 
 - official rootfs image as the first block device
-- repository-built `disk.img` as the support disk
+- repository-built `disk.img` or `disk-la.img` as the support disk
 - contest QEMU shape for `rv` and `la`
 - whole-QEMU timeout protection
 - optional `--workdir` and `--keep-workdir`
@@ -159,24 +146,8 @@ Accepted suffixes:
 
 [`scripts/build-oscomp-support-disk.sh`](/home/dia/TheKernel/scripts/build-oscomp-support-disk.sh) builds the support disk used by replay and evaluator-facing flows.
 
-Current payload includes:
-
-- `/meta/ltp_test.txt`
-- optional `/meta/oscomp_plan.txt`
-- `/usr/lib/locale/C.UTF-8`
-- `rv` and `la` glibc `libgcc_s.so.1`
-- per-arch overlay tools under `/<arch>/overlay`
-
-Overlay tools currently include:
-
-- `ar`
-- `date`
-- `file`
-- `readelf`
-- `oscomp-default-signals`
-- a minimal `make`
-- `liboscomp-musl-compat.so`
-- `rv` also gets `liboscomp-mmsg-compat.so`
+Current payload includes `ltp_test.txt`, optional plan/env overrides, locale and
+libgcc support, and per-arch overlay tools/libraries under `/<arch>/overlay`.
 
 At boot, [`src/init.sh`](/home/dia/TheKernel/src/init.sh) mounts the support disk read-only, copies what it needs into the rootfs, then unmounts `/support` early.
 
@@ -184,6 +155,9 @@ At boot, [`src/init.sh`](/home/dia/TheKernel/src/init.sh) mounts the support dis
 
 The local framework supports focused replay instead of only full-matrix runs.
 Use [`docs/ltp-lab.md`](./ltp-lab.md) for the current LTP experiment workflow.
+For LTP expansion work, prefer `lab campaign ...` over ad hoc list/run commands:
+campaigns keep fixed 50-150 case batches, semantic prompts, run evidence,
+promotion outputs, and self-cleaning records under `.state/ltp-lab/campaigns`.
 
 Support-disk build options:
 
@@ -237,7 +211,7 @@ What this framework is good at now:
 - rebuilding evaluator-facing artifacts reproducibly
 - replaying official `rv` and `la` images locally
 - validating official image layout before replay
-- injecting support payloads through `disk.img`
+- injecting support payloads through `disk.img` / `disk-la.img`
 - running full or focused LTP subsets
 - indexing official LTP payloads and source runtest entries
 - storing focused LTP experiment results in `.state/ltp-lab`

@@ -2733,6 +2733,80 @@ run_ltp_group() {
         fi
     }
 
+    run_ltp_case_command_with_optional_timeout() {
+        timeout_case_name="$1"
+        shell_path="$2"
+        testcase_path="$3"
+        shift 3
+
+        timeout_secs="${OSCOMP_LTP_CASE_TIMEOUT_SECS:-0}"
+        case "$timeout_secs" in
+            ''|*[!0-9]*)
+                timeout_secs=0
+                ;;
+        esac
+
+        if [ "$timeout_secs" -gt 0 ] 2>/dev/null && \
+            [ -n "${OSCOMP_SUPPORT_BIN:-}" ] && \
+            [ -x "$OSCOMP_SUPPORT_BIN/oscomp-timeout" ]; then
+            run_ltp_case_timeout_exec() {
+                timeout_exec_secs="$1"
+                shift
+                if [ -n "${OSCOMP_SUPPORT_BIN:-}" ] && [ -x "$OSCOMP_SUPPORT_BIN/oscomp-default-signals" ]; then
+                    "$OSCOMP_SUPPORT_BIN/oscomp-timeout" "$timeout_exec_secs" \
+                        "$OSCOMP_SUPPORT_BIN/oscomp-default-signals" "$@"
+                else
+                    "$OSCOMP_SUPPORT_BIN/oscomp-timeout" "$timeout_exec_secs" "$@"
+                fi
+            }
+
+            if [ "$#" -gt 0 ]; then
+                if [ -n "$shell_path" ] && [ "${testcase_path##*.}" = "sh" ]; then
+                    if [ "${shell_path##*/}" = "busybox" ]; then
+                        run_ltp_case_timeout_exec "$timeout_secs" "$shell_path" sh "$testcase_path" "$@"
+                    else
+                        run_ltp_case_timeout_exec "$timeout_secs" "$shell_path" "$testcase_path" "$@"
+                    fi
+                else
+                    run_ltp_case_timeout_exec "$timeout_secs" "$testcase_path" "$@"
+                fi
+            else
+                if [ -n "$shell_path" ] && [ "${testcase_path##*.}" = "sh" ]; then
+                    if [ "${shell_path##*/}" = "busybox" ]; then
+                        run_ltp_case_timeout_exec "$timeout_secs" "$shell_path" sh "$testcase_path"
+                    else
+                        run_ltp_case_timeout_exec "$timeout_secs" "$shell_path" "$testcase_path"
+                    fi
+                else
+                    run_ltp_case_timeout_exec "$timeout_secs" "$testcase_path"
+                fi
+            fi
+            timeout_ret=$?
+            if [ "$timeout_ret" -eq 124 ]; then
+                echo "#### OSCOMP RUNNER LTP CASE TIMEOUT ${timeout_case_name} AFTER ${timeout_secs}s ####"
+            fi
+            return "$timeout_ret"
+        fi
+
+        run_ltp_case_command "$shell_path" "$testcase_path" "$@"
+    }
+
+    ltp_case_uptime_secs() {
+        LTP_CASE_UPTIME_SECS=""
+        if [ -r /proc/uptime ]; then
+            ltp_case_now="$(bb awk '{print int($1)}' /proc/uptime 2>/dev/null || true)"
+        else
+            ltp_case_now=""
+        fi
+        case "$ltp_case_now" in
+            ''|*[!0-9]*)
+                ;;
+            *)
+                LTP_CASE_UPTIME_SECS="$ltp_case_now"
+                ;;
+        esac
+    }
+
     resolve_ltp_case_path() {
         resolve_name="$1"
         LTP_CASE_PATH_RESULT=""
@@ -2856,6 +2930,11 @@ run_ltp_group() {
 
         ran_cases=$((ran_cases + 1))
         echo "RUN LTP CASE $testcase"
+        ltp_case_start_secs=""
+        ltp_case_uptime_secs
+        if [ -n "$LTP_CASE_UPTIME_SECS" ]; then
+            ltp_case_start_secs="$LTP_CASE_UPTIME_SECS"
+        fi
         if runner_truthy "${OSCOMP_RUNNER_DEBUG:-0}" && [ "${testcase_path##*.}" = "sh" ]; then
             runner_debug "#### OSCOMP RUNNER LTP SHELL CASE ${testcase} PATH ${testcase_path} SHELL ${shell_path} TST_TEST_SH $(command -v tst_test.sh 2>/dev/null || true) ####"
         fi
@@ -2872,7 +2951,7 @@ run_ltp_group() {
         if ltp_output_normalize_enabled; then
             case_log="/var/tmp/oscomp-ltp-case-${testcase}.$$.$ran_cases.log"
             bb rm -f "$case_log" 2>/dev/null || true
-            if run_ltp_case_command "$shell_path" "$testcase_path" "$@" </dev/null >"$case_log" 2>&1; then
+            if run_ltp_case_command_with_optional_timeout "$testcase" "$shell_path" "$testcase_path" "$@" </dev/null >"$case_log" 2>&1; then
                 ret=0
             else
                 ret=$?
@@ -2890,12 +2969,12 @@ run_ltp_group() {
                 case_log=""
             fi
         elif [ "$LTP_CASE_OUTPUT_MODE" = "stream" ]; then
-            run_ltp_case_command "$shell_path" "$testcase_path" "$@" </dev/null
+            run_ltp_case_command_with_optional_timeout "$testcase" "$shell_path" "$testcase_path" "$@" </dev/null
             ret=$?
         else
             case_log="/var/tmp/oscomp-ltp-case-${testcase}.$$.$ran_cases.log"
             bb rm -f "$case_log" 2>/dev/null || true
-            if run_ltp_case_command "$shell_path" "$testcase_path" "$@" </dev/null >"$case_log" 2>&1; then
+            if run_ltp_case_command_with_optional_timeout "$testcase" "$shell_path" "$testcase_path" "$@" </dev/null >"$case_log" 2>&1; then
                 ret=0
             else
                 ret=$?
@@ -2917,6 +2996,14 @@ run_ltp_group() {
             unset LD_PRELOAD
         fi
 
+        if [ -n "$ltp_case_start_secs" ]; then
+            ltp_case_uptime_secs
+            if [ -n "$LTP_CASE_UPTIME_SECS" ]; then
+                ltp_case_duration=$((LTP_CASE_UPTIME_SECS - ltp_case_start_secs))
+                [ "$ltp_case_duration" -lt 0 ] 2>/dev/null && ltp_case_duration=0
+                echo "#### OSCOMP RUNNER LTP CASE DURATION ${testcase} ${ltp_case_duration}s ####"
+            fi
+        fi
         echo "FAIL LTP CASE $testcase : $ret"
         if [ "$ret" -ne 0 ]; then
             if [ -n "$case_log" ] && [ -s "$case_log" ]; then

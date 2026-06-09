@@ -4,15 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as _dt
 import fnmatch
 import json
 import os
 import random
 import re
+import signal
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -25,11 +29,13 @@ PLAN_DIR = STATE_DIR / "plans"
 RUN_DIR = STATE_DIR / "runs"
 IMAGE_CACHE_DIR = STATE_DIR / "images"
 REF_DIR = STATE_DIR / "refs"
+CAMPAIGN_DIR = STATE_DIR / "campaigns"
 INVENTORY_PATH = STATE_DIR / "inventory.json"
 DEFAULT_TEST_LIST = REPO_ROOT / "ltp_test.txt"
 DEFAULT_PLAN_NAME = "ltp-both"
 DEFAULT_TESTSUITE_SOURCE = Path.home() / "testsuits-for-oskernel"
 DEFAULT_TESTSUITE_REF = REF_DIR / "testsuits-for-oskernel"
+DEFAULT_LINUX_REF = REF_DIR / "linux"
 DEFAULT_IMAGE_ROOTS = [
     os.environ.get("OSCOMP_TESTSUITE_DIR", ""),
     "/home/dia/kernel-image",
@@ -43,6 +49,38 @@ RESULT_KINDS = ("TPASS", "TFAIL", "TBROK", "TCONF", "TWARN")
 BUILD_STATE_DIRS = (REPO_ROOT / ".state" / "riscv64", REPO_ROOT / ".state" / "loongarch64")
 
 
+@dataclass
+class ReplayTask:
+    task_id: str
+    arch: str
+    libcs: list[str]
+    plan_path: Path
+    support_image: Path
+    task_dir: Path
+    workdir: Path
+    console_log: Path
+    timeout: int
+    env_path: Path | None
+    command: list[str]
+
+
+@dataclass
+class ReplayResult:
+    task_id: str
+    arch: str
+    libcs: list[str]
+    exit_code: int | None
+    console_log: Path
+    cases_jsonl: Path
+    summary_json: Path
+    started_at: str | None
+    ended_at: str | None
+    duration_secs: float
+    status: str
+    killed_by_fail_fast: bool = False
+    error: str = ""
+
+
 def die(message: str) -> None:
     print(f"[ltp-lab] error: {message}", file=sys.stderr)
     raise SystemExit(1)
@@ -53,7 +91,7 @@ def log(message: str) -> None:
 
 
 def ensure_dirs() -> None:
-    for path in (STATE_DIR, LIST_DIR, PLAN_DIR, RUN_DIR, IMAGE_CACHE_DIR, REF_DIR):
+    for path in (STATE_DIR, LIST_DIR, PLAN_DIR, RUN_DIR, IMAGE_CACHE_DIR, REF_DIR, CAMPAIGN_DIR):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -155,6 +193,10 @@ def canonical_libcs(values: list[str] | None) -> list[str]:
 
 def now_id() -> str:
     return _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def iso_now() -> str:
+    return _dt.datetime.now().isoformat(timespec="seconds")
 
 
 def write_json(path: Path, data: Any) -> None:
@@ -606,30 +648,61 @@ def filter_lines(lines: list[str], args: argparse.Namespace) -> list[str]:
     return lines
 
 
+def generation_mode_for(args: argparse.Namespace) -> str:
+    if getattr(args, "mode", None) == "unopened-runtest" and split_csv(getattr(args, "case", None)):
+        return "cases"
+    return args.mode
+
+
+def current_case_line_by_marker() -> dict[str, str]:
+    return {item["marker"]: item["line"].strip() for item in parse_test_list(DEFAULT_TEST_LIST)}
+
+
+def resolve_explicit_case_lines(cases: list[str]) -> list[str]:
+    line_by_marker = current_case_line_by_marker()
+    lines: list[str] = []
+    for case in cases:
+        stripped = case.strip()
+        if not stripped:
+            continue
+        if len(stripped.split()) == 1:
+            lines.append(line_by_marker.get(stripped, stripped))
+        else:
+            lines.append(stripped)
+    return lines
+
+
 def generate_list(args: argparse.Namespace) -> Path:
     ensure_dirs()
-    inv = load_inventory(args.inventory)
     arches = canonical_arches(args.arch)
     libcs = canonical_libcs(args.libc)
-    mode = args.mode
-    current_list_path = inventory_repo_path(inv, inv.get("current_list"), DEFAULT_TEST_LIST)
-    current_items = parse_test_list(current_list_path)
-    if not current_items:
-        current_items = inv["current"]["items"]
-    current_markers = {item["marker"] for item in current_items}
-    available = selected_available_names(inv, arches, libcs)
+    mode = generation_mode_for(args)
     lines: list[str]
 
-    if mode == "current":
-        lines = [item["line"].strip() for item in current_items]
-    elif mode == "cases":
+    if mode == "cases":
         raw_cases = split_csv(args.case)
         if not raw_cases:
             die("generate --mode cases requires --case")
-        lines = raw_cases
+        lines = resolve_explicit_case_lines(raw_cases)
+    elif mode == "current":
+        inv = load_inventory(args.inventory)
+        current_list_path = inventory_repo_path(inv, inv.get("current_list"), DEFAULT_TEST_LIST)
+        current_items = parse_test_list(current_list_path)
+        if not current_items:
+            current_items = inv["current"]["items"]
+        lines = [item["line"].strip() for item in current_items]
     elif mode == "all-bins":
+        inv = load_inventory(args.inventory)
+        available = selected_available_names(inv, arches, libcs)
         lines = sorted(available)
     elif mode in ("runtest", "unopened-runtest"):
+        inv = load_inventory(args.inventory)
+        current_list_path = inventory_repo_path(inv, inv.get("current_list"), DEFAULT_TEST_LIST)
+        current_items = parse_test_list(current_list_path)
+        if not current_items:
+            current_items = inv["current"]["items"]
+        current_markers = {item["marker"] for item in current_items}
+        available = selected_available_names(inv, arches, libcs)
         entries = inv["source_runtest"].get("entries_data", [])
         runtest_filters = set(split_csv(args.runtest))
         selected: list[str] = []
@@ -706,6 +779,10 @@ def env_file_for(args: argparse.Namespace, run_path: Path) -> Path | None:
         lines.append(f"OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS={args.glibc_budget}")
     if args.musl_budget is not None:
         lines.append(f"OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS={args.musl_budget}")
+    if getattr(args, "case_timeout", None) is not None:
+        if args.case_timeout < 0:
+            die("--case-timeout must be non-negative")
+        lines.append(f"OSCOMP_LTP_CASE_TIMEOUT_SECS={args.case_timeout}")
     if not lines:
         return None
     path = run_path / "oscomp.env"
@@ -722,8 +799,8 @@ def ensure_kernels(arches: list[str], rebuild: bool) -> None:
         run_cmd(["make", targets[arch]], capture=False)
 
 
-def build_support_image(args: argparse.Namespace, run_path: Path, arches: list[str], test_list: Path, plan: Path) -> Path:
-    support_image = run_path / "support.img"
+def build_support_image(args: argparse.Namespace, image_dir: Path, arches: list[str], test_list: Path, plan: Path) -> tuple[Path, Path | None]:
+    support_image = image_dir / "support.img"
     arch_arg = "both" if len(arches) > 1 else arches[0]
     cmd = [
         "bash",
@@ -737,31 +814,47 @@ def build_support_image(args: argparse.Namespace, run_path: Path, arches: list[s
         "--plan-override",
         str(plan),
     ]
-    env_path = env_file_for(args, run_path)
+    env_path = env_file_for(args, image_dir)
     if env_path:
         cmd.extend(["--env-override", str(env_path)])
     run_cmd(cmd, capture=True)
-    return support_image
+    return support_image, env_path
 
 
-def run_experiment(args: argparse.Namespace) -> Path:
-    ensure_dirs()
-    arches = canonical_arches(args.arch)
-    if args.image and len(arches) > 1:
-        die("--image override is only valid for single-arch runs")
-    run_id = args.name or now_id()
+def resolve_parallel_mode(args: argparse.Namespace) -> str:
+    mode = args.parallel
+    if args.split_combos:
+        mode = "combo"
+    if args.no_parallel:
+        mode = "serial"
+    return mode
 
-    if not args.skip_kernel_build:
-        ensure_kernels(arches, args.rebuild_kernels)
 
-    run_path = RUN_DIR / run_id
-    if run_path.exists() and not args.replace:
-        die(f"run already exists: {run_path}; pass --replace or choose --name")
-    if run_path.exists():
-        shutil.rmtree(run_path)
-    run_path.mkdir(parents=True)
+def resolve_jobs(args: argparse.Namespace, mode: str, task_count: int) -> int:
+    if mode == "serial":
+        return 1
+    value = str(args.jobs or "auto")
+    if value == "auto":
+        return max(1, task_count)
+    try:
+        jobs = int(value)
+    except ValueError:
+        die("--jobs must be a positive integer or auto")
+    if jobs <= 0:
+        die("--jobs must be a positive integer or auto")
+    return min(jobs, max(1, task_count))
 
-    test_list = Path(args.test_list).expanduser() if args.test_list else generate_list(
+
+def prepare_run_test_list(args: argparse.Namespace, run_id: str, run_path: Path) -> Path:
+    output = run_path / "ltp_test.txt"
+    if args.test_list:
+        source = Path(args.test_list).expanduser()
+        if not source.is_file():
+            die(f"test list not found: {source}")
+        if source.resolve() != output.resolve():
+            shutil.copyfile(source, output)
+        return output
+    return generate_list(
         argparse.Namespace(
             inventory=args.inventory,
             arch=args.arch,
@@ -776,69 +869,453 @@ def run_experiment(args: argparse.Namespace) -> Path:
             offset=args.offset,
             limit=args.limit,
             name=f"{run_id}-list",
-            output=str(run_path / "ltp_test.txt"),
+            output=str(output),
         )
     )
-    plan = Path(args.plan).expanduser() if args.plan else write_plan(
+
+
+def write_task_plan(args: argparse.Namespace, output: Path, libcs: list[str]) -> Path:
+    return write_plan(
         argparse.Namespace(
-            libc=args.libc,
+            libc=libcs,
             group=["ltp"],
             ltp_order=args.ltp_order,
-            name=f"{run_id}-plan",
-            output=str(run_path / "plan.txt"),
+            name=output.stem,
+            output=str(output),
         )
     )
-    support_image = build_support_image(args, run_path, arches, test_list, plan)
+
+
+def prepare_common_plan(args: argparse.Namespace, run_path: Path, run_id: str) -> Path:
+    output = run_path / "plan.txt"
+    if args.plan:
+        source = Path(args.plan).expanduser()
+        if not source.is_file():
+            die(f"plan not found: {source}")
+        if source.resolve() != output.resolve():
+            shutil.copyfile(source, output)
+        return output
+    return write_task_plan(args, output, canonical_libcs(args.libc))
+
+
+def replay_command(args: argparse.Namespace, arch: str, support_image: Path, workdir: Path, timeout: int) -> list[str]:
+    cmd = [
+        str(REPO_ROOT / "scripts" / "replay-oscomp-eval.sh"),
+        "--arch",
+        arch,
+        "--support-image",
+        str(support_image),
+        "--workdir",
+        str(workdir),
+        "--keep-workdir",
+        "--timeout",
+        str(timeout),
+        "--skip-kernel-build",
+    ]
+    if args.image:
+        cmd.extend(["--image", str(Path(args.image).expanduser())])
+    return cmd
+
+
+def create_replay_tasks(
+    args: argparse.Namespace,
+    run_path: Path,
+    run_id: str,
+    arches: list[str],
+    libcs: list[str],
+    test_list: Path,
+    mode: str,
+) -> list[ReplayTask]:
+    task_timeout = args.task_timeout if args.task_timeout is not None else args.timeout
+    if task_timeout <= 0:
+        die("--task-timeout/--timeout must be positive")
+    tasks: list[ReplayTask] = []
+    if not arches:
+        die("no arches selected")
+    if not libcs:
+        die("no libcs selected")
+    if mode not in ("arch", "combo", "serial"):
+        die(f"unsupported parallel mode: {mode}")
+
+    if mode == "combo":
+        if args.plan:
+            die("--plan cannot be used with --parallel combo/--split-combos; combo tasks need one-libc plans")
+        for arch in arches:
+            for libc in libcs:
+                task_id = f"{arch}-{libc}"
+                task_dir = run_path / "tasks" / task_id
+                task_dir.mkdir(parents=True)
+                plan = write_task_plan(args, task_dir / "plan.txt", [libc])
+                support_image, env_path = build_support_image(args, task_dir, [arch], test_list, plan)
+                workdir = task_dir / "work"
+                command = replay_command(args, arch, support_image, workdir, task_timeout)
+                tasks.append(
+                    ReplayTask(
+                        task_id=task_id,
+                        arch=arch,
+                        libcs=[libc],
+                        plan_path=plan,
+                        support_image=support_image,
+                        task_dir=task_dir,
+                        workdir=workdir,
+                        console_log=task_dir / "console.log",
+                        timeout=task_timeout,
+                        env_path=env_path,
+                        command=command,
+                    )
+                )
+        return tasks
+
+    plan = prepare_common_plan(args, run_path, run_id)
+    support_image, env_path = build_support_image(args, run_path, arches, test_list, plan)
+    for arch in arches:
+        task_dir = run_path / arch
+        task_dir.mkdir(exist_ok=True)
+        workdir = task_dir / "work"
+        command = replay_command(args, arch, support_image, workdir, task_timeout)
+        tasks.append(
+            ReplayTask(
+                task_id=arch,
+                arch=arch,
+                libcs=libcs,
+                plan_path=plan,
+                support_image=support_image,
+                task_dir=task_dir,
+                workdir=workdir,
+                console_log=task_dir / "console.log",
+                timeout=task_timeout,
+                env_path=env_path,
+                command=command,
+            )
+        )
+    return tasks
+
+
+def task_manifest(task: ReplayTask, run_path: Path) -> dict[str, Any]:
+    def rel(path: Path | None) -> str:
+        if path is None:
+            return ""
+        try:
+            return str(path.relative_to(run_path))
+        except ValueError:
+            return str(path)
+
+    return {
+        "task_id": task.task_id,
+        "arch": task.arch,
+        "libcs": task.libcs,
+        "plan": rel(task.plan_path),
+        "support_image": rel(task.support_image),
+        "env": rel(task.env_path),
+        "task_dir": rel(task.task_dir),
+        "workdir": rel(task.workdir),
+        "console_log": rel(task.console_log),
+        "timeout": task.timeout,
+        "command": task.command,
+    }
+
+
+def result_manifest(result: ReplayResult, run_path: Path) -> dict[str, Any]:
+    def rel(path: Path) -> str:
+        try:
+            return str(path.relative_to(run_path))
+        except ValueError:
+            return str(path)
+
+    return {
+        "task_id": result.task_id,
+        "arch": result.arch,
+        "libcs": result.libcs,
+        "exit_code": result.exit_code,
+        "console_log": rel(result.console_log),
+        "cases_jsonl": rel(result.cases_jsonl),
+        "summary_json": rel(result.summary_json),
+        "started_at": result.started_at,
+        "ended_at": result.ended_at,
+        "duration_secs": result.duration_secs,
+        "status": result.status,
+        "killed_by_fail_fast": result.killed_by_fail_fast,
+        "error": result.error,
+    }
+
+
+def terminate_process_group(proc: subprocess.Popen[Any]) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        proc.terminate()
+    deadline = time.monotonic() + 2.0
+    while proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except OSError:
+            proc.kill()
+
+
+def run_replay_task(task: ReplayTask, cancel_event: threading.Event) -> ReplayResult:
+    started_at = iso_now()
+    start = time.monotonic()
+    status = "completed"
+    exit_code: int | None = None
+    killed_by_fail_fast = False
+    error = ""
+    task.task_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with task.console_log.open("w", encoding="utf-8", errors="replace") as out:
+            if cancel_event.is_set():
+                status = "cancelled"
+                killed_by_fail_fast = True
+                out.write("[ltp-lab] task cancelled before start\n")
+                exit_code = None
+            else:
+                proc = subprocess.Popen(
+                    task.command,
+                    cwd=REPO_ROOT,
+                    stdout=out,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    start_new_session=True,
+                )
+                while True:
+                    ret = proc.poll()
+                    if ret is not None:
+                        exit_code = ret
+                        status = "completed" if ret == 0 else "failed"
+                        break
+                    if cancel_event.is_set():
+                        killed_by_fail_fast = True
+                        status = "cancelled"
+                        terminate_process_group(proc)
+                        ret = proc.wait()
+                        exit_code = ret
+                        out.write("\n[ltp-lab] task killed by fail-fast\n")
+                        break
+                    time.sleep(1.0)
+    except Exception as exc:  # pragma: no cover - defensive for long-running subprocess orchestration
+        status = "failed"
+        error = str(exc)
+        exit_code = -1
+
+    ended_at = iso_now()
+    duration_secs = round(time.monotonic() - start, 3)
+    if exit_code is None:
+        (task.task_dir / "exit_code.txt").write_text("cancelled\n", encoding="utf-8")
+    else:
+        (task.task_dir / "exit_code.txt").write_text(f"{exit_code}\n", encoding="utf-8")
+    if task.console_log.is_file():
+        parse_log_file(task.console_log, arch=task.arch, output_dir=task.task_dir)
+    return ReplayResult(
+        task_id=task.task_id,
+        arch=task.arch,
+        libcs=task.libcs,
+        exit_code=exit_code,
+        console_log=task.console_log,
+        cases_jsonl=task.task_dir / "cases.jsonl",
+        summary_json=task.task_dir / "summary.json",
+        started_at=started_at,
+        ended_at=ended_at,
+        duration_secs=duration_secs,
+        status=status,
+        killed_by_fail_fast=killed_by_fail_fast,
+        error=error,
+    )
+
+
+def write_cases_jsonl(path: Path, cases: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as out:
+        for case in cases:
+            out.write(json.dumps(case, sort_keys=True) + "\n")
+
+
+def summary_from_cases(cases: list[dict[str, Any]], arch: str = "") -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "arch": arch,
+        "cases": len(cases),
+        "global_timeout": any(case.get("timed_out") for case in cases),
+        "global_panic": any(case.get("panic") for case in cases),
+        "by_status": {},
+        "by_libc": {},
+    }
+    for case in cases:
+        status = case.get("status") or "unknown"
+        summary["by_status"][status] = summary["by_status"].get(status, 0) + 1
+        libc = case.get("libc") or "unknown"
+        by_libc = summary["by_libc"].setdefault(libc, {})
+        by_libc[status] = by_libc.get(status, 0) + 1
+    slow_cases = [
+        {
+            "case": case.get("case", ""),
+            "arch": arch,
+            "libc": case.get("libc") or "unknown",
+            "status": case.get("status") or "unknown",
+            "duration_secs": case.get("duration_secs"),
+        }
+        for case in cases
+        if case.get("duration_secs") is not None
+    ]
+    slow_cases.sort(key=lambda item: float(item.get("duration_secs") or 0), reverse=True)
+    if slow_cases:
+        summary["slow_cases"] = slow_cases[:50]
+    return summary
+
+
+def read_exit_code(path: Path) -> int | None:
+    if not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8", errors="replace").strip()
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def aggregate_split_combo_results(run_path: Path, tasks: list[ReplayTask]) -> None:
+    for arch in ARCHES:
+        arch_tasks = [task for task in tasks if task.arch == arch]
+        if not arch_tasks:
+            continue
+        arch_dir = run_path / arch
+        arch_dir.mkdir(exist_ok=True)
+        cases: list[dict[str, Any]] = []
+        exit_codes: list[int] = []
+        for task in arch_tasks:
+            cases.extend(read_cases_jsonl(task.task_dir / "cases.jsonl"))
+            code = read_exit_code(task.task_dir / "exit_code.txt")
+            if code is not None:
+                exit_codes.append(code)
+        write_cases_jsonl(arch_dir / "cases.jsonl", cases)
+        write_json(arch_dir / "summary.json", summary_from_cases(cases, arch=arch))
+        aggregate_exit = 0
+        for code in exit_codes:
+            if code != 0:
+                aggregate_exit = code
+                break
+        if exit_codes:
+            (arch_dir / "exit_code.txt").write_text(f"{aggregate_exit}\n", encoding="utf-8")
+
+
+def run_tasks(tasks: list[ReplayTask], jobs: int, fail_fast: bool) -> list[ReplayResult]:
+    cancel_event = threading.Event()
+    results: list[ReplayResult] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+        futures = {executor.submit(run_replay_task, task, cancel_event): task for task in tasks}
+        pending = set(futures)
+        while pending:
+            done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                task = futures[future]
+                if future.cancelled():
+                    task.task_dir.mkdir(parents=True, exist_ok=True)
+                    task.console_log.write_text("[ltp-lab] task cancelled before start\n", encoding="utf-8")
+                    (task.task_dir / "exit_code.txt").write_text("cancelled\n", encoding="utf-8")
+                    parse_log_file(task.console_log, arch=task.arch, output_dir=task.task_dir)
+                    results.append(
+                        ReplayResult(
+                            task_id=task.task_id,
+                            arch=task.arch,
+                            libcs=task.libcs,
+                            exit_code=None,
+                            console_log=task.console_log,
+                            cases_jsonl=task.task_dir / "cases.jsonl",
+                            summary_json=task.task_dir / "summary.json",
+                            started_at=None,
+                            ended_at=iso_now(),
+                            duration_secs=0.0,
+                            status="cancelled",
+                            killed_by_fail_fast=True,
+                        )
+                    )
+                    continue
+                try:
+                    result = future.result()
+                except Exception as exc:  # pragma: no cover - defensive
+                    result = ReplayResult(
+                        task_id=task.task_id,
+                        arch=task.arch,
+                        libcs=task.libcs,
+                        exit_code=-1,
+                        console_log=task.console_log,
+                        cases_jsonl=task.task_dir / "cases.jsonl",
+                        summary_json=task.task_dir / "summary.json",
+                        started_at=None,
+                        ended_at=iso_now(),
+                        duration_secs=0.0,
+                        status="failed",
+                        error=str(exc),
+                    )
+                results.append(result)
+                if fail_fast and result.exit_code not in (0, None) and not cancel_event.is_set():
+                    cancel_event.set()
+                    for pending_future in pending:
+                        pending_future.cancel()
+    results.sort(key=lambda item: item.task_id)
+    return results
+
+
+def run_experiment(args: argparse.Namespace) -> Path:
+    ensure_dirs()
+    arches = canonical_arches(args.arch)
+    libcs = canonical_libcs(args.libc)
+    if args.image and len(arches) > 1:
+        die("--image override is only valid for single-arch runs")
+    run_id = args.name or now_id()
+    parallel_mode = resolve_parallel_mode(args)
+
+    if not args.skip_kernel_build:
+        ensure_kernels(arches, args.rebuild_kernels)
+
+    run_path = RUN_DIR / run_id
+    if run_path.exists() and not args.replace:
+        die(f"run already exists: {run_path}; pass --replace or choose --name")
+    if run_path.exists():
+        shutil.rmtree(run_path)
+    run_path.mkdir(parents=True)
+
+    test_list = prepare_run_test_list(args, run_id, run_path)
+    tasks = create_replay_tasks(args, run_path, run_id, arches, libcs, test_list, parallel_mode)
+    jobs = resolve_jobs(args, parallel_mode, len(tasks))
     manifest = {
         "run_id": run_id,
-        "created_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "created_at": iso_now(),
         "repo_root": str(REPO_ROOT),
         "arches": arches,
-        "libcs": canonical_libcs(args.libc),
+        "libcs": libcs,
         "test_list": str(test_list),
-        "plan": str(plan),
-        "support_image": str(support_image),
-        "commands": {},
+        "parallel": {
+            "mode": parallel_mode,
+            "jobs": jobs,
+            "split_combos": parallel_mode == "combo",
+        },
+        "tasks": {task.task_id: task_manifest(task, run_path) for task in tasks},
+        "results": {},
     }
     write_json(run_path / "manifest.json", manifest)
     if args.prepare_only:
         log(f"prepared run inputs in {run_path}")
         return run_path
 
-    replay_failures: dict[str, int] = {}
-    for arch in arches:
-        arch_dir = run_path / arch
-        arch_dir.mkdir()
-        workdir = arch_dir / "work"
-        cmd = [
-            str(REPO_ROOT / "scripts" / "replay-oscomp-eval.sh"),
-            "--arch",
-            arch,
-            "--support-image",
-            str(support_image),
-            "--workdir",
-            str(workdir),
-            "--keep-workdir",
-            "--timeout",
-            str(args.timeout),
-            "--skip-kernel-build",
-        ]
-        if args.image:
-            cmd.extend(["--image", str(Path(args.image).expanduser())])
-        manifest["commands"][arch] = cmd
-        write_json(run_path / "manifest.json", manifest)
-        log(f"running {arch}; log={arch_dir / 'console.log'}")
-        proc = run_cmd(cmd, capture=False, check=False, log_path=arch_dir / "console.log")
-        (arch_dir / "exit_code.txt").write_text(f"{proc.returncode}\n", encoding="utf-8")
-        parse_log_file(arch_dir / "console.log", arch=arch, output_dir=arch_dir)
-        if proc.returncode != 0:
-            replay_failures[arch] = proc.returncode
-            if args.fail_fast:
-                summarize_run(run_path)
-                die(f"{arch} replay failed with {proc.returncode}")
+    log(f"running {len(tasks)} task(s) mode={parallel_mode} jobs={jobs}")
+    for task in tasks:
+        log(f"task {task.task_id}: arch={task.arch} libc={','.join(task.libcs)} log={task.console_log}")
+    results = run_tasks(tasks, jobs, args.fail_fast)
+    manifest["results"] = {result.task_id: result_manifest(result, run_path) for result in results}
+    write_json(run_path / "manifest.json", manifest)
+    if parallel_mode == "combo":
+        aggregate_split_combo_results(run_path, tasks)
     summarize_run(run_path)
-    if replay_failures:
-        details = " ".join(f"{arch}={code}" for arch, code in sorted(replay_failures.items()))
+    replay_failures = {result.task_id: result.exit_code for result in results if result.exit_code not in (0, None)}
+    cancelled = [result.task_id for result in results if result.status == "cancelled"]
+    if replay_failures or cancelled:
+        details = " ".join(f"{task}={code}" for task, code in sorted(replay_failures.items()))
+        if cancelled:
+            details = (details + " " if details else "") + "cancelled=" + ",".join(sorted(cancelled))
         die(f"replay failed: {details}")
     return run_path
 
@@ -847,6 +1324,8 @@ GROUP_START_RE = re.compile(r"#### OS COMP TEST GROUP START ([^ ]+) ####")
 GROUP_END_RE = re.compile(r"#### OS COMP TEST GROUP END ([^ ]+) ####")
 RUN_CASE_RE = re.compile(r"^RUN LTP CASE (.+)$")
 END_CASE_RE = re.compile(r"^FAIL LTP CASE (.+?) : (-?\d+)$")
+CASE_TIMEOUT_RE = re.compile(r"^#### OSCOMP RUNNER LTP CASE TIMEOUT (.+?) AFTER (\d+)s ####$")
+CASE_DURATION_RE = re.compile(r"^#### OSCOMP RUNNER LTP CASE DURATION (.+?) ([0-9.]+)s ####$")
 SUMMARY_COUNT_RE = re.compile(r"^(passed|failed|broken|skipped|warnings)\s+(\d+)\s*$")
 
 
@@ -871,6 +1350,8 @@ def new_case(name: str, group: str | None, line_no: int) -> dict[str, Any]:
         "results": {kind: 0 for kind in RESULT_KINDS},
         "summary": {},
         "timed_out": False,
+        "timeout_secs": None,
+        "duration_secs": None,
         "panic": False,
         "status": "running",
     }
@@ -939,6 +1420,17 @@ def parse_log_text(text: str, arch: str = "") -> dict[str, Any]:
             for kind in RESULT_KINDS:
                 if kind in line:
                     current_case["results"][kind] += 1
+            timeout = CASE_TIMEOUT_RE.match(line)
+            if timeout:
+                current_case["timed_out"] = True
+                current_case["timeout_secs"] = int(timeout.group(2))
+            duration = CASE_DURATION_RE.match(line)
+            if duration:
+                try:
+                    value = float(duration.group(2))
+                except ValueError:
+                    value = None
+                current_case["duration_secs"] = value
             summary = SUMMARY_COUNT_RE.match(line.strip())
             if summary:
                 current_case["summary"][summary.group(1)] = int(summary.group(2))
@@ -967,6 +1459,20 @@ def parse_log_text(text: str, arch: str = "") -> dict[str, Any]:
         libc = case.get("libc") or "unknown"
         by_libc = summary["by_libc"].setdefault(libc, {})
         by_libc[status] = by_libc.get(status, 0) + 1
+    slow_cases = [
+        {
+            "case": case.get("case", ""),
+            "arch": arch,
+            "libc": case.get("libc") or "unknown",
+            "status": case.get("status") or "unknown",
+            "duration_secs": case.get("duration_secs"),
+        }
+        for case in cases
+        if case.get("duration_secs") is not None
+    ]
+    slow_cases.sort(key=lambda item: float(item.get("duration_secs") or 0), reverse=True)
+    if slow_cases:
+        summary["slow_cases"] = slow_cases[:50]
     return {"summary": summary, "cases": cases}
 
 
@@ -1000,40 +1506,121 @@ def print_summary(summary: dict[str, Any]) -> None:
         print(f"  {libc}: {details}")
 
 
+def add_counts(dst: dict[str, int], src: dict[str, Any]) -> None:
+    for key, value in src.items():
+        try:
+            dst[key] = dst.get(key, 0) + int(value)
+        except (TypeError, ValueError):
+            pass
+
+
 def summarize_run(run_path: Path) -> dict[str, Any]:
     run_path = run_path.expanduser()
     if not run_path.is_dir():
         die(f"run dir not found: {run_path}")
-    summaries: dict[str, Any] = {}
+    manifest: dict[str, Any] = {}
+    manifest_path = run_path / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            manifest = read_json(manifest_path)
+        except json.JSONDecodeError:
+            manifest = {}
+
+    arch_summaries: dict[str, Any] = {}
     exit_codes: dict[str, int] = {}
+    by_combo: dict[str, dict[str, int]] = {}
+    by_arch: dict[str, dict[str, int]] = {}
+    total: dict[str, int] = {}
+
     for arch in ARCHES:
         summary_path = run_path / arch / "summary.json"
         if summary_path.is_file():
-            summaries[arch] = read_json(summary_path)
+            summary = read_json(summary_path)
+            arch_summaries[arch] = summary
+            by_arch[arch] = dict(summary.get("by_status", {}))
+            add_counts(total, summary.get("by_status", {}))
+            for libc, statuses in summary.get("by_libc", {}).items():
+                key = f"{arch}/{libc}"
+                by_combo[key] = dict(statuses)
         exit_code_path = run_path / arch / "exit_code.txt"
         if exit_code_path.is_file():
-            try:
-                exit_codes[arch] = int(exit_code_path.read_text(encoding="utf-8").strip())
-            except ValueError:
-                exit_codes[arch] = -1
-    total: dict[str, int] = {}
-    for summary in summaries.values():
-        for status, count in summary.get("by_status", {}).items():
-            total[status] = total.get(status, 0) + int(count)
+            code = read_exit_code(exit_code_path)
+            exit_codes[arch] = code if code is not None else -1
+
+    task_summaries: dict[str, Any] = {}
+    task_exit_codes: dict[str, int | None] = {}
+    task_results = (manifest.get("results") or {}) if isinstance(manifest.get("results"), dict) else {}
+    task_defs = (manifest.get("tasks") or {}) if isinstance(manifest.get("tasks"), dict) else {}
+    for task_id, task_def in sorted(task_defs.items()):
+        task_dir = run_path / (task_def.get("task_dir") or "")
+        summary_path = task_dir / "summary.json"
+        exit_code_path = task_dir / "exit_code.txt"
+        summary = read_json(summary_path) if summary_path.is_file() else {}
+        result = task_results.get(task_id, {})
+        code = result.get("exit_code")
+        if code is None:
+            code = read_exit_code(exit_code_path)
+        task_exit_codes[task_id] = code
+        task_summaries[task_id] = {
+            "arch": task_def.get("arch", ""),
+            "libcs": task_def.get("libcs", []),
+            "exit_code": code,
+            "duration_secs": result.get("duration_secs"),
+            "status": result.get("status", "prepared" if not result else ""),
+            "cases": summary.get("cases", 0),
+            "by_status": summary.get("by_status", {}),
+        }
+
     failed_arches = {arch: code for arch, code in exit_codes.items() if code != 0}
+    failed_tasks = [
+        task_id
+        for task_id, task in task_summaries.items()
+        if task.get("exit_code") not in (0, None)
+    ]
+    cancelled_tasks = [
+        task_id
+        for task_id, task in task_summaries.items()
+        if task.get("status") == "cancelled"
+    ]
+
+    parallel = manifest.get("parallel") or {"mode": "serial", "jobs": 1, "split_combos": False}
     combined = {
         "run": str(run_path),
-        "arches": summaries,
+        "run_id": manifest.get("run_id", run_path.name),
+        "parallel": parallel,
+        "tasks": task_summaries,
+        "arches": arch_summaries,
+        "by_combo": by_combo,
+        "by_arch": by_arch,
         "exit_codes": exit_codes,
+        "task_exit_codes": task_exit_codes,
         "failed_arches": failed_arches,
+        "failed_tasks": failed_tasks,
+        "cancelled_tasks": cancelled_tasks,
         "total_by_status": total,
     }
     write_json(run_path / "combined-summary.json", combined)
     print(f"run: {run_path}")
-    for arch in sorted(summaries):
+    if parallel:
+        print(
+            "parallel: "
+            f"mode={parallel.get('mode', 'serial')} jobs={parallel.get('jobs', 1)}"
+        )
+    if task_summaries:
+        print("tasks:")
+        for task_id, task in sorted(task_summaries.items()):
+            statuses = task.get("by_status", {})
+            details = " ".join(f"{k}={v}" for k, v in sorted(statuses.items()))
+            duration = task.get("duration_secs")
+            duration_text = f" duration={duration}s" if duration is not None else ""
+            print(
+                f"  {task_id} exit={task.get('exit_code')} cases={task.get('cases', 0)}"
+                f"{duration_text}{' ' + details if details else ''}"
+            )
+    for arch in sorted(arch_summaries):
         if arch in exit_codes:
             print(f"replay_exit[{arch}]={exit_codes[arch]}")
-        print_summary(summaries[arch])
+        print_summary(arch_summaries[arch])
     if total:
         print("total: " + " ".join(f"{k}={v}" for k, v in sorted(total.items())))
     return combined
@@ -1095,31 +1682,152 @@ def read_cases_jsonl(path: Path) -> list[dict[str, Any]]:
     return cases
 
 
-def promote_cmd(args: argparse.Namespace) -> None:
-    run_dirs = [Path(item).expanduser() for item in args.run_dir]
-    required = split_csv(args.require) or [f"{arch}/{libc}" for arch in ARCHES for libc in LIBCS]
-    passing_statuses = {"pass"}
-    if args.allow_silent_pass:
-        passing_statuses.add("silent-pass")
-    pass_sets: dict[str, set[str]] = {key: set() for key in required}
+def combo_key(arch: str, libc: str) -> str:
+    return f"{arch}/{libc}"
+
+
+def all_combos() -> list[str]:
+    return [combo_key(arch, libc) for arch in ARCHES for libc in LIBCS]
+
+
+def status_rank(status: str, passing_statuses: set[str]) -> int:
+    if status in passing_statuses:
+        return 100
+    return {
+        "silent-pass": 90,
+        "fail": 60,
+        "nonzero": 50,
+        "timeout": 40,
+        "panic": 30,
+        "incomplete": 20,
+        "unknown": 10,
+    }.get(status or "", 0)
+
+
+def load_run_list_lines(run_dirs: list[Path]) -> dict[str, str]:
     line_by_case: dict[str, str] = {}
     for run_dir in run_dirs:
         list_path = run_dir / "ltp_test.txt"
         for item in parse_test_list(list_path):
             line_by_case[item["marker"]] = item["line"].strip()
+    return line_by_case
+
+
+def collect_case_evidence(
+    run_dirs: list[Path],
+    required: list[str],
+    passing_statuses: set[str],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    evidence: dict[str, dict[str, dict[str, Any]]] = {}
+    required_set = set(required)
+    for run_dir in run_dirs:
         for arch in ARCHES:
             for case in read_cases_jsonl(run_dir / arch / "cases.jsonl"):
-                key = f"{arch}/{case.get('libc') or 'unknown'}"
-                if key in pass_sets and case.get("status") in passing_statuses:
-                    pass_sets[key].add(case["case"])
-    if not pass_sets:
+                libc = case.get("libc") or "unknown"
+                key = combo_key(arch, libc)
+                if key not in required_set:
+                    continue
+                name = case.get("case", "")
+                if not name:
+                    continue
+                by_combo = evidence.setdefault(name, {})
+                existing = by_combo.get(key)
+                if existing is None or status_rank(case.get("status", ""), passing_statuses) > status_rank(existing.get("status", ""), passing_statuses):
+                    item = dict(case)
+                    item["arch"] = arch
+                    item["combo"] = key
+                    item["run_dir"] = str(run_dir)
+                    by_combo[key] = item
+    return evidence
+
+
+def candidate_case_order(test_list: Path | None, evidence: dict[str, dict[str, dict[str, Any]]]) -> list[str]:
+    if test_list:
+        items = parse_test_list(test_list)
+        if items:
+            return [item["marker"] for item in items]
+    return sorted(evidence)
+
+
+def case_combo_status(
+    evidence: dict[str, dict[str, dict[str, Any]]],
+    case: str,
+    combo: str,
+) -> str:
+    item = evidence.get(case, {}).get(combo)
+    if not item:
+        return "missing"
+    return str(item.get("status") or "unknown")
+
+
+def promotable_cases(
+    evidence: dict[str, dict[str, dict[str, Any]]],
+    required: list[str],
+    passing_statuses: set[str],
+) -> set[str]:
+    return {
+        case
+        for case, by_combo in evidence.items()
+        if all(by_combo.get(combo, {}).get("status") in passing_statuses for combo in required)
+    }
+
+
+def print_case_matrix(
+    cases: list[str],
+    evidence: dict[str, dict[str, dict[str, Any]]],
+    required: list[str],
+    *,
+    only_missing: bool = False,
+    limit: int | None = None,
+) -> None:
+    shown = 0
+    for case in cases:
+        statuses = {combo: case_combo_status(evidence, case, combo) for combo in required}
+        if only_missing and all(status != "missing" for status in statuses.values()):
+            continue
+        details = " ".join(f"{combo}={status}" for combo, status in statuses.items())
+        print(f"{case}: {details}")
+        shown += 1
+        if limit is not None and shown >= limit:
+            break
+
+
+def promote_cmd(args: argparse.Namespace) -> None:
+    run_dirs = [Path(item).expanduser() for item in args.run_dir]
+    required = split_csv(args.require) or all_combos()
+    passing_statuses = {"pass"}
+    if args.allow_silent_pass:
+        passing_statuses.add("silent-pass")
+    if not required:
         die("no required combos selected")
-    promoted = set.intersection(*pass_sets.values()) if pass_sets else set()
+    line_by_case = load_run_list_lines(run_dirs)
+    if args.test_list:
+        for item in parse_test_list(Path(args.test_list).expanduser()):
+            line_by_case[item["marker"]] = item["line"].strip()
+    evidence = collect_case_evidence(run_dirs, required, passing_statuses)
+    promoted = promotable_cases(evidence, required, passing_statuses)
     base_path = Path(args.base).expanduser() if args.base else DEFAULT_TEST_LIST
     base_items = parse_test_list(base_path)
     existing = {item["marker"] for item in base_items}
     lines = [item["line"].strip() for item in base_items]
     added = 0
+    candidates = candidate_case_order(Path(args.test_list).expanduser() if args.test_list else None, evidence)
+    if not candidates:
+        candidates = sorted(promoted)
+    if args.explain or args.status_matrix:
+        promotable = [case for case in candidates if case in promoted]
+        blocked = [case for case in candidates if case not in promoted]
+        print("promotable:")
+        for case in promotable:
+            details = " ".join(f"{combo} pass" for combo in required)
+            print(f"  {case}: {details}")
+        print("not promoted:")
+        for case in blocked:
+            statuses = {combo: case_combo_status(evidence, case, combo) for combo in required}
+            if args.show_missing and all(status != "missing" for status in statuses.values()):
+                continue
+            details = " ".join(f"{combo} {status}" for combo, status in statuses.items())
+            print(f"  {case}: {details}")
     for case in sorted(promoted):
         if case in existing:
             continue
@@ -1127,8 +1835,957 @@ def promote_cmd(args: argparse.Namespace) -> None:
         added += 1
     output = Path(args.output).expanduser()
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    log(f"promoted {added} new cases into {output} (base={len(base_items)} total={len(lines)})")
+    if args.dry_run:
+        log(f"dry-run: would promote {added} new cases into {output} (base={len(base_items)} total={len(lines)})")
+    else:
+        output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        log(f"promoted {added} new cases into {output} (base={len(base_items)} total={len(lines)})")
+
+
+def matrix_status_cmd(args: argparse.Namespace) -> None:
+    run_dirs = [Path(item).expanduser() for item in args.run_dir]
+    required = split_csv(args.require) or all_combos()
+    passing_statuses = {"pass", "silent-pass"}
+    evidence = collect_case_evidence(run_dirs, required, passing_statuses)
+    test_list = Path(args.test_list).expanduser() if args.test_list else None
+    cases = candidate_case_order(test_list, evidence)
+    print_case_matrix(cases, evidence, required, only_missing=args.only_missing, limit=args.limit)
+
+
+def missing_combos_cmd(args: argparse.Namespace) -> None:
+    run_dirs = [Path(item).expanduser() for item in args.run_dir]
+    required = split_csv(args.require) or all_combos()
+    passing_statuses = {"pass"}
+    if args.allow_silent_pass:
+        passing_statuses.add("silent-pass")
+    evidence = collect_case_evidence(run_dirs, required, passing_statuses)
+    test_list = Path(args.test_list).expanduser() if args.test_list else None
+    cases = candidate_case_order(test_list, evidence)
+    line_by_case = load_run_list_lines(run_dirs)
+    if test_list:
+        for item in parse_test_list(test_list):
+            line_by_case[item["marker"]] = item["line"].strip()
+    output_dir = Path(args.output).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    counts: dict[str, int] = {}
+    for combo in required:
+        missing_lines: list[str] = []
+        for case in cases:
+            status = case_combo_status(evidence, case, combo)
+            if status in passing_statuses:
+                continue
+            missing_lines.append(line_by_case.get(case, case))
+        path = output_dir / f"{combo.replace('/', '-')}.txt"
+        path.write_text("\n".join(missing_lines) + ("\n" if missing_lines else ""), encoding="utf-8")
+        counts[combo] = len(missing_lines)
+        log(f"wrote {len(missing_lines)} missing cases for {combo} to {path}")
+    write_json(output_dir / "summary.json", {"required": required, "counts": counts})
+
+
+def reorder_cmd(args: argparse.Namespace) -> None:
+    base_path = Path(args.base).expanduser()
+    base_items = parse_test_list(base_path)
+    if not base_items:
+        die(f"base list is empty or missing: {base_path}")
+    run_dirs = [Path(item).expanduser() for item in args.evidence]
+    required = split_csv(args.require) or all_combos()
+    passing_statuses = {"pass", "silent-pass"}
+    evidence = collect_case_evidence(run_dirs, required, passing_statuses)
+
+    def score_item(item: dict[str, Any]) -> tuple[int, float, int]:
+        case = item["marker"]
+        statuses = [case_combo_status(evidence, case, combo) for combo in required]
+        durations = [
+            float(ev.get("duration_secs") or 0)
+            for ev in evidence.get(case, {}).values()
+            if ev.get("duration_secs") is not None
+        ]
+        max_duration = max(durations) if durations else 0.0
+        if statuses and all(status in passing_statuses for status in statuses):
+            bucket = 0 if max_duration <= args.fast_threshold else 1
+        elif any(status in {"timeout", "panic"} for status in statuses):
+            bucket = 4
+        elif any(status == "missing" for status in statuses):
+            bucket = 3
+        else:
+            bucket = 2
+        return (bucket, max_duration, int(item["line_no"]))
+
+    ordered = sorted(base_items, key=score_item)
+    output = Path(args.output).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(item["line"].strip() for item in ordered) + "\n", encoding="utf-8")
+    write_json(
+        output.with_suffix(output.suffix + ".json"),
+        {
+            "base": str(base_path),
+            "evidence": [str(path) for path in run_dirs],
+            "output": str(output),
+            "count": len(ordered),
+            "fast_threshold": args.fast_threshold,
+        },
+    )
+    log(f"wrote reordered list with {len(ordered)} cases to {output}")
+
+
+SEMANTIC_DEFS: list[dict[str, Any]] = [
+    {
+        "id": "fs-open-permission",
+        "title": "Open, Access, Mode, And Ownership Semantics",
+        "patterns": [
+            "open*",
+            "openat*",
+            "creat*",
+            "access*",
+            "faccessat*",
+            "chmod*",
+            "fchmod*",
+            "fchmodat*",
+            "chown*",
+            "fchown*",
+            "lchown*",
+            "umask*",
+        ],
+        "required": [
+            "Validate Linux-compatible open/access mode, flag, O_PATH, and permission behavior.",
+            "Return the errno expected by the testcase for invalid pointers, bad flags, missing files, and permission failures.",
+            "Keep VFS metadata changes coherent across file handles, directory entries, and stat-family syscalls.",
+        ],
+        "linux_refs": ["fs/open.c", "fs/namei.c", "fs/stat.c", "include/uapi/asm-generic/fcntl.h"],
+        "kernel_paths": ["kernel/src/syscall/fs", "kernel/src/file", "third_party/rust-patches/axfs-ng"],
+    },
+    {
+        "id": "fs-link-rename-unlink",
+        "title": "Link, Rename, Symlink, And Directory Entry Semantics",
+        "patterns": [
+            "link*",
+            "linkat*",
+            "unlink*",
+            "unlinkat*",
+            "rename*",
+            "renameat*",
+            "renameat2*",
+            "symlink*",
+            "symlinkat*",
+            "readlink*",
+            "readlinkat*",
+        ],
+        "required": [
+            "Implement Linux-like link count, overwrite, exchange, no-replace, directory, and cross-directory behavior.",
+            "Keep directory entries, inode cache state, and page-cache lifetime coherent after rename or unlink.",
+            "Cross-check edge-case errno with test source and Linux VFS paths before editing kernel code.",
+        ],
+        "linux_refs": ["fs/namei.c", "fs/libfs.c", "fs/inode.c"],
+        "kernel_paths": ["kernel/src/syscall/fs", "kernel/src/file", "kernel/src/pseudofs", "third_party/rust-patches/axfs-ng"],
+    },
+    {
+        "id": "fs-truncate-fallocate",
+        "title": "Truncate, Fallocate, Size, And EOF Semantics",
+        "patterns": ["truncate*", "ftruncate*", "fallocate*", "posix_fallocate*"],
+        "required": [
+            "Update inode size, allocated storage, and cached pages consistently for growth and shrink paths.",
+            "Honor keep-size and unsupported fallocate mode errno behavior where the official testcase checks it.",
+            "Invalidate or zero page-cache ranges past EOF so later reads and stats observe Linux-compatible state.",
+        ],
+        "linux_refs": ["fs/open.c", "mm/truncate.c", "mm/filemap.c", "include/uapi/linux/falloc.h"],
+        "kernel_paths": ["kernel/src/syscall/fs/io.rs", "kernel/src/file", "third_party/rust-patches/axfs-ng/src/highlevel/file.rs"],
+    },
+    {
+        "id": "fs-read-write-copy",
+        "title": "Read, Write, Vector IO, And File Copy Semantics",
+        "patterns": [
+            "read*",
+            "write*",
+            "pread*",
+            "pwrite*",
+            "readv*",
+            "writev*",
+            "preadv*",
+            "pwritev*",
+            "copy_file_range*",
+            "sendfile*",
+            "splice*",
+            "tee*",
+        ],
+        "required": [
+            "Preserve Linux-compatible short IO, offset update, bad fd, bad buffer, and vector validation behavior.",
+            "Keep direct IO, buffered IO, and page-cache visibility coherent for later reads and stats.",
+            "Check Linux fallback behavior for copy-like syscalls before implementing backend shortcuts.",
+        ],
+        "linux_refs": ["fs/read_write.c", "fs/splice.c", "mm/filemap.c"],
+        "kernel_paths": ["kernel/src/syscall/fs/io.rs", "kernel/src/file", "third_party/rust-patches/axfs-ng"],
+    },
+    {
+        "id": "fs-stat-directory-xattr",
+        "title": "Stat, Directory, Filesystem Info, And Xattr Semantics",
+        "patterns": [
+            "stat*",
+            "fstat*",
+            "lstat*",
+            "statx*",
+            "newfstatat*",
+            "getdents*",
+            "readdir*",
+            "statfs*",
+            "fstatfs*",
+            "*xattr*",
+        ],
+        "required": [
+            "Return stable Linux-like metadata fields, masks, mode bits, nlink, timestamps, sizes, and filesystem info.",
+            "Make directory iteration offsets and end-of-directory behavior repeatable across libc variants.",
+            "Treat unsupported xattr and statx feature combinations with Linux-compatible errno or mask behavior.",
+        ],
+        "linux_refs": ["fs/stat.c", "fs/readdir.c", "fs/statfs.c", "fs/xattr.c"],
+        "kernel_paths": ["kernel/src/syscall/fs", "kernel/src/file", "kernel/src/pseudofs"],
+    },
+    {
+        "id": "fs-sync-cache-mmap",
+        "title": "Sync, Page Cache, Readahead, And Mmap File Semantics",
+        "patterns": ["fsync*", "fdatasync*", "sync*", "syncfs*", "msync*", "mmap*", "munmap*", "mincore*", "readahead*", "ioctl*"],
+        "required": [
+            "Keep dirty data, page-cache invalidation, mmap visibility, and sync ordering coherent.",
+            "Avoid deadlocks or lost dirty state in global page-cache flush and reclaim paths.",
+            "Map unsupported device or ioctl cases to Linux-compatible errno instead of panicking.",
+        ],
+        "linux_refs": ["fs/sync.c", "mm/filemap.c", "mm/mmap.c", "mm/readahead.c", "fs/ioctl.c"],
+        "kernel_paths": ["kernel/src/mm", "kernel/src/syscall/fs", "kernel/src/file", "third_party/rust-patches/axfs-ng"],
+    },
+    {
+        "id": "process-signal-time",
+        "title": "Process, Signal, Time, And Scheduler-Visible Semantics",
+        "patterns": [
+            "clone*",
+            "fork*",
+            "exec*",
+            "wait*",
+            "kill*",
+            "signal*",
+            "sig*",
+            "clock*",
+            "timer*",
+            "nanosleep*",
+            "futex*",
+            "sched*",
+        ],
+        "required": [
+            "Preserve Linux-visible process, signal, wait, timer, and futex contracts across libc variants.",
+            "Treat timeout, wakeup, restart, and errno behavior as correctness and performance-sensitive.",
+        ],
+        "linux_refs": ["kernel/fork.c", "kernel/signal.c", "kernel/time", "kernel/futex"],
+        "kernel_paths": ["kernel/src/task", "kernel/src/syscall", "kernel/src/mm"],
+    },
+]
+
+
+def rel_to_repo(path: Path) -> str:
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def campaign_path(name_or_path: str) -> Path:
+    path = Path(name_or_path).expanduser()
+    if path.is_absolute() or path.parent != Path("."):
+        return path
+    return CAMPAIGN_DIR / name_or_path
+
+
+def campaign_manifest_path(path: Path) -> Path:
+    return path / "manifest.json"
+
+
+def load_campaign(name_or_path: str) -> tuple[Path, dict[str, Any]]:
+    path = campaign_path(name_or_path)
+    manifest_path = campaign_manifest_path(path)
+    if not manifest_path.is_file():
+        die(f"campaign manifest not found: {manifest_path}")
+    return path, read_json(manifest_path)
+
+
+def save_campaign(path: Path, manifest: dict[str, Any]) -> None:
+    manifest["updated_at"] = iso_now()
+    write_json(campaign_manifest_path(path), manifest)
+
+
+def testcase_source_dirs(source_root: Path | None) -> list[Path]:
+    dirs: list[Path] = []
+    for root in candidate_testsuite_sources(source_root):
+        for candidate in (
+            root / "ltp-full-20240524" / "testcases",
+            root / "ltp" / "testcases",
+            root / "testcases",
+        ):
+            if candidate.is_dir() and candidate not in dirs:
+                dirs.append(candidate)
+    return dirs
+
+
+def build_test_source_index(source_root: Path | None) -> dict[str, list[Path]]:
+    index: dict[str, list[Path]] = {}
+    for base in testcase_source_dirs(source_root):
+        for path in base.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix and path.suffix not in {".c", ".h", ".sh", ".py", ".pl", ".txt"}:
+                continue
+            keys = {path.name, path.stem}
+            for key in keys:
+                index.setdefault(key, []).append(path)
+    for key in list(index):
+        index[key] = sorted(index[key])[:8]
+    return index
+
+
+def find_test_sources(index: dict[str, list[Path]], marker: str, exec_name: str) -> list[str]:
+    found: list[Path] = []
+    for key in (marker, exec_name, f"{marker}.c", f"{exec_name}.c", f"{marker}.sh", f"{exec_name}.sh"):
+        for path in index.get(key, []):
+            if path not in found:
+                found.append(path)
+    return [rel_to_repo(path) for path in found[:10]]
+
+
+def semantic_for_case(marker: str, exec_name: str) -> dict[str, Any]:
+    keys = [marker, exec_name]
+    for semantic in SEMANTIC_DEFS:
+        for pattern in semantic["patterns"]:
+            if any(fnmatch.fnmatch(key, pattern) for key in keys):
+                return semantic
+    return {
+        "id": "general-linux-abi",
+        "title": "General Linux ABI Semantics",
+        "patterns": [],
+        "required": [
+            "Read the testcase source and Linux behavior before implementation.",
+            "Prefer subsystem-level Linux-compatible behavior over per-case special handling.",
+            "Record the concrete syscall, errno, metadata, or timing contract that the case checks.",
+        ],
+        "linux_refs": ["kernel", "fs", "mm", "include/uapi"],
+        "kernel_paths": ["kernel/src"],
+    }
+
+
+def linux_ref_paths(root: Path, refs: list[str]) -> list[str]:
+    paths: list[str] = []
+    for ref in refs:
+        path = root / ref
+        paths.append(rel_to_repo(path) if path.exists() else str(path))
+    return paths
+
+
+def campaign_candidate_records(campaign_dir: Path, inv: dict[str, Any] | None, source_root: Path | None) -> list[dict[str, Any]]:
+    list_path = campaign_dir / "candidates.txt"
+    items = parse_test_list(list_path)
+    runtest_by_line: dict[str, dict[str, Any]] = {}
+    if inv:
+        for entry in inv.get("source_runtest", {}).get("entries_data", []):
+            runtest_by_line.setdefault(entry.get("line", ""), entry)
+    source_index = build_test_source_index(source_root)
+    records: list[dict[str, Any]] = []
+    for item in items:
+        line = item["line"].strip()
+        runtest_entry = runtest_by_line.get(line, {})
+        exec_name = runtest_entry.get("exec") or (item["tokens"][1] if len(item["tokens"]) > 1 else item["marker"])
+        semantic = semantic_for_case(item["marker"], exec_name)
+        records.append(
+            {
+                "marker": item["marker"],
+                "exec": exec_name,
+                "line": line,
+                "line_no": item["line_no"],
+                "runtest": runtest_entry.get("runtest", ""),
+                "runtest_line_no": runtest_entry.get("line_no"),
+                "semantic": semantic["id"],
+                "test_sources": find_test_sources(source_index, item["marker"], exec_name),
+            }
+        )
+    return records
+
+
+def write_campaign_readme(campaign_dir: Path, manifest: dict[str, Any]) -> None:
+    name = manifest["name"]
+    text = f"""# {name}
+
+Goal: {manifest.get("goal", "")}
+
+This campaign fixes real kernel behavior for a fixed LTP candidate batch. Do
+not add or remove cases while implementing semantics; create a new campaign for
+the next batch.
+
+## Files
+
+- `manifest.json`: campaign settings, associated runs, and finish status.
+- `candidates.txt`: fixed LTP test list for this batch.
+- `cases.jsonl`: candidate metadata, source pointers, and semantic bucket.
+- `semantics/*.md`: short implementation prompts tied to testcase and Linux behavior.
+- `implementation.md`: ledger for kernel changes and cross-check notes.
+- `analysis.json` and `taxonomy.md`: generated after `campaign analyze` or `campaign finish`.
+- `promotable.txt`: generated case lines that have all required pass evidence.
+
+## Commands
+
+```bash
+./scripts/oscomp.sh lab campaign status {name}
+make kernels
+make dev-shell DEV_CMD='./scripts/oscomp.sh lab campaign run {name} --skip-kernel-build'
+./scripts/oscomp.sh lab campaign analyze {name}
+./scripts/oscomp.sh lab campaign finish {name}
+```
+
+Promotion still requires all required rv/la x glibc/musl parser `pass` evidence.
+"""
+    (campaign_dir / "README.md").write_text(text, encoding="utf-8")
+
+
+def write_semantic_cards(campaign_dir: Path, records: list[dict[str, Any]], linux_ref: Path) -> None:
+    semantics_dir = campaign_dir / "semantics"
+    semantics_dir.mkdir(parents=True, exist_ok=True)
+    by_semantic: dict[str, list[dict[str, Any]]] = {}
+    semantic_defs = {item["id"]: item for item in SEMANTIC_DEFS}
+    for record in records:
+        by_semantic.setdefault(record["semantic"], []).append(record)
+    for semantic_id, items in sorted(by_semantic.items()):
+        semantic = semantic_defs.get(semantic_id) or semantic_for_case("", "")
+        case_lines = "\n".join(f"- `{item['marker']}`: `{item['line']}`" for item in items)
+        source_lines = []
+        seen_sources: set[str] = set()
+        for item in items:
+            for source in item.get("test_sources", []):
+                if source in seen_sources:
+                    continue
+                seen_sources.add(source)
+                source_lines.append(f"- `{source}`")
+        if not source_lines:
+            source_lines.append("- Fill after reading the testcase source.")
+        required_lines = "\n".join(f"- {line}" for line in semantic["required"])
+        linux_lines = "\n".join(f"- `{path}`" for path in linux_ref_paths(linux_ref, semantic["linux_refs"]))
+        kernel_lines = "\n".join(f"- `{path}`" for path in semantic["kernel_paths"])
+        text = f"""# {semantic['title']}
+
+## Cases
+
+{case_lines}
+
+## Test Sources
+
+{chr(10).join(source_lines)}
+
+## Linux References
+
+{linux_lines}
+
+## Required Semantics
+
+{required_lines}
+
+## Kernel Paths To Read
+
+{kernel_lines}
+
+## Implementation Notes
+
+- Write the real subsystem behavior that satisfies this semantic bucket.
+- Cross-check testcase expectations against Linux behavior before editing shared code.
+- Keep promotion evidence separate from canary or partial runs.
+"""
+        (semantics_dir / f"{semantic_id}.md").write_text(text, encoding="utf-8")
+
+
+def write_implementation_template(campaign_dir: Path, records: list[dict[str, Any]]) -> None:
+    semantic_ids = sorted({record["semantic"] for record in records})
+    sections = []
+    for semantic_id in semantic_ids:
+        sections.append(
+            f"""## {semantic_id}
+
+Changed Files:
+- Fill in touched kernel/framework files.
+
+Behavior Implemented:
+- Fill in the Linux-visible behavior implemented for this semantic bucket.
+
+Testcase Cross-Checks:
+- Fill in testcase source files and checked expectations.
+
+Linux Reference Cross-Checks:
+- Fill in Linux reference files/functions and observed behavior.
+
+Residual Risk:
+- Fill in remaining risk or follow-up cases.
+"""
+        )
+    text = "# Implementation Ledger\n\n" + "\n".join(sections)
+    (campaign_dir / "implementation.md").write_text(text, encoding="utf-8")
+
+
+def write_initial_taxonomy(campaign_dir: Path) -> None:
+    text = """# Failure Taxonomy
+
+Run `./scripts/oscomp.sh lab campaign analyze <name>` after a matrix run to
+replace this placeholder with observed pass/fail/panic/timeout buckets.
+"""
+    (campaign_dir / "taxonomy.md").write_text(text, encoding="utf-8")
+
+
+def campaign_create_cmd(args: argparse.Namespace) -> None:
+    ensure_dirs()
+    name = args.name
+    campaign_dir = campaign_path(name)
+    if campaign_dir.exists() and not args.replace:
+        die(f"campaign already exists: {campaign_dir}; pass --replace or choose another name")
+    if campaign_dir.exists():
+        shutil.rmtree(campaign_dir)
+    campaign_dir.mkdir(parents=True)
+
+    list_path = campaign_dir / "candidates.txt"
+    generate_list(
+        argparse.Namespace(
+            inventory=args.inventory,
+            arch=args.arch,
+            libc=args.libc,
+            mode=args.mode,
+            case=args.case,
+            runtest=args.runtest,
+            include=args.include,
+            exclude=args.exclude,
+            shuffle=args.shuffle,
+            seed=args.seed,
+            offset=args.offset,
+            limit=args.limit,
+            name=name,
+            output=str(list_path),
+        )
+    )
+    inv: dict[str, Any] | None = None
+    if args.inventory or INVENTORY_PATH.is_file():
+        inv = load_inventory(args.inventory)
+    source_root = Path(args.testsuite_source).expanduser() if args.testsuite_source else None
+    linux_ref = Path(args.linux_ref).expanduser() if args.linux_ref else DEFAULT_LINUX_REF
+    records = campaign_candidate_records(campaign_dir, inv, source_root)
+    write_cases_jsonl(campaign_dir / "cases.jsonl", records)
+    semantic_counts: dict[str, int] = {}
+    for record in records:
+        semantic_counts[record["semantic"]] = semantic_counts.get(record["semantic"], 0) + 1
+    manifest = {
+        "name": name,
+        "created_at": iso_now(),
+        "updated_at": iso_now(),
+        "goal": args.goal,
+        "risk": args.risk,
+        "repo_root": str(REPO_ROOT),
+        "inventory": str(Path(args.inventory).expanduser()) if args.inventory else str(INVENTORY_PATH),
+        "linux_ref": str(linux_ref),
+        "testsuite_source": str(source_root) if source_root else "",
+        "candidate_list": "candidates.txt",
+        "candidate_count": len(records),
+        "semantic_counts": semantic_counts,
+        "generation": {
+            "mode": generation_mode_for(args),
+            "arches": canonical_arches(args.arch),
+            "libcs": canonical_libcs(args.libc),
+            "runtest": split_csv(args.runtest),
+            "include": split_csv(args.include),
+            "exclude": split_csv(args.exclude),
+            "limit": args.limit,
+            "offset": args.offset,
+            "shuffle": args.shuffle,
+            "seed": args.seed,
+        },
+        "runs": [],
+        "status": "created",
+    }
+    save_campaign(campaign_dir, manifest)
+    write_campaign_readme(campaign_dir, manifest)
+    write_semantic_cards(campaign_dir, records, linux_ref)
+    write_implementation_template(campaign_dir, records)
+    write_initial_taxonomy(campaign_dir)
+    log(f"created campaign {name} with {len(records)} cases at {campaign_dir}")
+
+
+def latest_campaign_run(manifest: dict[str, Any]) -> str | None:
+    runs = manifest.get("runs") or []
+    if not runs:
+        return None
+    return str(runs[-1].get("run_id") or "")
+
+
+def campaign_run_args(args: argparse.Namespace, campaign_dir: Path, manifest: dict[str, Any], run_id: str) -> argparse.Namespace:
+    generation = manifest.get("generation", {})
+    return argparse.Namespace(
+        inventory=args.inventory or manifest.get("inventory") or None,
+        arch=args.arch or generation.get("arches") or ["both"],
+        libc=args.libc or generation.get("libcs") or ["both"],
+        mode="cases",
+        case=None,
+        runtest=None,
+        include=None,
+        exclude=None,
+        shuffle=False,
+        seed=1,
+        offset=0,
+        limit=None,
+        test_list=str(campaign_dir / manifest.get("candidate_list", "candidates.txt")),
+        plan=args.plan,
+        name=run_id,
+        replace=args.replace,
+        image=args.image,
+        timeout=args.timeout,
+        parallel=args.parallel,
+        split_combos=args.split_combos,
+        jobs=args.jobs,
+        no_parallel=args.no_parallel,
+        case_timeout=args.case_timeout,
+        task_timeout=args.task_timeout,
+        ltp_order=args.ltp_order,
+        ltp_budget=args.ltp_budget,
+        glibc_budget=args.glibc_budget,
+        musl_budget=args.musl_budget,
+        env=args.env,
+        skip_kernel_build=args.skip_kernel_build,
+        rebuild_kernels=args.rebuild_kernels,
+        prepare_only=args.prepare_only,
+        fail_fast=args.fail_fast,
+    )
+
+
+def campaign_run_cmd(args: argparse.Namespace) -> None:
+    campaign_dir, manifest = load_campaign(args.name)
+    run_id = args.run_name or f"{manifest['name']}-run-{len(manifest.get('runs') or []) + 1:04d}"
+    run_entry = {
+        "run_id": run_id,
+        "started_at": iso_now(),
+        "status": "started",
+        "path": str(RUN_DIR / run_id),
+    }
+    manifest.setdefault("runs", []).append(run_entry)
+    manifest["status"] = "running"
+    save_campaign(campaign_dir, manifest)
+    try:
+        run_experiment(campaign_run_args(args, campaign_dir, manifest, run_id))
+    except SystemExit as exc:
+        run_entry["ended_at"] = iso_now()
+        run_entry["status"] = "failed"
+        run_entry["exit"] = exc.code
+        save_campaign(campaign_dir, manifest)
+        raise
+    run_entry["ended_at"] = iso_now()
+    run_entry["status"] = "completed"
+    manifest["status"] = "ran"
+    save_campaign(campaign_dir, manifest)
+    log(f"campaign {manifest['name']} recorded run {run_id}")
+
+
+def campaign_status_cmd(args: argparse.Namespace) -> None:
+    campaign_dir, manifest = load_campaign(args.name)
+    print(f"campaign: {manifest.get('name')}")
+    print(f"path: {campaign_dir}")
+    print(f"status: {manifest.get('status')}")
+    print(f"cases: {manifest.get('candidate_count', 0)}")
+    print(f"goal: {manifest.get('goal', '')}")
+    print("semantics:")
+    for semantic, count in sorted((manifest.get("semantic_counts") or {}).items()):
+        print(f"  {semantic}: {count}")
+    print("runs:")
+    for run in manifest.get("runs") or []:
+        print(f"  {run.get('run_id')}: {run.get('status')} {run.get('path')}")
+    analysis_path = campaign_dir / "analysis.json"
+    if analysis_path.is_file():
+        analysis = read_json(analysis_path)
+        print(
+            "analysis: "
+            f"promotable={analysis.get('promotable_count', 0)} "
+            f"blocked={analysis.get('blocked_count', 0)} "
+            f"runs={','.join(analysis.get('runs', []))}"
+        )
+
+
+def campaign_list_cmd(args: argparse.Namespace) -> None:
+    ensure_dirs()
+    campaigns = children_for_cleanup(CAMPAIGN_DIR, dirs_only=True)
+    for path in sorted(campaigns, key=newest_mtime, reverse=True):
+        manifest_path = campaign_manifest_path(path)
+        if not manifest_path.is_file():
+            continue
+        manifest = read_json(manifest_path)
+        print(
+            f"{manifest.get('name', path.name)} "
+            f"status={manifest.get('status', '')} "
+            f"cases={manifest.get('candidate_count', 0)} "
+            f"runs={len(manifest.get('runs') or [])} "
+            f"updated={manifest.get('updated_at', '')}"
+        )
+
+
+def campaign_required_combos(args: argparse.Namespace) -> list[str]:
+    return split_csv(getattr(args, "require", None)) or all_combos()
+
+
+def campaign_run_dirs(manifest: dict[str, Any], selected: list[str] | None = None) -> list[Path]:
+    wanted = set(selected or [])
+    run_dirs: list[Path] = []
+    for run in manifest.get("runs") or []:
+        run_id = str(run.get("run_id") or "")
+        if wanted and run_id not in wanted:
+            continue
+        path = Path(run.get("path") or RUN_DIR / run_id).expanduser()
+        if path.is_dir():
+            run_dirs.append(path)
+    return run_dirs
+
+
+def failure_bucket_for(case: str, statuses: dict[str, str], semantic: str) -> str:
+    values = set(statuses.values())
+    if "panic" in values:
+        return "panic-frontier"
+    if "timeout" in values:
+        return "timeout-or-heavy-io"
+    if "missing" in values or "incomplete" in values:
+        return "missing-or-incomplete-evidence"
+    if any(value in {"fail", "nonzero"} for value in values):
+        return semantic or "linux-abi-mismatch"
+    if values <= {"pass", "silent-pass"}:
+        return "promotable-or-silent"
+    return "unknown"
+
+
+def write_campaign_analysis(
+    campaign_dir: Path,
+    manifest: dict[str, Any],
+    run_dirs: list[Path],
+    required: list[str],
+    *,
+    allow_silent_pass: bool,
+    persist: bool = True,
+) -> dict[str, Any]:
+    candidate_list = campaign_dir / manifest.get("candidate_list", "candidates.txt")
+    candidates = parse_test_list(candidate_list)
+    candidate_records = {record["marker"]: record for record in read_cases_jsonl(campaign_dir / "cases.jsonl")}
+    passing_statuses = {"pass"}
+    if allow_silent_pass:
+        passing_statuses.add("silent-pass")
+    evidence = collect_case_evidence(run_dirs, required, passing_statuses)
+    promoted = promotable_cases(evidence, required, passing_statuses)
+    line_by_case = load_run_list_lines(run_dirs)
+    for item in candidates:
+        line_by_case[item["marker"]] = item["line"].strip()
+    cases: list[dict[str, Any]] = []
+    bucket_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    promotable_lines: list[str] = []
+    for item in candidates:
+        marker = item["marker"]
+        statuses = {combo: case_combo_status(evidence, marker, combo) for combo in required}
+        for status in statuses.values():
+            status_counts[status] = status_counts.get(status, 0) + 1
+        semantic = (candidate_records.get(marker) or {}).get("semantic", "")
+        bucket = failure_bucket_for(marker, statuses, semantic)
+        bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+        is_promotable = marker in promoted
+        if is_promotable:
+            promotable_lines.append(line_by_case.get(marker, marker))
+        cases.append(
+            {
+                "case": marker,
+                "line": line_by_case.get(marker, marker),
+                "semantic": semantic,
+                "statuses": statuses,
+                "bucket": bucket,
+                "promotable": is_promotable,
+            }
+        )
+    analysis = {
+        "campaign": manifest["name"],
+        "generated_at": iso_now(),
+        "runs": [path.name for path in run_dirs],
+        "required": required,
+        "allow_silent_pass": allow_silent_pass,
+        "candidate_count": len(candidates),
+        "promotable_count": len(promotable_lines),
+        "blocked_count": len(candidates) - len(promotable_lines),
+        "status_counts": status_counts,
+        "bucket_counts": bucket_counts,
+        "cases": cases,
+    }
+    if persist:
+        write_json(campaign_dir / "analysis.json", analysis)
+        (campaign_dir / "promotable.txt").write_text(
+            "\n".join(promotable_lines) + ("\n" if promotable_lines else ""),
+            encoding="utf-8",
+        )
+        write_campaign_taxonomy(campaign_dir, analysis)
+    return analysis
+
+
+def write_campaign_taxonomy(campaign_dir: Path, analysis: dict[str, Any]) -> None:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for case in analysis.get("cases", []):
+        grouped.setdefault(case.get("bucket", "unknown"), []).append(case)
+    lines = [
+        "# Failure Taxonomy",
+        "",
+        f"Campaign: `{analysis.get('campaign')}`",
+        f"Runs: `{', '.join(analysis.get('runs', []))}`",
+        f"Candidates: {analysis.get('candidate_count', 0)}",
+        f"Promotable: {analysis.get('promotable_count', 0)}",
+        f"Blocked: {analysis.get('blocked_count', 0)}",
+        "",
+        "## Buckets",
+        "",
+    ]
+    for bucket, items in sorted(grouped.items(), key=lambda pair: (-len(pair[1]), pair[0])):
+        lines.append(f"### {bucket} ({len(items)})")
+        lines.append("")
+        for item in items[:200]:
+            statuses = " ".join(f"{combo}={status}" for combo, status in item.get("statuses", {}).items())
+            lines.append(f"- `{item.get('case')}` [{item.get('semantic', '')}] {statuses}")
+        if len(items) > 200:
+            lines.append(f"- ... {len(items) - 200} more")
+        lines.append("")
+    (campaign_dir / "taxonomy.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def campaign_analyze_cmd(args: argparse.Namespace) -> None:
+    campaign_dir, manifest = load_campaign(args.name)
+    selected = split_csv(args.run)
+    if not selected and args.latest:
+        latest = latest_campaign_run(manifest)
+        selected = [latest] if latest else []
+    run_dirs = campaign_run_dirs(manifest, selected or None)
+    if not run_dirs:
+        die("campaign has no matching run directories to analyze")
+    analysis = write_campaign_analysis(
+        campaign_dir,
+        manifest,
+        run_dirs,
+        campaign_required_combos(args),
+        allow_silent_pass=args.allow_silent_pass,
+    )
+    manifest["status"] = "analyzed"
+    manifest["last_analysis"] = "analysis.json"
+    save_campaign(campaign_dir, manifest)
+    log(
+        f"analyzed campaign {manifest['name']}: "
+        f"promotable={analysis['promotable_count']} blocked={analysis['blocked_count']}"
+    )
+
+
+def campaign_promote_cmd(args: argparse.Namespace) -> None:
+    campaign_dir, manifest = load_campaign(args.name)
+    selected = split_csv(args.run)
+    run_dirs = campaign_run_dirs(manifest, selected or None)
+    if not run_dirs:
+        die("campaign has no matching run directories to promote from")
+    output = Path(args.output).expanduser() if args.output else campaign_dir / "promoted-ltp_test.txt"
+    promote_cmd(
+        argparse.Namespace(
+            run_dir=[str(path) for path in run_dirs],
+            require=args.require,
+            test_list=str(campaign_dir / manifest.get("candidate_list", "candidates.txt")),
+            base=args.base,
+            output=str(output),
+            allow_silent_pass=args.allow_silent_pass,
+            dry_run=args.dry_run,
+            explain=args.explain,
+            show_missing=args.show_missing,
+            status_matrix=args.status_matrix,
+        )
+    )
+    if args.apply_root and not args.dry_run:
+        shutil.copyfile(output, DEFAULT_TEST_LIST)
+        log(f"applied promoted list to {DEFAULT_TEST_LIST}")
+    manifest["last_promoted_list"] = str(output)
+    save_campaign(campaign_dir, manifest)
+
+
+def cleanup_heavy_run_artifacts(run_dirs: list[Path], *, dry_run: bool) -> list[str]:
+    targets: list[Path] = []
+    for run_dir in run_dirs:
+        for image in run_dir.rglob("support.img"):
+            add_cleanup_target(targets, image)
+        for workdir in run_dir.rglob("work"):
+            if workdir.is_dir():
+                add_cleanup_target(targets, workdir)
+    removed: list[str] = []
+    for target in collapse_cleanup_targets(targets):
+        if not target.exists():
+            continue
+        removed.append(str(target))
+        if dry_run:
+            print(f"{target} [{'dir' if target.is_dir() else 'file'}, {format_bytes(path_size(target))}]")
+        elif target.is_dir():
+            shutil.rmtree(target)
+            log(f"removed {target}")
+        else:
+            target.unlink()
+            log(f"removed {target}")
+    return removed
+
+
+def campaign_finish_cmd(args: argparse.Namespace) -> None:
+    campaign_dir, manifest = load_campaign(args.name)
+    selected = split_csv(args.run)
+    run_dirs = campaign_run_dirs(manifest, selected or None)
+    if run_dirs:
+        analysis = write_campaign_analysis(
+            campaign_dir,
+            manifest,
+            run_dirs,
+            campaign_required_combos(args),
+            allow_silent_pass=args.allow_silent_pass,
+            persist=not args.dry_run,
+        )
+    else:
+        analysis = {}
+    cleaned: list[str] = []
+    if not args.no_clean:
+        cleaned = cleanup_heavy_run_artifacts(run_dirs, dry_run=args.dry_run)
+    cleanup_label = "Heavy artifacts selected for cleanup" if args.dry_run else "Heavy artifacts cleaned"
+    final_lines = [
+        "# Campaign Finish",
+        "",
+        f"Campaign: `{manifest.get('name')}`",
+        f"Finished: `{iso_now()}`",
+        f"Runs: `{', '.join(path.name for path in run_dirs)}`",
+        f"Promotable: {analysis.get('promotable_count', 0)}",
+        f"Blocked: {analysis.get('blocked_count', 0)}",
+        f"{cleanup_label}: {len(cleaned)}",
+        "",
+        "Evidence files retained: `console.log`, `cases.jsonl`, `summary.json`, `combined-summary.json`, `analysis.json`, `taxonomy.md`.",
+    ]
+    if args.dry_run:
+        print("\n".join(["# Campaign Finish Dry Run", *final_lines[1:], "", "No campaign metadata was updated."]))
+        return
+    (campaign_dir / "finish.md").write_text("\n".join(final_lines) + "\n", encoding="utf-8")
+    manifest["status"] = "finished"
+    manifest["finished_at"] = iso_now()
+    manifest["last_analysis"] = "analysis.json" if analysis else manifest.get("last_analysis", "")
+    manifest["cleaned_heavy_artifacts"] = cleaned
+    save_campaign(campaign_dir, manifest)
+    log(f"finished campaign {manifest['name']}")
+
+
+def campaign_clean_cmd(args: argparse.Namespace) -> None:
+    campaign_dir, manifest = load_campaign(args.name)
+    targets: list[Path] = []
+    if args.heavy:
+        cleanup_heavy_run_artifacts(campaign_run_dirs(manifest, split_csv(args.run) or None), dry_run=args.dry_run)
+    if args.runs:
+        for run_dir in campaign_run_dirs(manifest, split_csv(args.run) or None):
+            add_cleanup_target(targets, run_dir)
+    if args.campaign:
+        add_cleanup_target(targets, campaign_dir)
+    for target in collapse_cleanup_targets(targets):
+        if not target.exists():
+            continue
+        if args.dry_run:
+            print(f"{target} [{'dir' if target.is_dir() else 'file'}, {format_bytes(path_size(target))}]")
+        elif target.is_dir():
+            shutil.rmtree(target)
+            log(f"removed {target}")
+        else:
+            target.unlink()
+            log(f"removed {target}")
 
 
 def bootstrap_cmd(args: argparse.Namespace) -> None:
@@ -1191,7 +2848,17 @@ def run_failed(run_dir: Path) -> bool:
         failed_arches = data.get("failed_arches") or {}
         if failed_arches:
             return True
+        if data.get("failed_tasks") or data.get("cancelled_tasks"):
+            return True
         for code in (data.get("exit_codes") or {}).values():
+            try:
+                if int(code) != 0:
+                    return True
+            except (TypeError, ValueError):
+                return True
+        for code in (data.get("task_exit_codes") or {}).values():
+            if code is None:
+                continue
             try:
                 if int(code) != 0:
                     return True
@@ -1289,6 +2956,8 @@ def clean_cmd(args: argparse.Namespace) -> None:
             args.empty_runs,
             args.lists,
             args.plans,
+            args.campaigns,
+            bool(args.campaign),
             args.inventory,
             args.images,
             args.cache,
@@ -1313,6 +2982,8 @@ def clean_cmd(args: argparse.Namespace) -> None:
         args.plans = True
     if args.cache or args.all:
         args.images = True
+    if args.all:
+        args.campaigns = True
 
     if args.runs:
         for run_dir in apply_time_filters(
@@ -1340,6 +3011,11 @@ def clean_cmd(args: argparse.Namespace) -> None:
     if args.plans:
         for item in apply_time_filters(children_for_cleanup(PLAN_DIR), older_than=args.older_than, keep=None):
             add_cleanup_target(targets, item)
+    if args.campaigns:
+        for item in apply_time_filters(children_for_cleanup(CAMPAIGN_DIR, dirs_only=True), older_than=args.older_than, keep=None):
+            add_cleanup_target(targets, item)
+    for campaign_name in split_csv(args.campaign):
+        add_cleanup_target(targets, campaign_path(campaign_name))
     if args.images:
         for item in apply_time_filters(children_for_cleanup(IMAGE_CACHE_DIR), older_than=args.older_than, keep=None):
             add_cleanup_target(targets, item)
@@ -1348,8 +3024,13 @@ def clean_cmd(args: argparse.Namespace) -> None:
             add_cleanup_target(targets, item)
     if args.support_images:
         for run_dir in children_for_cleanup(RUN_DIR, dirs_only=True):
-            image = run_dir / "support.img"
-            if image.exists():
+            images = [run_dir / "support.img"]
+            tasks_dir = run_dir / "tasks"
+            if tasks_dir.is_dir():
+                images.extend(sorted(tasks_dir.glob("*/support.img")))
+            for image in images:
+                if not image.exists():
+                    continue
                 if args.older_than:
                     cutoff = _dt.datetime.now().timestamp() - parse_duration(args.older_than)
                     if newest_mtime(image) >= cutoff:
@@ -1357,8 +3038,11 @@ def clean_cmd(args: argparse.Namespace) -> None:
                 add_cleanup_target(targets, image)
     if args.workdirs:
         for run_dir in children_for_cleanup(RUN_DIR, dirs_only=True):
-            for arch in ARCHES:
-                workdir = run_dir / arch / "work"
+            workdirs = [run_dir / arch / "work" for arch in ARCHES]
+            tasks_dir = run_dir / "tasks"
+            if tasks_dir.is_dir():
+                workdirs.extend(sorted(tasks_dir.glob("*/work")))
+            for workdir in workdirs:
                 if not workdir.exists():
                     continue
                 if args.older_than:
@@ -1367,7 +3051,7 @@ def clean_cmd(args: argparse.Namespace) -> None:
                         continue
                 add_cleanup_target(targets, workdir)
     if args.smoke:
-        for base in (LIST_DIR, PLAN_DIR, RUN_DIR):
+        for base in (LIST_DIR, PLAN_DIR, RUN_DIR, CAMPAIGN_DIR):
             for item in children_for_cleanup(base):
                 if "smoke" in item.name.lower():
                     add_cleanup_target(targets, item)
@@ -1375,7 +3059,7 @@ def clean_cmd(args: argparse.Namespace) -> None:
     if not targets and not requested:
         die(
             "clean requires a target such as --generated, --runs, --run NAME, "
-            "--failed-runs, --empty-runs, --cache, --lab, --legacy-root, or --all"
+            "--failed-runs, --empty-runs, --campaigns, --cache, --lab, --legacy-root, or --all"
         )
     if not targets:
         log("nothing to clean")
@@ -1414,6 +3098,7 @@ def audit_cmd(args: argparse.Namespace) -> None:
         checks.append(("lab_runs", str(len(children_for_cleanup(RUN_DIR, dirs_only=True)))))
         checks.append(("lab_lists", str(len(children_for_cleanup(LIST_DIR)))))
         checks.append(("lab_plans", str(len(children_for_cleanup(PLAN_DIR)))))
+        checks.append(("lab_campaigns", str(len(children_for_cleanup(CAMPAIGN_DIR, dirs_only=True)))))
         checks.append(("lab_images", str(len(children_for_cleanup(IMAGE_CACHE_DIR)))))
     build_state = [path.name for path in BUILD_STATE_DIRS if path.exists()]
     checks.append(("build_state", ",".join(build_state) if build_state else "absent"))
@@ -1424,7 +3109,7 @@ def audit_cmd(args: argparse.Namespace) -> None:
     checks.append(("stale_docs", ",".join(stale_docs) if stale_docs else "absent"))
     smoke_state: list[str] = []
     if STATE_DIR.exists():
-        for base in (LIST_DIR, PLAN_DIR, RUN_DIR):
+        for base in (LIST_DIR, PLAN_DIR, RUN_DIR, CAMPAIGN_DIR):
             if not base.exists():
                 continue
             for item in base.rglob("*"):
@@ -1505,6 +3190,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--replace", action="store_true")
     p.add_argument("--image", help="official image override, only for single-arch runs")
     p.add_argument("--timeout", type=int, default=7000)
+    p.add_argument("--parallel", choices=["arch", "combo", "serial"], default="arch", help="matrix execution mode, default arch")
+    p.add_argument("--split-combos", action="store_true", help="run each selected arch/libc combo as its own task")
+    p.add_argument("--jobs", default="auto", help="parallel task slots: auto or a positive integer")
+    p.add_argument("--no-parallel", action="store_true", help="equivalent to --parallel serial --jobs 1")
+    p.add_argument("--case-timeout", type=int, help="per-LTP-case timeout inside the guest; 0 disables")
+    p.add_argument("--task-timeout", type=int, help="per-QEMU-task timeout; defaults to --timeout")
     p.add_argument("--ltp-order", choices=["glibc-first", "musl-first"], default="glibc-first")
     p.add_argument("--ltp-budget", type=int)
     p.add_argument("--glibc-budget", type=int)
@@ -1536,10 +3227,126 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("promote", help="merge stable passing cases into a new LTP list")
     p.add_argument("run_dir", nargs="+")
     p.add_argument("--require", action="append", help="required combo such as rv/glibc, default all four")
+    p.add_argument("--test-list", help="candidate list used for explain/status output")
     p.add_argument("--base", help="base list, default ltp_test.txt")
     p.add_argument("--output", required=True)
     p.add_argument("--allow-silent-pass", action="store_true", help="also promote silent-pass/TCONF-only cases")
+    p.add_argument("--dry-run", action="store_true", help="show what would be promoted without writing output")
+    p.add_argument("--explain", action="store_true", help="print promotable and blocked cases with combo status")
+    p.add_argument("--show-missing", action="store_true", help="with --explain, only show blocked cases that have missing evidence")
+    p.add_argument("--status-matrix", action="store_true", help="alias for explain-style combo status output")
     p.set_defaults(func=promote_cmd)
+
+    p = sub.add_parser("matrix-status", help="show per-case status across arch/libc combos")
+    p.add_argument("run_dir", nargs="+")
+    p.add_argument("--test-list", help="candidate list to order/filter output")
+    p.add_argument("--require", action="append", help="combo filter such as rv/glibc, default all four")
+    p.add_argument("--only-missing", action="store_true", help="only show cases missing at least one selected combo")
+    p.add_argument("--limit", type=int)
+    p.set_defaults(func=matrix_status_cmd)
+
+    p = sub.add_parser("missing-combos", help="write per-combo rerun lists for missing/nonpassing evidence")
+    p.add_argument("run_dir", nargs="+")
+    p.add_argument("--test-list", help="candidate list to check")
+    p.add_argument("--require", action="append", help="combo filter such as rv/glibc, default all four")
+    p.add_argument("--output", required=True, help="output directory")
+    p.add_argument("--allow-silent-pass", action="store_true", help="treat silent-pass as passing evidence")
+    p.set_defaults(func=missing_combos_cmd)
+
+    p = sub.add_parser("reorder", help="sort an LTP list using pass/fail/timing evidence")
+    p.add_argument("--base", required=True, help="base LTP list")
+    p.add_argument("--evidence", action="append", required=True, help="run dir, comma-separated or repeated")
+    p.add_argument("--require", action="append", help="combo filter such as rv/glibc, default all four")
+    p.add_argument("--output", required=True)
+    p.add_argument("--fast-threshold", type=float, default=30.0, help="max per-combo case duration considered fast")
+    p.set_defaults(func=lambda args: reorder_cmd(argparse.Namespace(**{**vars(args), "evidence": split_csv(args.evidence)})))
+
+    p = sub.add_parser("campaign", help="agentic batch workflow for LTP implementation campaigns")
+    campaign_sub = p.add_subparsers(dest="campaign_cmd", required=True)
+
+    c = campaign_sub.add_parser("create", help="create a fixed candidate batch with semantic prompts")
+    c.add_argument("name")
+    add_common_generation_args(c)
+    c.add_argument("--goal", default="LTP semantic expansion campaign")
+    c.add_argument("--risk", choices=["low", "medium", "high"], default="medium")
+    c.add_argument("--testsuite-source", help="testsuits-for-oskernel source checkout")
+    c.add_argument("--linux-ref", help="Linux behavior reference source tree")
+    c.add_argument("--replace", action="store_true")
+    c.set_defaults(func=campaign_create_cmd)
+
+    c = campaign_sub.add_parser("list", help="list local campaigns")
+    c.set_defaults(func=campaign_list_cmd)
+
+    c = campaign_sub.add_parser("status", help="show campaign state")
+    c.add_argument("name")
+    c.set_defaults(func=campaign_status_cmd)
+
+    c = campaign_sub.add_parser("run", help="run the campaign candidate list and record the run")
+    c.add_argument("name")
+    c.add_argument("--run-name", help="explicit run id under .state/ltp-lab/runs")
+    c.add_argument("--inventory", help="inventory JSON path")
+    c.add_argument("--arch", action="append", choices=["rv", "la", "riscv64", "loongarch64", "both"], help="arch set override")
+    c.add_argument("--libc", action="append", choices=["glibc", "musl", "both"], help="libc set override")
+    c.add_argument("--plan", help="existing plan path")
+    c.add_argument("--replace", action="store_true")
+    c.add_argument("--image", help="official image override, only for single-arch runs")
+    c.add_argument("--timeout", type=int, default=7000)
+    c.add_argument("--parallel", choices=["arch", "combo", "serial"], default="arch", help="matrix execution mode, default arch")
+    c.add_argument("--split-combos", action="store_true", help="run each selected arch/libc combo as its own task")
+    c.add_argument("--jobs", default="auto", help="parallel task slots: auto or a positive integer")
+    c.add_argument("--no-parallel", action="store_true", help="equivalent to --parallel serial --jobs 1")
+    c.add_argument("--case-timeout", type=int, help="per-LTP-case timeout inside the guest; 0 disables")
+    c.add_argument("--task-timeout", type=int, help="per-QEMU-task timeout; defaults to --timeout")
+    c.add_argument("--ltp-order", choices=["glibc-first", "musl-first"], default="glibc-first")
+    c.add_argument("--ltp-budget", type=int)
+    c.add_argument("--glibc-budget", type=int)
+    c.add_argument("--musl-budget", type=int)
+    c.add_argument("--env", action="append", help="guest env KEY=VALUE, comma-separated or repeated")
+    c.add_argument("--skip-kernel-build", action="store_true")
+    c.add_argument("--rebuild-kernels", action="store_true")
+    c.add_argument("--prepare-only", action="store_true", help="build list, plan, and support image without QEMU replay")
+    c.add_argument("--fail-fast", action="store_true")
+    c.set_defaults(func=campaign_run_cmd)
+
+    c = campaign_sub.add_parser("analyze", help="classify campaign run evidence")
+    c.add_argument("name")
+    c.add_argument("--run", action="append", help="run id to analyze, comma-separated or repeated")
+    c.add_argument("--latest", action="store_true", help="analyze only the latest recorded run")
+    c.add_argument("--require", action="append", help="required combo such as rv/glibc, default all four")
+    c.add_argument("--allow-silent-pass", action="store_true")
+    c.set_defaults(func=campaign_analyze_cmd)
+
+    c = campaign_sub.add_parser("promote", help="write or apply a promoted list from campaign evidence")
+    c.add_argument("name")
+    c.add_argument("--run", action="append", help="run id to promote from, comma-separated or repeated")
+    c.add_argument("--require", action="append", help="required combo such as rv/glibc, default all four")
+    c.add_argument("--base", help="base list, default ltp_test.txt")
+    c.add_argument("--output", help="output list path, default campaign promoted-ltp_test.txt")
+    c.add_argument("--allow-silent-pass", action="store_true")
+    c.add_argument("--dry-run", action="store_true")
+    c.add_argument("--explain", action="store_true")
+    c.add_argument("--show-missing", action="store_true")
+    c.add_argument("--status-matrix", action="store_true")
+    c.add_argument("--apply-root", action="store_true", help="replace root ltp_test.txt with the promoted output")
+    c.set_defaults(func=campaign_promote_cmd)
+
+    c = campaign_sub.add_parser("finish", help="analyze and clean heavy per-run artifacts while retaining evidence")
+    c.add_argument("name")
+    c.add_argument("--run", action="append", help="run id to include, comma-separated or repeated")
+    c.add_argument("--require", action="append", help="required combo such as rv/glibc, default all four")
+    c.add_argument("--allow-silent-pass", action="store_true")
+    c.add_argument("--no-clean", action="store_true", help="skip automatic support.img/workdir cleanup")
+    c.add_argument("--dry-run", action="store_true")
+    c.set_defaults(func=campaign_finish_cmd)
+
+    c = campaign_sub.add_parser("clean", help="clean campaign-owned state")
+    c.add_argument("name")
+    c.add_argument("--run", action="append", help="run id, comma-separated or repeated")
+    c.add_argument("--heavy", action="store_true", help="remove support.img and QEMU workdirs for campaign runs")
+    c.add_argument("--runs", action="store_true", help="remove campaign run directories")
+    c.add_argument("--campaign", action="store_true", help="remove the campaign directory itself")
+    c.add_argument("--dry-run", action="store_true")
+    c.set_defaults(func=campaign_clean_cmd)
 
     p = sub.add_parser("clean", help="remove lab state or old root artifacts")
     p.add_argument("--lab", action="store_true", help="remove the whole .state/ltp-lab tree")
@@ -1551,6 +3358,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep-runs", type=int, help="when cleaning --runs, keep newest N runs")
     p.add_argument("--lists", action="store_true", help="remove generated LTP lists")
     p.add_argument("--plans", action="store_true", help="remove generated evaluation plans")
+    p.add_argument("--campaigns", action="store_true", help="remove campaign directories")
+    p.add_argument("--campaign", action="append", help="specific campaign name or path, comma-separated or repeated")
     p.add_argument("--inventory", action="store_true", help="remove inventory.json")
     p.add_argument("--images", action="store_true", help="remove cached decompressed official images")
     p.add_argument("--cache", action="store_true", help="remove cacheable lab data such as cached images")

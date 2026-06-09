@@ -224,6 +224,9 @@ build_overlay_tools_for_arch() {
         "$REPO_ROOT/scripts/support-tools/tar.c" \
         -o "$arch_root/overlay/bin/tar"
     "$cc" -O2 -static -s -std=c11 \
+        "$REPO_ROOT/scripts/support-tools/oscomp-timeout.c" \
+        -o "$arch_root/overlay/bin/oscomp-timeout"
+    "$cc" -O2 -static -s -std=c11 \
         "$REPO_ROOT/scripts/support-tools/sleep.c" \
         -o "$arch_root/overlay/bin/oscomp-sleep"
     if [ "$arch" = la ]; then

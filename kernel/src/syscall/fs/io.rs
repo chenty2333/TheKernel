@@ -13,13 +13,13 @@ use syscalls::Sysno;
 use crate::{
     file::{
         Directory, File, FileHandle, FileLike, FileLikeKind, Pipe, Socket, allowed_write_len,
-        check_resize_limit, get_file_like, get_typed_file,
+        check_resize_limit, executable, flock, get_file_like, get_typed_file, inode_flags,
         inotify::{notify_exact, notify_read, notify_write},
-        executable, flock, inode_flags, lease, memfd,
+        lease, memfd,
         permission::check_open_permissions,
     },
-    mounts,
     mm::{IoVec, IoVectorBuf, UserConstPtr, VmBytes, VmBytesMut},
+    mounts,
     pseudofs::tmp,
     task::AsThread,
     time::wall_time,
@@ -33,7 +33,7 @@ const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
 const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
 const FALLOC_FL_INSERT_RANGE: u32 = 0x20;
 const TMPFS_FALLOC_BLOCK_SIZE: u64 = 4096;
-const FALLOC_IO_CHUNK: usize = 64 * 1024;
+const FALLOC_IO_CHUNK: usize = 0x1000;
 const MAX_FILE_OFFSET: u64 = i64::MAX as u64;
 const SPLICE_F_NONBLOCK: u32 = 0x02;
 const SYNC_FILE_RANGE_WAIT_BEFORE: u32 = 0x01;
@@ -409,18 +409,14 @@ fn do_pwritev(
             memfd::check_write(file.inner().location(), append_offset, allowed)?;
             let mut io = io.into_io();
             io.limit_remaining(allowed);
-            file.inner()
-                .access(FileFlags::APPEND)?
-                .append(io)?
-                .0
+            file.inner().access(FileFlags::APPEND)?.append(io)?.0
         } else {
             let allowed = allowed_write_len(offset as u64, io.len())?;
             inode_flags::check_write(file.inner().location(), false)?;
             memfd::check_write(file.inner().location(), offset as u64, allowed)?;
             let mut io = io.into_io();
             io.limit_remaining(allowed);
-            file.inner()
-                .write_at(io, offset as u64)?
+            file.inner().write_at(io, offset as u64)?
         }
     } as isize;
     if written > 0 {
