@@ -3,6 +3,7 @@ use alloc::collections::BTreeMap;
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::{Location, NodeType};
 use axsync::Mutex;
+use linux_raw_sys::general::STATX_ATTR_MOUNT_ROOT;
 use starry_vm::{VmMutPtr, VmPtr};
 
 pub const FS_COMPR_FL: u32 = 0x0000_0004;
@@ -49,11 +50,20 @@ pub fn flags(loc: &Location) -> u32 {
 }
 
 pub fn statx_attributes(loc: &Location) -> (u64, u64) {
-    if !flags_supported_on(loc) {
-        return (0, 0);
+    let mut attributes = 0_u64;
+    let mut attributes_mask = STATX_ATTR_MOUNT_ROOT as u64;
+
+    if loc.is_root_of_mount() {
+        attributes |= STATX_ATTR_MOUNT_ROOT as u64;
     }
-    let flags = flags(loc) & SUPPORTED_FLAGS;
-    (flags as u64, SUPPORTED_FLAGS as u64)
+
+    if flags_supported_on(loc) {
+        let flags = flags(loc) & SUPPORTED_FLAGS;
+        attributes |= flags as u64;
+        attributes_mask |= SUPPORTED_FLAGS as u64;
+    }
+
+    (attributes, attributes_mask)
 }
 
 pub fn clear(loc: &Location) {
