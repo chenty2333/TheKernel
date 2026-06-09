@@ -632,21 +632,31 @@ impl NodeOps for MemoryNode {
 
     fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()> {
         let mut metadata = self.inode.metadata.lock();
+        let mut status_changed = false;
         if let Some(mode) = update.mode {
             metadata.mode = mode;
+            status_changed = true;
         }
         if let Some((uid, gid)) = update.owner {
             metadata.uid = uid;
             metadata.gid = gid;
+            status_changed = true;
         }
         if let Some(rdev) = update.rdev {
             metadata.rdev = rdev;
+            status_changed = true;
         }
         if let Some(atime) = update.atime {
             metadata.atime = atime;
         }
         if let Some(mtime) = update.mtime {
             metadata.mtime = mtime;
+            status_changed = true;
+        }
+        if let Some(ctime) = update.ctime {
+            metadata.ctime = ctime;
+        } else if status_changed {
+            metadata.ctime = wall_time();
         }
         Ok(())
     }

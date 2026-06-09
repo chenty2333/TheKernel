@@ -92,22 +92,31 @@ impl NodeOps for Inode {
     fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()> {
         let mut fs = self.fs.lock();
         fs.with_inode_ref(self.ino, |inode| {
+            let mut status_changed = false;
             if let Some(mode) = update.mode {
                 inode.set_mode((inode.mode() & !0xfff) | (mode.bits() as u32));
+                status_changed = true;
             }
             if let Some((uid, gid)) = update.owner {
                 inode.set_owner(uid as _, gid as _);
+                status_changed = true;
             }
             if let Some(rdev) = update.rdev {
                 inode.set_rdev(rdev.0);
+                status_changed = true;
             }
             if let Some(atime) = update.atime {
                 inode.set_atime(&atime);
             }
             if let Some(mtime) = update.mtime {
                 inode.set_mtime(&mtime);
+                status_changed = true;
             }
-            inode.update_ctime();
+            if let Some(ctime) = update.ctime {
+                inode.set_ctime(&ctime);
+            } else if status_changed {
+                inode.update_ctime();
+            }
             Ok(())
         })
         .map_err(into_vfs_err)?;

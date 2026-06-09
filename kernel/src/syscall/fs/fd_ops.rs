@@ -44,6 +44,7 @@ use crate::{
     pseudofs::{Device, dev::tty},
     syscall::fs::ctl::validate_pathname,
     task::{AX_FILE_LIMIT, AsThread},
+    time::wall_time,
 };
 
 /// Convert open flags to [`OpenOptions`].
@@ -146,6 +147,16 @@ fn check_inode_flags_for_open(loc: &Location, flags: c_int) -> AxResult<()> {
     if flags & O_ACCMODE != O_RDONLY {
         inode_flags::check_write(loc, flags & O_APPEND != 0)?;
     }
+    Ok(())
+}
+
+fn touch_truncated_metadata(loc: &Location) -> AxResult<()> {
+    let now = wall_time();
+    loc.update_metadata(MetadataUpdate {
+        mtime: Some(now),
+        ctime: Some(now),
+        ..Default::default()
+    })?;
     Ok(())
 }
 
@@ -564,6 +575,7 @@ fn open_in_fs(
     if created_parent.is_none() && (flags as u32) & O_CREAT != 0 && (flags as u32) & O_EXCL == 0 {
         effective_flags &= !(O_CREAT as i32);
     }
+    let opened_existing = created_parent.is_none();
 
     let options = flags_to_options(effective_flags, mode, (uid, gid));
     let open_result = if let Some(loc) = existing_loc {
@@ -592,6 +604,10 @@ fn open_in_fs(
                 ..Default::default()
             })?;
             let _ = notify_parent_with_name(&parent, &name, IN_CREATE, loc.is_dir(), 0);
+        }
+        if opened_existing && (flags as u32) & O_TRUNC != 0 {
+            touch_truncated_metadata(&loc)?;
+            let _ = notify_exact(&loc, IN_MODIFY | IN_ATTRIB);
         }
         let _ = notify_parent(&loc, IN_OPEN);
         let _ = notify_exact(&loc, IN_OPEN);

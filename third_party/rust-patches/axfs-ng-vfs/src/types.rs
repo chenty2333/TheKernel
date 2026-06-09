@@ -117,6 +117,8 @@ pub struct MetadataUpdate {
     pub atime: Option<Duration>,
     /// Time of last modification
     pub mtime: Option<Duration>,
+    /// Time of last status change
+    pub ctime: Option<Duration>,
 }
 
 /// Device Id

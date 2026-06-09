@@ -1062,6 +1062,7 @@ impl File {
         }
         if flags & 2 != 0 {
             update.mtime = Some(now);
+            update.ctime = Some(now);
         }
         if let Err(err) = self.inner.location().update_metadata(update) {
             warn!("Failed to update file times: {err:?}");

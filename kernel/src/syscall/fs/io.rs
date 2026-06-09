@@ -3,9 +3,10 @@ use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FileFlags, OpenOptions};
+use axfs_ng_vfs::{Location, MetadataUpdate};
 use axio::{Seek, SeekFrom};
 use axpoll::{IoEvents, Pollable};
-use linux_raw_sys::general::{__kernel_off_t, W_OK};
+use linux_raw_sys::general::{__kernel_off_t, IN_ATTRIB, IN_MODIFY, W_OK};
 use starry_vm::{VmMutPtr, VmPtr};
 use syscalls::Sysno;
 
@@ -13,7 +14,7 @@ use crate::{
     file::{
         Directory, File, FileHandle, FileLike, FileLikeKind, Pipe, Socket, allowed_write_len,
         check_resize_limit, get_file_like, get_typed_file,
-        inotify::{notify_read, notify_write},
+        inotify::{notify_exact, notify_read, notify_write},
         executable, flock, inode_flags, lease, memfd,
         permission::check_open_permissions,
     },
@@ -21,6 +22,7 @@ use crate::{
     mm::{IoVec, IoVectorBuf, UserConstPtr, VmBytes, VmBytesMut},
     pseudofs::tmp,
     task::AsThread,
+    time::wall_time,
 };
 
 const SEEK_DATA: c_int = 3;
@@ -37,6 +39,16 @@ const SPLICE_F_NONBLOCK: u32 = 0x02;
 const SYNC_FILE_RANGE_WAIT_BEFORE: u32 = 0x01;
 const SYNC_FILE_RANGE_WRITE: u32 = 0x02;
 const SYNC_FILE_RANGE_WAIT_AFTER: u32 = 0x04;
+
+fn touch_modified_metadata(loc: &Location) -> AxResult<()> {
+    let now = wall_time();
+    loc.update_metadata(MetadataUpdate {
+        mtime: Some(now),
+        ctime: Some(now),
+        ..Default::default()
+    })?;
+    Ok(())
+}
 
 fn write_zero_range(file: &axfs::File, offset: u64, len: u64) -> AxResult<()> {
     if len == 0 {
@@ -520,6 +532,8 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
         .open(&FS_CONTEXT.lock(), path)?
         .into_file()?;
     file.access(FileFlags::WRITE)?.set_len(length as _)?;
+    touch_modified_metadata(&loc)?;
+    let _ = notify_exact(&loc, IN_MODIFY | IN_ATTRIB);
     Ok(0)
 }
 
@@ -555,7 +569,9 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
         flock::RecordLockOwner::Posix(axtask::current().as_thread().proc_data.proc.pid()),
     )?;
     backend.set_len(length as _)?;
+    touch_modified_metadata(f.inner().location())?;
     notify_write(fd);
+    let _ = notify_exact(f.inner().location(), IN_ATTRIB);
     Ok(0)
 }
 
@@ -694,6 +710,8 @@ pub fn sys_fallocate(
         _ => return Err(AxError::InvalidInput),
     }
 
+    touch_modified_metadata(&loc)?;
+    let _ = notify_exact(&loc, IN_MODIFY | IN_ATTRIB);
     Ok(0)
 }
 

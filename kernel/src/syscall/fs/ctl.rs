@@ -908,6 +908,7 @@ fn update_times(
     loc.update_metadata(MetadataUpdate {
         atime,
         mtime,
+        ctime: Some(wall_time()),
         ..Default::default()
     })?;
     Ok(())
