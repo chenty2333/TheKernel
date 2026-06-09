@@ -278,7 +278,7 @@ make dev-shell DEV_CMD='./scripts/oscomp.sh lab run --name rv-syscalls-0001 --ar
 
 `lab run` defaults to `--parallel arch --jobs auto`, so `--arch both` launches
 RV and LA concurrently. For a stronger machine, use `--split-combos --jobs auto`
-to split by `arch/libc`.
+to split by `arch/libc` into up to four independent QEMU tasks.
 
 Useful execution controls:
 
@@ -291,8 +291,10 @@ Useful execution controls:
 
 The run command writes `ltp_test.txt`, `plan.txt`, support images, console logs,
 `cases.jsonl`, `summary.json`, and `combined-summary.json` under
-`.state/ltp-lab/runs/<run>/`. Split-combo runs also keep per-combo logs under
-`tasks/`, then aggregate evidence back to `rv/` and `la/` for promotion.
+`.state/ltp-lab/runs/<run>/`. Split-combo runs keep per-combo logs and summaries
+under `tasks/<arch-libc>/`, then aggregate evidence back to `rv/` and `la/`.
+Evidence commands also fall back to `tasks/*/cases.jsonl` if an old or partial
+split-combo run is missing the aggregate `rv/` or `la/` files.
 
 If replay fails before LTP starts, the run still writes logs, exit codes, and
 summaries, but `lab run` exits nonzero. Treat `cases=0` with a nonzero
@@ -341,8 +343,11 @@ Merge cases that passed the required combo set into a new list:
 ```
 
 By default promotion requires real parser `pass` on all four combos. Override
-with `--require` for narrower experiments. `silent-pass` and TCONF-only cases
-are not promoted unless `--allow-silent-pass` is passed explicitly.
+with `--require` for narrower experiments. Selectors accept exact combos such as
+`rv/glibc`, equivalent spellings such as `rv-glibc`, whole arches such as `rv`,
+whole libcs such as `glibc`, or `both` for the full matrix. `silent-pass` and
+TCONF-only cases are not promoted unless `--allow-silent-pass` is passed
+explicitly.
 
 Promotion can merge evidence from multiple run directories. Use `--dry-run` and
 `--explain` to see why a case is or is not promotable:
@@ -368,6 +373,15 @@ Inspect a candidate list or generate rerun lists for missing/nonpassing combos:
   .state/ltp-lab/runs/run-b \
   --test-list .state/ltp-lab/lists/candidates.txt \
   --output .state/ltp-lab/lists/missing
+```
+
+If a focused repair or missing-combo run was launched with `lab run` instead of
+`lab campaign run`, attach it before campaign analysis so promotion and finish
+use the same recorded evidence set:
+
+```bash
+./scripts/oscomp.sh lab campaign attach-run goal3-fs-vfs-0001 repair-run-0001 \
+  --note "rv/musl missing-combo repair"
 ```
 
 Review promoted lists before replacing the repository root `ltp_test.txt`.

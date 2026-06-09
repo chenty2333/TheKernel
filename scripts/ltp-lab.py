@@ -1637,7 +1637,7 @@ def failures_cmd(args: argparse.Namespace) -> None:
     statuses = set(split_csv(args.status) or ["fail", "nonzero", "timeout", "panic", "incomplete"])
     rows: list[dict[str, Any]] = []
     for arch in ARCHES:
-        for case in read_cases_jsonl(run_path / arch / "cases.jsonl"):
+        for case in run_cases_for_arch(run_path, arch):
             if case.get("status") not in statuses:
                 continue
             rows.append(
@@ -1682,12 +1682,146 @@ def read_cases_jsonl(path: Path) -> list[dict[str, Any]]:
     return cases
 
 
+def task_arch_libcs_from_id(task_id: str) -> tuple[str, list[str]]:
+    for arch in ARCHES:
+        prefix = f"{arch}-"
+        if task_id.startswith(prefix):
+            libc = task_id[len(prefix) :]
+            if libc in LIBCS:
+                return arch, [libc]
+    if task_id in ARCHES:
+        return task_id, list(LIBCS)
+    return "", []
+
+
+def task_case_sources(run_dir: Path) -> list[tuple[Path, str, list[str]]]:
+    sources: list[tuple[Path, str, list[str]]] = []
+    seen: set[Path] = set()
+    manifest_path = run_dir / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            manifest = read_json(manifest_path)
+        except json.JSONDecodeError:
+            manifest = {}
+        task_defs = manifest.get("tasks") if isinstance(manifest, dict) else {}
+        if isinstance(task_defs, dict):
+            for task_id, task_def in sorted(task_defs.items()):
+                if not isinstance(task_def, dict):
+                    continue
+                task_dir_text = task_def.get("task_dir") or f"tasks/{task_id}"
+                cases_path = run_dir / str(task_dir_text) / "cases.jsonl"
+                if cases_path in seen or not cases_path.is_file():
+                    continue
+                arch = str(task_def.get("arch") or "")
+                libcs = [str(item) for item in task_def.get("libcs", []) if str(item) in LIBCS]
+                if arch not in ARCHES:
+                    arch, inferred_libcs = task_arch_libcs_from_id(str(task_id))
+                    if not libcs:
+                        libcs = inferred_libcs
+                seen.add(cases_path)
+                sources.append((cases_path, arch, libcs))
+
+    tasks_dir = run_dir / "tasks"
+    if tasks_dir.is_dir():
+        for cases_path in sorted(tasks_dir.glob("*/cases.jsonl")):
+            if cases_path in seen:
+                continue
+            arch, libcs = task_arch_libcs_from_id(cases_path.parent.name)
+            seen.add(cases_path)
+            sources.append((cases_path, arch, libcs))
+    return sources
+
+
+def run_case_records(run_dir: Path) -> list[tuple[str, list[str], dict[str, Any], str]]:
+    records: list[tuple[str, list[str], dict[str, Any], str]] = []
+    for arch in ARCHES:
+        cases_path = run_dir / arch / "cases.jsonl"
+        for case in read_cases_jsonl(cases_path):
+            records.append((arch, [], case, str(cases_path)))
+    for cases_path, arch, libcs in task_case_sources(run_dir):
+        if arch not in ARCHES:
+            continue
+        for case in read_cases_jsonl(cases_path):
+            records.append((arch, libcs, case, str(cases_path)))
+    return records
+
+
+def run_cases_for_arch(run_dir: Path, arch: str) -> list[dict[str, Any]]:
+    cases = read_cases_jsonl(run_dir / arch / "cases.jsonl")
+    if cases:
+        return cases
+    fallback: list[dict[str, Any]] = []
+    for cases_path, task_arch, task_libcs in task_case_sources(run_dir):
+        if task_arch != arch:
+            continue
+        for case in read_cases_jsonl(cases_path):
+            item = dict(case)
+            if not item.get("libc") and len(task_libcs) == 1:
+                item["libc"] = task_libcs[0]
+            fallback.append(item)
+    return fallback
+
+
 def combo_key(arch: str, libc: str) -> str:
     return f"{arch}/{libc}"
 
 
 def all_combos() -> list[str]:
     return [combo_key(arch, libc) for arch in ARCHES for libc in LIBCS]
+
+
+def normalize_required_combos(values: list[str] | None) -> list[str]:
+    raw_items = split_csv(values)
+    if not raw_items:
+        return all_combos()
+
+    result: list[str] = []
+
+    def add_combo(arch: str, libc: str) -> None:
+        key = combo_key(arch, libc)
+        if key not in result:
+            result.append(key)
+
+    for raw in raw_items:
+        item = raw.strip()
+        if not item:
+            continue
+        item = item.replace("-", "/").replace(":", "/")
+        if item in ("all", "both", "matrix"):
+            for arch in ARCHES:
+                for libc in LIBCS:
+                    add_combo(arch, libc)
+            continue
+        if item in ("rv", "riscv64", "la", "loongarch64"):
+            arch = canonical_arch(item)
+            for libc in LIBCS:
+                add_combo(arch, libc)
+            continue
+        if item in LIBCS:
+            for arch in ARCHES:
+                add_combo(arch, item)
+            continue
+        if "/" in item:
+            parts = item.split("/")
+            if len(parts) != 2:
+                die(f"invalid --require combo: {raw}")
+            arch_text, libc_text = parts
+            arches = list(ARCHES) if arch_text in ("all", "both") else [canonical_arch(arch_text)]
+            if libc_text in ("all", "both"):
+                libcs = list(LIBCS)
+            elif libc_text in LIBCS:
+                libcs = [libc_text]
+            else:
+                die(f"invalid --require libc: {raw}")
+            for arch in arches:
+                for libc in libcs:
+                    add_combo(arch, libc)
+            continue
+        die(f"invalid --require selector: {raw}")
+
+    if not result:
+        die("no required combos selected")
+    return result
 
 
 def status_rank(status: str, passing_statuses: set[str]) -> int:
@@ -1721,23 +1855,24 @@ def collect_case_evidence(
     evidence: dict[str, dict[str, dict[str, Any]]] = {}
     required_set = set(required)
     for run_dir in run_dirs:
-        for arch in ARCHES:
-            for case in read_cases_jsonl(run_dir / arch / "cases.jsonl"):
-                libc = case.get("libc") or "unknown"
-                key = combo_key(arch, libc)
-                if key not in required_set:
-                    continue
-                name = case.get("case", "")
-                if not name:
-                    continue
-                by_combo = evidence.setdefault(name, {})
-                existing = by_combo.get(key)
-                if existing is None or status_rank(case.get("status", ""), passing_statuses) > status_rank(existing.get("status", ""), passing_statuses):
-                    item = dict(case)
-                    item["arch"] = arch
-                    item["combo"] = key
-                    item["run_dir"] = str(run_dir)
-                    by_combo[key] = item
+        for arch, task_libcs, case, source in run_case_records(run_dir):
+            libc = case.get("libc") or (task_libcs[0] if len(task_libcs) == 1 else "unknown")
+            key = combo_key(arch, libc)
+            if key not in required_set:
+                continue
+            name = case.get("case", "")
+            if not name:
+                continue
+            by_combo = evidence.setdefault(name, {})
+            existing = by_combo.get(key)
+            if existing is None or status_rank(case.get("status", ""), passing_statuses) > status_rank(existing.get("status", ""), passing_statuses):
+                item = dict(case)
+                item["arch"] = arch
+                item["libc"] = libc
+                item["combo"] = key
+                item["run_dir"] = str(run_dir)
+                item["source"] = source
+                by_combo[key] = item
     return evidence
 
 
@@ -1794,12 +1929,10 @@ def print_case_matrix(
 
 def promote_cmd(args: argparse.Namespace) -> None:
     run_dirs = [Path(item).expanduser() for item in args.run_dir]
-    required = split_csv(args.require) or all_combos()
+    required = normalize_required_combos(args.require)
     passing_statuses = {"pass"}
     if args.allow_silent_pass:
         passing_statuses.add("silent-pass")
-    if not required:
-        die("no required combos selected")
     line_by_case = load_run_list_lines(run_dirs)
     if args.test_list:
         for item in parse_test_list(Path(args.test_list).expanduser()):
@@ -1834,17 +1967,17 @@ def promote_cmd(args: argparse.Namespace) -> None:
         lines.append(line_by_case.get(case, case))
         added += 1
     output = Path(args.output).expanduser()
-    output.parent.mkdir(parents=True, exist_ok=True)
     if args.dry_run:
         log(f"dry-run: would promote {added} new cases into {output} (base={len(base_items)} total={len(lines)})")
     else:
+        output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text("\n".join(lines) + "\n", encoding="utf-8")
         log(f"promoted {added} new cases into {output} (base={len(base_items)} total={len(lines)})")
 
 
 def matrix_status_cmd(args: argparse.Namespace) -> None:
     run_dirs = [Path(item).expanduser() for item in args.run_dir]
-    required = split_csv(args.require) or all_combos()
+    required = normalize_required_combos(args.require)
     passing_statuses = {"pass", "silent-pass"}
     evidence = collect_case_evidence(run_dirs, required, passing_statuses)
     test_list = Path(args.test_list).expanduser() if args.test_list else None
@@ -1854,7 +1987,7 @@ def matrix_status_cmd(args: argparse.Namespace) -> None:
 
 def missing_combos_cmd(args: argparse.Namespace) -> None:
     run_dirs = [Path(item).expanduser() for item in args.run_dir]
-    required = split_csv(args.require) or all_combos()
+    required = normalize_required_combos(args.require)
     passing_statuses = {"pass"}
     if args.allow_silent_pass:
         passing_statuses.add("silent-pass")
@@ -1888,7 +2021,7 @@ def reorder_cmd(args: argparse.Namespace) -> None:
     if not base_items:
         die(f"base list is empty or missing: {base_path}")
     run_dirs = [Path(item).expanduser() for item in args.evidence]
-    required = split_csv(args.require) or all_combos()
+    required = normalize_required_combos(args.require)
     passing_statuses = {"pass", "silent-pass"}
     evidence = collect_case_evidence(run_dirs, required, passing_statuses)
 
@@ -2518,7 +2651,22 @@ def campaign_list_cmd(args: argparse.Namespace) -> None:
 
 
 def campaign_required_combos(args: argparse.Namespace) -> list[str]:
-    return split_csv(getattr(args, "require", None)) or all_combos()
+    return normalize_required_combos(getattr(args, "require", None))
+
+
+def normalize_recorded_state_path(path: Path) -> Path:
+    if not path.is_absolute() or path.exists():
+        return path
+
+    parts = path.parts
+    marker = (".state", "ltp-lab")
+    for index in range(len(parts) - len(marker) + 1):
+        if parts[index : index + len(marker)] == marker:
+            remapped = STATE_DIR.joinpath(*parts[index + len(marker) :])
+            if remapped.exists():
+                return remapped
+
+    return path
 
 
 def campaign_run_dirs(manifest: dict[str, Any], selected: list[str] | None = None) -> list[Path]:
@@ -2528,10 +2676,56 @@ def campaign_run_dirs(manifest: dict[str, Any], selected: list[str] | None = Non
         run_id = str(run.get("run_id") or "")
         if wanted and run_id not in wanted:
             continue
-        path = Path(run.get("path") or RUN_DIR / run_id).expanduser()
+        path = normalize_recorded_state_path(Path(run.get("path") or RUN_DIR / run_id).expanduser())
         if path.is_dir():
             run_dirs.append(path)
     return run_dirs
+
+
+def resolve_lab_run_path(run: str) -> Path:
+    path = Path(run).expanduser()
+    if not path.is_absolute() and path.parent == Path("."):
+        path = RUN_DIR / run
+    return normalize_recorded_state_path(path)
+
+
+def campaign_attach_run_cmd(args: argparse.Namespace) -> None:
+    campaign_dir, manifest = load_campaign(args.name)
+    runs = manifest.setdefault("runs", [])
+    existing = {str(run.get("run_id") or "") for run in runs if isinstance(run, dict)}
+    attached = 0
+    for item in split_csv(args.run):
+        run_path = resolve_lab_run_path(item)
+        if not run_path.is_dir():
+            die(f"run directory not found: {run_path}")
+        manifest_path = run_path / "manifest.json"
+        run_manifest: dict[str, Any] = {}
+        if manifest_path.is_file():
+            try:
+                loaded = read_json(manifest_path)
+                if isinstance(loaded, dict):
+                    run_manifest = loaded
+            except json.JSONDecodeError:
+                run_manifest = {}
+        run_id = str(run_manifest.get("run_id") or run_path.name)
+        if run_id in existing:
+            log(f"campaign {manifest['name']} already has run {run_id}")
+            continue
+        runs.append(
+            {
+                "run_id": run_id,
+                "attached_at": iso_now(),
+                "status": args.status,
+                "path": str(run_path),
+                "note": args.note or "",
+            }
+        )
+        existing.add(run_id)
+        attached += 1
+    if attached:
+        manifest["status"] = "ran"
+        save_campaign(campaign_dir, manifest)
+    log(f"campaign {manifest['name']} attached {attached} run(s)")
 
 
 def failure_bucket_for(case: str, statuses: dict[str, str], semantic: str) -> str:
@@ -2694,8 +2888,9 @@ def campaign_promote_cmd(args: argparse.Namespace) -> None:
     if args.apply_root and not args.dry_run:
         shutil.copyfile(output, DEFAULT_TEST_LIST)
         log(f"applied promoted list to {DEFAULT_TEST_LIST}")
-    manifest["last_promoted_list"] = str(output)
-    save_campaign(campaign_dir, manifest)
+    if not args.dry_run:
+        manifest["last_promoted_list"] = str(output)
+        save_campaign(campaign_dir, manifest)
 
 
 def cleanup_heavy_run_artifacts(run_dirs: list[Path], *, dry_run: bool) -> list[str]:
@@ -3226,7 +3421,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("promote", help="merge stable passing cases into a new LTP list")
     p.add_argument("run_dir", nargs="+")
-    p.add_argument("--require", action="append", help="required combo such as rv/glibc, default all four")
+    p.add_argument("--require", action="append", help="required selector: rv/glibc, rv, glibc, or both; default all four")
     p.add_argument("--test-list", help="candidate list used for explain/status output")
     p.add_argument("--base", help="base list, default ltp_test.txt")
     p.add_argument("--output", required=True)
@@ -3240,7 +3435,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("matrix-status", help="show per-case status across arch/libc combos")
     p.add_argument("run_dir", nargs="+")
     p.add_argument("--test-list", help="candidate list to order/filter output")
-    p.add_argument("--require", action="append", help="combo filter such as rv/glibc, default all four")
+    p.add_argument("--require", action="append", help="combo selector: rv/glibc, rv, glibc, or both; default all four")
     p.add_argument("--only-missing", action="store_true", help="only show cases missing at least one selected combo")
     p.add_argument("--limit", type=int)
     p.set_defaults(func=matrix_status_cmd)
@@ -3248,7 +3443,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("missing-combos", help="write per-combo rerun lists for missing/nonpassing evidence")
     p.add_argument("run_dir", nargs="+")
     p.add_argument("--test-list", help="candidate list to check")
-    p.add_argument("--require", action="append", help="combo filter such as rv/glibc, default all four")
+    p.add_argument("--require", action="append", help="combo selector: rv/glibc, rv, glibc, or both; default all four")
     p.add_argument("--output", required=True, help="output directory")
     p.add_argument("--allow-silent-pass", action="store_true", help="treat silent-pass as passing evidence")
     p.set_defaults(func=missing_combos_cmd)
@@ -3256,7 +3451,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("reorder", help="sort an LTP list using pass/fail/timing evidence")
     p.add_argument("--base", required=True, help="base LTP list")
     p.add_argument("--evidence", action="append", required=True, help="run dir, comma-separated or repeated")
-    p.add_argument("--require", action="append", help="combo filter such as rv/glibc, default all four")
+    p.add_argument("--require", action="append", help="combo selector: rv/glibc, rv, glibc, or both; default all four")
     p.add_argument("--output", required=True)
     p.add_argument("--fast-threshold", type=float, default=30.0, help="max per-combo case duration considered fast")
     p.set_defaults(func=lambda args: reorder_cmd(argparse.Namespace(**{**vars(args), "evidence": split_csv(args.evidence)})))
@@ -3308,18 +3503,25 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--fail-fast", action="store_true")
     c.set_defaults(func=campaign_run_cmd)
 
+    c = campaign_sub.add_parser("attach-run", help="record an existing lab run as campaign evidence")
+    c.add_argument("name")
+    c.add_argument("run", nargs="+", help="run id/path to attach, comma-separated or repeated")
+    c.add_argument("--status", default="completed", help="manifest status for the attached run")
+    c.add_argument("--note", help="short note describing why the run was attached")
+    c.set_defaults(func=campaign_attach_run_cmd)
+
     c = campaign_sub.add_parser("analyze", help="classify campaign run evidence")
     c.add_argument("name")
     c.add_argument("--run", action="append", help="run id to analyze, comma-separated or repeated")
     c.add_argument("--latest", action="store_true", help="analyze only the latest recorded run")
-    c.add_argument("--require", action="append", help="required combo such as rv/glibc, default all four")
+    c.add_argument("--require", action="append", help="required selector: rv/glibc, rv, glibc, or both; default all four")
     c.add_argument("--allow-silent-pass", action="store_true")
     c.set_defaults(func=campaign_analyze_cmd)
 
     c = campaign_sub.add_parser("promote", help="write or apply a promoted list from campaign evidence")
     c.add_argument("name")
     c.add_argument("--run", action="append", help="run id to promote from, comma-separated or repeated")
-    c.add_argument("--require", action="append", help="required combo such as rv/glibc, default all four")
+    c.add_argument("--require", action="append", help="required selector: rv/glibc, rv, glibc, or both; default all four")
     c.add_argument("--base", help="base list, default ltp_test.txt")
     c.add_argument("--output", help="output list path, default campaign promoted-ltp_test.txt")
     c.add_argument("--allow-silent-pass", action="store_true")
@@ -3333,7 +3535,7 @@ def build_parser() -> argparse.ArgumentParser:
     c = campaign_sub.add_parser("finish", help="analyze and clean heavy per-run artifacts while retaining evidence")
     c.add_argument("name")
     c.add_argument("--run", action="append", help="run id to include, comma-separated or repeated")
-    c.add_argument("--require", action="append", help="required combo such as rv/glibc, default all four")
+    c.add_argument("--require", action="append", help="required selector: rv/glibc, rv, glibc, or both; default all four")
     c.add_argument("--allow-silent-pass", action="store_true")
     c.add_argument("--no-clean", action="store_true", help="skip automatic support.img/workdir cleanup")
     c.add_argument("--dry-run", action="store_true")
