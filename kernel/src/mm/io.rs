@@ -1,4 +1,3 @@
-use alloc::{vec, vec::Vec};
 use core::mem::{self, MaybeUninit};
 
 use axerrno::{AxError, AxResult};
@@ -40,21 +39,8 @@ impl IoVectorBuf {
         Ok(Self { iovs, iovcnt, len })
     }
 
-    pub fn read_all(self) -> AxResult<Vec<u8>> {
-        let mut data = vec![0u8; self.len];
-        let mut offset = 0;
-        for i in 0..self.iovcnt {
-            let iov = self.iovs.wrapping_add(i).vm_read()?;
-            let len = iov.iov_len as usize;
-            if len == 0 {
-                continue;
-            }
-            vm_read_slice(iov.iov_base, unsafe {
-                mem::transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(&mut data[offset..offset + len])
-            })?;
-            offset += len;
-        }
-        Ok(data)
+    pub fn len(&self) -> usize {
+        self.len
     }
 
     pub fn check_readable(&self) -> AxResult<()> {
@@ -70,44 +56,6 @@ impl IoVectorBuf {
             check_user_readable(iov.iov_base as usize, len)?;
         }
         Ok(())
-    }
-
-    pub fn read_with(
-        self,
-        mut f: impl FnMut(*const u8, usize) -> AxResult<usize>,
-    ) -> AxResult<usize> {
-        let mut count = 0;
-        for i in 0..self.iovcnt {
-            let iov = self.iovs.wrapping_add(i).vm_read()?;
-            if iov.iov_len == 0 {
-                continue;
-            }
-            let read = f(iov.iov_base, iov.iov_len as usize)?;
-            if read == 0 {
-                break;
-            }
-            count += read;
-        }
-        Ok(count)
-    }
-
-    pub fn fill_with(
-        self,
-        mut f: impl FnMut(*mut u8, usize) -> AxResult<usize>,
-    ) -> AxResult<usize> {
-        let mut count = 0;
-        for i in 0..self.iovcnt {
-            let iov = self.iovs.wrapping_add(i).vm_read()?;
-            if iov.iov_len == 0 {
-                continue;
-            }
-            let written = f(iov.iov_base, iov.iov_len as usize)?;
-            if written == 0 {
-                break;
-            }
-            count += written;
-        }
-        Ok(count)
     }
 
     pub fn into_io(self) -> IoVectorBufIo {
@@ -126,6 +74,10 @@ pub struct IoVectorBufIo {
 }
 
 impl IoVectorBufIo {
+    pub fn limit_remaining(&mut self, len: usize) {
+        self.inner.len = self.inner.len.min(len);
+    }
+
     fn skip_empty(&mut self) -> AxResult<()> {
         while self.start < self.inner.iovcnt {
             let iov = self.inner.iovs.wrapping_add(self.start).vm_read()?;
@@ -143,12 +95,17 @@ impl Read for IoVectorBufIo {
     fn read(&mut self, buf: &mut [u8]) -> AxResult<usize> {
         let mut count = 0;
         loop {
+            if self.inner.len == 0 {
+                break;
+            }
             self.skip_empty()?;
             if self.start >= self.inner.iovcnt {
                 break;
             }
             let iov = self.inner.iovs.wrapping_add(self.start).vm_read()?;
-            let len = (iov.iov_len as usize - self.offset).min(buf.len() - count);
+            let len = (iov.iov_len as usize - self.offset)
+                .min(buf.len() - count)
+                .min(self.inner.len);
             if len == 0 {
                 break;
             }
@@ -167,12 +124,17 @@ impl Write for IoVectorBufIo {
     fn write(&mut self, buf: &[u8]) -> AxResult<usize> {
         let mut count = 0;
         loop {
+            if self.inner.len == 0 {
+                break;
+            }
             self.skip_empty()?;
             if self.start >= self.inner.iovcnt {
                 break;
             }
             let iov = self.inner.iovs.wrapping_add(self.start).vm_read()?;
-            let len = (iov.iov_len as usize - self.offset).min(buf.len() - count);
+            let len = (iov.iov_len as usize - self.offset)
+                .min(buf.len() - count)
+                .min(self.inner.len);
             if len == 0 {
                 break;
             }

@@ -1,13 +1,18 @@
 use alloc::{
     borrow::ToOwned,
+    boxed::Box,
     collections::{BTreeMap, BTreeSet},
     string::String,
     sync::Arc,
     vec::Vec,
 };
-use core::{any::Any, borrow::Borrow, cmp::Ordering, task::Context};
+use core::{any::Any, borrow::Borrow, cmp::Ordering, mem, task::Context};
 
 use axerrno::{AxError, AxResult};
+use axfs::{
+    prune_dead_cached_file_registry_entries_for_inode, remove_cached_file_registry_entry,
+    sync_and_invalidate_cached_file_pages,
+};
 use axfs_ng_vfs::{
     DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode, FileNodeOps, Filesystem,
     FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission, NodeType,
@@ -108,12 +113,33 @@ impl FilesystemOps for MemoryFs {
     }
 }
 
-fn release_inode(fs: &MemoryFs, inode: &Arc<Inode>, nlink: u64) {
+fn finalize_unlinked_inode(fs: &MemoryFs, inode: &Arc<Inode>) {
     let mut inodes = fs.inodes.lock();
+    let metadata = inode.metadata.lock();
+    if metadata.nlink != 0 {
+        return;
+    }
+    let device = metadata.device;
+    let ino = metadata.inode;
+    drop(metadata);
+
+    remove_cached_file_registry_entry(device, ino);
+    prune_dead_cached_file_registry_entries_for_inode(ino);
+    if Arc::strong_count(inode) == 2 {
+        if let NodeContent::File(file) = &inode.content {
+            file.clear_storage();
+        }
+        inodes.remove(ino as usize - 1);
+    }
+}
+
+fn release_inode(fs: &MemoryFs, inode: &Arc<Inode>, nlink: u64) {
     let mut metadata = inode.metadata.lock();
     metadata.nlink -= nlink;
-    if metadata.nlink == 0 && Arc::strong_count(inode) == 2 {
-        inodes.remove(metadata.inode as usize - 1);
+    let is_unlinked = metadata.nlink == 0;
+    drop(metadata);
+    if is_unlinked {
+        finalize_unlinked_inode(fs, inode);
     }
 }
 
@@ -125,6 +151,7 @@ struct FileContent {
     /// content management to page cache.
     length: Mutex<u64>,
     symlink: Mutex<Option<String>>,
+    pages: Mutex<BTreeMap<u64, Box<[u8; PAGE_SIZE_4K]>>>,
     allocated_pages: Mutex<BTreeSet<u64>>,
     hole_pages: Mutex<BTreeSet<u64>>,
 }
@@ -133,8 +160,84 @@ impl FileContent {
     fn set_len(&self, len: u64) {
         *self.length.lock() = len;
         let last_page = len.div_ceil(TMPFS_BLOCK_SIZE);
+        let mut pages = self.pages.lock();
+        pages.retain(|page, _| *page < last_page);
+        if len > 0 {
+            let last_used_page = (len - 1) / TMPFS_BLOCK_SIZE;
+            let last_used_len = ((len - 1) % TMPFS_BLOCK_SIZE + 1) as usize;
+            if let Some(page) = pages.get_mut(&last_used_page) {
+                page[last_used_len..].fill(0);
+            }
+        }
+        drop(pages);
         self.allocated_pages.lock().retain(|page| *page < last_page);
         self.hole_pages.lock().retain(|page| *page < last_page);
+    }
+
+    fn clear_storage(&self) {
+        *self.length.lock() = 0;
+        *self.symlink.lock() = None;
+        self.pages.lock().clear();
+        self.allocated_pages.lock().clear();
+        self.hole_pages.lock().clear();
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        let len = *self.length.lock();
+        if offset >= len {
+            return Ok(0);
+        }
+        let total = buf.len().min((len - offset) as usize);
+        let pages = self.pages.lock();
+        let holes = self.hole_pages.lock();
+        let mut done = 0;
+        while done < total {
+            let pos = offset + done as u64;
+            let page = pos / TMPFS_BLOCK_SIZE;
+            let page_off = (pos % TMPFS_BLOCK_SIZE) as usize;
+            let chunk = (total - done).min(PAGE_SIZE_4K - page_off);
+            let dst = &mut buf[done..done + chunk];
+            if holes.contains(&page) {
+                dst.fill(0);
+            } else if let Some(src) = pages.get(&page) {
+                dst.copy_from_slice(&src[page_off..page_off + chunk]);
+            } else {
+                dst.fill(0);
+            }
+            done += chunk;
+        }
+        Ok(total)
+    }
+
+    fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(VfsError::InvalidInput)?;
+        let current_len = *self.length.lock();
+        if end > current_len {
+            self.set_len(end);
+        }
+        let mut pages = self.pages.lock();
+        let mut allocated = self.allocated_pages.lock();
+        let mut holes = self.hole_pages.lock();
+        let mut done = 0;
+        while done < buf.len() {
+            let pos = offset + done as u64;
+            let page = pos / TMPFS_BLOCK_SIZE;
+            let page_off = (pos % TMPFS_BLOCK_SIZE) as usize;
+            let chunk = (buf.len() - done).min(PAGE_SIZE_4K - page_off);
+            let dst = pages
+                .entry(page)
+                .or_insert_with(|| Box::new([0; PAGE_SIZE_4K]));
+            dst[page_off..page_off + chunk].copy_from_slice(&buf[done..done + chunk]);
+            allocated.insert(page);
+            holes.remove(&page);
+            done += chunk;
+        }
+        Ok(buf.len())
     }
 
     fn reserve_range(&self, offset: u64, len: u64) {
@@ -153,9 +256,11 @@ impl FileContent {
         let Some((start, end)) = full_page_range(offset, len) else {
             return;
         };
+        let mut pages = self.pages.lock();
         let mut allocated = self.allocated_pages.lock();
         let mut holes = self.hole_pages.lock();
         for page in start..end {
+            pages.remove(&page);
             allocated.remove(&page);
             holes.insert(page);
         }
@@ -179,8 +284,51 @@ impl FileContent {
             }
         };
 
+        let mut data_pages = self.pages.lock();
+        let current = mem::take(&mut *data_pages);
+        for (page, data) in current {
+            if page < start {
+                data_pages.insert(page, data);
+            } else if page >= end {
+                data_pages.insert(page - delta, data);
+            }
+        }
+        drop(data_pages);
         remap_pages(&mut self.allocated_pages.lock());
         remap_pages(&mut self.hole_pages.lock());
+    }
+
+    fn insert_range(&self, offset: u64, len: u64) {
+        let Some((start, end)) = full_page_range(offset, len) else {
+            return;
+        };
+        let delta = end - start;
+
+        let remap_pages = |pages: &mut BTreeSet<u64>| {
+            let current = pages.iter().copied().collect::<Vec<_>>();
+            pages.clear();
+            for page in current {
+                if page < start {
+                    pages.insert(page);
+                } else {
+                    pages.insert(page + delta);
+                }
+            }
+        };
+
+        let mut data_pages = self.pages.lock();
+        let current = mem::take(&mut *data_pages);
+        for (page, data) in current {
+            if page < start {
+                data_pages.insert(page, data);
+            } else {
+                data_pages.insert(page + delta, data);
+            }
+        }
+        drop(data_pages);
+        remap_pages(&mut self.allocated_pages.lock());
+        remap_pages(&mut self.hole_pages.lock());
+        self.hole_pages.lock().extend(start..end);
     }
 
     fn blocks(&self) -> u64 {
@@ -259,6 +407,9 @@ pub fn reserve_fallocate_range(
 ) -> Option<AxResult<()>> {
     let inode = file_content_for(loc)?;
     let file = inode.as_file().ok()?;
+    if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
+        return Some(Err(err));
+    }
     if extend {
         let Some(end) = offset.checked_add(len) else {
             return Some(Err(AxError::InvalidInput));
@@ -278,6 +429,9 @@ pub fn punch_hole_fallocate_range(
 ) -> Option<AxResult<()>> {
     let inode = file_content_for(loc)?;
     let file = inode.as_file().ok()?;
+    if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
+        return Some(Err(err));
+    }
     file.punch_hole(offset, len);
     Some(Ok(()))
 }
@@ -289,7 +443,24 @@ pub fn collapse_fallocate_range(
 ) -> Option<AxResult<()>> {
     let inode = file_content_for(loc)?;
     let file = inode.as_file().ok()?;
+    if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
+        return Some(Err(err));
+    }
     file.collapse_range(offset, len);
+    Some(Ok(()))
+}
+
+pub fn insert_fallocate_range(
+    loc: &axfs_ng_vfs::Location,
+    offset: u64,
+    len: u64,
+) -> Option<AxResult<()>> {
+    let inode = file_content_for(loc)?;
+    let file = inode.as_file().ok()?;
+    if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
+        return Some(Err(err));
+    }
+    file.insert_range(offset, len);
     Some(Ok(()))
 }
 
@@ -506,15 +677,18 @@ impl FileNodeOps for MemoryNode {
             buf[..len].copy_from_slice(&symlink.as_bytes()[..len]);
             return Ok(len);
         }
-        unreachable!("page cache should handle reading");
+        file.read_at(buf, offset)
     }
 
-    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        unreachable!("page cache should handle writing");
+    fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
+        self.inode.as_file()?.write_at(buf, offset)
     }
 
-    fn append(&self, _buf: &[u8]) -> VfsResult<(usize, u64)> {
-        unreachable!("page cache should handle writing");
+    fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {
+        let file = self.inode.as_file()?;
+        let offset = *file.length.lock();
+        let written = file.write_at(buf, offset)?;
+        Ok((written, offset + written as u64))
     }
 
     fn set_len(&self, len: u64) -> VfsResult<()> {
@@ -621,6 +795,7 @@ impl DirNodeOps for MemoryNode {
             }
             child_entries.clear();
         }
+        drop(inode);
         entries.remove(name);
 
         Ok(())

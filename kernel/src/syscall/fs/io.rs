@@ -3,7 +3,7 @@ use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FileFlags, OpenOptions};
-use axio::{Cursor, Seek, SeekFrom};
+use axio::{Seek, SeekFrom};
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::general::{__kernel_off_t, W_OK};
 use starry_vm::{VmMutPtr, VmPtr};
@@ -28,6 +28,7 @@ const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
 const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
 const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
 const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+const FALLOC_FL_INSERT_RANGE: u32 = 0x20;
 const TMPFS_FALLOC_BLOCK_SIZE: u64 = 4096;
 const FALLOC_IO_CHUNK: usize = 64 * 1024;
 const MAX_FILE_OFFSET: u64 = i64::MAX as u64;
@@ -68,6 +69,30 @@ fn copy_within_file(file: &axfs::File, src: u64, dst: u64, len: u64) -> AxResult
         }
         backend.write_at(&buf[..read], dst + done)?;
         done += read as u64;
+    }
+    Ok(())
+}
+
+fn copy_within_file_reverse(file: &axfs::File, src: u64, dst: u64, len: u64) -> AxResult<()> {
+    if len == 0 || src == dst {
+        return Ok(());
+    }
+
+    let backend = file.backend()?;
+    let mut buf = vec![0u8; FALLOC_IO_CHUNK];
+    let mut remaining = len;
+    while remaining > 0 {
+        let chunk = remaining.min(buf.len() as u64) as usize;
+        let pos = remaining - chunk as u64;
+        let read = backend.read_at(&mut buf[..chunk], src + pos)?;
+        if read != chunk {
+            return Err(AxError::InvalidInput);
+        }
+        let written = backend.write_at(&buf[..read], dst + pos)?;
+        if written != read {
+            return Err(AxError::InvalidInput);
+        }
+        remaining = pos;
     }
     Ok(())
 }
@@ -319,26 +344,38 @@ fn do_pwritev(
     let file = positioned_write_file(fd)?;
     let io = IoVectorBuf::new(iov, iovcnt)?;
     let written = if offset == -1 {
-        let data = io.read_all()?;
-        let mut cursor = Cursor::new(data.as_slice());
-        file.write(&mut cursor)?
+        let appending = file.inner().flags().contains(FileFlags::APPEND);
+        let write_offset = if appending {
+            file.inner().location().len()?
+        } else {
+            current_file_offset(file.inner())?
+        };
+        let allowed = allowed_write_len(write_offset, io.len())?;
+        inode_flags::check_write(file.inner().location(), appending)?;
+        memfd::check_write(file.inner().location(), write_offset, allowed)?;
+        let mut io = io.into_io();
+        io.limit_remaining(allowed);
+        file.write(&mut io)?
     } else {
-        let data = io.read_all()?;
         if file.inner().flags().contains(FileFlags::APPEND) {
             let append_offset = file.inner().location().len()?;
-            let allowed = allowed_write_len(append_offset, data.len())?;
+            let allowed = allowed_write_len(append_offset, io.len())?;
             inode_flags::check_write(file.inner().location(), true)?;
             memfd::check_write(file.inner().location(), append_offset, allowed)?;
+            let mut io = io.into_io();
+            io.limit_remaining(allowed);
             file.inner()
                 .access(FileFlags::APPEND)?
-                .append(Cursor::new(&data[..allowed]))?
+                .append(io)?
                 .0
         } else {
-            let allowed = allowed_write_len(offset as u64, data.len())?;
+            let allowed = allowed_write_len(offset as u64, io.len())?;
             inode_flags::check_write(file.inner().location(), false)?;
             memfd::check_write(file.inner().location(), offset as u64, allowed)?;
+            let mut io = io.into_io();
+            io.limit_remaining(allowed);
             file.inner()
-                .write_at(Cursor::new(&data[..allowed]), offset as u64)?
+                .write_at(io, offset as u64)?
         }
     } as isize;
     if written > 0 {
@@ -520,7 +557,8 @@ pub fn sys_fallocate(
     let supported_modes = FALLOC_FL_KEEP_SIZE
         | FALLOC_FL_PUNCH_HOLE
         | FALLOC_FL_COLLAPSE_RANGE
-        | FALLOC_FL_ZERO_RANGE;
+        | FALLOC_FL_ZERO_RANGE
+        | FALLOC_FL_INSERT_RANGE;
 
     if mode & !supported_modes != 0 {
         return Err(AxError::OperationNotSupported);
@@ -578,13 +616,37 @@ pub fn sys_fallocate(
                 return Err(AxError::OperationNotPermitted);
             }
             memfd::check_resize(&loc, size - len)?;
-            copy_within_file(file, end, offset, size - end)?;
             if let Some(result) = tmp::collapse_fallocate_range(&loc, offset, len) {
                 result?;
             } else {
-                return Err(AxError::OperationNotSupported);
+                copy_within_file(file, end, offset, size - end)?;
             }
             backend.set_len(size - len)?;
+        }
+        FALLOC_FL_INSERT_RANGE => {
+            if len == 0
+                || offset % TMPFS_FALLOC_BLOCK_SIZE != 0
+                || len % TMPFS_FALLOC_BLOCK_SIZE != 0
+                || offset >= size
+            {
+                return Err(AxError::InvalidInput);
+            }
+            if seals & linux_raw_sys::general::F_SEAL_WRITE != 0 {
+                return Err(AxError::OperationNotPermitted);
+            }
+            let new_size = size
+                .checked_add(len)
+                .filter(|new_size| *new_size <= MAX_FILE_OFFSET)
+                .ok_or_else(|| AxError::from(LinuxError::EFBIG))?;
+            check_resize_limit(new_size)?;
+            memfd::check_resize(&loc, new_size)?;
+            backend.set_len(new_size)?;
+            if let Some(result) = tmp::insert_fallocate_range(&loc, offset, len) {
+                result?;
+            } else {
+                copy_within_file_reverse(file, offset, offset + len, size - offset)?;
+                write_zero_range(file, offset, len)?;
+            }
         }
         _ => return Err(AxError::InvalidInput),
     }
