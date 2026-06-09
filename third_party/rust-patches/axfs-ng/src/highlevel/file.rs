@@ -333,6 +333,7 @@ impl Default for OpenOptions {
 }
 
 const PAGE_SIZE: usize = 4096;
+const IN_MEMORY_PAGE_CACHE_PAGES: usize = 16;
 static DIRTY_PAGE_CACHE_PFNS: Once<Mutex<BTreeSet<usize>>> = Once::new();
 static FILE_CACHE_REGISTRY: Once<Mutex<BTreeMap<(u64, u64), FileUserData>>> = Once::new();
 
@@ -354,7 +355,12 @@ fn cached_file_shared_for_location(location: &Location) -> Option<Arc<CachedFile
         .lock()
         .get(&key)
         .and_then(FileUserData::get)
-        .or_else(|| location.user_data().get::<FileUserData>().and_then(|it| it.get()))
+        .or_else(|| {
+            location
+                .user_data()
+                .get::<FileUserData>()
+                .and_then(|it| it.get())
+        })
 }
 
 /// Drops the shared page-cache registry entry for a fully released inode.
@@ -376,7 +382,7 @@ pub fn sync_and_invalidate_cached_file_pages(location: &Location) -> VfsResult<(
         let file = location.entry().as_file()?;
         let mut cache = shared.page_cache.lock();
         while let Some((pn, mut page)) = cache.pop_lru() {
-            writeback_cached_page(&shared, file, pn, &mut page)?;
+            let _ = writeback_cached_page(&shared, file, pn, &mut page)?;
         }
     }
     Ok(())
@@ -458,8 +464,10 @@ fn writeback_cached_page(
     file: &FileNode,
     pn: u32,
     page: &mut PageCache,
-) -> VfsResult<()> {
+) -> VfsResult<bool> {
+    let mut had_evict_listener = false;
     for listener in shared.evict_listeners.lock().iter() {
+        had_evict_listener = true;
         (listener.listener)(pn, page);
     }
     if page.dirty {
@@ -470,7 +478,20 @@ fn writeback_cached_page(
         }
         page.clear_dirty();
     }
-    Ok(())
+    Ok(had_evict_listener)
+}
+
+/// A page evicted while inserting a new cached file page.
+pub struct EvictedPage {
+    pn: u32,
+    _page: Option<PageCache>,
+}
+
+impl EvictedPage {
+    /// Returns the file page number that was evicted.
+    pub fn page_number(&self) -> u32 {
+        self.pn
+    }
 }
 
 fn per_file_page_cache_capacity() -> NonZeroUsize {
@@ -488,6 +509,10 @@ fn per_file_page_cache_capacity() -> NonZeroUsize {
     NonZeroUsize::new(pages).unwrap()
 }
 
+fn in_memory_page_cache_capacity() -> NonZeroUsize {
+    NonZeroUsize::new(IN_MEMORY_PAGE_CACHE_PAGES).unwrap()
+}
+
 struct EvictListener {
     listener: EvictListenerFn,
     link: LinkedListAtomicLink,
@@ -501,16 +526,21 @@ struct CachedFileShared {
 }
 
 impl CachedFileShared {
-    pub fn new() -> Self {
+    pub fn new(in_memory: bool) -> Self {
+        let capacity = if in_memory {
+            in_memory_page_cache_capacity()
+        } else {
+            per_file_page_cache_capacity()
+        };
         Self {
-            page_cache: Mutex::new(new_bounded_page_cache_store()),
+            page_cache: Mutex::new(new_bounded_page_cache_store(capacity)),
             evict_listeners: Mutex::new(LinkedList::default()),
         }
     }
 }
 
-fn new_bounded_page_cache_store() -> LruCache<u32, PageCache> {
-    LruCache::new(per_file_page_cache_capacity())
+fn new_bounded_page_cache_store(capacity: NonZeroUsize) -> LruCache<u32, PageCache> {
+    LruCache::new(capacity)
 }
 
 /// A file handle with an LRU page cache for buffered I/O.
@@ -554,7 +584,7 @@ impl CachedFile {
 
         let key = cached_file_registry_key(&location);
         let shared = cached_file_shared_for_location(&location)
-            .unwrap_or_else(|| Arc::new(CachedFileShared::new()));
+            .unwrap_or_else(|| Arc::new(CachedFileShared::new(in_memory)));
 
         file_cache_registry()
             .lock()
@@ -609,7 +639,7 @@ impl CachedFile {
         cursor.remove();
     }
 
-    fn evict_cache(&self, file: &FileNode, pn: u32, page: &mut PageCache) -> VfsResult<()> {
+    fn evict_cache(&self, file: &FileNode, pn: u32, page: &mut PageCache) -> VfsResult<bool> {
         writeback_cached_page(&self.shared, file, pn, page)
     }
 
@@ -623,7 +653,7 @@ impl CachedFile {
 
     fn drain_cache(&self, file: &FileNode) -> VfsResult<()> {
         while let Some((pn, mut page)) = self.pop_lru_page() {
-            self.evict_cache(file, pn, &mut page)?;
+            let _ = self.evict_cache(file, pn, &mut page)?;
         }
         Ok(())
     }
@@ -661,7 +691,7 @@ impl CachedFile {
         file: &FileNode,
         cache: &mut LruCache<u32, PageCache>,
         pn: u32,
-    ) -> VfsResult<Option<(u32, PageCache)>> {
+    ) -> VfsResult<Option<EvictedPage>> {
         if cache.contains(&pn) {
             return Ok(None);
         }
@@ -669,8 +699,9 @@ impl CachedFile {
         if cache.len() == cache.cap().get() {
             // Cache is full, remove the least recently used page
             if let Some((pn, mut page)) = cache.pop_lru() {
-                self.evict_cache(file, pn, &mut page)?;
-                evicted = Some((pn, page));
+                let retain_page = self.evict_cache(file, pn, &mut page)?;
+                let page = retain_page.then_some(page);
+                evicted = Some(EvictedPage { pn, _page: page });
             }
         }
 
@@ -693,12 +724,12 @@ impl CachedFile {
 
     /// Invokes `f` with the cached page at `pn`, loading it from disk if absent.
     ///
-    /// If loading the page causes an eviction, the evicted `(page_number, page)`
-    /// pair is also passed to `f`.
+    /// If loading the page causes an eviction, the evicted page is also passed
+    /// to `f`.
     pub fn with_page_or_insert<R>(
         &self,
         pn: u32,
-        f: impl FnOnce(&mut PageCache, Option<(u32, PageCache)>) -> VfsResult<R>,
+        f: impl FnOnce(&mut PageCache, Option<EvictedPage>) -> VfsResult<R>,
     ) -> VfsResult<R> {
         let mut guard = self.shared.page_cache.lock();
         let evicted = self.ensure_page_cached(self.inner.entry().as_file()?, &mut guard, pn)?;
@@ -838,7 +869,7 @@ impl CachedFile {
                 if let Some(mut page) = self.pop_cached_page(pn) {
                     // Don't write back pages since they're discarded.
                     page.clear_dirty();
-                    self.evict_cache(file, pn, &mut page)?;
+                    let _ = self.evict_cache(file, pn, &mut page)?;
                 }
             }
         } else if old_len > len {

@@ -21,8 +21,7 @@ struct FileFutexKey {
     inode: u64,
 }
 
-static FILE_FUTEX_HANDLES: Mutex<BTreeMap<FileFutexKey, Weak<()>>> =
-    Mutex::new(BTreeMap::new());
+static FILE_FUTEX_HANDLES: Mutex<BTreeMap<FileFutexKey, Weak<()>>> = Mutex::new(BTreeMap::new());
 
 fn file_futex_handle(cache: &CachedFile) -> Arc<()> {
     let loc = cache.location();
@@ -312,8 +311,9 @@ impl BackendOps for FileBackend {
                 Err(PagingError::NotMapped) => {
                     let map_flags = flags - MappingFlags::WRITE;
                     self.0.cache.with_page_or_insert(pn, |page, evicted| {
-                        if let Some((pn, _)) = evicted {
-                            to_be_evicted.push(pn);
+                        let evicted = evicted;
+                        if let Some(evicted) = evicted.as_ref() {
+                            to_be_evicted.push(evicted.page_number());
                         }
                         pt.map(
                             addr,
