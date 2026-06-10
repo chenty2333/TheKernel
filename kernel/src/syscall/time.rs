@@ -16,8 +16,8 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     task::{
-        AlarmClock, AsThread, ITimerType, PosixTimer, PosixTimerClock, PosixTimerNotify,
-        nanos_to_clock_ticks, register_posix_timer_alarm,
+        AlarmClock, AsThread, ITimerType, PosixTimer, PosixTimerClock, PosixTimerNotify, TaskUsage,
+        get_task, nanos_to_clock_ticks, register_posix_timer_alarm,
     },
     time::{TimeValueLike, set_wall_time, wall_time, wall_time_nanos},
 };
@@ -66,6 +66,14 @@ const STA_MODE: i32 = 0x4000;
 
 const TIME_OK: isize = 0;
 const TIME_ERROR: isize = 5;
+const CPUCLOCK_PROF: i32 = 0;
+const CPUCLOCK_VIRT: i32 = 1;
+const CPUCLOCK_SCHED: i32 = 2;
+const CPUCLOCK_MAX: i32 = 3;
+const CPUCLOCK_PERTHREAD_MASK: i32 = 4;
+const CPUCLOCK_CLOCK_MASK: i32 = 3;
+const CLOCKFD: i32 = CPUCLOCK_MAX;
+const CLOCKFD_MASK: i32 = CPUCLOCK_PERTHREAD_MASK | CPUCLOCK_CLOCK_MASK;
 
 const TIMEX_SETTABLE_STATUS_BITS: i32 = STA_PLL
     | STA_PPSFREQ
@@ -80,6 +88,17 @@ const TIMEX_SETTABLE_BIT_MODES: u32 = ADJ_ALL | ADJ_MICRO | ADJ_NANO;
 const ADJ_SINGLESHOT_FLAG: u32 = ADJ_OFFSET_SINGLESHOT & !ADJ_OFFSET;
 
 fn clock_domain(clock_id: __kernel_clockid_t) -> AxResult<ClockDomain> {
+    if let Some(clock) = decode_cpu_clock_id(clock_id) {
+        return Ok(match clock.target {
+            CpuClockTarget::Process(_) => ClockDomain::ProcessCpu,
+            CpuClockTarget::Thread(_) => ClockDomain::ThreadCpu,
+        });
+    }
+
+    if clock_id < 0 {
+        return Err(AxError::InvalidInput);
+    }
+
     match clock_id as u32 {
         CLOCK_REALTIME | CLOCK_REALTIME_ALARM => Ok(ClockDomain::Realtime),
         CLOCK_REALTIME_COARSE => Ok(ClockDomain::RealtimeCoarse),
@@ -114,14 +133,8 @@ fn clock_now(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {
             monotonic_time(),
             coarse_clock_resolution(),
         )),
-        ClockDomain::ProcessCpu => {
-            let usage = current().as_thread().proc_data.self_usage();
-            Ok(usage.utime() + usage.stime())
-        }
-        ClockDomain::ThreadCpu => {
-            let (utime, stime) = current().as_thread().time.borrow().output();
-            Ok(utime + stime)
-        }
+        ClockDomain::ProcessCpu => cpu_clock_now(clock_id),
+        ClockDomain::ThreadCpu => cpu_clock_now(clock_id),
         ClockDomain::Tai => Ok(TimeValue::from_nanos(
             wall_time_nanos() + DEFAULT_TAI_OFFSET_SECS * NANOS_PER_SEC,
         )),
@@ -223,6 +236,79 @@ impl TimexState {
 }
 
 static TIMEX_STATE: SpinNoIrq<TimexState> = SpinNoIrq::new(TimexState::new());
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CpuClockTarget {
+    Process(u32),
+    Thread(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CpuClockId {
+    target: CpuClockTarget,
+    which: i32,
+}
+
+fn decode_cpu_clock_id(clock_id: __kernel_clockid_t) -> Option<CpuClockId> {
+    let raw = clock_id;
+    if raw < 0 {
+        if (raw & CLOCKFD_MASK) == CLOCKFD {
+            return None;
+        }
+        let which = raw & CPUCLOCK_CLOCK_MASK;
+        if which >= CPUCLOCK_MAX {
+            return None;
+        }
+        let id = !(raw >> 3);
+        if id < 0 {
+            return None;
+        }
+        let id = id as u32;
+        let target = if raw & CPUCLOCK_PERTHREAD_MASK != 0 {
+            CpuClockTarget::Thread(id)
+        } else {
+            CpuClockTarget::Process(id)
+        };
+        return Some(CpuClockId { target, which });
+    }
+
+    match raw as u32 {
+        CLOCK_PROCESS_CPUTIME_ID => Some(CpuClockId {
+            target: CpuClockTarget::Process(0),
+            which: CPUCLOCK_SCHED,
+        }),
+        CLOCK_THREAD_CPUTIME_ID => Some(CpuClockId {
+            target: CpuClockTarget::Thread(0),
+            which: CPUCLOCK_SCHED,
+        }),
+        _ => None,
+    }
+}
+
+fn usage_value_for_cpu_clock(usage: TaskUsage, which: i32) -> TimeValue {
+    match which {
+        CPUCLOCK_PROF | CPUCLOCK_SCHED => usage.utime() + usage.stime(),
+        CPUCLOCK_VIRT => usage.utime(),
+        _ => TimeValue::ZERO,
+    }
+}
+
+fn cpu_clock_now(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {
+    let decoded = decode_cpu_clock_id(clock_id).ok_or(AxError::InvalidInput)?;
+    let usage = match decoded.target {
+        CpuClockTarget::Process(0) => current().as_thread().proc_data.self_usage(),
+        CpuClockTarget::Thread(0) => TaskUsage::from_thread(current().as_thread()),
+        CpuClockTarget::Process(pid) => {
+            let task = get_task(pid)?;
+            task.as_thread().proc_data.self_usage()
+        }
+        CpuClockTarget::Thread(tid) => {
+            let task = get_task(tid)?;
+            TaskUsage::from_thread(task.as_thread())
+        }
+    };
+    Ok(usage_value_for_cpu_clock(usage, decoded.which))
+}
 
 fn timex_tick_bounds() -> (i64, i64) {
     let hz = axconfig::TICKS_PER_SEC as i64;
@@ -760,9 +846,41 @@ mod tests {
         assert_eq!(clock_domain(CLOCK_TAI as _), Ok(ClockDomain::Tai));
     }
 
+    fn make_process_cpuclock(pid: u32, which: i32) -> __kernel_clockid_t {
+        (!(pid as i32) << 3) | which
+    }
+
+    fn make_thread_cpuclock(tid: u32, which: i32) -> __kernel_clockid_t {
+        make_process_cpuclock(tid, which | CPUCLOCK_PERTHREAD_MASK)
+    }
+
+    #[test]
+    fn clock_domain_accepts_linux_encoded_cpu_clock_ids() {
+        assert_eq!(
+            clock_domain(make_process_cpuclock(123, CPUCLOCK_SCHED)),
+            Ok(ClockDomain::ProcessCpu)
+        );
+        assert_eq!(
+            clock_domain(make_thread_cpuclock(456, CPUCLOCK_SCHED)),
+            Ok(ClockDomain::ThreadCpu)
+        );
+        assert_eq!(
+            clock_domain(make_thread_cpuclock(456, CPUCLOCK_VIRT)),
+            Ok(ClockDomain::ThreadCpu)
+        );
+    }
+
     #[test]
     fn clock_domain_rejects_invalid_ids() {
         assert_eq!(clock_domain(-1), Err(AxError::InvalidInput));
+        assert_eq!(
+            clock_domain(make_process_cpuclock(1, CLOCKFD)),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            clock_domain(make_thread_cpuclock(1, CLOCKFD)),
+            Err(AxError::InvalidInput)
+        );
         assert_eq!(clock_domain(MAX_CLOCKS as _), Err(AxError::InvalidInput));
         assert_eq!(
             clock_domain((MAX_CLOCKS + 1) as _),
@@ -779,6 +897,10 @@ mod tests {
         assert_eq!(
             clock_resolution(CLOCK_REALTIME_COARSE as _),
             Ok(coarse_clock_resolution())
+        );
+        assert_eq!(
+            clock_resolution(make_thread_cpuclock(123, CPUCLOCK_SCHED)),
+            Ok(fine_clock_resolution())
         );
         assert_eq!(clock_resolution(-1), Err(AxError::InvalidInput));
     }

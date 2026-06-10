@@ -49,9 +49,9 @@ pub enum TaskState {
 )]
 pub trait TaskExt {
     /// Called when the task is switched in.
-    fn on_enter(&self) {}
+    fn on_enter(&self, _task: &TaskInner) {}
     /// Called when the task is switched out.
-    fn on_leave(&self) {}
+    fn on_leave(&self, _task: &TaskInner) {}
 }
 
 /// The inner task structure.

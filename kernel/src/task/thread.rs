@@ -11,13 +11,13 @@ use axtask::{TaskExt, TaskInner};
 use extern_trait::extern_trait;
 use scope_local::{ActiveScope, Scope};
 use starry_process::Pid;
-use starry_signal::api::ThreadSignalManager;
+use starry_signal::{SignalInfo, api::ThreadSignalManager};
 
 use super::{
+    ProcessData,
     accounting::{AtomicTaskUsage, TaskUsage},
     restart::RestartTracker,
     timer::TimeManager,
-    ProcessData,
 };
 
 ///  A wrapper type that assumes the inner type is `Sync`.
@@ -214,6 +214,28 @@ impl Thread {
     pub(crate) fn set_proc_state_hint(&self, hint: ProcStateHint) {
         self.proc_state_hint.store(hint as u8, Ordering::Release);
     }
+
+    fn pause_cpu_accounting_for_switch(&self, task: &TaskInner) {
+        let Ok(mut time) = self.time.try_borrow_mut() else {
+            return;
+        };
+        time.pause_for_switch(|signo| {
+            if self.signal.send_signal(SignalInfo::new_kernel(signo)) {
+                task.interrupt();
+            }
+        });
+        let (utime, stime) = time.output();
+        self.store_usage_snapshot(TaskUsage::from_time_values(utime, stime));
+    }
+
+    fn resume_cpu_accounting_after_switch(&self) {
+        let Ok(mut time) = self.time.try_borrow_mut() else {
+            return;
+        };
+        time.resume_after_switch();
+        let (utime, stime) = time.output();
+        self.store_usage_snapshot(TaskUsage::from_time_values(utime, stime));
+    }
 }
 
 #[repr(u8)]
@@ -237,13 +259,15 @@ impl From<u8> for ProcStateHint {
 
 #[extern_trait]
 impl TaskExt for Box<Thread> {
-    fn on_enter(&self) {
+    fn on_enter(&self, _task: &TaskInner) {
         let scope = self.proc_data.scope.read();
         unsafe { ActiveScope::set(&scope) };
         core::mem::forget(scope);
+        self.resume_cpu_accounting_after_switch();
     }
 
-    fn on_leave(&self) {
+    fn on_leave(&self, task: &TaskInner) {
+        self.pause_cpu_accounting_for_switch(task);
         ActiveScope::set_global();
         unsafe { self.proc_data.scope.force_read_decrement() };
     }

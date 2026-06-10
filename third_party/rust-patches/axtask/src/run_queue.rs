@@ -790,10 +790,10 @@ impl AxRunQueue {
             use crate::TaskExt;
 
             if let Some(ext) = prev_task.task_ext() {
-                ext.on_leave()
+                ext.on_leave(&prev_task)
             }
             if let Some(ext) = next_task.task_ext() {
-                ext.on_enter()
+                ext.on_enter(&next_task)
             }
         }
 

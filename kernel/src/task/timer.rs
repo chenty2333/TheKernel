@@ -304,7 +304,7 @@ impl ITimer {
 }
 
 /// Represents the state of the timer.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TimerState {
     /// Fallback state.
     None,
@@ -319,8 +319,10 @@ pub enum TimerState {
 pub struct TimeManager {
     utime_ns: usize,
     stime_ns: usize,
+    last_cpu_ns: usize,
     last_wall_ns: usize,
     state: TimerState,
+    paused_state: TimerState,
     itimers: [ITimer; 3],
 }
 
@@ -335,8 +337,10 @@ impl TimeManager {
         Self {
             utime_ns: 0,
             stime_ns: 0,
+            last_cpu_ns: 0,
             last_wall_ns: 0,
             state: TimerState::None,
+            paused_state: TimerState::None,
             itimers: Default::default(),
         }
     }
@@ -352,26 +356,43 @@ impl TimeManager {
     /// necessary.
     pub fn poll(&mut self, emitter: impl Fn(Signo)) {
         let now_ns = monotonic_time_nanos() as usize;
-        let delta = now_ns - self.last_wall_ns;
+        let wall_delta = now_ns.saturating_sub(self.last_wall_ns);
+        let cpu_delta = now_ns.saturating_sub(self.last_cpu_ns);
         match self.state {
             TimerState::User => {
-                self.utime_ns += delta;
-                self.update_itimer(ITimerType::Virtual, delta, &emitter);
-                self.update_itimer(ITimerType::Prof, delta, &emitter);
+                self.utime_ns += cpu_delta;
+                self.update_itimer(ITimerType::Virtual, cpu_delta, &emitter);
+                self.update_itimer(ITimerType::Prof, cpu_delta, &emitter);
             }
             TimerState::Kernel => {
-                self.stime_ns += delta;
-                self.update_itimer(ITimerType::Prof, delta, &emitter);
+                self.stime_ns += cpu_delta;
+                self.update_itimer(ITimerType::Prof, cpu_delta, &emitter);
             }
             TimerState::None => {}
         }
-        self.update_itimer(ITimerType::Real, delta, &emitter);
+        self.update_itimer(ITimerType::Real, wall_delta, &emitter);
+        self.last_cpu_ns = now_ns;
         self.last_wall_ns = now_ns;
     }
 
     /// Updates the timer state.
     pub fn set_state(&mut self, state: TimerState) {
+        self.last_cpu_ns = monotonic_time_nanos() as usize;
         self.state = state;
+    }
+
+    /// Pauses CPU-time accounting while this thread is not running.
+    pub fn pause_for_switch(&mut self, emitter: impl Fn(Signo)) {
+        self.poll(emitter);
+        self.paused_state = self.state;
+        self.set_state(TimerState::None);
+    }
+
+    /// Resumes the CPU-time accounting state that was active before switch-out.
+    pub fn resume_after_switch(&mut self) {
+        let state = self.paused_state;
+        self.paused_state = TimerState::None;
+        self.set_state(state);
     }
 
     /// Sets the interval timer of the specified type with the given interval
