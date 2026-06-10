@@ -23,7 +23,7 @@ use axtask::{
 use linux_raw_sys::general::{
     DN_ATTRIB, DN_MULTISHOT, DN_RENAME, IN_ACCESS, IN_ALL_EVENTS, IN_ATTRIB, IN_CLOSE_NOWRITE,
     IN_CLOSE_WRITE, IN_DELETE_SELF, IN_EXCL_UNLINK, IN_IGNORED, IN_ISDIR, IN_MODIFY, IN_MOVE_SELF,
-    IN_ONESHOT, IN_Q_OVERFLOW, POLL_MSG, SI_SIGIO, inotify_event,
+    IN_ONESHOT, IN_Q_OVERFLOW, IN_UNMOUNT, POLL_MSG, SI_SIGIO, inotify_event,
 };
 use spin::Mutex;
 use starry_process::Pid;
@@ -161,14 +161,14 @@ impl InotifyFile {
         if state.queue.back().is_some_and(|last| *last == event) {
             return false;
         }
+        if state
+            .queue
+            .iter()
+            .any(|queued| queued.mask == IN_Q_OVERFLOW && queued.wd == -1)
+        {
+            return false;
+        }
         if event.mask != IN_Q_OVERFLOW && state.queue.len() >= MAX_QUEUED_EVENTS {
-            if state
-                .queue
-                .iter()
-                .any(|queued| queued.mask == IN_Q_OVERFLOW && queued.wd == -1)
-            {
-                return false;
-            }
             state.queue.push_back(QueuedEvent {
                 wd: -1,
                 mask: IN_Q_OVERFLOW,
@@ -266,6 +266,47 @@ impl Pollable for InotifyFile {
             self.poll_rx.register(context.waker());
         }
     }
+}
+
+pub(crate) fn notify_unmount(root: &Location) -> AxResult<()> {
+    let dev = root.metadata()?.device;
+    each_inotify_file(|file| {
+        let mut state = file.state.lock();
+        let mut wake = false;
+        let mut idx = 0;
+        while idx < state.watches.len() {
+            if state.watches[idx].key.dev != dev {
+                idx += 1;
+                continue;
+            }
+
+            let wd = state.watches[idx].wd;
+            state.watches.remove(idx);
+            wake |= InotifyFile::enqueue_locked(
+                &mut state,
+                QueuedEvent {
+                    wd,
+                    mask: IN_UNMOUNT,
+                    cookie: 0,
+                    name: Vec::new(),
+                },
+            );
+            wake |= InotifyFile::enqueue_locked(
+                &mut state,
+                QueuedEvent {
+                    wd,
+                    mask: IN_IGNORED,
+                    cookie: 0,
+                    name: Vec::new(),
+                },
+            );
+        }
+        drop(state);
+        if wake {
+            file.poll_rx.wake();
+        }
+    });
+    Ok(())
 }
 
 fn each_inotify_file(mut f: impl FnMut(&Arc<InotifyFile>)) {

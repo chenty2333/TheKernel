@@ -45,7 +45,10 @@ use crate::{
         set_domainname_bytes, set_msg_next_id, set_msgmni_limit, set_shmmax_limit, shmall_limit,
         shmmax_limit, shmmni_limit, sysvipc_msg_snapshot,
     },
-    task::{AsThread, get_task, get_visible_task_including_exiting, render_task_stat, tasks},
+    task::{
+        AsThread, get_process_data, get_task, get_visible_task_including_exiting,
+        render_task_stat, tasks,
+    },
 };
 
 const PROC_PID_MAX_MIN: u32 = 301;
@@ -77,6 +80,23 @@ fn render_mounts() -> String {
         );
     }
     out
+}
+
+fn proc_task_for_pid(pid: u32) -> VfsResult<AxTaskRef> {
+    if let Ok(task) = get_visible_task_including_exiting(pid) {
+        return Ok(task);
+    }
+
+    let proc_data = get_process_data(pid).map_err(|_| VfsError::NotFound)?;
+    for tid in proc_data.proc.threads() {
+        if let Ok(task) = get_task(tid)
+            && !task.as_thread().pending_exit()
+        {
+            return Ok(task);
+        }
+    }
+
+    Err(VfsError::NotFound)
 }
 
 fn real_meminfo() -> String {
@@ -188,7 +208,7 @@ impl SimpleDirOps for ProcessTaskDir {
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         let process = self.process.upgrade().ok_or(VfsError::NotFound)?;
         let tid = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-        let task = get_visible_task_including_exiting(tid).map_err(|_| VfsError::NotFound)?;
+        let task = proc_task_for_pid(tid)?;
         if task.as_thread().proc_data.proc.pid() != process.pid() {
             return Err(VfsError::NotFound);
         }
@@ -922,8 +942,8 @@ impl SimpleDirOps for ProcFsHandler {
         let task = if name == "self" {
             current().clone()
         } else {
-            let tid = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-            get_visible_task_including_exiting(tid).map_err(|_| VfsError::NotFound)?
+            let pid = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
+            proc_task_for_pid(pid)?
         };
         let node = NodeOpsMux::Dir(SimpleDir::new_maker(
             self.0.clone(),

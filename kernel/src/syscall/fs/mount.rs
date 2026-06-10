@@ -1,5 +1,6 @@
 use alloc::{
     borrow::Cow,
+    collections::BTreeMap,
     string::{String, ToString},
 };
 use core::{
@@ -18,7 +19,7 @@ use linux_raw_sys::general::{AT_EMPTY_PATH, O_CLOEXEC};
 use spin::Mutex;
 
 use crate::{
-    file::{FileLike, get_file_like, resolve_at, with_path_fs},
+    file::{FileLike, get_file_like, inotify::notify_unmount, resolve_at, with_path_fs},
     mm::vm_load_string,
     mounts,
     pseudofs::MemoryFs,
@@ -66,6 +67,9 @@ const MS_RDONLY: u32 = 0x1;
 const MS_REMOUNT: u32 = 0x20;
 const MOVE_MOUNT_F_EMPTY_PATH: u32 = 0x00000004;
 const MOVE_MOUNT__MASK: u32 = 0x00000077;
+
+static DEVICE_TMPFS_MOUNTS: Mutex<BTreeMap<(String, String), Filesystem>> =
+    Mutex::new(BTreeMap::new());
 
 struct FsOpenState {
     fs_type: String,
@@ -115,6 +119,19 @@ fn is_basic_compat_vfat_umount(target: &str) -> bool {
             | BASIC_COMPAT_MUSL_MOUNT_TARGET
             | BASIC_COMPAT_GLIBC_MOUNT_TARGET
     )
+}
+
+fn tmpfs_for_mount(source: &str, target_path: &str) -> Filesystem {
+    if !source.starts_with("/dev/") {
+        return MemoryFs::new();
+    }
+
+    let key = (source.to_string(), target_path.to_string());
+    DEVICE_TMPFS_MOUNTS
+        .lock()
+        .entry(key)
+        .or_insert_with(MemoryFs::new)
+        .clone()
 }
 
 impl FileLike for FsMountFd {
@@ -417,7 +434,7 @@ pub fn sys_mount(
     };
 
     let fs = if normalized_fs == "tmpfs" {
-        MemoryFs::new()
+        tmpfs_for_mount(&source, &target_path)
     } else if let Some(dev_name) = source.strip_prefix("/dev/") {
         let device_names = block_device_names();
         debug!("sys_mount: available extra block devices = {device_names:?}");
@@ -460,6 +477,7 @@ pub fn sys_umount2(target: *const c_char, _flags: i32) -> AxResult<isize> {
         .map_err(|_| AxError::InvalidInput)?
         .to_string();
     target.unmount()?;
+    let _ = notify_unmount(&target);
     mounts::remove(&target_path);
     Ok(0)
 }
