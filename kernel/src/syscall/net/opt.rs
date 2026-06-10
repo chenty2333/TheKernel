@@ -1,7 +1,8 @@
 use axerrno::{AxError, AxResult, LinuxError};
 use axnet::options::{Configurable, GetSocketOption, SetSocketOption};
 use linux_raw_sys::net::{
-    SO_ATTACH_BPF, SO_DETACH_BPF, SO_OOBINLINE, SO_SNDBUFFORCE, SOL_SOCKET, socklen_t,
+    AF_INET, IPV6_ADDRFORM, SO_ATTACH_BPF, SO_DETACH_BPF, SO_OOBINLINE, SO_SNDBUFFORCE, SOL_IPV6,
+    SOL_SOCKET, socklen_t,
 };
 
 use crate::{
@@ -228,6 +229,13 @@ pub fn sys_setsockopt(
     let socket = Socket::from_fd(fd)?;
     if level == SOL_SOCKET && optname == SO_OOBINLINE {
         let _ = get::<i32>(optval, optlen)?;
+        return Ok(0);
+    }
+    if level == SOL_IPV6 && optname == IPV6_ADDRFORM {
+        if *get::<i32>(optval, optlen)? as u32 != AF_INET {
+            return Err(AxError::from(LinuxError::EAFNOSUPPORT));
+        }
+        socket.set_ipv6_addrform_to_ipv4()?;
         return Ok(0);
     }
     if level == PROTO_IP {

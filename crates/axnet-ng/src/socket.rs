@@ -231,4 +231,22 @@ impl Socket {
             Socket::Vsock(vsock) => vsock.set_filter(filter),
         }
     }
+
+    pub fn disconnect(&self) -> AxResult<()> {
+        match self {
+            Socket::Tcp(tcp) => tcp.disconnect(),
+            Socket::Udp(_) | Socket::Unix(_) => Err(AxError::OperationNotSupported),
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(_) => Err(AxError::OperationNotSupported),
+        }
+    }
+
+    pub fn set_ipv6_addrform_to_ipv4(&self) -> AxResult<()> {
+        match self {
+            Socket::Tcp(tcp) => tcp.set_ipv6_addrform_to_ipv4(),
+            Socket::Udp(_) | Socket::Unix(_) => Err(AxError::from(LinuxError::ENOPROTOOPT)),
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(_) => Err(AxError::from(LinuxError::ENOPROTOOPT)),
+        }
+    }
 }

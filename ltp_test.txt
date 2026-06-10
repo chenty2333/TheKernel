@@ -1182,3 +1182,4 @@ ioctl_ns01
 ioctl_ns02
 ioctl_ns03
 fork13
+connect02

@@ -5,14 +5,14 @@ use core::{
     task::Context,
 };
 
-use axerrno::{AxError, AxResult, ax_bail, ax_err_type};
+use axerrno::{AxError, AxResult, LinuxError, ax_bail, ax_err_type};
 use axio::prelude::*;
 use axpoll::{IoEvents, PollSet, Pollable};
 use smoltcp::{
     iface::SocketHandle,
     socket::tcp as smol,
     time::Duration,
-    wire::{IpEndpoint, IpListenEndpoint},
+    wire::{IpEndpoint, IpListenEndpoint, IpVersion},
 };
 
 use crate::{
@@ -189,6 +189,65 @@ impl TcpSocket {
         _filter: Option<alloc::sync::Arc<dyn crate::SocketFilter>>,
     ) -> AxResult<()> {
         Ok(())
+    }
+
+    pub fn set_ipv6_addrform_to_ipv4(&self) -> AxResult<()> {
+        if self.state() != State::Connected {
+            return Err(AxError::from(LinuxError::ENOTCONN));
+        }
+
+        let is_ipv4_connection = self.with_smol_socket(|socket| {
+            socket
+                .remote_endpoint()
+                .is_some_and(|endpoint| matches!(endpoint.addr.version(), IpVersion::Ipv4))
+        });
+        if !is_ipv4_connection {
+            return Err(AxError::from(LinuxError::EADDRNOTAVAIL));
+        }
+
+        Ok(())
+    }
+
+    pub fn disconnect(&self) -> AxResult<()> {
+        if let Ok(guard) = self.state.lock(State::Listening) {
+            return guard.transit(State::Idle, || {
+                self.stack
+                    .listen_table
+                    .unlisten(self.bound_endpoint()?.port);
+                self.with_smol_socket(|socket| {
+                    socket.abort();
+                    socket.set_bound_endpoint(IpListenEndpoint::default());
+                });
+                self.rx_closed.store(false, Ordering::Release);
+                self.poll_rx_closed.wake();
+                self.stack.poll_interfaces();
+                Ok(())
+            });
+        }
+
+        let guard = match self.state.lock(State::Connected) {
+            Ok(guard) => guard,
+            Err(State::Closed) => self
+                .state
+                .lock(State::Closed)
+                .map_err(|_| ax_err_type!(InvalidInput, "busy"))?,
+            Err(State::Idle) => return Ok(()),
+            Err(State::Connecting) => ax_bail!(InvalidInput, "connect in progress"),
+            Err(State::Connected) | Err(State::Listening) | Err(State::Busy) => {
+                ax_bail!(InvalidInput, "busy")
+            }
+        };
+
+        guard.transit(State::Idle, || {
+            self.with_smol_socket(|socket| {
+                socket.abort();
+                socket.set_bound_endpoint(IpListenEndpoint::default());
+            });
+            self.rx_closed.store(false, Ordering::Release);
+            self.poll_rx_closed.wake();
+            self.stack.poll_interfaces();
+            Ok(())
+        })
     }
 }
 

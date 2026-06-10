@@ -1,3 +1,5 @@
+use core::mem::size_of;
+
 use axerrno::{AxError, AxResult, LinuxError};
 #[cfg(feature = "vsock")]
 use axnet::vsock::{VsockSocket, VsockStreamTransport};
@@ -11,8 +13,9 @@ use axtask::current;
 use linux_raw_sys::{
     general::{O_CLOEXEC, O_NONBLOCK},
     net::{
-        AF_INET, AF_INET6, AF_PACKET, AF_UNIX, AF_VSOCK, IPPROTO_TCP, IPPROTO_UDP, SHUT_RD,
-        SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, sockaddr, socklen_t,
+        AF_INET, AF_INET6, AF_PACKET, AF_UNIX, AF_UNSPEC, AF_VSOCK, IPPROTO_TCP, IPPROTO_UDP,
+        SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, sockaddr,
+        socklen_t,
     },
 };
 
@@ -164,6 +167,17 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
 }
 
 pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult<isize> {
+    if addrlen as usize >= size_of::<linux_raw_sys::net::__kernel_sa_family_t>()
+        && (*addr
+            .cast::<linux_raw_sys::net::__kernel_sa_family_t>()
+            .get_as_ref()? as u32)
+            == AF_UNSPEC
+    {
+        debug!("sys_connect <= fd: {fd}, addr: AF_UNSPEC");
+        Socket::from_fd(fd)?.disconnect()?;
+        return Ok(0);
+    }
+
     let addr = SocketAddrEx::read_from_user(addr, addrlen)?;
     debug!("sys_connect <= fd: {fd}, addr: {addr:?}");
 
