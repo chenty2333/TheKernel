@@ -25,6 +25,10 @@ use axhal::paging::MappingFlags;
 use axpoll::{IoEvents, Pollable};
 use axtask::{AxTaskRef, TaskState, WeakAxTaskRef, current};
 use inherit_methods_macro::inherit_methods;
+use linux_raw_sys::{
+    general::{CLONE_NEWPID, CLONE_NEWUTS},
+    ioctl::{NS_GET_NSTYPE, NS_GET_OWNER_UID, NS_GET_PARENT},
+};
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use starry_process::Process;
 
@@ -388,6 +392,138 @@ impl SimpleDirOps for ThreadFdInfoDir {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ProcNamespaceKind {
+    Pid,
+    Uts,
+}
+
+struct ProcNamespaceFile {
+    node: SimpleFsNode,
+    kind: ProcNamespaceKind,
+    task: WeakAxTaskRef,
+}
+
+impl ProcNamespaceFile {
+    fn new(fs: Arc<SimpleFs>, kind: ProcNamespaceKind, task: WeakAxTaskRef) -> Arc<Self> {
+        Arc::new(Self {
+            node: SimpleFsNode::new(
+                fs,
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o444),
+            ),
+            kind,
+            task,
+        })
+    }
+
+    fn nstype(&self) -> u32 {
+        match self.kind {
+            ProcNamespaceKind::Pid => CLONE_NEWPID,
+            ProcNamespaceKind::Uts => CLONE_NEWUTS,
+        }
+    }
+}
+
+#[inherit_methods(from = "self.node")]
+impl NodeOps for ProcNamespaceFile {
+    fn inode(&self) -> u64;
+
+    fn metadata(&self) -> VfsResult<Metadata>;
+
+    fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()>;
+
+    fn filesystem(&self) -> &dyn FilesystemOps;
+
+    fn sync(&self, _data_only: bool) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+
+    fn len(&self) -> VfsResult<u64> {
+        Ok(0)
+    }
+
+    fn flags(&self) -> NodeFlags {
+        NodeFlags::NON_CACHEABLE
+    }
+}
+
+impl FileNodeOps for ProcNamespaceFile {
+    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
+        self.task.upgrade().ok_or(VfsError::NotFound)?;
+        Ok(0)
+    }
+
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        Err(VfsError::BadFileDescriptor)
+    }
+
+    fn append(&self, _buf: &[u8]) -> VfsResult<(usize, u64)> {
+        Err(VfsError::BadFileDescriptor)
+    }
+
+    fn set_len(&self, _len: u64) -> VfsResult<()> {
+        Err(VfsError::BadFileDescriptor)
+    }
+
+    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+        Err(VfsError::BadFileDescriptor)
+    }
+
+    fn ioctl(&self, cmd: u32, _arg: usize) -> VfsResult<usize> {
+        self.task.upgrade().ok_or(VfsError::NotFound)?;
+        match cmd {
+            NS_GET_PARENT => match self.kind {
+                ProcNamespaceKind::Pid => Err(VfsError::OperationNotPermitted),
+                ProcNamespaceKind::Uts => Err(VfsError::InvalidInput),
+            },
+            NS_GET_OWNER_UID => Err(VfsError::InvalidInput),
+            NS_GET_NSTYPE => Ok(self.nstype() as usize),
+            _ => Err(VfsError::NotATty),
+        }
+    }
+}
+
+impl Pollable for ProcNamespaceFile {
+    fn poll(&self) -> IoEvents {
+        IoEvents::IN | IoEvents::OUT
+    }
+
+    fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+}
+
+struct ThreadNamespaceDir {
+    fs: Arc<SimpleFs>,
+    task: WeakAxTaskRef,
+}
+
+impl SimpleDirOps for ThreadNamespaceDir {
+    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+        if self.task.upgrade().is_none() {
+            return Box::new(iter::empty());
+        }
+        Box::new(["pid", "uts"].into_iter().map(Cow::Borrowed))
+    }
+
+    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+        self.task.upgrade().ok_or(VfsError::NotFound)?;
+        let kind = match name {
+            "pid" => ProcNamespaceKind::Pid,
+            "uts" => ProcNamespaceKind::Uts,
+            _ => return Err(VfsError::NotFound),
+        };
+        Ok(ProcNamespaceFile::new(self.fs.clone(), kind, self.task.clone()).into())
+    }
+
+    fn is_cacheable(&self) -> bool {
+        false
+    }
+}
+
 /// The /proc/[pid] directory
 struct ThreadDir {
     fs: Arc<SimpleFs>,
@@ -618,6 +754,7 @@ impl SimpleDirOps for ThreadDir {
                 Some("exe"),
                 Some("fd"),
                 Some("fdinfo"),
+                Some("ns"),
             ]
             .into_iter()
             .flatten()
@@ -743,6 +880,14 @@ impl SimpleDirOps for ThreadDir {
             "fdinfo" => SimpleDir::new_maker(
                 fs.clone(),
                 Arc::new(ThreadFdInfoDir {
+                    fs,
+                    task: Arc::downgrade(&task),
+                }),
+            )
+            .into(),
+            "ns" => SimpleDir::new_maker(
+                fs.clone(),
+                Arc::new(ThreadNamespaceDir {
                     fs,
                     task: Arc::downgrade(&task),
                 }),
