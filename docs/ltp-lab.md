@@ -21,6 +21,7 @@ Repository-owned entrypoints:
 - `make lab-campaign`
 - `make lab-list`
 - `make lab-plan`
+- `make lab-trim`
 - `make lab-clean`
 
 Generated local state:
@@ -29,7 +30,7 @@ Generated local state:
 - `.state/ltp-lab/inventory.json` records image, runtest, and current-list facts
 - `.state/ltp-lab/lists/` stores generated `ltp_test.txt` variants
 - `.state/ltp-lab/plans/` stores focused evaluator plans
-- `.state/ltp-lab/runs/<run-id>/` stores support images, replay logs, parsed cases, and summaries
+- `.state/ltp-lab/runs/<run-id>/` stores replay logs, parsed cases, summaries, and sometimes disposable support images/QEMU workdirs
 - `.state/ltp-lab/campaigns/<name>/` stores fixed candidate batches, semantic prompts, implementation ledgers, analysis, taxonomy, and promotion outputs
 - `.state/ltp-lab/refs/` is available for optional reference source trees
 
@@ -404,24 +405,28 @@ later, and writes a new list instead of editing root `ltp_test.txt`.
 
 ## Cleanup
 
-Remove generated run/list/plan state and old root-level score artifacts:
+Use short cleanup targets by default:
 
 ```bash
+make lab-trim
 make lab-clean
 ```
 
-Pass extra cleanup flags through `LAB_CLEAN_ARGS`:
+- `make lab-trim`: daily cleanup for disposable state after campaign evidence has
+  been analyzed or finished. It removes failed or zero-case lab runs, per-run
+  `support.img`, QEMU `work/`, smoke leftovers, baseline replay image copies,
+  and old root-level score artifacts. It keeps campaigns, cached official
+  images, and reference checkouts.
+- `make lab-clean`: stronger generated-state cleanup for run/list/plan state and
+  stale root score artifacts.
 
-```bash
-make lab-clean LAB_CLEAN_ARGS="--cache --dry-run"
-```
+Baseline replay directories under `.state/baseline/` keep logs and parsed
+evidence, but their copied `sdcard-*.img` and `disk*.img` files are removable
+heavy artifacts. `make lab-trim` removes those image copies without deleting the
+baseline evidence directory.
 
-Baseline replay directories under `.state/baseline/` are intentionally not part
-of `make lab-clean`; remove old baseline runs manually after their evidence has
-been superseded.
-
-`make lab-clean` keeps cached official image decompressions and optional
-reference checkouts. Remove those explicitly when needed:
+Both short targets keep cached official image decompressions and optional
+reference checkouts. Remove those explicitly only under disk pressure:
 
 ```bash
 ./scripts/oscomp.sh lab clean --cache --dry-run
@@ -431,7 +436,10 @@ reference checkouts. Remove those explicitly when needed:
 Useful cleanup modes:
 
 ```bash
-# Preview all generated run/list/plan removals.
+# Preview daily cleanup.
+./scripts/oscomp.sh lab clean --trim --dry-run
+
+# Preview generated run/list/plan removals.
 ./scripts/oscomp.sh lab clean --generated --dry-run
 
 # Preview campaign removals.
@@ -440,20 +448,11 @@ Useful cleanup modes:
 # Preview finish analysis and heavy per-run artifact cleanup.
 ./scripts/oscomp.sh lab campaign finish goal3-fs-vfs-0001 --dry-run
 
-# Remove failed or zero-case runs after an experiment pass.
-./scripts/oscomp.sh lab clean --failed-runs --empty-runs
-
 # Keep only the newest 10 run directories.
 ./scripts/oscomp.sh lab clean --runs --keep-runs 10
 
-# Remove large per-run QEMU workdirs while preserving console logs and parsed summaries.
-./scripts/oscomp.sh lab clean --workdirs --dry-run
-
-# Remove run support images older than one week while preserving logs.
-./scripts/oscomp.sh lab clean --support-images --older-than 7d
-
-# Remove stale smoke-named local experiments from older framework revisions.
-./scripts/oscomp.sh lab clean --smoke
+# Remove baseline replay image copies while preserving logs and parsed summaries.
+./scripts/oscomp.sh lab clean --baseline-heavy --dry-run
 
 # Remove the whole lab tree, cache, refs, inventory, and legacy root outputs.
 ./scripts/oscomp.sh lab clean --all --dry-run

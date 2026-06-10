@@ -75,6 +75,7 @@ help:
 		'  make lab-campaign LAB_ARGS="create goal3-fs-vfs-0001 --runtest fs --runtest syscalls --limit 120"' \
 		'  make lab-list LAB_ARGS="..."' \
 		'  make lab-run LAB_ARGS="..."' \
+		'  make lab-trim       daily cleanup of disposable lab artifacts' \
 		'  make lab-clean LAB_CLEAN_ARGS="..."'
 
 all:
@@ -181,6 +182,9 @@ lab-campaign:
 lab-clean:
 	@./scripts/oscomp.sh lab clean --generated --legacy-root $(LAB_CLEAN_ARGS)
 
+lab-trim:
+	@./scripts/oscomp.sh lab clean --trim $(LAB_CLEAN_ARGS)
+
 debug:
 	@printf '%s\n' 'debug is not wired to the official pre-2025 evaluator flow; use scripts/oscomp.sh run instead.' >&2
 	@exit 1
@@ -218,7 +222,7 @@ rv:
 la:
 	$(MAKE) ARCH=loongarch64 run
 
-.PHONY: help all artifacts kernels build run eval-rv eval-la replay-rv replay-la lab-check lab-inventory lab-plan lab-list lab-run lab-parse lab-summary lab-promote lab-campaign lab-clean dev-image dev-check dev-shell dev-shell-root debug disasm clean clean-eval legacy-clean prebuild-scrub check-eval-kernel-size kernel-rv kernel-la disk.img disk-la.img
+.PHONY: help all artifacts kernels build run eval-rv eval-la replay-rv replay-la lab-check lab-inventory lab-plan lab-list lab-run lab-parse lab-summary lab-promote lab-campaign lab-clean lab-trim dev-image dev-check dev-shell dev-shell-root debug disasm clean clean-eval legacy-clean prebuild-scrub check-eval-kernel-size kernel-rv kernel-la disk.img disk-la.img
 check-eval-kernel-size:
 	@for kernel in $(ROOT_DIR)/kernel-rv $(ROOT_DIR)/kernel-la; do \
 		[ -f "$$kernel" ] || continue; \

@@ -99,6 +99,7 @@ mod cfs_rt {
             nice: 0,
             rt_priority: 10,
             reset_on_fork: false,
+            ..Default::default()
         }));
         scheduler.add_task(fair.clone());
         scheduler.add_task(rt.clone());
@@ -121,6 +122,7 @@ mod cfs_rt {
             nice: 0,
             rt_priority: 50,
             reset_on_fork: false,
+            ..Default::default()
         }));
 
         scheduler.add_task(fair.clone());
@@ -141,12 +143,14 @@ mod cfs_rt {
             nice: 0,
             rt_priority: 10,
             reset_on_fork: false,
+            ..Default::default()
         }));
         assert!(high.configure(CfsTaskParams {
             class: CfsTaskClass::Fifo,
             nice: 0,
             rt_priority: 20,
             reset_on_fork: false,
+            ..Default::default()
         }));
         scheduler.add_task(low);
         scheduler.add_task(high);
@@ -166,6 +170,7 @@ mod cfs_rt {
                 nice: 0,
                 rt_priority: 42,
                 reset_on_fork: false,
+                ..Default::default()
             }));
             scheduler.add_task(task.clone());
         }
@@ -192,6 +197,7 @@ mod cfs_rt {
                 nice: 0,
                 rt_priority: 42,
                 reset_on_fork: false,
+                ..Default::default()
             }));
             scheduler.add_task(task.clone());
         }
@@ -222,6 +228,7 @@ mod cfs_rt {
                 nice: 0,
                 rt_priority: 99,
                 reset_on_fork: false,
+                ..Default::default()
             }));
             scheduler.add_task(task.clone());
         }
@@ -251,6 +258,7 @@ mod cfs_rt {
             nice: 0,
             rt_priority: 99,
             reset_on_fork: false,
+            ..Default::default()
         }));
         scheduler.add_task(fair);
         scheduler.add_task(rt);
@@ -258,7 +266,10 @@ mod cfs_rt {
         let running = scheduler.pick_next_task().unwrap();
         assert_eq!(*running.inner(), 2);
         for tick in 0..RR_TIMESLICE_TICKS {
-            assert_eq!(scheduler.task_tick(&running), tick + 1 == RR_TIMESLICE_TICKS);
+            assert_eq!(
+                scheduler.task_tick(&running),
+                tick + 1 == RR_TIMESLICE_TICKS
+            );
         }
         scheduler.put_prev_task(running, true);
 
@@ -282,6 +293,7 @@ mod cfs_rt {
                 nice: 0,
                 rt_priority: 99,
                 reset_on_fork: false,
+                ..Default::default()
             }));
             scheduler.add_task(task.clone());
         }
@@ -290,7 +302,10 @@ mod cfs_rt {
         let running = scheduler.pick_next_task().unwrap();
         assert_eq!(*running.inner(), 2);
         for tick in 0..RR_TIMESLICE_TICKS {
-            assert_eq!(scheduler.task_tick(&running), tick + 1 == RR_TIMESLICE_TICKS);
+            assert_eq!(
+                scheduler.task_tick(&running),
+                tick + 1 == RR_TIMESLICE_TICKS
+            );
         }
         scheduler.put_prev_task(running, true);
 
@@ -314,6 +329,7 @@ mod cfs_rt {
                 nice: 0,
                 rt_priority: 99,
                 reset_on_fork: false,
+                ..Default::default()
             }));
             scheduler.add_task(task.clone());
         }
@@ -321,7 +337,10 @@ mod cfs_rt {
 
         let running = scheduler.pick_next_task().unwrap();
         for tick in 0..RR_TIMESLICE_TICKS {
-            assert_eq!(scheduler.task_tick(&running), tick + 1 == RR_TIMESLICE_TICKS);
+            assert_eq!(
+                scheduler.task_tick(&running),
+                tick + 1 == RR_TIMESLICE_TICKS
+            );
         }
         scheduler.put_prev_task(running, true);
 
@@ -329,7 +348,8 @@ mod cfs_rt {
         assert_eq!(*fair.inner(), 1);
         assert!(
             !scheduler.task_tick(&fair),
-            "fair control task should get more than one tick to finish joins or command substitutions",
+            "fair control task should get more than one tick to finish joins or command \
+             substitutions",
         );
         assert!(
             scheduler.task_tick(&fair),

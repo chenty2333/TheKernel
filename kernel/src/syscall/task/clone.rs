@@ -221,12 +221,26 @@ impl CloneArgs {
                     child_sched_state.class = SchedClass::Normal;
                     child_sched_state.nice = 0;
                     child_sched_state.rt_priority = 0;
+                    child_sched_state.dl_runtime = 0;
+                    child_sched_state.dl_deadline = 0;
+                    child_sched_state.dl_period = 0;
                 }
                 SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
                     if child_sched_state.nice < 0 {
                         child_sched_state.nice = 0;
                     }
                     child_sched_state.rt_priority = 0;
+                    child_sched_state.dl_runtime = 0;
+                    child_sched_state.dl_deadline = 0;
+                    child_sched_state.dl_period = 0;
+                }
+                SchedClass::Deadline => {
+                    child_sched_state.class = SchedClass::Normal;
+                    child_sched_state.nice = 0;
+                    child_sched_state.rt_priority = 0;
+                    child_sched_state.dl_runtime = 0;
+                    child_sched_state.dl_deadline = 0;
+                    child_sched_state.dl_period = 0;
                 }
             }
         }
@@ -321,6 +335,7 @@ impl CloneArgs {
             proc_data.set_supplementary_groups(old_proc_data.supplementary_groups());
             proc_data.set_heap_top(old_proc_data.get_heap_top());
             proc_data.set_ioprio(old_proc_data.ioprio());
+            proc_data.inherit_mempolicy_from(old_proc_data);
             proc_data.inherit_timerslack_from(old_proc_data);
             if old_proc_data.no_new_privs() {
                 proc_data.set_no_new_privs();

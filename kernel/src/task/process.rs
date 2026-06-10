@@ -114,6 +114,74 @@ impl UtsNamespace {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mempolicy {
+    pub mode: u32,
+    pub nodemask: usize,
+}
+
+impl Mempolicy {
+    pub const fn new(mode: u32, nodemask: usize) -> Self {
+        Self { mode, nodemask }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MempolicyRange {
+    start: usize,
+    end: usize,
+    policy: Mempolicy,
+}
+
+#[derive(Clone, Debug)]
+struct MempolicyState {
+    process_policy: Mempolicy,
+    ranges: Vec<MempolicyRange>,
+}
+
+impl Default for MempolicyState {
+    fn default() -> Self {
+        Self {
+            process_policy: Mempolicy::new(0, 0),
+            ranges: Vec::new(),
+        }
+    }
+}
+
+impl MempolicyState {
+    fn remove_range(&mut self, start: usize, end: usize) {
+        let old_ranges = core::mem::take(&mut self.ranges);
+        for range in old_ranges {
+            if range.end <= start || range.start >= end {
+                self.ranges.push(range);
+                continue;
+            }
+            if range.start < start {
+                self.ranges.push(MempolicyRange {
+                    start: range.start,
+                    end: start,
+                    policy: range.policy,
+                });
+            }
+            if range.end > end {
+                self.ranges.push(MempolicyRange {
+                    start: end,
+                    end: range.end,
+                    policy: range.policy,
+                });
+            }
+        }
+    }
+
+    fn policy_for_addr(&self, addr: usize) -> Option<Mempolicy> {
+        self.ranges
+            .iter()
+            .rev()
+            .find(|range| addr >= range.start && addr < range.end)
+            .map(|range| range.policy)
+    }
+}
+
 /// [`Process`]-shared data.
 pub struct ProcessData {
     /// The process.
@@ -162,6 +230,8 @@ pub struct ProcessData {
     personality: AtomicU32,
     /// Raw Linux I/O priority value configured through ioprio_set(2).
     ioprio: AtomicU32,
+    /// NUMA memory policy state for the single-node kernel memory model.
+    mempolicy: SpinNoIrq<MempolicyState>,
     /// Parent-death signal configured through prctl(PR_SET_PDEATHSIG).
     pdeath_signal: AtomicU32,
     /// Current timer slack in nanoseconds.
@@ -244,6 +314,7 @@ impl ProcessData {
             supplementary_groups: SpinNoIrq::new(Vec::new()),
             personality: AtomicU32::new(0),
             ioprio: AtomicU32::new(0),
+            mempolicy: SpinNoIrq::new(MempolicyState::default()),
             pdeath_signal: AtomicU32::new(0),
             timerslack_current_ns: AtomicUsize::new(50_000),
             timerslack_default_ns: AtomicUsize::new(50_000),
@@ -421,6 +492,49 @@ impl ProcessData {
 
     pub fn set_ioprio(&self, ioprio: u32) {
         self.ioprio.store(ioprio, Ordering::Release);
+    }
+
+    pub fn mempolicy(&self) -> Mempolicy {
+        self.mempolicy.lock().process_policy
+    }
+
+    pub fn set_mempolicy(&self, policy: Mempolicy) {
+        self.mempolicy.lock().process_policy = policy;
+    }
+
+    pub fn inherit_mempolicy_from(&self, parent: &Self) {
+        let parent_state = parent.mempolicy.lock().clone();
+        *self.mempolicy.lock() = parent_state;
+    }
+
+    pub fn bind_mempolicy_range(&self, start: usize, size: usize, policy: Mempolicy) {
+        if size == 0 {
+            return;
+        }
+        let Some(end) = start.checked_add(size) else {
+            return;
+        };
+        let mut state = self.mempolicy.lock();
+        state.remove_range(start, end);
+        state.ranges.push(MempolicyRange { start, end, policy });
+    }
+
+    pub fn clear_mempolicy_range(&self, start: usize, size: usize) {
+        if size == 0 {
+            return;
+        }
+        let Some(end) = start.checked_add(size) else {
+            return;
+        };
+        self.mempolicy.lock().remove_range(start, end);
+    }
+
+    pub fn clear_mempolicy_ranges(&self) {
+        self.mempolicy.lock().ranges.clear();
+    }
+
+    pub fn mempolicy_for_addr(&self, addr: usize) -> Option<Mempolicy> {
+        self.mempolicy.lock().policy_for_addr(addr)
     }
 
     pub fn uid(&self) -> u32 {

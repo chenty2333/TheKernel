@@ -676,6 +676,9 @@ impl AxRunQueue {
                 nice: 0,
                 rt_priority: 0,
                 reset_on_fork: false,
+                dl_runtime: 0,
+                dl_deadline: 0,
+                dl_period: 0,
             }),
             "invalid gc scheduling state"
         );

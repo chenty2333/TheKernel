@@ -33,13 +33,13 @@ use crate::{
     mm::{Backend, BackendOps, system_memory_stats},
     mounts,
     pseudofs::{
-        dev::RANDOM_ENTROPY_BITS,
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
-        SimpleFileOperation, SimpleFs, SimpleFsNode,
+        SimpleFileOperation, SimpleFs, SimpleFsNode, dev::RANDOM_ENTROPY_BITS,
     },
     syscall::{
-        current_domainname_string, proc_version_string, set_domainname_bytes, set_shmmax_limit,
-        shmall_limit, shmmax_limit, shmmni_limit,
+        current_domainname_string, msg_next_id, msgmni_limit, proc_version_string,
+        set_domainname_bytes, set_msg_next_id, set_msgmni_limit, set_shmmax_limit, shmall_limit,
+        shmmax_limit, shmmni_limit, sysvipc_msg_snapshot,
     },
     task::{AsThread, get_task, get_visible_task_including_exiting, render_task_stat, tasks},
 };
@@ -705,6 +705,14 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             .ok_or(VfsError::InvalidInput)
     }
 
+    fn write_proc_i32(data: &[u8]) -> VfsResult<i32> {
+        str::from_utf8(data)
+            .ok()
+            .map(str::trim)
+            .and_then(|it| it.parse::<i32>().ok())
+            .ok_or(VfsError::InvalidInput)
+    }
+
     fn is_proc_truncate_write(data: &[u8]) -> bool {
         data.iter().all(|byte| byte.is_ascii_whitespace())
     }
@@ -714,6 +722,14 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         "mounts",
         SimpleFile::new_regular(fs.clone(), || Ok(render_mounts())),
     );
+    root.add("sysvipc", {
+        let mut sysvipc = DirMapping::new();
+        sysvipc.add(
+            "msg",
+            SimpleFile::new_regular(fs.clone(), || Ok(sysvipc_msg_snapshot())),
+        );
+        SimpleDir::new_maker(fs.clone(), Arc::new(sysvipc))
+    });
     root.add(
         "meminfo",
         SimpleFile::new_regular(fs.clone(), || Ok(real_meminfo())),
@@ -945,6 +961,44 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 SimpleFile::new_regular(fs.clone(), || Ok(alloc::format!("{}\n", shmall_limit()))),
             );
             kernel.add(
+                "msgmni",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => {
+                            Ok(Some(alloc::format!("{}\n", msgmni_limit()).into_bytes()))
+                        }
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let value = write_proc_usize(data)?;
+                            set_msgmni_limit(value);
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            kernel.add(
+                "msg_next_id",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => {
+                            Ok(Some(alloc::format!("{}\n", msg_next_id()).into_bytes()))
+                        }
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let value = write_proc_i32(data)?;
+                            set_msg_next_id(value).map_err(|_| VfsError::InvalidInput)?;
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            kernel.add(
                 "shmmax",
                 SimpleFile::new_regular(
                     fs.clone(),
@@ -980,9 +1034,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 let mut random = DirMapping::new();
                 random.add(
                     "entropy_avail",
-                    SimpleFile::new_regular(fs.clone(), || {
-                        Ok(format!("{RANDOM_ENTROPY_BITS}\n"))
-                    }),
+                    SimpleFile::new_regular(fs.clone(), || Ok(format!("{RANDOM_ENTROPY_BITS}\n"))),
                 );
 
                 SimpleDir::new_maker(fs.clone(), Arc::new(random))

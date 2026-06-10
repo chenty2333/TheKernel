@@ -1153,3 +1153,13 @@ ioprio_set01 ioprio_set01
 ioprio_set02 ioprio_set02
 ioprio_set03 ioprio_set03
 prctl06 prctl06
+msgget03 msgget03
+msgrcv05 msgrcv05
+msgrcv06 msgrcv06
+msgrcv07 msgrcv07
+msgrcv08 msgrcv08
+msgsnd01 msgsnd01
+msgsnd02 msgsnd02
+msgsnd05 msgsnd05
+msgsnd06 msgsnd06
+sched_getattr01 sched_getattr01

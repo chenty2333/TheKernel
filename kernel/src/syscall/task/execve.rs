@@ -280,6 +280,7 @@ fn do_execve(
     }
 
     proc_data.set_heap_top(USER_HEAP_BASE + crate::config::USER_HEAP_SIZE);
+    proc_data.clear_mempolicy_ranges();
 
     #[cfg(target_arch = "loongarch64")]
     reset_current_user_fpu_state();

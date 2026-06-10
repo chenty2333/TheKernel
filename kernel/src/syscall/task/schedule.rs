@@ -77,7 +77,7 @@ fn sched_class_from_policy(policy: i32) -> AxResult<SchedClass> {
         SCHED_IDLE => Ok(SchedClass::Idle),
         SCHED_FIFO => Ok(SchedClass::Fifo),
         SCHED_RR => Ok(SchedClass::RoundRobin),
-        SCHED_DEADLINE => Err(AxError::InvalidInput),
+        SCHED_DEADLINE => Ok(SchedClass::Deadline),
         _ => Err(AxError::InvalidInput),
     }
 }
@@ -145,6 +145,7 @@ fn linux_policy_from_state(state: SchedState) -> i32 {
         SchedClass::Idle => SCHED_IDLE as i32,
         SchedClass::Fifo => SCHED_FIFO as i32,
         SchedClass::RoundRobin => SCHED_RR as i32,
+        SchedClass::Deadline => SCHED_DEADLINE as i32,
     };
 
     if state.reset_on_fork {
@@ -157,15 +158,33 @@ fn linux_policy_from_state(state: SchedState) -> i32 {
 fn state_static_priority(state: SchedState) -> i32 {
     match state.class {
         SchedClass::Fifo | SchedClass::RoundRobin => state.rt_priority as i32,
-        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => 0,
+        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle | SchedClass::Deadline => 0,
     }
 }
 
 fn state_nice(state: SchedState) -> i32 {
     match state.class {
-        SchedClass::Fifo | SchedClass::RoundRobin => 0,
+        SchedClass::Fifo | SchedClass::RoundRobin | SchedClass::Deadline => 0,
         SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => state.nice as i32,
     }
+}
+
+fn clear_deadline_state(state: &mut SchedState) {
+    state.dl_runtime = 0;
+    state.dl_deadline = 0;
+    state.dl_period = 0;
+}
+
+fn validate_deadline_attr(attr: &SchedAttr) -> AxResult<()> {
+    if attr.sched_priority != 0
+        || attr.sched_runtime == 0
+        || attr.sched_deadline == 0
+        || attr.sched_runtime > attr.sched_deadline
+        || attr.sched_deadline > attr.sched_period
+    {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
 }
 
 fn raw_priority_from_nice(nice: i8) -> isize {
@@ -272,12 +291,17 @@ fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult
             }
             state.rt_priority = validate_rt_priority(priority)?;
             state.nice = 0;
+            clear_deadline_state(&mut state);
         }
         SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
             state.rt_priority = validate_static_priority(priority)?;
             if matches!(class, SchedClass::Idle) {
                 state.nice = 19;
             }
+            clear_deadline_state(&mut state);
+        }
+        SchedClass::Deadline => {
+            return Err(AxError::InvalidInput);
         }
     }
     state.reset_on_fork = reset_on_fork;
@@ -297,6 +321,10 @@ fn update_sched_param(task: &AxTaskRef, priority: i32) -> AxResult<isize> {
         SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
             validate_static_priority(priority)?;
             state.rt_priority = 0;
+            clear_deadline_state(&mut state);
+        }
+        SchedClass::Deadline => {
+            validate_static_priority(priority)?;
         }
     }
     apply_sched_state(task, state)
@@ -567,12 +595,7 @@ pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResu
     if attr.sched_flags & !SUPPORTED_SCHED_ATTR_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }
-    if attr.sched_runtime != 0
-        || attr.sched_deadline != 0
-        || attr.sched_period != 0
-        || attr.sched_util_min != 0
-        || attr.sched_util_max != 0
-    {
+    if attr.sched_util_min != 0 || attr.sched_util_max != 0 {
         return Err(AxError::InvalidInput);
     }
 
@@ -582,12 +605,28 @@ pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResu
     state.class = class;
     match class {
         SchedClass::Fifo | SchedClass::RoundRobin => {
+            if attr.sched_runtime != 0 || attr.sched_deadline != 0 || attr.sched_period != 0 {
+                return Err(AxError::InvalidInput);
+            }
             state.rt_priority = validate_rt_priority(attr.sched_priority as i32)?;
             state.nice = 0;
+            clear_deadline_state(&mut state);
         }
         SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
+            if attr.sched_runtime != 0 || attr.sched_deadline != 0 || attr.sched_period != 0 {
+                return Err(AxError::InvalidInput);
+            }
             state.rt_priority = validate_static_priority(attr.sched_priority as i32)?;
             state.nice = validate_nice(attr.sched_nice)?;
+            clear_deadline_state(&mut state);
+        }
+        SchedClass::Deadline => {
+            validate_deadline_attr(&attr)?;
+            state.rt_priority = 0;
+            state.nice = 0;
+            state.dl_runtime = attr.sched_runtime;
+            state.dl_deadline = attr.sched_deadline;
+            state.dl_period = attr.sched_period;
         }
     }
     state.reset_on_fork = attr.sched_flags & SUPPORTED_SCHED_ATTR_FLAGS != 0;
@@ -616,9 +655,9 @@ pub fn sys_sched_getattr(pid: i32, attr: *mut SchedAttr, size: u32, flags: u32) 
         },
         sched_nice: state_nice(state),
         sched_priority: state_static_priority(state) as u32,
-        sched_runtime: 0,
-        sched_deadline: 0,
-        sched_period: 0,
+        sched_runtime: state.dl_runtime,
+        sched_deadline: state.dl_deadline,
+        sched_period: state.dl_period,
         sched_util_min: 0,
         sched_util_max: 0,
     };

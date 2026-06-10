@@ -186,6 +186,27 @@ It generates focused `ltp_test.txt` files, generates plan overrides, builds a
 matching support disk, replays QEMU, parses logs, and stores results under
 `.state/ltp-lab`.
 
+## Cleanup
+
+Use the short cleanup targets by intent:
+
+- `make lab-trim`: daily cleanup for disposable state after campaign evidence has
+  been analyzed or finished. It removes failed or empty lab runs, per-run support
+  images and QEMU workdirs, baseline replay image copies, smoke leftovers, and
+  stale root score artifacts. It keeps campaigns, cached official images, and
+  reference checkouts.
+- `make lab-clean`: stronger cleanup for generated lab run/list/plan state and
+  stale root score artifacts.
+- `make clean-eval`: evaluator-artifact cleanup before a clean local build.
+- `make clean`: full local cleanup, including `.state`.
+
+Preview cleanup before removing large state:
+
+```bash
+./scripts/oscomp.sh lab clean --trim --dry-run
+./scripts/oscomp.sh lab audit
+```
+
 ## Output And Debugging
 
 The guest runner in [`src/init.sh`](/home/dia/TheKernel/src/init.sh) is evaluator-oriented:

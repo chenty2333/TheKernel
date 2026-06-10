@@ -20,7 +20,7 @@ pub use self::{
     accounting::*,
     futex::*,
     ops::*,
-    process::ProcessData,
+    process::{Mempolicy, ProcessData},
     resources::*,
     signal::*,
     stat::*,

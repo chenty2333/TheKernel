@@ -24,6 +24,7 @@ from typing import Any, Iterable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STATE_DIR = REPO_ROOT / ".state" / "ltp-lab"
+BASELINE_DIR = REPO_ROOT / ".state" / "baseline"
 LIST_DIR = STATE_DIR / "lists"
 PLAN_DIR = STATE_DIR / "plans"
 RUN_DIR = STATE_DIR / "runs"
@@ -3179,10 +3180,21 @@ def collapse_cleanup_targets(targets: list[Path]) -> list[Path]:
     return collapsed
 
 
+def baseline_heavy_artifacts() -> list[Path]:
+    if not BASELINE_DIR.is_dir():
+        return []
+    patterns = ("sdcard-*.img", "disk*.img")
+    artifacts: list[Path] = []
+    for pattern in patterns:
+        artifacts.extend(path for path in BASELINE_DIR.rglob(pattern) if path.is_file())
+    return artifacts
+
+
 def clean_cmd(args: argparse.Namespace) -> None:
     targets: list[Path] = []
     requested = any(
         (
+            args.trim,
             args.lab,
             args.generated,
             args.runs,
@@ -3199,11 +3211,20 @@ def clean_cmd(args: argparse.Namespace) -> None:
             args.refs,
             args.support_images,
             args.workdirs,
+            args.baseline_heavy,
             args.smoke,
             args.legacy_root,
             args.all,
         )
     )
+    if args.trim:
+        args.failed_runs = True
+        args.empty_runs = True
+        args.support_images = True
+        args.workdirs = True
+        args.baseline_heavy = True
+        args.smoke = True
+        args.legacy_root = True
     if args.lab or args.all:
         add_cleanup_target(targets, STATE_DIR)
     if args.legacy_root or args.all:
@@ -3285,6 +3306,13 @@ def clean_cmd(args: argparse.Namespace) -> None:
                     if newest_mtime(workdir) >= cutoff:
                         continue
                 add_cleanup_target(targets, workdir)
+    if args.baseline_heavy:
+        for artifact in baseline_heavy_artifacts():
+            if args.older_than:
+                cutoff = _dt.datetime.now().timestamp() - parse_duration(args.older_than)
+                if newest_mtime(artifact) >= cutoff:
+                    continue
+            add_cleanup_target(targets, artifact)
     if args.smoke:
         for base in (LIST_DIR, PLAN_DIR, RUN_DIR, CAMPAIGN_DIR):
             for item in children_for_cleanup(base):
@@ -3293,7 +3321,7 @@ def clean_cmd(args: argparse.Namespace) -> None:
 
     if not targets and not requested:
         die(
-            "clean requires a target such as --generated, --runs, --run NAME, "
+            "clean requires a target such as --trim, --generated, --runs, --run NAME, "
             "--failed-runs, --empty-runs, --campaigns, --cache, --lab, --legacy-root, or --all"
         )
     if not targets:
@@ -3335,6 +3363,10 @@ def audit_cmd(args: argparse.Namespace) -> None:
         checks.append(("lab_plans", str(len(children_for_cleanup(PLAN_DIR)))))
         checks.append(("lab_campaigns", str(len(children_for_cleanup(CAMPAIGN_DIR, dirs_only=True)))))
         checks.append(("lab_images", str(len(children_for_cleanup(IMAGE_CACHE_DIR)))))
+    baseline_heavy = baseline_heavy_artifacts()
+    checks.append(("baseline_heavy_artifacts", str(len(baseline_heavy)) if baseline_heavy else "absent"))
+    if baseline_heavy:
+        checks.append(("baseline_heavy_size", format_bytes(sum(path_size(path) for path in baseline_heavy))))
     build_state = [path.name for path in BUILD_STATE_DIRS if path.exists()]
     checks.append(("build_state", ",".join(build_state) if build_state else "absent"))
     checks.append(("old_ltp_count_state", "present" if (REPO_ROOT / ".state" / "ltp-count-current").exists() else "absent"))
@@ -3591,6 +3623,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.set_defaults(func=campaign_clean_cmd)
 
     p = sub.add_parser("clean", help="remove lab state or old root artifacts")
+    p.add_argument("--trim", action="store_true", help="daily cleanup of disposable failed/empty runs, per-run heavy artifacts, baseline images, smoke state, and legacy root outputs")
     p.add_argument("--lab", action="store_true", help="remove the whole .state/ltp-lab tree")
     p.add_argument("--generated", action="store_true", help="remove generated runs, lists, and plans")
     p.add_argument("--runs", action="store_true", help="remove run directories")
@@ -3608,6 +3641,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--refs", action="store_true", help="remove optional reference checkouts under .state/ltp-lab/refs")
     p.add_argument("--support-images", action="store_true", help="remove per-run support.img files while keeping logs")
     p.add_argument("--workdirs", action="store_true", help="remove per-run QEMU workdirs while keeping parsed logs")
+    p.add_argument("--baseline-heavy", action="store_true", help="remove baseline replay sdcard/disk image copies while keeping logs and parsed summaries")
     p.add_argument("--smoke", action="store_true", help="remove lab entries whose names contain 'smoke'")
     p.add_argument("--older-than", help="only remove matching items older than a duration like 12h, 7d, or 2w")
     p.add_argument("--legacy-root", action="store_true", help="remove stale root score artifacts rv_.out/la_.out/score.txt")

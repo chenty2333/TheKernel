@@ -62,6 +62,7 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
         {
             return Ok(current_top as isize);
         }
+        proc_data.clear_mempolicy_range(shrink_start.as_usize(), shrink_size);
     }
 
     proc_data.set_heap_top(addr);

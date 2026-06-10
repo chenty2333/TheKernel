@@ -353,6 +353,7 @@ pub fn sys_mmap(
     };
 
     let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
     let aspace_handle = curr.as_thread().proc_data.aspace();
     let mut aspace = aspace_handle.lock();
     let start = addr.align_down(page_size);
@@ -363,6 +364,7 @@ pub fn sys_mmap(
         let dst_addr = VirtAddr::from(start);
         if !map_flags.contains(MmapFlags::FIXED_NOREPLACE) {
             aspace.unmap(dst_addr, length)?;
+            proc_data.clear_mempolicy_range(dst_addr.as_usize(), length);
         }
         dst_addr
     } else {
@@ -537,11 +539,13 @@ pub fn sys_mmap(
 pub fn sys_munmap(addr: usize, length: usize) -> AxResult<isize> {
     debug!("sys_munmap <= addr: {addr:#x}, length: {length:x}");
     let curr = current();
-    let aspace_handle = curr.as_thread().proc_data.aspace();
+    let proc_data = &curr.as_thread().proc_data;
+    let aspace_handle = proc_data.aspace();
     let mut aspace = aspace_handle.lock();
     let length = align_up_4k(length);
     let start_addr = VirtAddr::from(addr);
     aspace.unmap(start_addr, length)?;
+    proc_data.clear_mempolicy_range(start_addr.as_usize(), length);
     Ok(0)
 }
 
@@ -599,7 +603,8 @@ pub fn sys_mremap(
     let old_size = align_up_4k(old_size);
     let new_size = align_up_4k(new_size);
     let curr = current();
-    let aspace_handle = curr.as_thread().proc_data.aspace();
+    let proc_data = &curr.as_thread().proc_data;
+    let aspace_handle = proc_data.aspace();
     let mut aspace = aspace_handle.lock();
 
     if old_size == 0 {
@@ -620,6 +625,7 @@ pub fn sys_mremap(
             }
             validate_fixed_remap_dst(&aspace, addr, new_size, dst, new_size)?;
             aspace.unmap(dst, new_size)?;
+            proc_data.clear_mempolicy_range(dst.as_usize(), new_size);
             dst
         } else {
             aspace
@@ -656,6 +662,7 @@ pub fn sys_mremap(
 
     if !fixed && new_size < old_size {
         aspace.unmap(addr + new_size, old_size - new_size)?;
+        proc_data.clear_mempolicy_range((addr + new_size).as_usize(), old_size - new_size);
         return Ok(addr.as_usize() as isize);
     }
 
@@ -699,6 +706,7 @@ pub fn sys_mremap(
     }
     if fixed {
         aspace.unmap(dst, new_size)?;
+        proc_data.clear_mempolicy_range(dst.as_usize(), new_size);
     }
 
     if let Err(err) = map_relocated_segments(
@@ -723,6 +731,8 @@ pub fn sys_mremap(
         let _ = aspace.unmap(dst, new_size);
         return Err(err);
     }
+    proc_data.clear_mempolicy_range(addr.as_usize(), old_size);
+    proc_data.clear_mempolicy_range(dst.as_usize(), new_size);
 
     Ok(dst.as_usize() as isize)
 }

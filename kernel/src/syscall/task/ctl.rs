@@ -2,19 +2,134 @@ use alloc::sync::Arc;
 use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult};
+use axhal::paging::MappingFlags;
 use axtask::current;
-use linux_raw_sys::general::{
-    __user_cap_data_struct, __user_cap_header_struct, _LINUX_CAPABILITY_VERSION_1,
-    _LINUX_CAPABILITY_VERSION_2, _LINUX_CAPABILITY_VERSION_3, CAP_SETPCAP,
+use linux_raw_sys::{
+    general::{
+        __user_cap_data_struct, __user_cap_header_struct, _LINUX_CAPABILITY_VERSION_1,
+        _LINUX_CAPABILITY_VERSION_2, _LINUX_CAPABILITY_VERSION_3, CAP_SETPCAP,
+    },
+    mempolicy::*,
 };
+use memory_addr::{MemoryAddr, VirtAddr};
 use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
 
 use crate::{
     mm::vm_load_string,
-    task::{AsThread, CapabilityState, ProcessData, get_process_data},
+    task::{AsThread, CapabilityState, Mempolicy, ProcessData, get_process_data},
 };
 
 const NO_ID_CHANGE: u32 = u32::MAX;
+const ALLOWED_NODEMASK: usize = 1;
+const SUPPORTED_GET_MEMPOLICY_FLAGS: usize =
+    (MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED) as usize;
+const SUPPORTED_MODE_FLAGS: usize = MPOL_MODE_FLAGS as usize;
+const SUPPORTED_MBIND_FLAGS: usize = MPOL_MF_VALID as usize;
+
+fn mempolicy_mode(mode_with_flags: usize) -> u32 {
+    (mode_with_flags & !SUPPORTED_MODE_FLAGS) as u32
+}
+
+fn mempolicy_mode_flags(mode_with_flags: usize) -> usize {
+    mode_with_flags & SUPPORTED_MODE_FLAGS
+}
+
+fn read_nodemask(nodemask: *const usize, maxnode: usize) -> AxResult<usize> {
+    if nodemask.is_null() || maxnode == 0 {
+        return Ok(0);
+    }
+
+    let words = maxnode.div_ceil(usize::BITS as usize);
+    let mut result = 0usize;
+    for index in 0..words {
+        let word = nodemask.wrapping_add(index).vm_read()?;
+        if index == 0 {
+            result = word;
+        } else if word != 0 {
+            return Err(AxError::InvalidInput);
+        }
+    }
+
+    if maxnode < usize::BITS as usize {
+        let mask = (1usize << maxnode) - 1;
+        if result & !mask != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        result &= mask;
+    }
+
+    Ok(result)
+}
+
+fn write_nodemask(nodemask: *mut usize, maxnode: usize, value: usize) -> AxResult<()> {
+    if nodemask.is_null() || maxnode == 0 {
+        return Ok(());
+    }
+
+    let words = maxnode.div_ceil(usize::BITS as usize);
+    for index in 0..words {
+        let word = if index == 0 { value } else { 0 };
+        nodemask.wrapping_add(index).vm_write(word)?;
+    }
+    Ok(())
+}
+
+fn validate_mempolicy(mode_with_flags: usize, nodemask: usize) -> AxResult<Mempolicy> {
+    let mode = mempolicy_mode(mode_with_flags);
+    if mempolicy_mode_flags(mode_with_flags) & MPOL_F_NUMA_BALANCING as usize != 0
+        && mode != MPOL_BIND as u32
+    {
+        return Err(AxError::InvalidInput);
+    }
+
+    if nodemask & !ALLOWED_NODEMASK != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let needs_nodes = matches!(mode, mode if mode == MPOL_BIND as u32 || mode == MPOL_INTERLEAVE as u32 || mode == MPOL_PREFERRED_MANY as u32);
+    if needs_nodes && nodemask == 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    match mode {
+        mode if mode == MPOL_DEFAULT as u32 => {
+            if nodemask != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            Ok(Mempolicy::new(mode, 0))
+        }
+        mode if mode == MPOL_PREFERRED as u32 => Ok(Mempolicy::new(mode, nodemask)),
+        mode if mode == MPOL_BIND as u32
+            || mode == MPOL_INTERLEAVE as u32
+            || mode == MPOL_LOCAL as u32
+            || mode == MPOL_PREFERRED_MANY as u32 =>
+        {
+            if mode == MPOL_LOCAL as u32 && nodemask != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            Ok(Mempolicy::new(mode, nodemask))
+        }
+        _ => Err(AxError::InvalidInput),
+    }
+}
+
+fn validate_mapped_user_range(start: usize, size: usize) -> AxResult<(VirtAddr, usize)> {
+    let start = VirtAddr::from(start);
+    if size == 0 {
+        return Ok((start, 0));
+    }
+    let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+    let aligned_start = start.align_down_4k();
+    let aligned_end = end.align_up_4k();
+    let aligned_size = aligned_end.sub_addr(aligned_start);
+    let curr = current();
+    let aspace_handle = curr.as_thread().proc_data.aspace();
+    let aspace = aspace_handle.lock();
+    if !aspace.can_access_range(aligned_start, aligned_size, MappingFlags::USER) {
+        return Err(AxError::BadAddress);
+    }
+    Ok((aligned_start, aligned_size))
+}
 
 fn cap_data_words(version: u32) -> usize {
     match version {
@@ -173,13 +288,91 @@ pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> AxResult<isize> {
 }
 
 pub fn sys_get_mempolicy(
-    _policy: *mut i32,
-    _nodemask: *mut usize,
-    _maxnode: usize,
-    _addr: usize,
-    _flags: usize,
+    policy: *mut i32,
+    nodemask: *mut usize,
+    maxnode: usize,
+    addr: usize,
+    flags: usize,
 ) -> AxResult<isize> {
-    warn!("Dummy get_mempolicy called");
+    if flags & !SUPPORTED_GET_MEMPOLICY_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & MPOL_F_MEMS_ALLOWED as usize != 0 {
+        if flags & (MPOL_F_ADDR | MPOL_F_NODE) as usize != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        write_nodemask(nodemask, maxnode, ALLOWED_NODEMASK)?;
+        return Ok(0);
+    }
+    if addr != 0 && flags & MPOL_F_ADDR as usize == 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let selected = if flags & MPOL_F_ADDR as usize != 0 {
+        let addr = VirtAddr::from(addr);
+        let aspace_handle = proc_data.aspace();
+        if aspace_handle.lock().find_area(addr).is_none() {
+            return Err(AxError::BadAddress);
+        }
+        proc_data
+            .mempolicy_for_addr(addr.as_usize())
+            .unwrap_or_else(|| Mempolicy::new(MPOL_DEFAULT as u32, 0))
+    } else {
+        proc_data.mempolicy()
+    };
+
+    if flags & MPOL_F_NODE as usize != 0 {
+        if !nodemask.is_null() {
+            return Err(AxError::InvalidInput);
+        }
+        if !policy.is_null() {
+            policy.vm_write(0)?;
+        }
+        return Ok(0);
+    }
+
+    if !policy.is_null() {
+        policy.vm_write(selected.mode as i32)?;
+    }
+    let returned_nodemask = if flags & MPOL_F_ADDR as usize == 0 && selected.nodemask == 0 {
+        ALLOWED_NODEMASK
+    } else {
+        selected.nodemask
+    };
+    write_nodemask(nodemask, maxnode, returned_nodemask)?;
+    Ok(0)
+}
+
+pub fn sys_set_mempolicy(mode: usize, nodemask: *const usize, maxnode: usize) -> AxResult<isize> {
+    if mempolicy_mode_flags(mode) & !SUPPORTED_MODE_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let nodemask = read_nodemask(nodemask, maxnode)?;
+    let policy = validate_mempolicy(mode, nodemask)?;
+    current().as_thread().proc_data.set_mempolicy(policy);
+    Ok(0)
+}
+
+pub fn sys_mbind(
+    start: usize,
+    len: usize,
+    mode: usize,
+    nodemask: *const usize,
+    maxnode: usize,
+    flags: usize,
+) -> AxResult<isize> {
+    if flags & !SUPPORTED_MBIND_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let (start, len) = validate_mapped_user_range(start, len)?;
+    let nodemask = read_nodemask(nodemask, maxnode)?;
+    let policy = validate_mempolicy(mode, nodemask)?;
+    current()
+        .as_thread()
+        .proc_data
+        .bind_mempolicy_range(start.as_usize(), len, policy);
     Ok(0)
 }
 

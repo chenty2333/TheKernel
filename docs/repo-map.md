@@ -115,10 +115,16 @@ make dev-shell DEV_CMD="./scripts/oscomp.sh lab audit"
   contents, source runtest entries, and current subset resolution.
 - `.state/ltp-lab/lists/`: generated candidate LTP lists.
 - `.state/ltp-lab/plans/`: generated focused evaluation plans.
-- `.state/ltp-lab/runs/`: per-run logs, parsed case records, summaries, support
-  images, and QEMU workdirs.
+- `.state/ltp-lab/runs/`: per-run logs, parsed case records, summaries, and
+  sometimes disposable support images and QEMU workdirs.
 - `.state/ltp-lab/campaigns/`: per-batch candidate lists, semantic cards,
   implementation ledgers, taxonomy, and promotion evidence.
+- `.state/ltp-lab/images/`: cached decompressed official images; keep these for
+  faster inventory and replay unless disk pressure is severe.
+- `.state/ltp-lab/refs/`: optional Linux and testsuite reference checkouts.
+- `.state/baseline/`: local baseline replay evidence. Logs and parsed summaries
+  are useful; copied `sdcard-*.img` and `disk*.img` files are disposable heavy
+  artifacts.
 
 `.state/ltp-lab` is local and ignored by git. Recreate it with:
 
@@ -170,15 +176,27 @@ Removed stale documentation:
 
 ## Cleanup
 
-Clean generated lab state and legacy root score artifacts:
+Daily disposable-state cleanup:
+
+```bash
+make lab-trim
+```
+
+Run this after campaign evidence has been analyzed or finished. It removes
+failed/empty lab runs, per-run support images and QEMU workdirs, baseline replay
+image copies, smoke leftovers, and stale root score artifacts while keeping
+campaigns, official image cache, and reference checkouts.
+
+Stronger generated-state cleanup:
 
 ```bash
 make lab-clean
 ```
 
-Preview cleanup targets before removing them:
+Preview or customize cleanup:
 
 ```bash
+./scripts/oscomp.sh lab clean --trim --dry-run
 ./scripts/oscomp.sh lab clean --generated --cache --dry-run
 ```
 
