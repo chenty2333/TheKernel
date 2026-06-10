@@ -1183,3 +1183,8 @@ ioctl_ns02
 ioctl_ns03
 fork13
 connect02
+fsconfig01
+fsconfig02
+fsmount01
+fspick01
+fspick02

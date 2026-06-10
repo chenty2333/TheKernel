@@ -186,6 +186,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg4() as _,
         ),
         Sysno::open_tree => sys_open_tree(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::fspick => sys_fspick(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
 
         // file ops
         #[cfg(target_arch = "x86_64")]
@@ -939,9 +940,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::bpf => bpf::sys_bpf(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
 
         // dummy fds
-        Sysno::fanotify_init | Sysno::perf_event_open | Sysno::fspick | Sysno::memfd_secret => {
-            sys_dummy_fd(sysno)
-        }
+        Sysno::fanotify_init | Sysno::perf_event_open | Sysno::memfd_secret => sys_dummy_fd(sysno),
 
         Sysno::timer_create => {
             sys_timer_create(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)

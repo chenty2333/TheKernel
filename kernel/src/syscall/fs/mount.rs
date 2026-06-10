@@ -7,27 +7,54 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{
     FS_CONTEXT, OpenBlockDeviceError, block_device_is_read_only, block_device_names,
     new_block_filesystem, open_block_device,
 };
 use axfs_ng_vfs::{Filesystem, path::Path};
 use axpoll::{IoEvents, Pollable};
-use linux_raw_sys::general::O_CLOEXEC;
+use linux_raw_sys::general::{AT_EMPTY_PATH, O_CLOEXEC};
 use spin::Mutex;
 
 use crate::{
-    file::{FileLike, get_file_like, with_path_fs},
+    file::{FileLike, get_file_like, resolve_at, with_path_fs},
     mm::vm_load_string,
     mounts,
     pseudofs::MemoryFs,
 };
 
 const FSOPEN_CLOEXEC: u32 = 0x00000001;
+const FSPICK_CLOEXEC: u32 = 0x00000001;
+const FSPICK_SYMLINK_NOFOLLOW: u32 = 0x00000002;
+const FSPICK_NO_AUTOMOUNT: u32 = 0x00000004;
+const FSPICK_EMPTY_PATH: u32 = 0x00000008;
+const FSPICK__MASK: u32 =
+    FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW | FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH;
+const FSCONFIG_SET_FLAG: u32 = 0;
 const FSCONFIG_SET_STRING: u32 = 1;
+const FSCONFIG_SET_BINARY: u32 = 2;
+const FSCONFIG_SET_PATH: u32 = 3;
+const FSCONFIG_SET_PATH_EMPTY: u32 = 4;
+const FSCONFIG_SET_FD: u32 = 5;
 const FSCONFIG_CMD_CREATE: u32 = 6;
+const FSCONFIG_CMD_RECONFIGURE: u32 = 7;
+const FSCONFIG_CMD_CREATE_EXCL: u32 = 8;
 const FSMOUNT_CLOEXEC: u32 = 0x00000001;
+const MOUNT_ATTR_RDONLY: u32 = 0x00000001;
+const MOUNT_ATTR_NOSUID: u32 = 0x00000002;
+const MOUNT_ATTR_NODEV: u32 = 0x00000004;
+const MOUNT_ATTR_NOEXEC: u32 = 0x00000008;
+const MOUNT_ATTR_NOATIME: u32 = 0x00000010;
+const MOUNT_ATTR_STRICTATIME: u32 = 0x00000020;
+const MOUNT_ATTR_NODIRATIME: u32 = 0x00000080;
+const MOUNT_ATTR_SUPPORTED: u32 = MOUNT_ATTR_RDONLY
+    | MOUNT_ATTR_NOSUID
+    | MOUNT_ATTR_NODEV
+    | MOUNT_ATTR_NOEXEC
+    | MOUNT_ATTR_NOATIME
+    | MOUNT_ATTR_STRICTATIME
+    | MOUNT_ATTR_NODIRATIME;
 const OPEN_TREE_CLONE: u32 = 0x00000001;
 const OPEN_TREE_CLOEXEC: u32 = O_CLOEXEC;
 const OPEN_TREE__MASK: u32 = OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC;
@@ -130,15 +157,65 @@ pub fn sys_fsconfig(
     cmd: u32,
     key: *const c_char,
     value: *const c_void,
-    _aux: i32,
+    aux: i32,
 ) -> AxResult<isize> {
+    if fd < 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    match cmd {
+        FSCONFIG_SET_FLAG => {
+            if key.is_null() || !value.is_null() || aux != 0 {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        FSCONFIG_SET_STRING => {
+            if key.is_null() || value.is_null() || aux != 0 {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        FSCONFIG_SET_BINARY => {
+            if key.is_null() || value.is_null() || aux <= 0 || aux > 1024 * 1024 {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        FSCONFIG_SET_PATH | FSCONFIG_SET_PATH_EMPTY => {
+            if key.is_null()
+                || value.is_null()
+                || (aux != linux_raw_sys::general::AT_FDCWD && aux < 0)
+            {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        FSCONFIG_SET_FD => {
+            if key.is_null() || !value.is_null() || aux < 0 {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        FSCONFIG_CMD_CREATE | FSCONFIG_CMD_CREATE_EXCL | FSCONFIG_CMD_RECONFIGURE => {
+            if !key.is_null() || !value.is_null() || aux != 0 {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        _ => return Err(AxError::from(LinuxError::EOPNOTSUPP)),
+    }
+
     let file = get_file_like(fd)?;
     let fsopen = file
         .downcast_ref::<FsOpenFd>()
-        .ok_or(AxError::BadFileDescriptor)?;
+        .ok_or(AxError::InvalidInput)?;
     let mut state = fsopen.0.lock();
 
     match cmd {
+        FSCONFIG_SET_FLAG => {
+            let key = vm_load_string(key)?;
+            let entry_len = key.len() + 2;
+            if state.config_len.saturating_add(entry_len) > 4096 {
+                return Err(AxError::InvalidInput);
+            }
+            state.config_len += entry_len;
+            Ok(0)
+        }
         FSCONFIG_SET_STRING => {
             let key = vm_load_string(key)?;
             let value = vm_load_string(value as *const c_char)?;
@@ -152,22 +229,30 @@ pub fn sys_fsconfig(
             }
             Ok(0)
         }
-        FSCONFIG_CMD_CREATE => {
+        FSCONFIG_SET_BINARY | FSCONFIG_SET_PATH | FSCONFIG_SET_PATH_EMPTY | FSCONFIG_SET_FD => {
+            Err(AxError::OperationNotSupported)
+        }
+        FSCONFIG_CMD_CREATE | FSCONFIG_CMD_CREATE_EXCL => {
             state.created = true;
             Ok(0)
         }
-        _ => Err(AxError::InvalidInput),
+        FSCONFIG_CMD_RECONFIGURE => Ok(0),
+        _ => unreachable!(),
     }
 }
 
 pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
+    if fd < 0 {
+        return Err(AxError::BadFileDescriptor);
+    }
+
     let file = get_file_like(fd)?;
     let fsopen = file
         .downcast_ref::<FsOpenFd>()
         .ok_or(AxError::BadFileDescriptor)?;
     let state = fsopen.0.lock();
 
-    if flags & !FSMOUNT_CLOEXEC != 0 || mount_attrs != 0 {
+    if flags & !FSMOUNT_CLOEXEC != 0 || mount_attrs & !MOUNT_ATTR_SUPPORTED != 0 {
         return Err(AxError::InvalidInput);
     }
     if !state.created {
@@ -184,6 +269,33 @@ pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
     }
     .add_to_fd_table(flags & FSMOUNT_CLOEXEC != 0)
     .map(|new_fd| new_fd as isize)
+}
+
+pub fn sys_fspick(dirfd: i32, pathname: *const c_char, flags: u32) -> AxResult<isize> {
+    let path = vm_load_string(pathname)?;
+    debug!("sys_fspick <= dirfd: {dirfd}, path: {path:?}, flags: {flags:#x}");
+
+    if flags & !FSPICK__MASK != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let resolve_flags = if flags & FSPICK_EMPTY_PATH != 0 {
+        AT_EMPTY_PATH
+    } else {
+        0
+    };
+    let loc = resolve_at(dirfd, Some(&path), resolve_flags)?.into_file();
+    let loc = loc.ok_or(AxError::InvalidInput)?;
+    loc.check_is_dir()?;
+
+    FsOpenFd(Mutex::new(FsOpenState {
+        fs_type: loc.filesystem().name().to_string(),
+        source: loc.absolute_path().ok().map(|path| path.to_string()),
+        config_len: 0,
+        created: true,
+    }))
+    .add_to_fd_table(flags & FSPICK_CLOEXEC != 0)
+    .map(|fd| fd as isize)
 }
 
 pub fn sys_open_tree(dirfd: i32, pathname: *const c_char, flags: u32) -> AxResult<isize> {
