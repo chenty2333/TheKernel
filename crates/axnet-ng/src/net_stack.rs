@@ -1,4 +1,5 @@
 use alloc::{boxed::Box, sync::Arc};
+use core::sync::atomic::{AtomicI32, Ordering};
 
 use axerrno::{AxResult, ax_bail, ax_err_type};
 use axsync::Mutex;
@@ -31,6 +32,8 @@ pub struct NetStack {
     pub(crate) service: Mutex<Service>,
     pub(crate) tcp_ephemeral_port: Mutex<u16>,
     pub(crate) udp_ephemeral_port: Mutex<u16>,
+    ipv4_conf_default_tag: AtomicI32,
+    ipv4_conf_lo_tag: AtomicI32,
 }
 
 const PORT_START: u16 = 0xc000;
@@ -49,6 +52,8 @@ impl NetStack {
             service: Mutex::new(service),
             tcp_ephemeral_port: Mutex::new(PORT_START),
             udp_ephemeral_port: Mutex::new(PORT_START),
+            ipv4_conf_default_tag: AtomicI32::new(0),
+            ipv4_conf_lo_tag: AtomicI32::new(0),
         })
     }
 
@@ -124,6 +129,25 @@ impl NetStack {
     /// Poll all network interfaces owned by this stack.
     pub fn poll_interfaces(&self) {
         while self.service.lock().poll(&mut self.socket_set.inner.lock()) {}
+    }
+
+    /// Return the Linux-compatible IPv4 interface `tag` sysctl value.
+    pub fn ipv4_conf_tag(&self, iface: &str) -> Option<i32> {
+        match iface {
+            "default" => Some(self.ipv4_conf_default_tag.load(Ordering::Acquire)),
+            "lo" => Some(self.ipv4_conf_lo_tag.load(Ordering::Acquire)),
+            _ => None,
+        }
+    }
+
+    /// Update the Linux-compatible IPv4 interface `tag` sysctl value.
+    pub fn set_ipv4_conf_tag(&self, iface: &str, value: i32) -> AxResult {
+        match iface {
+            "default" => self.ipv4_conf_default_tag.store(value, Ordering::Release),
+            "lo" => self.ipv4_conf_lo_tag.store(value, Ordering::Release),
+            _ => ax_bail!(NotFound, "unknown IPv4 interface sysctl"),
+        }
+        Ok(())
     }
 
     /// Acquire a lock on the Service.

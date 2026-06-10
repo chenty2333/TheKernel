@@ -45,6 +45,7 @@ use crate::{
 };
 
 const PROC_PID_MAX: u32 = 4_194_304;
+const PROC_THREADS_MAX: u32 = 4_194_304;
 const PROC_PAGEMAP_ENTRY_BYTES: u64 = 8;
 const PROC_KPAGEFLAGS_ENTRY_BYTES: u64 = 8;
 const KPF_DIRTY: u64 = 1 << 4;
@@ -110,6 +111,44 @@ fn rw_static_file(content: &'static str) -> impl crate::pseudofs::SimpleFileOps 
     RwFile::new(move |req| match req {
         SimpleFileOperation::Read => Ok(Some(content.as_bytes().to_vec())),
         SimpleFileOperation::Write(_) => Ok(None),
+    })
+}
+
+fn current_net_ipv4_conf_tag(iface: &str) -> VfsResult<i32> {
+    current()
+        .as_thread()
+        .proc_data
+        .net_ns
+        .ipv4_conf_tag(iface)
+        .ok_or(VfsError::NotFound)
+}
+
+fn set_current_net_ipv4_conf_tag(iface: &str, value: i32) -> VfsResult<()> {
+    current()
+        .as_thread()
+        .proc_data
+        .net_ns
+        .set_ipv4_conf_tag(iface, value)
+        .map_err(|_| VfsError::NotFound)
+}
+
+fn proc_ipv4_conf_tag_file(iface: &'static str) -> impl crate::pseudofs::SimpleFileOps {
+    RwFile::new(move |req| match req {
+        SimpleFileOperation::Read => Ok(Some(
+            format!("{}\n", current_net_ipv4_conf_tag(iface)?).into_bytes(),
+        )),
+        SimpleFileOperation::Write(data) => {
+            if data.iter().all(|byte| byte.is_ascii_whitespace()) {
+                return Ok(None);
+            }
+            let value = str::from_utf8(data)
+                .ok()
+                .map(str::trim)
+                .and_then(|it| it.parse::<i32>().ok())
+                .ok_or(VfsError::InvalidInput)?;
+            set_current_net_ipv4_conf_tag(iface, value)?;
+            Ok(None)
+        }
     })
 }
 
@@ -957,6 +996,10 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 SimpleFile::new_regular(fs.clone(), || Ok(alloc::format!("{PROC_PID_MAX}\n"))),
             );
             kernel.add(
+                "threads-max",
+                SimpleFile::new_regular(fs.clone(), || Ok(format!("{PROC_THREADS_MAX}\n"))),
+            );
+            kernel.add(
                 "shmall",
                 SimpleFile::new_regular(fs.clone(), || Ok(alloc::format!("{}\n", shmall_limit()))),
             );
@@ -1041,6 +1084,29 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             });
 
             SimpleDir::new_maker(fs.clone(), Arc::new(kernel))
+        });
+
+        sys.add("net", {
+            let mut net = DirMapping::new();
+            net.add("ipv4", {
+                let mut ipv4 = DirMapping::new();
+                ipv4.add("conf", {
+                    let mut conf = DirMapping::new();
+                    for iface in ["default", "lo"] {
+                        conf.add(iface, {
+                            let mut iface_dir = DirMapping::new();
+                            iface_dir.add(
+                                "tag",
+                                SimpleFile::new_regular(fs.clone(), proc_ipv4_conf_tag_file(iface)),
+                            );
+                            SimpleDir::new_maker(fs.clone(), Arc::new(iface_dir))
+                        });
+                    }
+                    SimpleDir::new_maker(fs.clone(), Arc::new(conf))
+                });
+                SimpleDir::new_maker(fs.clone(), Arc::new(ipv4))
+            });
+            SimpleDir::new_maker(fs.clone(), Arc::new(net))
         });
 
         SimpleDir::new_maker(fs.clone(), Arc::new(sys))
