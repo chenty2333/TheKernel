@@ -1139,3 +1139,7 @@ gf30 growfiles -W gf30 -D 0 -b -i 0 -L 60 -u -B 1000b -e 1 -o O_RDWR,O_CREAT,O_S
 ftruncate04 ftruncate04
 ftruncate04_64 ftruncate04_64
 statx12 statx12
+openfile01 openfile -f10 -t10
+read_all_dev read_all -d /dev -p -q -r 3
+read_all_proc read_all -d /proc -q -r 3
+read_all_sys read_all -d /sys -q -r 3

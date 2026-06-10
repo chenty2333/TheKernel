@@ -11,10 +11,7 @@ use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::NodeFlags;
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
-use axtask::{
-    current,
-    future::{block_on, poll_io},
-};
+use axtask::current;
 use starry_process::Process;
 use starry_vm::{VmMutPtr, VmPtr};
 
@@ -86,18 +83,11 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
 
 impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
     fn read_at(&self, buf: &mut [u8], _offset: u64) -> AxResult<usize> {
-        block_on(poll_io(
-            &self.terminal.job_control,
-            IoEvents::IN,
-            false,
-            || {
-                if self.is_ptm || self.terminal.job_control.current_in_foreground() {
-                    self.ldisc.lock().read(buf)
-                } else {
-                    Err(AxError::WouldBlock)
-                }
-            },
-        ))
+        if self.is_ptm || self.terminal.job_control.current_in_foreground() {
+            self.ldisc.lock().read(buf)
+        } else {
+            Err(AxError::WouldBlock)
+        }
     }
 
     fn write_at(&self, buf: &[u8], _offset: u64) -> AxResult<usize> {

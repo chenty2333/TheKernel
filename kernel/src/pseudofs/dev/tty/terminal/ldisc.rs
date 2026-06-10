@@ -3,12 +3,12 @@ use core::{
     future::poll_fn,
     ops::Range,
     sync::atomic::{AtomicBool, Ordering},
-    task::{Context, Poll, Waker},
+    task::{Poll, Waker},
 };
 
 use axerrno::{AxError, AxResult};
-use axpoll::{IoEvents, PollSet, Pollable};
-use axtask::future::{block_on, poll_io};
+use axpoll::PollSet;
+use axtask::future::block_on;
 use linux_raw_sys::general::{
     ECHOCTL, ECHOK, ICRNL, IGNCR, ISIG, VEOF, VERASE, VKILL, VMIN, VTIME,
 };
@@ -215,21 +215,6 @@ pub struct LineDiscipline<R, W> {
     processor: Processor<R, W>,
 }
 
-struct WaitPollable<'a>(Option<&'a Arc<PollSet>>);
-impl Pollable for WaitPollable<'_> {
-    fn poll(&self) -> IoEvents {
-        unreachable!()
-    }
-
-    fn register(&self, context: &mut Context<'_>, _events: IoEvents) {
-        if let Some(set) = self.0 {
-            set.register(context.waker());
-        } else {
-            context.waker().wake_by_ref();
-        }
-    }
-}
-
 impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
     pub fn new(terminal: Arc<Terminal>, config: TtyConfig<R, W>) -> Self {
         let (buf_tx, buf_rx) = ReadBuf::default().split();
@@ -304,6 +289,11 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
     }
 
     pub fn poll_read(&mut self) -> bool {
+        self.refill_read_buffer();
+        !self.buf_rx.is_empty()
+    }
+
+    fn refill_read_buffer(&mut self) {
         match &mut self.processor {
             Processor::Manual(reader) => {
                 reader.poll();
@@ -311,7 +301,6 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             Processor::None(reader, _) => reader.poll(),
             _ => {}
         }
-        !self.buf_rx.is_empty()
     }
 
     pub fn register_rx_waker(&self, waker: &Waker) {
@@ -329,6 +318,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         if buf.is_empty() {
             return Ok(0);
         }
+        self.refill_read_buffer();
         if matches!(self.processor, Processor::None(_, _)) {
             let read = self.buf_rx.pop_slice(buf);
             return if read == 0 {
@@ -353,19 +343,12 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             return Err(AxError::WouldBlock);
         }
 
-        let mut total_read = 0;
-        let set = match &self.processor {
-            Processor::Manual(_) => None,
-            Processor::External(set) => Some(set),
-            _ => unreachable!(),
-        };
-        let pollable = WaitPollable(set);
-        block_on(poll_io(&pollable, IoEvents::IN, false, || {
-            total_read += self.buf_rx.pop_slice(&mut buf[total_read..]);
-            self.poll_tx.wake();
-            (total_read >= vmin)
-                .then_some(total_read)
-                .ok_or(AxError::WouldBlock)
-        }))
+        if vmin > 0 && self.buf_rx.occupied_len() < vmin {
+            return Err(AxError::WouldBlock);
+        }
+
+        let total_read = self.buf_rx.pop_slice(buf);
+        self.poll_tx.wake();
+        Ok(total_read)
     }
 }
