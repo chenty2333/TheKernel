@@ -11,6 +11,7 @@ pub(crate) struct ExecutableKey {
 }
 
 static ACTIVE_EXECUTABLES: Mutex<BTreeMap<ExecutableKey, usize>> = Mutex::new(BTreeMap::new());
+static WRITE_OPEN_FILES: Mutex<BTreeMap<ExecutableKey, usize>> = Mutex::new(BTreeMap::new());
 
 pub(crate) fn key(loc: &Location) -> Option<ExecutableKey> {
     (loc.node_type() == NodeType::RegularFile).then_some(ExecutableKey {
@@ -44,6 +45,27 @@ pub(crate) fn release(key: Option<ExecutableKey>) {
     }
 }
 
+pub(crate) fn retain_write_open(loc: &Location) -> Option<ExecutableKey> {
+    let key = key(loc)?;
+    let mut open = WRITE_OPEN_FILES.lock();
+    *open.entry(key).or_insert(0) += 1;
+    Some(key)
+}
+
+pub(crate) fn release_write_open(key: Option<ExecutableKey>) {
+    let Some(key) = key else {
+        return;
+    };
+    let mut open = WRITE_OPEN_FILES.lock();
+    let Some(count) = open.get_mut(&key) else {
+        return;
+    };
+    *count = count.saturating_sub(1);
+    if *count == 0 {
+        open.remove(&key);
+    }
+}
+
 pub(crate) fn is_active(loc: &Location) -> bool {
     let Some(key) = key(loc) else {
         return false;
@@ -56,6 +78,21 @@ pub(crate) fn is_active(loc: &Location) -> bool {
 
 pub(crate) fn check_not_active(loc: &Location) -> AxResult<()> {
     if is_active(loc) {
+        Err(LinuxError::ETXTBSY.into())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn check_not_write_open(loc: &Location) -> AxResult<()> {
+    let Some(key) = key(loc) else {
+        return Ok(());
+    };
+    if WRITE_OPEN_FILES
+        .lock()
+        .get(&key)
+        .is_some_and(|count| *count != 0)
+    {
         Err(LinuxError::ETXTBSY.into())
     } else {
         Ok(())

@@ -26,14 +26,14 @@ use starry_signal::Signo;
 use crate::{
     file::{
         AsyncIoOwner, Directory, FD_TABLE, File, FileDescription, FileDescriptor, FileLike, Pipe,
-        ResolveAtResult, add_file_like_with_flags, close_file_like,
+        ResolveAtResult, add_file_like_with_flags_and_write_open_key, close_file_like, executable,
         flock::{self, RecordLockOwner},
-        get_file_description, get_file_like, get_typed_file,
+        get_file_description, get_file_like, get_typed_file, inode_flags,
         inotify::{
             location_for_fd, notify_close, notify_exact, notify_parent, notify_parent_with_name,
             remove_dnotify_watch, set_dnotify_watch,
         },
-        executable, inode_flags, install_tmpfile_state, lease, memfd,
+        install_tmpfile_state, lease, memfd,
         permission::{
             check_create_permissions, check_open_permissions, check_path_prefix_search_permissions,
         },
@@ -307,6 +307,7 @@ fn is_magic_proc_link(loc: &Location) -> bool {
 }
 
 fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
+    let mut write_open_key = None;
     let f: Arc<dyn FileLike> = match result {
         OpenResult::File(mut file) => {
             if flags & O_PATH == 0 && file.location().metadata()?.node_type == NodeType::Fifo {
@@ -355,7 +356,11 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
                         file = axfs::File::new(FileBackend::Direct(loc), file.flags());
                     }
                 }
-                Arc::new(File::new(file))
+                let file = Arc::new(File::new(file));
+                if flags & O_PATH == 0 && flags & O_ACCMODE != O_RDONLY {
+                    write_open_key = executable::retain_write_open(file.inner().location());
+                }
+                file
             }
         }
         OpenResult::Dir(dir) => Arc::new(Directory::new(dir)),
@@ -363,7 +368,12 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
     if flags & O_NONBLOCK != 0 {
         f.set_nonblocking(true)?;
     }
-    add_file_like_with_flags(f, flags & O_CLOEXEC != 0, open_status_flags(flags))
+    add_file_like_with_flags_and_write_open_key(
+        f,
+        flags & O_CLOEXEC != 0,
+        open_status_flags(flags),
+        write_open_key,
+    )
 }
 
 fn linux_file_handle_body(handle_addr: usize) -> UserPtr<u8> {

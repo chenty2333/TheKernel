@@ -11,6 +11,7 @@ use spin::Mutex;
 use starry_process::Pid;
 
 use super::{
+    executable::{self, ExecutableKey},
     flock, lease,
     types::{FileLike, IoDst, IoSrc, Kstat},
 };
@@ -43,6 +44,7 @@ pub struct FileDescription {
     pub inner: Arc<dyn FileLike>,
     flock_owner: u64,
     status_flags: AtomicU32,
+    write_open_key: Option<ExecutableKey>,
     async_io: Mutex<AsyncIoState>,
 }
 
@@ -55,10 +57,27 @@ impl FileDescription {
         inner: Arc<dyn FileLike>,
         status_flags: u32,
     ) -> Arc<Self> {
+        Self::new_inner(inner, status_flags, None)
+    }
+
+    pub(in crate::file) fn new_with_write_open_key(
+        inner: Arc<dyn FileLike>,
+        status_flags: u32,
+        write_open_key: Option<ExecutableKey>,
+    ) -> Arc<Self> {
+        Self::new_inner(inner, status_flags, write_open_key)
+    }
+
+    fn new_inner(
+        inner: Arc<dyn FileLike>,
+        status_flags: u32,
+        write_open_key: Option<ExecutableKey>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner,
             flock_owner: FILE_DESCRIPTION_ID.fetch_add(1, Ordering::Relaxed),
             status_flags: AtomicU32::new(status_flags),
+            write_open_key,
             async_io: Mutex::new(AsyncIoState::default()),
         })
     }
@@ -93,6 +112,7 @@ impl Drop for FileDescription {
         flock::release_owner(self.flock_owner);
         flock::release_ofd_owner(self.flock_owner);
         lease::release_owner(self.flock_owner);
+        executable::release_write_open(self.write_open_key);
     }
 }
 

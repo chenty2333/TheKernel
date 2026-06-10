@@ -9,6 +9,7 @@ use spin::RwLock;
 
 use super::{
     desc::{FileDescription, FileDescriptor, FileHandle},
+    executable::ExecutableKey,
     flock,
     types::FileLike,
 };
@@ -79,6 +80,18 @@ pub fn add_file_like_with_flags(
     status_flags: u32,
 ) -> AxResult<c_int> {
     add_file_description(FileDescription::new_with_flags(f, status_flags), cloexec)
+}
+
+pub(crate) fn add_file_like_with_flags_and_write_open_key(
+    f: Arc<dyn FileLike>,
+    cloexec: bool,
+    status_flags: u32,
+    write_open_key: Option<ExecutableKey>,
+) -> AxResult<c_int> {
+    add_file_description(
+        FileDescription::new_with_write_open_key(f, status_flags, write_open_key),
+        cloexec,
+    )
 }
 
 pub(crate) fn release_posix_locks_on_close(description: &FileDescription) {

@@ -210,6 +210,8 @@ fn do_execve(
     args: Vec<String>,
     envs: Vec<String>,
 ) -> AxResult<isize> {
+    executable::check_not_write_open(&loc)?;
+
     let abs_path = loc.absolute_path()?.to_string();
     let task_name = loc.name().to_string();
 
