@@ -12,7 +12,7 @@ use core::{
     ffi::CStr,
     fmt::Write as _,
     iter, str,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
     task::Context,
 };
 
@@ -48,11 +48,13 @@ use crate::{
     task::{AsThread, get_task, get_visible_task_including_exiting, render_task_stat, tasks},
 };
 
-const PROC_PID_MAX: u32 = 4_194_304;
+const PROC_PID_MAX_MIN: u32 = 301;
+const PROC_PID_MAX_DEFAULT: u32 = 4_194_304;
 const PROC_THREADS_MAX: u32 = 4_194_304;
 const PROC_PAGEMAP_ENTRY_BYTES: u64 = 8;
 const PROC_KPAGEFLAGS_ENTRY_BYTES: u64 = 8;
 const KPF_DIRTY: u64 = 1 << 4;
+static PROC_PID_MAX: AtomicU32 = AtomicU32::new(PROC_PID_MAX_DEFAULT);
 // Minimal gzip-compressed kernel config for LTP kconfig probes.
 const PROC_CONFIG_GZ: &[u8] = &[
     0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x73, 0xf6, 0xf7, 0x73, 0xf3, 0x74,
@@ -1205,7 +1207,26 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             );
             kernel.add(
                 "pid_max",
-                SimpleFile::new_regular(fs.clone(), || Ok(alloc::format!("{PROC_PID_MAX}\n"))),
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", PROC_PID_MAX.load(Ordering::Relaxed))
+                                .into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let value = write_proc_u32(data)?;
+                            if !(PROC_PID_MAX_MIN..=PROC_PID_MAX_DEFAULT).contains(&value) {
+                                return Err(VfsError::InvalidInput);
+                            }
+                            PROC_PID_MAX.store(value, Ordering::Relaxed);
+                            Ok(None)
+                        }
+                    }),
+                ),
             );
             kernel.add(
                 "threads-max",
