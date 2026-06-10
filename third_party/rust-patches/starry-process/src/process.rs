@@ -73,8 +73,8 @@ pub struct Process {
     pub(crate) tg: SpinNoIrq<ThreadGroup>,
     exit_signal: Option<u8>,
     zombie_snapshot: SpinNoIrq<Option<ZombieSnapshot>>,
+    child_subreaper: AtomicBool,
 
-    // TODO: child subreaper9
     children: SpinNoIrq<StrongMap<Pid, Arc<Process>>>,
     parent: SpinNoIrq<Weak<Process>>,
 
@@ -109,6 +109,17 @@ impl Process {
     /// Publishes the durable zombie snapshot for this process.
     pub fn publish_zombie_snapshot(&self, snapshot: ZombieSnapshot) {
         *self.zombie_snapshot.lock() = Some(snapshot);
+    }
+
+    /// Returns whether this process acts as a child subreaper for orphaned
+    /// descendants.
+    pub fn is_child_subreaper(&self) -> bool {
+        self.child_subreaper.load(Ordering::Acquire)
+    }
+
+    /// Configures child subreaper state for this process.
+    pub fn set_child_subreaper(&self, enabled: bool) {
+        self.child_subreaper.store(enabled, Ordering::Release);
     }
 }
 
@@ -256,6 +267,18 @@ impl Process {
 
 /// Status & exit
 impl Process {
+    fn reaper_for_exit(self: &Arc<Self>) -> Arc<Process> {
+        let init = INIT_PROC.get().unwrap();
+        let mut ancestor = self.parent();
+        while let Some(process) = ancestor {
+            if process.is_child_subreaper() && !process.is_zombie() {
+                return process;
+            }
+            ancestor = process.parent();
+        }
+        init.clone()
+    }
+
     /// Returns `true` if the [`Process`] is a zombie process.
     pub fn is_zombie(&self) -> bool {
         self.is_zombie.load(Ordering::Acquire)
@@ -268,10 +291,9 @@ impl Process {
     ///
     /// This method panics if the [`Process`] is the init process.
     pub fn exit(self: &Arc<Self>) {
-        // TODO: child subreaper
-        let reaper = INIT_PROC.get().unwrap();
+        let reaper = self.reaper_for_exit();
 
-        if Arc::ptr_eq(self, reaper) {
+        if self.is_init() {
             return;
         }
 
@@ -279,7 +301,7 @@ impl Process {
         self.is_zombie.store(true, Ordering::Release);
 
         let mut reaper_children = reaper.children.lock();
-        let reaper = Arc::downgrade(reaper);
+        let reaper = Arc::downgrade(&reaper);
 
         for (pid, child) in core::mem::take(&mut *children) {
             *child.parent.lock() = reaper.clone();
@@ -354,6 +376,7 @@ impl Process {
             tg: SpinNoIrq::new(ThreadGroup::default()),
             exit_signal,
             zombie_snapshot: SpinNoIrq::new(None),
+            child_subreaper: AtomicBool::new(false),
             children: SpinNoIrq::new(StrongMap::new()),
             parent: SpinNoIrq::new(parent.as_ref().map(Arc::downgrade).unwrap_or_default()),
             group: SpinNoIrq::new(group.clone()),

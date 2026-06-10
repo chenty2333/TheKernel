@@ -419,6 +419,17 @@ pub fn sys_prctl(
         PR_GET_PDEATHSIG => {
             (arg2 as *mut i32).vm_write(current().as_thread().proc_data.pdeath_signal() as i32)?;
         }
+        PR_SET_CHILD_SUBREAPER => {
+            current()
+                .as_thread()
+                .proc_data
+                .proc
+                .set_child_subreaper(arg2 != 0);
+        }
+        PR_GET_CHILD_SUBREAPER => {
+            (arg2 as *mut i32)
+                .vm_write(current().as_thread().proc_data.proc.is_child_subreaper() as i32)?;
+        }
         PR_SET_TIMERSLACK => {
             current().as_thread().proc_data.set_timerslack_ns(arg2);
         }
