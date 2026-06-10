@@ -29,7 +29,7 @@ use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use starry_process::Process;
 
 use crate::{
-    file::{FD_TABLE, lease, pipe},
+    file::{FD_TABLE, FileDescription, inotify::InotifyFile, lease, pipe},
     mm::{Backend, BackendOps, system_memory_stats},
     mounts,
     pseudofs::{
@@ -330,6 +330,64 @@ impl SimpleDirOps for ThreadFdDir {
     }
 }
 
+/// The /proc/[pid]/fdinfo directory
+struct ThreadFdInfoDir {
+    fs: Arc<SimpleFs>,
+    task: WeakAxTaskRef,
+}
+
+impl ThreadFdInfoDir {
+    fn description_for(&self, name: &str) -> VfsResult<Arc<FileDescription>> {
+        let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
+        let fd = name.parse::<usize>().map_err(|_| VfsError::NotFound)?;
+        FD_TABLE
+            .scope(&task.as_thread().proc_data.scope.read())
+            .read()
+            .get(fd)
+            .map(|entry| entry.description.clone())
+            .ok_or(VfsError::NotFound)
+    }
+
+    fn render_fdinfo(description: &FileDescription) -> String {
+        let mut out = format!(
+            "pos:\t0\nflags:\t{:o}\nmnt_id:\t0\n",
+            description.status_flags()
+        );
+        if let Ok(stat) = description.inner.stat() {
+            let _ = writeln!(out, "ino:\t{}", stat.ino);
+        }
+        if let Some(inotify) = description.inner.downcast_ref::<InotifyFile>() {
+            out.push_str(&inotify.fdinfo());
+        }
+        out
+    }
+}
+
+impl SimpleDirOps for ThreadFdInfoDir {
+    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+        let Some(task) = self.task.upgrade() else {
+            return Box::new(iter::empty());
+        };
+        let ids = FD_TABLE
+            .scope(&task.as_thread().proc_data.scope.read())
+            .read()
+            .ids()
+            .map(|id| Cow::Owned(id.to_string()))
+            .collect::<Vec<_>>();
+        Box::new(ids.into_iter())
+    }
+
+    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+        let fs = self.fs.clone();
+        let description = self.description_for(name)?;
+        Ok(SimpleFile::new_regular(fs, move || Ok(Self::render_fdinfo(&description))).into())
+    }
+
+    fn is_cacheable(&self) -> bool {
+        false
+    }
+}
+
 /// The /proc/[pid] directory
 struct ThreadDir {
     fs: Arc<SimpleFs>,
@@ -559,6 +617,7 @@ impl SimpleDirOps for ThreadDir {
                 Some("comm"),
                 Some("exe"),
                 Some("fd"),
+                Some("fdinfo"),
             ]
             .into_iter()
             .flatten()
@@ -676,6 +735,14 @@ impl SimpleDirOps for ThreadDir {
             "fd" => SimpleDir::new_maker(
                 fs.clone(),
                 Arc::new(ThreadFdDir {
+                    fs,
+                    task: Arc::downgrade(&task),
+                }),
+            )
+            .into(),
+            "fdinfo" => SimpleDir::new_maker(
+                fs.clone(),
+                Arc::new(ThreadFdInfoDir {
                     fs,
                     task: Arc::downgrade(&task),
                 }),

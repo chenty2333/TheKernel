@@ -1,6 +1,8 @@
 use alloc::{
     borrow::Cow,
     collections::VecDeque,
+    format,
+    string::String,
     sync::{Arc, Weak},
     vec,
     vec::Vec,
@@ -20,8 +22,8 @@ use axtask::{
 };
 use linux_raw_sys::general::{
     DN_ATTRIB, DN_MULTISHOT, DN_RENAME, IN_ACCESS, IN_ALL_EVENTS, IN_ATTRIB, IN_CLOSE_NOWRITE,
-    IN_CLOSE_WRITE, IN_DELETE_SELF, IN_ISDIR, IN_MODIFY, IN_MOVE_SELF, POLL_MSG, SI_SIGIO,
-    inotify_event,
+    IN_CLOSE_WRITE, IN_DELETE_SELF, IN_EXCL_UNLINK, IN_IGNORED, IN_ISDIR, IN_MODIFY, IN_MOVE_SELF,
+    IN_ONESHOT, IN_Q_OVERFLOW, POLL_MSG, SI_SIGIO, inotify_event,
 };
 use spin::Mutex;
 use starry_process::Pid;
@@ -90,6 +92,7 @@ pub struct InotifyFile {
 
 static INOTIFY_FILES: Mutex<Vec<Weak<InotifyFile>>> = Mutex::new(Vec::new());
 static NEXT_COOKIE: AtomicU32 = AtomicU32::new(1);
+pub(crate) const MAX_QUEUED_EVENTS: usize = 16384;
 
 #[derive(Clone)]
 struct DnotifyWatch {
@@ -142,13 +145,40 @@ impl InotifyFile {
         Ok(())
     }
 
-    fn enqueue(&self, event: QueuedEvent) {
-        let mut state = self.state.lock();
+    pub fn fdinfo(&self) -> String {
+        let state = self.state.lock();
+        let mut out = String::new();
+        for watch in &state.watches {
+            out.push_str(&format!(
+                "inotify wd:{} ino:{:x} sdev:{:x} mask:{:x}\n",
+                watch.wd, watch.key.ino, watch.key.dev, watch.mask
+            ));
+        }
+        out
+    }
+
+    fn enqueue_locked(state: &mut InotifyState, event: QueuedEvent) -> bool {
         if state.queue.back().is_some_and(|last| *last == event) {
-            return;
+            return false;
+        }
+        if event.mask != IN_Q_OVERFLOW && state.queue.len() >= MAX_QUEUED_EVENTS {
+            if state
+                .queue
+                .iter()
+                .any(|queued| queued.mask == IN_Q_OVERFLOW && queued.wd == -1)
+            {
+                return false;
+            }
+            state.queue.push_back(QueuedEvent {
+                wd: -1,
+                mask: IN_Q_OVERFLOW,
+                cookie: 0,
+                name: Vec::new(),
+            });
+            return true;
         }
         state.queue.push_back(event);
-        self.poll_rx.wake();
+        true
     }
 
     fn has_events(&self) -> bool {
@@ -312,26 +342,64 @@ fn emit_dnotify(key: WatchKey, event: u32) {
     }
 }
 
-fn emit_to_matching_watches(key: WatchKey, mask: u32, cookie: u32, name: &[u8], require_dir: bool) {
+fn emit_to_matching_watches(
+    key: WatchKey,
+    mask: u32,
+    cookie: u32,
+    name: &[u8],
+    require_dir: bool,
+    unlinked_child: bool,
+) {
     let interest = mask & IN_ALL_EVENTS;
     each_inotify_file(|file| {
-        let watches = file.state.lock().watches.clone();
-        for watch in watches {
+        let mut state = file.state.lock();
+        let mut idx = 0;
+        let mut wake = false;
+        while idx < state.watches.len() {
+            let watch = state.watches[idx].clone();
             if watch.key != key {
+                idx += 1;
                 continue;
             }
             if require_dir && !watch.is_dir {
+                idx += 1;
+                continue;
+            }
+            if unlinked_child && watch.mask & IN_EXCL_UNLINK != 0 {
+                idx += 1;
                 continue;
             }
             if interest != 0 && watch.mask & interest == 0 {
+                idx += 1;
                 continue;
             }
-            file.enqueue(QueuedEvent {
-                wd: watch.wd,
-                mask,
-                cookie,
-                name: name.to_vec(),
-            });
+            wake |= InotifyFile::enqueue_locked(
+                &mut state,
+                QueuedEvent {
+                    wd: watch.wd,
+                    mask,
+                    cookie,
+                    name: name.to_vec(),
+                },
+            );
+            if watch.mask & IN_ONESHOT != 0 {
+                state.watches.remove(idx);
+                wake |= InotifyFile::enqueue_locked(
+                    &mut state,
+                    QueuedEvent {
+                        wd: watch.wd,
+                        mask: IN_IGNORED,
+                        cookie: 0,
+                        name: Vec::new(),
+                    },
+                );
+            } else {
+                idx += 1;
+            }
+        }
+        drop(state);
+        if wake {
+            file.poll_rx.wake();
         }
     });
 }
@@ -351,7 +419,7 @@ pub(crate) fn next_rename_cookie() -> u32 {
 pub(crate) fn notify_exact(loc: &Location, mut mask: u32) -> AxResult<()> {
     mask = exact_dir_mask(mask, loc.is_dir());
     let key = WatchKey::from_location(loc)?;
-    emit_to_matching_watches(key, mask, 0, &[], false);
+    emit_to_matching_watches(key, mask, 0, &[], false, false);
     if mask & IN_ATTRIB != 0 {
         emit_dnotify(key, DN_ATTRIB);
     }
@@ -360,7 +428,14 @@ pub(crate) fn notify_exact(loc: &Location, mut mask: u32) -> AxResult<()> {
 
 pub(crate) fn notify_exact_with_cookie(loc: &Location, mut mask: u32, cookie: u32) -> AxResult<()> {
     mask = exact_dir_mask(mask, loc.is_dir());
-    emit_to_matching_watches(WatchKey::from_location(loc)?, mask, cookie, &[], false);
+    emit_to_matching_watches(
+        WatchKey::from_location(loc)?,
+        mask,
+        cookie,
+        &[],
+        false,
+        false,
+    );
     Ok(())
 }
 
@@ -372,7 +447,8 @@ pub(crate) fn notify_parent(loc: &Location, mut mask: u32) -> AxResult<()> {
         mask |= IN_ISDIR;
     }
     let key = WatchKey::from_location(&parent)?;
-    emit_to_matching_watches(key, mask, 0, loc.name().as_bytes(), true);
+    let unlinked_child = matches!(loc.metadata(), Ok(meta) if meta.nlink == 0);
+    emit_to_matching_watches(key, mask, 0, loc.name().as_bytes(), true, unlinked_child);
     if mask & IN_ATTRIB != 0 {
         emit_dnotify(key, DN_ATTRIB);
     }
@@ -395,6 +471,7 @@ pub(crate) fn notify_parent_with_name(
         cookie,
         child_name.as_bytes(),
         true,
+        false,
     );
     Ok(())
 }
@@ -411,6 +488,7 @@ pub(crate) fn notify_read(fd: i32) {
     if let Ok(file) = File::from_fd(fd) {
         let loc = file.inner().location().clone();
         let _ = notify_exact(&loc, IN_ACCESS);
+        let _ = notify_parent(&loc, IN_ACCESS);
     }
 }
 
@@ -418,6 +496,7 @@ pub(crate) fn notify_write(fd: i32) {
     if let Ok(file) = File::from_fd(fd) {
         let loc = file.inner().location().clone();
         let _ = notify_exact(&loc, IN_MODIFY);
+        let _ = notify_parent(&loc, IN_MODIFY);
     }
 }
 
