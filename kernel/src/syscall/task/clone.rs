@@ -320,6 +320,7 @@ impl CloneArgs {
             proc_data.set_capability_state(old_proc_data.capability_state());
             proc_data.set_supplementary_groups(old_proc_data.supplementary_groups());
             proc_data.set_heap_top(old_proc_data.get_heap_top());
+            proc_data.set_ioprio(old_proc_data.ioprio());
             proc_data.inherit_timerslack_from(old_proc_data);
             if old_proc_data.no_new_privs() {
                 proc_data.set_no_new_privs();

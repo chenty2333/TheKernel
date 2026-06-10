@@ -14,7 +14,6 @@ use starry_signal::{
     api::{ProcessSignalManager, SignalActions},
 };
 
-use crate::file::executable::{self, ExecutableKey};
 use super::{
     accounting::{AtomicTaskUsage, live_process_usage},
     creds::{CAPABILITY_WORDS, CapabilityState, Credentials},
@@ -23,7 +22,10 @@ use super::{
     resources::Rlimits,
     timer::PosixTimer,
 };
-use crate::mm::AddrSpace;
+use crate::{
+    file::executable::{self, ExecutableKey},
+    mm::AddrSpace,
+};
 
 pub(crate) const UTS_FIELD_LEN: usize = 64;
 
@@ -158,6 +160,8 @@ pub struct ProcessData {
     supplementary_groups: SpinNoIrq<Vec<u32>>,
     /// Linux personality flags shared by all threads in the process.
     personality: AtomicU32,
+    /// Raw Linux I/O priority value configured through ioprio_set(2).
+    ioprio: AtomicU32,
     /// Parent-death signal configured through prctl(PR_SET_PDEATHSIG).
     pdeath_signal: AtomicU32,
     /// Current timer slack in nanoseconds.
@@ -239,6 +243,7 @@ impl ProcessData {
             caps: SpinNoIrq::new(CapabilityState::full()),
             supplementary_groups: SpinNoIrq::new(Vec::new()),
             personality: AtomicU32::new(0),
+            ioprio: AtomicU32::new(0),
             pdeath_signal: AtomicU32::new(0),
             timerslack_current_ns: AtomicUsize::new(50_000),
             timerslack_default_ns: AtomicUsize::new(50_000),
@@ -408,6 +413,14 @@ impl ProcessData {
 
     pub fn set_personality(&self, personality: u32) {
         self.personality.store(personality, Ordering::Release);
+    }
+
+    pub fn ioprio(&self) -> u32 {
+        self.ioprio.load(Ordering::Acquire)
+    }
+
+    pub fn set_ioprio(&self, ioprio: u32) {
+        self.ioprio.store(ioprio, Ordering::Release);
     }
 
     pub fn uid(&self) -> u32 {

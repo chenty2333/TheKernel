@@ -574,6 +574,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::getpid => sys_getpid(),
         Sysno::getppid => sys_getppid(),
         Sysno::gettid => sys_gettid(),
+        Sysno::getcpu => sys_getcpu(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::getrusage => sys_getrusage(uctx.arg0() as _, uctx.arg1() as _),
 
         // task sched
@@ -613,6 +614,8 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         ),
         Sysno::getpriority => sys_getpriority(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::setpriority => sys_setpriority(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::ioprio_get => sys_ioprio_get(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::ioprio_set => sys_ioprio_set(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
 
         // task ops
         Sysno::execve => sys_execve(uctx, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
@@ -925,10 +928,9 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::bpf => bpf::sys_bpf(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
 
         // dummy fds
-        Sysno::fanotify_init
-        | Sysno::perf_event_open
-        | Sysno::fspick
-        | Sysno::memfd_secret => sys_dummy_fd(sysno),
+        Sysno::fanotify_init | Sysno::perf_event_open | Sysno::fspick | Sysno::memfd_secret => {
+            sys_dummy_fd(sysno)
+        }
 
         Sysno::timer_create => {
             sys_timer_create(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)

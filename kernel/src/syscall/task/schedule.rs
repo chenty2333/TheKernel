@@ -10,10 +10,10 @@ use axtask::{
     sched_state, set_sched_state, set_task_affinity,
 };
 use linux_raw_sys::general::{
-    __kernel_clockid_t, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID,
-    CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, SCHED_BATCH,
-    SCHED_DEADLINE, SCHED_FIFO, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE, SCHED_NORMAL,
-    SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
+    __kernel_clockid_t, CAP_SYS_ADMIN, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC,
+    CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP, PRIO_PROCESS,
+    PRIO_USER, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE,
+    SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
 };
 use starry_process::Pid;
 use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
@@ -27,6 +27,16 @@ use crate::{
 };
 
 const SUPPORTED_SCHED_ATTR_FLAGS: u64 = SCHED_FLAG_RESET_ON_FORK as u64;
+const IOPRIO_CLASS_SHIFT: u32 = 13;
+const IOPRIO_PRIO_MASK: u32 = (1 << IOPRIO_CLASS_SHIFT) - 1;
+const IOPRIO_NR_LEVELS: u32 = 8;
+const IOPRIO_CLASS_NONE: u32 = 0;
+const IOPRIO_CLASS_RT: u32 = 1;
+const IOPRIO_CLASS_BE: u32 = 2;
+const IOPRIO_CLASS_IDLE: u32 = 3;
+const IOPRIO_WHO_PROCESS: u32 = 1;
+const IOPRIO_WHO_PGRP: u32 = 2;
+const IOPRIO_WHO_USER: u32 = 3;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -77,6 +87,13 @@ fn has_sched_admin_capability() -> bool {
         .as_thread()
         .proc_data
         .has_effective_capability(CAP_SYS_NICE)
+}
+
+fn has_ioprio_realtime_capability() -> bool {
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    proc_data.has_effective_capability(CAP_SYS_ADMIN)
+        || proc_data.has_effective_capability(CAP_SYS_NICE)
 }
 
 fn can_manage_sched_target(task: &AxTaskRef) -> AxResult<()> {
@@ -153,6 +170,75 @@ fn state_nice(state: SchedState) -> i32 {
 
 fn raw_priority_from_nice(nice: i8) -> isize {
     20 - nice as isize
+}
+
+fn ioprio_class(ioprio: u32) -> u32 {
+    ioprio >> IOPRIO_CLASS_SHIFT
+}
+
+fn ioprio_level(ioprio: u32) -> u32 {
+    ioprio & IOPRIO_PRIO_MASK
+}
+
+fn ioprio_value(class: u32, level: u32) -> u32 {
+    (class << IOPRIO_CLASS_SHIFT) | level
+}
+
+fn validate_ioprio(ioprio: u32) -> AxResult<()> {
+    let class = ioprio_class(ioprio);
+    let level = ioprio_level(ioprio);
+    match class {
+        IOPRIO_CLASS_RT => {
+            if !has_ioprio_realtime_capability() {
+                return Err(AxError::OperationNotPermitted);
+            }
+            if level >= IOPRIO_NR_LEVELS {
+                return Err(AxError::InvalidInput);
+            }
+            Ok(())
+        }
+        IOPRIO_CLASS_BE => {
+            if level < IOPRIO_NR_LEVELS {
+                Ok(())
+            } else {
+                Err(AxError::InvalidInput)
+            }
+        }
+        IOPRIO_CLASS_IDLE => Ok(()),
+        IOPRIO_CLASS_NONE => {
+            if level == 0 {
+                Ok(())
+            } else {
+                Err(AxError::InvalidInput)
+            }
+        }
+        _ => Err(AxError::InvalidInput),
+    }
+}
+
+fn ioprio_from_nice(nice: i8) -> u32 {
+    ioprio_value(IOPRIO_CLASS_BE, ((nice as i32 + 20) / 5) as u32)
+}
+
+fn effective_ioprio_for_task(task: &AxTaskRef) -> u32 {
+    let raw = task.as_thread().proc_data.ioprio();
+    if ioprio_class(raw) == IOPRIO_CLASS_NONE {
+        ioprio_from_nice(sched_state(task).nice)
+    } else {
+        raw
+    }
+}
+
+fn raw_ioprio_for_task(task: &AxTaskRef) -> u32 {
+    task.as_thread().proc_data.ioprio()
+}
+
+fn ioprio_best(current: u32, candidate: u32) -> u32 {
+    if candidate < current {
+        candidate
+    } else {
+        current
+    }
 }
 
 fn rr_interval_for_state(state: SchedState) -> Duration {
@@ -404,6 +490,24 @@ pub fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, user_mask: *const u8) 
     Ok(0)
 }
 
+pub fn sys_getcpu(cpu: *mut u32, node: *mut u32) -> AxResult<isize> {
+    let curr = current();
+    let mask = curr.cpumask();
+    let mut cpu_id = axhal::percpu::this_cpu_id();
+    if !mask.get(cpu_id) {
+        cpu_id = (0..axhal::cpu_num())
+            .find(|&candidate| mask.get(candidate))
+            .ok_or(AxError::InvalidInput)?;
+    }
+    if !cpu.is_null() {
+        cpu.vm_write(cpu_id as u32)?;
+    }
+    if !node.is_null() {
+        node.vm_write(0)?;
+    }
+    Ok(0)
+}
+
 pub fn sys_sched_getscheduler(pid: i32) -> AxResult<isize> {
     let task = sched_target(pid)?;
     Ok(linux_policy_from_state(sched_state(&task)) as isize)
@@ -619,6 +723,115 @@ pub fn sys_setpriority(which: u32, who: u32, prio: i32) -> AxResult<isize> {
 
     for task in &targets {
         set_task_nice(task, new_nice)?;
+    }
+
+    Ok(0)
+}
+
+pub fn sys_ioprio_get(which: u32, who: u32) -> AxResult<isize> {
+    debug!("sys_ioprio_get <= which: {which}, who: {who}");
+
+    match which {
+        IOPRIO_WHO_PROCESS => {
+            let task = if who == 0 {
+                current().clone()
+            } else {
+                get_task(who)?
+            };
+            Ok(raw_ioprio_for_task(&task) as isize)
+        }
+        IOPRIO_WHO_PGRP => {
+            let pgid = if who == 0 {
+                current().as_thread().proc_data.proc.group().pgid()
+            } else {
+                who
+            };
+            let group = get_process_group(pgid)?;
+            let mut best = None;
+            for task in group
+                .processes()
+                .into_iter()
+                .flat_map(|proc| proc.threads())
+                .filter_map(|tid| get_task(tid).ok())
+            {
+                let prio = effective_ioprio_for_task(&task);
+                best = Some(best.map_or(prio, |current| ioprio_best(current, prio)));
+            }
+            best.map(|prio| prio as isize).ok_or(AxError::NoSuchProcess)
+        }
+        IOPRIO_WHO_USER => {
+            let uid = if who == 0 {
+                current().as_thread().proc_data.uid()
+            } else {
+                who
+            };
+            let mut best = None;
+            for task in processes()
+                .into_iter()
+                .filter(|proc_data| proc_data.uid() == uid)
+                .flat_map(|proc_data| proc_data.proc.threads())
+                .filter_map(|tid| get_task(tid).ok())
+            {
+                let prio = effective_ioprio_for_task(&task);
+                best = Some(best.map_or(prio, |current| ioprio_best(current, prio)));
+            }
+            best.map(|prio| prio as isize).ok_or(AxError::NoSuchProcess)
+        }
+        _ => Err(AxError::InvalidInput),
+    }
+}
+
+pub fn sys_ioprio_set(which: u32, who: u32, ioprio: u32) -> AxResult<isize> {
+    debug!("sys_ioprio_set <= which: {which}, who: {who}, ioprio: {ioprio}");
+
+    validate_ioprio(ioprio)?;
+    let targets: Vec<AxTaskRef> = match which {
+        IOPRIO_WHO_PROCESS => {
+            if who == 0 {
+                vec![current().clone()]
+            } else {
+                vec![get_task(who)?]
+            }
+        }
+        IOPRIO_WHO_PGRP => {
+            let pgid = if who == 0 {
+                current().as_thread().proc_data.proc.group().pgid()
+            } else {
+                who
+            };
+            let group = get_process_group(pgid)?;
+            group
+                .processes()
+                .into_iter()
+                .flat_map(|proc| proc.threads())
+                .filter_map(|tid| get_task(tid).ok())
+                .collect()
+        }
+        IOPRIO_WHO_USER => {
+            let uid = if who == 0 {
+                current().as_thread().proc_data.uid()
+            } else {
+                who
+            };
+            processes()
+                .into_iter()
+                .filter(|proc_data| proc_data.uid() == uid)
+                .flat_map(|proc_data| proc_data.proc.threads())
+                .filter_map(|tid| get_task(tid).ok())
+                .collect()
+        }
+        _ => return Err(AxError::InvalidInput),
+    };
+
+    if targets.is_empty() {
+        return Err(AxError::NoSuchProcess);
+    }
+
+    for task in &targets {
+        can_manage_sched_target(task)?;
+    }
+    for task in targets {
+        task.as_thread().proc_data.set_ioprio(ioprio);
     }
 
     Ok(0)

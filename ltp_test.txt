@@ -1143,3 +1143,13 @@ openfile01 openfile -f10 -t10
 read_all_dev read_all -d /dev -p -q -r 3
 read_all_proc read_all -d /proc -q -r 3
 read_all_sys read_all -d /sys -q -r 3
+fsconfig03 fsconfig03
+fsmount02 fsmount02
+fsopen01 fsopen01
+fsopen02 fsopen02
+getcpu01 getcpu01
+ioprio_get01 ioprio_get01
+ioprio_set01 ioprio_set01
+ioprio_set02 ioprio_set02
+ioprio_set03 ioprio_set03
+prctl06 prctl06
