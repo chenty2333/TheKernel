@@ -13,6 +13,7 @@ const MEMBARRIER_CMD_PRIVATE_EXPEDITED: i32 = 1 << 3;
 const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: i32 = 1 << 4;
 const MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE: i32 = 1 << 5;
 const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: i32 = 1 << 6;
+const MEMBARRIER_CMD_GET_REGISTRATIONS: i32 = 1 << 9;
 
 /// Supported command flags for query
 const SUPPORTED_COMMANDS: i32 = MEMBARRIER_CMD_GLOBAL
@@ -21,7 +22,8 @@ const SUPPORTED_COMMANDS: i32 = MEMBARRIER_CMD_GLOBAL
     | MEMBARRIER_CMD_PRIVATE_EXPEDITED
     | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
     | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
-    | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE;
+    | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+    | MEMBARRIER_CMD_GET_REGISTRATIONS;
 
 pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> AxResult<isize> {
     if flags != 0 {
@@ -67,6 +69,10 @@ pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> AxResult<isize> {
             }
             compiler_fence(Ordering::SeqCst);
             Ok(0)
+        }
+        MEMBARRIER_CMD_GET_REGISTRATIONS => {
+            let proc_data = axtask::current().as_thread().proc_data.clone();
+            Ok((proc_data.membarrier_registrations() & SUPPORTED_COMMANDS as u32) as isize)
         }
         _ => Err(AxError::InvalidInput),
     }

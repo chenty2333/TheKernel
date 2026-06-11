@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use core::ffi::c_int;
 
-use axerrno::AxResult;
+use axerrno::{AxError, AxResult};
 use bitflags::bitflags;
 use linux_raw_sys::general::{O_CLOEXEC, O_DIRECT, O_NONBLOCK, O_RDONLY, O_WRONLY};
 use starry_vm::VmMutPtr;
@@ -22,13 +22,7 @@ bitflags! {
 }
 
 pub fn sys_pipe2(fds: *mut [c_int; 2], flags: u32) -> AxResult<isize> {
-    let flags = {
-        let new_flags = PipeFlags::from_bits_truncate(flags);
-        if new_flags.bits() != flags {
-            warn!("sys_pipe2 <= unrecognized flags: {flags}");
-        }
-        new_flags
-    };
+    let flags = PipeFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
 
     let cloexec = flags.contains(PipeFlags::CLOEXEC);
     let (read_end, write_end) = Pipe::new();
@@ -50,7 +44,11 @@ pub fn sys_pipe2(fds: *mut [c_int; 2], flags: u32) -> AxResult<isize> {
     let write_fd = add_file_like_with_flags(Arc::new(write_end), cloexec, write_status)
         .inspect_err(|_| close_file_like(read_fd).unwrap())?;
 
-    fds.vm_write([read_fd, write_fd])?;
+    if let Err(err) = fds.vm_write([read_fd, write_fd]) {
+        close_file_like(read_fd).unwrap();
+        close_file_like(write_fd).unwrap();
+        return Err(err.into());
+    }
 
     debug!(
         "sys_pipe2 <= fds: {:?}, flags: {:?}",

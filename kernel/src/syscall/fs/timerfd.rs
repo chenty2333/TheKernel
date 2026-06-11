@@ -24,7 +24,8 @@ bitflags! {
 fn validate_clockid(clockid: i32) -> AxResult<crate::file::timerfd::TimerClock> {
     match clockid as u32 {
         CLOCK_REALTIME => Ok(crate::file::timerfd::TimerClock::Realtime),
-        CLOCK_MONOTONIC | CLOCK_BOOTTIME => Ok(crate::file::timerfd::TimerClock::Monotonic),
+        CLOCK_MONOTONIC => Ok(crate::file::timerfd::TimerClock::Monotonic),
+        CLOCK_BOOTTIME => Ok(crate::file::timerfd::TimerClock::Boottime),
         _ => Err(AxError::InvalidInput),
     }
 }

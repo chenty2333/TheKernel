@@ -4,7 +4,7 @@ use core::{
     task::Context,
 };
 
-use axerrno::AxError;
+use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::future::{block_on, poll_io};
 
@@ -29,6 +29,19 @@ impl EventFd {
             poll_rx: PollSet::new(),
             poll_tx: PollSet::new(),
         })
+    }
+
+    pub fn signal(&self, value: u64) -> AxResult {
+        if value == u64::MAX {
+            return Err(AxError::InvalidInput);
+        }
+        self.count
+            .fetch_update(Ordering::Release, Ordering::Acquire, |count| {
+                Some(count.saturating_add(value))
+            })
+            .map_err(|_| AxError::WouldBlock)?;
+        self.poll_rx.wake();
+        Ok(())
     }
 }
 
@@ -111,12 +124,13 @@ impl Pollable for EventFd {
         let mut events = IoEvents::empty();
         let count = self.count.load(Ordering::Acquire);
         events.set(IoEvents::IN, count > 0);
+        events.set(IoEvents::ERR, count == u64::MAX);
         events.set(IoEvents::OUT, u64::MAX - 1 > count);
         events
     }
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.contains(IoEvents::IN) {
+        if events.intersects(IoEvents::IN | IoEvents::ERR) {
             self.poll_rx.register(context.waker());
         }
         if events.contains(IoEvents::OUT) {

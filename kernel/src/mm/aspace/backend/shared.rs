@@ -146,6 +146,7 @@ impl Drop for SharedPages {
 pub struct SharedBackend {
     start: VirtAddr,
     pages: Arc<SharedPages>,
+    may_protect: MappingFlags,
     map_id: Arc<()>,
 }
 impl SharedBackend {
@@ -169,6 +170,7 @@ impl SharedBackend {
         Self {
             start: new_start.sub(delta),
             pages: self.pages.clone(),
+            may_protect: self.may_protect,
             map_id,
         }
     }
@@ -187,6 +189,14 @@ impl SharedBackend {
         let count = divide_page(size, self.pages.size);
         self.pages.ensure_len(start_index + count)
     }
+
+    pub(crate) fn check_protect_flags(&self, flags: MappingFlags) -> AxResult {
+        let requested = flags & access_flags();
+        if !self.may_protect.contains(requested) {
+            return Err(AxError::PermissionDenied);
+        }
+        Ok(())
+    }
 }
 
 impl BackendOps for SharedBackend {
@@ -202,7 +212,17 @@ impl BackendOps for SharedBackend {
     ) -> AxResult {
         debug!("Shared::map: {:?} {:?}", range, flags);
         pages_in(range, self.pages.size)?;
+        self.check_protect_flags(flags)?;
         Ok(())
+    }
+
+    fn on_protect(
+        &self,
+        _range: VirtAddrRange,
+        new_flags: MappingFlags,
+        _pt: &mut PageTableCursor,
+    ) -> AxResult {
+        self.check_protect_flags(new_flags)
     }
 
     fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult {
@@ -267,10 +287,23 @@ impl BackendOps for SharedBackend {
 
 impl Backend {
     pub fn new_shared(start: VirtAddr, pages: Arc<SharedPages>) -> Self {
+        Self::new_shared_with_may_protect(start, pages, access_flags())
+    }
+
+    pub fn new_shared_with_may_protect(
+        start: VirtAddr,
+        pages: Arc<SharedPages>,
+        may_protect: MappingFlags,
+    ) -> Self {
         Self::Shared(SharedBackend {
             start,
             pages,
+            may_protect: may_protect & access_flags(),
             map_id: Arc::new(()),
         })
     }
+}
+
+fn access_flags() -> MappingFlags {
+    MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE
 }

@@ -5,10 +5,10 @@ use axfs_ng_vfs::{Location, NodePermission, path::Path};
 use axtask::current;
 use linux_raw_sys::general::{
     __kernel_fsid_t, AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_STATX_SYNC_TYPE,
-    AT_SYMLINK_NOFOLLOW, R_OK, STATX_ALL, STATX_ATIME, STATX_BLOCKS, STATX_BTIME, STATX_CTIME,
-    STATX_DIOALIGN, STATX_GID, STATX_INO, STATX_MNT_ID, STATX_MNT_ID_UNIQUE, STATX_MODE,
-    STATX_MTIME, STATX_NLINK, STATX_SIZE, STATX_SUBVOL, STATX_TYPE, STATX_UID, STATX_WRITE_ATOMIC,
-    W_OK, X_OK, stat, statfs, statx,
+    AT_SYMLINK_NOFOLLOW, R_OK, STATX__RESERVED, STATX_ALL, STATX_ATIME, STATX_BASIC_STATS,
+    STATX_BLOCKS, STATX_BTIME, STATX_CTIME, STATX_DIOALIGN, STATX_GID, STATX_INO, STATX_MNT_ID,
+    STATX_MNT_ID_UNIQUE, STATX_MODE, STATX_MTIME, STATX_NLINK, STATX_SIZE, STATX_SUBVOL,
+    STATX_TYPE, STATX_UID, STATX_WRITE_ATOMIC, W_OK, X_OK, stat, statfs, statx, statx_timestamp,
 };
 use starry_vm::{VmMutPtr, VmPtr};
 
@@ -23,6 +23,7 @@ use crate::{
         resolve_at, with_path_fs,
     },
     mm::vm_load_string,
+    mounts,
     task::AsThread,
 };
 
@@ -48,8 +49,52 @@ const VALID_STATX_MASK: u32 = STATX_TYPE
     | STATX_SUBVOL
     | STATX_WRITE_ATOMIC
     | STATX_ALL;
+const STATX_CHANGE_COOKIE: u32 = 0x4000_0000;
 const PIPEFS_MAGIC: i64 = 0x5049_5045;
 const SOCKFS_MAGIC: i64 = 0x534f_434b;
+
+fn statx_timestamp_from_duration(time: core::time::Duration) -> statx_timestamp {
+    statx_timestamp {
+        tv_sec: time.as_secs() as _,
+        tv_nsec: time.subsec_nanos() as _,
+        __reserved: 0,
+    }
+}
+
+fn statx_from_kstat(value: crate::file::Kstat, request_mask: u32) -> statx {
+    let mut result: statx = unsafe { core::mem::zeroed() };
+    result.stx_mask = STATX_BASIC_STATS | STATX_BTIME | STATX_MNT_ID;
+    result.stx_blksize = value.blksize as _;
+    result.stx_attributes = value.attributes;
+    result.stx_attributes_mask = value.attributes_mask;
+    result.stx_nlink = value.nlink as _;
+    result.stx_uid = value.uid as _;
+    result.stx_gid = value.gid as _;
+    result.stx_mode = value.mode as _;
+    result.stx_ino = value.ino as _;
+    result.stx_size = value.size as _;
+    result.stx_blocks = value.blocks as _;
+    result.stx_atime = statx_timestamp_from_duration(value.atime);
+    result.stx_btime = statx_timestamp_from_duration(value.btime);
+    result.stx_ctime = statx_timestamp_from_duration(value.ctime);
+    result.stx_mtime = statx_timestamp_from_duration(value.mtime);
+    result.stx_rdev_major = value.rdev.major();
+    result.stx_rdev_minor = value.rdev.minor();
+    result.stx_dev_major = (value.dev >> 32) as _;
+    result.stx_dev_minor = value.dev as _;
+    result.stx_mnt_id = value.dev;
+
+    let request_mask = request_mask & !STATX_CHANGE_COOKIE;
+    if request_mask & STATX_DIOALIGN != 0
+        && value.mode & linux_raw_sys::general::S_IFMT == linux_raw_sys::general::S_IFBLK
+    {
+        result.stx_mask |= STATX_DIOALIGN;
+        result.stx_dio_mem_align = 1;
+        result.stx_dio_offset_align = value.blksize.max(512);
+    }
+
+    result
+}
 
 /// Get the file metadata by `path` and write into `statbuf`.
 ///
@@ -157,7 +202,13 @@ pub fn sys_statx(
     if flags & !SUPPORTED_STATX_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }
-    if mask & !VALID_STATX_MASK != 0 {
+    if flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE {
+        return Err(AxError::InvalidInput);
+    }
+    if mask & STATX__RESERVED != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if mask & !(VALID_STATX_MASK | STATX__RESERVED | STATX_CHANGE_COOKIE) != 0 {
         return Err(AxError::InvalidInput);
     }
     if path.is_none() && flags & AT_EMPTY_PATH == 0 {
@@ -183,7 +234,7 @@ pub fn sys_statx(
             )?;
         }
     }
-    statxbuf.vm_write(loc.stat()?.into())?;
+    statxbuf.vm_write(statx_from_kstat(loc.stat()?, mask))?;
 
     Ok(0)
 }
@@ -205,6 +256,12 @@ fn check_readonly_write_access(loc: &Location) -> AxResult {
         Err(AxError::ReadOnlyFilesystem)
     } else {
         Ok(())
+    }
+}
+
+fn note_mount_access(loc: &Location) {
+    if let Ok(path) = loc.absolute_path() {
+        mounts::clear_expiry_for_path(path.as_ref());
     }
 }
 
@@ -248,6 +305,7 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
         if mode & W_OK != 0 {
             check_readonly_write_access(loc)?;
         }
+        note_mount_access(loc);
     }
 
     if mode == 0 {

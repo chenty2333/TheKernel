@@ -1,11 +1,18 @@
-use alloc::{string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use alloc::{format, string::String, sync::Arc, vec, vec::Vec};
+use core::{
+    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    time::Duration,
+};
 
 use axerrno::{AxError, AxResult};
+use axhal::time::monotonic_time_nanos;
 use axnet::NetStack;
 use axpoll::PollSet;
 use axsync::{Mutex, spin::SpinNoIrq};
-use linux_raw_sys::general::{CAP_SETGID, CAP_SETUID};
+use linux_raw_sys::general::{
+    CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_LINUX_IMMUTABLE,
+    CAP_MAC_OVERRIDE, CAP_MKNOD, CAP_SETGID, CAP_SETUID,
+};
 use scope_local::Scope;
 use spin::RwLock;
 use starry_process::{Pid, Process};
@@ -18,16 +25,101 @@ use super::{
     accounting::{AtomicTaskUsage, live_process_usage},
     creds::{CAPABILITY_WORDS, CapabilityState, Credentials},
     futex::FutexTable,
-    jobctl::{ContinueResult, ExecControlState, JobControlState, StopState, VforkControlState},
+    jobctl::{
+        ContinueResult, ExecControlState, JobControlState, PtraceControlState, StopKind,
+        StopReport, StopState, VforkControlState,
+    },
     resources::Rlimits,
     timer::PosixTimer,
 };
 use crate::{
     file::executable::{self, ExecutableKey},
     mm::AddrSpace,
+    time::wall_time,
 };
 
 pub(crate) const UTS_FIELD_LEN: usize = 64;
+const PROC_NS_INO_BASE: u64 = 0x9_0000_0000;
+const SECBIT_NO_SETUID_FIXUP: u32 = 1 << 2;
+const SECBIT_KEEP_CAPS: u32 = 1 << 4;
+const SECBIT_KEEP_CAPS_LOCKED: u32 = 1 << 5;
+const SECBIT_NO_CAP_AMBIENT_RAISE: u32 = 1 << 6;
+const SECURE_ALL_BITS: u32 =
+    (1 << 0) | SECBIT_NO_SETUID_FIXUP | SECBIT_KEEP_CAPS | SECBIT_NO_CAP_AMBIENT_RAISE;
+const SECURE_ALL_LOCKS: u32 = SECURE_ALL_BITS << 1;
+static PROC_NS_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+pub(crate) struct PidNamespace {
+    id: u64,
+    parent: Option<Arc<PidNamespace>>,
+    init_pid: Option<Pid>,
+}
+
+impl PidNamespace {
+    pub(crate) fn new_root() -> Arc<Self> {
+        Self::new(None, None)
+    }
+
+    fn new(parent: Option<Arc<Self>>, init_pid: Option<Pid>) -> Arc<Self> {
+        Arc::new(Self {
+            id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
+            parent,
+            init_pid,
+        })
+    }
+
+    pub(crate) fn fork(self: &Arc<Self>, init_pid: Pid) -> Arc<Self> {
+        Self::new(Some(self.clone()), Some(init_pid))
+    }
+
+    pub(crate) fn parent(&self) -> Option<Arc<Self>> {
+        self.parent.clone()
+    }
+
+    pub(crate) fn visible_pid(&self, global_pid: Pid) -> Pid {
+        if self.init_pid == Some(global_pid) {
+            1
+        } else {
+            global_pid
+        }
+    }
+
+    pub(crate) fn proc_inode(&self) -> u64 {
+        PROC_NS_INO_BASE + self.id.saturating_mul(8)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct UserNamespace {
+    id: u64,
+    parent: Option<Arc<UserNamespace>>,
+}
+
+impl UserNamespace {
+    pub(crate) fn new_root() -> Arc<Self> {
+        Self::new(None)
+    }
+
+    fn new(parent: Option<Arc<Self>>) -> Arc<Self> {
+        Arc::new(Self {
+            id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
+            parent,
+        })
+    }
+
+    pub(crate) fn fork(self: &Arc<Self>) -> Arc<Self> {
+        Self::new(Some(self.clone()))
+    }
+
+    pub(crate) fn parent(&self) -> Option<Arc<Self>> {
+        self.parent.clone()
+    }
+
+    pub(crate) fn proc_inode(&self) -> u64 {
+        PROC_NS_INO_BASE + self.id.saturating_mul(8)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct UtsState {
@@ -114,6 +206,87 @@ impl UtsNamespace {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct TimeNamespaceState {
+    monotonic_offset_ns: i64,
+    boottime_offset_ns: i64,
+}
+
+pub(crate) struct TimeNamespace {
+    state: SpinNoIrq<TimeNamespaceState>,
+}
+
+impl TimeNamespace {
+    pub(crate) fn new_default() -> Self {
+        Self {
+            state: SpinNoIrq::new(TimeNamespaceState::default()),
+        }
+    }
+
+    pub(crate) fn fork(&self) -> Arc<Self> {
+        Arc::new(Self {
+            state: SpinNoIrq::new(*self.state.lock()),
+        })
+    }
+
+    fn offset_ns(&self, boottime: bool) -> i64 {
+        let state = self.state.lock();
+        if boottime {
+            state.boottime_offset_ns
+        } else {
+            state.monotonic_offset_ns
+        }
+    }
+
+    pub(crate) fn apply_monotonic_offset(&self, value: Duration) -> Duration {
+        apply_time_offset(value, self.offset_ns(false))
+    }
+
+    pub(crate) fn apply_boottime_offset(&self, value: Duration) -> Duration {
+        apply_time_offset(value, self.offset_ns(true))
+    }
+
+    pub(crate) fn host_monotonic_deadline(&self, value: Duration) -> Duration {
+        apply_time_offset(value, self.offset_ns(false).saturating_neg())
+    }
+
+    pub(crate) fn host_boottime_deadline(&self, value: Duration) -> Duration {
+        apply_time_offset(value, self.offset_ns(true).saturating_neg())
+    }
+
+    pub(crate) fn set_monotonic_offset(&self, secs: i64, nsecs: u32) {
+        self.state.lock().monotonic_offset_ns = offset_to_nanos(secs, nsecs);
+    }
+
+    pub(crate) fn set_boottime_offset(&self, secs: i64, nsecs: u32) {
+        self.state.lock().boottime_offset_ns = offset_to_nanos(secs, nsecs);
+    }
+
+    pub(crate) fn render_offsets(&self) -> Vec<u8> {
+        let state = self.state.lock();
+        let (mono_sec, mono_nsec) = nanos_to_offset(state.monotonic_offset_ns);
+        let (boot_sec, boot_nsec) = nanos_to_offset(state.boottime_offset_ns);
+        format!("monotonic  {mono_sec:10} {mono_nsec:9}\nboottime   {boot_sec:10} {boot_nsec:9}\n")
+            .into_bytes()
+    }
+}
+
+fn offset_to_nanos(secs: i64, nsecs: u32) -> i64 {
+    secs.saturating_mul(1_000_000_000)
+        .saturating_add(nsecs as i64)
+}
+
+fn nanos_to_offset(nanos: i64) -> (i64, u32) {
+    let secs = nanos.div_euclid(1_000_000_000);
+    let nsecs = nanos.rem_euclid(1_000_000_000) as u32;
+    (secs, nsecs)
+}
+
+fn apply_time_offset(value: Duration, offset_ns: i64) -> Duration {
+    let adjusted = value.as_nanos() as i128 + offset_ns as i128;
+    Duration::from_nanos(adjusted.clamp(0, u64::MAX as i128) as u64)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Mempolicy {
     pub mode: u32,
@@ -192,6 +365,10 @@ pub struct ProcessData {
     pub(crate) executable: SpinNoIrq<Option<ExecutableKey>>,
     /// The command line arguments
     pub cmdline: RwLock<Arc<Vec<String>>>,
+    /// Realtime process creation timestamp, in seconds.
+    start_realtime_sec: u64,
+    /// Monotonic process creation timestamp, in nanoseconds.
+    start_monotonic_ns: u64,
     /// The virtual memory address space.
     // TODO: scopify
     aspace_handle: RwLock<Arc<Mutex<AddrSpace>>>,
@@ -230,6 +407,10 @@ pub struct ProcessData {
     personality: AtomicU32,
     /// Raw Linux I/O priority value configured through ioprio_set(2).
     ioprio: AtomicU32,
+    /// Linux I/O context identity shared by CLONE_IO.
+    pub(crate) io_context: Arc<()>,
+    /// System V semaphore undo-list identity shared by CLONE_SYSVSEM.
+    pub(crate) sysvsem_undo: Arc<()>,
     /// NUMA memory policy state for the single-node kernel memory model.
     mempolicy: SpinNoIrq<MempolicyState>,
     /// Parent-death signal configured through prctl(PR_SET_PDEATHSIG).
@@ -240,6 +421,10 @@ pub struct ProcessData {
     timerslack_default_ns: AtomicUsize,
     /// no_new_privs state configured through prctl(PR_SET_NO_NEW_PRIVS).
     no_new_privs: AtomicU32,
+    /// Seccomp mode reported through prctl(PR_GET_SECCOMP).
+    seccomp_mode: AtomicU32,
+    /// Transparent huge-page disable flag reported through prctl(PR_GET_THP_DISABLE).
+    thp_disabled: AtomicU32,
     /// Process-scoped membarrier registration state.
     membarrier_state: AtomicU32,
     /// POSIX interval timers created by this process.
@@ -249,12 +434,16 @@ pub struct ProcessData {
     pub(in crate::task) exited_threads_usage: AtomicTaskUsage,
     /// CPU time accumulated from waited-for child subtrees.
     waited_children_usage: AtomicTaskUsage,
+    /// Maximum resident set size observed for this process, in kilobytes.
+    maxrss_kb: AtomicU64,
 
     /// Serializes wait* selection and consumption for this process.
     pub wait_lock: Mutex<()>,
 
     /// Job-control stop state shared by all threads in the process.
     job_ctl: SpinNoIrq<JobControlState>,
+    /// ptrace ownership and options shared by all threads in the process.
+    ptrace_ctl: SpinNoIrq<PtraceControlState>,
     /// Multi-thread exec coordination state.
     exec_ctl: SpinNoIrq<ExecControlState>,
     /// CLONE_VFORK coordination state.
@@ -266,8 +455,16 @@ pub struct ProcessData {
 
     /// The network namespace (network stack) for this process.
     pub net_ns: Arc<NetStack>,
+    /// Lightweight PID namespace identity for procfs namespace fd ABI.
+    pid_ns: Arc<PidNamespace>,
+    /// Lightweight user namespace identity for procfs namespace fd ABI.
+    user_ns: Arc<UserNamespace>,
     /// The UTS namespace for this process.
-    pub(crate) uts_ns: Arc<UtsNamespace>,
+    uts_ns: RwLock<Arc<UtsNamespace>>,
+    /// The time namespace visible to this process.
+    time_ns: RwLock<Arc<TimeNamespace>>,
+    /// The time namespace inherited by children created after unshare/setns.
+    time_ns_for_children: RwLock<Arc<TimeNamespace>>,
 }
 
 impl ProcessData {
@@ -281,13 +478,23 @@ impl ProcessData {
         signal_actions: Arc<SpinNoIrq<SignalActions>>,
         exit_signal: Option<Signo>,
         net_ns: Arc<NetStack>,
+        pid_ns: Arc<PidNamespace>,
+        user_ns: Arc<UserNamespace>,
         uts_ns: Arc<UtsNamespace>,
+        time_ns: Arc<TimeNamespace>,
+        io_context: Arc<()>,
+        sysvsem_undo: Arc<()>,
     ) -> Arc<Self> {
+        let start_realtime_sec = wall_time().as_secs();
+        let start_monotonic_ns = monotonic_time_nanos();
+
         Arc::new(Self {
             proc,
             exe_path: RwLock::new(exe_path),
             executable: SpinNoIrq::new(executable),
             cmdline: RwLock::new(cmdline),
+            start_realtime_sec,
+            start_monotonic_ns,
             aspace_handle: RwLock::new(aspace),
             scope: RwLock::new(Scope::new()),
             heap_top: AtomicUsize::new(
@@ -311,28 +518,38 @@ impl ProcessData {
             umask: AtomicU32::new(0o022),
             creds: SpinNoIrq::new(Credentials::default()),
             caps: SpinNoIrq::new(CapabilityState::full()),
-            supplementary_groups: SpinNoIrq::new(Vec::new()),
+            supplementary_groups: SpinNoIrq::new(vec![0]),
             personality: AtomicU32::new(0),
             ioprio: AtomicU32::new(0),
+            io_context,
+            sysvsem_undo,
             mempolicy: SpinNoIrq::new(MempolicyState::default()),
             pdeath_signal: AtomicU32::new(0),
             timerslack_current_ns: AtomicUsize::new(50_000),
             timerslack_default_ns: AtomicUsize::new(50_000),
             no_new_privs: AtomicU32::new(0),
+            seccomp_mode: AtomicU32::new(0),
+            thp_disabled: AtomicU32::new(0),
             membarrier_state: AtomicU32::new(0),
             posix_timers: SpinNoIrq::new(Vec::new()),
             exited_threads_usage: AtomicTaskUsage::new(),
             waited_children_usage: AtomicTaskUsage::new(),
+            maxrss_kb: AtomicU64::new(0),
             wait_lock: Mutex::new(()),
 
             job_ctl: SpinNoIrq::new(JobControlState::default()),
+            ptrace_ctl: SpinNoIrq::new(PtraceControlState::default()),
             exec_ctl: SpinNoIrq::new(ExecControlState::default()),
             vfork_ctl: SpinNoIrq::new(VforkControlState::default()),
             stop_event: Arc::default(),
             vfork_event: Arc::default(),
 
             net_ns,
-            uts_ns,
+            pid_ns,
+            user_ns,
+            uts_ns: RwLock::new(uts_ns),
+            time_ns: RwLock::new(time_ns.clone()),
+            time_ns_for_children: RwLock::new(time_ns),
         })
     }
 
@@ -349,6 +566,48 @@ impl ProcessData {
     /// Rebinds the process to a new address-space handle and returns the old one.
     pub fn replace_aspace(&self, aspace: Arc<Mutex<AddrSpace>>) -> Arc<Mutex<AddrSpace>> {
         core::mem::replace(&mut *self.aspace_handle.write(), aspace)
+    }
+
+    pub(crate) fn uts_ns(&self) -> Arc<UtsNamespace> {
+        self.uts_ns.read().clone()
+    }
+
+    pub(crate) fn pid_ns(&self) -> Arc<PidNamespace> {
+        self.pid_ns.clone()
+    }
+
+    pub(crate) fn user_ns(&self) -> Arc<UserNamespace> {
+        self.user_ns.clone()
+    }
+
+    pub(crate) fn replace_uts_ns(&self, uts_ns: Arc<UtsNamespace>) {
+        *self.uts_ns.write() = uts_ns;
+    }
+
+    pub(crate) fn time_ns(&self) -> Arc<TimeNamespace> {
+        self.time_ns.read().clone()
+    }
+
+    pub(crate) fn time_ns_for_children(&self) -> Arc<TimeNamespace> {
+        self.time_ns_for_children.read().clone()
+    }
+
+    pub(crate) fn replace_time_ns(&self, time_ns: Arc<TimeNamespace>) {
+        *self.time_ns.write() = time_ns.clone();
+        *self.time_ns_for_children.write() = time_ns;
+    }
+
+    pub(crate) fn unshare_time_ns(&self) {
+        let new_ns = self.time_ns_for_children().fork();
+        *self.time_ns_for_children.write() = new_ns;
+    }
+
+    pub(crate) fn start_realtime_sec(&self) -> u64 {
+        self.start_realtime_sec
+    }
+
+    pub(crate) fn start_monotonic_ns(&self) -> u64 {
+        self.start_monotonic_ns
     }
 
     pub(crate) fn executable(&self) -> Option<ExecutableKey> {
@@ -408,6 +667,22 @@ impl ProcessData {
         self.no_new_privs.store(1, Ordering::Release)
     }
 
+    pub fn seccomp_mode(&self) -> u32 {
+        self.seccomp_mode.load(Ordering::Acquire)
+    }
+
+    pub fn set_seccomp_mode(&self, mode: u32) {
+        self.seccomp_mode.store(mode, Ordering::Release)
+    }
+
+    pub fn thp_disabled(&self) -> bool {
+        self.thp_disabled.load(Ordering::Acquire) != 0
+    }
+
+    pub fn set_thp_disabled(&self, disabled: bool) {
+        self.thp_disabled.store(disabled as u32, Ordering::Release)
+    }
+
     /// Linux manual: A "clone" child is one which delivers no signal, or a
     /// signal other than SIGCHLD to its parent upon termination.
     pub fn is_clone_child(&self) -> bool {
@@ -416,7 +691,7 @@ impl ProcessData {
 
     /// Returns process CPU usage, including live threads and exited siblings.
     pub fn self_usage(&self) -> super::accounting::TaskUsage {
-        live_process_usage(self)
+        live_process_usage(self).with_maxrss_floor(self.sample_maxrss_kb())
     }
 
     /// Returns waited-for child CPU usage accumulated for this process.
@@ -437,6 +712,23 @@ impl ProcessData {
     /// Records a waited-for child subtree into the process's child ledger.
     pub fn account_waited_child(&self, usage: super::accounting::TaskUsage) {
         self.waited_children_usage.add(usage);
+    }
+
+    fn sample_maxrss_kb(&self) -> u64 {
+        let resident_kb = self.aspace().lock().resident_user_bytes() as u64 / 1024;
+        let mut current = self.maxrss_kb.load(Ordering::Acquire);
+        while resident_kb > current {
+            match self.maxrss_kb.compare_exchange_weak(
+                current,
+                resident_kb,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return resident_kb,
+                Err(observed) => current = observed,
+            }
+        }
+        current
     }
 
     /// Get the umask.
@@ -585,24 +877,93 @@ impl ProcessData {
         self.membarrier_state.fetch_or(flags, Ordering::Relaxed);
     }
 
+    pub fn membarrier_registrations(&self) -> u32 {
+        self.membarrier_state.load(Ordering::Relaxed)
+    }
+
     pub fn membarrier_registered(&self, flags: u32) -> bool {
         self.membarrier_state.load(Ordering::Relaxed) & flags == flags
     }
 
-    pub fn bounding_capability_enabled(&self, cap: u32) -> bool {
-        self.capability_state().bounding_contains(cap)
+    pub fn clear_membarrier_registrations(&self) {
+        self.membarrier_state.store(0, Ordering::SeqCst);
+    }
+
+    pub fn bounding_capability_enabled(&self, cap: u32) -> AxResult<bool> {
+        if CapabilityState::cap_mask(cap).is_none() {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(self.capability_state().bounding_contains(cap))
     }
 
     pub fn drop_bounding_capability(&self, cap: u32) -> AxResult<()> {
         self.caps.lock().drop_bounding(cap)
     }
 
+    pub fn ambient_capability_enabled(&self, cap: u32) -> AxResult<bool> {
+        if CapabilityState::cap_mask(cap).is_none() {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(self.capability_state().ambient_contains(cap))
+    }
+
+    pub fn raise_ambient_capability(&self, cap: u32) -> AxResult<()> {
+        let Some((word, mask)) = CapabilityState::cap_mask(cap) else {
+            return Err(AxError::InvalidInput);
+        };
+        let mut caps = self.caps.lock();
+        if caps.securebits & SECBIT_NO_CAP_AMBIENT_RAISE != 0
+            || caps.permitted[word] & mask == 0
+            || caps.inheritable[word] & mask == 0
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+        caps.raise_ambient(cap)
+    }
+
+    pub fn lower_ambient_capability(&self, cap: u32) -> AxResult<()> {
+        self.caps.lock().lower_ambient(cap)
+    }
+
+    pub fn clear_ambient_capabilities(&self) {
+        self.caps.lock().clear_ambient();
+    }
+
     pub fn securebits(&self) -> u32 {
         self.caps.lock().securebits
     }
 
-    pub fn set_securebits(&self, securebits: u32) {
-        self.caps.lock().securebits = securebits;
+    pub fn set_securebits(&self, securebits: u32) -> AxResult<()> {
+        let mut caps = self.caps.lock();
+        if (((caps.securebits & SECURE_ALL_LOCKS) >> 1) & (caps.securebits ^ securebits)) != 0
+            || (caps.securebits & SECURE_ALL_LOCKS & !securebits) != 0
+            || (securebits & !(SECURE_ALL_LOCKS | SECURE_ALL_BITS)) != 0
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+        caps.securebits = securebits;
+        Ok(())
+    }
+
+    pub fn keep_caps(&self) -> bool {
+        self.caps.lock().securebits & SECBIT_KEEP_CAPS != 0
+    }
+
+    pub fn set_keep_caps(&self, enabled: bool) -> AxResult<()> {
+        let mut caps = self.caps.lock();
+        if caps.securebits & SECBIT_KEEP_CAPS_LOCKED != 0 {
+            return Err(AxError::OperationNotPermitted);
+        }
+        if enabled {
+            caps.securebits |= SECBIT_KEEP_CAPS;
+        } else {
+            caps.securebits &= !SECBIT_KEEP_CAPS;
+        }
+        Ok(())
+    }
+
+    pub fn clear_keep_caps_on_exec(&self) {
+        self.caps.lock().securebits &= !SECBIT_KEEP_CAPS;
     }
 
     fn fixup_capabilities_for_euid_change(&self, old_euid: u32, new_euid: u32) {
@@ -611,10 +972,49 @@ impl ProcessData {
         }
 
         let mut caps = self.caps.lock();
+        if caps.securebits & SECBIT_NO_SETUID_FIXUP != 0 {
+            return;
+        }
         if old_euid == 0 && new_euid != 0 {
             caps.effective = [0; CAPABILITY_WORDS];
+            if caps.securebits & SECBIT_KEEP_CAPS == 0 {
+                caps.permitted = [0; CAPABILITY_WORDS];
+                caps.clear_ambient();
+            }
         } else if old_euid != 0 && new_euid == 0 {
             caps.effective = caps.permitted;
+        }
+    }
+
+    fn fixup_capabilities_for_fsuid_change(&self, old_fsuid: u32, new_fsuid: u32) {
+        if old_fsuid == new_fsuid {
+            return;
+        }
+
+        const FS_CAPS: [u32; 8] = [
+            CAP_CHOWN,
+            CAP_MKNOD,
+            CAP_DAC_OVERRIDE,
+            CAP_DAC_READ_SEARCH,
+            CAP_FOWNER,
+            CAP_FSETID,
+            CAP_MAC_OVERRIDE,
+            CAP_LINUX_IMMUTABLE,
+        ];
+
+        let mut caps = self.caps.lock();
+        if caps.securebits & SECBIT_NO_SETUID_FIXUP != 0 {
+            return;
+        }
+        for cap in FS_CAPS {
+            let Some((word, mask)) = CapabilityState::cap_mask(cap) else {
+                continue;
+            };
+            if old_fsuid == 0 && new_fsuid != 0 {
+                caps.effective[word] &= !mask;
+            } else if old_fsuid != 0 && new_fsuid == 0 && caps.permitted[word] & mask != 0 {
+                caps.effective[word] |= mask;
+            }
         }
     }
 
@@ -666,10 +1066,18 @@ impl ProcessData {
         let mut creds = self.creds.lock();
         let old = *creds;
         if !can_setuid {
-            for id in [ruid, euid].into_iter().flatten() {
-                if id != old.ruid && id != old.euid && id != old.suid {
-                    return Err(AxError::OperationNotPermitted);
-                }
+            if let Some(id) = ruid
+                && id != old.ruid
+                && id != old.euid
+            {
+                return Err(AxError::OperationNotPermitted);
+            }
+            if let Some(id) = euid
+                && id != old.ruid
+                && id != old.euid
+                && id != old.suid
+            {
+                return Err(AxError::OperationNotPermitted);
             }
         }
 
@@ -691,10 +1099,18 @@ impl ProcessData {
         let mut creds = self.creds.lock();
         let old = *creds;
         if !can_setgid {
-            for id in [rgid, egid].into_iter().flatten() {
-                if id != old.rgid && id != old.egid && id != old.sgid {
-                    return Err(AxError::OperationNotPermitted);
-                }
+            if let Some(id) = rgid
+                && id != old.rgid
+                && id != old.egid
+            {
+                return Err(AxError::OperationNotPermitted);
+            }
+            if let Some(id) = egid
+                && id != old.rgid
+                && id != old.egid
+                && id != old.sgid
+            {
+                return Err(AxError::OperationNotPermitted);
             }
         }
 
@@ -787,6 +1203,9 @@ impl ProcessData {
         {
             creds.fsuid = fsuid;
         }
+        let new_fsuid = creds.fsuid;
+        drop(creds);
+        self.fixup_capabilities_for_fsuid_change(old_fsuid, new_fsuid);
         old_fsuid
     }
 
@@ -806,6 +1225,54 @@ impl ProcessData {
             creds.fsgid = fsgid;
         }
         old_fsgid
+    }
+
+    pub fn ptrace_tracer(&self) -> Option<Pid> {
+        self.ptrace_ctl.lock().tracer
+    }
+
+    pub fn ptrace_options(&self) -> u32 {
+        self.ptrace_ctl.lock().options
+    }
+
+    pub fn ptrace_event_message(&self) -> usize {
+        self.ptrace_ctl.lock().event_message
+    }
+
+    pub fn ptrace_set_options(&self, options: u32) {
+        self.ptrace_ctl.lock().options = options;
+    }
+
+    pub fn ptrace_set_event_message(&self, event_message: usize) {
+        self.ptrace_ctl.lock().event_message = event_message;
+    }
+
+    pub fn is_traced_by(&self, tracer: Pid) -> bool {
+        self.ptrace_tracer() == Some(tracer)
+    }
+
+    pub fn begin_ptrace(&self, tracer: Pid) -> bool {
+        let mut ptrace_ctl = self.ptrace_ctl.lock();
+        if ptrace_ctl.tracer.is_some() {
+            return false;
+        }
+        ptrace_ctl.tracer = Some(tracer);
+        ptrace_ctl.options = 0;
+        ptrace_ctl.event_message = 0;
+        true
+    }
+
+    pub fn end_ptrace(&self, tracer: Pid) -> bool {
+        let mut ptrace_ctl = self.ptrace_ctl.lock();
+        if ptrace_ctl.tracer != Some(tracer) {
+            return false;
+        }
+        *ptrace_ctl = PtraceControlState::default();
+        true
+    }
+
+    pub fn clear_ptrace(&self) {
+        *self.ptrace_ctl.lock() = PtraceControlState::default();
     }
 
     fn stop_state(&self) -> StopState {
@@ -830,6 +1297,7 @@ impl ProcessData {
         }
         job_ctl.state = StopState::Stopping;
         job_ctl.stop_signal = signo;
+        job_ctl.stop_kind = StopKind::JobControl;
         true
     }
 
@@ -840,6 +1308,20 @@ impl ProcessData {
             return false;
         }
         job_ctl.state = StopState::Stopped;
+        job_ctl.stop_reported = false;
+        job_ctl.continued = false;
+        true
+    }
+
+    /// Stops a traced process at a signal-delivery or attach boundary.
+    pub fn ptrace_stop(&self, signo: u8) -> bool {
+        let mut job_ctl = self.job_ctl.lock();
+        if job_ctl.state != StopState::Running {
+            return false;
+        }
+        job_ctl.state = StopState::Stopped;
+        job_ctl.stop_signal = signo;
+        job_ctl.stop_kind = StopKind::Ptrace;
         job_ctl.stop_reported = false;
         job_ctl.continued = false;
         true
@@ -857,7 +1339,9 @@ impl ProcessData {
                 }
                 StopState::Stopped => {
                     job_ctl.state = StopState::Running;
-                    job_ctl.continued = true;
+                    if job_ctl.stop_kind == StopKind::JobControl {
+                        job_ctl.continued = true;
+                    }
                     ContinueResult::ResumedStopped
                 }
             }
@@ -877,35 +1361,44 @@ impl ProcessData {
     }
 
     /// Takes the current stopped status for waitpid reporting, if it has not been reported yet.
-    pub fn take_stop_status(&self) -> Option<u8> {
+    pub(crate) fn take_stop_status(&self) -> Option<StopReport> {
         let mut job_ctl = self.job_ctl.lock();
         if job_ctl.state == StopState::Stopped && !job_ctl.stop_reported {
             job_ctl.stop_reported = true;
-            Some(job_ctl.stop_signal)
+            Some(StopReport {
+                signal: job_ctl.stop_signal,
+                traced: job_ctl.stop_kind == StopKind::Ptrace,
+            })
         } else {
             None
         }
     }
 
     /// Peeks at the stopped status without consuming it (for WNOWAIT).
-    pub fn peek_stop_status(&self) -> Option<u8> {
+    pub(crate) fn peek_stop_status(&self) -> Option<StopReport> {
         let job_ctl = self.job_ctl.lock();
         if job_ctl.state == StopState::Stopped && !job_ctl.stop_reported {
-            Some(job_ctl.stop_signal)
+            Some(StopReport {
+                signal: job_ctl.stop_signal,
+                traced: job_ctl.stop_kind == StopKind::Ptrace,
+            })
         } else {
             None
         }
     }
 
     /// Claims the pending stop report so a waiter can complete userspace copies first.
-    pub fn claim_stop_status(&self) -> Option<u8> {
+    pub(crate) fn claim_stop_status(&self) -> Option<StopReport> {
         self.take_stop_status()
     }
 
     /// Restores a previously claimed stop report after a failed userspace copy.
-    pub fn restore_stop_status(&self, stop_signal: u8) {
+    pub(crate) fn restore_stop_status(&self, report: StopReport) {
         let mut job_ctl = self.job_ctl.lock();
-        if job_ctl.state == StopState::Stopped && job_ctl.stop_signal == stop_signal {
+        if job_ctl.state == StopState::Stopped
+            && job_ctl.stop_signal == report.signal
+            && (job_ctl.stop_kind == StopKind::Ptrace) == report.traced
+        {
             job_ctl.stop_reported = false;
         }
     }

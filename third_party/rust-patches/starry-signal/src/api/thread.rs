@@ -36,6 +36,8 @@ pub struct ThreadSignalManager {
     pending: SpinNoIrq<PendingSignals>,
     /// The set of signals currently blocked from delivery.
     blocked: SpinNoIrq<SignalSet>,
+    /// Temporarily preserved mask while a synchronous wait unblocks signals.
+    real_blocked: SpinNoIrq<Option<SignalSet>>,
     /// The stack used by signal handlers
     stack: SpinNoIrq<SignalStack>,
 
@@ -49,6 +51,7 @@ impl ThreadSignalManager {
 
             pending: SpinNoIrq::new(PendingSignals::default()),
             blocked: SpinNoIrq::new(SignalSet::default()),
+            real_blocked: SpinNoIrq::new(None),
             stack: SpinNoIrq::new(SignalStack::default()),
 
             possibly_has_signal: AtomicBool::new(false),
@@ -218,14 +221,15 @@ impl ThreadSignalManager {
     #[must_use]
     pub fn send_signal(&self, sig: SignalInfo) -> bool {
         let signo = sig.signo();
-        if self.proc.signal_ignored(signo) {
+        let blocked = self.signal_blocked(signo);
+        if self.proc.signal_ignored(signo) && !blocked && !self.signal_real_blocked(signo) {
             return false;
         }
 
         if self.pending.lock().put_signal(sig) {
             self.possibly_has_signal.store(true, Ordering::Release);
         }
-        !self.signal_blocked(signo)
+        !blocked
     }
 
     /// Gets the blocked signals.
@@ -247,6 +251,14 @@ impl ThreadSignalManager {
     /// Checks if a signal is blocked.
     pub fn signal_blocked(&self, signo: Signo) -> bool {
         self.blocked.lock().has(signo)
+    }
+
+    pub fn signal_real_blocked(&self, signo: Signo) -> bool {
+        self.real_blocked.lock().is_some_and(|set| set.has(signo))
+    }
+
+    pub fn set_real_blocked(&self, set: Option<SignalSet>) {
+        *self.real_blocked.lock() = set;
     }
 
     /// Gets the signal stack.

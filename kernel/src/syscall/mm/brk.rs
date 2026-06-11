@@ -3,6 +3,7 @@ use axhal::paging::{MappingFlags, PageSize};
 use axtask::current;
 use memory_addr::{VirtAddr, align_up_4k};
 
+use super::mmap::check_mmap_memlock_limit;
 use crate::{
     config::{USER_HEAP_BASE, USER_HEAP_SIZE, USER_HEAP_SIZE_MAX},
     mm::Backend,
@@ -34,19 +35,37 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
         let expand_size = new_top_aligned.saturating_sub(expand_start.as_usize());
         let aspace_handle = proc_data.aspace();
 
-        if expand_size > 0
-            && aspace_handle
-                .lock()
-                .map(
+        if expand_size > 0 {
+            let mut aspace = aspace_handle.lock();
+            let locked = aspace.locks_future_mappings();
+            if locked
+                && check_mmap_memlock_limit(proc_data, &aspace, expand_start, expand_size).is_err()
+            {
+                return Ok(current_top as isize);
+            }
+
+            let populate = locked && !aspace.locks_future_mappings_on_fault();
+            if aspace
+                .map_with_lock_state(
                     expand_start,
                     expand_size,
                     MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
                     false,
                     Backend::new_alloc(expand_start, PageSize::Size4K),
+                    locked,
                 )
                 .is_err()
-        {
-            return Ok(current_top as isize);
+            {
+                return Ok(current_top as isize);
+            }
+            if populate
+                && aspace
+                    .populate_area(expand_start, expand_size, MappingFlags::empty())
+                    .is_err()
+            {
+                let _ = aspace.unmap(expand_start, expand_size);
+                return Ok(current_top as isize);
+            }
         }
     } else if new_top_aligned < current_top_aligned {
         // Only unmap pages beyond the initially mapped heap region.

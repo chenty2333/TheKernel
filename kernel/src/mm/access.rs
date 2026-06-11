@@ -373,6 +373,10 @@ pub fn check_user_readable(start: usize, len: usize) -> VmResult {
     populate_user_range(start, len, MappingFlags::READ)
 }
 
+pub fn check_user_writable(start: usize, len: usize) -> VmResult {
+    populate_user_range(start, len, MappingFlags::WRITE)
+}
+
 #[extern_trait]
 unsafe impl VmIo for Vm {
     fn new() -> Self {

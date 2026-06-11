@@ -21,7 +21,7 @@ pub use crate::task::{AxTaskExt, TaskExt};
 pub use crate::timers::register_timer_callback;
 #[doc(cfg(feature = "multitask"))]
 pub use crate::{
-    task::{CurrentTask, TaskId, TaskInner, TaskState},
+    task::{CurrentTask, TaskId, TaskInner, TaskState, last_task_id, set_last_task_id},
     wait_queue::WaitQueue,
 };
 

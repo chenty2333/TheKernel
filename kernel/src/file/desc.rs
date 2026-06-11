@@ -12,6 +12,7 @@ use starry_process::Pid;
 
 use super::{
     executable::{self, ExecutableKey},
+    fanotify::FanotifyFile,
     flock, lease,
     types::{FileLike, IoDst, IoSrc, Kstat},
 };
@@ -109,6 +110,9 @@ impl FileDescription {
 
 impl Drop for FileDescription {
     fn drop(&mut self) {
+        if let Some(fanotify) = self.inner.downcast_ref::<FanotifyFile>() {
+            fanotify.release();
+        }
         flock::release_owner(self.flock_owner);
         flock::release_ofd_owner(self.flock_owner);
         lease::release_owner(self.flock_owner);

@@ -1,18 +1,20 @@
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::time::Duration;
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axtask::current;
 use linux_raw_sys::general::{
-    FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE,
-    FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, robust_list_head, timespec,
+    __kernel_clockid_t, CLOCK_MONOTONIC, CLOCK_REALTIME, FUTEX_32, FUTEX_CLOCK_REALTIME,
+    FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_WAIT,
+    FUTEX_WAIT_BITSET, FUTEX_WAITV_MAX, FUTEX_WAKE, FUTEX_WAKE_BITSET, futex_waitv,
+    robust_list_head, timespec,
 };
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     task::{
-        AlarmClock, AsThread, FutexKey, FutexWaitRestart, RestartBlock, futex_table_for,
-        get_visible_task,
+        AlarmClock, AsThread, FutexHandle, FutexKey, FutexWaitRestart, RestartBlock,
+        futex_table_for, get_visible_task, wait_on_any_futex_if,
     },
     time::TimeValueLike,
 };
@@ -97,6 +99,89 @@ fn do_futex_wait(
     Ok(0)
 }
 
+fn validate_waitv_timeout(
+    timeout: *const timespec,
+    clockid: __kernel_clockid_t,
+) -> AxResult<Option<FutexWaitDeadline>> {
+    let Some(timeout) = timeout.nullable() else {
+        return Ok(None);
+    };
+    let clock = match clockid as u32 {
+        CLOCK_REALTIME => AlarmClock::Realtime,
+        CLOCK_MONOTONIC => AlarmClock::Monotonic,
+        _ => return Err(AxError::InvalidInput),
+    };
+    let ts = unsafe { timeout.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
+    Ok(Some(FutexWaitDeadline {
+        clock,
+        deadline: ts,
+    }))
+}
+
+fn validate_waitv_entry(waiter: &futex_waitv) -> AxResult<()> {
+    const FUTEXV_WAITER_MASK: u32 = FUTEX_32 | FUTEX_PRIVATE_FLAG;
+
+    if waiter.__reserved != 0 || waiter.flags & !FUTEXV_WAITER_MASK != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if waiter.flags & FUTEX_32 == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if waiter.uaddr == 0 {
+        return Err(AxError::BadAddress);
+    }
+    if !(waiter.uaddr as *const u32).is_aligned() {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
+pub fn sys_futex_waitv(
+    waiters: *const futex_waitv,
+    nr_futexes: u32,
+    flags: u32,
+    timeout: *const timespec,
+    clockid: __kernel_clockid_t,
+) -> AxResult<isize> {
+    debug!(
+        "sys_futex_waitv <= waiters: {waiters:?}, nr_futexes: {nr_futexes}, flags: {flags}, \
+         timeout: {timeout:?}, clockid: {clockid}",
+    );
+
+    if flags != 0 || nr_futexes == 0 || nr_futexes > FUTEX_WAITV_MAX || waiters.nullable().is_none()
+    {
+        return Err(AxError::InvalidInput);
+    }
+
+    let timeout = validate_waitv_timeout(timeout, clockid)?;
+    let mut entries = Vec::with_capacity(nr_futexes as usize);
+    let mut futexes: Vec<(FutexHandle, u32)> = Vec::with_capacity(nr_futexes as usize);
+
+    for index in 0..nr_futexes as usize {
+        let waiter = unsafe { waiters.add(index).vm_read_uninit()?.assume_init() };
+        validate_waitv_entry(&waiter)?;
+
+        let private = waiter.flags & FUTEX_PRIVATE_FLAG != 0;
+        let key = futex_key_from(waiter.uaddr as usize, private);
+        let futex_table = futex_table_for(&key);
+        let futex = futex_table.get_or_insert_owned(&key);
+        entries.push(waiter);
+        futexes.push((futex, u32::MAX));
+    }
+
+    let index = wait_on_any_futex_if(
+        futexes,
+        timeout.map(|it| (it.clock, it.deadline)),
+        |index| {
+            let waiter = entries[index];
+            let value = (waiter.uaddr as *const u32).vm_read()?;
+            Ok(value == waiter.val as u32)
+        },
+    )?;
+
+    Ok(index as isize)
+}
+
 pub(crate) fn restart_futex_wait(block: FutexWaitRestart) -> AxResult<isize> {
     do_futex_wait(
         block.uaddr as *const u32,
@@ -125,6 +210,9 @@ pub fn sys_futex(
 
     let private = futex_op & FUTEX_PRIVATE_FLAG != 0;
     let command = futex_op & (FUTEX_CMD_MASK as u32);
+    if futex_op & FUTEX_CLOCK_REALTIME != 0 && command != FUTEX_WAIT_BITSET {
+        return Err(LinuxError::ENOSYS.into());
+    }
     match command {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             let bitset = if command == FUTEX_WAIT_BITSET {
@@ -132,6 +220,9 @@ pub fn sys_futex(
             } else {
                 u32::MAX
             };
+            if bitset == 0 {
+                return Err(AxError::InvalidInput);
+            }
             let timeout = futex_wait_deadline(command, futex_op, timeout)?;
             if let Some(timeout) = timeout {
                 current()
@@ -147,16 +238,19 @@ pub fn sys_futex(
             do_futex_wait(uaddr, value, bitset, timeout, private)
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            let bitset = if command == FUTEX_WAKE_BITSET {
+                value3
+            } else {
+                u32::MAX
+            };
+            if bitset == 0 {
+                return Err(AxError::InvalidInput);
+            }
             let key = futex_key_from(uaddr.addr(), private);
             let futex_table = futex_table_for(&key);
             let futex = futex_table.get(&key);
             let mut count = 0;
             if let Some(futex) = futex {
-                let bitset = if command == FUTEX_WAKE_BITSET {
-                    value3
-                } else {
-                    u32::MAX
-                };
                 count = futex.wq.wake(value as _, bitset);
             }
             Ok(count as _)

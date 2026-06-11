@@ -21,13 +21,15 @@ use axtask::{WeakAxTaskRef, current, future::block_on, register_timer_callback};
 use event_listener::{Event, listener};
 use kspin::SpinNoIrq;
 use lazy_static::lazy_static;
-use linux_raw_sys::general::SI_TIMER;
+use linux_raw_sys::general::{RLIM_INFINITY, RLIMIT_CPU, SI_TIMER};
 use spin::Mutex;
 use starry_process::Pid;
 use starry_signal::{SignalInfo, Signo};
 use strum::FromRepr;
 
-use super::{ProcessData, poll_timer, send_signal_to_process, send_signal_to_visible_thread};
+use super::{
+    AsThread, ProcessData, poll_timer, send_signal_to_process, send_signal_to_visible_thread,
+};
 use crate::time::wall_time;
 
 fn time_value_from_nanos(nanos: usize) -> TimeValue {
@@ -265,6 +267,29 @@ struct ITimer {
     remained_ns: usize,
 }
 
+#[derive(Debug, Default)]
+struct CpuLimitState {
+    soft_signal_sent: bool,
+}
+
+impl CpuLimitState {
+    fn reset_if_below_soft(&mut self, total_cpu_ns: usize, soft_secs: u64) {
+        if soft_secs == RLIM_INFINITY as i64 as u64 {
+            self.soft_signal_sent = false;
+            return;
+        }
+        if total_cpu_ns < secs_to_nanos(soft_secs) {
+            self.soft_signal_sent = false;
+        }
+    }
+}
+
+fn secs_to_nanos(secs: u64) -> usize {
+    secs.saturating_mul(NANOS_PER_SEC)
+        .try_into()
+        .unwrap_or(usize::MAX)
+}
+
 impl ITimer {
     pub fn new(interval_ns: usize, remained_ns: usize) -> Self {
         let result = Self {
@@ -324,6 +349,7 @@ pub struct TimeManager {
     state: TimerState,
     paused_state: TimerState,
     itimers: [ITimer; 3],
+    cpu_limit: CpuLimitState,
 }
 
 impl Default for TimeManager {
@@ -342,6 +368,7 @@ impl TimeManager {
             state: TimerState::None,
             paused_state: TimerState::None,
             itimers: Default::default(),
+            cpu_limit: CpuLimitState::default(),
         }
     }
 
@@ -371,6 +398,7 @@ impl TimeManager {
             TimerState::None => {}
         }
         self.update_itimer(ITimerType::Real, wall_delta, &emitter);
+        self.update_rlimit_cpu(&emitter);
         self.last_cpu_ns = now_ns;
         self.last_wall_ns = now_ns;
     }
@@ -425,6 +453,30 @@ impl TimeManager {
     fn update_itimer(&mut self, ty: ITimerType, delta: usize, emitter: impl Fn(Signo)) {
         if self.itimers[ty as usize].update(delta) {
             emitter(ty.signo());
+        }
+    }
+
+    fn update_rlimit_cpu(&mut self, emitter: impl Fn(Signo)) {
+        let proc_data = current().as_thread().proc_data.clone();
+        let (soft_limit, hard_limit) = {
+            let limits = proc_data.rlim.read();
+            let limit = &limits[RLIMIT_CPU];
+            (limit.current, limit.max)
+        };
+        let total = self.utime_ns.saturating_add(self.stime_ns);
+
+        self.cpu_limit.reset_if_below_soft(total, soft_limit);
+
+        if hard_limit != RLIM_INFINITY as i64 as u64 && total >= secs_to_nanos(hard_limit) {
+            emitter(Signo::SIGKILL);
+            return;
+        }
+        if soft_limit != RLIM_INFINITY as i64 as u64
+            && total >= secs_to_nanos(soft_limit)
+            && !self.cpu_limit.soft_signal_sent
+        {
+            self.cpu_limit.soft_signal_sent = true;
+            emitter(Signo::SIGXCPU);
         }
     }
 }
@@ -630,17 +682,20 @@ fn fire_posix_timer(proc_data: Arc<ProcessData>, timerid: usize, sequence: u64) 
             let interval = timer.interval.as_nanos().max(1);
             1_u128.saturating_add(elapsed / interval)
         };
-        let should_deliver = !timer.signal_pending;
+        let notify = timer.notify;
+        let should_deliver = match notify {
+            PosixTimerNotify::None => false,
+            PosixTimerNotify::Signal { .. } => !timer.signal_pending,
+        };
         if should_deliver {
             timer.overrun = expirations.saturating_sub(1).min(i32::MAX as u128) as i32;
             timer.signal_pending = true;
-        } else {
+        } else if matches!(notify, PosixTimerNotify::Signal { .. }) {
             let extra = expirations.min(i32::MAX as u128) as i32;
             timer.overrun = timer.overrun.saturating_add(extra);
         }
         let overrun = timer.overrun;
 
-        let notify = timer.notify;
         let next = if timer.interval.is_zero() {
             timer.deadline = None;
             timer.sequence = timer.sequence.wrapping_add(1);

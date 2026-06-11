@@ -13,21 +13,23 @@ use axtask::current;
 use linux_raw_sys::{
     general::{O_CLOEXEC, O_NONBLOCK},
     net::{
-        AF_INET, AF_INET6, AF_PACKET, AF_UNIX, AF_UNSPEC, AF_VSOCK, IPPROTO_TCP, IPPROTO_UDP,
-        SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, sockaddr,
-        socklen_t,
+        AF_INET, AF_INET6, AF_PACKET, AF_UNIX, AF_UNSPEC, AF_VSOCK, IPPROTO_SCTP, IPPROTO_TCP,
+        IPPROTO_UDP, IPPROTO_UDPLITE, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW,
+        SOCK_SEQPACKET, SOCK_STREAM, sockaddr, socklen_t,
     },
 };
 
 use super::addr::SocketAddrExt;
 use crate::{
-    file::{AfAlgSocket, FileLike, PacketSocket, Socket, af_alg},
+    file::{AfAlgSocket, FileLike, PacketSocket, Socket, af_alg, close_file_like, get_file_like},
     mm::{UserConstPtr, UserPtr},
     task::AsThread,
 };
 
 const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
 const AF_RDS: u32 = 21;
+const SOCK_TYPE_MASK: u32 = 0xf;
+const SOCK_CLOEXEC_NONBLOCK_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
 
 fn require_bind_permissions(addr: &SocketAddrEx) -> AxResult<()> {
     let SocketAddrEx::Ip(ip_addr) = addr else {
@@ -51,18 +53,44 @@ fn validate_socket_type(ty: u32) -> AxResult<u32> {
     }
 }
 
+fn parse_socket_type(raw_ty: u32) -> AxResult<(u32, bool, bool)> {
+    let flags = raw_ty & !SOCK_TYPE_MASK;
+    if flags & !SOCK_CLOEXEC_NONBLOCK_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let ty = validate_socket_type(raw_ty & SOCK_TYPE_MASK)?;
+    Ok((ty, flags & O_NONBLOCK != 0, flags & O_CLOEXEC != 0))
+}
+
+fn parse_accept4_flags(flags: u32) -> AxResult<(bool, bool)> {
+    if flags & !SOCK_CLOEXEC_NONBLOCK_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    Ok((flags & O_NONBLOCK != 0, flags & O_CLOEXEC != 0))
+}
+
+fn supported_stream_protocol(proto: u32) -> bool {
+    proto == 0 || proto == IPPROTO_TCP as u32 || proto == IPPROTO_SCTP as u32
+}
+
+fn supported_datagram_protocol(proto: u32) -> bool {
+    proto == 0 || proto == IPPROTO_UDP as u32 || proto == IPPROTO_UDPLITE as u32
+}
+
 fn inet_socketpair_error(ty: u32, proto: u32) -> AxError {
     match ty {
         SOCK_RAW => AxError::from(LinuxError::EPROTONOSUPPORT),
         SOCK_DGRAM => {
-            if proto == 0 || proto == IPPROTO_UDP as _ {
+            if supported_datagram_protocol(proto) {
                 AxError::from(LinuxError::EOPNOTSUPP)
             } else {
                 AxError::from(LinuxError::EPROTONOSUPPORT)
             }
         }
         SOCK_STREAM => {
-            if proto == 0 || proto == IPPROTO_TCP as _ {
+            if supported_stream_protocol(proto) {
                 AxError::from(LinuxError::EOPNOTSUPP)
             } else {
                 AxError::from(LinuxError::EPROTONOSUPPORT)
@@ -74,15 +102,14 @@ fn inet_socketpair_error(ty: u32, proto: u32) -> AxError {
 
 pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     debug!("sys_socket <= domain: {domain}, ty: {raw_ty}, proto: {proto}");
-    let ty = validate_socket_type(raw_ty & 0xFF)?;
+    let (ty, nonblocking, cloexec) = parse_socket_type(raw_ty)?;
 
     if domain == af_alg::AF_ALG {
         AfAlgSocket::validate_socket_type(ty, proto)?;
         let socket = AfAlgSocket::new_listener();
-        if raw_ty & O_NONBLOCK != 0 {
+        if nonblocking {
             socket.set_nonblocking(true)?;
         }
-        let cloexec = raw_ty & O_CLOEXEC != 0;
         return socket.add_to_fd_table(cloexec).map(|fd| fd as isize);
     }
 
@@ -91,10 +118,9 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
             return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
         }
         let socket = PacketSocket::new(u16::from_be(proto as u16));
-        if raw_ty & O_NONBLOCK != 0 {
+        if nonblocking {
             socket.set_nonblocking(true)?;
         }
-        let cloexec = raw_ty & O_CLOEXEC != 0;
         return socket.add_to_fd_table(cloexec).map(|fd| fd as isize);
     }
 
@@ -102,13 +128,13 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     let net_ns = current().as_thread().proc_data.net_ns.clone();
     let socket = match (domain, ty) {
         (AF_INET | AF_INET6, SOCK_STREAM) => {
-            if proto != 0 && proto != IPPROTO_TCP as _ {
+            if !supported_stream_protocol(proto) {
                 return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
             }
             SocketInner::Tcp(TcpSocket::new(net_ns))
         }
         (AF_INET | AF_INET6, SOCK_DGRAM) => {
-            if proto != 0 && proto != IPPROTO_UDP as _ {
+            if !supported_datagram_protocol(proto) {
                 return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
             }
             SocketInner::Udp(UdpSocket::new(net_ns))
@@ -141,10 +167,9 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     };
     let socket = Socket(socket);
 
-    if raw_ty & O_NONBLOCK != 0 {
+    if nonblocking {
         socket.set_nonblocking(true)?;
     }
-    let cloexec = raw_ty & O_CLOEXEC != 0;
 
     socket.add_to_fd_table(cloexec).map(|fd| fd as isize)
 }
@@ -157,16 +182,19 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
         return Ok(0);
     }
 
+    let socket = Socket::from_fd(fd)?;
     let addr = SocketAddrEx::read_from_user(addr, addrlen)?;
     debug!("sys_bind <= fd: {fd}, addr: {addr:?}");
 
     require_bind_permissions(&addr)?;
-    Socket::from_fd(fd)?.bind(addr)?;
+    socket.bind(addr)?;
 
     Ok(0)
 }
 
 pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult<isize> {
+    let _ = get_file_like(fd)?;
+
     if addrlen as usize >= size_of::<linux_raw_sys::net::__kernel_sa_family_t>()
         && (*addr
             .cast::<linux_raw_sys::net::__kernel_sa_family_t>()
@@ -220,11 +248,11 @@ pub fn sys_accept4(
 ) -> AxResult<isize> {
     debug!("sys_accept <= fd: {fd}, flags: {flags}");
 
-    let cloexec = flags & O_CLOEXEC != 0;
+    let (nonblocking, cloexec) = parse_accept4_flags(flags)?;
 
     if let Ok(socket) = AfAlgSocket::from_fd(fd) {
         let request = socket.accept_request()?;
-        if flags & O_NONBLOCK != 0 {
+        if nonblocking {
             request.set_nonblocking(true)?;
         }
         if !addr.is_null() {
@@ -235,17 +263,17 @@ pub fn sys_accept4(
 
     let socket = Socket::from_fd(fd)?;
     let socket = Socket(socket.accept()?);
-    if flags & O_NONBLOCK != 0 {
+    if nonblocking {
         socket.set_nonblocking(true)?;
     }
 
     let remote_addr = socket.peer_addr()?;
-    let fd = socket.add_to_fd_table(cloexec).map(|fd| fd as isize)?;
-    debug!("sys_accept => fd: {fd}, addr: {remote_addr:?}");
-
     if !addr.is_null() {
         remote_addr.write_to_user(addr, addrlen.get_as_mut()?)?;
     }
+
+    let fd = socket.add_to_fd_table(cloexec).map(|fd| fd as isize)?;
+    debug!("sys_accept => fd: {fd}, addr: {remote_addr:?}");
 
     Ok(fd)
 }
@@ -270,7 +298,8 @@ pub fn sys_socketpair(
     fds: UserPtr<[i32; 2]>,
 ) -> AxResult<isize> {
     debug!("sys_socketpair <= domain: {domain}, ty: {raw_ty}, proto: {proto}");
-    let ty = validate_socket_type(raw_ty & 0xFF)?;
+    let (ty, nonblocking, cloexec) = parse_socket_type(raw_ty)?;
+    let fds = fds.get_as_mut()?;
 
     if matches!(domain, AF_INET | AF_INET6) {
         return Err(inet_socketpair_error(ty, proto));
@@ -301,15 +330,19 @@ pub fn sys_socketpair(
     let sock1 = Socket(SocketInner::Unix(sock1));
     let sock2 = Socket(SocketInner::Unix(sock2));
 
-    if raw_ty & O_NONBLOCK != 0 {
+    if nonblocking {
         sock1.set_nonblocking(true)?;
         sock2.set_nonblocking(true)?;
     }
-    let cloexec = raw_ty & O_CLOEXEC != 0;
 
-    *fds.get_as_mut()? = [
-        sock1.add_to_fd_table(cloexec)?,
-        sock2.add_to_fd_table(cloexec)?,
-    ];
+    let fd1 = sock1.add_to_fd_table(cloexec)?;
+    let fd2 = match sock2.add_to_fd_table(cloexec) {
+        Ok(fd) => fd,
+        Err(err) => {
+            let _ = close_file_like(fd1);
+            return Err(err);
+        }
+    };
+    *fds = [fd1, fd2];
     Ok(0)
 }

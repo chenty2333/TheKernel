@@ -22,8 +22,9 @@ use axtask::{
 };
 use linux_raw_sys::general::{
     DN_ATTRIB, DN_MULTISHOT, DN_RENAME, IN_ACCESS, IN_ALL_EVENTS, IN_ATTRIB, IN_CLOSE_NOWRITE,
-    IN_CLOSE_WRITE, IN_DELETE_SELF, IN_EXCL_UNLINK, IN_IGNORED, IN_ISDIR, IN_MODIFY, IN_MOVE_SELF,
-    IN_ONESHOT, IN_Q_OVERFLOW, IN_UNMOUNT, POLL_MSG, SI_SIGIO, inotify_event,
+    IN_CLOSE_WRITE, IN_DELETE_SELF, IN_EXCL_UNLINK, IN_IGNORED, IN_ISDIR, IN_MASK_ADD,
+    IN_MASK_CREATE, IN_MODIFY, IN_MOVE_SELF, IN_ONESHOT, IN_Q_OVERFLOW, IN_UNMOUNT, POLL_MSG,
+    SI_SIGIO, inotify_event,
 };
 use spin::Mutex;
 use starry_process::Pid;
@@ -36,12 +37,12 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WatchKey {
-    dev: u64,
-    ino: u64,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
 }
 
 impl WatchKey {
-    fn from_location(loc: &Location) -> AxResult<Self> {
+    pub(crate) fn from_location(loc: &Location) -> AxResult<Self> {
         let meta = loc.metadata()?;
         Ok(Self {
             dev: meta.device,
@@ -93,6 +94,7 @@ pub struct InotifyFile {
 static INOTIFY_FILES: Mutex<Vec<Weak<InotifyFile>>> = Mutex::new(Vec::new());
 static NEXT_COOKIE: AtomicU32 = AtomicU32::new(1);
 pub(crate) const MAX_QUEUED_EVENTS: usize = 16384;
+const INOTIFY_PERSISTENT_FLAGS: u32 = IN_EXCL_UNLINK | IN_ONESHOT;
 
 #[derive(Clone)]
 struct DnotifyWatch {
@@ -121,15 +123,34 @@ impl InotifyFile {
     }
 
     pub fn add_watch(&self, loc: &Location, mask: u32) -> AxResult<i32> {
+        if mask & IN_MASK_ADD != 0 && mask & IN_MASK_CREATE != 0 {
+            return Err(AxError::InvalidInput);
+        }
+
         let key = WatchKey::from_location(loc)?;
         let is_dir = loc.is_dir();
+        let persistent_mask = mask & (IN_ALL_EVENTS | INOTIFY_PERSISTENT_FLAGS);
         let mut state = self.state.lock();
+
+        if let Some(watch) = state.watches.iter_mut().find(|watch| watch.key == key) {
+            if mask & IN_MASK_CREATE != 0 {
+                return Err(AxError::AlreadyExists);
+            }
+            if mask & IN_MASK_ADD != 0 {
+                watch.mask |= persistent_mask;
+            } else {
+                watch.mask = persistent_mask;
+            }
+            watch.is_dir = is_dir;
+            return Ok(watch.wd);
+        }
+
         let wd = state.next_wd;
         state.next_wd += 1;
         state.watches.push(Watch {
             wd,
             key,
-            mask,
+            mask: persistent_mask,
             is_dir,
         });
         Ok(wd)
@@ -137,10 +158,19 @@ impl InotifyFile {
 
     pub fn remove_watch(&self, wd: i32) -> AxResult<()> {
         let mut state = self.state.lock();
-        let len = state.watches.len();
-        state.watches.retain(|watch| watch.wd != wd);
-        if state.watches.len() == len {
-            return Err(AxError::InvalidInput);
+        remove_watch_locked(&mut state, wd)?;
+        let wake = InotifyFile::enqueue_locked(
+            &mut state,
+            QueuedEvent {
+                wd,
+                mask: IN_IGNORED,
+                cookie: 0,
+                name: Vec::new(),
+            },
+        );
+        drop(state);
+        if wake {
+            self.poll_rx.wake();
         }
         Ok(())
     }
@@ -183,6 +213,16 @@ impl InotifyFile {
 
     fn has_events(&self) -> bool {
         !self.state.lock().queue.is_empty()
+    }
+}
+
+fn remove_watch_locked(state: &mut InotifyState, wd: i32) -> AxResult<()> {
+    let len = state.watches.len();
+    state.watches.retain(|watch| watch.wd != wd);
+    if state.watches.len() == len {
+        Err(AxError::InvalidInput)
+    } else {
+        Ok(())
     }
 }
 
@@ -323,7 +363,7 @@ fn each_inotify_file(mut f: impl FnMut(&Arc<InotifyFile>)) {
 
 pub(crate) fn set_dnotify_watch(fd: i32, loc: &Location, mask: u32, signal: u8) -> AxResult<()> {
     if !loc.is_dir() {
-        return Err(AxError::InvalidInput);
+        return Err(AxError::NotADirectory);
     }
 
     let owner = current().as_thread().proc_data.proc.pid();
@@ -423,7 +463,9 @@ fn emit_to_matching_watches(
                     name: name.to_vec(),
                 },
             );
-            if watch.mask & IN_ONESHOT != 0 {
+            let remove_watch =
+                watch.mask & IN_ONESHOT != 0 || mask & (IN_DELETE_SELF | IN_UNMOUNT) != 0;
+            if remove_watch {
                 state.watches.remove(idx);
                 wake |= InotifyFile::enqueue_locked(
                     &mut state,
@@ -461,6 +503,7 @@ pub(crate) fn notify_exact(loc: &Location, mut mask: u32) -> AxResult<()> {
     mask = exact_dir_mask(mask, loc.is_dir());
     let key = WatchKey::from_location(loc)?;
     emit_to_matching_watches(key, mask, 0, &[], false, false);
+    crate::file::fanotify::notify(loc, loc, inotify_to_fanotify(mask), loc.is_dir(), false);
     if mask & IN_ATTRIB != 0 {
         emit_dnotify(key, DN_ATTRIB);
     }
@@ -490,6 +533,7 @@ pub(crate) fn notify_parent(loc: &Location, mut mask: u32) -> AxResult<()> {
     let key = WatchKey::from_location(&parent)?;
     let unlinked_child = matches!(loc.metadata(), Ok(meta) if meta.nlink == 0);
     emit_to_matching_watches(key, mask, 0, loc.name().as_bytes(), true, unlinked_child);
+    crate::file::fanotify::notify(loc, &parent, inotify_to_fanotify(mask), loc.is_dir(), true);
     if mask & IN_ATTRIB != 0 {
         emit_dnotify(key, DN_ATTRIB);
     }
@@ -498,6 +542,7 @@ pub(crate) fn notify_parent(loc: &Location, mut mask: u32) -> AxResult<()> {
 
 pub(crate) fn notify_parent_with_name(
     parent: &Location,
+    child: Option<&Location>,
     child_name: &str,
     mut mask: u32,
     is_dir: bool,
@@ -514,7 +559,58 @@ pub(crate) fn notify_parent_with_name(
         true,
         false,
     );
+    crate::file::fanotify::notify(
+        child.unwrap_or(parent),
+        parent,
+        inotify_to_fanotify(mask),
+        is_dir,
+        true,
+    );
     Ok(())
+}
+
+fn inotify_to_fanotify(mask: u32) -> u64 {
+    let mut out = 0;
+    if mask & IN_ACCESS != 0 {
+        out |= crate::file::fanotify::FAN_ACCESS;
+    }
+    if mask & IN_MODIFY != 0 {
+        out |= crate::file::fanotify::FAN_MODIFY;
+    }
+    if mask & IN_ATTRIB != 0 {
+        out |= crate::file::fanotify::FAN_ATTRIB;
+    }
+    if mask & IN_CLOSE_WRITE != 0 {
+        out |= crate::file::fanotify::FAN_CLOSE_WRITE;
+    }
+    if mask & IN_CLOSE_NOWRITE != 0 {
+        out |= crate::file::fanotify::FAN_CLOSE_NOWRITE;
+    }
+    if mask & linux_raw_sys::general::IN_OPEN != 0 {
+        out |= crate::file::fanotify::FAN_OPEN;
+    }
+    if mask & linux_raw_sys::general::IN_MOVED_FROM != 0 {
+        out |= crate::file::fanotify::FAN_MOVED_FROM;
+    }
+    if mask & linux_raw_sys::general::IN_MOVED_TO != 0 {
+        out |= crate::file::fanotify::FAN_MOVED_TO;
+    }
+    if mask & linux_raw_sys::general::IN_CREATE != 0 {
+        out |= crate::file::fanotify::FAN_CREATE;
+    }
+    if mask & linux_raw_sys::general::IN_DELETE != 0 {
+        out |= crate::file::fanotify::FAN_DELETE;
+    }
+    if mask & IN_DELETE_SELF != 0 {
+        out |= crate::file::fanotify::FAN_DELETE_SELF;
+    }
+    if mask & IN_MOVE_SELF != 0 {
+        out |= crate::file::fanotify::FAN_MOVE_SELF;
+    }
+    if mask & IN_ISDIR != 0 {
+        out |= crate::file::fanotify::FAN_ONDIR;
+    }
+    out
 }
 
 pub(crate) fn notify_dnotify_rename(old_parent: &Location, new_parent: &Location) -> AxResult<()> {

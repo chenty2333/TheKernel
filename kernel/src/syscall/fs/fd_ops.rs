@@ -43,7 +43,7 @@ use crate::{
     mm::{UserConstPtr, UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
     syscall::fs::ctl::validate_pathname,
-    task::{AX_FILE_LIMIT, AsThread},
+    task::{AX_FILE_LIMIT, AsThread, get_process_data, get_process_group, get_visible_task},
     time::wall_time,
 };
 
@@ -96,6 +96,10 @@ fn open_status_flags(flags: u32) -> u32 {
 
 const FCNTL_SETFL_MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK | FASYNC;
 
+fn fcntl_allowed_on_path_fd(cmd: u32) -> bool {
+    matches!(cmd, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL)
+}
+
 fn validate_async_signal(sig: c_int) -> AxResult<u8> {
     if sig == 0 {
         return Ok(0);
@@ -116,6 +120,19 @@ fn sync_async_io_to_file(description: &FileDescription) {
     } else if let Some(pipe) = description.inner.downcast_ref::<NamedPipe>() {
         pipe.set_async_io(enabled, state);
     }
+}
+
+fn validate_async_owner(owner: AsyncIoOwner) -> AxResult<()> {
+    match owner {
+        AsyncIoOwner::Tid(0) | AsyncIoOwner::Pid(0) | AsyncIoOwner::Pgrp(0) => Ok(()),
+        AsyncIoOwner::Tid(tid) => get_visible_task(tid).map(|_| ()),
+        AsyncIoOwner::Pid(pid) => get_process_data(pid).map(|_| ()),
+        AsyncIoOwner::Pgrp(pgid) => get_process_group(pgid).map(|_| ()),
+    }
+}
+
+fn async_owner_is_live(owner: AsyncIoOwner) -> bool {
+    validate_async_owner(owner).is_ok()
 }
 
 fn open_access_mask(flags: c_int) -> u32 {
@@ -576,6 +593,15 @@ fn open_in_fs(
             return Err(AxError::IsADirectory);
         }
         lease::wait_for_open(&existing, flags)?;
+        if (flags as u32) & O_PATH == 0 {
+            crate::file::fanotify::permission_check(
+                &existing,
+                &existing,
+                crate::file::fanotify::FAN_OPEN_PERM,
+                existing.is_dir(),
+                false,
+            )?;
+        }
         Some(existing)
     } else {
         None
@@ -613,7 +639,7 @@ fn open_in_fs(
                 mode: Some(final_mode),
                 ..Default::default()
             })?;
-            let _ = notify_parent_with_name(&parent, &name, IN_CREATE, loc.is_dir(), 0);
+            let _ = notify_parent_with_name(&parent, Some(&loc), &name, IN_CREATE, loc.is_dir(), 0);
         }
         if opened_existing && (flags as u32) & O_TRUNC != 0 {
             touch_truncated_metadata(&loc)?;
@@ -632,7 +658,7 @@ fn open_in_fs(
 /// flags: open flags
 /// mode: see man 7 inode
 /// return new file descriptor if succeed, or return -1.
-pub(super) fn openat_inner(
+pub(crate) fn openat_inner(
     dirfd: c_int,
     path: &str,
     flags: i32,
@@ -712,6 +738,9 @@ pub fn sys_openat2(
         || how.flags & !OPENAT2_ALLOWED_FLAGS != 0
         || how.resolve & !OPENAT2_ALLOWED_RESOLVE != 0
     {
+        return Err(AxError::InvalidInput);
+    }
+    if how.resolve & RESOLVE_BENEATH as u64 != 0 && how.resolve & RESOLVE_IN_ROOT as u64 != 0 {
         return Err(AxError::InvalidInput);
     }
     if how.resolve & RESOLVE_CACHED as u64 != 0 {
@@ -862,9 +891,14 @@ fn dup_fd_at_least(
     }
 
     let max_nofile = current().as_thread().proc_data.rlim.read()[RLIMIT_NOFILE].current as usize;
+    let min_fd = min_fd as usize;
+    if min_fd >= max_nofile {
+        return Err(AxError::InvalidInput);
+    }
+
     let upper_bound = max_nofile.min(AX_FILE_LIMIT);
     let mut fd_table = FD_TABLE.write();
-    for new_fd in min_fd as usize..upper_bound {
+    for new_fd in min_fd..upper_bound {
         if fd_table.get(new_fd).is_some() {
             continue;
         }
@@ -887,6 +921,36 @@ fn validate_flock(lock: &flock64) -> AxResult<()> {
     match lock.l_whence as i32 {
         0..=2 => Ok(()),
         _ => Err(AxError::InvalidInput),
+    }
+}
+
+fn validate_getlk_type(lock: &flock64) -> AxResult<()> {
+    match lock.l_type {
+        ty if ty == F_RDLCK as i16 || ty == F_WRLCK as i16 => Ok(()),
+        _ => Err(AxError::InvalidInput),
+    }
+}
+
+fn validate_ofd_lock_pid(lock: &flock64) -> AxResult<()> {
+    if lock.l_pid != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn validate_record_lock_access(
+    description: &crate::file::FileDescription,
+    lock: &flock64,
+) -> AxResult<()> {
+    let flags = description.status_flags();
+    match lock.l_type {
+        ty if ty == F_RDLCK as i16 && (flags & O_PATH != 0 || flags & O_ACCMODE == O_WRONLY) => {
+            Err(AxError::BadFileDescriptor)
+        }
+        ty if ty == F_WRLCK as i16 && (flags & O_PATH != 0 || flags & O_ACCMODE == O_RDONLY) => {
+            Err(AxError::BadFileDescriptor)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -954,8 +1018,16 @@ pub fn sys_dup3(old_fd: c_int, new_fd: c_int, flags: c_int) -> AxResult<isize> {
 
 pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
     debug!("sys_fcntl <= fd: {fd} cmd: {cmd} arg: {arg}");
+    let cmd = cmd as u32;
 
-    match cmd as u32 {
+    if !fcntl_allowed_on_path_fd(cmd) {
+        let description = get_file_description(fd)?;
+        if description.status_flags() & O_PATH != 0 {
+            return Err(AxError::BadFileDescriptor);
+        }
+    }
+
+    match cmd {
         F_DUPFD => {
             let description = get_file_description(fd)?;
             dup_fd_at_least(description, arg as c_int, false)
@@ -969,8 +1041,12 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
             let stat = description.inner.stat()?;
             let lock = *UserConstPtr::<flock64>::from(arg as *const flock64).get_as_ref()?;
             validate_flock(&lock)?;
+            if matches!(cmd, F_OFD_SETLK | F_OFD_SETLKW) {
+                validate_ofd_lock_pid(&lock)?;
+            }
+            validate_record_lock_access(&description, &lock)?;
             let current_offset = record_lock_current_offset(&description, &lock)?;
-            let owner = match cmd as u32 {
+            let owner = match cmd {
                 F_OFD_SETLK | F_OFD_SETLKW => RecordLockOwner::Ofd(description.flock_owner()),
                 _ => RecordLockOwner::Posix(current().as_thread().proc_data.proc.pid()),
             };
@@ -980,7 +1056,7 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
                 stat.size,
                 current_offset,
                 &lock,
-                matches!(cmd as u32, F_SETLKW | F_OFD_SETLKW),
+                matches!(cmd, F_SETLKW | F_OFD_SETLKW),
             )?;
             Ok(0)
         }
@@ -989,8 +1065,12 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
             let stat = description.inner.stat()?;
             let lock = UserPtr::<flock64>::from(arg).get_as_mut()?;
             validate_flock(lock)?;
+            validate_getlk_type(lock)?;
+            if cmd == F_OFD_GETLK {
+                validate_ofd_lock_pid(lock)?;
+            }
             let current_offset = record_lock_current_offset(&description, lock)?;
-            let owner = if cmd as u32 == F_OFD_GETLK {
+            let owner = if cmd == F_OFD_GETLK {
                 RecordLockOwner::Ofd(description.flock_owner())
             } else {
                 RecordLockOwner::Posix(current().as_thread().proc_data.proc.pid())
@@ -1019,13 +1099,18 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
             } else {
                 AsyncIoOwner::Pid(owner as _)
             };
+            validate_async_owner(owner)?;
             description.set_async_io_owner(owner);
             sync_async_io_to_file(&description);
             Ok(0)
         }
         F_GETOWN => {
             let description = get_file_description(fd)?;
-            let owner = match description.async_io_state().owner {
+            let owner = description.async_io_state().owner;
+            if !async_owner_is_live(owner) {
+                return Ok(0);
+            }
+            let owner = match owner {
                 AsyncIoOwner::Tid(pid) | AsyncIoOwner::Pid(pid) => pid as c_int,
                 AsyncIoOwner::Pgrp(pgid) => -(pgid as c_int),
             };
@@ -1035,7 +1120,7 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
             let description = get_file_description(fd)?;
             let owner = *UserConstPtr::<f_owner_ex>::from(arg as *const f_owner_ex).get_as_ref()?;
             if owner.pid < 0 {
-                return Err(AxError::InvalidInput);
+                return Err(AxError::NoSuchProcess);
             }
             let owner = match owner.type_ as u32 {
                 F_OWNER_TID => AsyncIoOwner::Tid(owner.pid as _),
@@ -1043,6 +1128,7 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
                 F_OWNER_PGRP => AsyncIoOwner::Pgrp(owner.pid as _),
                 _ => return Err(AxError::InvalidInput),
             };
+            validate_async_owner(owner)?;
             description.set_async_io_owner(owner);
             sync_async_io_to_file(&description);
             Ok(0)
@@ -1050,18 +1136,31 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
         F_GETOWN_EX => {
             let description = get_file_description(fd)?;
             let owner = UserPtr::<f_owner_ex>::from(arg).get_as_mut()?;
-            match description.async_io_state().owner {
+            let state_owner = description.async_io_state().owner;
+            match state_owner {
                 AsyncIoOwner::Tid(pid) => {
                     owner.type_ = F_OWNER_TID as _;
-                    owner.pid = pid as _;
+                    owner.pid = if async_owner_is_live(state_owner) {
+                        pid as _
+                    } else {
+                        0
+                    };
                 }
                 AsyncIoOwner::Pid(pid) => {
                     owner.type_ = F_OWNER_PID as _;
-                    owner.pid = pid as _;
+                    owner.pid = if async_owner_is_live(state_owner) {
+                        pid as _
+                    } else {
+                        0
+                    };
                 }
                 AsyncIoOwner::Pgrp(pgid) => {
                     owner.type_ = F_OWNER_PGRP as _;
-                    owner.pid = pgid as _;
+                    owner.pid = if async_owner_is_live(state_owner) {
+                        pgid as _
+                    } else {
+                        0
+                    };
                 }
             }
             Ok(0)

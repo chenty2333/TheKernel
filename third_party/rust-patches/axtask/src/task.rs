@@ -96,7 +96,6 @@ pub struct TaskInner {
 
 impl TaskId {
     fn new() -> Self {
-        static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
         Self(ID_COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
@@ -104,6 +103,21 @@ impl TaskId {
     pub const fn as_u64(&self) -> u64 {
         self.0
     }
+}
+
+static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Returns the last task ID that will have been allocated by [`TaskId::new`].
+pub fn last_task_id() -> u64 {
+    ID_COUNTER.load(Ordering::Relaxed).saturating_sub(1)
+}
+
+/// Sets the last task ID used by [`TaskId::new`].
+///
+/// This backs Linux-compatible `/proc/sys/kernel/ns_last_pid` behavior. The
+/// next allocated task receives `last + 1`.
+pub fn set_last_task_id(last: u64) {
+    ID_COUNTER.store(last.saturating_add(1), Ordering::Relaxed);
 }
 
 impl From<u8> for TaskState {

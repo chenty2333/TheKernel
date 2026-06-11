@@ -4,7 +4,7 @@ use core::{
     task::Context,
 };
 
-use axerrno::{AxError, AxResult, ax_bail, ax_err_type};
+use axerrno::{AxError, AxResult, LinuxError, ax_bail, ax_err_type};
 use axio::prelude::*;
 use axpoll::{IoEvents, Pollable};
 use smoltcp::{
@@ -24,6 +24,8 @@ use crate::{
     options::{Configurable, GetSocketOption, SetSocketOption},
     wrapper::Transport,
 };
+
+const MAX_UDP_SEND_LEN: usize = u16::MAX as usize;
 
 pub(crate) fn new_udp_socket() -> smol::Socket<'static> {
     // TODO(mivik): buffer size
@@ -239,6 +241,9 @@ impl SocketOps for UdpSocket {
         };
         if remote_addr.port == 0 || remote_addr.addr.is_unspecified() {
             ax_bail!(InvalidInput, "invalid address");
+        }
+        if src.remaining() > MAX_UDP_SEND_LEN {
+            return Err(LinuxError::EMSGSIZE.into());
         }
 
         if self.local_addr.read().is_none() {

@@ -37,6 +37,8 @@ DEFAULT_PLAN_NAME = "ltp-both"
 DEFAULT_TESTSUITE_SOURCE = Path.home() / "testsuits-for-oskernel"
 DEFAULT_TESTSUITE_REF = REF_DIR / "testsuits-for-oskernel"
 DEFAULT_LINUX_REF = REF_DIR / "linux"
+DEFAULT_CAMPAIGN_LIMIT = 120
+DEFAULT_CAMPAIGN_CASE_TIMEOUT = 90
 DEFAULT_IMAGE_ROOTS = [
     os.environ.get("OSCOMP_TESTSUITE_DIR", ""),
     "/home/dia/kernel-image",
@@ -48,6 +50,30 @@ ARCHES = ("rv", "la")
 LIBCS = ("glibc", "musl")
 RESULT_KINDS = ("TPASS", "TFAIL", "TBROK", "TCONF", "TWARN")
 BUILD_STATE_DIRS = (REPO_ROOT / ".state" / "riscv64", REPO_ROOT / ".state" / "loongarch64")
+RUNTEST_PRESETS = {
+    "fs": ["fs", "syscalls", "dio", "fcntl-locktests"],
+    "vfs": ["fs", "syscalls", "dio", "fcntl-locktests", "fs_perms_simple", "fs_readonly"],
+    "file": ["fs", "syscalls", "dio", "fcntl-locktests"],
+    "proc": ["syscalls", "sched", "nptl"],
+    "process": ["syscalls", "sched", "nptl"],
+    "signal": ["syscalls"],
+    "time": ["syscalls", "sched"],
+    "futex": ["syscalls", "sched", "nptl"],
+    "sched": ["sched", "syscalls"],
+    "mm": ["mm", "syscalls", "numa"],
+    "ipc": ["ipc", "syscalls-ipc", "syscalls"],
+    "tty": ["pty", "syscalls"],
+    "pty": ["pty", "syscalls"],
+    "net": [
+        "net.features",
+        "net.ipv6",
+        "net.multicast",
+        "net.tcp_cmds",
+        "net_stress.appl",
+        "net_stress.interface",
+    ],
+    "all": [],
+}
 
 
 @dataclass
@@ -269,6 +295,19 @@ def split_csv(values: list[str] | None) -> list[str]:
             item = item.strip()
             if item:
                 result.append(item)
+    return result
+
+
+def split_words_or_csv(values: list[str] | None) -> list[str]:
+    if not values:
+        return []
+    result: list[str] = []
+    for value in values:
+        for chunk in value.split(","):
+            for item in chunk.split():
+                item = item.strip()
+                if item:
+                    result.append(item)
     return result
 
 
@@ -673,6 +712,16 @@ def resolve_explicit_case_lines(cases: list[str]) -> list[str]:
     return lines
 
 
+def expanded_runtests(values: list[str] | None) -> list[str]:
+    result: list[str] = []
+    for value in split_words_or_csv(values):
+        expanded = RUNTEST_PRESETS.get(value, [value])
+        for item in expanded:
+            if item and item not in result:
+                result.append(item)
+    return result
+
+
 def generate_list(args: argparse.Namespace) -> Path:
     ensure_dirs()
     arches = canonical_arches(args.arch)
@@ -705,7 +754,7 @@ def generate_list(args: argparse.Namespace) -> Path:
         current_markers = {item["marker"] for item in current_items}
         available = selected_available_names(inv, arches, libcs)
         entries = inv["source_runtest"].get("entries_data", [])
-        runtest_filters = set(split_csv(args.runtest))
+        runtest_filters = set(expanded_runtests(args.runtest))
         selected: list[str] = []
         seen: set[str] = set()
         for item in entries:
@@ -2383,7 +2432,8 @@ def write_campaign_readme(campaign_dir: Path, manifest: dict[str, Any]) -> None:
 
 Goal: {manifest.get("goal", "")}
 
-This campaign fixes real kernel behavior for a fixed LTP candidate batch. Do
+This campaign is a fixed LTP case ledger first and a validation record second.
+Use it to drive real shared kernel behavior before spending time on replay. Do
 not add or remove cases while implementing semantics; create a new campaign for
 the next batch.
 
@@ -2394,20 +2444,36 @@ the next batch.
 - `cases.jsonl`: candidate metadata, source pointers, and semantic bucket.
 - `semantics/*.md`: short implementation prompts tied to testcase and Linux behavior.
 - `implementation.md`: ledger for kernel changes and cross-check notes.
-- `analysis.json` and `taxonomy.md`: generated after `campaign analyze` or `campaign finish`.
+- `taxonomy.md`: static unfinished-work map before replay; observed failure taxonomy after analyze.
+- `analysis.json`: generated after `campaign analyze` or `campaign finish`.
 - `promotable.txt`: generated case lines that have all required pass evidence.
 
 ## Commands
 
+Code-first phase:
+
 ```bash
-./scripts/oscomp.sh lab campaign status {name}
+make lab-status NAME={name}
 make kernels
-make dev-shell DEV_CMD='./scripts/oscomp.sh lab campaign run {name} --skip-kernel-build'
-./scripts/oscomp.sh lab campaign analyze {name}
-./scripts/oscomp.sh lab campaign finish {name}
+```
+
+Before running replay, read `cases.jsonl`, `semantics/*.md`, testcase sources,
+Linux reference code, and local kernel paths. Record shared kernel behavior,
+covered buckets, expected candidate coverage, deferred validation groups, and
+unresolved cases in `implementation.md` and `taxonomy.md`.
+
+Validation phase, after a meaningful implementation pass:
+
+```bash
+make lab-run NAME={name}
+make lab-review NAME={name}
+make lab-apply NAME={name}
+make lab-done NAME={name}
 ```
 
 Promotion still requires all required rv/la x glibc/musl parser `pass` evidence.
+Run these commands inside an already-open `make dev-shell`; use
+`make dev-shell DEV_CMD='...'` only for one-off host-side execution.
 """
     (campaign_dir / "README.md").write_text(text, encoding="utf-8")
 
@@ -2461,6 +2527,8 @@ def write_semantic_cards(campaign_dir: Path, records: list[dict[str, Any]], linu
 
 - Write the real subsystem behavior that satisfies this semantic bucket.
 - Cross-check testcase expectations against Linux behavior before editing shared code.
+- Use cheap builds, static inspection, and tiny crash probes during implementation.
+- Defer full matrix replay until a substantial shared behavior pass is ready.
 - Keep promotion evidence separate from canary or partial runs.
 """
         (semantics_dir / f"{semantic_id}.md").write_text(text, encoding="utf-8")
@@ -2479,11 +2547,17 @@ Changed Files:
 Behavior Implemented:
 - Fill in the Linux-visible behavior implemented for this semantic bucket.
 
+Candidate Coverage:
+- Fill in cases this implementation is expected to cover.
+
 Testcase Cross-Checks:
 - Fill in testcase source files and checked expectations.
 
 Linux Reference Cross-Checks:
 - Fill in Linux reference files/functions and observed behavior.
+
+Deferred Validation:
+- Fill in candidate groups that should be replayed after this code-first pass.
 
 Residual Risk:
 - Fill in remaining risk or follow-up cases.
@@ -2496,8 +2570,14 @@ Residual Risk:
 def write_initial_taxonomy(campaign_dir: Path) -> None:
     text = """# Failure Taxonomy
 
-Run `./scripts/oscomp.sh lab campaign analyze <name>` after a matrix run to
-replace this placeholder with observed pass/fail/panic/timeout buckets.
+Before replay, use this file as the static semantic map for unfinished work:
+
+- Shared semantic buckets to implement.
+- Cases expected to be covered by each bucket.
+- Cases deferred because they need a different subsystem or are risky.
+
+After a matrix run, `./scripts/lab campaign analyze <name>` replaces
+this with observed pass/fail/panic/timeout buckets.
 """
     (campaign_dir / "taxonomy.md").write_text(text, encoding="utf-8")
 
@@ -2577,6 +2657,74 @@ def campaign_create_cmd(args: argparse.Namespace) -> None:
     log(f"created campaign {name} with {len(records)} cases at {campaign_dir}")
 
 
+def campaign_new_cmd(args: argparse.Namespace) -> None:
+    runtests = expanded_runtests([*(args.suite or []), *(args.runtest or [])])
+    create_args = argparse.Namespace(
+        name=args.name,
+        inventory=None,
+        arch=["both"],
+        libc=["both"],
+        mode="unopened-runtest",
+        case=None,
+        runtest=runtests,
+        include=None,
+        exclude=None,
+        shuffle=False,
+        seed=1,
+        offset=args.offset,
+        limit=args.limit,
+        goal=args.goal or "LTP semantic expansion campaign",
+        risk=args.risk,
+        testsuite_source=None,
+        linux_ref=None,
+        replace=args.replace,
+    )
+    campaign_create_cmd(create_args)
+
+
+def default_campaign_run_namespace(name: str) -> argparse.Namespace:
+    return argparse.Namespace(
+        name=name,
+        run_name=None,
+        inventory=None,
+        arch=["both"],
+        libc=["both"],
+        plan=None,
+        replace=False,
+        image=None,
+        timeout=7000,
+        parallel="arch",
+        split_combos=False,
+        jobs="auto",
+        no_parallel=False,
+        case_timeout=DEFAULT_CAMPAIGN_CASE_TIMEOUT,
+        task_timeout=None,
+        ltp_order="glibc-first",
+        ltp_budget=None,
+        glibc_budget=None,
+        musl_budget=None,
+        env=None,
+        skip_kernel_build=True,
+        rebuild_kernels=False,
+        prepare_only=False,
+        fail_fast=False,
+    )
+
+
+def campaign_quick_run_cmd(args: argparse.Namespace) -> None:
+    run_args = default_campaign_run_namespace(args.name)
+    if args.run_name:
+        run_args.run_name = args.run_name
+    if args.replace:
+        run_args.replace = True
+    if args.build:
+        run_args.rebuild_kernels = True
+        run_args.skip_kernel_build = False
+    if args.prepare:
+        run_args.prepare_only = True
+    campaign_run_cmd(run_args)
+
+
 def latest_campaign_run(manifest: dict[str, Any]) -> str | None:
     runs = manifest.get("runs") or []
     if not runs:
@@ -2609,14 +2757,14 @@ def campaign_run_args(args: argparse.Namespace, campaign_dir: Path, manifest: di
         split_combos=args.split_combos,
         jobs=args.jobs,
         no_parallel=args.no_parallel,
-        case_timeout=args.case_timeout,
+        case_timeout=args.case_timeout if args.case_timeout is not None else DEFAULT_CAMPAIGN_CASE_TIMEOUT,
         task_timeout=args.task_timeout,
         ltp_order=args.ltp_order,
         ltp_budget=args.ltp_budget,
         glibc_budget=args.glibc_budget,
         musl_budget=args.musl_budget,
         env=args.env,
-        skip_kernel_build=args.skip_kernel_build,
+        skip_kernel_build=not args.rebuild_kernels,
         rebuild_kernels=args.rebuild_kernels,
         prepare_only=args.prepare_only,
         fail_fast=args.fail_fast,
@@ -2648,6 +2796,51 @@ def campaign_run_cmd(args: argparse.Namespace) -> None:
     manifest["status"] = "ran"
     save_campaign(campaign_dir, manifest)
     log(f"campaign {manifest['name']} recorded run {run_id}")
+
+
+def campaign_review_cmd(args: argparse.Namespace) -> None:
+    campaign_analyze_cmd(
+        argparse.Namespace(
+            name=args.name,
+            run=args.run,
+            latest=args.latest,
+            require=args.require,
+            allow_silent_pass=args.allow_silent_pass,
+        )
+    )
+    campaign_promote_cmd(
+        argparse.Namespace(
+            name=args.name,
+            run=args.run,
+            require=args.require,
+            base=None,
+            output=None,
+            allow_silent_pass=args.allow_silent_pass,
+            dry_run=True,
+            explain=True,
+            show_missing=args.show_missing,
+            status_matrix=args.status_matrix,
+            apply_root=False,
+        )
+    )
+
+
+def campaign_apply_cmd(args: argparse.Namespace) -> None:
+    campaign_promote_cmd(
+        argparse.Namespace(
+            name=args.name,
+            run=args.run,
+            require=args.require,
+            base=None,
+            output=None,
+            allow_silent_pass=args.allow_silent_pass,
+            dry_run=args.dry_run,
+            explain=args.explain,
+            show_missing=args.show_missing,
+            status_matrix=args.status_matrix,
+            apply_root=not args.dry_run,
+        )
+    )
 
 
 def campaign_status_cmd(args: argparse.Namespace) -> None:
@@ -3043,6 +3236,9 @@ def bootstrap_cmd(args: argparse.Namespace) -> None:
         checks[f"official-image-{arch}"] = find_official_image(arch) is not None
     for name, ok in checks.items():
         print(f"{name}: {'ok' if ok else 'missing'}")
+    if args.fetch and not args.linux_ref and not args.testsuits_ref:
+        args.linux_ref = str(DEFAULT_LINUX_REF)
+        args.testsuits_ref = str(DEFAULT_TESTSUITE_REF)
     if args.linux_ref:
         target = Path(args.linux_ref).expanduser()
         if target.exists():
@@ -3192,6 +3388,27 @@ def baseline_heavy_artifacts() -> list[Path]:
 
 def clean_cmd(args: argparse.Namespace) -> None:
     targets: list[Path] = []
+    for preset in split_words_or_csv(getattr(args, "preset", None)):
+        if preset in ("trim", "daily"):
+            args.trim = True
+        elif preset in ("gen", "generated"):
+            args.generated = True
+        elif preset == "runs":
+            args.runs = True
+        elif preset == "cache":
+            args.cache = True
+        elif preset == "refs":
+            args.refs = True
+        elif preset == "lab":
+            args.lab = True
+        elif preset in ("root", "legacy-root"):
+            args.legacy_root = True
+        elif preset == "smoke":
+            args.smoke = True
+        elif preset == "all":
+            args.all = True
+        else:
+            die(f"unknown clean preset: {preset}")
     requested = any(
         (
             args.trim,
@@ -3330,8 +3547,6 @@ def clean_cmd(args: argparse.Namespace) -> None:
     targets = collapse_cleanup_targets(targets)
     for target in targets:
         if not target.exists():
-            if args.dry_run:
-                print(f"{target} (missing)")
             continue
         if args.dry_run:
             kind = "dir" if target.is_dir() else "file"
@@ -3435,6 +3650,55 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--inventory", help="inventory JSON path")
     p.set_defaults(func=lambda args: print_inventory_summary(load_inventory(args.inventory)))
 
+    p = sub.add_parser("new", help="create a default campaign: unopened all-four batch, 120 cases")
+    p.add_argument("name")
+    p.add_argument("suite", nargs="*", help="runtest names or presets, e.g. fs, proc, mm, ipc, tty, net")
+    p.add_argument("-n", "--limit", type=int, default=DEFAULT_CAMPAIGN_LIMIT)
+    p.add_argument("-o", "--offset", type=int, default=0)
+    p.add_argument("-g", "--goal")
+    p.add_argument("--risk", choices=["low", "medium", "high"], default="medium")
+    p.add_argument("--runtest", action="append", help="extra runtest names or presets")
+    p.add_argument("--replace", action="store_true")
+    p.set_defaults(func=campaign_new_cmd)
+
+    p = sub.add_parser("run", help="run campaign with default all-four matrix")
+    p.add_argument("name")
+    p.add_argument("--run-name")
+    p.add_argument("--replace", action="store_true")
+    p.add_argument("--build", action="store_true", help="build kernels before replay")
+    p.add_argument("--prepare", action="store_true", help="prepare list/plan/support image only")
+    p.set_defaults(func=campaign_quick_run_cmd)
+
+    p = sub.add_parser("review", help="analyze campaign evidence and print dry-run promotion status")
+    p.add_argument("name")
+    p.add_argument("--run", action="append", help="run id to review, comma-separated or repeated")
+    p.add_argument("--latest", action="store_true", help="review only the latest recorded run")
+    p.add_argument("--require", action="append", help="required selector, default all four")
+    p.add_argument("--allow-silent-pass", action="store_true")
+    p.add_argument("--show-missing", action="store_true")
+    p.add_argument("--status-matrix", action="store_true")
+    p.set_defaults(func=campaign_review_cmd)
+
+    p = sub.add_parser("apply", help="apply all-four campaign promotions to ltp_test.txt")
+    p.add_argument("name")
+    p.add_argument("--run", action="append", help="run id to promote from, comma-separated or repeated")
+    p.add_argument("--require", action="append", help="required selector, default all four")
+    p.add_argument("--allow-silent-pass", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--explain", action="store_true")
+    p.add_argument("--show-missing", action="store_true")
+    p.add_argument("--status-matrix", action="store_true")
+    p.set_defaults(func=campaign_apply_cmd)
+
+    p = sub.add_parser("done", help="finish campaign and clean heavy run artifacts")
+    p.add_argument("name")
+    p.add_argument("--run", action="append", help="run id to include, comma-separated or repeated")
+    p.add_argument("--require", action="append", help="required selector, default all four")
+    p.add_argument("--allow-silent-pass", action="store_true")
+    p.add_argument("--no-clean", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=campaign_finish_cmd)
+
     p = sub.add_parser("generate", help="generate an LTP test list")
     add_common_generation_args(p)
     p.add_argument("--name", help="list name under .state/ltp-lab/lists")
@@ -3449,7 +3713,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", help="output plan path")
     p.set_defaults(func=lambda args: write_plan(args))
 
-    p = sub.add_parser("run", help="build a support disk, replay QEMU, and parse logs")
+    p = sub.add_parser("replay", help="low-level focused replay with explicit list/plan controls")
     add_common_generation_args(p)
     p.add_argument("--test-list", help="existing LTP list path")
     p.add_argument("--plan", help="existing plan path")
@@ -3562,18 +3826,29 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--split-combos", action="store_true", help="run each selected arch/libc combo as its own task")
     c.add_argument("--jobs", default="auto", help="parallel task slots: auto or a positive integer")
     c.add_argument("--no-parallel", action="store_true", help="equivalent to --parallel serial --jobs 1")
-    c.add_argument("--case-timeout", type=int, help="per-LTP-case timeout inside the guest; 0 disables")
+    c.add_argument("--case-timeout", type=int, default=DEFAULT_CAMPAIGN_CASE_TIMEOUT, help="per-LTP-case timeout inside the guest; 0 disables")
     c.add_argument("--task-timeout", type=int, help="per-QEMU-task timeout; defaults to --timeout")
     c.add_argument("--ltp-order", choices=["glibc-first", "musl-first"], default="glibc-first")
     c.add_argument("--ltp-budget", type=int)
     c.add_argument("--glibc-budget", type=int)
     c.add_argument("--musl-budget", type=int)
     c.add_argument("--env", action="append", help="guest env KEY=VALUE, comma-separated or repeated")
-    c.add_argument("--skip-kernel-build", action="store_true")
-    c.add_argument("--rebuild-kernels", action="store_true")
+    c.add_argument("--build", dest="rebuild_kernels", action="store_true", help="build kernels before replay")
+    c.add_argument("--rebuild-kernels", action="store_true", help=argparse.SUPPRESS)
+    c.add_argument("--skip-kernel-build", action="store_true", help=argparse.SUPPRESS)
     c.add_argument("--prepare-only", action="store_true", help="build list, plan, and support image without QEMU replay")
     c.add_argument("--fail-fast", action="store_true")
     c.set_defaults(func=campaign_run_cmd)
+
+    c = campaign_sub.add_parser("review", help="analyze evidence and dry-run promotion")
+    c.add_argument("name")
+    c.add_argument("--run", action="append", help="run id to review, comma-separated or repeated")
+    c.add_argument("--latest", action="store_true", help="review only the latest recorded run")
+    c.add_argument("--require", action="append", help="required selector: rv/glibc, rv, glibc, or both; default all four")
+    c.add_argument("--allow-silent-pass", action="store_true")
+    c.add_argument("--show-missing", action="store_true")
+    c.add_argument("--status-matrix", action="store_true")
+    c.set_defaults(func=campaign_review_cmd)
 
     c = campaign_sub.add_parser("attach-run", help="record an existing lab run as campaign evidence")
     c.add_argument("name")
@@ -3604,6 +3879,17 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--apply-root", action="store_true", help="replace root ltp_test.txt with the promoted output")
     c.set_defaults(func=campaign_promote_cmd)
 
+    c = campaign_sub.add_parser("apply", help="apply all-four promoted cases to root ltp_test.txt")
+    c.add_argument("name")
+    c.add_argument("--run", action="append", help="run id to promote from, comma-separated or repeated")
+    c.add_argument("--require", action="append", help="required selector: rv/glibc, rv, glibc, or both; default all four")
+    c.add_argument("--allow-silent-pass", action="store_true")
+    c.add_argument("--dry-run", action="store_true")
+    c.add_argument("--explain", action="store_true")
+    c.add_argument("--show-missing", action="store_true")
+    c.add_argument("--status-matrix", action="store_true")
+    c.set_defaults(func=campaign_apply_cmd)
+
     c = campaign_sub.add_parser("finish", help="analyze and clean heavy per-run artifacts while retaining evidence")
     c.add_argument("name")
     c.add_argument("--run", action="append", help="run id to include, comma-separated or repeated")
@@ -3623,6 +3909,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.set_defaults(func=campaign_clean_cmd)
 
     p = sub.add_parser("clean", help="remove lab state or old root artifacts")
+    p.add_argument("preset", nargs="*", help="short cleanup preset: trim, generated, runs, cache, refs, lab, legacy-root, smoke, or all")
     p.add_argument("--trim", action="store_true", help="daily cleanup of disposable failed/empty runs, per-run heavy artifacts, baseline images, smoke state, and legacy root outputs")
     p.add_argument("--lab", action="store_true", help="remove the whole .state/ltp-lab tree")
     p.add_argument("--generated", action="store_true", help="remove generated runs, lists, and plans")

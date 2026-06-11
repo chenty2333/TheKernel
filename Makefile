@@ -71,12 +71,15 @@ help:
 		'' \
 		'Lab commands:' \
 		'  make lab-check' \
+		'  make lab-bootstrap' \
 		'  make lab-inventory' \
-		'  make lab-campaign LAB_ARGS="create goal3-fs-vfs-0001 --runtest fs --runtest syscalls --limit 120"' \
-		'  make lab-list LAB_ARGS="..."' \
-		'  make lab-run LAB_ARGS="..."' \
+		'  make lab-new NAME=goal3-fs-vfs-0001 SUITE="fs syscalls"' \
+		'  make lab-run NAME=goal3-fs-vfs-0001' \
+		'  make lab-review NAME=goal3-fs-vfs-0001' \
+		'  make lab-apply NAME=goal3-fs-vfs-0001' \
+		'  make lab-done NAME=goal3-fs-vfs-0001' \
 		'  make lab-trim       daily cleanup of disposable lab artifacts' \
-		'  make lab-clean LAB_CLEAN_ARGS="..."'
+		'  make lab-clean      generated lab state cleanup'
 
 all:
 	@$(MAKE) --no-print-directory clean-eval
@@ -153,37 +156,67 @@ replay-la:
 	@./scripts/oscomp.sh run --arch la --skip-kernel-build $(OSCOMP_ARGS)
 
 lab-check:
-	@./scripts/oscomp.sh lab bootstrap
+	@./scripts/lab bootstrap
+
+lab-bootstrap:
+	@./scripts/lab bootstrap --fetch
 
 lab-inventory:
-	@./scripts/oscomp.sh lab inventory
-
-lab-plan:
-	@./scripts/oscomp.sh lab plan $(LAB_ARGS)
-
-lab-list:
-	@./scripts/oscomp.sh lab generate $(LAB_ARGS)
-
-lab-run:
-	@./scripts/oscomp.sh lab run $(LAB_ARGS)
-
-lab-parse:
-	@./scripts/oscomp.sh lab parse $(LAB_ARGS)
+	@./scripts/lab inventory
 
 lab-summary:
-	@./scripts/oscomp.sh lab summarize $(LAB_ARGS)
+	@./scripts/lab summary
+
+lab-new:
+	@test -n "$(NAME)" || { printf '%s\n' 'NAME is required, e.g. make lab-new NAME=goal3-fs-vfs-0001 SUITE="fs syscalls"' >&2; exit 1; }
+	@./scripts/lab new "$(NAME)" $(SUITE) $(if $(LIMIT),--limit $(LIMIT),) $(if $(OFFSET),--offset $(OFFSET),) $(if $(GOAL),--goal "$(GOAL)",) $(LAB_ARGS)
+
+lab-run:
+	@test -n "$(NAME)" || { printf '%s\n' 'NAME is required, e.g. make lab-run NAME=goal3-fs-vfs-0001' >&2; exit 1; }
+	@./scripts/lab run "$(NAME)" $(LAB_ARGS)
+
+lab-review:
+	@test -n "$(NAME)" || { printf '%s\n' 'NAME is required, e.g. make lab-review NAME=goal3-fs-vfs-0001' >&2; exit 1; }
+	@./scripts/lab review "$(NAME)" $(LAB_ARGS)
+
+lab-apply:
+	@test -n "$(NAME)" || { printf '%s\n' 'NAME is required, e.g. make lab-apply NAME=goal3-fs-vfs-0001' >&2; exit 1; }
+	@./scripts/lab apply "$(NAME)" $(LAB_ARGS)
+
+lab-done:
+	@test -n "$(NAME)" || { printf '%s\n' 'NAME is required, e.g. make lab-done NAME=goal3-fs-vfs-0001' >&2; exit 1; }
+	@./scripts/lab done "$(NAME)" $(LAB_ARGS)
+
+lab-status:
+	@test -n "$(NAME)" || { printf '%s\n' 'NAME is required, e.g. make lab-status NAME=goal3-fs-vfs-0001' >&2; exit 1; }
+	@./scripts/lab campaign status "$(NAME)"
+
+lab-plan:
+	@./scripts/lab plan $(LAB_ARGS)
+
+lab-list:
+	@./scripts/lab generate $(LAB_ARGS)
+
+lab-replay:
+	@./scripts/lab replay $(LAB_ARGS)
+
+lab-parse:
+	@./scripts/lab parse $(LAB_ARGS)
+
+lab-summarize:
+	@./scripts/lab summarize $(LAB_ARGS)
 
 lab-promote:
-	@./scripts/oscomp.sh lab promote $(LAB_ARGS)
+	@./scripts/lab promote $(LAB_ARGS)
 
 lab-campaign:
-	@./scripts/oscomp.sh lab campaign $(LAB_ARGS)
+	@./scripts/lab campaign $(LAB_ARGS)
 
 lab-clean:
-	@./scripts/oscomp.sh lab clean --generated --legacy-root $(LAB_CLEAN_ARGS)
+	@./scripts/lab clean generated legacy-root $(LAB_CLEAN_ARGS)
 
 lab-trim:
-	@./scripts/oscomp.sh lab clean --trim $(LAB_CLEAN_ARGS)
+	@./scripts/lab clean trim $(LAB_CLEAN_ARGS)
 
 debug:
 	@printf '%s\n' 'debug is not wired to the official pre-2025 evaluator flow; use scripts/oscomp.sh run instead.' >&2
@@ -222,7 +255,7 @@ rv:
 la:
 	$(MAKE) ARCH=loongarch64 run
 
-.PHONY: help all artifacts kernels build run eval-rv eval-la replay-rv replay-la lab-check lab-inventory lab-plan lab-list lab-run lab-parse lab-summary lab-promote lab-campaign lab-clean lab-trim dev-image dev-check dev-shell dev-shell-root debug disasm clean clean-eval legacy-clean prebuild-scrub check-eval-kernel-size kernel-rv kernel-la disk.img disk-la.img
+.PHONY: help all artifacts kernels build run eval-rv eval-la replay-rv replay-la lab-check lab-bootstrap lab-inventory lab-summary lab-new lab-run lab-review lab-apply lab-done lab-status lab-plan lab-list lab-replay lab-parse lab-summarize lab-promote lab-campaign lab-clean lab-trim dev-image dev-check dev-shell dev-shell-root debug disasm clean clean-eval legacy-clean prebuild-scrub check-eval-kernel-size kernel-rv kernel-la disk.img disk-la.img
 check-eval-kernel-size:
 	@for kernel in $(ROOT_DIR)/kernel-rv $(ROOT_DIR)/kernel-la; do \
 		[ -f "$$kernel" ] || continue; \

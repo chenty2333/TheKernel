@@ -1,4 +1,8 @@
-use alloc::{collections::btree_map::BTreeMap, sync::Arc, vec::Vec};
+use alloc::{collections::btree_map::BTreeMap, string::String, sync::Arc, vec::Vec};
+use core::{
+    fmt::Write as _,
+    sync::atomic::{AtomicI32, Ordering},
+};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::paging::{MappingFlags, PageSize};
@@ -13,8 +17,8 @@ use starry_process::Pid;
 
 use super::{
     IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcPerm, SHM_DEST,
-    SHM_INFO, SHM_LOCK, SHM_LOCKED, SHM_STAT, SHM_UNLOCK, SHMMIN, next_ipc_id, shmall_limit,
-    shmmax_limit, shmmni_limit, shmseg_limit,
+    SHM_INFO, SHM_LOCK, SHM_LOCKED, SHM_STAT, SHM_STAT_ANY, SHM_UNLOCK, SHMMIN, next_ipc_id,
+    shmall_limit, shmmax_limit, shmmni_limit, shmseg_limit,
 };
 use crate::{
     mm::{Backend, SharedPages, UserPtr, nullable},
@@ -375,11 +379,16 @@ impl ShmManager {
         self.shmid_inner.len()
     }
 
-    pub fn nth_active(&self, index: usize) -> Option<(i32, Arc<Mutex<ShmInner>>)> {
+    pub fn contains_shmid(&self, shmid: i32) -> bool {
+        self.shmid_inner.contains_key(&shmid)
+    }
+
+    pub fn max_active_index(&self) -> isize {
         self.shmid_inner
-            .iter()
-            .nth(index)
-            .map(|(&shmid, inner)| (shmid, inner.clone()))
+            .keys()
+            .map(|&shmid| shmid as isize)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Returns the shared memory ID associated with the given pid and virtual
@@ -499,9 +508,71 @@ impl ShmManager {
 
 /// Global shared memory manager.
 pub static SHM_MANAGER: Mutex<ShmManager> = Mutex::new(ShmManager::new());
+static SHM_NEXT_ID: AtomicI32 = AtomicI32::new(-1);
 
 pub fn inherit_proc_shm(parent_pid: Pid, child_pid: Pid) {
     SHM_MANAGER.lock().inherit_proc_shm(parent_pid, child_pid);
+}
+
+fn allocate_shm_id(shm_manager: &ShmManager) -> i32 {
+    let desired = SHM_NEXT_ID.swap(-1, Ordering::Relaxed);
+    if desired >= 0 && !shm_manager.contains_shmid(desired) {
+        desired
+    } else {
+        loop {
+            let candidate = next_ipc_id();
+            if !shm_manager.contains_shmid(candidate) {
+                return candidate;
+            }
+        }
+    }
+}
+
+pub(crate) fn shm_next_id() -> i32 {
+    SHM_NEXT_ID.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_shm_next_id(value: i32) -> AxResult<()> {
+    if value < -1 {
+        return Err(AxError::from(LinuxError::EINVAL));
+    }
+    SHM_NEXT_ID.store(value, Ordering::Relaxed);
+    Ok(())
+}
+
+pub(crate) fn sysvipc_shm_snapshot() -> String {
+    let mut out = String::from(
+        "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  \
+         cgid      atime      dtime      ctime        rss       swap\n",
+    );
+    let shm_manager = SHM_MANAGER.lock();
+    for (&shmid, shm_inner) in &shm_manager.shmid_inner {
+        let shm_inner = shm_inner.lock();
+        let ds = shm_inner.shmid_ds;
+        let rss_bytes = shm_inner.page_num.saturating_mul(PAGE_SIZE_4K);
+        let _ = writeln!(
+            out,
+            "{:10} {:10} {:5o} {:21} {:5} {:5} {:6} {:5} {:5} {:5} {:5} {:10} {:10} {:10} {:10} \
+             {:10}",
+            ds.shm_perm.key,
+            shmid,
+            ds.shm_perm.mode & 0o777,
+            ds.shm_segsz,
+            ds.shm_cpid,
+            ds.shm_lpid,
+            ds.shm_nattch,
+            ds.shm_perm.uid,
+            ds.shm_perm.gid,
+            ds.shm_perm.cuid,
+            ds.shm_perm.cgid,
+            ds.shm_atime,
+            ds.shm_dtime,
+            ds.shm_ctime,
+            rss_bytes,
+            0,
+        );
+    }
+    out
 }
 
 pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
@@ -561,7 +632,7 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
     }
 
     // Create a new shm_inner
-    let shmid = next_ipc_id();
+    let shmid = allocate_shm_id(&shm_manager);
     let shm_inner = Arc::new(Mutex::new(ShmInner::new(
         key,
         shmid,
@@ -704,7 +775,7 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
                 reserved4: 0,
             };
             *buf.cast::<IpcInfo>().get_as_mut()? = info;
-            return Ok(shm_manager.active_segment_count().saturating_sub(1) as isize);
+            return Ok(shm_manager.max_active_index());
         }
         if cmd == SHM_INFO {
             let mut info = ShmUsageInfo {
@@ -721,19 +792,22 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
                 info.shm_rss = info.shm_rss.saturating_add(shm_inner.page_num as c_ulong);
             }
             *buf.cast::<ShmUsageInfo>().get_as_mut()? = info;
-            return Ok(shm_manager.active_segment_count().saturating_sub(1) as isize);
+            return Ok(shm_manager.max_active_index());
         }
-        if cmd == SHM_STAT {
+        if cmd == SHM_STAT || cmd == SHM_STAT_ANY {
             let (actual_shmid, shm_inner) = shm_manager
-                .nth_active(shmid as usize)
+                .get_inner_by_shmid(shmid)
+                .map(|inner| (shmid, inner))
                 .ok_or(AxError::InvalidInput)?;
             let shm_inner = shm_inner.lock();
-            if !super::has_ipc_permission(
-                &shm_inner.shmid_ds.shm_perm,
-                current_uid,
-                current_gid,
-                false,
-            ) {
+            if cmd == SHM_STAT
+                && !super::has_ipc_permission(
+                    &shm_inner.shmid_ds.shm_perm,
+                    current_uid,
+                    current_gid,
+                    false,
+                )
+            {
                 return Err(AxError::from(LinuxError::EACCES));
             }
             *buf.get_as_mut()? = shm_inner.shmid_ds;

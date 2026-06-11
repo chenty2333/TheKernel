@@ -16,6 +16,11 @@ use axfs::{FS_CONTEXT, FsContext};
 use axfs_ng_vfs::{DirNodeOps, FileNodeOps, Filesystem, NodePermission, WeakDirEntry};
 pub use tmp::MemoryFs;
 
+pub(crate) use self::proc::{
+    ProcDirProcess, ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
+    namespace_target_from_proc_file, proc_namespace_location_from_object,
+    process_data_from_proc_dir,
+};
 pub use self::{device::*, dir::*, file::*, fs::*};
 use crate::mounts;
 
@@ -51,10 +56,16 @@ fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> LinuxResult<()>
     if fs.resolve(path).is_err() {
         fs.create_dir(path, DIR_PERMISSION)?;
     }
-    fs.resolve(path)?.mount(&mount_fs)?;
+    let mountpoint = fs.resolve(path)?.mount(&mount_fs)?;
     if path != "/proc" {
         let fs_type = mount_fs.name().to_string();
-        mounts::record(fs_type.clone(), path.to_string(), fs_type, 0);
+        mounts::record(
+            fs_type.clone(),
+            path.to_string(),
+            fs_type,
+            mountpoint.device(),
+            0,
+        );
     }
     info!("Mounted {} at {}", mount_fs.name(), path);
     Ok(())
@@ -67,12 +78,24 @@ pub fn mount_all() -> LinuxResult<()> {
     let fs = FS_CONTEXT.lock();
     mount_at(&fs, "/dev", dev::new_devfs())?;
     let tmp_permission = NodePermission::from_bits_truncate(0o1777);
-    mount_at(&fs, "/dev/shm", tmp::MemoryFs::new_with_permission(tmp_permission))?;
-    mount_at(&fs, "/tmp", tmp::MemoryFs::new_with_permission(tmp_permission))?;
+    mount_at(
+        &fs,
+        "/dev/shm",
+        tmp::MemoryFs::new_with_permission(tmp_permission),
+    )?;
+    mount_at(
+        &fs,
+        "/tmp",
+        tmp::MemoryFs::new_with_permission(tmp_permission),
+    )?;
     if fs.resolve("/var").is_err() {
         fs.create_dir("/var", DIR_PERMISSION)?;
     }
-    mount_at(&fs, "/var/tmp", tmp::MemoryFs::new_with_permission(tmp_permission))?;
+    mount_at(
+        &fs,
+        "/var/tmp",
+        tmp::MemoryFs::new_with_permission(tmp_permission),
+    )?;
     mount_at(&fs, "/proc", proc::new_procfs())?;
 
     mount_at(&fs, "/sys", sys::new_sysfs())?;

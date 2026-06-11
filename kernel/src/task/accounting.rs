@@ -25,12 +25,26 @@ pub struct TaskUsage {
     pub utime_ns: u64,
     /// System CPU time in nanoseconds.
     pub stime_ns: u64,
+    /// Maximum resident set size in kilobytes.
+    pub maxrss_kb: u64,
 }
 
 impl TaskUsage {
     /// Creates a new usage record.
     pub const fn new(utime_ns: u64, stime_ns: u64) -> Self {
-        Self { utime_ns, stime_ns }
+        Self {
+            utime_ns,
+            stime_ns,
+            maxrss_kb: 0,
+        }
+    }
+
+    pub const fn with_maxrss(utime_ns: u64, stime_ns: u64, maxrss_kb: u64) -> Self {
+        Self {
+            utime_ns,
+            stime_ns,
+            maxrss_kb,
+        }
     }
 
     /// Collects usage from a live thread.
@@ -56,7 +70,13 @@ impl TaskUsage {
         Self {
             utime_ns: self.utime_ns.saturating_add(other.utime_ns),
             stime_ns: self.stime_ns.saturating_add(other.stime_ns),
+            maxrss_kb: self.maxrss_kb.max(other.maxrss_kb),
         }
+    }
+
+    pub fn with_maxrss_floor(mut self, maxrss_kb: u64) -> Self {
+        self.maxrss_kb = self.maxrss_kb.max(maxrss_kb);
+        self
     }
 
     /// User CPU time as a [`TimeValue`].
@@ -85,19 +105,20 @@ impl From<TaskUsage> for rusage {
         let mut usage: rusage = unsafe { core::mem::zeroed() };
         usage.ru_utime = __kernel_old_timeval::from_time_value(value.utime());
         usage.ru_stime = __kernel_old_timeval::from_time_value(value.stime());
+        usage.ru_maxrss = value.maxrss_kb as _;
         usage
     }
 }
 
 impl From<TaskUsage> for ProcessUsage {
     fn from(value: TaskUsage) -> Self {
-        Self::new(value.utime_ns, value.stime_ns)
+        Self::with_maxrss(value.utime_ns, value.stime_ns, value.maxrss_kb)
     }
 }
 
 impl From<ProcessUsage> for TaskUsage {
     fn from(value: ProcessUsage) -> Self {
-        Self::new(value.utime_ns, value.stime_ns)
+        Self::with_maxrss(value.utime_ns, value.stime_ns, value.maxrss_kb)
     }
 }
 
@@ -106,6 +127,7 @@ impl From<ProcessUsage> for TaskUsage {
 pub struct AtomicTaskUsage {
     utime_ns: AtomicU64,
     stime_ns: AtomicU64,
+    maxrss_kb: AtomicU64,
 }
 
 impl AtomicTaskUsage {
@@ -114,6 +136,7 @@ impl AtomicTaskUsage {
         Self {
             utime_ns: AtomicU64::new(0),
             stime_ns: AtomicU64::new(0),
+            maxrss_kb: AtomicU64::new(0),
         }
     }
 
@@ -121,12 +144,14 @@ impl AtomicTaskUsage {
     pub fn add(&self, usage: TaskUsage) {
         self.utime_ns.fetch_add(usage.utime_ns, Ordering::AcqRel);
         self.stime_ns.fetch_add(usage.stime_ns, Ordering::AcqRel);
+        self.update_maxrss(usage.maxrss_kb);
     }
 
     /// Replaces the accumulated totals with the provided snapshot.
     pub fn store(&self, usage: TaskUsage) {
         self.utime_ns.store(usage.utime_ns, Ordering::Release);
         self.stime_ns.store(usage.stime_ns, Ordering::Release);
+        self.update_maxrss(usage.maxrss_kb);
     }
 
     /// Returns a snapshot of the accumulated usage.
@@ -134,6 +159,22 @@ impl AtomicTaskUsage {
         TaskUsage {
             utime_ns: self.utime_ns.load(Ordering::Acquire),
             stime_ns: self.stime_ns.load(Ordering::Acquire),
+            maxrss_kb: self.maxrss_kb.load(Ordering::Acquire),
+        }
+    }
+
+    fn update_maxrss(&self, maxrss_kb: u64) {
+        let mut current = self.maxrss_kb.load(Ordering::Acquire);
+        while maxrss_kb > current {
+            match self.maxrss_kb.compare_exchange_weak(
+                current,
+                maxrss_kb,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
         }
     }
 }

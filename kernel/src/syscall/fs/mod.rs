@@ -1,5 +1,7 @@
+mod aio;
 mod ctl;
 mod event;
+mod fanotify;
 mod fd_ops;
 mod inotify;
 mod io;
@@ -8,6 +10,7 @@ mod memfd;
 mod mount;
 mod pidfd;
 mod pipe;
+mod quota;
 mod signalfd;
 mod stat;
 mod timerfd;
@@ -15,6 +18,7 @@ mod userfaultfd;
 mod xattr;
 
 pub use self::{
-    ctl::*, event::*, fd_ops::*, inotify::*, io::*, io_uring::*, memfd::*, mount::*, pidfd::*,
-    pipe::*, signalfd::*, stat::*, timerfd::*, userfaultfd::*, xattr::*,
+    aio::*, ctl::*, event::*, fanotify::*, fd_ops::*, inotify::*, io::*, io_uring::*, memfd::*,
+    mount::*, pidfd::*, pipe::*, quota::*, signalfd::*, stat::*, timerfd::*, userfaultfd::*,
+    xattr::*,
 };

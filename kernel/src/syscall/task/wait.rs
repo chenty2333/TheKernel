@@ -1,4 +1,4 @@
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 use core::{future::poll_fn, task::Poll};
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -6,13 +6,19 @@ use axtask::{current, future::block_on};
 use bitflags::bitflags;
 use linux_raw_sys::general::{
     __WALL, __WCLONE, __WNOTHREAD, CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED,
-    P_ALL, P_PGID, P_PID, SIGCHLD, SIGCONT, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WUNTRACED,
-    rusage, siginfo,
+    CLD_TRAPPED, P_ALL, P_PGID, P_PID, P_PIDFD, SIGCHLD, SIGCONT, WCONTINUED, WEXITED, WNOHANG,
+    WNOWAIT, WUNTRACED, rusage, siginfo,
 };
 use starry_process::{Pid, Process, ZombieSnapshot};
 use starry_vm::{VmMutPtr, VmPtr};
 
-use crate::task::{AsThread, ProcessData, TaskUsage, get_process_data, has_pending_syscall_signal};
+use crate::{
+    file::{FileHandle, FileLike, PidFd},
+    task::{
+        AsThread, ProcessData, StopReport, TaskUsage, get_process_data, has_pending_syscall_signal,
+        processes,
+    },
+};
 
 const WAITPID_ALLOWED_BITS: u32 =
     WNOHANG | WUNTRACED | WCONTINUED | __WNOTHREAD | __WALL | __WCLONE;
@@ -66,10 +72,16 @@ impl WaitPid {
 }
 
 #[derive(Clone)]
+struct WaitCandidate {
+    process: Arc<Process>,
+    allow_exit: bool,
+}
+
+#[derive(Clone)]
 enum WaitEvent {
     Stopped {
         pid: Pid,
-        stop_signal: u8,
+        stop: StopReport,
         proc_data: Arc<ProcessData>,
     },
     Continued {
@@ -92,7 +104,7 @@ impl WaitEvent {
 
     fn waitpid_status(&self) -> i32 {
         match self {
-            WaitEvent::Stopped { stop_signal, .. } => ((*stop_signal as i32) << 8) | 0x7f,
+            WaitEvent::Stopped { stop, .. } => ((stop.signal as i32) << 8) | 0x7f,
             WaitEvent::Continued { .. } => 0xffff,
             WaitEvent::Exited { snapshot, .. } => snapshot.wait_status,
         }
@@ -100,9 +112,16 @@ impl WaitEvent {
 
     fn waitid_siginfo(&self) -> siginfo {
         match self {
-            WaitEvent::Stopped {
-                pid, stop_signal, ..
-            } => fill_siginfo(*pid, 0, CLD_STOPPED, *stop_signal as i32),
+            WaitEvent::Stopped { pid, stop, .. } => fill_siginfo(
+                *pid,
+                0,
+                if stop.traced {
+                    CLD_TRAPPED
+                } else {
+                    CLD_STOPPED
+                },
+                stop.signal as i32,
+            ),
             WaitEvent::Continued { pid, .. } => {
                 fill_siginfo(*pid, 0, CLD_CONTINUED, SIGCONT as i32)
             }
@@ -149,50 +168,102 @@ fn should_wait_for_child(child: &Process, options: &WaitOptions) -> bool {
     }
 }
 
-fn matching_children(
+fn matching_wait_candidates(
     proc: &Process,
     pid: WaitPid,
     options: &WaitOptions,
-) -> AxResult<Vec<Arc<Process>>> {
-    let children = proc
+) -> AxResult<Vec<WaitCandidate>> {
+    let mut candidates = proc
         .children()
         .into_iter()
         .filter(|child| pid.apply(child) && should_wait_for_child(child, options))
+        .map(|process| WaitCandidate {
+            process,
+            allow_exit: true,
+        })
         .collect::<Vec<_>>();
 
-    if children.is_empty() {
+    let tracer = proc.pid();
+    for proc_data in processes() {
+        let tracee = &proc_data.proc;
+        if proc_data.ptrace_tracer() != Some(tracer) || !pid.apply(tracee) {
+            continue;
+        }
+        if candidates
+            .iter()
+            .any(|candidate| candidate.process.pid() == tracee.pid())
+        {
+            continue;
+        }
+        candidates.push(WaitCandidate {
+            process: tracee.clone(),
+            allow_exit: false,
+        });
+    }
+
+    if candidates.is_empty() {
         Err(AxError::from(LinuxError::ECHILD))
     } else {
-        Ok(children)
+        Ok(candidates)
     }
 }
 
+fn waitid_pidfd(fd: i32) -> AxResult<FileHandle<PidFd>> {
+    PidFd::from_fd(fd).map_err(|err| {
+        if err == AxError::InvalidInput {
+            AxError::BadFileDescriptor
+        } else {
+            err
+        }
+    })
+}
+
+fn pidfd_wait_candidate(
+    proc: &Process,
+    pidfd: &PidFd,
+    options: &WaitOptions,
+) -> AxResult<WaitCandidate> {
+    let target = pidfd.process()?;
+
+    if target
+        .parent()
+        .is_none_or(|parent| parent.pid() != proc.pid())
+        || !should_wait_for_child(&target, options)
+    {
+        return Err(AxError::from(LinuxError::ECHILD));
+    }
+
+    Ok(WaitCandidate {
+        process: target,
+        allow_exit: true,
+    })
+}
+
 fn select_wait_event(
-    children: &[Arc<Process>],
+    candidates: &[WaitCandidate],
     options: &WaitOptions,
     wait_exited: bool,
 ) -> Option<WaitEvent> {
-    if options.contains(WaitOptions::WUNTRACED) {
-        for child in children {
-            if let Ok(proc_data) = get_process_data(child.pid())
-                && let Some(stop_signal) = proc_data.peek_stop_status()
-            {
-                return Some(WaitEvent::Stopped {
-                    pid: child.pid(),
-                    stop_signal,
-                    proc_data,
-                });
-            }
+    for candidate in candidates {
+        if let Ok(proc_data) = get_process_data(candidate.process.pid())
+            && let Some(stop) = proc_data.peek_stop_status()
+            && (stop.traced || options.contains(WaitOptions::WUNTRACED))
+        {
+            return Some(WaitEvent::Stopped {
+                pid: candidate.process.pid(),
+                stop,
+                proc_data,
+            });
         }
     }
 
     if options.contains(WaitOptions::WCONTINUED) {
-        for child in children {
-            if let Ok(proc_data) = get_process_data(child.pid())
+        for candidate in candidates {
+            if let Ok(proc_data) = get_process_data(candidate.process.pid())
                 && proc_data.peek_continued()
             {
                 return Some(WaitEvent::Continued {
-                    pid: child.pid(),
+                    pid: candidate.process.pid(),
                     proc_data,
                 });
             }
@@ -200,7 +271,11 @@ fn select_wait_event(
     }
 
     if wait_exited {
-        for child in children {
+        for candidate in candidates {
+            if !candidate.allow_exit {
+                continue;
+            }
+            let child = &candidate.process;
             if child.is_zombie()
                 && let Some(snapshot) = child.zombie_snapshot()
             {
@@ -250,10 +325,8 @@ fn write_waitid_event(
 fn restore_wait_event(event: &WaitEvent) {
     match event {
         WaitEvent::Stopped {
-            stop_signal,
-            proc_data,
-            ..
-        } => proc_data.restore_stop_status(*stop_signal),
+            stop, proc_data, ..
+        } => proc_data.restore_stop_status(*stop),
         WaitEvent::Continued { proc_data, .. } => proc_data.restore_continued(),
         WaitEvent::Exited { .. } => {}
     }
@@ -287,23 +360,21 @@ pub fn sys_waitpid(
 
     let check_children = || {
         let _wait_guard = proc_data.wait_lock.lock();
-        let children = match matching_children(proc, pid, &options) {
-            Ok(children) => children,
+        let candidates = match matching_wait_candidates(proc, pid, &options) {
+            Ok(candidates) => candidates,
             Err(err) => return Err(err),
         };
 
-        if let Some(event) = select_wait_event(&children, &options, true) {
+        if let Some(event) = select_wait_event(&candidates, &options, true) {
             let claimed_event = match &event {
                 WaitEvent::Stopped {
-                    stop_signal,
-                    proc_data,
-                    ..
+                    stop, proc_data, ..
                 } => {
-                    let Some(claimed_signal) = proc_data.claim_stop_status() else {
+                    let Some(claimed_stop) = proc_data.claim_stop_status() else {
                         return Ok(None);
                     };
-                    if claimed_signal != *stop_signal {
-                        proc_data.restore_stop_status(claimed_signal);
+                    if claimed_stop != *stop {
+                        proc_data.restore_stop_status(claimed_stop);
                         return Ok(None);
                     }
                     Some(event.clone())
@@ -422,40 +493,70 @@ pub fn sys_waitid(
     let proc = &proc_data.proc;
     let nowait = options.contains(WaitOptions::WNOWAIT);
 
+    let explicit_nohang = options.contains(WaitOptions::WNOHANG);
+    let mut wait_options = options;
+    let mut pidfd_nonblocking = false;
+    let mut pidfd_candidate = None;
     let pid = match idtype {
-        P_ALL => WaitPid::Any,
-        P_PID => WaitPid::Pid(id as _),
+        P_ALL => Some(WaitPid::Any),
+        P_PID => {
+            let pid = id as i32;
+            if pid <= 0 {
+                return Err(AxError::InvalidInput);
+            }
+            Some(WaitPid::Pid(pid as _))
+        }
         P_PGID => {
-            if id == 0 {
+            let pgid = id as i32;
+            if pgid < 0 {
+                return Err(AxError::InvalidInput);
+            }
+            Some(if pgid == 0 {
                 WaitPid::Pgid(proc.group().pgid())
             } else {
-                WaitPid::Pgid(id as _)
+                WaitPid::Pgid(pgid as _)
+            })
+        }
+        P_PIDFD => {
+            if id > i32::MAX as u32 {
+                return Err(AxError::InvalidInput);
             }
+            let pidfd = waitid_pidfd(id as i32)?;
+            pidfd_nonblocking = pidfd.nonblocking();
+            if pidfd_nonblocking {
+                wait_options.insert(WaitOptions::WNOHANG);
+            }
+            pidfd_candidate = Some(pidfd_wait_candidate(proc, &pidfd, &wait_options)?);
+            None
         }
         _ => return Err(AxError::InvalidInput),
     };
 
     let check_children = || -> AxResult<Option<isize>> {
         let _wait_guard = proc_data.wait_lock.lock();
-        let children = matching_children(proc, pid, &options)?;
+        let candidates = if let Some(pid) = pid {
+            matching_wait_candidates(proc, pid, &wait_options)?
+        } else {
+            vec![pidfd_candidate.clone().ok_or(AxError::InvalidInput)?]
+        };
 
-        if let Some(event) =
-            select_wait_event(&children, &options, options.contains(WaitOptions::WEXITED))
-        {
+        if let Some(event) = select_wait_event(
+            &candidates,
+            &wait_options,
+            wait_options.contains(WaitOptions::WEXITED),
+        ) {
             let claimed_event = if nowait {
                 None
             } else {
                 match &event {
                     WaitEvent::Stopped {
-                        stop_signal,
-                        proc_data,
-                        ..
+                        stop, proc_data, ..
                     } => {
-                        let Some(claimed_signal) = proc_data.claim_stop_status() else {
+                        let Some(claimed_stop) = proc_data.claim_stop_status() else {
                             return Ok(None);
                         };
-                        if claimed_signal != *stop_signal {
-                            proc_data.restore_stop_status(claimed_signal);
+                        if claimed_stop != *stop {
+                            proc_data.restore_stop_status(claimed_stop);
                             return Ok(None);
                         }
                         Some(event.clone())
@@ -490,7 +591,10 @@ pub fn sys_waitid(
             return Ok(Some(0));
         }
 
-        if options.contains(WaitOptions::WNOHANG) {
+        if wait_options.contains(WaitOptions::WNOHANG) {
+            if pidfd_nonblocking && !explicit_nohang {
+                return Err(AxError::from(LinuxError::EAGAIN));
+            }
             if let Some(infop) = infop.nullable() {
                 infop.vm_write(unsafe { core::mem::zeroed::<siginfo>() })?;
             }

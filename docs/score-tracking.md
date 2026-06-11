@@ -53,11 +53,12 @@ Summary:
 Use the harvest document for 2026-06-08 post-promotion frontier context; use the
 baseline document for the pre-harvest full replay blockers.
 
-Live repo note on 2026-06-10: `ltp_test.txt` contains 1122 non-comment entries
-with no duplicate lines or duplicate markers. The cached
-`.state/ltp-lab/inventory.json` still reports 1099 entries from
-`2026-06-08T05:50:37`, so refresh inventory before claiming all-four resolution
-or unopened frontier counts for the live list.
+Checkout note from the 2026-06-10 framework cleanup: `ltp_test.txt` contained
+1192 non-comment entries with no duplicate lines or duplicate markers. The
+cached `.state/ltp-lab/inventory.json` reported 1169 entries from
+`2026-06-10T18:50:16`, so refresh inventory before claiming all-four resolution
+or unopened frontier counts for the live list. This is a list-size fact, not
+pass evidence.
 
 ## Protected Groups
 
@@ -106,8 +107,8 @@ Known payload layers:
   of `docs/baseline-2026-06-08.md`
 - after `docs/ltp-harvest-2026-06-08.md`: list was 1099 entries and the
   unopened frontier is 2724 unique available lines
-- live repo check on 2026-06-10: `ltp_test.txt` has 1122 entries, but all-four
-  resolution has not been refreshed in inventory
+- 2026-06-10 framework cleanup check: `ltp_test.txt` has 1192 entries, but
+  all-four resolution has not been refreshed in inventory
 
 Recompute these from official images and support-disk plumbing when the images,
 runner, or `ltp_test.txt` change.

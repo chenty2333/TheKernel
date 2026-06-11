@@ -1,14 +1,19 @@
 use axerrno::{AxError, AxResult, LinuxError};
-use axnet::options::{Configurable, GetSocketOption, SetSocketOption};
+use axnet::{
+    Socket as SocketInner,
+    options::{Configurable, GetSocketOption, SetSocketOption},
+};
 use linux_raw_sys::net::{
-    AF_INET, IPV6_ADDRFORM, SO_ATTACH_BPF, SO_DETACH_BPF, SO_OOBINLINE, SO_SNDBUFFORCE, SOL_IPV6,
-    SOL_SOCKET, socklen_t,
+    AF_INET, IPV6_ADDRFORM, SO_ATTACH_BPF, SO_DETACH_BPF, SO_NO_CHECK, SO_OOBINLINE,
+    SO_SNDBUFFORCE, SOL_IPV6, SOL_SOCKET, TCP_ULP, socklen_t,
 };
 
 use crate::{
     file::{
-        AfAlgSocket, FileLike, PacketSocket, Socket, af_alg,
-        packet::{PACKET_RX_RING, PACKET_VERSION, SOL_PACKET, TpacketReq3},
+        AfAlgSocket, FileLike, PacketSocket, Socket, af_alg, get_file_like,
+        packet::{
+            PACKET_RESERVE, PACKET_RX_RING, PACKET_VERSION, SOL_PACKET, TpacketReq, TpacketReq3,
+        },
     },
     mm::{UserConstPtr, UserPtr},
 };
@@ -18,6 +23,14 @@ const PROTO_TCP: u32 = linux_raw_sys::net::IPPROTO_TCP as u32;
 const PROTO_IP: u32 = linux_raw_sys::net::IPPROTO_IP as u32;
 const MCAST_JOIN_GROUP: u32 = 42;
 const MCAST_LEAVE_GROUP: u32 = 45;
+
+fn socket_fd_error(fd: i32, err: AxError) -> AxError {
+    if err != AxError::BadFileDescriptor || get_file_like(fd).is_err() {
+        err
+    } else {
+        AxError::NotASocket
+    }
+}
 
 mod conv {
     use axerrno::{AxError, AxResult};
@@ -149,7 +162,24 @@ pub fn sys_getsockopt(
         val.cast().get_as_mut()
     }
 
-    let socket = Socket::from_fd(fd)?;
+    if let Ok(socket) = PacketSocket::from_fd(fd) {
+        if level != SOL_PACKET {
+            return Err(AxError::from(LinuxError::ENOPROTOOPT));
+        }
+
+        match optname {
+            PACKET_VERSION => {
+                *get::<i32>(optval, optlen)? = socket.packet_version();
+            }
+            PACKET_RESERVE => {
+                *get::<u32>(optval, optlen)? = socket.packet_reserve();
+            }
+            _ => return Err(AxError::from(LinuxError::ENOPROTOOPT)),
+        }
+        return Ok(0);
+    }
+
+    let socket = Socket::from_fd(fd).map_err(|err| socket_fd_error(fd, err))?;
     if level == SOL_SOCKET && optname == SO_OOBINLINE {
         *get::<i32>(optval, optlen)? = 0;
         return Ok(0);
@@ -218,16 +248,31 @@ pub fn sys_setsockopt(
                 socket.set_packet_version(version)?;
             }
             PACKET_RX_RING => {
-                let req = *get::<TpacketReq3>(optval, optlen)?;
+                let req = if socket.packet_version() == 2 {
+                    *get::<TpacketReq3>(optval, optlen)?
+                } else {
+                    if (optlen as usize) < size_of::<TpacketReq>() {
+                        return Err(AxError::InvalidInput);
+                    }
+                    TpacketReq3::from(*optval.cast::<TpacketReq>().get_as_ref()?)
+                };
                 socket.set_rx_ring(req)?;
+            }
+            PACKET_RESERVE => {
+                let reserve = *get::<u32>(optval, optlen)?;
+                socket.set_packet_reserve(reserve)?;
             }
             _ => return Err(AxError::from(LinuxError::ENOPROTOOPT)),
         }
         return Ok(0);
     }
 
-    let socket = Socket::from_fd(fd)?;
+    let socket = Socket::from_fd(fd).map_err(|err| socket_fd_error(fd, err))?;
     if level == SOL_SOCKET && optname == SO_OOBINLINE {
+        let _ = get::<i32>(optval, optlen)?;
+        return Ok(0);
+    }
+    if level == SOL_SOCKET && optname == SO_NO_CHECK {
         let _ = get::<i32>(optval, optlen)?;
         return Ok(0);
     }
@@ -244,6 +289,19 @@ pub fn sys_setsockopt(
             MCAST_LEAVE_GROUP => return Err(AxError::from(LinuxError::EADDRNOTAVAIL)),
             _ => {}
         }
+    }
+    if level == PROTO_TCP && optname == TCP_ULP {
+        let SocketInner::Tcp(_) = &socket.0 else {
+            return Err(AxError::from(LinuxError::ENOPROTOOPT));
+        };
+        if optlen == 0 {
+            return Err(AxError::InvalidInput);
+        }
+        let name = optval.get_as_slice(optlen as usize)?;
+        if name.starts_with(b"tls") {
+            return Err(AxError::from(LinuxError::ENOENT));
+        }
+        return Err(AxError::from(LinuxError::ENOENT));
     }
     if level == SOL_SOCKET {
         match optname {

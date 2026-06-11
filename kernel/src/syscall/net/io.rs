@@ -19,7 +19,10 @@ use starry_vm::{vm_read_slice, vm_write_slice};
 use super::addr::SocketAddrExt;
 use crate::{
     file::{AfAlgSocket, FileLike, Socket, add_file_description},
-    mm::{IoVec, IoVectorBuf, UserConstPtr, UserPtr, VmBytes, VmBytesMut},
+    mm::{
+        IoVec, IoVectorBuf, UserConstPtr, UserPtr, VmBytes, VmBytesMut, check_user_readable,
+        check_user_writable,
+    },
     syscall::net::{CMsg, CMsgBuilder},
 };
 
@@ -66,6 +69,13 @@ fn validate_recvmsg_flags(flags: u32) -> AxResult<RecvFlags> {
     Ok(recv_flags)
 }
 
+fn validate_sendmsg_flags(flags: u32) -> AxResult {
+    if flags & MSG_OOB != 0 {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    Ok(())
+}
+
 fn send_impl(
     fd: i32,
     mut src: impl Read + IoBuf,
@@ -83,6 +93,7 @@ fn send_impl(
     debug!("sys_send <= fd: {fd}, flags: {flags}, addr: {addr:?}");
 
     let socket = Socket::from_fd(fd)?;
+    validate_sendmsg_flags(flags)?;
     let sent = socket.send(
         &mut src,
         SendOptions {
@@ -103,6 +114,9 @@ pub fn sys_sendto(
     addr: UserConstPtr<sockaddr>,
     addrlen: socklen_t,
 ) -> AxResult<isize> {
+    if len != 0 {
+        check_user_readable(buf as usize, len)?;
+    }
     send_impl(fd, VmBytes::new(buf, len), flags, addr, addrlen, Vec::new())
 }
 
@@ -126,9 +140,12 @@ pub fn sys_sendmsg(fd: i32, msg: UserConstPtr<msghdr>, flags: u32) -> AxResult<i
             ptr += hdr.cmsg_len;
         }
     }
+    let send_iov = IoVectorBuf::new(msg.msg_iov.cast::<IoVec>(), msg.msg_iovlen)?;
+    send_iov.check_readable()?;
+
     send_impl(
         fd,
-        IoVectorBuf::new(msg.msg_iov.cast::<IoVec>(), msg.msg_iovlen)?.into_io(),
+        send_iov.into_io(),
         flags,
         UserConstPtr::from(msg.msg_name as usize),
         msg.msg_namelen as socklen_t,
@@ -201,6 +218,9 @@ pub fn sys_recvfrom(
     addr: UserPtr<sockaddr>,
     addrlen: UserPtr<socklen_t>,
 ) -> AxResult<isize> {
+    if len != 0 {
+        check_user_writable(buf as usize, len)?;
+    }
     let recv_flags = validate_recvmsg_flags(flags)?;
     let addrlen_ptr = addrlen;
     let mut user_addrlen = if addr.is_null() {
@@ -235,10 +255,13 @@ pub fn sys_recvmsg(fd: i32, msg: UserPtr<msghdr>, flags: u32) -> AxResult<isize>
         return Err(AxError::from(LinuxError::EMSGSIZE));
     }
 
+    let recv_iov = IoVectorBuf::new(msg_hdr.msg_iov.cast::<IoVec>(), msg_hdr.msg_iovlen)?;
+    recv_iov.check_writable()?;
+
     let mut name_len = msg_hdr.msg_namelen as socklen_t;
     let recv = recv_impl(
         fd,
-        IoVectorBuf::new(msg_hdr.msg_iov.cast::<IoVec>(), msg_hdr.msg_iovlen)?.into_io(),
+        recv_iov.into_io(),
         recv_flags,
         UserPtr::from(msg_hdr.msg_name as usize),
         (!msg_hdr.msg_name.is_null()).then_some(&mut name_len),

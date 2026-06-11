@@ -31,7 +31,7 @@ OSCOMP_TESTSUITE_HOST_DIR=/abs/path/to/kernel-image make dev-shell
 Run a command directly inside the dev container:
 
 ```bash
-make dev-shell DEV_CMD="./scripts/oscomp.sh lab audit"
+make dev-shell DEV_CMD="./scripts/lab audit"
 ```
 
 `make dev-shell-root` starts the privileged `builder` compose service for cases
@@ -50,14 +50,14 @@ Evaluator-facing artifacts are:
 Main commands:
 
 ```bash
-make all
-make artifacts
-make kernels
-make kernel-rv
-make kernel-la
-make disk.img
-make disk-la.img
+make dev-shell DEV_CMD='make all'
+make dev-shell DEV_CMD='make artifacts'
+make dev-shell DEV_CMD='make kernels'
 ```
+
+Inside an already-open `make dev-shell`, run `make all`, `make artifacts`,
+`make kernels`, `make kernel-rv`, `make kernel-la`, `make disk.img`, or
+`make disk-la.img` directly.
 
 Command intent:
 
@@ -98,7 +98,7 @@ image instead of warning and keeping the stale one.
 Main replay entrypoints:
 
 - `./scripts/oscomp.sh list`
-- `./scripts/oscomp.sh lab ...`
+- `./scripts/lab ...`
 - `./scripts/oscomp.sh run --arch rv`
 - `./scripts/oscomp.sh run --arch la`
 - `./scripts/oscomp.sh verify --arch rv`
@@ -155,9 +155,25 @@ At boot, [`src/init.sh`](/home/dia/TheKernel/src/init.sh) mounts the support dis
 
 The local framework supports focused replay instead of only full-matrix runs.
 Use [`docs/ltp-lab.md`](./ltp-lab.md) for the current LTP experiment workflow.
-For LTP expansion work, prefer `lab campaign ...` over ad hoc list/run commands:
-campaigns keep fixed 50-150 case batches, semantic prompts, run evidence,
-promotion outputs, and self-cleaning records under `.state/ltp-lab/campaigns`.
+For LTP expansion work, prefer the short campaign targets:
+
+```bash
+make lab-new NAME=goal3-fs-vfs-0001 SUITE="fs syscalls"
+make lab-run NAME=goal3-fs-vfs-0001
+make lab-review NAME=goal3-fs-vfs-0001
+make lab-apply NAME=goal3-fs-vfs-0001
+make lab-done NAME=goal3-fs-vfs-0001
+```
+
+Campaigns keep fixed 50-150 case batches, semantic prompts, implementation
+notes, deferred validation state, run evidence, promotion outputs, and
+self-cleaning records under `.state/ltp-lab/campaigns`. For code-first goals,
+use the campaign as a case ledger and semantic work queue before running replay.
+
+For broad code-first work outside one campaign, use `docs/deferred-validation-*.md`
+as a simple pending-validation list. Keep only syscall/surface names, short
+caveats, and replay batches there; do not use it as pass evidence. Do not add
+cheap-check sections or format/build-check logs.
 
 Support-disk build options:
 
@@ -170,41 +186,27 @@ Top-level support-disk build also accepts:
 OSCOMP_PLAN_OVERRIDE=/abs/path/plan.txt make disk.img
 ```
 
-This allows:
-
-- focused LTP subsets
-- custom evaluation plans
-- targeted regression checks without editing the default guest runner
-
-The preferred high-level entrypoint is:
-
-```bash
-./scripts/oscomp.sh lab ...
-```
-
-It generates focused `ltp_test.txt` files, generates plan overrides, builds a
-matching support disk, replays QEMU, parses logs, and stores results under
-`.state/ltp-lab`.
+This allows focused LTP subsets, custom evaluation plans, and targeted
+regression checks without editing the default guest runner.
 
 ## Cleanup
 
-Use the short cleanup targets by intent:
+Use the short cleanup targets by intent. `docs/ltp-lab.md` has the detailed
+cleanup flag reference.
 
-- `make lab-trim`: daily cleanup for disposable state after campaign evidence has
-  been analyzed or finished. It removes failed or empty lab runs, per-run support
-  images and QEMU workdirs, baseline replay image copies, smoke leftovers, and
-  stale root score artifacts. It keeps campaigns, cached official images, and
+- `make lab-trim`: daily disposable-state cleanup after campaign evidence has
+  been analyzed or finished. It keeps campaigns, cached official images, and
   reference checkouts.
-- `make lab-clean`: stronger cleanup for generated lab run/list/plan state and
-  stale root score artifacts.
+- `make lab-clean`: stronger generated run/list/plan cleanup. It also keeps
+  cached official images and reference checkouts.
 - `make clean-eval`: evaluator-artifact cleanup before a clean local build.
 - `make clean`: full local cleanup, including `.state`.
 
-Preview cleanup before removing large state:
+Preview before removing generated state:
 
 ```bash
-./scripts/oscomp.sh lab clean --trim --dry-run
-./scripts/oscomp.sh lab audit
+./scripts/lab clean trim --dry-run
+./scripts/lab audit
 ```
 
 ## Output And Debugging

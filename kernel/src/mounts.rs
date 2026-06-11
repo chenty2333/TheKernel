@@ -10,7 +10,9 @@ pub struct MountRecord {
     pub source: String,
     pub target: String,
     pub fs_type: String,
+    pub dev: u64,
     pub flags: u32,
+    pub expire_marked: bool,
 }
 
 static MOUNT_RECORDS: Mutex<Vec<MountRecord>> = Mutex::new(Vec::new());
@@ -34,14 +36,16 @@ pub fn snapshot() -> Vec<MountRecord> {
     MOUNT_RECORDS.lock().clone()
 }
 
-pub fn record(source: String, target: String, fs_type: String, flags: u32) {
+pub fn record(source: String, target: String, fs_type: String, dev: u64, flags: u32) {
     let mut records = MOUNT_RECORDS.lock();
     records.retain(|record| record.target != target);
     records.push(MountRecord {
         source,
         target,
         fs_type,
+        dev,
         flags,
+        expire_marked: false,
     });
 }
 
@@ -55,20 +59,43 @@ pub fn remount(source: String, target: String, fs_type: String, flags: u32) {
             record.fs_type = fs_type;
         }
         record.flags = flags;
+        record.expire_marked = false;
         return;
     }
     records.push(MountRecord {
         source,
         target,
         fs_type,
+        dev: 0,
         flags,
+        expire_marked: false,
     });
 }
 
-pub fn remove(target: &str) {
-    MOUNT_RECORDS
-        .lock()
-        .retain(|record| record.target != target);
+pub fn remove(target: &str) -> Option<MountRecord> {
+    let mut records = MOUNT_RECORDS.lock();
+    records
+        .iter()
+        .position(|record| record.target == target)
+        .map(|index| records.remove(index))
+}
+
+pub fn mark_expiry(target: &str) -> bool {
+    let mut records = MOUNT_RECORDS.lock();
+    let Some(record) = records.iter_mut().find(|record| record.target == target) else {
+        return false;
+    };
+    let was_marked = record.expire_marked;
+    record.expire_marked = true;
+    was_marked
+}
+
+pub fn clear_expiry_for_path(path: &str) {
+    for record in MOUNT_RECORDS.lock().iter_mut() {
+        if contains_path(&record.target, path) {
+            record.expire_marked = false;
+        }
+    }
 }
 
 fn contains_path(record_target: &str, path: &str) -> bool {

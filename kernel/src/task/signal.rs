@@ -16,6 +16,35 @@ use super::{
     get_process_data, get_process_group, get_task, get_visible_task,
 };
 
+fn notify_tracer_or_parent_stop_continue(proc_data: &ProcessData) {
+    let notify_pid = proc_data
+        .ptrace_tracer()
+        .or_else(|| proc_data.proc.parent().map(|parent| parent.pid()));
+    if let Some(pid) = notify_pid {
+        let _ = send_signal_to_process(pid, Some(SignalInfo::new_kernel(Signo::SIGCHLD)));
+        if let Ok(waiter) = get_process_data(pid) {
+            waiter.child_exit_event.wake();
+        }
+    }
+}
+
+fn ptrace_signal_stop(proc_data: &ProcessData, signo: Signo) -> bool {
+    if matches!(signo, Signo::SIGKILL | Signo::SIGCONT) || proc_data.ptrace_tracer().is_none() {
+        return false;
+    }
+    if !proc_data.ptrace_stop(signo as u8) {
+        return true;
+    }
+    info!(
+        "Stopping traced process {} by signal {}",
+        proc_data.proc.pid(),
+        signo as u8
+    );
+    notify_tracer_or_parent_stop_continue(proc_data);
+    interrupt_stop_siblings(proc_data);
+    true
+}
+
 pub fn check_signals(
     thr: &Thread,
     uctx: &mut UserContext,
@@ -128,6 +157,10 @@ pub(super) fn send_signal_thread_inner(task: &TaskInner, thr: &Thread, sig: Sign
     if sig.signo() == Signo::SIGCONT {
         do_continue(&thr.proc_data);
     }
+    if ptrace_signal_stop(&thr.proc_data, sig.signo()) {
+        task.interrupt();
+        return;
+    }
     if thr.signal.send_signal(sig) {
         task.interrupt();
     }
@@ -182,6 +215,14 @@ pub fn send_signal_to_process(pid: Pid, sig: Option<SignalInfo>) -> AxResult<()>
         }
 
         info!("Send signal {signo:?} to process {pid}");
+        if ptrace_signal_stop(&proc_data, signo) {
+            for tid in proc_data.proc.threads() {
+                if let Ok(task) = get_task(tid) {
+                    task.interrupt();
+                }
+            }
+            return Ok(());
+        }
         if proc_data.signal.send_signal(sig).is_some() {
             for tid in proc_data.proc.threads() {
                 let Ok(task) = get_task(tid) else {
@@ -252,7 +293,7 @@ fn do_stop(thr: &Thread, uctx: &mut UserContext, signo: u8) {
     );
 
     if proc_data.finish_stop() {
-        notify_parent_stop_continue(proc_data);
+        notify_tracer_or_parent_stop_continue(proc_data);
         interrupt_stop_siblings(proc_data);
     }
 
@@ -272,7 +313,7 @@ fn do_continue(proc_data: &ProcessData) {
         }
         ContinueResult::ResumedStopped => {
             info!("Continuing process {}", proc_data.proc.pid());
-            notify_parent_stop_continue(proc_data);
+            notify_tracer_or_parent_stop_continue(proc_data);
         }
     }
 }
@@ -340,13 +381,6 @@ fn handle_stopped_interrupt(thr: &Thread, uctx: &mut UserContext) {
     while check_signals(thr, uctx, None) {}
 }
 
-/// Sends SIGCHLD to the parent and wakes its child_exit_event.
-fn notify_parent_stop_continue(proc_data: &ProcessData) {
-    let process = &proc_data.proc;
-    if let Some(parent) = process.parent() {
-        let _ = send_signal_to_process(parent.pid(), Some(SignalInfo::new_kernel(Signo::SIGCHLD)));
-        if let Ok(parent_data) = get_process_data(parent.pid()) {
-            parent_data.child_exit_event.wake();
-        }
-    }
+pub fn notify_ptrace_attach_stop(proc_data: &ProcessData) {
+    notify_tracer_or_parent_stop_continue(proc_data);
 }

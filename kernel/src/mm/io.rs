@@ -5,7 +5,9 @@ use axio::prelude::*;
 use bytemuck::AnyBitPattern;
 use starry_vm::{VmPtr, vm_read_slice, vm_write_slice};
 
-use super::check_user_readable;
+use super::{check_user_readable, check_user_writable};
+
+const MAX_RW_COUNT: usize = 0x7fff_f000;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, AnyBitPattern)]
@@ -32,9 +34,9 @@ impl IoVectorBuf {
             if iov.iov_len < 0 {
                 return Err(AxError::InvalidInput);
             }
-            len = len
-                .checked_add(iov.iov_len as usize)
-                .ok_or(AxError::InvalidInput)?;
+            if len < MAX_RW_COUNT {
+                len += (iov.iov_len as usize).min(MAX_RW_COUNT - len);
+            }
         }
         Ok(Self { iovs, iovcnt, len })
     }
@@ -54,6 +56,21 @@ impl IoVectorBuf {
                 continue;
             }
             check_user_readable(iov.iov_base as usize, len)?;
+        }
+        Ok(())
+    }
+
+    pub fn check_writable(&self) -> AxResult<()> {
+        for i in 0..self.iovcnt {
+            let iov = self.iovs.wrapping_add(i).vm_read()?;
+            if iov.iov_len < 0 {
+                return Err(AxError::InvalidInput);
+            }
+            let len = iov.iov_len as usize;
+            if len == 0 {
+                continue;
+            }
+            check_user_writable(iov.iov_base as usize, len)?;
         }
         Ok(())
     }

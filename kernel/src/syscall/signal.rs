@@ -30,8 +30,12 @@ pub(crate) fn check_sigset_size(size: usize) -> AxResult<()> {
     Ok(())
 }
 
-fn parse_signo(signo: u32) -> AxResult<Signo> {
+pub(crate) fn parse_signo(signo: u32) -> AxResult<Signo> {
     Signo::from_repr(signo as u8).ok_or(AxError::InvalidInput)
+}
+
+fn current_visible_tid() -> Pid {
+    current().as_thread().tid()
 }
 
 pub fn sys_rt_sigprocmask(
@@ -245,7 +249,7 @@ pub fn sys_tgkill(tgid: i32, tid: i32, signo: u32) -> AxResult<isize> {
 }
 
 pub(crate) fn make_queue_signal_info(
-    target_pid: Pid,
+    target_tid: Pid,
     signo: u32,
     sig: *const SignalInfo,
 ) -> AxResult<Option<SignalInfo>> {
@@ -256,15 +260,16 @@ pub(crate) fn make_queue_signal_info(
     let signo = parse_signo(signo)?;
     let mut sig = unsafe { sig.vm_read_uninit()?.assume_init() };
     sig.set_signo(signo);
-    let target_process_pid = get_visible_task(target_pid)
+    let target_process_pid = get_visible_task(target_tid)
         .ok()
         .and_then(|task| {
             task.try_as_thread()
                 .map(|thread| thread.proc_data.proc.pid())
         })
-        .unwrap_or(target_pid);
-    if current().as_thread().proc_data.proc.pid() != target_process_pid
-        && (sig.code() >= 0 || sig.code() == SI_TKILL)
+        .unwrap_or(target_tid);
+    if (sig.code() >= 0 || sig.code() == SI_TKILL)
+        && current_visible_tid() != target_tid
+        && current().as_thread().proc_data.proc.pid() != target_process_pid
     {
         return Err(AxError::OperationNotPermitted);
     }
@@ -308,7 +313,7 @@ pub fn sys_rt_tgsigqueueinfo(
         ensure_realtime_signal_queue_capacity_for_thread(Some(tgid as Pid), tid as Pid)?;
     }
 
-    let sig = make_queue_signal_info(tgid as Pid, signo, sig)?;
+    let sig = make_queue_signal_info(tid as Pid, signo, sig)?;
     send_signal_to_visible_thread(Some(tgid as Pid), tid as Pid, sig)?;
     Ok(0)
 }
@@ -346,14 +351,17 @@ pub fn sys_rt_sigtimedwait(
     let signal = &thr.signal;
 
     let old_blocked = signal.blocked();
+    signal.set_real_blocked(Some(old_blocked));
     signal.set_blocked(old_blocked & !set);
 
     uctx.set_retval(-LinuxError::EINTR.code() as usize);
     let fut = poll_fn(|cx| {
         if let Some(sig) = signal.dequeue_signal(&set) {
+            signal.set_real_blocked(None);
             signal.set_blocked(old_blocked);
             Poll::Ready(Some(sig))
         } else if check_signals(thr, uctx, Some(old_blocked)) {
+            signal.set_real_blocked(None);
             Poll::Ready(None)
         } else {
             let _ = curr.poll_interrupt(cx);
@@ -363,6 +371,7 @@ pub fn sys_rt_sigtimedwait(
 
     let Ok(sig) = block_on(future::timeout(timeout, fut)) else {
         // Timeout
+        signal.set_real_blocked(None);
         signal.set_blocked(old_blocked);
         return Err(AxError::WouldBlock);
     };

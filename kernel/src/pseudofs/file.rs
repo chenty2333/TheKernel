@@ -78,7 +78,17 @@ pub struct SimpleFile {
 impl SimpleFile {
     /// Creates a simple file from given file operations.
     pub fn new(fs: Arc<SimpleFs>, ty: NodeType, ops: impl SimpleFileOps) -> Arc<Self> {
-        let node = SimpleFsNode::new(fs, ty, NodePermission::default());
+        Self::new_with_permission(fs, ty, NodePermission::default(), ops)
+    }
+
+    /// Creates a simple file from given file operations and permissions.
+    pub fn new_with_permission(
+        fs: Arc<SimpleFs>,
+        ty: NodeType,
+        permission: NodePermission,
+        ops: impl SimpleFileOps,
+    ) -> Arc<Self> {
+        let node = SimpleFsNode::new(fs, ty, permission);
         Arc::new(Self {
             node,
             ops: Arc::new(ops),
@@ -88,6 +98,15 @@ impl SimpleFile {
     /// Creates a simple file from given file operations.
     pub fn new_regular(fs: Arc<SimpleFs>, ops: impl SimpleFileOps) -> Arc<Self> {
         Self::new(fs, NodeType::RegularFile, ops)
+    }
+
+    /// Creates a regular file from given file operations and permissions.
+    pub fn new_regular_with_permission(
+        fs: Arc<SimpleFs>,
+        permission: NodePermission,
+        ops: impl SimpleFileOps,
+    ) -> Arc<Self> {
+        Self::new_with_permission(fs, NodeType::RegularFile, permission, ops)
     }
 }
 

@@ -4,7 +4,8 @@ use core::ffi::c_char;
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::{Location, NodeType, path::Path};
 use axsync::Mutex;
-use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
+use axtask::current;
+use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, CAP_SYS_ADMIN};
 use starry_vm::vm_write_slice;
 
 use super::ctl::validate_pathname;
@@ -12,6 +13,7 @@ use crate::{
     file::{ResolveAtResult, inode_flags, is_path_only_fd, resolve_at},
     mm::{UserConstPtr, vm_load_string},
     pseudofs::tmp,
+    task::AsThread,
 };
 
 const XATTR_CREATE: u32 = 0x1;
@@ -92,14 +94,44 @@ fn check_fd_xattr_access(fd: i32) -> AxResult<()> {
     Ok(())
 }
 
-fn namespace_allows_set(loc: &Location, name: &str) -> AxResult<()> {
+fn current_can_access_trusted_xattrs() -> bool {
+    current()
+        .as_thread()
+        .proc_data
+        .has_effective_capability(CAP_SYS_ADMIN)
+}
+
+fn check_namespace_access(loc: &Location, name: &str, write: bool) -> AxResult<()> {
     let (namespace, _) = name.split_once('.').unwrap();
-    if namespace == "user"
-        && !matches!(loc.node_type(), NodeType::RegularFile | NodeType::Directory)
-    {
-        return Err(LinuxError::EPERM.into());
+
+    match namespace {
+        "trusted" if !current_can_access_trusted_xattrs() => {
+            if write {
+                return Err(LinuxError::EPERM.into());
+            }
+            return Err(LinuxError::ENODATA.into());
+        }
+        "user" if !matches!(loc.node_type(), NodeType::RegularFile | NodeType::Directory) => {
+            if write {
+                return Err(LinuxError::EPERM.into());
+            }
+            return Err(LinuxError::ENODATA.into());
+        }
+        _ => {}
     }
     Ok(())
+}
+
+fn list_name_visible(loc: &Location, name: &str, can_access_trusted: bool) -> bool {
+    if name.starts_with("trusted.") && !can_access_trusted {
+        return false;
+    }
+    if name.starts_with("user.")
+        && !matches!(loc.node_type(), NodeType::RegularFile | NodeType::Directory)
+    {
+        return false;
+    }
+    true
 }
 
 fn set_map_xattr(
@@ -133,9 +165,16 @@ fn get_map_xattr(map: &BTreeMap<String, Vec<u8>>, name: &str) -> AxResult<Vec<u8
         .ok_or_else(|| LinuxError::ENODATA.into())
 }
 
-fn list_map_xattrs(map: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+fn list_map_xattrs(
+    loc: &Location,
+    map: &BTreeMap<String, Vec<u8>>,
+    can_access_trusted: bool,
+) -> Vec<u8> {
     let mut list = Vec::new();
     for name in map.keys() {
+        if !list_name_visible(loc, name, can_access_trusted) {
+            continue;
+        }
         list.extend_from_slice(name.as_bytes());
         list.push(0);
     }
@@ -143,7 +182,7 @@ fn list_map_xattrs(map: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
 }
 
 fn set_location_xattr(loc: &Location, name: &str, value: Vec<u8>, flags: u32) -> AxResult<()> {
-    namespace_allows_set(loc, name)?;
+    check_namespace_access(loc, name, true)?;
     inode_flags::check_xattr_update(loc)?;
 
     if let Some(store) = tmp::xattr_store(loc) {
@@ -164,6 +203,8 @@ fn set_location_xattr(loc: &Location, name: &str, value: Vec<u8>, flags: u32) ->
 }
 
 fn get_location_xattr(loc: &Location, name: &str) -> AxResult<Vec<u8>> {
+    check_namespace_access(loc, name, false)?;
+
     if let Some(store) = tmp::xattr_store(loc) {
         let map = store.lock();
         return get_map_xattr(&map, name);
@@ -181,9 +222,11 @@ fn get_location_xattr(loc: &Location, name: &str) -> AxResult<Vec<u8>> {
 }
 
 fn list_location_xattrs(loc: &Location) -> Vec<u8> {
+    let can_access_trusted = current_can_access_trusted_xattrs();
+
     if let Some(store) = tmp::xattr_store(loc) {
         let map = store.lock();
-        return list_map_xattrs(&map);
+        return list_map_xattrs(loc, &map, can_access_trusted);
     }
 
     let key = XattrKey {
@@ -191,10 +234,13 @@ fn list_location_xattrs(loc: &Location) -> Vec<u8> {
         inode: loc.inode(),
     };
     let stores = GENERIC_XATTRS.lock();
-    stores.get(&key).map_or_else(Vec::new, list_map_xattrs)
+    stores.get(&key).map_or_else(Vec::new, |map| {
+        list_map_xattrs(loc, map, can_access_trusted)
+    })
 }
 
 fn remove_location_xattr(loc: &Location, name: &str) -> AxResult<()> {
+    check_namespace_access(loc, name, true)?;
     inode_flags::check_xattr_update(loc)?;
 
     if let Some(store) = tmp::xattr_store(loc) {

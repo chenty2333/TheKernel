@@ -19,6 +19,19 @@ impl From<u8> for StopState {
     }
 }
 
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(in crate::task) enum StopKind {
+    JobControl = 0,
+    Ptrace     = 1,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct StopReport {
+    pub(crate) signal: u8,
+    pub(crate) traced: bool,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ContinueResult {
     None,
@@ -30,6 +43,7 @@ pub(crate) enum ContinueResult {
 pub(in crate::task) struct JobControlState {
     pub(in crate::task) state: StopState,
     pub(in crate::task) stop_signal: u8,
+    pub(in crate::task) stop_kind: StopKind,
     pub(in crate::task) continued: bool,
     pub(in crate::task) stop_reported: bool,
 }
@@ -39,10 +53,18 @@ impl Default for JobControlState {
         Self {
             state: StopState::Running,
             stop_signal: 0,
+            stop_kind: StopKind::JobControl,
             continued: false,
             stop_reported: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(in crate::task) struct PtraceControlState {
+    pub(in crate::task) tracer: Option<Pid>,
+    pub(in crate::task) options: u32,
+    pub(in crate::task) event_message: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

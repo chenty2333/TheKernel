@@ -8,8 +8,8 @@ use linux_raw_sys::general::{
     __kernel_clockid_t, CAP_SYS_TIME, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC,
     CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
     CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, SIGEV_NONE,
-    SIGEV_SIGNAL, SIGEV_THREAD_ID, TIMER_ABSTIME, itimerspec, itimerval, sigevent, timespec,
-    timeval, timezone,
+    SIGEV_SIGNAL, SIGEV_THREAD, SIGEV_THREAD_ID, TIMER_ABSTIME, itimerspec, itimerval, sigevent,
+    timespec, timeval, timezone,
 };
 use starry_signal::Signo;
 use starry_vm::{VmMutPtr, VmPtr};
@@ -17,7 +17,7 @@ use starry_vm::{VmMutPtr, VmPtr};
 use crate::{
     task::{
         AlarmClock, AsThread, ITimerType, PosixTimer, PosixTimerClock, PosixTimerNotify, TaskUsage,
-        get_task, nanos_to_clock_ticks, register_posix_timer_alarm,
+        get_task, nanos_to_clock_ticks, poll_timer, register_posix_timer_alarm,
     },
     time::{TimeValueLike, set_wall_time, wall_time, wall_time_nanos},
 };
@@ -122,6 +122,30 @@ fn fine_clock_resolution() -> TimeValue {
 }
 
 fn clock_now(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {
+    match clock_id as u32 {
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => {
+            let now = match clock_id as u32 {
+                CLOCK_MONOTONIC_COARSE => {
+                    quantize_clock_reading(monotonic_time(), coarse_clock_resolution())
+                }
+                _ => monotonic_time(),
+            };
+            return Ok(current()
+                .as_thread()
+                .proc_data
+                .time_ns()
+                .apply_monotonic_offset(now));
+        }
+        CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => {
+            return Ok(current()
+                .as_thread()
+                .proc_data
+                .time_ns()
+                .apply_boottime_offset(monotonic_time()));
+        }
+        _ => {}
+    }
+
     match clock_domain(clock_id)? {
         ClockDomain::Realtime => Ok(wall_time()),
         ClockDomain::RealtimeCoarse => Ok(quantize_clock_reading(
@@ -498,7 +522,7 @@ fn decode_timer_notify(event: Option<sigevent>) -> AxResult<PosixTimerNotify> {
 
     match event.sigev_notify as u32 {
         SIGEV_NONE => Ok(PosixTimerNotify::None),
-        SIGEV_SIGNAL => {
+        SIGEV_SIGNAL | SIGEV_THREAD => {
             let signo = Signo::from_repr(event.sigev_signo as u8).ok_or(AxError::InvalidInput)?;
             Ok(PosixTimerNotify::Signal {
                 signo,
@@ -592,18 +616,18 @@ pub fn sys_timer_settime(
     new_value: *const itimerspec,
     old_value: *mut itimerspec,
 ) -> AxResult<isize> {
-    if timerid < 0 {
-        return Err(AxError::InvalidInput);
-    }
     if new_value.is_null() {
-        return Err(AxError::InvalidInput);
-    }
-    if flags & !TIMER_ABSTIME as i32 != 0 {
         return Err(AxError::InvalidInput);
     }
 
     let new_value = unsafe { new_value.vm_read_uninit()?.assume_init() };
     let (interval, value) = itimerspec_to_durations(&new_value)?;
+    if timerid < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & !TIMER_ABSTIME as i32 != 0 {
+        return Err(AxError::InvalidInput);
+    }
     let absolute = (flags & TIMER_ABSTIME as i32) != 0;
     let curr = current();
     let thr = curr.as_thread();
@@ -768,9 +792,9 @@ pub fn sys_clock_getres(clock_id: __kernel_clockid_t, res: *mut timespec) -> AxR
 }
 
 pub fn sys_clock_settime(clock_id: __kernel_clockid_t, ts: *const timespec) -> AxResult<isize> {
-    let ts = unsafe { ts.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
     match clock_id as u32 {
         CLOCK_REALTIME => {
+            let ts = unsafe { ts.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
             if !current()
                 .as_thread()
                 .proc_data
@@ -942,22 +966,26 @@ pub struct Tms {
 }
 
 pub fn sys_times(tms: *mut Tms) -> AxResult<isize> {
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let self_usage = proc_data.self_usage();
-    let child_usage = proc_data.children_usage();
-    tms.vm_write(Tms {
-        tms_utime: self_usage.utime_ticks() as usize,
-        tms_stime: self_usage.stime_ticks() as usize,
-        tms_cutime: child_usage.utime_ticks() as usize,
-        tms_cstime: child_usage.stime_ticks() as usize,
-    })?;
+    if let Some(tms) = tms.nullable() {
+        let curr = current();
+        let proc_data = &curr.as_thread().proc_data;
+        let self_usage = proc_data.self_usage();
+        let child_usage = proc_data.children_usage();
+        tms.vm_write(Tms {
+            tms_utime: self_usage.utime_ticks() as usize,
+            tms_stime: self_usage.stime_ticks() as usize,
+            tms_cutime: child_usage.utime_ticks() as usize,
+            tms_cstime: child_usage.stime_ticks() as usize,
+        })?;
+    }
     Ok(nanos_to_clock_ticks(monotonic_time_nanos()) as _)
 }
 
 pub fn sys_getitimer(which: i32, value: *mut itimerval) -> AxResult<isize> {
     let ty = ITimerType::from_repr(which).ok_or(AxError::InvalidInput)?;
-    let (it_interval, it_value) = current().as_thread().time.borrow().get_itimer(ty);
+    let curr = current();
+    poll_timer(&curr);
+    let (it_interval, it_value) = curr.as_thread().time.borrow().get_itimer(ty);
 
     value.vm_write(itimerval {
         it_interval: timeval::from_time_value(it_interval),
@@ -988,6 +1016,7 @@ pub fn sys_setitimer(
 
     debug!("sys_setitimer <= type: {ty:?}, interval: {interval:?}, remained: {remained:?}");
 
+    poll_timer(&curr);
     let old = curr
         .as_thread()
         .time

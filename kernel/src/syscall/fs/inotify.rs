@@ -1,17 +1,45 @@
 use core::ffi::c_char;
 
-use axerrno::AxResult;
-use linux_raw_sys::general::{IN_CLOEXEC, IN_NONBLOCK};
+use axerrno::{AxError, AxResult};
+use linux_raw_sys::general::{
+    AT_FDCWD, AT_SYMLINK_NOFOLLOW, IN_ACCESS, IN_ATTRIB, IN_CLOEXEC, IN_CLOSE_NOWRITE,
+    IN_CLOSE_WRITE, IN_CREATE, IN_DELETE, IN_DELETE_SELF, IN_DONT_FOLLOW, IN_EXCL_UNLINK,
+    IN_IGNORED, IN_ISDIR, IN_MASK_ADD, IN_MASK_CREATE, IN_MODIFY, IN_MOVE_SELF, IN_MOVED_FROM,
+    IN_MOVED_TO, IN_NONBLOCK, IN_ONESHOT, IN_ONLYDIR, IN_OPEN, IN_Q_OVERFLOW, IN_UNMOUNT,
+};
 
 use crate::{
-    file::{FileLike, add_file_like, inotify::InotifyFile},
+    file::{FileLike, ResolveAtResult, add_file_like, inotify::InotifyFile, resolve_at},
     mm::vm_load_string,
 };
+
+const ALL_INOTIFY_BITS: u32 = IN_ACCESS
+    | IN_MODIFY
+    | IN_ATTRIB
+    | IN_CLOSE_WRITE
+    | IN_CLOSE_NOWRITE
+    | IN_OPEN
+    | IN_MOVED_FROM
+    | IN_MOVED_TO
+    | IN_CREATE
+    | IN_DELETE
+    | IN_DELETE_SELF
+    | IN_MOVE_SELF
+    | IN_UNMOUNT
+    | IN_Q_OVERFLOW
+    | IN_IGNORED
+    | IN_ONLYDIR
+    | IN_DONT_FOLLOW
+    | IN_EXCL_UNLINK
+    | IN_MASK_ADD
+    | IN_MASK_CREATE
+    | IN_ISDIR
+    | IN_ONESHOT;
 
 pub fn sys_inotify_init1(flags: i32) -> AxResult<isize> {
     let flags = flags as u32;
     if flags & !(IN_CLOEXEC | IN_NONBLOCK) != 0 {
-        return Err(axerrno::AxError::InvalidInput);
+        return Err(AxError::InvalidInput);
     }
 
     add_file_like(
@@ -22,9 +50,27 @@ pub fn sys_inotify_init1(flags: i32) -> AxResult<isize> {
 }
 
 pub fn sys_inotify_add_watch(fd: i32, pathname: *const c_char, mask: u32) -> AxResult<isize> {
-    let pathname = vm_load_string(pathname)?;
-    let loc = axfs::FS_CONTEXT.lock().resolve_no_follow(&pathname)?;
+    if mask & !ALL_INOTIFY_BITS != 0 || mask & ALL_INOTIFY_BITS == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if mask & IN_MASK_ADD != 0 && mask & IN_MASK_CREATE != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
     let inotify = crate::file::inotify::InotifyFile::from_fd(fd)?;
+    let pathname = vm_load_string(pathname)?;
+    let resolve_flags = if mask & IN_DONT_FOLLOW != 0 {
+        AT_SYMLINK_NOFOLLOW
+    } else {
+        0
+    };
+    let ResolveAtResult::File(loc) = resolve_at(AT_FDCWD, Some(&pathname), resolve_flags)? else {
+        return Err(AxError::InvalidInput);
+    };
+    if mask & IN_ONLYDIR != 0 && !loc.is_dir() {
+        return Err(AxError::NotADirectory);
+    }
+
     inotify.add_watch(&loc, mask).map(|wd| wd as isize)
 }
 

@@ -1,30 +1,69 @@
 use alloc::sync::Arc;
 use core::ffi::c_char;
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
+use axfs::FS_CONTEXT;
 use axhal::paging::MappingFlags;
 use axtask::current;
 use linux_raw_sys::{
     general::{
         __user_cap_data_struct, __user_cap_header_struct, _LINUX_CAPABILITY_VERSION_1,
-        _LINUX_CAPABILITY_VERSION_2, _LINUX_CAPABILITY_VERSION_3, CAP_SETPCAP,
+        _LINUX_CAPABILITY_VERSION_2, _LINUX_CAPABILITY_VERSION_3, CAP_SETPCAP, CAP_SYS_ADMIN,
+        CAP_SYS_NICE, CAP_SYS_PTRACE, CLONE_FILES, CLONE_FS, CLONE_NEWCGROUP, CLONE_NEWIPC,
+        CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS,
+        CLONE_SYSVSEM,
     },
     mempolicy::*,
 };
 use memory_addr::{MemoryAddr, VirtAddr};
+use spin::RwLock;
 use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
 
 use crate::{
+    file::{FD_TABLE, File, FileDescription, FileLike},
     mm::vm_load_string,
+    pseudofs::{
+        ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
+        namespace_target_from_proc_file,
+    },
     task::{AsThread, CapabilityState, Mempolicy, ProcessData, get_process_data},
 };
 
 const NO_ID_CHANGE: u32 = u32::MAX;
-const ALLOWED_NODEMASK: usize = 1;
+const ALLOWED_NODEMASK: usize = 0b11;
+const DEFAULT_NUMA_NODE: i32 = 0;
 const SUPPORTED_GET_MEMPOLICY_FLAGS: usize =
     (MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED) as usize;
 const SUPPORTED_MODE_FLAGS: usize = MPOL_MODE_FLAGS as usize;
 const SUPPORTED_MBIND_FLAGS: usize = MPOL_MF_VALID as usize;
+const SUPPORTED_MOVE_PAGES_FLAGS: usize = (MPOL_MF_MOVE | MPOL_MF_MOVE_ALL) as usize;
+const MAX_NODEMASK_BITS: usize = 4096;
+const KCMP_FILE: i32 = 0;
+const KCMP_VM: i32 = 1;
+const KCMP_FILES: i32 = 2;
+const KCMP_FS: i32 = 3;
+const KCMP_SIGHAND: i32 = 4;
+const KCMP_IO: i32 = 5;
+const KCMP_SYSVSEM: i32 = 6;
+const KCMP_EPOLL_TFD: i32 = 7;
+const UNSHARE_SUPPORTED_FLAGS: u32 = CLONE_FILES | CLONE_FS | CLONE_NEWUTS | CLONE_NEWTIME;
+const UNSHARE_RECOGNIZED_FLAGS: u32 = UNSHARE_SUPPORTED_FLAGS
+    | CLONE_NEWNS
+    | CLONE_NEWIPC
+    | CLONE_NEWNET
+    | CLONE_NEWPID
+    | CLONE_NEWUSER
+    | CLONE_NEWCGROUP
+    | CLONE_NEWTIME
+    | CLONE_SYSVSEM;
+const NAMESPACE_FLAGS: u32 = CLONE_NEWNS
+    | CLONE_NEWUTS
+    | CLONE_NEWIPC
+    | CLONE_NEWNET
+    | CLONE_NEWPID
+    | CLONE_NEWUSER
+    | CLONE_NEWCGROUP
+    | CLONE_NEWTIME;
 
 fn mempolicy_mode(mode_with_flags: usize) -> u32 {
     (mode_with_flags & !SUPPORTED_MODE_FLAGS) as u32
@@ -37,6 +76,9 @@ fn mempolicy_mode_flags(mode_with_flags: usize) -> usize {
 fn read_nodemask(nodemask: *const usize, maxnode: usize) -> AxResult<usize> {
     if nodemask.is_null() || maxnode == 0 {
         return Ok(0);
+    }
+    if maxnode > MAX_NODEMASK_BITS {
+        return Err(AxError::InvalidInput);
     }
 
     let words = maxnode.div_ceil(usize::BITS as usize);
@@ -131,6 +173,256 @@ fn validate_mapped_user_range(start: usize, size: usize) -> AxResult<(VirtAddr, 
     Ok((aligned_start, aligned_size))
 }
 
+fn current_has_capability(cap: u32) -> bool {
+    current()
+        .as_thread()
+        .proc_data
+        .has_effective_capability(cap)
+}
+
+fn numa_target_process(pid: i32) -> AxResult<Arc<ProcessData>> {
+    if pid < 0 {
+        return Err(AxError::NoSuchProcess);
+    }
+    get_process_data(pid as u32)
+}
+
+fn check_numa_target_permission(target: &ProcessData) -> AxResult<()> {
+    if current_has_capability(CAP_SYS_NICE) {
+        return Ok(());
+    }
+
+    let curr = current();
+    let actor = &curr.as_thread().proc_data;
+    if actor.proc.pid() == target.proc.pid()
+        || actor.euid() == target.uid()
+        || actor.euid() == target.euid()
+    {
+        Ok(())
+    } else {
+        Err(AxError::OperationNotPermitted)
+    }
+}
+
+fn kcmp_target_process(pid: i32) -> AxResult<Arc<ProcessData>> {
+    if pid <= 0 {
+        return Err(AxError::NoSuchProcess);
+    }
+    get_process_data(pid as u32)
+}
+
+fn check_kcmp_permission(target: &ProcessData) -> AxResult<()> {
+    let curr = current();
+    let actor = &curr.as_thread().proc_data;
+    if actor.proc.pid() == target.proc.pid()
+        || actor.euid() == 0
+        || actor.has_effective_capability(CAP_SYS_PTRACE)
+        || [actor.uid(), actor.euid()]
+            .into_iter()
+            .any(|id| id == target.uid() || id == target.euid() || id == target.suid())
+    {
+        Ok(())
+    } else {
+        Err(AxError::OperationNotPermitted)
+    }
+}
+
+fn kcmp_result(equal: bool) -> isize {
+    if equal { 0 } else { 1 }
+}
+
+fn kcmp_file_description(proc_data: &ProcessData, fd: usize) -> AxResult<Arc<FileDescription>> {
+    FD_TABLE
+        .scope(&proc_data.scope.read())
+        .read()
+        .get(fd)
+        .map(|entry| entry.description.clone())
+        .ok_or(AxError::BadFileDescriptor)
+}
+
+pub fn sys_kcmp(pid1: i32, pid2: i32, type_: i32, idx1: usize, idx2: usize) -> AxResult<isize> {
+    debug!("sys_kcmp <= pid1: {pid1}, pid2: {pid2}, type: {type_}, idx1: {idx1}, idx2: {idx2}");
+
+    let proc1 = kcmp_target_process(pid1)?;
+    let proc2 = kcmp_target_process(pid2)?;
+    check_kcmp_permission(&proc1)?;
+    check_kcmp_permission(&proc2)?;
+
+    match type_ {
+        KCMP_FILE => {
+            let file1 = kcmp_file_description(&proc1, idx1)?;
+            let file2 = kcmp_file_description(&proc2, idx2)?;
+            Ok(kcmp_result(Arc::ptr_eq(&file1, &file2)))
+        }
+        KCMP_VM => {
+            let aspace1 = proc1.aspace();
+            let aspace2 = proc2.aspace();
+            Ok(kcmp_result(Arc::ptr_eq(&aspace1, &aspace2)))
+        }
+        KCMP_FILES => {
+            let scope1 = proc1.scope.read();
+            let scope2 = proc2.scope.read();
+            Ok(kcmp_result(Arc::ptr_eq(
+                &*FD_TABLE.scope(&scope1),
+                &*FD_TABLE.scope(&scope2),
+            )))
+        }
+        KCMP_FS => {
+            let scope1 = proc1.scope.read();
+            let scope2 = proc2.scope.read();
+            Ok(kcmp_result(Arc::ptr_eq(
+                &*FS_CONTEXT.scope(&scope1),
+                &*FS_CONTEXT.scope(&scope2),
+            )))
+        }
+        KCMP_SIGHAND => Ok(kcmp_result(Arc::ptr_eq(
+            &proc1.signal.actions,
+            &proc2.signal.actions,
+        ))),
+        KCMP_IO => Ok(kcmp_result(Arc::ptr_eq(
+            &proc1.io_context,
+            &proc2.io_context,
+        ))),
+        KCMP_SYSVSEM => Ok(kcmp_result(Arc::ptr_eq(
+            &proc1.sysvsem_undo,
+            &proc2.sysvsem_undo,
+        ))),
+        KCMP_EPOLL_TFD => Err(LinuxError::EOPNOTSUPP.into()),
+        _ => Err(AxError::InvalidInput),
+    }
+}
+
+pub fn sys_unshare(flags: u32) -> AxResult<isize> {
+    debug!("sys_unshare <= flags: {flags:#x}");
+
+    if flags & !UNSHARE_RECOGNIZED_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & NAMESPACE_FLAGS != 0 && !current_has_capability(CAP_SYS_ADMIN) {
+        return Err(AxError::OperationNotPermitted);
+    }
+    if flags & !UNSHARE_SUPPORTED_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let curr = current();
+    let thread = curr.as_thread();
+    if flags & (CLONE_FILES | CLONE_FS) != 0 {
+        thread.with_mut_scope(|scope| {
+            if flags & CLONE_FILES != 0 {
+                let cloned = FD_TABLE.scope(scope).read().clone();
+                *FD_TABLE.scope_mut(scope) = Arc::new(RwLock::new(cloned));
+            }
+            if flags & CLONE_FS != 0 {
+                let cloned = FS_CONTEXT.scope(scope).lock().clone();
+                *FS_CONTEXT.scope_mut(scope) = Arc::new(axsync::Mutex::new(cloned));
+            }
+        });
+    }
+    if flags & CLONE_NEWUTS != 0 {
+        thread
+            .proc_data
+            .replace_uts_ns(thread.proc_data.uts_ns().fork());
+    }
+    if flags & CLONE_NEWTIME != 0 {
+        thread.proc_data.unshare_time_ns();
+    }
+
+    Ok(0)
+}
+
+pub fn sys_setns(fd: i32, nstype: u32) -> AxResult<isize> {
+    debug!("sys_setns <= fd: {fd}, nstype: {nstype:#x}");
+
+    let file = File::from_fd(fd)?;
+    let target = match namespace_target_from_proc_file(file.inner().location()) {
+        ProcNamespaceTarget::Live(kind, object) => (kind, object),
+        ProcNamespaceTarget::NotNamespace => return Err(AxError::InvalidInput),
+    };
+    let (kind, object) = target;
+    let expected_type = match kind {
+        ProcNamespaceKind::Pid => CLONE_NEWPID,
+        ProcNamespaceKind::Time | ProcNamespaceKind::TimeForChildren => CLONE_NEWTIME,
+        ProcNamespaceKind::User => CLONE_NEWUSER,
+        ProcNamespaceKind::Uts => CLONE_NEWUTS,
+    };
+    if nstype != 0 && nstype != expected_type {
+        return Err(AxError::InvalidInput);
+    }
+    if !current_has_capability(CAP_SYS_ADMIN) {
+        return Err(AxError::OperationNotPermitted);
+    }
+
+    match kind {
+        ProcNamespaceKind::Uts => {
+            let ProcNamespaceObject::Uts(uts_ns) = object else {
+                return Err(AxError::InvalidInput);
+            };
+            current().as_thread().proc_data.replace_uts_ns(uts_ns);
+            Ok(0)
+        }
+        ProcNamespaceKind::Time | ProcNamespaceKind::TimeForChildren => {
+            let ProcNamespaceObject::Time(time_ns) = object else {
+                return Err(AxError::InvalidInput);
+            };
+            current().as_thread().proc_data.replace_time_ns(time_ns);
+            Ok(0)
+        }
+        ProcNamespaceKind::Pid | ProcNamespaceKind::User => Err(LinuxError::EOPNOTSUPP.into()),
+    }
+}
+
+fn validate_movable_node(node: i32) -> AxResult<()> {
+    if node < 0 {
+        return Err(AxError::NoSuchDevice);
+    }
+    if ALLOWED_NODEMASK & (1usize.checked_shl(node as u32).unwrap_or(0)) == 0 {
+        return Err(AxError::NoSuchDevice);
+    }
+    Ok(())
+}
+
+fn validate_migration_nodes(mask: usize) -> AxResult<()> {
+    if mask & !ALLOWED_NODEMASK == 0 {
+        Ok(())
+    } else {
+        Err(AxError::InvalidInput)
+    }
+}
+
+fn mempolicy_preferred_node(policy: Mempolicy) -> i32 {
+    if policy.nodemask == 0 {
+        return DEFAULT_NUMA_NODE;
+    }
+    policy.nodemask.trailing_zeros() as i32
+}
+
+fn numa_page_node(target: &ProcessData, page: usize) -> AxResult<i32> {
+    let start = VirtAddr::from(page).align_down_4k();
+    let aspace_handle = target.aspace();
+    let aspace = aspace_handle.lock();
+    if !aspace.can_access_range(start, 1, MappingFlags::USER) {
+        return Err(AxError::BadAddress);
+    }
+    aspace
+        .page_table()
+        .query(start)
+        .map_err(|_| AxError::BadAddress)?;
+    Ok(target
+        .mempolicy_for_addr(start.as_usize())
+        .map(mempolicy_preferred_node)
+        .unwrap_or(DEFAULT_NUMA_NODE))
+}
+
+fn numa_page_is_shareable(target: &ProcessData, page: usize) -> bool {
+    let start = VirtAddr::from(page).align_down_4k();
+    let aspace_handle = target.aspace();
+    let aspace = aspace_handle.lock();
+    aspace
+        .find_area(start)
+        .is_some_and(|area| area.backend().is_shareable())
+}
+
 fn cap_data_words(version: u32) -> usize {
     match version {
         _LINUX_CAPABILITY_VERSION_1 => 1,
@@ -146,9 +438,9 @@ fn cap_set_union(lhs: [u32; 2], rhs: [u32; 2]) -> [u32; 2] {
     [lhs[0] | rhs[0], lhs[1] | rhs[1]]
 }
 
-fn validate_cap_header(
+fn validate_cap_version(
     header_ptr: *mut __user_cap_header_struct,
-) -> AxResult<(__user_cap_header_struct, Arc<ProcessData>)> {
+) -> AxResult<__user_cap_header_struct> {
     // FIXME: AnyBitPattern
     let mut header = unsafe { header_ptr.vm_read_uninit()?.assume_init() };
     if !matches!(
@@ -159,10 +451,21 @@ fn validate_cap_header(
         header_ptr.vm_write(header)?;
         return Err(AxError::InvalidInput);
     }
+    Ok(header)
+}
+
+fn resolve_cap_process(header: __user_cap_header_struct) -> AxResult<Arc<ProcessData>> {
     if header.pid < 0 {
         return Err(AxError::InvalidInput);
     }
-    let proc_data = get_process_data(header.pid as u32)?;
+    get_process_data(header.pid as u32)
+}
+
+fn validate_cap_header(
+    header_ptr: *mut __user_cap_header_struct,
+) -> AxResult<(__user_cap_header_struct, Arc<ProcessData>)> {
+    let header = validate_cap_version(header_ptr)?;
+    let proc_data = resolve_cap_process(header)?;
     Ok((header, proc_data))
 }
 
@@ -187,15 +490,17 @@ fn read_cap_data(data: *mut __user_cap_data_struct, version: u32) -> AxResult<Ca
         permitted: [0; 2],
         inheritable: [0; 2],
         bounding: [0; 2],
+        ambient: [0; 2],
         securebits: 0,
     };
 
     for index in 0..cap_data_words(version) {
         let entry: __user_cap_data_struct =
             unsafe { data.wrapping_add(index).vm_read_uninit()?.assume_init() };
-        state.effective[index] = entry.effective;
-        state.permitted[index] = entry.permitted;
-        state.inheritable[index] = entry.inheritable;
+        let valid = CapabilityState::valid_mask(index);
+        state.effective[index] = entry.effective & valid;
+        state.permitted[index] = entry.permitted & valid;
+        state.inheritable[index] = entry.inheritable & valid;
     }
     Ok(state)
 }
@@ -204,7 +509,16 @@ pub fn sys_capget(
     header: *mut __user_cap_header_struct,
     data: *mut __user_cap_data_struct,
 ) -> AxResult<isize> {
-    let (header, proc_data) = validate_cap_header(header)?;
+    let header = match validate_cap_version(header) {
+        Ok(header) => header,
+        Err(err) if data.is_null() && err == AxError::InvalidInput => return Ok(0),
+        Err(err) => return Err(err),
+    };
+    if data.is_null() {
+        return Ok(0);
+    }
+
+    let proc_data = resolve_cap_process(header)?;
     write_cap_data(data, header.version, proc_data.capability_state())?;
     Ok(0)
 }
@@ -242,6 +556,7 @@ pub fn sys_capset(
     old_state.effective = new_state.effective;
     old_state.permitted = new_state.permitted;
     old_state.inheritable = new_state.inheritable;
+    old_state.reconcile_ambient();
     proc_data.set_capability_state(old_state);
 
     Ok(0)
@@ -328,7 +643,7 @@ pub fn sys_get_mempolicy(
             return Err(AxError::InvalidInput);
         }
         if !policy.is_null() {
-            policy.vm_write(0)?;
+            policy.vm_write(mempolicy_preferred_node(selected))?;
         }
         return Ok(0);
     }
@@ -374,6 +689,82 @@ pub fn sys_mbind(
         .proc_data
         .bind_mempolicy_range(start.as_usize(), len, policy);
     Ok(0)
+}
+
+pub fn sys_move_pages(
+    pid: i32,
+    nr_pages: usize,
+    pages: *const usize,
+    nodes: *const i32,
+    status: *mut i32,
+    flags: usize,
+) -> AxResult<isize> {
+    if flags & !SUPPORTED_MOVE_PAGES_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & MPOL_MF_MOVE_ALL as usize != 0 && !current_has_capability(CAP_SYS_NICE) {
+        return Err(AxError::OperationNotPermitted);
+    }
+    if nr_pages == 0 {
+        return Ok(0);
+    }
+    if pages.is_null() || status.is_null() {
+        return Err(AxError::BadAddress);
+    }
+
+    let target = numa_target_process(pid)?;
+    check_numa_target_permission(&target)?;
+
+    for index in 0..nr_pages {
+        let page = pages.wrapping_add(index).vm_read()?;
+        let status_value = match numa_page_node(&target, page) {
+            Ok(current_node) if nodes.is_null() => current_node,
+            Ok(_) => {
+                let node = nodes.wrapping_add(index).vm_read()?;
+                validate_movable_node(node)?;
+                if flags & MPOL_MF_MOVE_ALL as usize == 0 && numa_page_is_shareable(&target, page) {
+                    -(LinuxError::EACCES.code() as i32)
+                } else {
+                    target.bind_mempolicy_range(
+                        VirtAddr::from(page).align_down_4k().as_usize(),
+                        4096,
+                        Mempolicy::new(MPOL_BIND as u32, 1usize << node),
+                    );
+                    node
+                }
+            }
+            Err(_) => -(LinuxError::EFAULT.code() as i32),
+        };
+        status.wrapping_add(index).vm_write(status_value)?;
+    }
+
+    Ok(0)
+}
+
+pub fn sys_migrate_pages(
+    pid: i32,
+    maxnode: usize,
+    old_nodes: *const usize,
+    new_nodes: *const usize,
+) -> AxResult<isize> {
+    let target = numa_target_process(pid)?;
+    check_numa_target_permission(&target)?;
+
+    let old_nodes = read_nodemask(old_nodes, maxnode)?;
+    let new_nodes = read_nodemask(new_nodes, maxnode)?;
+    validate_migration_nodes(old_nodes)?;
+    validate_migration_nodes(new_nodes)?;
+    Ok(0)
+}
+
+const SECCOMP_MODE_STRICT: u32 = 1;
+const SECCOMP_MODE_FILTER: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockFprog {
+    len: u16,
+    filter: usize,
 }
 
 /// prctl() is called with a first argument describing what to do, and further
@@ -448,8 +839,84 @@ pub fn sys_prctl(
             }
             return Ok(current().as_thread().proc_data.no_new_privs() as isize);
         }
-        PR_SET_SECCOMP => {}
+        PR_GET_KEEPCAPS => {
+            return Ok(current().as_thread().proc_data.keep_caps() as isize);
+        }
+        PR_SET_KEEPCAPS => {
+            if arg2 > 1 {
+                return Err(AxError::InvalidInput);
+            }
+            current().as_thread().proc_data.set_keep_caps(arg2 != 0)?;
+        }
+        PR_GET_SECCOMP => {
+            return Ok(current().as_thread().proc_data.seccomp_mode() as isize);
+        }
+        PR_SET_SECCOMP => match arg2 as u32 {
+            SECCOMP_MODE_STRICT => {
+                current()
+                    .as_thread()
+                    .proc_data
+                    .set_seccomp_mode(SECCOMP_MODE_STRICT);
+            }
+            SECCOMP_MODE_FILTER => {
+                let fprog: SockFprog =
+                    unsafe { (arg3 as *const SockFprog).vm_read_uninit()?.assume_init() };
+                if fprog.len == 0 {
+                    return Err(AxError::InvalidInput);
+                }
+                let curr = current();
+                let proc_data = &curr.as_thread().proc_data;
+                if !proc_data.no_new_privs() && !proc_data.has_effective_capability(CAP_SYS_ADMIN) {
+                    return Err(AxError::PermissionDenied);
+                }
+                proc_data.set_seccomp_mode(SECCOMP_MODE_FILTER);
+            }
+            _ => return Err(AxError::InvalidInput),
+        },
         PR_MCE_KILL => {}
+        PR_SET_THP_DISABLE => {
+            if arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            current().as_thread().proc_data.set_thp_disabled(arg2 != 0);
+        }
+        PR_GET_THP_DISABLE => {
+            if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            return Ok(current().as_thread().proc_data.thp_disabled() as isize);
+        }
+        PR_CAP_AMBIENT => {
+            let curr = current();
+            let proc_data = &curr.as_thread().proc_data;
+            match arg2 as u32 {
+                PR_CAP_AMBIENT_CLEAR_ALL => {
+                    if arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                        return Err(AxError::InvalidInput);
+                    }
+                    proc_data.clear_ambient_capabilities();
+                }
+                PR_CAP_AMBIENT_IS_SET => {
+                    if arg4 != 0 || arg5 != 0 {
+                        return Err(AxError::InvalidInput);
+                    }
+                    return Ok(proc_data.ambient_capability_enabled(arg3 as u32)? as isize);
+                }
+                PR_CAP_AMBIENT_RAISE => {
+                    if arg4 != 0 || arg5 != 0 {
+                        return Err(AxError::InvalidInput);
+                    }
+                    proc_data.raise_ambient_capability(arg3 as u32)?;
+                }
+                PR_CAP_AMBIENT_LOWER => {
+                    if arg4 != 0 || arg5 != 0 {
+                        return Err(AxError::InvalidInput);
+                    }
+                    proc_data.lower_ambient_capability(arg3 as u32)?;
+                }
+                _ => return Err(AxError::InvalidInput),
+            }
+        }
         PR_CAPBSET_DROP => {
             let curr = current();
             let proc_data = &curr.as_thread().proc_data;
@@ -462,7 +929,7 @@ pub fn sys_prctl(
             return Ok(current()
                 .as_thread()
                 .proc_data
-                .bounding_capability_enabled(arg2 as u32) as isize);
+                .bounding_capability_enabled(arg2 as u32)? as isize);
         }
         PR_SET_SECUREBITS => {
             if arg3 != 0 || arg4 != 0 || arg5 != 0 {
@@ -473,7 +940,10 @@ pub fn sys_prctl(
             if !proc_data.has_effective_capability(CAP_SETPCAP) {
                 return Err(AxError::OperationNotPermitted);
             }
-            proc_data.set_securebits(arg2 as u32);
+            proc_data.set_securebits(arg2 as u32)?;
+        }
+        PR_GET_SECUREBITS => {
+            return Ok(current().as_thread().proc_data.securebits() as isize);
         }
         PR_SET_MM => {
             // not implemented; but avoid annoying warnings

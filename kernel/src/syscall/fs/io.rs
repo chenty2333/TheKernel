@@ -12,8 +12,9 @@ use syscalls::Sysno;
 
 use crate::{
     file::{
-        Directory, File, FileHandle, FileLike, FileLikeKind, Pipe, Socket, allowed_write_len,
-        check_resize_limit, executable, flock, get_file_like, get_typed_file, inode_flags,
+        Directory, File, FileHandle, FileLike, FileLikeKind, PidFd, Pipe, Socket,
+        allowed_write_len, check_resize_limit, executable, flock, get_file_like, get_typed_file,
+        inode_flags,
         inotify::{notify_exact, notify_read, notify_write},
         lease, memfd,
         permission::check_open_permissions,
@@ -35,10 +36,21 @@ const FALLOC_FL_INSERT_RANGE: u32 = 0x20;
 const TMPFS_FALLOC_BLOCK_SIZE: u64 = 4096;
 const FALLOC_IO_CHUNK: usize = 0x1000;
 const MAX_FILE_OFFSET: u64 = i64::MAX as u64;
+const SPLICE_F_MOVE: u32 = 0x01;
 const SPLICE_F_NONBLOCK: u32 = 0x02;
+const SPLICE_F_MORE: u32 = 0x04;
+const SPLICE_F_GIFT: u32 = 0x08;
+const SPLICE_F_ALL: u32 = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
 const SYNC_FILE_RANGE_WAIT_BEFORE: u32 = 0x01;
 const SYNC_FILE_RANGE_WRITE: u32 = 0x02;
 const SYNC_FILE_RANGE_WAIT_AFTER: u32 = 0x04;
+
+fn validate_splice_flags(flags: u32) -> AxResult<()> {
+    if flags & !SPLICE_F_ALL != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
 
 fn touch_modified_metadata(loc: &Location) -> AxResult<()> {
     let now = wall_time();
@@ -120,6 +132,9 @@ pub fn sys_dummy_fd(sysno: Sysno) -> AxResult<isize> {
 /// Return the read size if success.
 pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     debug!("sys_read <= fd: {fd}, buf: {buf:p}, len: {len}");
+    if len != 0 {
+        crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
+    }
     let read = get_file_like(fd)?.read(&mut VmBytesMut::new(buf, len))? as isize;
     if read > 0 {
         notify_read(fd);
@@ -129,6 +144,9 @@ pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
 
 pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     debug!("sys_readv <= fd: {fd}, iovcnt: {iovcnt}");
+    if iovcnt != 0 {
+        crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
+    }
     let f = get_file_like(fd)?;
     let read = f.read(&mut IoVectorBuf::new(iov, iovcnt)?.into_io())? as isize;
     if read > 0 {
@@ -172,6 +190,9 @@ pub fn sys_readahead(fd: c_int, offset: __kernel_off_t, count: usize) -> AxResul
     }
 
     let file_like = get_file_like(fd)?;
+    if file_like.downcast_ref::<PidFd>().is_some() {
+        return Ok(0);
+    }
     match FileLikeKind::from_file_like(file_like.as_ref()) {
         FileLikeKind::Regular => {
             let file = file_like
@@ -359,7 +380,11 @@ fn do_preadv(
     }
 
     let file = positioned_file(fd, FileFlags::READ)?;
-    let mut io = IoVectorBuf::new(iov, iovcnt)?.into_io();
+    let iov = IoVectorBuf::new(iov, iovcnt)?;
+    if iov.len() != 0 {
+        crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
+    }
+    let mut io = iov.into_io();
     let read = if offset == -1 {
         file.read(&mut io)?
     } else {
@@ -798,6 +823,9 @@ pub fn sys_pread64(fd: c_int, buf: *mut u8, len: usize, offset: __kernel_off_t) 
         return Err(AxError::InvalidInput);
     }
     let f = positioned_file(fd, FileFlags::READ)?;
+    if len != 0 {
+        crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
+    }
     let read = f.inner().read_at(VmBytesMut::new(buf, len), offset as _)?;
     if read > 0 {
         notify_read(fd);
@@ -895,6 +923,16 @@ enum SendFile {
     Offset(FileHandle<File>, *mut u64),
 }
 
+fn checked_offset_advance(offset: u64, len: usize) -> AxResult<u64> {
+    let offset = offset
+        .checked_add(len as u64)
+        .ok_or_else(|| AxError::from(LinuxError::EOVERFLOW))?;
+    if offset > MAX_FILE_OFFSET {
+        return Err(AxError::from(LinuxError::EOVERFLOW));
+    }
+    Ok(offset)
+}
+
 impl SendFile {
     fn has_data(&self) -> bool {
         match self {
@@ -910,7 +948,7 @@ impl SendFile {
             SendFile::Offset(file, offset) => {
                 let off = offset.vm_read()?;
                 let bytes_read = file.inner().read_at(&mut buf, off)?;
-                offset.vm_write(off + bytes_read as u64)?;
+                offset.vm_write(checked_offset_advance(off, bytes_read)?)?;
                 Ok(bytes_read)
             }
         }
@@ -923,8 +961,13 @@ impl SendFile {
                 let off = offset.vm_read()?;
                 executable::check_not_active(file.inner().location())?;
                 inode_flags::check_write(file.inner().location(), false)?;
-                let bytes_written = file.inner().write_at(buf, off)?;
-                offset.vm_write(off + bytes_written as u64)?;
+                let allowed = allowed_write_len(off, buf.len())?;
+                if allowed == 0 {
+                    return Ok(0);
+                }
+                memfd::check_write(file.inner().location(), off, allowed)?;
+                let bytes_written = file.inner().write_at(&buf[..allowed], off)?;
+                offset.vm_write(checked_offset_advance(off, bytes_written)?)?;
                 Ok(bytes_written)
             }
         }
@@ -1047,7 +1090,7 @@ pub fn sys_sendfile(out_fd: c_int, in_fd: c_int, offset: *mut u64, len: usize) -
     validate_sendfile_destination(out_fd)?;
 
     let src = if !offset.is_null() {
-        if offset.vm_read()? > u32::MAX as u64 {
+        if offset.vm_read()? > MAX_FILE_OFFSET {
             return Err(AxError::InvalidInput);
         }
         SendFile::Offset(File::from_fd(in_fd)?, offset)
@@ -1116,12 +1159,18 @@ pub fn sys_copy_file_range(
     };
 
     let dst = if !off_out.is_null() {
-        SendFile::Offset(dst_file, off_out)
+        SendFile::Offset(dst_file.clone(), off_out)
     } else {
         SendFile::Direct(get_file_like(fd_out)?)
     };
 
-    do_send(src, dst, len).map(|n| n as _)
+    let copied = do_send(src, dst, len)?;
+    if copied > 0 {
+        touch_modified_metadata(dst_file.inner().location())?;
+        notify_read(fd_in);
+        notify_write(fd_out);
+    }
+    Ok(copied as _)
 }
 
 pub fn sys_splice(
@@ -1141,6 +1190,11 @@ pub fn sys_splice(
         len,
         _flags
     );
+
+    if len == 0 {
+        return Ok(0);
+    }
+    validate_splice_flags(_flags)?;
 
     let mut has_pipe = false;
 
@@ -1209,6 +1263,11 @@ pub fn sys_splice(
 pub fn sys_tee(fd_in: c_int, fd_out: c_int, len: usize, flags: u32) -> AxResult<isize> {
     debug!("sys_tee <= fd_in: {fd_in}, fd_out: {fd_out}, len: {len}, flags: {flags:#x}");
 
+    validate_splice_flags(flags)?;
+    if len == 0 {
+        return Ok(0);
+    }
+
     let src = pipe_from_fd(fd_in, AxError::InvalidInput)?;
     let dst = pipe_from_fd(fd_out, AxError::InvalidInput)?;
     src.tee_to(&dst, len, flags & SPLICE_F_NONBLOCK != 0)
@@ -1217,6 +1276,8 @@ pub fn sys_tee(fd_in: c_int, fd_out: c_int, len: usize, flags: u32) -> AxResult<
 
 pub fn sys_vmsplice(fd: c_int, iov: *const IoVec, nr_segs: usize, flags: u32) -> AxResult<isize> {
     debug!("sys_vmsplice <= fd: {fd}, iov: {iov:p}, nr_segs: {nr_segs}, flags: {flags:#x}");
+
+    validate_splice_flags(flags)?;
 
     let pipe = pipe_from_fd(fd, AxError::BadFileDescriptor)?;
     let mut io = IoVectorBuf::new(iov, nr_segs)?.into_io();

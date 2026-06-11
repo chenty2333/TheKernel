@@ -43,10 +43,15 @@ unsafe fn cast_to_slice<T>(value: &T) -> &[u8] {
 }
 
 fn fill_addr(addr: UserPtr<sockaddr>, addrlen: &mut socklen_t, data: &[u8]) -> AxResult<()> {
+    if *addrlen > i32::MAX as socklen_t {
+        return Err(AxError::InvalidInput);
+    }
     let len = (*addrlen as usize).min(data.len());
-    addr.cast::<u8>()
-        .get_as_mut_slice(len)?
-        .copy_from_slice(&data[..len]);
+    if len != 0 {
+        addr.cast::<u8>()
+            .get_as_mut_slice(len)?
+            .copy_from_slice(&data[..len]);
+    }
     *addrlen = data.len() as _;
     Ok(())
 }

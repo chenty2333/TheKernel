@@ -11,7 +11,7 @@ use axtask::{
     future::{block_on, interruptible, timeout_at},
 };
 use linux_raw_sys::general::{
-    F_RDLCK, F_UNLCK, F_WRLCK, O_ACCMODE, O_PATH, O_RDONLY, O_TRUNC, O_WRONLY,
+    CAP_LEASE, F_RDLCK, F_UNLCK, F_WRLCK, O_ACCMODE, O_PATH, O_RDONLY, O_TRUNC, O_WRONLY,
 };
 use spin::Mutex;
 use starry_signal::{SignalInfo, Signo};
@@ -98,10 +98,10 @@ fn current_pid() -> u32 {
     current().as_thread().proc_data.proc.pid()
 }
 
-fn current_is_root() -> bool {
-    current()
-        .try_as_thread()
-        .is_some_and(|thr| thr.proc_data.euid() == 0)
+fn current_can_set_lease(owner_uid: u32) -> bool {
+    current().try_as_thread().is_some_and(|thr| {
+        thr.proc_data.fsuid() == owner_uid || thr.proc_data.has_effective_capability(CAP_LEASE)
+    })
 }
 
 fn file_open_has_write(file: &File) -> bool {
@@ -234,8 +234,8 @@ pub(crate) fn set_lease(file: &File, owner: LeaseOwner, arg: i32) -> AxResult<()
     if !is_regular_file(loc) || file.inner().is_path() {
         return Err(AxError::InvalidInput);
     }
-    if !current_is_root() {
-        return Err(AxError::OperationNotPermitted);
+    if !current_can_set_lease(loc.metadata()?.uid) {
+        return Err(AxError::PermissionDenied);
     }
 
     let id = lease_id(loc);

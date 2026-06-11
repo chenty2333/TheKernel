@@ -14,22 +14,22 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
-use axfs::FS_CONTEXT;
+use axfs::{FS_CONTEXT, FileBackend, FileFlags};
 use axfs_ng_vfs::{
-    DeviceId, Location, MetadataUpdate, NodePermission, NodeType,
+    DeviceId, Location, Metadata, MetadataUpdate, NodePermission, NodeType,
     path::{MAX_NAME_LEN, Path},
 };
 use axhal::power::system_off;
 use axtask::current;
 use linux_raw_sys::{
     general::*,
-    ioctl::{FIONBIO, TIOCGWINSZ},
+    ioctl::{FIONBIO, NS_GET_PARENT, NS_GET_USERNS, TIOCGWINSZ},
 };
 use starry_vm::{VmPtr, vm_write_slice};
 
 use crate::{
     file::{
-        Directory, FileLike, get_file_like, has_tmpfile_state,
+        Directory, File, FileLike, add_file_like, get_file_like, has_tmpfile_state,
         inode_flags::{self, TimeUpdate},
         inotify::location_for_fd,
         is_path_only_fd,
@@ -41,6 +41,10 @@ use crate::{
     },
     mm::vm_load_string,
     mounts,
+    pseudofs::{
+        ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
+        namespace_target_from_proc_file, proc_namespace_location_from_object,
+    },
     task::AsThread,
     time::{TimeValueLike, wall_time},
 };
@@ -51,6 +55,59 @@ const SUPPORTED_FCHMODAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
 const SUPPORTED_FCHOWNAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
 const SUPPORTED_UNLINKAT_FLAGS: u32 = AT_REMOVEDIR;
 const GETDENTS64_MAX_BUFFER: usize = 16 * 1024;
+
+fn add_proc_namespace_fd(
+    template: &Location,
+    kind: ProcNamespaceKind,
+    object: ProcNamespaceObject,
+) -> AxResult<isize> {
+    let loc = proc_namespace_location_from_object(template, kind, object)?;
+    let file = axfs::File::new(FileBackend::Direct(loc), FileFlags::READ);
+    Ok(add_file_like(Arc::new(File::new(file)), false)? as isize)
+}
+
+fn proc_namespace_ioctl(loc: &Location, cmd: u32) -> Option<AxResult<isize>> {
+    let ProcNamespaceTarget::Live(kind, object) = namespace_target_from_proc_file(loc) else {
+        return None;
+    };
+
+    let result = match cmd {
+        NS_GET_PARENT => match (kind, object) {
+            (ProcNamespaceKind::Pid, ProcNamespaceObject::Pid(ns)) => ns
+                .parent()
+                .map(|parent| {
+                    add_proc_namespace_fd(
+                        loc,
+                        ProcNamespaceKind::Pid,
+                        ProcNamespaceObject::Pid(parent),
+                    )
+                })
+                .unwrap_or(Err(AxError::OperationNotPermitted)),
+            (ProcNamespaceKind::Time | ProcNamespaceKind::TimeForChildren, _) => {
+                Err(AxError::InvalidInput)
+            }
+            (ProcNamespaceKind::User | ProcNamespaceKind::Uts, _) => Err(AxError::InvalidInput),
+            _ => Err(AxError::InvalidInput),
+        },
+        NS_GET_USERNS => match object {
+            ProcNamespaceObject::User(ns) => ns
+                .parent()
+                .map(|parent| {
+                    add_proc_namespace_fd(
+                        loc,
+                        ProcNamespaceKind::User,
+                        ProcNamespaceObject::User(parent),
+                    )
+                })
+                .unwrap_or(Err(AxError::OperationNotPermitted)),
+            ProcNamespaceObject::Pid(_)
+            | ProcNamespaceObject::Time(_)
+            | ProcNamespaceObject::Uts(_) => Err(AxError::OperationNotPermitted),
+        },
+        _ => return None,
+    };
+    Some(result)
+}
 
 pub(super) fn validate_pathname(path: &Path) -> AxResult {
     if path.as_str().len() >= PATH_MAX
@@ -163,6 +220,60 @@ fn check_proc_fd_metadata_access(path: Option<&str>) -> AxResult<()> {
     Ok(())
 }
 
+fn current_has_capability(cap: u32) -> bool {
+    current()
+        .as_thread()
+        .proc_data
+        .has_effective_capability(cap)
+}
+
+fn current_can_preserve_setgid(gid: u32) -> bool {
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    proc_data.is_in_fs_group(gid) || proc_data.has_effective_capability(CAP_FSETID)
+}
+
+fn chown_mode_after_update(meta: &Metadata) -> NodePermission {
+    let mut mode = meta.mode;
+    if meta.node_type == NodeType::Directory {
+        return mode;
+    }
+    mode.remove(NodePermission::SET_UID);
+    if mode.contains(NodePermission::GROUP_EXEC) || !current_can_preserve_setgid(meta.gid) {
+        mode.remove(NodePermission::SET_GID);
+    }
+    mode
+}
+
+fn check_chown_permission(meta: &Metadata, uid: u32, gid: u32) -> AxResult<()> {
+    if current_has_capability(CAP_CHOWN) {
+        return Ok(());
+    }
+
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    if uid != meta.uid {
+        return Err(AxError::OperationNotPermitted);
+    }
+    if proc_data.fsuid() != meta.uid {
+        return Err(AxError::OperationNotPermitted);
+    }
+    if gid != meta.gid && !proc_data.is_in_fs_group(gid) {
+        return Err(AxError::OperationNotPermitted);
+    }
+    Ok(())
+}
+
+fn check_chmod_permission(meta: &Metadata) -> AxResult<()> {
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    if proc_data.fsuid() == meta.uid || proc_data.has_effective_capability(CAP_FOWNER) {
+        Ok(())
+    } else {
+        Err(AxError::OperationNotPermitted)
+    }
+}
+
 fn same_entry_at(
     old_dirfd: i32,
     old_path: &Path,
@@ -252,6 +363,11 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: usize) -> AxResult<isize> {
         f.set_nonblocking(val != 0)?;
         return Ok(0);
     }
+    if let Some(file) = f.downcast_ref::<File>()
+        && let Some(result) = proc_namespace_ioctl(file.inner().location(), cmd)
+    {
+        return result;
+    }
     f.ioctl(cmd, arg)
         .map(|result| result as isize)
         .inspect_err(|err| {
@@ -331,7 +447,7 @@ pub fn sys_chroot(path: *const c_char) -> AxResult<isize> {
         proc_data.fsgid(),
         &supplementary_groups,
     )?;
-    if proc_data.euid() != 0 {
+    if !current_has_capability(CAP_SYS_CHROOT) {
         return Err(AxError::OperationNotPermitted);
     }
     fs.set_root_dir(loc)?;
@@ -374,7 +490,14 @@ pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize
         mode: Some(final_mode),
         ..Default::default()
     })?;
-    let _ = crate::file::inotify::notify_parent_with_name(&parent, loc.name(), IN_CREATE, true, 0);
+    let _ = crate::file::inotify::notify_parent_with_name(
+        &parent,
+        Some(&loc),
+        loc.name(),
+        IN_CREATE,
+        true,
+        0,
+    );
     Ok(0)
 }
 
@@ -430,7 +553,14 @@ pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, dev: u64) -> AxRe
             .then_some(DeviceId(dev)),
         ..Default::default()
     })?;
-    let _ = crate::file::inotify::notify_parent_with_name(&parent, &name, IN_CREATE, false, 0);
+    let _ = crate::file::inotify::notify_parent_with_name(
+        &parent,
+        Some(&loc),
+        &name,
+        IN_CREATE,
+        false,
+        0,
+    );
     Ok(0)
 }
 
@@ -594,6 +724,16 @@ pub fn sys_linkat(
     } else {
         new_dir.link(new_name, &old)?;
     }
+    if let Ok(loc) = new_dir.lookup_no_follow(new_name) {
+        let _ = crate::file::inotify::notify_parent_with_name(
+            &new_dir,
+            Some(&loc),
+            new_name,
+            IN_CREATE,
+            loc.is_dir(),
+            0,
+        );
+    }
     Ok(0)
 }
 
@@ -656,7 +796,17 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
         inode_flags::clear(&loc);
     }
     if let Some(parent) = parent {
-        let _ = crate::file::inotify::notify_parent_with_name(&parent, &name, IN_DELETE, is_dir, 0);
+        let _ = crate::file::inotify::notify_parent_with_name(
+            &parent,
+            Some(&loc),
+            &name,
+            IN_DELETE,
+            is_dir,
+            0,
+        );
+    }
+    if !is_dir && clear_xattrs {
+        let _ = crate::file::inotify::notify_exact(&loc, IN_ATTRIB);
     }
     let _ = crate::file::inotify::notify_exact(&loc, IN_DELETE_SELF);
     Ok(0)
@@ -717,8 +867,8 @@ pub fn sys_symlinkat(
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let supplementary_groups = proc_data.supplementary_groups();
-    with_path_fs(new_dirfd, linkpath_ref, |fs| {
-        let (parent, _) = fs.resolve_nonexistent(linkpath_ref)?;
+    let (parent, name) = with_path_fs(new_dirfd, linkpath_ref, |fs| {
+        let (parent, name) = fs.resolve_nonexistent(linkpath_ref)?;
         check_create_permissions(
             &parent,
             proc_data.fsuid(),
@@ -726,8 +876,19 @@ pub fn sys_symlinkat(
             &supplementary_groups,
         )?;
         fs.symlink(target.as_str(), linkpath.as_str())?;
-        Ok(0)
-    })
+        Ok((parent, name.to_string()))
+    })?;
+    if let Ok(loc) = parent.lookup_no_follow(&name) {
+        let _ = crate::file::inotify::notify_parent_with_name(
+            &parent,
+            Some(&loc),
+            &name,
+            IN_CREATE,
+            loc.is_dir(),
+            0,
+        );
+    }
+    Ok(0)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -763,7 +924,13 @@ pub fn sys_readlinkat(
         return Err(AxError::InvalidInput);
     }
     if path.is_empty() {
+        if dirfd == AT_FDCWD {
+            return Err(AxError::NotFound);
+        }
         let loc = location_for_fd(dirfd).ok_or(AxError::BadFileDescriptor)?;
+        if loc.node_type() != NodeType::Symlink {
+            return Err(AxError::NotFound);
+        }
         return write_readlink_result(&loc, buf, size);
     }
     validate_pathname(Path::new(&path))?;
@@ -813,36 +980,29 @@ pub fn sys_fchownat(
         .ok_or(AxError::BadFileDescriptor)?;
     let meta = loc.metadata()?;
 
-    let mut mode = meta.mode;
-    if meta.node_type == NodeType::RegularFile
-        && mode.intersects(
-            NodePermission::OWNER_EXEC | NodePermission::GROUP_EXEC | NodePermission::OTHER_EXEC,
-        )
-    {
-        mode.remove(NodePermission::SET_UID);
-        if mode.contains(NodePermission::GROUP_EXEC) {
-            mode.remove(NodePermission::SET_GID);
-        }
-    }
-
     let uid = if uid == -1 { meta.uid } else { uid as _ };
     let gid = if gid == -1 { meta.gid } else { gid as _ };
     check_writable_mount(&loc)?;
     inode_flags::check_metadata_update(&loc)?;
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    if proc_data.fsuid() != 0
-        && (proc_data.fsuid() != meta.uid
-            || uid != meta.uid
-            || (gid != meta.gid && !proc_data.is_in_fs_group(gid)))
-    {
-        return Err(AxError::OperationNotPermitted);
+    if path.as_deref().is_some_and(|path| !path.is_empty()) {
+        check_parent_search_permissions(
+            &loc,
+            proc_data.fsuid(),
+            proc_data.fsgid(),
+            &proc_data.supplementary_groups(),
+        )?;
     }
+    check_chown_permission(&meta, uid, gid)?;
+    let mode = chown_mode_after_update(&meta);
     loc.update_metadata(MetadataUpdate {
         owner: Some((uid, gid)),
         mode: Some(mode),
         ..Default::default()
     })?;
+    let _ = crate::file::inotify::notify_parent(&loc, IN_ATTRIB);
+    let _ = crate::file::inotify::notify_exact(&loc, IN_ATTRIB);
     Ok(0)
 }
 
@@ -872,14 +1032,10 @@ pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> A
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
     let meta = loc.metadata()?;
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
     check_writable_mount(&loc)?;
-    if proc_data.fsuid() != 0 && proc_data.fsuid() != meta.uid {
-        return Err(AxError::OperationNotPermitted);
-    }
     let mut mode = NodePermission::from_bits_truncate(mode as u16);
-    if proc_data.fsuid() != 0 && !proc_data.is_in_fs_group(meta.gid) {
+    check_chmod_permission(&meta)?;
+    if !current_can_preserve_setgid(meta.gid) {
         mode.remove(NodePermission::SET_GID);
     }
     inode_flags::check_metadata_update(&loc)?;
@@ -1154,6 +1310,7 @@ pub fn sys_renameat2(
     let cookie = crate::file::inotify::next_rename_cookie();
     let _ = crate::file::inotify::notify_parent_with_name(
         &old_dir,
+        Some(&old_loc),
         &old_name,
         IN_MOVED_FROM,
         old_is_dir,
@@ -1161,6 +1318,7 @@ pub fn sys_renameat2(
     );
     let _ = crate::file::inotify::notify_parent_with_name(
         &new_dir,
+        Some(&old_loc),
         &new_name,
         IN_MOVED_TO,
         old_is_dir,
@@ -1190,6 +1348,9 @@ pub fn sys_syncfs(fd: i32) -> AxResult<isize> {
 }
 
 pub fn sys_reboot(magic1: i32, magic2: i32, cmd: i32, _arg: *const c_void) -> AxResult<isize> {
+    if !current_has_capability(CAP_SYS_BOOT) {
+        return Err(AxError::OperationNotPermitted);
+    }
     if magic1 as u32 != LINUX_REBOOT_MAGIC1 {
         return Err(AxError::InvalidInput);
     }
@@ -1207,6 +1368,15 @@ pub fn sys_reboot(magic1: i32, magic2: i32, cmd: i32, _arg: *const c_void) -> Ax
             sys_sync()?;
             system_off();
         }
-        _ => Err(AxError::Unsupported),
+        LINUX_REBOOT_CMD_CAD_ON | LINUX_REBOOT_CMD_CAD_OFF => Ok(0),
+        _ => Err(AxError::InvalidInput),
+    }
+}
+
+pub fn sys_vhangup() -> AxResult<isize> {
+    if current_has_capability(CAP_SYS_TTY_CONFIG) {
+        Ok(0)
+    } else {
+        Err(AxError::OperationNotPermitted)
     }
 }

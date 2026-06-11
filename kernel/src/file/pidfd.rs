@@ -9,6 +9,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet, Pollable};
+use starry_process::Process;
 
 use crate::{
     file::FileLike,
@@ -17,6 +18,7 @@ use crate::{
 
 pub struct PidFd {
     proc_data: Weak<ProcessData>,
+    process: Weak<Process>,
     exit_event: Arc<PollSet>,
     thread_exit: Option<Arc<AtomicBool>>,
 
@@ -26,6 +28,7 @@ impl PidFd {
     pub fn new_process(proc_data: &Arc<ProcessData>) -> Self {
         Self {
             proc_data: Arc::downgrade(proc_data),
+            process: Arc::downgrade(&proc_data.proc),
             exit_event: proc_data.exit_event.clone(),
             thread_exit: None,
 
@@ -36,6 +39,7 @@ impl PidFd {
     pub fn new_thread(thread: &Thread) -> Self {
         Self {
             proc_data: Arc::downgrade(&thread.proc_data),
+            process: Arc::downgrade(&thread.proc_data.proc),
             exit_event: thread.exit_event.clone(),
             thread_exit: Some(thread.exit.clone()),
 
@@ -52,6 +56,10 @@ impl PidFd {
             return Err(AxError::NoSuchProcess);
         }
         self.proc_data.upgrade().ok_or(AxError::NoSuchProcess)
+    }
+
+    pub fn process(&self) -> AxResult<Arc<Process>> {
+        self.process.upgrade().ok_or(AxError::NoSuchProcess)
     }
 }
 impl FileLike for PidFd {
@@ -72,14 +80,14 @@ impl FileLike for PidFd {
 impl Pollable for PidFd {
     fn poll(&self) -> IoEvents {
         let mut events = IoEvents::empty();
-        events.set(
-            IoEvents::IN,
-            self.proc_data.strong_count() > 0
-                && self
-                    .thread_exit
-                    .as_ref()
-                    .is_none_or(|it| !it.load(Ordering::Acquire)),
-        );
+        let exited = if let Some(thread_exit) = &self.thread_exit {
+            thread_exit.load(Ordering::Acquire)
+        } else {
+            self.process
+                .upgrade()
+                .is_none_or(|process| process.is_zombie())
+        };
+        events.set(IoEvents::IN, exited);
         events
     }
 

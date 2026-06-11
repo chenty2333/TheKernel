@@ -4,7 +4,7 @@ use core::ffi::c_char;
 use axconfig::ARCH;
 use axerrno::{AxError, AxResult};
 use axfs::FS_CONTEXT;
-use axhal::uspace::UserContext;
+use axhal::{time::monotonic_time, uspace::UserContext};
 use axtask::current;
 #[cfg(target_arch = "riscv64")]
 use bytemuck::AnyBitPattern;
@@ -174,8 +174,9 @@ pub(crate) fn current_utsname() -> new_utsname {
     };
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    fill_uts_field(&mut utsname.nodename, &proc_data.uts_ns.nodename());
-    fill_uts_field(&mut utsname.domainname, &proc_data.uts_ns.domainname());
+    let uts_ns = proc_data.uts_ns();
+    fill_uts_field(&mut utsname.nodename, &uts_ns.nodename());
+    fill_uts_field(&mut utsname.domainname, &uts_ns.domainname());
     utsname
 }
 
@@ -188,22 +189,61 @@ pub(crate) fn proc_version_string() -> String {
     format!("{sysname} version {release} ({machine}) {version}\n")
 }
 
+pub(crate) fn current_sysname_string() -> String {
+    let utsname = current_utsname();
+    cstr_field_to_string(&utsname.sysname)
+}
+
+pub(crate) fn current_release_string() -> String {
+    let utsname = current_utsname();
+    cstr_field_to_string(&utsname.release)
+}
+
+pub(crate) fn current_version_string() -> String {
+    let utsname = current_utsname();
+    cstr_field_to_string(&utsname.version)
+}
+
+pub(crate) fn current_machine_string() -> String {
+    let utsname = current_utsname();
+    cstr_field_to_string(&utsname.machine)
+}
+
+pub(crate) fn current_hostname_string() -> String {
+    current()
+        .as_thread()
+        .proc_data
+        .uts_ns()
+        .nodename()
+        .into_iter()
+        .map(char::from)
+        .collect()
+}
+
 pub(crate) fn current_domainname_string() -> String {
     current()
         .as_thread()
         .proc_data
-        .uts_ns
+        .uts_ns()
         .domainname()
         .into_iter()
         .map(char::from)
         .collect()
 }
 
+pub(crate) fn set_hostname_bytes(hostname: &[u8]) {
+    current()
+        .as_thread()
+        .proc_data
+        .uts_ns()
+        .set_nodename(hostname);
+}
+
 pub(crate) fn set_domainname_bytes(domainname: &[u8]) {
     current()
         .as_thread()
         .proc_data
-        .uts_ns
+        .uts_ns()
         .set_domainname(domainname);
 }
 
@@ -229,33 +269,33 @@ pub fn sys_uname(name: *mut new_utsname) -> AxResult<isize> {
 }
 
 pub fn sys_sethostname(name: *const u8, len: usize) -> AxResult<isize> {
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    if !proc_data.has_effective_capability(linux_raw_sys::general::CAP_SYS_ADMIN) {
+        return Err(AxError::OperationNotPermitted);
+    }
     if len > UTS_FIELD_LEN {
         return Err(AxError::InvalidInput);
     }
     if name.is_null() {
         return Err(AxError::BadAddress);
     }
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    if !proc_data.has_effective_capability(linux_raw_sys::general::CAP_SYS_ADMIN) {
-        return Err(AxError::OperationNotPermitted);
-    }
     let hostname = vm_load(name, len)?;
-    proc_data.uts_ns.set_nodename(&hostname);
+    set_hostname_bytes(&hostname);
     Ok(0)
 }
 
 pub fn sys_setdomainname(name: *const u8, len: usize) -> AxResult<isize> {
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    if !proc_data.has_effective_capability(linux_raw_sys::general::CAP_SYS_ADMIN) {
+        return Err(AxError::OperationNotPermitted);
+    }
     if len > UTS_FIELD_LEN {
         return Err(AxError::InvalidInput);
     }
     if name.is_null() {
         return Err(AxError::BadAddress);
-    }
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    if !proc_data.has_effective_capability(linux_raw_sys::general::CAP_SYS_ADMIN) {
-        return Err(AxError::OperationNotPermitted);
     }
     let domainname = vm_load(name, len)?;
     set_domainname_bytes(&domainname);
@@ -266,6 +306,15 @@ pub fn sys_sysinfo(info: *mut sysinfo) -> AxResult<isize> {
     // FIXME: Zeroable
     let mut kinfo: sysinfo = unsafe { core::mem::zeroed() };
     let stats = system_memory_stats();
+    let uptime = current()
+        .as_thread()
+        .proc_data
+        .time_ns()
+        .apply_boottime_offset(monotonic_time());
+    let uptime_secs = uptime
+        .as_secs()
+        .saturating_add(u64::from(uptime.subsec_nanos() != 0));
+    kinfo.uptime = uptime_secs.min(i64::MAX as u64) as _;
     kinfo.procs = processes().len() as _;
     kinfo.totalram = stats.total_bytes as _;
     kinfo.freeram = stats.free_bytes as _;
@@ -293,6 +342,15 @@ pub fn sys_personality(persona: u32) -> AxResult<isize> {
 }
 
 pub fn sys_syslog(kind: i32, buf: *mut c_char, len: isize) -> AxResult<isize> {
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let privileged = proc_data.has_effective_capability(CAP_SYSLOG)
+        || proc_data.has_effective_capability(CAP_SYS_ADMIN);
+    let restricted = kind != 3 && kind != 10;
+    if restricted && !privileged {
+        return Err(AxError::OperationNotPermitted);
+    }
+
     if !(0..=10).contains(&kind) {
         return Err(AxError::InvalidInput);
     }
@@ -300,24 +358,13 @@ pub fn sys_syslog(kind: i32, buf: *mut c_char, len: isize) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
 
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let privileged = proc_data.has_effective_capability(CAP_SYSLOG)
-        || proc_data.has_effective_capability(CAP_SYS_ADMIN);
-
     match kind {
         2 | 3 | 4 => {
-            if !privileged {
-                return Err(AxError::OperationNotPermitted);
-            }
             if buf.is_null() {
                 return Err(AxError::InvalidInput);
             }
         }
         8 => {
-            if !privileged {
-                return Err(AxError::OperationNotPermitted);
-            }
             if len > 8 {
                 return Err(AxError::InvalidInput);
             }
@@ -338,10 +385,13 @@ bitflags::bitflags! {
 }
 
 pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> AxResult<isize> {
+    let flags = GetRandomFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
+    if flags.contains(GetRandomFlags::RANDOM) && flags.contains(GetRandomFlags::INSECURE) {
+        return Err(AxError::InvalidInput);
+    }
     if len == 0 {
         return Ok(0);
     }
-    let flags = GetRandomFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
 
     debug!("sys_getrandom <= buf: {buf:p}, len: {len}, flags: {flags:?}");
 

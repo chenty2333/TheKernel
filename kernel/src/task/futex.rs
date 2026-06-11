@@ -51,39 +51,37 @@ struct WaitFuture<'a, F> {
 
 impl<F> Unpin for WaitFuture<'_, F> {}
 
+struct WaitRegistration {
+    waiter: Option<Arc<SpinNoIrq<WaiterEntry>>>,
+}
+
+impl Drop for WaitRegistration {
+    fn drop(&mut self) {
+        if let Some(waiter) = self.waiter.take() {
+            cancel_waiter(waiter);
+        }
+    }
+}
+
+struct WaitAnyFuture {
+    waiters: Vec<WaitRegistration>,
+    _targets: Vec<FutexHandle>,
+    timeout: Option<(AlarmClock, Duration)>,
+}
+
+impl Unpin for WaitAnyFuture {}
+
+impl Drop for WaitAnyFuture {
+    fn drop(&mut self) {
+        self.waiters.clear();
+        self._targets.clear();
+    }
+}
+
 impl<F> Drop for WaitFuture<'_, F> {
     fn drop(&mut self) {
         if let Some(waiter) = self.waiter.take() {
-            // Mark the waiter as cancelled first so future requeues can no
-            // longer keep moving it between futex queues.
-            let mut owner = {
-                let mut waiter = waiter.lock();
-                if waiter.awakened {
-                    return;
-                }
-                waiter.cancelled = true;
-                clear_waiter_proc_state(&waiter);
-                waiter.owner.clone()
-            };
-
-            loop {
-                let Some(owner_entry) = owner.upgrade() else {
-                    return;
-                };
-
-                let _gate = owner_entry.wq.gate.lock();
-                owner = {
-                    let waiter_entry = waiter.lock();
-                    if waiter_entry.awakened {
-                        return;
-                    }
-                    if Weak::ptr_eq(&waiter_entry.owner, &Arc::downgrade(&owner_entry)) {
-                        owner_entry.wq.remove_waiter_locked(&waiter);
-                        return;
-                    }
-                    waiter_entry.owner.clone()
-                };
-            }
+            cancel_waiter(waiter);
         }
     }
 }
@@ -134,11 +132,87 @@ impl<F: FnOnce() -> AxResult<bool>> Future for WaitFuture<'_, F> {
     }
 }
 
+impl Future for WaitAnyFuture {
+    type Output = AxResult<usize>;
+
+    fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        for (index, waiter) in self.waiters.iter_mut().enumerate() {
+            let Some(waiter) = waiter.waiter.as_ref() else {
+                continue;
+            };
+            let mut waiter = waiter.lock();
+            if waiter.awakened {
+                return Poll::Ready(Ok(index));
+            }
+            waiter.waker = Some(cx.waker().clone());
+        }
+
+        if self
+            .timeout
+            .is_some_and(|(clock, deadline)| clock.now() >= deadline)
+        {
+            return Poll::Ready(Err(AxError::TimedOut));
+        }
+
+        Poll::Pending
+    }
+}
+
 fn clear_waiter_proc_state(waiter: &WaiterEntry) {
     if let Some(task) = waiter.task.upgrade()
         && let Some(thread) = task.try_as_thread()
     {
         thread.set_proc_state_hint(ProcStateHint::None);
+    }
+}
+
+fn cancel_waiter(waiter: Arc<SpinNoIrq<WaiterEntry>>) {
+    // Mark the waiter as cancelled first so future requeues can no longer keep
+    // moving it between futex queues.
+    let mut owner = {
+        let mut waiter = waiter.lock();
+        if waiter.awakened {
+            return;
+        }
+        waiter.cancelled = true;
+        clear_waiter_proc_state(&waiter);
+        waiter.owner.clone()
+    };
+
+    loop {
+        let Some(owner_entry) = owner.upgrade() else {
+            return;
+        };
+
+        let _gate = owner_entry.wq.gate.lock();
+        owner = {
+            let waiter_entry = waiter.lock();
+            if waiter_entry.awakened {
+                return;
+            }
+            if Weak::ptr_eq(&waiter_entry.owner, &Arc::downgrade(&owner_entry)) {
+                owner_entry.wq.remove_waiter_locked(&waiter);
+                return;
+            }
+            waiter_entry.owner.clone()
+        };
+    }
+}
+
+fn awakened_registration_index(registrations: &[WaitRegistration]) -> Option<usize> {
+    registrations.iter().position(|registration| {
+        registration
+            .waiter
+            .as_ref()
+            .is_some_and(|waiter| waiter.lock().awakened)
+    })
+}
+
+fn setup_error_or_wake(registrations: &[WaitRegistration], err: AxError) -> AxResult<usize> {
+    if let Some(index) = awakened_registration_index(registrations) {
+        Ok(index)
+    } else {
+        Err(err)
     }
 }
 
@@ -378,6 +452,87 @@ impl WaitQueue {
     }
 }
 
+/// Waits until any one futex entry is woken.
+///
+/// The caller must already have validated each futex value while holding the
+/// corresponding queue gate. This helper only owns the sleep/wake lifecycle.
+pub fn wait_on_any_futex_if(
+    waiters: Vec<(FutexHandle, u32)>,
+    timeout: Option<(AlarmClock, Duration)>,
+    mut condition: impl FnMut(usize) -> AxResult<bool>,
+) -> AxResult<usize> {
+    let mut targets = Vec::with_capacity(waiters.len());
+    let mut registrations = Vec::with_capacity(waiters.len());
+    for (index, (futex, bitset)) in waiters.into_iter().enumerate() {
+        let waiter = Arc::new(SpinNoIrq::new(WaiterEntry {
+            bitset,
+            awakened: false,
+            cancelled: false,
+            owner: Arc::downgrade(&futex.inner),
+            task: Arc::downgrade(&current()),
+            waker: None,
+        }));
+        {
+            let _gate = futex.inner.wq.gate.lock();
+            let matches = match condition(index) {
+                Ok(matches) => matches,
+                Err(err) => return setup_error_or_wake(&registrations, err),
+            };
+            if !matches {
+                return setup_error_or_wake(&registrations, AxError::WouldBlock);
+            }
+            futex.inner.wq.queue.lock().push_back(waiter.clone());
+            if let Some(task) = waiter.lock().task.upgrade()
+                && let Some(thread) = task.try_as_thread()
+            {
+                thread.set_proc_state_hint(ProcStateHint::Interruptible);
+            }
+        }
+        registrations.push(WaitRegistration {
+            waiter: Some(waiter),
+        });
+        targets.push(futex);
+    }
+
+    let wait = WaitAnyFuture {
+        waiters: registrations,
+        _targets: targets,
+        timeout,
+    };
+    let wait = async {
+        if let Some((clock, deadline)) = timeout {
+            let mut wait = core::pin::pin!(wait);
+            let mut sleeper = core::pin::pin!(sleep_until_clock(clock, deadline));
+            poll_fn(|cx| {
+                if let Poll::Ready(result) = wait.as_mut().poll(cx) {
+                    return Poll::Ready(result);
+                }
+                if sleeper.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Err(AxError::TimedOut));
+                }
+                Poll::Pending
+            })
+            .await
+        } else {
+            wait.await
+        }
+    };
+    let curr = current();
+    let mut wait = core::pin::pin!(wait);
+    block_on(poll_fn(|cx| {
+        if let Poll::Ready(result) = wait.as_mut().poll(cx) {
+            return Poll::Ready(result);
+        }
+        if curr.poll_interrupt(cx).is_ready() {
+            return Poll::Ready(Err(AxError::Interrupted));
+        }
+        if let Poll::Ready(result) = wait.as_mut().poll(cx) {
+            return Poll::Ready(result);
+        }
+        Poll::Pending
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use core::task::{Context, Poll, Waker};
@@ -611,6 +766,21 @@ impl FutexTable {
             inner: entry.clone(),
         }
     }
+
+    /// Gets or inserts a futex entry and keeps its table slot alive until the
+    /// returned handle is dropped.
+    pub fn get_or_insert_owned(self: &Arc<Self>, key: &FutexKey) -> FutexHandle {
+        let key = key.as_usize();
+        let mut table = self.0.lock();
+        let entry = table
+            .entry(key)
+            .or_insert_with(|| Arc::new(FutexEntry::new()));
+        FutexHandle {
+            table: self.clone(),
+            key,
+            inner: entry.clone(),
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -625,6 +795,29 @@ impl Deref for FutexGuard<'_> {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
+    }
+}
+
+/// An owned futex table entry handle that can be held across a blocking wait.
+pub struct FutexHandle {
+    table: Arc<FutexTable>,
+    key: usize,
+    inner: Arc<FutexEntry>,
+}
+
+impl Deref for FutexHandle {
+    type Target = Arc<FutexEntry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Drop for FutexHandle {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.inner) <= 2 && self.inner.wq.is_empty() {
+            self.table.0.lock().remove(&self.key);
+        }
     }
 }
 

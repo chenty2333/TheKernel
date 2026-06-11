@@ -26,7 +26,10 @@ use super::{
     AsThread, FutexKey, ProcStateHint, ProcessData, TaskUsage, TimerState, futex_table_for,
     send_signal_thread_inner, send_signal_to_process, send_signal_to_thread,
 };
-use crate::mm::{AddrSpace, UserPtr, access_user_memory};
+use crate::{
+    mm::{AddrSpace, UserPtr, access_user_memory},
+    syscall::acct_process_exit,
+};
 
 static TASK_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
 static TASK_ALIAS_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
@@ -527,12 +530,15 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     thr.proc_data.end_exec(tid);
     let process_exited = process.exit_thread(tid, exit_code);
     if process_exited {
+        let self_usage = thr.proc_data.self_usage();
+        let child_usage = thr.proc_data.children_usage();
+        acct_process_exit(&thr.proc_data, exit_code, self_usage);
         thr.proc_data.release_executable();
         crate::file::flock::release_posix_owner(process.pid());
         process.publish_zombie_snapshot(ZombieSnapshot {
             wait_status: process.exit_code(),
-            self_usage: thr.proc_data.self_usage().into(),
-            child_usage: thr.proc_data.children_usage().into(),
+            self_usage: self_usage.into(),
+            child_usage: child_usage.into(),
             uid: thr.proc_data.uid(),
         });
         process.exit();

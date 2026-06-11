@@ -24,11 +24,11 @@ use starry_vm::{VmError, vm_load_until_nul};
 use crate::task::reset_current_user_fpu_state;
 use crate::{
     config::USER_HEAP_BASE,
-    file::{FD_TABLE, ResolveAtResult, executable, resolve_at},
+    file::{FD_TABLE, ResolveAtResult, executable, fanotify, resolve_at},
     mm::{copy_from_kernel, load_user_app, new_user_aspace_empty, vm_load_string},
     task::{
         AsThread, ProcessData, Thread, add_task_alias, check_signals, get_task,
-        has_pending_fatal_signal, set_current_user_page_table_root,
+        has_pending_fatal_signal, notify_ptrace_attach_stop, set_current_user_page_table_root,
     },
 };
 
@@ -211,6 +211,14 @@ fn do_execve(
     envs: Vec<String>,
 ) -> AxResult<isize> {
     executable::check_not_write_open(&loc)?;
+    fanotify::permission_check(
+        &loc,
+        &loc,
+        fanotify::FAN_OPEN_EXEC_PERM,
+        loc.is_dir(),
+        false,
+    )?;
+    fanotify::permission_check(&loc, &loc, fanotify::FAN_OPEN_PERM, loc.is_dir(), false)?;
 
     let abs_path = loc.absolute_path()?.to_string();
     let task_name = loc.name().to_string();
@@ -220,6 +228,13 @@ fn do_execve(
     let (entry_point, user_stack_base) =
         load_user_app(&mut new_aspace, Some(abs_path.as_str()), &args, &envs)?;
     let executable_key = executable::acquire(&loc);
+    fanotify::notify(
+        &loc,
+        &loc,
+        fanotify::FAN_OPEN | fanotify::FAN_OPEN_EXEC,
+        loc.is_dir(),
+        false,
+    );
 
     let curr = current();
     let thr = curr.as_thread();
@@ -252,6 +267,8 @@ fn do_execve(
     let old_aspace = proc_data.replace_aspace(new_aspace);
     set_current_user_page_table_root(new_root);
     drop(old_aspace);
+    proc_data.clear_membarrier_registrations();
+    proc_data.clear_keep_caps_on_exec();
     curr.as_thread().set_tid(proc_data.proc.pid());
     if curr_tid != proc_data.proc.pid() {
         let curr_task = curr.clone();
@@ -308,6 +325,9 @@ fn do_execve(
 
     uctx.set_ip(entry_point.as_usize());
     uctx.set_sp(user_stack_base.as_usize());
+    if proc_data.ptrace_tracer().is_some() && proc_data.ptrace_stop(Signo::SIGTRAP as u8) {
+        notify_ptrace_attach_stop(proc_data);
+    }
     Ok(0)
 }
 

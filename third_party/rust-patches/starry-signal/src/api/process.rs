@@ -104,7 +104,14 @@ impl ProcessSignalManager {
     pub fn send_signal(&self, sig: SignalInfo) -> Option<u32> {
         let signo = sig.signo();
         if self.signal_ignored(signo) {
-            return None;
+            let blocked_by_any_thread = self.children.lock().iter().any(|(_, thread)| {
+                thread.upgrade().is_some_and(|thread| {
+                    thread.signal_blocked(signo) || thread.signal_real_blocked(signo)
+                })
+            });
+            if !blocked_by_any_thread {
+                return None;
+            }
         }
 
         if self.pending.lock().put_signal(sig) {

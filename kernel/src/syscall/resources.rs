@@ -1,10 +1,39 @@
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axtask::current;
-use linux_raw_sys::general::{CAP_SYS_RESOURCE, RLIM_NLIMITS, rlimit, rlimit64, rusage};
+use linux_raw_sys::general::{
+    CAP_SYS_RESOURCE, RLIM_NLIMITS, RLIMIT_NOFILE, rlimit, rlimit64, rusage,
+};
 use starry_process::Pid;
 use starry_vm::{VmMutPtr, VmPtr};
 
-use crate::task::{AsThread, TaskUsage, get_process_data};
+use crate::task::{AsThread, ProcessData, TaskUsage, get_process_data, nr_open_limit};
+
+fn can_raise_hard_limit(proc_data: &ProcessData) -> bool {
+    proc_data.has_effective_capability(CAP_SYS_RESOURCE) || proc_data.euid() == 0
+}
+
+fn set_resource_limit(proc_data: &ProcessData, resource: u32, new_limit: rlimit64) -> AxResult<()> {
+    if new_limit.rlim_cur > new_limit.rlim_max {
+        return Err(AxError::InvalidInput);
+    }
+    if resource == RLIMIT_NOFILE && new_limit.rlim_max > nr_open_limit() {
+        return Err(AxError::from(LinuxError::EPERM));
+    }
+
+    let curr = current();
+    let curr_proc = &curr.as_thread().proc_data;
+    let limit = &mut proc_data.rlim.write()[resource];
+    if new_limit.rlim_max <= limit.max {
+        limit.max = new_limit.rlim_max;
+    } else if can_raise_hard_limit(curr_proc) {
+        limit.max = new_limit.rlim_max;
+    } else {
+        return Err(AxError::OperationNotPermitted);
+    }
+
+    limit.current = new_limit.rlim_cur;
+    Ok(())
+}
 
 pub fn sys_prlimit64(
     pid: Pid,
@@ -28,24 +57,27 @@ pub fn sys_prlimit64(
     if let Some(new_limit) = new_limit.nullable() {
         // FIXME: AnyBitPattern
         let new_limit = unsafe { new_limit.vm_read_uninit()?.assume_init() };
-        if new_limit.rlim_cur > new_limit.rlim_max {
-            return Err(AxError::InvalidInput);
-        }
-
-        let curr = current();
-        let curr_proc = &curr.as_thread().proc_data;
-        let limit = &mut proc_data.rlim.write()[resource];
-        if new_limit.rlim_max <= limit.max {
-            limit.max = new_limit.rlim_max;
-        } else if curr_proc.has_effective_capability(CAP_SYS_RESOURCE) || curr_proc.euid() == 0 {
-            limit.max = new_limit.rlim_max;
-        } else {
-            return Err(AxError::OperationNotPermitted);
-        }
-
-        limit.current = new_limit.rlim_cur;
+        set_resource_limit(&proc_data, resource, new_limit)?;
     }
 
+    Ok(0)
+}
+
+pub fn sys_setrlimit(resource: u32, new_limit: *const rlimit) -> AxResult<isize> {
+    if resource >= RLIM_NLIMITS {
+        return Err(AxError::InvalidInput);
+    }
+
+    let new_limit = unsafe { new_limit.vm_read_uninit()?.assume_init() };
+    let proc_data = current().as_thread().proc_data.clone();
+    set_resource_limit(
+        &proc_data,
+        resource,
+        rlimit64 {
+            rlim_cur: new_limit.rlim_cur,
+            rlim_max: new_limit.rlim_max,
+        },
+    )?;
     Ok(0)
 }
 

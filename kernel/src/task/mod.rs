@@ -30,8 +30,8 @@ pub use self::{
 };
 pub(crate) use self::{
     creds::{CapabilityState, Credentials},
-    jobctl::ContinueResult,
-    process::{UTS_FIELD_LEN, UtsNamespace},
+    jobctl::{ContinueResult, StopReport},
+    process::{PidNamespace, TimeNamespace, UTS_FIELD_LEN, UserNamespace, UtsNamespace},
     restart::*,
     thread::ProcStateHint,
 };

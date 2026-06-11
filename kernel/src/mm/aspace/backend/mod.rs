@@ -200,6 +200,14 @@ impl Backend {
         matches!(self, Backend::Cow(backend) if backend.is_private_anonymous())
     }
 
+    pub fn check_protect_flags(&self, flags: MappingFlags) -> AxResult {
+        match self {
+            Backend::File(backend) => backend.check_flags(flags),
+            Backend::Shared(backend) => backend.check_protect_flags(flags),
+            Backend::Linear(_) | Backend::Cow(_) => Ok(()),
+        }
+    }
+
     pub fn relocate(
         &self,
         old_start: VirtAddr,

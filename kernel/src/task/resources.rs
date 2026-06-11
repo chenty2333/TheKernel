@@ -1,6 +1,9 @@
 //! Resource limits.
 
-use core::ops::{Index, IndexMut};
+use core::{
+    ops::{Index, IndexMut},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use linux_raw_sys::general::{
     RLIM_INFINITY, RLIM_NLIMITS, RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_STACK,
@@ -8,6 +11,23 @@ use linux_raw_sys::general::{
 
 /// The maximum number of open files
 pub const AX_FILE_LIMIT: usize = 1024;
+
+/// Linux's default system-wide ceiling for RLIMIT_NOFILE.
+pub const NR_OPEN_MAX: u64 = 1_048_576;
+
+static NR_OPEN_LIMIT: AtomicU64 = AtomicU64::new(NR_OPEN_MAX);
+
+pub fn nr_open_limit() -> u64 {
+    NR_OPEN_LIMIT.load(Ordering::Relaxed)
+}
+
+pub fn set_nr_open_limit(value: u64) -> bool {
+    if value < AX_FILE_LIMIT as u64 {
+        return false;
+    }
+    NR_OPEN_LIMIT.store(value, Ordering::Relaxed);
+    true
+}
 
 /// The limit for a specific resource
 #[derive(Default)]

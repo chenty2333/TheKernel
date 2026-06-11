@@ -89,7 +89,7 @@ make dev-shell
 or non-interactively:
 
 ```bash
-make dev-shell DEV_CMD="./scripts/oscomp.sh lab audit"
+make dev-shell DEV_CMD="./scripts/lab audit"
 ```
 
 ## OSComp Scripts
@@ -101,6 +101,7 @@ make dev-shell DEV_CMD="./scripts/oscomp.sh lab audit"
 - `scripts/verify-pre2025-layout.sh`: checks the official image layout.
 - `scripts/build-oscomp-support-disk.sh`: builds the support disk consumed by
   the guest runner.
+- `scripts/lab`: short LTP lab entrypoint.
 - `scripts/ltp-lab.py`: LTP inventory, campaign creation, semantic batch
   records, focused replay, parsing, promotion, cleanup, and audit tooling.
 - `scripts/support-tools/`: small helper binaries built into the support disk.
@@ -121,7 +122,10 @@ make dev-shell DEV_CMD="./scripts/oscomp.sh lab audit"
   implementation ledgers, taxonomy, and promotion evidence.
 - `.state/ltp-lab/images/`: cached decompressed official images; keep these for
   faster inventory and replay unless disk pressure is severe.
-- `.state/ltp-lab/refs/`: optional Linux and testsuite reference checkouts.
+- `.state/ltp-lab/refs/linux`: optional Linux source tree used as a behavior
+  and ABI reference.
+- `.state/ltp-lab/refs/testsuits-for-oskernel`: optional testsuite source tree
+  used for testcase source and runtest metadata.
 - `.state/baseline/`: local baseline replay evidence. Logs and parsed summaries
   are useful; copied `sdcard-*.img` and `disk*.img` files are disposable heavy
   artifacts.
@@ -129,7 +133,7 @@ make dev-shell DEV_CMD="./scripts/oscomp.sh lab audit"
 `.state/ltp-lab` is local and ignored by git. Recreate it with:
 
 ```bash
-make lab-inventory
+make dev-shell DEV_CMD='make lab-inventory'
 ```
 
 ## External Assets
@@ -149,17 +153,25 @@ Search order is encoded in `scripts/replay-oscomp-eval.sh` and
 - `/coursegrader/testdata`
 
 Reference source checkouts are optional and should stay under `.state/ltp-lab/refs`
-or another ignored path:
+or another ignored path. The standard repo-local paths are:
 
-- Linux source for behavior reference
-- `testsuits-for-oskernel` source for test source and runtest metadata
+- `.state/ltp-lab/refs/linux` for Linux behavior and ABI reference.
+- `.state/ltp-lab/refs/testsuits-for-oskernel` for testcase source and runtest
+  metadata.
+
+These source references are not official replay images. Official images are the
+`sdcard-*.img[.xz]` files discovered from the search order above or mounted in
+Docker at `/opt/oskernel/testsuites`.
 
 ## LTP Campaigns
 
 The main LTP expansion path is campaign-based. Campaign directories under
 `.state/ltp-lab/campaigns/` are local, ignored state for fixed candidate
-batches, semantic prompts, implementation notes, run analysis, taxonomy, and
-cleanup status. See `docs/ltp-lab.md` for commands.
+batches, semantic prompts, implementation notes, deferred validation, run
+analysis, taxonomy, and cleanup status. Use `make lab-new`, `make lab-run`,
+`make lab-review`, `make lab-apply`, and `make lab-done` for the normal flow.
+Code-first goals should use campaigns as the static case ledger before spending
+time on replay. See `docs/ltp-lab.md` for details.
 
 ## Current Documentation
 
@@ -183,27 +195,26 @@ make lab-trim
 ```
 
 Run this after campaign evidence has been analyzed or finished. It removes
-failed/empty lab runs, per-run support images and QEMU workdirs, baseline replay
-image copies, smoke leftovers, and stale root score artifacts while keeping
-campaigns, official image cache, and reference checkouts.
+disposable generated state while keeping campaigns, cached official images, and
+reference checkouts.
 
-Stronger generated-state cleanup:
+Stronger generated run/list/plan cleanup:
 
 ```bash
 make lab-clean
 ```
 
-Preview or customize cleanup:
+Preview or customize cleanup through the lab tool:
 
 ```bash
-./scripts/oscomp.sh lab clean --trim --dry-run
-./scripts/oscomp.sh lab clean --generated --cache --dry-run
+./scripts/lab clean trim --dry-run
+./scripts/lab clean generated --dry-run
 ```
 
-Audit stale state:
+Audit stale state and disk-heavy artifacts:
 
 ```bash
-./scripts/oscomp.sh lab audit
+./scripts/lab audit
 ```
 
 Root-level `rv_.out`, `la_.out`, and `score.txt` are treated as stale legacy

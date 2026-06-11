@@ -1,3 +1,4 @@
+use alloc::sync::Arc;
 use core::time::Duration;
 
 use axerrno::{AxError, AxResult};
@@ -15,6 +16,7 @@ use crate::{
     file::{
         FileLike,
         epoll::{Epoll, EpollEvent, EpollFlags},
+        get_file_description,
     },
     mm::{UserConstPtr, UserPtr, nullable},
     syscall::signal::check_sigset_size,
@@ -43,7 +45,16 @@ pub fn sys_epoll_ctl(
     fd: i32,
     event: UserConstPtr<epoll_event>,
 ) -> AxResult<isize> {
-    let epoll = Epoll::from_fd(epfd)?;
+    let epoll_description = get_file_description(epfd)?;
+    let target = get_file_description(fd)?;
+    if Arc::ptr_eq(&epoll_description, &target) {
+        return Err(AxError::InvalidInput);
+    }
+    let epoll = epoll_description
+        .inner
+        .clone()
+        .downcast_arc::<Epoll>()
+        .map_err(|_| AxError::InvalidInput)?;
     debug!("sys_epoll_ctl <= epfd: {epfd}, op: {op}, fd: {fd}");
 
     let parse_event = || -> AxResult<(EpollEvent, EpollFlags)> {
@@ -61,11 +72,13 @@ pub fn sys_epoll_ctl(
     };
     match op {
         EPOLL_CTL_ADD => {
-            let (event, flags) = parse_event()?;
+            let (mut event, flags) = parse_event()?;
+            event.events |= IoEvents::ALWAYS_POLL;
             epoll.add(fd, event, flags)?;
         }
         EPOLL_CTL_MOD => {
-            let (event, flags) = parse_event()?;
+            let (mut event, flags) = parse_event()?;
+            event.events |= IoEvents::ALWAYS_POLL;
             epoll.modify(fd, event, flags)?;
         }
         EPOLL_CTL_DEL => {

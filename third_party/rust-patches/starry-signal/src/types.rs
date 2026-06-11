@@ -217,13 +217,7 @@ impl SignalInfo {
         let mut result: Self = unsafe { mem::zeroed() };
         result.set_signo(signo);
         result.set_code(code);
-        result
-            .0
-            .__bindgen_anon_1
-            .__bindgen_anon_1
-            ._sifields
-            ._sigchld
-            ._pid = pid as _;
+        result.set_pid(pid);
         result
     }
 
@@ -241,6 +235,26 @@ impl SignalInfo {
 
     pub fn set_code(&mut self, code: i32) {
         self.0.__bindgen_anon_1.__bindgen_anon_1.si_code = code;
+    }
+
+    pub fn pid(&self) -> u32 {
+        unsafe {
+            self.0
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._kill
+                ._pid as u32
+        }
+    }
+
+    pub fn set_pid(&mut self, pid: u32) {
+        self.0
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            ._sifields
+            ._kill
+            ._pid = pid as _;
     }
 
     pub fn errno(&self) -> i32 {

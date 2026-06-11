@@ -11,7 +11,7 @@ use crate::{
     file::{File, FileLike, get_file_description, get_typed_file, io_uring::IoUringFile},
     mm::{AddrSpace, Backend, BackendOps, SharedPages},
     pseudofs::{Device, DeviceMmap},
-    task::AsThread,
+    task::{AsThread, ProcessData},
 };
 
 bitflags::bitflags! {
@@ -120,6 +120,14 @@ fn validate_file_mmap_access(
     Ok(())
 }
 
+fn may_protect_from_file_flags(open_flags: FileFlags) -> MappingFlags {
+    let mut flags = MappingFlags::READ | MappingFlags::EXECUTE;
+    if open_flags.contains(FileFlags::WRITE) && !open_flags.contains(FileFlags::APPEND) {
+        flags |= MappingFlags::WRITE;
+    }
+    flags
+}
+
 fn prefix_segments(segments: &[RemapSegment], size: usize) -> Vec<RemapSegment> {
     let mut remaining = size;
     let mut prefix = Vec::new();
@@ -226,7 +234,7 @@ fn map_relocated_segments(
             seg.backend
                 .duplicate_mapping(seg.start, seg_start, aspace_handle)?
         };
-        aspace.map(seg_start, seg.size, seg.flags, false, relocated)?;
+        aspace.map_with_lock_state(seg_start, seg.size, seg.flags, false, relocated, false)?;
         seg.backend.migrate_present_pages(
             seg.start,
             seg_start,
@@ -234,6 +242,53 @@ fn map_relocated_segments(
             &mut aspace.page_table_mut().cursor(),
         )?;
     }
+    Ok(())
+}
+
+fn locked_segments_for_remap(
+    aspace: &AddrSpace,
+    old_start: VirtAddr,
+    size: usize,
+) -> Vec<(usize, usize)> {
+    aspace
+        .locked_segments_in_range(old_start, size)
+        .into_iter()
+        .map(|(start, size)| (start.sub_addr(old_start), size))
+        .collect()
+}
+
+fn set_relocated_locked_segments(
+    aspace: &mut AddrSpace,
+    new_start: VirtAddr,
+    segments: &[(usize, usize)],
+) -> AxResult {
+    for &(offset, size) in segments {
+        aspace.set_locked(new_start + offset, size, true)?;
+    }
+    Ok(())
+}
+
+fn check_mremap_locked_growth_limit(
+    proc_data: &ProcessData,
+    aspace: &AddrSpace,
+    grow: usize,
+    reclaimed_locked: usize,
+) -> AxResult {
+    if grow == 0 || proc_data.has_effective_capability(CAP_IPC_LOCK) {
+        return Ok(());
+    }
+
+    let limit_error = AxError::from(LinuxError::EAGAIN);
+    let locked_bytes = aspace
+        .locked_bytes()
+        .saturating_sub(reclaimed_locked)
+        .checked_add(grow)
+        .ok_or(limit_error)?;
+    let limit = proc_data.rlim.read()[RLIMIT_MEMLOCK].current;
+    if (locked_bytes as u128) > u128::from(limit) {
+        return Err(limit_error);
+    }
+
     Ok(())
 }
 
@@ -429,9 +484,10 @@ pub fn sys_mmap(
                             DeviceMmap::None => {
                                 return Err(AxError::NoSuchDevice);
                             }
-                            DeviceMmap::Anonymous => Backend::new_shared(
+                            DeviceMmap::Anonymous => Backend::new_shared_with_may_protect(
                                 start,
                                 Arc::new(SharedPages::new(length, PageSize::Size4K)?),
+                                may_protect_from_file_flags(file.flags()),
                             ),
                             DeviceMmap::ReadOnly => Backend::new_cow(
                                 start,
@@ -520,11 +576,16 @@ pub fn sys_mmap(
         _ => return Err(AxError::InvalidInput),
     };
 
-    if map_flags.contains(MmapFlags::LOCKED) {
-        check_memlock_limit(&curr.as_thread().proc_data, length)?;
+    let locked_mapping = map_flags.contains(MmapFlags::LOCKED) || aspace.locks_future_mappings();
+    if locked_mapping {
+        check_mmap_memlock_limit(proc_data, &aspace, start, length)?;
     }
 
-    let populate = map_flags.intersects(MmapFlags::POPULATE | MmapFlags::LOCKED);
+    let populate = map_flags.contains(MmapFlags::POPULATE)
+        || map_flags.contains(MmapFlags::LOCKED)
+        || (aspace.locks_future_mappings()
+            && !aspace.locks_future_mappings_on_fault()
+            && !permission_flags.is_empty());
     aspace.map(start, length, permission_flags.into(), populate, backend)?;
     if map_flags.contains(MmapFlags::LOCKED) {
         aspace.set_locked(start, length, true)?;
@@ -538,6 +599,16 @@ pub fn sys_mmap(
 
 pub fn sys_munmap(addr: usize, length: usize) -> AxResult<isize> {
     debug!("sys_munmap <= addr: {addr:#x}, length: {length:x}");
+    const PAGE_SIZE: usize = PageSize::Size4K as usize;
+    const USER_SPACE_END: usize = crate::config::USER_SPACE_BASE + crate::config::USER_SPACE_SIZE;
+
+    if !addr.is_multiple_of(PAGE_SIZE) || length == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if length > USER_SPACE_END.saturating_sub(addr) {
+        return Err(AxError::InvalidInput);
+    }
+
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let aspace_handle = proc_data.aspace();
@@ -670,15 +741,30 @@ pub fn sys_mremap(
     let moved_segments = prefix_segments(&segments, preserve_size);
     let grow = new_size.saturating_sub(old_size);
     let primary = &segments[0];
+    let locked_segments = locked_segments_for_remap(&aspace, addr, preserve_size);
+    let grow_locked = new_size > old_size && aspace.range_is_fully_locked(addr, old_size);
 
     // Try to grow in-place first.
     let after = addr + old_size;
     let can_grow_inplace =
         !fixed && new_size > old_size && range_is_free(&aspace, after, grow, page_size as usize);
     if can_grow_inplace {
+        if grow_locked {
+            check_mremap_locked_growth_limit(proc_data, &aspace, grow, 0)?;
+        }
         primary.backend.ensure_range_covered(addr, new_size)?;
         let tail_backend = primary.backend.relocate(addr, addr, &aspace_handle)?;
-        aspace.map(after, grow, primary.flags, false, tail_backend)?;
+        if let Err(err) = aspace.map_with_lock_state(
+            after,
+            grow,
+            primary.flags,
+            grow_locked,
+            tail_backend,
+            grow_locked,
+        ) {
+            let _ = aspace.unmap(after, grow);
+            return Err(err);
+        }
         return Ok(addr.as_usize() as isize);
     }
 
@@ -702,6 +788,12 @@ pub fn sys_mremap(
     };
 
     if new_size > old_size {
+        if grow_locked {
+            let reclaimed_locked = fixed
+                .then(|| aspace.locked_bytes_in_range(dst, new_size))
+                .unwrap_or(0);
+            check_mremap_locked_growth_limit(proc_data, &aspace, grow, reclaimed_locked)?;
+        }
         primary.backend.ensure_range_covered(addr, new_size)?;
     }
     if fixed {
@@ -722,7 +814,14 @@ pub fn sys_mremap(
     }
     if new_size > old_size {
         let tail_backend = primary.backend.relocate(addr, dst, &aspace_handle)?;
-        if let Err(err) = aspace.map(dst + old_size, grow, primary.flags, false, tail_backend) {
+        if let Err(err) = aspace.map_with_lock_state(
+            dst + old_size,
+            grow,
+            primary.flags,
+            grow_locked,
+            tail_backend,
+            grow_locked,
+        ) {
             let _ = aspace.unmap(dst, new_size);
             return Err(err);
         }
@@ -733,6 +832,7 @@ pub fn sys_mremap(
     }
     proc_data.clear_mempolicy_range(addr.as_usize(), old_size);
     proc_data.clear_mempolicy_range(dst.as_usize(), new_size);
+    set_relocated_locked_segments(&mut aspace, dst, &locked_segments)?;
 
     Ok(dst.as_usize() as isize)
 }
@@ -754,10 +854,15 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
 
     match advice {
         // Hints the kernel may safely ignore once the range is known-valid.
-        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTFORK
-        | MADV_DOFORK | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP
-        | MADV_COLD | MADV_PAGEOUT | MADV_COLLAPSE => {
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_HUGEPAGE
+        | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP | MADV_COLD | MADV_PAGEOUT
+        | MADV_COLLAPSE => {
             inspect_madvise_range(&aspace, start, length)?;
+            Ok(0)
+        }
+        MADV_DONTFORK | MADV_DOFORK => {
+            inspect_madvise_range(&aspace, start, length)?;
+            aspace.set_dontfork(start, length, advice == MADV_DONTFORK)?;
             Ok(0)
         }
         MADV_POPULATE_READ => {
@@ -810,6 +915,7 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
 
 pub fn sys_msync(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     debug!("sys_msync <= addr: {addr:#x}, length: {length:x}, flags: {flags:#x}");
+    const PAGE_SIZE: usize = PageSize::Size4K as usize;
 
     if !addr.is_multiple_of(PageSize::Size4K as usize) {
         return Err(AxError::InvalidInput);
@@ -827,18 +933,23 @@ pub fn sys_msync(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     // outside the lock so page-cache eviction callbacks can unmap old PTEs.
     let curr = current();
     let aspace_handle = curr.as_thread().proc_data.aspace();
-    let length = align_up_4k(length);
-    let backends = {
+    let length = length.wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    if addr.wrapping_add(length) < addr {
+        return Err(AxError::NoMemory);
+    }
+    let fail_on_first_unmapped = flags == MS_ASYNC;
+    let (backends, saw_unmapped) = {
         let aspace = aspace_handle.lock();
         if length > 0 {
             let start = VirtAddr::from(addr);
-            let backends = aspace.sync_backends_in_range(start, length)?;
+            let (backends, saw_unmapped) =
+                aspace.sync_backends_in_range(start, length, fail_on_first_unmapped)?;
             if flags & MS_INVALIDATE != 0 && aspace.range_is_locked(start, length) {
                 return Err(LinuxError::EBUSY.into());
             }
-            backends
+            (backends, saw_unmapped)
         } else {
-            Vec::new()
+            (Vec::new(), false)
         }
     };
 
@@ -848,6 +959,10 @@ pub fn sys_msync(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
         }
     }
 
+    if saw_unmapped {
+        return Err(AxError::NoMemory);
+    }
+
     Ok(0)
 }
 
@@ -855,20 +970,73 @@ pub fn sys_mlock(addr: usize, length: usize) -> AxResult<isize> {
     sys_mlock2(addr, length, 0)
 }
 
-fn check_memlock_limit(proc_data: &crate::task::ProcessData, length: usize) -> AxResult {
-    if length == 0 || proc_data.has_effective_capability(CAP_IPC_LOCK) {
-        return Ok(());
+fn memlock_limit(proc_data: &ProcessData) -> AxResult<Option<u64>> {
+    if proc_data.has_effective_capability(CAP_IPC_LOCK) {
+        return Ok(None);
     }
-
     let limit = proc_data.rlim.read()[RLIMIT_MEMLOCK].current;
     if limit == 0 {
         return Err(AxError::OperationNotPermitted);
     }
-    if (length as u64) > limit {
-        return Err(AxError::NoMemory);
+
+    Ok(Some(limit))
+}
+
+fn check_memlock_total(
+    proc_data: &ProcessData,
+    locked_bytes: usize,
+    limit_error: AxError,
+) -> AxResult {
+    if let Some(limit) = memlock_limit(proc_data)?
+        && (locked_bytes as u128) > u128::from(limit)
+    {
+        return Err(limit_error);
     }
 
     Ok(())
+}
+
+fn locked_bytes_after_range(
+    aspace: &AddrSpace,
+    start: VirtAddr,
+    length: usize,
+    overflow_error: AxError,
+) -> AxResult<usize> {
+    let already_locked = aspace.locked_bytes_in_range(start, length);
+    let additional_locked = length.saturating_sub(already_locked);
+    aspace
+        .locked_bytes()
+        .checked_add(additional_locked)
+        .ok_or(overflow_error)
+}
+
+fn check_mlock_range_limit(
+    proc_data: &ProcessData,
+    aspace: &AddrSpace,
+    start: VirtAddr,
+    length: usize,
+) -> AxResult {
+    let locked_bytes = locked_bytes_after_range(aspace, start, length, AxError::NoMemory)?;
+    check_memlock_total(proc_data, locked_bytes, AxError::NoMemory)
+}
+
+pub(super) fn check_mmap_memlock_limit(
+    proc_data: &ProcessData,
+    aspace: &AddrSpace,
+    start: VirtAddr,
+    length: usize,
+) -> AxResult {
+    let limit_error = AxError::from(LinuxError::EAGAIN);
+    let locked_bytes = locked_bytes_after_range(aspace, start, length, limit_error)?;
+    check_memlock_total(proc_data, locked_bytes, limit_error)
+}
+
+fn check_mlockall_current_limit(proc_data: &ProcessData, aspace: &AddrSpace) -> AxResult {
+    check_memlock_total(proc_data, aspace.current_mapping_bytes(), AxError::NoMemory)
+}
+
+fn check_mlockall_future_limit(proc_data: &ProcessData) -> AxResult {
+    memlock_limit(proc_data).map(|_| ())
 }
 
 pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
@@ -887,7 +1055,7 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
         return Err(AxError::NoMemory);
     }
 
-    check_memlock_limit(proc_data, length)?;
+    check_mlock_range_limit(proc_data, &aspace, start, length)?;
     if flags & MLOCK_ONFAULT == 0 {
         aspace.populate_area(start, length, MappingFlags::empty())?;
     }
@@ -928,8 +1096,7 @@ pub fn sys_mlockall(flags: u32) -> AxResult<isize> {
     let mut aspace = aspace_handle.lock();
 
     if flags & MCL_CURRENT != 0 {
-        let length = aspace.current_mapping_bytes();
-        check_memlock_limit(proc_data, length)?;
+        check_mlockall_current_limit(proc_data, &aspace)?;
         if flags & MCL_ONFAULT == 0 {
             let ranges: Vec<_> = aspace
                 .areas()
@@ -941,12 +1108,10 @@ pub fn sys_mlockall(flags: u32) -> AxResult<isize> {
         }
         aspace.lock_current_mappings();
     } else {
-        check_memlock_limit(proc_data, 1)?;
+        check_mlockall_future_limit(proc_data)?;
     }
 
-    if flags & MCL_FUTURE != 0 {
-        aspace.set_lock_future_mappings(true);
-    }
+    aspace.set_lock_future_mappings(flags & MCL_FUTURE != 0, flags & MCL_ONFAULT != 0);
 
     Ok(0)
 }

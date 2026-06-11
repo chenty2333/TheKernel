@@ -28,12 +28,27 @@ pub struct ProcessUsage {
     pub utime_ns: u64,
     /// System CPU time in nanoseconds.
     pub stime_ns: u64,
+    /// Maximum resident set size in kilobytes.
+    pub maxrss_kb: u64,
 }
 
 impl ProcessUsage {
     /// Creates a new usage record.
     pub const fn new(utime_ns: u64, stime_ns: u64) -> Self {
-        Self { utime_ns, stime_ns }
+        Self {
+            utime_ns,
+            stime_ns,
+            maxrss_kb: 0,
+        }
+    }
+
+    /// Creates a new usage record with memory high-water accounting.
+    pub const fn with_maxrss(utime_ns: u64, stime_ns: u64, maxrss_kb: u64) -> Self {
+        Self {
+            utime_ns,
+            stime_ns,
+            maxrss_kb,
+        }
     }
 
     /// Returns the sum of two usage records, saturating on overflow.
@@ -41,6 +56,7 @@ impl ProcessUsage {
         Self {
             utime_ns: self.utime_ns.saturating_add(other.utime_ns),
             stime_ns: self.stime_ns.saturating_add(other.stime_ns),
+            maxrss_kb: self.maxrss_kb.max(other.maxrss_kb),
         }
     }
 }

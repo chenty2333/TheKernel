@@ -24,6 +24,8 @@ use crate::{
     task::{AsThread, ProcessData, Thread, add_task_to_table, new_user_task, vm_write_in_aspace},
 };
 
+const NORMAL_FORK_YIELD_INTERVAL: Pid = 64;
+
 bitflags! {
     /// Options for use with [`sys_clone`] and [`sys_clone3`].
     #[derive(Debug, Clone, Copy, Default)]
@@ -85,6 +87,21 @@ bitflags! {
         /// (Deprecated) Causes the parent not to receive a signal when the child terminated.
         const DETACHED = CLONE_DETACHED as u64;
     }
+}
+
+fn should_yield_after_clone(flags: CloneFlags, tid: Pid) -> bool {
+    if flags.intersects(
+        CloneFlags::THREAD
+            | CloneFlags::VM
+            | CloneFlags::VFORK
+            | CloneFlags::PARENT_SETTID
+            | CloneFlags::CHILD_SETTID
+            | CloneFlags::CHILD_CLEARTID,
+    ) {
+        return true;
+    }
+
+    tid % NORMAL_FORK_YIELD_INTERVAL == 0
 }
 
 /// Unified arguments for clone/clone3/fork/vfork.
@@ -297,11 +314,22 @@ impl CloneArgs {
             } else {
                 old_proc_data.net_ns.clone()
             };
-            let uts_ns = if flags.contains(CloneFlags::NEWUTS) {
-                old_proc_data.uts_ns.fork()
+            let pid_ns = if flags.contains(CloneFlags::NEWPID) {
+                old_proc_data.pid_ns().fork(tid)
             } else {
-                old_proc_data.uts_ns.clone()
+                old_proc_data.pid_ns()
             };
+            let user_ns = if flags.contains(CloneFlags::NEWUSER) {
+                old_proc_data.user_ns().fork()
+            } else {
+                old_proc_data.user_ns()
+            };
+            let uts_ns = if flags.contains(CloneFlags::NEWUTS) {
+                old_proc_data.uts_ns().fork()
+            } else {
+                old_proc_data.uts_ns()
+            };
+            let time_ns = old_proc_data.time_ns_for_children();
 
             #[cfg(target_arch = "loongarch64")]
             let (child_exe_path, child_cmdline) = {
@@ -327,7 +355,20 @@ impl CloneArgs {
                 signal_actions,
                 exit_signal,
                 net_ns,
+                pid_ns,
+                user_ns,
                 uts_ns,
+                time_ns,
+                if flags.contains(CloneFlags::IO) {
+                    old_proc_data.io_context.clone()
+                } else {
+                    Arc::new(())
+                },
+                if flags.contains(CloneFlags::SYSVSEM) {
+                    old_proc_data.sysvsem_undo.clone()
+                } else {
+                    Arc::new(())
+                },
             );
             proc_data.set_umask(old_proc_data.umask());
             proc_data.set_credentials(old_proc_data.credentials());
@@ -340,6 +381,8 @@ impl CloneArgs {
             if old_proc_data.no_new_privs() {
                 proc_data.set_no_new_privs();
             }
+            proc_data.set_seccomp_mode(old_proc_data.seccomp_mode());
+            proc_data.set_thp_disabled(old_proc_data.thp_disabled());
 
             {
                 let mut scope = proc_data.scope.write();
@@ -417,18 +460,14 @@ impl CloneArgs {
             new_proc_data.begin_vfork(curr.id().as_u64() as Pid);
         }
 
-        // Freshly forked user tasks need to run once promptly so they can
-        // establish their first blocking point before the parent starts
-        // /proc-based synchronization loops. Seeding them behind the parent's
-        // fair vruntime leaves large fork storms stuck in runnable state long
-        // enough for LTP children to hit their own futex timeouts first.
         let task = spawn_task_with_sched(new_task, child_sched_state);
         add_task_to_table(&task);
-        // Give the freshly cloned task a chance to enter its first blocking
-        // syscall before the parent spins in /proc-based synchronization
-        // loops. Large LTP fork storms otherwise leave children runnable long
-        // enough to trip their own timeouts on the single-CPU contest shape.
-        yield_now();
+        // Thread/vfork-style clones often rely on immediate child progress for
+        // futex or parent/child tid handshakes. Plain fork storms are allowed
+        // to batch so the parent can finish setup before worker children run.
+        if should_yield_after_clone(flags, tid) {
+            yield_now();
+        }
 
         if flags.contains(CloneFlags::VFORK) {
             Self::wait_for_vfork(&new_proc_data);

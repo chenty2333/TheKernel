@@ -9,12 +9,15 @@ use core::{
 use axerrno::AxError;
 use axhal::time::monotonic_time;
 use axpoll::{IoEvents, PollSet, Pollable};
-use axtask::future::{block_on, poll_io};
+use axtask::{
+    current,
+    future::{block_on, poll_io},
+};
 use spin::Mutex;
 
 use crate::{
     file::{FileLike, IoDst, IoSrc},
-    task::{AlarmClock, register_pollset_alarm},
+    task::{AlarmClock, AsThread, register_pollset_alarm},
     time::wall_time,
 };
 
@@ -22,20 +25,37 @@ use crate::{
 pub(crate) enum TimerClock {
     Realtime,
     Monotonic,
+    Boottime,
 }
 
 impl TimerClock {
-    fn now(self) -> Duration {
+    fn host_now(self) -> Duration {
         match self {
             Self::Realtime => wall_time(),
-            Self::Monotonic => monotonic_time(),
+            Self::Monotonic | Self::Boottime => monotonic_time(),
         }
     }
 
     fn alarm_clock(self) -> AlarmClock {
         match self {
             Self::Realtime => AlarmClock::Realtime,
-            Self::Monotonic => AlarmClock::Monotonic,
+            Self::Monotonic | Self::Boottime => AlarmClock::Monotonic,
+        }
+    }
+
+    fn absolute_deadline_to_host(self, value: Duration) -> Duration {
+        match self {
+            Self::Realtime => value,
+            Self::Monotonic => current()
+                .as_thread()
+                .proc_data
+                .time_ns()
+                .host_monotonic_deadline(value),
+            Self::Boottime => current()
+                .as_thread()
+                .proc_data
+                .time_ns()
+                .host_boottime_deadline(value),
         }
     }
 }
@@ -115,7 +135,7 @@ impl TimerFd {
         value: Duration,
     ) -> (Duration, Duration) {
         let mut inner = self.inner.lock();
-        let now = self.clock.now();
+        let now = self.clock.host_now();
 
         // Capture old state before modifying.
         inner.update_expirations(now);
@@ -135,7 +155,7 @@ impl TimerFd {
         } else {
             inner.interval = interval;
             let deadline = if absolute {
-                value
+                self.clock.absolute_deadline_to_host(value)
             } else {
                 now.checked_add(value).unwrap_or(Duration::MAX)
             };
@@ -151,7 +171,7 @@ impl TimerFd {
     /// Returns the current (interval, time-until-next-expiration).
     pub fn gettime(&self) -> (Duration, Duration) {
         let mut inner = self.inner.lock();
-        let now = self.clock.now();
+        let now = self.clock.host_now();
         inner.update_expirations(now);
 
         let value = inner
@@ -174,7 +194,7 @@ impl FileLike for TimerFd {
 
         block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
             let mut inner = self.inner.lock();
-            let now = self.clock.now();
+            let now = self.clock.host_now();
             inner.update_expirations(now);
 
             if inner.expirations > 0 {
@@ -220,7 +240,7 @@ impl FileLike for TimerFd {
 impl Pollable for TimerFd {
     fn poll(&self) -> IoEvents {
         let mut inner = self.inner.lock();
-        let now = self.clock.now();
+        let now = self.clock.host_now();
         inner.update_expirations(now);
 
         let mut events = IoEvents::empty();

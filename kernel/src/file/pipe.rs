@@ -39,6 +39,18 @@ const PIPE_MAX_CAPACITY_ARG: usize = 1 << 31;
 
 static PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(RING_BUFFER_INIT_SIZE);
 
+fn round_pipe_size(size: usize) -> AxResult<usize> {
+    if size > PIPE_MAX_CAPACITY_ARG {
+        return Err(AxError::InvalidInput);
+    }
+    if size < PAGE_SIZE_4K {
+        return Ok(PAGE_SIZE_4K);
+    }
+    size.checked_next_power_of_two()
+        .filter(|&size| size <= PIPE_MAX_CAPACITY_ARG)
+        .ok_or(AxError::InvalidInput)
+}
+
 fn pipe_capacity_limit() -> usize {
     PIPE_MAX_SIZE.load(Ordering::Relaxed).max(PAGE_SIZE_4K)
 }
@@ -48,6 +60,10 @@ fn default_pipe_capacity() -> usize {
         Some(thr) if thr.proc_data.euid() != 0 => RING_BUFFER_INIT_SIZE.min(pipe_capacity_limit()),
         _ => RING_BUFFER_INIT_SIZE,
     }
+}
+
+fn pipe_poll_writable(buffer: &HeapRb<u8>) -> bool {
+    buffer.vacant_len() >= PAGE_SIZE_4K
 }
 
 struct Shared {
@@ -230,18 +246,7 @@ impl Pipe {
     }
 
     pub fn resize(&self, requested_size: usize) -> AxResult<usize> {
-        if requested_size > PIPE_MAX_CAPACITY_ARG {
-            return Err(AxError::InvalidInput);
-        }
-
-        let pages = requested_size
-            .checked_add(PAGE_SIZE_4K - 1)
-            .ok_or(AxError::InvalidInput)?
-            / PAGE_SIZE_4K;
-        let new_size = pages
-            .max(1)
-            .checked_mul(PAGE_SIZE_4K)
-            .ok_or(AxError::InvalidInput)?;
+        let new_size = round_pipe_size(requested_size)?;
 
         if current().try_as_thread().is_some_and(|thr| {
             !thr.proc_data.has_effective_capability(CAP_SYS_RESOURCE)
@@ -363,7 +368,7 @@ impl Pipe {
                 events.set(IoEvents::IN, src.occupied_len() > 0);
                 drop(src);
                 let dst = self.dst.shared.buffer.lock();
-                events.set(IoEvents::OUT, dst.vacant_len() > 0);
+                events.set(IoEvents::OUT, pipe_poll_writable(&dst));
                 events
             }
 
@@ -460,8 +465,9 @@ pub(crate) fn pipe_max_size() -> usize {
     pipe_capacity_limit()
 }
 
-pub(crate) fn set_pipe_max_size(size: usize) {
-    PIPE_MAX_SIZE.store(size.max(PAGE_SIZE_4K), Ordering::Relaxed);
+pub(crate) fn set_pipe_max_size(size: usize) -> AxResult<()> {
+    PIPE_MAX_SIZE.store(round_pipe_size(size)?, Ordering::Relaxed);
+    Ok(())
 }
 
 fn raise_pipe() {
@@ -680,7 +686,8 @@ impl Pollable for Pipe {
             events.set(IoEvents::IN, buf.occupied_len() > 0);
             events.set(IoEvents::HUP, self.closed());
         } else {
-            events.set(IoEvents::OUT, buf.vacant_len() > 0);
+            events.set(IoEvents::OUT, pipe_poll_writable(&buf));
+            events.set(IoEvents::ERR, self.closed());
         }
         events
     }
@@ -810,8 +817,9 @@ impl Pollable for NamedPipe {
         if self.access.can_write() {
             events.set(
                 IoEvents::OUT,
-                self.state.reader_count() > 0 && buf.vacant_len() > 0,
+                self.state.reader_count() > 0 && pipe_poll_writable(&buf),
             );
+            events.set(IoEvents::ERR, self.state.reader_count() == 0);
         }
         events
     }

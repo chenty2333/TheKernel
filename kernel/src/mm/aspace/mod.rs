@@ -34,8 +34,10 @@ pub struct AddrSpace {
     areas: MemorySet<Backend>,
     growdown_starts: BTreeSet<VirtAddr>,
     wipe_on_fork_ranges: BTreeMap<VirtAddr, VirtAddr>,
+    dontfork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     locked_ranges: BTreeMap<VirtAddr, VirtAddr>,
     lock_future_mappings: bool,
+    lock_future_on_fault: bool,
     pt: PageTable,
 }
 
@@ -84,8 +86,10 @@ impl AddrSpace {
             areas: MemorySet::new(),
             growdown_starts: BTreeSet::new(),
             wipe_on_fork_ranges: BTreeMap::new(),
+            dontfork_ranges: BTreeMap::new(),
             locked_ranges: BTreeMap::new(),
             lock_future_mappings: false,
+            lock_future_on_fault: false,
             pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,
         })
     }
@@ -115,56 +119,101 @@ impl AddrSpace {
         }
     }
 
-    fn insert_wipe_on_fork_range(&mut self, start: VirtAddr, end: VirtAddr) {
+    fn insert_interval(ranges: &mut BTreeMap<VirtAddr, VirtAddr>, start: VirtAddr, end: VirtAddr) {
         if start >= end {
             return;
         }
 
         let mut new_start = start;
         let mut new_end = end;
-        let overlaps: Vec<_> = self
-            .wipe_on_fork_ranges
+        let overlaps: Vec<_> = ranges
             .range(..=end)
             .filter_map(|(&range_start, &range_end)| {
                 (range_end >= start && range_start <= end).then_some((range_start, range_end))
             })
             .collect();
         for (range_start, range_end) in overlaps {
-            self.wipe_on_fork_ranges.remove(&range_start);
+            ranges.remove(&range_start);
             new_start = new_start.min(range_start);
             new_end = new_end.max(range_end);
         }
-        self.wipe_on_fork_ranges.insert(new_start, new_end);
+        ranges.insert(new_start, new_end);
     }
 
-    fn clear_wipe_on_fork_range(&mut self, start: VirtAddr, size: usize) {
+    fn clear_interval(ranges: &mut BTreeMap<VirtAddr, VirtAddr>, start: VirtAddr, size: usize) {
         if size == 0 {
             return;
         }
         let end = start + size;
-        let overlaps: Vec<_> = self
-            .wipe_on_fork_ranges
+        let overlaps: Vec<_> = ranges
             .range(..end)
             .filter_map(|(&range_start, &range_end)| {
                 (range_end > start).then_some((range_start, range_end))
             })
             .collect();
         for (range_start, range_end) in overlaps {
-            self.wipe_on_fork_ranges.remove(&range_start);
+            ranges.remove(&range_start);
             if range_start < start {
-                self.wipe_on_fork_ranges.insert(range_start, start);
+                ranges.insert(range_start, start);
             }
             if range_end > end {
-                self.wipe_on_fork_ranges.insert(end, range_end);
+                ranges.insert(end, range_end);
             }
         }
     }
 
+    fn interval_end_covering(
+        ranges: &BTreeMap<VirtAddr, VirtAddr>,
+        addr: VirtAddr,
+    ) -> Option<VirtAddr> {
+        ranges
+            .range(..=addr)
+            .last()
+            .and_then(|(&range_start, &range_end)| {
+                (range_start <= addr && range_end > addr).then_some(range_end)
+            })
+    }
+
+    fn next_interval_start(
+        ranges: &BTreeMap<VirtAddr, VirtAddr>,
+        addr: VirtAddr,
+        limit: VirtAddr,
+    ) -> Option<VirtAddr> {
+        ranges
+            .range(addr..)
+            .filter_map(|(&range_start, _)| {
+                (range_start > addr && range_start < limit).then_some(range_start)
+            })
+            .next()
+    }
+
+    fn interval_overlaps(
+        ranges: &BTreeMap<VirtAddr, VirtAddr>,
+        start: VirtAddr,
+        end: VirtAddr,
+    ) -> bool {
+        ranges
+            .range(..end)
+            .any(|(&range_start, &range_end)| range_end > start && range_start < end)
+    }
+
     pub fn set_wipe_on_fork(&mut self, start: VirtAddr, size: usize, enabled: bool) -> AxResult {
         self.validate_region(start, size)?;
-        self.clear_wipe_on_fork_range(start, size);
+        Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
         if enabled {
-            self.insert_wipe_on_fork_range(start, start + size);
+            Self::insert_interval(&mut self.wipe_on_fork_ranges, start, start + size);
+        }
+        Ok(())
+    }
+
+    pub fn set_dontfork(&mut self, start: VirtAddr, size: usize, enabled: bool) -> AxResult {
+        self.validate_region(start, size)?;
+        Self::clear_interval(&mut self.dontfork_ranges, start, size);
+        if !enabled {
+            Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
+        }
+        if enabled {
+            Self::insert_interval(&mut self.dontfork_ranges, start, start + size);
         }
         Ok(())
     }
@@ -258,8 +307,51 @@ impl AddrSpace {
             .sum()
     }
 
+    pub fn locked_segments_in_range(&self, start: VirtAddr, size: usize) -> Vec<(VirtAddr, usize)> {
+        if size == 0 {
+            return Vec::new();
+        }
+        let end = start + size;
+        self.locked_ranges
+            .range(..end)
+            .filter_map(|(&range_start, &range_end)| {
+                if range_end <= start {
+                    return None;
+                }
+                let overlap_start = range_start.max(start);
+                let overlap_end = range_end.min(end);
+                (overlap_start < overlap_end)
+                    .then_some((overlap_start, overlap_end.sub_addr(overlap_start)))
+            })
+            .collect()
+    }
+
+    pub fn range_is_fully_locked(&self, start: VirtAddr, size: usize) -> bool {
+        size > 0 && self.locked_bytes_in_range(start, size) == size
+    }
+
     pub fn current_mapping_bytes(&self) -> usize {
         self.areas.iter().map(MemoryArea::size).sum()
+    }
+
+    pub fn resident_user_bytes(&self) -> usize {
+        self.areas
+            .iter()
+            .filter(|area| area.flags().contains(MappingFlags::USER))
+            .map(|area| {
+                let page_size = area.backend().page_size() as usize;
+                let mut resident_bytes = 0usize;
+                let mut cursor = area.start();
+                while cursor < area.end() {
+                    let step = page_size.min(area.end().sub_addr(cursor));
+                    if self.pt.query(cursor).is_ok() {
+                        resident_bytes = resident_bytes.saturating_add(step);
+                    }
+                    cursor += page_size;
+                }
+                resident_bytes
+            })
+            .sum()
     }
 
     pub fn lock_current_mappings(&mut self) {
@@ -273,13 +365,23 @@ impl AddrSpace {
         }
     }
 
-    pub fn set_lock_future_mappings(&mut self, enabled: bool) {
+    pub fn set_lock_future_mappings(&mut self, enabled: bool, on_fault: bool) {
         self.lock_future_mappings = enabled;
+        self.lock_future_on_fault = enabled && on_fault;
+    }
+
+    pub fn locks_future_mappings(&self) -> bool {
+        self.lock_future_mappings
+    }
+
+    pub fn locks_future_mappings_on_fault(&self) -> bool {
+        self.lock_future_on_fault
     }
 
     pub fn clear_locked_mappings(&mut self) {
         self.locked_ranges.clear();
         self.lock_future_mappings = false;
+        self.lock_future_on_fault = false;
     }
 
     fn validate_region(&self, start: VirtAddr, size: usize) -> AxResult {
@@ -377,11 +479,30 @@ impl AddrSpace {
         populate: bool,
         backend: Backend,
     ) -> AxResult {
+        self.map_with_lock_state(
+            start,
+            size,
+            flags,
+            populate,
+            backend,
+            self.lock_future_mappings,
+        )
+    }
+
+    pub fn map_with_lock_state(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+        flags: MappingFlags,
+        populate: bool,
+        backend: Backend,
+        locked: bool,
+    ) -> AxResult {
         self.validate_region(start, size)?;
 
         let area = MemoryArea::new(start, size, flags, backend);
         self.areas.map(area, &mut self.pt, false)?;
-        if self.lock_future_mappings {
+        if locked {
             self.insert_locked_range(start, start + size);
         }
         if populate {
@@ -450,23 +571,41 @@ impl AddrSpace {
         &self,
         mut start: VirtAddr,
         size: usize,
-    ) -> AxResult<Vec<Backend>> {
+        fail_on_first_unmapped: bool,
+    ) -> AxResult<(Vec<Backend>, bool)> {
         self.validate_region(start, size)?;
         let end = start + size;
         let mut backends = Vec::new();
+        let mut saw_unmapped = false;
 
-        while start < end {
-            let Some(area) = self.areas.find(start) else {
-                ax_bail!(NoMemory);
-            };
+        for area in self.areas.iter() {
+            if area.end() <= start {
+                continue;
+            }
+            if area.start() >= end {
+                break;
+            }
             if area.start() > start {
-                ax_bail!(NoMemory);
+                if fail_on_first_unmapped {
+                    ax_bail!(NoMemory);
+                }
+                saw_unmapped = true;
             }
             backends.push(area.backend().clone());
             start = area.end().min(end);
+            if start >= end {
+                break;
+            }
         }
 
-        Ok(backends)
+        if start < end {
+            if fail_on_first_unmapped {
+                ax_bail!(NoMemory);
+            }
+            saw_unmapped = true;
+        }
+
+        Ok((backends, saw_unmapped))
     }
 
     /// Removes mappings within the specified virtual address range.
@@ -478,7 +617,8 @@ impl AddrSpace {
 
         self.areas.unmap(start, size, &mut self.pt)?;
         self.refresh_growdown_starts();
-        self.clear_wipe_on_fork_range(start, size);
+        Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
+        Self::clear_interval(&mut self.dontfork_ranges, start, size);
         self.clear_locked_range(start, size);
         Ok(())
     }
@@ -547,10 +687,33 @@ impl AddrSpace {
     /// aligned.
     pub fn protect(&mut self, start: VirtAddr, size: usize, flags: MappingFlags) -> AxResult {
         self.validate_region(start, size)?;
+        self.check_protect_range(start, size, flags)?;
 
         self.areas
             .protect(start, size, |_| Some(flags), &mut self.pt)?;
         self.refresh_growdown_starts();
+
+        Ok(())
+    }
+
+    fn check_protect_range(
+        &self,
+        mut start: VirtAddr,
+        size: usize,
+        flags: MappingFlags,
+    ) -> AxResult {
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+
+        while start < end {
+            let Some(area) = self.areas.find(start) else {
+                ax_bail!(NoMemory);
+            };
+            if area.start() > start {
+                ax_bail!(NoMemory);
+            }
+            area.backend().check_protect_flags(flags)?;
+            start = area.end().min(end);
+        }
 
         Ok(())
     }
@@ -562,6 +725,7 @@ impl AddrSpace {
         }
         self.growdown_starts.clear();
         self.wipe_on_fork_ranges.clear();
+        self.dontfork_ranges.clear();
         self.locked_ranges.clear();
     }
 
@@ -746,46 +910,50 @@ impl AddrSpace {
 
         let mut guard = new_aspace.lock();
         guard.growdown_starts = self.growdown_starts.clone();
-        guard.wipe_on_fork_ranges = self.wipe_on_fork_ranges.clone();
 
         let wipe_on_fork_ranges = self.wipe_on_fork_ranges.clone();
+        let dontfork_ranges = self.dontfork_ranges.clone();
         let mut self_modify = self.pt.cursor();
         for area in self.areas.iter() {
-            let wipe_segments: Vec<_> = wipe_on_fork_ranges
-                .range(..area.end())
-                .filter_map(|(&start, &end)| {
-                    if end <= area.start() {
-                        return None;
-                    }
-                    let seg_start = start.max(area.start());
-                    let seg_end = end.min(area.end());
-                    (seg_start < seg_end).then_some(VirtAddrRange::new(seg_start, seg_end))
-                })
-                .collect();
-            if wipe_segments.is_empty() {
-                let new_backend = {
-                    let mut new_modify = guard.pt.cursor_no_flush();
-                    area.backend().clone_map(
-                        area.va_range(),
-                        area.flags(),
-                        &mut self_modify,
-                        &mut new_modify,
-                        &new_aspace_clone,
-                    )?
-                };
-
-                let new_area =
-                    MemoryArea::new(area.start(), area.size(), area.flags(), new_backend);
-                let aspace = guard.deref_mut();
-                aspace.areas.map(new_area, &mut aspace.pt, false)?;
-                continue;
-            }
-
             let page_size = area.backend().page_size();
             let mut cursor = area.start();
-            for wipe_range in wipe_segments {
-                if cursor < wipe_range.start {
-                    let segment_size = wipe_range.start.sub_addr(cursor);
+            while cursor < area.end() {
+                if let Some(dontfork_end) = Self::interval_end_covering(&dontfork_ranges, cursor) {
+                    cursor = dontfork_end.min(area.end());
+                    continue;
+                }
+
+                if let Some(wipe_end) = Self::interval_end_covering(&wipe_on_fork_ranges, cursor) {
+                    let segment_end = wipe_end.min(area.end());
+                    let wipe_size = segment_end.sub_addr(cursor);
+                    debug_assert!(page_size.is_aligned(wipe_size));
+                    let new_area = MemoryArea::new(
+                        cursor,
+                        wipe_size,
+                        area.flags(),
+                        Backend::new_alloc(cursor, page_size),
+                    );
+                    let aspace = guard.deref_mut();
+                    aspace.areas.map(new_area, &mut aspace.pt, false)?;
+                    Self::insert_interval(&mut aspace.wipe_on_fork_ranges, cursor, segment_end);
+                    cursor = segment_end;
+                    continue;
+                }
+
+                let mut segment_end = area.end();
+                if let Some(next_start) =
+                    Self::next_interval_start(&dontfork_ranges, cursor, area.end())
+                {
+                    segment_end = segment_end.min(next_start);
+                }
+                if let Some(next_start) =
+                    Self::next_interval_start(&wipe_on_fork_ranges, cursor, area.end())
+                {
+                    segment_end = segment_end.min(next_start);
+                }
+
+                if cursor < segment_end {
+                    let segment_size = segment_end.sub_addr(cursor);
                     let new_backend = {
                         let mut new_modify = guard.pt.cursor_no_flush();
                         area.backend().clone_map(
@@ -801,39 +969,16 @@ impl AddrSpace {
                     let new_area = MemoryArea::new(cursor, segment_size, area.flags(), new_backend);
                     let aspace = guard.deref_mut();
                     aspace.areas.map(new_area, &mut aspace.pt, false)?;
+                    if Self::interval_overlaps(&wipe_on_fork_ranges, cursor, segment_end) {
+                        Self::insert_interval(&mut aspace.wipe_on_fork_ranges, cursor, segment_end);
+                    }
+                    cursor = segment_end;
+                } else {
+                    cursor += page_size as usize;
                 }
-
-                let wipe_size = wipe_range.size();
-                debug_assert!(page_size.is_aligned(wipe_size));
-                let new_area = MemoryArea::new(
-                    wipe_range.start,
-                    wipe_size,
-                    area.flags(),
-                    Backend::new_alloc(wipe_range.start, page_size),
-                );
-                let aspace = guard.deref_mut();
-                aspace.areas.map(new_area, &mut aspace.pt, false)?;
-                cursor = wipe_range.end;
-            }
-
-            if cursor < area.end() {
-                let segment_size = area.end().sub_addr(cursor);
-                let new_backend = {
-                    let mut new_modify = guard.pt.cursor_no_flush();
-                    area.backend().clone_map(
-                        VirtAddrRange::from_start_size(cursor, segment_size),
-                        area.flags(),
-                        &mut self_modify,
-                        &mut new_modify,
-                        &new_aspace_clone,
-                    )?
-                };
-                let new_backend = new_backend.relocate(area.start(), cursor, &new_aspace_clone)?;
-                let new_area = MemoryArea::new(cursor, segment_size, area.flags(), new_backend);
-                let aspace = guard.deref_mut();
-                aspace.areas.map(new_area, &mut aspace.pt, false)?;
             }
         }
+        guard.refresh_growdown_starts();
         drop(guard);
 
         Ok(new_aspace)

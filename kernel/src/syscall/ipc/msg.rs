@@ -15,7 +15,7 @@ use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use super::{
     IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcPerm, MSG_INFO,
-    MSG_STAT, has_ipc_permission, next_ipc_id,
+    MSG_STAT, MSG_STAT_ANY, has_ipc_permission, next_ipc_id,
 };
 use crate::{
     syscall::{sys_getgid, sys_getuid},
@@ -95,8 +95,8 @@ pub struct Message {
 pub struct MessageQueue {
     /// Message queue data structure
     pub msqid_ds: msqid_ds,
-    /// Queue of messages
-    pub messages: BTreeMap<i64, Vec<Message>>, // mtype -> messages of that type
+    /// FIFO queue of messages
+    pub messages: Vec<Message>,
     /// Total bytes in queue
     pub total_bytes: usize,
     /// Marked for removal
@@ -109,7 +109,7 @@ impl MessageQueue {
     pub fn new(key: i32, mode: __kernel_mode_t, pid: Pid, uid: u32, gid: u32) -> Self {
         MessageQueue {
             msqid_ds: msqid_ds::new(key, mode, pid as __kernel_pid_t, uid, gid),
-            messages: BTreeMap::new(),
+            messages: Vec::new(),
             total_bytes: 0,
             mark_removed: false,
             waiters: Arc::new(axtask::WaitQueue::new()),
@@ -126,7 +126,7 @@ impl MessageQueue {
 
         let message = Message { mtype, data };
 
-        self.messages.entry(mtype).or_default().push(message);
+        self.messages.push(message);
         self.total_bytes += data_len;
         self.msqid_ds.msg_cbytes += data_len as __kernel_size_t;
         self.msqid_ds.msg_qnum += 1;
@@ -135,106 +135,73 @@ impl MessageQueue {
     }
 
     /// Find the first message (without removing)
-    pub fn find_first_message(&self) -> Option<(i64, &[u8])> {
-        for (&mtype, messages) in &self.messages {
-            if let Some(message) = messages.first() {
-                return Some((mtype, &message.data[..]));
-            }
-        }
-        None
+    pub fn find_first_message(&self) -> Option<(usize, i64, &[u8])> {
+        self.messages
+            .first()
+            .map(|message| (0, message.mtype, &message.data[..]))
     }
 
     /// Find message by type (without removing)
-    pub fn find_message_by_type(&self, msgtyp: i64) -> Option<(i64, &[u8])> {
+    pub fn find_message_by_type(&self, msgtyp: i64) -> Option<(usize, i64, &[u8])> {
         self.messages
-            .get(&msgtyp)
-            .and_then(|msgs| msgs.first())
-            .map(|msg| (msgtyp, &msg.data[..]))
+            .iter()
+            .enumerate()
+            .find(|(_, message)| message.mtype == msgtyp)
+            .map(|(index, message)| (index, message.mtype, &message.data[..]))
     }
 
     /// Find the first message with a type not equal to the specified value
     /// (without removing)
-    pub fn find_message_not_equal(&self, msgtyp: i64) -> Option<(i64, &[u8])> {
-        for (&mtype, messages) in &self.messages {
-            if mtype != msgtyp
-                && let Some(message) = messages.first()
-            {
-                return Some((mtype, &message.data[..]));
-            }
-        }
-        None
+    pub fn find_message_not_equal(&self, msgtyp: i64) -> Option<(usize, i64, &[u8])> {
+        self.messages
+            .iter()
+            .enumerate()
+            .find(|(_, message)| message.mtype != msgtyp)
+            .map(|(index, message)| (index, message.mtype, &message.data[..]))
     }
 
     /// Find the first message with a type less than or equal to |msgtyp|
     /// (without removing)
-    pub fn find_message_less_equal(&self, abs_typ: i64) -> Option<(i64, &[u8])> {
-        let mut candidate_type = None;
+    pub fn find_message_less_equal(&self, abs_typ: i64) -> Option<(usize, i64, &[u8])> {
+        let mut candidate = None;
 
-        // Find the smallest type among all types ≤ abs_typ
-        for (&mtype, messages) in &self.messages {
-            if mtype <= abs_typ
-                && !messages.is_empty()
-                && candidate_type.is_none_or(|candidate| mtype < candidate)
+        for (index, message) in self.messages.iter().enumerate() {
+            if message.mtype <= abs_typ
+                && candidate.is_none_or(|(_, candidate_type)| message.mtype < candidate_type)
             {
-                candidate_type = Some(mtype);
+                candidate = Some((index, message.mtype));
+                if message.mtype == 1 {
+                    break;
+                }
             }
         }
 
-        // Return the found message (without removing)
-        if let Some(mtype) = candidate_type {
-            self.messages
-                .get(&mtype)
-                .and_then(|msgs| msgs.first())
-                .map(|msg| (mtype, &msg.data[..]))
-        } else {
-            None
-        }
+        candidate.map(|(index, mtype)| (index, mtype, &self.messages[index].data[..]))
     }
 
     /// Get total number of messages in the queue (for MSG_COPY)
     pub fn get_total_message_count(&self) -> usize {
-        self.messages.values().map(|msgs| msgs.len()).sum()
+        self.messages.len()
     }
 
     /// Get message by index (for MSG_COPY)
     pub fn get_message_by_index(&self, index: usize) -> Option<&Message> {
-        let mut current_index = 0;
-
-        // Iterate over all messages in order of message type
-        for messages in self.messages.values() {
-            if index < current_index + messages.len() {
-                return messages.get(index - current_index);
-            }
-            current_index += messages.len();
-        }
-        None
+        self.messages.get(index)
     }
 
-    /// Remove the message by specified type and index
-    pub fn remove_message_by_type_and_index(
-        &mut self,
-        mtype: i64,
-        index: usize,
-    ) -> AxResult<Message> {
-        if let Some(messages) = self.messages.get_mut(&mtype)
-            && index < messages.len()
-        {
-            let removed_msg = messages.remove(index);
+    /// Remove the message by FIFO index
+    pub fn remove_message_by_index(&mut self, index: usize) -> AxResult<Message> {
+        let removed_msg = if index < self.messages.len() {
+            self.messages.remove(index)
+        } else {
+            return Err(AxError::from(LinuxError::ENOMSG));
+        };
 
-            // Update core queue statistics in the removal method
-            self.total_bytes -= removed_msg.data.len();
-            self.msqid_ds.msg_cbytes -= removed_msg.data.len() as __kernel_size_t;
-            self.msqid_ds.msg_qnum -= 1;
+        self.total_bytes -= removed_msg.data.len();
+        self.msqid_ds.msg_cbytes -= removed_msg.data.len() as __kernel_size_t;
+        self.msqid_ds.msg_qnum -= 1;
 
-            // If the message list of this type is empty, remove the entire type entry
-            if messages.is_empty() {
-                self.messages.remove(&mtype);
-            }
-
-            return Ok(removed_msg);
-        }
-
-        Err(AxError::from(LinuxError::ENOMSG)) // ENOMSG
+        Ok(removed_msg)
     }
 }
 
@@ -306,6 +273,24 @@ impl MsgManager {
                 guard.total_bytes
             })
             .sum()
+    }
+
+    /// get total number of messages in all queues
+    pub fn total_messages(&self) -> usize {
+        self.iter_active_queues()
+            .map(|(_, queue)| {
+                let guard = queue.lock();
+                guard.get_total_message_count()
+            })
+            .sum()
+    }
+
+    /// get the largest active IPC index
+    pub fn max_active_index(&self) -> isize {
+        self.iter_active_queues()
+            .map(|(msqid, _)| msqid as isize)
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -386,6 +371,41 @@ pub(crate) fn sysvipc_msg_snapshot() -> String {
         );
     }
     out
+}
+
+#[repr(C)]
+struct MsgInfo {
+    msgpool: i32,
+    msgmap: i32,
+    msgmax: i32,
+    msgmnb: i32,
+    msgmni: i32,
+    msgssz: i32,
+    msgtql: i32,
+    msgseg: u16,
+}
+
+impl MsgInfo {
+    fn ipc_info() -> Self {
+        Self {
+            msgpool: MSGMNI.saturating_mul(MSGMNB / 1024) as i32,
+            msgmap: MSGMNB as i32,
+            msgmax: MSGMAX as i32,
+            msgmnb: MSGMNB as i32,
+            msgmni: msgmni_limit() as i32,
+            msgssz: 16,
+            msgtql: MSGMNB as i32,
+            msgseg: u16::MAX,
+        }
+    }
+
+    fn msg_info(msg_manager: &MsgManager) -> Self {
+        let mut info = Self::ipc_info();
+        info.msgpool = msg_manager.queue_count().min(i32::MAX as usize) as i32;
+        info.msgmap = msg_manager.total_messages().min(i32::MAX as usize) as i32;
+        info.msgtql = msg_manager.total_bytes().min(i32::MAX as usize) as i32;
+        info
+    }
 }
 
 bitflags::bitflags! {
@@ -613,7 +633,7 @@ fn find_msgrcv_message(
         _ => None,
     };
 
-    matched_message.map(|(mtype, data)| (mtype, data.to_vec(), 0, true))
+    matched_message.map(|(index, mtype, data)| (mtype, data.to_vec(), index, true))
 }
 
 pub fn sys_msgrcv(
@@ -688,7 +708,7 @@ pub fn sys_msgrcv(
 
                 // Remove the message from the queue (normal mode only)
                 if should_remove {
-                    msg_queue.remove_message_by_type_and_index(mtype, index)?;
+                    msg_queue.remove_message_by_index(index)?;
                 }
 
                 msg_queue.msqid_ds.msg_lrpid = current_pid as _;
@@ -730,6 +750,7 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
         && cmd != IPC_INFO
         && cmd != MSG_INFO
         && cmd != MSG_STAT
+        && cmd != MSG_STAT_ANY
     {
         // Simplified: do not support some Linux extensions
         return Err(AxError::from(LinuxError::EINVAL)); // EINVAL
@@ -737,94 +758,40 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
 
     // IPC_INFO (put before looking up the queue!)
     if cmd == IPC_INFO {
-        // IPC_INFO uses msqid=0, no actual queue needed
-        // Return system-level information
-        #[repr(C)]
-        struct MsgInfo {
-            msgpool: i32,
-            msgmap: i32,
-            msgmax: i32,
-            msgmnb: i32,
-            msgmni: i32,
-            msgssz: i32,
-            msgtql: i32,
-            msgseg: u16,
-        }
-
-        let info = MsgInfo {
-            msgpool: 0,
-            msgmap: 0,
-            msgmax: MSGMAX as i32,
-            msgmnb: MSGMNB as i32,
-            msgmni: msgmni_limit() as i32,
-            msgssz: 0,
-            msgtql: 0,
-            msgseg: 0,
-        };
-
-        // Copy to user space
+        let msg_manager = MSG_MANAGER.lock();
+        let info = MsgInfo::ipc_info();
         let ptr = buf as *mut MsgInfo;
         ptr.vm_write(info)?;
-        return Ok(0);
+        return Ok(msg_manager.max_active_index());
     }
 
     // MSG_INFO (put before looking up the queue!)
     if cmd == MSG_INFO {
         let msg_manager = MSG_MANAGER.lock();
-        // Manually create IpcPerm
-        let msg_perm = IpcPerm {
-            key: 0,
-            uid: current_uid,
-            gid: current_gid,
-            cuid: current_uid,
-            cgid: current_gid,
-            mode: 0o600,
-            pad1: 0,
-            seq: 0,
-            pad2: 0,
-            unused0: 0,
-            unused1: 0,
-        };
-
-        // Create a temporary msqid_ds to return information
-        let info_ds = msqid_ds {
-            msg_perm,
-            msg_stime: 0,
-            msg_rtime: 0,
-            msg_ctime: 0,
-            msg_cbytes: msg_manager.total_bytes() as u64,
-            // Use msg_qnum to return the number of allocated queues
-            msg_qnum: msg_manager.queue_count() as u64,
-            // Use msg_qbytes to return system limits or usage
-            msg_qbytes: MSGMNB as u64,
-            msg_lspid: Pid::from(0u32) as _,
-            msg_lrpid: Pid::from(0u32) as _,
-        };
-
-        // Copy to user space
-        let ptr = buf as *mut msqid_ds;
-        ptr.vm_write(info_ds)?;
-
-        // Return the current number of allocated queues
-        return Ok(msg_manager.queue_count() as isize);
+        let info = MsgInfo::msg_info(&msg_manager);
+        let ptr = buf as *mut MsgInfo;
+        ptr.vm_write(info)?;
+        return Ok(msg_manager.max_active_index());
     }
-    // MSG_STAT handling
-    if cmd == MSG_STAT {
+    // MSG_STAT and MSG_STAT_ANY use an IPC index and return the real queue ID.
+    if cmd == MSG_STAT || cmd == MSG_STAT_ANY {
         let msg_manager = MSG_MANAGER.lock();
 
         let result = msg_manager
-            .iter_active_queues()
-            .nth(msqid as usize)
+            .get_queue_by_msqid(msqid)
             .ok_or(AxError::from(LinuxError::EINVAL))
+            .map(|queue| (msqid, queue))
             .and_then(|(actual_msqid, queue)| {
                 let guard = queue.lock();
 
-                if !has_ipc_permission(
-                    &guard.msqid_ds.msg_perm,
-                    current_uid,
-                    current_gid,
-                    false, // read permission check
-                ) {
+                if cmd == MSG_STAT
+                    && !has_ipc_permission(
+                        &guard.msqid_ds.msg_perm,
+                        current_uid,
+                        current_gid,
+                        false, // read permission check
+                    )
+                {
                     return Err(AxError::from(LinuxError::EACCES));
                 }
 

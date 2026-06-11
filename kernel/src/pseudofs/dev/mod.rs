@@ -5,7 +5,7 @@ mod event;
 mod fb;
 #[cfg(feature = "dev-log")]
 mod log;
-mod r#loop;
+pub(crate) mod r#loop;
 #[cfg(feature = "memtrack")]
 mod memtrack;
 mod rtc;
@@ -21,11 +21,11 @@ use axerrno::AxError;
 use axfs::BlockDeviceInfo;
 use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodeType, VfsResult};
 use axsync::Mutex;
-#[cfg(feature = "dev-log")]
-pub use log::bind_dev_log;
 use linux_raw_sys::ioctl::{
     BLKGETSIZE, BLKGETSIZE64, BLKRAGET, BLKRASET, BLKROGET, BLKROSET, BLKSSZGET, RNDGETENTCNT,
 };
+#[cfg(feature = "dev-log")]
+pub use log::bind_dev_log;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use starry_vm::{VmMutPtr, VmPtr};
 
@@ -390,6 +390,16 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 NodeType::BlockDevice,
                 dev_id,
                 Arc::new(r#loop::LoopDevice::new(i, dev_id)),
+            ),
+        );
+        let part_dev_id = DeviceId::new(7, 256 + i);
+        root.add(
+            format!("loop{i}p1"),
+            Device::new(
+                fs.clone(),
+                NodeType::BlockDevice,
+                part_dev_id,
+                Arc::new(r#loop::LoopDevice::new(i, part_dev_id)),
             ),
         );
     }

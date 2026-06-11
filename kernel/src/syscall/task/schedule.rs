@@ -1,8 +1,12 @@
 use alloc::{vec, vec::Vec};
-use core::{mem::size_of, time::Duration};
+use core::{
+    mem::size_of,
+    sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
+};
 
-use axerrno::{AxError, AxResult};
-use axhal::time::{NANOS_PER_SEC, TimeValue};
+use axerrno::{AxError, AxResult, LinuxError};
+use axhal::time::TimeValue;
 use axtask::{
     AxCpuMask, AxTaskRef, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN, SchedClass,
     SchedState, current,
@@ -27,6 +31,8 @@ use crate::{
 };
 
 const SUPPORTED_SCHED_ATTR_FLAGS: u64 = SCHED_FLAG_RESET_ON_FORK as u64;
+const SCHED_ATTR_SIZE_VER0: usize = 48;
+const SCHED_ATTR_MAX_SIZE: usize = 4096;
 const IOPRIO_CLASS_SHIFT: u32 = 13;
 const IOPRIO_PRIO_MASK: u32 = (1 << IOPRIO_CLASS_SHIFT) - 1;
 const IOPRIO_NR_LEVELS: u32 = 8;
@@ -37,6 +43,11 @@ const IOPRIO_CLASS_IDLE: u32 = 3;
 const IOPRIO_WHO_PROCESS: u32 = 1;
 const IOPRIO_WHO_PGRP: u32 = 2;
 const IOPRIO_WHO_USER: u32 = 3;
+const SCHED_RR_TIMESLICE_MS_DEFAULT: u32 = {
+    let ms = (RR_TIMESLICE_TICKS * 1000) / axconfig::TICKS_PER_SEC;
+    if ms == 0 { 1 } else { ms as u32 }
+};
+static SCHED_RR_TIMESLICE_MS: AtomicU32 = AtomicU32::new(SCHED_RR_TIMESLICE_MS_DEFAULT);
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -187,6 +198,45 @@ fn validate_deadline_attr(attr: &SchedAttr) -> AxResult<()> {
     Ok(())
 }
 
+fn write_sched_attr_kernel_size(attr: *const SchedAttr) -> AxResult<()> {
+    let size_ptr = attr as *mut u32;
+    size_ptr.vm_write(size_of::<SchedAttr>() as u32)?;
+    Ok(())
+}
+
+fn read_sched_attr(attr: *const SchedAttr) -> AxResult<SchedAttr> {
+    let mut attr_size = attr.cast::<u32>().vm_read()? as usize;
+    if attr_size == 0 {
+        attr_size = SCHED_ATTR_SIZE_VER0;
+    }
+    if !(SCHED_ATTR_SIZE_VER0..=SCHED_ATTR_MAX_SIZE).contains(&attr_size) {
+        write_sched_attr_kernel_size(attr)?;
+        return Err(LinuxError::E2BIG.into());
+    }
+
+    let mut out = SchedAttr::default();
+    let copy_size = attr_size.min(size_of::<SchedAttr>());
+    let src = vm_load(attr.cast::<u8>(), copy_size)?;
+    let dst = unsafe {
+        core::slice::from_raw_parts_mut((&mut out as *mut SchedAttr).cast::<u8>(), copy_size)
+    };
+    dst.copy_from_slice(&src);
+
+    if attr_size > size_of::<SchedAttr>() {
+        let extra = vm_load(
+            attr.cast::<u8>().wrapping_add(size_of::<SchedAttr>()),
+            attr_size - size_of::<SchedAttr>(),
+        )?;
+        if extra.iter().any(|byte| *byte != 0) {
+            write_sched_attr_kernel_size(attr)?;
+            return Err(LinuxError::E2BIG.into());
+        }
+    }
+
+    out.sched_nice = out.sched_nice.clamp(-20, 19);
+    Ok(out)
+}
+
 fn raw_priority_from_nice(nice: i8) -> isize {
     20 - nice as isize
 }
@@ -262,12 +312,23 @@ fn ioprio_best(current: u32, candidate: u32) -> u32 {
 
 fn rr_interval_for_state(state: SchedState) -> Duration {
     if matches!(state.class, SchedClass::RoundRobin) {
-        Duration::from_nanos(
-            RR_TIMESLICE_TICKS as u64 * (NANOS_PER_SEC / axconfig::TICKS_PER_SEC as u64),
-        )
+        Duration::from_millis(sched_rr_timeslice_ms() as u64)
     } else {
         Duration::ZERO
     }
+}
+
+pub fn sched_rr_timeslice_ms() -> u32 {
+    SCHED_RR_TIMESLICE_MS.load(Ordering::Relaxed)
+}
+
+pub fn set_sched_rr_timeslice_ms(value: i32) {
+    let value = if value <= 0 {
+        SCHED_RR_TIMESLICE_MS_DEFAULT
+    } else {
+        value as u32
+    };
+    SCHED_RR_TIMESLICE_MS.store(value, Ordering::Relaxed);
 }
 
 fn apply_sched_state(task: &AxTaskRef, state: SchedState) -> AxResult<isize> {
@@ -418,6 +479,14 @@ fn sleep_absolute(clock: AlarmClock, deadline: TimeValue) -> bool {
     clock.now() >= deadline
 }
 
+fn remaining_relative_sleep(req: TimeValue, actual: TimeValue) -> Option<TimeValue> {
+    if actual < req {
+        Some(req - actual)
+    } else {
+        None
+    }
+}
+
 /// Sleep some nanoseconds
 pub fn sys_nanosleep(req: *const timespec, rem: *mut timespec) -> AxResult<isize> {
     // FIXME: AnyBitPattern
@@ -426,7 +495,7 @@ pub fn sys_nanosleep(req: *const timespec, rem: *mut timespec) -> AxResult<isize
 
     let actual = sleep_relative(req);
 
-    if let Some(diff) = req.checked_sub(actual) {
+    if let Some(diff) = remaining_relative_sleep(req, actual) {
         debug!("sys_nanosleep => rem: {diff:?}");
         if let Some(rem) = rem.nullable() {
             rem.vm_write(timespec::from_time_value(diff))?;
@@ -459,7 +528,20 @@ pub fn sys_clock_nanosleep(
     debug!("sys_clock_nanosleep <= clock_id: {clock_id}, flags: {flags}, req: {req:?}");
 
     if flags & TIMER_ABSTIME != 0 {
-        if sleep_absolute(clock, req) {
+        let deadline = match clock_id as u32 {
+            CLOCK_MONOTONIC => current()
+                .as_thread()
+                .proc_data
+                .time_ns()
+                .host_monotonic_deadline(req),
+            CLOCK_BOOTTIME => current()
+                .as_thread()
+                .proc_data
+                .time_ns()
+                .host_boottime_deadline(req),
+            _ => req,
+        };
+        if sleep_absolute(clock, deadline) {
             Ok(0)
         } else {
             Err(AxError::Interrupted)
@@ -467,7 +549,7 @@ pub fn sys_clock_nanosleep(
     } else {
         let actual = sleep_relative(req);
 
-        if let Some(diff) = req.checked_sub(actual) {
+        if let Some(diff) = remaining_relative_sleep(req, actual) {
             debug!("sys_clock_nanosleep => rem: {diff:?}");
             if let Some(rem) = rem.nullable() {
                 rem.vm_write(timespec::from_time_value(diff))?;
@@ -587,11 +669,11 @@ pub fn sys_sched_rr_get_interval(pid: i32, interval: *mut timespec) -> AxResult<
 }
 
 pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResult<isize> {
-    if flags != 0 {
+    if attr.is_null() || pid < 0 || flags != 0 {
         return Err(AxError::InvalidInput);
     }
 
-    let attr = unsafe { attr.vm_read_uninit()?.assume_init() };
+    let attr = read_sched_attr(attr)?;
     if attr.sched_flags & !SUPPORTED_SCHED_ATTR_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }
@@ -601,12 +683,16 @@ pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResu
 
     let class = sched_class_from_policy(attr.sched_policy as i32)?;
     let task = sched_target(pid)?;
+    can_manage_sched_target(&task)?;
     let mut state = sched_state(&task);
     state.class = class;
     match class {
         SchedClass::Fifo | SchedClass::RoundRobin => {
             if attr.sched_runtime != 0 || attr.sched_deadline != 0 || attr.sched_period != 0 {
                 return Err(AxError::InvalidInput);
+            }
+            if !has_sched_admin_capability() {
+                return Err(AxError::OperationNotPermitted);
             }
             state.rt_priority = validate_rt_priority(attr.sched_priority as i32)?;
             state.nice = 0;
@@ -621,6 +707,9 @@ pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResu
             clear_deadline_state(&mut state);
         }
         SchedClass::Deadline => {
+            if !has_sched_admin_capability() {
+                return Err(AxError::OperationNotPermitted);
+            }
             validate_deadline_attr(&attr)?;
             state.rt_priority = 0;
             state.nice = 0;
@@ -634,19 +723,20 @@ pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResu
 }
 
 pub fn sys_sched_getattr(pid: i32, attr: *mut SchedAttr, size: u32, flags: u32) -> AxResult<isize> {
-    if flags != 0 {
-        return Err(AxError::InvalidInput);
-    }
-
     let out_size = size as usize;
-    if out_size < size_of::<u32>() {
+    if attr.is_null()
+        || pid < 0
+        || out_size > SCHED_ATTR_MAX_SIZE
+        || out_size < SCHED_ATTR_SIZE_VER0
+        || flags != 0
+    {
         return Err(AxError::InvalidInput);
     }
 
     let task = sched_target(pid)?;
     let state = sched_state(&task);
-    let out = SchedAttr {
-        size: size_of::<SchedAttr>() as u32,
+    let mut out = SchedAttr {
+        size: out_size.min(size_of::<SchedAttr>()) as u32,
         sched_policy: linux_policy_from_state(state) as u32 & !(SCHED_RESET_ON_FORK as u32),
         sched_flags: if state.reset_on_fork {
             SUPPORTED_SCHED_ATTR_FLAGS
@@ -661,6 +751,7 @@ pub fn sys_sched_getattr(pid: i32, attr: *mut SchedAttr, size: u32, flags: u32) 
         sched_util_min: 0,
         sched_util_max: 0,
     };
+    out.sched_flags &= SUPPORTED_SCHED_ATTR_FLAGS;
 
     let copy_size = out_size.min(size_of::<SchedAttr>());
     vm_write_slice(attr.cast::<u8>(), &unsafe {
