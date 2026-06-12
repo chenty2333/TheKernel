@@ -570,12 +570,13 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
             if !array.writable(current_uid, current_gid) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
-            if arg > SEMVMX {
+            let value = arg as c_int;
+            if value < 0 || value as usize > SEMVMX {
                 return Err(AxError::from(LinuxError::ERANGE));
             }
             let index = validate_semnum(&array, semnum)?;
             let pid = current().as_thread().proc_data.proc.pid() as __kernel_pid_t;
-            array.sems[index].value = arg as u16;
+            array.sems[index].value = value as u16;
             array.sems[index].pid = pid;
             array.mark_changed();
             array.waiters.notify_all(false);
@@ -785,8 +786,7 @@ pub fn sys_semtimedop(
             match try_apply_semops(&mut array, &ops, current_pid)? {
                 SemTryResult::Ready => {
                     array.waiters.notify_all(false);
-                    drop(wait_guard);
-                    return Ok(0);
+                    break;
                 }
                 SemTryResult::WouldBlock { sem_num, wait_zero } => {
                     if op_has_nowait(&ops) {
@@ -806,4 +806,6 @@ pub fn sys_semtimedop(
         }
         wait_for_sem(waiters, deadline, &array)?;
     }
+    drop(wait_guard);
+    Ok(0)
 }
