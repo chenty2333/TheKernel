@@ -1190,3 +1190,17 @@ fspick01
 fspick02
 prctl03
 inotify03
+cgroup_core02	cgroup_core02
+cgroup_core03	cgroup_core03
+cgroup_fj_function_blkio cgroup_fj_function.sh blkio
+cgroup_fj_function_cpu cgroup_fj_function.sh cpu
+cgroup_fj_function_cpuacct cgroup_fj_function.sh cpuacct
+cgroup_fj_function_cpuset cgroup_fj_function.sh cpuset
+cgroup_fj_function_debug cgroup_fj_function.sh debug
+cgroup_fj_function_devices cgroup_fj_function.sh devices
+cgroup_fj_function_freezer cgroup_fj_function.sh freezer
+cgroup_fj_function_hugetlb cgroup_fj_function.sh hugetlb
+cgroup_fj_function_memory cgroup_fj_function.sh memory
+cgroup_fj_function_net_cls cgroup_fj_function.sh net_cls
+cgroup_fj_function_net_prio cgroup_fj_function.sh net_prio
+cgroup_fj_function_perf_event cgroup_fj_function.sh perf_event

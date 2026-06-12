@@ -1,9 +1,4 @@
-use alloc::{
-    borrow::ToOwned,
-    string::String,
-    sync::{Arc, Weak},
-    vec,
-};
+use alloc::{borrow::ToOwned, string::String, sync::Arc, vec};
 use core::{
     iter, mem,
     sync::atomic::{AtomicU64, Ordering},
@@ -27,7 +22,7 @@ pub struct Mountpoint {
     /// Location in the parent mountpoint.
     location: Mutex<Option<Location>>,
     /// Children of the mountpoint.
-    children: Mutex<HashMap<ReferenceKey, Weak<Self>>>,
+    children: Mutex<HashMap<ReferenceKey, Arc<Self>>>,
     /// Device ID
     device: u64,
 }
@@ -75,7 +70,7 @@ impl Mountpoint {
                 .children
                 .lock()
                 .get(&mountpoint.root.key())
-                .and_then(Weak::upgrade);
+                .cloned();
             if let Some(next) = next {
                 mountpoint = next;
             } else {
@@ -196,8 +191,7 @@ impl Location {
         self.mountpoint
             .children
             .lock()
-            .get(&self.entry.key())
-            .is_some_and(|child| child.strong_count() > 0)
+            .contains_key(&self.entry.key())
     }
 
     pub fn is_root_of_mount(&self) -> bool {
@@ -214,7 +208,7 @@ impl Location {
             .children
             .lock()
             .get(&self.entry.key())
-            .and_then(Weak::upgrade)
+            .cloned()
         else {
             return self;
         };
@@ -290,7 +284,7 @@ impl Location {
         self.mountpoint
             .children
             .lock()
-            .insert(self.entry.key(), Arc::downgrade(&result));
+            .insert(self.entry.key(), result.clone());
         Ok(result)
     }
 
@@ -316,7 +310,7 @@ impl Location {
             .mountpoint
             .children
             .lock()
-            .insert(target.entry.key(), Arc::downgrade(&self.mountpoint));
+            .insert(target.entry.key(), self.mountpoint.clone());
         Ok(())
     }
 
@@ -345,9 +339,7 @@ impl Location {
         }
         let children = mem::take(&mut *self.mountpoint.children.lock());
         for (_, child) in children {
-            if let Some(child) = child.upgrade() {
-                child.root_location().unmount_all()?;
-            }
+            child.root_location().unmount_all()?;
         }
         self.unmount()
     }
