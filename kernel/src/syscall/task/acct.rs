@@ -1,4 +1,3 @@
-use alloc::vec::Vec;
 use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -18,10 +17,16 @@ use crate::{
 
 const ACCT_COMM: usize = 16;
 const ACCT_RECORD_SIZE: usize = 64;
+const ACCT_VERSION: u8 = 2;
 const ACCT_HZ: u64 = 100;
 const COMP_T_MANTISSA_BITS: u32 = 13;
 const COMP_T_EXPONENT_SHIFT: u32 = 3;
 const COMP_T_MAX_FRACTION: u64 = (1 << COMP_T_MANTISSA_BITS) - 1;
+
+#[cfg(target_endian = "big")]
+const ACCT_BYTEORDER: u8 = 0x80;
+#[cfg(target_endian = "little")]
+const ACCT_BYTEORDER: u8 = 0x00;
 
 static PROCESS_ACCOUNTING: Mutex<Option<AccountingFile>> = Mutex::new(None);
 
@@ -66,12 +71,12 @@ fn nanos_to_acct_ticks(nanos: u64) -> u64 {
     nanos.saturating_mul(ACCT_HZ).saturating_div(NANOS_PER_SEC)
 }
 
-fn append_u16(out: &mut Vec<u8>, value: u16) {
-    out.extend_from_slice(&value.to_ne_bytes());
+fn put_u16(record: &mut [u8; ACCT_RECORD_SIZE], offset: usize, value: u16) {
+    record[offset..offset + 2].copy_from_slice(&value.to_ne_bytes());
 }
 
-fn append_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_ne_bytes());
+fn put_u32(record: &mut [u8; ACCT_RECORD_SIZE], offset: usize, value: u32) {
+    record[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
 }
 
 fn build_record(
@@ -86,32 +91,38 @@ fn build_record(
     let elapsed_ticks = nanos_to_acct_ticks(elapsed_ns);
     let btime = proc_data.start_realtime_sec().min(u32::MAX as u64) as u32;
 
-    let mut out = Vec::with_capacity(ACCT_RECORD_SIZE);
-    out.push(0); // ac_flag
-    append_u16(&mut out, owner_uid.min(u16::MAX as u32) as u16);
-    append_u16(&mut out, owner_gid.min(u16::MAX as u32) as u16);
-    append_u16(&mut out, 0); // ac_tty
-    append_u32(&mut out, btime);
-    append_u16(&mut out, encode_comp_t(nanos_to_acct_ticks(usage.utime_ns)));
-    append_u16(&mut out, encode_comp_t(nanos_to_acct_ticks(usage.stime_ns)));
-    append_u16(&mut out, encode_comp_t(elapsed_ticks));
-    append_u16(&mut out, 0); // ac_mem
-    append_u16(&mut out, 0); // ac_io
-    append_u16(&mut out, 0); // ac_rw
-    append_u16(&mut out, 0); // ac_minflt
-    append_u16(&mut out, 0); // ac_majflt
-    append_u16(&mut out, 0); // ac_swaps
-    append_u32(&mut out, exit_code as u32);
+    let mut record = [0u8; ACCT_RECORD_SIZE];
+    record[0] = 0; // ac_flag
+    record[1] = ACCT_VERSION | ACCT_BYTEORDER;
+    put_u16(&mut record, 2, owner_uid.min(u16::MAX as u32) as u16);
+    put_u16(&mut record, 4, owner_gid.min(u16::MAX as u32) as u16);
+    put_u16(&mut record, 6, 0); // ac_tty
+    put_u32(&mut record, 8, btime);
+    put_u16(
+        &mut record,
+        12,
+        encode_comp_t(nanos_to_acct_ticks(usage.utime_ns)),
+    );
+    put_u16(
+        &mut record,
+        14,
+        encode_comp_t(nanos_to_acct_ticks(usage.stime_ns)),
+    );
+    put_u16(&mut record, 16, encode_comp_t(elapsed_ticks));
+    put_u16(&mut record, 18, 0); // ac_mem
+    put_u16(&mut record, 20, 0); // ac_io
+    put_u16(&mut record, 22, 0); // ac_rw
+    put_u16(&mut record, 24, 0); // ac_minflt
+    put_u16(&mut record, 26, 0); // ac_majflt
+    put_u16(&mut record, 28, 0); // ac_swaps
+    put_u16(&mut record, 30, ACCT_HZ.min(u16::MAX as u64) as u16);
+    put_u32(&mut record, 32, exit_code as u32);
 
-    let mut comm = [0u8; ACCT_COMM + 1];
     let bytes = command.as_bytes();
     let copy_len = bytes.len().min(ACCT_COMM);
-    comm[..copy_len].copy_from_slice(&bytes[..copy_len]);
-    out.extend_from_slice(&comm);
-    out.extend_from_slice(&[0u8; 10]);
-
-    let mut record = [0u8; ACCT_RECORD_SIZE];
-    record.copy_from_slice(&out[..ACCT_RECORD_SIZE]);
+    record[36..36 + copy_len].copy_from_slice(&bytes[..copy_len]);
+    put_u32(&mut record, 56, owner_uid);
+    put_u32(&mut record, 60, owner_gid);
     record
 }
 
@@ -120,7 +131,11 @@ pub fn acct_process_exit(proc_data: &ProcessData, exit_code: i32, usage: TaskUsa
         return;
     };
 
-    let command = current().name();
+    let cmdline = proc_data.cmdline.read();
+    let command = cmdline
+        .first()
+        .and_then(|arg| arg.rsplit('/').next())
+        .unwrap_or("");
     let record = build_record(
         proc_data,
         &command,

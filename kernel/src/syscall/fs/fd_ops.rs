@@ -133,6 +133,17 @@ fn validate_async_owner(owner: AsyncIoOwner) -> AxResult<()> {
     }
 }
 
+fn trailing_slash_requires_directory(path: &str) -> bool {
+    path.len() > 1 && path.as_bytes().last() == Some(&b'/')
+}
+
+fn enforce_trailing_slash_directory(path: &str, loc: &Location) -> AxResult<()> {
+    if trailing_slash_requires_directory(path) && !loc.is_dir() {
+        return Err(AxError::NotADirectory);
+    }
+    Ok(())
+}
+
 fn async_owner_is_live(owner: AsyncIoOwner) -> bool {
     validate_async_owner(owner).is_ok()
 }
@@ -549,6 +560,7 @@ fn open_in_fs(
     let created_parent = if (flags as u32) & O_CREAT != 0 {
         match fs.resolve_no_follow(path) {
             Ok(loc) => {
+                enforce_trailing_slash_directory(path, &loc)?;
                 if (flags as u32) & O_EXCL != 0 {
                     return Err(AxError::AlreadyExists);
                 }
@@ -578,6 +590,7 @@ fn open_in_fs(
         } else {
             fs.resolve(path)?
         };
+        enforce_trailing_slash_directory(path, &loc)?;
         enforce_special_open_rules(&loc, flags, uid)?;
         if loc.is_dir() && invalid_directory_open(flags) {
             return Err(AxError::IsADirectory);
@@ -598,6 +611,7 @@ fn open_in_fs(
         } else {
             fs.resolve(path)
         }?;
+        enforce_trailing_slash_directory(path, &existing)?;
         enforce_special_open_rules(&existing, flags, uid)?;
         check_inode_flags_for_open(&existing, flags)?;
         if existing.is_dir() && invalid_directory_open(flags) {

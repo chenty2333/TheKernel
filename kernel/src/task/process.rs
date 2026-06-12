@@ -1095,8 +1095,8 @@ impl ProcessData {
         self.caps.lock().securebits &= !SECBIT_KEEP_CAPS;
     }
 
-    fn fixup_capabilities_for_euid_change(&self, old_euid: u32, new_euid: u32) {
-        if old_euid == new_euid {
+    fn fixup_capabilities_for_uid_change(&self, old: Credentials, new: Credentials) {
+        if old.ruid == new.ruid && old.euid == new.euid && old.suid == new.suid {
             return;
         }
 
@@ -1104,13 +1104,19 @@ impl ProcessData {
         if caps.securebits & SECBIT_NO_SETUID_FIXUP != 0 {
             return;
         }
-        if old_euid == 0 && new_euid != 0 {
+        if old.euid == 0 && new.euid != 0 {
             caps.effective = [0; CAPABILITY_WORDS];
-            if caps.securebits & SECBIT_KEEP_CAPS == 0 {
+            if old.ruid == 0
+                && old.suid == 0
+                && new.ruid != 0
+                && new.euid != 0
+                && new.suid != 0
+                && caps.securebits & SECBIT_KEEP_CAPS == 0
+            {
                 caps.permitted = [0; CAPABILITY_WORDS];
                 caps.clear_ambient();
             }
-        } else if old_euid != 0 && new_euid == 0 {
+        } else if old.euid != 0 && new.euid == 0 {
             caps.effective = caps.permitted;
         }
     }
@@ -1150,23 +1156,23 @@ impl ProcessData {
     pub fn setuid(&self, uid: u32) -> AxResult<()> {
         let can_setuid = self.has_effective_capability(CAP_SETUID);
         let mut creds = self.creds.lock();
-        let old_euid = creds.euid;
+        let old = *creds;
         if can_setuid {
             creds.ruid = uid;
             creds.euid = uid;
             creds.suid = uid;
             creds.fsuid = uid;
-            let new_euid = creds.euid;
+            let new = *creds;
             drop(creds);
-            self.fixup_capabilities_for_euid_change(old_euid, new_euid);
+            self.fixup_capabilities_for_uid_change(old, new);
             return Ok(());
         }
         if uid == creds.ruid || uid == creds.suid {
             creds.euid = uid;
             creds.fsuid = uid;
-            let new_euid = creds.euid;
+            let new = *creds;
             drop(creds);
-            self.fixup_capabilities_for_euid_change(old_euid, new_euid);
+            self.fixup_capabilities_for_uid_change(old, new);
             return Ok(());
         }
         Err(AxError::OperationNotPermitted)
@@ -1218,8 +1224,9 @@ impl ProcessData {
         if ruid.is_some() || euid.is_some_and(|id| id != old.ruid) {
             creds.suid = new_euid;
         }
+        let new = *creds;
         drop(creds);
-        self.fixup_capabilities_for_euid_change(old.euid, new_euid);
+        self.fixup_capabilities_for_uid_change(old, new);
         Ok(())
     }
 
@@ -1281,9 +1288,9 @@ impl ProcessData {
             creds.suid = id;
         }
         creds.fsuid = creds.euid;
-        let new_euid = creds.euid;
+        let new = *creds;
         drop(creds);
-        self.fixup_capabilities_for_euid_change(old.euid, new_euid);
+        self.fixup_capabilities_for_uid_change(old, new);
         Ok(())
     }
 

@@ -457,7 +457,11 @@ impl TimeManager {
     }
 
     fn update_rlimit_cpu(&mut self, emitter: impl Fn(Signo)) {
-        let proc_data = current().as_thread().proc_data.clone();
+        let curr = current();
+        let Some(thread) = curr.try_as_thread() else {
+            return;
+        };
+        let proc_data = thread.proc_data.clone();
         let (soft_limit, hard_limit) = {
             let limits = proc_data.rlim.read();
             let limit = &limits[RLIMIT_CPU];
