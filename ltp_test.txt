@@ -1210,3 +1210,6 @@ add_key03 add_key03
 add_key04 add_key04
 delete_module02 delete_module02
 fallocate05 fallocate05
+msgctl06 msgctl06
+msgget04 msgget04
+msgget05 msgget05
