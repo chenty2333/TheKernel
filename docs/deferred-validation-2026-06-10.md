@@ -45,14 +45,13 @@ No LTP replay, campaign run, promotion, or score harvest is claimed here.
 - Pidfd: `pidfd_send_signal` proc-dir compatibility, non-pidfd `EBADF`, stale
   PID identity, `pidfd_getfd`, `pidfd_open` non-positive PID errno and
   readiness, `waitid(P_PIDFD)`.
-- Cross-process memory/advice: `process_vm_readv`, `process_vm_writev`,
-  `process_madvise`.
-- Ptrace subset: `TRACEME`, `ATTACH`, `SEIZE`, `DETACH`, `CONT`,
-  `SYSCALL`, `SINGLESTEP`, `KILL`, `PEEKTEXT`, `PEEKDATA`, `POKETEXT`,
-  `POKEDATA`, `SETOPTIONS`, `GETEVENTMSG`, `INTERRUPT`, `LISTEN`.
-- Process comparison/accounting: `kcmp`, `acct`.
-- Resource limits: `getrlimit`, `setrlimit`, `prlimit64`, mandatory
-  getrlimit copyout faulting, `RLIMIT_NOFILE`/`RLIMIT_FSIZE` behavior,
+- Cross-process advice: `process_madvise`.
+- Remaining ptrace subset: `SEIZE`, `SYSCALL`, `SINGLESTEP`, `PEEKTEXT`,
+  `PEEKDATA`, `POKETEXT`, `POKEDATA`, `SETOPTIONS`, `GETEVENTMSG`,
+  `INTERRUPT`, `LISTEN`.
+- Resource limits: `getrlimit`, `prlimit64`, mandatory getrlimit copyout
+  faulting, remaining `setrlimit` edges outside `setrlimit06` RLIMIT_CPU
+  soft/hard signal delivery, `RLIMIT_NOFILE`/`RLIMIT_FSIZE` behavior,
   `RLIMIT_NPROC` clone/fork `EAGAIN` with privilege exemptions,
   `/proc/<pid>/limits`, and `/proc/sys/fs/nr_open`.
 - Kernel module failure surface: `init_module`, `finit_module`,
@@ -265,7 +264,7 @@ make lab-done NAME=<campaign>
 Prioritize replay in large semantic batches:
 
 - IPC/AIO/direct-IO/eventfd/mqueue/semaphore.
-- Pidfd/wait/ptrace/kcmp/acct/module/membarrier.
+- Pidfd/wait/ptrace/module/membarrier.
 - Time/timer/scheduler/signal/futex.
 - MM/NUMA/swap/mlock/mincore/mremap/getrusage.
 - Xattr/fcntl/pipe/epoll/splice/copy_file_range/sendfile/vectored I/O.

@@ -1219,3 +1219,18 @@ io_getevents01 io_getevents01
 io_setup02 io_setup02
 io_submit02 io_submit02
 io_submit03 io_submit03
+acct01 acct01
+acct02 acct02
+kcmp01 kcmp01
+kcmp02 kcmp02
+kcmp03 kcmp03
+process_vm_readv01 process_vm01 -r
+process_vm_readv02 process_vm_readv02
+process_vm_readv03 process_vm_readv03
+process_vm_writev01 process_vm01
+process_vm_writev02 process_vm_writev02
+ptrace01 ptrace01
+ptrace02 ptrace02
+ptrace03 ptrace03
+ptrace11 ptrace11
+setrlimit06 setrlimit06
