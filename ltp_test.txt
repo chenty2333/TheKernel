@@ -1204,3 +1204,9 @@ cgroup_fj_function_memory cgroup_fj_function.sh memory
 cgroup_fj_function_net_cls cgroup_fj_function.sh net_cls
 cgroup_fj_function_net_prio cgroup_fj_function.sh net_prio
 cgroup_fj_function_perf_event cgroup_fj_function.sh perf_event
+add_key01 add_key01
+add_key02 add_key02
+add_key03 add_key03
+add_key04 add_key04
+delete_module02 delete_module02
+fallocate05 fallocate05
