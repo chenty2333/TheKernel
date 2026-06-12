@@ -39,6 +39,18 @@ fn file_futex_handle(cache: &CachedFile) -> Arc<()> {
     handle
 }
 
+fn relocate_backend_start(
+    backend_start: VirtAddr,
+    old_start: VirtAddr,
+    new_start: VirtAddr,
+) -> VirtAddr {
+    if backend_start >= old_start {
+        new_start + backend_start.sub_addr(old_start)
+    } else {
+        new_start.sub(old_start.sub_addr(backend_start))
+    }
+}
+
 #[doc(hidden)]
 pub struct FileBackendInner {
     start: VirtAddr,
@@ -157,8 +169,10 @@ impl FileBackend {
             return false;
         };
         let page_start = vaddr.align_down_4k();
-        let file_offset = self.0.offset_page as u64 * PAGE_SIZE_4K as u64
-            + page_start.sub_addr(self.0.start) as u64;
+        let page_delta = page_start
+            .as_usize()
+            .saturating_sub(self.0.start.as_usize()) as u64;
+        let file_offset = self.0.offset_page as u64 * PAGE_SIZE_4K as u64 + page_delta;
         let current_end = self.0.cache.location().len().unwrap_or(file_end);
         file_offset >= current_end
     }
@@ -191,8 +205,7 @@ impl FileBackend {
         aspace: &Arc<Mutex<AddrSpace>>,
         map_id: Arc<()>,
     ) -> Self {
-        let delta = old_start.sub_addr(self.0.start);
-        let start = new_start.sub(delta);
+        let start = relocate_backend_start(self.0.start, old_start, new_start);
         let inner = Arc::new(FileBackendInner {
             start,
             cache: self.0.cache.clone(),

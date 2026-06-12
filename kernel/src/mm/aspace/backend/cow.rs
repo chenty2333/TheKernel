@@ -78,6 +78,18 @@ impl FrameTableRefCount {
 
 static FRAME_TABLE: SpinNoIrq<FrameTableRefCount> = SpinNoIrq::new(FrameTableRefCount::new());
 
+fn relocate_backend_start(
+    backend_start: VirtAddr,
+    old_start: VirtAddr,
+    new_start: VirtAddr,
+) -> VirtAddr {
+    if backend_start >= old_start {
+        new_start + backend_start.sub_addr(old_start)
+    } else {
+        new_start.sub(old_start.sub_addr(backend_start))
+    }
+}
+
 /// Copy-on-write mapping backend.
 ///
 /// This corresponds to the `MAP_PRIVATE` flag.
@@ -193,9 +205,8 @@ impl CowBackend {
         new_start: VirtAddr,
         map_id: Arc<()>,
     ) -> Self {
-        let delta = old_start.sub_addr(self.start);
         Self {
-            start: new_start.sub(delta),
+            start: relocate_backend_start(self.start, old_start, new_start),
             size: self.size,
             file: self.file.clone(),
             map_id,
@@ -208,7 +219,12 @@ impl CowBackend {
             return false;
         };
         let page_start = vaddr.align_down(self.size);
-        let page_file_start = *file_start + page_start.sub_addr(self.start) as u64;
+        // The fault handler may align non-page-aligned file mappings down to the
+        // backing page size. `alloc_new_at` treats the bytes before `self.start`
+        // as a zero-filled gap, so keep the SIGBUS check on the mapped file
+        // offset rather than underflowing here.
+        let page_delta = page_start.as_usize().saturating_sub(self.start.as_usize()) as u64;
+        let page_file_start = file_start.saturating_add(page_delta);
         page_file_start >= *file_end
     }
 
