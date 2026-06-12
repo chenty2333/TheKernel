@@ -1,6 +1,8 @@
 use alloc::{
     borrow::Cow,
     collections::VecDeque,
+    format,
+    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -24,10 +26,10 @@ use spin::Mutex;
 
 use crate::{
     file::{
-        Directory, File, FileLike, IoDst, IoSrc, add_file_like,
+        Directory, File, FileLike, IoDst, IoSrc, PidFd, add_file_like,
         inotify::{WatchKey, location_for_fd},
     },
-    task::AsThread,
+    task::{AsThread, get_process_data},
 };
 
 pub const FAN_ACCESS: u64 = 0x0000_0001;
@@ -90,6 +92,9 @@ pub const FAN_MARK_IGNORE: u32 = 0x0000_0400;
 
 pub const FANOTIFY_METADATA_VERSION: u8 = 3;
 pub const FAN_NOFD: i32 = -1;
+pub const FAN_NOPIDFD: i32 = FAN_NOFD;
+pub const FAN_EPIDFD: i32 = -2;
+pub const FAN_EVENT_INFO_TYPE_PIDFD: u8 = 4;
 pub const MAX_QUEUED_EVENTS: usize = 16384;
 pub const MAX_USER_GROUPS: usize = 128;
 pub const MAX_USER_MARKS: usize = 1048576;
@@ -149,6 +154,14 @@ struct FanotifyEventMetadata {
 }
 
 #[repr(C)]
+struct FanotifyEventInfoPidfd {
+    info_type: u8,
+    pad: u8,
+    len: u16,
+    pidfd: c_int,
+}
+
+#[repr(C)]
 struct FanotifyResponse {
     fd: c_int,
     response: u32,
@@ -160,6 +173,7 @@ struct FanotifyMark {
     mask: u64,
     ignored_mask: u64,
     ignored_survives_modify: bool,
+    user_flags: u32,
     is_dir: bool,
     scope: FanotifyScope,
 }
@@ -210,6 +224,9 @@ pub fn validate_init_flags(flags: u32, event_f_flags: u32) -> AxResult<()> {
     if flags & (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT)
         == (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT)
     {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & FAN_REPORT_PIDFD != 0 && flags & FAN_REPORT_TID != 0 {
         return Err(AxError::InvalidInput);
     }
     if flags & FANOTIFY_FID_BITS != 0 && flags & (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT) != 0 {
@@ -306,6 +323,10 @@ impl FanotifyFile {
         self.flags & FANOTIFY_FID_BITS != 0
     }
 
+    fn report_pidfd(&self) -> bool {
+        self.flags & FAN_REPORT_PIDFD != 0
+    }
+
     pub(in crate::file) fn release(&self) {
         let mut state = self.state.lock();
         if state.released {
@@ -320,6 +341,48 @@ impl FanotifyFile {
         }
         drop(state);
         self.poll_rx.wake();
+    }
+
+    pub fn fdinfo(&self) -> String {
+        let state = self.state.lock();
+        let mut out = format!(
+            "fanotify flags:{:x} event-flags:{:x}\n",
+            self.flags & FANOTIFY_INIT_FLAGS,
+            self.event_f_flags
+        );
+        for mark in &state.marks {
+            let mflags = mark.user_flags
+                | if mark.ignored_survives_modify {
+                    FAN_MARK_IGNORED_SURV_MODIFY
+                } else {
+                    0
+                };
+            match mark.scope {
+                FanotifyScope::Inode => {
+                    out.push_str(&format!(
+                        "fanotify ino:{:x} sdev:{:x} mflags:{:x} mask:{:x} ignored_mask:{:x}\n",
+                        mark.key.ino,
+                        mark.key.dev,
+                        mflags,
+                        mark.mask as u32,
+                        mark.ignored_mask as u32
+                    ));
+                }
+                FanotifyScope::Mount(mnt_id) => {
+                    out.push_str(&format!(
+                        "fanotify mnt_id:{:x} mflags:{:x} mask:{:x} ignored_mask:{:x}\n",
+                        mnt_id, mflags, mark.mask as u32, mark.ignored_mask as u32
+                    ));
+                }
+                FanotifyScope::Filesystem(sdev) => {
+                    out.push_str(&format!(
+                        "fanotify sdev:{:x} mflags:{:x} mask:{:x} ignored_mask:{:x}\n",
+                        sdev, mflags, mark.mask as u32, mark.ignored_mask as u32
+                    ));
+                }
+            }
+        }
+        out
     }
 
     fn handle_permission_response(&self, fd: c_int, response: u32) -> AxResult<()> {
@@ -360,21 +423,33 @@ impl FileLike for FanotifyFile {
         block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
             let mut state = self.state.lock();
             let metadata_len = size_of::<FanotifyEventMetadata>();
+            let pidfd_info_len = size_of::<FanotifyEventInfoPidfd>();
             if dst.remaining_mut() < metadata_len {
                 return Err(AxError::InvalidInput);
             }
             let mut written = 0usize;
 
             while let Some(event) = state.queue.front() {
-                if dst.remaining_mut() < metadata_len {
+                let event_len = metadata_len
+                    + if self.report_pidfd() {
+                        pidfd_info_len
+                    } else {
+                        0
+                    };
+                if dst.remaining_mut() < event_len {
                     break;
                 }
                 let fd = event
                     .fd_loc
                     .as_ref()
                     .map_or(FAN_NOFD, |loc| opened_event_fd(self, loc));
+                let pidfd = if self.report_pidfd() {
+                    Some(fanotify_event_pidfd(event.pid))
+                } else {
+                    None
+                };
                 let metadata = FanotifyEventMetadata {
-                    event_len: metadata_len as u32,
+                    event_len: event_len as u32,
                     vers: FANOTIFY_METADATA_VERSION,
                     reserved: 0,
                     metadata_len: metadata_len as u16,
@@ -389,6 +464,21 @@ impl FileLike for FanotifyFile {
                     )
                 };
                 dst.write(bytes)?;
+                if let Some(pidfd) = pidfd {
+                    let info = FanotifyEventInfoPidfd {
+                        info_type: FAN_EVENT_INFO_TYPE_PIDFD,
+                        pad: 0,
+                        len: pidfd_info_len as u16,
+                        pidfd,
+                    };
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(
+                            (&info as *const FanotifyEventInfoPidfd).cast::<u8>(),
+                            pidfd_info_len,
+                        )
+                    };
+                    dst.write(bytes)?;
+                }
                 let event = state.queue.pop_front().expect("queue front disappeared");
                 if let Some(id) = event.permission_id
                     && let Some(pending) =
@@ -399,7 +489,7 @@ impl FileLike for FanotifyFile {
                         pending.response = Some(FAN_ALLOW);
                     }
                 }
-                written += metadata_len;
+                written += event_len;
             }
 
             if written == 0 {
@@ -553,6 +643,7 @@ fn add_mark(
         .find(|mark| mark.key == key && mark.scope == scope)
     {
         mark.mask |= mask & ALL_FANOTIFY_EVENT_BITS;
+        mark.user_flags |= flags & FAN_MARK_EVICTABLE;
         mark.is_dir = loc.is_dir();
         return Ok(());
     }
@@ -561,6 +652,7 @@ fn add_mark(
         mask: mask & ALL_FANOTIFY_EVENT_BITS,
         ignored_mask: 0,
         ignored_survives_modify: flags & FAN_MARK_IGNORED_SURV_MODIFY != 0,
+        user_flags: flags & FAN_MARK_EVICTABLE,
         is_dir: loc.is_dir(),
         scope,
     });
@@ -584,6 +676,9 @@ fn update_ignored_mark(
         } else {
             mark.ignored_mask |= mask;
             mark.ignored_survives_modify = flags & FAN_MARK_IGNORED_SURV_MODIFY != 0;
+            if flags & FAN_MARK_IGNORE != 0 {
+                mark.user_flags |= FAN_MARK_IGNORE;
+            }
         }
     }
 }
@@ -655,6 +750,18 @@ fn fanotify_pid(file: &FanotifyFile) -> c_int {
     } else {
         thread.as_thread().proc_data.proc.pid() as c_int
     }
+}
+
+fn fanotify_event_pidfd(pid: c_int) -> c_int {
+    if pid <= 0 {
+        return FAN_NOPIDFD;
+    }
+    let Ok(proc_data) = get_process_data(pid as u32) else {
+        return FAN_NOPIDFD;
+    };
+    PidFd::new_process(&proc_data)
+        .add_to_fd_table(true)
+        .unwrap_or(FAN_EPIDFD)
 }
 
 fn fanotify_mark_matches(

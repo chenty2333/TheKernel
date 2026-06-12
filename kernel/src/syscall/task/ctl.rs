@@ -15,7 +15,7 @@ use linux_raw_sys::{
     },
     mempolicy::*,
 };
-use memory_addr::{MemoryAddr, VirtAddr};
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use spin::RwLock;
 use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
 
@@ -23,7 +23,7 @@ use crate::{
     file::{FD_TABLE, File, FileDescription, FileLike},
     mm::vm_load_string,
     pseudofs::{
-        ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
+        ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget, cgroup::cpuset_allowed_masks,
         namespace_target_from_proc_file,
     },
     task::{AsThread, CapabilityState, Mempolicy, ProcessData, get_process_data},
@@ -46,7 +46,8 @@ const KCMP_SIGHAND: i32 = 4;
 const KCMP_IO: i32 = 5;
 const KCMP_SYSVSEM: i32 = 6;
 const KCMP_EPOLL_TFD: i32 = 7;
-const UNSHARE_SUPPORTED_FLAGS: u32 = CLONE_FILES | CLONE_FS | CLONE_NEWUTS | CLONE_NEWTIME;
+const UNSHARE_SUPPORTED_FLAGS: u32 =
+    CLONE_FILES | CLONE_FS | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWTIME;
 const UNSHARE_RECOGNIZED_FLAGS: u32 = UNSHARE_SUPPORTED_FLAGS
     | CLONE_NEWNS
     | CLONE_NEWIPC
@@ -116,20 +117,22 @@ fn write_nodemask(nodemask: *mut usize, maxnode: usize, value: usize) -> AxResul
     Ok(())
 }
 
-fn validate_mempolicy(mode_with_flags: usize, nodemask: usize) -> AxResult<Mempolicy> {
+fn validate_mempolicy(
+    mode_with_flags: usize,
+    nodemask: usize,
+    allowed_nodemask: usize,
+) -> AxResult<Mempolicy> {
     let mode = mempolicy_mode(mode_with_flags);
     if mempolicy_mode_flags(mode_with_flags) & MPOL_F_NUMA_BALANCING as usize != 0
         && mode != MPOL_BIND as u32
     {
         return Err(AxError::InvalidInput);
     }
-
-    if nodemask & !ALLOWED_NODEMASK != 0 {
-        return Err(AxError::InvalidInput);
-    }
+    let allowed_nodemask = allowed_nodemask & ALLOWED_NODEMASK;
+    let effective_nodemask = nodemask & allowed_nodemask;
 
     let needs_nodes = matches!(mode, mode if mode == MPOL_BIND as u32 || mode == MPOL_INTERLEAVE as u32 || mode == MPOL_PREFERRED_MANY as u32);
-    if needs_nodes && nodemask == 0 {
+    if needs_nodes && effective_nodemask == 0 {
         return Err(AxError::InvalidInput);
     }
 
@@ -140,7 +143,12 @@ fn validate_mempolicy(mode_with_flags: usize, nodemask: usize) -> AxResult<Mempo
             }
             Ok(Mempolicy::new(mode, 0))
         }
-        mode if mode == MPOL_PREFERRED as u32 => Ok(Mempolicy::new(mode, nodemask)),
+        mode if mode == MPOL_PREFERRED as u32 => {
+            if nodemask != 0 && effective_nodemask == 0 {
+                return Err(AxError::InvalidInput);
+            }
+            Ok(Mempolicy::new(mode, effective_nodemask))
+        }
         mode if mode == MPOL_BIND as u32
             || mode == MPOL_INTERLEAVE as u32
             || mode == MPOL_LOCAL as u32
@@ -149,10 +157,21 @@ fn validate_mempolicy(mode_with_flags: usize, nodemask: usize) -> AxResult<Mempo
             if mode == MPOL_LOCAL as u32 && nodemask != 0 {
                 return Err(AxError::InvalidInput);
             }
-            Ok(Mempolicy::new(mode, nodemask))
+            let stored_nodemask = if mode == MPOL_LOCAL as u32 {
+                0
+            } else {
+                effective_nodemask
+            };
+            Ok(Mempolicy::new(mode, stored_nodemask))
         }
         _ => Err(AxError::InvalidInput),
     }
+}
+
+fn current_allowed_nodemask() -> usize {
+    cpuset_allowed_masks(current().as_thread().proc_data.proc.pid())
+        .map(|(_, mems)| mems)
+        .unwrap_or(ALLOWED_NODEMASK)
 }
 
 fn validate_mapped_user_range(start: usize, size: usize) -> AxResult<(VirtAddr, usize)> {
@@ -307,13 +326,13 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
 
     let curr = current();
     let thread = curr.as_thread();
-    if flags & (CLONE_FILES | CLONE_FS) != 0 {
+    if flags & (CLONE_FILES | CLONE_FS | CLONE_NEWNS) != 0 {
         thread.with_mut_scope(|scope| {
             if flags & CLONE_FILES != 0 {
                 let cloned = FD_TABLE.scope(scope).read().clone();
                 *FD_TABLE.scope_mut(scope) = Arc::new(RwLock::new(cloned));
             }
-            if flags & CLONE_FS != 0 {
+            if flags & (CLONE_FS | CLONE_NEWNS) != 0 {
                 let cloned = FS_CONTEXT.scope(scope).lock().clone();
                 *FS_CONTEXT.scope_mut(scope) = Arc::new(axsync::Mutex::new(cloned));
             }
@@ -397,6 +416,42 @@ fn mempolicy_preferred_node(policy: Mempolicy) -> i32 {
     policy.nodemask.trailing_zeros() as i32
 }
 
+fn mempolicy_target_mask(policy: Mempolicy) -> usize {
+    if policy.nodemask != 0 {
+        policy.nodemask
+    } else {
+        1usize << DEFAULT_NUMA_NODE
+    }
+}
+
+fn nth_numa_node(mask: usize, ordinal: usize) -> Option<i32> {
+    let mut seen = 0usize;
+    for candidate in 0..usize::BITS as usize {
+        if mask & (1usize.checked_shl(candidate as u32).unwrap_or(0)) == 0 {
+            continue;
+        }
+        if seen == ordinal {
+            return Some(candidate as i32);
+        }
+        seen += 1;
+    }
+    None
+}
+
+fn mempolicy_page_node(policy: Mempolicy, addr: usize) -> i32 {
+    let mask = mempolicy_target_mask(policy) & ALLOWED_NODEMASK;
+    if mask == 0 {
+        return DEFAULT_NUMA_NODE;
+    }
+
+    if policy.mode == MPOL_INTERLEAVE as u32 {
+        let ordinal = (addr / PAGE_SIZE_4K) % mask.count_ones() as usize;
+        return nth_numa_node(mask, ordinal).unwrap_or(DEFAULT_NUMA_NODE);
+    }
+
+    mask.trailing_zeros() as i32
+}
+
 fn numa_page_node(target: &ProcessData, page: usize) -> AxResult<i32> {
     let start = VirtAddr::from(page).align_down_4k();
     let aspace_handle = target.aspace();
@@ -408,10 +463,10 @@ fn numa_page_node(target: &ProcessData, page: usize) -> AxResult<i32> {
         .page_table()
         .query(start)
         .map_err(|_| AxError::BadAddress)?;
-    Ok(target
+    let policy = target
         .mempolicy_for_addr(start.as_usize())
-        .map(mempolicy_preferred_node)
-        .unwrap_or(DEFAULT_NUMA_NODE))
+        .unwrap_or_else(|| target.mempolicy());
+    Ok(mempolicy_page_node(policy, start.as_usize()))
 }
 
 fn numa_page_is_shareable(target: &ProcessData, page: usize) -> bool {
@@ -421,6 +476,26 @@ fn numa_page_is_shareable(target: &ProcessData, page: usize) -> bool {
     aspace
         .find_area(start)
         .is_some_and(|area| area.backend().is_shareable())
+}
+
+fn check_mbind_strict_resident(start: VirtAddr, len: usize, policy: Mempolicy) -> AxResult<()> {
+    let target_mask = mempolicy_target_mask(policy);
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let mut offset = 0usize;
+
+    while offset < len {
+        let addr = start.as_usize() + offset;
+        if let Ok(node) = numa_page_node(proc_data, addr) {
+            let node_mask = 1usize.checked_shl(node as u32).unwrap_or(0);
+            if target_mask & node_mask == 0 {
+                return Err(LinuxError::EIO.into());
+            }
+        }
+        offset += 4096;
+    }
+
+    Ok(())
 }
 
 fn cap_data_words(version: u32) -> usize {
@@ -564,7 +639,7 @@ pub fn sys_capset(
 
 pub fn sys_umask(mask: u32) -> AxResult<isize> {
     let curr = current();
-    let old = curr.as_thread().proc_data.replace_umask(mask);
+    let old = curr.as_thread().proc_data.replace_umask(mask & 0o777);
     Ok(old as isize)
 }
 
@@ -616,7 +691,10 @@ pub fn sys_get_mempolicy(
         if flags & (MPOL_F_ADDR | MPOL_F_NODE) as usize != 0 {
             return Err(AxError::InvalidInput);
         }
-        write_nodemask(nodemask, maxnode, ALLOWED_NODEMASK)?;
+        let allowed = cpuset_allowed_masks(current().as_thread().proc_data.proc.pid())
+            .map(|(_, mems)| mems)
+            .unwrap_or(ALLOWED_NODEMASK);
+        write_nodemask(nodemask, maxnode, allowed)?;
         return Ok(0);
     }
     if addr != 0 && flags & MPOL_F_ADDR as usize == 0 {
@@ -642,6 +720,12 @@ pub fn sys_get_mempolicy(
         if !nodemask.is_null() {
             return Err(AxError::InvalidInput);
         }
+        if flags & MPOL_F_ADDR as usize != 0 {
+            if !policy.is_null() {
+                policy.vm_write(numa_page_node(proc_data, addr)?)?;
+            }
+            return Ok(0);
+        }
         if !policy.is_null() {
             policy.vm_write(mempolicy_preferred_node(selected))?;
         }
@@ -665,7 +749,7 @@ pub fn sys_set_mempolicy(mode: usize, nodemask: *const usize, maxnode: usize) ->
         return Err(AxError::InvalidInput);
     }
     let nodemask = read_nodemask(nodemask, maxnode)?;
-    let policy = validate_mempolicy(mode, nodemask)?;
+    let policy = validate_mempolicy(mode, nodemask, current_allowed_nodemask())?;
     current().as_thread().proc_data.set_mempolicy(policy);
     Ok(0)
 }
@@ -683,7 +767,12 @@ pub fn sys_mbind(
     }
     let (start, len) = validate_mapped_user_range(start, len)?;
     let nodemask = read_nodemask(nodemask, maxnode)?;
-    let policy = validate_mempolicy(mode, nodemask)?;
+    let policy = validate_mempolicy(mode, nodemask, current_allowed_nodemask())?;
+    if flags & MPOL_MF_STRICT as usize != 0
+        && flags & (MPOL_MF_MOVE | MPOL_MF_MOVE_ALL) as usize == 0
+    {
+        check_mbind_strict_resident(start, len, policy)?;
+    }
     current()
         .as_thread()
         .proc_data
@@ -754,6 +843,7 @@ pub fn sys_migrate_pages(
     let new_nodes = read_nodemask(new_nodes, maxnode)?;
     validate_migration_nodes(old_nodes)?;
     validate_migration_nodes(new_nodes)?;
+    target.migrate_mempolicy_ranges(old_nodes, new_nodes);
     Ok(0)
 }
 

@@ -6,7 +6,7 @@ use axfs::{FS_CONTEXT, FileFlags, OpenOptions};
 use axfs_ng_vfs::{Location, MetadataUpdate};
 use axio::{Seek, SeekFrom};
 use axpoll::{IoEvents, Pollable};
-use linux_raw_sys::general::{__kernel_off_t, IN_ATTRIB, IN_MODIFY, W_OK};
+use linux_raw_sys::general::{__kernel_off_t, IN_ATTRIB, IN_MODIFY, O_DSYNC, O_SYNC, W_OK};
 use starry_vm::{VmMutPtr, VmPtr};
 use syscalls::Sysno;
 
@@ -17,7 +17,7 @@ use crate::{
         inode_flags,
         inotify::{notify_exact, notify_read, notify_write},
         lease, memfd,
-        permission::check_open_permissions,
+        permission::{check_open_permissions, check_writable_mount},
     },
     mm::{IoVec, IoVectorBuf, UserConstPtr, VmBytes, VmBytesMut},
     mounts,
@@ -44,6 +44,9 @@ const SPLICE_F_ALL: u32 = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SP
 const SYNC_FILE_RANGE_WAIT_BEFORE: u32 = 0x01;
 const SYNC_FILE_RANGE_WRITE: u32 = 0x02;
 const SYNC_FILE_RANGE_WAIT_AFTER: u32 = 0x04;
+// Regular-file O_DIRECT is constrained by logical sector alignment. LTP
+// exercises 512-byte offset and 1 KiB transfer cases.
+const DIRECT_IO_ALIGNMENT: usize = 512;
 
 fn validate_splice_flags(flags: u32) -> AxResult<()> {
     if flags & !SPLICE_F_ALL != 0 {
@@ -122,6 +125,60 @@ fn copy_within_file_reverse(file: &axfs::File, src: u64, dst: u64, len: u64) -> 
     Ok(())
 }
 
+fn file_uses_direct_io(file: &File) -> bool {
+    file.inner().flags().contains(FileFlags::DIRECT)
+}
+
+fn validate_direct_io(file: &File, addr: usize, len: usize, offset: u64) -> AxResult<()> {
+    if !file_uses_direct_io(file) || len == 0 {
+        return Ok(());
+    }
+    if !addr.is_multiple_of(DIRECT_IO_ALIGNMENT)
+        || !len.is_multiple_of(DIRECT_IO_ALIGNMENT)
+        || !(offset as usize).is_multiple_of(DIRECT_IO_ALIGNMENT)
+    {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn validate_direct_iov(file: &File, iov: &IoVectorBuf, offset: u64) -> AxResult<()> {
+    if !file_uses_direct_io(file) || iov.len() == 0 {
+        return Ok(());
+    }
+    if !(offset as usize).is_multiple_of(DIRECT_IO_ALIGNMENT)
+        || !iov.len().is_multiple_of(DIRECT_IO_ALIGNMENT)
+        || !iov.is_aligned(DIRECT_IO_ALIGNMENT)?
+    {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn sync_regular_file_after_status_write(status_flags: u32, file: &File) -> AxResult<()> {
+    if status_flags & O_SYNC != 0 {
+        file.inner().sync(false)?;
+    } else if status_flags & O_DSYNC != 0 {
+        file.inner().sync(true)?;
+    }
+    Ok(())
+}
+
+fn sync_file_after_status_write(file: &FileHandle<File>) -> AxResult<()> {
+    sync_regular_file_after_status_write(file.status_flags(), file.as_ref())
+}
+
+fn sync_file_like_after_status_write(file_like: &FileHandle<dyn FileLike>) -> AxResult<()> {
+    if let Some(file) = file_like.downcast_ref::<File>() {
+        sync_regular_file_after_status_write(file_like.status_flags(), file)?;
+    }
+    Ok(())
+}
+
+fn sync_fd_after_status_write(fd: c_int) -> AxResult<()> {
+    sync_file_like_after_status_write(&get_file_like(fd)?)
+}
+
 pub fn sys_dummy_fd(sysno: Sysno) -> AxResult<isize> {
     warn!("Unimplemented fd syscall: {sysno}");
     Err(AxError::Unsupported)
@@ -135,7 +192,11 @@ pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     if len != 0 {
         crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
     }
-    let read = get_file_like(fd)?.read(&mut VmBytesMut::new(buf, len))? as isize;
+    let f = get_file_like(fd)?;
+    if let Some(file) = f.downcast_ref::<File>() {
+        validate_direct_io(file, buf as usize, len, current_file_offset(file.inner())?)?;
+    }
+    let read = f.read(&mut VmBytesMut::new(buf, len))? as isize;
     if read > 0 {
         notify_read(fd);
     }
@@ -148,7 +209,11 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
         crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
     }
     let f = get_file_like(fd)?;
-    let read = f.read(&mut IoVectorBuf::new(iov, iovcnt)?.into_io())? as isize;
+    let iov = IoVectorBuf::new(iov, iovcnt)?;
+    if let Some(file) = f.downcast_ref::<File>() {
+        validate_direct_iov(file, &iov, current_file_offset(file.inner())?)?;
+    }
+    let read = f.read(&mut iov.into_io())? as isize;
     if read > 0 {
         notify_read(fd);
     }
@@ -160,8 +225,22 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
 /// Return the written size if success.
 pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     debug!("sys_write <= fd: {fd}, buf: {buf:p}, len: {len}");
-    let written = get_file_like(fd)?.write(&mut VmBytes::new(buf, len))? as isize;
+    let f = get_file_like(fd)?;
+    if let Some(file) = f.downcast_ref::<File>() {
+        file.inner().access(FileFlags::WRITE)?;
+        if len != 0 {
+            check_writable_mount(file.inner().location())?;
+        }
+        let offset = if file.inner().flags().contains(FileFlags::APPEND) {
+            file.inner().location().len()?
+        } else {
+            current_file_offset(file.inner())?
+        };
+        validate_direct_io(file, buf as usize, len, offset)?;
+    }
+    let written = f.with_write_credentials(|| f.write(&mut VmBytes::new(buf, len)))? as isize;
     if written > 0 {
+        sync_file_like_after_status_write(&f)?;
         notify_write(fd);
     }
     Ok(written)
@@ -172,10 +251,28 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> 
     let iov = IoVectorBuf::new(iov, iovcnt)?;
     let written = if let Ok(file) = get_typed_file::<File>(fd) {
         iov.check_readable()?;
-        file.write(&mut iov.into_io())?
+        file.inner().access(FileFlags::WRITE)?;
+        if iov.len() != 0 {
+            check_writable_mount(file.inner().location())?;
+        }
+        let offset = if file.inner().flags().contains(FileFlags::APPEND) {
+            file.inner().location().len()?
+        } else {
+            current_file_offset(file.inner())?
+        };
+        validate_direct_iov(file.as_ref(), &iov, offset)?;
+        let written = file.with_write_credentials(|| file.write(&mut iov.into_io()))?;
+        if written > 0 {
+            sync_file_after_status_write(&file)?;
+        }
+        written
     } else {
         let f = get_file_like(fd)?;
-        f.write(&mut iov.into_io())?
+        let written = f.with_write_credentials(|| f.write(&mut iov.into_io()))?;
+        if written > 0 {
+            sync_file_like_after_status_write(&f)?;
+        }
+        written
     } as isize;
     if written > 0 {
         notify_write(fd);
@@ -222,6 +319,7 @@ fn positioned_file(fd: c_int, access: FileFlags) -> AxResult<FileHandle<File>> {
 
 fn positioned_write_file(fd: c_int) -> AxResult<FileHandle<File>> {
     let file = positioned_file(fd, FileFlags::WRITE)?;
+    check_writable_mount(file.inner().location())?;
     executable::check_not_active(file.inner().location())?;
     Ok(file)
 }
@@ -242,6 +340,7 @@ fn regular_copy_file(fd: c_int, write: bool) -> AxResult<FileHandle<File>> {
             return Err(AxError::BadFileDescriptor);
         }
         file.inner().access(FileFlags::WRITE)?;
+        check_writable_mount(file.inner().location())?;
         executable::check_not_active(file.inner().location())?;
         inode_flags::check_write(file.inner().location(), false)?;
     } else {
@@ -384,10 +483,13 @@ fn do_preadv(
     if iov.len() != 0 {
         crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
     }
-    let mut io = iov.into_io();
     let read = if offset == -1 {
+        validate_direct_iov(file.as_ref(), &iov, current_file_offset(file.inner())?)?;
+        let mut io = iov.into_io();
         file.read(&mut io)?
     } else {
+        validate_direct_iov(file.as_ref(), &iov, offset as u64)?;
+        let io = iov.into_io();
         file.inner().read_at(io, offset as u64)?
     } as isize;
     if read > 0 {
@@ -413,38 +515,47 @@ fn do_pwritev(
 
     let file = positioned_write_file(fd)?;
     let io = IoVectorBuf::new(iov, iovcnt)?;
-    let written = if offset == -1 {
-        let appending = file.inner().flags().contains(FileFlags::APPEND);
-        let write_offset = if appending {
-            file.inner().location().len()?
-        } else {
-            current_file_offset(file.inner())?
-        };
-        let allowed = allowed_write_len(write_offset, io.len())?;
-        inode_flags::check_write(file.inner().location(), appending)?;
-        memfd::check_write(file.inner().location(), write_offset, allowed)?;
-        let mut io = io.into_io();
-        io.limit_remaining(allowed);
-        file.write(&mut io)?
-    } else {
-        if file.inner().flags().contains(FileFlags::APPEND) {
-            let append_offset = file.inner().location().len()?;
-            let allowed = allowed_write_len(append_offset, io.len())?;
-            inode_flags::check_write(file.inner().location(), true)?;
-            memfd::check_write(file.inner().location(), append_offset, allowed)?;
+    let written = file.with_write_credentials(|| {
+        if offset == -1 {
+            let appending = file.inner().flags().contains(FileFlags::APPEND);
+            let write_offset = if appending {
+                file.inner().location().len()?
+            } else {
+                current_file_offset(file.inner())?
+            };
+            validate_direct_iov(file.as_ref(), &io, write_offset)?;
+            let allowed = allowed_write_len(write_offset, io.len())?;
+            inode_flags::check_write(file.inner().location(), appending)?;
+            memfd::check_write(file.inner().location(), write_offset, allowed)?;
             let mut io = io.into_io();
             io.limit_remaining(allowed);
-            file.inner().access(FileFlags::APPEND)?.append(io)?.0
+            file.write(&mut io)
         } else {
-            let allowed = allowed_write_len(offset as u64, io.len())?;
-            inode_flags::check_write(file.inner().location(), false)?;
-            memfd::check_write(file.inner().location(), offset as u64, allowed)?;
-            let mut io = io.into_io();
-            io.limit_remaining(allowed);
-            file.inner().write_at(io, offset as u64)?
+            if file.inner().flags().contains(FileFlags::APPEND) {
+                let append_offset = file.inner().location().len()?;
+                validate_direct_iov(file.as_ref(), &io, append_offset)?;
+                let allowed = allowed_write_len(append_offset, io.len())?;
+                inode_flags::check_write(file.inner().location(), true)?;
+                memfd::check_write(file.inner().location(), append_offset, allowed)?;
+                let mut io = io.into_io();
+                io.limit_remaining(allowed);
+                file.inner()
+                    .access(FileFlags::APPEND)?
+                    .append(io)
+                    .map(|it| it.0)
+            } else {
+                validate_direct_iov(file.as_ref(), &io, offset as u64)?;
+                let allowed = allowed_write_len(offset as u64, io.len())?;
+                inode_flags::check_write(file.inner().location(), false)?;
+                memfd::check_write(file.inner().location(), offset as u64, allowed)?;
+                let mut io = io.into_io();
+                io.limit_remaining(allowed);
+                file.inner().write_at(io, offset as u64)
+            }
         }
-    } as isize;
+    })? as isize;
     if written > 0 {
+        sync_file_after_status_write(&file)?;
         notify_write(fd);
     }
     Ok(written)
@@ -477,15 +588,8 @@ pub fn sys_lseek(fd: c_int, offset: __kernel_off_t, whence: c_int) -> AxResult<i
 fn generic_seek_data_or_hole(file: &axfs::File, offset: u64, seek_hole: bool) -> AxResult<u64> {
     let metadata = file.location().metadata()?;
     let size = metadata.size;
-    if offset > size {
-        return Err(AxError::InvalidInput);
-    }
-    if offset == size {
-        return if seek_hole {
-            Ok(size)
-        } else {
-            Err(AxError::NotFound)
-        };
+    if offset >= size {
+        return Err(AxError::from(LinuxError::ENXIO));
     }
 
     let block_size = metadata.block_size.max(1) as usize;
@@ -514,7 +618,7 @@ fn generic_seek_data_or_hole(file: &axfs::File, offset: u64, seek_hole: bool) ->
     if seek_hole {
         Ok(size)
     } else {
-        Err(AxError::NotFound)
+        Err(AxError::from(LinuxError::ENXIO))
     }
 }
 
@@ -538,6 +642,7 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
         proc_data.fsgid(),
         &supplementary_groups,
     )?;
+    check_writable_mount(&loc)?;
     check_resize_limit(length as u64)?;
     executable::check_not_active(&loc)?;
     inode_flags::check_resize(&loc)?;
@@ -580,6 +685,7 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
             AxError::BadFileDescriptor => AxError::InvalidInput,
             other => other,
         })?;
+    check_writable_mount(f.inner().location())?;
     executable::check_not_active(f.inner().location())?;
     inode_flags::check_resize(f.inner().location())?;
     lease::wait_for_truncate(f.inner().location())?;
@@ -618,6 +724,7 @@ pub fn sys_fallocate(
 
     let f = get_typed_file::<File>(fd)?;
     f.inner().access(FileFlags::WRITE)?;
+    check_writable_mount(f.inner().location())?;
 
     let file = f.inner();
     let backend = file.backend()?;
@@ -648,11 +755,16 @@ pub fn sys_fallocate(
         0 => {
             check_resize_limit(size.max(end))?;
             memfd::check_resize(&loc, size.max(end))?;
-            backend.set_len(size.max(end))?;
-            let _ = tmp::reserve_fallocate_range(&loc, offset, len, false);
+            if let Some(result) = tmp::reserve_fallocate_range(&loc, offset, len, true) {
+                result?;
+            } else {
+                backend.set_len(size.max(end))?;
+            }
         }
         FALLOC_FL_KEEP_SIZE => {
-            let _ = tmp::reserve_fallocate_range(&loc, offset, len, false);
+            if let Some(result) = tmp::reserve_fallocate_range(&loc, offset, len, false) {
+                result?;
+            }
         }
         mode if mode == (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE) => {
             if seals & linux_raw_sys::general::F_SEAL_WRITE != 0 {
@@ -682,7 +794,9 @@ pub fn sys_fallocate(
             };
             let zero_len = zero_end.saturating_sub(offset);
             write_zero_range(file, offset, zero_len)?;
-            let _ = tmp::reserve_fallocate_range(&loc, offset, zero_len, false);
+            if let Some(result) = tmp::reserve_fallocate_range(&loc, offset, zero_len, false) {
+                result?;
+            }
         }
         FALLOC_FL_COLLAPSE_RANGE => {
             if len == 0
@@ -823,6 +937,7 @@ pub fn sys_pread64(fd: c_int, buf: *mut u8, len: usize, offset: __kernel_off_t) 
         return Err(AxError::InvalidInput);
     }
     let f = positioned_file(fd, FileFlags::READ)?;
+    validate_direct_io(f.as_ref(), buf as usize, len, offset as u64)?;
     if len != 0 {
         crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
     }
@@ -846,23 +961,27 @@ pub fn sys_pwrite64(
         return Ok(0);
     }
     let f = positioned_write_file(fd)?;
-    let write = if f.inner().flags().contains(FileFlags::APPEND) {
-        let append_offset = f.inner().location().len()?;
-        let allowed = allowed_write_len(append_offset, len)?;
-        inode_flags::check_write(f.inner().location(), true)?;
-        memfd::check_write(f.inner().location(), append_offset, allowed)?;
-        f.inner()
-            .access(FileFlags::APPEND)?
-            .append(VmBytes::new(buf, allowed))?
-            .0
-    } else {
-        let allowed = allowed_write_len(offset as u64, len)?;
-        inode_flags::check_write(f.inner().location(), false)?;
-        memfd::check_write(f.inner().location(), offset as u64, allowed)?;
-        f.inner()
-            .write_at(VmBytes::new(buf, allowed), offset as _)?
-    };
+    let write = f.with_write_credentials(|| {
+        if f.inner().flags().contains(FileFlags::APPEND) {
+            let append_offset = f.inner().location().len()?;
+            validate_direct_io(f.as_ref(), buf as usize, len, append_offset)?;
+            let allowed = allowed_write_len(append_offset, len)?;
+            inode_flags::check_write(f.inner().location(), true)?;
+            memfd::check_write(f.inner().location(), append_offset, allowed)?;
+            f.inner()
+                .access(FileFlags::APPEND)?
+                .append(VmBytes::new(buf, allowed))
+                .map(|it| it.0)
+        } else {
+            validate_direct_io(f.as_ref(), buf as usize, len, offset as u64)?;
+            let allowed = allowed_write_len(offset as u64, len)?;
+            inode_flags::check_write(f.inner().location(), false)?;
+            memfd::check_write(f.inner().location(), offset as u64, allowed)?;
+            f.inner().write_at(VmBytes::new(buf, allowed), offset as _)
+        }
+    })?;
     if write > 0 {
+        sync_file_after_status_write(&f)?;
         notify_write(fd);
     }
     Ok(write as _)
@@ -956,9 +1075,10 @@ impl SendFile {
 
     fn write(&mut self, mut buf: &[u8]) -> AxResult<usize> {
         match self {
-            SendFile::Direct(file) => file.write(&mut buf),
+            SendFile::Direct(file) => file.with_write_credentials(|| file.write(&mut buf)),
             SendFile::Offset(file, offset) => {
                 let off = offset.vm_read()?;
+                check_writable_mount(file.inner().location())?;
                 executable::check_not_active(file.inner().location())?;
                 inode_flags::check_write(file.inner().location(), false)?;
                 let allowed = allowed_write_len(off, buf.len())?;
@@ -966,7 +1086,8 @@ impl SendFile {
                     return Ok(0);
                 }
                 memfd::check_write(file.inner().location(), off, allowed)?;
-                let bytes_written = file.inner().write_at(&buf[..allowed], off)?;
+                let bytes_written =
+                    file.with_write_credentials(|| file.inner().write_at(&buf[..allowed], off))?;
                 offset.vm_write(checked_offset_advance(off, bytes_written)?)?;
                 Ok(bytes_written)
             }
@@ -1015,6 +1136,7 @@ fn validate_sendfile_destination(fd: c_int) -> AxResult<()> {
     let file_like = get_file_like(fd)?;
     if let Some(file) = file_like.downcast_ref::<File>() {
         file.inner().access(FileFlags::WRITE)?;
+        check_writable_mount(file.inner().location())?;
         executable::check_not_active(file.inner().location())?;
     } else if matches!(
         FileLikeKind::from_file_like(file_like.as_ref()),
@@ -1057,6 +1179,7 @@ fn validate_splice_endpoint(fd: c_int, input: bool) -> AxResult<()> {
                 return Err(AxError::InvalidInput);
             }
             file.inner().access(FileFlags::WRITE)?;
+            check_writable_mount(file.inner().location())?;
             executable::check_not_active(file.inner().location())?;
         }
         return Ok(());
@@ -1100,7 +1223,11 @@ pub fn sys_sendfile(out_fd: c_int, in_fd: c_int, offset: *mut u64, len: usize) -
 
     let dst = SendFile::Direct(get_file_like(out_fd)?);
 
-    do_send(src, dst, len).map(|n| n as _)
+    let sent = do_send(src, dst, len)?;
+    if sent > 0 {
+        sync_fd_after_status_write(out_fd)?;
+    }
+    Ok(sent as _)
 }
 
 pub fn sys_copy_file_range(
@@ -1167,6 +1294,7 @@ pub fn sys_copy_file_range(
     let copied = do_send(src, dst, len)?;
     if copied > 0 {
         touch_modified_metadata(dst_file.inner().location())?;
+        sync_file_after_status_write(&dst_file)?;
         notify_read(fd_in);
         notify_write(fd_out);
     }
@@ -1257,7 +1385,11 @@ pub fn sys_splice(
         return Err(AxError::InvalidInput);
     }
 
-    do_send(src, dst, len).map(|n| n as _)
+    let spliced = do_send(src, dst, len)?;
+    if spliced > 0 {
+        sync_fd_after_status_write(fd_out)?;
+    }
+    Ok(spliced as _)
 }
 
 pub fn sys_tee(fd_in: c_int, fd_out: c_int, len: usize, flags: u32) -> AxResult<isize> {

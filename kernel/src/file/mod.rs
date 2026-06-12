@@ -13,6 +13,7 @@ pub mod io_uring;
 pub(crate) mod lease;
 pub(crate) mod memfd;
 mod net;
+pub(crate) mod netlink;
 pub(crate) mod packet;
 pub(crate) mod permission;
 mod pidfd;
@@ -36,6 +37,7 @@ pub use self::{
     fd_table::*,
     fs::{Directory, File, ResolveAtResult, is_path_only_fd, resolve_at, with_fs, with_path_fs},
     net::Socket,
+    netlink::NetlinkSocket,
     packet::PacketSocket,
     pidfd::PidFd,
     pipe::Pipe,

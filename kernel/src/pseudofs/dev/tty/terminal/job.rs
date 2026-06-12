@@ -41,6 +41,10 @@ impl JobControl {
         self.foreground.lock().upgrade()
     }
 
+    pub fn session(&self) -> Option<Arc<Session>> {
+        self.session.lock().upgrade()
+    }
+
     pub fn set_foreground(&self, pg: &Arc<ProcessGroup>) -> AxResult<()> {
         let mut guard = self.foreground.lock();
         let weak = Arc::downgrade(pg);

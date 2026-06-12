@@ -9,7 +9,7 @@ use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange, align_up_4k};
 
 use crate::{
     file::{File, FileLike, get_file_description, get_typed_file, io_uring::IoUringFile},
-    mm::{AddrSpace, Backend, BackendOps, SharedPages},
+    mm::{AddrSpace, Backend, BackendOps, SharedPages, check_memory_overcommit},
     pseudofs::{Device, DeviceMmap},
     task::{AsThread, ProcessData},
 };
@@ -414,6 +414,10 @@ pub fn sys_mmap(
     let start = addr.align_down(page_size);
     let end = (addr + length).align_up(page_size);
     let mut length = end - start;
+
+    if is_anonymous_mapping && permission_flags.contains(MmapProt::WRITE) {
+        check_memory_overcommit(length)?;
+    }
 
     let start = if map_flags.intersects(MmapFlags::FIXED | MmapFlags::FIXED_NOREPLACE) {
         let dst_addr = VirtAddr::from(start);
@@ -891,7 +895,7 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
             Ok(0)
         }
         MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_REMOVE => Err(AxError::InvalidInput),
-        MADV_WIPEONFORK | MADV_KEEPONFORK => {
+        MADV_WIPEONFORK => {
             let end = start + length;
             let mut cursor = start;
             while cursor < end {
@@ -907,6 +911,11 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
                 cursor = area.end().min(end);
             }
             aspace.set_wipe_on_fork(start, length, advice == MADV_WIPEONFORK)?;
+            Ok(0)
+        }
+        MADV_KEEPONFORK => {
+            inspect_madvise_range(&aspace, start, length)?;
+            aspace.set_wipe_on_fork(start, length, false)?;
             Ok(0)
         }
         _ => Err(AxError::InvalidInput),

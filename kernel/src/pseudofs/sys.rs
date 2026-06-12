@@ -1,10 +1,12 @@
-use alloc::{format, string::String, sync::Arc};
+use alloc::{borrow::Cow, boxed::Box, format, string::String, sync::Arc};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use axfs_ng_vfs::{DeviceId, Filesystem, NodeType};
+use axfs_ng_vfs::{DeviceId, Filesystem, NodeType, VfsError, VfsResult};
 use axhal::mem::MemRegionFlags;
 
-use crate::pseudofs::{DirMapping, SimpleDir, SimpleFile, SimpleFs, dev::r#loop as loopdev};
+use crate::pseudofs::{
+    DirMapping, NodeOpsMux, SimpleDir, SimpleDirOps, SimpleFile, SimpleFs, dev::r#loop as loopdev,
+};
 
 const LOOP_MAJOR: u32 = 7;
 const VIRTIO_BLOCK_MAJOR: u32 = 8;
@@ -228,6 +230,42 @@ fn block_device_dir(
     SimpleDir::new_maker(fs, Arc::new(dir))
 }
 
+struct LoopPartitionDirs {
+    fs: Arc<SimpleFs>,
+    number: u32,
+}
+
+impl SimpleDirOps for LoopPartitionDirs {
+    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+        let number = self.number;
+        Box::new(
+            (1..=loopdev::partition_count(number))
+                .map(move |partition| Cow::Owned(format!("loop{number}p{partition}"))),
+        )
+    }
+
+    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+        let prefix = format!("loop{}p", self.number);
+        let partition = name
+            .strip_prefix(&prefix)
+            .and_then(|part| part.parse().ok())
+            .ok_or(VfsError::NotFound)?;
+        if !loopdev::partition_visible(self.number, partition) {
+            return Err(VfsError::NotFound);
+        }
+
+        Ok(NodeOpsMux::Dir(loop_partition_dir(
+            self.fs.clone(),
+            self.number,
+            partition,
+        )))
+    }
+
+    fn is_cacheable(&self) -> bool {
+        false
+    }
+}
+
 fn loop_block_device_dir(
     fs: Arc<SimpleFs>,
     number: u32,
@@ -298,21 +336,21 @@ fn loop_block_device_dir(
     );
     dir.add("queue", SimpleDir::new_maker(fs.clone(), Arc::new(queue)));
     dir.add("loop", SimpleDir::new_maker(fs.clone(), Arc::new(loop_dir)));
-    dir.add(
-        format!("loop{number}p1"),
-        loop_partition_dir(fs.clone(), number),
-    );
     dir.add("uevent", uevent_file(fs.clone(), dev_name, dev_id));
+    let dir = dir.chain(LoopPartitionDirs {
+        fs: fs.clone(),
+        number,
+    });
     SimpleDir::new_maker(fs, Arc::new(dir))
 }
 
-fn loop_partition_dir(fs: Arc<SimpleFs>, number: u32) -> crate::pseudofs::DirMaker {
+fn loop_partition_dir(fs: Arc<SimpleFs>, number: u32, partition: u32) -> crate::pseudofs::DirMaker {
     let mut dir = DirMapping::new();
     dir.add(
         "size",
         SimpleFile::new_regular(fs.clone(), move || {
             let snapshot = loopdev::snapshot(number);
-            let sectors = if snapshot.partscan {
+            let sectors = if loopdev::partition_visible(number, partition) {
                 snapshot.size_sectors
             } else {
                 0

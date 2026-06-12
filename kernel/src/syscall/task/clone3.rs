@@ -26,6 +26,7 @@ pub struct Clone3Args {
 
 const MIN_CLONE_ARGS_SIZE: usize = core::mem::size_of::<u64>() * 8;
 const CLONE3_ARGS_SIZE: usize = core::mem::size_of::<Clone3Args>();
+const CLONE3_ARGS_SIZE_VER2: usize = core::mem::size_of::<Clone3Args>();
 
 impl TryFrom<Clone3Args> for CloneArgs {
     type Error = axerrno::AxError;
@@ -34,10 +35,6 @@ impl TryFrom<Clone3Args> for CloneArgs {
         if args.set_tid != 0 || args.set_tid_size != 0 {
             warn!("sys_clone3: set_tid/set_tid_size not supported, ignoring");
         }
-        if args.cgroup != 0 {
-            warn!("sys_clone3: cgroup parameter not supported, ignoring");
-        }
-
         let flags = CloneFlags::from_bits(args.flags).ok_or(AxError::InvalidInput)?;
 
         if args.exit_signal > 0 && flags.intersects(CloneFlags::THREAD | CloneFlags::PARENT) {
@@ -64,6 +61,9 @@ impl TryFrom<Clone3Args> for CloneArgs {
             parent_tid: args.parent_tid as usize,
             child_tid: args.child_tid as usize,
             pidfd: args.pidfd as usize,
+            cgroup_fd: flags
+                .contains(CloneFlags::INTO_CGROUP)
+                .then_some(args.cgroup as i32),
         })
     }
 }
@@ -100,6 +100,11 @@ pub fn sys_clone3(uctx: &UserContext, args: *const u8, size: usize) -> AxResult<
     }
     let clone3_args: Clone3Args =
         bytemuck::try_pod_read_unaligned(&buffer).map_err(|_| AxError::InvalidInput)?;
+    if clone3_args.flags & CloneFlags::INTO_CGROUP.bits() != 0
+        && (clone3_args.cgroup > i32::MAX as u64 || size < CLONE3_ARGS_SIZE_VER2)
+    {
+        return Err(AxError::InvalidInput);
+    }
 
     let clone_args = CloneArgs::try_from(clone3_args)?;
     clone_args.do_clone(uctx, CloneApi::Clone3)

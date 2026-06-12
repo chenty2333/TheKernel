@@ -21,7 +21,6 @@ use super::{
     has_ipc_permission, next_ipc_id,
 };
 use crate::{
-    syscall::{sys_getgid, sys_getuid},
     task::{AsThread, ProcStateHint, has_pending_syscall_signal, with_proc_state_hint},
     time::{TimeValueLike, wall_time},
 };
@@ -266,9 +265,10 @@ impl SemManager {
     }
 
     fn max_active_index(&self) -> isize {
-        self.active_array_count()
-            .checked_sub(1)
-            .map(|index| index as isize)
+        self.semid_arrays
+            .iter()
+            .filter_map(|(semid, array)| (!array.lock().removed).then_some(*semid as isize))
+            .max()
             .unwrap_or(0)
     }
 }
@@ -401,8 +401,10 @@ fn strip_ipc64(cmd: i32) -> i32 {
 }
 
 pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
-    let current_uid = sys_getuid()? as u32;
-    let current_gid = sys_getgid()? as u32;
+    let current = current();
+    let proc_data = &current.as_thread().proc_data;
+    let current_uid = proc_data.euid();
+    let current_gid = proc_data.egid();
     let create = (semflg & IPC_CREAT) != 0;
     let excl = (semflg & IPC_EXCL) != 0;
 
@@ -453,8 +455,10 @@ pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
 }
 
 pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isize> {
-    let current_uid = sys_getuid()? as u32;
-    let current_gid = sys_getgid()? as u32;
+    let current_task = current();
+    let proc_data = &current_task.as_thread().proc_data;
+    let current_uid = proc_data.euid();
+    let current_gid = proc_data.egid();
     let cmd = strip_ipc64(cmd);
 
     if cmd == IPC_INFO {
@@ -469,18 +473,9 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
     }
     if cmd == SEM_STAT || cmd == SEM_STAT_ANY {
         let manager = SEM_MANAGER.lock();
-        let array = if let Some(array) = manager.get_array_by_semid(semid) {
-            array
-        } else if semid >= 0 {
-            manager
-                .semid_arrays
-                .values()
-                .nth(semid as usize)
-                .cloned()
-                .ok_or(AxError::from(LinuxError::EINVAL))?
-        } else {
-            return Err(AxError::from(LinuxError::EINVAL));
-        };
+        let array = manager
+            .get_array_by_semid(semid)
+            .ok_or(AxError::from(LinuxError::EINVAL))?;
         let array = array.lock();
         if array.removed {
             return Err(AxError::from(LinuxError::EINVAL));
@@ -758,8 +753,8 @@ pub fn sys_semtimedop(
     let ops = vm_load(sops, nsops)?;
     let current = current();
     let proc_data = &current.as_thread().proc_data;
-    let current_uid = sys_getuid()? as u32;
-    let current_gid = sys_getgid()? as u32;
+    let current_uid = proc_data.euid();
+    let current_gid = proc_data.egid();
     let current_pid = proc_data.proc.pid() as __kernel_pid_t;
     let needs_write = ops.iter().any(|op| op.sem_op != 0);
 

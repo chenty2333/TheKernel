@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use core::{future::poll_fn, task::Poll};
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
 use axtask::{
@@ -20,8 +20,11 @@ use crate::task::copy_current_user_fpu_state_to;
 use crate::{
     file::{FD_TABLE, FileLike, PidFd, close_file_like},
     mm::copy_from_kernel,
+    pseudofs::cgroup,
     syscall::inherit_proc_shm,
-    task::{AsThread, ProcessData, Thread, add_task_to_table, new_user_task, vm_write_in_aspace},
+    task::{
+        AsThread, ProcessData, Thread, add_task_to_table, new_user_task, tasks, vm_write_in_aspace,
+    },
 };
 
 const NORMAL_FORK_YIELD_INTERVAL: Pid = 64;
@@ -104,6 +107,35 @@ fn should_yield_after_clone(flags: CloneFlags, tid: Pid) -> bool {
     tid % NORMAL_FORK_YIELD_INTERVAL == 0
 }
 
+fn check_rlimit_nproc(proc_data: &ProcessData) -> AxResult<()> {
+    if proc_data.uid() == 0
+        || proc_data.has_effective_capability(CAP_SYS_RESOURCE)
+        || proc_data.has_effective_capability(CAP_SYS_ADMIN)
+    {
+        return Ok(());
+    }
+
+    let limit = proc_data.rlim.read()[RLIMIT_NPROC].current;
+    if limit == RLIM_INFINITY as i64 as u64 {
+        return Ok(());
+    }
+
+    let uid = proc_data.uid();
+    let count = tasks()
+        .into_iter()
+        .filter(|task| {
+            let thread = task.as_thread();
+            !thread.pending_exit() && thread.proc_data.uid() == uid
+        })
+        .count() as u64;
+
+    if count >= limit {
+        return Err(AxError::from(LinuxError::EAGAIN));
+    }
+
+    Ok(())
+}
+
 /// Unified arguments for clone/clone3/fork/vfork.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CloneArgs {
@@ -114,6 +146,7 @@ pub struct CloneArgs {
     pub parent_tid: usize,
     pub child_tid: usize,
     pub pidfd: usize,
+    pub cgroup_fd: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -177,9 +210,8 @@ impl CloneArgs {
             return Err(AxError::OperationNotPermitted);
         }
 
-        if flags.contains(CloneFlags::INTO_CGROUP) {
-            warn!("sys_clone3: CLONE_INTO_CGROUP not supported");
-            return Err(AxError::OperationNotSupported);
+        if flags.contains(CloneFlags::INTO_CGROUP) && api != CloneApi::Clone3 {
+            return Err(AxError::InvalidInput);
         }
 
         Ok(())
@@ -196,6 +228,7 @@ impl CloneArgs {
             parent_tid,
             child_tid,
             pidfd,
+            cgroup_fd,
         } = self;
 
         debug!(
@@ -229,6 +262,7 @@ impl CloneArgs {
         // post-join fork/create phases do not inherit the previous burst's
         // stack and task-structure pressure.
         reclaim_exited_tasks();
+        check_rlimit_nproc(old_proc_data)?;
 
         let mut child_sched_state = sched_state(&curr);
         if !flags.contains(CloneFlags::THREAD) && child_sched_state.reset_on_fork {
@@ -314,13 +348,18 @@ impl CloneArgs {
             } else {
                 old_proc_data.net_ns.clone()
             };
+            let cgroup_ns = if flags.contains(CloneFlags::NEWCGROUP) {
+                old_proc_data.cgroup_ns().fork()
+            } else {
+                old_proc_data.cgroup_ns()
+            };
             let pid_ns = if flags.contains(CloneFlags::NEWPID) {
                 old_proc_data.pid_ns().fork(tid)
             } else {
                 old_proc_data.pid_ns()
             };
             let user_ns = if flags.contains(CloneFlags::NEWUSER) {
-                old_proc_data.user_ns().fork()
+                old_proc_data.user_ns().fork(old_proc_data.euid())
             } else {
                 old_proc_data.user_ns()
             };
@@ -355,6 +394,7 @@ impl CloneArgs {
                 signal_actions,
                 exit_signal,
                 net_ns,
+                cgroup_ns,
                 pid_ns,
                 user_ns,
                 uts_ns,
@@ -454,6 +494,17 @@ impl CloneArgs {
                 return Err(err.into());
             }
         }
+        if !flags.contains(CloneFlags::THREAD) {
+            let charge_result = if let Some(fd) = cgroup_fd {
+                cgroup::try_charge_fork_into(fd, tid)
+            } else {
+                cgroup::try_charge_fork(old_proc_data.proc.pid(), tid)
+            };
+            if let Err(err) = charge_result {
+                rollback_clone_setup();
+                return Err(err);
+            }
+        }
         *new_task.task_ext_mut() = Some(AxTaskExt::from_impl(thr));
 
         if flags.contains(CloneFlags::VFORK) {
@@ -507,6 +558,7 @@ pub fn sys_clone(
         } else {
             0
         },
+        cgroup_fd: None,
     };
 
     args.do_clone(uctx, CloneApi::Clone)

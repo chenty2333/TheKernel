@@ -36,6 +36,7 @@ use crate::{
         install_tmpfile_state, lease, memfd,
         permission::{
             check_create_permissions, check_open_permissions, check_path_prefix_search_permissions,
+            check_writable_mount,
         },
         pipe::NamedPipe,
         release_posix_locks_on_close, resolve_at, with_path_fs,
@@ -90,7 +91,8 @@ fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32))
 
 fn open_status_flags(flags: u32) -> u32 {
     let mut status = flags & O_ACCMODE;
-    status |= flags & (O_APPEND | O_NONBLOCK | FASYNC | O_NOATIME | O_PATH);
+    status |=
+        flags & (O_APPEND | O_DIRECT | O_DSYNC | O_SYNC | O_NONBLOCK | FASYNC | O_NOATIME | O_PATH);
     status
 }
 
@@ -148,6 +150,11 @@ fn open_access_mask(flags: c_int) -> u32 {
         mask |= W_OK;
     }
     mask
+}
+
+fn open_requires_writable_mount(flags: c_int) -> bool {
+    let flags = flags as u32;
+    flags & O_PATH == 0 && (flags & O_ACCMODE != O_RDONLY || flags & O_TRUNC != 0)
 }
 
 fn check_inode_flags_for_open(loc: &Location, flags: c_int) -> AxResult<()> {
@@ -351,6 +358,10 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
                         );
                         let loc = Location::new(file.location().mountpoint().clone(), entry);
                         file = axfs::File::new(FileBackend::Direct(loc), file.flags());
+                    } else if let Some(pty) = inner.downcast_ref::<tty::PtyDriver>() {
+                        if flags & O_PATH == 0 && pty.is_locked_pty_slave() {
+                            return Err(AxError::Io);
+                        }
                     } else if inner.is::<tty::CurrentTty>() {
                         let term = current()
                             .as_thread()
@@ -591,6 +602,9 @@ fn open_in_fs(
         check_inode_flags_for_open(&existing, flags)?;
         if existing.is_dir() && invalid_directory_open(flags) {
             return Err(AxError::IsADirectory);
+        }
+        if open_requires_writable_mount(flags) {
+            check_writable_mount(&existing)?;
         }
         lease::wait_for_open(&existing, flags)?;
         if (flags as u32) & O_PATH == 0 {

@@ -13,7 +13,7 @@ use axhal::{
 };
 use axsync::Mutex;
 use kspin::SpinNoIrq;
-use memory_addr::{MemoryAddr, PhysAddr, VirtAddr, VirtAddrRange};
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
     AddrSpace, Backend, BackendOps, PopulateCallback, alloc_frame, dealloc_frame, page_table_flags,
@@ -210,6 +210,28 @@ impl CowBackend {
         let page_start = vaddr.align_down(self.size);
         let page_file_start = *file_start + page_start.sub_addr(self.start) as u64;
         page_file_start >= *file_end
+    }
+
+    pub(crate) fn cached_page_resident(&self, vaddr: VirtAddr) -> bool {
+        let Some((file, file_start, ..)) = &self.file else {
+            return false;
+        };
+        let page_start = vaddr.align_down(self.size);
+        if page_start < self.start {
+            return false;
+        }
+
+        let file_offset = *file_start + page_start.sub_addr(self.start) as u64;
+        let file_page = file_offset / PAGE_SIZE_4K as u64;
+        if file_page > u32::MAX as u64 {
+            return false;
+        }
+
+        let mut resident = false;
+        file.with_page(file_page as u32, |page| {
+            resident = page.is_some();
+        });
+        resident
     }
 
     pub(crate) fn clone_for_range(&self, old_start: VirtAddr, new_start: VirtAddr) -> Self {

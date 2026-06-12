@@ -45,7 +45,7 @@ use crate::{
         ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
         namespace_target_from_proc_file, proc_namespace_location_from_object,
     },
-    task::AsThread,
+    task::{AsThread, PidNamespace},
     time::{TimeValueLike, wall_time},
 };
 
@@ -66,6 +66,21 @@ fn add_proc_namespace_fd(
     Ok(add_file_like(Arc::new(File::new(file)), false)? as isize)
 }
 
+fn visible_pid_namespace_parent(ns: &Arc<PidNamespace>) -> Option<Arc<PidNamespace>> {
+    let parent = ns.parent()?;
+    let active = current().as_thread().proc_data.pid_ns();
+    let mut cursor = Some(parent.clone());
+
+    while let Some(candidate) = cursor {
+        if Arc::ptr_eq(&candidate, &active) {
+            return Some(parent);
+        }
+        cursor = candidate.parent();
+    }
+
+    None
+}
+
 fn proc_namespace_ioctl(loc: &Location, cmd: u32) -> Option<AxResult<isize>> {
     let ProcNamespaceTarget::Live(kind, object) = namespace_target_from_proc_file(loc) else {
         return None;
@@ -73,16 +88,17 @@ fn proc_namespace_ioctl(loc: &Location, cmd: u32) -> Option<AxResult<isize>> {
 
     let result = match cmd {
         NS_GET_PARENT => match (kind, object) {
-            (ProcNamespaceKind::Pid, ProcNamespaceObject::Pid(ns)) => ns
-                .parent()
-                .map(|parent| {
-                    add_proc_namespace_fd(
-                        loc,
-                        ProcNamespaceKind::Pid,
-                        ProcNamespaceObject::Pid(parent),
-                    )
-                })
-                .unwrap_or(Err(AxError::OperationNotPermitted)),
+            (ProcNamespaceKind::Pid, ProcNamespaceObject::Pid(ns)) => {
+                visible_pid_namespace_parent(&ns)
+                    .map(|parent| {
+                        add_proc_namespace_fd(
+                            loc,
+                            ProcNamespaceKind::Pid,
+                            ProcNamespaceObject::Pid(parent),
+                        )
+                    })
+                    .unwrap_or(Err(AxError::OperationNotPermitted))
+            }
             (ProcNamespaceKind::Time | ProcNamespaceKind::TimeForChildren, _) => {
                 Err(AxError::InvalidInput)
             }
@@ -1061,6 +1077,7 @@ fn update_times(
     let loc = resolve_at(dirfd, path.as_deref(), flags)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
+    check_writable_mount(&loc)?;
     inode_flags::check_time_update(&loc, atime_intent, mtime_intent)?;
     loc.update_metadata(MetadataUpdate {
         atime,

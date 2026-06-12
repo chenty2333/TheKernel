@@ -55,6 +55,13 @@ impl SwapManager {
     fn next_default_priority(&self) -> i32 {
         -(self.entries.len() as i32) - 1
     }
+
+    fn total_bytes(&self) -> u64 {
+        self.entries
+            .iter()
+            .map(|entry| entry.size_pages.saturating_mul(PAGE_SIZE_4K as u64))
+            .sum()
+    }
 }
 
 fn current_has_swap_capability() -> bool {
@@ -117,6 +124,16 @@ pub fn swap_snapshot() -> String {
         );
     }
     out
+}
+
+pub(crate) fn swap_total_bytes() -> u64 {
+    SWAP_MANAGER.lock().total_bytes()
+}
+
+pub(crate) fn swap_free_bytes() -> u64 {
+    // This compatibility layer records enabled swap files but does not page out
+    // memory, so all enabled swap remains free in procfs accounting.
+    swap_total_bytes()
 }
 
 pub fn sys_swapon(specialfile: *const c_char, swap_flags: i32) -> AxResult<isize> {

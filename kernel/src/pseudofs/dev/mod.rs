@@ -11,7 +11,7 @@ mod memtrack;
 mod rtc;
 pub mod tty;
 
-use alloc::{format, string::String, sync::Arc};
+use alloc::{borrow::Cow, boxed::Box, format, string::String, sync::Arc};
 use core::{
     any::Any,
     sync::atomic::{AtomicU32, Ordering},
@@ -19,20 +19,33 @@ use core::{
 
 use axerrno::AxError;
 use axfs::BlockDeviceInfo;
-use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodeType, VfsResult};
+use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodeType, VfsError, VfsResult};
 use axsync::Mutex;
 use linux_raw_sys::ioctl::{
     BLKGETSIZE, BLKGETSIZE64, BLKRAGET, BLKRASET, BLKROGET, BLKROSET, BLKSSZGET, RNDGETENTCNT,
+    TUNGETFEATURES,
 };
 #[cfg(feature = "dev-log")]
 pub use log::bind_dev_log;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use starry_vm::{VmMutPtr, VmPtr};
 
-use crate::pseudofs::{Device, DeviceMmap, DeviceOps, DirMaker, DirMapping, SimpleDir, SimpleFs};
+use crate::pseudofs::{
+    Device, DeviceMmap, DeviceOps, DirMaker, DirMapping, NodeOpsMux, SimpleDir, SimpleDirOps,
+    SimpleFs,
+};
 
 const RANDOM_SEED: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
 pub(crate) const RANDOM_ENTROPY_BITS: i32 = 256;
+const IFF_TUN: u32 = 0x0001;
+const IFF_TAP: u32 = 0x0002;
+const IFF_NAPI: u32 = 0x0010;
+const IFF_NAPI_FRAGS: u32 = 0x0020;
+const IFF_NO_CARRIER: u32 = 0x0040;
+const IFF_MULTI_QUEUE: u32 = 0x0100;
+const IFF_NO_PI: u32 = 0x1000;
+const IFF_ONE_QUEUE: u32 = 0x2000;
+const IFF_VNET_HDR: u32 = 0x4000;
 
 pub(crate) fn new_devfs() -> Filesystem {
     SimpleFs::new_with("devfs".into(), 0x01021994, builder)
@@ -227,6 +240,46 @@ impl DeviceOps for BlockDevice {
     }
 }
 
+struct LoopPartitionDevices {
+    fs: Arc<SimpleFs>,
+}
+
+impl LoopPartitionDevices {
+    fn parse_name(name: &str) -> Option<(u32, u32)> {
+        let rest = name.strip_prefix("loop")?;
+        let (number, partition) = rest.split_once('p')?;
+        Some((number.parse().ok()?, partition.parse().ok()?))
+    }
+}
+
+impl SimpleDirOps for LoopPartitionDevices {
+    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+        Box::new((0..16).flat_map(|number| {
+            (1..=r#loop::partition_count(number))
+                .map(move |partition| Cow::Owned(format!("loop{number}p{partition}")))
+        }))
+    }
+
+    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+        let (number, partition) = Self::parse_name(name).ok_or(VfsError::NotFound)?;
+        if number >= 16 || !r#loop::partition_visible(number, partition) {
+            return Err(VfsError::NotFound);
+        }
+
+        let dev_id = DeviceId::new(7, 256 * partition + number);
+        Ok(NodeOpsMux::File(Device::new(
+            self.fs.clone(),
+            NodeType::BlockDevice,
+            dev_id,
+            Arc::new(r#loop::LoopDevice::new(number, dev_id)),
+        )))
+    }
+
+    fn is_cacheable(&self) -> bool {
+        false
+    }
+}
+
 struct CpuDmaLatency;
 
 impl DeviceOps for CpuDmaLatency {
@@ -244,6 +297,48 @@ impl DeviceOps for CpuDmaLatency {
 
     fn flags(&self) -> NodeFlags {
         NodeFlags::NON_CACHEABLE
+    }
+}
+
+struct Tun;
+
+impl Tun {
+    const FEATURES: u32 = IFF_TUN
+        | IFF_TAP
+        | IFF_NO_CARRIER
+        | IFF_NO_PI
+        | IFF_ONE_QUEUE
+        | IFF_VNET_HDR
+        | IFF_MULTI_QUEUE
+        | IFF_NAPI
+        | IFF_NAPI_FRAGS;
+}
+
+impl DeviceOps for Tun {
+    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
+        Err(AxError::InvalidInput)
+    }
+
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        Err(AxError::InvalidInput)
+    }
+
+    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+        match cmd {
+            TUNGETFEATURES => {
+                (arg as *mut u32).vm_write(Self::FEATURES)?;
+                Ok(0)
+            }
+            _ => Err(AxError::NotATty),
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn flags(&self) -> NodeFlags {
+        NodeFlags::NON_CACHEABLE | NodeFlags::STREAM
     }
 }
 
@@ -364,6 +459,20 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         ),
     );
 
+    root.add("net", {
+        let mut net = DirMapping::new();
+        net.add(
+            "tun",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(10, 200),
+                Arc::new(Tun),
+            ),
+        );
+        SimpleDir::new_maker(fs.clone(), Arc::new(net))
+    });
+
     root.add(
         "cpu_dma_latency",
         Device::new(
@@ -381,6 +490,15 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     );
 
     // Loop devices
+    root.add(
+        "loop-control",
+        Device::new(
+            fs.clone(),
+            NodeType::CharacterDevice,
+            DeviceId::new(10, 237),
+            Arc::new(r#loop::LoopControl),
+        ),
+    );
     for i in 0..16 {
         let dev_id = DeviceId::new(7, i);
         root.add(
@@ -390,16 +508,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 NodeType::BlockDevice,
                 dev_id,
                 Arc::new(r#loop::LoopDevice::new(i, dev_id)),
-            ),
-        );
-        let part_dev_id = DeviceId::new(7, 256 + i);
-        root.add(
-            format!("loop{i}p1"),
-            Device::new(
-                fs.clone(),
-                NodeType::BlockDevice,
-                part_dev_id,
-                Arc::new(r#loop::LoopDevice::new(i, part_dev_id)),
             ),
         );
     }
@@ -426,5 +534,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         SimpleDir::new_maker(fs.clone(), Arc::new(event::input_devices(fs.clone()))),
     );
 
+    let root = root.chain(LoopPartitionDevices { fs: fs.clone() });
     SimpleDir::new_maker(fs, Arc::new(root))
 }

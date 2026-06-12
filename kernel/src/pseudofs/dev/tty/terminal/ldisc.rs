@@ -288,6 +288,11 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         self.clear_line_buf.store(true, Ordering::Relaxed);
     }
 
+    pub fn readable_len(&mut self) -> usize {
+        self.refill_read_buffer();
+        self.buf_rx.occupied_len()
+    }
+
     pub fn poll_read(&mut self) -> bool {
         self.refill_read_buffer();
         !self.buf_rx.is_empty()

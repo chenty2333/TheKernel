@@ -4,7 +4,6 @@ use alloc::{
     format,
     string::{String, ToString},
     sync::{Arc, Weak},
-    vec,
     vec::Vec,
 };
 use core::{
@@ -29,19 +28,34 @@ use inherit_methods_macro::inherit_methods;
 use linux_raw_sys::{
     general::{
         CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS,
+        RLIM_INFINITY, RLIM_NLIMITS,
     },
     ioctl::{NS_GET_NSTYPE, NS_GET_OWNER_UID, NS_GET_PARENT, NS_GET_USERNS},
+    mempolicy::{
+        MPOL_BIND, MPOL_DEFAULT, MPOL_INTERLEAVE, MPOL_LOCAL, MPOL_PREFERRED, MPOL_PREFERRED_MANY,
+    },
 };
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use starry_process::Process;
+use starry_vm::VmMutPtr;
 
 use crate::{
-    file::{FD_TABLE, FileDescription, inotify::InotifyFile, lease, pipe},
-    mm::{Backend, BackendOps, system_memory_stats},
+    file::{
+        FD_TABLE, FileDescription, PidFd, fanotify::FanotifyFile, inotify::InotifyFile, lease, pipe,
+    },
+    mm::{
+        Backend, BackendOps, commit_limit_bytes, committed_as_bytes, overcommit_memory_policy,
+        overcommit_ratio, set_overcommit_memory_policy, set_overcommit_ratio, system_memory_stats,
+    },
     mounts,
     pseudofs::{
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
-        SimpleFileOperation, SimpleFs, SimpleFsNode, dev::RANDOM_ENTROPY_BITS,
+        SimpleFileOperation, SimpleFs, SimpleFsNode,
+        cgroup::{
+            cpuset_allowed_masks, proc_cgroup_membership, proc_cgroups_snapshot,
+            proc_cpuset_membership,
+        },
+        dev::RANDOM_ENTROPY_BITS,
     },
     syscall::{
         aio_max_nr, aio_nr, current_domainname_string, current_hostname_string,
@@ -54,13 +68,14 @@ use crate::{
         set_key_root_maxkeys, set_mq_msg_max, set_mq_msgsize_max, set_mq_queues_max,
         set_msg_next_id, set_msgmni_limit, set_sched_rr_timeslice_ms, set_sem_limits,
         set_sem_next_id, set_shm_next_id, set_shmmax_limit, shm_next_id, shmall_limit,
-        shmmax_limit, shmmni_limit, swap_snapshot, sysvipc_msg_snapshot, sysvipc_sem_snapshot,
-        sysvipc_shm_snapshot,
+        shmmax_limit, shmmni_limit, swap_free_bytes, swap_snapshot, swap_total_bytes,
+        sysvipc_msg_snapshot, sysvipc_sem_snapshot, sysvipc_shm_snapshot,
     },
     task::{
-        AsThread, PidNamespace, ProcessData, TimeNamespace, UserNamespace, UtsNamespace,
-        get_process_data, get_task, get_visible_task_including_exiting, nr_open_limit,
-        render_task_stat, set_nr_open_limit, tasks,
+        AsThread, Mempolicy, PidNamespace, ProcessData, TimeNamespace, UserNamespace, UtsNamespace,
+        get_process_data, get_process_including_zombie, get_task,
+        get_visible_task_including_exiting, nr_open_limit, render_task_stat, render_zombie_stat,
+        set_nr_open_limit, tasks,
     },
 };
 
@@ -73,12 +88,31 @@ const PROC_SCHED_RT_PERIOD_US_DEFAULT: u32 = 1_000_000;
 const PROC_SCHED_RT_RUNTIME_US_DEFAULT: i32 = 950_000;
 const PROC_PAGEMAP_ENTRY_BYTES: u64 = 8;
 const PROC_KPAGEFLAGS_ENTRY_BYTES: u64 = 8;
+const PROC_NUMA_NODEMASK: usize = 0b11;
 const KPF_DIRTY: u64 = 1 << 4;
 static PROC_PID_MAX: AtomicU32 = AtomicU32::new(PROC_PID_MAX_DEFAULT);
 static PROC_FILE_MAX: AtomicUsize = AtomicUsize::new(PROC_FILE_MAX_DEFAULT);
 static PROC_SCHED_TIME_AVG_MS: AtomicU32 = AtomicU32::new(PROC_SCHED_TIME_AVG_MS_DEFAULT);
 static PROC_SCHED_RT_PERIOD_US: AtomicU32 = AtomicU32::new(PROC_SCHED_RT_PERIOD_US_DEFAULT);
 static PROC_SCHED_RT_RUNTIME_US: AtomicI32 = AtomicI32::new(PROC_SCHED_RT_RUNTIME_US_DEFAULT);
+const PROC_LIMIT_NAMES: [(&str, Option<&str>); RLIM_NLIMITS as usize] = [
+    ("Max cpu time", Some("seconds")),
+    ("Max file size", Some("bytes")),
+    ("Max data size", Some("bytes")),
+    ("Max stack size", Some("bytes")),
+    ("Max core file size", Some("bytes")),
+    ("Max resident set", Some("bytes")),
+    ("Max processes", Some("processes")),
+    ("Max open files", Some("files")),
+    ("Max locked memory", Some("bytes")),
+    ("Max address space", Some("bytes")),
+    ("Max file locks", Some("locks")),
+    ("Max pending signals", Some("signals")),
+    ("Max msgqueue size", Some("bytes")),
+    ("Max nice priority", None),
+    ("Max realtime priority", None),
+    ("Max realtime timeout", Some("us")),
+];
 // Minimal gzip-compressed kernel config for LTP kconfig probes.
 const PROC_CONFIG_GZ: &[u8] = &[
     0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x6d, 0xcc, 0xb1, 0x12, 0x40, 0x40,
@@ -90,16 +124,43 @@ const PROC_CONFIG_GZ: &[u8] = &[
     0x03, 0x33, 0x02, 0xb5, 0x79, 0x98, 0x00, 0x00, 0x00,
 ];
 
+fn append_mount_data_options(options: &mut String, data: &str) {
+    for option in data
+        .split(',')
+        .map(|option| option.trim())
+        .filter(|option| !option.is_empty())
+    {
+        if !options.split(',').any(|existing| existing == option) {
+            options.push(',');
+            options.push_str(option);
+        }
+    }
+}
+
+fn record_mount_options(record: &mounts::MountRecord) -> String {
+    let mut options = mounts::mount_options(record.flags);
+    let data = match record.fs_type.as_str() {
+        "cgroup" if !record.data.is_empty() => Some(record.data.as_str()),
+        "cgroup" if !matches!(record.source.as_str(), "none" | "cgroup") => {
+            Some(record.source.as_str())
+        }
+        "cgroup2" if !record.data.is_empty() => Some(record.data.as_str()),
+        _ => None,
+    };
+    if let Some(data) = data {
+        append_mount_data_options(&mut options, data);
+    }
+    options
+}
+
 fn render_mounts() -> String {
     let mut out = String::from("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n");
     for record in mounts::snapshot() {
+        let options = record_mount_options(&record);
         let _ = writeln!(
             out,
             "{} {} {} {} 0 0",
-            record.source,
-            record.target,
-            record.fs_type,
-            mounts::mount_options(record.flags)
+            record.source, record.target, record.fs_type, options
         );
     }
     out
@@ -110,7 +171,7 @@ fn render_mountinfo() -> String {
     for record in mounts::snapshot() {
         let major = record.dev >> 32;
         let minor = record.dev as u32;
-        let options = mounts::mount_options(record.flags);
+        let options = record_mount_options(&record);
         let _ = writeln!(
             out,
             "{} 1 {}:{} / {} {} - {} {} {}",
@@ -153,6 +214,10 @@ fn real_meminfo() -> String {
     let cached_kb = stats.cached_bytes / 1024;
     let mapped_kb = stats.mapped_bytes / 1024;
     let page_tables_kb = stats.page_table_bytes / 1024;
+    let swap_total_kb = swap_total_bytes() as usize / 1024;
+    let swap_free_kb = swap_free_bytes() as usize / 1024;
+    let commit_limit_kb = commit_limit_bytes() / 1024;
+    let committed_kb = committed_as_bytes() / 1024;
     format!(
         "MemTotal:       {total_kb:>8} kB\n\
          MemFree:        {free_kb:>8} kB\n\
@@ -162,8 +227,8 @@ fn real_meminfo() -> String {
          SwapCached:            0 kB\n\
          Active:         {used_kb:>8} kB\n\
          Inactive:              0 kB\n\
-         SwapTotal:             0 kB\n\
-         SwapFree:              0 kB\n\
+         SwapTotal:      {swap_total_kb:>8} kB\n\
+         SwapFree:       {swap_free_kb:>8} kB\n\
          Dirty:                 0 kB\n\
          Writeback:             0 kB\n\
          AnonPages:             0 kB\n\
@@ -171,8 +236,8 @@ fn real_meminfo() -> String {
          Shmem:                 0 kB\n\
          Slab:                  0 kB\n\
          PageTables:     {page_tables_kb:>8} kB\n\
-         CommitLimit:    {total_kb:>8} kB\n\
-         Committed_AS:   {used_kb:>8} kB\n\
+         CommitLimit:    {commit_limit_kb:>8} kB\n\
+         Committed_AS:   {committed_kb:>8} kB\n\
          VmallocTotal:          0 kB\n\
          VmallocUsed:           0 kB\n"
     )
@@ -277,6 +342,45 @@ fn format_cap_set(words: [u32; 2]) -> String {
     format!("{:016x}", ((words[1] as u64) << 32) | words[0] as u64)
 }
 
+fn task_cpu_mask_bits(task: &AxTaskRef) -> usize {
+    let cpus = axhal::cpu_num().max(1).min(usize::BITS as usize);
+    let cpumask = task.cpumask();
+    let mut mask = 0usize;
+    for cpu in 0..cpus {
+        if cpumask.get(cpu) {
+            mask |= 1usize << cpu;
+        }
+    }
+    if mask != 0 { mask } else { 1 }
+}
+
+fn format_mask_list(mask: usize, width: usize) -> String {
+    let mut ranges = Vec::new();
+    let mut index = 0usize;
+    let width = width.min(usize::BITS as usize);
+    while index < width {
+        if mask & (1usize << index) == 0 {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index + 1 < width && mask & (1usize << (index + 1)) != 0 {
+            index += 1;
+        }
+        if start == index {
+            ranges.push(start.to_string());
+        } else {
+            ranges.push(format!("{start}-{index}"));
+        }
+        index += 1;
+    }
+    if ranges.is_empty() {
+        "0".into()
+    } else {
+        ranges.join(",")
+    }
+}
+
 #[rustfmt::skip]
 fn task_status(task: &AxTaskRef) -> String {
     let proc_data = &task.as_thread().proc_data;
@@ -286,6 +390,17 @@ fn task_status(task: &AxTaskRef) -> String {
         aspace.locked_bytes() / 1024
     };
     let caps = proc_data.capability_state();
+    let cpu_mask = task_cpu_mask_bits(task);
+    let mem_mask = cpuset_allowed_masks(proc_data.proc.pid())
+        .map(|(_, mems)| mems)
+        .unwrap_or(PROC_NUMA_NODEMASK);
+    let cpu_width = axhal::cpu_num().max(1);
+    let mem_width = PROC_NUMA_NODEMASK
+        .next_power_of_two()
+        .trailing_zeros()
+        .max(1) as usize;
+    let cpu_allowed_list = format_mask_list(cpu_mask, cpu_width);
+    let mem_allowed_list = format_mask_list(mem_mask, mem_width);
     format!(
         "Tgid:\t{}\n\
         Pid:\t{}\n\
@@ -299,10 +414,10 @@ fn task_status(task: &AxTaskRef) -> String {
         CapEff:\t{}\n\
         CapBnd:\t{}\n\
         CapAmb:\t{}\n\
-        Cpus_allowed:\t1\n\
-        Cpus_allowed_list:\t0\n\
-        Mems_allowed:\t3\n\
-        Mems_allowed_list:\t0-1",
+        Cpus_allowed:\t{:x}\n\
+        Cpus_allowed_list:\t{}\n\
+        Mems_allowed:\t{:x}\n\
+        Mems_allowed_list:\t{}",
         proc_data.proc.pid(),
         task.as_thread().tid(),
         locked_kb,
@@ -311,8 +426,43 @@ fn task_status(task: &AxTaskRef) -> String {
         format_cap_set(caps.permitted),
         format_cap_set(caps.effective),
         format_cap_set(caps.bounding),
-        format_cap_set(caps.ambient)
+        format_cap_set(caps.ambient),
+        cpu_mask,
+        cpu_allowed_list,
+        mem_mask,
+        mem_allowed_list
     )
+}
+
+fn format_rlimit_value(value: u64) -> String {
+    if value == RLIM_INFINITY as i64 as u64 {
+        "unlimited".into()
+    } else {
+        value.to_string()
+    }
+}
+
+fn render_task_limits(task: &AxTaskRef) -> Vec<u8> {
+    let limits = task.as_thread().proc_data.rlim.read();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<25} {:<20} {:<20} {:<10}",
+        "Limit", "Soft Limit", "Hard Limit", "Units"
+    );
+
+    for (resource, (name, unit)) in PROC_LIMIT_NAMES.iter().enumerate() {
+        let limit = &limits[resource as u32];
+        let soft = format_rlimit_value(limit.current);
+        let hard = format_rlimit_value(limit.max);
+        if let Some(unit) = unit {
+            let _ = writeln!(out, "{name:<25} {soft:<20} {hard:<20} {unit:<10}");
+        } else {
+            let _ = writeln!(out, "{name:<25} {soft:<20} {hard:<20}");
+        }
+    }
+
+    out.into_bytes()
 }
 
 fn render_task_maps(task: &AxTaskRef, include_smaps: bool) -> String {
@@ -371,6 +521,111 @@ fn render_task_maps(task: &AxTaskRef, include_smaps: bool) -> String {
             let _ = writeln!(out, "Rss:            {:>8} kB", resident_bytes / 1024);
             let _ = writeln!(out, "Locked:         {:>8} kB", locked_bytes / 1024);
         }
+    }
+
+    out
+}
+
+fn mempolicy_effective_mask(policy: Mempolicy) -> usize {
+    let mask = policy.nodemask & PROC_NUMA_NODEMASK;
+    if mask != 0 { mask } else { 1 }
+}
+
+fn format_node_list(mask: usize) -> String {
+    let mut ranges = Vec::new();
+    let mut node = 0usize;
+    while node < usize::BITS as usize {
+        let bit = 1usize.checked_shl(node as u32).unwrap_or(0);
+        if mask & bit == 0 {
+            node += 1;
+            continue;
+        }
+        let start = node;
+        while node + 1 < usize::BITS as usize {
+            let next_bit = 1usize.checked_shl((node + 1) as u32).unwrap_or(0);
+            if mask & next_bit == 0 {
+                break;
+            }
+            node += 1;
+        }
+        if start == node {
+            ranges.push(start.to_string());
+        } else {
+            ranges.push(format!("{start}-{node}"));
+        }
+        node += 1;
+    }
+    ranges.join(",")
+}
+
+fn first_node(mask: usize) -> usize {
+    if mask == 0 {
+        0
+    } else {
+        mask.trailing_zeros() as usize
+    }
+}
+
+fn numa_policy_text(policy: Mempolicy) -> String {
+    let mask = mempolicy_effective_mask(policy);
+    let nodes = format_node_list(mask);
+    match policy.mode {
+        mode if mode == MPOL_BIND as u32 => format!("bind:{nodes}"),
+        mode if mode == MPOL_INTERLEAVE as u32 => format!("interleave:{nodes}"),
+        mode if mode == MPOL_PREFERRED as u32 || mode == MPOL_PREFERRED_MANY as u32 => {
+            format!("prefer:{nodes}")
+        }
+        mode if mode == MPOL_LOCAL as u32 => "local".into(),
+        mode if mode == MPOL_DEFAULT as u32 => "default".into(),
+        _ => "default".into(),
+    }
+}
+
+fn is_user_stack_area(start: usize, end: usize) -> bool {
+    let stack_top = crate::config::USER_STACK_TOP;
+    let stack_bottom = stack_top.saturating_sub(crate::config::USER_STACK_SIZE);
+    start < stack_top && end > stack_bottom
+}
+
+fn render_task_numa_maps(task: &AxTaskRef) -> String {
+    let thr = task.as_thread();
+    let proc_data = &thr.proc_data;
+    let aspace_handle = proc_data.aspace();
+    let aspace = aspace_handle.lock();
+    let mut out = String::new();
+
+    for area in aspace.areas() {
+        if !area.flags().contains(MappingFlags::USER) {
+            continue;
+        }
+        let start = area.start().as_usize();
+        let end = start + area.size();
+        let policy = proc_data
+            .mempolicy_for_addr(start)
+            .unwrap_or_else(|| proc_data.mempolicy());
+        let policy_text = numa_policy_text(policy);
+        let page_size = area.backend().page_size() as usize;
+        let mut resident_pages = 0usize;
+        let mut cursor = area.start();
+        while cursor < area.end() {
+            let step = page_size.min(area.end().sub_addr(cursor));
+            if aspace.page_table().query(cursor).is_ok() {
+                resident_pages += step.div_ceil(PAGE_SIZE_4K);
+            }
+            cursor += step;
+        }
+        let node = first_node(mempolicy_effective_mask(policy));
+        let stack = if is_user_stack_area(start, end) {
+            " stack"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "{start:x} {policy_text}{stack} anon={resident_pages} dirty={resident_pages} \
+             N{node}={resident_pages} kernelpagesize_kB={}",
+            page_size / 1024
+        );
     }
 
     out
@@ -448,6 +703,16 @@ impl ThreadFdInfoDir {
         }
         if let Some(inotify) = description.inner.downcast_ref::<InotifyFile>() {
             out.push_str(&inotify.fdinfo());
+        }
+        if let Some(fanotify) = description.inner.downcast_ref::<FanotifyFile>() {
+            out.push_str(&fanotify.fdinfo());
+        }
+        if let Some(pidfd) = description.inner.downcast_ref::<PidFd>() {
+            if let Ok(proc_data) = pidfd.process_data() {
+                let pid = proc_data.proc.pid();
+                let _ = writeln!(out, "Pid:\t{pid}");
+                let _ = writeln!(out, "NSpid:\t{pid}");
+            }
         }
         out
     }
@@ -607,7 +872,7 @@ impl FileNodeOps for ProcNamespaceFile {
         Err(VfsError::BadFileDescriptor)
     }
 
-    fn ioctl(&self, cmd: u32, _arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
             NS_GET_PARENT => match self.kind {
                 ProcNamespaceKind::Pid => Err(VfsError::OperationNotPermitted),
@@ -624,7 +889,13 @@ impl FileNodeOps for ProcNamespaceFile {
                 | ProcNamespaceKind::User
                 | ProcNamespaceKind::Uts => Err(VfsError::OperationNotPermitted),
             },
-            NS_GET_OWNER_UID => Err(VfsError::InvalidInput),
+            NS_GET_OWNER_UID => match &self.object {
+                ProcNamespaceObject::User(ns) => {
+                    (arg as *mut u32).vm_write(ns.owner_uid())?;
+                    Ok(0)
+                }
+                _ => Err(VfsError::InvalidInput),
+            },
             NS_GET_NSTYPE => Ok(self.nstype() as usize),
             _ => Err(VfsError::NotATty),
         }
@@ -679,6 +950,11 @@ struct ThreadDir {
     fs: Arc<SimpleFs>,
     task: WeakAxTaskRef,
     show_task_dir: bool,
+}
+
+struct ZombieProcessDir {
+    fs: Arc<SimpleFs>,
+    process: Weak<Process>,
 }
 
 pub(crate) enum ProcDirProcess {
@@ -1015,16 +1291,46 @@ impl Pollable for ProcKpageflagsFile {
     fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
 }
 
+impl SimpleDirOps for ZombieProcessDir {
+    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+        if self.process.upgrade().is_some() {
+            Box::new(iter::once(Cow::Borrowed("stat")))
+        } else {
+            Box::new(iter::empty())
+        }
+    }
+
+    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+        if name != "stat" {
+            return Err(VfsError::NotFound);
+        }
+        let fs = self.fs.clone();
+        let process = self.process.upgrade().ok_or(VfsError::NotFound)?;
+        Ok(
+            SimpleFile::new_regular(fs, move || Ok(render_zombie_stat(&process)?.into_bytes()))
+                .into(),
+        )
+    }
+
+    fn is_cacheable(&self) -> bool {
+        false
+    }
+}
+
 impl SimpleDirOps for ThreadDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
         Box::new(
             [
                 Some("stat"),
                 Some("status"),
+                Some("limits"),
                 Some("oom_score_adj"),
+                Some("cgroup"),
+                Some("cpuset"),
                 self.show_task_dir.then_some("task"),
                 Some("maps"),
                 Some("smaps"),
+                Some("numa_maps"),
                 Some("pagemap"),
                 Some("mounts"),
                 Some("mountinfo"),
@@ -1053,6 +1359,7 @@ impl SimpleDirOps for ThreadDir {
                     .into()
             }
             "status" => SimpleFile::new_regular(fs, move || Ok(task_status(&task))).into(),
+            "limits" => SimpleFile::new_regular(fs, move || Ok(render_task_limits(&task))).into(),
             "oom_score_adj" => SimpleFile::new_regular(
                 fs,
                 RwFile::new(move |req| match req {
@@ -1072,6 +1379,14 @@ impl SimpleDirOps for ThreadDir {
                 }),
             )
             .into(),
+            "cgroup" => {
+                let pid = task.as_thread().proc_data.proc.pid();
+                SimpleFile::new_regular(fs, move || Ok(proc_cgroup_membership(pid))).into()
+            }
+            "cpuset" => {
+                let pid = task.as_thread().proc_data.proc.pid();
+                SimpleFile::new_regular(fs, move || Ok(proc_cpuset_membership(pid))).into()
+            }
             "task" if self.show_task_dir => SimpleDir::new_maker(
                 fs.clone(),
                 Arc::new(ProcessTaskDir {
@@ -1085,6 +1400,9 @@ impl SimpleDirOps for ThreadDir {
             }
             "smaps" => {
                 SimpleFile::new_regular(fs, move || Ok(render_task_maps(&task, true))).into()
+            }
+            "numa_maps" => {
+                SimpleFile::new_regular(fs, move || Ok(render_task_numa_maps(&task))).into()
             }
             "pagemap" => ProcPagemapFile::new(fs, Arc::downgrade(&task)).into(),
             "mounts" => SimpleFile::new_regular(fs, move || Ok(render_mounts())).into(),
@@ -1135,16 +1453,17 @@ impl SimpleDirOps for ThreadDir {
                 fs,
                 RwFile::new(move |req| match req {
                     SimpleFileOperation::Read => {
-                        let mut bytes = vec![0; 16];
                         let name = task.name();
                         let copy_len = name.len().min(15);
-                        bytes[..copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
-                        bytes[copy_len] = b'\n';
+                        let mut bytes = Vec::with_capacity(copy_len + 1);
+                        bytes.extend_from_slice(&name.as_bytes()[..copy_len]);
+                        bytes.push(b'\n');
                         Ok(Some(bytes))
                     }
                     SimpleFileOperation::Write(data) => {
                         if !data.is_empty() {
                             let mut input = [0; 16];
+                            let data = data.strip_suffix(b"\n").unwrap_or(data);
                             let copy_len = data.len().min(15);
                             input[..copy_len].copy_from_slice(&data[..copy_len]);
                             task.set_name(
@@ -1211,21 +1530,41 @@ impl SimpleDirOps for ProcFsHandler {
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
-        let task = if name == "self" {
-            current().clone()
-        } else {
-            let pid = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-            proc_task_for_pid(pid)?
-        };
-        let node = NodeOpsMux::Dir(SimpleDir::new_maker(
+        if name == "self" {
+            let task = current().clone();
+            return Ok(NodeOpsMux::Dir(SimpleDir::new_maker(
+                self.0.clone(),
+                Arc::new(ThreadDir {
+                    fs: self.0.clone(),
+                    task: Arc::downgrade(&task),
+                    show_task_dir: true,
+                }),
+            )));
+        }
+
+        let pid = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
+        if let Ok(task) = proc_task_for_pid(pid) {
+            return Ok(NodeOpsMux::Dir(SimpleDir::new_maker(
+                self.0.clone(),
+                Arc::new(ThreadDir {
+                    fs: self.0.clone(),
+                    task: Arc::downgrade(&task),
+                    show_task_dir: true,
+                }),
+            )));
+        }
+
+        let process = get_process_including_zombie(pid).map_err(|_| VfsError::NotFound)?;
+        if !process.is_zombie() || process.zombie_snapshot().is_none() {
+            return Err(VfsError::NotFound);
+        }
+        Ok(NodeOpsMux::Dir(SimpleDir::new_maker(
             self.0.clone(),
-            Arc::new(ThreadDir {
+            Arc::new(ZombieProcessDir {
                 fs: self.0.clone(),
-                task: Arc::downgrade(&task),
-                show_task_dir: true,
+                process: Arc::downgrade(&process),
             }),
-        ));
-        Ok(node)
+        )))
     }
 
     fn is_cacheable(&self) -> bool {
@@ -1313,6 +1652,10 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     root.add(
         "meminfo",
         SimpleFile::new_regular(fs.clone(), || Ok(real_meminfo())),
+    );
+    root.add(
+        "cgroups",
+        SimpleFile::new_regular(fs.clone(), || Ok(proc_cgroups_snapshot())),
     );
     root.add(
         "swaps",
@@ -1665,6 +2008,51 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             });
 
             SimpleDir::new_maker(fs.clone(), Arc::new(fs_dir))
+        });
+
+        sys.add("vm", {
+            let mut vm = DirMapping::new();
+
+            vm.add(
+                "overcommit_memory",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", overcommit_memory_policy()).into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let value = write_proc_u32(data)?;
+                            set_overcommit_memory_policy(value).map_err(LinuxError::from)?;
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            vm.add(
+                "overcommit_ratio",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", overcommit_ratio()).into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let value = write_proc_u32(data)?;
+                            set_overcommit_ratio(value);
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+
+            SimpleDir::new_maker(fs.clone(), Arc::new(vm))
         });
 
         sys.add("kernel", {

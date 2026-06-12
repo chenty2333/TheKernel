@@ -1,4 +1,9 @@
-use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, VecDeque},
+    string::String,
+    sync::Arc,
+    vec::Vec,
+};
 use core::{
     fmt::Write as _,
     sync::atomic::{AtomicI32, AtomicUsize, Ordering},
@@ -18,7 +23,6 @@ use super::{
     MSG_STAT, MSG_STAT_ANY, has_ipc_permission, next_ipc_id,
 };
 use crate::{
-    syscall::{sys_getgid, sys_getuid},
     task::{AsThread, ProcStateHint, has_pending_syscall_signal, with_proc_state_hint},
     time::wall_time,
 };
@@ -96,7 +100,7 @@ pub struct MessageQueue {
     /// Message queue data structure
     pub msqid_ds: msqid_ds,
     /// FIFO queue of messages
-    pub messages: Vec<Message>,
+    pub messages: VecDeque<Message>,
     /// Total bytes in queue
     pub total_bytes: usize,
     /// Marked for removal
@@ -109,7 +113,7 @@ impl MessageQueue {
     pub fn new(key: i32, mode: __kernel_mode_t, pid: Pid, uid: u32, gid: u32) -> Self {
         MessageQueue {
             msqid_ds: msqid_ds::new(key, mode, pid as __kernel_pid_t, uid, gid),
-            messages: Vec::new(),
+            messages: VecDeque::new(),
             total_bytes: 0,
             mark_removed: false,
             waiters: Arc::new(axtask::WaitQueue::new()),
@@ -126,7 +130,7 @@ impl MessageQueue {
 
         let message = Message { mtype, data };
 
-        self.messages.push(message);
+        self.messages.push_back(message);
         self.total_bytes += data_len;
         self.msqid_ds.msg_cbytes += data_len as __kernel_size_t;
         self.msqid_ds.msg_qnum += 1;
@@ -137,7 +141,7 @@ impl MessageQueue {
     /// Find the first message (without removing)
     pub fn find_first_message(&self) -> Option<(usize, i64, &[u8])> {
         self.messages
-            .first()
+            .front()
             .map(|message| (0, message.mtype, &message.data[..]))
     }
 
@@ -191,11 +195,12 @@ impl MessageQueue {
 
     /// Remove the message by FIFO index
     pub fn remove_message_by_index(&mut self, index: usize) -> AxResult<Message> {
-        let removed_msg = if index < self.messages.len() {
-            self.messages.remove(index)
+        let removed_msg = if index == 0 {
+            self.messages.pop_front()
         } else {
-            return Err(AxError::from(LinuxError::ENOMSG));
-        };
+            self.messages.remove(index)
+        }
+        .ok_or(AxError::from(LinuxError::ENOMSG))?;
 
         self.total_bytes -= removed_msg.data.len();
         self.msqid_ds.msg_cbytes -= removed_msg.data.len() as __kernel_size_t;
@@ -443,8 +448,8 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
     let current = current();
     let thread = current.as_thread();
     let proc_data = &thread.proc_data;
-    let current_uid = sys_getuid()? as u32;
-    let current_gid = sys_getgid()? as u32;
+    let current_uid = proc_data.euid();
+    let current_gid = proc_data.egid();
     let current_pid = proc_data.proc.pid();
 
     let mut msg_manager = MSG_MANAGER.lock();
@@ -534,8 +539,8 @@ pub fn sys_msgsnd(
     let current = current();
     let thread = current.as_thread();
     let proc_data = &thread.proc_data;
-    let current_uid = sys_getuid()? as u32;
-    let current_gid = sys_getgid()? as u32;
+    let current_uid = proc_data.euid();
+    let current_gid = proc_data.egid();
     let current_pid = proc_data.proc.pid();
     let flags = MsgSndFlags::from_bits_truncate(msgflg);
 
@@ -610,11 +615,11 @@ fn find_msgrcv_message(
     msg_queue: &MessageQueue,
     msgtyp: i64,
     flags: &MsgRcvFlags,
-) -> Option<(i64, Vec<u8>, usize, bool)> {
+) -> Option<(usize, bool)> {
     if flags.contains(MsgRcvFlags::MSG_COPY) {
         let index = msgtyp as usize;
-        let message = msg_queue.get_message_by_index(index)?;
-        return Some((message.mtype, message.data.clone(), index, false));
+        msg_queue.get_message_by_index(index)?;
+        return Some((index, false));
     }
 
     let matched_message = match msgtyp {
@@ -633,7 +638,7 @@ fn find_msgrcv_message(
         _ => None,
     };
 
-    matched_message.map(|(index, mtype, data)| (mtype, data.to_vec(), index, true))
+    matched_message.map(|(index, ..)| (index, true))
 }
 
 pub fn sys_msgrcv(
@@ -649,8 +654,8 @@ pub fn sys_msgrcv(
     let current = current();
     let thread = current.as_thread();
     let proc_data = &thread.proc_data;
-    let current_uid = sys_getuid()? as u32;
-    let current_gid = sys_getgid()? as u32;
+    let current_uid = proc_data.euid();
+    let current_gid = proc_data.egid();
     let current_pid = proc_data.proc.pid();
 
     // Check validity of flag combinations
@@ -689,24 +694,34 @@ pub fn sys_msgrcv(
                 return Err(AxError::from(LinuxError::EIDRM)); // EIDRM
             }
 
-            if let Some((mtype, data_vec, index, should_remove)) =
-                find_msgrcv_message(&msg_queue, msgtyp, &flags)
-            {
+            if let Some((index, should_remove)) = find_msgrcv_message(&msg_queue, msgtyp, &flags) {
                 // Message size check
-                if data_vec.len() > msgsz && !flags.contains(MsgRcvFlags::MSG_NOERROR) {
+                let data_len = msg_queue
+                    .get_message_by_index(index)
+                    .ok_or(AxError::from(LinuxError::ENOMSG))?
+                    .data
+                    .len();
+                if data_len > msgsz && !flags.contains(MsgRcvFlags::MSG_NOERROR) {
                     return Err(AxError::from(LinuxError::E2BIG)); // E2BIG
                 }
 
-                // Write mtype
-                let mtype_ptr = unsafe { core::ptr::addr_of_mut!((*msgp).mtype) };
-                mtype_ptr.vm_write(mtype)?;
+                let copy_len = {
+                    let message = msg_queue
+                        .get_message_by_index(index)
+                        .ok_or(AxError::from(LinuxError::ENOMSG))?;
+                    let copy_len = message.data.len().min(msgsz);
 
-                // Write data part
-                let data_ptr = unsafe { core::ptr::addr_of_mut!((*msgp).mtext) };
-                let copy_len = data_vec.len().min(msgsz);
-                vm_write_slice(data_ptr.cast::<u8>(), &data_vec[..copy_len])?;
+                    // Write mtype
+                    let mtype_ptr = unsafe { core::ptr::addr_of_mut!((*msgp).mtype) };
+                    mtype_ptr.vm_write(message.mtype)?;
 
-                // Remove the message from the queue (normal mode only)
+                    // Write data part
+                    let data_ptr = unsafe { core::ptr::addr_of_mut!((*msgp).mtext) };
+                    vm_write_slice(data_ptr.cast::<u8>(), &message.data[..copy_len])?;
+
+                    copy_len
+                };
+
                 if should_remove {
                     msg_queue.remove_message_by_index(index)?;
                 }
@@ -739,8 +754,10 @@ pub fn sys_msgrcv(
 
 pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
     //  Get current process information
-    let current_uid = sys_getuid()? as u32;
-    let current_gid = sys_getgid()? as u32;
+    let current = current();
+    let proc_data = &current.as_thread().proc_data;
+    let current_uid = proc_data.euid();
+    let current_gid = proc_data.egid();
     let is_privileged = current_uid == 0; // root user check
 
     // Validate command code

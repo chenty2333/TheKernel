@@ -20,15 +20,19 @@ use axtask::{
     current,
     future::{block_on, poll_io},
 };
-use linux_raw_sys::general::{
-    DN_ATTRIB, DN_MULTISHOT, DN_RENAME, IN_ACCESS, IN_ALL_EVENTS, IN_ATTRIB, IN_CLOSE_NOWRITE,
-    IN_CLOSE_WRITE, IN_DELETE_SELF, IN_EXCL_UNLINK, IN_IGNORED, IN_ISDIR, IN_MASK_ADD,
-    IN_MASK_CREATE, IN_MODIFY, IN_MOVE_SELF, IN_ONESHOT, IN_Q_OVERFLOW, IN_UNMOUNT, POLL_MSG,
-    SI_SIGIO, inotify_event,
+use linux_raw_sys::{
+    general::{
+        DN_ATTRIB, DN_MULTISHOT, DN_RENAME, IN_ACCESS, IN_ALL_EVENTS, IN_ATTRIB, IN_CLOSE_NOWRITE,
+        IN_CLOSE_WRITE, IN_DELETE_SELF, IN_EXCL_UNLINK, IN_IGNORED, IN_ISDIR, IN_MASK_ADD,
+        IN_MASK_CREATE, IN_MODIFY, IN_MOVE_SELF, IN_ONESHOT, IN_Q_OVERFLOW, IN_UNMOUNT, POLL_MSG,
+        SI_SIGIO, inotify_event,
+    },
+    ioctl::FIONREAD,
 };
 use spin::Mutex;
 use starry_process::Pid;
 use starry_signal::{SignalInfo, Signo};
+use starry_vm::VmMutPtr;
 
 use crate::{
     file::{Directory, File, FileLike, IoDst, get_file_like},
@@ -69,13 +73,16 @@ struct QueuedEvent {
 
 impl QueuedEvent {
     fn encoded_len(&self) -> usize {
-        let name_len = if self.name.is_empty() {
+        size_of::<inotify_event>() + self.encoded_name_len()
+    }
+
+    fn encoded_name_len(&self) -> usize {
+        if self.name.is_empty() {
             0
         } else {
-            self.name.len() + 1
-        };
-        let name_len = (name_len + 3) & !3;
-        size_of::<inotify_event>() + name_len
+            let name_len = self.name.len() + 1;
+            (name_len + size_of::<inotify_event>() - 1) & !(size_of::<inotify_event>() - 1)
+        }
     }
 }
 
@@ -214,6 +221,15 @@ impl InotifyFile {
     fn has_events(&self) -> bool {
         !self.state.lock().queue.is_empty()
     }
+
+    fn queued_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .queue
+            .iter()
+            .map(QueuedEvent::encoded_len)
+            .sum()
+    }
 }
 
 fn remove_watch_locked(state: &mut InotifyState, wd: i32) -> AxResult<()> {
@@ -241,12 +257,8 @@ impl FileLike for InotifyFile {
                     break;
                 }
 
-                let name_len = if event.name.is_empty() {
-                    0
-                } else {
-                    event.name.len() + 1
-                };
-                let padded_name_len = (name_len + 3) & !3;
+                let name_len = event.name.len() + usize::from(!event.name.is_empty());
+                let padded_name_len = event.encoded_name_len();
                 let header = inotify_event {
                     wd: event.wd,
                     mask: event.mask,
@@ -292,6 +304,16 @@ impl FileLike for InotifyFile {
     fn path(&self) -> Cow<'_, str> {
         "anon_inode:[inotify]".into()
     }
+
+    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+        match cmd {
+            FIONREAD => {
+                (arg as *mut u32).vm_write(self.queued_bytes() as u32)?;
+                Ok(0)
+            }
+            _ => Err(AxError::NotATty),
+        }
+    }
 }
 
 impl Pollable for InotifyFile {
@@ -308,8 +330,7 @@ impl Pollable for InotifyFile {
     }
 }
 
-pub(crate) fn notify_unmount(root: &Location) -> AxResult<()> {
-    let dev = root.metadata()?.device;
+pub(crate) fn notify_unmount_device(dev: u64) {
     each_inotify_file(|file| {
         let mut state = file.state.lock();
         let mut wake = false;
@@ -346,7 +367,6 @@ pub(crate) fn notify_unmount(root: &Location) -> AxResult<()> {
             file.poll_rx.wake();
         }
     });
-    Ok(())
 }
 
 fn each_inotify_file(mut f: impl FnMut(&Arc<InotifyFile>)) {

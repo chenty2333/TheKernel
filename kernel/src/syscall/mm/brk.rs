@@ -6,7 +6,7 @@ use memory_addr::{VirtAddr, align_up_4k};
 use super::mmap::check_mmap_memlock_limit;
 use crate::{
     config::{USER_HEAP_BASE, USER_HEAP_SIZE, USER_HEAP_SIZE_MAX},
-    mm::Backend,
+    mm::{Backend, check_memory_overcommit},
     task::AsThread,
 };
 
@@ -36,6 +36,10 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
         let aspace_handle = proc_data.aspace();
 
         if expand_size > 0 {
+            if check_memory_overcommit(expand_size).is_err() {
+                return Ok(current_top as isize);
+            }
+
             let mut aspace = aspace_handle.lock();
             let locked = aspace.locks_future_mappings();
             if locked

@@ -10,7 +10,9 @@ use starry_vm::vm_write_slice;
 
 use super::ctl::validate_pathname;
 use crate::{
-    file::{ResolveAtResult, inode_flags, is_path_only_fd, resolve_at},
+    file::{
+        ResolveAtResult, inode_flags, is_path_only_fd, permission::check_writable_mount, resolve_at,
+    },
     mm::{UserConstPtr, vm_load_string},
     pseudofs::tmp,
     task::AsThread,
@@ -183,6 +185,7 @@ fn list_map_xattrs(
 
 fn set_location_xattr(loc: &Location, name: &str, value: Vec<u8>, flags: u32) -> AxResult<()> {
     check_namespace_access(loc, name, true)?;
+    check_writable_mount(loc)?;
     inode_flags::check_xattr_update(loc)?;
 
     if let Some(store) = tmp::xattr_store(loc) {
@@ -241,6 +244,7 @@ fn list_location_xattrs(loc: &Location) -> Vec<u8> {
 
 fn remove_location_xattr(loc: &Location, name: &str) -> AxResult<()> {
     check_namespace_access(loc, name, true)?;
+    check_writable_mount(loc)?;
     inode_flags::check_xattr_update(loc)?;
 
     if let Some(store) = tmp::xattr_store(loc) {

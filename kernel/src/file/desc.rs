@@ -7,6 +7,7 @@ use core::{
 
 use axerrno::AxResult;
 use axpoll::{IoEvents, Pollable};
+use axtask::{current, current_may_uninit};
 use spin::Mutex;
 use starry_process::Pid;
 
@@ -16,8 +17,55 @@ use super::{
     flock, lease,
     types::{FileLike, IoDst, IoSrc, Kstat},
 };
+use crate::task::AsThread;
 
 static FILE_DESCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
+
+scope_local::scope_local! {
+    pub static FILE_WRITE_CREDENTIALS: Option<OpenCredentials> = None;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct OpenCredentials {
+    pub uid: u32,
+    pub euid: u32,
+    pub suid: u32,
+    pub fsuid: u32,
+    pub cgroup_ns_id: u64,
+}
+
+impl OpenCredentials {
+    pub fn current() -> Self {
+        let Some(task) = current_may_uninit() else {
+            return Self::root();
+        };
+        let Some(thread) = task.try_as_thread() else {
+            return Self::root();
+        };
+        let proc_data = &thread.proc_data;
+        Self {
+            uid: proc_data.uid(),
+            euid: proc_data.euid(),
+            suid: proc_data.suid(),
+            fsuid: proc_data.fsuid(),
+            cgroup_ns_id: proc_data.cgroup_ns_id(),
+        }
+    }
+
+    const fn root() -> Self {
+        Self {
+            uid: 0,
+            euid: 0,
+            suid: 0,
+            fsuid: 0,
+            cgroup_ns_id: 0,
+        }
+    }
+}
+
+pub fn current_file_write_credentials() -> Option<OpenCredentials> {
+    *FILE_WRITE_CREDENTIALS
+}
 
 #[derive(Clone, Copy)]
 pub enum AsyncIoOwner {
@@ -43,6 +91,7 @@ impl Default for AsyncIoState {
 
 pub struct FileDescription {
     pub inner: Arc<dyn FileLike>,
+    open_credentials: OpenCredentials,
     flock_owner: u64,
     status_flags: AtomicU32,
     write_open_key: Option<ExecutableKey>,
@@ -76,6 +125,7 @@ impl FileDescription {
     ) -> Arc<Self> {
         Arc::new(Self {
             inner,
+            open_credentials: OpenCredentials::current(),
             flock_owner: FILE_DESCRIPTION_ID.fetch_add(1, Ordering::Relaxed),
             status_flags: AtomicU32::new(status_flags),
             write_open_key,
@@ -85,6 +135,10 @@ impl FileDescription {
 
     pub fn flock_owner(&self) -> u64 {
         self.flock_owner
+    }
+
+    pub fn open_credentials(&self) -> OpenCredentials {
+        self.open_credentials
     }
 
     pub fn status_flags(&self) -> u32 {
@@ -185,6 +239,27 @@ impl<T: ?Sized> Deref for FileHandle<T> {
 impl<T: ?Sized> AsRef<T> for FileHandle<T> {
     fn as_ref(&self) -> &T {
         self.file.as_ref()
+    }
+}
+
+impl<T: ?Sized> FileHandle<T> {
+    pub fn status_flags(&self) -> u32 {
+        self.description.status_flags()
+    }
+
+    pub fn with_write_credentials<R>(&self, f: impl FnOnce() -> R) -> R {
+        let credentials = self.description.open_credentials();
+        let previous = current().as_thread().with_mut_scope(|scope| {
+            let mut slot = FILE_WRITE_CREDENTIALS.scope_mut(scope);
+            let previous = *slot;
+            *slot = Some(credentials);
+            previous
+        });
+        let result = f();
+        current().as_thread().with_mut_scope(|scope| {
+            *FILE_WRITE_CREDENTIALS.scope_mut(scope) = previous;
+        });
+        result
     }
 }
 

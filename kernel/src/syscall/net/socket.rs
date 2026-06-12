@@ -13,21 +13,25 @@ use axtask::current;
 use linux_raw_sys::{
     general::{O_CLOEXEC, O_NONBLOCK},
     net::{
-        AF_INET, AF_INET6, AF_PACKET, AF_UNIX, AF_UNSPEC, AF_VSOCK, IPPROTO_SCTP, IPPROTO_TCP,
-        IPPROTO_UDP, IPPROTO_UDPLITE, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW,
-        SOCK_SEQPACKET, SOCK_STREAM, sockaddr, socklen_t,
+        AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, AF_UNSPEC, AF_VSOCK, IPPROTO_DCCP,
+        IPPROTO_SCTP, IPPROTO_TCP, IPPROTO_UDP, IPPROTO_UDPLITE, SHUT_RD, SHUT_RDWR, SHUT_WR,
+        SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, sockaddr, socklen_t,
     },
 };
 
 use super::addr::SocketAddrExt;
 use crate::{
-    file::{AfAlgSocket, FileLike, PacketSocket, Socket, af_alg, close_file_like, get_file_like},
+    file::{
+        AfAlgSocket, FileLike, NetlinkSocket, PacketSocket, Socket, add_file_like, af_alg,
+        close_file_like, get_file_like,
+    },
     mm::{UserConstPtr, UserPtr},
     task::AsThread,
 };
 
 const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
 const AF_RDS: u32 = 21;
+const SOCK_DCCP: u32 = 6;
 const SOCK_TYPE_MASK: u32 = 0xf;
 const SOCK_CLOEXEC_NONBLOCK_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
 
@@ -48,7 +52,7 @@ fn require_bind_permissions(addr: &SocketAddrEx) -> AxResult<()> {
 
 fn validate_socket_type(ty: u32) -> AxResult<u32> {
     match ty {
-        SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET | SOCK_RAW => Ok(ty),
+        SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET | SOCK_RAW | SOCK_DCCP => Ok(ty),
         _ => Err(AxError::InvalidInput),
     }
 }
@@ -79,11 +83,22 @@ fn supported_datagram_protocol(proto: u32) -> bool {
     proto == 0 || proto == IPPROTO_UDP as u32 || proto == IPPROTO_UDPLITE as u32
 }
 
+fn supported_dccp_protocol(proto: u32) -> bool {
+    proto == 0 || proto == IPPROTO_DCCP as u32
+}
+
 fn inet_socketpair_error(ty: u32, proto: u32) -> AxError {
     match ty {
         SOCK_RAW => AxError::from(LinuxError::EPROTONOSUPPORT),
         SOCK_DGRAM => {
             if supported_datagram_protocol(proto) {
+                AxError::from(LinuxError::EOPNOTSUPP)
+            } else {
+                AxError::from(LinuxError::EPROTONOSUPPORT)
+            }
+        }
+        SOCK_DCCP => {
+            if supported_dccp_protocol(proto) {
                 AxError::from(LinuxError::EOPNOTSUPP)
             } else {
                 AxError::from(LinuxError::EPROTONOSUPPORT)
@@ -124,6 +139,15 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
         return socket.add_to_fd_table(cloexec).map(|fd| fd as isize);
     }
 
+    if domain == AF_NETLINK {
+        NetlinkSocket::validate_socket_type(ty, proto)?;
+        let socket = NetlinkSocket::new(proto);
+        if nonblocking {
+            socket.set_nonblocking(true)?;
+        }
+        return add_file_like(socket as _, cloexec).map(|fd| fd as isize);
+    }
+
     let pid = current().as_thread().proc_data.proc.pid();
     let net_ns = current().as_thread().proc_data.net_ns.clone();
     let socket = match (domain, ty) {
@@ -138,6 +162,12 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
                 return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
             }
             SocketInner::Udp(UdpSocket::new(net_ns))
+        }
+        (AF_INET | AF_INET6, SOCK_DCCP) => {
+            if !supported_dccp_protocol(proto) {
+                return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
+            }
+            SocketInner::Tcp(TcpSocket::new(net_ns))
         }
         (AF_INET | AF_INET6, SOCK_RAW) => {
             return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
@@ -179,6 +209,25 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
         let addr = af_alg::SockAddrAlg::read_from_user(addr, addrlen)?;
         debug!("sys_bind <= fd: {fd}, af_alg: {addr:?}");
         socket.bind(addr)?;
+        return Ok(0);
+    }
+
+    if let Ok(socket) = NetlinkSocket::from_fd(fd) {
+        if addrlen as usize != size_of::<crate::file::netlink::SockaddrNl>() {
+            return Err(AxError::InvalidInput);
+        }
+        let addr = *addr
+            .cast::<crate::file::netlink::SockaddrNl>()
+            .get_as_ref()?;
+        if addr.nl_family as u32 != AF_NETLINK {
+            return Err(AxError::from(LinuxError::EAFNOSUPPORT));
+        }
+        let port_id = if addr.nl_pid == 0 {
+            current().as_thread().proc_data.proc.pid() as u32
+        } else {
+            addr.nl_pid
+        };
+        socket.bind(port_id, addr.nl_groups)?;
         return Ok(0);
     }
 

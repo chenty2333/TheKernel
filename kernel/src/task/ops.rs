@@ -18,7 +18,7 @@ use linux_raw_sys::general::{FUTEX_OWNER_DIED, FUTEX_TID_MASK, FUTEX_WAITERS, RO
 use memory_addr::{MemoryAddr, PhysAddr, VirtAddr};
 use spin::RwLock;
 use starry_process::{Pid, Process, ProcessGroup, Session, ZombieSnapshot};
-use starry_signal::{SignalInfo, Signo};
+use starry_signal::{SignalActionFlags, SignalDisposition, SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 use weak_map::WeakMap;
 
@@ -37,6 +37,14 @@ static TASK_ALIAS_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakM
 static PROCESS_TABLE: RwLock<WeakMap<Pid, Weak<ProcessData>>> = RwLock::new(WeakMap::new());
 
 static PROCESS_GROUP_TABLE: RwLock<WeakMap<Pid, Weak<ProcessGroup>>> = RwLock::new(WeakMap::new());
+
+fn parent_sigchld_autoreap(parent: &ProcessData) -> (bool, bool) {
+    let actions = parent.signal.actions.lock();
+    let action = &actions[Signo::SIGCHLD];
+    let ignored = matches!(action.disposition, SignalDisposition::Ignore);
+    let no_cldwait = action.flags.contains(SignalActionFlags::NOCLDWAIT);
+    (ignored || no_cldwait, ignored)
+}
 
 static SESSION_TABLE: RwLock<WeakMap<Pid, Weak<Session>>> = RwLock::new(WeakMap::new());
 
@@ -532,26 +540,47 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     if process_exited {
         let self_usage = thr.proc_data.self_usage();
         let child_usage = thr.proc_data.children_usage();
+        let parent = process.parent();
+        let parent_data = parent
+            .as_ref()
+            .and_then(|parent| get_process_data(parent.pid()).ok());
+        let (auto_reap, suppress_exit_signal) = if thr.proc_data.exit_signal == Some(Signo::SIGCHLD)
+        {
+            parent_data
+                .as_ref()
+                .map(|parent| parent_sigchld_autoreap(parent))
+                .unwrap_or((false, false))
+        } else {
+            (false, false)
+        };
+
         acct_process_exit(&thr.proc_data, exit_code, self_usage);
         thr.proc_data.release_executable();
-        crate::file::flock::release_posix_owner(process.pid());
-        process.publish_zombie_snapshot(ZombieSnapshot {
-            wait_status: process.exit_code(),
-            self_usage: self_usage.into(),
-            child_usage: child_usage.into(),
-            uid: thr.proc_data.uid(),
-        });
+        if !auto_reap {
+            process.publish_zombie_snapshot(ZombieSnapshot {
+                wait_status: process.exit_code(),
+                self_usage: self_usage.into(),
+                child_usage: child_usage.into(),
+                uid: thr.proc_data.uid(),
+            });
+        }
         process.exit();
-        if let Some(parent) = process.parent() {
-            if let Some(signo) = thr.proc_data.exit_signal {
-                let _ = send_signal_to_process(parent.pid(), Some(SignalInfo::new_kernel(signo)));
-            }
-            if let Ok(data) = get_process_data(parent.pid()) {
-                data.child_exit_event.wake();
-            }
+        if let Some(parent) = parent.as_ref()
+            && !suppress_exit_signal
+            && let Some(signo) = thr.proc_data.exit_signal
+        {
+            let _ = send_signal_to_process(parent.pid(), Some(SignalInfo::new_kernel(signo)));
+        }
+        if auto_reap {
+            let _ = process.reap();
+        }
+        if let Some(data) = parent_data {
+            data.child_exit_event.wake();
         }
         thr.proc_data.exit_event.wake();
         thr.proc_data.release_vfork();
+
+        crate::file::flock::release_posix_owner(process.pid());
 
         crate::syscall::SHM_MANAGER
             .lock()

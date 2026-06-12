@@ -5,10 +5,11 @@ use axfs_ng_vfs::{Location, NodePermission, path::Path};
 use axtask::current;
 use linux_raw_sys::general::{
     __kernel_fsid_t, AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_STATX_SYNC_TYPE,
-    AT_SYMLINK_NOFOLLOW, R_OK, STATX__RESERVED, STATX_ALL, STATX_ATIME, STATX_BASIC_STATS,
-    STATX_BLOCKS, STATX_BTIME, STATX_CTIME, STATX_DIOALIGN, STATX_GID, STATX_INO, STATX_MNT_ID,
-    STATX_MNT_ID_UNIQUE, STATX_MODE, STATX_MTIME, STATX_NLINK, STATX_SIZE, STATX_SUBVOL,
-    STATX_TYPE, STATX_UID, STATX_WRITE_ATOMIC, W_OK, X_OK, stat, statfs, statx, statx_timestamp,
+    AT_SYMLINK_NOFOLLOW, R_OK, S_IFBLK, S_IFMT, S_IFREG, STATX__RESERVED, STATX_ALL, STATX_ATIME,
+    STATX_BASIC_STATS, STATX_BLOCKS, STATX_BTIME, STATX_CTIME, STATX_DIOALIGN, STATX_GID,
+    STATX_INO, STATX_MNT_ID, STATX_MNT_ID_UNIQUE, STATX_MODE, STATX_MTIME, STATX_NLINK, STATX_SIZE,
+    STATX_SUBVOL, STATX_TYPE, STATX_UID, STATX_WRITE_ATOMIC, W_OK, X_OK, stat, statfs, statx,
+    statx_timestamp,
 };
 use starry_vm::{VmMutPtr, VmPtr};
 
@@ -50,6 +51,9 @@ const VALID_STATX_MASK: u32 = STATX_TYPE
     | STATX_WRITE_ATOMIC
     | STATX_ALL;
 const STATX_CHANGE_COOKIE: u32 = 0x4000_0000;
+// Match Linux's regular-file O_DIRECT floor: logical sector alignment, not
+// the filesystem's preferred st_blksize.
+const REGULAR_FILE_DIO_ALIGNMENT: u32 = 512;
 const PIPEFS_MAGIC: i64 = 0x5049_5045;
 const SOCKFS_MAGIC: i64 = 0x534f_434b;
 
@@ -85,12 +89,15 @@ fn statx_from_kstat(value: crate::file::Kstat, request_mask: u32) -> statx {
     result.stx_mnt_id = value.dev;
 
     let request_mask = request_mask & !STATX_CHANGE_COOKIE;
-    if request_mask & STATX_DIOALIGN != 0
-        && value.mode & linux_raw_sys::general::S_IFMT == linux_raw_sys::general::S_IFBLK
-    {
+    let file_type = value.mode & S_IFMT;
+    if request_mask & STATX_DIOALIGN != 0 && file_type == S_IFBLK {
         result.stx_mask |= STATX_DIOALIGN;
         result.stx_dio_mem_align = 1;
         result.stx_dio_offset_align = value.blksize.max(512);
+    } else if request_mask & STATX_DIOALIGN != 0 && file_type == S_IFREG {
+        result.stx_mask |= STATX_DIOALIGN;
+        result.stx_dio_mem_align = REGULAR_FILE_DIO_ALIGNMENT;
+        result.stx_dio_offset_align = REGULAR_FILE_DIO_ALIGNMENT;
     }
 
     result

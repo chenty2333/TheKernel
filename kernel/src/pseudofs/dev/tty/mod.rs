@@ -31,6 +31,8 @@ use crate::{
     task::AsThread,
 };
 
+const N_TTY_LDISC: i32 = 0;
+
 pub fn create_pty_master(fs: Arc<SimpleFs>) -> AxResult<Arc<PtyDriver>> {
     let (master, slave) = pty::create_pty_pair();
     pts::add_slave(fs, slave)?;
@@ -79,6 +81,10 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
     pub fn pty_number(&self) -> u32 {
         self.terminal.pty_number.load(Ordering::Acquire)
     }
+
+    pub fn is_locked_pty_slave(&self) -> bool {
+        !self.is_ptm && self.terminal.pty_locked.load(Ordering::Acquire)
+    }
 }
 
 impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
@@ -96,7 +102,10 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
-        use linux_raw_sys::ioctl::*;
+        use linux_raw_sys::{
+            general::{CAP_SYS_ADMIN, TCIFLUSH, TCIOFF, TCIOFLUSH, TCION, TCOFLUSH, TCOOFF, TCOON},
+            ioctl::*,
+        };
         match cmd {
             TCGETA => {
                 (arg as *mut Termio).vm_write(self.terminal.termios.lock().as_termio())?;
@@ -132,6 +141,35 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                     self.ldisc.lock().drain_input();
                 }
             }
+            FIONREAD => {
+                let readable = self.ldisc.lock().readable_len() as u32;
+                (arg as *mut u32).vm_write(readable)?;
+            }
+            TIOCOUTQ => {
+                (arg as *mut u32).vm_write(0)?;
+            }
+            TIOCGETD => {
+                let ldisc = self.terminal.line_discipline.load(Ordering::Acquire) as i32;
+                (arg as *mut i32).vm_write(ldisc)?;
+            }
+            TIOCSETD => {
+                let ldisc = (arg as *const i32).vm_read()?;
+                if ldisc != N_TTY_LDISC {
+                    return Err(AxError::InvalidInput);
+                }
+                self.terminal
+                    .line_discipline
+                    .store(ldisc as u32, Ordering::Release);
+            }
+            TCXONC => match arg as u32 {
+                TCOOFF | TCOON | TCIOFF | TCION => {}
+                _ => return Err(AxError::InvalidInput),
+            },
+            TCFLSH => match arg as u32 {
+                TCIFLUSH | TCIOFLUSH => self.ldisc.lock().drain_input(),
+                TCOFLUSH => {}
+                _ => return Err(AxError::InvalidInput),
+            },
             TIOCGPGRP => {
                 let foreground = self
                     .terminal
@@ -152,7 +190,20 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
             TIOCSWINSZ => {
                 *self.terminal.window_size.lock() = (arg as *const WindowSize).vm_read()?;
             }
-            TIOCSPTLCK => {}
+            TIOCSPTLCK => {
+                if !self.is_ptm {
+                    return Err(AxError::NotATty);
+                }
+                let locked = (arg as *const i32).vm_read()? != 0;
+                self.terminal.pty_locked.store(locked, Ordering::Release);
+            }
+            TIOCGPTLCK => {
+                if !self.is_ptm {
+                    return Err(AxError::NotATty);
+                }
+                let locked = self.terminal.pty_locked.load(Ordering::Acquire) as i32;
+                (arg as *mut i32).vm_write(locked)?;
+            }
             TIOCGPTN => {
                 (arg as *mut u32).vm_write(self.pty_number())?;
             }
@@ -178,6 +229,24 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 } else {
                     warn!("Failed to unset terminal");
                 }
+            }
+            TIOCGSID => {
+                let session = self
+                    .terminal
+                    .job_control
+                    .session()
+                    .ok_or(AxError::NotATty)?;
+                (arg as *mut u32).vm_write(session.sid())?;
+            }
+            TIOCVHANGUP => {
+                if !current()
+                    .as_thread()
+                    .proc_data
+                    .has_effective_capability(CAP_SYS_ADMIN)
+                {
+                    return Err(AxError::OperationNotPermitted);
+                }
+                self.ldisc.lock().drain_input();
             }
             _ => return Err(AxError::NotATty),
         }

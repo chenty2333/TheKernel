@@ -40,6 +40,8 @@ bitflags::bitflags! {
         const PATH = 16;
         /// Suppress access-time updates on successful reads.
         const NOATIME = 32;
+        /// Direct-I/O mode requested by the opener.
+        const DIRECT = 64;
     }
 }
 
@@ -303,6 +305,9 @@ impl OpenOptions {
         if self.no_atime {
             flags |= FileFlags::NOATIME;
         }
+        if self.direct {
+            flags |= FileFlags::DIRECT;
+        }
         Ok(flags)
     }
 
@@ -349,6 +354,10 @@ fn cached_file_registry_key(location: &Location) -> (u64, u64) {
     (location.mountpoint().device(), location.inode())
 }
 
+fn cached_file_is_in_memory(location: &Location) -> bool {
+    location.flags().contains(NodeFlags::ALWAYS_CACHE) || location.filesystem().name() == "tmpfs"
+}
+
 fn cached_file_shared_for_location(location: &Location) -> Option<Arc<CachedFileShared>> {
     let key = cached_file_registry_key(location);
     file_cache_registry()
@@ -361,6 +370,33 @@ fn cached_file_shared_for_location(location: &Location) -> Option<Arc<CachedFile
                 .get::<FileUserData>()
                 .and_then(|it| it.get())
         })
+}
+
+fn cached_file_shared_for_location_or_create(location: &Location) -> Arc<CachedFileShared> {
+    let key = cached_file_registry_key(location);
+    let mut registry = file_cache_registry().lock();
+
+    if let Some(shared) = registry.get(&key).and_then(FileUserData::get) {
+        return shared;
+    }
+
+    if let Some(shared) = location
+        .user_data()
+        .get::<FileUserData>()
+        .and_then(|it| it.get())
+    {
+        registry.insert(key, FileUserData::Weak(Arc::downgrade(&shared)));
+        return shared;
+    }
+
+    let shared = Arc::new(CachedFileShared::new(cached_file_is_in_memory(location)));
+    registry.insert(key, FileUserData::Weak(Arc::downgrade(&shared)));
+
+    location
+        .user_data()
+        .insert(FileUserData::Weak(Arc::downgrade(&shared)));
+
+    shared
 }
 
 /// Drops the shared page-cache registry entry for a fully released inode.
@@ -380,8 +416,13 @@ pub fn sync_and_invalidate_cached_file_pages(location: &Location) -> VfsResult<(
     let shared = cached_file_shared_for_location(location);
     if let Some(shared) = shared {
         let file = location.entry().as_file()?;
-        let mut cache = shared.page_cache.lock();
-        while let Some((pn, mut page)) = cache.pop_lru() {
+        loop {
+            let Some((pn, mut page)) = ({
+                let mut cache = shared.page_cache.lock();
+                cache.pop_lru()
+            }) else {
+                break;
+            };
             let _ = writeback_cached_page(&shared, file, pn, &mut page)?;
         }
     }
@@ -523,6 +564,10 @@ intrusive_adapter!(EvictListenerAdapter = Box<EvictListener>: EvictListener { li
 struct CachedFileShared {
     page_cache: Mutex<LruCache<u32, PageCache>>,
     evict_listeners: Mutex<LinkedList<EvictListenerAdapter>>,
+    /// Serializes cached page-cache users with direct-I/O cache drains.
+    direct_io_lock: RwLock<()>,
+    /// Serializes O_APPEND writes across all cached handles for this inode.
+    append_lock: RwLock<()>,
 }
 
 impl CachedFileShared {
@@ -535,6 +580,8 @@ impl CachedFileShared {
         Self {
             page_cache: Mutex::new(new_bounded_page_cache_store(capacity)),
             evict_listeners: Mutex::new(LinkedList::default()),
+            direct_io_lock: RwLock::new(()),
+            append_lock: RwLock::new(()),
         }
     }
 }
@@ -548,9 +595,6 @@ pub struct CachedFile {
     inner: Location,
     shared: Arc<CachedFileShared>,
     in_memory: bool,
-    /// Only one thread can append to the file at a time, while multiple writers
-    /// are permitted.
-    append_lock: RwLock<()>,
 }
 
 impl Clone for CachedFile {
@@ -559,7 +603,6 @@ impl Clone for CachedFile {
             inner: self.inner.clone(),
             shared: self.shared.clone(),
             in_memory: self.in_memory,
-            append_lock: RwLock::new(()),
         }
     }
 }
@@ -579,26 +622,13 @@ impl FileUserData {
 impl CachedFile {
     /// Returns an existing cached file for `location`, or creates a new one.
     pub fn get_or_create(location: Location) -> Self {
-        let in_memory = location.flags().contains(NodeFlags::ALWAYS_CACHE)
-            || location.filesystem().name() == "tmpfs";
-
-        let key = cached_file_registry_key(&location);
-        let shared = cached_file_shared_for_location(&location)
-            .unwrap_or_else(|| Arc::new(CachedFileShared::new(in_memory)));
-
-        file_cache_registry()
-            .lock()
-            .insert(key, FileUserData::Weak(Arc::downgrade(&shared)));
-
-        location
-            .user_data()
-            .insert(FileUserData::Weak(Arc::downgrade(&shared)));
+        let in_memory = cached_file_is_in_memory(&location);
+        let shared = cached_file_shared_for_location_or_create(&location);
 
         Self {
             inner: location,
             shared,
             in_memory,
-            append_lock: RwLock::new(()),
         }
     }
 
@@ -737,6 +767,12 @@ impl CachedFile {
         f(page, evicted)
     }
 
+    /// Runs `f` while direct I/O is excluded from this inode's page cache.
+    pub fn with_direct_io_excluded<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.shared.direct_io_lock.read();
+        f()
+    }
+
     fn with_pages<T>(
         &self,
         range: Range<u64>,
@@ -769,6 +805,7 @@ impl CachedFile {
 
     /// Reads data from the file at `offset` into `dst`.
     pub fn read_at(&self, mut dst: impl Write + IoBufMut, offset: u64) -> VfsResult<usize> {
+        let _direct_guard = self.shared.direct_io_lock.read();
         let len = self.inner.len()?;
         let end = (offset + dst.remaining_mut() as u64).min(len);
         if end <= offset {
@@ -814,13 +851,15 @@ impl CachedFile {
 
     /// Writes `buf` to the file at `offset`.
     pub fn write_at(&self, buf: impl Read + IoBuf, offset: u64) -> VfsResult<usize> {
-        let _guard = self.append_lock.read();
+        let _direct_guard = self.shared.direct_io_lock.read();
+        let _guard = self.shared.append_lock.read();
         self.write_at_locked(buf, offset)
     }
 
     /// Appends `buf` to the end of the file. Returns `(bytes_written, new_end)`.
     pub fn append(&self, buf: impl Read + IoBuf) -> VfsResult<(usize, u64)> {
-        let _guard = self.append_lock.write();
+        let _direct_guard = self.shared.direct_io_lock.read();
+        let _guard = self.shared.append_lock.write();
         let file = self.inner.entry().as_file()?;
         let len = file.len()?;
         self.write_at_locked(buf, len)
@@ -829,6 +868,7 @@ impl CachedFile {
 
     /// Truncates or extends the file to `len` bytes.
     pub fn set_len(&self, len: u64) -> VfsResult<()> {
+        let _direct_guard = self.shared.direct_io_lock.read();
         let file = self.inner.entry().as_file()?;
         let old_len = file.len()?;
         if self.in_memory && old_len > len {
@@ -857,7 +897,6 @@ impl CachedFile {
                     let new_page_offset =
                         len.saturating_sub(page_start).min(PAGE_SIZE as u64) as usize;
                     page.data()[new_page_offset..].fill(0);
-                    page.clear_dirty();
                 }
                 guard
                     .iter()
@@ -878,7 +917,8 @@ impl CachedFile {
                 let page_start = new_last_page as u64 * PAGE_SIZE as u64;
                 let new_page_offset = len.saturating_sub(page_start).min(PAGE_SIZE as u64) as usize;
                 page.data()[new_page_offset..].fill(0);
-                page.clear_dirty();
+                // Preserve dirty state for retained bytes; writeback clamps to the new length.
+                page.mark_dirty();
             }
         }
         Ok(())
@@ -886,6 +926,7 @@ impl CachedFile {
 
     /// Flushes all cached pages back to disk.
     pub fn sync(&self, data_only: bool) -> VfsResult<()> {
+        let _direct_guard = self.shared.direct_io_lock.read();
         if self.in_memory {
             self.sync_in_memory_cache();
             return Ok(());
@@ -945,11 +986,22 @@ impl FileBackend {
         Self::Cached(CachedFile::get_or_create(location))
     }
 
+    fn direct_io_shared(location: &Location) -> Arc<CachedFileShared> {
+        cached_file_shared_for_location_or_create(location)
+    }
+
+    fn sync_direct_cache(location: &Location) -> VfsResult<()> {
+        sync_and_invalidate_cached_file_pages(location)
+    }
+
     /// Reads data from the file at `offset` into `dst`.
     pub fn read_at(&self, mut dst: impl Write + IoBufMut, mut offset: u64) -> VfsResult<usize> {
         match self {
             Self::Cached(cached) => cached.read_at(dst, offset),
             Self::Direct(loc) => {
+                let shared = Self::direct_io_shared(loc);
+                let _guard = shared.direct_io_lock.write();
+                Self::sync_direct_cache(loc)?;
                 let file = loc.entry().as_file()?;
                 let mut total = 0;
                 let mut chunk = vec![0_u8; Self::DIRECT_IO_CHUNK];
@@ -981,6 +1033,9 @@ impl FileBackend {
         match self {
             Self::Cached(cached) => cached.write_at(src, offset),
             Self::Direct(loc) => {
+                let shared = Self::direct_io_shared(loc);
+                let _guard = shared.direct_io_lock.write();
+                Self::sync_direct_cache(loc)?;
                 let file = loc.entry().as_file()?;
                 let mut total = 0;
                 let mut chunk = vec![0_u8; Self::DIRECT_IO_CHUNK];
@@ -1002,6 +1057,9 @@ impl FileBackend {
                     }
                 }
 
+                if total > 0 {
+                    Self::sync_direct_cache(loc)?;
+                }
                 Ok(total)
             }
         }
@@ -1012,6 +1070,9 @@ impl FileBackend {
         match self {
             Self::Cached(cached) => cached.append(src),
             Self::Direct(loc) => {
+                let shared = Self::direct_io_shared(loc);
+                let _guard = shared.direct_io_lock.write();
+                Self::sync_direct_cache(loc)?;
                 let file = loc.entry().as_file()?;
                 let mut total = 0;
                 let mut end = file.len()?;
@@ -1034,6 +1095,9 @@ impl FileBackend {
                     }
                 }
 
+                if total > 0 {
+                    Self::sync_direct_cache(loc)?;
+                }
                 Ok((total, end))
             }
         }
@@ -1051,7 +1115,12 @@ impl FileBackend {
     pub fn sync(&self, data_only: bool) -> VfsResult<()> {
         match self {
             Self::Cached(cached) => cached.sync(data_only),
-            Self::Direct(loc) => loc.entry().as_file()?.sync(data_only),
+            Self::Direct(loc) => {
+                let shared = Self::direct_io_shared(loc);
+                let _guard = shared.direct_io_lock.write();
+                Self::sync_direct_cache(loc)?;
+                loc.entry().as_file()?.sync(data_only)
+            }
         }
     }
 
@@ -1059,7 +1128,13 @@ impl FileBackend {
     pub fn set_len(&self, len: u64) -> VfsResult<()> {
         match self {
             Self::Cached(cached) => cached.set_len(len),
-            Self::Direct(loc) => loc.entry().as_file()?.set_len(len),
+            Self::Direct(loc) => {
+                let shared = Self::direct_io_shared(loc);
+                let _guard = shared.direct_io_lock.write();
+                Self::sync_direct_cache(loc)?;
+                loc.entry().as_file()?.set_len(len)?;
+                Self::sync_direct_cache(loc)
+            }
         }
     }
 }

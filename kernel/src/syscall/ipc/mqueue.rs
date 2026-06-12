@@ -20,7 +20,10 @@ use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use crate::{
-    file::{FileLike, Kstat, add_file_like_with_flags, get_file_description, get_typed_file},
+    file::{
+        FileHandle, FileLike, Kstat, NetlinkSocket, add_file_like_with_flags, get_file_description,
+        get_typed_file,
+    },
     mm::vm_load_string,
     task::{
         AsThread, ProcStateHint, has_pending_syscall_signal, send_signal_to_process,
@@ -37,6 +40,9 @@ const DEFAULT_MSG_MAX: usize = 1024;
 const DEFAULT_MSGSIZE_MAX: usize = 1 << 20;
 const MQ_WAIT_SLICE: Duration = Duration::from_millis(10);
 const MQ_NAME_MAX: usize = 255;
+const NOTIFY_COOKIE_LEN: usize = 32;
+const NOTIFY_WOKENUP: u8 = 1;
+const NOTIFY_REMOVED: u8 = 2;
 
 static MQ_MANAGER: Mutex<MqManager> = Mutex::new(MqManager::new());
 static MQ_QUEUES_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_QUEUES_MAX);
@@ -60,12 +66,19 @@ struct MqMessage {
     data: Vec<u8>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
+struct MqThreadNotifier {
+    netlink: FileHandle<NetlinkSocket>,
+    cookie: [u8; NOTIFY_COOKIE_LEN],
+}
+
+#[derive(Clone)]
 struct MqNotifier {
     pid: u32,
     notify: i32,
     signo: i32,
     value_int: i32,
+    thread: Option<MqThreadNotifier>,
 }
 
 struct PosixMqueue {
@@ -376,6 +389,31 @@ fn validate_notify_event(event: &sigevent) -> AxResult {
     }
 }
 
+fn build_notifier(event: &sigevent) -> AxResult<MqNotifier> {
+    validate_notify_event(event)?;
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let mut notifier = MqNotifier {
+        pid: proc_data.proc.pid(),
+        notify: event.sigev_notify,
+        signo: event.sigev_signo,
+        value_int: unsafe { event.sigev_value.sival_int },
+        thread: None,
+    };
+
+    if event.sigev_notify == SIGEV_THREAD as i32 {
+        let netlink =
+            NetlinkSocket::from_fd(event.sigev_signo).map_err(|_| AxError::BadFileDescriptor)?;
+        let cookie_ptr = unsafe { event.sigev_value.sival_ptr };
+        let cookie_data = vm_load(cookie_ptr.cast::<u8>(), NOTIFY_COOKIE_LEN)?;
+        let mut cookie = [0u8; NOTIFY_COOKIE_LEN];
+        cookie.copy_from_slice(&cookie_data);
+        notifier.thread = Some(MqThreadNotifier { netlink, cookie });
+    }
+
+    Ok(notifier)
+}
+
 fn wall_time_duration() -> Duration {
     let now = wall_time();
     Duration::new(now.as_secs(), now.subsec_nanos())
@@ -406,10 +444,31 @@ fn wait_for_queue(waiters: Arc<axtask::WaitQueue>, deadline: Option<Duration>) -
     Ok(())
 }
 
+fn send_thread_notification(thread: &MqThreadNotifier, state: u8) {
+    let mut cookie = thread.cookie;
+    cookie[NOTIFY_COOKIE_LEN - 1] = state;
+    thread.netlink.enqueue_kernel(Vec::from(cookie));
+}
+
+fn remove_notification(notifier: Option<MqNotifier>) {
+    if let Some(notifier) = notifier
+        && notifier.notify == SIGEV_THREAD as i32
+        && let Some(thread) = notifier.thread.as_ref()
+    {
+        send_thread_notification(thread, NOTIFY_REMOVED);
+    }
+}
+
 fn maybe_notify(notifier: Option<MqNotifier>) {
     let Some(notifier) = notifier else {
         return;
     };
+    if notifier.notify == SIGEV_THREAD as i32 {
+        if let Some(thread) = notifier.thread.as_ref() {
+            send_thread_notification(thread, NOTIFY_WOKENUP);
+        }
+        return;
+    }
     if notifier.notify != SIGEV_SIGNAL as i32 {
         return;
     }
@@ -616,38 +675,36 @@ pub fn sys_mq_timedreceive(
 }
 
 pub fn sys_mq_notify(fd: i32, notification: *const sigevent) -> AxResult<isize> {
-    let event = if notification.is_null() {
+    let notifier = if notification.is_null() {
         None
     } else {
-        Some(unsafe { notification.vm_read_uninit()?.assume_init() })
+        let event = unsafe { notification.vm_read_uninit()?.assume_init() };
+        Some(build_notifier(&event)?)
     };
-    if let Some(event) = &event {
-        validate_notify_event(event)?;
-    }
     let file = get_mq_fd(fd)?;
 
-    let mut queue = file.queue.lock();
-    if let Some(event) = event {
-        if queue.notifier.is_some() {
-            return Err(AxError::ResourceBusy);
+    let removed = {
+        let mut queue = file.queue.lock();
+        if let Some(notifier) = notifier {
+            if queue.notifier.is_some() {
+                return Err(AxError::ResourceBusy);
+            }
+            queue.notifier = Some(notifier);
+            None
+        } else {
+            let curr_pid = current().as_thread().proc_data.proc.pid();
+            if queue
+                .notifier
+                .as_ref()
+                .is_some_and(|notifier| notifier.pid == curr_pid)
+            {
+                queue.notifier.take()
+            } else {
+                None
+            }
         }
-        let curr = current();
-        let proc_data = &curr.as_thread().proc_data;
-        queue.notifier = Some(MqNotifier {
-            pid: proc_data.proc.pid(),
-            notify: event.sigev_notify,
-            signo: event.sigev_signo,
-            value_int: unsafe { event.sigev_value.sival_int },
-        });
-    } else {
-        let curr_pid = current().as_thread().proc_data.proc.pid();
-        if queue
-            .notifier
-            .is_some_and(|notifier| notifier.pid == curr_pid)
-        {
-            queue.notifier = None;
-        }
-    }
+    };
+    remove_notification(removed);
     Ok(0)
 }
 

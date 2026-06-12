@@ -357,6 +357,10 @@ fn timex_modes_supported(modes: u32) -> bool {
     }
 }
 
+fn timex_invalid_adjadjtime_mode(modes: u32) -> bool {
+    modes & ADJ_SINGLESHOT_FLAG != 0 && modes & ADJ_OFFSET == 0
+}
+
 fn fill_timex_output(timex: &mut KernelOldTimex, state: TimexState) {
     timex.modes = state.resolution_mode();
     timex.offset = state.offset;
@@ -455,6 +459,9 @@ fn sys_do_clock_adjtime(
 
     let mut timex = unsafe { timex_ptr.vm_read_uninit()?.assume_init() };
     let modes = timex.modes;
+    if timex_invalid_adjadjtime_mode(modes) {
+        return Err(AxError::InvalidInput);
+    }
     let privileged = current()
         .as_thread()
         .proc_data
@@ -768,10 +775,19 @@ pub fn sys_gettimeofday(ts: *mut timeval, tz: *mut timezone) -> AxResult<isize> 
 }
 
 pub fn sys_settimeofday(ts: *const timeval, tz: *const timezone) -> AxResult<isize> {
-    if let Some(tz) = tz.nullable() {
-        let _ = unsafe { tz.vm_read_uninit()?.assume_init() };
-    }
-    let ts = unsafe { ts.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
+    let ts = if let Some(ts) = ts.nullable() {
+        Some(unsafe { ts.vm_read_uninit()?.assume_init() })
+    } else {
+        None
+    };
+
+    let tz = if let Some(tz) = tz.nullable() {
+        Some(unsafe { tz.vm_read_uninit()?.assume_init() })
+    } else {
+        None
+    };
+
+    let ts = ts.map(TimeValueLike::try_into_time_value).transpose()?;
     if !current()
         .as_thread()
         .proc_data
@@ -779,7 +795,16 @@ pub fn sys_settimeofday(ts: *const timeval, tz: *const timezone) -> AxResult<isi
     {
         return Err(AxError::OperationNotPermitted);
     }
-    set_wall_time(ts);
+
+    if let Some(tz) = tz {
+        if tz.tz_minuteswest < -15 * 60 || tz.tz_minuteswest > 15 * 60 {
+            return Err(AxError::InvalidInput);
+        }
+    }
+
+    if let Some(ts) = ts {
+        set_wall_time(ts);
+    }
     Ok(0)
 }
 

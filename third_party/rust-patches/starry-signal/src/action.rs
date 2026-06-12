@@ -4,7 +4,7 @@ use bitflags::bitflags;
 use linux_raw_sys::{
     general::{
         __kernel_sighandler_t, __sigrestore_t, SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SA_RESTART,
-        SA_SIGINFO, kernel_sigaction,
+        SA_NOCLDSTOP, SA_NOCLDWAIT, SA_SIGINFO, kernel_sigaction,
     },
     signal_macros::sig_ign,
 };
@@ -47,6 +47,8 @@ bitflags! {
     #[derive(Default, Debug, Clone, Copy)]
     pub struct SignalActionFlags: c_ulong {
         const SIGINFO = SA_SIGINFO as _;
+        const NOCLDSTOP = SA_NOCLDSTOP as _;
+        const NOCLDWAIT = SA_NOCLDWAIT as _;
         const NODEFER = SA_NODEFER as _;
         const RESETHAND = SA_RESETHAND as _;
         const RESTART = SA_RESTART as _;

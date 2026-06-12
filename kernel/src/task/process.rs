@@ -50,6 +50,31 @@ const SECURE_ALL_LOCKS: u32 = SECURE_ALL_BITS << 1;
 static PROC_NS_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
+pub(crate) struct CgroupNamespace {
+    id: u64,
+}
+
+impl CgroupNamespace {
+    pub(crate) fn new_root() -> Arc<Self> {
+        Self::new()
+    }
+
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
+        })
+    }
+
+    pub(crate) fn fork(self: &Arc<Self>) -> Arc<Self> {
+        Self::new()
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct PidNamespace {
     id: u64,
     parent: Option<Arc<PidNamespace>>,
@@ -94,26 +119,32 @@ impl PidNamespace {
 pub(crate) struct UserNamespace {
     id: u64,
     parent: Option<Arc<UserNamespace>>,
+    owner_uid: u32,
 }
 
 impl UserNamespace {
     pub(crate) fn new_root() -> Arc<Self> {
-        Self::new(None)
+        Self::new(None, 0)
     }
 
-    fn new(parent: Option<Arc<Self>>) -> Arc<Self> {
+    fn new(parent: Option<Arc<Self>>, owner_uid: u32) -> Arc<Self> {
         Arc::new(Self {
             id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
             parent,
+            owner_uid,
         })
     }
 
-    pub(crate) fn fork(self: &Arc<Self>) -> Arc<Self> {
-        Self::new(Some(self.clone()))
+    pub(crate) fn fork(self: &Arc<Self>, owner_uid: u32) -> Arc<Self> {
+        Self::new(Some(self.clone()), owner_uid)
     }
 
     pub(crate) fn parent(&self) -> Option<Arc<Self>> {
         self.parent.clone()
+    }
+
+    pub(crate) fn owner_uid(&self) -> u32 {
+        self.owner_uid
     }
 
     pub(crate) fn proc_inode(&self) -> u64 {
@@ -322,6 +353,88 @@ impl Default for MempolicyState {
 }
 
 impl MempolicyState {
+    fn first_node(mask: usize) -> Option<usize> {
+        (mask != 0).then(|| mask.trailing_zeros() as usize)
+    }
+
+    fn node_mask(node: usize) -> usize {
+        1usize.checked_shl(node as u32).unwrap_or(0)
+    }
+
+    fn node_ordinal(mask: usize, node: usize) -> Option<usize> {
+        let mut ordinal = 0usize;
+        for candidate in 0..usize::BITS as usize {
+            if mask & Self::node_mask(candidate) == 0 {
+                continue;
+            }
+            if candidate == node {
+                return Some(ordinal);
+            }
+            ordinal += 1;
+        }
+        None
+    }
+
+    fn nth_node(mask: usize, ordinal: usize) -> Option<usize> {
+        let mut seen = 0usize;
+        for candidate in 0..usize::BITS as usize {
+            if mask & Self::node_mask(candidate) == 0 {
+                continue;
+            }
+            if seen == ordinal {
+                return Some(candidate);
+            }
+            seen += 1;
+        }
+        None
+    }
+
+    fn migration_destination(
+        old_mask: usize,
+        new_mask: usize,
+        source_node: usize,
+    ) -> Option<usize> {
+        let source_mask = Self::node_mask(source_node);
+        if old_mask & source_mask == 0 || new_mask == 0 {
+            return None;
+        }
+
+        if old_mask == new_mask {
+            return None;
+        }
+
+        if old_mask.count_ones() == new_mask.count_ones() {
+            return Self::node_ordinal(old_mask, source_node)
+                .and_then(|ordinal| Self::nth_node(new_mask, ordinal));
+        }
+
+        if new_mask & source_mask != 0 {
+            return None;
+        }
+
+        Self::first_node(new_mask)
+    }
+
+    fn migrate_policy(policy: &mut Mempolicy, old_mask: usize, new_mask: usize) -> bool {
+        let source_node = Self::first_node(policy.nodemask).unwrap_or(0);
+        let Some(dest_node) = Self::migration_destination(old_mask, new_mask, source_node) else {
+            return false;
+        };
+        if dest_node == source_node {
+            return false;
+        }
+        policy.nodemask = Self::node_mask(dest_node);
+        true
+    }
+
+    fn migrate_ranges(&mut self, old_mask: usize, new_mask: usize) -> usize {
+        let mut migrated = 0;
+        for range in &mut self.ranges {
+            migrated += usize::from(Self::migrate_policy(&mut range.policy, old_mask, new_mask));
+        }
+        migrated
+    }
+
     fn remove_range(&mut self, start: usize, end: usize) {
         let old_ranges = core::mem::take(&mut self.ranges);
         for range in old_ranges {
@@ -455,6 +568,8 @@ pub struct ProcessData {
 
     /// The network namespace (network stack) for this process.
     pub net_ns: Arc<NetStack>,
+    /// Lightweight cgroup namespace identity for cgroup.procs open-time checks.
+    cgroup_ns: Arc<CgroupNamespace>,
     /// Lightweight PID namespace identity for procfs namespace fd ABI.
     pid_ns: Arc<PidNamespace>,
     /// Lightweight user namespace identity for procfs namespace fd ABI.
@@ -478,6 +593,7 @@ impl ProcessData {
         signal_actions: Arc<SpinNoIrq<SignalActions>>,
         exit_signal: Option<Signo>,
         net_ns: Arc<NetStack>,
+        cgroup_ns: Arc<CgroupNamespace>,
         pid_ns: Arc<PidNamespace>,
         user_ns: Arc<UserNamespace>,
         uts_ns: Arc<UtsNamespace>,
@@ -545,6 +661,7 @@ impl ProcessData {
             vfork_event: Arc::default(),
 
             net_ns,
+            cgroup_ns,
             pid_ns,
             user_ns,
             uts_ns: RwLock::new(uts_ns),
@@ -570,6 +687,14 @@ impl ProcessData {
 
     pub(crate) fn uts_ns(&self) -> Arc<UtsNamespace> {
         self.uts_ns.read().clone()
+    }
+
+    pub(crate) fn cgroup_ns(&self) -> Arc<CgroupNamespace> {
+        self.cgroup_ns.clone()
+    }
+
+    pub(crate) fn cgroup_ns_id(&self) -> u64 {
+        self.cgroup_ns.id()
     }
 
     pub(crate) fn pid_ns(&self) -> Arc<PidNamespace> {
@@ -823,6 +948,10 @@ impl ProcessData {
 
     pub fn clear_mempolicy_ranges(&self) {
         self.mempolicy.lock().ranges.clear();
+    }
+
+    pub fn migrate_mempolicy_ranges(&self, old_mask: usize, new_mask: usize) -> usize {
+        self.mempolicy.lock().migrate_ranges(old_mask, new_mask)
     }
 
     pub fn mempolicy_for_addr(&self, addr: usize) -> Option<Mempolicy> {

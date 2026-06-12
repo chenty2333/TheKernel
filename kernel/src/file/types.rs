@@ -13,6 +13,10 @@ use linux_raw_sys::general::{
 
 use super::{FileHandle, add_file_like, get_typed_file};
 
+// Match Linux's regular-file O_DIRECT floor: logical sector alignment, not
+// the filesystem's preferred st_blksize.
+const REGULAR_FILE_DIO_ALIGNMENT: u32 = 512;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Kstat {
     pub dev: u64,
@@ -114,10 +118,15 @@ impl From<Kstat> for statx {
 
         statx.stx_dev_major = (value.dev >> 32) as _;
         statx.stx_dev_minor = value.dev as _;
-        if value.mode & S_IFMT == S_IFBLK {
+        let file_type = value.mode & S_IFMT;
+        if file_type == S_IFBLK {
             statx.stx_mask |= STATX_DIOALIGN;
             statx.stx_dio_mem_align = 1;
             statx.stx_dio_offset_align = value.blksize.max(512);
+        } else if file_type == S_IFREG {
+            statx.stx_mask |= STATX_DIOALIGN;
+            statx.stx_dio_mem_align = REGULAR_FILE_DIO_ALIGNMENT;
+            statx.stx_dio_offset_align = REGULAR_FILE_DIO_ALIGNMENT;
         }
 
         statx

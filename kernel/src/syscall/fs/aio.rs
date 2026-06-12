@@ -5,6 +5,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axsync::Mutex;
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::__kernel_off_t;
+use starry_signal::SignalSet;
 use starry_vm::{VmMutPtr, VmPtr, vm_read_slice};
 
 use super::{sys_fdatasync, sys_fsync, sys_pread64, sys_preadv, sys_pwrite64, sys_pwritev};
@@ -24,6 +25,13 @@ const IOCB_CMD_PREADV: u16 = 7;
 const IOCB_CMD_PWRITEV: u16 = 8;
 const IOCB_FLAG_RESFD: u32 = 1 << 0;
 const IOCB_FLAG_IOPRIO: u32 = 1 << 1;
+const KIOCB_KEY: u32 = 0;
+const RWF_HIPRI: u32 = 0x00000001;
+const RWF_DSYNC: u32 = 0x00000002;
+const RWF_SYNC: u32 = 0x00000004;
+const RWF_NOWAIT: u32 = 0x00000008;
+const RWF_APPEND: u32 = 0x00000010;
+const RWF_SUPPORTED: u32 = RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_NOWAIT | RWF_APPEND;
 const AIO_HARD_MAX_EVENTS: usize = 0x10000000 / size_of::<IoEvent>();
 
 static NEXT_AIO_CTX: AtomicU64 = AtomicU64::new(1);
@@ -138,9 +146,18 @@ fn read_iocb_ptr(iocbpp: *const *const Iocb, index: usize) -> AxResult<*const Io
     Ok(unsafe { iocbpp.wrapping_add(index).vm_read_uninit()?.assume_init() })
 }
 
+fn write_iocb_key(iocb: *const Iocb) -> AxResult {
+    let key = unsafe { core::ptr::addr_of_mut!((*iocb.cast_mut()).aio_key) };
+    key.vm_write(KIOCB_KEY)?;
+    Ok(())
+}
+
 fn validate_optional_timespec(timeout: *const KernelTimespec) -> AxResult {
     if !timeout.is_null() {
-        let _ = timeout.vm_read()?;
+        let timeout = timeout.vm_read()?;
+        if !(0..1_000_000_000).contains(&timeout.tv_nsec) {
+            return Err(AxError::InvalidInput);
+        }
     }
     Ok(())
 }
@@ -148,10 +165,12 @@ fn validate_optional_timespec(timeout: *const KernelTimespec) -> AxResult {
 fn validate_optional_sigset(sigset: *const AioSigset) -> AxResult {
     if !sigset.is_null() {
         let sigset = sigset.vm_read()?;
-        if !sigset.sigmask.is_null() && sigset.sigsetsize > 0 {
-            let len = sigset.sigsetsize.min(128);
-            let mut buf = [core::mem::MaybeUninit::<u8>::uninit(); 128];
-            vm_read_slice(sigset.sigmask, &mut buf[..len])?;
+        if !sigset.sigmask.is_null() {
+            if sigset.sigsetsize != size_of::<SignalSet>() {
+                return Err(AxError::InvalidInput);
+            }
+            let mut buf = [core::mem::MaybeUninit::<u8>::uninit(); size_of::<SignalSet>()];
+            vm_read_slice(sigset.sigmask, &mut buf)?;
         }
     }
     Ok(())
@@ -165,47 +184,122 @@ fn resfd_file(iocb: &Iocb) -> AxResult<Option<FileHandle<EventFd>>> {
     Ok(Some(get_typed_file::<EventFd>(iocb.aio_resfd as i32)?))
 }
 
-fn execute_iocb(iocb: &Iocb) -> AxResult<isize> {
-    if iocb.aio_reserved2 != 0 || iocb.aio_rw_flags != 0 {
+fn validate_iocb_common(iocb: &Iocb) -> AxResult {
+    if iocb.aio_reserved2 != 0 || iocb.aio_nbytes > isize::MAX as u64 {
         return Err(AxError::InvalidInput);
     }
     if iocb.aio_flags & !(IOCB_FLAG_RESFD | IOCB_FLAG_IOPRIO) != 0 {
         return Err(AxError::InvalidInput);
     }
+    Ok(())
+}
+
+fn validate_aio_rw_flags(flags: u32) -> AxResult {
+    if flags & !RWF_SUPPORTED != 0 {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    if flags & (RWF_NOWAIT | RWF_APPEND) != 0 {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    Ok(())
+}
+
+fn maybe_sync_after_write(fd: i32, flags: u32) -> AxResult {
+    if flags & RWF_SYNC != 0 {
+        sys_fsync(fd)?;
+    } else if flags & RWF_DSYNC != 0 {
+        sys_fdatasync(fd)?;
+    }
+    Ok(())
+}
+
+fn execute_iocb(iocb: &Iocb) -> AxResult<isize> {
+    validate_iocb_common(iocb)?;
 
     let fd = iocb.aio_fildes as i32;
     let offset = iocb.aio_offset as __kernel_off_t;
     match iocb.aio_lio_opcode {
-        IOCB_CMD_PREAD => sys_pread64(
-            fd,
-            iocb.aio_buf as *mut u8,
-            iocb.aio_nbytes as usize,
-            offset,
-        ),
-        IOCB_CMD_PWRITE => sys_pwrite64(
-            fd,
-            iocb.aio_buf as *const u8,
-            iocb.aio_nbytes as usize,
-            offset,
-        ),
-        IOCB_CMD_FSYNC => sys_fsync(fd),
-        IOCB_CMD_FDSYNC => sys_fdatasync(fd),
+        IOCB_CMD_PREAD => {
+            validate_aio_rw_flags(iocb.aio_rw_flags)?;
+            sys_pread64(
+                fd,
+                iocb.aio_buf as *mut u8,
+                iocb.aio_nbytes as usize,
+                offset,
+            )
+        }
+        IOCB_CMD_PWRITE => {
+            validate_aio_rw_flags(iocb.aio_rw_flags)?;
+            let res = sys_pwrite64(
+                fd,
+                iocb.aio_buf as *const u8,
+                iocb.aio_nbytes as usize,
+                offset,
+            )?;
+            maybe_sync_after_write(fd, iocb.aio_rw_flags)?;
+            Ok(res)
+        }
+        IOCB_CMD_FSYNC | IOCB_CMD_FDSYNC => {
+            if iocb.aio_buf != 0
+                || iocb.aio_offset != 0
+                || iocb.aio_nbytes != 0
+                || iocb.aio_rw_flags != 0
+            {
+                return Err(AxError::InvalidInput);
+            }
+            if iocb.aio_lio_opcode == IOCB_CMD_FSYNC {
+                sys_fsync(fd)
+            } else {
+                sys_fdatasync(fd)
+            }
+        }
         IOCB_CMD_NOOP => Ok(0),
-        IOCB_CMD_PREADV => sys_preadv(
-            fd,
-            iocb.aio_buf as *const IoVec,
-            iocb.aio_nbytes as usize,
-            offset,
-        ),
-        IOCB_CMD_PWRITEV => sys_pwritev(
-            fd,
-            iocb.aio_buf as *const IoVec,
-            iocb.aio_nbytes as usize,
-            offset,
-        ),
-        IOCB_CMD_POLL => Err(AxError::Unsupported),
+        IOCB_CMD_PREADV => {
+            validate_aio_rw_flags(iocb.aio_rw_flags)?;
+            sys_preadv(
+                fd,
+                iocb.aio_buf as *const IoVec,
+                iocb.aio_nbytes as usize,
+                offset,
+            )
+        }
+        IOCB_CMD_PWRITEV => {
+            validate_aio_rw_flags(iocb.aio_rw_flags)?;
+            let res = sys_pwritev(
+                fd,
+                iocb.aio_buf as *const IoVec,
+                iocb.aio_nbytes as usize,
+                offset,
+            )?;
+            maybe_sync_after_write(fd, iocb.aio_rw_flags)?;
+            Ok(res)
+        }
+        IOCB_CMD_POLL => {
+            if iocb.aio_buf > u16::MAX as u64
+                || iocb.aio_offset != 0
+                || iocb.aio_nbytes != 0
+                || iocb.aio_rw_flags != 0
+            {
+                return Err(AxError::InvalidInput);
+            }
+            Err(AxError::Unsupported)
+        }
         _ => Err(AxError::InvalidInput),
     }
+}
+
+fn finish_io_submit(ctx: u64, completions: VecDeque<IoEvent>, submitted: isize) -> AxResult<isize> {
+    if completions.is_empty() {
+        return Ok(submitted);
+    }
+
+    let mut manager = AIO_CONTEXTS.lock();
+    let context = manager
+        .contexts
+        .get_mut(&ctx)
+        .ok_or(AxError::InvalidInput)?;
+    context.events.extend(completions);
+    Ok(submitted)
 }
 
 pub fn sys_io_setup(nr_events: u32, ctxp: *mut u64) -> AxResult<isize> {
@@ -250,35 +344,37 @@ pub fn sys_io_submit(ctx: u64, nr: isize, iocbpp: *const *const Iocb) -> AxResul
     if nr < 0 {
         return Err(AxError::InvalidInput);
     }
-    if nr == 0 {
-        return Ok(0);
-    }
 
-    {
+    let available = {
         let manager = AIO_CONTEXTS.lock();
-        if !manager.contexts.contains_key(&ctx) {
-            return Err(AxError::InvalidInput);
+        let context = manager.contexts.get(&ctx).ok_or(AxError::InvalidInput)?;
+        if nr == 0 {
+            return Ok(0);
         }
+        context.max_events.saturating_sub(context.events.len())
+    };
+    if available == 0 {
+        return Err(LinuxError::EAGAIN.into());
     }
 
     let mut submitted = 0isize;
     let mut completions = VecDeque::new();
 
-    for index in 0..nr as usize {
+    for index in 0..(nr as usize).min(available) {
         let ptr = match read_iocb_ptr(iocbpp, index) {
             Ok(ptr) if !ptr.is_null() => ptr,
             Ok(_) => {
                 return if submitted == 0 {
                     Err(AxError::BadAddress)
                 } else {
-                    Ok(submitted)
+                    finish_io_submit(ctx, completions, submitted)
                 };
             }
             Err(err) => {
                 return if submitted == 0 {
                     Err(err)
                 } else {
-                    Ok(submitted)
+                    finish_io_submit(ctx, completions, submitted)
                 };
             }
         };
@@ -288,7 +384,7 @@ pub fn sys_io_submit(ctx: u64, nr: isize, iocbpp: *const *const Iocb) -> AxResul
                 return if submitted == 0 {
                     Err(err.into())
                 } else {
-                    Ok(submitted)
+                    finish_io_submit(ctx, completions, submitted)
                 };
             }
         };
@@ -299,17 +395,24 @@ pub fn sys_io_submit(ctx: u64, nr: isize, iocbpp: *const *const Iocb) -> AxResul
                 return if submitted == 0 {
                     Err(err)
                 } else {
-                    Ok(submitted)
+                    finish_io_submit(ctx, completions, submitted)
                 };
             }
         };
+        if let Err(err) = write_iocb_key(ptr) {
+            return if submitted == 0 {
+                Err(err)
+            } else {
+                finish_io_submit(ctx, completions, submitted)
+            };
+        }
         let res = match execute_iocb(&iocb) {
             Ok(res) => res,
             Err(err) => {
                 return if submitted == 0 {
                     Err(err)
                 } else {
-                    Ok(submitted)
+                    finish_io_submit(ctx, completions, submitted)
                 };
             }
         };
@@ -318,7 +421,7 @@ pub fn sys_io_submit(ctx: u64, nr: isize, iocbpp: *const *const Iocb) -> AxResul
                 return if submitted == 0 {
                     Err(err)
                 } else {
-                    Ok(submitted)
+                    finish_io_submit(ctx, completions, submitted)
                 };
             }
         }
@@ -331,13 +434,7 @@ pub fn sys_io_submit(ctx: u64, nr: isize, iocbpp: *const *const Iocb) -> AxResul
         submitted += 1;
     }
 
-    let mut manager = AIO_CONTEXTS.lock();
-    let context = manager
-        .contexts
-        .get_mut(&ctx)
-        .ok_or(AxError::InvalidInput)?;
-    context.events.extend(completions);
-    Ok(submitted)
+    finish_io_submit(ctx, completions, submitted)
 }
 
 pub fn sys_io_getevents(
@@ -364,11 +461,11 @@ pub fn sys_io_getevents(
     }
 
     for index in 0..count {
-        let event = context
-            .events
-            .pop_front()
-            .expect("count was bounded by len");
+        let event = *context.events.get(index).expect("count was bounded by len");
         events.wrapping_add(index).vm_write(event)?;
+    }
+    for _ in 0..count {
+        context.events.pop_front();
     }
     Ok(count as isize)
 }

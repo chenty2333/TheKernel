@@ -18,7 +18,7 @@ use starry_vm::{vm_read_slice, vm_write_slice};
 
 use super::addr::SocketAddrExt;
 use crate::{
-    file::{AfAlgSocket, FileLike, Socket, add_file_description},
+    file::{AfAlgSocket, FileLike, NetlinkSocket, Socket, add_file_description},
     mm::{
         IoVec, IoVectorBuf, UserConstPtr, UserPtr, VmBytes, VmBytesMut, check_user_readable,
         check_user_writable,
@@ -84,6 +84,12 @@ fn send_impl(
     addrlen: socklen_t,
     cmsg: Vec<CMsgData>,
 ) -> AxResult<isize> {
+    if let Ok(socket) = NetlinkSocket::from_fd(fd) {
+        debug!("sys_send <= fd: {fd}, flags: {flags}, netlink");
+        validate_sendmsg_flags(flags)?;
+        return socket.write(&mut src).map(|sent| sent as isize);
+    }
+
     let addr = if addr.is_null() || addrlen == 0 {
         None
     } else {
@@ -163,6 +169,15 @@ fn recv_impl(
     cloexec_rights: bool,
 ) -> AxResult<isize> {
     debug!("sys_recv <= fd: {fd}, flags: {recv_flags:?}");
+
+    if let Ok(socket) = NetlinkSocket::from_fd(fd) {
+        let recv = socket.recv(&mut dst, recv_flags)?;
+        if let Some(addrlen) = addrlen {
+            *addrlen = 0;
+        }
+        debug!("sys_recv => fd: {fd}, netlink recv: {recv}");
+        return Ok(recv as isize);
+    }
 
     let socket = Socket::from_fd(fd)?;
     let mut cmsg = Vec::new();

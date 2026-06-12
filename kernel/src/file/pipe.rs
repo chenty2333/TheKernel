@@ -34,6 +34,7 @@ use crate::{
     },
 };
 
+const PIPE_BUF_SIZE: usize = PAGE_SIZE_4K;
 const RING_BUFFER_INIT_SIZE: usize = 65536; // 64 KiB
 const PIPE_MAX_CAPACITY_ARG: usize = 1 << 31;
 
@@ -63,7 +64,31 @@ fn default_pipe_capacity() -> usize {
 }
 
 fn pipe_poll_writable(buffer: &HeapRb<u8>) -> bool {
-    buffer.vacant_len() >= PAGE_SIZE_4K
+    buffer.vacant_len() >= PIPE_BUF_SIZE
+}
+
+fn write_pipe_buffer(
+    buffer: &Mutex<HeapRb<u8>>,
+    src: &mut IoSrc,
+    atomic_len: Option<usize>,
+) -> AxResult<usize> {
+    let mut prod = buffer.lock();
+    if atomic_len.is_some_and(|len| prod.vacant_len() < len) {
+        return Ok(0);
+    }
+
+    let (left, right) = prod.vacant_slices_mut();
+    // The ring buffer exposes valid writable byte slices here.
+    let left =
+        unsafe { core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len()) };
+    let right =
+        unsafe { core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len()) };
+    let mut count = src.read(left)?;
+    if count >= left.len() {
+        count += src.read(right)?;
+    }
+    unsafe { prod.advance_write_index(count) };
+    Ok(count)
 }
 
 struct Shared {
@@ -319,22 +344,7 @@ impl Pipe {
                 return Err(AxError::BrokenPipe);
             }
 
-            let written = {
-                let mut prod = self.shared.buffer.lock();
-                let (left, right) = prod.vacant_slices_mut();
-                let left = unsafe {
-                    core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
-                };
-                let right = unsafe {
-                    core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len())
-                };
-                let mut count = src.read(left)?;
-                if count >= left.len() {
-                    count += src.read(right)?;
-                }
-                unsafe { prod.advance_write_index(count) };
-                count
-            };
+            let written = write_pipe_buffer(&self.shared.buffer, src, None)?;
             if written > 0 {
                 self.shared.poll_rx.wake();
                 notify_async_readable(&self.shared.async_io);
@@ -610,6 +620,7 @@ impl FileLike for Pipe {
             return Ok(0);
         }
 
+        let atomic_len = (size <= PIPE_BUF_SIZE).then_some(size);
         let mut total_written = 0;
 
         block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
@@ -618,23 +629,7 @@ impl FileLike for Pipe {
                 return Err(AxError::BrokenPipe);
             }
 
-            let written = {
-                let mut prod = self.shared.buffer.lock();
-                let (left, right) = prod.vacant_slices_mut();
-                // The ring buffer exposes valid writable byte slices here.
-                let left = unsafe {
-                    core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
-                };
-                let right = unsafe {
-                    core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len())
-                };
-                let mut count = src.read(left)?;
-                if count >= left.len() {
-                    count += src.read(right)?;
-                }
-                unsafe { prod.advance_write_index(count) };
-                count
-            };
+            let written = write_pipe_buffer(&self.shared.buffer, src, atomic_len)?;
             if written > 0 {
                 self.shared.poll_rx.wake();
                 notify_async_readable(&self.shared.async_io);
@@ -743,6 +738,7 @@ impl FileLike for NamedPipe {
             return Ok(0);
         }
 
+        let atomic_len = (size <= PIPE_BUF_SIZE).then_some(size);
         let mut total_written = 0;
         block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
             if self.state.reader_count() == 0 {
@@ -750,22 +746,7 @@ impl FileLike for NamedPipe {
                 return Err(AxError::BrokenPipe);
             }
 
-            let written = {
-                let mut prod = self.state.buffer.lock();
-                let (left, right) = prod.vacant_slices_mut();
-                let left = unsafe {
-                    core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
-                };
-                let right = unsafe {
-                    core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len())
-                };
-                let mut count = src.read(left)?;
-                if count >= left.len() {
-                    count += src.read(right)?;
-                }
-                unsafe { prod.advance_write_index(count) };
-                count
-            };
+            let written = write_pipe_buffer(&self.state.buffer, src, atomic_len)?;
             if written > 0 {
                 self.state.poll_rx.wake();
                 notify_async_readable(&self.state.async_io);

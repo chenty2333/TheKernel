@@ -45,6 +45,23 @@ impl IoVectorBuf {
         self.len
     }
 
+    pub fn is_aligned(&self, align: usize) -> AxResult<bool> {
+        for i in 0..self.iovcnt {
+            let iov = self.iovs.wrapping_add(i).vm_read()?;
+            if iov.iov_len < 0 {
+                return Err(AxError::InvalidInput);
+            }
+            let len = iov.iov_len as usize;
+            if len == 0 {
+                continue;
+            }
+            if !(iov.iov_base as usize).is_multiple_of(align) || !len.is_multiple_of(align) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub fn check_readable(&self) -> AxResult<()> {
         for i in 0..self.iovcnt {
             let iov = self.iovs.wrapping_add(i).vm_read()?;

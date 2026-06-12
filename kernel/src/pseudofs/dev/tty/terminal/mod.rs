@@ -1,7 +1,7 @@
 //! Terminal module.
 
 use alloc::sync::Arc;
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicBool, AtomicU32};
 
 use bytemuck::AnyBitPattern;
 use kspin::SpinNoPreempt;
@@ -24,6 +24,8 @@ pub struct Terminal {
     pub window_size: SpinNoPreempt<WindowSize>,
     pub termios: SpinNoPreempt<Arc<termios::Termios2>>,
     pub pty_number: AtomicU32,
+    pub pty_locked: AtomicBool,
+    pub line_discipline: AtomicU32,
 }
 impl Default for Terminal {
     fn default() -> Self {
@@ -37,6 +39,8 @@ impl Default for Terminal {
             }),
             termios: SpinNoPreempt::new(Arc::new(termios::Termios2::default())),
             pty_number: AtomicU32::new(0),
+            pty_locked: AtomicBool::new(true),
+            line_discipline: AtomicU32::new(0),
         }
     }
 }

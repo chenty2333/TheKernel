@@ -915,17 +915,35 @@ fn get_xfs_statv(target: QuotaTarget, addr: usize) -> AxResult<isize> {
     Ok(0)
 }
 
-fn xfs_quota_rm(addr: usize) -> AxResult<isize> {
+fn xfs_quota_rm(target: QuotaTarget, addr: usize) -> AxResult<isize> {
     if addr == 0 {
         return Err(AxError::BadAddress);
     }
     let flags = (addr as *const u32).vm_read()?;
     let valid = (FS_USER_QUOTA | FS_GROUP_QUOTA | FS_PROJ_QUOTA) as u32;
     if flags == 0 || flags & !valid != 0 {
-        Err(AxError::InvalidInput)
-    } else {
-        Ok(0)
+        return Err(AxError::InvalidInput);
     }
+
+    let mut manager = QUOTA_MANAGER.lock();
+    if manager.xfs_flags(target.dev) != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let device = manager
+        .devices
+        .entry(target.dev)
+        .or_insert_with(DeviceQuota::new);
+    if flags & FS_USER_QUOTA as u32 != 0 {
+        device.types[USRQUOTA as usize].records.clear();
+    }
+    if flags & FS_GROUP_QUOTA as u32 != 0 {
+        device.types[GRPQUOTA as usize].records.clear();
+    }
+    if flags & FS_PROJ_QUOTA as u32 != 0 {
+        device.types[PRJQUOTA as usize].records.clear();
+    }
+    Ok(0)
 }
 
 fn do_quotactl(target: QuotaTarget, raw_cmd: u32, id: u32, addr: usize) -> AxResult<isize> {
@@ -956,7 +974,7 @@ fn do_quotactl(target: QuotaTarget, raw_cmd: u32, id: u32, addr: usize) -> AxRes
         Q_XSETQLIM => set_xfs_quota(target, qtype, id, addr),
         Q_XGETQUOTA => get_xfs_quota(target, qtype, id, addr),
         Q_XGETNEXTQUOTA => get_next_xfs_quota(target, qtype, id, addr),
-        Q_XQUOTARM => xfs_quota_rm(addr),
+        Q_XQUOTARM => xfs_quota_rm(target, addr),
         _ => Err(AxError::InvalidInput),
     }
 }

@@ -11,12 +11,15 @@ use axfs_ng_vfs::{DeviceId, NodeFlags, VfsResult};
 use axsync::Mutex;
 use lazy_static::lazy_static;
 use linux_raw_sys::{
-    ioctl::{BLKGETSIZE, BLKGETSIZE64, BLKRAGET, BLKRASET, BLKROGET, BLKROSET, BLKSSZGET},
+    ioctl::{
+        BLKGETSIZE, BLKGETSIZE64, BLKRAGET, BLKRASET, BLKROGET, BLKROSET, BLKRRPART, BLKSSZGET,
+    },
     loop_device::{
         LO_FLAGS_AUTOCLEAR, LO_FLAGS_DIRECT_IO, LO_FLAGS_PARTSCAN, LO_FLAGS_READ_ONLY,
-        LOOP_CHANGE_FD, LOOP_CLR_FD, LOOP_CONFIGURE, LOOP_GET_STATUS, LOOP_GET_STATUS64,
-        LOOP_SET_BLOCK_SIZE, LOOP_SET_CAPACITY, LOOP_SET_DIRECT_IO, LOOP_SET_FD, LOOP_SET_STATUS,
-        LOOP_SET_STATUS64, loop_config, loop_info, loop_info64,
+        LOOP_CHANGE_FD, LOOP_CLR_FD, LOOP_CONFIGURE, LOOP_CTL_ADD, LOOP_CTL_GET_FREE,
+        LOOP_CTL_REMOVE, LOOP_GET_STATUS, LOOP_GET_STATUS64, LOOP_SET_BLOCK_SIZE,
+        LOOP_SET_CAPACITY, LOOP_SET_DIRECT_IO, LOOP_SET_FD, LOOP_SET_STATUS, LOOP_SET_STATUS64,
+        loop_config, loop_info, loop_info64,
     },
 };
 use memory_addr::PAGE_SIZE_4K;
@@ -63,23 +66,27 @@ pub(crate) struct LoopSnapshot {
 }
 
 struct LoopState {
+    visible: bool,
     backing: Option<LoopBacking>,
     flags: u32,
     offset: u64,
     sizelimit: u64,
     size_sectors: u64,
     block_size: u32,
+    partition_count: u32,
 }
 
 impl Default for LoopState {
     fn default() -> Self {
         Self {
+            visible: true,
             backing: None,
             flags: 0,
             offset: 0,
             sizelimit: 0,
             size_sectors: 0,
             block_size: DEFAULT_BLOCK_SIZE,
+            partition_count: 0,
         }
     }
 }
@@ -87,6 +94,10 @@ impl Default for LoopState {
 impl LoopState {
     fn is_bound(&self) -> bool {
         self.backing.is_some()
+    }
+
+    fn is_visible(&self) -> bool {
+        self.visible
     }
 
     fn size_bytes(&self) -> u64 {
@@ -98,6 +109,10 @@ impl LoopState {
     }
 
     fn snapshot(&self) -> LoopSnapshot {
+        if !self.visible {
+            return LoopSnapshot::default();
+        }
+
         LoopSnapshot {
             backing_file: self
                 .backing
@@ -128,7 +143,14 @@ impl LoopState {
         Ok(())
     }
 
+    fn reread_partitions(&mut self, minimum_count: u32) {
+        self.partition_count = self.partition_count.max(minimum_count);
+    }
+
     fn bind(&mut self, backing: LoopBacking, read_only: bool) -> VfsResult<()> {
+        if !self.is_visible() {
+            return Err(AxError::NoSuchDevice);
+        }
         if self.is_bound() {
             return Err(AxError::ResourceBusy);
         }
@@ -147,6 +169,9 @@ impl LoopState {
         info: loop_info64,
         block_size: u32,
     ) -> VfsResult<()> {
+        if !self.is_visible() {
+            return Err(AxError::NoSuchDevice);
+        }
         if self.is_bound() {
             return Err(AxError::ResourceBusy);
         }
@@ -167,10 +192,16 @@ impl LoopState {
         } else {
             block_size
         };
+        if self.flags & FLAG_PARTSCAN != 0 {
+            self.reread_partitions(1);
+        }
         self.recompute_size()
     }
 
     fn clear(&mut self) -> VfsResult<()> {
+        if !self.is_visible() {
+            return Err(AxError::NoSuchDevice);
+        }
         if !self.is_bound() {
             return Err(AxError::from(LinuxError::ENXIO));
         }
@@ -179,6 +210,9 @@ impl LoopState {
     }
 
     fn set_info64(&mut self, info: loop_info64) -> VfsResult<()> {
+        if !self.is_visible() {
+            return Err(AxError::NoSuchDevice);
+        }
         if !self.is_bound() {
             return Err(AxError::from(LinuxError::ENXIO));
         }
@@ -193,6 +227,9 @@ impl LoopState {
         self.flags = preserved | cleared | (info.lo_flags & SET_STATUS_SETTABLE_FLAGS);
         self.offset = info.lo_offset;
         self.sizelimit = info.lo_sizelimit;
+        if self.flags & FLAG_PARTSCAN != 0 {
+            self.reread_partitions(1);
+        }
         self.recompute_size()
     }
 
@@ -204,6 +241,9 @@ impl LoopState {
     }
 
     fn get_info(&self, number: u32, dev_id: DeviceId) -> VfsResult<loop_info> {
+        if !self.is_visible() {
+            return Err(AxError::NoSuchDevice);
+        }
         if !self.is_bound() {
             return Err(AxError::from(LinuxError::ENXIO));
         }
@@ -219,6 +259,9 @@ impl LoopState {
     }
 
     fn get_info64(&self, number: u32, dev_id: DeviceId) -> VfsResult<loop_info64> {
+        if !self.is_visible() {
+            return Err(AxError::NoSuchDevice);
+        }
         if !self.is_bound() {
             return Err(AxError::from(LinuxError::ENXIO));
         }
@@ -235,6 +278,9 @@ impl LoopState {
     }
 
     fn change_fd(&mut self, backing: LoopBacking) -> VfsResult<()> {
+        if !self.is_visible() {
+            return Err(AxError::NoSuchDevice);
+        }
         if !self.is_bound() {
             return Err(AxError::from(LinuxError::ENXIO));
         }
@@ -247,6 +293,92 @@ impl LoopState {
         }
         self.backing = Some(backing);
         Ok(())
+    }
+}
+
+fn loop_control_get_free() -> VfsResult<usize> {
+    for number in 0..LOOP_COUNT {
+        let state = LOOP_STATES[number].lock();
+        if state.is_visible() && !state.is_bound() {
+            return Ok(number);
+        }
+    }
+
+    for number in 0..LOOP_COUNT {
+        let mut state = LOOP_STATES[number].lock();
+        if !state.is_visible() {
+            state.visible = true;
+            return Ok(number);
+        }
+    }
+
+    Err(AxError::from(LinuxError::ENOSPC))
+}
+
+fn loop_control_add(number: usize) -> VfsResult<usize> {
+    if number >= LOOP_COUNT {
+        return Err(AxError::from(LinuxError::ENOSPC));
+    }
+
+    let mut state = LOOP_STATES[number].lock();
+    if state.is_visible() {
+        return Err(AxError::from(LinuxError::EEXIST));
+    }
+
+    state.visible = true;
+    Ok(number)
+}
+
+fn loop_control_remove(number: usize) -> VfsResult<()> {
+    if number >= LOOP_COUNT {
+        return Err(AxError::from(LinuxError::ENODEV));
+    }
+
+    let mut state = LOOP_STATES[number].lock();
+    if !state.is_visible() {
+        return Err(AxError::from(LinuxError::ENODEV));
+    }
+    if state.is_bound() {
+        return Err(AxError::ResourceBusy);
+    }
+
+    state.visible = false;
+    Ok(())
+}
+
+/// /dev/loop-control controller.
+pub struct LoopControl;
+
+impl DeviceOps for LoopControl {
+    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
+        Err(AxError::InvalidInput)
+    }
+
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        Err(AxError::InvalidInput)
+    }
+
+    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+        match cmd {
+            LOOP_CTL_GET_FREE => loop_control_get_free(),
+            LOOP_CTL_ADD => loop_control_add(arg),
+            LOOP_CTL_REMOVE => {
+                if arg > i32::MAX as usize {
+                    return Err(AxError::InvalidInput);
+                }
+                loop_control_remove(arg)?;
+                Ok(0)
+            }
+            _ => Err(AxError::from(LinuxError::ENOSYS)),
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn flags(&self) -> NodeFlags {
+        NodeFlags::NON_CACHEABLE | NodeFlags::STREAM
     }
 }
 
@@ -295,9 +427,28 @@ pub(crate) fn snapshot(number: u32) -> LoopSnapshot {
     LOOP_STATES[number as usize].lock().snapshot()
 }
 
+pub(crate) fn partition_count(number: u32) -> u32 {
+    if (number as usize) >= LOOP_COUNT {
+        return 0;
+    }
+    let state = LOOP_STATES[number as usize].lock();
+    if state.is_visible() {
+        state.partition_count
+    } else {
+        0
+    }
+}
+
+pub(crate) fn partition_visible(number: u32, partition: u32) -> bool {
+    partition != 0 && partition <= partition_count(number)
+}
+
 impl DeviceOps for LoopDevice {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         let state = self.state().lock();
+        if !state.is_visible() {
+            return Err(AxError::NoSuchDevice);
+        }
         let backing = state
             .backing
             .as_ref()
@@ -313,6 +464,9 @@ impl DeviceOps for LoopDevice {
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
         let state = self.state().lock();
+        if !state.is_visible() {
+            return Err(AxError::NoSuchDevice);
+        }
         if state.read_only() {
             return Err(AxError::ReadOnlyFilesystem);
         }
@@ -358,6 +512,9 @@ impl DeviceOps for LoopDevice {
             }
             LOOP_SET_CAPACITY => {
                 let mut state = self.state().lock();
+                if !state.is_visible() {
+                    return Err(AxError::NoSuchDevice);
+                }
                 if !state.is_bound() {
                     return Err(AxError::from(LinuxError::ENXIO));
                 }
@@ -365,6 +522,9 @@ impl DeviceOps for LoopDevice {
             }
             LOOP_SET_DIRECT_IO => {
                 let mut state = self.state().lock();
+                if !state.is_visible() {
+                    return Err(AxError::NoSuchDevice);
+                }
                 if !state.is_bound() {
                     return Err(AxError::from(LinuxError::ENXIO));
                 }
@@ -379,8 +539,15 @@ impl DeviceOps for LoopDevice {
             }
             LOOP_SET_BLOCK_SIZE => {
                 let block_size = u32::try_from(arg).map_err(|_| AxError::InvalidInput)?;
+                let mut state = self.state().lock();
+                if !state.is_visible() {
+                    return Err(AxError::NoSuchDevice);
+                }
+                if !state.is_bound() {
+                    return Err(AxError::from(LinuxError::ENXIO));
+                }
                 validate_block_size(block_size)?;
-                self.state().lock().block_size = block_size;
+                state.block_size = block_size;
             }
             LOOP_CONFIGURE => {
                 let config = unsafe { (arg as *const loop_config).vm_read_uninit()?.assume_init() };
@@ -396,6 +563,9 @@ impl DeviceOps for LoopDevice {
             // TODO: the following should apply to any block devices
             BLKGETSIZE | BLKGETSIZE64 => {
                 let state = self.state().lock();
+                if !state.is_visible() {
+                    return Err(AxError::NoSuchDevice);
+                }
                 if !state.is_bound() {
                     return Err(AxError::from(LinuxError::ENXIO));
                 }
@@ -406,10 +576,18 @@ impl DeviceOps for LoopDevice {
                 }
             }
             BLKSSZGET => {
-                (arg as *mut u32).vm_write(self.state().lock().block_size)?;
+                let state = self.state().lock();
+                if !state.is_visible() {
+                    return Err(AxError::NoSuchDevice);
+                }
+                (arg as *mut u32).vm_write(state.block_size)?;
             }
             BLKROGET => {
-                (arg as *mut u32).vm_write(self.state().lock().read_only() as u32)?;
+                let state = self.state().lock();
+                if !state.is_visible() {
+                    return Err(AxError::NoSuchDevice);
+                }
+                (arg as *mut u32).vm_write(state.read_only() as u32)?;
             }
             BLKROSET => {
                 let ro = (arg as *const u32).vm_read()?;
@@ -417,11 +595,24 @@ impl DeviceOps for LoopDevice {
                     return Err(AxError::InvalidInput);
                 }
                 let mut state = self.state().lock();
+                if !state.is_visible() {
+                    return Err(AxError::NoSuchDevice);
+                }
                 if ro == 0 {
                     state.flags &= !FLAG_READ_ONLY;
                 } else {
                     state.flags |= FLAG_READ_ONLY;
                 }
+            }
+            BLKRRPART => {
+                let mut state = self.state().lock();
+                if !state.is_visible() {
+                    return Err(AxError::NoSuchDevice);
+                }
+                if !state.is_bound() {
+                    return Err(AxError::from(LinuxError::ENXIO));
+                }
+                state.reread_partitions(2);
             }
             BLKRAGET => {
                 (arg as *mut usize).vm_write(self.ra.load(Ordering::Relaxed) as usize)?;
@@ -443,6 +634,9 @@ impl DeviceOps for LoopDevice {
 
     fn mmap(&self) -> DeviceMmap {
         let state = self.state().lock();
+        if !state.is_visible() {
+            return DeviceMmap::None;
+        }
         if let Some(FileBackend::Cached(cache)) = state.backing.as_ref().map(|b| &b.file) {
             DeviceMmap::Cache(cache.clone())
         } else {
@@ -451,7 +645,11 @@ impl DeviceOps for LoopDevice {
     }
 
     fn len(&self) -> VfsResult<u64> {
-        Ok(self.state().lock().size_bytes())
+        let state = self.state().lock();
+        if !state.is_visible() {
+            return Err(AxError::NoSuchDevice);
+        }
+        Ok(state.size_bytes())
     }
 
     fn flags(&self) -> NodeFlags {

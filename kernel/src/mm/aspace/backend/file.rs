@@ -163,6 +163,27 @@ impl FileBackend {
         file_offset >= current_end
     }
 
+    pub(crate) fn cached_page_resident(&self, vaddr: VirtAddr) -> bool {
+        let page_start = vaddr.align_down_4k();
+        if page_start < self.0.start {
+            return false;
+        }
+
+        let file_page = page_start.sub_addr(self.0.start) / PAGE_SIZE_4K;
+        if file_page > u32::MAX as usize {
+            return false;
+        }
+        let Some(pn) = self.0.offset_page.checked_add(file_page as u32) else {
+            return false;
+        };
+
+        let mut resident = false;
+        self.0.cache.with_page(pn, |page| {
+            resident = page.is_some();
+        });
+        resident
+    }
+
     fn clone_for_range_with_id(
         &self,
         old_start: VirtAddr,
@@ -287,50 +308,50 @@ impl BackendOps for FileBackend {
         access_flags: MappingFlags,
         pt: &mut PageTableCursor,
     ) -> AxResult<(usize, Option<PopulateCallback>)> {
-        let mut pages = 0;
-        let mut to_be_evicted = Vec::new();
-        let start_page = ((range.start - self.0.start) / PAGE_SIZE_4K) as u32 + self.0.offset_page;
-        for (i, addr) in pages_in(range, PageSize::Size4K)?.enumerate() {
-            let pn = start_page + i as u32;
-            match pt.query(addr) {
-                Ok((paddr, page_flags, _)) => {
-                    if access_flags.contains(MappingFlags::WRITE)
-                        && !page_flags.contains(MappingFlags::WRITE)
-                    {
-                        self.0.cache.with_page(pn, |page| {
-                            page.expect("page should be present").mark_dirty();
-                            pt.remap(addr, paddr, page_table_flags(flags))?;
+        self.0.cache.with_direct_io_excluded(|| {
+            let mut pages = 0;
+            let mut to_be_evicted = Vec::new();
+            let start_page =
+                ((range.start - self.0.start) / PAGE_SIZE_4K) as u32 + self.0.offset_page;
+            for (i, addr) in pages_in(range, PageSize::Size4K)?.enumerate() {
+                let pn = start_page + i as u32;
+                match pt.query(addr) {
+                    Ok((paddr, page_flags, _)) => {
+                        if access_flags.contains(MappingFlags::WRITE)
+                            && !page_flags.contains(MappingFlags::WRITE)
+                        {
+                            self.0.cache.with_page(pn, |page| {
+                                page.expect("page should be present").mark_dirty();
+                                pt.remap(addr, paddr, page_table_flags(flags))?;
+                                pages += 1;
+                                AxResult::Ok(())
+                            })?;
+                        } else if page_flags.contains(access_flags) {
                             pages += 1;
-                            AxResult::Ok(())
-                        })?;
-                    } else if page_flags.contains(access_flags) {
-                        pages += 1;
-                    }
-                }
-                // If the page is not mapped, try map it.
-                Err(PagingError::NotMapped) => {
-                    let map_flags = flags - MappingFlags::WRITE;
-                    self.0.cache.with_page_or_insert(pn, |page, evicted| {
-                        let evicted = evicted;
-                        if let Some(evicted) = evicted.as_ref() {
-                            to_be_evicted.push(evicted.page_number());
                         }
-                        pt.map(
-                            addr,
-                            page.paddr(),
-                            PageSize::Size4K,
-                            page_table_flags(map_flags),
-                        )?;
-                        pages += 1;
-                        Ok(())
-                    })?;
+                    }
+                    // If the page is not mapped, try map it.
+                    Err(PagingError::NotMapped) => {
+                        let map_flags = flags - MappingFlags::WRITE;
+                        self.0.cache.with_page_or_insert(pn, |page, evicted| {
+                            let evicted = evicted;
+                            if let Some(evicted) = evicted.as_ref() {
+                                to_be_evicted.push(evicted.page_number());
+                            }
+                            pt.map(
+                                addr,
+                                page.paddr(),
+                                PageSize::Size4K,
+                                page_table_flags(map_flags),
+                            )?;
+                            pages += 1;
+                            Ok(())
+                        })?;
+                    }
+                    Err(_) => return Err(AxError::BadAddress),
                 }
-                Err(_) => return Err(AxError::BadAddress),
             }
-        }
-        Ok((
-            pages,
-            if to_be_evicted.is_empty() {
+            let callback: Option<PopulateCallback> = if to_be_evicted.is_empty() {
                 None
             } else {
                 let inner = self.0.clone();
@@ -339,8 +360,9 @@ impl BackendOps for FileBackend {
                         inner.on_evict(pn, aspace);
                     }
                 }))
-            },
-        ))
+            };
+            Ok((pages, callback))
+        })
     }
 
     fn clone_map(

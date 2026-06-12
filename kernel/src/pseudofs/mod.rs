@@ -1,5 +1,6 @@
 //! Basic virtual filesystem support
 
+pub mod cgroup;
 pub mod dev;
 mod device;
 mod dir;

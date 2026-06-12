@@ -87,13 +87,11 @@ pub fn sys_getrlimit(resource: u32, old_limit: *mut rlimit) -> AxResult<isize> {
     }
 
     let proc_data = current().as_thread().proc_data.clone();
-    if let Some(old_limit) = old_limit.nullable() {
-        let limit = &proc_data.rlim.read()[resource];
-        old_limit.vm_write(rlimit {
-            rlim_cur: limit.current as _,
-            rlim_max: limit.max as _,
-        })?;
-    }
+    let limit = &proc_data.rlim.read()[resource];
+    old_limit.vm_write(rlimit {
+        rlim_cur: limit.current as _,
+        rlim_max: limit.max as _,
+    })?;
 
     Ok(0)
 }

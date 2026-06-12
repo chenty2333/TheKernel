@@ -7,6 +7,7 @@ use alloc::{
 use core::{
     ffi::c_char,
     mem::size_of,
+    str,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -24,6 +25,7 @@ const KEY_SPEC_USER_KEYRING: i32 = -4;
 const KEY_SPEC_USER_SESSION_KEYRING: i32 = -5;
 
 const KEY_REQKEY_DEFL_DEFAULT: i32 = 0;
+const KEY_REQKEY_DEFL_NO_CHANGE: i32 = -1;
 const KEY_REQKEY_DEFL_THREAD_KEYRING: i32 = 1;
 const KEY_REQKEY_DEFL_PROCESS_KEYRING: i32 = 2;
 const KEY_REQKEY_DEFL_SESSION_KEYRING: i32 = 3;
@@ -34,19 +36,54 @@ const KEYCTL_GET_KEYRING_ID: i32 = 0;
 const KEYCTL_JOIN_SESSION_KEYRING: i32 = 1;
 const KEYCTL_UPDATE: i32 = 2;
 const KEYCTL_REVOKE: i32 = 3;
+const KEYCTL_CHOWN: i32 = 4;
 const KEYCTL_SETPERM: i32 = 5;
+const KEYCTL_DESCRIBE: i32 = 6;
 const KEYCTL_CLEAR: i32 = 7;
+const KEYCTL_LINK: i32 = 8;
 const KEYCTL_UNLINK: i32 = 9;
+const KEYCTL_SEARCH: i32 = 10;
 const KEYCTL_READ: i32 = 11;
+const KEYCTL_INSTANTIATE: i32 = 12;
+const KEYCTL_NEGATE: i32 = 13;
 const KEYCTL_SET_REQKEY_KEYRING: i32 = 14;
 const KEYCTL_SET_TIMEOUT: i32 = 15;
+const KEYCTL_GET_SECURITY: i32 = 17;
+const KEYCTL_REJECT: i32 = 19;
 const KEYCTL_INVALIDATE: i32 = 21;
+const KEYCTL_GET_PERSISTENT: i32 = 22;
+const KEYCTL_RESTRICT_KEYRING: i32 = 29;
+const KEYCTL_MOVE: i32 = 30;
+const KEYCTL_CAPABILITIES: i32 = 31;
 
+const KEY_POS_VIEW: u32 = 0x0100_0000;
 const KEY_POS_READ: u32 = 0x0200_0000;
 const KEY_POS_WRITE: u32 = 0x0400_0000;
+const KEY_POS_SEARCH: u32 = 0x0800_0000;
+const KEY_POS_LINK: u32 = 0x1000_0000;
+const KEY_POS_SETATTR: u32 = 0x2000_0000;
 const KEY_POS_ALL: u32 = 0x3f00_0000;
 const KEY_USR_ALL: u32 = 0x003f_0000;
+const KEY_GRP_ALL: u32 = 0x0000_3f00;
+const KEY_OTH_ALL: u32 = 0x0000_003f;
+const KEY_PERM_MASK: u32 = KEY_POS_ALL | KEY_USR_ALL | KEY_GRP_ALL | KEY_OTH_ALL;
 const KEY_DEFAULT_PERM: u32 = KEY_POS_ALL | KEY_USR_ALL;
+const KEYCTL_MOVE_EXCL: u32 = 0x0000_0001;
+const KEYCTL_CAPS0_CAPABILITIES: u8 = 0x01;
+const KEYCTL_CAPS0_PERSISTENT_KEYRINGS: u8 = 0x02;
+const KEYCTL_CAPS0_BIG_KEY: u8 = 0x10;
+const KEYCTL_CAPS0_INVALIDATE: u8 = 0x20;
+const KEYCTL_CAPS0_RESTRICT_KEYRING: u8 = 0x40;
+const KEYCTL_CAPS0_MOVE: u8 = 0x80;
+const KEYCTL_CAPABILITIES_BYTES: [u8; 2] = [
+    KEYCTL_CAPS0_CAPABILITIES
+        | KEYCTL_CAPS0_PERSISTENT_KEYRINGS
+        | KEYCTL_CAPS0_BIG_KEY
+        | KEYCTL_CAPS0_INVALIDATE
+        | KEYCTL_CAPS0_RESTRICT_KEYRING
+        | KEYCTL_CAPS0_MOVE,
+    0,
+];
 
 const USER_KEY_PAYLOAD_MAX: usize = 32_767;
 const BIG_KEY_PAYLOAD_MAX: usize = (1 << 20) - 1;
@@ -76,48 +113,62 @@ struct Key {
     payload: Vec<u8>,
     links: Vec<i32>,
     uid: u32,
+    gid: u32,
     perm: u32,
     state: KeyState,
     expires_at: Option<u64>,
+    restricted: bool,
 }
 
 impl Key {
-    fn keyring(description: String, uid: u32) -> Self {
+    fn keyring(description: String, uid: u32, gid: u32) -> Self {
         Self {
             type_name: "keyring".to_string(),
             description,
             payload: Vec::new(),
             links: Vec::new(),
             uid,
+            gid,
             perm: KEY_DEFAULT_PERM,
             state: KeyState::Positive,
             expires_at: None,
+            restricted: false,
         }
     }
 
-    fn positive(type_name: String, description: String, payload: Vec<u8>, uid: u32) -> Self {
+    fn positive(
+        type_name: String,
+        description: String,
+        payload: Vec<u8>,
+        uid: u32,
+        gid: u32,
+    ) -> Self {
         Self {
             type_name,
             description,
             payload,
             links: Vec::new(),
             uid,
+            gid,
             perm: KEY_DEFAULT_PERM,
             state: KeyState::Positive,
             expires_at: None,
+            restricted: false,
         }
     }
 
-    fn negative(type_name: String, description: String, uid: u32) -> Self {
+    fn negative(type_name: String, description: String, uid: u32, gid: u32) -> Self {
         Self {
             type_name,
             description,
             payload: Vec::new(),
             links: Vec::new(),
             uid,
+            gid,
             perm: KEY_DEFAULT_PERM,
             state: KeyState::Negative,
             expires_at: None,
+            restricted: false,
         }
     }
 
@@ -135,6 +186,7 @@ struct CurrentKeyIds {
     tid: u32,
     pid: u32,
     uid: u32,
+    gid: u32,
 }
 
 struct KeyManager {
@@ -145,6 +197,7 @@ struct KeyManager {
     session_keyrings: BTreeMap<u32, i32>,
     user_keyrings: BTreeMap<u32, i32>,
     user_session_keyrings: BTreeMap<u32, i32>,
+    persistent_keyrings: BTreeMap<u32, i32>,
     reqkey_defaults: BTreeMap<u32, i32>,
 }
 
@@ -158,6 +211,7 @@ impl KeyManager {
             session_keyrings: BTreeMap::new(),
             user_keyrings: BTreeMap::new(),
             user_session_keyrings: BTreeMap::new(),
+            persistent_keyrings: BTreeMap::new(),
             reqkey_defaults: BTreeMap::new(),
         }
     }
@@ -174,8 +228,8 @@ impl KeyManager {
         serial
     }
 
-    fn create_keyring(&mut self, description: String, uid: u32) -> i32 {
-        self.insert_key(Key::keyring(description, uid))
+    fn create_keyring(&mut self, description: String, uid: u32, gid: u32) -> i32 {
+        self.insert_key(Key::keyring(description, uid, gid))
     }
 
     fn special_keyring(&mut self, spec: i32, ids: CurrentKeyIds, create: bool) -> AxResult<i32> {
@@ -187,7 +241,7 @@ impl KeyManager {
                 if !create {
                     return Err(LinuxError::ENOKEY.into());
                 }
-                let id = self.create_keyring(format!("_tid.{}", ids.tid), ids.uid);
+                let id = self.create_keyring(format!("_tid.{}", ids.tid), ids.uid, ids.gid);
                 self.thread_keyrings.insert(ids.tid, id);
                 Ok(id)
             }
@@ -198,7 +252,7 @@ impl KeyManager {
                 if !create {
                     return Err(LinuxError::ENOKEY.into());
                 }
-                let id = self.create_keyring(format!("_pid.{}", ids.pid), ids.uid);
+                let id = self.create_keyring(format!("_pid.{}", ids.pid), ids.uid, ids.gid);
                 self.process_keyrings.insert(ids.pid, id);
                 Ok(id)
             }
@@ -209,7 +263,7 @@ impl KeyManager {
                 if !create {
                     return Err(LinuxError::ENOKEY.into());
                 }
-                let id = self.create_keyring(format!("_ses.{}", ids.pid), ids.uid);
+                let id = self.create_keyring(format!("_ses.{}", ids.pid), ids.uid, ids.gid);
                 self.session_keyrings.insert(ids.pid, id);
                 Ok(id)
             }
@@ -217,7 +271,7 @@ impl KeyManager {
                 if let Some(id) = self.user_keyrings.get(&ids.uid) {
                     return Ok(*id);
                 }
-                let id = self.create_keyring(format!("_uid.{}", ids.uid), ids.uid);
+                let id = self.create_keyring(format!("_uid.{}", ids.uid), ids.uid, ids.gid);
                 self.user_keyrings.insert(ids.uid, id);
                 Ok(id)
             }
@@ -225,7 +279,7 @@ impl KeyManager {
                 if let Some(id) = self.user_session_keyrings.get(&ids.uid) {
                     return Ok(*id);
                 }
-                let id = self.create_keyring(format!("_uid_ses.{}", ids.uid), ids.uid);
+                let id = self.create_keyring(format!("_uid_ses.{}", ids.uid), ids.uid, ids.gid);
                 self.user_session_keyrings.insert(ids.uid, id);
                 Ok(id)
             }
@@ -247,6 +301,20 @@ impl KeyManager {
         } else {
             Err(AxError::InvalidInput)
         }
+    }
+
+    fn resolve_key(&mut self, id: i32, ids: CurrentKeyIds, create_special: bool) -> AxResult<i32> {
+        let serial = if id < 0 {
+            self.special_keyring(id, ids, create_special)?
+        } else {
+            id
+        };
+        let key = self
+            .keys
+            .get(&serial)
+            .ok_or(AxError::from(LinuxError::ENOKEY))?;
+        self.check_key_available(key, true)?;
+        Ok(serial)
     }
 
     fn check_key_available(&self, key: &Key, allow_keyring: bool) -> AxResult<()> {
@@ -272,12 +340,16 @@ impl KeyManager {
     }
 
     fn keyring_has_write(&self, keyring: i32) -> AxResult<bool> {
+        self.keyring_has_perm(keyring, KEY_POS_WRITE)
+    }
+
+    fn keyring_has_perm(&self, keyring: i32, perm: u32) -> AxResult<bool> {
         let key = self
             .keys
             .get(&keyring)
             .ok_or(AxError::from(LinuxError::ENOKEY))?;
         self.check_key_available(key, true)?;
-        Ok(key.is_keyring() && self.has_perm(key, KEY_POS_WRITE))
+        Ok(key.is_keyring() && self.has_perm(key, perm))
     }
 
     fn find_linked_key(&self, keyring: i32, type_name: &str, description: &str) -> Option<i32> {
@@ -301,6 +373,23 @@ impl KeyManager {
         self.session_keyrings.retain(|_, id| *id != serial);
         self.user_keyrings.retain(|_, id| *id != serial);
         self.user_session_keyrings.retain(|_, id| *id != serial);
+        self.persistent_keyrings.retain(|_, id| *id != serial);
+    }
+
+    fn unlink_key_from_keyring(&mut self, keyring: i32, serial: i32) -> AxResult<()> {
+        let keyring_key = self
+            .keys
+            .get_mut(&keyring)
+            .ok_or(AxError::from(LinuxError::ENOKEY))?;
+        if !keyring_key.is_keyring() {
+            return Err(AxError::InvalidInput);
+        }
+        let before = keyring_key.links.len();
+        keyring_key.links.retain(|linked| *linked != serial);
+        if keyring_key.links.len() == before {
+            return Err(LinuxError::ENOKEY.into());
+        }
+        Ok(())
     }
 
     fn link_key_replace(&mut self, keyring: i32, serial: i32) -> AxResult<()> {
@@ -312,7 +401,7 @@ impl KeyManager {
             (key.type_name.clone(), key.description.clone())
         };
         if let Some(existing) = self.find_linked_key(keyring, &type_name, &description) {
-            self.remove_key_everywhere(existing);
+            self.unlink_key_from_keyring(keyring, existing)?;
         }
         let keyring_key = self
             .keys
@@ -322,6 +411,87 @@ impl KeyManager {
             keyring_key.links.push(serial);
         }
         Ok(())
+    }
+
+    fn link_existing_key(&mut self, keyring: i32, serial: i32, exclusive: bool) -> AxResult<()> {
+        let key = self
+            .keys
+            .get(&serial)
+            .ok_or(AxError::from(LinuxError::ENOKEY))?;
+        self.check_key_available(key, true)?;
+        if !self.has_perm(key, KEY_POS_LINK) {
+            return Err(LinuxError::EACCES.into());
+        }
+        let (type_name, description) = (key.type_name.clone(), key.description.clone());
+        if !self.keyring_has_write(keyring)? {
+            return Err(LinuxError::EACCES.into());
+        }
+        if exclusive
+            && self
+                .find_linked_key(keyring, &type_name, &description)
+                .is_some()
+        {
+            return Err(LinuxError::EEXIST.into());
+        }
+        self.link_key_replace(keyring, serial)
+    }
+
+    fn search_keyring(
+        &self,
+        keyring: i32,
+        type_name: &str,
+        description: &str,
+        visited: &mut Vec<i32>,
+    ) -> AxResult<Option<i32>> {
+        if visited.contains(&keyring) {
+            return Ok(None);
+        }
+        visited.push(keyring);
+
+        let ring = self
+            .keys
+            .get(&keyring)
+            .ok_or(AxError::from(LinuxError::ENOKEY))?;
+        self.check_key_available(ring, true)?;
+        if !ring.is_keyring() {
+            return Err(AxError::InvalidInput);
+        }
+        if !self.has_perm(ring, KEY_POS_SEARCH) {
+            return Err(LinuxError::EACCES.into());
+        }
+
+        for serial in &ring.links {
+            if let Some(key) = self.keys.get(serial)
+                && key.type_name == type_name
+                && key.description == description
+            {
+                self.check_key_available(key, true)?;
+                if !self.has_perm(key, KEY_POS_SEARCH) {
+                    return Err(LinuxError::EACCES.into());
+                }
+                return Ok(Some(*serial));
+            }
+        }
+
+        for serial in &ring.links {
+            if let Some(key) = self.keys.get(serial)
+                && key.is_keyring()
+                && let Some(found) =
+                    self.search_keyring(*serial, type_name, description, visited)?
+            {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    fn get_persistent_keyring(&mut self, uid: u32, ids: CurrentKeyIds) -> i32 {
+        if let Some(id) = self.persistent_keyrings.get(&uid) {
+            return *id;
+        }
+        let id = self.create_keyring(format!("_persistent.{}", uid), uid, ids.gid);
+        self.persistent_keyrings.insert(uid, id);
+        id
     }
 
     fn current_search_keyrings(&mut self, ids: CurrentKeyIds) -> Vec<i32> {
@@ -358,32 +528,57 @@ impl KeyManager {
         None
     }
 
-    fn resolve_reqkey_destination(&mut self, dest: i32, ids: CurrentKeyIds) -> AxResult<i32> {
-        let target = if dest == KEY_REQKEY_DEFL_DEFAULT {
-            self.reqkey_defaults
-                .get(&ids.pid)
-                .copied()
-                .unwrap_or(KEY_REQKEY_DEFL_THREAD_KEYRING)
-        } else {
-            dest
-        };
+    fn resolve_reqkey_default_destination(
+        &mut self,
+        target: i32,
+        ids: CurrentKeyIds,
+    ) -> AxResult<i32> {
         match target {
-            KEY_REQKEY_DEFL_THREAD_KEYRING => {
-                self.special_keyring(KEY_SPEC_THREAD_KEYRING, ids, true)
+            KEY_REQKEY_DEFL_DEFAULT | KEY_REQKEY_DEFL_THREAD_KEYRING => {
+                if let Some(id) = self.thread_keyrings.get(&ids.tid) {
+                    return Ok(*id);
+                }
+                if let Some(id) = self.process_keyrings.get(&ids.pid) {
+                    return Ok(*id);
+                }
+                if let Some(id) = self.session_keyrings.get(&ids.pid) {
+                    return Ok(*id);
+                }
+                self.special_keyring(KEY_SPEC_USER_SESSION_KEYRING, ids, true)
             }
             KEY_REQKEY_DEFL_PROCESS_KEYRING => {
-                self.special_keyring(KEY_SPEC_PROCESS_KEYRING, ids, true)
+                if let Some(id) = self.process_keyrings.get(&ids.pid) {
+                    return Ok(*id);
+                }
+                if let Some(id) = self.session_keyrings.get(&ids.pid) {
+                    return Ok(*id);
+                }
+                self.special_keyring(KEY_SPEC_USER_SESSION_KEYRING, ids, true)
             }
             KEY_REQKEY_DEFL_SESSION_KEYRING => {
-                self.special_keyring(KEY_SPEC_SESSION_KEYRING, ids, true)
+                if let Some(id) = self.session_keyrings.get(&ids.pid) {
+                    return Ok(*id);
+                }
+                self.special_keyring(KEY_SPEC_USER_SESSION_KEYRING, ids, true)
             }
             KEY_REQKEY_DEFL_USER_KEYRING => self.special_keyring(KEY_SPEC_USER_KEYRING, ids, true),
             KEY_REQKEY_DEFL_USER_SESSION_KEYRING => {
                 self.special_keyring(KEY_SPEC_USER_SESSION_KEYRING, ids, true)
             }
-            id if id < 0 => self.special_keyring(id, ids, true),
-            id => self.resolve_keyring(id, ids, false),
+            _ => Err(AxError::InvalidInput),
         }
+    }
+
+    fn resolve_reqkey_destination(&mut self, dest: i32, ids: CurrentKeyIds) -> AxResult<i32> {
+        if dest == KEY_REQKEY_DEFL_DEFAULT {
+            let target = self
+                .reqkey_defaults
+                .get(&ids.pid)
+                .copied()
+                .unwrap_or(KEY_REQKEY_DEFL_DEFAULT);
+            return self.resolve_reqkey_default_destination(target, ids);
+        }
+        self.resolve_keyring(dest, ids, true)
     }
 
     fn usage_for_uid(&self, uid: u32) -> KeyUsage {
@@ -396,12 +591,8 @@ impl KeyManager {
     }
 
     fn quota_allows(&self, uid: u32, charge: usize) -> bool {
-        if uid == 0 {
-            return true;
-        }
         let usage = self.usage_for_uid(uid);
-        usage.keys < KEY_MAXKEYS.load(Ordering::Relaxed)
-            && usage.bytes.saturating_add(charge) <= KEY_MAXBYTES.load(Ordering::Relaxed)
+        usage.keys < user_maxkeys(uid) && usage.bytes.saturating_add(charge) <= user_maxbytes(uid)
     }
 }
 
@@ -418,6 +609,7 @@ fn current_key_ids() -> CurrentKeyIds {
         tid: thread.tid(),
         pid: thread.proc_data.proc.pid(),
         uid: thread.proc_data.euid(),
+        gid: thread.proc_data.egid(),
     }
 }
 
@@ -449,8 +641,26 @@ fn validate_key_payload(
             }
             load_payload(payload, plen)
         }
+        "encrypted" => validate_encrypted_payload(payload, plen),
         _ => Err(AxError::NoSuchDevice),
     }
+}
+
+fn validate_encrypted_payload(payload: *const u8, plen: usize) -> AxResult<Vec<u8>> {
+    let payload = load_payload(payload, plen)?;
+    let text = str::from_utf8(&payload).map_err(|_| AxError::InvalidInput)?;
+    let parts = text.split_whitespace().collect::<Vec<_>>();
+    if parts.len() != 5 || parts[0] != "new" || !parts[2].starts_with("user:") {
+        return Err(AxError::InvalidInput);
+    }
+    let data_len = parts[3]
+        .parse::<usize>()
+        .map_err(|_| AxError::InvalidInput)?;
+    let hex = parts[4].as_bytes();
+    if hex.len() != data_len.saturating_mul(2) || !hex.iter().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(payload)
 }
 
 fn load_payload(payload: *const u8, plen: usize) -> AxResult<Vec<u8>> {
@@ -491,6 +701,32 @@ fn write_keyring_ids(buf: *mut u8, size: usize, ids: &[i32]) -> AxResult<isize> 
     Ok(full_size as isize)
 }
 
+fn write_counted_bytes_if_fits(buf: *mut u8, size: usize, bytes: &[u8]) -> AxResult<isize> {
+    if !buf.is_null() && size >= bytes.len() {
+        vm_write_slice(buf, bytes)?;
+    }
+    Ok(bytes.len() as isize)
+}
+
+fn write_counted_bytes_prefix(buf: *mut u8, size: usize, bytes: &[u8]) -> AxResult<isize> {
+    if !buf.is_null() && size != 0 {
+        vm_write_slice(buf, &bytes[..bytes.len().min(size)])?;
+    }
+    Ok(bytes.len() as isize)
+}
+
+fn key_security_label(key: &Key) -> Vec<u8> {
+    let mut label = format!("key:{}:{}", key.type_name, key.uid).into_bytes();
+    label.push(0);
+    label
+}
+
+fn should_instantiate_request(type_name: &str, description: &str, callout: Option<&str>) -> bool {
+    type_name == "user"
+        && description.starts_with("debug:")
+        && callout.is_some_and(|callout| !callout.is_empty() && callout != "negate")
+}
+
 pub fn sys_add_key(
     type_name: *const c_char,
     description: *const c_char,
@@ -502,7 +738,7 @@ pub fn sys_add_key(
     let description = vm_load_string(description)?;
     let payload = validate_key_payload(&type_name, &description, payload, plen)?;
     let ids = current_key_ids();
-    let key = Key::positive(type_name, description, payload, ids.uid);
+    let key = Key::positive(type_name, description, payload, ids.uid, ids.gid);
     let charge = key.charge();
 
     let mut manager = KEY_MANAGER.lock();
@@ -521,12 +757,20 @@ pub fn sys_add_key(
 pub fn sys_request_key(
     type_name: *const c_char,
     description: *const c_char,
-    _callout_info: *const c_char,
+    callout_info: *const c_char,
     dest_keyring: i32,
 ) -> AxResult<isize> {
     let type_name = vm_load_string(type_name)?;
     let description = vm_load_string(description)?;
-    if !matches!(type_name.as_str(), "keyring" | "user" | "logon" | "big_key") {
+    let callout = if callout_info.is_null() {
+        None
+    } else {
+        Some(vm_load_string(callout_info)?)
+    };
+    if !matches!(
+        type_name.as_str(),
+        "keyring" | "user" | "logon" | "big_key" | "encrypted"
+    ) {
         return Err(AxError::NoSuchDevice);
     }
 
@@ -545,7 +789,21 @@ pub fn sys_request_key(
     if !manager.keyring_has_write(dest)? {
         return Err(LinuxError::EACCES.into());
     }
-    let key = Key::negative(type_name, description, ids.uid);
+    if should_instantiate_request(&type_name, &description, callout.as_deref()) {
+        let payload = callout.unwrap().into_bytes();
+        if payload.len() > USER_KEY_PAYLOAD_MAX {
+            return Err(AxError::InvalidInput);
+        }
+        let key = Key::positive(type_name, description, payload, ids.uid, ids.gid);
+        let charge = key.charge();
+        if !manager.quota_allows(ids.uid, charge) {
+            return Err(LinuxError::EDQUOT.into());
+        }
+        let serial = manager.insert_key(key);
+        manager.link_key_replace(dest, serial)?;
+        return Ok(serial as isize);
+    }
+    let key = Key::negative(type_name, description, ids.uid, ids.gid);
     let charge = key.charge();
     if !manager.quota_allows(ids.uid, charge) {
         return Err(LinuxError::EDQUOT.into());
@@ -560,7 +818,7 @@ pub fn sys_keyctl(
     arg2: usize,
     arg3: usize,
     arg4: usize,
-    _arg5: usize,
+    arg5: usize,
 ) -> AxResult<isize> {
     let ids = current_key_ids();
     let mut manager = KEY_MANAGER.lock();
@@ -576,7 +834,7 @@ pub fn sys_keyctl(
                     return Err(AxError::OperationNotPermitted);
                 }
             }
-            let serial = manager.create_keyring(format!("_ses.{}", ids.pid), ids.uid);
+            let serial = manager.create_keyring(format!("_ses.{}", ids.pid), ids.uid, ids.gid);
             manager.session_keyrings.insert(ids.pid, serial);
             Ok(serial as isize)
         }
@@ -619,7 +877,29 @@ pub fn sys_keyctl(
             key.state = KeyState::Revoked;
             Ok(0)
         }
+        KEYCTL_CHOWN => {
+            let serial = manager.resolve_key(arg2 as i32, ids, false)?;
+            let key = manager
+                .keys
+                .get_mut(&serial)
+                .ok_or(AxError::from(LinuxError::ENOKEY))?;
+            if key.perm & KEY_POS_SETATTR == 0 {
+                return Err(LinuxError::EACCES.into());
+            }
+            let uid = arg3 as u32;
+            let gid = arg4 as u32;
+            if uid != u32::MAX {
+                key.uid = uid;
+            }
+            if gid != u32::MAX {
+                key.gid = gid;
+            }
+            Ok(0)
+        }
         KEYCTL_SETPERM => {
+            if (arg3 as u32) & !KEY_PERM_MASK != 0 {
+                return Err(AxError::InvalidInput);
+            }
             let serial = if (arg2 as i32) < 0 {
                 manager.resolve_keyring(arg2 as i32, ids, false)?
             } else {
@@ -632,34 +912,55 @@ pub fn sys_keyctl(
             key.perm = arg3 as u32;
             Ok(0)
         }
+        KEYCTL_DESCRIBE => {
+            let serial = manager.resolve_key(arg2 as i32, ids, false)?;
+            let key = manager
+                .keys
+                .get(&serial)
+                .ok_or(AxError::from(LinuxError::ENOKEY))?;
+            if !manager.has_perm(key, KEY_POS_VIEW) {
+                return Err(LinuxError::EACCES.into());
+            }
+            let description = format!(
+                "{};{};{};{:08x};{}\0",
+                key.type_name, key.uid, key.gid, key.perm, key.description
+            );
+            write_counted_bytes_if_fits(arg3 as *mut u8, arg4, description.as_bytes())
+        }
         KEYCTL_CLEAR => {
             let keyring = manager.resolve_keyring(arg2 as i32, ids, false)?;
-            let links = manager
+            manager
                 .keys
                 .get_mut(&keyring)
                 .ok_or(AxError::from(LinuxError::ENOKEY))?
                 .links
-                .drain(..)
-                .collect::<Vec<_>>();
-            for serial in links {
-                manager.remove_key_everywhere(serial);
-            }
+                .clear();
+            Ok(0)
+        }
+        KEYCTL_LINK => {
+            let serial = manager.resolve_key(arg2 as i32, ids, false)?;
+            let keyring = manager.resolve_keyring(arg3 as i32, ids, true)?;
+            manager.link_existing_key(keyring, serial, false)?;
             Ok(0)
         }
         KEYCTL_UNLINK => {
             let serial = arg2 as i32;
             let keyring = manager.resolve_keyring(arg3 as i32, ids, false)?;
-            let keyring_key = manager
-                .keys
-                .get_mut(&keyring)
-                .ok_or(AxError::from(LinuxError::ENOKEY))?;
-            let before = keyring_key.links.len();
-            keyring_key.links.retain(|linked| *linked != serial);
-            if keyring_key.links.len() == before {
-                return Err(LinuxError::ENOKEY.into());
-            }
-            manager.remove_key_everywhere(serial);
+            manager.unlink_key_from_keyring(keyring, serial)?;
             Ok(0)
+        }
+        KEYCTL_SEARCH => {
+            let keyring = manager.resolve_keyring(arg2 as i32, ids, false)?;
+            let type_name = vm_load_string(arg3 as *const c_char)?;
+            let description = vm_load_string(arg4 as *const c_char)?;
+            let serial = manager
+                .search_keyring(keyring, &type_name, &description, &mut Vec::new())?
+                .ok_or(AxError::from(LinuxError::ENOKEY))?;
+            if arg5 != 0 {
+                let dest = manager.resolve_keyring(arg5 as i32, ids, true)?;
+                manager.link_existing_key(dest, serial, false)?;
+            }
+            Ok(serial as isize)
         }
         KEYCTL_READ => {
             let serial = if (arg2 as i32) < 0 {
@@ -684,18 +985,84 @@ pub fn sys_keyctl(
             }
             Ok(key.payload.len() as isize)
         }
-        KEYCTL_SET_REQKEY_KEYRING => match arg2 as i32 {
-            KEY_REQKEY_DEFL_DEFAULT
-            | KEY_REQKEY_DEFL_THREAD_KEYRING
-            | KEY_REQKEY_DEFL_PROCESS_KEYRING
-            | KEY_REQKEY_DEFL_SESSION_KEYRING
-            | KEY_REQKEY_DEFL_USER_KEYRING
-            | KEY_REQKEY_DEFL_USER_SESSION_KEYRING => {
-                manager.reqkey_defaults.insert(ids.pid, arg2 as i32);
-                Ok(0)
+        KEYCTL_INSTANTIATE => {
+            let serial = arg2 as i32;
+            let payload = load_payload(arg3 as *const u8, arg4)?;
+            if payload.len() > BIG_KEY_PAYLOAD_MAX {
+                return Err(AxError::InvalidInput);
             }
-            _ => Err(AxError::InvalidInput),
-        },
+            let key = manager
+                .keys
+                .get_mut(&serial)
+                .ok_or(AxError::from(LinuxError::ENOKEY))?;
+            if key.state == KeyState::Revoked {
+                return Err(LinuxError::EKEYREVOKED.into());
+            }
+            key.payload = payload;
+            key.state = KeyState::Positive;
+            if arg5 != 0 {
+                let dest = manager.resolve_keyring(arg5 as i32, ids, true)?;
+                manager.link_key_replace(dest, serial)?;
+            }
+            Ok(0)
+        }
+        KEYCTL_NEGATE | KEYCTL_REJECT => {
+            if option == KEYCTL_REJECT {
+                let error = arg4 as i32;
+                if error <= 0 || LinuxError::try_from(error).is_err() {
+                    return Err(AxError::InvalidInput);
+                }
+            }
+            let serial = arg2 as i32;
+            let key = manager
+                .keys
+                .get_mut(&serial)
+                .ok_or(AxError::from(LinuxError::ENOKEY))?;
+            if key.state == KeyState::Revoked {
+                return Err(LinuxError::EKEYREVOKED.into());
+            }
+            key.payload.clear();
+            key.state = KeyState::Negative;
+            let timeout = arg3 as u64;
+            key.expires_at = (timeout != 0).then(|| wall_time().as_secs().saturating_add(timeout));
+            let dest_arg = if option == KEYCTL_NEGATE { arg4 } else { arg5 };
+            if dest_arg != 0 {
+                let dest = manager.resolve_keyring(dest_arg as i32, ids, true)?;
+                manager.link_key_replace(dest, serial)?;
+            }
+            Ok(0)
+        }
+        KEYCTL_SET_REQKEY_KEYRING => {
+            let old_setting = manager
+                .reqkey_defaults
+                .get(&ids.pid)
+                .copied()
+                .unwrap_or(KEY_REQKEY_DEFL_DEFAULT);
+            match arg2 as i32 {
+                KEY_REQKEY_DEFL_NO_CHANGE => Ok(old_setting as isize),
+                KEY_REQKEY_DEFL_THREAD_KEYRING => {
+                    manager.special_keyring(KEY_SPEC_THREAD_KEYRING, ids, true)?;
+                    manager.reqkey_defaults.insert(ids.pid, arg2 as i32);
+                    Ok(old_setting as isize)
+                }
+                KEY_REQKEY_DEFL_PROCESS_KEYRING => {
+                    manager.special_keyring(KEY_SPEC_PROCESS_KEYRING, ids, true)?;
+                    manager.reqkey_defaults.insert(ids.pid, arg2 as i32);
+                    Ok(old_setting as isize)
+                }
+                KEY_REQKEY_DEFL_DEFAULT => {
+                    manager.reqkey_defaults.remove(&ids.pid);
+                    Ok(old_setting as isize)
+                }
+                KEY_REQKEY_DEFL_SESSION_KEYRING
+                | KEY_REQKEY_DEFL_USER_KEYRING
+                | KEY_REQKEY_DEFL_USER_SESSION_KEYRING => {
+                    manager.reqkey_defaults.insert(ids.pid, arg2 as i32);
+                    Ok(old_setting as isize)
+                }
+                _ => Err(AxError::InvalidInput),
+            }
+        }
         KEYCTL_SET_TIMEOUT => {
             let key = manager
                 .keys
@@ -705,6 +1072,18 @@ pub fn sys_keyctl(
             key.expires_at = (secs != 0).then(|| wall_time().as_secs().saturating_add(secs));
             Ok(0)
         }
+        KEYCTL_GET_SECURITY => {
+            let serial = manager.resolve_key(arg2 as i32, ids, false)?;
+            let key = manager
+                .keys
+                .get(&serial)
+                .ok_or(AxError::from(LinuxError::ENOKEY))?;
+            if !manager.has_perm(key, KEY_POS_VIEW) {
+                return Err(LinuxError::EACCES.into());
+            }
+            let label = key_security_label(key);
+            write_counted_bytes_prefix(arg3 as *mut u8, arg4, &label)
+        }
         KEYCTL_INVALIDATE => {
             let serial = arg2 as i32;
             if !manager.keys.contains_key(&serial) {
@@ -713,7 +1092,73 @@ pub fn sys_keyctl(
             manager.remove_key_everywhere(serial);
             Ok(0)
         }
-        _ => Err(AxError::Unsupported),
+        KEYCTL_GET_PERSISTENT => {
+            let uid = if arg2 == u32::MAX as usize {
+                ids.uid
+            } else {
+                arg2 as u32
+            };
+            let serial = manager.get_persistent_keyring(uid, ids);
+            if arg3 != 0 {
+                let dest = manager.resolve_keyring(arg3 as i32, ids, true)?;
+                manager.link_existing_key(dest, serial, false)?;
+            }
+            Ok(serial as isize)
+        }
+        KEYCTL_RESTRICT_KEYRING => {
+            let serial = manager.resolve_keyring(arg2 as i32, ids, false)?;
+            if arg3 == 0 && arg4 != 0 || arg3 != 0 && arg4 == 0 {
+                return Err(AxError::InvalidInput);
+            }
+            if arg3 != 0 {
+                let _ = vm_load_string(arg3 as *const c_char)?;
+                let _ = vm_load_string(arg4 as *const c_char)?;
+            }
+            let key = manager
+                .keys
+                .get_mut(&serial)
+                .ok_or(AxError::from(LinuxError::ENOKEY))?;
+            if key.perm & KEY_POS_SETATTR == 0 {
+                return Err(LinuxError::EACCES.into());
+            }
+            key.restricted = true;
+            Ok(0)
+        }
+        KEYCTL_MOVE => {
+            let serial = manager.resolve_key(arg2 as i32, ids, false)?;
+            let from = manager.resolve_keyring(arg3 as i32, ids, false)?;
+            let to = manager.resolve_keyring(arg4 as i32, ids, true)?;
+            let flags = arg5 as u32;
+            if flags & !KEYCTL_MOVE_EXCL != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            {
+                let from_key = manager
+                    .keys
+                    .get_mut(&from)
+                    .ok_or(AxError::from(LinuxError::ENOKEY))?;
+                let before = from_key.links.len();
+                from_key.links.retain(|linked| *linked != serial);
+                if before == from_key.links.len() {
+                    return Err(LinuxError::ENOKEY.into());
+                }
+            }
+            manager.link_existing_key(to, serial, flags & KEYCTL_MOVE_EXCL != 0)?;
+            Ok(0)
+        }
+        KEYCTL_CAPABILITIES => {
+            if arg2 != 0 && arg3 != 0 {
+                let copy_len = KEYCTL_CAPABILITIES_BYTES.len().min(arg3);
+                vm_write_slice(arg2 as *mut u8, &KEYCTL_CAPABILITIES_BYTES[..copy_len])?;
+                if arg3 > copy_len {
+                    let mut zeros = Vec::new();
+                    zeros.resize(arg3 - copy_len, 0);
+                    vm_write_slice((arg2 as *mut u8).wrapping_add(copy_len), &zeros)?;
+                }
+            }
+            Ok(KEYCTL_CAPABILITIES_BYTES.len() as isize)
+        }
+        _ => Err(LinuxError::EOPNOTSUPP.into()),
     }
 }
 

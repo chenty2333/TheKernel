@@ -17,8 +17,8 @@ use crate::{
     },
     pseudofs::{self, dev::tty::N_TTY},
     task::{
-        PidNamespace, ProcessData, Thread, TimeNamespace, UserNamespace, UtsNamespace,
-        add_task_to_table, new_user_task, spawn_alarm_task,
+        CgroupNamespace, PidNamespace, ProcessData, Thread, TimeNamespace, UserNamespace,
+        UtsNamespace, add_task_to_table, new_user_task, spawn_alarm_task,
     },
 };
 
@@ -70,6 +70,7 @@ pub fn init(args: &[String], envs: &[String]) {
         Arc::default(),
         None,
         axnet::default_stack().clone(),
+        CgroupNamespace::new_root(),
         PidNamespace::new_root(),
         UserNamespace::new_root(),
         Arc::new(UtsNamespace::new_default()),

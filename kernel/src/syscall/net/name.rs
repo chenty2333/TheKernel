@@ -4,7 +4,7 @@ use linux_raw_sys::net::{sockaddr, socklen_t};
 
 use super::addr::SocketAddrExt;
 use crate::{
-    file::{FileLike, Socket},
+    file::{FileLike, NetlinkSocket, Socket},
     mm::UserPtr,
 };
 
@@ -21,6 +21,11 @@ pub fn sys_getsockname(
     addr: UserPtr<sockaddr>,
     addrlen: UserPtr<socklen_t>,
 ) -> AxResult<isize> {
+    if let Ok(socket) = NetlinkSocket::from_fd(fd) {
+        socket.write_local_addr(addr, checked_socklen_mut(addrlen)?)?;
+        return Ok(0);
+    }
+
     let socket = Socket::from_fd(fd)?;
     let local_addr = socket.local_addr()?;
     debug!("sys_getsockname <= fd: {fd}, addr: {local_addr:?}");

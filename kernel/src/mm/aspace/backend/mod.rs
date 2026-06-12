@@ -196,6 +196,14 @@ impl Backend {
         }
     }
 
+    pub fn cached_page_resident(&self, vaddr: VirtAddr) -> bool {
+        match self {
+            Backend::Cow(backend) => backend.cached_page_resident(vaddr),
+            Backend::File(backend) => backend.cached_page_resident(vaddr),
+            Backend::Linear(_) | Backend::Shared(_) => false,
+        }
+    }
+
     pub fn is_private_anonymous(&self) -> bool {
         matches!(self, Backend::Cow(backend) if backend.is_private_anonymous())
     }

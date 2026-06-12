@@ -13,24 +13,18 @@ use crate::{
 };
 
 fn process_data_from_proc_dir_fd(fd: i32) -> AxResult<alloc::sync::Arc<crate::task::ProcessData>> {
-    let dir = Directory::from_fd(fd)?;
+    let dir = Directory::from_fd(fd).map_err(|err| {
+        if err == AxError::InvalidInput {
+            AxError::BadFileDescriptor
+        } else {
+            err
+        }
+    })?;
     match process_data_from_proc_dir(dir.inner()) {
-        ProcDirProcess::Live(proc_data) => return Ok(proc_data),
-        ProcDirProcess::Stale => return Err(AxError::NoSuchProcess),
-        ProcDirProcess::NotProcDir => {}
+        ProcDirProcess::Live(proc_data) => Ok(proc_data),
+        ProcDirProcess::Stale => Err(AxError::NoSuchProcess),
+        ProcDirProcess::NotProcDir => Err(AxError::BadFileDescriptor),
     }
-    let path = dir.path();
-    let proc_path = path.strip_prefix("/proc/").ok_or(AxError::InvalidInput)?;
-    let pid = if proc_path == "self" {
-        current().as_thread().proc_data.proc.pid()
-    } else {
-        proc_path
-            .split('/')
-            .next()
-            .and_then(|it| it.parse::<u32>().ok())
-            .ok_or(AxError::InvalidInput)?
-    };
-    get_process_data(pid)
 }
 
 fn process_data_from_signal_fd(fd: i32) -> AxResult<alloc::sync::Arc<crate::task::ProcessData>> {
@@ -65,10 +59,14 @@ bitflags! {
     }
 }
 
-pub fn sys_pidfd_open(pid: u32, flags: u32) -> AxResult<isize> {
+pub fn sys_pidfd_open(pid: i32, flags: u32) -> AxResult<isize> {
     debug!("sys_pidfd_open <= pid: {pid}, flags: {flags}");
 
     let flags = PidFdFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
+    if pid <= 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let pid = pid as u32;
 
     let fd = if flags.contains(PidFdFlags::THREAD) {
         PidFd::new_thread(get_visible_task(pid)?.as_thread())

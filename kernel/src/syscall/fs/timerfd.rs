@@ -4,7 +4,7 @@ use axerrno::{AxError, AxResult};
 use bitflags::bitflags;
 use linux_raw_sys::general::{
     CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, TFD_CLOEXEC, TFD_NONBLOCK, TFD_TIMER_ABSTIME,
-    itimerspec, timespec,
+    TFD_TIMER_CANCEL_ON_SET, itimerspec, timespec,
 };
 use starry_vm::{VmMutPtr, VmPtr};
 
@@ -66,7 +66,7 @@ pub fn sys_timerfd_settime(
     debug!("sys_timerfd_settime <= fd: {fd}, flags: {flags}");
 
     let flags = flags as u32;
-    if flags & !TFD_TIMER_ABSTIME != 0 {
+    if flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET) != 0 {
         return Err(AxError::InvalidInput);
     }
     let absolute = (flags & TFD_TIMER_ABSTIME) != 0;

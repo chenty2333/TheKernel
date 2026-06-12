@@ -13,9 +13,6 @@ use crate::{
 
 pub fn sys_fanotify_init(flags: u32, event_f_flags: u32) -> AxResult<isize> {
     validate_init_flags(flags, event_f_flags)?;
-    if flags & FAN_REPORT_PIDFD != 0 {
-        return Err(AxError::InvalidInput);
-    }
 
     add_file_like(
         FanotifyFile::new(flags, event_f_flags),

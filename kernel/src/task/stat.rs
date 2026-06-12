@@ -1,7 +1,8 @@
 use alloc::{borrow::ToOwned, format, string::String};
 
-use axerrno::AxResult;
+use axerrno::{AxError, AxResult};
 use axtask::{AxTaskRef, TaskState};
+use starry_process::Process;
 use starry_signal::Signo;
 
 use crate::task::{AsThread, ProcStateHint, TaskUsage};
@@ -67,6 +68,31 @@ pub fn render_task_stat(task: &AxTaskRef) -> AxResult<String> {
     let child_usage = proc_data.children_usage();
     let exit_signal = proc.exit_signal().unwrap_or(Signo::SIGCHLD as u8);
     let exit_code = proc.exit_code();
+
+    Ok(format!(
+        "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 0 0 0 0 0 0 {} {} {} {} 20 0 \
+         {num_threads} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {exit_signal} 0 0 0 0 0 0 0 0 0 0 0 \
+         {exit_code}\n",
+        self_usage.utime_ticks(),
+        self_usage.stime_ticks(),
+        child_usage.utime_ticks(),
+        child_usage.stime_ticks(),
+    ))
+}
+
+pub fn render_zombie_stat(process: &Process) -> AxResult<String> {
+    let snapshot = process.zombie_snapshot().ok_or(AxError::NoSuchProcess)?;
+    let pid = process.pid();
+    let comm = "zombie";
+    let state = 'Z';
+    let ppid = process.parent().map_or(0, |parent| parent.pid());
+    let pgrp = process.group().pgid();
+    let session = process.group().session().sid();
+    let num_threads = 1;
+    let self_usage: TaskUsage = snapshot.self_usage.into();
+    let child_usage: TaskUsage = snapshot.child_usage.into();
+    let exit_signal = process.exit_signal().unwrap_or(Signo::SIGCHLD as u8);
+    let exit_code = snapshot.wait_status;
 
     Ok(format!(
         "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 0 0 0 0 0 0 {} {} {} {} 20 0 \

@@ -103,8 +103,10 @@ pub fn sys_mincore(addr: usize, length: usize, vec: *mut u8) -> AxResult<isize> 
                     (true, size as _)
                 }
                 Err(_) => {
-                    // Page is mapped but not populated.
-                    (false, PAGE_SIZE_4K)
+                    // Linux also reports a file-backed page as resident when
+                    // it is already in the shared file cache but this address
+                    // space has not installed a PTE for it yet.
+                    (area.backend().cached_page_resident(addr), PAGE_SIZE_4K)
                 }
             };
             let n = size / PAGE_SIZE_4K;
