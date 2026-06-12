@@ -31,15 +31,6 @@ No LTP replay, campaign run, promotion, or score harvest is claimed here.
   `semtimedop_time64`, effective-credential permissions, `SEM_INFO` and
   `SEM_STAT_ANY` index consistency, `/proc/sysvipc/sem`,
   `/proc/sys/kernel/sem`, `/proc/sys/kernel/sem_next_id`.
-- POSIX mqueue: `mq_open`, `mq_unlink`, `mq_timedsend`,
-  `mq_timedreceive`, `mq_notify`, `mq_getsetattr`, `SIGEV_THREAD`
-  notification cookies over AF_NETLINK.
-- Linux AIO: `io_setup`, `io_destroy`, `io_submit`, `io_cancel`,
-  `io_getevents`, `io_pgetevents`, context-capacity `EAGAIN`,
-  zero-request context validation, partial-submit completion retention,
-  no-consume `io_getevents` copy-fault handling, timeout validation, iocb
-  field/rw-flag validation, `io_pgetevents` sigset wrapper validation,
-  `/proc/sys/fs/aio-*`.
 - Direct file I/O: open-time `O_DIRECT` status propagation and shared
   512-byte logical-sector buffer/count/offset alignment checks across read/write,
   pread/pwrite, readv/writev, preadv/pwritev, and AIO-backed paths; cached/direct
