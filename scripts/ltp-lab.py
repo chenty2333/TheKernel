@@ -1412,6 +1412,7 @@ RUN_CASE_RE = re.compile(r"^RUN LTP CASE (.+)$")
 END_CASE_RE = re.compile(r"^FAIL LTP CASE (.+?) : (-?\d+)$")
 CASE_TIMEOUT_RE = re.compile(r"^#### OSCOMP RUNNER LTP CASE TIMEOUT (.+?) AFTER (\d+)s ####$")
 CASE_DURATION_RE = re.compile(r"^#### OSCOMP RUNNER LTP CASE DURATION (.+?) ([0-9.]+)s ####$")
+RUNNER_TIMEOUT_RE = re.compile(r"^#### OSCOMP RUNNER (?:GLOBAL )?TIMEOUT .+ ####$")
 SUMMARY_COUNT_RE = re.compile(r"^(passed|failed|broken|skipped|warnings)\s+(\d+)\s*$")
 
 
@@ -1489,7 +1490,7 @@ def parse_log_text(text: str, arch: str = "") -> dict[str, Any]:
             current_case = None
             current_group = None
             continue
-        if "QEMU timed out" in line or "timed out after" in line or "TIMEOUT" in line:
+        if "QEMU timed out" in line or "timed out after" in line or CASE_TIMEOUT_RE.match(line) or RUNNER_TIMEOUT_RE.match(line):
             global_timeout = True
             if current_case:
                 current_case["timed_out"] = True
