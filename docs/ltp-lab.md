@@ -162,11 +162,13 @@ semantics, and local kernel paths to inspect. Then inspect testcase sources,
 Linux reference code, and local kernel code, and implement shared kernel
 behavior before spending time on full replay.
 
-Use `implementation.md` to record changed files, implemented semantics,
-testcase/Linux cross-checks, expected candidate coverage, and deferred
-validation groups. Before replay, use `taxonomy.md` as the static semantic map
-for unresolved buckets. Do not add or remove candidates inside a campaign after
-implementation starts; create another campaign for the next batch.
+Use `implementation.md` as a concise semantic ledger: changed files,
+implemented behavior, testcase/Linux cross-checks, expected candidate coverage,
+promotion evidence, and residual risks. Do not put command logs, repeated
+build-check notes, or `Cheap Checks Recorded`-style sections there. Before
+replay, use `taxonomy.md` as the static semantic map for unresolved buckets. Do
+not add or remove candidates inside a campaign after implementation starts;
+create another campaign for the next batch.
 
 Cheap compiler checks and tiny crash probes are fine during this phase.
 Repeated small pre-fix matrices should not be the main loop.
