@@ -1249,3 +1249,7 @@ semop02 semop02
 shmget03 shmget03
 shmget05 shmget05
 shmget06 shmget06
+mq_timedreceive01 mq_timedreceive01
+mq_timedsend01 mq_timedsend01
+semop05 semop05
+shmctl04 shmctl04
