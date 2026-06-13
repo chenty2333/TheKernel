@@ -77,6 +77,9 @@ pub struct Thread {
     /// Indicates whether the thread is currently accessing user memory.
     accessing_user_memory: AtomicBool,
 
+    /// Whether this thread currently owns the leaked active-scope read guard.
+    active_scope_read_held: AtomicBool,
+
     /// Syscall restart bookkeeping shared across normal execution and signal handlers.
     pub(in crate::task) restart: SpinNoIrq<RestartTracker>,
 
@@ -99,6 +102,7 @@ impl Thread {
             exit: Arc::new(AtomicBool::new(false)),
             oom_score_adj: AtomicI32::new(200),
             accessing_user_memory: AtomicBool::new(false),
+            active_scope_read_held: AtomicBool::new(false),
             restart: SpinNoIrq::new(RestartTracker::default()),
             exit_event: Arc::default(),
         })
@@ -129,21 +133,14 @@ impl Thread {
     /// can mutate its process scope, then restores the active scope binding.
     pub fn with_mut_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
         ActiveScope::set_global();
-        // SAFETY: on_enter() permanently holds one read lock for the currently
-        // running task; release it here so we can take the matching write lock.
-        unsafe { self.proc_data.scope.force_read_decrement() };
+        self.release_active_scope_read();
 
         let result = {
             let mut scope = self.proc_data.scope.write();
             f(&mut scope)
         };
 
-        let scope = self.proc_data.scope.read();
-        // SAFETY: rebind the task-local active scope to the freshly updated
-        // process scope and intentionally keep the read guard alive until
-        // on_leave() forcefully decrements it.
-        unsafe { ActiveScope::set(&scope) };
-        core::mem::forget(scope);
+        self.acquire_active_scope_read();
 
         result
     }
@@ -236,6 +233,28 @@ impl Thread {
         let (utime, stime) = time.output();
         self.store_usage_snapshot(TaskUsage::from_time_values(utime, stime));
     }
+
+    fn acquire_active_scope_read(&self) {
+        let already_held = self.active_scope_read_held.swap(true, Ordering::AcqRel);
+        let scope = self.proc_data.scope.read();
+        // SAFETY: bind the task-local active scope to this process scope. When
+        // this is a fresh acquire, keep the read guard alive until the matching
+        // release forcefully decrements it. If a scheduler edge calls enter
+        // twice, the existing leaked guard keeps the pointer valid and this
+        // temporary guard is dropped normally.
+        unsafe { ActiveScope::set(&scope) };
+        if !already_held {
+            core::mem::forget(scope);
+        }
+    }
+
+    fn release_active_scope_read(&self) {
+        if self.active_scope_read_held.swap(false, Ordering::AcqRel) {
+            // SAFETY: guarded by active_scope_read_held, which is set only
+            // after acquire_active_scope_read leaks exactly one read guard.
+            unsafe { self.proc_data.scope.force_read_decrement() };
+        }
+    }
 }
 
 #[repr(u8)]
@@ -260,16 +279,14 @@ impl From<u8> for ProcStateHint {
 #[extern_trait]
 impl TaskExt for Box<Thread> {
     fn on_enter(&self, _task: &TaskInner) {
-        let scope = self.proc_data.scope.read();
-        unsafe { ActiveScope::set(&scope) };
-        core::mem::forget(scope);
+        self.acquire_active_scope_read();
         self.resume_cpu_accounting_after_switch();
     }
 
     fn on_leave(&self, task: &TaskInner) {
         self.pause_cpu_accounting_for_switch(task);
         ActiveScope::set_global();
-        unsafe { self.proc_data.scope.force_read_decrement() };
+        self.release_active_scope_read();
     }
 }
 
