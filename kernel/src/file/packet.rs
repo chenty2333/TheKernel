@@ -1,22 +1,30 @@
 use alloc::borrow::Cow;
 use core::{
     ffi::c_int,
+    mem::size_of,
     sync::atomic::{AtomicBool, Ordering},
     task::Context,
 };
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axpoll::{IoEvents, Pollable};
-use linux_raw_sys::general::S_IFSOCK;
+use linux_raw_sys::{
+    general::S_IFSOCK,
+    ioctl::{SIOCGIFFLAGS, SIOCGIFINDEX, SIOCSIFFLAGS, SIOCSIFMTU},
+    net::{ifreq, net_device_flags, sockaddr, socklen_t},
+};
 use memory_addr::PAGE_SIZE_4K;
 use spin::Mutex;
 
 use super::{FileHandle, FileLike, Kstat, get_typed_file};
+use crate::mm::{UserConstPtr, UserPtr};
 
 pub const SOL_PACKET: u32 = 263;
 pub const PACKET_RX_RING: u32 = 5;
 pub const PACKET_VERSION: u32 = 10;
 pub const PACKET_RESERVE: u32 = 12;
+pub const PACKET_VNET_HDR: u32 = 15;
+pub const PACKET_FANOUT: u32 = 18;
 
 const TPACKET_V1: i32 = 0;
 const TPACKET_V2: i32 = 1;
@@ -27,6 +35,18 @@ const TPACKET2_HDRLEN: u32 = 52;
 const TPACKET3_HDRLEN: u32 = 68;
 const TPACKET3_BLOCK_HDRLEN: u64 = 48;
 const TPACKET3_PRIV_ALIGNMENT: u64 = 8;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockAddrLl {
+    sll_family: u16,
+    sll_protocol: u16,
+    sll_ifindex: i32,
+    sll_hatype: u16,
+    sll_pkttype: u8,
+    sll_halen: u8,
+    sll_addr: [u8; 8],
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -80,8 +100,11 @@ fn align_u64(value: u64, alignment: u64) -> Option<u64> {
 }
 
 struct PacketSocketState {
+    ifindex: i32,
     version: i32,
     reserve: u32,
+    vnet_hdr: bool,
+    fanout: Option<u32>,
     rx_ring: Option<TpacketReq3>,
 }
 
@@ -97,8 +120,11 @@ impl PacketSocket {
             protocol,
             nonblocking: AtomicBool::new(false),
             state: Mutex::new(PacketSocketState {
+                ifindex: 0,
                 version: TPACKET_V1,
                 reserve: 0,
+                vnet_hdr: false,
+                fanout: None,
                 rx_ring: None,
             }),
         }
@@ -141,6 +167,42 @@ impl PacketSocket {
 
     pub fn packet_reserve(&self) -> u32 {
         self.state.lock().reserve
+    }
+
+    pub fn set_vnet_hdr(&self, enabled: bool) {
+        self.state.lock().vnet_hdr = enabled;
+    }
+
+    pub fn set_fanout(&self, value: u32) {
+        self.state.lock().fanout = Some(value);
+    }
+
+    pub fn bind_raw(&self, addr: UserConstPtr<sockaddr>, addrlen: socklen_t) -> AxResult<()> {
+        if addrlen as usize != size_of::<SockAddrLl>() {
+            return Err(AxError::InvalidInput);
+        }
+        let addr = addr.cast::<SockAddrLl>().get_as_ref()?;
+        let mut state = self.state.lock();
+        state.ifindex = addr.sll_ifindex;
+        Ok(())
+    }
+
+    pub fn send_raw(
+        &self,
+        len: usize,
+        addr: UserConstPtr<sockaddr>,
+        addrlen: socklen_t,
+    ) -> AxResult<usize> {
+        if !addr.is_null() {
+            if addrlen as usize != size_of::<SockAddrLl>() {
+                return Err(AxError::InvalidInput);
+            }
+            let addr = addr.cast::<SockAddrLl>().get_as_ref()?;
+            if addr.sll_ifindex < 0 {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        Ok(len)
     }
 
     pub fn set_rx_ring(&self, req: TpacketReq3) -> AxResult<()> {
@@ -222,6 +284,10 @@ impl FileLike for PacketSocket {
         self.nonblocking.store(nonblocking, Ordering::Relaxed);
         Ok(())
     }
+
+    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+        socket_ifreq_ioctl(cmd, arg)
+    }
 }
 
 impl Pollable for PacketSocket {
@@ -230,4 +296,23 @@ impl Pollable for PacketSocket {
     }
 
     fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+}
+
+pub fn socket_ifreq_ioctl(cmd: u32, arg: usize) -> AxResult<usize> {
+    let ifr = UserPtr::<ifreq>::from(arg).get_as_mut()?;
+    match cmd {
+        SIOCGIFINDEX => {
+            ifr.ifr_ifru.ifru_ivalue = 1;
+            Ok(0)
+        }
+        SIOCGIFFLAGS => {
+            ifr.ifr_ifru.ifru_flags = (net_device_flags::IFF_UP as u32
+                | net_device_flags::IFF_LOOPBACK as u32
+                | net_device_flags::IFF_RUNNING as u32)
+                as i16;
+            Ok(0)
+        }
+        SIOCSIFFLAGS | SIOCSIFMTU => Ok(0),
+        _ => Err(AxError::from(LinuxError::ENOTTY)),
+    }
 }

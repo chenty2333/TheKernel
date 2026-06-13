@@ -18,7 +18,7 @@ use starry_vm::{vm_read_slice, vm_write_slice};
 
 use super::addr::SocketAddrExt;
 use crate::{
-    file::{AfAlgSocket, FileLike, NetlinkSocket, Socket, add_file_description},
+    file::{AfAlgSocket, FileLike, NetlinkSocket, PacketSocket, Socket, add_file_description},
     mm::{
         IoVec, IoVectorBuf, UserConstPtr, UserPtr, VmBytes, VmBytesMut, check_user_readable,
         check_user_writable,
@@ -88,6 +88,14 @@ fn send_impl(
         debug!("sys_send <= fd: {fd}, flags: {flags}, netlink");
         validate_sendmsg_flags(flags)?;
         return socket.write(&mut src).map(|sent| sent as isize);
+    }
+
+    if let Ok(socket) = PacketSocket::from_fd(fd) {
+        debug!("sys_send <= fd: {fd}, flags: {flags}, packet");
+        validate_sendmsg_flags(flags)?;
+        return socket
+            .send_raw(src.remaining(), addr, addrlen)
+            .map(|sent| sent as isize);
     }
 
     let addr = if addr.is_null() || addrlen == 0 {

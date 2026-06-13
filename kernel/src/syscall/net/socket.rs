@@ -129,7 +129,7 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     }
 
     if domain == AF_PACKET {
-        if ty != SOCK_RAW {
+        if !matches!(ty, SOCK_RAW | SOCK_DGRAM) {
             return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
         }
         let socket = PacketSocket::new(u16::from_be(proto as u16));
@@ -229,6 +229,10 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
         };
         socket.bind(port_id, addr.nl_groups)?;
         return Ok(0);
+    }
+
+    if let Ok(socket) = PacketSocket::from_fd(fd) {
+        return socket.bind_raw(addr, addrlen).map(|_| 0);
     }
 
     let socket = Socket::from_fd(fd)?;

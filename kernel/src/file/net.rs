@@ -12,7 +12,7 @@ use linux_raw_sys::general::S_IFSOCK;
 use super::{File, FileHandle, FileLike, Kstat};
 use crate::{
     bpf::{prog::BpfProgram, vm::BpfVm},
-    file::{IoDst, IoSrc, get_file_like, get_typed_file},
+    file::{IoDst, IoSrc, get_file_like, get_typed_file, packet::socket_ifreq_ioctl},
 };
 
 struct AttachedSocketFilter {
@@ -78,6 +78,10 @@ impl FileLike for Socket {
     fn set_nonblocking(&self, nonblocking: bool) -> AxResult<()> {
         self.0
             .set_option(SetSocketOption::NonBlocking(&nonblocking))
+    }
+
+    fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
+        socket_ifreq_ioctl(cmd, arg)
     }
 
     fn path(&self) -> Cow<'_, str> {

@@ -13,7 +13,8 @@ use crate::{
     file::{
         AfAlgSocket, FileLike, NetlinkSocket, PacketSocket, Socket, af_alg, get_file_like,
         packet::{
-            PACKET_RESERVE, PACKET_RX_RING, PACKET_VERSION, SOL_PACKET, TpacketReq, TpacketReq3,
+            PACKET_FANOUT, PACKET_RESERVE, PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR,
+            SOL_PACKET, TpacketReq, TpacketReq3,
         },
     },
     mm::{UserConstPtr, UserPtr},
@@ -461,6 +462,14 @@ pub fn sys_setsockopt(
             PACKET_RESERVE => {
                 let reserve = *get::<u32>(optval, optlen)?;
                 socket.set_packet_reserve(reserve)?;
+            }
+            PACKET_VNET_HDR => {
+                let enabled = *get::<i32>(optval, optlen)? != 0;
+                socket.set_vnet_hdr(enabled);
+            }
+            PACKET_FANOUT => {
+                let value = *get::<u32>(optval, optlen)?;
+                socket.set_fanout(value);
             }
             _ => return Err(AxError::from(LinuxError::ENOPROTOOPT)),
         }
