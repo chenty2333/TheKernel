@@ -1291,3 +1291,4 @@ sched_stress sched_stress.sh
 cve-2017-12193 add_key04
 cve-2017-15274 add_key02
 qmm01 mmap001 -m 1
+timerfd_settime02 timerfd_settime02
