@@ -213,7 +213,7 @@ No LTP replay, campaign run, promotion, or score harvest is claimed here.
 ### Networking
 
 - Socket options and packet socket state: `setsockopt`, `getsockopt`,
-  `SO_NO_CHECK`, unsupported TCP ULP, `PACKET_VERSION`, `PACKET_RX_RING`,
+  `SO_NO_CHECK`, `PACKET_VERSION`, `PACKET_RX_RING`,
   `PACKET_RESERVE`, malformed `IPT_SO_SET_REPLACE`.
 - Socket creation and protocol aliases: `socket`, `socketpair`, `accept4`,
   `SOCK_CLOEXEC`, `SOCK_NONBLOCK`, `IPPROTO_SCTP`, `IPPROTO_UDPLITE`,

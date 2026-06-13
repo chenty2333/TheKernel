@@ -1165,7 +1165,7 @@ fn validate_splice_endpoint(fd: c_int, input: bool) -> AxResult<()> {
     }
 
     if let Some(socket) = file_like.downcast_ref::<Socket>() {
-        if matches!(&socket.0, axnet::Socket::Unix(unix) if !unix.is_connected()) {
+        if matches!(&socket.inner, axnet::Socket::Unix(unix) if !unix.is_connected()) {
             return Err(AxError::InvalidInput);
         }
         return Ok(());

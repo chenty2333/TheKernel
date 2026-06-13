@@ -44,10 +44,10 @@ fn socket_timeout_configured(fd: i32, direction: SocketIoDirection) -> bool {
     let mut timeout = Duration::ZERO;
     let result = match direction {
         SocketIoDirection::Read => socket
-            .0
+            .inner
             .get_option(GetSocketOption::ReceiveTimeout(&mut timeout)),
         SocketIoDirection::Write => socket
-            .0
+            .inner
             .get_option(GetSocketOption::SendTimeout(&mut timeout)),
     };
     result.is_ok() && timeout != Duration::ZERO

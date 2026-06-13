@@ -195,7 +195,7 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
             return Err(AxError::from(LinuxError::EAFNOSUPPORT));
         }
     };
-    let socket = Socket(socket);
+    let socket = Socket::new(socket);
 
     if nonblocking {
         socket.set_nonblocking(true)?;
@@ -315,7 +315,7 @@ pub fn sys_accept4(
     }
 
     let socket = Socket::from_fd(fd)?;
-    let socket = Socket(socket.accept()?);
+    let socket = Socket::new(socket.accept()?);
     if nonblocking {
         socket.set_nonblocking(true)?;
     }
@@ -380,8 +380,8 @@ pub fn sys_socketpair(
             return Err(AxError::InvalidInput);
         }
     };
-    let sock1 = Socket(SocketInner::Unix(sock1));
-    let sock2 = Socket(SocketInner::Unix(sock2));
+    let sock1 = Socket::new(SocketInner::Unix(sock1));
+    let sock2 = Socket::new(SocketInner::Unix(sock2));
 
     if nonblocking {
         sock1.set_nonblocking(true)?;

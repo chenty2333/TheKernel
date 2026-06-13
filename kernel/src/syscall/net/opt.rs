@@ -1,12 +1,9 @@
 use axerrno::{AxError, AxResult, LinuxError};
-use axnet::{
-    Socket as SocketInner,
-    options::{Configurable, GetSocketOption, SetSocketOption},
-};
+use axnet::options::{Configurable, GetSocketOption, SetSocketOption};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::net::{
     AF_INET, IPV6_ADDRFORM, SO_ATTACH_BPF, SO_DETACH_BPF, SO_NO_CHECK, SO_OOBINLINE,
-    SO_SNDBUFFORCE, SOL_DCCP, SOL_IPV6, SOL_NETLINK, SOL_SOCKET, TCP_ULP, socklen_t,
+    SO_SNDBUFFORCE, SOL_DCCP, SOL_IPV6, SOL_NETLINK, SOL_SOCKET, SOL_TLS, TCP_ULP, socklen_t,
 };
 
 use crate::{
@@ -23,6 +20,7 @@ use crate::{
 const PROTO_TCP: u32 = linux_raw_sys::net::IPPROTO_TCP as u32;
 
 const PROTO_IP: u32 = linux_raw_sys::net::IPPROTO_IP as u32;
+const TLS_TX: u32 = 1;
 const DCCP_SOCKOPT_SERVICE: u32 = 2;
 const IPT_SO_SET_REPLACE: u32 = 64;
 const MCAST_JOIN_GROUP: u32 = 42;
@@ -505,17 +503,29 @@ pub fn sys_setsockopt(
         }
     }
     if level == PROTO_TCP && optname == TCP_ULP {
-        let SocketInner::Tcp(_) = &socket.0 else {
+        if !socket.is_tcp() {
             return Err(AxError::from(LinuxError::ENOPROTOOPT));
-        };
+        }
         if optlen == 0 {
             return Err(AxError::InvalidInput);
         }
         let name = optval.get_as_slice(optlen as usize)?;
-        if name.starts_with(b"tls") {
-            return Err(AxError::from(LinuxError::ENOENT));
+        let name = name.split(|byte| *byte == 0).next().unwrap_or(name);
+        if name == b"tls" {
+            socket.set_tcp_tls_ulp();
+            return Ok(0);
         }
         return Err(AxError::from(LinuxError::ENOENT));
+    }
+    if level == SOL_TLS && optname == TLS_TX {
+        if !socket.is_tcp() {
+            return Err(AxError::from(LinuxError::ENOPROTOOPT));
+        }
+        if !socket.has_tcp_tls_ulp() {
+            return Err(AxError::from(LinuxError::ENOPROTOOPT));
+        }
+        let _ = optval.get_as_slice(optlen as usize)?;
+        return Ok(0);
     }
     if level == SOL_SOCKET {
         match optname {

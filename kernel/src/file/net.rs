@@ -8,6 +8,7 @@ use axnet::{
 };
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::general::S_IFSOCK;
+use spin::Mutex;
 
 use super::{File, FileHandle, FileLike, Kstat};
 use crate::{
@@ -32,21 +33,55 @@ impl axnet::SocketFilter for AttachedSocketFilter {
     }
 }
 
-pub struct Socket(pub SocketInner);
+#[derive(Default)]
+struct SocketCompatState {
+    tcp_tls_ulp: bool,
+}
+
+pub struct Socket {
+    pub inner: SocketInner,
+    compat: Mutex<SocketCompatState>,
+}
 
 impl Deref for Socket {
     type Target = SocketInner;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
 impl Socket {
+    pub fn new(inner: SocketInner) -> Self {
+        Self {
+            inner,
+            compat: Mutex::new(SocketCompatState::default()),
+        }
+    }
+
     pub fn set_bpf_filter(&self, prog: Option<Arc<BpfProgram>>) -> AxResult<()> {
         let filter = prog
             .map(|prog| Arc::new(AttachedSocketFilter { prog }) as Arc<dyn axnet::SocketFilter>);
-        self.0.set_filter(filter)
+        self.inner.set_filter(filter)
+    }
+
+    pub fn is_tcp(&self) -> bool {
+        matches!(&self.inner, SocketInner::Tcp(_))
+    }
+
+    pub fn set_tcp_tls_ulp(&self) {
+        self.compat.lock().tcp_tls_ulp = true;
+    }
+
+    pub fn has_tcp_tls_ulp(&self) -> bool {
+        self.compat.lock().tcp_tls_ulp
+    }
+
+    pub fn listen(&self) -> AxResult<()> {
+        if self.has_tcp_tls_ulp() {
+            return Err(AxError::InvalidInput);
+        }
+        self.inner.listen()
     }
 }
 
@@ -76,7 +111,7 @@ impl FileLike for Socket {
     }
 
     fn set_nonblocking(&self, nonblocking: bool) -> AxResult<()> {
-        self.0
+        self.inner
             .set_option(SetSocketOption::NonBlocking(&nonblocking))
     }
 
@@ -109,10 +144,10 @@ impl FileLike for Socket {
 }
 impl Pollable for Socket {
     fn poll(&self) -> IoEvents {
-        self.0.poll()
+        self.inner.poll()
     }
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        self.0.register(context, events);
+        self.inner.register(context, events);
     }
 }
