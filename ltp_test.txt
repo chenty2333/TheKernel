@@ -1286,3 +1286,5 @@ pipeio_5 pipeio -T pipeio_5 -c 5 -s 5000 -i 10 -b -f x80
 pipeio_6 pipeio -T pipeio_6 -c 5 -s 5000 -i 10 -b -u -f x80
 pipeio_8 pipeio -T pipeio_8 -c 5 -s 5000 -i 10 -u -f x80
 semctl01 semctl01
+sched_cli_serv run_sched_cliserv.sh
+sched_stress sched_stress.sh
