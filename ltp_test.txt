@@ -1255,3 +1255,6 @@ semop05 semop05
 shmctl04 shmctl04
 cve-2023-0461 setsockopt10
 setsockopt10 setsockopt10
+mm01 mmap001 -m 10000
+mm02 mmap001
+mtest06_2 mmap2 -a -p
