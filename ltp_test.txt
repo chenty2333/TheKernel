@@ -1288,3 +1288,5 @@ pipeio_8 pipeio -T pipeio_8 -c 5 -s 5000 -i 10 -u -f x80
 semctl01 semctl01
 sched_cli_serv run_sched_cliserv.sh
 sched_stress sched_stress.sh
+cve-2017-12193 add_key04
+cve-2017-15274 add_key02
