@@ -339,31 +339,28 @@ fn exchange_rename_entries(
     Err(AxError::AlreadyExists)
 }
 
-fn path_from_root(mut loc: Location, root: &Location) -> AxResult<String> {
-    let mut components: Vec<String> = Vec::new();
-    loop {
-        if loc.ptr_eq(root) {
-            if components.is_empty() {
-                return Ok("/".to_string());
-            }
-
-            let mut path = String::from("/");
-            for (index, component) in components.iter().rev().enumerate() {
-                if index > 0 {
-                    path.push('/');
-                }
-                path.push_str(component.as_str());
-            }
-            return Ok(path);
-        }
-
-        let name = loc.name().to_string();
-        let Some(parent) = loc.parent() else {
-            return Err(AxError::NotFound);
-        };
-        components.push(name);
-        loc = parent;
+fn path_from_root(loc: Location, root: &Location) -> AxResult<String> {
+    if loc.ptr_eq(root) {
+        return Ok("/".to_string());
     }
+
+    let loc_path = loc.absolute_path()?.to_string();
+    if root.is_root() {
+        return Ok(loc_path);
+    }
+
+    let root_path = root.absolute_path()?.to_string();
+    if loc_path == root_path {
+        return Ok("/".to_string());
+    }
+
+    let prefix = if root_path == "/" {
+        "/".to_string()
+    } else {
+        format!("{root_path}/")
+    };
+    let rest = loc_path.strip_prefix(&prefix).ok_or(AxError::NotFound)?;
+    Ok(format!("/{rest}"))
 }
 
 /// The ioctl() system call manipulates the underlying device parameters
