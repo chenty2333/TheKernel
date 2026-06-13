@@ -1258,3 +1258,6 @@ setsockopt10 setsockopt10
 mm01 mmap001 -m 10000
 mm02 mmap001
 mtest06_2 mmap2 -a -p
+ioctl03 ioctl03
+pidfd_getfd01 pidfd_getfd01
+pidfd_send_signal03 pidfd_send_signal03
