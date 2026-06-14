@@ -291,6 +291,20 @@ impl NetlinkSocket {
         }))
     }
 
+    pub fn recv_from(
+        &self,
+        dst: &mut IoDst,
+        flags: RecvFlags,
+        addr: UserPtr<sockaddr>,
+        addrlen: Option<&mut socklen_t>,
+    ) -> AxResult<usize> {
+        let recv = self.recv(dst, flags)?;
+        if let Some(addrlen) = addrlen {
+            write_netlink_kernel_addr(addr, addrlen)?;
+        }
+        Ok(recv)
+    }
+
     fn handle_write(&self, data: &[u8]) -> AxResult {
         if self.protocol != NETLINK_ROUTE {
             return Ok(());
@@ -496,6 +510,7 @@ impl NetlinkSocket {
         } else {
             None
         };
+        let port_id = self.state.lock().port_id;
         let state = ROUTE_NETLINK_STATE.lock();
         for entry in builtin_addresses()
             .into_iter()
@@ -507,9 +522,9 @@ impl NetlinkSocket {
             {
                 continue;
             }
-            self.enqueue_kernel(address_message(hdr, &entry));
+            self.enqueue_kernel(address_message(hdr, port_id, &entry));
         }
-        self.enqueue_kernel(done_message(hdr));
+        self.enqueue_kernel(done_message(hdr, port_id));
         Ok(())
     }
 
@@ -519,6 +534,7 @@ impl NetlinkSocket {
         } else {
             None
         };
+        let port_id = self.state.lock().port_id;
         let state = ROUTE_NETLINK_STATE.lock();
         for entry in &state.routes {
             if let Some(filter) = filter
@@ -527,9 +543,9 @@ impl NetlinkSocket {
             {
                 continue;
             }
-            self.enqueue_kernel(route_message(hdr, entry));
+            self.enqueue_kernel(route_message(hdr, port_id, entry));
         }
-        self.enqueue_kernel(done_message(hdr));
+        self.enqueue_kernel(done_message(hdr, port_id));
         Ok(())
     }
 
@@ -539,6 +555,7 @@ impl NetlinkSocket {
         } else {
             None
         };
+        let port_id = self.state.lock().port_id;
         let state = ROUTE_NETLINK_STATE.lock();
         for link in builtin_links()
             .into_iter()
@@ -550,9 +567,9 @@ impl NetlinkSocket {
             {
                 continue;
             }
-            self.enqueue_kernel(link_message(hdr, &link));
+            self.enqueue_kernel(link_message(hdr, port_id, &link));
         }
-        self.enqueue_kernel(done_message(hdr));
+        self.enqueue_kernel(done_message(hdr, port_id));
         Ok(())
     }
 }
@@ -683,20 +700,25 @@ fn netlink_ack(request: &NlMsgHdr, port_id: u32, error: i32) -> Vec<u8> {
     out
 }
 
-fn done_message(request: &NlMsgHdr) -> Vec<u8> {
+fn done_message(request: &NlMsgHdr, port_id: u32) -> Vec<u8> {
     let mut out = vec![0; size_of::<NlMsgHdr>()];
     let hdr = NlMsgHdr {
         nlmsg_len: out.len() as u32,
         nlmsg_type: NLMSG_DONE,
         nlmsg_flags: NLM_F_MULTI,
         nlmsg_seq: request.nlmsg_seq,
-        nlmsg_pid: 0,
+        nlmsg_pid: port_id,
     };
     write_struct(&mut out, &hdr);
     out
 }
 
-fn netlink_message(request: &NlMsgHdr, msg_type: u16, mut payload: Vec<u8>) -> Vec<u8> {
+fn netlink_message(
+    request: &NlMsgHdr,
+    port_id: u32,
+    msg_type: u16,
+    mut payload: Vec<u8>,
+) -> Vec<u8> {
     let header_len = size_of::<NlMsgHdr>();
     let mut out = vec![0; header_len];
     out.append(&mut payload);
@@ -705,7 +727,7 @@ fn netlink_message(request: &NlMsgHdr, msg_type: u16, mut payload: Vec<u8>) -> V
         nlmsg_type: msg_type,
         nlmsg_flags: NLM_F_MULTI,
         nlmsg_seq: request.nlmsg_seq,
-        nlmsg_pid: 0,
+        nlmsg_pid: port_id,
     };
     write_struct(&mut out[..header_len], &hdr);
     out
@@ -742,7 +764,7 @@ fn push_attr_string(out: &mut Vec<u8>, attr_type: u16, value: &str) {
     push_attr(out, attr_type, &bytes);
 }
 
-fn address_message(request: &NlMsgHdr, entry: &AddressEntry) -> Vec<u8> {
+fn address_message(request: &NlMsgHdr, port_id: u32, entry: &AddressEntry) -> Vec<u8> {
     let mut payload = payload_with(&IfAddrMsg {
         ifa_family: entry.family,
         ifa_prefixlen: entry.prefix_len,
@@ -759,10 +781,10 @@ fn address_message(request: &NlMsgHdr, entry: &AddressEntry) -> Vec<u8> {
     if !entry.label.is_empty() {
         push_attr_string(&mut payload, IFA_LABEL, &entry.label);
     }
-    netlink_message(request, RTM_NEWADDR, payload)
+    netlink_message(request, port_id, RTM_NEWADDR, payload)
 }
 
-fn route_message(request: &NlMsgHdr, entry: &RouteEntry) -> Vec<u8> {
+fn route_message(request: &NlMsgHdr, port_id: u32, entry: &RouteEntry) -> Vec<u8> {
     let mut payload = payload_with(&RtMsg {
         rtm_family: entry.family,
         rtm_dst_len: entry.dst_len,
@@ -783,10 +805,10 @@ fn route_message(request: &NlMsgHdr, entry: &RouteEntry) -> Vec<u8> {
     if let Some(oif) = entry.oif {
         push_attr_u32(&mut payload, RTA_OIF, oif);
     }
-    netlink_message(request, RTM_NEWROUTE, payload)
+    netlink_message(request, port_id, RTM_NEWROUTE, payload)
 }
 
-fn link_message(request: &NlMsgHdr, entry: &LinkEntry) -> Vec<u8> {
+fn link_message(request: &NlMsgHdr, port_id: u32, entry: &LinkEntry) -> Vec<u8> {
     let mut payload = payload_with(&IfInfoMsg {
         ifi_family: AF_UNSPEC as u8,
         ifi_pad: 0,
@@ -800,7 +822,30 @@ fn link_message(request: &NlMsgHdr, entry: &LinkEntry) -> Vec<u8> {
     if !entry.hwaddr.is_empty() {
         push_attr(&mut payload, IFLA_ADDRESS, &entry.hwaddr);
     }
-    netlink_message(request, RTM_NEWLINK, payload)
+    netlink_message(request, port_id, RTM_NEWLINK, payload)
+}
+
+fn write_netlink_kernel_addr(addr: UserPtr<sockaddr>, addrlen: &mut socklen_t) -> AxResult {
+    let nl = SockaddrNl {
+        nl_family: AF_NETLINK as _,
+        nl_pad: 0,
+        nl_pid: 0,
+        nl_groups: 0,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&nl as *const SockaddrNl).cast::<u8>(),
+            size_of::<SockaddrNl>(),
+        )
+    };
+    let copy_len = (*addrlen as usize).min(bytes.len());
+    if copy_len != 0 {
+        addr.cast::<u8>()
+            .get_as_mut_slice(copy_len)?
+            .copy_from_slice(&bytes[..copy_len]);
+    }
+    *addrlen = bytes.len() as _;
+    Ok(())
 }
 
 fn builtin_links() -> Vec<LinkEntry> {

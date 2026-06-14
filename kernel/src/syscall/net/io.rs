@@ -179,10 +179,7 @@ fn recv_impl(
     debug!("sys_recv <= fd: {fd}, flags: {recv_flags:?}");
 
     if let Ok(socket) = NetlinkSocket::from_fd(fd) {
-        let recv = socket.recv(&mut dst, recv_flags)?;
-        if let Some(addrlen) = addrlen {
-            *addrlen = 0;
-        }
+        let recv = socket.recv_from(&mut dst, recv_flags, addr, addrlen)?;
         debug!("sys_recv => fd: {fd}, netlink recv: {recv}");
         return Ok(recv as isize);
     }

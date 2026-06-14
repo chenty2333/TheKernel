@@ -406,6 +406,7 @@ fn task_status(task: &AxTaskRef) -> String {
         Pid:\t{}\n\
         Uid:\t0 0 0 0\n\
         Gid:\t0 0 0 0\n\
+        VmData:\t0 kB\n\
         VmLck:\t{} kB\n\
         VmSwap:\t0 kB\n\
         NoNewPrivs:\t{}\n\
@@ -1613,6 +1614,19 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         data.iter().all(|byte| byte.is_ascii_whitespace())
     }
 
+    fn proc_net_dev_snapshot() -> String {
+        concat!(
+            "Inter-|   Receive                                                |  Transmit\n",
+            " face |bytes    packets errs drop fifo frame compressed multicast|",
+            "bytes    packets errs drop fifo colls carrier compressed\n",
+            "    lo:       0       0    0    0    0     0          0         0 ",
+            "       0       0    0    0    0     0       0          0\n",
+            "  eth0:       0       0    0    0    0     0          0         0 ",
+            "       0       0    0    0    0     0       0          0\n",
+        )
+        .to_string()
+    }
+
     fn proc_uts_write_value(data: &[u8]) -> Option<&[u8]> {
         if is_proc_truncate_write(data) {
             return None;
@@ -1789,6 +1803,14 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         "cmdline",
         SimpleFile::new_regular(fs.clone(), || Ok("console=ttyS0\n")),
     );
+    root.add("net", {
+        let mut net = DirMapping::new();
+        net.add(
+            "dev",
+            SimpleFile::new_regular(fs.clone(), || Ok(proc_net_dev_snapshot())),
+        );
+        SimpleDir::new_maker(fs.clone(), Arc::new(net))
+    });
 
     root.add("sys", {
         let mut sys = DirMapping::new();

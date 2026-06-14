@@ -2525,6 +2525,16 @@ run_pre2025_init_sequence() {
     if [ ! -s /etc/resolv.conf ]; then
         write_file_lines /etc/resolv.conf "nameserver 8.8.8.8"
     fi
+    if [ ! -s /etc/hosts ]; then
+        write_file_lines /etc/hosts \
+            "127.0.0.1 localhost" \
+            "::1 localhost ip6-localhost ip6-loopback"
+    fi
+    if [ ! -s /etc/services ]; then
+        write_file_lines /etc/services \
+            "echo 7/tcp" \
+            "echo 7/udp"
+    fi
 
     clear_dir_contents /var/tmp
     clear_dir_contents /tmp

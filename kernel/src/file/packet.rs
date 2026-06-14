@@ -1,7 +1,8 @@
 use alloc::borrow::Cow;
 use core::{
     ffi::c_int,
-    mem::size_of,
+    mem::{size_of, zeroed},
+    ptr,
     sync::atomic::{AtomicBool, Ordering},
     task::Context,
 };
@@ -10,8 +11,8 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::{
     general::S_IFSOCK,
-    ioctl::{SIOCGIFFLAGS, SIOCGIFINDEX, SIOCSIFFLAGS, SIOCSIFMTU},
-    net::{ifreq, net_device_flags, sockaddr, socklen_t},
+    ioctl::{SIOCGIFCONF, SIOCGIFFLAGS, SIOCGIFINDEX, SIOCGIFNAME, SIOCSIFFLAGS, SIOCSIFMTU},
+    net::{AF_INET, ifconf, ifreq, in_addr, net_device_flags, sockaddr, sockaddr_in, socklen_t},
 };
 use memory_addr::PAGE_SIZE_4K;
 use spin::Mutex;
@@ -35,6 +36,9 @@ const TPACKET2_HDRLEN: u32 = 52;
 const TPACKET3_HDRLEN: u32 = 68;
 const TPACKET3_BLOCK_HDRLEN: u64 = 48;
 const TPACKET3_PRIV_ALIGNMENT: u64 = 8;
+
+const IFCONF_INTERFACES: &[(&[u8], [u8; 4])] =
+    &[(b"lo", [127, 0, 0, 1]), (b"eth0", [10, 0, 2, 15])];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -298,11 +302,106 @@ impl Pollable for PacketSocket {
     fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
 }
 
+fn ifreq_name_eq(ifr: &ifreq, name: &[u8]) -> bool {
+    let raw_name = unsafe { ifr.ifr_ifrn.ifrn_name };
+    let len = raw_name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(raw_name.len());
+    len == name.len()
+        && raw_name[..len]
+            .iter()
+            .zip(name)
+            .all(|(left, right)| *left as u8 == *right)
+}
+
+fn ifreq_index(ifr: &ifreq) -> Option<i32> {
+    if ifreq_name_eq(ifr, b"lo") {
+        Some(1)
+    } else if ifreq_name_eq(ifr, b"eth0") {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+fn ifreq_index_name(index: i32) -> Option<&'static [u8]> {
+    match index {
+        1 => Some(b"lo"),
+        2 => Some(b"eth0"),
+        _ => None,
+    }
+}
+
+fn write_ifreq_name(ifr: &mut ifreq, name: &[u8]) {
+    let raw_name = unsafe { &mut ifr.ifr_ifrn.ifrn_name };
+    for byte in raw_name.iter_mut() {
+        *byte = 0;
+    }
+    let max_len = raw_name.len().saturating_sub(1);
+    for (dst, src) in raw_name.iter_mut().zip(name.iter().copied()).take(max_len) {
+        *dst = src as _;
+    }
+}
+
+fn make_ifconf_ifreq(name: &[u8], ipv4: [u8; 4]) -> ifreq {
+    let mut ifr = unsafe { zeroed::<ifreq>() };
+    write_ifreq_name(&mut ifr, name);
+
+    let addr = sockaddr_in {
+        sin_family: AF_INET as _,
+        sin_port: 0,
+        sin_addr: in_addr {
+            s_addr: u32::from_be_bytes(ipv4).to_be(),
+        },
+        __pad: [0; 8],
+    };
+    unsafe {
+        ptr::write(
+            (&mut ifr.ifr_ifru.ifru_addr as *mut sockaddr).cast::<sockaddr_in>(),
+            addr,
+        );
+    }
+
+    ifr
+}
+
+fn socket_ifconf_ioctl(arg: usize) -> AxResult<usize> {
+    let ifc = UserPtr::<ifconf>::from(arg).get_as_mut()?;
+    let entry_size = size_of::<ifreq>();
+    let requested_len = ifc.ifc_len.max(0) as usize;
+    let buf = unsafe { ifc.ifc_ifcu.ifcu_req };
+
+    let written_len = if buf.is_null() {
+        IFCONF_INTERFACES.len() * entry_size
+    } else {
+        let count = (requested_len / entry_size).min(IFCONF_INTERFACES.len());
+        let dst = UserPtr::<ifreq>::from(buf as usize).get_as_mut_slice(count)?;
+        for (slot, (name, ipv4)) in dst.iter_mut().zip(IFCONF_INTERFACES.iter().copied()) {
+            *slot = make_ifconf_ifreq(name, ipv4);
+        }
+        count * entry_size
+    };
+    ifc.ifc_len = written_len as c_int;
+    Ok(0)
+}
+
 pub fn socket_ifreq_ioctl(cmd: u32, arg: usize) -> AxResult<usize> {
+    if cmd == SIOCGIFCONF {
+        return socket_ifconf_ioctl(arg);
+    }
+
     let ifr = UserPtr::<ifreq>::from(arg).get_as_mut()?;
     match cmd {
         SIOCGIFINDEX => {
-            ifr.ifr_ifru.ifru_ivalue = 1;
+            ifr.ifr_ifru.ifru_ivalue =
+                ifreq_index(ifr).ok_or_else(|| AxError::from(LinuxError::ENODEV))?;
+            Ok(0)
+        }
+        SIOCGIFNAME => {
+            let index = unsafe { ifr.ifr_ifru.ifru_ivalue };
+            let name = ifreq_index_name(index).ok_or_else(|| AxError::from(LinuxError::ENODEV))?;
+            write_ifreq_name(ifr, name);
             Ok(0)
         }
         SIOCGIFFLAGS => {
