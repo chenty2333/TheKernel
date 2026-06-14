@@ -18,7 +18,7 @@ use axfs_ng_vfs::{
     FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission, NodeType,
     Reference, StatFs, VfsError, VfsResult, WeakDirEntry, path::MAX_NAME_LEN,
 };
-use axhal::time::wall_time;
+use axhal::{mem::total_ram_size, time::wall_time};
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
 use hashbrown::HashMap;
@@ -27,7 +27,16 @@ use slab::Slab;
 
 const TMPFS_BLOCK_SIZE: u64 = PAGE_SIZE_4K as u64;
 const STAT_BLOCK_UNIT: u64 = 512;
-const DEFAULT_TMPFS_STAT_BYTES: u64 = 1024 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
+const DEFAULT_TMPFS_MIN_BYTES: u64 = 16 * MIB;
+const DEFAULT_TMPFS_MAX_BYTES: u64 = 256 * MIB;
+
+fn default_tmpfs_capacity_bytes() -> u64 {
+    let ram = total_ram_size() as u64;
+    let max = DEFAULT_TMPFS_MAX_BYTES.min(ram.max(TMPFS_BLOCK_SIZE));
+    let min = DEFAULT_TMPFS_MIN_BYTES.min(max);
+    (ram / 4).max(min).min(max)
+}
 
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct FileName(String);
@@ -99,10 +108,11 @@ impl MemoryFs {
         permission: NodePermission,
         capacity_bytes: Option<u64>,
     ) -> Filesystem {
+        let capacity_bytes = capacity_bytes.unwrap_or_else(default_tmpfs_capacity_bytes);
         let fs = Arc::new(Self {
             inodes: Mutex::new(Slab::new()),
             root: Mutex::default(),
-            capacity_pages: capacity_bytes.map(|bytes| bytes.div_ceil(TMPFS_BLOCK_SIZE)),
+            capacity_pages: Some(capacity_bytes.div_ceil(TMPFS_BLOCK_SIZE)),
             allocated_pages: Mutex::new(0),
         });
         let root_ino = Inode::new(&fs, None, NodeType::Directory, permission);
@@ -166,7 +176,7 @@ impl FilesystemOps for MemoryFs {
         let allocated = *self.allocated_pages.lock();
         let total = self
             .capacity_pages
-            .unwrap_or(DEFAULT_TMPFS_STAT_BYTES / TMPFS_BLOCK_SIZE)
+            .unwrap_or_else(|| default_tmpfs_capacity_bytes() / TMPFS_BLOCK_SIZE)
             .max(allocated);
         let free = total.saturating_sub(allocated);
         Ok(StatFs {
