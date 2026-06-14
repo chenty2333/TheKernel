@@ -52,6 +52,7 @@ impl<T: FileNodeOps> From<Arc<T>> for NodeOpsMux {
 }
 
 const DIR_PERMISSION: NodePermission = NodePermission::from_bits_truncate(0o755);
+const VAR_TMP_CAPACITY_BYTES: u64 = 512 * 1024 * 1024;
 
 fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> LinuxResult<()> {
     if fs.resolve(path).is_err() {
@@ -95,7 +96,10 @@ pub fn mount_all() -> LinuxResult<()> {
     mount_at(
         &fs,
         "/var/tmp",
-        tmp::MemoryFs::new_with_permission(tmp_permission),
+        tmp::MemoryFs::new_with_permission_and_capacity(
+            tmp_permission,
+            Some(VAR_TMP_CAPACITY_BYTES),
+        ),
     )?;
     mount_at(&fs, "/proc", proc::new_procfs())?;
 
