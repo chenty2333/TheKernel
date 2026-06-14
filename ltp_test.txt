@@ -1297,3 +1297,4 @@ timerfd_settime02 timerfd_settime02
 semget05 semget05
 semop03 semop03
 semop04 semop04
+sysctl01_sh sysctl01.sh
