@@ -1272,8 +1272,10 @@ overcommit_memory06 overcommit_memory -R 200
 page01 page01
 page02 page02
 shmt02 shmt02
+shmt03 shmt03
 shmt04 shmt04
 shmt05 shmt05
+shmt06 shmt06
 shmt07 shmt07
 shmt08 shmt08
 shmt10 shmt10

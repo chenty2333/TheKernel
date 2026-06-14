@@ -440,6 +440,30 @@ impl AddrSpace {
         self.areas.find(vaddr)
     }
 
+    pub fn brk_growth_collides(&self, start: VirtAddr, end: VirtAddr, heap_base: VirtAddr) -> bool {
+        if start >= end {
+            return false;
+        }
+
+        for area in self.areas.iter() {
+            if area.end() <= start {
+                continue;
+            }
+            if area.start() >= end {
+                break;
+            }
+
+            let is_heap_area = area.start() == heap_base
+                && area.backend().is_private_anonymous()
+                && area.flags().contains(MappingFlags::USER);
+            if !is_heap_area {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Add a new linear mapping.
     ///
     /// See [`Backend`] for more details about the mapping backends.

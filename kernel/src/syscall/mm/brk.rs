@@ -1,7 +1,7 @@
 use axerrno::AxResult;
 use axhal::paging::{MappingFlags, PageSize};
 use axtask::current;
-use memory_addr::{VirtAddr, align_up_4k};
+use memory_addr::{PAGE_SIZE_4K, VirtAddr, align_up_4k};
 
 use super::mmap::check_mmap_memlock_limit;
 use crate::{
@@ -41,6 +41,15 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
             }
 
             let mut aspace = aspace_handle.lock();
+            let collision_end = new_top_aligned.saturating_add(PAGE_SIZE_4K);
+            if aspace.brk_growth_collides(
+                current_top_aligned.into(),
+                collision_end.into(),
+                USER_HEAP_BASE.into(),
+            ) {
+                return Ok(current_top as isize);
+            }
+
             let locked = aspace.locks_future_mappings();
             if locked
                 && check_mmap_memlock_limit(proc_data, &aspace, expand_start, expand_size).is_err()
