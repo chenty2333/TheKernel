@@ -24,8 +24,8 @@ use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use crate::{
     task::{
-        AlarmClock, AsThread, ProcStateHint, get_process_group, get_task, processes,
-        sleep_until_clock, with_proc_state_hint,
+        AlarmClock, AsThread, ProcStateHint, get_process_group, get_task,
+        has_pending_syscall_signal, processes, sleep_until_clock, with_proc_state_hint,
     },
     time::TimeValueLike,
 };
@@ -48,6 +48,7 @@ const SCHED_RR_TIMESLICE_MS_DEFAULT: u32 = {
     if ms == 0 { 1 } else { ms as u32 }
 };
 static SCHED_RR_TIMESLICE_MS: AtomicU32 = AtomicU32::new(SCHED_RR_TIMESLICE_MS_DEFAULT);
+const SHORT_RELATIVE_SLEEP_LIMIT: Duration = Duration::from_micros(1000);
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -455,6 +456,17 @@ pub fn sys_sched_yield() -> AxResult<isize> {
 
 fn sleep_relative(dur: TimeValue) -> TimeValue {
     debug!("sleep_impl <= {dur:?}");
+
+    if dur.is_zero() {
+        return dur;
+    }
+    if dur < SHORT_RELATIVE_SLEEP_LIMIT {
+        let curr = current();
+        if has_pending_syscall_signal(curr.as_thread()) {
+            return Duration::ZERO;
+        }
+        return dur;
+    }
 
     let start = AlarmClock::Monotonic.now();
     let deadline = start.checked_add(dur).unwrap_or(Duration::MAX);

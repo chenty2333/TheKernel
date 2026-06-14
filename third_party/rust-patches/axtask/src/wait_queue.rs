@@ -3,7 +3,7 @@ use core::time::Duration;
 use axhal::time::wall_time;
 use event_listener::{Event, listener};
 
-use crate::future::{block_on, timeout_at};
+use crate::future::{Interrupted, block_on, interruptible, timeout_at};
 
 /// A queue to store sleeping tasks.
 ///
@@ -76,6 +76,26 @@ impl WaitQueue {
         });
     }
 
+    /// Blocks the current task until the given `condition` becomes true, or
+    /// the task is interrupted.
+    pub fn wait_until_interruptible<F>(&self, mut condition: F) -> Result<(), Interrupted>
+    where
+        F: FnMut() -> bool,
+    {
+        block_on(interruptible(async {
+            loop {
+                if condition() {
+                    break;
+                }
+                listener!(self.event => listener);
+                if condition() {
+                    break;
+                }
+                listener.await;
+            }
+        }))
+    }
+
     /// Blocks the current task and put it into the wait queue, until other tasks
     /// notify it, or the given duration has elapsed.
     pub fn wait_timeout(&self, dur: Duration) -> bool {
@@ -105,6 +125,9 @@ impl WaitQueue {
                     return true;
                 }
                 listener!(self.event => listener);
+                if condition() {
+                    return false;
+                }
                 let _ = timeout_at(Some(deadline), listener).await;
             }
         })

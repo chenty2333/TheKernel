@@ -29,10 +29,11 @@ const IPC_MODE_MASK: c_ushort = 0o777;
 const IPC_NOWAIT: i16 = 0o4000;
 const SEM_UNDO: i16 = 0x1000;
 const SEM_UNSUPPORTED_FLAGS: i16 = !(IPC_NOWAIT | SEM_UNDO);
-const SEM_WAIT_SLICE: Duration = Duration::from_millis(10);
+const SEM_TIMED_WAIT_SLICE: Duration = Duration::from_millis(100);
 
-pub const SEMMNI: usize = 32000;
 pub const SEMMSL: usize = 32000;
+pub const SEMMNI: usize = 128;
+pub const SEMMNS: usize = SEMMSL * SEMMNI;
 pub const SEMOPM: usize = 500;
 pub const SEMVMX: usize = 32767;
 const SEMAEM: usize = SEMVMX;
@@ -42,6 +43,7 @@ const SEMUSZ: usize = 20;
 static SEM_MANAGER: Mutex<SemManager> = Mutex::new(SemManager::new());
 static SEM_MNI_LIMIT: AtomicUsize = AtomicUsize::new(SEMMNI);
 static SEM_MSL_LIMIT: AtomicUsize = AtomicUsize::new(SEMMSL);
+static SEM_MNS_LIMIT: AtomicUsize = AtomicUsize::new(SEMMNS);
 static SEM_OPM_LIMIT: AtomicUsize = AtomicUsize::new(SEMOPM);
 static SEM_NEXT_ID: AtomicI32 = AtomicI32::new(-1);
 
@@ -109,7 +111,7 @@ impl SemInfo {
     fn ipc_info() -> Self {
         let semmni = semmni_limit().min(c_int::MAX as usize) as c_int;
         let semmsl = semmsl_limit().min(c_int::MAX as usize) as c_int;
-        let semmns = semmni.saturating_mul(semmsl);
+        let semmns = semmns_limit().min(c_int::MAX as usize) as c_int;
         Self {
             semmap: semmns,
             semmni,
@@ -299,6 +301,10 @@ pub(crate) fn semmsl_limit() -> usize {
     SEM_MSL_LIMIT.load(Ordering::Relaxed)
 }
 
+pub(crate) fn semmns_limit() -> usize {
+    SEM_MNS_LIMIT.load(Ordering::Relaxed)
+}
+
 pub(crate) fn semopm_limit() -> usize {
     SEM_OPM_LIMIT.load(Ordering::Relaxed)
 }
@@ -306,16 +312,17 @@ pub(crate) fn semopm_limit() -> usize {
 pub(crate) fn set_sem_limits(semmsl: usize, semmns: usize, semopm: usize, semmni: usize) {
     let semmni = semmni.max(1);
     let semmsl = semmsl.max(1);
-    let derived_msl = (semmns / semmni).max(1);
+    let semmns = semmns.max(1);
     SEM_MNI_LIMIT.store(semmni, Ordering::Relaxed);
-    SEM_MSL_LIMIT.store(semmsl.min(derived_msl).max(1), Ordering::Relaxed);
+    SEM_MSL_LIMIT.store(semmsl, Ordering::Relaxed);
+    SEM_MNS_LIMIT.store(semmns, Ordering::Relaxed);
     SEM_OPM_LIMIT.store(semopm.max(1), Ordering::Relaxed);
 }
 
 pub(crate) fn sem_limits_string() -> String {
     let semmsl = semmsl_limit();
     let semmni = semmni_limit();
-    let semmns = semmsl.saturating_mul(semmni);
+    let semmns = semmns_limit();
     alloc::format!("{} {} {} {}\n", semmsl, semmns, semopm_limit(), semmni)
 }
 
@@ -388,6 +395,12 @@ fn copy_sem_values_from_user(ptr: usize, nsems: usize) -> AxResult<Vec<u16>> {
     vm_load(ptr as *const u16, nsems).map_err(Into::into)
 }
 
+fn notify_sem_waiters(waiters: Arc<axtask::WaitQueue>) {
+    if waiters.notify_many(usize::MAX, false) > 0 {
+        axtask::yield_now();
+    }
+}
+
 fn validate_semnum(array: &SemArray, semnum: i32) -> AxResult<usize> {
     if semnum < 0 || semnum as usize >= array.nsems() {
         Err(AxError::from(LinuxError::EINVAL))
@@ -436,6 +449,9 @@ pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
     }
     if nsems <= 0 || nsems as usize > semmsl_limit() {
         return Err(AxError::from(LinuxError::EINVAL));
+    }
+    if manager.total_semaphores().saturating_add(nsems as usize) > semmns_limit() {
+        return Err(AxError::from(LinuxError::ENOSPC));
     }
     if manager.active_array_count() >= semmni_limit() {
         return Err(AxError::from(LinuxError::ENOSPC));
@@ -524,9 +540,10 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
             }
             array.removed = true;
             array.mark_changed();
-            array.waiters.notify_all(false);
+            let waiters = array.waiters.clone();
             drop(array);
             SEM_MANAGER.lock().remove_semid(semid);
+            notify_sem_waiters(waiters);
             Ok(0)
         }
         GETVAL => {
@@ -579,7 +596,9 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
             array.sems[index].value = value as u16;
             array.sems[index].pid = pid;
             array.mark_changed();
-            array.waiters.notify_all(false);
+            let waiters = array.waiters.clone();
+            drop(array);
+            notify_sem_waiters(waiters);
             Ok(0)
         }
         SETALL => {
@@ -596,7 +615,9 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
                 sem.pid = pid;
             }
             array.mark_changed();
-            array.waiters.notify_all(false);
+            let waiters = array.waiters.clone();
+            drop(array);
+            notify_sem_waiters(waiters);
             Ok(0)
         }
         _ => Err(AxError::from(LinuxError::EINVAL)),
@@ -605,7 +626,61 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
 
 enum SemTryResult {
     Ready,
-    WouldBlock { sem_num: usize, wait_zero: bool },
+    WouldBlock {
+        sem_num: usize,
+        wait_zero: bool,
+        needed_value: u16,
+    },
+}
+
+fn try_apply_single_semop(
+    array: &mut SemArray,
+    op: Sembuf,
+    pid: __kernel_pid_t,
+) -> AxResult<SemTryResult> {
+    let index = op.sem_num as usize;
+    if index >= array.sems.len() {
+        return Err(AxError::from(LinuxError::EFBIG));
+    }
+    if op.sem_flg & SEM_UNSUPPORTED_FLAGS != 0 {
+        return Err(AxError::from(LinuxError::EINVAL));
+    }
+
+    let sem = &mut array.sems[index];
+    let value = sem.value as i32;
+    match op.sem_op {
+        op if op > 0 => {
+            let new_value = value + op as i32;
+            if new_value > SEMVMX as i32 {
+                return Err(AxError::from(LinuxError::ERANGE));
+            }
+            sem.value = new_value as u16;
+        }
+        op if op < 0 => {
+            let delta = -(op as i32);
+            if value < delta {
+                return Ok(SemTryResult::WouldBlock {
+                    sem_num: index,
+                    wait_zero: false,
+                    needed_value: delta as u16,
+                });
+            }
+            sem.value = (value - delta) as u16;
+        }
+        _ => {
+            if value != 0 {
+                return Ok(SemTryResult::WouldBlock {
+                    sem_num: index,
+                    wait_zero: true,
+                    needed_value: 0,
+                });
+            }
+        }
+    }
+
+    sem.pid = pid;
+    array.semid_ds.sem_otime = ipc_time_secs();
+    Ok(SemTryResult::Ready)
 }
 
 fn try_apply_semops(
@@ -613,6 +688,10 @@ fn try_apply_semops(
     ops: &[Sembuf],
     pid: __kernel_pid_t,
 ) -> AxResult<SemTryResult> {
+    if let [op] = ops {
+        return try_apply_single_semop(array, *op, pid);
+    }
+
     let mut values = array.sems.iter().map(|sem| sem.value).collect::<Vec<_>>();
     for op in ops {
         let index = op.sem_num as usize;
@@ -637,6 +716,7 @@ fn try_apply_semops(
                     return Ok(SemTryResult::WouldBlock {
                         sem_num: index,
                         wait_zero: false,
+                        needed_value: delta as u16,
                     });
                 }
                 values[index] = (value - delta) as u16;
@@ -646,6 +726,7 @@ fn try_apply_semops(
                     return Ok(SemTryResult::WouldBlock {
                         sem_num: index,
                         wait_zero: true,
+                        needed_value: 0,
                     });
                 }
             }
@@ -695,37 +776,82 @@ fn add_wait_count(
     guard
 }
 
+fn deadline_elapsed(deadline: Option<Duration>) -> bool {
+    deadline.is_some_and(|deadline| wall_time_duration() >= deadline)
+}
+
+fn sem_wait_ready(
+    array: &Arc<Mutex<SemArray>>,
+    sem_num: usize,
+    wait_zero: bool,
+    needed_value: u16,
+) -> AxResult<bool> {
+    let array = array.lock();
+    if array.removed {
+        return Err(AxError::from(LinuxError::EIDRM));
+    }
+    let Some(sem) = array.sems.get(sem_num) else {
+        return Ok(true);
+    };
+    Ok(if wait_zero {
+        sem.value == 0
+    } else {
+        sem.value >= needed_value
+    })
+}
+
 fn wait_for_sem(
     waiters: Arc<axtask::WaitQueue>,
     deadline: Option<Duration>,
     array: &Arc<Mutex<SemArray>>,
+    sem_num: usize,
+    wait_zero: bool,
+    needed_value: u16,
 ) -> AxResult<()> {
     let current = current();
     let thread = current.as_thread();
+    if sem_wait_ready(array, sem_num, wait_zero, needed_value)? {
+        return Ok(());
+    }
     if has_pending_syscall_signal(thread) {
         return Err(AxError::Interrupted);
     }
-    if let Some(deadline) = deadline
-        && wall_time_duration() >= deadline
-    {
+    if deadline_elapsed(deadline) {
         return Err(AxError::from(LinuxError::EAGAIN));
     }
-    {
-        let array = array.lock();
-        if array.removed {
-            return Err(AxError::from(LinuxError::EIDRM));
+    if deadline.is_none() {
+        let interrupted = with_proc_state_hint(ProcStateHint::Interruptible, || {
+            waiters
+                .wait_until_interruptible(|| {
+                    sem_wait_ready(array, sem_num, wait_zero, needed_value).unwrap_or(true)
+                        || has_pending_syscall_signal(thread)
+                })
+                .is_err()
+        });
+        if interrupted || has_pending_syscall_signal(thread) {
+            return Err(AxError::Interrupted);
         }
+        sem_wait_ready(array, sem_num, wait_zero, needed_value)?;
+        return Ok(());
     }
+
     let sleep_for = deadline
         .map(|deadline| {
             deadline
                 .saturating_sub(wall_time_duration())
-                .min(SEM_WAIT_SLICE)
+                .min(SEM_TIMED_WAIT_SLICE)
         })
-        .unwrap_or(SEM_WAIT_SLICE);
+        .unwrap_or(SEM_TIMED_WAIT_SLICE);
     with_proc_state_hint(ProcStateHint::Interruptible, || {
-        waiters.wait_timeout(sleep_for);
+        waiters.wait_timeout_until(sleep_for, || {
+            sem_wait_ready(array, sem_num, wait_zero, needed_value).unwrap_or(true)
+                || has_pending_syscall_signal(thread)
+                || deadline_elapsed(deadline)
+        });
     });
+    if sem_wait_ready(array, sem_num, wait_zero, needed_value)? {
+        return Ok(());
+    }
     Ok(())
 }
 
@@ -785,26 +911,32 @@ pub fn sys_semtimedop(
 
             match try_apply_semops(&mut array, &ops, current_pid)? {
                 SemTryResult::Ready => {
-                    array.waiters.notify_all(false);
+                    let waiters = array.waiters.clone();
+                    drop(array);
+                    notify_sem_waiters(waiters);
                     break;
                 }
-                SemTryResult::WouldBlock { sem_num, wait_zero } => {
+                SemTryResult::WouldBlock {
+                    sem_num,
+                    wait_zero,
+                    needed_value,
+                } => {
                     if op_has_nowait(&ops) {
                         return Err(AxError::from(LinuxError::EAGAIN));
                     }
-                    (array.waiters.clone(), sem_num, wait_zero)
+                    (array.waiters.clone(), sem_num, wait_zero, needed_value)
                 }
             }
         };
 
-        let (waiters, sem_num, wait_zero) = wait_state;
+        let (waiters, sem_num, wait_zero, needed_value) = wait_state;
         let key = (sem_num, wait_zero);
         if wait_key != Some(key) {
             drop(wait_guard.take());
             wait_guard = Some(add_wait_count(&array, sem_num, wait_zero));
             wait_key = Some(key);
         }
-        wait_for_sem(waiters, deadline, &array)?;
+        wait_for_sem(waiters, deadline, &array, sem_num, wait_zero, needed_value)?;
     }
     drop(wait_guard);
     Ok(0)

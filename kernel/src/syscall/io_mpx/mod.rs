@@ -3,12 +3,12 @@ mod poll;
 mod select;
 
 use alloc::vec::Vec;
-use core::{future::pending, task::Context};
+use core::{future::pending, task::Context, time::Duration};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::uspace::UserContext;
 use axpoll::{IoEvents, Pollable};
-use axtask::{current, future};
+use axtask::{current, future, yield_now};
 use starry_signal::SignalSet;
 
 pub use self::{epoll::*, poll::*, select::*};
@@ -20,6 +20,7 @@ use crate::{
 };
 
 struct FdPollSet(pub Vec<(FileHandle<dyn FileLike>, IoEvents)>);
+const SHORT_SIGNAL_TIMEOUT: Duration = Duration::from_micros(1000);
 impl Pollable for FdPollSet {
     fn poll(&self) -> IoEvents {
         unreachable!()
@@ -111,9 +112,28 @@ fn wait_io_result(
 
 fn wait_signal_only(
     uctx: Option<&mut UserContext>,
-    timeout: Option<core::time::Duration>,
+    timeout: Option<Duration>,
     sigmask: Option<SignalSet>,
 ) -> AxResult<isize> {
+    if let Some(timeout) = timeout
+        && !timeout.is_zero()
+        && timeout < SHORT_SIGNAL_TIMEOUT
+    {
+        let mut yielded = false;
+        let mut wait_once = || {
+            if !yielded {
+                yielded = true;
+                yield_now();
+            }
+            if has_pending_syscall_signal(current().as_thread()) {
+                Ok(Err(AxError::Interrupted))
+            } else {
+                Ok(Ok(0))
+            }
+        };
+        return wait_io_result(uctx, sigmask, &mut wait_once);
+    }
+
     let deadline = timeout.map(|dur| axhal::time::wall_time().saturating_add(dur));
     let mut wait_once = || {
         future::block_on(future::timeout(
