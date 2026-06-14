@@ -1298,3 +1298,5 @@ semget05 semget05
 semop03 semop03
 semop04 semop04
 sysctl01_sh sysctl01.sh
+pth_str01 pth_str01
+pth_str02 pth_str02 -n1000
