@@ -5,16 +5,16 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 REFERENCE_PLAN_GROUPS=(
     basic
-    iozone
+    ltp
     busybox
-    netperf
     lua
-    libcbench
     libctest
+    netperf
     cyclictest
+    libcbench
+    iozone
     lmbench
     iperf
-    ltp
 )
 
 die() {
@@ -82,26 +82,26 @@ list_cmd() {
     printf '  la (loongarch64)\n'
     printf 'plan order:\n'
     printf '  /musl basic\n'
-    printf '  /musl iozone\n'
-    printf '  /musl busybox\n'
-    printf '  /musl netperf\n'
-    printf '  /musl lua\n'
-    printf '  /musl libcbench\n'
-    printf '  /musl libctest\n'
-    printf '  /musl cyclictest\n'
     printf '  /glibc basic\n'
-    printf '  /glibc iozone\n'
+    printf '  /musl ltp\n'
+    printf '  /glibc ltp\n'
+    printf '  /musl busybox\n'
     printf '  /glibc busybox\n'
-    printf '  /glibc netperf\n'
+    printf '  /musl lua\n'
     printf '  /glibc lua\n'
-    printf '  /glibc libcbench\n'
+    printf '  /musl libctest\n'
+    printf '  /musl netperf\n'
+    printf '  /glibc netperf\n'
+    printf '  /musl cyclictest\n'
     printf '  /glibc cyclictest\n'
+    printf '  /musl libcbench\n'
+    printf '  /glibc libcbench\n'
+    printf '  /musl iozone\n'
+    printf '  /glibc iozone\n'
     printf '  /musl lmbench\n'
     printf '  /glibc lmbench\n'
     printf '  /musl iperf\n'
     printf '  /glibc iperf\n'
-    printf '  /glibc ltp\n'
-    printf '  /musl ltp\n'
     printf 'groups in fixed plan:\n'
     printf '  %s\n' "${REFERENCE_PLAN_GROUPS[@]}"
 }

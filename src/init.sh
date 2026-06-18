@@ -3344,26 +3344,26 @@ reference_eval_plan() {
 
     cat <<'EOF'
 /musl basic
-/musl iozone
-/musl busybox
-/musl netperf
-/musl lua
-/musl libcbench
-/musl libctest
-/musl cyclictest
 /glibc basic
-/glibc iozone
+/musl ltp
+/glibc ltp
+/musl busybox
 /glibc busybox
-/glibc netperf
+/musl lua
 /glibc lua
-/glibc libcbench
+/musl libctest
+/musl netperf
+/glibc netperf
+/musl cyclictest
 /glibc cyclictest
+/musl libcbench
+/glibc libcbench
+/musl iozone
+/glibc iozone
 /musl lmbench
 /glibc lmbench
 /musl iperf
 /glibc iperf
-/glibc ltp
-/musl ltp
 EOF
 }
 
@@ -4205,9 +4205,28 @@ oscomp_runner_main() {
     export USER=root
     export TERM=dumb
 
-    RUNNER_GLOBAL_TIMEOUT_SECS="${OSCOMP_TIMEOUT_GLOBAL:-6900}"
     RUNNER_GLOBAL_TIMEOUT_REACHED=""
 
+    run_pre2025_init_sequence || exit 1
+
+    if [ -z "${OSCOMP_TIMEOUT_GLOBAL+x}" ]; then
+        OSCOMP_TIMEOUT_GLOBAL=840
+        export OSCOMP_TIMEOUT_GLOBAL
+    fi
+    if [ -z "${OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS+x}" ]; then
+        OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS=270
+        export OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS
+    fi
+    if [ -z "${OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS+x}" ]; then
+        OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS=270
+        export OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS
+    fi
+    if [ -z "${OSCOMP_IOZONE_CASE_FILTER+x}" ]; then
+        OSCOMP_IOZONE_CASE_FILTER=write-read,random-read
+        export OSCOMP_IOZONE_CASE_FILTER
+    fi
+
+    RUNNER_GLOBAL_TIMEOUT_SECS="${OSCOMP_TIMEOUT_GLOBAL:-6900}"
     runner_now_epoch
     RUNNER_START_EPOCH="$RUNNER_NOW_EPOCH"
     case "$RUNNER_GLOBAL_TIMEOUT_SECS:$RUNNER_START_EPOCH" in
@@ -4215,8 +4234,6 @@ oscomp_runner_main() {
             RUNNER_GLOBAL_TIMEOUT_SECS=""
             ;;
     esac
-
-    run_pre2025_init_sequence || exit 1
 
     runner_debug "#### OSCOMP RUNNER BOOTSTRAP ${OSCOMP_BOOTSTRAP:-/bin/sh} ####"
 
