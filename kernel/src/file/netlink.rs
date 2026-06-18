@@ -895,6 +895,16 @@ fn builtin_addresses() -> Vec<AddressEntry> {
             address: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
             label: "lo".to_string(),
         },
+        AddressEntry {
+            family: AF_INET as u8,
+            prefix_len: 24,
+            flags: 0x80,
+            scope: 0,
+            index: 2,
+            local: vec![10, 0, 2, 15],
+            address: vec![10, 0, 2, 15],
+            label: "eth0".to_string(),
+        },
     ]
 }
 

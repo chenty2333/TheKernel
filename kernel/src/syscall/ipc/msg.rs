@@ -59,7 +59,7 @@ pub struct msqid_ds {
 }
 
 impl msqid_ds {
-    fn new(key: i32, mode: __kernel_mode_t, pid: __kernel_pid_t, uid: u32, gid: u32) -> Self {
+    fn new(key: i32, mode: __kernel_mode_t, _pid: __kernel_pid_t, uid: u32, gid: u32) -> Self {
         let now = ipc_time_secs();
         Self {
             msg_perm: IpcPerm {
@@ -81,8 +81,8 @@ impl msqid_ds {
             msg_cbytes: 0,
             msg_qnum: 0,
             msg_qbytes: MSGMNB as __kernel_size_t,
-            msg_lspid: pid,
-            msg_lrpid: pid,
+            msg_lspid: 0,
+            msg_lrpid: 0,
         }
     }
 }

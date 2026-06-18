@@ -1870,9 +1870,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                                 return Ok(None);
                             }
                             let value = write_proc_u32(data)?;
-                            if value == 0 {
-                                return Err(VfsError::InvalidInput);
-                            }
                             lease::set_lease_break_time_secs(value);
                             Ok(None)
                         }

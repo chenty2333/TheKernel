@@ -12,7 +12,9 @@ use linux_raw_sys::{
 };
 use starry_signal::SignalSet;
 
-use super::{FdPollSet, wait_io_result, wait_signal_only};
+use super::{
+    FdPollSet, is_short_timeout, wait_io_result, wait_short_poll_timeout, wait_signal_only,
+};
 use crate::{
     file::get_file_like,
     mm::{UserConstPtr, UserPtr, nullable},
@@ -121,39 +123,47 @@ fn do_select(
     if let Some(exceptfds) = exceptfds.as_deref_mut() {
         unsafe { FD_ZERO(exceptfds) };
     }
+    let mut poll_once = || {
+        let mut res = 0usize;
+        for ((fd, interested), index) in fds.0.iter().zip(fd_indices.iter().copied()) {
+            let events = fd.poll() & *interested;
+            if events.contains(IoEvents::IN)
+                && let Some(set) = readfds.as_deref_mut()
+            {
+                res += 1;
+                unsafe { FD_SET(index as _, set) };
+            }
+            if events.contains(IoEvents::OUT)
+                && let Some(set) = writefds.as_deref_mut()
+            {
+                res += 1;
+                unsafe { FD_SET(index as _, set) };
+            }
+            if events.contains(IoEvents::ERR)
+                && let Some(set) = exceptfds.as_deref_mut()
+            {
+                res += 1;
+                unsafe { FD_SET(index as _, set) };
+            }
+        }
+        if res > 0 {
+            return Ok(res as _);
+        }
+
+        Err(AxError::WouldBlock)
+    };
+
+    if let Some(timeout) = timeout
+        && is_short_timeout(Some(timeout))
+    {
+        return wait_short_poll_timeout(uctx, sigmask.copied(), timeout, &mut poll_once);
+    }
+
     let deadline = timeout.map(|dur| axhal::time::wall_time().saturating_add(dur));
     let mut select_once = || {
         block_on(future::timeout(
             deadline.map(|end| end.saturating_sub(axhal::time::wall_time())),
-            poll_io(&fds, IoEvents::empty(), false, || {
-                let mut res = 0usize;
-                for ((fd, interested), index) in fds.0.iter().zip(fd_indices.iter().copied()) {
-                    let events = fd.poll() & *interested;
-                    if events.contains(IoEvents::IN)
-                        && let Some(set) = readfds.as_deref_mut()
-                    {
-                        res += 1;
-                        unsafe { FD_SET(index as _, set) };
-                    }
-                    if events.contains(IoEvents::OUT)
-                        && let Some(set) = writefds.as_deref_mut()
-                    {
-                        res += 1;
-                        unsafe { FD_SET(index as _, set) };
-                    }
-                    if events.contains(IoEvents::ERR)
-                        && let Some(set) = exceptfds.as_deref_mut()
-                    {
-                        res += 1;
-                        unsafe { FD_SET(index as _, set) };
-                    }
-                }
-                if res > 0 {
-                    return Ok(res as _);
-                }
-
-                Err(AxError::WouldBlock)
-            }),
+            poll_io(&fds, IoEvents::empty(), false, &mut poll_once),
         ))
     };
 

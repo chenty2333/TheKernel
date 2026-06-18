@@ -24,6 +24,8 @@ use crate::{
     task::{AlarmClock, AsThread, ProcStateHint, sleep_until_clock},
 };
 
+const SHORT_FUTEX_TIMEOUT: Duration = Duration::from_micros(2000);
+
 /// Wait queue used by futex.
 #[derive(Default)]
 pub struct WaitQueue {
@@ -307,6 +309,11 @@ impl WaitQueue {
             condition: Some(condition),
             waiter: None,
         };
+        if let Some((clock, deadline)) = timeout
+            && is_short_futex_deadline(clock, deadline)
+        {
+            return wait_short_futex(wait, clock, deadline);
+        }
         let wait = async {
             if let Some((clock, deadline)) = timeout {
                 let mut wait = core::pin::pin!(wait);
@@ -449,6 +456,38 @@ impl WaitQueue {
             waker.wake();
         }
         result
+    }
+}
+
+fn is_short_futex_deadline(clock: AlarmClock, deadline: Duration) -> bool {
+    let now = clock.now();
+    now >= deadline || deadline.saturating_sub(now) <= SHORT_FUTEX_TIMEOUT
+}
+
+fn wait_short_futex<F>(
+    wait: WaitFuture<'_, F>,
+    clock: AlarmClock,
+    deadline: Duration,
+) -> AxResult<bool>
+where
+    F: FnOnce() -> AxResult<bool>,
+{
+    let curr = current();
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let mut wait = core::pin::pin!(wait);
+
+    loop {
+        if let Poll::Ready(result) = wait.as_mut().poll(&mut cx) {
+            return result;
+        }
+        if curr.poll_interrupt(&mut cx).is_ready() {
+            return Err(AxError::Interrupted);
+        }
+        if clock.now() >= deadline {
+            return Err(AxError::TimedOut);
+        }
+        core::hint::spin_loop();
     }
 }
 

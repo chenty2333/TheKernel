@@ -951,17 +951,31 @@ group_override_enabled() {
             return 1
             ;;
         cyclictest)
-            case "${machine}:${flavor}" in
-                loongarch64:musl)
-                    if runner_truthy "${OSCOMP_DISABLE_LA_MUSL_CYCLICTEST_OVERRIDE:-0}"; then
+            case "$flavor" in
+                musl)
+                    if runner_truthy "${OSCOMP_DISABLE_MUSL_CYCLICTEST_OVERRIDE:-0}"; then
                         return 1
                     fi
+                    case "$machine" in
+                        loongarch64)
+                            if runner_truthy "${OSCOMP_DISABLE_LA_MUSL_CYCLICTEST_OVERRIDE:-0}"; then
+                                return 1
+                            fi
+                            ;;
+                    esac
                     return 0
                     ;;
-                loongarch64:glibc)
-                    if runner_truthy "${OSCOMP_DISABLE_LA_GLIBC_CYCLICTEST_OVERRIDE:-0}"; then
+                glibc)
+                    if runner_truthy "${OSCOMP_DISABLE_GLIBC_CYCLICTEST_OVERRIDE:-0}"; then
                         return 1
                     fi
+                    case "$machine" in
+                        loongarch64)
+                            if runner_truthy "${OSCOMP_DISABLE_LA_GLIBC_CYCLICTEST_OVERRIDE:-0}"; then
+                                return 1
+                            fi
+                            ;;
+                    esac
                     return 0
                     ;;
             esac
@@ -1440,11 +1454,9 @@ cyclictest_control_sleep() {
     support_sleep="${OSCOMP_SUPPORT_BIN:-/opt/oscomp-support/bin}/oscomp-sleep"
     support_default_signals="${OSCOMP_SUPPORT_BIN:-/opt/oscomp-support/bin}/oscomp-default-signals"
 
-    case "$sleep_secs" in
-        ''|0)
-            return 0
-            ;;
-    esac
+    if [ -z "$sleep_secs" ] || [ "$sleep_secs" = 0 ]; then
+        return 0
+    fi
 
     if [ -x "$support_sleep" ]; then
         if [ -x "$support_default_signals" ]; then
@@ -1479,11 +1491,9 @@ cyclictest_step_settle() {
     esac
 
     settle_secs="$(cyclictest_step_settle_secs "$settle_label")"
-    case "$settle_secs" in
-        ''|0)
-            return 0
-            ;;
-    esac
+    if [ -z "$settle_secs" ] || [ "$settle_secs" = 0 ]; then
+        return 0
+    fi
     debug_step "settle ${settle_secs}s after $settle_label"
     cyclictest_control_sleep "$settle_secs"
 }
@@ -1594,16 +1604,16 @@ prepare_cyclictest_env() {
 cyclictest_args() {
     case "$1" in
         NO_STRESS_P1)
-            echo "${OSCOMP_CYCLICTEST_ARGS_NO_STRESS_P1:--a -i 1000 -t1 -p99 -D 1s -q}"
+            echo "${OSCOMP_CYCLICTEST_ARGS_NO_STRESS_P1:--a -i 1000 -t1 -p99 -D 1s -q -r}"
             ;;
         NO_STRESS_P8)
-            echo "${OSCOMP_CYCLICTEST_ARGS_NO_STRESS_P8:--a -i 1000 -t8 -p99 -D 1s -q}"
+            echo "${OSCOMP_CYCLICTEST_ARGS_NO_STRESS_P8:--i 1000 -t8 -p99 -D 1s -q -r}"
             ;;
         STRESS_P1)
-            echo "${OSCOMP_CYCLICTEST_ARGS_STRESS_P1:--a -i 1000 -t1 -p99 -D 1s -q}"
+            echo "${OSCOMP_CYCLICTEST_ARGS_STRESS_P1:--a -i 1000 -t1 -p99 -D 1s -q -r}"
             ;;
         STRESS_P8)
-            echo "${OSCOMP_CYCLICTEST_ARGS_STRESS_P8:--a -i 1000 -t8 -p99 -D 1s -q}"
+            echo "${OSCOMP_CYCLICTEST_ARGS_STRESS_P8:--i 1000 -t8 -p99 -D 1s -q -r}"
             ;;
         *)
             return 1
@@ -1756,12 +1766,10 @@ cyclictest_control_sleep() {
 
     debug_step "sleep begin ${sleep_secs}s runtime $(cyclictest_runtime_root)"
 
-    case "$sleep_secs" in
-        ''|0)
-            debug_step "sleep end ${sleep_secs}s runtime skipped"
-            return 0
-            ;;
-    esac
+    if [ -z "$sleep_secs" ] || [ "$sleep_secs" = 0 ]; then
+        debug_step "sleep end ${sleep_secs}s runtime skipped"
+        return 0
+    fi
 
     if [ -x "$support_sleep" ]; then
         if [ -x "$support_default_signals" ]; then
@@ -1809,11 +1817,9 @@ cyclictest_true_once() {
 
 cyclictest_control_yield_rounds() {
     rounds="$1"
-    case "$rounds" in
-        ''|0)
-            return 0
-            ;;
-    esac
+    if [ -z "$rounds" ] || [ "$rounds" = 0 ]; then
+        return 0
+    fi
 
     debug_step "yield rounds ${rounds}"
     round_i=0
@@ -1837,11 +1843,9 @@ cyclictest_step_settle() {
     cyclictest_control_yield_rounds "$settle_rounds"
 
     settle_secs="$(cyclictest_step_settle_secs "$settle_label")"
-    case "$settle_secs" in
-        ''|0)
-            return 0
-            ;;
-    esac
+    if [ -z "$settle_secs" ] || [ "$settle_secs" = 0 ]; then
+        return 0
+    fi
     debug_step "settle ${settle_secs}s after $settle_label"
     cyclictest_control_sleep "$settle_secs"
 }
@@ -1922,16 +1926,16 @@ cyclictest_ld_path() {
 cyclictest_args() {
     case "$1" in
         NO_STRESS_P1)
-            echo "${OSCOMP_CYCLICTEST_ARGS_NO_STRESS_P1:--a -i 1000 -t1 -p99 -D 1s -q}"
+            echo "${OSCOMP_CYCLICTEST_ARGS_NO_STRESS_P1:--a -i 1000 -t1 -p99 -D 1s -q -r}"
             ;;
         NO_STRESS_P8)
-            echo "${OSCOMP_CYCLICTEST_ARGS_NO_STRESS_P8:--a -i 1000 -t8 -p99 -D 1s -q}"
+            echo "${OSCOMP_CYCLICTEST_ARGS_NO_STRESS_P8:--i 1000 -t8 -p99 -D 1s -q -r}"
             ;;
         STRESS_P1)
-            echo "${OSCOMP_CYCLICTEST_ARGS_STRESS_P1:--a -i 1000 -t1 -p99 -D 1s -q}"
+            echo "${OSCOMP_CYCLICTEST_ARGS_STRESS_P1:--a -i 1000 -t1 -p99 -D 1s -q -r}"
             ;;
         STRESS_P8)
-            echo "${OSCOMP_CYCLICTEST_ARGS_STRESS_P8:--a -i 1000 -t8 -p99 -D 1s -q}"
+            echo "${OSCOMP_CYCLICTEST_ARGS_STRESS_P8:--i 1000 -t8 -p99 -D 1s -q -r}"
             ;;
         *)
             return 1
@@ -2007,6 +2011,22 @@ fi
 "$MUSL_BUSYBOX" chmod +x "$TMP_SCRIPT" 2>/dev/null || chmod +x "$TMP_SCRIPT"
 OSCOMP_CYCLICTEST_BIN="${OSCOMP_CYCLICTEST_BIN:-/glibc/cyclictest}"
 export OSCOMP_CYCLICTEST_BIN
+if [ -z "${OSCOMP_CYCLICTEST_ARGS_NO_STRESS_P1+x}" ]; then
+    OSCOMP_CYCLICTEST_ARGS_NO_STRESS_P1="-a -i 1000 -t1 -p99 -D 1s -q -r"
+    export OSCOMP_CYCLICTEST_ARGS_NO_STRESS_P1
+fi
+if [ -z "${OSCOMP_CYCLICTEST_ARGS_STRESS_P1+x}" ]; then
+    OSCOMP_CYCLICTEST_ARGS_STRESS_P1="-a -i 1000 -t1 -p99 -D 1s -q -r"
+    export OSCOMP_CYCLICTEST_ARGS_STRESS_P1
+fi
+if [ -z "${OSCOMP_CYCLICTEST_ARGS_NO_STRESS_P8+x}" ]; then
+    OSCOMP_CYCLICTEST_ARGS_NO_STRESS_P8="-i 1000 -t8 -p99 -D 1s -q -r"
+    export OSCOMP_CYCLICTEST_ARGS_NO_STRESS_P8
+fi
+if [ -z "${OSCOMP_CYCLICTEST_ARGS_STRESS_P8+x}" ]; then
+    OSCOMP_CYCLICTEST_ARGS_STRESS_P8="-i 1000 -t8 -p99 -D 1s -q -r"
+    export OSCOMP_CYCLICTEST_ARGS_STRESS_P8
+fi
 "$MUSL_BUSYBOX" sh "$TMP_SCRIPT"
 status=$?
 "$MUSL_BUSYBOX" rm -f "$TMP_SCRIPT" 2>/dev/null || rm -f "$TMP_SCRIPT"
@@ -2707,12 +2727,16 @@ run_ltp_group() {
     if [ "${LTP_VIRT_OVERRIDE+x}" != "x" ]; then
         export LTP_VIRT_OVERRIDE=kvm
     fi
-    if [ "${LTP_TIMEOUT_MUL+x}" != "x" ]; then
-        case "$(runner_machine_quiet)" in
-            loongarch64)
-                export LTP_TIMEOUT_MUL=2
-                ;;
-        esac
+    if [ "$root" = /musl ]; then
+        if [ -n "${OSCOMP_MUSL_LTP_TIMEOUT_MUL:-}" ]; then
+            LTP_TIMEOUT_MUL="$OSCOMP_MUSL_LTP_TIMEOUT_MUL"
+            export LTP_TIMEOUT_MUL
+        else
+            unset LTP_TIMEOUT_MUL
+        fi
+    elif [ "${LTP_TIMEOUT_MUL+x}" != "x" ]; then
+        LTP_TIMEOUT_MUL="${OSCOMP_LTP_TIMEOUT_MUL_DEFAULT:-2}"
+        export LTP_TIMEOUT_MUL
     fi
 
     run_ltp_case_command() {
@@ -3284,7 +3308,7 @@ run_iozone_group() {
         IOZONE_NO_UNLINK_ARG="-w"
     fi
 
-    skip_auto_mode=0
+    skip_auto_mode=1
     case "${OSCOMP_IOZONE_AUTO_MODE:-}" in
         1|y|Y|yes|YES|true|TRUE|on|ON)
             skip_auto_mode=0
@@ -3293,14 +3317,9 @@ run_iozone_group() {
             skip_auto_mode=1
             ;;
         *)
-            case "$(bb uname -m 2>/dev/null || true)" in
-                loongarch64)
-                    # The online iozone judge only consumes the explicit
-                    # throughput sections below. On LA, iozone's auto sweep
-                    # can stall for minutes before reaching any scored output.
-                    skip_auto_mode=1
-                    ;;
-            esac
+            # The online iozone judge consumes the explicit throughput
+            # sections below. The auto sweep can stall for minutes before
+            # reaching any scored output, so keep it opt-in for local debug.
             ;;
     esac
 
@@ -3376,7 +3395,7 @@ group_timeout_secs() {
             GROUP_TIMEOUT_SECS=480
             ;;
         libcbench)
-            GROUP_TIMEOUT_SECS=300
+            GROUP_TIMEOUT_SECS="${OSCOMP_TIMEOUT_LIBCBENCH:-900}"
             ;;
         ltp)
             GROUP_TIMEOUT_SECS=5400
@@ -3639,11 +3658,9 @@ runner_quiesce_rounds() {
 
 runner_control_sleep() {
     sleep_secs="$1"
-    case "$sleep_secs" in
-        ''|0)
-            return 0
-            ;;
-    esac
+    if [ -z "$sleep_secs" ] || [ "$sleep_secs" = 0 ]; then
+        return 0
+    fi
 
     support_sleep="${OSCOMP_SUPPORT_BIN:-/opt/oscomp-support/bin}/oscomp-sleep"
     support_default_signals="${OSCOMP_SUPPORT_BIN:-/opt/oscomp-support/bin}/oscomp-default-signals"

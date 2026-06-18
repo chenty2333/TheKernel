@@ -97,6 +97,8 @@ struct Shared {
     poll_tx: PollSet,
     poll_close: PollSet,
     async_io: Mutex<PipeAsyncIo>,
+    readers: AtomicUsize,
+    writers: AtomicUsize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -228,6 +230,13 @@ pub struct Pipe {
 }
 impl Drop for Pipe {
     fn drop(&mut self) {
+        if self.read_side {
+            self.shared.readers.fetch_sub(1, Ordering::AcqRel);
+        } else {
+            self.shared.writers.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.shared.poll_rx.wake();
+        self.shared.poll_tx.wake();
         self.shared.poll_close.wake();
     }
 }
@@ -240,6 +249,8 @@ impl Pipe {
             poll_tx: PollSet::new(),
             poll_close: PollSet::new(),
             async_io: Mutex::new(PipeAsyncIo::default()),
+            readers: AtomicUsize::new(1),
+            writers: AtomicUsize::new(1),
         });
         let read_end = Pipe {
             read_side: true,
@@ -263,7 +274,11 @@ impl Pipe {
     }
 
     pub fn closed(&self) -> bool {
-        Arc::strong_count(&self.shared) == 1
+        if self.read_side {
+            self.shared.writers.load(Ordering::Acquire) == 0
+        } else {
+            self.shared.readers.load(Ordering::Acquire) == 0
+        }
     }
 
     pub fn capacity(&self) -> usize {

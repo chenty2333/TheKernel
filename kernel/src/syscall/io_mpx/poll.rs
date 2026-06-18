@@ -11,7 +11,9 @@ use axtask::future::{self, block_on, poll_io};
 use linux_raw_sys::general::{POLLNVAL, pollfd, timespec};
 use starry_signal::SignalSet;
 
-use super::{FdPollSet, wait_io_result, wait_signal_only};
+use super::{
+    FdPollSet, is_short_timeout, wait_io_result, wait_short_poll_timeout, wait_signal_only,
+};
 use crate::{
     file::get_file_like,
     mm::{UserConstPtr, UserPtr, nullable},
@@ -83,6 +85,13 @@ fn do_poll(
             Err(AxError::WouldBlock)
         }
     };
+
+    let timeout_duration = timeout.map(Duration::from);
+    if let Some(timeout) = timeout_duration
+        && is_short_timeout(Some(timeout))
+    {
+        return wait_short_poll_timeout(uctx, sigmask, timeout, &mut poll_once);
+    }
 
     let mut wait_once = || {
         block_on(future::timeout(

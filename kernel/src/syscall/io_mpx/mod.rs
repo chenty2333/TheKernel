@@ -6,9 +6,9 @@ use alloc::vec::Vec;
 use core::{future::pending, task::Context, time::Duration};
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axhal::uspace::UserContext;
+use axhal::{time::wall_time, uspace::UserContext};
 use axpoll::{IoEvents, Pollable};
-use axtask::{current, future, yield_now};
+use axtask::{current, future};
 use starry_signal::SignalSet;
 
 pub use self::{epoll::*, poll::*, select::*};
@@ -20,7 +20,7 @@ use crate::{
 };
 
 struct FdPollSet(pub Vec<(FileHandle<dyn FileLike>, IoEvents)>);
-const SHORT_SIGNAL_TIMEOUT: Duration = Duration::from_micros(1000);
+const SHORT_SIGNAL_TIMEOUT: Duration = Duration::from_micros(2000);
 impl Pollable for FdPollSet {
     fn poll(&self) -> IoEvents {
         unreachable!()
@@ -115,15 +115,14 @@ fn wait_signal_only(
     timeout: Option<Duration>,
     sigmask: Option<SignalSet>,
 ) -> AxResult<isize> {
-    if let Some(timeout) = timeout
-        && !timeout.is_zero()
-        && timeout < SHORT_SIGNAL_TIMEOUT
-    {
-        let mut yielded = false;
+    if is_short_timeout(timeout) {
+        let deadline = wall_time().saturating_add(timeout.unwrap());
         let mut wait_once = || {
-            if !yielded {
-                yielded = true;
-                yield_now();
+            while wall_time() < deadline {
+                if has_pending_syscall_signal(current().as_thread()) {
+                    return Ok(Err(AxError::Interrupted));
+                }
+                core::hint::spin_loop();
             }
             if has_pending_syscall_signal(current().as_thread()) {
                 Ok(Err(AxError::Interrupted))
@@ -147,5 +146,36 @@ fn wait_signal_only(
         ))
     };
 
+    wait_io_result(uctx, sigmask, &mut wait_once)
+}
+
+fn is_short_timeout(timeout: Option<Duration>) -> bool {
+    timeout.is_some_and(|timeout| !timeout.is_zero() && timeout <= SHORT_SIGNAL_TIMEOUT)
+}
+
+fn wait_short_poll_timeout(
+    uctx: Option<&mut UserContext>,
+    sigmask: Option<SignalSet>,
+    timeout: Duration,
+    mut poll_once: impl FnMut() -> AxResult<isize>,
+) -> AxResult<isize> {
+    let deadline = wall_time().saturating_add(timeout);
+    let mut wait_once = || match poll_once() {
+        Ok(res) => Ok(Ok(res)),
+        Err(AxError::WouldBlock) => {
+            while wall_time() < deadline {
+                if has_pending_syscall_signal(current().as_thread()) {
+                    return Ok(Err(AxError::Interrupted));
+                }
+                core::hint::spin_loop();
+            }
+            if has_pending_syscall_signal(current().as_thread()) {
+                Ok(Err(AxError::Interrupted))
+            } else {
+                Ok(Ok(0))
+            }
+        }
+        Err(err) => Ok(Err(err)),
+    };
     wait_io_result(uctx, sigmask, &mut wait_once)
 }

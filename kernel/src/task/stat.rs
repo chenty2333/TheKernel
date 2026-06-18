@@ -25,12 +25,14 @@ fn task_state(task: &AxTaskRef) -> char {
     }
 
     match state {
-        TaskState::Running | TaskState::Ready => 'R',
+        TaskState::Running => 'R',
+        TaskState::Ready => match thread.proc_state_hint() {
+            ProcStateHint::Interruptible => 'S',
+            ProcStateHint::Uninterruptible => 'D',
+            ProcStateHint::None => 'R',
+        },
         TaskState::Exited => 'Z',
         TaskState::Blocked => match thread.proc_state_hint() {
-            // Only publish sleep-class hints once the scheduler has actually
-            // committed the task to `Blocked`; otherwise procfs pollers like
-            // LTP can observe `S` before the waiter is truly sleeping.
             ProcStateHint::Interruptible => 'S',
             ProcStateHint::Uninterruptible => 'D',
             ProcStateHint::None => 'S',
