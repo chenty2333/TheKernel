@@ -27,7 +27,9 @@ impl CMsg {
                 }
                 let mut fds = Vec::new();
                 for fd in data.chunks_exact(size_of::<i32>()) {
-                    let fd = i32::from_ne_bytes(fd.try_into().unwrap());
+                    let fd = i32::from_ne_bytes(
+                        fd.try_into().map_err(|_| AxError::InvalidInput)?,
+                    );
                     if fd < 0 {
                         return Err(AxError::BadFileDescriptor);
                     }

@@ -312,10 +312,13 @@ fn do_execve(
 
     // Close CLOEXEC file descriptors
     let mut fd_table = FD_TABLE.write();
-    let cloexec_fds = fd_table
-        .ids()
-        .filter(|it| fd_table.get(*it).unwrap().cloexec)
-        .collect::<Vec<_>>();
+    let mut cloexec_fds = Vec::new();
+    for it in fd_table.ids() {
+        let fd = fd_table.get(it).ok_or(AxError::BadFileDescriptor)?;
+        if fd.cloexec {
+            cloexec_fds.push(it);
+        }
+    }
     for fd in cloexec_fds {
         fd_table.remove(fd);
     }

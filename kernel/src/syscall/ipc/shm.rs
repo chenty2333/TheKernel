@@ -580,7 +580,7 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
     let excl = shmflg & IPC_EXCL as usize != 0;
     let huge = shmflg & SHM_HUGETLB_FLAG != 0;
 
-    let mut mapping_flags = MappingFlags::from_name("USER").unwrap();
+    let mut mapping_flags = MappingFlags::USER;
     if perm_mode & 0o444 != 0 {
         mapping_flags.insert(MappingFlags::READ);
     }

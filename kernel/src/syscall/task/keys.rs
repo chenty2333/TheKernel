@@ -790,7 +790,8 @@ pub fn sys_request_key(
         return Err(LinuxError::EACCES.into());
     }
     if should_instantiate_request(&type_name, &description, callout.as_deref()) {
-        let payload = callout.unwrap().into_bytes();
+        let callout = callout.ok_or(AxError::InvalidInput)?;
+        let payload = callout.into_bytes();
         if payload.len() > USER_KEY_PAYLOAD_MAX {
             return Err(AxError::InvalidInput);
         }

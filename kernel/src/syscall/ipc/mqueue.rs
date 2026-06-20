@@ -655,7 +655,7 @@ pub fn sys_mq_timedreceive(
                 if msg_len < queue.msgsize {
                     return Err(AxError::from(LinuxError::EMSGSIZE));
                 }
-                let message = queue.pop_message().expect("queue is not empty");
+                let message = queue.pop_message().ok_or(AxError::InvalidInput)?;
                 let waiters = queue.waiters.clone();
                 waiters.notify_all(false);
                 drop(queue);

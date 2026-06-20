@@ -98,11 +98,19 @@ fn swap_header_pages(header: &[u8; PAGE_SIZE_4K]) -> AxResult<u64> {
         return Err(e(LinuxError::EINVAL));
     }
 
-    let version = u32::from_ne_bytes(header[1024..1028].try_into().unwrap());
+    let version = u32::from_ne_bytes(
+        header[1024..1028]
+            .try_into()
+            .map_err(|_| AxError::InvalidInput)?,
+    );
     if version != 1 {
         return Err(e(LinuxError::EINVAL));
     }
-    let last_page = u32::from_ne_bytes(header[1028..1032].try_into().unwrap()) as u64;
+    let last_page = u32::from_ne_bytes(
+        header[1028..1032]
+            .try_into()
+            .map_err(|_| AxError::InvalidInput)?,
+    ) as u64;
     if last_page == 0 {
         return Err(e(LinuxError::EINVAL));
     }

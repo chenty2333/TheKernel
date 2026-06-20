@@ -42,11 +42,13 @@ pub fn sys_pipe2(fds: *mut [c_int; 2], flags: u32) -> AxResult<isize> {
 
     let read_fd = add_file_like_with_flags(Arc::new(read_end), cloexec, read_status)?;
     let write_fd = add_file_like_with_flags(Arc::new(write_end), cloexec, write_status)
-        .inspect_err(|_| close_file_like(read_fd).unwrap())?;
+        .inspect_err(|_| {
+            let _ = close_file_like(read_fd);
+        })?;
 
     if let Err(err) = fds.vm_write([read_fd, write_fd]) {
-        close_file_like(read_fd).unwrap();
-        close_file_like(write_fd).unwrap();
+        let _ = close_file_like(read_fd);
+        let _ = close_file_like(write_fd);
         return Err(err.into());
     }
 

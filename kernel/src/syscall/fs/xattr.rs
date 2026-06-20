@@ -104,7 +104,7 @@ fn current_can_access_trusted_xattrs() -> bool {
 }
 
 fn check_namespace_access(loc: &Location, name: &str, write: bool) -> AxResult<()> {
-    let (namespace, _) = name.split_once('.').unwrap();
+    let (namespace, _) = name.split_once('.').ok_or(AxError::InvalidInput)?;
 
     match namespace {
         "trusted" if !current_can_access_trusted_xattrs() => {
@@ -344,7 +344,7 @@ fn xattr_set_by_fd(
             Ok(0)
         }
         ResolveAtResult::Other(_) => {
-            let (namespace, _) = name.split_once('.').unwrap();
+            let (namespace, _) = name.split_once('.').ok_or(AxError::InvalidInput)?;
             if namespace == "user" {
                 Err(LinuxError::EPERM.into())
             } else {

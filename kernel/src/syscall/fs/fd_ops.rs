@@ -390,7 +390,7 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
                                 .lookup_no_follow("pts")?
                                 .lookup_no_follow(&pts.pty_number().to_string())?
                         } else {
-                            panic!("unknown terminal type")
+                            return Err(LinuxError::ENODEV.into());
                         };
                         file = axfs::File::new(FileBackend::Direct(loc), file.flags());
                     }

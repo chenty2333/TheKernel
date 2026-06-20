@@ -437,7 +437,7 @@ fn seek_file_like(
             0 => SeekFrom::Start(offset as _),
             1 => SeekFrom::Current(offset as _),
             2 => SeekFrom::End(offset as _),
-            _ => unreachable!(),
+            _ => return Err(LinuxError::EINVAL.into()),
         };
         return file.inner().seek(pos).map(|off| off as isize);
     }
@@ -454,7 +454,7 @@ fn seek_file_like(
                 .len()?
                 .checked_add_signed(offset)
                 .ok_or(AxError::InvalidInput)?,
-            _ => unreachable!(),
+            _ => return Err(LinuxError::EINVAL.into()),
         };
         *current = new_pos;
         return Ok(new_pos as isize);

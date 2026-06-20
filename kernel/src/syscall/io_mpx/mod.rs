@@ -23,7 +23,7 @@ struct FdPollSet(pub Vec<(FileHandle<dyn FileLike>, IoEvents)>);
 const SHORT_SIGNAL_TIMEOUT: Duration = Duration::from_micros(2000);
 impl Pollable for FdPollSet {
     fn poll(&self) -> IoEvents {
-        unreachable!()
+        IoEvents::empty()
     }
 
     fn register(&self, context: &mut Context<'_>, _events: IoEvents) {
@@ -116,7 +116,7 @@ fn wait_signal_only(
     sigmask: Option<SignalSet>,
 ) -> AxResult<isize> {
     if is_short_timeout(timeout) {
-        let deadline = wall_time().saturating_add(timeout.unwrap());
+        let deadline = wall_time().saturating_add(timeout.ok_or(AxError::InvalidInput)?);
         let mut wait_once = || {
             while wall_time() < deadline {
                 if has_pending_syscall_signal(current().as_thread()) {

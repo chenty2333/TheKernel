@@ -687,7 +687,7 @@ pub fn sys_fsconfig(
             Ok(0)
         }
         FSCONFIG_CMD_RECONFIGURE => Ok(0),
-        _ => unreachable!(),
+        _ => return Err(LinuxError::EINVAL.into()),
     }
 }
 

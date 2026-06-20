@@ -461,7 +461,7 @@ pub fn sys_io_getevents(
     }
 
     for index in 0..count {
-        let event = *context.events.get(index).expect("count was bounded by len");
+        let event = *context.events.get(index).ok_or(AxError::InvalidInput)?;
         events.wrapping_add(index).vm_write(event)?;
     }
     for _ in 0..count {
