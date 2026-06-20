@@ -40,7 +40,7 @@ Usage: $(basename "$0") --arch {rv|la} [options]
 Options:
   --arch {rv|la}        Target architecture
   --image IMG[.xz|.gz]  Override the official testsuite image
-  --support-image IMG    Override the support disk image (default: disk.img)
+  --support-image IMG    Override the support disk image (default: disk-rv.img for rv, disk-la.img for la)
   --timeout SECS        Whole-QEMU timeout in seconds (default: $TIMEOUT_SECS)
   --workdir DIR         Working directory for decompressed/copied images
   --skip-kernel-build   Reuse existing kernel-rv/kernel-la
@@ -212,6 +212,8 @@ else
             "$REPO_ROOT/disk.img.xz" || true)
     else
         SUPPORT_IMAGE_SOURCE=$(find_first_existing \
+            "$REPO_ROOT/disk-rv.img" \
+            "$REPO_ROOT/disk-rv.img.xz" \
             "$REPO_ROOT/disk.img" \
             "$REPO_ROOT/disk.img.xz" || true)
     fi

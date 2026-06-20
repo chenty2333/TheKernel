@@ -43,6 +43,7 @@ Usage:
   scripts/oscomp.sh lab ...
   scripts/oscomp.sh run --arch {rv|la|riscv64|loongarch64} [options]
   scripts/oscomp.sh verify --arch {rv|la|riscv64|loongarch64} [--image PATH]
+  scripts/oscomp.sh validate-output --log PATH [--arch {rv|la|riscv64|loongarch64}]
 
 Commands:
   list
@@ -73,6 +74,11 @@ Commands:
 
   verify
       Validate the expected internal pre-2025 image layout.
+
+  validate-output
+      Validate score-facing OSComp TEST GROUP markers in a replay or remote
+      console log. This checks evaluator-visible group protocol separately
+      from LTP case parsing.
 EOF
 }
 
@@ -170,6 +176,40 @@ verify_cmd() {
     exec "$SCRIPT_DIR/verify-pre2025-layout.sh" --arch "$arch" "${args[@]}"
 }
 
+validate_output_cmd() {
+    local arch=""
+    local args=()
+
+    while (($#)); do
+        case "$1" in
+            --arch)
+                [[ $# -ge 2 ]] || die "missing value for --arch"
+                arch=$(canonical_arch "$2") || die "unsupported arch: $2"
+                args+=("--arch" "$arch")
+                shift 2
+                ;;
+            --log)
+                [[ $# -ge 2 ]] || die "missing value for --log"
+                args+=("--log" "$2")
+                shift 2
+                ;;
+            --require-conclusion)
+                args+=("$1")
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                die "unknown validate-output option: $1"
+                ;;
+        esac
+    done
+
+    exec python3 "$SCRIPT_DIR/validate-oscomp-output.py" "${args[@]}"
+}
+
 main() {
     case "${1:-}" in
         list)
@@ -183,6 +223,10 @@ main() {
         verify)
             shift
             verify_cmd "$@"
+            ;;
+        validate-output)
+            shift
+            validate_output_cmd "$@"
             ;;
         lab)
             shift

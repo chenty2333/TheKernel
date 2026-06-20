@@ -67,7 +67,7 @@ run_netperf() {
 
 trap cleanup EXIT INT TERM
 
-echo "#### OS COMP TEST GROUP START netperf-glibc ####"
+echo "#### OS COMP TEST GROUP START netperf ####"
 run_netperf UDP_STREAM
 run_netperf TCP_STREAM
 run_netperf UDP_RR
@@ -75,4 +75,4 @@ run_netperf TCP_RR
 run_netperf TCP_CRR
 
 cleanup
-echo "#### OS COMP TEST GROUP END netperf-glibc ####"
+echo "#### OS COMP TEST GROUP END netperf ####"

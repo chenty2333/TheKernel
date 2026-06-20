@@ -284,7 +284,7 @@ run_cyclictest() {
     cyclictest_step_settle "$1"
 }
 
-echo "#### OS COMP TEST GROUP START cyclictest-musl ####"
+echo "#### OS COMP TEST GROUP START cyclictest ####"
 debug_step "cyclictest bin ${CYCLICTEST_BIN} runtime $(cyclictest_runtime_root)"
 
 run_cyclictest NO_STRESS_P1
@@ -312,4 +312,4 @@ else
 fi
 echo "====== kill hackbench: $ans ======"
 
-echo "#### OS COMP TEST GROUP END cyclictest-musl ####"
+echo "#### OS COMP TEST GROUP END cyclictest ####"

@@ -284,7 +284,7 @@ run_cyclictest() {
     cyclictest_step_settle "$1"
 }
 
-echo "#### OS COMP TEST GROUP START cyclictest-glibc ####"
+echo "#### OS COMP TEST GROUP START cyclictest ####"
 
 prepare_cyclictest_env
 
@@ -313,4 +313,4 @@ else
 fi
 echo "====== kill hackbench: $ans ======"
 
-echo "#### OS COMP TEST GROUP END cyclictest-glibc ####"
+echo "#### OS COMP TEST GROUP END cyclictest ####"

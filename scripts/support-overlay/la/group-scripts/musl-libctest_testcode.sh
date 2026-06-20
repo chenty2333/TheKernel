@@ -65,7 +65,7 @@ run_filtered_script() {
     return "$last_status"
 }
 
-echo "#### OS COMP TEST GROUP START libctest-musl ####"
+echo "#### OS COMP TEST GROUP START libctest ####"
 
 cd "$ROOT" || exit 1
 
@@ -77,4 +77,4 @@ else
     run_filtered_script ./run-dynamic.sh
 fi
 
-echo "#### OS COMP TEST GROUP END libctest-musl ####"
+echo "#### OS COMP TEST GROUP END libctest ####"

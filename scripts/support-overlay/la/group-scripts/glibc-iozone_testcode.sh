@@ -6,7 +6,7 @@ if [ -n "${OSCOMP_IOZONE_CHDIR:-}" ]; then
     cd "$OSCOMP_IOZONE_CHDIR" || exit 1
 fi
 
-echo "#### OS COMP TEST GROUP START iozone-glibc ####"
+echo "#### OS COMP TEST GROUP START iozone ####"
 
 run_iozone_direct() {
     no_unlink="$1"
@@ -70,4 +70,4 @@ run_iozone_case fwrite-fread "iozone throughput fwrite/fread measurements" -t 4 
 run_iozone_case pwrite-pread "iozone throughput pwrite/pread measurements" -t 4 -i 9 -i 10 -r 1k -s 1m || exit $?
 run_iozone_case pwritev-preadv "iozone throughtput pwritev/preadv measurements" -t 4 -i 11 -i 12 -r 1k -s 1m || exit $?
 
-echo "#### OS COMP TEST GROUP END iozone-glibc ####"
+echo "#### OS COMP TEST GROUP END iozone ####"

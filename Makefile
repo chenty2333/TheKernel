@@ -55,11 +55,11 @@ help:
 	@printf '%s\n' \
 		'Build commands:' \
 		'  make all          clean evaluator build; remote-submission entrypoint, not high-frequency' \
-		'  make artifacts    refresh kernel-rv/kernel-la/disk.img/disk-la.img without clean-eval' \
+		'  make artifacts    refresh kernel-rv/kernel-la/disk.img/disk-rv.img/disk-la.img without clean-eval' \
 		'  make kernels      high-frequency build of kernel-rv and kernel-la only' \
 		'  make kernel-rv    high-frequency RISC-V evaluator kernel; keeps Cargo target cache' \
 		'  make kernel-la    high-frequency LoongArch evaluator kernel; keeps Cargo target cache' \
-		'  make disk.img     rebuild support disk only' \
+		'  make disk.img     rebuild shared support disk only' \
 		'  make clean-eval   remove evaluator artifacts and build/replay state; keep .state/ltp-lab' \
 		'  make clean        full local clean, including .state' \
 		'' \
@@ -85,7 +85,8 @@ all:
 	@$(MAKE) --no-print-directory clean-eval
 	@$(MAKE) --no-print-directory artifacts
 
-artifacts: kernels disk.img disk-la.img
+artifacts: kernels disk.img disk-rv.img disk-la.img
+	@$(MAKE) --no-print-directory check-eval-artifacts
 
 kernels: kernel-rv kernel-la
 
@@ -104,6 +105,7 @@ legacy-clean:
 		$(ROOT_DIR)/kernel-rv \
 		$(ROOT_DIR)/kernel-la \
 		$(ROOT_DIR)/disk.img \
+		$(ROOT_DIR)/disk-rv.img \
 		$(ROOT_DIR)/disk-la.img \
 		$(ROOT_DIR)/rv_.out \
 		$(ROOT_DIR)/la_.out \
@@ -245,6 +247,9 @@ disk.img:
 		fi; \
 		"$$@"
 
+disk-rv.img: disk.img
+	@cp "$<" "$@"
+
 disk-la.img: disk.img
 	@cp "$<" "$@"
 
@@ -255,7 +260,23 @@ rv:
 la:
 	$(MAKE) ARCH=loongarch64 run
 
-.PHONY: help all artifacts kernels build run eval-rv eval-la replay-rv replay-la lab-check lab-bootstrap lab-inventory lab-summary lab-new lab-run lab-review lab-apply lab-done lab-status lab-plan lab-list lab-replay lab-parse lab-summarize lab-promote lab-campaign lab-clean lab-trim dev-image dev-check dev-shell dev-shell-root debug disasm clean clean-eval legacy-clean prebuild-scrub check-eval-kernel-size kernel-rv kernel-la disk.img disk-la.img
+.PHONY: help all artifacts kernels build run eval-rv eval-la replay-rv replay-la lab-check lab-bootstrap lab-inventory lab-summary lab-new lab-run lab-review lab-apply lab-done lab-status lab-plan lab-list lab-replay lab-parse lab-summarize lab-promote lab-campaign lab-clean lab-trim dev-image dev-check dev-shell dev-shell-root debug disasm clean clean-eval legacy-clean prebuild-scrub check-eval-artifacts check-eval-kernel-size kernel-rv kernel-la disk.img disk-rv.img disk-la.img
+check-eval-artifacts:
+	@missing=0; \
+	for artifact in \
+		$(ROOT_DIR)/kernel-rv \
+		$(ROOT_DIR)/kernel-la \
+		$(ROOT_DIR)/disk.img \
+		$(ROOT_DIR)/disk-rv.img \
+		$(ROOT_DIR)/disk-la.img; \
+	do \
+		if [ ! -s "$$artifact" ]; then \
+			printf 'missing evaluator artifact: %s\n' "$$artifact" >&2; \
+			missing=1; \
+		fi; \
+	done; \
+	exit "$$missing"
+
 check-eval-kernel-size:
 	@for kernel in $(ROOT_DIR)/kernel-rv $(ROOT_DIR)/kernel-la; do \
 		[ -f "$$kernel" ] || continue; \

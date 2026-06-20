@@ -1,5 +1,6 @@
 ARG DEBIAN_IMAGE=debian:bookworm-slim
 ARG RUST_TOOLCHAIN=nightly-2025-05-20
+ARG CARGO_AXPLAT_VERSION=0.3.0
 ARG QEMU_VERSION=9.2.1
 ARG QEMU_SHA256=72874fe9c395ced0c7fd7c22c43744072697f7ee1926a72237bd81784b2faf62
 ARG LOONGARCH64_MUSL_TOOLCHAIN_URL=https://github.com/LoongsonLab/oscomp-toolchains-for-oskernel/releases/download/loongarch64-linux-musl-cross-gcc-13.2.0/loongarch64-linux-musl-cross.tgz
@@ -56,6 +57,7 @@ FROM ${DEBIAN_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG RUST_TOOLCHAIN
+ARG CARGO_AXPLAT_VERSION
 ARG QEMU_VERSION
 ARG LOONGARCH64_MUSL_TOOLCHAIN_URL
 ARG LOONGARCH64_MUSL_TOOLCHAIN_SHA256
@@ -147,7 +149,8 @@ RUN export RUSTUP_HOME="${RUSTUP_HOME}" CARGO_HOME="${CARGO_HOME}"; \
       aarch64-unknown-none-softfloat \
       loongarch64-unknown-none-softfloat \
       --toolchain "${RUST_TOOLCHAIN}" \
- && "${CARGO_HOME}/bin/cargo" install --locked cargo-binutils cargo-axplat axconfig-gen \
+ && "${CARGO_HOME}/bin/cargo" install --locked cargo-binutils axconfig-gen \
+ && "${CARGO_HOME}/bin/cargo" install --locked --version "${CARGO_AXPLAT_VERSION}" cargo-axplat \
  && chmod -R a+rX "${RUSTUP_HOME}" "${CARGO_HOME}"
 
 ENV LANG=C.UTF-8

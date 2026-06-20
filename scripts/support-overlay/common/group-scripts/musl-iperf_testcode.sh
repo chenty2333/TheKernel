@@ -90,7 +90,7 @@ run_iperf() {
 
 trap cleanup EXIT INT TERM
 
-echo "#### OS COMP TEST GROUP START iperf-musl ####"
+echo "#### OS COMP TEST GROUP START iperf ####"
 start_server || echo "#### OSCOMP IPERF SERVER START FAIL musl ####"
 run_iperf BASIC_UDP
 run_iperf BASIC_TCP
@@ -100,4 +100,4 @@ run_iperf REVERSE_UDP
 run_iperf REVERSE_TCP
 
 cleanup
-echo "#### OS COMP TEST GROUP END iperf-musl ####"
+echo "#### OS COMP TEST GROUP END iperf ####"

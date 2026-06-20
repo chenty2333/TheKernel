@@ -26,7 +26,7 @@ run_case() {
     "./$case_name"
 }
 
-echo "#### OS COMP TEST GROUP START basic-glibc ####"
+echo "#### OS COMP TEST GROUP START basic ####"
 
 cd "$ROOT/basic" || exit 1
 
@@ -67,4 +67,4 @@ do
     run_case "$case_name" || exit $?
 done
 
-echo "#### OS COMP TEST GROUP END basic-glibc ####"
+echo "#### OS COMP TEST GROUP END basic ####"

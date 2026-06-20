@@ -1079,7 +1079,7 @@ run_netperf() {
 
 trap cleanup EXIT INT TERM
 
-echo "#### OS COMP TEST GROUP START netperf-glibc ####"
+echo "#### OS COMP TEST GROUP START netperf ####"
 run_netperf UDP_STREAM
 run_netperf TCP_STREAM
 run_netperf UDP_RR
@@ -1087,7 +1087,7 @@ run_netperf TCP_RR
 run_netperf TCP_CRR
 
 cleanup
-echo "#### OS COMP TEST GROUP END netperf-glibc ####"'
+echo "#### OS COMP TEST GROUP END netperf ####"'
 
     ensure_executable_script "$OSCOMP_SUPPORT_GROUP_ROOT/musl-netperf_testcode.sh" '#!/bin/sh
 
@@ -1156,7 +1156,7 @@ run_netperf() {
 
 trap cleanup EXIT INT TERM
 
-echo "#### OS COMP TEST GROUP START netperf-musl ####"
+echo "#### OS COMP TEST GROUP START netperf ####"
 run_netperf UDP_STREAM
 run_netperf TCP_STREAM
 run_netperf UDP_RR
@@ -1164,7 +1164,7 @@ run_netperf TCP_RR
 run_netperf TCP_CRR
 
 cleanup
-echo "#### OS COMP TEST GROUP END netperf-musl ####"'
+echo "#### OS COMP TEST GROUP END netperf ####"'
 
     ensure_executable_script "$OSCOMP_SUPPORT_GROUP_ROOT/glibc-iperf_testcode.sh" '#!/bin/sh
 
@@ -1258,7 +1258,7 @@ run_iperf() {
 
 trap cleanup EXIT INT TERM
 
-echo "#### OS COMP TEST GROUP START iperf-glibc ####"
+echo "#### OS COMP TEST GROUP START iperf ####"
 start_server || echo "#### OSCOMP IPERF SERVER START FAIL glibc ####"
 run_iperf BASIC_UDP
 run_iperf BASIC_TCP
@@ -1268,7 +1268,7 @@ run_iperf REVERSE_UDP
 run_iperf REVERSE_TCP
 
 cleanup
-echo "#### OS COMP TEST GROUP END iperf-glibc ####"'
+echo "#### OS COMP TEST GROUP END iperf ####"'
 
     ensure_executable_script "$OSCOMP_SUPPORT_GROUP_ROOT/musl-iperf_testcode.sh" '#!/bin/sh
 
@@ -1362,7 +1362,7 @@ run_iperf() {
 
 trap cleanup EXIT INT TERM
 
-echo "#### OS COMP TEST GROUP START iperf-musl ####"
+echo "#### OS COMP TEST GROUP START iperf ####"
 start_server || echo "#### OSCOMP IPERF SERVER START FAIL musl ####"
 run_iperf BASIC_UDP
 run_iperf BASIC_TCP
@@ -1372,7 +1372,7 @@ run_iperf REVERSE_UDP
 run_iperf REVERSE_TCP
 
 cleanup
-echo "#### OS COMP TEST GROUP END iperf-musl ####"'
+echo "#### OS COMP TEST GROUP END iperf ####"'
 
     ensure_executable_script "$OSCOMP_SUPPORT_GROUP_ROOT/glibc-cyclictest_testcode.sh" '#!/bin/sh
 
@@ -1660,7 +1660,7 @@ run_cyclictest() {
     cyclictest_step_settle "$1"
 }
 
-echo "#### OS COMP TEST GROUP START cyclictest-glibc ####"
+echo "#### OS COMP TEST GROUP START cyclictest ####"
 
 prepare_cyclictest_env
 
@@ -1689,7 +1689,7 @@ else
 fi
 echo "====== kill hackbench: $ans ======"
 
-echo "#### OS COMP TEST GROUP END cyclictest-glibc ####"'
+echo "#### OS COMP TEST GROUP END cyclictest ####"'
 
     ensure_executable_script "$OSCOMP_SUPPORT_GROUP_ROOT/musl-cyclictest_testcode.sh" '#!/bin/sh
 
@@ -1963,7 +1963,7 @@ run_cyclictest() {
     cyclictest_step_settle "$1"
 }
 
-echo "#### OS COMP TEST GROUP START cyclictest-musl ####"
+echo "#### OS COMP TEST GROUP START cyclictest ####"
 debug_step "cyclictest bin ${CYCLICTEST_BIN} runtime $(cyclictest_runtime_root)"
 
 run_cyclictest NO_STRESS_P1
@@ -1991,7 +1991,7 @@ else
 fi
 echo "====== kill hackbench: $ans ======"
 
-echo "#### OS COMP TEST GROUP END cyclictest-musl ####"'
+echo "#### OS COMP TEST GROUP END cyclictest ####"'
 
     ensure_executable_script "$OSCOMP_SUPPORT_GROUP_ROOT/glibc-cyclictest_testcode.sh" '#!/bin/sh
 
@@ -2000,10 +2000,10 @@ TMP_SCRIPT="/tmp/oscomp-glibc-cyclictest-$$.sh"
 MUSL_BUSYBOX="${OSCOMP_MUSL_BUSYBOX:-/musl/busybox}"
 
 if [ ! -f "$SOURCE_SCRIPT" ] || [ ! -x "$MUSL_BUSYBOX" ]; then
-    echo "#### OS COMP TEST GROUP START cyclictest-glibc ####"
+    echo "#### OS COMP TEST GROUP START cyclictest ####"
     echo "====== cyclictest NO_STRESS_P1 begin ======"
     echo "====== cyclictest NO_STRESS_P1 end: fail ======"
-    echo "#### OS COMP TEST GROUP END cyclictest-glibc ####"
+    echo "#### OS COMP TEST GROUP END cyclictest ####"
     exit 1
 fi
 
@@ -2567,7 +2567,9 @@ run_pre2025_init_sequence() {
     install_userdel_tool
     install_builtin_group_overrides
     mount_support_disk
-    retag_pre2025_group_scripts
+    if runner_truthy "${OSCOMP_RETAG_SCORE_GROUP_MARKERS:-0}"; then
+        retag_pre2025_group_scripts
+    fi
     load_oscomp_env
     seed_oscomp_machine
     seed_oscomp_shells
@@ -3832,7 +3834,12 @@ stream_group_output_incremental() {
 
     start_byte=$((streamed_bytes + 1))
     bytes_to_emit=$((current_size - streamed_bytes))
-    bb tail -c +"$start_byte" "$output_file" | bb head -c "$bytes_to_emit"
+    if [ -z "${RUNNER_CHUNK_SENTINEL:-}" ]; then
+        RUNNER_CHUNK_SENTINEL="$(printf '\001')"
+    fi
+    chunk="$(bb tail -c +"$start_byte" "$output_file" | bb head -c "$bytes_to_emit"; printf '%s' "$RUNNER_CHUNK_SENTINEL")"
+    chunk="${chunk%"$RUNNER_CHUNK_SENTINEL"}"
+    printf '%s' "$chunk" | normalize_group_output_chunk
     STREAM_GROUP_OUTPUT_BYTES="$current_size"
 }
 
@@ -3846,15 +3853,7 @@ emit_group_end() {
 
 group_marker_name() {
     group="$1"
-    flavor="$2"
-    case "$flavor" in
-        musl|glibc)
-            printf '%s-%s\n' "$group" "$flavor"
-            ;;
-        *)
-            printf '%s\n' "$group"
-            ;;
-    esac
+    printf '%s\n' "$group"
 }
 
 should_suppress_group_marker_line() {
@@ -3868,6 +3867,7 @@ should_suppress_group_marker_line() {
 
 emit_normalized_group_line() {
     line="$1"
+    line_had_group_marker=""
     if [ -n "${RUNNER_CR:-}" ]; then
         case "$line" in
             *"$RUNNER_CR")
@@ -3877,10 +3877,15 @@ emit_normalized_group_line() {
     fi
     case "$line" in
         *'#### OS COMP TEST GROUP '*)
+            line_had_group_marker=1
             line="$(printf '%s\n' "$line" | bb sed -E 's/#### OS COMP TEST GROUP (START|END) [^#]+ ####//g')"
             ;;
     esac
-    [ -n "$line" ] || return 0
+    if [ -z "$line" ]; then
+        [ -n "$line_had_group_marker" ] && return 0
+        printf '\n'
+        return 0
+    fi
     should_suppress_group_marker_line "$line" && return 0
     printf '%s\n' "$line"
 }
@@ -3918,7 +3923,10 @@ normalize_group_output_chunk() {
 }
 
 flush_group_output_fragment() {
-    :
+    if [ -n "${STREAM_GROUP_OUTPUT_FRAGMENT:-}" ]; then
+        emit_normalized_group_line "$STREAM_GROUP_OUTPUT_FRAGMENT"
+        STREAM_GROUP_OUTPUT_FRAGMENT=""
+    fi
 }
 
 run_group_script() {
@@ -3933,6 +3941,7 @@ run_group_script() {
     group_marker="$(group_marker_name "$group" "$flavor")"
 
     runner_debug "#### OSCOMP RUNNER START ${script} ####"
+    runner_debug "#### OSCOMP RUNNER GROUP FLAVOR ${flavor} GROUP ${group} ROOT ${root} MARKER ${group_marker} ####"
 
     if ! prepare_group_timeout_secs "$root" "$group" "$script"; then
         runner_debug "#### OSCOMP RUNNER END ${script} STATUS 124 ####"
@@ -3969,6 +3978,7 @@ run_group_script() {
     prime_group_output_stream
     STREAM_GROUP_OUTPUT_FRAGMENT=""
 
+    emit_group_start "$group_marker"
     (
         cd "$run_dir" || exit 125
         runner_debug "#### OSCOMP RUNNER GROUP STEP ensure_support_runtime_payload enter ${root}/${group} ####"
@@ -4094,8 +4104,11 @@ run_group_script() {
             fi
         fi
 
+        emit_group_start "$group_marker"
         run_clean_shell_script "$exec_shell" "$exec_script" </dev/null
-        exit $?
+        group_status=$?
+        emit_group_end "$group_marker"
+        exit "$group_status"
     ) </dev/null >"$output_file" 2>&1 &
     runner_pid=$!
     timed_out=""
@@ -4127,6 +4140,7 @@ run_group_script() {
     refresh_runner_timeout_state
     stream_group_output_incremental "$output_file" "$streamed_bytes"
     flush_group_output_fragment
+    emit_group_end "$group_marker"
     runner_debug "#### OSCOMP RUNNER POST GROUP QUIESCE BEGIN ${script} ####"
     runner_quiesce_rounds "${OSCOMP_POST_GROUP_QUIESCE_ROUNDS:-128}"
     runner_debug "#### OSCOMP RUNNER POST GROUP QUIESCE END ${script} ####"

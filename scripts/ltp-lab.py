@@ -3565,7 +3565,7 @@ def audit_cmd(args: argparse.Namespace) -> None:
     checks.append(("repo", str(REPO_ROOT)))
     checks.append(("git_dirty", "yes" if run_cmd(["git", "status", "--short"], capture=True, check=False).stdout.strip() else "no"))
     checks.append(("default_ltp_list", "ok" if DEFAULT_TEST_LIST.is_file() else "missing"))
-    artifacts = [name for name in ("kernel-rv", "kernel-la", "disk.img", "disk-la.img") if (REPO_ROOT / name).is_file()]
+    artifacts = [name for name in ("kernel-rv", "kernel-la", "disk.img", "disk-rv.img", "disk-la.img") if (REPO_ROOT / name).is_file()]
     checks.append(("evaluator_artifacts", ",".join(artifacts) if artifacts else "missing"))
     for arch in ARCHES:
         image = find_official_image(arch)
