@@ -149,8 +149,13 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
 impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H> {
     fn alloc_table() -> PagingResult<PhysAddr> {
         if let Some(paddr) = H::alloc_frame() {
-            let ptr = H::phys_to_virt(paddr).as_mut_ptr();
-            unsafe { core::ptr::write_bytes(ptr, 0, PAGE_SIZE_4K) };
+            let ptr = H::phys_to_virt(paddr).as_mut_ptr() as *mut u64;
+            // u64 store loop instead of write_bytes: under QEMU TCG the emitted
+            // memset for write_bytes is ~4x slower here (it issues ~4x more
+            // stores), and this runs on every freshly allocated page-table page.
+            for i in 0..(PAGE_SIZE_4K / 8) {
+                unsafe { *ptr.add(i) = 0 };
+            }
             Ok(paddr)
         } else {
             Err(PagingError::NoMemory)
@@ -600,7 +605,11 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
             return Err(PagingError::AlreadyMapped);
         }
         *entry = GenericPTE::new_page(target.align_down(page_size), flags, page_size.is_huge());
-        self.push(vaddr);
+        // No TLB flush: the entry was unused, so no CPU can hold a stale TLB
+        // entry for this VA. Skipping self.push(vaddr) avoids a serializing
+        // sfence.vma on every freshly-mapped leaf, which is the common
+        // page-fault path. (Unmap/protect/remap still flush via their own push,
+        // so reusing a VA after an unmap remains correct.)
         Ok(())
     }
 
