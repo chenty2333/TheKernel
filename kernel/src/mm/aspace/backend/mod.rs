@@ -31,7 +31,15 @@ fn alloc_frame(zeroed: bool, size: PageSize) -> AxResult<PhysAddr> {
     let vaddr =
         VirtAddr::from(global_allocator().alloc_pages(num_pages, page_size, UsageKind::VirtMem)?);
     if zeroed {
-        unsafe { core::ptr::write_bytes(vaddr.as_mut_ptr(), 0, page_size) };
+        // Zero with a u64 store loop instead of core::ptr::write_bytes. Under
+        // QEMU TCG the compiler-emitted memset for write_bytes runs ~4x slower
+        // here (it issues ~4x more stores), which made anonymous page faults
+        // (stack/heap/malloc) dominate at ~170us/page. The u64 loop cuts that
+        // to ~43us. page_size is always a multiple of 8 (4K/2M).
+        let p = vaddr.as_mut_ptr() as *mut u64;
+        for i in 0..(page_size / 8) {
+            unsafe { *p.add(i) = 0 };
+        }
     }
     let paddr = virt_to_phys(vaddr);
 
