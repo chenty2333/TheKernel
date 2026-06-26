@@ -49,9 +49,6 @@ const SCHED_RR_TIMESLICE_MS_DEFAULT: u32 = {
 };
 static SCHED_RR_TIMESLICE_MS: AtomicU32 = AtomicU32::new(SCHED_RR_TIMESLICE_MS_DEFAULT);
 const SHORT_RELATIVE_SLEEP_LIMIT: Duration = Duration::from_micros(2000);
-const PRECISE_RELATIVE_SLEEP_MIN: Duration = Duration::from_millis(50);
-const PRECISE_RELATIVE_SLEEP_LIMIT: Duration = Duration::from_millis(250);
-const PRECISE_RELATIVE_SLEEP_SPIN_TAIL: Duration = Duration::from_millis(80);
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -478,26 +475,6 @@ fn sleep_relative(dur: TimeValue) -> TimeValue {
         });
         let actual = AlarmClock::Monotonic.now().saturating_sub(start);
         return if actual < dur { Duration::ZERO } else { actual };
-    }
-
-    if (PRECISE_RELATIVE_SLEEP_MIN..=PRECISE_RELATIVE_SLEEP_LIMIT).contains(&dur) {
-        let curr = current();
-        let _ = with_proc_state_hint(ProcStateHint::Interruptible, || {
-            let block_until = deadline.saturating_sub(PRECISE_RELATIVE_SLEEP_SPIN_TAIL);
-            if block_until > start {
-                let _ = block_on(interruptible(sleep_until_clock(
-                    AlarmClock::Monotonic,
-                    block_until,
-                )));
-            }
-            while AlarmClock::Monotonic.now() < deadline {
-                if has_pending_syscall_signal(curr.as_thread()) {
-                    break;
-                }
-                core::hint::spin_loop();
-            }
-        });
-        return AlarmClock::Monotonic.now() - start;
     }
 
     // We detect EINTR manually if the slept time is not enough.

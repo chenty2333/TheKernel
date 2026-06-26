@@ -13,7 +13,7 @@ use super::{
     util::{LwExt4Filesystem, into_vfs_err},
 };
 
-const EXT4_CONFIG: FsConfig = FsConfig { bcache_size: 256 };
+const EXT4_CONFIG: FsConfig = FsConfig { bcache_size: 2048 };
 
 pub struct Ext4Filesystem {
     inner: Mutex<LwExt4Filesystem>,
