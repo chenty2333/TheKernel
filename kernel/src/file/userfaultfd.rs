@@ -104,6 +104,11 @@ pub struct UserfaultFile {
 }
 
 static USERFAULT_FILES: Mutex<Vec<Weak<UserfaultFile>>> = Mutex::new(Vec::new());
+// Cleared until the first userfaultfd is created. The page-fault path polls
+// USERFAULT_FILES on every fault; when no userfaultfd has ever existed (the
+// common case for the evaluator workloads) this flag lets it skip the global
+// mutex acquire + Vec scan entirely.
+static USERFAULTFD_EVER_CREATED: AtomicBool = AtomicBool::new(false);
 
 impl UserfaultFile {
     pub fn new(pid: Pid, nonblocking: bool) -> Arc<Self> {
@@ -118,6 +123,7 @@ impl UserfaultFile {
             poll_rx: PollSet::new(),
         });
         USERFAULT_FILES.lock().push(Arc::downgrade(&file));
+        USERFAULTFD_EVER_CREATED.store(true, Ordering::Release);
         file
     }
 
@@ -322,6 +328,9 @@ fn each_userfault_file(mut f: impl FnMut(&Arc<UserfaultFile>) -> bool) {
 }
 
 pub fn wait_missing_page_for_current(pid: Pid, addr: VirtAddr, write: bool) -> Option<Vec<u8>> {
+    if !USERFAULTFD_EVER_CREATED.load(Ordering::Acquire) {
+        return None;
+    }
     let mut matched = None;
     each_userfault_file(|file| {
         if file.begin_fault(pid, addr, write) {
