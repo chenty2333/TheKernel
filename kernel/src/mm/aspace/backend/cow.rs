@@ -135,7 +135,12 @@ impl CowBackend {
         flags: MappingFlags,
         pt: &mut PageTableCursor,
     ) -> AxResult {
-        let frame = self.alloc_new_frame(true)?;
+        // For file-backed faults the file read fills the page, so a full-page
+        // pre-zero is wasted work (and the zero path is the dominant fault
+        // cost). Only anonymous pages need the frame pre-zeroed; for file
+        // pages we zero just the gap before and the tail after the file data.
+        let is_file = self.file.is_some();
+        let frame = self.alloc_new_frame(!is_file)?;
 
         if let Some((file, file_start, file_end, _)) = &self.file {
             let buf = unsafe {
@@ -152,7 +157,14 @@ impl CowBackend {
                 .map_or(u64::MAX, |end| end.saturating_sub(file_start))
                 .min((buf.len() - start) as u64) as usize;
 
+            if start > 0 {
+                unsafe { core::ptr::write_bytes(buf.as_mut_ptr(), 0, start) };
+            }
             file.read_at(&mut &mut buf[start..start + max_read], file_start)?;
+            let tail_start = start + max_read;
+            if tail_start < buf.len() {
+                unsafe { core::ptr::write_bytes(buf.as_mut_ptr().add(tail_start), 0, buf.len() - tail_start) };
+            }
         }
         pt.map(vaddr, frame, self.size, page_table_flags(flags))?;
         self.mark_materialized();
