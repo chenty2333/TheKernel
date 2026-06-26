@@ -1,7 +1,9 @@
 use axplat::mem::{Aligned4K, pa, va};
 use page_table_entry::{GenericPTE, MappingFlags, loongarch64::LA64PTE};
 
-use crate::config::plat::{BOOT_STACK_SIZE, PHYS_BOOT_OFFSET, PHYS_VIRT_OFFSET};
+use crate::config::plat::{
+    BOOT_STACK_SIZE, KERNEL_BASE_PADDR, PHYS_BOOT_OFFSET, PHYS_VIRT_OFFSET,
+};
 
 #[unsafe(link_section = ".bss.stack")]
 static mut BOOT_STACK: [u8; BOOT_STACK_SIZE] = [0; BOOT_STACK_SIZE];
@@ -63,6 +65,7 @@ fn init_mmu() {
 }
 
 const BOOT_TO_VIRT: usize = PHYS_VIRT_OFFSET - PHYS_BOOT_OFFSET;
+const BOOT_HEADER_ENTRY: usize = KERNEL_BASE_PADDR + 0x40;
 
 /// The earliest entry point for the primary CPU.
 ///
@@ -74,9 +77,9 @@ unsafe extern "C" fn _start() -> ! {
     core::arch::naked_asm!("
         .word   0x5a4d              # MZ, MS-DOS header
         .word   0                   # Reserved
-        .dword  0x00200040          # Kernel entry point
+        .dword  {boot_header_entry} # Kernel entry point
         .dword  _ekernel - _skernel # Kernel image effective size
-        .dword  0x00200000          # Kernel image load offset from start of RAM
+        .dword  {kernel_base_paddr} # Kernel image load offset from start of RAM
         .dword  0                   # Reserved
         .dword  0                   # Reserved
         .dword  0                   # Reserved
@@ -116,6 +119,8 @@ unsafe extern "C" fn _start() -> ! {
 
         phys_boot_offset = const PHYS_BOOT_OFFSET,
         boot_to_virt = const BOOT_TO_VIRT,
+        boot_header_entry = const BOOT_HEADER_ENTRY,
+        kernel_base_paddr = const KERNEL_BASE_PADDR,
 
         boot_stack = sym BOOT_STACK,
         boot_stack_size = const BOOT_STACK_SIZE,

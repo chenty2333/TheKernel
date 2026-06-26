@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 ADDR_DELTA = 0xFFFF800000000000
-ENTRY_ADDR = 0x200040
+BOOT_HEADER_SIZE = 0x40
 
 
 def adjust_addr(value: int) -> int:
@@ -25,7 +25,8 @@ def main() -> int:
     if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
         raise ValueError("expected ELF64 little-endian input")
 
-    struct.pack_into("<Q", data, 24, ENTRY_ADDR)
+    original_entry = struct.unpack_from("<Q", data, 24)[0]
+    struct.pack_into("<Q", data, 24, adjust_addr(original_entry) + BOOT_HEADER_SIZE)
 
     phoff = struct.unpack_from("<Q", data, 32)[0]
     shoff = struct.unpack_from("<Q", data, 40)[0]

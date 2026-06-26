@@ -24,7 +24,7 @@ CANONICAL_GROUPS = {
     "unixbench",
 }
 
-GROUP_RE = re.compile(r"#### OS COMP TEST GROUP (START|END) ([^ ]+) ####")
+GROUP_RE = re.compile(r"^#### OS COMP TEST GROUP (START|END) ([^ ]+) ####$")
 SUFFIX_RE = re.compile(r"-(musl|glibc)$")
 CONCLUSION_RE = re.compile(
     r"(QEMU timed out after|OSCOMP RUNNER (?:GLOBAL )?TIMEOUT|poweroff|shutdown|System is shutting down)",
@@ -60,7 +60,7 @@ def main() -> int:
     markers: list[tuple[str, str, int]] = []
 
     for line_no, line in enumerate(text.splitlines(), 1):
-        match = GROUP_RE.search(line)
+        match = GROUP_RE.match(line)
         if not match:
             continue
 
@@ -97,7 +97,7 @@ def main() -> int:
             current = None
             continue
 
-        if group in CANONICAL_GROUPS and not SUFFIX_RE.search(group):
+        if group in CANONICAL_GROUPS:
             complete.append((group, open_line, line_no))
         current = None
 

@@ -1,24 +1,20 @@
 use core::ptr::write_volatile;
 
-use axplat::{
-    console::ConsoleIf,
-    mem::{pa, phys_to_virt},
-};
+use axplat::console::ConsoleIf;
 use kspin::SpinNoIrq;
 use lazyinit::LazyInit;
 use uart_16550::MmioSerialPort;
 
-use crate::config::devices::UART_PADDR;
+use crate::config::{devices::UART_PADDR, plat::PHYS_VIRT_OFFSET};
 
 static UART: LazyInit<SpinNoIrq<MmioSerialPort>> = LazyInit::new();
 
 pub(crate) fn init_early() {
-    let base = phys_to_virt(pa!(UART_PADDR)).as_usize();
+    let base = UART_PADDR + PHYS_VIRT_OFFSET;
     unsafe {
-        // QEMU's LoongArch virt machine enters the kernel with the NS16550A
-        // UART already clocked. Do not rewrite DLL/DLM here: on this platform
-        // that divisor-latch write is visible as a leading 0x03 byte on the
-        // score-facing serial stream.
+        // QEMU/OpenSBI already provides a usable NS16550A UART. Avoid
+        // rewriting DLL/DLM here: on this platform that divisor-latch write is
+        // visible as a leading 0x03 byte on the score-facing serial stream.
         write_volatile((base + 3) as *mut u8, 0x03);
         write_volatile((base + 1) as *mut u8, 0x00);
         write_volatile((base + 2) as *mut u8, 0xC7);
@@ -62,6 +58,7 @@ impl ConsoleIf for ConsoleIfImpl {
         bytes.len()
     }
 
+    /// Returns the IRQ number for the console, if applicable.
     #[cfg(feature = "irq")]
     fn irq_num() -> Option<usize> {
         Some(crate::config::devices::UART_IRQ)

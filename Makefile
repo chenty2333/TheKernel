@@ -7,7 +7,9 @@ BANNER ?= n
 export BANNER
 BACKTRACE ?= n
 export BACKTRACE
-DWARF ?= y
+DEBUGINFO ?= y
+export DEBUGINFO
+DWARF ?= n
 export DWARF
 MEMTRACK ?= n
 export MEMTRACK
@@ -241,7 +243,7 @@ kernel-la:
 	@$(MAKE) --no-print-directory check-eval-kernel-size
 
 disk.img:
-	@set -- bash ./scripts/build-oscomp-support-disk.sh --arch both --output "$@"; \
+	@set -- bash ./scripts/build-oscomp-support-disk.sh --arch rv --output "$@"; \
 		if [ -n "$(OSCOMP_PLAN_OVERRIDE)" ]; then \
 			set -- "$$@" --plan-override "$(OSCOMP_PLAN_OVERRIDE)"; \
 		fi; \
@@ -250,8 +252,12 @@ disk.img:
 disk-rv.img: disk.img
 	@cp "$<" "$@"
 
-disk-la.img: disk.img
-	@cp "$<" "$@"
+disk-la.img:
+	@set -- bash ./scripts/build-oscomp-support-disk.sh --arch la --output "$@"; \
+		if [ -n "$(OSCOMP_PLAN_OVERRIDE)" ]; then \
+			set -- "$$@" --plan-override "$(OSCOMP_PLAN_OVERRIDE)"; \
+		fi; \
+		"$$@"
 
 # Aliases
 rv:

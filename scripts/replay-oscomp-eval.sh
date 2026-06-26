@@ -249,7 +249,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-IMAGE_RUNTIME=$(prepare_image "$IMAGE_SOURCE" "$(basename -- "${IMAGE_SOURCE%.xz}")")
+IMAGE_RUNTIME=$(prepare_image "$IMAGE_SOURCE" "$(basename -- "${IMAGE_SOURCE%.xz}")" 1)
 SUPPORT_IMAGE_RUNTIME=""
 if [ -n "$SUPPORT_IMAGE_SOURCE" ]; then
     SUPPORT_IMAGE_RUNTIME=$(prepare_image \
@@ -298,7 +298,6 @@ if [ "$ARCH" = "rv" ]; then
 else
     QEMU_CMD=(
         qemu-system-loongarch64
-        -machine virt
         -kernel "$KERNEL_PATH"
         -m 1G
         -nographic

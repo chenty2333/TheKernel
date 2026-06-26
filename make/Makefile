@@ -47,6 +47,7 @@ SMP ?=
 MODE ?= release
 LOG ?= off
 V ?=
+DEBUGINFO ?=
 DWARF ?=
 LTO ?=
 TARGET_DIR ?= $(STATE_ARCH_DIR)/target

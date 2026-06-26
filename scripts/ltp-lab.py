@@ -1406,10 +1406,10 @@ def run_experiment(args: argparse.Namespace) -> Path:
     return run_path
 
 
-GROUP_START_RE = re.compile(r"#### OS COMP TEST GROUP START ([^ ]+) ####")
-GROUP_END_RE = re.compile(r"#### OS COMP TEST GROUP END ([^ ]+) ####")
+GROUP_START_RE = re.compile(r"^#### OS COMP TEST GROUP START ([^ ]+) ####$")
+GROUP_END_RE = re.compile(r"^#### OS COMP TEST GROUP END ([^ ]+) ####$")
 RUN_CASE_RE = re.compile(r"^RUN LTP CASE (.+)$")
-END_CASE_RE = re.compile(r"^FAIL LTP CASE (.+?) : (-?\d+)$")
+END_CASE_RE = re.compile(r"^(?:PASS|FAIL) LTP CASE (.+?) : (-?\d+)$")
 CASE_TIMEOUT_RE = re.compile(r"^#### OSCOMP RUNNER LTP CASE TIMEOUT (.+?) AFTER (\d+)s ####$")
 CASE_DURATION_RE = re.compile(r"^#### OSCOMP RUNNER LTP CASE DURATION (.+?) ([0-9.]+)s ####$")
 RUNNER_TIMEOUT_RE = re.compile(r"^#### OSCOMP RUNNER (?:GLOBAL )?TIMEOUT .+ ####$")
@@ -1476,12 +1476,12 @@ def parse_log_text(text: str, arch: str = "") -> dict[str, Any]:
     global_timeout = False
 
     for line_no, line in enumerate(text.splitlines(), 1):
-        start = GROUP_START_RE.search(line)
+        start = GROUP_START_RE.match(line)
         if start:
             current_group = start.group(1)
             current_case = None
             continue
-        end = GROUP_END_RE.search(line)
+        end = GROUP_END_RE.match(line)
         if end:
             if current_case:
                 current_case["line_end"] = line_no

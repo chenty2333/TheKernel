@@ -11,6 +11,7 @@ REFERENCE_PLAN_GROUPS=(
     lua
     libcbench
     libctest
+    unixbench
     cyclictest
     lmbench
     iperf
@@ -94,6 +95,7 @@ list_cmd() {
     printf '  /musl lua\n'
     printf '  /musl libcbench\n'
     printf '  /musl libctest\n'
+    printf '  /musl unixbench\n'
     printf '  /musl cyclictest\n'
     printf '  /glibc basic\n'
     printf '  /glibc iozone\n'
@@ -101,6 +103,7 @@ list_cmd() {
     printf '  /glibc netperf\n'
     printf '  /glibc lua\n'
     printf '  /glibc libcbench\n'
+    printf '  /glibc unixbench\n'
     printf '  /glibc cyclictest\n'
     printf '  /musl lmbench\n'
     printf '  /glibc lmbench\n'

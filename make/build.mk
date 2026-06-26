@@ -45,7 +45,7 @@ else ifneq ($(filter $(or $(MAKECMDGOALS), $(.DEFAULT_GOAL)), all build build-el
       endif
     endif
   endif
-  ifeq ($(DWARF), y)
+  ifneq ($(filter y,$(DEBUGINFO) $(DWARF)),)
     RUSTFLAGS += -C force-frame-pointers -C debuginfo=2 -C strip=none
   endif
   $(if $(V), $(info RUSTFLAGS: "$(RUSTFLAGS)"))

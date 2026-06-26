@@ -25,6 +25,7 @@ Build an evaluator support disk aligned to /home/dia/T202510213995926-2475:
   - /<arch>/overlay/... runtime overlay copied into /
   - /usr/lib/locale/C.UTF-8
   - /<arch>/glibc/lib/libgcc_s.so.1
+  - /meta/init.sh used as the score-facing init script
   - /meta/ltp_test.txt used at runtime to overlay the same LTP subset
   - /meta/oscomp_plan.txt only when --plan-override is provided
   - /meta/oscomp.env only when --env-override is provided
@@ -214,6 +215,9 @@ build_overlay_tools_for_arch() {
     "$cc" -O2 -static -s -std=c11 \
         "$REPO_ROOT/scripts/support-tools/hello-world.c" \
         -o "$arch_root/overlay/bin/oscomp-hello-world"
+    mkdir -p "$arch_root/overlay/glibc" "$arch_root/overlay/musl"
+    cp "$arch_root/overlay/bin/oscomp-hello-world" "$arch_root/overlay/musl/hello"
+    cp "$arch_root/overlay/bin/oscomp-hello-world" "$arch_root/overlay/glibc/hello"
     "$cc" -O2 -static -s -std=c11 \
         "$REPO_ROOT/scripts/support-tools/ltp-musl-compat-cases.c" \
         -o "$arch_root/overlay/bin/oscomp-ltp-musl-compat-case"
@@ -338,6 +342,31 @@ EOF
 
 }
 
+stage_reference_group_scripts_for_arch() {
+    local arch=$1
+    local arch_root=
+    local scripts_root="$REPO_ROOT/.state/ltp-lab/refs/testsuits-for-oskernel/scripts"
+    case "$arch" in
+        rv)
+            arch_root="$WORK_ROOT/rv"
+            ;;
+        la)
+            arch_root="$WORK_ROOT/la"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    [ -d "$scripts_root" ] || return 0
+    mkdir -p "$arch_root/overlay/musl" "$arch_root/overlay/glibc"
+    for script in "$scripts_root"/*/*_testcode.sh; do
+        [ -f "$script" ] || continue
+        [ -f "$arch_root/overlay/musl/${script##*/}" ] || cp "$script" "$arch_root/overlay/musl/${script##*/}"
+        [ -f "$arch_root/overlay/glibc/${script##*/}" ] || cp "$script" "$arch_root/overlay/glibc/${script##*/}"
+    done
+}
+
 find_libgcc_for_arch() {
     local arch=$1
     local env_override=""
@@ -455,6 +484,8 @@ trap cleanup EXIT
 WORK_ROOT="$TMP_ROOT/root"
 mkdir -p "$WORK_ROOT/usr/lib/locale/C.UTF-8" "$WORK_ROOT/meta"
 cp -a "$LOCALE_SOURCE"/. "$WORK_ROOT/usr/lib/locale/C.UTF-8/"
+cp "$REPO_ROOT/src/init.sh" "$WORK_ROOT/meta/init.sh"
+chmod 0755 "$WORK_ROOT/meta/init.sh"
 cp "$TEST_LIST_PATH" "$WORK_ROOT/meta/ltp_test.txt"
 
 if [ -n "$PLAN_OVERRIDE_PATH" ] && [ -f "$PLAN_OVERRIDE_PATH" ]; then
@@ -469,11 +500,13 @@ case "$ARCH" in
         mkdir -p "$WORK_ROOT/rv/glibc/lib"
         cp "$RV_LIBGCC_SOURCE" "$WORK_ROOT/rv/glibc/lib/libgcc_s.so.1"
         build_overlay_tools_for_arch rv
+        stage_reference_group_scripts_for_arch rv
         ;;
     la)
         mkdir -p "$WORK_ROOT/la/glibc/lib"
         cp "$LA_LIBGCC_SOURCE" "$WORK_ROOT/la/glibc/lib/libgcc_s.so.1"
         build_overlay_tools_for_arch la
+        stage_reference_group_scripts_for_arch la
         ;;
     both|all)
         mkdir -p "$WORK_ROOT/rv/glibc/lib" "$WORK_ROOT/la/glibc/lib"
@@ -481,6 +514,8 @@ case "$ARCH" in
         cp "$LA_LIBGCC_SOURCE" "$WORK_ROOT/la/glibc/lib/libgcc_s.so.1"
         build_overlay_tools_for_arch rv
         build_overlay_tools_for_arch la
+        stage_reference_group_scripts_for_arch rv
+        stage_reference_group_scripts_for_arch la
         ;;
 esac
 

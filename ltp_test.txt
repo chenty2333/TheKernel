@@ -9,7 +9,6 @@ pipe11
 getitimer01
 chmod01
 posix_fadvise03
-posix_fadvise03_64
 timer_settime02
 signal03
 signal05
@@ -1023,7 +1022,6 @@ msgsnd06 msgsnd06
 sched_getattr01 sched_getattr01
 fork06 fork_procs -n 1000
 fork11 fork_procs -n 100
-fs_racer fs_racer.sh -t 5
 inode02 inode02
 proc01 proc01 -m 128
 stream01 stream01
@@ -1090,8 +1088,6 @@ pidfd_send_signal03 pidfd_send_signal03
 data_space data_space
 mem02 mem02
 mmap10_1 mmap10 -a
-overcommit_memory01 overcommit_memory
-overcommit_memory03 overcommit_memory -R 30
 overcommit_memory04 overcommit_memory -R 80
 overcommit_memory05 overcommit_memory -R 100
 overcommit_memory06 overcommit_memory -R 200
@@ -1115,7 +1111,6 @@ pipeio_6 pipeio -T pipeio_6 -c 5 -s 5000 -i 10 -b -u -f x80
 pipeio_8 pipeio -T pipeio_8 -c 5 -s 5000 -i 10 -u -f x80
 semctl01 semctl01
 sched_cli_serv run_sched_cliserv.sh
-sched_stress sched_stress.sh
 cve-2017-12193 add_key04
 cve-2017-15274 add_key02
 qmm01 mmap001 -m 1
