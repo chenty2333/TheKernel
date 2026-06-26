@@ -255,24 +255,6 @@ run_regular_group() {
     cleanup_after_group
 }
 
-ltp_timeout_mul_for_case() {
-    case "$1" in
-        fork06) printf '2\n' ;;
-        *) return 1 ;;
-    esac
-}
-
-run_ltp_case_cmd() {
-    tag="$1"
-    shift
-    timeout_mul="$(ltp_timeout_mul_for_case "$tag" 2>/dev/null || true)"
-    if [ -n "$timeout_mul" ]; then
-        ( export LTP_TIMEOUT_MUL="$timeout_mul"; "$@" )
-    else
-        "$@"
-    fi
-}
-
 run_ltp_command() {
     root="$1"
     flavor="$2"
@@ -296,7 +278,7 @@ run_ltp_command() {
         override="/opt/oscomp-support/ltp-cases/$flavor/$key"
         if [ -f "$override" ]; then
             echo "RUN LTP CASE $tag"
-            run_ltp_case_cmd "$tag" run_shell "$root" "$override" "$@" < /dev/null
+            run_shell "$root" "$override" "$@" < /dev/null
             ret=$?
             finish_ltp_case "$ret"
             return 0
@@ -307,10 +289,10 @@ run_ltp_command() {
         echo "RUN LTP CASE $tag"
         case "$prog" in
             *.sh)
-                run_ltp_case_cmd "$tag" run_shell "$root" "./$prog" "$@" < /dev/null
+                run_shell "$root" "./$prog" "$@" < /dev/null
                 ;;
             *)
-                run_ltp_case_cmd "$tag" "./$prog" "$@" < /dev/null
+                "./$prog" "$@" < /dev/null
                 ;;
         esac
         ret=$?
@@ -321,7 +303,7 @@ run_ltp_command() {
     script="$root/ltp/testscripts/$prog"
     if [ -f "$script" ]; then
         echo "RUN LTP CASE $tag"
-        run_ltp_case_cmd "$tag" run_shell "$root" "$script" "$@" < /dev/null
+        run_shell "$root" "$script" "$@" < /dev/null
         ret=$?
         finish_ltp_case "$ret"
     fi
