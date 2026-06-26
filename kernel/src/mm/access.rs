@@ -384,12 +384,18 @@ unsafe impl VmIo for Vm {
     }
 
     fn read(&mut self, start: usize, buf: &mut [MaybeUninit<u8>]) -> VmResult {
-        populate_user_range(start, buf.len(), MappingFlags::READ)?;
+        // Reject non-user pointers up front; let the copy fault-in pages lazily
+        // via the page-fault handler (accessing_user_memory is set inside
+        // copy_user_bytes). This avoids an aspace mutex lock + VMA iteration +
+        // per-page page-table walk on every syscall that copies user memory.
+        // On the 1-vCPU evaluator the aspace is uncontended during the
+        // IRQ-masked copy, so the fault path never sleeps.
+        check_access(start, buf.len())?;
         copy_user_bytes(buf.as_mut_ptr() as *mut _, start as _, buf.len())
     }
 
     fn write(&mut self, start: usize, buf: &[u8]) -> VmResult {
-        populate_user_range(start, buf.len(), MappingFlags::WRITE)?;
+        check_access(start, buf.len())?;
         copy_user_bytes(start as _, buf.as_ptr() as *const _, buf.len())
     }
 }

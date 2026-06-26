@@ -343,6 +343,10 @@ impl Default for OpenOptions {
 }
 
 const PAGE_SIZE: usize = 4096;
+/// Sequential-read readahead window in pages. On a cache miss we issue one
+/// device read for up to this many pages and populate the page cache ahead of
+/// the scan, amortizing the per-request ext4-lock + lwext4 + virtio-blk cost.
+const READAHEAD_PAGES: usize = 4;
 const MAX_DIRTY_WRITEBACK_PAGES: usize = 16;
 const IN_MEMORY_PAGE_CACHE_PAGES: usize = 16;
 static DIRTY_PAGE_CACHE_PFNS: Once<Mutex<BTreeSet<usize>>> = Once::new();
@@ -850,27 +854,67 @@ impl CachedFile {
         if cache.contains(&pn) {
             return Ok(None);
         }
+        let cap = cache.cap().get();
         let mut evicted = None;
-        if cache.len() == cache.cap().get() {
-            // Cache is full, remove the least recently used page
-            if let Some((pn, mut page)) = cache.pop_lru() {
-                let retain_page = self.evict_cache(file, pn, &mut page)?;
-                let page = retain_page.then_some(page);
-                evicted = Some(EvictedPage { pn, _page: page });
+        // Make room for the requested page. The caller may receive this
+        // EvictedPage; any further evictions done for readahead below are
+        // written back and dropped.
+        if cache.len() >= cap {
+            if let Some((epn, mut epage)) = cache.pop_lru() {
+                let retain_page = self.evict_cache(file, epn, &mut epage)?;
+                let page = retain_page.then_some(epage);
+                evicted = Some(EvictedPage { pn: epn, _page: page });
             }
         }
 
-        // Page not in cache, read it
+        if !load_from_file {
+            let mut page = PageCache::new()?;
+            page.data().fill(0);
+            cache.put(pn, page);
+            return Ok(evicted);
+        }
+
+        // Readahead: read up to READAHEAD_PAGES pages in one device read into a
+        // scratch buffer, then populate the cache for the requested page and the
+        // following pages. Subsequent reads in a sequential scan hit the cache
+        // instead of re-issuing device I/O.
+        let avail = cap.saturating_sub(cache.len());
+        let ra = READAHEAD_PAGES.min(avail).max(1);
+        let base = pn as u64 * PAGE_SIZE as u64;
+        let mut buf = [0u8; READAHEAD_PAGES * PAGE_SIZE];
+        let read = file.read_at(&mut buf[..ra * PAGE_SIZE], base)?;
+
+        // The requested page.
         let mut page = PageCache::new()?;
         let data = page.data();
         data.fill(0);
-        if load_from_file {
-            let read = file.read_at(data, pn as u64 * PAGE_SIZE as u64)?;
-            if read < PAGE_SIZE {
-                data[read..].fill(0);
-            }
-        }
+        let n0 = read.min(PAGE_SIZE);
+        data[..n0].copy_from_slice(&buf[..n0]);
         cache.put(pn, page);
+
+        // Prefetch the subsequent pages already fetched into buf.
+        for i in 1..ra {
+            let off = i * PAGE_SIZE;
+            if off >= read {
+                break; // reached EOF
+            }
+            let next_pn = pn + i as u32;
+            if cache.contains(&next_pn) {
+                continue;
+            }
+            if cache.len() >= cap {
+                if let Some((epn, mut epage)) = cache.pop_lru() {
+                    let _ = self.evict_cache(file, epn, &mut epage)?;
+                }
+            }
+            let mut np = PageCache::new()?;
+            let nd = np.data();
+            nd.fill(0);
+            let chunk_end = (off + PAGE_SIZE).min(read);
+            nd[..chunk_end - off].copy_from_slice(&buf[off..chunk_end]);
+            cache.put(next_pn, np);
+        }
+
         Ok(evicted)
     }
 
