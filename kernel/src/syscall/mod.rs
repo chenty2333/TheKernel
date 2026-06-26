@@ -14,7 +14,7 @@ mod time;
 
 use core::time::Duration;
 
-use axerrno::{AxError, LinuxError};
+use axerrno::{AxError, AxResult, LinuxError};
 use axhal::uspace::UserContext;
 use axnet::options::{Configurable, GetSocketOption};
 use axtask::current;
@@ -108,6 +108,25 @@ fn maybe_request_syscall_restart(thr: &Thread, result: &Result<isize, AxError>) 
     thr.request_syscall_restart();
 }
 
+/// Fast path for trivial getter syscalls that only read from the current
+/// thread and return a scalar: no user copy, no restart, no blocking, no
+/// timer accounting. Handling them here skips the per-syscall
+/// enter_syscall/set_timer_state/restart bookkeeping, cutting the null-syscall
+/// latency that lmbench measures. Signal delivery and preemption run in the
+/// user-mode loop after handle_syscall returns, so they remain correct.
+fn fast_path_getter(sysno: Sysno) -> Option<AxResult<isize>> {
+    Some(match sysno {
+        Sysno::getpid => sys_getpid(),
+        Sysno::getppid => sys_getppid(),
+        Sysno::gettid => sys_gettid(),
+        Sysno::getuid => sys_getuid(),
+        Sysno::geteuid => sys_geteuid(),
+        Sysno::getgid => sys_getgid(),
+        Sysno::getegid => sys_getegid(),
+        _ => return None,
+    })
+}
+
 pub fn handle_syscall(uctx: &mut UserContext) {
     let Some(sysno) = Sysno::new(uctx.sysno()) else {
         warn!("Invalid syscall number: {}", uctx.sysno());
@@ -116,6 +135,11 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     };
 
     trace!("Syscall {sysno:?}");
+
+    if let Some(result) = fast_path_getter(sysno) {
+        uctx.set_retval(result.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
+        return;
+    }
     let curr = current();
     let thr = curr.as_thread();
     let signal_handler_depth = thr.signal_handler_depth();
