@@ -166,7 +166,8 @@ impl CowBackend {
         flags: MappingFlags,
         pt: &mut PageTableCursor,
     ) -> AxResult {
-        let Some(frame) = FRAME_TABLE.lock().get_frame_ref(paddr) else {
+        let frame = { FRAME_TABLE.lock().get_frame_ref(paddr) };
+        let Some(frame) = frame else {
             pt.protect(vaddr, page_table_flags(flags))?;
             self.mark_materialized();
             return Ok(());
@@ -369,7 +370,8 @@ impl BackendOps for CowBackend {
         let materialized = pt.drain_present_leaves(range.start, range.size())?;
         for (_addr, frame, _flags, page_size) in materialized {
             assert_eq!(page_size, self.size);
-            if let Some(frame_ref) = FRAME_TABLE.lock().get_frame_ref(frame) {
+            let frame_ref = { FRAME_TABLE.lock().get_frame_ref(frame) };
+            if let Some(frame_ref) = frame_ref {
                 let mut frame_ref = frame_ref.lock();
                 frame_ref.drop_frame(frame, self.size);
             } else {
