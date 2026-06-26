@@ -25,7 +25,9 @@ llseek03
 fgetxattr02
 clock_settime02
 clone302
-ln_tests.sh
+# Covered by the canonical ln01_sh entry later in this list. Keep only the
+# named LTP case to avoid duplicate shell cleanup in full glibc+musl runs.
+# ln_tests.sh
 getrlimit01
 getrlimit03
 openat201
