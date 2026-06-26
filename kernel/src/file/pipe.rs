@@ -604,7 +604,8 @@ impl FileLike for Pipe {
             return Ok(0);
         }
 
-        block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
+        let nonblocking = self.nonblocking();
+        block_on(poll_io(self, IoEvents::IN, nonblocking, || {
             let read = {
                 let cons = self.shared.buffer.lock();
                 let (left, right) = cons.as_slices();
@@ -637,8 +638,9 @@ impl FileLike for Pipe {
 
         let atomic_len = (size <= PIPE_BUF_SIZE).then_some(size);
         let mut total_written = 0;
+        let nonblocking = self.nonblocking();
 
-        block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
+        block_on(poll_io(self, IoEvents::OUT, nonblocking, || {
             if self.closed() {
                 raise_pipe();
                 return Err(AxError::BrokenPipe);

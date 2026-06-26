@@ -826,7 +826,7 @@ impl AxRunQueue {
 
 fn poll_gc(cx: &mut Context<'_>) -> Poll<()> {
     loop {
-        reclaim_exited_tasks_current_cpu();
+        let retained = reclaim_exited_tasks_current_cpu();
         // Note: we cannot block current task with preemption disabled,
         // use `current_ref_raw` to get the `WAIT_FOR_EXIT`'s reference here to avoid
         // the use of `NoPreemptGuard`. Since gc task is pinned to the current
@@ -836,6 +836,14 @@ fn poll_gc(cx: &mut Context<'_>) -> Poll<()> {
         // New tasks might be added during the above section, recheck it to
         // prevent us from sleeping indefinitely.
         if EXITED_TASKS_COUNT.with_current(|c| c.load(core::sync::atomic::Ordering::Relaxed)) == 0 {
+            break;
+        }
+        // A just-exited child can still be held by the clone/wakeup path that
+        // spawned it. Re-polling immediately would spin the GC task against a
+        // transient reference and steal CPU from fork/thread-heavy workloads.
+        // Later exits wake the GC again, and explicit reclaim points in clone
+        // and wait drain any retained task once that reference is gone.
+        if retained {
             break;
         }
 
@@ -859,14 +867,20 @@ fn clear_exited_tasks() {
 }
 
 pub(crate) fn has_exited_tasks() -> bool {
-    EXITED_TASKS_COUNT.with_current(|c| c.load(core::sync::atomic::Ordering::Relaxed)) > 0
+    let len = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.len());
+    EXITED_TASKS_COUNT.with_current(|c| {
+        c.store(len, core::sync::atomic::Ordering::Relaxed);
+    });
+    len > 0
 }
 
-pub(crate) fn reclaim_exited_tasks_current_cpu() {
+pub(crate) fn reclaim_exited_tasks_current_cpu() -> bool {
     // Snapshot the current queue depth so that tasks re-pushed because
     // Arc::try_unwrap failed are deferred to a later round rather than
     // keeping this loop spinning forever.
-    let n = EXITED_TASKS_COUNT.with_current(|c| c.load(core::sync::atomic::Ordering::Relaxed));
+    let n = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.len());
+    EXITED_TASKS_COUNT.with_current(|c| c.store(n, core::sync::atomic::Ordering::Relaxed));
+    let mut retained = false;
     for _ in 0..n {
         let Some(task) = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.pop_front()) else {
             break;
@@ -883,10 +897,16 @@ pub(crate) fn reclaim_exited_tasks_current_cpu() {
             Err(task) => {
                 // Still held by a joiner or scheduler handoff; push back for a
                 // later round.
+                retained = true;
                 push_exited_task(task);
             }
         }
     }
+    let remaining = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.len());
+    EXITED_TASKS_COUNT.with_current(|c| {
+        c.store(remaining, core::sync::atomic::Ordering::Relaxed);
+    });
+    retained
 }
 
 /// The task routine for migrating the current task to the correct CPU.

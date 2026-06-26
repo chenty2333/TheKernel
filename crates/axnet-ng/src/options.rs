@@ -71,6 +71,7 @@ define_options! {
 
     // ---- IP level options (IP_*) ----
     Ttl(u8),
+    Ipv6Only(bool),
 
     // ---- Extra options ----
     NonBlocking(bool),

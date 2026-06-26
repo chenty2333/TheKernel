@@ -1,5 +1,8 @@
 use alloc::vec;
-use core::ffi::{c_char, c_int};
+use core::{
+    ffi::{c_char, c_int},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FileFlags, OpenOptions};
@@ -38,6 +41,19 @@ const FALLOC_IO_CHUNK: usize = 0x1000;
 const MAX_FILE_OFFSET: u64 = i64::MAX as u64;
 const SPLICE_F_MOVE: u32 = 0x01;
 const SPLICE_F_NONBLOCK: u32 = 0x02;
+const FILE_IO_COOPERATE_INTERVAL: usize = 256;
+
+static FILE_IO_COOPERATE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn cooperate_after_regular_file_io(done: isize) {
+    if done <= 0 {
+        return;
+    }
+    let count = FILE_IO_COOPERATE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    if count % FILE_IO_COOPERATE_INTERVAL == 0 {
+        axtask::yield_now();
+    }
+}
 const SPLICE_F_MORE: u32 = 0x04;
 const SPLICE_F_GIFT: u32 = 0x08;
 const SPLICE_F_ALL: u32 = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
@@ -193,12 +209,18 @@ pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
         crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
     }
     let f = get_file_like(fd)?;
-    if let Some(file) = f.downcast_ref::<File>() {
+    let is_regular_file = if let Some(file) = f.downcast_ref::<File>() {
         validate_direct_io(file, buf as usize, len, current_file_offset(file.inner())?)?;
-    }
+        true
+    } else {
+        false
+    };
     let read = f.read(&mut VmBytesMut::new(buf, len))? as isize;
     if read > 0 {
         notify_read(fd);
+        if is_regular_file {
+            cooperate_after_regular_file_io(read);
+        }
     }
     Ok(read)
 }
@@ -210,12 +232,18 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     }
     let f = get_file_like(fd)?;
     let iov = IoVectorBuf::new(iov, iovcnt)?;
-    if let Some(file) = f.downcast_ref::<File>() {
+    let is_regular_file = if let Some(file) = f.downcast_ref::<File>() {
         validate_direct_iov(file, &iov, current_file_offset(file.inner())?)?;
-    }
+        true
+    } else {
+        false
+    };
     let read = f.read(&mut iov.into_io())? as isize;
     if read > 0 {
         notify_read(fd);
+        if is_regular_file {
+            cooperate_after_regular_file_io(read);
+        }
     }
     Ok(read)
 }
@@ -226,7 +254,7 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
 pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     debug!("sys_write <= fd: {fd}, buf: {buf:p}, len: {len}");
     let f = get_file_like(fd)?;
-    if let Some(file) = f.downcast_ref::<File>() {
+    let is_regular_file = if let Some(file) = f.downcast_ref::<File>() {
         file.inner().access(FileFlags::WRITE)?;
         if len != 0 {
             check_writable_mount(file.inner().location())?;
@@ -237,11 +265,17 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
             current_file_offset(file.inner())?
         };
         validate_direct_io(file, buf as usize, len, offset)?;
-    }
+        true
+    } else {
+        false
+    };
     let written = f.with_write_credentials(|| f.write(&mut VmBytes::new(buf, len)))? as isize;
     if written > 0 {
         sync_file_like_after_status_write(&f)?;
         notify_write(fd);
+        if is_regular_file {
+            cooperate_after_regular_file_io(written);
+        }
     }
     Ok(written)
 }
@@ -264,6 +298,7 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> 
         let written = file.with_write_credentials(|| file.write(&mut iov.into_io()))?;
         if written > 0 {
             sync_file_after_status_write(&file)?;
+            cooperate_after_regular_file_io(written as isize);
         }
         written
     } else {

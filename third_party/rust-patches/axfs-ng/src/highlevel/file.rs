@@ -6,13 +6,18 @@ use alloc::{
     vec::Vec,
 };
 #[cfg(feature = "times")]
-use core::sync::atomic::{AtomicU8, Ordering};
-use core::{num::NonZeroUsize, ops::Range, task::Context};
+use core::sync::atomic::AtomicU8;
+use core::{
+    num::NonZeroUsize,
+    ops::Range,
+    sync::atomic::{AtomicBool, Ordering},
+    task::Context,
+};
 
 use axalloc::{UsageKind, global_allocator};
 use axfs_ng_vfs::{
-    FileNode, Location, MetadataUpdate, NodeFlags, NodePermission, NodeType, VfsError, VfsResult,
-    path::Path,
+    FileNode, Location, MetadataUpdate, Mountpoint, NodeFlags, NodePermission, NodeType, VfsError,
+    VfsResult, WeakDirEntry, path::Path,
 };
 use axhal::mem::{PhysAddr, VirtAddr, total_ram_size, virt_to_phys};
 use axio::{SeekFrom, prelude::*};
@@ -338,6 +343,7 @@ impl Default for OpenOptions {
 }
 
 const PAGE_SIZE: usize = 4096;
+const MAX_DIRTY_WRITEBACK_PAGES: usize = 16;
 const IN_MEMORY_PAGE_CACHE_PAGES: usize = 16;
 static DIRTY_PAGE_CACHE_PFNS: Once<Mutex<BTreeSet<usize>>> = Once::new();
 static FILE_CACHE_REGISTRY: Once<Mutex<BTreeMap<(u64, u64), FileUserData>>> = Once::new();
@@ -363,12 +369,12 @@ fn cached_file_shared_for_location(location: &Location) -> Option<Arc<CachedFile
     file_cache_registry()
         .lock()
         .get(&key)
-        .and_then(FileUserData::get)
+        .and_then(FileUserData::shared)
         .or_else(|| {
             location
                 .user_data()
                 .get::<FileUserData>()
-                .and_then(|it| it.get())
+                .and_then(|it| it.shared())
         })
 }
 
@@ -376,25 +382,25 @@ fn cached_file_shared_for_location_or_create(location: &Location) -> Arc<CachedF
     let key = cached_file_registry_key(location);
     let mut registry = file_cache_registry().lock();
 
-    if let Some(shared) = registry.get(&key).and_then(FileUserData::get) {
+    if let Some(shared) = registry.get(&key).and_then(FileUserData::shared) {
         return shared;
     }
 
     if let Some(shared) = location
         .user_data()
         .get::<FileUserData>()
-        .and_then(|it| it.get())
+        .and_then(|it| it.shared())
     {
-        registry.insert(key, FileUserData::Weak(Arc::downgrade(&shared)));
+        registry.insert(key, FileUserData::new(location, &shared));
         return shared;
     }
 
     let shared = Arc::new(CachedFileShared::new(cached_file_is_in_memory(location)));
-    registry.insert(key, FileUserData::Weak(Arc::downgrade(&shared)));
+    registry.insert(key, FileUserData::new(location, &shared));
 
     location
         .user_data()
-        .insert(FileUserData::Weak(Arc::downgrade(&shared)));
+        .insert(FileUserData::new(location, &shared));
 
     shared
 }
@@ -408,7 +414,7 @@ pub fn remove_cached_file_registry_entry(device: u64, inode: u64) {
 pub fn prune_dead_cached_file_registry_entries_for_inode(inode: u64) {
     file_cache_registry()
         .lock()
-        .retain(|(_, entry_inode), entry| *entry_inode != inode || entry.get().is_some());
+        .retain(|(_, entry_inode), entry| *entry_inode != inode || entry.shared().is_some());
 }
 
 /// Flushes and drops cached pages before backend storage is changed out-of-band.
@@ -432,6 +438,46 @@ pub fn sync_and_invalidate_cached_file_pages(location: &Location) -> VfsResult<(
 /// Returns whether the page-cache page with the given PFN is currently dirty.
 pub fn page_cache_pfn_is_dirty(pfn: usize) -> bool {
     dirty_page_cache_pfns().lock().contains(&pfn)
+}
+
+fn discard_cached_pages(shared: &CachedFileShared) {
+    let mut guard = shared.page_cache.lock();
+    while let Some((_pn, mut page)) = guard.pop_lru() {
+        page.clear_dirty();
+    }
+}
+
+/// Marks cached pages for an inode whose final directory entry is being removed.
+pub fn mark_cached_file_unlinked(location: &Location) {
+    if let Some(shared) = cached_file_shared_for_location(location) {
+        shared.unlinked.store(true, Ordering::Release);
+    }
+}
+
+/// Flushes all live dirty cached file pages before a global sync.
+pub fn sync_all_cached_file_pages() -> VfsResult<()> {
+    let entries = {
+        let mut registry = file_cache_registry().lock();
+        registry.retain(|_, entry| entry.shared().is_some() && entry.location().is_some());
+        registry
+            .values()
+            .filter_map(|entry| Some((entry.shared()?, entry.location()?)))
+            .collect::<Vec<_>>()
+    };
+
+    for (shared, location) in entries {
+        if shared.unlinked.load(Ordering::Acquire) {
+            continue;
+        }
+        let file = location.entry().as_file()?;
+        let cached = CachedFile {
+            in_memory: cached_file_is_in_memory(&location),
+            inner: location.clone(),
+            shared,
+        };
+        cached.flush_dirty_cache(file)?;
+    }
+    Ok(())
 }
 
 /// A single page-sized cache entry backed by a physical page.
@@ -498,7 +544,16 @@ impl Drop for PageCache {
     }
 }
 
-type EvictListenerFn = Box<dyn Fn(u32, &PageCache) + Send + Sync>;
+type EvictListenerFn = Arc<dyn Fn(u32, &PageCache) + Send + Sync>;
+
+fn evict_listeners_snapshot(shared: &CachedFileShared) -> Vec<EvictListenerFn> {
+    shared
+        .evict_listeners
+        .lock()
+        .iter()
+        .map(|listener| listener.listener.clone())
+        .collect()
+}
 
 fn writeback_cached_page(
     shared: &CachedFileShared,
@@ -506,10 +561,10 @@ fn writeback_cached_page(
     pn: u32,
     page: &mut PageCache,
 ) -> VfsResult<bool> {
-    let mut had_evict_listener = false;
-    for listener in shared.evict_listeners.lock().iter() {
-        had_evict_listener = true;
-        (listener.listener)(pn, page);
+    let listeners = evict_listeners_snapshot(shared);
+    let had_evict_listener = !listeners.is_empty();
+    for listener in listeners {
+        listener(pn, page);
     }
     if page.dirty {
         let page_start = pn as u64 * PAGE_SIZE as u64;
@@ -542,10 +597,10 @@ fn per_file_page_cache_capacity() -> NonZeroUsize {
     let pages = if ram <= 512 * MIB {
         64
     } else if ram <= 2 * GIB {
-        256
+        2048
     } else {
         let extra_gib = (ram - 2 * GIB) / GIB;
-        512usize.saturating_add(extra_gib.saturating_mul(128))
+        2048usize.saturating_add(extra_gib.saturating_mul(256))
     };
     NonZeroUsize::new(pages).unwrap()
 }
@@ -564,6 +619,7 @@ intrusive_adapter!(EvictListenerAdapter = Box<EvictListener>: EvictListener { li
 struct CachedFileShared {
     page_cache: Mutex<LruCache<u32, PageCache>>,
     evict_listeners: Mutex<LinkedList<EvictListenerAdapter>>,
+    unlinked: AtomicBool,
     /// Serializes cached page-cache users with direct-I/O cache drains.
     direct_io_lock: RwLock<()>,
     /// Serializes O_APPEND writes across all cached handles for this inode.
@@ -580,6 +636,7 @@ impl CachedFileShared {
         Self {
             page_cache: Mutex::new(new_bounded_page_cache_store(capacity)),
             evict_listeners: Mutex::new(LinkedList::default()),
+            unlinked: AtomicBool::new(false),
             direct_io_lock: RwLock::new(()),
             append_lock: RwLock::new(()),
         }
@@ -607,15 +664,27 @@ impl Clone for CachedFile {
     }
 }
 
-enum FileUserData {
-    Weak(Weak<CachedFileShared>),
+struct FileUserData {
+    shared: Weak<CachedFileShared>,
+    mountpoint: Weak<Mountpoint>,
+    entry: WeakDirEntry,
 }
 
 impl FileUserData {
-    pub fn get(&self) -> Option<Arc<CachedFileShared>> {
-        match self {
-            FileUserData::Weak(weak) => weak.upgrade(),
+    fn new(location: &Location, shared: &Arc<CachedFileShared>) -> Self {
+        Self {
+            shared: Arc::downgrade(shared),
+            mountpoint: Arc::downgrade(location.mountpoint()),
+            entry: location.entry().downgrade(),
         }
+    }
+
+    pub fn shared(&self) -> Option<Arc<CachedFileShared>> {
+        self.shared.upgrade()
+    }
+
+    pub fn location(&self) -> Option<Location> {
+        Some(Location::new(self.mountpoint.upgrade()?, self.entry.upgrade()?))
     }
 }
 
@@ -651,7 +720,7 @@ impl CachedFile {
         F: Fn(u32, &PageCache) + Send + Sync + 'static,
     {
         let pointer = Box::new(EvictListener {
-            listener: Box::new(listener),
+            listener: Arc::new(listener),
             link: LinkedListAtomicLink::new(),
         });
         let handle = pointer.as_ref() as *const EvictListener as usize;
@@ -688,6 +757,10 @@ impl CachedFile {
         Ok(())
     }
 
+    fn discard_cache(&self) {
+        discard_cached_pages(&self.shared);
+    }
+
     fn sync_in_memory_cache(&self) {
         let Ok(file) = self.inner.entry().as_file() else {
             return;
@@ -699,19 +772,61 @@ impl CachedFile {
 
     fn flush_dirty_cache(&self, file: &FileNode) -> VfsResult<()> {
         let mut guard = self.shared.page_cache.lock();
-        for (pn, page) in guard.iter_mut() {
-            if !page.is_dirty() {
+        let file_len = file.len()?;
+        let mut dirty_pages = guard
+            .iter()
+            .filter_map(|(pn, page)| page.is_dirty().then_some(*pn))
+            .collect::<Vec<_>>();
+        dirty_pages.sort_unstable();
+
+        let mut start = 0;
+        while start < dirty_pages.len() {
+            let first_pn = dirty_pages[start];
+            let end_limit = (start + MAX_DIRTY_WRITEBACK_PAGES).min(dirty_pages.len());
+            let mut end = start + 1;
+            while end < end_limit && dirty_pages[end] == dirty_pages[end - 1] + 1 {
+                end += 1;
+            }
+
+            let page_start = first_pn as u64 * PAGE_SIZE as u64;
+            let max_len = file_len
+                .saturating_sub(page_start)
+                .min(((end - start) * PAGE_SIZE) as u64) as usize;
+            if max_len == 0 {
+                for pn in &dirty_pages[start..end] {
+                    if let Some(page) = guard.get_mut(pn) {
+                        page.clear_dirty();
+                    }
+                }
+                start = end;
                 continue;
             }
-            for listener in self.shared.evict_listeners.lock().iter() {
-                (listener.listener)(*pn, page);
+
+            let mut data = vec![0; max_len];
+            for (idx, pn) in dirty_pages[start..end].iter().enumerate() {
+                let Some(page) = guard.get_mut(pn) else {
+                    continue;
+                };
+                for listener in evict_listeners_snapshot(&self.shared) {
+                    listener(*pn, page);
+                }
+                let dst_start = idx * PAGE_SIZE;
+                if dst_start >= max_len {
+                    continue;
+                }
+                let len = (max_len - dst_start).min(PAGE_SIZE);
+                data[dst_start..dst_start + len].copy_from_slice(&page.data()[..len]);
             }
-            let page_start = *pn as u64 * PAGE_SIZE as u64;
-            let len = (file.len()?.saturating_sub(page_start)).min(PAGE_SIZE as u64) as usize;
-            if len > 0 {
-                file.write_at(&page.data()[..len], page_start)?;
+
+            file.write_at(&data, page_start)?;
+
+            for pn in &dirty_pages[start..end] {
+                if let Some(page) = guard.get_mut(pn) {
+                    page.clear_dirty();
+                }
             }
-            page.clear_dirty();
+
+            start = end;
         }
         Ok(())
     }
@@ -721,6 +836,16 @@ impl CachedFile {
         file: &FileNode,
         cache: &mut LruCache<u32, PageCache>,
         pn: u32,
+    ) -> VfsResult<Option<EvictedPage>> {
+        self.ensure_page_cached_with(file, cache, pn, true)
+    }
+
+    fn ensure_page_cached_with(
+        &self,
+        file: &FileNode,
+        cache: &mut LruCache<u32, PageCache>,
+        pn: u32,
+        load_from_file: bool,
     ) -> VfsResult<Option<EvictedPage>> {
         if cache.contains(&pn) {
             return Ok(None);
@@ -739,9 +864,11 @@ impl CachedFile {
         let mut page = PageCache::new()?;
         let data = page.data();
         data.fill(0);
-        let read = file.read_at(data, pn as u64 * PAGE_SIZE as u64)?;
-        if read < PAGE_SIZE {
-            data[read..].fill(0);
+        if load_from_file {
+            let read = file.read_at(data, pn as u64 * PAGE_SIZE as u64)?;
+            if read < PAGE_SIZE {
+                data[read..].fill(0);
+            }
         }
         cache.put(pn, page);
         Ok(evicted)
@@ -777,6 +904,7 @@ impl CachedFile {
         &self,
         range: Range<u64>,
         page_initial: impl FnOnce(&FileNode) -> VfsResult<T>,
+        mut load_page: impl FnMut(u64, &Range<usize>) -> bool,
         mut page_each: impl FnMut(T, &mut PageCache, u64, Range<usize>) -> VfsResult<T>,
     ) -> VfsResult<T> {
         let file = self.inner.entry().as_file()?;
@@ -788,15 +916,13 @@ impl CachedFile {
             let page_start = pn as u64 * PAGE_SIZE as u64;
 
             let mut guard = self.shared.page_cache.lock();
-            self.ensure_page_cached(file, &mut guard, pn)?;
+            let page_range =
+                page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize;
+            let load_from_file = load_page(page_start, &page_range);
+            self.ensure_page_cached_with(file, &mut guard, pn, load_from_file)?;
             let page = guard.get_mut(&pn).unwrap();
 
-            initial = page_each(
-                initial,
-                page,
-                page_start,
-                page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize,
-            )?;
+            initial = page_each(initial, page, page_start, page_range)?;
             page_offset = 0;
         }
 
@@ -814,6 +940,7 @@ impl CachedFile {
         self.with_pages(
             offset..end,
             |_| Ok(0),
+            |_, _| true,
             |read, page, _page_start, range| {
                 let len = range.end - range.start;
                 dst.write(&page.data()[range.start..range.end])?;
@@ -832,18 +959,11 @@ impl CachedFile {
                 }
                 Ok(0)
             },
-            |written, page, page_start, range| {
+            |_, range| !(range.start == 0 && range.end == PAGE_SIZE),
+            |written, page, _page_start, range| {
                 let len = range.end - range.start;
                 buf.read(&mut page.data()[range.start..range.end])?;
-                if self.in_memory {
-                    page.mark_dirty();
-                } else {
-                    let start = page_start + range.start as u64;
-                    self.inner
-                        .entry()
-                        .as_file()?
-                        .write_at(&page.data()[range.start..range.end], start)?;
-                }
+                page.mark_dirty();
                 Ok(written + len)
             },
         )
@@ -932,7 +1052,7 @@ impl CachedFile {
             return Ok(());
         }
         let file = self.inner.entry().as_file()?;
-        self.drain_cache(file)?;
+        self.flush_dirty_cache(file)?;
         file.sync(data_only)?;
         Ok(())
     }
@@ -948,6 +1068,10 @@ impl Drop for CachedFile {
         if Arc::strong_count(&self.shared) > 1 {
             // If there are other references to this cached file, we don't
             // need to drop it.
+            return;
+        }
+        if self.shared.unlinked.load(Ordering::Acquire) {
+            self.discard_cache();
             return;
         }
         let file = match self.inner.entry().as_file() {

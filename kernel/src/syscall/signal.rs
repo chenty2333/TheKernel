@@ -356,16 +356,20 @@ pub fn sys_rt_sigtimedwait(
 
     uctx.set_retval(-LinuxError::EINTR.code() as usize);
     let fut = poll_fn(|cx| {
-        if let Some(sig) = signal.dequeue_signal(&set) {
-            signal.set_real_blocked(None);
-            signal.set_blocked(old_blocked);
-            Poll::Ready(Some(sig))
-        } else if check_signals(thr, uctx, Some(old_blocked)) {
-            signal.set_real_blocked(None);
-            Poll::Ready(None)
-        } else {
-            let _ = curr.poll_interrupt(cx);
-            Poll::Pending
+        loop {
+            if let Some(sig) = signal.dequeue_signal(&set) {
+                signal.set_real_blocked(None);
+                signal.set_blocked(old_blocked);
+                return Poll::Ready(Some(sig));
+            }
+            if check_signals(thr, uctx, Some(old_blocked)) {
+                signal.set_real_blocked(None);
+                return Poll::Ready(None);
+            }
+
+            if curr.poll_interrupt(cx).is_pending() {
+                return Poll::Pending;
+            }
         }
     });
 
@@ -399,18 +403,28 @@ pub fn sys_rt_sigsuspend(
     let thr = curr.as_thread();
 
     let set = unsafe { set.vm_read_uninit()?.assume_init() };
-    let old_blocked = thr.signal.set_blocked(set);
+    let old_blocked = thr.signal.blocked();
+    thr.signal.set_real_blocked(Some(old_blocked));
+    thr.signal.set_blocked(set);
 
     // sigsuspend always returns -EINTR when a signal is caught
     // We set this in uctx before check_signals so it's saved in SignalFrame
     uctx.set_retval(-LinuxError::EINTR.code() as usize);
 
     block_on(poll_fn(|cx| {
-        if check_signals(thr, uctx, Some(old_blocked)) {
-            return Poll::Ready(());
+        loop {
+            if check_signals(thr, uctx, Some(old_blocked)) {
+                thr.signal.set_real_blocked(None);
+                return Poll::Ready(());
+            }
+
+            if curr.poll_interrupt(cx).is_pending() {
+                return Poll::Pending;
+            }
+            // A stale task interrupt can be consumed without a deliverable
+            // signal. Poll again so the current waker is registered before the
+            // task blocks; otherwise the next signal can be lost.
         }
-        let _ = curr.poll_interrupt(cx);
-        Poll::Pending
     }));
 
     // sigsuspend always returns -EINTR

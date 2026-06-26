@@ -591,6 +591,22 @@ impl AddrSpace {
         Ok(())
     }
 
+    /// Drops resident private anonymous pages while keeping the VMA layout.
+    pub fn discard_private_anonymous_pages(&mut self) {
+        let ranges = self
+            .areas
+            .iter()
+            .filter(|area| area.backend().is_private_anonymous())
+            .map(|area| (area.start(), area.size()))
+            .collect::<Vec<_>>();
+
+        for (start, size) in ranges {
+            if let Err(err) = self.discard_pages(start, size) {
+                warn!("AddrSpace::discard_private_anonymous_pages: {start:?}+{size:#x}: {err:?}");
+            }
+        }
+    }
+
     pub fn sync_backends_in_range(
         &self,
         mut start: VirtAddr,

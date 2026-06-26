@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::ffi::c_int;
 
 use axerrno::{AxError, AxResult};
@@ -113,4 +113,97 @@ pub fn close_file_like(fd: c_int) -> AxResult {
         Arc::strong_count(&f.description)
     );
     Ok(())
+}
+
+pub(crate) fn close_fd_table(
+    table: &mut FlattenObjects<FileDescriptor, AX_FILE_LIMIT>,
+) -> Vec<FileDescriptor> {
+    let mut closed = Vec::new();
+    let fds = table.ids().collect::<Vec<_>>();
+    for fd in fds {
+        if let Some(f) = table.remove(fd) {
+            release_posix_locks_on_close(&f.description);
+            closed.push(f);
+        }
+    }
+    closed
+}
+
+pub(crate) fn close_process_fd_table(scope: &mut scope_local::Scope) -> Vec<FileDescriptor> {
+    let mut fd_table = FD_TABLE.scope_mut(scope);
+    let mut closed = Vec::new();
+    if Arc::strong_count(&*fd_table) == 1 {
+        closed = close_fd_table(&mut fd_table.write());
+    }
+    *fd_table = Arc::default();
+    closed
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{borrow::Cow, sync::Arc};
+    use core::{
+        sync::atomic::{AtomicUsize, Ordering},
+        task::Context,
+    };
+
+    use axpoll::{IoEvents, Pollable};
+
+    use super::*;
+    use crate::task::AX_FILE_LIMIT;
+
+    struct DropCountingFile {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DropCountingFile {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Pollable for DropCountingFile {
+        fn poll(&self) -> IoEvents {
+            IoEvents::empty()
+        }
+
+        fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+    }
+
+    impl FileLike for DropCountingFile {
+        fn stat(&self) -> AxResult<crate::file::Kstat> {
+            Err(AxError::InvalidInput)
+        }
+
+        fn path(&self) -> Cow<'_, str> {
+            Cow::Borrowed("drop-counting-file")
+        }
+    }
+
+    fn descriptor_for(drops: &Arc<AtomicUsize>) -> FileDescriptor {
+        FileDescriptor {
+            description: FileDescription::new(Arc::new(DropCountingFile {
+                drops: drops.clone(),
+            })),
+            cloexec: false,
+        }
+    }
+
+    #[test]
+    fn close_fd_table_removes_all_descriptors_and_drops_files() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut table = FlattenObjects::<FileDescriptor, AX_FILE_LIMIT>::new();
+
+        assert!(table.add_at(0, descriptor_for(&drops)).is_ok());
+        assert!(table.add_at(7, descriptor_for(&drops)).is_ok());
+        assert_eq!(table.count(), 2);
+
+        let closed = close_fd_table(&mut table);
+
+        assert_eq!(table.count(), 0);
+        assert!(table.get(0).is_none());
+        assert!(table.get(7).is_none());
+        drop(closed);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
 }

@@ -970,6 +970,10 @@ fn detach_mapped_pid(pid: Pid) {
     }
 }
 
+pub(crate) fn detach_process(pid: Pid) {
+    detach_mapped_pid(pid);
+}
+
 fn cgroup_for_pid(pid: Pid) -> Option<Arc<CgroupDir>> {
     let weak = PID_CGROUPS.lock().get(&pid).cloned()?;
     let Some(dir) = weak.upgrade() else {

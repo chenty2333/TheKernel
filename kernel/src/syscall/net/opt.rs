@@ -173,6 +173,7 @@ macro_rules! call_dispatch {
             (PROTO_TCP, TCP_INFO) => TcpInfo,
 
             (PROTO_IP, IP_TTL) => Ttl as Int<u8>,
+            (SOL_IPV6, IPV6_V6ONLY) => Ipv6Only as IntBool,
         }
     }};
     ($dispatch:ident, $in:expr, $($pat:pat => $which:ident $(as $conv:ty)?),* $(,)?) => {
@@ -394,7 +395,9 @@ pub fn sys_getsockopt(
         };
     }
     match level {
-        SOL_SOCKET | PROTO_TCP | PROTO_IP => call_dispatch!(dispatch, (level, optname)),
+        SOL_SOCKET | PROTO_TCP | PROTO_IP | SOL_IPV6 => {
+            call_dispatch!(dispatch, (level, optname))
+        }
         _ => return Err(AxError::from(LinuxError::EOPNOTSUPP)),
     }
 
@@ -560,7 +563,9 @@ pub fn sys_setsockopt(
         };
     }
     match level {
-        SOL_SOCKET | PROTO_TCP | PROTO_IP => call_dispatch!(dispatch, (level, optname)),
+        SOL_SOCKET | PROTO_TCP | PROTO_IP | SOL_IPV6 => {
+            call_dispatch!(dispatch, (level, optname))
+        }
         _ => return Err(AxError::from(LinuxError::ENOPROTOOPT)),
     }
 

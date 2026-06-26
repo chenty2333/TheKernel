@@ -23,11 +23,12 @@ use starry_vm::{VmMutPtr, VmPtr};
 use weak_map::WeakMap;
 
 use super::{
-    AsThread, FutexKey, ProcStateHint, ProcessData, TaskUsage, TimerState, futex_table_for,
-    send_signal_thread_inner, send_signal_to_process, send_signal_to_thread,
+    AsThread, FutexKey, ITimerType, ProcStateHint, ProcessData, TaskUsage, TimerState,
+    futex_table_for, send_signal_thread_inner, send_signal_to_process, send_signal_to_thread,
 };
 use crate::{
     mm::{AddrSpace, UserPtr, access_user_memory},
+    pseudofs::cgroup,
     syscall::acct_process_exit,
 };
 
@@ -44,6 +45,33 @@ fn parent_sigchld_autoreap(parent: &ProcessData) -> (bool, bool) {
     let ignored = matches!(action.disposition, SignalDisposition::Ignore);
     let no_cldwait = action.flags.contains(SignalActionFlags::NOCLDWAIT);
     (ignored || no_cldwait, ignored)
+}
+
+fn notify_reaper_of_inherited_zombie(child: &Arc<Process>) {
+    let Some(parent) = child.parent() else {
+        return;
+    };
+    let Ok(parent_data) = get_process_data(parent.pid()) else {
+        return;
+    };
+
+    let (auto_reap, suppress_exit_signal) = if child.exit_signal() == Some(Signo::SIGCHLD as u8) {
+        parent_sigchld_autoreap(&parent_data)
+    } else {
+        (false, false)
+    };
+
+    if auto_reap {
+        if child.reap() {
+            cgroup::detach_process(child.pid());
+        }
+        return;
+    }
+
+    if !suppress_exit_signal && let Some(signo) = child.exit_signal().and_then(Signo::from_repr) {
+        let _ = send_signal_to_process(parent.pid(), Some(SignalInfo::new_kernel(signo)));
+    }
+    parent_data.child_exit_event.wake();
 }
 
 static SESSION_TABLE: RwLock<WeakMap<Pid, Weak<Session>>> = RwLock::new(WeakMap::new());
@@ -319,6 +347,24 @@ pub fn vm_write_in_aspace<T: Copy>(
     with_current_user_page_table_root(root, || ptr.vm_write(value)).map_err(Into::into)
 }
 
+fn detach_ptrace_links_on_process_exit(proc_data: &ProcessData) {
+    let pid = proc_data.proc.pid();
+    if let Some(tracer) = proc_data.clear_ptrace()
+        && let Ok(tracer_data) = get_process_data(tracer)
+    {
+        tracer_data.remove_ptrace_tracee(pid);
+    }
+
+    for tracee in proc_data.clear_ptrace_tracees() {
+        let Ok(tracee_data) = get_process_data(tracee) else {
+            continue;
+        };
+        if tracee_data.end_ptrace(pid) {
+            tracee_data.continue_job();
+        }
+    }
+}
+
 #[cfg(target_arch = "loongarch64")]
 fn with_current_task_ctx_mut<R>(f: impl FnOnce(&mut axhal::context::TaskContext) -> R) -> R {
     let _guard = NoPreemptIrqSave::new();
@@ -365,15 +411,42 @@ pub fn poll_timer(task: &TaskInner) {
     let Some(thr) = task.try_as_thread() else {
         return;
     };
-    let Ok(mut time) = thr.time.try_borrow_mut() else {
-        // reentrant borrow, likely IRQ
+    let mut signals = Vec::new();
+    let usage = {
+        let Ok(mut time) = thr.time.try_borrow_mut() else {
+            // reentrant borrow, likely IRQ
+            return;
+        };
+        time.poll(&mut signals);
+        let (utime, stime) = time.output();
+        TaskUsage::from_time_values(utime, stime)
+    };
+    thr.store_usage_snapshot(usage);
+    for signo in signals {
+        send_signal_thread_inner(task, thr, SignalInfo::new_kernel(signo));
+    }
+}
+
+pub fn poll_itimer_alarm(task: &TaskInner, ty: ITimerType, sequence: u64) {
+    let Some(thr) = task.try_as_thread() else {
         return;
     };
-    time.poll(|signo| {
+    let mut signals = Vec::new();
+    let usage = {
+        let Ok(mut time) = thr.time.try_borrow_mut() else {
+            return;
+        };
+        if !time.itimer_sequence_matches(ty, sequence) {
+            return;
+        }
+        time.poll(&mut signals);
+        let (utime, stime) = time.output();
+        TaskUsage::from_time_values(utime, stime)
+    };
+    thr.store_usage_snapshot(usage);
+    for signo in signals {
         send_signal_thread_inner(task, thr, SignalInfo::new_kernel(signo));
-    });
-    let (utime, stime) = time.output();
-    thr.store_usage_snapshot(TaskUsage::from_time_values(utime, stime));
+    }
 }
 
 /// Sets the timer state.
@@ -381,16 +454,21 @@ pub fn set_timer_state(task: &TaskInner, state: TimerState) {
     let Some(thr) = task.try_as_thread() else {
         return;
     };
-    let Ok(mut time) = thr.time.try_borrow_mut() else {
-        // reentrant borrow, likely IRQ
-        return;
+    let mut signals = Vec::new();
+    let usage = {
+        let Ok(mut time) = thr.time.try_borrow_mut() else {
+            // reentrant borrow, likely IRQ
+            return;
+        };
+        time.poll(&mut signals);
+        time.set_state(state);
+        let (utime, stime) = time.output();
+        TaskUsage::from_time_values(utime, stime)
     };
-    time.poll(|signo| {
+    thr.store_usage_snapshot(usage);
+    for signo in signals {
         send_signal_thread_inner(task, thr, SignalInfo::new_kernel(signo));
-    });
-    time.set_state(state);
-    let (utime, stime) = time.output();
-    thr.store_usage_snapshot(TaskUsage::from_time_values(utime, stime));
+    }
 }
 
 #[repr(C)]
@@ -527,6 +605,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     if !head.is_null() {
         exit_robust_list(head);
     }
+    drop(aspace);
 
     let process = &thr.proc_data.proc;
     set_timer_state(&curr, TimerState::Kernel);
@@ -538,6 +617,14 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     thr.proc_data.end_exec(tid);
     let process_exited = process.exit_thread(tid, exit_code);
     if process_exited {
+        // Drop resident anonymous memory before the zombie waits to be reaped.
+        // CLONE_VM can share this mm with a different live process, so only do
+        // this when the exiting process is the sole ProcessData owner. The VMA
+        // metadata and file mappings are still released by AddrSpace drop.
+        let aspace = thr.proc_data.aspace();
+        if Arc::strong_count(&aspace) == 2 {
+            aspace.lock().discard_private_anonymous_pages();
+        }
         let self_usage = thr.proc_data.self_usage();
         let child_usage = thr.proc_data.children_usage();
         let parent = process.parent();
@@ -556,6 +643,16 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
 
         acct_process_exit(&thr.proc_data, exit_code, self_usage);
         thr.proc_data.release_executable();
+        let closed_fds = thr.with_mut_scope(crate::file::close_process_fd_table);
+        // wait(2) may return as soon as the parent observes the zombie state.
+        // Child-owned file descriptions must be fully dropped before that point
+        // so close-time writeback and unlink interactions are complete.
+        drop(closed_fds);
+        detach_ptrace_links_on_process_exit(&thr.proc_data);
+        crate::syscall::SHM_MANAGER
+            .lock()
+            .clear_proc_shm(process.pid());
+        crate::file::flock::release_posix_owner(process.pid());
         if !auto_reap {
             process.publish_zombie_snapshot(ZombieSnapshot {
                 wait_status: process.exit_code(),
@@ -564,7 +661,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
                 uid: thr.proc_data.uid(),
             });
         }
-        process.exit();
+        let inherited_zombies = process.exit();
         if let Some(parent) = parent.as_ref()
             && !suppress_exit_signal
             && let Some(signo) = thr.proc_data.exit_signal
@@ -572,19 +669,18 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
             let _ = send_signal_to_process(parent.pid(), Some(SignalInfo::new_kernel(signo)));
         }
         if auto_reap {
-            let _ = process.reap();
+            if process.reap() {
+                cgroup::detach_process(process.pid());
+            }
         }
         if let Some(data) = parent_data {
             data.child_exit_event.wake();
         }
+        for child in inherited_zombies {
+            notify_reaper_of_inherited_zombie(&child);
+        }
         thr.proc_data.exit_event.wake();
         thr.proc_data.release_vfork();
-
-        crate::file::flock::release_posix_owner(process.pid());
-
-        crate::syscall::SHM_MANAGER
-            .lock()
-            .clear_proc_shm(process.pid());
     }
     thr.proc_data.exec_event.wake();
     thr.exit_event.wake();

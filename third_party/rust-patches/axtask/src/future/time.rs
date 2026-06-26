@@ -57,9 +57,9 @@ impl TimerRuntime {
         self.wheel.remove(key);
     }
 
-    fn wake(&mut self) {
+    fn wake(&mut self) -> bool {
         if self.wheel.is_empty() {
-            return;
+            return false;
         }
 
         let now = wall_time();
@@ -70,9 +70,11 @@ impl TimerRuntime {
         });
 
         let expired = core::mem::replace(&mut self.wheel, pending);
+        let woke = !expired.is_empty();
         for (_, w) in expired {
             w.wake();
         }
+        woke
     }
 }
 
@@ -83,7 +85,10 @@ percpu_static! {
 #[allow(dead_code)]
 pub(crate) fn check_timer_events() {
     // SAFETY: only called in timer::check_events
-    unsafe { TIMER_RUNTIME.current_ref_mut_raw() }.wake();
+    if unsafe { TIMER_RUNTIME.current_ref_mut_raw() }.wake() {
+        #[cfg(feature = "preempt")]
+        crate::current().set_preempt_pending(true);
+    }
 }
 
 fn with_current<R>(f: impl FnOnce(&mut TimerRuntime) -> R) -> R {

@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     cell::RefCell,
     ops::Deref,
@@ -132,6 +132,7 @@ impl Thread {
     /// Temporarily releases the active-scope read lock so the current thread
     /// can mutate its process scope, then restores the active scope binding.
     pub fn with_mut_scope<R>(&self, f: impl FnOnce(&mut Scope) -> R) -> R {
+        let _guard = kernel_guard::NoPreemptIrqSave::new();
         ActiveScope::set_global();
         self.release_active_scope_read();
 
@@ -213,16 +214,21 @@ impl Thread {
     }
 
     fn pause_cpu_accounting_for_switch(&self, task: &TaskInner) {
-        let Ok(mut time) = self.time.try_borrow_mut() else {
-            return;
+        let mut signals = Vec::new();
+        let usage = {
+            let Ok(mut time) = self.time.try_borrow_mut() else {
+                return;
+            };
+            time.pause_for_switch(&mut signals);
+            let (utime, stime) = time.output();
+            TaskUsage::from_time_values(utime, stime)
         };
-        time.pause_for_switch(|signo| {
+        self.store_usage_snapshot(usage);
+        for signo in signals {
             if self.signal.send_signal(SignalInfo::new_kernel(signo)) {
                 task.interrupt();
             }
-        });
-        let (utime, stime) = time.output();
-        self.store_usage_snapshot(TaskUsage::from_time_values(utime, stime));
+        }
     }
 
     fn resume_cpu_accounting_after_switch(&self) {

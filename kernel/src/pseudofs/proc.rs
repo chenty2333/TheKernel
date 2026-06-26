@@ -73,9 +73,9 @@ use crate::{
     },
     task::{
         AsThread, Mempolicy, PidNamespace, ProcessData, TimeNamespace, UserNamespace, UtsNamespace,
-        get_process_data, get_process_including_zombie, get_task,
-        get_visible_task_including_exiting, nr_open_limit, render_task_stat, render_zombie_stat,
-        set_nr_open_limit, tasks,
+        get_process_data, get_process_including_zombie, get_task, get_visible_task,
+        get_visible_task_including_exiting, nr_open_limit, processes, render_task_stat,
+        render_zombie_stat, set_nr_open_limit, tasks,
     },
 };
 
@@ -115,13 +115,15 @@ const PROC_LIMIT_NAMES: [(&str, Option<&str>); RLIM_NLIMITS as usize] = [
 ];
 // Minimal gzip-compressed kernel config for LTP kconfig probes.
 const PROC_CONFIG_GZ: &[u8] = &[
-    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x6d, 0xcc, 0xb1, 0x12, 0x40, 0x40,
-    0x0c, 0x84, 0xe1, 0xde, 0x3b, 0x29, 0x58, 0x39, 0x32, 0xb8, 0x9c, 0x4b, 0x18, 0xaa, 0x3c, 0x87,
-    0xb7, 0x37, 0x46, 0x91, 0x46, 0xb9, 0xdf, 0x3f, 0xb3, 0x90, 0x9c, 0x78, 0x74, 0xbd, 0xf4, 0xe0,
-    0x82, 0xf6, 0x6e, 0xf0, 0x01, 0x26, 0xc2, 0x5c, 0x84, 0xb3, 0x79, 0x25, 0x35, 0xa9, 0x14, 0xad,
-    0x63, 0x89, 0x51, 0x44, 0xf9, 0xf4, 0x75, 0xdb, 0x69, 0xa7, 0x7f, 0x7d, 0xcf, 0x61, 0x4b, 0xc4,
-    0x5e, 0x07, 0x2f, 0x55, 0x40, 0xaa, 0xde, 0x01, 0x16, 0x65, 0xc8, 0x62, 0x9c, 0xae, 0x00, 0x5b,
-    0xb4, 0xbd, 0x9b, 0x07, 0xf4, 0x50, 0x9d, 0x4d, 0xa5, 0x00, 0x00, 0x00,
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x75, 0xcc, 0xb1, 0x0e, 0x82, 0x40,
+    0x10, 0x84, 0xe1, 0x9e, 0xa7, 0xb8, 0xc4, 0x47, 0xb0, 0xa6, 0xc0, 0x61, 0xd1, 0x8d, 0x78, 0x7b,
+    0xde, 0x2e, 0x44, 0xaa, 0xad, 0x2c, 0x6c, 0xb4, 0x80, 0x86, 0xb7, 0x57, 0x63, 0xcc, 0x35, 0x5a,
+    0xce, 0x7c, 0xc9, 0x0f, 0x89, 0x1d, 0xef, 0x5d, 0x27, 0x1d, 0x39, 0xa1, 0x5e, 0x2b, 0x7c, 0x0e,
+    0x1c, 0x08, 0xc7, 0x24, 0x1c, 0xcd, 0x33, 0xa9, 0x49, 0xa6, 0x62, 0x0d, 0x4b, 0x19, 0x49, 0x94,
+    0x2f, 0x7e, 0x3a, 0x0f, 0x34, 0xd0, 0xef, 0xf7, 0x1d, 0x87, 0xf5, 0x05, 0x77, 0xda, 0x7a, 0xca,
+    0x02, 0x52, 0xf5, 0x06, 0xb0, 0x97, 0x6c, 0xc2, 0x1f, 0xf3, 0x71, 0x1b, 0x6e, 0x73, 0xb8, 0x3f,
+    0x96, 0x30, 0x5f, 0x97, 0x6f, 0xa1, 0x8d, 0x62, 0xdc, 0x4d, 0x25, 0x69, 0xbd, 0xd6, 0x6b, 0xf5,
+    0x04, 0xe1, 0x08, 0x09, 0xc8, 0xcd, 0x00, 0x00, 0x00,
 ];
 
 fn append_mount_data_options(options: &mut String, data: &str) {
@@ -311,6 +313,9 @@ impl SimpleDirOps for ProcessTaskDir {
         };
         Box::new(process.threads().into_iter().filter_map(|tid| {
             let task = get_task(tid).ok()?;
+            if task.as_thread().pending_exit() {
+                return None;
+            }
             Some(Cow::Owned(task.as_thread().tid().to_string()))
         }))
     }
@@ -318,7 +323,7 @@ impl SimpleDirOps for ProcessTaskDir {
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         let process = self.process.upgrade().ok_or(VfsError::NotFound)?;
         let tid = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-        let task = proc_task_for_pid(tid)?;
+        let task = get_visible_task(tid).map_err(|_| VfsError::NotFound)?;
         if task.as_thread().proc_data.proc.pid() != process.pid() {
             return Err(VfsError::NotFound);
         }
@@ -1522,10 +1527,10 @@ struct ProcFsHandler(Arc<SimpleFs>);
 impl SimpleDirOps for ProcFsHandler {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
         Box::new(
-            tasks()
+            processes()
                 .into_iter()
-                .filter(|task| !task.as_thread().pending_exit())
-                .map(|task| task.as_thread().tid().to_string().into())
+                .filter(|proc_data| !proc_data.proc.is_zombie())
+                .map(|proc_data| proc_data.proc.pid().to_string().into())
                 .chain([Cow::Borrowed("self")]),
         )
     }
@@ -1728,7 +1733,8 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 {
                     let _ = write!(
                         out,
-                        "processor\t: {i}\nhart\t\t: {i}\nisa\t\t: rv64imafdc\nmmu\t\t: sv39\n"
+                        "processor\t: {i}\nmodel name\t: QEMU Virtual CPU\nhart\t\t: \
+                         {i}\nisa\t\t: rv64imafdc\nmmu\t\t: sv39\n"
                     );
                 }
                 #[cfg(target_arch = "aarch64")]
@@ -1748,7 +1754,10 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 }
                 #[cfg(target_arch = "loongarch64")]
                 {
-                    let _ = write!(out, "processor\t: {i}\nISA\t\t: loongarch64\n");
+                    let _ = write!(
+                        out,
+                        "processor\t: {i}\nmodel name\t: QEMU Virtual CPU\nISA\t\t: loongarch64\n"
+                    );
                 }
             }
             Ok(out)

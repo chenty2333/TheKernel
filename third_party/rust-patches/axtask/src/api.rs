@@ -135,6 +135,18 @@ pub fn on_timer_tick() {
     current_run_queue::<NoOp>().scheduler_timer_tick();
 }
 
+/// Runs a pending preemption request at a voluntary kernel boundary.
+pub fn resched_if_needed() {
+    #[cfg(feature = "preempt")]
+    TaskInner::current_check_preempt_pending();
+}
+
+/// Requests rescheduling of the current task at the next preemption point.
+pub fn request_resched_current() {
+    #[cfg(feature = "preempt")]
+    current().set_preempt_pending(true);
+}
+
 /// Adds the given task to the run queue, returns the task reference.
 pub fn spawn_task(task: TaskInner) -> AxTaskRef {
     let task_ref = task.into_arc();
@@ -251,10 +263,35 @@ pub fn set_sched_state(task: &AxTaskRef, sched_state: SchedState) -> bool {
 /// bursts and immediately continue with more forks, where waiting for the GC
 /// task to run can retain many dead task stacks and address spaces longer than
 /// necessary.
-pub fn reclaim_exited_tasks() {
+///
+/// Returns `true` if tasks are still queued after this reclaim pass. That means
+/// at least one exited task is still held by another scheduler-side reference
+/// and a later scheduling point is needed before it can be freed.
+pub fn reclaim_exited_tasks() -> bool {
     if crate::run_queue::has_exited_tasks() {
         crate::run_queue::reclaim_exited_tasks_current_cpu();
     }
+    crate::run_queue::has_exited_tasks()
+}
+
+pub(crate) fn drive_reclaim_until_clear(
+    max_yields: usize,
+    mut reclaim: impl FnMut() -> bool,
+    mut yield_now: impl FnMut(),
+) {
+    for _ in 0..max_yields {
+        if !reclaim() {
+            return;
+        }
+        yield_now();
+    }
+    let _ = reclaim();
+}
+
+/// Reclaims exited tasks, yielding between bounded passes while scheduler-side
+/// handoff references still keep some task objects alive.
+pub fn reclaim_exited_tasks_until_clear(max_yields: usize) {
+    drive_reclaim_until_clear(max_yields, reclaim_exited_tasks, yield_now);
 }
 
 /// Set the affinity for the current task.

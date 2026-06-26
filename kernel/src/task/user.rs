@@ -58,7 +58,13 @@ pub fn new_user_task(name: &str, mut uctx: UserContext) -> TaskInner {
                 set_timer_state(&curr, TimerState::Kernel);
 
                 match reason {
-                    ReturnReason::Syscall => handle_syscall(&mut uctx),
+                    ReturnReason::Syscall => {
+                        handle_syscall(&mut uctx);
+                        if thr.pending_exit() {
+                            break;
+                        }
+                        axtask::resched_if_needed();
+                    }
                     ReturnReason::PageFault(addr, flags) => {
                         let aspace_handle = thr.proc_data.aspace();
                         let result = if let Some(data) = wait_missing_page_for_current(
@@ -121,7 +127,12 @@ pub fn new_user_task(name: &str, mut uctx: UserContext) -> TaskInner {
                                 .expect("Failed to send page-fault signal");
                         }
                     }
-                    ReturnReason::Interrupt => {}
+                    ReturnReason::Interrupt => {
+                        // Timer IRQ handling only marks the current task for preemption.
+                        // Run the scheduler before returning to user space so CPU-bound
+                        // workloads are not delayed until their next syscall.
+                        axtask::resched_if_needed();
+                    }
                     #[allow(unused_labels)]
                     ReturnReason::Exception(exc_info) => 'exc: {
                         let signo = match exc_info.kind() {

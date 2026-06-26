@@ -81,6 +81,20 @@ static RECORD_LOCK_TABLE: Mutex<RecordLockTableInner> = Mutex::new(RecordLockTab
     waiters: PollSet::new(),
 });
 
+fn take_flock_waiters(table: &mut FlockTableInner) -> PollSet {
+    core::mem::replace(&mut table.waiters, PollSet::new())
+}
+
+fn take_record_lock_waiters(table: &mut RecordLockTableInner) -> PollSet {
+    core::mem::replace(&mut table.waiters, PollSet::new())
+}
+
+fn wake_waiters(waiters: Option<PollSet>) {
+    if let Some(waiters) = waiters {
+        waiters.wake();
+    }
+}
+
 impl RecordRange {
     fn overlaps(self, other: Self) -> bool {
         self.start < other.end && other.start < self.end
@@ -267,13 +281,18 @@ fn try_set_record_lock_inner(
     if locks.is_empty() {
         table.locks.remove(&id);
     }
-    table.waiters.wake();
     true
 }
 
 fn try_set_record_lock(id: InodeId, owner: RecordLockOwner, req: RecordLockRequest) -> bool {
-    let mut table = RECORD_LOCK_TABLE.lock();
-    try_set_record_lock_inner(&mut table, id, owner, req)
+    let (ok, waiters) = {
+        let mut table = RECORD_LOCK_TABLE.lock();
+        let ok = try_set_record_lock_inner(&mut table, id, owner, req);
+        let waiters = ok.then(|| take_record_lock_waiters(&mut table));
+        (ok, waiters)
+    };
+    wake_waiters(waiters);
+    ok
 }
 
 fn record_lock_blocking(
@@ -284,6 +303,9 @@ fn record_lock_blocking(
     match block_on(interruptible(poll_fn(|cx| {
         let mut table = RECORD_LOCK_TABLE.lock();
         if try_set_record_lock_inner(&mut table, id, owner, req) {
+            let waiters = take_record_lock_waiters(&mut table);
+            drop(table);
+            wake_waiters(Some(waiters));
             Poll::Ready(Ok(()))
         } else {
             let blockers = record_lock_conflict_owners(&table, id, owner, req);
@@ -299,6 +321,9 @@ fn record_lock_blocking(
                 .insert(owner, RecordLockWait { id, req });
             table.waiters.register(cx.waker());
             if try_set_record_lock_inner(&mut table, id, owner, req) {
+                let waiters = take_record_lock_waiters(&mut table);
+                drop(table);
+                wake_waiters(Some(waiters));
                 Poll::Ready(Ok(()))
             } else {
                 Poll::Pending
@@ -424,9 +449,9 @@ fn release_record_owner(owner: RecordLockOwner, only_id: Option<InodeId>) {
             table.locks.remove(&id);
         }
     }
-    if changed {
-        table.waiters.wake();
-    }
+    let waiters = changed.then(|| take_record_lock_waiters(&mut table));
+    drop(table);
+    wake_waiters(waiters);
 }
 
 fn remember_owner_lock(table: &mut FlockTableInner, owner: FlockOwner, id: InodeId) {
@@ -444,30 +469,34 @@ fn forget_owner_lock(table: &mut FlockTableInner, owner: FlockOwner, id: InodeId
 
 /// Attempt to acquire a shared lock. Returns `true` on success.
 fn try_lock_shared(id: InodeId, owner: FlockOwner) -> bool {
-    let mut table = FLOCK_TABLE.lock();
-    match table.locks.get_mut(&id) {
-        None => {
-            let mut holders = BTreeSet::new();
-            holders.insert(owner);
-            table.locks.insert(id, FlockState::Shared(holders));
-            remember_owner_lock(&mut table, owner, id);
-            true
+    let (ok, waiters) = {
+        let mut table = FLOCK_TABLE.lock();
+        match table.locks.get_mut(&id) {
+            None => {
+                let mut holders = BTreeSet::new();
+                holders.insert(owner);
+                table.locks.insert(id, FlockState::Shared(holders));
+                remember_owner_lock(&mut table, owner, id);
+                (true, None)
+            }
+            Some(FlockState::Shared(holders)) => {
+                holders.insert(owner);
+                remember_owner_lock(&mut table, owner, id);
+                (true, None)
+            }
+            Some(FlockState::Exclusive(current_owner)) if *current_owner == owner => {
+                let mut holders = BTreeSet::new();
+                holders.insert(owner);
+                table.locks.insert(id, FlockState::Shared(holders));
+                remember_owner_lock(&mut table, owner, id);
+                let waiters = take_flock_waiters(&mut table);
+                (true, Some(waiters))
+            }
+            Some(FlockState::Exclusive(_)) => (false, None),
         }
-        Some(FlockState::Shared(holders)) => {
-            holders.insert(owner);
-            remember_owner_lock(&mut table, owner, id);
-            true
-        }
-        Some(FlockState::Exclusive(current_owner)) if *current_owner == owner => {
-            let mut holders = BTreeSet::new();
-            holders.insert(owner);
-            table.locks.insert(id, FlockState::Shared(holders));
-            remember_owner_lock(&mut table, owner, id);
-            table.waiters.wake();
-            true
-        }
-        Some(FlockState::Exclusive(_)) => false,
-    }
+    };
+    wake_waiters(waiters);
+    ok
 }
 
 /// Attempt to acquire an exclusive lock. Returns `true` on success.
@@ -491,47 +520,51 @@ fn try_lock_exclusive(id: InodeId, owner: FlockOwner) -> bool {
 
 /// Release the lock held by `owner` on the given inode.
 pub fn flock_unlock(id: InodeId, owner: FlockOwner) {
-    let mut table = FLOCK_TABLE.lock();
-    let (changed, should_remove) = match table.locks.get_mut(&id) {
-        Some(FlockState::Shared(holders)) => {
-            let changed = holders.remove(&owner);
-            (changed, holders.is_empty())
+    let waiters = {
+        let mut table = FLOCK_TABLE.lock();
+        let (changed, should_remove) = match table.locks.get_mut(&id) {
+            Some(FlockState::Shared(holders)) => {
+                let changed = holders.remove(&owner);
+                (changed, holders.is_empty())
+            }
+            Some(FlockState::Exclusive(current_owner)) if *current_owner == owner => (true, true),
+            _ => (false, false),
+        };
+        if changed {
+            forget_owner_lock(&mut table, owner, id);
         }
-        Some(FlockState::Exclusive(current_owner)) if *current_owner == owner => (true, true),
-        _ => (false, false),
+        if should_remove {
+            table.locks.remove(&id);
+        }
+        changed.then(|| take_flock_waiters(&mut table))
     };
-    if changed {
-        forget_owner_lock(&mut table, owner, id);
-    }
-    if should_remove {
-        table.locks.remove(&id);
-    }
-    if changed {
-        table.waiters.wake();
-    }
+    wake_waiters(waiters);
 }
 
 /// Release every flock lock owned by the given open file description.
 pub fn release_owner(owner: FlockOwner) {
-    let mut table = FLOCK_TABLE.lock();
-    let Some(owned_locks) = table.owners.remove(&owner) else {
-        return;
-    };
-
-    for id in owned_locks {
-        let should_remove = match table.locks.get_mut(&id) {
-            Some(FlockState::Shared(holders)) => {
-                holders.remove(&owner);
-                holders.is_empty()
-            }
-            Some(FlockState::Exclusive(current_owner)) if *current_owner == owner => true,
-            _ => false,
+    let waiters = {
+        let mut table = FLOCK_TABLE.lock();
+        let Some(owned_locks) = table.owners.remove(&owner) else {
+            return;
         };
-        if should_remove {
-            table.locks.remove(&id);
+
+        for id in owned_locks {
+            let should_remove = match table.locks.get_mut(&id) {
+                Some(FlockState::Shared(holders)) => {
+                    holders.remove(&owner);
+                    holders.is_empty()
+                }
+                Some(FlockState::Exclusive(current_owner)) if *current_owner == owner => true,
+                _ => false,
+            };
+            if should_remove {
+                table.locks.remove(&id);
+            }
         }
-    }
-    table.waiters.wake();
+        take_flock_waiters(&mut table)
+    };
+    wake_waiters(Some(waiters));
 }
 
 /// Acquire a shared lock, blocking if necessary.

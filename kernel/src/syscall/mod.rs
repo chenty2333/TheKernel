@@ -17,7 +17,7 @@ use core::time::Duration;
 use axerrno::{AxError, LinuxError};
 use axhal::uspace::UserContext;
 use axnet::options::{Configurable, GetSocketOption};
-use axtask::{current, reclaim_exited_tasks};
+use axtask::current;
 use linux_raw_sys::general::{FUTEX_CMD_MASK, FUTEX_WAIT, FUTEX_WAIT_BITSET};
 use syscalls::Sysno;
 
@@ -1265,12 +1265,6 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     };
     maybe_request_syscall_restart(thr, &result);
     debug!("Syscall {sysno} return {result:?}");
-
-    // Pthread-heavy user workloads frequently reap threads via futex-based
-    // joins rather than waitpid. Reclaiming exited tasks on syscall return
-    // keeps the current CPU's deferred-exit queue from carrying a whole burst
-    // of dead threads into the next scheduling-sensitive phase.
-    reclaim_exited_tasks();
 
     if thr.take_resume_restored_context() {
         thr.clear_saved_syscall();

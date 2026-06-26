@@ -125,3 +125,43 @@ fn test_task_join() {
         assert_eq!(task.join(), i as _);
     }
 }
+
+#[test]
+fn reclaim_driver_yields_until_exited_queue_drains() {
+    let mut reclaim_calls = 0;
+    let mut yield_calls = 0;
+
+    axtask::drive_reclaim_until_clear(
+        8,
+        || {
+            reclaim_calls += 1;
+            reclaim_calls < 4
+        },
+        || {
+            yield_calls += 1;
+        },
+    );
+
+    assert_eq!(reclaim_calls, 4);
+    assert_eq!(yield_calls, 3);
+}
+
+#[test]
+fn reclaim_driver_is_bounded_when_scheduler_refs_remain() {
+    let mut reclaim_calls = 0;
+    let mut yield_calls = 0;
+
+    axtask::drive_reclaim_until_clear(
+        8,
+        || {
+            reclaim_calls += 1;
+            true
+        },
+        || {
+            yield_calls += 1;
+        },
+    );
+
+    assert_eq!(reclaim_calls, 9);
+    assert_eq!(yield_calls, 8);
+}

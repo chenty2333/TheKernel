@@ -87,7 +87,9 @@ fn interrupt_process_threads(target: &ProcessData) {
 }
 
 fn do_attach(target: &ProcessData, seize_only: bool) -> AxResult<isize> {
-    let tracer = current_pid();
+    let curr = current();
+    let tracer_data = curr.as_thread().proc_data.clone();
+    let tracer = tracer_data.proc.pid();
     if target.proc.pid() == tracer {
         return Err(AxError::OperationNotPermitted);
     }
@@ -95,6 +97,7 @@ fn do_attach(target: &ProcessData, seize_only: bool) -> AxResult<isize> {
     if !target.begin_ptrace(tracer) {
         return Err(AxError::OperationNotPermitted);
     }
+    tracer_data.add_ptrace_tracee(target.proc.pid());
     if !seize_only && target.ptrace_stop(Signo::SIGSTOP as u8) {
         notify_ptrace_attach_stop(target);
         interrupt_process_threads(target);
@@ -104,10 +107,15 @@ fn do_attach(target: &ProcessData, seize_only: bool) -> AxResult<isize> {
 
 fn do_continue(target: &ProcessData, data: usize, detach: bool) -> AxResult<isize> {
     check_tracee(target)?;
-    let tracer = current_pid();
+    let curr = current();
+    let tracer_data = curr.as_thread().proc_data.clone();
+    let tracer = tracer_data.proc.pid();
     let signal = parse_signal(data)?;
     if detach && !target.end_ptrace(tracer) {
         return Err(AxError::NoSuchProcess);
+    }
+    if detach {
+        tracer_data.remove_ptrace_tracee(target.proc.pid());
     }
     target.continue_job();
     if let Some(signal) = signal {
@@ -167,7 +175,9 @@ fn sys_ptrace_traceme() -> AxResult<isize> {
         .proc
         .parent()
         .ok_or(AxError::OperationNotPermitted)?;
+    let parent_data = get_process_data(parent.pid()).map_err(|_| AxError::OperationNotPermitted)?;
     if proc_data.begin_ptrace(parent.pid()) {
+        parent_data.add_ptrace_tracee(proc_data.proc.pid());
         Ok(0)
     } else {
         Err(AxError::OperationNotPermitted)

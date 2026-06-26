@@ -557,6 +557,8 @@ pub struct ProcessData {
     job_ctl: SpinNoIrq<JobControlState>,
     /// ptrace ownership and options shared by all threads in the process.
     ptrace_ctl: SpinNoIrq<PtraceControlState>,
+    /// Processes currently traced by this process.
+    ptrace_tracees: SpinNoIrq<Vec<Pid>>,
     /// Multi-thread exec coordination state.
     exec_ctl: SpinNoIrq<ExecControlState>,
     /// CLONE_VFORK coordination state.
@@ -655,6 +657,7 @@ impl ProcessData {
 
             job_ctl: SpinNoIrq::new(JobControlState::default()),
             ptrace_ctl: SpinNoIrq::new(PtraceControlState::default()),
+            ptrace_tracees: SpinNoIrq::new(Vec::new()),
             exec_ctl: SpinNoIrq::new(ExecControlState::default()),
             vfork_ctl: SpinNoIrq::new(VforkControlState::default()),
             stop_event: Arc::default(),
@@ -1407,8 +1410,33 @@ impl ProcessData {
         true
     }
 
-    pub fn clear_ptrace(&self) {
-        *self.ptrace_ctl.lock() = PtraceControlState::default();
+    pub fn clear_ptrace(&self) -> Option<Pid> {
+        let mut ptrace_ctl = self.ptrace_ctl.lock();
+        let tracer = ptrace_ctl.tracer;
+        *ptrace_ctl = PtraceControlState::default();
+        tracer
+    }
+
+    pub fn ptrace_tracees(&self) -> Vec<Pid> {
+        self.ptrace_tracees.lock().clone()
+    }
+
+    pub fn add_ptrace_tracee(&self, tracee: Pid) {
+        let mut tracees = self.ptrace_tracees.lock();
+        if !tracees.contains(&tracee) {
+            tracees.push(tracee);
+        }
+    }
+
+    pub fn remove_ptrace_tracee(&self, tracee: Pid) {
+        self.ptrace_tracees.lock().retain(|pid| *pid != tracee);
+    }
+
+    pub fn clear_ptrace_tracees(&self) -> Vec<Pid> {
+        let mut tracees = self.ptrace_tracees.lock();
+        let old = tracees.clone();
+        tracees.clear();
+        old
     }
 
     fn stop_state(&self) -> StopState {

@@ -272,30 +272,21 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         if len < cur_len {
             self.truncate(len)?;
         } else if len > cur_len {
-            // TODO: correct implementation
             let block_size = get_block_size(self.superblock());
-            let old_blocks = cur_len.div_ceil(block_size as u64) as u32;
-            let new_blocks = len.div_ceil(block_size as u64) as u32;
-            for block in old_blocks..new_blocks {
-                let (fblock, new_block) = self.append_inode_fblock()?;
-                assert_eq!(block, new_block);
-                self.write_bytes(fblock * block_size as u64, &EMPTY[..block_size as usize])?;
-            }
-
-            // Only clear the previously partial tail block. When the old size
-            // is zero or already block-aligned, there is no stale tail region
-            // to zero and `init_inode_fblock()` may legitimately report no
-            // initialized mapping yet for that block.
-            let old_last_block = (cur_len / block_size as u64) as u32;
-            let old_block_start = (cur_len - (old_last_block as u64 * block_size as u64)) as usize;
-            if old_block_start > 0 {
-                let fblock = self.init_inode_fblock(old_last_block)?;
-                assert!(fblock != 0, "fblock should not be zero");
-                let length = block_size as usize - old_block_start;
-                self.write_bytes(
-                    fblock * block_size as u64 + old_block_start as u64,
-                    &EMPTY[..length],
-                )?;
+            let old_block_offset = (cur_len % block_size as u64) as usize;
+            if old_block_offset > 0 {
+                let old_last_block = (cur_len / block_size as u64) as u32;
+                let zero_end = len.min((old_last_block as u64 + 1) * block_size as u64);
+                let length = (zero_end - cur_len) as usize;
+                if length > 0 {
+                    let fblock = self.get_inode_fblock(old_last_block)?;
+                    if fblock != 0 {
+                        self.write_bytes(
+                            fblock * block_size as u64 + old_block_offset as u64,
+                            &EMPTY[..length],
+                        )?;
+                    }
+                }
             }
 
             unsafe {

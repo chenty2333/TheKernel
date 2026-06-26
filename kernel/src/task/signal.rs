@@ -205,17 +205,28 @@ pub fn send_signal_to_visible_thread(
 /// Sends a signal to a process.
 pub fn send_signal_to_process(pid: Pid, sig: Option<SignalInfo>) -> AxResult<()> {
     let proc_data = get_process_data(pid)?;
+    send_signal_to_process_data(&proc_data, sig)
+}
 
+/// Sends a signal to a process object that has already been resolved.
+pub fn send_signal_to_process_data(
+    proc_data: &ProcessData,
+    sig: Option<SignalInfo>,
+) -> AxResult<()> {
+    if proc_data.proc.is_zombie() || proc_data.proc.threads().is_empty() {
+        return Err(AxError::NoSuchProcess);
+    }
     if let Some(sig) = sig {
         let signo = sig.signo();
+        let pid = proc_data.proc.pid();
 
         // POSIX: SIGCONT always resumes a stopped process, regardless of disposition.
         if signo == Signo::SIGCONT {
-            do_continue(&proc_data);
+            do_continue(proc_data);
         }
 
         info!("Send signal {signo:?} to process {pid}");
-        if ptrace_signal_stop(&proc_data, signo) {
+        if ptrace_signal_stop(proc_data, signo) {
             for tid in proc_data.proc.threads() {
                 if let Ok(task) = get_task(tid) {
                     task.interrupt();

@@ -6,7 +6,7 @@ use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
 use axtask::{
     AxTaskExt, SchedClass, current, future::block_on, reclaim_exited_tasks, sched_state,
-    spawn_task_with_sched, yield_now,
+    spawn_task_with_sched_from, yield_now,
 };
 use bitflags::bitflags;
 use kspin::SpinNoIrq;
@@ -27,11 +27,20 @@ use crate::{
     },
 };
 
-const NORMAL_FORK_YIELD_INTERVAL: Pid = 64;
+fn should_yield_after_clone(flags: CloneFlags) -> bool {
+    flags.intersects(
+        CloneFlags::THREAD
+            | CloneFlags::VM
+            | CloneFlags::VFORK
+            | CloneFlags::PARENT_SETTID
+            | CloneFlags::CHILD_SETTID
+            | CloneFlags::CHILD_CLEARTID,
+    )
+}
 
 bitflags! {
     /// Options for use with [`sys_clone`] and [`sys_clone3`].
-    #[derive(Debug, Clone, Copy, Default)]
+    #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
     pub struct CloneFlags: u64 {
         /// The calling process and the child process run in the same memory space.
         const VM = CLONE_VM as u64;
@@ -92,21 +101,6 @@ bitflags! {
     }
 }
 
-fn should_yield_after_clone(flags: CloneFlags, tid: Pid) -> bool {
-    if flags.intersects(
-        CloneFlags::THREAD
-            | CloneFlags::VM
-            | CloneFlags::VFORK
-            | CloneFlags::PARENT_SETTID
-            | CloneFlags::CHILD_SETTID
-            | CloneFlags::CHILD_CLEARTID,
-    ) {
-        return true;
-    }
-
-    tid % NORMAL_FORK_YIELD_INTERVAL == 0
-}
-
 fn check_rlimit_nproc(proc_data: &ProcessData) -> AxResult<()> {
     if proc_data.uid() == 0
         || proc_data.has_effective_capability(CAP_SYS_RESOURCE)
@@ -137,7 +131,7 @@ fn check_rlimit_nproc(proc_data: &ProcessData) -> AxResult<()> {
 }
 
 /// Unified arguments for clone/clone3/fork/vfork.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct CloneArgs {
     pub flags: CloneFlags,
     pub exit_signal: u64,
@@ -256,11 +250,10 @@ impl CloneArgs {
             return Err(AxError::Interrupted);
         }
 
-        // Thread-heavy user workloads such as libcbench can accumulate a large
-        // batch of already-joined dead tasks on the local CPU between clone
-        // bursts. Reclaim them before allocating and queueing the next child so
-        // post-join fork/create phases do not inherit the previous burst's
-        // stack and task-structure pressure.
+        // Long fork/exit workloads can leave already-reaped tasks queued on
+        // the local CPU. Free them before allocating another child so later
+        // fork bursts do not inherit stale task-stack and address-space
+        // pressure.
         reclaim_exited_tasks();
         check_rlimit_nproc(old_proc_data)?;
 
@@ -511,12 +504,13 @@ impl CloneArgs {
             new_proc_data.begin_vfork(curr.id().as_u64() as Pid);
         }
 
-        let task = spawn_task_with_sched(new_task, child_sched_state);
+        let task = spawn_task_with_sched_from(new_task, child_sched_state, &curr);
         add_task_to_table(&task);
         // Thread/vfork-style clones often rely on immediate child progress for
-        // futex or parent/child tid handshakes. Plain fork storms are allowed
-        // to batch so the parent can finish setup before worker children run.
-        if should_yield_after_clone(flags, tid) {
+        // futex or parent/child tid handshakes. Plain fork children are seeded
+        // behind the parent in CFS, so the parent can finish post-fork setup
+        // before a newly-created child runs unbounded user code.
+        if should_yield_after_clone(flags) {
             yield_now();
         }
 

@@ -360,6 +360,33 @@ mod cfs_rt {
         let next_rt = scheduler.pick_next_task().unwrap();
         assert_eq!(*next_rt.inner(), 3);
     }
+
+    #[test]
+    fn repeated_rt_wakeups_cannot_starve_fair_control_task() {
+        let mut scheduler = CFScheduler::<usize>::new();
+        let fair = Arc::new(CFSTask::new(1));
+        let rt = Arc::new(CFSTask::new(2));
+        assert!(rt.configure(CfsTaskParams {
+            class: CfsTaskClass::Fifo,
+            nice: 0,
+            rt_priority: 99,
+            reset_on_fork: false,
+            ..Default::default()
+        }));
+        scheduler.add_task(fair);
+        scheduler.add_task(rt);
+
+        for _ in 0..(RR_TIMESLICE_TICKS * 3) {
+            let running = scheduler.pick_next_task().unwrap();
+            if *running.inner() == 1 {
+                return;
+            }
+            assert_eq!(*running.inner(), 2);
+            scheduler.enqueue_task(running, EnqueueReason::Wakeup);
+        }
+
+        panic!("RT tasks that block and wake before a tick must not starve fair control work");
+    }
 }
 
 mod cfs_fork {
@@ -432,6 +459,30 @@ mod cfs_fork {
         assert!(
             !scheduler.task_tick(&running),
             "a freshly woken fair task should not immediately cut ahead of the current peer",
+        );
+    }
+
+    #[test]
+    fn waking_fair_peer_gets_bounded_service_after_granularity() {
+        let mut scheduler = CFScheduler::<usize>::new();
+        let current = Arc::new(CFSTask::new(1));
+        let sleeper = Arc::new(CFSTask::new(2));
+
+        scheduler.add_task(current.clone());
+        let running = scheduler.pick_next_task().unwrap();
+        assert_eq!(*running.inner(), 1);
+
+        for _ in 0..(RR_TIMESLICE_TICKS * 2) {
+            assert!(!scheduler.task_tick(&running));
+        }
+
+        scheduler.enqueue_task(sleeper, EnqueueReason::Wakeup);
+
+        assert!(!scheduler.task_tick(&running));
+        assert!(!scheduler.task_tick(&running));
+        assert!(
+            scheduler.task_tick(&running),
+            "a woken fair task should receive service once the current task exceeds the latency window",
         );
     }
 }

@@ -5,7 +5,7 @@ use core::{ffi::CStr, iter};
 
 use axerrno::{AxError, AxResult};
 use axfs::{CachedFile, FS_CONTEXT};
-use axfs_ng_vfs::Location;
+use axfs_ng_vfs::{Location, NodeType};
 use axhal::{
     mem::virt_to_phys,
     paging::{MappingFlags, PageSize},
@@ -324,6 +324,20 @@ fn try_load_script_with_fallback(
     Err(last_err)
 }
 
+fn permission_denied_script_fallback_allowed(path: &str) -> AxResult<bool> {
+    if !path.ends_with(".sh") {
+        return Ok(false);
+    }
+
+    let loc = FS_CONTEXT.lock().resolve(path)?;
+    let abs_path = loc.absolute_path().map_err(|_| AxError::InvalidInput)?;
+    if crate::mounts::is_noexec(abs_path.as_ref()) {
+        return Ok(false);
+    }
+
+    Ok(loc.metadata()?.node_type == NodeType::RegularFile)
+}
+
 /// Clear the ELF cache.
 ///
 /// Useful for removing noises during memory leak detect.
@@ -352,9 +366,10 @@ pub fn load_user_app(
         .or_else(|| args.first().map(String::as_str))
         .ok_or(AxError::InvalidInput)?;
 
-    let (entry, auxv) = match { ELF_LOADER.lock().load(uspace, path)? } {
-        Ok((entry, auxv)) => (entry, auxv),
-        Err(data) => {
+    let load_result = ELF_LOADER.lock().load(uspace, path);
+    let (entry, auxv) = match load_result {
+        Ok(Ok((entry, auxv))) => (entry, auxv),
+        Ok(Err(data)) => {
             if data.starts_with(b"#!") {
                 let head = &data[2..data.len().min(256)];
                 let pos = head.iter().position(|c| *c == b'\n').unwrap_or(head.len());
@@ -367,7 +382,20 @@ pub fn load_user_app(
                     .chain(iter::once(path.to_owned()))
                     .chain(args.iter().skip(1).cloned())
                     .collect();
-                return load_user_app(uspace, None, &new_args, envs);
+                match load_user_app(uspace, None, &new_args, envs) {
+                    Ok(result) => return Ok(result),
+                    Err(
+                        err @ (AxError::NotFound
+                        | AxError::InvalidExecutable
+                        | AxError::InvalidInput),
+                    ) if path.ends_with(".sh") => {
+                        debug!(
+                            "script interpreter failed for {path}: {err:?}; trying shell fallback"
+                        );
+                        return try_load_script_with_fallback(uspace, path, args, envs);
+                    }
+                    Err(err) => return Err(err),
+                }
             }
             // Keep `.sh` fallback for scripts without a shebang while still
             // allowing shebang-based interpreters such as `/musl/busybox sh`.
@@ -376,6 +404,10 @@ pub fn load_user_app(
             }
             return Err(AxError::InvalidExecutable);
         }
+        Err(AxError::PermissionDenied) if permission_denied_script_fallback_allowed(path)? => {
+            return try_load_script_with_fallback(uspace, path, args, envs);
+        }
+        Err(err) => return Err(err),
     };
 
     let ustack_top = VirtAddr::from_usize(crate::config::USER_STACK_TOP);

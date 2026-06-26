@@ -796,6 +796,9 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
             &supplementary_groups,
         )?;
     }
+    if !is_dir && clear_xattrs {
+        axfs::mark_cached_file_unlinked(&loc);
+    }
     with_path_fs(dirfd, Path::new(&path), |fs| {
         if flags == AT_REMOVEDIR as _ {
             fs.remove_dir(&path)?;
@@ -1344,11 +1347,13 @@ pub fn sys_renameat2(
 }
 
 pub fn sys_sync() -> AxResult<isize> {
+    axfs::sync_all_cached_file_pages()?;
     FS_CONTEXT.lock().root_dir().filesystem().flush()?;
     Ok(0)
 }
 
 pub fn sys_syncfs(fd: i32) -> AxResult<isize> {
+    axfs::sync_all_cached_file_pages()?;
     let file = get_file_like(fd)?;
     if let Some(file) = file.downcast_ref::<crate::file::File>() {
         file.inner().location().filesystem().flush()?;
@@ -1380,6 +1385,7 @@ pub fn sys_reboot(magic1: i32, magic2: i32, cmd: i32, _arg: *const c_void) -> Ax
         | LINUX_REBOOT_CMD_POWER_OFF
         | LINUX_REBOOT_CMD_RESTART2 => {
             sys_sync()?;
+            ax_println!("System is shutting down");
             system_off();
         }
         LINUX_REBOOT_CMD_CAD_ON | LINUX_REBOOT_CMD_CAD_OFF => Ok(0),

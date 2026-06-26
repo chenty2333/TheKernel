@@ -9,7 +9,9 @@ use crate::{
     file::{Directory, FD_TABLE, FileLike, PidFd, add_file_description},
     pseudofs::{ProcDirProcess, process_data_from_proc_dir},
     syscall::signal::parse_signo,
-    task::{AsThread, ProcessData, get_process_data, get_visible_task, send_signal_to_process},
+    task::{
+        AsThread, ProcessData, get_process_data, get_visible_task, send_signal_to_process_data,
+    },
 };
 
 fn process_data_from_proc_dir_fd(fd: i32) -> AxResult<alloc::sync::Arc<crate::task::ProcessData>> {
@@ -133,7 +135,6 @@ pub fn sys_pidfd_send_signal(
     }
 
     let proc_data = process_data_from_signal_fd(pidfd)?;
-    let pid = proc_data.proc.pid();
 
     let sig = if sig.is_null() {
         if signo == 0 {
@@ -149,6 +150,6 @@ pub fn sys_pidfd_send_signal(
     } else {
         make_pidfd_signal_info(&proc_data, signo, sig)?
     };
-    send_signal_to_process(pid, sig)?;
+    send_signal_to_process_data(&proc_data, sig)?;
     Ok(0)
 }

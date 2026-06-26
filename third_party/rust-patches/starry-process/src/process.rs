@@ -305,12 +305,16 @@ impl Process {
     /// Child processes are inherited by the init process or by the nearest
     /// subreaper process.
     ///
+    /// Returns children that were already zombies when they were inherited by
+    /// the new reaper. The caller must notify or reap them according to the new
+    /// reaper's SIGCHLD policy.
+    ///
     /// This method panics if the [`Process`] is the init process.
-    pub fn exit(self: &Arc<Self>) {
+    pub fn exit(self: &Arc<Self>) -> Vec<Arc<Process>> {
         let reaper = self.reaper_for_exit();
 
         if self.is_init() {
-            return;
+            return Vec::new();
         }
 
         let mut children = self.children.lock(); // Acquire the lock first
@@ -318,11 +322,17 @@ impl Process {
 
         let mut reaper_children = reaper.children.lock();
         let reaper = Arc::downgrade(&reaper);
+        let mut inherited_zombies = Vec::new();
 
         for (pid, child) in core::mem::take(&mut *children) {
             *child.parent.lock() = reaper.clone();
+            if child.is_zombie() {
+                inherited_zombies.push(child.clone());
+            }
             reaper_children.insert(pid, child);
         }
+
+        inherited_zombies
     }
 
     /// Frees a zombie [`Process`]. Removes it from the parent.
@@ -337,6 +347,7 @@ impl Process {
         if let Some(parent) = self.parent() {
             parent.children.lock().remove(&self.pid);
         }
+        self.group.lock().processes.lock().remove(&self.pid);
         true
     }
 

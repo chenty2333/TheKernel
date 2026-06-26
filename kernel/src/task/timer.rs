@@ -4,6 +4,7 @@ use alloc::{
     borrow::ToOwned,
     collections::{BTreeMap, binary_heap::BinaryHeap},
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use core::{
     future::{Future, poll_fn},
@@ -28,7 +29,7 @@ use starry_signal::{SignalInfo, Signo};
 use strum::FromRepr;
 
 use super::{
-    AsThread, ProcessData, poll_timer, send_signal_to_process, send_signal_to_visible_thread,
+    AsThread, ProcessData, poll_itimer_alarm, send_signal_to_process, send_signal_to_visible_thread,
 };
 use crate::time::wall_time;
 
@@ -108,8 +109,12 @@ impl PosixTimer {
 
 /// The action to take when an alarm fires.
 enum AlarmAction {
-    /// Interrupt a task and poll its itimers.
-    PollTask(WeakAxTaskRef),
+    /// Interrupt a task and poll an itimer if the queued generation is current.
+    PollITimer {
+        task: WeakAxTaskRef,
+        ty: ITimerType,
+        sequence: u64,
+    },
     /// Wake a PollSet (used by timerfd).
     WakePollSet(Arc<PollSet>),
     /// Deliver a POSIX timer event.
@@ -185,9 +190,9 @@ impl ClockTimerRuntime {
         self.wheel.remove(key);
     }
 
-    fn wake(&mut self, now: Duration) {
+    fn wake(&mut self, now: Duration) -> bool {
         if self.wheel.is_empty() {
-            return;
+            return false;
         }
 
         let pending = self.wheel.split_off(&TimerKey {
@@ -195,9 +200,11 @@ impl ClockTimerRuntime {
             key: u64::MAX,
         });
         let expired = mem::replace(&mut self.wheel, pending);
+        let woke = !expired.is_empty();
         for (_, waker) in expired {
             waker.wake();
         }
+        woke
     }
 }
 
@@ -217,9 +224,7 @@ impl Future for ClockTimerFuture {
 impl Drop for ClockTimerFuture {
     fn drop(&mut self) {
         timer_runtime(self.clock).lock().cancel(&self.key);
-        if self.clock == AlarmClock::Monotonic {
-            update_monotonic_timer_deadline();
-        }
+        update_clock_timer_deadline();
     }
 }
 
@@ -265,6 +270,7 @@ impl ITimerType {
 struct ITimer {
     interval_ns: usize,
     remained_ns: usize,
+    sequence: u64,
 }
 
 #[derive(Debug, Default)]
@@ -291,16 +297,15 @@ fn secs_to_nanos(secs: u64) -> usize {
 }
 
 impl ITimer {
-    pub fn new(interval_ns: usize, remained_ns: usize) -> Self {
-        let result = Self {
+    pub fn new(interval_ns: usize, remained_ns: usize, sequence: u64) -> Self {
+        Self {
             interval_ns,
             remained_ns,
-        };
-        result.renew_timer();
-        result
+            sequence,
+        }
     }
 
-    pub fn update(&mut self, delta: usize) -> bool {
+    pub fn update(&mut self, ty: ITimerType, delta: usize) -> bool {
         if self.remained_ns == 0 {
             return false;
         }
@@ -309,12 +314,12 @@ impl ITimer {
             false
         } else {
             self.remained_ns = self.interval_ns;
-            self.renew_timer();
+            self.renew_timer(ty);
             true
         }
     }
 
-    pub fn renew_timer(&self) {
+    pub fn renew_timer(&self, ty: ITimerType) {
         if self.remained_ns > 0 {
             let deadline = wall_time()
                 .checked_add(Duration::from_nanos(self.remained_ns as u64))
@@ -322,7 +327,11 @@ impl ITimer {
             register_alarm(
                 AlarmClock::Realtime,
                 deadline,
-                AlarmAction::PollTask(Arc::downgrade(&current())),
+                AlarmAction::PollITimer {
+                    task: Arc::downgrade(&current()),
+                    ty,
+                    sequence: self.sequence,
+                },
             );
         }
     }
@@ -381,24 +390,24 @@ impl TimeManager {
 
     /// Polls the time manager to update the timers and emit signals if
     /// necessary.
-    pub fn poll(&mut self, emitter: impl Fn(Signo)) {
+    pub fn poll(&mut self, signals: &mut Vec<Signo>) {
         let now_ns = monotonic_time_nanos() as usize;
         let wall_delta = now_ns.saturating_sub(self.last_wall_ns);
         let cpu_delta = now_ns.saturating_sub(self.last_cpu_ns);
         match self.state {
             TimerState::User => {
                 self.utime_ns += cpu_delta;
-                self.update_itimer(ITimerType::Virtual, cpu_delta, &emitter);
-                self.update_itimer(ITimerType::Prof, cpu_delta, &emitter);
+                self.update_itimer(ITimerType::Virtual, cpu_delta, signals);
+                self.update_itimer(ITimerType::Prof, cpu_delta, signals);
             }
             TimerState::Kernel => {
                 self.stime_ns += cpu_delta;
-                self.update_itimer(ITimerType::Prof, cpu_delta, &emitter);
+                self.update_itimer(ITimerType::Prof, cpu_delta, signals);
             }
             TimerState::None => {}
         }
-        self.update_itimer(ITimerType::Real, wall_delta, &emitter);
-        self.update_rlimit_cpu(&emitter);
+        self.update_itimer(ITimerType::Real, wall_delta, signals);
+        self.update_rlimit_cpu(signals);
         self.last_cpu_ns = now_ns;
         self.last_wall_ns = now_ns;
     }
@@ -410,8 +419,8 @@ impl TimeManager {
     }
 
     /// Pauses CPU-time accounting while this thread is not running.
-    pub fn pause_for_switch(&mut self, emitter: impl Fn(Signo)) {
-        self.poll(emitter);
+    pub fn pause_for_switch(&mut self, signals: &mut Vec<Signo>) {
+        self.poll(signals);
         self.paused_state = self.state;
         self.set_state(TimerState::None);
     }
@@ -431,10 +440,13 @@ impl TimeManager {
         interval_ns: usize,
         remained_ns: usize,
     ) -> (TimeValue, TimeValue) {
+        let index = ty as usize;
+        let sequence = self.itimers[index].sequence.wrapping_add(1);
         let old = mem::replace(
-            &mut self.itimers[ty as usize],
-            ITimer::new(interval_ns, remained_ns),
+            &mut self.itimers[index],
+            ITimer::new(interval_ns, remained_ns, sequence),
         );
+        self.itimers[index].renew_timer(ty);
         (
             time_value_from_nanos(old.interval_ns),
             time_value_from_nanos(old.remained_ns),
@@ -450,13 +462,17 @@ impl TimeManager {
         )
     }
 
-    fn update_itimer(&mut self, ty: ITimerType, delta: usize, emitter: impl Fn(Signo)) {
-        if self.itimers[ty as usize].update(delta) {
-            emitter(ty.signo());
+    fn update_itimer(&mut self, ty: ITimerType, delta: usize, signals: &mut Vec<Signo>) {
+        if self.itimers[ty as usize].update(ty, delta) {
+            signals.push(ty.signo());
         }
     }
 
-    fn update_rlimit_cpu(&mut self, emitter: impl Fn(Signo)) {
+    pub fn itimer_sequence_matches(&self, ty: ITimerType, sequence: u64) -> bool {
+        self.itimers[ty as usize].sequence == sequence
+    }
+
+    fn update_rlimit_cpu(&mut self, signals: &mut Vec<Signo>) {
         let curr = current();
         let Some(thread) = curr.try_as_thread() else {
             return;
@@ -472,7 +488,7 @@ impl TimeManager {
         self.cpu_limit.reset_if_below_soft(total, soft_limit);
 
         if hard_limit != RLIM_INFINITY as i64 as u64 && total >= secs_to_nanos(hard_limit) {
-            emitter(Signo::SIGKILL);
+            signals.push(Signo::SIGKILL);
             return;
         }
         if soft_limit != RLIM_INFINITY as i64 as u64
@@ -480,7 +496,7 @@ impl TimeManager {
             && !self.cpu_limit.soft_signal_sent
         {
             self.cpu_limit.soft_signal_sent = true;
-            emitter(Signo::SIGXCPU);
+            signals.push(Signo::SIGXCPU);
         }
     }
 }
@@ -497,6 +513,7 @@ async fn alarm_task(clock: AlarmClock) {
         listener!(alarm_event(clock) => listener);
 
         if process_due(clock) {
+            axtask::resched_if_needed();
             continue;
         }
 
@@ -560,14 +577,36 @@ fn ensure_clock_timer_runtime() {
 }
 
 fn wake_clock_timers(clock: AlarmClock) {
-    timer_runtime(clock).lock().wake(clock.now());
-    if clock == AlarmClock::Monotonic {
-        update_monotonic_timer_deadline();
+    if timer_runtime(clock).lock().wake(clock.now()) {
+        axtask::request_resched_current();
+    }
+    update_clock_timer_deadline();
+}
+
+fn realtime_deadline_as_monotonic(deadline: Duration) -> Duration {
+    let realtime_now = AlarmClock::Realtime.now();
+    let monotonic_now = AlarmClock::Monotonic.now();
+    if deadline <= realtime_now {
+        monotonic_now
+    } else {
+        monotonic_now
+            .checked_add(deadline - realtime_now)
+            .unwrap_or(Duration::MAX)
     }
 }
 
-fn update_monotonic_timer_deadline() {
-    let deadline = MONOTONIC_TIMER_RUNTIME.lock().next_deadline();
+fn update_clock_timer_deadline() {
+    let realtime_deadline = REALTIME_TIMER_RUNTIME
+        .lock()
+        .next_deadline()
+        .map(realtime_deadline_as_monotonic);
+    let monotonic_deadline = MONOTONIC_TIMER_RUNTIME.lock().next_deadline();
+    let deadline = match (realtime_deadline, monotonic_deadline) {
+        (Some(real), Some(mono)) => Some(real.min(mono)),
+        (Some(real), None) => Some(real),
+        (None, Some(mono)) => Some(mono),
+        (None, None) => None,
+    };
     axruntime::set_early_timer_deadline(deadline);
 }
 
@@ -764,9 +803,9 @@ fn process_due(clock: AlarmClock) -> bool {
     while let Some(action) = pop_due(clock) {
         progressed = true;
         match action {
-            AlarmAction::PollTask(weak_task) => {
-                if let Some(task) = weak_task.upgrade() {
-                    poll_timer(&task);
+            AlarmAction::PollITimer { task, ty, sequence } => {
+                if let Some(task) = task.upgrade() {
+                    poll_itimer_alarm(&task, ty, sequence);
                 }
             }
             AlarmAction::WakePollSet(poll_set) => {
@@ -806,9 +845,7 @@ where
 pub async fn sleep_until_clock(clock: AlarmClock, deadline: Duration) {
     ensure_clock_timer_runtime();
     let key = timer_runtime(clock).lock().add(clock.now(), deadline);
-    if clock == AlarmClock::Monotonic {
-        update_monotonic_timer_deadline();
-    }
+    update_clock_timer_deadline();
     if let Some(key) = key {
         ClockTimerFuture { clock, key }.await;
     }

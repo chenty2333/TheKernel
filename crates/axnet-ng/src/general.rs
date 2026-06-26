@@ -30,6 +30,8 @@ pub(crate) struct GeneralOptions {
     send_buffer: AtomicUsize,
     recv_buffer: AtomicUsize,
 
+    ipv6_only: AtomicBool,
+
     device_mask: AtomicU64,
 }
 impl Default for GeneralOptions {
@@ -49,6 +51,8 @@ impl GeneralOptions {
 
             send_buffer: AtomicUsize::new(TCP_TX_BUF_LEN),
             recv_buffer: AtomicUsize::new(TCP_RX_BUF_LEN),
+
+            ipv6_only: AtomicBool::new(false),
 
             device_mask: AtomicU64::new(0),
         }
@@ -82,6 +86,10 @@ impl GeneralOptions {
 
     pub fn recv_buffer(&self) -> usize {
         self.recv_buffer.load(Ordering::Relaxed)
+    }
+
+    pub fn ipv6_only(&self) -> bool {
+        self.ipv6_only.load(Ordering::Relaxed)
     }
 
     pub fn set_device_mask(&self, mask: u64) {
@@ -194,6 +202,9 @@ impl Configurable for GeneralOptions {
             O::ReceiveBuffer(size) => {
                 **size = clamp_sockbuf(self.recv_buffer.load(Ordering::Relaxed));
             }
+            O::Ipv6Only(ipv6_only) => {
+                **ipv6_only = self.ipv6_only();
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -236,8 +247,44 @@ impl Configurable for GeneralOptions {
                 self.recv_buffer
                     .store(clamp_sockbuf(*size), Ordering::Relaxed);
             }
+            O::Ipv6Only(ipv6_only) => {
+                self.ipv6_only.store(*ipv6_only, Ordering::Relaxed);
+            }
             _ => return Ok(false),
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::options::{Configurable, GetSocketOption, SetSocketOption};
+
+    #[test]
+    fn ipv6_only_option_tracks_bool_value() {
+        let options = GeneralOptions::new();
+        let mut ipv6_only = true;
+
+        options
+            .get_option(GetSocketOption::Ipv6Only(&mut ipv6_only))
+            .unwrap();
+        assert!(!ipv6_only);
+
+        options
+            .set_option(SetSocketOption::Ipv6Only(&true))
+            .unwrap();
+        options
+            .get_option(GetSocketOption::Ipv6Only(&mut ipv6_only))
+            .unwrap();
+        assert!(ipv6_only);
+
+        options
+            .set_option(SetSocketOption::Ipv6Only(&false))
+            .unwrap();
+        options
+            .get_option(GetSocketOption::Ipv6Only(&mut ipv6_only))
+            .unwrap();
+        assert!(!ipv6_only);
     }
 }

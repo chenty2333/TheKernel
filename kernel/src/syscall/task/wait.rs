@@ -14,9 +14,9 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     file::{FileHandle, FileLike, PidFd},
+    pseudofs::cgroup,
     task::{
         AsThread, ProcessData, StopReport, TaskUsage, get_process_data, has_pending_syscall_signal,
-        processes,
     },
 };
 
@@ -24,8 +24,7 @@ const WAITPID_ALLOWED_BITS: u32 =
     WNOHANG | WUNTRACED | WCONTINUED | __WNOTHREAD | __WALL | __WCLONE;
 const WAITID_ALLOWED_BITS: u32 =
     WNOHANG | WEXITED | WUNTRACED | WCONTINUED | WNOWAIT | __WNOTHREAD | __WALL | __WCLONE;
-const POST_WAIT_RECLAIM_ROUNDS: usize = 8;
-
+const POST_WAIT_RECLAIM_YIELDS: usize = 4;
 bitflags! {
     #[derive(Debug)]
     struct WaitOptions: u32 {
@@ -169,10 +168,11 @@ fn should_wait_for_child(child: &Process, options: &WaitOptions) -> bool {
 }
 
 fn matching_wait_candidates(
-    proc: &Process,
+    proc_data: &ProcessData,
     pid: WaitPid,
     options: &WaitOptions,
 ) -> AxResult<Vec<WaitCandidate>> {
+    let proc = &proc_data.proc;
     let mut candidates = proc
         .children()
         .into_iter()
@@ -183,10 +183,17 @@ fn matching_wait_candidates(
         })
         .collect::<Vec<_>>();
 
-    let tracer = proc.pid();
-    for proc_data in processes() {
-        let tracee = &proc_data.proc;
-        if proc_data.ptrace_tracer() != Some(tracer) || !pid.apply(tracee) {
+    for tracee_pid in proc_data.ptrace_tracees() {
+        let Ok(tracee_data) = get_process_data(tracee_pid) else {
+            proc_data.remove_ptrace_tracee(tracee_pid);
+            continue;
+        };
+        if !tracee_data.is_traced_by(proc.pid()) {
+            proc_data.remove_ptrace_tracee(tracee_pid);
+            continue;
+        }
+        let tracee = &tracee_data.proc;
+        if !pid.apply(tracee) {
             continue;
         }
         if candidates
@@ -357,10 +364,9 @@ pub fn sys_waitpid(
     } else {
         WaitPid::Pgid(-pid as _)
     };
-
     let check_children = || {
         let _wait_guard = proc_data.wait_lock.lock();
-        let candidates = match matching_wait_candidates(proc, pid, &options) {
+        let candidates = match matching_wait_candidates(proc_data, pid, &options) {
             Ok(candidates) => candidates,
             Err(err) => return Err(err),
         };
@@ -400,6 +406,7 @@ pub fn sys_waitpid(
                     if !child.reap() {
                         return Ok(None);
                     }
+                    cgroup::detach_process(child.pid());
                     proc_data.account_waited_child(snapshot.total_usage().into());
                 }
                 _ => {}
@@ -420,6 +427,10 @@ pub fn sys_waitpid(
             return Poll::Ready(res);
         }
 
+        if has_pending_syscall_signal(curr.as_thread()) {
+            return Poll::Ready(Err(AxError::Interrupted));
+        }
+
         if curr.poll_interrupt(cx).is_ready() {
             if let Some(res) = check_children().transpose() {
                 return Poll::Ready(res);
@@ -436,16 +447,7 @@ pub fn sys_waitpid(
             Poll::Pending
         }
     }))?;
-    if result > 0 {
-        // A just-reaped process may still have sibling threads queued in the
-        // per-CPU exited-task list. Let the scheduler/GC observe the transition
-        // before the shell immediately starts another thread-heavy program.
-        for _ in 0..POST_WAIT_RECLAIM_ROUNDS {
-            axtask::reclaim_exited_tasks();
-            axtask::yield_now();
-        }
-    }
-    axtask::reclaim_exited_tasks();
+    axtask::reclaim_exited_tasks_until_clear(POST_WAIT_RECLAIM_YIELDS);
     Ok(result)
 }
 
@@ -535,7 +537,7 @@ pub fn sys_waitid(
     let check_children = || -> AxResult<Option<isize>> {
         let _wait_guard = proc_data.wait_lock.lock();
         let candidates = if let Some(pid) = pid {
-            matching_wait_candidates(proc, pid, &wait_options)?
+            matching_wait_candidates(proc_data, pid, &wait_options)?
         } else {
             vec![pidfd_candidate.clone().ok_or(AxError::InvalidInput)?]
         };
@@ -583,6 +585,7 @@ pub fn sys_waitid(
                     if !child.reap() {
                         return Ok(None);
                     }
+                    cgroup::detach_process(child.pid());
                     proc_data.account_waited_child(snapshot.total_usage().into());
                 }
                 _ => {}
@@ -609,6 +612,10 @@ pub fn sys_waitid(
             return Poll::Ready(res);
         }
 
+        if has_pending_syscall_signal(curr.as_thread()) {
+            return Poll::Ready(Err(AxError::Interrupted));
+        }
+
         if curr.poll_interrupt(cx).is_ready() {
             if let Some(res) = check_children().transpose() {
                 return Poll::Ready(res);
@@ -625,6 +632,6 @@ pub fn sys_waitid(
             Poll::Pending
         }
     }))?;
-    axtask::reclaim_exited_tasks();
+    axtask::reclaim_exited_tasks_until_clear(POST_WAIT_RECLAIM_YIELDS);
     Ok(result)
 }
