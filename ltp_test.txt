@@ -1022,7 +1022,7 @@ msgsnd02 msgsnd02
 msgsnd05 msgsnd05
 msgsnd06 msgsnd06
 sched_getattr01 sched_getattr01
-fork06 fork_procs -I 60 -n 1000
+fork06 fork_procs -n 1000
 fork11 fork_procs -n 100
 inode02 inode02
 proc01 proc01 -m 128
