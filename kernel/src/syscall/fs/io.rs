@@ -41,7 +41,7 @@ const FALLOC_IO_CHUNK: usize = 0x1000;
 const MAX_FILE_OFFSET: u64 = i64::MAX as u64;
 const SPLICE_F_MOVE: u32 = 0x01;
 const SPLICE_F_NONBLOCK: u32 = 0x02;
-const FILE_IO_COOPERATE_INTERVAL: usize = 256;
+const FILE_IO_COOPERATE_INTERVAL: usize = 4096;
 
 static FILE_IO_COOPERATE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 

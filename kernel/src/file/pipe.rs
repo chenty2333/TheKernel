@@ -1,5 +1,6 @@
-use alloc::{borrow::Cow, format, string::ToString, sync::Arc, vec};
+use alloc::{borrow::Cow, format, string::ToString, sync::Arc};
 use core::{
+    cmp::min,
     mem,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::Context,
@@ -67,14 +68,82 @@ fn pipe_poll_writable(buffer: &HeapRb<u8>) -> bool {
     buffer.vacant_len() >= PIPE_BUF_SIZE
 }
 
+#[derive(Clone, Copy, Default)]
+struct PipeTransfer {
+    len: usize,
+    became_readable: bool,
+    became_writable: bool,
+}
+
+impl PipeTransfer {
+    const fn none() -> Self {
+        Self {
+            len: 0,
+            became_readable: false,
+            became_writable: false,
+        }
+    }
+}
+
+fn notify_pipe_readable(poll_rx: &PollSet, async_io: &Mutex<PipeAsyncIo>, transfer: PipeTransfer) {
+    if transfer.became_readable {
+        poll_rx.wake();
+    }
+    if transfer.len > 0 {
+        notify_async_readable(async_io);
+    }
+}
+
+fn notify_pipe_writable(poll_tx: &PollSet, transfer: PipeTransfer) {
+    if transfer.became_writable {
+        poll_tx.wake();
+    }
+}
+
+fn copy_slices_to_ring(dst: &mut HeapRb<u8>, src: &[&[u8]], max_len: usize) -> usize {
+    let (left, right) = dst.vacant_slices_mut();
+    // The ring buffer exposes valid writable byte slices here.
+    let mut dst_slices = [
+        unsafe { core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len()) },
+        unsafe { core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len()) },
+    ];
+    let mut copied = 0;
+    let mut src_index = 0;
+    let mut src_offset = 0;
+    for dst_slice in dst_slices.iter_mut() {
+        let mut dst_offset = 0;
+        while dst_offset < dst_slice.len() && copied < max_len {
+            while src_index < src.len() && src_offset == src[src_index].len() {
+                src_index += 1;
+                src_offset = 0;
+            }
+            if src_index == src.len() {
+                unsafe { dst.advance_write_index(copied) };
+                return copied;
+            }
+            let src_slice = src[src_index];
+            let count = min(dst_slice.len() - dst_offset, max_len - copied)
+                .min(src_slice.len() - src_offset);
+            dst_slice[dst_offset..dst_offset + count]
+                .copy_from_slice(&src_slice[src_offset..src_offset + count]);
+            dst_offset += count;
+            src_offset += count;
+            copied += count;
+        }
+    }
+    unsafe { dst.advance_write_index(copied) };
+    copied
+}
+
 fn write_pipe_buffer(
     buffer: &Mutex<HeapRb<u8>>,
     src: &mut IoSrc,
     atomic_len: Option<usize>,
-) -> AxResult<usize> {
+) -> AxResult<PipeTransfer> {
     let mut prod = buffer.lock();
+    let was_empty = prod.occupied_len() == 0;
     if atomic_len.is_some_and(|len| prod.vacant_len() < len) {
-        return Ok(0);
+        return Ok(PipeTransfer::none());
     }
 
     let (left, right) = prod.vacant_slices_mut();
@@ -88,7 +157,27 @@ fn write_pipe_buffer(
         count += src.read(right)?;
     }
     unsafe { prod.advance_write_index(count) };
-    Ok(count)
+    Ok(PipeTransfer {
+        len: count,
+        became_readable: was_empty && count > 0,
+        became_writable: false,
+    })
+}
+
+fn read_pipe_buffer(buffer: &Mutex<HeapRb<u8>>, dst: &mut IoDst) -> AxResult<PipeTransfer> {
+    let cons = buffer.lock();
+    let was_writable = pipe_poll_writable(&cons);
+    let (left, right) = cons.as_slices();
+    let mut count = dst.write(left)?;
+    if count >= left.len() {
+        count += dst.write(right)?;
+    }
+    unsafe { cons.advance_read_index(count) };
+    Ok(PipeTransfer {
+        len: count,
+        became_readable: false,
+        became_writable: !was_writable && pipe_poll_writable(&cons),
+    })
 }
 
 struct Shared {
@@ -324,19 +413,10 @@ impl Pipe {
         }
 
         block_on(poll_io(self, IoEvents::IN, nonblocking, || {
-            let read = {
-                let cons = self.shared.buffer.lock();
-                let (left, right) = cons.as_slices();
-                let mut count = dst.write(left)?;
-                if count >= left.len() {
-                    count += dst.write(right)?;
-                }
-                unsafe { cons.advance_read_index(count) };
-                count
-            };
-            if read > 0 {
-                self.shared.poll_tx.wake();
-                Ok(read)
+            let read = read_pipe_buffer(&self.shared.buffer, dst)?;
+            if read.len > 0 {
+                notify_pipe_writable(&self.shared.poll_tx, read);
+                Ok(read.len)
             } else if self.closed() {
                 Ok(0)
             } else {
@@ -360,10 +440,9 @@ impl Pipe {
             }
 
             let written = write_pipe_buffer(&self.shared.buffer, src, None)?;
-            if written > 0 {
-                self.shared.poll_rx.wake();
-                notify_async_readable(&self.shared.async_io);
-                Ok(written)
+            if written.len > 0 {
+                notify_pipe_readable(&self.shared.poll_rx, &self.shared.async_io, written);
+                Ok(written.len)
             } else {
                 Err(AxError::WouldBlock)
             }
@@ -443,39 +522,23 @@ impl Pipe {
                 }
 
                 let to_copy = remaining.min(src_available).min(dst_space);
-                let mut tmp = vec![0u8; to_copy];
-                {
+                let written = {
                     let src = self.shared.buffer.lock();
-                    let (left, right) = src.as_slices();
-                    let first = left.len().min(to_copy);
-                    tmp[..first].copy_from_slice(&left[..first]);
-                    let second = to_copy - first;
-                    if second > 0 {
-                        tmp[first..].copy_from_slice(&right[..second]);
-                    }
-                }
-                {
+                    let (src_left, src_right) = src.as_slices();
                     let mut dst = out.shared.buffer.lock();
-                    let (left, right) = dst.vacant_slices_mut();
-                    let left = unsafe {
-                        core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
-                    };
-                    let right = unsafe {
-                        core::slice::from_raw_parts_mut(
-                            right.as_mut_ptr().cast::<u8>(),
-                            right.len(),
-                        )
-                    };
-                    let first = left.len().min(to_copy);
-                    left[..first].copy_from_slice(&tmp[..first]);
-                    let second = to_copy - first;
-                    if second > 0 {
-                        right[..second].copy_from_slice(&tmp[first..]);
+                    let was_empty = dst.occupied_len() == 0;
+                    let written = copy_slices_to_ring(&mut dst, &[src_left, src_right], to_copy);
+                    PipeTransfer {
+                        len: written,
+                        became_readable: was_empty && written > 0,
+                        became_writable: false,
                     }
-                    unsafe { dst.advance_write_index(to_copy) };
+                };
+                if written.len == 0 {
+                    return Err(AxError::WouldBlock);
                 }
-                out.shared.poll_rx.wake();
-                total_copied += to_copy;
+                notify_pipe_readable(&out.shared.poll_rx, &out.shared.async_io, written);
+                total_copied += written.len;
                 if total_copied == len || nonblocking {
                     Ok(total_copied)
                 } else {
@@ -606,19 +669,10 @@ impl FileLike for Pipe {
 
         let nonblocking = self.nonblocking();
         block_on(poll_io(self, IoEvents::IN, nonblocking, || {
-            let read = {
-                let cons = self.shared.buffer.lock();
-                let (left, right) = cons.as_slices();
-                let mut count = dst.write(left)?;
-                if count >= left.len() {
-                    count += dst.write(right)?;
-                }
-                unsafe { cons.advance_read_index(count) };
-                count
-            };
-            if read > 0 {
-                self.shared.poll_tx.wake();
-                Ok(read)
+            let read = read_pipe_buffer(&self.shared.buffer, dst)?;
+            if read.len > 0 {
+                notify_pipe_writable(&self.shared.poll_tx, read);
+                Ok(read.len)
             } else if self.closed() {
                 Ok(0)
             } else {
@@ -647,10 +701,9 @@ impl FileLike for Pipe {
             }
 
             let written = write_pipe_buffer(&self.shared.buffer, src, atomic_len)?;
-            if written > 0 {
-                self.shared.poll_rx.wake();
-                notify_async_readable(&self.shared.async_io);
-                total_written += written;
+            if written.len > 0 {
+                notify_pipe_readable(&self.shared.poll_rx, &self.shared.async_io, written);
+                total_written += written.len;
                 if total_written == size || self.nonblocking() {
                     return Ok(total_written);
                 }
@@ -764,10 +817,10 @@ impl FileLike for NamedPipe {
             }
 
             let written = write_pipe_buffer(&self.state.buffer, src, atomic_len)?;
-            if written > 0 {
+            if written.len > 0 {
                 self.state.poll_rx.wake();
                 notify_async_readable(&self.state.async_io);
-                total_written += written;
+                total_written += written.len;
                 if total_written == size || self.nonblocking() {
                     return Ok(total_written);
                 }

@@ -18,7 +18,7 @@ use spin::RwLock;
 
 use crate::{
     RecvFlags, RecvOptions, SendOptions, Shutdown, SocketAddrEx, SocketOps,
-    consts::{UDP_RX_BUF_LEN, UDP_TX_BUF_LEN},
+    consts::{SOCKET_BUFFER_SIZE, UDP_RX_BUF_LEN, UDP_TX_BUF_LEN},
     general::GeneralOptions,
     net_stack::NetStack,
     options::{Configurable, GetSocketOption, SetSocketOption},
@@ -26,12 +26,23 @@ use crate::{
 };
 
 const MAX_UDP_SEND_LEN: usize = u16::MAX as usize;
+const UDP_SEND_COOPERATE_INTERVAL: usize = 32;
+const LOOPBACK_UDP_PAYLOAD_HINT: usize = 60 * 1024;
+
+static UDP_SEND_COOPERATE_COUNTER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) fn new_udp_socket() -> smol::Socket<'static> {
     // TODO(mivik): buffer size
     smol::Socket::new(
-        smol::PacketBuffer::new(vec![PacketMetadata::EMPTY; 512], vec![0; UDP_RX_BUF_LEN]),
-        smol::PacketBuffer::new(vec![PacketMetadata::EMPTY; 512], vec![0; UDP_TX_BUF_LEN]),
+        smol::PacketBuffer::new(
+            vec![PacketMetadata::EMPTY; SOCKET_BUFFER_SIZE],
+            vec![0; UDP_RX_BUF_LEN],
+        ),
+        smol::PacketBuffer::new(
+            vec![PacketMetadata::EMPTY; SOCKET_BUFFER_SIZE],
+            vec![0; UDP_TX_BUF_LEN],
+        ),
     )
 }
 
@@ -103,6 +114,18 @@ impl UdpSocket {
             addr,
             port: bound.port,
         });
+    }
+
+    fn note_udp_send_progress(&self, sent: usize) {
+        if sent < LOOPBACK_UDP_PAYLOAD_HINT {
+            return;
+        }
+        let count = UDP_SEND_COOPERATE_COUNTER
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if count % UDP_SEND_COOPERATE_INTERVAL == 0 {
+            axtask::yield_now();
+        }
     }
 
     pub fn set_filter(
@@ -227,6 +250,7 @@ impl SocketOps for UdpSocket {
     }
 
     fn send(&self, mut src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {
+        let has_explicit_destination = options.to.is_some();
         let (remote_addr, source_addr) = match options.to {
             Some(addr) => {
                 let addr = IpEndpoint::from(addr.into_ip()?);
@@ -287,6 +311,9 @@ impl SocketOps for UdpSocket {
         // Push freshly queued datagrams through the interface/router path so
         // loopback receivers observe readiness immediately.
         self.stack.poll_interfaces();
+        if sent > 0 && (sent >= LOOPBACK_UDP_PAYLOAD_HINT || has_explicit_destination) {
+            self.note_udp_send_progress(sent);
+        }
         Ok(sent)
     }
 

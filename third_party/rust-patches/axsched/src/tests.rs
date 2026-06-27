@@ -218,7 +218,7 @@ mod cfs_rt {
     }
 
     #[test]
-    fn fifo_same_priority_peers_get_bounded_progress() {
+    fn fifo_same_priority_peers_do_not_time_slice() {
         let mut scheduler = CFScheduler::<usize>::new();
         let a = Arc::new(CFSTask::new(1));
         let b = Arc::new(CFSTask::new(2));
@@ -235,21 +235,24 @@ mod cfs_rt {
 
         let first = scheduler.pick_next_task().unwrap();
         assert_eq!(*first.inner(), 1);
-        for tick in 0..RR_TIMESLICE_TICKS {
-            assert_eq!(scheduler.task_tick(&first), tick + 1 == RR_TIMESLICE_TICKS);
+        for _ in 0..(RR_TIMESLICE_TICKS * 2) {
+            assert!(
+                !scheduler.task_tick(&first),
+                "SCHED_FIFO must not rotate same-priority peers on timer ticks",
+            );
         }
         scheduler.put_prev_task(first, true);
 
-        let second = scheduler.pick_next_task().unwrap();
+        let next = scheduler.pick_next_task().unwrap();
         assert_eq!(
-            *second.inner(),
-            2,
-            "same-priority FIFO peers need a starvation guard on single-core test VMs",
+            *next.inner(),
+            1,
+            "a preempted SCHED_FIFO task keeps precedence over same-priority peers",
         );
     }
 
     #[test]
-    fn fifo_periodic_rt_yields_to_fair_control_task() {
+    fn fifo_rt_keeps_precedence_over_fair_task() {
         let mut scheduler = CFScheduler::<usize>::new();
         let fair = Arc::new(CFSTask::new(1));
         let rt = Arc::new(CFSTask::new(2));
@@ -265,10 +268,10 @@ mod cfs_rt {
 
         let running = scheduler.pick_next_task().unwrap();
         assert_eq!(*running.inner(), 2);
-        for tick in 0..RR_TIMESLICE_TICKS {
-            assert_eq!(
-                scheduler.task_tick(&running),
-                tick + 1 == RR_TIMESLICE_TICKS
+        for _ in 0..(RR_TIMESLICE_TICKS * 2) {
+            assert!(
+                !scheduler.task_tick(&running),
+                "SCHED_FIFO must not be time-slice preempted for fair work",
             );
         }
         scheduler.put_prev_task(running, true);
@@ -276,13 +279,13 @@ mod cfs_rt {
         let next = scheduler.pick_next_task().unwrap();
         assert_eq!(
             *next.inner(),
-            1,
-            "periodic RT workloads must not starve fair control threads forever",
+            2,
+            "runnable RT work must stay ahead of fair tasks in benchmark/default mode",
         );
     }
 
     #[test]
-    fn fifo_rt_peers_still_yield_to_fair_control_task() {
+    fn fifo_rt_peers_do_not_yield_to_fair_control_task() {
         let mut scheduler = CFScheduler::<usize>::new();
         let fair = Arc::new(CFSTask::new(1));
         let rt_a = Arc::new(CFSTask::new(2));
@@ -301,91 +304,42 @@ mod cfs_rt {
 
         let running = scheduler.pick_next_task().unwrap();
         assert_eq!(*running.inner(), 2);
-        for tick in 0..RR_TIMESLICE_TICKS {
-            assert_eq!(
-                scheduler.task_tick(&running),
-                tick + 1 == RR_TIMESLICE_TICKS
-            );
+        for _ in 0..(RR_TIMESLICE_TICKS * 2) {
+            assert!(!scheduler.task_tick(&running));
         }
         scheduler.put_prev_task(running, true);
 
         let next = scheduler.pick_next_task().unwrap();
         assert_eq!(
             *next.inner(),
-            1,
-            "same-priority RT peers must not indefinitely postpone fair control work",
+            2,
+            "same-priority SCHED_FIFO peers and fair tasks wait until the running FIFO task \
+             blocks, yields, exits, or is preempted by higher priority RT",
         );
     }
 
     #[test]
-    fn fair_control_task_gets_bounded_budget_before_rt_resumes() {
+    fn fair_task_is_preempted_while_rt_is_ready() {
         let mut scheduler = CFScheduler::<usize>::new();
         let fair = Arc::new(CFSTask::new(1));
-        let rt_a = Arc::new(CFSTask::new(2));
-        let rt_b = Arc::new(CFSTask::new(3));
-        for task in [&rt_a, &rt_b] {
-            assert!(task.configure(CfsTaskParams {
-                class: CfsTaskClass::Fifo,
-                nice: 0,
-                rt_priority: 99,
-                reset_on_fork: false,
-                ..Default::default()
-            }));
-            scheduler.add_task(task.clone());
-        }
-        scheduler.add_task(fair);
+        let rt = Arc::new(CFSTask::new(2));
+        assert!(rt.configure(CfsTaskParams {
+            class: CfsTaskClass::Fifo,
+            nice: 0,
+            rt_priority: 99,
+            reset_on_fork: false,
+            ..Default::default()
+        }));
+        scheduler.add_task(rt);
 
-        let running = scheduler.pick_next_task().unwrap();
-        for tick in 0..RR_TIMESLICE_TICKS {
-            assert_eq!(
-                scheduler.task_tick(&running),
-                tick + 1 == RR_TIMESLICE_TICKS
-            );
-        }
-        scheduler.put_prev_task(running, true);
-
-        let fair = scheduler.pick_next_task().unwrap();
-        assert_eq!(*fair.inner(), 1);
-        assert!(
-            !scheduler.task_tick(&fair),
-            "fair control task should get more than one tick to finish joins or command \
-             substitutions",
-        );
         assert!(
             scheduler.task_tick(&fair),
-            "fair budget must stay bounded so RT tasks resume promptly",
+            "fair task should request reschedule whenever RT work is ready",
         );
         scheduler.put_prev_task(fair, true);
 
         let next_rt = scheduler.pick_next_task().unwrap();
-        assert_eq!(*next_rt.inner(), 3);
-    }
-
-    #[test]
-    fn repeated_rt_wakeups_cannot_starve_fair_control_task() {
-        let mut scheduler = CFScheduler::<usize>::new();
-        let fair = Arc::new(CFSTask::new(1));
-        let rt = Arc::new(CFSTask::new(2));
-        assert!(rt.configure(CfsTaskParams {
-            class: CfsTaskClass::Fifo,
-            nice: 0,
-            rt_priority: 99,
-            reset_on_fork: false,
-            ..Default::default()
-        }));
-        scheduler.add_task(fair);
-        scheduler.add_task(rt);
-
-        for _ in 0..(RR_TIMESLICE_TICKS * 3) {
-            let running = scheduler.pick_next_task().unwrap();
-            if *running.inner() == 1 {
-                return;
-            }
-            assert_eq!(*running.inner(), 2);
-            scheduler.enqueue_task(running, EnqueueReason::Wakeup);
-        }
-
-        panic!("RT tasks that block and wake before a tick must not starve fair control work");
+        assert_eq!(*next_rt.inner(), 2);
     }
 }
 
@@ -459,30 +413,6 @@ mod cfs_fork {
         assert!(
             !scheduler.task_tick(&running),
             "a freshly woken fair task should not immediately cut ahead of the current peer",
-        );
-    }
-
-    #[test]
-    fn waking_fair_peer_gets_bounded_service_after_granularity() {
-        let mut scheduler = CFScheduler::<usize>::new();
-        let current = Arc::new(CFSTask::new(1));
-        let sleeper = Arc::new(CFSTask::new(2));
-
-        scheduler.add_task(current.clone());
-        let running = scheduler.pick_next_task().unwrap();
-        assert_eq!(*running.inner(), 1);
-
-        for _ in 0..(RR_TIMESLICE_TICKS * 2) {
-            assert!(!scheduler.task_tick(&running));
-        }
-
-        scheduler.enqueue_task(sleeper, EnqueueReason::Wakeup);
-
-        assert!(!scheduler.task_tick(&running));
-        assert!(!scheduler.task_tick(&running));
-        assert!(
-            scheduler.task_tick(&running),
-            "a woken fair task should receive service once the current task exceeds the latency window",
         );
     }
 }

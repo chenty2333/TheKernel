@@ -19,6 +19,7 @@ use crate::{
 };
 
 const PROTO_TCP: u32 = linux_raw_sys::net::IPPROTO_TCP as u32;
+const SO_RXQ_OVFL_COMPAT: u32 = 40;
 const TCP_ESTABLISHED: u8 = 1;
 const DEFAULT_TCP_MSS: u32 = 1460;
 const DEFAULT_TCP_CWND: u32 = 10;
@@ -427,6 +428,10 @@ pub fn sys_getsockopt(
         *get::<i32>(optval, optlen)? = 0;
         return Ok(0);
     }
+    if level == SOL_SOCKET && optname == SO_RXQ_OVFL_COMPAT {
+        *get::<i32>(optval, optlen)? = 0;
+        return Ok(0);
+    }
     macro_rules! dispatch {
         ($which:ident) => {
             socket.get_option(GetSocketOption::$which(get(optval, optlen)?))?;
@@ -526,6 +531,10 @@ pub fn sys_setsockopt(
         return Ok(0);
     }
     if level == SOL_SOCKET && optname == SO_NO_CHECK {
+        let _ = get::<i32>(optval, optlen)?;
+        return Ok(0);
+    }
+    if level == SOL_SOCKET && optname == SO_RXQ_OVFL_COMPAT {
         let _ = get::<i32>(optval, optlen)?;
         return Ok(0);
     }

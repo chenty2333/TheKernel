@@ -17,7 +17,7 @@ use smoltcp::{
 
 use crate::{
     RecvFlags, RecvOptions, SendOptions, Shutdown, Socket, SocketAddrEx, SocketOps,
-    consts::{TCP_RX_BUF_LEN, TCP_TX_BUF_LEN},
+    consts::{LOOPBACK_TCP_MSS, TCP_RX_BUF_LEN, TCP_TX_BUF_LEN},
     general::GeneralOptions,
     net_stack::NetStack,
     options::{Configurable, GetSocketOption, SetSocketOption},
@@ -111,6 +111,25 @@ impl TcpSocket {
             ax_bail!(InvalidInput, "not bound");
         }
         Ok(endpoint)
+    }
+
+    fn uses_loopback_endpoint(&self) -> bool {
+        fn is_loopback_addr(addr: smoltcp::wire::IpAddress) -> bool {
+            match addr {
+                smoltcp::wire::IpAddress::Ipv4(addr) => addr.is_loopback(),
+                smoltcp::wire::IpAddress::Ipv6(addr) => addr.is_loopback(),
+            }
+        }
+
+        self.with_smol_socket(|socket| {
+            socket
+                .remote_endpoint()
+                .is_some_and(|endpoint| is_loopback_addr(endpoint.addr))
+                || socket
+                    .get_bound_endpoint()
+                    .addr
+                    .is_some_and(is_loopback_addr)
+        })
     }
 
     fn poll_connect(&self) -> IoEvents {
@@ -267,8 +286,11 @@ impl Configurable for TcpSocket {
                 **keep_alive = self.with_smol_socket(|socket| socket.keep_alive().is_some());
             }
             O::MaxSegment(max_segment) => {
-                // TODO(mivik): get actual MSS
-                **max_segment = 1460;
+                **max_segment = if self.uses_loopback_endpoint() {
+                    LOOPBACK_TCP_MSS
+                } else {
+                    1460
+                };
             }
             O::SendBuffer(size) => {
                 **size = TCP_TX_BUF_LEN;

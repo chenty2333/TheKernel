@@ -114,11 +114,10 @@ fn clock_domain(clock_id: __kernel_clockid_t) -> AxResult<ClockDomain> {
 }
 
 fn fine_clock_resolution() -> TimeValue {
-    // Report the real kernel timer granularity instead of an idealized 1ns.
-    // LTP's clock_gettime04 uses clock_getres() to derive its tolerance.
-    // Returning 1ns here makes the tolerance unrealistically tight on our
-    // tick-based timer implementation and produces false failures under QEMU.
-    TimeValue::from_nanos((NANOS_PER_SEC / axconfig::TICKS_PER_SEC as u64).max(1))
+    // Fine POSIX clocks expose nanosecond timestamps and the timer subsystem can
+    // program one-shot deadlines; keep tick granularity only for explicit
+    // *_COARSE clocks.
+    TimeValue::from_nanos(1)
 }
 
 fn clock_now(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {

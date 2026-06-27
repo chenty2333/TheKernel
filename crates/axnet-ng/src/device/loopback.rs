@@ -9,7 +9,7 @@ use smoltcp::{
 };
 
 use crate::{
-    consts::{SOCKET_BUFFER_SIZE, STANDARD_MTU},
+    consts::{LOOPBACK_MTU, SOCKET_BUFFER_SIZE},
     device::Device,
 };
 
@@ -21,7 +21,7 @@ impl LoopbackDevice {
     pub fn new() -> Self {
         let buffer = PacketBuffer::new(
             vec![PacketMetadata::EMPTY; SOCKET_BUFFER_SIZE],
-            vec![0u8; STANDARD_MTU * SOCKET_BUFFER_SIZE],
+            vec![0u8; LOOPBACK_MTU * SOCKET_BUFFER_SIZE],
         );
         Self {
             buffer,

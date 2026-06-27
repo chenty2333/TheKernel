@@ -10,8 +10,6 @@ pub const RR_TIMESLICE_TICKS: usize = 5;
 pub const RT_PRIORITY_MIN: u8 = 1;
 pub const RT_PRIORITY_MAX: u8 = 99;
 const FAIR_PREEMPT_GRANULARITY_TICKS: isize = 2;
-const RT_FAIR_BUDGET_TICKS: isize = 2;
-const RT_FAIR_PICK_INTERVAL: isize = RR_TIMESLICE_TICKS as isize;
 
 /// Runtime scheduling class for CFS tasks.
 #[repr(u8)]
@@ -329,8 +327,6 @@ pub struct CFScheduler<T> {
     id_pool: AtomicIsize,
     rt_front_seq: isize,
     rt_back_seq: isize,
-    rt_fair_budget: isize,
-    rt_picks_since_fair: isize,
 }
 
 impl<T> CFScheduler<T> {
@@ -343,8 +339,6 @@ impl<T> CFScheduler<T> {
             id_pool: AtomicIsize::new(0_isize),
             rt_front_seq: 0,
             rt_back_seq: 0,
-            rt_fair_budget: 0,
-            rt_picks_since_fair: 0,
         }
     }
 
@@ -401,13 +395,10 @@ impl<T> CFScheduler<T> {
     fn wakeup_floor(&self, task: &CFSTask<T>) -> isize {
         let floor = self.queue_floor();
         match task.class() {
-            // Event wakeups (futex, pipe, wait queues) are latency-sensitive:
-            // if the current task requested a reschedule after waking a peer,
-            // the peer must be eligible immediately rather than being pushed a
-            // full granularity window behind. New/forked tasks are separately
-            // seeded behind their parent, and cooperative yield still moves the
-            // yielding task behind ready peers.
-            CfsTaskClass::Normal => floor,
+            // Keep freshly woken fair tasks slightly behind the current floor
+            // so a wakeup burst does not immediately displace the task that is
+            // doing the wakeup-side follow-up work.
+            CfsTaskClass::Normal => floor.saturating_add(FAIR_PREEMPT_GRANULARITY_TICKS),
             CfsTaskClass::Batch => floor.saturating_add(FAIR_PREEMPT_GRANULARITY_TICKS + 1),
             CfsTaskClass::Idle => floor.saturating_add(FAIR_PREEMPT_GRANULARITY_TICKS + 2),
             CfsTaskClass::RoundRobin | CfsTaskClass::Fifo | CfsTaskClass::Deadline => floor,
@@ -449,38 +440,6 @@ impl<T> CFScheduler<T> {
             .range((key, isize::MIN)..=(key, isize::MAX))
             .next()
             .is_some()
-    }
-
-    fn arm_rt_fair_budget(&mut self) -> bool {
-        if self.ready_fair_queue.is_empty() {
-            return false;
-        }
-        self.rt_fair_budget = self.rt_fair_budget.max(RT_FAIR_BUDGET_TICKS);
-        true
-    }
-
-    fn pick_fair_task(&mut self) -> Option<Arc<CFSTask<T>>> {
-        let next = self.ready_fair_queue.pop_first().map(|(_, task)| task);
-        match &next {
-            Some(task) => {
-                self.rt_picks_since_fair = 0;
-                self.refresh_min_vruntime(Some(task.get_vruntime()));
-            }
-            None => self.refresh_min_vruntime(None),
-        }
-        next
-    }
-
-    fn pick_rt_task(&mut self) -> Option<Arc<CFSTask<T>>> {
-        let next = self.ready_rt_queue.pop_first().map(|(_, task)| task);
-        if next.is_some() {
-            if self.ready_fair_queue.is_empty() {
-                self.rt_picks_since_fair = 0;
-            } else {
-                self.rt_picks_since_fair = self.rt_picks_since_fair.saturating_add(1);
-            }
-        }
-        next
     }
 
     /// Updates runtime scheduling parameters for a task.
@@ -527,37 +486,23 @@ impl<T> BaseScheduler for CFScheduler<T> {
     }
 
     fn pick_next_task(&mut self) -> Option<Self::SchedItem> {
-        if self.rt_fair_budget > 0 {
-            if let Some(task) = self.pick_fair_task() {
-                return Some(task);
-            }
-            self.rt_fair_budget = 0;
-        }
-
-        if !self.ready_rt_queue.is_empty()
-            && !self.ready_fair_queue.is_empty()
-            && self.rt_picks_since_fair >= RT_FAIR_PICK_INTERVAL
-        {
-            self.arm_rt_fair_budget();
-            if let Some(task) = self.pick_fair_task() {
-                return Some(task);
-            }
-            self.rt_fair_budget = 0;
-        }
-
-        if let Some(task) = self.pick_rt_task() {
+        if let Some((_, task)) = self.ready_rt_queue.pop_first() {
             return Some(task);
         }
-        self.pick_fair_task()
+        let next = self.ready_fair_queue.pop_first().map(|(_, task)| task);
+        match &next {
+            Some(task) => self.refresh_min_vruntime(Some(task.get_vruntime())),
+            None => self.refresh_min_vruntime(None),
+        }
+        next
     }
 
     fn put_prev_task(&mut self, prev: Self::SchedItem, preempt: bool) {
         match prev.class() {
             CfsTaskClass::Fifo => {
-                if preempt && prev.rr_time_slice() > 0 {
+                if preempt {
                     self.insert_rt_task(prev, true);
                 } else {
-                    prev.reset_rr_time_slice();
                     self.insert_rt_task(prev, false);
                 }
             }
@@ -624,25 +569,10 @@ impl<T> BaseScheduler for CFScheduler<T> {
             }
 
             return match current.class() {
-                CfsTaskClass::Fifo => {
-                    let old_slice = current.task_tick_rr();
-                    if old_slice <= 1 {
-                        if self.arm_rt_fair_budget() {
-                            return true;
-                        }
-                        if self.has_ready_rt_with_same_priority(current_priority) {
-                            return true;
-                        }
-                        current.reset_rr_time_slice();
-                    }
-                    false
-                }
+                CfsTaskClass::Fifo => false,
                 CfsTaskClass::RoundRobin => {
                     let old_slice = current.task_tick_rr();
                     if old_slice <= 1 {
-                        if self.arm_rt_fair_budget() {
-                            return true;
-                        }
                         if self.has_ready_rt_with_same_priority(current_priority) {
                             return true;
                         }
@@ -658,16 +588,8 @@ impl<T> BaseScheduler for CFScheduler<T> {
         }
 
         if !self.ready_rt_queue.is_empty() {
-            if self.rt_fair_budget > 0 {
-                current.task_tick();
-                let current_vruntime = current.get_vruntime();
-                self.refresh_min_vruntime(Some(current_vruntime));
-                self.rt_fair_budget -= 1;
-                return self.rt_fair_budget <= 0;
-            }
             return true;
         }
-        self.rt_fair_budget = 0;
 
         current.task_tick();
         let current_vruntime = current.get_vruntime();

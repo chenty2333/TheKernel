@@ -346,9 +346,9 @@ const PAGE_SIZE: usize = 4096;
 /// Sequential-read readahead window in pages. On a cache miss we issue one
 /// device read for up to this many pages and populate the page cache ahead of
 /// the scan, amortizing the per-request ext4-lock + lwext4 + virtio-blk cost.
-const READAHEAD_PAGES: usize = 16;
-const MAX_DIRTY_WRITEBACK_PAGES: usize = 16;
-const IN_MEMORY_PAGE_CACHE_PAGES: usize = 16;
+const READAHEAD_PAGES: usize = 64;
+const MAX_DIRTY_WRITEBACK_PAGES: usize = 64;
+const IN_MEMORY_PAGE_CACHE_PAGES: usize = 1024;
 static DIRTY_PAGE_CACHE_PFNS: Once<Mutex<BTreeSet<usize>>> = Once::new();
 static FILE_CACHE_REGISTRY: Once<Mutex<BTreeMap<(u64, u64), FileUserData>>> = Once::new();
 
@@ -881,8 +881,8 @@ impl CachedFile {
         let avail = cap.saturating_sub(cache.len());
         let ra = READAHEAD_PAGES.min(avail).max(1);
         let base = pn as u64 * PAGE_SIZE as u64;
-        let mut buf = [0u8; READAHEAD_PAGES * PAGE_SIZE];
-        let read = file.read_at(&mut buf[..ra * PAGE_SIZE], base)?;
+        let mut buf = vec![0u8; ra * PAGE_SIZE];
+        let read = file.read_at(&mut buf, base)?;
 
         // The requested page.
         let mut page = PageCache::new()?;

@@ -77,7 +77,7 @@ pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) -> Arc<NetStac
     let socket_set = Arc::new(SocketSetWrapper::new());
     let listen_table = Arc::new(ListenTable::new());
 
-    let mut router = Router::new(listen_table.clone());
+    let mut router = Router::new_loopback_only(listen_table.clone());
     let lo_dev = router.add_device(Box::new(LoopbackDevice::new()));
 
     let lo_ip = Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8);

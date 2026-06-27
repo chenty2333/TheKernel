@@ -69,6 +69,14 @@ setup_base_fs() {
         '::1 localhost ip6-localhost ip6-loopback' \
         > /etc/hosts
     printf '%s\n' \
+        'ip 0 IP' \
+        'icmp 1 ICMP' \
+        'tcp 6 TCP' \
+        'udp 17 UDP' \
+        'ipv6 41 IPv6' \
+        'icmpv6 58 IPv6-ICMP' \
+        > /etc/protocols
+    printf '%s\n' \
         'echo 7/tcp' \
         'echo 7/udp' \
         > /etc/services

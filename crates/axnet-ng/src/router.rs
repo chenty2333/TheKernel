@@ -9,7 +9,7 @@ use smoltcp::{
 };
 
 use crate::{
-    consts::{SOCKET_BUFFER_SIZE, STANDARD_MTU},
+    consts::{LOOPBACK_MTU, SOCKET_BUFFER_SIZE, STANDARD_MTU},
     device::Device,
     listen_table::ListenTable,
 };
@@ -61,23 +61,33 @@ impl RouteTable {
 pub struct Router {
     rx_buffer: PacketBuffer,
     tx_buffer: PacketBuffer,
+    mtu: usize,
     pub(crate) devices: Vec<Box<dyn Device>>,
     pub(crate) table: RouteTable,
     pub(crate) listen_table: Arc<ListenTable>,
 }
 impl Router {
     pub fn new(listen_table: Arc<ListenTable>) -> Self {
+        Self::new_with_mtu(listen_table, STANDARD_MTU)
+    }
+
+    pub fn new_loopback_only(listen_table: Arc<ListenTable>) -> Self {
+        Self::new_with_mtu(listen_table, LOOPBACK_MTU)
+    }
+
+    fn new_with_mtu(listen_table: Arc<ListenTable>, mtu: usize) -> Self {
         let rx_buffer = PacketBuffer::new(
             vec![PacketMetadata::EMPTY; SOCKET_BUFFER_SIZE],
-            vec![0u8; STANDARD_MTU * SOCKET_BUFFER_SIZE],
+            vec![0u8; mtu * SOCKET_BUFFER_SIZE],
         );
         let tx_buffer = PacketBuffer::new(
             vec![PacketMetadata::EMPTY; SOCKET_BUFFER_SIZE],
-            vec![0u8; STANDARD_MTU * SOCKET_BUFFER_SIZE],
+            vec![0u8; mtu * SOCKET_BUFFER_SIZE],
         );
         Self {
             rx_buffer,
             tx_buffer,
+            mtu,
             devices: Vec::new(),
             table: RouteTable::new(),
             listen_table,
@@ -260,7 +270,7 @@ impl smoltcp::phy::Device for Router {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
-        caps.max_transmission_unit = STANDARD_MTU;
+        caps.max_transmission_unit = self.mtu;
         caps.max_burst_size = Some(SOCKET_BUFFER_SIZE);
         caps
     }
