@@ -3,7 +3,8 @@ use axnet::options::{Configurable, GetSocketOption, SetSocketOption};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::net::{
     AF_INET, IPV6_ADDRFORM, SO_ATTACH_BPF, SO_DETACH_BPF, SO_NO_CHECK, SO_OOBINLINE,
-    SO_SNDBUFFORCE, SOL_DCCP, SOL_IPV6, SOL_NETLINK, SOL_SOCKET, SOL_TLS, TCP_ULP, socklen_t,
+    SO_SNDBUFFORCE, SOL_DCCP, SOL_IPV6, SOL_NETLINK, SOL_SOCKET, SOL_TLS, TCP_INFO, TCP_ULP,
+    socklen_t, tcp_info,
 };
 
 use crate::{
@@ -18,6 +19,10 @@ use crate::{
 };
 
 const PROTO_TCP: u32 = linux_raw_sys::net::IPPROTO_TCP as u32;
+const TCP_ESTABLISHED: u8 = 1;
+const DEFAULT_TCP_MSS: u32 = 1460;
+const DEFAULT_TCP_CWND: u32 = 10;
+const DEFAULT_TCP_RTO_US: u32 = 200_000;
 
 const PROTO_IP: u32 = linux_raw_sys::net::IPPROTO_IP as u32;
 const TLS_TX: u32 = 1;
@@ -324,6 +329,41 @@ fn handle_ipt_set_replace(optval: UserConstPtr<u8>) -> AxResult<isize> {
     Err(AxError::from(LinuxError::ENOPROTOOPT))
 }
 
+fn get_tcp_info(fd: i32, optval: UserPtr<u8>, optlen: &mut socklen_t) -> AxResult<isize> {
+    let socket = Socket::from_fd(fd).map_err(|err| socket_fd_error(fd, err))?;
+    if !socket.is_tcp() {
+        return Err(AxError::from(LinuxError::ENOPROTOOPT));
+    }
+
+    let user_len = *optlen as usize;
+    if user_len == 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let mut info = tcp_info {
+        tcpi_state: TCP_ESTABLISHED,
+        tcpi_rto: DEFAULT_TCP_RTO_US,
+        tcpi_snd_mss: DEFAULT_TCP_MSS,
+        tcpi_rcv_mss: DEFAULT_TCP_MSS,
+        tcpi_pmtu: DEFAULT_TCP_MSS,
+        tcpi_rcv_ssthresh: u32::MAX,
+        tcpi_snd_ssthresh: u32::MAX,
+        tcpi_snd_cwnd: DEFAULT_TCP_CWND,
+        tcpi_advmss: DEFAULT_TCP_MSS,
+        tcpi_reordering: 3,
+        tcpi_rcv_space: 64 * 1024,
+        ..unsafe { core::mem::zeroed() }
+    };
+
+    let copy_len = user_len.min(size_of::<tcp_info>());
+    let bytes = unsafe {
+        core::slice::from_raw_parts((&mut info as *mut tcp_info).cast::<u8>(), copy_len)
+    };
+    optval.get_as_mut_slice(copy_len)?.copy_from_slice(bytes);
+    *optlen = copy_len as socklen_t;
+    Ok(0)
+}
+
 pub fn sys_getsockopt(
     fd: i32,
     level: u32,
@@ -343,6 +383,9 @@ pub fn sys_getsockopt(
 
     if *optlen > i32::MAX as socklen_t {
         return Err(AxError::InvalidInput);
+    }
+    if level == PROTO_TCP && optname == TCP_INFO {
+        return get_tcp_info(fd, optval, optlen);
     }
 
     fn get<'a, T: 'static>(val: UserPtr<u8>, len: &mut socklen_t) -> AxResult<&'a mut T> {

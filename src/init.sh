@@ -251,7 +251,7 @@ run_regular_group() {
         build_runtime_env "$root" "$group"
         [ "$group" = lmbench ] && prepare_lmbench_path "$root"
         run_shell "$root" "./${group}_testcode.sh"
-    ) < /dev/null 2>&1
+    ) < /dev/null 2>&1 | normalize_group_markers
     cleanup_after_group
 }
 
@@ -274,7 +274,7 @@ run_ltp_command() {
         override="/opt/oscomp-support/ltp-cases/$flavor/$key"
         if [ -f "$override" ]; then
             echo "RUN LTP CASE $tag"
-            run_shell "$root" "$override" "$@" < /dev/null
+            run_ltp_timed "$(busybox_for_root "$root")" ash "$override" "$@" < /dev/null
             ret=$?
             finish_ltp_case "$ret"
             return 0
@@ -285,10 +285,10 @@ run_ltp_command() {
         echo "RUN LTP CASE $tag"
         case "$prog" in
             *.sh)
-                run_shell "$root" "./$prog" "$@" < /dev/null
+                run_ltp_timed "$(busybox_for_root "$root")" ash "./$prog" "$@" < /dev/null
                 ;;
             *)
-                "./$prog" "$@" < /dev/null
+                run_ltp_timed "./$prog" "$@" < /dev/null
                 ;;
         esac
         ret=$?
@@ -299,27 +299,65 @@ run_ltp_command() {
     script="$root/ltp/testscripts/$prog"
     if [ -f "$script" ]; then
         echo "RUN LTP CASE $tag"
-        run_shell "$root" "$script" "$@" < /dev/null
+        run_ltp_timed "$(busybox_for_root "$root")" ash "$script" "$@" < /dev/null
         ret=$?
         finish_ltp_case "$ret"
     fi
 }
 
-# Wall-clock watchdog for the LTP group. The evaluator runs on shared,
-# variably-loaded hardware, so a fixed case count cannot reliably finish before
-# the hard timeout. Instead of trimming the curated list, we stop launching new
-# LTP cases once we approach the deadline, then emit the END marker and let the
-# kernel shut down cleanly. Every case that did run is still reported with the
-# reference "FAIL LTP CASE <name> : <ret>" line, so the group scores whatever
-# fit in the time budget. Deadline is seconds since init start; default leaves a
-# comfortable margin under the ~2h evaluator timeout and is overridable via env.
-ltp_time_budget_reached() {
+# Wall-clock watchdog for the LTP group. The evaluator has one hard wall-clock
+# limit for the entire QEMU run, not a separate LTP limit. We run LTP last and
+# stop launching new LTP cases once total elapsed time since init approaches the
+# evaluator limit, then emit the END marker and let the kernel shut down cleanly.
+# Earlier groups consume part of this budget; LTP receives only the remaining
+# time. Every case that did run is still reported with the reference "FAIL LTP
+# CASE <name> : <ret>" line, so the group scores whatever fit in the whole-run
+# budget. Default stops near 1h55m of the 7200s evaluator limit and is
+# overridable via env.
+ltp_deadline_secs() {
+    printf '%s\n' "${OSCOMP_LTP_DEADLINE_SECS:-6900}"
+}
+
+ltp_update_elapsed() {
     [ "${RUN_START_SECS:-0}" -gt 0 ] || return 1
     now=$(bb date +%s 2>/dev/null || printf '0')
     [ "$now" -gt 0 ] || return 1
     RUN_ELAPSED=$((now - RUN_START_SECS))
-    deadline=${OSCOMP_LTP_DEADLINE_SECS:-6600}
-    [ "$RUN_ELAPSED" -ge "$deadline" ]
+    return 0
+}
+
+ltp_time_budget_reached() {
+    ltp_update_elapsed || return 1
+    deadline=$(ltp_deadline_secs)
+    grace=${OSCOMP_LTP_CASE_GRACE_SECS:-5}
+    stop_at=$((deadline - grace))
+    [ "$stop_at" -gt 0 ] || stop_at=0
+    [ "$RUN_ELAPSED" -ge "$stop_at" ]
+}
+
+ltp_remaining_secs() {
+    ltp_update_elapsed || { printf '0\n'; return 1; }
+    deadline=$(ltp_deadline_secs)
+    remaining=$((deadline - RUN_ELAPSED))
+    [ "$remaining" -gt 0 ] || remaining=0
+    printf '%s\n' "$remaining"
+}
+
+run_ltp_timed() {
+    remaining=$(ltp_remaining_secs)
+    # oscomp-timeout itself gives the child a short SIGTERM/SIGKILL grace, so
+    # leave a small margin inside the group deadline before printing END.
+    run_secs=$((remaining - ${OSCOMP_LTP_CASE_GRACE_SECS:-5}))
+    [ "$run_secs" -gt 0 ] || return 124
+    max_secs=${OSCOMP_LTP_CASE_MAX_SECS:-0}
+    if [ "$max_secs" -gt 0 ] && [ "$run_secs" -gt "$max_secs" ]; then
+        run_secs=$max_secs
+    fi
+    if [ -x /opt/oscomp-support/bin/oscomp-timeout ]; then
+        /opt/oscomp-support/bin/oscomp-timeout "$run_secs" "$@"
+    else
+        "$@"
+    fi
 }
 
 run_ltp_group() {
@@ -406,13 +444,13 @@ run_default_plan() {
         [ -n "$group" ] && run_group "$root" "$group"
     done <<'EOF'
 # Interleave musl/glibc and run high-value, fast groups first so a heavily
-# loaded evaluator host still completes them for *both* libcs instead of only
-# the first libc's first few groups. musl precedes glibc within each group so
-# attribution is stable whether the grader keys on the -musl/-glibc marker
-# suffix or on first/second occurrence. Slow or unscored groups (iozone,
-# libcbench, cyclictest, netperf) move last; unixbench is unscored and very
-# slow on LoongArch so it is omitted to protect the LTP time budget. LTP stays
-# last and is bounded by the wall-clock watchdog above.
+# loaded evaluator host reaches every score category before the slow performance
+# groups consume the whole-run budget. Test order does not affect scoring, and
+# the evaluator requires serial execution, so the plan favors category coverage:
+# functional tests first, then network/realtime groups that previously scored
+# zero because they were starved behind lmbench/iozone, then slower storage/CPU
+# benchmarks. LTP stays last and uses the remaining whole-run time until the
+# watchdog approaches the evaluator timeout.
 /musl basic
 /glibc basic
 /musl busybox
@@ -420,18 +458,18 @@ run_default_plan() {
 /musl libctest
 /musl lua
 /glibc lua
-/musl lmbench
-/glibc lmbench
-/musl libcbench
-/glibc libcbench
-/musl iozone
-/glibc iozone
 /musl iperf
 /glibc iperf
 /musl cyclictest
 /glibc cyclictest
 /musl netperf
 /glibc netperf
+/musl iozone
+/glibc iozone
+/musl libcbench
+/glibc libcbench
+/musl lmbench
+/glibc lmbench
 /glibc ltp
 /musl ltp
 EOF

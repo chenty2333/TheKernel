@@ -605,11 +605,15 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
             return Err(PagingError::AlreadyMapped);
         }
         *entry = GenericPTE::new_page(target.align_down(page_size), flags, page_size.is_huge());
-        // No TLB flush: the entry was unused, so no CPU can hold a stale TLB
-        // entry for this VA. Skipping self.push(vaddr) avoids a serializing
-        // sfence.vma on every freshly-mapped leaf, which is the common
-        // page-fault path. (Unmap/protect/remap still flush via their own push,
-        // so reusing a VA after an unmap remains correct.)
+        #[cfg(target_arch = "loongarch64")]
+        if flags.contains(MappingFlags::USER) {
+            self.push(vaddr);
+        }
+        // No TLB flush for non-user fresh mappings: the entry was unused, so no
+        // CPU can hold a stale TLB entry for this VA. LoongArch user mappings are
+        // the exception: hardware page-walk may cache invalid user TLB entries
+        // before the kernel populates the PTE, so flush only those faulted user
+        // VAs while keeping the RV/non-user fresh-map optimization.
         Ok(())
     }
 

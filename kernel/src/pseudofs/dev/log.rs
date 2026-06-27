@@ -14,9 +14,12 @@ pub fn bind_dev_log() -> LinuxResult<()> {
             let mut buf = [0u8; 65536];
             loop {
                 match server.recv(&mut buf[..], RecvOptions::default()) {
+                    Ok(0) => break,
                     Ok(read) => {
                         let msg = ByteStr::new(buf[..read].trim_ascii_end());
-                        info!("{msg}");
+                        if !msg.is_empty() {
+                            info!("{msg}");
+                        }
                     }
                     Err(err) => {
                         warn!("Failed to receive logs from client: {err:?}");
