@@ -17,8 +17,8 @@ pub const STANDARD_MTU: usize = 1500;
 // cut packet loss (the previous 64 KiB + 64-packet router/loopback queues led
 // to 54% UDP loss under iperf). SO_SNDBUF/SO_RCVBUF from userspace is currently
 // a no-op for capacity, so these constants are the effective sizes.
-pub const TCP_RX_BUF_LEN: usize = 512 * 1024;
-pub const TCP_TX_BUF_LEN: usize = 512 * 1024;
+pub const TCP_RX_BUF_LEN: usize = 256 * 1024;
+pub const TCP_TX_BUF_LEN: usize = 256 * 1024;
 pub const UDP_RX_BUF_LEN: usize = 512 * 1024;
 pub const UDP_TX_BUF_LEN: usize = 512 * 1024;
 pub const LISTEN_QUEUE_SIZE: usize = 512;
