@@ -346,7 +346,7 @@ const PAGE_SIZE: usize = 4096;
 /// Sequential-read readahead window in pages. On a cache miss we issue one
 /// device read for up to this many pages and populate the page cache ahead of
 /// the scan, amortizing the per-request ext4-lock + lwext4 + virtio-blk cost.
-const READAHEAD_PAGES: usize = 4;
+const READAHEAD_PAGES: usize = 16;
 const MAX_DIRTY_WRITEBACK_PAGES: usize = 16;
 const IN_MEMORY_PAGE_CACHE_PAGES: usize = 16;
 static DIRTY_PAGE_CACHE_PFNS: Once<Mutex<BTreeSet<usize>>> = Once::new();

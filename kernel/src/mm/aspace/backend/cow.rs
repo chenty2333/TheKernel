@@ -103,7 +103,7 @@ pub struct CowBackend {
 }
 
 impl CowBackend {
-    const ANON_FAULT_AROUND_PAGES: usize = 16;
+    const ANON_FAULT_AROUND_PAGES: usize = 4;
 
     fn alloc_new_frame(&self, zeroed: bool) -> AxResult<PhysAddr> {
         alloc_frame(zeroed, self.size)

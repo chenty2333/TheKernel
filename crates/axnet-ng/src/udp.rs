@@ -30,8 +30,8 @@ const MAX_UDP_SEND_LEN: usize = u16::MAX as usize;
 pub(crate) fn new_udp_socket() -> smol::Socket<'static> {
     // TODO(mivik): buffer size
     smol::Socket::new(
-        smol::PacketBuffer::new(vec![PacketMetadata::EMPTY; 256], vec![0; UDP_RX_BUF_LEN]),
-        smol::PacketBuffer::new(vec![PacketMetadata::EMPTY; 256], vec![0; UDP_TX_BUF_LEN]),
+        smol::PacketBuffer::new(vec![PacketMetadata::EMPTY; 512], vec![0; UDP_RX_BUF_LEN]),
+        smol::PacketBuffer::new(vec![PacketMetadata::EMPTY; 512], vec![0; UDP_TX_BUF_LEN]),
     )
 }
 

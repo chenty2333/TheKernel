@@ -18,7 +18,10 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axhal::uspace::UserContext;
 use axnet::options::{Configurable, GetSocketOption};
 use axtask::current;
-use linux_raw_sys::general::{FUTEX_CMD_MASK, FUTEX_WAIT, FUTEX_WAIT_BITSET};
+use linux_raw_sys::general::{
+    CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID, FUTEX_CMD_MASK, FUTEX_WAIT,
+    FUTEX_WAIT_BITSET,
+};
 use syscalls::Sysno;
 
 pub use self::{
@@ -139,6 +142,38 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     if let Some(result) = fast_path_getter(sysno) {
         uctx.set_retval(result.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
         return;
+    }
+
+    // Fast path for time-read syscalls: they don't block and aren't
+    // restartable, so skip the per-syscall set_timer_state/enter_syscall/restart
+    // bookkeeping (the dominant cyclictest per-cycle cost). clock_gettime is
+    // gated to the non-CPUTIME clocks; CPUTIME clocks fall through to the full
+    // path for accurate CPU-time accounting. Signal delivery and preemption
+    // still run in the user-mode loop after handle_syscall returns.
+    match sysno {
+        Sysno::gettimeofday => {
+            let r = sys_gettimeofday(uctx.arg0() as _, uctx.arg1() as _);
+            uctx.set_retval(r.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
+            return;
+        }
+        Sysno::clock_gettime => {
+            let clockid = uctx.arg0() as u32;
+            if !matches!(clockid, CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID) {
+                let r = sys_clock_gettime(uctx.arg0() as _, uctx.arg1() as _);
+                uctx.set_retval(r.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
+                return;
+            }
+        }
+        #[cfg(target_arch = "loongarch64")]
+        Sysno::clock_gettime64 => {
+            let clockid = uctx.arg0() as u32;
+            if !matches!(clockid, CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID) {
+                let r = sys_clock_gettime(uctx.arg0() as _, uctx.arg1() as _);
+                uctx.set_retval(r.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
+                return;
+            }
+        }
+        _ => {}
     }
     let curr = current();
     let thr = curr.as_thread();
