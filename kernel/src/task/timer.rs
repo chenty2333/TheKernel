@@ -242,6 +242,10 @@ lazy_static! {
 static CLOCK_TIMER_CALLBACK_REGISTERED: [AtomicBool; axconfig::plat::MAX_CPU_NUM] =
     [const { AtomicBool::new(false) }; axconfig::plat::MAX_CPU_NUM];
 
+// Set (sticky) when any process sets RLIMIT_CPU to a finite value, so the
+// per-fault/per-syscall update_rlimit_cpu can skip the current()+rlim path.
+pub static ANY_RLIMIT_CPU_SET: AtomicBool = AtomicBool::new(false);
+
 /// The type of interval timer.
 #[repr(i32)]
 #[allow(non_camel_case_types)]
@@ -473,6 +477,14 @@ impl TimeManager {
     }
 
     fn update_rlimit_cpu(&mut self, signals: &mut Vec<Signo>) {
+        // Common case: no process has ever set RLIMIT_CPU to a finite value, so
+        // there is nothing to check. Skip the current() + proc_data.clone() +
+        // rlim.read() path that would otherwise run twice per fault/syscall via
+        // set_timer_state. The flag is sticky (once a CPU limit is set, always
+        // check) so rlimit users stay correct.
+        if !ANY_RLIMIT_CPU_SET.load(Ordering::Relaxed) {
+            return;
+        }
         let curr = current();
         let Some(thread) = curr.try_as_thread() else {
             return;

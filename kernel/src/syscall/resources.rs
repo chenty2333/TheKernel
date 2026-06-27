@@ -1,7 +1,8 @@
 use axerrno::{AxError, AxResult, LinuxError};
 use axtask::current;
 use linux_raw_sys::general::{
-    CAP_SYS_RESOURCE, RLIM_NLIMITS, RLIMIT_NOFILE, rlimit, rlimit64, rusage,
+    CAP_SYS_RESOURCE, RLIM_NLIMITS, RLIM_INFINITY, RLIMIT_CPU, RLIMIT_NOFILE, rlimit, rlimit64,
+    rusage,
 };
 use starry_process::Pid;
 use starry_vm::{VmMutPtr, VmPtr};
@@ -32,6 +33,9 @@ fn set_resource_limit(proc_data: &ProcessData, resource: u32, new_limit: rlimit6
     }
 
     limit.current = new_limit.rlim_cur;
+    if resource == RLIMIT_CPU && new_limit.rlim_cur != RLIM_INFINITY as i64 as u64 {
+        crate::task::ANY_RLIMIT_CPU_SET.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
     Ok(())
 }
 
