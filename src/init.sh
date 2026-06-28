@@ -340,9 +340,24 @@ ltp_deadline_secs() {
     printf '%s\n' "${OSCOMP_LTP_DEADLINE_SECS:-6900}"
 }
 
+oscomp_elapsed_clock_secs() {
+    if read -r uptime _ < /proc/uptime 2>/dev/null; then
+        uptime=${uptime%%.*}
+        case "$uptime" in
+            ''|*[!0-9]*)
+                ;;
+            *)
+                printf '%s\n' "$uptime"
+                return 0
+                ;;
+        esac
+    fi
+    bb date +%s 2>/dev/null || printf '0'
+}
+
 ltp_update_elapsed() {
     [ "${RUN_START_SECS:-0}" -gt 0 ] || return 1
-    now=$(bb date +%s 2>/dev/null || printf '0')
+    now=$(oscomp_elapsed_clock_secs)
     [ "$now" -gt 0 ] || return 1
     RUN_ELAPSED=$((now - RUN_START_SECS))
     return 0
@@ -418,7 +433,7 @@ run_ltp_group() {
 _group_timing() {
     [ "${OSCOMP_GROUP_TIMING:-0}" != 0 ] || return 0
     [ "${RUN_START_SECS:-0}" -gt 0 ] || return 0
-    _t=$(bb date +%s 2>/dev/null || printf '0')
+    _t=$(oscomp_elapsed_clock_secs)
     [ "$_t" -gt 0 ] || return 0
     printf '### OSCOMP GROUP T+%ss %s %s %s\n' "$(( _t - RUN_START_SECS ))" "$1" "$2" "$3"
 }
@@ -513,7 +528,7 @@ setup_loaders
 load_env_file
 prepare_unixbench_inputs
 printf '\n'
-RUN_START_SECS=$(bb date +%s 2>/dev/null || printf '0')
+RUN_START_SECS=$(oscomp_elapsed_clock_secs)
 export RUN_START_SECS
 run_plan_file /etc/oscomp-plan.txt || run_default_plan
 shutdown_system
