@@ -204,6 +204,21 @@ cleanup_after_group() {
     done
 }
 
+cleanup_after_ltp_case() {
+    ltp_mounts=
+    while read -r _ mount_dir _; do
+        case "$mount_dir" in
+            /tmp/LTP_*|/var/tmp/LTP_*)
+                ltp_mounts="$mount_dir $ltp_mounts"
+                ;;
+        esac
+    done < /proc/mounts
+    for mount_dir in $ltp_mounts; do
+        bb umount "$mount_dir" >/dev/null 2>&1 || true
+    done
+    bb rm -rf /tmp/LTP_* /var/tmp/LTP_* >/dev/null 2>&1 || true
+}
+
 normalize_group_markers() {
     if [ ! -f "$NORMALIZE_SED" ]; then
         bb cat > "$NORMALIZE_SED" <<'EOF'
@@ -357,7 +372,7 @@ run_ltp_timed() {
     # leave a small margin inside the group deadline before printing END.
     run_secs=$((remaining - ${OSCOMP_LTP_CASE_GRACE_SECS:-5}))
     [ "$run_secs" -gt 0 ] || return 124
-    max_secs=${OSCOMP_LTP_CASE_MAX_SECS:-0}
+    max_secs=${OSCOMP_LTP_CASE_MAX_SECS:-300}
     if [ "$max_secs" -gt 0 ] && [ "$run_secs" -gt "$max_secs" ]; then
         run_secs=$max_secs
     fi
@@ -391,6 +406,7 @@ run_ltp_group() {
             shift
             [ $# -gt 0 ] && cmdline="$*" || cmdline="$tag"
             run_ltp_command "$root" "$flavor" "$tag" "$cmdline"
+            cleanup_after_ltp_case
         done < "$list"
     ) 2>&1
     echo "#### OS COMP TEST GROUP END ltp ####"
