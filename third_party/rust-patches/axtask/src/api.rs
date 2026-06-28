@@ -268,8 +268,10 @@ pub fn set_sched_state(task: &AxTaskRef, sched_state: SchedState) -> bool {
 /// at least one exited task is still held by another scheduler-side reference
 /// and a later scheduling point is needed before it can be freed.
 pub fn reclaim_exited_tasks() -> bool {
+    const DEFAULT_RECLAIM_BATCH: usize = 128;
+
     if crate::run_queue::has_exited_tasks() {
-        crate::run_queue::reclaim_exited_tasks_current_cpu();
+        crate::run_queue::reclaim_exited_tasks_current_cpu_bounded(DEFAULT_RECLAIM_BATCH);
     }
     crate::run_queue::has_exited_tasks()
 }

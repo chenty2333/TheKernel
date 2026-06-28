@@ -874,14 +874,15 @@ pub(crate) fn has_exited_tasks() -> bool {
     len > 0
 }
 
-pub(crate) fn reclaim_exited_tasks_current_cpu() -> bool {
+fn reclaim_exited_tasks_current_cpu_batch(max_tasks: Option<usize>) -> (bool, bool) {
     // Snapshot the current queue depth so that tasks re-pushed because
     // Arc::try_unwrap failed are deferred to a later round rather than
     // keeping this loop spinning forever.
     let n = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.len());
     EXITED_TASKS_COUNT.with_current(|c| c.store(n, core::sync::atomic::Ordering::Relaxed));
+    let budget = max_tasks.map_or(n, |max_tasks| n.min(max_tasks.max(1)));
     let mut retained = false;
-    for _ in 0..n {
+    for _ in 0..budget {
         let Some(task) = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.pop_front()) else {
             break;
         };
@@ -906,7 +907,15 @@ pub(crate) fn reclaim_exited_tasks_current_cpu() -> bool {
     EXITED_TASKS_COUNT.with_current(|c| {
         c.store(remaining, core::sync::atomic::Ordering::Relaxed);
     });
-    retained
+    (retained, remaining > 0)
+}
+
+pub(crate) fn reclaim_exited_tasks_current_cpu() -> bool {
+    reclaim_exited_tasks_current_cpu_batch(None).0
+}
+
+pub(crate) fn reclaim_exited_tasks_current_cpu_bounded(max_tasks: usize) -> bool {
+    reclaim_exited_tasks_current_cpu_batch(Some(max_tasks)).1
 }
 
 /// The task routine for migrating the current task to the correct CPU.
