@@ -824,7 +824,7 @@ def env_file_for(args: argparse.Namespace, run_path: Path) -> Path | None:
             die(f"--env must be KEY=VALUE: {item}")
         lines.append(item)
     if args.ltp_budget is not None:
-        lines.append(f"OSCOMP_LTP_GROUP_BUDGET_SECS={args.ltp_budget}")
+        lines.append(f"OSCOMP_LTP_DEADLINE_SECS={args.ltp_budget}")
     if args.glibc_budget is not None:
         lines.append(f"OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS={args.glibc_budget}")
     if args.musl_budget is not None:
@@ -832,7 +832,7 @@ def env_file_for(args: argparse.Namespace, run_path: Path) -> Path | None:
     if getattr(args, "case_timeout", None) is not None:
         if args.case_timeout < 0:
             die("--case-timeout must be non-negative")
-        lines.append(f"OSCOMP_LTP_CASE_TIMEOUT_SECS={args.case_timeout}")
+        lines.append(f"OSCOMP_LTP_CASE_MAX_SECS={args.case_timeout}")
     if not lines:
         return None
     path = run_path / "oscomp.env"
