@@ -216,7 +216,6 @@ cleanup_after_ltp_case() {
     for mount_dir in $ltp_mounts; do
         bb umount "$mount_dir" >/dev/null 2>&1 || true
     done
-    bb rm -rf /tmp/LTP_* /var/tmp/LTP_* >/dev/null 2>&1 || true
 }
 
 normalize_group_markers() {
