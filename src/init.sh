@@ -217,15 +217,15 @@ cleanup_after_ltp_case() {
     done
 }
 
-tag_group_markers() {
-    flavor="$1"
-    bb sed \
-        -e 's/^\(#### OS COMP TEST GROUP START [^ ]*\)-musl\( ####\)$/\1\2/' \
-        -e 's/^\(#### OS COMP TEST GROUP END [^ ]*\)-musl\( ####\)$/\1\2/' \
-        -e 's/^\(#### OS COMP TEST GROUP START [^ ]*\)-glibc\( ####\)$/\1\2/' \
-        -e 's/^\(#### OS COMP TEST GROUP END [^ ]*\)-glibc\( ####\)$/\1\2/' \
-        -e "s/^\(#### OS COMP TEST GROUP START [^ ]*\)\( ####\)$/\1-$flavor\2/" \
-        -e "s/^\(#### OS COMP TEST GROUP END [^ ]*\)\( ####\)$/\1-$flavor\2/"
+filter_group_markers() {
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            '#### OS COMP TEST GROUP START '*|'#### OS COMP TEST GROUP END '*)
+                continue
+                ;;
+        esac
+        printf '%s\n' "$line"
+    done
 }
 
 flavor_for_root() {
@@ -261,18 +261,49 @@ build_runtime_env() {
     [ "$group" = ltp ] && export LTPROOT="$root/ltp"
 }
 
+regular_group_timeout_secs() {
+    case "$2" in
+        iozone)
+            printf '%s\n' "${OSCOMP_IOZONE_GROUP_TIMEOUT_SECS:-900}"
+            ;;
+        lmbench)
+            printf '%s\n' "${OSCOMP_LMBENCH_GROUP_TIMEOUT_SECS:-600}"
+            ;;
+        libcbench)
+            printf '%s\n' "${OSCOMP_LIBCBENCH_GROUP_TIMEOUT_SECS:-300}"
+            ;;
+        *)
+            printf '0\n'
+            ;;
+    esac
+}
+
+run_regular_script() {
+    root="$1"
+    group="$2"
+    timeout_secs="$(regular_group_timeout_secs "$root" "$group")"
+    shell_busybox="$(busybox_for_root "$root")"
+    if [ "$timeout_secs" -gt 0 ] 2>/dev/null && [ -x /opt/oscomp-support/bin/oscomp-timeout ]; then
+        /opt/oscomp-support/bin/oscomp-timeout "$timeout_secs" "$shell_busybox" ash "./${group}_testcode.sh"
+    else
+        "$shell_busybox" ash "./${group}_testcode.sh"
+    fi
+}
+
 run_regular_group() {
     root="$1"
     group="$2"
     script="$root/${group}_testcode.sh"
     [ -f "$script" ] || return 0
     flavor_for_root "$root"
+    echo "#### OS COMP TEST GROUP START $group-$FLAVOR ####"
     (
         cd "$root" || exit 125
         build_runtime_env "$root" "$group"
         [ "$group" = lmbench ] && prepare_lmbench_path "$root"
-        run_shell "$root" "./${group}_testcode.sh"
-    ) < /dev/null 2>&1 | tag_group_markers "$FLAVOR"
+        run_regular_script "$root" "$group"
+    ) < /dev/null 2>&1 | filter_group_markers
+    echo "#### OS COMP TEST GROUP END $group-$FLAVOR ####"
     cleanup_after_group
 }
 
@@ -326,15 +357,12 @@ run_ltp_command() {
     fi
 }
 
-# Wall-clock watchdog for the LTP group. The evaluator has one hard wall-clock
-# limit for the entire QEMU run, not a separate LTP limit. We run LTP last and
-# stop launching new LTP cases once total elapsed time since init approaches the
-# evaluator limit, then emit the END marker and let the kernel shut down cleanly.
-# Earlier groups consume part of this budget; LTP receives only the remaining
-# time. Every case that did run is still reported with the reference "FAIL LTP
-# CASE <name> : <ret>" line, so the group scores whatever fit in the whole-run
-# budget. Default stops near 1h55m of the 7200s evaluator limit and is
-# overridable via env.
+# Wall-clock watchdog for LTP. The evaluator has one hard wall-clock limit for
+# the entire QEMU run, not a separate LTP limit. LTP stops launching new cases
+# once either the whole-run deadline or the per-libc group budget approaches,
+# then emits the END marker so later groups or shutdown can proceed cleanly.
+# Every case that did run is still reported with the reference "FAIL LTP CASE
+# <name> : <ret>" line, so the group scores whatever fit in the bounded budget.
 ltp_deadline_secs() {
     printf '%s\n' "${OSCOMP_LTP_DEADLINE_SECS:-6900}"
 }
@@ -379,8 +407,45 @@ ltp_remaining_secs() {
     printf '%s\n' "$remaining"
 }
 
+ltp_group_budget_secs() {
+    case "$1" in
+        glibc)
+            printf '%s\n' "${OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS:-900}"
+            ;;
+        *)
+            printf '%s\n' "${OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS:-900}"
+            ;;
+    esac
+}
+
+ltp_group_remaining_secs() {
+    [ "${LTP_GROUP_BUDGET_SECS:-0}" -gt 0 ] 2>/dev/null || {
+        printf '0\n'
+        return 1
+    }
+    ltp_update_elapsed || {
+        printf '0\n'
+        return 1
+    }
+    elapsed=$((RUN_ELAPSED - ${LTP_GROUP_START_ELAPSED:-0}))
+    remaining=$((LTP_GROUP_BUDGET_SECS - elapsed))
+    [ "$remaining" -gt 0 ] || remaining=0
+    printf '%s\n' "$remaining"
+}
+
+ltp_group_time_budget_reached() {
+    remaining=$(ltp_group_remaining_secs) || return 1
+    grace=${OSCOMP_LTP_CASE_GRACE_SECS:-5}
+    [ "$remaining" -le "$grace" ]
+}
+
 run_ltp_timed() {
     remaining=$(ltp_remaining_secs)
+    group_remaining=$(ltp_group_remaining_secs 2>/dev/null)
+    [ -n "$group_remaining" ] || group_remaining=0
+    if [ "$group_remaining" -gt 0 ] && [ "$group_remaining" -lt "$remaining" ]; then
+        remaining=$group_remaining
+    fi
     # oscomp-timeout itself gives the child a short SIGTERM/SIGKILL grace, so
     # leave a small margin inside the group deadline before printing END.
     run_secs=$((remaining - ${OSCOMP_LTP_CASE_GRACE_SECS:-5}))
@@ -403,6 +468,9 @@ run_ltp_group() {
     [ -d "$bin_dir" ] && [ -f "$list" ] || return 0
     flavor_for_root "$root"
     flavor="$FLAVOR"
+    ltp_update_elapsed || RUN_ELAPSED=0
+    LTP_GROUP_START_ELAPSED=${RUN_ELAPSED:-0}
+    LTP_GROUP_BUDGET_SECS=$(ltp_group_budget_secs "$flavor")
 
     echo "#### OS COMP TEST GROUP START ltp-$flavor ####"
     (
@@ -412,6 +480,10 @@ run_ltp_group() {
             case "$line" in ''|'#'*) continue ;; esac
             if ltp_time_budget_reached; then
                 printf '#### OSCOMP LTP DEADLINE REACHED AFTER %ss; stopping LTP group to allow shutdown ####\n' "${RUN_ELAPSED:-0}"
+                break
+            fi
+            if ltp_group_time_budget_reached; then
+                printf '#### OSCOMP LTP %s BUDGET REACHED AFTER %ss; stopping LTP group ####\n' "$flavor" "$((RUN_ELAPSED - LTP_GROUP_START_ELAPSED))"
                 break
             fi
             set -- $line
@@ -485,9 +557,9 @@ run_default_plan() {
 # groups consume the whole-run budget. Test order does not affect scoring, and
 # the evaluator requires serial execution, so the plan favors category coverage:
 # functional tests first, then network/realtime groups that previously scored
-# zero because they were starved behind lmbench/iozone, then slower storage/CPU
-# benchmarks. LTP stays last and uses the remaining whole-run time until the
-# watchdog approaches the evaluator timeout.
+# zero because they were starved behind lmbench/iozone. Libcbench is fast, so it
+# runs before bounded LTP. Slow storage/CPU benchmarks stay last; if remote disk
+# I/O stalls there, earlier score categories and LTP are already closed.
 /musl basic
 /glibc basic
 /musl busybox
@@ -501,14 +573,14 @@ run_default_plan() {
 /glibc cyclictest
 /musl netperf
 /glibc netperf
-/musl iozone
-/glibc iozone
 /musl libcbench
 /glibc libcbench
-/musl lmbench
-/glibc lmbench
 /glibc ltp
 /musl ltp
+/musl iozone
+/glibc iozone
+/musl lmbench
+/glibc lmbench
 EOF
 }
 

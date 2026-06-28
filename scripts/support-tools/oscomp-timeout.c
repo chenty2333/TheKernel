@@ -88,7 +88,17 @@ int main(int argc, char **argv) {
     }
 
     kill(-child, SIGKILL);
-    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    long kill_deadline = monotonic_secs() + 2;
+    while (monotonic_secs() < kill_deadline) {
+        pid_t waited = waitpid(child, &status, WNOHANG);
+        if (waited == child) {
+            return 124;
+        }
+        if (waited < 0 && errno != EINTR) {
+            return 124;
+        }
+        struct timespec nap = {.tv_sec = 0, .tv_nsec = 100000000L};
+        nanosleep(&nap, NULL);
     }
     return 124;
 }
