@@ -912,7 +912,6 @@ impl<'a> Socket<'a> {
         self.local_rx_dup_acks = 0;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
-        self.tsval_generator = None;
         self.last_remote_tsval = 0;
 
         #[cfg(feature = "async")]
@@ -1684,7 +1683,11 @@ impl<'a> Socket<'a> {
         }
 
         let window_start = self.remote_seq_no + self.rx_buffer.len();
-        let window_end = self.remote_seq_no + self.rx_buffer.capacity();
+        let window_end = if let Some(last_ack) = self.remote_last_ack {
+            last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
+        } else {
+            window_start
+        };
         let segment_start = repr.seq_number;
         let segment_end = repr.seq_number + repr.payload.len();
 
@@ -8173,6 +8176,68 @@ mod test {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 3),
                 payload: &b"xyz"[..],
+                ..RECV_TEMPL
+            })
+        );
+    }
+
+    #[test]
+    fn test_reject_data_past_advertised_receive_window() {
+        let mut s = socket_established();
+        s.set_ack_delay(Some(ACK_DELAY_DEFAULT));
+        s.remote_mss = 32;
+
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Psh,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0; 32],
+                ..SEND_TEMPL
+            }
+        );
+        recv_nothing!(s);
+
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Psh,
+                seq_number: REMOTE_SEQ + 33,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0; 1],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 34),
+                window_len: 31,
+                ..RECV_TEMPL
+            })
+        );
+
+        s.recv_slice(&mut [0; 1]).unwrap();
+        recv_nothing!(s);
+
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Psh,
+                seq_number: REMOTE_SEQ + 34,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0; 32],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 65),
+                window_len: 1,
                 ..RECV_TEMPL
             })
         );
