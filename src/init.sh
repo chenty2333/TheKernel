@@ -26,7 +26,6 @@ run_shell() {
 }
 
 ROOTS="/musl /glibc"
-NORMALIZE_SED=/tmp/oscomp-marker-normalize.sed
 
 detect_arch() {
     machine="$(uname -m 2>/dev/null || true)"
@@ -218,16 +217,15 @@ cleanup_after_ltp_case() {
     done
 }
 
-normalize_group_markers() {
-    if [ ! -f "$NORMALIZE_SED" ]; then
-        bb cat > "$NORMALIZE_SED" <<'EOF'
-s/^\(#### OS COMP TEST GROUP START [^ ]*\)-musl\( ####\)$/\1\2/
-s/^\(#### OS COMP TEST GROUP END [^ ]*\)-musl\( ####\)$/\1\2/
-s/^\(#### OS COMP TEST GROUP START [^ ]*\)-glibc\( ####\)$/\1\2/
-s/^\(#### OS COMP TEST GROUP END [^ ]*\)-glibc\( ####\)$/\1\2/
-EOF
-    fi
-    bb sed -f "$NORMALIZE_SED"
+tag_group_markers() {
+    flavor="$1"
+    bb sed \
+        -e 's/^\(#### OS COMP TEST GROUP START [^ ]*\)-musl\( ####\)$/\1\2/' \
+        -e 's/^\(#### OS COMP TEST GROUP END [^ ]*\)-musl\( ####\)$/\1\2/' \
+        -e 's/^\(#### OS COMP TEST GROUP START [^ ]*\)-glibc\( ####\)$/\1\2/' \
+        -e 's/^\(#### OS COMP TEST GROUP END [^ ]*\)-glibc\( ####\)$/\1\2/' \
+        -e "s/^\(#### OS COMP TEST GROUP START [^ ]*\)\( ####\)$/\1-$flavor\2/" \
+        -e "s/^\(#### OS COMP TEST GROUP END [^ ]*\)\( ####\)$/\1-$flavor\2/"
 }
 
 flavor_for_root() {
@@ -268,12 +266,13 @@ run_regular_group() {
     group="$2"
     script="$root/${group}_testcode.sh"
     [ -f "$script" ] || return 0
+    flavor_for_root "$root"
     (
         cd "$root" || exit 125
         build_runtime_env "$root" "$group"
         [ "$group" = lmbench ] && prepare_lmbench_path "$root"
         run_shell "$root" "./${group}_testcode.sh"
-    ) < /dev/null 2>&1 | normalize_group_markers
+    ) < /dev/null 2>&1 | tag_group_markers "$FLAVOR"
     cleanup_after_group
 }
 
@@ -405,7 +404,7 @@ run_ltp_group() {
     flavor_for_root "$root"
     flavor="$FLAVOR"
 
-    echo "#### OS COMP TEST GROUP START ltp ####"
+    echo "#### OS COMP TEST GROUP START ltp-$flavor ####"
     (
         cd "$bin_dir" || exit 125
         build_runtime_env "$root" ltp
@@ -423,7 +422,7 @@ run_ltp_group() {
             cleanup_after_ltp_case
         done < "$list"
     ) 2>&1
-    echo "#### OS COMP TEST GROUP END ltp ####"
+    echo "#### OS COMP TEST GROUP END ltp-$flavor ####"
     cleanup_after_group
 }
 

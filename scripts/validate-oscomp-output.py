@@ -32,6 +32,10 @@ CONCLUSION_RE = re.compile(
 )
 
 
+def marker_base_group(group: str) -> str:
+    return SUFFIX_RE.sub("", group)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="validate score-facing OSComp evaluator output markers"
@@ -67,13 +71,10 @@ def main() -> int:
         action, group = match.group(1), match.group(2)
         markers.append((action, group, line_no))
 
-        if SUFFIX_RE.search(group):
+        base_group = marker_base_group(group)
+        if base_group not in CANONICAL_GROUPS:
             issues.append(
-                f"line {line_no}: score-facing group marker uses libc suffix: {group}"
-            )
-        if group not in CANONICAL_GROUPS:
-            issues.append(
-                f"line {line_no}: score-facing group marker is not canonical: {group}"
+                f"line {line_no}: score-facing group marker has unknown base group: {group}"
             )
 
         if action == "START":
@@ -97,7 +98,7 @@ def main() -> int:
             current = None
             continue
 
-        if group in CANONICAL_GROUPS:
+        if base_group in CANONICAL_GROUPS:
             complete.append((group, open_line, line_no))
         current = None
 
@@ -106,14 +107,14 @@ def main() -> int:
         issues.append(f"line {open_line}: group {open_group} starts without a matching end")
 
     if text.strip() and not complete:
-        issues.append("log has output but zero complete canonical evaluator groups")
+        issues.append("log has output but zero complete evaluator groups")
 
     if args.require_conclusion and not CONCLUSION_RE.search(text):
         issues.append("log has no visible timeout/shutdown conclusion")
 
     label = f" arch={args.arch}" if args.arch else ""
     print(
-        f"oscomp-output{label} markers={len(markers)} complete_canonical_groups={len(complete)} issues={len(issues)}"
+        f"oscomp-output{label} markers={len(markers)} complete_groups={len(complete)} issues={len(issues)}"
     )
     for group, start_line, end_line in complete:
         print(f"  complete {group} lines={start_line}-{end_line}")
