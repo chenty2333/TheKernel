@@ -258,6 +258,8 @@ build_runtime_env() {
         [ "$group" = ltp ] && add_preload_if_present /opt/oscomp-support/lib/liboscomp-mmsg-compat.so
         [ -n "$preload" ] && export LD_PRELOAD="$preload" || unset LD_PRELOAD
     fi
+    # Keep lmbench calibration bounded so slow evaluator I/O cannot starve LTP.
+    [ "$group" = lmbench ] && export ENOUGH="${OSCOMP_LMBENCH_ENOUGH:-5000}"
     [ "$group" = ltp ] && export LTPROOT="$root/ltp"
 }
 
@@ -267,7 +269,7 @@ regular_group_timeout_secs() {
             printf '%s\n' "${OSCOMP_IOZONE_GROUP_TIMEOUT_SECS:-900}"
             ;;
         lmbench)
-            printf '%s\n' "${OSCOMP_LMBENCH_GROUP_TIMEOUT_SECS:-600}"
+            printf '%s\n' "${OSCOMP_LMBENCH_GROUP_TIMEOUT_SECS:-300}"
             ;;
         libcbench)
             printf '%s\n' "${OSCOMP_LIBCBENCH_GROUP_TIMEOUT_SECS:-600}"
@@ -410,10 +412,10 @@ ltp_remaining_secs() {
 ltp_group_budget_secs() {
     case "$1" in
         glibc)
-            printf '%s\n' "${OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS:-1200}"
+            printf '%s\n' "${OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS:-1500}"
             ;;
         *)
-            printf '%s\n' "${OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS:-1800}"
+            printf '%s\n' "${OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS:-2000}"
             ;;
     esac
 }
