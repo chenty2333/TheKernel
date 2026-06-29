@@ -410,10 +410,10 @@ ltp_remaining_secs() {
 ltp_group_budget_secs() {
     case "$1" in
         glibc)
-            printf '%s\n' "${OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS:-2000}"
+            printf '%s\n' "${OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS:-900}"
             ;;
         *)
-            printf '%s\n' "${OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS:-2000}"
+            printf '%s\n' "${OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS:-900}"
             ;;
     esac
 }
