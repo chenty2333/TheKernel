@@ -413,7 +413,7 @@ ltp_group_budget_secs() {
             printf '%s\n' "${OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS:-1200}"
             ;;
         *)
-            printf '%s\n' "${OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS:-1200}"
+            printf '%s\n' "${OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS:-1800}"
             ;;
     esac
 }
@@ -553,13 +553,12 @@ run_default_plan() {
         [ -n "$group" ] && run_group "$root" "$group"
     done <<'EOF'
 # Interleave musl/glibc and run high-value, fast groups first so a heavily
-# loaded evaluator host reaches every score category before the slow performance
-# groups consume the whole-run budget. Test order does not affect scoring, and
-# the evaluator requires serial execution, so the plan favors category coverage:
-# functional tests first, then network/realtime groups that previously scored
-# zero because they were starved behind lmbench/iozone. Libcbench is fast, so it
-# runs before bounded LTP. Slow storage/CPU benchmarks stay last; if remote disk
-# I/O stalls there, earlier score categories and LTP are already closed.
+# loaded evaluator host reaches every score category. Test order does not
+# affect scoring, and the evaluator requires serial execution, so the plan
+# favors category coverage: functional/network/realtime/libc groups first, then
+# bounded storage/CPU benchmarks, then bounded LTP. Keeping iozone and lmbench
+# before LTP gives the evaluator complete benchmark groups before LTP spends
+# the remaining wall-clock budget.
 /musl basic
 /glibc basic
 /musl busybox
@@ -575,12 +574,12 @@ run_default_plan() {
 /glibc netperf
 /musl libcbench
 /glibc libcbench
-/glibc ltp
-/musl ltp
 /musl iozone
 /glibc iozone
 /musl lmbench
 /glibc lmbench
+/glibc ltp
+/musl ltp
 EOF
 }
 
