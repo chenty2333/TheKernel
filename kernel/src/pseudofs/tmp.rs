@@ -30,7 +30,9 @@ const STAT_BLOCK_UNIT: u64 = 512;
 const MIB: u64 = 1024 * 1024;
 const DEFAULT_TMPFS_MIN_BYTES: u64 = 16 * MIB;
 const DEFAULT_TMPFS_MAX_BYTES: u64 = 256 * MIB;
-const TMPFS_PAGE_POOL_MAX_PAGES: usize = 8192;
+const TMPFS_PAGE_POOL_TARGET_BYTES: usize = 192 * 1024 * 1024;
+const TMPFS_PAGE_POOL_MIN_FREE_BYTES: usize = 384 * 1024 * 1024;
+const TMPFS_PAGE_POOL_TARGET_PAGES: usize = TMPFS_PAGE_POOL_TARGET_BYTES / PAGE_SIZE_4K;
 
 type TmpfsPage = Box<[u8; PAGE_SIZE_4K]>;
 
@@ -176,15 +178,32 @@ impl MemoryFs {
         }
     }
 
+    fn page_pool_max_pages(&self) -> usize {
+        let capacity_pages = self
+            .capacity_pages
+            .unwrap_or_else(|| default_tmpfs_capacity_bytes() / TMPFS_BLOCK_SIZE);
+        TMPFS_PAGE_POOL_TARGET_PAGES.min((capacity_pages / 2).min(usize::MAX as u64) as usize)
+    }
+
     fn recycle_pages<I>(&self, pages: I)
     where
         I: IntoIterator<Item = TmpfsPage>,
     {
+        if crate::mm::system_memory_stats().available_bytes < TMPFS_PAGE_POOL_MIN_FREE_BYTES {
+            return;
+        }
+
+        let max_pages = self.page_pool_max_pages();
+        if max_pages == 0 {
+            return;
+        }
+
         let mut free_pages = self.free_pages.lock();
         for page in pages {
-            if free_pages.len() < TMPFS_PAGE_POOL_MAX_PAGES {
-                free_pages.push(page);
+            if free_pages.len() >= max_pages {
+                break;
             }
+            free_pages.push(page);
         }
     }
 }
