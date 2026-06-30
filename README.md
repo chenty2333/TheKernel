@@ -14,6 +14,8 @@ compatibility for the official test suite.
 - Author: 陈天意 <hi@tychen.cc>
 - Upstream baseline: StarryOS commit
   [`2e075accf4fb0aefdd1d252ebd9ccf29727d9923`](https://github.com/Starry-OS/StarryOS/tree/2e075accf4fb0aefdd1d252ebd9ccf29727d9923).
+- AI-assisted commits are marked in Git history with
+  `Co-Authored-By: Codex <noreply@openai.com>`.
 - Source code license: Apache License 2.0, see [LICENSE](LICENSE) and
   [NOTICE](NOTICE).
 - Technical documents, presentation slides, and other defense materials:
