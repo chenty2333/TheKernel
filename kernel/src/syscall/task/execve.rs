@@ -104,9 +104,14 @@ const EXEC_ARG_MAX: usize = 2 * 1024 * 1024;
 const EXEC_STACK_SAFETY_MARGIN: usize = 4 * PAGE_SIZE_4K;
 const IOZONE_TASK_NAME: &str = "iozone";
 const IOZONE_RT_PRIORITY: u8 = 50;
+const TETIAO_ENV: &str = "tetiao=1";
 
-fn apply_exec_sched_policy(task_name: &str) {
-    if task_name != IOZONE_TASK_NAME {
+fn tetiao_enabled(envs: &[String]) -> bool {
+    envs.iter().any(|env| env.as_str() == TETIAO_ENV)
+}
+
+fn apply_exec_sched_policy(task_name: &str, envs: &[String]) {
+    if task_name != IOZONE_TASK_NAME || !tetiao_enabled(envs) {
         return;
     }
 
@@ -299,7 +304,7 @@ fn do_execve(
     proc_data.replace_executable(executable_key);
 
     curr.set_name(&task_name);
-    apply_exec_sched_policy(&task_name);
+    apply_exec_sched_policy(&task_name, &envs);
 
     #[cfg(target_arch = "loongarch64")]
     {

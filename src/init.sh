@@ -173,6 +173,11 @@ load_env_file() {
     done < /etc/oscomp.env
 }
 
+configure_tetiao_default() {
+    : "${tetiao:=1}"
+    export tetiao
+}
+
 prepare_unixbench_inputs() {
     src=/opt/oscomp-support/share/unixbench/sort.src
     [ -f "$src" ] || return 0
@@ -273,6 +278,9 @@ regular_group_timeout_secs() {
             ;;
         libcbench)
             printf '%s\n' "${OSCOMP_LIBCBENCH_GROUP_TIMEOUT_SECS:-600}"
+            ;;
+        libctest)
+            printf '%s\n' "${OSCOMP_LIBCTEST_GROUP_TIMEOUT_SECS:-300}"
             ;;
         *)
             printf '0\n'
@@ -420,6 +428,36 @@ ltp_group_budget_secs() {
     esac
 }
 
+ltp_effective_group_budget_secs() {
+    flavor="$1"
+    budget=$(ltp_group_budget_secs "$flavor")
+    [ "${OSCOMP_LTP_BALANCE_LIBC_BUDGETS:-1}" != 0 ] || {
+        printf '%s\n' "$budget"
+        return 0
+    }
+    [ "$flavor" = glibc ] || {
+        printf '%s\n' "$budget"
+        return 0
+    }
+    [ -d /musl/ltp/testcases/bin ] || {
+        printf '%s\n' "$budget"
+        return 0
+    }
+
+    remaining=$(ltp_remaining_secs 2>/dev/null) || {
+        printf '%s\n' "$budget"
+        return 0
+    }
+    reserve=${OSCOMP_LTP_BALANCE_RESERVE_SECS:-30}
+    available=$((remaining - reserve))
+    [ "$available" -gt 0 ] || available=0
+    balanced=$((available / 2))
+    if [ "$balanced" -gt 0 ] && [ "$balanced" -lt "$budget" ]; then
+        budget=$balanced
+    fi
+    printf '%s\n' "$budget"
+}
+
 ltp_group_remaining_secs() {
     [ "${LTP_GROUP_BUDGET_SECS:-0}" -gt 0 ] 2>/dev/null || {
         printf '0\n'
@@ -452,7 +490,7 @@ run_ltp_timed() {
     # leave a small margin inside the group deadline before printing END.
     run_secs=$((remaining - ${OSCOMP_LTP_CASE_GRACE_SECS:-5}))
     [ "$run_secs" -gt 0 ] || return 124
-    max_secs=${OSCOMP_LTP_CASE_MAX_SECS:-60}
+    max_secs=${OSCOMP_LTP_CASE_MAX_SECS:-45}
     if [ "$max_secs" -gt 0 ] && [ "$run_secs" -gt "$max_secs" ]; then
         run_secs=$max_secs
     fi
@@ -472,7 +510,7 @@ run_ltp_group() {
     flavor="$FLAVOR"
     ltp_update_elapsed || RUN_ELAPSED=0
     LTP_GROUP_START_ELAPSED=${RUN_ELAPSED:-0}
-    LTP_GROUP_BUDGET_SECS=$(ltp_group_budget_secs "$flavor")
+    LTP_GROUP_BUDGET_SECS=$(ltp_effective_group_budget_secs "$flavor")
 
     echo "#### OS COMP TEST GROUP START ltp-$flavor ####"
     (
@@ -598,6 +636,7 @@ detect_arch
 stage_support_disk
 setup_loaders
 load_env_file
+configure_tetiao_default
 prepare_unixbench_inputs
 printf '\n'
 RUN_START_SECS=$(oscomp_elapsed_clock_secs)
