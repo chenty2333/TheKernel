@@ -15,6 +15,7 @@ TIMEOUT_SECS=7000
 WORKDIR=""
 KEEP_WORKDIR=0
 SKIP_KERNEL_BUILD=0
+INTERACTIVE=0
 REPLAY_VERBOSE=${OSCOMP_REPLAY_VERBOSE:-0}
 
 log() {
@@ -41,10 +42,11 @@ Options:
   --arch {rv|la}        Target architecture
   --image IMG[.xz|.gz]  Override the official testsuite image
   --support-image IMG    Override the support disk image (default: disk-rv.img for rv, disk-la.img for la)
-  --timeout SECS        Whole-QEMU timeout in seconds (default: $TIMEOUT_SECS)
+  --timeout SECS        Whole-QEMU timeout in seconds; use 0 to disable (default: $TIMEOUT_SECS)
   --workdir DIR         Working directory for decompressed/copied images
   --skip-kernel-build   Reuse existing kernel-rv/kernel-la
   --keep-workdir        Keep the working directory after the run
+  --interactive         Keep QEMU stdin attached to the terminal
 EOF
 }
 
@@ -74,6 +76,10 @@ while (($#)); do
             SKIP_KERNEL_BUILD=1
             shift
             ;;
+        --interactive)
+            INTERACTIVE=1
+            shift
+            ;;
         --keep-workdir)
             KEEP_WORKDIR=1
             shift
@@ -93,6 +99,11 @@ case "$ARCH" in
         ;;
     *)
         die "--arch must be rv or la"
+        ;;
+esac
+case "$TIMEOUT_SECS" in
+    ''|*[!0-9]*)
+        die "--timeout must be a non-negative integer"
         ;;
 esac
 
@@ -325,7 +336,16 @@ if [ -n "$QEMU_DEBUG_FILE" ]; then
 fi
 
 set +e
-timeout --foreground "$TIMEOUT_SECS" "${QEMU_CMD[@]}" </dev/null 2>&1 | tee "$QEMU_LOG"
+if [ "$TIMEOUT_SECS" -gt 0 ]; then
+    QEMU_RUN_CMD=(timeout --foreground "$TIMEOUT_SECS" "${QEMU_CMD[@]}")
+else
+    QEMU_RUN_CMD=("${QEMU_CMD[@]}")
+fi
+if [ "$INTERACTIVE" -eq 1 ]; then
+    "${QEMU_RUN_CMD[@]}" 2>&1 | tee "$QEMU_LOG"
+else
+    "${QEMU_RUN_CMD[@]}" </dev/null 2>&1 | tee "$QEMU_LOG"
+fi
 status=${PIPESTATUS[0]}
 set -e
 

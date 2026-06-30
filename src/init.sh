@@ -635,6 +635,24 @@ shutdown_system() {
     bb halt -f >/dev/null 2>&1 || true
 }
 
+boot_shell_requested() {
+    case "${OSCOMP_BOOT_SHELL:-0}" in
+        1|y|Y|yes|YES|true|TRUE|on|ON)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+run_boot_shell() {
+    echo "Entering TheKernel boot shell. Exit the shell to power off."
+    cd /root 2>/dev/null || cd /
+    export PS1='thekernel# '
+    "$BUSYBOX" sh
+}
+
 setup_base_fs
 detect_arch
 stage_support_disk
@@ -643,6 +661,11 @@ load_env_file
 configure_tetiao_default
 prepare_unixbench_inputs
 printf '\n'
+if boot_shell_requested; then
+    run_boot_shell
+    shutdown_system
+    exit 0
+fi
 RUN_START_SECS=$(oscomp_elapsed_clock_secs)
 export RUN_START_SECS
 run_plan_file /etc/oscomp-plan.txt || run_default_plan

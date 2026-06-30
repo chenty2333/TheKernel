@@ -46,6 +46,10 @@ LOG_DIR ?= $(STATE_ARCH_DIR)/logs
 QEMU_LOG_FILE ?= $(LOG_DIR)/qemu.log
 NET_DUMP_FILE ?= $(LOG_DIR)/netdump.pcap
 DISK_IMG ?= $(STATE_ARCH_DIR)/disk.img
+BOOT_STATE_DIR ?= $(STATE_DIR)/boot
+BOOT_ENV_FILE ?= $(BOOT_STATE_DIR)/oscomp-boot.env
+BOOT_RV_SUPPORT_IMG ?= $(BOOT_STATE_DIR)/disk-rv.img
+BOOT_LA_SUPPORT_IMG ?= $(BOOT_STATE_DIR)/disk-la.img
 
 ifeq ($(MEMTRACK), y)
 	APP_FEATURES += starry-api/memtrack
@@ -70,6 +74,10 @@ help:
 		'  make eval-la      rebuild kernel-la, then replay la official image' \
 		'  make replay-rv    reuse existing artifacts, then replay rv official image' \
 		'  make replay-la    reuse existing artifacts, then replay la official image' \
+		'' \
+		'Boot commands:' \
+		'  make boot-rv      build/reuse rv artifacts, then boot an interactive shell' \
+		'  make boot-la      build/reuse la artifacts, then boot an interactive shell' \
 		'' \
 		'Lab commands:' \
 		'  make lab-check' \
@@ -158,6 +166,22 @@ replay-rv:
 
 replay-la:
 	@./scripts/oscomp.sh run --arch la --skip-kernel-build $(OSCOMP_ARGS)
+
+$(BOOT_ENV_FILE):
+	@mkdir -p "$(BOOT_STATE_DIR)"
+	@printf '%s\n' 'OSCOMP_BOOT_SHELL=1' > "$@"
+
+$(BOOT_RV_SUPPORT_IMG): $(BOOT_ENV_FILE) src/init.sh scripts/build-oscomp-support-disk.sh
+	@bash ./scripts/build-oscomp-support-disk.sh --arch rv --output "$@" --env-override "$(BOOT_ENV_FILE)"
+
+$(BOOT_LA_SUPPORT_IMG): $(BOOT_ENV_FILE) src/init.sh scripts/build-oscomp-support-disk.sh
+	@bash ./scripts/build-oscomp-support-disk.sh --arch la --output "$@" --env-override "$(BOOT_ENV_FILE)"
+
+boot-rv: kernel-rv $(BOOT_RV_SUPPORT_IMG)
+	@./scripts/replay-oscomp-eval.sh --arch rv --support-image "$(BOOT_RV_SUPPORT_IMG)" --skip-kernel-build --interactive --timeout 0 $(OSCOMP_ARGS)
+
+boot-la: kernel-la $(BOOT_LA_SUPPORT_IMG)
+	@./scripts/replay-oscomp-eval.sh --arch la --support-image "$(BOOT_LA_SUPPORT_IMG)" --skip-kernel-build --interactive --timeout 0 $(OSCOMP_ARGS)
 
 lab-check:
 	@./scripts/lab bootstrap
@@ -266,7 +290,7 @@ rv:
 la:
 	$(MAKE) ARCH=loongarch64 run
 
-.PHONY: help all artifacts kernels build run eval-rv eval-la replay-rv replay-la lab-check lab-bootstrap lab-inventory lab-summary lab-new lab-run lab-review lab-apply lab-done lab-status lab-plan lab-list lab-replay lab-parse lab-summarize lab-promote lab-campaign lab-clean lab-trim dev-image dev-check dev-shell dev-shell-root debug disasm clean clean-eval legacy-clean prebuild-scrub check-eval-artifacts check-eval-kernel-size kernel-rv kernel-la disk.img disk-rv.img disk-la.img
+.PHONY: help all artifacts kernels build run eval-rv eval-la replay-rv replay-la boot-rv boot-la lab-check lab-bootstrap lab-inventory lab-summary lab-new lab-run lab-review lab-apply lab-done lab-status lab-plan lab-list lab-replay lab-parse lab-summarize lab-promote lab-campaign lab-clean lab-trim dev-image dev-check dev-shell dev-shell-root debug disasm clean clean-eval legacy-clean prebuild-scrub check-eval-artifacts check-eval-kernel-size kernel-rv kernel-la disk.img disk-rv.img disk-la.img
 check-eval-artifacts:
 	@missing=0; \
 	for artifact in \
