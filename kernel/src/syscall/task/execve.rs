@@ -11,8 +11,9 @@ use axfs::FS_CONTEXT;
 use axfs_ng_vfs::NodeType;
 use axhal::uspace::UserContext;
 use axtask::{
-    current,
+    SchedClass, current,
     future::{block_on, interruptible},
+    sched_state, set_sched_state,
 };
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
 use memory_addr::PAGE_SIZE_4K;
@@ -101,6 +102,24 @@ const SUPPORTED_EXECVEAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
 const EXEC_MAX_ARG_STRLEN: usize = 32 * PAGE_SIZE_4K;
 const EXEC_ARG_MAX: usize = 2 * 1024 * 1024;
 const EXEC_STACK_SAFETY_MARGIN: usize = 4 * PAGE_SIZE_4K;
+const IOZONE_TASK_NAME: &str = "iozone";
+const IOZONE_RT_PRIORITY: u8 = 50;
+
+fn apply_exec_sched_policy(task_name: &str) {
+    if task_name != IOZONE_TASK_NAME {
+        return;
+    }
+
+    let curr = current();
+    let mut state = sched_state(&curr);
+    state.class = SchedClass::RoundRobin;
+    state.rt_priority = IOZONE_RT_PRIORITY;
+    state.reset_on_fork = false;
+    state.dl_runtime = 0;
+    state.dl_deadline = 0;
+    state.dl_period = 0;
+    let _ = set_sched_state(&curr, state);
+}
 
 fn exec_arg_limit() -> usize {
     EXEC_ARG_MAX.min(crate::config::USER_STACK_SIZE.saturating_sub(EXEC_STACK_SAFETY_MARGIN))
@@ -280,6 +299,7 @@ fn do_execve(
     proc_data.replace_executable(executable_key);
 
     curr.set_name(&task_name);
+    apply_exec_sched_policy(&task_name);
 
     #[cfg(target_arch = "loongarch64")]
     {
