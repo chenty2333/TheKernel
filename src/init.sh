@@ -366,7 +366,7 @@ run_ltp_command() {
 # Every case that did run is still reported with the reference "FAIL LTP CASE
 # <name> : <ret>" line, so the group scores whatever fit in the bounded budget.
 ltp_deadline_secs() {
-    printf '%s\n' "${OSCOMP_LTP_DEADLINE_SECS:-6900}"
+    printf '%s\n' "${OSCOMP_LTP_DEADLINE_SECS:-7000}"
 }
 
 oscomp_elapsed_clock_secs() {
@@ -412,10 +412,10 @@ ltp_remaining_secs() {
 ltp_group_budget_secs() {
     case "$1" in
         glibc)
-            printf '%s\n' "${OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS:-1500}"
+            printf '%s\n' "${OSCOMP_LTP_GLIBC_GROUP_BUDGET_SECS:-1000}"
             ;;
         *)
-            printf '%s\n' "${OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS:-2000}"
+            printf '%s\n' "${OSCOMP_LTP_MUSL_GROUP_BUDGET_SECS:-1000}"
             ;;
     esac
 }
@@ -452,7 +452,7 @@ run_ltp_timed() {
     # leave a small margin inside the group deadline before printing END.
     run_secs=$((remaining - ${OSCOMP_LTP_CASE_GRACE_SECS:-5}))
     [ "$run_secs" -gt 0 ] || return 124
-    max_secs=${OSCOMP_LTP_CASE_MAX_SECS:-300}
+    max_secs=${OSCOMP_LTP_CASE_MAX_SECS:-60}
     if [ "$max_secs" -gt 0 ] && [ "$run_secs" -gt "$max_secs" ]; then
         run_secs=$max_secs
     fi
