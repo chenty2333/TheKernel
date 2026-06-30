@@ -96,8 +96,6 @@ list_cmd() {
     printf '  /glibc lua\n'
     printf '  /musl iperf\n'
     printf '  /glibc iperf\n'
-    printf '  /musl cyclictest\n'
-    printf '  /glibc cyclictest\n'
     printf '  /musl netperf\n'
     printf '  /glibc netperf\n'
     printf '  /musl libcbench\n'
@@ -108,6 +106,8 @@ list_cmd() {
     printf '  /glibc lmbench\n'
     printf '  /glibc ltp\n'
     printf '  /musl ltp\n'
+    printf '  /musl cyclictest\n'
+    printf '  /glibc cyclictest\n'
     printf 'groups in fixed plan:\n'
     printf '  %s\n' "${REFERENCE_PLAN_GROUPS[@]}"
 }

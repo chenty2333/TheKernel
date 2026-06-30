@@ -282,6 +282,9 @@ regular_group_timeout_secs() {
         libctest)
             printf '%s\n' "${OSCOMP_LIBCTEST_GROUP_TIMEOUT_SECS:-300}"
             ;;
+        cyclictest)
+            printf '%s\n' "${OSCOMP_CYCLICTEST_GROUP_TIMEOUT_SECS:-120}"
+            ;;
         *)
             printf '0\n'
             ;;
@@ -595,10 +598,11 @@ run_default_plan() {
 # Interleave musl/glibc and run high-value, fast groups first so a heavily
 # loaded evaluator host reaches every score category. Test order does not
 # affect scoring, and the evaluator requires serial execution, so the plan
-# favors category coverage: functional/network/realtime/libc groups first, then
-# bounded storage/CPU benchmarks, then bounded LTP. Keeping iozone and lmbench
-# before LTP gives the evaluator complete benchmark groups before LTP spends
-# the remaining wall-clock budget.
+# favors category coverage: functional/network/libc groups first, then bounded
+# storage/CPU benchmarks, then bounded LTP. Keeping iozone and lmbench before
+# LTP gives the evaluator complete benchmark groups before LTP spends the
+# remaining wall-clock budget. cyclictest is low value and stress-heavy, so run
+# it last behind a group timeout to isolate loaded-host scheduler stalls.
 /musl basic
 /glibc basic
 /musl busybox
@@ -608,8 +612,6 @@ run_default_plan() {
 /glibc lua
 /musl iperf
 /glibc iperf
-/musl cyclictest
-/glibc cyclictest
 /musl netperf
 /glibc netperf
 /musl libcbench
@@ -620,6 +622,8 @@ run_default_plan() {
 /glibc lmbench
 /glibc ltp
 /musl ltp
+/musl cyclictest
+/glibc cyclictest
 EOF
 }
 
