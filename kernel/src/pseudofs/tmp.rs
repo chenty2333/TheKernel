@@ -30,9 +30,6 @@ const STAT_BLOCK_UNIT: u64 = 512;
 const MIB: u64 = 1024 * 1024;
 const DEFAULT_TMPFS_MIN_BYTES: u64 = 16 * MIB;
 const DEFAULT_TMPFS_MAX_BYTES: u64 = 256 * MIB;
-const TMPFS_PAGE_POOL_MAX_PAGES: usize = 8192;
-
-type TmpfsPage = Box<[u8; PAGE_SIZE_4K]>;
 
 fn default_tmpfs_capacity_bytes() -> u64 {
     let ram = total_ram_size() as u64;
@@ -84,7 +81,6 @@ pub struct MemoryFs {
     root: Mutex<Option<DirEntry>>,
     capacity_pages: Option<u64>,
     allocated_pages: Mutex<u64>,
-    free_pages: Mutex<Vec<TmpfsPage>>,
 }
 
 impl MemoryFs {
@@ -118,7 +114,6 @@ impl MemoryFs {
             root: Mutex::default(),
             capacity_pages: Some(capacity_bytes.div_ceil(TMPFS_BLOCK_SIZE)),
             allocated_pages: Mutex::new(0),
-            free_pages: Mutex::new(Vec::new()),
         });
         let root_ino = Inode::new(&fs, None, NodeType::Directory, permission);
         *fs.root.lock() = Some(DirEntry::new_dir(
@@ -165,27 +160,6 @@ impl MemoryFs {
         }
         let mut allocated = self.allocated_pages.lock();
         *allocated = allocated.saturating_sub(pages);
-    }
-
-    fn allocate_page(&self) -> TmpfsPage {
-        if let Some(mut page) = self.free_pages.lock().pop() {
-            page.fill(0);
-            page
-        } else {
-            Box::new([0; PAGE_SIZE_4K])
-        }
-    }
-
-    fn recycle_pages<I>(&self, pages: I)
-    where
-        I: IntoIterator<Item = TmpfsPage>,
-    {
-        let mut free_pages = self.free_pages.lock();
-        for page in pages {
-            if free_pages.len() < TMPFS_PAGE_POOL_MAX_PAGES {
-                free_pages.push(page);
-            }
-        }
     }
 }
 
@@ -258,7 +232,7 @@ struct FileContent {
     /// content management to page cache.
     length: Mutex<u64>,
     symlink: Mutex<Option<String>>,
-    pages: Mutex<BTreeMap<u64, TmpfsPage>>,
+    pages: Mutex<BTreeMap<u64, Box<[u8; PAGE_SIZE_4K]>>>,
     allocated_pages: Mutex<BTreeSet<u64>>,
     hole_pages: Mutex<BTreeSet<u64>>,
 }
@@ -270,21 +244,8 @@ impl FileContent {
         let last_page = len.div_ceil(TMPFS_BLOCK_SIZE);
         let old_last_page = old_len.div_ceil(TMPFS_BLOCK_SIZE);
         let mut pages = self.pages.lock();
-        let mut recycled_pages = Vec::new();
-        if last_page < old_last_page {
-            let current = mem::take(&mut *pages);
-            for (page, mut data) in current {
-                if page < last_page {
-                    if len > 0 && page == (len - 1) / TMPFS_BLOCK_SIZE {
-                        let last_used_len = ((len - 1) % TMPFS_BLOCK_SIZE + 1) as usize;
-                        data[last_used_len..].fill(0);
-                    }
-                    pages.insert(page, data);
-                } else {
-                    recycled_pages.push(data);
-                }
-            }
-        } else if len > 0 {
+        pages.retain(|page, _| *page < last_page);
+        if len > 0 {
             let last_used_page = (len - 1) / TMPFS_BLOCK_SIZE;
             let last_used_len = ((len - 1) % TMPFS_BLOCK_SIZE + 1) as usize;
             if let Some(page) = pages.get_mut(&last_used_page) {
@@ -292,7 +253,6 @@ impl FileContent {
             }
         }
         drop(pages);
-        fs.recycle_pages(recycled_pages);
         if last_page < old_last_page {
             let mut allocated = self.allocated_pages.lock();
             let released = allocated.iter().filter(|page| **page >= last_page).count() as u64;
@@ -306,8 +266,7 @@ impl FileContent {
     fn clear_storage(&self, fs: &MemoryFs) {
         *self.length.lock() = 0;
         *self.symlink.lock() = None;
-        let pages = mem::take(&mut *self.pages.lock());
-        fs.recycle_pages(pages.into_values());
+        self.pages.lock().clear();
         let mut allocated = self.allocated_pages.lock();
         let released = allocated.len() as u64;
         allocated.clear();
@@ -370,7 +329,9 @@ impl FileContent {
             let page = pos / TMPFS_BLOCK_SIZE;
             let page_off = (pos % TMPFS_BLOCK_SIZE) as usize;
             let chunk = (buf.len() - done).min(PAGE_SIZE_4K - page_off);
-            let dst = pages.entry(page).or_insert_with(|| fs.allocate_page());
+            let dst = pages
+                .entry(page)
+                .or_insert_with(|| Box::new([0; PAGE_SIZE_4K]));
             dst[page_off..page_off + chunk].copy_from_slice(&buf[done..done + chunk]);
             allocated.insert(page);
             holes.remove(&page);
@@ -403,21 +364,15 @@ impl FileContent {
         let mut pages = self.pages.lock();
         let mut allocated = self.allocated_pages.lock();
         let mut holes = self.hole_pages.lock();
-        let mut recycled_pages = Vec::new();
         let mut released = 0;
         for page in start..end {
-            if let Some(data) = pages.remove(&page) {
-                recycled_pages.push(data);
-            }
+            pages.remove(&page);
             if allocated.remove(&page) {
                 released += 1;
             }
             holes.insert(page);
         }
-        drop(pages);
         drop(allocated);
-        drop(holes);
-        fs.recycle_pages(recycled_pages);
         fs.release_pages(released);
     }
 
@@ -445,18 +400,14 @@ impl FileContent {
 
         let mut data_pages = self.pages.lock();
         let current = mem::take(&mut *data_pages);
-        let mut recycled_pages = Vec::new();
         for (page, data) in current {
             if page < start {
                 data_pages.insert(page, data);
             } else if page >= end {
                 data_pages.insert(page - delta, data);
-            } else {
-                recycled_pages.push(data);
             }
         }
         drop(data_pages);
-        fs.recycle_pages(recycled_pages);
         let released = remap_pages(&mut self.allocated_pages.lock());
         fs.release_pages(released);
         remap_pages(&mut self.hole_pages.lock());

@@ -188,19 +188,6 @@ prepare_lmbench_path() {
     bb ln -sf "$root/lmbench_all" /code/lmbench_src/bin/build/lmbench_all 2>/dev/null || true
 }
 
-prepare_iozone_scratch() {
-    root="$1"
-    flavor="$2"
-    scratch="/var/tmp/oscomp-iozone-$flavor"
-    bb rm -rf "$scratch" 2>/dev/null || true
-    bb mkdir -p "$scratch" 2>/dev/null || return 1
-    for name in busybox iozone iozone_testcode.sh; do
-        [ -e "$root/$name" ] || return 1
-        bb ln -sf "$root/$name" "$scratch/$name" 2>/dev/null || return 1
-    done
-    printf '%s\n' "$scratch"
-}
-
 add_preload_if_present() {
     so="$1"
     [ -f "$so" ] || return 0
@@ -214,7 +201,6 @@ cleanup_after_group() {
     for proc in iperf3 netserver hackbench cyclictest iozone; do
         bb killall -9 "$proc" >/dev/null 2>&1 || true
     done
-    bb rm -rf /var/tmp/oscomp-iozone-musl /var/tmp/oscomp-iozone-glibc >/dev/null 2>&1 || true
 }
 
 cleanup_after_ltp_case() {
@@ -314,11 +300,7 @@ run_regular_group() {
     flavor_for_root "$root"
     echo "#### OS COMP TEST GROUP START $group-$FLAVOR ####"
     (
-        workdir="$root"
-        if [ "$group" = iozone ]; then
-            workdir="$(prepare_iozone_scratch "$root" "$FLAVOR")" || workdir="$root"
-        fi
-        cd "$workdir" || exit 125
+        cd "$root" || exit 125
         build_runtime_env "$root" "$group"
         [ "$group" = lmbench ] && prepare_lmbench_path "$root"
         run_regular_script "$root" "$group"
