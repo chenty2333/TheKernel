@@ -22,3 +22,9 @@ score.txt
 *out
 __pycache__/
 *.pyc
+
+# Local agent/editor state.
+/.claude/
+/.codex/
+/.humanize/
+/.vscode/
