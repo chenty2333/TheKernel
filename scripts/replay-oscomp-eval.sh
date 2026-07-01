@@ -13,6 +13,7 @@ SUPPORT_IMAGE_OVERRIDE=""
 SUPPORT_IMAGE_SOURCE=""
 TIMEOUT_SECS=7000
 WORKDIR=""
+QEMU_LOG_OVERRIDE=""
 KEEP_WORKDIR=0
 SKIP_KERNEL_BUILD=0
 INTERACTIVE=0
@@ -30,7 +31,12 @@ log() {
 }
 
 die() {
-    printf '[replay-oscomp] error: %s\n' "$*" >&2
+    local message="[replay-oscomp] error: $*"
+    printf '%s\n' "$message" >&2
+    if [ -n "${QEMU_LOG_OVERRIDE:-}" ]; then
+        mkdir -p "$(dirname -- "$QEMU_LOG_OVERRIDE")"
+        printf '%s\n' "$message" >>"$QEMU_LOG_OVERRIDE"
+    fi
     exit 1
 }
 
@@ -44,6 +50,7 @@ Options:
   --support-image IMG    Override the support disk image (default: disk-rv.img for rv, disk-la.img for la)
   --timeout SECS        Whole-QEMU timeout in seconds; use 0 to disable (default: $TIMEOUT_SECS)
   --workdir DIR         Working directory for decompressed/copied images
+  --log PATH            Console log path (default: WORKDIR/qemu.log)
   --skip-kernel-build   Reuse existing kernel-rv/kernel-la
   --keep-workdir        Keep the working directory after the run
   --interactive         Keep QEMU stdin attached to the terminal
@@ -70,6 +77,10 @@ while (($#)); do
             ;;
         --workdir)
             WORKDIR=${2:-}
+            shift 2
+            ;;
+        --log)
+            QEMU_LOG_OVERRIDE=${2:-}
             shift 2
             ;;
         --skip-kernel-build)
@@ -277,7 +288,8 @@ else
     "$SCRIPT_DIR/verify-pre2025-layout.sh" --arch "$ARCH" --image "$IMAGE_RUNTIME" >/dev/null
 fi
 
-QEMU_LOG="$WORKDIR/qemu.log"
+QEMU_LOG="${QEMU_LOG_OVERRIDE:-$WORKDIR/qemu.log}"
+mkdir -p "$(dirname -- "$QEMU_LOG")"
 QEMU_DEBUG_FLAGS=${OSCOMP_QEMU_DEBUG:-}
 QEMU_DEBUG_FILE=${OSCOMP_QEMU_DEBUG_FILE:-}
 if [ -n "$QEMU_DEBUG_FLAGS" ] && [ -z "$QEMU_DEBUG_FILE" ]; then
@@ -350,6 +362,9 @@ status=${PIPESTATUS[0]}
 set -e
 
 if [ "$status" -eq 124 ]; then
-    die "QEMU timed out after ${TIMEOUT_SECS}s"
+    timeout_message="[replay-oscomp] error: QEMU timed out after ${TIMEOUT_SECS}s"
+    printf '%s\n' "$timeout_message" >&2
+    printf '%s\n' "$timeout_message" >>"$QEMU_LOG"
+    exit 124
 fi
 exit "$status"

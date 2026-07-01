@@ -23,7 +23,12 @@ from typing import Any, Iterable
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from tools.oscomp_eval.markers import GROUP_RE as OSCOMP_GROUP_RE
+
 STATE_DIR = REPO_ROOT / ".state" / "ltp-lab"
+OSCOMP_EVAL_RUN_DIR = REPO_ROOT / ".state" / "oscomp-eval" / "runs"
 BASELINE_DIR = REPO_ROOT / ".state" / "baseline"
 LIST_DIR = STATE_DIR / "lists"
 PLAN_DIR = STATE_DIR / "plans"
@@ -1406,8 +1411,6 @@ def run_experiment(args: argparse.Namespace) -> Path:
     return run_path
 
 
-GROUP_START_RE = re.compile(r"^#### OS COMP TEST GROUP START ([^ ]+) ####$")
-GROUP_END_RE = re.compile(r"^#### OS COMP TEST GROUP END ([^ ]+) ####$")
 RUN_CASE_RE = re.compile(r"^RUN LTP CASE (.+)$")
 END_CASE_RE = re.compile(r"^(?:PASS|FAIL) LTP CASE (.+?) : (-?\d+)$")
 CASE_TIMEOUT_RE = re.compile(r"^#### OSCOMP RUNNER LTP CASE TIMEOUT (.+?) AFTER (\d+)s ####$")
@@ -1476,13 +1479,13 @@ def parse_log_text(text: str, arch: str = "") -> dict[str, Any]:
     global_timeout = False
 
     for line_no, line in enumerate(text.splitlines(), 1):
-        start = GROUP_START_RE.match(line)
-        if start:
-            current_group = start.group(1)
-            current_case = None
-            continue
-        end = GROUP_END_RE.match(line)
-        if end:
+        group_marker = OSCOMP_GROUP_RE.match(line)
+        if group_marker:
+            action, group = group_marker.group(1), group_marker.group(2)
+            if action == "START":
+                current_group = group
+                current_case = None
+                continue
             if current_case:
                 current_case["line_end"] = line_no
                 current_case["status"] = classify_case(current_case)
@@ -1490,7 +1493,7 @@ def parse_log_text(text: str, arch: str = "") -> dict[str, Any]:
             current_case = None
             current_group = None
             continue
-        if "QEMU timed out" in line or "timed out after" in line or CASE_TIMEOUT_RE.match(line) or RUNNER_TIMEOUT_RE.match(line):
+        if "QEMU timed out" in line or CASE_TIMEOUT_RE.match(line) or RUNNER_TIMEOUT_RE.match(line):
             global_timeout = True
             if current_case:
                 current_case["timed_out"] = True
@@ -1604,7 +1607,89 @@ def add_counts(dst: dict[str, int], src: dict[str, Any]) -> None:
             pass
 
 
-def summarize_run(run_path: Path) -> dict[str, Any]:
+def path_under(child: Path, parent: Path) -> bool:
+    try:
+        return child.resolve().is_relative_to(parent.resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def resolve_manifest_input_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path
+
+
+def score_report_record(score_run_dir: Path, *, source: str) -> dict[str, Any] | None:
+    score_json = score_run_dir / "score.json"
+    report_md = score_run_dir / "report.md"
+    if not score_json.is_file() or not report_md.is_file():
+        return None
+    try:
+        score = read_json(score_json)
+    except json.JSONDecodeError:
+        return None
+    issues = score.get("issues", [])
+    return {
+        "run": rel_to_repo(score_run_dir),
+        "report": rel_to_repo(report_md),
+        "score_json": rel_to_repo(score_json),
+        "source": source,
+        "total_score": score.get("total_score"),
+        "issue_count": len(issues) if isinstance(issues, list) else None,
+    }
+
+
+def score_reports_for_run(
+    run_path: Path,
+    score_run_dirs: list[Path] | None = None,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[Path] = set()
+
+    def add(score_run_dir: Path, source: str) -> None:
+        resolved = score_run_dir.expanduser().resolve()
+        if resolved in seen:
+            return
+        record = score_report_record(resolved, source=source)
+        if record is None:
+            return
+        seen.add(resolved)
+        records.append(record)
+
+    for score_run_dir in score_run_dirs or []:
+        add(score_run_dir, "explicit")
+
+    add(run_path, "same-run")
+
+    if OSCOMP_EVAL_RUN_DIR.is_dir():
+        for manifest_path in sorted(OSCOMP_EVAL_RUN_DIR.glob("*/manifest.json")):
+            try:
+                manifest = read_json(manifest_path)
+            except json.JSONDecodeError:
+                continue
+            inputs = manifest.get("inputs", {})
+            if not isinstance(inputs, dict):
+                continue
+            matched = False
+            for value in inputs.values():
+                if not isinstance(value, str):
+                    continue
+                if path_under(resolve_manifest_input_path(value), run_path):
+                    matched = True
+                    break
+            if matched:
+                add(manifest_path.parent, "manifest-input")
+
+    return records
+
+
+def summarize_run(
+    run_path: Path,
+    *,
+    score_run_dirs: list[Path] | None = None,
+) -> dict[str, Any]:
     run_path = run_path.expanduser()
     if not run_path.is_dir():
         die(f"run dir not found: {run_path}")
@@ -1673,6 +1758,7 @@ def summarize_run(run_path: Path) -> dict[str, Any]:
         for task_id, task in task_summaries.items()
         if task.get("status") == "cancelled"
     ]
+    score_reports = score_reports_for_run(run_path, score_run_dirs)
 
     parallel = manifest.get("parallel") or {"mode": "serial", "jobs": 1, "split_combos": False}
     combined = {
@@ -1688,6 +1774,7 @@ def summarize_run(run_path: Path) -> dict[str, Any]:
         "failed_arches": failed_arches,
         "failed_tasks": failed_tasks,
         "cancelled_tasks": cancelled_tasks,
+        "score_reports": score_reports,
         "total_by_status": total,
     }
     write_json(run_path / "combined-summary.json", combined)
@@ -1714,11 +1801,19 @@ def summarize_run(run_path: Path) -> dict[str, Any]:
         print_summary(arch_summaries[arch])
     if total:
         print("total: " + " ".join(f"{k}={v}" for k, v in sorted(total.items())))
+    if score_reports:
+        print("score_reports:")
+        for report in score_reports:
+            print(
+                f"  {report['run']} total={report.get('total_score')} "
+                f"issues={report.get('issue_count')} report={report['report']}"
+            )
     return combined
 
 
 def summarize_cmd(args: argparse.Namespace) -> None:
-    summarize_run(Path(args.run_dir).expanduser())
+    score_run_dirs = [Path(item).expanduser() for item in args.score_run or []]
+    summarize_run(Path(args.run_dir).expanduser(), score_run_dirs=score_run_dirs)
 
 
 def failures_cmd(args: argparse.Namespace) -> None:
@@ -3747,6 +3842,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("summarize", help="summarize a run directory")
     p.add_argument("run_dir")
+    p.add_argument(
+        "--score-run",
+        action="append",
+        help="related tools/oscomp_eval run directory whose report.md should be linked",
+    )
     p.set_defaults(func=summarize_cmd)
 
     p = sub.add_parser("failures", help="group failed or incomplete LTP cases from a run")

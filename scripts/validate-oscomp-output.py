@@ -4,36 +4,14 @@
 from __future__ import annotations
 
 import argparse
-import re
+import os
 import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
-CANONICAL_GROUPS = {
-    "basic",
-    "iozone",
-    "busybox",
-    "netperf",
-    "lua",
-    "libcbench",
-    "libctest",
-    "cyclictest",
-    "lmbench",
-    "iperf",
-    "ltp",
-    "unixbench",
-}
-
-GROUP_RE = re.compile(r"^#### OS COMP TEST GROUP (START|END) ([^ ]+) ####$")
-SUFFIX_RE = re.compile(r"-(musl|glibc)$")
-CONCLUSION_RE = re.compile(
-    r"(QEMU timed out after|OSCOMP RUNNER (?:GLOBAL )?TIMEOUT|poweroff|shutdown|System is shutting down)",
-    re.IGNORECASE,
-)
-
-
-def marker_base_group(group: str) -> str:
-    return SUFFIX_RE.sub("", group)
+from tools.oscomp_eval.markers import MarkerError, compatible_summary, parse_log
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,81 +29,28 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    if os.environ.get("OSCOMP_VALIDATE_OUTPUT_WRAPPER") != "1":
+        print(
+            "warning: scripts/validate-oscomp-output.py is a compatibility shim; "
+            "prefer scripts/oscomp.sh validate-output, or "
+            "python3 -m tools.oscomp_eval markers for direct parser debugging.",
+            file=sys.stderr,
+        )
+
     args = parse_args()
     log_path = Path(args.log).expanduser()
-    if not log_path.is_file():
-        print(f"error: log not found: {log_path}", file=sys.stderr)
+    try:
+        result = parse_log(
+            log_path,
+            arch=args.arch,
+            require_conclusion=args.require_conclusion,
+        )
+    except MarkerError as error:
+        print(f"error: {error}", file=sys.stderr)
         return 2
 
-    text = log_path.read_text(encoding="utf-8", errors="replace")
-    issues: list[str] = []
-    current: tuple[str, int] | None = None
-    complete: list[tuple[str, int, int]] = []
-    markers: list[tuple[str, str, int]] = []
-
-    for line_no, line in enumerate(text.splitlines(), 1):
-        match = GROUP_RE.match(line)
-        if not match:
-            continue
-
-        action, group = match.group(1), match.group(2)
-        markers.append((action, group, line_no))
-
-        base_group = marker_base_group(group)
-        if base_group not in CANONICAL_GROUPS:
-            issues.append(
-                f"line {line_no}: score-facing group marker has unknown base group: {group}"
-            )
-
-        if action == "START":
-            if current is not None:
-                open_group, open_line = current
-                issues.append(
-                    f"line {line_no}: group {group} starts before {open_group} from line {open_line} ends"
-                )
-            current = (group, line_no)
-            continue
-
-        if current is None:
-            issues.append(f"line {line_no}: group {group} ends without a start")
-            continue
-
-        open_group, open_line = current
-        if group != open_group:
-            issues.append(
-                f"line {line_no}: group {group} ends but open group is {open_group} from line {open_line}"
-            )
-            current = None
-            continue
-
-        if base_group in CANONICAL_GROUPS:
-            complete.append((group, open_line, line_no))
-        current = None
-
-    if current is not None:
-        open_group, open_line = current
-        issues.append(f"line {open_line}: group {open_group} starts without a matching end")
-
-    if text.strip() and not complete:
-        issues.append("log has output but zero complete evaluator groups")
-
-    if args.require_conclusion and not CONCLUSION_RE.search(text):
-        issues.append("log has no visible timeout/shutdown conclusion")
-
-    label = f" arch={args.arch}" if args.arch else ""
-    print(
-        f"oscomp-output{label} markers={len(markers)} complete_groups={len(complete)} issues={len(issues)}"
-    )
-    for group, start_line, end_line in complete:
-        print(f"  complete {group} lines={start_line}-{end_line}")
-
-    if issues:
-        print("issues:")
-        for issue in issues:
-            print(f"  - {issue}")
-        return 1
-
-    return 0
+    print(compatible_summary(result))
+    return 1 if result.has_errors else 0
 
 
 if __name__ == "__main__":

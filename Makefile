@@ -14,6 +14,8 @@ export DWARF
 MEMTRACK ?= n
 export MEMTRACK
 OSCOMP_PLAN_OVERRIDE ?=
+EVAL_NAME ?= full-local
+EVAL_ARGS ?=
 export OSKERNEL_DEV_IMAGE ?= thekernel-dev:local
 DEV_ENV_DIR ?= $(ROOT_DIR)/dev-env
 EMPTY_TESTSUITE_DIR ?= $(ROOT_DIR)/.state/empty-testsuites
@@ -74,6 +76,9 @@ help:
 		'  make eval-la      rebuild kernel-la, then replay la official image' \
 		'  make replay-rv    reuse existing artifacts, then replay rv official image' \
 		'  make replay-la    reuse existing artifacts, then replay la official image' \
+		'  make eval-score-rv  run new local rv evaluate pipeline' \
+		'  make eval-score-la  run new local la evaluate pipeline' \
+		'  make eval-score     run new local rv+la evaluate pipeline' \
 		'' \
 		'Boot commands:' \
 		'  make boot-rv      build/reuse rv artifacts, then boot an interactive shell' \
@@ -166,6 +171,15 @@ replay-rv:
 
 replay-la:
 	@./scripts/oscomp.sh run --arch la --skip-kernel-build $(OSCOMP_ARGS)
+
+eval-score-rv:
+	@./scripts/oscomp.sh evaluate --arch rv --name "$(EVAL_NAME)-rv" $(EVAL_ARGS)
+
+eval-score-la:
+	@./scripts/oscomp.sh evaluate --arch la --name "$(EVAL_NAME)-la" $(EVAL_ARGS)
+
+eval-score:
+	@./scripts/oscomp.sh evaluate --arch both --name "$(EVAL_NAME)" $(EVAL_ARGS)
 
 $(BOOT_ENV_FILE):
 	@mkdir -p "$(BOOT_STATE_DIR)"
@@ -290,7 +304,7 @@ rv:
 la:
 	$(MAKE) ARCH=loongarch64 run
 
-.PHONY: help all artifacts kernels build run eval-rv eval-la replay-rv replay-la boot-rv boot-la lab-check lab-bootstrap lab-inventory lab-summary lab-new lab-run lab-review lab-apply lab-done lab-status lab-plan lab-list lab-replay lab-parse lab-summarize lab-promote lab-campaign lab-clean lab-trim dev-image dev-check dev-shell dev-shell-root debug disasm clean clean-eval legacy-clean prebuild-scrub check-eval-artifacts check-eval-kernel-size kernel-rv kernel-la disk.img disk-rv.img disk-la.img
+.PHONY: help all artifacts kernels build run eval-rv eval-la replay-rv replay-la eval-score-rv eval-score-la eval-score boot-rv boot-la lab-check lab-bootstrap lab-inventory lab-summary lab-new lab-run lab-review lab-apply lab-done lab-status lab-plan lab-list lab-replay lab-parse lab-summarize lab-promote lab-campaign lab-clean lab-trim dev-image dev-check dev-shell dev-shell-root debug disasm clean clean-eval legacy-clean prebuild-scrub check-eval-artifacts check-eval-kernel-size kernel-rv kernel-la disk.img disk-rv.img disk-la.img
 check-eval-artifacts:
 	@missing=0; \
 	for artifact in \
@@ -306,6 +320,8 @@ check-eval-artifacts:
 		fi; \
 	done; \
 	exit "$$missing"
+	@./scripts/oscomp.sh support-check --arch rv --image "$(ROOT_DIR)/disk-rv.img"
+	@./scripts/oscomp.sh support-check --arch la --image "$(ROOT_DIR)/disk-la.img"
 
 check-eval-kernel-size:
 	@for kernel in $(ROOT_DIR)/kernel-rv $(ROOT_DIR)/kernel-la; do \

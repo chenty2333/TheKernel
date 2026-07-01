@@ -128,6 +128,96 @@ Validate official image layout inside the dev shell:
 ./scripts/oscomp.sh verify --arch la
 ```
 
+## Offline Local Scoring
+
+Existing replay or lab console logs can be parsed, judged with the vendored
+official-compatible judge scripts, scored, and reported without starting QEMU:
+
+```bash
+./scripts/oscomp.sh validate-output --log .state/path/to/qemu.log --arch rv
+./scripts/oscomp.sh judge-log --arch rv --log .state/path/to/qemu.log --out .state/oscomp-eval/runs/manual-rv/rv
+./scripts/oscomp.sh score-logs \
+  --rv-log .state/path/to/rv.log \
+  --la-log .state/path/to/la.log \
+  --name manual-score
+./scripts/oscomp.sh report-run .state/oscomp-eval/runs/manual-score
+./scripts/oscomp.sh inspect-run --json .state/oscomp-eval/runs/manual-score
+```
+
+`scripts/validate-oscomp-output.py` remains as a compatibility shim for old
+local scripts, but new usage should go through `scripts/oscomp.sh
+validate-output`. For direct parser debugging, use `python3 -m
+tools.oscomp_eval markers`.
+
+`scripts/oscomp.sh evaluate --rv-log PATH --la-log PATH --name NAME` is the
+same offline path under the new evaluation entrypoint. `scripts/oscomp.sh
+evaluate --arch rv|la|both --name NAME` launches replay through the existing
+`scripts/replay-oscomp-eval.sh` runner and then judges, scores, and reports the
+captured logs. Replay mode accepts `--idle-timeout SECS`; when a QEMU run stops
+writing console output for that long, the evaluator kills that replay, records a
+structured timeout, and still writes the run artifacts that can be recovered.
+
+Before a replay-backed run, `scripts/oscomp.sh support-check --arch rv --image
+disk-rv.img` and the matching LA command validate that the support disk contains
+the current `src/init.sh` and guest-side timeout helper used to keep LTP cases
+bounded. `make check-eval-artifacts` runs those checks after confirming the
+kernel and disk artifacts exist.
+
+Every scored run writes `manifest.json`, `score.json`, a plain Markdown
+`report.md`, and a machine-readable `artifact-index.json` that lists the run
+artifacts that actually exist. The local evaluator does not generate an HTML
+report.
+Use `inspect-run --json` to check those artifacts without mutating the run
+directory.
+When `--replace` is used, stale evaluator artifacts in that run directory are
+cleared before writing the new run; unrelated files are left alone.
+
+Replay-backed evaluation can also build a run-local support image from an
+explicit LTP list:
+
+```bash
+./scripts/oscomp.sh evaluate \
+  --arch rv \
+  --ltp-list .state/ltp-lab/candidates/ltp_test.txt \
+  --name ltp-list-rv
+```
+
+`--ltp-list` is replay-only and is mutually exclusive with `--support-image`,
+because an already-built support image already contains its own
+`/meta/ltp_test.txt`.
+
+Refresh the vendored official judge snapshot from an explicit local checkout:
+
+```bash
+./scripts/oscomp.sh official-refresh \
+  --source /home/ava/Desktop/autotest-for-oskernel
+```
+
+This only imports `kernel/judge` scripts and provenance. It does not fetch from
+the network or adopt the official Docker/QEMU controller.
+
+Focused runs that intentionally use a reduced guest plan should pass the same
+plan file to scoring so missing full-matrix groups are not treated as failures:
+
+```bash
+./scripts/oscomp.sh evaluate \
+  --arch rv \
+  --support-image .tmp/focused-rv-support.img \
+  --plan .tmp/focused-plan.txt \
+  --name focused-rv
+```
+
+Local evaluator exit codes are stable enough for scripts:
+
+- `0`: command completed without score-facing issues.
+- `1`: command completed and wrote artifacts, but validation, judging, scoring,
+  or replay status found issues.
+- `2`: invalid command line, missing input, or unsupported configuration.
+- `3`: infrastructure failure such as missing QEMU, image, runner, or toolchain.
+- `4`: internal evaluator error with traceback written to stderr.
+- `124`: replay timeout.
+- `130`: interrupted by the user.
+
 ## Boot
 
 Boot an interactive local shell instead of the evaluator replay plan, from the

@@ -230,6 +230,9 @@ build_overlay_tools_for_arch() {
     "$cc" -O2 -static -s -std=c11 \
         "$REPO_ROOT/scripts/support-tools/oscomp-timeout.c" \
         -o "$arch_root/overlay/bin/oscomp-timeout"
+    "$cc" -O2 -static -s -std=c11 -pthread \
+        "$REPO_ROOT/scripts/support-tools/io-pin-safety.c" \
+        -o "$arch_root/overlay/bin/oscomp-io-pin-safety"
     "$cc" -O2 -static -s -std=c11 \
         "$REPO_ROOT/scripts/support-tools/sleep.c" \
         -o "$arch_root/overlay/bin/oscomp-sleep"

@@ -552,6 +552,32 @@ _group_timing() {
     printf '### OSCOMP GROUP T+%ss %s %s %s\n' "$(( _t - RUN_START_SECS ))" "$1" "$2" "$3"
 }
 
+io_stats_capture_enabled() {
+    case "${OSCOMP_IO_STATS_CAPTURE:-0}" in
+        1|y|Y|yes|YES|true|TRUE|on|ON)
+            [ -e /proc/io_stats ]
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+io_stats_capture_start() {
+    io_stats_capture_enabled || return 0
+    echo on > /proc/io_stats 2>/dev/null || return 0
+    echo reset > /proc/io_stats 2>/dev/null || true
+    echo "#### OSCOMP IO_STATS CAPTURE START ####"
+}
+
+io_stats_capture_finish() {
+    io_stats_capture_enabled || return 0
+    echo "#### OSCOMP IO_STATS CAPTURE BEGIN ####"
+    cat /proc/io_stats 2>/dev/null || true
+    echo "#### OSCOMP IO_STATS CAPTURE END ####"
+    echo off > /proc/io_stats 2>/dev/null || true
+}
+
 run_group() {
     root="$1"
     group="$2"
@@ -668,6 +694,8 @@ if boot_shell_requested; then
 fi
 RUN_START_SECS=$(oscomp_elapsed_clock_secs)
 export RUN_START_SECS
+io_stats_capture_start
 run_plan_file /etc/oscomp-plan.txt || run_default_plan
+io_stats_capture_finish
 shutdown_system
 exit 0
