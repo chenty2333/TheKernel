@@ -15,8 +15,21 @@ use core::{
     task::Context,
 };
 
+use axdriver::{
+    AsyncBlockWaitPolicy, reset_virtio_async_block_adaptive_depth, reset_virtio_io_counters,
+    set_virtio_async_block_adaptive_enabled, set_virtio_async_block_depth,
+    set_virtio_async_block_enabled, set_virtio_async_block_la_depth,
+    set_virtio_async_block_merge_write_enabled, set_virtio_async_block_wait_policy,
+    set_virtio_io_counters_enabled, virtio_io_counters_snapshot,
+};
 use axerrno::LinuxError;
-use axfs::page_cache_pfn_is_dirty;
+use axfs::{
+    async_block_queue_interrupt_selftest, async_block_queue_irq_first_wait_selftest,
+    async_block_queue_read_selftest, async_block_queue_read_write_selftest,
+    page_cache_pfn_is_dirty, render_io_stats_counters, reset_io_stats_counters,
+    set_async_dirty_flush_sg_enabled, set_cached_readahead_enabled, set_io_stats_counters_enabled,
+    set_lwext4_async_mapped_read_enabled,
+};
 use axfs_ng_vfs::{
     DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, Location, Metadata, MetadataUpdate,
     NodeFlags, NodeOps, NodePermission, NodeType, Reference, VfsError, VfsResult,
@@ -44,8 +57,11 @@ use crate::{
         FD_TABLE, FileDescription, PidFd, fanotify::FanotifyFile, inotify::InotifyFile, lease, pipe,
     },
     mm::{
-        Backend, BackendOps, commit_limit_bytes, committed_as_bytes, overcommit_memory_policy,
-        overcommit_ratio, set_overcommit_memory_policy, set_overcommit_ratio, system_memory_stats,
+        Backend, BackendOps, USER_IO_PIN_TEST_DELAY_MS_MAX, commit_limit_bytes, committed_as_bytes,
+        overcommit_memory_policy, overcommit_ratio, reset_user_io_pin_counters,
+        set_overcommit_memory_policy, set_overcommit_ratio, set_user_io_async_direct_enabled,
+        set_user_io_pin_counters_enabled, set_user_io_pin_test_delay_ms, system_memory_stats,
+        user_io_pin_counters_snapshot,
     },
     mounts,
     pseudofs::{
@@ -85,6 +101,569 @@ const PROC_THREADS_MAX: u32 = 4_194_304;
 const PROC_FILE_MAX_DEFAULT: usize = 1_048_576;
 const PROC_SCHED_TIME_AVG_MS_DEFAULT: u32 = 1000;
 const PROC_SCHED_RT_PERIOD_US_DEFAULT: u32 = 1_000_000;
+
+fn render_proc_io_stats() -> Vec<u8> {
+    let mut out = render_io_stats_counters();
+    let pin = user_io_pin_counters_snapshot();
+    let _ = writeln!(out, "user_pin.to_user_attempts {}", pin.to_user_attempts);
+    let _ = writeln!(out, "user_pin.to_user_hits {}", pin.to_user_hits);
+    let _ = writeln!(out, "user_pin.to_user_bytes {}", pin.to_user_bytes);
+    let _ = writeln!(
+        out,
+        "user_pin.from_user_attempts {}",
+        pin.from_user_attempts
+    );
+    let _ = writeln!(out, "user_pin.from_user_hits {}", pin.from_user_hits);
+    let _ = writeln!(out, "user_pin.from_user_bytes {}", pin.from_user_bytes);
+    let _ = writeln!(out, "user_pin.reject_empty {}", pin.reject_empty);
+    let _ = writeln!(out, "user_pin.reject_unaligned {}", pin.reject_unaligned);
+    let _ = writeln!(out, "user_pin.reject_access {}", pin.reject_access);
+    let _ = writeln!(out, "user_pin.reject_populate {}", pin.reject_populate);
+    let _ = writeln!(out, "user_pin.reject_pagetable {}", pin.reject_pagetable);
+    let _ = writeln!(out, "user_pin.reject_noncontig {}", pin.reject_noncontig);
+    let _ = writeln!(out, "user_pin.reject_segments {}", pin.reject_segments);
+    let _ = writeln!(out, "user_pin.reject_frame_pin {}", pin.reject_frame_pin);
+    let _ = writeln!(
+        out,
+        "user_pin.reject_page_cache_pin {}",
+        pin.reject_page_cache_pin
+    );
+    let _ = writeln!(out, "user_pin.reject_cow_pin {}", pin.reject_cow_pin);
+    let _ = writeln!(out, "user_pin.reject_shared_pin {}", pin.reject_shared_pin);
+    let _ = writeln!(out, "user_pin.reject_file_pin {}", pin.reject_file_pin);
+    let _ = writeln!(out, "user_pin.reject_linear_pin {}", pin.reject_linear_pin);
+    let _ = writeln!(out, "user_pin.sg_batches {}", pin.sg_batches);
+    let _ = writeln!(out, "user_pin.sg_segments {}", pin.sg_segments);
+    let _ = writeln!(out, "user_pin.sg_bytes {}", pin.sg_bytes);
+    let _ = writeln!(
+        out,
+        "user_pin.sg_multi_segment_batches {}",
+        pin.sg_multi_segment_batches
+    );
+    let _ = writeln!(out, "user_pin.direct_read_hits {}", pin.direct_read_hits);
+    let _ = writeln!(out, "user_pin.direct_read_bytes {}", pin.direct_read_bytes);
+    let _ = writeln!(
+        out,
+        "user_pin.direct_read_segments {}",
+        pin.direct_read_segments
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.direct_read_fallbacks {}",
+        pin.direct_read_fallbacks
+    );
+    let _ = writeln!(out, "user_pin.direct_write_hits {}", pin.direct_write_hits);
+    let _ = writeln!(
+        out,
+        "user_pin.direct_write_bytes {}",
+        pin.direct_write_bytes
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.direct_write_segments {}",
+        pin.direct_write_segments
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.direct_write_fallbacks {}",
+        pin.direct_write_fallbacks
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.async_direct_enabled {}",
+        pin.async_direct_enabled
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.async_direct_read_hits {}",
+        pin.async_direct_read_hits
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.async_direct_read_bytes {}",
+        pin.async_direct_read_bytes
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.async_direct_read_segments {}",
+        pin.async_direct_read_segments
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.async_direct_write_hits {}",
+        pin.async_direct_write_hits
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.async_direct_write_bytes {}",
+        pin.async_direct_write_bytes
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.async_direct_write_segments {}",
+        pin.async_direct_write_segments
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.async_submit_fallbacks {}",
+        pin.async_submit_fallbacks
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.async_signal_after_submit {}",
+        pin.async_signal_after_submit
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.async_resource_unpins {}",
+        pin.async_resource_unpins
+    );
+    let _ = writeln!(
+        out,
+        "user_prefault.to_user_attempts {}",
+        pin.prefault_to_user_attempts
+    );
+    let _ = writeln!(
+        out,
+        "user_prefault.to_user_hits {}",
+        pin.prefault_to_user_hits
+    );
+    let _ = writeln!(
+        out,
+        "user_prefault.to_user_bytes {}",
+        pin.prefault_to_user_bytes
+    );
+    let _ = writeln!(
+        out,
+        "user_prefault.to_user_rejects {}",
+        pin.prefault_to_user_rejects
+    );
+    let _ = writeln!(
+        out,
+        "user_prefault.from_user_attempts {}",
+        pin.prefault_from_user_attempts
+    );
+    let _ = writeln!(
+        out,
+        "user_prefault.from_user_hits {}",
+        pin.prefault_from_user_hits
+    );
+    let _ = writeln!(
+        out,
+        "user_prefault.from_user_bytes {}",
+        pin.prefault_from_user_bytes
+    );
+    let _ = writeln!(
+        out,
+        "user_prefault.from_user_rejects {}",
+        pin.prefault_from_user_rejects
+    );
+    let _ = writeln!(out, "user_pin.cow_pin_pages {}", pin.cow_pin_pages);
+    let _ = writeln!(out, "user_pin.shared_pin_pages {}", pin.shared_pin_pages);
+    let _ = writeln!(out, "user_pin.file_pin_pages {}", pin.file_pin_pages);
+    let _ = writeln!(
+        out,
+        "user_pin.frame_pin_attempts {}",
+        pin.frame_pin_attempts
+    );
+    let _ = writeln!(out, "user_pin.frame_pin_hits {}", pin.frame_pin_hits);
+    let _ = writeln!(out, "user_pin.frame_pin_pages {}", pin.frame_pin_pages);
+    let _ = writeln!(out, "user_pin.frame_pin_bytes {}", pin.frame_pin_bytes);
+    let _ = writeln!(out, "user_pin.frame_pin_unpins {}", pin.frame_pin_unpins);
+    let _ = writeln!(
+        out,
+        "user_pin.page_cache_pin_attempts {}",
+        pin.page_cache_pin_attempts
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.page_cache_pin_hits {}",
+        pin.page_cache_pin_hits
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.page_cache_pin_pages {}",
+        pin.page_cache_pin_pages
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.page_cache_pin_bytes {}",
+        pin.page_cache_pin_bytes
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.page_cache_pin_unpins {}",
+        pin.page_cache_pin_unpins
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.vm_range_pin_attempts {}",
+        pin.vm_range_pin_attempts
+    );
+    let _ = writeln!(out, "user_pin.vm_range_pin_hits {}", pin.vm_range_pin_hits);
+    let _ = writeln!(
+        out,
+        "user_pin.vm_range_pin_bytes {}",
+        pin.vm_range_pin_bytes
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.vm_range_pin_rejects {}",
+        pin.vm_range_pin_rejects
+    );
+    let _ = writeln!(
+        out,
+        "user_pin.vm_range_pin_unpins {}",
+        pin.vm_range_pin_unpins
+    );
+    let _ = writeln!(out, "user_pin.unpins {}", pin.unpins);
+    let _ = writeln!(out, "user_pin.test_delay_ms {}", pin.test_delay_ms);
+    let virtio = virtio_io_counters_snapshot();
+    let _ = writeln!(out, "virtio.queue_sync_waits {}", virtio.queue_sync_waits);
+    let _ = writeln!(
+        out,
+        "virtio.queue_sync_wait_polls {}",
+        virtio.queue_sync_wait_polls
+    );
+    let _ = writeln!(
+        out,
+        "virtio.queue_sync_wait_immediate {}",
+        virtio.queue_sync_wait_immediate
+    );
+    let _ = writeln!(
+        out,
+        "virtio.queue_notify_calls {}",
+        virtio.queue_notify_calls
+    );
+    let _ = writeln!(out, "virtio.blk_requests {}", virtio.blk_requests);
+    let _ = writeln!(out, "virtio.blk_read_requests {}", virtio.blk_read_requests);
+    let _ = writeln!(
+        out,
+        "virtio.blk_write_requests {}",
+        virtio.blk_write_requests
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_flush_requests {}",
+        virtio.blk_flush_requests
+    );
+    let _ = writeln!(out, "virtio.blk_data_fences {}", virtio.blk_data_fences);
+    let _ = writeln!(
+        out,
+        "virtio.blk_metadata_fences {}",
+        virtio.blk_metadata_fences
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_flush_unsupported {}",
+        virtio.blk_flush_unsupported
+    );
+    let _ = writeln!(out, "virtio.blk_read_bytes {}", virtio.blk_read_bytes);
+    let _ = writeln!(out, "virtio.blk_write_bytes {}", virtio.blk_write_bytes);
+    let _ = writeln!(
+        out,
+        "virtio.blk_vectored_read_requests {}",
+        virtio.blk_vectored_read_requests
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_vectored_write_requests {}",
+        virtio.blk_vectored_write_requests
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_vectored_segments {}",
+        virtio.blk_vectored_segments
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_pending_max_depth {}",
+        virtio.blk_pending_max_depth
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_pending_queue_full {}",
+        virtio.blk_pending_queue_full
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_pending_drain_batches {}",
+        virtio.blk_pending_drain_batches
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_pending_drained_requests {}",
+        virtio.blk_pending_drained_requests
+    );
+    let _ = writeln!(out, "virtio.blk_async_enabled {}", virtio.blk_async_enabled);
+    let _ = writeln!(out, "virtio.blk_async_depth {}", virtio.blk_async_depth);
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_la_depth {}",
+        virtio.blk_async_la_depth
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_wait_policy {}",
+        virtio.blk_async_wait_policy
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_adaptive_enabled {}",
+        virtio.blk_async_adaptive_enabled
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_adaptive_depth {}",
+        virtio.blk_async_adaptive_depth
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_adaptive_increases {}",
+        virtio.blk_async_adaptive_increases
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_adaptive_decreases {}",
+        virtio.blk_async_adaptive_decreases
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_adaptive_good_events {}",
+        virtio.blk_async_adaptive_good_events
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_adaptive_pressure_events {}",
+        virtio.blk_async_adaptive_pressure_events
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_merge_write_enabled {}",
+        virtio.blk_async_merge_write_enabled
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_merge_write_calls {}",
+        virtio.blk_async_merge_write_calls
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_merge_write_input_segments {}",
+        virtio.blk_async_merge_write_input_segments
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_merge_write_output_requests {}",
+        virtio.blk_async_merge_write_output_requests
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_merge_write_saved_requests {}",
+        virtio.blk_async_merge_write_saved_requests
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_merge_write_max_segments {}",
+        virtio.blk_async_merge_write_max_segments
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_flush_requests {}",
+        virtio.blk_async_flush_requests
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_flush_completions {}",
+        virtio.blk_async_flush_completions
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_fallback_sync {}",
+        virtio.blk_async_fallback_sync
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_submit_batches {}",
+        virtio.blk_async_submit_batches
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_submit_requests {}",
+        virtio.blk_async_submit_requests
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_submit_bytes {}",
+        virtio.blk_async_submit_bytes
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_submit_partial_batches {}",
+        virtio.blk_async_submit_partial_batches
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_completion_batches {}",
+        virtio.blk_async_completion_batches
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_completed_requests {}",
+        virtio.blk_async_completed_requests
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_completed_bytes {}",
+        virtio.blk_async_completed_bytes
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_max_depth {}",
+        virtio.blk_async_max_depth
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_current_depth {}",
+        virtio.blk_async_current_depth
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_desc_in_use_max {}",
+        virtio.blk_async_desc_in_use_max
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_desc_budget {}",
+        virtio.blk_async_desc_budget
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_admission_stalls {}",
+        virtio.blk_async_admission_stalls
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_queue_full {}",
+        virtio.blk_async_queue_full
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_notify_calls {}",
+        virtio.blk_async_notify_calls
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_wait_spins {}",
+        virtio.blk_async_wait_spins
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_wait_spin_hits {}",
+        virtio.blk_async_wait_spin_hits
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_wait_yields {}",
+        virtio.blk_async_wait_yields
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_wait_sleeps {}",
+        virtio.blk_async_wait_sleeps
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_wait_wakeups {}",
+        virtio.blk_async_wait_wakeups
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_wait_timeouts {}",
+        virtio.blk_async_wait_timeouts
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_interrupt_drains {}",
+        virtio.blk_async_interrupt_drains
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_irq_first_arms {}",
+        virtio.blk_async_irq_first_arms
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_irq_first_waits {}",
+        virtio.blk_async_irq_first_waits
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_irq_first_fallbacks {}",
+        virtio.blk_async_irq_first_fallbacks
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_irq_first_fallback_unarmed {}",
+        virtio.blk_async_irq_first_fallback_unarmed
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_irq_first_fallback_cannot_block {}",
+        virtio.blk_async_irq_first_fallback_cannot_block
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_irq_first_fallback_no_irq {}",
+        virtio.blk_async_irq_first_fallback_no_irq
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_irq_first_fallback_register_failed {}",
+        virtio.blk_async_irq_first_fallback_register_failed
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_irq_first_fallback_feature_disabled {}",
+        virtio.blk_async_irq_first_fallback_feature_disabled
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_submit_errors {}",
+        virtio.blk_async_submit_errors
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_completion_errors {}",
+        virtio.blk_async_completion_errors
+    );
+    let _ = writeln!(
+        out,
+        "virtio.blk_async_resource_leaks {}",
+        virtio.blk_async_resource_leaks
+    );
+    out.into_bytes()
+}
+
+fn parse_proc_io_stats_pin_delay_ms(text: &str) -> Option<u64> {
+    let value = text
+        .strip_prefix("pin_delay_ms=")
+        .or_else(|| text.strip_prefix("pin_delay_ms "))
+        .or_else(|| text.strip_prefix("pin_delay_ms\t"))?;
+    value.trim().parse::<u64>().ok()
+}
+
+fn parse_proc_io_stats_u64_command<'a>(text: &'a str, names: &[&str]) -> Option<u64> {
+    for name in names {
+        if let Some(value) = text
+            .strip_prefix(*name)
+            .and_then(|tail| tail.strip_prefix('=').or_else(|| tail.strip_prefix(' ')))
+        {
+            return value.trim().parse::<u64>().ok();
+        }
+    }
+    None
+}
 const PROC_SCHED_RT_RUNTIME_US_DEFAULT: i32 = 950_000;
 const PROC_PAGEMAP_ENTRY_BYTES: u64 = 8;
 const PROC_KPAGEFLAGS_ENTRY_BYTES: u64 = 8;
@@ -1690,6 +2269,171 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             let allocator = axalloc::global_allocator();
             Ok(format!("{:?}\n", allocator.usages()))
         }),
+    );
+    root.add(
+        "io_stats",
+        SimpleFile::new_regular(
+            fs.clone(),
+            RwFile::new(move |req| match req {
+                SimpleFileOperation::Read => Ok(Some(render_proc_io_stats())),
+                SimpleFileOperation::Write(data) => {
+                    if is_proc_truncate_write(data) {
+                        return Ok(None);
+                    }
+                    let Some(command) = str::from_utf8(data).ok().map(str::trim) else {
+                        return Err(VfsError::InvalidInput);
+                    };
+                    if let Some(delay_ms) = parse_proc_io_stats_pin_delay_ms(command) {
+                        if delay_ms > USER_IO_PIN_TEST_DELAY_MS_MAX {
+                            return Err(VfsError::InvalidInput);
+                        }
+                        set_user_io_pin_test_delay_ms(delay_ms)
+                            .map_err(|_| VfsError::InvalidInput)?;
+                    } else if let Some(depth) =
+                        parse_proc_io_stats_u64_command(command, &["async_block_depth"])
+                    {
+                        set_virtio_async_block_depth(depth);
+                    } else if let Some(depth) =
+                        parse_proc_io_stats_u64_command(command, &["async_block_la_depth"])
+                    {
+                        set_virtio_async_block_la_depth(depth);
+                    } else {
+                        match command {
+                            "on" | "1" => {
+                                set_io_stats_counters_enabled(true);
+                                set_user_io_pin_counters_enabled(true);
+                            }
+                            "virtio_on" | "virtio=on" | "virtio 1" => {
+                                set_virtio_io_counters_enabled(true);
+                            }
+                            "virtio_off" | "virtio=off" | "virtio 0" => {
+                                set_virtio_io_counters_enabled(false);
+                            }
+                            "async_block_on" | "async_block=on" | "async_block 1" => {
+                                set_virtio_async_block_enabled(true);
+                            }
+                            "async_block_off" | "async_block=off" | "async_block 0" => {
+                                set_virtio_async_block_enabled(false);
+                            }
+                            "async_dirty_flush_sg_on"
+                            | "async_dirty_flush_sg=on"
+                            | "async_dirty_flush_sg 1" => {
+                                set_async_dirty_flush_sg_enabled(true);
+                            }
+                            "async_dirty_flush_sg_off"
+                            | "async_dirty_flush_sg=off"
+                            | "async_dirty_flush_sg 0" => {
+                                set_async_dirty_flush_sg_enabled(false);
+                            }
+                            "cached_readahead_on"
+                            | "cached_readahead=on"
+                            | "cached_readahead 1" => {
+                                set_cached_readahead_enabled(true);
+                            }
+                            "cached_readahead_off"
+                            | "cached_readahead=off"
+                            | "cached_readahead 0" => {
+                                set_cached_readahead_enabled(false);
+                            }
+                            "user_direct_async_on"
+                            | "user_direct_async=on"
+                            | "user_direct_async 1" => {
+                                set_user_io_async_direct_enabled(true);
+                            }
+                            "user_direct_async_off"
+                            | "user_direct_async=off"
+                            | "user_direct_async 0" => {
+                                set_user_io_async_direct_enabled(false);
+                            }
+                            "lwext4_async_read_on"
+                            | "lwext4_async_read=on"
+                            | "lwext4_async_read 1" => {
+                                set_lwext4_async_mapped_read_enabled(true);
+                            }
+                            "lwext4_async_read_off"
+                            | "lwext4_async_read=off"
+                            | "lwext4_async_read 0" => {
+                                set_lwext4_async_mapped_read_enabled(false);
+                            }
+                            "async_block_wait=hybrid" | "async_block_wait hybrid" => {
+                                set_virtio_async_block_wait_policy(AsyncBlockWaitPolicy::Hybrid);
+                            }
+                            "async_block_wait=sync" | "async_block_wait sync" => {
+                                set_virtio_async_block_wait_policy(AsyncBlockWaitPolicy::Sync);
+                            }
+                            "async_block_wait=irq_first"
+                            | "async_block_wait irq_first"
+                            | "async_block_wait=interrupt_first"
+                            | "async_block_wait interrupt_first" => {
+                                set_virtio_async_block_wait_policy(
+                                    AsyncBlockWaitPolicy::InterruptFirst,
+                                );
+                            }
+                            "async_block_adaptive_on"
+                            | "async_block_adaptive=on"
+                            | "async_block_adaptive 1" => {
+                                set_virtio_async_block_adaptive_enabled(true);
+                            }
+                            "async_block_adaptive_off"
+                            | "async_block_adaptive=off"
+                            | "async_block_adaptive 0" => {
+                                set_virtio_async_block_adaptive_enabled(false);
+                            }
+                            "async_block_adaptive_reset" => {
+                                reset_virtio_async_block_adaptive_depth();
+                            }
+                            "async_block_merge_write_on"
+                            | "async_block_merge_write=on"
+                            | "async_block_merge_write 1" => {
+                                set_virtio_async_block_merge_write_enabled(true);
+                            }
+                            "async_block_merge_write_off"
+                            | "async_block_merge_write=off"
+                            | "async_block_merge_write 0" => {
+                                set_virtio_async_block_merge_write_enabled(false);
+                            }
+                            "async_block_selftest_read" => {
+                                async_block_queue_read_selftest()
+                                    .map_err(|_| VfsError::InvalidInput)?;
+                            }
+                            "async_block_selftest_rw" => {
+                                async_block_queue_read_write_selftest()
+                                    .map_err(|_| VfsError::InvalidInput)?;
+                            }
+                            "async_block_selftest_irq" => {
+                                async_block_queue_interrupt_selftest()
+                                    .map_err(|_| VfsError::InvalidInput)?;
+                            }
+                            "async_block_selftest_irq_first" => {
+                                async_block_queue_irq_first_wait_selftest()
+                                    .map_err(|_| VfsError::InvalidInput)?;
+                            }
+                            "off" | "0" => {
+                                set_io_stats_counters_enabled(false);
+                                set_user_io_pin_counters_enabled(false);
+                                set_virtio_io_counters_enabled(false);
+                                set_virtio_async_block_enabled(false);
+                                set_virtio_async_block_adaptive_enabled(false);
+                                set_virtio_async_block_merge_write_enabled(false);
+                                set_async_dirty_flush_sg_enabled(false);
+                                set_cached_readahead_enabled(false);
+                                set_user_io_async_direct_enabled(false);
+                                set_lwext4_async_mapped_read_enabled(false);
+                                set_user_io_pin_test_delay_ms(0)
+                                    .map_err(|_| VfsError::InvalidInput)?;
+                            }
+                            "reset" => {
+                                reset_io_stats_counters();
+                                reset_user_io_pin_counters();
+                                reset_virtio_io_counters();
+                            }
+                            _ => return Err(VfsError::InvalidInput),
+                        }
+                    }
+                    Ok(None)
+                }
+            }),
+        ),
     );
     root.add("kpageflags", ProcKpageflagsFile::new(fs.clone()));
     root.add(

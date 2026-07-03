@@ -55,6 +55,6 @@ cfg_if::cfg_if! {
         pub use self::api::{sleep, sleep_until, yield_now};
     } else {
         mod api_s;
-        pub use self::api_s::{sleep, sleep_until, yield_now};
+        pub use self::api_s::{can_block_current, sleep, sleep_until, yield_now};
     }
 }

@@ -13,8 +13,12 @@ use crate::config::devices::{EIOINTC_IRQ, IPI_IRQ, TIMER_IRQ};
 mod eiointc;
 mod pch_pic;
 
-/// The maximum number of IRQs.
-pub const MAX_IRQ_COUNT: usize = 13;
+/// The maximum number of external IRQ vectors routed through EIOINTC.
+///
+/// QEMU LoongArch `virt` wires GPEX PCI INTx pins to PCH-PIC lines 16..19
+/// before forwarding them through EIOINTC, so the handler table must cover
+/// device IRQ lines beyond the CPU timer/IPI line numbers.
+pub const MAX_IRQ_COUNT: usize = 256;
 const IOCSR_IPI_SEND_CPU_SHIFT: u32 = 16;
 const IOCSR_IPI_SEND_BLOCKING: u32 = 1 << 31;
 

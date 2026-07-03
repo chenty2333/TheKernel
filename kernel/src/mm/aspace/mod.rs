@@ -28,6 +28,12 @@ pub enum PageFaultResult {
     Unhandled,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct UserIoPinRange {
+    start: VirtAddr,
+    end: VirtAddr,
+}
+
 /// The virtual memory address space.
 pub struct AddrSpace {
     va_range: VirtAddrRange,
@@ -36,6 +42,8 @@ pub struct AddrSpace {
     wipe_on_fork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     dontfork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     locked_ranges: BTreeMap<VirtAddr, VirtAddr>,
+    user_io_pins: BTreeMap<u64, UserIoPinRange>,
+    next_user_io_pin: u64,
     lock_future_mappings: bool,
     lock_future_on_fault: bool,
     pt: PageTable,
@@ -88,6 +96,8 @@ impl AddrSpace {
             wipe_on_fork_ranges: BTreeMap::new(),
             dontfork_ranges: BTreeMap::new(),
             locked_ranges: BTreeMap::new(),
+            user_io_pins: BTreeMap::new(),
+            next_user_io_pin: 1,
             lock_future_mappings: false,
             lock_future_on_fault: false,
             pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,
@@ -330,6 +340,51 @@ impl AddrSpace {
         size > 0 && self.locked_bytes_in_range(start, size) == size
     }
 
+    pub fn begin_user_io_pin(&mut self, start: VirtAddr, size: usize) -> AxResult<u64> {
+        self.validate_region(start, size)?;
+        if size == 0 {
+            return Err(AxError::InvalidInput);
+        }
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        for _ in 0..u64::MAX {
+            let token = self.next_user_io_pin;
+            self.next_user_io_pin = self.next_user_io_pin.wrapping_add(1).max(1);
+            if let alloc::collections::btree_map::Entry::Vacant(entry) =
+                self.user_io_pins.entry(token)
+            {
+                entry.insert(UserIoPinRange { start, end });
+                return Ok(token);
+            }
+        }
+        Err(AxError::ResourceBusy)
+    }
+
+    pub fn end_user_io_pin(&mut self, token: u64) {
+        if self.user_io_pins.remove(&token).is_none() {
+            warn!("AddrSpace::end_user_io_pin: unknown token {token}");
+        }
+    }
+
+    pub fn user_io_pin_overlaps(&self, start: VirtAddr, size: usize) -> bool {
+        if size == 0 {
+            return false;
+        }
+        let Some(end) = start.checked_add(size) else {
+            return true;
+        };
+        self.user_io_pins
+            .values()
+            .any(|range| range.start < end && range.end > start)
+    }
+
+    fn check_no_user_io_pin_overlap(&self, start: VirtAddr, size: usize) -> AxResult {
+        if self.user_io_pin_overlaps(start, size) {
+            Err(AxError::ResourceBusy)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn current_mapping_bytes(&self) -> usize {
         self.areas.iter().map(MemoryArea::size).sum()
     }
@@ -568,6 +623,7 @@ impl AddrSpace {
 
     pub fn discard_pages(&mut self, mut start: VirtAddr, size: usize) -> AxResult {
         self.validate_region(start, size)?;
+        self.check_no_user_io_pin_overlap(start, size)?;
         let end = start + size;
 
         let mut modify = self.pt.cursor();
@@ -654,6 +710,7 @@ impl AddrSpace {
     /// aligned.
     pub fn unmap(&mut self, start: VirtAddr, size: usize) -> AxResult {
         self.validate_region(start, size)?;
+        self.check_no_user_io_pin_overlap(start, size)?;
 
         self.areas.unmap(start, size, &mut self.pt)?;
         self.refresh_growdown_starts();
@@ -727,6 +784,7 @@ impl AddrSpace {
     /// aligned.
     pub fn protect(&mut self, start: VirtAddr, size: usize, flags: MappingFlags) -> AxResult {
         self.validate_region(start, size)?;
+        self.check_no_user_io_pin_overlap(start, size)?;
         self.check_protect_range(start, size, flags)?;
 
         self.areas
@@ -760,6 +818,12 @@ impl AddrSpace {
 
     /// Removes all mappings in the address space.
     pub fn clear(&mut self) {
+        if !self.user_io_pins.is_empty() {
+            warn!(
+                "AddrSpace::clear: clearing address space with {} active user I/O pins",
+                self.user_io_pins.len()
+            );
+        }
         if let Err(err) = self.areas.clear(&mut self.pt) {
             warn!("AddrSpace::clear: failed to unmap all areas: {err:?}");
         }
@@ -767,6 +831,7 @@ impl AddrSpace {
         self.wipe_on_fork_ranges.clear();
         self.dontfork_ranges.clear();
         self.locked_ranges.clear();
+        self.user_io_pins.clear();
     }
 
     fn try_handle_growdown_fault(
@@ -945,6 +1010,10 @@ impl AddrSpace {
     /// size, then iterates over all memory areas in the original address
     /// space to copy or share their mappings into the new one.
     pub fn try_clone(&mut self) -> AxResult<Arc<Mutex<Self>>> {
+        if !self.user_io_pins.is_empty() {
+            return Err(AxError::ResourceBusy);
+        }
+
         let new_aspace = Arc::new(Mutex::new(Self::new_empty(self.base(), self.size())?));
         let new_aspace_clone = new_aspace.clone();
 

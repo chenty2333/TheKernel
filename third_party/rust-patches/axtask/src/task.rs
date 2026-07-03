@@ -491,7 +491,8 @@ pub(crate) struct TaskStack {
 impl TaskStack {
     pub fn alloc(size: usize) -> Self {
         let layout = Layout::from_size_align(size, 16).unwrap();
-        if let Some(stack) = crate::run_queue::take_cached_task_stack(layout.size(), layout.align()) {
+        if let Some(stack) = crate::run_queue::take_cached_task_stack(layout.size(), layout.align())
+        {
             return stack;
         }
         Self {
@@ -521,7 +522,6 @@ impl TaskStack {
         // concern. Skipping this is a large win for pthread/fork churn.
         let _ = self;
     }
-
 }
 
 impl Drop for TaskStack {

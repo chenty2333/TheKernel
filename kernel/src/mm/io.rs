@@ -45,6 +45,21 @@ impl IoVectorBuf {
         self.len
     }
 
+    pub fn iovcnt(&self) -> usize {
+        self.iovcnt
+    }
+
+    pub fn entry(&self, index: usize) -> AxResult<IoVec> {
+        if index >= self.iovcnt {
+            return Err(AxError::InvalidInput);
+        }
+        let iov = self.iovs.wrapping_add(index).vm_read()?;
+        if iov.iov_len < 0 {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(iov)
+    }
+
     pub fn is_aligned(&self, align: usize) -> AxResult<bool> {
         for i in 0..self.iovcnt {
             let iov = self.iovs.wrapping_add(i).vm_read()?;

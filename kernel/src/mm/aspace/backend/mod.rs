@@ -3,6 +3,7 @@ use alloc::{boxed::Box, sync::Arc};
 
 use axalloc::{UsageKind, global_allocator};
 use axerrno::{AxError, AxResult};
+use axfs::{CachedFilePagePin, CachedFilePinWindow};
 use axhal::{
     mem::{phys_to_virt, virt_to_phys},
     paging::{MappingFlags, PageSize, PageTable, PageTableCursor},
@@ -15,8 +16,10 @@ use memory_set::MappingBackend;
 mod cow;
 mod file;
 mod linear;
+mod phys_pin;
 mod shared;
 
+pub(crate) use self::phys_pin::{PhysicalFramePin, pin_frame};
 pub use self::shared::SharedPages;
 use super::AddrSpace;
 
@@ -47,6 +50,13 @@ fn alloc_frame(zeroed: bool, size: PageSize) -> AxResult<PhysAddr> {
 }
 
 fn dealloc_frame(frame: PhysAddr, align: PageSize) {
+    if phys_pin::defer_frame_dealloc_if_pinned(frame, align) {
+        return;
+    }
+    dealloc_frame_now(frame, align);
+}
+
+fn dealloc_frame_now(frame: PhysAddr, align: PageSize) {
     let vaddr = phys_to_virt(frame);
     let page_size: usize = align.into();
     let num_pages = page_size / PAGE_SIZE_4K;
@@ -216,6 +226,28 @@ impl Backend {
         matches!(self, Backend::Cow(backend) if backend.is_private_anonymous())
     }
 
+    pub fn supports_user_io_frame_pin(&self) -> bool {
+        matches!(self, Backend::Cow(_) | Backend::Shared(_))
+    }
+
+    pub fn begin_user_io_pin_window(&self) -> Option<CachedFilePinWindow> {
+        match self {
+            Backend::File(backend) => Some(backend.begin_user_io_pin_window()),
+            Backend::Linear(_) | Backend::Cow(_) | Backend::Shared(_) => None,
+        }
+    }
+
+    pub fn pin_user_io_page_cache(
+        &self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+    ) -> AxResult<Option<CachedFilePagePin>> {
+        match self {
+            Backend::File(backend) => Ok(Some(backend.pin_user_io_page(vaddr, paddr)?)),
+            Backend::Linear(_) | Backend::Cow(_) | Backend::Shared(_) => Ok(None),
+        }
+    }
+
     pub fn check_protect_flags(&self, flags: MappingFlags) -> AxResult {
         match self {
             Backend::File(backend) => backend.check_flags(flags),
@@ -238,9 +270,9 @@ impl Backend {
             Backend::Shared(backend) => Ok(Backend::Shared(
                 backend.clone_for_range(old_start, new_start),
             )),
-            Backend::File(backend) => Ok(Backend::File(
-                backend.clone_for_range(old_start, new_start, aspace),
-            )),
+            Backend::File(backend) => backend
+                .clone_for_range(old_start, new_start, aspace)
+                .map(Backend::File),
         }
     }
 
@@ -258,9 +290,9 @@ impl Backend {
             Backend::Shared(backend) => Ok(Backend::Shared(
                 backend.duplicate_mapping(old_start, new_start),
             )),
-            Backend::File(backend) => Ok(Backend::File(
-                backend.duplicate_mapping(old_start, new_start, aspace),
-            )),
+            Backend::File(backend) => backend
+                .duplicate_mapping(old_start, new_start, aspace)
+                .map(Backend::File),
         }
     }
 

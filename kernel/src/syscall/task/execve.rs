@@ -26,7 +26,7 @@ use crate::task::reset_current_user_fpu_state;
 use crate::{
     config::USER_HEAP_BASE,
     file::{FD_TABLE, ResolveAtResult, executable, fanotify, resolve_at},
-    mm::{copy_from_kernel, load_user_app, new_user_aspace_empty, vm_load_string},
+    mm::{copy_from_kernel, load_user_app_at, new_user_aspace_empty, vm_load_string},
     task::{
         AsThread, ProcessData, Thread, add_task_alias, check_signals, get_task,
         has_pending_fatal_signal, notify_ptrace_attach_stop, set_current_user_page_table_root,
@@ -228,6 +228,19 @@ fn load_exec_args_env(
     Ok((args, envs))
 }
 
+fn exec_or_release<T>(
+    executable_key: Option<executable::ExecutableKey>,
+    result: AxResult<T>,
+) -> AxResult<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            executable::release(executable_key);
+            Err(err)
+        }
+    }
+}
+
 fn do_execve(
     uctx: &mut UserContext,
     loc: axfs_ng_vfs::Location,
@@ -246,12 +259,20 @@ fn do_execve(
 
     let abs_path = loc.absolute_path()?.to_string();
     let task_name = loc.name().to_string();
+    let executable_key = executable::acquire_if_not_write_open(&loc)?;
 
-    let mut new_aspace = new_user_aspace_empty()?;
-    copy_from_kernel(&mut new_aspace)?;
-    let (entry_point, user_stack_base) =
-        load_user_app(&mut new_aspace, Some(abs_path.as_str()), &args, &envs)?;
-    let executable_key = executable::acquire(&loc);
+    let mut new_aspace = exec_or_release(executable_key, new_user_aspace_empty())?;
+    exec_or_release(executable_key, copy_from_kernel(&mut new_aspace))?;
+    let (entry_point, user_stack_base) = exec_or_release(
+        executable_key,
+        load_user_app_at(
+            &mut new_aspace,
+            loc.clone(),
+            abs_path.as_str(),
+            &args,
+            &envs,
+        ),
+    )?;
     fanotify::notify(
         &loc,
         &loc,
@@ -287,9 +308,11 @@ fn do_execve(
     }
 
     let new_aspace = Arc::new(axsync::Mutex::new(new_aspace));
-    let new_root = new_aspace.lock().page_table_root();
-    let old_aspace = proc_data.replace_aspace(new_aspace);
+    let new_aspace_guard = new_aspace.lock();
+    let new_root = new_aspace_guard.page_table_root();
+    let old_aspace = proc_data.replace_aspace(new_aspace.clone());
     set_current_user_page_table_root(new_root);
+    drop(new_aspace_guard);
     drop(old_aspace);
     proc_data.clear_membarrier_registrations();
     proc_data.clear_keep_caps_on_exec();

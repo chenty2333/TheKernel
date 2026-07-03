@@ -1,8 +1,7 @@
 use core::{mem, slice};
 
-use crate::{Ext4Result, SystemHal, error::Context, ffi::*, util::revision_tuple};
-
 use super::{InodeRef, InodeType};
+use crate::{Ext4Result, SystemHal, error::Context, ffi::*, util::revision_tuple};
 
 impl<Hal: SystemHal> InodeRef<Hal> {
     pub fn read_dir(mut self, offset: u64) -> Ext4Result<DirReader<Hal>> {

@@ -1,14 +1,13 @@
-use core::{
-    marker::PhantomData,
-    ptr,
-    ptr::NonNull,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+#[cfg(target_arch = "loongarch64")]
+use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{marker::PhantomData, ptr, ptr::NonNull};
 
 use axalloc::{UsageKind, global_allocator};
 use axdriver_base::{BaseDriverOps, DevResult, DeviceType};
 use axdriver_virtio::{BufferDirection, PhysAddr, VirtIoHal};
-use axhal::mem::{phys_to_virt, virt_to_phys};
+use axhal::mem::phys_to_virt;
+#[cfg(not(target_arch = "loongarch64"))]
+use axhal::mem::virt_to_phys;
 #[cfg(target_arch = "loongarch64")]
 use axhal::paging::MappingFlags;
 use cfg_if::cfg_if;
@@ -24,6 +23,29 @@ cfg_if! {
     } else if #[cfg(bus =  "mmio")] {
         type VirtIoTransport = axdriver_virtio::MmioTransport;
     }
+}
+
+#[cfg(all(bus = "mmio", target_arch = "riscv64"))]
+fn virtio_mmio_irq(mmio_base: usize) -> Option<usize> {
+    const QEMU_VIRTIO_MMIO_BASE: usize = 0x1000_1000;
+    const QEMU_VIRTIO_MMIO_STRIDE: usize = 0x1000;
+    const QEMU_VIRTIO_MMIO_COUNT: usize = 8;
+
+    let offset = mmio_base.checked_sub(QEMU_VIRTIO_MMIO_BASE)?;
+    if offset % QEMU_VIRTIO_MMIO_STRIDE != 0 {
+        return None;
+    }
+    let index = offset / QEMU_VIRTIO_MMIO_STRIDE;
+    if index < QEMU_VIRTIO_MMIO_COUNT {
+        Some(index + 1)
+    } else {
+        None
+    }
+}
+
+#[cfg(all(bus = "mmio", not(target_arch = "riscv64")))]
+fn virtio_mmio_irq(_mmio_base: usize) -> Option<usize> {
+    None
 }
 
 /// A trait for VirtIO device meta information.
@@ -59,8 +81,8 @@ cfg_if! {
             const DEVICE_TYPE: DeviceType = DeviceType::Block;
             type Device = axdriver_virtio::VirtIoBlkDev<VirtIoHalImpl, VirtIoTransport>;
 
-            fn try_new(transport: VirtIoTransport, _irq: Option<usize>) -> DevResult<AxDeviceEnum> {
-                Ok(AxDeviceEnum::from_block(Self::Device::try_new(transport)?))
+            fn try_new(transport: VirtIoTransport, irq: Option<usize>) -> DevResult<AxDeviceEnum> {
+                Ok(AxDeviceEnum::from_block(Self::Device::try_new_with_irq(transport, irq)?))
             }
         }
     }
@@ -122,7 +144,7 @@ impl<D: VirtIoDevMeta> DriverProbe for VirtIoDriver<D> {
             axdriver_virtio::probe_mmio_device(base_vaddr.as_mut_ptr(), mmio_size)
             && ty == D::DEVICE_TYPE
         {
-            match D::try_new(transport, None) {
+            match D::try_new(transport, virtio_mmio_irq(mmio_base)) {
                 Ok(dev) => return Some(dev),
                 Err(e) => {
                     warn!(
@@ -213,10 +235,12 @@ const DMA_POOL_BITMAP_WORDS: usize =
     (DMA_POOL_PAGES + usize::BITS as usize - 1) / usize::BITS as usize;
 
 #[cfg(target_arch = "loongarch64")]
-static DMA_REGION_BASES: [AtomicUsize; DMA_REGION_SLOTS] = [const { AtomicUsize::new(0) }; DMA_REGION_SLOTS];
+static DMA_REGION_BASES: [AtomicUsize; DMA_REGION_SLOTS] =
+    [const { AtomicUsize::new(0) }; DMA_REGION_SLOTS];
 
 #[cfg(target_arch = "loongarch64")]
-static DMA_REGION_PAGES: [AtomicUsize; DMA_REGION_SLOTS] = [const { AtomicUsize::new(0) }; DMA_REGION_SLOTS];
+static DMA_REGION_PAGES: [AtomicUsize; DMA_REGION_SLOTS] =
+    [const { AtomicUsize::new(0) }; DMA_REGION_SLOTS];
 
 #[cfg(target_arch = "loongarch64")]
 struct DmaPoolState {
@@ -251,7 +275,10 @@ impl DmaPoolState {
 
     fn contains_paddr(&self, paddr: usize, pages: usize) -> bool {
         let size = pages * DMA_PAGE_SIZE;
-        paddr >= DMA_POOL_PADDR && paddr.checked_add(size).is_some_and(|end| end <= DMA_POOL_PADDR + DMA_POOL_SIZE)
+        paddr >= DMA_POOL_PADDR
+            && paddr
+                .checked_add(size)
+                .is_some_and(|end| end <= DMA_POOL_PADDR + DMA_POOL_SIZE)
     }
 
     fn vaddr_of(&self, paddr: usize) -> usize {
@@ -430,7 +457,8 @@ fn free_dma_region(paddr: usize, pages: usize) -> bool {
 fn dma_pool_vaddr(paddr: usize, pages: usize) -> Option<usize> {
     let mut pool = DMA_POOL_STATE.lock();
     pool.init_if_needed();
-    pool.contains_paddr(paddr, pages).then(|| pool.vaddr_of(paddr))
+    pool.contains_paddr(paddr, pages)
+        .then(|| pool.vaddr_of(paddr))
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -482,8 +510,7 @@ fn free_queue_dma_page(paddr: usize, vaddr: usize) -> bool {
         assert!(
             slot.in_use,
             "LA virtio queue dma slot double-free: paddr={:#x} vaddr={:#x}",
-            paddr,
-            vaddr
+            paddr, vaddr
         );
         unregister_dma_region(paddr);
         unsafe {
@@ -510,6 +537,9 @@ fn use_queue_dma_pool(pages: usize) -> bool {
 
 unsafe impl VirtIoHal for VirtIoHalImpl {
     fn dma_alloc(pages: usize, direction: BufferDirection) -> (PhysAddr, NonNull<u8>) {
+        #[cfg(not(target_arch = "loongarch64"))]
+        let _ = direction;
+
         #[cfg(target_arch = "loongarch64")]
         let (paddr, vaddr) = if use_queue_dma_pool(pages) {
             if let Some((paddr, vaddr)) = alloc_queue_dma_page(direction) {
@@ -558,9 +588,7 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
 
     unsafe fn dma_dealloc(_paddr: PhysAddr, vaddr: NonNull<u8>, pages: usize) -> i32 {
         #[cfg(target_arch = "loongarch64")]
-        if use_queue_dma_pool(pages)
-            && free_queue_dma_page(_paddr, vaddr.as_ptr() as usize)
-        {
+        if use_queue_dma_pool(pages) && free_queue_dma_page(_paddr, vaddr.as_ptr() as usize) {
             return 0;
         }
         #[cfg(target_arch = "loongarch64")]
@@ -589,6 +617,9 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
 
     #[inline]
     unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> PhysAddr {
+        #[cfg(not(target_arch = "loongarch64"))]
+        let _ = direction;
+
         #[cfg(target_arch = "loongarch64")]
         {
             assert_ne!(buffer.len(), 0);
@@ -646,9 +677,13 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
                     paddr, pages
                 );
             }
-            let vaddr = dma_pool_vaddr(paddr, pages).unwrap_or_else(|| phys_to_virt(paddr.into()).as_usize());
+            let vaddr = dma_pool_vaddr(paddr, pages)
+                .unwrap_or_else(|| phys_to_virt(paddr.into()).as_usize());
             dma_sync_barrier();
-            if matches!(direction, BufferDirection::DeviceToDriver | BufferDirection::Both) {
+            if matches!(
+                direction,
+                BufferDirection::DeviceToDriver | BufferDirection::Both
+            ) {
                 // SAFETY: caller guarantees the destination buffer is valid for
                 // the duration of this call; the shared buffer does not alias
                 // `buffer`.

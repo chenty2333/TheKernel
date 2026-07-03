@@ -1,6 +1,6 @@
 extern crate alloc;
 
-use alloc::format;
+use alloc::{format, sync::Arc};
 
 use axdriver_base::DeviceType;
 use axdriver_block::BlockDriverOps;
@@ -52,24 +52,33 @@ fn probe(info: FdtInfo<'_>, plat_dev: PlatformDevice) -> Result<(), OnProbeError
         return Err(OnProbeError::NotMatch);
     }
 
-    let dev = Device::try_new(transport).map_err(|e| {
+    let irq = info
+        .interrupts()
+        .into_iter()
+        .next()
+        .and_then(|cells| cells.into_iter().next())
+        .map(|irq| irq as usize);
+
+    let dev = Device::try_new_with_irq(transport, irq).map_err(|e| {
         OnProbeError::other(format!(
             "failed to initialize Virtio Block device at [PA:{mmio_base:?},): {e:?}"
         ))
     })?;
 
-    let dev = BlockDivce { dev: Some(dev) };
+    let dev = BlockDivce {
+        dev: Arc::new(spin::Mutex::new(dev)),
+    };
     plat_dev.register_block(dev);
     debug!("virtio block device registered successfully");
     Ok(())
 }
 
 struct BlockDivce {
-    dev: Option<Device<MmioTransport>>,
+    dev: Arc<spin::Mutex<Device<MmioTransport>>>,
 }
 
 struct BlockQueue {
-    raw: Device<MmioTransport>,
+    raw: Arc<spin::Mutex<Device<MmioTransport>>>,
 }
 
 impl DriverGeneric for BlockDivce {
@@ -80,35 +89,48 @@ impl DriverGeneric for BlockDivce {
 
 impl rd_block::Interface for BlockDivce {
     fn create_queue(&mut self) -> Option<alloc::boxed::Box<dyn rd_block::IQueue>> {
-        self.dev
-            .take()
-            .map(|dev| alloc::boxed::Box::new(BlockQueue { raw: dev }) as _)
+        Some(alloc::boxed::Box::new(BlockQueue {
+            raw: self.dev.clone(),
+        }) as _)
     }
 
     fn enable_irq(&mut self) {
-        todo!()
+        self.dev.lock().enable_irq();
     }
 
     fn disable_irq(&mut self) {
-        todo!()
+        self.dev.lock().disable_irq();
     }
 
     fn is_irq_enabled(&self) -> bool {
-        false
+        self.dev.lock().is_irq_enabled()
     }
 
     fn handle_irq(&mut self) -> rd_block::Event {
-        rd_block::Event::none()
+        let drained = match self.dev.lock().handle_irq() {
+            Ok(drained) => drained,
+            Err(err) => {
+                warn!("virtio block irq handling failed: {err:?}");
+                0
+            }
+        };
+        if drained == 0 {
+            return rd_block::Event::none();
+        }
+
+        let mut event = rd_block::Event::none();
+        event.queue.insert(0);
+        event
     }
 }
 
 impl rd_block::IQueue for BlockQueue {
     fn num_blocks(&self) -> usize {
-        self.raw.num_blocks() as _
+        self.raw.lock().num_blocks() as _
     }
 
     fn block_size(&self) -> usize {
-        self.raw.block_size()
+        self.raw.lock().block_size()
     }
 
     fn id(&self) -> usize {
@@ -131,12 +153,14 @@ impl rd_block::IQueue for BlockQueue {
         match request.kind {
             rd_block::RequestKind::Read(mut buffer) => {
                 self.raw
+                    .lock()
                     .read_block(id as _, &mut buffer)
                     .map_err(maping_dev_err_to_blk_err)?;
                 Ok(rd_block::RequestId::new(0))
             }
             rd_block::RequestKind::Write(items) => {
                 self.raw
+                    .lock()
                     .write_block(id as _, items)
                     .map_err(maping_dev_err_to_blk_err)?;
                 Ok(rd_block::RequestId::new(0))

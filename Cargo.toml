@@ -96,6 +96,7 @@ all-features = true
 axfeat = { path = "third_party/rust-patches/axfeat" }
 axnet-ng = { path = "crates/axnet-ng" }
 axdriver = { path = "third_party/rust-patches/axdriver" }
+axdriver_block = { path = "third_party/rust-patches/axdriver_block" }
 axdriver_virtio = { path = "third_party/rust-patches/axdriver_virtio" }
 axio = { path = "third_party/rust-patches/axio" }
 axcpu = { path = "third_party/rust-patches/axcpu" }

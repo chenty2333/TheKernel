@@ -392,8 +392,6 @@ checksum = "c4614d9e505dae224e4e4cb934c8fa916d77ecfb7b770a8bf8eac78bdeec3dba"
 [[package]]
 name = "axdriver_block"
 version = "0.1.4-preview.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cccf23999a9dff620ef87c08c571509d2e90cc9dc80f932381b0fd949f020f9"
 dependencies = [
  "axdriver_base",
  "log",
@@ -448,6 +446,8 @@ dependencies = [
  "axdriver_display",
  "axdriver_input",
  "axdriver_net",
+ "axhal",
+ "axtask",
  "log",
  "spin 0.9.8",
  "virtio-drivers",

@@ -7,10 +7,10 @@ use alloc::{
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use axerrno::{AxError, AxResult};
-use axfs::{CachedFile, FileFlags};
+use axfs::{CachedFile, CachedFilePagePin, CachedFilePinWindow, FileFlags};
 use axhal::paging::{MappingFlags, PageSize, PageTableCursor, PagingError};
 use axsync::Mutex;
-use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{AddrSpace, Backend, BackendOps, PopulateCallback, page_table_flags, pages_in};
 use crate::file::memfd;
@@ -22,6 +22,7 @@ struct FileFutexKey {
 }
 
 static FILE_FUTEX_HANDLES: Mutex<BTreeMap<FileFutexKey, Weak<()>>> = Mutex::new(BTreeMap::new());
+const REGISTERING_LISTENER: usize = usize::MAX;
 
 fn file_futex_handle(cache: &CachedFile) -> Arc<()> {
     let loc = cache.location();
@@ -66,7 +67,7 @@ pub struct FileBackendInner {
 impl Drop for FileBackendInner {
     fn drop(&mut self) {
         let handle = self.handle.load(Ordering::Acquire);
-        if handle != 0 {
+        if handle != 0 && handle != REGISTERING_LISTENER {
             unsafe {
                 self.cache.remove_evict_listener(handle);
             }
@@ -74,9 +75,13 @@ impl Drop for FileBackendInner {
     }
 }
 impl FileBackendInner {
-    pub fn register_listener(self: &Arc<Self>, aspace: &Arc<Mutex<AddrSpace>>) {
-        if self.handle.load(Ordering::Acquire) != 0 {
-            panic!("Listener already registered");
+    pub fn register_listener(self: &Arc<Self>, aspace: &Arc<Mutex<AddrSpace>>) -> AxResult {
+        if self
+            .handle
+            .compare_exchange(0, REGISTERING_LISTENER, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(AxError::AlreadyExists);
         }
         let aspace = Arc::downgrade(aspace);
         let handle = self.cache.add_evict_listener({
@@ -99,6 +104,7 @@ impl FileBackendInner {
             }
         });
         self.handle.store(handle, Ordering::Release);
+        Ok(())
     }
 
     fn on_evict(self: &Arc<Self>, pn: u32, aspace: &mut AddrSpace) {
@@ -198,13 +204,38 @@ impl FileBackend {
         resident
     }
 
+    pub(crate) fn begin_user_io_pin_window(&self) -> CachedFilePinWindow {
+        self.0.cache.begin_user_io_pin_window()
+    }
+
+    pub(crate) fn pin_user_io_page(
+        &self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+    ) -> AxResult<CachedFilePagePin> {
+        let page_start = vaddr.align_down_4k();
+        if page_start < self.0.start {
+            return Err(AxError::BadAddress);
+        }
+
+        let file_page = page_start.sub_addr(self.0.start) / PAGE_SIZE_4K;
+        if file_page > u32::MAX as usize {
+            return Err(AxError::BadAddress);
+        }
+        let Some(pn) = self.0.offset_page.checked_add(file_page as u32) else {
+            return Err(AxError::BadAddress);
+        };
+
+        self.0.cache.pin_cached_page_by_paddr(pn, paddr)
+    }
+
     fn clone_for_range_with_id(
         &self,
         old_start: VirtAddr,
         new_start: VirtAddr,
         aspace: &Arc<Mutex<AddrSpace>>,
         map_id: Arc<()>,
-    ) -> Self {
+    ) -> AxResult<Self> {
         let start = relocate_backend_start(self.0.start, old_start, new_start);
         let inner = Arc::new(FileBackendInner {
             start,
@@ -217,8 +248,8 @@ impl FileBackend {
             futex_handle: self.0.futex_handle.clone(),
             writable_mapping: self.0.writable_mapping.clone(),
         });
-        inner.register_listener(aspace);
-        Self(inner)
+        inner.register_listener(aspace)?;
+        Ok(Self(inner))
     }
 
     pub(crate) fn clone_for_range(
@@ -226,7 +257,7 @@ impl FileBackend {
         old_start: VirtAddr,
         new_start: VirtAddr,
         aspace: &Arc<Mutex<AddrSpace>>,
-    ) -> Self {
+    ) -> AxResult<Self> {
         self.clone_for_range_with_id(old_start, new_start, aspace, self.0.map_id.clone())
     }
 
@@ -235,7 +266,7 @@ impl FileBackend {
         old_start: VirtAddr,
         new_start: VirtAddr,
         aspace: &Arc<Mutex<AddrSpace>>,
-    ) -> Self {
+    ) -> AxResult<Self> {
         self.clone_for_range_with_id(old_start, new_start, aspace, Arc::new(()))
     }
 
@@ -397,7 +428,7 @@ impl BackendOps for FileBackend {
             futex_handle: self.0.futex_handle.clone(),
             writable_mapping: self.0.writable_mapping.clone(),
         });
-        inner.register_listener(new_aspace);
+        inner.register_listener(new_aspace)?;
         Ok(Backend::File(FileBackend(inner)))
     }
 }
@@ -410,7 +441,7 @@ impl Backend {
         offset: usize,
         file_end: Option<u64>,
         aspace: &Arc<Mutex<AddrSpace>>,
-    ) -> Self {
+    ) -> AxResult<Self> {
         let offset_page = (offset / PAGE_SIZE_4K) as u32;
         let writable_mapping = memfd::new_writable_mapping_registration(cache.location());
         let futex_handle = file_futex_handle(&cache);
@@ -425,7 +456,7 @@ impl Backend {
             futex_handle,
             writable_mapping,
         });
-        inner.register_listener(aspace);
-        Self::File(FileBackend(inner))
+        inner.register_listener(aspace)?;
+        Ok(Self::File(FileBackend(inner)))
     }
 }

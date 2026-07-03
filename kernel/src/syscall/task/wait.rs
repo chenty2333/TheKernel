@@ -25,6 +25,7 @@ const WAITPID_ALLOWED_BITS: u32 =
 const WAITID_ALLOWED_BITS: u32 =
     WNOHANG | WEXITED | WUNTRACED | WCONTINUED | WNOWAIT | __WNOTHREAD | __WALL | __WCLONE;
 const POST_WAIT_RECLAIM_YIELDS: usize = 4;
+
 bitflags! {
     #[derive(Debug)]
     struct WaitOptions: u32 {
@@ -403,7 +404,8 @@ pub fn sys_waitpid(
 
             match &event {
                 WaitEvent::Exited { child, snapshot } => {
-                    if !child.reap() {
+                    let reaped = child.reap();
+                    if !reaped {
                         return Ok(None);
                     }
                     cgroup::detach_process(child.pid());
@@ -446,7 +448,8 @@ pub fn sys_waitpid(
         } else {
             Poll::Pending
         }
-    }))?;
+    }));
+    let result = result?;
     axtask::reclaim_exited_tasks_until_clear(POST_WAIT_RECLAIM_YIELDS);
     Ok(result)
 }

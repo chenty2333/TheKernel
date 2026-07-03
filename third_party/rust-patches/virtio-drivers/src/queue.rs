@@ -3,22 +3,30 @@
 #[cfg(feature = "alloc")]
 pub mod owning;
 
-use crate::hal::{BufferDirection, Dma, Hal, PhysAddr};
-use crate::transport::Transport;
-use crate::{align_up, nonnull_slice_from_raw_parts, pages, Error, Result, PAGE_SIZE};
 #[cfg(feature = "alloc")]
 use alloc::boxed::Box;
-use bitflags::bitflags;
 #[cfg(test)]
 use core::cmp::min;
-use core::convert::TryInto;
-use core::hint::spin_loop;
-use core::mem::{size_of, take};
 #[cfg(test)]
 use core::ptr;
-use core::ptr::NonNull;
-use core::sync::atomic::{fence, AtomicU16, Ordering};
+use core::{
+    convert::TryInto,
+    hint::spin_loop,
+    mem::{size_of, take},
+    ptr::NonNull,
+    sync::atomic::{AtomicU16, Ordering, fence},
+};
+
+use bitflags::bitflags;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
+
+use crate::{
+    Error, PAGE_SIZE, Result, align_up,
+    hal::{BufferDirection, Dma, Hal, PhysAddr},
+    nonnull_slice_from_raw_parts, pages,
+    stats::{io_counters_enabled, record_queue_sync_wait},
+    transport::Transport,
+};
 
 #[cfg(target_arch = "loongarch64")]
 #[inline]
@@ -119,7 +127,8 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         #[cfg(target_arch = "loongarch64")]
         if log::log_enabled!(log::Level::Debug) {
             log::debug!(
-                "LA virtio queue new q={} size={} desc_paddr={:#x} avail_paddr={:#x} used_paddr={:#x}",
+                "LA virtio queue new q={} size={} desc_paddr={:#x} avail_paddr={:#x} \
+                 used_paddr={:#x}",
                 idx,
                 size,
                 layout.descriptors_paddr(),
@@ -185,6 +194,30 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         inputs: &'a [&'b [u8]],
         outputs: &'a mut [&'b mut [u8]],
     ) -> Result<u16> {
+        // SAFETY: This method preserves the original add contract: it publishes
+        // the descriptor chain before returning, and the caller must keep the
+        // buffers alive until the matching `pop_used`.
+        let head = unsafe { self.add_unpublished(inputs, outputs) }?;
+        self.publish_unpublished(head);
+        Ok(head)
+    }
+
+    /// Add buffers to the descriptor table without publishing them in the
+    /// available ring yet.
+    ///
+    /// This is used by block pending-completion paths which must install their
+    /// token metadata before a fast device can observe and complete the chain.
+    ///
+    /// # Safety
+    ///
+    /// The input and output buffers must remain valid and not be accessed until
+    /// a call to `pop_used` for the returned token succeeds. The caller must
+    /// publish the returned token with [`publish_unpublished`](Self::publish_unpublished).
+    pub unsafe fn add_unpublished<'a, 'b>(
+        &mut self,
+        inputs: &'a [&'b [u8]],
+        outputs: &'a mut [&'b mut [u8]],
+    ) -> Result<u16> {
         if inputs.is_empty() && outputs.is_empty() {
             return Err(Error::InvalidParam);
         }
@@ -212,6 +245,12 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         #[cfg(not(feature = "alloc"))]
         let head = self.add_direct(inputs, outputs);
 
+        Ok(head)
+    }
+
+    /// Publishes a descriptor chain previously returned by
+    /// [`add_unpublished`](Self::add_unpublished) to the available ring.
+    pub fn publish_unpublished(&mut self, head: u16) {
         let avail_slot = self.avail_idx & (SIZE as u16 - 1);
         // Safe because self.avail is properly aligned, dereferenceable and initialised.
         unsafe {
@@ -237,8 +276,6 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                 .idx
                 .store(self.avail_idx, Ordering::Release);
         }
-
-        Ok(head)
     }
 
     fn add_direct<'a, 'b>(
@@ -340,80 +377,105 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         // Safe because we don't return until the same token has been popped, so the buffers remain
         // valid and are not otherwise accessed until then.
         let token = unsafe { self.add(inputs, outputs) }?;
+        let count_io_stats = io_counters_enabled();
+        let mut notified = false;
 
         // Notify the queue.
         if self.should_notify() {
             dma_sync_barrier();
             transport.notify(self.queue_idx);
+            notified = true;
+        }
+
+        macro_rules! report_loongarch_stall {
+            ($spin_count:ident, $next_report:ident) => {{
+                #[cfg(target_arch = "loongarch64")]
+                {
+                    $spin_count += 1;
+                    if $spin_count == $next_report {
+                        let used_idx = unsafe { (*self.used.as_ptr()).idx.load(Ordering::Acquire) };
+                        let d0 = &self.desc_shadow[usize::from(token)];
+                        let d1_index = d0.next;
+                        let d1 = &self.desc_shadow[usize::from(d1_index)];
+                        let d2_index = d1.next;
+                        let d2 = &self.desc_shadow[usize::from(d2_index)];
+                        let hw0 = unsafe { &(*self.desc.as_ptr())[usize::from(token)] };
+                        let hw1 = unsafe { &(*self.desc.as_ptr())[usize::from(d1_index)] };
+                        let hw2 = unsafe { &(*self.desc.as_ptr())[usize::from(d2_index)] };
+                        let req_bytes = unsafe {
+                            let ptr =
+                                H::mmio_phys_to_virt(d0.addr as usize, d0.len as usize).as_ptr();
+                            core::slice::from_raw_parts(ptr as *const u8, d0.len as usize)
+                        };
+                        let req_type = u32::from_le_bytes(req_bytes[0..4].try_into().unwrap());
+                        let req_reserved = u32::from_le_bytes(req_bytes[4..8].try_into().unwrap());
+                        let req_sector = u64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
+                        log::warn!(
+                            "LA virtio queue stall q={} token={} avail={} used={} last_used={} \
+                             num_used={} free_head={} req=({:#x},{:#x},{}) \
+                             shadow=[({:#x},{},{:#x},{})->({:#x},{},{:#x},{})->({:#x},{},{:#x},\
+                             {})] hw=[({:#x},{},{:#x},{})->({:#x},{},{:#x},{})->({:#x},{},{:#x},\
+                             {})]",
+                            self.queue_idx,
+                            token,
+                            self.avail_idx,
+                            used_idx,
+                            self.last_used_idx,
+                            self.num_used,
+                            self.free_head,
+                            req_type,
+                            req_reserved,
+                            req_sector,
+                            d0.addr,
+                            d0.len,
+                            d0.flags.bits(),
+                            d0.next,
+                            d1.addr,
+                            d1.len,
+                            d1.flags.bits(),
+                            d1.next,
+                            d2.addr,
+                            d2.len,
+                            d2.flags.bits(),
+                            d2.next,
+                            hw0.addr,
+                            hw0.len,
+                            hw0.flags.bits(),
+                            hw0.next,
+                            hw1.addr,
+                            hw1.len,
+                            hw1.flags.bits(),
+                            hw1.next,
+                            hw2.addr,
+                            hw2.len,
+                            hw2.flags.bits(),
+                            hw2.next,
+                        );
+                        $next_report = $next_report.saturating_mul(4);
+                    }
+                }
+            }};
         }
 
         // Wait until there is at least one element in the used ring.
-        #[cfg(target_arch = "loongarch64")]
+        #[allow(unused_mut, unused_variables)]
         let mut spin_count = 0usize;
-        #[cfg(target_arch = "loongarch64")]
+        #[allow(unused_mut, unused_variables)]
         let mut next_report = 1_000_000usize;
-        while !self.can_pop() {
-            #[cfg(target_arch = "loongarch64")]
-            {
-                spin_count += 1;
-                if spin_count == next_report {
-                    let used_idx = unsafe { (*self.used.as_ptr()).idx.load(Ordering::Acquire) };
-                    let d0 = &self.desc_shadow[usize::from(token)];
-                    let d1_index = d0.next;
-                    let d1 = &self.desc_shadow[usize::from(d1_index)];
-                    let d2_index = d1.next;
-                    let d2 = &self.desc_shadow[usize::from(d2_index)];
-                    let hw0 = unsafe { &(*self.desc.as_ptr())[usize::from(token)] };
-                    let hw1 = unsafe { &(*self.desc.as_ptr())[usize::from(d1_index)] };
-                    let hw2 = unsafe { &(*self.desc.as_ptr())[usize::from(d2_index)] };
-                    let req_bytes = unsafe {
-                        let ptr = H::mmio_phys_to_virt(d0.addr as usize, d0.len as usize).as_ptr();
-                        core::slice::from_raw_parts(ptr as *const u8, d0.len as usize)
-                    };
-                    let req_type = u32::from_le_bytes(req_bytes[0..4].try_into().unwrap());
-                    let req_reserved = u32::from_le_bytes(req_bytes[4..8].try_into().unwrap());
-                    let req_sector = u64::from_le_bytes(req_bytes[8..16].try_into().unwrap());
-                    log::warn!(
-                        "LA virtio queue stall q={} token={} avail={} used={} last_used={} num_used={} free_head={} req=({:#x},{:#x},{}) shadow=[({:#x},{},{:#x},{})->({:#x},{},{:#x},{})->({:#x},{},{:#x},{})] hw=[({:#x},{},{:#x},{})->({:#x},{},{:#x},{})->({:#x},{},{:#x},{})]",
-                        self.queue_idx,
-                        token,
-                        self.avail_idx,
-                        used_idx,
-                        self.last_used_idx,
-                        self.num_used,
-                        self.free_head,
-                        req_type,
-                        req_reserved,
-                        req_sector,
-                        d0.addr,
-                        d0.len,
-                        d0.flags.bits(),
-                        d0.next,
-                        d1.addr,
-                        d1.len,
-                        d1.flags.bits(),
-                        d1.next,
-                        d2.addr,
-                        d2.len,
-                        d2.flags.bits(),
-                        d2.next,
-                        hw0.addr,
-                        hw0.len,
-                        hw0.flags.bits(),
-                        hw0.next,
-                        hw1.addr,
-                        hw1.len,
-                        hw1.flags.bits(),
-                        hw1.next,
-                        hw2.addr,
-                        hw2.len,
-                        hw2.flags.bits(),
-                        hw2.next,
-                    );
-                    next_report = next_report.saturating_mul(4);
-                }
+
+        if count_io_stats {
+            let mut wait_polls = 0u64;
+            while !self.can_pop() {
+                wait_polls = wait_polls.saturating_add(1);
+                report_loongarch_stall!(spin_count, next_report);
+                spin_loop();
             }
-            spin_loop();
+            record_queue_sync_wait(wait_polls, notified);
+        } else {
+            while !self.can_pop() {
+                report_loongarch_stall!(spin_count, next_report);
+                spin_loop();
+            }
         }
 
         // Safe because these are the same buffers as we passed to `add` above and they are still
@@ -1082,18 +1144,19 @@ pub(crate) fn fake_read_write_queue<const QUEUE_SIZE: usize>(
 
 #[cfg(test)]
 mod tests {
+    use core::ptr::NonNull;
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use crate::{
         device::common::Feature,
         hal::fake::FakeHal,
         transport::{
-            fake::{FakeTransport, QueueStatus, State},
-            mmio::{MmioTransport, VirtIOHeader, MODERN_VERSION},
             DeviceType,
+            fake::{FakeTransport, QueueStatus, State},
+            mmio::{MODERN_VERSION, MmioTransport, VirtIOHeader},
         },
     };
-    use core::ptr::NonNull;
-    use std::sync::{Arc, Mutex};
 
     #[test]
     fn queue_too_big() {

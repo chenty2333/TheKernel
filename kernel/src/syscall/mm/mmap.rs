@@ -476,7 +476,7 @@ pub fn sys_mmap(
                             offset,
                             Some(file_end),
                             &aspace_handle,
-                        )
+                        )?
                     }
                     FileBackend::Direct(loc) => {
                         let device = loc
@@ -519,7 +519,7 @@ pub fn sys_mmap(
                                     offset,
                                     Some(file_end),
                                     &aspace_handle,
-                                )
+                                )?
                             }
                         }
                     }

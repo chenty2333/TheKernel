@@ -236,6 +236,9 @@ build_overlay_tools_for_arch() {
     "$cc" -O2 -static -s -std=c11 \
         "$REPO_ROOT/scripts/support-tools/sleep.c" \
         -o "$arch_root/overlay/bin/oscomp-sleep"
+    "$cc" -O2 -static -s -std=c11 \
+        "$REPO_ROOT/scripts/support-tools/sync-fence.c" \
+        -o "$arch_root/overlay/bin/oscomp-sync-fence"
     if [ "$arch" = la ]; then
         "$cc" -O2 -fPIC -shared \
             "$REPO_ROOT/scripts/support-tools/musl-compat.c" \

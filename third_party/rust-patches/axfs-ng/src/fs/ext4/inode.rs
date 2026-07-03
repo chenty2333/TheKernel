@@ -135,11 +135,14 @@ impl NodeOps for Inode {
         &*self.fs
     }
 
-    fn sync(&self, _data_only: bool) -> VfsResult<()> {
+    fn sync(&self, data_only: bool) -> VfsResult<()> {
         // lwext4 exposes writeback at the filesystem level. Reopen-heavy
         // workloads such as iozone rely on sync/fsync making previous updates
         // visible before the next phase starts, so route inode sync through the
         // ext4-wide flush path.
+        if data_only {
+            crate::highlevel::record_file_sync_data_only_metadata_fallback();
+        }
         self.fs.lock().flush().map_err(into_vfs_err)
     }
 
@@ -154,17 +157,123 @@ impl NodeOps for Inode {
 
 impl FileNodeOps for Inode {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
-        self.fs
-            .lock()
-            .read_at(self.ino, buf, offset)
-            .map_err(into_vfs_err)
+        if {
+            let fs = self.fs.lock();
+            fs.is_block_aligned_range(offset, buf.len())
+        } {
+            self.fs
+                .lock()
+                .read_at_aligned_hot(self.ino, buf, offset)
+                .map_err(into_vfs_err)
+        } else {
+            self.fs
+                .lock()
+                .read_at(self.ino, buf, offset)
+                .map_err(into_vfs_err)
+        }
+    }
+
+    fn read_at_vectored(&self, bufs: &mut [&mut [u8]], mut offset: u64) -> VfsResult<usize> {
+        let len = bufs.iter().map(|buf| buf.len()).sum();
+        if {
+            let fs = self.fs.lock();
+            fs.is_block_aligned_range(offset, len)
+        } {
+            let mut fs = self.fs.lock();
+            if let Some(read) = fs
+                .read_at_aligned_hot_vectored(self.ino, bufs, offset)
+                .map_err(into_vfs_err)?
+            {
+                return Ok(read);
+            }
+        }
+
+        let mut fs = self.fs.lock();
+        let mut total = 0usize;
+        for buf in bufs.iter_mut() {
+            if buf.is_empty() {
+                continue;
+            }
+            let requested = buf.len();
+            let read = fs.read_at(self.ino, buf, offset).map_err(into_vfs_err)?;
+            total += read;
+            offset = offset
+                .checked_add(read as u64)
+                .ok_or(VfsError::InvalidInput)?;
+            if read < requested || read == 0 {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    fn try_read_at_vectored_async(
+        &self,
+        bufs: &mut [&mut [u8]],
+        offset: u64,
+    ) -> VfsResult<Option<usize>> {
+        let submission = {
+            let mut fs = self.fs.lock();
+            fs.read_at_aligned_hot_vectored_async_submit(self.ino, bufs, offset)
+                .map_err(into_vfs_err)?
+        };
+        let Some(submission) = submission else {
+            return Ok(None);
+        };
+        self.fs.wait_async_read(&submission)?;
+        Ok(Some(submission.bytes))
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
-        self.fs
-            .lock()
-            .write_at(self.ino, buf, offset)
-            .map_err(into_vfs_err)
+        let mut fs = self.fs.lock();
+        if fs.is_block_aligned_range(offset, buf.len()) {
+            fs.write_at_aligned_hot(self.ino, buf, offset)
+        } else {
+            fs.write_at(self.ino, buf, offset)
+        }
+        .map_err(into_vfs_err)
+    }
+
+    fn write_at_vectored(&self, bufs: &[&[u8]], mut offset: u64) -> VfsResult<usize> {
+        let len = bufs.iter().map(|buf| buf.len()).sum();
+        let mut fs = self.fs.lock();
+        if fs.is_block_aligned_range(offset, len)
+            && let Some(written) = fs
+                .write_at_aligned_hot_vectored(self.ino, bufs, offset)
+                .map_err(into_vfs_err)?
+        {
+            return Ok(written);
+        }
+
+        let mut total = 0usize;
+        for buf in bufs.iter().copied() {
+            if buf.is_empty() {
+                continue;
+            }
+            let requested = buf.len();
+            let written = fs.write_at(self.ino, buf, offset).map_err(into_vfs_err)?;
+            total += written;
+            offset = offset
+                .checked_add(written as u64)
+                .ok_or(VfsError::InvalidInput)?;
+            if written < requested || written == 0 {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    fn try_write_at_vectored_async(&self, bufs: &[&[u8]], offset: u64) -> VfsResult<Option<usize>> {
+        let submission = {
+            let mut fs = self.fs.lock();
+            fs.write_at_aligned_hot_vectored_async_submit(self.ino, bufs, offset)
+                .map_err(into_vfs_err)?
+        };
+        let Some(submission) = submission else {
+            return Ok(None);
+        };
+        self.fs.wait_async_write(&submission)?;
+        Ok(Some(submission.bytes))
     }
 
     fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {

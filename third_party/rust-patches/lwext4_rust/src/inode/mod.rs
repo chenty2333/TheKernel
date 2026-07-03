@@ -3,26 +3,26 @@ mod dir;
 mod file;
 
 use alloc::boxed::Box;
+use core::marker::PhantomData;
+
 pub use attr::FileAttr;
 pub use dir::{DirEntry, DirLookupResult, DirReader};
 
-use core::marker::PhantomData;
-
-use crate::{SystemHal, ffi::*};
+use crate::{SystemHal, ffi::*, hot::ExtentStatusCache};
 
 /// Inode type.
 #[repr(u8)]
 #[derive(PartialEq, Default, Eq, Clone, Copy, Debug)]
 pub enum InodeType {
     #[default]
-    Unknown = 0,
-    Fifo = 1,
+    Unknown         = 0,
+    Fifo            = 1,
     CharacterDevice = 2,
-    Directory = 4,
-    BlockDevice = 6,
-    RegularFile = 8,
-    Symlink = 10,
-    Socket = 12,
+    Directory       = 4,
+    BlockDevice     = 6,
+    RegularFile     = 8,
+    Symlink         = 10,
+    Socket          = 12,
 }
 impl From<u8> for InodeType {
     fn from(value: u8) -> Self {
@@ -39,15 +39,18 @@ impl From<u8> for InodeType {
     }
 }
 
-#[repr(transparent)]
 pub struct InodeRef<Hal: SystemHal> {
     pub(crate) inner: Box<ext4_inode_ref>,
+    pub(crate) extent_status: ExtentStatusCache,
+    pub(crate) mapping_seq: u64,
     _phantom: PhantomData<Hal>,
 }
 impl<Hal: SystemHal> InodeRef<Hal> {
     pub(crate) fn new(inner: ext4_inode_ref) -> Self {
         Self {
             inner: Box::new(inner),
+            extent_status: ExtentStatusCache::new(),
+            mapping_seq: 0,
             _phantom: PhantomData,
         }
     }
@@ -65,6 +68,10 @@ impl<Hal: SystemHal> InodeRef<Hal> {
 
     pub(crate) fn mark_dirty(&mut self) {
         self.inner.dirty = true;
+    }
+
+    pub(crate) fn invalidate_mapping_seq(&mut self) {
+        self.mapping_seq = self.mapping_seq.wrapping_add(1);
     }
 
     pub(crate) fn inc_nlink(&mut self) {

@@ -1,8 +1,7 @@
 use core::time::Duration;
 
-use crate::{SystemHal, ffi::*, util::get_block_size};
-
 use super::{InodeRef, InodeType};
+use crate::{SystemHal, ffi::*, util::get_block_size};
 
 /// Filesystem node metadata.
 #[derive(Clone, Debug, Default)]

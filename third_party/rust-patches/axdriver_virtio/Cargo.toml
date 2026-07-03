@@ -43,7 +43,11 @@ repository = "https://github.com/arceos-org/axdriver_crates"
 
 [features]
 alloc = ["virtio-drivers/alloc"]
-block = ["axdriver_block"]
+block = [
+    "alloc",
+    "axdriver_block",
+    "axtask",
+]
 gpu = [
     "alloc",
     "axdriver_display",
@@ -52,6 +56,7 @@ input = [
     "alloc",
     "axdriver_input",
 ]
+irq = ["dep:axhal"]
 net = [
     "alloc",
     "axdriver_net",
@@ -86,6 +91,14 @@ optional = true
 
 [dependencies.axdriver_vsock]
 version = "0.1.4-preview.3"
+optional = true
+
+[dependencies.axhal]
+version = "=0.3.0-preview.2"
+optional = true
+
+[dependencies.axtask]
+version = "=0.3.0-preview.2"
 optional = true
 
 [dependencies.log]

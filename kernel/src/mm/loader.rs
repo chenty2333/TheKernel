@@ -184,8 +184,12 @@ impl ElfLoader {
         Self(LRUCache::new())
     }
 
-    fn load(&mut self, uspace: &mut AddrSpace, path: &str) -> AxResult<LoadResult> {
+    fn load_path(&mut self, uspace: &mut AddrSpace, path: &str) -> AxResult<LoadResult> {
         let loc = FS_CONTEXT.lock().resolve(path)?;
+        self.load_location(uspace, loc)
+    }
+
+    fn load_location(&mut self, uspace: &mut AddrSpace, loc: Location) -> AxResult<LoadResult> {
         check_current_execute_permissions(&loc)?;
 
         if !self.0.touch(|e| e.borrow_cache().location().ptr_eq(&loc)) {
@@ -324,18 +328,22 @@ fn try_load_script_with_fallback(
     Err(last_err)
 }
 
-fn permission_denied_script_fallback_allowed(path: &str) -> AxResult<bool> {
-    if !path.ends_with(".sh") {
-        return Ok(false);
-    }
-
-    let loc = FS_CONTEXT.lock().resolve(path)?;
+fn permission_denied_script_fallback_allowed_for_loc(loc: &Location) -> AxResult<bool> {
     let abs_path = loc.absolute_path().map_err(|_| AxError::InvalidInput)?;
     if crate::mounts::is_noexec(abs_path.as_ref()) {
         return Ok(false);
     }
 
     Ok(loc.metadata()?.node_type == NodeType::RegularFile)
+}
+
+fn permission_denied_script_fallback_allowed(path: &str) -> AxResult<bool> {
+    if !path.ends_with(".sh") {
+        return Ok(false);
+    }
+
+    let loc = FS_CONTEXT.lock().resolve(path)?;
+    permission_denied_script_fallback_allowed_for_loc(&loc)
 }
 
 /// Clear the ELF cache.
@@ -345,28 +353,65 @@ pub fn clear_elf_cache() {
     ELF_LOADER.lock().0.clear();
 }
 
-/// Load the user app to the user address space.
-///
-/// # Arguments
-/// - `uspace`: The address space of the user app.
-/// - `args`: The arguments of the user app. The first argument is the path of
-///   the user app.
-/// - `envs`: The environment variables of the user app.
-///
-/// # Returns
-/// - The entry point of the user app.
-/// - The stack pointer of the user app.
-pub fn load_user_app(
+fn install_loaded_user_app(
     uspace: &mut AddrSpace,
-    path: Option<&str>,
+    path: &str,
     args: &[String],
     envs: &[String],
+    entry: VirtAddr,
+    auxv: &[AuxEntry],
 ) -> AxResult<(VirtAddr, VirtAddr)> {
-    let path = path
-        .or_else(|| args.first().map(String::as_str))
-        .ok_or(AxError::InvalidInput)?;
+    let ustack_top = VirtAddr::from_usize(crate::config::USER_STACK_TOP);
+    let ustack_size = crate::config::USER_STACK_SIZE;
+    // Reserve one page at the bottom as an unmapped guard region.
+    // Accessing it triggers a page fault -> SIGSEGV, catching stack overflow.
+    let guard_size = PAGE_SIZE_4K;
+    let ustack_start = ustack_top - ustack_size + guard_size;
+    let ustack_mapped_size = ustack_size - guard_size;
+    debug!(
+        "Mapping user stack: {ustack_start:#x?} -> {ustack_top:#x?} (guard page at {:#x?})",
+        ustack_top - ustack_size
+    );
 
-    let load_result = ELF_LOADER.lock().load(uspace, path);
+    uspace.map(
+        ustack_start,
+        ustack_mapped_size,
+        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
+        false,
+        Backend::new_alloc(ustack_start, PageSize::Size4K),
+    )?;
+
+    let stack_data = app_stack_region(args, envs, auxv, path, ustack_top.into());
+    let user_sp = ustack_top - stack_data.len();
+    let user_sp_aligned = user_sp.align_down_4k();
+    uspace.populate_area(
+        user_sp_aligned,
+        (ustack_top - user_sp_aligned).align_up_4k(),
+        MappingFlags::READ | MappingFlags::WRITE,
+    )?;
+    uspace.write(user_sp, stack_data.as_slice())?;
+
+    let heap_start = VirtAddr::from_usize(crate::config::USER_HEAP_BASE);
+    let heap_size = crate::config::USER_HEAP_SIZE;
+    uspace.map(
+        heap_start,
+        heap_size,
+        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
+        true,
+        Backend::new_alloc(heap_start, PageSize::Size4K),
+    )?;
+
+    Ok((entry, user_sp))
+}
+
+fn finish_load_user_app(
+    uspace: &mut AddrSpace,
+    path: &str,
+    args: &[String],
+    envs: &[String],
+    load_result: AxResult<LoadResult>,
+    fallback_loc: Option<&Location>,
+) -> AxResult<(VirtAddr, VirtAddr)> {
     let (entry, auxv) = match load_result {
         Ok(Ok((entry, auxv))) => (entry, auxv),
         Ok(Err(data)) => {
@@ -404,51 +449,62 @@ pub fn load_user_app(
             }
             return Err(AxError::InvalidExecutable);
         }
-        Err(AxError::PermissionDenied) if permission_denied_script_fallback_allowed(path)? => {
-            return try_load_script_with_fallback(uspace, path, args, envs);
+        Err(AxError::PermissionDenied) => {
+            let fallback_allowed = if path.ends_with(".sh") {
+                match fallback_loc {
+                    Some(loc) => permission_denied_script_fallback_allowed_for_loc(loc)?,
+                    None => permission_denied_script_fallback_allowed(path)?,
+                }
+            } else {
+                false
+            };
+            if fallback_allowed {
+                return try_load_script_with_fallback(uspace, path, args, envs);
+            }
+            return Err(AxError::PermissionDenied);
         }
         Err(err) => return Err(err),
     };
 
-    let ustack_top = VirtAddr::from_usize(crate::config::USER_STACK_TOP);
-    let ustack_size = crate::config::USER_STACK_SIZE;
-    // Reserve one page at the bottom as an unmapped guard region.
-    // Accessing it triggers a page fault → SIGSEGV, catching stack overflow.
-    let guard_size = PAGE_SIZE_4K;
-    let ustack_start = ustack_top - ustack_size + guard_size;
-    let ustack_mapped_size = ustack_size - guard_size;
-    debug!(
-        "Mapping user stack: {ustack_start:#x?} -> {ustack_top:#x?} (guard page at {:#x?})",
-        ustack_top - ustack_size
-    );
+    install_loaded_user_app(uspace, path, args, envs, entry, &auxv)
+}
 
-    uspace.map(
-        ustack_start,
-        ustack_mapped_size,
-        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
-        false,
-        Backend::new_alloc(ustack_start, PageSize::Size4K),
-    )?;
+/// Load the user app to the user address space.
+///
+/// # Arguments
+/// - `uspace`: The address space of the user app.
+/// - `args`: The arguments of the user app. The first argument is the path of
+///   the user app.
+/// - `envs`: The environment variables of the user app.
+///
+/// # Returns
+/// - The entry point of the user app.
+/// - The stack pointer of the user app.
+pub fn load_user_app(
+    uspace: &mut AddrSpace,
+    path: Option<&str>,
+    args: &[String],
+    envs: &[String],
+) -> AxResult<(VirtAddr, VirtAddr)> {
+    let path = path
+        .or_else(|| args.first().map(String::as_str))
+        .ok_or(AxError::InvalidInput)?;
 
-    let stack_data = app_stack_region(args, envs, &auxv, path, ustack_top.into());
-    let user_sp = ustack_top - stack_data.len();
-    let user_sp_aligned = user_sp.align_down_4k();
-    uspace.populate_area(
-        user_sp_aligned,
-        (ustack_top - user_sp_aligned).align_up_4k(),
-        MappingFlags::READ | MappingFlags::WRITE,
-    )?;
-    uspace.write(user_sp, stack_data.as_slice())?;
+    let load_result = ELF_LOADER.lock().load_path(uspace, path);
+    finish_load_user_app(uspace, path, args, envs, load_result, None)
+}
 
-    let heap_start = VirtAddr::from_usize(crate::config::USER_HEAP_BASE);
-    let heap_size = crate::config::USER_HEAP_SIZE;
-    uspace.map(
-        heap_start,
-        heap_size,
-        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
-        true,
-        Backend::new_alloc(heap_start, PageSize::Size4K),
-    )?;
-
-    Ok((entry, user_sp))
+/// Load an already resolved executable location into the user address space.
+///
+/// This is used by execve after permission checks and executable-write
+/// exclusion have been performed on the same inode.
+pub fn load_user_app_at(
+    uspace: &mut AddrSpace,
+    loc: Location,
+    path: &str,
+    args: &[String],
+    envs: &[String],
+) -> AxResult<(VirtAddr, VirtAddr)> {
+    let load_result = ELF_LOADER.lock().load_location(uspace, loc.clone());
+    finish_load_user_app(uspace, path, args, envs, load_result, Some(&loc))
 }

@@ -67,7 +67,7 @@ fxmac = [
     "dep:axdma",
 ]
 input = ["dep:axdriver_input"]
-irq = []
+irq = ["axdriver_virtio?/irq"]
 ixgbe = [
     "net",
     "axdriver_net/ixgbe",

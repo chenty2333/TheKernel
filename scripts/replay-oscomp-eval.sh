@@ -11,6 +11,8 @@ ARCH=""
 IMAGE_PATH=""
 SUPPORT_IMAGE_OVERRIDE=""
 SUPPORT_IMAGE_SOURCE=""
+EXTRA_BLOCK_IMAGE_OVERRIDE=""
+EXTRA_BLOCK_IMAGE_SOURCE=""
 TIMEOUT_SECS=7000
 WORKDIR=""
 QEMU_LOG_OVERRIDE=""
@@ -48,6 +50,7 @@ Options:
   --arch {rv|la}        Target architecture
   --image IMG[.xz|.gz]  Override the official testsuite image
   --support-image IMG    Override the support disk image (default: disk-rv.img for rv, disk-la.img for la)
+  --extra-block-image IMG Attach an additional disposable raw block image
   --timeout SECS        Whole-QEMU timeout in seconds; use 0 to disable (default: $TIMEOUT_SECS)
   --workdir DIR         Working directory for decompressed/copied images
   --log PATH            Console log path (default: WORKDIR/qemu.log)
@@ -69,6 +72,10 @@ while (($#)); do
             ;;
         --support-image)
             SUPPORT_IMAGE_OVERRIDE=${2:-}
+            shift 2
+            ;;
+        --extra-block-image)
+            EXTRA_BLOCK_IMAGE_OVERRIDE=${2:-}
             shift 2
             ;;
         --timeout)
@@ -241,6 +248,11 @@ else
     fi
 fi
 
+if [ -n "$EXTRA_BLOCK_IMAGE_OVERRIDE" ]; then
+    [ -f "$EXTRA_BLOCK_IMAGE_OVERRIDE" ] || die "extra block image does not exist: $EXTRA_BLOCK_IMAGE_OVERRIDE"
+    EXTRA_BLOCK_IMAGE_SOURCE="$EXTRA_BLOCK_IMAGE_OVERRIDE"
+fi
+
 if [ "$SKIP_KERNEL_BUILD" -eq 0 ]; then
     require_cmd make
     (cd "$REPO_ROOT" && make "$KERNEL_NAME")
@@ -277,6 +289,13 @@ if [ -n "$SUPPORT_IMAGE_SOURCE" ]; then
     SUPPORT_IMAGE_RUNTIME=$(prepare_image \
         "$SUPPORT_IMAGE_SOURCE" \
         "$(basename -- "${SUPPORT_IMAGE_SOURCE%.xz}")" \
+        1)
+fi
+EXTRA_BLOCK_IMAGE_RUNTIME=""
+if [ -n "$EXTRA_BLOCK_IMAGE_SOURCE" ]; then
+    EXTRA_BLOCK_IMAGE_RUNTIME=$(prepare_image \
+        "$EXTRA_BLOCK_IMAGE_SOURCE" \
+        "$(basename -- "${EXTRA_BLOCK_IMAGE_SOURCE%.xz}")" \
         1)
 fi
 
@@ -318,6 +337,12 @@ if [ "$ARCH" = "rv" ]; then
             -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
         )
     fi
+    if [ -n "$EXTRA_BLOCK_IMAGE_RUNTIME" ]; then
+        QEMU_CMD+=(
+            -drive "file=$EXTRA_BLOCK_IMAGE_RUNTIME,if=none,format=raw,id=x2"
+            -device virtio-blk-device,drive=x2,bus=virtio-mmio-bus.2
+        )
+    fi
 else
     QEMU_CMD=(
         qemu-system-loongarch64
@@ -336,6 +361,12 @@ else
         QEMU_CMD+=(
             -drive "file=$SUPPORT_IMAGE_RUNTIME,if=none,format=raw,id=x1"
             -device virtio-blk-pci,drive=x1
+        )
+    fi
+    if [ -n "$EXTRA_BLOCK_IMAGE_RUNTIME" ]; then
+        QEMU_CMD+=(
+            -drive "file=$EXTRA_BLOCK_IMAGE_RUNTIME,if=none,format=raw,id=x2"
+            -device virtio-blk-pci,drive=x2
         )
     fi
 fi

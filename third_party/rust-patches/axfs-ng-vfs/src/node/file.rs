@@ -10,8 +10,78 @@ pub trait FileNodeOps: NodeOps + Pollable {
     /// Reads a number of bytes starting from a given offset.
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize>;
 
+    /// Reads data into a scatter list starting from a given offset.
+    fn read_at_vectored(&self, bufs: &mut [&mut [u8]], mut offset: u64) -> VfsResult<usize> {
+        let mut total = 0usize;
+        for buf in bufs.iter_mut() {
+            if buf.is_empty() {
+                continue;
+            }
+            let requested = buf.len();
+            let read = self.read_at(buf, offset)?;
+            total += read;
+            offset = offset
+                .checked_add(read as u64)
+                .ok_or(VfsError::InvalidInput)?;
+            if read < requested || read == 0 {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Attempts to read data into a scatter list through an asynchronous
+    /// lower-device path.
+    ///
+    /// Implementations must return only after accepted device requests have
+    /// completed, but may split submit and wait internally to avoid holding
+    /// filesystem locks across a blocking wait. `Ok(None)` means the caller
+    /// should use [`read_at_vectored`](Self::read_at_vectored).
+    fn try_read_at_vectored_async(
+        &self,
+        bufs: &mut [&mut [u8]],
+        offset: u64,
+    ) -> VfsResult<Option<usize>> {
+        let _ = bufs;
+        let _ = offset;
+        Ok(None)
+    }
+
     /// Writes a number of bytes starting from a given offset.
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize>;
+
+    /// Writes data from a scatter list starting from a given offset.
+    fn write_at_vectored(&self, bufs: &[&[u8]], mut offset: u64) -> VfsResult<usize> {
+        let mut total = 0usize;
+        for buf in bufs.iter().copied() {
+            if buf.is_empty() {
+                continue;
+            }
+            let requested = buf.len();
+            let written = self.write_at(buf, offset)?;
+            total += written;
+            offset = offset
+                .checked_add(written as u64)
+                .ok_or(VfsError::InvalidInput)?;
+            if written < requested || written == 0 {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Attempts to write data from a scatter list through an asynchronous
+    /// lower-device path.
+    ///
+    /// Implementations must return only after accepted device requests have
+    /// completed, but may split submit and wait internally to avoid holding
+    /// filesystem locks across a blocking wait. `Ok(None)` means the caller
+    /// should use [`write_at_vectored`](Self::write_at_vectored).
+    fn try_write_at_vectored_async(&self, bufs: &[&[u8]], offset: u64) -> VfsResult<Option<usize>> {
+        let _ = bufs;
+        let _ = offset;
+        Ok(None)
+    }
 
     /// Appends data to the file.
     ///

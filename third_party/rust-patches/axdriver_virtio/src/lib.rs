@@ -38,16 +38,34 @@ pub use self::net::VirtIoNetDev;
 
 #[cfg(feature = "socket")]
 mod socket;
-#[cfg(feature = "socket")]
-pub use self::socket::VirtIoSocketDev;
-
-pub use virtio_drivers::transport::pci::bus as pci;
-pub use virtio_drivers::transport::{mmio::MmioTransport, pci::PciTransport, Transport};
-pub use virtio_drivers::{BufferDirection, Hal as VirtIoHal, PhysAddr};
-
-use self::pci::{DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axdriver_base::{DevError, DeviceType};
 use virtio_drivers::transport::DeviceType as VirtIoDevType;
+pub use virtio_drivers::{
+    BufferDirection, Hal as VirtIoHal, PhysAddr,
+    stats::{
+        AsyncBlockWaitPolicy, VirtioIoCounters, async_block_enabled as virtio_async_block_enabled,
+        async_block_wait_policy as virtio_async_block_wait_policy,
+        io_counters_snapshot as virtio_io_counters_snapshot,
+        reset_async_block_adaptive_depth as reset_virtio_async_block_adaptive_depth,
+        reset_io_counters as reset_virtio_io_counters,
+        set_async_block_adaptive_enabled as set_virtio_async_block_adaptive_enabled,
+        set_async_block_depth as set_virtio_async_block_depth,
+        set_async_block_enabled as set_virtio_async_block_enabled,
+        set_async_block_la_depth as set_virtio_async_block_la_depth,
+        set_async_block_merge_write_enabled as set_virtio_async_block_merge_write_enabled,
+        set_async_block_wait_policy as set_virtio_async_block_wait_policy,
+        set_io_counters_enabled as set_virtio_io_counters_enabled,
+    },
+    transport::{
+        Transport,
+        mmio::MmioTransport,
+        pci::{PciTransport, bus as pci},
+    },
+};
+
+use self::pci::{DeviceFunction, DeviceFunctionInfo, PciRoot};
+#[cfg(feature = "socket")]
+pub use self::socket::VirtIoSocketDev;
 
 /// Try to probe a VirtIO MMIO device from the given memory region.
 ///
@@ -58,6 +76,7 @@ pub fn probe_mmio_device(
     _reg_size: usize,
 ) -> Option<(DeviceType, MmioTransport)> {
     use core::ptr::NonNull;
+
     use virtio_drivers::transport::mmio::VirtIOHeader;
 
     let header = NonNull::new(reg_base as *mut VirtIOHeader).unwrap();
@@ -106,8 +125,7 @@ const fn as_dev_type(t: VirtIoDevType) -> Option<DeviceType> {
 
 #[allow(dead_code)]
 const fn as_dev_err(e: virtio_drivers::Error) -> DevError {
-    use virtio_drivers::device::socket::SocketError::*;
-    use virtio_drivers::Error::*;
+    use virtio_drivers::{Error::*, device::socket::SocketError::*};
     match e {
         QueueFull => DevError::BadState,
         NotReady => DevError::Again,
@@ -123,9 +141,7 @@ const fn as_dev_err(e: virtio_drivers::Error) -> DevError {
             ConnectionExists => DevError::AlreadyExists,
             NotConnected => DevError::BadState,
             InvalidOperation | InvalidNumber | UnknownOperation(_) => DevError::InvalidParam,
-            OutputBufferTooShort(_) | BufferTooShort | BufferTooLong(_, _) => {
-                DevError::InvalidParam
-            }
+            OutputBufferTooShort(_) | BufferTooShort | BufferTooLong(..) => DevError::InvalidParam,
             UnexpectedDataInPacket | PeerSocketShutdown | NoResponseReceived | ConnectionFailed => {
                 DevError::Io
             }

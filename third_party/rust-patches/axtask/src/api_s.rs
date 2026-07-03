@@ -10,6 +10,11 @@ pub fn yield_now() {
     }
 }
 
+/// Returns whether the current single-task context may block.
+pub fn can_block_current() -> bool {
+    false
+}
+
 /// For single-task situation, we just busy wait for the given duration.
 pub fn sleep(dur: core::time::Duration) {
     axhal::time::busy_wait(dur);

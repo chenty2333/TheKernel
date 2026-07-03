@@ -17,16 +17,19 @@ const EXT4_CONFIG: FsConfig = FsConfig { bcache_size: 2048 };
 
 pub struct Ext4Filesystem {
     inner: Mutex<LwExt4Filesystem>,
+    disk: Ext4Disk,
     root_dir: OnceCell<DirEntry>,
 }
 
 impl Ext4Filesystem {
     pub fn new(dev: AxBlockDevice) -> VfsResult<Filesystem> {
+        let disk = Ext4Disk::new(dev);
         let ext4 =
-            lwext4_rust::Ext4Filesystem::new(Ext4Disk(dev), EXT4_CONFIG).map_err(into_vfs_err)?;
+            lwext4_rust::Ext4Filesystem::new(disk.clone(), EXT4_CONFIG).map_err(into_vfs_err)?;
 
         let fs = Arc::new(Self {
             inner: Mutex::new(ext4),
+            disk,
             root_dir: OnceCell::new(),
         });
         let _ = fs.root_dir.set(DirEntry::new_dir(
@@ -38,6 +41,20 @@ impl Ext4Filesystem {
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, LwExt4Filesystem> {
         self.inner.lock()
+    }
+
+    pub(crate) fn wait_async_write(
+        &self,
+        submission: &lwext4_rust::AsyncWriteSubmission,
+    ) -> VfsResult<()> {
+        self.disk.wait_async_write(submission).map_err(into_vfs_err)
+    }
+
+    pub(crate) fn wait_async_read(
+        &self,
+        submission: &lwext4_rust::AsyncReadSubmission,
+    ) -> VfsResult<()> {
+        self.disk.wait_async_read(submission).map_err(into_vfs_err)
     }
 }
 

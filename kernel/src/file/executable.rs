@@ -24,6 +24,24 @@ pub(crate) fn acquire(loc: &Location) -> Option<ExecutableKey> {
     retain(key(loc))
 }
 
+pub(crate) fn acquire_if_not_write_open(loc: &Location) -> AxResult<Option<ExecutableKey>> {
+    let Some(key) = key(loc) else {
+        return Ok(None);
+    };
+
+    let mut active = ACTIVE_EXECUTABLES.lock();
+    if WRITE_OPEN_FILES
+        .lock()
+        .get(&key)
+        .is_some_and(|count| *count != 0)
+    {
+        return Err(LinuxError::ETXTBSY.into());
+    }
+
+    *active.entry(key).or_insert(0) += 1;
+    Ok(Some(key))
+}
+
 pub(crate) fn retain(key: Option<ExecutableKey>) -> Option<ExecutableKey> {
     let key = key?;
     let mut active = ACTIVE_EXECUTABLES.lock();

@@ -163,7 +163,13 @@ impl CowBackend {
             file.read_at(&mut &mut buf[start..start + max_read], file_start)?;
             let tail_start = start + max_read;
             if tail_start < buf.len() {
-                unsafe { core::ptr::write_bytes(buf.as_mut_ptr().add(tail_start), 0, buf.len() - tail_start) };
+                unsafe {
+                    core::ptr::write_bytes(
+                        buf.as_mut_ptr().add(tail_start),
+                        0,
+                        buf.len() - tail_start,
+                    )
+                };
             }
         }
         pt.map(vaddr, frame, self.size, page_table_flags(flags))?;

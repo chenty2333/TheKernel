@@ -201,11 +201,21 @@ add_preload_if_present() {
 
 cleanup_after_group() {
     for mount_dir in /musl/basic/mnt /glibc/basic/mnt; do
-        bb umount "$mount_dir" >/dev/null 2>&1 || true
+        cleanup_cmd "$BUSYBOX" umount "$mount_dir"
     done
-    for proc in iperf3 netserver hackbench cyclictest iozone; do
-        bb killall -9 "$proc" >/dev/null 2>&1 || true
+    for proc in iperf3 netserver hackbench cyclictest iozone lmbench_all lat_ctx lat_proc lat_syscall lat_pipe lat_pagefault bw_file_rd bw_file_wr bw_mmap_rd bw_pipe; do
+        cleanup_cmd "$BUSYBOX" killall -9 "$proc"
     done
+    cleanup_cmd "$BUSYBOX" rm -f /var/tmp/XXX /tmp/XXX
+}
+
+cleanup_cmd() {
+    timeout_secs="${OSCOMP_CLEANUP_TIMEOUT_SECS:-3}"
+    if [ -x /opt/oscomp-support/bin/oscomp-timeout ]; then
+        /opt/oscomp-support/bin/oscomp-timeout "$timeout_secs" "$@" >/dev/null 2>&1 || true
+    else
+        "$@" >/dev/null 2>&1 || true
+    fi
 }
 
 cleanup_after_ltp_case() {
@@ -214,7 +224,7 @@ cleanup_after_ltp_case() {
         case "$mount_dir" in
             /tmp/LTP_*|/var/tmp/LTP_*)
                 ltp_mounts="$mount_dir $ltp_mounts"
-                ;;
+            ;;
         esac
     done < /proc/mounts
     for mount_dir in $ltp_mounts; do
@@ -563,9 +573,21 @@ io_stats_capture_enabled() {
     esac
 }
 
+io_stats_virtio_capture_enabled() {
+    case "${OSCOMP_VIRTIO_STATS_CAPTURE:-0}" in
+        1|y|Y|yes|YES|true|TRUE|on|ON)
+            [ -e /proc/io_stats ]
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 io_stats_capture_start() {
     io_stats_capture_enabled || return 0
     echo on > /proc/io_stats 2>/dev/null || return 0
+    io_stats_virtio_capture_enabled && echo virtio_on > /proc/io_stats 2>/dev/null || true
     echo reset > /proc/io_stats 2>/dev/null || true
     echo "#### OSCOMP IO_STATS CAPTURE START ####"
 }
@@ -576,6 +598,68 @@ io_stats_capture_finish() {
     cat /proc/io_stats 2>/dev/null || true
     echo "#### OSCOMP IO_STATS CAPTURE END ####"
     echo off > /proc/io_stats 2>/dev/null || true
+}
+
+configure_async_block_default() {
+    [ -e /proc/io_stats ] || return 0
+
+    case "${OSCOMP_ASYNC_BLOCK:-auto}" in
+        0|n|N|no|NO|false|FALSE|off|OFF)
+            OSCOMP_ASYNC_BLOCK=off
+            export OSCOMP_ASYNC_BLOCK
+            echo async_block_off > /proc/io_stats 2>/dev/null || true
+            return 0
+            ;;
+        1|y|Y|yes|YES|true|TRUE|on|ON)
+            OSCOMP_ASYNC_BLOCK=on
+            export OSCOMP_ASYNC_BLOCK
+            ;;
+        auto|AUTO|"")
+            [ "$OSCOMP_ARCH" = rv ] || {
+                OSCOMP_ASYNC_BLOCK=off
+                export OSCOMP_ASYNC_BLOCK
+                echo async_block_off > /proc/io_stats 2>/dev/null || true
+                return 0
+            }
+            OSCOMP_ASYNC_BLOCK=on
+            export OSCOMP_ASYNC_BLOCK
+            ;;
+        *)
+            ;;
+    esac
+
+    echo async_block_on > /proc/io_stats 2>/dev/null || true
+    echo async_block_wait=hybrid > /proc/io_stats 2>/dev/null || true
+    if [ -n "${OSCOMP_ASYNC_BLOCK_DEPTH:-}" ]; then
+        echo "async_block_depth=${OSCOMP_ASYNC_BLOCK_DEPTH}" > /proc/io_stats 2>/dev/null || true
+    elif [ "$OSCOMP_ARCH" = rv ]; then
+        echo async_block_depth=4 > /proc/io_stats 2>/dev/null || true
+    fi
+    [ -n "${OSCOMP_ASYNC_BLOCK_LA_DEPTH:-}" ] && \
+        echo "async_block_la_depth=${OSCOMP_ASYNC_BLOCK_LA_DEPTH}" > /proc/io_stats 2>/dev/null || true
+    case "${OSCOMP_ASYNC_DIRTY_FLUSH_SG:-auto}" in
+        1|y|Y|yes|YES|true|TRUE|on|ON)
+            OSCOMP_ASYNC_DIRTY_FLUSH_SG=on
+            export OSCOMP_ASYNC_DIRTY_FLUSH_SG
+            echo async_dirty_flush_sg_on > /proc/io_stats 2>/dev/null || true
+            ;;
+        auto|AUTO|"")
+            if [ "$OSCOMP_ARCH" = rv ]; then
+                OSCOMP_ASYNC_DIRTY_FLUSH_SG=on
+                export OSCOMP_ASYNC_DIRTY_FLUSH_SG
+                echo async_dirty_flush_sg_on > /proc/io_stats 2>/dev/null || true
+            else
+                OSCOMP_ASYNC_DIRTY_FLUSH_SG=off
+                export OSCOMP_ASYNC_DIRTY_FLUSH_SG
+                echo async_dirty_flush_sg_off > /proc/io_stats 2>/dev/null || true
+            fi
+            ;;
+        *)
+            OSCOMP_ASYNC_DIRTY_FLUSH_SG=off
+            export OSCOMP_ASYNC_DIRTY_FLUSH_SG
+            echo async_dirty_flush_sg_off > /proc/io_stats 2>/dev/null || true
+            ;;
+    esac
 }
 
 run_group() {
@@ -694,6 +778,7 @@ if boot_shell_requested; then
 fi
 RUN_START_SECS=$(oscomp_elapsed_clock_secs)
 export RUN_START_SECS
+configure_async_block_default
 io_stats_capture_start
 run_plan_file /etc/oscomp-plan.txt || run_default_plan
 io_stats_capture_finish

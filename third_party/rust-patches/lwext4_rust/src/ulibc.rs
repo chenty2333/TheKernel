@@ -10,7 +10,7 @@ mod uprint {
 
         let mut s = alloc::string::String::new();
         let bytes_written = unsafe { format(str as _, args, output::fmt_write(&mut s)) };
-        //println!("{}", s);
+        // println!("{}", s);
         info!("{}", s);
 
         bytes_written
@@ -22,7 +22,7 @@ mod uprint {
     unsafe extern "C" fn printf(str: *const c_char, _args: ...) -> c_int {
         use core::ffi::CStr;
         let c_str = unsafe { CStr::from_ptr(str) };
-        //let arg1 = args.arg::<usize>();
+        // let arg1 = args.arg::<usize>();
 
         info!("[lwext4] {:?}", c_str);
         0
@@ -30,10 +30,14 @@ mod uprint {
 }
 
 mod ualloc {
-    use alloc::alloc::{Layout, alloc, dealloc};
-    use alloc::slice::from_raw_parts_mut;
-    use core::cmp::min;
-    use core::ffi::{c_int, c_size_t, c_void};
+    use alloc::{
+        alloc::{Layout, alloc, dealloc},
+        slice::from_raw_parts_mut,
+    };
+    use core::{
+        cmp::min,
+        ffi::{c_int, c_size_t, c_void},
+    };
 
     #[unsafe(no_mangle)]
     pub extern "C" fn ext4_user_calloc(m: c_size_t, n: c_size_t) -> *mut c_void {
@@ -81,7 +85,7 @@ mod ualloc {
         unsafe {
             let ptr = alloc(layout);
             assert!(!ptr.is_null(), "malloc failed");
-            //debug!("malloc {}@{:p}", size + CTRL_BLK_SIZE, ptr);
+            // debug!("malloc {}@{:p}", size + CTRL_BLK_SIZE, ptr);
 
             let ptr = ptr.cast::<MemoryControlBlock>();
             ptr.write(MemoryControlBlock { size });
@@ -96,7 +100,7 @@ mod ualloc {
             warn!("free a null pointer !");
             return;
         }
-        //debug!("free pointer {:p}", ptr);
+        // debug!("free pointer {:p}", ptr);
 
         let ptr = ptr.cast::<MemoryControlBlock>();
         assert!(ptr as usize > CTRL_BLK_SIZE, "free a null pointer"); // ?
