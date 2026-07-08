@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
 
 ARCH=rv
 WORKDIR=""
@@ -103,41 +105,13 @@ elif [[ "$EXTRA_IMAGE" != /* ]]; then
     EXTRA_IMAGE="$REPO_ROOT/$EXTRA_IMAGE"
 fi
 
-case "$ARCH" in
-    rv) KERNEL_TARGET=kernel-rv ;;
-    la) KERNEL_TARGET=kernel-la ;;
-esac
-
 cd "$REPO_ROOT"
 mkdir -p "$REPO_ROOT/.state/async-irq-first-current"
-SMOKE_ENV_FILE="$REPO_ROOT/.state/async-irq-first-current/smoke-support.env"
-if [ ! -f "$SMOKE_ENV_FILE" ] || ! grep -qx 'OSCOMP_BOOT_SHELL=1' "$SMOKE_ENV_FILE"; then
-    printf 'OSCOMP_BOOT_SHELL=1\n' >"$SMOKE_ENV_FILE"
-fi
-
-support_image_needs_rebuild() {
-    [ ! -f "$SUPPORT_IMAGE" ] && return 0
-    [ "$SUPPORT_IMAGE_EXPLICIT" -eq 1 ] && return 1
-    [ "$REPO_ROOT/scripts/build-oscomp-support-disk.sh" -nt "$SUPPORT_IMAGE" ] && return 0
-    [ "$SMOKE_ENV_FILE" -nt "$SUPPORT_IMAGE" ] && return 0
-    find "$REPO_ROOT/scripts/support-tools" -type f -newer "$SUPPORT_IMAGE" | grep -q .
-}
-
-if support_image_needs_rebuild; then
-    mkdir -p "$(dirname -- "$SUPPORT_IMAGE")"
-    "$REPO_ROOT/scripts/build-oscomp-support-disk.sh" \
-        --arch "$ARCH" \
-        --output "$SUPPORT_IMAGE" \
-        --env-override "$SMOKE_ENV_FILE" >/dev/null
-fi
+smoke_build_support_image_if_needed "$ARCH" "$SUPPORT_IMAGE" "$SUPPORT_IMAGE_EXPLICIT"
 
 mkdir -p "$(dirname -- "$EXTRA_IMAGE")"
 rm -f "$EXTRA_IMAGE"
 truncate -s 8M "$EXTRA_IMAGE"
-
-if [ "$SKIP_KERNEL_BUILD" -eq 0 ] || [ ! -f "$REPO_ROOT/$KERNEL_TARGET" ]; then
-    make "$KERNEL_TARGET"
-fi
 
 rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR"
@@ -169,6 +143,7 @@ echo ASYNC_IRQ_FIRST_SMOKE_DONE
 exit
 EOF
 
+readarray -d '' -t kernel_args < <(smoke_replay_kernel_args "$ARCH" "$SKIP_KERNEL_BUILD")
 (
     sleep "$BOOT_WAIT_SECS"
     while IFS= read -r line; do
@@ -177,13 +152,13 @@ EOF
     done <"$COMMANDS_FILE"
 ) | python3 -m tools.oscomp_eval.replay qemu \
     --arch "$ARCH" \
+    "${kernel_args[@]}" \
     --support-image "$SUPPORT_IMAGE" \
     --extra-block-image "$EXTRA_IMAGE" \
     --timeout "$TIMEOUT_SECS" \
     --workdir "$WORKDIR" \
     --keep-workdir \
-    --interactive \
-    $([ "$SKIP_KERNEL_BUILD" -eq 1 ] && printf '%s\n' --skip-kernel-build)
+    --interactive
 
 LOG="$WORKDIR/qemu.log"
 [ -f "$LOG" ] || die "missing QEMU log: $LOG"

@@ -53,6 +53,9 @@ class ScoreLogsTests(unittest.TestCase):
             self.assertFalse(result.score.has_errors)
             self.assertEqual(result.status, "complete")
             score_json = json.loads((run_dir / "score.json").read_text())
+            self.assertEqual(score_json["run"]["mode"], "score-logs")
+            self.assertEqual(score_json["run"]["name"], "unit")
+            self.assertEqual(score_json["run"]["arches"], ["rv"])
             self.assertEqual(
                 score_json["group_totals"]["rv/basic-musl"]["json_path"],
                 "rv/judges/basic-musl.json",

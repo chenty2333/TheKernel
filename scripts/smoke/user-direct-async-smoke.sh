@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
 
 ARCH=rv
 WORKDIR=""
@@ -78,64 +80,9 @@ while (($#)); do
     esac
 done
 
-case "$ARCH" in
-    rv|la) ;;
-    *) die "--arch must be rv or la" ;;
-esac
-
-case "$WAIT_POLICY" in
-    hybrid|irq_first) ;;
-    interrupt_first) WAIT_POLICY=irq_first ;;
-    *) die "--wait-policy must be hybrid or irq_first" ;;
-esac
-
-case "$TIMEOUT_SECS" in
-    ''|*[!0-9]*) die "--timeout must be a non-negative integer" ;;
-esac
-
-if [ -z "$WORKDIR" ]; then
-    WORKDIR="$REPO_ROOT/.state/user-direct-async-current/auto-smoke-$ARCH"
-elif [[ "$WORKDIR" != /* ]]; then
-    WORKDIR="$REPO_ROOT/$WORKDIR"
-fi
-
-if [ -z "$SUPPORT_IMAGE" ]; then
-    SUPPORT_IMAGE="$REPO_ROOT/.state/user-direct-async-current/support-$ARCH.img"
-elif [[ "$SUPPORT_IMAGE" != /* ]]; then
-    SUPPORT_IMAGE="$REPO_ROOT/$SUPPORT_IMAGE"
-fi
-
-case "$ARCH" in
-    rv) KERNEL_TARGET=kernel-rv ;;
-    la) KERNEL_TARGET=kernel-la ;;
-esac
-
 cd "$REPO_ROOT"
 mkdir -p "$REPO_ROOT/.state/user-direct-async-current"
-SMOKE_ENV_FILE="$REPO_ROOT/.state/user-direct-async-current/smoke-support.env"
-if [ ! -f "$SMOKE_ENV_FILE" ] || ! grep -qx 'OSCOMP_BOOT_SHELL=1' "$SMOKE_ENV_FILE"; then
-    printf 'OSCOMP_BOOT_SHELL=1\n' >"$SMOKE_ENV_FILE"
-fi
-
-support_image_needs_rebuild() {
-    [ ! -f "$SUPPORT_IMAGE" ] && return 0
-    [ "$SUPPORT_IMAGE_EXPLICIT" -eq 1 ] && return 1
-    [ "$REPO_ROOT/scripts/build-oscomp-support-disk.sh" -nt "$SUPPORT_IMAGE" ] && return 0
-    [ "$SMOKE_ENV_FILE" -nt "$SUPPORT_IMAGE" ] && return 0
-    find "$REPO_ROOT/scripts/support-tools" -type f -newer "$SUPPORT_IMAGE" | grep -q .
-}
-
-if support_image_needs_rebuild; then
-    mkdir -p "$(dirname -- "$SUPPORT_IMAGE")"
-    "$REPO_ROOT/scripts/build-oscomp-support-disk.sh" \
-        --arch "$ARCH" \
-        --output "$SUPPORT_IMAGE" \
-        --env-override "$SMOKE_ENV_FILE" >/dev/null
-fi
-
-if [ "$SKIP_KERNEL_BUILD" -eq 0 ] || [ ! -f "$REPO_ROOT/$KERNEL_TARGET" ]; then
-    make "$KERNEL_TARGET"
-fi
+smoke_build_support_image_if_needed "$ARCH" "$SUPPORT_IMAGE" "$SUPPORT_IMAGE_EXPLICIT"
 
 rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR"
@@ -171,6 +118,7 @@ else
     sed -i "s/__ASYNC_DIRECT_ARG__/--async-direct-no-signal/g" "$COMMANDS_FILE"
 fi
 
+readarray -d '' -t kernel_args < <(smoke_replay_kernel_args "$ARCH" "$SKIP_KERNEL_BUILD")
 (
     sleep "$BOOT_WAIT_SECS"
     while IFS= read -r line; do
@@ -179,12 +127,12 @@ fi
     done <"$COMMANDS_FILE"
 ) | python3 -m tools.oscomp_eval.replay qemu \
     --arch "$ARCH" \
+    "${kernel_args[@]}" \
     --support-image "$SUPPORT_IMAGE" \
     --timeout "$TIMEOUT_SECS" \
     --workdir "$WORKDIR" \
     --keep-workdir \
-    --interactive \
-    $([ "$SKIP_KERNEL_BUILD" -eq 1 ] && printf '%s\n' --skip-kernel-build)
+    --interactive
 
 LOG="$WORKDIR/qemu.log"
 [ -f "$LOG" ] || die "missing QEMU log: $LOG"

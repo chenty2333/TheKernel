@@ -11,11 +11,12 @@ from unittest.mock import patch
 
 from tools.oscomp_eval import cli
 from tools.oscomp_eval.cli import evaluate_exit_code
-from tools.oscomp_eval.evaluate import evaluate_replay, score_with_extra_issues
 from tools.oscomp_eval.replay import (
     build_qemu_command,
+    evaluate_replay,
     prepare_image,
     run_replay,
+    score_with_extra_issues,
 )
 from tools.oscomp_eval.scoring import score_judge_summaries
 
@@ -206,6 +207,60 @@ class EvaluateHelpersTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_evaluate_cmd_uses_full_replay_timeout_by_default(self) -> None:
+        from argparse import Namespace
+        from tools.oscomp_eval.config import REPLAY_TIMEOUT_FULL_SECS
+
+        captured: dict[str, object] = {}
+
+        def fake_evaluate_replay(**kwargs):
+            captured.update(kwargs)
+            from tools.oscomp_eval.replay import ReplayRunResult
+            from tools.oscomp_eval.schemas import ScoreSummary
+
+            score = ScoreSummary(
+                total_score=0.0,
+                non_ltp_score=0.0,
+                ltp_raw_total=0.0,
+                ltp_score=0.0,
+                arch_totals={},
+                libc_totals={},
+                ltp_group_totals={},
+                group_totals={},
+                issues=(),
+            )
+            return ReplayRunResult(
+                run_dir=Path("."),
+                replays=(),
+                judge_summaries=(),
+                score=score,
+                status="complete",
+            )
+
+        args = Namespace(
+            rv_log=None,
+            la_log=None,
+            ltp_list=None,
+            support_image=None,
+            arch="rv",
+            timeout=None,
+            idle_timeout=None,
+            image=None,
+            plan=None,
+            skip_kernel_build=True,
+            name="unit-timeout-default",
+            out=None,
+            judge_dir=None,
+            judge_timeout=30,
+            fail_fast=False,
+            replace=False,
+        )
+
+        with patch("tools.oscomp_eval.cli.evaluate_replay", side_effect=fake_evaluate_replay):
+            self.assertEqual(cli.evaluate_cmd(args), 0)
+
+        self.assertEqual(captured["timeout_secs"], REPLAY_TIMEOUT_FULL_SECS)
+
     def test_main_returns_130_on_keyboard_interrupt(self) -> None:
         class Args:
             @staticmethod

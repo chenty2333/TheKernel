@@ -11,10 +11,11 @@ from pathlib import Path
 from .config import (
     ConfigError,
     JUDGE_TIMEOUT_SECS,
+    REPLAY_TIMEOUT_FULL_SECS,
     canonical_arch,
     group_libc_matrix_from_plan,
 )
-from .evaluate import evaluate_replay
+from .replay import evaluate_replay
 from .judge_runner import JudgeRunnerError, judge_log
 from .markers import MarkerError, compatible_summary, parse_log, write_artifacts
 from .provenance import ProvenanceError, refresh_official_snapshot
@@ -195,7 +196,9 @@ def evaluate_cmd(args: argparse.Namespace) -> int:
             name=args.name,
             arch=args.arch,
             run_dir=Path(args.out).expanduser() if args.out else None,
-            timeout_secs=args.timeout,
+            timeout_secs=args.timeout
+            if args.timeout is not None
+            else REPLAY_TIMEOUT_FULL_SECS,
             idle_timeout_secs=args.idle_timeout,
             image=Path(args.image).expanduser() if args.image else None,
             support_image=Path(args.support_image).expanduser()

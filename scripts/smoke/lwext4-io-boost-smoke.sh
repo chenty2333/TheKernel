@@ -3,16 +3,17 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
 
 ARCH=rv
 WORKDIR=""
 SUPPORT_IMAGE=""
 SUPPORT_IMAGE_EXPLICIT=0
-TIMEOUT_SECS=240
+TIMEOUT_SECS=${OSCOMP_SMOKE_TIMEOUT_SECS:-$SMOKE_REPLAY_TIMEOUT_SECS}
 BOOT_WAIT_SECS=${OSCOMP_SMOKE_BOOT_WAIT_SECS:-35}
 LINE_DELAY_SECS=${OSCOMP_SMOKE_LINE_DELAY_SECS:-0.75}
 SKIP_KERNEL_BUILD=1
-SMOKE_ENV_FILE=""
 
 usage() {
     cat <<EOF
@@ -104,37 +105,9 @@ elif [[ "$SUPPORT_IMAGE" != /* ]]; then
     SUPPORT_IMAGE="$REPO_ROOT/$SUPPORT_IMAGE"
 fi
 
-case "$ARCH" in
-    rv) KERNEL_TARGET=kernel-rv ;;
-    la) KERNEL_TARGET=kernel-la ;;
-esac
-
 cd "$REPO_ROOT"
 mkdir -p "$REPO_ROOT/.state/lwext4-io-boost-current"
-SMOKE_ENV_FILE="$REPO_ROOT/.state/lwext4-io-boost-current/smoke-support.env"
-if [ ! -f "$SMOKE_ENV_FILE" ] || ! grep -qx 'OSCOMP_BOOT_SHELL=1' "$SMOKE_ENV_FILE"; then
-    printf 'OSCOMP_BOOT_SHELL=1\n' >"$SMOKE_ENV_FILE"
-fi
-
-support_image_needs_rebuild() {
-    [ ! -f "$SUPPORT_IMAGE" ] && return 0
-    [ "$SUPPORT_IMAGE_EXPLICIT" -eq 1 ] && return 1
-    [ "$REPO_ROOT/scripts/build-oscomp-support-disk.sh" -nt "$SUPPORT_IMAGE" ] && return 0
-    [ "$SMOKE_ENV_FILE" -nt "$SUPPORT_IMAGE" ] && return 0
-    find "$REPO_ROOT/scripts/support-tools" -type f -newer "$SUPPORT_IMAGE" | grep -q .
-}
-
-if support_image_needs_rebuild; then
-    mkdir -p "$(dirname -- "$SUPPORT_IMAGE")"
-    "$REPO_ROOT/scripts/build-oscomp-support-disk.sh" \
-        --arch "$ARCH" \
-        --output "$SUPPORT_IMAGE" \
-        --env-override "$SMOKE_ENV_FILE" >/dev/null
-fi
-
-if [ "$SKIP_KERNEL_BUILD" -eq 0 ] || [ ! -f "$REPO_ROOT/$KERNEL_TARGET" ]; then
-    make "$KERNEL_TARGET"
-fi
+smoke_build_support_image_if_needed "$ARCH" "$SUPPORT_IMAGE" "$SUPPORT_IMAGE_EXPLICIT"
 
 rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR"
@@ -215,6 +188,7 @@ echo LWEXT4_IO_BOOST_SMOKE_DONE
 exit
 EOF
 
+readarray -d '' -t kernel_args < <(smoke_replay_kernel_args "$ARCH" "$SKIP_KERNEL_BUILD")
 (
     sleep "$BOOT_WAIT_SECS"
     while IFS= read -r line; do
@@ -229,12 +203,12 @@ EOF
     done <"$COMMANDS_FILE"
 ) | python3 -m tools.oscomp_eval.replay qemu \
     --arch "$ARCH" \
+    "${kernel_args[@]}" \
     --support-image "$SUPPORT_IMAGE" \
     --timeout "$TIMEOUT_SECS" \
     --workdir "$WORKDIR" \
     --keep-workdir \
-    --interactive \
-    $([ "$SKIP_KERNEL_BUILD" -eq 1 ] && printf '%s\n' --skip-kernel-build)
+    --interactive
 
 LOG="$WORKDIR/qemu.log"
 [ -f "$LOG" ] || die "missing QEMU log: $LOG"

@@ -25,7 +25,7 @@ upstream copyright notices and license terms.
 
 ## Environment
 
-Build, boot, and replay commands should run inside the repo development
+Build, boot, replay, and smoke commands should run inside the repo development
 container. The host may not have the RISC-V or LoongArch cross toolchains; a
 host-side build failure such as `no usable cross toolchain found for
 architecture riscv64` means the command was run outside the dev shell.
@@ -78,8 +78,15 @@ Both forms produce the evaluator artifacts at the repository root:
 
 - `kernel-rv`
 - `kernel-la`
-- `disk.img`
+- `disk.img` (RISC-V support disk)
 - `disk-la.img`
+
+RISC-V submissions use `disk.img` locally. Some remote logs show `disk-rv.img`;
+that is the same support-disk role with a different filename on the grader side.
+
+High-frequency kernel rebuilds keep Cargo target caches under
+`.state/<arch>/target`. Kernel and support-disk outputs also use content keys in
+`.state/kernel-cache/` and `.state/support-disk/`.
 
 Build only the kernel artifacts:
 
@@ -90,6 +97,25 @@ make dev-shell DEV_CMD='make kernel-la'
 ```
 
 Inside `make dev-shell`, run the inner `make ...` commands directly.
+
+## Local Evaluator
+
+The local evaluator is centered on `tools/oscomp_eval/replay.py`.
+
+| Entry | Purpose |
+| --- | --- |
+| `make replay-rv` / `make replay-la` | Build artifacts, run QEMU, judge, score |
+| `python3 -m tools.oscomp_eval.replay replay` | Same pipeline with explicit CLI flags |
+| `python3 -m tools.oscomp_eval.cli evaluate` | Compatibility alias for replay launch or offline log scoring |
+| `scripts/oscomp.sh score-logs` | Offline scoring from existing console logs |
+| `scripts/lab` | Focused replay for one group or LTP case |
+| `scripts/ltp-lab.py` via `scripts/oscomp.sh ltp-lab` | LTP campaign inventory, replay, and cleanup |
+
+Default replay timeouts live in `tools/oscomp_eval/config.py`:
+
+- `REPLAY_TIMEOUT_FULL_SECS = 7000` for full `make replay-*`
+- `REPLAY_TIMEOUT_FOCUSED_SECS = 3600` for `scripts/lab run`
+- `REPLAY_TIMEOUT_SMOKE_SECS = 240` for boot-shell smoke scripts
 
 ## Replay
 
@@ -108,12 +134,19 @@ make replay-rv
 make replay-la
 ```
 
-Each replay writes `score.json` and per-group judge artifacts under
-`.state/oscomp-eval/runs/`. Raw `.img` test images are
-attached with QEMU snapshot mode. The support disk is attached read-only.
-Compressed `.gz` or `.xz` test images are decompressed once into
-`.state/oscomp-image-cache/` and reused by later replays. `make clean` keeps
-the image cache; `make clean-all` removes all `.state` data.
+Each replay writes `score.json` and per-arch judge artifacts under
+`.state/oscomp-eval/runs/`. `score.json` includes a top-level `run` object with
+replay provenance: run name, mode, status, arches, timeout, image paths, and per-
+arch QEMU metadata. There is no `report.md`, `manifest.json`, or artifact index.
+
+Raw `.img` test images are attached with QEMU snapshot mode. The support disk is
+attached read-only. Compressed `.gz` or `.xz` test images are decompressed once
+into `.state/oscomp-image-cache/` and reused by later replays. `make clean`
+keeps the image cache; `make clean-all` removes all `.state` data.
+
+Running both architectures through `python3 -m tools.oscomp_eval.cli evaluate
+--arch both` launches RV and LA replays in parallel when `--fail-fast` is not
+set.
 
 Validate official image layout inside the dev shell:
 
@@ -179,8 +212,8 @@ python3 -m tools.oscomp_eval.replay replay \
 ## Focused Lab
 
 Use `scripts/lab` for focused replay runs. It generates a guest plan, optional
-case filter payload, and support image, then uses the same replay, judge, and
-score path as `make replay-rv` and `make replay-la`.
+case filter payload, and support image under `.state/oscomp-lab/`, then uses the
+same replay, judge, and score path as `make replay-rv` and `make replay-la`.
 
 ```bash
 make dev-shell DEV_CMD='./scripts/lab list'
@@ -191,6 +224,9 @@ make dev-shell DEV_CMD='./scripts/lab run --arch rv --select basic-musl'
 
 Selectors use `GROUP-LIBC[:EXPR]`. `ltp` supports exact case names,
 `prefix=...`, and `regex=...`. Other groups run at group level.
+
+Use `scripts/oscomp.sh ltp-lab` for broader LTP campaign workflows. That path is
+separate from `scripts/lab` and keeps state under `.state/ltp-lab/`.
 
 Exit codes:
 
@@ -212,7 +248,8 @@ make dev-shell DEV_CMD='make shell-rv'
 make dev-shell DEV_CMD='make shell-la'
 ```
 
-These targets build a shell-mode kernel. The shell uses the official test image
+These targets build a `boot-shell` kernel (`kernel-*-shell`) that injects
+`OSCOMP_BOOT_SHELL=1` at compile time. The shell uses the official test image
 as the first disk so `/musl/busybox` and the usual userland layout are present.
 The image is attached with QEMU snapshot mode, so the shell does not rewrite or
 copy the test image.
@@ -229,8 +266,25 @@ make dev-shell DEV_CMD='./scripts/smoke.sh list'
 make dev-shell DEV_CMD='./scripts/smoke.sh lwext4-io-boost --arch rv'
 ```
 
+Boot-shell smokes share helpers in `scripts/smoke/lib.sh`. They build or reuse
+`kernel-rv-shell` / `kernel-la-shell`, attach a support disk for guest tools,
+and feed scripted commands into `python3 -m tools.oscomp_eval.replay qemu
+--interactive`. They do not rely on `OSCOMP_BOOT_SHELL` env overrides baked
+into the support disk.
+
+`phase9-la-depth-gate` is different: it exercises the eval `kernel-la` path for
+LoongArch async-depth gates.
+
+## Tests
+
+Run the local evaluator unit tests inside the dev shell or on the host:
+
+```bash
+PYTHONPATH=. python3 -m unittest discover -s tests/oscomp_eval -v
+```
+
 ## Notes
 
 - Kernel behavior lives mainly under `kernel/`.
-- `src/init.sh` is guest-side runner logic.
-- Runtime, replay, and lab state live under `.state`.
+- `src/init.sh` is guest-side runner logic embedded into the kernel image.
+- Runtime, replay, lab, and smoke state live under `.state`.

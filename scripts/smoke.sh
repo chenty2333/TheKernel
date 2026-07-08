@@ -11,6 +11,10 @@ Usage:
   scripts/smoke.sh list
   scripts/smoke.sh NAME [ARGS...]
 
+Boot-shell smokes build or reuse kernel-*-shell and drive commands through
+tools.oscomp_eval.replay qemu --interactive. phase9-la-depth-gate uses the
+eval kernel-la path instead.
+
 Smoke names:
   async-block-queue
   async-flush-fence

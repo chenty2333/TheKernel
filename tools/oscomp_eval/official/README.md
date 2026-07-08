@@ -31,6 +31,11 @@ QEMU, prework, postwork, template, or `pygrading.Job` controller path.
 Validation commands:
 
 ```bash
-python3 -m unittest discover -s tests/oscomp_eval -v
-python3 -m py_compile tools/oscomp_eval/*.py tools/oscomp_eval/lab/*.py scripts/ltp-lab.py tests/oscomp_eval/*.py
+PYTHONPATH=. python3 -m unittest discover -s tests/oscomp_eval -v
+python3 -m py_compile \
+  tools/oscomp_eval/*.py \
+  tools/oscomp_eval/lab/*.py \
+  tools/oscomp_eval/lab/plugins/**/*.py \
+  scripts/ltp-lab.py \
+  tests/oscomp_eval/*.py
 ```
