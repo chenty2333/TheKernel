@@ -14,17 +14,19 @@ from tools.oscomp_eval.support_image import (
 
 
 class SupportImageTests(unittest.TestCase):
-    def test_inspect_support_image_accepts_current_runner_and_timeout_tool(self) -> None:
+    def test_inspect_support_image_accepts_embedded_runner_and_timeout_tool(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "src").mkdir()
             (root / "src" / "init.sh").write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
-            image = root / "disk-rv.img"
+            image = root / "disk.img"
             image.write_bytes(b"fake ext image")
 
             def fake_debugfs(image_path: Path, command: str) -> subprocess.CompletedProcess[str]:
+                if command == "stat /meta/init.sh":
+                    return subprocess.CompletedProcess([], 1, stdout="", stderr="File not found")
                 if command == "cat /meta/init.sh":
-                    return subprocess.CompletedProcess([], 0, stdout="#!/bin/sh\necho ok\n", stderr="")
+                    return subprocess.CompletedProcess([], 1, stdout="", stderr="File not found")
                 if command in (
                     "stat /meta/ltp_test.txt",
                     "stat /rv/overlay/bin/oscomp-timeout",
@@ -38,7 +40,7 @@ class SupportImageTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertEqual(result.issues, ())
 
-    def test_inspect_support_image_reports_stale_runner_and_missing_timeout_tool(self) -> None:
+    def test_inspect_support_image_reports_stale_optional_runner_and_missing_timeout_tool(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "src").mkdir()
@@ -47,6 +49,8 @@ class SupportImageTests(unittest.TestCase):
             image.write_bytes(b"fake ext image")
 
             def fake_debugfs(image_path: Path, command: str) -> subprocess.CompletedProcess[str]:
+                if command == "stat /meta/init.sh":
+                    return subprocess.CompletedProcess([], 0, stdout="Inode: 1\n", stderr="")
                 if command == "cat /meta/init.sh":
                     return subprocess.CompletedProcess([], 0, stdout="#!/bin/sh\necho old\n", stderr="")
                 if command == "stat /meta/ltp_test.txt":
@@ -59,7 +63,7 @@ class SupportImageTests(unittest.TestCase):
                 result = inspect_support_image(arch="la", image=image, root=root)
 
             self.assertFalse(result.ok)
-            self.assertIn("/meta/init.sh does not match current src/init.sh", result.issues)
+            self.assertIn("optional /meta/init.sh does not match current src/init.sh", result.issues)
             self.assertIn(
                 "missing /la/overlay/bin/oscomp-timeout: File not found",
                 result.issues,

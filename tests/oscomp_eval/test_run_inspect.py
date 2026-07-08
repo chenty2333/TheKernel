@@ -5,24 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.oscomp_eval.artifact_index import write_artifact_index
 from tools.oscomp_eval.run_inspect import inspect_run
 
 
-def write_minimal_run(run_dir: Path, *, status: str = "complete", issues: list[object] | None = None) -> None:
+def write_minimal_run(run_dir: Path, *, issues: list[object] | None = None) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "manifest.json").write_text(
-        json.dumps(
-            {
-                "schema": "oscomp-eval.run-manifest.v1",
-                "name": "unit",
-                "mode": "score-logs",
-                "status": status,
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
     (run_dir / "score.json").write_text(
         json.dumps(
             {
@@ -39,8 +26,6 @@ def write_minimal_run(run_dir: Path, *, status: str = "complete", issues: list[o
         + "\n",
         encoding="utf-8",
     )
-    (run_dir / "report.md").write_text("# report\n", encoding="utf-8")
-    write_artifact_index(run_dir)
 
 
 def write_run_with_nested_artifacts(run_dir: Path) -> None:
@@ -98,7 +83,6 @@ def write_run_with_nested_artifacts(run_dir: Path) -> None:
         + "\n",
         encoding="utf-8",
     )
-    write_artifact_index(run_dir)
 
 
 class RunInspectTests(unittest.TestCase):
@@ -113,7 +97,7 @@ class RunInspectTests(unittest.TestCase):
             self.assertEqual(result.run_status, "complete")
             self.assertEqual(result.structural_issues, ())
             self.assertEqual(result.score_issue_count, 0)
-            self.assertGreaterEqual(result.artifact_count, 4)
+            self.assertEqual(result.artifact_count, 1)
             data = result.to_json_dict()
             self.assertEqual(data["schema"], "oscomp-eval.run-inspection.v1")
             self.assertTrue(data["ok"])
@@ -126,7 +110,6 @@ class RunInspectTests(unittest.TestCase):
             run_dir = Path(tmp)
             write_minimal_run(
                 run_dir,
-                status="incomplete",
                 issues=[{"kind": "judge-status"}],
             )
 
@@ -137,56 +120,19 @@ class RunInspectTests(unittest.TestCase):
             self.assertEqual(result.score_issue_count, 1)
             self.assertEqual(result.structural_issues, ())
 
-    def test_inspect_reports_index_mismatch(self) -> None:
+    def test_inspect_reports_bad_score_schema(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
             write_minimal_run(run_dir)
-            (run_dir / "report.md").write_text("# report changed\n", encoding="utf-8")
-
-            result = inspect_run(run_dir)
-
-            self.assertFalse(result.ok)
-            self.assertTrue(
-                any("artifact size mismatch: report.md" in issue for issue in result.structural_issues)
-            )
-
-    def test_inspect_rejects_stale_html_report(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            run_dir = Path(tmp)
-            write_minimal_run(run_dir)
-            (run_dir / "report.html").write_text("stale html\n", encoding="utf-8")
+            score = json.loads((run_dir / "score.json").read_text())
+            score["schema"] = "oscomp-eval.score-summary.v2"
+            (run_dir / "score.json").write_text(json.dumps(score) + "\n", encoding="utf-8")
 
             result = inspect_run(run_dir)
 
             self.assertFalse(result.ok)
             self.assertIn(
-                "report.html is stale; report.md is the only supported human-readable report",
-                result.structural_issues,
-            )
-
-    def test_inspect_rejects_html_report_in_artifact_index(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            run_dir = Path(tmp)
-            write_minimal_run(run_dir)
-            index = json.loads((run_dir / "artifact-index.json").read_text())
-            index["artifacts"].append(
-                {
-                    "path": "report.html",
-                    "kind": "html-report",
-                    "size_bytes": 0,
-                }
-            )
-            index["artifact_count"] = len(index["artifacts"])
-            (run_dir / "artifact-index.json").write_text(
-                json.dumps(index) + "\n",
-                encoding="utf-8",
-            )
-
-            result = inspect_run(run_dir)
-
-            self.assertFalse(result.ok)
-            self.assertIn(
-                "artifact-index contains unsupported HTML report: report.html",
+                "score.json schema oscomp-eval.score-summary.v2 != oscomp-eval.score-summary.v1",
                 result.structural_issues,
             )
 
@@ -204,35 +150,6 @@ class RunInspectTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
             write_run_with_nested_artifacts(run_dir)
-            index = json.loads((run_dir / "artifact-index.json").read_text())
-            for artifact in index["artifacts"]:
-                if artifact["path"] == "rv/marker-validation.json":
-                    artifact["schema"] = "oscomp-eval.marker-artifacts.v2"
-                if artifact["path"] == "rv/judges/basic-musl.json":
-                    artifact.pop("schema", None)
-            (run_dir / "artifact-index.json").write_text(
-                json.dumps(index) + "\n",
-                encoding="utf-8",
-            )
-
-            result = inspect_run(run_dir)
-
-            self.assertFalse(result.ok)
-            self.assertIn(
-                "artifact-index schema rv/marker-validation.json "
-                "oscomp-eval.marker-artifacts.v2 != oscomp-eval.marker-artifacts.v1",
-                result.structural_issues,
-            )
-            self.assertIn(
-                "artifact-index schema rv/judges/basic-musl.json <missing> "
-                "!= oscomp-eval.judge-result.v1",
-                result.structural_issues,
-            )
-
-    def test_inspect_reports_actual_artifact_file_schema_mismatch(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            run_dir = Path(tmp)
-            write_run_with_nested_artifacts(run_dir)
             (run_dir / "rv" / "marker-validation.json").write_text(
                 json.dumps(
                     {
@@ -247,6 +164,18 @@ class RunInspectTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            (run_dir / "rv" / "judges" / "basic-musl.json").write_text(
+                json.dumps(
+                    {
+                        "arch": "rv",
+                        "group_id": "basic-musl",
+                        "status": "ok",
+                        "rows": [],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
             result = inspect_run(run_dir)
 
@@ -254,6 +183,11 @@ class RunInspectTests(unittest.TestCase):
             self.assertIn(
                 "artifact file schema rv/marker-validation.json "
                 "oscomp-eval.marker-artifacts.v2 != oscomp-eval.marker-artifacts.v1",
+                result.structural_issues,
+            )
+            self.assertIn(
+                "artifact file schema rv/judges/basic-musl.json <missing> "
+                "!= oscomp-eval.judge-result.v1",
                 result.structural_issues,
             )
 

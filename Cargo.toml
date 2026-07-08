@@ -51,6 +51,7 @@ repository.workspace = true
 
 [features]
 default = []
+boot-shell = []
 qemu = [
     "axfeat/defplat",
     "axfeat/bus-pci",

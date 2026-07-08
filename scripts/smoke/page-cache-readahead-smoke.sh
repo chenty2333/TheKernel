@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
 ARCH=rv
 WORKDIR=""
@@ -160,7 +160,7 @@ EOF
         printf '%s\n' "$line"
         sleep "$LINE_DELAY_SECS"
     done <"$COMMANDS_FILE"
-) | "$REPO_ROOT/scripts/replay-oscomp-eval.sh" \
+) | python3 -m tools.oscomp_eval.replay qemu \
     --arch "$ARCH" \
     --support-image "$SUPPORT_IMAGE" \
     --timeout "$TIMEOUT_SECS" \

@@ -11,6 +11,8 @@ MIN_IMAGE_SIZE_MB=32
 TEST_LIST_PATH="$REPO_ROOT/ltp_test.txt"
 PLAN_OVERRIDE_PATH=""
 PLAN_OVERRIDE_EXPLICIT=0
+CASES_OVERRIDE_PATH=""
+CASES_OVERRIDE_EXPLICIT=0
 ENV_OVERRIDE_PATH=""
 TMP_ROOT=""
 TMP_BASE="$REPO_ROOT/.tmp"
@@ -18,16 +20,17 @@ TMP_BASE="$REPO_ROOT/.tmp"
 usage() {
     cat <<EOF
 Usage: $(basename "$0") --arch {rv|la|both} [--out-dir DIR] [--output PATH] [--size-mb N]
-                             [--test-list PATH] [--plan-override PATH] [--env-override PATH]
+                             [--test-list PATH] [--plan-override PATH] [--cases-override PATH]
+                             [--env-override PATH]
 
 Build an evaluator support disk aligned to /home/dia/T202510213995926-2475:
   - /rv/... and /la/... arch-specific payload roots
   - /<arch>/overlay/... runtime overlay copied into /
   - /usr/lib/locale/C.UTF-8
   - /<arch>/glibc/lib/libgcc_s.so.1
-  - /meta/init.sh used as the score-facing init script
   - /meta/ltp_test.txt used at runtime to overlay the same LTP subset
   - /meta/oscomp_plan.txt only when --plan-override is provided
+  - /meta/oscomp_cases.txt only when --cases-override is provided
   - /meta/oscomp.env only when --env-override is provided
 
 EOF
@@ -58,6 +61,11 @@ while (($#)); do
         --plan-override)
             PLAN_OVERRIDE_PATH=${2:-}
             PLAN_OVERRIDE_EXPLICIT=1
+            shift 2
+            ;;
+        --cases-override)
+            CASES_OVERRIDE_PATH=${2:-}
+            CASES_OVERRIDE_EXPLICIT=1
             shift 2
             ;;
         --env-override)
@@ -436,6 +444,10 @@ if [ "$PLAN_OVERRIDE_EXPLICIT" -eq 1 ] && [ ! -f "$PLAN_OVERRIDE_PATH" ]; then
     printf 'missing plan override: %s\n' "$PLAN_OVERRIDE_PATH" >&2
     exit 1
 fi
+if [ "$CASES_OVERRIDE_EXPLICIT" -eq 1 ] && [ ! -f "$CASES_OVERRIDE_PATH" ]; then
+    printf 'missing cases override: %s\n' "$CASES_OVERRIDE_PATH" >&2
+    exit 1
+fi
 
 [ -z "$ENV_OVERRIDE_PATH" ] || [ -f "$ENV_OVERRIDE_PATH" ] || {
     printf 'missing env override: %s\n' "$ENV_OVERRIDE_PATH" >&2
@@ -490,12 +502,13 @@ trap cleanup EXIT
 WORK_ROOT="$TMP_ROOT/root"
 mkdir -p "$WORK_ROOT/usr/lib/locale/C.UTF-8" "$WORK_ROOT/meta"
 cp -a "$LOCALE_SOURCE"/. "$WORK_ROOT/usr/lib/locale/C.UTF-8/"
-cp "$REPO_ROOT/src/init.sh" "$WORK_ROOT/meta/init.sh"
-chmod 0755 "$WORK_ROOT/meta/init.sh"
 cp "$TEST_LIST_PATH" "$WORK_ROOT/meta/ltp_test.txt"
 
 if [ -n "$PLAN_OVERRIDE_PATH" ] && [ -f "$PLAN_OVERRIDE_PATH" ]; then
     cp "$PLAN_OVERRIDE_PATH" "$WORK_ROOT/meta/oscomp_plan.txt"
+fi
+if [ -n "$CASES_OVERRIDE_PATH" ] && [ -f "$CASES_OVERRIDE_PATH" ]; then
+    cp "$CASES_OVERRIDE_PATH" "$WORK_ROOT/meta/oscomp_cases.txt"
 fi
 if [ -n "$ENV_OVERRIDE_PATH" ] && [ -f "$ENV_OVERRIDE_PATH" ]; then
     cp "$ENV_OVERRIDE_PATH" "$WORK_ROOT/meta/oscomp.env"

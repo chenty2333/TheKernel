@@ -955,7 +955,7 @@ def prepare_common_plan(args: argparse.Namespace, run_path: Path, run_id: str) -
 
 def replay_command(args: argparse.Namespace, arch: str, support_image: Path, workdir: Path, timeout: int) -> list[str]:
     cmd = [
-        str(REPO_ROOT / "scripts" / "replay-oscomp-eval.sh"),
+        sys.executable, "-m", "tools.oscomp_eval.replay", "qemu",
         "--arch",
         arch,
         "--support-image",
@@ -1623,8 +1623,7 @@ def resolve_manifest_input_path(value: str) -> Path:
 
 def score_report_record(score_run_dir: Path, *, source: str) -> dict[str, Any] | None:
     score_json = score_run_dir / "score.json"
-    report_md = score_run_dir / "report.md"
-    if not score_json.is_file() or not report_md.is_file():
+    if not score_json.is_file():
         return None
     try:
         score = read_json(score_json)
@@ -1633,7 +1632,6 @@ def score_report_record(score_run_dir: Path, *, source: str) -> dict[str, Any] |
     issues = score.get("issues", [])
     return {
         "run": rel_to_repo(score_run_dir),
-        "report": rel_to_repo(report_md),
         "score_json": rel_to_repo(score_json),
         "source": source,
         "total_score": score.get("total_score"),
@@ -1806,7 +1804,7 @@ def summarize_run(
         for report in score_reports:
             print(
                 f"  {report['run']} total={report.get('total_score')} "
-                f"issues={report.get('issue_count')} report={report['report']}"
+                f"issues={report.get('issue_count')} score_json={report['score_json']}"
             )
     return combined
 
@@ -3660,7 +3658,7 @@ def audit_cmd(args: argparse.Namespace) -> None:
     checks.append(("repo", str(REPO_ROOT)))
     checks.append(("git_dirty", "yes" if run_cmd(["git", "status", "--short"], capture=True, check=False).stdout.strip() else "no"))
     checks.append(("default_ltp_list", "ok" if DEFAULT_TEST_LIST.is_file() else "missing"))
-    artifacts = [name for name in ("kernel-rv", "kernel-la", "disk.img", "disk-rv.img", "disk-la.img") if (REPO_ROOT / name).is_file()]
+    artifacts = [name for name in ("kernel-rv", "kernel-la", "disk.img", "disk-la.img") if (REPO_ROOT / name).is_file()]
     checks.append(("evaluator_artifacts", ",".join(artifacts) if artifacts else "missing"))
     for arch in ARCHES:
         image = find_official_image(arch)
@@ -3845,7 +3843,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--score-run",
         action="append",
-        help="related tools/oscomp_eval run directory whose report.md should be linked",
+        help="related tools/oscomp_eval run directory whose score.json should be linked",
     )
     p.set_defaults(func=summarize_cmd)
 

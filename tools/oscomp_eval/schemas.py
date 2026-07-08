@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 
-RUN_MANIFEST_SCHEMA = "oscomp-eval.run-manifest.v1"
 MARKER_RESULT_SCHEMA = "oscomp-eval.marker-result.v1"
 MARKER_ARTIFACT_SCHEMA = "oscomp-eval.marker-artifacts.v1"
 SEGMENT_RECORD_SCHEMA = "oscomp-eval.segment-record.v1"
@@ -250,13 +249,14 @@ class ScoreSummary:
     ltp_group_totals: dict[str, dict[str, float]]
     group_totals: dict[str, dict[str, Any]]
     issues: tuple[dict[str, Any], ...]
+    run: dict[str, Any] | None = None
 
     @property
     def has_errors(self) -> bool:
         return bool(self.issues)
 
     def to_json_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "schema": SCORE_SUMMARY_SCHEMA,
             "total_score": self.total_score,
             "non_ltp_score": self.non_ltp_score,
@@ -268,3 +268,6 @@ class ScoreSummary:
             "group_totals": self.group_totals,
             "issues": list(self.issues),
         }
+        if self.run is not None:
+            data["run"] = self.run
+        return data

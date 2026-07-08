@@ -82,8 +82,11 @@ def _debugfs_exists(image: Path, path: str) -> tuple[bool, str | None]:
         completed = _debugfs_capture(image, f"stat {path}")
     except OSError as error:
         return False, f"could not run debugfs: {error}"
+    detail = (completed.stderr or completed.stdout).strip()
+    combined = f"{completed.stdout}\n{completed.stderr}".lower()
+    if "not found" in combined or "no such file" in combined:
+        return False, detail or f"debugfs stat failed for {path}"
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout).strip()
         return False, detail or f"debugfs stat failed for {path}"
     return True, None
 
@@ -107,13 +110,15 @@ def inspect_support_image(
             issues=(f"support image does not exist: {image}",),
         )
 
-    init_text, error = _debugfs_cat(image, "/meta/init.sh")
-    if error is not None:
-        issues.append(f"missing or unreadable /meta/init.sh: {error}")
+    init_exists, _ = _debugfs_exists(image, "/meta/init.sh")
+    if init_exists:
+        init_text, error = _debugfs_cat(image, "/meta/init.sh")
     else:
+        init_text, error = None, "optional init is absent"
+    if init_exists and error is None and init_text is not None:
         current_init = (root / "src" / "init.sh").read_text(encoding="utf-8")
         if init_text != current_init:
-            issues.append("/meta/init.sh does not match current src/init.sh")
+            issues.append("optional /meta/init.sh does not match current src/init.sh")
 
     for required_path in (
         "/meta/ltp_test.txt",

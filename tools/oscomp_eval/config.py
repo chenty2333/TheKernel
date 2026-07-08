@@ -24,6 +24,12 @@ ARCH_ALIASES: dict[str, Arch] = {
 
 DEFAULT_ARCHES: tuple[Arch, ...] = ("rv", "la")
 
+JUDGE_TIMEOUT_SECS = 30
+REPLAY_TIMEOUT_FULL_SECS = 7000
+REPLAY_TIMEOUT_FOCUSED_SECS = 3600
+REPLAY_TIMEOUT_SMOKE_SECS = 240
+SHELL_TIMEOUT_SECS = 0
+
 # This is the current local default plan. It intentionally excludes
 # libctest-glibc because src/init.sh skips that group today.
 DEFAULT_GROUP_LIBC_MATRIX: tuple[tuple[str, Libc], ...] = (
@@ -79,8 +85,8 @@ class MatrixCell:
 class EvalConfig:
     arches: tuple[Arch, ...] = DEFAULT_ARCHES
     group_libc_matrix: tuple[tuple[str, Libc], ...] = DEFAULT_GROUP_LIBC_MATRIX
-    judge_timeout_secs: int = 30
-    replay_timeout_secs: int = 3600
+    judge_timeout_secs: int = JUDGE_TIMEOUT_SECS
+    replay_timeout_secs: int = REPLAY_TIMEOUT_FULL_SECS
     strict_markers: bool = True
 
     def expected_matrix(self) -> tuple[MatrixCell, ...]:

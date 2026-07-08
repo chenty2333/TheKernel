@@ -109,7 +109,6 @@ class LtpLabMarkerIntegrationTests(unittest.TestCase):
                 json.dumps({"total_score": 12.5, "issues": [{"kind": "missing"}]}),
                 encoding="utf-8",
             )
-            (score_run / "report.md").write_text("# report\n", encoding="utf-8")
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):

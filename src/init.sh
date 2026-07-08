@@ -128,6 +128,7 @@ stage_support_disk() {
 
     [ -f /support/meta/ltp_test.txt ] && bb cp /support/meta/ltp_test.txt /etc/oscomp-ltp.txt 2>/dev/null || true
     [ -f /support/meta/oscomp_plan.txt ] && bb cp /support/meta/oscomp_plan.txt /etc/oscomp-plan.txt 2>/dev/null || true
+    [ -f /support/meta/oscomp_cases.txt ] && bb cp /support/meta/oscomp_cases.txt /etc/oscomp-cases.txt 2>/dev/null || true
     [ -f /support/meta/oscomp.env ] && bb cp /support/meta/oscomp.env /etc/oscomp.env 2>/dev/null || true
 
     arch_root="/support/$OSCOMP_ARCH"
@@ -171,6 +172,30 @@ load_env_file() {
         case "$name" in ''|[0-9]*|*[!A-Za-z0-9_]*) continue ;; esac
         export "$line" 2>/dev/null || true
     done < /etc/oscomp.env
+}
+
+case_selected() {
+    group="$1"
+    flavor="$2"
+    case_name="$3"
+    cases_file=/etc/oscomp-cases.txt
+    group_id="$group-$flavor"
+    found_group=0
+
+    [ -s "$cases_file" ] || return 0
+    while IFS=' ' read -r selected_group selected_case _ || [ -n "$selected_group" ]; do
+        case "$selected_group" in ''|'#'*) continue ;; esac
+        [ "$selected_group" = "$group_id" ] || continue
+        found_group=1
+        case "$selected_case" in
+            ''|'*'|"$case_name")
+                return 0
+                ;;
+        esac
+    done < "$cases_file"
+
+    [ "$found_group" -eq 0 ] && return 0
+    return 1
 }
 
 configure_tetiao_default() {
@@ -542,6 +567,7 @@ run_ltp_group() {
             set -- $line
             tag="$1"
             shift
+            case_selected ltp "$flavor" "$tag" || continue
             [ $# -gt 0 ] && cmdline="$*" || cmdline="$tag"
             run_ltp_command "$root" "$flavor" "$tag" "$cmdline"
             cleanup_after_ltp_case

@@ -14,8 +14,6 @@ compatibility for the official test suite.
 - Author: 陈天意 <hi@tychen.cc>
 - Upstream baseline: StarryOS commit
   [`2e075accf4fb0aefdd1d252ebd9ccf29727d9923`](https://github.com/Starry-OS/StarryOS/tree/2e075accf4fb0aefdd1d252ebd9ccf29727d9923).
-- AI-assisted commits are marked in Git history with
-  `Co-Authored-By: Codex <noreply@openai.com>`.
 - Source code license: Apache License 2.0, see [LICENSE](LICENSE) and
   [NOTICE](NOTICE).
 - Technical documents, presentation slides, and other defense materials:
@@ -25,7 +23,7 @@ compatibility for the official test suite.
 Third-party code under `third_party/` and vendored patch directories keeps its
 upstream copyright notices and license terms.
 
-## Development
+## Environment
 
 Build, boot, and replay commands should run inside the repo development
 container. The host may not have the RISC-V or LoongArch cross toolchains; a
@@ -50,13 +48,13 @@ Open a development shell:
 make dev-shell
 ```
 
-Run one command inside the development shell without staying in it:
+Run a repository command inside the container:
 
 ```bash
 make dev-shell DEV_CMD='make kernels'
 ```
 
-Open the privileged builder service when needed:
+Open the privileged builder service:
 
 ```bash
 make dev-shell-root
@@ -64,13 +62,13 @@ make dev-shell-root
 
 ## Build
 
-Official evaluator artifact build, from the host:
+Build evaluator artifacts from the host:
 
 ```bash
 make dev-shell DEV_CMD='make all'
 ```
 
-The same build from inside an already-open `make dev-shell`:
+Build from inside an already-open `make dev-shell`:
 
 ```bash
 make all
@@ -81,45 +79,41 @@ Both forms produce the evaluator artifacts at the repository root:
 - `kernel-rv`
 - `kernel-la`
 - `disk.img`
-- `disk-rv.img`
 - `disk-la.img`
 
-Local iteration can use narrower commands:
+Build only the kernel artifacts:
 
 ```bash
 make dev-shell DEV_CMD='make kernels'
-make dev-shell DEV_CMD='make artifacts'
 make dev-shell DEV_CMD='make kernel-rv'
 make dev-shell DEV_CMD='make kernel-la'
 ```
 
-Inside an already-open `make dev-shell`, run those inner `make ...` commands
-directly.
+Inside `make dev-shell`, run the inner `make ...` commands directly.
 
 ## Replay
 
-Replay the evaluator flow from the host:
+Build the matching artifacts, run one architecture in QEMU, judge the console
+log, and write the local score report:
 
 ```bash
 make dev-shell DEV_CMD='make replay-rv'
 make dev-shell DEV_CMD='make replay-la'
 ```
 
-Rebuild the matching kernel before replaying:
-
-```bash
-make dev-shell DEV_CMD='make eval-rv'
-make dev-shell DEV_CMD='make eval-la'
-```
-
-Inside an already-open `make dev-shell`, run the inner commands directly:
+Inside `make dev-shell`:
 
 ```bash
 make replay-rv
 make replay-la
-make eval-rv
-make eval-la
 ```
+
+Each replay writes `score.json` and per-group judge artifacts under
+`.state/oscomp-eval/runs/`. Raw `.img` test images are
+attached with QEMU snapshot mode. The support disk is attached read-only.
+Compressed `.gz` or `.xz` test images are decompressed once into
+`.state/oscomp-image-cache/` and reused by later replays. `make clean` keeps
+the image cache; `make clean-all` removes all `.state` data.
 
 Validate official image layout inside the dev shell:
 
@@ -128,10 +122,10 @@ Validate official image layout inside the dev shell:
 ./scripts/oscomp.sh verify --arch la
 ```
 
-## Offline Local Scoring
+## Local Scoring
 
-Existing replay or lab console logs can be parsed, judged with the vendored
-official-compatible judge scripts, scored, and reported without starting QEMU:
+Replay and lab console logs can be parsed, judged, and scored without starting
+QEMU:
 
 ```bash
 ./scripts/oscomp.sh validate-output --log .state/path/to/qemu.log --arch rv
@@ -140,51 +134,30 @@ official-compatible judge scripts, scored, and reported without starting QEMU:
   --rv-log .state/path/to/rv.log \
   --la-log .state/path/to/la.log \
   --name manual-score
-./scripts/oscomp.sh report-run .state/oscomp-eval/runs/manual-score
 ./scripts/oscomp.sh inspect-run --json .state/oscomp-eval/runs/manual-score
 ```
 
-`scripts/validate-oscomp-output.py` remains as a compatibility shim for old
-local scripts, but new usage should go through `scripts/oscomp.sh
-validate-output`. For direct parser debugging, use `python3 -m
-tools.oscomp_eval markers`.
+For direct parser debugging, use `python3 -m tools.oscomp_eval markers`.
 
-`scripts/oscomp.sh evaluate --rv-log PATH --la-log PATH --name NAME` is the
-same offline path under the new evaluation entrypoint. `scripts/oscomp.sh
-evaluate --arch rv|la|both --name NAME` launches replay through the existing
-`scripts/replay-oscomp-eval.sh` runner and then judges, scores, and reports the
-captured logs. Replay mode accepts `--idle-timeout SECS`; when a QEMU run stops
-writing console output for that long, the evaluator kills that replay, records a
-structured timeout, and still writes the run artifacts that can be recovered.
-
-Before a replay-backed run, `scripts/oscomp.sh support-check --arch rv --image
-disk-rv.img` and the matching LA command validate that the support disk contains
-the current `src/init.sh` and guest-side timeout helper used to keep LTP cases
-bounded. `make check-eval-artifacts` runs those checks after confirming the
-kernel and disk artifacts exist.
-
-Every scored run writes `manifest.json`, `score.json`, a plain Markdown
-`report.md`, and a machine-readable `artifact-index.json` that lists the run
-artifacts that actually exist. The local evaluator does not generate an HTML
-report.
-Use `inspect-run --json` to check those artifacts without mutating the run
-directory.
-When `--replace` is used, stale evaluator artifacts in that run directory are
-cleared before writing the new run; unrelated files are left alone.
-
-Replay-backed evaluation can also build a run-local support image from an
-explicit LTP list:
+Support disks can be checked explicitly:
 
 ```bash
-./scripts/oscomp.sh evaluate \
+./scripts/oscomp.sh support-check --arch rv --image disk.img
+./scripts/oscomp.sh support-check --arch la --image disk-la.img
+```
+
+Every scored run writes `score.json` and the per-arch marker/judge artifacts.
+Use `inspect-run --json` to check those artifacts without mutating the run
+directory.
+
+Replay can build a support image from an explicit LTP list:
+
+```bash
+python3 -m tools.oscomp_eval.replay replay \
   --arch rv \
   --ltp-list .state/ltp-lab/candidates/ltp_test.txt \
   --name ltp-list-rv
 ```
-
-`--ltp-list` is replay-only and is mutually exclusive with `--support-image`,
-because an already-built support image already contains its own
-`/meta/ltp_test.txt`.
 
 Refresh the vendored official judge snapshot from an explicit local checkout:
 
@@ -193,21 +166,33 @@ Refresh the vendored official judge snapshot from an explicit local checkout:
   --source /home/ava/Desktop/autotest-for-oskernel
 ```
 
-This only imports `kernel/judge` scripts and provenance. It does not fetch from
-the network or adopt the official Docker/QEMU controller.
-
-Focused runs that intentionally use a reduced guest plan should pass the same
-plan file to scoring so missing full-matrix groups are not treated as failures:
+Focused replays can pass an explicit group plan:
 
 ```bash
-./scripts/oscomp.sh evaluate \
+python3 -m tools.oscomp_eval.replay replay \
   --arch rv \
   --support-image .tmp/focused-rv-support.img \
   --plan .tmp/focused-plan.txt \
   --name focused-rv
 ```
 
-Local evaluator exit codes are stable enough for scripts:
+## Focused Lab
+
+Use `scripts/lab` for focused replay runs. It generates a guest plan, optional
+case filter payload, and support image, then uses the same replay, judge, and
+score path as `make replay-rv` and `make replay-la`.
+
+```bash
+make dev-shell DEV_CMD='./scripts/lab list'
+make dev-shell DEV_CMD='./scripts/lab explain --arch rv --select ltp-glibc:openat01'
+make dev-shell DEV_CMD='./scripts/lab run --arch rv --select ltp-glibc:openat01'
+make dev-shell DEV_CMD='./scripts/lab run --arch rv --select basic-musl'
+```
+
+Selectors use `GROUP-LIBC[:EXPR]`. `ltp` supports exact case names,
+`prefix=...`, and `regex=...`. Other groups run at group level.
+
+Exit codes:
 
 - `0`: command completed without score-facing issues.
 - `1`: command completed and wrote artifacts, but validation, judging, scoring,
@@ -220,25 +205,32 @@ Local evaluator exit codes are stable enough for scripts:
 
 ## Boot
 
-Boot an interactive local shell instead of the evaluator replay plan, from the
-host:
+Boot an interactive local shell:
 
 ```bash
-make dev-shell DEV_CMD='make boot-rv'
-make dev-shell DEV_CMD='make boot-la'
+make dev-shell DEV_CMD='make shell-rv'
+make dev-shell DEV_CMD='make shell-la'
 ```
 
-These targets build the matching kernel and a local support disk that sets
-`OSCOMP_BOOT_SHELL=1`. That boot-only variable makes `src/init.sh` enter a
-BusyBox shell; evaluator builds and replay runs do not set it.
+These targets build a shell-mode kernel. The shell uses the official test image
+as the first disk so `/musl/busybox` and the usual userland layout are present.
+The image is attached with QEMU snapshot mode, so the shell does not rewrite or
+copy the test image.
 
-Inside an already-open `make dev-shell`, run `make boot-rv` or `make boot-la`
-directly. Exit the guest shell with `exit`; the kernel then powers off.
+Inside `make dev-shell`, run `make shell-rv` or `make shell-la` directly. Exit
+the guest shell with `exit`; the kernel then powers off.
+
+## Smoke
+
+Targeted smoke checks are available through the smoke dispatcher:
+
+```bash
+make dev-shell DEV_CMD='./scripts/smoke.sh list'
+make dev-shell DEV_CMD='./scripts/smoke.sh lwext4-io-boost --arch rv'
+```
 
 ## Notes
 
 - Kernel behavior lives mainly under `kernel/`.
 - `src/init.sh` is guest-side runner logic.
 - Runtime, replay, and lab state live under `.state`.
-- OpenSpec changes should hold task-specific plans, investigations, and
-  implementation notes.

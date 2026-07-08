@@ -38,20 +38,23 @@ def official_judge_dir(root: Path | None = None) -> Path:
     return official_root(root) / "judge"
 
 
-RUN_ARTIFACT_NAMES = (
-    "manifest.json",
+CURRENT_RUN_ARTIFACT_NAMES = (
     "score.json",
-    "report.md",
-    "report.html",
-    "artifact-index.json",
     "inputs",
     "rv",
     "la",
 )
 
+LEGACY_RUN_ARTIFACT_NAMES = (
+    "manifest.json",
+    "report.md",
+    "report.html",
+    "artifact-index.json",
+)
+
 
 def _remove_run_artifacts(run_dir: Path) -> None:
-    for name in RUN_ARTIFACT_NAMES:
+    for name in CURRENT_RUN_ARTIFACT_NAMES + LEGACY_RUN_ARTIFACT_NAMES:
         path = run_dir / name
         if path.is_dir() and not path.is_symlink():
             shutil.rmtree(path)

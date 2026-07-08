@@ -1,6 +1,7 @@
 # Build Options
 ARCH ?= riscv64
 export ARCH
+export PYTHONDONTWRITEBYTECODE ?= 1
 LOG ?= off
 export LOG
 BANNER ?= n
@@ -21,8 +22,6 @@ DEV_ENV_DIR ?= $(ROOT_DIR)/dev-env
 EMPTY_TESTSUITE_DIR ?= $(ROOT_DIR)/.state/empty-testsuites
 AUTOSCRUB_DIRS ?= \
 	$(ROOT_DIR)/.tmp \
-	$(STATE_DIR)/riscv64 \
-	$(STATE_DIR)/loongarch64 \
 	$(STATE_DIR)/oscomp-replay
 
 # QEMU Options
@@ -48,59 +47,53 @@ LOG_DIR ?= $(STATE_ARCH_DIR)/logs
 QEMU_LOG_FILE ?= $(LOG_DIR)/qemu.log
 NET_DUMP_FILE ?= $(LOG_DIR)/netdump.pcap
 DISK_IMG ?= $(STATE_ARCH_DIR)/disk.img
-BOOT_STATE_DIR ?= $(STATE_DIR)/boot
-BOOT_ENV_FILE ?= $(BOOT_STATE_DIR)/oscomp-boot.env
-BOOT_RV_SUPPORT_IMG ?= $(BOOT_STATE_DIR)/disk-rv.img
-BOOT_LA_SUPPORT_IMG ?= $(BOOT_STATE_DIR)/disk-la.img
+STRIP_EVAL_ELF ?= y
+SUPPORT_DISK_CACHE_DIR ?= $(STATE_DIR)/support-disk
+KERNEL_CACHE_DIR ?= $(STATE_DIR)/kernel-cache
 
 ifeq ($(MEMTRACK), y)
 	APP_FEATURES += starry-api/memtrack
 endif
 
-default: build
+default: all
 
 help:
 	@printf '%s\n' \
 		'Build commands:' \
-		'  make all          clean evaluator build; remote-submission entrypoint, not high-frequency' \
-		'  make artifacts    refresh kernel-rv/kernel-la/disk.img/disk-rv.img/disk-la.img without clean-eval' \
+		'  make all          official evaluator entrypoint; builds kernel-rv/kernel-la/disk.img/disk-la.img only' \
 		'  make kernels      high-frequency build of kernel-rv and kernel-la only' \
 		'  make kernel-rv    high-frequency RISC-V evaluator kernel; keeps Cargo target cache' \
 		'  make kernel-la    high-frequency LoongArch evaluator kernel; keeps Cargo target cache' \
-		'  make disk.img     rebuild shared support disk only' \
-		'  make clean-eval   remove evaluator artifacts and build/replay state; keep .state/ltp-lab' \
-		'  make clean        full local clean, including .state' \
+		'  make disk.img     build/update RISC-V support disk only' \
+		'  make disk-la.img  build/update LoongArch support disk only' \
+		'  make clean        remove daily rebuild/replay artifacts; keep image cache and lab state' \
+		'  make clean-all    full local clean, including all .state data' \
 		'' \
 		'Replay commands:' \
-		'  make eval-rv      rebuild kernel-rv, then replay rv official image' \
-		'  make eval-la      rebuild kernel-la, then replay la official image' \
-		'  make replay-rv    reuse existing artifacts, then replay rv official image' \
-		'  make replay-la    reuse existing artifacts, then replay la official image' \
-		'  make eval-score-rv  run new local rv evaluate pipeline' \
-		'  make eval-score-la  run new local la evaluate pipeline' \
-		'  make eval-score     run new local rv+la evaluate pipeline' \
+		'  make replay-rv    build rv artifacts, run all rv tests, judge, score, and report' \
+		'  make replay-la    build la artifacts, run all la tests, judge, score, and report' \
 		'' \
 		'Boot commands:' \
-		'  make boot-rv      build/reuse rv artifacts, then boot an interactive shell' \
-		'  make boot-la      build/reuse la artifacts, then boot an interactive shell' \
+		'  make shell-rv     build a shell-mode rv kernel, then boot an interactive shell' \
+		'  make shell-la     build a shell-mode la kernel, then boot an interactive shell' \
 		'' \
+		'More:' \
+		'  make help-lab     show focused lab helper commands'
+
+help-lab:
+	@printf '%s\n' \
 		'Lab commands:' \
-		'  make lab-check' \
-		'  make lab-bootstrap' \
-		'  make lab-inventory' \
-		'  make lab-new NAME=goal3-fs-vfs-0001 SUITE="fs syscalls"' \
-		'  make lab-run NAME=goal3-fs-vfs-0001' \
-		'  make lab-review NAME=goal3-fs-vfs-0001' \
-		'  make lab-apply NAME=goal3-fs-vfs-0001' \
-		'  make lab-done NAME=goal3-fs-vfs-0001' \
-		'  make lab-trim       daily cleanup of disposable lab artifacts' \
-		'  make lab-clean      generated lab state cleanup'
+		'  make lab-list' \
+		'  make lab-explain ARCH=rv SELECT=ltp-glibc:openat01' \
+		'  make lab-run ARCH=rv SELECT=ltp-glibc:openat01' \
+		'' \
+		'Direct form:' \
+		'  ./scripts/lab run --arch rv --select ltp-glibc:openat01'
 
 all:
-	@$(MAKE) --no-print-directory clean-eval
 	@$(MAKE) --no-print-directory artifacts
 
-artifacts: kernels disk.img disk-rv.img disk-la.img
+artifacts: kernels disk.img disk-la.img
 	@$(MAKE) --no-print-directory check-eval-artifacts
 
 kernels: kernel-rv kernel-la
@@ -109,7 +102,7 @@ prebuild-scrub:
 	@rm -rf $(AUTOSCRUB_DIRS)
 	@mkdir -p $(STATE_DIR)
 
-clean-eval: prebuild-scrub legacy-clean
+clean: prebuild-scrub legacy-clean
 
 legacy-clean:
 	@rm -rf \
@@ -120,7 +113,6 @@ legacy-clean:
 		$(ROOT_DIR)/kernel-rv \
 		$(ROOT_DIR)/kernel-la \
 		$(ROOT_DIR)/disk.img \
-		$(ROOT_DIR)/disk-rv.img \
 		$(ROOT_DIR)/disk-la.img \
 		$(ROOT_DIR)/rv_.out \
 		$(ROOT_DIR)/la_.out \
@@ -149,7 +141,7 @@ dev-shell:
 dev-shell-root:
 	@OSKERNEL_DEV_IMAGE="$(OSKERNEL_DEV_IMAGE)" ./scripts/dev-shell.sh --service builder -- bash
 
-clean:
+clean-all:
 	@$(MAKE) -C make clean
 	@rm -rf $(STATE_DIR)
 	@$(MAKE) --no-print-directory legacy-clean
@@ -157,161 +149,212 @@ clean:
 build disasm: defconfig
 	@$(MAKE) -C make $@
 
-run:
-	@./scripts/oscomp.sh run --arch $(ARCH) $(OSCOMP_ARGS)
+replay-rv: kernel-rv disk.img
+	@PYTHONPATH="$(ROOT_DIR)$${PYTHONPATH:+:$$PYTHONPATH}" python3 -m tools.oscomp_eval.replay replay --arch rv $(if $(IMAGE),--image $(IMAGE),) $(if $(PLAN),--plan $(PLAN),) $(if $(TIMEOUT),--timeout $(TIMEOUT),) $(if $(IDLE_TIMEOUT),--idle-timeout $(IDLE_TIMEOUT),) $(if $(VERBOSE),--verbose,)
 
-eval-rv: kernel-rv
-	@./scripts/oscomp.sh run --arch rv --skip-kernel-build $(OSCOMP_ARGS)
+replay-la: kernel-la disk-la.img
+	@PYTHONPATH="$(ROOT_DIR)$${PYTHONPATH:+:$$PYTHONPATH}" python3 -m tools.oscomp_eval.replay replay --arch la $(if $(IMAGE),--image $(IMAGE),) $(if $(PLAN),--plan $(PLAN),) $(if $(TIMEOUT),--timeout $(TIMEOUT),) $(if $(IDLE_TIMEOUT),--idle-timeout $(IDLE_TIMEOUT),) $(if $(VERBOSE),--verbose,)
 
-eval-la: kernel-la
-	@./scripts/oscomp.sh run --arch la --skip-kernel-build $(OSCOMP_ARGS)
+shell-rv: kernel-rv-shell
+	@PYTHONPATH="$(ROOT_DIR)$${PYTHONPATH:+:$$PYTHONPATH}" python3 -m tools.oscomp_eval.replay shell --arch rv --kernel "$(STATE_DIR)/shell/kernel-rv" $(if $(IMAGE),--image $(IMAGE),) $(if $(TIMEOUT),--timeout $(TIMEOUT),) $(if $(VERBOSE),--verbose,)
 
-replay-rv:
-	@./scripts/oscomp.sh run --arch rv --skip-kernel-build $(OSCOMP_ARGS)
-
-replay-la:
-	@./scripts/oscomp.sh run --arch la --skip-kernel-build $(OSCOMP_ARGS)
-
-eval-score-rv:
-	@./scripts/oscomp.sh evaluate --arch rv --name "$(EVAL_NAME)-rv" $(EVAL_ARGS)
-
-eval-score-la:
-	@./scripts/oscomp.sh evaluate --arch la --name "$(EVAL_NAME)-la" $(EVAL_ARGS)
-
-eval-score:
-	@./scripts/oscomp.sh evaluate --arch both --name "$(EVAL_NAME)" $(EVAL_ARGS)
-
-$(BOOT_ENV_FILE):
-	@mkdir -p "$(BOOT_STATE_DIR)"
-	@printf '%s\n' 'OSCOMP_BOOT_SHELL=1' > "$@"
-
-$(BOOT_RV_SUPPORT_IMG): $(BOOT_ENV_FILE) src/init.sh scripts/build-oscomp-support-disk.sh
-	@bash ./scripts/build-oscomp-support-disk.sh --arch rv --output "$@" --env-override "$(BOOT_ENV_FILE)"
-
-$(BOOT_LA_SUPPORT_IMG): $(BOOT_ENV_FILE) src/init.sh scripts/build-oscomp-support-disk.sh
-	@bash ./scripts/build-oscomp-support-disk.sh --arch la --output "$@" --env-override "$(BOOT_ENV_FILE)"
-
-boot-rv: kernel-rv $(BOOT_RV_SUPPORT_IMG)
-	@./scripts/replay-oscomp-eval.sh --arch rv --support-image "$(BOOT_RV_SUPPORT_IMG)" --skip-kernel-build --interactive --timeout 0 $(OSCOMP_ARGS)
-
-boot-la: kernel-la $(BOOT_LA_SUPPORT_IMG)
-	@./scripts/replay-oscomp-eval.sh --arch la --support-image "$(BOOT_LA_SUPPORT_IMG)" --skip-kernel-build --interactive --timeout 0 $(OSCOMP_ARGS)
-
-lab-check:
-	@./scripts/lab bootstrap
-
-lab-bootstrap:
-	@./scripts/lab bootstrap --fetch
-
-lab-inventory:
-	@./scripts/lab inventory
-
-lab-summary:
-	@./scripts/lab summary
-
-lab-new:
-	@test -n "$(NAME)" || { printf '%s\n' 'NAME is required, e.g. make lab-new NAME=goal3-fs-vfs-0001 SUITE="fs syscalls"' >&2; exit 1; }
-	@./scripts/lab new "$(NAME)" $(SUITE) $(if $(LIMIT),--limit $(LIMIT),) $(if $(OFFSET),--offset $(OFFSET),) $(if $(GOAL),--goal "$(GOAL)",) $(LAB_ARGS)
-
-lab-run:
-	@test -n "$(NAME)" || { printf '%s\n' 'NAME is required, e.g. make lab-run NAME=goal3-fs-vfs-0001' >&2; exit 1; }
-	@./scripts/lab run "$(NAME)" $(LAB_ARGS)
-
-lab-review:
-	@test -n "$(NAME)" || { printf '%s\n' 'NAME is required, e.g. make lab-review NAME=goal3-fs-vfs-0001' >&2; exit 1; }
-	@./scripts/lab review "$(NAME)" $(LAB_ARGS)
-
-lab-apply:
-	@test -n "$(NAME)" || { printf '%s\n' 'NAME is required, e.g. make lab-apply NAME=goal3-fs-vfs-0001' >&2; exit 1; }
-	@./scripts/lab apply "$(NAME)" $(LAB_ARGS)
-
-lab-done:
-	@test -n "$(NAME)" || { printf '%s\n' 'NAME is required, e.g. make lab-done NAME=goal3-fs-vfs-0001' >&2; exit 1; }
-	@./scripts/lab done "$(NAME)" $(LAB_ARGS)
-
-lab-status:
-	@test -n "$(NAME)" || { printf '%s\n' 'NAME is required, e.g. make lab-status NAME=goal3-fs-vfs-0001' >&2; exit 1; }
-	@./scripts/lab campaign status "$(NAME)"
-
-lab-plan:
-	@./scripts/lab plan $(LAB_ARGS)
+shell-la: kernel-la-shell
+	@PYTHONPATH="$(ROOT_DIR)$${PYTHONPATH:+:$$PYTHONPATH}" python3 -m tools.oscomp_eval.replay shell --arch la --kernel "$(STATE_DIR)/shell/kernel-la" $(if $(IMAGE),--image $(IMAGE),) $(if $(TIMEOUT),--timeout $(TIMEOUT),) $(if $(VERBOSE),--verbose,)
 
 lab-list:
-	@./scripts/lab generate $(LAB_ARGS)
+	@./scripts/lab list
 
-lab-replay:
-	@./scripts/lab replay $(LAB_ARGS)
+lab-explain:
+	@test -n "$(ARCH)" || { printf '%s\n' 'ARCH is required, e.g. make lab-explain ARCH=rv SELECT=ltp-glibc:openat01' >&2; exit 1; }
+	@test -n "$(SELECT)" || { printf '%s\n' 'SELECT is required, e.g. make lab-explain ARCH=rv SELECT=ltp-glibc:openat01' >&2; exit 1; }
+	@./scripts/lab explain --arch "$(ARCH)" --select "$(SELECT)" $(LAB_ARGS)
 
-lab-parse:
-	@./scripts/lab parse $(LAB_ARGS)
+lab-run:
+	@test -n "$(ARCH)" || { printf '%s\n' 'ARCH is required, e.g. make lab-run ARCH=rv SELECT=ltp-glibc:openat01' >&2; exit 1; }
+	@test -n "$(SELECT)" || { printf '%s\n' 'SELECT is required, e.g. make lab-run ARCH=rv SELECT=ltp-glibc:openat01' >&2; exit 1; }
+	@./scripts/lab run --arch "$(ARCH)" --select "$(SELECT)" $(LAB_ARGS)
 
-lab-summarize:
-	@./scripts/lab summarize $(LAB_ARGS)
+define kernel_cache_key
+		{ \
+			printf 'target=%s\n' "$@"; \
+			printf 'arch=%s\n' "$(1)"; \
+			printf 'make_args=%s\n' "$(2)"; \
+			printf 'app_features=%s\n' "$(3)"; \
+			printf 'output=%s\n' "$(5)"; \
+			printf 'STRIP_EVAL_ELF=%s\n' "$(STRIP_EVAL_ELF)"; \
+			printf 'DEBUGINFO=%s\n' "$(DEBUGINFO)"; \
+			printf 'DWARF=%s\n' "$(DWARF)"; \
+			printf 'LOG=%s\n' "$(LOG)"; \
+			printf 'BANNER=%s\n' "$(BANNER)"; \
+			printf 'BACKTRACE=%s\n' "$(BACKTRACE)"; \
+			printf 'MEMTRACK=%s\n' "$(MEMTRACK)"; \
+			printf 'NO_AXSTD=%s\n' "$(NO_AXSTD)"; \
+			printf 'AX_LIB=%s\n' "$(AX_LIB)"; \
+			printf 'BLK=%s\n' "$(BLK)"; \
+			printf 'NET=%s\n' "$(NET)"; \
+			printf 'VSOCK=%s\n' "$(VSOCK)"; \
+			printf 'MEM=%s\n' "$(MEM)"; \
+			printf 'rustc:\n'; rustc -Vv; \
+			printf 'cargo:\n'; cargo -V; \
+			if [ "$(STRIP_EVAL_ELF)" = y ]; then \
+				printf 'rust-objcopy:\n'; rust-objcopy --version | sed -n '1,3p'; \
+			fi; \
+			for path in \
+				"$(ROOT_DIR)/Cargo.toml" \
+				"$(ROOT_DIR)/Cargo.lock" \
+				"$(ROOT_DIR)/kernel/Cargo.toml" \
+				"$(ROOT_DIR)/Makefile" \
+				"$(ROOT_DIR)/$(4)" \
+			; do \
+				[ -f "$$path" ] || continue; \
+				stat -c 'meta=%a %s %Y %n' "$$path"; \
+				sha256sum "$$path"; \
+			done; \
+			if [ -f "$(ROOT_DIR)/.cargo/config.toml" ]; then \
+				stat -c 'meta=%a %s %Y %n' "$(ROOT_DIR)/.cargo/config.toml"; \
+				sha256sum "$(ROOT_DIR)/.cargo/config.toml"; \
+			fi; \
+			for dir in \
+				"$(ROOT_DIR)/src" \
+				"$(ROOT_DIR)/kernel/src" \
+				"$(ROOT_DIR)/crates" \
+				"$(ROOT_DIR)/third_party/rust-patches" \
+				"$(ROOT_DIR)/make" \
+			; do \
+				[ -d "$$dir" ] || continue; \
+				find "$$dir" -type f -print0 | sort -z | xargs -0 -r stat -c 'meta=%s %Y %n'; \
+			done; \
+		} | sha256sum | awk '{print $$1}'
+endef
 
-lab-promote:
-	@./scripts/lab promote $(LAB_ARGS)
-
-lab-campaign:
-	@./scripts/lab campaign $(LAB_ARGS)
-
-lab-clean:
-	@./scripts/lab clean generated legacy-root $(LAB_CLEAN_ARGS)
-
-lab-trim:
-	@./scripts/lab clean trim $(LAB_CLEAN_ARGS)
-
-debug:
-	@printf '%s\n' 'debug is not wired to the official pre-2025 evaluator flow; use scripts/oscomp.sh run instead.' >&2
-	@exit 1
+define build_kernel_artifact
+	@set -e; \
+	mkdir -p "$(KERNEL_CACHE_DIR)" "$(dir $(5))"; \
+	key_file="$(KERNEL_CACHE_DIR)/$@.key"; \
+	if [ -s "$(5)" ] && [ -f "$$key_file" ]; then \
+		stale=0; \
+		for path in \
+			"$(ROOT_DIR)/Cargo.toml" \
+			"$(ROOT_DIR)/Cargo.lock" \
+			"$(ROOT_DIR)/kernel/Cargo.toml" \
+			"$(ROOT_DIR)/Makefile" \
+			"$(ROOT_DIR)/$(4)" \
+			"$(ROOT_DIR)/.cargo/config.toml" \
+		; do \
+			[ -e "$$path" ] || continue; \
+			if [ "$$path" -nt "$$key_file" ]; then stale=1; break; fi; \
+		done; \
+		if [ "$$stale" -eq 0 ]; then \
+			for dir in \
+				"$(ROOT_DIR)/src" \
+				"$(ROOT_DIR)/kernel/src" \
+				"$(ROOT_DIR)/crates" \
+				"$(ROOT_DIR)/third_party/rust-patches" \
+				"$(ROOT_DIR)/make" \
+			; do \
+				[ -d "$$dir" ] || continue; \
+				if find "$$dir" -type f -newer "$$key_file" -print -quit | grep -q .; then \
+					stale=1; \
+					break; \
+				fi; \
+			done; \
+		fi; \
+		if [ "$$stale" -eq 0 ]; then \
+			printf '%s\n' "$(5) is up to date"; \
+			exit 0; \
+		fi; \
+	fi; \
+	key="$$( $(call kernel_cache_key,$(1),$(2),$(3),$(4),$(5)) )"; \
+	if [ -s "$(5)" ] && [ -f "$$key_file" ] && [ "$$key" = "$$(cat "$$key_file")" ]; then \
+		printf '%s\n' "$(5) is up to date"; \
+		exit 0; \
+	fi; \
+	$(MAKE) -C make ARCH="$(1)" $(2) APP_FEATURES="$(3)" defconfig; \
+	$(MAKE) -C make ARCH="$(1)" $(2) APP_FEATURES="$(3)" build-elf-fast; \
+	kernel="$$(find "$(STATE_DIR)/$(1)/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
+	test -n "$$kernel"; \
+	python3 "$(4)" "$$kernel" "$(5)"; \
+	if [ "$(STRIP_EVAL_ELF)" = y ]; then \
+		rust-objcopy --strip-all "$(5)" "$(5).stripped"; \
+		mv "$(5).stripped" "$(5)"; \
+	fi; \
+	printf '%s\n' "$$key" > "$$key_file"; \
+	$(MAKE) --no-print-directory check-eval-kernel-size
+endef
 
 kernel-rv:
-	@$(MAKE) -C make ARCH=riscv64 BUS=mmio defconfig
-	@$(MAKE) -C make ARCH=riscv64 BUS=mmio build-elf-fast
-	@kernel="$$(find "$(STATE_DIR)/riscv64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
-	test -n "$$kernel"; \
-	python3 scripts/patch-riscv-kernel-elf.py "$$kernel" "$@"
-	@$(MAKE) --no-print-directory check-eval-kernel-size
+	$(call build_kernel_artifact,riscv64,BUS=mmio,$(APP_FEATURES),scripts/patch-riscv-kernel-elf.py,$@)
 
 kernel-la:
-	@$(MAKE) -C make ARCH=loongarch64 defconfig
-	@$(MAKE) -C make ARCH=loongarch64 build-elf-fast
-	@kernel="$$(find "$(STATE_DIR)/loongarch64/out" -maxdepth 1 -name '*.elf' | head -n 1)"; \
-	test -n "$$kernel"; \
-	python3 scripts/patch-loongarch-kernel-elf.py "$$kernel" "$@"
-	@$(MAKE) --no-print-directory check-eval-kernel-size
+	$(call build_kernel_artifact,loongarch64,,$(APP_FEATURES),scripts/patch-loongarch-kernel-elf.py,$@)
+
+kernel-rv-shell:
+	$(call build_kernel_artifact,riscv64,BUS=mmio,qemu boot-shell,scripts/patch-riscv-kernel-elf.py,$(STATE_DIR)/shell/kernel-rv)
+
+kernel-la-shell:
+	$(call build_kernel_artifact,loongarch64,,qemu boot-shell,scripts/patch-loongarch-kernel-elf.py,$(STATE_DIR)/shell/kernel-la)
+
+define build_support_disk
+	@set -e; \
+	mkdir -p "$(SUPPORT_DISK_CACHE_DIR)"; \
+	if [ -n "$(OSCOMP_PLAN_OVERRIDE)" ] && [ ! -f "$(OSCOMP_PLAN_OVERRIDE)" ]; then \
+		printf 'missing plan override: %s\n' "$(OSCOMP_PLAN_OVERRIDE)" >&2; \
+		exit 1; \
+	fi; \
+	key="$$( \
+		{ \
+			printf 'arch=%s\n' "$(1)"; \
+			printf 'plan=%s\n' "$(OSCOMP_PLAN_OVERRIDE)"; \
+			printf 'OSCOMP_RV_CC=%s\n' "$${OSCOMP_RV_CC:-}"; \
+			printf 'OSCOMP_LA_CC=%s\n' "$${OSCOMP_LA_CC:-}"; \
+			printf 'OSCOMP_LA_GLIBC_CC=%s\n' "$${OSCOMP_LA_GLIBC_CC:-}"; \
+			printf 'OSCOMP_RV_LIBGCC=%s\n' "$${OSCOMP_RV_LIBGCC:-}"; \
+			printf 'OSCOMP_LA_LIBGCC=%s\n' "$${OSCOMP_LA_LIBGCC:-}"; \
+			stat -c 'meta=%a %s %n' "$(ROOT_DIR)/scripts/build-oscomp-support-disk.sh" "$(ROOT_DIR)/ltp_test.txt"; \
+			sha256sum "$(ROOT_DIR)/scripts/build-oscomp-support-disk.sh" "$(ROOT_DIR)/ltp_test.txt"; \
+			if [ -n "$(OSCOMP_PLAN_OVERRIDE)" ]; then \
+				stat -c 'meta=%a %s %n' "$(OSCOMP_PLAN_OVERRIDE)"; \
+				sha256sum "$(OSCOMP_PLAN_OVERRIDE)"; \
+			fi; \
+			find "$(ROOT_DIR)/scripts/support-tools" "$(ROOT_DIR)/scripts/support-overlay" -type f -print0 | sort -z | xargs -0 -r stat -c 'meta=%a %s %n'; \
+			find "$(ROOT_DIR)/scripts/support-tools" "$(ROOT_DIR)/scripts/support-overlay" -type f -print0 | sort -z | xargs -0 -r sha256sum; \
+			if [ -d "$(STATE_DIR)/ltp-lab/refs/testsuits-for-oskernel/scripts" ]; then \
+				find "$(STATE_DIR)/ltp-lab/refs/testsuits-for-oskernel/scripts" -type f -print0 | sort -z | xargs -0 -r stat -c 'meta=%a %s %n'; \
+				find "$(STATE_DIR)/ltp-lab/refs/testsuits-for-oskernel/scripts" -type f -print0 | sort -z | xargs -0 -r sha256sum; \
+			fi; \
+		} | sha256sum | awk '{print $$1}' \
+	)"; \
+	key_file="$(SUPPORT_DISK_CACHE_DIR)/$@.key"; \
+	if [ -s "$@" ] && [ -f "$$key_file" ] && [ "$$key" = "$$(cat "$$key_file")" ]; then \
+		printf '%s\n' "$@ is up to date"; \
+		exit 0; \
+	fi; \
+	if [ -s "$@" ] && [ ! -f "$$key_file" ] && ./scripts/oscomp.sh support-check --arch "$(1)" --image "$@" >/dev/null; then \
+		printf '%s\n' "$$key" > "$$key_file"; \
+		printf '%s\n' "$@ is up to date"; \
+		exit 0; \
+	fi; \
+	set -- bash ./scripts/build-oscomp-support-disk.sh --arch "$(1)" --output "$@"; \
+		if [ -n "$(OSCOMP_PLAN_OVERRIDE)" ]; then \
+			set -- "$$@" --plan-override "$(OSCOMP_PLAN_OVERRIDE)"; \
+		fi; \
+	"$$@"; \
+	printf '%s\n' "$$key" > "$$key_file"
+endef
 
 disk.img:
-	@set -- bash ./scripts/build-oscomp-support-disk.sh --arch rv --output "$@"; \
-		if [ -n "$(OSCOMP_PLAN_OVERRIDE)" ]; then \
-			set -- "$$@" --plan-override "$(OSCOMP_PLAN_OVERRIDE)"; \
-		fi; \
-		"$$@"
-
-disk-rv.img: disk.img
-	@cp "$<" "$@"
+	$(call build_support_disk,rv)
 
 disk-la.img:
-	@set -- bash ./scripts/build-oscomp-support-disk.sh --arch la --output "$@"; \
-		if [ -n "$(OSCOMP_PLAN_OVERRIDE)" ]; then \
-			set -- "$$@" --plan-override "$(OSCOMP_PLAN_OVERRIDE)"; \
-		fi; \
-		"$$@"
+	$(call build_support_disk,la)
 
-# Aliases
-rv:
-	$(MAKE) ARCH=riscv64 run
-
-la:
-	$(MAKE) ARCH=loongarch64 run
-
-.PHONY: help all artifacts kernels build run eval-rv eval-la replay-rv replay-la eval-score-rv eval-score-la eval-score boot-rv boot-la lab-check lab-bootstrap lab-inventory lab-summary lab-new lab-run lab-review lab-apply lab-done lab-status lab-plan lab-list lab-replay lab-parse lab-summarize lab-promote lab-campaign lab-clean lab-trim dev-image dev-check dev-shell dev-shell-root debug disasm clean clean-eval legacy-clean prebuild-scrub check-eval-artifacts check-eval-kernel-size kernel-rv kernel-la disk.img disk-rv.img disk-la.img
+.PHONY: help help-lab all artifacts kernels build replay-rv replay-la shell-rv shell-la lab-list lab-explain lab-run dev-image dev-check dev-shell dev-shell-root disasm clean clean-all legacy-clean prebuild-scrub check-eval-artifacts check-eval-kernel-size kernel-rv kernel-la kernel-rv-shell kernel-la-shell disk.img disk-la.img
 check-eval-artifacts:
 	@missing=0; \
 	for artifact in \
 		$(ROOT_DIR)/kernel-rv \
 		$(ROOT_DIR)/kernel-la \
 		$(ROOT_DIR)/disk.img \
-		$(ROOT_DIR)/disk-rv.img \
 		$(ROOT_DIR)/disk-la.img; \
 	do \
 		if [ ! -s "$$artifact" ]; then \
@@ -320,7 +363,7 @@ check-eval-artifacts:
 		fi; \
 	done; \
 	exit "$$missing"
-	@./scripts/oscomp.sh support-check --arch rv --image "$(ROOT_DIR)/disk-rv.img"
+	@./scripts/oscomp.sh support-check --arch rv --image "$(ROOT_DIR)/disk.img"
 	@./scripts/oscomp.sh support-check --arch la --image "$(ROOT_DIR)/disk-la.img"
 
 check-eval-kernel-size:

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
 ARCH=rv
 WORKDIR=""
@@ -32,7 +32,7 @@ Runs an automated lwext4 I/O boost boot-shell smoke. The smoke covers:
 
 Run from the repo root, typically through the dev container, for example:
 
-  make dev-shell DEV_CMD='./scripts/lwext4-io-boost-smoke.sh --arch rv'
+  make dev-shell DEV_CMD='./scripts/smoke.sh lwext4-io-boost --arch rv'
 
 EOF
 }
@@ -227,7 +227,7 @@ EOF
         printf '%s\n' "$line"
         sleep "$LINE_DELAY_SECS"
     done <"$COMMANDS_FILE"
-) | "$REPO_ROOT/scripts/replay-oscomp-eval.sh" \
+) | python3 -m tools.oscomp_eval.replay qemu \
     --arch "$ARCH" \
     --support-image "$SUPPORT_IMAGE" \
     --timeout "$TIMEOUT_SECS" \

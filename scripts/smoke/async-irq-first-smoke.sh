@@ -2,14 +2,14 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
 ARCH=rv
 WORKDIR=""
 SUPPORT_IMAGE=""
 SUPPORT_IMAGE_EXPLICIT=0
 EXTRA_IMAGE=""
-TIMEOUT_SECS=180
+TIMEOUT_SECS=220
 BOOT_WAIT_SECS=${OSCOMP_SMOKE_BOOT_WAIT_SECS:-35}
 LINE_DELAY_SECS=${OSCOMP_SMOKE_LINE_DELAY_SECS:-0.75}
 SKIP_KERNEL_BUILD=1
@@ -19,16 +19,16 @@ usage() {
 Usage: $(basename "$0") [--arch {rv|la}] [--workdir DIR] [--support-image IMG]
                          [--extra-image IMG] [--timeout SECS] [--build-kernel]
 
-Runs a targeted async block queue smoke. It attaches a disposable extra raw
-block image, submits direct async write and read requests against that extra
-block device from the kernel, waits for completion, and checks VirtIO async
-counters.
+Runs a targeted async block wait-policy smoke. It switches to the default-off
+irq_first policy, first proves a no-timeout IRQ-first wait through the block
+selftest, then exercises dirty page-cache writeback and verifies the fallback
+diagnostic counters for consumers that still cannot block.
 
 EOF
 }
 
 die() {
-    printf 'async-block-queue-smoke: error: %s\n' "$*" >&2
+    printf 'async-irq-first-smoke: error: %s\n' "$*" >&2
     exit 1
 }
 
@@ -86,19 +86,19 @@ case "$TIMEOUT_SECS" in
 esac
 
 if [ -z "$WORKDIR" ]; then
-    WORKDIR="$REPO_ROOT/.state/async-block-queue-current/auto-smoke-$ARCH"
+    WORKDIR="$REPO_ROOT/.state/async-irq-first-current/auto-smoke-$ARCH"
 elif [[ "$WORKDIR" != /* ]]; then
     WORKDIR="$REPO_ROOT/$WORKDIR"
 fi
 
 if [ -z "$SUPPORT_IMAGE" ]; then
-    SUPPORT_IMAGE="$REPO_ROOT/.state/async-block-queue-current/support-$ARCH.img"
+    SUPPORT_IMAGE="$REPO_ROOT/.state/async-irq-first-current/support-$ARCH.img"
 elif [[ "$SUPPORT_IMAGE" != /* ]]; then
     SUPPORT_IMAGE="$REPO_ROOT/$SUPPORT_IMAGE"
 fi
 
 if [ -z "$EXTRA_IMAGE" ]; then
-    EXTRA_IMAGE="$REPO_ROOT/.state/async-block-queue-current/extra-$ARCH.img"
+    EXTRA_IMAGE="$REPO_ROOT/.state/async-irq-first-current/extra-$ARCH.img"
 elif [[ "$EXTRA_IMAGE" != /* ]]; then
     EXTRA_IMAGE="$REPO_ROOT/$EXTRA_IMAGE"
 fi
@@ -109,8 +109,8 @@ case "$ARCH" in
 esac
 
 cd "$REPO_ROOT"
-mkdir -p "$REPO_ROOT/.state/async-block-queue-current"
-SMOKE_ENV_FILE="$REPO_ROOT/.state/async-block-queue-current/smoke-support.env"
+mkdir -p "$REPO_ROOT/.state/async-irq-first-current"
+SMOKE_ENV_FILE="$REPO_ROOT/.state/async-irq-first-current/smoke-support.env"
 if [ ! -f "$SMOKE_ENV_FILE" ] || ! grep -qx 'OSCOMP_BOOT_SHELL=1' "$SMOKE_ENV_FILE"; then
     printf 'OSCOMP_BOOT_SHELL=1\n' >"$SMOKE_ENV_FILE"
 fi
@@ -142,89 +142,40 @@ fi
 rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR"
 
-COMMANDS_FILE=$(mktemp "$REPO_ROOT/.state/async-block-queue-current/smoke-$ARCH.commands.XXXXXX")
+COMMANDS_FILE=$(mktemp "$REPO_ROOT/.state/async-irq-first-current/smoke-$ARCH.commands.XXXXXX")
 trap 'rm -f "$COMMANDS_FILE"' EXIT
 cat >"$COMMANDS_FILE" <<'EOF'
-echo ASYNC_BLOCK_QUEUE_SMOKE_START
+echo ASYNC_IRQ_FIRST_SMOKE_START
 echo on > /proc/io_stats
 echo virtio_on > /proc/io_stats
 echo async_block_on > /proc/io_stats
 echo async_block_depth=4 > /proc/io_stats
 echo async_block_la_depth=2 > /proc/io_stats
-echo async_block_wait=hybrid > /proc/io_stats
+echo async_block_wait=irq_first > /proc/io_stats
 echo async_dirty_flush_sg_on > /proc/io_stats
-echo reset > /proc/io_stats
-if echo async_block_selftest_rw > /proc/io_stats; then
-    echo ASYNC_BLOCK_BATCH_RW_OK
-else
-    echo ASYNC_BLOCK_QUEUE_BAD
-fi
-echo async_block_adaptive_on > /proc/io_stats
-echo async_block_merge_write_on > /proc/io_stats
-rm -f /async_dirty /async_dirty_copy
-rm -f /async_rewrite /async_rewrite_copy /async_rewrite_expected
-rm -f /async_trunc /async_trunc_expected
-i=0
-while [ $i -lt 18 ]; do
-    rm -f /async_trim_$i
-    i=$((i + 1))
-done
-dd if=/dev/zero of=/async_dirty bs=4096 count=128
+rm -f /async_irq_first_dirty /async_irq_first_copy /async_irq_first_expected
+dd if=/dev/zero of=/async_irq_first_dirty bs=4096 count=128
 sync
 echo reset > /proc/io_stats
-dd if=/dev/zero of=/async_dirty bs=1024 count=512 conv=notrunc
+if echo async_block_selftest_irq_first > /proc/io_stats; then echo ASYNC_IRQ_FIRST_WAIT_OK; else echo ASYNC_IRQ_FIRST_WAIT_BAD; fi
+dd if=/bin/busybox of=/async_irq_first_dirty bs=1024 count=512 conv=notrunc
 sync
-dd if=/async_dirty of=/async_dirty_copy bs=4096 count=128
-cmp /async_dirty /async_dirty_copy && echo ASYNC_DIRTY_FLUSH_WRITE_OK || echo ASYNC_DIRTY_FLUSH_WRITE_BAD
-dd if=/dev/zero of=/async_rewrite bs=4096 count=128
-sync
-dd if=/bin/busybox of=/async_rewrite bs=1024 count=512 conv=notrunc
-sync
-dd if=/async_rewrite of=/async_rewrite_copy bs=4096 count=128
-dd if=/bin/busybox of=/async_rewrite_expected bs=1024 count=512
-cmp /async_rewrite_copy /async_rewrite_expected && echo ASYNC_DIRTY_FLUSH_REWRITE_OK || echo ASYNC_DIRTY_FLUSH_REWRITE_BAD
-dd if=/dev/zero of=/async_trunc bs=4096 count=128
-sync
-dd if=/bin/busybox of=/async_trunc bs=1024 count=512 conv=notrunc
-truncate -s 262144 /async_trunc
-sync
-dd if=/bin/busybox of=/async_trunc_expected bs=1024 count=256
-cmp /async_trunc /async_trunc_expected && echo ASYNC_DIRTY_FLUSH_TRUNCATE_BARRIER_OK || echo ASYNC_DIRTY_FLUSH_TRUNCATE_BARRIER_BAD
-i=0
-while [ $i -lt 18 ]; do
-    dd if=/bin/busybox of=/async_trim_$i bs=1000 count=264
-    i=$((i + 1))
-done
-# HOST_SLEEP 6
-sync
-rm -f /async_trim_first /async_trim_expected
-dd if=/async_trim_0 of=/async_trim_first bs=4096 count=1
-dd if=/bin/busybox of=/async_trim_expected bs=4096 count=1
-cmp /async_trim_first /async_trim_expected && echo ASYNC_DIRTY_FLUSH_RETAINED_TRIM_OK || echo ASYNC_DIRTY_FLUSH_RETAINED_TRIM_BAD
-if echo async_block_selftest_irq > /proc/io_stats; then
-    echo ASYNC_BLOCK_IRQ_DRAIN_OK
-else
-    echo ASYNC_BLOCK_IRQ_DRAIN_BAD
-fi
+dd if=/async_irq_first_dirty of=/async_irq_first_copy bs=4096 count=128
+dd if=/bin/busybox of=/async_irq_first_expected bs=1024 count=512
+cmp /async_irq_first_copy /async_irq_first_expected && echo ASYNC_IRQ_FIRST_DIRTY_OK || echo ASYNC_IRQ_FIRST_DIRTY_BAD
 cat /proc/io_stats
 echo off > /proc/io_stats
-echo ASYNC_BLOCK_QUEUE_DONE
+echo ASYNC_IRQ_FIRST_SMOKE_DONE
 exit
 EOF
 
 (
     sleep "$BOOT_WAIT_SECS"
     while IFS= read -r line; do
-        case "$line" in
-            "# HOST_SLEEP "*)
-                sleep "${line#"# HOST_SLEEP "}"
-                continue
-                ;;
-        esac
         printf '%s\n' "$line"
         sleep "$LINE_DELAY_SECS"
     done <"$COMMANDS_FILE"
-) | "$REPO_ROOT/scripts/replay-oscomp-eval.sh" \
+) | python3 -m tools.oscomp_eval.replay qemu \
     --arch "$ARCH" \
     --support-image "$SUPPORT_IMAGE" \
     --extra-block-image "$EXTRA_IMAGE" \
@@ -238,23 +189,27 @@ LOG="$WORKDIR/qemu.log"
 [ -f "$LOG" ] || die "missing QEMU log: $LOG"
 
 for marker in \
-    ASYNC_BLOCK_BATCH_RW_OK \
-    ASYNC_DIRTY_FLUSH_WRITE_OK \
-    ASYNC_DIRTY_FLUSH_REWRITE_OK \
-    ASYNC_DIRTY_FLUSH_TRUNCATE_BARRIER_OK \
-    ASYNC_DIRTY_FLUSH_RETAINED_TRIM_OK \
-    ASYNC_BLOCK_IRQ_DRAIN_OK \
-    ASYNC_BLOCK_QUEUE_DONE
+    ASYNC_IRQ_FIRST_WAIT_OK \
+    ASYNC_IRQ_FIRST_DIRTY_OK \
+    ASYNC_IRQ_FIRST_SMOKE_DONE
 do
     grep -Eq "^${marker}([[:space:]].*)?$" "$LOG" || die "missing marker: $marker"
 done
 
-if grep -Eq '^[[:space:]]*(ASYNC_BLOCK_QUEUE_BAD|ASYNC_BLOCK_IRQ_DRAIN_BAD|ASYNC_DIRTY_FLUSH_[A-Z0-9_]+_BAD)([[:space:]].*)?$|Kernel panic|panic|BUG:' "$LOG"; then
+if grep -Eq '^[[:space:]]*(ASYNC_IRQ_FIRST_WAIT_BAD|ASYNC_IRQ_FIRST_DIRTY_BAD)([[:space:]].*)?$|Kernel panic|panic|BUG:' "$LOG"; then
     die "failure marker or panic found in $LOG"
 fi
 
 counter_value() {
     awk -v key="$1" '$1 == key { value = $2; gsub(/\r/, "", value) } END { if (value != "") print value; }' "$LOG"
+}
+
+assert_counter_present() {
+    local key=$1
+    local value
+    value=$(counter_value "$key")
+    [ -n "$value" ] || die "missing counter: $key"
+    printf '%s %s\n' "$key" "$value"
 }
 
 assert_counter_ge() {
@@ -267,48 +222,47 @@ assert_counter_ge() {
     printf '%s %s\n' "$key" "$value"
 }
 
-assert_counter_eq_zero() {
+assert_counter_eq() {
     local key=$1
+    local expected=$2
     local value
     value=$(counter_value "$key")
     [ -n "$value" ] || die "missing counter: $key"
-    [ "$value" -eq 0 ] || die "counter unexpectedly increased: $key=$value"
+    [ "$value" -eq "$expected" ] || die "counter mismatch: $key=$value expected=$expected"
     printf '%s %s\n' "$key" "$value"
 }
 
-printf 'async-block-queue-smoke: markers OK\n'
+assert_counter_eq_zero() {
+    assert_counter_eq "$1" 0
+}
+
+printf 'async-irq-first-smoke: markers OK\n'
+assert_counter_eq virtio.blk_async_wait_policy 2
 assert_counter_ge virtio.blk_async_submit_batches 1
-assert_counter_ge virtio.blk_async_submit_requests 8
-assert_counter_ge virtio.blk_async_completed_requests 8
+assert_counter_ge virtio.blk_async_submit_requests 4
+assert_counter_ge virtio.blk_async_completed_requests 4
 assert_counter_ge virtio.blk_async_max_depth 2
-assert_counter_ge virtio.blk_async_adaptive_enabled 1
-assert_counter_ge virtio.blk_async_adaptive_depth 2
-assert_counter_ge virtio.blk_async_adaptive_increases 1
-assert_counter_ge virtio.blk_async_adaptive_decreases 0
-assert_counter_ge virtio.blk_async_adaptive_good_events 2
-assert_counter_ge virtio.blk_async_adaptive_pressure_events 0
-assert_counter_ge virtio.blk_async_merge_write_enabled 1
-assert_counter_ge virtio.blk_async_merge_write_calls 1
-assert_counter_ge virtio.blk_async_merge_write_input_segments 64
-assert_counter_ge virtio.blk_async_merge_write_output_requests 1
-assert_counter_ge virtio.blk_async_merge_write_saved_requests 1
-if [ "$ARCH" = rv ]; then
-    assert_counter_ge virtio.blk_async_merge_write_max_segments 8
-else
-    assert_counter_ge virtio.blk_async_merge_write_max_segments 4
-fi
-assert_counter_ge virtio.blk_async_desc_budget 1
-assert_counter_ge virtio.blk_async_interrupt_drains 1
 assert_counter_ge cached.async_dirty_flush_hits 1
-assert_counter_ge cached.async_dirty_flush_pages 64
-assert_counter_ge cached.async_dirty_flush_bytes 262144
 assert_counter_ge cached.async_dirty_flush_sg_enabled 1
 assert_counter_ge cached.async_dirty_flush_sg_hits 1
 assert_counter_ge cached.async_dirty_flush_sg_segments 64
-assert_counter_ge cached.async_dirty_flush_bounce_fallbacks 0
+assert_counter_ge cached.async_dirty_flush_sg_async_submit_hits 1
+assert_counter_ge cached.async_dirty_flush_sg_async_submit_segments 64
+assert_counter_present cached.async_dirty_flush_bounce_fallbacks
+assert_counter_ge ext4.mapped_overwrite_vectored_hits 1
+assert_counter_ge ext4.mapped_overwrite_vectored_bytes 262144
+assert_counter_ge virtio.blk_vectored_write_requests 16
+assert_counter_ge virtio.blk_async_irq_first_arms 1
+assert_counter_ge virtio.blk_async_irq_first_waits 2
+assert_counter_ge virtio.blk_async_wait_wakeups 2
+assert_counter_present virtio.blk_async_irq_first_fallbacks
+assert_counter_eq_zero virtio.blk_async_irq_first_fallback_unarmed
+assert_counter_present virtio.blk_async_irq_first_fallback_cannot_block
+assert_counter_eq_zero virtio.blk_async_irq_first_fallback_no_irq
+assert_counter_eq_zero virtio.blk_async_irq_first_fallback_register_failed
+assert_counter_eq_zero virtio.blk_async_irq_first_fallback_feature_disabled
+assert_counter_eq_zero virtio.blk_async_queue_full
 assert_counter_eq_zero cached.async_dirty_flush_errors
-assert_counter_eq_zero cached.async_dirty_flush_writeback_restarts
-assert_counter_eq_zero cached.closed_cache_trim_flush_errors
 assert_counter_eq_zero virtio.blk_async_completion_errors
 assert_counter_eq_zero virtio.blk_async_resource_leaks
-printf 'async-block-queue-smoke: counters OK\n'
+printf 'async-irq-first-smoke: counters OK\n'

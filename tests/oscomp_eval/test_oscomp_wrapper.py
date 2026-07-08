@@ -72,14 +72,14 @@ class OscompWrapperTests(unittest.TestCase):
         self.assertIn("scripts/oscomp.sh validate-output", result.stderr)
 
     def test_lab_help_remains_available(self) -> None:
-        result = self.run_wrapper("lab", "--help")
+        result = self.run_wrapper("ltp-lab", "--help")
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("Local LTP experiment harness", result.stdout)
         self.assertIn("replay", result.stdout)
 
     def test_missing_option_value_is_usage_error(self) -> None:
-        result = self.run_wrapper("evaluate", "--rv-log")
+        result = self.run_wrapper("score-logs", "--rv-log")
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("missing value for --rv-log", result.stderr)

@@ -12,8 +12,8 @@ Imported source:
 - source path used for this import: `/home/ava/Desktop/autotest-for-oskernel`
 
 The inspected source checkout did not contain a top-level `LICENSE`, `COPYING`,
-or `NOTICE` file. Keep the exact source URL, commit, and imported file list in
-`manifest.json` so future refreshes are auditable.
+or `NOTICE` file. The exact source URL, commit, and imported file list are
+recorded in `manifest.json`.
 
 Refresh from an explicit local checkout only:
 
@@ -28,9 +28,9 @@ commit, source status, imported file list, and added/removed/changed file
 summary. It does not fetch from the network and does not import the official
 QEMU, prework, postwork, template, or `pygrading.Job` controller path.
 
-After refreshing, run:
+Validation commands:
 
 ```bash
 python3 -m unittest discover -s tests/oscomp_eval -v
-python3 -m compileall -q tools/oscomp_eval scripts/validate-oscomp-output.py scripts/ltp-lab.py tests/oscomp_eval
+python3 -m py_compile tools/oscomp_eval/*.py tools/oscomp_eval/lab/*.py scripts/ltp-lab.py tests/oscomp_eval/*.py
 ```

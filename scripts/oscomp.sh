@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+export PYTHONDONTWRITEBYTECODE=1
 
 REFERENCE_PLAN_GROUPS=(
     basic
@@ -41,14 +42,11 @@ usage() {
     cat <<'EOF'
 Usage:
   scripts/oscomp.sh list
-  scripts/oscomp.sh lab ...
-  scripts/oscomp.sh run --arch {rv|la|riscv64|loongarch64} [options]
+  scripts/oscomp.sh ltp-lab ...
   scripts/oscomp.sh verify --arch {rv|la|riscv64|loongarch64} [--image PATH]
   scripts/oscomp.sh validate-output --log PATH [--arch {rv|la|riscv64|loongarch64}]
   scripts/oscomp.sh judge-log --arch {rv|la|riscv64|loongarch64} --log PATH --out DIR [--plan PATH] [options]
   scripts/oscomp.sh score-logs [--rv-log PATH] [--la-log PATH] [--plan PATH] [--name NAME] [--out DIR] [options]
-  scripts/oscomp.sh evaluate [--rv-log PATH] [--la-log PATH] [--arch {rv|la|both}] [--plan PATH] [--ltp-list PATH] [options]
-  scripts/oscomp.sh report-run RUN_DIR
   scripts/oscomp.sh inspect-run [--json] RUN_DIR
   scripts/oscomp.sh official-refresh --source PATH [--repo URL] [--commit SHA] [--allow-dirty]
   scripts/oscomp.sh support-check --arch {rv|la|riscv64|loongarch64} --image PATH [--json]
@@ -57,28 +55,9 @@ Commands:
   list
       Print the current T202-aligned evaluation plan.
 
-  lab
-      Forward to scripts/ltp-lab.py for LTP inventory, focused list
-      generation, replay orchestration, log parsing, and cleanup.
-
-  run
-      Boot the official pre-2025 evaluator image under the contest QEMU shape.
-      The image search order is:
-        $OSCOMP_TESTSUITE_DIR
-        /home/dia/kernel-image
-        $HOME/kernel-image
-        $HOME/testsuits-for-oskernel
-        /coursegrader/testdata
-      Accepted image suffixes are .img, .img.xz, and .img.gz.
-
-      Options:
-        --arch VALUE
-        --image PATH
-        --support-image PATH
-        --timeout SECS
-        --workdir DIR
-        --skip-kernel-build
-        --keep-workdir
+  ltp-lab
+      Run the LTP inventory, focused list, replay, log parsing, and cleanup
+      utilities.
 
   verify
       Validate the expected internal pre-2025 image layout.
@@ -91,32 +70,18 @@ Commands:
   judge-log
       Parse one console log, write marker artifacts, and run the vendored
       official-compatible judge scripts for the expected local matrix.
-      Pass --plan PATH for focused logs that intentionally contain a reduced
-      group/libc matrix.
+      Pass --plan PATH for focused logs with a reduced group/libc matrix.
 
   score-logs
       Offline score path for existing RV/LA logs. This creates a local run
-      directory with marker, judge, manifest, and score JSON artifacts.
+      directory with marker, judge, and score JSON artifacts.
       Pass --plan PATH when the logs were generated from a matching reduced
       guest plan.
 
-  report-run
-      Regenerate report.md from an existing local run directory.
-
   inspect-run
       Inspect an existing local run directory without mutating it. This checks
-      manifest, score, report, and artifact-index structure and returns
-      nonzero when structural or score-facing issues are found.
-
-  evaluate
-      New local evaluation entrypoint. With --rv-log/--la-log it scores
-      existing logs; without logs it launches replay through the existing
-      replay-oscomp-eval.sh runner and then judges, scores, and reports.
-      In replay mode, --plan PATH defines the expected matrix; use it with a
-      matching --support-image when running a focused guest plan. Pass
-      --ltp-list PATH to build a run-local support image with that LTP list.
-      Pass --idle-timeout SECS to stop a replay that stops writing console
-      output even though the whole-QEMU timeout has not expired.
+      score and per-arch marker/judge artifacts and returns nonzero when
+      structural or score-facing issues are found.
 
   official-refresh
       Refresh the vendored official judge snapshot from an explicit local
@@ -124,8 +89,7 @@ Commands:
       network and does not import the official QEMU/prework/postwork controller.
 
   support-check
-      Validate a support disk image before replay. This catches stale images
-      whose /meta/init.sh no longer matches src/init.sh, or images missing
+      Validate a support disk image before replay. This catches images missing
       guest-side timeout support required for bounded LTP runs.
 EOF
 }
@@ -158,40 +122,6 @@ list_cmd() {
     printf '  /glibc cyclictest\n'
     printf 'groups in fixed plan:\n'
     printf '  %s\n' "${REFERENCE_PLAN_GROUPS[@]}"
-}
-
-run_cmd() {
-    local arch=""
-    local args=()
-
-    while (($#)); do
-        case "$1" in
-            --arch)
-                [[ $# -ge 2 ]] || die "missing value for --arch"
-                arch=$(canonical_arch "$2") || die "unsupported arch: $2"
-                shift 2
-                ;;
-            --image|--support-image|--timeout|--workdir)
-                [[ $# -ge 2 ]] || die "missing value for $1"
-                args+=("$1" "$2")
-                shift 2
-                ;;
-            --skip-kernel-build|--keep-workdir)
-                args+=("$1")
-                shift
-                ;;
-            -h|--help)
-                usage
-                exit 0
-                ;;
-            *)
-                die "unknown run option: $1"
-                ;;
-        esac
-    done
-
-    [[ -n "$arch" ]] || die "run requires --arch"
-    exec "$SCRIPT_DIR/replay-oscomp-eval.sh" --arch "$arch" "${args[@]}"
 }
 
 verify_cmd() {
@@ -320,38 +250,6 @@ score_logs_cmd() {
     exec env PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m tools.oscomp_eval score-logs "${args[@]}"
 }
 
-evaluate_cmd() {
-    local args=()
-
-    while (($#)); do
-        case "$1" in
-            --rv-log|--la-log|--name|--out|--judge-dir|--judge-timeout|--arch|--timeout|--idle-timeout|--image|--support-image|--plan|--ltp-list)
-                [[ $# -ge 2 ]] || die "missing value for $1"
-                args+=("$1" "$2")
-                shift 2
-                ;;
-            --fail-fast|--replace|--skip-kernel-build|--keep-workdir)
-                args+=("$1")
-                shift
-                ;;
-            -h|--help)
-                usage
-                exit 0
-                ;;
-            *)
-                die "unknown evaluate option: $1"
-                ;;
-        esac
-    done
-
-    exec env PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m tools.oscomp_eval evaluate "${args[@]}"
-}
-
-report_run_cmd() {
-    [[ $# -eq 1 ]] || die "report-run requires exactly one RUN_DIR"
-    exec env PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m tools.oscomp_eval report-run "$1"
-}
-
 inspect_run_cmd() {
     local args=()
 
@@ -451,10 +349,6 @@ main() {
             shift
             list_cmd "$@"
             ;;
-        run)
-            shift
-            run_cmd "$@"
-            ;;
         verify)
             shift
             verify_cmd "$@"
@@ -471,14 +365,6 @@ main() {
             shift
             score_logs_cmd "$@"
             ;;
-        evaluate)
-            shift
-            evaluate_cmd "$@"
-            ;;
-        report-run)
-            shift
-            report_run_cmd "$@"
-            ;;
         inspect-run)
             shift
             inspect_run_cmd "$@"
@@ -491,7 +377,7 @@ main() {
             shift
             support_check_cmd "$@"
             ;;
-        lab)
+        ltp-lab)
             shift
             exec "$SCRIPT_DIR/ltp-lab.py" "$@"
             ;;

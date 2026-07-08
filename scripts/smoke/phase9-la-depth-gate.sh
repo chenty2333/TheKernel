@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
 WORKROOT="$REPO_ROOT/.state/phase9-la-depth-gate"
 TIMEOUT_SECS=7000
@@ -401,7 +401,7 @@ run_scenario() {
 
     printf 'phase9-la-depth-gate: running %s\n' "$scenario"
     set +e
-    "$REPO_ROOT/scripts/replay-oscomp-eval.sh" "${replay_args[@]}"
+    python3 -m tools.oscomp_eval.replay qemu "${replay_args[@]}"
     local replay_status=$?
     set -e
 

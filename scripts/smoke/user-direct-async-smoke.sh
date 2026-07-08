@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
 ARCH=rv
 WORKDIR=""
@@ -18,22 +18,18 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [--arch {rv|la}] [--workdir DIR] [--support-image IMG]
                          [--timeout SECS] [--boot-wait SECS] [--line-delay SECS]
-                         [--wait-policy {hybrid|irq_first}]
-                         [--build-kernel]
+                         [--wait-policy {hybrid|irq_first}] [--build-kernel]
 
-Runs a targeted lwext4 async mapped-read smoke. The smoke covers:
-  - aligned mapped read into the hot read path
-  - page-cache fill through aligned backend reads
-  - multi-open read-after-overwrite coherence
-  - truncate-after-prefetch stale-read rejection
-  - sparse-hole fallback and zero-fill correctness
-  - fragmented-extent-style fallback correctness
+Runs a targeted user-direct async I/O smoke. The smoke enables the async block
+queue plus user_direct_async, then runs the oscomp-io-pin-safety --async-direct
+support tool to cover aligned pinned read/write, readv/writev, fallback cases,
+and advisory signal-after-submit accounting in irq-first mode.
 
 EOF
 }
 
 die() {
-    printf 'lwext4-async-read-smoke: error: %s\n' "$*" >&2
+    printf 'user-direct-async-smoke: error: %s\n' "$*" >&2
     exit 1
 }
 
@@ -86,23 +82,25 @@ case "$ARCH" in
     rv|la) ;;
     *) die "--arch must be rv or la" ;;
 esac
+
 case "$WAIT_POLICY" in
     hybrid|irq_first) ;;
     interrupt_first) WAIT_POLICY=irq_first ;;
     *) die "--wait-policy must be hybrid or irq_first" ;;
 esac
+
 case "$TIMEOUT_SECS" in
     ''|*[!0-9]*) die "--timeout must be a non-negative integer" ;;
 esac
 
 if [ -z "$WORKDIR" ]; then
-    WORKDIR="$REPO_ROOT/.state/lwext4-async-read-current/auto-smoke-$ARCH"
+    WORKDIR="$REPO_ROOT/.state/user-direct-async-current/auto-smoke-$ARCH"
 elif [[ "$WORKDIR" != /* ]]; then
     WORKDIR="$REPO_ROOT/$WORKDIR"
 fi
 
 if [ -z "$SUPPORT_IMAGE" ]; then
-    SUPPORT_IMAGE="$REPO_ROOT/.state/lwext4-async-read-current/support-$ARCH.img"
+    SUPPORT_IMAGE="$REPO_ROOT/.state/user-direct-async-current/support-$ARCH.img"
 elif [[ "$SUPPORT_IMAGE" != /* ]]; then
     SUPPORT_IMAGE="$REPO_ROOT/$SUPPORT_IMAGE"
 fi
@@ -113,8 +111,8 @@ case "$ARCH" in
 esac
 
 cd "$REPO_ROOT"
-mkdir -p "$REPO_ROOT/.state/lwext4-async-read-current"
-SMOKE_ENV_FILE="$REPO_ROOT/.state/lwext4-async-read-current/smoke-support.env"
+mkdir -p "$REPO_ROOT/.state/user-direct-async-current"
+SMOKE_ENV_FILE="$REPO_ROOT/.state/user-direct-async-current/smoke-support.env"
 if [ ! -f "$SMOKE_ENV_FILE" ] || ! grep -qx 'OSCOMP_BOOT_SHELL=1' "$SMOKE_ENV_FILE"; then
     printf 'OSCOMP_BOOT_SHELL=1\n' >"$SMOKE_ENV_FILE"
 fi
@@ -142,57 +140,36 @@ fi
 rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR"
 
-COMMANDS_FILE=$(mktemp "$REPO_ROOT/.state/lwext4-async-read-current/smoke-$ARCH.commands.XXXXXX")
+COMMANDS_FILE=$(mktemp "$REPO_ROOT/.state/user-direct-async-current/smoke-$ARCH.commands.XXXXXX")
 trap 'rm -f "$COMMANDS_FILE"' EXIT
 cat >"$COMMANDS_FILE" <<'EOF'
-echo LWEXT4_ASYNC_READ_SMOKE_START
+echo USER_DIRECT_ASYNC_SMOKE_START
 echo on > /proc/io_stats
 echo virtio_on > /proc/io_stats
 echo async_block_on > /proc/io_stats
 echo async_block_depth=4 > /proc/io_stats
 echo async_block_la_depth=2 > /proc/io_stats
 echo async_block_wait=__WAIT_POLICY__ > /proc/io_stats
+echo user_direct_async_on > /proc/io_stats
 echo lwext4_async_read_on > /proc/io_stats
 echo reset > /proc/io_stats
-rm -f /ar_src /ar_copy /ar_pagefill /ar_pagefill_expected
-rm -f /ar_multi /ar_multi_read /ar_zero /ar_trunc /ar_trunc_tail
-rm -f /ar_sparse /ar_sparse_first /ar_frag /ar_gap /ar_frag_read
-dd if=/dev/zero of=/ar_zero bs=4096 count=1
-dd if=/bin/busybox of=/ar_src bs=4096 count=16
-sync
-dd if=/ar_src of=/ar_copy bs=4096 count=16
-cmp /ar_src /ar_copy && echo ASYNC_ALIGNED_MAPPED_READ_OK || echo ASYNC_ALIGNED_MAPPED_READ_BAD
-dd if=/ar_src of=/ar_pagefill bs=1000 count=5
-dd if=/ar_src of=/ar_pagefill_expected bs=1000 count=5
-cmp /ar_pagefill /ar_pagefill_expected && echo ASYNC_PAGECACHE_FILL_OK || echo ASYNC_PAGECACHE_FILL_BAD
-dd if=/bin/busybox of=/ar_multi bs=4096 count=2
-sync
-exec 7</ar_multi
-dd if=/dev/zero of=/ar_multi bs=4096 count=1 conv=notrunc
-dd of=/ar_multi_read bs=4096 count=1 <&7
-exec 7<&-
-cmp /ar_zero /ar_multi_read && echo ASYNC_MULTIOPEN_OVERWRITE_OK || echo ASYNC_MULTIOPEN_OVERWRITE_BAD
-dd if=/bin/busybox of=/ar_trunc bs=4096 count=8
-dd if=/ar_trunc of=/ar_trunc_tail bs=1000 count=5
-truncate -s 4096 /ar_trunc && echo ASYNC_TRUNCATE_CMD_OK || echo ASYNC_TRUNCATE_CMD_BAD
-dd if=/ar_trunc of=/ar_trunc_tail bs=4096 skip=1 count=1
-bytes=$(wc -c < /ar_trunc_tail)
-test "$bytes" = 0 && echo ASYNC_TRUNCATE_STALE_REJECT_OK || echo ASYNC_TRUNCATE_STALE_REJECT_BAD
-dd if=/bin/busybox of=/ar_sparse bs=4096 count=1 seek=1
-dd if=/ar_sparse of=/ar_sparse_first bs=4096 count=1
-cmp /ar_zero /ar_sparse_first && echo ASYNC_SPARSE_HOLE_FALLBACK_OK || echo ASYNC_SPARSE_HOLE_FALLBACK_BAD
-dd if=/bin/busybox of=/ar_frag bs=4096 count=1
-dd if=/bin/busybox of=/ar_gap bs=4096 count=8
-dd if=/bin/busybox of=/ar_frag bs=4096 skip=1 seek=1 count=1 conv=notrunc
-dd if=/ar_frag of=/ar_frag_read bs=4096 count=2
-bytes=$(wc -c < /ar_frag_read)
-test "$bytes" = 8192 && echo ASYNC_FRAGMENTED_FALLBACK_OK || echo ASYNC_FRAGMENTED_FALLBACK_BAD
+/opt/oscomp-support/bin/oscomp-io-pin-safety __ASYNC_DIRECT_ARG__
+tool_rc=$?
 cat /proc/io_stats
+echo user_direct_async_off > /proc/io_stats
+echo lwext4_async_read_off > /proc/io_stats
 echo off > /proc/io_stats
-echo LWEXT4_ASYNC_READ_SMOKE_DONE
+if [ $tool_rc -eq 0 ]; then echo USER_DIRECT_ASYNC_TOOL_OK; fi
+if [ $tool_rc -ne 0 ]; then echo USER_DIRECT_ASYNC_TOOL_FAIL; fi
+echo USER_DIRECT_ASYNC_SMOKE_DONE
 exit
 EOF
 sed -i "s/__WAIT_POLICY__/$WAIT_POLICY/g" "$COMMANDS_FILE"
+if [ "$WAIT_POLICY" = irq_first ]; then
+    sed -i "s/__ASYNC_DIRECT_ARG__/--async-direct/g" "$COMMANDS_FILE"
+else
+    sed -i "s/__ASYNC_DIRECT_ARG__/--async-direct-no-signal/g" "$COMMANDS_FILE"
+fi
 
 (
     sleep "$BOOT_WAIT_SECS"
@@ -200,7 +177,7 @@ sed -i "s/__WAIT_POLICY__/$WAIT_POLICY/g" "$COMMANDS_FILE"
         printf '%s\n' "$line"
         sleep "$LINE_DELAY_SECS"
     done <"$COMMANDS_FILE"
-) | "$REPO_ROOT/scripts/replay-oscomp-eval.sh" \
+) | python3 -m tools.oscomp_eval.replay qemu \
     --arch "$ARCH" \
     --support-image "$SUPPORT_IMAGE" \
     --timeout "$TIMEOUT_SECS" \
@@ -213,19 +190,29 @@ LOG="$WORKDIR/qemu.log"
 [ -f "$LOG" ] || die "missing QEMU log: $LOG"
 
 for marker in \
-    ASYNC_ALIGNED_MAPPED_READ_OK \
-    ASYNC_PAGECACHE_FILL_OK \
-    ASYNC_MULTIOPEN_OVERWRITE_OK \
-    ASYNC_TRUNCATE_CMD_OK \
-    ASYNC_TRUNCATE_STALE_REJECT_OK \
-    ASYNC_SPARSE_HOLE_FALLBACK_OK \
-    ASYNC_FRAGMENTED_FALLBACK_OK \
-    LWEXT4_ASYNC_READ_SMOKE_DONE
+    USER_DIRECT_ASYNC_CONTIG_READ_OK \
+    USER_DIRECT_ASYNC_CONTIG_WRITE_OK \
+    USER_DIRECT_ASYNC_IOV_READ_OK \
+    USER_DIRECT_ASYNC_IOV_WRITE_OK \
+    USER_DIRECT_ASYNC_FILE_MMAP_READ_OK \
+    USER_DIRECT_ASYNC_FILE_MMAP_WRITE_OK \
+    USER_DIRECT_ASYNC_UNALIGNED_FALLBACK_OK \
+    USER_DIRECT_ASYNC_TOO_MANY_SEGMENTS_FALLBACK_OK \
+    USER_DIRECT_ASYNC_OK \
+    USER_DIRECT_ASYNC_TOOL_OK \
+    USER_DIRECT_ASYNC_SMOKE_DONE
 do
     grep -Eq "^${marker}([[:space:]].*)?$" "$LOG" || die "missing marker: $marker"
 done
+if [ "$WAIT_POLICY" = irq_first ]; then
+    grep -Eq '^USER_DIRECT_ASYNC_SIGNAL_AFTER_SUBMIT_(OK|MISSED)([[:space:]].*)?$' "$LOG" \
+        || die "missing signal-after-submit advisory marker"
+else
+    grep -Eq '^USER_DIRECT_ASYNC_SIGNAL_AFTER_SUBMIT_SKIPPED([[:space:]].*)?$' "$LOG" \
+        || die "missing marker: USER_DIRECT_ASYNC_SIGNAL_AFTER_SUBMIT_SKIPPED"
+fi
 
-if grep -Eq '^[[:space:]]*ASYNC_[A-Z0-9_]+_BAD([[:space:]].*)?$|Kernel panic|panic|BUG:' "$LOG"; then
+if grep -Eq '^[[:space:]]*(USER_DIRECT_ASYNC_FAIL|USER_DIRECT_ASYNC_TOOL_FAIL)([[:space:]].*)?$|Kernel panic|panic|BUG:' "$LOG"; then
     die "failure marker or panic found in $LOG"
 fi
 
@@ -257,17 +244,36 @@ assert_counter_eq_zero() {
     assert_counter_eq "$1" 0
 }
 
-printf 'lwext4-async-read-smoke: markers OK\n'
+printf 'user-direct-async-smoke: markers OK\n'
+assert_counter_ge user_pin.async_direct_enabled 1
+assert_counter_ge user_pin.async_direct_read_hits 2
+assert_counter_ge user_pin.async_direct_read_bytes 36864
+assert_counter_ge user_pin.async_direct_read_segments 9
+assert_counter_ge user_pin.async_direct_write_hits 2
+assert_counter_ge user_pin.async_direct_write_bytes 36864
+assert_counter_ge user_pin.async_direct_write_segments 9
+assert_counter_ge user_pin.async_submit_fallbacks 2
+assert_counter_ge user_pin.async_resource_unpins 4
+assert_counter_ge user_pin.direct_read_hits 2
+assert_counter_ge user_pin.direct_write_hits 2
+assert_counter_ge user_pin.page_cache_pin_hits 1
+assert_counter_ge user_pin.page_cache_pin_unpins 1
+assert_counter_ge user_pin.unpins 4
+assert_counter_ge virtio.blk_async_submit_batches 1
+assert_counter_ge virtio.blk_async_submit_requests 4
+assert_counter_ge virtio.blk_async_completed_requests 4
 assert_counter_ge ext4.async_mapped_read_enabled 1
 assert_counter_ge ext4.async_mapped_read_hits 1
 assert_counter_ge ext4.async_mapped_read_runs 1
 assert_counter_ge ext4.async_mapped_read_bytes 4096
 assert_counter_ge ext4.async_mapped_read_submit_batches 1
-assert_counter_ge ext4.async_mapped_read_fallbacks 1
-assert_counter_ge ext4.mapped_read_runs 1
-assert_counter_ge virtio.blk_async_submit_batches 1
-assert_counter_ge virtio.blk_async_submit_requests 1
-assert_counter_ge virtio.blk_async_completed_requests 1
+assert_counter_ge ext4.mapped_read_vectored_runs 1
+assert_counter_eq_zero ext4.async_mapped_read_cookie_rejects
+if [ "$ARCH" = rv ]; then
+    assert_counter_ge virtio.blk_async_max_depth 2
+else
+    assert_counter_ge virtio.blk_async_max_depth 1
+fi
 if [ "$WAIT_POLICY" = irq_first ]; then
     assert_counter_eq virtio.blk_async_wait_policy 2
     assert_counter_ge virtio.blk_async_irq_first_arms 1
@@ -281,8 +287,7 @@ else
     assert_counter_eq virtio.blk_async_wait_policy 0
     assert_counter_eq_zero virtio.blk_async_irq_first_waits
 fi
-assert_counter_eq_zero ext4.async_mapped_read_cookie_rejects
 assert_counter_eq_zero virtio.blk_async_completion_errors
 assert_counter_eq_zero virtio.blk_async_resource_leaks
-printf 'lwext4-async-read-smoke: counters OK\n'
-printf 'lwext4-async-read-smoke: log %s\n' "$LOG"
+printf 'user-direct-async-smoke: counters OK\n'
+printf 'user-direct-async-smoke: log %s\n' "$LOG"

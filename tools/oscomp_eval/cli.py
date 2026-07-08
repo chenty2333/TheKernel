@@ -8,12 +8,16 @@ import sys
 import traceback
 from pathlib import Path
 
-from .config import ConfigError, canonical_arch, group_libc_matrix_from_plan
+from .config import (
+    ConfigError,
+    JUDGE_TIMEOUT_SECS,
+    canonical_arch,
+    group_libc_matrix_from_plan,
+)
 from .evaluate import evaluate_replay
 from .judge_runner import JudgeRunnerError, judge_log
 from .markers import MarkerError, compatible_summary, parse_log, write_artifacts
 from .provenance import ProvenanceError, refresh_official_snapshot
-from .report import ReportError, generate_report
 from .run_inspect import RunInspectError, inspect_run
 from .score_logs import score_logs
 from .support_image import SupportImageConfigError, SupportImageError, inspect_support_image
@@ -130,9 +134,7 @@ def _run_score_logs_from_args(args: argparse.Namespace, *, label: str) -> int:
             judge_timeout_secs=args.judge_timeout,
             fail_fast=args.fail_fast,
             replace=args.replace,
-            command=sys.argv,
             group_libc_matrix=group_libc_matrix,
-            plan_path=Path(args.plan).expanduser() if args.plan else None,
         )
     except (ValueError, FileExistsError, MarkerError, JudgeRunnerError) as error:
         print(f"error: {error}", file=sys.stderr)
@@ -202,12 +204,11 @@ def evaluate_cmd(args: argparse.Namespace) -> int:
             ltp_list=Path(args.ltp_list).expanduser() if args.ltp_list else None,
             plan_path=Path(args.plan).expanduser() if args.plan else None,
             skip_kernel_build=args.skip_kernel_build,
-            keep_workdir=args.keep_workdir,
+            keep_workdir=False,
             judge_dir=Path(args.judge_dir).expanduser() if args.judge_dir else None,
             judge_timeout_secs=args.judge_timeout,
             fail_fast=args.fail_fast,
             replace=args.replace,
-            command=sys.argv,
             group_libc_matrix=group_libc_matrix,
         )
     except (
@@ -236,22 +237,6 @@ def evaluate_cmd(args: argparse.Namespace) -> int:
         f"replay_failures={result.replay_failures}"
     )
     return evaluate_exit_code(result)
-
-
-def report_run_cmd(args: argparse.Namespace) -> int:
-    try:
-        result = generate_report(Path(args.run_dir).expanduser())
-    except ReportError as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 2
-
-    print(
-        "report-run "
-        f"run_dir={result.run_dir} "
-        f"markdown={result.markdown_path} "
-        f"issues={result.issue_count}"
-    )
-    return 1 if result.issue_count else 0
 
 
 def inspect_run_cmd(args: argparse.Namespace) -> int:
@@ -363,7 +348,7 @@ def build_parser() -> argparse.ArgumentParser:
     judge_log_parser.add_argument(
         "--judge-timeout",
         type=float,
-        default=30,
+        default=JUDGE_TIMEOUT_SECS,
         help="per-judge timeout in seconds",
     )
     judge_log_parser.add_argument(
@@ -396,7 +381,7 @@ def build_parser() -> argparse.ArgumentParser:
     score_logs_parser.add_argument(
         "--judge-timeout",
         type=float,
-        default=30,
+        default=JUDGE_TIMEOUT_SECS,
         help="per-judge timeout in seconds",
     )
     score_logs_parser.add_argument(
@@ -440,7 +425,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="plan file defining the expected group/libc matrix for judging/scoring",
     )
     evaluate_parser.add_argument("--skip-kernel-build", action="store_true")
-    evaluate_parser.add_argument("--keep-workdir", action="store_true")
     evaluate_parser.add_argument(
         "--name",
         default="manual-evaluate",
@@ -451,19 +435,12 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument(
         "--judge-timeout",
         type=float,
-        default=30,
+        default=JUDGE_TIMEOUT_SECS,
         help="per-judge timeout in seconds",
     )
     evaluate_parser.add_argument("--fail-fast", action="store_true")
     evaluate_parser.add_argument("--replace", action="store_true")
     evaluate_parser.set_defaults(func=evaluate_cmd)
-
-    report_run_parser = subparsers.add_parser(
-        "report-run",
-        help="regenerate report.md from an existing run directory",
-    )
-    report_run_parser.add_argument("run_dir", help="run directory containing manifest.json and score.json")
-    report_run_parser.set_defaults(func=report_run_cmd)
 
     inspect_run_parser = subparsers.add_parser(
         "inspect-run",
