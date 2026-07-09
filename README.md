@@ -113,9 +113,9 @@ make dev-shell DEV_CMD='make disk-la.img'
 Inside `make dev-shell`, run the inner `make ...` commands directly.
 
 `make clean` removes root evaluator artifacts (`kernel-rv`, `kernel-la`,
-`disk.img`, `disk-la.img`), replay workdirs (`.state/oscomp-replay`,
-`.state/oscomp-eval/runs`), arch build outputs (`.state/<arch>/out` and
-`logs`), and shell kernels (`.state/shell`). It keeps Cargo target caches
+`disk.img`, `disk-la.img`), replay outputs (`.state/replay`,
+`.state/oscomp-replay`, `.state/oscomp-eval/runs`), arch build outputs
+(`.state/<arch>/out` and `logs`), and shell kernels (`.state/shell`). It keeps Cargo target caches
 (`.state/<arch>/target`), the build cache (`.state/build-cache`), decompressed
 test images (`.state/oscomp-image-cache`), and lab state (`.state/oscomp-lab`,
 `.state/ltp-lab`). `make clean-all` removes all `.state` data.
@@ -130,8 +130,8 @@ The local evaluator is centered on `tools/oscomp_eval/replay.py`.
 
 | Entry | Purpose |
 | --- | --- |
-| `make replay ARCH=both` | Build artifacts, run RV/LA in parallel, judge, score |
-| `make replay-rv` / `make replay-la` | Build artifacts, run QEMU, judge, score |
+| `make replay` | Build artifacts, run RV/LA in parallel, judge, score |
+| `make replay ARCH=rv` / `make replay ARCH=la` | Build one architecture, run QEMU, judge, score |
 | `scripts/oscomp.sh score-logs` | Offline scoring from existing console logs |
 | `scripts/lab` | Focused replay for one group or LTP case |
 | `scripts/ltp-lab.py` via `scripts/oscomp.sh ltp-lab` | LTP campaign inventory, replay, and cleanup |
@@ -148,41 +148,53 @@ Build the matching artifacts, run both architectures in QEMU, judge the console
 logs, and write the local score:
 
 ```bash
-make dev-shell DEV_CMD='make replay ARCH=both'
+make dev-shell DEV_CMD='make replay'
 ```
 
 Inside `make dev-shell`:
 
 ```bash
-make replay ARCH=both
+make replay
 ```
 
-Single-architecture replay is still available:
+Single-architecture replay:
 
 ```bash
-make replay-rv
-make replay-la
 make replay ARCH=rv
 make replay ARCH=la
 ```
 
-Each replay writes the kernel console output as `qemu.log` and the score as
-`score.json` under `.state/oscomp-eval/runs/`. A dual-architecture replay keeps
-the logs at `.state/oscomp-eval/runs/replay/rv/qemu.log` and
-`.state/oscomp-eval/runs/replay/la/qemu.log`. `score.json` includes a top-level
-`run` object with run name, status, arches, timeout, image paths, and per-arch
-QEMU metadata. There is no `report.md`, `manifest.json`, artifact index, or
-retained marker/judge intermediate output in replay runs.
+Each replay writes a numbered run under `.state/replay/<id>/`. The evaluator-
+visible console logs are `rv.out` and `la.out`; these are the kernel serial
+outputs used for local judging. `score.json` includes the total score, issues,
+run name, run id, status, arches, git commit/dirty state, artifact digests, and
+log paths. Replay runs do not write `report.md`, `manifest.json`, artifact
+indexes, or retained marker/judge intermediate output.
+
+The latest replay is linked as `.state/replay/latest`. Normal replay garbage
+collection keeps the newest 5 numbered runs and every 10th older run. Use
+`KEEP=1` for a run that should never be removed by replay garbage collection:
+
+```bash
+make dev-shell DEV_CMD='make replay NAME="memory_sys_improve" KEEP=1'
+```
+
+QEMU internal debug logging is off by default. Enable a small guest-error log
+only when needed:
+
+```bash
+make dev-shell DEV_CMD='make replay ARCH=rv QEMU_LOG=1'
+make dev-shell DEV_CMD='make replay ARCH=rv QEMU_TRACE=int'
+make dev-shell DEV_CMD='make replay ARCH=rv QEMU_TRACE=cpu'
+```
+
+Those commands create `rv_qemu.log` or `la_qemu.log` next to the matching
+`.out` file. The `_qemu.log` files are QEMU internal diagnostics, not the
+evaluator-visible kernel output.
 
 Raw `.img` test images are attached with QEMU snapshot mode. The support disk is
 attached read-only. Compressed `.gz` or `.xz` test images are decompressed once
 into `.state/oscomp-image-cache/` and reused by later replays.
-
-Use `REPLAY_ARGS` for explicit replay flags:
-
-```bash
-make dev-shell DEV_CMD='make replay ARCH=rv REPLAY_ARGS="--timeout 1200 --image path/to/sdcard-rv.img"'
-```
 
 `make replay ARCH=both` launches RV and LA replays in parallel. `make all`
 remains the official evaluator build entrypoint and does not run QEMU.
@@ -200,8 +212,8 @@ Replay and lab console logs can be parsed, judged, and scored without starting
 QEMU:
 
 ```bash
-./scripts/oscomp.sh validate-output --log .state/path/to/qemu.log --arch rv
-./scripts/oscomp.sh judge-log --arch rv --log .state/path/to/qemu.log --out .state/oscomp-eval/runs/manual-rv/rv
+./scripts/oscomp.sh validate-output --log .state/replay/latest/rv.out --arch rv
+./scripts/oscomp.sh judge-log --arch rv --log .state/replay/latest/rv.out --out .state/oscomp-eval/runs/manual-rv/rv
 ./scripts/oscomp.sh score-logs \
   --rv-log .state/path/to/rv.log \
   --la-log .state/path/to/la.log \
@@ -220,18 +232,11 @@ Support disks can be checked explicitly:
 
 Offline scoring commands write `score.json` and per-arch marker/judge artifacts.
 Use `inspect-run --json` to check those artifacts without mutating the run
-directory. Normal replay runs keep only `score.json` and per-arch `qemu.log`.
+directory. Normal replay runs keep only `score.json`, `rv.out` / `la.out`, and
+optional `rv_qemu.log` / `la_qemu.log`.
 
-Replay can build a support image from an explicit LTP list. The image is stored
-in the content-addressed pool under `.state/build-cache/support-disks/` (not
-under the run directory):
-
-```bash
-python3 -m tools.oscomp_eval.replay replay \
-  --arch rv \
-  --ltp-list .state/ltp-lab/candidates/ltp_test.txt \
-  --name ltp-list-rv
-```
+Focused and case-level runs are handled by `scripts/lab`; `make replay` is only
+for the full local evaluator flow.
 
 Refresh the vendored official judge snapshot from an explicit local checkout:
 
@@ -240,22 +245,12 @@ Refresh the vendored official judge snapshot from an explicit local checkout:
   --source /home/ava/Desktop/autotest-for-oskernel
 ```
 
-Focused replays can pass an explicit group plan:
-
-```bash
-python3 -m tools.oscomp_eval.replay replay \
-  --arch rv \
-  --support-image .tmp/focused-rv-support.img \
-  --plan .tmp/focused-plan.txt \
-  --name focused-rv
-```
-
 ## Focused Lab
 
 Use `scripts/lab` for focused replay runs. It writes the guest plan and optional
 case filter payload under `.state/oscomp-lab/`, builds or reuses the focused
 support image from `.state/build-cache/support-disks/`, then uses the same
-replay, judge, and score path as `make replay-rv` and `make replay-la`.
+underlying replay, judge, and score path as the full local evaluator.
 
 ```bash
 make dev-shell DEV_CMD='make lab-list'

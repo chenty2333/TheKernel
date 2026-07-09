@@ -2,16 +2,20 @@ ROOT_DIR := $(CURDIR)
 STATE_DIR ?= $(ROOT_DIR)/.state
 ARCH ?= riscv64
 export PYTHONDONTWRITEBYTECODE ?= 1
-REPLAY_ARGS ?=
+KEEP ?=
+QEMU_LOG ?=
+QEMU_TRACE ?=
 SHELL_ARGS ?=
 LAB_ARGS ?=
 SMOKE_ARGS ?=
 REPLAY_ARCH ?= $(if $(filter command line,$(origin ARCH)),$(ARCH),both)
+REPLAY_NAME := $(if $(filter command line,$(origin NAME)),$(NAME),replay)
 export OSKERNEL_DEV_IMAGE ?= thekernel-dev:local
 DEV_ENV_DIR ?= $(ROOT_DIR)/dev-env
 EMPTY_TESTSUITE_DIR ?= $(ROOT_DIR)/.state/empty-testsuites
 CLEAN_DIRS ?= \
 	$(ROOT_DIR)/.tmp \
+	$(STATE_DIR)/replay \
 	$(STATE_DIR)/oscomp-replay \
 	$(STATE_DIR)/oscomp-eval/runs \
 	$(STATE_DIR)/riscv64/out \
@@ -44,9 +48,10 @@ help:
 		'Replay commands:' \
 		'  make replay       build artifacts, run rv/la in parallel, judge, and score' \
 		'  make replay ARCH=rv|la|both' \
-		'  make replay-rv    build rv artifacts, run all rv tests, judge, and score' \
-		'  make replay-la    build la artifacts, run all la tests, judge, and score' \
-		'  make replay-rv REPLAY_ARGS="--timeout 1200 --image path/to/sdcard-rv.img"' \
+		'  make replay NAME="memory_sys_improve"' \
+		'  make replay KEEP=1' \
+		'  make replay QEMU_LOG=1' \
+		'  make replay QEMU_TRACE=int|cpu|exec' \
 		'' \
 		'Boot commands:' \
 		'  make shell-rv     build a shell-mode rv kernel, then boot an interactive shell' \
@@ -132,7 +137,7 @@ replay:
 	case "$$arch" in \
 		both|all) \
 			$(MAKE) --no-print-directory artifacts; \
-			$(PYTHONPATH_CMD) python3 -m tools.oscomp_eval evaluate --arch both --name replay --replace $(REPLAY_ARGS); \
+			$(PYTHONPATH_CMD) python3 -m tools.oscomp_eval evaluate --arch both --name "$(REPLAY_NAME)" $(if $(KEEP),--keep,) $(if $(QEMU_LOG),--qemu-log,) $(if $(QEMU_TRACE),--qemu-trace "$(QEMU_TRACE)",); \
 			;; \
 		rv|riscv64) \
 			$(MAKE) --no-print-directory replay-rv; \
@@ -147,10 +152,10 @@ replay:
 	esac
 
 replay-rv: kernel-rv disk.img
-	@$(PYTHONPATH_CMD) python3 -m tools.oscomp_eval.replay replay --arch rv $(REPLAY_ARGS)
+	@$(PYTHONPATH_CMD) python3 -m tools.oscomp_eval evaluate --arch rv --name "$(REPLAY_NAME)" $(if $(KEEP),--keep,) $(if $(QEMU_LOG),--qemu-log,) $(if $(QEMU_TRACE),--qemu-trace "$(QEMU_TRACE)",)
 
 replay-la: kernel-la disk-la.img
-	@$(PYTHONPATH_CMD) python3 -m tools.oscomp_eval.replay replay --arch la $(REPLAY_ARGS)
+	@$(PYTHONPATH_CMD) python3 -m tools.oscomp_eval evaluate --arch la --name "$(REPLAY_NAME)" $(if $(KEEP),--keep,) $(if $(QEMU_LOG),--qemu-log,) $(if $(QEMU_TRACE),--qemu-trace "$(QEMU_TRACE)",)
 
 shell-rv: kernel-rv-shell
 	@$(PYTHONPATH_CMD) python3 -m tools.oscomp_eval.replay shell --arch rv --kernel "$(STATE_DIR)/shell/kernel-rv" $(SHELL_ARGS)

@@ -21,6 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, TextIO
 
@@ -36,7 +37,7 @@ from .config import (
 )
 from .judge_runner import JudgeRunnerError, judge_log
 from .markers import MarkerError
-from .paths import create_run_dir, prepare_run_dir, repo_root
+from .paths import prepare_run_dir, repo_root
 from .schemas import JudgeSummary, ScoreSummary
 from .scoring import score_judge_summaries, write_score_summary
 from .support_image import SupportImageBuild, build_support_image
@@ -48,6 +49,14 @@ Mode = Literal["replay", "shell"]
 
 QEMU_MEMORY = "1G"
 QEMU_SMP = "1"
+REPLAY_RECENT_KEEP = 5
+REPLAY_INTERVAL_KEEP = 10
+QEMU_TRACE_PRESETS = {
+    "guest": "guest_errors",
+    "int": "guest_errors,int",
+    "cpu": "guest_errors,int,cpu",
+    "exec": "guest_errors,int,cpu,in_asm,exec",
+}
 
 
 class ReplayError(RuntimeError):
@@ -77,6 +86,8 @@ class ReplayResult:
     log_path: Path
     workdir: Path
     error_message: str | None = None
+    qemu_debug: str | None = None
+    qemu_debug_log_path: Path | None = None
 
     @property
     def ok(self) -> bool:
@@ -112,8 +123,18 @@ class ReplayResult:
         }
         if self.error_message is not None:
             data["error"] = self.error_message
+        if self.qemu_debug is not None:
+            data["qemu_debug"] = self.qemu_debug
+        if self.qemu_debug_log_path is not None:
+            data["qemu_debug_log_path"] = str(self.qemu_debug_log_path)
         if base_dir is not None:
-            for field, path in (("log_relpath", self.log_path), ("workdir_relpath", self.workdir)):
+            for field, path in (
+                ("log_relpath", self.log_path),
+                ("workdir_relpath", self.workdir),
+                ("qemu_debug_log_relpath", self.qemu_debug_log_path),
+            ):
+                if path is None:
+                    continue
                 try:
                     data[field] = str(path.relative_to(base_dir))
                 except ValueError:
@@ -162,6 +183,110 @@ def workdir_base(root: Path) -> Path:
 
 def image_cache_dir(root: Path) -> Path:
     return Path(os.environ.get("OSCOMP_IMAGE_CACHE_DIR", state_root(root) / "oscomp-image-cache"))
+
+
+def replay_root(root: Path) -> Path:
+    return Path(os.environ.get("OSCOMP_REPLAY_DIR", state_root(root) / "replay"))
+
+
+def parse_run_id(path: Path) -> int | None:
+    if not path.name.isdigit():
+        return None
+    try:
+        return int(path.name)
+    except ValueError:
+        return None
+
+
+def numeric_run_dirs(root: Path) -> list[tuple[int, Path]]:
+    if not root.is_dir():
+        return []
+    runs: list[tuple[int, Path]] = []
+    for path in root.iterdir():
+        if not path.is_dir():
+            continue
+        run_id = parse_run_id(path)
+        if run_id is not None:
+            runs.append((run_id, path))
+    runs.sort(key=lambda item: item[0])
+    return runs
+
+
+def create_numbered_run_dir(root: Path, *, replace: bool = False) -> tuple[Path, int]:
+    root.mkdir(parents=True, exist_ok=True)
+    lock_dir = root / ".alloc.lock"
+    while True:
+        try:
+            lock_dir.mkdir()
+            break
+        except FileExistsError:
+            if stale_lock(lock_dir):
+                shutil.rmtree(lock_dir, ignore_errors=True)
+                continue
+            time.sleep(0.1)
+    try:
+        next_id = (numeric_run_dirs(root)[-1][0] + 1) if numeric_run_dirs(root) else 1
+        run_dir = root / str(next_id)
+        prepare_run_dir(run_dir, replace=replace)
+        return run_dir, next_id
+    finally:
+        shutil.rmtree(lock_dir, ignore_errors=True)
+
+
+def is_numbered_replay_run(root: Path, run_dir: Path) -> bool:
+    try:
+        return (
+            run_dir.parent.resolve() == root.resolve()
+            and parse_run_id(run_dir) is not None
+        )
+    except OSError:
+        return False
+
+
+def update_latest_link(root: Path, run_dir: Path) -> None:
+    latest = root / "latest"
+    try:
+        if latest.exists() or latest.is_symlink():
+            if latest.is_dir() and not latest.is_symlink():
+                shutil.rmtree(latest)
+            else:
+                latest.unlink()
+        latest.symlink_to(run_dir.name)
+    except OSError:
+        latest.write_text(f"{run_dir.name}\n", encoding="utf-8")
+
+
+def run_is_marked_keep(run_dir: Path) -> bool:
+    if (run_dir / ".keep").exists():
+        return True
+    score_path = run_dir / "score.json"
+    if not score_path.is_file():
+        return False
+    try:
+        import json
+
+        data = json.loads(score_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    run = data.get("run") if isinstance(data, dict) else None
+    return isinstance(run, dict) and bool(run.get("keep"))
+
+
+def gc_replay_runs(root: Path, *, current_id: int | None) -> None:
+    runs = numeric_run_dirs(root)
+    if not runs:
+        return
+    max_id = runs[-1][0]
+    for run_id, run_dir in runs:
+        if current_id is not None and run_id == current_id:
+            continue
+        if run_id > max_id - REPLAY_RECENT_KEEP:
+            continue
+        if run_id % REPLAY_INTERVAL_KEEP == 0:
+            continue
+        if run_is_marked_keep(run_dir):
+            continue
+        shutil.rmtree(run_dir, ignore_errors=True)
 
 
 def testsuite_roots(root: Path) -> tuple[Path, ...]:
@@ -235,6 +360,83 @@ def cache_key(source: Path) -> str:
     digest.update(b"\0")
     digest.update(str(stat.st_mtime_ns).encode())
     return digest.hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while True:
+            chunk = file.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def artifact_metadata(path: Path, *, root: Path) -> dict[str, object] | None:
+    if not path.is_file():
+        return None
+    stat = path.stat()
+    try:
+        relpath = path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        relpath = str(path)
+    return {
+        "path": relpath,
+        "size": stat.st_size,
+        "sha256": sha256_file(path),
+    }
+
+
+def replay_artifacts_metadata(root: Path, arches: tuple[str, ...]) -> dict[str, dict[str, object]]:
+    paths: list[Path] = []
+    if "rv" in arches:
+        paths.extend((root / "kernel-rv", root / "disk.img"))
+    if "la" in arches:
+        paths.extend((root / "kernel-la", root / "disk-la.img"))
+
+    artifacts: dict[str, dict[str, object]] = {}
+    for path in paths:
+        data = artifact_metadata(path, root=root)
+        if data is not None:
+            artifacts[path.name] = data
+    return artifacts
+
+
+def capture_text(argv: list[str], *, cwd: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=cwd,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip()
+
+
+def git_metadata(root: Path) -> dict[str, object]:
+    commit = capture_text(["git", "rev-parse", "HEAD"], cwd=root)
+    status = capture_text(["git", "status", "--porcelain"], cwd=root)
+    data: dict[str, object] = {"dirty": bool(status)}
+    if commit:
+        data["commit"] = commit
+    return data
+
+
+def qemu_trace_flags(trace: str | None, *, qemu_log: bool = False) -> str | None:
+    if trace is None or trace == "":
+        return QEMU_TRACE_PRESETS["guest"] if qemu_log else None
+    if trace not in QEMU_TRACE_PRESETS:
+        supported = ", ".join(sorted(QEMU_TRACE_PRESETS))
+        raise ReplayError(f"unsupported QEMU_TRACE preset: {trace}; expected one of: {supported}")
+    return QEMU_TRACE_PRESETS[trace]
 
 
 def stale_lock(lock_dir: Path) -> bool:
@@ -332,6 +534,8 @@ def build_qemu_command(
     image: Path,
     support_image: Path | None,
     extra_block_image: Path | None = None,
+    qemu_debug: str | None = None,
+    qemu_debug_log: Path | None = None,
 ) -> tuple[str, ...]:
     if arch == "rv":
         command = [
@@ -377,6 +581,10 @@ def build_qemu_command(
                     "virtio-blk-device,drive=x2,bus=virtio-mmio-bus.2",
                 ]
             )
+        if qemu_debug is not None:
+            if qemu_debug_log is None:
+                raise ReplayError("qemu debug log path is required when QEMU debug is enabled")
+            command.extend(["-d", qemu_debug, "-D", str(qemu_debug_log)])
         return tuple(command)
 
     command = [
@@ -418,6 +626,10 @@ def build_qemu_command(
                 "virtio-blk-pci,drive=x2",
             ]
         )
+    if qemu_debug is not None:
+        if qemu_debug_log is None:
+            raise ReplayError("qemu debug log path is required when QEMU debug is enabled")
+        command.extend(["-d", qemu_debug, "-D", str(qemu_debug_log)])
     return tuple(command)
 
 
@@ -475,7 +687,6 @@ def wait_for_process(
         now = time.monotonic()
         if timeout_secs is not None and timeout_secs > 0 and now - start >= timeout_secs:
             message = f"QEMU timed out after {timeout_secs}s"
-            append_log(log_path, message)
             terminate_process_group(process, signal.SIGTERM)
             try:
                 process.wait(timeout=5)
@@ -489,7 +700,6 @@ def wait_for_process(
             and now - last_output_at >= idle_timeout_secs
         ):
             message = f"replay idle timeout after {idle_timeout_secs}s without console output"
-            append_log(log_path, message)
             terminate_process_group(process, signal.SIGTERM)
             try:
                 process.wait(timeout=5)
@@ -510,6 +720,8 @@ def run_qemu(
     timeout_secs: int | None,
     idle_timeout_secs: int | None,
     interactive: bool = False,
+    qemu_debug: str | None = None,
+    qemu_debug_log_path: Path | None = None,
 ) -> ReplayResult:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
@@ -517,7 +729,6 @@ def run_qemu(
     try:
         stdin = None if interactive else subprocess.DEVNULL
         with log_path.open("w", encoding="utf-8", errors="ignore", buffering=1) as log_file:
-            log_file.write(" ".join(command) + "\n")
             process = subprocess.Popen(
                 command,
                 cwd=workdir,
@@ -546,7 +757,6 @@ def run_qemu(
     except OSError as error:
         returncode = 3
         error_message = f"replay launch failed: {error}"
-        append_log(log_path, error_message)
 
     duration_ms = int((time.monotonic() - start) * 1000)
     return ReplayResult(
@@ -557,6 +767,8 @@ def run_qemu(
         log_path=log_path,
         workdir=workdir,
         error_message=error_message,
+        qemu_debug=qemu_debug,
+        qemu_debug_log_path=qemu_debug_log_path,
     )
 
 
@@ -576,6 +788,8 @@ def run_replay(
     workdir_override: Path | None = None,
     log_path_override: Path | None = None,
     kernel_override: Path | None = None,
+    qemu_debug: str | None = None,
+    qemu_debug_log_path: Path | None = None,
 ) -> ReplayResult:
     selected_arch = normalize_arch(arch)
     root = repo_root()
@@ -601,18 +815,21 @@ def run_replay(
         else None
     )
 
-    arch_dir = run_dir / selected_arch
-    workdir = workdir_override.expanduser() if workdir_override is not None else arch_dir / "work"
+    workdir = workdir_override.expanduser() if workdir_override is not None else run_dir / f".work-{selected_arch}"
     if workdir.exists():
         shutil.rmtree(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
-    log_path = log_path_override.expanduser() if log_path_override is not None else arch_dir / "qemu.log"
+    log_path = log_path_override.expanduser() if log_path_override is not None else run_dir / f"{selected_arch}.out"
+    if qemu_debug is not None and qemu_debug_log_path is None:
+        qemu_debug_log_path = run_dir / f"{selected_arch}_qemu.log"
     command = build_qemu_command(
         arch=selected_arch,
         kernel=kernel,
         image=prepared_image.runtime,
         support_image=prepared_support.runtime if prepared_support else None,
         extra_block_image=prepared_extra.runtime if prepared_extra else None,
+        qemu_debug=qemu_debug,
+        qemu_debug_log=qemu_debug_log_path,
     )
 
     result = run_qemu(
@@ -623,6 +840,8 @@ def run_replay(
         timeout_secs=timeout_secs,
         idle_timeout_secs=idle_timeout_secs,
         interactive=interactive,
+        qemu_debug=qemu_debug,
+        qemu_debug_log_path=qemu_debug_log_path,
     )
     if keep_workdir:
         log_copy = log_path.read_bytes() if log_path.is_file() else None
@@ -654,23 +873,35 @@ def score_with_extra_issues(
 
 def build_run_provenance(
     *,
+    root: Path,
+    run_dir: Path,
+    run_id: int | None,
     name: str,
     mode: str,
     status: str,
     arches: tuple[str, ...],
+    keep: bool,
     timeout_secs: int | None,
     idle_timeout_secs: int | None,
     plan_path: Path | None,
     support_image: Path | None,
     ltp_list: Path | None,
+    qemu_debug: str | None,
     replays: tuple[ReplayResult, ...],
 ) -> dict[str, Any]:
     run: dict[str, Any] = {
+        "id": run_id,
         "name": name,
         "mode": mode,
         "status": status,
         "arches": list(arches),
+        "keep": keep,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "git": git_metadata(root),
+        "artifacts": replay_artifacts_metadata(root, arches),
     }
+    if qemu_debug is not None:
+        run["qemu_debug"] = qemu_debug
     if timeout_secs is not None:
         run["timeout_secs"] = timeout_secs
     if idle_timeout_secs is not None:
@@ -682,7 +913,19 @@ def build_run_provenance(
     if ltp_list is not None:
         run["ltp_list"] = str(ltp_list)
     if replays:
-        run["replays"] = [replay.to_json_dict() for replay in replays]
+        run["replays"] = [replay.to_json_dict(base_dir=run_dir) for replay in replays]
+        logs: dict[str, str] = {}
+        for replay in replays:
+            try:
+                logs[f"{replay.arch}_out"] = replay.log_path.relative_to(run_dir).as_posix()
+            except ValueError:
+                logs[f"{replay.arch}_out"] = str(replay.log_path)
+            if replay.qemu_debug_log_path is not None:
+                try:
+                    logs[f"{replay.arch}_qemu_log"] = replay.qemu_debug_log_path.relative_to(run_dir).as_posix()
+                except ValueError:
+                    logs[f"{replay.arch}_qemu_log"] = str(replay.qemu_debug_log_path)
+        run["logs"] = logs
     return run
 
 
@@ -707,6 +950,7 @@ def _replay_and_judge_arch(
     judge_timeout_secs: float,
     effective_matrix: tuple[tuple[str, Libc], ...],
     verbose: bool,
+    qemu_debug: str | None,
 ) -> _ArchReplayOutcome:
     replay = run_replay(
         arch=selected_arch,
@@ -718,6 +962,7 @@ def _replay_and_judge_arch(
         skip_kernel_build=skip_kernel_build,
         keep_workdir=keep_workdir,
         verbose=verbose,
+        qemu_debug=qemu_debug,
     )
     replay_issue: dict[str, object] | None = None
     if not replay.ok:
@@ -735,7 +980,7 @@ def _replay_and_judge_arch(
         judge_summary = judge_log(
             log_path=replay.log_path,
             arch=selected_arch,
-            out_dir=run_dir / selected_arch,
+            out_dir=run_dir / ".judge" / selected_arch,
             judge_dir=judge_dir,
             judge_timeout_secs=judge_timeout_secs,
             fail_fast=False,
@@ -749,6 +994,7 @@ def _replay_and_judge_arch(
 
 
 def _prune_replay_intermediates(run_dir: Path, arches: tuple[str, ...]) -> None:
+    shutil.rmtree(run_dir / ".judge", ignore_errors=True)
     for arch in arches:
         arch_dir = run_dir / arch
         for name in (
@@ -805,13 +1051,25 @@ def evaluate_replay(
     replace: bool = False,
     group_libc_matrix: tuple[tuple[str, Libc], ...] | None = None,
     verbose: bool = False,
+    keep: bool = False,
+    qemu_log: bool = False,
+    qemu_trace: str | None = None,
 ) -> ReplayRunResult:
+    root = repo_root()
+    default_replay_root = replay_root(root)
+    run_id: int | None
     if run_dir is None:
-        run_dir = create_run_dir(name, replace=replace)
+        run_dir, run_id = create_numbered_run_dir(default_replay_root, replace=replace)
     else:
         run_dir = prepare_run_dir(run_dir, replace=replace)
+        run_id = (
+            parse_run_id(run_dir)
+            if is_numbered_replay_run(default_replay_root, run_dir)
+            else None
+        )
     arches = tuple(normalize_arch(item) for item in expand_arches(arch))
     effective_matrix = effective_group_libc_matrix(group_libc_matrix)
+    qemu_debug = qemu_trace_flags(qemu_trace, qemu_log=qemu_log)
     if support_image is not None and ltp_list is not None:
         raise ValueError("--support-image and --ltp-list cannot be combined")
     if ltp_list is not None and not ltp_list.is_file():
@@ -842,6 +1100,7 @@ def evaluate_replay(
         "judge_timeout_secs": judge_timeout_secs,
         "effective_matrix": effective_matrix,
         "verbose": verbose,
+        "qemu_debug": qemu_debug,
     }
 
     outcomes: list[_ArchReplayOutcome] = []
@@ -886,19 +1145,29 @@ def evaluate_replay(
     score = dataclass_replace(
         score,
         run=build_run_provenance(
+            root=root,
+            run_dir=run_dir,
+            run_id=run_id,
             name=name,
             mode="replay",
             status=status,
             arches=arches,
+            keep=keep,
             timeout_secs=timeout_secs,
             idle_timeout_secs=idle_timeout_secs,
             plan_path=plan_path,
             support_image=support_image,
             ltp_list=ltp_list,
+            qemu_debug=qemu_debug,
             replays=tuple(replays),
         ),
     )
     write_score_summary(score, run_dir / "score.json")
+    if keep:
+        (run_dir / ".keep").write_text(f"{name}\n", encoding="utf-8")
+    if run_id is not None and is_numbered_replay_run(default_replay_root, run_dir):
+        update_latest_link(default_replay_root, run_dir)
+        gc_replay_runs(default_replay_root, current_id=run_id)
     _prune_replay_intermediates(run_dir, arches)
     return ReplayRunResult(
         run_dir=run_dir,
@@ -970,8 +1239,11 @@ def replay_cmd(args: argparse.Namespace) -> int:
             skip_kernel_build=True,
             keep_workdir=False,
             judge_timeout_secs=args.judge_timeout,
-            replace=True,
+            replace=args.replace,
             group_libc_matrix=group_libc_matrix,
+            keep=args.keep,
+            qemu_log=args.qemu_log,
+            qemu_trace=args.qemu_trace,
             verbose=args.verbose or truthy(os.environ.get("OSCOMP_REPLAY_VERBOSE")),
         )
     except (ReplayError, ValueError, FileExistsError, OSError, MarkerError, JudgeRunnerError) as error:
@@ -1049,7 +1321,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     replay_parser = subparsers.add_parser("replay", help="run QEMU, judge, and score")
-    replay_parser.add_argument("--arch", required=True, choices=("rv", "la"))
+    replay_parser.add_argument("--arch", required=True, choices=("rv", "la", "both"))
     replay_parser.add_argument("--image", help="official testsuite image override")
     replay_parser.add_argument("--support-image", help="support disk image override")
     replay_parser.add_argument(
@@ -1063,6 +1335,18 @@ def build_parser() -> argparse.ArgumentParser:
     replay_parser.add_argument("--judge-timeout", type=float, default=JUDGE_TIMEOUT_SECS)
     replay_parser.add_argument("--name", help="run name; default replay-ARCH")
     replay_parser.add_argument("--out", help="explicit run directory")
+    replay_parser.add_argument("--replace", action="store_true")
+    replay_parser.add_argument("--keep", action="store_true", help="preserve this run during replay GC")
+    replay_parser.add_argument(
+        "--qemu-log",
+        action="store_true",
+        help="write QEMU internal guest-error log next to the console output",
+    )
+    replay_parser.add_argument(
+        "--qemu-trace",
+        choices=tuple(QEMU_TRACE_PRESETS),
+        help="QEMU internal trace preset: guest, int, cpu, or exec",
+    )
     replay_parser.add_argument("--verbose", action="store_true")
     replay_parser.set_defaults(func=replay_cmd)
 

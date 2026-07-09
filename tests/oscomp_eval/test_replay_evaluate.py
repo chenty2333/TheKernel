@@ -16,7 +16,10 @@ from tools.oscomp_eval.replay import (
     _prune_replay_intermediates,
     build_qemu_command,
     evaluate_replay,
+    gc_replay_runs,
     prepare_image,
+    qemu_trace_flags,
+    replay_root,
     run_replay,
     score_with_extra_issues,
 )
@@ -52,6 +55,21 @@ class ReplayImageTests(unittest.TestCase):
 
         self.assertIn("file=sdcard-rv.img,if=none,format=raw,id=x0,snapshot=on", command)
         self.assertIn("file=disk.img,if=none,format=raw,id=x1,readonly=on", command)
+
+    def test_build_qemu_command_can_enable_qemu_debug_log(self) -> None:
+        command = build_qemu_command(
+            arch="rv",
+            kernel=Path("kernel-rv"),
+            image=Path("sdcard-rv.img"),
+            support_image=None,
+            qemu_debug=qemu_trace_flags("cpu"),
+            qemu_debug_log=Path("rv_qemu.log"),
+        )
+
+        self.assertIn("-d", command)
+        self.assertIn("guest_errors,int,cpu", command)
+        self.assertIn("-D", command)
+        self.assertIn("rv_qemu.log", command)
 
 
 class ReplayRunTests(unittest.TestCase):
@@ -97,7 +115,7 @@ class ReplayRunTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertTrue(result.launch_failed)
             self.assertEqual(result.error_message, "replay launch failed: missing qemu")
-            self.assertIn("missing qemu", result.log_path.read_text(encoding="utf-8"))
+            self.assertEqual(result.log_path.read_text(encoding="utf-8"), "")
 
 
 class EvaluateHelpersTests(unittest.TestCase):
@@ -154,12 +172,19 @@ class EvaluateHelpersTests(unittest.TestCase):
             self.assertEqual(score["run"]["name"], "unit-launch-error")
             self.assertEqual(score["run"]["arches"], ["rv"])
             self.assertEqual(score["run"]["status"], "replay-error")
+            self.assertEqual(score["run"]["logs"], {"rv_out": "rv.out"})
 
-    def test_replay_compaction_keeps_only_qemu_log_and_score_inputs(self) -> None:
+    def test_replay_compaction_keeps_only_flat_console_log_and_score_inputs(self) -> None:
         from tools.oscomp_eval.schemas import ScoreSummary
 
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
+            (run_dir / ".judge" / "rv" / "judges").mkdir(parents=True)
+            (run_dir / ".judge" / "rv" / "judges" / "basic-musl.json").write_text(
+                "{}\n",
+                encoding="utf-8",
+            )
+            (run_dir / "rv.out").write_text("console\n", encoding="utf-8")
             rv_dir = run_dir / "rv"
             (rv_dir / "segments").mkdir(parents=True)
             (rv_dir / "judges").mkdir()
@@ -169,7 +194,6 @@ class EvaluateHelpersTests(unittest.TestCase):
                 rv_dir / "segments" / "basic-musl.txt",
                 rv_dir / "judges" / "basic-musl.json",
                 rv_dir / "judge-summary.json",
-                rv_dir / "qemu.log",
             ):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("{}\n", encoding="utf-8")
@@ -197,7 +221,8 @@ class EvaluateHelpersTests(unittest.TestCase):
             _prune_replay_intermediates(run_dir, ("rv",))
 
             self.assertNotIn("json_path", compacted.group_totals["rv/basic-musl"])
-            self.assertTrue((rv_dir / "qemu.log").is_file())
+            self.assertTrue((run_dir / "rv.out").is_file())
+            self.assertFalse((run_dir / ".judge").exists())
             self.assertFalse((rv_dir / "marker-validation.json").exists())
             self.assertFalse((rv_dir / "segments.jsonl").exists())
             self.assertFalse((rv_dir / "segments").exists())
@@ -221,14 +246,15 @@ class EvaluateHelpersTests(unittest.TestCase):
                 calls.append(selected_arch)
                 from tools.oscomp_eval.replay import ReplayResult, _ArchReplayOutcome
 
+                call_run_dir = kwargs["run_dir"]
                 return _ArchReplayOutcome(
                     replay=ReplayResult(
                         arch=selected_arch,
                         command=("qemu", selected_arch),
                         returncode=0,
                         duration_ms=1,
-                        log_path=run_dir / selected_arch / "qemu.log",
-                        workdir=run_dir / selected_arch / "work",
+                        log_path=call_run_dir / f"{selected_arch}.out",
+                        workdir=call_run_dir / f".work-{selected_arch}",
                     ),
                     judge_summary={
                         "schema": "oscomp-eval.judge-summary.v1",
@@ -255,6 +281,78 @@ class EvaluateHelpersTests(unittest.TestCase):
             self.assertEqual(len(result.replays), 2)
             score = json.loads((run_dir / "score.json").read_text())
             self.assertEqual(score["run"]["arches"], ["rv", "la"])
+            self.assertEqual(
+                score["run"]["logs"],
+                {
+                    "rv_out": "rv.out",
+                    "la_out": "la.out",
+                },
+            )
+
+    def test_evaluate_replay_allocates_numbered_run_dir_and_latest_link(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("kernel-rv", "kernel-la", "disk.img", "disk-la.img"):
+                (root / name).write_bytes(name.encode())
+
+            def fake_replay_and_judge(*, selected_arch, **kwargs):
+                from tools.oscomp_eval.replay import ReplayResult, _ArchReplayOutcome
+
+                call_run_dir = kwargs["run_dir"]
+                return _ArchReplayOutcome(
+                    replay=ReplayResult(
+                        arch=selected_arch,
+                        command=("qemu", selected_arch),
+                        returncode=0,
+                        duration_ms=1,
+                        log_path=call_run_dir / f"{selected_arch}.out",
+                        workdir=call_run_dir / f".work-{selected_arch}",
+                    ),
+                    judge_summary={
+                        "schema": "oscomp-eval.judge-summary.v1",
+                        "arch": selected_arch,
+                        "results": [],
+                    },
+                    replay_issue=None,
+                )
+
+            with patch("tools.oscomp_eval.replay.repo_root", return_value=root):
+                with patch(
+                    "tools.oscomp_eval.replay._replay_and_judge_arch",
+                    side_effect=fake_replay_and_judge,
+                ):
+                    first = evaluate_replay(
+                        name="unit-numbered",
+                        arch="rv",
+                        skip_kernel_build=True,
+                    )
+                    second = evaluate_replay(
+                        name="unit-numbered",
+                        arch="la",
+                        skip_kernel_build=True,
+                        keep=True,
+                    )
+
+            self.assertEqual(first.run_dir, replay_root(root) / "1")
+            self.assertEqual(second.run_dir, replay_root(root) / "2")
+            self.assertTrue((replay_root(root) / "latest").is_symlink())
+            self.assertEqual((replay_root(root) / "latest").readlink(), Path("2"))
+            self.assertTrue((second.run_dir / ".keep").is_file())
+            score = json.loads((second.run_dir / "score.json").read_text())
+            self.assertEqual(score["run"]["id"], 2)
+            self.assertTrue(score["run"]["keep"])
+
+    def test_gc_replay_runs_keeps_recent_interval_and_marked_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for run_id in range(1, 21):
+                (root / str(run_id)).mkdir()
+            (root / "7" / ".keep").write_text("important\n", encoding="utf-8")
+
+            gc_replay_runs(root, current_id=20)
+
+            remaining = sorted(int(path.name) for path in root.iterdir() if path.is_dir())
+            self.assertEqual(remaining, [7, 10, 16, 17, 18, 19, 20])
 
 
 class CliTests(unittest.TestCase):
@@ -305,6 +403,9 @@ class CliTests(unittest.TestCase):
             judge_timeout=30,
             fail_fast=False,
             replace=False,
+            keep=False,
+            qemu_log=False,
+            qemu_trace=None,
             verbose=False,
         )
 

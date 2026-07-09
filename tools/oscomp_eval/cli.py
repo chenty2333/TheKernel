@@ -15,7 +15,7 @@ from .config import (
     canonical_arch,
     group_libc_matrix_from_plan,
 )
-from .replay import evaluate_replay
+from .replay import QEMU_TRACE_PRESETS, ReplayError, evaluate_replay
 from .judge_runner import JudgeRunnerError, judge_log
 from .markers import MarkerError, compatible_summary, parse_log, write_artifacts
 from .provenance import ProvenanceError, refresh_official_snapshot
@@ -213,6 +213,9 @@ def evaluate_cmd(args: argparse.Namespace) -> int:
             fail_fast=args.fail_fast,
             replace=args.replace,
             group_libc_matrix=group_libc_matrix,
+            keep=args.keep,
+            qemu_log=args.qemu_log,
+            qemu_trace=args.qemu_trace,
             verbose=args.verbose,
         )
     except (
@@ -221,6 +224,7 @@ def evaluate_cmd(args: argparse.Namespace) -> int:
         OSError,
         MarkerError,
         JudgeRunnerError,
+        ReplayError,
         SupportImageConfigError,
         SupportImageError,
     ) as error:
@@ -445,6 +449,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate_parser.add_argument("--fail-fast", action="store_true")
     evaluate_parser.add_argument("--replace", action="store_true")
+    evaluate_parser.add_argument("--keep", action="store_true")
+    evaluate_parser.add_argument(
+        "--qemu-log",
+        action="store_true",
+        help="write QEMU internal guest-error log next to the console output",
+    )
+    evaluate_parser.add_argument(
+        "--qemu-trace",
+        choices=tuple(QEMU_TRACE_PRESETS),
+        help="QEMU internal trace preset: guest, int, cpu, or exec",
+    )
     evaluate_parser.add_argument("--verbose", action="store_true")
     evaluate_parser.set_defaults(func=evaluate_cmd)
 

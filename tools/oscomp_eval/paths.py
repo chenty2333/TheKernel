@@ -43,6 +43,14 @@ CURRENT_RUN_ARTIFACT_NAMES = (
     "inputs",
     "rv",
     "la",
+    "rv.out",
+    "la.out",
+    "rv_qemu.log",
+    "la_qemu.log",
+    ".judge",
+    ".work-rv",
+    ".work-la",
+    ".keep",
 )
 
 LEGACY_RUN_ARTIFACT_NAMES = (
