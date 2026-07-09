@@ -6,6 +6,7 @@ REPLAY_ARGS ?=
 SHELL_ARGS ?=
 LAB_ARGS ?=
 SMOKE_ARGS ?=
+REPLAY_ARCH ?= $(if $(filter command line,$(origin ARCH)),$(ARCH),both)
 export OSKERNEL_DEV_IMAGE ?= thekernel-dev:local
 DEV_ENV_DIR ?= $(ROOT_DIR)/dev-env
 EMPTY_TESTSUITE_DIR ?= $(ROOT_DIR)/.state/empty-testsuites
@@ -41,10 +42,11 @@ help:
 		'  make clean-all    full local clean, including all .state data' \
 		'' \
 		'Replay commands:' \
+		'  make replay       build artifacts, run rv/la in parallel, judge, and score' \
+		'  make replay ARCH=rv|la|both' \
 		'  make replay-rv    build rv artifacts, run all rv tests, judge, and score' \
 		'  make replay-la    build la artifacts, run all la tests, judge, and score' \
 		'  make replay-rv REPLAY_ARGS="--timeout 1200 --image path/to/sdcard-rv.img"' \
-		'  python3 -m tools.oscomp_eval evaluate --arch both --replace  run rv/la in parallel after make all' \
 		'' \
 		'Boot commands:' \
 		'  make shell-rv     build a shell-mode rv kernel, then boot an interactive shell' \
@@ -125,6 +127,25 @@ clean-all:
 	@rm -rf $(STATE_DIR)
 	@$(MAKE) --no-print-directory legacy-clean
 
+replay:
+	@arch="$(REPLAY_ARCH)"; \
+	case "$$arch" in \
+		both|all) \
+			$(MAKE) --no-print-directory artifacts; \
+			$(PYTHONPATH_CMD) python3 -m tools.oscomp_eval evaluate --arch both --name replay --replace $(REPLAY_ARGS); \
+			;; \
+		rv|riscv64) \
+			$(MAKE) --no-print-directory replay-rv; \
+			;; \
+		la|loongarch64) \
+			$(MAKE) --no-print-directory replay-la; \
+			;; \
+		*) \
+			printf 'unsupported replay ARCH: %s\n' "$$arch" >&2; \
+			exit 2; \
+			;; \
+	esac
+
 replay-rv: kernel-rv disk.img
 	@$(PYTHONPATH_CMD) python3 -m tools.oscomp_eval.replay replay --arch rv $(REPLAY_ARGS)
 
@@ -190,7 +211,7 @@ test-tools:
 	@$(PYTHONPATH_CMD) python3 -m unittest discover -s tests/oscomp_eval -v
 	@$(PYTHONPATH_CMD) python3 -m unittest discover -s tests/build_tools -v
 
-.PHONY: help help-lab all artifacts kernels replay-rv replay-la shell-rv shell-la lab-list lab-explain lab-run smoke-list smoke test-tools dev-image dev-check dev-shell dev-shell-root clean clean-all legacy-clean prebuild-scrub check-eval-artifacts check-eval-kernel-size kernel-rv kernel-la kernel-rv-shell kernel-la-shell disk.img disk-la.img
+.PHONY: help help-lab all artifacts kernels replay replay-rv replay-la shell-rv shell-la lab-list lab-explain lab-run smoke-list smoke test-tools dev-image dev-check dev-shell dev-shell-root clean clean-all legacy-clean prebuild-scrub check-eval-artifacts check-eval-kernel-size kernel-rv kernel-la kernel-rv-shell kernel-la-shell disk.img disk-la.img
 
 check-eval-artifacts:
 	@missing=0; \

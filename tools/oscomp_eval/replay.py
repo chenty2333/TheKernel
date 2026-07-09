@@ -606,7 +606,7 @@ def run_replay(
     if workdir.exists():
         shutil.rmtree(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
-    log_path = log_path_override.expanduser() if log_path_override is not None else arch_dir / "console.log"
+    log_path = log_path_override.expanduser() if log_path_override is not None else arch_dir / "qemu.log"
     command = build_qemu_command(
         arch=selected_arch,
         kernel=kernel,
@@ -748,6 +748,32 @@ def _replay_and_judge_arch(
     )
 
 
+def _prune_replay_intermediates(run_dir: Path, arches: tuple[str, ...]) -> None:
+    for arch in arches:
+        arch_dir = run_dir / arch
+        for name in (
+            "marker-validation.json",
+            "segments.jsonl",
+            "segments",
+            "judges",
+            "judge-summary.json",
+        ):
+            path = arch_dir / name
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            elif path.exists() or path.is_symlink():
+                path.unlink()
+
+
+def _compact_score_for_replay(score: ScoreSummary) -> ScoreSummary:
+    group_totals = {}
+    for key, value in score.group_totals.items():
+        cleaned = dict(value)
+        cleaned.pop("json_path", None)
+        group_totals[key] = cleaned
+    return dataclass_replace(score, group_totals=group_totals)
+
+
 def replay_status(replays: tuple[ReplayResult, ...], score: ScoreSummary) -> str:
     if any(replay.interrupted for replay in replays):
         return "interrupted"
@@ -855,6 +881,7 @@ def evaluate_replay(
 
     score = score_judge_summaries(judge_summaries)
     score = score_with_extra_issues(score, replay_issues)
+    score = _compact_score_for_replay(score)
     status = replay_status(tuple(replays), score)
     score = dataclass_replace(
         score,
@@ -872,6 +899,7 @@ def evaluate_replay(
         ),
     )
     write_score_summary(score, run_dir / "score.json")
+    _prune_replay_intermediates(run_dir, arches)
     return ReplayRunResult(
         run_dir=run_dir,
         replays=tuple(replays),

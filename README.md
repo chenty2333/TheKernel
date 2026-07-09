@@ -130,9 +130,8 @@ The local evaluator is centered on `tools/oscomp_eval/replay.py`.
 
 | Entry | Purpose |
 | --- | --- |
+| `make replay ARCH=both` | Build artifacts, run RV/LA in parallel, judge, score |
 | `make replay-rv` / `make replay-la` | Build artifacts, run QEMU, judge, score |
-| `python3 -m tools.oscomp_eval.replay replay` | Same pipeline with explicit CLI flags |
-| `python3 -m tools.oscomp_eval evaluate` | Compatibility alias for replay launch or offline log scoring |
 | `scripts/oscomp.sh score-logs` | Offline scoring from existing console logs |
 | `scripts/lab` | Focused replay for one group or LTP case |
 | `scripts/ltp-lab.py` via `scripts/oscomp.sh ltp-lab` | LTP campaign inventory, replay, and cleanup |
@@ -145,25 +144,35 @@ Default replay timeouts live in `tools/oscomp_eval/config.py`:
 
 ## Replay
 
-Build the matching artifacts, run one architecture in QEMU, judge the console
-log, and write the local score report:
+Build the matching artifacts, run both architectures in QEMU, judge the console
+logs, and write the local score:
 
 ```bash
-make dev-shell DEV_CMD='make replay-rv'
-make dev-shell DEV_CMD='make replay-la'
+make dev-shell DEV_CMD='make replay ARCH=both'
 ```
 
 Inside `make dev-shell`:
 
 ```bash
-make replay-rv
-make replay-la
+make replay ARCH=both
 ```
 
-Each replay writes `score.json` and per-arch judge artifacts under
-`.state/oscomp-eval/runs/`. `score.json` includes a top-level `run` object with
-replay provenance: run name, mode, status, arches, timeout, image paths, and per-
-arch QEMU metadata. There is no `report.md`, `manifest.json`, or artifact index.
+Single-architecture replay is still available:
+
+```bash
+make replay-rv
+make replay-la
+make replay ARCH=rv
+make replay ARCH=la
+```
+
+Each replay writes the kernel console output as `qemu.log` and the score as
+`score.json` under `.state/oscomp-eval/runs/`. A dual-architecture replay keeps
+the logs at `.state/oscomp-eval/runs/replay/rv/qemu.log` and
+`.state/oscomp-eval/runs/replay/la/qemu.log`. `score.json` includes a top-level
+`run` object with run name, status, arches, timeout, image paths, and per-arch
+QEMU metadata. There is no `report.md`, `manifest.json`, artifact index, or
+retained marker/judge intermediate output in replay runs.
 
 Raw `.img` test images are attached with QEMU snapshot mode. The support disk is
 attached read-only. Compressed `.gz` or `.xz` test images are decompressed once
@@ -172,18 +181,11 @@ into `.state/oscomp-image-cache/` and reused by later replays.
 Use `REPLAY_ARGS` for explicit replay flags:
 
 ```bash
-make dev-shell DEV_CMD='make replay-rv REPLAY_ARGS="--timeout 1200 --image path/to/sdcard-rv.img"'
+make dev-shell DEV_CMD='make replay ARCH=rv REPLAY_ARGS="--timeout 1200 --image path/to/sdcard-rv.img"'
 ```
 
-Run both architectures through the evaluator CLI after artifacts exist:
-
-```bash
-make dev-shell DEV_CMD='make all && PYTHONPATH=. python3 -m tools.oscomp_eval evaluate --arch both --replace'
-```
-
-`--arch both` launches RV and LA replays in parallel when `--fail-fast` is not
-set. `make replay-rv` and `make replay-la` stay as the simple single-arch entry
-points.
+`make replay ARCH=both` launches RV and LA replays in parallel. `make all`
+remains the official evaluator build entrypoint and does not run QEMU.
 
 Validate official image layout inside the dev shell:
 
@@ -216,9 +218,9 @@ Support disks can be checked explicitly:
 ./scripts/oscomp.sh support-check --arch la --image disk-la.img
 ```
 
-Every scored run writes `score.json` and the per-arch marker/judge artifacts.
+Offline scoring commands write `score.json` and per-arch marker/judge artifacts.
 Use `inspect-run --json` to check those artifacts without mutating the run
-directory.
+directory. Normal replay runs keep only `score.json` and per-arch `qemu.log`.
 
 Replay can build a support image from an explicit LTP list. The image is stored
 in the content-addressed pool under `.state/build-cache/support-disks/` (not

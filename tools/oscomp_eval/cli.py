@@ -213,6 +213,7 @@ def evaluate_cmd(args: argparse.Namespace) -> int:
             fail_fast=args.fail_fast,
             replace=args.replace,
             group_libc_matrix=group_libc_matrix,
+            verbose=args.verbose,
         )
     except (
         ValueError,
@@ -444,6 +445,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate_parser.add_argument("--fail-fast", action="store_true")
     evaluate_parser.add_argument("--replace", action="store_true")
+    evaluate_parser.add_argument("--verbose", action="store_true")
     evaluate_parser.set_defaults(func=evaluate_cmd)
 
     inspect_run_parser = subparsers.add_parser(

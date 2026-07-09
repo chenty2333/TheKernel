@@ -12,6 +12,8 @@ from unittest.mock import patch
 from tools.oscomp_eval import cli
 from tools.oscomp_eval.cli import evaluate_exit_code
 from tools.oscomp_eval.replay import (
+    _compact_score_for_replay,
+    _prune_replay_intermediates,
     build_qemu_command,
     evaluate_replay,
     prepare_image,
@@ -153,6 +155,55 @@ class EvaluateHelpersTests(unittest.TestCase):
             self.assertEqual(score["run"]["arches"], ["rv"])
             self.assertEqual(score["run"]["status"], "replay-error")
 
+    def test_replay_compaction_keeps_only_qemu_log_and_score_inputs(self) -> None:
+        from tools.oscomp_eval.schemas import ScoreSummary
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            rv_dir = run_dir / "rv"
+            (rv_dir / "segments").mkdir(parents=True)
+            (rv_dir / "judges").mkdir()
+            for path in (
+                rv_dir / "marker-validation.json",
+                rv_dir / "segments.jsonl",
+                rv_dir / "segments" / "basic-musl.txt",
+                rv_dir / "judges" / "basic-musl.json",
+                rv_dir / "judge-summary.json",
+                rv_dir / "qemu.log",
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n", encoding="utf-8")
+
+            score = ScoreSummary(
+                total_score=1.0,
+                non_ltp_score=1.0,
+                ltp_raw_total=0.0,
+                ltp_score=0.0,
+                arch_totals={},
+                libc_totals={},
+                ltp_group_totals={},
+                group_totals={
+                    "rv/basic-musl": {
+                        "arch": "rv",
+                        "group": "basic",
+                        "group_id": "basic-musl",
+                        "json_path": "rv/judges/basic-musl.json",
+                    }
+                },
+                issues=(),
+            )
+
+            compacted = _compact_score_for_replay(score)
+            _prune_replay_intermediates(run_dir, ("rv",))
+
+            self.assertNotIn("json_path", compacted.group_totals["rv/basic-musl"])
+            self.assertTrue((rv_dir / "qemu.log").is_file())
+            self.assertFalse((rv_dir / "marker-validation.json").exists())
+            self.assertFalse((rv_dir / "segments.jsonl").exists())
+            self.assertFalse((rv_dir / "segments").exists())
+            self.assertFalse((rv_dir / "judges").exists())
+            self.assertFalse((rv_dir / "judge-summary.json").exists())
+
     def test_evaluate_replay_runs_both_arches_in_parallel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -176,7 +227,7 @@ class EvaluateHelpersTests(unittest.TestCase):
                         command=("qemu", selected_arch),
                         returncode=0,
                         duration_ms=1,
-                        log_path=run_dir / selected_arch / "console.log",
+                        log_path=run_dir / selected_arch / "qemu.log",
                         workdir=run_dir / selected_arch / "work",
                     ),
                     judge_summary={
@@ -254,6 +305,7 @@ class CliTests(unittest.TestCase):
             judge_timeout=30,
             fail_fast=False,
             replace=False,
+            verbose=False,
         )
 
         with patch("tools.oscomp_eval.cli.evaluate_replay", side_effect=fake_evaluate_replay):
