@@ -2547,7 +2547,7 @@ the next batch.
 Code-first phase:
 
 ```bash
-make lab-status NAME={name}
+./scripts/oscomp.sh ltp-lab campaign status {name}
 make kernels
 ```
 
@@ -2559,10 +2559,10 @@ unresolved cases in `implementation.md` and `taxonomy.md`.
 Validation phase, after a meaningful implementation pass:
 
 ```bash
-make lab-run NAME={name}
-make lab-review NAME={name}
-make lab-apply NAME={name}
-make lab-done NAME={name}
+./scripts/oscomp.sh ltp-lab run {name}
+./scripts/oscomp.sh ltp-lab review {name}
+./scripts/oscomp.sh ltp-lab apply {name}
+./scripts/oscomp.sh ltp-lab done {name}
 ```
 
 Promotion still requires all required rv/la x glibc/musl parser `pass` evidence.

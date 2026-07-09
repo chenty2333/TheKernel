@@ -1020,11 +1020,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python3 -m tools.oscomp_eval.replay")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    replay_parser = subparsers.add_parser("replay", help="run QEMU, judge, score, and report")
+    replay_parser = subparsers.add_parser("replay", help="run QEMU, judge, and score")
     replay_parser.add_argument("--arch", required=True, choices=("rv", "la"))
     replay_parser.add_argument("--image", help="official testsuite image override")
     replay_parser.add_argument("--support-image", help="support disk image override")
-    replay_parser.add_argument("--ltp-list", help="build run-local support image with this LTP list")
+    replay_parser.add_argument(
+        "--ltp-list",
+        help="build or reuse a content-addressed support image from this LTP list "
+        "(stored under .state/build-cache/support-disks/)",
+    )
     replay_parser.add_argument("--plan", help="focused group/libc plan")
     replay_parser.add_argument("--timeout", type=int, default=REPLAY_TIMEOUT_FULL_SECS)
     replay_parser.add_argument("--idle-timeout", type=int)

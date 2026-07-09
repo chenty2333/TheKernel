@@ -22,28 +22,20 @@ smoke_kernel_shell_path() {
     esac
 }
 
-smoke_support_image_needs_rebuild() {
-    local support_image=$1
-    local explicit=$2
-
-    [ ! -f "$support_image" ] && return 0
-    [ "$explicit" -eq 1 ] && return 1
-    [ "$REPO_ROOT/scripts/build-oscomp-support-disk.sh" -nt "$support_image" ] && return 0
-    find "$REPO_ROOT/scripts/support-tools" "$REPO_ROOT/scripts/support-overlay" \
-        -type f -newer "$support_image" -print -quit | grep -q .
-}
-
 smoke_build_support_image_if_needed() {
     local arch=$1
     local support_image=$2
     local explicit=$3
 
-    if smoke_support_image_needs_rebuild "$support_image" "$explicit"; then
-        mkdir -p "$(dirname -- "$support_image")"
-        "$REPO_ROOT/scripts/build-oscomp-support-disk.sh" \
-            --arch "$arch" \
-            --output "$support_image" >/dev/null
+    # Explicit caller-provided image path: do not rebuild or replace it.
+    if [ "$explicit" -eq 1 ]; then
+        return 0
     fi
+
+    mkdir -p "$(dirname -- "$support_image")"
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 "$REPO_ROOT/tools/build.py" support "$arch" \
+        --output "$support_image"
 }
 
 smoke_ensure_shell_kernel() {
@@ -66,12 +58,4 @@ smoke_replay_kernel_args() {
 
     kernel_path=$(smoke_ensure_shell_kernel "$arch" "$skip_build")
     printf '%s\0%s\0%s\0' --kernel "$kernel_path" --skip-kernel-build
-}
-
-ensure_boot_shell_env() {
-    local env_file=$1
-
-    if [ ! -f "$env_file" ] || ! grep -qx 'OSCOMP_BOOT_SHELL=1' "$env_file"; then
-        printf 'OSCOMP_BOOT_SHELL=1\n' >"$env_file"
-    fi
 }

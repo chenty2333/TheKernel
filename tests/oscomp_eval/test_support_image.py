@@ -69,39 +69,44 @@ class SupportImageTests(unittest.TestCase):
                 result.issues,
             )
 
-    def test_build_support_image_wires_ltp_list_and_plan(self) -> None:
+    def test_build_support_image_uses_content_pool(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ltp_list = root / "ltp_test.txt"
             plan = root / "plan.txt"
             ltp_list.write_text("fork06\n", encoding="utf-8")
             plan.write_text("/glibc ltp\n", encoding="utf-8")
-            (root / "scripts").mkdir()
-            builder = root / "scripts" / "build-oscomp-support-disk.sh"
-            builder.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            (root / "scripts" / "support-tools").mkdir(parents=True)
+            (root / "scripts" / "support-overlay").mkdir(parents=True)
+            (root / "scripts" / "build-oscomp-support-disk.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+            (root / "scripts" / "support-tools" / "t.c").write_text("x\n", encoding="utf-8")
+            (root / "scripts" / "support-overlay" / "n").write_text("y\n", encoding="utf-8")
+            (root / "tools").mkdir()
+            (root / "tools" / "build.py").write_text("# build helper\n", encoding="utf-8")
 
-            def fake_run(command: list[str], check: bool) -> subprocess.CompletedProcess[str]:
-                self.assertFalse(check)
-                output = Path(command[command.index("--output") + 1])
+            def fake_build(req, output: Path, **_: object):
+                output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_bytes(b"support image")
-                return subprocess.CompletedProcess(command, 0)
 
-            with patch("tools.oscomp_eval.support_image.repo_root", return_value=root):
-                with patch("tools.oscomp_eval.support_image.subprocess.run", side_effect=fake_run):
-                    result = build_support_image(
-                        arch="rv",
-                        run_dir=root / "run",
-                        ltp_list=ltp_list,
-                        plan=plan,
-                    )
+            with patch(
+                "tools.build.support_disk_build",
+                side_effect=fake_build,
+            ):
+                result = build_support_image(
+                    arch="rv",
+                    run_dir=root / "run",
+                    ltp_list=ltp_list,
+                    plan=plan,
+                    root=root,
+                )
 
             self.assertEqual(result.arch, "rv")
             self.assertEqual(result.returncode, 0)
-            self.assertEqual(result.output_path, root / "run" / "inputs" / "support-rv.img")
-            self.assertIn("--test-list", result.command)
-            self.assertIn(str(ltp_list), result.command)
-            self.assertIn("--plan-override", result.command)
-            self.assertIn(str(plan), result.command)
+            self.assertFalse(result.hit)
+            self.assertIn(".state/build-cache/support-disks", str(result.output_path))
+            self.assertTrue(result.output_path.is_file())
+            self.assertFalse((root / "run" / "inputs" / "support-rv.img").exists())
+            self.assertTrue(result.identity)
 
     def test_missing_ltp_list_is_structured_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -111,6 +116,7 @@ class SupportImageTests(unittest.TestCase):
                     arch="rv",
                     run_dir=root / "run",
                     ltp_list=root / "missing.txt",
+                    root=root,
                 )
 
 

@@ -7,6 +7,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from tools.build import BuildError, ensure_support_disk
+
 from .paths import repo_root
 
 
@@ -37,22 +39,24 @@ class SupportImageInspection:
 @dataclass(frozen=True)
 class SupportImageBuild:
     arch: str
-    command: tuple[str, ...]
     returncode: int
     duration_ms: int
     output_path: Path
     ltp_list: Path
     plan: Path | None
+    identity: str
+    hit: bool
 
     def to_json_dict(self) -> dict[str, object]:
         return {
             "arch": self.arch,
-            "command": list(self.command),
             "returncode": self.returncode,
             "duration_ms": self.duration_ms,
             "output_path": str(self.output_path),
             "ltp_list": str(self.ltp_list),
             "plan": str(self.plan) if self.plan is not None else None,
+            "identity": self.identity,
+            "hit": self.hit,
         }
 
 
@@ -142,53 +146,43 @@ def build_support_image(
     run_dir: Path,
     ltp_list: Path,
     plan: Path | None = None,
+    cases: Path | None = None,
+    root: Path | None = None,
 ) -> SupportImageBuild:
+    """Build or reuse a content-addressed support image (not under run_dir)."""
     if arch not in ("rv", "la", "both"):
         raise SupportImageConfigError(f"unsupported support-image arch: {arch}")
     if not ltp_list.is_file():
         raise SupportImageConfigError(f"ltp list does not exist: {ltp_list}")
     if plan is not None and not plan.is_file():
         raise SupportImageConfigError(f"plan does not exist: {plan}")
+    if cases is not None and not cases.is_file():
+        raise SupportImageConfigError(f"cases does not exist: {cases}")
 
-    root = repo_root()
-    inputs_dir = run_dir / "inputs"
-    inputs_dir.mkdir(parents=True, exist_ok=True)
-    output_path = inputs_dir / f"support-{arch}.img"
-    builder = root / "scripts" / "build-oscomp-support-disk.sh"
-    command = [
-        str(builder),
-        "--arch",
-        arch,
-        "--output",
-        str(output_path),
-        "--test-list",
-        str(ltp_list),
-    ]
-    if plan is not None:
-        command.extend(["--plan-override", str(plan)])
-
+    root = (root or repo_root()).resolve()
     start = time.monotonic()
     try:
-        completed = subprocess.run(command, check=False)
-    except OSError as error:
-        raise SupportImageError(f"could not run support image builder: {builder}") from error
+        result = ensure_support_disk(
+            arch=arch,
+            root=root,
+            plan=plan,
+            cases=cases,
+            ltp_list=ltp_list,
+        )
+    except (BuildError, ValueError, FileNotFoundError, RuntimeError, OSError) as error:
+        raise SupportImageError(str(error)) from error
     duration_ms = int((time.monotonic() - start) * 1000)
 
-    if completed.returncode != 0:
-        raise SupportImageError(
-            f"support image build failed with exit code {completed.returncode}"
-        )
-    if not output_path.is_file():
-        raise SupportImageError(
-            f"support image builder did not create expected output: {output_path}"
-        )
+    # run_dir is retained for API compatibility; images live in the content pool.
+    _ = run_dir
 
     return SupportImageBuild(
         arch=arch,
-        command=tuple(command),
-        returncode=completed.returncode,
+        returncode=0,
         duration_ms=duration_ms,
-        output_path=output_path,
+        output_path=result.output_path,
         ltp_list=ltp_list,
         plan=plan,
+        identity=result.identity,
+        hit=result.hit,
     )

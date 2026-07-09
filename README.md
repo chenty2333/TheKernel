@@ -81,12 +81,19 @@ Both forms produce the evaluator artifacts at the repository root:
 - `disk.img` (RISC-V support disk)
 - `disk-la.img`
 
-RISC-V submissions use `disk.img` locally. Some remote logs show `disk-rv.img`;
-that is the same support-disk role with a different filename on the grader side.
-
 High-frequency kernel rebuilds keep Cargo target caches under
-`.state/<arch>/target`. Kernel and support-disk outputs also use content keys in
-`.state/kernel-cache/` and `.state/support-disk/`.
+`.state/<arch>/target`. Kernel and support-disk outputs are reused from
+`.state/build-cache/` when their build inputs have not changed.
+Evaluator and shell kernels use fixed build profiles; top-level `make` targets
+do not accept ad-hoc kernel feature or debug toggles.
+
+The build cache is content-addressed. Touching a source file without changing
+its content does not force a new final artifact. If kernel source content
+changes, the final ELF identity changes, but Cargo still reuses
+`.state/<arch>/target` and rebuilds only the affected Rust units and link steps
+that Cargo considers stale. Support disks use a separate content key; unchanged
+support scripts, overlays, plans, case filters, and LTP lists do not rebuild or
+rewrite `disk.img` / `disk-la.img`.
 
 Build only the kernel artifacts:
 
@@ -96,7 +103,26 @@ make dev-shell DEV_CMD='make kernel-rv'
 make dev-shell DEV_CMD='make kernel-la'
 ```
 
+Rebuild only a support disk:
+
+```bash
+make dev-shell DEV_CMD='make disk.img'
+make dev-shell DEV_CMD='make disk-la.img'
+```
+
 Inside `make dev-shell`, run the inner `make ...` commands directly.
+
+`make clean` removes root evaluator artifacts (`kernel-rv`, `kernel-la`,
+`disk.img`, `disk-la.img`), replay workdirs (`.state/oscomp-replay`,
+`.state/oscomp-eval/runs`), arch build outputs (`.state/<arch>/out` and
+`logs`), and shell kernels (`.state/shell`). It keeps Cargo target caches
+(`.state/<arch>/target`), the build cache (`.state/build-cache`), decompressed
+test images (`.state/oscomp-image-cache`), and lab state (`.state/oscomp-lab`,
+`.state/ltp-lab`). `make clean-all` removes all `.state` data.
+
+Make and repo script entrypoints set `PYTHONDONTWRITEBYTECODE=1`, so normal
+build, replay, lab, smoke, and test runs do not create Python `__pycache__`
+directories.
 
 ## Local Evaluator
 
@@ -106,7 +132,7 @@ The local evaluator is centered on `tools/oscomp_eval/replay.py`.
 | --- | --- |
 | `make replay-rv` / `make replay-la` | Build artifacts, run QEMU, judge, score |
 | `python3 -m tools.oscomp_eval.replay replay` | Same pipeline with explicit CLI flags |
-| `python3 -m tools.oscomp_eval.cli evaluate` | Compatibility alias for replay launch or offline log scoring |
+| `python3 -m tools.oscomp_eval evaluate` | Compatibility alias for replay launch or offline log scoring |
 | `scripts/oscomp.sh score-logs` | Offline scoring from existing console logs |
 | `scripts/lab` | Focused replay for one group or LTP case |
 | `scripts/ltp-lab.py` via `scripts/oscomp.sh ltp-lab` | LTP campaign inventory, replay, and cleanup |
@@ -141,12 +167,23 @@ arch QEMU metadata. There is no `report.md`, `manifest.json`, or artifact index.
 
 Raw `.img` test images are attached with QEMU snapshot mode. The support disk is
 attached read-only. Compressed `.gz` or `.xz` test images are decompressed once
-into `.state/oscomp-image-cache/` and reused by later replays. `make clean`
-keeps the image cache; `make clean-all` removes all `.state` data.
+into `.state/oscomp-image-cache/` and reused by later replays.
 
-Running both architectures through `python3 -m tools.oscomp_eval.cli evaluate
---arch both` launches RV and LA replays in parallel when `--fail-fast` is not
-set.
+Use `REPLAY_ARGS` for explicit replay flags:
+
+```bash
+make dev-shell DEV_CMD='make replay-rv REPLAY_ARGS="--timeout 1200 --image path/to/sdcard-rv.img"'
+```
+
+Run both architectures through the evaluator CLI after artifacts exist:
+
+```bash
+make dev-shell DEV_CMD='make all && PYTHONPATH=. python3 -m tools.oscomp_eval evaluate --arch both --replace'
+```
+
+`--arch both` launches RV and LA replays in parallel when `--fail-fast` is not
+set. `make replay-rv` and `make replay-la` stay as the simple single-arch entry
+points.
 
 Validate official image layout inside the dev shell:
 
@@ -183,7 +220,9 @@ Every scored run writes `score.json` and the per-arch marker/judge artifacts.
 Use `inspect-run --json` to check those artifacts without mutating the run
 directory.
 
-Replay can build a support image from an explicit LTP list:
+Replay can build a support image from an explicit LTP list. The image is stored
+in the content-addressed pool under `.state/build-cache/support-disks/` (not
+under the run directory):
 
 ```bash
 python3 -m tools.oscomp_eval.replay replay \
@@ -211,15 +250,24 @@ python3 -m tools.oscomp_eval.replay replay \
 
 ## Focused Lab
 
-Use `scripts/lab` for focused replay runs. It generates a guest plan, optional
-case filter payload, and support image under `.state/oscomp-lab/`, then uses the
-same replay, judge, and score path as `make replay-rv` and `make replay-la`.
+Use `scripts/lab` for focused replay runs. It writes the guest plan and optional
+case filter payload under `.state/oscomp-lab/`, builds or reuses the focused
+support image from `.state/build-cache/support-disks/`, then uses the same
+replay, judge, and score path as `make replay-rv` and `make replay-la`.
+
+```bash
+make dev-shell DEV_CMD='make lab-list'
+make dev-shell DEV_CMD='make lab-explain ARCH=rv SELECT=ltp-glibc:openat01'
+make dev-shell DEV_CMD='make lab-run ARCH=rv SELECT=ltp-glibc:openat01'
+make dev-shell DEV_CMD='make lab-run ARCH=rv SELECT=basic-musl'
+```
+
+Equivalent direct form:
 
 ```bash
 make dev-shell DEV_CMD='./scripts/lab list'
 make dev-shell DEV_CMD='./scripts/lab explain --arch rv --select ltp-glibc:openat01'
 make dev-shell DEV_CMD='./scripts/lab run --arch rv --select ltp-glibc:openat01'
-make dev-shell DEV_CMD='./scripts/lab run --arch rv --select basic-musl'
 ```
 
 Selectors use `GROUP-LIBC[:EXPR]`. `ltp` supports exact case names,
@@ -257,13 +305,19 @@ copy the test image.
 Inside `make dev-shell`, run `make shell-rv` or `make shell-la` directly. Exit
 the guest shell with `exit`; the kernel then powers off.
 
+Use `SHELL_ARGS` for explicit shell boot flags:
+
+```bash
+make dev-shell DEV_CMD='make shell-rv SHELL_ARGS="--image path/to/sdcard-rv.img"'
+```
+
 ## Smoke
 
 Targeted smoke checks are available through the smoke dispatcher:
 
 ```bash
-make dev-shell DEV_CMD='./scripts/smoke.sh list'
-make dev-shell DEV_CMD='./scripts/smoke.sh lwext4-io-boost --arch rv'
+make dev-shell DEV_CMD='make smoke-list'
+make dev-shell DEV_CMD='make smoke NAME=lwext4-io-boost ARCH=rv'
 ```
 
 Boot-shell smokes share helpers in `scripts/smoke/lib.sh`. They build or reuse
@@ -277,10 +331,10 @@ LoongArch async-depth gates.
 
 ## Tests
 
-Run the local evaluator unit tests inside the dev shell or on the host:
+Run tool tests inside the development container:
 
 ```bash
-PYTHONPATH=. python3 -m unittest discover -s tests/oscomp_eval -v
+make dev-shell DEV_CMD='make test-tools'
 ```
 
 ## Notes

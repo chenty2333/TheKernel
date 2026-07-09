@@ -37,7 +37,7 @@ class SmokeLibTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, msg=result.stderr)
 
-    def test_support_image_rebuild_skips_env_override_dependency(self) -> None:
+    def test_explicit_support_image_skips_rebuild(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as tmp:
             tmp.write(b"disk")
             tmp.flush()
@@ -46,7 +46,7 @@ class SmokeLibTests(unittest.TestCase):
         try:
             result = self.run_lib(
                 f'SUPPORT_IMAGE="{support_image}"',
-                'if smoke_support_image_needs_rebuild "$SUPPORT_IMAGE" 1; then exit 9; fi',
+                'smoke_build_support_image_if_needed rv "$SUPPORT_IMAGE" 1',
             )
         finally:
             support_image.unlink(missing_ok=True)

@@ -421,7 +421,8 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument("--support-image", help="support disk image override")
     evaluate_parser.add_argument(
         "--ltp-list",
-        help="build a run-local support image with this LTP list before replay",
+        help="build or reuse a content-addressed support image from this LTP list "
+        "(stored under .state/build-cache/support-disks/)",
     )
     evaluate_parser.add_argument(
         "--plan",

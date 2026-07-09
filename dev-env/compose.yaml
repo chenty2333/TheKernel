@@ -6,6 +6,7 @@ x-common-env: &common-env
   RUSTUP_HOME: /usr/local/rustup
   OSCOMP_TESTSUITE_DIR: /opt/oskernel/testsuites
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  PYTHONDONTWRITEBYTECODE: "1"
   LOCAL_UID: "${LOCAL_UID:-1000}"
   LOCAL_GID: "${LOCAL_GID:-1000}"
 
