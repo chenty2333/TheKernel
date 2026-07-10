@@ -115,8 +115,8 @@ fn maybe_request_syscall_restart(thr: &Thread, result: &Result<isize, AxError>) 
 /// Fast path for trivial getter syscalls that only read from the current
 /// thread and return a scalar: no user copy, no restart, no blocking, no
 /// timer accounting. Handling them here skips the per-syscall
-/// enter_syscall/set_timer_state/restart bookkeeping, cutting the null-syscall
-/// latency that lmbench measures. Signal delivery and preemption run in the
+/// enter_syscall/set_timer_state/restart bookkeeping, reducing common getter
+/// latency. Signal delivery and preemption run in the
 /// user-mode loop after handle_syscall returns, so they remain correct.
 fn fast_path_getter(sysno: Sysno) -> Option<AxResult<isize>> {
     Some(match sysno {

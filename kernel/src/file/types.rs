@@ -8,7 +8,7 @@ use axpoll::Pollable;
 use downcast_rs::{DowncastSync, impl_downcast};
 use linux_raw_sys::general::{
     S_IFBLK, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, STATX_BASIC_STATS, STATX_BTIME,
-    STATX_DIOALIGN, stat, statx, statx_timestamp,
+    STATX_DIOALIGN, STATX_MNT_ID, stat, statx, statx_timestamp,
 };
 
 use super::{FileHandle, add_file_like, get_typed_file};
@@ -20,6 +20,7 @@ const REGULAR_FILE_DIO_ALIGNMENT: u32 = 512;
 #[derive(Debug, Clone, Copy)]
 pub struct Kstat {
     pub dev: u64,
+    pub mnt_id: u64,
     pub ino: u64,
     pub nlink: u32,
     pub mode: u32,
@@ -41,11 +42,12 @@ impl Default for Kstat {
     fn default() -> Self {
         Self {
             dev: 0,
-            ino: 1,
-            nlink: 1,
+            mnt_id: 0,
+            ino: 0,
+            nlink: 0,
             mode: 0,
-            uid: 1,
-            gid: 1,
+            uid: 0,
+            gid: 0,
             size: 0,
             blksize: 4096,
             blocks: 0,
@@ -115,9 +117,14 @@ impl From<Kstat> for statx {
         statx.stx_btime = time_to_statx(&value.btime);
         statx.stx_ctime = time_to_statx(&value.ctime);
         statx.stx_mtime = time_to_statx(&value.mtime);
+        if value.mnt_id != 0 {
+            statx.stx_mask |= STATX_MNT_ID;
+            statx.stx_mnt_id = value.mnt_id;
+        }
 
-        statx.stx_dev_major = (value.dev >> 32) as _;
-        statx.stx_dev_minor = value.dev as _;
+        let dev = DeviceId(value.dev);
+        statx.stx_dev_major = dev.major();
+        statx.stx_dev_minor = dev.minor();
         let file_type = value.mode & S_IFMT;
         if file_type == S_IFBLK {
             statx.stx_mask |= STATX_DIOALIGN;
@@ -151,9 +158,7 @@ pub trait FileLike: Pollable + DowncastSync {
         Err(AxError::InvalidInput)
     }
 
-    fn stat(&self) -> AxResult<Kstat> {
-        Ok(Kstat::default())
-    }
+    fn stat(&self) -> AxResult<Kstat>;
 
     fn path(&self) -> Cow<'_, str>;
 

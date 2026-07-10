@@ -1,7 +1,5 @@
 use alloc::sync::Arc;
-use core::cell::OnceCell;
 
-use axdriver::AxBlockDevice;
 use axfs_ng_vfs::{
     DirEntry, DirNode, Filesystem, FilesystemOps, Reference, StatFs, VfsResult, path::MAX_NAME_LEN,
 };
@@ -12,17 +10,18 @@ use super::{
     Ext4Disk, Inode,
     util::{LwExt4Filesystem, into_vfs_err},
 };
+use crate::MountedBlockDevice;
 
 const EXT4_CONFIG: FsConfig = FsConfig { bcache_size: 2048 };
 
 pub struct Ext4Filesystem {
     inner: Mutex<LwExt4Filesystem>,
     disk: Ext4Disk,
-    root_dir: OnceCell<DirEntry>,
+    root_dir: Mutex<Option<DirEntry>>,
 }
 
 impl Ext4Filesystem {
-    pub fn new(dev: AxBlockDevice) -> VfsResult<Filesystem> {
+    pub fn new(dev: MountedBlockDevice) -> VfsResult<Filesystem> {
         let disk = Ext4Disk::new(dev);
         let ext4 =
             lwext4_rust::Ext4Filesystem::new(disk.clone(), EXT4_CONFIG).map_err(into_vfs_err)?;
@@ -30,9 +29,9 @@ impl Ext4Filesystem {
         let fs = Arc::new(Self {
             inner: Mutex::new(ext4),
             disk,
-            root_dir: OnceCell::new(),
+            root_dir: Mutex::new(None),
         });
-        let _ = fs.root_dir.set(DirEntry::new_dir(
+        *fs.root_dir.lock() = Some(DirEntry::new_dir(
             |this| DirNode::new(Inode::new(fs.clone(), EXT4_ROOT_INO, Some(this))),
             Reference::root(),
         ));
@@ -68,7 +67,7 @@ impl FilesystemOps for Ext4Filesystem {
     }
 
     fn root_dir(&self) -> DirEntry {
-        self.root_dir.get().unwrap().clone()
+        self.root_dir.lock().clone().unwrap()
     }
 
     fn stat(&self) -> VfsResult<StatFs> {
@@ -91,6 +90,11 @@ impl FilesystemOps for Ext4Filesystem {
     }
 
     fn flush(&self) -> VfsResult<()> {
+        crate::highlevel::sync_cached_file_pages_for_filesystem(self)?;
         self.inner.lock().flush().map_err(into_vfs_err)
+    }
+
+    fn unmount(&self) {
+        self.root_dir.lock().take();
     }
 }

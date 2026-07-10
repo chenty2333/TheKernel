@@ -1,7 +1,7 @@
 use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult};
-use axfs_ng_vfs::{Location, NodePermission, path::Path};
+use axfs_ng_vfs::{DeviceId, Location, NodePermission, path::Path};
 use axtask::current;
 use linux_raw_sys::general::{
     __kernel_fsid_t, AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_STATX_SYNC_TYPE,
@@ -67,7 +67,7 @@ fn statx_timestamp_from_duration(time: core::time::Duration) -> statx_timestamp 
 
 fn statx_from_kstat(value: crate::file::Kstat, request_mask: u32) -> statx {
     let mut result: statx = unsafe { core::mem::zeroed() };
-    result.stx_mask = STATX_BASIC_STATS | STATX_BTIME | STATX_MNT_ID;
+    result.stx_mask = STATX_BASIC_STATS | STATX_BTIME;
     result.stx_blksize = value.blksize as _;
     result.stx_attributes = value.attributes;
     result.stx_attributes_mask = value.attributes_mask;
@@ -84,9 +84,13 @@ fn statx_from_kstat(value: crate::file::Kstat, request_mask: u32) -> statx {
     result.stx_mtime = statx_timestamp_from_duration(value.mtime);
     result.stx_rdev_major = value.rdev.major();
     result.stx_rdev_minor = value.rdev.minor();
-    result.stx_dev_major = (value.dev >> 32) as _;
-    result.stx_dev_minor = value.dev as _;
-    result.stx_mnt_id = value.dev;
+    let dev = DeviceId(value.dev);
+    result.stx_dev_major = dev.major();
+    result.stx_dev_minor = dev.minor();
+    if value.mnt_id != 0 {
+        result.stx_mask |= STATX_MNT_ID;
+        result.stx_mnt_id = value.mnt_id;
+    }
 
     let request_mask = request_mask & !STATX_CHANGE_COOKIE;
     let file_type = value.mode & S_IFMT;
@@ -347,9 +351,9 @@ fn statfs(loc: &Location) -> AxResult<statfs> {
     result.f_bavail = stat.blocks_available as _;
     result.f_files = stat.file_count as _;
     result.f_ffree = stat.free_file_count as _;
-    // TODO: fsid
+    let device = mounts::linux_device_id(loc.mountpoint().device()).0;
     result.f_fsid = __kernel_fsid_t {
-        val: [0, loc.mountpoint().device() as _],
+        val: [device as _, (device >> 32) as _],
     };
     result.f_namelen = stat.name_length as _;
     result.f_frsize = stat.fragment_size as _;

@@ -32,6 +32,10 @@ impl FatFileNode {
     }
 }
 
+fn regular_file_size(file: &ff::File<'_>) -> VfsResult<u64> {
+    file.size().map(u64::from).ok_or(VfsError::Io)
+}
+
 fn grow_file(fs: &FatFilesystemInner, file: &mut ff::File<'static>, len: u64) -> VfsResult<()> {
     // rust-fatfs does not support growing files directly. We need to
     // pad with zeros manually.
@@ -59,7 +63,12 @@ impl NodeOps for FatFileNode {
     fn metadata(&self) -> VfsResult<Metadata> {
         let fs = self.fs.lock();
         let file = self.inner.borrow(&fs);
-        Ok(file_metadata(&fs, file, NodeType::RegularFile))
+        file_metadata(
+            &fs,
+            file,
+            self.inode,
+            NodeType::RegularFile,
+        )
     }
 
     fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()> {
@@ -67,8 +76,7 @@ impl NodeOps for FatFileNode {
 
         let fs = self.fs.lock();
         let file = self.inner.borrow_mut(&fs);
-        update_file_metadata(file, update);
-        Ok(())
+        update_file_metadata(file, update)
     }
 
     fn filesystem(&self) -> &dyn FilesystemOps {
@@ -78,13 +86,11 @@ impl NodeOps for FatFileNode {
     fn len(&self) -> VfsResult<u64> {
         let fs = self.fs.lock();
         let file = self.inner.borrow(&fs);
-        Ok(file.size().unwrap_or(0) as u64)
+        regular_file_size(file)
     }
 
     fn sync(&self, _data_only: bool) -> VfsResult<()> {
-        let fs = self.fs.lock();
-        let file = self.inner.borrow_mut(&fs);
-        file.flush().map_err(into_vfs_err)
+        self.fs.flush()
     }
 
     fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
@@ -116,7 +122,7 @@ impl FileNodeOps for FatFileNode {
     fn write_at(&self, mut buf: &[u8], offset: u64) -> VfsResult<usize> {
         let fs = self.fs.lock();
         let file = self.inner.borrow_mut(&fs);
-        if offset > file.size().unwrap_or(0) as u64 {
+        if offset > regular_file_size(file)? {
             grow_file(&fs, file, offset)?;
         }
         file.seek(SeekFrom::Start(offset)).map_err(into_vfs_err)?;
@@ -137,13 +143,13 @@ impl FileNodeOps for FatFileNode {
         let file = self.inner.borrow_mut(&fs);
         file.seek(SeekFrom::End(0)).map_err(into_vfs_err)?;
         let written = file.write(buf).map_err(into_vfs_err)?;
-        Ok((written, file.size().unwrap_or(0) as u64))
+        Ok((written, regular_file_size(file)?))
     }
 
     fn set_len(&self, len: u64) -> VfsResult<()> {
         let fs = self.fs.lock();
         let file = self.inner.borrow_mut(&fs);
-        if len <= file.size().unwrap_or(0) as u64 {
+        if len <= regular_file_size(file)? {
             file.seek(SeekFrom::Start(len)).map_err(into_vfs_err)?;
             file.truncate().map_err(into_vfs_err)
         } else {

@@ -518,12 +518,6 @@ pub struct ProcessData {
     supplementary_groups: SpinNoIrq<Vec<u32>>,
     /// Linux personality flags shared by all threads in the process.
     personality: AtomicU32,
-    /// Raw Linux I/O priority value configured through ioprio_set(2).
-    ioprio: AtomicU32,
-    /// Linux I/O context identity shared by CLONE_IO.
-    pub(crate) io_context: Arc<()>,
-    /// System V semaphore undo-list identity shared by CLONE_SYSVSEM.
-    pub(crate) sysvsem_undo: Arc<()>,
     /// NUMA memory policy state for the single-node kernel memory model.
     mempolicy: SpinNoIrq<MempolicyState>,
     /// Parent-death signal configured through prctl(PR_SET_PDEATHSIG).
@@ -534,12 +528,6 @@ pub struct ProcessData {
     timerslack_default_ns: AtomicUsize,
     /// no_new_privs state configured through prctl(PR_SET_NO_NEW_PRIVS).
     no_new_privs: AtomicU32,
-    /// Seccomp mode reported through prctl(PR_GET_SECCOMP).
-    seccomp_mode: AtomicU32,
-    /// Transparent huge-page disable flag reported through prctl(PR_GET_THP_DISABLE).
-    thp_disabled: AtomicU32,
-    /// Process-scoped membarrier registration state.
-    membarrier_state: AtomicU32,
     /// POSIX interval timers created by this process.
     pub(crate) posix_timers: SpinNoIrq<Vec<Option<PosixTimer>>>,
 
@@ -600,8 +588,6 @@ impl ProcessData {
         user_ns: Arc<UserNamespace>,
         uts_ns: Arc<UtsNamespace>,
         time_ns: Arc<TimeNamespace>,
-        io_context: Arc<()>,
-        sysvsem_undo: Arc<()>,
     ) -> Arc<Self> {
         let start_realtime_sec = wall_time().as_secs();
         let start_monotonic_ns = monotonic_time_nanos();
@@ -638,17 +624,11 @@ impl ProcessData {
             caps: SpinNoIrq::new(CapabilityState::full()),
             supplementary_groups: SpinNoIrq::new(vec![0]),
             personality: AtomicU32::new(0),
-            ioprio: AtomicU32::new(0),
-            io_context,
-            sysvsem_undo,
             mempolicy: SpinNoIrq::new(MempolicyState::default()),
             pdeath_signal: AtomicU32::new(0),
             timerslack_current_ns: AtomicUsize::new(50_000),
             timerslack_default_ns: AtomicUsize::new(50_000),
             no_new_privs: AtomicU32::new(0),
-            seccomp_mode: AtomicU32::new(0),
-            thp_disabled: AtomicU32::new(0),
-            membarrier_state: AtomicU32::new(0),
             posix_timers: SpinNoIrq::new(Vec::new()),
             exited_threads_usage: AtomicTaskUsage::new(),
             waited_children_usage: AtomicTaskUsage::new(),
@@ -795,22 +775,6 @@ impl ProcessData {
         self.no_new_privs.store(1, Ordering::Release)
     }
 
-    pub fn seccomp_mode(&self) -> u32 {
-        self.seccomp_mode.load(Ordering::Acquire)
-    }
-
-    pub fn set_seccomp_mode(&self, mode: u32) {
-        self.seccomp_mode.store(mode, Ordering::Release)
-    }
-
-    pub fn thp_disabled(&self) -> bool {
-        self.thp_disabled.load(Ordering::Acquire) != 0
-    }
-
-    pub fn set_thp_disabled(&self, disabled: bool) {
-        self.thp_disabled.store(disabled as u32, Ordering::Release)
-    }
-
     /// Linux manual: A "clone" child is one which delivers no signal, or a
     /// signal other than SIGCHLD to its parent upon termination.
     pub fn is_clone_child(&self) -> bool {
@@ -906,14 +870,6 @@ impl ProcessData {
         self.personality.store(personality, Ordering::Release);
     }
 
-    pub fn ioprio(&self) -> u32 {
-        self.ioprio.load(Ordering::Acquire)
-    }
-
-    pub fn set_ioprio(&self, ioprio: u32) {
-        self.ioprio.store(ioprio, Ordering::Release);
-    }
-
     pub fn mempolicy(&self) -> Mempolicy {
         self.mempolicy.lock().process_policy
     }
@@ -1003,22 +959,6 @@ impl ProcessData {
 
     pub fn has_effective_capability(&self, cap: u32) -> bool {
         self.capability_state().has_effective(cap)
-    }
-
-    pub fn register_membarrier(&self, flags: u32) {
-        self.membarrier_state.fetch_or(flags, Ordering::Relaxed);
-    }
-
-    pub fn membarrier_registrations(&self) -> u32 {
-        self.membarrier_state.load(Ordering::Relaxed)
-    }
-
-    pub fn membarrier_registered(&self, flags: u32) -> bool {
-        self.membarrier_state.load(Ordering::Relaxed) & flags == flags
-    }
-
-    pub fn clear_membarrier_registrations(&self) {
-        self.membarrier_state.store(0, Ordering::SeqCst);
     }
 
     pub fn bounding_capability_enabled(&self, cap: u32) -> AxResult<bool> {

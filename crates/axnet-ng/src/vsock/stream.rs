@@ -47,6 +47,10 @@ impl Default for VsockStreamTransport {
 }
 
 impl Configurable for VsockStreamTransport {
+    fn nonblocking(&self) -> bool {
+        self.general.nonblocking()
+    }
+
     fn get_option_inner(&self, opt: &mut GetSocketOption) -> AxResult<bool> {
         self.general.get_option_inner(opt)
     }
@@ -78,7 +82,7 @@ impl VsockTransportOps for VsockStreamTransport {
         Ok(())
     }
 
-    fn listen(&self) -> AxResult<()> {
+    fn listen(&self, backlog: usize) -> AxResult<()> {
         let guard = self
             .state
             .lock(State::Idle)
@@ -89,7 +93,7 @@ impl VsockTransportOps for VsockStreamTransport {
             let local_addr = conn.lock().local_addr();
 
             // register in the global listen table
-            VSOCK_CONN_MANAGER.lock().listen(local_addr)?;
+            VSOCK_CONN_MANAGER.lock().listen(local_addr, backlog)?;
             vsock_listen(local_addr)?;
             // set state
             conn.lock().set_state(ConnectionState::Listening);

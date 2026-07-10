@@ -229,7 +229,10 @@ impl AcceptQueue {
         self.consumer.is_empty()
     }
 
-    pub fn push(&mut self, conn_id: VsockConnId) -> AxResult<()> {
+    pub fn push(&mut self, conn_id: VsockConnId, backlog: usize) -> AxResult<()> {
+        if self.consumer.occupied_len() >= backlog {
+            ax_bail!(ResourceBusy, "accept queue full");
+        }
         match self.producer.try_push(conn_id) {
             Ok(_) => Ok(()),
             Err(_) => ax_bail!(ResourceBusy, "accept queue full"),
@@ -246,14 +249,16 @@ pub struct ListenQueue {
     pub accept_queue: AcceptQueue,
     pub wakers: PollSet,
     pub local_addr: VsockAddr,
+    backlog: usize,
 }
 
 impl ListenQueue {
-    pub fn new(local_addr: VsockAddr) -> Self {
+    pub fn new(local_addr: VsockAddr, backlog: usize) -> Self {
         Self {
             accept_queue: AcceptQueue::new(),
             wakers: PollSet::new(),
             local_addr,
+            backlog: backlog.clamp(1, VSOCK_ACCEPT_QUEUE_SIZE),
         }
     }
 
@@ -317,12 +322,12 @@ impl VsockConnectionManager {
     }
 
     /// create a listen queue
-    pub fn listen(&mut self, local_addr: VsockAddr) -> AxResult<()> {
+    pub fn listen(&mut self, local_addr: VsockAddr, backlog: usize) -> AxResult<()> {
         if self.listen_queues.contains_key(&local_addr.port) {
             ax_bail!(AddrInUse, "port already in use");
         }
 
-        let queue = Arc::new(Mutex::new(ListenQueue::new(local_addr)));
+        let queue = Arc::new(Mutex::new(ListenQueue::new(local_addr, backlog)));
         self.listen_queues.insert(local_addr.port, queue);
         Ok(())
     }
@@ -422,7 +427,8 @@ impl VsockConnectionManager {
 
         // enqueue connection to accept queue
         let mut queue_guard = queue.lock();
-        if queue_guard.accept_queue.push(conn_id).is_err() {
+        let backlog = queue_guard.backlog;
+        if queue_guard.accept_queue.push(conn_id, backlog).is_err() {
             info!(
                 "Accept queue full for port {}, dropping connection from {:?}",
                 conn_id.local_port, conn_id.peer_addr

@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 
 use smoltcp::{
     iface::SocketSet,
@@ -9,8 +9,8 @@ use smoltcp::{
 };
 
 use crate::{
-    consts::{LOOPBACK_MTU, SOCKET_BUFFER_SIZE, STANDARD_MTU},
-    device::Device,
+    consts::{LOOPBACK_MTU, PACKET_QUEUE_LEN, STANDARD_MTU},
+    device::{Device, DeviceStats, InterfaceInfo},
     listen_table::ListenTable,
 };
 
@@ -20,6 +20,19 @@ pub struct Rule {
     pub via: Option<IpAddress>,
     pub dev: usize,
     pub src: IpAddress,
+}
+
+/// A point-in-time routing-table entry with a public interface index.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteInfo {
+    /// Destination prefix matched by this route.
+    pub destination: IpCidr,
+    /// Optional next-hop address.
+    pub gateway: Option<IpAddress>,
+    /// One-based index of the output interface.
+    pub interface_index: u32,
+    /// Source address selected for packets using this route.
+    pub source: IpAddress,
 }
 
 impl Rule {
@@ -77,12 +90,12 @@ impl Router {
 
     fn new_with_mtu(listen_table: Arc<ListenTable>, mtu: usize) -> Self {
         let rx_buffer = PacketBuffer::new(
-            vec![PacketMetadata::EMPTY; SOCKET_BUFFER_SIZE],
-            vec![0u8; mtu * SOCKET_BUFFER_SIZE],
+            vec![PacketMetadata::EMPTY; PACKET_QUEUE_LEN],
+            vec![0u8; mtu * PACKET_QUEUE_LEN],
         );
         let tx_buffer = PacketBuffer::new(
-            vec![PacketMetadata::EMPTY; SOCKET_BUFFER_SIZE],
-            vec![0u8; mtu * SOCKET_BUFFER_SIZE],
+            vec![PacketMetadata::EMPTY; PACKET_QUEUE_LEN],
+            vec![0u8; mtu * PACKET_QUEUE_LEN],
         );
         Self {
             rx_buffer,
@@ -103,6 +116,41 @@ impl Router {
         self.devices.len() - 1
     }
 
+    pub(crate) fn device_stats(&self) -> Vec<(String, DeviceStats)> {
+        self.devices
+            .iter()
+            .map(|device| (device.name().into(), device.stats()))
+            .collect()
+    }
+
+    pub(crate) fn interfaces(&self) -> Vec<InterfaceInfo> {
+        self.devices
+            .iter()
+            .enumerate()
+            .map(|(index, device)| InterfaceInfo {
+                index: index as u32 + 1,
+                name: device.name().into(),
+                kind: device.interface_kind(),
+                mtu: device.mtu(),
+                hardware_address: device.hardware_address(),
+                addresses: device.addresses(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn routes(&self) -> Vec<RouteInfo> {
+        self.table
+            .rules
+            .iter()
+            .map(|rule| RouteInfo {
+                destination: rule.filter,
+                gateway: rule.via,
+                interface_index: rule.dev as u32 + 1,
+                source: rule.src,
+            })
+            .collect()
+    }
+
     pub fn poll(&mut self, timestamp: Instant) {
         for dev in &mut self.devices {
             while !self.rx_buffer.is_full() && dev.recv(&mut self.rx_buffer, timestamp) {}
@@ -112,10 +160,16 @@ impl Router {
     pub fn dispatch(&mut self, timestamp: Instant) -> bool {
         let mut poll_next = false;
         while let Ok(((), packet)) = self.tx_buffer.dequeue() {
-            match IpVersion::of_packet(packet).expect("got invalid IP packet") {
+            let Ok(version) = IpVersion::of_packet(packet) else {
+                warn!("Dropping malformed IP packet from transmit queue");
+                continue;
+            };
+            match version {
                 IpVersion::Ipv4 => {
-                    let packet = smoltcp::wire::Ipv4Packet::new_checked(packet)
-                        .expect("got invalid IPv4 packet");
+                    let Ok(packet) = smoltcp::wire::Ipv4Packet::new_checked(packet) else {
+                        warn!("Dropping malformed IPv4 packet from transmit queue");
+                        continue;
+                    };
                     let dst_addr = IpAddress::Ipv4(packet.dst_addr());
                     if packet.dst_addr().is_broadcast() {
                         let buf = packet.into_inner();
@@ -138,13 +192,18 @@ impl Router {
                         }
 
                         let next_hop = rule.via.unwrap_or(dst_addr);
-                        let dev = &mut self.devices[rule.dev];
+                        let Some(dev) = self.devices.get_mut(rule.dev) else {
+                            warn!("Dropping IPv4 packet for missing route device {}", rule.dev);
+                            continue;
+                        };
                         poll_next |= dev.send(next_hop, packet.into_inner(), timestamp);
                     }
                 }
                 IpVersion::Ipv6 => {
-                    let packet = smoltcp::wire::Ipv6Packet::new_checked(packet)
-                        .expect("got invalid IPv6 packet");
+                    let Ok(packet) = smoltcp::wire::Ipv6Packet::new_checked(packet) else {
+                        warn!("Dropping malformed IPv6 packet from transmit queue");
+                        continue;
+                    };
                     let dst_addr = IpAddress::Ipv6(packet.dst_addr());
                     if packet.dst_addr().is_multicast() {
                         let buf = packet.into_inner();
@@ -167,7 +226,10 @@ impl Router {
                         }
 
                         let next_hop = rule.via.unwrap_or(dst_addr);
-                        let dev = &mut self.devices[rule.dev];
+                        let Some(dev) = self.devices.get_mut(rule.dev) else {
+                            warn!("Dropping IPv6 packet for missing route device {}", rule.dev);
+                            continue;
+                        };
                         poll_next |= dev.send(next_hop, packet.into_inner(), timestamp);
                     }
                 }
@@ -192,9 +254,14 @@ impl smoltcp::phy::TxToken for TxToken<'_> {
 }
 
 fn snoop_tcp_packet(buf: &[u8], sockets: &mut SocketSet<'_>, listen_table: &ListenTable) {
-    let (protocol, src_addr, dst_addr, payload) = match IpVersion::of_packet(buf).unwrap() {
+    let Ok(version) = IpVersion::of_packet(buf) else {
+        return;
+    };
+    let (protocol, src_addr, dst_addr, payload) = match version {
         IpVersion::Ipv4 => {
-            let packet = Ipv4Packet::new_unchecked(buf);
+            let Ok(packet) = Ipv4Packet::new_checked(buf) else {
+                return;
+            };
             (
                 packet.next_header(),
                 IpAddress::Ipv4(packet.src_addr()),
@@ -203,7 +270,9 @@ fn snoop_tcp_packet(buf: &[u8], sockets: &mut SocketSet<'_>, listen_table: &List
             )
         }
         IpVersion::Ipv6 => {
-            let packet = Ipv6Packet::new_unchecked(buf);
+            let Ok(packet) = Ipv6Packet::new_checked(buf) else {
+                return;
+            };
             (
                 packet.next_header(),
                 IpAddress::Ipv6(packet.src_addr()),
@@ -213,7 +282,9 @@ fn snoop_tcp_packet(buf: &[u8], sockets: &mut SocketSet<'_>, listen_table: &List
         }
     };
     if protocol == IpProtocol::Tcp {
-        let tcp_packet = TcpPacket::new_unchecked(payload);
+        let Ok(tcp_packet) = TcpPacket::new_checked(payload) else {
+            return;
+        };
         let src_addr = (src_addr, tcp_packet.src_port()).into();
         let dst_addr = (dst_addr, tcp_packet.dst_port()).into();
         let is_first = tcp_packet.syn() && !tcp_packet.ack();
@@ -271,7 +342,7 @@ impl smoltcp::phy::Device for Router {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = self.mtu;
-        caps.max_burst_size = Some(SOCKET_BUFFER_SIZE);
+        caps.max_burst_size = Some(PACKET_QUEUE_LEN);
         caps
     }
 }

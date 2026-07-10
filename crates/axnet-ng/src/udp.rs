@@ -1,12 +1,13 @@
-use alloc::{sync::Arc, vec};
+use alloc::sync::Arc;
 use core::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::Context,
 };
 
 use axerrno::{AxError, AxResult, LinuxError, ax_bail, ax_err_type};
 use axio::prelude::*;
-use axpoll::{IoEvents, Pollable};
+use axpoll::{IoEvents, PollSet, Pollable};
 use smoltcp::{
     iface::SocketHandle,
     phy::PacketMeta,
@@ -18,7 +19,11 @@ use spin::RwLock;
 
 use crate::{
     RecvFlags, RecvOptions, SendOptions, Shutdown, SocketAddrEx, SocketOps,
-    consts::{SOCKET_BUFFER_SIZE, UDP_RX_BUF_LEN, UDP_TX_BUF_LEN},
+    buffer::{
+        normalized_socket_buffer_size, try_filled_buffer, try_zeroed_socket_buffer,
+        udp_packet_slots,
+    },
+    consts::{UDP_RX_BUF_LEN, UDP_TX_BUF_LEN},
     general::GeneralOptions,
     net_stack::NetStack,
     options::{Configurable, GetSocketOption, SetSocketOption},
@@ -26,24 +31,33 @@ use crate::{
 };
 
 const MAX_UDP_SEND_LEN: usize = u16::MAX as usize;
-const UDP_SEND_COOPERATE_INTERVAL: usize = 32;
-const LOOPBACK_UDP_PAYLOAD_HINT: usize = 60 * 1024;
+const UDP_SEND_COOPERATE_BYTES: usize = 256 * 1024;
 
-static UDP_SEND_COOPERATE_COUNTER: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+fn new_udp_packet_buffer(requested: usize) -> AxResult<smol::PacketBuffer<'static>> {
+    let size = normalized_socket_buffer_size(requested);
+    Ok(smol::PacketBuffer::new(
+        try_filled_buffer(udp_packet_slots(size), PacketMetadata::EMPTY)?,
+        try_zeroed_socket_buffer(size)?,
+    ))
+}
 
-pub(crate) fn new_udp_socket() -> smol::Socket<'static> {
-    // TODO(mivik): buffer size
-    smol::Socket::new(
-        smol::PacketBuffer::new(
-            vec![PacketMetadata::EMPTY; SOCKET_BUFFER_SIZE],
-            vec![0; UDP_RX_BUF_LEN],
-        ),
-        smol::PacketBuffer::new(
-            vec![PacketMetadata::EMPTY; SOCKET_BUFFER_SIZE],
-            vec![0; UDP_TX_BUF_LEN],
-        ),
-    )
+pub(crate) fn new_udp_socket() -> AxResult<smol::Socket<'static>> {
+    Ok(smol::Socket::new(
+        new_udp_packet_buffer(UDP_RX_BUF_LEN)?,
+        new_udp_packet_buffer(UDP_TX_BUF_LEN)?,
+    ))
+}
+
+fn replace_udp_send_buffer(socket: &mut smol::Socket, requested: usize) -> AxResult<()> {
+    socket
+        .replace_send_buffer(new_udp_packet_buffer(requested)?)
+        .map_err(|_| AxError::ResourceBusy)
+}
+
+fn replace_udp_recv_buffer(socket: &mut smol::Socket, requested: usize) -> AxResult<()> {
+    socket
+        .replace_recv_buffer(new_udp_packet_buffer(requested)?)
+        .map_err(|_| AxError::ResourceBusy)
 }
 
 /// A UDP socket that provides POSIX-like APIs.
@@ -53,25 +67,33 @@ pub struct UdpSocket {
     local_addr: RwLock<Option<IpEndpoint>>,
     reported_local_addr: RwLock<Option<IpEndpoint>>,
     peer_addr: RwLock<Option<(IpEndpoint, IpAddress)>>,
+    send_bytes_since_yield: AtomicUsize,
+    rx_shutdown: AtomicBool,
+    tx_shutdown: AtomicBool,
+    poll_state: PollSet,
 
     general: GeneralOptions,
 }
 
 impl UdpSocket {
     /// Creates a new UDP socket bound to the given network stack.
-    pub fn new(stack: Arc<NetStack>) -> Self {
-        let socket = new_udp_socket();
+    pub fn new(stack: Arc<NetStack>) -> AxResult<Self> {
+        let socket = new_udp_socket()?;
         let handle = stack.socket_set.add(socket);
 
-        Self {
+        Ok(Self {
             stack,
             handle,
             local_addr: RwLock::new(None),
             reported_local_addr: RwLock::new(None),
             peer_addr: RwLock::new(None),
+            send_bytes_since_yield: AtomicUsize::new(0),
+            rx_shutdown: AtomicBool::new(false),
+            tx_shutdown: AtomicBool::new(false),
+            poll_state: PollSet::new(),
 
             general: GeneralOptions::new(),
-        }
+        })
     }
 
     fn with_smol_socket<R>(&self, f: impl FnOnce(&mut smol::Socket) -> R) -> R {
@@ -117,13 +139,17 @@ impl UdpSocket {
     }
 
     fn note_udp_send_progress(&self, sent: usize) {
-        if sent < LOOPBACK_UDP_PAYLOAD_HINT {
-            return;
-        }
-        let count = UDP_SEND_COOPERATE_COUNTER
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-            + 1;
-        if count % UDP_SEND_COOPERATE_INTERVAL == 0 {
+        let mut should_yield = false;
+        let _ = self.send_bytes_since_yield.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| {
+                let next = current.saturating_add(sent);
+                should_yield = next >= UDP_SEND_COOPERATE_BYTES;
+                Some(if should_yield { 0 } else { next })
+            },
+        );
+        if should_yield {
             axtask::yield_now();
         }
     }
@@ -132,11 +158,21 @@ impl UdpSocket {
         &self,
         _filter: Option<alloc::sync::Arc<dyn crate::SocketFilter>>,
     ) -> AxResult<()> {
-        Ok(())
+        Err(AxError::Unsupported)
+    }
+
+    pub fn disconnect(&self) {
+        *self.peer_addr.write() = None;
+        *self.reported_local_addr.write() = None;
+        self.poll_state.wake();
     }
 }
 
 impl Configurable for UdpSocket {
+    fn nonblocking(&self) -> bool {
+        self.general.nonblocking()
+    }
+
     fn get_option_inner(&self, option: &mut GetSocketOption) -> AxResult<bool> {
         use GetSocketOption as O;
 
@@ -150,10 +186,10 @@ impl Configurable for UdpSocket {
                 });
             }
             O::SendBuffer(size) => {
-                **size = UDP_TX_BUF_LEN;
+                **size = self.with_smol_socket(|socket| socket.payload_send_capacity());
             }
             O::ReceiveBuffer(size) => {
-                **size = UDP_RX_BUF_LEN;
+                **size = self.with_smol_socket(|socket| socket.payload_recv_capacity());
             }
             _ => return Ok(false),
         }
@@ -171,6 +207,12 @@ impl Configurable for UdpSocket {
                 self.with_smol_socket(|socket| {
                     socket.set_hop_limit(Some(*ttl));
                 });
+            }
+            O::SendBuffer(size) | O::SendBufferForce(size) => {
+                self.with_smol_socket(|socket| replace_udp_send_buffer(socket, *size))?;
+            }
+            O::ReceiveBuffer(size) | O::ReceiveBufferForce(size) => {
+                self.with_smol_socket(|socket| replace_udp_recv_buffer(socket, *size))?;
             }
             _ => return Ok(false),
         }
@@ -233,16 +275,17 @@ impl SocketOps for UdpSocket {
         }
 
         let remote_addr = IpEndpoint::from(remote_addr);
-        let outbound = self
-            .stack
-            .get_service()
-            .resolve_outbound(&remote_addr.addr, self.bound_source_addr())?;
+        let outbound = self.stack.get_service().resolve_outbound_with_dont_route(
+            &remote_addr.addr,
+            self.bound_source_addr(),
+            self.general.dont_route(),
+        )?;
         self.general.set_device_mask(outbound.device_mask);
         // Linux reports the selected source address after a connected UDP
         // socket resolves its route. Keep the wildcard bind semantics in the
         // actual socket state, but surface the concrete source address through
         // getsockname/local_addr so user space can advertise a usable reply
-        // endpoint (for example, netperf's UDP_RR control path).
+        // endpoint after an implicit bind.
         self.remember_reported_local_addr(outbound.src_addr);
         *guard = Some((remote_addr, outbound.src_addr));
         debug!("UDP socket {}: connected to {}", self.handle, remote_addr);
@@ -250,14 +293,17 @@ impl SocketOps for UdpSocket {
     }
 
     fn send(&self, mut src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {
-        let has_explicit_destination = options.to.is_some();
+        if self.tx_shutdown.load(Ordering::Acquire) {
+            return Err(AxError::BrokenPipe);
+        }
         let (remote_addr, source_addr) = match options.to {
             Some(addr) => {
                 let addr = IpEndpoint::from(addr.into_ip()?);
-                let outbound = self
-                    .stack
-                    .get_service()
-                    .resolve_outbound(&addr.addr, self.bound_source_addr())?;
+                let outbound = self.stack.get_service().resolve_outbound_with_dont_route(
+                    &addr.addr,
+                    self.bound_source_addr(),
+                    self.general.dont_route(),
+                )?;
                 self.general.set_device_mask(outbound.device_mask);
                 (addr, outbound.src_addr)
             }
@@ -311,13 +357,16 @@ impl SocketOps for UdpSocket {
         // Push freshly queued datagrams through the interface/router path so
         // loopback receivers observe readiness immediately.
         self.stack.poll_interfaces();
-        if sent > 0 && (sent >= LOOPBACK_UDP_PAYLOAD_HINT || has_explicit_destination) {
+        if sent > 0 {
             self.note_udp_send_progress(sent);
         }
         Ok(sent)
     }
 
     fn recv(&self, mut dst: impl Write, options: RecvOptions) -> AxResult<usize> {
+        if self.rx_shutdown.load(Ordering::Acquire) {
+            return Ok(0);
+        }
         if self.local_addr.read().is_none() {
             ax_bail!(NotConnected);
         }
@@ -374,9 +423,7 @@ impl SocketOps for UdpSocket {
                             })
                         }
                         Err(smol::RecvError::Exhausted) => Err(AxError::WouldBlock),
-                        Err(smol::RecvError::Truncated) => {
-                            unreachable!("UDP socket recv never returns Err(Truncated)")
-                        }
+                        Err(smol::RecvError::Truncated) => Err(LinuxError::EMSGSIZE.into()),
                     }
                 }
             })
@@ -396,15 +443,17 @@ impl SocketOps for UdpSocket {
             .map(SocketAddrEx::Ip)
     }
 
-    fn shutdown(&self, _how: Shutdown) -> AxResult {
-        // TODO(mivik): shutdown
-        self.stack.poll_interfaces();
-
-        self.with_smol_socket(|socket| {
-            debug!("UDP socket {}: shutting down", self.handle);
-            socket.close();
-        });
-        *self.reported_local_addr.write() = None;
+    fn shutdown(&self, how: Shutdown) -> AxResult {
+        if self.peer_addr.read().is_none() {
+            return Err(AxError::NotConnected);
+        }
+        if how.has_read() {
+            self.rx_shutdown.store(true, Ordering::Release);
+        }
+        if how.has_write() {
+            self.tx_shutdown.store(true, Ordering::Release);
+        }
+        self.poll_state.wake();
         Ok(())
     }
 }
@@ -418,8 +467,13 @@ impl Pollable for UdpSocket {
 
         let mut events = IoEvents::empty();
         self.with_smol_socket(|socket| {
-            events.set(IoEvents::IN, socket.can_recv());
-            events.set(IoEvents::OUT, socket.can_send());
+            let rx_shutdown = self.rx_shutdown.load(Ordering::Acquire);
+            events.set(IoEvents::IN, rx_shutdown || socket.can_recv());
+            events.set(
+                IoEvents::OUT,
+                !self.tx_shutdown.load(Ordering::Acquire) && socket.can_send(),
+            );
+            events.set(IoEvents::RDHUP, rx_shutdown);
         });
         events
     }
@@ -428,12 +482,32 @@ impl Pollable for UdpSocket {
         if events.intersects(IoEvents::IN | IoEvents::OUT) {
             self.general.register_waker(&self.stack, context.waker());
         }
+        self.poll_state.register(context.waker());
     }
 }
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
-        self.shutdown(Shutdown::Both).ok();
+        self.with_smol_socket(|socket| socket.close());
         self.stack.socket_set.remove(self.handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consts::{SOCKET_BUFFER_MAX, SOCKET_BUFFER_MIN};
+
+    #[test]
+    fn replacement_changes_udp_storage_capacity() {
+        let mut socket = new_udp_socket().unwrap();
+
+        replace_udp_send_buffer(&mut socket, 64 * 1024).unwrap();
+        replace_udp_recv_buffer(&mut socket, 0).unwrap();
+        assert_eq!(socket.payload_send_capacity(), 64 * 1024);
+        assert_eq!(socket.payload_recv_capacity(), SOCKET_BUFFER_MIN);
+
+        replace_udp_recv_buffer(&mut socket, usize::MAX).unwrap();
+        assert_eq!(socket.payload_recv_capacity(), SOCKET_BUFFER_MAX);
     }
 }

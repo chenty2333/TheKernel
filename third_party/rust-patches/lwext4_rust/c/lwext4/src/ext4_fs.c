@@ -1465,15 +1465,8 @@ int ext4_fs_get_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
 						   false, support_unwritten);
 }
 
-int ext4_fs_init_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
-				ext4_lblk_t iblock, ext4_fsblk_t *fblock)
-{
-	return ext4_fs_get_inode_dblk_idx_internal(inode_ref, iblock, fblock,
-						   true, true);
-}
-
 static int ext4_fs_set_inode_data_block_index(struct ext4_inode_ref *inode_ref,
-				       ext4_lblk_t iblock, ext4_fsblk_t fblock)
+					       ext4_lblk_t iblock, ext4_fsblk_t fblock)
 {
 	struct ext4_fs *fs = inode_ref->fs;
 
@@ -1637,9 +1630,70 @@ static int ext4_fs_set_inode_data_block_index(struct ext4_inode_ref *inode_ref,
 	return EOK;
 }
 
+static int ext4_fs_zero_data_block(struct ext4_fs *fs, ext4_fsblk_t fblock)
+{
+	struct ext4_blockdev *bdev = fs->bdev;
+	uint32_t block_size = ext4_sb_get_block_size(&fs->sb);
+	uint32_t physical_block_size = bdev->bdif->ph_bsize;
+	if (!physical_block_size || block_size % physical_block_size)
+		return EINVAL;
+
+	memset(bdev->bdif->ph_bbuf, 0, physical_block_size);
+	uint64_t offset = fblock * block_size;
+	for (uint32_t written = 0; written < block_size;
+	     written += physical_block_size) {
+		int rc = ext4_block_writebytes(bdev, offset + written,
+					       bdev->bdif->ph_bbuf,
+					       physical_block_size);
+		if (rc != EOK)
+			return rc;
+	}
+	return EOK;
+}
+
+int ext4_fs_init_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
+				ext4_lblk_t iblock, ext4_fsblk_t *fblock)
+{
+	int rc = ext4_fs_get_inode_dblk_idx_internal(inode_ref, iblock, fblock,
+						    true, true);
+	if (rc != EOK || *fblock != 0)
+		return rc;
+
+	/*
+	 * Extents allocate or convert an unwritten block in the lookup above.
+	 * Legacy block maps only report a sparse hole, so allocate and attach a
+	 * zeroed data block before the caller writes into it.  Returning block 0
+	 * here would make partial writes appear successful while leaving a hole.
+	 */
+	ext4_fsblk_t goal;
+	ext4_fsblk_t phys_block;
+	rc = ext4_fs_indirect_find_goal(inode_ref, &goal);
+	if (rc != EOK)
+		return rc;
+
+	rc = ext4_balloc_alloc_block(inode_ref, goal, &phys_block);
+	if (rc != EOK)
+		return rc;
+
+	rc = ext4_fs_zero_data_block(inode_ref->fs, phys_block);
+	if (rc != EOK)
+		goto free_block;
+
+	rc = ext4_fs_set_inode_data_block_index(inode_ref, iblock, phys_block);
+	if (rc != EOK)
+		goto free_block;
+
+	*fblock = phys_block;
+	return EOK;
+
+free_block:
+	ext4_balloc_free_block(inode_ref, phys_block);
+	return rc;
+}
+
 
 int ext4_fs_append_inode_dblk(struct ext4_inode_ref *inode_ref,
-			      ext4_fsblk_t *fblock, ext4_lblk_t *iblock)
+				      ext4_fsblk_t *fblock, ext4_lblk_t *iblock)
 {
 #if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
 	/* Handle extents separately */

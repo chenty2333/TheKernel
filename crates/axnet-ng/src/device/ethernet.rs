@@ -15,7 +15,7 @@ use smoltcp::{
 
 use crate::{
     consts::{ETHERNET_MAX_PENDING_PACKETS, STANDARD_MTU},
-    device::Device,
+    device::{Device, DeviceStats, InterfaceKind},
 };
 
 const EMPTY_MAC: EthernetAddress = EthernetAddress([0; 6]);
@@ -30,6 +30,7 @@ pub struct EthernetDevice {
     inner: AxNetDevice,
     neighbors: HashMap<IpAddress, Option<Neighbor>>,
     ip: Ipv4Cidr,
+    stats: DeviceStats,
 
     pending_packets: PacketBuffer<'static, IpAddress>,
 }
@@ -50,6 +51,7 @@ impl EthernetDevice {
             inner,
             neighbors: HashMap::new(),
             ip,
+            stats: DeviceStats::default(),
 
             pending_packets,
         }
@@ -62,6 +64,7 @@ impl EthernetDevice {
 
     fn send_to<F>(
         inner: &mut AxNetDevice,
+        stats: &mut DeviceStats,
         dst: EthernetAddress,
         size: usize,
         f: F,
@@ -70,6 +73,7 @@ impl EthernetDevice {
         F: FnOnce(&mut [u8]),
     {
         if let Err(err) = inner.recycle_tx_buffers() {
+            stats.record_tx_error();
             warn!("recycle_tx_buffers failed: {:?}", err);
             return;
         }
@@ -83,6 +87,7 @@ impl EthernetDevice {
         let mut tx_buf = match inner.alloc_tx_buffer(repr.buffer_len() + size) {
             Ok(buf) => buf,
             Err(err) => {
+                stats.record_tx_drop();
                 warn!("alloc_tx_buffer failed: {:?}", err);
                 return;
             }
@@ -95,8 +100,14 @@ impl EthernetDevice {
             tx_buf.packet_len(),
             tx_buf.packet()
         );
-        if let Err(err) = inner.transmit(tx_buf) {
-            warn!("transmit failed: {:?}", err);
+        let frame_len = tx_buf.packet_len();
+        match inner.transmit(tx_buf) {
+            Ok(()) => stats.record_tx(frame_len),
+            Err(err) => {
+                stats.record_tx_error();
+                stats.record_tx_drop();
+                warn!("transmit failed: {:?}", err);
+            }
         }
     }
 
@@ -108,6 +119,8 @@ impl EthernetDevice {
     ) -> bool {
         let frame = EthernetFrame::new_unchecked(frame);
         let Ok(repr) = EthernetRepr::parse(&frame) else {
+            self.stats.record_rx_error();
+            self.stats.record_rx_drop();
             warn!("Dropping malformed Ethernet frame");
             return false;
         };
@@ -116,22 +129,28 @@ impl EthernetDevice {
             && repr.dst_addr != EMPTY_MAC
             && repr.dst_addr != self.hardware_address()
         {
+            self.stats.record_rx_drop();
             return false;
         }
 
         match repr.ethertype {
             EthernetProtocol::Ipv4 => {
-                buffer
-                    .enqueue(frame.payload().len(), ())
-                    .unwrap()
-                    .copy_from_slice(frame.payload());
-                return true;
+                let Ok(dst) = buffer.enqueue(frame.payload().len(), ()) else {
+                    self.stats.record_rx_drop();
+                    return false;
+                };
+                dst.copy_from_slice(frame.payload());
+                true
             }
-            EthernetProtocol::Arp => self.process_arp(frame.payload(), timestamp),
-            _ => {}
+            EthernetProtocol::Arp => {
+                self.process_arp(frame.payload(), timestamp);
+                false
+            }
+            _ => {
+                self.stats.record_rx_drop();
+                false
+            }
         }
-
-        false
     }
 
     fn request_arp(&mut self, target_ip: IpAddress) {
@@ -151,6 +170,7 @@ impl EthernetDevice {
 
         Self::send_to(
             &mut self.inner,
+            &mut self.stats,
             EthernetAddress::BROADCAST,
             arp_repr.buffer_len(),
             |buf| arp_repr.emit(&mut ArpPacket::new_unchecked(buf)),
@@ -217,6 +237,7 @@ impl EthernetDevice {
 
                 Self::send_to(
                     &mut self.inner,
+                    &mut self.stats,
                     source_hardware_addr,
                     response.buffer_len(),
                     |buf| response.emit(&mut ArpPacket::new_unchecked(buf)),
@@ -244,6 +265,7 @@ impl EthernetDevice {
 
                     Self::send_to(
                         &mut self.inner,
+                        &mut self.stats,
                         neighbor.hardware_address,
                         buf.len(),
                         |b| b.copy_from_slice(buf),
@@ -261,12 +283,33 @@ impl Device for EthernetDevice {
         &self.name
     }
 
+    fn stats(&self) -> DeviceStats {
+        self.stats
+    }
+
+    fn interface_kind(&self) -> InterfaceKind {
+        InterfaceKind::Ethernet
+    }
+
+    fn mtu(&self) -> usize {
+        STANDARD_MTU
+    }
+
+    fn hardware_address(&self) -> Option<[u8; 6]> {
+        Some(self.hardware_address().0)
+    }
+
+    fn addresses(&self) -> alloc::vec::Vec<smoltcp::wire::IpCidr> {
+        vec![self.ip.into()]
+    }
+
     fn recv(&mut self, buffer: &mut PacketBuffer<()>, timestamp: Instant) -> bool {
         loop {
             let rx_buf = match self.inner.receive() {
                 Ok(buf) => buf,
                 Err(err) => {
                     if !matches!(err, DevError::Again) {
+                        self.stats.record_rx_error();
                         warn!("receive failed: {:?}", err);
                     }
                     return false;
@@ -277,9 +320,14 @@ impl Device for EthernetDevice {
                 rx_buf.packet_len(),
                 rx_buf.packet()
             );
+            self.stats.record_rx(rx_buf.packet_len());
 
             let result = self.handle_frame(rx_buf.packet(), buffer, timestamp);
-            self.inner.recycle_rx_buffer(rx_buf).unwrap();
+            if let Err(err) = self.inner.recycle_rx_buffer(rx_buf) {
+                self.stats.record_rx_error();
+                warn!("recycle_rx_buffer failed: {:?}", err);
+                return false;
+            }
             if result {
                 return true;
             }
@@ -290,6 +338,7 @@ impl Device for EthernetDevice {
         if next_hop.is_broadcast() || self.ip.broadcast().map(IpAddress::Ipv4) == Some(next_hop) {
             Self::send_to(
                 &mut self.inner,
+                &mut self.stats,
                 EthernetAddress::BROADCAST,
                 packet.len(),
                 |buf| buf.copy_from_slice(packet),
@@ -303,6 +352,7 @@ impl Device for EthernetDevice {
                 if neighbor.expires_at > timestamp {
                     Self::send_to(
                         &mut self.inner,
+                        &mut self.stats,
                         neighbor.hardware_address,
                         packet.len(),
                         |buf| buf.copy_from_slice(packet),
@@ -322,10 +372,12 @@ impl Device for EthernetDevice {
             self.request_arp(next_hop);
         }
         if self.pending_packets.is_full() {
+            self.stats.record_tx_drop();
             warn!("Pending packets buffer is full, dropping packet");
             return false;
         }
         let Ok(dst_buffer) = self.pending_packets.enqueue(packet.len(), next_hop) else {
+            self.stats.record_tx_drop();
             warn!("Failed to enqueue packet in pending packets buffer");
             return false;
         };

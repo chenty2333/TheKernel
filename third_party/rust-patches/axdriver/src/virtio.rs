@@ -11,10 +11,12 @@ use axhal::mem::virt_to_phys;
 #[cfg(target_arch = "loongarch64")]
 use axhal::paging::MappingFlags;
 use cfg_if::cfg_if;
-#[cfg(target_arch = "loongarch64")]
 use spin::Mutex;
 
-use crate::{AxDeviceEnum, drivers::DriverProbe};
+use crate::{
+    AxDeviceEnum,
+    drivers::{BusProbeResult, DriverProbe},
+};
 
 cfg_if! {
     if #[cfg(bus = "pci")] {
@@ -22,6 +24,82 @@ cfg_if! {
         type VirtIoTransport = axdriver_virtio::PciTransport;
     } else if #[cfg(bus =  "mmio")] {
         type VirtIoTransport = axdriver_virtio::MmioTransport;
+    }
+}
+
+#[cfg(feature = "virtio-rng")]
+type VirtIoEntropyDevice = axdriver_virtio::VirtIOEntropy<VirtIoHalImpl, VirtIoTransport>;
+
+#[cfg(feature = "virtio-rng")]
+static ENTROPY_DEVICE: Mutex<Option<VirtIoEntropyDevice>> = Mutex::new(None);
+
+/// Returns whether a hardware-backed entropy source was initialized.
+#[cfg(feature = "virtio-rng")]
+pub fn entropy_source_ready() -> bool {
+    ENTROPY_DEVICE.lock().is_some()
+}
+
+/// Fills `buf` from the initialized hardware entropy source.
+#[cfg(feature = "virtio-rng")]
+pub fn fill_entropy(buf: &mut [u8]) -> DevResult {
+    let mut slot = ENTROPY_DEVICE.lock();
+    let device = slot.as_mut().ok_or(axdriver_base::DevError::Unsupported)?;
+    device
+        .fill_bytes(buf)
+        .map_err(|_| axdriver_base::DevError::Io)
+}
+
+/// Side-effect-only probe for a VirtIO entropy source.
+#[cfg(feature = "virtio-rng")]
+pub struct VirtIoEntropyDriver;
+
+#[cfg(feature = "virtio-rng")]
+impl VirtIoEntropyDriver {
+    fn install(transport: VirtIoTransport) {
+        let mut slot = ENTROPY_DEVICE.lock();
+        if slot.is_some() {
+            return;
+        }
+        match VirtIoEntropyDevice::new(transport) {
+            Ok(device) => {
+                *slot = Some(device);
+                info!("registered VirtIO entropy source");
+            }
+            Err(error) => warn!("failed to initialize VirtIO entropy source: {error:?}"),
+        }
+    }
+}
+
+#[cfg(feature = "virtio-rng")]
+impl DriverProbe for VirtIoEntropyDriver {
+    #[cfg(bus = "mmio")]
+    fn probe_mmio(mmio_base: usize, mmio_size: usize) -> BusProbeResult {
+        let base_vaddr = phys_to_virt(mmio_base.into());
+        if let Some(transport) =
+            axdriver_virtio::probe_mmio_entropy_device(base_vaddr.as_mut_ptr(), mmio_size)
+        {
+            Self::install(transport);
+            BusProbeResult::Claimed
+        } else {
+            BusProbeResult::NotMatched
+        }
+    }
+
+    #[cfg(bus = "pci")]
+    fn probe_pci(
+        root: &mut PciRoot,
+        bdf: DeviceFunction,
+        dev_info: &DeviceFunctionInfo,
+    ) -> BusProbeResult {
+        if dev_info.vendor_id == 0x1af4
+            && let Some(transport) =
+                axdriver_virtio::probe_pci_entropy_device::<VirtIoHalImpl>(root, bdf, dev_info)
+        {
+            Self::install(transport);
+            BusProbeResult::Claimed
+        } else {
+            BusProbeResult::NotMatched
+        }
     }
 }
 
@@ -111,8 +189,8 @@ cfg_if! {
             const DEVICE_TYPE: DeviceType = DeviceType::Input;
             type Device = axdriver_virtio::VirtIoInputDev<VirtIoHalImpl, VirtIoTransport>;
 
-            fn try_new(transport: VirtIoTransport, _irq: Option<usize>) -> DevResult<AxDeviceEnum> {
-                Ok(AxDeviceEnum::from_input(Self::Device::try_new(transport)?))
+            fn try_new(transport: VirtIoTransport, irq: Option<usize>) -> DevResult<AxDeviceEnum> {
+                Ok(AxDeviceEnum::from_input(Self::Device::try_new(transport, irq)?))
             }
         }
     }
@@ -138,14 +216,14 @@ pub struct VirtIoDriver<D: VirtIoDevMeta + ?Sized>(PhantomData<D>);
 
 impl<D: VirtIoDevMeta> DriverProbe for VirtIoDriver<D> {
     #[cfg(bus = "mmio")]
-    fn probe_mmio(mmio_base: usize, mmio_size: usize) -> Option<AxDeviceEnum> {
+    fn probe_mmio(mmio_base: usize, mmio_size: usize) -> BusProbeResult {
         let base_vaddr = phys_to_virt(mmio_base.into());
         if let Some((ty, transport)) =
             axdriver_virtio::probe_mmio_device(base_vaddr.as_mut_ptr(), mmio_size)
             && ty == D::DEVICE_TYPE
         {
             match D::try_new(transport, virtio_mmio_irq(mmio_base)) {
-                Ok(dev) => return Some(dev),
+                Ok(dev) => return BusProbeResult::Device(dev),
                 Err(e) => {
                     warn!(
                         "failed to initialize MMIO device at [PA:{:#x}, PA:{:#x}): {:?}",
@@ -153,11 +231,11 @@ impl<D: VirtIoDevMeta> DriverProbe for VirtIoDriver<D> {
                         mmio_base + mmio_size,
                         e
                     );
-                    return None;
+                    return BusProbeResult::Claimed;
                 }
             }
         }
-        None
+        BusProbeResult::NotMatched
     }
 
     #[cfg(bus = "pci")]
@@ -165,17 +243,9 @@ impl<D: VirtIoDevMeta> DriverProbe for VirtIoDriver<D> {
         root: &mut PciRoot,
         bdf: DeviceFunction,
         dev_info: &DeviceFunctionInfo,
-    ) -> Option<AxDeviceEnum> {
-        #[cfg(target_arch = "loongarch64")]
-        if D::DEVICE_TYPE == DeviceType::Net {
-            // Keep LA/QEMU on the in-kernel loopback path. The external
-            // virtio-net device is not required by the official pre-2025
-            // scripts, which exercise netperf/iperf against 127.0.0.1.
-            return None;
-        }
-
+    ) -> BusProbeResult {
         if dev_info.vendor_id != 0x1af4 {
-            return None;
+            return BusProbeResult::NotMatched;
         }
         match (D::DEVICE_TYPE, dev_info.device_id) {
             (DeviceType::Net, 0x1000) | (DeviceType::Net, 0x1041) => {}
@@ -183,7 +253,7 @@ impl<D: VirtIoDevMeta> DriverProbe for VirtIoDriver<D> {
             (DeviceType::Input, 0x1052) => {}
             (DeviceType::Display, 0x1050) => {}
             (DeviceType::Vsock, 0x1053) => {}
-            _ => return None,
+            _ => return BusProbeResult::NotMatched,
         }
 
         if let Some((ty, transport, irq)) =
@@ -191,14 +261,14 @@ impl<D: VirtIoDevMeta> DriverProbe for VirtIoDriver<D> {
             && ty == D::DEVICE_TYPE
         {
             match D::try_new(transport, Some(irq)) {
-                Ok(dev) => return Some(dev),
+                Ok(dev) => return BusProbeResult::Device(dev),
                 Err(e) => {
                     warn!("failed to initialize PCI device at {bdf}({dev_info}): {e:?}");
-                    return None;
+                    return BusProbeResult::Claimed;
                 }
             }
         }
-        None
+        BusProbeResult::NotMatched
     }
 }
 

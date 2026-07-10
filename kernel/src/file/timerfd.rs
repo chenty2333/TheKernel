@@ -16,7 +16,7 @@ use axtask::{
 use spin::Mutex;
 
 use crate::{
-    file::{FileLike, IoDst, IoSrc},
+    file::{FileLike, IoDst, IoSrc, Kstat, anon_inode_stat},
     task::{AlarmClock, AsThread, register_pollset_alarm},
     time::wall_time,
 };
@@ -187,6 +187,10 @@ impl TimerFd {
 }
 
 impl FileLike for TimerFd {
+    fn stat(&self) -> axio::Result<Kstat> {
+        Ok(anon_inode_stat())
+    }
+
     fn read(&self, dst: &mut IoDst) -> axio::Result<usize> {
         if dst.remaining_mut() < size_of::<u64>() {
             return Err(AxError::InvalidInput);

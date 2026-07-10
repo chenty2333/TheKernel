@@ -1,19 +1,25 @@
 //! Driver for VirtIO socket devices.
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use super::error::SocketError;
-use super::protocol::{
-    Feature, StreamShutdown, VirtioVsockConfig, VirtioVsockHdr, VirtioVsockOp, VsockAddr,
-};
-use super::DEFAULT_RX_BUFFER_SIZE;
-use crate::hal::Hal;
-use crate::queue::{owning::OwningQueue, VirtQueue};
-use crate::transport::Transport;
-use crate::volatile::volread;
-use crate::Result;
 use core::mem::size_of;
+
 use log::debug;
 use zerocopy::{AsBytes, FromBytes};
+
+use super::{
+    DEFAULT_RX_BUFFER_SIZE,
+    error::SocketError,
+    protocol::{
+        Feature, StreamShutdown, VirtioVsockConfig, VirtioVsockHdr, VirtioVsockOp, VsockAddr,
+    },
+};
+use crate::{
+    Result,
+    hal::Hal,
+    queue::{VirtQueue, owning::OwningQueue},
+    transport::Transport,
+    volatile::volread,
+};
 
 pub(crate) const RX_QUEUE_IDX: u16 = 0;
 pub(crate) const TX_QUEUE_IDX: u16 = 1;
@@ -458,18 +464,19 @@ fn read_header_and_body(buffer: &[u8]) -> Result<(VirtioVsockHdr, &[u8])> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::{sync::Arc, vec};
+    use core::ptr::NonNull;
+    use std::sync::Mutex;
+
     use super::*;
     use crate::{
         hal::fake::FakeHal,
         transport::{
-            fake::{FakeTransport, QueueStatus, State},
             DeviceType,
+            fake::{FakeTransport, QueueStatus, State},
         },
         volatile::ReadOnly,
     };
-    use alloc::{sync::Arc, vec};
-    use core::ptr::NonNull;
-    use std::sync::Mutex;
 
     #[test]
     fn config() {

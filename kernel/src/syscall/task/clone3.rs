@@ -1,6 +1,6 @@
 use core::mem::{self, MaybeUninit};
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axhal::uspace::UserContext;
 use bytemuck::AnyBitPattern;
 use starry_vm::vm_read_slice;
@@ -28,12 +28,20 @@ const MIN_CLONE_ARGS_SIZE: usize = core::mem::size_of::<u64>() * 8;
 const CLONE3_ARGS_SIZE: usize = core::mem::size_of::<Clone3Args>();
 const CLONE3_ARGS_SIZE_VER2: usize = core::mem::size_of::<Clone3Args>();
 
+fn validate_extra_bytes(bytes: &[u8]) -> AxResult<()> {
+    if bytes.iter().any(|byte| *byte != 0) {
+        Err(LinuxError::E2BIG.into())
+    } else {
+        Ok(())
+    }
+}
+
 impl TryFrom<Clone3Args> for CloneArgs {
     type Error = axerrno::AxError;
 
     fn try_from(args: Clone3Args) -> AxResult<Self> {
-        if args.set_tid != 0 || args.set_tid_size != 0 {
-            warn!("sys_clone3: set_tid/set_tid_size not supported, ignoring");
+        if args.set_tid_size != 0 {
+            return Err(LinuxError::EOPNOTSUPP.into());
         }
         let flags = CloneFlags::from_bits(args.flags).ok_or(AxError::InvalidInput)?;
 
@@ -95,6 +103,7 @@ pub fn sys_clone3(uctx: &UserContext, args: *const u8, size: usize) -> AxResult<
         vm_read_slice(extra_ptr, unsafe {
             mem::transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(&mut chunk[..chunk_len])
         })?;
+        validate_extra_bytes(&chunk[..chunk_len])?;
         extra_ptr = extra_ptr.wrapping_add(chunk_len);
         remaining -= chunk_len;
     }
@@ -117,7 +126,7 @@ mod tests {
         CLONE_DETACHED, CLONE_FS, CLONE_NEWNS, CLONE_NEWPID, CLONE_PIDFD,
     };
 
-    use super::{Clone3Args, CloneApi, CloneArgs, CloneFlags};
+    use super::{Clone3Args, CloneApi, CloneArgs, CloneFlags, validate_extra_bytes};
 
     #[test]
     fn clone3_requires_matching_stack_and_stack_size() {
@@ -137,14 +146,46 @@ mod tests {
     }
 
     #[test]
-    fn clone_validate_rejects_fs_newns_pair() {
+    fn clone3_rejects_unsupported_set_tid_request() {
+        let args = Clone3Args {
+            set_tid: 0x1000,
+            set_tid_size: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            CloneArgs::try_from(args),
+            Err(AxError::OperationNotSupported)
+        );
+    }
+
+    #[test]
+    fn clone3_allows_unused_set_tid_pointer() {
+        let args = Clone3Args {
+            set_tid: 0x1000,
+            set_tid_size: 0,
+            ..Default::default()
+        };
+        assert!(CloneArgs::try_from(args).is_ok());
+    }
+
+    #[test]
+    fn clone3_only_accepts_zeroed_unknown_fields() {
+        assert_eq!(validate_extra_bytes(&[0; 32]), Ok(()));
+        assert_eq!(
+            validate_extra_bytes(&[0, 0, 1, 0]),
+            Err(AxError::ArgumentListTooLong)
+        );
+    }
+
+    #[test]
+    fn clone_validate_rejects_unimplemented_mount_namespace() {
         let args = CloneArgs {
             flags: CloneFlags::from_bits_retain((CLONE_FS | CLONE_NEWNS) as u64),
             ..Default::default()
         };
         assert_eq!(
             args.validate_for(CloneApi::Clone),
-            Err(AxError::InvalidInput)
+            Err(AxError::OperationNotSupported)
         );
     }
 

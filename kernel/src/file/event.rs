@@ -8,7 +8,7 @@ use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::future::{block_on, poll_io};
 
-use crate::file::{FileLike, IoDst, IoSrc};
+use crate::file::{FileLike, IoDst, IoSrc, Kstat, anon_inode_stat};
 
 pub struct EventFd {
     count: AtomicU64,
@@ -46,6 +46,10 @@ impl EventFd {
 }
 
 impl FileLike for EventFd {
+    fn stat(&self) -> AxResult<Kstat> {
+        Ok(anon_inode_stat())
+    }
+
     fn read(&self, dst: &mut IoDst) -> axio::Result<usize> {
         if dst.remaining_mut() < size_of::<u64>() {
             return Err(AxError::InvalidInput);

@@ -5,6 +5,11 @@ use starry_process::Pid;
 use crate::task::{AsThread, get_process_data, get_process_group, remember_process_group};
 
 pub fn sys_getsid(pid: Pid) -> AxResult<isize> {
+    let pid = if pid == 0 {
+        current().as_thread().proc_data.proc.pid()
+    } else {
+        pid
+    };
     Ok(get_process_data(pid)?.proc.group().session().sid() as _)
 }
 
@@ -24,6 +29,11 @@ pub fn sys_setsid() -> AxResult<isize> {
 }
 
 pub fn sys_getpgid(pid: Pid) -> AxResult<isize> {
+    let pid = if pid == 0 {
+        current().as_thread().proc_data.proc.pid()
+    } else {
+        pid
+    };
     Ok(get_process_data(pid)?.proc.group().pgid() as _)
 }
 

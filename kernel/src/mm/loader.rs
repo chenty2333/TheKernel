@@ -26,6 +26,8 @@ use crate::{
     task::AsThread,
 };
 
+const MAX_INTERPRETER_PATH: u64 = 4096;
+
 /// Creates a new empty user address space.
 pub fn new_user_aspace_empty() -> AxResult<AddrSpace> {
     AddrSpace::new_empty(VirtAddr::from_usize(USER_SPACE_BASE), USER_SPACE_SIZE)
@@ -89,8 +91,10 @@ fn map_elf<'a>(
     base: usize,
     entry: &'a ElfCacheEntry,
 ) -> AxResult<ELFParser<'a>> {
-    let elf_parser = ELFParser::new(entry.borrow_elf(), base).map_err(|_| AxError::InvalidData)?;
+    let elf_parser =
+        ELFParser::new(entry.borrow_elf(), base).map_err(|_| AxError::InvalidExecutable)?;
     let cache = entry.borrow_cache();
+    let file_len = cache.location().metadata()?.size;
 
     for ph in elf_parser
         .headers()
@@ -98,18 +102,42 @@ fn map_elf<'a>(
         .iter()
         .filter(|ph| ph.get_type() == Ok(xmas_elf::program::Type::Load))
     {
-        let vaddr = ph.virtual_addr as usize + elf_parser.base();
+        if ph.file_size > ph.mem_size {
+            return Err(AxError::InvalidExecutable);
+        }
+        let file_end = ph
+            .offset
+            .checked_add(ph.file_size)
+            .filter(|end| *end <= file_len)
+            .ok_or(AxError::InvalidExecutable)?;
+        let vaddr = usize::try_from(ph.virtual_addr)
+            .ok()
+            .and_then(|address| address.checked_add(elf_parser.base()))
+            .ok_or(AxError::InvalidExecutable)?;
+        let mem_size = usize::try_from(ph.mem_size).map_err(|_| AxError::InvalidExecutable)?;
+        if mem_size == 0 {
+            continue;
+        }
+        let segment_end = vaddr
+            .checked_add(mem_size)
+            .ok_or(AxError::InvalidExecutable)?;
         debug!(
             "Mapping ELF segment: [{:#x?}, {:#x?}) flags: {}",
-            vaddr,
-            vaddr + ph.mem_size as usize,
-            ph.flags
+            vaddr, segment_end, ph.flags
         );
         let seg_pad = vaddr.align_offset_4k();
-        assert_eq!(seg_pad, ph.offset as usize % PAGE_SIZE_4K);
+        if seg_pad as u64 != ph.offset % PAGE_SIZE_4K as u64 {
+            return Err(AxError::InvalidExecutable);
+        }
 
-        let seg_align_size =
-            (ph.mem_size as usize + seg_pad + PAGE_SIZE_4K - 1) & !(PAGE_SIZE_4K - 1);
+        let seg_align_size = mem_size
+            .checked_add(seg_pad)
+            .and_then(|size| size.checked_add(PAGE_SIZE_4K - 1))
+            .map(|size| size & !(PAGE_SIZE_4K - 1))
+            .ok_or(AxError::InvalidExecutable)?;
+        if seg_align_size == 0 {
+            continue;
+        }
         let seg_start = VirtAddr::from_usize(vaddr);
 
         // Note that `offset` might not be aligned to 4K here, and it's
@@ -119,7 +147,7 @@ fn map_elf<'a>(
             PageSize::Size4K,
             cache.location().clone(),
             ph.offset,
-            Some(ph.offset + ph.file_size),
+            Some(file_end),
             false,
         );
         uspace.map(
@@ -152,6 +180,7 @@ struct ElfCacheEntry {
 
 impl ElfCacheEntry {
     fn load(loc: Location) -> AxResult<Result<Self, Vec<u8>>> {
+        let file_len = loc.metadata()?.size;
         let cache = CachedFile::get_or_create(loc);
 
         let mut data = vec![0; 4096];
@@ -159,12 +188,22 @@ impl ElfCacheEntry {
         data.truncate(read);
         match ElfCacheEntry::try_new_or_recover::<AxError>(cache.clone(), data, |data| {
             let builder = ELFHeadersBuilder::new(data).map_err(map_elf_error)?;
-            let range = builder.ph_range();
-            if range.end as usize <= data.len() {
-                builder.build(&data[range.start as usize..range.end as usize])
+            let range = builder.ph_range().ok_or(AxError::InvalidExecutable)?;
+            if range.end > file_len {
+                return Err(AxError::InvalidExecutable);
+            }
+            let start = usize::try_from(range.start).map_err(|_| AxError::InvalidExecutable)?;
+            let end = usize::try_from(range.end).map_err(|_| AxError::InvalidExecutable)?;
+            if end <= data.len() {
+                builder.build(&data[start..end])
             } else {
-                let mut buf = vec![0; (range.end - range.start) as usize];
-                cache.read_at(&mut buf[..], range.start)?;
+                let len = end.checked_sub(start).ok_or(AxError::InvalidExecutable)?;
+                let mut buf = Vec::new();
+                buf.try_reserve_exact(len).map_err(|_| AxError::NoMemory)?;
+                buf.resize(len, 0);
+                if cache.read_at(&mut buf[..], range.start)? != len {
+                    return Err(AxError::InvalidExecutable);
+                }
                 builder.build(&buf)
             }
             .map_err(map_elf_error)
@@ -206,7 +245,8 @@ impl ElfLoader {
         uspace.clear();
         map_trampoline(uspace)?;
 
-        let entry = self.0.front().unwrap();
+        let entry = self.0.front().ok_or(AxError::BadState)?;
+        let executable_loc = entry.borrow_cache().location().clone();
         let ldso = if let Some(header) = entry
             .borrow_elf()
             .ph
@@ -214,9 +254,22 @@ impl ElfLoader {
             .find(|ph| ph.get_type() == Ok(xmas_elf::program::Type::Interp))
         {
             let cache = entry.borrow_cache();
-            let mut data = vec![0; header.file_size as usize];
+            if header.file_size == 0 || header.file_size > MAX_INTERPRETER_PATH {
+                return Err(AxError::InvalidExecutable);
+            }
+            let interp_file_len = cache.location().metadata()?.size;
+            header
+                .offset
+                .checked_add(header.file_size)
+                .filter(|end| *end <= interp_file_len)
+                .ok_or(AxError::InvalidExecutable)?;
+            let interp_len =
+                usize::try_from(header.file_size).map_err(|_| AxError::InvalidExecutable)?;
+            let mut data = vec![0; interp_len];
             let read = cache.read_at(&mut data[..], header.offset)?;
-            assert_eq!(data.len(), read);
+            if read != data.len() {
+                return Err(AxError::InvalidExecutable);
+            }
 
             let ldso = CStr::from_bytes_with_nul(&data)
                 .ok()
@@ -230,14 +283,17 @@ impl ElfLoader {
 
         let (elf, ldso) = if let Some(ldso) = ldso {
             let loc = FS_CONTEXT.lock().resolve(ldso)?;
+            if loc.ptr_eq(&executable_loc) {
+                return Err(AxError::InvalidExecutable);
+            }
             if !self.0.touch(|e| e.borrow_cache().location().ptr_eq(&loc)) {
                 let e = ElfCacheEntry::load(loc)?.map_err(|_| AxError::InvalidInput)?;
                 self.0.insert(e);
             }
 
             let mut iter = self.0.iter();
-            let ldso = iter.next().unwrap();
-            let elf = iter.next().unwrap();
+            let ldso = iter.next().ok_or(AxError::BadState)?;
+            let elf = iter.next().ok_or(AxError::InvalidExecutable)?;
             (elf, Some(ldso))
         } else {
             (entry, None)

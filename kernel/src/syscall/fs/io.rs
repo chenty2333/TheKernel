@@ -1,8 +1,5 @@
 use alloc::{vec, vec::Vec};
-use core::{
-    ffi::{c_char, c_int},
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FileFlags, OpenOptions};
@@ -52,19 +49,6 @@ const FALLOC_IO_CHUNK: usize = 0x1000;
 const MAX_FILE_OFFSET: u64 = i64::MAX as u64;
 const SPLICE_F_MOVE: u32 = 0x01;
 const SPLICE_F_NONBLOCK: u32 = 0x02;
-const FILE_IO_COOPERATE_INTERVAL: usize = 4096;
-
-static FILE_IO_COOPERATE_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-fn cooperate_after_regular_file_io(done: isize) {
-    if done <= 0 {
-        return;
-    }
-    let count = FILE_IO_COOPERATE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-    if count % FILE_IO_COOPERATE_INTERVAL == 0 {
-        axtask::yield_now();
-    }
-}
 const SPLICE_F_MORE: u32 = 0x04;
 const SPLICE_F_GIFT: u32 = 0x08;
 const SPLICE_F_ALL: u32 = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT;
@@ -88,7 +72,7 @@ fn validate_splice_flags(flags: u32) -> AxResult<()> {
 
 fn touch_modified_metadata(loc: &Location) -> AxResult<()> {
     let now = wall_time();
-    loc.update_metadata(MetadataUpdate {
+    loc.update_supported_metadata(MetadataUpdate {
         mtime: Some(now),
         ctime: Some(now),
         ..Default::default()
@@ -565,7 +549,6 @@ fn try_regular_file_write_user_slice(
 
     let offset = current_file_offset(file.inner())?;
     executable::check_not_active(file.inner().location())?;
-    inode_flags::check_write(file.inner().location(), false)?;
     let allowed = allowed_write_len(offset, len)?;
     if allowed == 0 {
         return Ok(Some(0));
@@ -616,7 +599,6 @@ fn try_regular_file_write_user_segments(
 
     let offset = current_file_offset(file.inner())?;
     executable::check_not_active(file.inner().location())?;
-    inode_flags::check_write(file.inner().location(), false)?;
     let allowed = allowed_write_len(offset, len)?;
     if allowed == 0 {
         return Ok(Some(0));
@@ -671,7 +653,6 @@ fn try_regular_file_pwrite_user_slice(
     }
 
     executable::check_not_active(file.inner().location())?;
-    inode_flags::check_write(file.inner().location(), false)?;
     let allowed = allowed_write_len(offset, len)?;
     if allowed == 0 {
         return Ok(Some(0));
@@ -723,7 +704,6 @@ fn try_regular_file_pwrite_user_segments(
     }
 
     executable::check_not_active(file.inner().location())?;
-    inode_flags::check_write(file.inner().location(), false)?;
     let allowed = allowed_write_len(offset, len)?;
     if allowed == 0 {
         return Ok(Some(0));
@@ -932,7 +912,6 @@ fn try_regular_file_writev_user_segments(
 
     let offset = current_file_offset(file.inner())?;
     executable::check_not_active(file.inner().location())?;
-    inode_flags::check_write(file.inner().location(), false)?;
     let allowed = allowed_write_len(offset, iov.len())?;
     if allowed == 0 {
         return Ok(Some(0));
@@ -987,7 +966,6 @@ fn try_regular_file_pwritev_user_segments(
     }
 
     executable::check_not_active(file.inner().location())?;
-    inode_flags::check_write(file.inner().location(), false)?;
     let allowed = allowed_write_len(offset, iov.len())?;
     if allowed == 0 {
         return Ok(Some(0));
@@ -1029,7 +1007,7 @@ fn try_regular_file_pwritev_user_segments(
     Ok(Some(written))
 }
 
-pub fn sys_dummy_fd(sysno: Sysno) -> AxResult<isize> {
+pub fn sys_unsupported_fd(sysno: Sysno) -> AxResult<isize> {
     warn!("Unimplemented fd syscall: {sysno}");
     Err(AxError::Unsupported)
 }
@@ -1049,7 +1027,6 @@ pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     } else {
         None
     };
-    let is_regular_file = regular_file.is_some();
     if let Some(file) = regular_file {
         let fast_read = match try_regular_file_read_user_slice(file, buf, len)? {
             Some(read) => Some(read),
@@ -1059,7 +1036,6 @@ pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
             let read = read as isize;
             if read > 0 {
                 notify_read(fd);
-                cooperate_after_regular_file_io(read);
             }
             return Ok(read);
         }
@@ -1071,9 +1047,6 @@ pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     let read = f.read(&mut VmBytesMut::new(buf, len))? as isize;
     if read > 0 {
         notify_read(fd);
-        if is_regular_file {
-            cooperate_after_regular_file_io(read);
-        }
     }
     Ok(read)
 }
@@ -1091,13 +1064,11 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     } else {
         None
     };
-    let is_regular_file = regular_file.is_some();
     if let Some(file) = regular_file {
         if let Some(read) = try_regular_file_readv_user_segments(file, &iov)? {
             let read = read as isize;
             if read > 0 {
                 notify_read(fd);
-                cooperate_after_regular_file_io(read);
             }
             return Ok(read);
         }
@@ -1105,9 +1076,6 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     let read = f.read(&mut iov.into_io())? as isize;
     if read > 0 {
         notify_read(fd);
-        if is_regular_file {
-            cooperate_after_regular_file_io(read);
-        }
     }
     Ok(read)
 }
@@ -1133,7 +1101,6 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     } else {
         None
     };
-    let is_regular_file = regular_file.is_some();
     if let Some(file) = regular_file {
         if let Some(written) = f.with_write_credentials(|| {
             if let Some(written) = try_regular_file_write_user_slice(file, buf as *const u8, len)? {
@@ -1145,7 +1112,6 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
             if written > 0 {
                 sync_file_like_after_status_write(&f)?;
                 notify_write(fd);
-                cooperate_after_regular_file_io(written);
             }
             return Ok(written);
         }
@@ -1165,9 +1131,6 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     if written > 0 {
         sync_file_like_after_status_write(&f)?;
         notify_write(fd);
-        if is_regular_file {
-            cooperate_after_regular_file_io(written);
-        }
     }
     Ok(written)
 }
@@ -1195,7 +1158,6 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> 
         })?;
         if written > 0 {
             sync_file_after_status_write(&file)?;
-            cooperate_after_regular_file_io(written as isize);
         }
         written
     } else {
@@ -1274,7 +1236,6 @@ fn regular_copy_file(fd: c_int, write: bool) -> AxResult<FileHandle<File>> {
         file.inner().access(FileFlags::WRITE)?;
         check_writable_mount(file.inner().location())?;
         executable::check_not_active(file.inner().location())?;
-        inode_flags::check_write(file.inner().location(), false)?;
     } else {
         file.inner().access(FileFlags::READ)?;
     }
@@ -1471,7 +1432,6 @@ fn do_pwritev(
             };
             validate_direct_iov(file.as_ref(), &io, write_offset)?;
             let allowed = allowed_write_len(write_offset, io.len())?;
-            inode_flags::check_write(file.inner().location(), appending)?;
             memfd::check_write(file.inner().location(), write_offset, allowed)?;
             if !appending {
                 if let Some(written) = try_regular_file_writev_user_segments(file.as_ref(), &io)? {
@@ -1486,7 +1446,6 @@ fn do_pwritev(
                 let append_offset = file.inner().location().len()?;
                 validate_direct_iov(file.as_ref(), &io, append_offset)?;
                 let allowed = allowed_write_len(append_offset, io.len())?;
-                inode_flags::check_write(file.inner().location(), true)?;
                 memfd::check_write(file.inner().location(), append_offset, allowed)?;
                 let mut io = io.into_io();
                 io.limit_remaining(allowed);
@@ -1497,7 +1456,6 @@ fn do_pwritev(
             } else {
                 validate_direct_iov(file.as_ref(), &io, offset as u64)?;
                 let allowed = allowed_write_len(offset as u64, io.len())?;
-                inode_flags::check_write(file.inner().location(), false)?;
                 memfd::check_write(file.inner().location(), offset as u64, allowed)?;
                 if let Some(written) =
                     try_regular_file_pwritev_user_segments(file.as_ref(), &io, offset as u64)?
@@ -1601,7 +1559,6 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
     check_writable_mount(&loc)?;
     check_resize_limit(length as u64)?;
     executable::check_not_active(&loc)?;
-    inode_flags::check_resize(&loc)?;
     lease::wait_for_truncate(&loc)?;
     memfd::check_resize(&loc, length as u64)?;
     check_mandatory_truncate_lock(
@@ -1643,7 +1600,6 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
         })?;
     check_writable_mount(f.inner().location())?;
     executable::check_not_active(f.inner().location())?;
-    inode_flags::check_resize(f.inner().location())?;
     lease::wait_for_truncate(f.inner().location())?;
     memfd::check_resize(f.inner().location(), length as u64)?;
     check_mandatory_truncate_lock(
@@ -1686,7 +1642,6 @@ pub fn sys_fallocate(
     let backend = file.backend()?;
     let loc = backend.location().clone();
     executable::check_not_active(&loc)?;
-    inode_flags::check_resize(&loc)?;
     let offset = offset as u64;
     let len = len as u64;
     let end = offset
@@ -1935,7 +1890,6 @@ pub fn sys_pwrite64(
             let append_offset = f.inner().location().len()?;
             validate_direct_io(f.as_ref(), buf as usize, len, append_offset)?;
             let allowed = allowed_write_len(append_offset, len)?;
-            inode_flags::check_write(f.inner().location(), true)?;
             memfd::check_write(f.inner().location(), append_offset, allowed)?;
             if allowed >= USER_COPY_PREFAULT_MIN {
                 prefault_regular_file_write_fallback(f.as_ref(), buf, allowed)?;
@@ -1947,7 +1901,6 @@ pub fn sys_pwrite64(
         } else {
             validate_direct_io(f.as_ref(), buf as usize, len, offset as u64)?;
             let allowed = allowed_write_len(offset as u64, len)?;
-            inode_flags::check_write(f.inner().location(), false)?;
             memfd::check_write(f.inner().location(), offset as u64, allowed)?;
             let fast_written =
                 match try_regular_file_pwrite_user_slice(f.as_ref(), buf, len, offset as u64)? {
@@ -2065,7 +2018,6 @@ impl SendFile {
                 let off = offset.vm_read()?;
                 check_writable_mount(file.inner().location())?;
                 executable::check_not_active(file.inner().location())?;
-                inode_flags::check_write(file.inner().location(), false)?;
                 let allowed = allowed_write_len(off, buf.len())?;
                 if allowed == 0 {
                     return Ok(0);

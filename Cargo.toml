@@ -60,7 +60,6 @@ qemu = [
 
     "starry-kernel/bpf",
     "starry-kernel/input",
-    "starry-kernel/vsock",
 
     # auxilary features
     "axfeat/fs-ng-times",
@@ -116,4 +115,5 @@ page_table_multiarch = { path = "third_party/rust-patches/page_table_multiarch" 
 kernel-elf-parser = { path = "third_party/rust-patches/kernel-elf-parser" }
 lwext4_rust = { path = "third_party/rust-patches/lwext4_rust" }
 starry-smoltcp = { path = "third_party/rust-patches/starry-smoltcp" }
+starry-fatfs = { path = "third_party/rust-patches/starry-fatfs" }
 virtio-drivers = { path = "third_party/rust-patches/virtio-drivers" }

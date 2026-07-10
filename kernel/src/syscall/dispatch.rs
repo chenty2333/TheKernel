@@ -1117,8 +1117,8 @@ pub(super) fn dispatch_syscall(sysno: Sysno, uctx: &mut UserContext) -> AxResult
         #[cfg(feature = "bpf")]
         Sysno::bpf => bpf::sys_bpf(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
 
-        // dummy fds
-        Sysno::perf_event_open | Sysno::memfd_secret => sys_dummy_fd(sysno),
+        // Unsupported fd-producing syscalls.
+        Sysno::perf_event_open | Sysno::memfd_secret => sys_unsupported_fd(sysno),
 
         Sysno::timer_create => {
             sys_timer_create(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)

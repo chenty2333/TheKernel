@@ -280,7 +280,7 @@ mod cfs_rt {
         assert_eq!(
             *next.inner(),
             2,
-            "runnable RT work must stay ahead of fair tasks in benchmark/default mode",
+            "runnable RT work must stay ahead of fair tasks in normal mixed-class operation",
         );
     }
 

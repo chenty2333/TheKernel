@@ -1,12 +1,4 @@
-use alloc::{
-    borrow::Cow,
-    collections::VecDeque,
-    format,
-    string::{String, ToString},
-    sync::Arc,
-    vec,
-    vec::Vec,
-};
+use alloc::{borrow::Cow, collections::VecDeque, format, string::String, sync::Arc, vec, vec::Vec};
 use core::{
     mem::size_of,
     sync::atomic::{AtomicBool, Ordering},
@@ -15,17 +7,16 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::prelude::*;
-use axnet::RecvFlags;
+use axnet::{InterfaceInfo, InterfaceKind, IpAddress, NetStack, RecvFlags, RouteInfo};
 use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::future::{block_on, poll_io};
-use linux_raw_sys::{
-    general::S_IFSOCK,
-    net::{AF_INET, AF_INET6, AF_NETLINK, AF_UNSPEC, SOCK_DGRAM, SOCK_RAW, sockaddr, socklen_t},
+use linux_raw_sys::net::{
+    AF_INET, AF_INET6, AF_NETLINK, AF_UNSPEC, SOCK_DGRAM, SOCK_RAW, sockaddr, socklen_t,
 };
 use spin::Mutex;
 
 use crate::{
-    file::{FileLike, IoDst, IoSrc, Kstat},
+    file::{FileLike, IoDst, IoSrc, Kstat, PseudoInode},
     mm::UserPtr,
 };
 
@@ -62,13 +53,12 @@ const IFF_RUNNING: u32 = 0x40;
 const IFF_MULTICAST: u32 = 0x1000;
 const ARPHRD_ETHER: u16 = 1;
 const ARPHRD_LOOPBACK: u16 = 772;
-const DEFAULT_MTU: u32 = 1500;
-
-static ROUTE_NETLINK_STATE: Mutex<RouteNetlinkState> = Mutex::new(RouteNetlinkState {
-    addresses: Vec::new(),
-    routes: Vec::new(),
-    links: Vec::new(),
-});
+const RT_TABLE_MAIN: u8 = 254;
+const RT_SCOPE_UNIVERSE: u8 = 0;
+const RT_SCOPE_LINK: u8 = 253;
+const RT_SCOPE_HOST: u8 = 254;
+const RTN_UNICAST: u8 = 1;
+const IFA_F_PERMANENT: u8 = 0x80;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -172,20 +162,17 @@ struct LinkEntry {
     arphrd: u16,
 }
 
-struct RouteNetlinkState {
-    addresses: Vec<AddressEntry>,
-    routes: Vec<RouteEntry>,
-    links: Vec<LinkEntry>,
-}
-
 #[derive(Default)]
 struct NetlinkState {
     port_id: u32,
     groups: u32,
+    option_flags: u32,
 }
 
 pub struct NetlinkSocket {
     protocol: u32,
+    net_stack: Arc<NetStack>,
+    inode: PseudoInode,
     state: Mutex<NetlinkState>,
     queue: Mutex<VecDeque<Vec<u8>>>,
     nonblocking: AtomicBool,
@@ -197,15 +184,17 @@ impl NetlinkSocket {
         if !matches!(ty, SOCK_RAW | SOCK_DGRAM) {
             return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
         }
-        if protocol > NETLINK_MAX_PROTOCOL {
+        if protocol > NETLINK_MAX_PROTOCOL || protocol != NETLINK_ROUTE {
             return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
         }
         Ok(())
     }
 
-    pub fn new(protocol: u32) -> Arc<Self> {
+    pub fn new(protocol: u32, net_stack: Arc<NetStack>) -> Arc<Self> {
         Arc::new(Self {
             protocol,
+            net_stack,
+            inode: PseudoInode::socket(),
             state: Mutex::new(NetlinkState::default()),
             queue: Mutex::new(VecDeque::new()),
             nonblocking: AtomicBool::new(false),
@@ -223,14 +212,39 @@ impl NetlinkSocket {
     pub fn set_option(&self, optname: u32, value: u32) -> AxResult {
         match optname {
             // NETLINK_ADD_MEMBERSHIP and NETLINK_DROP_MEMBERSHIP use a multicast group number.
-            1 => self.state.lock().groups |= value,
-            2 => self.state.lock().groups &= !value,
+            1 | 2 => {
+                let bit = value
+                    .checked_sub(1)
+                    .filter(|bit| *bit < u32::BITS)
+                    .ok_or(AxError::InvalidInput)?;
+                if optname == 1 {
+                    self.state.lock().groups |= 1 << bit;
+                } else {
+                    self.state.lock().groups &= !(1 << bit);
+                }
+            }
             // NETLINK_BROADCAST_ERROR, NETLINK_NO_ENOBUFS, NETLINK_CAP_ACK,
-            // NETLINK_EXT_ACK, and NETLINK_GET_STRICT_CHK are accepted toggles.
-            4 | 5 | 10 | 11 | 12 => {}
+            // NETLINK_EXT_ACK, and NETLINK_GET_STRICT_CHK are boolean toggles.
+            4 | 5 | 10 | 11 | 12 => {
+                let mask = 1 << optname;
+                if value == 0 {
+                    self.state.lock().option_flags &= !mask;
+                } else {
+                    self.state.lock().option_flags |= mask;
+                }
+            }
             _ => return Err(AxError::from(LinuxError::ENOPROTOOPT)),
         }
         Ok(())
+    }
+
+    pub fn get_option(&self, optname: u32) -> AxResult<u32> {
+        match optname {
+            4 | 5 | 10 | 11 | 12 => Ok(u32::from(
+                self.state.lock().option_flags & (1 << optname) != 0,
+            )),
+            _ => Err(LinuxError::ENOPROTOOPT.into()),
+        }
     }
 
     pub fn write_local_addr(&self, addr: UserPtr<sockaddr>, addrlen: &mut socklen_t) -> AxResult {
@@ -307,7 +321,7 @@ impl NetlinkSocket {
 
     fn handle_write(&self, data: &[u8]) -> AxResult {
         if self.protocol != NETLINK_ROUTE {
-            return Ok(());
+            return Err(AxError::OperationNotSupported);
         }
 
         let mut offset = 0usize;
@@ -346,162 +360,14 @@ impl NetlinkSocket {
 
     fn handle_route_message(&self, hdr: &NlMsgHdr, payload: &[u8]) -> AxResult {
         match hdr.nlmsg_type {
-            RTM_NEWROUTE | RTM_DELROUTE => self.handle_route_update(hdr.nlmsg_type, payload),
+            RTM_NEWROUTE | RTM_DELROUTE => Err(AxError::OperationNotSupported),
             RTM_GETROUTE => self.dump_routes(hdr, payload),
-            RTM_NEWADDR | RTM_DELADDR => self.handle_addr_update(hdr.nlmsg_type, payload),
+            RTM_NEWADDR | RTM_DELADDR => Err(AxError::OperationNotSupported),
             RTM_GETADDR => self.dump_addresses(hdr, payload),
-            RTM_NEWLINK | RTM_SETLINK | RTM_DELLINK => {
-                self.handle_link_update(hdr.nlmsg_type, payload)
-            }
+            RTM_NEWLINK | RTM_SETLINK | RTM_DELLINK => Err(AxError::OperationNotSupported),
             RTM_GETLINK => self.dump_links(hdr, payload),
             _ => Err(AxError::OperationNotSupported),
         }
-    }
-
-    fn handle_route_update(&self, msg_type: u16, payload: &[u8]) -> AxResult {
-        if payload.len() < size_of::<RtMsg>() {
-            return Err(AxError::InvalidInput);
-        }
-        let msg = read_unaligned::<RtMsg>(payload)?;
-        let attrs = parse_route_attrs(&payload[size_of::<RtMsg>()..])?;
-        let entry = RouteEntry {
-            family: msg.rtm_family,
-            dst_len: msg.rtm_dst_len,
-            table: msg.rtm_table,
-            scope: msg.rtm_scope,
-            route_type: msg.rtm_type,
-            oif: attrs.oif,
-            dst: attrs.dst,
-            gateway: attrs.gateway,
-        };
-
-        let mut state = ROUTE_NETLINK_STATE.lock();
-        match msg_type {
-            RTM_NEWROUTE => {
-                if let Some(existing) = state.routes.iter_mut().find(|route| **route == entry) {
-                    *existing = entry;
-                } else {
-                    state.routes.push(entry);
-                }
-            }
-            RTM_DELROUTE => {
-                state.routes.retain(|route| *route != entry);
-            }
-            _ => unreachable!(),
-        }
-        Ok(())
-    }
-
-    fn handle_addr_update(&self, msg_type: u16, payload: &[u8]) -> AxResult {
-        if payload.len() < size_of::<IfAddrMsg>() {
-            return Err(AxError::InvalidInput);
-        }
-        let msg = read_unaligned::<IfAddrMsg>(payload)?;
-        let attrs = parse_attrs(&payload[size_of::<IfAddrMsg>()..])?;
-        let local = attrs
-            .value(IFA_LOCAL)
-            .or_else(|| attrs.value(IFA_ADDRESS))
-            .unwrap_or(&[])
-            .to_vec();
-        let address = attrs
-            .value(IFA_ADDRESS)
-            .or_else(|| attrs.value(IFA_LOCAL))
-            .unwrap_or(&[])
-            .to_vec();
-        if local.is_empty() && address.is_empty() {
-            return Err(AxError::InvalidInput);
-        }
-
-        let mut state = ROUTE_NETLINK_STATE.lock();
-        let label = attrs
-            .string(IFA_LABEL)
-            .unwrap_or_else(|| link_name(msg.ifa_index, &state));
-        let entry = AddressEntry {
-            family: msg.ifa_family,
-            prefix_len: msg.ifa_prefixlen,
-            flags: msg.ifa_flags,
-            scope: msg.ifa_scope,
-            index: msg.ifa_index,
-            local,
-            address,
-            label,
-        };
-        match msg_type {
-            RTM_NEWADDR => {
-                if let Some(existing) = state.addresses.iter_mut().find(|addr| {
-                    addr.family == entry.family
-                        && addr.index == entry.index
-                        && addr.local == entry.local
-                        && addr.address == entry.address
-                }) {
-                    *existing = entry;
-                } else {
-                    state.addresses.push(entry);
-                }
-            }
-            RTM_DELADDR => {
-                state.addresses.retain(|addr| {
-                    !(addr.family == entry.family
-                        && addr.index == entry.index
-                        && addr.local == entry.local
-                        && addr.address == entry.address)
-                });
-            }
-            _ => unreachable!(),
-        }
-        Ok(())
-    }
-
-    fn handle_link_update(&self, msg_type: u16, payload: &[u8]) -> AxResult {
-        if payload.len() < size_of::<IfInfoMsg>() {
-            return Err(AxError::InvalidInput);
-        }
-        let msg = read_unaligned::<IfInfoMsg>(payload)?;
-        let attrs = parse_attrs(&payload[size_of::<IfInfoMsg>()..])?;
-        let mut state = ROUTE_NETLINK_STATE.lock();
-        let name = attrs
-            .string(IFLA_IFNAME)
-            .or_else(|| (msg.ifi_index > 0).then(|| link_name(msg.ifi_index as u32, &state)));
-        match msg_type {
-            RTM_DELLINK => {
-                if let Some(name) = name {
-                    state.links.retain(|link| link.name != name);
-                } else if msg.ifi_index > 0 {
-                    state
-                        .links
-                        .retain(|link| link.index != msg.ifi_index as u32);
-                }
-            }
-            RTM_NEWLINK | RTM_SETLINK => {
-                if let Some(name) = name {
-                    if builtin_link_by_name(&name).is_some() {
-                        return Ok(());
-                    }
-                    let next_index =
-                        state.links.iter().map(|link| link.index).max().unwrap_or(2) + 1;
-                    let mtu = attrs.u32(IFLA_MTU).unwrap_or(DEFAULT_MTU);
-                    if let Some(link) = state.links.iter_mut().find(|link| link.name == name) {
-                        link.flags = msg.ifi_flags;
-                        link.mtu = mtu;
-                    } else {
-                        state.links.push(LinkEntry {
-                            index: if msg.ifi_index > 0 {
-                                msg.ifi_index as u32
-                            } else {
-                                next_index
-                            },
-                            name,
-                            flags: msg.ifi_flags | IFF_UP | IFF_RUNNING | IFF_MULTICAST,
-                            mtu,
-                            hwaddr: vec![0x02, 0, 0, 0, 0, next_index as u8],
-                            arphrd: ARPHRD_ETHER,
-                        });
-                    }
-                }
-            }
-            _ => unreachable!(),
-        }
-        Ok(())
     }
 
     fn dump_addresses(&self, hdr: &NlMsgHdr, payload: &[u8]) -> AxResult {
@@ -511,18 +377,16 @@ impl NetlinkSocket {
             None
         };
         let port_id = self.state.lock().port_id;
-        let state = ROUTE_NETLINK_STATE.lock();
-        for entry in builtin_addresses()
-            .into_iter()
-            .chain(state.addresses.iter().cloned())
-        {
-            if let Some(filter) = filter
-                && ((filter.ifa_family != AF_UNSPEC as u8 && filter.ifa_family != entry.family)
-                    || (filter.ifa_index != 0 && filter.ifa_index != entry.index))
-            {
-                continue;
+        for interface in self.net_stack.interfaces() {
+            for entry in address_entries(&interface) {
+                if let Some(filter) = filter
+                    && ((filter.ifa_family != AF_UNSPEC as u8 && filter.ifa_family != entry.family)
+                        || (filter.ifa_index != 0 && filter.ifa_index != entry.index))
+                {
+                    continue;
+                }
+                self.enqueue_kernel(address_message(hdr, port_id, &entry));
             }
-            self.enqueue_kernel(address_message(hdr, port_id, &entry));
         }
         self.enqueue_kernel(done_message(hdr, port_id));
         Ok(())
@@ -535,15 +399,15 @@ impl NetlinkSocket {
             None
         };
         let port_id = self.state.lock().port_id;
-        let state = ROUTE_NETLINK_STATE.lock();
-        for entry in &state.routes {
+        for route in self.net_stack.routes() {
+            let entry = route_entry(&route);
             if let Some(filter) = filter
                 && filter.rtm_family != AF_UNSPEC as u8
                 && filter.rtm_family != entry.family
             {
                 continue;
             }
-            self.enqueue_kernel(route_message(hdr, port_id, entry));
+            self.enqueue_kernel(route_message(hdr, port_id, &entry));
         }
         self.enqueue_kernel(done_message(hdr, port_id));
         Ok(())
@@ -556,11 +420,8 @@ impl NetlinkSocket {
             None
         };
         let port_id = self.state.lock().port_id;
-        let state = ROUTE_NETLINK_STATE.lock();
-        for link in builtin_links()
-            .into_iter()
-            .chain(state.links.iter().cloned())
-        {
+        for interface in self.net_stack.interfaces() {
+            let link = link_entry(interface);
             if let Some(filter) = filter
                 && filter.ifi_index > 0
                 && filter.ifi_index as u32 != link.index
@@ -588,11 +449,7 @@ impl FileLike for NetlinkSocket {
     }
 
     fn stat(&self) -> AxResult<Kstat> {
-        Ok(Kstat {
-            mode: S_IFSOCK | 0o777,
-            blksize: 4096,
-            ..Kstat::default()
-        })
+        Ok(self.inode.stat())
     }
 
     fn nonblocking(&self) -> bool {
@@ -605,79 +462,8 @@ impl FileLike for NetlinkSocket {
     }
 
     fn path(&self) -> Cow<'_, str> {
-        format!("socket:[netlink:{}]", self.protocol).into()
+        format!("socket:[{}]", self.inode.inode()).into()
     }
-}
-
-struct ParsedAttrs {
-    attrs: Vec<(u16, Vec<u8>)>,
-}
-
-impl ParsedAttrs {
-    fn value(&self, ty: u16) -> Option<&[u8]> {
-        self.attrs
-            .iter()
-            .find_map(|(attr_ty, value)| (*attr_ty == ty).then_some(value.as_slice()))
-    }
-
-    fn string(&self, ty: u16) -> Option<String> {
-        let value = self.value(ty)?;
-        let end = value
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(value.len());
-        core::str::from_utf8(&value[..end])
-            .ok()
-            .map(ToString::to_string)
-    }
-
-    fn u32(&self, ty: u16) -> Option<u32> {
-        let value = self.value(ty)?;
-        if value.len() < size_of::<u32>() {
-            return None;
-        }
-        Some(u32::from_ne_bytes(value[..4].try_into().ok()?))
-    }
-}
-
-#[derive(Default)]
-struct RouteAttrs {
-    dst: Vec<u8>,
-    gateway: Vec<u8>,
-    oif: Option<u32>,
-}
-
-fn parse_attrs(mut data: &[u8]) -> AxResult<ParsedAttrs> {
-    let mut attrs = Vec::new();
-    while data.len() >= size_of::<RtAttr>() {
-        let attr = read_unaligned::<RtAttr>(data)?;
-        if attr.rta_len < size_of::<RtAttr>() as u16 {
-            return Err(AxError::InvalidInput);
-        }
-
-        let len = attr.rta_len as usize;
-        if len > data.len() {
-            return Err(AxError::InvalidInput);
-        }
-
-        attrs.push((attr.rta_type, data[size_of::<RtAttr>()..len].to_vec()));
-
-        let next = align4(len);
-        if next > data.len() {
-            break;
-        }
-        data = &data[next..];
-    }
-    Ok(ParsedAttrs { attrs })
-}
-
-fn parse_route_attrs(data: &[u8]) -> AxResult<RouteAttrs> {
-    let parsed = parse_attrs(data)?;
-    Ok(RouteAttrs {
-        dst: parsed.value(RTA_DST).unwrap_or(&[]).to_vec(),
-        gateway: parsed.value(RTA_GATEWAY).unwrap_or(&[]).to_vec(),
-        oif: parsed.u32(RTA_OIF),
-    })
 }
 
 fn netlink_ack(request: &NlMsgHdr, port_id: u32, error: i32) -> Vec<u8> {
@@ -848,72 +634,95 @@ fn write_netlink_kernel_addr(addr: UserPtr<sockaddr>, addrlen: &mut socklen_t) -
     Ok(())
 }
 
-fn builtin_links() -> Vec<LinkEntry> {
-    vec![
-        LinkEntry {
-            index: 1,
-            name: "lo".to_string(),
-            flags: IFF_UP | IFF_LOOPBACK | IFF_RUNNING,
-            mtu: 65_536,
-            hwaddr: vec![0, 0, 0, 0, 0, 0],
-            arphrd: ARPHRD_LOOPBACK,
-        },
-        LinkEntry {
-            index: 2,
-            name: "eth0".to_string(),
-            flags: IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST,
-            mtu: DEFAULT_MTU,
-            hwaddr: vec![0x02, 0, 0, 0, 0, 0x02],
-            arphrd: ARPHRD_ETHER,
-        },
-    ]
+fn ip_address_bytes(address: IpAddress) -> Vec<u8> {
+    match address {
+        IpAddress::Ipv4(address) => address.octets().to_vec(),
+        IpAddress::Ipv6(address) => address.octets().to_vec(),
+    }
 }
 
-fn builtin_link_by_name(name: &str) -> Option<LinkEntry> {
-    builtin_links().into_iter().find(|link| link.name == name)
+fn address_entries(interface: &InterfaceInfo) -> Vec<AddressEntry> {
+    interface
+        .addresses
+        .iter()
+        .map(|cidr| {
+            let address = cidr.address();
+            let family = match address {
+                IpAddress::Ipv4(_) => AF_INET as u8,
+                IpAddress::Ipv6(_) => AF_INET6 as u8,
+            };
+            let bytes = ip_address_bytes(address);
+            AddressEntry {
+                family,
+                prefix_len: cidr.prefix_len(),
+                flags: IFA_F_PERMANENT,
+                scope: if interface.kind == InterfaceKind::Loopback {
+                    RT_SCOPE_HOST
+                } else {
+                    RT_SCOPE_UNIVERSE
+                },
+                index: interface.index,
+                local: bytes.clone(),
+                address: bytes,
+                label: interface.name.clone(),
+            }
+        })
+        .collect()
 }
 
-fn builtin_addresses() -> Vec<AddressEntry> {
-    vec![
-        AddressEntry {
-            family: AF_INET as u8,
-            prefix_len: 8,
-            flags: 0x80,
-            scope: 254,
-            index: 1,
-            local: vec![127, 0, 0, 1],
-            address: vec![127, 0, 0, 1],
-            label: "lo".to_string(),
+fn link_entry(interface: InterfaceInfo) -> LinkEntry {
+    let is_loopback = interface.kind == InterfaceKind::Loopback;
+    let flags = if is_loopback {
+        IFF_UP | IFF_LOOPBACK | IFF_RUNNING
+    } else {
+        IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST
+    };
+    LinkEntry {
+        index: interface.index,
+        name: interface.name,
+        flags,
+        mtu: interface.mtu.min(u32::MAX as usize) as u32,
+        hwaddr: interface
+            .hardware_address
+            .map(|address| address.to_vec())
+            .unwrap_or_default(),
+        arphrd: if is_loopback {
+            ARPHRD_LOOPBACK
+        } else {
+            ARPHRD_ETHER
         },
-        AddressEntry {
-            family: AF_INET6 as u8,
-            prefix_len: 128,
-            flags: 0x80,
-            scope: 254,
-            index: 1,
-            local: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            address: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            label: "lo".to_string(),
-        },
-        AddressEntry {
-            family: AF_INET as u8,
-            prefix_len: 24,
-            flags: 0x80,
-            scope: 0,
-            index: 2,
-            local: vec![10, 0, 2, 15],
-            address: vec![10, 0, 2, 15],
-            label: "eth0".to_string(),
-        },
-    ]
+    }
 }
 
-fn link_name(index: u32, state: &RouteNetlinkState) -> String {
-    builtin_links()
-        .into_iter()
-        .chain(state.links.iter().cloned())
-        .find_map(|link| (link.index == index).then_some(link.name))
-        .unwrap_or_else(|| format!("if{index}"))
+fn route_entry(route: &RouteInfo) -> RouteEntry {
+    let destination = route.destination.address();
+    let is_loopback = match destination {
+        IpAddress::Ipv4(address) => address.is_loopback(),
+        IpAddress::Ipv6(address) => address.is_loopback(),
+    };
+    RouteEntry {
+        family: match destination {
+            IpAddress::Ipv4(_) => AF_INET as u8,
+            IpAddress::Ipv6(_) => AF_INET6 as u8,
+        },
+        dst_len: route.destination.prefix_len(),
+        table: RT_TABLE_MAIN,
+        scope: if is_loopback {
+            RT_SCOPE_HOST
+        } else if route.gateway.is_some() {
+            RT_SCOPE_UNIVERSE
+        } else {
+            RT_SCOPE_LINK
+        },
+        route_type: RTN_UNICAST,
+        oif: Some(route.interface_index),
+        dst: if route.destination.prefix_len() == 0 {
+            Vec::new()
+        } else {
+            ip_address_bytes(destination)
+        },
+        gateway: route.gateway.map(ip_address_bytes).unwrap_or_default(),
+    }
 }
 
 fn read_unaligned<T: Copy>(data: &[u8]) -> AxResult<T> {

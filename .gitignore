@@ -27,10 +27,10 @@ __pycache__/
 /.claude/
 /.codex/
 /.humanize/
+/.local/
 /.vscode/
 /AGENTS.md
 /CLAUDE.md
 /openspec/
 /opencpec/
 /output/
-/docs/superpowers/

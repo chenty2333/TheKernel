@@ -244,6 +244,6 @@ pub trait BlockDriverOps: BaseDriverOps {
 
     /// Fences previously submitted async writes without forcing a device-cache flush.
     fn fence_async(&mut self) -> DevResult {
-        Ok(())
+        Err(DevError::Unsupported)
     }
 }

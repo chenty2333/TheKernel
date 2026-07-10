@@ -1,7 +1,7 @@
 use alloc::sync::{Arc, Weak};
 use core::task::Context;
 
-use axerrno::{AxResult, ax_bail};
+use axerrno::{AxError, AxResult, ax_bail};
 use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::current;
 use kspin::SpinNoIrq;
@@ -71,10 +71,39 @@ impl JobControl {
         Ok(())
     }
 
-    pub fn set_session(&self, session: &Arc<Session>) {
+    /// Associates this terminal with a session.
+    ///
+    /// Returns whether a new association was installed. Reclaiming a terminal
+    /// owned by another live session is rejected instead of replacing it.
+    pub fn claim_session(&self, session: &Arc<Session>) -> AxResult<bool> {
         let mut guard = self.session.lock();
-        assert!(guard.upgrade().is_none());
+        if let Some(current) = guard.upgrade() {
+            if Arc::ptr_eq(&current, session) {
+                return Ok(false);
+            }
+            return Err(AxError::OperationNotPermitted);
+        }
         *guard = Arc::downgrade(session);
+        Ok(true)
+    }
+
+    /// Removes this terminal's session and foreground process group.
+    pub fn release_session(&self, session: &Arc<Session>) -> Option<Arc<ProcessGroup>> {
+        // Keep the lock order consistent with `set_foreground`.
+        let mut foreground = self.foreground.lock();
+        let mut current_session = self.session.lock();
+        let current = current_session.upgrade()?;
+        if !Arc::ptr_eq(&current, session) {
+            return None;
+        }
+
+        let old_foreground = foreground.upgrade();
+        *foreground = Weak::new();
+        *current_session = Weak::new();
+        drop(current_session);
+        drop(foreground);
+        self.poll_fg.wake();
+        old_foreground
     }
 }
 

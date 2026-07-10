@@ -11,9 +11,8 @@ use axfs::FS_CONTEXT;
 use axfs_ng_vfs::NodeType;
 use axhal::uspace::UserContext;
 use axtask::{
-    SchedClass, current,
+    current,
     future::{block_on, interruptible},
-    sched_state, set_sched_state,
 };
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
 use memory_addr::PAGE_SIZE_4K;
@@ -102,29 +101,6 @@ const SUPPORTED_EXECVEAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
 const EXEC_MAX_ARG_STRLEN: usize = 32 * PAGE_SIZE_4K;
 const EXEC_ARG_MAX: usize = 2 * 1024 * 1024;
 const EXEC_STACK_SAFETY_MARGIN: usize = 4 * PAGE_SIZE_4K;
-const IOZONE_TASK_NAME: &str = "iozone";
-const IOZONE_RT_PRIORITY: u8 = 50;
-const TETIAO_ENV: &str = "tetiao=1";
-
-fn tetiao_enabled(envs: &[String]) -> bool {
-    envs.iter().any(|env| env.as_str() == TETIAO_ENV)
-}
-
-fn apply_exec_sched_policy(task_name: &str, envs: &[String]) {
-    if task_name != IOZONE_TASK_NAME || !tetiao_enabled(envs) {
-        return;
-    }
-
-    let curr = current();
-    let mut state = sched_state(&curr);
-    state.class = SchedClass::RoundRobin;
-    state.rt_priority = IOZONE_RT_PRIORITY;
-    state.reset_on_fork = false;
-    state.dl_runtime = 0;
-    state.dl_deadline = 0;
-    state.dl_period = 0;
-    let _ = set_sched_state(&curr, state);
-}
 
 fn exec_arg_limit() -> usize {
     EXEC_ARG_MAX.min(crate::config::USER_STACK_SIZE.saturating_sub(EXEC_STACK_SAFETY_MARGIN))
@@ -310,11 +286,11 @@ fn do_execve(
     let new_aspace = Arc::new(axsync::Mutex::new(new_aspace));
     let new_aspace_guard = new_aspace.lock();
     let new_root = new_aspace_guard.page_table_root();
+    crate::syscall::cleanup_process_aio(proc_data.proc.pid());
     let old_aspace = proc_data.replace_aspace(new_aspace.clone());
     set_current_user_page_table_root(new_root);
     drop(new_aspace_guard);
     drop(old_aspace);
-    proc_data.clear_membarrier_registrations();
     proc_data.clear_keep_caps_on_exec();
     curr.as_thread().set_tid(proc_data.proc.pid());
     if curr_tid != proc_data.proc.pid() {
@@ -327,7 +303,6 @@ fn do_execve(
     proc_data.replace_executable(executable_key);
 
     curr.set_name(&task_name);
-    apply_exec_sched_policy(&task_name, &envs);
 
     #[cfg(target_arch = "loongarch64")]
     {

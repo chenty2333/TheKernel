@@ -167,6 +167,17 @@ impl CloneArgs {
     pub(super) fn validate_for(&self, api: CloneApi) -> AxResult<()> {
         let Self { flags, .. } = self;
 
+        if flags.intersects(
+            CloneFlags::NEWNS
+                | CloneFlags::NEWIPC
+                | CloneFlags::IO
+                | CloneFlags::SYSVSEM
+                | CloneFlags::PTRACE
+                | CloneFlags::UNTRACED,
+        ) {
+            return Err(AxError::OperationNotSupported);
+        }
+
         if flags.contains(CloneFlags::THREAD)
             && !flags.contains(CloneFlags::VM | CloneFlags::SIGHAND)
         {
@@ -188,10 +199,6 @@ impl CloneArgs {
             return Err(AxError::InvalidInput);
         }
         if flags.contains(CloneFlags::THREAD | CloneFlags::NEWNET) {
-            return Err(AxError::InvalidInput);
-        }
-
-        if flags.contains(CloneFlags::FS | CloneFlags::NEWNS) {
             return Err(AxError::InvalidInput);
         }
 
@@ -296,8 +303,8 @@ impl CloneArgs {
         }
 
         let tid = new_task.id().as_u64() as Pid;
-        if flags.contains(CloneFlags::PARENT_SETTID) && parent_tid != 0 {
-            (parent_tid as *mut Pid).vm_write(tid).ok();
+        if flags.contains(CloneFlags::PARENT_SETTID) {
+            (parent_tid as *mut Pid).vm_write(tid)?;
         }
 
         let new_proc_data = if flags.contains(CloneFlags::THREAD) {
@@ -392,30 +399,17 @@ impl CloneArgs {
                 user_ns,
                 uts_ns,
                 time_ns,
-                if flags.contains(CloneFlags::IO) {
-                    old_proc_data.io_context.clone()
-                } else {
-                    Arc::new(())
-                },
-                if flags.contains(CloneFlags::SYSVSEM) {
-                    old_proc_data.sysvsem_undo.clone()
-                } else {
-                    Arc::new(())
-                },
             );
             proc_data.set_umask(old_proc_data.umask());
             proc_data.set_credentials(old_proc_data.credentials());
             proc_data.set_capability_state(old_proc_data.capability_state());
             proc_data.set_supplementary_groups(old_proc_data.supplementary_groups());
             proc_data.set_heap_top(old_proc_data.get_heap_top());
-            proc_data.set_ioprio(old_proc_data.ioprio());
             proc_data.inherit_mempolicy_from(old_proc_data);
             proc_data.inherit_timerslack_from(old_proc_data);
             if old_proc_data.no_new_privs() {
                 proc_data.set_no_new_privs();
             }
-            proc_data.set_seccomp_mode(old_proc_data.seccomp_mode());
-            proc_data.set_thp_disabled(old_proc_data.thp_disabled());
 
             {
                 let mut scope = proc_data.scope.write();
@@ -532,7 +526,8 @@ pub fn sys_clone(
     #[cfg(not(any(target_arch = "x86_64", target_arch = "loongarch64")))] child_tid: usize,
 ) -> AxResult<isize> {
     const FLAG_MASK: u32 = 0xff;
-    let clone_flags = CloneFlags::from_bits_truncate((flags & !FLAG_MASK) as u64);
+    let clone_flags =
+        CloneFlags::from_bits((flags & !FLAG_MASK) as u64).ok_or(AxError::InvalidInput)?;
     let exit_signal = (flags & FLAG_MASK) as u64;
 
     if clone_flags.contains(CloneFlags::PIDFD | CloneFlags::PARENT_SETTID) {

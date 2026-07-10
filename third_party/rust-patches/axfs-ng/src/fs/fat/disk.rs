@@ -3,6 +3,8 @@ use core::mem;
 
 use axdriver::prelude::*;
 
+use crate::MountedBlockDevice;
+
 fn take<'a>(buf: &mut &'a [u8], cnt: usize) -> &'a [u8] {
     let (first, rem) = buf.split_at(cnt);
     *buf = rem;
@@ -18,7 +20,7 @@ fn take_mut<'a>(buf: &mut &'a mut [u8], cnt: usize) -> &'a mut [u8] {
 
 /// A disk device with a cursor.
 pub struct SeekableDisk {
-    dev: AxBlockDevice,
+    dev: MountedBlockDevice,
 
     block_id: u64,
     offset: usize,
@@ -34,11 +36,11 @@ pub struct SeekableDisk {
 
 impl SeekableDisk {
     /// Create a new disk.
-    pub fn new(dev: AxBlockDevice) -> Self {
-        assert!(dev.block_size().is_power_of_two());
-        let block_size_log2 = dev.block_size().trailing_zeros() as u8;
-        let read_buffer = vec![0u8; dev.block_size()].into_boxed_slice();
-        let write_buffer = vec![0u8; dev.block_size()].into_boxed_slice();
+    pub fn new(dev: MountedBlockDevice) -> Self {
+        assert!(dev.device().block_size().is_power_of_two());
+        let block_size_log2 = dev.device().block_size().trailing_zeros() as u8;
+        let read_buffer = vec![0u8; dev.device().block_size()].into_boxed_slice();
+        let write_buffer = vec![0u8; dev.device().block_size()].into_boxed_slice();
         Self {
             dev,
             block_id: 0,
@@ -52,7 +54,7 @@ impl SeekableDisk {
 
     /// Get the size of the disk.
     pub fn size(&self) -> u64 {
-        self.dev.num_blocks() << self.block_size_log2
+        self.dev.device().num_blocks() << self.block_size_log2
     }
 
     /// Get the block size.
@@ -76,7 +78,10 @@ impl SeekableDisk {
     /// Write all pending changes to the disk.
     pub fn flush(&mut self) -> DevResult<()> {
         if self.write_buffer_dirty {
-            self.dev.write_block(self.block_id, &self.write_buffer)?;
+            self.dev
+                .device()
+                .lock()
+                .write_block(self.block_id, &self.write_buffer)?;
             self.write_buffer_dirty = false;
         }
         Ok(())
@@ -84,7 +89,10 @@ impl SeekableDisk {
 
     fn read_partial(&mut self, buf: &mut &mut [u8]) -> DevResult<usize> {
         self.flush()?;
-        self.dev.read_block(self.block_id, &mut self.read_buffer)?;
+        self.dev
+            .device()
+            .lock()
+            .read_block(self.block_id, &mut self.read_buffer)?;
 
         let data = &self.read_buffer[self.offset..];
         let length = buf.len().min(data.len());
@@ -109,6 +117,8 @@ impl SeekableDisk {
             let blocks = buf.len() >> self.block_size_log2;
             let length = blocks << self.block_size_log2;
             self.dev
+                .device()
+                .lock()
                 .read_block(self.block_id, take_mut(&mut buf, length))?;
             read += length;
 
@@ -123,7 +133,10 @@ impl SeekableDisk {
 
     fn write_partial(&mut self, buf: &mut &[u8]) -> DevResult<usize> {
         if !self.write_buffer_dirty {
-            self.dev.read_block(self.block_id, &mut self.write_buffer)?;
+            self.dev
+                .device()
+                .lock()
+                .read_block(self.block_id, &mut self.write_buffer)?;
             self.write_buffer_dirty = true;
         }
 
@@ -151,6 +164,8 @@ impl SeekableDisk {
             let blocks = buf.len() >> self.block_size_log2;
             let length = blocks << self.block_size_log2;
             self.dev
+                .device()
+                .lock()
                 .write_block(self.block_id, take(&mut buf, length))?;
             written += length;
 

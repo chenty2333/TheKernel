@@ -6,11 +6,12 @@
 use alloc::{borrow::Cow, sync::Arc};
 use core::task::Context;
 
+use axerrno::AxResult;
 use axpoll::{IoEvents, Pollable};
 
 use crate::{
     bpf::{defs::BPF_OBJ_NAME_LEN, map::BpfMap, prog::BpfProgram},
-    file::FileLike,
+    file::{FileLike, Kstat, anon_inode_stat},
 };
 
 // ---------------------------------------------------------------------------
@@ -30,6 +31,10 @@ impl BpfMapFd {
 }
 
 impl FileLike for BpfMapFd {
+    fn stat(&self) -> AxResult<Kstat> {
+        Ok(anon_inode_stat())
+    }
+
     fn path(&self) -> Cow<'_, str> {
         "anon_inode:bpf-map".into()
     }
@@ -58,6 +63,10 @@ impl BpfProgFd {
 }
 
 impl FileLike for BpfProgFd {
+    fn stat(&self) -> AxResult<Kstat> {
+        Ok(anon_inode_stat())
+    }
+
     fn path(&self) -> Cow<'_, str> {
         "anon_inode:bpf-prog".into()
     }

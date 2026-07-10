@@ -4,13 +4,9 @@ mod util;
 
 use alloc::{sync::Arc, vec::Vec};
 
-use axdriver::{
-    AxBlockDevice,
-    prelude::{
-        BlockAsyncOp, BlockDriverOps, BlockQueueRequest, BlockRequestHandle, BlockSegment, DevError,
-    },
+use axdriver::prelude::{
+    BlockAsyncOp, BlockDriverOps, BlockQueueRequest, BlockRequestHandle, BlockSegment, DevError,
 };
-use axsync::Mutex;
 pub use fs::*;
 pub use inode::*;
 use lwext4_rust::{
@@ -18,15 +14,17 @@ use lwext4_rust::{
     ffi::EIO,
 };
 
+use crate::MountedBlockDevice;
+
 #[derive(Clone)]
 pub(crate) struct Ext4Disk {
-    inner: Arc<Mutex<AxBlockDevice>>,
+    inner: Arc<MountedBlockDevice>,
 }
 
 impl Ext4Disk {
-    pub(crate) fn new(dev: AxBlockDevice) -> Self {
+    pub(crate) fn new(dev: MountedBlockDevice) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(dev)),
+            inner: Arc::new(dev),
         }
     }
 
@@ -47,6 +45,7 @@ impl Ext4Disk {
             return Ok(());
         }
         self.inner
+            .device()
             .lock()
             .wait_async_all(&handles)
             .map_err(|_| Ext4Error::new(EIO as _, None))
@@ -56,6 +55,7 @@ impl Ext4Disk {
 impl BlockDevice for Ext4Disk {
     fn read_blocks(&mut self, block_id: u64, buf: &mut [u8]) -> Ext4Result<usize> {
         self.inner
+            .device()
             .lock()
             .read_block(block_id, buf)
             .map_err(|_| Ext4Error::new(EIO as _, None))?;
@@ -65,6 +65,7 @@ impl BlockDevice for Ext4Disk {
     fn read_blocks_vectored(&mut self, block_id: u64, bufs: &mut [&mut [u8]]) -> Ext4Result<usize> {
         let bytes = bufs.iter().map(|buf| buf.len()).sum();
         self.inner
+            .device()
             .lock()
             .read_block_vectored(block_id, bufs)
             .map_err(|_| Ext4Error::new(EIO as _, None))?;
@@ -76,7 +77,7 @@ impl BlockDevice for Ext4Disk {
         block_id: u64,
         bufs: &mut [&mut [u8]],
     ) -> Ext4Result<Option<AsyncReadStats>> {
-        let mut dev = self.inner.lock();
+        let mut dev = self.inner.device().lock();
         let Some(caps) = dev.async_queue_caps() else {
             return Ok(None);
         };
@@ -172,7 +173,7 @@ impl BlockDevice for Ext4Disk {
         block_id: u64,
         bufs: &mut [&mut [u8]],
     ) -> Ext4Result<Option<AsyncReadSubmission>> {
-        let mut dev = self.inner.lock();
+        let mut dev = self.inner.device().lock();
         let Some(caps) = dev.async_queue_caps() else {
             return Ok(None);
         };
@@ -265,7 +266,7 @@ impl BlockDevice for Ext4Disk {
         block_id: u64,
         bufs: &[&[u8]],
     ) -> Ext4Result<Option<AsyncWriteSubmission>> {
-        let mut dev = self.inner.lock();
+        let mut dev = self.inner.device().lock();
         let Some(caps) = dev.async_queue_caps() else {
             return Ok(None);
         };
@@ -355,6 +356,7 @@ impl BlockDevice for Ext4Disk {
 
     fn write_blocks(&mut self, block_id: u64, buf: &[u8]) -> Ext4Result<usize> {
         self.inner
+            .device()
             .lock()
             .write_block(block_id, buf)
             .map_err(|_| Ext4Error::new(EIO as _, None))?;
@@ -364,6 +366,7 @@ impl BlockDevice for Ext4Disk {
     fn write_blocks_vectored(&mut self, block_id: u64, bufs: &[&[u8]]) -> Ext4Result<usize> {
         let bytes = bufs.iter().map(|buf| buf.len()).sum();
         self.inner
+            .device()
             .lock()
             .write_block_vectored(block_id, bufs)
             .map_err(|_| Ext4Error::new(EIO as _, None))?;
@@ -371,11 +374,12 @@ impl BlockDevice for Ext4Disk {
     }
 
     fn num_blocks(&self) -> Ext4Result<u64> {
-        Ok(self.inner.lock().num_blocks())
+        Ok(self.inner.device().num_blocks())
     }
 
     fn flush(&mut self) -> Ext4Result<()> {
         self.inner
+            .device()
             .lock()
             .flush()
             .map_err(|_| Ext4Error::new(EIO as _, None))

@@ -3,24 +3,9 @@ use axdriver_pci::{
 };
 use axhal::mem::phys_to_virt;
 
-use crate::{AllDevices, prelude::*};
+use crate::{AllDevices, drivers::BusProbeResult, prelude::*};
 
 const PCI_BAR_NUM: u8 = 6;
-
-#[cfg(target_arch = "loongarch64")]
-#[inline]
-fn should_skip_pci_device(dev_info: &axdriver_pci::DeviceFunctionInfo) -> bool {
-    // The official LA evaluator only needs loopback networking. Ignore the
-    // external virtio-net PCI function completely so we do not assign BARs or
-    // enable bus mastering for a device the kernel intentionally never drives.
-    dev_info.vendor_id == 0x1af4 && matches!(dev_info.device_id, 0x1000 | 0x1041)
-}
-
-#[cfg(not(target_arch = "loongarch64"))]
-#[inline]
-fn should_skip_pci_device(_dev_info: &axdriver_pci::DeviceFunctionInfo) -> bool {
-    false
-}
 
 fn config_pci_device(
     root: &mut PciRoot,
@@ -114,20 +99,21 @@ impl AllDevices {
                 if dev_info.header_type != HeaderType::Standard {
                     continue;
                 }
-                if should_skip_pci_device(&dev_info) {
-                    continue;
-                }
                 match config_pci_device(&mut root, bdf, &mut allocator) {
                     Ok(_) => for_each_drivers!(type Driver, {
-                        if let Some(dev) = Driver::probe_pci(&mut root, bdf, &dev_info) {
-                            info!(
-                                "registered a new {:?} device at {}: {:?}",
-                                dev.device_type(),
-                                bdf,
-                                dev.device_name(),
-                            );
-                            self.add_device(dev);
-                            continue; // skip to the next device
+                        match Driver::probe_pci(&mut root, bdf, &dev_info) {
+                            BusProbeResult::NotMatched => {}
+                            BusProbeResult::Claimed => continue,
+                            BusProbeResult::Device(dev) => {
+                                info!(
+                                    "registered a new {:?} device at {}: {:?}",
+                                    dev.device_type(),
+                                    bdf,
+                                    dev.device_name(),
+                                );
+                                self.add_device(dev);
+                                continue;
+                            }
                         }
                     }),
                     Err(e) => warn!("failed to enable PCI device at {bdf}({dev_info}): {e:?}"),

@@ -1,7 +1,7 @@
 use axerrno::{AxError, AxResult};
 use axtask::current;
 use bitflags::bitflags;
-use linux_raw_sys::general::{CAP_SYS_PTRACE, SI_TKILL};
+use linux_raw_sys::general::SI_TKILL;
 use starry_signal::SignalInfo;
 use starry_vm::VmPtr;
 
@@ -10,7 +10,9 @@ use crate::{
     pseudofs::{ProcDirProcess, process_data_from_proc_dir},
     syscall::signal::parse_signo,
     task::{
-        AsThread, ProcessData, get_process_data, get_visible_task, send_signal_to_process_data,
+        AsThread, ProcessData, PtraceCredentialMode, check_current_ptrace_access,
+        check_current_signal_access, get_process_data, get_visible_task,
+        send_signal_to_process_data,
     },
 };
 
@@ -38,19 +40,7 @@ fn process_data_from_signal_fd(fd: i32) -> AxResult<alloc::sync::Arc<crate::task
 }
 
 fn check_pidfd_getfd_permission(target: &ProcessData) -> AxResult<()> {
-    let curr = current();
-    let actor = &curr.as_thread().proc_data;
-    if actor.proc.pid() == target.proc.pid()
-        || actor.euid() == 0
-        || actor.has_effective_capability(CAP_SYS_PTRACE)
-        || [actor.uid(), actor.euid()]
-            .into_iter()
-            .any(|id| id == target.uid() || id == target.euid() || id == target.suid())
-    {
-        Ok(())
-    } else {
-        Err(AxError::OperationNotPermitted)
-    }
+    check_current_ptrace_access(target, PtraceCredentialMode::Real)
 }
 
 bitflags! {
@@ -150,6 +140,7 @@ pub fn sys_pidfd_send_signal(
     } else {
         make_pidfd_signal_info(&proc_data, signo, sig)?
     };
+    check_current_signal_access(&proc_data, sig.as_ref().map(SignalInfo::signo))?;
     send_signal_to_process_data(&proc_data, sig)?;
     Ok(0)
 }

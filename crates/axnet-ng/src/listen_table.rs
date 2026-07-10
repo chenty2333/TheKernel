@@ -1,35 +1,36 @@
-use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc};
 use core::ops::DerefMut;
 
 use axerrno::{AxError, AxResult};
 use axsync::Mutex;
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
-    socket::tcp::{self, SocketBuffer, State},
+    socket::tcp::{self, State},
     wire::{IpEndpoint, IpListenEndpoint},
 };
 
-use crate::{
-    consts::{LISTEN_QUEUE_SIZE, TCP_RX_BUF_LEN, TCP_TX_BUF_LEN},
-    wrapper::SocketSetWrapper,
-};
+use crate::{consts::LISTEN_QUEUE_SIZE, tcp::new_tcp_socket, wrapper::SocketSetWrapper};
 
 const PORT_NUM: usize = 65536;
 
 struct ListenTableEntryInner {
     listen_endpoint: IpListenEndpoint,
     syn_queue: VecDeque<SocketHandle>,
+    queue_limit: usize,
     socket_set: alloc::sync::Weak<SocketSetWrapper<'static>>,
 }
 
 impl ListenTableEntryInner {
     pub fn new(
         listen_endpoint: IpListenEndpoint,
+        backlog: usize,
         socket_set: alloc::sync::Weak<SocketSetWrapper<'static>>,
     ) -> Self {
+        let queue_limit = backlog.clamp(1, LISTEN_QUEUE_SIZE);
         Self {
             listen_endpoint,
-            syn_queue: VecDeque::with_capacity(LISTEN_QUEUE_SIZE),
+            syn_queue: VecDeque::with_capacity(queue_limit),
+            queue_limit,
             socket_set,
         }
     }
@@ -63,13 +64,10 @@ impl ListenTable {
         Self { tcp }
     }
 
-    pub fn can_listen(&self, port: u16) -> bool {
-        self.tcp[port as usize].lock().is_none()
-    }
-
     pub(crate) fn listen(
         &self,
         listen_endpoint: IpListenEndpoint,
+        backlog: usize,
         socket_set: &Arc<SocketSetWrapper<'static>>,
     ) -> AxResult {
         let port = listen_endpoint.port;
@@ -78,6 +76,7 @@ impl ListenTable {
         if entry.is_none() {
             *entry = Some(Box::new(ListenTableEntryInner::new(
                 listen_endpoint,
+                backlog,
                 Arc::downgrade(socket_set),
             )));
             Ok(())
@@ -85,6 +84,14 @@ impl ListenTable {
             warn!("socket already listening on port {port}");
             Err(AxError::AddrInUse)
         }
+    }
+
+    pub(crate) fn set_backlog(&self, port: u16, backlog: usize) -> AxResult {
+        let entry = self.listen_entry(port);
+        let mut entry = entry.lock();
+        let entry = entry.as_mut().ok_or(AxError::InvalidInput)?;
+        entry.queue_limit = backlog.clamp(1, LISTEN_QUEUE_SIZE);
+        Ok(())
     }
 
     pub fn unlisten(&self, port: u16) {
@@ -158,16 +165,16 @@ impl ListenTable {
             {
                 return;
             }
-            if entry.syn_queue.len() >= LISTEN_QUEUE_SIZE {
+            if entry.syn_queue.len() >= entry.queue_limit {
                 // SYN queue is full, drop the packet
                 warn!("SYN queue overflow!");
                 return;
             }
 
-            let mut socket = smoltcp::socket::tcp::Socket::new(
-                SocketBuffer::new(vec![0; TCP_RX_BUF_LEN]),
-                SocketBuffer::new(vec![0; TCP_TX_BUF_LEN]),
-            );
+            let Ok(mut socket) = new_tcp_socket() else {
+                warn!("Failed to allocate TCP buffers for an incoming connection");
+                return;
+            };
             if let Err(err) = socket.listen(entry.listen_endpoint) {
                 warn!("Failed to listen on {}: {:?}", entry.listen_endpoint, err);
                 return;
@@ -191,4 +198,29 @@ fn is_connected(handle: SocketHandle, socket_set: &SocketSetWrapper) -> bool {
 fn is_closed(handle: SocketHandle, socket_set: &SocketSetWrapper) -> bool {
     socket_set
         .with_socket::<tcp::Socket, _, _>(handle, |socket| matches!(socket.state(), State::Closed))
+}
+
+#[cfg(test)]
+mod tests {
+    use smoltcp::wire::Ipv4Address;
+
+    use super::*;
+
+    #[test]
+    fn listen_backlog_is_nonzero_and_bounded() {
+        let endpoint = IpListenEndpoint {
+            addr: Some(Ipv4Address::LOCALHOST.into()),
+            port: 1234,
+        };
+        let empty = alloc::sync::Weak::<SocketSetWrapper<'static>>::new();
+
+        assert_eq!(
+            ListenTableEntryInner::new(endpoint, 0, empty.clone()).queue_limit,
+            1
+        );
+        assert_eq!(
+            ListenTableEntryInner::new(endpoint, usize::MAX, empty).queue_limit,
+            LISTEN_QUEUE_SIZE
+        );
+    }
 }

@@ -19,18 +19,46 @@ impl<'a> ELFHeadersBuilder<'a> {
         }))
     }
 
-    pub fn ph_range(&self) -> Range<u64> {
+    pub fn ph_range(&self) -> Option<Range<u64>> {
         let start = self.0.header.pt2.ph_offset();
-        let size = self.0.header.pt2.ph_entry_size() as u64 * self.0.header.pt2.ph_count() as u64;
-        start..start + size
+        let entry_size = self.expected_ph_entry_size()?;
+        if self.0.header.pt2.ph_entry_size() as usize != entry_size {
+            return None;
+        }
+        let size = (entry_size as u64)
+            .checked_mul(self.0.header.pt2.ph_count() as u64)?;
+        Some(start..start.checked_add(size)?)
+    }
+
+    fn expected_ph_entry_size(&self) -> Option<usize> {
+        match self.0.header.pt1.class() {
+            Class::ThirtyTwo => Some(core::mem::size_of::<ProgramHeader32>()),
+            Class::SixtyFour => Some(core::mem::size_of::<ProgramHeader64>()),
+            Class::None | Class::Other(_) => None,
+        }
     }
 
     pub fn build(mut self, ph: &[u8]) -> Result<ELFHeaders<'a>, &'static str> {
+        let entry_size = self.0.header.pt2.ph_entry_size() as usize;
+        let expected_entry_size = self
+            .expected_ph_entry_size()
+            .ok_or("unsupported ELF class")?;
+        if entry_size != expected_entry_size {
+            return Err("invalid program header entry size");
+        }
+        let expected_len = entry_size
+            .checked_mul(self.0.header.pt2.ph_count() as usize)
+            .ok_or("program header table is too large")?;
+        if ph.len() != expected_len {
+            return Err("incomplete program header table");
+        }
+
         self.0.ph = ph
-            .chunks_exact(self.0.header.pt2.ph_entry_size() as usize)
+            .chunks_exact(entry_size)
             .map(|chunk| match self.0.header.pt1.class() {
                 Class::ThirtyTwo => {
-                    let ph: &ProgramHeader32 = zero::read(chunk);
+                    // The entry size was validated above; ELF permits byte-aligned tables.
+                    let ph = unsafe { chunk.as_ptr().cast::<ProgramHeader32>().read_unaligned() };
                     ProgramHeader64 {
                         type_: ph.type_,
                         offset: ph.offset as _,
@@ -42,7 +70,10 @@ impl<'a> ELFHeadersBuilder<'a> {
                         align: ph.align as _,
                     }
                 }
-                Class::SixtyFour => *zero::read(chunk),
+                // ProgramHeader64 contains only integer fields and accepts every bit pattern.
+                Class::SixtyFour => unsafe {
+                    chunk.as_ptr().cast::<ProgramHeader64>().read_unaligned()
+                },
                 Class::None | Class::Other(_) => unreachable!(),
             })
             .collect();
@@ -60,6 +91,8 @@ pub struct ELFParser<'a> {
     headers: &'a ELFHeaders<'a>,
     /// Base address of the ELF file loaded into the memory.
     base: usize,
+    entry: usize,
+    phdr: usize,
 }
 
 impl<'a> ELFParser<'a> {
@@ -70,13 +103,38 @@ impl<'a> ELFParser<'a> {
         } else {
             0
         };
-        Ok(Self { headers, base })
+        let entry = usize::try_from(headers.header.pt2.entry_point())
+            .ok()
+            .and_then(|entry| entry.checked_add(base))
+            .ok_or("ELF entry address overflow")?;
+        let ph_offset = headers.header.pt2.ph_offset();
+        let phdr = headers
+            .ph
+            .iter()
+            .find_map(|header| {
+                let file_end = header.offset.checked_add(header.file_size)?;
+                (header.offset..file_end)
+                    .contains(&ph_offset)
+                    .then(|| {
+                        ph_offset
+                            .checked_sub(header.offset)?
+                            .checked_add(header.virtual_addr)?
+                            .checked_add(u64::try_from(base).ok()?)
+                    })?
+            })
+            .and_then(|address| usize::try_from(address).ok())
+            .ok_or("program header table is not mapped")?;
+        Ok(Self {
+            headers,
+            base,
+            entry,
+            phdr,
+        })
     }
 
     /// The entry point of the ELF file.
     pub fn entry(&self) -> usize {
-        // TODO: base_load_address_offset?
-        self.headers.header.pt2.entry_point() as usize + self.base
+        self.entry
     }
 
     /// The number of program headers in the ELF file.
@@ -91,16 +149,7 @@ impl<'a> ELFParser<'a> {
 
     /// The offset of the program header table in the ELF file.
     pub fn phdr(&self) -> usize {
-        let ph_offset = self.headers.header.pt2.ph_offset() as usize;
-        let header = self
-            .headers
-            .ph
-            .iter()
-            .find(|header| {
-                (header.offset..header.offset + header.file_size).contains(&(ph_offset as u64))
-            })
-            .expect("can not find program header table address in elf");
-        ph_offset - header.offset as usize + header.virtual_addr as usize + self.base
+        self.phdr
     }
 
     /// The base address of the ELF file loaded into the memory.

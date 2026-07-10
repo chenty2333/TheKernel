@@ -325,7 +325,7 @@ pub fn call_helper(
         BPF_FUNC_RINGBUF_DISCARD => helper_ringbuf_discard(r1, r2, hctx),
         BPF_FUNC_TRACE_PRINTK => helper_trace_printk(r1, r2, r3, r4, r5, hctx),
         BPF_FUNC_GET_PRANDOM_U32 => Ok(helper_get_prandom_u32()),
-        BPF_FUNC_GET_SMP_PROCESSOR_ID => Ok(0), // unikernel: always CPU 0
+        BPF_FUNC_GET_SMP_PROCESSOR_ID => Ok(axhal::percpu::this_cpu_id() as u64),
         _ => Ok(helper_error()),
     }
 }

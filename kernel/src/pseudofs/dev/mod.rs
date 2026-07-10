@@ -11,41 +11,32 @@ mod memtrack;
 mod rtc;
 pub mod tty;
 
-use alloc::{borrow::Cow, boxed::Box, format, string::String, sync::Arc};
-use core::{
-    any::Any,
-    sync::atomic::{AtomicU32, Ordering},
-};
+use alloc::{format, string::String, sync::Arc};
+use core::any::Any;
 
+use axdriver::{
+    SharedBlockDevice,
+    prelude::{BlockDriverOps, DevError},
+};
 use axerrno::AxError;
 use axfs::BlockDeviceInfo;
-use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodeType, VfsError, VfsResult};
-use axsync::Mutex;
-use linux_raw_sys::ioctl::{
-    BLKGETSIZE, BLKGETSIZE64, BLKRAGET, BLKRASET, BLKROGET, BLKROSET, BLKSSZGET, RNDGETENTCNT,
-    TUNGETFEATURES,
+use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodePermission, NodeType, VfsResult};
+use axtask::current;
+use linux_raw_sys::{
+    general::CAP_SYS_ADMIN,
+    ioctl::{
+        BLKGETSIZE, BLKGETSIZE64, BLKRAGET, BLKRASET, BLKROGET, BLKROSET, BLKSSZGET, RNDGETENTCNT,
+    },
 };
 #[cfg(feature = "dev-log")]
 pub use log::bind_dev_log;
-use rand::{Rng, SeedableRng, rngs::SmallRng};
 use starry_vm::{VmMutPtr, VmPtr};
 
-use crate::pseudofs::{
-    Device, DeviceMmap, DeviceOps, DirMaker, DirMapping, NodeOpsMux, SimpleDir, SimpleDirOps,
-    SimpleFs,
+use crate::{
+    mounts,
+    pseudofs::{Device, DeviceMmap, DeviceOps, DirMaker, DirMapping, SimpleDir, SimpleFs},
+    task::AsThread,
 };
-
-const RANDOM_SEED: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
-pub(crate) const RANDOM_ENTROPY_BITS: i32 = 256;
-const IFF_TUN: u32 = 0x0001;
-const IFF_TAP: u32 = 0x0002;
-const IFF_NAPI: u32 = 0x0010;
-const IFF_NAPI_FRAGS: u32 = 0x0020;
-const IFF_NO_CARRIER: u32 = 0x0040;
-const IFF_MULTI_QUEUE: u32 = 0x0100;
-const IFF_NO_PI: u32 = 0x1000;
-const IFF_ONE_QUEUE: u32 = 0x2000;
-const IFF_VNET_HDR: u32 = 0x4000;
 
 pub(crate) fn new_devfs() -> Filesystem {
     SimpleFs::new_with("devfs".into(), 0x01021994, builder)
@@ -96,32 +87,22 @@ impl DeviceOps for Zero {
     }
 }
 
-struct Random {
-    rng: Mutex<SmallRng>,
-}
-
-impl Random {
-    pub fn new() -> Self {
-        Self {
-            rng: Mutex::new(SmallRng::from_seed(*RANDOM_SEED)),
-        }
-    }
-}
+struct Random;
 
 impl DeviceOps for Random {
     fn read_at(&self, buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
-        self.rng.lock().fill_bytes(buf);
+        crate::random::fill_secure(buf)?;
         Ok(buf.len())
     }
 
-    fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        Ok(buf.len())
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        Err(AxError::OperationNotSupported)
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
             RNDGETENTCNT => {
-                (arg as *mut i32).vm_write(RANDOM_ENTROPY_BITS)?;
+                (arg as *mut i32).vm_write(crate::random::entropy_bits())?;
                 Ok(0)
             }
             _ => Err(AxError::NotATty),
@@ -161,20 +142,29 @@ impl DeviceOps for Full {
 struct BlockDevice {
     name: String,
     info: BlockDeviceInfo,
-    ra: AtomicU32,
+    device: SharedBlockDevice,
 }
 
 impl BlockDevice {
-    fn new(name: String, info: BlockDeviceInfo) -> Self {
-        Self {
-            name,
-            info,
-            ra: AtomicU32::new(512),
-        }
+    fn new(name: String, info: BlockDeviceInfo, device: SharedBlockDevice) -> Self {
+        Self { name, info, device }
     }
 
     fn read_only(&self) -> bool {
         axfs::block_device_is_read_only(&self.name).unwrap_or(false)
+    }
+
+    fn map_error(err: DevError) -> AxError {
+        match err {
+            DevError::AlreadyExists => AxError::AlreadyExists,
+            DevError::Again => AxError::WouldBlock,
+            DevError::BadState => AxError::BadState,
+            DevError::InvalidParam => AxError::InvalidInput,
+            DevError::Io => AxError::Io,
+            DevError::NoMemory => AxError::NoMemory,
+            DevError::ResourceBusy => AxError::ResourceBusy,
+            DevError::Unsupported => AxError::OperationNotSupported,
+        }
     }
 }
 
@@ -183,14 +173,20 @@ impl DeviceOps for BlockDevice {
         if buf.is_empty() || offset >= self.info.byte_len() {
             return Ok(0);
         }
-        Err(AxError::InvalidInput)
+        self.device.read_at(offset, buf).map_err(Self::map_error)
     }
 
-    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+    fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         if self.read_only() {
             return Err(AxError::ReadOnlyFilesystem);
         }
-        Err(AxError::InvalidInput)
+        if offset >= self.info.byte_len() {
+            return Err(AxError::StorageFull);
+        }
+        self.device.write_at(offset, buf).map_err(Self::map_error)
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
@@ -209,22 +205,30 @@ impl DeviceOps for BlockDevice {
                 (arg as *mut u32).vm_write(self.read_only() as u32)?;
             }
             BLKROSET => {
+                if !current()
+                    .as_thread()
+                    .proc_data
+                    .has_effective_capability(CAP_SYS_ADMIN)
+                {
+                    return Err(AxError::PermissionDenied);
+                }
                 let ro = (arg as *const u32).vm_read()?;
                 if ro != 0 && ro != 1 {
                     return Err(AxError::InvalidInput);
                 }
-                axfs::set_block_device_read_only(&self.name, ro != 0)
-                    .map_err(|_| AxError::NoSuchDevice)?;
+                axfs::set_block_device_read_only(&self.name, ro != 0).map_err(|err| match err {
+                    axfs::OpenBlockDeviceError::NotFound => AxError::NoSuchDevice,
+                    axfs::OpenBlockDeviceError::Busy => AxError::ResourceBusy,
+                })?;
             }
-            BLKRAGET => {
-                (arg as *mut usize).vm_write(self.ra.load(Ordering::Relaxed) as usize)?;
-            }
-            BLKRASET => {
-                self.ra.store(arg as u32, Ordering::Relaxed);
-            }
+            BLKRAGET | BLKRASET => return Err(AxError::OperationNotSupported),
             _ => return Err(AxError::NotATty),
         }
         Ok(0)
+    }
+
+    fn sync(&self, _data_only: bool) -> VfsResult<()> {
+        self.device.lock().flush().map_err(Self::map_error)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -237,108 +241,6 @@ impl DeviceOps for BlockDevice {
 
     fn flags(&self) -> NodeFlags {
         NodeFlags::NON_CACHEABLE
-    }
-}
-
-struct LoopPartitionDevices {
-    fs: Arc<SimpleFs>,
-}
-
-impl LoopPartitionDevices {
-    fn parse_name(name: &str) -> Option<(u32, u32)> {
-        let rest = name.strip_prefix("loop")?;
-        let (number, partition) = rest.split_once('p')?;
-        Some((number.parse().ok()?, partition.parse().ok()?))
-    }
-}
-
-impl SimpleDirOps for LoopPartitionDevices {
-    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
-        Box::new((0..16).flat_map(|number| {
-            (1..=r#loop::partition_count(number))
-                .map(move |partition| Cow::Owned(format!("loop{number}p{partition}")))
-        }))
-    }
-
-    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
-        let (number, partition) = Self::parse_name(name).ok_or(VfsError::NotFound)?;
-        if number >= 16 || !r#loop::partition_visible(number, partition) {
-            return Err(VfsError::NotFound);
-        }
-
-        let dev_id = DeviceId::new(7, 256 * partition + number);
-        Ok(NodeOpsMux::File(Device::new(
-            self.fs.clone(),
-            NodeType::BlockDevice,
-            dev_id,
-            Arc::new(r#loop::LoopDevice::new(number, dev_id)),
-        )))
-    }
-
-    fn is_cacheable(&self) -> bool {
-        false
-    }
-}
-
-struct CpuDmaLatency;
-
-impl DeviceOps for CpuDmaLatency {
-    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
-        Err(AxError::InvalidInput)
-    }
-
-    fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        Ok(buf.len())
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn flags(&self) -> NodeFlags {
-        NodeFlags::NON_CACHEABLE
-    }
-}
-
-struct Tun;
-
-impl Tun {
-    const FEATURES: u32 = IFF_TUN
-        | IFF_TAP
-        | IFF_NO_CARRIER
-        | IFF_NO_PI
-        | IFF_ONE_QUEUE
-        | IFF_VNET_HDR
-        | IFF_MULTI_QUEUE
-        | IFF_NAPI
-        | IFF_NAPI_FRAGS;
-}
-
-impl DeviceOps for Tun {
-    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
-        Err(AxError::InvalidInput)
-    }
-
-    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        Err(AxError::InvalidInput)
-    }
-
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
-        match cmd {
-            TUNGETFEATURES => {
-                (arg as *mut u32).vm_write(Self::FEATURES)?;
-                Ok(0)
-            }
-            _ => Err(AxError::NotATty),
-        }
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn flags(&self) -> NodeFlags {
-        NodeFlags::NON_CACHEABLE | NodeFlags::STREAM
     }
 }
 
@@ -377,7 +279,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             fs.clone(),
             NodeType::CharacterDevice,
             DeviceId::new(1, 8),
-            Arc::new(Random::new()),
+            Arc::new(Random),
         ),
     );
     root.add(
@@ -386,7 +288,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             fs.clone(),
             NodeType::CharacterDevice,
             DeviceId::new(1, 9),
-            Arc::new(Random::new()),
+            Arc::new(Random),
         ),
     );
     root.add(
@@ -459,30 +361,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         ),
     );
 
-    root.add("net", {
-        let mut net = DirMapping::new();
-        net.add(
-            "tun",
-            Device::new(
-                fs.clone(),
-                NodeType::CharacterDevice,
-                DeviceId::new(10, 200),
-                Arc::new(Tun),
-            ),
-        );
-        SimpleDir::new_maker(fs.clone(), Arc::new(net))
-    });
-
-    root.add(
-        "cpu_dma_latency",
-        Device::new(
-            fs.clone(),
-            NodeType::CharacterDevice,
-            DeviceId::new(10, 1024),
-            Arc::new(CpuDmaLatency),
-        ),
-    );
-
     // This is mounted to a tmpfs in `new_procfs`
     root.add(
         "shm",
@@ -512,17 +390,44 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         );
     }
 
+    if let (Some(info), Ok(device)) = (
+        axfs::root_block_device_info(),
+        axfs::raw_block_device(axfs::ROOT_BLOCK_DEVICE_NAME),
+    ) {
+        root.add(
+            axfs::ROOT_BLOCK_DEVICE_NAME,
+            Device::new_with_permissions(
+                fs.clone(),
+                NodeType::BlockDevice,
+                mounts::ROOT_BLOCK_DEVICE_ID,
+                NodePermission::from_bits_truncate(0o600),
+                Arc::new(BlockDevice::new(
+                    axfs::ROOT_BLOCK_DEVICE_NAME.into(),
+                    info,
+                    device,
+                )),
+            ),
+        );
+    }
+
     for (index, name) in axfs::block_device_names().into_iter().enumerate() {
         let Some(info) = axfs::block_device_info(&name) else {
             continue;
         };
+        let Ok(device) = axfs::raw_block_device(&name) else {
+            continue;
+        };
+        let Some(dev_id) = mounts::extra_block_device_id(index) else {
+            continue;
+        };
         root.add(
             name.clone(),
-            Device::new(
+            Device::new_with_permissions(
                 fs.clone(),
                 NodeType::BlockDevice,
-                DeviceId::new(8, 16 + index as u32),
-                Arc::new(BlockDevice::new(name, info)),
+                dev_id,
+                NodePermission::from_bits_truncate(0o600),
+                Arc::new(BlockDevice::new(name, info, device)),
             ),
         );
     }
@@ -534,6 +439,5 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         SimpleDir::new_maker(fs.clone(), Arc::new(event::input_devices(fs.clone()))),
     );
 
-    let root = root.chain(LoopPartitionDevices { fs: fs.clone() });
     SimpleDir::new_maker(fs, Arc::new(root))
 }

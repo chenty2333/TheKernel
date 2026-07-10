@@ -4,6 +4,7 @@ use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::{
     future::poll_fn,
     mem::MaybeUninit,
+    sync::atomic::{AtomicU64, Ordering},
     task::{Context, Poll},
 };
 
@@ -46,6 +47,11 @@ percpu_static! {
 }
 
 const MIB: usize = 1024 * 1024;
+static IDLE_TICKS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn idle_ticks() -> u64 {
+    IDLE_TICKS.load(Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct StackCacheKey {
@@ -445,7 +451,9 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
             curr.set_preempt_pending(true);
             return;
         }
-        if !curr.is_idle() && self.inner.scheduler.lock().task_tick(curr) {
+        if curr.is_idle() {
+            IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
+        } else if self.inner.scheduler.lock().task_tick(curr) {
             #[cfg(feature = "preempt")]
             curr.set_preempt_pending(true);
         }

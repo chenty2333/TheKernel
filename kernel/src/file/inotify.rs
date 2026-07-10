@@ -35,7 +35,7 @@ use starry_signal::{SignalInfo, Signo};
 use starry_vm::VmMutPtr;
 
 use crate::{
-    file::{Directory, File, FileLike, IoDst, get_file_like},
+    file::{Directory, File, FileLike, IoDst, Kstat, get_file_like},
     task::{AsThread, send_signal_to_process},
 };
 
@@ -243,6 +243,10 @@ fn remove_watch_locked(state: &mut InotifyState, wd: i32) -> AxResult<()> {
 }
 
 impl FileLike for InotifyFile {
+    fn stat(&self) -> AxResult<Kstat> {
+        Ok(super::anon_inode_stat())
+    }
+
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
         block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
             let mut state = self.state.lock();

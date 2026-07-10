@@ -3,16 +3,13 @@ use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::{Location, NodeType, path::Path};
-use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, CAP_SYS_ADMIN};
 use starry_vm::vm_write_slice;
 
 use super::ctl::validate_pathname;
 use crate::{
-    file::{
-        ResolveAtResult, inode_flags, is_path_only_fd, permission::check_writable_mount, resolve_at,
-    },
+    file::{ResolveAtResult, is_path_only_fd, permission::check_writable_mount, resolve_at},
     mm::{UserConstPtr, vm_load_string},
     pseudofs::tmp,
     task::AsThread,
@@ -22,15 +19,6 @@ const XATTR_CREATE: u32 = 0x1;
 const XATTR_REPLACE: u32 = 0x2;
 const XATTR_NAME_MAX: usize = 255;
 const XATTR_SIZE_MAX: usize = 65536;
-
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-struct XattrKey {
-    device: u64,
-    inode: u64,
-}
-
-static GENERIC_XATTRS: Mutex<BTreeMap<XattrKey, BTreeMap<String, Vec<u8>>>> =
-    Mutex::new(BTreeMap::new());
 
 fn validate_xattr_name(name: &str) -> AxResult<()> {
     if name.is_empty() || name.len() > XATTR_NAME_MAX {
@@ -157,6 +145,16 @@ fn set_map_xattr(
         _ => return Err(AxError::InvalidInput),
     }
 
+    let current = map.get(name).map_or(0, |old| name.len() + 1 + old.len());
+    let used = map
+        .iter()
+        .map(|(name, value)| name.len() + 1 + value.len())
+        .sum::<usize>()
+        .saturating_sub(current);
+    if used.saturating_add(name.len() + 1 + value.len()) > XATTR_SIZE_MAX {
+        return Err(LinuxError::ENOSPC.into());
+    }
+
     map.insert(name.into(), value);
     Ok(())
 }
@@ -186,23 +184,13 @@ fn list_map_xattrs(
 fn set_location_xattr(loc: &Location, name: &str, value: Vec<u8>, flags: u32) -> AxResult<()> {
     check_namespace_access(loc, name, true)?;
     check_writable_mount(loc)?;
-    inode_flags::check_xattr_update(loc)?;
 
     if let Some(store) = tmp::xattr_store(loc) {
         let mut map = store.lock();
         return set_map_xattr(&mut map, name, value, flags);
     }
 
-    let key = XattrKey {
-        device: loc.mountpoint().device(),
-        inode: loc.inode(),
-    };
-    let mut stores = GENERIC_XATTRS.lock();
-    {
-        let map = stores.entry(key).or_default();
-        set_map_xattr(map, name, value, flags)?;
-    }
-    Ok(())
+    Err(LinuxError::EOPNOTSUPP.into())
 }
 
 fn get_location_xattr(loc: &Location, name: &str) -> AxResult<Vec<u8>> {
@@ -213,39 +201,23 @@ fn get_location_xattr(loc: &Location, name: &str) -> AxResult<Vec<u8>> {
         return get_map_xattr(&map, name);
     }
 
-    let key = XattrKey {
-        device: loc.mountpoint().device(),
-        inode: loc.inode(),
-    };
-    let stores = GENERIC_XATTRS.lock();
-    let map = stores
-        .get(&key)
-        .ok_or_else(|| AxError::from(LinuxError::ENODATA))?;
-    get_map_xattr(map, name)
+    Err(LinuxError::EOPNOTSUPP.into())
 }
 
-fn list_location_xattrs(loc: &Location) -> Vec<u8> {
+fn list_location_xattrs(loc: &Location) -> AxResult<Vec<u8>> {
     let can_access_trusted = current_can_access_trusted_xattrs();
 
     if let Some(store) = tmp::xattr_store(loc) {
         let map = store.lock();
-        return list_map_xattrs(loc, &map, can_access_trusted);
+        return Ok(list_map_xattrs(loc, &map, can_access_trusted));
     }
 
-    let key = XattrKey {
-        device: loc.mountpoint().device(),
-        inode: loc.inode(),
-    };
-    let stores = GENERIC_XATTRS.lock();
-    stores.get(&key).map_or_else(Vec::new, |map| {
-        list_map_xattrs(loc, map, can_access_trusted)
-    })
+    Err(LinuxError::EOPNOTSUPP.into())
 }
 
 fn remove_location_xattr(loc: &Location, name: &str) -> AxResult<()> {
     check_namespace_access(loc, name, true)?;
     check_writable_mount(loc)?;
-    inode_flags::check_xattr_update(loc)?;
 
     if let Some(store) = tmp::xattr_store(loc) {
         let mut map = store.lock();
@@ -255,37 +227,7 @@ fn remove_location_xattr(loc: &Location, name: &str) -> AxResult<()> {
         return Ok(());
     }
 
-    let key = XattrKey {
-        device: loc.mountpoint().device(),
-        inode: loc.inode(),
-    };
-    let mut stores = GENERIC_XATTRS.lock();
-    let should_remove_key = {
-        let map = stores
-            .get_mut(&key)
-            .ok_or_else(|| AxError::from(LinuxError::ENODATA))?;
-        if map.remove(name).is_none() {
-            return Err(LinuxError::ENODATA.into());
-        }
-        map.is_empty()
-    };
-    if should_remove_key {
-        stores.remove(&key);
-    }
-    Ok(())
-}
-
-pub(crate) fn clear_location_xattrs(loc: &Location) {
-    if let Some(store) = tmp::xattr_store(loc) {
-        store.lock().clear();
-        return;
-    }
-
-    let key = XattrKey {
-        device: loc.mountpoint().device(),
-        inode: loc.inode(),
-    };
-    GENERIC_XATTRS.lock().remove(&key);
+    Err(LinuxError::EOPNOTSUPP.into())
 }
 
 fn write_xattr_value(buf: *mut u8, size: usize, value: &[u8]) -> AxResult<isize> {
@@ -384,14 +326,14 @@ fn xattr_list_by_path(
     no_follow: bool,
 ) -> AxResult<isize> {
     let loc = resolve_xattr_path(path, no_follow)?;
-    let names = list_location_xattrs(&loc);
+    let names = list_location_xattrs(&loc)?;
     write_xattr_list(list, size, &names)
 }
 
 fn xattr_list_by_fd(fd: i32, list: *mut c_char, size: usize) -> AxResult<isize> {
     check_fd_xattr_access(fd)?;
     let names = match resolve_xattr_fd(fd)? {
-        ResolveAtResult::File(loc) => list_location_xattrs(&loc),
+        ResolveAtResult::File(loc) => list_location_xattrs(&loc)?,
         ResolveAtResult::Other(_) => Vec::new(),
     };
     write_xattr_list(list, size, &names)

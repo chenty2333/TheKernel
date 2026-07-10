@@ -2,7 +2,10 @@ pub(crate) mod dgram;
 pub(crate) mod stream;
 
 use alloc::{boxed::Box, sync::Arc};
-use core::task::Context;
+use core::{
+    sync::atomic::{AtomicBool, Ordering},
+    task::Context,
+};
 
 use async_trait::async_trait;
 use axerrno::{AxError, AxResult};
@@ -42,6 +45,10 @@ pub trait TransportOps: Configurable + Pollable + Send + Sync {
     fn bind(&self, slot: &BindSlot, local_addr: &UnixSocketAddr) -> AxResult;
     /// Connect the transport to a remote address.
     fn connect(&self, slot: &BindSlot, local_addr: &UnixSocketAddr) -> AxResult;
+    /// Start listening with a bounded pending-connection queue.
+    fn listen(&self, _slot: &BindSlot, _backlog: usize) -> AxResult {
+        Err(AxError::OperationNotSupported)
+    }
 
     /// Accept an incoming connection, returning the new transport and peer address.
     async fn accept(&self) -> AxResult<(Transport, UnixSocketAddr)>;
@@ -53,7 +60,7 @@ pub trait TransportOps: Configurable + Pollable + Send + Sync {
 
     /// Shutdown the transport.
     fn shutdown(&self, _how: Shutdown) -> AxResult {
-        Ok(())
+        Err(AxError::OperationNotSupported)
     }
 }
 
@@ -152,6 +159,7 @@ pub struct UnixSocket {
     transport: Transport,
     local_addr: Mutex<UnixSocketAddr>,
     remote_addr: Mutex<UnixSocketAddr>,
+    owns_bind: AtomicBool,
 }
 impl UnixSocket {
     /// Create a new Unix socket with the given transport.
@@ -160,6 +168,7 @@ impl UnixSocket {
             transport: transport.into(),
             local_addr: Mutex::new(UnixSocketAddr::Unnamed),
             remote_addr: Mutex::new(UnixSocketAddr::Unnamed),
+            owns_bind: AtomicBool::new(false),
         }
     }
 
@@ -178,6 +187,10 @@ impl UnixSocket {
     }
 }
 impl Configurable for UnixSocket {
+    fn nonblocking(&self) -> bool {
+        self.transport.nonblocking()
+    }
+
     fn get_option_inner(&self, opt: &mut GetSocketOption) -> AxResult<bool> {
         self.transport.get_option_inner(opt)
     }
@@ -193,6 +206,7 @@ impl SocketOps for UnixSocket {
         if matches!(&*guard, UnixSocketAddr::Unnamed) {
             with_slot_or_insert(&local_addr, |slot| self.transport.bind(slot, &local_addr))?;
             *guard = local_addr;
+            self.owns_bind.store(true, Ordering::Release);
         } else {
             return Err(AxError::InvalidInput);
         }
@@ -214,8 +228,9 @@ impl SocketOps for UnixSocket {
         Ok(())
     }
 
-    fn listen(&self) -> AxResult {
-        Ok(())
+    fn listen(&self, backlog: usize) -> AxResult {
+        let local_addr = self.local_addr.lock().clone();
+        with_slot(&local_addr, |slot| self.transport.listen(slot, backlog))
     }
 
     fn accept(&self) -> AxResult<Socket> {
@@ -224,6 +239,7 @@ impl SocketOps for UnixSocket {
             transport,
             local_addr: Mutex::new(self.local_addr.lock().clone()),
             remote_addr: Mutex::new(peer_addr),
+            owns_bind: AtomicBool::new(false),
         }))
     }
 
@@ -248,6 +264,17 @@ impl SocketOps for UnixSocket {
     }
 }
 
+impl Drop for UnixSocket {
+    fn drop(&mut self) {
+        if !self.owns_bind.load(Ordering::Acquire) {
+            return;
+        }
+        if let UnixSocketAddr::Abstract(name) = &*self.local_addr.lock() {
+            ABSTRACT_BINDS.lock().remove(name);
+        }
+    }
+}
+
 impl Pollable for UnixSocket {
     fn poll(&self) -> IoEvents {
         self.transport.poll()
@@ -255,5 +282,28 @@ impl Pollable for UnixSocket {
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {
         self.transport.register(context, events);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abstract_binding_is_released_with_its_owner() {
+        let name: Arc<[u8]> = Arc::from(&b"axnet-ng-drop-test"[..]);
+        ABSTRACT_BINDS
+            .lock()
+            .insert(name.clone(), BindSlot::default());
+
+        let socket = UnixSocket {
+            transport: DgramTransport::new().into(),
+            local_addr: Mutex::new(UnixSocketAddr::Abstract(name.clone())),
+            remote_addr: Mutex::new(UnixSocketAddr::Unnamed),
+            owns_bind: AtomicBool::new(true),
+        };
+        drop(socket);
+
+        assert!(!ABSTRACT_BINDS.lock().contains_key(&name));
     }
 }

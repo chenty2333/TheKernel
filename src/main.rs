@@ -23,11 +23,7 @@ fn main() {
         .copied()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let envs = ENVS
-        .iter()
-        .copied()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+    let envs = ENVS.iter().copied().map(str::to_owned).collect::<Vec<_>>();
 
     starry_kernel::entry::init(&args, &envs);
 }

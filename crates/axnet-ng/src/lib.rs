@@ -17,6 +17,7 @@
 extern crate log;
 extern crate alloc;
 
+mod buffer;
 mod consts;
 mod device;
 mod general;
@@ -44,6 +45,7 @@ use alloc::{borrow::ToOwned, boxed::Box, sync::Arc};
 
 use axdriver::{AxDeviceContainer, prelude::*};
 use smoltcp::wire::{EthernetAddress, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr};
+pub use smoltcp::wire::{IpAddress, IpCidr};
 use spin::Once;
 
 use self::{
@@ -54,7 +56,12 @@ use self::{
     service::Service,
     wrapper::SocketSetWrapper,
 };
-pub use self::{device::VethEnd, net_stack::NetStack, router::Rule, socket::*};
+pub use self::{
+    device::{DeviceStats, InterfaceInfo, InterfaceKind, VethEnd},
+    net_stack::NetStack,
+    router::{RouteInfo, Rule},
+    socket::*,
+};
 
 static DEFAULT_STACK: Once<Arc<NetStack>> = Once::new();
 

@@ -1,16 +1,22 @@
 //! Driver for VirtIO input devices.
 
-use super::common::Feature;
-use crate::hal::Hal;
-use crate::queue::VirtQueue;
-use crate::transport::Transport;
-use crate::volatile::{volread, volwrite, ReadOnly, VolatileReadable, WriteOnly};
-use crate::Error;
 use alloc::{boxed::Box, string::String};
-use core::cmp::min;
-use core::mem::size_of;
-use core::ptr::{addr_of, NonNull};
+use core::{
+    cmp::min,
+    mem::size_of,
+    ptr::{NonNull, addr_of},
+};
+
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
+
+use super::common::Feature;
+use crate::{
+    Error,
+    hal::Hal,
+    queue::VirtQueue,
+    transport::Transport,
+    volatile::{ReadOnly, VolatileReadable, WriteOnly, volread, volwrite},
+};
 
 /// Virtual human interface devices such as keyboards, mice and tablets.
 ///
@@ -232,7 +238,7 @@ const CONFIG_DATA_MAX_LENGTH: usize = 128;
 #[derive(Debug, Clone, Copy)]
 pub enum InputConfigSelect {
     /// Returns the name of the device, in u.string. subsel is zero.
-    IdName = 0x01,
+    IdName   = 0x01,
     /// Returns the serial number of the device, in u.string. subsel is zero.
     IdSerial = 0x02,
     /// Returns ID information of the device, in u.ids. subsel is zero.
@@ -246,10 +252,10 @@ pub enum InputConfigSelect {
     /// and a bitmap of supported event codes is returned in u.bitmap. Individual
     /// bits in the bitmap correspond to implementation-defined input event codes,
     /// for example keys or pointing device axes.
-    EvBits = 0x11,
+    EvBits   = 0x11,
     /// subsel specifies the absolute axis using ABS_* constants in the underlying
     /// evdev implementation. Information about the axis will be returned in u.abs.
-    AbsInfo = 0x12,
+    AbsInfo  = 0x12,
 }
 
 #[repr(C)]
@@ -313,17 +319,18 @@ const QUEUE_SIZE: usize = 32;
 
 #[cfg(test)]
 mod tests {
+    use alloc::{sync::Arc, vec};
+    use core::convert::TryInto;
+    use std::sync::Mutex;
+
     use super::*;
     use crate::{
         hal::fake::FakeHal,
         transport::{
-            fake::{FakeTransport, QueueStatus, State},
             DeviceType,
+            fake::{FakeTransport, QueueStatus, State},
         },
     };
-    use alloc::{sync::Arc, vec};
-    use core::convert::TryInto;
-    use std::sync::Mutex;
 
     #[test]
     fn config() {

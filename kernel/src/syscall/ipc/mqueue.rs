@@ -21,8 +21,8 @@ use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use crate::{
     file::{
-        FileHandle, FileLike, Kstat, NetlinkSocket, add_file_like_with_flags, get_file_description,
-        get_typed_file,
+        FileHandle, FileLike, Kstat, NetlinkSocket, PseudoInode, add_file_like_with_flags,
+        get_file_description, get_typed_file,
     },
     mm::vm_load_string,
     task::{
@@ -43,6 +43,7 @@ const MQ_NAME_MAX: usize = 255;
 const NOTIFY_COOKIE_LEN: usize = 32;
 const NOTIFY_WOKENUP: u8 = 1;
 const NOTIFY_REMOVED: u8 = 2;
+const MQ_INODE_SIZE: u64 = 80;
 
 static MQ_MANAGER: Mutex<MqManager> = Mutex::new(MqManager::new());
 static MQ_QUEUES_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_QUEUES_MAX);
@@ -82,6 +83,7 @@ struct MqNotifier {
 }
 
 struct PosixMqueue {
+    inode: PseudoInode,
     name: String,
     mode: __kernel_mode_t,
     uid: u32,
@@ -122,6 +124,7 @@ impl MqManager {
 impl PosixMqueue {
     fn new(name: String, mode: __kernel_mode_t, uid: u32, gid: u32, attr: MqAttr) -> Self {
         Self {
+            inode: PseudoInode::mqueue(mode, uid, gid),
             name,
             mode,
             uid,
@@ -207,17 +210,16 @@ impl MqFd {
 impl FileLike for MqFd {
     fn stat(&self) -> AxResult<Kstat> {
         let queue = self.queue.lock();
-        Ok(Kstat {
-            mode: linux_raw_sys::general::S_IFREG | (queue.mode & 0o777),
-            uid: queue.uid,
-            gid: queue.gid,
-            size: queue.messages.len() as u64,
-            ..Kstat::default()
-        })
+        let mut stat = queue.inode.stat();
+        stat.mode = linux_raw_sys::general::S_IFREG | (queue.mode & 0o777);
+        stat.uid = queue.uid;
+        stat.gid = queue.gid;
+        stat.size = MQ_INODE_SIZE;
+        Ok(stat)
     }
 
     fn path(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("mqueue:{}", self.queue.lock().name))
+        Cow::Owned(format!("/{}", self.queue.lock().name))
     }
 
     fn nonblocking(&self) -> bool {

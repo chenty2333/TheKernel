@@ -13,17 +13,18 @@ extern crate alloc;
 #[macro_use]
 extern crate log;
 
-use alloc::{format, string::String, vec::Vec};
+use alloc::{format, string::String, sync::Arc, vec::Vec};
 use core::{
     fmt::Write as _,
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use axdriver::{AxBlockDevice, AxDeviceContainer, prelude::*};
+use axdriver::{AxBlockDevice, AxDeviceContainer, SharedBlockDevice, prelude::*};
 use axsync::Mutex;
 use spin::Once;
 
 mod fs;
+pub use fs::FatMountOptions;
 
 mod highlevel;
 pub use highlevel::*;
@@ -428,14 +429,38 @@ pub fn render_io_stats_counters() -> String {
 
 struct RegisteredBlockDevice {
     name: String,
-    device: Option<AxBlockDevice>,
+    device: SharedBlockDevice,
     info: BlockDeviceInfo,
     read_only: AtomicBool,
+    mounted: Arc<AtomicBool>,
 }
 
+#[derive(Debug)]
 pub enum OpenBlockDeviceError {
     NotFound,
     Busy,
+}
+
+/// A block-device mount claim paired with a shared driver handle.
+///
+/// Raw device users may clone the underlying handle concurrently, while only
+/// one filesystem mount may hold this claim. Dropping the filesystem releases
+/// the claim, including failure paths during filesystem construction.
+pub struct MountedBlockDevice {
+    device: SharedBlockDevice,
+    mounted: Arc<AtomicBool>,
+}
+
+impl MountedBlockDevice {
+    pub(crate) fn device(&self) -> &SharedBlockDevice {
+        &self.device
+    }
+}
+
+impl Drop for MountedBlockDevice {
+    fn drop(&mut self) {
+        self.mounted.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -451,6 +476,9 @@ impl BlockDeviceInfo {
 }
 
 static EXTRA_BLOCK_DEVICES: Once<Mutex<Vec<RegisteredBlockDevice>>> = Once::new();
+static ROOT_BLOCK_DEVICE: Once<RegisteredBlockDevice> = Once::new();
+
+pub const ROOT_BLOCK_DEVICE_NAME: &str = "vda";
 
 fn extra_device_name(index: usize) -> String {
     let letter = (b'a' + index as u8) as char;
@@ -471,6 +499,9 @@ pub fn block_device_names() -> Vec<String> {
 }
 
 pub fn block_device_info(name: &str) -> Option<BlockDeviceInfo> {
+    if name == ROOT_BLOCK_DEVICE_NAME {
+        return ROOT_BLOCK_DEVICE.get().map(|entry| entry.info);
+    }
     let devices = EXTRA_BLOCK_DEVICES.get()?;
     devices
         .lock()
@@ -479,16 +510,37 @@ pub fn block_device_info(name: &str) -> Option<BlockDeviceInfo> {
         .map(|entry| entry.info)
 }
 
+pub fn root_block_device_info() -> Option<BlockDeviceInfo> {
+    ROOT_BLOCK_DEVICE.get().map(|entry| entry.info)
+}
+
 pub fn block_device_is_read_only(name: &str) -> Option<bool> {
+    if name == ROOT_BLOCK_DEVICE_NAME {
+        return ROOT_BLOCK_DEVICE
+            .get()
+            .map(|entry| entry.read_only.load(Ordering::Acquire));
+    }
     let devices = EXTRA_BLOCK_DEVICES.get()?;
     devices
         .lock()
         .iter()
         .find(|entry| entry.name == name)
-        .map(|entry| entry.read_only.load(Ordering::Relaxed))
+        .map(|entry| entry.read_only.load(Ordering::Acquire))
 }
 
 pub fn set_block_device_read_only(name: &str, read_only: bool) -> Result<(), OpenBlockDeviceError> {
+    if name == ROOT_BLOCK_DEVICE_NAME {
+        let entry = ROOT_BLOCK_DEVICE
+            .get()
+            .ok_or(OpenBlockDeviceError::NotFound)?;
+        if entry.read_only.load(Ordering::Acquire) != read_only
+            && entry.mounted.load(Ordering::Acquire)
+        {
+            return Err(OpenBlockDeviceError::Busy);
+        }
+        entry.read_only.store(read_only, Ordering::Release);
+        return Ok(());
+    }
     let devices = EXTRA_BLOCK_DEVICES
         .get()
         .ok_or(OpenBlockDeviceError::NotFound)?;
@@ -497,36 +549,93 @@ pub fn set_block_device_read_only(name: &str, read_only: bool) -> Result<(), Ope
         .iter()
         .find(|entry| entry.name == name)
         .ok_or(OpenBlockDeviceError::NotFound)?;
-    entry.read_only.store(read_only, Ordering::Relaxed);
+    if entry.read_only.load(Ordering::Acquire) != read_only
+        && entry.mounted.load(Ordering::Acquire)
+    {
+        return Err(OpenBlockDeviceError::Busy);
+    }
+    entry.read_only.store(read_only, Ordering::Release);
     Ok(())
 }
 
-pub fn open_block_device(name: &str) -> Result<AxBlockDevice, OpenBlockDeviceError> {
+fn claim_block_device(
+    entry: &RegisteredBlockDevice,
+) -> Result<MountedBlockDevice, OpenBlockDeviceError> {
+    entry
+        .mounted
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| OpenBlockDeviceError::Busy)?;
+    Ok(MountedBlockDevice {
+        device: entry.device.clone(),
+        mounted: entry.mounted.clone(),
+    })
+}
+
+/// Opens a block device for a filesystem mount.
+pub fn open_block_device(name: &str) -> Result<MountedBlockDevice, OpenBlockDeviceError> {
+    if name == ROOT_BLOCK_DEVICE_NAME {
+        let entry = ROOT_BLOCK_DEVICE
+            .get()
+            .ok_or(OpenBlockDeviceError::NotFound)?;
+        return claim_block_device(entry);
+    }
     let devices = EXTRA_BLOCK_DEVICES
         .get()
         .ok_or(OpenBlockDeviceError::NotFound)?;
-    let mut devices = devices.lock();
+    let devices = devices.lock();
     let entry = devices
-        .iter_mut()
+        .iter()
         .find(|entry| entry.name == name)
         .ok_or(OpenBlockDeviceError::NotFound)?;
-    entry.device.take().ok_or(OpenBlockDeviceError::Busy)
+    claim_block_device(entry)
+}
+
+/// Clones a raw-access handle without taking a filesystem mount claim.
+pub fn raw_block_device(name: &str) -> Result<SharedBlockDevice, OpenBlockDeviceError> {
+    if name == ROOT_BLOCK_DEVICE_NAME {
+        return ROOT_BLOCK_DEVICE
+            .get()
+            .map(|entry| entry.device.clone())
+            .ok_or(OpenBlockDeviceError::NotFound);
+    }
+    let devices = EXTRA_BLOCK_DEVICES
+        .get()
+        .ok_or(OpenBlockDeviceError::NotFound)?;
+    devices
+        .lock()
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.device.clone())
+        .ok_or(OpenBlockDeviceError::NotFound)
 }
 
 pub fn with_block_device_mut<R>(
     name: &str,
     f: impl FnOnce(&mut AxBlockDevice) -> R,
 ) -> Result<R, OpenBlockDeviceError> {
+    if name == ROOT_BLOCK_DEVICE_NAME {
+        let entry = ROOT_BLOCK_DEVICE
+            .get()
+            .ok_or(OpenBlockDeviceError::NotFound)?;
+        if entry.mounted.load(Ordering::Acquire) {
+            return Err(OpenBlockDeviceError::Busy);
+        }
+        let mut device = entry.device.lock();
+        return Ok(f(&mut device));
+    }
     let devices = EXTRA_BLOCK_DEVICES
         .get()
         .ok_or(OpenBlockDeviceError::NotFound)?;
-    let mut devices = devices.lock();
+    let devices = devices.lock();
     let entry = devices
-        .iter_mut()
+        .iter()
         .find(|entry| entry.name == name)
         .ok_or(OpenBlockDeviceError::NotFound)?;
-    let dev = entry.device.as_mut().ok_or(OpenBlockDeviceError::Busy)?;
-    Ok(f(dev))
+    if entry.mounted.load(Ordering::Acquire) {
+        return Err(OpenBlockDeviceError::Busy);
+    }
+    let mut device = entry.device.lock();
+    Ok(f(&mut device))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -872,9 +981,17 @@ pub fn async_block_queue_read_selftest() -> Result<(), AsyncBlockQueueSelftestEr
 
 pub fn new_block_filesystem(
     fs_type: &str,
-    dev: AxBlockDevice,
+    dev: MountedBlockDevice,
 ) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::Filesystem> {
-    fs::new_named(fs_type, dev)
+    fs::new_named(fs_type, dev, None)
+}
+
+pub fn new_block_filesystem_with_fat_options(
+    fs_type: &str,
+    dev: MountedBlockDevice,
+    options: FatMountOptions,
+) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::Filesystem> {
+    fs::new_named(fs_type, dev, Some(options))
 }
 
 /// Initializes the filesystem subsystem using the first available block device.
@@ -906,11 +1023,17 @@ pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
         dev.num_blocks()
     );
 
-    let fs = fs::new_default(dev).expect("Failed to initialize filesystem");
-    info!("  filesystem type: {:?}", fs.name());
-
-    let mp = axfs_ng_vfs::Mountpoint::new_root(&fs);
-    ROOT_FS_CONTEXT.call_once(|| FsContext::new(mp.root_location()));
+    let root_device = SharedBlockDevice::new(dev);
+    ROOT_BLOCK_DEVICE.call_once(|| RegisteredBlockDevice {
+        name: ROOT_BLOCK_DEVICE_NAME.into(),
+        info: BlockDeviceInfo {
+            num_blocks: root_device.num_blocks(),
+            block_size: root_device.block_size(),
+        },
+        read_only: AtomicBool::new(false),
+        mounted: Arc::new(AtomicBool::new(false)),
+        device: root_device,
+    });
 
     let mut extras = Vec::new();
     let mut index = 1;
@@ -921,16 +1044,26 @@ pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
             dev.device_name(),
             extra_device_name(index)
         );
+        let device = SharedBlockDevice::new(dev);
         extras.push(RegisteredBlockDevice {
             name: extra_device_name(index),
             info: BlockDeviceInfo {
-                num_blocks: dev.num_blocks(),
-                block_size: dev.block_size(),
+                num_blocks: device.num_blocks(),
+                block_size: device.block_size(),
             },
             read_only: AtomicBool::new(false),
-            device: Some(dev),
+            mounted: Arc::new(AtomicBool::new(false)),
+            device,
         });
         index += 1;
     }
     EXTRA_BLOCK_DEVICES.call_once(|| Mutex::new(extras));
+
+    let root_device = open_block_device(ROOT_BLOCK_DEVICE_NAME)
+        .expect("failed to claim root block device for filesystem mount");
+    let fs = fs::new_default(root_device).expect("Failed to initialize filesystem");
+    info!("  filesystem type: {:?}", fs.name());
+
+    let mp = axfs_ng_vfs::Mountpoint::new_root(&fs);
+    ROOT_FS_CONTEXT.call_once(|| FsContext::new(mp.root_location()));
 }

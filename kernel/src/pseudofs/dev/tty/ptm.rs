@@ -26,15 +26,15 @@ impl Ptmx {
 // tty file and these implementations wouldn't actually be used
 impl DeviceOps for Ptmx {
     fn read_at(&self, _buf: &mut [u8], _offset: u64) -> AxResult<usize> {
-        unreachable!()
+        Err(axerrno::AxError::NotATty)
     }
 
     fn write_at(&self, _buf: &[u8], _offset: u64) -> AxResult<usize> {
-        unreachable!()
+        Err(axerrno::AxError::NotATty)
     }
 
     fn ioctl(&self, _cmd: u32, _arg: usize) -> AxResult<usize> {
-        unreachable!()
+        Err(axerrno::AxError::NotATty)
     }
 
     fn as_any(&self) -> &dyn Any {

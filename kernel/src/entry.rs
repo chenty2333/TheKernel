@@ -30,6 +30,25 @@ pub fn init(args: &[String], envs: &[String]) {
 
     axfs::set_symlink_follow_policy(crate::mounts::should_follow_symlink);
     axfs::set_atime_update_policy(crate::mounts::should_update_atime);
+    {
+        let fs = FS_CONTEXT.lock();
+        let root = fs.root_dir();
+        crate::mounts::register_linux_device(
+            root.mountpoint().device(),
+            crate::mounts::ROOT_BLOCK_DEVICE_ID,
+            root.mountpoint().filesystem_lifetime(),
+        );
+        crate::mounts::record(
+            crate::mounts::ROOT_BLOCK_SOURCE.to_string(),
+            "/".to_string(),
+            root.filesystem().name().to_string(),
+            "/".to_string(),
+            root.mountpoint().device(),
+            root.mountpoint().mount_id(),
+            0,
+            0,
+        );
+    }
     pseudofs::mount_all().expect("Failed to mount pseudofs");
 
     let loc = FS_CONTEXT
@@ -75,8 +94,6 @@ pub fn init(args: &[String], envs: &[String]) {
         UserNamespace::new_root(),
         Arc::new(UtsNamespace::new_default()),
         Arc::new(TimeNamespace::new_default()),
-        Arc::new(()),
-        Arc::new(()),
     );
 
     {

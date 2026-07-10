@@ -52,7 +52,7 @@ mmio-ranges = [
     [0x100E_0000, 0x0000_1000],         # GED
     [0x1FE0_0000, 0x0000_1000],         # UART
     [0x2000_0000, 0x1000_0000],         # PCI
-    [0x4000_0000, 0x0002_0000],         # PCI RANGES
+    [0x4000_0000, 0x4000_0000],         # PCI 32-bit MMIO window
 ]           # [(uint, uint)]
 # VirtIO MMIO ranges with format (`base_paddr`, `size`).
 virtio-mmio-ranges = []    # [(uint, uint)]
@@ -63,7 +63,7 @@ pci-bus-end = 0x7f                      # uint
 # PCI device memory ranges.
 pci-ranges = [
     [0, 0],
-    [0x4000_0000, 0x0002_0000]
+    [0x4000_0000, 0x4000_0000]
 ]                                       # [(uint, uint)]
 # poweroff {
 #     value = <0x00000034>;

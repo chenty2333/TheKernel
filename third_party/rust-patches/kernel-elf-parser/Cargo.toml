@@ -50,9 +50,6 @@ path = "tests/test_static.rs"
 [dependencies.xmas-elf]
 version = "0.9"
 
-[dependencies.zero]
-version = "0.1.3"
-
 [dependencies.zerocopy]
 version = "0.8.26"
 features = ["derive"]

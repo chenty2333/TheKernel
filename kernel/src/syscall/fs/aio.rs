@@ -1,17 +1,33 @@
-use alloc::collections::{BTreeMap, VecDeque};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use alloc::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+    vec::Vec,
+};
+use core::{
+    future::poll_fn,
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    task::Poll,
+    time::Duration,
+};
 
 use axerrno::{AxError, AxResult, LinuxError};
+use axpoll::PollSet;
 use axsync::Mutex;
+use axtask::{
+    current,
+    future::{self, block_on, interruptible},
+};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::__kernel_off_t;
+use starry_process::Pid;
 use starry_signal::SignalSet;
-use starry_vm::{VmMutPtr, VmPtr, vm_read_slice};
+use starry_vm::{VmMutPtr, VmPtr};
 
 use super::{sys_fdatasync, sys_fsync, sys_pread64, sys_preadv, sys_pwrite64, sys_pwritev};
 use crate::{
     file::{FileHandle, event::EventFd, get_typed_file},
     mm::IoVec,
+    task::{AsThread, with_blocked_signals},
 };
 
 const AIO_MAX_NR_DEFAULT: usize = 0x10000;
@@ -80,12 +96,20 @@ pub struct AioSigset {
 }
 
 struct AioContext {
+    owner: Pid,
     max_events: usize,
+    state: Mutex<AioContextState>,
+    waiters: PollSet,
+}
+
+struct AioContextState {
     events: VecDeque<IoEvent>,
+    in_flight: usize,
+    accepting: bool,
 }
 
 struct AioManager {
-    contexts: BTreeMap<u64, AioContext>,
+    contexts: BTreeMap<u64, Arc<AioContext>>,
 }
 
 impl AioManager {
@@ -142,6 +166,38 @@ fn release_aio_events(count: usize) {
     AIO_NR.fetch_sub(count, Ordering::AcqRel);
 }
 
+fn current_aio_owner() -> Pid {
+    current().as_thread().proc_data.proc.pid()
+}
+
+fn context_for_current(ctx: u64) -> AxResult<Arc<AioContext>> {
+    let context = AIO_CONTEXTS
+        .lock()
+        .contexts
+        .get(&ctx)
+        .cloned()
+        .ok_or(AxError::InvalidInput)?;
+    if context.owner != current_aio_owner() {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(context)
+}
+
+fn reserve_submission_slots(context: &AioContext, requested: usize) -> AxResult<usize> {
+    let mut state = context.state.lock();
+    if !state.accepting {
+        return Err(AxError::InvalidInput);
+    }
+    let used = state.events.len().saturating_add(state.in_flight);
+    let available = context.max_events.saturating_sub(used);
+    if available == 0 && requested != 0 {
+        return Err(LinuxError::EAGAIN.into());
+    }
+    let reserved = requested.min(available);
+    state.in_flight += reserved;
+    Ok(reserved)
+}
+
 fn read_iocb_ptr(iocbpp: *const *const Iocb, index: usize) -> AxResult<*const Iocb> {
     Ok(unsafe { iocbpp.wrapping_add(index).vm_read_uninit()?.assume_init() })
 }
@@ -152,28 +208,40 @@ fn write_iocb_key(iocb: *const Iocb) -> AxResult {
     Ok(())
 }
 
-fn validate_optional_timespec(timeout: *const KernelTimespec) -> AxResult {
-    if !timeout.is_null() {
-        let timeout = timeout.vm_read()?;
-        if !(0..1_000_000_000).contains(&timeout.tv_nsec) {
-            return Err(AxError::InvalidInput);
-        }
+fn read_optional_timespec(timeout: *const KernelTimespec) -> AxResult<Option<Duration>> {
+    if timeout.is_null() {
+        return Ok(None);
     }
-    Ok(())
+
+    let timeout = timeout.vm_read()?;
+    if timeout.tv_sec < 0 || !(0..1_000_000_000).contains(&timeout.tv_nsec) {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(Some(Duration::new(
+        timeout.tv_sec as u64,
+        timeout.tv_nsec as u32,
+    )))
 }
 
-fn validate_optional_sigset(sigset: *const AioSigset) -> AxResult {
-    if !sigset.is_null() {
-        let sigset = sigset.vm_read()?;
-        if !sigset.sigmask.is_null() {
-            if sigset.sigsetsize != size_of::<SignalSet>() {
-                return Err(AxError::InvalidInput);
-            }
-            let mut buf = [core::mem::MaybeUninit::<u8>::uninit(); size_of::<SignalSet>()];
-            vm_read_slice(sigset.sigmask, &mut buf)?;
-        }
+fn read_optional_sigset(sigset: *const AioSigset) -> AxResult<Option<SignalSet>> {
+    if sigset.is_null() {
+        return Ok(None);
     }
-    Ok(())
+
+    let sigset = sigset.vm_read()?;
+    if sigset.sigmask.is_null() {
+        return Ok(None);
+    }
+    if sigset.sigsetsize != size_of::<SignalSet>() {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(Some(unsafe {
+        sigset
+            .sigmask
+            .cast::<SignalSet>()
+            .vm_read_uninit()?
+            .assume_init()
+    }))
 }
 
 fn resfd_file(iocb: &Iocb) -> AxResult<Option<FileHandle<EventFd>>> {
@@ -185,11 +253,14 @@ fn resfd_file(iocb: &Iocb) -> AxResult<Option<FileHandle<EventFd>>> {
 }
 
 fn validate_iocb_common(iocb: &Iocb) -> AxResult {
-    if iocb.aio_reserved2 != 0 || iocb.aio_nbytes > isize::MAX as u64 {
+    if iocb.aio_reserved2 != 0 || iocb.aio_nbytes > isize::MAX as u64 || iocb.aio_reqprio != 0 {
         return Err(AxError::InvalidInput);
     }
     if iocb.aio_flags & !(IOCB_FLAG_RESFD | IOCB_FLAG_IOPRIO) != 0 {
         return Err(AxError::InvalidInput);
+    }
+    if iocb.aio_flags & IOCB_FLAG_IOPRIO != 0 {
+        return Err(LinuxError::EOPNOTSUPP.into());
     }
     Ok(())
 }
@@ -198,7 +269,7 @@ fn validate_aio_rw_flags(flags: u32) -> AxResult {
     if flags & !RWF_SUPPORTED != 0 {
         return Err(LinuxError::EOPNOTSUPP.into());
     }
-    if flags & (RWF_NOWAIT | RWF_APPEND) != 0 {
+    if flags & (RWF_HIPRI | RWF_NOWAIT | RWF_APPEND) != 0 {
         return Err(LinuxError::EOPNOTSUPP.into());
     }
     Ok(())
@@ -288,18 +359,35 @@ fn execute_iocb(iocb: &Iocb) -> AxResult<isize> {
     }
 }
 
-fn finish_io_submit(ctx: u64, completions: VecDeque<IoEvent>, submitted: isize) -> AxResult<isize> {
-    if completions.is_empty() {
-        return Ok(submitted);
+fn finish_io_submit(
+    context: &AioContext,
+    reserved: usize,
+    completions: VecDeque<IoEvent>,
+    submitted: isize,
+) -> AxResult<isize> {
+    let mut state = context.state.lock();
+    state.in_flight = state.in_flight.saturating_sub(reserved);
+    if state.accepting {
+        state.events.extend(completions);
     }
-
-    let mut manager = AIO_CONTEXTS.lock();
-    let context = manager
-        .contexts
-        .get_mut(&ctx)
-        .ok_or(AxError::InvalidInput)?;
-    context.events.extend(completions);
+    drop(state);
+    context.waiters.wake();
     Ok(submitted)
+}
+
+fn fail_io_submit(
+    context: &AioContext,
+    reserved: usize,
+    completions: VecDeque<IoEvent>,
+    submitted: isize,
+    error: AxError,
+) -> AxResult<isize> {
+    finish_io_submit(context, reserved, completions, submitted)?;
+    if submitted == 0 {
+        Err(error)
+    } else {
+        Ok(submitted)
+    }
 }
 
 pub fn sys_io_setup(nr_events: u32, ctxp: *mut u64) -> AxResult<isize> {
@@ -317,10 +405,16 @@ pub fn sys_io_setup(nr_events: u32, ctxp: *mut u64) -> AxResult<isize> {
     let id = next_aio_context_id();
     AIO_CONTEXTS.lock().contexts.insert(
         id,
-        AioContext {
+        Arc::new(AioContext {
+            owner: current_aio_owner(),
             max_events: nr_events,
-            events: VecDeque::new(),
-        },
+            state: Mutex::new(AioContextState {
+                events: VecDeque::new(),
+                in_flight: 0,
+                accepting: true,
+            }),
+            waiters: PollSet::new(),
+        }),
     );
     if let Err(err) = ctxp.vm_write(id) {
         AIO_CONTEXTS.lock().contexts.remove(&id);
@@ -331,11 +425,32 @@ pub fn sys_io_setup(nr_events: u32, ctxp: *mut u64) -> AxResult<isize> {
 }
 
 pub fn sys_io_destroy(ctx: u64) -> AxResult<isize> {
-    let context = AIO_CONTEXTS
-        .lock()
-        .contexts
-        .remove(&ctx)
-        .ok_or(AxError::InvalidInput)?;
+    let context = {
+        let mut manager = AIO_CONTEXTS.lock();
+        let context = manager
+            .contexts
+            .get(&ctx)
+            .cloned()
+            .ok_or(AxError::InvalidInput)?;
+        if context.owner != current_aio_owner() {
+            return Err(AxError::InvalidInput);
+        }
+        context.state.lock().accepting = false;
+        manager.contexts.remove(&ctx);
+        context
+    };
+    block_on(poll_fn(|cx| {
+        if context.state.lock().in_flight == 0 {
+            return Poll::Ready(());
+        }
+        context.waiters.register(cx.waker());
+        if context.state.lock().in_flight == 0 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }));
+    context.state.lock().events.clear();
     release_aio_events(context.max_events);
     Ok(0)
 }
@@ -345,84 +460,56 @@ pub fn sys_io_submit(ctx: u64, nr: isize, iocbpp: *const *const Iocb) -> AxResul
         return Err(AxError::InvalidInput);
     }
 
-    let available = {
-        let manager = AIO_CONTEXTS.lock();
-        let context = manager.contexts.get(&ctx).ok_or(AxError::InvalidInput)?;
-        if nr == 0 {
-            return Ok(0);
-        }
-        context.max_events.saturating_sub(context.events.len())
-    };
-    if available == 0 {
-        return Err(LinuxError::EAGAIN.into());
+    let context = context_for_current(ctx)?;
+    if nr == 0 {
+        return Ok(0);
     }
+    let reserved = reserve_submission_slots(&context, nr as usize)?;
 
     let mut submitted = 0isize;
     let mut completions = VecDeque::new();
 
-    for index in 0..(nr as usize).min(available) {
+    for index in 0..reserved {
         let ptr = match read_iocb_ptr(iocbpp, index) {
             Ok(ptr) if !ptr.is_null() => ptr,
             Ok(_) => {
-                return if submitted == 0 {
-                    Err(AxError::BadAddress)
-                } else {
-                    finish_io_submit(ctx, completions, submitted)
-                };
+                return fail_io_submit(
+                    &context,
+                    reserved,
+                    completions,
+                    submitted,
+                    AxError::BadAddress,
+                );
             }
             Err(err) => {
-                return if submitted == 0 {
-                    Err(err)
-                } else {
-                    finish_io_submit(ctx, completions, submitted)
-                };
+                return fail_io_submit(&context, reserved, completions, submitted, err);
             }
         };
         let iocb = match ptr.vm_read() {
             Ok(iocb) => iocb,
             Err(err) => {
-                return if submitted == 0 {
-                    Err(err.into())
-                } else {
-                    finish_io_submit(ctx, completions, submitted)
-                };
+                return fail_io_submit(&context, reserved, completions, submitted, err.into());
             }
         };
 
         let resfd = match resfd_file(&iocb) {
             Ok(resfd) => resfd,
             Err(err) => {
-                return if submitted == 0 {
-                    Err(err)
-                } else {
-                    finish_io_submit(ctx, completions, submitted)
-                };
+                return fail_io_submit(&context, reserved, completions, submitted, err);
             }
         };
         if let Err(err) = write_iocb_key(ptr) {
-            return if submitted == 0 {
-                Err(err)
-            } else {
-                finish_io_submit(ctx, completions, submitted)
-            };
+            return fail_io_submit(&context, reserved, completions, submitted, err);
         }
         let res = match execute_iocb(&iocb) {
             Ok(res) => res,
             Err(err) => {
-                return if submitted == 0 {
-                    Err(err)
-                } else {
-                    finish_io_submit(ctx, completions, submitted)
-                };
+                return fail_io_submit(&context, reserved, completions, submitted, err);
             }
         };
         if let Some(event) = resfd {
             if let Err(err) = event.signal(1) {
-                return if submitted == 0 {
-                    Err(err)
-                } else {
-                    finish_io_submit(ctx, completions, submitted)
-                };
+                return fail_io_submit(&context, reserved, completions, submitted, err);
             }
         }
         completions.push_back(IoEvent {
@@ -434,7 +521,7 @@ pub fn sys_io_submit(ctx: u64, nr: isize, iocbpp: *const *const Iocb) -> AxResul
         submitted += 1;
     }
 
-    finish_io_submit(ctx, completions, submitted)
+    finish_io_submit(&context, reserved, completions, submitted)
 }
 
 pub fn sys_io_getevents(
@@ -444,28 +531,61 @@ pub fn sys_io_getevents(
     events: *mut IoEvent,
     timeout: *const KernelTimespec,
 ) -> AxResult<isize> {
-    validate_optional_timespec(timeout)?;
     if min_nr < 0 || nr < 0 || min_nr > nr {
         return Err(AxError::InvalidInput);
     }
+    let timeout = read_optional_timespec(timeout)?;
+    let context = context_for_current(ctx)?;
+    let min_nr = min_nr as usize;
+    let nr = nr as usize;
 
-    let mut manager = AIO_CONTEXTS.lock();
-    let context = manager
-        .contexts
-        .get_mut(&ctx)
-        .ok_or(AxError::InvalidInput)?;
+    enum WaitResult {
+        Ready,
+        TimedOut,
+        Interrupted,
+    }
 
-    let count = (nr as usize).min(context.events.len());
+    let enough_events = || context.state.lock().events.len() >= min_nr;
+    let wait_result = if min_nr == 0 || enough_events() {
+        WaitResult::Ready
+    } else {
+        let wait = poll_fn(|cx| {
+            let state = context.state.lock();
+            if state.events.len() >= min_nr || !state.accepting {
+                return Poll::Ready(());
+            }
+            drop(state);
+            context.waiters.register(cx.waker());
+            let state = context.state.lock();
+            if state.events.len() >= min_nr || !state.accepting {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        });
+        match block_on(future::timeout(timeout, interruptible(wait))) {
+            Ok(Ok(())) => WaitResult::Ready,
+            Ok(Err(_)) => WaitResult::Interrupted,
+            Err(_) => WaitResult::TimedOut,
+        }
+    };
+
+    let mut state = context.state.lock();
+    let count = nr.min(state.events.len());
     if count == 0 {
-        return Ok(0);
+        return match wait_result {
+            WaitResult::Interrupted => Err(AxError::Interrupted),
+            WaitResult::Ready if !state.accepting => Err(AxError::InvalidInput),
+            WaitResult::Ready | WaitResult::TimedOut => Ok(0),
+        };
     }
 
     for index in 0..count {
-        let event = *context.events.get(index).ok_or(AxError::InvalidInput)?;
+        let event = *state.events.get(index).ok_or(AxError::InvalidInput)?;
         events.wrapping_add(index).vm_write(event)?;
     }
     for _ in 0..count {
-        context.events.pop_front();
+        state.events.pop_front();
     }
     Ok(count as isize)
 }
@@ -478,8 +598,10 @@ pub fn sys_io_pgetevents(
     timeout: *const KernelTimespec,
     sigset: *const AioSigset,
 ) -> AxResult<isize> {
-    validate_optional_sigset(sigset)?;
-    sys_io_getevents(ctx, min_nr, nr, events, timeout)
+    let sigset = read_optional_sigset(sigset)?;
+    with_blocked_signals(sigset, || {
+        sys_io_getevents(ctx, min_nr, nr, events, timeout)
+    })
 }
 
 pub fn sys_io_cancel(ctx: u64, iocb: *const Iocb, result: *mut IoEvent) -> AxResult<isize> {
@@ -487,9 +609,83 @@ pub fn sys_io_cancel(ctx: u64, iocb: *const Iocb, result: *mut IoEvent) -> AxRes
     if result.is_null() {
         return Err(AxError::BadAddress);
     }
-    let manager = AIO_CONTEXTS.lock();
-    if !manager.contexts.contains_key(&ctx) {
-        return Err(AxError::InvalidInput);
-    }
+    context_for_current(ctx)?;
     Err(AxError::InvalidInput)
+}
+
+pub fn cleanup_process_aio(owner: Pid) {
+    let contexts = {
+        let mut manager = AIO_CONTEXTS.lock();
+        let ids = manager
+            .contexts
+            .iter()
+            .filter_map(|(id, context)| (context.owner == owner).then_some(*id))
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| manager.contexts.remove(&id))
+            .collect::<Vec<_>>()
+    };
+
+    for context in contexts {
+        let mut state = context.state.lock();
+        state.accepting = false;
+        state.events.clear();
+        drop(state);
+        context.waiters.wake();
+        release_aio_events(context.max_events);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(max_events: usize) -> AioContext {
+        AioContext {
+            owner: 1,
+            max_events,
+            state: Mutex::new(AioContextState {
+                events: VecDeque::new(),
+                in_flight: 0,
+                accepting: true,
+            }),
+            waiters: PollSet::new(),
+        }
+    }
+
+    #[test]
+    fn submission_reservations_share_the_hard_capacity() {
+        let context = context(4);
+        assert_eq!(reserve_submission_slots(&context, 3).unwrap(), 3);
+        assert_eq!(reserve_submission_slots(&context, 3).unwrap(), 1);
+        assert_eq!(
+            reserve_submission_slots(&context, 1).unwrap_err(),
+            LinuxError::EAGAIN.into()
+        );
+    }
+
+    #[test]
+    fn completions_release_in_flight_slots_but_remain_accounted() {
+        let context = context(2);
+        let reserved = reserve_submission_slots(&context, 2).unwrap();
+        let mut completions = VecDeque::new();
+        completions.push_back(IoEvent::default());
+        finish_io_submit(&context, reserved, completions, 1).unwrap();
+
+        let state = context.state.lock();
+        assert_eq!(state.in_flight, 0);
+        assert_eq!(state.events.len(), 1);
+        drop(state);
+        assert_eq!(reserve_submission_slots(&context, 2).unwrap(), 1);
+    }
+
+    #[test]
+    fn closed_context_rejects_new_submissions() {
+        let context = context(1);
+        context.state.lock().accepting = false;
+        assert_eq!(
+            reserve_submission_slots(&context, 1).unwrap_err(),
+            AxError::InvalidInput
+        );
+    }
 }

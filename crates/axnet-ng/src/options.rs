@@ -30,7 +30,7 @@ macro_rules! define_options {
 
 /// Corresponds to `struct ucred` in Linux.
 #[repr(C)]
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, Copy, Eq, PartialEq)]
 pub struct UnixCredentials {
     /// Process ID.
     pub pid: u32,
@@ -40,13 +40,12 @@ pub struct UnixCredentials {
     pub gid: u32,
 }
 impl UnixCredentials {
-    /// Create a new `UnixCredentials` with the given PID and default UID/GID.
-    pub fn new(pid: u32) -> Self {
-        UnixCredentials {
-            pid,
-            uid: 0,
-            gid: 0,
-        }
+    /// Credentials reported when Linux has no connected peer snapshot.
+    pub const UNKNOWN: Self = Self::new(0, u32::MAX, u32::MAX);
+
+    /// Create a new credential snapshot.
+    pub const fn new(pid: u32, uid: u32, gid: u32) -> Self {
+        UnixCredentials { pid, uid, gid }
     }
 }
 
@@ -61,13 +60,13 @@ define_options! {
     SendTimeout(Duration),
     ReceiveTimeout(Duration),
     SendBufferForce(usize),
+    ReceiveBufferForce(usize),
     PassCredentials(bool),
     PeerCredentials(UnixCredentials),
 
     // --- TCP level options (TCP_*) ----
     NoDelay(bool),
     MaxSegment(usize),
-    TcpInfo(()),
 
     // ---- IP level options (IP_*) ----
     Ttl(u8),
@@ -80,6 +79,9 @@ define_options! {
 /// Trait for configurable socket-like objects.
 #[enum_dispatch]
 pub trait Configurable {
+    /// Returns whether the socket is in non-blocking mode.
+    fn nonblocking(&self) -> bool;
+
     /// Get a socket option, returns `true` if the socket supports the option.
     fn get_option_inner(&self, opt: &mut GetSocketOption) -> AxResult<bool>;
     /// Set a socket option, returns `true` if the socket supports the option.

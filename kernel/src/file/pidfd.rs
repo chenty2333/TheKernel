@@ -12,11 +12,12 @@ use axpoll::{IoEvents, PollSet, Pollable};
 use starry_process::Process;
 
 use crate::{
-    file::FileLike,
+    file::{FileLike, Kstat, PseudoInode},
     task::{ProcessData, Thread},
 };
 
 pub struct PidFd {
+    inode: PseudoInode,
     proc_data: Weak<ProcessData>,
     process: Weak<Process>,
     exit_event: Arc<PollSet>,
@@ -27,6 +28,7 @@ pub struct PidFd {
 impl PidFd {
     pub fn new_process(proc_data: &Arc<ProcessData>) -> Self {
         Self {
+            inode: PseudoInode::pidfd(),
             proc_data: Arc::downgrade(proc_data),
             process: Arc::downgrade(&proc_data.proc),
             exit_event: proc_data.exit_event.clone(),
@@ -38,6 +40,7 @@ impl PidFd {
 
     pub fn new_thread(thread: &Thread) -> Self {
         Self {
+            inode: PseudoInode::pidfd(),
             proc_data: Arc::downgrade(&thread.proc_data),
             process: Arc::downgrade(&thread.proc_data.proc),
             exit_event: thread.exit_event.clone(),
@@ -63,6 +66,10 @@ impl PidFd {
     }
 }
 impl FileLike for PidFd {
+    fn stat(&self) -> AxResult<Kstat> {
+        Ok(self.inode.stat())
+    }
+
     fn path(&self) -> Cow<'_, str> {
         "anon_inode:[pidfd]".into()
     }

@@ -11,14 +11,20 @@ use crate::AxDeviceEnum;
 #[cfg(feature = "virtio")]
 use crate::virtio::{self, VirtIoDevMeta};
 
+pub(crate) enum BusProbeResult {
+    NotMatched,
+    Claimed,
+    Device(AxDeviceEnum),
+}
+
 pub trait DriverProbe {
     fn probe_global() -> Option<AxDeviceEnum> {
         None
     }
 
     #[cfg(bus = "mmio")]
-    fn probe_mmio(_mmio_base: usize, _mmio_size: usize) -> Option<AxDeviceEnum> {
-        None
+    fn probe_mmio(_mmio_base: usize, _mmio_size: usize) -> BusProbeResult {
+        BusProbeResult::NotMatched
     }
 
     #[cfg(bus = "pci")]
@@ -26,8 +32,8 @@ pub trait DriverProbe {
         _root: &mut PciRoot,
         _bdf: DeviceFunction,
         _dev_info: &DeviceFunctionInfo,
-    ) -> Option<AxDeviceEnum> {
-        None
+    ) -> BusProbeResult {
+        BusProbeResult::NotMatched
     }
 }
 

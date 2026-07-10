@@ -26,7 +26,7 @@ use hashbrown::HashMap;
 use kspin::SpinNoPreempt;
 use linux_raw_sys::general::{EPOLLET, EPOLLONESHOT, epoll_event};
 
-use crate::file::{FileDescription, FileLike, FileLikeKind, get_file_description};
+use crate::file::{FileDescription, FileLike, FileLikeKind, Kstat, get_file_description};
 
 const EPOLL_MAX_NESTS: usize = 5;
 
@@ -507,6 +507,10 @@ impl Epoll {
 }
 
 impl FileLike for Epoll {
+    fn stat(&self) -> AxResult<Kstat> {
+        Ok(super::anon_inode_stat())
+    }
+
     fn path(&self) -> Cow<'_, str> {
         "anon_inode:[eventpoll]".into()
     }

@@ -69,6 +69,26 @@ impl Default for NodePermission {
     }
 }
 
+bitflags::bitflags! {
+    /// Metadata fields that a filesystem can persist for an inode.
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct MetadataUpdateCapabilities: u8 {
+        const MODE  = 1 << 0;
+        const OWNER = 1 << 1;
+        const RDEV  = 1 << 2;
+        const ATIME = 1 << 3;
+        const MTIME = 1 << 4;
+        const CTIME = 1 << 5;
+
+        const ALL = Self::MODE.bits()
+            | Self::OWNER.bits()
+            | Self::RDEV.bits()
+            | Self::ATIME.bits()
+            | Self::MTIME.bits()
+            | Self::CTIME.bits();
+    }
+}
+
 /// Filesystem node metadata.
 #[derive(Clone, Debug)]
 pub struct Metadata {
@@ -121,6 +141,38 @@ pub struct MetadataUpdate {
     pub mtime: Option<Duration>,
     /// Time of last status change
     pub ctime: Option<Duration>,
+}
+
+impl MetadataUpdate {
+    pub fn retain_supported(&mut self, capabilities: MetadataUpdateCapabilities) {
+        if !capabilities.contains(MetadataUpdateCapabilities::MODE) {
+            self.mode = None;
+        }
+        if !capabilities.contains(MetadataUpdateCapabilities::OWNER) {
+            self.owner = None;
+        }
+        if !capabilities.contains(MetadataUpdateCapabilities::RDEV) {
+            self.rdev = None;
+        }
+        if !capabilities.contains(MetadataUpdateCapabilities::ATIME) {
+            self.atime = None;
+        }
+        if !capabilities.contains(MetadataUpdateCapabilities::MTIME) {
+            self.mtime = None;
+        }
+        if !capabilities.contains(MetadataUpdateCapabilities::CTIME) {
+            self.ctime = None;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mode.is_none()
+            && self.owner.is_none()
+            && self.rdev.is_none()
+            && self.atime.is_none()
+            && self.mtime.is_none()
+            && self.ctime.is_none()
+    }
 }
 
 /// Device Id

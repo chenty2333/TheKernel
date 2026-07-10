@@ -136,6 +136,11 @@ rtc = [
     "axhal/rtc",
     "axruntime/rtc",
 ]
+rng = [
+    "alloc",
+    "paging",
+    "axdriver/virtio-rng",
+]
 sched-cfs = [
     "axtask/sched-cfs",
     "irq",

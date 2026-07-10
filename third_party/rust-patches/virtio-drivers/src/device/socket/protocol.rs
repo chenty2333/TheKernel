@@ -1,16 +1,18 @@
 //! This module defines the socket device protocol according to the virtio spec v1.1 5.10 Socket Device
 
-use super::error::{self, SocketError};
-use crate::volatile::ReadOnly;
-use bitflags::bitflags;
 use core::{
     convert::{TryFrom, TryInto},
     fmt,
 };
+
+use bitflags::bitflags;
 use zerocopy::{
-    byteorder::{LittleEndian, U16, U32, U64},
     AsBytes, FromBytes, FromZeroes,
+    byteorder::{LittleEndian, U16, U32, U64},
 };
+
+use super::error::{self, SocketError};
+use crate::volatile::ReadOnly;
 
 /// Well-known CID for the host.
 pub const VMADDR_CID_HOST: u64 = 2;
@@ -20,7 +22,7 @@ pub const VMADDR_CID_HOST: u64 = 2;
 #[repr(u16)]
 pub enum SocketType {
     /// Stream sockets provide in-order, guaranteed, connection-oriented delivery without message boundaries.
-    Stream = 1,
+    Stream    = 1,
     /// seqpacket socket type introduced in virtio-v1.2.
     SeqPacket = 2,
 }
@@ -132,20 +134,20 @@ pub struct VirtioVsockEvent {
 #[derive(Copy, Clone, Eq, PartialEq)]
 #[repr(u16)]
 pub enum VirtioVsockOp {
-    Invalid = 0,
+    Invalid       = 0,
 
-    /* Connect operations */
-    Request = 1,
-    Response = 2,
-    Rst = 3,
-    Shutdown = 4,
+    // Connect operations
+    Request       = 1,
+    Response      = 2,
+    Rst           = 3,
+    Shutdown      = 4,
 
-    /* To send payload */
-    Rw = 5,
+    // To send payload
+    Rw            = 5,
 
-    /* Tell the peer our credit info */
-    CreditUpdate = 6,
-    /* Request the peer to send the credit info to us */
+    // Tell the peer our credit info
+    CreditUpdate  = 6,
+    // Request the peer to send the credit info to us
     CreditRequest = 7,
 }
 

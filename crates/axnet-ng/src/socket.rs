@@ -163,7 +163,7 @@ pub trait SocketOps: Configurable {
     fn connect(&self, remote_addr: SocketAddrEx) -> AxResult;
 
     /// Starts listening on the bound address and port.
-    fn listen(&self) -> AxResult {
+    fn listen(&self, _backlog: usize) -> AxResult {
         Err(AxError::OperationNotSupported)
     }
     /// Accepts a connection on a listening socket, returning a new socket.
@@ -235,7 +235,11 @@ impl Socket {
     pub fn disconnect(&self) -> AxResult<()> {
         match self {
             Socket::Tcp(tcp) => tcp.disconnect(),
-            Socket::Udp(_) | Socket::Unix(_) => Err(AxError::OperationNotSupported),
+            Socket::Udp(udp) => {
+                udp.disconnect();
+                Ok(())
+            }
+            Socket::Unix(_) => Err(AxError::OperationNotSupported),
             #[cfg(feature = "vsock")]
             Socket::Vsock(_) => Err(AxError::OperationNotSupported),
         }

@@ -28,7 +28,6 @@ use crate::{
 const IPC_MODE_MASK: c_ushort = 0o777;
 const IPC_NOWAIT: i16 = 0o4000;
 const SEM_UNDO: i16 = 0x1000;
-const SEM_UNSUPPORTED_FLAGS: i16 = !(IPC_NOWAIT | SEM_UNDO);
 const SEM_TIMED_WAIT_SLICE: Duration = Duration::from_millis(100);
 
 pub const SEMMSL: usize = 32000;
@@ -633,6 +632,16 @@ enum SemTryResult {
     },
 }
 
+fn validate_semop_flags(flags: i16) -> AxResult<()> {
+    if flags & SEM_UNDO != 0 {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    if flags & !(IPC_NOWAIT | SEM_UNDO) != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
 fn try_apply_single_semop(
     array: &mut SemArray,
     op: Sembuf,
@@ -642,9 +651,7 @@ fn try_apply_single_semop(
     if index >= array.sems.len() {
         return Err(AxError::from(LinuxError::EFBIG));
     }
-    if op.sem_flg & SEM_UNSUPPORTED_FLAGS != 0 {
-        return Err(AxError::from(LinuxError::EINVAL));
-    }
+    validate_semop_flags(op.sem_flg)?;
 
     let sem = &mut array.sems[index];
     let value = sem.value as i32;
@@ -698,9 +705,7 @@ fn try_apply_semops(
         if index >= values.len() {
             return Err(AxError::from(LinuxError::EFBIG));
         }
-        if op.sem_flg & SEM_UNSUPPORTED_FLAGS != 0 {
-            return Err(AxError::from(LinuxError::EINVAL));
-        }
+        validate_semop_flags(op.sem_flg)?;
         let value = values[index] as i32;
         match op.sem_op {
             op if op > 0 => {

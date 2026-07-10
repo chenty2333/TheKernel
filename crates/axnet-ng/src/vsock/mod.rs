@@ -24,7 +24,7 @@ pub trait VsockTransportOps: Configurable + Pollable + Send + Sync {
     /// Bind the transport to a local address.
     fn bind(&self, local_addr: VsockAddr) -> AxResult;
     /// Start listening for incoming connections.
-    fn listen(&self) -> AxResult;
+    fn listen(&self, backlog: usize) -> AxResult;
     /// Connect to a remote peer address.
     fn connect(&self, peer_addr: VsockAddr) -> AxResult;
     /// Accept an incoming connection.
@@ -79,11 +79,15 @@ impl VsockSocket {
     }
 
     pub fn set_filter(&self, _filter: Option<Arc<dyn crate::SocketFilter>>) -> AxResult<()> {
-        Ok(())
+        Err(AxError::Unsupported)
     }
 }
 
 impl Configurable for VsockSocket {
+    fn nonblocking(&self) -> bool {
+        self.transport.nonblocking()
+    }
+
     fn get_option_inner(&self, opt: &mut GetSocketOption) -> AxResult<bool> {
         self.transport.get_option_inner(opt)
     }
@@ -104,8 +108,8 @@ impl SocketOps for VsockSocket {
         self.transport.connect(remote_addr)
     }
 
-    fn listen(&self) -> AxResult {
-        self.transport.listen()
+    fn listen(&self, backlog: usize) -> AxResult {
+        self.transport.listen(backlog)
     }
 
     fn accept(&self) -> AxResult<Socket> {

@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::mem::{self, MaybeUninit};
 
 use axerrno::{AxError, AxResult};
@@ -16,10 +17,56 @@ pub struct IoVec {
     pub iov_len: isize,
 }
 
-#[derive(Default)]
+const INLINE_IOVEC_CAPACITY: usize = 8;
+const EMPTY_IOVEC: IoVec = IoVec {
+    iov_base: core::ptr::null_mut(),
+    iov_len: 0,
+};
+
+enum ImportedIoVecs {
+    Inline {
+        entries: [IoVec; INLINE_IOVEC_CAPACITY],
+        len: usize,
+    },
+    Heap(Vec<IoVec>),
+}
+
+impl ImportedIoVecs {
+    fn with_capacity(len: usize) -> AxResult<Self> {
+        if len <= INLINE_IOVEC_CAPACITY {
+            Ok(Self::Inline {
+                entries: [EMPTY_IOVEC; INLINE_IOVEC_CAPACITY],
+                len: 0,
+            })
+        } else {
+            let mut entries = Vec::new();
+            entries
+                .try_reserve_exact(len)
+                .map_err(|_| AxError::NoMemory)?;
+            Ok(Self::Heap(entries))
+        }
+    }
+
+    fn push(&mut self, entry: IoVec) {
+        match self {
+            Self::Inline { entries, len } => {
+                entries[*len] = entry;
+                *len += 1;
+            }
+            Self::Heap(entries) => entries.push(entry),
+        }
+    }
+
+    fn as_slice(&self) -> &[IoVec] {
+        match self {
+            Self::Inline { entries, len } => &entries[..*len],
+            Self::Heap(entries) => entries,
+        }
+    }
+}
+
 pub struct IoVectorBuf {
-    iovs: *const IoVec,
-    iovcnt: usize,
+    iovs: ImportedIoVecs,
     len: usize,
 }
 
@@ -28,6 +75,13 @@ impl IoVectorBuf {
         if iovcnt > 1024 {
             return Err(AxError::InvalidInput);
         }
+        if iovcnt > 0 {
+            let bytes = iovcnt
+                .checked_mul(mem::size_of::<IoVec>())
+                .ok_or(AxError::BadAddress)?;
+            check_user_readable(iovs as usize, bytes)?;
+        }
+        let mut imported = ImportedIoVecs::with_capacity(iovcnt)?;
         let mut len: usize = 0;
         for i in 0..iovcnt {
             let iov = iovs.wrapping_add(i).vm_read()?;
@@ -37,8 +91,12 @@ impl IoVectorBuf {
             if len < MAX_RW_COUNT {
                 len += (iov.iov_len as usize).min(MAX_RW_COUNT - len);
             }
+            imported.push(iov);
         }
-        Ok(Self { iovs, iovcnt, len })
+        Ok(Self {
+            iovs: imported,
+            len,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -46,26 +104,19 @@ impl IoVectorBuf {
     }
 
     pub fn iovcnt(&self) -> usize {
-        self.iovcnt
+        self.iovs.as_slice().len()
     }
 
     pub fn entry(&self, index: usize) -> AxResult<IoVec> {
-        if index >= self.iovcnt {
-            return Err(AxError::InvalidInput);
-        }
-        let iov = self.iovs.wrapping_add(index).vm_read()?;
-        if iov.iov_len < 0 {
-            return Err(AxError::InvalidInput);
-        }
-        Ok(iov)
+        self.iovs
+            .as_slice()
+            .get(index)
+            .copied()
+            .ok_or(AxError::InvalidInput)
     }
 
     pub fn is_aligned(&self, align: usize) -> AxResult<bool> {
-        for i in 0..self.iovcnt {
-            let iov = self.iovs.wrapping_add(i).vm_read()?;
-            if iov.iov_len < 0 {
-                return Err(AxError::InvalidInput);
-            }
+        for iov in self.iovs.as_slice() {
             let len = iov.iov_len as usize;
             if len == 0 {
                 continue;
@@ -78,11 +129,7 @@ impl IoVectorBuf {
     }
 
     pub fn check_readable(&self) -> AxResult<()> {
-        for i in 0..self.iovcnt {
-            let iov = self.iovs.wrapping_add(i).vm_read()?;
-            if iov.iov_len < 0 {
-                return Err(AxError::InvalidInput);
-            }
+        for iov in self.iovs.as_slice() {
             let len = iov.iov_len as usize;
             if len == 0 {
                 continue;
@@ -93,11 +140,7 @@ impl IoVectorBuf {
     }
 
     pub fn check_writable(&self) -> AxResult<()> {
-        for i in 0..self.iovcnt {
-            let iov = self.iovs.wrapping_add(i).vm_read()?;
-            if iov.iov_len < 0 {
-                return Err(AxError::InvalidInput);
-            }
+        for iov in self.iovs.as_slice() {
             let len = iov.iov_len as usize;
             if len == 0 {
                 continue;
@@ -128,8 +171,8 @@ impl IoVectorBufIo {
     }
 
     fn skip_empty(&mut self) -> AxResult<()> {
-        while self.start < self.inner.iovcnt {
-            let iov = self.inner.iovs.wrapping_add(self.start).vm_read()?;
+        while self.start < self.inner.iovs.as_slice().len() {
+            let iov = self.inner.iovs.as_slice()[self.start];
             if iov.iov_len as usize > self.offset {
                 break;
             }
@@ -148,10 +191,10 @@ impl Read for IoVectorBufIo {
                 break;
             }
             self.skip_empty()?;
-            if self.start >= self.inner.iovcnt {
+            if self.start >= self.inner.iovs.as_slice().len() {
                 break;
             }
-            let iov = self.inner.iovs.wrapping_add(self.start).vm_read()?;
+            let iov = self.inner.iovs.as_slice()[self.start];
             let len = (iov.iov_len as usize - self.offset)
                 .min(buf.len() - count)
                 .min(self.inner.len);
@@ -177,10 +220,10 @@ impl Write for IoVectorBufIo {
                 break;
             }
             self.skip_empty()?;
-            if self.start >= self.inner.iovcnt {
+            if self.start >= self.inner.iovs.as_slice().len() {
                 break;
             }
-            let iov = self.inner.iovs.wrapping_add(self.start).vm_read()?;
+            let iov = self.inner.iovs.as_slice()[self.start];
             let len = (iov.iov_len as usize - self.offset)
                 .min(buf.len() - count)
                 .min(self.inner.len);

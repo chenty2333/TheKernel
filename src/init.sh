@@ -198,11 +198,6 @@ case_selected() {
     return 1
 }
 
-configure_tetiao_default() {
-    : "${tetiao:=1}"
-    export tetiao
-}
-
 prepare_unixbench_inputs() {
     src=/opt/oscomp-support/share/unixbench/sort.src
     [ -f "$src" ] || return 0
@@ -794,7 +789,6 @@ detect_arch
 stage_support_disk
 setup_loaders
 load_env_file
-configure_tetiao_default
 prepare_unixbench_inputs
 printf '\n'
 if boot_shell_requested; then

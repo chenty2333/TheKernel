@@ -26,9 +26,9 @@ use starry_signal::Signo;
 use crate::{
     file::{
         AsyncIoOwner, Directory, FD_TABLE, File, FileDescription, FileDescriptor, FileLike, Pipe,
-        ResolveAtResult, add_file_like_with_flags_and_write_open_key, close_file_like, executable,
+        add_file_like_with_flags_and_write_open_key, close_file_like, executable,
         flock::{self, RecordLockOwner},
-        get_file_description, get_file_like, get_typed_file, inode_flags,
+        get_file_description, get_file_like, get_typed_file,
         inotify::{
             location_for_fd, notify_close, notify_exact, notify_parent, notify_parent_with_name,
             remove_dnotify_watch, set_dnotify_watch,
@@ -168,7 +168,7 @@ fn open_requires_writable_mount(flags: c_int) -> bool {
     flags & O_PATH == 0 && (flags & O_ACCMODE != O_RDONLY || flags & O_TRUNC != 0)
 }
 
-fn check_inode_flags_for_open(loc: &Location, flags: c_int) -> AxResult<()> {
+fn check_executable_open_rules(loc: &Location, flags: c_int) -> AxResult<()> {
     let flags = flags as u32;
     if flags & O_PATH != 0 {
         return Ok(());
@@ -176,18 +176,12 @@ fn check_inode_flags_for_open(loc: &Location, flags: c_int) -> AxResult<()> {
     if flags & O_TRUNC != 0 || flags & O_ACCMODE != O_RDONLY {
         executable::check_not_active(loc)?;
     }
-    if flags & O_TRUNC != 0 {
-        inode_flags::check_resize(loc)?;
-    }
-    if flags & O_ACCMODE != O_RDONLY {
-        inode_flags::check_write(loc, flags & O_APPEND != 0)?;
-    }
     Ok(())
 }
 
 fn touch_truncated_metadata(loc: &Location) -> AxResult<()> {
     let now = wall_time();
-    loc.update_metadata(MetadataUpdate {
+    loc.update_supported_metadata(MetadataUpdate {
         mtime: Some(now),
         ctime: Some(now),
         ..Default::default()
@@ -256,10 +250,6 @@ const OPENAT2_ALLOWED_RESOLVE: u64 = (RESOLVE_NO_XDEV
     | RESOLVE_CACHED) as u64;
 
 const MAX_FILE_HANDLE_SZ: u32 = 128;
-const OSCOMP_FILE_HANDLE_BYTES: u32 = 8;
-const OSCOMP_FILE_HANDLE_MAGIC: [u8; 4] = *b"TKH1";
-const OSCOMP_FILE_HANDLE_REGULAR: i32 = 1;
-const OSCOMP_FILE_HANDLE_SYMLINK: i32 = 2;
 const NAME_TO_HANDLE_ALLOWED_FLAGS: i32 = (AT_EMPTY_PATH | AT_SYMLINK_FOLLOW) as i32;
 
 #[repr(C)]
@@ -415,10 +405,6 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
     )
 }
 
-fn linux_file_handle_body(handle_addr: usize) -> UserPtr<u8> {
-    UserPtr::<u8>::from(handle_addr + size_of::<LinuxFileHandle>())
-}
-
 fn name_to_handle_resolve_flags(flags: i32) -> u32 {
     let mut resolve_flags = 0;
     if flags & AT_EMPTY_PATH as i32 != 0 {
@@ -430,93 +416,41 @@ fn name_to_handle_resolve_flags(flags: i32) -> u32 {
     resolve_flags
 }
 
-fn file_handle_kind(loc: ResolveAtResult) -> i32 {
-    match loc {
-        ResolveAtResult::File(loc) if loc.node_type() == NodeType::Symlink => {
-            OSCOMP_FILE_HANDLE_SYMLINK
-        }
-        ResolveAtResult::File(_) | ResolveAtResult::Other(_) => OSCOMP_FILE_HANDLE_REGULAR,
-    }
-}
-
 pub fn sys_name_to_handle_at(
     dirfd: c_int,
     path: *const c_char,
-    handle: UserPtr<u8>,
-    mount_id: UserPtr<i32>,
+    _handle: UserPtr<u8>,
+    _mount_id: UserPtr<i32>,
     flags: i32,
 ) -> AxResult<isize> {
-    let path = vm_load_string(path)?;
-    let handle_addr = handle.address().as_usize();
-    let handle_header = handle.cast::<LinuxFileHandle>();
-    let handle_bytes = handle_header.get_as_mut()?.handle_bytes;
-    let mount_id_ref = mount_id.get_as_mut()?;
-
     if flags & !NAME_TO_HANDLE_ALLOWED_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }
 
-    let resolved = if path.is_empty() && flags & AT_EMPTY_PATH as i32 != 0 && dirfd == AT_FDCWD {
-        ResolveAtResult::File(current_dir_location())
-    } else {
-        resolve_at(
+    let path = vm_load_string(path)?;
+    if !(path.is_empty() && flags & AT_EMPTY_PATH as i32 != 0 && dirfd == AT_FDCWD) {
+        let _ = resolve_at(
             dirfd,
             Some(path.as_str()),
             name_to_handle_resolve_flags(flags),
-        )?
-    };
-
-    if handle_bytes > MAX_FILE_HANDLE_SZ {
-        return Err(AxError::InvalidInput);
-    }
-    if handle_bytes < OSCOMP_FILE_HANDLE_BYTES {
-        let header = handle_header.get_as_mut()?;
-        header.handle_bytes = OSCOMP_FILE_HANDLE_BYTES;
-        header.handle_type = file_handle_kind(resolved);
-        return Err(LinuxError::EOVERFLOW.into());
+        )?;
     }
 
-    let kind = file_handle_kind(resolved);
-    {
-        let header = handle_header.get_as_mut()?;
-        header.handle_bytes = OSCOMP_FILE_HANDLE_BYTES;
-        header.handle_type = kind;
-    }
-
-    let body =
-        linux_file_handle_body(handle_addr).get_as_mut_slice(OSCOMP_FILE_HANDLE_BYTES as usize)?;
-    body.copy_from_slice(&[
-        OSCOMP_FILE_HANDLE_MAGIC[0],
-        OSCOMP_FILE_HANDLE_MAGIC[1],
-        OSCOMP_FILE_HANDLE_MAGIC[2],
-        OSCOMP_FILE_HANDLE_MAGIC[3],
-        kind as u8,
-        0,
-        0,
-        0,
-    ]);
-    *mount_id_ref = 1;
-
-    Ok(0)
+    // axfs-ng has no exportable mount/inode/generation handle contract yet.
+    Err(LinuxError::EOPNOTSUPP.into())
 }
 
-pub fn sys_open_by_handle_at(mount_fd: c_int, handle: UserPtr<u8>, flags: i32) -> AxResult<isize> {
+pub fn sys_open_by_handle_at(mount_fd: c_int, handle: UserPtr<u8>, _flags: i32) -> AxResult<isize> {
     let handle_addr = handle.address().as_usize();
-    let header = *handle.cast::<LinuxFileHandle>().get_as_mut()?;
+    let header = *UserConstPtr::<LinuxFileHandle>::from(handle_addr).get_as_ref()?;
 
-    if header.handle_bytes > MAX_FILE_HANDLE_SZ || header.handle_bytes == 0 {
+    if header.handle_bytes > MAX_FILE_HANDLE_SZ
+        || header.handle_bytes == 0
+        || header.handle_type < 0
+    {
         return Err(AxError::InvalidInput);
     }
 
-    let body =
-        linux_file_handle_body(handle_addr).get_as_mut_slice(header.handle_bytes as usize)?;
-
-    if mount_fd != AT_FDCWD && mount_fd < 0 {
-        return Err(AxError::BadFileDescriptor);
-    }
-    if mount_fd == 0 {
-        return Err(LinuxError::ESTALE.into());
-    }
     if mount_fd != AT_FDCWD {
         get_file_like(mount_fd)?;
     }
@@ -527,17 +461,13 @@ pub fn sys_open_by_handle_at(mount_fd: c_int, handle: UserPtr<u8>, flags: i32) -
         return Err(LinuxError::EPERM.into());
     }
 
-    let is_oscomp_handle = body.len() >= 5 && body[..4] == OSCOMP_FILE_HANDLE_MAGIC;
-    let handle_kind = if is_oscomp_handle {
-        body[4] as i32
-    } else {
-        header.handle_type
-    };
-    if handle_kind == OSCOMP_FILE_HANDLE_SYMLINK {
-        return Err(LinuxError::ELOOP.into());
-    }
+    let body_addr = handle_addr
+        .checked_add(size_of::<LinuxFileHandle>())
+        .ok_or(LinuxError::EFAULT)?;
+    UserConstPtr::<u8>::from(body_addr).get_as_slice(header.handle_bytes as usize)?;
 
-    openat_inner(AT_FDCWD, "/dev/null", flags, 0)
+    // A well-formed handle cannot be decoded until the VFS exports stable IDs.
+    Err(LinuxError::ESTALE.into())
 }
 
 fn open_in_fs(
@@ -613,7 +543,7 @@ fn open_in_fs(
         }?;
         enforce_trailing_slash_directory(path, &existing)?;
         enforce_special_open_rules(&existing, flags, uid)?;
-        check_inode_flags_for_open(&existing, flags)?;
+        check_executable_open_rules(&existing, flags)?;
         if existing.is_dir() && invalid_directory_open(flags) {
             return Err(AxError::IsADirectory);
         }
@@ -662,7 +592,7 @@ fn open_in_fs(
             if proc_data.fsuid() != 0 && !proc_data.is_in_fs_group(owner_gid) {
                 final_mode.remove(NodePermission::SET_GID);
             }
-            loc.update_metadata(MetadataUpdate {
+            loc.update_supported_metadata(MetadataUpdate {
                 owner: Some((proc_data.fsuid(), owner_gid)),
                 mode: Some(final_mode),
                 ..Default::default()

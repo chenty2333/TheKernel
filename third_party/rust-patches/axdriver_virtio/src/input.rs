@@ -15,6 +15,7 @@ pub struct VirtIoInputDev<H: Hal, T: Transport> {
     inner: InnerDev<H, T>,
     device_id: InputDeviceId,
     name: String,
+    irq: Option<usize>,
 }
 
 unsafe impl<H: Hal, T: Transport> Send for VirtIoInputDev<H, T> {}
@@ -23,7 +24,7 @@ unsafe impl<H: Hal, T: Transport> Sync for VirtIoInputDev<H, T> {}
 impl<H: Hal, T: Transport> VirtIoInputDev<H, T> {
     /// Creates a new driver instance and initializes the device, or returns
     /// an error if any step fails.
-    pub fn try_new(transport: T) -> DevResult<Self> {
+    pub fn try_new(transport: T, irq: Option<usize>) -> DevResult<Self> {
         let mut virtio = InnerDev::new(transport).unwrap();
         let name = virtio.name().unwrap_or_else(|_| "<unknown>".to_owned());
         let device_id = virtio.ids().map_err(as_dev_err)?;
@@ -38,6 +39,7 @@ impl<H: Hal, T: Transport> VirtIoInputDev<H, T> {
             inner: virtio,
             device_id,
             name,
+            irq,
         })
     }
 }
@@ -49,6 +51,10 @@ impl<H: Hal, T: Transport> BaseDriverOps for VirtIoInputDev<H, T> {
 
     fn device_type(&self) -> DeviceType {
         DeviceType::Input
+    }
+
+    fn irq_num(&self) -> Option<usize> {
+        self.irq
     }
 }
 

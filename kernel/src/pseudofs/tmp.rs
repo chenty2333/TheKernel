@@ -3,7 +3,7 @@ use alloc::{
     boxed::Box,
     collections::{BTreeMap, BTreeSet},
     string::String,
-    sync::Arc,
+    sync::{Arc, Weak},
     vec::Vec,
 };
 use core::{any::Any, borrow::Borrow, cmp::Ordering, mem, task::Context};
@@ -123,8 +123,8 @@ impl MemoryFs {
         Filesystem::new(fs)
     }
 
-    fn get(&self, ino: u64) -> Arc<Inode> {
-        self.inodes.lock()[ino as usize - 1].clone()
+    fn get(&self, ino: u64) -> Option<Arc<Inode>> {
+        self.inodes.lock().get(ino as usize - 1).cloned()
     }
 
     fn reserve_pages(&self, pages: u64) -> AxResult<()> {
@@ -191,6 +191,10 @@ impl FilesystemOps for MemoryFs {
             fragment_size: TMPFS_BLOCK_SIZE as u32,
             mount_flags: 0,
         })
+    }
+
+    fn unmount(&self) {
+        self.root.lock().take();
     }
 }
 
@@ -649,11 +653,8 @@ impl Inode {
         drop(inodes);
         if let NodeContent::Dir(dir) = &result.content {
             let mut entries = dir.entries.lock();
-            entries.insert(".".into(), InodeRef::new(fs.clone(), ino));
-            entries.insert(
-                "..".into(),
-                InodeRef::new(fs.clone(), parent.unwrap_or(ino)),
-            );
+            entries.insert(".".into(), InodeRef::new(fs, ino));
+            entries.insert("..".into(), InodeRef::new(fs, parent.unwrap_or(ino)));
         }
         result
     }
@@ -674,24 +675,37 @@ impl Inode {
 }
 
 struct InodeRef {
-    fs: Arc<MemoryFs>,
+    fs: Weak<MemoryFs>,
     ino: u64,
 }
 
 impl InodeRef {
-    pub fn new(fs: Arc<MemoryFs>, ino: u64) -> Self {
-        fs.get(ino).metadata.lock().nlink += 1;
-        Self { fs, ino }
+    pub fn new(fs: &Arc<MemoryFs>, ino: u64) -> Self {
+        fs.get(ino)
+            .expect("new tmpfs inode reference")
+            .metadata
+            .lock()
+            .nlink += 1;
+        Self {
+            fs: Arc::downgrade(fs),
+            ino,
+        }
     }
 
-    fn get(&self) -> Arc<Inode> {
-        self.fs.get(self.ino)
+    fn get(&self) -> Option<Arc<Inode>> {
+        self.fs.upgrade()?.get(self.ino)
     }
 }
 
 impl Drop for InodeRef {
     fn drop(&mut self) {
-        release_inode(&self.fs, &self.get(), 1);
+        let Some(fs) = self.fs.upgrade() else {
+            return;
+        };
+        let Some(inode) = fs.get(self.ino) else {
+            return;
+        };
+        release_inode(&fs, &inode, 1);
     }
 }
 
@@ -799,9 +813,14 @@ impl FileNodeOps for MemoryNode {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         let file = self.inode.as_file()?;
         if let Some(symlink) = file.symlink.lock().as_ref() {
-            assert_eq!(offset, 0);
-            let len = buf.len().min(symlink.len());
-            buf[..len].copy_from_slice(&symlink.as_bytes()[..len]);
+            let Ok(offset) = usize::try_from(offset) else {
+                return Ok(0);
+            };
+            let Some(remaining) = symlink.as_bytes().get(offset..) else {
+                return Ok(0);
+            };
+            let len = buf.len().min(remaining.len());
+            buf[..len].copy_from_slice(&remaining[..len]);
             return Ok(len);
         }
         file.read_at(buf, offset)
@@ -850,10 +869,11 @@ impl DirNodeOps for MemoryNode {
             .enumerate()
             .skip(offset as usize)
         {
+            let inode = entry.get().ok_or(VfsError::Io)?;
             if !sink.accept(
                 &name.0,
                 entry.ino,
-                entry.get().metadata.lock().node_type,
+                inode.metadata.lock().node_type,
                 i as u64 + 1,
             ) {
                 return Ok(count);
@@ -868,7 +888,7 @@ impl DirNodeOps for MemoryNode {
         let entries = dir.entries.lock();
 
         let entry = entries.get(name).ok_or(VfsError::NotFound)?;
-        let inode = entry.get();
+        let inode = entry.get().ok_or(VfsError::NotFound)?;
         let node_type = inode.metadata.lock().node_type;
         self.new_entry(name, node_type, inode)
     }
@@ -886,7 +906,7 @@ impl DirNodeOps for MemoryNode {
             return Err(VfsError::AlreadyExists);
         }
         let inode = Inode::new(&self.fs, Some(self.inode.ino), node_type, permission);
-        entries.insert(name.into(), InodeRef::new(self.fs.clone(), inode.ino));
+        entries.insert(name.into(), InodeRef::new(&self.fs, inode.ino));
         self.new_entry(name, node_type, inode)
     }
 
@@ -901,7 +921,7 @@ impl DirNodeOps for MemoryNode {
         }
         let inode = target.inode.clone();
         let node_type = target.metadata()?.node_type;
-        entries.insert(name.into(), InodeRef::new(self.fs.clone(), inode.ino));
+        entries.insert(name.into(), InodeRef::new(&self.fs, inode.ino));
         self.new_entry(name, node_type, inode)
     }
 
@@ -909,7 +929,7 @@ impl DirNodeOps for MemoryNode {
         let dir = self.inode.as_dir()?;
         let mut entries = dir.entries.lock();
 
-        let Some(inode) = entries.get(name).map(InodeRef::get) else {
+        let Some(inode) = entries.get(name).and_then(InodeRef::get) else {
             return Err(VfsError::NotFound);
         };
         if let NodeContent::Dir(DirContent {

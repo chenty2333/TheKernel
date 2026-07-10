@@ -98,7 +98,6 @@ static KEY_MAXKEYS: AtomicUsize = AtomicUsize::new(KEY_MAXKEYS_DEFAULT);
 static KEY_MAXBYTES: AtomicUsize = AtomicUsize::new(KEY_MAXBYTES_DEFAULT);
 static KEY_ROOT_MAXKEYS: AtomicUsize = AtomicUsize::new(KEY_ROOT_MAXKEYS_DEFAULT);
 static KEY_ROOT_MAXBYTES: AtomicUsize = AtomicUsize::new(KEY_ROOT_MAXBYTES_DEFAULT);
-static KEY_GC_DELAY: AtomicUsize = AtomicUsize::new(300);
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum KeyState {
@@ -1184,14 +1183,6 @@ pub(crate) fn key_users_snapshot() -> String {
         ));
     }
     out
-}
-
-pub(crate) fn key_gc_delay() -> usize {
-    KEY_GC_DELAY.load(Ordering::Relaxed)
-}
-
-pub(crate) fn set_key_gc_delay(value: usize) {
-    KEY_GC_DELAY.store(value, Ordering::Relaxed);
 }
 
 pub(crate) fn key_maxkeys() -> usize {

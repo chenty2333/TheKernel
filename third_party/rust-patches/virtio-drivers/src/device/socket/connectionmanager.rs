@@ -1,14 +1,14 @@
-use super::{
-    protocol::VsockAddr, vsock::ConnectionInfo, DisconnectReason, SocketError, VirtIOSocket,
-    VsockEvent, VsockEventType, DEFAULT_RX_BUFFER_SIZE,
-};
-use crate::{transport::Transport, Hal, Result};
 use alloc::{boxed::Box, vec::Vec};
-use core::cmp::min;
-use core::convert::TryInto;
-use core::hint::spin_loop;
+use core::{cmp::min, convert::TryInto, hint::spin_loop};
+
 use log::debug;
 use zerocopy::FromZeroes;
+
+use super::{
+    DEFAULT_RX_BUFFER_SIZE, DisconnectReason, SocketError, VirtIOSocket, VsockEvent,
+    VsockEventType, protocol::VsockAddr, vsock::ConnectionInfo,
+};
+use crate::{Hal, Result, transport::Transport};
 
 const DEFAULT_PER_CONNECTION_BUFFER_CAPACITY: u32 = 1024;
 
@@ -413,25 +413,27 @@ impl RingBuffer {
 
 #[cfg(test)]
 mod tests {
+    use alloc::{sync::Arc, vec};
+    use core::{mem::size_of, ptr::NonNull};
+    use std::{sync::Mutex, thread};
+
+    use zerocopy::{AsBytes, FromBytes};
+
     use super::*;
     use crate::{
         device::socket::{
             protocol::{
                 SocketType, StreamShutdown, VirtioVsockConfig, VirtioVsockHdr, VirtioVsockOp,
             },
-            vsock::{VsockBufferStatus, QUEUE_SIZE, RX_QUEUE_IDX, TX_QUEUE_IDX},
+            vsock::{QUEUE_SIZE, RX_QUEUE_IDX, TX_QUEUE_IDX, VsockBufferStatus},
         },
         hal::fake::FakeHal,
         transport::{
-            fake::{FakeTransport, QueueStatus, State},
             DeviceType,
+            fake::{FakeTransport, QueueStatus, State},
         },
         volatile::ReadOnly,
     };
-    use alloc::{sync::Arc, vec};
-    use core::{mem::size_of, ptr::NonNull};
-    use std::{sync::Mutex, thread};
-    use zerocopy::{AsBytes, FromBytes};
 
     #[test]
     fn send_recv() {

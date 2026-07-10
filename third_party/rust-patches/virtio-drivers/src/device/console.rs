@@ -1,13 +1,17 @@
 //! Driver for VirtIO console devices.
 
-use crate::hal::Hal;
-use crate::queue::VirtQueue;
-use crate::transport::Transport;
-use crate::volatile::{volread, ReadOnly, WriteOnly};
-use crate::{Result, PAGE_SIZE};
 use alloc::boxed::Box;
-use bitflags::bitflags;
 use core::ptr::NonNull;
+
+use bitflags::bitflags;
+
+use crate::{
+    PAGE_SIZE, Result,
+    hal::Hal,
+    queue::VirtQueue,
+    transport::Transport,
+    volatile::{ReadOnly, WriteOnly, volread},
+};
 
 const QUEUE_RECEIVEQ_PORT_0: u16 = 0;
 const QUEUE_TRANSMITQ_PORT_0: u16 = 1;
@@ -31,7 +35,7 @@ const SUPPORTED_FEATURES: Features = Features::RING_EVENT_IDX.union(Features::RI
 /// println!("VirtIO console {}x{}", info.rows, info.columns);
 ///
 /// for &c in b"Hello console!\n" {
-///   console.send(c)?;
+///     console.send(c)?;
 /// }
 ///
 /// let c = console.recv(true)?;
@@ -253,17 +257,18 @@ bitflags! {
 
 #[cfg(test)]
 mod tests {
+    use alloc::{sync::Arc, vec};
+    use core::ptr::NonNull;
+    use std::{sync::Mutex, thread};
+
     use super::*;
     use crate::{
         hal::fake::FakeHal,
         transport::{
-            fake::{FakeTransport, QueueStatus, State},
             DeviceType,
+            fake::{FakeTransport, QueueStatus, State},
         },
     };
-    use alloc::{sync::Arc, vec};
-    use core::ptr::NonNull;
-    use std::{sync::Mutex, thread};
 
     #[test]
     fn receive() {

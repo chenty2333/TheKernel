@@ -1213,10 +1213,41 @@ impl<'a> Socket<'a> {
         self.rx_buffer.capacity()
     }
 
+    /// Replace the receive storage before the TCP state machine is active.
+    pub fn replace_recv_buffer(
+        &mut self,
+        buffer: SocketBuffer<'a>,
+    ) -> Result<(), SocketBuffer<'a>> {
+        if self.state != State::Closed || !self.rx_buffer.is_empty() || !self.assembler.is_empty() {
+            return Err(buffer);
+        }
+
+        let capacity = buffer.capacity();
+        if capacity > 1 << 30 {
+            return Err(buffer);
+        }
+        let capacity_log2 = mem::size_of::<usize>() * 8 - capacity.max(1).leading_zeros() as usize;
+        self.remote_win_shift = capacity_log2.saturating_sub(16) as u8;
+        self.rx_buffer = buffer;
+        Ok(())
+    }
+
     /// Return the maximum number of bytes inside the transmit buffer.
     #[inline]
     pub fn send_capacity(&self) -> usize {
         self.tx_buffer.capacity()
+    }
+
+    /// Replace the transmit storage before the TCP state machine is active.
+    pub fn replace_send_buffer(
+        &mut self,
+        buffer: SocketBuffer<'a>,
+    ) -> Result<(), SocketBuffer<'a>> {
+        if self.state != State::Closed || !self.tx_buffer.is_empty() {
+            return Err(buffer);
+        }
+        self.tx_buffer = buffer;
+        Ok(())
     }
 
     /// Check whether the receive half of the full-duplex connection buffer is open

@@ -24,6 +24,7 @@ use starry_signal::{SignalInfo, Signo};
 use super::{FileHandle, FileLike, Kstat, get_file_description, get_file_like, get_typed_file};
 use crate::{
     file::{IoDst, IoSrc, memfd},
+    mounts,
     task::{AsThread, send_signal_to_process},
 };
 
@@ -169,7 +170,8 @@ pub fn metadata_to_kstat(metadata: &Metadata) -> Kstat {
     let perm = metadata.mode.bits() as u32;
     let mode = ((ty as u32) << 12) | perm;
     Kstat {
-        dev: metadata.device,
+        dev: mounts::linux_device_id(metadata.device).0,
+        mnt_id: 0,
         ino: metadata.inode,
         mode,
         nlink: metadata.nlink as _,
@@ -190,6 +192,7 @@ pub fn metadata_to_kstat(metadata: &Metadata) -> Kstat {
 
 pub fn location_to_kstat(loc: &Location) -> AxResult<Kstat> {
     let mut stat = metadata_to_kstat(&loc.metadata()?);
+    stat.mnt_id = loc.mountpoint().mount_id();
     let (attributes, attributes_mask) = super::inode_flags::statx_attributes(loc);
     stat.attributes = attributes;
     stat.attributes_mask = attributes_mask;
@@ -249,7 +252,6 @@ impl FileLike for File {
                 file.seek(SeekFrom::Current(0))?
             };
             super::executable::check_not_active(inner.location())?;
-            super::inode_flags::check_write(inner.location(), appending)?;
             let allowed = allowed_write_len(offset, len)?;
             if allowed == 0 {
                 return Ok(0);

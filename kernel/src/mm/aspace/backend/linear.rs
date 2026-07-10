@@ -39,7 +39,8 @@ impl LinearBackend {
     }
 
     pub(crate) fn ensure_range_covered(&self, start: VirtAddr, size: usize) -> AxResult {
-        self.check_range(VirtAddrRange::from_start_size(start, size))
+        let range = VirtAddrRange::try_from_start_size(start, size).ok_or(AxError::InvalidInput)?;
+        self.check_range(range)
     }
 
     fn clone_for_range(
@@ -96,7 +97,8 @@ impl BackendOps for LinearBackend {
 
     fn map(&self, range: VirtAddrRange, flags: MappingFlags, pt: &mut PageTableCursor) -> AxResult {
         self.check_range(range)?;
-        let pa_range = PhysAddrRange::from_start_size(self.pa(range.start), range.size());
+        let pa_range = PhysAddrRange::try_from_start_size(self.pa(range.start), range.size())
+            .ok_or(AxError::InvalidInput)?;
         debug!("Linear::map: {range:?} -> {pa_range:?} {flags:?}");
         pt.map_region(
             range.start,
@@ -110,7 +112,8 @@ impl BackendOps for LinearBackend {
 
     fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult {
         self.check_range(range)?;
-        let pa_range = PhysAddrRange::from_start_size(self.pa(range.start), range.size());
+        let pa_range = PhysAddrRange::try_from_start_size(self.pa(range.start), range.size())
+            .ok_or(AxError::InvalidInput)?;
         debug!("Linear::unmap: {range:?} -> {pa_range:?}");
         pt.unmap_region(range.start, range.size())?;
         Ok(())

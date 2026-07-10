@@ -21,10 +21,28 @@ struct FileFutexKey {
     inode: u64,
 }
 
-static FILE_FUTEX_HANDLES: Mutex<BTreeMap<FileFutexKey, Weak<()>>> = Mutex::new(BTreeMap::new());
+static FILE_FUTEX_HANDLES: Mutex<BTreeMap<FileFutexKey, Weak<FileFutexIdentity>>> =
+    Mutex::new(BTreeMap::new());
 const REGISTERING_LISTENER: usize = usize::MAX;
 
-fn file_futex_handle(cache: &CachedFile) -> Arc<()> {
+struct FileFutexIdentity {
+    key: FileFutexKey,
+    handle: Arc<()>,
+}
+
+impl Drop for FileFutexIdentity {
+    fn drop(&mut self) {
+        let mut handles = FILE_FUTEX_HANDLES.lock();
+        if handles
+            .get(&self.key)
+            .is_some_and(|weak| core::ptr::eq(weak.as_ptr(), self))
+        {
+            handles.remove(&self.key);
+        }
+    }
+}
+
+fn file_futex_handle(cache: &CachedFile) -> Arc<FileFutexIdentity> {
     let loc = cache.location();
     let key = FileFutexKey {
         device: loc.mountpoint().device(),
@@ -35,7 +53,10 @@ fn file_futex_handle(cache: &CachedFile) -> Arc<()> {
         return handle;
     }
 
-    let handle = Arc::new(());
+    let handle = Arc::new(FileFutexIdentity {
+        key,
+        handle: Arc::new(()),
+    });
     handles.insert(key, Arc::downgrade(&handle));
     handle
 }
@@ -61,7 +82,7 @@ pub struct FileBackendInner {
     file_end: Option<u64>,
     handle: AtomicUsize,
     map_id: Arc<()>,
-    futex_handle: Arc<()>,
+    futex_handle: Arc<FileFutexIdentity>,
     writable_mapping: Option<Arc<memfd::WritableMappingRegistration>>,
 }
 impl Drop for FileBackendInner {
@@ -133,6 +154,28 @@ impl FileBackendInner {
 #[derive(Clone)]
 pub struct FileBackend(Arc<FileBackendInner>);
 impl FileBackend {
+    fn page_number_for(&self, vaddr: VirtAddr) -> AxResult<u32> {
+        let delta = vaddr
+            .as_usize()
+            .checked_sub(self.0.start.as_usize())
+            .ok_or(AxError::InvalidInput)?;
+        if !delta.is_multiple_of(PAGE_SIZE_4K) {
+            return Err(AxError::InvalidInput);
+        }
+        u32::try_from(delta / PAGE_SIZE_4K)
+            .ok()
+            .and_then(|delta| self.0.offset_page.checked_add(delta))
+            .ok_or(AxError::InvalidInput)
+    }
+
+    fn validate_range(&self, range: VirtAddrRange) -> AxResult {
+        pages_in(range, PageSize::Size4K)?;
+        if !range.is_empty() {
+            self.page_number_for(range.end - PAGE_SIZE_4K)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_flags(&self, flags: MappingFlags) -> AxResult {
         let mut required_flags = FileFlags::empty();
         if flags.contains(MappingFlags::READ) {
@@ -152,12 +195,12 @@ impl FileBackend {
     }
 
     pub fn futex_handle(&self) -> Weak<()> {
-        Arc::downgrade(&self.0.futex_handle)
+        Arc::downgrade(&self.0.futex_handle.handle)
     }
 
     pub fn futex_key(&self, address: usize) -> (Weak<()>, usize) {
-        let offset = self.0.offset_page as usize * PAGE_SIZE_4K
-            + address.saturating_sub(self.0.start.as_usize());
+        let offset = (self.0.offset_page as usize * PAGE_SIZE_4K)
+            .saturating_add(address.saturating_sub(self.0.start.as_usize()));
         (self.futex_handle(), offset)
     }
 
@@ -189,11 +232,7 @@ impl FileBackend {
             return false;
         }
 
-        let file_page = page_start.sub_addr(self.0.start) / PAGE_SIZE_4K;
-        if file_page > u32::MAX as usize {
-            return false;
-        }
-        let Some(pn) = self.0.offset_page.checked_add(file_page as u32) else {
+        let Ok(pn) = self.page_number_for(page_start) else {
             return false;
         };
 
@@ -218,13 +257,9 @@ impl FileBackend {
             return Err(AxError::BadAddress);
         }
 
-        let file_page = page_start.sub_addr(self.0.start) / PAGE_SIZE_4K;
-        if file_page > u32::MAX as usize {
-            return Err(AxError::BadAddress);
-        }
-        let Some(pn) = self.0.offset_page.checked_add(file_page as u32) else {
-            return Err(AxError::BadAddress);
-        };
+        let pn = self
+            .page_number_for(page_start)
+            .map_err(|_| AxError::BadAddress)?;
 
         self.0.cache.pin_cached_page_by_paddr(pn, paddr)
     }
@@ -277,15 +312,17 @@ impl FileBackend {
         size: usize,
         pt: &mut PageTableCursor,
     ) -> AxResult {
-        let old_range = VirtAddrRange::from_start_size(old_start, size);
-        let new_pages = pages_in(
-            VirtAddrRange::from_start_size(new_start, size),
-            PageSize::Size4K,
-        )?;
+        let old_range =
+            VirtAddrRange::try_from_start_size(old_start, size).ok_or(AxError::InvalidInput)?;
+        let new_range =
+            VirtAddrRange::try_from_start_size(new_start, size).ok_or(AxError::InvalidInput)?;
+        let new_pages = pages_in(new_range, PageSize::Size4K)?;
         for (old_addr, new_addr) in pages_in(old_range, PageSize::Size4K)?.zip(new_pages) {
             match pt.query(old_addr) {
                 Ok((paddr, flags, page_size)) => {
-                    assert_eq!(page_size, PageSize::Size4K);
+                    if page_size != PageSize::Size4K {
+                        return Err(AxError::BadAddress);
+                    }
                     pt.map(new_addr, paddr, PageSize::Size4K, page_table_flags(flags))?;
                 }
                 Err(PagingError::NotMapped) => {}
@@ -308,10 +345,11 @@ impl BackendOps for FileBackend {
 
     fn map(
         &self,
-        _range: VirtAddrRange,
+        range: VirtAddrRange,
         flags: MappingFlags,
         _pt: &mut PageTableCursor,
     ) -> AxResult {
+        self.validate_range(range)?;
         self.check_flags(flags)?;
         if let Some(registration) = &self.0.writable_mapping {
             registration.set_active(flags.contains(MappingFlags::WRITE));
@@ -355,17 +393,26 @@ impl BackendOps for FileBackend {
         self.0.cache.with_direct_io_excluded(|| {
             let mut pages = 0;
             let mut to_be_evicted = Vec::new();
-            let start_page =
-                ((range.start - self.0.start) / PAGE_SIZE_4K) as u32 + self.0.offset_page;
+            let start_page = self.page_number_for(range.start)?;
             for (i, addr) in pages_in(range, PageSize::Size4K)?.enumerate() {
-                let pn = start_page + i as u32;
+                let pn = u32::try_from(i)
+                    .ok()
+                    .and_then(|i| start_page.checked_add(i))
+                    .ok_or(AxError::InvalidInput)?;
                 match pt.query(addr) {
-                    Ok((paddr, page_flags, _)) => {
+                    Ok((paddr, page_flags, page_size)) => {
+                        if page_size != PageSize::Size4K {
+                            return Err(AxError::BadAddress);
+                        }
                         if access_flags.contains(MappingFlags::WRITE)
                             && !page_flags.contains(MappingFlags::WRITE)
                         {
                             self.0.cache.with_page(pn, |page| {
-                                page.expect("page should be present").mark_dirty();
+                                let page = page.ok_or(AxError::BadAddress)?;
+                                if page.paddr() != paddr {
+                                    return Err(AxError::BadAddress);
+                                }
+                                page.mark_dirty();
                                 pt.remap(addr, paddr, page_table_flags(flags))?;
                                 pages += 1;
                                 AxResult::Ok(())
@@ -442,7 +489,8 @@ impl Backend {
         file_end: Option<u64>,
         aspace: &Arc<Mutex<AddrSpace>>,
     ) -> AxResult<Self> {
-        let offset_page = (offset / PAGE_SIZE_4K) as u32;
+        let offset_page =
+            u32::try_from(offset / PAGE_SIZE_4K).map_err(|_| AxError::InvalidInput)?;
         let writable_mapping = memfd::new_writable_mapping_registration(cache.location());
         let futex_handle = file_futex_handle(&cache);
         let inner = Arc::new(FileBackendInner {

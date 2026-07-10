@@ -424,7 +424,11 @@ impl Iterator for ReadDir {
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
-    use core::{any::Any, time::Duration};
+    use core::{
+        any::Any,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        time::Duration,
+    };
 
     use axfs_ng_vfs::{
         DirEntry, DirEntrySink, DirNode, DirNodeOps, Filesystem, FilesystemOps, Metadata,
@@ -437,11 +441,19 @@ mod tests {
 
     struct TestFs {
         root: Once<DirEntry>,
+        flushes: AtomicUsize,
+        unmounts: AtomicUsize,
+        fail_flush: AtomicBool,
     }
 
     impl TestFs {
         fn new() -> Arc<Self> {
-            let fs = Arc::new(Self { root: Once::new() });
+            let fs = Arc::new(Self {
+                root: Once::new(),
+                flushes: AtomicUsize::new(0),
+                unmounts: AtomicUsize::new(0),
+                fail_flush: AtomicBool::new(false),
+            });
             let root = DirEntry::new_dir(
                 {
                     let fs = fs.clone();
@@ -487,6 +499,19 @@ mod tests {
                 fragment_size: 4096,
                 mount_flags: 0,
             })
+        }
+
+        fn flush(&self) -> VfsResult<()> {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            if self.fail_flush.load(Ordering::Relaxed) {
+                Err(VfsError::Io)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn unmount(&self) {
+            self.unmounts.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -595,6 +620,239 @@ mod tests {
         fn rename(&self, _src_name: &str, _dst_dir: &DirNode, _dst_name: &str) -> VfsResult<()> {
             Err(VfsError::Unsupported)
         }
+    }
+
+    #[test]
+    fn filesystem_device_is_stable_across_mounts() {
+        let fs = Filesystem::new(TestFs::new());
+        let first = Mountpoint::new_root(&fs);
+        let second = Mountpoint::new_root(&fs);
+
+        assert_eq!(first.device(), second.device());
+        assert_ne!(first.mount_id(), second.mount_id());
+    }
+
+    #[test]
+    fn path_in_mount_stops_at_the_current_mount_root() {
+        let context = TestFs::context();
+        let nested = context.resolve("/child/child").unwrap();
+        assert_eq!(nested.path_in_mount().unwrap().as_str(), "/child/child");
+
+        let target = context.resolve("/child").unwrap();
+        let mounted_fs = Filesystem::new(TestFs::new());
+        let mountpoint = target.mount(&mounted_fs).unwrap();
+        let mounted_root = context.resolve("/child").unwrap();
+
+        assert_eq!(mounted_root.path_in_mount().unwrap().as_str(), "/");
+        assert_eq!(mounted_root.absolute_path().unwrap().as_str(), "/child");
+        assert_eq!(mounted_root.mountpoint().mount_id(), mountpoint.mount_id());
+    }
+
+    #[test]
+    fn unmount_flushes_before_releasing_the_filesystem() {
+        let context = TestFs::context();
+        let target = context.resolve("/child").unwrap();
+        let mounted = TestFs::new();
+        target.mount(&Filesystem::new(mounted.clone())).unwrap();
+
+        let mounted_root = context.resolve("/child").unwrap();
+        mounted_root.unmount().unwrap();
+
+        assert_eq!(mounted.flushes.load(Ordering::Relaxed), 1);
+        assert_eq!(mounted.unmounts.load(Ordering::Relaxed), 0);
+        drop(mounted_root);
+        assert_eq!(mounted.unmounts.load(Ordering::Relaxed), 1);
+        assert!(!target.is_mountpoint());
+    }
+
+    #[test]
+    fn normal_unmount_rejects_live_locations_without_flushing() {
+        let context = TestFs::context();
+        let target = context.resolve("/child").unwrap();
+        let mounted = TestFs::new();
+        target.mount(&Filesystem::new(mounted.clone())).unwrap();
+
+        let mounted_root = context.resolve("/child").unwrap();
+        let open_location = mounted_root.clone();
+        assert_eq!(mounted_root.unmount(), Err(VfsError::ResourceBusy));
+        assert_eq!(mounted.flushes.load(Ordering::Relaxed), 0);
+        assert!(target.is_mountpoint());
+
+        drop(open_location);
+        mounted_root.unmount().unwrap();
+        drop(mounted_root);
+        assert_eq!(mounted.flushes.load(Ordering::Relaxed), 1);
+        assert_eq!(mounted.unmounts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn lazy_unmount_keeps_an_open_location_alive() {
+        let context = TestFs::context();
+        let target = context.resolve("/child").unwrap();
+        let mounted = TestFs::new();
+        target.mount(&Filesystem::new(mounted.clone())).unwrap();
+
+        let mounted_root = context.resolve("/child").unwrap();
+        let mount_id = mounted_root.mountpoint().mount_id();
+        let open_location = mounted_root.clone();
+        mounted_root.lazy_unmount().unwrap();
+
+        assert!(!target.is_mountpoint());
+        assert_ne!(
+            context.resolve("/child").unwrap().mountpoint().mount_id(),
+            mount_id
+        );
+        assert!(open_location.lookup_no_follow("child").is_ok());
+        assert_eq!(mounted.flushes.load(Ordering::Relaxed), 0);
+        assert_eq!(mounted.unmounts.load(Ordering::Relaxed), 0);
+
+        drop(mounted_root);
+        assert_eq!(mounted.unmounts.load(Ordering::Relaxed), 0);
+        drop(open_location);
+        assert_eq!(mounted.unmounts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn lazy_unmount_detaches_a_nested_mount_tree() {
+        let context = TestFs::context();
+        let outer_target = context.resolve("/child").unwrap();
+        let outer = TestFs::new();
+        outer_target
+            .mount(&Filesystem::new(outer.clone()))
+            .unwrap();
+
+        let outer_root = context.resolve("/child").unwrap();
+        let inner_target = outer_root.lookup_no_follow("child").unwrap();
+        let inner = TestFs::new();
+        let inner_mount = inner_target
+            .mount(&Filesystem::new(inner.clone()))
+            .unwrap();
+        let inner_mount_id = inner_mount.mount_id();
+        drop(inner_mount);
+        drop(inner_target);
+
+        assert_eq!(outer_root.mountpoint().subtree_devices().len(), 2);
+        outer_root.lazy_unmount().unwrap();
+        assert!(!outer_target.is_mountpoint());
+
+        let detached_inner = outer_root.lookup_no_follow("child").unwrap();
+        assert_eq!(detached_inner.mountpoint().mount_id(), inner_mount_id);
+        drop(detached_inner);
+        drop(outer_root);
+        assert_eq!(outer.unmounts.load(Ordering::Relaxed), 1);
+        assert_eq!(inner.unmounts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn lazy_unmount_of_a_stacked_mount_reveals_the_previous_mount() {
+        let context = TestFs::context();
+        let target = context.resolve("/child").unwrap();
+        target.mount(&Filesystem::new(TestFs::new())).unwrap();
+        let lower = context.resolve("/child").unwrap();
+        let lower_mount_id = lower.mountpoint().mount_id();
+
+        lower.mount(&Filesystem::new(TestFs::new())).unwrap();
+        let upper = context.resolve("/child").unwrap();
+        assert_ne!(upper.mountpoint().mount_id(), lower_mount_id);
+        upper.lazy_unmount().unwrap();
+
+        assert_eq!(
+            context.resolve("/child").unwrap().mountpoint().mount_id(),
+            lower_mount_id
+        );
+    }
+
+    #[test]
+    fn namespace_root_cannot_be_unmounted() {
+        let context = TestFs::context();
+        let root = context.root_dir();
+
+        assert_eq!(root.unmount(), Err(VfsError::ResourceBusy));
+        assert_eq!(root.lazy_unmount(), Err(VfsError::ResourceBusy));
+    }
+
+    #[test]
+    fn failed_unmount_flush_leaves_the_mount_attached() {
+        let context = TestFs::context();
+        let target = context.resolve("/child").unwrap();
+        let mounted = TestFs::new();
+        target.mount(&Filesystem::new(mounted.clone())).unwrap();
+        mounted.fail_flush.store(true, Ordering::Relaxed);
+
+        let mounted_root = context.resolve("/child").unwrap();
+        assert_eq!(mounted_root.unmount().unwrap_err(), VfsError::Io);
+        assert_eq!(mounted.flushes.load(Ordering::Relaxed), 1);
+        assert_eq!(mounted.unmounts.load(Ordering::Relaxed), 0);
+        assert!(target.is_mountpoint());
+
+        mounted.fail_flush.store(false, Ordering::Relaxed);
+        mounted_root.unmount().unwrap();
+    }
+
+    #[test]
+    fn failed_recursive_unmount_keeps_the_child_attached() {
+        let context = TestFs::context();
+        let target = context.resolve("/child").unwrap();
+        let mounted = TestFs::new();
+        target.mount(&Filesystem::new(mounted.clone())).unwrap();
+        mounted.fail_flush.store(true, Ordering::Relaxed);
+
+        assert_eq!(context.root_dir().unmount_all(), Err(VfsError::Io));
+        assert!(target.is_mountpoint());
+        assert_eq!(mounted.unmounts.load(Ordering::Relaxed), 0);
+
+        mounted.fail_flush.store(false, Ordering::Relaxed);
+        context.resolve("/child").unwrap().unmount().unwrap();
+    }
+
+    #[test]
+    fn flush_all_filesystems_visits_each_stable_device_once() {
+        let root = TestFs::new();
+        let root_fs = Filesystem::new(root.clone());
+        let root_mount = Mountpoint::new_root(&root_fs);
+        let context = FsContext::new(root_mount.root_location());
+
+        let mounted = TestFs::new();
+        let mounted_fs = Filesystem::new(mounted.clone());
+        context
+            .resolve("/child")
+            .unwrap()
+            .mount(&mounted_fs)
+            .unwrap();
+
+        let alias = TestFs::new();
+        let alias_fs = Filesystem::new_with_device(alias.clone(), mounted_fs.device());
+        context
+            .resolve("/child/child")
+            .unwrap()
+            .mount(&alias_fs)
+            .unwrap();
+
+        root_mount.flush_all_filesystems().unwrap();
+
+        assert_eq!(root.flushes.load(Ordering::Relaxed), 1);
+        assert_eq!(mounted.flushes.load(Ordering::Relaxed), 1);
+        assert_eq!(alias.flushes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn flush_all_filesystems_continues_after_an_error() {
+        let root = TestFs::new();
+        root.fail_flush.store(true, Ordering::Relaxed);
+        let root_fs = Filesystem::new(root.clone());
+        let root_mount = Mountpoint::new_root(&root_fs);
+        let context = FsContext::new(root_mount.root_location());
+
+        let mounted = TestFs::new();
+        context
+            .resolve("/child")
+            .unwrap()
+            .mount(&Filesystem::new(mounted.clone()))
+            .unwrap();
+
+        assert_eq!(root_mount.flush_all_filesystems(), Err(VfsError::Io));
+        assert_eq!(root.flushes.load(Ordering::Relaxed), 1);
+        assert_eq!(mounted.flushes.load(Ordering::Relaxed), 1);
     }
 
     #[test]

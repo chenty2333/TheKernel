@@ -149,7 +149,7 @@ impl<O: SimpleDirOps> DirNodeOps for SimpleDir<O> {
             .map(Cow::Borrowed)
             .chain(self.ops.child_names());
 
-        let this_entry = self.this.upgrade().unwrap();
+        let this_entry = self.this.upgrade().ok_or(VfsError::NotFound)?;
         let this_dir = this_entry.as_dir()?;
 
         let mut count = 0;

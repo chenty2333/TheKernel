@@ -16,6 +16,7 @@ bus-mmio = []
 bus-pci = ["dep:axdriver_pci", "dep:axhal", "dep:axconfig"]
 net = ["dep:axdriver_net"]
 block = ["dep:axdriver_block"]
+shared-block = ["block", "dep:axsync"]
 display = ["dep:axdriver_display"]
 input = ["dep:axdriver_input"]
 vsock = ["axdriver_vsock"]
@@ -66,6 +67,7 @@ axdriver_vsock = { workspace = true, optional = true }
 axerrno = { workspace = true, optional = true }
 axhal = { workspace = true, optional = true }
 axmm = { workspace = true, optional = true }
+axsync = { workspace = true, optional = true }
 axklib = { workspace = true, optional = true }
 cfg-if.workspace = true
 crate_interface.workspace = true

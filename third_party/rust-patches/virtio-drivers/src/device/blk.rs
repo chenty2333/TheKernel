@@ -729,7 +729,9 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
 
     /// Requests the device to flush any pending writes to storage.
     ///
-    /// This will be ignored if the device doesn't support the `VIRTIO_BLK_F_FLUSH` feature.
+    /// If `VIRTIO_BLK_F_FLUSH` was not offered, the VirtIO block contract
+    /// treats the device as write-through (unless configurable writeback was
+    /// negotiated), so no explicit flush command is required.
     pub fn flush(&mut self) -> Result {
         if self.negotiated_features.contains(BlkFeature::FLUSH) {
             record_blk_flush();

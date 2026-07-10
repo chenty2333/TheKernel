@@ -1,5 +1,6 @@
 //! User task management.
 
+mod access;
 mod accounting;
 pub(crate) mod coredump;
 mod creds;
@@ -16,6 +17,19 @@ mod timer;
 mod user;
 
 // Re-exports from split sub-modules — keep the old `crate::task::*` paths unchanged.
+pub(crate) use self::{
+    access::{
+        PtraceCredentialMode, check_current_prlimit_access, check_current_ptrace_access,
+        check_current_signal_access,
+    },
+    creds::{CapabilityState, Credentials},
+    jobctl::{ContinueResult, StopReport},
+    process::{
+        CgroupNamespace, PidNamespace, TimeNamespace, UTS_FIELD_LEN, UserNamespace, UtsNamespace,
+    },
+    restart::*,
+    thread::ProcStateHint,
+};
 pub use self::{
     accounting::*,
     futex::*,
@@ -27,13 +41,4 @@ pub use self::{
     thread::{AsThread, AssumeSync, Thread},
     timer::*,
     user::*,
-};
-pub(crate) use self::{
-    creds::{CapabilityState, Credentials},
-    jobctl::{ContinueResult, StopReport},
-    process::{
-        CgroupNamespace, PidNamespace, TimeNamespace, UTS_FIELD_LEN, UserNamespace, UtsNamespace,
-    },
-    restart::*,
-    thread::ProcStateHint,
 };

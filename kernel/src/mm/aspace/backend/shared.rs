@@ -16,10 +16,24 @@ pub struct SharedPages {
 }
 impl SharedPages {
     pub fn new(size: usize, page_size: PageSize) -> AxResult<Self> {
-        let num_pages = divide_page(size, page_size);
-        let mut phys_pages = Vec::with_capacity(num_pages);
+        if !page_size.is_aligned(size) {
+            return Err(AxError::InvalidInput);
+        }
+        let num_pages = size / page_size as usize;
+        let mut phys_pages = Vec::new();
+        phys_pages
+            .try_reserve_exact(num_pages)
+            .map_err(|_| AxError::NoMemory)?;
         for _ in 0..num_pages {
-            phys_pages.push(alloc_frame(true, page_size)?);
+            match alloc_frame(true, page_size) {
+                Ok(frame) => phys_pages.push(frame),
+                Err(err) => {
+                    for frame in phys_pages {
+                        dealloc_frame(frame, page_size);
+                    }
+                    return Err(err);
+                }
+            }
         }
         Ok(Self {
             phys_pages: Mutex::new(phys_pages),
@@ -41,7 +55,10 @@ impl SharedPages {
             return Ok(());
         }
 
-        let mut new_pages = Vec::with_capacity(len - current_len);
+        let mut new_pages = Vec::new();
+        new_pages
+            .try_reserve_exact(len - current_len)
+            .map_err(|_| AxError::NoMemory)?;
         for _ in current_len..len {
             match alloc_frame(true, self.size) {
                 Ok(frame) => new_pages.push(frame),
@@ -62,7 +79,20 @@ impl SharedPages {
             }
             return Ok(());
         }
+        let needed = len - pages.len();
+        if pages.try_reserve_exact(needed).is_err() {
+            drop(pages);
+            for frame in new_pages {
+                dealloc_frame(frame, self.size);
+            }
+            return Err(AxError::NoMemory);
+        }
+        let unused = new_pages.split_off(needed);
         pages.extend(new_pages);
+        drop(pages);
+        for frame in unused {
+            dealloc_frame(frame, self.size);
+        }
         Ok(())
     }
 
@@ -184,10 +214,17 @@ impl SharedBackend {
     }
 
     pub(crate) fn ensure_range_covered(&self, start: VirtAddr, size: usize) -> AxResult {
-        debug_assert!(start.is_aligned(self.pages.size));
-        let start_index = divide_page(start - self.start, self.pages.size);
-        let count = divide_page(size, self.pages.size);
-        self.pages.ensure_len(start_index + count)
+        let offset = start
+            .as_usize()
+            .checked_sub(self.start.as_usize())
+            .ok_or(AxError::InvalidInput)?;
+        let start_index = divide_page(offset, self.pages.size)?;
+        let count = divide_page(size, self.pages.size)?;
+        self.pages.ensure_len(
+            start_index
+                .checked_add(count)
+                .ok_or(AxError::InvalidInput)?,
+        )
     }
 
     pub(crate) fn check_protect_flags(&self, flags: MappingFlags) -> AxResult {
@@ -243,16 +280,22 @@ impl BackendOps for SharedBackend {
         access_flags: MappingFlags,
         pt: &mut PageTableCursor,
     ) -> AxResult<(usize, Option<PopulateCallback>)> {
-        let start_index = divide_page(range.start - self.start, self.pages.size);
-        let count = divide_page(range.size(), self.pages.size);
+        let offset = range
+            .start
+            .as_usize()
+            .checked_sub(self.start.as_usize())
+            .ok_or(AxError::InvalidInput)?;
+        let start_index = divide_page(offset, self.pages.size)?;
+        let count = divide_page(range.size(), self.pages.size)?;
         let pages = self.pages.pages_range(start_index, count)?;
         let mut populated = 0;
 
         for (vaddr, paddr) in pages_in(range, self.pages.size)?.zip(pages.into_iter()) {
             match pt.query(vaddr) {
                 Ok((mapped_paddr, page_flags, page_size)) => {
-                    assert_eq!(page_size, self.pages.size);
-                    assert_eq!(mapped_paddr, paddr);
+                    if page_size != self.pages.size || mapped_paddr != paddr {
+                        return Err(AxError::BadAddress);
+                    }
                     if access_flags.contains(MappingFlags::WRITE)
                         && !page_flags.contains(MappingFlags::WRITE)
                     {

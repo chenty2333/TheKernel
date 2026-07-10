@@ -23,6 +23,7 @@ mod file;
 mod mm;
 mod mounts;
 mod pseudofs;
+mod random;
 mod syscall;
 mod task;
 mod time;

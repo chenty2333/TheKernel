@@ -1,15 +1,14 @@
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::paging::MappingFlags;
 use axtask::current;
-use linux_raw_sys::general::CAP_SYS_PTRACE;
 use memory_addr::{MemoryAddr, VirtAddr};
 use starry_process::Pid;
 use starry_signal::{SignalInfo, Signo};
 use starry_vm::VmMutPtr;
 
 use crate::task::{
-    AsThread, ProcessData, get_process_data, get_task, notify_ptrace_attach_stop,
-    send_signal_to_process,
+    AsThread, ProcessData, PtraceCredentialMode, check_current_ptrace_access, get_process_data,
+    get_task, notify_ptrace_attach_stop, send_signal_to_process,
 };
 
 const PTRACE_TRACEME: u32 = 0;
@@ -46,19 +45,7 @@ fn current_pid() -> Pid {
 }
 
 fn check_ptrace_permission(target: &ProcessData) -> AxResult<()> {
-    let curr = current();
-    let actor = &curr.as_thread().proc_data;
-    if actor.proc.pid() == target.proc.pid()
-        || actor.euid() == 0
-        || actor.has_effective_capability(CAP_SYS_PTRACE)
-        || [actor.uid(), actor.euid()]
-            .into_iter()
-            .any(|id| id == target.uid() || id == target.euid() || id == target.suid())
-    {
-        Ok(())
-    } else {
-        Err(AxError::OperationNotPermitted)
-    }
+    check_current_ptrace_access(target, PtraceCredentialMode::Real)
 }
 
 fn check_tracee(target: &ProcessData) -> AxResult<()> {
@@ -133,7 +120,9 @@ fn validate_remote_access(
     let start = VirtAddr::from_usize(addr);
     let end = start.checked_add(len).ok_or_else(ptrace_io_error)?;
     let page_start = start.align_down_4k();
-    let page_end = end.align_up_4k();
+    let page_end = VirtAddr::from_usize(
+        crate::mm::checked_align_up_4k(end.as_usize()).ok_or_else(ptrace_io_error)?,
+    );
     let aspace_handle = target.aspace();
     let mut aspace = aspace_handle.lock();
     if !aspace.can_access_range(start, len, flags) {

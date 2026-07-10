@@ -12,9 +12,7 @@ use linux_raw_sys::{
 };
 use starry_signal::SignalSet;
 
-use super::{
-    FdPollSet, is_short_timeout, wait_io_result, wait_short_poll_timeout, wait_signal_only,
-};
+use super::{FdPollSet, wait_io_result, wait_signal_only};
 use crate::{
     file::get_file_like,
     mm::{UserConstPtr, UserPtr, nullable},
@@ -152,12 +150,6 @@ fn do_select(
 
         Err(AxError::WouldBlock)
     };
-
-    if let Some(timeout) = timeout
-        && is_short_timeout(Some(timeout))
-    {
-        return wait_short_poll_timeout(uctx, sigmask.copied(), timeout, &mut poll_once);
-    }
 
     let deadline = timeout.map(|dur| axhal::time::wall_time().saturating_add(dur));
     let mut select_once = || {

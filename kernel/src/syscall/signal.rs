@@ -1,3 +1,4 @@
+use alloc::sync::Arc;
 use core::{future::poll_fn, task::Poll};
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -7,8 +8,8 @@ use axtask::{
     future::{self, block_on},
 };
 use linux_raw_sys::general::{
-    MINSIGSTKSZ, RLIMIT_SIGPENDING, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK,
-    SS_DISABLE, SS_ONSTACK, kernel_sigaction, siginfo, timespec,
+    CAP_KILL, MINSIGSTKSZ, RLIMIT_SIGPENDING, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK,
+    SIG_UNBLOCK, SS_DISABLE, SS_ONSTACK, kernel_sigaction, siginfo, timespec,
 };
 use starry_process::Pid;
 use starry_signal::{SignalInfo, SignalSet, SignalStack, Signo};
@@ -16,9 +17,10 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     task::{
-        AsThread, acknowledge_posix_timer_signal, check_signals, get_process_data,
-        get_process_including_zombie, get_visible_task, processes, send_signal_to_process,
-        send_signal_to_process_group, send_signal_to_visible_thread,
+        AsThread, ProcessData, acknowledge_posix_timer_signal, check_current_signal_access,
+        check_signals, get_process_data, get_process_group, get_process_including_zombie,
+        get_visible_task, processes, send_signal_to_process, send_signal_to_process_data,
+        send_signal_to_visible_thread,
     },
     time::TimeValueLike,
 };
@@ -138,25 +140,12 @@ fn ensure_realtime_signal_queue_capacity_for_process(pid: Pid) -> AxResult<()> {
     Ok(())
 }
 
-fn check_signal_permission(pid: Pid) -> AxResult<()> {
-    let actor = current();
-    let actor_proc = &actor.as_thread().proc_data;
-    if actor_proc.euid() == 0 {
-        return Ok(());
-    }
-
+fn check_signal_permission(pid: Pid, signal: Option<Signo>) -> AxResult<()> {
     let target = get_process_data(pid)?;
-    let allowed = [actor_proc.uid(), actor_proc.euid()]
-        .into_iter()
-        .any(|id| id == target.uid() || id == target.euid() || id == target.suid());
-    if allowed {
-        Ok(())
-    } else {
-        Err(AxError::OperationNotPermitted)
-    }
+    check_current_signal_access(&target, signal)
 }
 
-fn check_zombie_signal_permission(pid: Pid) -> AxResult<bool> {
+fn check_zombie_signal_permission(pid: Pid, signal: Option<Signo>) -> AxResult<bool> {
     let process = get_process_including_zombie(pid)?;
     if !process.is_zombie() {
         return Ok(false);
@@ -164,14 +153,13 @@ fn check_zombie_signal_permission(pid: Pid) -> AxResult<bool> {
 
     let actor = current();
     let actor_proc = &actor.as_thread().proc_data;
-    if actor_proc.euid() == 0 {
-        return Ok(true);
-    }
-
     let snapshot = process.zombie_snapshot().ok_or(AxError::NoSuchProcess)?;
     let allowed = [actor_proc.uid(), actor_proc.euid()]
         .into_iter()
-        .any(|id| id == snapshot.uid);
+        .any(|id| id == snapshot.uid)
+        || actor_proc.has_effective_capability(CAP_KILL)
+        || (signal == Some(Signo::SIGCONT)
+            && actor_proc.proc.group().session().sid() == process.group().session().sid());
     if allowed {
         Ok(true)
     } else {
@@ -179,49 +167,102 @@ fn check_zombie_signal_permission(pid: Pid) -> AxResult<bool> {
     }
 }
 
-fn zombie_signal_succeeds(pid: Pid) -> AxResult<bool> {
-    check_zombie_signal_permission(pid)
+fn zombie_signal_succeeds(pid: Pid, signal: Option<Signo>) -> AxResult<bool> {
+    check_zombie_signal_permission(pid, signal)
+}
+
+fn signal_signo(signal: &Option<SignalInfo>) -> Option<Signo> {
+    signal.as_ref().map(SignalInfo::signo)
+}
+
+fn send_user_signal_to_targets(
+    targets: impl IntoIterator<Item = Arc<ProcessData>>,
+    signal: Option<SignalInfo>,
+) -> AxResult<()> {
+    let signo = signal_signo(&signal);
+    let mut had_target = false;
+    let mut had_permission = false;
+    let mut delivered = false;
+    let mut first_error = None;
+
+    for target in targets {
+        had_target = true;
+        if check_current_signal_access(&target, signo).is_err() {
+            continue;
+        }
+        had_permission = true;
+        match send_signal_to_process_data(&target, signal.clone()) {
+            Ok(()) => delivered = true,
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
+        }
+    }
+
+    if delivered || (signal.is_none() && had_permission) {
+        Ok(())
+    } else if !had_target {
+        Err(AxError::NoSuchProcess)
+    } else if !had_permission {
+        Err(AxError::OperationNotPermitted)
+    } else {
+        Err(first_error.unwrap_or(AxError::NoSuchProcess))
+    }
+}
+
+fn check_visible_thread_signal_access(
+    tgid: Option<Pid>,
+    tid: Pid,
+    signal: Option<Signo>,
+) -> AxResult<()> {
+    let task = get_visible_task(tid)?;
+    let thread = task.try_as_thread().ok_or(AxError::OperationNotPermitted)?;
+    if tgid.is_some_and(|tgid| thread.proc_data.proc.pid() != tgid) {
+        return Err(AxError::NoSuchProcess);
+    }
+    check_current_signal_access(&thread.proc_data, signal)
 }
 
 pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
     debug!("sys_kill: pid = {pid}, signo = {signo}");
     let sig = make_siginfo(signo, SI_USER as _)?;
+    let permission_signal = signal_signo(&sig);
 
     match pid {
         1.. => {
             let target = pid as Pid;
-            match check_signal_permission(target) {
+            match check_signal_permission(target, permission_signal) {
                 Ok(()) => match send_signal_to_process(target, sig) {
                     Ok(()) => {}
-                    Err(AxError::NoSuchProcess) if zombie_signal_succeeds(target)? => {}
+                    Err(AxError::NoSuchProcess)
+                        if zombie_signal_succeeds(target, permission_signal)? => {}
                     Err(err) => return Err(err),
                 },
-                Err(AxError::NoSuchProcess) if zombie_signal_succeeds(target)? => {}
+                Err(AxError::NoSuchProcess)
+                    if zombie_signal_succeeds(target, permission_signal)? => {}
                 Err(err) => return Err(err),
             }
         }
         0 => {
             let pgid = current().as_thread().proc_data.proc.group().pgid();
-            send_signal_to_process_group(pgid, sig)?;
+            let targets = get_process_group(pgid)?
+                .processes()
+                .into_iter()
+                .filter_map(|process| get_process_data(process.pid()).ok());
+            send_user_signal_to_targets(targets, sig)?;
         }
         -1 => {
             let curr_pid = current().as_thread().proc_data.proc.pid();
-            if let Some(sig) = sig {
-                for proc_data in processes() {
-                    // POSIX.1 requires that kill(-1,sig) send sig to all processes that
-                    //    the calling process may send signals to, except possibly for some
-                    //    implementation-defined system processes.  Linux allows a process
-                    //    to signal itself, but on Linux the call kill(-1,sig) does not
-                    //    signal the calling process.
-                    if proc_data.proc.is_init() || proc_data.proc.pid() == curr_pid {
-                        continue;
-                    }
-                    let _ = send_signal_to_process(proc_data.proc.pid(), Some(sig.clone()));
-                }
-            }
+            let targets = processes()
+                .into_iter()
+                .filter(|proc_data| !proc_data.proc.is_init() && proc_data.proc.pid() != curr_pid);
+            send_user_signal_to_targets(targets, sig)?;
         }
         ..-1 => {
-            send_signal_to_process_group((-pid) as Pid, sig)?;
+            let targets = get_process_group((-pid) as Pid)?
+                .processes()
+                .into_iter()
+                .filter_map(|process| get_process_data(process.pid()).ok());
+            send_user_signal_to_targets(targets, sig)?;
         }
     }
     Ok(0)
@@ -232,6 +273,7 @@ pub fn sys_tkill(tid: i32, signo: u32) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
     let sig = make_siginfo(signo, SI_TKILL)?;
+    check_visible_thread_signal_access(None, tid as Pid, signal_signo(&sig))?;
     send_signal_to_visible_thread(None, tid as Pid, sig)?;
     Ok(0)
 }
@@ -240,10 +282,11 @@ pub fn sys_tgkill(tgid: i32, tid: i32, signo: u32) -> AxResult<isize> {
     if tgid <= 0 || tid <= 0 {
         return Err(AxError::InvalidInput);
     }
+    let sig = make_siginfo(signo, SI_TKILL)?;
+    check_visible_thread_signal_access(Some(tgid as Pid), tid as Pid, signal_signo(&sig))?;
     if signo != 0 && parse_signo(signo)?.is_realtime() {
         ensure_realtime_signal_queue_capacity_for_thread(Some(tgid as Pid), tid as Pid)?;
     }
-    let sig = make_siginfo(signo, SI_TKILL)?;
     send_signal_to_visible_thread(Some(tgid as Pid), tid as Pid, sig)?;
     Ok(0)
 }
@@ -278,8 +321,10 @@ pub(crate) fn make_queue_signal_info(
 
 pub fn sys_rt_sigqueueinfo(pid: Pid, signo: u32, sig: *const SignalInfo) -> AxResult<isize> {
     let sig = make_queue_signal_info(pid, signo, sig)?;
+    let permission_signal = signal_signo(&sig);
     if let Ok(task) = get_visible_task(pid) {
         let thread = task.try_as_thread().ok_or(AxError::OperationNotPermitted)?;
+        check_current_signal_access(&thread.proc_data, permission_signal)?;
         if thread.proc_data.proc.pid() == pid {
             if signo != 0 && parse_signo(signo)?.is_realtime() {
                 ensure_realtime_signal_queue_capacity_for_process(pid)?;
@@ -292,10 +337,12 @@ pub fn sys_rt_sigqueueinfo(pid: Pid, signo: u32, sig: *const SignalInfo) -> AxRe
             send_signal_to_visible_thread(None, pid, sig)?;
         }
     } else {
+        let target = get_process_data(pid)?;
+        check_current_signal_access(&target, permission_signal)?;
         if signo != 0 && parse_signo(signo)?.is_realtime() {
             ensure_realtime_signal_queue_capacity_for_process(pid)?;
         }
-        send_signal_to_process(pid, sig)?;
+        send_signal_to_process_data(&target, sig)?;
     }
     Ok(0)
 }
@@ -309,11 +356,12 @@ pub fn sys_rt_tgsigqueueinfo(
     if tgid <= 0 || tid <= 0 {
         return Err(AxError::InvalidInput);
     }
+
+    let sig = make_queue_signal_info(tid as Pid, signo, sig)?;
+    check_visible_thread_signal_access(Some(tgid as Pid), tid as Pid, signal_signo(&sig))?;
     if signo != 0 && parse_signo(signo)?.is_realtime() {
         ensure_realtime_signal_queue_capacity_for_thread(Some(tgid as Pid), tid as Pid)?;
     }
-
-    let sig = make_queue_signal_info(tid as Pid, signo, sig)?;
     send_signal_to_visible_thread(Some(tgid as Pid), tid as Pid, sig)?;
     Ok(0)
 }

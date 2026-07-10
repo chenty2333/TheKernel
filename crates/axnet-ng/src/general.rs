@@ -1,16 +1,15 @@
 use core::{
     future::poll_fn,
-    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
     task::{Poll, Waker},
     time::Duration,
 };
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axpoll::{IoEvents, Pollable};
 use axtask::future::{block_on, interruptible, timeout_at};
 
 use crate::{
-    consts::{TCP_RX_BUF_LEN, TCP_TX_BUF_LEN},
     net_stack::NetStack,
     options::{Configurable, GetSocketOption, SetSocketOption},
 };
@@ -27,10 +26,7 @@ pub(crate) struct GeneralOptions {
     send_timeout_nanos: AtomicU64,
     recv_timeout_nanos: AtomicU64,
 
-    send_buffer: AtomicUsize,
-    recv_buffer: AtomicUsize,
-
-    ipv6_only: AtomicBool,
+    pending_error: AtomicI32,
 
     device_mask: AtomicU64,
 }
@@ -49,10 +45,7 @@ impl GeneralOptions {
             send_timeout_nanos: AtomicU64::new(0),
             recv_timeout_nanos: AtomicU64::new(0),
 
-            send_buffer: AtomicUsize::new(TCP_TX_BUF_LEN),
-            recv_buffer: AtomicUsize::new(TCP_RX_BUF_LEN),
-
-            ipv6_only: AtomicBool::new(false),
+            pending_error: AtomicI32::new(0),
 
             device_mask: AtomicU64::new(0),
         }
@@ -80,16 +73,12 @@ impl GeneralOptions {
         (nanos > 0).then(|| Duration::from_nanos(nanos))
     }
 
-    pub fn send_buffer(&self) -> usize {
-        self.send_buffer.load(Ordering::Relaxed)
+    pub fn set_pending_error(&self, error: LinuxError) {
+        self.pending_error.store(error.code(), Ordering::Release);
     }
 
-    pub fn recv_buffer(&self) -> usize {
-        self.recv_buffer.load(Ordering::Relaxed)
-    }
-
-    pub fn ipv6_only(&self) -> bool {
-        self.ipv6_only.load(Ordering::Relaxed)
+    pub fn clear_pending_error(&self) {
+        self.pending_error.store(0, Ordering::Release);
     }
 
     pub fn set_device_mask(&self, mask: u64) {
@@ -169,17 +158,16 @@ impl GeneralOptions {
     }
 }
 impl Configurable for GeneralOptions {
+    fn nonblocking(&self) -> bool {
+        self.nonblocking()
+    }
+
     fn get_option_inner(&self, option: &mut GetSocketOption) -> AxResult<bool> {
         use GetSocketOption as O;
 
-        fn clamp_sockbuf(size: usize) -> usize {
-            size.min(i32::MAX as usize)
-        }
-
         match option {
             O::Error(error) => {
-                // TODO(mivik): actual logic
-                **error = 0;
+                **error = self.pending_error.swap(0, Ordering::AcqRel);
             }
             O::NonBlocking(nonblock) => {
                 **nonblock = self.nonblocking();
@@ -196,15 +184,6 @@ impl Configurable for GeneralOptions {
             O::ReceiveTimeout(timeout) => {
                 **timeout = Duration::from_nanos(self.recv_timeout_nanos.load(Ordering::Relaxed));
             }
-            O::SendBuffer(size) => {
-                **size = clamp_sockbuf(self.send_buffer.load(Ordering::Relaxed));
-            }
-            O::ReceiveBuffer(size) => {
-                **size = clamp_sockbuf(self.recv_buffer.load(Ordering::Relaxed));
-            }
-            O::Ipv6Only(ipv6_only) => {
-                **ipv6_only = self.ipv6_only();
-            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -212,10 +191,6 @@ impl Configurable for GeneralOptions {
 
     fn set_option_inner(&self, option: SetSocketOption) -> AxResult<bool> {
         use SetSocketOption as O;
-
-        fn clamp_sockbuf(size: usize) -> usize {
-            size.min(i32::MAX as usize)
-        }
 
         match option {
             O::NonBlocking(nonblock) => {
@@ -235,21 +210,6 @@ impl Configurable for GeneralOptions {
                 self.recv_timeout_nanos
                     .store(timeout.as_nanos() as u64, Ordering::Relaxed);
             }
-            O::SendBuffer(size) => {
-                self.send_buffer
-                    .store(clamp_sockbuf(*size), Ordering::Relaxed);
-            }
-            O::SendBufferForce(size) => {
-                self.send_buffer
-                    .store(clamp_sockbuf(*size), Ordering::Relaxed);
-            }
-            O::ReceiveBuffer(size) => {
-                self.recv_buffer
-                    .store(clamp_sockbuf(*size), Ordering::Relaxed);
-            }
-            O::Ipv6Only(ipv6_only) => {
-                self.ipv6_only.store(*ipv6_only, Ordering::Relaxed);
-            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -259,32 +219,22 @@ impl Configurable for GeneralOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::options::{Configurable, GetSocketOption, SetSocketOption};
+    use crate::options::{Configurable, GetSocketOption};
 
     #[test]
-    fn ipv6_only_option_tracks_bool_value() {
+    fn socket_error_is_reported_once() {
         let options = GeneralOptions::new();
-        let mut ipv6_only = true;
+        options.set_pending_error(LinuxError::ECONNREFUSED);
+
+        let mut error = 0;
+        options
+            .get_option(GetSocketOption::Error(&mut error))
+            .unwrap();
+        assert_eq!(error, LinuxError::ECONNREFUSED.code());
 
         options
-            .get_option(GetSocketOption::Ipv6Only(&mut ipv6_only))
+            .get_option(GetSocketOption::Error(&mut error))
             .unwrap();
-        assert!(!ipv6_only);
-
-        options
-            .set_option(SetSocketOption::Ipv6Only(&true))
-            .unwrap();
-        options
-            .get_option(GetSocketOption::Ipv6Only(&mut ipv6_only))
-            .unwrap();
-        assert!(ipv6_only);
-
-        options
-            .set_option(SetSocketOption::Ipv6Only(&false))
-            .unwrap();
-        options
-            .get_option(GetSocketOption::Ipv6Only(&mut ipv6_only))
-            .unwrap();
-        assert!(!ipv6_only);
+        assert_eq!(error, 0);
     }
 }

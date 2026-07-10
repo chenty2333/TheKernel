@@ -5,7 +5,8 @@ use core::{
     ffi::c_char,
     hint::unlikely,
     mem::{MaybeUninit, transmute},
-    ptr, slice, str,
+    ptr::{self, NonNull},
+    slice, str,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
@@ -511,7 +512,11 @@ fn check_region(start: VirtAddr, layout: Layout, access_flags: MappingFlags) -> 
     }
 
     let page_start = start.align_down_4k();
-    let page_end = (start + layout.size()).align_up_4k();
+    let end = start
+        .checked_add(layout.size())
+        .ok_or(AxError::BadAddress)?;
+    let page_end =
+        VirtAddr::from(super::checked_align_up_4k(end.as_usize()).ok_or(AxError::BadAddress)?);
     aspace.populate_area(page_start, page_end - page_start, access_flags)?;
 
     Ok(())
@@ -613,11 +618,11 @@ impl<T> UserPtr<T> {
     }
 
     pub fn get_as_mut_slice(self, len: usize) -> AxResult<&'static mut [T]> {
-        check_region(
-            self.address(),
-            Layout::array::<T>(len).unwrap(),
-            Self::ACCESS_FLAGS,
-        )?;
+        let layout = Layout::array::<T>(len).map_err(|_| AxError::BadAddress)?;
+        if len == 0 {
+            return Ok(unsafe { slice::from_raw_parts_mut(NonNull::<T>::dangling().as_ptr(), 0) });
+        }
+        check_region(self.address(), layout, Self::ACCESS_FLAGS)?;
         Ok(unsafe { slice::from_raw_parts_mut(self.0, len) })
     }
 
@@ -674,11 +679,11 @@ impl<T> UserConstPtr<T> {
     }
 
     pub fn get_as_slice(self, len: usize) -> AxResult<&'static [T]> {
-        check_region(
-            self.address(),
-            Layout::array::<T>(len).unwrap(),
-            Self::ACCESS_FLAGS,
-        )?;
+        let layout = Layout::array::<T>(len).map_err(|_| AxError::BadAddress)?;
+        if len == 0 {
+            return Ok(unsafe { slice::from_raw_parts(NonNull::<T>::dangling().as_ptr(), 0) });
+        }
+        check_region(self.address(), layout, Self::ACCESS_FLAGS)?;
         Ok(unsafe { slice::from_raw_parts(self.0, len) })
     }
 
@@ -798,7 +803,9 @@ fn populate_user_range(start: usize, len: usize, access_flags: MappingFlags) -> 
 
     let start = VirtAddr::from(start);
     let page_start = start.align_down_4k();
-    let page_end = (start + len).align_up_4k();
+    let end = start.checked_add(len).ok_or(VmError::AccessDenied)?;
+    let page_end =
+        VirtAddr::from(super::checked_align_up_4k(end.as_usize()).ok_or(VmError::AccessDenied)?);
     let aspace_handle = thr.proc_data.aspace();
     let mut aspace = aspace_handle.lock();
     if !aspace.can_access_range(start, len, access_flags) {
@@ -991,7 +998,10 @@ fn prepare_user_io_pin(
 
     let start_addr = VirtAddr::from(start);
     let page_start = start_addr.align_down_4k();
-    let page_end = VirtAddr::from(end).align_up_4k();
+    let Some(page_end) = super::checked_align_up_4k(end).map(VirtAddr::from) else {
+        reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+        return None;
+    };
     let page_len = page_end - page_start;
     let aspace_handle = thr.proc_data.aspace();
     let mut aspace = aspace_handle.lock();

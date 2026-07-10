@@ -157,6 +157,12 @@ pub fn resched_if_needed() {
     TaskInner::current_check_preempt_pending();
 }
 
+/// Returns aggregate scheduler idle time across all CPUs.
+pub fn idle_time() -> core::time::Duration {
+    let tick_nanos = axhal::time::NANOS_PER_SEC / axconfig::TICKS_PER_SEC as u64;
+    core::time::Duration::from_nanos(crate::run_queue::idle_ticks().saturating_mul(tick_nanos))
+}
+
 /// Requests rescheduling of the current task at the next preemption point.
 pub fn request_resched_current() {
     #[cfg(feature = "preempt")]

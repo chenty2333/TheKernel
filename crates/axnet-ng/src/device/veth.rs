@@ -10,8 +10,8 @@ use smoltcp::{
 };
 
 use crate::{
-    consts::{SOCKET_BUFFER_SIZE, STANDARD_MTU},
-    device::Device,
+    consts::{PACKET_QUEUE_LEN, STANDARD_MTU},
+    device::{Device, DeviceStats, InterfaceKind},
 };
 
 /// One end of a virtual ethernet pair.
@@ -29,12 +29,13 @@ pub struct VethEnd {
     waker: Arc<PollSet>,
     /// Waker for the peer — we notify it when we send data.
     peer_waker: Arc<PollSet>,
+    stats: DeviceStats,
 }
 
 fn new_packet_buffer() -> PacketBuffer<'static, ()> {
     PacketBuffer::new(
-        vec![PacketMetadata::EMPTY; SOCKET_BUFFER_SIZE],
-        vec![0u8; STANDARD_MTU * SOCKET_BUFFER_SIZE],
+        vec![PacketMetadata::EMPTY; PACKET_QUEUE_LEN],
+        vec![0u8; STANDARD_MTU * PACKET_QUEUE_LEN],
     )
 }
 
@@ -52,6 +53,7 @@ impl VethEnd {
             peer_rx_buffer: buf_b.clone(),
             waker: waker_a.clone(),
             peer_waker: waker_b.clone(),
+            stats: DeviceStats::default(),
         };
         let end_b = Self {
             name: name_b,
@@ -59,6 +61,7 @@ impl VethEnd {
             peer_rx_buffer: buf_a,
             waker: waker_b,
             peer_waker: waker_a,
+            stats: DeviceStats::default(),
         };
         (end_a, end_b)
     }
@@ -69,29 +72,44 @@ impl Device for VethEnd {
         &self.name
     }
 
+    fn stats(&self) -> DeviceStats {
+        self.stats
+    }
+
+    fn interface_kind(&self) -> InterfaceKind {
+        InterfaceKind::Ethernet
+    }
+
+    fn mtu(&self) -> usize {
+        STANDARD_MTU
+    }
+
     fn recv(&mut self, buffer: &mut PacketBuffer<()>, _timestamp: Instant) -> bool {
-        self.rx_buffer
-            .lock()
-            .dequeue()
-            .ok()
-            .is_some_and(|(_, rx_buf)| {
-                buffer
-                    .enqueue(rx_buf.len(), ())
-                    .unwrap()
-                    .copy_from_slice(rx_buf);
-                true
-            })
+        let mut rx_buffer = self.rx_buffer.lock();
+        let Ok((_, rx_buf)) = rx_buffer.dequeue() else {
+            return false;
+        };
+        let len = rx_buf.len();
+        let Ok(dst) = buffer.enqueue(len, ()) else {
+            self.stats.record_rx_drop();
+            return false;
+        };
+        dst.copy_from_slice(rx_buf);
+        self.stats.record_rx(len);
+        true
     }
 
     fn send(&mut self, next_hop: IpAddress, packet: &[u8], _timestamp: Instant) -> bool {
         match self.peer_rx_buffer.lock().enqueue(packet.len(), ()) {
             Ok(tx_buf) => {
                 tx_buf.copy_from_slice(packet);
+                self.stats.record_tx(packet.len());
                 // Wake the peer so it polls and picks up the packet.
                 self.peer_waker.wake();
                 false // recv readiness is on the OTHER stack, not ours
             }
             Err(_) => {
+                self.stats.record_tx_drop();
                 warn!(
                     "veth {}: peer buffer full, dropping packet to {}",
                     self.name, next_hop

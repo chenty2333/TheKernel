@@ -1,7 +1,9 @@
-use super::{VirtioNetHdr, NET_HDR_SIZE};
 use alloc::{vec, vec::Vec};
 use core::{convert::TryInto, mem::size_of};
+
 use zerocopy::AsBytes;
+
+use super::{NET_HDR_SIZE, VirtioNetHdr};
 
 /// A buffer used for transmitting.
 pub struct TxBuffer(pub(crate) Vec<u8>);

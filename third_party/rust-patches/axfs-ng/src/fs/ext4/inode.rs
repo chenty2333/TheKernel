@@ -136,9 +136,8 @@ impl NodeOps for Inode {
     }
 
     fn sync(&self, data_only: bool) -> VfsResult<()> {
-        // lwext4 exposes writeback at the filesystem level. Reopen-heavy
-        // workloads such as iozone rely on sync/fsync making previous updates
-        // visible before the next phase starts, so route inode sync through the
+        // lwext4 exposes writeback at the filesystem level. Reopen-after-sync
+        // workloads require previous updates to be visible, so route inode sync through the
         // ext4-wide flush path.
         if data_only {
             crate::highlevel::record_file_sync_data_only_metadata_fallback();

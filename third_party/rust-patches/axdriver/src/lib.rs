@@ -62,7 +62,6 @@
 #[macro_use]
 extern crate log;
 
-#[cfg(feature = "dyn")]
 extern crate alloc;
 
 #[macro_use]
@@ -73,6 +72,9 @@ mod bus;
 mod drivers;
 mod dummy;
 mod structs;
+
+#[cfg(feature = "shared-block")]
+mod shared_block;
 
 #[cfg(feature = "virtio")]
 mod virtio;
@@ -90,6 +92,8 @@ pub use axdriver_virtio::{AsyncBlockWaitPolicy, VirtioIoCounters};
 
 #[allow(unused_imports)]
 use self::prelude::*;
+#[cfg(feature = "shared-block")]
+pub use self::shared_block::SharedBlockDevice;
 #[cfg(feature = "block")]
 pub use self::structs::AxBlockDevice;
 #[cfg(feature = "display")]
@@ -97,6 +101,8 @@ pub use self::structs::AxDisplayDevice;
 #[cfg(feature = "net")]
 pub use self::structs::AxNetDevice;
 pub use self::structs::{AxDeviceContainer, AxDeviceEnum};
+#[cfg(feature = "virtio-rng")]
+pub use self::virtio::{entropy_source_ready, fill_entropy};
 
 /// Snapshot of VirtIO I/O counters.
 #[cfg(not(feature = "virtio-blk"))]

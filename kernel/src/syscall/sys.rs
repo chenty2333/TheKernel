@@ -2,14 +2,13 @@ use alloc::{format, string::String, vec, vec::Vec};
 use core::ffi::c_char;
 
 use axconfig::ARCH;
-use axerrno::{AxError, AxResult};
-use axfs::FS_CONTEXT;
+use axerrno::{AxError, AxResult, LinuxError};
 use axhal::{time::monotonic_time, uspace::UserContext};
 use axtask::current;
 #[cfg(target_arch = "riscv64")]
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::{
-    general::{CAP_SYS_ADMIN, CAP_SYSLOG, GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, NGROUPS_MAX},
+    general::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, NGROUPS_MAX},
     system::{new_utsname, sysinfo},
 };
 #[cfg(target_arch = "riscv64")]
@@ -133,28 +132,7 @@ const fn pad_str(info: &str) -> [c_char; 65] {
 
 const PER_MASK: u32 = 0xff;
 const UNAME26: u32 = 0x0020_000;
-const ADDR_NO_RANDOMIZE: u32 = 0x0040_000;
-const FDPIC_FUNCPTRS: u32 = 0x0080_000;
-const MMAP_PAGE_ZERO: u32 = 0x0100_000;
-const ADDR_COMPAT_LAYOUT: u32 = 0x0200_000;
-const READ_IMPLIES_EXEC: u32 = 0x0400_000;
-const ADDR_LIMIT_32BIT: u32 = 0x0800_000;
-const SHORT_INODE: u32 = 0x1000_000;
-const WHOLE_SECONDS: u32 = 0x2000_000;
-const STICKY_TIMEOUTS: u32 = 0x4000_000;
-const ADDR_LIMIT_3GB: u32 = 0x8000_000;
-const SUPPORTED_PERSONALITY: u32 = PER_MASK
-    | UNAME26
-    | ADDR_NO_RANDOMIZE
-    | FDPIC_FUNCPTRS
-    | MMAP_PAGE_ZERO
-    | ADDR_COMPAT_LAYOUT
-    | READ_IMPLIES_EXEC
-    | ADDR_LIMIT_32BIT
-    | SHORT_INODE
-    | WHOLE_SECONDS
-    | STICKY_TIMEOUTS
-    | ADDR_LIMIT_3GB;
+const SUPPORTED_PERSONALITY: u32 = UNAME26;
 const UNAME26_RELEASE: &[u8] = b"2.6.60";
 
 fn fill_uts_field(dst: &mut [c_char; 65], src: &[u8]) {
@@ -318,7 +296,8 @@ pub fn sys_sysinfo(info: *mut sysinfo) -> AxResult<isize> {
     kinfo.procs = processes().len() as _;
     kinfo.totalram = stats.total_bytes as _;
     kinfo.freeram = stats.free_bytes as _;
-    kinfo.bufferram = stats.cached_bytes as _;
+    // axfs uses a page cache, not Linux's separate block-buffer cache.
+    kinfo.bufferram = 0;
     kinfo.mem_unit = 1;
     info.vm_write(kinfo)?;
     Ok(0)
@@ -333,7 +312,7 @@ pub fn sys_personality(persona: u32) -> AxResult<isize> {
         return Ok(old as isize);
     }
 
-    if persona & !SUPPORTED_PERSONALITY != 0 {
+    if persona & PER_MASK != 0 || persona & !SUPPORTED_PERSONALITY != 0 {
         return Err(AxError::InvalidInput);
     }
 
@@ -341,38 +320,8 @@ pub fn sys_personality(persona: u32) -> AxResult<isize> {
     Ok(old as isize)
 }
 
-pub fn sys_syslog(kind: i32, buf: *mut c_char, len: isize) -> AxResult<isize> {
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let privileged = proc_data.has_effective_capability(CAP_SYSLOG)
-        || proc_data.has_effective_capability(CAP_SYS_ADMIN);
-    let restricted = kind != 3 && kind != 10;
-    if restricted && !privileged {
-        return Err(AxError::OperationNotPermitted);
-    }
-
-    if !(0..=10).contains(&kind) {
-        return Err(AxError::InvalidInput);
-    }
-    if len < 0 {
-        return Err(AxError::InvalidInput);
-    }
-
-    match kind {
-        2 | 3 | 4 => {
-            if buf.is_null() {
-                return Err(AxError::InvalidInput);
-            }
-        }
-        8 => {
-            if len > 8 {
-                return Err(AxError::InvalidInput);
-            }
-        }
-        _ => {}
-    }
-
-    Ok(0)
+pub fn sys_syslog(_kind: i32, _buf: *mut c_char, _len: isize) -> AxResult<isize> {
+    Err(LinuxError::ENOSYS.into())
 }
 
 bitflags::bitflags! {
@@ -385,6 +334,8 @@ bitflags::bitflags! {
 }
 
 pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> AxResult<isize> {
+    const GETRANDOM_CHUNK_SIZE: usize = 4096;
+
     let flags = GetRandomFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
     if flags.contains(GetRandomFlags::RANDOM) && flags.contains(GetRandomFlags::INSECURE) {
         return Err(AxError::InvalidInput);
@@ -395,24 +346,38 @@ pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> AxResult<isize> {
 
     debug!("sys_getrandom <= buf: {buf:p}, len: {len}, flags: {flags:?}");
 
-    let path = if flags.contains(GetRandomFlags::RANDOM) {
-        "/dev/random"
-    } else {
-        "/dev/urandom"
-    };
+    let mut total = 0;
+    let mut kbuf = [0u8; GETRANDOM_CHUNK_SIZE];
+    while total < len {
+        let chunk = (len - total).min(kbuf.len());
+        let fill_result = if flags.contains(GetRandomFlags::INSECURE) {
+            crate::random::fill_insecure(&mut kbuf[..chunk]);
+            Ok(())
+        } else {
+            crate::random::fill_secure(&mut kbuf[..chunk])
+        };
+        if let Err(error) = fill_result {
+            return if total == 0 {
+                Err(error.into())
+            } else {
+                Ok(total as isize)
+            };
+        }
+        if let Err(error) = vm_write_slice(buf.wrapping_add(total), &kbuf[..chunk]) {
+            return if total == 0 {
+                Err(error.into())
+            } else {
+                Ok(total as isize)
+            };
+        }
+        total += chunk;
+    }
 
-    let f = FS_CONTEXT.lock().resolve(path)?;
-    let mut kbuf = vec![0; len];
-    let len = f.entry().as_file()?.read_at(&mut kbuf, 0)?;
-
-    vm_write_slice(buf, &kbuf)?;
-
-    Ok(len as _)
+    Ok(total as isize)
 }
 
 pub fn sys_seccomp(_op: u32, _flags: u32, _args: *const ()) -> AxResult<isize> {
-    warn!("dummy sys_seccomp");
-    Ok(0)
+    Err(LinuxError::ENOSYS.into())
 }
 
 pub fn sys_restart_syscall(uctx: &UserContext) -> AxResult<isize> {

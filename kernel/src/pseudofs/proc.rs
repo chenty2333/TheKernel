@@ -6,14 +6,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{
-    any::Any,
-    ffi::CStr,
-    fmt::Write as _,
-    iter, str,
-    sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering},
-    task::Context,
-};
+use core::{any::Any, ffi::CStr, fmt::Write as _, iter, str, task::Context};
 
 use axdriver::{
     AsyncBlockWaitPolicy, reset_virtio_async_block_adaptive_depth, reset_virtio_io_counters,
@@ -26,17 +19,17 @@ use axerrno::LinuxError;
 use axfs::{
     async_block_queue_interrupt_selftest, async_block_queue_irq_first_wait_selftest,
     async_block_queue_read_selftest, async_block_queue_read_write_selftest,
-    page_cache_pfn_is_dirty, render_io_stats_counters, reset_io_stats_counters,
-    set_async_dirty_flush_sg_enabled, set_cached_readahead_enabled, set_io_stats_counters_enabled,
+    render_io_stats_counters, reset_io_stats_counters, set_async_dirty_flush_sg_enabled,
+    set_cached_readahead_enabled, set_io_stats_counters_enabled,
     set_lwext4_async_mapped_read_enabled,
 };
 use axfs_ng_vfs::{
-    DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, Location, Metadata, MetadataUpdate,
-    NodeFlags, NodeOps, NodePermission, NodeType, Reference, VfsError, VfsResult,
+    DeviceId, DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, Location, Metadata,
+    MetadataUpdate, NodeFlags, NodeOps, NodePermission, NodeType, Reference, VfsError, VfsResult,
 };
 use axhal::paging::MappingFlags;
 use axpoll::{IoEvents, Pollable};
-use axtask::{AxTaskRef, TaskState, WeakAxTaskRef, current, last_task_id, set_last_task_id};
+use axtask::{AxTaskRef, WeakAxTaskRef, current, last_task_id, set_last_task_id};
 use inherit_methods_macro::inherit_methods;
 use linux_raw_sys::{
     general::{
@@ -67,40 +60,33 @@ use crate::{
     pseudofs::{
         DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
         SimpleFileOperation, SimpleFs, SimpleFsNode,
-        cgroup::{
-            cpuset_allowed_masks, proc_cgroup_membership, proc_cgroups_snapshot,
-            proc_cpuset_membership,
-        },
-        dev::RANDOM_ENTROPY_BITS,
+        cgroup::{proc_cgroup_membership, proc_cgroups_snapshot, proc_cpuset_membership},
     },
     syscall::{
         aio_max_nr, aio_nr, current_domainname_string, current_hostname_string,
         current_machine_string, current_release_string, current_sysname_string,
-        current_version_string, key_gc_delay, key_maxbytes, key_maxkeys, key_root_maxbytes,
-        key_root_maxkeys, key_users_snapshot, mq_msg_max, mq_msgsize_max, mq_queues_max,
-        msg_next_id, msgmni_limit, parse_sem_limits, proc_version_string, sched_rr_timeslice_ms,
-        sem_limits_string, sem_next_id, set_aio_max_nr, set_domainname_bytes, set_hostname_bytes,
-        set_key_gc_delay, set_key_maxbytes, set_key_maxkeys, set_key_root_maxbytes,
-        set_key_root_maxkeys, set_mq_msg_max, set_mq_msgsize_max, set_mq_queues_max,
-        set_msg_next_id, set_msgmni_limit, set_sched_rr_timeslice_ms, set_sem_limits,
-        set_sem_next_id, set_shm_next_id, set_shmmax_limit, shm_next_id, shmall_limit,
-        shmmax_limit, shmmni_limit, swap_free_bytes, swap_snapshot, swap_total_bytes,
-        sysvipc_msg_snapshot, sysvipc_sem_snapshot, sysvipc_shm_snapshot,
+        current_version_string, key_maxbytes, key_maxkeys, key_root_maxbytes, key_root_maxkeys,
+        key_users_snapshot, mq_msg_max, mq_msgsize_max, mq_queues_max, msg_next_id, msgmni_limit,
+        parse_sem_limits, proc_version_string, sched_rr_timeslice_ms, sem_limits_string,
+        sem_next_id, set_aio_max_nr, set_domainname_bytes, set_hostname_bytes, set_key_maxbytes,
+        set_key_maxkeys, set_key_root_maxbytes, set_key_root_maxkeys, set_mq_msg_max,
+        set_mq_msgsize_max, set_mq_queues_max, set_msg_next_id, set_msgmni_limit,
+        set_sched_rr_timeslice_ms, set_sem_limits, set_sem_next_id, set_shm_next_id,
+        set_shmall_limit, set_shmmax_limit, set_shmmni_limit, shm_next_id, shmall_limit,
+        shmmax_limit, shmmni_limit, sysvipc_msg_snapshot, sysvipc_sem_snapshot,
+        sysvipc_shm_snapshot,
     },
     task::{
-        AsThread, Mempolicy, PidNamespace, ProcessData, TimeNamespace, UserNamespace, UtsNamespace,
-        get_process_data, get_process_including_zombie, get_task, get_visible_task,
+        AsThread, Mempolicy, PidNamespace, ProcessData, PtraceCredentialMode, TimeNamespace,
+        UserNamespace, UtsNamespace, check_current_ptrace_access, get_process_data,
+        get_process_including_zombie, get_task, get_visible_task,
         get_visible_task_including_exiting, nr_open_limit, processes, render_task_stat,
-        render_zombie_stat, set_nr_open_limit, tasks,
+        render_zombie_stat, set_nr_open_limit, task_state,
     },
 };
 
-const PROC_PID_MAX_MIN: u32 = 301;
 const PROC_PID_MAX_DEFAULT: u32 = 4_194_304;
-const PROC_THREADS_MAX: u32 = 4_194_304;
-const PROC_FILE_MAX_DEFAULT: usize = 1_048_576;
-const PROC_SCHED_TIME_AVG_MS_DEFAULT: u32 = 1000;
-const PROC_SCHED_RT_PERIOD_US_DEFAULT: u32 = 1_000_000;
+const PROC_SWAPS_HEADER: &str = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
 
 fn render_proc_io_stats() -> Vec<u8> {
     let mut out = render_io_stats_counters();
@@ -664,16 +650,8 @@ fn parse_proc_io_stats_u64_command<'a>(text: &'a str, names: &[&str]) -> Option<
     }
     None
 }
-const PROC_SCHED_RT_RUNTIME_US_DEFAULT: i32 = 950_000;
 const PROC_PAGEMAP_ENTRY_BYTES: u64 = 8;
-const PROC_KPAGEFLAGS_ENTRY_BYTES: u64 = 8;
-const PROC_NUMA_NODEMASK: usize = 0b11;
-const KPF_DIRTY: u64 = 1 << 4;
-static PROC_PID_MAX: AtomicU32 = AtomicU32::new(PROC_PID_MAX_DEFAULT);
-static PROC_FILE_MAX: AtomicUsize = AtomicUsize::new(PROC_FILE_MAX_DEFAULT);
-static PROC_SCHED_TIME_AVG_MS: AtomicU32 = AtomicU32::new(PROC_SCHED_TIME_AVG_MS_DEFAULT);
-static PROC_SCHED_RT_PERIOD_US: AtomicU32 = AtomicU32::new(PROC_SCHED_RT_PERIOD_US_DEFAULT);
-static PROC_SCHED_RT_RUNTIME_US: AtomicI32 = AtomicI32::new(PROC_SCHED_RT_RUNTIME_US_DEFAULT);
+const PROC_NUMA_NODEMASK: usize = 0b1;
 const PROC_LIMIT_NAMES: [(&str, Option<&str>); RLIM_NLIMITS as usize] = [
     ("Max cpu time", Some("seconds")),
     ("Max file size", Some("bytes")),
@@ -692,19 +670,6 @@ const PROC_LIMIT_NAMES: [(&str, Option<&str>); RLIM_NLIMITS as usize] = [
     ("Max realtime priority", None),
     ("Max realtime timeout", Some("us")),
 ];
-// Minimal gzip-compressed kernel config for LTP kconfig probes.
-const PROC_CONFIG_GZ: &[u8] = &[
-    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x75, 0xcc, 0xb1, 0x0e, 0x82, 0x40,
-    0x10, 0x84, 0xe1, 0x9e, 0xa7, 0xb8, 0xc4, 0x47, 0xb0, 0xa6, 0xc0, 0x61, 0xd1, 0x8d, 0x78, 0x7b,
-    0xde, 0x2e, 0x44, 0xaa, 0xad, 0x2c, 0x6c, 0xb4, 0x80, 0x86, 0xb7, 0x57, 0x63, 0xcc, 0x35, 0x5a,
-    0xce, 0x7c, 0xc9, 0x0f, 0x89, 0x1d, 0xef, 0x5d, 0x27, 0x1d, 0x39, 0xa1, 0x5e, 0x2b, 0x7c, 0x0e,
-    0x1c, 0x08, 0xc7, 0x24, 0x1c, 0xcd, 0x33, 0xa9, 0x49, 0xa6, 0x62, 0x0d, 0x4b, 0x19, 0x49, 0x94,
-    0x2f, 0x7e, 0x3a, 0x0f, 0x34, 0xd0, 0xef, 0xf7, 0x1d, 0x87, 0xf5, 0x05, 0x77, 0xda, 0x7a, 0xca,
-    0x02, 0x52, 0xf5, 0x06, 0xb0, 0x97, 0x6c, 0xc2, 0x1f, 0xf3, 0x71, 0x1b, 0x6e, 0x73, 0xb8, 0x3f,
-    0x96, 0x30, 0x5f, 0x97, 0x6f, 0xa1, 0x8d, 0x62, 0xdc, 0x4d, 0x25, 0x69, 0xbd, 0xd6, 0x6b, 0xf5,
-    0x04, 0xe1, 0x08, 0x09, 0xc8, 0xcd, 0x00, 0x00, 0x00,
-];
-
 fn append_mount_data_options(options: &mut String, data: &str) {
     for option in data
         .split(',')
@@ -734,35 +699,53 @@ fn record_mount_options(record: &mounts::MountRecord) -> String {
     options
 }
 
+fn escape_mount_field(field: &str) -> String {
+    let mut escaped = String::with_capacity(field.len());
+    for ch in field.chars() {
+        match ch {
+            ' ' => escaped.push_str("\\040"),
+            '\t' => escaped.push_str("\\011"),
+            '\n' => escaped.push_str("\\012"),
+            '\\' => escaped.push_str("\\134"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 fn render_mounts() -> String {
-    let mut out = String::from("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n");
+    let mut out = String::new();
     for record in mounts::snapshot() {
         let options = record_mount_options(&record);
         let _ = writeln!(
             out,
             "{} {} {} {} 0 0",
-            record.source, record.target, record.fs_type, options
+            escape_mount_field(&record.source),
+            escape_mount_field(&record.target),
+            record.fs_type,
+            options
         );
     }
     out
 }
 
 fn render_mountinfo() -> String {
-    let mut out = String::from("1 0 0:1 / / rw,relatime - rootfs rootfs rw\n");
+    let mut out = String::new();
     for record in mounts::snapshot() {
-        let major = record.dev >> 32;
-        let minor = record.dev as u32;
+        let dev = DeviceId(record.dev);
         let options = record_mount_options(&record);
         let _ = writeln!(
             out,
-            "{} 1 {}:{} / {} {} - {} {} {}",
-            record.dev,
-            major,
-            minor,
-            record.target,
+            "{} {} {}:{} {} {} {} - {} {} {}",
+            record.mount_id,
+            record.parent_id,
+            dev.major(),
+            dev.minor(),
+            escape_mount_field(&record.root),
+            escape_mount_field(&record.target),
             options,
             record.fs_type,
-            record.source,
+            escape_mount_field(&record.source),
             options
         );
     }
@@ -791,44 +774,17 @@ fn real_meminfo() -> String {
     let total_kb = stats.total_bytes / 1024;
     let free_kb = stats.free_bytes / 1024;
     let available_kb = stats.available_bytes / 1024;
-    let used_kb = stats.used_bytes / 1024;
     let cached_kb = stats.cached_bytes / 1024;
-    let mapped_kb = stats.mapped_bytes / 1024;
     let page_tables_kb = stats.page_table_bytes / 1024;
-    let swap_total_kb = swap_total_bytes() as usize / 1024;
-    let swap_free_kb = swap_free_bytes() as usize / 1024;
     let commit_limit_kb = commit_limit_bytes() / 1024;
     let committed_kb = committed_as_bytes() / 1024;
     format!(
-        "MemTotal:       {total_kb:>8} kB\n\
-         MemFree:        {free_kb:>8} kB\n\
-         MemAvailable:   {available_kb:>8} kB\n\
-         Buffers:               0 kB\n\
-         Cached:         {cached_kb:>8} kB\n\
-         SwapCached:            0 kB\n\
-         Active:         {used_kb:>8} kB\n\
-         Inactive:              0 kB\n\
-         SwapTotal:      {swap_total_kb:>8} kB\n\
-         SwapFree:       {swap_free_kb:>8} kB\n\
-         Dirty:                 0 kB\n\
-         Writeback:             0 kB\n\
-         AnonPages:             0 kB\n\
-         Mapped:         {mapped_kb:>8} kB\n\
-         Shmem:                 0 kB\n\
-         Slab:                  0 kB\n\
-         PageTables:     {page_tables_kb:>8} kB\n\
-         CommitLimit:    {commit_limit_kb:>8} kB\n\
-         Committed_AS:   {committed_kb:>8} kB\n\
-         VmallocTotal:          0 kB\n\
-         VmallocUsed:           0 kB\n"
+        "MemTotal:       {total_kb:>8} kB\nMemFree:        {free_kb:>8} kB\nMemAvailable:   \
+         {available_kb:>8} kB\nBuffers:               0 kB\nCached:         {cached_kb:>8} \
+         kB\nSwapCached:            0 kB\nSwapTotal:             0 kB\nSwapFree:              0 \
+         kB\nPageTables:     {page_tables_kb:>8} kB\nCommitLimit:    {commit_limit_kb:>8} \
+         kB\nCommitted_AS:   {committed_kb:>8} kB\n"
     )
-}
-
-fn rw_static_file(content: &'static str) -> impl crate::pseudofs::SimpleFileOps {
-    RwFile::new(move |req| match req {
-        SimpleFileOperation::Read => Ok(Some(content.as_bytes().to_vec())),
-        SimpleFileOperation::Write(_) => Ok(None),
-    })
 }
 
 fn current_net_ipv4_conf_tag(iface: &str) -> VfsResult<i32> {
@@ -968,16 +924,34 @@ fn format_mask_list(mask: usize, width: usize) -> String {
 #[rustfmt::skip]
 fn task_status(task: &AxTaskRef) -> String {
     let proc_data = &task.as_thread().proc_data;
-    let locked_kb = {
+    let (vm_size_kb, vm_rss_kb, locked_kb) = {
         let aspace_handle = proc_data.aspace();
         let aspace = aspace_handle.lock();
-        aspace.locked_bytes() / 1024
+        let vm_size = aspace
+            .areas()
+            .filter(|area| area.flags().contains(MappingFlags::USER))
+            .map(|area| area.size())
+            .sum::<usize>();
+        (
+            vm_size / 1024,
+            aspace.resident_user_bytes() / 1024,
+            aspace.locked_bytes() / 1024,
+        )
     };
+    let state = task_state(task);
+    let state_name = match state {
+        'R' => "running",
+        'S' => "sleeping",
+        'D' => "disk sleep",
+        'T' => "stopped",
+        'Z' => "zombie",
+        _ => "unknown",
+    };
+    let ppid = proc_data.proc.parent().map_or(0, |parent| parent.pid());
+    let threads = proc_data.proc.threads().len();
     let caps = proc_data.capability_state();
     let cpu_mask = task_cpu_mask_bits(task);
-    let mem_mask = cpuset_allowed_masks(proc_data.proc.pid())
-        .map(|(_, mems)| mems)
-        .unwrap_or(PROC_NUMA_NODEMASK);
+    let mem_mask = PROC_NUMA_NODEMASK;
     let cpu_width = axhal::cpu_num().max(1);
     let mem_width = PROC_NUMA_NODEMASK
         .next_power_of_two()
@@ -986,13 +960,18 @@ fn task_status(task: &AxTaskRef) -> String {
     let cpu_allowed_list = format_mask_list(cpu_mask, cpu_width);
     let mem_allowed_list = format_mask_list(mem_mask, mem_width);
     format!(
-        "Tgid:\t{}\n\
+        "Name:\t{}\n\
+        State:\t{} ({})\n\
+        Tgid:\t{}\n\
         Pid:\t{}\n\
-        Uid:\t0 0 0 0\n\
-        Gid:\t0 0 0 0\n\
-        VmData:\t0 kB\n\
+        PPid:\t{}\n\
+        Uid:\t{} {} {} {}\n\
+        Gid:\t{} {} {} {}\n\
+        VmSize:\t{} kB\n\
+        VmRSS:\t{} kB\n\
         VmLck:\t{} kB\n\
         VmSwap:\t0 kB\n\
+        Threads:\t{}\n\
         NoNewPrivs:\t{}\n\
         CapInh:\t{}\n\
         CapPrm:\t{}\n\
@@ -1003,9 +982,24 @@ fn task_status(task: &AxTaskRef) -> String {
         Cpus_allowed_list:\t{}\n\
         Mems_allowed:\t{:x}\n\
         Mems_allowed_list:\t{}",
+        task.name(),
+        state,
+        state_name,
         proc_data.proc.pid(),
         task.as_thread().tid(),
+        ppid,
+        proc_data.uid(),
+        proc_data.euid(),
+        proc_data.suid(),
+        proc_data.fsuid(),
+        proc_data.gid(),
+        proc_data.egid(),
+        proc_data.sgid(),
+        proc_data.fsgid(),
+        vm_size_kb,
+        vm_rss_kb,
         locked_kb,
+        threads,
         proc_data.no_new_privs() as u8,
         format_cap_set(caps.inheritable),
         format_cap_set(caps.permitted),
@@ -1277,7 +1271,7 @@ impl ThreadFdInfoDir {
 
     fn render_fdinfo(description: &FileDescription) -> String {
         let stat = description.inner.stat().ok();
-        let mnt_id = stat.map_or(0, |stat| stat.dev);
+        let mnt_id = stat.map_or(0, |stat| stat.mnt_id);
         let mut out = format!(
             "pos:\t0\nflags:\t{:o}\nmnt_id:\t{}\n",
             description.status_flags(),
@@ -1781,101 +1775,6 @@ impl Pollable for ProcPagemapFile {
     fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
 }
 
-struct ProcKpageflagsFile {
-    node: SimpleFsNode,
-}
-
-impl ProcKpageflagsFile {
-    fn new(fs: Arc<SimpleFs>) -> Arc<Self> {
-        Arc::new(Self {
-            node: SimpleFsNode::new(
-                fs,
-                NodeType::RegularFile,
-                NodePermission::from_bits_truncate(0o444),
-            ),
-        })
-    }
-
-    fn kpageflags_entry(&self, pfn: u64) -> u64 {
-        usize::try_from(pfn)
-            .ok()
-            .filter(|pfn| page_cache_pfn_is_dirty(*pfn))
-            .map_or(0, |_| KPF_DIRTY)
-    }
-}
-
-#[inherit_methods(from = "self.node")]
-impl NodeOps for ProcKpageflagsFile {
-    fn inode(&self) -> u64;
-
-    fn metadata(&self) -> VfsResult<Metadata>;
-
-    fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()>;
-
-    fn filesystem(&self) -> &dyn FilesystemOps;
-
-    fn sync(&self, _data_only: bool) -> VfsResult<()> {
-        Ok(())
-    }
-
-    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
-    }
-
-    fn len(&self) -> VfsResult<u64> {
-        Ok(0)
-    }
-
-    fn flags(&self) -> NodeFlags {
-        NodeFlags::NON_CACHEABLE
-    }
-}
-
-impl FileNodeOps for ProcKpageflagsFile {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
-        let mut written = 0;
-        let mut entry_index = offset / PROC_KPAGEFLAGS_ENTRY_BYTES;
-        let mut entry_offset = (offset % PROC_KPAGEFLAGS_ENTRY_BYTES) as usize;
-
-        while written < buf.len() {
-            let entry = self.kpageflags_entry(entry_index).to_le_bytes();
-            let copy_len =
-                (PROC_KPAGEFLAGS_ENTRY_BYTES as usize - entry_offset).min(buf.len() - written);
-            buf[written..written + copy_len]
-                .copy_from_slice(&entry[entry_offset..entry_offset + copy_len]);
-            written += copy_len;
-            entry_index += 1;
-            entry_offset = 0;
-        }
-
-        Ok(written)
-    }
-
-    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        Err(VfsError::BadFileDescriptor)
-    }
-
-    fn append(&self, _buf: &[u8]) -> VfsResult<(usize, u64)> {
-        Err(VfsError::BadFileDescriptor)
-    }
-
-    fn set_len(&self, _len: u64) -> VfsResult<()> {
-        Err(VfsError::BadFileDescriptor)
-    }
-
-    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
-        Err(VfsError::BadFileDescriptor)
-    }
-}
-
-impl Pollable for ProcKpageflagsFile {
-    fn poll(&self) -> IoEvents {
-        IoEvents::IN | IoEvents::OUT
-    }
-
-    fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
-}
-
 impl SimpleDirOps for ZombieProcessDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
         if self.process.upgrade().is_some() {
@@ -1920,7 +1819,6 @@ impl SimpleDirOps for ThreadDir {
                 Some("mounts"),
                 Some("mountinfo"),
                 Some("cmdline"),
-                Some("coredump_filter"),
                 Some("timerslack_ns"),
                 Some("timens_offsets"),
                 Some("comm"),
@@ -1938,6 +1836,13 @@ impl SimpleDirOps for ThreadDir {
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         let fs = self.fs.clone();
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
+        if matches!(
+            name,
+            "maps" | "smaps" | "numa_maps" | "pagemap" | "exe" | "fd" | "fdinfo" | "ns"
+        ) {
+            check_current_ptrace_access(&task.as_thread().proc_data, PtraceCredentialMode::Fs)
+                .map_err(|_| VfsError::PermissionDenied)?;
+        }
         Ok(match name {
             "stat" => {
                 SimpleFile::new_regular(fs, move || Ok(render_task_stat(&task)?.into_bytes()))
@@ -2002,7 +1907,6 @@ impl SimpleDirOps for ThreadDir {
                 Ok(buf)
             })
             .into(),
-            "coredump_filter" => SimpleFile::new_regular(fs, rw_static_file("33\n")).into(),
             "timerslack_ns" => SimpleFile::new_regular(
                 fs,
                 RwFile::new(move |req| match req {
@@ -2174,18 +2078,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             .ok_or(VfsError::InvalidInput)
     }
 
-    fn write_proc_long_max_bounded_usize(data: &[u8]) -> VfsResult<usize> {
-        let value = str::from_utf8(data)
-            .ok()
-            .map(str::trim)
-            .and_then(|it| it.parse::<u64>().ok())
-            .ok_or(VfsError::InvalidInput)?;
-        if value > i64::MAX as u64 {
-            return Err(VfsError::InvalidInput);
-        }
-        Ok(value as usize)
-    }
-
     fn write_proc_i32(data: &[u8]) -> VfsResult<i32> {
         str::from_utf8(data)
             .ok()
@@ -2199,16 +2091,29 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     }
 
     fn proc_net_dev_snapshot() -> String {
-        concat!(
+        let mut output = concat!(
             "Inter-|   Receive                                                |  Transmit\n",
             " face |bytes    packets errs drop fifo frame compressed multicast|",
             "bytes    packets errs drop fifo colls carrier compressed\n",
-            "    lo:       0       0    0    0    0     0          0         0 ",
-            "       0       0    0    0    0     0       0          0\n",
-            "  eth0:       0       0    0    0    0     0          0         0 ",
-            "       0       0    0    0    0     0       0          0\n",
         )
-        .to_string()
+        .to_string();
+        let net_ns = current().as_thread().proc_data.net_ns.clone();
+        for (name, stats) in net_ns.device_stats() {
+            let _ = writeln!(
+                output,
+                "{name:>6}: {rx_bytes:>7} {rx_packets:>7} {rx_errors:>4} {rx_dropped:>4} 0 0 0 0 \
+                 {tx_bytes:>8} {tx_packets:>7} {tx_errors:>4} {tx_dropped:>4} 0 0 0 0",
+                rx_bytes = stats.rx_bytes,
+                rx_packets = stats.rx_packets,
+                rx_errors = stats.rx_errors,
+                rx_dropped = stats.rx_dropped,
+                tx_bytes = stats.tx_bytes,
+                tx_packets = stats.tx_packets,
+                tx_errors = stats.tx_errors,
+                tx_dropped = stats.tx_dropped,
+            );
+        }
+        output
     }
 
     fn proc_uts_write_value(data: &[u8]) -> Option<&[u8]> {
@@ -2257,11 +2162,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     );
     root.add(
         "swaps",
-        SimpleFile::new_regular(fs.clone(), || Ok(swap_snapshot())),
-    );
-    root.add(
-        "config.gz",
-        SimpleFile::new_regular(fs.clone(), || Ok(PROC_CONFIG_GZ.to_vec())),
+        SimpleFile::new_regular(fs.clone(), || Ok(PROC_SWAPS_HEADER)),
     );
     root.add(
         "meminfo2",
@@ -2435,34 +2336,13 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             }),
         ),
     );
-    root.add("kpageflags", ProcKpageflagsFile::new(fs.clone()));
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
     root.add(
         "instret",
         SimpleFile::new_regular(fs.clone(), || {
-            #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
-            {
-                Ok(format!("{}\n", riscv::register::instret::read64()))
-            }
-            #[cfg(not(any(target_arch = "riscv32", target_arch = "riscv64")))]
-            {
-                Ok("0\n".to_string())
-            }
+            Ok(format!("{}\n", riscv::register::instret::read64()))
         }),
     );
-    {
-        static IRQ_CNT: AtomicUsize = AtomicUsize::new(0);
-
-        axtask::register_timer_callback(|_| {
-            IRQ_CNT.fetch_add(1, Ordering::Relaxed);
-        });
-
-        root.add(
-            "interrupts",
-            SimpleFile::new_regular(fs.clone(), || {
-                Ok(format!("0: {}", IRQ_CNT.load(Ordering::Relaxed)))
-            }),
-        );
-    }
 
     root.add(
         "cpuinfo",
@@ -2473,36 +2353,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 if i > 0 {
                     out.push('\n');
                 }
-                #[cfg(target_arch = "riscv64")]
-                {
-                    let _ = write!(
-                        out,
-                        "processor\t: {i}\nmodel name\t: QEMU Virtual CPU\nhart\t\t: \
-                         {i}\nisa\t\t: rv64imafdc\nmmu\t\t: sv39\n"
-                    );
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    let _ = write!(
-                        out,
-                        "processor\t: {i}\nBogoMIPS\t: 48.00\nFeatures\t: fp asimd\n"
-                    );
-                }
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let _ = write!(
-                        out,
-                        "processor\t: {i}\nvendor_id\t: GenuineIntel\nmodel name\t: QEMU Virtual \
-                         CPU\n"
-                    );
-                }
-                #[cfg(target_arch = "loongarch64")]
-                {
-                    let _ = write!(
-                        out,
-                        "processor\t: {i}\nmodel name\t: QEMU Virtual CPU\nISA\t\t: loongarch64\n"
-                    );
-                }
+                let _ = writeln!(out, "processor\t: {i}");
             }
             Ok(out)
         }),
@@ -2525,36 +2376,19 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 .apply_boottime_offset(axhal::time::monotonic_time());
             let secs = uptime.as_secs();
             let centisecs = uptime.subsec_nanos() / 10_000_000;
-            Ok(format!("{secs}.{centisecs:02} 0.00\n"))
-        }),
-    );
-    root.add(
-        "loadavg",
-        SimpleFile::new_regular(fs.clone(), || {
-            let all_tasks = tasks()
-                .into_iter()
-                .filter(|task| !task.as_thread().pending_exit())
-                .collect::<Vec<_>>();
-            let total = all_tasks.len();
-            let running = all_tasks
-                .iter()
-                .filter(|t| matches!(t.state(), TaskState::Running | TaskState::Ready))
-                .count();
-            // Approximate load as running/total ratio, clamped.
-            let load = running as f64;
-            let last_pid = all_tasks
-                .iter()
-                .map(|t| t.as_thread().tid() as u64)
-                .max()
-                .unwrap_or(0);
+            let idle = axtask::idle_time();
+            let idle_secs = idle.as_secs();
+            let idle_centisecs = idle.subsec_nanos() / 10_000_000;
             Ok(format!(
-                "{load:.2} {load:.2} {load:.2} {running}/{total} {last_pid}\n"
+                "{secs}.{centisecs:02} {idle_secs}.{idle_centisecs:02}\n"
             ))
         }),
     );
     root.add(
         "cmdline",
-        SimpleFile::new_regular(fs.clone(), || Ok("console=ttyS0\n")),
+        // The supported boot paths do not currently preserve firmware/QEMU
+        // command-line bytes. An empty line is honest when no source exists.
+        SimpleFile::new_regular(fs.clone(), || Ok("\n")),
     );
     root.add("net", {
         let mut net = DirMapping::new();
@@ -2571,26 +2405,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         sys.add("fs", {
             let mut fs_dir = DirMapping::new();
 
-            fs_dir.add(
-                "file-max",
-                SimpleFile::new_regular(
-                    fs.clone(),
-                    RwFile::new(move |req| match req {
-                        SimpleFileOperation::Read => Ok(Some(
-                            alloc::format!("{}\n", PROC_FILE_MAX.load(Ordering::Relaxed))
-                                .into_bytes(),
-                        )),
-                        SimpleFileOperation::Write(data) => {
-                            if is_proc_truncate_write(data) {
-                                return Ok(None);
-                            }
-                            let value = write_proc_long_max_bounded_usize(data)?;
-                            PROC_FILE_MAX.store(value, Ordering::Relaxed);
-                            Ok(None)
-                        }
-                    }),
-                ),
-            );
             fs_dir.add(
                 "pipe-max-size",
                 SimpleFile::new_regular(
@@ -2734,23 +2548,13 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 );
                 SimpleDir::new_maker(fs.clone(), Arc::new(mqueue))
             });
-            fs_dir.add(
-                "pipe-user-pages-soft",
-                SimpleFile::new_regular(fs.clone(), rw_static_file("16\n")),
-            );
             fs_dir.add("inotify", {
                 let mut inotify = DirMapping::new();
                 inotify.add(
                     "max_queued_events",
-                    SimpleFile::new_regular(fs.clone(), rw_static_file("16384\n")),
-                );
-                inotify.add(
-                    "max_user_instances",
-                    SimpleFile::new_regular(fs.clone(), rw_static_file("1024\n")),
-                );
-                inotify.add(
-                    "max_user_watches",
-                    SimpleFile::new_regular(fs.clone(), rw_static_file("1048576\n")),
+                    SimpleFile::new_regular(fs.clone(), || {
+                        Ok(format!("{}\n", crate::file::inotify::MAX_QUEUED_EVENTS).into_bytes())
+                    }),
                 );
 
                 SimpleDir::new_maker(fs.clone(), Arc::new(inotify))
@@ -2899,29 +2703,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 ),
             );
             kernel.add(
-                "pid_max",
-                SimpleFile::new_regular(
-                    fs.clone(),
-                    RwFile::new(move |req| match req {
-                        SimpleFileOperation::Read => Ok(Some(
-                            alloc::format!("{}\n", PROC_PID_MAX.load(Ordering::Relaxed))
-                                .into_bytes(),
-                        )),
-                        SimpleFileOperation::Write(data) => {
-                            if is_proc_truncate_write(data) {
-                                return Ok(None);
-                            }
-                            let value = write_proc_u32(data)?;
-                            if !(PROC_PID_MAX_MIN..=PROC_PID_MAX_DEFAULT).contains(&value) {
-                                return Err(VfsError::InvalidInput);
-                            }
-                            PROC_PID_MAX.store(value, Ordering::Relaxed);
-                            Ok(None)
-                        }
-                    }),
-                ),
-            );
-            kernel.add(
                 "ns_last_pid",
                 SimpleFile::new_regular(
                     fs.clone(),
@@ -2934,92 +2715,10 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                                 return Ok(None);
                             }
                             let value = write_proc_u32(data)?;
-                            if value >= PROC_PID_MAX.load(Ordering::Relaxed) {
+                            if value >= PROC_PID_MAX_DEFAULT {
                                 return Err(VfsError::InvalidInput);
                             }
                             set_last_task_id(value.into());
-                            Ok(None)
-                        }
-                    }),
-                ),
-            );
-            kernel.add(
-                "threads-max",
-                SimpleFile::new_regular(fs.clone(), || Ok(format!("{PROC_THREADS_MAX}\n"))),
-            );
-            kernel.add(
-                "sched_time_avg_ms",
-                SimpleFile::new_regular(
-                    fs.clone(),
-                    RwFile::new(move |req| match req {
-                        SimpleFileOperation::Read => Ok(Some(
-                            alloc::format!("{}\n", PROC_SCHED_TIME_AVG_MS.load(Ordering::Relaxed))
-                                .into_bytes(),
-                        )),
-                        SimpleFileOperation::Write(data) => {
-                            if is_proc_truncate_write(data) {
-                                return Ok(None);
-                            }
-                            let value = write_proc_u32(data)?;
-                            if value == 0 {
-                                return Err(VfsError::InvalidInput);
-                            }
-                            PROC_SCHED_TIME_AVG_MS.store(value, Ordering::Relaxed);
-                            Ok(None)
-                        }
-                    }),
-                ),
-            );
-            kernel.add(
-                "sched_rt_period_us",
-                SimpleFile::new_regular(
-                    fs.clone(),
-                    RwFile::new(move |req| match req {
-                        SimpleFileOperation::Read => Ok(Some(
-                            alloc::format!("{}\n", PROC_SCHED_RT_PERIOD_US.load(Ordering::Relaxed))
-                                .into_bytes(),
-                        )),
-                        SimpleFileOperation::Write(data) => {
-                            if is_proc_truncate_write(data) {
-                                return Ok(None);
-                            }
-                            let value = write_proc_i32(data)?;
-                            if value <= 0 {
-                                return Err(VfsError::InvalidInput);
-                            }
-                            let runtime = PROC_SCHED_RT_RUNTIME_US.load(Ordering::Relaxed);
-                            if runtime > value {
-                                return Err(VfsError::InvalidInput);
-                            }
-                            PROC_SCHED_RT_PERIOD_US.store(value as u32, Ordering::Relaxed);
-                            Ok(None)
-                        }
-                    }),
-                ),
-            );
-            kernel.add(
-                "sched_rt_runtime_us",
-                SimpleFile::new_regular(
-                    fs.clone(),
-                    RwFile::new(move |req| match req {
-                        SimpleFileOperation::Read => Ok(Some(
-                            alloc::format!(
-                                "{}\n",
-                                PROC_SCHED_RT_RUNTIME_US.load(Ordering::Relaxed)
-                            )
-                            .into_bytes(),
-                        )),
-                        SimpleFileOperation::Write(data) => {
-                            if is_proc_truncate_write(data) {
-                                return Ok(None);
-                            }
-                            let value = write_proc_i32(data)?;
-                            if value < -1
-                                || value > PROC_SCHED_RT_PERIOD_US.load(Ordering::Relaxed) as i32
-                            {
-                                return Err(VfsError::InvalidInput);
-                            }
-                            PROC_SCHED_RT_RUNTIME_US.store(value, Ordering::Relaxed);
                             Ok(None)
                         }
                     }),
@@ -3046,25 +2745,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             );
             kernel.add("keys", {
                 let mut keys = DirMapping::new();
-                keys.add(
-                    "gc_delay",
-                    SimpleFile::new_regular(
-                        fs.clone(),
-                        RwFile::new(move |req| match req {
-                            SimpleFileOperation::Read => {
-                                Ok(Some(alloc::format!("{}\n", key_gc_delay()).into_bytes()))
-                            }
-                            SimpleFileOperation::Write(data) => {
-                                if is_proc_truncate_write(data) {
-                                    return Ok(None);
-                                }
-                                let value = write_proc_usize(data)?;
-                                set_key_gc_delay(value);
-                                Ok(None)
-                            }
-                        }),
-                    ),
-                );
                 keys.add(
                     "maxkeys",
                     SimpleFile::new_regular(
@@ -3145,7 +2825,21 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             });
             kernel.add(
                 "shmall",
-                SimpleFile::new_regular(fs.clone(), || Ok(alloc::format!("{}\n", shmall_limit()))),
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => {
+                            Ok(Some(alloc::format!("{}\n", shmall_limit()).into_bytes()))
+                        }
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            set_shmall_limit(write_proc_usize(data)?);
+                            Ok(None)
+                        }
+                    }),
+                ),
             );
             kernel.add(
                 "msgmni",
@@ -3262,22 +2956,30 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             );
             kernel.add(
                 "shmmni",
-                SimpleFile::new_regular(fs.clone(), || Ok(alloc::format!("{}\n", shmmni_limit()))),
-            );
-            kernel.add("tainted", SimpleFile::new_regular(fs.clone(), || Ok("0\n")));
-            kernel.add(
-                "core_pattern",
-                SimpleFile::new_regular(fs.clone(), rw_static_file("core\n")),
-            );
-            kernel.add(
-                "printk",
-                SimpleFile::new_regular(fs.clone(), rw_static_file("4 4 1 7\n")),
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => {
+                            Ok(Some(alloc::format!("{}\n", shmmni_limit()).into_bytes()))
+                        }
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            set_shmmni_limit(write_proc_usize(data)?)
+                                .map_err(|_| VfsError::InvalidInput)?;
+                            Ok(None)
+                        }
+                    }),
+                ),
             );
             kernel.add("random", {
                 let mut random = DirMapping::new();
                 random.add(
                     "entropy_avail",
-                    SimpleFile::new_regular(fs.clone(), || Ok(format!("{RANDOM_ENTROPY_BITS}\n"))),
+                    SimpleFile::new_regular(fs.clone(), || {
+                        Ok(format!("{}\n", crate::random::entropy_bits()))
+                    }),
                 );
 
                 SimpleDir::new_maker(fs.clone(), Arc::new(random))

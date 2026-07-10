@@ -1,5 +1,7 @@
 use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
+use axerrno::{AxError, AxResult};
+
 mod mqueue;
 mod msg;
 mod sem;
@@ -57,12 +59,11 @@ pub(crate) const SHM_LOCKED: u32 = 0o2000;
 pub(crate) const SHMMIN: usize = 1;
 const DEFAULT_SHMMAX: usize = 0xFFFF_FFFF;
 const DEFAULT_SHMMNI: usize = 4096;
-const DEFAULT_SHMSEG: usize = 1024;
 const DEFAULT_SHMALL: usize = 0xFFFF_FFFF;
+const MAX_SHMMNI: usize = 32_768;
 
 static SHM_MAX_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_SHMMAX);
 static SHM_MNI_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_SHMMNI);
-static SHM_SEG_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_SHMSEG);
 static SHM_ALL_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_SHMALL);
 
 pub(crate) fn shmmax_limit() -> usize {
@@ -70,19 +71,27 @@ pub(crate) fn shmmax_limit() -> usize {
 }
 
 pub(crate) fn set_shmmax_limit(value: usize) {
-    SHM_MAX_LIMIT.store(value.max(SHMMIN), Ordering::Relaxed);
+    SHM_MAX_LIMIT.store(value, Ordering::Relaxed);
 }
 
 pub(crate) fn shmmni_limit() -> usize {
     SHM_MNI_LIMIT.load(Ordering::Relaxed)
 }
 
-pub(crate) fn shmseg_limit() -> usize {
-    SHM_SEG_LIMIT.load(Ordering::Relaxed)
+pub(crate) fn set_shmmni_limit(value: usize) -> AxResult<()> {
+    if value > MAX_SHMMNI {
+        return Err(AxError::InvalidInput);
+    }
+    SHM_MNI_LIMIT.store(value, Ordering::Relaxed);
+    Ok(())
 }
 
 pub(crate) fn shmall_limit() -> usize {
     SHM_ALL_LIMIT.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_shmall_limit(value: usize) {
+    SHM_ALL_LIMIT.store(value, Ordering::Relaxed);
 }
 
 /// Data structure used to pass permission information to IPC operations.

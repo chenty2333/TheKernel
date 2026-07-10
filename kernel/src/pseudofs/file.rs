@@ -47,7 +47,11 @@ where
     R: Into<Vec<u8>>,
 {
     fn read_all(&self) -> VfsResult<Cow<'_, [u8]>> {
-        (self.0)(SimpleFileOperation::Read).map(|it| Cow::Owned(it.unwrap().into()))
+        (self.0)(SimpleFileOperation::Read).and_then(|value| {
+            value
+                .map(|value| Cow::Owned(value.into()))
+                .ok_or(VfsError::InvalidData)
+        })
     }
 
     fn write_all(&self, data: &[u8]) -> VfsResult<()> {

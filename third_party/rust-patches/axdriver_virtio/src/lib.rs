@@ -42,6 +42,7 @@ use axdriver_base::{DevError, DeviceType};
 use virtio_drivers::transport::DeviceType as VirtIoDevType;
 pub use virtio_drivers::{
     BufferDirection, Hal as VirtIoHal, PhysAddr,
+    device::entropy::VirtIOEntropy,
     stats::{
         AsyncBlockWaitPolicy, VirtioIoCounters, async_block_enabled as virtio_async_block_enabled,
         async_block_wait_policy as virtio_async_block_wait_policy,
@@ -85,6 +86,17 @@ pub fn probe_mmio_device(
     Some((dev_type, transport))
 }
 
+/// Tries to probe a VirtIO MMIO entropy source from the given memory region.
+pub fn probe_mmio_entropy_device(reg_base: *mut u8, _reg_size: usize) -> Option<MmioTransport> {
+    use core::ptr::NonNull;
+
+    use virtio_drivers::transport::mmio::VirtIOHeader;
+
+    let header = NonNull::new(reg_base as *mut VirtIOHeader)?;
+    let transport = unsafe { MmioTransport::new(header) }.ok()?;
+    (transport.device_type() == VirtIoDevType::EntropySource).then_some(transport)
+}
+
 /// Try to probe a VirtIO PCI device from the given PCI address.
 ///
 /// If the device is recognized, returns the device type and a transport object
@@ -109,6 +121,20 @@ pub fn probe_pci_device<H: VirtIoHal>(
     let transport = PciTransport::new::<H>(root, bdf).ok()?;
     let irq = PCI_IRQ_BASE + (bdf.device & 3) as usize;
     Some((dev_type, transport, irq))
+}
+
+/// Tries to probe a VirtIO PCI entropy source at the given PCI address.
+pub fn probe_pci_entropy_device<H: VirtIoHal>(
+    root: &mut PciRoot,
+    bdf: DeviceFunction,
+    dev_info: &DeviceFunctionInfo,
+) -> Option<PciTransport> {
+    use virtio_drivers::transport::pci::virtio_device_type;
+
+    if virtio_device_type(dev_info)? != VirtIoDevType::EntropySource {
+        return None;
+    }
+    PciTransport::new::<H>(root, bdf).ok()
 }
 
 const fn as_dev_type(t: VirtIoDevType) -> Option<DeviceType> {

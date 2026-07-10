@@ -1,14 +1,19 @@
 //! Driver for VirtIO GPU devices.
 
-use crate::hal::{BufferDirection, Dma, Hal};
-use crate::queue::VirtQueue;
-use crate::transport::Transport;
-use crate::volatile::{volread, ReadOnly, Volatile, WriteOnly};
-use crate::{pages, Error, Result, PAGE_SIZE};
 use alloc::boxed::Box;
+
 use bitflags::bitflags;
 use log::info;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
+
+use crate::{
+    Error, PAGE_SIZE, Result,
+    hal::{BufferDirection, Dma, Hal},
+    pages,
+    queue::VirtQueue,
+    transport::Transport,
+    volatile::{ReadOnly, Volatile, WriteOnly, volread},
+};
 
 const QUEUE_SIZE: u16 = 2;
 const SUPPORTED_FEATURES: Features = Features::RING_EVENT_IDX.union(Features::RING_INDIRECT_DESC);

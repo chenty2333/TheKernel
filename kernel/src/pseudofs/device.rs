@@ -37,6 +37,11 @@ pub trait DeviceOps: Send + Sync {
         Err(VfsError::NotATty)
     }
 
+    /// Synchronizes buffered device state with the underlying hardware.
+    fn sync(&self, _data_only: bool) -> VfsResult<()> {
+        Err(VfsError::InvalidInput)
+    }
+
     /// Casts the device operations to a dynamic type.
     fn as_any(&self) -> &dyn Any;
 
@@ -75,7 +80,18 @@ impl Device {
         device_id: DeviceId,
         ops: Arc<dyn DeviceOps>,
     ) -> Arc<Self> {
-        let node = SimpleFsNode::new(fs, node_type, NodePermission::default());
+        Self::new_with_permissions(fs, node_type, device_id, NodePermission::default(), ops)
+    }
+
+    /// Creates a device node with explicit access permissions.
+    pub fn new_with_permissions(
+        fs: Arc<SimpleFs>,
+        node_type: NodeType,
+        device_id: DeviceId,
+        permissions: NodePermission,
+        ops: Arc<dyn DeviceOps>,
+    ) -> Arc<Self> {
+        let node = SimpleFsNode::new(fs, node_type, permissions);
         node.metadata.lock().rdev = device_id;
         Arc::new(Self { node, ops })
     }
@@ -106,8 +122,8 @@ impl NodeOps for Device {
 
     fn filesystem(&self) -> &dyn FilesystemOps;
 
-    fn sync(&self, _data_only: bool) -> VfsResult<()> {
-        Err(VfsError::InvalidInput)
+    fn sync(&self, data_only: bool) -> VfsResult<()> {
+        self.ops.sync(data_only)
     }
 
     fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {

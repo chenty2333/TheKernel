@@ -13,7 +13,7 @@ use core::{
     time::Duration,
 };
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FileBackend, FileFlags};
 use axfs_ng_vfs::{
     DeviceId, Location, Metadata, MetadataUpdate, NodePermission, NodeType,
@@ -30,12 +30,12 @@ use starry_vm::{VmPtr, vm_write_slice};
 use crate::{
     file::{
         Directory, File, FileLike, add_file_like, get_file_like, has_tmpfile_state,
-        inode_flags::{self, TimeUpdate},
         inotify::location_for_fd,
         is_path_only_fd,
         permission::{
-            check_create_permissions, check_parent_search_permissions, check_remove_permissions,
-            check_rename_permissions, check_search_permissions, check_writable_mount,
+            check_create_permissions, check_open_permissions, check_parent_search_permissions,
+            check_remove_permissions, check_rename_permissions, check_search_permissions,
+            check_writable_mount,
         },
         resolve_at, with_fs, with_path_fs,
     },
@@ -53,6 +53,13 @@ const SUPPORTED_RENAMEAT2_FLAGS: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE | RENA
 const PATH_MAX: usize = 4096;
 const SUPPORTED_FCHMODAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
 const SUPPORTED_FCHOWNAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TimeUpdate {
+    Omit,
+    Now,
+    Explicit,
+}
 const SUPPORTED_UNLINKAT_FLAGS: u32 = AT_REMOVEDIR;
 const GETDENTS64_MAX_BUFFER: usize = 16 * 1024;
 
@@ -175,7 +182,7 @@ fn materialize_tmpfile_link(old: &Location, new_dir: &Location, new_name: &str) 
     let metadata = old.metadata()?;
     let new = new_dir.create(new_name, NodeType::RegularFile, metadata.mode)?;
     let result = (|| {
-        new.update_metadata(MetadataUpdate {
+        new.update_supported_metadata(MetadataUpdate {
             owner: Some((metadata.uid, metadata.gid)),
             mode: Some(metadata.mode),
             atime: Some(metadata.atime),
@@ -498,7 +505,7 @@ pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize
         owner_gid = parent_meta.gid;
         final_mode.insert(NodePermission::SET_GID);
     }
-    loc.update_metadata(MetadataUpdate {
+    loc.update_supported_metadata(MetadataUpdate {
         owner: Some((proc_data.fsuid(), owner_gid)),
         mode: Some(final_mode),
         ..Default::default()
@@ -559,7 +566,7 @@ pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, dev: u64) -> AxRe
     if proc_data.fsuid() != 0 && !proc_data.is_in_fs_group(owner_gid) {
         final_mode.remove(NodePermission::SET_GID);
     }
-    loc.update_metadata(MetadataUpdate {
+    loc.update_supported_metadata(MetadataUpdate {
         owner: Some((proc_data.fsuid(), owner_gid)),
         mode: Some(final_mode),
         rdev: matches!(node_type, NodeType::CharacterDevice | NodeType::BlockDevice)
@@ -654,7 +661,7 @@ pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
     if buffer.offset > 0 && mounts::should_update_atime(dir.inner()) {
-        dir.inner().update_metadata(MetadataUpdate {
+        dir.inner().update_supported_metadata(MetadataUpdate {
             atime: Some(wall_time()),
             ..Default::default()
         })?;
@@ -785,8 +792,7 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
     let parent = loc.parent();
     let name = loc.name().to_string();
     let is_dir = loc.is_dir();
-    let clear_xattrs = is_dir || loc.metadata()?.nlink <= 1;
-    inode_flags::check_remove(&loc)?;
+    let last_link = is_dir || loc.metadata()?.nlink <= 1;
     if let Some(parent) = parent.as_ref() {
         check_remove_permissions(
             parent,
@@ -796,7 +802,7 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
             &supplementary_groups,
         )?;
     }
-    if !is_dir && clear_xattrs {
+    if !is_dir && last_link {
         axfs::mark_cached_file_unlinked(&loc);
     }
     with_path_fs(dirfd, Path::new(&path), |fs| {
@@ -807,10 +813,6 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
         }
         Ok(0)
     })?;
-    if clear_xattrs {
-        super::clear_location_xattrs(&loc);
-        inode_flags::clear(&loc);
-    }
     if let Some(parent) = parent {
         let _ = crate::file::inotify::notify_parent_with_name(
             &parent,
@@ -821,7 +823,7 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
             0,
         );
     }
-    if !is_dir && clear_xattrs {
+    if !is_dir && last_link {
         let _ = crate::file::inotify::notify_exact(&loc, IN_ATTRIB);
     }
     let _ = crate::file::inotify::notify_exact(&loc, IN_DELETE_SELF);
@@ -999,7 +1001,6 @@ pub fn sys_fchownat(
     let uid = if uid == -1 { meta.uid } else { uid as _ };
     let gid = if gid == -1 { meta.gid } else { gid as _ };
     check_writable_mount(&loc)?;
-    inode_flags::check_metadata_update(&loc)?;
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     if path.as_deref().is_some_and(|path| !path.is_empty()) {
@@ -1054,7 +1055,6 @@ pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> A
     if !current_can_preserve_setgid(meta.gid) {
         mode.remove(NodePermission::SET_GID);
     }
-    inode_flags::check_metadata_update(&loc)?;
     loc.update_metadata(MetadataUpdate {
         mode: Some(mode),
         ..Default::default()
@@ -1077,11 +1077,32 @@ fn update_times(
     let loc = resolve_at(dirfd, path.as_deref(), flags)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
+    if atime_intent == TimeUpdate::Omit && mtime_intent == TimeUpdate::Omit {
+        return Ok(());
+    }
+
+    let meta = loc.metadata()?;
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    if proc_data.fsuid() != meta.uid && !proc_data.has_effective_capability(CAP_FOWNER) {
+        if (atime_intent, mtime_intent) != (TimeUpdate::Now, TimeUpdate::Now) {
+            return Err(AxError::OperationNotPermitted);
+        }
+        check_open_permissions(
+            &loc,
+            W_OK,
+            proc_data.fsuid(),
+            proc_data.fsgid(),
+            &proc_data.supplementary_groups(),
+        )?;
+    }
     check_writable_mount(&loc)?;
-    inode_flags::check_time_update(&loc, atime_intent, mtime_intent)?;
     loc.update_metadata(MetadataUpdate {
         atime,
         mtime,
+        ..Default::default()
+    })?;
+    loc.update_supported_metadata(MetadataUpdate {
         ctime: Some(wall_time()),
         ..Default::default()
     })?;
@@ -1175,10 +1196,6 @@ pub fn sys_utimensat(
         let time = wall_time();
         (Some(time), Some(time), TimeUpdate::Now, TimeUpdate::Now)
     };
-    if atime.is_none() && mtime.is_none() {
-        return Ok(0);
-    }
-
     update_times(dirfd, path, atime, mtime, atime_intent, mtime_intent, flags)?;
     Ok(0)
 }
@@ -1276,10 +1293,6 @@ pub fn sys_renameat2(
     if flags & RENAME_NOREPLACE != 0 && new_existing.is_some() {
         return Err(AxError::AlreadyExists);
     }
-    inode_flags::check_remove(&old_loc)?;
-    if let Some(existing) = new_existing.as_ref() {
-        inode_flags::check_remove(existing)?;
-    }
 
     if flags & RENAME_EXCHANGE != 0 {
         let new_loc = new_existing.as_ref().ok_or(AxError::NotFound)?;
@@ -1347,13 +1360,15 @@ pub fn sys_renameat2(
 }
 
 pub fn sys_sync() -> AxResult<isize> {
-    axfs::sync_all_cached_file_pages()?;
-    FS_CONTEXT.lock().root_dir().filesystem().flush()?;
+    FS_CONTEXT
+        .lock()
+        .root_dir()
+        .mountpoint()
+        .flush_all_filesystems()?;
     Ok(0)
 }
 
 pub fn sys_syncfs(fd: i32) -> AxResult<isize> {
-    axfs::sync_all_cached_file_pages()?;
     let file = get_file_like(fd)?;
     if let Some(file) = file.downcast_ref::<crate::file::File>() {
         file.inner().location().filesystem().flush()?;
@@ -1388,15 +1403,14 @@ pub fn sys_reboot(magic1: i32, magic2: i32, cmd: i32, _arg: *const c_void) -> Ax
             ax_println!("System is shutting down");
             system_off();
         }
-        LINUX_REBOOT_CMD_CAD_ON | LINUX_REBOOT_CMD_CAD_OFF => Ok(0),
+        LINUX_REBOOT_CMD_CAD_ON | LINUX_REBOOT_CMD_CAD_OFF => Err(LinuxError::EOPNOTSUPP.into()),
         _ => Err(AxError::InvalidInput),
     }
 }
 
 pub fn sys_vhangup() -> AxResult<isize> {
-    if current_has_capability(CAP_SYS_TTY_CONFIG) {
-        Ok(0)
-    } else {
-        Err(AxError::OperationNotPermitted)
+    if !current_has_capability(CAP_SYS_TTY_CONFIG) {
+        return Err(AxError::OperationNotPermitted);
     }
+    Err(LinuxError::EOPNOTSUPP.into())
 }

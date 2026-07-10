@@ -85,7 +85,8 @@ pub fn sys_arch_prctl(
             uctx.gs_base = addr as _;
             Ok(0)
         }
-        ArchPrctlCode::GetCpuid => Ok(0),
+        ArchPrctlCode::GetCpuid => Ok(1),
+        ArchPrctlCode::SetCpuid if addr != 0 => Ok(0),
         ArchPrctlCode::SetCpuid => Err(axerrno::AxError::NoSuchDevice),
     }
 }

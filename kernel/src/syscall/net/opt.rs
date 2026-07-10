@@ -1,36 +1,25 @@
 use axerrno::{AxError, AxResult, LinuxError};
 use axnet::options::{Configurable, GetSocketOption, SetSocketOption};
+use axtask::current;
 use bytemuck::AnyBitPattern;
-use linux_raw_sys::net::{
-    AF_INET, IPV6_ADDRFORM, SO_ATTACH_BPF, SO_DETACH_BPF, SO_NO_CHECK, SO_OOBINLINE,
-    SO_SNDBUFFORCE, SOL_DCCP, SOL_IPV6, SOL_NETLINK, SOL_SOCKET, SOL_TLS, TCP_INFO, TCP_ULP,
-    socklen_t, tcp_info,
+use linux_raw_sys::{
+    general::CAP_NET_ADMIN,
+    net::{
+        AF_INET, IPV6_ADDRFORM, SO_ATTACH_BPF, SO_DETACH_BPF, SO_RCVBUFFORCE, SO_SNDBUFFORCE,
+        SOL_IPV6, SOL_NETLINK, SOL_SOCKET, socklen_t,
+    },
 };
 
 use crate::{
-    file::{
-        AfAlgSocket, FileLike, NetlinkSocket, PacketSocket, Socket, af_alg, get_file_like,
-        packet::{
-            PACKET_FANOUT, PACKET_RESERVE, PACKET_RX_RING, PACKET_VERSION, PACKET_VNET_HDR,
-            SOL_PACKET, TpacketReq, TpacketReq3,
-        },
-    },
+    file::{AfAlgSocket, FileLike, NetlinkSocket, Socket, af_alg, get_file_like},
     mm::{UserConstPtr, UserPtr},
+    task::AsThread,
 };
 
 const PROTO_TCP: u32 = linux_raw_sys::net::IPPROTO_TCP as u32;
-const SO_RXQ_OVFL_COMPAT: u32 = 40;
-const TCP_ESTABLISHED: u8 = 1;
-const DEFAULT_TCP_MSS: u32 = 1460;
-const DEFAULT_TCP_CWND: u32 = 10;
-const DEFAULT_TCP_RTO_US: u32 = 200_000;
 
 const PROTO_IP: u32 = linux_raw_sys::net::IPPROTO_IP as u32;
-const TLS_TX: u32 = 1;
-const DCCP_SOCKOPT_SERVICE: u32 = 2;
 const IPT_SO_SET_REPLACE: u32 = 64;
-const MCAST_JOIN_GROUP: u32 = 42;
-const MCAST_LEAVE_GROUP: u32 = 45;
 const NF_INET_NUMHOOKS: usize = 5;
 const XT_EXTENSION_MAXNAMELEN: usize = 29;
 const XT_ENTRY_HEADER_SIZE: usize = 2 + XT_EXTENSION_MAXNAMELEN + 1;
@@ -176,7 +165,6 @@ macro_rules! call_dispatch {
 
             (PROTO_TCP, TCP_NODELAY) => NoDelay as IntBool,
             (PROTO_TCP, TCP_MAXSEG) => MaxSegment as Int<usize>,
-            (PROTO_TCP, TCP_INFO) => TcpInfo,
 
             (PROTO_IP, IP_TTL) => Ttl as Int<u8>,
             (SOL_IPV6, IPV6_V6ONLY) => Ipv6Only as IntBool,
@@ -330,41 +318,6 @@ fn handle_ipt_set_replace(optval: UserConstPtr<u8>) -> AxResult<isize> {
     Err(AxError::from(LinuxError::ENOPROTOOPT))
 }
 
-fn get_tcp_info(fd: i32, optval: UserPtr<u8>, optlen: &mut socklen_t) -> AxResult<isize> {
-    let socket = Socket::from_fd(fd).map_err(|err| socket_fd_error(fd, err))?;
-    if !socket.is_tcp() {
-        return Err(AxError::from(LinuxError::ENOPROTOOPT));
-    }
-
-    let user_len = *optlen as usize;
-    if user_len == 0 {
-        return Err(AxError::InvalidInput);
-    }
-
-    let mut info = tcp_info {
-        tcpi_state: TCP_ESTABLISHED,
-        tcpi_rto: DEFAULT_TCP_RTO_US,
-        tcpi_snd_mss: DEFAULT_TCP_MSS,
-        tcpi_rcv_mss: DEFAULT_TCP_MSS,
-        tcpi_pmtu: DEFAULT_TCP_MSS,
-        tcpi_rcv_ssthresh: u32::MAX,
-        tcpi_snd_ssthresh: u32::MAX,
-        tcpi_snd_cwnd: DEFAULT_TCP_CWND,
-        tcpi_advmss: DEFAULT_TCP_MSS,
-        tcpi_reordering: 3,
-        tcpi_rcv_space: 64 * 1024,
-        ..unsafe { core::mem::zeroed() }
-    };
-
-    let copy_len = user_len.min(size_of::<tcp_info>());
-    let bytes = unsafe {
-        core::slice::from_raw_parts((&mut info as *mut tcp_info).cast::<u8>(), copy_len)
-    };
-    optval.get_as_mut_slice(copy_len)?.copy_from_slice(bytes);
-    *optlen = copy_len as socklen_t;
-    Ok(0)
-}
-
 pub fn sys_getsockopt(
     fd: i32,
     level: u32,
@@ -385,10 +338,6 @@ pub fn sys_getsockopt(
     if *optlen > i32::MAX as socklen_t {
         return Err(AxError::InvalidInput);
     }
-    if level == PROTO_TCP && optname == TCP_INFO {
-        return get_tcp_info(fd, optval, optlen);
-    }
-
     fn get<'a, T: 'static>(val: UserPtr<u8>, len: &mut socklen_t) -> AxResult<&'a mut T> {
         if (*len as usize) < size_of::<T>() {
             return Err(AxError::InvalidInput);
@@ -397,41 +346,15 @@ pub fn sys_getsockopt(
         val.cast().get_as_mut()
     }
 
-    if let Ok(socket) = PacketSocket::from_fd(fd) {
-        if level != SOL_PACKET {
-            return Err(AxError::from(LinuxError::ENOPROTOOPT));
-        }
-
-        match optname {
-            PACKET_VERSION => {
-                *get::<i32>(optval, optlen)? = socket.packet_version();
-            }
-            PACKET_RESERVE => {
-                *get::<u32>(optval, optlen)? = socket.packet_reserve();
-            }
-            _ => return Err(AxError::from(LinuxError::ENOPROTOOPT)),
-        }
-        return Ok(0);
-    }
-
     if let Ok(socket) = NetlinkSocket::from_fd(fd) {
         if level != SOL_NETLINK {
             return Err(AxError::from(LinuxError::ENOPROTOOPT));
         }
-        let value = *get::<u32>(optval, optlen)?;
-        socket.set_option(optname, value)?;
+        *get::<u32>(optval, optlen)? = socket.get_option(optname)?;
         return Ok(0);
     }
 
     let socket = Socket::from_fd(fd).map_err(|err| socket_fd_error(fd, err))?;
-    if level == SOL_SOCKET && optname == SO_OOBINLINE {
-        *get::<i32>(optval, optlen)? = 0;
-        return Ok(0);
-    }
-    if level == SOL_SOCKET && optname == SO_RXQ_OVFL_COMPAT {
-        *get::<i32>(optval, optlen)? = 0;
-        return Ok(0);
-    }
     macro_rules! dispatch {
         ($which:ident) => {
             socket.get_option(GetSocketOption::$which(get(optval, optlen)?))?;
@@ -487,61 +410,15 @@ pub fn sys_setsockopt(
         return Ok(0);
     }
 
-    if let Ok(socket) = PacketSocket::from_fd(fd) {
-        if level != SOL_PACKET {
+    if let Ok(socket) = NetlinkSocket::from_fd(fd) {
+        if level != SOL_NETLINK {
             return Err(AxError::from(LinuxError::ENOPROTOOPT));
         }
-
-        match optname {
-            PACKET_VERSION => {
-                let version = *get::<i32>(optval, optlen)?;
-                socket.set_packet_version(version)?;
-            }
-            PACKET_RX_RING => {
-                let req = if socket.packet_version() == 2 {
-                    *get::<TpacketReq3>(optval, optlen)?
-                } else {
-                    if (optlen as usize) < size_of::<TpacketReq>() {
-                        return Err(AxError::InvalidInput);
-                    }
-                    TpacketReq3::from(*optval.cast::<TpacketReq>().get_as_ref()?)
-                };
-                socket.set_rx_ring(req)?;
-            }
-            PACKET_RESERVE => {
-                let reserve = *get::<u32>(optval, optlen)?;
-                socket.set_packet_reserve(reserve)?;
-            }
-            PACKET_VNET_HDR => {
-                let enabled = *get::<i32>(optval, optlen)? != 0;
-                socket.set_vnet_hdr(enabled);
-            }
-            PACKET_FANOUT => {
-                let value = *get::<u32>(optval, optlen)?;
-                socket.set_fanout(value);
-            }
-            _ => return Err(AxError::from(LinuxError::ENOPROTOOPT)),
-        }
+        socket.set_option(optname, *get::<u32>(optval, optlen)?)?;
         return Ok(0);
     }
 
     let socket = Socket::from_fd(fd).map_err(|err| socket_fd_error(fd, err))?;
-    if level == SOL_SOCKET && optname == SO_OOBINLINE {
-        let _ = get::<i32>(optval, optlen)?;
-        return Ok(0);
-    }
-    if level == SOL_SOCKET && optname == SO_NO_CHECK {
-        let _ = get::<i32>(optval, optlen)?;
-        return Ok(0);
-    }
-    if level == SOL_SOCKET && optname == SO_RXQ_OVFL_COMPAT {
-        let _ = get::<i32>(optval, optlen)?;
-        return Ok(0);
-    }
-    if level == SOL_DCCP && optname == DCCP_SOCKOPT_SERVICE {
-        let _ = get::<i32>(optval, optlen)?;
-        return Ok(0);
-    }
     if level == SOL_IPV6 && optname == IPV6_ADDRFORM {
         if *get::<i32>(optval, optlen)? as u32 != AF_INET {
             return Err(AxError::from(LinuxError::EAFNOSUPPORT));
@@ -549,44 +426,33 @@ pub fn sys_setsockopt(
         socket.set_ipv6_addrform_to_ipv4()?;
         return Ok(0);
     }
-    if level == PROTO_IP {
-        match optname {
-            IPT_SO_SET_REPLACE => return handle_ipt_set_replace(optval),
-            MCAST_JOIN_GROUP => return Ok(0),
-            MCAST_LEAVE_GROUP => return Err(AxError::from(LinuxError::EADDRNOTAVAIL)),
-            _ => {}
-        }
-    }
-    if level == PROTO_TCP && optname == TCP_ULP {
-        if !socket.is_tcp() {
-            return Err(AxError::from(LinuxError::ENOPROTOOPT));
-        }
-        if optlen == 0 {
-            return Err(AxError::InvalidInput);
-        }
-        let name = optval.get_as_slice(optlen as usize)?;
-        let name = name.split(|byte| *byte == 0).next().unwrap_or(name);
-        if name == b"tls" {
-            socket.set_tcp_tls_ulp();
-            return Ok(0);
-        }
-        return Err(AxError::from(LinuxError::ENOENT));
-    }
-    if level == SOL_TLS && optname == TLS_TX {
-        if !socket.is_tcp() {
-            return Err(AxError::from(LinuxError::ENOPROTOOPT));
-        }
-        if !socket.has_tcp_tls_ulp() {
-            return Err(AxError::from(LinuxError::ENOPROTOOPT));
-        }
-        let _ = optval.get_as_slice(optlen as usize)?;
-        return Ok(0);
+    if level == PROTO_IP && optname == IPT_SO_SET_REPLACE {
+        return handle_ipt_set_replace(optval);
     }
     if level == SOL_SOCKET {
         match optname {
             SO_SNDBUFFORCE => {
+                if !current()
+                    .as_thread()
+                    .proc_data
+                    .has_effective_capability(CAP_NET_ADMIN)
+                {
+                    return Err(LinuxError::EPERM.into());
+                }
                 let size = (*get::<u32>(optval, optlen)? as usize).min(i32::MAX as usize);
                 socket.set_option(SetSocketOption::SendBufferForce(&size))?;
+                return Ok(0);
+            }
+            SO_RCVBUFFORCE => {
+                if !current()
+                    .as_thread()
+                    .proc_data
+                    .has_effective_capability(CAP_NET_ADMIN)
+                {
+                    return Err(LinuxError::EPERM.into());
+                }
+                let size = (*get::<u32>(optval, optlen)? as usize).min(i32::MAX as usize);
+                socket.set_option(SetSocketOption::ReceiveBufferForce(&size))?;
                 return Ok(0);
             }
             SO_ATTACH_BPF => {

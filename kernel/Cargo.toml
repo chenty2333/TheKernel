@@ -29,8 +29,11 @@ axfeat = { workspace = true, features = [
     "sched-cfs",
 
     "rtc",
+    "rng",
 
     "fs-ng-ext4",
+    "fs-ng-fat",
+    "net-ng",
 ] }
 
 axalloc.workspace = true
@@ -57,6 +60,7 @@ bitmaps = { version = "3.2", default-features = false }
 bytemuck = { version = "1.23", features = ["unsound_ptr_pod_impl", "derive"] }
 cfg-if = "1.0"
 chrono = { version = "0.4", default-features = false }
+chacha20 = { version = "0.9.1", default-features = false }
 downcast-rs = { version = "2.0", default-features = false, features = ["sync"] }
 enum_dispatch = "0.3"
 event-listener = { version = "5.4", default-features = false }
@@ -107,12 +111,6 @@ x86 = "0.52"
 
 [target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
 riscv = "0.16"
-
-[target.'cfg(target_arch = "loongarch64")'.dependencies]
-axfeat = { workspace = true, features = ["net-ng-loopback"] }
-
-[target.'cfg(not(target_arch = "loongarch64"))'.dependencies]
-axfeat = { workspace = true, features = ["net-ng"] }
 
 [target.'cfg(not(any(target_arch = "aarch64", target_arch = "loongarch64")))'.dependencies]
 page_table_multiarch = { version = "0.6", features = ["copy-from"] }

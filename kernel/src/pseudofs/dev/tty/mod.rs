@@ -12,7 +12,8 @@ use axfs_ng_vfs::NodeFlags;
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
 use axtask::current;
-use starry_process::Process;
+use starry_process::{Process, Session};
+use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use self::terminal::{
@@ -28,7 +29,7 @@ pub use self::{
 };
 use crate::{
     pseudofs::{DeviceOps, SimpleFs},
-    task::AsThread,
+    task::{AsThread, get_process_group, send_signal_to_process_group},
 };
 
 const N_TTY_LDISC: i32 = 0;
@@ -64,17 +65,56 @@ impl<R: TtyRead, W: TtyWrite + Clone> Tty<R, W> {
 }
 
 impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
+    fn controlling_session_for_current(&self) -> AxResult<Arc<Session>> {
+        let session = current().as_thread().proc_data.proc.group().session();
+        let terminal_session = self
+            .terminal
+            .job_control
+            .session()
+            .ok_or(AxError::NotATty)?;
+        if !Arc::ptr_eq(&session, &terminal_session) {
+            return Err(AxError::NotATty);
+        }
+        let tty: Arc<dyn Any + Send + Sync> = self.this.upgrade().ok_or(AxError::NotATty)?;
+        if !session
+            .terminal()
+            .is_some_and(|current| Arc::ptr_eq(&current, &tty))
+        {
+            return Err(AxError::NotATty);
+        }
+        Ok(session)
+    }
+
     pub fn bind_to(self: &Arc<Self>, proc: &Process) -> AxResult<()> {
         let pg = proc.group();
-        if pg.session().sid() != proc.pid() {
+        let session = pg.session();
+        if session.sid() != proc.pid() {
             return Err(AxError::OperationNotPermitted);
         }
-        assert!(pg.session().set_terminal_with(|| {
-            self.terminal.job_control.set_session(&pg.session());
-            self.clone()
-        }));
 
-        self.terminal.job_control.set_foreground(&pg).unwrap();
+        let tty: Arc<dyn Any + Send + Sync> = self.clone();
+        if let Some(current) = session.terminal() {
+            if !Arc::ptr_eq(&current, &tty) {
+                return Err(AxError::OperationNotPermitted);
+            }
+            self.terminal.job_control.claim_session(&session)?;
+            return self.terminal.job_control.set_foreground(&pg);
+        }
+
+        let claimed = self.terminal.job_control.claim_session(&session)?;
+        if !session.set_terminal_with(|| tty.clone()) {
+            if claimed {
+                self.terminal.job_control.release_session(&session);
+            }
+            return Err(AxError::OperationNotPermitted);
+        }
+        if let Err(err) = self.terminal.job_control.set_foreground(&pg) {
+            session.unset_terminal(&tty);
+            if claimed {
+                self.terminal.job_control.release_session(&session);
+            }
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -162,15 +202,16 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                     .store(ldisc as u32, Ordering::Release);
             }
             TCXONC => match arg as u32 {
-                TCOOFF | TCOON | TCIOFF | TCION => {}
+                TCOOFF | TCOON | TCIOFF | TCION => return Err(AxError::Unsupported),
                 _ => return Err(AxError::InvalidInput),
             },
             TCFLSH => match arg as u32 {
-                TCIFLUSH | TCIOFLUSH => self.ldisc.lock().drain_input(),
-                TCOFLUSH => {}
+                TCIFLUSH => self.ldisc.lock().drain_input(),
+                TCOFLUSH | TCIOFLUSH => return Err(AxError::Unsupported),
                 _ => return Err(AxError::InvalidInput),
             },
             TIOCGPGRP => {
+                self.controlling_session_for_current()?;
                 let foreground = self
                     .terminal
                     .job_control
@@ -179,10 +220,13 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 (arg as *mut u32).vm_write(foreground.pgid())?;
             }
             TIOCSPGRP => {
-                let curr = current();
-                self.terminal
-                    .job_control
-                    .set_foreground(&curr.as_thread().proc_data.proc.group())?;
+                self.controlling_session_for_current()?;
+                let pgid = (arg as *const i32).vm_read()?;
+                if pgid <= 0 {
+                    return Err(AxError::InvalidInput);
+                }
+                let foreground = get_process_group(pgid as u32)?;
+                self.terminal.job_control.set_foreground(&foreground)?;
             }
             TIOCGWINSZ => {
                 (arg as *mut WindowSize).vm_write(*self.terminal.window_size.lock())?;
@@ -208,26 +252,48 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 (arg as *mut u32).vm_write(self.pty_number())?;
             }
             TIOCSCTTY => {
+                if arg != 0 {
+                    return Err(AxError::OperationNotSupported);
+                }
                 self.this
                     .upgrade()
-                    .unwrap()
+                    .ok_or(AxError::NotATty)?
                     .bind_to(&current().as_thread().proc_data.proc)?;
             }
             TIOCNOTTY => {
-                if current()
-                    .as_thread()
-                    .proc_data
-                    .proc
-                    .group()
-                    .session()
-                    .unset_terminal(&(self.this.upgrade().unwrap() as _))
+                let curr = current();
+                let proc = &curr.as_thread().proc_data.proc;
+                let session = proc.group().session();
+                let tty: Arc<dyn Any + Send + Sync> =
+                    self.this.upgrade().ok_or(AxError::NotATty)?;
+                if !session
+                    .terminal()
+                    .is_some_and(|current| Arc::ptr_eq(&current, &tty))
                 {
-                    // TODO: If the process was session leader, send SIGHUP and
-                    // SIGCONT to the foreground process group and all processes
-                    // in the current session lose their
-                    // controlling terminal.
-                } else {
-                    warn!("Failed to unset terminal");
+                    return Err(AxError::NotATty);
+                }
+                if session.sid() != proc.pid() {
+                    // The process model currently stores the controlling tty on
+                    // the session, so it cannot represent Linux's per-process
+                    // non-leader detach without disconnecting the whole session.
+                    return Err(AxError::OperationNotSupported);
+                }
+
+                let foreground = self.terminal.job_control.foreground();
+                if !session.unset_terminal(&tty) {
+                    return Err(AxError::NotATty);
+                }
+                self.terminal.job_control.release_session(&session);
+                if let Some(foreground) = foreground {
+                    let pgid = foreground.pgid();
+                    let _ = send_signal_to_process_group(
+                        pgid,
+                        Some(SignalInfo::new_kernel(Signo::SIGHUP)),
+                    );
+                    let _ = send_signal_to_process_group(
+                        pgid,
+                        Some(SignalInfo::new_kernel(Signo::SIGCONT)),
+                    );
                 }
             }
             TIOCGSID => {
@@ -246,7 +312,7 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 {
                     return Err(AxError::OperationNotPermitted);
                 }
-                self.ldisc.lock().drain_input();
+                return Err(AxError::Unsupported);
             }
             _ => return Err(AxError::NotATty),
         }
@@ -289,15 +355,15 @@ impl<R: TtyRead, W: TtyWrite> Pollable for Tty<R, W> {
 pub struct CurrentTty;
 impl DeviceOps for CurrentTty {
     fn read_at(&self, _buf: &mut [u8], _offset: u64) -> AxResult<usize> {
-        unreachable!()
+        Err(AxError::NotATty)
     }
 
     fn write_at(&self, _buf: &[u8], _offset: u64) -> AxResult<usize> {
-        Ok(0)
+        Err(AxError::NotATty)
     }
 
     fn ioctl(&self, _cmd: u32, _arg: usize) -> AxResult<usize> {
-        unreachable!()
+        Err(AxError::NotATty)
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -15,7 +15,7 @@ use axtask::{
     future::{block_on, poll_io},
 };
 use linux_raw_sys::{
-    general::{CAP_SYS_RESOURCE, O_ACCMODE, O_NONBLOCK, O_RDONLY, O_WRONLY, S_IFIFO},
+    general::{CAP_SYS_RESOURCE, O_ACCMODE, O_NONBLOCK, O_RDONLY, O_WRONLY},
     ioctl::FIONREAD,
 };
 use memory_addr::PAGE_SIZE_4K;
@@ -26,7 +26,7 @@ use ringbuf::{
 use starry_signal::{SignalInfo, Signo};
 use starry_vm::VmMutPtr;
 
-use super::{AsyncIoOwner, AsyncIoState, FileLike, Kstat, fs::metadata_to_kstat};
+use super::{AsyncIoOwner, AsyncIoState, FileLike, Kstat, PseudoInode, fs::location_to_kstat};
 use crate::{
     file::{IoDst, IoSrc},
     task::{
@@ -181,6 +181,7 @@ fn read_pipe_buffer(buffer: &Mutex<HeapRb<u8>>, dst: &mut IoDst) -> AxResult<Pip
 }
 
 struct Shared {
+    inode: PseudoInode,
     buffer: Mutex<HeapRb<u8>>,
     poll_rx: PollSet,
     poll_tx: PollSet,
@@ -333,6 +334,7 @@ impl Drop for Pipe {
 impl Pipe {
     pub fn new() -> (Pipe, Pipe) {
         let shared = Arc::new(Shared {
+            inode: PseudoInode::pipe(),
             buffer: Mutex::new(HeapRb::new(default_pipe_capacity())),
             poll_rx: PollSet::new(),
             poll_tx: PollSet::new(),
@@ -560,11 +562,10 @@ pub(crate) fn set_pipe_max_size(size: usize) -> AxResult<()> {
 
 fn raise_pipe() {
     let curr = current();
-    send_signal_to_process(
+    let _ = send_signal_to_process(
         curr.as_thread().proc_data.proc.pid(),
         Some(SignalInfo::new_kernel(Signo::SIGPIPE)),
-    )
-    .expect("Failed to send SIGPIPE");
+    );
 }
 
 fn notify_async_readable(async_io: &Mutex<PipeAsyncIo>) {
@@ -713,14 +714,11 @@ impl FileLike for Pipe {
     }
 
     fn stat(&self) -> AxResult<Kstat> {
-        Ok(Kstat {
-            mode: S_IFIFO | if self.is_read() { 0o444 } else { 0o222 },
-            ..Default::default()
-        })
+        Ok(self.shared.inode.stat())
     }
 
     fn path(&self) -> Cow<'_, str> {
-        format!("pipe:[{}]", self as *const _ as usize).into()
+        format!("pipe:[{}]", self.shared.inode.inode()).into()
     }
 
     fn set_nonblocking(&self, nonblocking: bool) -> AxResult {
@@ -830,7 +828,7 @@ impl FileLike for NamedPipe {
     }
 
     fn stat(&self) -> AxResult<Kstat> {
-        Ok(metadata_to_kstat(&self.location.metadata()?))
+        location_to_kstat(&self.location)
     }
 
     fn path(&self) -> Cow<'_, str> {

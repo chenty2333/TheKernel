@@ -11,20 +11,20 @@ use slab::Slab;
 
 use super::DirMaker;
 
-/// Returns a dummy filesystem statistics.
-pub fn dummy_stat_fs(fs_type: u32) -> StatFs {
+/// Returns statistics for a metadata-only pseudo filesystem.
+pub fn pseudo_stat_fs(fs_type: u32) -> StatFs {
     StatFs {
         fs_type,
-        block_size: 512,
-        blocks: 100,
-        blocks_free: 100,
-        blocks_available: 100,
+        block_size: 4096,
+        blocks: 0,
+        blocks_free: 0,
+        blocks_available: 0,
 
         file_count: 0,
         free_file_count: 0,
 
         name_length: MAX_NAME_LEN as _,
-        fragment_size: 0,
+        fragment_size: 4096,
         mount_flags: 0,
     }
 }
@@ -81,7 +81,11 @@ impl FilesystemOps for SimpleFs {
     }
 
     fn stat(&self) -> VfsResult<StatFs> {
-        Ok(dummy_stat_fs(self.fs_type))
+        Ok(pseudo_stat_fs(self.fs_type))
+    }
+
+    fn unmount(&self) {
+        self.root.lock().take();
     }
 }
 

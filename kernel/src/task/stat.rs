@@ -1,13 +1,17 @@
 use alloc::{borrow::ToOwned, format, string::String};
 
 use axerrno::{AxError, AxResult};
-use axtask::{AxTaskRef, TaskState};
+use axtask::{AxTaskRef, SchedClass, TaskState, sched_state};
+use linux_raw_sys::general::{
+    RLIMIT_RSS, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_IDLE, SCHED_NORMAL, SCHED_RR,
+};
+use memory_addr::PAGE_SIZE_4K;
 use starry_process::Process;
 use starry_signal::Signo;
 
-use crate::task::{AsThread, ProcStateHint, TaskUsage};
+use crate::task::{AsThread, ProcStateHint, TaskUsage, nanos_to_clock_ticks};
 
-fn task_state(task: &AxTaskRef) -> char {
+pub(crate) fn task_state(task: &AxTaskRef) -> char {
     let thread = task.as_thread();
     let proc_data = &thread.proc_data;
     let state = task.state();
@@ -16,10 +20,8 @@ fn task_state(task: &AxTaskRef) -> char {
         return 'T';
     }
 
-    // A task in an interruptible sleep with a pending wakeup from signal
-    // delivery should be reported as runnable. LTP polls /proc/[pid]/stat to
-    // synchronize signal-driven children and expects the state to stop being
-    // `S` once the signal has been sent.
+    // Signal interruption makes an interruptible sleeper runnable before the
+    // handler executes, so procfs must not keep reporting it as sleeping.
     if task.is_interrupted() {
         return 'R';
     }
@@ -49,11 +51,42 @@ fn process_usage(task: &AxTaskRef, num_threads: u32) -> TaskUsage {
     }
 }
 
+fn task_sched_stat(task: &AxTaskRef) -> (i32, i8, u8, u32) {
+    let sched = sched_state(task);
+    let priority = match sched.class {
+        SchedClass::Fifo | SchedClass::RoundRobin => -(sched.rt_priority as i32) - 1,
+        SchedClass::Deadline => -1,
+        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => 20 + sched.nice as i32,
+    };
+    let policy = match sched.class {
+        SchedClass::Normal => SCHED_NORMAL,
+        SchedClass::Batch => SCHED_BATCH,
+        SchedClass::Idle => SCHED_IDLE,
+        SchedClass::Fifo => SCHED_FIFO,
+        SchedClass::RoundRobin => SCHED_RR,
+        SchedClass::Deadline => SCHED_DEADLINE,
+    };
+    (priority, sched.nice, sched.rt_priority, policy)
+}
+
+fn process_memory_stat(task: &AxTaskRef) -> (usize, isize, u64) {
+    let proc_data = &task.as_thread().proc_data;
+    let aspace_handle = proc_data.aspace();
+    let aspace = aspace_handle.lock();
+    let vsize = aspace
+        .areas()
+        .filter(|area| area.flags().contains(axhal::paging::MappingFlags::USER))
+        .map(|area| area.size())
+        .sum();
+    let rss = (aspace.resident_user_bytes() / PAGE_SIZE_4K) as isize;
+    let rsslim = proc_data.rlim.read()[RLIMIT_RSS].current;
+    (vsize, rss, rsslim)
+}
+
 /// Renders `/proc/[pid]/stat`.
 ///
-/// Keep the fields that LTP actually consumes accurate, and default the rest
-/// to stable zero values so procfs state polling stays cheap even under very
-/// large fork storms.
+/// Fields without a backing kernel counter remain zero until that counter is
+/// owned by the corresponding task, scheduler, VM, or tty subsystem.
 pub fn render_task_stat(task: &AxTaskRef) -> AxResult<String> {
     let thread = task.as_thread();
     let proc_data = &thread.proc_data;
@@ -68,17 +101,22 @@ pub fn render_task_stat(task: &AxTaskRef) -> AxResult<String> {
     let num_threads = proc.threads().len() as u32;
     let self_usage = process_usage(task, num_threads);
     let child_usage = proc_data.children_usage();
+    let (priority, nice, rt_priority, policy) = task_sched_stat(task);
+    let (vsize, rss, rsslim) = process_memory_stat(task);
+    let starttime = nanos_to_clock_ticks(proc_data.start_monotonic_ns());
+    let processor = task.cpu_id();
     let exit_signal = proc.exit_signal().unwrap_or(Signo::SIGCHLD as u8);
     let exit_code = proc.exit_code();
 
     Ok(format!(
-        "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 0 0 0 0 0 0 {} {} {} {} 20 0 \
-         {num_threads} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {exit_signal} 0 0 0 0 0 0 0 0 0 0 0 \
+        "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 0 0 0 0 0 0 {utime} {stime} {cutime} \
+         {cstime} {priority} {nice} {num_threads} 0 {starttime} {vsize} {rss} {rsslim} 0 0 0 0 0 \
+         0 0 0 0 0 0 0 {exit_signal} {processor} {rt_priority} {policy} 0 0 0 0 0 0 0 0 0 0 \
          {exit_code}\n",
-        self_usage.utime_ticks(),
-        self_usage.stime_ticks(),
-        child_usage.utime_ticks(),
-        child_usage.stime_ticks(),
+        utime = self_usage.utime_ticks(),
+        stime = self_usage.stime_ticks(),
+        cutime = child_usage.utime_ticks(),
+        cstime = child_usage.stime_ticks(),
     ))
 }
 

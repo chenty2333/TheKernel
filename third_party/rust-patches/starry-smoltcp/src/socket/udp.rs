@@ -289,10 +289,34 @@ impl<'a> Socket<'a> {
         self.rx_buffer.payload_capacity()
     }
 
+    /// Replace receive storage when no datagrams are queued.
+    pub fn replace_recv_buffer(
+        &mut self,
+        buffer: PacketBuffer<'a>,
+    ) -> Result<(), PacketBuffer<'a>> {
+        if !self.rx_buffer.is_empty() {
+            return Err(buffer);
+        }
+        self.rx_buffer = buffer;
+        Ok(())
+    }
+
     /// Return the maximum number of bytes inside the transmit buffer.
     #[inline]
     pub fn payload_send_capacity(&self) -> usize {
         self.tx_buffer.payload_capacity()
+    }
+
+    /// Replace transmit storage when no datagrams are queued.
+    pub fn replace_send_buffer(
+        &mut self,
+        buffer: PacketBuffer<'a>,
+    ) -> Result<(), PacketBuffer<'a>> {
+        if !self.tx_buffer.is_empty() {
+            return Err(buffer);
+        }
+        self.tx_buffer = buffer;
+        Ok(())
     }
 
     /// Enqueue a packet to be sent to a given remote endpoint, and return a pointer

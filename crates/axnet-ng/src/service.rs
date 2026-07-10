@@ -75,7 +75,19 @@ impl Service {
         dst_addr: &IpAddress,
         bound_src: Option<IpAddress>,
     ) -> AxResult<OutboundRoute> {
+        self.resolve_outbound_with_dont_route(dst_addr, bound_src, false)
+    }
+
+    pub(crate) fn resolve_outbound_with_dont_route(
+        &self,
+        dst_addr: &IpAddress,
+        bound_src: Option<IpAddress>,
+        dont_route: bool,
+    ) -> AxResult<OutboundRoute> {
         let rule = self.route_for(dst_addr)?;
+        if dont_route && rule.via.is_some() {
+            return Err(AxError::from(LinuxError::ENETUNREACH));
+        }
         if let Some(bound_src) = bound_src {
             if bound_src != rule.src {
                 return Err(AxError::from(LinuxError::EADDRNOTAVAIL));
@@ -182,6 +194,42 @@ mod tests {
             .resolve_outbound(&IpAddress::Ipv4(Ipv4Address::new(8, 8, 8, 8)), None)
             .unwrap_err();
         assert_eq!(err, AxError::from(LinuxError::ENETUNREACH));
+    }
+
+    #[test]
+    fn dont_route_rejects_gateway_routes_but_accepts_direct_routes() {
+        let socket_set = Arc::new(SocketSetWrapper::new());
+        let listen_table = Arc::new(ListenTable::new());
+        let mut router = Router::new(listen_table);
+        let dev = router.add_device(Box::new(LoopbackDevice::new()));
+        let source = IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 15));
+        let destination = IpAddress::Ipv4(Ipv4Address::new(8, 8, 8, 8));
+        router.add_rule(Rule::new(
+            Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0).into(),
+            Some(IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 2))),
+            dev,
+            source,
+        ));
+        let service = Service::new(router, socket_set);
+
+        assert!(
+            service
+                .resolve_outbound_with_dont_route(&destination, None, false)
+                .is_ok()
+        );
+        assert_eq!(
+            service
+                .resolve_outbound_with_dont_route(&destination, None, true)
+                .unwrap_err(),
+            AxError::from(LinuxError::ENETUNREACH)
+        );
+
+        let direct = test_service();
+        assert!(
+            direct
+                .resolve_outbound_with_dont_route(&destination, None, true)
+                .is_ok()
+        );
     }
 
     #[test]

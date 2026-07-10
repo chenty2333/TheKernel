@@ -1,22 +1,19 @@
-use alloc::{borrow::Cow, boxed::Box, format, string::String, sync::Arc};
-use core::sync::atomic::{AtomicU64, Ordering};
+use alloc::{
+    format,
+    string::{String, ToString},
+    sync::Arc,
+};
 
-use axfs_ng_vfs::{DeviceId, Filesystem, NodeType, VfsError, VfsResult};
-use axhal::mem::MemRegionFlags;
+use axfs_ng_vfs::{DeviceId, Filesystem, NodeType};
 
-use crate::pseudofs::{
-    DirMapping, NodeOpsMux, SimpleDir, SimpleDirOps, SimpleFile, SimpleFs, dev::r#loop as loopdev,
+use crate::{
+    mounts,
+    pseudofs::{DirMapping, SimpleDir, SimpleFile, SimpleFs, dev::r#loop as loopdev},
 };
 
 const LOOP_MAJOR: u32 = 7;
-const VIRTIO_BLOCK_MAJOR: u32 = 8;
-const BLOCK_LOGICAL_BLOCK_SIZE: u32 = 512;
 const BLOCK_DMA_ALIGNMENT: u32 = 0;
-const NUMA_NODE_COUNT: u32 = 2;
-const FAKE_WRITE_SECTORS_PER_READ: u64 = 131_072;
-
-static FAKE_BLOCK_WRITE_SECTORS: AtomicU64 = AtomicU64::new(0);
-static FAKE_BLOCK_IO_TICKS: AtomicU64 = AtomicU64::new(1);
+const NUMA_NODE_COUNT: u32 = 1;
 
 pub fn new_sysfs() -> Filesystem {
     SimpleFs::new_with("sysfs".into(), 0x6265_6572, builder)
@@ -25,7 +22,9 @@ pub fn new_sysfs() -> Filesystem {
 fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     let mut root = DirMapping::new();
 
-    root.add("class", graphics_class_dir(fs.clone()));
+    if axdisplay::has_display() {
+        root.add("class", graphics_class_dir(fs.clone()));
+    }
     root.add("block", block_dir(fs.clone()));
     root.add("dev", dev_dir(fs.clone()));
     root.add("devices", devices_dir(fs.clone()));
@@ -36,14 +35,7 @@ fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
 fn graphics_class_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     let mut class = DirMapping::new();
     let mut graphics = DirMapping::new();
-    let mut fb0 = DirMapping::new();
-    let mut device = DirMapping::new();
-
-    device.add(
-        "subsystem",
-        SimpleFile::new(fs.clone(), NodeType::Symlink, || Ok("whatever")),
-    );
-    fb0.add("device", SimpleDir::new_maker(fs.clone(), Arc::new(device)));
+    let fb0 = DirMapping::new();
     graphics.add("fb0", SimpleDir::new_maker(fs.clone(), Arc::new(fb0)));
     class.add(
         "graphics",
@@ -64,14 +56,24 @@ fn block_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
         );
     }
 
-    for (index, name) in axfs::block_device_names().into_iter().enumerate() {
+    if let Some(info) = axfs::root_block_device_info() {
+        let name = axfs::ROOT_BLOCK_DEVICE_NAME.to_string();
         block.add(
             name.clone(),
-            block_device_dir(
-                fs.clone(),
-                name,
-                DeviceId::new(VIRTIO_BLOCK_MAJOR, 16 + index as u32),
-            ),
+            block_device_dir(fs.clone(), name, mounts::ROOT_BLOCK_DEVICE_ID, info),
+        );
+    }
+
+    for (index, name) in axfs::block_device_names().into_iter().enumerate() {
+        let Some(info) = axfs::block_device_info(&name) else {
+            continue;
+        };
+        let Some(dev_id) = mounts::extra_block_device_id(index) else {
+            continue;
+        };
+        block.add(
+            name.clone(),
+            block_device_dir(fs.clone(), name, dev_id, info),
         );
     }
 
@@ -87,20 +89,36 @@ fn dev_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
         let dev_id = DeviceId::new(LOOP_MAJOR, i);
         block.add(
             format!("{}:{}", dev_id.major(), dev_id.minor()),
-            uevent_file(fs.clone(), name, dev_id),
+            block_device_link(fs.clone(), name),
+        );
+    }
+
+    if axfs::root_block_device_info().is_some() {
+        let dev_id = mounts::ROOT_BLOCK_DEVICE_ID;
+        block.add(
+            format!("{}:{}", dev_id.major(), dev_id.minor()),
+            block_device_link(fs.clone(), axfs::ROOT_BLOCK_DEVICE_NAME.to_string()),
         );
     }
 
     for (index, name) in axfs::block_device_names().into_iter().enumerate() {
-        let dev_id = DeviceId::new(VIRTIO_BLOCK_MAJOR, 16 + index as u32);
+        let Some(dev_id) = mounts::extra_block_device_id(index) else {
+            continue;
+        };
         block.add(
             format!("{}:{}", dev_id.major(), dev_id.minor()),
-            uevent_file(fs.clone(), name, dev_id),
+            block_device_link(fs.clone(), name),
         );
     }
 
     dev.add("block", SimpleDir::new_maker(fs.clone(), Arc::new(block)));
     SimpleDir::new_maker(fs, Arc::new(dev))
+}
+
+fn block_device_link(fs: Arc<SimpleFs>, dev_name: String) -> Arc<SimpleFile> {
+    SimpleFile::new(fs, NodeType::Symlink, move || {
+        Ok(format!("../../block/{dev_name}"))
+    })
 }
 
 fn devices_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
@@ -113,7 +131,11 @@ fn devices_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
 
 fn node_root_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     let mut node_root = DirMapping::new();
-    let possible = format!("0-{}\n", NUMA_NODE_COUNT - 1);
+    let possible = if NUMA_NODE_COUNT == 1 {
+        "0\n".into()
+    } else {
+        format!("0-{}\n", NUMA_NODE_COUNT - 1)
+    };
 
     node_root.add(
         "possible",
@@ -154,7 +176,11 @@ fn node_root_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
 fn node_dir(fs: Arc<SimpleFs>, node: u32) -> crate::pseudofs::DirMaker {
     let mut dir = DirMapping::new();
     let cpu_count = axhal::cpu_num().max(1);
-    let cpu_list = format!("0-{}\n", cpu_count - 1);
+    let cpu_list = if cpu_count == 1 {
+        "0\n".into()
+    } else {
+        format!("0-{}\n", cpu_count - 1)
+    };
     let cpumap = if cpu_count >= usize::BITS as usize {
         usize::MAX
     } else {
@@ -173,39 +199,20 @@ fn node_dir(fs: Arc<SimpleFs>, node: u32) -> crate::pseudofs::DirMaker {
         "meminfo",
         SimpleFile::new_regular(fs.clone(), move || Ok(node_meminfo(node))),
     );
-    dir.add("hugepages", hugepages_dir(fs.clone()));
-    SimpleDir::new_maker(fs, Arc::new(dir))
-}
-
-fn hugepages_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
-    let mut hugepages = DirMapping::new();
-    hugepages.add("hugepages-2048kB", hugepages_size_dir(fs.clone()));
-    SimpleDir::new_maker(fs, Arc::new(hugepages))
-}
-
-fn hugepages_size_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
-    let mut dir = DirMapping::new();
-    dir.add(
-        "nr_hugepages",
-        SimpleFile::new_regular(fs.clone(), || Ok("0\n")),
-    );
     SimpleDir::new_maker(fs, Arc::new(dir))
 }
 
 fn node_meminfo(node: u32) -> String {
-    let kb = axhal::mem::memory_regions()
-        .filter(|region| region.flags.contains(MemRegionFlags::FREE))
-        .map(|region| region.size / 1024)
-        .sum::<usize>()
-        .max(131_072);
-    let per_node_kb = kb / NUMA_NODE_COUNT as usize;
-    let used_kb = per_node_kb / 4;
-    let free_kb = per_node_kb.saturating_sub(used_kb);
+    let stats = crate::mm::system_memory_stats();
+    let total_kb = stats.total_bytes / 1024;
+    let free_kb = stats.free_bytes / 1024;
+    let used_kb = stats.used_bytes / 1024;
+    let cached_kb = stats.cached_bytes / 1024;
 
     format!(
-        "Node {node} MemTotal:       {per_node_kb} kB\nNode {node} MemFree:        {free_kb} \
-         kB\nNode {node} MemUsed:        {used_kb} kB\nNode {node} Active:         0 kB\nNode \
-         {node} Inactive:       0 kB\nNode {node} FilePages:      {free_kb} kB\n"
+        "Node {node} MemTotal:       {total_kb} kB\nNode {node} MemFree:        {free_kb} \
+         kB\nNode {node} MemUsed:        {used_kb} kB\nNode {node} FilePages:      {cached_kb} \
+         kB\n"
     )
 }
 
@@ -213,57 +220,27 @@ fn block_device_dir(
     fs: Arc<SimpleFs>,
     dev_name: String,
     dev_id: DeviceId,
+    info: axfs::BlockDeviceInfo,
 ) -> crate::pseudofs::DirMaker {
     let mut dir = DirMapping::new();
     let mut queue = DirMapping::new();
     queue.add(
         "logical_block_size",
-        SimpleFile::new_regular(fs.clone(), || Ok(format!("{BLOCK_LOGICAL_BLOCK_SIZE}\n"))),
+        SimpleFile::new_regular(fs.clone(), move || Ok(format!("{}\n", info.block_size))),
+    );
+    dir.add(
+        "size",
+        SimpleFile::new_regular(fs.clone(), move || {
+            Ok(format!("{}\n", info.byte_len() / 512))
+        }),
     );
     queue.add(
         "dma_alignment",
         SimpleFile::new_regular(fs.clone(), || Ok(format!("{BLOCK_DMA_ALIGNMENT}\n"))),
     );
-    dir.add("stat", block_stat_file(fs.clone()));
     dir.add("queue", SimpleDir::new_maker(fs.clone(), Arc::new(queue)));
     dir.add("uevent", uevent_file(fs.clone(), dev_name, dev_id));
     SimpleDir::new_maker(fs, Arc::new(dir))
-}
-
-struct LoopPartitionDirs {
-    fs: Arc<SimpleFs>,
-    number: u32,
-}
-
-impl SimpleDirOps for LoopPartitionDirs {
-    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
-        let number = self.number;
-        Box::new(
-            (1..=loopdev::partition_count(number))
-                .map(move |partition| Cow::Owned(format!("loop{number}p{partition}"))),
-        )
-    }
-
-    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
-        let prefix = format!("loop{}p", self.number);
-        let partition = name
-            .strip_prefix(&prefix)
-            .and_then(|part| part.parse().ok())
-            .ok_or(VfsError::NotFound)?;
-        if !loopdev::partition_visible(self.number, partition) {
-            return Err(VfsError::NotFound);
-        }
-
-        Ok(NodeOpsMux::Dir(loop_partition_dir(
-            self.fs.clone(),
-            self.number,
-            partition,
-        )))
-    }
-
-    fn is_cacheable(&self) -> bool {
-        false
-    }
 }
 
 fn loop_block_device_dir(
@@ -278,7 +255,9 @@ fn loop_block_device_dir(
 
     queue.add(
         "logical_block_size",
-        SimpleFile::new_regular(fs.clone(), || Ok(format!("{BLOCK_LOGICAL_BLOCK_SIZE}\n"))),
+        SimpleFile::new_regular(fs.clone(), move || {
+            Ok(format!("{}\n", loopdev::snapshot(number).block_size))
+        }),
     );
     queue.add(
         "dma_alignment",
@@ -287,15 +266,11 @@ fn loop_block_device_dir(
 
     loop_dir.add(
         "partscan",
-        SimpleFile::new_regular(fs.clone(), move || {
-            Ok(format!("{}\n", loopdev::snapshot(number).partscan as u32))
-        }),
+        SimpleFile::new_regular(fs.clone(), || Ok("0\n")),
     );
     loop_dir.add(
         "autoclear",
-        SimpleFile::new_regular(fs.clone(), move || {
-            Ok(format!("{}\n", loopdev::snapshot(number).autoclear as u32))
-        }),
+        SimpleFile::new_regular(fs.clone(), || Ok("0\n")),
     );
     loop_dir.add(
         "backing_file",
@@ -321,7 +296,6 @@ fn loop_block_device_dir(
         }),
     );
 
-    dir.add("stat", block_stat_file(fs.clone()));
     dir.add(
         "size",
         SimpleFile::new_regular(fs.clone(), move || {
@@ -337,38 +311,7 @@ fn loop_block_device_dir(
     dir.add("queue", SimpleDir::new_maker(fs.clone(), Arc::new(queue)));
     dir.add("loop", SimpleDir::new_maker(fs.clone(), Arc::new(loop_dir)));
     dir.add("uevent", uevent_file(fs.clone(), dev_name, dev_id));
-    let dir = dir.chain(LoopPartitionDirs {
-        fs: fs.clone(),
-        number,
-    });
     SimpleDir::new_maker(fs, Arc::new(dir))
-}
-
-fn loop_partition_dir(fs: Arc<SimpleFs>, number: u32, partition: u32) -> crate::pseudofs::DirMaker {
-    let mut dir = DirMapping::new();
-    dir.add(
-        "size",
-        SimpleFile::new_regular(fs.clone(), move || {
-            let snapshot = loopdev::snapshot(number);
-            let sectors = if loopdev::partition_visible(number, partition) {
-                snapshot.size_sectors
-            } else {
-                0
-            };
-            Ok(format!("{sectors}\n"))
-        }),
-    );
-    SimpleDir::new_maker(fs, Arc::new(dir))
-}
-
-fn block_stat_file(fs: Arc<SimpleFs>) -> Arc<SimpleFile> {
-    SimpleFile::new_regular(fs, || {
-        let sectors = FAKE_BLOCK_WRITE_SECTORS
-            .fetch_add(FAKE_WRITE_SECTORS_PER_READ, Ordering::Relaxed)
-            + FAKE_WRITE_SECTORS_PER_READ;
-        let ticks = FAKE_BLOCK_IO_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-        Ok(format!("0 0 0 0 0 0 {sectors} 1 0 {ticks} {ticks}\n"))
-    })
 }
 
 fn uevent_file(fs: Arc<SimpleFs>, dev_name: String, dev_id: DeviceId) -> Arc<SimpleFile> {

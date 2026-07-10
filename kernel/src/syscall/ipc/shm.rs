@@ -18,7 +18,7 @@ use starry_process::Pid;
 use super::{
     IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcPerm, SHM_DEST,
     SHM_INFO, SHM_LOCK, SHM_LOCKED, SHM_STAT, SHM_STAT_ANY, SHM_UNLOCK, SHMMIN, next_ipc_id,
-    shmall_limit, shmmax_limit, shmmni_limit, shmseg_limit,
+    shmall_limit, shmmax_limit, shmmni_limit,
 };
 use crate::{
     mm::{Backend, SharedPages, UserPtr, nullable},
@@ -356,6 +356,9 @@ pub struct ShmManager {
     key_shmid: BiBTreeMap<i32, i32>,
     /// shm_id -> shm_inner
     shmid_inner: BTreeMap<i32, Arc<Mutex<ShmInner>>>,
+    /// Total pages reserved by live segments, including segments awaiting
+    /// their final detach after IPC_RMID.
+    total_pages: usize,
     /// pid -> attach address -> shm_id
     pid_vaddr_shmid: BTreeMap<Pid, BTreeMap<VirtAddr, i32>>,
 }
@@ -365,6 +368,7 @@ impl ShmManager {
         ShmManager {
             key_shmid: BiBTreeMap::new(),
             shmid_inner: BTreeMap::new(),
+            total_pages: 0,
             pid_vaddr_shmid: BTreeMap::new(),
         }
     }
@@ -382,6 +386,10 @@ impl ShmManager {
 
     pub fn active_segment_count(&self) -> usize {
         self.shmid_inner.len()
+    }
+
+    pub fn total_page_count(&self) -> usize {
+        self.total_pages
     }
 
     pub fn contains_shmid(&self, shmid: i32) -> bool {
@@ -427,8 +435,18 @@ impl ShmManager {
 
     /// Inserts a mapping from a shared memory ID to its inner
     /// structure [`ShmInner`].
-    pub fn insert_shmid_inner(&mut self, shmid: i32, shm_inner: Arc<Mutex<ShmInner>>) {
-        self.shmid_inner.insert(shmid, shm_inner);
+    pub fn insert_shmid_inner(
+        &mut self,
+        shmid: i32,
+        page_num: usize,
+        shm_inner: Arc<Mutex<ShmInner>>,
+    ) {
+        let old = self.shmid_inner.insert(shmid, shm_inner);
+        assert!(old.is_none(), "duplicate shared memory ID {shmid}");
+        self.total_pages = self
+            .total_pages
+            .checked_add(page_num)
+            .expect("shared memory page accounting overflow");
     }
 
     /// Inserts a mapping from a process and shared memory ID to a virtual
@@ -459,9 +477,14 @@ impl ShmManager {
     }
 
     /// Removes the shared memory segment.
-    pub fn remove_shmid(&mut self, shmid: i32) {
+    pub fn remove_shmid(&mut self, shmid: i32, page_num: usize) {
         self.key_shmid.remove_by_value(&shmid);
-        self.shmid_inner.remove(&shmid);
+        if self.shmid_inner.remove(&shmid).is_some() {
+            self.total_pages = self
+                .total_pages
+                .checked_sub(page_num)
+                .expect("shared memory page accounting underflow");
+        }
         // Per-process attach maps are cleaned on shmdt/exit. IPC_RMID only
         // removes the segment once the last attach has gone away.
     }
@@ -474,7 +497,7 @@ impl ShmManager {
                     let mut shm_inner = shm_inner.lock();
                     shm_inner.detach_process(pid, vaddr);
                     if shm_inner.rmid && shm_inner.attach_count() == 0 {
-                        self.remove_shmid(shmid);
+                        self.remove_shmid(shmid, shm_inner.page_num);
                     }
                 }
             }
@@ -629,6 +652,13 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
     if shm_manager.active_segment_count() >= shmmni_limit() {
         return Err(AxError::from(LinuxError::ENOSPC));
     }
+    if shm_manager
+        .total_page_count()
+        .checked_add(page_num)
+        .is_none_or(|total| total > shmall_limit())
+    {
+        return Err(AxError::from(LinuxError::ENOSPC));
+    }
 
     // Create a new shm_inner
     let shmid = allocate_shm_id(&shm_manager);
@@ -643,7 +673,7 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
         egid,
     )));
     shm_manager.insert_key_shmid(key, shmid);
-    shm_manager.insert_shmid_inner(shmid, shm_inner);
+    shm_manager.insert_shmid_inner(shmid, page_num, shm_inner);
 
     Ok(shmid as isize)
 }
@@ -763,7 +793,9 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
                 shmmax: shmmax_limit() as c_ulong,
                 shmmin: SHMMIN as c_ulong,
                 shmmni: shmmni_limit() as c_ulong,
-                shmseg: shmseg_limit() as c_ulong,
+                // Linux keeps this compatibility field equal to SHMMNI; it
+                // does not enforce a separate per-process SHMSEG limit.
+                shmseg: shmmni_limit() as c_ulong,
                 shmall: shmall_limit() as c_ulong,
                 reserved1: 0,
                 reserved2: 0,
@@ -845,7 +877,7 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
         }
         shm_inner.set_removed(true);
         if shm_inner.attach_count() == 0 {
-            SHM_MANAGER.lock().remove_shmid(shmid);
+            SHM_MANAGER.lock().remove_shmid(shmid, shm_inner.page_num);
         }
     } else if cmd == SHM_LOCK {
         if !admin_ipc_permission(&shm_inner.shmid_ds.shm_perm, current_uid) {
@@ -911,7 +943,7 @@ pub fn sys_shmdt(shmaddr: usize) -> AxResult<isize> {
     shm_inner.detach_process(pid, shmaddr);
 
     if shm_inner.rmid && shm_inner.attach_count() == 0 {
-        shm_manager.remove_shmid(shmid);
+        shm_manager.remove_shmid(shmid, shm_inner.page_num);
     }
 
     Ok(0)

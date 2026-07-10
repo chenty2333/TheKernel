@@ -55,6 +55,19 @@ class ReplayImageTests(unittest.TestCase):
 
         self.assertIn("file=sdcard-rv.img,if=none,format=raw,id=x0,snapshot=on", command)
         self.assertIn("file=disk.img,if=none,format=raw,id=x1,readonly=on", command)
+        self.assertIn("rng-random,filename=/dev/urandom,id=rng0", command)
+        self.assertIn("virtio-rng-device,rng=rng0,bus=virtio-mmio-bus.7", command)
+
+    def test_build_qemu_command_adds_loongarch_entropy_source(self) -> None:
+        command = build_qemu_command(
+            arch="la",
+            kernel=Path("kernel-la"),
+            image=Path("sdcard-la.img"),
+            support_image=None,
+        )
+
+        self.assertIn("rng-random,filename=/dev/urandom,id=rng0", command)
+        self.assertIn("virtio-rng-pci,rng=rng0", command)
 
     def test_build_qemu_command_can_enable_qemu_debug_log(self) -> None:
         command = build_qemu_command(

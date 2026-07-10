@@ -56,15 +56,11 @@ impl FrameTableRefCount {
         self.table.get(&paddr).cloned()
     }
 
-    fn init_frame(&mut self, paddr: PhysAddr) {
-        assert!(
-            !self.table.contains_key(&paddr),
-            "initializing already referenced frame"
-        );
-        self.table.insert(
-            paddr,
-            Arc::new(SpinNoIrq::new(FrameRefCnt(Self::INITIAL_CNT))),
-        );
+    fn get_or_init_frame(&mut self, paddr: PhysAddr) -> Arc<SpinNoIrq<FrameRefCnt>> {
+        self.table
+            .entry(paddr)
+            .or_insert_with(|| Arc::new(SpinNoIrq::new(FrameRefCnt(Self::INITIAL_CNT))))
+            .clone()
     }
 
     fn remove_frame(&mut self, paddr: PhysAddr) {
@@ -118,15 +114,7 @@ impl CowBackend {
     }
 
     fn get_or_track_frame_ref(&self, paddr: PhysAddr) -> Arc<SpinNoIrq<FrameRefCnt>> {
-        let mut frame_table = FRAME_TABLE.lock();
-        if let Some(frame_ref) = frame_table.get_frame_ref(paddr) {
-            return frame_ref;
-        }
-
-        frame_table.init_frame(paddr);
-        frame_table
-            .get_frame_ref(paddr)
-            .expect("tracked frame must exist after initialization")
+        FRAME_TABLE.lock().get_or_init_frame(paddr)
     }
 
     fn alloc_new_at(
@@ -139,29 +127,52 @@ impl CowBackend {
         // pre-zero is wasted work (and the zero path is the dominant fault
         // cost). Only anonymous pages need the frame pre-zeroed; for file
         // pages we zero just the gap before and the tail after the file data.
-        let is_file = self.file.is_some();
-        let frame = self.alloc_new_frame(!is_file)?;
-
-        if let Some((file, file_start, file_end, _)) = &self.file {
-            let buf = unsafe {
-                slice::from_raw_parts_mut(phys_to_virt(frame).as_mut_ptr(), self.size as _)
-            };
+        let file_window = if let Some((file, file_start, file_end, sigbus_on_eof)) = &self.file {
+            let page_size = self.size as usize;
             // vaddr can be smaller than self.start (at most 1 page) due to
             // non-aligned mappings, we need to keep the gap clean.
             let start = self.start.as_usize().saturating_sub(vaddr.as_usize());
-            assert!(start < self.size as _);
-
-            let file_start =
-                *file_start + vaddr.as_usize().saturating_sub(self.start.as_usize()) as u64;
+            if start >= page_size {
+                return Err(AxError::InvalidInput);
+            }
+            let file_start = file_start
+                .checked_add(vaddr.as_usize().saturating_sub(self.start.as_usize()) as u64)
+                .ok_or(AxError::InvalidInput)?;
+            let file_end = if *sigbus_on_eof {
+                Some(file.location().len()?)
+            } else {
+                *file_end
+            };
             let max_read = file_end
                 .map_or(u64::MAX, |end| end.saturating_sub(file_start))
-                .min((buf.len() - start) as u64) as usize;
+                .min((page_size - start) as u64) as usize;
+            Some((file, file_start, start, max_read))
+        } else {
+            None
+        };
+
+        let frame = self.alloc_new_frame(file_window.is_none())?;
+
+        if let Some((file, file_start, start, max_read)) = file_window {
+            let buf = unsafe {
+                slice::from_raw_parts_mut(phys_to_virt(frame).as_mut_ptr(), self.size as _)
+            };
 
             if start > 0 {
                 unsafe { core::ptr::write_bytes(buf.as_mut_ptr(), 0, start) };
             }
-            file.read_at(&mut &mut buf[start..start + max_read], file_start)?;
-            let tail_start = start + max_read;
+            let read = match file.read_at(&mut &mut buf[start..start + max_read], file_start) {
+                Ok(read) if read <= max_read => read,
+                Ok(_) => {
+                    dealloc_frame(frame, self.size);
+                    return Err(AxError::Io);
+                }
+                Err(err) => {
+                    dealloc_frame(frame, self.size);
+                    return Err(err.into());
+                }
+            };
+            let tail_start = start + read;
             if tail_start < buf.len() {
                 unsafe {
                     core::ptr::write_bytes(
@@ -172,7 +183,10 @@ impl CowBackend {
                 };
             }
         }
-        pt.map(vaddr, frame, self.size, page_table_flags(flags))?;
+        if let Err(err) = pt.map(vaddr, frame, self.size, page_table_flags(flags)) {
+            dealloc_frame(frame, self.size);
+            return Err(err.into());
+        }
         self.mark_materialized();
         Ok(())
     }
@@ -209,7 +223,10 @@ impl CowBackend {
                         self.size as _,
                     );
                 }
-                pt.remap(vaddr, new_frame, page_table_flags(flags))?;
+                if let Err(err) = pt.remap(vaddr, new_frame, page_table_flags(flags)) {
+                    dealloc_frame(new_frame, self.size);
+                    return Err(err.into());
+                }
                 frame.drop_frame(paddr, self.size);
             }
         }
@@ -234,7 +251,7 @@ impl CowBackend {
     }
 
     pub(crate) fn faults_with_sigbus(&self, vaddr: VirtAddr) -> bool {
-        let Some((_, file_start, Some(file_end), true)) = &self.file else {
+        let Some((file, file_start, Some(file_end), true)) = &self.file else {
             return false;
         };
         let page_start = vaddr.align_down(self.size);
@@ -244,7 +261,8 @@ impl CowBackend {
         // offset rather than underflowing here.
         let page_delta = page_start.as_usize().saturating_sub(self.start.as_usize()) as u64;
         let page_file_start = file_start.saturating_add(page_delta);
-        page_file_start >= *file_end
+        let current_end = file.location().len().unwrap_or(*file_end);
+        page_file_start >= current_end
     }
 
     pub(crate) fn cached_page_resident(&self, vaddr: VirtAddr) -> bool {
@@ -333,14 +351,20 @@ impl CowBackend {
         size: usize,
         pt: &mut PageTableCursor,
     ) -> AxResult {
-        pages_in(VirtAddrRange::from_start_size(old_start, size), self.size)?;
-        pages_in(VirtAddrRange::from_start_size(new_start, size), self.size)?;
+        let old_range =
+            VirtAddrRange::try_from_start_size(old_start, size).ok_or(AxError::InvalidInput)?;
+        let new_range =
+            VirtAddrRange::try_from_start_size(new_start, size).ok_or(AxError::InvalidInput)?;
+        pages_in(old_range, self.size)?;
+        pages_in(new_range, self.size)?;
         let materialized = pt.collect_present_leaves(old_start, size)?;
         if !materialized.is_empty() {
             self.mark_materialized();
         }
         for (old_addr, paddr, flags, page_size) in materialized {
-            assert_eq!(page_size, self.size);
+            if page_size != self.size {
+                return Err(AxError::BadAddress);
+            }
             let new_addr = new_start + old_addr.sub_addr(old_start);
             let frame = self.get_or_track_frame_ref(paddr);
             let mut frame = frame.lock();
@@ -410,7 +434,9 @@ impl BackendOps for CowBackend {
         for addr in pages_in(range, self.size)? {
             match pt.query(addr) {
                 Ok((paddr, page_flags, page_size)) => {
-                    assert_eq!(self.size, page_size);
+                    if self.size != page_size {
+                        return Err(AxError::BadAddress);
+                    }
                     if access_flags.contains(MappingFlags::WRITE)
                         && !page_flags.contains(MappingFlags::WRITE)
                     {
@@ -456,7 +482,9 @@ impl BackendOps for CowBackend {
             self.mark_materialized();
         }
         for (vaddr, paddr, page_flags, page_size) in materialized {
-            assert_eq!(page_size, self.size);
+            if page_size != self.size {
+                return Err(AxError::BadAddress);
+            }
             // If the page is mapped in the old page table:
             // - Update its permissions in the old page table using `flags`.
             // - Map the same physical page into the new page table at the same

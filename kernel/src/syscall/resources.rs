@@ -1,16 +1,18 @@
 use axerrno::{AxError, AxResult, LinuxError};
 use axtask::current;
 use linux_raw_sys::general::{
-    CAP_SYS_RESOURCE, RLIM_NLIMITS, RLIM_INFINITY, RLIMIT_CPU, RLIMIT_NOFILE, rlimit, rlimit64,
+    CAP_SYS_RESOURCE, RLIM_INFINITY, RLIM_NLIMITS, RLIMIT_CPU, RLIMIT_NOFILE, rlimit, rlimit64,
     rusage,
 };
 use starry_process::Pid;
 use starry_vm::{VmMutPtr, VmPtr};
 
-use crate::task::{AsThread, ProcessData, TaskUsage, get_process_data, nr_open_limit};
+use crate::task::{
+    AsThread, ProcessData, TaskUsage, check_current_prlimit_access, get_process_data, nr_open_limit,
+};
 
 fn can_raise_hard_limit(proc_data: &ProcessData) -> bool {
-    proc_data.has_effective_capability(CAP_SYS_RESOURCE) || proc_data.euid() == 0
+    proc_data.has_effective_capability(CAP_SYS_RESOURCE)
 }
 
 fn set_resource_limit(proc_data: &ProcessData, resource: u32, new_limit: rlimit64) -> AxResult<()> {
@@ -50,6 +52,7 @@ pub fn sys_prlimit64(
     }
 
     let proc_data = get_process_data(pid)?;
+    check_current_prlimit_access(&proc_data)?;
     if let Some(old_limit) = old_limit.nullable() {
         let limit = &proc_data.rlim.read()[resource];
         old_limit.vm_write(rlimit64 {

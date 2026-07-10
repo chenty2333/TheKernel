@@ -1,6 +1,13 @@
-use alloc::{borrow::ToOwned, string::String, sync::Arc, vec};
+use alloc::{
+    borrow::ToOwned,
+    collections::BTreeSet,
+    string::String,
+    sync::{Arc, Weak},
+    vec,
+    vec::Vec,
+};
 use core::{
-    iter, mem,
+    iter,
     sync::atomic::{AtomicU64, Ordering},
     task::Context,
 };
@@ -20,23 +27,52 @@ pub struct Mountpoint {
     /// Root dir entry in the mountpoint.
     root: DirEntry,
     /// Location in the parent mountpoint.
-    location: Mutex<Option<Location>>,
+    location: Mutex<Option<MountLocation>>,
     /// Children of the mountpoint.
     children: Mutex<HashMap<ReferenceKey, Arc<Self>>>,
-    /// Device ID
+    /// Filesystem instance owned by this mount.
+    filesystem: Filesystem,
+    /// Stable identity of the mounted filesystem.
     device: u64,
+    /// Unique identity of this mount instance.
+    mount_id: u64,
+    /// Whether this is the root mount of its namespace.
+    namespace_root: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MountLocation {
+    mountpoint: Weak<Mountpoint>,
+    entry: DirEntry,
+}
+
+impl MountLocation {
+    fn new(location: Location) -> Self {
+        Self {
+            mountpoint: Arc::downgrade(&location.mountpoint),
+            entry: location.entry,
+        }
+    }
+
+    fn upgrade(&self) -> Option<Location> {
+        Some(Location::new(self.mountpoint.upgrade()?, self.entry.clone()))
+    }
 }
 
 impl Mountpoint {
     pub fn new(fs: &Filesystem, location_in_parent: Option<Location>) -> Arc<Self> {
-        static DEVICE_COUNTER: AtomicU64 = AtomicU64::new(1);
+        static MOUNT_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
         let root = fs.root_dir();
+        let namespace_root = location_in_parent.is_none();
         Arc::new(Self {
             root,
-            location: Mutex::new(location_in_parent),
+            location: Mutex::new(location_in_parent.map(MountLocation::new)),
             children: Mutex::default(),
-            device: DEVICE_COUNTER.fetch_add(1, Ordering::Relaxed),
+            filesystem: fs.clone(),
+            device: fs.device(),
+            mount_id: MOUNT_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            namespace_root,
         })
     }
 
@@ -50,11 +86,11 @@ impl Mountpoint {
 
     /// Returns the location in the parent mountpoint.
     pub fn location(&self) -> Option<Location> {
-        self.location.lock().clone()
+        self.location.lock().as_ref()?.upgrade()
     }
 
     pub fn is_root(&self) -> bool {
-        self.location.lock().is_none()
+        self.namespace_root
     }
 
     /// Returns the effective mountpoint.
@@ -81,6 +117,100 @@ impl Mountpoint {
 
     pub fn device(self: &Arc<Self>) -> u64 {
         self.device
+    }
+
+    pub fn mount_id(self: &Arc<Self>) -> u64 {
+        self.mount_id
+    }
+
+    pub fn filesystem_lifetime(self: &Arc<Self>) -> Weak<()> {
+        self.filesystem.lifetime_handle()
+    }
+
+    /// Returns every stable filesystem identity in this mount subtree.
+    pub fn subtree_devices(self: &Arc<Self>) -> BTreeSet<u64> {
+        let mut devices = BTreeSet::new();
+        self.collect_subtree_devices(&mut devices);
+        devices
+    }
+
+    fn collect_subtree_devices(self: &Arc<Self>, devices: &mut BTreeSet<u64>) {
+        devices.insert(self.device);
+        let children = self.children.lock().values().cloned().collect::<Vec<_>>();
+        for child in children {
+            child.collect_subtree_devices(devices);
+        }
+    }
+
+    fn parent_mountpoint(&self) -> Option<Arc<Mountpoint>> {
+        self.location.lock().as_ref()?.mountpoint.upgrade()
+    }
+
+    fn detach_from_parent(self: &Arc<Self>, require_unused: bool) -> VfsResult<()> {
+        if self.namespace_root {
+            return Err(VfsError::ResourceBusy);
+        }
+
+        let mut location = self.location.lock();
+        let parent_location = location.as_ref().ok_or(VfsError::InvalidInput)?;
+        let parent = parent_location
+            .mountpoint
+            .upgrade()
+            .ok_or(VfsError::InvalidInput)?;
+        let key = parent_location.entry.key();
+        let mut children = parent.children.lock();
+        if !children
+            .get(&key)
+            .is_some_and(|mounted| Arc::ptr_eq(mounted, self))
+        {
+            return Err(VfsError::InvalidInput);
+        }
+
+        // The attached-tree reference and the caller's Location are the only
+        // expected owners of an unused mount.
+        if require_unused && Arc::strong_count(self) != 2 {
+            return Err(VfsError::ResourceBusy);
+        }
+
+        children.remove(&key);
+        *location = None;
+        Ok(())
+    }
+
+    /// Flushes every distinct filesystem reachable from this mount tree.
+    ///
+    /// Bind mounts share a stable device identity with their source and are
+    /// flushed once. Mount-tree locks are released before filesystem code runs.
+    pub fn flush_all_filesystems(self: &Arc<Self>) -> VfsResult<()> {
+        self.flush_all_filesystems_inner(&mut BTreeSet::new())
+    }
+
+    fn flush_all_filesystems_inner(self: &Arc<Self>, flushed: &mut BTreeSet<u64>) -> VfsResult<()> {
+        let children = self.children.lock().values().cloned().collect::<Vec<_>>();
+        let mut first_error = None;
+
+        if flushed.insert(self.device)
+            && let Err(err) = self.filesystem.flush()
+        {
+            first_error = Some(err);
+        }
+        for child in children {
+            if let Err(err) = child.flush_all_filesystems_inner(flushed)
+                && first_error.is_none()
+            {
+                first_error = Some(err);
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for Mountpoint {
+    fn drop(&mut self) {
+        if let Ok(root) = self.root.as_dir() {
+            root.forget();
+        }
     }
 }
 
@@ -164,6 +294,20 @@ impl Location {
         Ok(metadata)
     }
 
+    /// Applies only fields the backing filesystem can persist.
+    ///
+    /// This is intended for inode initialization and kernel-maintained
+    /// timestamps. Explicit metadata-changing syscalls should use the strict
+    /// `update_metadata` operation so unsupported requests remain visible.
+    pub fn update_supported_metadata(&self, mut update: MetadataUpdate) -> VfsResult<()> {
+        update.retain_supported(self.filesystem().metadata_update_capabilities());
+        if update.is_empty() {
+            Ok(())
+        } else {
+            self.entry.update_metadata(update)
+        }
+    }
+
     pub fn absolute_path(&self) -> VfsResult<PathBuf> {
         let mut components = vec![];
         let mut cur = self.clone();
@@ -177,6 +321,19 @@ impl Location {
                 Some(loc) => loc,
                 None => break,
             }
+        }
+        Ok(iter::once("/")
+            .chain(components.iter().map(String::as_str).rev())
+            .collect())
+    }
+
+    /// Returns this entry's path relative to the root of its filesystem mount.
+    pub fn path_in_mount(&self) -> VfsResult<PathBuf> {
+        let mut components = vec![];
+        let mut entry = self.entry.clone();
+        while !entry.ptr_eq(&self.mountpoint.root) {
+            components.push(entry.name().to_owned());
+            entry = entry.parent().ok_or(VfsError::InvalidInput)?;
         }
         Ok(iter::once("/")
             .chain(components.iter().map(String::as_str).rev())
@@ -292,20 +449,40 @@ impl Location {
         if !self.is_root_of_mount() {
             return Err(VfsError::InvalidInput);
         }
+        if self.mountpoint.namespace_root {
+            return Err(VfsError::ResourceBusy);
+        }
         target.check_is_dir()?;
         if !self.is_dir() {
             return Err(VfsError::NotADirectory);
         }
 
-        if let Some(parent_loc) = self.mountpoint.location() {
-            parent_loc
-                .mountpoint
-                .children
-                .lock()
-                .remove(&parent_loc.entry.key());
+        let mut current = Some(target.mountpoint.clone());
+        while let Some(mountpoint) = current {
+            if Arc::ptr_eq(&mountpoint, &self.mountpoint) {
+                return Err(VfsError::InvalidInput);
+            }
+            current = mountpoint.parent_mountpoint();
         }
 
-        *self.mountpoint.location.lock() = Some(target.clone());
+        let mut location = self.mountpoint.location.lock();
+        if let Some(old_location) = location.as_ref() {
+            let old_parent = old_location
+                .mountpoint
+                .upgrade()
+                .ok_or(VfsError::InvalidInput)?;
+            let old_key = old_location.entry.key();
+            let mut old_children = old_parent.children.lock();
+            if !old_children
+                .get(&old_key)
+                .is_some_and(|mounted| Arc::ptr_eq(mounted, &self.mountpoint))
+            {
+                return Err(VfsError::InvalidInput);
+            }
+            old_children.remove(&old_key);
+        }
+
+        *location = Some(MountLocation::new(target.clone()));
         target
             .mountpoint
             .children
@@ -318,30 +495,48 @@ impl Location {
         if !self.is_root_of_mount() {
             return Err(VfsError::InvalidInput);
         }
+        if self.mountpoint.namespace_root {
+            return Err(VfsError::ResourceBusy);
+        }
         if !self.mountpoint.children.lock().is_empty() {
             return Err(VfsError::ResourceBusy);
         }
-        assert!(self.entry.ptr_eq(&self.mountpoint.root));
-        self.entry.as_dir()?.forget();
-        if let Some(parent_loc) = self.mountpoint.location() {
-            parent_loc
-                .mountpoint
-                .children
-                .lock()
-                .remove(&parent_loc.entry.key());
+        if Arc::strong_count(&self.mountpoint) != 2 {
+            return Err(VfsError::ResourceBusy);
         }
-        Ok(())
+        self.mountpoint.filesystem.flush()?;
+        self.mountpoint.detach_from_parent(true)
+    }
+
+    /// Lazily detaches this mount and its descendants from the namespace.
+    /// Existing Locations keep the detached tree alive and usable.
+    pub fn lazy_unmount(&self) -> VfsResult<()> {
+        if !self.is_root_of_mount() {
+            return Err(VfsError::InvalidInput);
+        }
+        self.mountpoint.detach_from_parent(false)
     }
 
     pub fn unmount_all(&self) -> VfsResult<()> {
         if !self.is_root_of_mount() {
             return Err(VfsError::InvalidInput);
         }
-        let children = mem::take(&mut *self.mountpoint.children.lock());
-        for (_, child) in children {
+        let children = self
+            .mountpoint
+            .children
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for child in children {
             child.root_location().unmount_all()?;
         }
-        self.unmount()
+        self.mountpoint.filesystem.flush()?;
+        if self.mountpoint.namespace_root {
+            Ok(())
+        } else {
+            self.mountpoint.detach_from_parent(false)
+        }
     }
 }
 

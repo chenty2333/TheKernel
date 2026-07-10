@@ -1,6 +1,6 @@
 use alloc::{
     boxed::Box,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{Arc, Weak},
     vec,
     vec::Vec,
@@ -18,8 +18,8 @@ use core::{
 use axalloc::{UsageKind, global_allocator};
 use axdriver::{AsyncBlockWaitPolicy, virtio_async_block_enabled, virtio_async_block_wait_policy};
 use axfs_ng_vfs::{
-    FileNode, Location, MetadataUpdate, Mountpoint, NodeFlags, NodePermission, NodeType, VfsError,
-    VfsResult, WeakDirEntry, path::Path,
+    FileNode, FilesystemOps, Location, MetadataUpdate, Mountpoint, NodeFlags, NodePermission,
+    NodeType, VfsError, VfsResult, WeakDirEntry, path::Path,
 };
 use axhal::mem::{PhysAddr, VirtAddr, total_ram_size, virt_to_phys};
 use axio::{SeekFrom, prelude::*};
@@ -353,7 +353,6 @@ const DIRTY_WRITEBACK_SEGMENT_PAGES: usize = 16;
 const IN_MEMORY_PAGE_CACHE_PAGES: usize = 1024;
 const ALIGNED_BYPASS_CHUNK: usize = 64 * 1024;
 const CLOSED_FILE_CACHE_RETAIN_MAX_PAGES: usize = 1024;
-static DIRTY_PAGE_CACHE_PFNS: Once<Mutex<BTreeSet<usize>>> = Once::new();
 static FILE_CACHE_REGISTRY: Once<Mutex<BTreeMap<(u64, u64), FileUserData>>> = Once::new();
 static ENABLE_CACHED_FILE_IO_COUNTERS: AtomicBool = AtomicBool::new(false);
 static READ_BYPASS_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
@@ -621,10 +620,6 @@ fn record_cached_file_counter(counter: &AtomicU64, value: u64) {
     }
 }
 
-fn dirty_page_cache_pfns() -> &'static Mutex<BTreeSet<usize>> {
-    DIRTY_PAGE_CACHE_PFNS.call_once(|| Mutex::new(BTreeSet::new()))
-}
-
 fn file_cache_registry() -> &'static Mutex<BTreeMap<(u64, u64), FileUserData>> {
     FILE_CACHE_REGISTRY.call_once(|| Mutex::new(BTreeMap::new()))
 }
@@ -657,6 +652,7 @@ fn cached_file_shared_for_location_or_create(location: &Location) -> Arc<CachedF
 
     if let Some(entry) = registry.get_mut(&key) {
         let shared = entry.shared();
+        entry.update_location(location);
         let was_retained = entry.release_retained();
         if let Some(shared) = shared {
             if was_retained {
@@ -687,6 +683,47 @@ fn cached_file_shared_for_location_or_create(location: &Location) -> Arc<CachedF
         .insert(FileUserData::new(location, &shared));
 
     shared
+}
+
+fn retain_cached_file_writeback_location_if_dirty(
+    location: &Location,
+    shared: &Arc<CachedFileShared>,
+) {
+    let guard = shared.page_cache.lock();
+    if !guard.iter().any(|(_pn, page)| page.is_dirty()) {
+        return;
+    }
+
+    let key = cached_file_registry_key(location);
+    let mut registry = file_cache_registry().lock();
+    let entry = registry
+        .entry(key)
+        .or_insert_with(|| FileUserData::new(location, shared));
+    if !entry
+        .shared()
+        .is_some_and(|registered| Arc::ptr_eq(&registered, shared))
+    {
+        *entry = FileUserData::new(location, shared);
+    }
+    entry.update_location(location);
+    entry.writeback_location = Some(location.clone());
+}
+
+fn release_cached_file_writeback_location_if_clean(shared: &CachedFileShared) {
+    let guard = shared.page_cache.lock();
+    if guard.iter().any(|(_pn, page)| page.is_dirty()) {
+        return;
+    }
+
+    let mut registry = file_cache_registry().lock();
+    for entry in registry.values_mut() {
+        if entry
+            .shared()
+            .is_some_and(|registered| core::ptr::eq(Arc::as_ptr(&registered), shared))
+        {
+            entry.writeback_location = None;
+        }
+    }
 }
 
 /// Drops the shared page-cache registry entry for a fully released inode.
@@ -815,6 +852,7 @@ fn try_retain_closed_cached_file(location: &Location, shared: &Arc<CachedFileSha
     if pages == 0 {
         return false;
     }
+    release_cached_file_writeback_location_if_clean(shared);
 
     let key = cached_file_registry_key(location);
     loop {
@@ -830,7 +868,7 @@ fn try_retain_closed_cached_file(location: &Location, shared: &Arc<CachedFileSha
                 .load(Ordering::Acquire)
                 .saturating_sub(entry.retained_pages);
             if current_without_entry.saturating_add(pages) <= CLOSED_FILE_CACHE_RETAIN_MAX_PAGES {
-                entry.retain_closed(shared, pages);
+                entry.retain_closed(location, shared, pages);
                 record_cached_file_counter(&CLOSED_FILE_CACHE_RETAIN_HITS, 1);
                 record_cached_file_counter(&CLOSED_FILE_CACHE_RETAIN_PAGES, pages as u64);
                 return true;
@@ -870,14 +908,10 @@ pub fn sync_and_invalidate_cached_file_pages(location: &Location) -> VfsResult<(
             };
             let _ = writeback_cached_page(&shared, file, pn, &mut page)?;
         }
+        release_cached_file_writeback_location_if_clean(&shared);
         release_closed_cached_file_retention(location);
     }
     Ok(())
-}
-
-/// Returns whether the page-cache page with the given PFN is currently dirty.
-pub fn page_cache_pfn_is_dirty(pfn: usize) -> bool {
-    dirty_page_cache_pfns().lock().contains(&pfn)
 }
 
 fn discard_cached_pages(shared: &CachedFileShared) {
@@ -931,6 +965,7 @@ pub fn mark_cached_file_unlinked(location: &Location) {
         shared.unlinked.store(true, Ordering::Release);
         if shared.open_handles.load(Ordering::Acquire) == 0 {
             discard_cached_pages(&shared);
+            release_cached_file_writeback_location_if_clean(&shared);
         }
         release_closed_cached_file_retention(location);
     }
@@ -949,6 +984,36 @@ pub fn sync_all_cached_file_pages() -> VfsResult<()> {
 
     for (_key, shared, location) in entries {
         if shared.unlinked.load(Ordering::Acquire) {
+            continue;
+        }
+        let dirty_pages = cached_dirty_page_numbers(&shared);
+        if dirty_pages.is_empty() {
+            continue;
+        }
+        let file = location.entry().as_file()?;
+        flush_dirty_page_list(&shared, file, dirty_pages, false)?;
+    }
+    Ok(())
+}
+
+/// Flushes live dirty pages owned by one filesystem instance.
+///
+/// Filesystem backends call this before flushing their own metadata and block
+/// caches so unmount and syncfs preserve writeback ordering.
+pub fn sync_cached_file_pages_for_filesystem(filesystem: &dyn FilesystemOps) -> VfsResult<()> {
+    let entries = {
+        let mut registry = file_cache_registry().lock();
+        registry.retain(|_, entry| entry.shared().is_some() && entry.location().is_some());
+        registry
+            .values()
+            .filter_map(|entry| Some((entry.shared()?, entry.location()?)))
+            .collect::<Vec<_>>()
+    };
+
+    for (shared, location) in entries {
+        if !core::ptr::addr_eq(location.filesystem(), filesystem)
+            || shared.unlinked.load(Ordering::Acquire)
+        {
             continue;
         }
         let dirty_pages = cached_dirty_page_numbers(&shared);
@@ -992,16 +1057,9 @@ impl PageCache {
         virt_to_phys(self.addr)
     }
 
-    fn pfn(&self) -> usize {
-        self.paddr().as_usize() / PAGE_SIZE
-    }
-
     /// Marks this page as dirty so it will be flushed on eviction.
     pub fn mark_dirty(&mut self) {
         self.prefetched = false;
-        if !self.dirty {
-            dirty_page_cache_pfns().lock().insert(self.pfn());
-        }
         self.dirty = true;
     }
 
@@ -1062,9 +1120,6 @@ impl PageCache {
     }
 
     fn clear_dirty(&mut self) {
-        if self.dirty {
-            dirty_page_cache_pfns().lock().remove(&self.pfn());
-        }
         self.dirty = false;
     }
 
@@ -1084,7 +1139,6 @@ impl Drop for PageCache {
         }
         if self.dirty {
             warn!("dirty page dropped without flushing");
-            dirty_page_cache_pfns().lock().remove(&self.pfn());
         }
         global_allocator().dealloc_pages(self.addr.as_usize(), 1, UsageKind::PageCache);
     }
@@ -1480,13 +1534,12 @@ pub(crate) fn record_file_sync_data_only_metadata_fallback() {
     record_cached_file_counter(&SYNC_DATA_ONLY_METADATA_FALLBACKS, 1);
 }
 
-fn flush_dirty_page_list(
+fn flush_dirty_page_list_locked(
     shared: &CachedFileShared,
     file: &FileNode,
     mut dirty_pages: Vec<u32>,
     range_flush: bool,
 ) -> VfsResult<()> {
-    let _writeback_guard = shared.writeback_lock.read();
     let file_len = file.len()?;
     dirty_pages.sort_unstable();
 
@@ -1603,10 +1656,21 @@ fn flush_dirty_page_list(
         }
         start = end;
     }
+    release_cached_file_writeback_location_if_clean(shared);
     Ok(())
 }
 
-fn flush_dirty_cache_shared(shared: &CachedFileShared, file: &FileNode) -> VfsResult<()> {
+fn flush_dirty_page_list(
+    shared: &CachedFileShared,
+    file: &FileNode,
+    dirty_pages: Vec<u32>,
+    range_flush: bool,
+) -> VfsResult<()> {
+    let _writeback_guard = shared.writeback_lock.read();
+    flush_dirty_page_list_locked(shared, file, dirty_pages, range_flush)
+}
+
+fn flush_dirty_cache_shared_locked(shared: &CachedFileShared, file: &FileNode) -> VfsResult<()> {
     let dirty_pages = {
         let guard = shared.page_cache.lock();
         guard
@@ -1614,7 +1678,12 @@ fn flush_dirty_cache_shared(shared: &CachedFileShared, file: &FileNode) -> VfsRe
             .filter_map(|(pn, page)| page.is_dirty().then_some(*pn))
             .collect::<Vec<_>>()
     };
-    flush_dirty_page_list(shared, file, dirty_pages, false)
+    flush_dirty_page_list_locked(shared, file, dirty_pages, false)
+}
+
+fn flush_dirty_cache_shared(shared: &CachedFileShared, file: &FileNode) -> VfsResult<()> {
+    let _writeback_guard = shared.writeback_lock.read();
+    flush_dirty_cache_shared_locked(shared, file)
 }
 
 /// A page evicted while inserting a new cached file page.
@@ -1715,6 +1784,7 @@ impl Clone for CachedFile {
 struct FileUserData {
     shared: Weak<CachedFileShared>,
     retained: Option<Arc<CachedFileShared>>,
+    writeback_location: Option<Location>,
     retained_pages: usize,
     retained_epoch: u64,
     mountpoint: Weak<Mountpoint>,
@@ -1726,6 +1796,7 @@ impl FileUserData {
         Self {
             shared: Arc::downgrade(shared),
             retained: None,
+            writeback_location: None,
             retained_pages: 0,
             retained_epoch: 0,
             mountpoint: Arc::downgrade(location.mountpoint()),
@@ -1738,13 +1809,25 @@ impl FileUserData {
     }
 
     pub fn location(&self) -> Option<Location> {
+        if let Some(location) = &self.writeback_location {
+            return Some(location.clone());
+        }
         Some(Location::new(
             self.mountpoint.upgrade()?,
             self.entry.upgrade()?,
         ))
     }
 
-    fn retain_closed(&mut self, shared: &Arc<CachedFileShared>, pages: usize) {
+    fn update_location(&mut self, location: &Location) {
+        self.mountpoint = Arc::downgrade(location.mountpoint());
+        self.entry = location.entry().downgrade();
+        if self.writeback_location.is_some() {
+            self.writeback_location = Some(location.clone());
+        }
+    }
+
+    fn retain_closed(&mut self, location: &Location, shared: &Arc<CachedFileShared>, pages: usize) {
+        self.update_location(location);
         let old_pages = self.retained_pages;
         if pages > old_pages {
             CLOSED_FILE_CACHE_RETAINED_PAGES.fetch_add(pages - old_pages, Ordering::AcqRel);
@@ -2402,7 +2485,13 @@ impl CachedFile {
                 wait_for_page_writeback_clear(&self.shared, pn);
                 continue;
             }
-            return f.take().unwrap()(guard.get_mut(&pn));
+            let result = f.take().unwrap()(guard.get_mut(&pn));
+            let dirty = guard.get(&pn).is_some_and(PageCache::is_dirty);
+            drop(guard);
+            if dirty {
+                retain_cached_file_writeback_location_if_dirty(&self.inner, &self.shared);
+            }
+            return result;
         }
     }
 
@@ -2426,7 +2515,13 @@ impl CachedFile {
                 continue;
             }
             let page = guard.get_mut(&pn).unwrap();
-            return f.take().unwrap()(page, evicted);
+            let result = f.take().unwrap()(page, evicted);
+            let dirty = guard.get(&pn).is_some_and(PageCache::is_dirty);
+            drop(guard);
+            if dirty {
+                retain_cached_file_writeback_location_if_dirty(&self.inner, &self.shared);
+            }
+            return result;
         }
     }
 
@@ -2535,7 +2630,7 @@ impl CachedFile {
     fn write_at_locked(&self, mut buf: impl Read + IoBuf, offset: u64) -> VfsResult<usize> {
         let end = offset + buf.remaining() as u64;
         let old_len = self.inner.entry().as_file()?.len()?;
-        self.with_pages(
+        let written = self.with_pages(
             offset..end,
             |file| {
                 if end > old_len {
@@ -2553,7 +2648,11 @@ impl CachedFile {
                 Ok(written + len)
             },
             true,
-        )
+        )?;
+        if written != 0 {
+            retain_cached_file_writeback_location_if_dirty(&self.inner, &self.shared);
+        }
+        Ok(written)
     }
 
     /// Writes `buf` to the file at `offset`.
@@ -2613,7 +2712,7 @@ impl CachedFile {
         let file = self.inner.entry().as_file()?;
         let old_len = file.len()?;
         if self.in_memory && old_len > len {
-            self.flush_dirty_cache(file)?;
+            flush_dirty_cache_shared_locked(&self.shared, file)?;
         }
         file.set_len(len)?;
 
@@ -2662,6 +2761,7 @@ impl CachedFile {
                 page.mark_dirty();
             }
         }
+        retain_cached_file_writeback_location_if_dirty(&self.inner, &self.shared);
         Ok(())
     }
 
@@ -2740,6 +2840,19 @@ impl FileBackend {
 
     fn direct_io_shared(location: &Location) -> Arc<CachedFileShared> {
         cached_file_shared_for_location_or_create(location)
+    }
+
+    /// Clones this backend while selecting whether I/O bypasses the page cache.
+    ///
+    /// Both modes retain the same file location. Direct operations synchronize
+    /// and invalidate cached pages before accessing the VFS node.
+    pub fn with_direct_io(&self, enabled: bool) -> Self {
+        let location = self.location().clone();
+        if enabled {
+            Self::new_direct(location)
+        } else {
+            Self::new_cached(location)
+        }
     }
 
     fn sync_direct_cache(location: &Location) -> VfsResult<()> {
@@ -2996,7 +3109,7 @@ impl File {
             update.mtime = Some(now);
             update.ctime = Some(now);
         }
-        if let Err(err) = self.inner.location().update_metadata(update) {
+        if let Err(err) = self.inner.location().update_supported_metadata(update) {
             warn!("Failed to update file times: {err:?}");
             self.access_flags.fetch_or(flags, Ordering::AcqRel);
         }

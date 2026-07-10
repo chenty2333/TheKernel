@@ -1,12 +1,11 @@
-use super::{Config, EthernetAddress, Features, VirtioNetHdr};
-use super::{MIN_BUFFER_LEN, NET_HDR_SIZE, QUEUE_RECEIVE, QUEUE_TRANSMIT, SUPPORTED_FEATURES};
-use crate::hal::Hal;
-use crate::queue::VirtQueue;
-use crate::transport::Transport;
-use crate::volatile::volread;
-use crate::{Error, Result};
 use log::{debug, info, warn};
 use zerocopy::AsBytes;
+
+use super::{
+    Config, EthernetAddress, Features, MIN_BUFFER_LEN, NET_HDR_SIZE, QUEUE_RECEIVE, QUEUE_TRANSMIT,
+    SUPPORTED_FEATURES, VirtioNetHdr,
+};
+use crate::{Error, Result, hal::Hal, queue::VirtQueue, transport::Transport, volatile::volread};
 
 /// Raw driver for a VirtIO network device.
 ///

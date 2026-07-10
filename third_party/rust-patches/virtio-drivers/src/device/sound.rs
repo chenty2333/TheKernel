@@ -3,15 +3,7 @@
 #[cfg(test)]
 mod fake;
 
-use super::common::Feature;
-use crate::{
-    queue::{owning::OwningQueue, VirtQueue},
-    transport::Transport,
-    volatile::{volread, ReadOnly},
-    Error, Hal, Result, PAGE_SIZE,
-};
 use alloc::{boxed::Box, collections::BTreeMap, vec, vec::Vec};
-use bitflags::bitflags;
 use core::{
     array,
     fmt::{self, Debug, Display, Formatter},
@@ -19,9 +11,19 @@ use core::{
     mem::size_of,
     ops::RangeInclusive,
 };
+
+use bitflags::bitflags;
 use enumn::N;
 use log::{error, info, warn};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
+
+use super::common::Feature;
+use crate::{
+    Error, Hal, PAGE_SIZE, Result,
+    queue::{VirtQueue, owning::OwningQueue},
+    transport::Transport,
+    volatile::{ReadOnly, volread},
+};
 
 /// Audio driver based on virtio v1.2.
 ///
@@ -257,7 +259,10 @@ impl<H: Hal, T: Transport> VirtIOSound<H, T> {
         stream_count: u32,
     ) -> Result<Vec<VirtIOSndPcmInfo>> {
         if stream_start_id + stream_count > self.streams {
-            error!("stream_start_id + stream_count > streams! There are not enough streams to be queried!");
+            error!(
+                "stream_start_id + stream_count > streams! There are not enough streams to be \
+                 queried!"
+            );
             return Err(Error::IoError);
         }
         let request_hdr = VirtIOSndHdr::from(ItemInformationRequestType::RPcmInfo);
@@ -826,53 +831,53 @@ bitflags! {
 pub enum PcmFormat {
     /// IMA ADPCM format.
     #[default]
-    ImaAdpcm = 0,
+    ImaAdpcm       = 0,
     /// Mu-law format.
-    MuLaw = 1,
+    MuLaw          = 1,
     /// A-law format.
-    ALaw = 2,
+    ALaw           = 2,
     /// Signed 8-bit format.
-    S8 = 3,
+    S8             = 3,
     /// Unsigned 8-bit format.
-    U8 = 4,
+    U8             = 4,
     /// Signed 16-bit format.
-    S16 = 5,
+    S16            = 5,
     /// Unsigned 16-bit format.
-    U16 = 6,
+    U16            = 6,
     /// Signed 18.3-bit format.
-    S18_3 = 7,
+    S18_3          = 7,
     /// Unsigned 18.3-bit format.
-    U18_3 = 8,
+    U18_3          = 8,
     /// Signed 20.3-bit format.
-    S20_3 = 9,
+    S20_3          = 9,
     /// Unsigned 20.3-bit format.
-    U20_3 = 10,
+    U20_3          = 10,
     /// Signed 24.3-bit format.
-    S24_3 = 11,
+    S24_3          = 11,
     /// Unsigned 24.3-bit format.
-    U24_3 = 12,
+    U24_3          = 12,
     /// Signed 20-bit format.
-    S20 = 13,
+    S20            = 13,
     /// Unsigned 20-bit format.
-    U20 = 14,
+    U20            = 14,
     /// Signed 24-bit format.
-    S24 = 15,
+    S24            = 15,
     /// Unsigned 24-bit format.
-    U24 = 16,
+    U24            = 16,
     /// Signed 32-bit format.
-    S32 = 17,
+    S32            = 17,
     /// Unsigned 32-bit format.
-    U32 = 18,
+    U32            = 18,
     /// 32-bit floating-point format.
-    FLOAT = 19,
+    FLOAT          = 19,
     /// 64-bit floating-point format.
-    FLOAT64 = 20,
+    FLOAT64        = 20,
     /// DSD unsigned 8-bit format.
-    DsdU8 = 21,
+    DsdU8          = 21,
     /// DSD unsigned 16-bit format.
-    DsdU16 = 22,
+    DsdU16         = 22,
     /// DSD unsigned 32-bit format.
-    DsdU32 = 23,
+    DsdU32         = 23,
     /// IEC958 subframe format.
     Iec958Subframe = 24,
 }
@@ -957,27 +962,27 @@ bitflags! {
 pub enum PcmRate {
     /// 5512 Hz PCM rate.
     #[default]
-    Rate5512 = 0,
+    Rate5512   = 0,
     /// 8000 Hz PCM rate.
-    Rate8000 = 1,
+    Rate8000   = 1,
     /// 11025 Hz PCM rate.
-    Rate11025 = 2,
+    Rate11025  = 2,
     /// 16000 Hz PCM rate.
-    Rate16000 = 3,
+    Rate16000  = 3,
     /// 22050 Hz PCM rate.
-    Rate22050 = 4,
+    Rate22050  = 4,
     /// 32000 Hz PCM rate.
-    Rate32000 = 5,
+    Rate32000  = 5,
     /// 44100 Hz PCM rate.
-    Rate44100 = 6,
+    Rate44100  = 6,
     /// 48000 Hz PCM rate.
-    Rate48000 = 7,
+    Rate48000  = 7,
     /// 64000 Hz PCM rate.
-    Rate64000 = 8,
+    Rate64000  = 8,
     /// 88200 Hz PCM rate.
-    Rate88200 = 9,
+    Rate88200  = 9,
     /// 96000 Hz PCM rate.
-    Rate96000 = 10,
+    Rate96000  = 10,
     /// 176400 Hz PCM rate.
     Rate176400 = 11,
     /// 192000 Hz PCM rate.
@@ -1026,32 +1031,32 @@ struct VirtIOSoundConfig {
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, Eq, N, PartialEq)]
 enum CommandCode {
-    /* jack control request types */
-    RJackInfo = 1,
+    // jack control request types
+    RJackInfo           = 1,
     RJackRemap,
 
-    /* PCM control request types */
-    RPcmInfo = 0x0100,
+    // PCM control request types
+    RPcmInfo            = 0x0100,
     RPcmSetParams,
     RPcmPrepare,
     RPcmRelease,
     RPcmStart,
     RPcmStop,
 
-    /* channel map control request types */
-    RChmapInfo = 0x0200,
+    // channel map control request types
+    RChmapInfo          = 0x0200,
 
-    /* jack event types */
-    EvtJackConnected = 0x1000,
+    // jack event types
+    EvtJackConnected    = 0x1000,
     EvtJackDisconnected,
 
-    /* PCM event types */
+    // PCM event types
     EvtPcmPeriodElapsed = 0x1100,
     EvtPcmXrun,
 
-    /* common status codes */
+    // common status codes
     /// success
-    SOk = 0x8000,
+    SOk                 = 0x8000,
     /// a control message is malformed or contains invalid parameters
     SBadMsg,
     /// requested operation or parameters are not supported
@@ -1071,9 +1076,9 @@ impl From<CommandCode> for u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ItemInformationRequestType {
     /// Represents a jack information request.
-    RJackInfo = 1,
+    RJackInfo  = 1,
     /// Represents a PCM information request.
-    RPcmInfo = 0x0100,
+    RPcmInfo   = 0x0100,
     /// Represents a channel map information request.
     RChmapInfo = 0x0200,
 }
@@ -1095,7 +1100,7 @@ impl From<ItemInformationRequestType> for u32 {
 #[derive(Copy, Clone, Eq, PartialEq)]
 #[repr(u32)]
 enum RequestStatusCode {
-    /* common status codes */
+    // common status codes
     Ok = 0x8000,
     BadMsg,
     NotSupp,
@@ -1138,7 +1143,7 @@ struct VirtIOSndEvent {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum NotificationType {
     /// An external device has been connected to the jack.
-    JackConnected = 0x1000,
+    JackConnected    = 0x1000,
     /// An external device has been disconnected from the jack.
     JackDisconnected,
     /// A hardware buffer period has elapsed, the period size is controlled using the `period_bytes` field.
@@ -1312,33 +1317,33 @@ impl From<PcmStreamFeatures> for u32 {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u64)]
 enum PcmSampleFormat {
-    /* analog formats (width / physical width) */
-    ImaAdpcm = 0, /* 4 / 4 bits */
-    MuLaw,        /* 8 / 8 bits */
-    ALaw,         /* 8 / 8 bits */
-    S8,           /* 8 / 8 bits */
-    U8,           /* 8 / 8 bits */
-    S16,          /* 16 / 16 bits */
-    U16,          /* 16 / 16 bits */
-    S18_3,        /* 18 / 24 bits */
-    U18_3,        /* 18 / 24 bits */
-    S20_3,        /* 20 / 24 bits */
-    U20_3,        /* 20 / 24 bits */
-    S24_3,        /* 24 / 24 bits */
-    U24_3,        /* 24 / 24 bits */
-    S20,          /* 20 / 32 bits */
-    U20,          /* 20 / 32 bits */
-    S24,          /* 24 / 32 bits */
-    U24,          /* 24 / 32 bits */
-    S32,          /* 32 / 32 bits */
-    U32,          /* 32 / 32 bits */
-    Float,        /* 32 / 32 bits */
-    Float64,      /* 64 / 64 bits */
-    /* digital formats (width / physical width) */
-    DsdU8,          /* 8 / 8 bits */
-    DsdU16,         /* 16 / 16 bits */
-    DsdU32,         /* 32 / 32 bits */
-    Iec958Subframe, /* 32 / 32 bits */
+    // analog formats (width / physical width)
+    ImaAdpcm = 0, // 4 / 4 bits
+    MuLaw,        // 8 / 8 bits
+    ALaw,         // 8 / 8 bits
+    S8,           // 8 / 8 bits
+    U8,           // 8 / 8 bits
+    S16,          // 16 / 16 bits
+    U16,          // 16 / 16 bits
+    S18_3,        // 18 / 24 bits
+    U18_3,        // 18 / 24 bits
+    S20_3,        // 20 / 24 bits
+    U20_3,        // 20 / 24 bits
+    S24_3,        // 24 / 24 bits
+    U24_3,        // 24 / 24 bits
+    S20,          // 20 / 32 bits
+    U20,          // 20 / 32 bits
+    S24,          // 24 / 32 bits
+    U24,          // 24 / 32 bits
+    S32,          // 32 / 32 bits
+    U32,          // 32 / 32 bits
+    Float,        // 32 / 32 bits
+    Float64,      // 64 / 64 bits
+    // digital formats (width / physical width)
+    DsdU8,          // 8 / 8 bits
+    DsdU16,         // 16 / 16 bits
+    DsdU32,         // 32 / 32 bits
+    Iec958Subframe, // 32 / 32 bits
 }
 
 impl From<PcmSampleFormat> for u64 {
@@ -1352,9 +1357,9 @@ impl From<PcmSampleFormat> for u64 {
 #[derive(AsBytes, Clone, Eq, FromBytes, FromZeroes, PartialEq)]
 pub struct VirtIOSndPcmInfo {
     hdr: VirtIOSndInfo,
-    features: u32, /* 1 << VIRTIO_SND_PCM_F_XXX */
-    formats: u64,  /* 1 << VIRTIO_SND_PCM_FMT_XXX */
-    rates: u64,    /* 1 << VIRTIO_SND_PCM_RATE_XXX */
+    features: u32, // 1 << VIRTIO_SND_PCM_F_XXX
+    formats: u64,  // 1 << VIRTIO_SND_PCM_FMT_XXX
+    rates: u64,    // 1 << VIRTIO_SND_PCM_RATE_XXX
     /// indicates the direction of data flow (VIRTIO_SND_D_*)
     direction: u8,
     /// indicates a minimum number of supported channels
@@ -1411,10 +1416,10 @@ struct PcmParameters {
 #[repr(C)]
 #[derive(AsBytes, Debug, Eq, FromBytes, FromZeroes, PartialEq)]
 struct VirtIOSndPcmSetParams {
-    hdr: VirtIOSndPcmHdr, /* .code = VIRTIO_SND_R_PCM_SET_PARAMS */
+    hdr: VirtIOSndPcmHdr, // .code = VIRTIO_SND_R_PCM_SET_PARAMS
     buffer_bytes: u32,
     period_bytes: u32,
-    features: u32, /* 1 << VIRTIO_SND_PCM_F_XXX */
+    features: u32, // 1 << VIRTIO_SND_PCM_F_XXX
     channels: u8,
     format: u8,
     rate: u8,
@@ -1557,19 +1562,21 @@ impl Display for VirtIOSndChmapInfo {
 
 #[cfg(test)]
 mod tests {
+    use alloc::{sync::Arc, vec};
+    use core::ptr::NonNull;
+    use std::sync::Mutex;
+
+    use fake::FakeSoundDevice;
+
     use super::*;
     use crate::{
         hal::fake::FakeHal,
         transport::{
-            fake::{FakeTransport, QueueStatus, State},
             DeviceType,
+            fake::{FakeTransport, QueueStatus, State},
         },
         volatile::ReadOnly,
     };
-    use alloc::{sync::Arc, vec};
-    use core::ptr::NonNull;
-    use fake::FakeSoundDevice;
-    use std::sync::Mutex;
 
     #[test]
     fn config() {

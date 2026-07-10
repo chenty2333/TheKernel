@@ -5,16 +5,16 @@ use axerrno::{AxError, AxResult};
 use axhal::paging::MappingFlags;
 use axsync::Mutex;
 use axtask::current;
-use linux_raw_sys::general::{
-    CAP_SYS_NICE, CAP_SYS_PTRACE, MADV_COLD, MADV_COLLAPSE, MADV_PAGEOUT, MADV_WILLNEED,
-};
+use linux_raw_sys::general::{CAP_SYS_NICE, MADV_COLD, MADV_COLLAPSE, MADV_PAGEOUT, MADV_WILLNEED};
 use memory_addr::{MemoryAddr, VirtAddr};
 use starry_vm::{VmPtr, vm_read_slice, vm_write_slice};
 
 use crate::{
     file::{FileLike, PidFd},
-    mm::{AddrSpace, IoVec},
-    task::{AsThread, ProcessData, get_process_data},
+    mm::{AddrSpace, IoVec, check_user_readable, checked_align_up_4k},
+    task::{
+        AsThread, ProcessData, PtraceCredentialMode, check_current_ptrace_access, get_process_data,
+    },
 };
 
 const PROCESS_VM_MAX_IOV: usize = 1024;
@@ -44,6 +44,13 @@ fn read_iovecs(iovs: *const IoVec, iovcnt: usize) -> AxResult<(Vec<UserIoVec>, u
     }
 
     let mut result = Vec::new();
+    result
+        .try_reserve_exact(iovcnt)
+        .map_err(|_| AxError::NoMemory)?;
+    let bytes = iovcnt
+        .checked_mul(core::mem::size_of::<IoVec>())
+        .ok_or(AxError::BadAddress)?;
+    check_user_readable(iovs as usize, bytes)?;
     let mut total = 0usize;
     for index in 0..iovcnt {
         let iov = iovs.wrapping_add(index).vm_read()?;
@@ -61,19 +68,7 @@ fn read_iovecs(iovs: *const IoVec, iovcnt: usize) -> AxResult<(Vec<UserIoVec>, u
 }
 
 fn check_process_vm_permission(target: &ProcessData) -> AxResult<()> {
-    let curr = current();
-    let actor = &curr.as_thread().proc_data;
-    if actor.proc.pid() == target.proc.pid()
-        || actor.euid() == 0
-        || actor.has_effective_capability(CAP_SYS_PTRACE)
-        || [actor.uid(), actor.euid()]
-            .into_iter()
-            .any(|id| id == target.uid() || id == target.euid() || id == target.suid())
-    {
-        Ok(())
-    } else {
-        Err(AxError::OperationNotPermitted)
-    }
+    check_current_ptrace_access(target, PtraceCredentialMode::Real)
 }
 
 fn check_process_madvise_permission(target: &ProcessData) -> AxResult<()> {
@@ -92,7 +87,8 @@ fn check_process_madvise_permission(target: &ProcessData) -> AxResult<()> {
 
 fn validate_process_madvise_behavior(behavior: u32) -> AxResult<()> {
     match behavior {
-        MADV_COLD | MADV_PAGEOUT | MADV_WILLNEED | MADV_COLLAPSE => Ok(()),
+        MADV_WILLNEED => Ok(()),
+        MADV_COLD | MADV_PAGEOUT | MADV_COLLAPSE => Err(AxError::OperationNotSupported),
         _ => Err(AxError::InvalidInput),
     }
 }
@@ -112,7 +108,7 @@ fn validate_remote_range(
         return Err(AxError::BadAddress);
     }
     let page_start = start.align_down_4k();
-    let page_end = end.align_up_4k();
+    let page_end = VirtAddr::from(checked_align_up_4k(end.as_usize()).ok_or(AxError::BadAddress)?);
     aspace.populate_area(page_start, page_end.sub_addr(page_start), access_flags)?;
     Ok(())
 }
@@ -343,4 +339,27 @@ pub fn sys_process_madvise(
     check_process_madvise_permission(&target)?;
     validate_remote_iovecs(&target, &remote)?;
     Ok(total_len as isize)
+}
+
+#[cfg(test)]
+mod tests {
+    use axerrno::AxError;
+    use linux_raw_sys::general::{MADV_COLD, MADV_COLLAPSE, MADV_PAGEOUT, MADV_WILLNEED};
+
+    use super::validate_process_madvise_behavior;
+
+    #[test]
+    fn process_madvise_only_accepts_implemented_behavior() {
+        assert_eq!(validate_process_madvise_behavior(MADV_WILLNEED), Ok(()));
+        for behavior in [MADV_COLD, MADV_PAGEOUT, MADV_COLLAPSE] {
+            assert_eq!(
+                validate_process_madvise_behavior(behavior),
+                Err(AxError::OperationNotSupported)
+            );
+        }
+        assert_eq!(
+            validate_process_madvise_behavior(u32::MAX),
+            Err(AxError::InvalidInput)
+        );
+    }
 }

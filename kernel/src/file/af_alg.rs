@@ -15,13 +15,10 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::prelude::*;
 use axpoll::{IoEvents, Pollable};
-use linux_raw_sys::{
-    general::S_IFSOCK,
-    net::{SOCK_SEQPACKET, cmsghdr, msghdr, sockaddr, socklen_t},
-};
+use linux_raw_sys::net::{SOCK_SEQPACKET, cmsghdr, msghdr, sockaddr, socklen_t};
 use spin::Mutex;
 
-use super::{FileLike, Kstat};
+use super::{FileLike, Kstat, PseudoInode};
 use crate::{
     file::{FileHandle, get_typed_file},
     mm::{IoVec, IoVectorBuf, UserConstPtr},
@@ -142,6 +139,7 @@ enum SocketKind {
 
 pub struct AfAlgSocket {
     kind: SocketKind,
+    inode: PseudoInode,
     nonblocking: AtomicBool,
 }
 
@@ -149,6 +147,7 @@ impl AfAlgSocket {
     pub fn new_listener() -> Self {
         Self {
             kind: SocketKind::Listener(Mutex::new(ListenerState::default())),
+            inode: PseudoInode::socket(),
             nonblocking: AtomicBool::new(false),
         }
     }
@@ -197,6 +196,7 @@ impl AfAlgSocket {
                 output_offset: 0,
                 output_finalized: false,
             })),
+            inode: PseudoInode::socket(),
             nonblocking: AtomicBool::new(self.nonblocking()),
         })
     }
@@ -326,11 +326,7 @@ impl FileLike for AfAlgSocket {
     }
 
     fn stat(&self) -> AxResult<Kstat> {
-        Ok(Kstat {
-            mode: S_IFSOCK | 0o777u32,
-            blksize: 4096,
-            ..Default::default()
-        })
+        Ok(self.inode.stat())
     }
 
     fn nonblocking(&self) -> bool {
@@ -343,7 +339,7 @@ impl FileLike for AfAlgSocket {
     }
 
     fn path(&self) -> Cow<'_, str> {
-        format!("af_alg:[{}]", self as *const _ as usize).into()
+        format!("socket:[{}]", self.inode.inode()).into()
     }
 }
 

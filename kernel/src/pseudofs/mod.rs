@@ -58,17 +58,20 @@ fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> LinuxResult<()>
     if fs.resolve(path).is_err() {
         fs.create_dir(path, DIR_PERMISSION)?;
     }
-    let mountpoint = fs.resolve(path)?.mount(&mount_fs)?;
-    if path != "/proc" {
-        let fs_type = mount_fs.name().to_string();
-        mounts::record(
-            fs_type.clone(),
-            path.to_string(),
-            fs_type,
-            mountpoint.device(),
-            0,
-        );
-    }
+    let target = fs.resolve(path)?;
+    let parent_id = target.mountpoint().mount_id();
+    let mountpoint = target.mount(&mount_fs)?;
+    let fs_type = mount_fs.name().to_string();
+    mounts::record(
+        fs_type.clone(),
+        path.to_string(),
+        fs_type,
+        "/".to_string(),
+        mountpoint.device(),
+        mountpoint.mount_id(),
+        parent_id,
+        0,
+    );
     info!("Mounted {} at {}", mount_fs.name(), path);
     Ok(())
 }

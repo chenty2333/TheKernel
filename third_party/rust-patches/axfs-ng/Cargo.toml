@@ -40,7 +40,10 @@ version = "=0.3.0-preview.2"
 
 [dependencies.axdriver]
 version = "=0.3.0-preview.2"
-features = ["block"]
+features = [
+    "block",
+    "shared-block",
+]
 
 [dependencies.axerrno]
 version = "0.2"

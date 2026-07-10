@@ -120,8 +120,9 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
                 self.output_char(&term, ch);
             }
             if !term.canonical() {
-                self.buf_tx.try_push(ch).unwrap();
-                sent += 1;
+                if self.buf_tx.try_push(ch).is_ok() {
+                    sent += 1;
+                }
                 continue;
             }
 
@@ -339,7 +340,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         } else {
             let vtime = term.special_char(VTIME);
             if vtime > 0 {
-                todo!();
+                return Err(AxError::Unsupported);
             }
             term.special_char(VMIN) as usize
         };

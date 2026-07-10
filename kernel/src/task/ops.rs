@@ -643,6 +643,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
 
         acct_process_exit(&thr.proc_data, exit_code, self_usage);
         thr.proc_data.release_executable();
+        crate::syscall::cleanup_process_aio(process.pid());
         let closed_fds = thr.with_mut_scope(crate::file::close_process_fd_table);
         // wait(2) may return as soon as the parent observes the zombie state.
         // Child-owned file descriptions must be fully dropped before that point

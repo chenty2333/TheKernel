@@ -6,7 +6,7 @@
 //
 // This file has been modified by KylinSoft on 2025.
 
-use alloc::vec;
+use alloc::vec::Vec;
 
 use axerrno::{AxError, AxResult};
 use axhal::paging::MappingFlags;
@@ -82,7 +82,11 @@ pub fn sys_mincore(addr: usize, length: usize, vec: *mut u8) -> AxResult<isize> 
             return Err(AxError::NoMemory);
         }
 
-        let mut result = vec![0u8; page_count];
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(page_count)
+            .map_err(|_| AxError::NoMemory)?;
+        result.resize(page_count, 0);
         let mut i = 0;
 
         while i < page_count {

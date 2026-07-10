@@ -1,6 +1,6 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::Context,
 };
 
@@ -13,7 +13,9 @@ use axsync::Mutex;
 use spin::RwLock;
 
 use crate::{
-    CMsgData, RecvFlags, RecvOptions, SendOptions, SocketAddrEx,
+    CMsgData, RecvFlags, RecvOptions, SendOptions, Shutdown, SocketAddrEx,
+    buffer::SocketBufferLimits,
+    consts::{TCP_RX_BUF_LEN, TCP_TX_BUF_LEN},
     general::GeneralOptions,
     options::{Configurable, GetSocketOption, SetSocketOption, UnixCredentials},
     socket::SocketFilter,
@@ -32,24 +34,22 @@ struct Channel {
     poll_update: Arc<PollSet>,
     filter: Arc<RwLock<Option<Arc<dyn SocketFilter>>>>,
     queued_bytes: Arc<AtomicUsize>,
-    peer_general: Arc<GeneralOptions>,
+    peer_buffers: Arc<SocketBufferLimits>,
+    peer_credentials: UnixCredentials,
 }
 
 impl Channel {
-    fn capacity(&self, local_general: &GeneralOptions) -> usize {
-        local_general
-            .send_buffer()
-            .min(self.peer_general.recv_buffer())
-            .max(1)
+    fn capacity(&self, local_buffers: &SocketBufferLimits) -> usize {
+        local_buffers.send().min(self.peer_buffers.recv()).max(1)
     }
 
-    fn writable(&self, local_general: &GeneralOptions) -> bool {
+    fn writable(&self, local_buffers: &SocketBufferLimits) -> bool {
         !self.data_tx.is_closed()
-            && self.queued_bytes.load(Ordering::Acquire) < self.capacity(local_general)
+            && self.queued_bytes.load(Ordering::Acquire) < self.capacity(local_buffers)
     }
 
-    fn try_send(&self, local_general: &GeneralOptions, mut packet: Packet) -> AxResult<()> {
-        let capacity = self.capacity(local_general);
+    fn try_send(&self, local_buffers: &SocketBufferLimits, mut packet: Packet) -> AxResult<()> {
+        let capacity = self.capacity(local_buffers);
         let charge = packet.data.len().max(1).min(capacity);
 
         loop {
@@ -85,7 +85,7 @@ pub struct Bind {
     poll_update: Arc<PollSet>,
     filter: Arc<RwLock<Option<Arc<dyn SocketFilter>>>>,
     queued_bytes: Arc<AtomicUsize>,
-    general: Arc<GeneralOptions>,
+    buffers: Arc<SocketBufferLimits>,
 }
 impl Bind {
     fn connect(&self) -> Channel {
@@ -95,7 +95,11 @@ impl Bind {
             poll_update: self.poll_update.clone(),
             filter: self.filter.clone(),
             queued_bytes: self.queued_bytes.clone(),
-            peer_general: self.general.clone(),
+            peer_buffers: self.buffers.clone(),
+            // Linux does not expose credentials through SO_PEERCRED for a
+            // pathname-connected datagram socket. SCM_CREDENTIALS is a
+            // separate, per-message facility.
+            peer_credentials: UnixCredentials::UNKNOWN,
         }
     }
 }
@@ -114,11 +118,13 @@ pub struct DgramTransport {
     poll_state: Arc<PollSet>,
     filter: Arc<RwLock<Option<Arc<dyn SocketFilter>>>>,
     general: Arc<GeneralOptions>,
-    pid: u32,
+    buffers: Arc<SocketBufferLimits>,
+    rx_shutdown: AtomicBool,
+    tx_shutdown: AtomicBool,
 }
 impl DgramTransport {
     /// Create a new unconnected datagram transport.
-    pub fn new(pid: u32) -> Self {
+    pub fn new() -> Self {
         DgramTransport {
             data_rx: Mutex::new(None),
             connected: RwLock::new(None),
@@ -126,7 +132,9 @@ impl DgramTransport {
             poll_state: Arc::default(),
             filter: Arc::new(RwLock::new(None)),
             general: Arc::new(GeneralOptions::default()),
-            pid,
+            buffers: Arc::new(SocketBufferLimits::new(TCP_TX_BUF_LEN, TCP_RX_BUF_LEN)),
+            rx_shutdown: AtomicBool::new(false),
+            tx_shutdown: AtomicBool::new(false),
         }
     }
 
@@ -139,7 +147,7 @@ impl DgramTransport {
         connected: Channel,
         filter: Arc<RwLock<Option<Arc<dyn SocketFilter>>>>,
         general: Arc<GeneralOptions>,
-        pid: u32,
+        buffers: Arc<SocketBufferLimits>,
     ) -> Self {
         DgramTransport {
             data_rx: Mutex::new(Some(data_rx)),
@@ -148,12 +156,14 @@ impl DgramTransport {
             poll_state: Arc::default(),
             filter,
             general,
-            pid,
+            buffers,
+            rx_shutdown: AtomicBool::new(false),
+            tx_shutdown: AtomicBool::new(false),
         }
     }
 
     /// Create a connected pair of datagram transports.
-    pub fn new_pair(pid: u32) -> (Self, Self) {
+    pub fn new_pair(credentials: UnixCredentials) -> (Self, Self) {
         let (tx1, rx1) = async_channel::unbounded();
         let (tx2, rx2) = async_channel::unbounded();
         let poll1 = Arc::new(PollSet::new());
@@ -164,6 +174,8 @@ impl DgramTransport {
         let filter2 = Arc::new(RwLock::new(None));
         let general1 = Arc::new(GeneralOptions::default());
         let general2 = Arc::new(GeneralOptions::default());
+        let buffers1 = Arc::new(SocketBufferLimits::new(TCP_TX_BUF_LEN, TCP_RX_BUF_LEN));
+        let buffers2 = Arc::new(SocketBufferLimits::new(TCP_TX_BUF_LEN, TCP_RX_BUF_LEN));
         let transport1 = DgramTransport::new_connected(
             (rx1, poll1.clone(), queued1.clone()),
             Channel {
@@ -171,11 +183,12 @@ impl DgramTransport {
                 poll_update: poll2.clone(),
                 filter: filter2.clone(),
                 queued_bytes: queued2.clone(),
-                peer_general: general2.clone(),
+                peer_buffers: buffers2.clone(),
+                peer_credentials: credentials,
             },
             filter1.clone(),
             general1.clone(),
-            pid,
+            buffers1.clone(),
         );
         let transport2 = DgramTransport::new_connected(
             (rx2, poll2.clone(), queued2),
@@ -184,11 +197,12 @@ impl DgramTransport {
                 poll_update: poll1.clone(),
                 filter: filter1.clone(),
                 queued_bytes: queued1,
-                peer_general: general1,
+                peer_buffers: buffers1,
+                peer_credentials: credentials,
             },
             filter2.clone(),
             general2,
-            pid,
+            buffers2,
         );
         (transport1, transport2)
     }
@@ -204,6 +218,10 @@ impl DgramTransport {
 }
 
 impl Configurable for DgramTransport {
+    fn nonblocking(&self) -> bool {
+        self.general.nonblocking()
+    }
+
     fn get_option_inner(&self, opt: &mut GetSocketOption) -> AxResult<bool> {
         use GetSocketOption as O;
 
@@ -212,12 +230,18 @@ impl Configurable for DgramTransport {
         }
 
         match opt {
-            O::PassCredentials(_) => {}
+            O::SendBuffer(size) => {
+                **size = self.buffers.send();
+            }
+            O::ReceiveBuffer(size) => {
+                **size = self.buffers.recv();
+            }
             O::PeerCredentials(cred) => {
-                // Datagram sockets are stateless and do not have a peer, so we
-                // return the credentials of the process that created the
-                // socket.
-                **cred = UnixCredentials::new(self.pid);
+                **cred = self
+                    .connected
+                    .read()
+                    .as_ref()
+                    .map_or(UnixCredentials::UNKNOWN, |channel| channel.peer_credentials);
             }
             _ => return Ok(false),
         }
@@ -232,7 +256,16 @@ impl Configurable for DgramTransport {
         }
 
         match opt {
-            O::PassCredentials(_) => {}
+            O::SendBuffer(size) | O::SendBufferForce(size) => {
+                self.buffers.set_send(*size);
+                self.poll_state.wake();
+            }
+            O::ReceiveBuffer(size) | O::ReceiveBufferForce(size) => {
+                self.buffers.set_recv(*size);
+                if let Some((_, poll_update, _)) = self.data_rx.lock().as_ref() {
+                    poll_update.wake();
+                }
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -257,7 +290,7 @@ impl TransportOps for DgramTransport {
             poll_update: poll_update.clone(),
             filter: self.filter.clone(),
             queued_bytes: queued_bytes.clone(),
-            general: self.general.clone(),
+            buffers: self.buffers.clone(),
         });
         *guard = Some((rx, poll_update, queued_bytes));
         self.local_addr.write().clone_from(local_addr);
@@ -286,6 +319,9 @@ impl TransportOps for DgramTransport {
     }
 
     fn send(&self, mut src: impl Read, options: SendOptions) -> AxResult<usize> {
+        if self.tx_shutdown.load(Ordering::Acquire) {
+            return Err(AxError::BrokenPipe);
+        }
         let mut message = Vec::new();
         src.read_to_end(&mut message)?;
         let len = message.len();
@@ -308,7 +344,7 @@ impl TransportOps for DgramTransport {
                         }
                         packet.data.truncate(keep.min(packet.data.len()));
                     }
-                    bind.connect().try_send(&self.general, packet)?;
+                    bind.connect().try_send(&self.buffers, packet)?;
                     Ok(())
                 } else {
                     Err(AxError::NotConnected)
@@ -322,7 +358,7 @@ impl TransportOps for DgramTransport {
                 }
                 packet.data.truncate(keep.min(packet.data.len()));
             }
-            chan.try_send(&self.general, packet)?;
+            chan.try_send(&self.buffers, packet)?;
         } else {
             return Err(AxError::NotConnected);
         }
@@ -330,6 +366,9 @@ impl TransportOps for DgramTransport {
     }
 
     fn recv(&self, mut dst: impl Write, mut options: RecvOptions) -> AxResult<usize> {
+        if self.rx_shutdown.load(Ordering::Acquire) {
+            return Ok(0);
+        }
         self.general.recv_poller(self, move || {
             let mut guard = self.data_rx.lock();
             let Some((rx, poll_update, queued_bytes)) = guard.as_mut() else {
@@ -376,21 +415,46 @@ impl TransportOps for DgramTransport {
             })
         })
     }
+
+    fn shutdown(&self, how: Shutdown) -> AxResult<()> {
+        if !self.is_connected() {
+            return Err(AxError::NotConnected);
+        }
+        if how.has_read() {
+            self.rx_shutdown.store(true, Ordering::Release);
+        }
+        if how.has_write() {
+            self.tx_shutdown.store(true, Ordering::Release);
+        }
+        self.poll_state.wake();
+        Ok(())
+    }
 }
 
 impl Pollable for DgramTransport {
     fn poll(&self) -> IoEvents {
         let mut events = IoEvents::empty();
-        if let Some((rx, ..)) = self.data_rx.lock().as_ref() {
-            events.set(IoEvents::IN, !rx.is_empty());
-        }
+        let rx_shutdown = self.rx_shutdown.load(Ordering::Acquire);
+        let tx_shutdown = self.tx_shutdown.load(Ordering::Acquire);
+        events.set(
+            IoEvents::IN,
+            rx_shutdown
+                || self
+                    .data_rx
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|(rx, ..)| !rx.is_empty()),
+        );
         events.set(
             IoEvents::OUT,
-            self.connected
-                .read()
-                .as_ref()
-                .is_none_or(|chan| chan.writable(&self.general)),
+            !tx_shutdown
+                && self
+                    .connected
+                    .read()
+                    .as_ref()
+                    .is_none_or(|chan| chan.writable(&self.buffers)),
         );
+        events.set(IoEvents::RDHUP, rx_shutdown);
         events
     }
 
@@ -406,6 +470,66 @@ impl Pollable for DgramTransport {
             chan.poll_update.register(context.waker());
         }
         self.poll_state.register(context.waker());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer_credentials(transport: &DgramTransport) -> UnixCredentials {
+        let mut credentials = UnixCredentials::default();
+        transport
+            .get_option(GetSocketOption::PeerCredentials(&mut credentials))
+            .unwrap();
+        credentials
+    }
+
+    #[test]
+    fn unconnected_datagram_reports_unknown_peer_credentials() {
+        let transport = DgramTransport::new();
+        assert_eq!(peer_credentials(&transport), UnixCredentials::UNKNOWN);
+    }
+
+    #[test]
+    fn datagram_socketpair_snapshots_creator_credentials() {
+        let credentials = UnixCredentials::new(11, 12, 13);
+        let (left, right) = DgramTransport::new_pair(credentials);
+        assert_eq!(peer_credentials(&left), credentials);
+        assert_eq!(peer_credentials(&right), credentials);
+    }
+
+    #[test]
+    fn pathname_datagram_channel_does_not_fake_peer_credentials() {
+        let (tx, _rx) = async_channel::unbounded();
+        let bind = Bind {
+            data_tx: tx,
+            poll_update: Arc::new(PollSet::new()),
+            filter: Arc::new(RwLock::new(None)),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            buffers: Arc::new(SocketBufferLimits::new(TCP_TX_BUF_LEN, TCP_RX_BUF_LEN)),
+        };
+
+        assert_eq!(bind.connect().peer_credentials, UnixCredentials::UNKNOWN);
+    }
+
+    #[test]
+    fn datagram_shutdown_requires_a_peer_and_changes_io_state() {
+        let unconnected = DgramTransport::new();
+        assert_eq!(
+            unconnected.shutdown(Shutdown::Both).unwrap_err(),
+            AxError::NotConnected
+        );
+
+        let credentials = UnixCredentials::new(1, 2, 3);
+        let (left, right) = DgramTransport::new_pair(credentials);
+        left.shutdown(Shutdown::Write).unwrap();
+        assert!(left.tx_shutdown.load(Ordering::Acquire));
+        assert!(!left.poll().contains(IoEvents::OUT));
+
+        right.shutdown(Shutdown::Read).unwrap();
+        assert!(right.rx_shutdown.load(Ordering::Acquire));
+        assert!(right.poll().contains(IoEvents::RDHUP));
     }
 }
 

@@ -16,7 +16,7 @@ use starry_signal::{SignalInfo, SignalSet};
 use zerocopy::{Immutable, IntoBytes};
 
 use crate::{
-    file::{FileLike, IoDst, IoSrc},
+    file::{FileLike, IoDst, IoSrc, Kstat, anon_inode_stat},
     task::{AsThread, acknowledge_posix_timer_signal},
 };
 
@@ -122,6 +122,10 @@ impl Signalfd {
 }
 
 impl FileLike for Signalfd {
+    fn stat(&self) -> AxResult<Kstat> {
+        Ok(anon_inode_stat())
+    }
+
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
         if dst.remaining_mut() < SIGNALFD_SIGINFO_SIZE {
             return Err(AxError::InvalidInput);

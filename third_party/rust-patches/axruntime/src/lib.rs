@@ -322,10 +322,6 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
 
         cfg_if::cfg_if! {
             if #[cfg(feature = "net-ng")] {
-                #[cfg(target_arch = "loongarch64")]
-                axnet_ng::init_network_loopback_only();
-
-                #[cfg(not(target_arch = "loongarch64"))]
                 axnet_ng::init_network(all_devices.net);
 
                 #[cfg(feature = "vsock")]

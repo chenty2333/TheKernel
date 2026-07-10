@@ -9,9 +9,8 @@ use linux_raw_sys::{
     general::{
         __user_cap_data_struct, __user_cap_header_struct, _LINUX_CAPABILITY_VERSION_1,
         _LINUX_CAPABILITY_VERSION_2, _LINUX_CAPABILITY_VERSION_3, CAP_SETPCAP, CAP_SYS_ADMIN,
-        CAP_SYS_NICE, CAP_SYS_PTRACE, CLONE_FILES, CLONE_FS, CLONE_NEWCGROUP, CLONE_NEWIPC,
-        CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS,
-        CLONE_SYSVSEM,
+        CAP_SYS_NICE, CLONE_FILES, CLONE_FS, CLONE_NEWCGROUP, CLONE_NEWIPC, CLONE_NEWNET,
+        CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS, CLONE_SYSVSEM,
     },
     mempolicy::*,
 };
@@ -23,14 +22,17 @@ use crate::{
     file::{FD_TABLE, File, FileDescription, FileLike},
     mm::vm_load_string,
     pseudofs::{
-        ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget, cgroup::cpuset_allowed_masks,
+        ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
         namespace_target_from_proc_file,
     },
-    task::{AsThread, CapabilityState, Mempolicy, ProcessData, get_process_data},
+    task::{
+        AsThread, CapabilityState, Mempolicy, ProcessData, PtraceCredentialMode,
+        check_current_ptrace_access, get_process_data,
+    },
 };
 
 const NO_ID_CHANGE: u32 = u32::MAX;
-const ALLOWED_NODEMASK: usize = 0b11;
+const ALLOWED_NODEMASK: usize = 0b1;
 const DEFAULT_NUMA_NODE: i32 = 0;
 const SUPPORTED_GET_MEMPOLICY_FLAGS: usize =
     (MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED) as usize;
@@ -46,8 +48,7 @@ const KCMP_SIGHAND: i32 = 4;
 const KCMP_IO: i32 = 5;
 const KCMP_SYSVSEM: i32 = 6;
 const KCMP_EPOLL_TFD: i32 = 7;
-const UNSHARE_SUPPORTED_FLAGS: u32 =
-    CLONE_FILES | CLONE_FS | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWTIME;
+const UNSHARE_SUPPORTED_FLAGS: u32 = CLONE_FILES | CLONE_FS | CLONE_NEWUTS | CLONE_NEWTIME;
 const UNSHARE_RECOGNIZED_FLAGS: u32 = UNSHARE_SUPPORTED_FLAGS
     | CLONE_NEWNS
     | CLONE_NEWIPC
@@ -169,9 +170,7 @@ fn validate_mempolicy(
 }
 
 fn current_allowed_nodemask() -> usize {
-    cpuset_allowed_masks(current().as_thread().proc_data.proc.pid())
-        .map(|(_, mems)| mems)
-        .unwrap_or(ALLOWED_NODEMASK)
+    ALLOWED_NODEMASK
 }
 
 fn validate_mapped_user_range(start: usize, size: usize) -> AxResult<(VirtAddr, usize)> {
@@ -181,7 +180,9 @@ fn validate_mapped_user_range(start: usize, size: usize) -> AxResult<(VirtAddr, 
     }
     let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
     let aligned_start = start.align_down_4k();
-    let aligned_end = end.align_up_4k();
+    let aligned_end = VirtAddr::from(
+        crate::mm::checked_align_up_4k(end.as_usize()).ok_or(AxError::InvalidInput)?,
+    );
     let aligned_size = aligned_end.sub_addr(aligned_start);
     let curr = current();
     let aspace_handle = curr.as_thread().proc_data.aspace();
@@ -231,19 +232,7 @@ fn kcmp_target_process(pid: i32) -> AxResult<Arc<ProcessData>> {
 }
 
 fn check_kcmp_permission(target: &ProcessData) -> AxResult<()> {
-    let curr = current();
-    let actor = &curr.as_thread().proc_data;
-    if actor.proc.pid() == target.proc.pid()
-        || actor.euid() == 0
-        || actor.has_effective_capability(CAP_SYS_PTRACE)
-        || [actor.uid(), actor.euid()]
-            .into_iter()
-            .any(|id| id == target.uid() || id == target.euid() || id == target.suid())
-    {
-        Ok(())
-    } else {
-        Err(AxError::OperationNotPermitted)
-    }
+    check_current_ptrace_access(target, PtraceCredentialMode::Real)
 }
 
 fn kcmp_result(equal: bool) -> isize {
@@ -298,14 +287,7 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, type_: i32, idx1: usize, idx2: usize) -> A
             &proc1.signal.actions,
             &proc2.signal.actions,
         ))),
-        KCMP_IO => Ok(kcmp_result(Arc::ptr_eq(
-            &proc1.io_context,
-            &proc2.io_context,
-        ))),
-        KCMP_SYSVSEM => Ok(kcmp_result(Arc::ptr_eq(
-            &proc1.sysvsem_undo,
-            &proc2.sysvsem_undo,
-        ))),
+        KCMP_IO | KCMP_SYSVSEM => Err(LinuxError::EOPNOTSUPP.into()),
         KCMP_EPOLL_TFD => Err(LinuxError::EOPNOTSUPP.into()),
         _ => Err(AxError::InvalidInput),
     }
@@ -317,22 +299,22 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
     if flags & !UNSHARE_RECOGNIZED_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }
+    if flags & !UNSHARE_SUPPORTED_FLAGS != 0 {
+        return Err(AxError::OperationNotSupported);
+    }
     if flags & NAMESPACE_FLAGS != 0 && !current_has_capability(CAP_SYS_ADMIN) {
         return Err(AxError::OperationNotPermitted);
-    }
-    if flags & !UNSHARE_SUPPORTED_FLAGS != 0 {
-        return Err(AxError::InvalidInput);
     }
 
     let curr = current();
     let thread = curr.as_thread();
-    if flags & (CLONE_FILES | CLONE_FS | CLONE_NEWNS) != 0 {
+    if flags & (CLONE_FILES | CLONE_FS) != 0 {
         thread.with_mut_scope(|scope| {
             if flags & CLONE_FILES != 0 {
                 let cloned = FD_TABLE.scope(scope).read().clone();
                 *FD_TABLE.scope_mut(scope) = Arc::new(RwLock::new(cloned));
             }
-            if flags & (CLONE_FS | CLONE_NEWNS) != 0 {
+            if flags & CLONE_FS != 0 {
                 let cloned = FS_CONTEXT.scope(scope).lock().clone();
                 *FS_CONTEXT.scope_mut(scope) = Arc::new(axsync::Mutex::new(cloned));
             }
@@ -691,10 +673,7 @@ pub fn sys_get_mempolicy(
         if flags & (MPOL_F_ADDR | MPOL_F_NODE) as usize != 0 {
             return Err(AxError::InvalidInput);
         }
-        let allowed = cpuset_allowed_masks(current().as_thread().proc_data.proc.pid())
-            .map(|(_, mems)| mems)
-            .unwrap_or(ALLOWED_NODEMASK);
-        write_nodemask(nodemask, maxnode, allowed)?;
+        write_nodemask(nodemask, maxnode, ALLOWED_NODEMASK)?;
         return Ok(0);
     }
     if addr != 0 && flags & MPOL_F_ADDR as usize == 0 {
@@ -847,23 +826,11 @@ pub fn sys_migrate_pages(
     Ok(0)
 }
 
-const SECCOMP_MODE_STRICT: u32 = 1;
-const SECCOMP_MODE_FILTER: u32 = 2;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SockFprog {
-    len: u16,
-    filter: usize,
-}
-
 /// prctl() is called with a first argument describing what to do, and further
 /// arguments with a significance depending on the first one.
 /// The first argument can be:
 /// - PR_SET_NAME: set the name of the calling thread, using the value pointed to by `arg2`
 /// - PR_GET_NAME: get the name of the calling
-/// - PR_SET_SECCOMP: enable seccomp mode, with the mode specified in `arg2`
-/// - PR_MCE_KILL: set the machine check exception policy
 /// - PR_SET_MM options: set various memory management options (start/end code/data/brk/stack)
 pub fn sys_prctl(
     option: u32,
@@ -938,43 +905,8 @@ pub fn sys_prctl(
             }
             current().as_thread().proc_data.set_keep_caps(arg2 != 0)?;
         }
-        PR_GET_SECCOMP => {
-            return Ok(current().as_thread().proc_data.seccomp_mode() as isize);
-        }
-        PR_SET_SECCOMP => match arg2 as u32 {
-            SECCOMP_MODE_STRICT => {
-                current()
-                    .as_thread()
-                    .proc_data
-                    .set_seccomp_mode(SECCOMP_MODE_STRICT);
-            }
-            SECCOMP_MODE_FILTER => {
-                let fprog: SockFprog =
-                    unsafe { (arg3 as *const SockFprog).vm_read_uninit()?.assume_init() };
-                if fprog.len == 0 {
-                    return Err(AxError::InvalidInput);
-                }
-                let curr = current();
-                let proc_data = &curr.as_thread().proc_data;
-                if !proc_data.no_new_privs() && !proc_data.has_effective_capability(CAP_SYS_ADMIN) {
-                    return Err(AxError::PermissionDenied);
-                }
-                proc_data.set_seccomp_mode(SECCOMP_MODE_FILTER);
-            }
-            _ => return Err(AxError::InvalidInput),
-        },
-        PR_MCE_KILL => {}
-        PR_SET_THP_DISABLE => {
-            if arg3 != 0 || arg4 != 0 || arg5 != 0 {
-                return Err(AxError::InvalidInput);
-            }
-            current().as_thread().proc_data.set_thp_disabled(arg2 != 0);
-        }
-        PR_GET_THP_DISABLE => {
-            if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
-                return Err(AxError::InvalidInput);
-            }
-            return Ok(current().as_thread().proc_data.thp_disabled() as isize);
+        PR_GET_SECCOMP | PR_SET_SECCOMP | PR_MCE_KILL | PR_SET_THP_DISABLE | PR_GET_THP_DISABLE => {
+            return Err(AxError::InvalidInput);
         }
         PR_CAP_AMBIENT => {
             let curr = current();
@@ -1036,8 +968,7 @@ pub fn sys_prctl(
             return Ok(current().as_thread().proc_data.securebits() as isize);
         }
         PR_SET_MM => {
-            // not implemented; but avoid annoying warnings
-            return Err(AxError::InvalidInput);
+            return Err(AxError::OperationNotSupported);
         }
         _ => {
             warn!("sys_prctl: unsupported option {option}");

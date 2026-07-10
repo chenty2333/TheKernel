@@ -1,16 +1,20 @@
 use alloc::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     string::{String, ToString},
+    sync::Weak,
     vec::Vec,
 };
 
-use axfs_ng_vfs::{Location, NodeType};
+use axfs_ng_vfs::{DeviceId, Location, NodeType};
 use spin::Mutex;
 
 use crate::time::wall_time;
 
 #[derive(Clone)]
 pub struct MountRecord {
+    pub mount_id: u64,
+    pub parent_id: u64,
+    pub root: String,
     pub source: String,
     pub target: String,
     pub fs_type: String,
@@ -21,6 +25,10 @@ pub struct MountRecord {
 }
 
 static MOUNT_RECORDS: Mutex<Vec<MountRecord>> = Mutex::new(Vec::new());
+static LINUX_DEVICE_IDS: Mutex<BTreeMap<u64, (DeviceId, Weak<()>)>> = Mutex::new(BTreeMap::new());
+
+pub const ROOT_BLOCK_SOURCE: &str = "/dev/vda";
+pub const ROOT_BLOCK_DEVICE_ID: DeviceId = DeviceId::new(8, 0);
 
 const MS_RDONLY: u32 = 0x1;
 const MS_NOSUID: u32 = 0x2;
@@ -48,25 +56,79 @@ pub fn snapshot() -> Vec<MountRecord> {
     MOUNT_RECORDS.lock().clone()
 }
 
-pub fn record(source: String, target: String, fs_type: String, dev: u64, flags: u32) {
-    record_with_data(source, target, fs_type, dev, flags, String::new());
+pub fn register_linux_device(vfs_device: u64, linux_device: DeviceId, lifetime: Weak<()>) {
+    if vfs_device != 0 {
+        LINUX_DEVICE_IDS
+            .lock()
+            .insert(vfs_device, (linux_device, lifetime));
+    }
+}
+
+pub fn linux_device_id(vfs_device: u64) -> DeviceId {
+    if vfs_device == 0 {
+        return DeviceId::default();
+    }
+
+    let mut devices = LINUX_DEVICE_IDS.lock();
+    devices.retain(|_, (_, lifetime)| lifetime.strong_count() != 0);
+    if let Some((device, _)) = devices.get(&vfs_device) {
+        return *device;
+    }
+    drop(devices);
+
+    let minor = vfs_device as u32;
+    DeviceId::new(0, if minor == 0 { u32::MAX } else { minor })
+}
+
+pub fn extra_block_device_id(index: usize) -> Option<DeviceId> {
+    let minor = index.checked_add(1)?.checked_mul(16)?;
+    Some(DeviceId::new(8, u32::try_from(minor).ok()?))
+}
+
+pub fn record(
+    source: String,
+    target: String,
+    fs_type: String,
+    root: String,
+    vfs_device: u64,
+    mount_id: u64,
+    parent_id: u64,
+    flags: u32,
+) {
+    record_with_data(
+        source,
+        target,
+        fs_type,
+        root,
+        vfs_device,
+        mount_id,
+        parent_id,
+        flags,
+        String::new(),
+    );
 }
 
 pub fn record_with_data(
     source: String,
     target: String,
     fs_type: String,
-    dev: u64,
+    root: String,
+    vfs_device: u64,
+    mount_id: u64,
+    parent_id: u64,
     flags: u32,
     data: String,
 ) {
     let mut records = MOUNT_RECORDS.lock();
     records.push(MountRecord {
+        mount_id,
+        parent_id,
+        root,
         source,
         target,
         fs_type,
         data,
-        dev,
+        dev: linux_device_id(vfs_device).0,
         flags,
         expire_marked: false,
     });
@@ -88,17 +150,13 @@ pub fn records_under(path: &str) -> Vec<MountRecord> {
         .collect()
 }
 
-pub fn remount(source: String, target: String, fs_type: String, flags: u32) {
-    remount_with_data(source, target, fs_type, flags, String::new());
-}
-
 pub fn remount_with_data(
     source: String,
     target: String,
     fs_type: String,
     flags: u32,
     data: String,
-) {
+) -> bool {
     let mut records = MOUNT_RECORDS.lock();
     if let Some(record) = records
         .iter_mut()
@@ -116,17 +174,24 @@ pub fn remount_with_data(
         }
         record.flags = flags;
         record.expire_marked = false;
-        return;
+        return true;
     }
-    records.push(MountRecord {
-        source,
-        target,
-        fs_type,
-        data,
-        dev: 0,
-        flags,
-        expire_marked: false,
-    });
+    false
+}
+
+pub fn update_flags_for_path(path: &str, flags: u32) -> bool {
+    let mut records = MOUNT_RECORDS.lock();
+    let Some((_, record)) = records
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, record)| contains_path(&record.target, path))
+        .max_by_key(|(index, record)| (record.target.len(), *index))
+    else {
+        return false;
+    };
+    record.flags = flags;
+    record.expire_marked = false;
+    true
 }
 
 pub fn change_propagation(target: &str, flags: u32, recursive: bool) {
@@ -144,11 +209,12 @@ pub fn change_propagation(target: &str, flags: u32, recursive: bool) {
     }
 }
 
-pub fn move_tree(old_target: &str, new_target: &str) {
+pub fn move_tree(old_target: &str, new_target: &str, new_parent_id: u64) {
     let mut records = MOUNT_RECORDS.lock();
     for record in records.iter_mut() {
         if record.target == old_target {
             record.target = new_target.to_string();
+            record.parent_id = new_parent_id;
             record.expire_marked = false;
         } else if let Some(suffix) = record
             .target
@@ -161,12 +227,36 @@ pub fn move_tree(old_target: &str, new_target: &str) {
     }
 }
 
-pub fn remove(target: &str) -> Option<MountRecord> {
+fn subtree_mount_ids(records: &[MountRecord], root_mount_id: u64) -> BTreeSet<u64> {
+    let mut ids = BTreeSet::new();
+    ids.insert(root_mount_id);
+
+    loop {
+        let old_len = ids.len();
+        for record in records {
+            if ids.contains(&record.parent_id) {
+                ids.insert(record.mount_id);
+            }
+        }
+        if ids.len() == old_len {
+            return ids;
+        }
+    }
+}
+
+pub fn remove_subtree(root_mount_id: u64) -> Vec<MountRecord> {
     let mut records = MOUNT_RECORDS.lock();
-    records
-        .iter()
-        .rposition(|record| record.target == target)
-        .map(|index| records.remove(index))
+    let ids = subtree_mount_ids(&records, root_mount_id);
+    let mut removed = Vec::new();
+    let mut index = 0;
+    while index < records.len() {
+        if ids.contains(&records[index].mount_id) {
+            removed.push(records.remove(index));
+        } else {
+            index += 1;
+        }
+    }
+    removed
 }
 
 pub fn mark_expiry(target: &str) -> bool {
@@ -386,4 +476,38 @@ pub fn statfs_mount_flags(path: &str, base_flags: u32) -> u32 {
         result |= ST_NOSYMFOLLOW;
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(mount_id: u64, parent_id: u64, target: &str) -> MountRecord {
+        MountRecord {
+            mount_id,
+            parent_id,
+            root: "/".to_string(),
+            source: "none".to_string(),
+            target: target.to_string(),
+            fs_type: "tmpfs".to_string(),
+            data: String::new(),
+            dev: mount_id,
+            flags: 0,
+            expire_marked: false,
+        }
+    }
+
+    #[test]
+    fn mount_subtree_uses_ids_instead_of_stacked_paths() {
+        let records = [
+            record(1, 0, "/"),
+            record(2, 1, "/mnt"),
+            record(3, 2, "/mnt"),
+            record(4, 3, "/mnt/nested"),
+            record(5, 1, "/other"),
+        ];
+
+        let ids = subtree_mount_ids(&records, 3);
+        assert_eq!(ids.into_iter().collect::<Vec<_>>(), [3, 4]);
+    }
 }

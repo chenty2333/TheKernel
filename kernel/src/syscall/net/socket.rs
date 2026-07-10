@@ -5,6 +5,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axnet::vsock::{VsockSocket, VsockStreamTransport};
 use axnet::{
     Shutdown, Socket as SocketInner, SocketAddrEx, SocketOps,
+    options::UnixCredentials,
     tcp::TcpSocket,
     udp::UdpSocket,
     unix::{DgramTransport, StreamTransport, UnixSocket},
@@ -13,27 +14,32 @@ use axtask::current;
 use linux_raw_sys::{
     general::{O_CLOEXEC, O_NONBLOCK},
     net::{
-        AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, AF_UNSPEC, AF_VSOCK, IPPROTO_DCCP,
-        IPPROTO_SCTP, IPPROTO_TCP, IPPROTO_UDP, IPPROTO_UDPLITE, SHUT_RD, SHUT_RDWR, SHUT_WR,
-        SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM, sockaddr, socklen_t,
+        AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, AF_UNSPEC, AF_VSOCK, IPPROTO_TCP,
+        IPPROTO_UDP, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET,
+        SOCK_STREAM, sockaddr, socklen_t,
     },
 };
 
 use super::addr::SocketAddrExt;
 use crate::{
     file::{
-        AfAlgSocket, FileLike, NetlinkSocket, PacketSocket, Socket, add_file_like, af_alg,
-        close_file_like, get_file_like,
+        AfAlgSocket, FileLike, NetlinkSocket, Socket, add_file_like, af_alg, close_file_like,
+        get_file_like,
     },
     mm::{UserConstPtr, UserPtr},
     task::AsThread,
 };
 
 const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
-const AF_RDS: u32 = 21;
 const SOCK_DCCP: u32 = 6;
 const SOCK_TYPE_MASK: u32 = 0xf;
 const SOCK_CLOEXEC_NONBLOCK_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
+
+fn current_unix_credentials() -> UnixCredentials {
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    UnixCredentials::new(proc_data.proc.pid(), proc_data.euid(), proc_data.egid())
+}
 
 fn require_bind_permissions(addr: &SocketAddrEx) -> AxResult<()> {
     let SocketAddrEx::Ip(ip_addr) = addr else {
@@ -76,15 +82,11 @@ fn parse_accept4_flags(flags: u32) -> AxResult<(bool, bool)> {
 }
 
 fn supported_stream_protocol(proto: u32) -> bool {
-    proto == 0 || proto == IPPROTO_TCP as u32 || proto == IPPROTO_SCTP as u32
+    proto == 0 || proto == IPPROTO_TCP as u32
 }
 
 fn supported_datagram_protocol(proto: u32) -> bool {
-    proto == 0 || proto == IPPROTO_UDP as u32 || proto == IPPROTO_UDPLITE as u32
-}
-
-fn supported_dccp_protocol(proto: u32) -> bool {
-    proto == 0 || proto == IPPROTO_DCCP as u32
+    proto == 0 || proto == IPPROTO_UDP as u32
 }
 
 fn inet_socketpair_error(ty: u32, proto: u32) -> AxError {
@@ -97,13 +99,7 @@ fn inet_socketpair_error(ty: u32, proto: u32) -> AxError {
                 AxError::from(LinuxError::EPROTONOSUPPORT)
             }
         }
-        SOCK_DCCP => {
-            if supported_dccp_protocol(proto) {
-                AxError::from(LinuxError::EOPNOTSUPP)
-            } else {
-                AxError::from(LinuxError::EPROTONOSUPPORT)
-            }
-        }
+        SOCK_DCCP => AxError::from(LinuxError::EPROTONOSUPPORT),
         SOCK_STREAM => {
             if supported_stream_protocol(proto) {
                 AxError::from(LinuxError::EOPNOTSUPP)
@@ -129,65 +125,49 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     }
 
     if domain == AF_PACKET {
-        if !matches!(ty, SOCK_RAW | SOCK_DGRAM) {
-            return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
-        }
-        let socket = PacketSocket::new(u16::from_be(proto as u16));
-        if nonblocking {
-            socket.set_nonblocking(true)?;
-        }
-        return socket.add_to_fd_table(cloexec).map(|fd| fd as isize);
+        return Err(LinuxError::EAFNOSUPPORT.into());
     }
+
+    let net_ns = current().as_thread().proc_data.net_ns.clone();
 
     if domain == AF_NETLINK {
         NetlinkSocket::validate_socket_type(ty, proto)?;
-        let socket = NetlinkSocket::new(proto);
+        let socket = NetlinkSocket::new(proto, net_ns);
         if nonblocking {
             socket.set_nonblocking(true)?;
         }
         return add_file_like(socket as _, cloexec).map(|fd| fd as isize);
     }
 
-    let pid = current().as_thread().proc_data.proc.pid();
-    let net_ns = current().as_thread().proc_data.net_ns.clone();
+    let credentials = current_unix_credentials();
     let socket = match (domain, ty) {
         (AF_INET | AF_INET6, SOCK_STREAM) => {
             if !supported_stream_protocol(proto) {
                 return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
             }
-            SocketInner::Tcp(TcpSocket::new(net_ns))
+            SocketInner::Tcp(TcpSocket::new(net_ns.clone())?)
         }
         (AF_INET | AF_INET6, SOCK_DGRAM) => {
             if !supported_datagram_protocol(proto) {
                 return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
             }
-            SocketInner::Udp(UdpSocket::new(net_ns))
+            SocketInner::Udp(UdpSocket::new(net_ns.clone())?)
         }
         (AF_INET | AF_INET6, SOCK_DCCP) => {
-            if !supported_dccp_protocol(proto) {
-                return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
-            }
-            SocketInner::Tcp(TcpSocket::new(net_ns))
+            return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
         }
         (AF_INET | AF_INET6, SOCK_RAW) => {
             return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
         }
-        (AF_RDS, SOCK_SEQPACKET) => {
-            if proto != 0 {
-                return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
-            }
-            // RDS is only exercised in OSCOMP/LTP as a local datagram transport
-            // with sockaddr_in-style names. Reuse the UDP data path so recvmsg
-            // reports the Linux-compatible address length and wakeup semantics.
-            SocketInner::Udp(UdpSocket::new(net_ns))
+        (AF_UNIX, SOCK_STREAM) => {
+            SocketInner::Unix(UnixSocket::new(StreamTransport::new(credentials)))
         }
-        (AF_UNIX, SOCK_STREAM) => SocketInner::Unix(UnixSocket::new(StreamTransport::new(pid))),
-        (AF_UNIX, SOCK_DGRAM) => SocketInner::Unix(UnixSocket::new(DgramTransport::new(pid))),
+        (AF_UNIX, SOCK_DGRAM) => SocketInner::Unix(UnixSocket::new(DgramTransport::new())),
         #[cfg(feature = "vsock")]
         (AF_VSOCK, SOCK_STREAM) => {
             SocketInner::Vsock(VsockSocket::new(VsockStreamTransport::new()))
         }
-        (AF_INET, _) | (AF_INET6, _) | (AF_UNIX, _) | (AF_VSOCK, _) | (AF_RDS, _) => {
+        (AF_INET, _) | (AF_INET6, _) | (AF_UNIX, _) | (AF_VSOCK, _) => {
             warn!("Unsupported socket type: domain: {domain}, ty: {ty}");
             return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
         }
@@ -195,7 +175,7 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
             return Err(AxError::from(LinuxError::EAFNOSUPPORT));
         }
     };
-    let socket = Socket::new(socket);
+    let socket = Socket::new(socket, net_ns);
 
     if nonblocking {
         socket.set_nonblocking(true)?;
@@ -229,10 +209,6 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
         };
         socket.bind(port_id, addr.nl_groups)?;
         return Ok(0);
-    }
-
-    if let Ok(socket) = PacketSocket::from_fd(fd) {
-        return socket.bind_raw(addr, addrlen).map(|_| 0);
     }
 
     let socket = Socket::from_fd(fd)?;
@@ -276,11 +252,9 @@ pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxRes
 pub fn sys_listen(fd: i32, backlog: i32) -> AxResult<isize> {
     debug!("sys_listen <= fd: {fd}, backlog: {backlog}");
 
-    if backlog < 0 && backlog != -1 {
-        return Err(AxError::InvalidInput);
-    }
-
-    Socket::from_fd(fd)?.listen()?;
+    // Linux treats a negative backlog as zero. The transport applies its own
+    // finite queue cap, analogous to net.core.somaxconn.
+    Socket::from_fd(fd)?.listen(backlog.max(0) as usize)?;
 
     Ok(0)
 }
@@ -315,7 +289,8 @@ pub fn sys_accept4(
     }
 
     let socket = Socket::from_fd(fd)?;
-    let socket = Socket::new(socket.accept()?);
+    let net_stack = socket.net_stack().clone();
+    let socket = Socket::new(socket.accept()?, net_stack);
     if nonblocking {
         socket.set_nonblocking(true)?;
     }
@@ -362,15 +337,18 @@ pub fn sys_socketpair(
         return Err(AxError::from(LinuxError::EAFNOSUPPORT));
     }
 
-    let pid = current().as_thread().proc_data.proc.pid();
+    let credentials = current_unix_credentials();
     let (sock1, sock2) = match ty {
         SOCK_STREAM => {
-            let (sock1, sock2) = StreamTransport::new_pair(pid);
+            let (sock1, sock2) = StreamTransport::new_pair(credentials);
             (UnixSocket::new(sock1), UnixSocket::new(sock2))
         }
-        SOCK_DGRAM | SOCK_SEQPACKET => {
-            let (sock1, sock2) = DgramTransport::new_pair(pid);
+        SOCK_DGRAM => {
+            let (sock1, sock2) = DgramTransport::new_pair(credentials);
             (UnixSocket::new(sock1), UnixSocket::new(sock2))
+        }
+        SOCK_SEQPACKET => {
+            return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
         }
         SOCK_RAW => {
             return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
@@ -380,8 +358,9 @@ pub fn sys_socketpair(
             return Err(AxError::InvalidInput);
         }
     };
-    let sock1 = Socket::new(SocketInner::Unix(sock1));
-    let sock2 = Socket::new(SocketInner::Unix(sock2));
+    let net_stack = current().as_thread().proc_data.net_ns.clone();
+    let sock1 = Socket::new(SocketInner::Unix(sock1), net_stack.clone());
+    let sock2 = Socket::new(SocketInner::Unix(sock2), net_stack);
 
     if nonblocking {
         sock1.set_nonblocking(true)?;

@@ -26,7 +26,7 @@ use spin::Mutex;
 
 use crate::{
     file::{
-        Directory, File, FileLike, IoDst, IoSrc, PidFd, add_file_like,
+        Directory, File, FileLike, IoDst, IoSrc, Kstat, PidFd, add_file_like,
         inotify::{WatchKey, location_for_fd},
     },
     task::{AsThread, get_process_data},
@@ -419,6 +419,10 @@ impl FanotifyFile {
 }
 
 impl FileLike for FanotifyFile {
+    fn stat(&self) -> AxResult<Kstat> {
+        Ok(super::anon_inode_stat())
+    }
+
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
         block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
             let mut state = self.state.lock();
@@ -613,7 +617,7 @@ fn validate_mark_target(group_flags: u32, flags: u32, mask: u64, loc: &Location)
 fn mark_scope(flags: u32, loc: &Location) -> AxResult<FanotifyScope> {
     let meta = loc.metadata()?;
     if flags & FAN_MARK_MOUNT != 0 {
-        Ok(FanotifyScope::Mount(meta.device))
+        Ok(FanotifyScope::Mount(loc.mountpoint().mount_id()))
     } else if flags & FAN_MARK_FILESYSTEM != 0 {
         Ok(FanotifyScope::Filesystem(meta.device))
     } else {
@@ -767,6 +771,7 @@ fn fanotify_event_pidfd(pid: c_int) -> c_int {
 fn fanotify_mark_matches(
     mark: &FanotifyMark,
     event_key: WatchKey,
+    event_mount_id: u64,
     watch_key: WatchKey,
     is_dir: bool,
     parent_event: bool,
@@ -774,15 +779,16 @@ fn fanotify_mark_matches(
     let matched = if parent_event {
         mark.key == watch_key && mark.is_dir && mark.mask & FAN_EVENT_ON_CHILD != 0
     } else {
-        mark.key == event_key || scope_matches(mark.scope, event_key)
+        mark.key == event_key || scope_matches(mark.scope, event_key, event_mount_id)
     };
     matched && (!is_dir || mark.mask & FAN_ONDIR != 0 || parent_event)
 }
 
-fn scope_matches(scope: FanotifyScope, key: WatchKey) -> bool {
+fn scope_matches(scope: FanotifyScope, key: WatchKey, mount_id: u64) -> bool {
     match scope {
         FanotifyScope::Inode => false,
-        FanotifyScope::Mount(dev) | FanotifyScope::Filesystem(dev) => dev == key.dev,
+        FanotifyScope::Mount(mark_mount_id) => mark_mount_id == mount_id,
+        FanotifyScope::Filesystem(dev) => dev == key.dev,
     }
 }
 
@@ -857,6 +863,7 @@ pub(crate) fn permission_check(
     parent_event: bool,
 ) -> AxResult<()> {
     let event_key = WatchKey::from_location(event_loc)?;
+    let event_mount_id = event_loc.mountpoint().mount_id();
     let watch_key = WatchKey::from_location(watch_loc)?;
     let mut waits = Vec::new();
 
@@ -866,8 +873,14 @@ pub(crate) fn permission_check(
             continue;
         }
         let should_queue = state.marks.clone().into_iter().any(|mark| {
-            fanotify_mark_matches(&mark, event_key, watch_key, is_dir, parent_event)
-                && mask & mark.mask != 0
+            fanotify_mark_matches(
+                &mark,
+                event_key,
+                event_mount_id,
+                watch_key,
+                is_dir,
+                parent_event,
+            ) && mask & mark.mask != 0
                 && mark.ignored_mask & mask == 0
         });
         if should_queue {
@@ -912,6 +925,7 @@ pub(crate) fn notify(
     let Ok(event_key) = WatchKey::from_location(event_loc) else {
         return;
     };
+    let event_mount_id = event_loc.mountpoint().mount_id();
     let Ok(watch_key) = WatchKey::from_location(watch_loc) else {
         return;
     };
@@ -922,7 +936,14 @@ pub(crate) fn notify(
         }
         let mut wake = false;
         for mark in state.marks.clone() {
-            if !fanotify_mark_matches(&mark, event_key, watch_key, is_dir, parent_event) {
+            if !fanotify_mark_matches(
+                &mark,
+                event_key,
+                event_mount_id,
+                watch_key,
+                is_dir,
+                parent_event,
+            ) {
                 continue;
             }
             let event_mask = mask & mark.mask & !FAN_EVENT_ON_CHILD;

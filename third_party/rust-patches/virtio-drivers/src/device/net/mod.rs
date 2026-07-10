@@ -6,13 +6,13 @@ mod dev_raw;
 #[cfg(feature = "alloc")]
 mod net_buf;
 
+use bitflags::bitflags;
+use zerocopy::{AsBytes, FromBytes, FromZeroes};
+
 pub use self::dev_raw::VirtIONetRaw;
 #[cfg(feature = "alloc")]
 pub use self::{dev::VirtIONet, net_buf::RxBuffer, net_buf::TxBuffer};
-
 use crate::volatile::ReadOnly;
-use bitflags::bitflags;
-use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 const MAX_BUFFER_LEN: usize = 65535;
 const MIN_BUFFER_LEN: usize = 1526;

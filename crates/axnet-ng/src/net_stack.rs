@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicI32, Ordering};
 
 use axerrno::{AxResult, ax_bail, ax_err_type};
@@ -10,9 +10,9 @@ use smoltcp::{
 };
 
 use crate::{
-    device::{Device, LoopbackDevice},
+    device::{Device, DeviceStats, InterfaceInfo, LoopbackDevice},
     listen_table::ListenTable,
-    router::{Router, Rule},
+    router::{RouteInfo, Router, Rule},
     service::Service,
     wrapper::{SocketSetWrapper, Transport},
 };
@@ -131,6 +131,21 @@ impl NetStack {
         while self.service.lock().poll(&mut self.socket_set.inner.lock()) {}
     }
 
+    /// Snapshot per-interface packet and byte counters for this namespace.
+    pub fn device_stats(&self) -> Vec<(String, DeviceStats)> {
+        self.service.lock().router.device_stats()
+    }
+
+    /// Snapshot the interfaces currently owned by this network stack.
+    pub fn interfaces(&self) -> Vec<InterfaceInfo> {
+        self.service.lock().router.interfaces()
+    }
+
+    /// Snapshot the routes currently used by this network stack.
+    pub fn routes(&self) -> Vec<RouteInfo> {
+        self.service.lock().router.routes()
+    }
+
     /// Return the Linux-compatible IPv4 interface `tag` sysctl value.
     pub fn ipv4_conf_tag(&self, iface: &str) -> Option<i32> {
         match iface {
@@ -206,5 +221,27 @@ impl NetStack {
             tries += 1;
         }
         ax_bail!(AddrInUse, "no available ports");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::InterfaceKind;
+
+    #[test]
+    fn loopback_stack_reports_real_interface_and_routes() {
+        let stack = NetStack::new_loopback_only();
+        let interfaces = stack.interfaces();
+        assert_eq!(interfaces.len(), 1);
+        assert_eq!(interfaces[0].index, 1);
+        assert_eq!(interfaces[0].name, "lo");
+        assert_eq!(interfaces[0].kind, InterfaceKind::Loopback);
+        assert_eq!(interfaces[0].addresses.len(), 2);
+
+        let routes = stack.routes();
+        assert_eq!(routes.len(), 2);
+        assert!(routes.iter().all(|route| route.interface_index == 1));
+        assert!(routes.iter().all(|route| route.gateway.is_none()));
     }
 }

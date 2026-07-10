@@ -1,6 +1,5 @@
 use alloc::{
     borrow::Cow,
-    collections::BTreeMap,
     string::{String, ToString},
     sync::Arc,
 };
@@ -11,10 +10,13 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{
-    FS_CONTEXT, FileFlags, OpenBlockDeviceError, block_device_is_read_only, block_device_names,
-    new_block_filesystem, open_block_device,
+    FS_CONTEXT, FatMountOptions, FileFlags, OpenBlockDeviceError, block_device_is_read_only,
+    block_device_names, new_block_filesystem, new_block_filesystem_with_fat_options,
+    open_block_device,
 };
-use axfs_ng_vfs::{DirEntry, Filesystem, FilesystemOps, NodeType, StatFs, VfsResult};
+use axfs_ng_vfs::{
+    DirEntry, Filesystem, FilesystemOps, NodePermission, NodeType, StatFs, VfsResult,
+};
 use axpoll::{IoEvents, Pollable};
 use axtask::current;
 use linux_raw_sys::general::{
@@ -26,8 +28,7 @@ use starry_vm::VmPtr;
 
 use crate::{
     file::{
-        Directory, FD_TABLE, File, FileLike, get_file_like, inotify::notify_unmount_device,
-        resolve_at,
+        FD_TABLE, File, FileLike, Kstat, get_file_like, inotify::notify_unmount_device, resolve_at,
     },
     mm::vm_load_string,
     mounts,
@@ -36,12 +37,6 @@ use crate::{
 };
 
 const FSOPEN_CLOEXEC: u32 = 0x00000001;
-const FSPICK_CLOEXEC: u32 = 0x00000001;
-const FSPICK_SYMLINK_NOFOLLOW: u32 = 0x00000002;
-const FSPICK_NO_AUTOMOUNT: u32 = 0x00000004;
-const FSPICK_EMPTY_PATH: u32 = 0x00000008;
-const FSPICK__MASK: u32 =
-    FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW | FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH;
 const FSCONFIG_SET_FLAG: u32 = 0;
 const FSCONFIG_SET_STRING: u32 = 1;
 const FSCONFIG_SET_BINARY: u32 = 2;
@@ -78,10 +73,6 @@ const OPEN_TREE__MASK: u32 = OPEN_TREE_CLONE
     | AT_NO_AUTOMOUNT
     | AT_RECURSIVE
     | AT_SYMLINK_NOFOLLOW;
-const BASIC_COMPAT_VFAT_SOURCE: &str = "/dev/vda2";
-const BASIC_COMPAT_MOUNT_TARGET: &str = "./mnt";
-const BASIC_COMPAT_MUSL_MOUNT_TARGET: &str = "/musl/basic/mnt";
-const BASIC_COMPAT_GLIBC_MOUNT_TARGET: &str = "/glibc/basic/mnt";
 const MS_RDONLY: u32 = 0x1;
 const MS_NOSUID: u32 = 0x2;
 const MS_NODEV: u32 = 0x4;
@@ -123,12 +114,10 @@ const MOUNT_SETATTR_FLAGS: u32 =
 const MOUNT_ATTR_SIZE_VER0: usize = core::mem::size_of::<mount_attr>();
 const PAGE_SIZE: usize = 4096;
 
-static DEVICE_TMPFS_MOUNTS: Mutex<BTreeMap<(String, String), Filesystem>> =
-    Mutex::new(BTreeMap::new());
-
 struct FsOpenState {
     fs_type: String,
     source: Option<String>,
+    data: String,
     config_len: usize,
     created: bool,
 }
@@ -136,6 +125,10 @@ struct FsOpenState {
 struct FsOpenFd(Mutex<FsOpenState>);
 
 impl FileLike for FsOpenFd {
+    fn stat(&self) -> AxResult<Kstat> {
+        Ok(crate::file::anon_inode_stat())
+    }
+
     fn path(&self) -> Cow<'_, str> {
         "anon_inode:[fsopen]".into()
     }
@@ -163,8 +156,8 @@ struct BindFilesystem {
 }
 
 impl BindFilesystem {
-    fn new(root: DirEntry, name: String) -> Filesystem {
-        Filesystem::new(Arc::new(Self { root, name }))
+    fn new(root: DirEntry, name: String, device: u64) -> Filesystem {
+        Filesystem::new_with_device(Arc::new(Self { root, name }), device)
     }
 }
 
@@ -252,46 +245,11 @@ fn apply_mount_attr_flags(current: u32, attr: mount_attr) -> AxResult<u32> {
     Ok(next)
 }
 
-fn is_basic_compat_vfat_mount(source: &str, target: &str, fs_type: &str) -> bool {
-    source == BASIC_COMPAT_VFAT_SOURCE
-        && fs_type.starts_with("vfat")
-        && matches!(
-            target,
-            BASIC_COMPAT_MOUNT_TARGET
-                | BASIC_COMPAT_MUSL_MOUNT_TARGET
-                | BASIC_COMPAT_GLIBC_MOUNT_TARGET
-        )
-}
-
-fn is_basic_compat_vfat_umount(target: &str) -> bool {
-    matches!(
-        target,
-        BASIC_COMPAT_MOUNT_TARGET
-            | BASIC_COMPAT_MUSL_MOUNT_TARGET
-            | BASIC_COMPAT_GLIBC_MOUNT_TARGET
-    )
-}
-
 fn current_has_capability(cap: u32) -> bool {
     current()
         .as_thread()
         .proc_data
         .has_effective_capability(cap)
-}
-
-fn current_fd_busy_on_mount(target: &axfs_ng_vfs::Location) -> bool {
-    let mountpoint = target.mountpoint().clone();
-    let table = FD_TABLE.read();
-    table.ids().any(|fd| {
-        table.get(fd).is_some_and(|entry| {
-            let file = &entry.description.inner;
-            file.downcast_ref::<File>()
-                .is_some_and(|file| Arc::ptr_eq(file.inner().location().mountpoint(), &mountpoint))
-                || file
-                    .downcast_ref::<Directory>()
-                    .is_some_and(|dir| Arc::ptr_eq(dir.inner().mountpoint(), &mountpoint))
-        })
-    })
 }
 
 fn current_write_fd_on_mount(target: &axfs_ng_vfs::Location) -> bool {
@@ -338,18 +296,83 @@ fn parse_tmpfs_size(data: &str) -> Option<u64> {
     })
 }
 
-fn tmpfs_for_mount(source: &str, target_path: &str, data: &str) -> Filesystem {
-    let capacity = parse_tmpfs_size(data);
-    if !source.starts_with("/dev/") {
-        return MemoryFs::new_with_capacity(capacity);
+fn parse_fat_mask(value: &str) -> Option<u16> {
+    let value = value.strip_prefix("0o").unwrap_or(value);
+    u16::from_str_radix(value, 8)
+        .ok()
+        .filter(|mask| *mask & !0o777 == 0)
+}
+
+fn parse_fat_mount_options(data: &str) -> AxResult<FatMountOptions> {
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    parse_fat_mount_options_with_defaults(
+        data,
+        proc_data.fsuid(),
+        proc_data.fsgid(),
+        proc_data.umask() as u16,
+    )
+}
+
+fn parse_fat_mount_options_with_defaults(
+    data: &str,
+    mut uid: u32,
+    mut gid: u32,
+    umask: u16,
+) -> AxResult<FatMountOptions> {
+    let mut file_mask = umask & 0o777;
+    let mut dir_mask = file_mask;
+
+    for raw in data.split(',') {
+        let option = raw.trim();
+        if option.is_empty()
+            || matches!(
+                option,
+                "rw" | "ro"
+                    | "suid"
+                    | "nosuid"
+                    | "dev"
+                    | "nodev"
+                    | "exec"
+                    | "noexec"
+                    | "atime"
+                    | "noatime"
+                    | "diratime"
+                    | "nodiratime"
+                    | "relatime"
+                    | "strictatime"
+            )
+        {
+            continue;
+        }
+
+        let Some((key, value)) = option.split_once('=') else {
+            return Err(AxError::OperationNotSupported);
+        };
+        match key {
+            "uid" => uid = value.parse().map_err(|_| AxError::InvalidInput)?,
+            "gid" => gid = value.parse().map_err(|_| AxError::InvalidInput)?,
+            "umask" => {
+                let mask = parse_fat_mask(value).ok_or(AxError::InvalidInput)?;
+                file_mask = mask;
+                dir_mask = mask;
+            }
+            "fmask" => file_mask = parse_fat_mask(value).ok_or(AxError::InvalidInput)?,
+            "dmask" => dir_mask = parse_fat_mask(value).ok_or(AxError::InvalidInput)?,
+            _ => return Err(AxError::OperationNotSupported),
+        }
     }
 
-    let key = (source.to_string(), target_path.to_string());
-    DEVICE_TMPFS_MOUNTS
-        .lock()
-        .entry(key)
-        .or_insert_with(|| MemoryFs::new_with_capacity(capacity))
-        .clone()
+    Ok(FatMountOptions {
+        uid,
+        gid,
+        file_mode: NodePermission::from_bits_truncate(0o777 & !file_mask),
+        dir_mode: NodePermission::from_bits_truncate(0o777 & !dir_mask),
+    })
+}
+
+fn tmpfs_for_mount(data: &str) -> Filesystem {
+    MemoryFs::new_with_capacity(parse_tmpfs_size(data))
 }
 
 fn joined_mount_path(base: &str, suffix: &str) -> String {
@@ -405,7 +428,11 @@ fn bind_mount_flags(source_path: &str, target_path: &str, requested: u32) -> u32
 }
 
 fn bind_filesystem_for(loc: &axfs_ng_vfs::Location, fs_type: &str) -> Filesystem {
-    BindFilesystem::new(loc.entry().clone(), fs_type.to_string())
+    BindFilesystem::new(
+        loc.entry().clone(),
+        fs_type.to_string(),
+        loc.mountpoint().device(),
+    )
 }
 
 fn propagate_shared_bind_mount(
@@ -429,13 +456,20 @@ fn propagate_shared_bind_mount(
         }
 
         let fs = bind_filesystem_for(source_loc, fs_type);
+        let parent_id = alias_target.mountpoint().mount_id();
         let mountpoint = alias_target.mount(&fs)?;
         let alias_flags = bind_mount_flags(source_path, &alias, mount_flags);
         mounts::record(
             source_path.to_string(),
             alias,
             fs_type.to_string(),
+            source_loc
+                .path_in_mount()
+                .map_err(|_| AxError::InvalidInput)?
+                .to_string(),
             mountpoint.device(),
+            mountpoint.mount_id(),
+            parent_id,
             alias_flags,
         );
     }
@@ -466,13 +500,20 @@ fn do_bind_mount(
         .to_string();
     let fs_type = source_loc.filesystem().name().to_string();
     let fs = bind_filesystem_for(&source_loc, &fs_type);
+    let parent_id = target.mountpoint().mount_id();
     let mountpoint = target.mount(&fs)?;
     let mount_flags = bind_mount_flags(&source_path, target_path, flags);
     mounts::record(
         source_path.clone(),
         target_path.to_string(),
         fs_type.clone(),
+        source_loc
+            .path_in_mount()
+            .map_err(|_| AxError::InvalidInput)?
+            .to_string(),
         mountpoint.device(),
+        mountpoint.mount_id(),
+        parent_id,
         mount_flags,
     );
     propagate_shared_bind_mount(
@@ -503,6 +544,7 @@ fn do_bind_mount(
             continue;
         }
         let child_fs = bind_filesystem_for(&child_source, &record.fs_type);
+        let child_parent_id = child_target.mountpoint().mount_id();
         let child_mountpoint = child_target.mount(&child_fs)?;
         let child_flags = bind_mount_flags(
             &record.target,
@@ -513,7 +555,13 @@ fn do_bind_mount(
             record.source.clone(),
             child_target_path.clone(),
             record.fs_type.clone(),
+            child_source
+                .path_in_mount()
+                .map_err(|_| AxError::InvalidInput)?
+                .to_string(),
             child_mountpoint.device(),
+            child_mountpoint.mount_id(),
+            child_parent_id,
             child_flags,
             record.data.clone(),
         );
@@ -546,28 +594,28 @@ fn do_move_mount_old(
         .absolute_path()
         .map_err(|_| AxError::InvalidInput)?
         .to_string();
+    let new_parent_id = target.mountpoint().mount_id();
     old.move_mount_to(target)?;
-    mounts::move_tree(&old_path, target_path);
+    mounts::move_tree(&old_path, target_path, new_parent_id);
     Ok(())
 }
 
-fn pseudo_fs_for_mount(
-    source: &str,
-    target_path: &str,
-    fs_type: &str,
-    data: &str,
-) -> Option<Filesystem> {
-    match fs_type {
-        "tmpfs" => Some(tmpfs_for_mount(source, target_path, data)),
+fn pseudo_fs_for_mount(source: &str, fs_type: &str, data: &str) -> AxResult<Option<Filesystem>> {
+    Ok(match fs_type {
+        "tmpfs" => Some(tmpfs_for_mount(data)),
         "cgroup" => Some(cgroup::new_cgroup_v1(cgroup::parse_v1_controllers(
             source, data,
-        ))),
+        )?)),
         "cgroup2" => Some(cgroup::new_cgroup_v2()),
         _ => None,
-    }
+    })
 }
 
 impl FileLike for FsMountFd {
+    fn stat(&self) -> AxResult<Kstat> {
+        Ok(crate::file::anon_inode_stat())
+    }
+
     fn path(&self) -> Cow<'_, str> {
         "anon_inode:[fsmount]".into()
     }
@@ -588,13 +636,17 @@ pub fn sys_fsopen(fs_name: *const c_char, flags: u32) -> AxResult<isize> {
     if flags & !FSOPEN_CLOEXEC != 0 {
         return Err(AxError::InvalidInput);
     }
-    if fs_name == "invalid" {
+    if !current_has_capability(CAP_SYS_ADMIN) {
+        return Err(LinuxError::EPERM.into());
+    }
+    if !matches!(fs_name.as_str(), "tmpfs" | "cgroup" | "cgroup2") {
         return Err(AxError::NoSuchDevice);
     }
 
     FsOpenFd(Mutex::new(FsOpenState {
         fs_type: fs_name,
         source: None,
+        data: String::new(),
         config_len: 0,
         created: false,
     }))
@@ -656,16 +708,22 @@ pub fn sys_fsconfig(
         .ok_or(AxError::InvalidInput)?;
     let mut state = fsopen.0.lock();
 
+    if state.created
+        && matches!(
+            cmd,
+            FSCONFIG_SET_FLAG
+                | FSCONFIG_SET_STRING
+                | FSCONFIG_SET_BINARY
+                | FSCONFIG_SET_PATH
+                | FSCONFIG_SET_PATH_EMPTY
+                | FSCONFIG_SET_FD
+        )
+    {
+        return Err(AxError::ResourceBusy);
+    }
+
     match cmd {
-        FSCONFIG_SET_FLAG => {
-            let key = vm_load_string(key)?;
-            let entry_len = key.len() + 2;
-            if state.config_len.saturating_add(entry_len) > 4096 {
-                return Err(AxError::InvalidInput);
-            }
-            state.config_len += entry_len;
-            Ok(0)
-        }
+        FSCONFIG_SET_FLAG => Err(AxError::OperationNotSupported),
         FSCONFIG_SET_STRING => {
             let key = vm_load_string(key)?;
             let value = vm_load_string(value as *const c_char)?;
@@ -673,20 +731,30 @@ pub fn sys_fsconfig(
             if state.config_len.saturating_add(entry_len) > 4096 {
                 return Err(AxError::InvalidInput);
             }
-            state.config_len += entry_len;
-            if key == "source" {
-                state.source = Some(value);
+            match (state.fs_type.as_str(), key.as_str()) {
+                (_, "source") => state.source = Some(value),
+                ("tmpfs", "size") => {
+                    if parse_tmpfs_size_component(&value).is_none() {
+                        return Err(AxError::InvalidInput);
+                    }
+                    state.data = alloc::format!("size={value}");
+                }
+                _ => return Err(AxError::OperationNotSupported),
             }
+            state.config_len += entry_len;
             Ok(0)
         }
         FSCONFIG_SET_BINARY | FSCONFIG_SET_PATH | FSCONFIG_SET_PATH_EMPTY | FSCONFIG_SET_FD => {
             Err(AxError::OperationNotSupported)
         }
         FSCONFIG_CMD_CREATE | FSCONFIG_CMD_CREATE_EXCL => {
+            if state.created {
+                return Err(AxError::ResourceBusy);
+            }
             state.created = true;
             Ok(0)
         }
-        FSCONFIG_CMD_RECONFIGURE => Ok(0),
+        FSCONFIG_CMD_RECONFIGURE => Err(AxError::OperationNotSupported),
         _ => return Err(LinuxError::EINVAL.into()),
     }
 }
@@ -694,6 +762,9 @@ pub fn sys_fsconfig(
 pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
     if fd < 0 {
         return Err(AxError::BadFileDescriptor);
+    }
+    if !current_has_capability(CAP_SYS_ADMIN) {
+        return Err(LinuxError::EPERM.into());
     }
 
     let file = get_file_like(fd)?;
@@ -709,12 +780,11 @@ pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
     if !state.created {
         return Err(AxError::InvalidInput);
     }
-    let _ = &state.fs_type;
-    let _ = &state.source;
-
     let source = state.source.clone().unwrap_or_else(|| "none".into());
+    let fs =
+        pseudo_fs_for_mount(&source, &state.fs_type, &state.data)?.ok_or(AxError::NoSuchDevice)?;
     FsMountFd {
-        fs: pseudo_fs_for_mount(&source, "", &state.fs_type, "").unwrap_or_else(MemoryFs::new),
+        fs,
         source,
         fs_type: state.fs_type.clone(),
         flags: Mutex::new(mount_attr_to_mount_flags(mount_attrs)),
@@ -724,31 +794,8 @@ pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
     .map(|new_fd| new_fd as isize)
 }
 
-pub fn sys_fspick(dirfd: i32, pathname: *const c_char, flags: u32) -> AxResult<isize> {
-    let path = vm_load_string(pathname)?;
-    debug!("sys_fspick <= dirfd: {dirfd}, path: {path:?}, flags: {flags:#x}");
-
-    if flags & !FSPICK__MASK != 0 {
-        return Err(AxError::InvalidInput);
-    }
-
-    let resolve_flags = if flags & FSPICK_EMPTY_PATH != 0 {
-        AT_EMPTY_PATH
-    } else {
-        0
-    };
-    let loc = resolve_at(dirfd, Some(&path), resolve_flags)?.into_file();
-    let loc = loc.ok_or(AxError::InvalidInput)?;
-    loc.check_is_dir()?;
-
-    FsOpenFd(Mutex::new(FsOpenState {
-        fs_type: loc.filesystem().name().to_string(),
-        source: loc.absolute_path().ok().map(|path| path.to_string()),
-        config_len: 0,
-        created: true,
-    }))
-    .add_to_fd_table(flags & FSPICK_CLOEXEC != 0)
-    .map(|fd| fd as isize)
+pub fn sys_fspick(_dirfd: i32, _pathname: *const c_char, _flags: u32) -> AxResult<isize> {
+    Err(AxError::OperationNotSupported)
 }
 
 pub fn sys_open_tree(dirfd: i32, pathname: *const c_char, flags: u32) -> AxResult<isize> {
@@ -763,6 +810,9 @@ pub fn sys_open_tree(dirfd: i32, pathname: *const c_char, flags: u32) -> AxResul
     }
     if flags & OPEN_TREE_CLONE == 0 {
         return Err(AxError::InvalidInput);
+    }
+    if !current_has_capability(CAP_SYS_ADMIN) {
+        return Err(LinuxError::EPERM.into());
     }
 
     let loc = resolve_at(dirfd, Some(&path), flags)?
@@ -809,6 +859,9 @@ pub fn sys_mount_setattr(
     if size < MOUNT_ATTR_SIZE_VER0 {
         return Err(AxError::InvalidInput);
     }
+    if !current_has_capability(CAP_SYS_ADMIN) {
+        return Err(LinuxError::EPERM.into());
+    }
 
     let attr = unsafe { attr.vm_read_uninit()?.assume_init() };
     if attr.attr_set == 0 && attr.attr_clr == 0 && attr.propagation == 0 {
@@ -830,12 +883,9 @@ pub fn sys_mount_setattr(
         .ok_or(AxError::InvalidInput)?;
     let path = loc.absolute_path().map_err(|_| AxError::InvalidInput)?;
     let current = mounts::effective_flags(path.as_ref());
-    mounts::remount(
-        String::new(),
-        path.to_string(),
-        String::new(),
-        apply_mount_attr_flags(current, attr)?,
-    );
+    if !mounts::update_flags_for_path(path.as_ref(), apply_mount_attr_flags(current, attr)?) {
+        return Err(AxError::InvalidInput);
+    }
     Ok(0)
 }
 
@@ -856,6 +906,9 @@ pub fn sys_move_mount(
     if flags & !MOVE_MOUNT__MASK != 0 {
         return Err(AxError::InvalidInput);
     }
+    if !current_has_capability(CAP_SYS_ADMIN) {
+        return Err(LinuxError::EPERM.into());
+    }
     if flags & MOVE_MOUNT_F_EMPTY_PATH == 0 || !from_path.is_empty() {
         return Err(AxError::NotFound);
     }
@@ -869,6 +922,7 @@ pub fn sys_move_mount(
     if mount_fd.attached.swap(true, Ordering::AcqRel) {
         return Err(AxError::ResourceBusy);
     }
+    let parent_id = target.mountpoint().mount_id();
     let mountpoint = target.mount(&mount_fd.fs)?;
     let target_path = target
         .absolute_path()
@@ -878,7 +932,10 @@ pub fn sys_move_mount(
         mount_fd.source.clone(),
         target_path,
         mount_fd.fs_type.clone(),
+        "/".to_string(),
         mountpoint.device(),
+        mountpoint.mount_id(),
+        parent_id,
         *mount_fd.flags.lock(),
     );
     Ok(0)
@@ -907,13 +964,6 @@ pub fn sys_mount(
     if !current_has_capability(CAP_SYS_ADMIN) {
         return Err(AxError::from(LinuxError::EPERM));
     }
-    if is_basic_compat_vfat_mount(&source, &target, &fs_type) {
-        // The basic mount/umount testcase only verifies syscall success for a
-        // synthetic `/dev/vda2` vfat mountpoint. Avoid touching the live VFS
-        // state until that path is backed by a real partition node.
-        return Ok(0);
-    }
-
     let target = FS_CONTEXT.lock().resolve(&target)?;
     let target_path = target
         .absolute_path()
@@ -925,7 +975,8 @@ pub fn sys_mount(
     } else {
         fs_type.as_str()
     };
-    let data = if matches!(normalized_fs, "tmpfs" | "cgroup" | "cgroup2") && !data.is_null() {
+    let data_is_ignored = flags_u32 & (MS_BIND | MS_MOVE | MS_PROPAGATION_FLAGS) != 0;
+    let data = if !data_is_ignored && !data.is_null() {
         vm_load_string(data as *const c_char)?
     } else {
         String::new()
@@ -938,13 +989,18 @@ pub fn sys_mount(
         if flags_u32 & MS_RDONLY != 0 && current_write_fd_on_mount(&target) {
             return Err(AxError::from(LinuxError::EBUSY));
         }
-        mounts::remount_with_data(
+        if !data.is_empty() {
+            return Err(AxError::OperationNotSupported);
+        }
+        if !mounts::remount_with_data(
             source,
             target_path,
             normalized_fs.to_string(),
             flags_u32,
             data,
-        );
+        ) {
+            return Err(AxError::InvalidInput);
+        }
         return Ok(0);
     }
 
@@ -971,18 +1027,36 @@ pub fn sys_mount(
         return Err(AxError::InvalidInput);
     }
 
-    let fs = if let Some(fs) = pseudo_fs_for_mount(&source, &target_path, normalized_fs, &data) {
-        fs
+    let (fs, linux_device) = if let Some(fs) = pseudo_fs_for_mount(&source, normalized_fs, &data)? {
+        (fs, None)
     } else if let Some(dev_name) = source.strip_prefix("/dev/") {
         let device_names = block_device_names();
         debug!("sys_mount: available extra block devices = {device_names:?}");
+        let device_index = device_names
+            .iter()
+            .position(|name| name == dev_name)
+            .ok_or(AxError::NoSuchDevice)?;
+        let linux_device =
+            mounts::extra_block_device_id(device_index).ok_or(AxError::InvalidInput)?;
         if block_device_is_read_only(dev_name).unwrap_or(false) && flags as u32 & MS_RDONLY == 0 {
             return Err(AxError::PermissionDenied);
         }
         match open_block_device(dev_name) {
             Ok(dev) => {
                 debug!("sys_mount: opening block device {dev_name}");
-                new_block_filesystem(normalized_fs, dev)?
+                let fs = if normalized_fs == "vfat" {
+                    new_block_filesystem_with_fat_options(
+                        normalized_fs,
+                        dev,
+                        parse_fat_mount_options(&data)?,
+                    )?
+                } else {
+                    if !data.is_empty() {
+                        return Err(AxError::OperationNotSupported);
+                    }
+                    new_block_filesystem(normalized_fs, dev)?
+                };
+                (fs, Some(linux_device))
             }
             Err(OpenBlockDeviceError::NotFound) => {
                 debug!("sys_mount: no such block device {dev_name}");
@@ -1004,7 +1078,15 @@ pub fn sys_mount(
         return Err(AxError::NoSuchDevice);
     };
 
+    let parent_id = target.mountpoint().mount_id();
     let mountpoint = target.mount(&fs)?;
+    if let Some(linux_device) = linux_device {
+        mounts::register_linux_device(
+            mountpoint.device(),
+            linux_device,
+            mountpoint.filesystem_lifetime(),
+        );
+    }
     let record_data = if normalized_fs == "cgroup" && data.is_empty() {
         match source.as_str() {
             "none" | "cgroup" => String::new(),
@@ -1017,7 +1099,10 @@ pub fn sys_mount(
         source,
         target_path,
         normalized_fs.to_string(),
+        "/".to_string(),
         mountpoint.device(),
+        mountpoint.mount_id(),
+        parent_id,
         flags_u32,
         record_data,
     );
@@ -1034,11 +1119,11 @@ pub fn sys_umount2(target: *const c_char, flags: i32) -> AxResult<isize> {
     if !current_has_capability(CAP_SYS_ADMIN) {
         return Err(AxError::from(LinuxError::EPERM));
     }
-    if is_basic_compat_vfat_umount(&target) {
-        return Ok(0);
-    }
     if flags & MNT_EXPIRE != 0 && flags & (MNT_FORCE | MNT_DETACH) != 0 {
         return Err(AxError::InvalidInput);
+    }
+    if flags & MNT_FORCE != 0 {
+        return Err(AxError::OperationNotSupported);
     }
 
     let target = if flags & UMOUNT_NOFOLLOW != 0 {
@@ -1049,22 +1134,63 @@ pub fn sys_umount2(target: *const c_char, flags: i32) -> AxResult<isize> {
     if !target.is_root_of_mount() {
         return Err(AxError::InvalidInput);
     }
-    if flags & MNT_EXPIRE != 0 && target.is_root() {
-        return Err(AxError::InvalidInput);
+    if target.is_root() {
+        return Err(AxError::from(LinuxError::EBUSY));
     }
     let target_path = target
         .absolute_path()
         .map_err(|_| AxError::InvalidInput)?
         .to_string();
-    if flags & MNT_DETACH == 0 && current_fd_busy_on_mount(&target) {
-        return Err(AxError::from(LinuxError::EBUSY));
-    }
     if flags & MNT_EXPIRE != 0 && !mounts::mark_expiry(&target_path) {
         return Err(AxError::from(LinuxError::EAGAIN));
     }
-    let unmount_dev = target.metadata()?.device;
-    target.unmount()?;
-    notify_unmount_device(unmount_dev);
-    let _ = mounts::remove(&target_path);
+    let mount_id = target.mountpoint().mount_id();
+    let unmount_devices = target.mountpoint().subtree_devices();
+    if flags & MNT_DETACH != 0 {
+        target.lazy_unmount()?;
+    } else {
+        target.unmount()?;
+    }
+    mounts::remove_subtree(mount_id);
+    for device in unmount_devices {
+        notify_unmount_device(device);
+    }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fat_mount_defaults_follow_mounting_process_identity_and_umask() {
+        let options = parse_fat_mount_options_with_defaults("", 1000, 100, 0o022).unwrap();
+        assert_eq!(options.uid, 1000);
+        assert_eq!(options.gid, 100);
+        assert_eq!(options.file_mode.bits(), 0o755);
+        assert_eq!(options.dir_mode.bits(), 0o755);
+    }
+
+    #[test]
+    fn fat_mount_masks_are_parsed_independently() {
+        let options =
+            parse_fat_mount_options_with_defaults("uid=42,gid=7,fmask=0133,dmask=0027", 0, 0, 0)
+                .unwrap();
+        assert_eq!(options.uid, 42);
+        assert_eq!(options.gid, 7);
+        assert_eq!(options.file_mode.bits(), 0o644);
+        assert_eq!(options.dir_mode.bits(), 0o750);
+    }
+
+    #[test]
+    fn fat_mount_rejects_unimplemented_or_invalid_options() {
+        assert_eq!(
+            parse_fat_mount_options_with_defaults("iocharset=utf8", 0, 0, 0).unwrap_err(),
+            AxError::OperationNotSupported
+        );
+        assert_eq!(
+            parse_fat_mount_options_with_defaults("umask=0899", 0, 0, 0).unwrap_err(),
+            AxError::InvalidInput
+        );
+    }
 }

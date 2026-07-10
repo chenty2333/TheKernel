@@ -3,14 +3,12 @@ use core::{ffi::c_int, ops::Deref, task::Context};
 
 use axerrno::{AxError, AxResult};
 use axnet::{
-    RecvOptions, SendOptions, Socket as SocketInner, SocketOps,
-    options::{Configurable, GetSocketOption, SetSocketOption},
+    NetStack, RecvOptions, SendOptions, Socket as SocketInner, SocketOps,
+    options::{Configurable, SetSocketOption},
 };
 use axpoll::{IoEvents, Pollable};
-use linux_raw_sys::general::S_IFSOCK;
-use spin::Mutex;
 
-use super::{File, FileHandle, FileLike, Kstat};
+use super::{File, FileHandle, FileLike, Kstat, PseudoInode};
 use crate::{
     bpf::{prog::BpfProgram, vm::BpfVm},
     file::{IoDst, IoSrc, get_file_like, get_typed_file, packet::socket_ifreq_ioctl},
@@ -33,14 +31,10 @@ impl axnet::SocketFilter for AttachedSocketFilter {
     }
 }
 
-#[derive(Default)]
-struct SocketCompatState {
-    tcp_tls_ulp: bool,
-}
-
 pub struct Socket {
     pub inner: SocketInner,
-    compat: Mutex<SocketCompatState>,
+    net_stack: Arc<NetStack>,
+    inode: PseudoInode,
 }
 
 impl Deref for Socket {
@@ -52,11 +46,16 @@ impl Deref for Socket {
 }
 
 impl Socket {
-    pub fn new(inner: SocketInner) -> Self {
+    pub fn new(inner: SocketInner, net_stack: Arc<NetStack>) -> Self {
         Self {
             inner,
-            compat: Mutex::new(SocketCompatState::default()),
+            net_stack,
+            inode: PseudoInode::socket(),
         }
+    }
+
+    pub fn net_stack(&self) -> &Arc<NetStack> {
+        &self.net_stack
     }
 
     pub fn set_bpf_filter(&self, prog: Option<Arc<BpfProgram>>) -> AxResult<()> {
@@ -65,23 +64,8 @@ impl Socket {
         self.inner.set_filter(filter)
     }
 
-    pub fn is_tcp(&self) -> bool {
-        matches!(&self.inner, SocketInner::Tcp(_))
-    }
-
-    pub fn set_tcp_tls_ulp(&self) {
-        self.compat.lock().tcp_tls_ulp = true;
-    }
-
-    pub fn has_tcp_tls_ulp(&self) -> bool {
-        self.compat.lock().tcp_tls_ulp
-    }
-
-    pub fn listen(&self) -> AxResult<()> {
-        if self.has_tcp_tls_ulp() {
-            return Err(AxError::InvalidInput);
-        }
-        self.inner.listen()
+    pub fn listen(&self, backlog: usize) -> AxResult<()> {
+        self.inner.listen(backlog)
     }
 }
 
@@ -95,19 +79,11 @@ impl FileLike for Socket {
     }
 
     fn stat(&self) -> AxResult<Kstat> {
-        // TODO(mivik): implement stat for sockets
-        Ok(Kstat {
-            mode: S_IFSOCK | 0o777u32, // rwxrwxrwx
-            blksize: 4096,
-            ..Default::default()
-        })
+        Ok(self.inode.stat())
     }
 
     fn nonblocking(&self) -> bool {
-        let mut result = false;
-        self.get_option(GetSocketOption::NonBlocking(&mut result))
-            .unwrap();
-        result
+        self.inner.nonblocking()
     }
 
     fn set_nonblocking(&self, nonblocking: bool) -> AxResult<()> {
@@ -116,11 +92,11 @@ impl FileLike for Socket {
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
-        socket_ifreq_ioctl(cmd, arg)
+        socket_ifreq_ioctl(&self.net_stack, cmd, arg)
     }
 
     fn path(&self) -> Cow<'_, str> {
-        format!("socket:[{}]", self as *const _ as usize).into()
+        format!("socket:[{}]", self.inode.inode()).into()
     }
 
     fn from_fd(fd: c_int) -> AxResult<FileHandle<Self>>

@@ -29,11 +29,11 @@ pub struct Rtc;
 
 impl DeviceOps for Rtc {
     fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
-        Ok(0)
+        Err(VfsError::Unsupported)
     }
 
     fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        Ok(0)
+        Err(VfsError::Unsupported)
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
@@ -47,8 +47,8 @@ impl DeviceOps for Rtc {
                     tm_mday: wall.day() as _,
                     tm_mon: wall.month0() as _,
                     tm_year: (wall.year() - 1900) as _,
-                    tm_wday: 0,
-                    tm_yday: 0,
+                    tm_wday: wall.weekday().num_days_from_sunday() as _,
+                    tm_yday: wall.ordinal0() as _,
                     tm_isdst: 0,
                 })?;
             }

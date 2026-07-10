@@ -17,12 +17,11 @@ use axfs_ng_vfs::{
 use axhal::time::wall_time;
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
-use memory_addr::PAGE_SIZE_4K;
 use slab::Slab;
 use starry_process::Pid;
 use starry_signal::{SignalInfo, Signo};
 
-use super::dummy_stat_fs;
+use super::pseudo_stat_fs;
 use crate::{
     file::{Directory, OpenCredentials, current_file_write_credentials, get_typed_file},
     task::{AsThread, get_process_data, send_signal_to_process},
@@ -30,137 +29,35 @@ use crate::{
 
 const CGROUP_SUPER_MAGIC: u32 = 0x27e0_eb;
 const CGROUP2_SUPER_MAGIC: u32 = 0x6367_7270;
-const CPUSET_NODE_COUNT: usize = 2;
 
 const CONTROL_FILES: &[&str] = &[
     "tasks",
     "cgroup.procs",
     "cgroup.controllers",
     "cgroup.subtree_control",
-    "cgroup.clone_children",
-    "cgroup.event_control",
     "cgroup.kill",
-    "cgroup.sane_behavior",
-    "notify_on_release",
-    "release_agent",
-    "cpus",
-    "mems",
-    "cpuset.cpus",
-    "cpuset.mems",
-    "cpuset.memory_migrate",
-    "cpuset.cpu_exclusive",
-    "cpuset.mem_exclusive",
-    "cpuset.mem_hardwall",
-    "cpuset.memory_pressure",
-    "cpuset.memory_pressure_enabled",
-    "cpuset.memory_spread_page",
-    "cpuset.memory_spread_slab",
-    "cpuset.sched_load_balance",
-    "cpuset.sched_relax_domain_level",
-    "memory.current",
-    "memory.events",
-    "memory.events.local",
-    "memory.low",
-    "memory.min",
-    "memory.max",
-    "memory.stat",
-    "memory.swappiness",
-    "memory.swap.current",
-    "memory.swap.max",
-    "memory.usage_in_bytes",
-    "memory.limit_in_bytes",
-    "memory.memsw.usage_in_bytes",
-    "memory.memsw.limit_in_bytes",
-    "memory.kmem.usage_in_bytes",
-    "memory.kmem.limit_in_bytes",
-    "memory.use_hierarchy",
-    "memory.max_usage_in_bytes",
-    "memory.memsw.max_usage_in_bytes",
-    "memory.kmem.max_usage_in_bytes",
-    "memory.failcnt",
-    "memory.memsw.failcnt",
-    "memory.force_empty",
-    "memory.oom_control",
-    "memory.soft_limit_in_bytes",
-    "memory.move_charge_at_immigrate",
-    "cpu.max",
-    "cpu.shares",
-    "cpu.cfs_quota_us",
-    "cpu.cfs_period_us",
-    "cpu.rt_runtime_us",
-    "cpu.rt_period_us",
-    "cpu.stat",
-    "cpuacct.usage",
-    "cpuacct.usage_percpu",
-    "cpuacct.stat",
-    "freezer.state",
-    "freezer.self_freezing",
-    "freezer.parent_freezing",
-    "io.stat",
-    "io.max",
-    "blkio.weight",
-    "blkio.weight_device",
-    "blkio.throttle.read_bps_device",
-    "blkio.throttle.write_bps_device",
-    "blkio.throttle.read_iops_device",
-    "blkio.throttle.write_iops_device",
-    "blkio.throttle.io_serviced",
-    "blkio.throttle.io_service_bytes",
-    "blkio.io_serviced",
-    "blkio.io_service_bytes",
-    "blkio.io_service_time",
-    "blkio.io_wait_time",
-    "blkio.io_merged",
-    "blkio.io_queued",
-    "blkio.sectors",
-    "blkio.time",
-    "blkio.reset_stats",
-    "devices.allow",
-    "devices.deny",
-    "devices.list",
-    "net_cls.classid",
-    "net_prio.ifpriomap",
-    "net_prio.prioidx",
-    "hugetlb.2MB.limit_in_bytes",
-    "hugetlb.2MB.max_usage_in_bytes",
-    "hugetlb.2MB.usage_in_bytes",
-    "hugetlb.2MB.failcnt",
-    "hugetlb.2MB.numa_stat",
-    "hugetlb.2MB.rsvd.limit_in_bytes",
-    "hugetlb.2MB.rsvd.max_usage_in_bytes",
-    "hugetlb.2MB.rsvd.usage_in_bytes",
-    "hugetlb.2MB.rsvd.failcnt",
-    "hugetlb.1GB.limit_in_bytes",
-    "hugetlb.1GB.max_usage_in_bytes",
-    "hugetlb.1GB.usage_in_bytes",
-    "hugetlb.1GB.failcnt",
-    "hugetlb.1GB.numa_stat",
-    "hugetlb.1GB.rsvd.limit_in_bytes",
-    "hugetlb.1GB.rsvd.max_usage_in_bytes",
-    "hugetlb.1GB.rsvd.usage_in_bytes",
-    "hugetlb.1GB.rsvd.failcnt",
     "pids.max",
     "pids.current",
     "pids.events",
     "pids.peak",
 ];
 
-const ALL_CONTROLLERS: &[&str] = &[
-    "memory",
+const ALL_CONTROLLERS: &[&str] = &["pids"];
+const KNOWN_V1_CONTROLLERS: &[&str] = &[
+    "blkio",
     "cpu",
-    "cpuset",
-    "io",
-    "pids",
-    "hugetlb",
     "cpuacct",
+    "cpuset",
+    "debug",
     "devices",
     "freezer",
+    "hugetlb",
+    "memory",
+    "misc",
     "net_cls",
     "net_prio",
-    "blkio",
-    "misc",
     "perf_event",
-    "debug",
+    "pids",
     "rdma",
 ];
 
@@ -186,26 +83,40 @@ pub fn new_cgroup_v2() -> Filesystem {
     )
 }
 
-pub fn parse_v1_controllers(source: &str, data: &str) -> Vec<String> {
+pub fn parse_v1_controllers(source: &str, data: &str) -> AxResult<Vec<String>> {
     let mut controllers = Vec::new();
-    for token in source.split(',').chain(data.split(',')) {
+    for token in source.split(',') {
         let token = token.trim();
-        if token.is_empty()
-            || matches!(
-                token,
-                "none" | "cgroup" | "rw" | "ro" | "relatime" | "nosuid" | "nodev" | "noexec"
-            )
-        {
+        if ALL_CONTROLLERS.contains(&token) && !controllers.iter().any(|it| it == token) {
+            controllers.push(token.to_string());
+        } else if KNOWN_V1_CONTROLLERS.contains(&token) {
+            return Err(AxError::NoSuchDevice);
+        }
+    }
+    for token in data.split(',') {
+        let token = token.trim();
+        if token.is_empty() || is_generic_cgroup_mount_option(token) {
             continue;
         }
         if ALL_CONTROLLERS.contains(&token) && !controllers.iter().any(|it| it == token) {
             controllers.push(token.to_string());
+        } else if KNOWN_V1_CONTROLLERS.contains(&token) {
+            return Err(AxError::NoSuchDevice);
+        } else {
+            return Err(AxError::InvalidInput);
         }
     }
     if controllers.is_empty() {
-        controllers.push("memory".to_string());
+        controllers.push("pids".to_string());
     }
-    controllers
+    Ok(controllers)
+}
+
+fn is_generic_cgroup_mount_option(token: &str) -> bool {
+    matches!(
+        token,
+        "none" | "cgroup" | "rw" | "ro" | "relatime" | "nosuid" | "nodev" | "noexec"
+    )
 }
 
 pub fn proc_cgroups_snapshot() -> String {
@@ -280,7 +191,12 @@ impl FilesystemOps for CgroupFs {
     }
 
     fn stat(&self) -> VfsResult<StatFs> {
-        Ok(dummy_stat_fs(self.fs_type))
+        Ok(pseudo_stat_fs(self.fs_type))
+    }
+
+    fn unmount(&self) {
+        self.root.lock().take();
+        self.root_dir.lock().take();
     }
 }
 
@@ -370,22 +286,14 @@ struct CgroupDir {
     pids_peak: Mutex<u64>,
     pids_events_limit: Mutex<u64>,
     subtree_control: Mutex<BTreeSet<String>>,
-    memory_max_usage: Mutex<u64>,
-    memory_memsw_max_usage: Mutex<u64>,
-    memory_failcnt: Mutex<u64>,
-    memory_memsw_failcnt: Mutex<u64>,
-    cpuacct_usage_ns: Mutex<u64>,
 }
 
 impl CgroupDir {
     fn new_root(fs: Arc<CgroupFs>) -> Arc<Self> {
-        let dir = Self::new(fs, None);
-        dir.init_root_cpuset_defaults();
-        dir
+        Self::new(fs, None)
     }
 
     fn new(fs: Arc<CgroupFs>, parent: Option<Weak<CgroupDir>>) -> Arc<Self> {
-        let parent_dir = parent.as_ref().and_then(Weak::upgrade);
         let mode = NodePermission::from_bits_truncate(0o755);
         let files = CONTROL_FILES
             .iter()
@@ -402,16 +310,8 @@ impl CgroupDir {
             pids_peak: Mutex::new(0),
             pids_events_limit: Mutex::new(0),
             subtree_control: Mutex::new(BTreeSet::new()),
-            memory_max_usage: Mutex::new(0),
-            memory_memsw_max_usage: Mutex::new(0),
-            memory_failcnt: Mutex::new(0),
-            memory_memsw_failcnt: Mutex::new(0),
-            cpuacct_usage_ns: Mutex::new(0),
         });
         dir.bind_control_files();
-        if let Some(parent) = parent_dir {
-            dir.inherit_from_parent(&parent);
-        }
         dir
     }
 
@@ -450,137 +350,10 @@ impl CgroupDir {
                 .sum::<usize>()
     }
 
-    fn local_memory_current_bytes(&self) -> u64 {
-        self.live_pids()
-            .into_iter()
-            .filter_map(|pid| get_process_data(pid).ok())
-            .map(|proc_data| proc_data.aspace().lock().resident_user_bytes() as u64)
-            .sum()
-    }
-
-    fn recursive_memory_current_bytes(&self) -> u64 {
-        let local = self.local_memory_current_bytes();
-        let children = self.children.lock().values().cloned().collect::<Vec<_>>();
-        local
-            + children
-                .iter()
-                .map(|child| child.recursive_memory_current_bytes())
-                .sum::<u64>()
-    }
-
-    fn note_memory_usage(&self, current: u64) {
-        {
-            let mut max = self.memory_max_usage.lock();
-            *max = (*max).max(current);
-        }
-        {
-            let mut max = self.memory_memsw_max_usage.lock();
-            *max = (*max).max(current);
-        }
-        if self
-            .memory_limit_bytes("memory.limit_in_bytes")
-            .is_some_and(|limit| current > limit)
-        {
-            *self.memory_failcnt.lock() += 1;
-        }
-        if self
-            .memory_limit_bytes("memory.memsw.limit_in_bytes")
-            .is_some_and(|limit| current > limit)
-        {
-            *self.memory_memsw_failcnt.lock() += 1;
-        }
-    }
-
-    fn memory_current_bytes(&self) -> u64 {
-        let current = self.recursive_memory_current_bytes();
-        self.note_memory_usage(current);
-        current
-    }
-
-    fn memory_max_usage_bytes(&self, memsw: bool) -> u64 {
-        let current = self.memory_current_bytes();
-        if memsw {
-            let mut max = self.memory_memsw_max_usage.lock();
-            *max = (*max).max(current);
-            *max
-        } else {
-            let mut max = self.memory_max_usage.lock();
-            *max = (*max).max(current);
-            *max
-        }
-    }
-
-    fn reset_memory_max_usage(&self, memsw: bool) {
-        let current = self.memory_current_bytes();
-        if memsw {
-            *self.memory_memsw_max_usage.lock() = current;
-        } else {
-            *self.memory_max_usage.lock() = current;
-        }
-    }
-
-    fn memory_limit_bytes(&self, name: &str) -> Option<u64> {
-        let value = self.stored_control_text(name)?;
-        let value = value.trim();
-        if value == "max" {
-            None
-        } else {
-            value.parse::<u64>().ok()
-        }
-    }
-
-    fn memory_stat_text(&self) -> String {
-        let anon = self.memory_current_bytes();
-        format!(
-            "anon {anon}\nfile 0\nkernel 0\nkernel_stack 0\npagetables 0\npercpu 0\nsock \
-             0\nvmalloc 0\nshmem 0\nfile_mapped 0\nfile_dirty 0\nfile_writeback 0\nswapcached \
-             0\nanon_thp 0\nfile_thp 0\nshmem_thp 0\ninactive_anon {anon}\nactive_anon \
-             0\ninactive_file 0\nactive_file 0\nunevictable 0\nslab_reclaimable \
-             0\nslab_unreclaimable 0\nslab 0\nworkingset_refault_anon 0\nworkingset_refault_file \
-             0\nworkingset_activate_anon 0\nworkingset_activate_file 0\nworkingset_restore_anon \
-             0\nworkingset_restore_file 0\nworkingset_nodereclaim 0\npgfault 0\npgmajfault 0\nrss \
-             {anon}\ncache 0\nmapped_file 0\n"
-        )
-    }
-
-    fn memory_events_text(&self) -> String {
-        "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n".to_string()
-    }
-
-    fn note_cpuacct_charge(&self) {
-        let mut usage = self.cpuacct_usage_ns.lock();
-        *usage = usage.saturating_add(1_000_000);
-    }
-
-    fn recursive_cpuacct_usage_ns(&self) -> u64 {
-        let local = *self.cpuacct_usage_ns.lock();
-        let children = self.children.lock().values().cloned().collect::<Vec<_>>();
-        local
-            + children
-                .iter()
-                .map(|child| child.recursive_cpuacct_usage_ns())
-                .sum::<u64>()
-    }
-
-    fn cpuacct_usage_percpu_text(&self) -> String {
-        let cpus = axhal::cpu_num().max(1);
-        let total = self.recursive_cpuacct_usage_ns();
-        let base = total / cpus as u64;
-        let extra = total % cpus as u64;
-        let mut values = Vec::new();
-        for cpu in 0..cpus {
-            let value = base + u64::from((cpu as u64) < extra);
-            values.push(value.to_string());
-        }
-        format!("{}\n", values.join(" "))
-    }
-
-    fn cpuacct_stat_text(&self) -> String {
-        let ticks = self.recursive_cpuacct_usage_ns() / 10_000_000;
-        format!("user {ticks}\nsystem 0\n")
-    }
-
     fn update_pids_peak(&self, count: usize) {
+        if !self.pids_controller_active() {
+            return;
+        }
         let mut peak = self.pids_peak.lock();
         *peak = (*peak).max(count as u64);
     }
@@ -596,11 +369,13 @@ impl CgroupDir {
     fn limiting_dir_for_fork(self: &Arc<Self>) -> Option<Arc<CgroupDir>> {
         let mut current = Some(self.clone());
         while let Some(dir) = current {
-            let limit = *dir.pids_max.lock();
-            if let Some(limit) = limit
-                && dir.recursive_live_pid_count() as u64 + 1 > limit
-            {
-                return Some(dir);
+            if dir.pids_controller_active() {
+                let limit = *dir.pids_max.lock();
+                if let Some(limit) = limit
+                    && dir.recursive_live_pid_count() as u64 + 1 > limit
+                {
+                    return Some(dir);
+                }
             }
             current = dir.parent.as_ref().and_then(Weak::upgrade);
         }
@@ -609,6 +384,48 @@ impl CgroupDir {
 
     fn has_real_children(&self) -> bool {
         !self.children.lock().is_empty()
+    }
+
+    fn pids_controller_active(&self) -> bool {
+        match self.node.fs.version {
+            CgroupVersion::V1 => self
+                .node
+                .fs
+                .controllers
+                .iter()
+                .any(|controller| controller == "pids"),
+            CgroupVersion::V2 => self
+                .parent
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_some_and(|parent| parent.subtree_control.lock().contains("pids")),
+        }
+    }
+
+    fn control_file_visible(&self, name: &str) -> bool {
+        match self.node.fs.version {
+            CgroupVersion::V1 => {
+                matches!(name, "tasks" | "cgroup.procs")
+                    || (name.starts_with("pids.") && self.pids_controller_active())
+            }
+            CgroupVersion::V2 => match name {
+                "cgroup.procs" | "cgroup.controllers" | "cgroup.subtree_control" => true,
+                "cgroup.kill" => self.parent.is_some(),
+                _ if name.starts_with("pids.") => self.pids_controller_active(),
+                _ => false,
+            },
+        }
+    }
+
+    fn reset_pids_controller(&self) {
+        *self.pids_max.lock() = None;
+        *self.pids_peak.lock() = 0;
+        *self.pids_events_limit.lock() = 0;
+    }
+
+    fn initialize_pids_controller(&self) {
+        self.reset_pids_controller();
+        self.update_pids_peak(self.recursive_live_pid_count());
     }
 
     fn v2_has_enabled_child_controllers(&self) -> bool {
@@ -634,17 +451,10 @@ impl CgroupDir {
         if !can_migrate_with_credentials(credentials, &target) {
             return Err(VfsError::PermissionDenied);
         }
-        if self.requires_cpuset_placement()
-            && (self.cpuset_mask("cpuset.cpus").is_empty()
-                || self.cpuset_mask("cpuset.mems").is_empty())
-        {
-            return Err(VfsError::InvalidInput);
-        }
         let this = self.this_dir()?;
         detach_mapped_pid(pid);
         self.node.fs.remove_pid_everywhere(pid);
         self.pids.lock().insert(pid);
-        self.note_cpuacct_charge();
         PID_CGROUPS.lock().insert(pid, Arc::downgrade(&this));
         this.update_pids_peak_hierarchy();
         Ok(())
@@ -652,7 +462,6 @@ impl CgroupDir {
 
     fn attach_fork_child(self: &Arc<Self>, pid: Pid) {
         self.pids.lock().insert(pid);
-        self.note_cpuacct_charge();
         PID_CGROUPS.lock().insert(pid, Arc::downgrade(self));
         self.update_pids_peak_hierarchy();
     }
@@ -783,6 +592,8 @@ impl CgroupDir {
                 return Err(VfsError::ResourceBusy);
             }
         }
+        let activate_pids = enable.contains("pids") && !next.contains("pids");
+        let deactivate_pids = disable.contains("pids") && next.contains("pids");
         for name in enable {
             next.insert(name);
         }
@@ -790,149 +601,14 @@ impl CgroupDir {
             next.remove(&name);
         }
         *self.subtree_control.lock() = next;
-        Ok(())
-    }
-
-    fn stored_control_text(&self, name: &str) -> Option<String> {
-        self.files.get(name).map(|file| file.value.lock().clone())
-    }
-
-    fn memory_hierarchy_enabled(&self) -> bool {
-        self.stored_control_text("memory.use_hierarchy")
-            .is_some_and(|value| value.trim() == "1")
-    }
-
-    fn ancestor_memory_hierarchy_enabled(&self) -> bool {
-        let mut current = self.parent.as_ref().and_then(Weak::upgrade);
-        while let Some(dir) = current {
-            if dir.memory_hierarchy_enabled() {
-                return true;
-            }
-            current = dir.parent.as_ref().and_then(Weak::upgrade);
-        }
-        false
-    }
-
-    fn inherit_from_parent(&self, parent: &CgroupDir) {
-        self.copy_control_value(parent, "notify_on_release");
-        self.copy_control_value(parent, "cpuset.memory_spread_page");
-        self.copy_control_value(parent, "cpuset.memory_spread_slab");
-        if parent
-            .stored_control_text("cgroup.clone_children")
-            .is_some_and(|value| value.trim() == "1")
-        {
-            self.copy_control_value(parent, "cgroup.clone_children");
-            for name in [
-                "cpus",
-                "mems",
-                "cpuset.cpus",
-                "cpuset.mems",
-                "cpuset.memory_migrate",
-            ] {
-                self.copy_control_value(parent, name);
-            }
-        }
-    }
-
-    fn copy_control_value(&self, parent: &CgroupDir, name: &str) {
-        let Some(value) = parent.stored_control_text(name) else {
-            return;
-        };
-        self.set_control_value(name, value);
-    }
-
-    fn init_root_cpuset_defaults(&self) {
-        let cpus = cpuset_topology_mask(axhal::cpu_num().max(1));
-        let mems = cpuset_topology_mask(CPUSET_NODE_COUNT);
-        for name in ["cpus", "cpuset.cpus"] {
-            self.set_control_value(name, cpus.clone());
-        }
-        for name in ["mems", "cpuset.mems"] {
-            self.set_control_value(name, mems.clone());
-        }
-    }
-
-    fn set_control_value(&self, name: &str, value: String) {
-        if let Some(file) = self.files.get(name) {
-            *file.value.lock() = value;
-        }
-    }
-
-    fn control_bool(&self, name: &str) -> bool {
-        self.stored_control_text(name)
-            .is_some_and(|value| value.trim() != "0")
-    }
-
-    fn requires_cpuset_placement(&self) -> bool {
-        self.node.fs.version == CgroupVersion::V1
-            && self
-                .node
-                .fs
-                .controllers
-                .iter()
-                .any(|controller| controller == "cpuset")
-    }
-
-    fn cpuset_mask(&self, name: &str) -> BTreeSet<u32> {
-        let max = cpuset_mask_max(name);
-        self.stored_control_text(name)
-            .and_then(|value| parse_cpuset_mask(value.as_bytes(), max).ok())
-            .map(|(mask, _)| mask)
-            .unwrap_or_default()
-    }
-
-    fn validate_exclusive_flag_update(
-        &self,
-        flag_name: &str,
-        mask_name: &str,
-        value: bool,
-    ) -> VfsResult<()> {
-        if value {
-            if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
-                if !parent.control_bool(flag_name) {
-                    return Err(VfsError::InvalidInput);
+        if activate_pids || deactivate_pids {
+            let children = self.children.lock().values().cloned().collect::<Vec<_>>();
+            for child in children {
+                if activate_pids {
+                    child.initialize_pids_controller();
+                } else {
+                    child.reset_pids_controller();
                 }
-                let mask = self.cpuset_mask(mask_name);
-                for sibling in parent.children.lock().values() {
-                    if sibling.node.ino == self.node.ino {
-                        continue;
-                    }
-                    if masks_overlap(&mask, &sibling.cpuset_mask(mask_name)) {
-                        return Err(VfsError::InvalidInput);
-                    }
-                }
-            }
-        } else {
-            for child in self.children.lock().values() {
-                if child.control_bool(flag_name) {
-                    return Err(VfsError::InvalidInput);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_cpuset_mask_update(
-        &self,
-        mask_name: &str,
-        candidate: &BTreeSet<u32>,
-    ) -> VfsResult<()> {
-        let flag_name = cpuset_exclusive_flag_for_mask(mask_name);
-        let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) else {
-            return Ok(());
-        };
-        if !parent.control_bool(flag_name) {
-            return Ok(());
-        }
-        let self_exclusive = self.control_bool(flag_name);
-        for sibling in parent.children.lock().values() {
-            if sibling.node.ino == self.node.ino {
-                continue;
-            }
-            if (self_exclusive || sibling.control_bool(flag_name))
-                && masks_overlap(candidate, &sibling.cpuset_mask(mask_name))
-            {
-                return Err(VfsError::InvalidInput);
             }
         }
         Ok(())
@@ -1027,30 +703,6 @@ pub(crate) fn proc_cpuset_membership(pid: Pid) -> String {
         .unwrap_or_else(|| "/\n".to_string())
 }
 
-fn cpuset_mask_bits(mask: &BTreeSet<u32>) -> usize {
-    let mut bits = 0usize;
-    for index in mask {
-        bits |= 1usize.checked_shl(*index).unwrap_or(0);
-    }
-    bits
-}
-
-pub(crate) fn cpuset_allowed_masks(pid: Pid) -> Option<(usize, usize)> {
-    let dir = cgroup_for_pid(pid)?;
-    let mut cpus = dir.cpuset_mask("cpuset.cpus");
-    if cpus.is_empty() {
-        cpus = dir.cpuset_mask("cpus");
-    }
-    let mut mems = dir.cpuset_mask("cpuset.mems");
-    if mems.is_empty() {
-        mems = dir.cpuset_mask("mems");
-    }
-    if cpus.is_empty() || mems.is_empty() {
-        return None;
-    }
-    Some((cpuset_mask_bits(&cpus), cpuset_mask_bits(&mems)))
-}
-
 pub fn try_charge_fork(parent_pid: Pid, child_pid: Pid) -> AxResult<()> {
     let Some(dir) = cgroup_for_pid(parent_pid) else {
         return Ok(());
@@ -1127,12 +779,14 @@ impl DirNodeOps for CgroupDir {
                 .iter()
                 .map(|(name, dir)| (Cow::Owned(name.clone()), dir.node.ino, NodeType::Directory)),
         );
-        entries.extend(self.files.iter().map(|(name, file)| {
-            (
-                Cow::Owned(name.clone()),
-                file.node.ino,
-                NodeType::RegularFile,
-            )
+        entries.extend(self.files.iter().filter_map(|(name, file)| {
+            self.control_file_visible(name).then(|| {
+                (
+                    Cow::Owned(name.clone()),
+                    file.node.ino,
+                    NodeType::RegularFile,
+                )
+            })
         }));
 
         let mut count = 0;
@@ -1153,7 +807,9 @@ impl DirNodeOps for CgroupDir {
                 self.reference(name),
             ));
         }
-        if let Some(file) = self.files.get(name).cloned() {
+        if self.control_file_visible(name)
+            && let Some(file) = self.files.get(name).cloned()
+        {
             return Ok(DirEntry::new_file(
                 FileNode::new(file),
                 NodeType::RegularFile,
@@ -1262,21 +918,19 @@ impl CgroupDir {
 struct CgroupFile {
     node: CgroupNode,
     name: &'static str,
-    value: Mutex<String>,
     dir: Mutex<Option<Weak<CgroupDir>>>,
 }
 
 impl CgroupFile {
     fn new(fs: Arc<CgroupFs>, name: &'static str) -> Arc<Self> {
-        let mode = NodePermission::from_bits_truncate(if is_read_only_control_file(name) {
-            0o444
-        } else {
-            0o644
+        let mode = NodePermission::from_bits_truncate(match name {
+            "cgroup.kill" => 0o200,
+            _ if is_read_only_control_file(name) => 0o444,
+            _ => 0o644,
         });
         Arc::new(Self {
             node: CgroupNode::new(fs, NodeType::RegularFile, mode),
             name,
-            value: Mutex::new(default_value(name)),
             dir: Mutex::new(None),
         })
     }
@@ -1298,54 +952,27 @@ impl CgroupFile {
 
     fn read_text(&self) -> VfsResult<String> {
         let dir = self.dir()?;
+        if !dir.control_file_visible(self.name) {
+            return Err(VfsError::NotFound);
+        }
         Ok(match self.name {
             "tasks" | "cgroup.procs" => dir.tasks_text(),
             "cgroup.controllers" => dir.controllers_text(),
             "cgroup.subtree_control" => dir.subtree_control_text(),
-            "memory.current" | "memory.usage_in_bytes" | "memory.memsw.usage_in_bytes" => {
-                format!("{}\n", dir.memory_current_bytes())
-            }
-            "memory.kmem.usage_in_bytes" => "0\n".to_string(),
-            "memory.max_usage_in_bytes" => format!("{}\n", dir.memory_max_usage_bytes(false)),
-            "memory.memsw.max_usage_in_bytes" => {
-                format!("{}\n", dir.memory_max_usage_bytes(true))
-            }
-            "memory.kmem.max_usage_in_bytes" => "0\n".to_string(),
-            "memory.failcnt" => format!("{}\n", *dir.memory_failcnt.lock()),
-            "memory.memsw.failcnt" => format!("{}\n", *dir.memory_memsw_failcnt.lock()),
-            "memory.events" | "memory.events.local" => dir.memory_events_text(),
-            "memory.stat" => dir.memory_stat_text(),
-            "cpuacct.usage" => format!("{}\n", dir.recursive_cpuacct_usage_ns()),
-            "cpuacct.usage_percpu" => dir.cpuacct_usage_percpu_text(),
-            "cpuacct.stat" => dir.cpuacct_stat_text(),
-            "freezer.self_freezing" => {
-                let state = self.value.lock();
-                freezer_self_freezing_text(&state)
-            }
-            "freezer.parent_freezing" => "0\n".to_string(),
-            "blkio.throttle.io_serviced"
-            | "blkio.throttle.io_service_bytes"
-            | "blkio.io_serviced"
-            | "blkio.io_service_bytes"
-            | "blkio.io_service_time"
-            | "blkio.io_wait_time"
-            | "blkio.io_merged"
-            | "blkio.io_queued"
-            | "blkio.sectors"
-            | "blkio.time" => "Total 0\n".to_string(),
-            name if name.starts_with("hugetlb.") && name.ends_with(".numa_stat") => {
-                "total=0 N0=0\n".to_string()
-            }
+            "cgroup.kill" => return Err(VfsError::BadFileDescriptor),
             "pids.max" => dir.pids_max_text(),
             "pids.current" => format!("{}\n", dir.recursive_live_pid_count()),
             "pids.events" => format!("max {}\n", *dir.pids_events_limit.lock()),
             "pids.peak" => format!("{}\n", *dir.pids_peak.lock()),
-            _ => self.value.lock().clone(),
+            _ => return Err(VfsError::NotFound),
         })
     }
 
     fn write_text(&self, data: &[u8]) -> VfsResult<()> {
         let dir = self.dir()?;
+        if !dir.control_file_visible(self.name) {
+            return Err(VfsError::NotFound);
+        }
         match self.name {
             "tasks" | "cgroup.procs" => {
                 let text = core::str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
@@ -1363,211 +990,12 @@ impl CgroupFile {
                 dir.kill_attached_recursive();
                 Ok(())
             }
-            "cgroup.event_control" => Ok(()),
             "cgroup.subtree_control" => dir.update_subtree_control(data),
             "pids.max" => dir.set_pids_max(data),
-            "cpu.shares" => {
-                if dir.parent.is_none() {
-                    return Err(VfsError::InvalidInput);
-                }
-                let shares = parse_cgroup_u64(data)?;
-                let shares = shares.clamp(2, 1 << 18);
-                *self.value.lock() = format!("{shares}\n");
-                Ok(())
-            }
-            "cpu.cfs_quota_us" => {
-                let value = parse_signed_cgroup_i64(data)?;
-                if value < -1 {
-                    return Err(VfsError::InvalidInput);
-                }
-                *self.value.lock() = format!("{value}\n");
-                Ok(())
-            }
-            "cpu.cfs_period_us" | "cpu.rt_period_us" => {
-                let value = parse_cgroup_u64(data)?;
-                if !(1_000..=1_000_000).contains(&value) {
-                    return Err(VfsError::InvalidInput);
-                }
-                *self.value.lock() = format!("{value}\n");
-                Ok(())
-            }
-            "cpu.rt_runtime_us" => {
-                let value = parse_signed_cgroup_i64(data)?;
-                if value < -1 {
-                    return Err(VfsError::InvalidInput);
-                }
-                *self.value.lock() = format!("{value}\n");
-                Ok(())
-            }
-            "freezer.state" => {
-                let text = core::str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
-                match text.trim() {
-                    "THAWED" | "FROZEN" => {
-                        *self.value.lock() = format!("{}\n", text.trim());
-                        Ok(())
-                    }
-                    _ => Err(VfsError::InvalidInput),
-                }
-            }
-            "net_cls.classid" => {
-                let value = parse_classid(data)?;
-                *self.value.lock() = format!("{value}\n");
-                Ok(())
-            }
-            name if name.starts_with("hugetlb.")
-                && (name.ends_with(".limit_in_bytes")
-                    || name.ends_with(".rsvd.limit_in_bytes")) =>
-            {
-                *self.value.lock() = parse_memory_control_value(data)?;
-                Ok(())
-            }
-            "cpus" | "cpuset.cpus" | "mems" | "cpuset.mems" => {
-                if dir.parent.is_none() {
-                    return Err(VfsError::BadFileDescriptor);
-                }
-                let (mask, value) = parse_cpuset_mask(data, cpuset_mask_max(self.name))?;
-                dir.validate_cpuset_mask_update(self.name, &mask)?;
-                *self.value.lock() = value;
-                Ok(())
-            }
-            "memory.use_hierarchy" => {
-                let text = core::str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
-                let value = text.trim();
-                match value {
-                    "1" if dir.has_real_children() => Err(VfsError::InvalidInput),
-                    "0" if dir.ancestor_memory_hierarchy_enabled() => Err(VfsError::InvalidInput),
-                    "0" | "1" => {
-                        *self.value.lock() = format!("{value}\n");
-                        Ok(())
-                    }
-                    _ => Err(VfsError::InvalidInput),
-                }
-            }
-            "notify_on_release" | "cgroup.clone_children" => {
-                let text = core::str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
-                match text.trim() {
-                    "0" | "1" => {
-                        *self.value.lock() = format!("{}\n", text.trim());
-                        Ok(())
-                    }
-                    _ => Err(VfsError::InvalidInput),
-                }
-            }
-            "cpuset.cpu_exclusive" | "cpuset.mem_exclusive" => {
-                let value = parse_cpuset_flag(data)?;
-                let mask_name = if self.name == "cpuset.cpu_exclusive" {
-                    "cpuset.cpus"
-                } else {
-                    "cpuset.mems"
-                };
-                dir.validate_exclusive_flag_update(self.name, mask_name, value)?;
-                *self.value.lock() = flag_text(value);
-                Ok(())
-            }
-            "cpuset.mem_hardwall"
-            | "cpuset.memory_migrate"
-            | "cpuset.memory_pressure_enabled"
-            | "cpuset.memory_spread_page"
-            | "cpuset.memory_spread_slab"
-            | "cpuset.sched_load_balance" => {
-                *self.value.lock() = flag_text(parse_cpuset_flag(data)?);
-                Ok(())
-            }
-            "cpuset.sched_relax_domain_level" => {
-                let text = core::str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
-                let value = text
-                    .trim()
-                    .parse::<i32>()
-                    .map_err(|_| VfsError::InvalidInput)?;
-                if !(-1..=5).contains(&value) {
-                    return Err(VfsError::InvalidInput);
-                }
-                *self.value.lock() = format!("{value}\n");
-                Ok(())
-            }
-            "memory.force_empty" => {
-                if dir.parent.is_none() {
-                    Err(VfsError::InvalidInput)
-                } else {
-                    Ok(())
-                }
-            }
-            "memory.max_usage_in_bytes" => {
-                dir.reset_memory_max_usage(false);
-                Ok(())
-            }
-            "memory.memsw.max_usage_in_bytes" => {
-                dir.reset_memory_max_usage(true);
-                Ok(())
-            }
-            "memory.failcnt" => {
-                *dir.memory_failcnt.lock() = 0;
-                Ok(())
-            }
-            "memory.memsw.failcnt" => {
-                *dir.memory_memsw_failcnt.lock() = 0;
-                Ok(())
-            }
-            "memory.low"
-            | "memory.min"
-            | "memory.max"
-            | "memory.swap.max"
-            | "memory.limit_in_bytes"
-            | "memory.memsw.limit_in_bytes"
-            | "memory.kmem.limit_in_bytes"
-            | "memory.soft_limit_in_bytes" => {
-                *self.value.lock() = parse_memory_control_value(data)?;
-                Ok(())
-            }
-            "cgroup.controllers"
-            | "cgroup.sane_behavior"
-            | "cpuset.memory_pressure"
-            | "cpu.stat"
-            | "cpuacct.usage"
-            | "cpuacct.usage_percpu"
-            | "cpuacct.stat"
-            | "freezer.self_freezing"
-            | "freezer.parent_freezing"
-            | "devices.list"
-            | "net_prio.prioidx"
-            | "pids.current"
-            | "pids.events"
-            | "pids.peak"
-            | "memory.current"
-            | "memory.usage_in_bytes"
-            | "memory.memsw.usage_in_bytes"
-            | "memory.kmem.usage_in_bytes"
-            | "memory.events"
-            | "memory.events.local"
-            | "memory.stat"
-            | "io.stat" => Err(VfsError::BadFileDescriptor),
-            name if name.starts_with("blkio.")
-                && !matches!(
-                    name,
-                    "blkio.weight"
-                        | "blkio.weight_device"
-                        | "blkio.throttle.read_bps_device"
-                        | "blkio.throttle.write_bps_device"
-                        | "blkio.throttle.read_iops_device"
-                        | "blkio.throttle.write_iops_device"
-                        | "blkio.reset_stats"
-                ) =>
-            {
+            "cgroup.controllers" | "pids.current" | "pids.events" | "pids.peak" => {
                 Err(VfsError::BadFileDescriptor)
             }
-            name if name.starts_with("hugetlb.")
-                && !name.ends_with(".limit_in_bytes")
-                && !name.ends_with(".rsvd.limit_in_bytes") =>
-            {
-                Err(VfsError::BadFileDescriptor)
-            }
-            _ => {
-                let text = core::str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
-                let mut value = text.trim_end_matches('\0').trim_end().to_string();
-                value.push('\n');
-                *self.value.lock() = value;
-                Ok(())
-            }
+            _ => Err(VfsError::NotFound),
         }
     }
 }
@@ -1575,302 +1003,8 @@ impl CgroupFile {
 fn is_read_only_control_file(name: &str) -> bool {
     matches!(
         name,
-        "cgroup.controllers"
-            | "cgroup.sane_behavior"
-            | "cpuset.memory_pressure"
-            | "cpu.stat"
-            | "cpuacct.usage"
-            | "cpuacct.usage_percpu"
-            | "cpuacct.stat"
-            | "freezer.self_freezing"
-            | "freezer.parent_freezing"
-            | "devices.list"
-            | "net_prio.prioidx"
-            | "pids.current"
-            | "pids.events"
-            | "pids.peak"
-            | "memory.current"
-            | "memory.usage_in_bytes"
-            | "memory.memsw.usage_in_bytes"
-            | "memory.kmem.usage_in_bytes"
-            | "memory.kmem.max_usage_in_bytes"
-            | "memory.events"
-            | "memory.events.local"
-            | "memory.stat"
-            | "io.stat"
-    ) || (name.starts_with("blkio.")
-        && !matches!(
-            name,
-            "blkio.weight"
-                | "blkio.weight_device"
-                | "blkio.throttle.read_bps_device"
-                | "blkio.throttle.write_bps_device"
-                | "blkio.throttle.read_iops_device"
-                | "blkio.throttle.write_iops_device"
-                | "blkio.reset_stats"
-        ))
-        || (name.starts_with("hugetlb.")
-            && !name.ends_with(".limit_in_bytes")
-            && !name.ends_with(".rsvd.limit_in_bytes"))
-}
-
-fn parse_cgroup_u64(data: &[u8]) -> VfsResult<u64> {
-    let text = core::str::from_utf8(data)
-        .map_err(|_| VfsError::InvalidInput)?
-        .trim();
-    if text.is_empty() || text.starts_with('-') || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(VfsError::InvalidInput);
-    }
-    text.parse::<u64>().map_err(|_| VfsError::InvalidInput)
-}
-
-fn parse_signed_cgroup_i64(data: &[u8]) -> VfsResult<i64> {
-    let text = core::str::from_utf8(data)
-        .map_err(|_| VfsError::InvalidInput)?
-        .trim();
-    if text.is_empty() {
-        return Err(VfsError::InvalidInput);
-    }
-    let digits = text.strip_prefix('-').unwrap_or(text);
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(VfsError::InvalidInput);
-    }
-    text.parse::<i64>().map_err(|_| VfsError::InvalidInput)
-}
-
-fn parse_classid(data: &[u8]) -> VfsResult<u64> {
-    let text = core::str::from_utf8(data)
-        .map_err(|_| VfsError::InvalidInput)?
-        .trim();
-    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        u64::from_str_radix(hex, 16).map_err(|_| VfsError::InvalidInput)
-    } else {
-        parse_cgroup_u64(data)
-    }
-}
-
-fn freezer_self_freezing_text(state: &str) -> String {
-    if state.trim() == "FROZEN" {
-        "1\n".to_string()
-    } else {
-        "0\n".to_string()
-    }
-}
-
-fn parse_memory_control_value(data: &[u8]) -> VfsResult<String> {
-    let text = core::str::from_utf8(data)
-        .map_err(|_| VfsError::InvalidInput)?
-        .trim();
-    if text == "max" {
-        return Ok("max\n".to_string());
-    }
-    if text == "-1" {
-        let unlimited = (i64::MAX as u64 / PAGE_SIZE_4K as u64) * PAGE_SIZE_4K as u64;
-        return Ok(format!("{unlimited}\n"));
-    }
-    let Some(bytes) = parse_size_bytes(text) else {
-        return Err(VfsError::InvalidInput);
-    };
-    let aligned = (bytes / PAGE_SIZE_4K as u64) * PAGE_SIZE_4K as u64;
-    Ok(format!("{aligned}\n"))
-}
-
-fn parse_size_bytes(text: &str) -> Option<u64> {
-    let bytes = text.as_bytes();
-    let mut index = 0;
-    let mut value = 0u64;
-    while index < bytes.len() && bytes[index].is_ascii_digit() {
-        value = value
-            .checked_mul(10)?
-            .checked_add((bytes[index] - b'0') as u64)?;
-        index += 1;
-    }
-    if index == 0 {
-        return None;
-    }
-    let multiplier = match &text[index..] {
-        "" => 1,
-        "K" | "k" => 1024,
-        "M" | "m" => 1024 * 1024,
-        "G" | "g" => 1024 * 1024 * 1024,
-        _ => return None,
-    };
-    value.checked_mul(multiplier)
-}
-
-fn cpuset_topology_mask(count: usize) -> String {
-    if count <= 1 {
-        "0\n".to_string()
-    } else {
-        format!("0-{}\n", count - 1)
-    }
-}
-
-fn cpuset_mask_max(name: &str) -> usize {
-    if name.ends_with("mems") {
-        CPUSET_NODE_COUNT
-    } else {
-        axhal::cpu_num().max(1)
-    }
-}
-
-fn cpuset_exclusive_flag_for_mask(mask_name: &str) -> &'static str {
-    if mask_name.ends_with("mems") {
-        "cpuset.mem_exclusive"
-    } else {
-        "cpuset.cpu_exclusive"
-    }
-}
-
-fn parse_cpuset_mask(data: &[u8], max_count: usize) -> VfsResult<(BTreeSet<u32>, String)> {
-    let text = core::str::from_utf8(data)
-        .map_err(|_| VfsError::InvalidInput)?
-        .trim();
-    let mut mask = BTreeSet::new();
-    if !text.is_empty() {
-        for token in text.split(',') {
-            let token = token.trim();
-            if token.is_empty() {
-                continue;
-            }
-            if let Some((start, end)) = token.split_once('-') {
-                if start.is_empty() || end.is_empty() {
-                    return Err(VfsError::InvalidInput);
-                }
-                let start = parse_cpuset_index(start, max_count)?;
-                let end = parse_cpuset_index(end, max_count)?;
-                if start > end {
-                    return Err(VfsError::InvalidInput);
-                }
-                for index in start..=end {
-                    mask.insert(index);
-                }
-            } else {
-                mask.insert(parse_cpuset_index(token, max_count)?);
-            }
-        }
-    }
-    Ok((mask.clone(), format!("{}\n", format_cpuset_mask(&mask))))
-}
-
-fn parse_cpuset_index(text: &str, max_count: usize) -> VfsResult<u32> {
-    if text.starts_with('-') || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(VfsError::InvalidInput);
-    }
-    let value = text.parse::<u32>().map_err(|_| VfsError::InvalidInput)?;
-    if value as usize >= max_count {
-        return Err(VfsError::InvalidInput);
-    }
-    Ok(value)
-}
-
-fn format_cpuset_mask(mask: &BTreeSet<u32>) -> String {
-    let mut ranges = Vec::new();
-    let mut iter = mask.iter().copied().peekable();
-    while let Some(start) = iter.next() {
-        let mut end = start;
-        while iter.peek().is_some_and(|next| *next == end + 1) {
-            end = iter.next().unwrap();
-        }
-        if start == end {
-            ranges.push(start.to_string());
-        } else {
-            ranges.push(format!("{start}-{end}"));
-        }
-    }
-    ranges.join(",")
-}
-
-fn masks_overlap(a: &BTreeSet<u32>, b: &BTreeSet<u32>) -> bool {
-    a.iter().any(|value| b.contains(value))
-}
-
-fn parse_cpuset_flag(data: &[u8]) -> VfsResult<bool> {
-    let text = core::str::from_utf8(data)
-        .map_err(|_| VfsError::InvalidInput)?
-        .trim();
-    if text.starts_with('-') || text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(VfsError::InvalidInput);
-    }
-    let value = text.parse::<u64>().map_err(|_| VfsError::InvalidInput)?;
-    Ok(value != 0)
-}
-
-fn flag_text(value: bool) -> String {
-    if value {
-        "1\n".to_string()
-    } else {
-        "0\n".to_string()
-    }
-}
-
-fn default_value(name: &str) -> String {
-    match name {
-        "release_agent" => "\n",
-        "cgroup.sane_behavior" => "0\n",
-        "cgroup.event_control" => "\n",
-        "cpus" | "cpuset.cpus" | "mems" | "cpuset.mems" => "\n",
-        "cpu.max" => "max 100000\n",
-        "cpu.shares" => "1024\n",
-        "cpu.cfs_quota_us" => "-1\n",
-        "cpu.cfs_period_us" => "100000\n",
-        "cpu.rt_runtime_us" => "950000\n",
-        "cpu.rt_period_us" => "1000000\n",
-        "cpu.stat" => "nr_periods 0\nnr_throttled 0\nthrottled_time 0\n",
-        "cpuacct.usage" | "cpuacct.usage_percpu" => "0\n",
-        "cpuacct.stat" => "user 0\nsystem 0\n",
-        "freezer.state" => "THAWED\n",
-        "freezer.self_freezing" | "freezer.parent_freezing" => "0\n",
-        "cpuset.sched_load_balance" => "1\n",
-        "cpuset.sched_relax_domain_level" => "-1\n",
-        "cpuset.memory_pressure" => "0\n",
-        "memory.max"
-        | "memory.limit_in_bytes"
-        | "memory.memsw.limit_in_bytes"
-        | "memory.kmem.limit_in_bytes"
-        | "memory.soft_limit_in_bytes"
-        | "pids.max" => "max\n",
-        "memory.swappiness" => "60\n",
-        "memory.oom_control" => "oom_kill_disable 0\nunder_oom 0\noom_kill 0\n",
-        "memory.move_charge_at_immigrate" => "0\n",
-        "io.max" => "\n",
-        "memory.events" | "memory.events.local" | "memory.stat" | "io.stat" => "",
-        "blkio.weight" => "500\n",
-        "blkio.weight_device"
-        | "blkio.throttle.read_bps_device"
-        | "blkio.throttle.write_bps_device"
-        | "blkio.throttle.read_iops_device"
-        | "blkio.throttle.write_iops_device" => "\n",
-        "blkio.reset_stats" => "0\n",
-        "blkio.throttle.io_serviced"
-        | "blkio.throttle.io_service_bytes"
-        | "blkio.io_serviced"
-        | "blkio.io_service_bytes"
-        | "blkio.io_service_time"
-        | "blkio.io_wait_time"
-        | "blkio.io_merged"
-        | "blkio.io_queued"
-        | "blkio.sectors"
-        | "blkio.time" => "Total 0\n",
-        "devices.list" => "a *:* rwm\n",
-        "devices.allow" | "devices.deny" => "\n",
-        "net_cls.classid" => "0\n",
-        "net_prio.ifpriomap" => "\n",
-        "net_prio.prioidx" => "0\n",
-        name if name.starts_with("hugetlb.") && name.ends_with(".limit_in_bytes") => "max\n",
-        name if name.starts_with("hugetlb.") && name.ends_with(".numa_stat") => "total=0 N0=0\n",
-        name if name.starts_with("hugetlb.")
-            && (name.ends_with(".usage_in_bytes")
-                || name.ends_with(".max_usage_in_bytes")
-                || name.ends_with(".failcnt")) =>
-        {
-            "0\n"
-        }
-        "pids.events" => "max 0\n",
-        "pids.peak" => "0\n",
-        _ => "0\n",
-    }
-    .to_string()
+        "cgroup.controllers" | "pids.current" | "pids.events" | "pids.peak"
+    )
 }
 
 impl NodeOps for CgroupFile {
@@ -1879,12 +1013,20 @@ impl NodeOps for CgroupFile {
     }
 
     fn metadata(&self) -> VfsResult<Metadata> {
+        let dir = self.dir()?;
+        if !dir.control_file_visible(self.name) {
+            return Err(VfsError::NotFound);
+        }
         let mut metadata = self.node.metadata();
         metadata.size = self.read_text().map_or(0, |text| text.len() as u64);
         Ok(metadata)
     }
 
     fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()> {
+        let dir = self.dir()?;
+        if !dir.control_file_visible(self.name) {
+            return Err(VfsError::NotFound);
+        }
         self.node.update_metadata(update);
         Ok(())
     }
@@ -1925,7 +1067,7 @@ impl FileNodeOps for CgroupFile {
 
     fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {
         self.write_text(buf)?;
-        Ok((buf.len(), self.read_text()?.len() as u64))
+        Ok((buf.len(), 0))
     }
 
     fn set_len(&self, len: u64) -> VfsResult<()> {
@@ -1942,10 +1084,41 @@ impl FileNodeOps for CgroupFile {
 
 impl Pollable for CgroupFile {
     fn poll(&self) -> IoEvents {
-        IoEvents::IN | IoEvents::OUT
+        if self.name == "cgroup.kill" {
+            IoEvents::OUT
+        } else if is_read_only_control_file(self.name) {
+            IoEvents::IN
+        } else {
+            IoEvents::IN | IoEvents::OUT
+        }
     }
 
     fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v1_controller_parser_rejects_unimplemented_controllers() {
+        assert_eq!(
+            parse_v1_controllers("none", "pids").unwrap(),
+            ["pids".to_string()]
+        );
+        assert_eq!(
+            parse_v1_controllers("memory", "").unwrap_err(),
+            AxError::NoSuchDevice
+        );
+        assert_eq!(
+            parse_v1_controllers("none", "pids,memory").unwrap_err(),
+            AxError::NoSuchDevice
+        );
+        assert_eq!(
+            parse_v1_controllers("none", "unknown").unwrap_err(),
+            AxError::InvalidInput
+        );
+    }
 }
 
 impl CgroupDir {

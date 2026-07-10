@@ -61,7 +61,7 @@ impl NodeOps for FatDirNode {
         let fs = self.fs.lock();
         let dir = self.inner.borrow(&fs);
         if let Some(file) = dir.as_file() {
-            return Ok(file_metadata(&fs, file, NodeType::Directory));
+            return file_metadata(&fs, file, self.inode, NodeType::Directory);
         }
 
         // root directory
@@ -70,23 +70,41 @@ impl NodeOps for FatDirNode {
             inode: self.inode(),
             device: 0,
             nlink: 1,
-            mode: NodePermission::default(),
+            mode: fs.mount_options.dir_mode,
             node_type: NodeType::Directory,
-            uid: 0,
-            gid: 0,
+            uid: fs.mount_options.uid,
+            gid: fs.mount_options.gid,
             size: block_size,
             block_size,
             blocks: 1,
             rdev: DeviceId::default(),
-            atime: Duration::default(),
+            atime: fs.root_atime,
             btime: Duration::default(),
-            mtime: Duration::default(),
+            mtime: fs.root_mtime,
             ctime: Duration::default(),
         })
     }
 
-    fn update_metadata(&self, _update: MetadataUpdate) -> VfsResult<()> {
-        // TODO: update metadata on directory
+    fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()> {
+        if update.mode.is_some()
+            || update.owner.is_some()
+            || update.rdev.is_some()
+            || update.ctime.is_some()
+        {
+            return Err(VfsError::Unsupported);
+        }
+
+        let mut fs = self.fs.lock();
+        let dir = self.inner.borrow_mut(&fs);
+        if let Some(file) = dir.as_file_mut() {
+            return super::util::update_file_metadata(file, update);
+        }
+        if let Some(atime) = update.atime {
+            fs.root_atime = atime;
+        }
+        if let Some(mtime) = update.mtime {
+            fs.root_mtime = mtime;
+        }
         Ok(())
     }
 
@@ -95,7 +113,7 @@ impl NodeOps for FatDirNode {
     }
 
     fn sync(&self, _data_only: bool) -> VfsResult<()> {
-        Ok(())
+        self.fs.flush()
     }
 
     fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
@@ -111,7 +129,7 @@ impl DirNodeOps for FatDirNode {
     fn read_dir(&self, offset: u64, sink: &mut dyn DirEntrySink) -> VfsResult<usize> {
         let mut fs = self.fs.lock();
         let dir = self.inner.borrow(&fs);
-        let this_entry = self.this.upgrade().unwrap();
+        let this_entry = self.this.upgrade().ok_or(VfsError::NotFound)?;
         let dir_node = this_entry.as_dir()?;
 
         let mut count = 0;
@@ -142,10 +160,14 @@ impl DirNodeOps for FatDirNode {
     fn lookup(&self, name: &str) -> VfsResult<DirEntry> {
         let mut fs = self.fs.lock();
         let dir = self.inner.borrow(&fs);
-        dir.iter()
-            .find_map(|entry| entry.ok().filter(|it| it.eq_name(name)))
-            .map(|entry| self.create_entry(entry, name.to_ascii_lowercase(), fs.alloc_inode()))
-            .ok_or(VfsError::NotFound)
+        for entry in dir.iter() {
+            let entry = entry.map_err(into_vfs_err)?;
+            if entry.eq_name(name) {
+                let inode = fs.alloc_inode();
+                return Ok(self.create_entry(entry, name.to_ascii_lowercase(), inode));
+            }
+        }
+        Err(VfsError::NotFound)
     }
 
     fn create(

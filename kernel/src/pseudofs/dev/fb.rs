@@ -2,7 +2,7 @@ use core::{any::Any, slice};
 
 #[allow(unused_imports)]
 use axdriver::prelude::DisplayDriverOps;
-use axerrno::AxError;
+use axerrno::{AxError, LinuxError};
 use axfs_ng_vfs::{NodeFlags, VfsError, VfsResult};
 use axhal::mem::virt_to_phys;
 use memory_addr::{PhysAddrRange, VirtAddr};
@@ -113,10 +113,11 @@ impl FrameBuffer {
 impl DeviceOps for FrameBuffer {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         let slice = self.as_mut_slice();
-        let len = buf
-            .len()
-            .min((slice.len() as u64).saturating_sub(offset) as usize);
-        buf[..len].copy_from_slice(&slice[..len]);
+        let offset = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(slice.len());
+        let len = buf.len().min(slice.len().saturating_sub(offset));
+        buf[..len].copy_from_slice(&slice[offset..offset + len]);
         Ok(len)
     }
 
@@ -125,8 +126,9 @@ impl DeviceOps for FrameBuffer {
         if offset >= slice.len() as u64 {
             return Err(VfsError::StorageFull);
         }
-        let len = buf.len().min(slice.len() - offset as usize);
-        slice[..len].copy_from_slice(&buf[..len]);
+        let offset = offset as usize;
+        let len = buf.len().min(slice.len() - offset);
+        slice[offset..offset + len].copy_from_slice(&buf[..len]);
         Ok(len)
     }
 
@@ -187,13 +189,13 @@ impl DeviceOps for FrameBuffer {
                 Ok(0)
             }
             // FBIOPUT_VSCREENINFO
-            0x4601 => Ok(0),
+            0x4601 => Err(LinuxError::EOPNOTSUPP.into()),
             // FBIOGET_FSCREENINFO
             0x4602 => {
                 let info = axdisplay::framebuffer_info();
                 (arg as *mut FixScreenInfo).vm_write(FixScreenInfo {
                     id: *b"Virtio Framebuf\0",
-                    smem_start: info.fb_base_vaddr as u64,
+                    smem_start: virt_to_phys(VirtAddr::from(info.fb_base_vaddr)).as_usize() as u64,
                     smem_len: info.fb_size as u32,
                     type_: 0,
                     type_aux: 0,
@@ -211,9 +213,9 @@ impl DeviceOps for FrameBuffer {
                 Ok(0)
             }
             // FBIOGETCMAP
-            0x4604 => Ok(0),
+            0x4604 => Err(LinuxError::EOPNOTSUPP.into()),
             // FBIOPUTCMAP
-            0x4605 => Ok(0),
+            0x4605 => Err(LinuxError::EOPNOTSUPP.into()),
             // FBIOPAN_DISPLAY
             0x4606 => Err(AxError::InvalidInput),
             // FBIOBLANK

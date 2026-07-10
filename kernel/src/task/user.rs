@@ -1,17 +1,13 @@
 use axhal::uspace::{ExceptionInfo, ExceptionKind, ReturnReason, UserContext};
 use axtask::TaskInner;
-use memory_addr::MemoryAddr;
 use starry_process::Pid;
 use starry_signal::{SignalInfo, Signo};
-use starry_vm::vm_write_slice;
 
 use super::{
     AsThread, TimerState, check_signals, do_exit, has_pending_fatal_signal, raise_signal_fatal,
     set_timer_state, wait_if_stopped,
 };
-use crate::{
-    file::userfaultfd::wait_missing_page_for_current, mm::PageFaultResult, syscall::handle_syscall,
-};
+use crate::{mm::PageFaultResult, syscall::handle_syscall};
 
 /// Maps an `ExceptionKind::Other` exception to the correct POSIX signal using
 /// arch-specific exception information.
@@ -39,6 +35,13 @@ fn map_other_exception(exc_info: &ExceptionInfo) -> Signo {
     Signo::SIGSEGV
 }
 
+fn deliver_fatal_user_signal(signo: Signo) {
+    if let Err(err) = raise_signal_fatal(SignalInfo::new_kernel(signo)) {
+        error!("Failed to deliver fatal user signal {signo:?}: {err:?}");
+        do_exit(signo as i32, true);
+    }
+}
+
 /// Create a new user task.
 pub fn new_user_task(name: &str, mut uctx: UserContext) -> TaskInner {
     TaskInner::new(
@@ -58,42 +61,14 @@ pub fn new_user_task(name: &str, mut uctx: UserContext) -> TaskInner {
                 set_timer_state(&curr, TimerState::Kernel);
 
                 match reason {
-                    ReturnReason::Syscall => {
-                        handle_syscall(&mut uctx);
-                        if thr.pending_exit() {
-                            break;
-                        }
-                        axtask::resched_if_needed();
-                    }
+                    ReturnReason::Syscall => handle_syscall(&mut uctx),
                     ReturnReason::PageFault(addr, flags) => {
                         let aspace_handle = thr.proc_data.aspace();
-                        let result = if let Some(data) = wait_missing_page_for_current(
-                            thr.proc_data.proc.pid(),
+                        let result = aspace_handle.lock().handle_page_fault_result(
                             addr,
-                            flags.contains(axhal::trap::PageFaultFlags::WRITE),
-                        ) {
-                            let page = addr.align_down_4k();
-                            match aspace_handle.lock().handle_page_fault_result(
-                                addr,
-                                flags,
-                                Some(uctx.sp().into()),
-                            ) {
-                                PageFaultResult::Handled => {
-                                    if vm_write_slice(page.as_usize() as *mut u8, &data).is_ok() {
-                                        PageFaultResult::Handled
-                                    } else {
-                                        PageFaultResult::Unhandled
-                                    }
-                                }
-                                outcome => outcome,
-                            }
-                        } else {
-                            aspace_handle.lock().handle_page_fault_result(
-                                addr,
-                                flags,
-                                Some(uctx.sp().into()),
-                            )
-                        };
+                            flags,
+                            Some(uctx.sp().into()),
+                        );
                         if result != PageFaultResult::Handled {
                             #[cfg(target_arch = "riscv64")]
                             info!(
@@ -123,16 +98,10 @@ pub fn new_user_task(name: &str, mut uctx: UserContext) -> TaskInner {
                             } else {
                                 Signo::SIGSEGV
                             };
-                            raise_signal_fatal(SignalInfo::new_kernel(signo))
-                                .expect("Failed to send page-fault signal");
+                            deliver_fatal_user_signal(signo);
                         }
                     }
-                    ReturnReason::Interrupt => {
-                        // Timer IRQ handling only marks the current task for preemption.
-                        // Run the scheduler before returning to user space so CPU-bound
-                        // workloads are not delayed until their next syscall.
-                        axtask::resched_if_needed();
-                    }
+                    ReturnReason::Interrupt => {}
                     #[allow(unused_labels)]
                     ReturnReason::Exception(exc_info) => 'exc: {
                         let signo = match exc_info.kind() {
@@ -147,15 +116,20 @@ pub fn new_user_task(name: &str, mut uctx: UserContext) -> TaskInner {
                             ExceptionKind::IllegalInstruction => Signo::SIGILL,
                             ExceptionKind::Other => map_other_exception(&exc_info),
                         };
-                        raise_signal_fatal(SignalInfo::new_kernel(signo))
-                            .expect("Failed to send signal");
+                        deliver_fatal_user_signal(signo);
                     }
                     r => {
                         warn!("Unexpected return reason: {r:?}");
-                        raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGSEGV))
-                            .expect("Failed to send SIGSEGV");
+                        deliver_fatal_user_signal(Signo::SIGSEGV);
                     }
                 }
+
+                if thr.pending_exit() {
+                    break;
+                }
+                // Timer IRQ handling marks the task for preemption. Honor that
+                // request at every user-return boundary, regardless of trap kind.
+                axtask::resched_if_needed();
 
                 if thr.proc_data.should_exit_for_exec(tid) {
                     if has_pending_fatal_signal(thr) {

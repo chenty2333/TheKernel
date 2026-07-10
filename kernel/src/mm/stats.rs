@@ -19,7 +19,6 @@ pub struct SystemMemoryStats {
     pub available_bytes: usize,
     pub used_bytes: usize,
     pub cached_bytes: usize,
-    pub mapped_bytes: usize,
     pub page_table_bytes: usize,
 }
 
@@ -46,7 +45,6 @@ pub fn system_memory_stats() -> SystemMemoryStats {
         available_bytes: free_bytes,
         used_bytes: total_bytes.saturating_sub(free_bytes),
         cached_bytes: usages.get(UsageKind::PageCache),
-        mapped_bytes: usages.get(UsageKind::VirtMem),
         page_table_bytes: usages.get(UsageKind::PageTable),
     }
 }
@@ -73,9 +71,8 @@ pub fn set_overcommit_ratio(value: u32) {
 
 pub fn commit_limit_bytes() -> usize {
     let stats = system_memory_stats();
-    let swap_bytes = crate::syscall::swap_total_bytes() as u128;
-    (swap_bytes + (stats.total_bytes as u128 * overcommit_ratio() as u128) / 100)
-        .min(usize::MAX as u128) as usize
+    ((stats.total_bytes as u128 * overcommit_ratio() as u128) / 100).min(usize::MAX as u128)
+        as usize
 }
 
 pub fn committed_as_bytes() -> usize {

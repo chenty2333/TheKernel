@@ -23,9 +23,11 @@ pub(crate) use self::phys_pin::{PhysicalFramePin, pin_frame};
 pub use self::shared::SharedPages;
 use super::AddrSpace;
 
-fn divide_page(size: usize, page_size: PageSize) -> usize {
-    assert!(page_size.is_aligned(size), "unaligned");
-    size >> (page_size as usize).trailing_zeros()
+fn divide_page(size: usize, page_size: PageSize) -> AxResult<usize> {
+    if !page_size.is_aligned(size) {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(size >> (page_size as usize).trailing_zeros())
 }
 
 fn alloc_frame(zeroed: bool, size: PageSize) -> AxResult<PhysAddr> {
@@ -148,7 +150,9 @@ impl MappingBackend for Backend {
     type PageTable = PageTable;
 
     fn map(&self, start: VirtAddr, size: usize, flags: MappingFlags, pt: &mut PageTable) -> bool {
-        let range = VirtAddrRange::from_start_size(start, size);
+        let Some(range) = VirtAddrRange::try_from_start_size(start, size) else {
+            return false;
+        };
         if let Err(err) = BackendOps::map(self, range, flags, &mut pt.cursor()) {
             warn!("Failed to map area: {:?}", err);
             false
@@ -158,7 +162,9 @@ impl MappingBackend for Backend {
     }
 
     fn unmap(&self, start: VirtAddr, size: usize, pt: &mut PageTable) -> bool {
-        let range = VirtAddrRange::from_start_size(start, size);
+        let Some(range) = VirtAddrRange::try_from_start_size(start, size) else {
+            return false;
+        };
         if let Err(err) = BackendOps::unmap(self, range, &mut pt.cursor()) {
             warn!("Failed to unmap area: {:?}", err);
             false
@@ -174,7 +180,9 @@ impl MappingBackend for Backend {
         new_flags: Self::Flags,
         pt: &mut Self::PageTable,
     ) -> bool {
-        let range = VirtAddrRange::from_start_size(start, size);
+        let Some(range) = VirtAddrRange::try_from_start_size(start, size) else {
+            return false;
+        };
         let mut cursor = pt.cursor();
         if let Err(err) = BackendOps::on_protect(self, range, new_flags, &mut cursor) {
             warn!("Failed to protect area: {:?}", err);

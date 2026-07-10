@@ -17,6 +17,8 @@ use memory_addr::{
 };
 use memory_set::{MemoryArea, MemorySet};
 
+use super::checked_align_up_4k;
+
 mod backend;
 
 pub use self::backend::*;
@@ -89,8 +91,9 @@ impl AddrSpace {
 
     /// Creates a new empty address space.
     pub fn new_empty(base: VirtAddr, size: usize) -> AxResult<Self> {
+        let va_range = VirtAddrRange::try_from_start_size(base, size).ok_or(AxError::NoMemory)?;
         Ok(Self {
-            va_range: VirtAddrRange::from_start_size(base, size),
+            va_range,
             areas: MemorySet::new(),
             growdown_starts: BTreeSet::new(),
             wipe_on_fork_ranges: BTreeMap::new(),
@@ -584,8 +587,16 @@ impl AddrSpace {
         if locked {
             self.insert_locked_range(start, start + size);
         }
-        if populate {
-            self.populate_area(start, size, flags)?;
+        if populate && let Err(err) = self.populate_area(start, size, flags) {
+            if let Err(unmap_err) = self.areas.unmap(start, size, &mut self.pt) {
+                warn!(
+                    "AddrSpace::map: failed to roll back {start:?}+{size:#x} after populate \
+                     error: {unmap_err:?}"
+                );
+            }
+            self.refresh_growdown_starts();
+            self.clear_locked_range(start, size);
+            return Err(err);
         }
         Ok(())
     }
@@ -607,7 +618,9 @@ impl AddrSpace {
             area.backend()
                 .populate(range, area.flags(), access_flags, &mut modify)?;
             start = area.end();
-            assert!(start.is_aligned_4k());
+            if !start.is_aligned_4k() {
+                return Err(AxError::BadAddress);
+            }
             if start >= end {
                 break;
             }
@@ -732,10 +745,12 @@ impl AddrSpace {
         }
         let mut cnt = 0;
         // If start is aligned to 4K, start_align_down will be equal to start_align_up.
-        let end_align_up = (start + size).align_up_4k();
-        for vaddr in PageIter4K::new(start.align_down_4k(), end_align_up)
-            .expect("Failed to create page iterator")
-        {
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        let end_align_up =
+            VirtAddr::from(checked_align_up_4k(end.as_usize()).ok_or(AxError::InvalidInput)?);
+        let pages =
+            PageIter4K::new(start.align_down_4k(), end_align_up).ok_or(AxError::InvalidInput)?;
+        for vaddr in pages {
             let (mut paddr, ..) = self.pt.query(vaddr).map_err(|_| AxError::BadAddress)?;
 
             let mut copy_size = (size - cnt).min(PAGE_SIZE_4K);

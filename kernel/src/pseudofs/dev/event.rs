@@ -5,7 +5,7 @@ use core::{any::Any, task::Context, time::Duration};
 use axdriver::prelude::{
     AxInputDevice, BaseDriverOps, DevError, Event, EventType, InputDeviceId, InputDriverOps,
 };
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::{DeviceId, NodeFlags, NodeType, VfsResult};
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
@@ -147,12 +147,6 @@ struct InputEvent {
     value: i32,
 }
 
-#[unsafe(no_mangle)]
-#[inline(never)]
-pub extern "C" fn ongkey() {
-    core::hint::black_box(());
-}
-
 impl DeviceOps for EventDev {
     fn read_at(&self, buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
         if buf.is_empty() {
@@ -216,7 +210,9 @@ impl DeviceOps for EventDev {
                     self.inner.lock().device.device_id();
                 Ok(0)
             }
-            EVIOCGRAB => Ok(0),
+            // Exclusive grabs require ownership per open file description. DeviceOps is
+            // shared by every opener, so claiming success here would not provide EVIOCGRAB.
+            EVIOCGRAB => Err(LinuxError::EOPNOTSUPP.into()),
             other => {
                 // variable-length command
                 let mut tmp = other;
@@ -293,8 +289,7 @@ impl DeviceOps for EventDev {
                         }
                         const ABS_CNT: u8 = 0x40;
                         if nr & !(ABS_CNT - 1) == ABS_CNT {
-                            // TODO: abs info
-                            return Ok(0);
+                            return Err(LinuxError::EOPNOTSUPP.into());
                         }
                         return Err(AxError::InvalidInput);
                     }
@@ -315,8 +310,10 @@ impl Pollable for EventDev {
     }
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.contains(IoEvents::IN) {
-            context.waker().wake_by_ref();
+        if events.contains(IoEvents::IN)
+            && let Some(irq) = self.inner.lock().device.irq_num()
+        {
+            axtask::future::register_irq_waker(irq, context.waker());
         }
     }
 }
