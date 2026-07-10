@@ -1,9 +1,8 @@
+use alloc::borrow::Cow;
+
 use axerrno::{AxError, AxResult};
 use axfs::FsContext;
-use axfs_ng_vfs::{
-    Location, NodePermission, NodeType,
-    path::{Component, Path},
-};
+use axfs_ng_vfs::{Location, NodePermission, NodeType, path::Path};
 use axtask::current_may_uninit;
 use linux_raw_sys::general::{CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, R_OK, W_OK, X_OK};
 
@@ -98,67 +97,11 @@ pub(crate) fn check_dac_permissions(
     }
 }
 
-pub(crate) fn check_parent_search_permissions(
-    loc: &Location,
+pub(crate) fn check_pathwalk_search_permission(
+    dir: &Location,
     credentials: &DacCredentialView,
 ) -> AxResult {
-    let mut parent = loc.parent();
-    while let Some(dir) = parent {
-        let stat = dir.metadata()?;
-        check_dac_permissions(
-            stat.mode.bits() as u32,
-            stat.uid,
-            stat.gid,
-            stat.node_type,
-            X_OK,
-            credentials,
-        )?;
-        parent = dir.parent();
-    }
-    Ok(())
-}
-
-pub(crate) fn check_path_prefix_search_permissions(
-    fs: &FsContext,
-    path: &Path,
-    credentials: &DacCredentialView,
-) -> AxResult {
-    let mut current = if path.is_absolute() {
-        fs.root_dir().clone()
-    } else {
-        fs.current_dir().clone()
-    };
-    let mut components = path.components().peekable();
-
-    while let Some(comp) = components.next() {
-        match comp {
-            Component::CurDir => {}
-            Component::RootDir => current = fs.root_dir().clone(),
-            Component::ParentDir => {
-                check_search_permissions(&current, credentials)?;
-                current = current.parent().unwrap_or_else(|| fs.root_dir().clone());
-            }
-            Component::Normal(name) => {
-                check_search_permissions(&current, credentials)?;
-                if components.peek().is_none() {
-                    break;
-                }
-                current = fs.with_current_dir(current.clone())?.resolve(name)?;
-                current.check_is_dir()?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-pub(crate) fn check_search_permissions(
-    loc: &Location,
-    credentials: &DacCredentialView,
-) -> AxResult {
-    check_parent_search_permissions(loc, credentials)?;
-
-    let stat = loc.metadata()?;
+    let stat = dir.metadata()?;
     check_dac_permissions(
         stat.mode.bits() as u32,
         stat.uid,
@@ -167,6 +110,86 @@ pub(crate) fn check_search_permissions(
         X_OK,
         credentials,
     )
+}
+
+/// Linux DAC admission over the generic axfs path resolver.
+///
+/// The generic resolver owns component and symlink traversal. This adapter
+/// injects one immutable-per-operation credential view without teaching axfs
+/// about Linux identities or capabilities.
+pub(crate) trait DacFsContextExt {
+    fn resolve_dac(
+        &self,
+        path: impl AsRef<Path>,
+        credentials: &DacCredentialView,
+    ) -> AxResult<Location>;
+
+    fn resolve_no_follow_dac(
+        &self,
+        path: impl AsRef<Path>,
+        credentials: &DacCredentialView,
+    ) -> AxResult<Location>;
+
+    fn resolve_parent_dac<'a>(
+        &self,
+        path: &'a Path,
+        credentials: &DacCredentialView,
+    ) -> AxResult<(Location, Cow<'a, str>)>;
+
+    fn resolve_nonexistent_dac<'a>(
+        &self,
+        path: &'a Path,
+        credentials: &DacCredentialView,
+    ) -> AxResult<(Location, &'a str)>;
+}
+
+impl DacFsContextExt for FsContext {
+    fn resolve_dac(
+        &self,
+        path: impl AsRef<Path>,
+        credentials: &DacCredentialView,
+    ) -> AxResult<Location> {
+        self.resolve_with_admission(path, &mut |dir| {
+            check_pathwalk_search_permission(dir, credentials)
+        })
+    }
+
+    fn resolve_no_follow_dac(
+        &self,
+        path: impl AsRef<Path>,
+        credentials: &DacCredentialView,
+    ) -> AxResult<Location> {
+        self.resolve_no_follow_with_admission(path, &mut |dir| {
+            check_pathwalk_search_permission(dir, credentials)
+        })
+    }
+
+    fn resolve_parent_dac<'a>(
+        &self,
+        path: &'a Path,
+        credentials: &DacCredentialView,
+    ) -> AxResult<(Location, Cow<'a, str>)> {
+        self.resolve_parent_with_admission(path, &mut |dir| {
+            check_pathwalk_search_permission(dir, credentials)
+        })
+    }
+
+    fn resolve_nonexistent_dac<'a>(
+        &self,
+        path: &'a Path,
+        credentials: &DacCredentialView,
+    ) -> AxResult<(Location, &'a str)> {
+        self.resolve_nonexistent_with_admission(path, &mut |dir| {
+            check_pathwalk_search_permission(dir, credentials)
+        })
+    }
+}
+
+pub(crate) fn check_search_permissions(
+    loc: &Location,
+    credentials: &DacCredentialView,
+) -> AxResult {
+    check_pathwalk_search_permission(loc, credentials)
 }
 
 pub(crate) fn check_create_permissions(
@@ -181,7 +204,6 @@ fn check_directory_write_search_permissions(
     credentials: &DacCredentialView,
 ) -> AxResult {
     check_writable_mount(dir)?;
-    check_parent_search_permissions(dir, credentials)?;
 
     let stat = dir.metadata()?;
     check_dac_permissions(
@@ -248,8 +270,6 @@ pub(crate) fn check_open_permissions(
         return Ok(());
     }
 
-    check_parent_search_permissions(loc, credentials)?;
-
     let stat = loc.metadata()?;
     check_dac_permissions(
         stat.mode.bits() as u32,
@@ -269,8 +289,6 @@ pub(crate) fn check_execute_permissions(
     if crate::mounts::is_noexec(path.as_ref()) {
         return Err(AxError::PermissionDenied);
     }
-
-    check_parent_search_permissions(loc, credentials)?;
 
     let stat = loc.metadata()?;
     if stat.node_type != NodeType::RegularFile {

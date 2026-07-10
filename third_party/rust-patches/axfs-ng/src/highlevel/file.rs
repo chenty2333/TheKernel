@@ -265,36 +265,65 @@ impl OpenOptions {
 
     /// Opens a file at the given path relative to the provided [`FsContext`].
     pub fn open(&self, context: &FsContext, path: impl AsRef<Path>) -> VfsResult<OpenResult> {
+        self.open_with_admission(context, path, &mut |_| Ok(()))
+    }
+
+    /// Opens a file while admitting every directory traversed by path lookup.
+    pub fn open_with_admission<F>(
+        &self,
+        context: &FsContext,
+        path: impl AsRef<Path>,
+        admission: &mut F,
+    ) -> VfsResult<OpenResult>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+    {
+        let mut allow_create = |_dir: &Location| Ok(());
+        let (loc, _created) = self.resolve_location_with_admission(
+            context,
+            path,
+            admission,
+            &mut allow_create,
+        )?;
+        self._open(loc)
+    }
+
+    /// Resolves or creates the exact location that an open operation would
+    /// use, without constructing the high-level file backend or applying
+    /// truncate semantics.
+    ///
+    /// A dangling final symlink is followed recursively when creation is
+    /// enabled. The same path-admission callback and symlink budget are kept
+    /// for the whole operation. `create_admission` is invoked on the actual
+    /// directory immediately before a missing final component may be created.
+    pub fn resolve_location_with_admission<F, C>(
+        &self,
+        context: &FsContext,
+        path: impl AsRef<Path>,
+        admission: &mut F,
+        create_admission: &mut C,
+    ) -> VfsResult<(Location, bool)>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        C: FnMut(&Location) -> VfsResult<()> + ?Sized,
+    {
         if !self.is_valid() {
             return Err(VfsError::InvalidInput);
         }
 
-        let loc = match context.resolve_parent(path.as_ref()) {
-            Ok((parent, name)) => {
-                let mut loc = parent.open_file(
-                    &name,
-                    &axfs_ng_vfs::OpenOptions {
-                        create: self.create,
-                        create_new: self.create_new,
-                        node_type: self.node_type,
-                        permission: NodePermission::from_bits_truncate(self.mode as _),
-                        user: self.user,
-                    },
-                )?;
-                if !self.no_follow {
-                    loc = context
-                        .with_current_dir(parent)?
-                        .try_resolve_symlink(loc, &mut 0)?;
-                }
-                loc
-            }
-            Err(VfsError::InvalidInput) => {
-                // root directory
-                context.root_dir().clone()
-            }
-            Err(err) => return Err(err),
-        };
-        self._open(loc)
+        context.resolve_open_with_admission(
+            path.as_ref(),
+            &axfs_ng_vfs::OpenOptions {
+                create: self.create,
+                create_new: self.create_new,
+                node_type: self.node_type,
+                permission: NodePermission::from_bits_truncate(self.mode as _),
+                user: self.user,
+            },
+            !self.no_follow,
+            admission,
+            create_admission,
+        )
     }
 
     pub(crate) fn to_flags(&self) -> VfsResult<FileFlags> {

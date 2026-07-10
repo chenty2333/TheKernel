@@ -7,14 +7,13 @@ use alloc::{
 use core::{ffi::c_char, future::poll_fn, mem::size_of, task::Poll};
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs::FS_CONTEXT;
 use axfs_ng_vfs::NodeType;
 use axhal::uspace::UserContext;
 use axtask::{
     current,
     future::{block_on, interruptible},
 };
-use linux_raw_sys::general::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
+use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use memory_addr::PAGE_SIZE_4K;
 use starry_process::Pid;
 use starry_signal::{SignalAction, SignalDisposition, Signo};
@@ -368,7 +367,9 @@ pub fn sys_execve(
 
     debug!("sys_execve <= path: {path:?}, args: {args:?}, envs: {envs:?}");
 
-    let loc = FS_CONTEXT.lock().resolve(&path)?;
+    let loc = resolve_at(AT_FDCWD, Some(&path), 0)?
+        .into_file()
+        .ok_or(AxError::InvalidInput)?;
     do_execve(uctx, loc, args, envs)
 }
 

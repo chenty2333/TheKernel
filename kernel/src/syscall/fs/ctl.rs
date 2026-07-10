@@ -33,11 +33,11 @@ use crate::{
         inotify::location_for_fd,
         is_path_only_fd,
         permission::{
-            check_create_permissions, check_open_permissions, check_parent_search_permissions,
+            DacFsContextExt, check_create_permissions, check_open_permissions,
             check_remove_permissions, check_rename_permissions, check_search_permissions,
             check_writable_mount,
         },
-        resolve_at, with_fs, with_path_fs,
+        resolve_at_with_credentials, with_fs, with_path_fs,
     },
     mm::vm_load_string,
     mounts,
@@ -45,7 +45,7 @@ use crate::{
         ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
         namespace_target_from_proc_file, proc_namespace_location_from_object,
     },
-    task::{AsThread, PidNamespace},
+    task::{AsThread, DacCredentialView, PidNamespace},
     time::{TimeValueLike, wall_time},
 };
 
@@ -143,11 +143,17 @@ pub(super) fn validate_pathname(path: &Path) -> AxResult {
     Ok(())
 }
 
-fn resolve_existing_at(dirfd: i32, path: &Path) -> AxResult<Option<Location>> {
-    with_path_fs(dirfd, path, |fs| match fs.resolve_no_follow(path) {
-        Ok(loc) => Ok(Some(loc)),
-        Err(AxError::NotFound) => Ok(None),
-        Err(err) => Err(err),
+fn resolve_existing_at(
+    dirfd: i32,
+    path: &Path,
+    credentials: &DacCredentialView,
+) -> AxResult<Option<Location>> {
+    with_path_fs(dirfd, path, |fs| {
+        match fs.resolve_no_follow_dac(path, credentials) {
+            Ok(loc) => Ok(Some(loc)),
+            Err(AxError::NotFound) => Ok(None),
+            Err(err) => Err(err),
+        }
     })
 }
 
@@ -302,11 +308,12 @@ fn same_entry_at(
     old_path: &Path,
     new_dirfd: i32,
     new_path: &Path,
+    credentials: &DacCredentialView,
 ) -> AxResult<bool> {
-    let Some(old) = resolve_existing_at(old_dirfd, old_path)? else {
+    let Some(old) = resolve_existing_at(old_dirfd, old_path, credentials)? else {
         return Ok(false);
     };
-    let Some(new) = resolve_existing_at(new_dirfd, new_path)? else {
+    let Some(new) = resolve_existing_at(new_dirfd, new_path, credentials)? else {
         return Ok(false);
     };
     Ok(old.inode() == new.inode() && Arc::ptr_eq(old.mountpoint(), new.mountpoint()))
@@ -410,7 +417,7 @@ pub fn sys_chdir(path: *const c_char) -> AxResult<isize> {
     let proc_data = &curr.as_thread().proc_data;
     let credentials = proc_data.fs_dac_credentials();
     let mut fs = FS_CONTEXT.lock();
-    let entry = fs.resolve(path)?;
+    let entry = fs.resolve_dac(path, &credentials)?;
     if entry.node_type() != NodeType::Directory {
         return Err(AxError::NotADirectory);
     }
@@ -447,7 +454,7 @@ pub fn sys_chroot(path: *const c_char) -> AxResult<isize> {
     let proc_data = &curr.as_thread().proc_data;
     let credentials = proc_data.fs_dac_credentials();
     let mut fs = FS_CONTEXT.lock();
-    let loc = fs.resolve(path)?;
+    let loc = fs.resolve_dac(path, &credentials)?;
     if loc.node_type() != NodeType::Directory {
         return Err(AxError::NotADirectory);
     }
@@ -473,7 +480,7 @@ pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize
     let credentials = proc_data.fs_dac_credentials();
     let path_ref = Path::new(&path);
     let (parent, name) = with_path_fs(dirfd, path_ref, |fs| {
-        let (parent, name) = fs.resolve_nonexistent(path_ref)?;
+        let (parent, name) = fs.resolve_nonexistent_dac(path_ref, &credentials)?;
         check_create_permissions(&parent, &credentials)?;
         Ok((parent, name.to_string()))
     })?;
@@ -527,7 +534,7 @@ pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, dev: u64) -> AxRe
     let requested_mode = NodePermission::from_bits_truncate((mode & !proc_data.umask()) as u16);
     let credentials = proc_data.fs_dac_credentials();
     let (parent, name) = with_path_fs(dirfd, path_ref, |fs| {
-        let (parent, name) = fs.resolve_nonexistent(path_ref)?;
+        let (parent, name) = fs.resolve_nonexistent_dac(path_ref, &credentials)?;
         check_create_permissions(&parent, &credentials)?;
         Ok((parent, name.to_string()))
     })?;
@@ -681,23 +688,22 @@ pub fn sys_linkat(
     let old = match old_path.as_deref() {
         Some(path) if flags & AT_SYMLINK_FOLLOW != 0 => proc_self_fd_location(path)
             .unwrap_or_else(|| {
-                resolve_at(old_dirfd, Some(path), flags)?
+                resolve_at_with_credentials(old_dirfd, Some(path), flags, &credentials)?
                     .into_file()
                     .ok_or(AxError::BadFileDescriptor)
             })?,
-        Some(path) if !path.is_empty() => {
-            with_path_fs(old_dirfd, Path::new(path), |fs| fs.resolve_no_follow(path))?
-        }
-        _ => resolve_at(old_dirfd, old_path.as_deref(), flags)?
+        Some(path) if !path.is_empty() => with_path_fs(old_dirfd, Path::new(path), |fs| {
+            fs.resolve_no_follow_dac(path, &credentials)
+        })?,
+        _ => resolve_at_with_credentials(old_dirfd, old_path.as_deref(), flags, &credentials)?
             .into_file()
             .ok_or(AxError::BadFileDescriptor)?,
     };
-    check_parent_search_permissions(&old, &credentials)?;
     let (new_dir, new_name) = with_path_fs(new_dirfd, Path::new(&new_path), |fs| {
-        if fs.resolve(Path::new(&new_path)).is_ok() {
+        if fs.resolve_dac(Path::new(&new_path), &credentials).is_ok() {
             return Err(AxError::AlreadyExists);
         }
-        let (new_dir, new_name) = fs.resolve_nonexistent(Path::new(&new_path))?;
+        let (new_dir, new_name) = fs.resolve_nonexistent_dac(Path::new(&new_path), &credentials)?;
         check_create_permissions(&new_dir, &credentials)?;
         Ok((new_dir, new_name))
     })?;
@@ -750,39 +756,28 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
     let proc_data = &curr.as_thread().proc_data;
     let credentials = proc_data.fs_dac_credentials();
     let (parent_hint, name_hint) = with_path_fs(dirfd, path_ref, |fs| {
-        let (parent, name) = fs.resolve_nonexistent(path_ref)?;
+        let (parent, name) = fs.resolve_nonexistent_dac(path_ref, &credentials)?;
         check_writable_mount(&parent)?;
         Ok((parent, name.to_string()))
     })?;
     let loc = parent_hint.lookup_no_follow(&name_hint)?;
-    let parent = loc.parent();
-    let name = loc.name().to_string();
+    let parent = parent_hint;
+    let name = name_hint;
     let is_dir = loc.is_dir();
     let last_link = is_dir || loc.metadata()?.nlink <= 1;
-    if let Some(parent) = parent.as_ref() {
-        check_remove_permissions(parent, &loc, &credentials)?;
-    }
+    check_remove_permissions(&parent, &loc, &credentials)?;
+    parent.unlink_checked(&name, flags == AT_REMOVEDIR as _, &loc)?;
     if !is_dir && last_link {
         axfs::mark_cached_file_unlinked(&loc);
     }
-    with_path_fs(dirfd, Path::new(&path), |fs| {
-        if flags == AT_REMOVEDIR as _ {
-            fs.remove_dir(&path)?;
-        } else {
-            fs.remove_file(&path)?;
-        }
-        Ok(0)
-    })?;
-    if let Some(parent) = parent {
-        let _ = crate::file::inotify::notify_parent_with_name(
-            &parent,
-            Some(&loc),
-            &name,
-            IN_DELETE,
-            is_dir,
-            0,
-        );
-    }
+    let _ = crate::file::inotify::notify_parent_with_name(
+        &parent,
+        Some(&loc),
+        &name,
+        IN_DELETE,
+        is_dir,
+        0,
+    );
     if !is_dir && last_link {
         let _ = crate::file::inotify::notify_exact(&loc, IN_ATTRIB);
     }
@@ -845,17 +840,18 @@ pub fn sys_symlinkat(
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let credentials = proc_data.fs_dac_credentials();
-    let (parent, name) = with_path_fs(new_dirfd, linkpath_ref, |fs| {
-        let (parent, name) = fs.resolve_nonexistent(linkpath_ref)?;
+    let loc = with_path_fs(new_dirfd, linkpath_ref, |fs| {
+        let (parent, name) = fs.resolve_nonexistent_dac(linkpath_ref, &credentials)?;
         check_create_permissions(&parent, &credentials)?;
-        fs.symlink(target.as_str(), linkpath.as_str())?;
-        Ok((parent, name.to_string()))
+        let loc = parent.create(name, NodeType::Symlink, NodePermission::default())?;
+        loc.entry().as_file()?.set_symlink(&target)?;
+        Ok(loc)
     })?;
-    if let Ok(loc) = parent.lookup_no_follow(&name) {
+    if let Some(parent) = loc.parent() {
         let _ = crate::file::inotify::notify_parent_with_name(
             &parent,
             Some(&loc),
-            &name,
+            loc.name(),
             IN_CREATE,
             loc.is_dir(),
             0,
@@ -876,10 +872,6 @@ pub fn sys_readlinkat(
     size: usize,
 ) -> AxResult<isize> {
     fn write_readlink_result(loc: &Location, buf: *mut u8, size: usize) -> AxResult<isize> {
-        let curr = current();
-        let proc_data = &curr.as_thread().proc_data;
-        let credentials = proc_data.fs_dac_credentials();
-        check_parent_search_permissions(loc, &credentials)?;
         let link = loc.read_link()?;
         let read = size.min(link.len());
         vm_write_slice(buf, &link.as_bytes()[..read])?;
@@ -904,8 +896,11 @@ pub fn sys_readlinkat(
     }
     validate_pathname(Path::new(&path))?;
 
+    let curr = current();
+    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+
     with_path_fs(dirfd, Path::new(&path), |fs| {
-        let entry = fs.resolve_no_follow(path.as_str())?;
+        let entry = fs.resolve_no_follow_dac(path.as_str(), &credentials)?;
         write_readlink_result(&entry, buf, size)
     })
 }
@@ -944,7 +939,10 @@ pub fn sys_fchownat(
     }
     check_empty_fd_metadata_access(dirfd, path.as_deref(), flags)?;
     check_proc_fd_metadata_access(path.as_deref())?;
-    let loc = resolve_at(dirfd, path.as_deref(), flags)?
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let credentials = proc_data.fs_dac_credentials();
+    let loc = resolve_at_with_credentials(dirfd, path.as_deref(), flags, &credentials)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
     let meta = loc.metadata()?;
@@ -952,12 +950,6 @@ pub fn sys_fchownat(
     let uid = if uid == -1 { meta.uid } else { uid as _ };
     let gid = if gid == -1 { meta.gid } else { gid as _ };
     check_writable_mount(&loc)?;
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    if path.as_deref().is_some_and(|path| !path.is_empty()) {
-        let credentials = proc_data.fs_dac_credentials();
-        check_parent_search_permissions(&loc, &credentials)?;
-    }
     check_chown_permission(&meta, uid, gid)?;
     let mode = chown_mode_after_update(&meta);
     loc.update_metadata(MetadataUpdate {
@@ -992,7 +984,9 @@ pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> A
     }
     check_empty_fd_metadata_access(dirfd, path.as_deref(), flags)?;
     check_proc_fd_metadata_access(path.as_deref())?;
-    let loc = resolve_at(dirfd, path.as_deref(), flags)?
+    let curr = current();
+    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+    let loc = resolve_at_with_credentials(dirfd, path.as_deref(), flags, &credentials)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
     let meta = loc.metadata()?;
@@ -1021,7 +1015,10 @@ fn update_times(
     flags: u32,
 ) -> AxResult<()> {
     let path = path.nullable().map(vm_load_string).transpose()?;
-    let loc = resolve_at(dirfd, path.as_deref(), flags)?
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let credentials = proc_data.fs_dac_credentials();
+    let loc = resolve_at_with_credentials(dirfd, path.as_deref(), flags, &credentials)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
     if atime_intent == TimeUpdate::Omit && mtime_intent == TimeUpdate::Omit {
@@ -1029,9 +1026,6 @@ fn update_times(
     }
 
     let meta = loc.metadata()?;
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let credentials = proc_data.fs_dac_credentials();
     if credentials.uid() != meta.uid && !credentials.has_capability(CAP_FOWNER) {
         if (atime_intent, mtime_intent) != (TimeUpdate::Now, TimeUpdate::Now) {
             return Err(AxError::OperationNotPermitted);
@@ -1191,15 +1185,18 @@ pub fn sys_renameat2(
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let credentials = proc_data.fs_dac_credentials();
-    let old_loc = with_path_fs(old_dirfd, old_path_ref, |fs| {
-        fs.resolve_no_follow(&old_path)
+    let (old_loc, old_is_root) = with_path_fs(old_dirfd, old_path_ref, |fs| {
+        let loc = fs.resolve_no_follow_dac(&old_path, &credentials)?;
+        let is_root = loc.ptr_eq(fs.root_dir());
+        Ok((loc, is_root))
     })?;
     let old_is_dir = old_loc.is_dir();
-    let old_is_root = with_path_fs(old_dirfd, old_path_ref, |fs| {
-        Ok(fs.path_refers_to_root(old_path_ref))
-    })?;
     let new_is_root = with_path_fs(new_dirfd, new_path_ref, |fs| {
-        Ok(fs.path_refers_to_root(new_path_ref))
+        match fs.resolve_no_follow_dac(new_path_ref, &credentials) {
+            Ok(loc) => Ok(loc.ptr_eq(fs.root_dir())),
+            Err(AxError::NotFound) => Ok(false),
+            Err(err) => Err(err),
+        }
     })?;
 
     if old_is_root {
@@ -1207,30 +1204,32 @@ pub fn sys_renameat2(
             return Err(AxError::ResourceBusy);
         }
         with_path_fs(new_dirfd, new_path_ref, |fs| {
-            fs.resolve_parent(new_path_ref)?;
+            fs.resolve_parent_dac(new_path_ref, &credentials)?;
             Err(AxError::ResourceBusy)
         })?;
     }
 
     if new_is_root {
-        with_path_fs(old_dirfd, old_path_ref, |fs| {
-            fs.resolve_no_follow(old_path_ref)?;
-            Ok(())
-        })?;
         return Err(AxError::ResourceBusy);
     }
 
-    if same_entry_at(old_dirfd, old_path_ref, new_dirfd, new_path_ref)? {
+    if same_entry_at(
+        old_dirfd,
+        old_path_ref,
+        new_dirfd,
+        new_path_ref,
+        &credentials,
+    )? {
         return Ok(0);
     }
 
     let (old_dir, old_name) = with_path_fs(old_dirfd, old_path_ref, |fs| {
-        fs.resolve_parent(old_path_ref)
+        fs.resolve_parent_dac(old_path_ref, &credentials)
     })?;
     let (new_dir, new_name) = with_path_fs(new_dirfd, new_path_ref, |fs| {
-        fs.resolve_parent(new_path_ref)
+        fs.resolve_parent_dac(new_path_ref, &credentials)
     })?;
-    let new_existing = resolve_existing_at(new_dirfd, new_path_ref)?;
+    let new_existing = resolve_existing_at(new_dirfd, new_path_ref, &credentials)?;
 
     if flags & RENAME_NOREPLACE != 0 && new_existing.is_some() {
         return Err(AxError::AlreadyExists);

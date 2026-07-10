@@ -17,7 +17,7 @@ use crate::{
         inode_flags,
         inotify::{notify_exact, notify_read, notify_write},
         lease, memfd,
-        permission::{check_open_permissions, check_writable_mount},
+        permission::{DacFsContextExt, check_open_permissions, check_writable_mount},
     },
     mm::{
         IoVec, IoVectorBuf, PinnedUserSegments, PinnedUserSegmentsMut, UserConstPtr, VmBytes,
@@ -1548,7 +1548,7 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
     let curr = axtask::current();
     let proc_data = &curr.as_thread().proc_data;
     let credentials = proc_data.fs_dac_credentials();
-    let loc = FS_CONTEXT.lock().resolve(path)?;
+    let loc = FS_CONTEXT.lock().resolve_dac(path, &credentials)?;
     check_open_permissions(&loc, W_OK as u32, &credentials)?;
     check_writable_mount(&loc)?;
     check_resize_limit(length as u64)?;
@@ -1562,7 +1562,7 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
     )?;
     let file = OpenOptions::new()
         .write(true)
-        .open(&FS_CONTEXT.lock(), path)?
+        .open_loc(loc.clone())?
         .into_file()?;
     file.access(FileFlags::WRITE)?.set_len(length as _)?;
     touch_modified_metadata(&loc)?;

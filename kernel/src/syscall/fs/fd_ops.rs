@@ -35,8 +35,8 @@ use crate::{
         },
         install_tmpfile_state, lease, memfd,
         permission::{
-            check_create_permissions, check_open_permissions, check_path_prefix_search_permissions,
-            check_writable_mount,
+            DacFsContextExt, check_create_permissions, check_open_permissions,
+            check_pathwalk_search_permission, check_writable_mount,
         },
         pipe::NamedPipe,
         release_posix_locks_on_close, resolve_at, with_path_fs,
@@ -44,7 +44,10 @@ use crate::{
     mm::{UserConstPtr, UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
     syscall::fs::ctl::validate_pathname,
-    task::{AX_FILE_LIMIT, AsThread, get_process_data, get_process_group, get_visible_task},
+    task::{
+        AX_FILE_LIMIT, AsThread, DacCredentialView, get_process_data, get_process_group,
+        get_visible_task,
+    },
     time::wall_time,
 };
 
@@ -475,113 +478,82 @@ fn open_in_fs(
     path: &str,
     flags: i32,
     mode: __kernel_mode_t,
+    credentials: &DacCredentialView,
 ) -> AxResult<isize> {
     validate_pathname(Path::new(path))?;
     debug!("sys_openat <= {path:?} {flags:#o} {mode:#o}");
 
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let credentials = proc_data.fs_dac_credentials();
     let uid = credentials.uid();
     let gid = credentials.gid();
     let mode = mode & !current().as_thread().proc_data.umask();
-    let path_ref = Path::new(path);
-    check_path_prefix_search_permissions(fs, path_ref, &credentials)?;
-    let created_parent = if (flags as u32) & O_CREAT != 0 {
-        match fs.resolve_no_follow(path) {
-            Ok(loc) => {
-                enforce_trailing_slash_directory(path, &loc)?;
-                if (flags as u32) & O_EXCL != 0 {
-                    return Err(AxError::AlreadyExists);
-                }
-                enforce_special_open_rules(&loc, flags, uid)?;
-                if loc.is_dir() && invalid_directory_open(flags) {
-                    return Err(AxError::IsADirectory);
-                }
-                check_open_permissions(&loc, open_access_mask(flags), &credentials)?;
-                None
-            }
-            Err(AxError::NotFound) => {
-                let (parent, name) = fs.resolve_nonexistent(Path::new(path))?;
-                check_create_permissions(&parent, &credentials)?;
-                Some((parent, name.to_string()))
-            }
-            Err(err) => return Err(err),
-        }
-    } else {
-        let loc = if (flags as u32) & O_NOFOLLOW != 0 {
-            fs.resolve_no_follow(path)?
-        } else {
-            fs.resolve(path)?
-        };
-        enforce_trailing_slash_directory(path, &loc)?;
-        enforce_special_open_rules(&loc, flags, uid)?;
-        if loc.is_dir() && invalid_directory_open(flags) {
-            return Err(AxError::IsADirectory);
-        }
-        check_open_permissions(&loc, open_access_mask(flags), &credentials)?;
-        None
-    };
+    let resolve_options = flags_to_options(flags, mode, (uid, gid));
+    let (loc, created) = resolve_options.resolve_location_with_admission(
+        fs,
+        path,
+        &mut |dir| check_pathwalk_search_permission(dir, credentials),
+        &mut |dir| check_create_permissions(dir, credentials),
+    )?;
 
-    let existing_loc = if created_parent.is_none() {
-        let existing = if (flags as u32) & O_NOFOLLOW != 0 {
-            fs.resolve_no_follow(path)
-        } else {
-            fs.resolve(path)
-        }?;
-        enforce_trailing_slash_directory(path, &existing)?;
-        enforce_special_open_rules(&existing, flags, uid)?;
-        check_executable_open_rules(&existing, flags)?;
-        if existing.is_dir() && invalid_directory_open(flags) {
-            return Err(AxError::IsADirectory);
-        }
+    enforce_trailing_slash_directory(path, &loc)?;
+    enforce_special_open_rules(&loc, flags, uid)?;
+    if loc.is_dir() && invalid_directory_open(flags) {
+        return Err(AxError::IsADirectory);
+    }
+    if !created {
+        check_open_permissions(&loc, open_access_mask(flags), credentials)?;
+        check_executable_open_rules(&loc, flags)?;
         if open_requires_writable_mount(flags) {
-            check_writable_mount(&existing)?;
+            check_writable_mount(&loc)?;
         }
-        lease::wait_for_open(&existing, flags)?;
+        lease::wait_for_open(&loc, flags)?;
         if (flags as u32) & O_PATH == 0 {
             crate::file::fanotify::permission_check(
-                &existing,
-                &existing,
+                &loc,
+                &loc,
                 crate::file::fanotify::FAN_OPEN_PERM,
-                existing.is_dir(),
+                loc.is_dir(),
                 false,
             )?;
         }
-        Some(existing)
+    }
+
+    let created_parent = if created {
+        Some((
+            loc.parent().ok_or(AxError::InvalidInput)?,
+            loc.name().to_string(),
+        ))
     } else {
         None
     };
 
     let mut effective_flags = flags;
-    if created_parent.is_none() && (flags as u32) & O_CREAT != 0 && (flags as u32) & O_EXCL == 0 {
+    if !created && (flags as u32) & O_CREAT != 0 && (flags as u32) & O_EXCL == 0 {
         effective_flags &= !(O_CREAT as i32);
     }
-    let opened_existing = created_parent.is_none();
+    let opened_existing = !created;
 
     let options = flags_to_options(effective_flags, mode, (uid, gid));
-    let open_result = if let Some(loc) = existing_loc {
-        options.open_loc(loc)
-    } else {
-        options.open(fs, path)
-    };
-    let fd = open_result
+    let fd = options
+        .open_loc(loc)
         .and_then(|it| add_to_fd(it, effective_flags as _))
         .map(|fd| fd as isize)?;
 
     if let Some(loc) = location_for_fd(fd as i32) {
         if let Some((parent, name)) = created_parent {
             let mut final_mode = NodePermission::from_bits_truncate(mode as u16);
-            let mut owner_gid = proc_data.fsgid();
+            let mut owner_gid = credentials.gid();
             let parent_meta = parent.metadata()?;
             if parent_meta.mode.contains(NodePermission::SET_GID) {
                 owner_gid = parent_meta.gid;
             }
-            if proc_data.fsuid() != 0 && !proc_data.is_in_fs_group(owner_gid) {
+            if credentials.uid() != 0
+                && credentials.gid() != owner_gid
+                && !credentials.supplementary_groups().contains(&owner_gid)
+            {
                 final_mode.remove(NodePermission::SET_GID);
             }
             loc.update_supported_metadata(MetadataUpdate {
-                owner: Some((proc_data.fsuid(), owner_gid)),
+                owner: Some((credentials.uid(), owner_gid)),
                 mode: Some(final_mode),
                 ..Default::default()
             })?;
@@ -610,12 +582,24 @@ pub(crate) fn openat_inner(
     flags: i32,
     mode: __kernel_mode_t,
 ) -> AxResult<isize> {
+    let curr = current();
+    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+    openat_inner_with_credentials(dirfd, path, flags, mode, &credentials)
+}
+
+fn openat_inner_with_credentials(
+    dirfd: c_int,
+    path: &str,
+    flags: i32,
+    mode: __kernel_mode_t,
+    credentials: &DacCredentialView,
+) -> AxResult<isize> {
     if (flags as u32 & O_TMPFILE) == O_TMPFILE {
-        return open_tmpfile(dirfd, path, flags, mode);
+        return open_tmpfile(dirfd, path, flags, mode, credentials);
     }
 
     with_path_fs(dirfd, Path::new(path), |fs| {
-        open_in_fs(fs, path, flags, mode)
+        open_in_fs(fs, path, flags, mode, credentials)
     })
 }
 
@@ -626,20 +610,26 @@ fn unlink_tmpfile_backing(fd: c_int) -> AxResult<()> {
     parent.unlink(loc.name(), false)
 }
 
-fn open_tmpfile(dirfd: c_int, path: &str, flags: i32, mode: __kernel_mode_t) -> AxResult<isize> {
+fn open_tmpfile(
+    dirfd: c_int,
+    path: &str,
+    flags: i32,
+    mode: __kernel_mode_t,
+    credentials: &DacCredentialView,
+) -> AxResult<isize> {
     if (flags as u32 & O_ACCMODE) == O_RDONLY {
         return Err(AxError::InvalidInput);
     }
 
     let path_ref = Path::new(path);
     validate_pathname(path_ref)?;
-    let dir_loc = with_path_fs(dirfd, path_ref, |fs| fs.resolve(path_ref))?;
+    let dir_loc = with_path_fs(dirfd, path_ref, |fs| fs.resolve_dac(path_ref, credentials))?;
     dir_loc.check_is_dir()?;
 
     let tmp_flags = ((flags as u32) & !(O_TMPFILE | O_DIRECTORY)) | O_CREAT | O_EXCL;
     for _ in 0..64 {
         let tmp_path = next_tmpfile_path(path);
-        match openat_inner(dirfd, &tmp_path, tmp_flags as i32, mode) {
+        match openat_inner_with_credentials(dirfd, &tmp_path, tmp_flags as i32, mode, credentials) {
             Ok(fd) => {
                 if let Err(err) = unlink_tmpfile_backing(fd as c_int) {
                     let _ = close_file_like(fd as c_int);
@@ -672,6 +662,8 @@ pub fn sys_openat2(
     size: usize,
 ) -> AxResult<isize> {
     let path = vm_load_string(path)?;
+    let curr = current();
+    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
     if size < OPENAT2_HOW_SIZE {
         return Err(AxError::InvalidInput);
     }
@@ -715,13 +707,19 @@ pub fn sys_openat2(
         if how.resolve & RESOLVE_NO_XDEV as u64 != 0 {
             return Err(AxError::from(LinuxError::EXDEV));
         }
-        let exe_path = current().as_thread().proc_data.exe_path.read().clone();
-        return openat_inner(AT_FDCWD, &exe_path, flags, how.mode as __kernel_mode_t);
+        let exe_path = curr.as_thread().proc_data.exe_path.read().clone();
+        return openat_inner_with_credentials(
+            AT_FDCWD,
+            &exe_path,
+            flags,
+            how.mode as __kernel_mode_t,
+            &credentials,
+        );
     }
 
     let base_dir = openat_base_dir(dirfd, &path, how.resolve)?;
     match with_path_fs(dirfd, adjusted_ref, |fs| {
-        fs.resolve_no_follow(&adjusted_path)
+        fs.resolve_no_follow_dac(&adjusted_path, &credentials)
     }) {
         Ok(loc) => {
             if how.resolve & RESOLVE_NO_XDEV as u64 != 0
@@ -739,7 +737,7 @@ pub fn sys_openat2(
         }
         Err(AxError::NotFound) if creating => {
             let parent = with_path_fs(dirfd, adjusted_ref, |fs| {
-                let (parent, _) = fs.resolve_nonexistent(adjusted_ref)?;
+                let (parent, _) = fs.resolve_nonexistent_dac(adjusted_ref, &credentials)?;
                 Ok(parent)
             })?;
             if how.resolve & RESOLVE_NO_XDEV as u64 != 0
@@ -753,10 +751,22 @@ pub fn sys_openat2(
 
     if how.resolve & RESOLVE_IN_ROOT as u64 != 0 && Path::new(&path).is_absolute() {
         let mut fs = FsContext::new(base_dir);
-        return open_in_fs(&mut fs, &adjusted_path, flags, how.mode as __kernel_mode_t);
+        return open_in_fs(
+            &mut fs,
+            &adjusted_path,
+            flags,
+            how.mode as __kernel_mode_t,
+            &credentials,
+        );
     }
 
-    openat_inner(dirfd, &adjusted_path, flags, how.mode as __kernel_mode_t)
+    openat_inner_with_credentials(
+        dirfd,
+        &adjusted_path,
+        flags,
+        how.mode as __kernel_mode_t,
+        &credentials,
+    )
 }
 
 /// Open a file by `filename` and insert it into the file descriptor table.

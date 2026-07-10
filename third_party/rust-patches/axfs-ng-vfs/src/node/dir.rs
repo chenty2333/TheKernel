@@ -223,10 +223,32 @@ impl DirNode {
 
     /// Unlinks a directory entry by name.
     pub fn unlink(&self, name: &str, is_dir: bool) -> VfsResult<()> {
+        self.unlink_inner(name, is_dir, None)
+    }
+
+    /// Unlinks `name` only if it still denotes `expected`.
+    pub fn unlink_checked(
+        &self,
+        name: &str,
+        is_dir: bool,
+        expected: &DirEntry,
+    ) -> VfsResult<()> {
+        self.unlink_inner(name, is_dir, Some(expected))
+    }
+
+    fn unlink_inner(
+        &self,
+        name: &str,
+        is_dir: bool,
+        expected: Option<&DirEntry>,
+    ) -> VfsResult<()> {
         verify_entry_name(name)?;
 
         let mut children = self.cache.lock();
         let entry = self.lookup_locked(name, &mut children)?;
+        if expected.is_some_and(|expected| !entry.ptr_eq(expected)) {
+            return Err(VfsError::NotFound);
+        }
         match (entry.is_dir(), is_dir) {
             (true, false) => return Err(VfsError::IsADirectory),
             (false, true) => return Err(VfsError::NotADirectory),
@@ -332,6 +354,20 @@ impl DirNode {
 
     /// Opens (or creates) a file in the directory.
     pub fn open_file(&self, name: &str, options: &OpenOptions) -> VfsResult<DirEntry> {
+        self.open_file_with_status(name, options)
+            .map(|(entry, _created)| entry)
+    }
+
+    /// Opens (or creates) a file and reports whether this call created it.
+    ///
+    /// The status is decided while holding the directory cache lock, so a
+    /// caller never has to infer creation from a racy lookup before or after
+    /// the operation.
+    pub fn open_file_with_status(
+        &self,
+        name: &str,
+        options: &OpenOptions,
+    ) -> VfsResult<(DirEntry, bool)> {
         verify_entry_name(name)?;
 
         let mut children = self.cache.lock();
@@ -340,20 +376,26 @@ impl DirNode {
                 if options.create_new {
                     return Err(VfsError::AlreadyExists);
                 }
-                return Ok(val);
+                return Ok((val, false));
             }
             Err(err) if err.canonicalize() == VfsError::NotFound && options.create => {}
             Err(err) => return Err(err),
         }
         let entry =
             self.create_locked(name, options.node_type, options.permission, &mut children)?;
-        if options.user.is_some() {
-            entry.update_metadata(MetadataUpdate {
+        if options.user.is_some()
+            && let Err(err) = entry.update_metadata(MetadataUpdate {
                 owner: options.user,
                 ..Default::default()
-            })?;
+            })
+        {
+            let _ = self.ops.unlink(name);
+            let retired = children.remove(name);
+            drop(children);
+            drop(retired);
+            return Err(err);
         }
-        Ok(entry)
+        Ok((entry, true))
     }
 
     pub fn mountpoint(&self) -> Option<Arc<Mountpoint>> {

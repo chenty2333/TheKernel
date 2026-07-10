@@ -7,7 +7,8 @@ use alloc::{
 };
 
 use axfs_ng_vfs::{
-    Location, Metadata, NodePermission, NodeType, VfsError, VfsResult,
+    Location, Metadata, NodePermission, NodeType, OpenOptions as VfsOpenOptions, VfsError,
+    VfsResult,
     path::{Component, Components, Path, PathBuf},
 };
 use axio::{Read, Write};
@@ -18,6 +19,15 @@ use super::File;
 
 /// Maximum number of symlinks that will be followed during path resolution.
 pub const SYMLINKS_MAX: usize = 40;
+
+fn allow_pathwalk(_dir: &Location) -> VfsResult<()> {
+    Ok(())
+}
+
+pub(crate) fn path_requires_directory(path: &Path) -> bool {
+    let raw = path.as_str();
+    raw.ends_with('/') || raw.trim_end_matches('/').rsplit('/').next() == Some(".")
+}
 
 /// Global root filesystem context, initialized once during [`init_filesystems`](crate::init_filesystems).
 pub static ROOT_FS_CONTEXT: Once<FsContext> = Once::new();
@@ -69,7 +79,7 @@ impl FsContext {
         path.is_absolute()
             && self
                 .resolve_no_follow(path)
-                .is_ok_and(|entry| entry.is_root())
+                .is_ok_and(|entry| entry.ptr_eq(&self.root_dir))
     }
 
     /// Creates a new context with `root_dir` as both root and current directory.
@@ -122,6 +132,19 @@ impl FsContext {
         loc: Location,
         follow_count: &mut usize,
     ) -> VfsResult<Location> {
+        self.try_resolve_symlink_with_admission(loc, follow_count, &mut allow_pathwalk)
+    }
+
+    /// Resolves a possible symlink while admitting each traversed directory.
+    pub fn try_resolve_symlink_with_admission<F>(
+        &self,
+        loc: Location,
+        follow_count: &mut usize,
+        admission: &mut F,
+    ) -> VfsResult<Location>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+    {
         if loc.node_type() != NodeType::Symlink {
             return Ok(loc);
         }
@@ -136,70 +159,295 @@ impl FsContext {
         if target.is_empty() {
             return Err(VfsError::NotFound);
         }
-        self.resolve_components(PathBuf::from(target).components(), follow_count)
+        self.resolve_path_with_admission(Path::new(&target), follow_count, admission)
     }
 
-    fn lookup(&self, dir: &Location, name: &str, follow_count: &mut usize) -> VfsResult<Location> {
+    fn lookup_with_admission<F>(
+        &self,
+        dir: &Location,
+        name: &str,
+        follow_count: &mut usize,
+        admission: &mut F,
+    ) -> VfsResult<Location>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+    {
+        admission(dir)?;
         let loc = dir.lookup_no_follow(name)?;
         self.with_current_dir(dir.clone())?
-            .try_resolve_symlink(loc, follow_count)
+            .try_resolve_symlink_with_admission(loc, follow_count, admission)
     }
 
-    fn resolve_components(
+    fn resolve_components_with_admission<F>(
         &self,
         components: Components,
         follow_count: &mut usize,
-    ) -> VfsResult<Location> {
+        admission: &mut F,
+    ) -> VfsResult<Location>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+    {
         let mut dir = self.current_dir.clone();
         for comp in components {
             match comp {
-                Component::CurDir => {}
+                Component::CurDir => {
+                    dir.check_is_dir()?;
+                    admission(&dir)?;
+                }
                 Component::ParentDir => {
-                    dir = dir.parent().unwrap_or_else(|| self.root_dir.clone());
+                    dir.check_is_dir()?;
+                    admission(&dir)?;
+                    if !dir.ptr_eq(&self.root_dir) {
+                        dir = dir.parent().unwrap_or_else(|| self.root_dir.clone());
+                    }
                 }
                 Component::RootDir => {
                     dir = self.root_dir.clone();
                 }
                 Component::Normal(name) => {
-                    dir = self.lookup(&dir, name, follow_count)?;
+                    dir =
+                        self.lookup_with_admission(&dir, name, follow_count, admission)?;
                 }
             }
         }
         Ok(dir)
     }
 
-    fn resolve_inner<'a>(
+    fn resolve_inner_with_admission<'a, F>(
         &self,
         path: &'a Path,
         follow_count: &mut usize,
-    ) -> VfsResult<(Location, Option<&'a str>)> {
+        admission: &mut F,
+    ) -> VfsResult<(Location, Option<&'a str>)>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+    {
         let entry_name = path.file_name();
         let mut components = path.components();
         if entry_name.is_some() {
             components.next_back();
         }
-        let dir = self.resolve_components(components, follow_count)?;
+        let dir =
+            self.resolve_components_with_admission(components, follow_count, admission)?;
         dir.check_is_dir()?;
         Ok((dir, entry_name))
     }
 
     /// Resolves a path starting from `current_dir`.
     pub fn resolve(&self, path: impl AsRef<Path>) -> VfsResult<Location> {
+        self.resolve_with_admission(path, &mut allow_pathwalk)
+    }
+
+    /// Resolves a path after admitting every directory used for lookup.
+    ///
+    /// The callback is also applied while following relative or absolute
+    /// symlink targets. It lets callers enforce pathname-search policy without
+    /// embedding an ABI policy in the generic VFS.
+    pub fn resolve_with_admission<F>(
+        &self,
+        path: impl AsRef<Path>,
+        admission: &mut F,
+    ) -> VfsResult<Location>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+    {
         let mut follow_count = 0;
-        let (dir, name) = self.resolve_inner(path.as_ref(), &mut follow_count)?;
-        match name {
-            Some(name) => self.lookup(&dir, name, &mut follow_count),
+        self.resolve_path_with_admission(path.as_ref(), &mut follow_count, admission)
+    }
+
+    fn resolve_path_with_admission<F>(
+        &self,
+        path: &Path,
+        follow_count: &mut usize,
+        admission: &mut F,
+    ) -> VfsResult<Location>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+    {
+        let (dir, name) =
+            self.resolve_inner_with_admission(path, follow_count, admission)?;
+        let loc = match name {
+            Some(name) => self.lookup_with_admission(&dir, name, follow_count, admission),
             None => Ok(dir),
+        }?;
+        if path_requires_directory(path) {
+            loc.check_is_dir()?;
+            let final_component_is_dot = path
+                .as_str()
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                == Some(".");
+            if final_component_is_dot && path.file_name().is_some()
+            {
+                admission(&loc)?;
+            }
         }
+        Ok(loc)
     }
 
     /// Resolves a path starting from `current_dir` not following symlinks.
     pub fn resolve_no_follow(&self, path: impl AsRef<Path>) -> VfsResult<Location> {
-        let (dir, name) = self.resolve_inner(path.as_ref(), &mut 0)?;
+        self.resolve_no_follow_with_admission(path, &mut allow_pathwalk)
+    }
+
+    /// Resolves a path without following the final symlink, admitting every
+    /// directory traversed through parent components and their symlink targets.
+    pub fn resolve_no_follow_with_admission<F>(
+        &self,
+        path: impl AsRef<Path>,
+        admission: &mut F,
+    ) -> VfsResult<Location>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+    {
+        let path = path.as_ref();
+        if path_requires_directory(path) {
+            return self.resolve_with_admission(path, admission);
+        }
+        let (dir, name) = self.resolve_inner_with_admission(path, &mut 0, admission)?;
         match name {
-            Some(name) => dir.lookup_no_follow(name),
+            Some(name) => {
+                admission(&dir)?;
+                dir.lookup_no_follow(name)
+            }
             None => Ok(dir),
         }
+    }
+
+    pub(crate) fn resolve_open_with_admission<F, C>(
+        &self,
+        path: &Path,
+        options: &VfsOpenOptions,
+        follow_final_symlink: bool,
+        admission: &mut F,
+        create_admission: &mut C,
+    ) -> VfsResult<(Location, bool)>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        C: FnMut(&Location) -> VfsResult<()> + ?Sized,
+    {
+        let mut follow_count = 0;
+        self.resolve_open_inner(
+            path,
+            options,
+            follow_final_symlink,
+            &mut follow_count,
+            admission,
+            create_admission,
+        )
+    }
+
+    fn resolve_open_inner<F, C>(
+        &self,
+        path: &Path,
+        options: &VfsOpenOptions,
+        follow_final_symlink: bool,
+        follow_count: &mut usize,
+        admission: &mut F,
+        create_admission: &mut C,
+    ) -> VfsResult<(Location, bool)>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        C: FnMut(&Location) -> VfsResult<()> + ?Sized,
+    {
+        if path.as_str().is_empty() {
+            return Err(VfsError::NotFound);
+        }
+
+        if path.file_name().is_none() {
+            let loc = self.resolve_path_with_admission(path, follow_count, admission)?;
+            if options.create_new {
+                return Err(VfsError::AlreadyExists);
+            }
+            return Ok((loc, false));
+        }
+
+        let (parent, name) = match self.resolve_parent_with_admission_at_count(
+            path,
+            follow_count,
+            admission,
+        ) {
+            Ok(parent_and_name) => parent_and_name,
+            Err(VfsError::InvalidInput) => {
+                let loc = self.resolve_path_with_admission(path, follow_count, admission)?;
+                if options.create_new {
+                    return Err(VfsError::AlreadyExists);
+                }
+                return Ok((loc, false));
+            }
+            Err(err) => return Err(err),
+        };
+        admission(&parent)?;
+
+        let loc = match parent.lookup_no_follow(&name) {
+            Ok(loc) => {
+                if options.create_new {
+                    return Err(VfsError::AlreadyExists);
+                }
+                loc
+            }
+            Err(VfsError::NotFound) if options.create => {
+                if path_requires_directory(path) {
+                    return Err(VfsError::IsADirectory);
+                }
+                create_admission(&parent)?;
+                let (loc, created) = parent.open_file_with_status(&name, options)?;
+                if created {
+                    return Ok((loc, true));
+                }
+                loc
+            }
+            Err(err) => return Err(err),
+        };
+
+        let requires_directory = path_requires_directory(path);
+        if (follow_final_symlink || requires_directory) && loc.node_type() == NodeType::Symlink {
+            if !Self::may_follow_symlink(&loc) || *follow_count >= SYMLINKS_MAX {
+                return Err(VfsError::FilesystemLoop);
+            }
+            *follow_count += 1;
+            let target = loc.read_link()?;
+            if target.is_empty() {
+                return Err(VfsError::NotFound);
+            }
+            let result = self.with_current_dir(parent)?.resolve_open_inner(
+                Path::new(&target),
+                options,
+                follow_final_symlink,
+                follow_count,
+                admission,
+                create_admission,
+            )?;
+            if requires_directory {
+                result.0.check_is_dir()?;
+                let final_component_is_dot = path
+                    .as_str()
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    == Some(".");
+                if final_component_is_dot && path.file_name().is_some() {
+                    admission(&result.0)?;
+                }
+            }
+            return Ok(result);
+        }
+
+        if requires_directory {
+            loc.check_is_dir()?;
+            let final_component_is_dot = path
+                .as_str()
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                == Some(".");
+            if final_component_is_dot && path.file_name().is_some() {
+                admission(&loc)?;
+            }
+        }
+
+        Ok((loc, false))
     }
 
     /// Taking current node as root directory, resolves a path starting from
@@ -208,9 +456,35 @@ impl FsContext {
     /// Returns `(parent_dir, entry_name)`, where `entry_name` is the name of
     /// the entry.
     pub fn resolve_parent<'a>(&self, path: &'a Path) -> VfsResult<(Location, Cow<'a, str>)> {
-        let (dir, name) = self.resolve_inner(path, &mut 0)?;
+        self.resolve_parent_with_admission(path, &mut allow_pathwalk)
+    }
+
+    /// Resolves a parent directory while admitting every directory traversed.
+    pub fn resolve_parent_with_admission<'a, F>(
+        &self,
+        path: &'a Path,
+        admission: &mut F,
+    ) -> VfsResult<(Location, Cow<'a, str>)>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+    {
+        self.resolve_parent_with_admission_at_count(path, &mut 0, admission)
+    }
+
+    fn resolve_parent_with_admission_at_count<'a, F>(
+        &self,
+        path: &'a Path,
+        follow_count: &mut usize,
+        admission: &mut F,
+    ) -> VfsResult<(Location, Cow<'a, str>)>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+    {
+        let (dir, name) = self.resolve_inner_with_admission(path, follow_count, admission)?;
         if let Some(name) = name {
             Ok((dir, Cow::Borrowed(name)))
+        } else if dir.ptr_eq(&self.root_dir) {
+            Err(VfsError::InvalidInput)
         } else if let Some(parent) = dir.parent() {
             Ok((parent, Cow::Owned(dir.name().to_owned())))
         } else {
@@ -226,10 +500,22 @@ impl FsContext {
     /// entry's non-existence. It simply raises an error if the entry name is
     /// not present in the path.
     pub fn resolve_nonexistent<'a>(&self, path: &'a Path) -> VfsResult<(Location, &'a str)> {
-        let (dir, name) = self.resolve_inner(path, &mut 0)?;
+        self.resolve_nonexistent_with_admission(path, &mut allow_pathwalk)
+    }
+
+    /// Resolves a nonexistent final component while admitting its parent walk.
+    pub fn resolve_nonexistent_with_admission<'a, F>(
+        &self,
+        path: &'a Path,
+        admission: &mut F,
+    ) -> VfsResult<(Location, &'a str)>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+    {
+        let (dir, name) = self.resolve_inner_with_admission(path, &mut 0, admission)?;
         if let Some(name) = name {
             Ok((dir, name))
-        } else if self.path_refers_to_root(path) {
+        } else if path.is_absolute() && dir.ptr_eq(&self.root_dir) {
             Err(VfsError::AlreadyExists)
         } else {
             Err(VfsError::InvalidInput)
@@ -423,11 +709,12 @@ impl Iterator for ReadDir {
 
 #[cfg(test)]
 mod tests {
-    use alloc::sync::Arc;
+    use alloc::{sync::Arc, vec::Vec};
     use core::{
         any::Any,
         mem::size_of,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        task::Context,
         time::Duration,
     };
     use std::{
@@ -436,13 +723,15 @@ mod tests {
     };
 
     use axfs_ng_vfs::{
-        DirEntry, DirEntrySink, DirNode, DirNodeOps, Filesystem, FilesystemOps, Location, Metadata,
-        MetadataUpdate, Mountpoint, NodeOps, NodePermission, NodeType, Reference, StatFs, VfsError,
-        VfsResult, WeakDirEntry,
+        DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode, FileNodeOps, Filesystem,
+        FilesystemOps, Location, Metadata, MetadataUpdate, Mountpoint, NodeOps, NodePermission,
+        NodeType, Reference, StatFs, VfsError, VfsResult, WeakDirEntry, path::Path,
     };
+    use axpoll::{IoEvents, Pollable};
     use spin::Once;
 
     use super::FsContext;
+    use crate::OpenOptions;
 
     // Keep normal unmount as a consuming capability operation. In particular,
     // this must not silently regress to `fn(&Location)` where `Arc<Location>`
@@ -588,6 +877,100 @@ mod tests {
                 Reference::new(parent, name.to_owned()),
             )
         }
+
+        fn file(&self, name: &str, node_type: NodeType, contents: &str) -> DirEntry {
+            DirEntry::new_file(
+                FileNode::new(Arc::new(TestFile {
+                    fs: self.fs.clone(),
+                    contents: contents.as_bytes().to_vec(),
+                })),
+                node_type,
+                Reference::new(self.this.upgrade(), name.to_owned()),
+            )
+        }
+    }
+
+    struct TestFile {
+        fs: Arc<TestFs>,
+        contents: Vec<u8>,
+    }
+
+    impl NodeOps for TestFile {
+        fn inode(&self) -> u64 {
+            2
+        }
+
+        fn metadata(&self) -> VfsResult<Metadata> {
+            Ok(Metadata {
+                device: 0,
+                inode: 2,
+                nlink: 1,
+                mode: NodePermission::from_bits_truncate(0o755),
+                node_type: NodeType::RegularFile,
+                uid: 0,
+                gid: 0,
+                size: self.contents.len() as u64,
+                block_size: 4096,
+                blocks: 0,
+                rdev: Default::default(),
+                atime: Duration::ZERO,
+                btime: Duration::ZERO,
+                mtime: Duration::ZERO,
+                ctime: Duration::ZERO,
+            })
+        }
+
+        fn update_metadata(&self, _update: MetadataUpdate) -> VfsResult<()> {
+            Ok(())
+        }
+
+        fn filesystem(&self) -> &dyn FilesystemOps {
+            &*self.fs
+        }
+
+        fn sync(&self, _data_only: bool) -> VfsResult<()> {
+            Ok(())
+        }
+
+        fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+            self
+        }
+    }
+
+    impl Pollable for TestFile {
+        fn poll(&self) -> IoEvents {
+            IoEvents::IN | IoEvents::OUT
+        }
+
+        fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+    }
+
+    impl FileNodeOps for TestFile {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+            let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidInput)?;
+            let Some(contents) = self.contents.get(offset..) else {
+                return Ok(0);
+            };
+            let len = buf.len().min(contents.len());
+            buf[..len].copy_from_slice(&contents[..len]);
+            Ok(len)
+        }
+
+        fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+            Err(VfsError::Unsupported)
+        }
+
+        fn append(&self, _buf: &[u8]) -> VfsResult<(usize, u64)> {
+            Err(VfsError::Unsupported)
+        }
+
+        fn set_len(&self, _len: u64) -> VfsResult<()> {
+            Err(VfsError::Unsupported)
+        }
+
+        fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+            Err(VfsError::Unsupported)
+        }
     }
 
     impl NodeOps for TestDir {
@@ -645,20 +1028,26 @@ mod tests {
         }
 
         fn lookup(&self, name: &str) -> VfsResult<DirEntry> {
-            if matches!(name, "child" | "other") {
-                Ok(self.child(name))
-            } else {
-                Err(VfsError::NotFound)
+            match name {
+                "child" | "other" => Ok(self.child(name)),
+                "file" => Ok(self.file(name, NodeType::RegularFile, "")),
+                "jump" => Ok(self.file(name, NodeType::Symlink, "/child/child")),
+                "jump-create" => Ok(self.file(name, NodeType::Symlink, "/child/new")),
+                "bad-jump" => Ok(self.file(name, NodeType::Symlink, "/file/")),
+                _ => Err(VfsError::NotFound),
             }
         }
 
         fn create(
             &self,
-            _name: &str,
-            _node_type: NodeType,
+            name: &str,
+            node_type: NodeType,
             _permission: NodePermission,
         ) -> VfsResult<DirEntry> {
-            Err(VfsError::Unsupported)
+            Ok(match node_type {
+                NodeType::Directory => self.child(name),
+                node_type => self.file(name, node_type, ""),
+            })
         }
 
         fn link(&self, _name: &str, _node: &DirEntry) -> VfsResult<DirEntry> {
@@ -687,6 +1076,150 @@ mod tests {
     #[test]
     fn location_stays_two_pointer_words() {
         assert_eq!(size_of::<Location>(), size_of::<usize>() * 2);
+    }
+
+    #[test]
+    fn pathwalk_admission_observes_each_lookup_directory() {
+        let context = TestFs::context();
+        let mut visited = Vec::new();
+
+        context
+            .resolve_with_admission("/child/child", &mut |dir| {
+                visited.push(dir.absolute_path()?.as_str().to_owned());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(visited, ["/", "/child"]);
+    }
+
+    #[test]
+    fn pathwalk_admission_can_reject_an_intermediate_directory() {
+        let context = TestFs::context();
+
+        let result = context.resolve_with_admission("/child/child", &mut |dir| {
+            if dir.name() == "child" {
+                Err(VfsError::PermissionDenied)
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(result.unwrap_err(), VfsError::PermissionDenied);
+    }
+
+    #[test]
+    fn pathwalk_admission_covers_symlink_targets() {
+        let context = TestFs::context();
+
+        let result = context.resolve_with_admission("/jump", &mut |dir| {
+            if dir.name() == "child" {
+                Err(VfsError::PermissionDenied)
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(result.unwrap_err(), VfsError::PermissionDenied);
+    }
+
+    #[test]
+    fn pathwalk_rejects_parent_traversal_through_a_regular_file() {
+        let context = TestFs::context();
+        assert_eq!(
+            context.resolve("/file/../child").unwrap_err(),
+            VfsError::NotADirectory
+        );
+    }
+
+    #[test]
+    fn terminal_dot_is_a_directory_search_component() {
+        let context = TestFs::context();
+        let result = context.resolve_with_admission("/child/.", &mut |dir| {
+            if dir.name() == "child" {
+                Err(VfsError::PermissionDenied)
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result.unwrap_err(), VfsError::PermissionDenied);
+    }
+
+    #[test]
+    fn no_follow_still_follows_a_symlink_before_a_trailing_slash() {
+        let context = TestFs::context();
+        assert!(context.resolve_no_follow("/jump/").unwrap().is_dir());
+    }
+
+    #[test]
+    fn context_root_clamps_parent_traversal_and_parent_resolution() {
+        let outer = TestFs::context();
+        let jail_root = outer.resolve("/child").unwrap();
+        let context = FsContext::new(jail_root);
+
+        assert!(context.resolve("..").unwrap().ptr_eq(context.root_dir()));
+        assert_eq!(
+            context.resolve_parent(Path::new("/")).unwrap_err(),
+            VfsError::InvalidInput
+        );
+    }
+
+    #[test]
+    fn create_open_follows_a_dangling_symlink_with_one_admission_chain() {
+        let context = TestFs::context();
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).mode(0o600).user(1000, 1000);
+        let mut create_parents = Vec::new();
+
+        let (loc, created) = options
+            .resolve_location_with_admission(
+                &context,
+                "/jump-create",
+                &mut |_| Ok(()),
+                &mut |parent| {
+                    create_parents.push(parent.absolute_path()?.as_str().to_owned());
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert!(created);
+        assert_eq!(loc.absolute_path().unwrap().as_str(), "/child/new");
+        assert_eq!(create_parents, ["/child"]);
+    }
+
+    #[test]
+    fn exclusive_create_rejects_a_dangling_symlink_itself() {
+        let context = TestFs::context();
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create(true)
+            .create_new(true)
+            .mode(0o600);
+
+        let result = options.resolve_location_with_admission(
+            &context,
+            "/jump-create",
+            &mut |_| Ok(()),
+            &mut |_| Ok(()),
+        );
+        assert_eq!(result.unwrap_err(), VfsError::AlreadyExists);
+    }
+
+    #[test]
+    fn open_honors_a_trailing_slash_inside_a_symlink_target() {
+        let context = TestFs::context();
+        let mut options = OpenOptions::new();
+        options.read(true);
+
+        let result = options.resolve_location_with_admission(
+            &context,
+            "/bad-jump",
+            &mut |_| Ok(()),
+            &mut |_| Ok(()),
+        );
+        assert_eq!(result.unwrap_err(), VfsError::NotADirectory);
     }
 
     #[test]

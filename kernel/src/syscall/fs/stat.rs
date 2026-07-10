@@ -17,11 +17,8 @@ use super::ctl::validate_pathname;
 use crate::{
     file::{
         Directory, File, FileLike, Pipe, Socket, get_file_like,
-        permission::{
-            check_dac_permissions, check_parent_search_permissions,
-            check_path_prefix_search_permissions,
-        },
-        resolve_at, with_path_fs,
+        permission::{DacFsContextExt, check_dac_permissions},
+        resolve_at, resolve_at_with_credentials, with_path_fs,
     },
     mm::vm_load_string,
     mounts,
@@ -61,6 +58,7 @@ fn node_type_from_mode(mode: u32) -> NodeType {
     NodeType::from(((mode & S_IFMT) >> 12) as u8)
 }
 
+#[cfg(test)]
 fn uses_empty_path_fd(path: Option<&str>, flags: u32) -> bool {
     flags & AT_EMPTY_PATH != 0 && path.is_none_or(str::is_empty)
 }
@@ -171,16 +169,7 @@ pub fn sys_fstatat(
 
     debug!("sys_fstatat <= dirfd: {dirfd}, path: {path:?}, flags: {flags}");
 
-    let uses_fd = uses_empty_path_fd(path.as_deref(), flags);
     let loc = resolve_at(dirfd, path.as_deref(), flags)?;
-    if let crate::file::ResolveAtResult::File(file) = &loc {
-        if !uses_fd {
-            let curr = current();
-            let proc_data = &curr.as_thread().proc_data;
-            let credentials = proc_data.fs_dac_credentials();
-            check_parent_search_permissions(file, &credentials)?;
-        }
-    }
     statbuf.vm_write(loc.stat()?.into())?;
 
     Ok(0)
@@ -244,16 +233,7 @@ pub fn sys_statx(
         validate_pathname(Path::new(path))?;
     }
 
-    let uses_fd = uses_empty_path_fd(path.as_deref(), flags);
     let loc = resolve_at(dirfd, path.as_deref(), flags)?;
-    if let crate::file::ResolveAtResult::File(file) = &loc {
-        if !uses_fd {
-            let curr = current();
-            let proc_data = &curr.as_thread().proc_data;
-            let credentials = proc_data.fs_dac_credentials();
-            check_parent_search_permissions(file, &credentials)?;
-        }
-    }
     statxbuf.vm_write(statx_from_kstat(loc.stat()?, mask))?;
 
     Ok(0)
@@ -306,8 +286,7 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
     let proc_data = &curr.as_thread().proc_data;
     let credentials = proc_data.access_dac_credentials(flags & AT_EACCESS as u32 != 0);
 
-    let uses_fd = uses_empty_path_fd(path.as_deref(), flags);
-    let file = resolve_at(dirfd, path.as_deref(), flags)?;
+    let file = resolve_at_with_credentials(dirfd, path.as_deref(), flags, &credentials)?;
     let stat = file.stat()?;
     let perm = stat.mode & NodePermission::all().bits() as u32;
     let node_type = node_type_from_mode(stat.mode);
@@ -317,9 +296,6 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
         crate::file::ResolveAtResult::Other(_) => None,
     };
     if let Some(loc) = loc {
-        if !uses_fd {
-            check_parent_search_permissions(loc, &credentials)?;
-        }
         if mode & X_OK != 0 && node_type == NodeType::RegularFile {
             let path = loc.absolute_path().map_err(|_| AxError::InvalidInput)?;
             if crate::mounts::is_noexec(path.as_ref()) {
@@ -405,8 +381,7 @@ pub fn sys_statfs(path: *const c_char, buf: *mut statfs) -> AxResult<isize> {
     let proc_data = &curr.as_thread().proc_data;
     let credentials = proc_data.fs_dac_credentials();
     let loc = with_path_fs(AT_FDCWD, path_ref, |fs| {
-        check_path_prefix_search_permissions(fs, path_ref, &credentials)?;
-        fs.resolve(path_ref).map_err(Into::into)
+        fs.resolve_dac(path_ref, &credentials)
     })?;
 
     buf.vm_write(statfs(&loc.mountpoint().root_location())?)?;

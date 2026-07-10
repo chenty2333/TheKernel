@@ -774,11 +774,38 @@ impl Location {
         self.entry.as_dir()?.unlink(name, is_dir)
     }
 
+    pub fn unlink_checked(
+        &self,
+        name: &str,
+        is_dir: bool,
+        expected: &Self,
+    ) -> VfsResult<()> {
+        if !Arc::ptr_eq(self.mountpoint(), expected.mountpoint()) {
+            return Err(VfsError::ResourceBusy);
+        }
+        self.entry
+            .as_dir()?
+            .unlink_checked(name, is_dir, &expected.entry)
+    }
+
     pub fn open_file(&self, name: &str, options: &OpenOptions) -> VfsResult<Location> {
         self.entry
             .as_dir()?
             .open_file(name, options)
             .and_then(|entry| self.wrap(entry).resolve_mountpoint())
+    }
+
+    pub fn open_file_with_status(
+        &self,
+        name: &str,
+        options: &OpenOptions,
+    ) -> VfsResult<(Location, bool)> {
+        self.entry
+            .as_dir()?
+            .open_file_with_status(name, options)
+            .and_then(|(entry, created)| {
+                Ok((self.wrap(entry).resolve_mountpoint()?, created))
+            })
     }
 
     pub fn read_dir(&self, offset: u64, sink: &mut dyn DirEntrySink) -> VfsResult<usize> {

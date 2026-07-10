@@ -21,11 +21,14 @@ use linux_raw_sys::general::{
 };
 use starry_signal::{SignalInfo, Signo};
 
-use super::{FileHandle, FileLike, Kstat, get_file_description, get_file_like, get_typed_file};
+use super::{
+    FileHandle, FileLike, Kstat, get_file_description, get_file_like, get_typed_file,
+    permission::DacFsContextExt,
+};
 use crate::{
     file::{IoDst, IoSrc, memfd},
     mounts,
-    task::{AsThread, send_signal_to_process},
+    task::{AsThread, DacCredentialView, send_signal_to_process},
 };
 
 const O_PATH_STATUS_FLAG: u32 = linux_raw_sys::general::O_PATH;
@@ -127,10 +130,26 @@ impl ResolveAtResult {
 }
 
 pub fn resolve_at(dirfd: c_int, path: Option<&str>, flags: u32) -> AxResult<ResolveAtResult> {
+    let current = current();
+    let credentials = current.as_thread().proc_data.fs_dac_credentials();
+    resolve_at_with_credentials(dirfd, path, flags, &credentials)
+}
+
+pub fn resolve_at_with_credentials(
+    dirfd: c_int,
+    path: Option<&str>,
+    flags: u32,
+    credentials: &DacCredentialView,
+) -> AxResult<ResolveAtResult> {
     match path {
         Some("") | None => {
             if flags & AT_EMPTY_PATH == 0 {
                 return Err(AxError::NotFound);
+            }
+            if dirfd == AT_FDCWD {
+                return Ok(ResolveAtResult::File(
+                    FS_CONTEXT.lock().current_dir().clone(),
+                ));
             }
             let file_like = get_file_like(dirfd)?;
             let f = file_like.clone();
@@ -144,9 +163,9 @@ pub fn resolve_at(dirfd: c_int, path: Option<&str>, flags: u32) -> AxResult<Reso
         }
         Some(path) => with_path_fs(dirfd, Path::new(path), |fs| {
             if flags & AT_SYMLINK_NOFOLLOW != 0 {
-                fs.resolve_no_follow(path)
+                fs.resolve_no_follow_dac(path, credentials)
             } else {
-                fs.resolve(path)
+                fs.resolve_dac(path, credentials)
             }
             .map(ResolveAtResult::File)
         }),

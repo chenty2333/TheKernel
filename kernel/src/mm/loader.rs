@@ -21,12 +21,24 @@ use uluru::LRUCache;
 
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
-    file::permission::check_current_execute_permissions,
+    file::permission::{DacFsContextExt, check_current_execute_permissions},
     mm::aspace::{AddrSpace, Backend},
     task::AsThread,
 };
 
 const MAX_INTERPRETER_PATH: u64 = 4096;
+
+fn resolve_exec_path(path: &str) -> AxResult<Location> {
+    let fs = FS_CONTEXT.lock();
+    let curr = current();
+    if let Some(thread) = curr.try_as_thread() {
+        let credentials = thread.proc_data.fs_dac_credentials();
+        fs.resolve_dac(path, &credentials)
+    } else {
+        // Early kernel startup has no Linux credential-bearing thread yet.
+        fs.resolve(path)
+    }
+}
 
 /// Creates a new empty user address space.
 pub fn new_user_aspace_empty() -> AxResult<AddrSpace> {
@@ -224,7 +236,7 @@ impl ElfLoader {
     }
 
     fn load_path(&mut self, uspace: &mut AddrSpace, path: &str) -> AxResult<LoadResult> {
-        let loc = FS_CONTEXT.lock().resolve(path)?;
+        let loc = resolve_exec_path(path)?;
         self.load_location(uspace, loc)
     }
 
@@ -282,7 +294,7 @@ impl ElfLoader {
         };
 
         let (elf, ldso) = if let Some(ldso) = ldso {
-            let loc = FS_CONTEXT.lock().resolve(ldso)?;
+            let loc = resolve_exec_path(&ldso)?;
             if loc.ptr_eq(&executable_loc) {
                 return Err(AxError::InvalidExecutable);
             }
@@ -367,7 +379,7 @@ fn try_load_script_with_fallback(
     let mut last_err = AxError::NotFound;
 
     for shell in SCRIPT_INTERPRETERS.iter().copied() {
-        if FS_CONTEXT.lock().resolve(shell).is_err() {
+        if resolve_exec_path(shell).is_err() {
             continue;
         }
 
@@ -398,7 +410,7 @@ fn permission_denied_script_fallback_allowed(path: &str) -> AxResult<bool> {
         return Ok(false);
     }
 
-    let loc = FS_CONTEXT.lock().resolve(path)?;
+    let loc = resolve_exec_path(path)?;
     permission_denied_script_fallback_allowed_for_loc(&loc)
 }
 
