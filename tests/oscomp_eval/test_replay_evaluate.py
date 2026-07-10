@@ -14,6 +14,7 @@ from tools.oscomp_eval.cli import evaluate_exit_code
 from tools.oscomp_eval.replay import (
     _compact_score_for_replay,
     _prune_replay_intermediates,
+    _validate_support_staging,
     build_qemu_command,
     evaluate_replay,
     gc_replay_runs,
@@ -45,7 +46,7 @@ class ReplayImageTests(unittest.TestCase):
             self.assertEqual(first.runtime.read_bytes(), b"abc")
             self.assertEqual(list((root / "cache").glob("*/*")), [first.runtime])
 
-    def test_build_qemu_command_uses_snapshot_and_readonly_drives(self) -> None:
+    def test_build_qemu_command_uses_snapshot_drives(self) -> None:
         command = build_qemu_command(
             arch="rv",
             kernel=Path("kernel-rv"),
@@ -54,9 +55,19 @@ class ReplayImageTests(unittest.TestCase):
         )
 
         self.assertIn("file=sdcard-rv.img,if=none,format=raw,id=x0,snapshot=on", command)
-        self.assertIn("file=disk.img,if=none,format=raw,id=x1,readonly=on", command)
+        self.assertIn("file=disk.img,if=none,format=raw,id=x1,snapshot=on", command)
         self.assertIn("rng-random,filename=/dev/urandom,id=rng0", command)
         self.assertIn("virtio-rng-device,rng=rng0,bus=virtio-mmio-bus.7", command)
+
+    def test_loongarch_support_drive_is_snapshot_backed(self) -> None:
+        command = build_qemu_command(
+            arch="la",
+            kernel=Path("kernel-la"),
+            image=Path("sdcard-la.img"),
+            support_image=Path("disk-la.img"),
+        )
+
+        self.assertIn("file=disk-la.img,if=none,format=raw,id=x1,snapshot=on", command)
 
     def test_build_qemu_command_adds_loongarch_entropy_source(self) -> None:
         command = build_qemu_command(
@@ -86,6 +97,67 @@ class ReplayImageTests(unittest.TestCase):
 
 
 class ReplayRunTests(unittest.TestCase):
+    @staticmethod
+    def _successful_replay(log_path: Path):
+        from tools.oscomp_eval.replay import ReplayResult
+
+        return ReplayResult(
+            arch="rv",
+            command=("qemu",),
+            returncode=0,
+            duration_ms=1,
+            log_path=log_path,
+            workdir=log_path.parent / ".work-rv",
+        )
+
+    def test_support_staging_requires_guest_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "rv.out"
+            log_path.write_text("System is shutting down\n", encoding="utf-8")
+            replay = self._successful_replay(log_path)
+
+            result = _validate_support_staging(replay, support_expected=True)
+
+            self.assertEqual(result.returncode, 4)
+            self.assertEqual(result.error_message, "guest did not confirm support-disk staging")
+
+    def test_support_staging_accepts_ready_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "rv.out"
+            log_path.write_text(
+                "#### OSCOMP SUPPORT READY ####\nSystem is shutting down\n",
+                encoding="utf-8",
+            )
+            replay = self._successful_replay(log_path)
+
+            result = _validate_support_staging(replay, support_expected=True)
+
+            self.assertIs(result, replay)
+
+    def test_support_staging_reports_guest_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "rv.out"
+            log_path.write_text(
+                "#### OSCOMP SUPPORT STAGING FAILED: mount failed ####\n",
+                encoding="utf-8",
+            )
+            replay = self._successful_replay(log_path)
+
+            result = _validate_support_staging(replay, support_expected=True)
+
+            self.assertEqual(result.returncode, 4)
+            self.assertEqual(result.error_message, "guest reported support-disk staging failure")
+
+    def test_replay_without_support_does_not_require_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "rv.out"
+            log_path.write_text("System is shutting down\n", encoding="utf-8")
+            replay = self._successful_replay(log_path)
+
+            result = _validate_support_staging(replay, support_expected=False)
+
+            self.assertIs(result, replay)
+
     def test_run_replay_converts_keyboard_interrupt_to_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

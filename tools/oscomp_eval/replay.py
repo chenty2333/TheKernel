@@ -49,6 +49,8 @@ Mode = Literal["replay", "shell"]
 
 QEMU_MEMORY = "1G"
 QEMU_SMP = "1"
+SUPPORT_READY_MARKER = "#### OSCOMP SUPPORT READY ####"
+SUPPORT_FAILURE_MARKER = "#### OSCOMP SUPPORT STAGING FAILED"
 REPLAY_RECENT_KEEP = 5
 REPLAY_INTERVAL_KEEP = 10
 QEMU_TRACE_PRESETS = {
@@ -571,7 +573,7 @@ def build_qemu_command(
             command.extend(
                 [
                     "-drive",
-                    drive_opts(support_image, "x1", mode="readonly"),
+                    drive_opts(support_image, "x1", mode="snapshot"),
                     "-device",
                     "virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1",
                 ]
@@ -620,7 +622,7 @@ def build_qemu_command(
         command.extend(
             [
                 "-drive",
-                drive_opts(support_image, "x1", mode="readonly"),
+                drive_opts(support_image, "x1", mode="snapshot"),
                 "-device",
                 "virtio-blk-pci,drive=x1",
             ]
@@ -648,6 +650,35 @@ def append_log(log_path: Path, message: str) -> None:
             log_file.write(f"[oscomp-replay] {message}\n")
     except OSError:
         pass
+
+
+def _validate_support_staging(
+    result: ReplayResult,
+    *,
+    support_expected: bool,
+) -> ReplayResult:
+    """Turn a silently ignored support-disk failure into a replay failure."""
+    if not support_expected or not result.ok:
+        return result
+
+    try:
+        output = result.log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        return dataclass_replace(
+            result,
+            returncode=4,
+            error_message=f"could not verify support-disk staging: {error}",
+        )
+
+    if SUPPORT_READY_MARKER in output:
+        return result
+
+    if SUPPORT_FAILURE_MARKER in output:
+        message = "guest reported support-disk staging failure"
+    else:
+        message = "guest did not confirm support-disk staging"
+    append_log(result.log_path, message)
+    return dataclass_replace(result, returncode=4, error_message=message)
 
 
 def terminate_process_group(process: subprocess.Popen[str], sig: int) -> None:
@@ -850,6 +881,10 @@ def run_replay(
         interactive=interactive,
         qemu_debug=qemu_debug,
         qemu_debug_log_path=qemu_debug_log_path,
+    )
+    result = _validate_support_staging(
+        result,
+        support_expected=prepared_support is not None,
     )
     if keep_workdir:
         log_copy = log_path.read_bytes() if log_path.is_file() else None

@@ -53,6 +53,19 @@ class LtpLabMarkerIntegrationTests(unittest.TestCase):
 
         self.assertFalse(parsed["summary"]["global_timeout"])
 
+    def test_reference_fail_delimiter_with_zero_exit_is_classified_from_ltp_results(self) -> None:
+        parsed = self.ltp_lab.parse_log_text(
+            "#### OS COMP TEST GROUP START ltp-glibc ####\n"
+            "RUN LTP CASE getrandom01\n"
+            "getrandom01.c:20: TPASS: getrandom returned EFAULT\n"
+            "FAIL LTP CASE getrandom01 : 0\n"
+            "#### OS COMP TEST GROUP END ltp-glibc ####\n",
+            arch="rv",
+        )
+
+        self.assertEqual(parsed["cases"][0]["ret"], 0)
+        self.assertEqual(parsed["cases"][0]["status"], "pass")
+
     def test_parse_log_file_writes_to_explicit_output_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

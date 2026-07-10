@@ -94,6 +94,13 @@ support_payload_present() {
     return 1
 }
 
+support_device_present() {
+    for dev in /dev/vdb /dev/sdb /dev/vdc /dev/sdc; do
+        [ -e "$dev" ] && return 0
+    done
+    return 1
+}
+
 mount_support_disk() {
     support_payload_present && return 0
     for dev in /dev/vdb /dev/sdb /dev/vdc /dev/sdc /dev/vda /dev/sda; do
@@ -104,6 +111,7 @@ mount_support_disk() {
             bb umount /support >/dev/null 2>&1 || true
         done
     done
+    support_device_present && return 2
     return 1
 }
 
@@ -111,8 +119,16 @@ copy_tree() {
     src="$1"
     dst="$2"
     [ -d "$src" ] || return 0
-    bb mkdir -p "$dst"
-    bb cp -a "$src/." "$dst/" 2>/dev/null || bb cp -R "$src/." "$dst/" 2>/dev/null || true
+    bb mkdir -p "$dst" || return 1
+    bb cp -a "$src/." "$dst/" 2>/dev/null && return 0
+    bb cp -R "$src/." "$dst/" 2>/dev/null
+}
+
+copy_support_file() {
+    src="$1"
+    dst="$2"
+    [ -f "$src" ] || return 0
+    bb cp "$src" "$dst" 2>/dev/null
 }
 
 link_file() {
@@ -124,24 +140,40 @@ link_file() {
 }
 
 stage_support_disk() {
-    mount_support_disk || return 0
+    mount_support_disk
+    mount_status=$?
+    case "$mount_status" in
+        0) ;;
+        1) return 0 ;;
+        *)
+            echo "#### OSCOMP SUPPORT STAGING FAILED: payload disk could not be mounted ####"
+            return 1
+            ;;
+    esac
 
-    [ -f /support/meta/ltp_test.txt ] && bb cp /support/meta/ltp_test.txt /etc/oscomp-ltp.txt 2>/dev/null || true
-    [ -f /support/meta/oscomp_plan.txt ] && bb cp /support/meta/oscomp_plan.txt /etc/oscomp-plan.txt 2>/dev/null || true
-    [ -f /support/meta/oscomp_cases.txt ] && bb cp /support/meta/oscomp_cases.txt /etc/oscomp-cases.txt 2>/dev/null || true
-    [ -f /support/meta/oscomp.env ] && bb cp /support/meta/oscomp.env /etc/oscomp.env 2>/dev/null || true
+    stage_failed=0
+    copy_support_file /support/meta/ltp_test.txt /etc/oscomp-ltp.txt || stage_failed=1
+    copy_support_file /support/meta/oscomp_plan.txt /etc/oscomp-plan.txt || stage_failed=1
+    copy_support_file /support/meta/oscomp_cases.txt /etc/oscomp-cases.txt || stage_failed=1
+    copy_support_file /support/meta/oscomp.env /etc/oscomp.env || stage_failed=1
 
     arch_root="/support/$OSCOMP_ARCH"
-    copy_tree /support/usr/lib/locale/C.UTF-8 /usr/lib/locale/C.UTF-8
-    copy_tree "$arch_root/glibc/lib" /glibc/lib
-    copy_tree "$arch_root/overlay/bin" /opt/oscomp-support/bin
-    copy_tree "$arch_root/overlay/lib" /opt/oscomp-support/lib
-    copy_tree "$arch_root/overlay/ltp-cases" /opt/oscomp-support/ltp-cases
-    copy_tree "$arch_root/overlay/share" /opt/oscomp-support/share
-    copy_tree "$arch_root/overlay/musl" /musl
-    copy_tree "$arch_root/overlay/glibc" /glibc
+    copy_tree /support/usr/lib/locale/C.UTF-8 /usr/lib/locale/C.UTF-8 || stage_failed=1
+    copy_tree "$arch_root/glibc/lib" /glibc/lib || stage_failed=1
+    copy_tree "$arch_root/overlay/bin" /opt/oscomp-support/bin || stage_failed=1
+    copy_tree "$arch_root/overlay/lib" /opt/oscomp-support/lib || stage_failed=1
+    copy_tree "$arch_root/overlay/ltp-cases" /opt/oscomp-support/ltp-cases || stage_failed=1
+    copy_tree "$arch_root/overlay/share" /opt/oscomp-support/share || stage_failed=1
+    copy_tree "$arch_root/overlay/musl" /musl || stage_failed=1
+    copy_tree "$arch_root/overlay/glibc" /glibc || stage_failed=1
 
     bb umount /support >/dev/null 2>&1 || true
+    if [ "$stage_failed" -ne 0 ]; then
+        echo "#### OSCOMP SUPPORT STAGING FAILED: payload copy was incomplete ####"
+        return 1
+    fi
+    echo "#### OSCOMP SUPPORT READY ####"
+    return 0
 }
 
 setup_loaders() {
@@ -786,7 +818,10 @@ run_boot_shell() {
 
 setup_base_fs
 detect_arch
-stage_support_disk
+if ! stage_support_disk; then
+    shutdown_system
+    exit 1
+fi
 setup_loaders
 load_env_file
 prepare_unixbench_inputs
