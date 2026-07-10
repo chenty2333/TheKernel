@@ -3,10 +3,9 @@ use alloc::borrow::Cow;
 use axerrno::{AxError, AxResult};
 use axfs::FsContext;
 use axfs_ng_vfs::{Location, NodePermission, NodeType, path::Path};
-use axtask::current_may_uninit;
 use linux_raw_sys::general::{CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, R_OK, W_OK, X_OK};
 
-use crate::task::{AsThread, DacCredentialView};
+use crate::task::DacCredentialView;
 
 const STICKY_MODE_BIT: u32 = 0o1000;
 
@@ -297,19 +296,6 @@ pub(crate) fn check_execute_permissions(
 
     let perm = stat.mode.bits() as u32 & NodePermission::all().bits() as u32;
     check_dac_permissions(perm, stat.uid, stat.gid, stat.node_type, X_OK, credentials)
-}
-
-pub(crate) fn check_current_execute_permissions(loc: &Location) -> AxResult {
-    let Some(curr) = current_may_uninit() else {
-        return Ok(());
-    };
-    let Some(thr) = curr.try_as_thread() else {
-        return Ok(());
-    };
-
-    let proc_data = &thr.proc_data;
-    let credentials = proc_data.fs_dac_credentials();
-    check_execute_permissions(loc, &credentials)
 }
 
 #[cfg(test)]

@@ -1,17 +1,17 @@
 //! User address space management.
 
 use alloc::{borrow::ToOwned, string::String, vec, vec::Vec};
-use core::{ffi::CStr, iter};
+use core::ffi::CStr;
 
 use axerrno::{AxError, AxResult};
 use axfs::{CachedFile, FS_CONTEXT};
-use axfs_ng_vfs::{Location, NodeType};
+use axfs_ng_vfs::Location;
 use axhal::{
     mem::virt_to_phys,
     paging::{MappingFlags, PageSize},
 };
 use axsync::Mutex;
-use axtask::current;
+use axtask::current_may_uninit;
 use kernel_elf_parser::{
     AuxEntry, AuxType, ELFHeaders, ELFHeadersBuilder, ELFParser, app_stack_region,
 };
@@ -21,22 +21,36 @@ use uluru::LRUCache;
 
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
-    file::permission::{DacFsContextExt, check_current_execute_permissions},
+    file::permission::{DacFsContextExt, check_execute_permissions},
     mm::aspace::{AddrSpace, Backend},
-    task::AsThread,
+    task::{AsThread, DacCredentialView},
 };
 
+const BINPRM_BUF_SIZE: usize = 256;
 const MAX_INTERPRETER_PATH: u64 = 4096;
+// Linux permits five binfmt rewrites before returning ELOOP.
+const MAX_SCRIPT_RECURSION: usize = 5;
 
-fn resolve_exec_path(path: &str) -> AxResult<Location> {
-    let fs = FS_CONTEXT.lock();
-    let curr = current();
-    if let Some(thread) = curr.try_as_thread() {
-        let credentials = thread.proc_data.fs_dac_credentials();
-        fs.resolve_dac(path, &credentials)
-    } else {
-        // Early kernel startup has no Linux credential-bearing thread yet.
-        fs.resolve(path)
+#[derive(Clone, Copy)]
+enum ExecAccess<'a> {
+    TrustedBoot,
+    User(&'a DacCredentialView),
+}
+
+impl ExecAccess<'_> {
+    fn resolve(self, path: &str) -> AxResult<Location> {
+        let fs = FS_CONTEXT.lock();
+        match self {
+            Self::TrustedBoot => fs.resolve(path),
+            Self::User(credentials) => fs.resolve_dac(path, credentials),
+        }
+    }
+
+    fn check_location(self, loc: &Location) -> AxResult {
+        match self {
+            Self::TrustedBoot => Ok(()),
+            Self::User(credentials) => check_execute_permissions(loc, credentials),
+        }
     }
 }
 
@@ -235,13 +249,23 @@ impl ElfLoader {
         Self(LRUCache::new())
     }
 
-    fn load_path(&mut self, uspace: &mut AddrSpace, path: &str) -> AxResult<LoadResult> {
-        let loc = resolve_exec_path(path)?;
-        self.load_location(uspace, loc)
+    fn load_path(
+        &mut self,
+        uspace: &mut AddrSpace,
+        path: &str,
+        access: ExecAccess<'_>,
+    ) -> AxResult<LoadResult> {
+        let loc = access.resolve(path)?;
+        self.load_location(uspace, loc, access)
     }
 
-    fn load_location(&mut self, uspace: &mut AddrSpace, loc: Location) -> AxResult<LoadResult> {
-        check_current_execute_permissions(&loc)?;
+    fn load_location(
+        &mut self,
+        uspace: &mut AddrSpace,
+        loc: Location,
+        access: ExecAccess<'_>,
+    ) -> AxResult<LoadResult> {
+        access.check_location(&loc)?;
 
         if !self.0.touch(|e| e.borrow_cache().location().ptr_eq(&loc)) {
             match ElfCacheEntry::load(loc)? {
@@ -294,12 +318,14 @@ impl ElfLoader {
         };
 
         let (elf, ldso) = if let Some(ldso) = ldso {
-            let loc = resolve_exec_path(&ldso)?;
+            let loc = access.resolve(&ldso)?;
+            access.check_location(&loc)?;
             if loc.ptr_eq(&executable_loc) {
                 return Err(AxError::InvalidExecutable);
             }
             if !self.0.touch(|e| e.borrow_cache().location().ptr_eq(&loc)) {
-                let e = ElfCacheEntry::load(loc)?.map_err(|_| AxError::InvalidInput)?;
+                let e = ElfCacheEntry::load(loc)?
+                    .map_err(|_| AxError::from(axerrno::LinuxError::ELIBBAD))?;
                 self.0.insert(e);
             }
 
@@ -320,17 +346,18 @@ impl ElfLoader {
             ldso.as_ref()
                 .map_or_else(|| elf.entry(), |ldso| ldso.entry()),
         );
-        let (uid, euid, gid, egid) = if let Some(thread) = current().try_as_thread() {
-            let proc_data = &thread.proc_data;
-            (
-                proc_data.uid() as usize,
-                proc_data.euid() as usize,
-                proc_data.gid() as usize,
-                proc_data.egid() as usize,
-            )
-        } else {
-            (0, 0, 0, 0)
-        };
+        let (uid, euid, gid, egid) = current_may_uninit()
+            .and_then(|task| {
+                let thread = task.try_as_thread()?;
+                let proc_data = &thread.proc_data;
+                Some((
+                    proc_data.uid() as usize,
+                    proc_data.euid() as usize,
+                    proc_data.gid() as usize,
+                    proc_data.egid() as usize,
+                ))
+            })
+            .unwrap_or((0, 0, 0, 0));
         let secure = usize::from(uid != euid || gid != egid);
         let mut auxv = elf
             .aux_vector(PAGE_SIZE_4K, ldso.map(|elf| elf.base()))
@@ -353,65 +380,73 @@ impl ElfLoader {
 
 static ELF_LOADER: Mutex<ElfLoader> = Mutex::new(ElfLoader::new());
 
-const SCRIPT_INTERPRETERS: &[&str] = &[
-    "/musl/busybox",
-    "/glibc/busybox",
-    "/busybox",
-    "/bin/busybox",
-    "/bin/sh",
-];
+#[derive(Debug, Eq, PartialEq)]
+struct Shebang<'a> {
+    interpreter: &'a str,
+    optional_arg: Option<&'a str>,
+}
 
-fn script_interpreter_args(shell: &str, path: &str, args: &[String]) -> Vec<String> {
-    let mut new_args = vec![shell.to_owned()];
-    if shell.ends_with("busybox") {
-        new_args.push("sh".to_owned());
+fn is_script_space(byte: u8) -> bool {
+    byte == b' ' || byte == b'\t'
+}
+
+fn parse_shebang(data: &[u8]) -> AxResult<Option<Shebang<'_>>> {
+    if !data.starts_with(b"#!") {
+        return Ok(None);
     }
-    new_args.extend(iter::once(path.to_owned()).chain(args.iter().skip(1).cloned()));
+
+    let head = &data[2..data.len().min(BINPRM_BUF_SIZE)];
+    let terminator = head.iter().position(|byte| *byte == b'\n' || *byte == 0);
+    let may_be_truncated = terminator.is_none() && data.len() >= BINPRM_BUF_SIZE;
+    let line = &head[..terminator.unwrap_or(head.len())];
+    let start = line
+        .iter()
+        .position(|byte| !is_script_space(*byte))
+        .ok_or(AxError::InvalidExecutable)?;
+    if may_be_truncated && !line[start..].iter().any(|byte| is_script_space(*byte)) {
+        // The kernel must not execute a truncated interpreter pathname.
+        return Err(AxError::InvalidExecutable);
+    }
+    let end = line
+        .iter()
+        .rposition(|byte| !is_script_space(*byte))
+        .map(|index| index + 1)
+        .ok_or(AxError::InvalidExecutable)?;
+    let command = &line[start..end];
+    let interpreter_end = command
+        .iter()
+        .position(|byte| is_script_space(*byte))
+        .unwrap_or(command.len());
+    let interpreter =
+        core::str::from_utf8(&command[..interpreter_end]).map_err(|_| AxError::InvalidInput)?;
+    if interpreter.is_empty() {
+        return Err(AxError::InvalidExecutable);
+    }
+
+    let optional_arg = command[interpreter_end..]
+        .iter()
+        .position(|byte| !is_script_space(*byte))
+        .map(|offset| {
+            core::str::from_utf8(&command[interpreter_end + offset..])
+                .map_err(|_| AxError::InvalidInput)
+        })
+        .transpose()?;
+
+    Ok(Some(Shebang {
+        interpreter,
+        optional_arg,
+    }))
+}
+
+fn script_interpreter_args(shebang: &Shebang<'_>, path: &str, args: &[String]) -> Vec<String> {
+    let mut new_args = Vec::with_capacity(args.len().saturating_add(2));
+    new_args.push(shebang.interpreter.to_owned());
+    if let Some(optional_arg) = shebang.optional_arg {
+        new_args.push(optional_arg.to_owned());
+    }
+    new_args.push(path.to_owned());
+    new_args.extend(args.iter().skip(1).cloned());
     new_args
-}
-
-fn try_load_script_with_fallback(
-    uspace: &mut AddrSpace,
-    path: &str,
-    args: &[String],
-    envs: &[String],
-) -> AxResult<(VirtAddr, VirtAddr)> {
-    let mut last_err = AxError::NotFound;
-
-    for shell in SCRIPT_INTERPRETERS.iter().copied() {
-        if resolve_exec_path(shell).is_err() {
-            continue;
-        }
-
-        let new_args = script_interpreter_args(shell, path, args);
-        match load_user_app(uspace, None, &new_args, envs) {
-            Ok(result) => return Ok(result),
-            Err(err @ (AxError::NotFound | AxError::InvalidExecutable | AxError::InvalidInput)) => {
-                last_err = err
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    Err(last_err)
-}
-
-fn permission_denied_script_fallback_allowed_for_loc(loc: &Location) -> AxResult<bool> {
-    let abs_path = loc.absolute_path().map_err(|_| AxError::InvalidInput)?;
-    if crate::mounts::is_noexec(abs_path.as_ref()) {
-        return Ok(false);
-    }
-
-    Ok(loc.metadata()?.node_type == NodeType::RegularFile)
-}
-
-fn permission_denied_script_fallback_allowed(path: &str) -> AxResult<bool> {
-    if !path.ends_with(".sh") {
-        return Ok(false);
-    }
-
-    let loc = resolve_exec_path(path)?;
-    permission_denied_script_fallback_allowed_for_loc(&loc)
 }
 
 /// Clear the ELF cache.
@@ -475,80 +510,67 @@ fn install_loaded_user_app(
 fn finish_load_user_app(
     uspace: &mut AddrSpace,
     path: &str,
+    execfn: &str,
     args: &[String],
     envs: &[String],
     load_result: AxResult<LoadResult>,
-    fallback_loc: Option<&Location>,
+    access: ExecAccess<'_>,
+    script_depth: usize,
 ) -> AxResult<(VirtAddr, VirtAddr)> {
     let (entry, auxv) = match load_result {
         Ok(Ok((entry, auxv))) => (entry, auxv),
         Ok(Err(data)) => {
-            if data.starts_with(b"#!") {
-                let head = &data[2..data.len().min(256)];
-                let pos = head.iter().position(|c| *c == b'\n').unwrap_or(head.len());
-                let line = core::str::from_utf8(&head[..pos]).map_err(|_| AxError::InvalidInput)?;
-
-                let new_args: Vec<String> = line
-                    .trim()
-                    .splitn(2, |c: char| c.is_ascii_whitespace())
-                    .map(|s| s.trim_ascii().to_owned())
-                    .chain(iter::once(path.to_owned()))
-                    .chain(args.iter().skip(1).cloned())
-                    .collect();
-                match load_user_app(uspace, None, &new_args, envs) {
-                    Ok(result) => return Ok(result),
-                    Err(
-                        err @ (AxError::NotFound
-                        | AxError::InvalidExecutable
-                        | AxError::InvalidInput),
-                    ) if path.ends_with(".sh") => {
-                        debug!(
-                            "script interpreter failed for {path}: {err:?}; trying shell fallback"
-                        );
-                        return try_load_script_with_fallback(uspace, path, args, envs);
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-            // Keep `.sh` fallback for scripts without a shebang while still
-            // allowing shebang-based interpreters such as `/musl/busybox sh`.
-            if path.ends_with(".sh") {
-                return try_load_script_with_fallback(uspace, path, args, envs);
-            }
-            return Err(AxError::InvalidExecutable);
-        }
-        Err(AxError::PermissionDenied) => {
-            let fallback_allowed = if path.ends_with(".sh") {
-                match fallback_loc {
-                    Some(loc) => permission_denied_script_fallback_allowed_for_loc(loc)?,
-                    None => permission_denied_script_fallback_allowed(path)?,
-                }
-            } else {
-                false
+            let Some(shebang) = parse_shebang(&data)? else {
+                return Err(AxError::InvalidExecutable);
             };
-            if fallback_allowed {
-                return try_load_script_with_fallback(uspace, path, args, envs);
+            if script_depth >= MAX_SCRIPT_RECURSION {
+                return Err(axerrno::LinuxError::ELOOP.into());
             }
-            return Err(AxError::PermissionDenied);
+
+            let new_args = script_interpreter_args(&shebang, path, args);
+            return load_user_app_path(
+                uspace,
+                shebang.interpreter,
+                execfn,
+                &new_args,
+                envs,
+                access,
+                script_depth + 1,
+            );
         }
         Err(err) => return Err(err),
     };
 
-    install_loaded_user_app(uspace, path, args, envs, entry, &auxv)
+    install_loaded_user_app(uspace, execfn, args, envs, entry, &auxv)
 }
 
-/// Load the user app to the user address space.
+fn load_user_app_path(
+    uspace: &mut AddrSpace,
+    path: &str,
+    execfn: &str,
+    args: &[String],
+    envs: &[String],
+    access: ExecAccess<'_>,
+    script_depth: usize,
+) -> AxResult<(VirtAddr, VirtAddr)> {
+    let load_result = ELF_LOADER.lock().load_path(uspace, path, access);
+    finish_load_user_app(
+        uspace,
+        path,
+        execfn,
+        args,
+        envs,
+        load_result,
+        access,
+        script_depth,
+    )
+}
+
+/// Load a trusted early-boot app without Linux DAC admission.
 ///
-/// # Arguments
-/// - `uspace`: The address space of the user app.
-/// - `args`: The arguments of the user app. The first argument is the path of
-///   the user app.
-/// - `envs`: The environment variables of the user app.
-///
-/// # Returns
-/// - The entry point of the user app.
-/// - The stack pointer of the user app.
-pub fn load_user_app(
+/// This raw path API is only for boot before a Linux credential-bearing thread
+/// exists. User-originated exec must use [`load_user_app_at`].
+pub(crate) fn load_user_app_trusted(
     uspace: &mut AddrSpace,
     path: Option<&str>,
     args: &[String],
@@ -558,21 +580,72 @@ pub fn load_user_app(
         .or_else(|| args.first().map(String::as_str))
         .ok_or(AxError::InvalidInput)?;
 
-    let load_result = ELF_LOADER.lock().load_path(uspace, path);
-    finish_load_user_app(uspace, path, args, envs, load_result, None)
+    load_user_app_path(uspace, path, path, args, envs, ExecAccess::TrustedBoot, 0)
 }
 
 /// Load an already resolved executable location into the user address space.
 ///
-/// This is used by execve after permission checks and executable-write
-/// exclusion have been performed on the same inode.
-pub fn load_user_app_at(
+/// The same pre-exec credential view checks the final target, `PT_INTERP`, and
+/// every shebang interpreter lookup.
+pub(crate) fn load_user_app_at(
     uspace: &mut AddrSpace,
     loc: Location,
     path: &str,
     args: &[String],
     envs: &[String],
+    credentials: &DacCredentialView,
 ) -> AxResult<(VirtAddr, VirtAddr)> {
-    let load_result = ELF_LOADER.lock().load_location(uspace, loc.clone());
-    finish_load_user_app(uspace, path, args, envs, load_result, Some(&loc))
+    let access = ExecAccess::User(credentials);
+    let load_result = ELF_LOADER.lock().load_location(uspace, loc, access);
+    finish_load_user_app(uspace, path, path, args, envs, load_result, access, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shebang_keeps_one_optional_argument() {
+        let shebang = parse_shebang(b"#!/usr/bin/env -S python -O\nprint('ok')")
+            .unwrap()
+            .unwrap();
+        assert_eq!(shebang.interpreter, "/usr/bin/env");
+        assert_eq!(shebang.optional_arg, Some("-S python -O"));
+    }
+
+    #[test]
+    fn shebang_arguments_follow_linux_order() {
+        let shebang = parse_shebang(b"#!  /bin/sh\t-e  \n").unwrap().unwrap();
+        let args = vec!["original-argv-zero".to_owned(), "tail".to_owned()];
+        assert_eq!(
+            script_interpreter_args(&shebang, "/tmp/test.sh", &args),
+            ["/bin/sh", "-e", "/tmp/test.sh", "tail"]
+        );
+    }
+
+    #[test]
+    fn empty_shebang_is_not_a_shell_request() {
+        assert!(matches!(
+            parse_shebang(b"#!  \t\n"),
+            Err(AxError::InvalidExecutable)
+        ));
+        assert_eq!(parse_shebang(b"plain text").unwrap(), None);
+    }
+
+    #[test]
+    fn truncated_interpreter_path_is_rejected() {
+        let mut data = vec![b'x'; BINPRM_BUF_SIZE];
+        data[0] = b'#';
+        data[1] = b'!';
+        assert!(matches!(
+            parse_shebang(&data),
+            Err(AxError::InvalidExecutable)
+        ));
+
+        data[2] = b' ';
+        assert!(matches!(
+            parse_shebang(&data),
+            Err(AxError::InvalidExecutable)
+        ));
+    }
 }

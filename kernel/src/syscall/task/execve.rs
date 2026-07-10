@@ -23,10 +23,10 @@ use starry_vm::{VmError, vm_load_until_nul};
 use crate::task::reset_current_user_fpu_state;
 use crate::{
     config::USER_HEAP_BASE,
-    file::{FD_TABLE, ResolveAtResult, executable, fanotify, resolve_at},
+    file::{FD_TABLE, ResolveAtResult, executable, fanotify, resolve_at_with_credentials},
     mm::{copy_from_kernel, load_user_app_at, new_user_aspace_empty, vm_load_string},
     task::{
-        AsThread, ProcessData, Thread, add_task_alias, check_signals, get_task,
+        AsThread, DacCredentialView, ProcessData, Thread, add_task_alias, check_signals, get_task,
         has_pending_fatal_signal, notify_ptrace_attach_stop, set_current_user_page_table_root,
     },
 };
@@ -221,6 +221,7 @@ fn do_execve(
     loc: axfs_ng_vfs::Location,
     args: Vec<String>,
     envs: Vec<String>,
+    credentials: &DacCredentialView,
 ) -> AxResult<isize> {
     executable::check_not_write_open(&loc)?;
     fanotify::permission_check(
@@ -246,6 +247,7 @@ fn do_execve(
             abs_path.as_str(),
             &args,
             &envs,
+            credentials,
         ),
     )?;
     fanotify::notify(
@@ -367,10 +369,12 @@ pub fn sys_execve(
 
     debug!("sys_execve <= path: {path:?}, args: {args:?}, envs: {envs:?}");
 
-    let loc = resolve_at(AT_FDCWD, Some(&path), 0)?
+    // Credential locks precede FS_CONTEXT for the whole pathname operation.
+    let credentials = current().as_thread().proc_data.fs_dac_credentials();
+    let loc = resolve_at_with_credentials(AT_FDCWD, Some(&path), 0, &credentials)?
         .into_file()
         .ok_or(AxError::InvalidInput)?;
-    do_execve(uctx, loc, args, envs)
+    do_execve(uctx, loc, args, envs, &credentials)
 }
 
 pub fn sys_execveat(
@@ -392,13 +396,15 @@ pub fn sys_execveat(
          {flags:#x}"
     );
 
+    // Use one pre-exec view for the initial path and every interpreter lookup.
+    let credentials = current().as_thread().proc_data.fs_dac_credentials();
     let resolved = if path.is_empty() {
         if (flags as u32) & AT_EMPTY_PATH == 0 {
             return Err(AxError::NotFound);
         }
-        resolve_at(dirfd, None, flags as u32)?
+        resolve_at_with_credentials(dirfd, None, flags as u32, &credentials)?
     } else {
-        resolve_at(dirfd, Some(path.as_str()), flags as u32)?
+        resolve_at_with_credentials(dirfd, Some(path.as_str()), flags as u32, &credentials)?
     };
 
     let loc = match resolved {
@@ -409,5 +415,5 @@ pub fn sys_execveat(
         return Err(axerrno::LinuxError::ELOOP.into());
     }
 
-    do_execve(uctx, loc, args, envs)
+    do_execve(uctx, loc, args, envs, &credentials)
 }
