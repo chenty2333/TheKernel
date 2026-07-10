@@ -18,6 +18,7 @@ use axfs_ng_vfs::{
     DirEntry, Filesystem, FilesystemOps, NodePermission, NodeType, StatFs, VfsResult,
 };
 use axpoll::{IoEvents, Pollable};
+use axsync::Mutex as BlockingMutex;
 use axtask::current;
 use linux_raw_sys::general::{
     AT_EMPTY_PATH, AT_NO_AUTOMOUNT, AT_RECURSIVE, AT_SYMLINK_NOFOLLOW, CAP_SYS_ADMIN, O_CLOEXEC,
@@ -37,6 +38,13 @@ use crate::{
 };
 
 const FSOPEN_CLOEXEC: u32 = 0x00000001;
+/// Serializes namespace topology changes with the kernel-side mount ledger.
+///
+/// This is a blocking mutex because normal unmount may flush storage while the
+/// transaction is open. The lower VFS topology lock remains short-lived and is
+/// never held across that flush.
+static MOUNT_NAMESPACE_OPERATION: BlockingMutex<()> = BlockingMutex::new(());
+
 const FSCONFIG_SET_FLAG: u32 = 0;
 const FSCONFIG_SET_STRING: u32 = 1;
 const FSCONFIG_SET_BINARY: u32 = 2;
@@ -594,9 +602,10 @@ fn do_move_mount_old(
         .absolute_path()
         .map_err(|_| AxError::InvalidInput)?
         .to_string();
+    let old_mount_id = old.mountpoint().mount_id();
     let new_parent_id = target.mountpoint().mount_id();
     old.move_mount_to(target)?;
-    mounts::move_tree(&old_path, target_path, new_parent_id);
+    mounts::move_tree(old_mount_id, &old_path, target_path, new_parent_id);
     Ok(())
 }
 
@@ -878,6 +887,7 @@ pub fn sys_mount_setattr(
         return Ok(0);
     }
 
+    let _mount_operation = MOUNT_NAMESPACE_OPERATION.lock();
     let loc = resolve_at(dirfd, Some(&path), flags)?
         .into_file()
         .ok_or(AxError::InvalidInput)?;
@@ -913,21 +923,24 @@ pub fn sys_move_mount(
         return Err(AxError::NotFound);
     }
 
+    let _mount_operation = MOUNT_NAMESPACE_OPERATION.lock();
     let file = get_file_like(from_dirfd)?;
     let mount_fd = file
         .downcast_ref::<FsMountFd>()
         .ok_or(AxError::BadFileDescriptor)?;
 
     let target = crate::file::with_fs(to_dirfd, |fs| fs.resolve(&to_path))?;
-    if mount_fd.attached.swap(true, Ordering::AcqRel) {
-        return Err(AxError::ResourceBusy);
-    }
-    let parent_id = target.mountpoint().mount_id();
-    let mountpoint = target.mount(&mount_fd.fs)?;
     let target_path = target
         .absolute_path()
         .map_err(|_| AxError::InvalidInput)?
         .to_string();
+    if mount_fd.attached.swap(true, Ordering::AcqRel) {
+        return Err(AxError::ResourceBusy);
+    }
+    let parent_id = target.mountpoint().mount_id();
+    let mountpoint = target.mount(&mount_fd.fs).inspect_err(|_| {
+        mount_fd.attached.store(false, Ordering::Release);
+    })?;
     mounts::record(
         mount_fd.source.clone(),
         target_path,
@@ -964,6 +977,7 @@ pub fn sys_mount(
     if !current_has_capability(CAP_SYS_ADMIN) {
         return Err(AxError::from(LinuxError::EPERM));
     }
+    let _mount_operation = MOUNT_NAMESPACE_OPERATION.lock();
     let target = FS_CONTEXT.lock().resolve(&target)?;
     let target_path = target
         .absolute_path()
@@ -1126,6 +1140,7 @@ pub fn sys_umount2(target: *const c_char, flags: i32) -> AxResult<isize> {
         return Err(AxError::OperationNotSupported);
     }
 
+    let _mount_operation = MOUNT_NAMESPACE_OPERATION.lock();
     let target = if flags & UMOUNT_NOFOLLOW != 0 {
         FS_CONTEXT.lock().resolve_no_follow(&target)?
     } else {
@@ -1145,7 +1160,7 @@ pub fn sys_umount2(target: *const c_char, flags: i32) -> AxResult<isize> {
         return Err(AxError::from(LinuxError::EAGAIN));
     }
     let mount_id = target.mountpoint().mount_id();
-    let unmount_devices = target.mountpoint().subtree_devices();
+    let unmount_devices = target.mountpoint().subtree_devices()?;
     if flags & MNT_DETACH != 0 {
         target.lazy_unmount()?;
     } else {

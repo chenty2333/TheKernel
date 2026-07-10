@@ -19,7 +19,7 @@ use axalloc::{UsageKind, global_allocator};
 use axdriver::{AsyncBlockWaitPolicy, virtio_async_block_enabled, virtio_async_block_wait_policy};
 use axfs_ng_vfs::{
     FileNode, FilesystemOps, Location, MetadataUpdate, Mountpoint, NodeFlags, NodePermission,
-    NodeType, VfsError, VfsResult, WeakDirEntry, path::Path,
+    NodeType, VfsError, VfsResult, WeakDirEntry, WritebackAnchor, path::Path,
 };
 use axhal::mem::{PhysAddr, VirtAddr, total_ram_size, virt_to_phys};
 use axio::{SeekFrom, prelude::*};
@@ -634,108 +634,184 @@ fn cached_file_is_in_memory(location: &Location) -> bool {
 
 fn cached_file_shared_for_location(location: &Location) -> Option<Arc<CachedFileShared>> {
     let key = cached_file_registry_key(location);
-    file_cache_registry()
-        .lock()
-        .get(&key)
-        .and_then(FileUserData::shared)
-        .or_else(|| {
-            location
-                .user_data()
-                .get::<FileUserData>()
-                .and_then(|it| it.shared())
-        })
+    let registry_shared = {
+        let registry = file_cache_registry().lock();
+        registry.get(&key).and_then(FileUserData::shared)
+    };
+    registry_shared.or_else(|| {
+        location
+            .user_data()
+            .get::<FileUserData>()
+            .and_then(|it| it.shared())
+    })
 }
 
 fn cached_file_shared_for_location_or_create(location: &Location) -> Arc<CachedFileShared> {
     let key = cached_file_registry_key(location);
-    let mut registry = file_cache_registry().lock();
-
-    if let Some(entry) = registry.get_mut(&key) {
-        let shared = entry.shared();
-        entry.update_location(location);
-        let was_retained = entry.release_retained();
-        if let Some(shared) = shared {
-            if was_retained {
-                record_cached_file_counter(&CLOSED_FILE_CACHE_REOPEN_HITS, 1);
-            }
-            return shared;
-        }
-    }
-
-    if let Some(shared) = registry.get(&key).and_then(FileUserData::shared) {
-        return shared;
-    }
-
-    if let Some(shared) = location
+    let user_data_shared = location
         .user_data()
         .get::<FileUserData>()
-        .and_then(|it| it.shared())
-    {
-        registry.insert(key, FileUserData::new(location, &shared));
-        return shared;
+        .and_then(|it| it.shared());
+    let (shared, retired_entry, released_retained, install_user_data) = 'registry: {
+        let mut registry = file_cache_registry().lock();
+        let mut released_retained = None;
+
+        if let Some(entry) = registry.get_mut(&key) {
+            let shared = entry.shared();
+            entry.update_location(location);
+            released_retained = entry.release_retained();
+            if let Some(shared) = shared {
+                break 'registry (shared, None, released_retained, false);
+            }
+        }
+
+        if let Some(shared) = user_data_shared {
+            let retired_entry = registry.insert(key, FileUserData::new(location, &shared));
+            break 'registry (shared, retired_entry, released_retained, false);
+        }
+
+        let shared = Arc::new(CachedFileShared::new(cached_file_is_in_memory(location)));
+        let retired_entry = registry.insert(key, FileUserData::new(location, &shared));
+        (shared, retired_entry, released_retained, true)
+    };
+
+    // Cached ownership may release filesystem or inode state. Never run those
+    // destructors while the registry is locked: teardown can re-enter here.
+    if released_retained.is_some() {
+        record_cached_file_counter(&CLOSED_FILE_CACHE_REOPEN_HITS, 1);
     }
-
-    let shared = Arc::new(CachedFileShared::new(cached_file_is_in_memory(location)));
-    registry.insert(key, FileUserData::new(location, &shared));
-
-    location
-        .user_data()
-        .insert(FileUserData::new(location, &shared));
-
+    drop(retired_entry);
+    drop(released_retained);
+    if install_user_data {
+        location
+            .user_data()
+            .insert(FileUserData::new(location, &shared));
+    }
     shared
 }
 
-fn retain_cached_file_writeback_location_if_dirty(
+fn retain_cached_file_writeback_anchor_if_dirty(
     location: &Location,
     shared: &Arc<CachedFileShared>,
 ) {
-    let guard = shared.page_cache.lock();
-    if !guard.iter().any(|(_pn, page)| page.is_dirty()) {
+    let page_cache = shared.page_cache.lock();
+    if !page_cache.iter().any(|(_pn, page)| page.is_dirty()) {
         return;
     }
 
     let key = cached_file_registry_key(location);
-    let mut registry = file_cache_registry().lock();
-    let entry = registry
-        .entry(key)
-        .or_insert_with(|| FileUserData::new(location, shared));
-    if !entry
-        .shared()
-        .is_some_and(|registered| Arc::ptr_eq(&registered, shared))
-    {
-        *entry = FileUserData::new(location, shared);
-    }
-    entry.update_location(location);
-    entry.writeback_location = Some(location.clone());
+    let mut candidate_anchor = Some(location.writeback_anchor());
+    let retired_entry = {
+        let mut registry = file_cache_registry().lock();
+        let entry = registry
+            .entry(key)
+            .or_insert_with(|| FileUserData::new(location, shared));
+        let retired = if !entry
+            .shared()
+            .is_some_and(|registered| Arc::ptr_eq(&registered, shared))
+        {
+            Some(core::mem::replace(
+                entry,
+                FileUserData::new(location, shared),
+            ))
+        } else {
+            None
+        };
+        entry.update_location(location);
+        if entry.writeback_anchor.is_none() {
+            entry.writeback_anchor = candidate_anchor.take();
+        }
+        retired
+    };
+    // Filesystem and inode teardown may call back into cache bookkeeping.
+    // Drop replaced ownership only after releasing both bookkeeping locks.
+    drop(page_cache);
+    drop(retired_entry);
+    drop(candidate_anchor);
 }
 
-fn release_cached_file_writeback_location_if_clean(shared: &CachedFileShared) {
-    let guard = shared.page_cache.lock();
-    if guard.iter().any(|(_pn, page)| page.is_dirty()) {
+fn release_cached_file_writeback_anchor_if_clean(shared: &CachedFileShared) {
+    let page_cache = shared.page_cache.lock();
+    if page_cache.iter().any(|(_pn, page)| page.is_dirty()) {
         return;
     }
 
-    let mut registry = file_cache_registry().lock();
-    for entry in registry.values_mut() {
-        if entry
-            .shared()
-            .is_some_and(|registered| core::ptr::eq(Arc::as_ptr(&registered), shared))
-        {
-            entry.writeback_location = None;
+    let released = {
+        let mut registry = file_cache_registry().lock();
+        registry
+            .values_mut()
+            .filter(|entry| {
+                entry
+                    .shared()
+                    .is_some_and(|registered| core::ptr::eq(Arc::as_ptr(&registered), shared))
+            })
+            .filter_map(|entry| entry.writeback_anchor.take())
+            .collect::<Vec<_>>()
+    };
+    drop(page_cache);
+    drop(released);
+}
+
+type CachedFileWritebackSnapshotEntry = ((u64, u64), Arc<CachedFileShared>, WritebackAnchor);
+
+fn cached_file_writeback_snapshot() -> Vec<CachedFileWritebackSnapshotEntry> {
+    let (entries, deferred, retired) = {
+        let mut registry = file_cache_registry().lock();
+        let mut entries = Vec::new();
+        let mut dead_keys = Vec::new();
+        let mut deferred = Vec::new();
+
+        for (key, entry) in registry.iter() {
+            let shared = entry.shared();
+            let anchor = entry.writeback_anchor();
+            match (shared, anchor) {
+                (Some(shared), Some(anchor)) => entries.push((*key, shared, anchor)),
+                (shared, anchor) => {
+                    dead_keys.push(*key);
+                    deferred.push((shared, anchor));
+                }
+            }
         }
-    }
+
+        let retired = dead_keys
+            .into_iter()
+            .filter_map(|key| registry.remove(&key))
+            .collect::<Vec<_>>();
+        (entries, deferred, retired)
+    };
+
+    // Snapshot failures and dead registry entries can own filesystem state.
+    // Their destruction must happen only after the registry guard is gone.
+    drop(deferred);
+    drop(retired);
+    entries
 }
 
 /// Drops the shared page-cache registry entry for a fully released inode.
 pub fn remove_cached_file_registry_entry(device: u64, inode: u64) {
-    file_cache_registry().lock().remove(&(device, inode));
+    let retired = {
+        let mut registry = file_cache_registry().lock();
+        registry.remove(&(device, inode))
+    };
+    drop(retired);
 }
 
 /// Prunes dead cache registry entries for a released inode.
 pub fn prune_dead_cached_file_registry_entries_for_inode(inode: u64) {
-    file_cache_registry()
-        .lock()
-        .retain(|(_, entry_inode), entry| *entry_inode != inode || entry.shared().is_some());
+    let retired = {
+        let mut registry = file_cache_registry().lock();
+        let dead_keys = registry
+            .iter()
+            .filter_map(|(key @ (_, entry_inode), entry)| {
+                (*entry_inode == inode && !entry.has_live_shared()).then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        dead_keys
+            .into_iter()
+            .filter_map(|key| registry.remove(&key))
+            .collect::<Vec<_>>()
+    };
+    drop(retired);
 }
 
 fn cached_file_page_count(shared: &CachedFileShared) -> usize {
@@ -744,17 +820,26 @@ fn cached_file_page_count(shared: &CachedFileShared) -> usize {
 
 fn release_closed_cached_file_retention(location: &Location) {
     let key = cached_file_registry_key(location);
-    if let Some(entry) = file_cache_registry().lock().get_mut(&key) {
-        let _ = entry.release_retained();
-    }
+    let released = {
+        let mut registry = file_cache_registry().lock();
+        registry
+            .get_mut(&key)
+            .and_then(FileUserData::release_retained)
+    };
+    drop(released);
 }
 
 struct ClosedFileCacheTrimCandidate {
     key: (u64, u64),
     shared: Arc<CachedFileShared>,
-    location: Location,
+    anchor: WritebackAnchor,
     pages: usize,
     epoch: u64,
+}
+
+enum ClosedFileCacheRetentionDecision {
+    Retained(Option<Arc<CachedFileShared>>),
+    Trim(Vec<ClosedFileCacheTrimCandidate>),
 }
 
 fn closed_file_cache_trim_candidates(
@@ -780,7 +865,7 @@ fn closed_file_cache_trim_candidates(
             Some(ClosedFileCacheTrimCandidate {
                 key: *key,
                 shared,
-                location: entry.location()?,
+                anchor: entry.writeback_anchor()?,
                 pages: entry.retained_pages,
                 epoch: entry.retained_epoch,
             })
@@ -805,7 +890,7 @@ fn flush_and_release_closed_file_cache_candidate(candidate: ClosedFileCacheTrimC
         return false;
     }
 
-    let file = match candidate.location.entry().as_file() {
+    let file = match candidate.anchor.entry().as_file() {
         Ok(file) => file,
         Err(err) => {
             warn!("Failed to access retained cached file for trim: {err:?}");
@@ -819,21 +904,25 @@ fn flush_and_release_closed_file_cache_candidate(candidate: ClosedFileCacheTrimC
         return false;
     }
 
-    let mut registry = file_cache_registry().lock();
-    let Some(entry) = registry.get_mut(&candidate.key) else {
-        return false;
+    let released = {
+        let mut registry = file_cache_registry().lock();
+        let Some(entry) = registry.get_mut(&candidate.key) else {
+            return false;
+        };
+        let still_retained = entry
+            .retained
+            .as_ref()
+            .is_some_and(|shared| Arc::ptr_eq(shared, &candidate.shared));
+        if !still_retained || candidate.shared.open_handles.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        let pages = entry.retained_pages;
+        entry.release_retained().map(|retained| (retained, pages))
     };
-    let still_retained = entry
-        .retained
-        .as_ref()
-        .is_some_and(|shared| Arc::ptr_eq(shared, &candidate.shared));
-    if !still_retained || candidate.shared.open_handles.load(Ordering::Acquire) != 0 {
-        return false;
-    }
-    let pages = entry.retained_pages;
-    if entry.release_retained() {
+    if let Some((retained, pages)) = released {
         record_cached_file_counter(&CLOSED_FILE_CACHE_TRIM_RELEASES, 1);
         record_cached_file_counter(&CLOSED_FILE_CACHE_TRIM_PAGES, pages as u64);
+        drop(retained);
         return true;
     }
     false
@@ -852,11 +941,11 @@ fn try_retain_closed_cached_file(location: &Location, shared: &Arc<CachedFileSha
     if pages == 0 {
         return false;
     }
-    release_cached_file_writeback_location_if_clean(shared);
+    release_cached_file_writeback_anchor_if_clean(shared);
 
     let key = cached_file_registry_key(location);
     loop {
-        let trim_candidates = {
+        let decision = {
             let mut registry = file_cache_registry().lock();
             if shared.open_handles.load(Ordering::Acquire) != 0 {
                 return false;
@@ -868,12 +957,28 @@ fn try_retain_closed_cached_file(location: &Location, shared: &Arc<CachedFileSha
                 .load(Ordering::Acquire)
                 .saturating_sub(entry.retained_pages);
             if current_without_entry.saturating_add(pages) <= CLOSED_FILE_CACHE_RETAIN_MAX_PAGES {
-                entry.retain_closed(location, shared, pages);
+                let retired = entry.retain_closed(location, shared, pages);
+                ClosedFileCacheRetentionDecision::Retained(retired)
+            } else {
+                ClosedFileCacheRetentionDecision::Trim(closed_file_cache_trim_candidates(
+                    &registry,
+                    key,
+                    current_without_entry,
+                    pages,
+                ))
+            }
+        };
+
+        let trim_candidates = match decision {
+            ClosedFileCacheRetentionDecision::Retained(retired) => {
+                // Replacing a retained cache can release filesystem-backed
+                // state. Keep that destructor outside the registry lock.
+                drop(retired);
                 record_cached_file_counter(&CLOSED_FILE_CACHE_RETAIN_HITS, 1);
                 record_cached_file_counter(&CLOSED_FILE_CACHE_RETAIN_PAGES, pages as u64);
                 return true;
             }
-            closed_file_cache_trim_candidates(&registry, key, current_without_entry, pages)
+            ClosedFileCacheRetentionDecision::Trim(candidates) => candidates,
         };
 
         if trim_candidates.is_empty() {
@@ -908,7 +1013,7 @@ pub fn sync_and_invalidate_cached_file_pages(location: &Location) -> VfsResult<(
             };
             let _ = writeback_cached_page(&shared, file, pn, &mut page)?;
         }
-        release_cached_file_writeback_location_if_clean(&shared);
+        release_cached_file_writeback_anchor_if_clean(&shared);
         release_closed_cached_file_retention(location);
     }
     Ok(())
@@ -965,7 +1070,7 @@ pub fn mark_cached_file_unlinked(location: &Location) {
         shared.unlinked.store(true, Ordering::Release);
         if shared.open_handles.load(Ordering::Acquire) == 0 {
             discard_cached_pages(&shared);
-            release_cached_file_writeback_location_if_clean(&shared);
+            release_cached_file_writeback_anchor_if_clean(&shared);
         }
         release_closed_cached_file_retention(location);
     }
@@ -973,14 +1078,7 @@ pub fn mark_cached_file_unlinked(location: &Location) {
 
 /// Flushes all live dirty cached file pages before a global sync.
 pub fn sync_all_cached_file_pages() -> VfsResult<()> {
-    let entries = {
-        let mut registry = file_cache_registry().lock();
-        registry.retain(|_, entry| entry.shared().is_some() && entry.location().is_some());
-        registry
-            .iter()
-            .filter_map(|(key, entry)| Some((*key, entry.shared()?, entry.location()?)))
-            .collect::<Vec<_>>()
-    };
+    let entries = cached_file_writeback_snapshot();
 
     for (_key, shared, location) in entries {
         if shared.unlinked.load(Ordering::Acquire) {
@@ -1001,16 +1099,9 @@ pub fn sync_all_cached_file_pages() -> VfsResult<()> {
 /// Filesystem backends call this before flushing their own metadata and block
 /// caches so unmount and syncfs preserve writeback ordering.
 pub fn sync_cached_file_pages_for_filesystem(filesystem: &dyn FilesystemOps) -> VfsResult<()> {
-    let entries = {
-        let mut registry = file_cache_registry().lock();
-        registry.retain(|_, entry| entry.shared().is_some() && entry.location().is_some());
-        registry
-            .values()
-            .filter_map(|entry| Some((entry.shared()?, entry.location()?)))
-            .collect::<Vec<_>>()
-    };
+    let entries = cached_file_writeback_snapshot();
 
-    for (shared, location) in entries {
+    for (_key, shared, location) in entries {
         if !core::ptr::addr_eq(location.filesystem(), filesystem)
             || shared.unlinked.load(Ordering::Acquire)
         {
@@ -1656,7 +1747,7 @@ fn flush_dirty_page_list_locked(
         }
         start = end;
     }
-    release_cached_file_writeback_location_if_clean(shared);
+    release_cached_file_writeback_anchor_if_clean(shared);
     Ok(())
 }
 
@@ -1784,7 +1875,7 @@ impl Clone for CachedFile {
 struct FileUserData {
     shared: Weak<CachedFileShared>,
     retained: Option<Arc<CachedFileShared>>,
-    writeback_location: Option<Location>,
+    writeback_anchor: Option<WritebackAnchor>,
     retained_pages: usize,
     retained_epoch: u64,
     mountpoint: Weak<Mountpoint>,
@@ -1796,7 +1887,7 @@ impl FileUserData {
         Self {
             shared: Arc::downgrade(shared),
             retained: None,
-            writeback_location: None,
+            writeback_anchor: None,
             retained_pages: 0,
             retained_epoch: 0,
             mountpoint: Arc::downgrade(location.mountpoint()),
@@ -1808,25 +1899,32 @@ impl FileUserData {
         self.retained.clone().or_else(|| self.shared.upgrade())
     }
 
-    pub fn location(&self) -> Option<Location> {
-        if let Some(location) = &self.writeback_location {
-            return Some(location.clone());
+    fn has_live_shared(&self) -> bool {
+        self.retained.is_some() || self.shared.strong_count() != 0
+    }
+
+    pub fn writeback_anchor(&self) -> Option<WritebackAnchor> {
+        if let Some(anchor) = &self.writeback_anchor {
+            return Some(anchor.clone());
         }
-        Some(Location::new(
-            self.mountpoint.upgrade()?,
-            self.entry.upgrade()?,
-        ))
+        Some(
+            self.mountpoint
+                .upgrade()?
+                .writeback_anchor(self.entry.upgrade()?),
+        )
     }
 
     fn update_location(&mut self, location: &Location) {
         self.mountpoint = Arc::downgrade(location.mountpoint());
         self.entry = location.entry().downgrade();
-        if self.writeback_location.is_some() {
-            self.writeback_location = Some(location.clone());
-        }
     }
 
-    fn retain_closed(&mut self, location: &Location, shared: &Arc<CachedFileShared>, pages: usize) {
+    fn retain_closed(
+        &mut self,
+        location: &Location,
+        shared: &Arc<CachedFileShared>,
+        pages: usize,
+    ) -> Option<Arc<CachedFileShared>> {
         self.update_location(location);
         let old_pages = self.retained_pages;
         if pages > old_pages {
@@ -1834,15 +1932,14 @@ impl FileUserData {
         } else if old_pages > pages {
             CLOSED_FILE_CACHE_RETAINED_PAGES.fetch_sub(old_pages - pages, Ordering::AcqRel);
         }
-        self.retained = Some(shared.clone());
+        let retired = self.retained.replace(shared.clone());
         self.retained_pages = pages;
         self.retained_epoch = CLOSED_FILE_CACHE_RETAIN_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+        retired
     }
 
-    fn release_retained(&mut self) -> bool {
-        let Some(_) = self.retained.take() else {
-            return false;
-        };
+    fn release_retained(&mut self) -> Option<Arc<CachedFileShared>> {
+        let retained = self.retained.take()?;
         let pages = self.retained_pages;
         self.retained_pages = 0;
         self.retained_epoch = 0;
@@ -1850,7 +1947,7 @@ impl FileUserData {
             CLOSED_FILE_CACHE_RETAINED_PAGES.fetch_sub(pages, Ordering::AcqRel);
         }
         record_cached_file_counter(&CLOSED_FILE_CACHE_RETAIN_RELEASES, 1);
-        true
+        Some(retained)
     }
 }
 
@@ -2489,7 +2586,7 @@ impl CachedFile {
             let dirty = guard.get(&pn).is_some_and(PageCache::is_dirty);
             drop(guard);
             if dirty {
-                retain_cached_file_writeback_location_if_dirty(&self.inner, &self.shared);
+                retain_cached_file_writeback_anchor_if_dirty(&self.inner, &self.shared);
             }
             return result;
         }
@@ -2519,7 +2616,7 @@ impl CachedFile {
             let dirty = guard.get(&pn).is_some_and(PageCache::is_dirty);
             drop(guard);
             if dirty {
-                retain_cached_file_writeback_location_if_dirty(&self.inner, &self.shared);
+                retain_cached_file_writeback_anchor_if_dirty(&self.inner, &self.shared);
             }
             return result;
         }
@@ -2650,7 +2747,7 @@ impl CachedFile {
             true,
         )?;
         if written != 0 {
-            retain_cached_file_writeback_location_if_dirty(&self.inner, &self.shared);
+            retain_cached_file_writeback_anchor_if_dirty(&self.inner, &self.shared);
         }
         Ok(written)
     }
@@ -2761,7 +2858,7 @@ impl CachedFile {
                 page.mark_dirty();
             }
         }
-        retain_cached_file_writeback_location_if_dirty(&self.inner, &self.shared);
+        retain_cached_file_writeback_anchor_if_dirty(&self.inner, &self.shared);
         Ok(())
     }
 

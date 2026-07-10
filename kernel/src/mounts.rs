@@ -209,20 +209,36 @@ pub fn change_propagation(target: &str, flags: u32, recursive: bool) {
     }
 }
 
-pub fn move_tree(old_target: &str, new_target: &str, new_parent_id: u64) {
+pub fn move_tree(root_mount_id: u64, old_target: &str, new_target: &str, new_parent_id: u64) {
     let mut records = MOUNT_RECORDS.lock();
+    move_tree_records(
+        &mut records,
+        root_mount_id,
+        old_target,
+        new_target,
+        new_parent_id,
+    );
+}
+
+fn move_tree_records(
+    records: &mut [MountRecord],
+    root_mount_id: u64,
+    old_target: &str,
+    new_target: &str,
+    new_parent_id: u64,
+) {
+    let subtree = subtree_mount_ids(records, root_mount_id);
     for record in records.iter_mut() {
-        if record.target == old_target {
-            record.target = new_target.to_string();
+        if !subtree.contains(&record.mount_id) {
+            continue;
+        }
+
+        if let Some(suffix) = path_suffix(old_target, &record.target) {
+            record.target = joined_path(new_target, suffix);
+            record.expire_marked = false;
+        }
+        if record.mount_id == root_mount_id {
             record.parent_id = new_parent_id;
-            record.expire_marked = false;
-        } else if let Some(suffix) = record
-            .target
-            .strip_prefix(old_target)
-            .filter(|suffix| suffix.starts_with('/'))
-        {
-            record.target = alloc::format!("{new_target}{suffix}");
-            record.expire_marked = false;
         }
     }
 }
@@ -292,6 +308,8 @@ fn contains_path(record_target: &str, path: &str) -> bool {
 fn path_suffix<'a>(base: &str, path: &'a str) -> Option<&'a str> {
     if path == base {
         Some("")
+    } else if base == "/" && path.starts_with('/') {
+        Some(path)
     } else {
         path.strip_prefix(base)
             .filter(|suffix| suffix.starts_with('/'))
@@ -509,5 +527,61 @@ mod tests {
 
         let ids = subtree_mount_ids(&records, 3);
         assert_eq!(ids.into_iter().collect::<Vec<_>>(), [3, 4]);
+    }
+
+    #[test]
+    fn move_tree_only_moves_the_selected_stacked_subtree() {
+        let mut records = [
+            record(1, 0, "/"),
+            record(2, 1, "/mnt"),
+            record(3, 2, "/mnt"),
+            record(4, 3, "/mnt/nested"),
+        ];
+
+        move_tree_records(&mut records, 3, "/mnt", "/moved", 1);
+
+        let lower = records.iter().find(|record| record.mount_id == 2).unwrap();
+        let moved = records.iter().find(|record| record.mount_id == 3).unwrap();
+        let nested = records.iter().find(|record| record.mount_id == 4).unwrap();
+        assert_eq!(lower.target, "/mnt");
+        assert_eq!(lower.parent_id, 1);
+        assert_eq!(moved.target, "/moved");
+        assert_eq!(moved.parent_id, 1);
+        assert_eq!(nested.target, "/moved/nested");
+        assert_eq!(nested.parent_id, 3);
+    }
+
+    #[test]
+    fn move_tree_rewrites_descendants_of_a_root_overmount() {
+        let mut records = [
+            record(1, 0, "/"),
+            record(2, 1, "/"),
+            record(3, 2, "/nested"),
+        ];
+
+        move_tree_records(&mut records, 2, "/", "/moved", 1);
+
+        let namespace_root = records.iter().find(|record| record.mount_id == 1).unwrap();
+        let moved = records.iter().find(|record| record.mount_id == 2).unwrap();
+        let nested = records.iter().find(|record| record.mount_id == 3).unwrap();
+        assert_eq!(namespace_root.target, "/");
+        assert_eq!(moved.target, "/moved");
+        assert_eq!(nested.target, "/moved/nested");
+    }
+
+    #[test]
+    fn move_tree_to_namespace_root_does_not_add_a_second_separator() {
+        let mut records = [
+            record(1, 0, "/"),
+            record(2, 1, "/source"),
+            record(3, 2, "/source/nested"),
+        ];
+
+        move_tree_records(&mut records, 2, "/source", "/", 1);
+
+        let moved = records.iter().find(|record| record.mount_id == 2).unwrap();
+        let nested = records.iter().find(|record| record.mount_id == 3).unwrap();
+        assert_eq!(moved.target, "/");
+        assert_eq!(nested.target, "/nested");
     }
 }
