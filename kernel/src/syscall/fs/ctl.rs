@@ -408,18 +408,13 @@ pub fn sys_chdir(path: *const c_char) -> AxResult<isize> {
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    let supplementary_groups = proc_data.supplementary_groups();
+    let credentials = proc_data.fs_dac_credentials();
     let mut fs = FS_CONTEXT.lock();
     let entry = fs.resolve(path)?;
     if entry.node_type() != NodeType::Directory {
         return Err(AxError::NotADirectory);
     }
-    check_search_permissions(
-        &entry,
-        proc_data.fsuid(),
-        proc_data.fsgid(),
-        &supplementary_groups,
-    )?;
+    check_search_permissions(&entry, &credentials)?;
     fs.set_current_dir(entry)?;
     Ok(0)
 }
@@ -430,16 +425,11 @@ pub fn sys_fchdir(dirfd: i32) -> AxResult<isize> {
     let entry = with_fs(dirfd, |fs| Ok(fs.current_dir().clone()))?;
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    let supplementary_groups = proc_data.supplementary_groups();
+    let credentials = proc_data.fs_dac_credentials();
     if entry.node_type() != NodeType::Directory {
         return Err(AxError::NotADirectory);
     }
-    check_search_permissions(
-        &entry,
-        proc_data.fsuid(),
-        proc_data.fsgid(),
-        &supplementary_groups,
-    )?;
+    check_search_permissions(&entry, &credentials)?;
     FS_CONTEXT.lock().set_current_dir(entry)?;
     Ok(0)
 }
@@ -455,18 +445,13 @@ pub fn sys_chroot(path: *const c_char) -> AxResult<isize> {
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    let supplementary_groups = proc_data.supplementary_groups();
+    let credentials = proc_data.fs_dac_credentials();
     let mut fs = FS_CONTEXT.lock();
     let loc = fs.resolve(path)?;
     if loc.node_type() != NodeType::Directory {
         return Err(AxError::NotADirectory);
     }
-    check_search_permissions(
-        &loc,
-        proc_data.fsuid(),
-        proc_data.fsgid(),
-        &supplementary_groups,
-    )?;
+    check_search_permissions(&loc, &credentials)?;
     if !current_has_capability(CAP_SYS_CHROOT) {
         return Err(AxError::OperationNotPermitted);
     }
@@ -485,16 +470,11 @@ pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let requested_mode = NodePermission::from_bits_truncate((mode & !proc_data.umask()) as u16);
-    let supplementary_groups = proc_data.supplementary_groups();
+    let credentials = proc_data.fs_dac_credentials();
     let path_ref = Path::new(&path);
     let (parent, name) = with_path_fs(dirfd, path_ref, |fs| {
         let (parent, name) = fs.resolve_nonexistent(path_ref)?;
-        check_create_permissions(
-            &parent,
-            proc_data.fsuid(),
-            proc_data.fsgid(),
-            &supplementary_groups,
-        )?;
+        check_create_permissions(&parent, &credentials)?;
         Ok((parent, name.to_string()))
     })?;
     let parent_meta = parent.metadata()?;
@@ -545,14 +525,10 @@ pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, dev: u64) -> AxRe
     }
 
     let requested_mode = NodePermission::from_bits_truncate((mode & !proc_data.umask()) as u16);
+    let credentials = proc_data.fs_dac_credentials();
     let (parent, name) = with_path_fs(dirfd, path_ref, |fs| {
         let (parent, name) = fs.resolve_nonexistent(path_ref)?;
-        check_create_permissions(
-            &parent,
-            proc_data.fsuid(),
-            proc_data.fsgid(),
-            &proc_data.supplementary_groups(),
-        )?;
+        check_create_permissions(&parent, &credentials)?;
         Ok((parent, name.to_string()))
     })?;
 
@@ -701,7 +677,7 @@ pub fn sys_linkat(
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    let supplementary_groups = proc_data.supplementary_groups();
+    let credentials = proc_data.fs_dac_credentials();
     let old = match old_path.as_deref() {
         Some(path) if flags & AT_SYMLINK_FOLLOW != 0 => proc_self_fd_location(path)
             .unwrap_or_else(|| {
@@ -716,23 +692,13 @@ pub fn sys_linkat(
             .into_file()
             .ok_or(AxError::BadFileDescriptor)?,
     };
-    check_search_permissions(
-        &old,
-        proc_data.fsuid(),
-        proc_data.fsgid(),
-        &supplementary_groups,
-    )?;
+    check_parent_search_permissions(&old, &credentials)?;
     let (new_dir, new_name) = with_path_fs(new_dirfd, Path::new(&new_path), |fs| {
         if fs.resolve(Path::new(&new_path)).is_ok() {
             return Err(AxError::AlreadyExists);
         }
         let (new_dir, new_name) = fs.resolve_nonexistent(Path::new(&new_path))?;
-        check_create_permissions(
-            &new_dir,
-            proc_data.fsuid(),
-            proc_data.fsgid(),
-            &supplementary_groups,
-        )?;
+        check_create_permissions(&new_dir, &credentials)?;
         Ok((new_dir, new_name))
     })?;
 
@@ -782,7 +748,7 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    let supplementary_groups = proc_data.supplementary_groups();
+    let credentials = proc_data.fs_dac_credentials();
     let (parent_hint, name_hint) = with_path_fs(dirfd, path_ref, |fs| {
         let (parent, name) = fs.resolve_nonexistent(path_ref)?;
         check_writable_mount(&parent)?;
@@ -794,13 +760,7 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
     let is_dir = loc.is_dir();
     let last_link = is_dir || loc.metadata()?.nlink <= 1;
     if let Some(parent) = parent.as_ref() {
-        check_remove_permissions(
-            parent,
-            &loc,
-            proc_data.fsuid(),
-            proc_data.fsgid(),
-            &supplementary_groups,
-        )?;
+        check_remove_permissions(parent, &loc, &credentials)?;
     }
     if !is_dir && last_link {
         axfs::mark_cached_file_unlinked(&loc);
@@ -884,15 +844,10 @@ pub fn sys_symlinkat(
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    let supplementary_groups = proc_data.supplementary_groups();
+    let credentials = proc_data.fs_dac_credentials();
     let (parent, name) = with_path_fs(new_dirfd, linkpath_ref, |fs| {
         let (parent, name) = fs.resolve_nonexistent(linkpath_ref)?;
-        check_create_permissions(
-            &parent,
-            proc_data.fsuid(),
-            proc_data.fsgid(),
-            &supplementary_groups,
-        )?;
+        check_create_permissions(&parent, &credentials)?;
         fs.symlink(target.as_str(), linkpath.as_str())?;
         Ok((parent, name.to_string()))
     })?;
@@ -923,12 +878,8 @@ pub fn sys_readlinkat(
     fn write_readlink_result(loc: &Location, buf: *mut u8, size: usize) -> AxResult<isize> {
         let curr = current();
         let proc_data = &curr.as_thread().proc_data;
-        check_parent_search_permissions(
-            loc,
-            proc_data.fsuid(),
-            proc_data.fsgid(),
-            &proc_data.supplementary_groups(),
-        )?;
+        let credentials = proc_data.fs_dac_credentials();
+        check_parent_search_permissions(loc, &credentials)?;
         let link = loc.read_link()?;
         let read = size.min(link.len());
         vm_write_slice(buf, &link.as_bytes()[..read])?;
@@ -1004,12 +955,8 @@ pub fn sys_fchownat(
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     if path.as_deref().is_some_and(|path| !path.is_empty()) {
-        check_parent_search_permissions(
-            &loc,
-            proc_data.fsuid(),
-            proc_data.fsgid(),
-            &proc_data.supplementary_groups(),
-        )?;
+        let credentials = proc_data.fs_dac_credentials();
+        check_parent_search_permissions(&loc, &credentials)?;
     }
     check_chown_permission(&meta, uid, gid)?;
     let mode = chown_mode_after_update(&meta);
@@ -1084,17 +1031,12 @@ fn update_times(
     let meta = loc.metadata()?;
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    if proc_data.fsuid() != meta.uid && !proc_data.has_effective_capability(CAP_FOWNER) {
+    let credentials = proc_data.fs_dac_credentials();
+    if credentials.uid() != meta.uid && !credentials.has_capability(CAP_FOWNER) {
         if (atime_intent, mtime_intent) != (TimeUpdate::Now, TimeUpdate::Now) {
             return Err(AxError::OperationNotPermitted);
         }
-        check_open_permissions(
-            &loc,
-            W_OK,
-            proc_data.fsuid(),
-            proc_data.fsgid(),
-            &proc_data.supplementary_groups(),
-        )?;
+        check_open_permissions(&loc, W_OK, &credentials)?;
     }
     check_writable_mount(&loc)?;
     loc.update_metadata(MetadataUpdate {
@@ -1248,7 +1190,7 @@ pub fn sys_renameat2(
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    let supplementary_groups = proc_data.supplementary_groups();
+    let credentials = proc_data.fs_dac_credentials();
     let old_loc = with_path_fs(old_dirfd, old_path_ref, |fs| {
         fs.resolve_no_follow(&old_path)
     })?;
@@ -1296,24 +1238,8 @@ pub fn sys_renameat2(
 
     if flags & RENAME_EXCHANGE != 0 {
         let new_loc = new_existing.as_ref().ok_or(AxError::NotFound)?;
-        check_rename_permissions(
-            &old_dir,
-            &old_loc,
-            &new_dir,
-            Some(new_loc),
-            proc_data.fsuid(),
-            proc_data.fsgid(),
-            &supplementary_groups,
-        )?;
-        check_rename_permissions(
-            &new_dir,
-            new_loc,
-            &old_dir,
-            Some(&old_loc),
-            proc_data.fsuid(),
-            proc_data.fsgid(),
-            &supplementary_groups,
-        )?;
+        check_rename_permissions(&old_dir, &old_loc, &new_dir, Some(new_loc), &credentials)?;
+        check_rename_permissions(&new_dir, new_loc, &old_dir, Some(&old_loc), &credentials)?;
         exchange_rename_entries(&old_dir, &old_name, &new_dir, &new_name)?;
         return Ok(0);
     }
@@ -1331,9 +1257,7 @@ pub fn sys_renameat2(
         &old_loc,
         &new_dir,
         new_existing.as_ref(),
-        proc_data.fsuid(),
-        proc_data.fsgid(),
-        &supplementary_groups,
+        &credentials,
     )?;
 
     old_dir.rename(&old_name, &new_dir, &new_name)?;

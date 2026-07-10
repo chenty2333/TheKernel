@@ -5,9 +5,9 @@ use axfs_ng_vfs::{
     path::{Component, Path},
 };
 use axtask::current_may_uninit;
-use linux_raw_sys::general::{W_OK, X_OK};
+use linux_raw_sys::general::{CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, R_OK, W_OK, X_OK};
 
-use crate::task::AsThread;
+use crate::task::{AsThread, DacCredentialView};
 
 const STICKY_MODE_BIT: u32 = 0o1000;
 
@@ -28,37 +28,91 @@ pub(crate) fn granted_access_bits(
     gid: u32,
     supplementary_groups: &[u32],
 ) -> u32 {
-    let mut granted = perm & 0o7;
-    if gid == owner_gid || supplementary_groups.contains(&owner_gid) {
-        granted |= (perm >> 3) & 0o7;
-    }
     if uid == owner_uid {
-        granted |= (perm >> 6) & 0o7;
+        (perm >> 6) & 0o7
+    } else if gid == owner_gid || supplementary_groups.contains(&owner_gid) {
+        (perm >> 3) & 0o7
+    } else {
+        perm & 0o7
     }
-    granted
+}
+
+fn dac_access_allowed(
+    perm: u32,
+    owner_uid: u32,
+    owner_gid: u32,
+    node_type: NodeType,
+    requested: u32,
+    credentials: &DacCredentialView,
+) -> bool {
+    let requested = requested & 0o7;
+    if requested == 0 {
+        return true;
+    }
+
+    let granted = granted_access_bits(
+        perm,
+        owner_uid,
+        owner_gid,
+        credentials.uid(),
+        credentials.gid(),
+        credentials.supplementary_groups(),
+    );
+    if granted & requested == requested {
+        return true;
+    }
+
+    if node_type == NodeType::Directory {
+        if requested & W_OK == 0 && credentials.has_capability(CAP_DAC_READ_SEARCH) {
+            return true;
+        }
+        return credentials.has_capability(CAP_DAC_OVERRIDE);
+    }
+
+    if requested == R_OK && credentials.has_capability(CAP_DAC_READ_SEARCH) {
+        return true;
+    }
+
+    (requested & X_OK == 0 || perm & 0o111 != 0) && credentials.has_capability(CAP_DAC_OVERRIDE)
+}
+
+pub(crate) fn check_dac_permissions(
+    perm: u32,
+    owner_uid: u32,
+    owner_gid: u32,
+    node_type: NodeType,
+    requested: u32,
+    credentials: &DacCredentialView,
+) -> AxResult {
+    if dac_access_allowed(
+        perm,
+        owner_uid,
+        owner_gid,
+        node_type,
+        requested,
+        credentials,
+    ) {
+        Ok(())
+    } else {
+        Err(AxError::PermissionDenied)
+    }
 }
 
 pub(crate) fn check_parent_search_permissions(
     loc: &Location,
-    uid: u32,
-    gid: u32,
-    supplementary_groups: &[u32],
+    credentials: &DacCredentialView,
 ) -> AxResult {
     let mut parent = loc.parent();
     while let Some(dir) = parent {
         let stat = dir.metadata()?;
-        if granted_access_bits(
+        check_dac_permissions(
             stat.mode.bits() as u32,
             stat.uid,
             stat.gid,
-            uid,
-            gid,
-            supplementary_groups,
-        ) & X_OK
-            == 0
-        {
-            return Err(AxError::PermissionDenied);
-        }
+            stat.node_type,
+            X_OK,
+            credentials,
+        )?;
         parent = dir.parent();
     }
     Ok(())
@@ -67,14 +121,8 @@ pub(crate) fn check_parent_search_permissions(
 pub(crate) fn check_path_prefix_search_permissions(
     fs: &FsContext,
     path: &Path,
-    uid: u32,
-    gid: u32,
-    supplementary_groups: &[u32],
+    credentials: &DacCredentialView,
 ) -> AxResult {
-    if uid == 0 {
-        return Ok(());
-    }
-
     let mut current = if path.is_absolute() {
         fs.root_dir().clone()
     } else {
@@ -87,11 +135,11 @@ pub(crate) fn check_path_prefix_search_permissions(
             Component::CurDir => {}
             Component::RootDir => current = fs.root_dir().clone(),
             Component::ParentDir => {
-                check_search_permissions(&current, uid, gid, supplementary_groups)?;
+                check_search_permissions(&current, credentials)?;
                 current = current.parent().unwrap_or_else(|| fs.root_dir().clone());
             }
             Component::Normal(name) => {
-                check_search_permissions(&current, uid, gid, supplementary_groups)?;
+                check_search_permissions(&current, credentials)?;
                 if components.peek().is_none() {
                     break;
                 }
@@ -106,107 +154,61 @@ pub(crate) fn check_path_prefix_search_permissions(
 
 pub(crate) fn check_search_permissions(
     loc: &Location,
-    uid: u32,
-    gid: u32,
-    supplementary_groups: &[u32],
+    credentials: &DacCredentialView,
 ) -> AxResult {
-    if uid == 0 {
-        return Ok(());
-    }
-
-    check_parent_search_permissions(loc, uid, gid, supplementary_groups)?;
+    check_parent_search_permissions(loc, credentials)?;
 
     let stat = loc.metadata()?;
-    if granted_access_bits(
+    check_dac_permissions(
         stat.mode.bits() as u32,
         stat.uid,
         stat.gid,
-        uid,
-        gid,
-        supplementary_groups,
-    ) & X_OK
-        == 0
-    {
-        return Err(AxError::PermissionDenied);
-    }
-
-    Ok(())
+        stat.node_type,
+        X_OK,
+        credentials,
+    )
 }
 
 pub(crate) fn check_create_permissions(
     dir: &Location,
-    uid: u32,
-    gid: u32,
-    supplementary_groups: &[u32],
+    credentials: &DacCredentialView,
 ) -> AxResult {
-    check_writable_mount(dir)?;
-
-    if uid == 0 {
-        return Ok(());
-    }
-
-    check_search_permissions(dir, uid, gid, supplementary_groups)?;
-
-    let stat = dir.metadata()?;
-    if granted_access_bits(
-        stat.mode.bits() as u32,
-        stat.uid,
-        stat.gid,
-        uid,
-        gid,
-        supplementary_groups,
-    ) & W_OK
-        == 0
-    {
-        return Err(AxError::PermissionDenied);
-    }
-
-    Ok(())
+    check_directory_write_search_permissions(dir, credentials)
 }
 
 fn check_directory_write_search_permissions(
     dir: &Location,
-    uid: u32,
-    gid: u32,
-    supplementary_groups: &[u32],
+    credentials: &DacCredentialView,
 ) -> AxResult {
     check_writable_mount(dir)?;
-
-    if uid == 0 {
-        return Ok(());
-    }
-
-    check_search_permissions(dir, uid, gid, supplementary_groups)?;
+    check_parent_search_permissions(dir, credentials)?;
 
     let stat = dir.metadata()?;
-    if granted_access_bits(
+    check_dac_permissions(
         stat.mode.bits() as u32,
         stat.uid,
         stat.gid,
-        uid,
-        gid,
-        supplementary_groups,
-    ) & W_OK
-        == 0
-    {
-        return Err(AxError::PermissionDenied);
-    }
-
-    Ok(())
+        stat.node_type,
+        W_OK | X_OK,
+        credentials,
+    )
 }
 
-fn check_sticky_delete_permissions(dir: &Location, target: &Location, uid: u32) -> AxResult {
-    if uid == 0 {
-        return Ok(());
-    }
-
+fn check_sticky_delete_permissions(
+    dir: &Location,
+    target: &Location,
+    credentials: &DacCredentialView,
+) -> AxResult {
     let dir_stat = dir.metadata()?;
     if dir_stat.mode.bits() as u32 & STICKY_MODE_BIT == 0 {
         return Ok(());
     }
 
     let target_stat = target.metadata()?;
-    if uid == dir_stat.uid || uid == target_stat.uid {
+    if credentials.uid() == dir_stat.uid
+        || credentials.uid() == target_stat.uid
+        || credentials.has_capability(CAP_FOWNER)
+    {
         return Ok(());
     }
 
@@ -216,12 +218,10 @@ fn check_sticky_delete_permissions(dir: &Location, target: &Location, uid: u32) 
 pub(crate) fn check_remove_permissions(
     dir: &Location,
     target: &Location,
-    uid: u32,
-    gid: u32,
-    supplementary_groups: &[u32],
+    credentials: &DacCredentialView,
 ) -> AxResult {
-    check_directory_write_search_permissions(dir, uid, gid, supplementary_groups)?;
-    check_sticky_delete_permissions(dir, target, uid)
+    check_directory_write_search_permissions(dir, credentials)?;
+    check_sticky_delete_permissions(dir, target, credentials)
 }
 
 pub(crate) fn check_rename_permissions(
@@ -229,14 +229,12 @@ pub(crate) fn check_rename_permissions(
     source: &Location,
     new_dir: &Location,
     replaced: Option<&Location>,
-    uid: u32,
-    gid: u32,
-    supplementary_groups: &[u32],
+    credentials: &DacCredentialView,
 ) -> AxResult {
-    check_remove_permissions(old_dir, source, uid, gid, supplementary_groups)?;
-    check_directory_write_search_permissions(new_dir, uid, gid, supplementary_groups)?;
+    check_remove_permissions(old_dir, source, credentials)?;
+    check_directory_write_search_permissions(new_dir, credentials)?;
     if let Some(replaced) = replaced {
-        check_sticky_delete_permissions(new_dir, replaced, uid)?;
+        check_sticky_delete_permissions(new_dir, replaced, credentials)?;
     }
     Ok(())
 }
@@ -244,46 +242,35 @@ pub(crate) fn check_rename_permissions(
 pub(crate) fn check_open_permissions(
     loc: &Location,
     mask: u32,
-    uid: u32,
-    gid: u32,
-    supplementary_groups: &[u32],
+    credentials: &DacCredentialView,
 ) -> AxResult {
-    if uid == 0 || mask == 0 {
+    if mask == 0 {
         return Ok(());
     }
 
-    check_parent_search_permissions(loc, uid, gid, supplementary_groups)?;
+    check_parent_search_permissions(loc, credentials)?;
 
     let stat = loc.metadata()?;
-    let granted = granted_access_bits(
+    check_dac_permissions(
         stat.mode.bits() as u32,
         stat.uid,
         stat.gid,
-        uid,
-        gid,
-        supplementary_groups,
-    );
-    if granted & mask != mask {
-        return Err(AxError::PermissionDenied);
-    }
-
-    Ok(())
+        stat.node_type,
+        mask,
+        credentials,
+    )
 }
 
 pub(crate) fn check_execute_permissions(
     loc: &Location,
-    uid: u32,
-    gid: u32,
-    supplementary_groups: &[u32],
+    credentials: &DacCredentialView,
 ) -> AxResult {
     let path = loc.absolute_path().map_err(|_| AxError::InvalidInput)?;
     if crate::mounts::is_noexec(path.as_ref()) {
         return Err(AxError::PermissionDenied);
     }
 
-    if uid != 0 {
-        check_parent_search_permissions(loc, uid, gid, supplementary_groups)?;
-    }
+    check_parent_search_permissions(loc, credentials)?;
 
     let stat = loc.metadata()?;
     if stat.node_type != NodeType::RegularFile {
@@ -291,18 +278,7 @@ pub(crate) fn check_execute_permissions(
     }
 
     let perm = stat.mode.bits() as u32 & NodePermission::all().bits() as u32;
-    if uid == 0 {
-        if perm & 0o111 == 0 {
-            return Err(AxError::PermissionDenied);
-        }
-        return Ok(());
-    }
-
-    if granted_access_bits(perm, stat.uid, stat.gid, uid, gid, supplementary_groups) & X_OK == 0 {
-        return Err(AxError::PermissionDenied);
-    }
-
-    Ok(())
+    check_dac_permissions(perm, stat.uid, stat.gid, stat.node_type, X_OK, credentials)
 }
 
 pub(crate) fn check_current_execute_permissions(loc: &Location) -> AxResult {
@@ -314,10 +290,125 @@ pub(crate) fn check_current_execute_permissions(loc: &Location) -> AxResult {
     };
 
     let proc_data = &thr.proc_data;
-    check_execute_permissions(
-        loc,
-        proc_data.fsuid(),
-        proc_data.fsgid(),
-        &proc_data.supplementary_groups(),
-    )
+    let credentials = proc_data.fs_dac_credentials();
+    check_execute_permissions(loc, &credentials)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn credentials(uid: u32, gid: u32, groups: &[u32], capabilities: &[u32]) -> DacCredentialView {
+        let mut effective = [0; 2];
+        for &capability in capabilities {
+            let word = capability as usize / u32::BITS as usize;
+            effective[word] |= 1 << (capability % u32::BITS);
+        }
+        DacCredentialView::new(uid, gid, groups.to_vec(), effective)
+    }
+
+    #[test]
+    fn owner_class_does_not_inherit_other_permissions() {
+        let credentials = credentials(1000, 100, &[], &[]);
+        assert!(!dac_access_allowed(
+            0o004,
+            1000,
+            200,
+            NodeType::RegularFile,
+            R_OK,
+            &credentials,
+        ));
+    }
+
+    #[test]
+    fn group_class_does_not_inherit_other_permissions() {
+        let credentials = credentials(1000, 200, &[], &[]);
+        assert!(!dac_access_allowed(
+            0o004,
+            3000,
+            200,
+            NodeType::RegularFile,
+            R_OK,
+            &credentials,
+        ));
+    }
+
+    #[test]
+    fn uid_zero_without_effective_dac_capabilities_is_not_privileged() {
+        let credentials = credentials(0, 0, &[], &[]);
+        assert!(!dac_access_allowed(
+            0,
+            1000,
+            100,
+            NodeType::RegularFile,
+            R_OK,
+            &credentials,
+        ));
+        assert!(!dac_access_allowed(
+            0,
+            1000,
+            100,
+            NodeType::Directory,
+            X_OK,
+            &credentials,
+        ));
+    }
+
+    #[test]
+    fn read_search_does_not_override_write_permissions() {
+        let credentials = credentials(0, 0, &[], &[CAP_DAC_READ_SEARCH]);
+        assert!(dac_access_allowed(
+            0,
+            1000,
+            100,
+            NodeType::RegularFile,
+            R_OK,
+            &credentials,
+        ));
+        assert!(dac_access_allowed(
+            0,
+            1000,
+            100,
+            NodeType::Directory,
+            X_OK,
+            &credentials,
+        ));
+        assert!(!dac_access_allowed(
+            0,
+            1000,
+            100,
+            NodeType::RegularFile,
+            W_OK,
+            &credentials,
+        ));
+    }
+
+    #[test]
+    fn override_requires_an_execute_bit_for_regular_files() {
+        let credentials = credentials(0, 0, &[], &[CAP_DAC_OVERRIDE]);
+        assert!(dac_access_allowed(
+            0,
+            1000,
+            100,
+            NodeType::RegularFile,
+            R_OK | W_OK,
+            &credentials,
+        ));
+        assert!(!dac_access_allowed(
+            0,
+            1000,
+            100,
+            NodeType::RegularFile,
+            X_OK,
+            &credentials,
+        ));
+        assert!(dac_access_allowed(
+            0o001,
+            1000,
+            100,
+            NodeType::RegularFile,
+            X_OK,
+            &credentials,
+        ));
+    }
 }

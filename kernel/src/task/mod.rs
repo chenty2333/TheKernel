@@ -22,7 +22,7 @@ pub(crate) use self::{
         PtraceCredentialMode, check_current_prlimit_access, check_current_ptrace_access,
         check_current_signal_access,
     },
-    creds::{CapabilityState, Credentials},
+    creds::{CapabilityState, Credentials, DacCredentialView},
     jobctl::{ContinueResult, StopReport},
     process::{
         CgroupNamespace, PidNamespace, TimeNamespace, UTS_FIELD_LEN, UserNamespace, UtsNamespace,

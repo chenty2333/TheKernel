@@ -23,7 +23,7 @@ use starry_signal::{
 
 use super::{
     accounting::{AtomicTaskUsage, live_process_usage},
-    creds::{CAPABILITY_WORDS, CapabilityState, Credentials},
+    creds::{CAPABILITY_WORDS, CapabilityState, Credentials, DacCredentialView},
     futex::FutexTable,
     jobctl::{
         ContinueResult, ExecControlState, JobControlState, PtraceControlState, StopKind,
@@ -955,6 +955,42 @@ impl ProcessData {
 
     pub fn is_in_fs_group(&self, gid: u32) -> bool {
         self.fsgid() == gid || self.supplementary_groups.lock().contains(&gid)
+    }
+
+    /// Snapshot the filesystem identity and effective capabilities used by DAC.
+    pub(crate) fn fs_dac_credentials(&self) -> DacCredentialView {
+        let credentials = self.credentials();
+        let capabilities = self.capability_state();
+        DacCredentialView::new(
+            credentials.fsuid,
+            credentials.fsgid,
+            self.supplementary_groups(),
+            capabilities.effective,
+        )
+    }
+
+    /// Snapshot the credentials used by access(2)/faccessat2(2).
+    ///
+    /// Without AT_EACCESS Linux uses real IDs. Unless setuid fixups are
+    /// disabled, a non-root real UID gets no capabilities while real UID 0
+    /// checks with the permitted set. AT_EACCESS keeps the current filesystem
+    /// IDs and effective capability set, matching Linux's normal VFS view.
+    pub(crate) fn access_dac_credentials(&self, effective: bool) -> DacCredentialView {
+        let credentials = self.credentials();
+        let capabilities = self.capability_state();
+        let (uid, gid, capability_set) = if effective {
+            (credentials.fsuid, credentials.fsgid, capabilities.effective)
+        } else {
+            let capability_set = if capabilities.securebits & SECBIT_NO_SETUID_FIXUP != 0 {
+                capabilities.effective
+            } else if credentials.ruid == 0 {
+                capabilities.permitted
+            } else {
+                [0; CAPABILITY_WORDS]
+            };
+            (credentials.ruid, credentials.rgid, capability_set)
+        };
+        DacCredentialView::new(uid, gid, self.supplementary_groups(), capability_set)
     }
 
     pub fn has_effective_capability(&self, cap: u32) -> bool {

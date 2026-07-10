@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use axerrno::{AxError, AxResult};
 use linux_raw_sys::general::CAP_LAST_CAP;
 
@@ -30,6 +32,55 @@ pub(crate) struct Credentials {
     pub(in crate::task) egid: u32,
     pub(in crate::task) sgid: u32,
     pub(in crate::task) fsgid: u32,
+}
+
+/// The credential fields used by one discretionary-access-control operation.
+///
+/// This keeps a path operation from repeatedly sampling mutable process state.
+/// The backing credential stores are still split until the immutable credential
+/// foundation is introduced, so constructing this view is not yet an atomic
+/// Linux-style `current_cred()` read.
+#[derive(Debug, Clone)]
+pub(crate) struct DacCredentialView {
+    uid: u32,
+    gid: u32,
+    supplementary_groups: Vec<u32>,
+    effective: [u32; CAPABILITY_WORDS],
+}
+
+impl DacCredentialView {
+    pub(crate) fn new(
+        uid: u32,
+        gid: u32,
+        supplementary_groups: Vec<u32>,
+        effective: [u32; CAPABILITY_WORDS],
+    ) -> Self {
+        Self {
+            uid,
+            gid,
+            supplementary_groups,
+            effective,
+        }
+    }
+
+    pub(crate) fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    pub(crate) fn gid(&self) -> u32 {
+        self.gid
+    }
+
+    pub(crate) fn supplementary_groups(&self) -> &[u32] {
+        &self.supplementary_groups
+    }
+
+    pub(crate) fn has_capability(&self, cap: u32) -> bool {
+        let Some((word, mask)) = CapabilityState::cap_mask(cap) else {
+            return false;
+        };
+        self.effective[word] & mask != 0
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

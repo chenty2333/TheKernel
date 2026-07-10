@@ -481,12 +481,12 @@ fn open_in_fs(
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    let supplementary_groups = proc_data.supplementary_groups();
-    let uid = proc_data.fsuid();
-    let gid = proc_data.fsgid();
+    let credentials = proc_data.fs_dac_credentials();
+    let uid = credentials.uid();
+    let gid = credentials.gid();
     let mode = mode & !current().as_thread().proc_data.umask();
     let path_ref = Path::new(path);
-    check_path_prefix_search_permissions(fs, path_ref, uid, gid, &supplementary_groups)?;
+    check_path_prefix_search_permissions(fs, path_ref, &credentials)?;
     let created_parent = if (flags as u32) & O_CREAT != 0 {
         match fs.resolve_no_follow(path) {
             Ok(loc) => {
@@ -498,18 +498,12 @@ fn open_in_fs(
                 if loc.is_dir() && invalid_directory_open(flags) {
                     return Err(AxError::IsADirectory);
                 }
-                check_open_permissions(
-                    &loc,
-                    open_access_mask(flags),
-                    uid,
-                    gid,
-                    &supplementary_groups,
-                )?;
+                check_open_permissions(&loc, open_access_mask(flags), &credentials)?;
                 None
             }
             Err(AxError::NotFound) => {
                 let (parent, name) = fs.resolve_nonexistent(Path::new(path))?;
-                check_create_permissions(&parent, uid, gid, &supplementary_groups)?;
+                check_create_permissions(&parent, &credentials)?;
                 Some((parent, name.to_string()))
             }
             Err(err) => return Err(err),
@@ -525,13 +519,7 @@ fn open_in_fs(
         if loc.is_dir() && invalid_directory_open(flags) {
             return Err(AxError::IsADirectory);
         }
-        check_open_permissions(
-            &loc,
-            open_access_mask(flags),
-            uid,
-            gid,
-            &supplementary_groups,
-        )?;
+        check_open_permissions(&loc, open_access_mask(flags), &credentials)?;
         None
     };
 

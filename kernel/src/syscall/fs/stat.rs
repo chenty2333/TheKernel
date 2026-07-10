@@ -1,7 +1,7 @@
 use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult};
-use axfs_ng_vfs::{DeviceId, Location, NodePermission, path::Path};
+use axfs_ng_vfs::{DeviceId, Location, NodePermission, NodeType, path::Path};
 use axtask::current;
 use linux_raw_sys::general::{
     __kernel_fsid_t, AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_STATX_SYNC_TYPE,
@@ -18,8 +18,8 @@ use crate::{
     file::{
         Directory, File, FileLike, Pipe, Socket, get_file_like,
         permission::{
-            check_parent_search_permissions, check_path_prefix_search_permissions,
-            granted_access_bits,
+            check_dac_permissions, check_parent_search_permissions,
+            check_path_prefix_search_permissions,
         },
         resolve_at, with_path_fs,
     },
@@ -56,6 +56,21 @@ const STATX_CHANGE_COOKIE: u32 = 0x4000_0000;
 const REGULAR_FILE_DIO_ALIGNMENT: u32 = 512;
 const PIPEFS_MAGIC: i64 = 0x5049_5045;
 const SOCKFS_MAGIC: i64 = 0x534f_434b;
+
+fn node_type_from_mode(mode: u32) -> NodeType {
+    NodeType::from(((mode & S_IFMT) >> 12) as u8)
+}
+
+fn uses_empty_path_fd(path: Option<&str>, flags: u32) -> bool {
+    flags & AT_EMPTY_PATH != 0 && path.is_none_or(str::is_empty)
+}
+
+fn readonly_access_check_applies(node_type: NodeType) -> bool {
+    !matches!(
+        node_type,
+        NodeType::CharacterDevice | NodeType::BlockDevice | NodeType::Fifo | NodeType::Socket
+    )
+}
 
 fn statx_timestamp_from_duration(time: core::time::Duration) -> statx_timestamp {
     statx_timestamp {
@@ -156,17 +171,14 @@ pub fn sys_fstatat(
 
     debug!("sys_fstatat <= dirfd: {dirfd}, path: {path:?}, flags: {flags}");
 
+    let uses_fd = uses_empty_path_fd(path.as_deref(), flags);
     let loc = resolve_at(dirfd, path.as_deref(), flags)?;
     if let crate::file::ResolveAtResult::File(file) = &loc {
-        let curr = current();
-        let proc_data = &curr.as_thread().proc_data;
-        if proc_data.fsuid() != 0 {
-            check_parent_search_permissions(
-                file,
-                proc_data.fsuid(),
-                proc_data.fsgid(),
-                &proc_data.supplementary_groups(),
-            )?;
+        if !uses_fd {
+            let curr = current();
+            let proc_data = &curr.as_thread().proc_data;
+            let credentials = proc_data.fs_dac_credentials();
+            check_parent_search_permissions(file, &credentials)?;
         }
     }
     statbuf.vm_write(loc.stat()?.into())?;
@@ -232,17 +244,14 @@ pub fn sys_statx(
         validate_pathname(Path::new(path))?;
     }
 
+    let uses_fd = uses_empty_path_fd(path.as_deref(), flags);
     let loc = resolve_at(dirfd, path.as_deref(), flags)?;
     if let crate::file::ResolveAtResult::File(file) = &loc {
-        let curr = current();
-        let proc_data = &curr.as_thread().proc_data;
-        if proc_data.fsuid() != 0 {
-            check_parent_search_permissions(
-                file,
-                proc_data.fsuid(),
-                proc_data.fsgid(),
-                &proc_data.supplementary_groups(),
-            )?;
+        if !uses_fd {
+            let curr = current();
+            let proc_data = &curr.as_thread().proc_data;
+            let credentials = proc_data.fs_dac_credentials();
+            check_parent_search_permissions(file, &credentials)?;
         }
     }
     statxbuf.vm_write(statx_from_kstat(loc.stat()?, mask))?;
@@ -295,26 +304,27 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    let supplementary_groups = proc_data.supplementary_groups();
-    let (uid, gid) = if flags & AT_EACCESS as u32 != 0 {
-        (proc_data.euid(), proc_data.egid())
-    } else {
-        (proc_data.uid(), proc_data.gid())
-    };
+    let credentials = proc_data.access_dac_credentials(flags & AT_EACCESS as u32 != 0);
 
+    let uses_fd = uses_empty_path_fd(path.as_deref(), flags);
     let file = resolve_at(dirfd, path.as_deref(), flags)?;
     let stat = file.stat()?;
     let perm = stat.mode & NodePermission::all().bits() as u32;
+    let node_type = node_type_from_mode(stat.mode);
 
-    if let Some(loc) = match &file {
+    let loc = match &file {
         crate::file::ResolveAtResult::File(loc) => Some(loc),
         crate::file::ResolveAtResult::Other(_) => None,
-    } {
-        if uid != 0 {
-            check_parent_search_permissions(loc, uid, gid, &supplementary_groups)?;
+    };
+    if let Some(loc) = loc {
+        if !uses_fd {
+            check_parent_search_permissions(loc, &credentials)?;
         }
-        if mode & W_OK != 0 {
-            check_readonly_write_access(loc)?;
+        if mode & X_OK != 0 && node_type == NodeType::RegularFile {
+            let path = loc.absolute_path().map_err(|_| AxError::InvalidInput)?;
+            if crate::mounts::is_noexec(path.as_ref()) {
+                return Err(AxError::PermissionDenied);
+            }
         }
         note_mount_access(loc);
     }
@@ -323,18 +333,12 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
         return Ok(0);
     }
 
-    if uid == 0 {
-        if mode & X_OK != 0 && perm & 0o111 == 0 {
-            return Err(AxError::PermissionDenied);
-        }
-        return Ok(0);
-    }
-
-    let granted = granted_access_bits(perm, stat.uid, stat.gid, uid, gid, &supplementary_groups);
-
-    let requested = mode & 0o7;
-    if requested & granted != requested {
-        return Err(AxError::PermissionDenied);
+    check_dac_permissions(perm, stat.uid, stat.gid, node_type, mode, &credentials)?;
+    if mode & W_OK != 0
+        && readonly_access_check_applies(node_type)
+        && let Some(loc) = loc
+    {
+        check_readonly_write_access(loc)?;
     }
 
     Ok(0)
@@ -399,14 +403,9 @@ pub fn sys_statfs(path: *const c_char, buf: *mut statfs) -> AxResult<isize> {
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
+    let credentials = proc_data.fs_dac_credentials();
     let loc = with_path_fs(AT_FDCWD, path_ref, |fs| {
-        check_path_prefix_search_permissions(
-            fs,
-            path_ref,
-            proc_data.fsuid(),
-            proc_data.fsgid(),
-            &proc_data.supplementary_groups(),
-        )?;
+        check_path_prefix_search_permissions(fs, path_ref, &credentials)?;
         fs.resolve(path_ref).map_err(Into::into)
     })?;
 
@@ -428,4 +427,32 @@ pub fn sys_fstatfs(fd: i32, buf: *mut statfs) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_path_fd_detection_requires_the_flag_and_an_empty_path() {
+        assert!(uses_empty_path_fd(None, AT_EMPTY_PATH));
+        assert!(uses_empty_path_fd(Some(""), AT_EMPTY_PATH));
+        assert!(!uses_empty_path_fd(Some("file"), AT_EMPTY_PATH));
+        assert!(!uses_empty_path_fd(None, 0));
+    }
+
+    #[test]
+    fn readonly_access_check_excludes_linux_special_files() {
+        for node_type in [
+            NodeType::CharacterDevice,
+            NodeType::BlockDevice,
+            NodeType::Fifo,
+            NodeType::Socket,
+        ] {
+            assert!(!readonly_access_check_applies(node_type));
+        }
+        assert!(readonly_access_check_applies(NodeType::RegularFile));
+        assert!(readonly_access_check_applies(NodeType::Directory));
+        assert!(readonly_access_check_applies(NodeType::Symlink));
+    }
 }
