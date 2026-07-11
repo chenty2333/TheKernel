@@ -1,0 +1,37 @@
+#!/bin/sh
+
+failure_bytes=${1:-67108864}
+case "$failure_bytes" in
+    ''|*[!0-9]*|0) echo 'CI_NIGHTLY_OOM_FAILPOINT_FAIL invalid-size'; exit 1 ;;
+esac
+
+fail() {
+    echo "CI_NIGHTLY_OOM_FAILPOINT_FAIL $1"
+    exit 1
+}
+
+echo CI_NIGHTLY_OOM_FAILPOINT_START
+tool=/opt/oscomp-support/bin/oscomp-nightly-oom-admission
+test -x "$tool" || fail missing-tool
+test -r /proc/sys/vm/overcommit_memory \
+    -a -w /proc/sys/vm/overcommit_memory || fail missing-overcommit-policy
+test -r /proc/sys/vm/overcommit_ratio \
+    -a -w /proc/sys/vm/overcommit_ratio || fail missing-overcommit-ratio
+
+old_policy=$(cat /proc/sys/vm/overcommit_memory) || fail read-policy
+old_ratio=$(cat /proc/sys/vm/overcommit_ratio) || fail read-ratio
+echo 2 >/proc/sys/vm/overcommit_memory; policy_status=$?
+echo 1 >/proc/sys/vm/overcommit_ratio; ratio_status=$?
+"$tool" --expect-failure "$failure_bytes"; failure_status=$?
+echo "$old_ratio" >/proc/sys/vm/overcommit_ratio; restore_ratio_status=$?
+echo "$old_policy" >/proc/sys/vm/overcommit_memory; restore_policy_status=$?
+
+test "$policy_status" -eq 0 -a "$ratio_status" -eq 0 || fail configure
+test "$restore_ratio_status" -eq 0 -a "$restore_policy_status" -eq 0 \
+    || fail restore
+test "$failure_status" -eq 0 || fail admission
+"$tool" --expect-success 4096 || fail recovery-map
+printf 'oom-recovery\n' >/tmp/ci-nightly-oom-recovery || fail recovery-write
+test "$(cat /tmp/ci-nightly-oom-recovery)" = oom-recovery || fail recovery-read
+rm -f /tmp/ci-nightly-oom-recovery
+echo CI_NIGHTLY_OOM_FAILPOINT_PASS

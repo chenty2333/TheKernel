@@ -11,6 +11,9 @@ trap 'rm -rf "$tmp"' EXIT
 while IFS= read -r script; do
     bash -n "$script"
 done < <(find "$CI_DIR" -type f -name '*.sh' -print | sort)
+for script in "$REPO_ROOT"/scripts/support-overlay/common/bin/thekernel-nightly-*; do
+    sh -n "$script"
+done
 bash -n "$0"
 
 python3 "$REPO_ROOT/tests/ci/test_vendor_provenance.py"

@@ -16,30 +16,8 @@ selected_arches=$(nightly_selected_arches) || exit $?
 while IFS= read -r arch; do
     commands="$NIGHTLY_LOG_DIR/$arch.commands"
     run_dir="$NIGHTLY_LOG_DIR/$arch"
-    printf 'failure_bytes=%s\n' "$FAILURE_BYTES" >"$commands"
-    cat >>"$commands" <<'EOF'
-echo CI_NIGHTLY_OOM_FAILPOINT_START
-tool=/opt/oscomp-support/bin/oscomp-nightly-oom-admission
-test -x "$tool" || { echo CI_NIGHTLY_OOM_FAILPOINT_FAIL missing-tool; exit 1; }
-test -r /proc/sys/vm/overcommit_memory -a -w /proc/sys/vm/overcommit_memory || { echo CI_NIGHTLY_OOM_FAILPOINT_FAIL missing-overcommit-policy; exit 1; }
-test -r /proc/sys/vm/overcommit_ratio -a -w /proc/sys/vm/overcommit_ratio || { echo CI_NIGHTLY_OOM_FAILPOINT_FAIL missing-overcommit-ratio; exit 1; }
-old_policy=$(cat /proc/sys/vm/overcommit_memory)
-old_ratio=$(cat /proc/sys/vm/overcommit_ratio)
-echo 2 > /proc/sys/vm/overcommit_memory; policy_status=$?
-echo 1 > /proc/sys/vm/overcommit_ratio; ratio_status=$?
-"$tool" --expect-failure "$failure_bytes"; failure_status=$?
-echo "$old_ratio" > /proc/sys/vm/overcommit_ratio; restore_ratio_status=$?
-echo "$old_policy" > /proc/sys/vm/overcommit_memory; restore_policy_status=$?
-test "$policy_status" -eq 0 -a "$ratio_status" -eq 0 || { echo CI_NIGHTLY_OOM_FAILPOINT_FAIL configure; exit 1; }
-test "$restore_ratio_status" -eq 0 -a "$restore_policy_status" -eq 0 || { echo CI_NIGHTLY_OOM_FAILPOINT_FAIL restore; exit 1; }
-test "$failure_status" -eq 0 || { echo CI_NIGHTLY_OOM_FAILPOINT_FAIL admission; exit 1; }
-"$tool" --expect-success 4096 || { echo CI_NIGHTLY_OOM_FAILPOINT_FAIL recovery-map; exit 1; }
-printf 'oom-recovery\n' > /tmp/ci-nightly-oom-recovery || { echo CI_NIGHTLY_OOM_FAILPOINT_FAIL recovery-write; exit 1; }
-test "$(cat /tmp/ci-nightly-oom-recovery)" = oom-recovery || { echo CI_NIGHTLY_OOM_FAILPOINT_FAIL recovery-read; exit 1; }
-rm -f /tmp/ci-nightly-oom-recovery
-echo CI_NIGHTLY_OOM_FAILPOINT_PASS
-exit
-EOF
+    printf '/opt/oscomp-support/bin/thekernel-nightly-oom-failpoint %s; exit\n' \
+        "$FAILURE_BYTES" >"$commands"
 
     nightly_run_guest "$arch" "$commands" "$run_dir" "$support_image"
     nightly_validate_guest_log \

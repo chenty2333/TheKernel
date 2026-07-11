@@ -9,6 +9,7 @@ source "$SCRIPT_DIR/lib.sh"
 command -v python3 >/dev/null 2>&1 || nightly_unsupported 'missing python3 host peer'
 command -v sha256sum >/dev/null 2>&1 || nightly_unsupported 'missing sha256sum'
 mkdir -p "$NIGHTLY_LOG_DIR"
+support_image=$(nightly_prepare_support_image)
 
 peer_pid=
 cleanup_peer() {
@@ -48,20 +49,11 @@ while IFS= read -r arch; do
         ''|*[!0-9]*) nightly_fail "host network peer published invalid port: $port" ;;
     esac
 
-    printf 'peer_port=%s\npeer_nonce=%s\n' "$port" "$nonce" >"$commands"
-    cat >>"$commands" <<'EOF'
-echo CI_NIGHTLY_NONLOOPBACK_NETWORK_START
-rm -f /tmp/ci-network-reply
-printf 'THEKERNEL_NETWORK_PROBE %s\n' "$peer_nonce" | /musl/busybox nc -w 30 10.0.2.2 "$peer_port" > /tmp/ci-network-reply
-network_status=$?
-test "$network_status" -eq 0 || { echo CI_NIGHTLY_NONLOOPBACK_NETWORK_FAIL connect; exit 1; }
-test "$(cat /tmp/ci-network-reply)" = "THEKERNEL_NETWORK_REPLY $peer_nonce" || { echo CI_NIGHTLY_NONLOOPBACK_NETWORK_FAIL payload; exit 1; }
-rm -f /tmp/ci-network-reply
-echo CI_NIGHTLY_NONLOOPBACK_NETWORK_PASS
-exit
-EOF
+    printf '%s %s %s; exit\n' \
+        /opt/oscomp-support/bin/thekernel-nightly-network "$port" "$nonce" \
+        >"$commands"
 
-    nightly_run_guest "$arch" "$commands" "$run_dir"
+    nightly_run_guest "$arch" "$commands" "$run_dir" "$support_image"
     if wait "$peer_pid"; then
         peer_pid=
     else
