@@ -1,12 +1,11 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
-    mem::size_of,
+    mem::{ManuallyDrop, size_of},
     ptr,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::Context,
 };
 
-use async_channel::TryRecvError;
 use async_trait::async_trait;
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::{IoBuf, Read, Write};
@@ -21,7 +20,12 @@ use crate::{
     general::GeneralOptions,
     options::{Configurable, GetSocketOption, SetSocketOption, UnixCredentials},
     socket::SocketFilter,
-    unix::{Transport, TransportOps, UnixSocketAddr, with_slot},
+    unix::{
+        BindSlot, Transport, TransportOps, UnixSocketAddr,
+        queue::{
+            PermitSendError, Receiver, ReserveError, SendPermit, Sender, TryRecvError, try_bounded,
+        },
+    },
 };
 
 struct Packet {
@@ -31,20 +35,6 @@ struct Packet {
     charge: usize,
 }
 
-impl Packet {
-    fn accounting_charge(&self) -> AxResult<usize> {
-        let ancillary_charge = self.cmsg.iter().try_fold(0usize, |total, cmsg| {
-            total.checked_add(cmsg.charge()).ok_or(AxError::NoMemory)
-        })?;
-        self.data
-            .len()
-            .max(1)
-            .checked_add(ancillary_charge)
-            .and_then(|charge| charge.checked_add(size_of::<Self>()))
-            .ok_or(AxError::NoMemory)
-    }
-}
-
 // Byte accounting is the primary socket-buffer limit. This independent slot
 // ceiling also bounds queue-node metadata if callers send very small
 // datagrams, and lets the underlying channel enforce the invariant directly.
@@ -52,24 +42,23 @@ const UNIX_DGRAM_QUEUE_SLOTS: usize = 1024;
 const UNIX_DGRAM_CLEANUP_SLOTS: usize = 16_384;
 const DEFERRED_CLEANUP_NODE_BUDGET: usize = 16;
 const DEFERRED_CLEANUP_PACKET_BUDGET: usize = 32;
+const MIN_PACKET_CHARGE: usize = 1 + size_of::<Packet>();
 
-type ReceiveQueue = (
-    async_channel::Receiver<Packet>,
-    Arc<PollSet>,
-    Arc<AtomicUsize>,
-    Arc<AtomicBool>,
-);
+type ReceiveQueue = (Receiver<Packet>, Arc<AtomicUsize>, Arc<AtomicBool>);
 
 struct DeferredReceiveCleanup {
     next: *mut Self,
     queue: Option<ReceiveQueue>,
+    channel: Option<Channel>,
+    poll_state: Option<PollSet>,
     _admission: DeferredCleanupAdmission,
 }
 
 // `next` is touched only while the node is uniquely owned or while the global
-// intrusive-list lock is held. The queued receiver and accounting objects are
-// themselves Send.
+// intrusive-list lock is held. Shared references cannot mutate or dereference
+// it, and all optional payloads are themselves Send + Sync.
 unsafe impl Send for DeferredReceiveCleanup {}
+unsafe impl Sync for DeferredReceiveCleanup {}
 
 impl DeferredReceiveCleanup {
     fn try_new() -> AxResult<Box<Self>> {
@@ -77,6 +66,8 @@ impl DeferredReceiveCleanup {
         Box::try_new(Self {
             next: ptr::null_mut(),
             queue: None,
+            channel: None,
+            poll_state: None,
             _admission: admission,
         })
         .map_err(|_| AxError::NoMemory)
@@ -155,16 +146,23 @@ static DEFERRED_CLEANUP_LIST: SpinNoIrq<DeferredCleanupList> =
     SpinNoIrq::new(DeferredCleanupList::new());
 static DEFERRED_CLEANUP_PENDING: AtomicBool = AtomicBool::new(false);
 
-fn publish_deferred_receive_cleanup(queue: ReceiveQueue, mut work: Box<DeferredReceiveCleanup>) {
-    let (rx, poll_update, queued_bytes, peer_closed) = queue;
-
+fn publish_deferred_receive_cleanup(
+    queue: Option<ReceiveQueue>,
+    channel: Option<Channel>,
+    poll_state: Option<PollSet>,
+    mut work: Box<DeferredReceiveCleanup>,
+) {
     // This is the complete close publication performed by Drop/shutdown:
-    // reject new sends immediately and wake bounded poll state. Channel close,
-    // packet destruction, and SCM_RIGHTS release stay in task context.
-    peer_closed.store(true, Ordering::Release);
-    poll_update.wake();
+    // reject new sends immediately. Channel close, waiter wake, packet
+    // destruction, SCM_RIGHTS release, and even the idle cleanup Box's
+    // deallocation stay in the task-context worker.
+    if let Some((_, _, peer_closed)) = queue.as_ref() {
+        peer_closed.store(true, Ordering::Release);
+    }
 
-    work.queue = Some((rx, poll_update, queued_bytes, peer_closed));
+    work.queue = queue;
+    work.channel = channel;
+    work.poll_state = poll_state;
     let mut list = DEFERRED_CLEANUP_LIST.lock();
     list.push(work);
     DEFERRED_CLEANUP_PENDING.store(true, Ordering::Release);
@@ -187,7 +185,7 @@ fn requeue_deferred_receive_cleanup(work: Box<DeferredReceiveCleanup>) {
 
 /// Returns whether a task-context Unix datagram finalizer has been published.
 pub fn has_deferred_receive_cleanup_work() -> bool {
-    DEFERRED_CLEANUP_PENDING.load(Ordering::Acquire)
+    DEFERRED_CLEANUP_PENDING.load(Ordering::Acquire) || super::stream::has_deferred_cleanup_work()
 }
 
 /// Releases a fixed amount of detached Unix datagram state in task context.
@@ -198,21 +196,19 @@ pub fn drain_deferred_receive_cleanup_work() {
     let mut packets = 0usize;
 
     while nodes < DEFERRED_CLEANUP_NODE_BUDGET && packets < DEFERRED_CLEANUP_PACKET_BUDGET {
-        let Some(work) = pop_deferred_receive_cleanup() else {
+        let Some(mut work) = pop_deferred_receive_cleanup() else {
             break;
         };
         nodes += 1;
 
-        let queue_drained = {
-            let Some((rx, _, queued_bytes, _)) = work.queue.as_ref() else {
-                continue;
-            };
+        let queue_drained = if let Some((rx, queued_bytes, _)) = work.queue.as_ref() {
             rx.close();
             let mut drained = false;
             while packets < DEFERRED_CLEANUP_PACKET_BUDGET {
-                match rx.try_recv() {
-                    Ok(packet) => {
+                match rx.try_recv_deferred_wake() {
+                    Ok((packet, completion)) => {
                         queued_bytes.fetch_sub(packet.charge, Ordering::AcqRel);
+                        completion.complete();
                         packets += 1;
                         drop(packet);
                     }
@@ -224,12 +220,26 @@ pub fn drain_deferred_receive_cleanup_work() {
                 }
             }
             drained
+        } else {
+            true
         };
 
         if !queue_drained {
             requeue_deferred_receive_cleanup(work);
+            continue;
         }
+
+        // Drop publishes a separate node for the connected sender and local
+        // PollSet. It may have no receive queue at all; never bypass its wake
+        // and task-context destruction through the queue-drain fast path.
+        if let Some(poll_state) = work.poll_state.take() {
+            poll_state.wake();
+            drop(poll_state);
+        }
+        let channel = work.channel.take();
+        drop(channel);
     }
+    super::stream::drain_deferred_cleanup_work();
 }
 
 enum ReceiveState {
@@ -274,6 +284,27 @@ impl ReceiveState {
         }
     }
 
+    fn rollback_bind(&mut self) -> Option<ReceiveQueue> {
+        match core::mem::replace(self, Self::Detached) {
+            Self::Attached { queue, cleanup } => {
+                *self = Self::Idle(cleanup);
+                Some(queue)
+            }
+            state => {
+                *self = state;
+                None
+            }
+        }
+    }
+
+    fn take_cleanup(&mut self) -> Option<(Option<ReceiveQueue>, Box<DeferredReceiveCleanup>)> {
+        match core::mem::replace(self, Self::Detached) {
+            Self::Idle(cleanup) => Some((None, cleanup)),
+            Self::Attached { queue, cleanup } => Some((Some(queue), cleanup)),
+            Self::Detached => None,
+        }
+    }
+
     fn install(&mut self, queue: ReceiveQueue) -> bool {
         let cleanup = match core::mem::replace(self, Self::Detached) {
             Self::Idle(cleanup) => cleanup,
@@ -291,36 +322,19 @@ impl ReceiveState {
         matches!(self, Self::Attached { .. })
     }
 
-    fn poll_update(&self) -> Option<&Arc<PollSet>> {
-        self.queue().map(|(_, poll_update, ..)| poll_update)
-    }
-
-    fn receiver(&self) -> Option<&async_channel::Receiver<Packet>> {
+    fn receiver(&self) -> Option<&Receiver<Packet>> {
         self.queue().map(|(rx, ..)| rx)
     }
 
-    fn receiver_parts_mut(
-        &mut self,
-    ) -> Option<(
-        &mut async_channel::Receiver<Packet>,
-        &mut Arc<PollSet>,
-        &mut Arc<AtomicUsize>,
-    )> {
+    fn receiver_parts_mut(&mut self) -> Option<(&mut Receiver<Packet>, &mut Arc<AtomicUsize>)> {
         self.queue_mut()
-            .map(|(rx, poll_update, queued_bytes, _)| (rx, poll_update, queued_bytes))
-    }
-
-    fn register_read_waker(&self, context: &mut Context<'_>) {
-        if let Some(poll) = self.poll_update() {
-            poll.register(context.waker());
-        }
+            .map(|(rx, queued_bytes, _)| (rx, queued_bytes))
     }
 }
 
 #[derive(Clone)]
 struct Channel {
-    data_tx: async_channel::Sender<Packet>,
-    poll_update: Arc<PollSet>,
+    data_tx: Sender<Packet>,
     filter: Arc<RwLock<Option<Arc<dyn SocketFilter>>>>,
     queued_bytes: Arc<AtomicUsize>,
     peer_closed: Arc<AtomicBool>,
@@ -337,7 +351,11 @@ impl Channel {
         self.peer_closed.load(Ordering::Acquire)
             || self.data_tx.is_closed()
             || (!self.data_tx.is_full()
-                && self.queued_bytes.load(Ordering::Acquire) < self.capacity(local_buffers))
+                && self
+                    .queued_bytes
+                    .load(Ordering::Acquire)
+                    .checked_add(MIN_PACKET_CHARGE)
+                    .is_some_and(|used| used <= self.capacity(local_buffers)))
     }
 
     fn writable_for(&self, local_buffers: &SocketBufferLimits, charge: usize) -> bool {
@@ -354,32 +372,31 @@ impl Channel {
                 .is_some_and(|queued| queued <= self.capacity(local_buffers))
     }
 
-    fn try_send(
+    fn try_admit(
         &self,
         local_buffers: &SocketBufferLimits,
-        mut packet: Packet,
-    ) -> Result<(), SendFailure> {
+        charge: usize,
+    ) -> AxResult<PendingSendAdmission> {
         // Deferred receiver teardown leaves the bounded channel object alive
         // until task context drains it. Report the published peer-close state
         // before consulting stale queue accounting so close can never turn a
         // full queue into an endless WouldBlock/retry loop.
         if self.peer_closed.load(Ordering::Acquire) || self.data_tx.is_closed() {
-            return Err(SendFailure {
-                error: AxError::BrokenPipe,
-                packet,
-            });
+            return Err(AxError::BrokenPipe);
         }
         let capacity = self.capacity(local_buffers);
-        let charge = match packet.accounting_charge() {
-            Ok(charge) => charge,
-            Err(error) => return Err(SendFailure { error, packet }),
-        };
         if charge > capacity {
-            return Err(SendFailure {
-                error: LinuxError::EMSGSIZE.into(),
-                packet,
-            });
+            return Err(LinuxError::EMSGSIZE.into());
         }
+
+        // Reserve queue metadata before any payload allocation/usercopy. The
+        // permit is part of the pending-send admission, so arbitrarily many
+        // blocked callers cannot each retain an unaccounted queue node.
+        let permit = match self.data_tx.try_reserve(UNIX_DGRAM_QUEUE_SLOTS) {
+            Ok(permit) => permit,
+            Err(ReserveError::Full) => return Err(AxError::WouldBlock),
+            Err(ReserveError::Closed) => return Err(AxError::BrokenPipe),
+        };
 
         loop {
             let queued = self.queued_bytes.load(Ordering::Acquire);
@@ -387,10 +404,8 @@ impl Channel {
                 .checked_add(charge)
                 .is_none_or(|queued| queued > capacity)
             {
-                return Err(SendFailure {
-                    error: AxError::WouldBlock,
-                    packet,
-                });
+                drop(permit);
+                return Err(AxError::WouldBlock);
             }
             if self
                 .queued_bytes
@@ -401,29 +416,56 @@ impl Channel {
             }
         }
 
-        packet.charge = charge;
-        if let Err(err) = self.data_tx.try_send(packet) {
-            self.queued_bytes.fetch_sub(charge, Ordering::AcqRel);
-            return Err(match err {
-                async_channel::TrySendError::Full(packet) => SendFailure {
-                    error: AxError::WouldBlock,
-                    packet,
-                },
-                async_channel::TrySendError::Closed(packet) => SendFailure {
-                    error: AxError::BrokenPipe,
-                    packet,
-                },
-            });
+        let admission = PendingSendAdmission {
+            permit: Some(permit),
+            admitted_bytes: self.queued_bytes.clone(),
+            charge,
+            transferred: false,
+        };
+        if self.peer_closed.load(Ordering::Acquire) || self.data_tx.is_closed() {
+            drop(admission);
+            return Err(AxError::BrokenPipe);
         }
-
-        self.poll_update.wake();
-        Ok(())
+        Ok(admission)
     }
 }
 
-struct SendFailure {
-    error: AxError,
-    packet: Packet,
+/// Owns both one queue slot and the complete conservative byte/ancillary
+/// charge before the payload buffer is allocated. Success transfers the byte
+/// charge to the queued Packet; every other exit rolls both reservations back.
+struct PendingSendAdmission {
+    permit: Option<SendPermit<Packet>>,
+    admitted_bytes: Arc<AtomicUsize>,
+    charge: usize,
+    transferred: bool,
+}
+
+impl PendingSendAdmission {
+    fn publish(mut self, mut packet: Packet) -> AxResult<()> {
+        packet.charge = self.charge;
+        let permit = self.permit.take().ok_or(AxError::BadState)?;
+        match permit.send(packet) {
+            Ok(()) => {
+                self.transferred = true;
+                Ok(())
+            }
+            Err(PermitSendError::Closed(packet)) => {
+                drop(packet);
+                Err(AxError::BrokenPipe)
+            }
+        }
+    }
+}
+
+impl Drop for PendingSendAdmission {
+    fn drop(&mut self) {
+        if !self.transferred {
+            self.admitted_bytes.fetch_sub(self.charge, Ordering::AcqRel);
+        }
+        // Drop releases an unpublished slot and wakes registered writers.
+        let permit = self.permit.take();
+        drop(permit);
+    }
 }
 
 struct DgramSendPoll<'a> {
@@ -444,26 +486,28 @@ impl Pollable for DgramSendPoll<'_> {
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {
         if events.contains(IoEvents::OUT) {
-            self.channel.poll_update.register(context.waker());
+            self.channel.data_tx.register_write(context.waker());
             self.local_poll.register(context.waker());
         }
     }
 }
 
+#[derive(Clone)]
 pub struct Bind {
-    data_tx: async_channel::Sender<Packet>,
-    poll_update: Arc<PollSet>,
+    data_tx: Sender<Packet>,
     filter: Arc<RwLock<Option<Arc<dyn SocketFilter>>>>,
     queued_bytes: Arc<AtomicUsize>,
     peer_closed: Arc<AtomicBool>,
     buffers: Arc<SocketBufferLimits>,
 }
 impl Bind {
-    fn connect(&self) -> Channel {
+    fn connect(&self) -> AxResult<Channel> {
+        if self.peer_closed.load(Ordering::Acquire) || self.data_tx.is_closed() {
+            return Err(AxError::ConnectionRefused);
+        }
         let tx = self.data_tx.clone();
-        Channel {
+        Ok(Channel {
             data_tx: tx,
-            poll_update: self.poll_update.clone(),
             filter: self.filter.clone(),
             queued_bytes: self.queued_bytes.clone(),
             peer_closed: self.peer_closed.clone(),
@@ -472,16 +516,27 @@ impl Bind {
             // pathname-connected datagram socket. SCM_CREDENTIALS is a
             // separate, per-message facility.
             peer_credentials: UnixCredentials::UNKNOWN,
-        }
+        })
     }
 }
 
 /// Datagram transport for Unix domain sockets.
+///
+/// [`Drop`] never acquires a blocking mutex and never invokes a registered
+/// waker. Attached/idle receive state, the connected sender, and the socket's
+/// poll registry are moved into preallocated bounded work and finalized by the
+/// task-context policy worker. Remaining automatic fields contain only fixed
+/// atomic state and admitted ownership without poll callbacks.
 pub struct DgramTransport {
     data_rx: Mutex<ReceiveState>,
+    drop_cleanup: ManuallyDrop<Box<DeferredReceiveCleanup>>,
     connected: RwLock<Option<Channel>>,
+    // Linux snapshots SO_PEERCRED when a datagram socketpair is created.
+    // Reconnecting or disconnecting either endpoint must not replace that
+    // creation-time identity with the credentials of a later pathname peer.
+    sticky_peer_credentials: Option<UnixCredentials>,
     local_addr: RwLock<UnixSocketAddr>,
-    poll_state: Arc<PollSet>,
+    poll_state: PollSet,
     filter: Arc<RwLock<Option<Arc<dyn SocketFilter>>>>,
     general: Arc<GeneralOptions>,
     buffers: Arc<SocketBufferLimits>,
@@ -492,11 +547,14 @@ impl DgramTransport {
     /// Create a new unconnected datagram transport.
     pub fn new() -> AxResult<Self> {
         let data_rx = ReceiveState::try_new(None)?;
+        let drop_cleanup = DeferredReceiveCleanup::try_new()?;
         Ok(DgramTransport {
             data_rx: Mutex::new(data_rx),
+            drop_cleanup: ManuallyDrop::new(drop_cleanup),
             connected: RwLock::new(None),
+            sticky_peer_credentials: None,
             local_addr: RwLock::new(UnixSocketAddr::Unnamed),
-            poll_state: Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?,
+            poll_state: PollSet::new(),
             filter: Arc::try_new(RwLock::new(None)).map_err(|_| AxError::NoMemory)?,
             general: Arc::try_new(GeneralOptions::default()).map_err(|_| AxError::NoMemory)?,
             buffers: Arc::try_new(SocketBufferLimits::new(TCP_TX_BUF_LEN, TCP_RX_BUF_LEN))
@@ -512,13 +570,17 @@ impl DgramTransport {
         filter: Arc<RwLock<Option<Arc<dyn SocketFilter>>>>,
         general: Arc<GeneralOptions>,
         buffers: Arc<SocketBufferLimits>,
+        sticky_peer_credentials: Option<UnixCredentials>,
     ) -> AxResult<Self> {
         let data_rx = ReceiveState::try_new(Some(data_rx))?;
+        let drop_cleanup = DeferredReceiveCleanup::try_new()?;
         Ok(DgramTransport {
             data_rx: Mutex::new(data_rx),
+            drop_cleanup: ManuallyDrop::new(drop_cleanup),
             connected: RwLock::new(Some(connected)),
+            sticky_peer_credentials,
             local_addr: RwLock::new(UnixSocketAddr::Unnamed),
-            poll_state: Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?,
+            poll_state: PollSet::new(),
             filter,
             general,
             buffers,
@@ -529,10 +591,8 @@ impl DgramTransport {
 
     /// Create a connected pair of datagram transports.
     pub fn new_pair(credentials: UnixCredentials) -> AxResult<(Self, Self)> {
-        let (tx1, rx1) = async_channel::bounded(UNIX_DGRAM_QUEUE_SLOTS);
-        let (tx2, rx2) = async_channel::bounded(UNIX_DGRAM_QUEUE_SLOTS);
-        let poll1 = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
-        let poll2 = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
+        let (tx1, rx1) = try_bounded(UNIX_DGRAM_QUEUE_SLOTS)?;
+        let (tx2, rx2) = try_bounded(UNIX_DGRAM_QUEUE_SLOTS)?;
         let queued1 = Arc::try_new(AtomicUsize::new(0)).map_err(|_| AxError::NoMemory)?;
         let queued2 = Arc::try_new(AtomicUsize::new(0)).map_err(|_| AxError::NoMemory)?;
         let closed1 = Arc::try_new(AtomicBool::new(false)).map_err(|_| AxError::NoMemory)?;
@@ -546,10 +606,9 @@ impl DgramTransport {
         let buffers2 = Arc::try_new(SocketBufferLimits::new(TCP_TX_BUF_LEN, TCP_RX_BUF_LEN))
             .map_err(|_| AxError::NoMemory)?;
         let transport1 = DgramTransport::new_connected(
-            (rx1, poll1.clone(), queued1.clone(), closed1.clone()),
+            (rx1, queued1.clone(), closed1.clone()),
             Channel {
                 data_tx: tx2,
-                poll_update: poll2.clone(),
                 filter: filter2.clone(),
                 queued_bytes: queued2.clone(),
                 peer_closed: closed2.clone(),
@@ -559,12 +618,12 @@ impl DgramTransport {
             filter1.clone(),
             general1.clone(),
             buffers1.clone(),
+            Some(credentials),
         )?;
         let transport2 = DgramTransport::new_connected(
-            (rx2, poll2.clone(), queued2, closed2),
+            (rx2, queued2, closed2),
             Channel {
                 data_tx: tx1,
-                poll_update: poll1.clone(),
                 filter: filter1.clone(),
                 queued_bytes: queued1,
                 peer_closed: closed1,
@@ -574,17 +633,143 @@ impl DgramTransport {
             filter2.clone(),
             general2,
             buffers2,
+            Some(credentials),
         )?;
         Ok((transport1, transport2))
     }
 
+    fn channel_from_slot(slot: &BindSlot) -> AxResult<Channel> {
+        let bind = slot.dgram.lock().as_ref().cloned();
+        if let Some(bind) = bind {
+            return bind.connect();
+        }
+        if slot.stream.lock().is_some() {
+            Err(LinuxError::EPROTOTYPE.into())
+        } else {
+            Err(AxError::ConnectionRefused)
+        }
+    }
+
+    fn send_via_channel(
+        &self,
+        mut src: impl Read + IoBuf,
+        flags: SendFlags,
+        cmsg: Vec<CMsgData>,
+        channel: Channel,
+    ) -> AxResult<usize> {
+        if self.tx_shutdown.load(Ordering::Acquire) {
+            return Err(AxError::BrokenPipe);
+        }
+
+        let len = src.remaining();
+        let ancillary_charge = cmsg.iter().try_fold(0usize, |total, cmsg| {
+            total.checked_add(cmsg.charge()).ok_or(AxError::NoMemory)
+        })?;
+        let charge = len
+            .max(1)
+            .checked_add(ancillary_charge)
+            .and_then(|charge| charge.checked_add(size_of::<Packet>()))
+            .ok_or(AxError::NoMemory)?;
+        if charge > channel.capacity(&self.buffers) {
+            return Err(AxError::from(LinuxError::EMSGSIZE));
+        }
+
+        let pollable = DgramSendPoll {
+            channel: &channel,
+            local_buffers: &self.buffers,
+            local_poll: &self.poll_state,
+            charge,
+        };
+        let admission = self.general.send_poller_with_nonblocking(
+            &pollable,
+            flags.contains(SendFlags::DONT_WAIT),
+            || {
+                if self.tx_shutdown.load(Ordering::Acquire) {
+                    Err(AxError::BrokenPipe)
+                } else {
+                    channel.try_admit(&self.buffers, charge)
+                }
+            },
+        )?;
+
+        let mut message = Vec::new();
+        message
+            .try_reserve_exact(len)
+            .map_err(|_| AxError::NoMemory)?;
+        message.resize(len, 0);
+        src.read_exact(&mut message)?;
+        let mut packet = Packet {
+            data: message,
+            cmsg,
+            sender: self.local_addr.read().clone(),
+            charge: 0,
+        };
+
+        let filter = channel.filter.read().clone();
+        if let Some(filter) = filter {
+            let keep = filter.filter(packet.data.as_mut_slice())?;
+            if keep == 0 {
+                return Ok(len);
+            }
+            packet.data.truncate(keep.min(packet.data.len()));
+        }
+        admission.publish(packet)?;
+        Ok(len)
+    }
+
+    pub(super) fn send_to_slot(
+        &self,
+        src: impl Read + IoBuf,
+        options: SendOptions,
+        slot: &BindSlot,
+    ) -> AxResult<usize> {
+        let SendOptions { to, flags, cmsg } = options;
+        if !matches!(to, Some(SocketAddrEx::Unix(UnixSocketAddr::Path(_)))) {
+            return Err(AxError::InvalidInput);
+        }
+        self.send_via_channel(src, flags, cmsg, Self::channel_from_slot(slot)?)
+    }
+
     pub fn set_filter(&self, filter: Option<Arc<dyn SocketFilter>>) -> AxResult<()> {
-        *self.filter.write() = filter;
+        let retired = core::mem::replace(&mut *self.filter.write(), filter);
+        drop(retired);
         Ok(())
     }
 
     pub fn is_connected(&self) -> bool {
         self.connected.read().is_some()
+    }
+
+    pub(super) fn disconnect(&self) {
+        let retired = self.connected.write().take();
+        drop(retired);
+        self.poll_state.wake();
+    }
+
+    pub(super) fn rollback_bind(&self, slot: &super::BindSlot) {
+        let retired_bind = slot.dgram.lock().take();
+        // This callback is only for a reservation that was never published.
+        // Recover the preallocated cleanup admission so the same socket can
+        // retry bind, and destroy the private empty queue in task context.
+        let retired_queue = self.data_rx.lock().rollback_bind();
+        let retired_address = core::mem::take(&mut *self.local_addr.write());
+        drop(retired_bind);
+        if let Some((receiver, queued_bytes, _peer_closed)) = retired_queue {
+            receiver.close();
+            for _ in 0..UNIX_DGRAM_QUEUE_SLOTS {
+                match receiver.try_recv_deferred_wake() {
+                    Ok((packet, completion)) => {
+                        queued_bytes.fetch_sub(packet.charge, Ordering::AcqRel);
+                        completion.complete();
+                        drop(packet);
+                    }
+                    Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                }
+            }
+            drop(receiver);
+        }
+        drop(retired_address);
+        self.poll_state.wake();
     }
 }
 
@@ -608,11 +793,12 @@ impl Configurable for DgramTransport {
                 **size = self.buffers.recv();
             }
             O::PeerCredentials(cred) => {
-                **cred = self
-                    .connected
-                    .read()
-                    .as_ref()
-                    .map_or(UnixCredentials::UNKNOWN, |channel| channel.peer_credentials);
+                **cred = self.sticky_peer_credentials.unwrap_or_else(|| {
+                    self.connected
+                        .read()
+                        .as_ref()
+                        .map_or(UnixCredentials::UNKNOWN, |channel| channel.peer_credentials)
+                });
             }
             _ => return Ok(false),
         }
@@ -633,8 +819,9 @@ impl Configurable for DgramTransport {
             }
             O::ReceiveBuffer(size) | O::ReceiveBufferForce(size) => {
                 self.buffers.set_recv(*size);
-                if let Some(poll_update) = self.data_rx.lock().poll_update() {
-                    poll_update.wake();
+                let receiver = self.data_rx.lock().receiver().cloned();
+                if let Some(receiver) = receiver {
+                    receiver.wake_writers();
                 }
             }
             _ => return Ok(false),
@@ -649,23 +836,20 @@ impl TransportOps for DgramTransport {
     }
 
     fn bind(&self, slot: &super::BindSlot, local_addr: &UnixSocketAddr) -> AxResult {
-        // Prepare the receive side before taking either publication lock. The
-        // async-channel constructor is an inherited infallible dependency API,
-        // but all state added by this layer is admitted fallibly and no
-        // allocator runs while the slot/transport locks are held.
-        let (tx, rx) = async_channel::bounded(UNIX_DGRAM_QUEUE_SLOTS);
-        let poll_update = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
+        // Prepare and reserve the complete bounded receive queue before taking
+        // either publication lock. Installation below only moves ownership.
+        let (tx, rx) = try_bounded(UNIX_DGRAM_QUEUE_SLOTS)?;
         let queued_bytes = Arc::try_new(AtomicUsize::new(0)).map_err(|_| AxError::NoMemory)?;
         let peer_closed = Arc::try_new(AtomicBool::new(false)).map_err(|_| AxError::NoMemory)?;
         let prepared_bind = Bind {
             data_tx: tx,
-            poll_update: poll_update.clone(),
             filter: self.filter.clone(),
             queued_bytes: queued_bytes.clone(),
             peer_closed: peer_closed.clone(),
             buffers: self.buffers.clone(),
         };
-        let prepared_queue = (rx, poll_update, queued_bytes, peer_closed);
+        let prepared_queue = (rx, queued_bytes, peer_closed);
+        let prepared_address = local_addr.clone();
 
         let mut slot = slot.dgram.lock();
         if slot.is_some() {
@@ -677,26 +861,32 @@ impl TransportOps for DgramTransport {
         }
         *slot = Some(prepared_bind);
         if !guard.install(prepared_queue) {
-            *slot = None;
+            let retired_bind = slot.take();
+            drop(guard);
+            drop(slot);
+            drop(retired_bind);
             return Err(AxError::InvalidInput);
         }
-        self.local_addr.write().clone_from(local_addr);
+        let retired_address = core::mem::replace(&mut *self.local_addr.write(), prepared_address);
+        drop(guard);
+        drop(slot);
+        drop(retired_address);
         self.poll_state.wake();
         Ok(())
     }
 
-    fn connect(&self, slot: &super::BindSlot, _local_addr: &UnixSocketAddr) -> AxResult {
-        let mut guard = self.connected.write();
-        if guard.is_some() {
-            return Err(AxError::AlreadyConnected);
-        }
-        *guard = Some(
-            slot.dgram
-                .lock()
-                .as_ref()
-                .ok_or(AxError::NotConnected)?
-                .connect(),
-        );
+    fn connect(
+        &self,
+        slot: &super::BindSlot,
+        _local_addr: &UnixSocketAddr,
+        _credentials: UnixCredentials,
+    ) -> AxResult {
+        let channel = Self::channel_from_slot(slot)?;
+        let retired = {
+            let mut guard = self.connected.write();
+            core::mem::replace(&mut *guard, Some(channel))
+        };
+        drop(retired);
         self.poll_state.wake();
         Ok(())
     }
@@ -705,20 +895,15 @@ impl TransportOps for DgramTransport {
         Err(AxError::InvalidInput)
     }
 
-    fn send(&self, mut src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {
-        if self.tx_shutdown.load(Ordering::Acquire) {
-            return Err(AxError::BrokenPipe);
-        }
+    fn send(&self, src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {
         let SendOptions { to, flags, cmsg } = options;
         let channel = if let Some(addr) = to {
             let addr = addr.into_unix()?;
-            with_slot(&addr, |slot| {
-                slot.dgram
-                    .lock()
-                    .as_ref()
-                    .map(Bind::connect)
-                    .ok_or(AxError::NotConnected)
-            })?
+            match addr {
+                UnixSocketAddr::Unnamed => return Err(AxError::InvalidInput),
+                UnixSocketAddr::Path(_) => return Err(AxError::OperationNotSupported),
+                UnixSocketAddr::Abstract(_) => return Err(AxError::OperationNotSupported),
+            }
         } else {
             self.connected
                 .read()
@@ -726,63 +911,7 @@ impl TransportOps for DgramTransport {
                 .cloned()
                 .ok_or(AxError::NotConnected)?
         };
-
-        let len = src.remaining();
-        let ancillary_charge = cmsg.iter().try_fold(0usize, |total, cmsg| {
-            total.checked_add(cmsg.charge()).ok_or(AxError::NoMemory)
-        })?;
-        let charge = len
-            .max(1)
-            .checked_add(ancillary_charge)
-            .and_then(|charge| charge.checked_add(size_of::<Packet>()))
-            .ok_or(AxError::NoMemory)?;
-        if charge > channel.capacity(&self.buffers) {
-            return Err(AxError::from(LinuxError::EMSGSIZE));
-        }
-
-        let mut message = Vec::new();
-        message
-            .try_reserve_exact(len)
-            .map_err(|_| AxError::NoMemory)?;
-        message.resize(len, 0);
-        src.read_exact(&mut message)?;
-        let mut packet = Packet {
-            data: message,
-            cmsg,
-            sender: self.local_addr.read().clone(),
-            charge: 0,
-        };
-
-        if let Some(filter) = channel.filter.read().as_ref() {
-            let keep = filter.filter(&mut packet.data)?;
-            if keep == 0 {
-                return Ok(len);
-            }
-            packet.data.truncate(keep.min(packet.data.len()));
-        }
-        let charge = packet.accounting_charge()?;
-        let pollable = DgramSendPoll {
-            channel: &channel,
-            local_buffers: &self.buffers,
-            local_poll: &self.poll_state,
-            charge,
-        };
-        let mut pending = Some(packet);
-        self.general.send_poller_with_nonblocking(
-            &pollable,
-            flags.contains(SendFlags::DONT_WAIT),
-            || {
-                let packet = pending.take().ok_or(AxError::BadState)?;
-                match channel.try_send(&self.buffers, packet) {
-                    Ok(()) => Ok(()),
-                    Err(failure) => {
-                        pending = Some(failure.packet);
-                        Err(failure.error)
-                    }
-                }
-            },
-        )?;
-        Ok(len)
+        self.send_via_channel(src, flags, cmsg, channel)
     }
 
     fn recv(&self, mut dst: impl Write, mut options: RecvOptions) -> AxResult<usize> {
@@ -799,13 +928,13 @@ impl TransportOps for DgramTransport {
         let per_call_nonblocking = options.flags.contains(RecvFlags::DONT_WAIT);
         self.general
             .recv_poller_with_nonblocking(self, per_call_nonblocking, move || {
-                let (packet, poll_update, queued_bytes) = {
+                let (packet, queued_bytes, completion) = {
                     let mut guard = self.data_rx.lock();
-                    let Some((rx, poll_update, queued_bytes)) = guard.receiver_parts_mut() else {
+                    let Some((rx, queued_bytes)) = guard.receiver_parts_mut() else {
                         return Err(AxError::NotConnected);
                     };
-                    let packet = match rx.try_recv() {
-                        Ok(packet) => packet,
+                    let (packet, completion) = match rx.try_recv_deferred_wake() {
+                        Ok(received) => received,
                         Err(TryRecvError::Empty) => {
                             return Err(AxError::WouldBlock);
                         }
@@ -813,7 +942,7 @@ impl TransportOps for DgramTransport {
                             return Ok(0);
                         }
                     };
-                    (packet, Arc::clone(poll_update), Arc::clone(queued_bytes))
+                    (packet, Arc::clone(queued_bytes), completion)
                 };
                 let Packet {
                     data,
@@ -822,7 +951,11 @@ impl TransportOps for DgramTransport {
                     charge,
                 } = packet;
                 queued_bytes.fetch_sub(charge, Ordering::AcqRel);
-                poll_update.wake();
+                // The queue slot and byte charge jointly define writability.
+                // Publish both removals before waking a sender; otherwise it
+                // can re-register while the stale byte charge still says full
+                // and miss the only completion edge.
+                completion.complete();
 
                 let count = dst.write(&data)?;
                 if count < data.len() {
@@ -857,7 +990,7 @@ impl TransportOps for DgramTransport {
         if how.has_read() && !self.rx_shutdown.swap(true, Ordering::AcqRel) {
             let detached = self.data_rx.lock().detach();
             if let Some((queue, cleanup)) = detached {
-                publish_deferred_receive_cleanup(queue, cleanup);
+                publish_deferred_receive_cleanup(Some(queue), None, None, cleanup);
             }
         }
         if how.has_write() {
@@ -882,12 +1015,11 @@ impl Pollable for DgramTransport {
                     .receiver()
                     .is_some_and(|rx| !rx.is_empty()),
         );
+        let connected = self.connected.read().as_ref().cloned();
         events.set(
             IoEvents::OUT,
             !tx_shutdown
-                && self
-                    .connected
-                    .read()
+                && connected
                     .as_ref()
                     .is_none_or(|chan| chan.writable(&self.buffers)),
         );
@@ -897,22 +1029,84 @@ impl Pollable for DgramTransport {
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {
         if events.contains(IoEvents::IN) {
-            self.data_rx.lock().register_read_waker(context);
+            let receiver = self.data_rx.lock().receiver().cloned();
+            if let Some(receiver) = receiver {
+                receiver.register_read(context.waker());
+            }
         }
-        if let Some(chan) = self.connected.read().as_ref()
-            && events.contains(IoEvents::OUT)
-        {
-            chan.poll_update.register(context.waker());
+        if events.contains(IoEvents::OUT) {
+            let sender = self
+                .connected
+                .read()
+                .as_ref()
+                .map(|channel| channel.data_tx.clone());
+            if let Some(sender) = sender {
+                sender.register_write(context.waker());
+            }
         }
         self.poll_state.register(context.waker());
     }
 }
 
+impl Drop for DgramTransport {
+    fn drop(&mut self) {
+        let receive_cleanup = self.data_rx.get_mut().take_cleanup();
+        if let Some((queue, cleanup)) = receive_cleanup {
+            publish_deferred_receive_cleanup(queue, None, None, cleanup);
+        }
+        let retired_channel = self.connected.get_mut().take();
+        let retired_poll_state = core::mem::replace(&mut self.poll_state, PollSet::new());
+        // SAFETY: `drop_cleanup` is initialized exactly once by each
+        // constructor, is inaccessible outside this type, and `Drop` runs at
+        // most once. Moving it into the worker also prevents its admitted Box
+        // from being deallocated in the transport's final-release context.
+        let finalizer = unsafe { ManuallyDrop::take(&mut self.drop_cleanup) };
+        publish_deferred_receive_cleanup(
+            None,
+            retired_channel,
+            Some(retired_poll_state),
+            finalizer,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use alloc::string::String;
+
     use super::*;
 
-    static DEFERRED_CLEANUP_TEST_LOCK: SpinNoIrq<()> = SpinNoIrq::new(());
+    struct GatedThreadWake {
+        thread: std::thread::Thread,
+        woke: Arc<AtomicBool>,
+        rechecked: Arc<std::sync::Barrier>,
+    }
+
+    impl alloc::task::Wake for GatedThreadWake {
+        fn wake(self: Arc<Self>) {
+            self.woke.store(true, Ordering::Release);
+            self.thread.unpark();
+            self.rechecked.wait();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.woke.store(true, Ordering::Release);
+            self.thread.unpark();
+            self.rechecked.wait();
+        }
+    }
+
+    struct CountingWake(Arc<AtomicUsize>);
+
+    impl alloc::task::Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     fn drain_all_deferred_cleanup() {
         for _ in 0..UNIX_DGRAM_QUEUE_SLOTS * 64 {
@@ -944,21 +1138,88 @@ mod tests {
         let (left, right) = DgramTransport::new_pair(credentials).unwrap();
         assert_eq!(peer_credentials(&left), credentials);
         assert_eq!(peer_credentials(&right), credentials);
+
+        let server = DgramTransport::new().unwrap();
+        let slot = BindSlot::default();
+        let pathname = UnixSocketAddr::Path(Arc::new(String::from("/tmp/peercred-reconnect")));
+        server.bind(&slot, &pathname).unwrap();
+        left.connect(&slot, &UnixSocketAddr::Unnamed, UnixCredentials::UNKNOWN)
+            .unwrap();
+        assert_eq!(peer_credentials(&left), credentials);
+
+        left.disconnect();
+        assert_eq!(peer_credentials(&left), credentials);
     }
 
     #[test]
     fn pathname_datagram_channel_does_not_fake_peer_credentials() {
-        let (tx, _rx) = async_channel::bounded(UNIX_DGRAM_QUEUE_SLOTS);
+        let (tx, _rx) = try_bounded(UNIX_DGRAM_QUEUE_SLOTS).unwrap();
         let bind = Bind {
             data_tx: tx,
-            poll_update: Arc::new(PollSet::new()),
             filter: Arc::new(RwLock::new(None)),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
             peer_closed: Arc::new(AtomicBool::new(false)),
             buffers: Arc::new(SocketBufferLimits::new(TCP_TX_BUF_LEN, TCP_RX_BUF_LEN)),
         };
 
-        assert_eq!(bind.connect().peer_credentials, UnixCredentials::UNKNOWN);
+        assert_eq!(
+            bind.connect().unwrap().peer_credentials,
+            UnixCredentials::UNKNOWN
+        );
+    }
+
+    #[test]
+    fn receive_accounting_completes_before_a_concurrent_writer_wakes() {
+        use core::task::Waker;
+        use std::{sync::Barrier, time::Duration};
+
+        let (tx, rx) = try_bounded(1).unwrap();
+        tx.try_send(7u8).unwrap();
+        let queued_bytes = Arc::new(AtomicUsize::new(1));
+        let ready = Arc::new(Barrier::new(2));
+        let rechecked = Arc::new(Barrier::new(2));
+        let woke = Arc::new(AtomicBool::new(false));
+        let observed_free = Arc::new(AtomicBool::new(false));
+
+        let writer = {
+            let tx = tx.clone();
+            let queued_bytes = queued_bytes.clone();
+            let ready = ready.clone();
+            let rechecked = rechecked.clone();
+            let woke = woke.clone();
+            let observed_free = observed_free.clone();
+            std::thread::spawn(move || {
+                let waker = Waker::from(Arc::new(GatedThreadWake {
+                    thread: std::thread::current(),
+                    woke: woke.clone(),
+                    rechecked: rechecked.clone(),
+                }));
+                tx.register_write(&waker);
+                ready.wait();
+                std::thread::park_timeout(Duration::from_secs(1));
+
+                let was_woken = woke.load(Ordering::Acquire);
+                let free = queued_bytes.load(Ordering::Acquire) == 0;
+                if was_woken && !free {
+                    // This is the lost-wake interleaving: a sender awakened by
+                    // queue removal still sees the stale byte charge and
+                    // registers again before that charge is decremented.
+                    tx.register_write(&waker);
+                }
+                observed_free.store(was_woken && free, Ordering::Release);
+                if was_woken {
+                    rechecked.wait();
+                }
+            })
+        };
+
+        ready.wait();
+        let (item, completion) = rx.try_recv_deferred_wake().unwrap();
+        assert_eq!(item, 7);
+        queued_bytes.fetch_sub(1, Ordering::AcqRel);
+        completion.complete();
+        writer.join().unwrap();
+        assert!(observed_free.load(Ordering::Acquire));
     }
 
     #[test]
@@ -990,7 +1251,7 @@ mod tests {
 
     #[test]
     fn read_shutdown_closes_peer_send_and_releases_queued_ancillary_data() {
-        let _guard = DEFERRED_CLEANUP_TEST_LOCK.lock();
+        let _guard = super::super::UNIX_CLEANUP_TEST_LOCK.lock();
         drain_all_deferred_cleanup();
         let credentials = UnixCredentials::new(1, 2, 3);
         let (left, right) = DgramTransport::new_pair(credentials).unwrap();
@@ -1028,11 +1289,18 @@ mod tests {
 
     #[test]
     fn drop_publishes_bounded_task_context_cleanup() {
-        let _guard = DEFERRED_CLEANUP_TEST_LOCK.lock();
+        use core::task::Waker;
+
+        let _guard = super::super::UNIX_CLEANUP_TEST_LOCK.lock();
         drain_all_deferred_cleanup();
         let credentials = UnixCredentials::new(1, 2, 3);
         let (left, right) = DgramTransport::new_pair(credentials).unwrap();
         let drops = Arc::new(AtomicUsize::new(0));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountingWake(wakes.clone())));
+        let mut context = Context::from_waker(&waker);
+        left.register(&mut context, IoEvents::IN);
+        right.register(&mut context, IoEvents::IN);
         let byte = [0u8; 1];
         let packet_count = DEFERRED_CLEANUP_PACKET_BUDGET + 1;
 
@@ -1048,8 +1316,10 @@ mod tests {
             .unwrap();
         }
 
+        let wakes_before_drop = wakes.load(Ordering::SeqCst);
         drop(right);
         assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(wakes.load(Ordering::SeqCst), wakes_before_drop);
         assert!(has_deferred_receive_cleanup_work());
         assert!(left.poll().contains(IoEvents::OUT));
         assert_eq!(
@@ -1073,8 +1343,27 @@ mod tests {
 
         drain_all_deferred_cleanup();
         assert_eq!(drops.load(Ordering::SeqCst), packet_count);
+        assert!(wakes.load(Ordering::SeqCst) > wakes_before_drop);
         drop(left);
         drain_all_deferred_cleanup();
+    }
+
+    #[test]
+    fn idle_drop_wakes_registered_poll_state_in_the_worker() {
+        use core::task::Waker;
+
+        let _guard = super::super::UNIX_CLEANUP_TEST_LOCK.lock();
+        drain_all_deferred_cleanup();
+        let transport = DgramTransport::new().unwrap();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountingWake(wakes.clone())));
+        let mut context = Context::from_waker(&waker);
+        transport.register(&mut context, IoEvents::IN | IoEvents::OUT);
+
+        drop(transport);
+        assert_eq!(wakes.load(Ordering::Acquire), 0);
+        drain_all_deferred_cleanup();
+        assert!(wakes.load(Ordering::Acquire) > 0);
     }
 
     #[test]
@@ -1112,16 +1401,88 @@ mod tests {
             AxError::BrokenPipe
         );
     }
-}
 
-impl Drop for DgramTransport {
-    fn drop(&mut self) {
-        let detached = self.data_rx.lock().detach();
-        if let Some((queue, cleanup)) = detached {
-            publish_deferred_receive_cleanup(queue, cleanup);
+    #[test]
+    fn concurrent_pending_sends_are_admitted_before_payload_and_bounded() {
+        use std::sync::{Arc as StdArc, Barrier};
+
+        let credentials = UnixCredentials::new(1, 2, 3);
+        let (left, _right) = DgramTransport::new_pair(credentials).unwrap();
+        let channel = left.connected.read().as_ref().unwrap().clone();
+        let capacity = channel.capacity(&left.buffers);
+        let charge = (capacity / 4).max(1);
+        let thread_count = 32usize;
+        let attempted = StdArc::new(Barrier::new(thread_count + 1));
+        let release = StdArc::new(Barrier::new(thread_count + 1));
+        let winners = StdArc::new(AtomicUsize::new(0));
+
+        let threads: Vec<_> = (0..thread_count)
+            .map(|_| {
+                let channel = channel.clone();
+                let buffers = left.buffers.clone();
+                let attempted = attempted.clone();
+                let release = release.clone();
+                let winners = winners.clone();
+                std::thread::spawn(move || {
+                    let admission = channel.try_admit(&buffers, charge);
+                    if admission.is_ok() {
+                        winners.fetch_add(1, Ordering::AcqRel);
+                    } else {
+                        assert!(matches!(admission, Err(AxError::WouldBlock)));
+                    }
+                    attempted.wait();
+                    release.wait();
+                    drop(admission);
+                })
+            })
+            .collect();
+
+        attempted.wait();
+        let admitted = channel.queued_bytes.load(Ordering::Acquire);
+        let winner_count = winners.load(Ordering::Acquire);
+        assert!(winner_count > 0);
+        assert_eq!(admitted, winner_count * charge);
+        assert!(admitted <= capacity);
+        assert!(winner_count <= UNIX_DGRAM_QUEUE_SLOTS);
+        release.wait();
+        for thread in threads {
+            thread.join().unwrap();
         }
-        if let Some(chan) = self.connected.write().take() {
-            chan.poll_update.wake();
-        }
+        assert_eq!(channel.queued_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn pollout_requires_room_for_the_smallest_datagram_charge() {
+        let credentials = UnixCredentials::new(1, 2, 3);
+        let (left, right) = DgramTransport::new_pair(credentials).unwrap();
+        let channel = left.connected.read().as_ref().unwrap().clone();
+        let capacity = channel.capacity(&left.buffers);
+        assert!(capacity >= MIN_PACKET_CHARGE);
+        let charge = capacity - (MIN_PACKET_CHARGE - 1);
+        let admission = channel.try_admit(&left.buffers, charge).unwrap();
+        admission
+            .publish(Packet {
+                data: alloc::vec![1],
+                cmsg: Vec::new(),
+                sender: UnixSocketAddr::Unnamed,
+                charge: 0,
+            })
+            .unwrap();
+
+        assert!(!left.poll().contains(IoEvents::OUT));
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            right
+                .recv(
+                    &mut byte[..],
+                    RecvOptions {
+                        flags: RecvFlags::DONT_WAIT,
+                        ..RecvOptions::default()
+                    },
+                )
+                .unwrap(),
+            1
+        );
+        assert!(left.poll().contains(IoEvents::OUT));
     }
 }

@@ -24,7 +24,7 @@ use crate::{
 };
 
 pub trait SocketFilter: Send + Sync {
-    fn filter(&self, data: &mut Vec<u8>) -> AxResult<usize>;
+    fn filter(&self, data: &mut [u8]) -> AxResult<usize>;
 }
 
 /// Extended socket address supporting IP, Unix, and vsock address families.
@@ -291,7 +291,7 @@ impl Socket {
                 udp.disconnect();
                 Ok(())
             }
-            Socket::Unix(_) => Err(AxError::OperationNotSupported),
+            Socket::Unix(unix) => unix.disconnect(),
             #[cfg(feature = "vsock")]
             Socket::Vsock(_) => Err(AxError::OperationNotSupported),
         }

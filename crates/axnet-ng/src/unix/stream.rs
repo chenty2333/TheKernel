@@ -1,6 +1,8 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::{
-    sync::atomic::{AtomicBool, Ordering},
+    mem::ManuallyDrop,
+    ptr,
+    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     task::Context,
 };
 
@@ -8,7 +10,7 @@ use async_trait::async_trait;
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::{IoBuf, Read, Write};
 use axpoll::{IoEvents, PollSet, Pollable};
-use axsync::spin::SpinNoIrq as Mutex;
+use axsync::{Mutex, spin::SpinNoIrq};
 use ringbuf::{
     HeapCons, HeapProd, HeapRb,
     traits::{Consumer, Observer, Producer, Split},
@@ -20,16 +22,19 @@ use crate::{
     general::GeneralOptions,
     options::{Configurable, GetSocketOption, SetSocketOption, UnixCredentials},
     socket::SocketFilter,
-    unix::{Transport, TransportOps, UnixSocketAddr},
+    unix::{
+        Transport, TransportOps, UnixSocketAddr,
+        queue::{PermitSendError, Receiver, SendPermit, Sender, TryRecvError, try_bounded},
+    },
 };
 
 // Match the default socket send buffer so large splice/socketpair transfers do
 // not deadlock behind an unrealistically tiny in-kernel Unix stream queue.
 const BUF_SIZE: usize = TCP_TX_BUF_LEN;
 
-fn new_uni_channel() -> (HeapProd<u8>, HeapCons<u8>) {
-    let rb = HeapRb::new(BUF_SIZE);
-    rb.split()
+fn new_uni_channel() -> AxResult<(HeapProd<u8>, HeapCons<u8>)> {
+    let rb = HeapRb::try_new(BUF_SIZE).map_err(|_| AxError::NoMemory)?;
+    Ok(rb.split())
 }
 
 fn finish_stream_send(
@@ -47,11 +52,11 @@ fn finish_stream_send(
 fn new_channels(
     left_credentials: UnixCredentials,
     right_credentials: UnixCredentials,
-) -> (Channel, Channel) {
-    let (client_tx, server_rx) = new_uni_channel();
-    let (server_tx, client_rx) = new_uni_channel();
-    let poll_update = Arc::new(PollSet::new());
-    (
+) -> AxResult<(Channel, Channel)> {
+    let (client_tx, server_rx) = new_uni_channel()?;
+    let (server_tx, client_rx) = new_uni_channel()?;
+    let poll_update = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
+    Ok((
         Channel {
             tx: Some(client_tx),
             rx: Some(client_rx),
@@ -64,7 +69,7 @@ fn new_channels(
             poll_update,
             peer_credentials: left_credentials,
         },
-    )
+    ))
 }
 
 struct Channel {
@@ -75,31 +80,54 @@ struct Channel {
     peer_credentials: UnixCredentials,
 }
 
-pub struct Bind {
-    /// New connections are sent to this channel.
-    conn_tx: async_channel::Sender<ConnRequest>,
-    poll_new_conn: Arc<PollSet>,
-    credentials: UnixCredentials,
-    backlog: usize,
+impl Channel {
+    fn close_and_wake(self) {
+        let poll_update = self.poll_update.clone();
+        drop(self);
+        poll_update.wake();
+    }
 }
+
+struct Listener {
+    conn_tx: Sender<ConnRequest>,
+    credentials: Mutex<UnixCredentials>,
+    backlog: AtomicUsize,
+}
+
+#[derive(Clone)]
+pub struct Bind(Arc<Listener>);
+
 impl Bind {
-    fn connect(
-        &self,
-        local_addr: UnixSocketAddr,
-        credentials: UnixCredentials,
-    ) -> AxResult<Channel> {
-        if self.backlog == 0 || self.conn_tx.len() >= self.backlog {
-            return Err(AxError::ConnectionRefused);
+    fn try_new(conn_tx: Sender<ConnRequest>) -> AxResult<Self> {
+        Arc::try_new(Listener {
+            conn_tx,
+            credentials: Mutex::new(UnixCredentials::UNKNOWN),
+            backlog: AtomicUsize::new(0),
+        })
+        .map(Self)
+        .map_err(|_| AxError::NoMemory)
+    }
+
+    fn reserve(&self) -> AxResult<SendPermit<ConnRequest>> {
+        self.0
+            .conn_tx
+            .try_reserve(self.0.backlog.load(Ordering::Acquire))
+            .map_err(|_| AxError::ConnectionRefused)
+    }
+
+    fn start_listening(&self, backlog: usize, credentials: UnixCredentials) -> AxResult<()> {
+        if self.0.conn_tx.is_closed() {
+            return Err(AxError::InvalidInput);
         }
-        let (client_chan, server_chan) = new_channels(credentials, self.credentials);
-        self.conn_tx
-            .try_send(ConnRequest {
-                channel: server_chan,
-                addr: local_addr,
-            })
-            .map_err(|_| AxError::ConnectionRefused)?;
-        self.poll_new_conn.wake();
-        Ok(client_chan)
+        // Publish the listen(2)-time identity before making any queue slot
+        // admissible.  A socket may have been created or bound by a different
+        // task (for example across fork), so creation-time credentials are not
+        // Linux SO_PEERCRED semantics.
+        *self.0.credentials.lock() = credentials;
+        self.0
+            .backlog
+            .store(backlog.clamp(1, LISTEN_QUEUE_SIZE), Ordering::Release);
+        Ok(())
     }
 }
 
@@ -108,31 +136,223 @@ struct ConnRequest {
     addr: UnixSocketAddr,
 }
 
+const UNIX_STREAM_CLEANUP_SLOTS: usize = 16_384;
+const STREAM_CLEANUP_NODE_BUDGET: usize = 16;
+const STREAM_CLEANUP_REQUEST_BUDGET: usize = 32;
+
+struct DeferredStreamCleanup {
+    next: *mut Self,
+    channel: Option<Channel>,
+    receiver: Option<Receiver<ConnRequest>>,
+    poll_state: Option<PollSet>,
+    _admission: StreamCleanupAdmission,
+}
+
+// `next` is only mutated under unique ownership or the intrusive-list lock.
+// Shared references cannot dereference it, and every payload is Send + Sync.
+unsafe impl Send for DeferredStreamCleanup {}
+unsafe impl Sync for DeferredStreamCleanup {}
+
+impl DeferredStreamCleanup {
+    fn try_new() -> AxResult<Box<Self>> {
+        let admission = StreamCleanupAdmission::try_acquire()?;
+        Box::try_new(Self {
+            next: ptr::null_mut(),
+            channel: None,
+            receiver: None,
+            poll_state: None,
+            _admission: admission,
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+
+    fn run(mut self: Box<Self>) -> Option<Box<Self>> {
+        if let Some(receiver) = self.receiver.take() {
+            receiver.close();
+            let mut drained = 0;
+            while drained < STREAM_CLEANUP_REQUEST_BUDGET {
+                match receiver.try_recv_deferred_wake() {
+                    Ok((request, completion)) => {
+                        request.channel.close_and_wake();
+                        completion.complete();
+                        drained += 1;
+                    }
+                    Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                }
+            }
+            if !receiver.is_empty() {
+                self.receiver = Some(receiver);
+            } else {
+                drop(receiver);
+            }
+        }
+        if let Some(channel) = self.channel.take() {
+            channel.close_and_wake();
+        }
+        if let Some(poll_state) = self.poll_state.take() {
+            poll_state.wake();
+            drop(poll_state);
+        }
+        self.receiver.is_some().then_some(self)
+    }
+}
+
+static STREAM_CLEANUP_ADMISSIONS: AtomicUsize = AtomicUsize::new(0);
+
+struct StreamCleanupAdmission;
+
+impl StreamCleanupAdmission {
+    fn try_acquire() -> AxResult<Self> {
+        STREAM_CLEANUP_ADMISSIONS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < UNIX_STREAM_CLEANUP_SLOTS).then_some(current + 1)
+            })
+            .map_err(|_| AxError::NoMemory)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for StreamCleanupAdmission {
+    fn drop(&mut self) {
+        STREAM_CLEANUP_ADMISSIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct DeferredStreamCleanupList {
+    head: *mut DeferredStreamCleanup,
+    tail: *mut DeferredStreamCleanup,
+}
+
+unsafe impl Send for DeferredStreamCleanupList {}
+
+impl DeferredStreamCleanupList {
+    const fn new() -> Self {
+        Self {
+            head: ptr::null_mut(),
+            tail: ptr::null_mut(),
+        }
+    }
+
+    fn push(&mut self, work: Box<DeferredStreamCleanup>) {
+        let raw = Box::into_raw(work);
+        unsafe {
+            (*raw).next = ptr::null_mut();
+            if self.tail.is_null() {
+                self.head = raw;
+            } else {
+                (*self.tail).next = raw;
+            }
+        }
+        self.tail = raw;
+    }
+
+    fn pop(&mut self) -> Option<Box<DeferredStreamCleanup>> {
+        let raw = self.head;
+        if raw.is_null() {
+            return None;
+        }
+        unsafe {
+            self.head = (*raw).next;
+            (*raw).next = ptr::null_mut();
+            if self.head.is_null() {
+                self.tail = ptr::null_mut();
+            }
+            Some(Box::from_raw(raw))
+        }
+    }
+}
+
+static STREAM_CLEANUP_LIST: SpinNoIrq<DeferredStreamCleanupList> =
+    SpinNoIrq::new(DeferredStreamCleanupList::new());
+static STREAM_CLEANUP_PENDING: AtomicBool = AtomicBool::new(false);
+
+fn publish_stream_cleanup(
+    channel: Option<Channel>,
+    receiver: Option<Receiver<ConnRequest>>,
+    poll_state: PollSet,
+    mut work: Box<DeferredStreamCleanup>,
+) {
+    work.channel = channel;
+    work.receiver = receiver;
+    work.poll_state = Some(poll_state);
+    let mut list = STREAM_CLEANUP_LIST.lock();
+    list.push(work);
+    STREAM_CLEANUP_PENDING.store(true, Ordering::Release);
+}
+
+fn requeue_stream_cleanup(work: Box<DeferredStreamCleanup>) {
+    let mut list = STREAM_CLEANUP_LIST.lock();
+    list.push(work);
+    STREAM_CLEANUP_PENDING.store(true, Ordering::Release);
+}
+
+pub(super) fn has_deferred_cleanup_work() -> bool {
+    STREAM_CLEANUP_PENDING.load(Ordering::Acquire)
+}
+
+pub(super) fn drain_deferred_cleanup_work() {
+    for _ in 0..STREAM_CLEANUP_NODE_BUDGET {
+        let work = {
+            let mut list = STREAM_CLEANUP_LIST.lock();
+            let work = list.pop();
+            if list.head.is_null() {
+                STREAM_CLEANUP_PENDING.store(false, Ordering::Release);
+            }
+            work
+        };
+        let Some(work) = work else {
+            break;
+        };
+        if let Some(work) = work.run() {
+            requeue_stream_cleanup(work);
+        }
+    }
+}
+
 /// Stream transport for Unix domain sockets.
 pub struct StreamTransport {
     channel: Mutex<Option<Channel>>,
-    conn_rx: Mutex<Option<(async_channel::Receiver<ConnRequest>, Arc<PollSet>)>>,
+    conn_rx: Mutex<Option<Receiver<ConnRequest>>>,
+    drop_cleanup: ManuallyDrop<Box<DeferredStreamCleanup>>,
     poll_state: PollSet,
     general: GeneralOptions,
-    credentials: UnixCredentials,
     rx_closed: AtomicBool,
     tx_closed: AtomicBool,
+    connect_state: AtomicU8,
 }
+
+const CONNECT_UNCONNECTED: u8 = 0;
+const CONNECT_RESERVED: u8 = 1;
+const CONNECT_CONNECTED: u8 = 2;
 impl StreamTransport {
     /// Create a new unconnected stream transport.
-    pub fn new(credentials: UnixCredentials) -> Self {
-        StreamTransport::new_channel(None, credentials)
+    pub fn new() -> AxResult<Self> {
+        StreamTransport::new_channel(None)
     }
 
-    fn new_channel(channel: Option<Channel>, credentials: UnixCredentials) -> Self {
+    fn new_channel(channel: Option<Channel>) -> AxResult<Self> {
+        let drop_cleanup = DeferredStreamCleanup::try_new()?;
+        Ok(Self::new_channel_with_cleanup(channel, drop_cleanup))
+    }
+
+    fn new_channel_with_cleanup(
+        channel: Option<Channel>,
+        drop_cleanup: Box<DeferredStreamCleanup>,
+    ) -> Self {
+        let connect_state = if channel.is_some() {
+            CONNECT_CONNECTED
+        } else {
+            CONNECT_UNCONNECTED
+        };
         StreamTransport {
             channel: Mutex::new(channel),
             conn_rx: Mutex::new(None),
+            drop_cleanup: ManuallyDrop::new(drop_cleanup),
             poll_state: PollSet::new(),
             general: GeneralOptions::default(),
-            credentials,
             rx_closed: AtomicBool::new(false),
             tx_closed: AtomicBool::new(false),
+            connect_state: AtomicU8::new(connect_state),
         }
     }
 
@@ -141,15 +361,43 @@ impl StreamTransport {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.channel.lock().is_some()
+        self.connect_state.load(Ordering::Acquire) == CONNECT_CONNECTED
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_connections(&self) -> usize {
+        self.conn_rx.lock().as_ref().map_or(0, Receiver::len)
     }
 
     /// Create a connected pair of stream transports.
-    pub fn new_pair(credentials: UnixCredentials) -> (Self, Self) {
-        let (chan1, chan2) = new_channels(credentials, credentials);
-        let transport1 = StreamTransport::new_channel(Some(chan1), credentials);
-        let transport2 = StreamTransport::new_channel(Some(chan2), credentials);
-        (transport1, transport2)
+    pub fn new_pair(credentials: UnixCredentials) -> AxResult<(Self, Self)> {
+        let (chan1, chan2) = new_channels(credentials, credentials)?;
+        let transport1 = StreamTransport::new_channel(Some(chan1))?;
+        let transport2 = StreamTransport::new_channel(Some(chan2))?;
+        Ok((transport1, transport2))
+    }
+
+    pub(super) fn rollback_bind(&self, slot: &super::BindSlot) {
+        let retired_bind = slot.stream.lock().take();
+        let retired_receiver = self.conn_rx.lock().take();
+        if let Some(receiver) = retired_receiver.as_ref() {
+            receiver.close();
+            // A cloned target may have been used before namespace commit.
+            // Drain every bounded request and explicitly wake its client so a
+            // rolled-back private listener cannot strand connected sleepers.
+            for _ in 0..LISTEN_QUEUE_SIZE {
+                match receiver.try_recv_deferred_wake() {
+                    Ok((request, completion)) => {
+                        request.channel.close_and_wake();
+                        completion.complete();
+                    }
+                    Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                }
+            }
+        }
+        drop(retired_bind);
+        drop(retired_receiver);
+        self.poll_state.wake();
     }
 }
 
@@ -197,6 +445,10 @@ impl TransportOps for StreamTransport {
     }
 
     fn bind(&self, slot: &super::BindSlot, _local_addr: &UnixSocketAddr) -> AxResult<()> {
+        // Admission and queue storage are completely prepared before either
+        // endpoint lock is acquired. Installation below only moves ownership.
+        let (tx, rx) = try_bounded(LISTEN_QUEUE_SIZE)?;
+        let prepared_bind = Bind::try_new(tx)?;
         let mut slot = slot.stream.lock();
         if slot.is_some() {
             return Err(AxError::AddrInUse);
@@ -205,48 +457,104 @@ impl TransportOps for StreamTransport {
         if guard.is_some() {
             return Err(AxError::InvalidInput);
         }
-        let (tx, rx) = async_channel::bounded(LISTEN_QUEUE_SIZE);
-        let poll = Arc::new(PollSet::new());
-        *slot = Some(Bind {
-            conn_tx: tx,
-            poll_new_conn: poll.clone(),
-            credentials: self.credentials,
-            backlog: 0,
-        });
-        *guard = Some((rx, poll));
+        *slot = Some(prepared_bind);
+        *guard = Some(rx);
+        drop(guard);
+        drop(slot);
         self.poll_state.wake();
         Ok(())
     }
 
-    fn listen(&self, slot: &super::BindSlot, backlog: usize) -> AxResult<()> {
+    fn listen(
+        &self,
+        slot: &super::BindSlot,
+        backlog: usize,
+        credentials: UnixCredentials,
+    ) -> AxResult<()> {
         if self.conn_rx.lock().is_none() {
             return Err(AxError::InvalidInput);
         }
-        let mut slot = slot.stream.lock();
-        let bind = slot.as_mut().ok_or(AxError::InvalidInput)?;
-        bind.backlog = backlog.clamp(1, LISTEN_QUEUE_SIZE);
+        let bind = slot
+            .stream
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or(AxError::InvalidInput)?;
+        bind.start_listening(backlog, credentials)?;
         self.poll_state.wake();
         Ok(())
     }
 
-    fn connect(&self, slot: &super::BindSlot, local_addr: &UnixSocketAddr) -> AxResult<()> {
-        let mut guard = self.channel.lock();
-        if guard.is_some() {
+    fn connect(
+        &self,
+        slot: &super::BindSlot,
+        local_addr: &UnixSocketAddr,
+        credentials: UnixCredentials,
+    ) -> AxResult<()> {
+        if self
+            .connect_state
+            .compare_exchange(
+                CONNECT_UNCONNECTED,
+                CONNECT_RESERVED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
             return Err(AxError::AlreadyConnected);
         }
-        *guard = Some(
-            slot.stream
-                .lock()
-                .as_ref()
-                .ok_or(AxError::NotConnected)?
-                .connect(local_addr.clone(), self.credentials)?,
-        );
-        self.poll_state.wake();
-        Ok(())
+
+        let result = (|| {
+            // Clone only the stable listener handle under the slot lock. Queue
+            // admission, ring allocation and publication all happen after it
+            // is released.
+            let bind = slot.stream.lock().as_ref().cloned();
+            let bind = if let Some(bind) = bind {
+                bind
+            } else if slot.dgram.lock().is_some() {
+                return Err(LinuxError::EPROTOTYPE.into());
+            } else {
+                return Err(AxError::ConnectionRefused);
+            };
+            let permit = bind.reserve()?;
+            let listener_credentials = *bind.0.credentials.lock();
+            let (client_channel, server_channel) = new_channels(credentials, listener_credentials)?;
+            let request = ConnRequest {
+                channel: server_channel,
+                addr: local_addr.clone(),
+            };
+            if let Err(PermitSendError::Closed(request)) = permit.send(request) {
+                // Channel endpoints can own wake state and ring buffers; keep
+                // their destruction outside every endpoint/queue lock.
+                drop(request);
+                drop(client_channel);
+                return Err(AxError::ConnectionRefused);
+            }
+
+            // The CAS above is the sole transition into CONNECT_RESERVED, and
+            // no other operation can install a channel in that state. This is
+            // therefore an infallible ownership move after listener enqueue.
+            *self.channel.lock() = Some(client_channel);
+            self.connect_state
+                .store(CONNECT_CONNECTED, Ordering::Release);
+            self.poll_state.wake();
+            Ok(())
+        })();
+
+        if result.is_err() {
+            self.connect_state
+                .store(CONNECT_UNCONNECTED, Ordering::Release);
+        }
+        result
     }
 
     async fn accept(&self) -> AxResult<(Transport, UnixSocketAddr)> {
-        let Some((rx, _)) = self.conn_rx.lock().clone() else {
+        // Admission must precede dequeue. Once a client-visible connection is
+        // removed from the listen queue, construction is an infallible move;
+        // otherwise ENOMEM here could drop the server endpoint without waking
+        // the already connected client.
+        let drop_cleanup = DeferredStreamCleanup::try_new()?;
+        let Some(rx) = self.conn_rx.lock().clone() else {
             return Err(AxError::NotConnected);
         };
         let ConnRequest {
@@ -254,9 +562,9 @@ impl TransportOps for StreamTransport {
             addr: peer_addr,
         } = rx.recv().await.map_err(|_| AxError::ConnectionReset)?;
         Ok((
-            Transport::Stream(StreamTransport::new_channel(
+            Transport::Stream(StreamTransport::new_channel_with_cleanup(
                 Some(channel),
-                self.credentials,
+                drop_cleanup,
             )),
             peer_addr,
         ))
@@ -308,11 +616,13 @@ impl TransportOps for StreamTransport {
                     count
                 };
                 total += count;
-                if count > 0 {
-                    chan.poll_update.wake();
+                let poll_update = (count > 0).then(|| chan.poll_update.clone());
+                let result = finish_stream_send(total, size, effective_nonblocking);
+                drop(guard);
+                if let Some(poll_update) = poll_update {
+                    poll_update.wake();
                 }
-
-                finish_stream_send(total, size, effective_nonblocking)
+                result
             });
         // Once stream bytes have been queued, Linux reports that positive
         // progress instead of a later interruption, timeout, peer close, or
@@ -347,29 +657,43 @@ impl TransportOps for StreamTransport {
                     }
                     count
                 };
-                if count > 0 {
-                    chan.poll_update.wake();
+                let poll_update = (count > 0).then(|| chan.poll_update.clone());
+                let result = if count > 0 {
                     Ok(count)
                 } else if !rx.write_is_held() {
                     Ok(0)
                 } else {
                     Err(AxError::WouldBlock)
+                };
+                drop(guard);
+                if let Some(poll_update) = poll_update {
+                    poll_update.wake();
                 }
+                result
             })
     }
 
     fn shutdown(&self, how: Shutdown) -> AxResult<()> {
-        let mut channel = self.channel.lock();
-        let channel = channel.as_mut().ok_or(AxError::NotConnected)?;
-        if how.has_read() {
-            self.rx_closed.store(true, Ordering::Release);
-            channel.rx.take();
-        }
-        if how.has_write() {
-            self.tx_closed.store(true, Ordering::Release);
-            channel.tx.take();
-        }
-        channel.poll_update.wake();
+        let (retired_rx, retired_tx, poll_update) = {
+            let mut channel = self.channel.lock();
+            let channel = channel.as_mut().ok_or(AxError::NotConnected)?;
+            let retired_rx = if how.has_read() {
+                self.rx_closed.store(true, Ordering::Release);
+                channel.rx.take()
+            } else {
+                None
+            };
+            let retired_tx = if how.has_write() {
+                self.tx_closed.store(true, Ordering::Release);
+                channel.tx.take()
+            } else {
+                None
+            };
+            (retired_rx, retired_tx, channel.poll_update.clone())
+        };
+        drop(retired_rx);
+        drop(retired_tx);
+        poll_update.wake();
         self.poll_state.wake();
         Ok(())
     }
@@ -398,21 +722,27 @@ impl Pollable for StreamTransport {
             events.set(IoEvents::ERR, peer_read_closed);
             events.set(IoEvents::RDHUP, peer_write_closed);
             events.set(IoEvents::HUP, peer_read_closed && peer_write_closed);
-        } else if let Some((conn_tx, _)) = self.conn_rx.lock().as_ref() {
-            events.set(IoEvents::IN, !conn_tx.is_empty());
+        } else if let Some(conn_rx) = self.conn_rx.lock().as_ref() {
+            events.set(IoEvents::IN, !conn_rx.is_empty());
         }
         self.general.add_pending_error_event(events)
     }
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if let Some(chan) = self.channel.lock().as_ref() {
+        let channel_poll = self
+            .channel
+            .lock()
+            .as_ref()
+            .map(|channel| channel.poll_update.clone());
+        if let Some(channel_poll) = channel_poll {
             if events.intersects(IoEvents::IN | IoEvents::OUT) {
-                chan.poll_update.register(context.waker());
+                channel_poll.register(context.waker());
             }
-        } else if let Some((_, poll_new_conn)) = self.conn_rx.lock().as_ref()
-            && events.contains(IoEvents::IN)
-        {
-            poll_new_conn.register(context.waker());
+        } else if events.contains(IoEvents::IN) {
+            let receiver = self.conn_rx.lock().clone();
+            if let Some(receiver) = receiver {
+                receiver.register_read(context.waker());
+            }
         }
         self.poll_state.register(context.waker());
     }
@@ -420,17 +750,37 @@ impl Pollable for StreamTransport {
 
 impl Drop for StreamTransport {
     fn drop(&mut self) {
-        if let Some(chan) = self.channel.lock().take() {
-            let poll_update = chan.poll_update.clone();
-            drop(chan);
-            poll_update.wake();
-        }
+        let retired_channel = self.channel.get_mut().take();
+        let retired_receiver = self.conn_rx.get_mut().take();
+        let retired_poll_state = core::mem::replace(&mut self.poll_state, PollSet::new());
+        // SAFETY: every constructor initializes this private field exactly
+        // once, and Drop runs at most once. The worker takes over the Box so
+        // no channel endpoint, receiver, PollSet, or waker is destroyed here.
+        let cleanup = unsafe { ManuallyDrop::take(&mut self.drop_cleanup) };
+        publish_stream_cleanup(
+            retired_channel,
+            retired_receiver,
+            retired_poll_state,
+            cleanup,
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CountingWake(Arc<AtomicUsize>);
+
+    impl alloc::task::Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     fn peer_credentials(transport: &StreamTransport) -> UnixCredentials {
         let mut credentials = UnixCredentials::default();
@@ -442,20 +792,126 @@ mod tests {
 
     #[test]
     fn unconnected_stream_reports_unknown_peer_credentials() {
-        let transport = StreamTransport::new(UnixCredentials::new(1, 2, 3));
+        let transport = StreamTransport::new().unwrap();
         assert_eq!(peer_credentials(&transport), UnixCredentials::UNKNOWN);
+    }
+
+    #[test]
+    fn stream_drop_defers_endpoint_and_waker_teardown() {
+        use core::task::Waker;
+
+        let _guard = super::super::UNIX_CLEANUP_TEST_LOCK.lock();
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+        let credentials = UnixCredentials::new(1, 2, 3);
+        let (left, right) = StreamTransport::new_pair(credentials).unwrap();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountingWake(wakes.clone())));
+        let mut context = Context::from_waker(&waker);
+        left.register(&mut context, IoEvents::IN | IoEvents::OUT);
+        right.register(&mut context, IoEvents::IN | IoEvents::OUT);
+
+        drop(right);
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        assert!(super::super::has_deferred_receive_cleanup_work());
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+        assert!(wakes.load(Ordering::SeqCst) > 0);
+
+        drop(left);
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+    }
+
+    #[test]
+    fn listener_drop_wakes_clients_with_queued_connections() {
+        use core::task::Waker;
+
+        let _guard = super::super::UNIX_CLEANUP_TEST_LOCK.lock();
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+
+        let credentials = UnixCredentials::new(1, 2, 3);
+        let listener = StreamTransport::new().unwrap();
+        let slot = super::super::BindSlot::default();
+        let address = UnixSocketAddr::Path(Arc::new(alloc::string::String::from(
+            "/tmp/axnet-listener-drop-wake",
+        )));
+        listener.bind(&slot, &address).unwrap();
+        listener.listen(&slot, 1, credentials).unwrap();
+
+        let client = StreamTransport::new().unwrap();
+        client
+            .connect(&slot, &UnixSocketAddr::Unnamed, credentials)
+            .unwrap();
+        assert_eq!(listener.pending_connections(), 1);
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountingWake(wakes.clone())));
+        let mut context = Context::from_waker(&waker);
+        client.register(&mut context, IoEvents::IN | IoEvents::OUT);
+
+        drop(listener);
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+
+        assert!(wakes.load(Ordering::SeqCst) > 0);
+        let events = client.poll();
+        assert!(events.contains(IoEvents::RDHUP));
+        assert!(events.contains(IoEvents::ERR));
+        assert!(events.contains(IoEvents::HUP));
+
+        drop(client);
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
     }
 
     #[test]
     fn connected_streams_snapshot_the_opposite_peer_credentials() {
         let left = UnixCredentials::new(11, 12, 13);
         let right = UnixCredentials::new(21, 22, 23);
-        let (left_channel, right_channel) = new_channels(left, right);
-        let left_transport = StreamTransport::new_channel(Some(left_channel), left);
-        let right_transport = StreamTransport::new_channel(Some(right_channel), right);
+        let (left_channel, right_channel) = new_channels(left, right).unwrap();
+        let left_transport = StreamTransport::new_channel(Some(left_channel)).unwrap();
+        let right_transport = StreamTransport::new_channel(Some(right_channel)).unwrap();
 
         assert_eq!(peer_credentials(&left_transport), right);
         assert_eq!(peer_credentials(&right_transport), left);
+    }
+
+    #[test]
+    fn stream_connect_snapshots_listen_and_connect_time_credentials() {
+        let listen_credentials = UnixCredentials::new(101, 102, 103);
+        let connect_credentials = UnixCredentials::new(201, 202, 203);
+        let listener = StreamTransport::new().unwrap();
+        let slot = super::super::BindSlot::default();
+        let address = UnixSocketAddr::Path(Arc::new(alloc::string::String::from(
+            "/tmp/axnet-operation-credentials",
+        )));
+        listener.bind(&slot, &address).unwrap();
+        listener.listen(&slot, 1, listen_credentials).unwrap();
+
+        let client = StreamTransport::new().unwrap();
+        client
+            .connect(&slot, &UnixSocketAddr::Unnamed, connect_credentials)
+            .unwrap();
+        assert_eq!(peer_credentials(&client), listen_credentials);
+
+        let request = listener
+            .conn_rx
+            .lock()
+            .as_ref()
+            .unwrap()
+            .try_recv()
+            .unwrap();
+        let accepted = StreamTransport::new_channel(Some(request.channel)).unwrap();
+        assert_eq!(peer_credentials(&accepted), connect_credentials);
     }
 
     #[test]
@@ -469,7 +925,7 @@ mod tests {
     #[test]
     fn per_call_nonblocking_stream_send_returns_the_queued_prefix() {
         let credentials = UnixCredentials::new(1, 2, 3);
-        let (left, right) = StreamTransport::new_pair(credentials);
+        let (left, right) = StreamTransport::new_pair(credentials).unwrap();
         let flags = SendFlags::DONT_WAIT;
 
         let prefill = alloc::vec![0x11u8; BUF_SIZE - 1];
@@ -518,37 +974,29 @@ mod tests {
     #[test]
     fn listener_rejects_connect_before_listen_and_enforces_backlog() {
         let credentials = UnixCredentials::new(1, 2, 3);
-        let (tx, rx) = async_channel::bounded(LISTEN_QUEUE_SIZE);
-        let mut bind = Bind {
-            conn_tx: tx,
-            poll_new_conn: Arc::new(PollSet::new()),
-            credentials,
-            backlog: 0,
-        };
+        let (tx, rx) = try_bounded(LISTEN_QUEUE_SIZE).unwrap();
+        let bind = Bind::try_new(tx).unwrap();
 
-        assert_eq!(
-            bind.connect(UnixSocketAddr::Unnamed, credentials)
-                .err()
-                .unwrap(),
-            AxError::ConnectionRefused
-        );
+        assert_eq!(bind.reserve().err().unwrap(), AxError::ConnectionRefused);
 
-        bind.backlog = 1;
-        let _client = bind.connect(UnixSocketAddr::Unnamed, credentials).unwrap();
-        assert_eq!(
-            bind.connect(UnixSocketAddr::Unnamed, credentials)
-                .err()
-                .unwrap(),
-            AxError::ConnectionRefused
-        );
+        bind.start_listening(1, credentials).unwrap();
+        let permit = bind.reserve().unwrap();
+        assert_eq!(bind.reserve().err().unwrap(), AxError::ConnectionRefused);
+        permit
+            .send(ConnRequest {
+                channel: new_channels(credentials, credentials).unwrap().1,
+                addr: UnixSocketAddr::Unnamed,
+            })
+            .ok()
+            .unwrap();
         drop(rx.try_recv().unwrap());
-        assert!(bind.connect(UnixSocketAddr::Unnamed, credentials).is_ok());
+        assert!(bind.reserve().is_ok());
     }
 
     #[test]
     fn stream_write_shutdown_preserves_queued_data_and_closes_peer_writer() {
         let credentials = UnixCredentials::new(1, 2, 3);
-        let (left, right) = StreamTransport::new_pair(credentials);
+        let (left, right) = StreamTransport::new_pair(credentials).unwrap();
 
         assert_eq!(
             left.channel
@@ -576,7 +1024,7 @@ mod tests {
     #[test]
     fn stream_read_shutdown_breaks_peer_writes() {
         let credentials = UnixCredentials::new(1, 2, 3);
-        let (left, right) = StreamTransport::new_pair(credentials);
+        let (left, right) = StreamTransport::new_pair(credentials).unwrap();
 
         right.shutdown(Shutdown::Read).unwrap();
         assert!(right.channel.lock().as_ref().unwrap().rx.is_none());

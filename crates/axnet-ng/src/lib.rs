@@ -17,6 +17,8 @@
 #[macro_use]
 extern crate log;
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod buffer;
 mod consts;

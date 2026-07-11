@@ -14,6 +14,7 @@ use crate::{
     listen_table::ListenTable,
     router::{RouteInfo, Router, Rule},
     service::Service,
+    unix::UnixNamespace,
     wrapper::{SocketSetWrapper, Transport},
 };
 
@@ -27,6 +28,7 @@ use crate::{
 /// listen-table entries (which hold `Weak<SocketSetWrapper>`) are cleaned up
 /// while the socket set is still alive.
 pub struct NetStack {
+    unix_namespace: Arc<UnixNamespace>,
     pub(crate) listen_table: Arc<ListenTable>,
     pub(crate) socket_set: Arc<SocketSetWrapper<'static>>,
     pub(crate) service: Mutex<Service>,
@@ -54,7 +56,9 @@ impl NetStack {
         socket_set: Arc<SocketSetWrapper<'static>>,
         service: Service,
     ) -> AxResult<Arc<Self>> {
+        let unix_namespace = UnixNamespace::try_new()?;
         Arc::try_new(Self {
+            unix_namespace,
             listen_table,
             socket_set,
             service: Mutex::new(service),
@@ -64,6 +68,12 @@ impl NetStack {
             ipv4_conf_lo_tag: AtomicI32::new(0),
         })
         .map_err(|_| AxError::NoMemory)
+    }
+
+    /// Returns the AF_UNIX abstract-name namespace paired with this network
+    /// stack. Pathname Unix sockets remain VFS namespace objects.
+    pub fn unix_namespace(&self) -> Arc<UnixNamespace> {
+        self.unix_namespace.clone()
     }
 
     /// Create a minimal network stack with only a loopback device.
