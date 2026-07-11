@@ -8,7 +8,10 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FsContext};
-use axfs_ng_vfs::{Location, Metadata, NodeFlags, path::Path};
+use axfs_ng_vfs::{
+    Location, Metadata, NodeFlags,
+    path::{MAX_NAME_LEN, Path},
+};
 use axio::{Cursor, IoBuf, Seek, SeekFrom};
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
@@ -32,6 +35,19 @@ use crate::{
 };
 
 const O_PATH_STATUS_FLAG: u32 = linux_raw_sys::general::O_PATH;
+const PATH_MAX: usize = 4096;
+
+pub(crate) fn validate_pathname(path: &Path) -> AxResult {
+    if path.as_str().len() >= PATH_MAX
+        || path
+            .components()
+            .any(|component| component.as_str().len() > MAX_NAME_LEN)
+    {
+        Err(AxError::NameTooLong)
+    } else {
+        Ok(())
+    }
+}
 
 fn fsize_limit() -> Option<u64> {
     let limit = current().as_thread().proc_data.rlim.read()[RLIMIT_FSIZE].current;

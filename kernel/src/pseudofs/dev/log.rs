@@ -1,14 +1,27 @@
 use core::bstr::ByteStr;
 
 use axerrno::LinuxResult;
+use axfs_ng_vfs::NodePermission;
 use axnet::{
-    RecvOptions, SocketAddrEx, SocketOps,
-    unix::{DgramTransport, UnixSocket, UnixSocketAddr},
+    RecvOptions, SocketOps,
+    unix::{DgramTransport, UnixSocket},
 };
+use axtask::current;
+
+use crate::task::AsThread;
 
 pub fn bind_dev_log() -> LinuxResult<()> {
-    let server = UnixSocket::new(DgramTransport::new()?);
-    server.bind(SocketAddrEx::Unix(UnixSocketAddr::Path("/dev/log".into())))?;
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let server = UnixSocket::new(DgramTransport::new()?, proc_data.net_ns.unix_namespace());
+    let credentials = proc_data.fs_dac_credentials();
+    crate::file::unix_socket::bind_path(
+        &server,
+        crate::file::unix_socket::try_path("/dev/log")?,
+        &credentials,
+        NodePermission::from_bits_truncate(0o666),
+        0,
+    )?;
     axtask::spawn_with_name(
         move || {
             let mut buf = [0u8; 65536];

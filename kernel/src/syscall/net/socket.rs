@@ -1,6 +1,7 @@
 use core::mem::size_of;
 
 use axerrno::{AxError, AxResult, LinuxError};
+use axfs_ng_vfs::NodePermission;
 #[cfg(feature = "vsock")]
 use axnet::vsock::{VsockSocket, VsockStreamTransport};
 use axnet::{
@@ -8,7 +9,7 @@ use axnet::{
     options::UnixCredentials,
     tcp::TcpSocket,
     udp::UdpSocket,
-    unix::{DgramTransport, StreamTransport, UnixSocket},
+    unix::{DgramTransport, StreamTransport, UnixSocket, UnixSocketAddr},
 };
 use axtask::current;
 use linux_raw_sys::{
@@ -139,7 +140,6 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
         return add_file_like(socket as _, cloexec).map(|fd| fd as isize);
     }
 
-    let credentials = current_unix_credentials();
     let socket = match (domain, ty) {
         (AF_INET | AF_INET6, SOCK_STREAM) => {
             if !supported_stream_protocol(proto) {
@@ -159,10 +159,14 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
         (AF_INET | AF_INET6, SOCK_RAW) => {
             return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
         }
-        (AF_UNIX, SOCK_STREAM) => {
-            SocketInner::Unix(UnixSocket::new(StreamTransport::new(credentials)))
-        }
-        (AF_UNIX, SOCK_DGRAM) => SocketInner::Unix(UnixSocket::new(DgramTransport::new()?)),
+        (AF_UNIX, SOCK_STREAM) => SocketInner::Unix(UnixSocket::new(
+            StreamTransport::new()?,
+            net_ns.unix_namespace(),
+        )),
+        (AF_UNIX, SOCK_DGRAM) => SocketInner::Unix(UnixSocket::new(
+            DgramTransport::new()?,
+            net_ns.unix_namespace(),
+        )),
         #[cfg(feature = "vsock")]
         (AF_VSOCK, SOCK_STREAM) => {
             SocketInner::Vsock(VsockSocket::new(VsockStreamTransport::new()))
@@ -215,30 +219,59 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
     let addr = SocketAddrEx::read_from_user(addr, addrlen)?;
     debug!("sys_bind <= fd: {fd}, addr: {addr:?}");
 
-    require_bind_permissions(&addr)?;
-    socket.bind(addr)?;
+    if let (SocketInner::Unix(unix), SocketAddrEx::Unix(UnixSocketAddr::Path(path))) =
+        (&socket.inner, &addr)
+    {
+        let curr = current();
+        let proc_data = &curr.as_thread().proc_data;
+        let credentials = proc_data.fs_dac_credentials();
+        crate::file::unix_socket::bind_path(
+            unix,
+            path.clone(),
+            &credentials,
+            NodePermission::from_bits_truncate(0o777),
+            proc_data.umask(),
+        )?;
+    } else {
+        require_bind_permissions(&addr)?;
+        socket.bind(addr)?;
+    }
 
     Ok(0)
 }
 
 pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult<isize> {
-    let _ = get_file_like(fd)?;
+    // Pin the open file description once. Address decoding intentionally
+    // remains before the ENOTSOCK downcast for the ordinary connect path, but
+    // a sibling sharing the fd table can no longer redirect the operation by
+    // closing and reusing the numeric descriptor between those two steps.
+    let file = get_file_like(fd)?;
 
     if addrlen as usize >= size_of::<linux_raw_sys::net::__kernel_sa_family_t>()
-        && (*addr
-            .cast::<linux_raw_sys::net::__kernel_sa_family_t>()
-            .get_as_ref()? as u32)
-            == AF_UNSPEC
+        && super::addr::read_family(addr, addrlen)? as u32 == AF_UNSPEC
     {
         debug!("sys_connect <= fd: {fd}, addr: AF_UNSPEC");
-        Socket::from_fd(fd)?.disconnect()?;
+        Socket::from_file_handle(&file)?.disconnect()?;
         return Ok(0);
     }
 
     let addr = SocketAddrEx::read_from_user(addr, addrlen)?;
     debug!("sys_connect <= fd: {fd}, addr: {addr:?}");
 
-    Socket::from_fd(fd)?.connect(addr).map_err(|e| {
+    let socket = Socket::from_file_handle(&file)?;
+    let result = match (&socket.inner, &addr) {
+        (SocketInner::Unix(unix), SocketAddrEx::Unix(UnixSocketAddr::Path(path))) => {
+            let curr = current();
+            let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+            let target = crate::file::unix_socket::resolve_peer(path.clone(), &credentials)?;
+            unix.connect_resolved_as(target, current_unix_credentials())
+        }
+        (SocketInner::Unix(unix), SocketAddrEx::Unix(_)) => {
+            unix.connect_as(addr.clone(), current_unix_credentials())
+        }
+        _ => socket.connect(addr.clone()),
+    };
+    result.map_err(|e| {
         if e == AxError::WouldBlock {
             AxError::InProgress
         } else {
@@ -254,7 +287,13 @@ pub fn sys_listen(fd: i32, backlog: i32) -> AxResult<isize> {
 
     // Linux treats a negative backlog as zero. The transport applies its own
     // finite queue cap, analogous to net.core.somaxconn.
-    Socket::from_fd(fd)?.listen(backlog.max(0) as usize)?;
+    let socket = Socket::from_fd(fd)?;
+    let backlog = backlog.max(0) as usize;
+    if let SocketInner::Unix(unix) = &socket.inner {
+        unix.listen_as(backlog, current_unix_credentials())?;
+    } else {
+        socket.listen(backlog)?;
+    }
 
     Ok(0)
 }
@@ -338,14 +377,22 @@ pub fn sys_socketpair(
     }
 
     let credentials = current_unix_credentials();
+    let net_stack = current().as_thread().proc_data.net_ns.clone();
+    let unix_namespace = net_stack.unix_namespace();
     let (sock1, sock2) = match ty {
         SOCK_STREAM => {
-            let (sock1, sock2) = StreamTransport::new_pair(credentials);
-            (UnixSocket::new(sock1), UnixSocket::new(sock2))
+            let (sock1, sock2) = StreamTransport::new_pair(credentials)?;
+            (
+                UnixSocket::new(sock1, unix_namespace.clone()),
+                UnixSocket::new(sock2, unix_namespace.clone()),
+            )
         }
         SOCK_DGRAM => {
             let (sock1, sock2) = DgramTransport::new_pair(credentials)?;
-            (UnixSocket::new(sock1), UnixSocket::new(sock2))
+            (
+                UnixSocket::new(sock1, unix_namespace.clone()),
+                UnixSocket::new(sock2, unix_namespace),
+            )
         }
         SOCK_SEQPACKET => {
             return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
@@ -358,7 +405,6 @@ pub fn sys_socketpair(
             return Err(AxError::InvalidInput);
         }
     };
-    let net_stack = current().as_thread().proc_data.net_ns.clone();
     let sock1 = Socket::new(SocketInner::Unix(sock1), net_stack.clone());
     let sock2 = Socket::new(SocketInner::Unix(sock2), net_stack);
 

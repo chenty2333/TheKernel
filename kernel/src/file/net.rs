@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, format, sync::Arc, vec::Vec};
+use alloc::{borrow::Cow, format, sync::Arc};
 use core::{ffi::c_int, ops::Deref, task::Context};
 
 use axerrno::{AxError, AxResult};
@@ -7,6 +7,7 @@ use axnet::{
     options::{Configurable, SetSocketOption},
 };
 use axpoll::{IoEvents, Pollable};
+use linux_raw_sys::general::O_PATH;
 
 use super::{File, FileHandle, FileLike, Kstat, PseudoInode};
 use crate::{
@@ -19,14 +20,14 @@ struct AttachedSocketFilter {
 }
 
 impl axnet::SocketFilter for AttachedSocketFilter {
-    fn filter(&self, data: &mut Vec<u8>) -> AxResult<usize> {
+    fn filter(&self, data: &mut [u8]) -> AxResult<usize> {
         let mut vm = BpfVm::with_aux_budget(
             &self.prog.insns,
             &self.prog.decoded_insns,
             &self.prog.maps,
             u64::MAX,
         );
-        let ret = vm.execute(data.as_mut_slice())? as usize;
+        let ret = vm.execute(data)? as usize;
         Ok(ret.min(data.len()))
     }
 }
@@ -66,6 +67,29 @@ impl Socket {
 
     pub fn listen(&self, backlog: usize) -> AxResult<()> {
         self.inner.listen(backlog)
+    }
+
+    /// Borrows a network socket from one already-stabilized open file
+    /// description.
+    ///
+    /// Syscalls that must perform usercopy before reporting `ENOTSOCK` can
+    /// retain the numeric fd's OFD at entry and downcast it only after the ABI
+    /// copy. This avoids a second fd-table lookup that a `CLONE_FILES` sibling
+    /// could redirect through close-and-reuse.
+    pub(crate) fn from_file_handle(file: &FileHandle<dyn FileLike>) -> AxResult<&Self> {
+        if file.status_flags() & O_PATH != 0 {
+            return Err(AxError::BadFileDescriptor);
+        }
+        if let Some(socket) = file.downcast_ref::<Self>() {
+            return Ok(socket);
+        }
+        if file
+            .downcast_ref::<File>()
+            .is_some_and(|file| file.inner().is_path())
+        {
+            return Err(AxError::BadFileDescriptor);
+        }
+        Err(AxError::NotASocket)
     }
 }
 

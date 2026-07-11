@@ -20,6 +20,7 @@ mod pidfd;
 pub(crate) mod pipe;
 pub mod signalfd;
 pub mod timerfd;
+pub(crate) mod unix_socket;
 
 mod desc;
 mod fd_table;
@@ -44,6 +45,6 @@ pub use self::{
     types::*,
 };
 pub(crate) use self::{
-    fs::{allowed_write_len, check_resize_limit},
+    fs::{allowed_write_len, check_resize_limit, validate_pathname},
     metadata::{PseudoInode, anon_inode_stat},
 };

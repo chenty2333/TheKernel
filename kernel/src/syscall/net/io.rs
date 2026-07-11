@@ -7,8 +7,10 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::prelude::*;
 use axnet::{
-    CMsgData, RecvFlags, RecvOptions, SendFlags, SendOptions, SocketAddrEx, SocketOps,
+    CMsgData, RecvFlags, RecvOptions, SendFlags, SendOptions, Socket as AxSocket, SocketAddrEx,
+    SocketOps,
     options::{Configurable, GetSocketOption},
+    unix::UnixSocketAddr,
 };
 use axtask::current;
 use linux_raw_sys::{
@@ -308,6 +310,10 @@ fn remember_recvmmsg_error(socket: &StableMessageSocket, error: AxError) {
     socket.remember_error(error);
 }
 
+const fn rights_push_was_truncated(expected: usize, result: super::cmsg::RightsPushResult) -> bool {
+    result.installed < expected || !result.published
+}
+
 fn send_impl(
     socket: &StableMessageSocket,
     fd: i32,
@@ -339,14 +345,25 @@ fn send_impl(
         return Err(AxError::NotASocket);
     }
     let socket = socket.network()?;
-    let sent = socket.send(
-        &mut src,
-        SendOptions {
-            to: addr,
-            flags: send_flags,
-            cmsg,
-        },
-    );
+    let pathname = match (&socket.inner, &addr) {
+        (AxSocket::Unix(_), Some(SocketAddrEx::Unix(UnixSocketAddr::Path(path)))) => {
+            Some(path.clone())
+        }
+        _ => None,
+    };
+    let options = SendOptions {
+        to: addr,
+        flags: send_flags,
+        cmsg,
+    };
+    let sent = if let (AxSocket::Unix(unix), Some(path)) = (&socket.inner, pathname) {
+        let curr = current();
+        let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+        let target = crate::file::unix_socket::resolve_peer(path, &credentials)?;
+        unix.send_to_resolved(&mut src, options, target)
+    } else {
+        socket.send(&mut src, options)
+    };
     let sent = match sent {
         Err(AxError::BrokenPipe) => {
             if flags & MSG_NOSIGNAL == 0 {
@@ -464,11 +481,11 @@ fn recv_impl(
                 continue;
             };
 
-            match *cmsg {
-                CMsg::Rights { fds } => {
+            match &*cmsg {
+                CMsg::Rights { fds, .. } => {
                     let expected = fds.len();
-                    let result = builder.push_rights(&fds, cloexec_rights);
-                    if result.installed < expected {
+                    let result = builder.push_rights(fds, cloexec_rights);
+                    if rights_push_was_truncated(expected, result) {
                         control_truncated = true;
                     }
                 }
@@ -744,5 +761,32 @@ mod tests {
         assert!(!recvmmsg_defers_error(AxError::WouldBlock));
         assert!(recvmmsg_defers_error(AxError::TimedOut));
         assert!(recvmmsg_defers_error(AxError::ConnectionReset));
+    }
+
+    #[test]
+    fn installed_rights_without_a_visible_header_still_report_ctrunc() {
+        use super::super::cmsg::RightsPushResult;
+
+        assert!(rights_push_was_truncated(
+            2,
+            RightsPushResult {
+                installed: 2,
+                published: false,
+            }
+        ));
+        assert!(rights_push_was_truncated(
+            2,
+            RightsPushResult {
+                installed: 1,
+                published: true,
+            }
+        ));
+        assert!(!rights_push_was_truncated(
+            2,
+            RightsPushResult {
+                installed: 2,
+                published: true,
+            }
+        ));
     }
 }

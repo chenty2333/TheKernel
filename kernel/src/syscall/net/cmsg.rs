@@ -4,16 +4,19 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::mem::size_of;
+use core::{
+    mem::{MaybeUninit, size_of},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axnet::CMsgData;
 use linux_raw_sys::net::{SCM_RIGHTS, SOL_SOCKET, cmsghdr};
-use starry_vm::VmMutPtr;
+use starry_vm::{VmMutPtr, vm_read_slice};
 
 use crate::{
     file::{FileDescription, Socket, epoll::Epoll, get_file_description, try_reserve_fd},
-    mm::{UserConstPtr, UserPtr},
+    mm::UserPtr,
 };
 
 /// Linux's per-message hard limit from `net/core/scm.c`.
@@ -23,6 +26,24 @@ pub const SCM_MAX_FD: usize = 253;
 // retained OFD reference plus queue/control metadata and prevents empty Unix
 // datagrams from turning fd references into an unmetered resource.
 const SCM_RIGHTS_FD_QUEUE_CHARGE: usize = 64;
+
+// Until Credential v2 can key this ledger by user namespace and real kuid,
+// impose a hard system-wide ceiling. This is deliberately independent of a
+// destination socket's byte budget: blocking sendmsg callers may hold their
+// owned SCM_RIGHTS snapshot while waiting to obtain that socket admission.
+const SCM_RIGHTS_INFLIGHT_LIMIT: usize = 16_384;
+static SCM_RIGHTS_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+fn try_acquire_scm_rights(count: usize) -> AxResult<()> {
+    SCM_RIGHTS_INFLIGHT
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current
+                .checked_add(count)
+                .filter(|next| *next <= SCM_RIGHTS_INFLIGHT_LIMIT)
+        })
+        .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
+    Ok(())
+}
 
 const fn cmsg_align(len: usize) -> Option<usize> {
     match len.checked_add(size_of::<usize>() - 1) {
@@ -62,7 +83,17 @@ fn try_box<T>(value: T) -> AxResult<Box<T>> {
 }
 
 pub enum CMsg {
-    Rights { fds: Vec<Arc<FileDescription>> },
+    Rights {
+        fds: Vec<Arc<FileDescription>>,
+        inflight_count: usize,
+    },
+}
+
+impl Drop for CMsg {
+    fn drop(&mut self) {
+        let Self::Rights { inflight_count, .. } = self;
+        SCM_RIGHTS_INFLIGHT.fetch_sub(*inflight_count, Ordering::AcqRel);
+    }
 }
 
 impl CMsg {
@@ -98,8 +129,27 @@ impl CMsg {
         let data_addr = hdr_addr
             .checked_add(header_len)
             .ok_or(AxError::InvalidInput)?;
-        let raw_fds = UserConstPtr::<i32>::from(data_addr).get_as_slice(fd_count)?;
-        for &fd in raw_fds {
+        let data_bytes = fd_count
+            .checked_mul(size_of::<i32>())
+            .ok_or(AxError::InvalidInput)?;
+        let mut raw_fds = Vec::new();
+        raw_fds
+            .try_reserve_exact(fd_count)
+            .map_err(|_| AxError::NoMemory)?;
+        raw_fds.resize(fd_count, 0_i32);
+        if data_bytes != 0 {
+            // Never expose userspace as a Rust slice. A sibling sharing this
+            // address space may mutate or unmap the control buffer while the
+            // syscall runs; take one bounded owned snapshot, then parse only
+            // kernel memory.
+            vm_read_slice(data_addr as *const u8, unsafe {
+                core::slice::from_raw_parts_mut(
+                    raw_fds.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                    data_bytes,
+                )
+            })?;
+        }
+        for fd in raw_fds {
             if fd < 0 {
                 return Err(AxError::BadFileDescriptor);
             }
@@ -135,7 +185,15 @@ impl CMsg {
                     .and_then(|storage| charge.checked_add(storage))
             })
             .ok_or(AxError::NoMemory)?;
-        Ok(Some(CMsgData::new(try_box(Self::Rights { fds })?, charge)))
+        try_acquire_scm_rights(fds.len())?;
+        let inflight_count = fds.len();
+        Ok(Some(CMsgData::new(
+            try_box(Self::Rights {
+                fds,
+                inflight_count,
+            })?,
+            charge,
+        )))
     }
 }
 
@@ -267,6 +325,8 @@ impl<'a> CMsgBuilder<'a> {
 mod tests {
     use super::*;
 
+    static SCM_ACCOUNT_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
     #[test]
     fn cmsg_lengths_match_linux_native_alignment() {
         assert_eq!(cmsg_len(0), Some(size_of::<cmsghdr>()));
@@ -280,5 +340,24 @@ mod tests {
     #[test]
     fn rights_limit_is_linux_scm_max_fd() {
         assert_eq!(SCM_MAX_FD, 253);
+    }
+
+    #[test]
+    fn inflight_rights_admission_saturates_and_drop_restores_the_ledger() {
+        let _guard = SCM_ACCOUNT_TEST_LOCK.lock();
+        let baseline = SCM_RIGHTS_INFLIGHT.load(Ordering::Acquire);
+        let available = SCM_RIGHTS_INFLIGHT_LIMIT - baseline;
+        assert!(available > 0);
+        try_acquire_scm_rights(available).unwrap();
+        let admitted = CMsg::Rights {
+            fds: Vec::new(),
+            inflight_count: available,
+        };
+        assert_eq!(
+            try_acquire_scm_rights(1),
+            Err(AxError::from(LinuxError::ENOBUFS))
+        );
+        drop(admitted);
+        assert_eq!(SCM_RIGHTS_INFLIGHT.load(Ordering::Acquire), baseline);
     }
 }

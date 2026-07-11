@@ -550,4 +550,19 @@ mod tests {
         assert_eq!(owner, (1000, 200));
         assert_eq!(mode.bits(), 0o2670);
     }
+
+    #[test]
+    fn unix_socket_mode_uses_umask_and_sgid_parent_group() {
+        let parent = directory_metadata(0o2770, 10, 200);
+        let caller = credentials(1000, 100, &[300], &[]);
+        let (mode, owner) = initial_named_create_owner_mode(
+            &parent,
+            &caller,
+            NodeType::Socket,
+            NodePermission::from_bits_truncate(0o777),
+            0o027,
+        );
+        assert_eq!(mode.bits(), 0o750);
+        assert_eq!(owner, (1000, 200));
+    }
 }
