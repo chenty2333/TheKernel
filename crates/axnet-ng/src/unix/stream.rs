@@ -81,6 +81,8 @@ fn new_channels(
 const STREAM_READ_CLOSED: u8 = 1 << 0;
 const STREAM_WRITE_CLOSED: u8 = 1 << 1;
 const STREAM_BOTH_CLOSED: u8 = STREAM_READ_CLOSED | STREAM_WRITE_CLOSED;
+const STREAM_RESET_OCCURRED: u8 = 1 << 2;
+const STREAM_RESET_OBSERVED: u8 = 1 << 3;
 
 struct Channel {
     tx: Option<HeapProd<u8>>,
@@ -103,9 +105,18 @@ impl Channel {
             .fetch_or(STREAM_WRITE_CLOSED, Ordering::AcqRel);
     }
 
-    fn publish_close(&self) {
+    fn publish_orderly_close(&self) {
         self.local_close
             .fetch_or(STREAM_BOTH_CLOSED, Ordering::AcqRel);
+    }
+
+    fn publish_reset(&self) {
+        // Keep occurrence separate from observation. Drop publishes this once
+        // without waking, then the task-context finalizer repeats publication
+        // before waking. An SO_ERROR/recv consumer between those two points
+        // must not see ECONNRESET a second time.
+        self.local_close
+            .fetch_or(STREAM_BOTH_CLOSED | STREAM_RESET_OCCURRED, Ordering::AcqRel);
     }
 
     fn peer_read_closed(&self) -> bool {
@@ -118,8 +129,29 @@ impl Channel {
             || self.rx.as_ref().is_some_and(|rx| !rx.write_is_held())
     }
 
-    fn close_and_wake(self) {
-        self.publish_close();
+    fn peer_reset_pending(&self) -> bool {
+        let state = self.peer_close.load(Ordering::Acquire);
+        state & STREAM_RESET_OCCURRED != 0 && state & STREAM_RESET_OBSERVED == 0
+    }
+
+    fn take_peer_reset(&self) -> bool {
+        self.peer_close
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & STREAM_RESET_OCCURRED != 0 && state & STREAM_RESET_OBSERVED == 0)
+                    .then_some(state | STREAM_RESET_OBSERVED)
+            })
+            .is_ok()
+    }
+
+    fn close_orderly_and_wake(self) {
+        self.publish_orderly_close();
+        let poll_update = self.poll_update.clone();
+        drop(self);
+        poll_update.wake();
+    }
+
+    fn reset_and_wake(self) {
+        self.publish_reset();
         let poll_update = self.poll_update.clone();
         drop(self);
         poll_update.wake();
@@ -211,7 +243,7 @@ impl DeferredStreamCleanup {
             while drained < STREAM_CLEANUP_REQUEST_BUDGET {
                 match receiver.try_recv_deferred_wake() {
                     Ok((request, completion)) => {
-                        request.channel.close_and_wake();
+                        request.channel.reset_and_wake();
                         completion.complete();
                         drained += 1;
                     }
@@ -225,7 +257,7 @@ impl DeferredStreamCleanup {
             }
         }
         if let Some(channel) = self.channel.take() {
-            channel.close_and_wake();
+            channel.close_orderly_and_wake();
         }
         if let Some(poll_state) = self.poll_state.take() {
             poll_state.wake();
@@ -426,7 +458,7 @@ impl StreamTransport {
             for _ in 0..LISTEN_QUEUE_SIZE {
                 match receiver.try_recv_deferred_wake() {
                     Ok((request, completion)) => {
-                        request.channel.close_and_wake();
+                        request.channel.reset_and_wake();
                         completion.complete();
                     }
                     Err(TryRecvError::Empty | TryRecvError::Closed) => break,
@@ -448,6 +480,17 @@ impl Configurable for StreamTransport {
         use GetSocketOption as O;
 
         if self.general.get_option_inner(opt)? {
+            if let O::Error(error) = opt {
+                if **error == 0
+                    && self
+                        .channel
+                        .lock()
+                        .as_ref()
+                        .is_some_and(Channel::take_peer_reset)
+                {
+                    **error = LinuxError::ECONNRESET.code();
+                }
+            }
             return Ok(true);
         }
 
@@ -679,6 +722,9 @@ impl TransportOps for StreamTransport {
                 let Some(chan) = guard.as_mut() else {
                     return Err(AxError::NotConnected);
                 };
+                if chan.take_peer_reset() {
+                    return Err(AxError::ConnectionReset);
+                }
                 let peer_write_closed = chan.peer_write_closed();
                 let Some(rx) = chan.rx.as_mut() else {
                     return Ok(0);
@@ -745,6 +791,7 @@ impl Pollable for StreamTransport {
         if let Some(chan) = self.channel.lock().as_ref() {
             let peer_write_closed = chan.peer_write_closed();
             let peer_read_closed = chan.peer_read_closed();
+            let peer_reset_pending = chan.peer_reset_pending();
             events.set(
                 IoEvents::IN,
                 self.rx_closed.load(Ordering::Acquire)
@@ -759,7 +806,7 @@ impl Pollable for StreamTransport {
                         .as_ref()
                         .is_some_and(|tx| peer_read_closed || tx.vacant_len() > 0),
             );
-            events.set(IoEvents::ERR, peer_read_closed);
+            events.set(IoEvents::ERR, peer_reset_pending);
             events.set(IoEvents::RDHUP, peer_write_closed);
             events.set(IoEvents::HUP, peer_read_closed && peer_write_closed);
         } else if let Some(conn_rx) = self.conn_rx.lock().as_ref() {
@@ -775,7 +822,9 @@ impl Pollable for StreamTransport {
             .as_ref()
             .map(|channel| channel.poll_update.clone());
         if let Some(channel_poll) = channel_poll {
-            if events.intersects(IoEvents::IN | IoEvents::OUT) {
+            if events.intersects(
+                IoEvents::IN | IoEvents::OUT | IoEvents::ERR | IoEvents::HUP | IoEvents::RDHUP,
+            ) {
                 channel_poll.register(context.waker());
             }
         } else if events.contains(IoEvents::IN) {
@@ -793,10 +842,10 @@ impl Drop for StreamTransport {
         let retired_channel = self.channel.get_mut().take();
         let retired_receiver = self.conn_rx.get_mut().take();
         if let Some(channel) = retired_channel.as_ref() {
-            channel.publish_close();
+            channel.publish_orderly_close();
         }
         if let Some(receiver) = retired_receiver.as_ref() {
-            receiver.close_without_wake_and_visit(|request| request.channel.publish_close());
+            receiver.close_without_wake_and_visit(|request| request.channel.publish_reset());
         }
         let retired_poll_state = core::mem::replace(&mut self.poll_state, PollSet::new());
         // SAFETY: every constructor initializes this private field exactly
@@ -836,6 +885,18 @@ mod tests {
         credentials
     }
 
+    fn socket_error(transport: &StreamTransport) -> i32 {
+        let mut error = -1;
+        transport
+            .get_option(GetSocketOption::Error(&mut error))
+            .unwrap();
+        error
+    }
+
+    fn closed_stream_events() -> IoEvents {
+        IoEvents::IN | IoEvents::OUT | IoEvents::HUP | IoEvents::RDHUP
+    }
+
     #[test]
     fn unconnected_stream_reports_unknown_peer_credentials() {
         let transport = StreamTransport::new().unwrap();
@@ -855,15 +916,15 @@ mod tests {
         let wakes = Arc::new(AtomicUsize::new(0));
         let waker = Waker::from(Arc::new(CountingWake(wakes.clone())));
         let mut context = Context::from_waker(&waker);
-        left.register(&mut context, IoEvents::IN | IoEvents::OUT);
-        right.register(&mut context, IoEvents::IN | IoEvents::OUT);
+        // poll(2) must wake for its unconditional ERR/HUP interests even when
+        // user space did not request IN or OUT.
+        left.register(&mut context, IoEvents::ERR | IoEvents::HUP);
 
         drop(right);
         assert_eq!(wakes.load(Ordering::SeqCst), 0);
         let events = left.poll();
-        assert!(events.contains(IoEvents::RDHUP));
-        assert!(events.contains(IoEvents::ERR));
-        assert!(events.contains(IoEvents::HUP));
+        assert_eq!(events.bits(), closed_stream_events().bits());
+        assert_eq!(socket_error(&left), 0);
         assert_eq!(
             left.send(&b"x"[..], SendOptions::default()),
             Err(AxError::BrokenPipe)
@@ -873,6 +934,8 @@ mod tests {
             super::super::drain_deferred_receive_cleanup_work();
         }
         assert!(wakes.load(Ordering::SeqCst) > 0);
+        assert_eq!(left.poll().bits(), closed_stream_events().bits());
+        assert_eq!(socket_error(&left), 0);
 
         drop(left);
         while super::super::has_deferred_receive_cleanup_work() {
@@ -912,12 +975,27 @@ mod tests {
         drop(listener);
         assert_eq!(wakes.load(Ordering::SeqCst), 0);
         let immediate_events = client.poll();
-        assert!(immediate_events.contains(IoEvents::RDHUP));
-        assert!(immediate_events.contains(IoEvents::ERR));
-        assert!(immediate_events.contains(IoEvents::HUP));
+        assert_eq!(
+            immediate_events.bits(),
+            (closed_stream_events() | IoEvents::ERR).bits()
+        );
+        assert_eq!(socket_error(&client), LinuxError::ECONNRESET.code());
+        assert_eq!(socket_error(&client), 0);
+        assert_eq!(client.poll().bits(), closed_stream_events().bits());
         assert_eq!(
             client.send(&b"x"[..], SendOptions::default()),
             Err(AxError::BrokenPipe)
+        );
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            client.recv(
+                &mut byte[..],
+                RecvOptions {
+                    flags: RecvFlags::DONT_WAIT,
+                    ..RecvOptions::default()
+                }
+            ),
+            Ok(0)
         );
         while super::super::has_deferred_receive_cleanup_work() {
             super::super::drain_deferred_receive_cleanup_work();
@@ -925,9 +1003,70 @@ mod tests {
 
         assert!(wakes.load(Ordering::SeqCst) > 0);
         let events = client.poll();
-        assert!(events.contains(IoEvents::RDHUP));
-        assert!(events.contains(IoEvents::ERR));
-        assert!(events.contains(IoEvents::HUP));
+        assert_eq!(events.bits(), closed_stream_events().bits());
+        assert_eq!(socket_error(&client), 0);
+
+        drop(client);
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+    }
+
+    #[test]
+    fn listener_reset_is_consumed_once_by_recv_but_not_send() {
+        let _guard = super::super::UNIX_CLEANUP_TEST_LOCK.lock();
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+
+        let credentials = UnixCredentials::new(1, 2, 3);
+        let listener = StreamTransport::new().unwrap();
+        let slot = super::super::BindSlot::default();
+        let address = UnixSocketAddr::Path(Arc::new(alloc::string::String::from(
+            "/tmp/axnet-listener-reset-recv",
+        )));
+        listener.bind(&slot, &address).unwrap();
+        listener.listen(&slot, 1, credentials).unwrap();
+
+        let client = StreamTransport::new().unwrap();
+        client
+            .connect(&slot, &UnixSocketAddr::Unnamed, credentials)
+            .unwrap();
+        drop(listener);
+
+        assert_eq!(
+            client.poll().bits(),
+            (closed_stream_events() | IoEvents::ERR).bits()
+        );
+        assert_eq!(
+            client.send(&b"x"[..], SendOptions::default()),
+            Err(AxError::BrokenPipe)
+        );
+        assert!(client.poll().contains(IoEvents::ERR));
+
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            client.recv(
+                &mut byte[..],
+                RecvOptions {
+                    flags: RecvFlags::DONT_WAIT,
+                    ..RecvOptions::default()
+                }
+            ),
+            Err(AxError::ConnectionReset)
+        );
+        assert_eq!(client.poll().bits(), closed_stream_events().bits());
+        assert_eq!(
+            client.recv(
+                &mut byte[..],
+                RecvOptions {
+                    flags: RecvFlags::DONT_WAIT,
+                    ..RecvOptions::default()
+                }
+            ),
+            Ok(0)
+        );
+        assert_eq!(socket_error(&client), 0);
 
         drop(client);
         while super::super::has_deferred_receive_cleanup_work() {
