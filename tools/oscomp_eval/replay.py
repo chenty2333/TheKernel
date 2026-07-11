@@ -51,6 +51,7 @@ QEMU_MEMORY = "1G"
 QEMU_SMP = "1"
 SUPPORT_READY_MARKER = "#### OSCOMP SUPPORT READY ####"
 SUPPORT_FAILURE_MARKER = "#### OSCOMP SUPPORT STAGING FAILED"
+INTENTIONAL_STOP_RETURN_CODE = 75
 REPLAY_RECENT_KEEP = 5
 REPLAY_INTERVAL_KEEP = 10
 QEMU_TRACE_PRESETS = {
@@ -102,6 +103,14 @@ class ReplayResult:
     @property
     def interrupted(self) -> bool:
         return self.returncode in (130, -2)
+
+    @property
+    def intentionally_stopped(self) -> bool:
+        return (
+            self.returncode == INTENTIONAL_STOP_RETURN_CODE
+            and self.error_message is not None
+            and self.error_message.startswith("QEMU stopped after marker: ")
+        )
 
     @property
     def launch_failed(self) -> bool:
@@ -698,6 +707,7 @@ def wait_for_process(
     timeout_secs: int | None,
     idle_timeout_secs: int | None,
     interactive: bool,
+    stop_after_marker: str | None,
 ) -> tuple[int, str | None]:
     start = time.monotonic()
     last_output_at = start
@@ -712,6 +722,15 @@ def wait_for_process(
                 if interactive:
                     print(line, end="")
                 last_output_at = time.monotonic()
+                if (
+                    stop_after_marker is not None
+                    and line.rstrip("\r\n") == stop_after_marker
+                ):
+                    message = f"QEMU stopped after marker: {stop_after_marker}"
+                    terminate_process_group(process, signal.SIGKILL)
+                    process.wait()
+                    process.stdout.close()
+                    return INTENTIONAL_STOP_RETURN_CODE, message
 
         returncode = process.poll()
         if returncode is not None:
@@ -759,6 +778,7 @@ def run_qemu(
     timeout_secs: int | None,
     idle_timeout_secs: int | None,
     interactive: bool = False,
+    stop_after_marker: str | None = None,
     qemu_debug: str | None = None,
     qemu_debug_log_path: Path | None = None,
 ) -> ReplayResult:
@@ -785,6 +805,7 @@ def run_qemu(
                 timeout_secs=timeout_secs,
                 idle_timeout_secs=idle_timeout_secs,
                 interactive=interactive,
+                stop_after_marker=stop_after_marker,
             )
     except KeyboardInterrupt:
         try:
@@ -823,6 +844,7 @@ def run_replay(
     keep_workdir: bool = False,
     interactive: bool = False,
     extra_block_image: Path | None = None,
+    stop_after_marker: str | None = None,
     verbose: bool = False,
     workdir_override: Path | None = None,
     log_path_override: Path | None = None,
@@ -831,6 +853,10 @@ def run_replay(
     qemu_debug_log_path: Path | None = None,
 ) -> ReplayResult:
     selected_arch = normalize_arch(arch)
+    if stop_after_marker is not None and (
+        not stop_after_marker or "\n" in stop_after_marker or "\r" in stop_after_marker
+    ):
+        raise ReplayError("stop-after marker must be one non-empty console line")
     root = repo_root()
     if not skip_kernel_build:
         subprocess.run(["make", kernel_name(selected_arch)], cwd=root, check=True)
@@ -879,6 +905,7 @@ def run_replay(
         timeout_secs=timeout_secs,
         idle_timeout_secs=idle_timeout_secs,
         interactive=interactive,
+        stop_after_marker=stop_after_marker,
         qemu_debug=qemu_debug,
         qemu_debug_log_path=qemu_debug_log_path,
     )
@@ -1344,6 +1371,7 @@ def qemu_cmd(args: argparse.Namespace) -> int:
             keep_workdir=args.keep_workdir,
             interactive=args.interactive,
             extra_block_image=Path(args.extra_block_image).expanduser() if args.extra_block_image else None,
+            stop_after_marker=args.stop_after_marker,
             verbose=args.verbose or truthy(os.environ.get("OSCOMP_REPLAY_VERBOSE")),
             workdir_override=Path(args.workdir).expanduser() if args.workdir else None,
             log_path_override=log_path,
@@ -1356,6 +1384,8 @@ def qemu_cmd(args: argparse.Namespace) -> int:
         return 130
     if result.timed_out:
         return 124
+    if result.intentionally_stopped and args.stop_after_marker:
+        return INTENTIONAL_STOP_RETURN_CODE
     return 0 if result.ok else 1
 
 
@@ -1411,6 +1441,10 @@ def build_parser() -> argparse.ArgumentParser:
     qemu_parser.add_argument("--image", help="official testsuite image override")
     qemu_parser.add_argument("--support-image", help="support disk image override")
     qemu_parser.add_argument("--extra-block-image", help="additional writable raw block image")
+    qemu_parser.add_argument(
+        "--stop-after-marker",
+        help="abruptly kill QEMU after an exact console marker and return 75",
+    )
     qemu_parser.add_argument("--timeout", type=int, default=REPLAY_TIMEOUT_FULL_SECS)
     qemu_parser.add_argument("--idle-timeout", type=int)
     qemu_parser.add_argument("--workdir", help="temporary run directory")

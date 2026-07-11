@@ -4,6 +4,7 @@ import contextlib
 import gzip
 import io
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +21,7 @@ from tools.oscomp_eval.replay import (
     gc_replay_runs,
     prepare_image,
     qemu_trace_flags,
+    run_qemu,
     replay_root,
     run_replay,
     score_with_extra_issues,
@@ -201,6 +203,29 @@ class ReplayRunTests(unittest.TestCase):
             self.assertTrue(result.launch_failed)
             self.assertEqual(result.error_message, "replay launch failed: missing qemu")
             self.assertEqual(result.log_path.read_text(encoding="utf-8"), "")
+
+    def test_run_qemu_can_abruptly_stop_after_exact_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = "CI_FS_POWERCUT_ARMED"
+            result = run_qemu(
+                arch="rv",
+                command=(
+                    sys.executable,
+                    "-c",
+                    "import time; print('CI_FS_POWERCUT_ARMED', flush=True); time.sleep(30)",
+                ),
+                log_path=root / "qemu.log",
+                workdir=root,
+                timeout_secs=10,
+                idle_timeout_secs=None,
+                stop_after_marker=marker,
+            )
+
+            self.assertEqual(result.returncode, 75)
+            self.assertTrue(result.intentionally_stopped)
+            self.assertEqual(result.error_message, f"QEMU stopped after marker: {marker}")
+            self.assertEqual(result.log_path.read_text(encoding="utf-8"), f"{marker}\n")
 
 
 class EvaluateHelpersTests(unittest.TestCase):

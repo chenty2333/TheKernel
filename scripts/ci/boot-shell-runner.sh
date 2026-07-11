@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 8 ]; then
-    printf 'Usage: %s ARCH KERNEL IMAGE WORKDIR COMMANDS TIMEOUT BOOT_WAIT LINE_DELAY\n' \
-        "$(basename "$0")" >&2
+if [ "$#" -lt 8 ] || [ "$#" -gt 11 ]; then
+    printf '%s\n' \
+        "Usage: $(basename "$0") ARCH KERNEL IMAGE WORKDIR COMMANDS TIMEOUT" \
+        '       BOOT_WAIT LINE_DELAY [SUPPORT_IMAGE [EXTRA_BLOCK_IMAGE [STOP_MARKER]]]' >&2
     exit 2
 fi
 
@@ -15,6 +16,23 @@ commands=$5
 timeout_secs=$6
 boot_wait_secs=$7
 line_delay_secs=$8
+support_image=${9:-}
+extra_block_image=${10:-}
+stop_marker=${11:-}
+
+replay_args=(
+    --arch "$arch"
+    --kernel "$kernel"
+    --image "$image"
+    --timeout "$timeout_secs"
+    --workdir "$workdir"
+    --keep-workdir
+    --skip-kernel-build
+    --interactive
+)
+[ -z "$support_image" ] || replay_args+=(--support-image "$support_image")
+[ -z "$extra_block_image" ] || replay_args+=(--extra-block-image "$extra_block_image")
+[ -z "$stop_marker" ] || replay_args+=(--stop-after-marker "$stop_marker")
 
 set +e
 (
@@ -24,14 +42,7 @@ set +e
         sleep "$line_delay_secs"
     done <"$commands"
 ) | python3 -m tools.oscomp_eval.replay qemu \
-    --arch "$arch" \
-    --kernel "$kernel" \
-    --image "$image" \
-    --timeout "$timeout_secs" \
-    --workdir "$workdir" \
-    --keep-workdir \
-    --skip-kernel-build \
-    --interactive
+    "${replay_args[@]}"
 pipeline_status=("${PIPESTATUS[@]}")
 set -e
 
