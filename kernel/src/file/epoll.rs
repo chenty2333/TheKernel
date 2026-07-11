@@ -1230,6 +1230,12 @@ impl FileLike for Epoll {
     fn path(&self) -> Cow<'_, str> {
         "anon_inode:[eventpoll]".into()
     }
+
+    fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+        // epoll_wait's timeout controls waiting. The OFD nevertheless retains
+        // O_NONBLOCK just as Linux's generic struct file does.
+        Ok(())
+    }
 }
 
 impl Pollable for Epoll {

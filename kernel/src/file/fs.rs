@@ -380,6 +380,12 @@ impl FileLike for Directory {
         super::inode_flags::ioctl(&self.inner, cmd, arg).unwrap_or(Err(AxError::NotATty))
     }
 
+    fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+        // Directories never block in this implementation. FileDescription
+        // still records O_NONBLOCK for F_GETFL and dup-shared OFD semantics.
+        Ok(())
+    }
+
     fn path(&self) -> Cow<'_, str> {
         path_for(&self.inner)
     }

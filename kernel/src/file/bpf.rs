@@ -38,6 +38,11 @@ impl FileLike for BpfMapFd {
     fn path(&self) -> Cow<'_, str> {
         "anon_inode:bpf-map".into()
     }
+
+    fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+        // The map fd has no blocking file operation; the OFD owns the flag.
+        Ok(())
+    }
 }
 
 impl Pollable for BpfMapFd {
@@ -69,6 +74,11 @@ impl FileLike for BpfProgFd {
 
     fn path(&self) -> Cow<'_, str> {
         "anon_inode:bpf-prog".into()
+    }
+
+    fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+        // The program fd has no blocking file operation; the OFD owns the flag.
+        Ok(())
     }
 }
 

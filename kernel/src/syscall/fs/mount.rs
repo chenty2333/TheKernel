@@ -174,6 +174,12 @@ impl FileLike for FsOpenFd {
     fn path(&self) -> Cow<'_, str> {
         "anon_inode:[fsopen]".into()
     }
+
+    fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+        // fsconfig operations are synchronous; FileDescription stores the
+        // status bit for generic fcntl semantics.
+        Ok(())
+    }
 }
 
 impl Pollable for FsOpenFd {
@@ -546,6 +552,11 @@ impl FileLike for FsMountFd {
 
     fn path(&self) -> Cow<'_, str> {
         "anon_inode:[fsmount]".into()
+    }
+
+    fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+        // This detached mount handle has no blocking data operation.
+        Ok(())
     }
 }
 

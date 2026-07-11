@@ -170,9 +170,12 @@ pub trait FileLike: Pollable + DowncastSync {
         false
     }
 
-    fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
-        Ok(())
-    }
+    /// Applies the object-specific part of an `O_NONBLOCK` transition.
+    ///
+    /// The open-file-description owns the status flag. Implementations whose
+    /// I/O semantics do not depend on it must still opt in explicitly instead
+    /// of inheriting a silent-success default.
+    fn set_nonblocking(&self, nonblocking: bool) -> AxResult;
 
     fn from_fd(fd: c_int) -> AxResult<FileHandle<Self>>
     where

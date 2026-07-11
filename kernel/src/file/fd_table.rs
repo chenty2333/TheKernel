@@ -746,6 +746,10 @@ mod tests {
         fn path(&self) -> Cow<'_, str> {
             Cow::Borrowed("drop-counting-file")
         }
+
+        fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+            Ok(())
+        }
     }
 
     impl Pollable for LockOrderFile {
@@ -763,6 +767,10 @@ mod tests {
 
         fn path(&self) -> Cow<'_, str> {
             Cow::Borrowed("lock-order-file")
+        }
+
+        fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+            Ok(())
         }
     }
 

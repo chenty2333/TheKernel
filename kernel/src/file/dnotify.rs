@@ -624,6 +624,10 @@ mod tests {
         fn path(&self) -> Cow<'_, str> {
             Cow::Borrowed("dnotify-test")
         }
+
+        fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+            Ok(())
+        }
     }
 
     fn description() -> Arc<FileDescription> {
