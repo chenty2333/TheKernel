@@ -67,6 +67,23 @@ bitflags! {
         /// generated dynamically. Pathwalk policy can distinguish the semantic
         /// capability without depending on filesystem names or path strings.
         const MAGIC_LINK = 0x0010;
+
+        /// O_APPEND writes use the open file description's current position
+        /// instead of asking the inode to discover a persistent end offset.
+        /// This is required by proc controls whose only writable position is
+        /// zero and whose successful write advances that OFD position.
+        const POSITIONED_APPEND = 0x0020;
+
+        /// I/O on this node requires the immutable credential captured by the
+        /// open file description. Higher layers may skip credential-context
+        /// installation for every other node.
+        const OPEN_CREDENTIAL = 0x0040;
+
+        /// Explicit-offset writes are not supported even though ordinary
+        /// writes advance an open file description position. Linux proc
+        /// controls with a legacy `.write` operation have this shape: lseek
+        /// and pread may work, while pwrite must fail with `ESPIPE`.
+        const NO_POSITIONED_WRITE = 0x0080;
     }
 }
 
@@ -99,6 +116,15 @@ pub trait NodeOps: Send + Sync + 'static {
     /// Returns the flags of the node.
     fn flags(&self) -> NodeFlags {
         NodeFlags::empty()
+    }
+
+    /// Admits one open before a high-level file backend is constructed.
+    ///
+    /// Dynamic filesystems can use this to enforce open-time policy which
+    /// cannot be reconstructed from a later read or write. `O_PATH`-style
+    /// handles call this with both access bits clear.
+    fn open(&self, _read: bool, _write: bool) -> VfsResult<()> {
+        Ok(())
     }
 
     /// Returns backend state whose lifetime follows one stable inode
@@ -228,6 +254,26 @@ impl Reference {
             anonymous_id: None,
             path_hash,
         }
+    }
+
+    /// Fallibly constructs a path reference for a userspace-triggered lookup.
+    pub fn try_new(parent: Option<DirEntry>, name: &str) -> VfsResult<Self> {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        let mut owned_name = String::new();
+        owned_name
+            .try_reserve_exact(name.len())
+            .map_err(|_| VfsError::NoMemory)?;
+        owned_name.push_str(name);
+        let parent_hash = parent
+            .as_ref()
+            .map_or(FNV_OFFSET, |parent| parent.0.reference.path_hash);
+        let path_hash = Self::extend_path_hash(parent_hash, &owned_name);
+        Ok(Self {
+            parent,
+            name: owned_name,
+            anonymous_id: None,
+            path_hash,
+        })
     }
 
     pub fn root() -> Self {
@@ -650,6 +696,8 @@ impl DirEntry {
     pub fn len(&self) -> VfsResult<u64>;
 
     pub fn flags(&self) -> NodeFlags;
+
+    pub fn open(&self, read: bool, write: bool) -> VfsResult<()>;
 
     pub fn sync(&self, data_only: bool) -> VfsResult<()>;
 }

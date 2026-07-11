@@ -12,6 +12,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
+use axfs_ng_vfs::NodeFlags;
 use axpoll::{IoEvents, Pollable};
 use axtask::{WeakAxTaskRef, current, current_may_uninit};
 use linux_raw_sys::general::{
@@ -25,13 +26,15 @@ use starry_signal::{SignalInfo, Signo};
 use super::{
     executable::{self, ExecutableKey},
     fanotify::FanotifyFile,
-    flock, lease,
+    flock,
+    fs::File,
+    lease,
     types::{FileLike, IoDst, IoSrc, Kstat},
 };
 use crate::{
     deferred_work::DeferredWorkAccount,
     task::{
-        AsThread, Cred, ProcessData, get_process_data, get_process_group, get_visible_task,
+        AsThread, Cred, ProcessData, Thread, get_process_data, get_process_group, get_visible_task,
         send_queued_signal_thread_inner, send_queued_signal_to_process_data,
         send_signal_thread_inner, send_signal_to_process_data,
     },
@@ -279,10 +282,6 @@ impl FileDescriptionId {
     }
 }
 
-scope_local::scope_local! {
-    pub static FILE_WRITE_CREDENTIALS: Option<OpenCredentials> = None;
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct OpenCredentials {
     pub uid: u32,
@@ -324,7 +323,19 @@ impl OpenCredentials {
 }
 
 pub fn current_file_write_credentials() -> Option<OpenCredentials> {
-    *FILE_WRITE_CREDENTIALS
+    current_may_uninit().and_then(|task| {
+        task.try_as_thread()
+            .and_then(Thread::file_write_credentials)
+    })
+}
+
+/// Returns the immutable Linux security credential captured by the open file
+/// description whose write operation is currently executing.
+pub(crate) fn current_file_operation_security_credential() -> Option<Arc<Cred>> {
+    current_may_uninit().and_then(|task| {
+        task.try_as_thread()
+            .and_then(Thread::file_operation_credential)
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -619,6 +630,7 @@ pub(crate) fn send_sigio(state: &AsyncIoState, fd: i32, reason: u32) {
 pub struct FileDescription {
     pub inner: Arc<dyn FileLike>,
     open_credentials: OpenCredentials,
+    open_security_credential: Option<Arc<Cred>>,
     id: FileDescriptionId,
     status_flags: AtomicU32,
     async_io: Mutex<AsyncIoState>,
@@ -684,9 +696,22 @@ impl FileDescription {
         let write_open_key = write_open_rollback.transfer();
         cleanup_work.write_open_key = write_open_key;
         cleanup_work.resource = resource;
+        let needs_open_security_credential = inner.downcast_ref::<File>().is_some_and(|file| {
+            file.inner()
+                .location()
+                .flags()
+                .contains(NodeFlags::OPEN_CREDENTIAL)
+        });
+        let open_security_credential = needs_open_security_credential
+            .then(|| {
+                current_may_uninit()
+                    .and_then(|task| task.try_as_thread().map(|thread| thread.current_cred()))
+            })
+            .flatten();
         Arc::try_new(Self {
             inner,
             open_credentials: OpenCredentials::current(),
+            open_security_credential,
             id,
             status_flags: AtomicU32::new(status_flags),
             async_io: Mutex::new(AsyncIoState::default()),
@@ -707,6 +732,10 @@ impl FileDescription {
 
     pub fn open_credentials(&self) -> OpenCredentials {
         self.open_credentials
+    }
+
+    pub(crate) fn open_security_credential(&self) -> Option<Arc<Cred>> {
+        self.open_security_credential.clone()
     }
 
     pub fn status_flags(&self) -> u32 {
@@ -833,24 +862,62 @@ impl<T: ?Sized> AsRef<T> for FileHandle<T> {
     }
 }
 
+struct RestoreOnDrop<T, F: FnMut(T)> {
+    previous: Option<T>,
+    restore: F,
+}
+
+impl<T, F: FnMut(T)> RestoreOnDrop<T, F> {
+    fn new(previous: T, restore: F) -> Self {
+        Self {
+            previous: Some(previous),
+            restore,
+        }
+    }
+}
+
+impl<T, F: FnMut(T)> Drop for RestoreOnDrop<T, F> {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            (self.restore)(previous);
+        }
+    }
+}
+
 impl<T: ?Sized> FileHandle<T> {
     pub fn status_flags(&self) -> u32 {
         self.description.status_flags()
     }
 
+    fn with_security_credential<R>(&self, f: impl FnOnce() -> R) -> R {
+        let Some(security_credential) = self.description.open_security_credential() else {
+            return f();
+        };
+        let current = current();
+        let thread = current.as_thread();
+        let previous = thread.replace_file_operation_credential(Some(security_credential));
+        let _guard = RestoreOnDrop::new(previous, |previous| {
+            // `replace_file_operation_credential` releases its spin guard
+            // before returning the displaced Arc, so its destructor cannot
+            // run while the slot is locked.
+            drop(thread.replace_file_operation_credential(previous));
+        });
+        f()
+    }
+
+    pub fn with_read_credentials<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.with_security_credential(f)
+    }
+
     pub fn with_write_credentials<R>(&self, f: impl FnOnce() -> R) -> R {
         let credentials = self.description.open_credentials();
-        let previous = current().as_thread().with_mut_scope(|scope| {
-            let mut slot = FILE_WRITE_CREDENTIALS.scope_mut(scope);
-            let previous = *slot;
-            *slot = Some(credentials);
-            previous
+        let current = current();
+        let thread = current.as_thread();
+        let previous = thread.replace_file_write_credentials(Some(credentials));
+        let _guard = RestoreOnDrop::new(previous, |previous| {
+            let _ = thread.replace_file_write_credentials(previous);
         });
-        let result = f();
-        current().as_thread().with_mut_scope(|scope| {
-            *FILE_WRITE_CREDENTIALS.scope_mut(scope) = previous;
-        });
-        result
+        self.with_security_credential(f)
     }
 }
 
@@ -862,7 +929,28 @@ pub struct FileDescriptor {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+
+    #[test]
+    fn restore_guard_unwinds_nested_overrides_in_lifo_order() {
+        let value = core::cell::Cell::new(1u32);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let previous = value.replace(2);
+            let _outer = RestoreOnDrop::new(previous, |previous| value.set(previous));
+            {
+                let previous = value.replace(3);
+                let _inner = RestoreOnDrop::new(previous, |previous| value.set(previous));
+                assert_eq!(value.get(), 3);
+            }
+            assert_eq!(value.get(), 2);
+            panic!("exercise unwind restoration");
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(value.get(), 1);
+    }
 
     fn pop_local_cleanup(head: &mut *mut DescriptionCleanupWork) -> Box<DescriptionCleanupWork> {
         let current = *head;

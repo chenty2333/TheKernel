@@ -22,69 +22,101 @@ use crate::{
 };
 
 pub fn sys_getuid() -> AxResult<isize> {
-    Ok(current().as_thread().uid() as isize)
+    let cred = current().as_thread().current_cred();
+    Ok(cred.user_ns().from_kuid_munged(cred.ids().ruid) as isize)
 }
 
 pub fn sys_geteuid() -> AxResult<isize> {
-    Ok(current().as_thread().euid() as isize)
+    let cred = current().as_thread().current_cred();
+    Ok(cred.user_ns().from_kuid_munged(cred.ids().euid) as isize)
 }
 
 pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> AxResult<isize> {
     let curr = current();
-    let ids = curr.as_thread().current_cred().ids();
+    let cred = curr.as_thread().current_cred();
+    let ids = cred.ids();
+    let namespace = cred.user_ns();
     if !ruid.is_null() {
-        ruid.vm_write(ids.ruid)?;
+        ruid.vm_write(namespace.from_kuid_munged(ids.ruid))?;
     }
     if !euid.is_null() {
-        euid.vm_write(ids.euid)?;
+        euid.vm_write(namespace.from_kuid_munged(ids.euid))?;
     }
     if !suid.is_null() {
-        suid.vm_write(ids.suid)?;
+        suid.vm_write(namespace.from_kuid_munged(ids.suid))?;
     }
     Ok(0)
 }
 
 pub fn sys_getgid() -> AxResult<isize> {
-    Ok(current().as_thread().gid() as isize)
+    let cred = current().as_thread().current_cred();
+    Ok(cred.user_ns().from_kgid_munged(cred.ids().rgid) as isize)
 }
 
 pub fn sys_getegid() -> AxResult<isize> {
-    Ok(current().as_thread().egid() as isize)
+    let cred = current().as_thread().current_cred();
+    Ok(cred.user_ns().from_kgid_munged(cred.ids().egid) as isize)
 }
 
 pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> AxResult<isize> {
     let curr = current();
-    let ids = curr.as_thread().current_cred().ids();
+    let cred = curr.as_thread().current_cred();
+    let ids = cred.ids();
+    let namespace = cred.user_ns();
     if !rgid.is_null() {
-        rgid.vm_write(ids.rgid)?;
+        rgid.vm_write(namespace.from_kgid_munged(ids.rgid))?;
     }
     if !egid.is_null() {
-        egid.vm_write(ids.egid)?;
+        egid.vm_write(namespace.from_kgid_munged(ids.egid))?;
     }
     if !sgid.is_null() {
-        sgid.vm_write(ids.sgid)?;
+        sgid.vm_write(namespace.from_kgid_munged(ids.sgid))?;
     }
     Ok(0)
 }
 
 pub fn sys_setuid(uid: u32) -> AxResult<isize> {
     debug!("sys_setuid <= uid: {uid}");
-    current().as_thread().setuid(uid)?;
+    let curr = current();
+    let cred = curr.as_thread().current_cred();
+    let uid = cred.user_ns().make_kuid(uid).ok_or(AxError::InvalidInput)?;
+    curr.as_thread().setuid(uid)?;
     Ok(0)
 }
 
 pub fn sys_setgid(gid: u32) -> AxResult<isize> {
     debug!("sys_setgid <= gid: {gid}");
-    current().as_thread().setgid(gid)?;
+    let curr = current();
+    let cred = curr.as_thread().current_cred();
+    let gid = cred.user_ns().make_kgid(gid).ok_or(AxError::InvalidInput)?;
+    curr.as_thread().setgid(gid)?;
     Ok(0)
 }
 
 pub fn sys_setfsuid(fsuid: u32) -> AxResult<isize> {
-    Ok(current().as_thread().setfsuid(fsuid)? as isize)
+    let curr = current();
+    let thread = curr.as_thread();
+    let cred = thread.current_cred();
+    let namespace = cred.user_ns().clone();
+    let old = namespace.from_kuid_munged(cred.ids().fsuid);
+    let Some(fsuid) = namespace.make_kuid(fsuid) else {
+        return Ok(old as isize);
+    };
+    let old = thread.setfsuid(fsuid)?;
+    Ok(namespace.from_kuid_munged(old) as isize)
 }
 
 pub fn sys_setfsgid(fsgid: u32) -> AxResult<isize> {
-    Ok(current().as_thread().setfsgid(fsgid)? as isize)
+    let curr = current();
+    let thread = curr.as_thread();
+    let cred = thread.current_cred();
+    let namespace = cred.user_ns().clone();
+    let old = namespace.from_kgid_munged(cred.ids().fsgid);
+    let Some(fsgid) = namespace.make_kgid(fsgid) else {
+        return Ok(old as isize);
+    };
+    let old = thread.setfsgid(fsgid)?;
+    Ok(namespace.from_kgid_munged(old) as isize)
 }
 
 pub fn sys_getgroups(size: usize, list: *mut u32) -> AxResult<isize> {
@@ -98,7 +130,16 @@ pub fn sys_getgroups(size: usize, list: *mut u32) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
     if !groups.is_empty() {
-        vm_write_slice(list, groups)?;
+        let mut visible = Vec::new();
+        visible
+            .try_reserve_exact(groups.len())
+            .map_err(|_| AxError::NoMemory)?;
+        visible.extend(
+            groups
+                .iter()
+                .map(|gid| cred.user_ns().from_kgid_munged(*gid)),
+        );
+        vm_write_slice(list, &visible)?;
     }
     Ok(groups.len() as isize)
 }
@@ -108,20 +149,26 @@ pub fn sys_setgroups(size: usize, list: *const u32) -> AxResult<isize> {
     // Reject the common unauthorized case before copying/sorting a bounded
     // user array. `set_supplementary_groups` rechecks under the writer mutex,
     // so this early check is only a cost guard, not the authorization point.
-    if !curr
-        .as_thread()
-        .has_effective_capability(linux_raw_sys::general::CAP_SETGID)
+    let cred = curr.as_thread().current_cred();
+    if !cred.has_effective_capability_in_own_user_ns(linux_raw_sys::general::CAP_SETGID)
+        || !cred.user_ns().may_setgroups()
     {
         return Err(AxError::OperationNotPermitted);
     }
     if size > NGROUPS_MAX as usize {
         return Err(AxError::InvalidInput);
     }
-    let groups = if size == 0 {
+    let mut groups = if size == 0 {
         vec![]
     } else {
         vm_load(list, size)?
     };
+    for gid in &mut groups {
+        *gid = cred
+            .user_ns()
+            .make_kgid(*gid)
+            .ok_or(AxError::InvalidInput)?;
+    }
     curr.as_thread().set_supplementary_groups(groups)?;
     Ok(0)
 }

@@ -16,7 +16,7 @@ use starry_signal::{
 
 use super::{
     AsThread, ContinueResult, Cred, ProcessData, Thread, acknowledge_posix_timer_signal, do_exit,
-    get_process_data, get_process_group, get_task, get_visible_task,
+    get_process_data, get_process_group, get_task, get_visible_task, idmap::Kuid,
 };
 
 fn notify_tracer_or_parent_stop_continue(proc_data: &ProcessData) {
@@ -182,10 +182,8 @@ fn prepare_signal_for_target(
         return Ok(PreparedSignal::unqueued(info));
     }
     let limit = target.rlim.read()[RLIMIT_SIGPENDING].current;
-    match target_cred
-        .user_ns()
-        .try_signal_queue_accounts(target_cred.ids().ruid)
-    {
+    let real_uid = Kuid::from_raw(target_cred.ids().ruid).ok_or(AxError::InvalidInput)?;
+    match target_cred.user_ns().try_signal_queue_accounts(real_uid) {
         Ok((per_user, global)) => {
             prepare_signal_with_accounts(info, policy, limit, &per_user, &global)
         }

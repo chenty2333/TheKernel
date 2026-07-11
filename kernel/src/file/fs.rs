@@ -270,7 +270,12 @@ impl FileLike for File {
         let mut limited = None;
         if len != 0 {
             let appending = inner.flags().contains(axfs::FileFlags::APPEND);
-            let offset = if appending {
+            let inode_append = appending
+                && !inner
+                    .location()
+                    .flags()
+                    .contains(NodeFlags::POSITIONED_APPEND);
+            let offset = if inode_append {
                 inner.location().len()?
             } else {
                 let mut file = inner;

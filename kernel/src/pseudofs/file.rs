@@ -152,6 +152,21 @@ impl SimpleFile {
         Self::new(fs, NodeType::RegularFile, ops)
     }
 
+    /// Fallibly creates a dynamic regular file whose reads/writes consume the
+    /// immutable credential stored in its open file description.
+    pub fn try_new_regular_with_open_credential(
+        fs: Arc<SimpleFs>,
+        ops: impl SimpleFileOps,
+    ) -> VfsResult<Arc<Self>> {
+        Self::try_new_with_permission_and_flags(
+            fs,
+            NodeType::RegularFile,
+            NodePermission::default(),
+            NodeFlags::NON_CACHEABLE | NodeFlags::OPEN_CREDENTIAL,
+            ops,
+        )
+    }
+
     /// Creates a regular file from given file operations and permissions.
     pub fn new_regular_with_permission(
         fs: Arc<SimpleFs>,

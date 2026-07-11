@@ -41,7 +41,11 @@ impl Thread {
         // owner before entering the credential writer transaction.
         let groups = GroupInfo::try_new(groups)?;
         let mut update = self.credential.prepare();
-        if !update.old().has_effective_capability(CAP_SETGID) {
+        if !update.old().user_ns().may_setgroups()
+            || !update
+                .old()
+                .has_effective_capability_in_own_user_ns(CAP_SETGID)
+        {
             return Err(AxError::OperationNotPermitted);
         }
         if update.old().groups().as_slice() == groups.as_slice() {
@@ -120,6 +124,7 @@ impl Thread {
             credentials.fsgid,
             cred.groups().clone(),
             capabilities.effective,
+            cred.user_ns().is_initial(),
         )
     }
 
@@ -145,7 +150,13 @@ impl Thread {
             };
             (credentials.ruid, credentials.rgid, capability_set)
         };
-        DacCredentialView::new(uid, gid, cred.groups().clone(), capability_set)
+        DacCredentialView::new(
+            uid,
+            gid,
+            cred.groups().clone(),
+            capability_set,
+            cred.user_ns().is_initial(),
+        )
     }
 
     pub fn has_effective_capability(&self, cap: u32) -> bool {
@@ -161,7 +172,10 @@ impl Thread {
 
     pub fn drop_bounding_capability(&self, cap: u32) -> AxResult<()> {
         let mut update = self.credential.prepare();
-        if !update.old().has_effective_capability(CAP_SETPCAP) {
+        if !update
+            .old()
+            .has_effective_capability_in_own_user_ns(CAP_SETPCAP)
+        {
             return Err(AxError::OperationNotPermitted);
         }
         update.builder.caps.drop_bounding(cap)?;
@@ -215,7 +229,10 @@ impl Thread {
 
     pub fn set_securebits(&self, securebits: u32) -> AxResult<()> {
         let mut update = self.credential.prepare();
-        if !update.old().has_effective_capability(CAP_SETPCAP) {
+        if !update
+            .old()
+            .has_effective_capability_in_own_user_ns(CAP_SETPCAP)
+        {
             return Err(AxError::OperationNotPermitted);
         }
         if update.builder.caps.securebits == securebits {
@@ -330,7 +347,9 @@ impl Thread {
 
     pub fn setuid(&self, uid: u32) -> AxResult<()> {
         let mut update = self.credential.prepare();
-        let can_setuid = update.old().has_effective_capability(CAP_SETUID);
+        let can_setuid = update
+            .old()
+            .has_effective_capability_in_own_user_ns(CAP_SETUID);
         let old = update.builder.ids;
         if can_setuid {
             update.builder.ids.ruid = uid;
@@ -361,7 +380,9 @@ impl Thread {
 
     pub fn setgid(&self, gid: u32) -> AxResult<()> {
         let mut update = self.credential.prepare();
-        let can_setgid = update.old().has_effective_capability(CAP_SETGID);
+        let can_setgid = update
+            .old()
+            .has_effective_capability_in_own_user_ns(CAP_SETGID);
         let old = update.builder.ids;
         if can_setgid {
             update.builder.ids.rgid = gid;
@@ -382,7 +403,9 @@ impl Thread {
 
     pub fn setreuid(&self, ruid: Option<u32>, euid: Option<u32>) -> AxResult<()> {
         let mut update = self.credential.prepare();
-        let can_setuid = update.old().has_effective_capability(CAP_SETUID);
+        let can_setuid = update
+            .old()
+            .has_effective_capability_in_own_user_ns(CAP_SETUID);
         let old = update.builder.ids;
         if !can_setuid {
             if let Some(id) = ruid
@@ -415,7 +438,9 @@ impl Thread {
 
     pub fn setregid(&self, rgid: Option<u32>, egid: Option<u32>) -> AxResult<()> {
         let mut update = self.credential.prepare();
-        let can_setgid = update.old().has_effective_capability(CAP_SETGID);
+        let can_setgid = update
+            .old()
+            .has_effective_capability_in_own_user_ns(CAP_SETGID);
         let old = update.builder.ids;
         if !can_setgid {
             if let Some(id) = rgid
@@ -452,7 +477,9 @@ impl Thread {
         suid: Option<u32>,
     ) -> AxResult<()> {
         let mut update = self.credential.prepare();
-        let can_setuid = update.old().has_effective_capability(CAP_SETUID);
+        let can_setuid = update
+            .old()
+            .has_effective_capability_in_own_user_ns(CAP_SETUID);
         let old = update.builder.ids;
         if !can_setuid {
             for id in [ruid, euid, suid].into_iter().flatten() {
@@ -484,7 +511,9 @@ impl Thread {
         sgid: Option<u32>,
     ) -> AxResult<()> {
         let mut update = self.credential.prepare();
-        let can_setgid = update.old().has_effective_capability(CAP_SETGID);
+        let can_setgid = update
+            .old()
+            .has_effective_capability_in_own_user_ns(CAP_SETGID);
         let old = update.builder.ids;
         if !can_setgid {
             for id in [rgid, egid, sgid].into_iter().flatten() {
@@ -510,7 +539,9 @@ impl Thread {
 
     pub fn setfsuid(&self, fsuid: u32) -> AxResult<u32> {
         let mut update = self.credential.prepare();
-        let can_setuid = update.old().has_effective_capability(CAP_SETUID);
+        let can_setuid = update
+            .old()
+            .has_effective_capability_in_own_user_ns(CAP_SETUID);
         let old_fsuid = update.builder.ids.fsuid;
         if fsuid == u32::MAX {
             return Ok(old_fsuid);
@@ -537,7 +568,9 @@ impl Thread {
 
     pub fn setfsgid(&self, fsgid: u32) -> AxResult<u32> {
         let mut update = self.credential.prepare();
-        let can_setgid = update.old().has_effective_capability(CAP_SETGID);
+        let can_setgid = update
+            .old()
+            .has_effective_capability_in_own_user_ns(CAP_SETGID);
         let old_fsgid = update.builder.ids.fsgid;
         if fsgid == u32::MAX {
             return Ok(old_fsgid);

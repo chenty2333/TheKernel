@@ -829,6 +829,8 @@ impl Location {
 
     pub fn flags(&self) -> NodeFlags;
 
+    pub fn open(&self, read: bool, write: bool) -> VfsResult<()>;
+
     pub fn user_data(&self) -> MutexGuard<'_, TypeMap>;
 }
 

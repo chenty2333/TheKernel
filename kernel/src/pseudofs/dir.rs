@@ -1,10 +1,4 @@
-use alloc::{
-    borrow::{Cow, ToOwned},
-    boxed::Box,
-    collections::btree_map::BTreeMap,
-    string::String,
-    sync::Arc,
-};
+use alloc::{borrow::Cow, boxed::Box, collections::btree_map::BTreeMap, string::String, sync::Arc};
 use core::any::Any;
 
 use axfs_ng_vfs::{
@@ -189,16 +183,17 @@ impl<O: SimpleDirOps> DirNodeOps for SimpleDir<O> {
 
     fn lookup(&self, name: &str) -> VfsResult<DirEntry> {
         let ops = self.ops.lookup_child(name)?;
-        let reference = Reference::new(self.this.upgrade(), name.to_owned());
-        Ok(match ops {
+        let reference = Reference::try_new(self.this.upgrade(), name)?;
+        let entry = match ops {
             NodeOpsMux::Dir(maker) => {
                 DirEntry::new_dir(|this| DirNode::new(maker(this)), reference)
             }
             NodeOpsMux::File(ops) => {
                 let node_type = ops.metadata()?.node_type;
-                DirEntry::new_file(FileNode::new(ops.clone()), node_type, reference)
+                DirEntry::try_new_file(FileNode::new(ops), node_type, reference)?
             }
-        })
+        };
+        Ok(entry)
     }
 
     fn is_cacheable(&self) -> bool {

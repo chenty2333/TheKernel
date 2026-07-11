@@ -23,9 +23,11 @@ pub(crate) use self::{
     access::{
         PtraceCredentialMode, check_current_process_prlimit_access,
         check_current_process_ptrace_access, check_current_process_signal_access,
-        check_current_ptrace_access, check_current_signal_access,
+        check_current_ptrace_access, check_current_signal_access, may_begin_gid_map_write,
+        may_begin_uid_map_write, may_update_setgroups_policy, may_write_gid_map, may_write_uid_map,
     },
     creds::{CapabilityState, Cred, CredentialSlot, Credentials, DacCredentialView},
+    idmap::{ID_MAP_MAX_EXTENTS, IdMapInputExtent, validate_id_map_input},
     jobctl::{ContinueResult, StopReport},
     process::{
         CgroupNamespace, PidNamespace, TimeNamespace, UTS_FIELD_LEN, UserNamespace, UtsNamespace,

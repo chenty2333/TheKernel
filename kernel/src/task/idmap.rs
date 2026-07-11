@@ -127,20 +127,28 @@ impl IdMap {
         input: Vec<IdMapInputExtent>,
         parent: &Self,
     ) -> AxResult<Arc<Self>> {
-        if input.is_empty() || input.len() > ID_MAP_MAX_EXTENTS {
-            return Err(AxError::InvalidInput);
-        }
+        Self::try_from_parent_slice(&input, parent)
+    }
+
+    /// Slice-based constructor for callers which must authorize against the
+    /// original rows after semantic validation without cloning a fallible
+    /// userspace-sized vector.
+    pub(crate) fn try_from_parent_slice(
+        input: &[IdMapInputExtent],
+        parent: &Self,
+    ) -> AxResult<Arc<Self>> {
+        validate_id_map_input(input)?;
 
         let mut resolved = Vec::new();
         resolved
             .try_reserve_exact(input.len())
             .map_err(|_| AxError::NoMemory)?;
-        for extent in input {
-            validate_range(extent.first, extent.count)?;
-            validate_range(extent.lower_first, extent.count)?;
+        for extent in input.iter().copied() {
             let lower_first = parent
                 .map_range_to_kernel(extent.lower_first, extent.count)
-                .ok_or(AxError::InvalidInput)?;
+                // Linux reports a syntactically and structurally valid range
+                // outside the parent map as an authorization failure.
+                .ok_or(AxError::OperationNotPermitted)?;
             resolved.push(IdMapExtent {
                 first: extent.first,
                 lower_first,
@@ -205,6 +213,29 @@ impl IdMap {
             .and_then(UserGid::from_raw)
     }
 
+    /// Fallibly snapshots rows as Linux displays them to one reader namespace.
+    ///
+    /// Stored lower IDs are kernel-global. `uid_m_show()`/`gid_m_show()` map
+    /// only the first lower ID through `seq_user_ns()` and preserve the count;
+    /// they do not require the entire range to be contiguous in the reader's
+    /// map. An unmapped first ID is rendered as the all-ones invalid value.
+    pub(crate) fn try_extents_for_lower(&self, lower: &Self) -> AxResult<Vec<IdMapInputExtent>> {
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(self.forward.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for extent in &self.forward {
+            let lower_first = lower
+                .map_id_from_kernel(extent.lower_first)
+                .unwrap_or(INVALID_ID);
+            rows.push(IdMapInputExtent {
+                first: extent.first,
+                lower_first,
+                count: extent.count,
+            });
+        }
+        Ok(rows)
+    }
+
     fn map_id_to_kernel(&self, id: u32) -> Option<u32> {
         let extent = find_extent(
             &self.forward,
@@ -238,6 +269,44 @@ impl IdMap {
         }
         extent.lower_first.checked_add(first - extent.first)
     }
+}
+
+/// Validates the user-visible map rows without resolving them through the
+/// parent namespace. Procfs performs this phase before `new_idmap_permitted()`
+/// so malformed ranges retain Linux's EINVAL-before-EPERM error ordering.
+pub(crate) fn validate_id_map_input(input: &[IdMapInputExtent]) -> AxResult<()> {
+    if input.is_empty() || input.len() > ID_MAP_MAX_EXTENTS {
+        return Err(AxError::InvalidInput);
+    }
+
+    let mut ordered = Vec::new();
+    ordered
+        .try_reserve_exact(input.len())
+        .map_err(|_| AxError::NoMemory)?;
+    ordered.extend_from_slice(input);
+    for extent in &ordered {
+        validate_range(extent.first, extent.count)?;
+        validate_range(extent.lower_first, extent.count)?;
+    }
+
+    ordered.sort_unstable_by_key(|extent| extent.first);
+    for pair in ordered.windows(2) {
+        let previous_end =
+            valid_range_end(pair[0].first, pair[0].count).ok_or(AxError::InvalidInput)?;
+        if previous_end > pair[1].first {
+            return Err(AxError::InvalidInput);
+        }
+    }
+
+    ordered.sort_unstable_by_key(|extent| extent.lower_first);
+    for pair in ordered.windows(2) {
+        let previous_end =
+            valid_range_end(pair[0].lower_first, pair[0].count).ok_or(AxError::InvalidInput)?;
+        if previous_end > pair[1].lower_first {
+            return Err(AxError::InvalidInput);
+        }
+    }
+    Ok(())
 }
 
 fn valid_range_end(first: u32, count: u32) -> Option<u32> {
@@ -346,6 +415,27 @@ mod tests {
             child.user_uid_to_kernel(UserUid::from_raw(10).unwrap()),
             None
         );
+        assert_eq!(
+            child.try_extents_for_lower(&parent).unwrap(),
+            vec![input(0, 110, 10)]
+        );
+    }
+
+    #[test]
+    fn display_maps_only_the_first_lower_id_through_the_viewer() {
+        let root = IdMap::try_identity().unwrap();
+        let target = IdMap::try_from_parent(vec![input(0, 1_000, 10)], &root).unwrap();
+        let partial_viewer = IdMap::try_from_parent(vec![input(77, 1_000, 1)], &root).unwrap();
+        let unmapped_viewer = IdMap::try_empty().unwrap();
+
+        assert_eq!(
+            target.try_extents_for_lower(&partial_viewer).unwrap(),
+            vec![input(0, 77, 10)]
+        );
+        assert_eq!(
+            target.try_extents_for_lower(&unmapped_viewer).unwrap(),
+            vec![input(0, INVALID_ID, 10)]
+        );
     }
 
     #[test]
@@ -407,7 +497,20 @@ mod tests {
         let parent =
             IdMap::try_from_parent(vec![input(0, 1_000, 5), input(5, 2_000, 5)], &root).unwrap();
         let error = IdMap::try_from_parent(vec![input(0, 3, 4)], &parent).unwrap_err();
-        assert_eq!(error, AxError::InvalidInput);
+        assert_eq!(error, AxError::OperationNotPermitted);
+    }
+
+    #[test]
+    fn malformed_rows_precede_unmapped_parent_authorization_failure() {
+        let empty_parent = IdMap::try_empty().unwrap();
+        assert_eq!(
+            validate_id_map_input(&[input(0, 0, 0)]),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            IdMap::try_from_parent(vec![input(0, 0, 1)], &empty_parent).unwrap_err(),
+            AxError::OperationNotPermitted
+        );
     }
 
     #[test]

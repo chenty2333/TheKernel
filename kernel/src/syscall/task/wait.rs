@@ -110,24 +110,33 @@ impl WaitEvent {
         }
     }
 
-    fn waitid_siginfo(&self) -> siginfo {
+    fn waitid_siginfo(&self, viewer_user_ns: &crate::task::UserNamespace) -> siginfo {
         match self {
-            WaitEvent::Stopped { pid, stop, .. } => fill_siginfo(
-                *pid,
-                0,
-                if stop.traced {
-                    CLD_TRAPPED
-                } else {
-                    CLD_STOPPED
-                },
-                stop.signal as i32,
-            ),
-            WaitEvent::Continued { pid, .. } => {
-                fill_siginfo(*pid, 0, CLD_CONTINUED, SIGCONT as i32)
+            WaitEvent::Stopped {
+                pid,
+                stop,
+                proc_data,
+            } => {
+                let uid = viewer_user_ns.from_kuid_munged(proc_data.group_leader_cred().ids().ruid);
+                fill_siginfo(
+                    *pid,
+                    uid,
+                    if stop.traced {
+                        CLD_TRAPPED
+                    } else {
+                        CLD_STOPPED
+                    },
+                    stop.signal as i32,
+                )
+            }
+            WaitEvent::Continued { pid, proc_data } => {
+                let uid = viewer_user_ns.from_kuid_munged(proc_data.group_leader_cred().ids().ruid);
+                fill_siginfo(*pid, uid, CLD_CONTINUED, SIGCONT as i32)
             }
             WaitEvent::Exited { child, snapshot } => {
                 let (si_code, si_status) = decode_exit_code(snapshot.wait_status);
-                fill_siginfo(child.pid(), snapshot.uid, si_code, si_status)
+                let uid = viewer_user_ns.from_kuid_munged(snapshot.uid);
+                fill_siginfo(child.pid(), uid, si_code, si_status)
             }
         }
     }
@@ -317,11 +326,12 @@ fn write_waitpid_event(
 
 fn write_waitid_event(
     event: &WaitEvent,
+    viewer_user_ns: &crate::task::UserNamespace,
     infop: *mut siginfo,
     rusage_ptr: *mut rusage,
 ) -> AxResult<()> {
     if let Some(infop) = infop.nullable() {
-        infop.vm_write(event.waitid_siginfo())?;
+        infop.vm_write(event.waitid_siginfo(viewer_user_ns))?;
     }
     if let Some(usage) = event.exited_usage()
         && let Some(rusage_ptr) = rusage_ptr.nullable()
@@ -495,6 +505,7 @@ pub fn sys_waitid(
     }
 
     let curr = current();
+    let viewer_user_ns = curr.as_thread().current_cred().user_ns().clone();
     let proc_data = &curr.as_thread().proc_data;
     let proc = &proc_data.proc;
     let nowait = options.contains(WaitOptions::WNOWAIT);
@@ -577,7 +588,7 @@ pub fn sys_waitid(
                 }
             };
 
-            if let Err(err) = write_waitid_event(&event, infop, rusage_ptr) {
+            if let Err(err) = write_waitid_event(&event, &viewer_user_ns, infop, rusage_ptr) {
                 if let Some(claimed_event) = &claimed_event {
                     restore_wait_event(claimed_event);
                 }

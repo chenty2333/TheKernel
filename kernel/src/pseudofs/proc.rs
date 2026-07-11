@@ -46,8 +46,8 @@ use starry_vm::VmMutPtr;
 
 use crate::{
     file::{
-        FD_TABLE, FileDescription, PidFd, fanotify::FanotifyFile, inotify::InotifyFile, lease,
-        pipe, try_path_into_bytes,
+        FD_TABLE, FileDescription, PidFd, current_file_operation_security_credential,
+        fanotify::FanotifyFile, inotify::InotifyFile, lease, pipe, try_path_into_bytes,
     },
     mm::{
         Backend, BackendOps, USER_IO_PIN_TEST_DELAY_MS_MAX, commit_limit_bytes, committed_as_bytes,
@@ -78,11 +78,13 @@ use crate::{
         sysvipc_shm_snapshot,
     },
     task::{
-        AsThread, Mempolicy, PidNamespace, ProcessData, PtraceCredentialMode, TimeNamespace,
-        UserNamespace, UtsNamespace, check_current_ptrace_access, get_process_data,
-        get_process_including_zombie, get_task, get_visible_task,
-        get_visible_task_including_exiting, nr_open_limit, render_task_stat, render_zombie_stat,
-        set_nr_open_limit, task_state, try_processes,
+        AsThread, Cred, ID_MAP_MAX_EXTENTS, IdMapInputExtent, Mempolicy, PidNamespace, ProcessData,
+        PtraceCredentialMode, TimeNamespace, UserNamespace, UtsNamespace,
+        check_current_ptrace_access, get_process_data, get_process_including_zombie, get_task,
+        get_visible_task, get_visible_task_including_exiting, may_begin_gid_map_write,
+        may_begin_uid_map_write, may_update_setgroups_policy, may_write_gid_map, may_write_uid_map,
+        nr_open_limit, render_task_stat, render_zombie_stat, set_nr_open_limit, task_state,
+        try_processes, validate_id_map_input,
     },
 };
 
@@ -777,6 +779,320 @@ fn proc_task_for_pid(pid: u32) -> VfsResult<AxTaskRef> {
     Err(VfsError::NotFound)
 }
 
+fn proc_subject_cred(task: &AxTaskRef, process_view: bool) -> Arc<Cred> {
+    let thread = task.as_thread();
+    if process_view {
+        thread.proc_data.group_leader_cred()
+    } else {
+        thread.current_cred()
+    }
+}
+
+fn parse_id_map_rows(data: &[u8]) -> VfsResult<Vec<IdMapInputExtent>> {
+    if data.is_empty() || data.len() >= PAGE_SIZE_4K {
+        return Err(VfsError::InvalidInput);
+    }
+    let text = str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
+    let line_count = text.lines().count();
+    if line_count == 0 || line_count > ID_MAP_MAX_EXTENTS {
+        return Err(VfsError::InvalidInput);
+    }
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(line_count)
+        .map_err(|_| VfsError::NoMemory)?;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            return Err(VfsError::InvalidInput);
+        }
+        let mut fields = line.split_ascii_whitespace();
+        let first = fields
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or(VfsError::InvalidInput)?;
+        let lower_first = fields
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or(VfsError::InvalidInput)?;
+        let count = fields
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or(VfsError::InvalidInput)?;
+        if fields.next().is_some() {
+            return Err(VfsError::InvalidInput);
+        }
+        rows.push(IdMapInputExtent::new(first, lower_first, count));
+    }
+    Ok(rows)
+}
+
+fn parse_setgroups_policy(data: &[u8]) -> VfsResult<bool> {
+    if data.len() >= 8 {
+        return Err(VfsError::InvalidInput);
+    }
+    let text = str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
+    let (allow, trailing) = if let Some(trailing) = text.strip_prefix("allow") {
+        (true, trailing)
+    } else if let Some(trailing) = text.strip_prefix("deny") {
+        (false, trailing)
+    } else {
+        return Err(VfsError::InvalidInput);
+    };
+    if !trailing.bytes().all(|byte| byte.is_ascii_whitespace()) {
+        return Err(VfsError::InvalidInput);
+    }
+    Ok(allow)
+}
+
+fn require_proc_userns_write_offset(offset: u64) -> VfsResult<()> {
+    if offset == 0 {
+        Ok(())
+    } else {
+        Err(VfsError::InvalidInput)
+    }
+}
+
+fn render_id_map(
+    namespace: &Arc<UserNamespace>,
+    viewer: &Arc<UserNamespace>,
+    uid: bool,
+) -> VfsResult<Vec<u8>> {
+    let rows = if uid {
+        namespace.try_uid_map_rows(viewer)?
+    } else {
+        namespace.try_gid_map_rows(viewer)?
+    };
+    let capacity = rows.len().checked_mul(33).ok_or(VfsError::NoMemory)?;
+    let mut output = String::new();
+    output
+        .try_reserve_exact(capacity)
+        .map_err(|_| VfsError::NoMemory)?;
+    for row in rows {
+        writeln!(
+            output,
+            "{:>10} {:>10} {:>10}",
+            row.first, row.lower_first, row.count
+        )
+        .map_err(|_| VfsError::Io)?;
+    }
+    Ok(output.into_bytes())
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProcUserNamespaceFileKind {
+    UidMap,
+    GidMap,
+    Setgroups,
+}
+
+/// Offset-aware proc user-namespace control node.
+///
+/// These files cannot use `SimpleFile`: Linux requires writes to start at
+/// offset zero and freezes the opener credential for map authorization.
+struct ProcUserNamespaceFile {
+    node: SimpleFsNode,
+    namespace: Arc<UserNamespace>,
+    kind: ProcUserNamespaceFileKind,
+}
+
+impl ProcUserNamespaceFile {
+    fn try_new(
+        fs: Arc<SimpleFs>,
+        namespace: Arc<UserNamespace>,
+        kind: ProcUserNamespaceFileKind,
+        owner_uid: u32,
+        owner_gid: u32,
+    ) -> VfsResult<Arc<Self>> {
+        let node = SimpleFsNode::try_new(
+            fs,
+            NodeType::RegularFile,
+            NodePermission::from_bits_truncate(0o644),
+        )?;
+        {
+            let mut metadata = node.metadata.lock();
+            metadata.uid = owner_uid;
+            metadata.gid = owner_gid;
+        }
+        Arc::try_new(Self {
+            node,
+            namespace,
+            kind,
+        })
+        .map_err(|_| VfsError::NoMemory)
+    }
+
+    fn try_render(&self) -> VfsResult<Vec<u8>> {
+        match self.kind {
+            ProcUserNamespaceFileKind::UidMap | ProcUserNamespaceFileKind::GidMap => {
+                let viewer = current_file_operation_security_credential().ok_or(VfsError::Io)?;
+                render_id_map(
+                    &self.namespace,
+                    viewer.user_ns(),
+                    self.kind == ProcUserNamespaceFileKind::UidMap,
+                )
+            }
+            ProcUserNamespaceFileKind::Setgroups => {
+                let value: &[u8] = if self.namespace.setgroups_allowed() {
+                    b"allow\n"
+                } else {
+                    b"deny\n"
+                };
+                let mut output = Vec::new();
+                output
+                    .try_reserve_exact(value.len())
+                    .map_err(|_| VfsError::NoMemory)?;
+                output.extend_from_slice(value);
+                Ok(output)
+            }
+        }
+    }
+
+    fn write_from_zero(&self, data: &[u8]) -> VfsResult<()> {
+        let opener = current_file_operation_security_credential().ok_or(VfsError::Io)?;
+        match self.kind {
+            ProcUserNamespaceFileKind::UidMap => {
+                if !may_begin_uid_map_write(&opener, &self.namespace) {
+                    return Err(VfsError::OperationNotPermitted);
+                }
+                let rows = parse_id_map_rows(data)?;
+                validate_id_map_input(&rows)?;
+                let actor = current().as_thread().current_cred();
+                if !may_write_uid_map(&actor, &opener, &self.namespace, &rows) {
+                    return Err(VfsError::OperationNotPermitted);
+                }
+                let map = self.namespace.try_build_uid_map_from_slice(&rows)?;
+                self.namespace.publish_uid_map(map)?;
+            }
+            ProcUserNamespaceFileKind::GidMap => {
+                if !may_begin_gid_map_write(&opener, &self.namespace) {
+                    return Err(VfsError::OperationNotPermitted);
+                }
+                let rows = parse_id_map_rows(data)?;
+                validate_id_map_input(&rows)?;
+                let actor = current().as_thread().current_cred();
+                if !may_write_gid_map(&actor, &opener, &self.namespace, &rows) {
+                    return Err(VfsError::OperationNotPermitted);
+                }
+                let map = self.namespace.try_build_gid_map_from_slice(&rows)?;
+                // If unprivileged authorization succeeded, setgroups was
+                // already irreversibly denied. Publication serializes the
+                // one-shot map state with that policy.
+                self.namespace.publish_gid_map(map, false)?;
+            }
+            ProcUserNamespaceFileKind::Setgroups => {
+                if !may_update_setgroups_policy(&opener, &self.namespace) {
+                    return Err(VfsError::OperationNotPermitted);
+                }
+                let allow = parse_setgroups_policy(data)?;
+                self.namespace.update_setgroups_policy(allow)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[inherit_methods(from = "self.node")]
+impl NodeOps for ProcUserNamespaceFile {
+    fn inode(&self) -> u64;
+
+    fn metadata(&self) -> VfsResult<Metadata>;
+
+    fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()>;
+
+    fn filesystem(&self) -> &dyn FilesystemOps;
+
+    fn sync(&self, _data_only: bool) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+
+    fn flags(&self) -> NodeFlags {
+        NodeFlags::NON_CACHEABLE
+            | NodeFlags::POSITIONED_APPEND
+            | NodeFlags::OPEN_CREDENTIAL
+            | NodeFlags::NO_POSITIONED_WRITE
+    }
+
+    fn open(&self, _read: bool, write: bool) -> VfsResult<()> {
+        let opener = current().as_thread().current_cred();
+        if write
+            && self.kind == ProcUserNamespaceFileKind::Setgroups
+            && !may_update_setgroups_policy(&opener, &self.namespace)
+        {
+            // Linux rejects the writable open itself with EACCES.
+            return Err(VfsError::PermissionDenied);
+        }
+        Ok(())
+    }
+}
+
+impl FileNodeOps for ProcUserNamespaceFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        let data = self.try_render()?;
+        if offset >= data.len() as u64 {
+            return Ok(0);
+        }
+        let data = &data[offset as usize..];
+        let read = data.len().min(buf.len());
+        buf[..read].copy_from_slice(&data[..read]);
+        Ok(read)
+    }
+
+    fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
+        require_proc_userns_write_offset(offset)?;
+        self.write_from_zero(buf)?;
+        Ok(buf.len())
+    }
+
+    fn write_at_vectored(&self, bufs: &[&[u8]], offset: u64) -> VfsResult<usize> {
+        require_proc_userns_write_offset(offset)?;
+        let len = bufs.iter().try_fold(0usize, |total, buf| {
+            total.checked_add(buf.len()).ok_or(VfsError::InvalidInput)
+        })?;
+        if len == 0 {
+            return Ok(0);
+        }
+        // map_write() accepts less than one page. Reject oversized vectors
+        // before allocating a contiguous transaction buffer.
+        if len >= PAGE_SIZE_4K {
+            return Err(VfsError::InvalidInput);
+        }
+        let mut data = Vec::new();
+        data.try_reserve_exact(len)
+            .map_err(|_| VfsError::NoMemory)?;
+        for buf in bufs {
+            data.extend_from_slice(buf);
+        }
+        self.write_from_zero(&data)?;
+        Ok(len)
+    }
+
+    fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {
+        let written = self.write_at(buf, 0)?;
+        Ok((written, written as u64))
+    }
+
+    fn set_len(&self, _len: u64) -> VfsResult<()> {
+        // Linux accepts O_TRUNC and ftruncate on these proc controls without
+        // changing their generated contents or one-shot publication state.
+        Ok(())
+    }
+
+    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+        Err(VfsError::BadFileDescriptor)
+    }
+}
+
+impl Pollable for ProcUserNamespaceFile {
+    fn poll(&self) -> IoEvents {
+        IoEvents::IN | IoEvents::OUT
+    }
+
+    fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+}
+
 fn real_meminfo() -> String {
     let stats = system_memory_stats();
     let total_kb = stats.total_bytes / 1024;
@@ -937,7 +1253,11 @@ fn format_mask_list(mask: usize, width: usize) -> String {
 }
 
 #[rustfmt::skip]
-fn task_status(task: &AxTaskRef, process_view: bool) -> String {
+fn task_status(
+    task: &AxTaskRef,
+    process_view: bool,
+    viewer_user_ns: &UserNamespace,
+) -> String {
     let thread = task.as_thread();
     let proc_data = &thread.proc_data;
     let (vm_size_kb, vm_rss_kb, locked_kb) = {
@@ -965,11 +1285,7 @@ fn task_status(task: &AxTaskRef, process_view: bool) -> String {
     };
     let ppid = proc_data.proc.parent().map_or(0, |parent| parent.pid());
     let threads = proc_data.proc.thread_count();
-    let cred = if process_view {
-        proc_data.group_leader_cred()
-    } else {
-        thread.current_cred()
-    };
+    let cred = proc_subject_cred(task, process_view);
     let ids = cred.ids();
     let caps = cred.capabilities();
     let cpu_mask = task_cpu_mask_bits(task);
@@ -1010,14 +1326,14 @@ fn task_status(task: &AxTaskRef, process_view: bool) -> String {
         proc_data.proc.pid(),
         if process_view { proc_data.proc.pid() } else { thread.tid() },
         ppid,
-        ids.ruid,
-        ids.euid,
-        ids.suid,
-        ids.fsuid,
-        ids.rgid,
-        ids.egid,
-        ids.sgid,
-        ids.fsgid,
+        viewer_user_ns.from_kuid_munged(ids.ruid),
+        viewer_user_ns.from_kuid_munged(ids.euid),
+        viewer_user_ns.from_kuid_munged(ids.suid),
+        viewer_user_ns.from_kuid_munged(ids.fsuid),
+        viewer_user_ns.from_kgid_munged(ids.rgid),
+        viewer_user_ns.from_kgid_munged(ids.egid),
+        viewer_user_ns.from_kgid_munged(ids.sgid),
+        viewer_user_ns.from_kgid_munged(ids.fsgid),
         vm_size_kb,
         vm_rss_kb,
         locked_kb,
@@ -1398,11 +1714,7 @@ impl ProcNamespaceFile {
                 ProcNamespaceObject::Time(proc_data.time_ns_for_children())
             }
             ProcNamespaceKind::User => {
-                let cred = if process_view {
-                    proc_data.group_leader_cred()
-                } else {
-                    thread.current_cred()
-                };
+                let cred = proc_subject_cred(task, process_view);
                 ProcNamespaceObject::User(cred.user_ns().clone())
             }
             ProcNamespaceKind::Uts => ProcNamespaceObject::Uts(proc_data.uts_ns()),
@@ -1520,7 +1832,9 @@ impl FileNodeOps for ProcNamespaceFile {
             },
             NS_GET_OWNER_UID => match &self.object {
                 ProcNamespaceObject::User(ns) => {
-                    (arg as *mut u32).vm_write(ns.owner_uid())?;
+                    let viewer = current().as_thread().current_cred();
+                    let owner = viewer.user_ns().from_kuid_munged(ns.owner_uid());
+                    (arg as *mut u32).vm_write(owner)?;
                     Ok(0)
                 }
                 _ => Err(VfsError::InvalidInput),
@@ -1861,6 +2175,9 @@ impl SimpleDirOps for ThreadDir {
             [
                 Some("stat"),
                 Some("status"),
+                Some("uid_map"),
+                Some("gid_map"),
+                Some("setgroups"),
                 Some("limits"),
                 Some("oom_score_adj"),
                 Some("cgroup"),
@@ -1896,11 +2213,7 @@ impl SimpleDirOps for ThreadDir {
             "maps" | "smaps" | "numa_maps" | "pagemap" | "exe" | "fd" | "fdinfo" | "ns"
         ) {
             let target = task.as_thread();
-            let target_cred = if process_view {
-                target.proc_data.group_leader_cred()
-            } else {
-                target.current_cred()
-            };
+            let target_cred = proc_subject_cred(&task, process_view);
             check_current_ptrace_access(&target.proc_data, &target_cred, PtraceCredentialMode::Fs)
                 .map_err(|_| VfsError::PermissionDenied)?;
         }
@@ -1909,8 +2222,46 @@ impl SimpleDirOps for ThreadDir {
                 SimpleFile::new_regular(fs, move || Ok(render_task_stat(&task)?.into_bytes()))
                     .into()
             }
-            "status" => {
-                SimpleFile::new_regular(fs, move || Ok(task_status(&task, process_view))).into()
+            "status" => SimpleFile::try_new_regular_with_open_credential(fs, move || {
+                let viewer = current_file_operation_security_credential().ok_or(VfsError::Io)?;
+                Ok(task_status(&task, process_view, viewer.user_ns()))
+            })?
+            .into(),
+            "uid_map" => {
+                let subject = proc_subject_cred(&task, process_view);
+                let ids = subject.ids();
+                ProcUserNamespaceFile::try_new(
+                    fs,
+                    subject.user_ns().clone(),
+                    ProcUserNamespaceFileKind::UidMap,
+                    ids.euid,
+                    ids.egid,
+                )?
+                .into()
+            }
+            "gid_map" => {
+                let subject = proc_subject_cred(&task, process_view);
+                let ids = subject.ids();
+                ProcUserNamespaceFile::try_new(
+                    fs,
+                    subject.user_ns().clone(),
+                    ProcUserNamespaceFileKind::GidMap,
+                    ids.euid,
+                    ids.egid,
+                )?
+                .into()
+            }
+            "setgroups" => {
+                let subject = proc_subject_cred(&task, process_view);
+                let ids = subject.ids();
+                ProcUserNamespaceFile::try_new(
+                    fs,
+                    subject.user_ns().clone(),
+                    ProcUserNamespaceFileKind::Setgroups,
+                    ids.euid,
+                    ids.egid,
+                )?
+                .into()
             }
             "limits" => SimpleFile::new_regular(fs, move || Ok(render_task_limits(&task))).into(),
             "oom_score_adj" => SimpleFile::new_regular(
@@ -3078,4 +3429,100 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
 
     let proc_dir = ProcFsHandler(fs.clone());
     SimpleDir::new_maker(fs, Arc::new(proc_dir.chain(root)))
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use alloc::{format, string::String, vec};
+
+    use super::*;
+
+    #[test]
+    fn id_map_parser_enforces_linux_record_bounds() {
+        assert_eq!(
+            parse_id_map_rows(b" 0 1000 1 \n").unwrap(),
+            vec![IdMapInputExtent::new(0, 1000, 1)]
+        );
+
+        for invalid in [
+            &b""[..],
+            &b"0 1000"[..],
+            &b"0 1000 1 junk\n"[..],
+            &b"0 1000 1\n\n"[..],
+            &b"0 1000 1\n \n"[..],
+            &b"-1 1000 1\n"[..],
+        ] {
+            assert_eq!(parse_id_map_rows(invalid), Err(VfsError::InvalidInput));
+        }
+
+        let page = vec![b'0'; PAGE_SIZE_4K];
+        assert_eq!(parse_id_map_rows(&page), Err(VfsError::InvalidInput));
+
+        let mut too_many = String::new();
+        for index in 0..=ID_MAP_MAX_EXTENTS {
+            writeln!(&mut too_many, "{} {} 1", index * 2, index * 2).unwrap();
+        }
+        assert_eq!(
+            parse_id_map_rows(too_many.as_bytes()),
+            Err(VfsError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn user_namespace_control_parsers_preserve_linux_offset_and_spacing_rules() {
+        assert_eq!(require_proc_userns_write_offset(0), Ok(()));
+        assert_eq!(
+            require_proc_userns_write_offset(1),
+            Err(VfsError::InvalidInput)
+        );
+
+        assert_eq!(parse_setgroups_policy(b"allow"), Ok(true));
+        assert_eq!(parse_setgroups_policy(b"deny\t\n"), Ok(false));
+        for invalid in [
+            &b" allow"[..],
+            &b"deny!"[..],
+            &b"deny\0"[..],
+            "deny\u{2003}".as_bytes(),
+            &b"allow   x"[..],
+        ] {
+            assert_eq!(parse_setgroups_policy(invalid), Err(VfsError::InvalidInput));
+        }
+    }
+
+    #[test]
+    fn id_map_render_uses_frozen_viewer_namespace() {
+        let root = UserNamespace::try_new_root().unwrap();
+        let parent = root.try_fork(1000, 1000, true).unwrap();
+        let parent_uid_map = parent
+            .try_build_uid_map(vec![IdMapInputExtent::new(100, 1000, 20)])
+            .unwrap();
+        let parent_gid_map = parent
+            .try_build_gid_map(vec![IdMapInputExtent::new(100, 1000, 20)])
+            .unwrap();
+        parent.publish_uid_map(parent_uid_map).unwrap();
+        parent.publish_gid_map(parent_gid_map, false).unwrap();
+
+        let child = parent.try_fork(1005, 1005, false).unwrap();
+        let child_uid_map = child
+            .try_build_uid_map(vec![IdMapInputExtent::new(0, 105, 5)])
+            .unwrap();
+        child.publish_uid_map(child_uid_map).unwrap();
+
+        assert_eq!(
+            render_id_map(&child, &child, true).unwrap(),
+            format!("{:>10} {:>10} {:>10}\n", 0, 105, 5).into_bytes()
+        );
+        assert_eq!(
+            render_id_map(&child, &root, true).unwrap(),
+            format!("{:>10} {:>10} {:>10}\n", 0, 1005, 5).into_bytes()
+        );
+
+        let unmapped_viewer = root.try_fork(2000, 2000, false).unwrap();
+        assert_eq!(
+            render_id_map(&child, &unmapped_viewer, true).unwrap(),
+            format!("{:>10} {:>10} {:>10}\n", 0, u32::MAX, 5).into_bytes()
+        );
+    }
 }

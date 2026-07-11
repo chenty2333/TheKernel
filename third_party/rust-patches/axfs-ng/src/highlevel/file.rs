@@ -17,12 +17,12 @@ use core::{
 
 use axalloc::{UsageKind, global_allocator};
 use axdriver::{AsyncBlockWaitPolicy, virtio_async_block_enabled, virtio_async_block_wait_policy};
+#[cfg(feature = "times")]
+use axfs_ng_vfs::MetadataUpdate;
 use axfs_ng_vfs::{
     FileNode, FilesystemOps, Location, Mountpoint, NodeFlags, NodePermission, NodeType, VfsError,
     VfsResult, WeakDirEntry, WritebackAnchor, path::Path,
 };
-#[cfg(feature = "times")]
-use axfs_ng_vfs::MetadataUpdate;
 use axhal::mem::{PhysAddr, VirtAddr, total_ram_size, virt_to_phys};
 use axio::{SeekFrom, prelude::*};
 use axpoll::{IoEvents, Pollable};
@@ -232,6 +232,10 @@ impl OpenOptions {
         {
             return Err(VfsError::IsADirectory);
         }
+        loc.open(
+            flags.contains(FileFlags::READ),
+            flags.contains(FileFlags::WRITE),
+        )?;
         Ok(if loc.is_dir() {
             OpenResult::Dir(loc)
         } else {
@@ -280,8 +284,7 @@ impl OpenOptions {
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
     {
-        let mut allow_create =
-            |_dir: &Location, _options: &mut axfs_ng_vfs::OpenOptions| Ok(());
+        let mut allow_create = |_dir: &Location, _options: &mut axfs_ng_vfs::OpenOptions| Ok(());
         let (loc, _created) =
             self.resolve_location_with_admission(context, path, admission, &mut allow_create)?;
         self._open(loc)
@@ -1981,10 +1984,7 @@ impl Drop for CachedFileShared {
         // Final Arc release makes the registered Weak impossible to upgrade.
         // The pointer check prevents a stale release from deleting a newer
         // shared state installed for the same filesystem/inode key.
-        remove_released_cached_file_registry_entry(
-            self.registry_key,
-            core::ptr::from_ref(self),
-        );
+        remove_released_cached_file_registry_entry(self.registry_key, core::ptr::from_ref(self));
     }
 }
 
@@ -3362,7 +3362,12 @@ impl File {
         let position = if inner.location().flags().contains(NodeFlags::STREAM) {
             None
         } else {
-            Some(Mutex::new(if flags.contains(FileFlags::APPEND) {
+            let inode_append = flags.contains(FileFlags::APPEND)
+                && !inner
+                    .location()
+                    .flags()
+                    .contains(NodeFlags::POSITIONED_APPEND);
+            Some(Mutex::new(if inode_append {
                 inner.location().len().unwrap_or_default()
             } else {
                 0
@@ -3552,18 +3557,24 @@ impl File {
         if let Some(pos) = self.position.as_ref() {
             let mut pos = pos.lock();
             if let Ok(f) = self.access(FileFlags::APPEND) {
-                f.append(src)
-                    .inspect(|(written, _)| {
-                        #[cfg(feature = "times")]
-                        if *written > 0 {
-                            self.record_time_flags(2);
-                            self.flush_times();
-                        }
+                if f.location().flags().contains(NodeFlags::POSITIONED_APPEND) {
+                    self.write_at(src, *pos).inspect(|written| {
+                        *pos += *written as u64;
                     })
-                    .map(|(written, new_size)| {
-                        *pos = new_size;
-                        written
-                    })
+                } else {
+                    f.append(src)
+                        .inspect(|(written, _)| {
+                            #[cfg(feature = "times")]
+                            if *written > 0 {
+                                self.record_time_flags(2);
+                                self.flush_times();
+                            }
+                        })
+                        .map(|(written, new_size)| {
+                            *pos = new_size;
+                            written
+                        })
+                }
             } else {
                 self.write_at(src, *pos).inspect(|n| {
                     *pos += *n as u64;
@@ -3578,18 +3589,24 @@ impl File {
         if let Some(pos) = self.position.as_ref() {
             let mut pos = pos.lock();
             if let Ok(f) = self.access(FileFlags::APPEND) {
-                f.append(src)
-                    .inspect(|(written, _)| {
-                        #[cfg(feature = "times")]
-                        if *written > 0 {
-                            self.record_time_flags(2);
-                            self.flush_times();
-                        }
+                if f.location().flags().contains(NodeFlags::POSITIONED_APPEND) {
+                    self.write_at_slice(src, *pos).inspect(|written| {
+                        *pos += *written as u64;
                     })
-                    .map(|(written, new_size)| {
-                        *pos = new_size;
-                        written
-                    })
+                } else {
+                    f.append(src)
+                        .inspect(|(written, _)| {
+                            #[cfg(feature = "times")]
+                            if *written > 0 {
+                                self.record_time_flags(2);
+                                self.flush_times();
+                            }
+                        })
+                        .map(|(written, new_size)| {
+                            *pos = new_size;
+                            written
+                        })
+                }
             } else {
                 self.write_at_slice(src, *pos).inspect(|n| {
                     *pos += *n as u64;
@@ -3604,6 +3621,11 @@ impl File {
         if let Some(pos) = self.position.as_ref() {
             let mut pos = pos.lock();
             if let Ok(f) = self.access(FileFlags::APPEND) {
+                if f.location().flags().contains(NodeFlags::POSITIONED_APPEND) {
+                    return self
+                        .write_at_vectored_slice(src, *pos)
+                        .inspect(|written| *pos += *written as u64);
+                }
                 let mut total = 0usize;
                 for buf in src.iter().copied() {
                     if buf.is_empty() {
@@ -3699,28 +3721,212 @@ impl Drop for File {
 
 #[cfg(test)]
 mod tests {
-    use alloc::sync::{Arc, Weak};
-    use core::{any::Any, sync::atomic::Ordering, task::Context, time::Duration};
+    use alloc::{
+        sync::{Arc, Weak},
+        vec::Vec,
+    };
+    use core::{
+        any::Any,
+        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+        task::Context,
+        time::Duration,
+    };
 
     use axfs_ng_vfs::{
         DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata, MetadataUpdate,
-        Mountpoint, NodeOps, NodePermission, NodeType, Reference, StatFs, VfsResult,
+        Mountpoint, NodeFlags, NodeOps, NodePermission, NodeType, Reference, StatFs, VfsError,
+        VfsResult,
     };
+    use axio::Cursor;
     use axpoll::{IoEvents, Pollable};
+    use axsync::Mutex;
 
     use super::{
-        CLOSED_FILE_CACHE_RETAINED_PAGES, CachedFile, CachedFileShared, FileUserData,
-        cached_file_registry_key, cached_file_shared_for_location_or_create,
-        file_cache_registry, release_unlinked_cached_file_registry_ownership,
+        CLOSED_FILE_CACHE_RETAINED_PAGES, CachedFile, CachedFileShared, File, FileBackend,
+        FileFlags, FileUserData, cached_file_registry_key,
+        cached_file_shared_for_location_or_create, file_cache_registry,
+        release_unlinked_cached_file_registry_ownership,
     };
+
+    struct AppendTestState {
+        write_offsets: Mutex<Vec<u64>>,
+        append_calls: AtomicUsize,
+        inode_len: AtomicU64,
+    }
+
+    impl AppendTestState {
+        fn new(inode_len: u64) -> Arc<Self> {
+            Arc::new(Self {
+                write_offsets: Mutex::new(Vec::new()),
+                append_calls: AtomicUsize::new(0),
+                inode_len: AtomicU64::new(inode_len),
+            })
+        }
+    }
+
+    struct AppendTestFile {
+        flags: NodeFlags,
+        state: Arc<AppendTestState>,
+        fs: Arc<RegistryTestFs>,
+    }
+
+    impl NodeOps for AppendTestFile {
+        fn inode(&self) -> u64 {
+            1
+        }
+
+        fn metadata(&self) -> VfsResult<Metadata> {
+            Ok(Metadata {
+                device: 0,
+                inode: 1,
+                nlink: 1,
+                mode: NodePermission::from_bits_truncate(0o600),
+                node_type: NodeType::RegularFile,
+                uid: 0,
+                gid: 0,
+                size: self.state.inode_len.load(Ordering::Acquire),
+                block_size: 4096,
+                blocks: 0,
+                rdev: Default::default(),
+                atime: Duration::ZERO,
+                btime: Duration::ZERO,
+                mtime: Duration::ZERO,
+                ctime: Duration::ZERO,
+            })
+        }
+
+        fn update_metadata(&self, _update: MetadataUpdate) -> VfsResult<()> {
+            Ok(())
+        }
+
+        fn filesystem(&self) -> &dyn FilesystemOps {
+            &*self.fs
+        }
+
+        fn sync(&self, _data_only: bool) -> VfsResult<()> {
+            Ok(())
+        }
+
+        fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+            self
+        }
+
+        fn flags(&self) -> NodeFlags {
+            self.flags
+        }
+    }
+
+    impl Pollable for AppendTestFile {
+        fn poll(&self) -> IoEvents {
+            IoEvents::IN | IoEvents::OUT
+        }
+
+        fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+    }
+
+    impl FileNodeOps for AppendTestFile {
+        fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
+            Ok(0)
+        }
+
+        fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
+            self.state.write_offsets.lock().push(offset);
+            if offset != 0 {
+                return Err(VfsError::InvalidInput);
+            }
+            Ok(buf.len().min(2))
+        }
+
+        fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {
+            self.state.append_calls.fetch_add(1, Ordering::AcqRel);
+            let written = buf.len();
+            let old_len = self
+                .state
+                .inode_len
+                .fetch_add(written as u64, Ordering::AcqRel);
+            Ok((written, old_len + written as u64))
+        }
+
+        fn set_len(&self, len: u64) -> VfsResult<()> {
+            self.state.inode_len.store(len, Ordering::Release);
+            Ok(())
+        }
+
+        fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+            Err(VfsError::InvalidInput)
+        }
+    }
+
+    fn append_test_file(flags: NodeFlags, inode_len: u64) -> (File, Arc<AppendTestState>) {
+        let state = AppendTestState::new(inode_len);
+        let fs = Filesystem::new(RegistryTestFs::new_for_append(flags, state.clone()));
+        let mountpoint = Mountpoint::new_root(&fs);
+        let location = mountpoint.root_location();
+        let file = File::new(
+            FileBackend::Direct(location),
+            FileFlags::WRITE | FileFlags::APPEND,
+        );
+        (file, state)
+    }
+
+    fn assert_positioned_append_offsets(state: &AppendTestState) {
+        assert_eq!(&*state.write_offsets.lock(), &[0, 2]);
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn positioned_append_write_forms_use_and_advance_ofd_offset() {
+        let flags = NodeFlags::NON_CACHEABLE | NodeFlags::POSITIONED_APPEND;
+
+        let (file, state) = append_test_file(flags, 97);
+        let mut src = Cursor::new(&b"abcd"[..]);
+        assert_eq!(file.write(&mut src), Ok(2));
+        let mut second = Cursor::new(&b"z"[..]);
+        assert_eq!(file.write(&mut second), Err(VfsError::InvalidInput));
+        assert_positioned_append_offsets(&state);
+
+        let (file, state) = append_test_file(flags, 97);
+        assert_eq!(file.write_slice(b"abcd"), Ok(2));
+        assert_eq!(file.write_slice(b"z"), Err(VfsError::InvalidInput));
+        assert_positioned_append_offsets(&state);
+
+        let (file, state) = append_test_file(flags, 97);
+        assert_eq!(file.write_vectored_slice(&[b"abcd", b"ef"]), Ok(2));
+        assert_eq!(
+            file.write_vectored_slice(&[b"z"]),
+            Err(VfsError::InvalidInput)
+        );
+        assert_positioned_append_offsets(&state);
+    }
+
+    #[test]
+    fn ordinary_append_still_uses_inode_append() {
+        let (file, state) = append_test_file(NodeFlags::NON_CACHEABLE, 41);
+
+        assert_eq!(file.write_slice(b"abc"), Ok(3));
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 1);
+        assert!(state.write_offsets.lock().is_empty());
+        assert_eq!(state.inode_len.load(Ordering::Acquire), 44);
+    }
 
     struct RegistryTestFs {
         this: Weak<Self>,
+        append: Option<(NodeFlags, Arc<AppendTestState>)>,
     }
 
     impl RegistryTestFs {
         fn new() -> Arc<Self> {
-            Arc::new_cyclic(|this| Self { this: this.clone() })
+            Arc::new_cyclic(|this| Self {
+                this: this.clone(),
+                append: None,
+            })
+        }
+
+        fn new_for_append(flags: NodeFlags, state: Arc<AppendTestState>) -> Arc<Self> {
+            Arc::new_cyclic(|this| Self {
+                this: this.clone(),
+                append: Some((flags, state)),
+            })
         }
     }
 
@@ -3731,8 +3937,17 @@ mod tests {
 
         fn root_dir(&self) -> DirEntry {
             let fs = self.this.upgrade().expect("test filesystem is live");
+            let node: Arc<dyn FileNodeOps> = if let Some((flags, state)) = &self.append {
+                Arc::new(AppendTestFile {
+                    flags: *flags,
+                    state: state.clone(),
+                    fs,
+                })
+            } else {
+                Arc::new(RegistryTestFile { fs })
+            };
             DirEntry::new_file(
-                FileNode::new(Arc::new(RegistryTestFile { fs })),
+                FileNode::new(node),
                 NodeType::RegularFile,
                 Reference::root(),
             )

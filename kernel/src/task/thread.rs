@@ -24,11 +24,11 @@ use starry_signal::{
 use super::{
     ProcessData,
     accounting::{AtomicTaskUsage, TaskUsage},
-    creds::CredentialSlot,
+    creds::{Cred, CredentialSlot},
     restart::RestartTracker,
     timer::TimeManager,
 };
-use crate::deferred_work::DeferredWorkAccount;
+use crate::{deferred_work::DeferredWorkAccount, file::OpenCredentials};
 
 ///  A wrapper type that assumes the inner type is `Sync`.
 #[repr(transparent)]
@@ -58,6 +58,17 @@ pub struct Thread {
     /// after an early leader exit. There is never a second credential copy or
     /// publication point.
     pub(in crate::task) credential: Arc<CredentialSlot>,
+
+    /// Per-task operation credential used while an OFD read/write is active.
+    /// This is not process Scope state: sibling threads may block or perform
+    /// I/O concurrently without replacing each other's Linux `file->f_cred`.
+    file_operation_credential: SpinNoIrq<Option<Arc<Cred>>>,
+
+    /// Legacy Linux write-side opener snapshot used by cgroup control files.
+    /// Keep it task-local for the same reason as `file_operation_credential`:
+    /// a process scope is shared by sibling threads and cannot represent two
+    /// blocked OFD operations at once.
+    file_write_credentials: SpinNoIrq<Option<OpenCredentials>>,
 
     /// The clear thread tid field
     ///
@@ -129,6 +140,8 @@ impl Thread {
             signal,
             proc_data,
             credential,
+            file_operation_credential: SpinNoIrq::new(None),
+            file_write_credentials: SpinNoIrq::new(None),
             clear_child_tid: AtomicUsize::new(0),
             visible_tid: AtomicU32::new(tid),
             robust_list_head: AtomicUsize::new(0),
@@ -164,6 +177,28 @@ impl Thread {
 
     pub(in crate::task) fn credential_slot(&self) -> Arc<CredentialSlot> {
         self.credential.clone()
+    }
+
+    pub(crate) fn file_operation_credential(&self) -> Option<Arc<Cred>> {
+        self.file_operation_credential.lock().clone()
+    }
+
+    pub(crate) fn replace_file_operation_credential(
+        &self,
+        replacement: Option<Arc<Cred>>,
+    ) -> Option<Arc<Cred>> {
+        core::mem::replace(&mut *self.file_operation_credential.lock(), replacement)
+    }
+
+    pub(crate) fn file_write_credentials(&self) -> Option<OpenCredentials> {
+        *self.file_write_credentials.lock()
+    }
+
+    pub(crate) fn replace_file_write_credentials(
+        &self,
+        replacement: Option<OpenCredentials>,
+    ) -> Option<OpenCredentials> {
+        core::mem::replace(&mut *self.file_write_credentials.lock(), replacement)
     }
 
     /// Get the clear child tid field.

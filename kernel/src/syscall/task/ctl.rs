@@ -671,36 +671,54 @@ pub fn sys_umask(mask: u32) -> AxResult<isize> {
 }
 
 pub fn sys_setreuid(ruid: u32, euid: u32) -> AxResult<isize> {
-    current().as_thread().setreuid(
-        (ruid != NO_ID_CHANGE).then_some(ruid),
-        (euid != NO_ID_CHANGE).then_some(euid),
-    )?;
+    let curr = current();
+    let thread = curr.as_thread();
+    let cred = thread.current_cred();
+    let map = |uid| {
+        (uid != NO_ID_CHANGE)
+            .then(|| cred.user_ns().make_kuid(uid).ok_or(AxError::InvalidInput))
+            .transpose()
+    };
+    thread.setreuid(map(ruid)?, map(euid)?)?;
     Ok(0)
 }
 
 pub fn sys_setregid(rgid: u32, egid: u32) -> AxResult<isize> {
-    current().as_thread().setregid(
-        (rgid != NO_ID_CHANGE).then_some(rgid),
-        (egid != NO_ID_CHANGE).then_some(egid),
-    )?;
+    let curr = current();
+    let thread = curr.as_thread();
+    let cred = thread.current_cred();
+    let map = |gid| {
+        (gid != NO_ID_CHANGE)
+            .then(|| cred.user_ns().make_kgid(gid).ok_or(AxError::InvalidInput))
+            .transpose()
+    };
+    thread.setregid(map(rgid)?, map(egid)?)?;
     Ok(0)
 }
 
 pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> AxResult<isize> {
-    current().as_thread().setresuid(
-        (ruid != NO_ID_CHANGE).then_some(ruid),
-        (euid != NO_ID_CHANGE).then_some(euid),
-        (suid != NO_ID_CHANGE).then_some(suid),
-    )?;
+    let curr = current();
+    let thread = curr.as_thread();
+    let cred = thread.current_cred();
+    let map = |uid| {
+        (uid != NO_ID_CHANGE)
+            .then(|| cred.user_ns().make_kuid(uid).ok_or(AxError::InvalidInput))
+            .transpose()
+    };
+    thread.setresuid(map(ruid)?, map(euid)?, map(suid)?)?;
     Ok(0)
 }
 
 pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> AxResult<isize> {
-    current().as_thread().setresgid(
-        (rgid != NO_ID_CHANGE).then_some(rgid),
-        (egid != NO_ID_CHANGE).then_some(egid),
-        (sgid != NO_ID_CHANGE).then_some(sgid),
-    )?;
+    let curr = current();
+    let thread = curr.as_thread();
+    let cred = thread.current_cred();
+    let map = |gid| {
+        (gid != NO_ID_CHANGE)
+            .then(|| cred.user_ns().make_kgid(gid).ok_or(AxError::InvalidInput))
+            .transpose()
+    };
+    thread.setresgid(map(rgid)?, map(egid)?, map(sgid)?)?;
     Ok(0)
 }
 

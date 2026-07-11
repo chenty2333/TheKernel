@@ -95,6 +95,7 @@ pub(crate) struct DacCredentialView {
     gid: u32,
     groups: Arc<GroupInfo>,
     effective: [u32; CAPABILITY_WORDS],
+    capabilities_apply_to_initial_user_ns: bool,
 }
 
 impl DacCredentialView {
@@ -103,12 +104,14 @@ impl DacCredentialView {
         gid: u32,
         groups: Arc<GroupInfo>,
         effective: [u32; CAPABILITY_WORDS],
+        capabilities_apply_to_initial_user_ns: bool,
     ) -> Self {
         Self {
             uid,
             gid,
             groups,
             effective,
+            capabilities_apply_to_initial_user_ns,
         }
     }
 
@@ -125,6 +128,9 @@ impl DacCredentialView {
     }
 
     pub(crate) fn has_capability(&self, cap: u32) -> bool {
+        if !self.capabilities_apply_to_initial_user_ns {
+            return false;
+        }
         let Some((word, mask)) = CapabilityState::cap_mask(cap) else {
             return false;
         };
@@ -143,7 +149,13 @@ impl DacCredentialView {
             .try_reserve_exact(source_groups.len())
             .map_err(|_| AxError::NoMemory)?;
         groups.extend_from_slice(source_groups);
-        Ok(Self::new(uid, gid, GroupInfo::try_new(groups)?, effective))
+        Ok(Self::new(
+            uid,
+            gid,
+            GroupInfo::try_new(groups)?,
+            effective,
+            true,
+        ))
     }
 }
 
@@ -271,12 +283,10 @@ impl Cred {
         self.ids
     }
 
-    pub(crate) fn euid(&self) -> u32 {
-        self.ids.euid
-    }
-
-    /// Reuses every immutable field except the namespace selected for an
-    /// unpublished clone child.
+    /// Creates the unpublished credential installed when a clone child enters
+    /// a newly created user namespace. Linux keeps kernel-global IDs and group
+    /// membership but resets namespace-relative capability state to a full,
+    /// unbounded set with default securebits.
     pub(crate) fn try_with_user_ns(
         current: &Arc<Self>,
         user_ns: Arc<UserNamespace>,
@@ -284,7 +294,7 @@ impl Cred {
         Arc::try_new(Self {
             ids: current.ids,
             groups: current.groups.clone(),
-            caps: current.caps,
+            caps: CapabilityState::full(),
             no_new_privs: current.no_new_privs,
             user_ns,
         })
@@ -307,7 +317,18 @@ impl Cred {
         &self.user_ns
     }
 
+    /// Returns whether this credential can use `cap` over a resource which has
+    /// not yet been assigned an owning user namespace. Such legacy/global
+    /// resources belong to the initial namespace; child-userns capability
+    /// bits must never silently become host authority.
     pub(crate) fn has_effective_capability(&self, cap: u32) -> bool {
+        self.user_ns.is_initial() && self.has_effective_capability_in_own_user_ns(cap)
+    }
+
+    /// Tests the capability set relative to this credential's own user
+    /// namespace. Callers must either operate on credential-local state or
+    /// have already selected the target namespace through `ns_capable()`.
+    pub(crate) fn has_effective_capability_in_own_user_ns(&self, cap: u32) -> bool {
         self.caps.has_effective(cap)
     }
 }
@@ -744,6 +765,43 @@ mod tests {
     }
 
     #[test]
+    fn entering_new_user_namespace_resets_namespace_relative_capabilities() {
+        let root_ns = UserNamespace::try_new_root().unwrap();
+        let slot = CredentialSlot::new(Cred::try_root(root_ns.clone()).unwrap());
+        let mut update = slot.prepare();
+        update.builder.caps.effective = [0; CAPABILITY_WORDS];
+        update.builder.caps.permitted = [0; CAPABILITY_WORDS];
+        update.builder.caps.bounding = [0; CAPABILITY_WORDS];
+        update.builder.no_new_privs = true;
+        let old = update.finish().unwrap().commit();
+
+        let child_ns = root_ns.try_fork(0, 0, false).unwrap();
+        let child = Cred::try_with_user_ns(&old, child_ns.clone()).unwrap();
+        let caps = child.capabilities();
+        assert!(Arc::ptr_eq(child.user_ns(), &child_ns));
+        assert_eq!(child.ids(), old.ids());
+        assert!(child.no_new_privs());
+        assert_eq!(caps.effective, CAPABILITY_VALID_MASK);
+        assert_eq!(caps.permitted, CAPABILITY_VALID_MASK);
+        assert_eq!(caps.bounding, CAPABILITY_VALID_MASK);
+        assert_eq!(caps.inheritable, [0; CAPABILITY_WORDS]);
+        assert_eq!(caps.ambient, [0; CAPABILITY_WORDS]);
+        assert_eq!(caps.securebits, 0);
+        assert!(child.has_effective_capability_in_own_user_ns(CAP_DAC_OVERRIDE));
+        assert!(!child.has_effective_capability(CAP_DAC_OVERRIDE));
+
+        let ids = child.ids();
+        let dac = DacCredentialView::new(
+            ids.fsuid,
+            ids.fsgid,
+            child.groups().clone(),
+            caps.effective,
+            child.user_ns().is_initial(),
+        );
+        assert!(!dac.has_capability(CAP_DAC_OVERRIDE));
+    }
+
+    #[test]
     fn concurrent_writers_preserve_each_others_fields() {
         const UPDATES: u32 = 500;
 
@@ -791,7 +849,7 @@ mod tests {
 
         let slot = slot();
         let root_ns = slot.current().user_ns().clone();
-        let child_ns = root_ns.try_fork(1000).unwrap();
+        let child_ns = root_ns.try_fork(1000, 100, false).unwrap();
 
         let publish = |slot: &CredentialSlot, first: bool| {
             let mut update = slot.prepare();

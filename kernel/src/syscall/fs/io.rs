@@ -1021,34 +1021,36 @@ pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
         crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
     }
     let f = get_file_like(fd)?;
-    let regular_file = if let Some(file) = f.downcast_ref::<File>() {
-        validate_direct_io(file, buf as usize, len, current_file_offset(file.inner())?)?;
-        Some(file)
-    } else {
-        None
-    };
-    if let Some(file) = regular_file {
-        let fast_read = match try_regular_file_read_user_slice(file, buf, len)? {
-            Some(read) => Some(read),
-            None => try_regular_file_read_user_segments(file, buf, len)?,
+    f.with_read_credentials(|| {
+        let regular_file = if let Some(file) = f.downcast_ref::<File>() {
+            validate_direct_io(file, buf as usize, len, current_file_offset(file.inner())?)?;
+            Some(file)
+        } else {
+            None
         };
-        if let Some(read) = fast_read {
-            let read = read as isize;
-            if read > 0 {
-                notify_read(fd);
+        if let Some(file) = regular_file {
+            let fast_read = match try_regular_file_read_user_slice(file, buf, len)? {
+                Some(read) => Some(read),
+                None => try_regular_file_read_user_segments(file, buf, len)?,
+            };
+            if let Some(read) = fast_read {
+                let read = read as isize;
+                if read > 0 {
+                    notify_read(fd);
+                }
+                return Ok(read);
             }
-            return Ok(read);
+            if len >= USER_COPY_PREFAULT_MIN {
+                let offset = current_file_offset(file.inner())?;
+                prefault_regular_file_read_fallback(file, buf, len, offset)?;
+            }
         }
-        if len >= USER_COPY_PREFAULT_MIN {
-            let offset = current_file_offset(file.inner())?;
-            prefault_regular_file_read_fallback(file, buf, len, offset)?;
+        let read = f.read(&mut VmBytesMut::new(buf, len))? as isize;
+        if read > 0 {
+            notify_read(fd);
         }
-    }
-    let read = f.read(&mut VmBytesMut::new(buf, len))? as isize;
-    if read > 0 {
-        notify_read(fd);
-    }
-    Ok(read)
+        Ok(read)
+    })
 }
 
 pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
@@ -1058,26 +1060,28 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     }
     let f = get_file_like(fd)?;
     let iov = IoVectorBuf::new(iov, iovcnt)?;
-    let regular_file = if let Some(file) = f.downcast_ref::<File>() {
-        validate_direct_iov(file, &iov, current_file_offset(file.inner())?)?;
-        Some(file)
-    } else {
-        None
-    };
-    if let Some(file) = regular_file {
-        if let Some(read) = try_regular_file_readv_user_segments(file, &iov)? {
+    f.with_read_credentials(|| {
+        let regular_file = if let Some(file) = f.downcast_ref::<File>() {
+            validate_direct_iov(file, &iov, current_file_offset(file.inner())?)?;
+            Some(file)
+        } else {
+            None
+        };
+        if let Some(file) = regular_file
+            && let Some(read) = try_regular_file_readv_user_segments(file, &iov)?
+        {
             let read = read as isize;
             if read > 0 {
                 notify_read(fd);
             }
             return Ok(read);
         }
-    }
-    let read = f.read(&mut iov.into_io())? as isize;
-    if read > 0 {
-        notify_read(fd);
-    }
-    Ok(read)
+        let read = f.read(&mut iov.into_io())? as isize;
+        if read > 0 {
+            notify_read(fd);
+        }
+        Ok(read)
+    })
 }
 
 /// Write data to the file indicated by `fd`.
@@ -1091,11 +1095,7 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
         if len != 0 {
             check_writable_mount(file.inner().location())?;
         }
-        let offset = if file.inner().flags().contains(FileFlags::APPEND) {
-            file.inner().location().len()?
-        } else {
-            current_file_offset(file.inner())?
-        };
+        let offset = current_write_offset(file.inner())?;
         validate_direct_io(file, buf as usize, len, offset)?;
         Some(file)
     } else {
@@ -1118,11 +1118,7 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     }
     let written = f.with_write_credentials(|| {
         if let Some(file) = regular_file.filter(|_| len >= USER_COPY_PREFAULT_MIN) {
-            let offset = if file.inner().flags().contains(FileFlags::APPEND) {
-                file.inner().location().len()?
-            } else {
-                current_file_offset(file.inner())?
-            };
+            let offset = current_write_offset(file.inner())?;
             let allowed = allowed_write_len(offset, len)?;
             prefault_regular_file_write_fallback(file, buf as *const u8, allowed)?;
         }
@@ -1144,11 +1140,7 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> 
         if iov.len() != 0 {
             check_writable_mount(file.inner().location())?;
         }
-        let offset = if file.inner().flags().contains(FileFlags::APPEND) {
-            file.inner().location().len()?
-        } else {
-            current_file_offset(file.inner())?
-        };
+        let offset = current_write_offset(file.inner())?;
         validate_direct_iov(file.as_ref(), &iov, offset)?;
         let written = file.with_write_credentials(|| {
             if let Some(written) = try_regular_file_writev_user_segments(file.as_ref(), &iov)? {
@@ -1211,10 +1203,24 @@ fn positioned_file(fd: c_int, access: FileFlags) -> AxResult<FileHandle<File>> {
     Ok(file)
 }
 
-fn positioned_write_file(fd: c_int) -> AxResult<FileHandle<File>> {
+fn write_file(fd: c_int) -> AxResult<FileHandle<File>> {
     let file = positioned_file(fd, FileFlags::WRITE)?;
     check_writable_mount(file.inner().location())?;
     executable::check_not_active(file.inner().location())?;
+    Ok(file)
+}
+
+fn check_positioned_write_flags(flags: NodeFlags) -> AxResult<()> {
+    if flags.contains(NodeFlags::NO_POSITIONED_WRITE) {
+        Err(LinuxError::ESPIPE.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn positioned_write_file(fd: c_int) -> AxResult<FileHandle<File>> {
+    let file = write_file(fd)?;
+    check_positioned_write_flags(file.inner().location().flags())?;
     Ok(file)
 }
 
@@ -1245,6 +1251,19 @@ fn regular_copy_file(fd: c_int, write: bool) -> AxResult<FileHandle<File>> {
 fn current_file_offset(file: &axfs::File) -> AxResult<u64> {
     let mut file = file;
     file.seek(SeekFrom::Current(0))
+}
+
+fn current_write_offset(file: &axfs::File) -> AxResult<u64> {
+    let inode_append = file.flags().contains(FileFlags::APPEND)
+        && !file
+            .location()
+            .flags()
+            .contains(NodeFlags::POSITIONED_APPEND);
+    if inode_append {
+        file.location().len()
+    } else {
+        current_file_offset(file)
+    }
 }
 
 fn has_mandatory_lock_mode(loc: &axfs_ng_vfs::Location) -> AxResult<bool> {
@@ -1373,33 +1392,35 @@ fn do_preadv(
     if iov.len() != 0 {
         crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
     }
-    let read = if offset == -1 {
-        validate_direct_iov(file.as_ref(), &iov, current_file_offset(file.inner())?)?;
-        if let Some(read) = try_regular_file_readv_user_segments(file.as_ref(), &iov)? {
-            if read > 0 {
-                notify_read(fd);
+    file.with_read_credentials(|| {
+        let read = if offset == -1 {
+            validate_direct_iov(file.as_ref(), &iov, current_file_offset(file.inner())?)?;
+            if let Some(read) = try_regular_file_readv_user_segments(file.as_ref(), &iov)? {
+                if read > 0 {
+                    notify_read(fd);
+                }
+                return Ok(read as _);
             }
-            return Ok(read as _);
-        }
-        let mut io = iov.into_io();
-        file.read(&mut io)?
-    } else {
-        validate_direct_iov(file.as_ref(), &iov, offset as u64)?;
-        if let Some(read) =
-            try_regular_file_preadv_user_segments(file.as_ref(), &iov, offset as u64)?
-        {
-            if read > 0 {
-                notify_read(fd);
+            let mut io = iov.into_io();
+            file.read(&mut io)?
+        } else {
+            validate_direct_iov(file.as_ref(), &iov, offset as u64)?;
+            if let Some(read) =
+                try_regular_file_preadv_user_segments(file.as_ref(), &iov, offset as u64)?
+            {
+                if read > 0 {
+                    notify_read(fd);
+                }
+                return Ok(read as _);
             }
-            return Ok(read as _);
+            let io = iov.into_io();
+            file.inner().read_at(io, offset as u64)?
+        } as isize;
+        if read > 0 {
+            notify_read(fd);
         }
-        let io = iov.into_io();
-        file.inner().read_at(io, offset as u64)?
-    } as isize;
-    if read > 0 {
-        notify_read(fd);
-    }
-    Ok(read)
+        Ok(read)
+    })
 }
 
 fn do_pwritev(
@@ -1417,16 +1438,18 @@ fn do_pwritev(
         return Err(AxError::InvalidInput);
     }
 
-    let file = positioned_write_file(fd)?;
+    // pwritev2(offset = -1) is an ordinary current-position write. Only an
+    // explicit offset requires positioned-write support.
+    let file = if offset == -1 {
+        write_file(fd)?
+    } else {
+        positioned_write_file(fd)?
+    };
     let io = IoVectorBuf::new(iov, iovcnt)?;
     let written = file.with_write_credentials(|| {
         if offset == -1 {
             let appending = file.inner().flags().contains(FileFlags::APPEND);
-            let write_offset = if appending {
-                file.inner().location().len()?
-            } else {
-                current_file_offset(file.inner())?
-            };
+            let write_offset = current_write_offset(file.inner())?;
             validate_direct_iov(file.as_ref(), &io, write_offset)?;
             let allowed = allowed_write_len(write_offset, io.len())?;
             memfd::check_write(file.inner().location(), write_offset, allowed)?;
@@ -1843,24 +1866,27 @@ pub fn sys_pread64(fd: c_int, buf: *mut u8, len: usize, offset: __kernel_off_t) 
     if len != 0 {
         crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
     }
-    let fast_read = match try_regular_file_pread_user_slice(f.as_ref(), buf, len, offset as u64)? {
-        Some(read) => Some(read),
-        None => try_regular_file_pread_user_segments(f.as_ref(), buf, len, offset as u64)?,
-    };
-    if let Some(read) = fast_read {
+    f.with_read_credentials(|| {
+        let fast_read =
+            match try_regular_file_pread_user_slice(f.as_ref(), buf, len, offset as u64)? {
+                Some(read) => Some(read),
+                None => try_regular_file_pread_user_segments(f.as_ref(), buf, len, offset as u64)?,
+            };
+        if let Some(read) = fast_read {
+            if read > 0 {
+                notify_read(fd);
+            }
+            return Ok(read as _);
+        }
+        if len >= USER_COPY_PREFAULT_MIN {
+            prefault_regular_file_read_fallback(f.as_ref(), buf, len, offset as u64)?;
+        }
+        let read = f.inner().read_at(VmBytesMut::new(buf, len), offset as _)?;
         if read > 0 {
             notify_read(fd);
         }
-        return Ok(read as _);
-    }
-    if len >= USER_COPY_PREFAULT_MIN {
-        prefault_regular_file_read_fallback(f.as_ref(), buf, len, offset as u64)?;
-    }
-    let read = f.inner().read_at(VmBytesMut::new(buf, len), offset as _)?;
-    if read > 0 {
-        notify_read(fd);
-    }
-    Ok(read as _)
+        Ok(read as _)
+    })
 }
 
 pub fn sys_pwrite64(
@@ -1872,10 +1898,13 @@ pub fn sys_pwrite64(
     if offset < 0 {
         return Err(AxError::InvalidInput);
     }
+    // Validate the descriptor and FMODE_PWRITE-equivalent capability even
+    // for a zero-length request. Proc id-map controls return ESPIPE here
+    // rather than a silent zero-byte success.
+    let f = positioned_write_file(fd)?;
     if len == 0 {
         return Ok(0);
     }
-    let f = positioned_write_file(fd)?;
     let write = f.with_write_credentials(|| {
         if f.inner().flags().contains(FileFlags::APPEND) {
             let append_offset = f.inner().location().len()?;
@@ -1992,10 +2021,11 @@ impl SendFile {
 
     fn read(&mut self, mut buf: &mut [u8]) -> AxResult<usize> {
         match self {
-            SendFile::Direct(file) => file.read(&mut buf),
+            SendFile::Direct(file) => file.with_read_credentials(|| file.read(&mut buf)),
             SendFile::Offset(file, offset) => {
                 let off = offset.vm_read()?;
-                let bytes_read = file.inner().read_at(&mut buf, off)?;
+                let bytes_read =
+                    file.with_read_credentials(|| file.inner().read_at(&mut buf, off))?;
                 offset.vm_write(checked_offset_advance(off, bytes_read)?)?;
                 Ok(bytes_read)
             }
@@ -2009,6 +2039,7 @@ impl SendFile {
                 let off = offset.vm_read()?;
                 check_writable_mount(file.inner().location())?;
                 executable::check_not_active(file.inner().location())?;
+                check_positioned_write_flags(file.inner().location().flags())?;
                 let allowed = allowed_write_len(off, buf.len())?;
                 if allowed == 0 {
                     return Ok(0);
@@ -2350,4 +2381,200 @@ pub fn sys_vmsplice(fd: c_int, iov: *const IoVec, nr_segs: usize, flags: u32) ->
     };
 
     result.map(|n| n as _)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::{Arc, Weak};
+    use core::{
+        any::Any,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        task::Context,
+        time::Duration,
+    };
+
+    use axfs_ng_vfs::{
+        DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata, MetadataUpdate,
+        Mountpoint, NodeOps, NodePermission, NodeType, Reference, StatFs, VfsError, VfsResult,
+    };
+
+    use super::*;
+
+    struct IoContractFs {
+        this: Weak<Self>,
+        flags: NodeFlags,
+        size: u64,
+        fail_open: AtomicBool,
+        open_calls: AtomicUsize,
+        set_len_calls: AtomicUsize,
+    }
+
+    impl IoContractFs {
+        fn new(flags: NodeFlags, size: u64) -> Arc<Self> {
+            Arc::new_cyclic(|this| Self {
+                this: this.clone(),
+                flags,
+                size,
+                fail_open: AtomicBool::new(false),
+                open_calls: AtomicUsize::new(0),
+                set_len_calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn location(self: &Arc<Self>) -> Location {
+            let filesystem = Filesystem::new(self.clone());
+            Mountpoint::new_root(&filesystem).root_location()
+        }
+    }
+
+    impl FilesystemOps for IoContractFs {
+        fn name(&self) -> &str {
+            "io-contract-test"
+        }
+
+        fn root_dir(&self) -> DirEntry {
+            let fs = self.this.upgrade().expect("test filesystem is live");
+            DirEntry::new_file(
+                FileNode::new(Arc::new(IoContractNode { fs })),
+                NodeType::RegularFile,
+                Reference::root(),
+            )
+        }
+
+        fn stat(&self) -> VfsResult<StatFs> {
+            Ok(StatFs {
+                fs_type: 0,
+                block_size: 4096,
+                blocks: 0,
+                blocks_free: 0,
+                blocks_available: 0,
+                file_count: 1,
+                free_file_count: 0,
+                name_length: 255,
+                fragment_size: 4096,
+                mount_flags: 0,
+            })
+        }
+    }
+
+    struct IoContractNode {
+        fs: Arc<IoContractFs>,
+    }
+
+    impl NodeOps for IoContractNode {
+        fn inode(&self) -> u64 {
+            1
+        }
+
+        fn metadata(&self) -> VfsResult<Metadata> {
+            Ok(Metadata {
+                device: 0,
+                inode: 1,
+                nlink: 1,
+                mode: NodePermission::from_bits_truncate(0o600),
+                node_type: NodeType::RegularFile,
+                uid: 0,
+                gid: 0,
+                size: self.fs.size,
+                block_size: 4096,
+                blocks: 0,
+                rdev: Default::default(),
+                atime: Duration::ZERO,
+                btime: Duration::ZERO,
+                mtime: Duration::ZERO,
+                ctime: Duration::ZERO,
+            })
+        }
+
+        fn update_metadata(&self, _update: MetadataUpdate) -> VfsResult<()> {
+            Ok(())
+        }
+
+        fn filesystem(&self) -> &dyn FilesystemOps {
+            &*self.fs
+        }
+
+        fn sync(&self, _data_only: bool) -> VfsResult<()> {
+            Ok(())
+        }
+
+        fn flags(&self) -> NodeFlags {
+            self.fs.flags
+        }
+
+        fn open(&self, _read: bool, _write: bool) -> VfsResult<()> {
+            self.fs.open_calls.fetch_add(1, Ordering::AcqRel);
+            if self.fs.fail_open.load(Ordering::Acquire) {
+                Err(VfsError::PermissionDenied)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+            self
+        }
+    }
+
+    impl Pollable for IoContractNode {
+        fn poll(&self) -> IoEvents {
+            IoEvents::IN | IoEvents::OUT
+        }
+
+        fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+    }
+
+    impl FileNodeOps for IoContractNode {
+        fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
+            Ok(0)
+        }
+
+        fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
+            let _ = offset;
+            Ok(buf.len())
+        }
+
+        fn write_at_vectored(&self, bufs: &[&[u8]], offset: u64) -> VfsResult<usize> {
+            let _ = offset;
+            bufs.iter().try_fold(0usize, |total, buf| {
+                total.checked_add(buf.len()).ok_or(VfsError::InvalidInput)
+            })
+        }
+
+        fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {
+            Ok((buf.len(), self.fs.size + buf.len() as u64))
+        }
+
+        fn set_len(&self, _len: u64) -> VfsResult<()> {
+            self.fs.set_len_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+            Err(VfsError::InvalidInput)
+        }
+    }
+
+    #[test]
+    fn explicit_write_marker_maps_to_espipe_only() {
+        assert!(check_positioned_write_flags(NodeFlags::empty()).is_ok());
+        assert_eq!(
+            check_positioned_write_flags(NodeFlags::NO_POSITIONED_WRITE),
+            Err(AxError::from(LinuxError::ESPIPE))
+        );
+    }
+
+    #[test]
+    fn open_hook_rejects_before_truncate_side_effects() {
+        let fs = IoContractFs::new(NodeFlags::NON_CACHEABLE, 17);
+        fs.fail_open.store(true, Ordering::Release);
+        let mut options = OpenOptions::new();
+        options.write(true).truncate(true);
+        assert!(matches!(
+            options.open_loc(fs.location()),
+            Err(VfsError::PermissionDenied)
+        ));
+        assert_eq!(fs.open_calls.load(Ordering::Acquire), 1);
+        assert_eq!(fs.set_len_calls.load(Ordering::Acquire), 0);
+    }
 }

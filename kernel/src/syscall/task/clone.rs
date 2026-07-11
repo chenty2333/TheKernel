@@ -333,7 +333,18 @@ impl CloneArgs {
         // from the calling task. Each child receives its own publication slot.
         let parent_cred = calling_thread.current_cred();
         let child_cred = if flags.contains(CloneFlags::NEWUSER) {
-            let user_ns = parent_cred.user_ns().try_fork(parent_cred.euid())?;
+            // Match Linux current_chrooted(): creating a user namespace from
+            // a restricted filesystem root must not create authority which
+            // can be used to escape that root in later namespace slices.
+            if !FS_CONTEXT.lock().root_dir().is_root() {
+                return Err(AxError::OperationNotPermitted);
+            }
+            let ids = parent_cred.ids();
+            let user_ns = parent_cred.user_ns().try_fork(
+                ids.euid,
+                ids.egid,
+                parent_cred.has_effective_capability_in_own_user_ns(CAP_SETFCAP),
+            )?;
             Cred::try_with_user_ns(&parent_cred, user_ns)?
         } else {
             parent_cred
