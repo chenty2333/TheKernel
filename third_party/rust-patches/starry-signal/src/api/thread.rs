@@ -237,15 +237,49 @@ impl ThreadSignalManager {
             SignalDisposition::Ignore => None,
             SignalDisposition::Handler(handler) => {
                 let layout = Layout::new::<SignalFrame>();
-                let stack = self.stack.lock();
-                let sp = if stack.disabled() || !action.flags.contains(SignalActionFlags::ONSTACK) {
-                    uctx.sp()
+                let stack = self.stack.lock().clone();
+                let already_on_altstack = stack.contains_sp(uctx.sp());
+                let use_altstack = action.flags.contains(SignalActionFlags::ONSTACK)
+                    && !stack.disabled()
+                    && !already_on_altstack;
+                let sp = if use_altstack {
+                    let Some(top) = stack.checked_top() else {
+                        return Some(SignalOSAction::CoreDump);
+                    };
+                    top
                 } else {
-                    stack.sp + stack.size
+                    uctx.sp()
                 };
-                drop(stack);
 
-                let aligned_sp = (sp - layout.size()) & !(layout.align() - 1);
+                let Some(frame_start) = sp.checked_sub(layout.size()) else {
+                    return Some(SignalOSAction::CoreDump);
+                };
+                let aligned_sp = frame_start & !(layout.align() - 1);
+                let Some(siginfo_ptr) = aligned_sp.checked_add(offset_of!(SignalFrame, siginfo))
+                else {
+                    return Some(SignalOSAction::CoreDump);
+                };
+                let Some(ucontext_ptr) = aligned_sp.checked_add(offset_of!(SignalFrame, ucontext))
+                else {
+                    return Some(SignalOSAction::CoreDump);
+                };
+
+                #[cfg(target_arch = "x86_64")]
+                let Some(published_sp) = aligned_sp.checked_sub(core::mem::size_of::<usize>())
+                else {
+                    return Some(SignalOSAction::CoreDump);
+                };
+                #[cfg(not(target_arch = "x86_64"))]
+                let published_sp = aligned_sp;
+
+                if use_altstack || already_on_altstack {
+                    let Some(frame_span) = sp.checked_sub(published_sp) else {
+                        return Some(SignalOSAction::CoreDump);
+                    };
+                    if !stack.contains_range(published_sp, frame_span) {
+                        return Some(SignalOSAction::CoreDump);
+                    }
+                }
 
                 let frame_ptr = aligned_sp as *mut SignalFrame;
                 if frame_ptr
@@ -255,21 +289,22 @@ impl ThreadSignalManager {
                     return Some(SignalOSAction::CoreDump);
                 }
 
-                uctx.set_ip(handler);
-                uctx.set_sp(aligned_sp);
-                uctx.set_arg0(signo as _);
-                uctx.set_arg1(aligned_sp + offset_of!(SignalFrame, siginfo));
-                uctx.set_arg2(aligned_sp + offset_of!(SignalFrame, ucontext));
-
                 let restorer = action.restorer.unwrap_or(self.proc.default_restorer);
                 #[cfg(target_arch = "x86_64")]
                 {
-                    let new_sp = uctx.sp() - 8;
-                    if (new_sp as *mut usize).vm_write(restorer).is_err() {
+                    if (published_sp as *mut usize).vm_write(restorer).is_err() {
                         return Some(SignalOSAction::CoreDump);
                     }
-                    uctx.set_sp(new_sp);
                 }
+
+                // Publish the new execution context only after every user
+                // write has succeeded. A failed frame/restorer copy therefore
+                // cannot leave a partially installed handler context.
+                uctx.set_ip(handler);
+                uctx.set_sp(published_sp);
+                uctx.set_arg0(signo as _);
+                uctx.set_arg1(siginfo_ptr);
+                uctx.set_arg2(ucontext_ptr);
                 #[cfg(not(target_arch = "x86_64"))]
                 uctx.set_ra(restorer);
 

@@ -1,7 +1,7 @@
 use core::{fmt, mem};
 
 use derive_more::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
-use linux_raw_sys::general::{SI_KERNEL, SS_DISABLE, kernel_sigset_t, siginfo_t};
+use linux_raw_sys::general::{SI_KERNEL, SS_DISABLE, SS_ONSTACK, kernel_sigset_t, siginfo_t};
 use strum::{EnumIter, FromRepr, IntoEnumIterator};
 
 use crate::DefaultSignalAction;
@@ -308,5 +308,47 @@ impl SignalStack {
     /// Checks if signal stack is disabled.
     pub fn disabled(&self) -> bool {
         self.flags == SS_DISABLE
+    }
+
+    /// Returns the exclusive top of the configured alternate stack.
+    ///
+    /// A userspace-provided base and length are not trusted to fit in the
+    /// address space. Callers must treat `None` as an unusable stack instead
+    /// of allowing integer wraparound to select a kernel or low address.
+    pub fn checked_top(&self) -> Option<usize> {
+        (!self.disabled())
+            .then(|| self.sp.checked_add(self.size))
+            .flatten()
+    }
+
+    /// Implements Linux's overflow-safe `on_sig_stack()` range predicate.
+    /// The exclusive base/inclusive-top shape matches the kernel rule for a
+    /// downward-growing stack pointer.
+    pub fn contains_sp(&self, sp: usize) -> bool {
+        !self.disabled() && sp > self.sp && sp.wrapping_sub(self.sp) <= self.size
+    }
+
+    /// Returns the flags Linux exposes when querying `sigaltstack(2)` at the
+    /// supplied userspace stack pointer.
+    pub fn flags_at(&self, sp: usize) -> u32 {
+        if self.disabled() {
+            SS_DISABLE
+        } else if self.contains_sp(sp) {
+            SS_ONSTACK
+        } else {
+            0
+        }
+    }
+
+    /// Checks that a complete object range remains within this alternate
+    /// stack. This is used before publishing a nested signal frame.
+    pub fn contains_range(&self, start: usize, len: usize) -> bool {
+        if self.disabled() || start < self.sp {
+            return false;
+        }
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        self.checked_top().is_some_and(|top| end <= top)
     }
 }

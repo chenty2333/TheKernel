@@ -539,38 +539,73 @@ pub fn sys_rt_sigsuspend(
     Err(AxError::Interrupted)
 }
 
-pub fn sys_sigaltstack(ss: *const SignalStack, old_ss: *mut SignalStack) -> AxResult<isize> {
+fn prepare_sigaltstack_update(
+    current_stack: &SignalStack,
+    current_sp: usize,
+    candidate: SignalStack,
+) -> AxResult<SignalStack> {
+    let valid_flags = SS_DISABLE as u32;
+    if candidate.flags & !valid_flags != 0 || candidate.flags & SS_ONSTACK as u32 != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if current_stack.contains_sp(current_sp) {
+        return Err(AxError::OperationNotPermitted);
+    }
+    if candidate.flags == SS_DISABLE as u32 {
+        return Ok(SignalStack::default());
+    }
+    if candidate.size < MINSIGSTKSZ as usize {
+        return Err(AxError::NoMemory);
+    }
+    if candidate.sp.checked_add(candidate.size).is_none() {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(candidate)
+}
+
+pub fn sys_sigaltstack(
+    uctx: &UserContext,
+    ss: *const SignalStack,
+    old_ss: *mut SignalStack,
+) -> AxResult<isize> {
     let curr = current();
     let sig = &curr.as_thread().signal;
+    let current_stack = sig.stack();
+
+    // Read and validate the proposed state before writing `old_ss`. Besides
+    // keeping publication last, this gives overlapping `ss == old_ss` the
+    // Linux ordering: the input value is captured before the old state is
+    // copied back to the same userspace address.
+    let prepared = if let Some(ss) = ss.nullable() {
+        let candidate = unsafe { ss.vm_read_uninit()?.assume_init() };
+        Some(prepare_sigaltstack_update(
+            &current_stack,
+            uctx.sp(),
+            candidate,
+        )?)
+    } else {
+        None
+    };
 
     if let Some(old_ss) = old_ss.nullable() {
-        old_ss.vm_write(sig.stack())?;
+        let mut visible_stack = current_stack.clone();
+        visible_stack.flags = current_stack.flags_at(uctx.sp());
+        old_ss.vm_write(visible_stack)?;
     }
 
-    if let Some(ss) = ss.nullable() {
-        let ss = unsafe { ss.vm_read_uninit()?.assume_init() };
-        let valid_flags = SS_DISABLE as u32;
-        if ss.flags & !valid_flags != 0 || ss.flags & SS_ONSTACK as u32 != 0 {
-            return Err(AxError::InvalidInput);
-        }
-        if ss.flags == SS_DISABLE as u32 {
-            sig.set_stack(SignalStack::default());
-            return Ok(0);
-        }
-        if ss.size < MINSIGSTKSZ as usize {
-            return Err(AxError::NoMemory);
-        }
-        sig.set_stack(ss);
+    if let Some(prepared) = prepared {
+        sig.set_stack(prepared);
     }
     Ok(0)
 }
 
 #[cfg(test)]
 mod tests {
-    use linux_raw_sys::general::{SI_TKILL, SI_USER};
-    use starry_signal::{SignalInfo, Signo};
+    use axerrno::AxError;
+    use linux_raw_sys::general::{MINSIGSTKSZ, SI_TKILL, SI_USER, SS_DISABLE, SS_ONSTACK};
+    use starry_signal::{SignalInfo, SignalStack, Signo};
 
-    use super::{parse_signo, queued_signal_required};
+    use super::{parse_signo, prepare_sigaltstack_update, queued_signal_required};
 
     #[test]
     fn signal_numbers_are_range_checked_before_narrowing() {
@@ -600,5 +635,62 @@ mod tests {
             SI_TKILL,
             1,
         ))));
+    }
+
+    #[test]
+    fn sigaltstack_update_rejects_onstack_mutation_and_wrapping_ranges() {
+        let current = SignalStack {
+            sp: 0x1000,
+            flags: 0,
+            size: 0x2000,
+        };
+        let replacement = SignalStack {
+            sp: 0x8000,
+            flags: 0,
+            size: MINSIGSTKSZ as usize,
+        };
+        assert_eq!(
+            prepare_sigaltstack_update(&current, 0x1800, replacement.clone()).err(),
+            Some(AxError::OperationNotPermitted)
+        );
+        assert_eq!(
+            prepare_sigaltstack_update(
+                &current,
+                0x4000,
+                SignalStack {
+                    sp: usize::MAX - 8,
+                    flags: 0,
+                    size: MINSIGSTKSZ as usize,
+                },
+            )
+            .err(),
+            Some(AxError::InvalidInput)
+        );
+        assert_eq!(
+            prepare_sigaltstack_update(
+                &current,
+                0x4000,
+                SignalStack {
+                    sp: 0x8000,
+                    flags: SS_ONSTACK,
+                    size: MINSIGSTKSZ as usize,
+                },
+            )
+            .err(),
+            Some(AxError::InvalidInput)
+        );
+        assert!(
+            prepare_sigaltstack_update(
+                &current,
+                0x4000,
+                SignalStack {
+                    sp: 1,
+                    flags: SS_DISABLE,
+                    size: 1,
+                },
+            )
+            .unwrap()
+            .disabled()
+        );
     }
 }

@@ -59,6 +59,9 @@ The current bounded-signal modernization slice additionally maintains:
   detach already-owned state;
 - `kspin/smp` in the maintained `Cargo.toml` so standalone concurrent tests
   use a real inter-CPU lock instead of the single-core no-lock specialization;
+- overflow-safe alternate-stack bounds, dynamically derived `SS_ONSTACK`
+  status, nested `SA_ONSTACK` frame placement below the active frame, and
+  transactional handler-context publication after all userspace writes;
 - ABI flag and `SignalInfo` compatibility updates.
 
 The bounded queue and low-resource behavior are compared against Linux commit

@@ -1,7 +1,8 @@
 use axcpu::uspace::UserContext;
+use linux_raw_sys::general::{SS_DISABLE, SS_ONSTACK};
 use starry_signal::{
-    SignalActionFlags, SignalDisposition, SignalInfo, SignalOSAction, SignalSet, Signo,
-    api::SignalFrame, arch::SignalContextError,
+    SignalActionFlags, SignalDisposition, SignalInfo, SignalOSAction, SignalSet, SignalStack,
+    Signo, api::SignalFrame, arch::SignalContextError,
 };
 
 mod common;
@@ -49,6 +50,106 @@ fn handle_signal() {
     assert_eq!(uctx.ip(), test_handler as *const () as usize);
     assert!(uctx.sp() < initial.sp());
     assert_eq!(uctx.arg0(), signo as usize);
+}
+
+#[test]
+fn alternate_stack_status_and_bounds_are_overflow_safe() {
+    let disabled = SignalStack::default();
+    assert_eq!(disabled.flags_at(0x2000), SS_DISABLE);
+    assert!(!disabled.contains_sp(0x2000));
+
+    let stack = SignalStack {
+        sp: 0x1000,
+        flags: 0,
+        size: 0x1000,
+    };
+    assert_eq!(stack.checked_top(), Some(0x2000));
+    assert!(!stack.contains_sp(0x1000));
+    assert!(stack.contains_sp(0x1001));
+    assert!(stack.contains_sp(0x2000));
+    assert!(!stack.contains_sp(0x2001));
+    assert_eq!(stack.flags_at(0x1800), SS_ONSTACK);
+    assert_eq!(stack.flags_at(0x2001), 0);
+    assert!(stack.contains_range(0x1001, 0xfff));
+    assert!(stack.contains_range(0x1000, 0x1000));
+
+    let overflowing = SignalStack {
+        sp: usize::MAX - 8,
+        flags: 0,
+        size: 16,
+    };
+    assert_eq!(overflowing.checked_top(), None);
+    assert!(!overflowing.contains_range(usize::MAX - 4, 8));
+}
+
+#[test]
+fn nested_onstack_signal_uses_remaining_stack_instead_of_reusing_top() {
+    let (proc, thr) = new_test_env();
+    let signo = Signo::SIGTERM;
+    let sig = SignalInfo::new_user(signo, 9, 9);
+
+    unsafe extern "C" fn test_handler(_: i32) {}
+    {
+        let mut actions = proc.actions.lock();
+        let action = &mut actions[signo];
+        action.disposition = SignalDisposition::Handler(test_handler as usize);
+        action.flags.insert(SignalActionFlags::ONSTACK);
+    }
+
+    let alt_top = initial_sp();
+    let alt_size = 0x8000;
+    let alt_stack = SignalStack {
+        sp: alt_top - alt_size,
+        flags: 0,
+        size: alt_size,
+    };
+    thr.set_stack(alt_stack.clone());
+
+    let mut uctx = UserContext::new(0, initial_sp().into(), 0);
+    let action = proc.actions.lock()[signo].clone();
+    assert_eq!(
+        thr.handle_signal(&mut uctx, thr.blocked(), &sig, &action),
+        Some(SignalOSAction::Handler)
+    );
+    let outer_sp = uctx.sp();
+    assert!(alt_stack.contains_sp(outer_sp));
+
+    assert_eq!(
+        thr.handle_signal(&mut uctx, thr.blocked(), &sig, &action),
+        Some(SignalOSAction::Handler)
+    );
+    assert!(uctx.sp() < outer_sp);
+    assert!(alt_stack.contains_sp(uctx.sp()));
+}
+
+#[test]
+fn overflowing_alternate_stack_fails_without_publishing_handler_context() {
+    let (proc, thr) = new_test_env();
+    let signo = Signo::SIGTERM;
+    let sig = SignalInfo::new_user(signo, 9, 9);
+
+    unsafe extern "C" fn test_handler(_: i32) {}
+    {
+        let mut actions = proc.actions.lock();
+        let action = &mut actions[signo];
+        action.disposition = SignalDisposition::Handler(test_handler as usize);
+        action.flags.insert(SignalActionFlags::ONSTACK);
+    }
+    thr.set_stack(SignalStack {
+        sp: usize::MAX - 8,
+        flags: 0,
+        size: 16,
+    });
+
+    let initial = UserContext::new(0x1234, initial_sp().into(), 0);
+    let mut uctx = initial;
+    let action = proc.actions.lock()[signo].clone();
+    assert_eq!(
+        thr.handle_signal(&mut uctx, thr.blocked(), &sig, &action),
+        Some(SignalOSAction::CoreDump)
+    );
+    assert_eq!(uctx.ip(), initial.ip());
+    assert_eq!(uctx.sp(), initial.sp());
 }
 
 #[test]

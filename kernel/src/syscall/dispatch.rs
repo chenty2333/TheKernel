@@ -831,7 +831,11 @@ pub(super) fn dispatch_syscall(sysno: Sysno, uctx: &mut UserContext) -> AxResult
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
-        Sysno::sigaltstack => sys_sigaltstack(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::sigaltstack => {
+            let ss = uctx.arg0() as _;
+            let old_ss = uctx.arg1() as _;
+            sys_sigaltstack(uctx, ss, old_ss)
+        }
         Sysno::futex => sys_futex(
             uctx.arg0() as _,
             uctx.arg1() as _,
