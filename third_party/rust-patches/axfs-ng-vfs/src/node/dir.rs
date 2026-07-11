@@ -88,6 +88,12 @@ pub trait DirNodeOps: NodeOps {
     /// under the backend's namespace serialization. A VFS-level
     /// lookup-followed-by-create sequence is not an atomic replacement for
     /// that contract.
+    ///
+    /// When `options.initial_data` is present, a newly created entry must
+    /// contain that exact prepared allocation before the backend makes `name`
+    /// visible. Existing entries returned by [`CreateDisposition::OpenOrCreate`]
+    /// are left unchanged. Backends must use [`NamedCreateOptions::install_initial_data`]
+    /// rather than invoking caller code under namespace serialization.
     fn create_named(
         &self,
         name: &str,
@@ -185,12 +191,24 @@ pub struct OpenOptions {
 /// [`crate::FilesystemOps::metadata_update_capabilities`] does not advertise.
 /// Every advertised field, however, must have its requested value before the
 /// new name becomes visible.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 pub struct NamedCreateOptions {
     pub node_type: NodeType,
     pub permission: NodePermission,
     pub owner: Option<(u32, u32)>,
     pub rdev: Option<DeviceId>,
+    pub initial_data: Option<super::InitialNodeData>,
+}
+
+impl NamedCreateOptions {
+    /// Installs already admitted opaque data while the backend still excludes
+    /// lookup of the new name. No caller callback is executed here.
+    pub fn install_initial_data(&self, entry: &DirEntry) -> VfsResult<()> {
+        if let Some(data) = self.initial_data.as_ref() {
+            entry.install_initial_data(data.clone())?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -537,6 +555,7 @@ impl DirNode {
                 permission,
                 owner: None,
                 rdev: None,
+                initial_data: None,
             },
             CreateDisposition::Exclusive,
         )
@@ -614,6 +633,7 @@ impl DirNode {
                     permission: options.permission,
                     owner: options.user,
                     rdev: None,
+                    initial_data: None,
                 },
                 if options.create_new {
                     CreateDisposition::Exclusive

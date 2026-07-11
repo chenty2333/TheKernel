@@ -1324,11 +1324,13 @@ mod tests {
                     Err(err) => return Err(err),
                 }
             }
+            let entry = match options.node_type {
+                NodeType::Directory => self.child(name),
+                node_type => self.file(name, node_type, ""),
+            };
+            options.install_initial_data(&entry)?;
             Ok(CreateOutcome {
-                entry: match options.node_type {
-                    NodeType::Directory => self.child(name),
-                    node_type => self.file(name, node_type, ""),
-                },
+                entry,
                 created: true,
             })
         }

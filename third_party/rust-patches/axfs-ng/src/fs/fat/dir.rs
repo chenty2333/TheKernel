@@ -326,7 +326,7 @@ impl DirNodeOps for FatDirNode {
         let create_directory = match options.node_type {
             NodeType::RegularFile => false,
             NodeType::Directory => true,
-            _ => return Err(VfsError::InvalidInput),
+            _ => return Err(VfsError::OperationNotSupported),
         };
         let reference_name = try_ascii_lowercase(name)?;
         let reference = Reference::new(Some(self.this_entry()?), reference_name);
@@ -341,6 +341,7 @@ impl DirNodeOps for FatDirNode {
                 FatFileNode::try_new_pending(self.fs.clone(), inode, admission.state(), reference)?;
             (entry, PendingFatNode::File(node))
         };
+        options.install_initial_data(&entry)?;
 
         let position = match pending {
             PendingFatNode::File(node) => {

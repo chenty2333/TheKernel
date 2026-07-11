@@ -8,8 +8,8 @@ use core::{
 use axfs_ng_vfs::{
     CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps,
     FileNode, FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NamedCreateOptions, NodeFlags,
-    NodeOps, NodePermission, NodeType, Reference, RenameRequest, UnlinkRequest, VfsError,
-    VfsResult, WeakDirEntry,
+    NodeOps, NodePermission, NodeType, NodeUserData, Reference, RenameRequest, UnlinkRequest,
+    VfsError, VfsResult, WeakDirEntry,
 };
 use axhal::time::wall_time;
 use axpoll::{IoEvents, Pollable};
@@ -17,7 +17,7 @@ use lwext4_rust::{FileAttr, InodeToken, InodeType, ffi::ENOENT};
 use spin::Once;
 
 use super::{
-    Ext4Filesystem,
+    Ext4Filesystem, RuntimeReservation,
     util::{LwExt4Filesystem, into_vfs_err, into_vfs_type},
 };
 
@@ -50,10 +50,26 @@ struct InodeBinding {
 pub(crate) struct PreparedInodeEntry {
     inode: Arc<Inode>,
     entry: DirEntry,
+    runtime_reservation: Option<(RuntimeReservation, Arc<NodeUserData>)>,
 }
 
 impl PreparedInodeEntry {
-    pub(crate) fn bind(self, token: InodeToken, namespace_epoch: Arc<AtomicU64>) -> DirEntry {
+    pub(crate) fn install_initial_data(&mut self, options: &NamedCreateOptions) -> VfsResult<()> {
+        let Some(initial_data) = options.initial_data.clone() else {
+            return Ok(());
+        };
+        let runtime = Arc::try_new(NodeUserData::new()).map_err(|_| VfsError::NoMemory)?;
+        runtime.install_initial_data(initial_data)?;
+        let reservation = self.inode.fs.reserve_runtime_attachment()?;
+        self.runtime_reservation = Some((reservation, runtime));
+        Ok(())
+    }
+
+    pub(crate) fn bind(mut self, token: InodeToken, namespace_epoch: Arc<AtomicU64>) -> DirEntry {
+        if let Some((reservation, runtime)) = self.runtime_reservation.take() {
+            let runtime = reservation.commit(token, runtime);
+            self.inode.attach_runtime(runtime);
+        }
         self.inode.bind(token, namespace_epoch);
         self.entry
     }
@@ -63,6 +79,7 @@ pub struct Inode {
     fs: Arc<Ext4Filesystem>,
     binding: Once<InodeBinding>,
     this: Once<WeakDirEntry>,
+    runtime: Once<Arc<NodeUserData>>,
 }
 
 impl Inode {
@@ -75,6 +92,7 @@ impl Inode {
             fs,
             binding: Once::new(),
             this: Once::new(),
+            runtime: Once::new(),
         })
         .map_err(|_| VfsError::NoMemory)?;
         let entry = if inode_type == InodeType::Directory {
@@ -88,7 +106,11 @@ impl Inode {
                 reference,
             )?
         };
-        Ok(PreparedInodeEntry { inode, entry })
+        Ok(PreparedInodeEntry {
+            inode,
+            entry,
+            runtime_reservation: None,
+        })
     }
 
     fn bind(&self, token: InodeToken, namespace_epoch: Arc<AtomicU64>) {
@@ -96,6 +118,11 @@ impl Inode {
             token,
             namespace_epoch,
         });
+    }
+
+    fn attach_runtime(&self, runtime: Arc<NodeUserData>) {
+        let installed = self.runtime.call_once(|| runtime.clone());
+        debug_assert!(Arc::ptr_eq(installed, &runtime));
     }
 
     fn token(&self) -> Option<InodeToken> {
@@ -129,7 +156,12 @@ impl Inode {
         name: String,
     ) -> VfsResult<DirEntry> {
         match self.try_prepare_child(inode_type, name) {
-            Ok(prepared) => Ok(prepared.bind(token, namespace_epoch)),
+            Ok(prepared) => {
+                if let Some(runtime) = self.fs.runtime_attachment(token) {
+                    prepared.inode.attach_runtime(runtime);
+                }
+                Ok(prepared.bind(token, namespace_epoch))
+            }
             Err(err) => {
                 self.fs.lock().release_inode_handle(token);
                 Err(err)
@@ -271,6 +303,10 @@ impl NodeOps for Inode {
 
     fn flags(&self) -> NodeFlags {
         NodeFlags::BLOCKING
+    }
+
+    fn persistent_user_data(&self) -> Option<&NodeUserData> {
+        self.runtime.get().map(Arc::as_ref)
     }
 }
 
@@ -519,7 +555,8 @@ impl DirNodeOps for Inode {
         }
 
         let entry_name = try_owned(name)?;
-        let prepared = self.try_prepare_child(inode_type, entry_name)?;
+        let mut prepared = self.try_prepare_child(inode_type, entry_name)?;
+        prepared.install_initial_data(options)?;
         let mut fs = self.fs.lock();
         // Allocation above opened a race window. Revalidate under the same
         // serialization used by the backend create before committing anything.
@@ -614,6 +651,9 @@ impl DirNodeOps for Inode {
             NodeType::Unknown => return Err(VfsError::InvalidData),
         };
         let prepared = self.try_prepare_child(inode_type, try_owned(name)?)?;
+        if let Some(runtime) = target.runtime.get() {
+            prepared.inode.attach_runtime(runtime.clone());
+        }
         let mut fs = self.fs.lock();
         let (retained_token, namespace_epoch) = fs
             .retain_inode_handle(target_token.ino())

@@ -1,4 +1,7 @@
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{
+    boxed::Box,
+    sync::{Arc, Weak},
+};
 use core::{
     mem::ManuallyDrop,
     ops::{Deref, DerefMut},
@@ -7,10 +10,12 @@ use core::{
 };
 
 use axfs_ng_vfs::{
-    DirEntry, Filesystem, FilesystemOps, Reference, StatFs, VfsError, VfsResult, path::MAX_NAME_LEN,
+    DirEntry, Filesystem, FilesystemOps, NodeUserData, Reference, StatFs, VfsError, VfsResult,
+    path::MAX_NAME_LEN,
 };
+use hashbrown::HashMap;
 use kspin::{SpinNoPreempt as Mutex, SpinNoPreemptGuard as MutexGuard};
-use lwext4_rust::{FsConfig, InodeType, ffi::EXT4_ROOT_INO};
+use lwext4_rust::{FsConfig, InodeToken, InodeType, ffi::EXT4_ROOT_INO};
 use spin::Once;
 
 use super::{
@@ -20,6 +25,197 @@ use super::{
 use crate::MountedBlockDevice;
 
 const EXT4_CONFIG: FsConfig = FsConfig { bcache_size: 2048 };
+const EXT4_RUNTIME_ATTACHMENT_SLOTS: usize = 4_096;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RuntimeToken {
+    ino: u32,
+    generation: u32,
+}
+
+impl From<InodeToken> for RuntimeToken {
+    fn from(token: InodeToken) -> Self {
+        Self {
+            ino: token.ino(),
+            generation: token.generation(),
+        }
+    }
+}
+
+struct RuntimeRegistry {
+    entries: HashMap<RuntimeToken, Weak<NodeUserData>>,
+    reservations: usize,
+}
+
+impl RuntimeRegistry {
+    fn try_new() -> VfsResult<Self> {
+        Ok(Self {
+            entries: HashMap::new(),
+            reservations: 0,
+        })
+    }
+
+    fn try_reserve(&mut self) -> VfsResult<()> {
+        let mut desired_reservations =
+            self.reservations.checked_add(1).ok_or(VfsError::NoMemory)?;
+        if self
+            .entries
+            .len()
+            .checked_add(desired_reservations)
+            .is_none_or(|used| used > EXT4_RUNTIME_ATTACHMENT_SLOTS)
+        {
+            // Creation is rare and may pay to reclaim stale weak entries.
+            // Ordinary path lookup below remains an O(1) hash probe and pays
+            // nothing when no runtime attachments exist.
+            self.entries.retain(|_, data| data.strong_count() != 0);
+        }
+        if self
+            .entries
+            .len()
+            .checked_add(desired_reservations)
+            .is_none_or(|used| used > EXT4_RUNTIME_ATTACHMENT_SLOTS)
+        {
+            return Err(VfsError::NoMemory);
+        }
+
+        // Reserve for every outstanding transaction, not merely this caller:
+        // several creators may prepare private inodes before any of them
+        // commits. This keeps the post-namespace-publication insert infallible
+        // without charging every ext4 mount for 4096 empty buckets up front.
+        if self.entries.try_reserve(desired_reservations).is_err() {
+            self.entries.retain(|_, data| data.strong_count() != 0);
+            desired_reservations = self.reservations.checked_add(1).ok_or(VfsError::NoMemory)?;
+            self.entries
+                .try_reserve(desired_reservations)
+                .map_err(|_| VfsError::NoMemory)?;
+        }
+        self.reservations = desired_reservations;
+        Ok(())
+    }
+
+    fn cancel_reservation(&mut self) {
+        debug_assert!(self.reservations != 0);
+        self.reservations = self.reservations.saturating_sub(1);
+    }
+
+    fn commit(
+        &mut self,
+        token: RuntimeToken,
+        data: Arc<NodeUserData>,
+    ) -> (Arc<NodeUserData>, Option<Weak<NodeUserData>>) {
+        self.cancel_reservation();
+        if let Some(existing) = self.entries.get(&token).and_then(Weak::upgrade) {
+            return (existing, None);
+        }
+        // try_reserve admitted capacity for every outstanding transaction,
+        // and reservations keep entries + pending commits within that
+        // capacity. This post-create insert cannot grow.
+        let retired = self.entries.insert(token, Arc::downgrade(&data));
+        (data, retired)
+    }
+
+    fn attachment(&mut self, token: RuntimeToken) -> Option<Arc<NodeUserData>> {
+        let data = self.entries.get(&token)?.upgrade();
+        if data.is_none() {
+            self.entries.remove(&token);
+        }
+        data
+    }
+}
+
+#[cfg(test)]
+mod runtime_registry_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_registry_allocates_capacity_on_demand() {
+        let mut registry = RuntimeRegistry::try_new().unwrap();
+        assert_eq!(registry.entries.capacity(), 0);
+
+        registry.try_reserve().unwrap();
+        assert!(registry.entries.capacity() >= 1);
+        assert!(registry.entries.capacity() < EXT4_RUNTIME_ATTACHMENT_SLOTS);
+        registry.cancel_reservation();
+    }
+
+    #[test]
+    fn runtime_identity_includes_inode_generation_and_reclaims_stale_entries() {
+        let mut registry = RuntimeRegistry::try_new().unwrap();
+        let token = RuntimeToken {
+            ino: 17,
+            generation: 3,
+        };
+        let replacement = RuntimeToken {
+            ino: 17,
+            generation: 4,
+        };
+        let data = Arc::new(NodeUserData::new());
+        registry.try_reserve().unwrap();
+        let (initial_installed, retired) = registry.commit(token, data.clone());
+        assert!(retired.is_none());
+        assert!(Arc::ptr_eq(&initial_installed, &data));
+        assert!(Arc::ptr_eq(&registry.attachment(token).unwrap(), &data));
+        assert!(registry.attachment(replacement).is_none());
+        drop(initial_installed);
+
+        registry.try_reserve().unwrap();
+        let duplicate = Arc::new(NodeUserData::new());
+        let (duplicate_installed, retired) = registry.commit(token, duplicate.clone());
+        assert!(retired.is_none());
+        assert!(Arc::ptr_eq(&duplicate_installed, &data));
+        assert!(!Arc::ptr_eq(&duplicate_installed, &duplicate));
+
+        drop(duplicate_installed);
+        drop(data);
+        assert!(registry.attachment(token).is_none());
+        assert!(registry.entries.is_empty());
+    }
+
+    #[test]
+    fn runtime_reservations_enforce_the_logical_ceiling() {
+        let mut registry = RuntimeRegistry::try_new().unwrap();
+        for _ in 0..EXT4_RUNTIME_ATTACHMENT_SLOTS {
+            registry.try_reserve().unwrap();
+        }
+        assert!(registry.entries.capacity() >= registry.entries.len() + registry.reservations);
+        assert!(matches!(registry.try_reserve(), Err(VfsError::NoMemory)));
+        for _ in 0..EXT4_RUNTIME_ATTACHMENT_SLOTS {
+            registry.cancel_reservation();
+        }
+        registry.try_reserve().unwrap();
+        registry.cancel_reservation();
+    }
+}
+
+pub(crate) struct RuntimeReservation {
+    fs: Arc<Ext4Filesystem>,
+    committed: bool,
+}
+
+impl RuntimeReservation {
+    pub(crate) fn commit(
+        mut self,
+        token: InodeToken,
+        data: Arc<NodeUserData>,
+    ) -> Arc<NodeUserData> {
+        let (installed, retired) = {
+            let mut registry = self.fs.runtime_data.lock();
+            registry.commit(token.into(), data)
+        };
+        drop(retired);
+        self.committed = true;
+        installed
+    }
+}
+
+impl Drop for RuntimeReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        self.fs.runtime_data.lock().cancel_reservation();
+    }
+}
 
 struct DeferredExt4Finalizer {
     fs: LwExt4Filesystem,
@@ -131,6 +327,7 @@ pub struct Ext4Filesystem {
     inner: Mutex<ManuallyDrop<Box<DeferredExt4Finalizer>>>,
     disk: Ext4Disk,
     root_dir: Mutex<Option<DirEntry>>,
+    runtime_data: Mutex<RuntimeRegistry>,
 }
 
 impl Ext4Filesystem {
@@ -147,10 +344,12 @@ impl Ext4Filesystem {
             next: AtomicPtr::new(ptr::null_mut()),
         })
         .map_err(|_| VfsError::NoMemory)?;
+        let runtime_data = RuntimeRegistry::try_new()?;
         let fs = Arc::try_new(Self {
             inner: Mutex::new(ManuallyDrop::new(finalizer)),
             disk,
             root_dir: Mutex::new(None),
+            runtime_data: Mutex::new(runtime_data),
         })
         .map_err(|_| VfsError::NoMemory)?;
         // Allocate the wrapper before installing the backend root self-cycle;
@@ -165,6 +364,18 @@ impl Ext4Filesystem {
 
     pub(crate) fn lock(&self) -> Ext4Guard<'_> {
         Ext4Guard(self.inner.lock())
+    }
+
+    pub(crate) fn reserve_runtime_attachment(self: &Arc<Self>) -> VfsResult<RuntimeReservation> {
+        self.runtime_data.lock().try_reserve()?;
+        Ok(RuntimeReservation {
+            fs: self.clone(),
+            committed: false,
+        })
+    }
+
+    pub(crate) fn runtime_attachment(&self, token: InodeToken) -> Option<Arc<NodeUserData>> {
+        self.runtime_data.lock().attachment(token.into())
     }
 
     pub(crate) fn wait_async_write(

@@ -8,23 +8,24 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use bitflags::bitflags;
 use core::{
     any::{Any, TypeId},
-    fmt, iter, mem,
+    fmt,
     hash::{Hash, Hasher},
+    iter, mem,
     ops::Deref,
     ptr,
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
     task::Context,
 };
-use hashbrown::Equivalent;
-use smallvec::SmallVec;
 
 use axpoll::{IoEvents, Pollable};
+use bitflags::bitflags;
 pub use dir::*;
 pub use file::*;
+use hashbrown::Equivalent;
 use inherit_methods_macro::inherit_methods;
+use smallvec::SmallVec;
 
 use crate::{
     FilesystemOps, Metadata, MetadataUpdate, Mutex, MutexGuard, NodeType, VfsError, VfsResult,
@@ -99,6 +100,16 @@ pub trait NodeOps: Send + Sync + 'static {
     /// Returns the flags of the node.
     fn flags(&self) -> NodeFlags {
         NodeFlags::empty()
+    }
+
+    /// Returns backend state whose lifetime follows one stable inode
+    /// generation rather than one replaceable directory-entry cache object.
+    ///
+    /// Backends that support prepared runtime attachments (for example Unix
+    /// socket endpoints) must return the same cell from every lookup and
+    /// hardlink alias of that inode generation.
+    fn persistent_user_data(&self) -> Option<&NodeUserData> {
+        None
     }
 }
 
@@ -180,10 +191,7 @@ impl Equivalent<ReferenceKey> for ReferenceKeyRef<'_> {
             if reference.name != *expected {
                 return false;
             }
-            current = reference
-                .parent
-                .as_ref()
-                .map(|parent| &parent.0.reference);
+            current = reference.parent.as_ref().map(|parent| &parent.0.reference);
         }
         current.is_none()
     }
@@ -242,18 +250,13 @@ impl Reference {
         if self.anonymous_id.is_none() {
             let mut current = Some(self);
             while let Some(reference) = current {
-                components
-                    .try_reserve(1)
-                    .map_err(|_| VfsError::NoMemory)?;
+                components.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
                 let mut name = String::new();
                 name.try_reserve(reference.name.len())
                     .map_err(|_| VfsError::NoMemory)?;
                 name.push_str(&reference.name);
                 components.push(name);
-                current = reference
-                    .parent
-                    .as_ref()
-                    .map(|parent| &parent.0.reference);
+                current = reference.parent.as_ref().map(|parent| &parent.0.reference);
             }
         }
         Ok(ReferenceKey {
@@ -292,20 +295,30 @@ impl TypeMap {
     /// Fallibly prepares both the erased value ownership and an additional
     /// inline-map slot before publishing either. Replacing an existing type
     /// needs no container growth, but the new `Arc` is still admitted first.
-    pub fn try_insert<T: Any + Send + Sync>(
+    pub fn try_insert<T: Any + Send + Sync>(&mut self, value: T) -> VfsResult<Option<Arc<T>>> {
+        let value = Arc::try_new(value).map_err(|_| VfsError::NoMemory)?;
+        self.try_insert_shared(value)
+    }
+
+    /// Fallibly publishes an already admitted shared value.
+    ///
+    /// Callers that must prepare all owned state before a namespace mutation
+    /// can allocate the [`Arc`] first, then attach that exact allocation to a
+    /// newly created entry without wrapping it in another allocation.
+    pub(crate) fn try_insert_shared<T: Any + Send + Sync>(
         &mut self,
-        value: T,
+        value: Arc<T>,
     ) -> VfsResult<Option<Arc<T>>> {
         let id = TypeId::of::<T>();
-        let value: Arc<dyn Any + Send + Sync> =
-            Arc::try_new(value).map_err(|_| VfsError::NoMemory)?;
-        let retired = if let Some((_, slot)) = self.0.iter_mut().find(|(existing, _)| *existing == id) {
-            Some(mem::replace(slot, value))
-        } else {
-            self.0.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
-            self.0.push((id, value));
-            None
-        };
+        let value: Arc<dyn Any + Send + Sync> = value;
+        let retired =
+            if let Some((_, slot)) = self.0.iter_mut().find(|(existing, _)| *existing == id) {
+                Some(mem::replace(slot, value))
+            } else {
+                self.0.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+                self.0.push((id, value));
+                None
+            };
         retired
             .map(|value| value.downcast::<T>().map_err(|_| VfsError::Io))
             .transpose()
@@ -353,6 +366,66 @@ impl TypeMap {
         debug_assert!(retired.is_none());
         drop(retired);
         self.get::<T>().ok_or(VfsError::Io)
+    }
+}
+
+/// Type-erased runtime attachments owned by one stable backend inode.
+#[derive(Default)]
+pub struct NodeUserData(Mutex<TypeMap>);
+
+fn install_initial_data_cell(cell: &Mutex<TypeMap>, data: InitialNodeData) -> VfsResult<()> {
+    let mut candidate = Some(data);
+    let error = {
+        let mut map = cell.lock();
+        let data = candidate.as_ref().ok_or(VfsError::Io)?;
+        if map.0.iter().any(|(id, _)| *id == data.type_id) {
+            Some(VfsError::AlreadyExists)
+        } else if map.0.len() >= 2 {
+            Some(VfsError::NoMemory)
+        } else {
+            let data = candidate.take().ok_or(VfsError::Io)?;
+            map.0.push((data.type_id, data.value));
+            None
+        }
+    };
+    drop(candidate);
+    error.map_or(Ok(()), Err)
+}
+
+impl NodeUserData {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, TypeMap> {
+        self.0.lock()
+    }
+
+    /// Installs one preallocated value without allocating while the cell is
+    /// locked. This is used before a backend publishes a fresh inode name.
+    pub fn install_initial_data(&self, data: InitialNodeData) -> VfsResult<()> {
+        install_initial_data_cell(&self.0, data)
+    }
+}
+
+/// One already admitted, type-erased value that may be attached to a fresh
+/// directory entry before its name is published.
+///
+/// This is data, not an arbitrary callback: filesystem backends can install
+/// it while holding namespace serialization without permitting allocation,
+/// re-entrancy, or caller code under that lock.
+#[derive(Clone)]
+pub struct InitialNodeData {
+    type_id: TypeId,
+    value: Arc<dyn Any + Send + Sync>,
+}
+
+impl InitialNodeData {
+    pub fn from_shared<T: Any + Send + Sync>(value: Arc<T>) -> Self {
+        Self {
+            type_id: TypeId::of::<T>(),
+            value,
+        }
     }
 }
 
@@ -758,6 +831,13 @@ impl DirEntry {
         Arc::as_ptr(&self.0) as usize
     }
 
+    /// Returns an allocation-free erased ownership token for this exact
+    /// dentry. Linux-ABI adapters may retain it while an external endpoint
+    /// needs the backend inode generation to remain discoverable.
+    pub fn lifetime_token(&self) -> Arc<dyn Any + Send + Sync> {
+        self.0.clone()
+    }
+
     pub fn read_link(&self) -> VfsResult<String> {
         if self.node_type() != NodeType::Symlink {
             return Err(VfsError::InvalidData);
@@ -776,7 +856,25 @@ impl DirEntry {
     }
 
     pub fn user_data(&self) -> MutexGuard<'_, TypeMap> {
-        self.0.user_data.lock()
+        self.0
+            .node
+            .persistent_user_data()
+            .map_or_else(|| self.0.user_data.lock(), NodeUserData::lock)
+    }
+
+    /// Installs one prepared value on an unpublished entry without allocating
+    /// or invoking caller code while the entry's spin lock is held.
+    pub(crate) fn install_initial_data(&self, data: InitialNodeData) -> VfsResult<()> {
+        // `NamedCreateOptions::initial_data` promises inode-generation-stable
+        // attachment. Falling back to this dentry's cache-local cell would
+        // make creation appear successful and then silently lose the value
+        // after a namespace epoch invalidates the dentry. Backends without a
+        // persistent cell must reject the capability before publishing.
+        self.0
+            .node
+            .persistent_user_data()
+            .ok_or(VfsError::OperationNotSupported)?
+            .install_initial_data(data)
     }
 }
 
@@ -793,5 +891,32 @@ impl Pollable for DirEntry {
             Node::File(file) => file.register(context, events),
             Node::Dir(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn type_map_publishes_the_exact_preallocated_arc() {
+        let mut map = TypeMap::new();
+        let prepared = Arc::new(42_u64);
+
+        assert!(map.try_insert_shared(prepared.clone()).unwrap().is_none());
+        let installed = map.get::<u64>().unwrap();
+        assert!(Arc::ptr_eq(&prepared, &installed));
+    }
+
+    #[test]
+    fn shared_type_map_replacement_returns_retired_ownership() {
+        let mut map = TypeMap::new();
+        let old = Arc::new(1_u64);
+        let new = Arc::new(2_u64);
+        map.try_insert_shared(old.clone()).unwrap();
+
+        let retired = map.try_insert_shared(new.clone()).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&old, &retired));
+        assert!(Arc::ptr_eq(&new, &map.get::<u64>().unwrap()));
     }
 }
