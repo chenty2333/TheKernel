@@ -2,13 +2,17 @@
 
 use core::ops::{Deref, DerefMut};
 
+use axerrno::{AxError, AxResult};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::{
-    B38400, CREAD, CS8, ECHO, ECHOCTL, ECHOE, ECHOK, ECHOKE, ICANON, ICRNL, IEXTEN, ISIG, IXON,
-    ONLCR, OPOST, VDISCARD, VEOF, VEOL, VEOL2, VERASE, VINTR, VKILL, VLNEXT, VQUIT, VREPRINT,
-    VWERASE, speed_t, tcflag_t,
+    B38400, CREAD, CS8, ECHO, ECHOCTL, ECHOE, ECHOK, ICANON, ICRNL, IGNCR, ISIG, ONLCR, OPOST,
+    VEOF, VEOL, VERASE, VINTR, VKILL, VMIN, VQUIT, speed_t, tcflag_t,
 };
 use starry_signal::Signo;
+
+const SUPPORTED_IFLAG_CHANGES: tcflag_t = ICRNL | IGNCR;
+const SUPPORTED_OFLAG_CHANGES: tcflag_t = OPOST | ONLCR;
+const SUPPORTED_LFLAG_CHANGES: tcflag_t = ICANON | ECHO | ISIG | ECHOE | ECHOK | ECHOCTL;
 
 #[repr(C)]
 #[derive(Clone, Copy, AnyBitPattern)]
@@ -35,10 +39,13 @@ pub struct Termios {
 impl Default for Termios {
     fn default() -> Self {
         let mut result = Self {
-            c_iflag: ICRNL | IXON,
+            // Only advertise defaults which the PTY line discipline actually
+            // enforces. Flow control and extended editing remain disabled
+            // until their state machines exist.
+            c_iflag: ICRNL,
             c_oflag: OPOST | ONLCR,
             c_cflag: B38400 | CS8 | CREAD,
-            c_lflag: ICANON | ECHO | ISIG | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN,
+            c_lflag: ICANON | ECHO | ISIG | ECHOE | ECHOK | ECHOCTL,
             c_line: 0,
             c_cc: [0; 19],
         };
@@ -53,11 +60,6 @@ impl Default for Termios {
             (VKILL, ctl(b'U')),
             (VEOF, ctl(b'D')),
             (VEOL, b'\0'),
-            (VREPRINT, ctl(b'R')),
-            (VDISCARD, ctl(b'O')),
-            (VWERASE, ctl(b'W')),
-            (VLNEXT, ctl(b'V')),
-            (VEOL2, b'\0'),
         ] {
             result.c_cc[i as usize] = ch;
         }
@@ -93,6 +95,11 @@ impl Termios {
         self.c_cc[index as usize]
     }
 
+    pub fn matches_special_char(&self, index: u32, ch: u8) -> bool {
+        let configured = self.special_char(index);
+        configured != 0 && configured == ch
+    }
+
     pub fn has_iflag(&self, flag: u32) -> bool {
         self.c_iflag & flag != 0
     }
@@ -117,28 +124,50 @@ impl Termios {
         self.has_lflag(ICANON)
     }
 
-    pub fn contains_iexten(&self) -> bool {
-        self.has_lflag(IEXTEN)
-    }
-
     pub fn is_eol(&self, ch: u8) -> bool {
-        if ch == b'\n' || ch == self.special_char(VEOL) {
-            return true;
-        }
-
-        if self.contains_iexten() && ch == self.special_char(VEOL2) {
-            return true;
-        }
-
-        false
+        ch == b'\n' || self.matches_special_char(VEOL, ch)
     }
 
     pub fn signo_for(&self, ch: u8) -> Option<Signo> {
-        Some(match ch {
-            ch if ch == self.special_char(VINTR) => Signo::SIGINT,
-            ch if ch == self.special_char(VQUIT) => Signo::SIGQUIT,
-            _ => return None,
-        })
+        if self.matches_special_char(VINTR, ch) {
+            Some(Signo::SIGINT)
+        } else if self.matches_special_char(VQUIT, ch) {
+            Some(Signo::SIGQUIT)
+        } else {
+            None
+        }
+    }
+
+    fn validate_update(&self, current: &Self) -> AxResult<()> {
+        if self.c_line != current.c_line {
+            return Err(AxError::OperationNotSupported);
+        }
+        if (self.c_iflag ^ current.c_iflag) & !SUPPORTED_IFLAG_CHANGES != 0
+            || (self.c_oflag ^ current.c_oflag) & !SUPPORTED_OFLAG_CHANGES != 0
+            || self.c_cflag != current.c_cflag
+            || (self.c_lflag ^ current.c_lflag) & !SUPPORTED_LFLAG_CHANGES != 0
+        {
+            return Err(AxError::OperationNotSupported);
+        }
+        // Canonical signal delivery is implemented. Noncanonical ISIG also
+        // requires Linux's input/output flush and signal-byte consumption
+        // rules, so reject that state instead of publishing a partial mode.
+        if !self.has_lflag(ICANON) && self.has_lflag(ISIG) {
+            return Err(AxError::OperationNotSupported);
+        }
+
+        for index in 0..self.c_cc.len() {
+            let supported = matches!(
+                index as u32,
+                VINTR | VQUIT | VERASE | VKILL | VEOF | VEOL | VMIN
+            );
+            if !supported && self.c_cc[index] != current.c_cc[index] {
+                return Err(AxError::OperationNotSupported);
+            }
+        }
+        // VTIME is not implemented by the reader. It is deliberately outside
+        // the supported index set above, so a nonzero request is rejected.
+        Ok(())
     }
 }
 
@@ -170,8 +199,22 @@ impl Termios2 {
         result
     }
 
+    pub fn from_termios(termios: Termios, current: &Self) -> Self {
+        let mut result = *current;
+        result.termios = termios;
+        result
+    }
+
     pub fn as_termio(&self) -> Termio {
         self.termios.as_termio()
+    }
+
+    pub fn validate_update(&self, current: &Self) -> AxResult<()> {
+        self.termios.validate_update(&current.termios)?;
+        if self.c_ispeed != current.c_ispeed || self.c_ospeed != current.c_ospeed {
+            return Err(AxError::OperationNotSupported);
+        }
+        Ok(())
     }
 }
 
@@ -188,6 +231,16 @@ impl Termios2 {
     pub(super) fn set_special_char_for_test(&mut self, index: u32, value: u8) {
         self.termios.c_cc[index as usize] = value;
     }
+
+    pub(super) fn set_output_processing_for_test(&mut self, opost: bool, onlcr: bool) {
+        self.termios.c_oflag &= !(OPOST | ONLCR);
+        if opost {
+            self.termios.c_oflag |= OPOST;
+        }
+        if onlcr {
+            self.termios.c_oflag |= ONLCR;
+        }
+    }
 }
 
 impl Deref for Termios2 {
@@ -201,5 +254,68 @@ impl Deref for Termios2 {
 impl DerefMut for Termios2 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.termios
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use linux_raw_sys::general::{IXON, VTIME, VWERASE};
+
+    use super::*;
+
+    #[test]
+    fn implemented_termios_changes_validate_atomically() {
+        let current = Termios2::default();
+        let mut next = current;
+        next.termios.c_iflag ^= IGNCR;
+        next.termios.c_oflag &= !(OPOST | ONLCR);
+        next.termios.c_lflag &= !(ICANON | ECHO | ISIG);
+        next.termios.c_cc[VMIN as usize] = 3;
+
+        assert_eq!(next.validate_update(&current), Ok(()));
+    }
+
+    #[test]
+    fn unsupported_termios_changes_are_rejected_without_mutating_current() {
+        let current = Termios2::default();
+
+        let mut flow_control = current;
+        flow_control.termios.c_iflag |= IXON;
+        assert_eq!(
+            flow_control.validate_update(&current),
+            Err(AxError::OperationNotSupported)
+        );
+
+        let mut unsupported_cc = current;
+        unsupported_cc.termios.c_cc[VWERASE as usize] = 0x17;
+        assert_eq!(
+            unsupported_cc.validate_update(&current),
+            Err(AxError::OperationNotSupported)
+        );
+
+        let mut timed_read = current;
+        timed_read.termios.c_cc[VTIME as usize] = 1;
+        assert_eq!(
+            timed_read.validate_update(&current),
+            Err(AxError::OperationNotSupported)
+        );
+        assert_eq!(current.termios.c_iflag, ICRNL);
+        assert_eq!(current.termios.c_cc[VTIME as usize], 0);
+
+        let mut partial_noncanonical_signals = current;
+        partial_noncanonical_signals.termios.c_lflag &= !ICANON;
+        assert_eq!(
+            partial_noncanonical_signals.validate_update(&current),
+            Err(AxError::OperationNotSupported)
+        );
+    }
+
+    #[test]
+    fn disabled_control_char_does_not_match_nul_input() {
+        let termios = Termios2::default();
+        assert!(!termios.is_eol(0));
+        assert_eq!(termios.signo_for(0), None);
+        assert!(!termios.matches_special_char(VEOF, 0));
+        assert!(!termios.matches_special_char(VERASE, 0));
     }
 }

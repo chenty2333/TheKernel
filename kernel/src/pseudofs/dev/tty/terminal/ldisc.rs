@@ -10,7 +10,7 @@ use axerrno::{AxError, AxResult};
 use axpoll::PollSet;
 use axtask::{AxTaskRef, future::block_on};
 use linux_raw_sys::general::{
-    ECHOCTL, ECHOK, ICRNL, IGNCR, ISIG, VEOF, VERASE, VKILL, VMIN, VTIME,
+    ECHOCTL, ECHOE, ECHOK, ICRNL, IGNCR, ISIG, ONLCR, OPOST, VEOF, VERASE, VKILL, VMIN, VTIME,
 };
 use ringbuf::{
     CachingCons, CachingProd,
@@ -154,20 +154,24 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
                 continue;
             }
 
-            if term.has_lflag(ECHOK) && ch == term.special_char(VKILL) {
+            if term.matches_special_char(VKILL, ch) {
                 self.line_buf.clear();
+                if term.has_lflag(ECHOK) && term.echo() {
+                    self.queue_echo(b"\n");
+                }
                 continue;
             }
-            if ch == term.special_char(VERASE) {
+            if term.matches_special_char(VERASE, ch) {
                 self.line_buf.pop();
                 continue;
             }
 
-            if term.is_eol(ch) || ch == term.special_char(VEOF) {
-                if ch != term.special_char(VEOF) && self.line_buf.len() < CANONICAL_BUF_SIZE {
+            let is_veof = term.matches_special_char(VEOF, ch);
+            if term.is_eol(ch) || is_veof {
+                if !is_veof && self.line_buf.len() < CANONICAL_BUF_SIZE {
                     self.line_buf.push(ch);
                 }
-                if self.line_buf.is_empty() && ch == term.special_char(VEOF) {
+                if self.line_buf.is_empty() && is_veof {
                     // Preserve record order: do not publish an empty record in
                     // front of bytes from an earlier completed line.
                     if !self.buf_tx.is_empty() {
@@ -205,6 +209,9 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
     }
 
     fn check_send_signal(&self, term: &Termios2, ch: u8) {
+        // The current signal path implements canonical N_TTY delivery. A
+        // noncanonical+ISIG configuration is rejected by termios admission
+        // until its flush and byte-consumption rules are implemented.
         if !term.canonical() || !term.has_lflag(ISIG) {
             return;
         }
@@ -222,7 +229,19 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
         match ch {
             b'\n' => self.queue_echo(b"\n"),
             b'\r' => self.queue_echo(b"\r\n"),
-            ch if ch == term.special_char(VERASE) => self.queue_echo(b"\x08 \x08"),
+            ch if term.canonical()
+                && term.matches_special_char(VERASE, ch)
+                && term.has_lflag(ECHOE) =>
+            {
+                self.queue_echo(b"\x08 \x08")
+            }
+            ch if term.canonical()
+                && term.matches_special_char(VERASE, ch)
+                && term.has_lflag(ECHOCTL) =>
+            {
+                self.queue_echo(b"^?")
+            }
+            ch if term.canonical() && term.matches_special_char(VERASE, ch) => {}
             ch if ch == b' ' || ch.is_ascii_graphic() => self.queue_echo(&[ch]),
             ch if ch.is_ascii_control() && term.has_lflag(ECHOCTL) => {
                 self.queue_echo(&[b'^', ch + 0x40]);
@@ -286,6 +305,7 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
 }
 
 struct SimpleReader<R> {
+    terminal: Arc<Terminal>,
     reader: R,
     read_buf: [u8; BUF_SIZE],
     read_range: Range<usize>,
@@ -307,10 +327,12 @@ impl<R: TtyRead> SimpleReader<R> {
             return Ok(());
         }
 
+        let term = self.terminal.load_termios();
+        let map_newline = term.has_oflag(OPOST) && term.has_oflag(ONLCR);
         while !self.buf_tx.is_full() && !self.read_range.is_empty() {
             let ch = self.read_buf[self.read_range.start];
             self.read_range.start += 1;
-            if ch == b'\n' {
+            if ch == b'\n' && map_newline {
                 // Preserve both bytes of the master-side CRLF expansion even
                 // when only one line-discipline slot remains.
                 if self.buf_tx.try_push(b'\r').is_err() {
@@ -516,6 +538,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             }
             ProcessMode::None(poll_rx) => Processor::None(
                 SimpleReader {
+                    terminal: terminal.clone(),
                     reader: reader.reader,
                     read_buf: [0; BUF_SIZE],
                     read_range: 0..0,
@@ -735,6 +758,38 @@ mod tests {
         fn wake_by_ref(self: &Arc<Self>) {
             self.0.unpark();
         }
+    }
+
+    fn master_side_output(opost: bool, onlcr: bool) -> Vec<u8> {
+        let terminal = Arc::try_new(Terminal::default()).unwrap();
+        terminal
+            .termios
+            .lock()
+            .set_output_processing_for_test(opost, onlcr);
+        let mut ldisc = LineDiscipline::try_new(
+            terminal,
+            TtyConfig {
+                reader: VecReader {
+                    input: vec![b'\n'],
+                    offset: 0,
+                    eof: true,
+                },
+                writer: Sink,
+                process_mode: ProcessMode::None(Arc::try_new(PollSet::new()).unwrap()),
+            },
+        )
+        .unwrap();
+        let mut output = [0; 2];
+        let read = ldisc.read(&mut output).unwrap();
+        output[..read].to_vec()
+    }
+
+    #[test]
+    fn master_side_newline_mapping_obeys_opost_and_onlcr() {
+        assert_eq!(master_side_output(true, true), b"\r\n");
+        assert_eq!(master_side_output(false, true), b"\n");
+        assert_eq!(master_side_output(true, false), b"\n");
+        assert_eq!(master_side_output(false, false), b"\n");
     }
 
     #[test]

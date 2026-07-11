@@ -274,17 +274,25 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
             }
             TCSETA => {
                 let termio = (arg as *const Termio).vm_read()?;
-                let current = *self.terminal.termios.lock();
+                let mut current = self.terminal.termios.lock();
                 let next = Termios2::from_termio(termio, &current);
-                *self.terminal.termios.lock() = next;
+                next.validate_update(&current)?;
+                *current = next;
             }
             TCSETAF | TCSETAW => return Err(AxError::Unsupported),
             TCSETS => {
-                *self.terminal.termios.lock() = Termios2::new((arg as *const Termios).vm_read()?);
+                let termios = (arg as *const Termios).vm_read()?;
+                let mut current = self.terminal.termios.lock();
+                let next = Termios2::from_termios(termios, &current);
+                next.validate_update(&current)?;
+                *current = next;
             }
             TCSETSF | TCSETSW => return Err(AxError::Unsupported),
             TCSETS2 => {
-                *self.terminal.termios.lock() = (arg as *const Termios2).vm_read()?;
+                let next = (arg as *const Termios2).vm_read()?;
+                let mut current = self.terminal.termios.lock();
+                next.validate_update(&current)?;
+                *current = next;
             }
             TCSETSF2 | TCSETSW2 => return Err(AxError::Unsupported),
             FIONREAD => {
