@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, format, string::ToString, sync::Arc};
+use alloc::{borrow::Cow, sync::Arc};
 use core::{
     cmp::min,
     mem,
@@ -26,7 +26,10 @@ use ringbuf::{
 use starry_signal::{SignalInfo, Signo};
 use starry_vm::VmMutPtr;
 
-use super::{AsyncIoState, FileLike, Kstat, PseudoInode, fs::location_to_kstat, send_sigio};
+use super::{
+    AsyncIoState, FileLike, Kstat, PseudoInode, fs::location_to_kstat, send_sigio, try_owned_path,
+    try_pseudo_inode_path,
+};
 use crate::{
     file::{IoDst, IoSrc},
     task::{AsThread, send_signal_to_process},
@@ -635,10 +638,9 @@ impl NamedPipe {
         })
     }
 
-    fn fifo_path(&self) -> Cow<'_, str> {
-        self.location
-            .absolute_path()
-            .map_or_else(|_| "<error>".into(), |path| Cow::Owned(path.to_string()))
+    fn fifo_path(&self) -> AxResult<Cow<'_, str>> {
+        let path = self.location.absolute_path()?;
+        Ok(Cow::Owned(try_owned_path(path.as_str())?))
     }
 
     pub(crate) fn set_async_io(&self, enabled: bool, state: AsyncIoState, fd: i32) {
@@ -706,8 +708,8 @@ impl FileLike for Pipe {
         Ok(self.shared.inode.stat())
     }
 
-    fn path(&self) -> Cow<'_, str> {
-        format!("pipe:[{}]", self.shared.inode.inode()).into()
+    fn path(&self) -> AxResult<Cow<'_, str>> {
+        try_pseudo_inode_path("pipe", self.shared.inode.inode())
     }
 
     fn set_nonblocking(&self, nonblocking: bool) -> AxResult {
@@ -820,7 +822,7 @@ impl FileLike for NamedPipe {
         location_to_kstat(&self.location)
     }
 
-    fn path(&self) -> Cow<'_, str> {
+    fn path(&self) -> AxResult<Cow<'_, str>> {
         self.fifo_path()
     }
 

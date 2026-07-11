@@ -6,7 +6,7 @@ use core::{
     time::Duration,
 };
 
-use axerrno::AxError;
+use axerrno::{AxError, AxResult};
 use axhal::time::monotonic_time;
 use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::{
@@ -236,8 +236,8 @@ impl FileLike for TimerFd {
         Ok(())
     }
 
-    fn path(&self) -> Cow<'_, str> {
-        "anon_inode:[timerfd]".into()
+    fn path(&self) -> AxResult<Cow<'_, str>> {
+        Ok("anon_inode:[timerfd]".into())
     }
 }
 

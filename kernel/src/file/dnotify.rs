@@ -621,8 +621,8 @@ mod tests {
             Err(AxError::InvalidInput)
         }
 
-        fn path(&self) -> Cow<'_, str> {
-            Cow::Borrowed("dnotify-test")
+        fn path(&self) -> AxResult<Cow<'_, str>> {
+            Ok(Cow::Borrowed("dnotify-test"))
         }
 
         fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {

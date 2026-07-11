@@ -111,10 +111,34 @@ impl SimpleFile {
         })
     }
 
+    fn try_new_with_permission_and_flags(
+        fs: Arc<SimpleFs>,
+        ty: NodeType,
+        permission: NodePermission,
+        flags: NodeFlags,
+        ops: impl SimpleFileOps,
+    ) -> VfsResult<Arc<Self>> {
+        let ops: Arc<dyn SimpleFileOps> = Arc::try_new(ops).map_err(|_| VfsError::NoMemory)?;
+        let node = SimpleFsNode::try_new(fs, ty, permission)?;
+        Arc::try_new(Self { node, ops, flags }).map_err(|_| VfsError::NoMemory)
+    }
+
     /// Creates a dynamic link that pathwalk policy can distinguish from an
     /// ordinary filesystem symlink.
     pub fn new_magic_link(fs: Arc<SimpleFs>, ops: impl SimpleFileOps) -> Arc<Self> {
         Self::new_with_permission_and_flags(
+            fs,
+            NodeType::Symlink,
+            NodePermission::default(),
+            NodeFlags::NON_CACHEABLE | NodeFlags::MAGIC_LINK,
+            ops,
+        )
+    }
+
+    /// Creates a userspace-triggered magic link with fallible inode, operation
+    /// object, and file-node publication allocations.
+    pub fn try_new_magic_link(fs: Arc<SimpleFs>, ops: impl SimpleFileOps) -> VfsResult<Arc<Self>> {
+        Self::try_new_with_permission_and_flags(
             fs,
             NodeType::Symlink,
             NodePermission::default(),

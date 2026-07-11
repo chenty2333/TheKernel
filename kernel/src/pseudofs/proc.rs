@@ -46,7 +46,8 @@ use starry_vm::VmMutPtr;
 
 use crate::{
     file::{
-        FD_TABLE, FileDescription, PidFd, fanotify::FanotifyFile, inotify::InotifyFile, lease, pipe,
+        FD_TABLE, FileDescription, PidFd, fanotify::FanotifyFile, inotify::InotifyFile, lease,
+        pipe, try_path_into_bytes,
     },
     mm::{
         Backend, BackendOps, USER_IO_PIN_TEST_DELAY_MS_MAX, commit_limit_bytes, committed_as_bytes,
@@ -58,7 +59,7 @@ use crate::{
     mounts,
     pseudofs::{
         ChildNames, DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
-        SimpleFileOperation, SimpleFs, SimpleFsNode,
+        SimpleFileOperation, SimpleFileOps, SimpleFs, SimpleFsNode,
         cgroup::{proc_cgroup_membership, proc_cgroups_snapshot, proc_cpuset_membership},
         try_boxed_names,
     },
@@ -1232,6 +1233,20 @@ struct ThreadFdDir {
     task: WeakAxTaskRef,
 }
 
+struct PreparedFdMagicLink {
+    target: Vec<u8>,
+}
+
+impl SimpleFileOps for PreparedFdMagicLink {
+    fn read_all(&self) -> VfsResult<Cow<'_, [u8]>> {
+        Ok(Cow::Borrowed(&self.target))
+    }
+
+    fn write_all(&self, _data: &[u8]) -> VfsResult<()> {
+        Err(VfsError::BadFileDescriptor)
+    }
+}
+
 impl SimpleDirOps for ThreadFdDir {
     fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
         let Some(task) = self.task.upgrade() else {
@@ -1250,16 +1265,17 @@ impl SimpleDirOps for ThreadFdDir {
         let fs = self.fs.clone();
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
         let fd = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-        let path = FD_TABLE
-            .scope(&task.as_thread().proc_data.scope.read())
-            .read()
-            .get(fd as _)
-            .ok_or(VfsError::NotFound)?
-            .description
-            .inner
-            .path()
-            .into_owned();
-        Ok(SimpleFile::new_magic_link(fs, move || Ok(path.clone())).into())
+        let description = {
+            let scope = task.as_thread().proc_data.scope.read();
+            let scoped_table = FD_TABLE.scope(&scope);
+            let table = scoped_table.read();
+            table
+                .get(fd as _)
+                .map(|entry| entry.description.clone())
+                .ok_or(VfsError::NotFound)?
+        };
+        let target = try_path_into_bytes(description.inner.path()?)?;
+        Ok(SimpleFile::try_new_magic_link(fs, PreparedFdMagicLink { target })?.into())
     }
 
     fn is_cacheable(&self) -> bool {

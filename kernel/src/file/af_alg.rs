@@ -1,6 +1,5 @@
 use alloc::{
     borrow::Cow,
-    format,
     string::{String, ToString},
     vec,
     vec::Vec,
@@ -18,7 +17,7 @@ use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::net::{SOCK_SEQPACKET, cmsghdr, msghdr, sockaddr, socklen_t};
 use spin::Mutex;
 
-use super::{FileLike, Kstat, PseudoInode};
+use super::{FileLike, Kstat, PseudoInode, try_pseudo_inode_path};
 use crate::{
     file::{FileHandle, get_typed_file},
     mm::{IoVec, IoVectorBuf, UserConstPtr},
@@ -338,8 +337,8 @@ impl FileLike for AfAlgSocket {
         Ok(())
     }
 
-    fn path(&self) -> Cow<'_, str> {
-        format!("socket:[{}]", self.inode.inode()).into()
+    fn path(&self) -> AxResult<Cow<'_, str>> {
+        try_pseudo_inode_path("socket", self.inode.inode())
     }
 }
 

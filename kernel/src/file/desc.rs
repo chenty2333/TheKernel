@@ -775,7 +775,7 @@ impl FileLike for FileDescription {
         self.inner.stat()
     }
 
-    fn path(&self) -> Cow<'_, str> {
+    fn path(&self) -> AxResult<Cow<'_, str>> {
         self.inner.path()
     }
 

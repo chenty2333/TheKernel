@@ -21,7 +21,7 @@ use memory_addr::PAGE_SIZE_4K;
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
-    file::{File, FileLike, get_file_like},
+    file::{File, FileLike, get_file_like, try_path_into_owned},
     pseudofs::DeviceOps,
 };
 
@@ -413,7 +413,7 @@ impl LoopDevice {
         let writable = flags.contains(FileFlags::WRITE);
         let backing = LoopBacking {
             file: file.inner().backend()?.clone(),
-            path: file.path().into_owned(),
+            path: try_path_into_owned(file.path()?)?,
             writable,
         };
         Ok((backing, !writable))

@@ -35,8 +35,8 @@ impl FileLike for BpfMapFd {
         Ok(anon_inode_stat())
     }
 
-    fn path(&self) -> Cow<'_, str> {
-        "anon_inode:bpf-map".into()
+    fn path(&self) -> AxResult<Cow<'_, str>> {
+        Ok("anon_inode:bpf-map".into())
     }
 
     fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
@@ -72,8 +72,8 @@ impl FileLike for BpfProgFd {
         Ok(anon_inode_stat())
     }
 
-    fn path(&self) -> Cow<'_, str> {
-        "anon_inode:bpf-prog".into()
+    fn path(&self) -> AxResult<Cow<'_, str>> {
+        Ok("anon_inode:bpf-prog".into())
     }
 
     fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {

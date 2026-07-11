@@ -1227,8 +1227,8 @@ impl FileLike for Epoll {
         Ok(super::anon_inode_stat())
     }
 
-    fn path(&self) -> Cow<'_, str> {
-        "anon_inode:[eventpoll]".into()
+    fn path(&self) -> AxResult<Cow<'_, str>> {
+        Ok("anon_inode:[eventpoll]".into())
     }
 
     fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {

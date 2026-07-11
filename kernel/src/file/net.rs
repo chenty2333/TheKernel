@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, format, sync::Arc};
+use alloc::{borrow::Cow, sync::Arc};
 use core::{ffi::c_int, ops::Deref, task::Context};
 
 use axerrno::{AxError, AxResult};
@@ -9,7 +9,7 @@ use axnet::{
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::general::O_PATH;
 
-use super::{File, FileHandle, FileLike, Kstat, PseudoInode};
+use super::{File, FileHandle, FileLike, Kstat, PseudoInode, try_pseudo_inode_path};
 use crate::{
     bpf::{prog::BpfProgram, vm::BpfVm},
     file::{IoDst, IoSrc, get_file_like, get_typed_file, packet::socket_ifreq_ioctl},
@@ -124,8 +124,8 @@ impl FileLike for Socket {
         socket_ifreq_ioctl(&self.net_stack, cmd, arg)
     }
 
-    fn path(&self) -> Cow<'_, str> {
-        format!("socket:[{}]", self.inode.inode()).into()
+    fn path(&self) -> AxResult<Cow<'_, str>> {
+        try_pseudo_inode_path("socket", self.inode.inode())
     }
 
     fn from_fd(fd: c_int) -> AxResult<FileHandle<Self>>

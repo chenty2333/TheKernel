@@ -753,8 +753,8 @@ mod tests {
             Err(AxError::InvalidInput)
         }
 
-        fn path(&self) -> Cow<'_, str> {
-            Cow::Borrowed("drop-counting-file")
+        fn path(&self) -> AxResult<Cow<'_, str>> {
+            Ok(Cow::Borrowed("drop-counting-file"))
         }
 
         fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
@@ -775,8 +775,8 @@ mod tests {
             Err(AxError::InvalidInput)
         }
 
-        fn path(&self) -> Cow<'_, str> {
-            Cow::Borrowed("lock-order-file")
+        fn path(&self) -> AxResult<Cow<'_, str>> {
+            Ok(Cow::Borrowed("lock-order-file"))
         }
 
         fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {

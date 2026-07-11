@@ -885,8 +885,8 @@ impl FileLike for FanotifyFile {
         Ok(())
     }
 
-    fn path(&self) -> Cow<'_, str> {
-        "anon_inode:[fanotify]".into()
+    fn path(&self) -> AxResult<Cow<'_, str>> {
+        Ok("anon_inode:[fanotify]".into())
     }
 }
 

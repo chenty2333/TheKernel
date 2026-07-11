@@ -171,8 +171,8 @@ impl FileLike for FsOpenFd {
         Ok(crate::file::anon_inode_stat())
     }
 
-    fn path(&self) -> Cow<'_, str> {
-        "anon_inode:[fsopen]".into()
+    fn path(&self) -> AxResult<Cow<'_, str>> {
+        Ok("anon_inode:[fsopen]".into())
     }
 
     fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
@@ -550,8 +550,8 @@ impl FileLike for FsMountFd {
         Ok(crate::file::anon_inode_stat())
     }
 
-    fn path(&self) -> Cow<'_, str> {
-        "anon_inode:[fsmount]".into()
+    fn path(&self) -> AxResult<Cow<'_, str>> {
+        Ok("anon_inode:[fsmount]".into())
     }
 
     fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {

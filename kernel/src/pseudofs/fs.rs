@@ -1,5 +1,8 @@
 use alloc::{string::String, sync::Arc};
-use core::any::Any;
+use core::{
+    any::Any,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use axfs_ng_vfs::{
     DeviceId, DirEntry, DirNode, Filesystem, FilesystemOps, Metadata, MetadataUpdate, NodeOps,
@@ -34,6 +37,7 @@ pub struct SimpleFs {
     name: String,
     fs_type: u32,
     inodes: Mutex<Slab<()>>,
+    next_ephemeral_inode: AtomicU64,
     root: Mutex<Option<DirEntry>>,
 }
 
@@ -48,6 +52,9 @@ impl SimpleFs {
             name,
             fs_type,
             inodes: Mutex::new(Slab::new()),
+            // Keep fallibly constructed, non-cacheable nodes in a disjoint
+            // inode range without growing the tracking slab.
+            next_ephemeral_inode: AtomicU64::new(1 << 63),
             root: Mutex::new(None),
         });
         let root = root(fs.clone());
@@ -64,6 +71,14 @@ impl SimpleFs {
 
     fn alloc_inode(&self) -> u64 {
         self.inodes.lock().insert(()) as u64 + 1
+    }
+
+    fn try_alloc_ephemeral_inode(&self) -> VfsResult<u64> {
+        self.next_ephemeral_inode
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| axfs_ng_vfs::VfsError::StorageFull)
     }
 
     fn release_inode(&self, ino: u64) {
@@ -93,6 +108,7 @@ impl FilesystemOps for SimpleFs {
 pub struct SimpleFsNode {
     fs: Arc<SimpleFs>,
     ino: u64,
+    tracked_inode: bool,
     pub(crate) metadata: Mutex<Metadata>,
 }
 
@@ -121,14 +137,52 @@ impl SimpleFsNode {
         Self {
             fs,
             ino,
+            tracked_inode: true,
             metadata: Mutex::new(metadata),
         }
+    }
+
+    /// Creates a userspace-triggered pseudo node without an abort-on-OOM slab
+    /// growth. The reserved inode is released if a later fallible constructor
+    /// step drops this node before publication.
+    pub fn try_new(
+        fs: Arc<SimpleFs>,
+        node_type: NodeType,
+        mode: NodePermission,
+    ) -> VfsResult<Self> {
+        let ino = fs.try_alloc_ephemeral_inode()?;
+        let now = wall_time();
+        let metadata = Metadata {
+            device: 0,
+            inode: ino,
+            nlink: 1,
+            mode,
+            node_type,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            block_size: 0,
+            blocks: 0,
+            rdev: DeviceId::default(),
+            atime: now,
+            btime: now,
+            mtime: now,
+            ctime: now,
+        };
+        Ok(Self {
+            fs,
+            ino,
+            tracked_inode: false,
+            metadata: Mutex::new(metadata),
+        })
     }
 }
 
 impl Drop for SimpleFsNode {
     fn drop(&mut self) {
-        self.fs.release_inode(self.ino);
+        if self.tracked_inode {
+            self.fs.release_inode(self.ino);
+        }
     }
 }
 
@@ -188,5 +242,29 @@ impl NodeOps for SimpleFsNode {
 
     fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ephemeral_nodes_use_unique_allocation_free_inode_range() {
+        let fs = Arc::new(SimpleFs {
+            name: String::new(),
+            fs_type: 0,
+            inodes: Mutex::new(Slab::new()),
+            next_ephemeral_inode: AtomicU64::new(1 << 63),
+            root: Mutex::new(None),
+        });
+
+        let first = SimpleFsNode::try_new(fs.clone(), NodeType::Symlink, NodePermission::default())
+            .unwrap();
+        let second =
+            SimpleFsNode::try_new(fs, NodeType::Symlink, NodePermission::default()).unwrap();
+
+        assert_eq!(first.inode(), 1 << 63);
+        assert_eq!(second.inode(), (1 << 63) + 1);
     }
 }

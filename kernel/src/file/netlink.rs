@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, collections::VecDeque, format, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{borrow::Cow, collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
 use core::{
     mem::size_of,
     sync::atomic::{AtomicBool, Ordering},
@@ -16,7 +16,7 @@ use linux_raw_sys::net::{
 use spin::Mutex;
 
 use crate::{
-    file::{FileLike, IoDst, IoSrc, Kstat, PseudoInode},
+    file::{FileLike, IoDst, IoSrc, Kstat, PseudoInode, try_pseudo_inode_path},
     mm::UserPtr,
 };
 
@@ -466,8 +466,8 @@ impl FileLike for NetlinkSocket {
         Ok(())
     }
 
-    fn path(&self) -> Cow<'_, str> {
-        format!("socket:[{}]", self.inode.inode()).into()
+    fn path(&self) -> AxResult<Cow<'_, str>> {
+        try_pseudo_inode_path("socket", self.inode.inode())
     }
 }
 

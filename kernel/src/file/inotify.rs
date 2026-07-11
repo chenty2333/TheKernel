@@ -776,8 +776,8 @@ impl FileLike for InotifyFile {
         Ok(())
     }
 
-    fn path(&self) -> Cow<'_, str> {
-        "anon_inode:[inotify]".into()
+    fn path(&self) -> AxResult<Cow<'_, str>> {
+        Ok("anon_inode:[inotify]".into())
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {

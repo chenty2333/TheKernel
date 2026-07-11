@@ -265,8 +265,8 @@ impl FileLike for Signalfd {
         Ok(())
     }
 
-    fn path(&self) -> Cow<'_, str> {
-        "anon_inode:[signalfd]".into()
+    fn path(&self) -> AxResult<Cow<'_, str>> {
+        Ok("anon_inode:[signalfd]".into())
     }
 }
 

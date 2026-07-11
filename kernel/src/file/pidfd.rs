@@ -70,8 +70,8 @@ impl FileLike for PidFd {
         Ok(self.inode.stat())
     }
 
-    fn path(&self) -> Cow<'_, str> {
-        "anon_inode:[pidfd]".into()
+    fn path(&self) -> AxResult<Cow<'_, str>> {
+        Ok("anon_inode:[pidfd]".into())
     }
 
     fn set_nonblocking(&self, nonblocking: bool) -> AxResult {

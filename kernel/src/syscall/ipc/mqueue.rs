@@ -1,7 +1,6 @@
 use alloc::{
     borrow::Cow,
     collections::BTreeMap,
-    format,
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
@@ -273,8 +272,17 @@ impl FileLike for MqFd {
         Ok(stat)
     }
 
-    fn path(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("/{}", self.queue.lock().name))
+    fn path(&self) -> AxResult<Cow<'_, str>> {
+        // Reserve the protocol maximum before taking the queue lock so path
+        // rendering cannot allocate while the queue's spin mutex is held.
+        let mut path = String::new();
+        path.try_reserve_exact(MQ_NAME_MAX + 1)
+            .map_err(|_| AxError::NoMemory)?;
+        path.push('/');
+        let queue = self.queue.lock();
+        debug_assert!(queue.name.len() <= MQ_NAME_MAX);
+        path.push_str(&queue.name);
+        Ok(Cow::Owned(path))
     }
 
     fn nonblocking(&self) -> bool {

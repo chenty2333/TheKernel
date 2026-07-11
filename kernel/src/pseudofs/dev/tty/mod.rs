@@ -525,8 +525,8 @@ mod tests {
             Err(AxError::InvalidInput)
         }
 
-        fn path(&self) -> Cow<'_, str> {
-            Cow::Borrowed("pty-lifecycle-test")
+        fn path(&self) -> AxResult<Cow<'_, str>> {
+            Ok(Cow::Borrowed("pty-lifecycle-test"))
         }
 
         fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {

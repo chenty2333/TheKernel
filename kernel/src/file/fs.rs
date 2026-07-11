@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, string::ToString, vec};
+use alloc::{borrow::Cow, vec};
 use core::{
     ffi::c_int,
     hint::likely,
@@ -26,7 +26,7 @@ use starry_signal::{SignalInfo, Signo};
 
 use super::{
     FileHandle, FileLike, Kstat, get_file_description, get_file_like, get_typed_file,
-    permission::DacFsContextExt,
+    permission::DacFsContextExt, try_owned_path,
 };
 use crate::{
     file::{IoDst, IoSrc, memfd},
@@ -247,9 +247,9 @@ impl File {
     }
 }
 
-fn path_for(loc: &Location) -> Cow<'static, str> {
-    loc.absolute_path()
-        .map_or_else(|_| "<error>".into(), |f| Cow::Owned(f.to_string()))
+fn path_for(loc: &Location) -> AxResult<Cow<'static, str>> {
+    let path = loc.absolute_path()?;
+    Ok(Cow::Owned(try_owned_path(path.as_str())?))
 }
 
 impl FileLike for File {
@@ -327,7 +327,7 @@ impl FileLike for File {
         self.nonblock.load(Ordering::Acquire)
     }
 
-    fn path(&self) -> Cow<'_, str> {
+    fn path(&self) -> AxResult<Cow<'_, str>> {
         path_for(self.inner.location())
     }
 
@@ -402,7 +402,7 @@ impl FileLike for Directory {
         Ok(())
     }
 
-    fn path(&self) -> Cow<'_, str> {
+    fn path(&self) -> AxResult<Cow<'_, str>> {
         path_for(&self.inner)
     }
 

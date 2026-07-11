@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, sync::Arc};
+use alloc::{borrow::Cow, string::String, sync::Arc, vec::Vec};
 use core::{ffi::c_int, time::Duration};
 
 use axerrno::{AxError, AxResult};
@@ -160,7 +160,12 @@ pub trait FileLike: Pollable + DowncastSync {
 
     fn stat(&self) -> AxResult<Kstat>;
 
-    fn path(&self) -> Cow<'_, str>;
+    /// Produces a stable display path for procfs and other kernel adapters.
+    ///
+    /// Dynamic paths must reserve their storage fallibly and report
+    /// `NoMemory`; user-triggered path rendering must never rely on
+    /// `format!`, `to_string`, or another abort-on-OOM allocation.
+    fn path(&self) -> AxResult<Cow<'_, str>>;
 
     fn ioctl(&self, _cmd: u32, _arg: usize) -> AxResult<usize> {
         Err(AxError::NotATty)
@@ -193,6 +198,63 @@ pub trait FileLike: Pollable + DowncastSync {
 }
 impl_downcast!(sync FileLike);
 
+pub(crate) fn try_owned_path(value: &str) -> AxResult<String> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| AxError::NoMemory)?;
+    owned.push_str(value);
+    Ok(owned)
+}
+
+pub(crate) fn try_path_into_owned(path: Cow<'_, str>) -> AxResult<String> {
+    match path {
+        Cow::Owned(path) => Ok(path),
+        Cow::Borrowed(path) => try_owned_path(path),
+    }
+}
+
+pub(crate) fn try_path_into_bytes(path: Cow<'_, str>) -> AxResult<Vec<u8>> {
+    match path {
+        Cow::Owned(path) => Ok(path.into_bytes()),
+        Cow::Borrowed(path) => {
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(path.len())
+                .map_err(|_| AxError::NoMemory)?;
+            bytes.extend_from_slice(path.as_bytes());
+            Ok(bytes)
+        }
+    }
+}
+
+/// Builds Linux's anonymous inode display form without an infallible format
+/// allocation. Twenty decimal digits cover every `u64` inode value.
+pub(crate) fn try_pseudo_inode_path(kind: &str, inode: u64) -> AxResult<Cow<'static, str>> {
+    let mut path = String::new();
+    path.try_reserve_exact(kind.len().saturating_add(23))
+        .map_err(|_| AxError::NoMemory)?;
+    path.push_str(kind);
+    path.push_str(":[");
+
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    let mut remaining = inode;
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (remaining % 10) as u8;
+        remaining /= 10;
+        if remaining == 0 {
+            break;
+        }
+    }
+    for digit in &digits[start..] {
+        path.push(*digit as char);
+    }
+    path.push(']');
+    Ok(Cow::Owned(path))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileLikeKind {
     Regular,
@@ -217,5 +279,31 @@ impl FileLikeKind {
         file.stat()
             .map(|stat| Self::from_mode(stat.mode))
             .unwrap_or(Self::Other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pseudo_inode_paths_cover_decimal_boundaries_without_formatting() {
+        assert_eq!(try_pseudo_inode_path("socket", 0).unwrap(), "socket:[0]");
+        assert_eq!(
+            try_pseudo_inode_path("pipe", u64::MAX).unwrap(),
+            "pipe:[18446744073709551615]"
+        );
+    }
+
+    #[test]
+    fn borrowed_and_owned_path_snapshots_keep_exact_bytes() {
+        assert_eq!(
+            try_path_into_bytes(Cow::Borrowed("anon_inode:[eventfd]")).unwrap(),
+            b"anon_inode:[eventfd]"
+        );
+        assert_eq!(
+            try_path_into_owned(Cow::Owned(try_owned_path("/tmp/file").unwrap())).unwrap(),
+            "/tmp/file"
+        );
     }
 }
