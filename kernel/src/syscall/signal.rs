@@ -19,11 +19,12 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     task::{
-        AsThread, ProcessData, acknowledge_posix_timer_signal, check_current_signal_access,
-        check_signals, force_signal_current_thread, get_process_data, get_process_group,
-        get_process_including_zombie, get_visible_task, send_queued_signal_to_process_data,
-        send_queued_signal_to_visible_thread, send_signal_to_process, send_signal_to_process_data,
-        send_signal_to_visible_thread, try_processes,
+        AsThread, ProcessData, acknowledge_posix_timer_signal, check_current_process_signal_access,
+        check_current_signal_access, check_signals, force_signal_current_thread, get_process_data,
+        get_process_group, get_process_including_zombie, get_visible_task,
+        send_queued_signal_to_process_data, send_queued_signal_to_visible_thread,
+        send_signal_to_process, send_signal_to_process_data, send_signal_to_visible_thread,
+        try_processes,
     },
     time::TimeValueLike,
 };
@@ -148,7 +149,7 @@ pub(crate) fn queued_signal_required(signal: &Option<SignalInfo>) -> bool {
 
 fn check_signal_permission(pid: Pid, signal: Option<Signo>) -> AxResult<()> {
     let target = get_process_data(pid)?;
-    check_current_signal_access(&target, signal)
+    check_current_process_signal_access(&target, signal)
 }
 
 fn check_zombie_signal_permission(pid: Pid, signal: Option<Signo>) -> AxResult<bool> {
@@ -158,8 +159,9 @@ fn check_zombie_signal_permission(pid: Pid, signal: Option<Signo>) -> AxResult<b
     }
 
     let actor = current();
-    let actor_proc = &actor.as_thread().proc_data;
-    let actor_cred = actor_proc.current_cred();
+    let actor_thread = actor.as_thread();
+    let actor_proc = &actor_thread.proc_data;
+    let actor_cred = actor_thread.current_cred();
     let actor_ids = actor_cred.ids();
     let snapshot = process.zombie_snapshot().ok_or(AxError::NoSuchProcess)?;
     let allowed = [actor_ids.ruid, actor_ids.euid]
@@ -195,7 +197,7 @@ fn send_user_signal_to_targets(
 
     for target in targets {
         had_target = true;
-        if check_current_signal_access(&target, signo).is_err() {
+        if check_current_process_signal_access(&target, signo).is_err() {
             continue;
         }
         had_permission = true;
@@ -227,7 +229,8 @@ fn check_visible_thread_signal_access(
     if tgid.is_some_and(|tgid| thread.proc_data.proc.pid() != tgid) {
         return Err(AxError::NoSuchProcess);
     }
-    check_current_signal_access(&thread.proc_data, signal)
+    let target_cred = thread.current_cred();
+    check_current_signal_access(&thread.proc_data, &target_cred, signal)
 }
 
 pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
@@ -332,7 +335,8 @@ pub fn sys_rt_sigqueueinfo(pid: Pid, signo: u32, sig: *const SignalInfo) -> AxRe
     let queue_required = queued_signal_required(&sig);
     if let Ok(task) = get_visible_task(pid) {
         let thread = task.try_as_thread().ok_or(AxError::OperationNotPermitted)?;
-        check_current_signal_access(&thread.proc_data, permission_signal)?;
+        let target_cred = thread.current_cred();
+        check_current_signal_access(&thread.proc_data, &target_cred, permission_signal)?;
         if thread.proc_data.proc.pid() == pid {
             if queue_required {
                 send_queued_signal_to_process_data(&thread.proc_data, sig)?;
@@ -348,7 +352,7 @@ pub fn sys_rt_sigqueueinfo(pid: Pid, signo: u32, sig: *const SignalInfo) -> AxRe
         }
     } else {
         let target = get_process_data(pid)?;
-        check_current_signal_access(&target, permission_signal)?;
+        check_current_process_signal_access(&target, permission_signal)?;
         if queue_required {
             send_queued_signal_to_process_data(&target, sig)?;
         } else {

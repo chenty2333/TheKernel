@@ -28,7 +28,10 @@ use starry_signal::{SignalInfo, Signo};
 use super::pseudo_stat_fs;
 use crate::{
     file::{Directory, OpenCredentials, current_file_write_credentials, get_typed_file},
-    task::{AsThread, get_process_data, get_process_including_zombie, send_signal_to_process},
+    task::{
+        AsThread, Cred, get_process_data, get_process_group_leader_task,
+        get_process_including_zombie, send_signal_to_process,
+    },
 };
 
 const CGROUP_SUPER_MAGIC: u32 = 0x27e0_eb;
@@ -619,7 +622,10 @@ impl CgroupDir {
         if !can_migrate_from_open_cgroup_namespace(credentials) {
             return Err(VfsError::NotFound);
         }
-        if !can_migrate_with_credentials(credentials, &target) {
+        // cgroup.procs is process-directed; sample the Linux group leader once.
+        let target_task = get_process_group_leader_task(&target).map_err(|_| VfsError::NotFound)?;
+        let target_cred = target_task.as_thread().current_cred();
+        if !can_migrate_with_credentials(credentials, &target_cred) {
             return Err(VfsError::PermissionDenied);
         }
         let this = self.this_dir()?;
@@ -961,11 +967,8 @@ impl PidMembershipRegistry {
     }
 }
 
-fn can_migrate_with_credentials(
-    credentials: OpenCredentials,
-    target: &crate::task::ProcessData,
-) -> bool {
-    let target_ids = target.current_cred().ids();
+fn can_migrate_with_credentials(credentials: OpenCredentials, target_cred: &Cred) -> bool {
+    let target_ids = target_cred.ids();
     credentials.euid == 0
         || credentials.fsuid == 0
         || [

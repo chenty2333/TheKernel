@@ -88,7 +88,6 @@ fn check_fd_xattr_access(fd: i32) -> AxResult<()> {
 fn current_can_access_trusted_xattrs() -> bool {
     current()
         .as_thread()
-        .proc_data
         .has_effective_capability(CAP_SYS_ADMIN)
 }
 

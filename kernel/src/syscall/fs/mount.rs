@@ -297,10 +297,7 @@ fn apply_mount_attr_flags(current: u32, attr: mount_attr) -> AxResult<u32> {
 }
 
 fn current_has_capability(cap: u32) -> bool {
-    current()
-        .as_thread()
-        .proc_data
-        .has_effective_capability(cap)
+    current().as_thread().has_effective_capability(cap)
 }
 
 fn validate_mount_flags(raw: i32) -> AxResult<u32> {
@@ -763,7 +760,7 @@ pub fn sys_open_tree(dirfd: i32, pathname: *const c_char, flags: u32) -> AxResul
         return Err(AxError::InvalidInput);
     }
     let curr = current();
-    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     if !credentials.has_capability(CAP_SYS_ADMIN) {
         return Err(LinuxError::EPERM.into());
     }
@@ -808,7 +805,7 @@ pub fn sys_mount_setattr(
         return Err(AxError::InvalidInput);
     }
     let curr = current();
-    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     if !credentials.has_capability(CAP_SYS_ADMIN) {
         return Err(LinuxError::EPERM.into());
     }
@@ -875,7 +872,7 @@ pub fn sys_move_mount(
         return Err(AxError::InvalidInput);
     }
     let curr = current();
-    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     if !credentials.has_capability(CAP_SYS_ADMIN) {
         return Err(LinuxError::EPERM.into());
     }
@@ -938,7 +935,7 @@ pub fn sys_mount(
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    let credentials = proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     let umask = proc_data.umask() as u16;
     if !credentials.has_capability(CAP_SYS_ADMIN) {
         return Err(AxError::from(LinuxError::EPERM));
@@ -1104,7 +1101,7 @@ pub fn sys_umount2(target: *const c_char, flags: i32) -> AxResult<isize> {
     let target = vm_load_string(target)?;
     debug!("sys_umount2 <= target: {target:?}, flags: {flags:#x}");
     let curr = current();
-    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     if !credentials.has_capability(CAP_SYS_ADMIN) {
         return Err(AxError::from(LinuxError::EPERM));
     }

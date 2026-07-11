@@ -106,7 +106,7 @@ fn current_pid() -> u32 {
 
 fn current_can_set_lease(owner_uid: u32) -> bool {
     current().try_as_thread().is_some_and(|thr| {
-        let cred = thr.proc_data.current_cred();
+        let cred = thr.current_cred();
         cred.ids().fsuid == owner_uid || cred.has_effective_capability(CAP_LEASE)
     })
 }

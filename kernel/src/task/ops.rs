@@ -776,6 +776,21 @@ pub fn get_process_data(pid: Pid) -> AxResult<Arc<ProcessData>> {
     PROCESS_TABLE.lock().get(&pid).ok_or(AxError::NoSuchProcess)
 }
 
+/// Resolves the Linux thread-group leader for process-scoped operations.
+///
+/// `ProcessData` deliberately carries no credential. Callers that implement a
+/// process-directed ABI (rather than a TID-directed ABI) use this resolver and
+/// take exactly one credential snapshot from the returned task. An exiting
+/// leader remains the group identity while sibling threads still exist, so the
+/// lookup intentionally includes published exiting tasks.
+pub fn get_process_group_leader_task(proc_data: &ProcessData) -> AxResult<AxTaskRef> {
+    let task = get_visible_task_including_exiting(proc_data.proc.pid())?;
+    if task.as_thread().proc_data.proc.pid() != proc_data.proc.pid() {
+        return Err(AxError::NoSuchProcess);
+    }
+    Ok(task)
+}
+
 /// Finds a process by PID even after its runtime [`ProcessData`] has been
 /// dropped. Zombie processes remain owned by their parent until wait reaps
 /// them, so PID-existence checks such as kill(2) must still see them.
@@ -1206,7 +1221,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
                 wait_status: process.exit_code(),
                 self_usage: self_usage.into(),
                 child_usage: child_usage.into(),
-                uid: thr.proc_data.uid(),
+                uid: thr.uid(),
             });
         }
         process.exit(|child| notify_reaper_of_inherited_zombie(&child));

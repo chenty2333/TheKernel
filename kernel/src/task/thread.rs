@@ -1,4 +1,8 @@
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{
+    boxed::Box,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::{
     cell::RefCell,
     ops::Deref,
@@ -20,6 +24,7 @@ use starry_signal::{
 use super::{
     ProcessData,
     accounting::{AtomicTaskUsage, TaskUsage},
+    creds::{Cred, CredentialSlot},
     restart::RestartTracker,
     timer::TimeManager,
 };
@@ -43,6 +48,13 @@ impl<T> Deref for AssumeSync<T> {
 pub struct Thread {
     /// The process data shared by all threads in the process.
     pub proc_data: Arc<ProcessData>,
+
+    /// Atomically published immutable security identity owned by this task.
+    ///
+    /// A new thread or fork child starts from one caller snapshot, but owns an
+    /// independent slot so later set-ID, capability, or prctl commits affect
+    /// only this task.
+    pub(in crate::task) credential: Arc<CredentialSlot>,
 
     /// The clear thread tid field
     ///
@@ -98,9 +110,10 @@ pub struct Thread {
 
 impl Thread {
     /// Create a new [`Thread`].
-    pub fn try_new(
+    pub(crate) fn try_new(
         tid: u32,
         proc_data: Arc<ProcessData>,
+        credential: Arc<Cred>,
     ) -> AxResult<(Box<Self>, ThreadSignalRegistration)> {
         let signal = ThreadSignalManager::try_new(proc_data.signal.clone())
             .map_err(|_| AxError::NoMemory)?;
@@ -109,9 +122,12 @@ impl Thread {
         let deferred_work =
             Arc::try_new(DeferredWorkAccount::new()).map_err(|_| AxError::NoMemory)?;
         let restart = RestartTracker::try_new().map_err(|_| AxError::NoMemory)?;
+        let credential =
+            Arc::try_new(CredentialSlot::new(credential)).map_err(|_| AxError::NoMemory)?;
         let thread = Box::try_new(Thread {
             signal,
             proc_data,
+            credential,
             clear_child_tid: AtomicUsize::new(0),
             visible_tid: AtomicU32::new(tid),
             robust_list_head: AtomicUsize::new(0),
@@ -136,6 +152,13 @@ impl Thread {
 
     pub(crate) fn deferred_work_account(&self) -> Arc<DeferredWorkAccount> {
         self.deferred_work.clone()
+    }
+
+    /// Stable weak access to this task's sole credential publication slot.
+    /// Used by thread pidfds so de-threading or numeric TID reuse cannot change
+    /// the credential object they name.
+    pub(crate) fn credential_slot_weak(&self) -> Weak<CredentialSlot> {
+        Arc::downgrade(&self.credential)
     }
 
     /// Get the clear child tid field.

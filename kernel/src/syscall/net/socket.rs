@@ -41,7 +41,7 @@ const SOCK_CLOEXEC_NONBLOCK_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
 fn current_unix_credentials() -> UnixCredentials {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    let ids = proc_data.current_cred().ids();
+    let ids = curr.as_thread().current_cred().ids();
     UnixCredentials::new(proc_data.proc.pid(), ids.euid, ids.egid)
 }
 
@@ -52,7 +52,7 @@ fn require_bind_permissions(addr: &SocketAddrEx) -> AxResult<()> {
 
     if ip_addr.port() != 0
         && ip_addr.port() < FIRST_UNPRIVILEGED_PORT
-        && current().as_thread().proc_data.euid() != 0
+        && current().as_thread().euid() != 0
     {
         return Err(AxError::from(LinuxError::EACCES));
     }
@@ -232,7 +232,7 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
     {
         let curr = current();
         let proc_data = &curr.as_thread().proc_data;
-        let credentials = proc_data.fs_dac_credentials();
+        let credentials = curr.as_thread().fs_dac_credentials();
         crate::file::unix_socket::bind_path(
             unix,
             path.clone(),
@@ -270,7 +270,7 @@ pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxRes
     let result = match (&socket.inner, &addr) {
         (SocketInner::Unix(unix), SocketAddrEx::Unix(UnixSocketAddr::Path(path))) => {
             let curr = current();
-            let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+            let credentials = curr.as_thread().fs_dac_credentials();
             let target = crate::file::unix_socket::resolve_peer(path.clone(), &credentials)?;
             unix.connect_resolved_as(target, current_unix_credentials())
         }

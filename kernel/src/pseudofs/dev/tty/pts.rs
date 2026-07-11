@@ -156,8 +156,7 @@ pub fn add_slave(fs: Arc<SimpleFs>, pty: Arc<PtyDriver>, lease: &PtsLease) -> Ax
     let pty_number = lease.id() as u32;
     let terminal = pty.terminal.clone();
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let ids = proc_data.current_cred().ids();
+    let ids = curr.as_thread().current_cred().ids();
     let device = Device::try_new(
         fs,
         NodeType::CharacterDevice,

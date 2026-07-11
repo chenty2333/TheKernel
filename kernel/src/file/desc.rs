@@ -31,9 +31,9 @@ use super::{
 use crate::{
     deferred_work::DeferredWorkAccount,
     task::{
-        AsThread, ProcessData, get_process_data, get_process_group, get_visible_task,
-        send_queued_signal_thread_inner, send_queued_signal_to_process_data,
-        send_signal_thread_inner, send_signal_to_process_data,
+        AsThread, Cred, ProcessData, get_process_data, get_process_group,
+        get_process_group_leader_task, get_visible_task, send_queued_signal_thread_inner,
+        send_queued_signal_to_process_data, send_signal_thread_inner, send_signal_to_process_data,
     },
 };
 
@@ -301,7 +301,7 @@ impl OpenCredentials {
             return Self::root();
         };
         let proc_data = &thread.proc_data;
-        let cred = proc_data.current_cred();
+        let cred = thread.current_cred();
         let ids = cred.ids();
         Self {
             uid: ids.ruid,
@@ -431,8 +431,8 @@ struct AsyncIoCredentials {
 impl AsyncIoCredentials {
     fn current() -> Option<Self> {
         let task = current_may_uninit()?;
-        let process = &task.try_as_thread()?.proc_data;
-        let cred = process.current_cred();
+        let thread = task.try_as_thread()?;
+        let cred = thread.current_cred();
         let ids = cred.ids();
         Some(Self {
             uid: ids.ruid,
@@ -444,8 +444,8 @@ impl AsyncIoCredentials {
         })
     }
 
-    fn may_signal(&self, target: &ProcessData) -> bool {
-        let ids = target.current_cred().ids();
+    fn may_signal(&self, target: &Cred) -> bool {
+        let ids = target.ids();
         self.may_signal_ids(ids.ruid, ids.suid)
     }
 
@@ -565,7 +565,8 @@ pub(crate) fn send_sigio(state: &AsyncIoState, fd: i32, reason: u32) {
             let Some(thread) = task.try_as_thread() else {
                 return;
             };
-            if thread.pending_exit() || !credentials.may_signal(&thread.proc_data) {
+            let target_cred = thread.current_cred();
+            if thread.pending_exit() || !credentials.may_signal(&target_cred) {
                 return;
             }
             let info = sigio_info(state.signal, fd, reason);
@@ -587,7 +588,11 @@ pub(crate) fn send_sigio(state: &AsyncIoState, fd: i32, reason: u32) {
             let Some(process) = process.upgrade() else {
                 return;
             };
-            if credentials.may_signal(&process) {
+            let Ok(target_task) = get_process_group_leader_task(&process) else {
+                return;
+            };
+            let target_cred = target_task.as_thread().current_cred();
+            if credentials.may_signal(&target_cred) {
                 send_sigio_to_process(&process, sigio_info(state.signal, fd, reason));
             }
         }
@@ -602,8 +607,12 @@ pub(crate) fn send_sigio(state: &AsyncIoState, fd: i32, reason: u32) {
                 let Ok(process_data) = get_process_data(process.pid()) else {
                     return;
                 };
+                let Ok(target_task) = get_process_group_leader_task(&process_data) else {
+                    return;
+                };
+                let target_cred = target_task.as_thread().current_cred();
                 if !Arc::ptr_eq(&process_data.proc, process)
-                    || !credentials.may_signal(&process_data)
+                    || !credentials.may_signal(&target_cred)
                 {
                     return;
                 }

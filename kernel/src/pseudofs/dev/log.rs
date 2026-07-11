@@ -14,7 +14,7 @@ pub fn bind_dev_log() -> LinuxResult<()> {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let server = UnixSocket::new(DgramTransport::new()?, proc_data.net_ns.unix_namespace());
-    let credentials = proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     crate::file::unix_socket::bind_path(
         &server,
         crate::file::unix_socket::try_path("/dev/log")?,

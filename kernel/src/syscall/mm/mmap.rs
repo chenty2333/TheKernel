@@ -279,11 +279,12 @@ fn set_relocated_locked_segments(
 
 fn check_mremap_locked_growth_limit(
     proc_data: &ProcessData,
+    has_ipc_lock: bool,
     aspace: &AddrSpace,
     grow: usize,
     reclaimed_locked: usize,
 ) -> AxResult {
-    if grow == 0 || proc_data.has_effective_capability(CAP_IPC_LOCK) {
+    if grow == 0 || has_ipc_lock {
         return Ok(());
     }
 
@@ -439,7 +440,9 @@ pub fn sys_mmap(
     }
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
+    let thread = curr.as_thread();
+    let proc_data = &thread.proc_data;
+    let has_ipc_lock = thread.has_effective_capability(CAP_IPC_LOCK);
     let aspace_handle = curr.as_thread().proc_data.aspace();
     let mut aspace = aspace_handle.lock();
     let start = addr.align_down(page_size);
@@ -603,7 +606,7 @@ pub fn sys_mmap(
 
     let locked_mapping = map_flags.contains(MmapFlags::LOCKED) || aspace.locks_future_mappings();
     if locked_mapping {
-        check_mmap_memlock_limit(proc_data, &aspace, start, length)?;
+        check_mmap_memlock_limit(proc_data, has_ipc_lock, &aspace, start, length)?;
     }
 
     let populate = map_flags.contains(MmapFlags::POPULATE)
@@ -639,7 +642,8 @@ pub fn sys_munmap(addr: usize, length: usize) -> AxResult<isize> {
     }
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
+    let thread = curr.as_thread();
+    let proc_data = &thread.proc_data;
     let aspace_handle = proc_data.aspace();
     let mut aspace = aspace_handle.lock();
     let length = checked_align_up_4k(length).ok_or(AxError::InvalidInput)?;
@@ -703,7 +707,9 @@ pub fn sys_mremap(
     let old_size = checked_align_up_4k(old_size).ok_or(AxError::InvalidInput)?;
     let new_size = checked_align_up_4k(new_size).ok_or(AxError::InvalidInput)?;
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
+    let thread = curr.as_thread();
+    let proc_data = &thread.proc_data;
+    let has_ipc_lock = thread.has_effective_capability(CAP_IPC_LOCK);
     let aspace_handle = proc_data.aspace();
     let mut aspace = aspace_handle.lock();
 
@@ -779,7 +785,7 @@ pub fn sys_mremap(
         !fixed && new_size > old_size && range_is_free(&aspace, after, grow, page_size as usize);
     if can_grow_inplace {
         if grow_locked {
-            check_mremap_locked_growth_limit(proc_data, &aspace, grow, 0)?;
+            check_mremap_locked_growth_limit(proc_data, has_ipc_lock, &aspace, grow, 0)?;
         }
         primary.backend.ensure_range_covered(addr, new_size)?;
         let tail_backend = primary.backend.relocate(addr, addr, &aspace_handle)?;
@@ -821,7 +827,13 @@ pub fn sys_mremap(
             let reclaimed_locked = fixed
                 .then(|| aspace.locked_bytes_in_range(dst, new_size))
                 .unwrap_or(0);
-            check_mremap_locked_growth_limit(proc_data, &aspace, grow, reclaimed_locked)?;
+            check_mremap_locked_growth_limit(
+                proc_data,
+                has_ipc_lock,
+                &aspace,
+                grow,
+                reclaimed_locked,
+            )?;
         }
         primary.backend.ensure_range_covered(addr, new_size)?;
     }
@@ -1003,8 +1015,8 @@ pub fn sys_mlock(addr: usize, length: usize) -> AxResult<isize> {
     sys_mlock2(addr, length, 0)
 }
 
-fn memlock_limit(proc_data: &ProcessData) -> AxResult<Option<u64>> {
-    if proc_data.has_effective_capability(CAP_IPC_LOCK) {
+fn memlock_limit(proc_data: &ProcessData, has_ipc_lock: bool) -> AxResult<Option<u64>> {
+    if has_ipc_lock {
         return Ok(None);
     }
     let limit = proc_data.rlim.read()[RLIMIT_MEMLOCK].current;
@@ -1017,10 +1029,11 @@ fn memlock_limit(proc_data: &ProcessData) -> AxResult<Option<u64>> {
 
 fn check_memlock_total(
     proc_data: &ProcessData,
+    has_ipc_lock: bool,
     locked_bytes: usize,
     limit_error: AxError,
 ) -> AxResult {
-    if let Some(limit) = memlock_limit(proc_data)?
+    if let Some(limit) = memlock_limit(proc_data, has_ipc_lock)?
         && (locked_bytes as u128) > u128::from(limit)
     {
         return Err(limit_error);
@@ -1045,31 +1058,42 @@ fn locked_bytes_after_range(
 
 fn check_mlock_range_limit(
     proc_data: &ProcessData,
+    has_ipc_lock: bool,
     aspace: &AddrSpace,
     start: VirtAddr,
     length: usize,
 ) -> AxResult {
     let locked_bytes = locked_bytes_after_range(aspace, start, length, AxError::NoMemory)?;
-    check_memlock_total(proc_data, locked_bytes, AxError::NoMemory)
+    check_memlock_total(proc_data, has_ipc_lock, locked_bytes, AxError::NoMemory)
 }
 
 pub(super) fn check_mmap_memlock_limit(
     proc_data: &ProcessData,
+    has_ipc_lock: bool,
     aspace: &AddrSpace,
     start: VirtAddr,
     length: usize,
 ) -> AxResult {
     let limit_error = AxError::from(LinuxError::EAGAIN);
     let locked_bytes = locked_bytes_after_range(aspace, start, length, limit_error)?;
-    check_memlock_total(proc_data, locked_bytes, limit_error)
+    check_memlock_total(proc_data, has_ipc_lock, locked_bytes, limit_error)
 }
 
-fn check_mlockall_current_limit(proc_data: &ProcessData, aspace: &AddrSpace) -> AxResult {
-    check_memlock_total(proc_data, aspace.current_mapping_bytes(), AxError::NoMemory)
+fn check_mlockall_current_limit(
+    proc_data: &ProcessData,
+    has_ipc_lock: bool,
+    aspace: &AddrSpace,
+) -> AxResult {
+    check_memlock_total(
+        proc_data,
+        has_ipc_lock,
+        aspace.current_mapping_bytes(),
+        AxError::NoMemory,
+    )
 }
 
-fn check_mlockall_future_limit(proc_data: &ProcessData) -> AxResult {
-    memlock_limit(proc_data).map(|_| ())
+fn check_mlockall_future_limit(proc_data: &ProcessData, has_ipc_lock: bool) -> AxResult {
+    memlock_limit(proc_data, has_ipc_lock).map(|_| ())
 }
 
 pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
@@ -1080,7 +1104,9 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     }
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
+    let thread = curr.as_thread();
+    let proc_data = &thread.proc_data;
+    let has_ipc_lock = thread.has_effective_capability(CAP_IPC_LOCK);
     let aspace_handle = proc_data.aspace();
     let mut aspace = aspace_handle.lock();
     let (start, length) = validate_page_aligned_range(addr, length)?;
@@ -1088,7 +1114,7 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
         return Err(AxError::NoMemory);
     }
 
-    check_mlock_range_limit(proc_data, &aspace, start, length)?;
+    check_mlock_range_limit(proc_data, has_ipc_lock, &aspace, start, length)?;
     if flags & MLOCK_ONFAULT == 0 {
         aspace.populate_area(start, length, MappingFlags::empty())?;
     }
@@ -1101,7 +1127,8 @@ pub fn sys_munlock(addr: usize, length: usize) -> AxResult<isize> {
     debug!("sys_munlock <= addr: {addr:#x}, length: {length:x}");
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
+    let thread = curr.as_thread();
+    let proc_data = &thread.proc_data;
     let aspace_handle = proc_data.aspace();
     let mut aspace = aspace_handle.lock();
     let (start, length) = validate_page_aligned_range(addr, length)?;
@@ -1124,12 +1151,14 @@ pub fn sys_mlockall(flags: u32) -> AxResult<isize> {
     }
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
+    let thread = curr.as_thread();
+    let proc_data = &thread.proc_data;
+    let has_ipc_lock = thread.has_effective_capability(CAP_IPC_LOCK);
     let aspace_handle = proc_data.aspace();
     let mut aspace = aspace_handle.lock();
 
     if flags & MCL_CURRENT != 0 {
-        check_mlockall_current_limit(proc_data, &aspace)?;
+        check_mlockall_current_limit(proc_data, has_ipc_lock, &aspace)?;
         if flags & MCL_ONFAULT == 0 {
             let ranges: Vec<_> = aspace
                 .areas()
@@ -1141,7 +1170,7 @@ pub fn sys_mlockall(flags: u32) -> AxResult<isize> {
         }
         aspace.lock_current_mappings();
     } else {
-        check_mlockall_future_limit(proc_data)?;
+        check_mlockall_future_limit(proc_data, has_ipc_lock)?;
     }
 
     aspace.set_lock_future_mappings(flags & MCL_FUTURE != 0, flags & MCL_ONFAULT != 0);

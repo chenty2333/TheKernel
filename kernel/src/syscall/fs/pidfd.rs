@@ -11,8 +11,8 @@ use crate::{
     syscall::signal::{parse_signo, queued_signal_required},
     task::{
         AsThread, ProcessData, PtraceCredentialMode, check_current_ptrace_access,
-        check_current_signal_access, get_process_data, get_visible_task,
-        send_queued_signal_to_process_data, send_signal_to_process_data,
+        check_current_signal_access, get_process_data, get_process_group_leader_task,
+        get_visible_task, send_queued_signal_to_process_data, send_signal_to_process_data,
     },
 };
 
@@ -31,16 +31,31 @@ fn process_data_from_proc_dir_fd(fd: i32) -> AxResult<alloc::sync::Arc<crate::ta
     }
 }
 
-fn process_data_from_signal_fd(fd: i32) -> AxResult<alloc::sync::Arc<crate::task::ProcessData>> {
+fn signal_target_from_fd(
+    fd: i32,
+) -> AxResult<(
+    alloc::sync::Arc<crate::task::ProcessData>,
+    alloc::sync::Arc<crate::task::Cred>,
+)> {
     match PidFd::from_fd(fd) {
-        Ok(pidfd) => pidfd.process_data(),
-        Err(AxError::InvalidInput) => process_data_from_proc_dir_fd(fd),
+        Ok(pidfd) => {
+            let proc_data = pidfd.process_data()?;
+            let cred = pidfd.credential_snapshot()?;
+            Ok((proc_data, cred))
+        }
+        Err(AxError::InvalidInput) => {
+            let proc_data = process_data_from_proc_dir_fd(fd)?;
+            let task = get_process_group_leader_task(&proc_data)?;
+            let cred = task.as_thread().current_cred();
+            Ok((proc_data, cred))
+        }
         Err(err) => Err(err),
     }
 }
 
-fn check_pidfd_getfd_permission(target: &ProcessData) -> AxResult<()> {
-    check_current_ptrace_access(target, PtraceCredentialMode::Real)
+fn check_pidfd_getfd_permission(pidfd: &PidFd, target: &ProcessData) -> AxResult<()> {
+    let target_cred = pidfd.credential_snapshot()?;
+    check_current_ptrace_access(target, &target_cred, PtraceCredentialMode::Real)
 }
 
 bitflags! {
@@ -80,7 +95,7 @@ pub fn sys_pidfd_getfd(pidfd: i32, target_fd: i32, flags: u32) -> AxResult<isize
     }
     let pidfd = PidFd::from_fd(pidfd)?;
     let proc_data = pidfd.process_data()?;
-    check_pidfd_getfd_permission(&proc_data)?;
+    check_pidfd_getfd_permission(&pidfd, &proc_data)?;
     FD_TABLE
         .scope(&proc_data.scope.read())
         .read()
@@ -124,7 +139,7 @@ pub fn sys_pidfd_send_signal(
         return Err(AxError::InvalidInput);
     }
 
-    let proc_data = process_data_from_signal_fd(pidfd)?;
+    let (proc_data, target_cred) = signal_target_from_fd(pidfd)?;
 
     let sig = if sig.is_null() {
         if signo == 0 {
@@ -140,7 +155,11 @@ pub fn sys_pidfd_send_signal(
     } else {
         make_pidfd_signal_info(&proc_data, signo, sig)?
     };
-    check_current_signal_access(&proc_data, sig.as_ref().map(SignalInfo::signo))?;
+    check_current_signal_access(
+        &proc_data,
+        &target_cred,
+        sig.as_ref().map(SignalInfo::signo),
+    )?;
     if queued_signal_required(&sig) {
         send_queued_signal_to_process_data(&proc_data, sig)?;
     } else {

@@ -418,7 +418,6 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
             TIOCVHANGUP => {
                 if !current()
                     .as_thread()
-                    .proc_data
                     .has_effective_capability(CAP_SYS_ADMIN)
                 {
                     return Err(AxError::OperationNotPermitted);

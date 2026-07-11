@@ -1,6 +1,7 @@
 use axerrno::AxResult;
 use axhal::paging::{MappingFlags, PageSize};
 use axtask::current;
+use linux_raw_sys::general::CAP_IPC_LOCK;
 use memory_addr::{PAGE_SIZE_4K, VirtAddr, align_up_4k};
 
 use super::mmap::check_mmap_memlock_limit;
@@ -52,7 +53,14 @@ pub fn sys_brk(addr: usize) -> AxResult<isize> {
 
             let locked = aspace.locks_future_mappings();
             if locked
-                && check_mmap_memlock_limit(proc_data, &aspace, expand_start, expand_size).is_err()
+                && check_mmap_memlock_limit(
+                    proc_data,
+                    curr.as_thread().has_effective_capability(CAP_IPC_LOCK),
+                    &aspace,
+                    expand_start,
+                    expand_size,
+                )
+                .is_err()
             {
                 return Ok(current_top as isize);
             }

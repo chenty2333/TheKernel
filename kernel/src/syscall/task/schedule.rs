@@ -25,7 +25,7 @@ use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 use crate::{
     task::{
         AlarmClock, AsThread, ProcStateHint, get_process_group, get_task, sleep_until_clock,
-        try_processes, with_proc_state_hint,
+        try_tasks, with_proc_state_hint,
     },
     time::TimeValueLike,
 };
@@ -97,23 +97,19 @@ fn sched_class_for_set(policy: u32, abi: SchedSetAbi) -> AxResult<SchedClass> {
 }
 
 fn has_sched_admin_capability() -> bool {
-    current()
-        .as_thread()
-        .proc_data
-        .has_effective_capability(CAP_SYS_NICE)
+    current().as_thread().has_effective_capability(CAP_SYS_NICE)
 }
 
 fn can_manage_sched_target(task: &AxTaskRef) -> AxResult<()> {
     let actor = current();
     let actor_thread = actor.as_thread();
-    let actor_cred = actor_thread.proc_data.current_cred();
+    let actor_cred = actor_thread.current_cred();
     if actor_cred.has_effective_capability(CAP_SYS_NICE) {
         return Ok(());
     }
     let actor_euid = actor_cred.ids().euid;
     let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
-    let target_proc = &target_thread.proc_data;
-    let target_ids = target_proc.current_cred().ids();
+    let target_ids = target_thread.current_cred().ids();
 
     if actor_euid == target_ids.ruid || actor_euid == target_ids.euid {
         Ok(())
@@ -327,8 +323,8 @@ fn can_adjust_task_nice(task: &AxTaskRef, new_nice: i8) -> AxResult<()> {
     let actor = current();
     let actor_thread = actor.as_thread();
     let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
-    let actor_euid = actor_thread.proc_data.current_cred().ids().euid;
-    let target_ids = target_thread.proc_data.current_cred().ids();
+    let actor_euid = actor_thread.current_cred().ids().euid;
+    let target_ids = target_thread.current_cred().ids();
 
     if actor_euid != 0 && actor_euid != target_ids.ruid && actor_euid != target_ids.euid {
         return Err(AxError::OperationNotPermitted);
@@ -682,18 +678,16 @@ pub fn sys_getpriority(which: u32, who: u32) -> AxResult<isize> {
         }
         PRIO_USER => {
             let uid = if who == 0 {
-                current().as_thread().proc_data.uid()
+                current().as_thread().uid()
             } else {
                 who
             };
             Ok(raw_priority_from_nice(min_nice_for_threads(
-                try_processes()?
-                    .into_iter()
-                    .filter(|proc_data| {
-                        let ids = proc_data.current_cred().ids();
-                        ids.ruid == uid || ids.euid == uid
-                    })
-                    .flat_map(|proc_data| proc_data.proc.thread_ids()),
+                try_tasks()?.into_iter().filter_map(|task| {
+                    let thread = task.try_as_thread()?;
+                    let ids = thread.current_cred().ids();
+                    (ids.ruid == uid || ids.euid == uid).then_some(thread.tid())
+                }),
             )?))
         }
         _ => Err(AxError::InvalidInput),
@@ -733,19 +727,18 @@ pub fn sys_setpriority(which: u32, who: u32, prio: i32) -> AxResult<isize> {
         }
         PRIO_USER => {
             let uid = if who == 0 {
-                current().as_thread().proc_data.uid()
+                current().as_thread().uid()
             } else {
                 who
             };
-            for proc_data in try_processes()?.into_iter().filter(|proc_data| {
-                let ids = proc_data.current_cred().ids();
-                ids.ruid == uid || ids.euid == uid
-            }) {
-                for tid in proc_data.proc.thread_ids() {
-                    if let Ok(task) = get_task(tid) {
-                        targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-                        targets.push(task);
-                    }
+            for task in try_tasks()? {
+                let Some(thread) = task.try_as_thread() else {
+                    continue;
+                };
+                let ids = thread.current_cred().ids();
+                if ids.ruid == uid || ids.euid == uid {
+                    targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                    targets.push(task);
                 }
             }
         }

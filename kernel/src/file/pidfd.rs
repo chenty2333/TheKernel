@@ -13,7 +13,7 @@ use starry_process::Process;
 
 use crate::{
     file::{FileLike, Kstat, PseudoInode},
-    task::{ProcessData, Thread},
+    task::{AsThread, Cred, CredentialSlot, ProcessData, Thread, get_process_group_leader_task},
 };
 
 pub struct PidFd {
@@ -22,6 +22,7 @@ pub struct PidFd {
     process: Weak<Process>,
     exit_event: Arc<PollSet>,
     thread_exit: Option<Arc<AtomicBool>>,
+    thread_credential: Option<Weak<CredentialSlot>>,
 
     non_blocking: AtomicBool,
 }
@@ -33,6 +34,7 @@ impl PidFd {
             process: Arc::downgrade(&proc_data.proc),
             exit_event: proc_data.exit_event.clone(),
             thread_exit: None,
+            thread_credential: None,
 
             non_blocking: AtomicBool::new(false),
         }
@@ -45,6 +47,7 @@ impl PidFd {
             process: Arc::downgrade(&thread.proc_data.proc),
             exit_event: thread.exit_event.clone(),
             thread_exit: Some(thread.exit.clone()),
+            thread_credential: Some(thread.credential_slot_weak()),
 
             non_blocking: AtomicBool::new(false),
         }
@@ -63,6 +66,19 @@ impl PidFd {
 
     pub fn process(&self) -> AxResult<Arc<Process>> {
         self.process.upgrade().ok_or(AxError::NoSuchProcess)
+    }
+
+    /// Takes the credential snapshot governing access through this pidfd.
+    /// Thread pidfds weakly retain the exact task publication slot across
+    /// de-threading; process pidfds explicitly resolve the Linux group leader.
+    pub fn credential_snapshot(&self) -> AxResult<Arc<Cred>> {
+        let proc_data = self.process_data()?;
+        if let Some(slot) = &self.thread_credential {
+            Ok(slot.upgrade().ok_or(AxError::NoSuchProcess)?.current())
+        } else {
+            let task = get_process_group_leader_task(&proc_data)?;
+            Ok(task.as_thread().current_cred())
+        }
     }
 }
 impl FileLike for PidFd {

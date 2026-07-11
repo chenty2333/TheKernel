@@ -394,9 +394,9 @@ impl CredBuilder {
 
 /// The single publication point for one task-identity owner.
 ///
-/// The slot has no `ProcessData` dependency so the current process-shared
-/// integration can later move to per-thread ownership without changing the
-/// immutable snapshot or transaction contract.
+/// The slot has no `ProcessData` dependency and is embedded exactly once in
+/// `Thread`. Clone and fork construct a new slot from one caller snapshot;
+/// subsequent commits therefore affect only the owning task.
 pub(crate) struct CredentialSlot {
     update: CredentialUpdateMutex<()>,
     current: SpinNoIrq<Arc<Cred>>,
@@ -518,6 +518,104 @@ mod tests {
     fn slot() -> Arc<CredentialSlot> {
         let namespace = UserNamespace::try_new_root().unwrap();
         Arc::new(CredentialSlot::new(Cred::try_root(namespace).unwrap()))
+    }
+
+    fn inherited_slot(parent: &CredentialSlot) -> Arc<CredentialSlot> {
+        Arc::new(CredentialSlot::new(parent.current()))
+    }
+
+    fn publish_raw_setuid(slot: &CredentialSlot, uid: u32) {
+        let mut update = slot.prepare();
+        update.builder.ids.ruid = uid;
+        update.builder.ids.euid = uid;
+        update.builder.ids.suid = uid;
+        update.builder.ids.fsuid = uid;
+        if uid != 0 {
+            update.builder.caps.effective = [0; CAPABILITY_WORDS];
+            update.builder.caps.permitted = [0; CAPABILITY_WORDS];
+            update.builder.caps.clear_ambient();
+        }
+        update.finish().unwrap().commit();
+    }
+
+    #[test]
+    fn sibling_task_slots_diverge_after_raw_setuid() {
+        let first = slot();
+        let second = inherited_slot(&first);
+
+        publish_raw_setuid(&first, 1000);
+
+        assert_eq!(first.current().ids().euid, 1000);
+        assert_eq!(second.current().ids().euid, 0);
+    }
+
+    #[test]
+    fn no_new_privs_is_task_local_after_clone_thread() {
+        let first = slot();
+        let second = inherited_slot(&first);
+
+        let mut update = first.prepare();
+        update.builder.no_new_privs = true;
+        update.finish().unwrap().commit();
+
+        assert!(first.current().no_new_privs());
+        assert!(!second.current().no_new_privs());
+    }
+
+    #[test]
+    fn capability_commits_are_task_local() {
+        let first = slot();
+        let second = inherited_slot(&first);
+        let (word, mask) = CapabilityState::cap_mask(CAP_CHOWN).unwrap();
+
+        let mut update = first.prepare();
+        update.builder.caps.effective[word] &= !mask;
+        update.builder.caps.permitted[word] &= !mask;
+        update.finish().unwrap().commit();
+
+        assert!(!first.current().has_effective_capability(CAP_CHOWN));
+        assert!(second.current().has_effective_capability(CAP_CHOWN));
+    }
+
+    #[test]
+    fn fork_inherits_calling_task_snapshot_into_independent_slot() {
+        let caller = slot();
+        let unrelated_sibling = inherited_slot(&caller);
+        publish_raw_setuid(&caller, 1000);
+
+        let child = inherited_slot(&caller);
+        assert_eq!(child.current().ids().euid, 1000);
+        assert_eq!(unrelated_sibling.current().ids().euid, 0);
+
+        publish_raw_setuid(&caller, 2000);
+        assert_eq!(caller.current().ids().euid, 2000);
+        assert_eq!(child.current().ids().euid, 1000);
+    }
+
+    #[test]
+    fn non_leader_exec_commit_stays_bound_to_executing_task_slot() {
+        let leader = slot();
+        let executor = inherited_slot(&leader);
+        publish_raw_setuid(&executor, 1000);
+        publish_raw_setuid(&leader, 2000);
+
+        let mut enable_keep_caps = executor.prepare();
+        enable_keep_caps.builder.caps.securebits |= SECBIT_KEEP_CAPS;
+        enable_keep_caps.finish().unwrap().commit();
+
+        let mut exec = executor.prepare();
+        exec.builder.caps.securebits &= !SECBIT_KEEP_CAPS;
+        let prepared = exec.finish_exec_keep_caps_clear().unwrap();
+        // Exec de-threading may rebind the visible TID, but it never replaces
+        // the executing Thread or the slot captured by this transaction.
+        prepared.commit();
+
+        assert_eq!(executor.current().ids().euid, 1000);
+        assert_eq!(
+            executor.current().capabilities().securebits & SECBIT_KEEP_CAPS,
+            0
+        );
+        assert_eq!(leader.current().ids().euid, 2000);
     }
 
     #[test]

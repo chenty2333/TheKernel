@@ -276,8 +276,9 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
     }
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let credentials = proc_data.access_dac_credentials(flags & AT_EACCESS as u32 != 0);
+    let credentials = curr
+        .as_thread()
+        .access_dac_credentials(flags & AT_EACCESS as u32 != 0);
 
     let file = resolve_at_with_credentials(dirfd, path.as_deref(), flags, &credentials)?;
     let stat = file.stat()?;
@@ -364,8 +365,7 @@ pub fn sys_statfs(path: *const c_char, buf: *mut statfs) -> AxResult<isize> {
     validate_pathname(path_ref)?;
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let credentials = proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     let loc = with_path_fs(AT_FDCWD, path_ref, |fs| {
         fs.resolve_dac(path_ref, &credentials)
     })?;

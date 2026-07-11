@@ -203,15 +203,12 @@ fn check_proc_fd_metadata_access(path: Option<&str>) -> AxResult<()> {
 }
 
 fn current_has_capability(cap: u32) -> bool {
-    current()
-        .as_thread()
-        .proc_data
-        .has_effective_capability(cap)
+    current().as_thread().has_effective_capability(cap)
 }
 
 fn current_can_preserve_setgid(gid: u32) -> bool {
     let curr = current();
-    let cred = curr.as_thread().proc_data.current_cred();
+    let cred = curr.as_thread().current_cred();
     cred.ids().fsgid == gid
         || cred.groups().contains(gid)
         || cred.has_effective_capability(CAP_FSETID)
@@ -231,8 +228,7 @@ fn chown_mode_after_update(meta: &Metadata) -> NodePermission {
 
 fn check_chown_permission(meta: &Metadata, uid: u32, gid: u32) -> AxResult<()> {
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let cred = proc_data.current_cred();
+    let cred = curr.as_thread().current_cred();
     if cred.has_effective_capability(CAP_CHOWN) {
         return Ok(());
     }
@@ -251,8 +247,7 @@ fn check_chown_permission(meta: &Metadata, uid: u32, gid: u32) -> AxResult<()> {
 
 fn check_chmod_permission(meta: &Metadata) -> AxResult<()> {
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let cred = proc_data.current_cred();
+    let cred = curr.as_thread().current_cred();
     if cred.ids().fsuid == meta.uid || cred.has_effective_capability(CAP_FOWNER) {
         Ok(())
     } else {
@@ -346,8 +341,7 @@ pub fn sys_chdir(path: *const c_char) -> AxResult<isize> {
     debug!("sys_chdir <= path: {path}");
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let credentials = proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     let mut fs = FS_CONTEXT.lock();
     let entry = fs.resolve_dac(path, &credentials)?;
     if entry.node_type() != NodeType::Directory {
@@ -363,8 +357,7 @@ pub fn sys_fchdir(dirfd: i32) -> AxResult<isize> {
 
     let entry = with_fs(dirfd, |fs| Ok(fs.current_dir().clone()))?;
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let credentials = proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     if entry.node_type() != NodeType::Directory {
         return Err(AxError::NotADirectory);
     }
@@ -383,8 +376,7 @@ pub fn sys_chroot(path: *const c_char) -> AxResult<isize> {
     debug!("sys_chroot <= path: {path}");
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let credentials = proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     let mut fs = FS_CONTEXT.lock();
     let loc = fs.resolve_dac(path, &credentials)?;
     if loc.node_type() != NodeType::Directory {
@@ -409,7 +401,7 @@ pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let requested_mode = NodePermission::from_bits_truncate(mode as u16);
-    let credentials = proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     let path_ref = Path::new(&path);
     let (parent, name) = with_path_fs(dirfd, path_ref, |fs| {
         let (parent, name) = fs.resolve_nonexistent_dac(path_ref, &credentials)?;
@@ -469,13 +461,13 @@ pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, dev: u64) -> AxRe
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     if matches!(node_type, NodeType::CharacterDevice | NodeType::BlockDevice)
-        && !proc_data.has_effective_capability(CAP_MKNOD)
+        && !curr.as_thread().has_effective_capability(CAP_MKNOD)
     {
         return Err(AxError::OperationNotPermitted);
     }
 
     let requested_mode = NodePermission::from_bits_truncate(mode as u16);
-    let credentials = proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     let (parent, name) = with_path_fs(dirfd, path_ref, |fs| {
         let (parent, name) = fs.resolve_nonexistent_dac(path_ref, &credentials)?;
         check_create_permissions(&parent, &credentials)?;
@@ -635,8 +627,7 @@ pub fn sys_linkat(
     validate_pathname(Path::new(&new_path))?;
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let credentials = proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     if old_path.is_empty()
         && (flags & AT_EMPTY_PATH == 0 || !credentials.has_capability(CAP_DAC_READ_SEARCH))
     {
@@ -713,8 +704,7 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
     debug!("sys_unlinkat <= dirfd: {dirfd}, path: {path:?}, flags: {flags}");
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let credentials = proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     let (parent_hint, name_hint) = with_path_fs(dirfd, path_ref, |fs| {
         let (parent, name) = fs.resolve_nonexistent_dac(path_ref, &credentials)?;
         check_writable_mount(&parent)?;
@@ -807,8 +797,7 @@ pub fn sys_symlinkat(
     validate_pathname(linkpath_ref)?;
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let credentials = proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     let loc = with_path_fs(new_dirfd, linkpath_ref, |fs| {
         let (parent, name) = fs.resolve_nonexistent_dac(linkpath_ref, &credentials)?;
         check_create_permissions(&parent, &credentials)?;
@@ -878,7 +867,7 @@ pub fn sys_readlinkat(
     validate_pathname(Path::new(&path))?;
 
     let curr = current();
-    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
 
     with_path_fs(dirfd, Path::new(&path), |fs| {
         let entry = fs.resolve_no_follow_dac(path.as_str(), &credentials)?;
@@ -921,8 +910,7 @@ pub fn sys_fchownat(
     check_empty_fd_metadata_access(dirfd, path.as_deref(), flags)?;
     check_proc_fd_metadata_access(path.as_deref())?;
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let credentials = proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     let loc = resolve_at_with_credentials(dirfd, path.as_deref(), flags, &credentials)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
@@ -972,7 +960,7 @@ pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> A
     check_empty_fd_metadata_access(dirfd, path.as_deref(), flags)?;
     check_proc_fd_metadata_access(path.as_deref())?;
     let curr = current();
-    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     let loc = resolve_at_with_credentials(dirfd, path.as_deref(), flags, &credentials)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
@@ -1009,8 +997,7 @@ fn update_times(
 ) -> AxResult<()> {
     let path = path.nullable().map(vm_load_string).transpose()?;
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let credentials = proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     let loc = resolve_at_with_credentials(dirfd, path.as_deref(), flags, &credentials)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
@@ -1177,8 +1164,7 @@ pub fn sys_renameat2(
     let _mount_operation = mounts::namespace_operation();
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let credentials = proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     let (old_loc, old_is_root) = with_path_fs(old_dirfd, old_path_ref, |fs| {
         let loc = fs.resolve_no_follow_dac(&old_path, &credentials)?;
         let is_root = loc.ptr_eq(fs.root_dir());

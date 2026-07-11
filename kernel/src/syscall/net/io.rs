@@ -362,7 +362,7 @@ fn send_impl(
     };
     let sent = if let (AxSocket::Unix(unix), Some(path)) = (&socket.inner, pathname) {
         let curr = current();
-        let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+        let credentials = curr.as_thread().fs_dac_credentials();
         let target = crate::file::unix_socket::resolve_peer(path, &credentials)?;
         unix.send_to_resolved(&mut src, options, target)
     } else {

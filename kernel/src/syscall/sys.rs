@@ -22,17 +22,16 @@ use crate::{
 };
 
 pub fn sys_getuid() -> AxResult<isize> {
-    Ok(current().as_thread().proc_data.uid() as isize)
+    Ok(current().as_thread().uid() as isize)
 }
 
 pub fn sys_geteuid() -> AxResult<isize> {
-    Ok(current().as_thread().proc_data.euid() as isize)
+    Ok(current().as_thread().euid() as isize)
 }
 
 pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> AxResult<isize> {
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let ids = proc_data.current_cred().ids();
+    let ids = curr.as_thread().current_cred().ids();
     if !ruid.is_null() {
         ruid.vm_write(ids.ruid)?;
     }
@@ -46,17 +45,16 @@ pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> AxResult
 }
 
 pub fn sys_getgid() -> AxResult<isize> {
-    Ok(current().as_thread().proc_data.gid() as isize)
+    Ok(current().as_thread().gid() as isize)
 }
 
 pub fn sys_getegid() -> AxResult<isize> {
-    Ok(current().as_thread().proc_data.egid() as isize)
+    Ok(current().as_thread().egid() as isize)
 }
 
 pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> AxResult<isize> {
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let ids = proc_data.current_cred().ids();
+    let ids = curr.as_thread().current_cred().ids();
     if !rgid.is_null() {
         rgid.vm_write(ids.rgid)?;
     }
@@ -71,27 +69,27 @@ pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> AxResult
 
 pub fn sys_setuid(uid: u32) -> AxResult<isize> {
     debug!("sys_setuid <= uid: {uid}");
-    current().as_thread().proc_data.setuid(uid)?;
+    current().as_thread().setuid(uid)?;
     Ok(0)
 }
 
 pub fn sys_setgid(gid: u32) -> AxResult<isize> {
     debug!("sys_setgid <= gid: {gid}");
-    current().as_thread().proc_data.setgid(gid)?;
+    current().as_thread().setgid(gid)?;
     Ok(0)
 }
 
 pub fn sys_setfsuid(fsuid: u32) -> AxResult<isize> {
-    Ok(current().as_thread().proc_data.setfsuid(fsuid)? as isize)
+    Ok(current().as_thread().setfsuid(fsuid)? as isize)
 }
 
 pub fn sys_setfsgid(fsgid: u32) -> AxResult<isize> {
-    Ok(current().as_thread().proc_data.setfsgid(fsgid)? as isize)
+    Ok(current().as_thread().setfsgid(fsgid)? as isize)
 }
 
 pub fn sys_getgroups(size: usize, list: *mut u32) -> AxResult<isize> {
     debug!("sys_getgroups <= size: {size}");
-    let cred = current().as_thread().proc_data.current_cred();
+    let cred = current().as_thread().current_cred();
     let groups = cred.groups().as_slice();
     if size == 0 {
         return Ok(groups.len() as isize);
@@ -107,11 +105,13 @@ pub fn sys_getgroups(size: usize, list: *mut u32) -> AxResult<isize> {
 
 pub fn sys_setgroups(size: usize, list: *const u32) -> AxResult<isize> {
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
     // Reject the common unauthorized case before copying/sorting a bounded
     // user array. `set_supplementary_groups` rechecks under the writer mutex,
     // so this early check is only a cost guard, not the authorization point.
-    if !proc_data.has_effective_capability(linux_raw_sys::general::CAP_SETGID) {
+    if !curr
+        .as_thread()
+        .has_effective_capability(linux_raw_sys::general::CAP_SETGID)
+    {
         return Err(AxError::OperationNotPermitted);
     }
     if size > NGROUPS_MAX as usize {
@@ -122,7 +122,7 @@ pub fn sys_setgroups(size: usize, list: *const u32) -> AxResult<isize> {
     } else {
         vm_load(list, size)?
     };
-    proc_data.set_supplementary_groups(groups)?;
+    curr.as_thread().set_supplementary_groups(groups)?;
     Ok(0)
 }
 
@@ -254,8 +254,10 @@ pub fn sys_uname(name: *mut new_utsname) -> AxResult<isize> {
 
 pub fn sys_sethostname(name: *const u8, len: usize) -> AxResult<isize> {
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    if !proc_data.has_effective_capability(linux_raw_sys::general::CAP_SYS_ADMIN) {
+    if !curr
+        .as_thread()
+        .has_effective_capability(linux_raw_sys::general::CAP_SYS_ADMIN)
+    {
         return Err(AxError::OperationNotPermitted);
     }
     if len > UTS_FIELD_LEN {
@@ -271,8 +273,10 @@ pub fn sys_sethostname(name: *const u8, len: usize) -> AxResult<isize> {
 
 pub fn sys_setdomainname(name: *const u8, len: usize) -> AxResult<isize> {
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    if !proc_data.has_effective_capability(linux_raw_sys::general::CAP_SYS_ADMIN) {
+    if !curr
+        .as_thread()
+        .has_effective_capability(linux_raw_sys::general::CAP_SYS_ADMIN)
+    {
         return Err(AxError::OperationNotPermitted);
     }
     if len > UTS_FIELD_LEN {

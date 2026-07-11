@@ -604,7 +604,7 @@ struct KeyUsage {
 fn current_key_ids() -> CurrentKeyIds {
     let curr = current();
     let thread = curr.as_thread();
-    let ids = thread.proc_data.current_cred().ids();
+    let ids = thread.current_cred().ids();
     CurrentKeyIds {
         tid: thread.tid(),
         pid: thread.proc_data.proc.pid(),

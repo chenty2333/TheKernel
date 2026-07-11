@@ -1544,7 +1544,7 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
     }
     let curr = axtask::current();
     let proc_data = &curr.as_thread().proc_data;
-    let credentials = proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     let loc = FS_CONTEXT.lock().resolve_dac(path, &credentials)?;
     check_open_permissions(&loc, W_OK as u32, &credentials)?;
     check_writable_mount(&loc)?;

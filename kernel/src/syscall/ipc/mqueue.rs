@@ -336,8 +336,7 @@ pub(crate) fn set_mq_msgsize_max(value: usize) {
 
 fn current_ids() -> (u32, u32) {
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let ids = proc_data.current_cred().ids();
+    let ids = curr.as_thread().current_cred().ids();
     (ids.fsuid, ids.fsgid)
 }
 
@@ -389,8 +388,7 @@ fn read_create_attr(attr: *const MqAttr) -> AxResult<MqAttr> {
 
 fn has_queue_permission(queue: &PosixMqueue, access: MqAccess) -> bool {
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let cred = proc_data.current_cred();
+    let cred = curr.as_thread().current_cred();
     let ids = cred.ids();
     if cred.has_effective_capability(CAP_DAC_OVERRIDE) {
         return true;
@@ -498,7 +496,7 @@ fn build_notifier(event: &RawSigevent) -> AxResult<MqNotifier> {
         unsafe {
             let rt = &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._rt;
             rt._pid = proc_data.proc.pid() as _;
-            rt._uid = proc_data.uid() as _;
+            rt._uid = curr.as_thread().uid() as _;
             rt._sigval = linux_raw_sys::general::sigval_t {
                 sival_ptr: event.value_ptr_address() as *mut linux_raw_sys::ctypes::c_void,
             };
@@ -718,8 +716,7 @@ pub fn sys_mq_unlink(name: *const c_char) -> AxResult<isize> {
     {
         let queue = queue.lock();
         let curr = current();
-        let proc_data = &curr.as_thread().proc_data;
-        let cred = proc_data.current_cred();
+        let cred = curr.as_thread().current_cred();
         if cred.ids().fsuid != queue.uid && !cred.has_effective_capability(CAP_FOWNER) {
             return Err(AxError::PermissionDenied);
         }

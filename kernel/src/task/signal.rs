@@ -15,8 +15,8 @@ use starry_signal::{
 };
 
 use super::{
-    AsThread, ContinueResult, ProcessData, Thread, acknowledge_posix_timer_signal, do_exit,
-    get_process_data, get_process_group, get_task, get_visible_task,
+    AsThread, ContinueResult, Cred, ProcessData, Thread, acknowledge_posix_timer_signal, do_exit,
+    get_process_data, get_process_group, get_process_group_leader_task, get_task, get_visible_task,
 };
 
 fn notify_tracer_or_parent_stop_continue(proc_data: &ProcessData) {
@@ -88,6 +88,27 @@ enum PtraceSignalTarget {
     },
 }
 
+fn ptrace_signal_target_cred(
+    proc_data: &ProcessData,
+    target: &PtraceSignalTarget,
+) -> AxResult<Arc<Cred>> {
+    match target {
+        PtraceSignalTarget::Process => {
+            let task = get_process_group_leader_task(proc_data)?;
+            Ok(task.as_thread().current_cred())
+        }
+        PtraceSignalTarget::Thread { tid, signal } => {
+            let task = get_visible_task(*tid)?;
+            let thread = task.as_thread();
+            let live_signal = signal.upgrade().ok_or(AxError::NoSuchProcess)?;
+            if !Arc::ptr_eq(&thread.signal, &live_signal) {
+                return Err(AxError::NoSuchProcess);
+            }
+            Ok(thread.current_cred())
+        }
+    }
+}
+
 impl PtraceSignalRecord {
     fn process(prepared: PreparedSignal) -> Self {
         Self {
@@ -156,6 +177,7 @@ fn prepare_signal_with_accounts(
 
 fn prepare_signal_for_target(
     target: &ProcessData,
+    target_cred: &Cred,
     info: SignalInfo,
     policy: SignalQueuePolicy,
 ) -> AxResult<PreparedSignal> {
@@ -163,8 +185,10 @@ fn prepare_signal_for_target(
         return Ok(PreparedSignal::unqueued(info));
     }
     let limit = target.rlim.read()[RLIMIT_SIGPENDING].current;
-    let cred = target.current_cred();
-    match cred.user_ns().try_signal_queue_accounts(cred.ids().ruid) {
+    match target_cred
+        .user_ns()
+        .try_signal_queue_accounts(target_cred.ids().ruid)
+    {
         Ok((per_user, global)) => {
             prepare_signal_with_accounts(info, policy, limit, &per_user, &global)
         }
@@ -184,7 +208,9 @@ pub(crate) fn prepare_queued_signal_for_process(
     target: &ProcessData,
     info: SignalInfo,
 ) -> AxResult<PreparedSignal> {
-    prepare_signal_for_target(target, info, SignalQueuePolicy::QueueRequired)
+    let target_task = get_process_group_leader_task(target)?;
+    let target_cred = target_task.as_thread().current_cred();
+    prepare_signal_for_target(target, &target_cred, info, SignalQueuePolicy::QueueRequired)
 }
 
 pub fn check_signals(
@@ -302,13 +328,14 @@ fn send_signal_thread_inner_with(
     policy: SignalQueuePolicy,
 ) -> AxResult<bool> {
     let signo = sig.signo();
+    let target_cred = thr.current_cred();
     if signo == Signo::SIGCONT {
         do_continue(&thr.proc_data);
     }
 
     if thr.proc_data.ptrace_tracer().is_some() && !matches!(signo, Signo::SIGKILL | Signo::SIGCONT)
     {
-        let prepared = prepare_signal_for_target(&thr.proc_data, sig, policy)?;
+        let prepared = prepare_signal_for_target(&thr.proc_data, &target_cred, sig, policy)?;
         match try_ptrace_signal_stop(&thr.proc_data, PtraceSignalRecord::thread(thr, prepared)) {
             Ok(()) => {
                 task.interrupt();
@@ -326,7 +353,7 @@ fn send_signal_thread_inner_with(
     }
 
     let outcome = thr.signal.try_send_signal_with(sig, |info| {
-        prepare_signal_for_target(&thr.proc_data, info, policy)
+        prepare_signal_for_target(&thr.proc_data, &target_cred, info, policy)
     })?;
     if outcome.wake {
         task.interrupt();
@@ -452,12 +479,14 @@ fn send_signal_to_process_data_with_policy(
     policy: SignalQueuePolicy,
 ) -> AxResult<bool> {
     let signo = sig.signo();
+    let target_task = get_process_group_leader_task(proc_data)?;
+    let target_cred = target_task.as_thread().current_cred();
     if signo == Signo::SIGCONT {
         do_continue(proc_data);
     }
 
     if proc_data.ptrace_tracer().is_some() && !matches!(signo, Signo::SIGKILL | Signo::SIGCONT) {
-        let prepared = prepare_signal_for_target(proc_data, sig, policy)?;
+        let prepared = prepare_signal_for_target(proc_data, &target_cred, sig, policy)?;
         match try_ptrace_signal_stop(proc_data, PtraceSignalRecord::process(prepared)) {
             Ok(()) => return Ok(true),
             Err(record) => {
@@ -468,7 +497,7 @@ fn send_signal_to_process_data_with_policy(
     }
 
     let outcome = proc_data.signal.try_send_signal_with(sig, |info| {
-        prepare_signal_for_target(proc_data, info, policy)
+        prepare_signal_for_target(proc_data, &target_cred, info, policy)
     })?;
     wake_process_signal_target(proc_data, signo, outcome.wake_tid.is_some());
     Ok(outcome.published)
@@ -580,8 +609,13 @@ pub(crate) fn reinject_ptrace_signal(
     let Some(record) = record else {
         if let Some(signo) = requested {
             let info = SignalInfo::new_kernel(signo);
-            let prepared =
-                prepare_signal_for_target(proc_data, info, SignalQueuePolicy::BestEffortKill)?;
+            let target_cred = ptrace_signal_target_cred(proc_data, &PtraceSignalTarget::Process)?;
+            let prepared = prepare_signal_for_target(
+                proc_data,
+                &target_cred,
+                info,
+                SignalQueuePolicy::BestEffortKill,
+            )?;
             publish_ptrace_target(proc_data, PtraceSignalTarget::Process, prepared)?;
         }
         return Ok(());
@@ -614,8 +648,13 @@ pub(crate) fn reinject_ptrace_signal(
             acknowledge_posix_timer_signal(proc_data, &original_info);
             drop(prepared);
             let info = SignalInfo::new_kernel(signo);
-            let prepared =
-                prepare_signal_for_target(proc_data, info, SignalQueuePolicy::BestEffortKill)?;
+            let target_cred = ptrace_signal_target_cred(proc_data, &target)?;
+            let prepared = prepare_signal_for_target(
+                proc_data,
+                &target_cred,
+                info,
+                SignalQueuePolicy::BestEffortKill,
+            )?;
             publish_ptrace_target(proc_data, target, prepared)?;
             Ok(())
         }

@@ -572,8 +572,10 @@ pub fn sys_open_by_handle_at(mount_fd: c_int, handle: UserPtr<u8>, _flags: i32) 
     }
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    if !proc_data.has_effective_capability(CAP_DAC_READ_SEARCH) {
+    if !curr
+        .as_thread()
+        .has_effective_capability(CAP_DAC_READ_SEARCH)
+    {
         return Err(LinuxError::EPERM.into());
     }
 
@@ -743,7 +745,7 @@ pub(crate) fn openat_inner(
     mode: __kernel_mode_t,
 ) -> AxResult<isize> {
     let curr = current();
-    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     openat_inner_with_credentials(dirfd, path, flags, mode, &credentials)
 }
 
@@ -880,7 +882,7 @@ pub fn sys_openat2(
         return Err(AxError::from(LinuxError::EAGAIN));
     }
     let curr = current();
-    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+    let credentials = curr.as_thread().fs_dac_credentials();
     let _mount_operation =
         (how.resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_NO_XDEV) as u64 != 0)
             .then(crate::mounts::namespace_operation);

@@ -384,7 +384,7 @@ fn do_execve(
     // Credential allocation and invariant checks must finish before the first
     // irreversible exec action. The prepared value remains invisible until
     // the address-space commit below.
-    let prepared_exec_cred = match proc_data.prepare_clear_keep_caps_on_exec() {
+    let prepared_exec_cred = match thr.prepare_clear_keep_caps_on_exec() {
         Ok(prepared) => prepared,
         Err(err) => {
             proc_data.end_exec(curr_tid);
@@ -472,7 +472,7 @@ pub fn sys_execve(
     debug!("sys_execve <= path: {path:?}, args: {args:?}, envs: {envs:?}");
 
     // Credential locks precede FS_CONTEXT for the whole pathname operation.
-    let credentials = current().as_thread().proc_data.fs_dac_credentials();
+    let credentials = current().as_thread().fs_dac_credentials();
     let loc = resolve_at_with_credentials(AT_FDCWD, Some(&path), 0, &credentials)?
         .into_file()
         .ok_or(AxError::InvalidInput)?;
@@ -511,7 +511,7 @@ pub fn sys_execveat(
     );
 
     // Use one pre-exec view for the initial path and every interpreter lookup.
-    let credentials = current().as_thread().proc_data.fs_dac_credentials();
+    let credentials = current().as_thread().fs_dac_credentials();
     let resolved = if path.is_empty() {
         if (flags as u32) & AT_EMPTY_PATH == 0 {
             return Err(AxError::NotFound);

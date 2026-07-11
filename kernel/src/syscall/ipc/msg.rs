@@ -448,7 +448,7 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
     let current = current();
     let thread = current.as_thread();
     let proc_data = &thread.proc_data;
-    let ids = proc_data.current_cred().ids();
+    let ids = thread.current_cred().ids();
     let current_uid = ids.euid;
     let current_gid = ids.egid;
     let current_pid = proc_data.proc.pid();
@@ -540,7 +540,7 @@ pub fn sys_msgsnd(
     let current = current();
     let thread = current.as_thread();
     let proc_data = &thread.proc_data;
-    let ids = proc_data.current_cred().ids();
+    let ids = thread.current_cred().ids();
     let current_uid = ids.euid;
     let current_gid = ids.egid;
     let current_pid = proc_data.proc.pid();
@@ -656,7 +656,7 @@ pub fn sys_msgrcv(
     let current = current();
     let thread = current.as_thread();
     let proc_data = &thread.proc_data;
-    let ids = proc_data.current_cred().ids();
+    let ids = thread.current_cred().ids();
     let current_uid = ids.euid;
     let current_gid = ids.egid;
     let current_pid = proc_data.proc.pid();
@@ -758,8 +758,7 @@ pub fn sys_msgrcv(
 pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
     //  Get current process information
     let current = current();
-    let proc_data = &current.as_thread().proc_data;
-    let ids = proc_data.current_cred().ids();
+    let ids = current.as_thread().current_cred().ids();
     let current_uid = ids.euid;
     let current_gid = ids.egid;
     let is_privileged = current_uid == 0; // root user check

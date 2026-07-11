@@ -13,7 +13,8 @@ use crate::{
     file::{FileLike, PidFd},
     mm::{AddrSpace, IoVec, check_user_readable, checked_align_up_4k},
     task::{
-        AsThread, ProcessData, PtraceCredentialMode, check_current_ptrace_access, get_process_data,
+        AsThread, Cred, ProcessData, PtraceCredentialMode, check_current_ptrace_access,
+        get_visible_task,
     },
 };
 
@@ -67,18 +68,14 @@ fn read_iovecs(iovs: *const IoVec, iovcnt: usize) -> AxResult<(Vec<UserIoVec>, u
     Ok((result, total))
 }
 
-fn check_process_vm_permission(target: &ProcessData) -> AxResult<()> {
-    check_current_ptrace_access(target, PtraceCredentialMode::Real)
+fn check_process_vm_permission(target: &ProcessData, target_cred: &Cred) -> AxResult<()> {
+    check_current_ptrace_access(target, target_cred, PtraceCredentialMode::Real)
 }
 
-fn check_process_madvise_permission(target: &ProcessData) -> AxResult<()> {
-    check_process_vm_permission(target)?;
+fn check_process_madvise_permission(target: &ProcessData, target_cred: &Cred) -> AxResult<()> {
+    check_process_vm_permission(target, target_cred)?;
     let curr = current();
-    if curr
-        .as_thread()
-        .proc_data
-        .has_effective_capability(CAP_SYS_NICE)
-    {
+    if curr.as_thread().has_effective_capability(CAP_SYS_NICE) {
         Ok(())
     } else {
         Err(AxError::OperationNotPermitted)
@@ -270,8 +267,11 @@ fn sys_process_vm_rw(
         return Err(AxError::NoSuchProcess);
     }
 
-    let target = get_process_data(pid as u32)?;
-    check_process_vm_permission(&target)?;
+    let target_task = get_visible_task(pid as u32)?;
+    let target_thread = target_task.as_thread();
+    let target_cred = target_thread.current_cred();
+    let target = target_thread.proc_data.clone();
+    check_process_vm_permission(&target, &target_cred)?;
     process_vm_copy(&target, &local, &remote, copy_len, op)
 }
 
@@ -335,8 +335,10 @@ pub fn sys_process_madvise(
         return Ok(0);
     }
 
-    let target = PidFd::from_fd(pidfd)?.process_data()?;
-    check_process_madvise_permission(&target)?;
+    let pidfd = PidFd::from_fd(pidfd)?;
+    let target = pidfd.process_data()?;
+    let target_cred = pidfd.credential_snapshot()?;
+    check_process_madvise_permission(&target, &target_cred)?;
     validate_remote_iovecs(&target, &remote)?;
     Ok(total_len as isize)
 }

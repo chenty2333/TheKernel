@@ -462,10 +462,7 @@ fn sys_do_clock_adjtime(
     if timex_invalid_adjadjtime_mode(modes) {
         return Err(AxError::InvalidInput);
     }
-    let privileged = current()
-        .as_thread()
-        .proc_data
-        .has_effective_capability(CAP_SYS_TIME);
+    let privileged = current().as_thread().has_effective_capability(CAP_SYS_TIME);
 
     if !privileged && modes != 0 && modes != ADJ_OFFSET_SS_READ {
         return Err(AxError::OperationNotPermitted);
@@ -795,11 +792,7 @@ pub fn sys_settimeofday(ts: *const timeval, tz: *const timezone) -> AxResult<isi
     };
 
     let ts = ts.map(TimeValueLike::try_into_time_value).transpose()?;
-    if !current()
-        .as_thread()
-        .proc_data
-        .has_effective_capability(CAP_SYS_TIME)
-    {
+    if !current().as_thread().has_effective_capability(CAP_SYS_TIME) {
         return Err(AxError::OperationNotPermitted);
     }
 
@@ -827,11 +820,7 @@ pub fn sys_clock_settime(clock_id: __kernel_clockid_t, ts: *const timespec) -> A
     match clock_id as u32 {
         CLOCK_REALTIME => {
             let ts = unsafe { ts.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
-            if !current()
-                .as_thread()
-                .proc_data
-                .has_effective_capability(CAP_SYS_TIME)
-            {
+            if !current().as_thread().has_effective_capability(CAP_SYS_TIME) {
                 return Err(AxError::OperationNotPermitted);
             }
             set_wall_time(ts);

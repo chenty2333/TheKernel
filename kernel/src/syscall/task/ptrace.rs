@@ -7,8 +7,9 @@ use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::task::{
-    AsThread, ProcessData, PtraceCredentialMode, check_current_ptrace_access, get_process_data,
-    get_task, notify_ptrace_attach_stop, reinject_ptrace_signal, send_signal_to_process,
+    AsThread, Cred, ProcessData, PtraceCredentialMode, check_current_ptrace_access,
+    get_process_data, get_task, get_visible_task, notify_ptrace_attach_stop,
+    reinject_ptrace_signal, send_signal_to_process,
 };
 
 const PTRACE_TRACEME: u32 = 0;
@@ -44,8 +45,8 @@ fn current_pid() -> Pid {
     current().as_thread().proc_data.proc.pid()
 }
 
-fn check_ptrace_permission(target: &ProcessData) -> AxResult<()> {
-    check_current_ptrace_access(target, PtraceCredentialMode::Real)
+fn check_ptrace_permission(target: &ProcessData, target_cred: &Cred) -> AxResult<()> {
+    check_current_ptrace_access(target, target_cred, PtraceCredentialMode::Real)
 }
 
 fn check_tracee(target: &ProcessData) -> AxResult<()> {
@@ -73,14 +74,14 @@ fn interrupt_process_threads(target: &ProcessData) {
     }
 }
 
-fn do_attach(target: &ProcessData, seize_only: bool) -> AxResult<isize> {
+fn do_attach(target: &ProcessData, target_cred: &Cred, seize_only: bool) -> AxResult<isize> {
     let curr = current();
     let tracer_data = curr.as_thread().proc_data.clone();
     let tracer = tracer_data.proc.pid();
     if target.proc.pid() == tracer {
         return Err(AxError::OperationNotPermitted);
     }
-    check_ptrace_permission(target)?;
+    check_ptrace_permission(target, target_cred)?;
     if !target.begin_ptrace(tracer) {
         return Err(AxError::OperationNotPermitted);
     }
@@ -173,14 +174,17 @@ fn sys_ptrace_traceme() -> AxResult<isize> {
 }
 
 fn sys_ptrace_for_target(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<isize> {
-    let target = get_process_data(pid)?;
+    let target_task = get_visible_task(pid)?;
+    let target_thread = target_task.as_thread();
+    let target_cred = target_thread.current_cred();
+    let target = target_thread.proc_data.clone();
     match request {
-        PTRACE_ATTACH => do_attach(&target, false),
+        PTRACE_ATTACH => do_attach(&target, &target_cred, false),
         PTRACE_SEIZE => {
             if data & !PTRACE_O_MASK != 0 {
                 return Err(AxError::InvalidInput);
             }
-            let result = do_attach(&target, true)?;
+            let result = do_attach(&target, &target_cred, true)?;
             target.ptrace_set_options(data as u32);
             Ok(result)
         }

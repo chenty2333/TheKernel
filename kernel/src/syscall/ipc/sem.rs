@@ -414,8 +414,7 @@ fn strip_ipc64(cmd: i32) -> i32 {
 
 pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
     let current = current();
-    let proc_data = &current.as_thread().proc_data;
-    let ids = proc_data.current_cred().ids();
+    let ids = current.as_thread().current_cred().ids();
     let current_uid = ids.euid;
     let current_gid = ids.egid;
     let create = (semflg & IPC_CREAT) != 0;
@@ -472,8 +471,7 @@ pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
 
 pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isize> {
     let current_task = current();
-    let proc_data = &current_task.as_thread().proc_data;
-    let ids = proc_data.current_cred().ids();
+    let ids = current_task.as_thread().current_cred().ids();
     let current_uid = ids.euid;
     let current_gid = ids.egid;
     let cmd = strip_ipc64(cmd);
@@ -887,7 +885,7 @@ pub fn sys_semtimedop(
     let ops = vm_load(sops, nsops)?;
     let current = current();
     let proc_data = &current.as_thread().proc_data;
-    let ids = proc_data.current_cred().ids();
+    let ids = current.as_thread().current_cred().ids();
     let current_uid = ids.euid;
     let current_gid = ids.egid;
     let current_pid = proc_data.proc.pid() as __kernel_pid_t;

@@ -938,7 +938,8 @@ fn format_mask_list(mask: usize, width: usize) -> String {
 
 #[rustfmt::skip]
 fn task_status(task: &AxTaskRef) -> String {
-    let proc_data = &task.as_thread().proc_data;
+    let thread = task.as_thread();
+    let proc_data = &thread.proc_data;
     let (vm_size_kb, vm_rss_kb, locked_kb) = {
         let aspace_handle = proc_data.aspace();
         let aspace = aspace_handle.lock();
@@ -964,7 +965,7 @@ fn task_status(task: &AxTaskRef) -> String {
     };
     let ppid = proc_data.proc.parent().map_or(0, |parent| parent.pid());
     let threads = proc_data.proc.thread_count();
-    let cred = proc_data.current_cred();
+    let cred = thread.current_cred();
     let ids = cred.ids();
     let caps = cred.capabilities();
     let cpu_mask = task_cpu_mask_bits(task);
@@ -1379,7 +1380,8 @@ struct ProcNamespaceFile {
 
 impl ProcNamespaceFile {
     fn new(fs: Arc<SimpleFs>, kind: ProcNamespaceKind, task: &AxTaskRef) -> Arc<Self> {
-        let proc_data = &task.as_thread().proc_data;
+        let thread = task.as_thread();
+        let proc_data = &thread.proc_data;
         let object = match kind {
             ProcNamespaceKind::Pid => ProcNamespaceObject::Pid(proc_data.pid_ns()),
             ProcNamespaceKind::Time => ProcNamespaceObject::Time(proc_data.time_ns()),
@@ -1387,7 +1389,7 @@ impl ProcNamespaceFile {
                 ProcNamespaceObject::Time(proc_data.time_ns_for_children())
             }
             ProcNamespaceKind::User => {
-                ProcNamespaceObject::User(proc_data.current_cred().user_ns().clone())
+                ProcNamespaceObject::User(thread.current_cred().user_ns().clone())
             }
             ProcNamespaceKind::Uts => ProcNamespaceObject::Uts(proc_data.uts_ns()),
         };
@@ -1675,7 +1677,10 @@ fn write_timens_offsets(task: &AxTaskRef, data: &[u8]) -> VfsResult<()> {
     }
     let text = str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
     let proc_data = &task.as_thread().proc_data;
-    if !proc_data.has_effective_capability(linux_raw_sys::general::CAP_SYS_TIME) {
+    if !current()
+        .as_thread()
+        .has_effective_capability(linux_raw_sys::general::CAP_SYS_TIME)
+    {
         return Err(VfsError::PermissionDenied);
     }
 
@@ -1874,7 +1879,9 @@ impl SimpleDirOps for ThreadDir {
             name,
             "maps" | "smaps" | "numa_maps" | "pagemap" | "exe" | "fd" | "fdinfo" | "ns"
         ) {
-            check_current_ptrace_access(&task.as_thread().proc_data, PtraceCredentialMode::Fs)
+            let target = task.as_thread();
+            let target_cred = target.current_cred();
+            check_current_ptrace_access(&target.proc_data, &target_cred, PtraceCredentialMode::Fs)
                 .map_err(|_| VfsError::PermissionDenied)?;
         }
         Ok(match name {

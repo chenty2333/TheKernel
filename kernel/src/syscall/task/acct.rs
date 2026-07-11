@@ -40,7 +40,6 @@ struct AccountingFile {
 fn current_has_pacct_capability() -> bool {
     current()
         .as_thread()
-        .proc_data
         .has_effective_capability(CAP_SYS_PACCT)
 }
 
@@ -185,8 +184,7 @@ pub fn sys_acct(name: *const c_char) -> AxResult<isize> {
     }
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let ids = proc_data.current_cred().ids();
+    let ids = curr.as_thread().current_cred().ids();
     let accounting = AccountingFile {
         file,
         uid: ids.ruid,

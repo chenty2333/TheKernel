@@ -8,11 +8,14 @@ use starry_process::Pid;
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::task::{
-    AsThread, ProcessData, TaskUsage, check_current_prlimit_access, get_process_data, nr_open_limit,
+    AsThread, ProcessData, TaskUsage, check_current_process_prlimit_access, get_process_data,
+    nr_open_limit,
 };
 
-fn can_raise_hard_limit(proc_data: &ProcessData) -> bool {
-    proc_data.has_effective_capability(CAP_SYS_RESOURCE)
+fn current_can_raise_hard_limit() -> bool {
+    current()
+        .as_thread()
+        .has_effective_capability(CAP_SYS_RESOURCE)
 }
 
 fn set_resource_limit(proc_data: &ProcessData, resource: u32, new_limit: rlimit64) -> AxResult<()> {
@@ -23,12 +26,10 @@ fn set_resource_limit(proc_data: &ProcessData, resource: u32, new_limit: rlimit6
         return Err(AxError::from(LinuxError::EPERM));
     }
 
-    let curr = current();
-    let curr_proc = &curr.as_thread().proc_data;
     let limit = &mut proc_data.rlim.write()[resource];
     if new_limit.rlim_max <= limit.max {
         limit.max = new_limit.rlim_max;
-    } else if can_raise_hard_limit(curr_proc) {
+    } else if current_can_raise_hard_limit() {
         limit.max = new_limit.rlim_max;
     } else {
         return Err(AxError::OperationNotPermitted);
@@ -52,7 +53,7 @@ pub fn sys_prlimit64(
     }
 
     let proc_data = get_process_data(pid)?;
-    check_current_prlimit_access(&proc_data)?;
+    check_current_process_prlimit_access(&proc_data)?;
     if let Some(old_limit) = old_limit.nullable() {
         let limit = &proc_data.rlim.read()[resource];
         old_limit.vm_write(rlimit64 {

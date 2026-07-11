@@ -4,7 +4,7 @@ use core::{ffi::c_char, mem};
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::FS_CONTEXT;
 use axhal::paging::MappingFlags;
-use axtask::current;
+use axtask::{AxTaskRef, current};
 use linux_raw_sys::{
     general::{
         __user_cap_data_struct, __user_cap_header_struct, _LINUX_CAPABILITY_VERSION_1,
@@ -26,7 +26,8 @@ use crate::{
     },
     task::{
         AsThread, CapabilityState, Mempolicy, ProcessData, PtraceCredentialMode,
-        check_current_ptrace_access, get_process_data,
+        check_current_process_ptrace_access, get_process_data, get_process_group_leader_task,
+        get_visible_task,
     },
 };
 
@@ -193,10 +194,7 @@ fn validate_mapped_user_range(start: usize, size: usize) -> AxResult<(VirtAddr, 
 }
 
 fn current_has_capability(cap: u32) -> bool {
-    current()
-        .as_thread()
-        .proc_data
-        .has_effective_capability(cap)
+    current().as_thread().has_effective_capability(cap)
 }
 
 fn numa_target_process(pid: i32) -> AxResult<Arc<ProcessData>> {
@@ -208,14 +206,18 @@ fn numa_target_process(pid: i32) -> AxResult<Arc<ProcessData>> {
 
 fn check_numa_target_permission(target: &ProcessData) -> AxResult<()> {
     let curr = current();
-    let actor = &curr.as_thread().proc_data;
+    let actor = curr.as_thread();
     let actor_cred = actor.current_cred();
     if actor_cred.has_effective_capability(CAP_SYS_NICE) {
         return Ok(());
     }
     let actor_ids = actor_cred.ids();
-    let target_ids = target.current_cred().ids();
-    if actor.proc.pid() == target.proc.pid()
+    // NUMA process operations name a process, so Linux's group leader is the
+    // explicit credential subject; no credential is cached in ProcessData.
+    let target_task = get_process_group_leader_task(target)?;
+    let target_cred = target_task.as_thread().current_cred();
+    let target_ids = target_cred.ids();
+    if actor.proc_data.proc.pid() == target.proc.pid()
         || actor_ids.euid == target_ids.ruid
         || actor_ids.euid == target_ids.euid
     {
@@ -233,7 +235,7 @@ fn kcmp_target_process(pid: i32) -> AxResult<Arc<ProcessData>> {
 }
 
 fn check_kcmp_permission(target: &ProcessData) -> AxResult<()> {
-    check_current_ptrace_access(target, PtraceCredentialMode::Real)
+    check_current_process_ptrace_access(target, PtraceCredentialMode::Real)
 }
 
 fn kcmp_result(equal: bool) -> isize {
@@ -551,19 +553,23 @@ fn validate_cap_version(
     Ok(header)
 }
 
-fn resolve_cap_process(header: __user_cap_header_struct) -> AxResult<Arc<ProcessData>> {
+fn resolve_cap_task(header: __user_cap_header_struct) -> AxResult<AxTaskRef> {
     if header.pid < 0 {
         return Err(AxError::InvalidInput);
     }
-    get_process_data(header.pid as u32)
+    if header.pid == 0 {
+        Ok(current().clone())
+    } else {
+        get_visible_task(header.pid as u32)
+    }
 }
 
 fn validate_cap_header(
     header_ptr: *mut __user_cap_header_struct,
-) -> AxResult<(__user_cap_header_struct, Arc<ProcessData>)> {
+) -> AxResult<(__user_cap_header_struct, AxTaskRef)> {
     let header = validate_cap_version(header_ptr)?;
-    let proc_data = resolve_cap_process(header)?;
-    Ok((header, proc_data))
+    let task = resolve_cap_task(header)?;
+    Ok((header, task))
 }
 
 fn write_cap_data(
@@ -615,12 +621,9 @@ pub fn sys_capget(
         return Ok(0);
     }
 
-    let proc_data = resolve_cap_process(header)?;
-    write_cap_data(
-        data,
-        header.version,
-        proc_data.current_cred().capabilities(),
-    )?;
+    let task = resolve_cap_task(header)?;
+    let cred = task.as_thread().current_cred();
+    write_cap_data(data, header.version, cred.capabilities())?;
     Ok(0)
 }
 
@@ -629,35 +632,36 @@ pub fn sys_capset(
     data: *mut __user_cap_data_struct,
 ) -> AxResult<isize> {
     let curr = current();
-    let current_pid = curr.as_thread().proc_data.proc.pid();
-    let (header, proc_data) = validate_cap_header(header)?;
-    if header.pid != 0 && header.pid as u32 != current_pid {
+    let current_tid = curr.as_thread().tid();
+    let (header, task) = validate_cap_header(header)?;
+    if header.pid != 0 && header.pid as u32 != current_tid {
         return Err(AxError::OperationNotPermitted);
     }
 
     let new_state = read_cap_data(data, header.version)?;
-    proc_data.try_update_capability_state(|old_state, proposed| {
-        if !cap_set_subset(new_state.effective, new_state.permitted)
-            || !cap_set_subset(new_state.permitted, old_state.permitted)
-        {
-            return Err(AxError::OperationNotPermitted);
-        }
+    task.as_thread()
+        .try_update_capability_state(|old_state, proposed| {
+            if !cap_set_subset(new_state.effective, new_state.permitted)
+                || !cap_set_subset(new_state.permitted, old_state.permitted)
+            {
+                return Err(AxError::OperationNotPermitted);
+            }
 
-        let allowed_inheritable = if old_state.has_effective(CAP_SETPCAP) {
-            cap_set_union(old_state.inheritable, old_state.bounding)
-        } else {
-            cap_set_union(old_state.inheritable, old_state.permitted)
-        };
-        if !cap_set_subset(new_state.inheritable, allowed_inheritable) {
-            return Err(AxError::OperationNotPermitted);
-        }
+            let allowed_inheritable = if old_state.has_effective(CAP_SETPCAP) {
+                cap_set_union(old_state.inheritable, old_state.bounding)
+            } else {
+                cap_set_union(old_state.inheritable, old_state.permitted)
+            };
+            if !cap_set_subset(new_state.inheritable, allowed_inheritable) {
+                return Err(AxError::OperationNotPermitted);
+            }
 
-        proposed.effective = new_state.effective;
-        proposed.permitted = new_state.permitted;
-        proposed.inheritable = new_state.inheritable;
-        proposed.reconcile_ambient();
-        Ok(())
-    })?;
+            proposed.effective = new_state.effective;
+            proposed.permitted = new_state.permitted;
+            proposed.inheritable = new_state.inheritable;
+            proposed.reconcile_ambient();
+            Ok(())
+        })?;
 
     Ok(0)
 }
@@ -669,7 +673,7 @@ pub fn sys_umask(mask: u32) -> AxResult<isize> {
 }
 
 pub fn sys_setreuid(ruid: u32, euid: u32) -> AxResult<isize> {
-    current().as_thread().proc_data.setreuid(
+    current().as_thread().setreuid(
         (ruid != NO_ID_CHANGE).then_some(ruid),
         (euid != NO_ID_CHANGE).then_some(euid),
     )?;
@@ -677,7 +681,7 @@ pub fn sys_setreuid(ruid: u32, euid: u32) -> AxResult<isize> {
 }
 
 pub fn sys_setregid(rgid: u32, egid: u32) -> AxResult<isize> {
-    current().as_thread().proc_data.setregid(
+    current().as_thread().setregid(
         (rgid != NO_ID_CHANGE).then_some(rgid),
         (egid != NO_ID_CHANGE).then_some(egid),
     )?;
@@ -685,7 +689,7 @@ pub fn sys_setregid(rgid: u32, egid: u32) -> AxResult<isize> {
 }
 
 pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> AxResult<isize> {
-    current().as_thread().proc_data.setresuid(
+    current().as_thread().setresuid(
         (ruid != NO_ID_CHANGE).then_some(ruid),
         (euid != NO_ID_CHANGE).then_some(euid),
         (suid != NO_ID_CHANGE).then_some(suid),
@@ -694,7 +698,7 @@ pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> AxResult<isize> {
 }
 
 pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> AxResult<isize> {
-    current().as_thread().proc_data.setresgid(
+    current().as_thread().setresgid(
         (rgid != NO_ID_CHANGE).then_some(rgid),
         (egid != NO_ID_CHANGE).then_some(egid),
         (sgid != NO_ID_CHANGE).then_some(sgid),
@@ -931,66 +935,64 @@ pub fn sys_prctl(
             if arg2 != 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
                 return Err(AxError::InvalidInput);
             }
-            current().as_thread().proc_data.set_no_new_privs()?;
+            current().as_thread().set_no_new_privs()?;
         }
         PR_GET_NO_NEW_PRIVS => {
             if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
                 return Err(AxError::InvalidInput);
             }
-            return Ok(current().as_thread().proc_data.no_new_privs() as isize);
+            return Ok(current().as_thread().no_new_privs() as isize);
         }
         PR_GET_KEEPCAPS => {
-            return Ok(current().as_thread().proc_data.keep_caps() as isize);
+            return Ok(current().as_thread().keep_caps() as isize);
         }
         PR_SET_KEEPCAPS => {
             if arg2 > 1 {
                 return Err(AxError::InvalidInput);
             }
-            current().as_thread().proc_data.set_keep_caps(arg2 != 0)?;
+            current().as_thread().set_keep_caps(arg2 != 0)?;
         }
         PR_GET_SECCOMP | PR_SET_SECCOMP | PR_MCE_KILL | PR_SET_THP_DISABLE | PR_GET_THP_DISABLE => {
             return Err(AxError::InvalidInput);
         }
         PR_CAP_AMBIENT => {
             let curr = current();
-            let proc_data = &curr.as_thread().proc_data;
+            let thread = curr.as_thread();
             match arg2 as u32 {
                 PR_CAP_AMBIENT_CLEAR_ALL => {
                     if arg3 != 0 || arg4 != 0 || arg5 != 0 {
                         return Err(AxError::InvalidInput);
                     }
-                    proc_data.clear_ambient_capabilities()?;
+                    thread.clear_ambient_capabilities()?;
                 }
                 PR_CAP_AMBIENT_IS_SET => {
                     if arg4 != 0 || arg5 != 0 {
                         return Err(AxError::InvalidInput);
                     }
-                    return Ok(proc_data.ambient_capability_enabled(arg3 as u32)? as isize);
+                    return Ok(thread.ambient_capability_enabled(arg3 as u32)? as isize);
                 }
                 PR_CAP_AMBIENT_RAISE => {
                     if arg4 != 0 || arg5 != 0 {
                         return Err(AxError::InvalidInput);
                     }
-                    proc_data.raise_ambient_capability(arg3 as u32)?;
+                    thread.raise_ambient_capability(arg3 as u32)?;
                 }
                 PR_CAP_AMBIENT_LOWER => {
                     if arg4 != 0 || arg5 != 0 {
                         return Err(AxError::InvalidInput);
                     }
-                    proc_data.lower_ambient_capability(arg3 as u32)?;
+                    thread.lower_ambient_capability(arg3 as u32)?;
                 }
                 _ => return Err(AxError::InvalidInput),
             }
         }
         PR_CAPBSET_DROP => {
             let curr = current();
-            let proc_data = &curr.as_thread().proc_data;
-            proc_data.drop_bounding_capability(arg2 as u32)?;
+            curr.as_thread().drop_bounding_capability(arg2 as u32)?;
         }
         PR_CAPBSET_READ => {
             return Ok(current()
                 .as_thread()
-                .proc_data
                 .bounding_capability_enabled(arg2 as u32)? as isize);
         }
         PR_SET_SECUREBITS => {
@@ -998,11 +1000,10 @@ pub fn sys_prctl(
                 return Err(AxError::InvalidInput);
             }
             let curr = current();
-            let proc_data = &curr.as_thread().proc_data;
-            proc_data.set_securebits(arg2 as u32)?;
+            curr.as_thread().set_securebits(arg2 as u32)?;
         }
         PR_GET_SECUREBITS => {
-            return Ok(current().as_thread().proc_data.securebits() as isize);
+            return Ok(current().as_thread().securebits() as isize);
         }
         PR_SET_MM => {
             return Err(AxError::OperationNotSupported);

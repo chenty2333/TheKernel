@@ -156,8 +156,9 @@ bitflags! {
     }
 }
 
-fn check_rlimit_nproc(proc_data: &ProcessData) -> AxResult<()> {
-    let cred = proc_data.current_cred();
+fn check_rlimit_nproc(thread: &Thread) -> AxResult<()> {
+    let proc_data = &thread.proc_data;
+    let cred = thread.current_cred();
     let uid = cred.ids().ruid;
     if uid == 0
         || cred.has_effective_capability(CAP_SYS_RESOURCE)
@@ -175,7 +176,7 @@ fn check_rlimit_nproc(proc_data: &ProcessData) -> AxResult<()> {
         .into_iter()
         .filter(|task| {
             let thread = task.as_thread();
-            !thread.pending_exit() && thread.proc_data.current_cred().ids().ruid == uid
+            !thread.pending_exit() && thread.current_cred().ids().ruid == uid
         })
         .count() as u64;
 
@@ -271,7 +272,6 @@ impl CloneArgs {
         if flags.contains(CloneFlags::NEWUTS)
             && !current()
                 .as_thread()
-                .proc_data
                 .has_effective_capability(CAP_SYS_ADMIN)
         {
             return Err(AxError::OperationNotPermitted);
@@ -318,7 +318,17 @@ impl CloneArgs {
         new_uctx.set_retval(0);
 
         let curr = current();
-        let old_proc_data = &curr.as_thread().proc_data;
+        let calling_thread = curr.as_thread();
+        let old_proc_data = &calling_thread.proc_data;
+        // Both CLONE_THREAD and fork inherit exactly one immutable snapshot
+        // from the calling task. Each child receives its own publication slot.
+        let parent_cred = calling_thread.current_cred();
+        let child_cred = if flags.contains(CloneFlags::NEWUSER) {
+            let user_ns = parent_cred.user_ns().try_fork(parent_cred.euid())?;
+            Cred::try_with_user_ns(&parent_cred, user_ns)?
+        } else {
+            parent_cred
+        };
         if old_proc_data.exec_in_progress() {
             return Err(AxError::Interrupted);
         }
@@ -328,7 +338,7 @@ impl CloneArgs {
         // fork bursts do not inherit stale task-stack and address-space
         // pressure.
         reclaim_exited_tasks();
-        check_rlimit_nproc(old_proc_data)?;
+        check_rlimit_nproc(calling_thread)?;
 
         let mut child_sched_state = sched_state(&curr);
         if !flags.contains(CloneFlags::THREAD) && child_sched_state.reset_on_fork {
@@ -416,13 +426,6 @@ impl CloneArgs {
             } else {
                 old_proc_data.pid_ns()
             };
-            let parent_cred = old_proc_data.current_cred();
-            let child_cred = if flags.contains(CloneFlags::NEWUSER) {
-                let user_ns = parent_cred.user_ns().try_fork(parent_cred.euid())?;
-                Cred::try_with_user_ns(&parent_cred, user_ns)?
-            } else {
-                parent_cred
-            };
             let uts_ns = if flags.contains(CloneFlags::NEWUTS) {
                 old_proc_data.uts_ns().try_fork()?
             } else {
@@ -486,7 +489,6 @@ impl CloneArgs {
                 net_ns,
                 cgroup_ns,
                 pid_ns,
-                child_cred,
                 uts_ns,
                 time_ns,
             )?;
@@ -499,7 +501,7 @@ impl CloneArgs {
             (proc_data, Some(process_admission), thread_admission)
         };
         let mut rollback = CloneRollback::new(tid);
-        let (thr, signal_registration) = Thread::try_new(tid, new_proc_data.clone())?;
+        let (thr, signal_registration) = Thread::try_new(tid, new_proc_data.clone(), child_cred)?;
         let child_aspace = new_proc_data.aspace();
         if flags.contains(CloneFlags::CHILD_CLEARTID) {
             thr.set_clear_child_tid(child_tid);

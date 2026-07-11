@@ -137,7 +137,7 @@ impl ResolveAtResult {
 
 pub fn resolve_at(dirfd: c_int, path: Option<&str>, flags: u32) -> AxResult<ResolveAtResult> {
     let current = current();
-    let credentials = current.as_thread().proc_data.fs_dac_credentials();
+    let credentials = current.as_thread().fs_dac_credentials();
     resolve_at_with_credentials(dirfd, path, flags, &credentials)
 }
 

@@ -434,7 +434,6 @@ pub fn sys_setsockopt(
             SO_SNDBUFFORCE => {
                 if !current()
                     .as_thread()
-                    .proc_data
                     .has_effective_capability(CAP_NET_ADMIN)
                 {
                     return Err(LinuxError::EPERM.into());
@@ -446,7 +445,6 @@ pub fn sys_setsockopt(
             SO_RCVBUFFORCE => {
                 if !current()
                     .as_thread()
-                    .proc_data
                     .has_effective_capability(CAP_NET_ADMIN)
                 {
                     return Err(LinuxError::EPERM.into());

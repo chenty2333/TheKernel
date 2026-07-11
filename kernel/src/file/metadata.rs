@@ -96,6 +96,6 @@ fn current_fs_owner() -> (u32, u32) {
     let Some(thread) = task.try_as_thread() else {
         return (0, 0);
     };
-    let ids = thread.proc_data.current_cred().ids();
+    let ids = thread.current_cred().ids();
     (ids.fsuid, ids.fsgid)
 }

@@ -130,7 +130,6 @@ pub fn init(args: &[String], envs: &[String]) {
         axnet::default_stack().clone(),
         CgroupNamespace::try_new_root().expect("Failed to allocate init cgroup namespace"),
         PidNamespace::try_new_root().expect("Failed to allocate init pid namespace"),
-        credential,
         Arc::try_new(UtsNamespace::new_default()).expect("Failed to allocate init UTS namespace"),
         Arc::try_new(TimeNamespace::new_default()).expect("Failed to allocate init time namespace"),
     )
@@ -146,7 +145,7 @@ pub fn init(args: &[String], envs: &[String]) {
         .prepare_thread(tid)
         .expect("Failed to admit init thread membership");
     let (thr, signal_registration) =
-        Thread::try_new(tid, proc).expect("Failed to allocate init thread state");
+        Thread::try_new(tid, proc, credential).expect("Failed to allocate init thread state");
     signal_registration.commit();
     thread_admission.commit();
     if INIT_PID != tid {

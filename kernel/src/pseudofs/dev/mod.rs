@@ -207,7 +207,6 @@ impl DeviceOps for BlockDevice {
             BLKROSET => {
                 if !current()
                     .as_thread()
-                    .proc_data
                     .has_effective_capability(CAP_SYS_ADMIN)
                 {
                     return Err(AxError::PermissionDenied);

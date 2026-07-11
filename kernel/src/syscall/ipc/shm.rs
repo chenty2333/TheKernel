@@ -202,8 +202,7 @@ impl ShmInner {
         }
 
         let curr = current();
-        let proc_data = &curr.as_thread().proc_data;
-        let ids = proc_data.current_cred().ids();
+        let ids = curr.as_thread().current_cred().ids();
         let uid = ids.euid;
         let gid = ids.egid;
         let wants_read = requested_mode & 0o444 != 0;
@@ -853,7 +852,7 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let cur_pid = proc_data.proc.pid();
-    let ids = proc_data.current_cred().ids();
+    let ids = curr.as_thread().current_cred().ids();
     let euid = ids.euid;
     let egid = ids.egid;
 
@@ -940,7 +939,7 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let pid = proc_data.proc.pid();
-    let ids = proc_data.current_cred().ids();
+    let ids = curr.as_thread().current_cred().ids();
     let (mut mapping_flags, page_num, existing_pages) = {
         let state = shm_inner.lock();
         if state.rmid {
@@ -1059,8 +1058,7 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
 
 pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize> {
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let ids = proc_data.current_cred().ids();
+    let ids = curr.as_thread().current_cred().ids();
     let current_uid = ids.euid;
     let current_gid = ids.egid;
     let cmd = cmd as i32;
