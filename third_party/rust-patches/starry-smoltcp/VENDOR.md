@@ -40,13 +40,20 @@ Against the verified archive, the current `src/` patch is 143 insertions and
 Whitespace-only changes also exist in the changelog, one example, the snapshot
 fixture, and the final license newline.
 
-## Known boundary
+## Async-waker lifecycle repair
 
-The current async-waker `clear` implementation uses `mem::forget` on a
-registered `Waker`. That avoids invoking a potentially stale wake vtable but
-can leak a waker reference. This provenance record does not endorse it as a
-stable ownership contract; future lifecycle work must replace it with a safe,
-bounded registration/cancellation design.
+TheKernel removed the local async-waker `clear` implementation that used
+`mem::forget` on a registered `Waker`. Clearing now releases the cloned task
+reference exactly once, with a focused strong-reference-count regression test.
+If a caller cannot run a waker destructor while holding its own lock, it must
+move the registration out and defer destruction explicitly; leaking a waker
+is not an accepted cancellation mechanism.
+
+The focused test passes with the installed stable Rust toolchain. The pinned
+`nightly-2025-05-20` standalone test remains blocked before reaching smoltcp by
+`zerocopy 0.8.41` using the newer `stdarch_x86_avx512` API. This toolchain
+boundary is distinct from the lifecycle result and must not be reported as a
+pinned-nightly pass.
 
 When rebasing, compare against the archive checksum rather than the dirty VCS
 context commit, retain 0BSD attribution, and independently revalidate every

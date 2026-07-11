@@ -1,4 +1,4 @@
-use core::{mem, task::Waker};
+use core::task::Waker;
 
 /// Utility struct to register and wake a waker.
 #[derive(Debug)]
@@ -33,11 +33,38 @@ impl WakerRegistration {
 
     /// Drop the registered waker without invoking it.
     pub fn clear(&mut self) {
-        // Some kernel users never register these internal smoltcp socket
-        // wakers, and on LA we have observed reset paths encountering stale
-        // bytes here. Overwrite the slot without dropping the old payload so
-        // we never dispatch through a corrupted waker vtable while tearing a
-        // socket down.
-        mem::forget(self.waker.take());
+        // A `Waker` owns its cloned task reference.  Clearing a registration
+        // must release that reference exactly once; leaking it to hide a bad
+        // vtable would turn memory corruption into an unbounded resource leak.
+        // Callers that need deferred destruction must take the registration
+        // outside their lock rather than weakening this ownership contract.
+        self.waker = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{sync::Arc, task::Wake};
+    use core::task::Waker;
+
+    use super::WakerRegistration;
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    #[test]
+    fn clear_releases_the_registered_waker_reference() {
+        let task = Arc::new(NoopWake);
+        let waker = Waker::from(task.clone());
+        let mut registration = WakerRegistration::new();
+
+        registration.register(&waker);
+        assert_eq!(Arc::strong_count(&task), 3);
+
+        registration.clear();
+        assert_eq!(Arc::strong_count(&task), 2);
     }
 }
