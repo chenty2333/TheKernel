@@ -1,11 +1,17 @@
 use std::{
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
 
 use axcpu::uspace::UserContext;
 use starry_signal::{
-    SignalDisposition, SignalInfo, SignalOSAction, SignalSet, Signo, api::SignalFrame,
+    PreparedSignal, SignalAction, SignalDisposition, SignalInfo, SignalOSAction,
+    SignalQueueAccount, SignalQueueError, SignalSet, Signo, api::SignalFrame,
 };
 
 mod common;
@@ -38,7 +44,7 @@ fn concurrent_send_signal() {
         let thr = thr.clone();
         move || {
             thread::sleep(Duration::from_millis(10));
-            let _ = thr.send_signal(sig);
+            let _ = thr.send_unqueued_signal(sig);
         }
     });
 
@@ -64,7 +70,7 @@ fn concurrent_blocked() {
         let thr = thr.clone();
         move || {
             thread::sleep(Duration::from_millis(10));
-            let _ = thr.send_signal(sig);
+            let _ = thr.send_unqueued_signal(sig);
         }
     });
 
@@ -96,7 +102,7 @@ fn concurrent_check_signals() {
     let mut uctx = UserContext::new(0, initial_sp().into(), 0);
 
     let first = SignalInfo::new_user(Signo::SIGTERM, 9, 9);
-    assert!(thr.send_signal(first.clone()));
+    assert!(thr.send_unqueued_signal(first.clone()));
 
     let delivered = thr.check_signals(&mut uctx, None).unwrap();
     assert_eq!(delivered.info.signo(), Signo::SIGTERM);
@@ -106,8 +112,8 @@ fn concurrent_check_signals() {
     thread::spawn({
         let thr = thr.clone();
         move || {
-            let _ = thr.send_signal(SignalInfo::new_user(Signo::SIGINT, 2, 2));
-            let _ = thr.send_signal(SignalInfo::new_user(Signo::SIGTERM, 3, 3));
+            let _ = thr.send_unqueued_signal(SignalInfo::new_user(Signo::SIGINT, 2, 2));
+            let _ = thr.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 3, 3));
         }
     });
 
@@ -132,4 +138,183 @@ fn concurrent_check_signals() {
         }
         delivered.has(Signo::SIGINT) && delivered.has(Signo::SIGTERM)
     }));
+}
+
+#[test]
+fn concurrent_account_admission_never_exceeds_limit() {
+    const SENDERS: usize = 32;
+    const LIMIT: usize = 7;
+
+    let (_proc, signal) = new_test_env();
+    let user = SignalQueueAccount::try_new(SENDERS).unwrap();
+    let global = SignalQueueAccount::try_new(SENDERS).unwrap();
+    let barrier = Arc::new(Barrier::new(SENDERS));
+
+    let senders: Vec<_> = (0..SENDERS)
+        .map(|sender| {
+            let signal = signal.clone();
+            let user = user.clone();
+            let global = global.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                signal
+                    .try_send_signal_with(
+                        SignalInfo::new_user(Signo::SIGRTMIN, sender as i32, sender as u32),
+                        |info| PreparedSignal::try_accounted(info, &user, LIMIT as u64, &global),
+                    )
+                    .is_ok()
+            })
+        })
+        .collect();
+
+    let admitted = senders
+        .into_iter()
+        .map(|sender| sender.join().unwrap())
+        .filter(|admitted| *admitted)
+        .count();
+    assert_eq!(admitted, LIMIT);
+    assert_eq!(user.queued(), LIMIT);
+    assert_eq!(global.queued(), LIMIT);
+
+    let mask = !SignalSet::default();
+    for delivered in 0..LIMIT {
+        assert!(
+            signal.dequeue_signal(&mask).is_some(),
+            "missing queued instance {delivered}; pending={:?}, user={}, global={}",
+            signal.pending(),
+            user.queued(),
+            global.queued(),
+        );
+    }
+    assert!(signal.dequeue_signal(&mask).is_none());
+    assert_eq!(user.queued(), 0);
+    assert_eq!(global.queued(), 0);
+}
+
+#[test]
+fn ignore_transition_linearizes_with_prepared_realtime_publication() {
+    let (process, signal) = new_test_env();
+    let user = SignalQueueAccount::try_new(1).unwrap();
+    let global = SignalQueueAccount::try_new(1).unwrap();
+    let prepared = Arc::new(Barrier::new(2));
+    let publish = Arc::new(Barrier::new(2));
+
+    let sender = {
+        let signal = signal.clone();
+        let user = user.clone();
+        let global = global.clone();
+        let prepared_barrier = prepared.clone();
+        let publish_barrier = publish.clone();
+        thread::spawn(move || {
+            signal
+                .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1), |info| {
+                    let signal = PreparedSignal::try_accounted(info, &user, 1, &global)?;
+                    prepared_barrier.wait();
+                    publish_barrier.wait();
+                    Ok::<_, SignalQueueError>(signal)
+                })
+                .unwrap()
+        })
+    };
+
+    prepared.wait();
+    process
+        .try_replace_action(
+            Signo::SIGRTMIN,
+            SignalAction {
+                disposition: SignalDisposition::Ignore,
+                ..SignalAction::default()
+            },
+        )
+        .unwrap();
+    publish.wait();
+
+    let outcome = sender.join().unwrap();
+    assert!(!outcome.published);
+    assert!(!outcome.wake);
+    assert!(!signal.pending().has(Signo::SIGRTMIN));
+    assert_eq!(user.queued(), 0);
+    assert_eq!(global.queued(), 0);
+}
+
+#[test]
+fn action_update_does_not_fail_under_registration_churn() {
+    let (process, signal) = new_test_env();
+    let running = Arc::new(AtomicBool::new(true));
+    let churn = {
+        let signal = signal.clone();
+        let running = running.clone();
+        thread::spawn(move || {
+            let mut tid = 100;
+            while running.load(Ordering::Acquire) {
+                if let Ok(registration) = signal.try_register(tid) {
+                    drop(registration);
+                }
+                tid = tid.wrapping_add(1);
+            }
+        })
+    };
+
+    let started = Instant::now();
+    for _ in 0..128 {
+        process
+            .try_replace_action(Signo::SIGTERM, SignalAction::default())
+            .expect("registration churn must not become a user-visible contention error");
+    }
+    running.store(false, Ordering::Release);
+    churn.join().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "action update retried without a finite contention bound"
+    );
+}
+
+#[test]
+fn registration_commit_linearizes_with_ignored_action_flush() {
+    for _ in 0..32 {
+        let (process, signal, registration) = new_unregistered_test_env();
+        let user = SignalQueueAccount::try_new(1).unwrap();
+        let global = SignalQueueAccount::try_new(1).unwrap();
+        let start = Arc::new(Barrier::new(2));
+        let (committed_tx, committed_rx) = mpsc::channel();
+
+        let commit = {
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                registration.commit();
+                committed_tx.send(()).unwrap();
+            })
+        };
+        let update = {
+            let process = process.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                process
+                    .try_replace_action(
+                        Signo::SIGRTMIN,
+                        SignalAction {
+                            disposition: SignalDisposition::Ignore,
+                            ..SignalAction::default()
+                        },
+                    )
+                    .unwrap();
+            })
+        };
+
+        committed_rx.recv().unwrap();
+        signal
+            .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1), |info| {
+                PreparedSignal::try_accounted(info, &user, 1, &global)
+            })
+            .unwrap();
+        commit.join().unwrap();
+        update.join().unwrap();
+
+        assert!(!signal.pending().has(Signo::SIGRTMIN));
+        assert_eq!(user.queued(), 0);
+        assert_eq!(global.queued(), 0);
+    }
 }

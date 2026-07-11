@@ -31,7 +31,8 @@ use crate::{
     deferred_work::DeferredWorkAccount,
     task::{
         AsThread, ProcessData, get_process_data, get_process_group, get_visible_task,
-        send_signal_to_process_data,
+        send_queued_signal_thread_inner, send_queued_signal_to_process_data,
+        send_signal_thread_inner, send_signal_to_process_data,
     },
 };
 
@@ -492,6 +493,26 @@ fn sigio_info(signal: u8, fd: i32, reason: u32) -> SignalInfo {
     info
 }
 
+fn send_sigio_to_process(process: &ProcessData, info: SignalInfo) {
+    if info.signo().is_realtime() {
+        match send_queued_signal_to_process_data(process, Some(info)) {
+            Ok(_) => return,
+            Err(AxError::WouldBlock) => {
+                // Linux falls back from a saturated F_SETSIG real-time queue
+                // to plain SIGIO. Delivering the selected RT number as
+                // SI_USER would fabricate a different notification contract.
+                let _ = send_signal_to_process_data(
+                    process,
+                    Some(SignalInfo::new_kernel(Signo::SIGIO)),
+                );
+            }
+            Err(_) => {}
+        }
+    } else {
+        let _ = send_signal_to_process_data(process, Some(info));
+    }
+}
+
 /// Delivers SIGIO through the stable owner object captured by F_SETOWN.
 /// Numeric IDs are retained only for ABI readback and are never looked up
 /// again during delivery, so a recycled PID/TID/PGID cannot inherit signals.
@@ -511,11 +532,19 @@ pub(crate) fn send_sigio(state: &AsyncIoState, fd: i32, reason: u32) {
             if thread.pending_exit() || !credentials.may_signal(&thread.proc_data) {
                 return;
             }
-            if thread
-                .signal
-                .send_signal(sigio_info(state.signal, fd, reason))
-            {
-                task.interrupt();
+            let info = sigio_info(state.signal, fd, reason);
+            if info.signo().is_realtime() {
+                match send_queued_signal_thread_inner(&task, thread, info) {
+                    Ok(_) => {}
+                    Err(AxError::WouldBlock) => send_signal_thread_inner(
+                        &task,
+                        thread,
+                        SignalInfo::new_kernel(Signo::SIGIO),
+                    ),
+                    Err(_) => {}
+                }
+            } else {
+                send_signal_thread_inner(&task, thread, info);
             }
         }
         AsyncIoOwner::Pid { process, .. } => {
@@ -523,10 +552,7 @@ pub(crate) fn send_sigio(state: &AsyncIoState, fd: i32, reason: u32) {
                 return;
             };
             if credentials.may_signal(&process) {
-                let _ = send_signal_to_process_data(
-                    &process,
-                    Some(sigio_info(state.signal, fd, reason)),
-                );
+                send_sigio_to_process(&process, sigio_info(state.signal, fd, reason));
             }
         }
         AsyncIoOwner::Pgrp { group, .. } => {
@@ -545,10 +571,7 @@ pub(crate) fn send_sigio(state: &AsyncIoState, fd: i32, reason: u32) {
                 {
                     return;
                 }
-                let _ = send_signal_to_process_data(
-                    &process_data,
-                    Some(sigio_info(state.signal, fd, reason)),
-                );
+                send_sigio_to_process(&process_data, sigio_info(state.signal, fd, reason));
             });
         }
     }

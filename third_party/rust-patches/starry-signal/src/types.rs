@@ -114,7 +114,8 @@ impl Signo {
             Signo::SIGIO => DefaultSignalAction::Terminate,
             Signo::SIGPWR => DefaultSignalAction::Terminate,
             Signo::SIGSYS => DefaultSignalAction::CoreDump,
-            _ => DefaultSignalAction::Ignore,
+            // POSIX real-time signals default to process termination.
+            _ => DefaultSignalAction::Terminate,
         }
     }
 }
@@ -222,7 +223,14 @@ impl SignalInfo {
     }
 
     pub fn signo(&self) -> Signo {
-        unsafe { Signo::from_repr(self.0.__bindgen_anon_1.__bindgen_anon_1.si_signo as _).unwrap() }
+        self.try_signo()
+            .expect("kernel SignalInfo has a valid signo")
+    }
+
+    /// Validates a raw ABI signal number without panicking.
+    pub fn try_signo(&self) -> Option<Signo> {
+        let raw = unsafe { self.0.__bindgen_anon_1.__bindgen_anon_1.si_signo };
+        u8::try_from(raw).ok().and_then(Signo::from_repr)
     }
 
     pub fn set_signo(&mut self, signo: Signo) {

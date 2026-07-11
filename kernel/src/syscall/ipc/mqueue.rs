@@ -1,13 +1,21 @@
-use alloc::{borrow::Cow, collections::BTreeMap, format, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    borrow::Cow,
+    collections::BTreeMap,
+    format,
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::{
     ffi::c_char,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     task::Context,
     time::Duration,
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axpoll::{IoEvents, Pollable};
+#[cfg(not(test))]
 use axsync::Mutex;
 use axtask::current;
 use bytemuck::AnyBitPattern;
@@ -16,7 +24,12 @@ use linux_raw_sys::general::{
     O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, SI_MESGQ, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD,
     timespec,
 };
-use starry_signal::{SignalInfo, Signo};
+// Host unit tests do not initialize a scheduler/current task. The ownership
+// tests below exercise the same queue/registry critical sections with a spin
+// mutex; blocking/wakeup behavior remains covered only by kernel/guest tests.
+#[cfg(test)]
+use spin::Mutex;
+use starry_signal::{PreparedSignal, SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use crate::{
@@ -27,7 +40,8 @@ use crate::{
     mm::vm_load_string,
     syscall::RawSigevent,
     task::{
-        AsThread, ProcStateHint, has_pending_syscall_signal, send_signal_to_process,
+        AsThread, ProcStateHint, ProcessData, has_pending_syscall_signal,
+        prepare_queued_signal_for_process, send_prepared_signal_to_process_data,
         with_proc_state_hint,
     },
     time::{TimeValueLike, wall_time},
@@ -47,6 +61,9 @@ const NOTIFY_REMOVED: u8 = 2;
 const MQ_INODE_SIZE: u64 = 80;
 
 static MQ_MANAGER: Mutex<MqManager> = Mutex::new(MqManager::new());
+static MQ_NOTIFICATION_REGISTRY: Mutex<MqNotificationRegistry> =
+    Mutex::new(MqNotificationRegistry::new());
+static MQ_NOTIFICATION_ID: AtomicU64 = AtomicU64::new(1);
 static MQ_QUEUES_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_QUEUES_MAX);
 static MQ_MSG_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_MSG_MAX);
 static MQ_MSGSIZE_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_MSGSIZE_MAX);
@@ -74,13 +91,23 @@ struct MqThreadNotifier {
     cookie: [u8; NOTIFY_COOKIE_LEN],
 }
 
-#[derive(Clone)]
 struct MqNotifier {
     pid: u32,
     notify: i32,
-    signo: i32,
-    value_int: i32,
     thread: Option<MqThreadNotifier>,
+    signal: Option<MqSignalNotifier>,
+    registration: Arc<MqNotificationToken>,
+}
+
+struct MqNotificationToken {
+    id: u64,
+    active: AtomicBool,
+}
+
+struct MqSignalNotifier {
+    target: Weak<ProcessData>,
+    info: SignalInfo,
+    prepared: PreparedSignal,
 }
 
 struct PosixMqueue {
@@ -101,6 +128,16 @@ struct MqManager {
     queues: BTreeMap<String, Arc<Mutex<PosixMqueue>>>,
 }
 
+struct MqNotificationRegistration {
+    owner: u32,
+    queue: Weak<Mutex<PosixMqueue>>,
+    token: Arc<MqNotificationToken>,
+}
+
+struct MqNotificationRegistry {
+    entries: BTreeMap<u64, MqNotificationRegistration>,
+}
+
 pub struct MqFd {
     queue: Arc<Mutex<PosixMqueue>>,
     access: MqAccess,
@@ -118,6 +155,14 @@ impl MqManager {
     const fn new() -> Self {
         Self {
             queues: BTreeMap::new(),
+        }
+    }
+}
+
+impl MqNotificationRegistry {
+    const fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
         }
     }
 }
@@ -171,6 +216,15 @@ impl PosixMqueue {
             None
         } else {
             Some(self.messages.remove(0))
+        }
+    }
+}
+
+impl Drop for PosixMqueue {
+    fn drop(&mut self) {
+        if let Some(notifier) = self.notifier.as_ref() {
+            notifier.registration.active.store(false, Ordering::Release);
+            unregister_notification(notifier.registration.id);
         }
     }
 }
@@ -392,6 +446,15 @@ fn validate_notify_event(event: &RawSigevent) -> AxResult {
     }
 }
 
+fn new_notification_token() -> AxResult<Arc<MqNotificationToken>> {
+    let id = MQ_NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed).max(1);
+    Arc::try_new(MqNotificationToken {
+        id,
+        active: AtomicBool::new(true),
+    })
+    .map_err(|_| AxError::NoMemory)
+}
+
 fn build_notifier(event: &RawSigevent) -> AxResult<MqNotifier> {
     validate_notify_event(event)?;
     let curr = current();
@@ -399,9 +462,9 @@ fn build_notifier(event: &RawSigevent) -> AxResult<MqNotifier> {
     let mut notifier = MqNotifier {
         pid: proc_data.proc.pid(),
         notify: event.notify(),
-        signo: event.signo(),
-        value_int: event.value_int(),
         thread: None,
+        signal: None,
+        registration: new_notification_token()?,
     };
 
     if event.notify() == SIGEV_THREAD as i32 {
@@ -412,6 +475,29 @@ fn build_notifier(event: &RawSigevent) -> AxResult<MqNotifier> {
         let mut cookie = [0u8; NOTIFY_COOKIE_LEN];
         cookie.copy_from_slice(&cookie_data);
         notifier.thread = Some(MqThreadNotifier { netlink, cookie });
+    } else if event.notify() == SIGEV_SIGNAL as i32
+        && let Some(signo) = u8::try_from(event.signo()).ok().and_then(Signo::from_repr)
+    {
+        // Linux reserves a sigqueue record when mq_notify registers, not when
+        // the empty->nonempty edge consumes the one-shot registration. This
+        // makes RT siginfo delivery allocation-free and preserves SI_MESGQ,
+        // sigev_value and the registering identity under queue pressure.
+        let mut info = SignalInfo::new_kernel(signo);
+        info.set_code(SI_MESGQ);
+        unsafe {
+            let rt = &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._rt;
+            rt._pid = proc_data.proc.pid() as _;
+            rt._uid = proc_data.uid() as _;
+            rt._sigval = linux_raw_sys::general::sigval_t {
+                sival_ptr: event.value_ptr_address() as *mut linux_raw_sys::ctypes::c_void,
+            };
+        }
+        let prepared = prepare_queued_signal_for_process(proc_data, info.clone())?;
+        notifier.signal = Some(MqSignalNotifier {
+            target: Arc::downgrade(proc_data),
+            info,
+            prepared,
+        });
     }
 
     Ok(notifier)
@@ -453,45 +539,91 @@ fn send_thread_notification(thread: &MqThreadNotifier, state: u8) {
     thread.netlink.enqueue_kernel(Vec::from(cookie));
 }
 
-fn remove_notification(notifier: Option<MqNotifier>) {
-    if let Some(notifier) = notifier
-        && notifier.notify == SIGEV_THREAD as i32
-        && let Some(thread) = notifier.thread.as_ref()
+fn unregister_notification(id: u64) {
+    let removed = MQ_NOTIFICATION_REGISTRY.lock().entries.remove(&id);
+    // Weak and token Arcs are released outside the registry mutex.
+    drop(removed);
+}
+
+fn claim_notification(notifier: &MqNotifier) -> bool {
+    if notifier
+        .registration
+        .active
+        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
     {
-        send_thread_notification(thread, NOTIFY_REMOVED);
+        return false;
+    }
+    unregister_notification(notifier.registration.id);
+    true
+}
+
+fn remove_notification(notifier: Option<MqNotifier>) {
+    if let Some(notifier) = notifier {
+        let claimed = claim_notification(&notifier);
+        if claimed
+            && notifier.notify == SIGEV_THREAD as i32
+            && let Some(thread) = notifier.thread.as_ref()
+        {
+            send_thread_notification(thread, NOTIFY_REMOVED);
+        }
     }
 }
 
 fn maybe_notify(notifier: Option<MqNotifier>) {
-    let Some(notifier) = notifier else {
+    let Some(mut notifier) = notifier else {
         return;
     };
+    if !claim_notification(&notifier) {
+        return;
+    }
     if notifier.notify == SIGEV_THREAD as i32 {
         if let Some(thread) = notifier.thread.as_ref() {
             send_thread_notification(thread, NOTIFY_WOKENUP);
         }
         return;
     }
-    if notifier.notify != SIGEV_SIGNAL as i32 {
-        return;
-    }
-    let Some(signo) = Signo::from_repr(notifier.signo as u8) else {
+    let Some(signal) = notifier.signal.take() else {
         return;
     };
+    let Some(target) = signal.target.upgrade() else {
+        return;
+    };
+    let _ = send_prepared_signal_to_process_data(&target, signal.info, signal.prepared);
+}
 
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let mut info = SignalInfo::new_kernel(signo);
-    info.set_code(SI_MESGQ);
-    unsafe {
-        let rt = &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._rt;
-        rt._pid = proc_data.proc.pid() as _;
-        rt._uid = proc_data.uid() as _;
-        rt._sigval = linux_raw_sys::general::sigval_t {
-            sival_int: notifier.value_int,
+/// Releases queue-notification reservations owned by an exiting process.
+///
+/// The registry stores a weak queue reference independently of the namespace
+/// name, so this also finds unlinked-but-open queues.
+pub(crate) fn cleanup_process_mqueue_notifications(pid: u32) {
+    loop {
+        let registration = {
+            let mut registry = MQ_NOTIFICATION_REGISTRY.lock();
+            let id = registry
+                .entries
+                .iter()
+                .find_map(|(id, registration)| (registration.owner == pid).then_some(*id));
+            id.and_then(|id| registry.entries.remove(&id))
         };
+        let Some(registration) = registration else {
+            break;
+        };
+        registration.token.active.store(false, Ordering::Release);
+        let removed = registration.queue.upgrade().and_then(|queue| {
+            let mut queue = queue.lock();
+            queue
+                .notifier
+                .as_ref()
+                .is_some_and(|notifier| notifier.registration.id == registration.token.id)
+                .then(|| queue.notifier.take())
+                .flatten()
+        });
+        // Drop the preallocated node, account charge, weak queue, and token
+        // only after releasing registry and queue mutexes.
+        drop(removed);
+        drop(registration);
     }
-    let _ = send_signal_to_process(notifier.pid, Some(info));
 }
 
 pub fn sys_mq_open(
@@ -686,14 +818,31 @@ pub fn sys_mq_notify(fd: i32, notification: *const RawSigevent) -> AxResult<isiz
     };
     let file = get_mq_fd(fd)?;
 
+    let mut rejected = None;
+    let mut detached_registration = None;
+    let mut busy = false;
     let removed = {
+        let mut registry = MQ_NOTIFICATION_REGISTRY.lock();
         let mut queue = file.queue.lock();
         if let Some(notifier) = notifier {
-            if queue.notifier.is_some() {
-                return Err(AxError::ResourceBusy);
+            if queue.notifier.is_some() || registry.entries.contains_key(&notifier.registration.id)
+            {
+                rejected = Some(notifier);
+                busy = true;
+                None
+            } else {
+                let id = notifier.registration.id;
+                registry.entries.insert(
+                    id,
+                    MqNotificationRegistration {
+                        owner: notifier.pid,
+                        queue: Arc::downgrade(&file.queue),
+                        token: notifier.registration.clone(),
+                    },
+                );
+                queue.notifier = Some(notifier);
+                None
             }
-            queue.notifier = Some(notifier);
-            None
         } else {
             let curr_pid = current().as_thread().proc_data.proc.pid();
             if queue
@@ -701,12 +850,23 @@ pub fn sys_mq_notify(fd: i32, notification: *const RawSigevent) -> AxResult<isiz
                 .as_ref()
                 .is_some_and(|notifier| notifier.pid == curr_pid)
             {
-                queue.notifier.take()
+                let removed = queue.notifier.take();
+                if let Some(notifier) = removed.as_ref() {
+                    detached_registration = registry.entries.remove(&notifier.registration.id);
+                }
+                removed
             } else {
                 None
             }
         }
     };
+    // A rejected preallocated RT record may deallocate and release account
+    // Arcs; do that only after the queue mutex is gone.
+    drop(rejected);
+    drop(detached_registration);
+    if busy {
+        return Err(AxError::ResourceBusy);
+    }
     remove_notification(removed);
     Ok(0)
 }
@@ -742,4 +902,137 @@ pub fn sys_mq_getsetattr(
         description.set_status_flags(flags);
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn install_accounted_notification(
+        pid: u32,
+    ) -> (
+        Arc<Mutex<PosixMqueue>>,
+        Arc<MqNotificationToken>,
+        Arc<starry_signal::SignalQueueAccount>,
+        Arc<starry_signal::SignalQueueAccount>,
+    ) {
+        let queue = Arc::new(Mutex::new(PosixMqueue::new(
+            String::from("registry-account-test"),
+            0o600,
+            pid,
+            0,
+            default_attr(),
+        )));
+        let token = new_notification_token().unwrap();
+        let per_user = starry_signal::SignalQueueAccount::try_new(4).unwrap();
+        let global = starry_signal::SignalQueueAccount::try_new(4).unwrap();
+        let mut info = SignalInfo::new_kernel(Signo::SIGRTMIN);
+        info.set_code(SI_MESGQ);
+        let prepared = PreparedSignal::try_accounted(info.clone(), &per_user, 4, &global).unwrap();
+        queue.lock().notifier = Some(MqNotifier {
+            pid,
+            notify: SIGEV_SIGNAL as i32,
+            thread: None,
+            signal: Some(MqSignalNotifier {
+                target: Weak::new(),
+                info,
+                prepared,
+            }),
+            registration: token.clone(),
+        });
+        MQ_NOTIFICATION_REGISTRY.lock().entries.insert(
+            token.id,
+            MqNotificationRegistration {
+                owner: pid,
+                queue: Arc::downgrade(&queue),
+                token: token.clone(),
+            },
+        );
+        (queue, token, per_user, global)
+    }
+
+    fn install_inert_notification(pid: u32) -> (Arc<Mutex<PosixMqueue>>, Arc<MqNotificationToken>) {
+        let queue = Arc::new(Mutex::new(PosixMqueue::new(
+            String::from("registry-test"),
+            0o600,
+            pid,
+            0,
+            default_attr(),
+        )));
+        let token = new_notification_token().unwrap();
+        queue.lock().notifier = Some(MqNotifier {
+            pid,
+            notify: SIGEV_NONE as i32,
+            thread: None,
+            signal: None,
+            registration: token.clone(),
+        });
+        MQ_NOTIFICATION_REGISTRY.lock().entries.insert(
+            token.id,
+            MqNotificationRegistration {
+                owner: pid,
+                queue: Arc::downgrade(&queue),
+                token: token.clone(),
+            },
+        );
+        (queue, token)
+    }
+
+    #[test]
+    fn owner_exit_cancels_unlinked_but_open_notification() {
+        let pid = 0xf001;
+        let (queue, token) = install_inert_notification(pid);
+        cleanup_process_mqueue_notifications(pid);
+
+        assert!(queue.lock().notifier.is_none());
+        assert!(!token.active.load(Ordering::Acquire));
+        assert!(
+            !MQ_NOTIFICATION_REGISTRY
+                .lock()
+                .entries
+                .contains_key(&token.id)
+        );
+    }
+
+    #[test]
+    fn owner_exit_wins_against_a_notification_already_taken_for_delivery() {
+        let pid = 0xf002;
+        let (queue, token) = install_inert_notification(pid);
+        let moved = queue.lock().notifier.take().unwrap();
+
+        cleanup_process_mqueue_notifications(pid);
+        assert!(!claim_notification(&moved));
+        assert!(!token.active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn owner_exit_refunds_an_unlinked_queue_signal_reservation() {
+        let pid = 0xf003;
+        let (queue, token, per_user, global) = install_accounted_notification(pid);
+        assert_eq!(per_user.queued(), 1);
+        assert_eq!(global.queued(), 1);
+
+        cleanup_process_mqueue_notifications(pid);
+        assert!(queue.lock().notifier.is_none());
+        assert!(!token.active.load(Ordering::Acquire));
+        assert_eq!(per_user.queued(), 0);
+        assert_eq!(global.queued(), 0);
+    }
+
+    #[test]
+    fn exit_cancellation_of_taken_notification_refunds_exactly_on_drop() {
+        let pid = 0xf004;
+        let (queue, token, per_user, global) = install_accounted_notification(pid);
+        let moved = queue.lock().notifier.take().unwrap();
+
+        cleanup_process_mqueue_notifications(pid);
+        assert!(!claim_notification(&moved));
+        assert!(!token.active.load(Ordering::Acquire));
+        assert_eq!(per_user.queued(), 1);
+        assert_eq!(global.queued(), 1);
+
+        drop(moved);
+        assert_eq!(per_user.queued(), 0);
+        assert_eq!(global.queued(), 0);
+    }
 }

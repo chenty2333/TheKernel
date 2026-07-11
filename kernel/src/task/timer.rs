@@ -10,7 +10,7 @@ use core::{
     future::{Future, poll_fn},
     mem,
     pin::Pin,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -29,7 +29,8 @@ use starry_signal::{SignalInfo, Signo};
 use strum::FromRepr;
 
 use super::{
-    AsThread, ProcessData, poll_itimer_alarm, send_signal_to_process, send_signal_to_visible_thread,
+    AsThread, ProcessData, poll_itimer_alarm, send_queued_signal_to_process_data,
+    send_queued_signal_to_visible_thread,
 };
 use crate::time::wall_time;
 
@@ -79,6 +80,8 @@ pub(crate) enum PosixTimerNotify {
     Signal {
         signo: Signo,
         target_tid: Option<Pid>,
+        /// `None` selects Linux's default `sival_int = timerid` behavior.
+        value: Option<usize>,
     },
 }
 
@@ -90,7 +93,9 @@ pub(crate) struct PosixTimer {
     pub deadline: Option<Duration>,
     pub sequence: u64,
     pub overrun: i32,
-    pub signal_pending: bool,
+    signal_pending: bool,
+    signal_retry_pending: bool,
+    signal_token: u32,
 }
 
 impl PosixTimer {
@@ -103,8 +108,90 @@ impl PosixTimer {
             sequence: 0,
             overrun: 0,
             signal_pending: false,
+            signal_retry_pending: false,
+            signal_token: 0,
         }
     }
+
+    fn begin_signal_delivery(&mut self, expirations: u128) -> Option<TimerSignalDelivery> {
+        if self.signal_pending {
+            let extra = expirations.min(i32::MAX as u128) as i32;
+            self.overrun = self.overrun.saturating_add(extra);
+            return None;
+        }
+
+        if self.signal_retry_pending {
+            // The original expiry still needs a notification. Every expiry
+            // observed while retrying is therefore an overrun of that event.
+            // Keep the existing token and sleeping retry: replacing it here
+            // would leave stale alarm entries behind for every short-period
+            // expiry and could amplify one timer into an unbounded heap load.
+            let extra = expirations.min(i32::MAX as u128) as i32;
+            self.overrun = self.overrun.saturating_add(extra);
+            return None;
+        }
+
+        self.overrun = expirations.saturating_sub(1).min(i32::MAX as u128) as i32;
+
+        self.signal_token = next_posix_timer_signal_token();
+        self.signal_pending = true;
+        Some(TimerSignalDelivery {
+            token: self.signal_token,
+            overrun: self.overrun,
+        })
+    }
+
+    fn fail_signal_delivery(&mut self, token: u32) -> bool {
+        if !self.signal_pending || self.signal_token != token {
+            return false;
+        }
+        self.signal_pending = false;
+        self.signal_retry_pending = true;
+        true
+    }
+
+    fn retry_signal_delivery(&mut self, token: u32) -> Option<TimerSignalDelivery> {
+        if self.signal_pending || !self.signal_retry_pending || self.signal_token != token {
+            return None;
+        }
+        self.signal_token = next_posix_timer_signal_token();
+        self.signal_pending = true;
+        Some(TimerSignalDelivery {
+            token: self.signal_token,
+            overrun: self.overrun,
+        })
+    }
+
+    fn abandon_signal_delivery(&mut self, token: u32) -> bool {
+        if !self.signal_pending || self.signal_token != token {
+            return false;
+        }
+        self.signal_pending = false;
+        self.signal_retry_pending = false;
+        true
+    }
+
+    fn acknowledge_signal_delivery(&mut self, token: u32) -> bool {
+        if !self.signal_pending || self.signal_token != token {
+            return false;
+        }
+        self.signal_pending = false;
+        self.signal_retry_pending = false;
+        true
+    }
+
+    pub(crate) fn reset_signal_delivery(&mut self) {
+        self.overrun = 0;
+        self.signal_pending = false;
+        self.signal_retry_pending = false;
+        self.signal_token = 0;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimerSignalDelivery {
+    token: u32,
+    overrun: i32,
 }
 
 /// The action to take when an alarm fires.
@@ -122,6 +209,13 @@ enum AlarmAction {
         proc: Weak<ProcessData>,
         timerid: usize,
         sequence: u64,
+    },
+    /// Retry an admitted timer event after temporary sigqueue pressure.
+    PosixTimerRetry {
+        proc: Weak<ProcessData>,
+        timerid: usize,
+        token: u32,
+        backoff: Duration,
     },
 }
 
@@ -241,6 +335,24 @@ lazy_static! {
 
 static CLOCK_TIMER_CALLBACK_REGISTERED: [AtomicBool; axconfig::plat::MAX_CPU_NUM] =
     [const { AtomicBool::new(false) }; axconfig::plat::MAX_CPU_NUM];
+
+static NEXT_POSIX_TIMER_SIGNAL_TOKEN: AtomicU32 = AtomicU32::new(1);
+const POSIX_TIMER_RETRY_INITIAL: Duration = Duration::from_millis(1);
+const POSIX_TIMER_RETRY_MAX: Duration = Duration::from_secs(1);
+
+fn next_posix_timer_signal_token() -> u32 {
+    loop {
+        let current = NEXT_POSIX_TIMER_SIGNAL_TOKEN.load(Ordering::Relaxed);
+        let token = current.max(1);
+        let next = token.wrapping_add(1).max(1);
+        if NEXT_POSIX_TIMER_SIGNAL_TOKEN
+            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return token;
+        }
+    }
+}
 
 // Set (sticky) when any process sets RLIMIT_CPU to a finite value, so the
 // per-fault/per-syscall update_rlimit_cpu can skip the current()+rlim path.
@@ -666,42 +778,36 @@ fn saturating_duration_mul(duration: Duration, count: u128) -> Duration {
     Duration::from_nanos(nanos)
 }
 
-fn posix_timer_signal_info(signo: Signo, timerid: usize, overrun: i32) -> SignalInfo {
+fn posix_timer_signal_info(
+    signo: Signo,
+    timerid: usize,
+    overrun: i32,
+    value: usize,
+    token: u32,
+) -> SignalInfo {
     let mut info = SignalInfo::new_kernel(signo);
     info.set_code(SI_TIMER);
-    info.0
-        .__bindgen_anon_1
-        .__bindgen_anon_1
-        ._sifields
-        ._timer
-        ._tid = timerid as _;
-    info.0
-        .__bindgen_anon_1
-        .__bindgen_anon_1
-        ._sifields
-        ._timer
-        ._overrun = overrun;
+    let timer = unsafe { &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._timer };
+    timer._tid = timerid as _;
+    timer._overrun = overrun;
+    timer._sigval = linux_raw_sys::general::sigval_t {
+        sival_ptr: value as *mut linux_raw_sys::ctypes::c_void,
+    };
+    timer._sys_private = token as i32;
     info
 }
 
-fn timer_signal_id(sig: &SignalInfo) -> Option<usize> {
+fn timer_signal_identity(sig: &SignalInfo) -> Option<(usize, u32)> {
     if sig.code() != SI_TIMER {
         return None;
     }
 
-    let raw_timerid = unsafe {
-        sig.0
-            .__bindgen_anon_1
-            .__bindgen_anon_1
-            ._sifields
-            ._timer
-            ._tid
-    };
-    usize::try_from(raw_timerid).ok()
+    let timer = unsafe { sig.0.__bindgen_anon_1.__bindgen_anon_1._sifields._timer };
+    Some((usize::try_from(timer._tid).ok()?, timer._sys_private as u32))
 }
 
 pub(crate) fn acknowledge_posix_timer_signal(proc_data: &ProcessData, sig: &SignalInfo) {
-    let Some(timerid) = timer_signal_id(sig) else {
+    let Some((timerid, token)) = timer_signal_identity(sig) else {
         return;
     };
 
@@ -709,11 +815,129 @@ pub(crate) fn acknowledge_posix_timer_signal(proc_data: &ProcessData, sig: &Sign
     let Some(Some(timer)) = timers.get_mut(timerid) else {
         return;
     };
-    timer.signal_pending = false;
+    timer.acknowledge_signal_delivery(token);
+}
+
+fn fail_posix_timer_signal(proc_data: &ProcessData, timerid: usize, token: u32) -> bool {
+    let mut timers = proc_data.posix_timers.lock();
+    let Some(Some(timer)) = timers.get_mut(timerid) else {
+        return false;
+    };
+    timer.fail_signal_delivery(token)
+}
+
+fn abandon_posix_timer_signal(proc_data: &ProcessData, timerid: usize, token: u32) {
+    let mut timers = proc_data.posix_timers.lock();
+    let Some(Some(timer)) = timers.get_mut(timerid) else {
+        return;
+    };
+    timer.abandon_signal_delivery(token);
+}
+
+fn register_posix_timer_retry(
+    proc_data: &Arc<ProcessData>,
+    timerid: usize,
+    token: u32,
+    backoff: Duration,
+) {
+    let deadline = AlarmClock::Monotonic
+        .now()
+        .checked_add(backoff)
+        .unwrap_or(Duration::MAX);
+    register_alarm(
+        AlarmClock::Monotonic,
+        deadline,
+        AlarmAction::PosixTimerRetry {
+            proc: Arc::downgrade(proc_data),
+            timerid,
+            token,
+            backoff,
+        },
+    );
+}
+
+fn next_posix_timer_retry_backoff(backoff: Duration) -> Duration {
+    backoff.saturating_mul(2).min(POSIX_TIMER_RETRY_MAX)
+}
+
+fn deliver_posix_timer_signal(
+    proc_data: &Arc<ProcessData>,
+    timerid: usize,
+    notify: PosixTimerNotify,
+    delivery: TimerSignalDelivery,
+    retry_backoff: Duration,
+) {
+    let (signo, target_tid, value) = match notify {
+        PosixTimerNotify::None => return,
+        PosixTimerNotify::Signal {
+            signo,
+            target_tid,
+            value,
+        } => (signo, target_tid, value.unwrap_or(timerid)),
+    };
+
+    let siginfo = posix_timer_signal_info(signo, timerid, delivery.overrun, value, delivery.token);
+    let result = if let Some(tid) = target_tid {
+        send_queued_signal_to_visible_thread(Some(proc_data.proc.pid()), tid, Some(siginfo))
+    } else {
+        send_queued_signal_to_process_data(proc_data, Some(siginfo))
+    };
+
+    match result {
+        Ok(true) => {}
+        Ok(false) => {
+            // Ignore and standard-signal coalescing own no timer record. They
+            // are semantic consumption, not queue-pressure failures.
+            abandon_posix_timer_signal(proc_data, timerid, delivery.token);
+        }
+        Err(err) => {
+            let linux_error = LinuxError::from(err);
+            if linux_error == LinuxError::ESRCH {
+                abandon_posix_timer_signal(proc_data, timerid, delivery.token);
+                return;
+            }
+
+            // Admission/allocation failure retains the exact timer event and
+            // schedules one sleeping retry. Periodic expiries merge their
+            // overruns into that generation; rearm/delete invalidate it.
+            if fail_posix_timer_signal(proc_data, timerid, delivery.token) {
+                register_posix_timer_retry(proc_data, timerid, delivery.token, retry_backoff);
+            }
+            if linux_error != LinuxError::EAGAIN {
+                warn!("failed to deliver POSIX timer signal: {err:?}");
+            }
+        }
+    }
+}
+
+fn retry_posix_timer_signal(
+    proc_data: Arc<ProcessData>,
+    timerid: usize,
+    token: u32,
+    backoff: Duration,
+) {
+    let (notify, delivery) = {
+        let mut timers = proc_data.posix_timers.lock();
+        let Some(Some(timer)) = timers.get_mut(timerid) else {
+            return;
+        };
+        let notify = timer.notify;
+        let Some(delivery) = timer.retry_signal_delivery(token) else {
+            return;
+        };
+        (notify, delivery)
+    };
+    deliver_posix_timer_signal(
+        &proc_data,
+        timerid,
+        notify,
+        delivery,
+        next_posix_timer_retry_backoff(backoff),
+    );
 }
 
 fn fire_posix_timer(proc_data: Arc<ProcessData>, timerid: usize, sequence: u64) {
-    let (notify, overrun, should_deliver, next) = {
+    let (notify, delivery, next) = {
         let mut timers = proc_data.posix_timers.lock();
         let Some(Some(timer)) = timers.get_mut(timerid) else {
             return;
@@ -738,18 +962,10 @@ fn fire_posix_timer(proc_data: Arc<ProcessData>, timerid: usize, sequence: u64) 
             1_u128.saturating_add(elapsed / interval)
         };
         let notify = timer.notify;
-        let should_deliver = match notify {
-            PosixTimerNotify::None => false,
-            PosixTimerNotify::Signal { .. } => !timer.signal_pending,
+        let delivery = match notify {
+            PosixTimerNotify::None => None,
+            PosixTimerNotify::Signal { .. } => timer.begin_signal_delivery(expirations),
         };
-        if should_deliver {
-            timer.overrun = expirations.saturating_sub(1).min(i32::MAX as u128) as i32;
-            timer.signal_pending = true;
-        } else if matches!(notify, PosixTimerNotify::Signal { .. }) {
-            let extra = expirations.min(i32::MAX as u128) as i32;
-            timer.overrun = timer.overrun.saturating_add(extra);
-        }
-        let overrun = timer.overrun;
 
         let next = if timer.interval.is_zero() {
             timer.deadline = None;
@@ -763,33 +979,86 @@ fn fire_posix_timer(proc_data: Arc<ProcessData>, timerid: usize, sequence: u64) 
             timer.sequence = timer.sequence.wrapping_add(1);
             Some((timer.clock.alarm_clock(), next_deadline, timer.sequence))
         };
-        (notify, overrun, should_deliver, next)
+        (notify, delivery, next)
     };
 
     if let Some((clock, deadline, next_sequence)) = next {
         register_posix_timer_alarm(&proc_data, timerid, clock, deadline, next_sequence);
     }
 
-    if !should_deliver {
-        return;
+    let Some(delivery) = delivery else { return };
+
+    deliver_posix_timer_signal(
+        &proc_data,
+        timerid,
+        notify,
+        delivery,
+        POSIX_TIMER_RETRY_INITIAL,
+    );
+}
+
+#[cfg(test)]
+mod posix_timer_signal_tests {
+    use super::*;
+
+    fn timer() -> PosixTimer {
+        PosixTimer::new(
+            PosixTimerClock::Monotonic,
+            PosixTimerNotify::Signal {
+                signo: Signo::SIGRTMIN,
+                target_tid: None,
+                value: Some(7),
+            },
+        )
     }
 
-    let (signo, target_tid) = match notify {
-        PosixTimerNotify::None => return,
-        PosixTimerNotify::Signal { signo, target_tid } => (signo, target_tid),
-    };
+    #[test]
+    fn failed_admission_retries_without_losing_overrun() {
+        let mut timer = timer();
+        let first = timer.begin_signal_delivery(1).unwrap();
+        assert_eq!(first.overrun, 0);
+        assert!(timer.fail_signal_delivery(first.token));
 
-    let siginfo = posix_timer_signal_info(signo, timerid, overrun);
-    let result = if let Some(tid) = target_tid {
-        send_signal_to_visible_thread(Some(proc_data.proc.pid()), tid, Some(siginfo))
-    } else {
-        send_signal_to_process(proc_data.proc.pid(), Some(siginfo))
-    };
+        assert!(timer.begin_signal_delivery(2).is_none());
+        let retry = timer.retry_signal_delivery(first.token).unwrap();
+        assert_eq!(retry.overrun, 2);
+        assert!(!timer.acknowledge_signal_delivery(first.token));
+        assert!(timer.acknowledge_signal_delivery(retry.token));
+    }
 
-    if let Err(err) = result
-        && LinuxError::from(err) != LinuxError::ESRCH
-    {
-        warn!("failed to deliver POSIX timer signal: {err:?}");
+    #[test]
+    fn one_shot_deferred_retry_retains_the_original_event() {
+        let mut timer = timer();
+        let first = timer.begin_signal_delivery(1).unwrap();
+        assert!(timer.fail_signal_delivery(first.token));
+
+        let retry = timer.retry_signal_delivery(first.token).unwrap();
+        assert_eq!(retry.overrun, 0);
+        assert_ne!(retry.token, first.token);
+        assert!(timer.acknowledge_signal_delivery(retry.token));
+    }
+
+    #[test]
+    fn pending_delivery_accumulates_and_stale_tokens_cannot_clear_it() {
+        let mut timer = timer();
+        let delivery = timer.begin_signal_delivery(3).unwrap();
+        assert_eq!(delivery.overrun, 2);
+        assert!(timer.begin_signal_delivery(4).is_none());
+        assert_eq!(timer.overrun, 6);
+        assert!(!timer.fail_signal_delivery(delivery.token.wrapping_add(1)));
+        assert!(timer.signal_pending);
+    }
+
+    #[test]
+    fn rearm_invalidates_a_deferred_one_shot_retry() {
+        let mut timer = timer();
+        let first = timer.begin_signal_delivery(1).unwrap();
+        assert!(timer.fail_signal_delivery(first.token));
+
+        timer.reset_signal_delivery();
+        assert!(timer.retry_signal_delivery(first.token).is_none());
+        assert!(!timer.signal_pending);
+        assert!(!timer.signal_retry_pending);
     }
 }
 
@@ -830,6 +1099,16 @@ fn process_due(clock: AlarmClock) -> bool {
             } => {
                 if let Some(proc_data) = proc.upgrade() {
                     fire_posix_timer(proc_data, timerid, sequence);
+                }
+            }
+            AlarmAction::PosixTimerRetry {
+                proc,
+                timerid,
+                token,
+                backoff,
+            } => {
+                if let Some(proc_data) = proc.upgrade() {
+                    retry_posix_timer_signal(proc_data, timerid, token, backoff);
                 }
             }
         }

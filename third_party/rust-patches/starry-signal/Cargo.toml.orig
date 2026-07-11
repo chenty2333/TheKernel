@@ -8,13 +8,18 @@ keywords = ["starry-os", "arceos", "signal", "ipc"]
 license = "Apache-2.0"
 repository = "https://github.com/Starry-OS/starry-signal"
 
+[features]
+default = []
+multitask = ["axsync/multitask"]
+
 [dependencies]
 axcpu = { version = "0.3.0-preview.5", features = ["uspace"] }
+axsync = { version = "0.3.0-preview.2", default-features = false }
 bitflags = "2.6"
 cfg-if = "1"
 derive_more = { version = "2.0", default-features = false, features = ["full"] }
 event-listener = { version = "5.4", default-features = false }
-kspin = "0.1"
+kspin = { version = "0.1", features = ["smp"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = [
     "general",
     "no_std",

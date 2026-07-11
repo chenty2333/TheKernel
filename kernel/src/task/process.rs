@@ -1,4 +1,9 @@
-use alloc::{format, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    format,
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::{
     sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     time::Duration,
@@ -9,6 +14,7 @@ use axhal::time::monotonic_time_nanos;
 use axnet::NetStack;
 use axpoll::PollSet;
 use axsync::{Mutex, spin::SpinNoIrq};
+use hashbrown::HashMap;
 use linux_raw_sys::general::{
     CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_LINUX_IMMUTABLE,
     CAP_MAC_OVERRIDE, CAP_MKNOD, CAP_SETGID, CAP_SETUID,
@@ -17,9 +23,17 @@ use scope_local::Scope;
 use spin::RwLock;
 use starry_process::{Pid, Process, ProcessError, ThreadAdmission as StarryThreadAdmission};
 use starry_signal::{
-    Signo,
+    SignalInfo, SignalQueueAccount, Signo,
     api::{ProcessSignalManager, SignalActions},
 };
+
+// Host unit tests do not initialize the kernel scheduler/current task. Keep
+// the production registry sleepable, but let ownership/admission tests execute
+// the same critical sections without entering `axsync::Mutex`'s task wait path.
+#[cfg(not(test))]
+type SignalAccountRegistryMutex<T> = axsync::Mutex<T>;
+#[cfg(test)]
+type SignalAccountRegistryMutex<T> = spin::Mutex<T>;
 
 use super::{
     accounting::{AtomicTaskUsage, live_process_usage},
@@ -30,6 +44,7 @@ use super::{
         StopReport, StopState, VforkControlState,
     },
     resources::Rlimits,
+    signal::PtraceSignalRecord,
     timer::PosixTimer,
 };
 use crate::{
@@ -51,6 +66,13 @@ const SECURE_ALL_BITS: u32 =
     (1 << 0) | SECBIT_NO_SETUID_FIXUP | SECBIT_KEEP_CAPS | SECBIT_NO_CAP_AMBIENT_RAISE;
 const SECURE_ALL_LOCKS: u32 = SECURE_ALL_BITS << 1;
 static PROC_NS_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Implementation ceiling for queued RT nodes charged to one (user_ns, ruid).
+/// RLIMIT_SIGPENDING may lower this value but cannot raise it.
+pub(crate) const SIGNAL_QUEUE_PER_USER_HARD_LIMIT: usize = 4_096;
+/// Implementation ceiling for all queued RT nodes in one root user-namespace
+/// hierarchy. Descendant NEWUSER namespaces share this account.
+pub(crate) const SIGNAL_QUEUE_GLOBAL_HARD_LIMIT: usize = 16_384;
 
 #[derive(Clone)]
 pub(crate) struct CgroupNamespace {
@@ -120,11 +142,12 @@ impl PidNamespace {
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct UserNamespace {
     id: u64,
     parent: Option<Arc<UserNamespace>>,
     owner_uid: u32,
+    signal_accounts: SignalAccountRegistryMutex<HashMap<u32, Weak<SignalQueueAccount>>>,
+    global_signal_account: Arc<SignalQueueAccount>,
 }
 
 impl UserNamespace {
@@ -133,10 +156,18 @@ impl UserNamespace {
     }
 
     fn try_new(parent: Option<Arc<Self>>, owner_uid: u32) -> AxResult<Arc<Self>> {
+        let global_signal_account = if let Some(parent) = parent.as_ref() {
+            parent.global_signal_account.clone()
+        } else {
+            SignalQueueAccount::try_new(SIGNAL_QUEUE_GLOBAL_HARD_LIMIT)
+                .map_err(|_| AxError::NoMemory)?
+        };
         Arc::try_new(Self {
             id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
             parent,
             owner_uid,
+            signal_accounts: SignalAccountRegistryMutex::new(HashMap::new()),
+            global_signal_account,
         })
         .map_err(|_| AxError::NoMemory)
     }
@@ -155,6 +186,45 @@ impl UserNamespace {
 
     pub(crate) fn owner_uid(&self) -> u32 {
         self.owner_uid
+    }
+
+    /// Returns the RT signal queue accounts for a real UID in this namespace.
+    ///
+    /// Registry allocation is fallible and happens under a sleepable mutex,
+    /// never under a signal pending SpinNoIrq guard. A losing candidate is
+    /// dropped only after the registry guard has been released.
+    pub(crate) fn try_signal_queue_accounts(
+        &self,
+        real_uid: u32,
+    ) -> AxResult<(Arc<SignalQueueAccount>, Arc<SignalQueueAccount>)> {
+        let existing = {
+            let accounts = self.signal_accounts.lock();
+            accounts.get(&real_uid).and_then(Weak::upgrade)
+        };
+        if let Some(existing) = existing {
+            return Ok((existing, self.global_signal_account.clone()));
+        }
+
+        let candidate = SignalQueueAccount::try_new(SIGNAL_QUEUE_PER_USER_HARD_LIMIT)
+            .map_err(|_| AxError::NoMemory)?;
+        let winner = {
+            let mut accounts = self.signal_accounts.lock();
+            if let Some(existing) = accounts.get(&real_uid).and_then(Weak::upgrade) {
+                Some(existing)
+            } else {
+                accounts.retain(|_, account| account.strong_count() != 0);
+                accounts.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                accounts.insert(real_uid, Arc::downgrade(&candidate));
+                None
+            }
+        };
+
+        if let Some(winner) = winner {
+            drop(candidate);
+            Ok((winner, self.global_signal_account.clone()))
+        } else {
+            Ok((candidate, self.global_signal_account.clone()))
+        }
     }
 
     pub(crate) fn proc_inode(&self) -> u64 {
@@ -559,6 +629,8 @@ pub struct ProcessData {
     job_ctl: SpinNoIrq<JobControlState>,
     /// ptrace ownership and options shared by all threads in the process.
     ptrace_ctl: SpinNoIrq<PtraceControlState>,
+    /// Exact queued signal retained while stopped at a ptrace delivery boundary.
+    ptrace_signal: Mutex<Option<PtraceSignalRecord>>,
     /// Processes currently traced by this process.
     ptrace_tracees: SpinNoIrq<Vec<Pid>>,
     /// Multi-thread exec coordination state.
@@ -721,6 +793,7 @@ impl ProcessData {
 
             job_ctl: SpinNoIrq::new(JobControlState::default()),
             ptrace_ctl: SpinNoIrq::new(PtraceControlState::default()),
+            ptrace_signal: Mutex::new(None),
             ptrace_tracees: SpinNoIrq::new(Vec::new()),
             exec_ctl: SpinNoIrq::new(ExecControlState::default()),
             vfork_ctl: SpinNoIrq::new(VforkControlState::default()),
@@ -1540,19 +1613,115 @@ impl ProcessData {
         true
     }
 
-    pub fn end_ptrace(&self, tracer: Pid) -> bool {
+    /// Stops at a signal-delivery boundary while transferring exact queue
+    /// ownership into ptrace state. On failure the caller gets the untouched
+    /// record back and may publish it normally.
+    pub(crate) fn try_ptrace_signal_stop(
+        &self,
+        record: PtraceSignalRecord,
+    ) -> Result<(), PtraceSignalRecord> {
+        let mut pending = self.ptrace_signal.lock();
+        let ptrace_ctl = self.ptrace_ctl.lock();
+        let mut job_ctl = self.job_ctl.lock();
+        if ptrace_ctl.tracer.is_none() || job_ctl.state != StopState::Running || pending.is_some() {
+            return Err(record);
+        }
+
+        job_ctl.state = StopState::Stopped;
+        job_ctl.stop_signal = record.info().signo() as u8;
+        job_ctl.stop_kind = StopKind::Ptrace;
+        job_ctl.stop_reported = false;
+        job_ctl.continued = false;
+        *pending = Some(record);
+        Ok(())
+    }
+
+    pub(crate) fn ptrace_signal_info(&self) -> Option<SignalInfo> {
+        self.ptrace_signal
+            .lock()
+            .as_ref()
+            .map(|record| record.info().clone())
+    }
+
+    pub(crate) fn replace_ptrace_signal_info(&self, info: SignalInfo) -> bool {
+        let mut pending = self.ptrace_signal.lock();
+        pending
+            .as_mut()
+            .is_some_and(|record| record.replace_info(info).is_some())
+    }
+
+    /// Resumes a ptrace stop and atomically takes its retained signal record.
+    /// If `detach` is true, tracer ownership is cleared under the same gate so
+    /// no new delivery stop can appear between resume and detach.
+    pub(crate) fn resume_ptrace(
+        &self,
+        tracer: Pid,
+        detach: bool,
+    ) -> Option<(ContinueResult, Option<PtraceSignalRecord>)> {
+        let mut pending = self.ptrace_signal.lock();
         let mut ptrace_ctl = self.ptrace_ctl.lock();
         if ptrace_ctl.tracer != Some(tracer) {
-            return false;
+            return None;
         }
-        *ptrace_ctl = PtraceControlState::default();
+        if detach {
+            *ptrace_ctl = PtraceControlState::default();
+        }
+
+        let mut job_ctl = self.job_ctl.lock();
+        let result = match job_ctl.state {
+            StopState::Running => ContinueResult::None,
+            StopState::Stopping => {
+                job_ctl.state = StopState::Running;
+                ContinueResult::CanceledStopping
+            }
+            StopState::Stopped => {
+                job_ctl.state = StopState::Running;
+                if job_ctl.stop_kind == StopKind::JobControl {
+                    job_ctl.continued = true;
+                }
+                ContinueResult::ResumedStopped
+            }
+        };
+        let record = pending.take();
+        drop(job_ctl);
+        drop(ptrace_ctl);
+        drop(pending);
+        Some((result, record))
+    }
+
+    /// Publishes the wake only after the caller has resolved the retained
+    /// ptrace signal record. This prevents a tracee from returning to user mode
+    /// before a requested reinjection has become pending.
+    pub(crate) fn finish_ptrace_resume(&self, result: ContinueResult) {
+        if result != ContinueResult::None {
+            self.stop_event.wake();
+        }
+    }
+
+    pub fn end_ptrace(&self, tracer: Pid) -> bool {
+        let Some((result, record)) = self.resume_ptrace(tracer, true) else {
+            return false;
+        };
+        if let Some(record) = record {
+            super::timer::acknowledge_posix_timer_signal(self, record.info());
+            drop(record);
+        }
+        self.finish_ptrace_resume(result);
         true
     }
 
     pub fn clear_ptrace(&self) -> Option<Pid> {
-        let mut ptrace_ctl = self.ptrace_ctl.lock();
-        let tracer = ptrace_ctl.tracer;
-        *ptrace_ctl = PtraceControlState::default();
+        let (tracer, record) = {
+            let mut pending = self.ptrace_signal.lock();
+            let mut ptrace_ctl = self.ptrace_ctl.lock();
+            let tracer = ptrace_ctl.tracer;
+            *ptrace_ctl = PtraceControlState::default();
+            (tracer, pending.take())
+        };
+        if let Some(record) = record {
+            super::timer::acknowledge_posix_timer_signal(self, record.info());
+            drop(record);
+        }
         tracer
     }
 
@@ -1632,6 +1801,7 @@ impl ProcessData {
 
     /// Resumes or cancels a job-control stop transition.
     pub(crate) fn continue_job(&self) -> ContinueResult {
+        let traced = self.ptrace_tracer().is_some();
         let result = {
             let mut job_ctl = self.job_ctl.lock();
             match job_ctl.state {
@@ -1641,6 +1811,9 @@ impl ProcessData {
                     ContinueResult::CanceledStopping
                 }
                 StopState::Stopped => {
+                    if job_ctl.stop_kind == StopKind::Ptrace && traced {
+                        return ContinueResult::None;
+                    }
                     job_ctl.state = StopState::Running;
                     if job_ctl.stop_kind == StopKind::JobControl {
                         job_ctl.continued = true;
@@ -1833,5 +2006,89 @@ impl Drop for ProcessData {
     fn drop(&mut self) {
         let executable = *self.executable.lock();
         executable::release(executable);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use alloc::sync::Arc;
+    use std::{sync::Barrier, thread, vec::Vec};
+
+    use super::{SIGNAL_QUEUE_GLOBAL_HARD_LIMIT, SIGNAL_QUEUE_PER_USER_HARD_LIMIT, UserNamespace};
+
+    #[test]
+    fn signal_accounts_are_keyed_by_user_namespace_and_real_uid() {
+        let first_ns = UserNamespace::try_new(None, 0).unwrap();
+        let second_ns = UserNamespace::try_new(None, 0).unwrap();
+
+        let (first, first_global) = first_ns.try_signal_queue_accounts(1000).unwrap();
+        let (same, same_global) = first_ns.try_signal_queue_accounts(1000).unwrap();
+        let (other_uid, _) = first_ns.try_signal_queue_accounts(1001).unwrap();
+        let (other_ns, other_global) = second_ns.try_signal_queue_accounts(1000).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(Arc::ptr_eq(&first_global, &same_global));
+        assert!(!Arc::ptr_eq(&first, &other_uid));
+        assert!(!Arc::ptr_eq(&first, &other_ns));
+        assert!(!Arc::ptr_eq(&first_global, &other_global));
+    }
+
+    #[test]
+    fn descendant_user_namespaces_share_the_root_global_account_only() {
+        let root = UserNamespace::try_new(None, 0).unwrap();
+        let child = UserNamespace::try_new(Some(root.clone()), 1000).unwrap();
+        let grandchild = UserNamespace::try_new(Some(child.clone()), 1000).unwrap();
+
+        let (root_user, root_global) = root.try_signal_queue_accounts(1000).unwrap();
+        let (child_user, child_global) = child.try_signal_queue_accounts(1000).unwrap();
+        let (grandchild_user, grandchild_global) =
+            grandchild.try_signal_queue_accounts(1000).unwrap();
+
+        assert!(!Arc::ptr_eq(&root_user, &child_user));
+        assert!(!Arc::ptr_eq(&child_user, &grandchild_user));
+        assert!(Arc::ptr_eq(&root_global, &child_global));
+        assert!(Arc::ptr_eq(&root_global, &grandchild_global));
+    }
+
+    #[test]
+    fn concurrent_registry_admission_publishes_one_live_winner() {
+        const THREADS: usize = 16;
+
+        let namespace = UserNamespace::try_new(None, 0).unwrap();
+        let start = Arc::new(Barrier::new(THREADS));
+        let hold = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let namespace = namespace.clone();
+                let start = start.clone();
+                let hold = hold.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    let account = namespace.try_signal_queue_accounts(1000).unwrap().0;
+                    // Keep every returned strong reference alive until all
+                    // racing lookups have completed.
+                    hold.wait();
+                    account
+                })
+            })
+            .collect();
+        let accounts: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+
+        assert!(
+            accounts[1..]
+                .iter()
+                .all(|account| Arc::ptr_eq(&accounts[0], account))
+        );
+    }
+
+    #[test]
+    fn implementation_signal_queue_ceilings_are_bounded() {
+        assert_eq!(SIGNAL_QUEUE_PER_USER_HARD_LIMIT, 4_096);
+        assert_eq!(SIGNAL_QUEUE_GLOBAL_HARD_LIMIT, 16_384);
     }
 }

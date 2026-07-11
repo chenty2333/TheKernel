@@ -524,6 +524,7 @@ fn decode_timer_notify(event: Option<RawSigevent>) -> AxResult<PosixTimerNotify>
         return Ok(PosixTimerNotify::Signal {
             signo: Signo::SIGALRM,
             target_tid: None,
+            value: None,
         });
     };
 
@@ -534,6 +535,7 @@ fn decode_timer_notify(event: Option<RawSigevent>) -> AxResult<PosixTimerNotify>
             Ok(PosixTimerNotify::Signal {
                 signo,
                 target_tid: None,
+                value: Some(event.value_ptr_address()),
             })
         }
         SIGEV_THREAD_ID => {
@@ -545,6 +547,7 @@ fn decode_timer_notify(event: Option<RawSigevent>) -> AxResult<PosixTimerNotify>
             Ok(PosixTimerNotify::Signal {
                 signo,
                 target_tid: Some(tid as _),
+                value: Some(event.value_ptr_address()),
             })
         }
         _ => Err(AxError::InvalidInput),
@@ -655,8 +658,7 @@ pub fn sys_timer_settime(
         let old_remaining = timer_remaining(timer);
 
         timer.interval = interval;
-        timer.overrun = 0;
-        timer.signal_pending = false;
+        timer.reset_signal_delivery();
         timer.sequence = timer.sequence.wrapping_add(1);
         timer.deadline = if value.is_zero() {
             None

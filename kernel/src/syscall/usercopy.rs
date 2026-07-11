@@ -68,11 +68,6 @@ impl RawSigevent {
         self.signo
     }
 
-    pub(crate) fn value_int(&self) -> i32 {
-        // SAFETY: every RawSigval bit pattern is valid as i32.
-        unsafe { self.value.int }
-    }
-
     pub(crate) fn value_ptr_address(&self) -> usize {
         // SAFETY: every RawSigval bit pattern is valid as usize.
         unsafe { self.value.bits }

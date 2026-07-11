@@ -34,6 +34,10 @@ keywords = [
 license = "Apache-2.0"
 repository = "https://github.com/Starry-OS/starry-signal"
 
+[features]
+default = []
+multitask = ["axsync/multitask"]
+
 [lib]
 name = "starry_signal"
 path = "src/lib.rs"
@@ -66,6 +70,10 @@ path = "tests/types.rs"
 version = "0.3.0-preview.5"
 features = ["uspace"]
 
+[dependencies.axsync]
+version = "0.3.0-preview.2"
+default-features = false
+
 [dependencies.bitflags]
 version = "2.6"
 
@@ -83,6 +91,7 @@ default-features = false
 
 [dependencies.kspin]
 version = "0.1"
+features = ["smp"]
 
 [dependencies.linux-raw-sys]
 version = "0.12"

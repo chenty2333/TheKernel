@@ -21,11 +21,25 @@ impl TestEnv {
 #[test]
 fn send_wakes_sets_pending() {
     let env = TestEnv::new();
-    let _thr = ThreadSignalManager::new(9, env.proc.clone());
+    let thr = ThreadSignalManager::try_new(env.proc.clone()).unwrap();
+    thr.try_register(9).unwrap().commit();
     let sig = SignalInfo::new_user(Signo::SIGTERM, 0, 100);
 
-    assert_eq!(env.proc.send_signal(sig.clone()), Some(9));
+    assert_eq!(env.proc.send_unqueued_signal(sig.clone()), Some(9));
     assert!(env.proc.pending().has(Signo::SIGTERM));
+}
+
+#[test]
+fn rolled_back_registration_is_never_selected_for_wakeup() {
+    let env = TestEnv::new();
+    let rolled_back = ThreadSignalManager::try_new(env.proc.clone()).unwrap();
+    drop(rolled_back.try_register(8).unwrap());
+
+    let live = ThreadSignalManager::try_new(env.proc.clone()).unwrap();
+    live.try_register(9).unwrap().commit();
+
+    let sig = SignalInfo::new_user(Signo::SIGTERM, 0, 100);
+    assert_eq!(env.proc.send_unqueued_signal(sig), Some(9));
 }
 
 #[test]
@@ -34,7 +48,7 @@ fn signal_ignore() {
     env.proc.actions.lock()[Signo::SIGTERM].disposition = SignalDisposition::Ignore;
     let sig = SignalInfo::new_user(Signo::SIGTERM, 0, 100);
 
-    assert_eq!(env.proc.send_signal(sig), None);
+    assert_eq!(env.proc.send_unqueued_signal(sig), None);
     assert!(!env.proc.pending().has(Signo::SIGTERM));
 }
 

@@ -1,7 +1,4 @@
-use alloc::{
-    alloc::AllocError,
-    sync::{Arc, Weak},
-};
+use alloc::{alloc::AllocError, sync::Arc, vec::Vec};
 use core::{
     alloc::Layout,
     mem::offset_of,
@@ -12,12 +9,20 @@ use axcpu::uspace::UserContext;
 use kspin::SpinNoIrq;
 use starry_vm::{VmMutPtr, VmPtr, VmResult};
 
-use super::ProcessSignalManager;
+use super::{ProcessSignalManager, RegisteredThread};
 use crate::{
-    DefaultSignalAction, PendingSignals, SignalAction, SignalActionFlags, SignalDisposition,
-    SignalInfo, SignalOSAction, SignalSet, SignalStack, Signo,
+    DefaultSignalAction, DetachedSignal, PendingSignals, PreparedSignal, SignalAction,
+    SignalActionFlags, SignalDisposition, SignalInfo, SignalOSAction, SignalSet, SignalStack,
+    Signo,
     arch::{SignalContextError, UContext},
 };
+
+/// Result of publishing one thread-directed signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadSignalSendOutcome {
+    pub published: bool,
+    pub wake: bool,
+}
 
 /// The userspace ABI frame created for a signal handler.
 ///
@@ -101,32 +106,32 @@ pub struct ThreadSignalManager {
     possibly_has_signal: AtomicBool,
 }
 
-/// Removes a newly registered weak endpoint if the owning thread fails to
+/// Deactivates a newly registered endpoint if the owning thread fails to
 /// finish construction. Successful lifecycle publication disarms the token.
+///
+/// Rollback is one atomic store. It neither takes a lock nor destroys the
+/// endpoint; the next registry publication compacts inactive entries.
 #[must_use = "dropping the token rolls back thread-signal registration"]
 pub struct ThreadSignalRegistration {
-    manager: Arc<ThreadSignalManager>,
-    tid: u32,
-    active: bool,
+    entry: Arc<RegisteredThread>,
+    process: Arc<ProcessSignalManager>,
+    rollback: bool,
 }
 
 impl ThreadSignalRegistration {
     pub fn commit(mut self) {
-        self.active = false;
+        let update = self.process.action_update.lock();
+        self.entry.activate();
+        self.rollback = false;
+        drop(update);
     }
 }
 
 impl Drop for ThreadSignalRegistration {
     fn drop(&mut self) {
-        if !self.active {
-            return;
+        if self.rollback {
+            self.entry.deactivate();
         }
-        let expected = Arc::downgrade(&self.manager);
-        self.manager
-            .proc
-            .children
-            .lock()
-            .retain(|(tid, thread)| *tid != self.tid || !thread.ptr_eq(&expected));
     }
 }
 
@@ -152,36 +157,60 @@ impl ThreadSignalManager {
         self: &Arc<Self>,
         tid: u32,
     ) -> Result<ThreadSignalRegistration, AllocError> {
-        let mut children = self.proc.children.lock();
-        children.try_reserve(1).map_err(|_| AllocError)?;
-        children.push((tid, Arc::downgrade(self)));
-        Ok(ThreadSignalRegistration {
-            manager: self.clone(),
-            tid,
-            active: true,
-        })
-    }
+        let entry = RegisteredThread::try_new(tid, self)?;
+        let update = self.proc.action_update.lock();
+        let registry = self.proc.children_registry_snapshot();
+        let len = registry.as_deref().map_or(0, Vec::len);
+        let capacity = len.checked_add(1).ok_or(AllocError)?;
+        let mut replacement = Vec::new();
+        replacement
+            .try_reserve_exact(capacity)
+            .map_err(|_| AllocError)?;
+        if let Some(registry) = registry.as_deref() {
+            for registered in registry {
+                if registered.is_live() {
+                    replacement.push(registered.clone());
+                }
+            }
+        }
+        replacement.push(entry.clone());
+        let replacement = Arc::try_new(replacement).map_err(|_| AllocError)?;
 
-    /// Constructs and registers a signal endpoint using the allocator's
-    /// configured OOM handler. New kernel lifecycle paths should prefer the
-    /// two fallible methods above.
-    pub fn new(tid: u32, proc: Arc<ProcessSignalManager>) -> Arc<Self> {
-        let this = Self::try_new(proc)
-            .unwrap_or_else(|_| alloc::alloc::handle_alloc_error(Layout::new::<Self>()));
-        let registration = this.try_register(tid).unwrap_or_else(|_| {
-            alloc::alloc::handle_alloc_error(Layout::new::<(u32, Weak<Self>)>())
-        });
-        registration.commit();
-        this
+        let previous = {
+            let mut children = self.proc.children.lock();
+            children.replace(replacement)
+        };
+
+        // The immutable registry and all of its owned Arcs are allocated and
+        // destroyed outside the publication spin lock. The shared update
+        // mutex serializes this pointer swap with disposition transitions.
+        drop(update);
+        drop(previous);
+        drop(registry);
+        Ok(ThreadSignalRegistration {
+            entry,
+            process: self.proc.clone(),
+            rollback: true,
+        })
     }
 
     /// Dequeues a signal from the thread's pending signals.
     #[must_use]
     pub fn dequeue_signal(&self, mask: &SignalSet) -> Option<SignalInfo> {
-        self.pending
-            .lock()
-            .dequeue_signal(mask)
+        self.dequeue_thread_signal(mask)
             .or_else(|| self.proc.dequeue_signal(mask))
+    }
+
+    fn dequeue_thread_signal(&self, mask: &SignalSet) -> Option<SignalInfo> {
+        let signal = {
+            let mut pending = self.pending.lock();
+            let signal = pending.dequeue_signal(mask);
+            if pending.set.is_empty() {
+                self.possibly_has_signal.store(false, Ordering::Release);
+            }
+            signal
+        };
+        signal.map(|signal| signal.into_info())
     }
 
     pub fn process(&self) -> &Arc<ProcessSignalManager> {
@@ -270,13 +299,9 @@ impl ThreadSignalManager {
         drop(blocked);
 
         loop {
-            let sig = match self.pending.lock().dequeue_signal(&mask) {
-                Some(sig) => Some(sig),
-                None => {
-                    self.possibly_has_signal.store(false, Ordering::Release);
-                    self.proc.dequeue_signal(&mask)
-                }
-            }?;
+            let sig = self
+                .dequeue_thread_signal(&mask)
+                .or_else(|| self.proc.dequeue_signal(&mask))?;
             let action = self.proc.actions.lock()[sig.signo()].clone();
             let restartable_handler = matches!(action.disposition, SignalDisposition::Handler(_))
                 && action.flags.contains(SignalActionFlags::RESTART);
@@ -340,24 +365,75 @@ impl ThreadSignalManager {
         self.set_blocked(prepared.blocked);
     }
 
-    /// Sends a signal to the thread.
+    /// Sends a signal, preparing any queue record outside spin locks.
     ///
-    /// Returns `true` if the task was woken up by the signal (i.e. the signal
-    /// was not blocked and not ignored).
+    /// Returns publication and wakeup state separately.
     ///
-    /// See [`ProcessSignalManager::send_signal`] for the process-level version.
-    #[must_use]
-    pub fn send_signal(&self, sig: SignalInfo) -> bool {
+    /// The preparation closure is skipped for ignored signals and coalesced
+    /// standard signals, and is never called under a pending/actions lock.
+    #[must_use = "the caller must handle queue-admission failure"]
+    pub fn try_send_signal_with<E>(
+        &self,
+        sig: SignalInfo,
+        prepare: impl FnOnce(SignalInfo) -> Result<PreparedSignal, E>,
+    ) -> Result<ThreadSignalSendOutcome, E> {
         let signo = sig.signo();
         let blocked = self.signal_blocked(signo);
         if self.proc.signal_ignored(signo) && !blocked && !self.signal_real_blocked(signo) {
-            return false;
+            return Ok(ThreadSignalSendOutcome {
+                published: false,
+                wake: false,
+            });
         }
 
-        if self.pending.lock().put_signal(sig) {
-            self.possibly_has_signal.store(true, Ordering::Release);
+        let already_pending = !signo.is_realtime() && self.pending.lock().set.has(signo);
+        let mut published = false;
+        if !already_pending {
+            let mut prepared = Some(prepare(sig)?);
+            let outcome = {
+                let actions = self.proc.actions.lock();
+                let blocked = self.signal_blocked(signo);
+                let ignored = match &actions[signo].disposition {
+                    SignalDisposition::Ignore => true,
+                    SignalDisposition::Default => {
+                        matches!(signo.default_action(), DefaultSignalAction::Ignore)
+                    }
+                    SignalDisposition::Handler(_) => false,
+                };
+                if ignored && !blocked && !self.signal_real_blocked(signo) {
+                    None
+                } else {
+                    let mut pending = self.pending.lock();
+                    Some(pending.publish(prepared.take().unwrap()))
+                }
+            };
+            // Drop a node made obsolete by a disposition transition only
+            // after releasing every signal-state spin guard.
+            drop(prepared);
+            let Some(outcome) = outcome else {
+                return Ok(ThreadSignalSendOutcome {
+                    published: false,
+                    wake: false,
+                });
+            };
+            published = outcome.finish();
         }
-        !blocked
+        self.possibly_has_signal.store(true, Ordering::Release);
+        Ok(ThreadSignalSendOutcome {
+            published,
+            wake: !blocked,
+        })
+    }
+
+    /// Sends a signal through the allocation-free fallback path.
+    #[must_use]
+    pub fn send_unqueued_signal(&self, sig: SignalInfo) -> bool {
+        match self.try_send_signal_with(sig, |sig| {
+            Ok::<_, core::convert::Infallible>(PreparedSignal::unqueued(sig))
+        }) {
+            Ok(outcome) => outcome.wake,
+            Err(error) => match error {},
+        }
     }
 
     /// Gets the blocked signals.
@@ -404,7 +480,36 @@ impl ThreadSignalManager {
         self.pending.lock().set | self.proc.pending()
     }
 
-    pub fn pending_realtime_count(&self) -> usize {
-        self.pending.lock().realtime_count() + self.proc.pending_realtime_count()
+    /// Detaches all thread-private pending records under the lock and destroys
+    /// them after releasing it.
+    pub fn flush_pending(&self) {
+        let detached = self.pending.lock().take_all();
+        self.possibly_has_signal.store(false, Ordering::Release);
+        drop(detached);
+    }
+
+    /// Detaches every thread-directed instance of one signal and releases
+    /// queue ownership after dropping the pending lock.
+    pub fn flush_signal(&self, signo: Signo) {
+        let (detached, empty) = {
+            let mut pending = self.pending.lock();
+            let detached = pending.take_signal(signo);
+            (detached, pending.set.is_empty())
+        };
+        if empty {
+            self.possibly_has_signal.store(false, Ordering::Release);
+        }
+        drop(detached);
+    }
+
+    pub(crate) fn detach_signal_into(&self, signo: Signo, detached: &mut DetachedSignal) {
+        let empty = {
+            let mut pending = self.pending.lock();
+            pending.detach_signal_into(signo, detached);
+            pending.set.is_empty()
+        };
+        if empty {
+            self.possibly_has_signal.store(false, Ordering::Release);
+        }
     }
 }

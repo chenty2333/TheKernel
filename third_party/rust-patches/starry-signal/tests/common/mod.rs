@@ -8,7 +8,9 @@ use std::{
 
 use extern_trait::extern_trait;
 use kspin::SpinNoIrq;
-use starry_signal::api::{ProcessSignalManager, SignalActions, ThreadSignalManager};
+use starry_signal::api::{
+    ProcessSignalManager, SignalActions, ThreadSignalManager, ThreadSignalRegistration,
+};
 use starry_vm::{VmError, VmIo, VmResult};
 
 static POOL: LazyLock<Mutex<Box<[u8]>>> = LazyLock::new(|| {
@@ -65,11 +67,22 @@ unsafe impl VmIo for Vm {
 
 pub const TID: u32 = 7;
 
-pub fn new_test_env() -> (Arc<ProcessSignalManager>, Arc<ThreadSignalManager>) {
+pub fn new_unregistered_test_env() -> (
+    Arc<ProcessSignalManager>,
+    Arc<ThreadSignalManager>,
+    ThreadSignalRegistration,
+) {
     let proc = Arc::new(ProcessSignalManager::new(
         Arc::new(SpinNoIrq::new(SignalActions::default())),
         0,
     ));
-    let thr = ThreadSignalManager::new(TID, proc.clone());
+    let thr = ThreadSignalManager::try_new(proc.clone()).unwrap();
+    let registration = thr.try_register(TID).unwrap();
+    (proc, thr, registration)
+}
+
+pub fn new_test_env() -> (Arc<ProcessSignalManager>, Arc<ThreadSignalManager>) {
+    let (proc, thr, registration) = new_unregistered_test_env();
+    registration.commit();
     (proc, thr)
 }

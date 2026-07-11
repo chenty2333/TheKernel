@@ -6,7 +6,7 @@ use core::{
 };
 
 use linux_raw_sys::general::{
-    RLIM_INFINITY, RLIM_NLIMITS, RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_STACK,
+    RLIM_INFINITY, RLIM_NLIMITS, RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_SIGPENDING, RLIMIT_STACK,
 };
 
 /// The maximum number of open files
@@ -30,7 +30,7 @@ pub fn set_nr_open_limit(value: u64) -> bool {
 }
 
 /// The limit for a specific resource
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct Rlimit {
     /// The current limit for the resource (soft)
     pub current: u64,
@@ -58,6 +58,7 @@ impl From<u64> for Rlimit {
 }
 
 /// Process resource limits
+#[derive(Clone)]
 pub struct Rlimits([Rlimit; RLIM_NLIMITS as usize]);
 
 impl Default for Rlimits {
@@ -71,6 +72,10 @@ impl Default for Rlimits {
         );
         result[RLIMIT_CORE] = Rlimit::new(0, RLIM_INFINITY as i64 as u64);
         result[RLIMIT_NOFILE] = (AX_FILE_LIMIT as u64).into();
+        // Explicit bounded default for per-(user namespace, real UID) queued
+        // real-time signals. The global implementation ceiling is enforced by
+        // the shared signal queue account independently of this rlimit.
+        result[RLIMIT_SIGPENDING] = 1_024.into();
         result
     }
 }
@@ -86,5 +91,33 @@ impl Index<u32> for Rlimits {
 impl IndexMut<u32> for Rlimits {
     fn index_mut(&mut self, index: u32) -> &mut Self::Output {
         &mut self.0[index as usize]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use linux_raw_sys::general::{RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_SIGPENDING};
+
+    use super::{Rlimit, Rlimits};
+
+    #[test]
+    fn sigpending_default_is_explicitly_bounded() {
+        let limits = Rlimits::default();
+        assert_eq!(limits[RLIMIT_SIGPENDING].current, 1_024);
+        assert_eq!(limits[RLIMIT_SIGPENDING].max, 1_024);
+    }
+
+    #[test]
+    fn cloning_preserves_every_soft_and_hard_value() {
+        let mut parent = Rlimits::default();
+        parent[RLIMIT_CORE] = Rlimit::new(17, 23);
+        parent[RLIMIT_NOFILE] = Rlimit::new(41, 47);
+        parent[RLIMIT_SIGPENDING] = Rlimit::new(53, 59);
+
+        let child = parent.clone();
+        for resource in 0..linux_raw_sys::general::RLIM_NLIMITS {
+            assert_eq!(child[resource].current, parent[resource].current);
+            assert_eq!(child[resource].max, parent[resource].max);
+        }
     }
 }

@@ -1,89 +1,261 @@
-use starry_signal::{PendingSignals, SignalInfo, SignalSet, Signo};
+use std::sync::Arc;
 
-#[test]
-fn standard_signal() {
-    let mut ps = PendingSignals::default();
-    let sig1 = SignalInfo::new_user(Signo::SIGINT, 9, 9);
-    assert!(ps.put_signal(sig1.clone()));
-    assert!(!ps.put_signal(sig1));
-    let sig2 = SignalInfo::new_user(Signo::SIGTERM, 9, 9);
-    let sig3 = SignalInfo::new_user(Signo::SIGHUP, 9, 9);
+use kspin::SpinNoIrq;
+use starry_signal::{
+    PreparedSignal, SignalAction, SignalDisposition, SignalInfo, SignalQueueAccount, SignalSet,
+    Signo,
+    api::{ProcessSignalManager, SignalActions, ThreadSignalManager},
+};
 
-    let mut mask = SignalSet::default();
-    mask.add(Signo::SIGHUP);
-    mask.add(Signo::SIGTERM);
-    mask.add(Signo::SIGINT);
+fn new_test_env() -> (Arc<ProcessSignalManager>, Arc<ThreadSignalManager>) {
+    let process = Arc::new(ProcessSignalManager::new(
+        Arc::new(SpinNoIrq::new(SignalActions::default())),
+        0,
+    ));
+    let thread = ThreadSignalManager::try_new(process.clone()).unwrap();
+    thread.try_register(7).unwrap().commit();
+    (process, thread)
+}
 
-    assert!(ps.put_signal(sig3));
-    assert!(ps.put_signal(sig2));
-    assert_eq!(ps.dequeue_signal(&mask).unwrap().signo(), Signo::SIGHUP);
-    assert_eq!(ps.dequeue_signal(&mask).unwrap().signo(), Signo::SIGINT);
-    assert_eq!(ps.dequeue_signal(&mask).unwrap().signo(), Signo::SIGTERM);
-    assert!(ps.dequeue_signal(&mask).is_none());
+fn accounts(limit: usize) -> (Arc<SignalQueueAccount>, Arc<SignalQueueAccount>) {
+    (
+        SignalQueueAccount::try_new(limit).unwrap(),
+        SignalQueueAccount::try_new(limit).unwrap(),
+    )
+}
 
-    let sig4 = SignalInfo::new_user(Signo::SIGTERM, 9, 9);
-    let sig5 = SignalInfo::new_user(Signo::SIGQUIT, 9, 9);
-    assert!(ps.put_signal(sig4));
-    assert!(ps.put_signal(sig5));
-    assert_eq!(ps.dequeue_signal(&mask).unwrap().signo(), Signo::SIGTERM);
-    assert!(ps.set.has(Signo::SIGQUIT));
+fn send_accounted(
+    thread: &ThreadSignalManager,
+    info: SignalInfo,
+    user: &Arc<SignalQueueAccount>,
+    global: &Arc<SignalQueueAccount>,
+    limit: u64,
+) {
+    thread
+        .try_send_signal_with(info, |info| {
+            PreparedSignal::try_accounted(info, user, limit, global)
+        })
+        .unwrap();
+}
+
+fn all_signals() -> SignalSet {
+    !SignalSet::default()
 }
 
 #[test]
-fn realtime_signal() {
-    let mut ps = PendingSignals::default();
-    let sig1 = SignalInfo::new_user(Signo::SIGRT1, 9, 9);
-    let sig2 = SignalInfo::new_user(Signo::SIGRT3, 9, 9);
-    let sig3 = SignalInfo::new_user(Signo::SIGRTMIN, 9, 9);
-    let sig4 = SignalInfo::new_user(Signo::SIGRTMIN, 9, 9);
+fn send_outcome_distinguishes_owned_publication_from_coalescing() {
+    fn assert_send<T: Send>() {}
+    assert_send::<PreparedSignal>();
 
-    let mut mask = SignalSet::default();
-    mask.add(Signo::SIGRT3);
-    mask.add(Signo::SIGRT1);
-    mask.add(Signo::SIGRTMIN);
+    let (_proc, thread) = new_test_env();
+    let first = thread
+        .try_send_signal_with(SignalInfo::new_user(Signo::SIGINT, 1, 1), |info| {
+            Ok::<_, core::convert::Infallible>(PreparedSignal::unqueued(info))
+        })
+        .unwrap();
+    assert!(first.published);
 
-    assert!(ps.put_signal(sig1));
-    assert!(ps.put_signal(sig2));
-    assert!(ps.put_signal(sig3));
-    assert!(ps.put_signal(sig4));
-    assert_eq!(ps.dequeue_signal(&mask).unwrap().signo(), Signo::SIGRTMIN);
-    assert!(ps.set.has(Signo::SIGRTMIN));
-    assert_eq!(ps.dequeue_signal(&mask).unwrap().signo(), Signo::SIGRTMIN);
-    assert_eq!(ps.dequeue_signal(&mask).unwrap().signo(), Signo::SIGRT1);
-    assert_eq!(ps.dequeue_signal(&mask).unwrap().signo(), Signo::SIGRT3);
-    assert!(ps.dequeue_signal(&mask).is_none());
-
-    let sig5 = SignalInfo::new_user(Signo::SIGRT3, 9, 9);
-    let sig6 = SignalInfo::new_user(Signo::SIGRT2, 9, 9);
-    assert!(ps.put_signal(sig5));
-    assert!(ps.put_signal(sig6));
-    assert_eq!(ps.dequeue_signal(&mask).unwrap().signo(), Signo::SIGRT3);
-    assert!(ps.set.has(Signo::SIGRT2));
+    let coalesced = thread
+        .try_send_signal_with(SignalInfo::new_user(Signo::SIGINT, 2, 2), |info| {
+            Ok::<_, core::convert::Infallible>(PreparedSignal::unqueued(info))
+        })
+        .unwrap();
+    assert!(!coalesced.published);
+    assert_eq!(thread.dequeue_signal(&all_signals()).unwrap().code(), 1);
 }
 
 #[test]
-fn mixed_signal() {
-    let mut ps = PendingSignals::default();
-    let sig1 = SignalInfo::new_user(Signo::SIGINT, 9, 9);
-    let sig2 = SignalInfo::new_user(Signo::SIGTERM, 9, 9);
-    let sig3 = SignalInfo::new_user(Signo::SIGRTMIN, 9, 9);
-    let sig4 = SignalInfo::new_user(Signo::SIGRTMIN, 9, 9);
+fn prepared_signal_replaces_siginfo_without_changing_signo() {
+    let mut prepared = PreparedSignal::unqueued(SignalInfo::new_user(Signo::SIGRTMIN, 1, 10));
+    let replacement = SignalInfo::new_user(Signo::SIGRTMIN, 2, 20);
+    let old = prepared.replace_info(replacement).unwrap();
+    assert_eq!(old.code(), 1);
+    assert_eq!(prepared.info().code(), 2);
 
-    let mut mask = SignalSet::default();
-    mask.add(Signo::SIGINT);
-    mask.add(Signo::SIGTERM);
-    mask.add(Signo::SIGRTMIN);
+    let wrong_signo = SignalInfo::new_user(Signo::SIGRT1, 3, 30);
+    assert!(prepared.replace_info(wrong_signo).is_none());
+    assert_eq!(prepared.signo(), Signo::SIGRTMIN);
+}
 
-    assert!(ps.put_signal(sig1));
-    assert!(ps.put_signal(sig2));
-    assert!(ps.put_signal(sig3));
-    assert!(ps.put_signal(sig4));
+#[test]
+fn standard_signal_uses_fixed_slots_and_coalesces() {
+    let (_proc, thread) = new_test_env();
+    let (user, global) = accounts(1);
+    send_accounted(
+        &thread,
+        SignalInfo::new_user(Signo::SIGINT, 9, 9),
+        &user,
+        &global,
+        0,
+    );
+    send_accounted(
+        &thread,
+        SignalInfo::new_user(Signo::SIGINT, 10, 10),
+        &user,
+        &global,
+        0,
+    );
 
-    assert_eq!(ps.dequeue_signal(&mask).unwrap().signo(), Signo::SIGINT);
-    assert_eq!(ps.dequeue_signal(&mask).unwrap().signo(), Signo::SIGTERM);
+    assert_eq!(user.queued(), 0);
+    assert_eq!(global.queued(), 0);
+    assert_eq!(thread.dequeue_signal(&all_signals()).unwrap().code(), 9);
+    assert!(thread.dequeue_signal(&all_signals()).is_none());
+}
 
-    assert_eq!(ps.dequeue_signal(&mask).unwrap().signo(), Signo::SIGRTMIN);
-    assert!(ps.set.has(Signo::SIGRTMIN));
-    assert_eq!(ps.dequeue_signal(&mask).unwrap().signo(), Signo::SIGRTMIN);
-    assert!(ps.dequeue_signal(&mask).is_none());
+#[test]
+fn realtime_signal_is_fifo_with_lowest_signo_priority() {
+    let (_proc, thread) = new_test_env();
+    let (user, global) = accounts(8);
+    for (signo, code) in [
+        (Signo::SIGRT2, 20),
+        (Signo::SIGRTMIN, 10),
+        (Signo::SIGRTMIN, 11),
+        (Signo::SIGRT1, 15),
+    ] {
+        send_accounted(
+            &thread,
+            SignalInfo::new_user(signo, code, 9),
+            &user,
+            &global,
+            8,
+        );
+    }
+
+    assert_eq!(user.queued(), 4);
+    let delivered: Vec<_> = (0..4)
+        .map(|_| thread.dequeue_signal(&all_signals()).unwrap())
+        .map(|info| (info.signo(), info.code()))
+        .collect();
+    assert_eq!(
+        delivered,
+        [
+            (Signo::SIGRTMIN, 10),
+            (Signo::SIGRTMIN, 11),
+            (Signo::SIGRT1, 15),
+            (Signo::SIGRT2, 20),
+        ]
+    );
+    assert_eq!(user.queued(), 0);
+    assert_eq!(global.queued(), 0);
+}
+
+#[test]
+fn process_and_thread_pending_share_one_account() {
+    let (process, thread) = new_test_env();
+    let (user, global) = accounts(2);
+    process
+        .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1), |info| {
+            PreparedSignal::try_accounted(info, &user, 2, &global)
+        })
+        .unwrap();
+    send_accounted(
+        &thread,
+        SignalInfo::new_user(Signo::SIGRT1, 2, 2),
+        &user,
+        &global,
+        2,
+    );
+    assert_eq!(user.queued(), 2);
+
+    let rejected = thread.try_send_signal_with(SignalInfo::new_user(Signo::SIGRT2, 3, 3), |info| {
+        PreparedSignal::try_accounted(info, &user, 2, &global)
+    });
+    assert!(rejected.is_err());
+    assert_eq!(user.queued(), 2);
+
+    assert!(thread.dequeue_signal(&all_signals()).is_some());
+    assert!(thread.dequeue_signal(&all_signals()).is_some());
+    assert_eq!(user.queued(), 0);
+}
+
+#[test]
+fn flush_one_signal_refunds_process_and_thread_queues_precisely() {
+    let (process, thread) = new_test_env();
+    let (user, global) = accounts(8);
+    for (signo, code) in [(Signo::SIGRTMIN, 1), (Signo::SIGRT1, 2)] {
+        process
+            .try_send_signal_with(SignalInfo::new_user(signo, code, 1), |info| {
+                PreparedSignal::try_accounted(info, &user, 8, &global)
+            })
+            .unwrap();
+        send_accounted(
+            &thread,
+            SignalInfo::new_user(signo, code + 10, 1),
+            &user,
+            &global,
+            8,
+        );
+    }
+    assert_eq!(user.queued(), 4);
+
+    process.flush_signal(Signo::SIGRTMIN);
+    assert_eq!(user.queued(), 3);
+    thread.flush_signal(Signo::SIGRTMIN);
+    assert_eq!(user.queued(), 2);
+    assert_eq!(global.queued(), 2);
+
+    let delivered: Vec<_> = (0..2)
+        .map(|_| thread.dequeue_signal(&all_signals()).unwrap())
+        .map(|info| (info.signo(), info.code()))
+        .collect();
+    assert_eq!(delivered, [(Signo::SIGRT1, 12), (Signo::SIGRT1, 2)]);
+    assert_eq!(user.queued(), 0);
+    assert_eq!(global.queued(), 0);
+}
+
+#[test]
+fn dropping_signal_managers_refunds_all_queue_charges() {
+    let (user, global) = accounts(4);
+    {
+        let (process, thread) = new_test_env();
+        process
+            .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1), |info| {
+                PreparedSignal::try_accounted(info, &user, 4, &global)
+            })
+            .unwrap();
+        send_accounted(
+            &thread,
+            SignalInfo::new_user(Signo::SIGRT1, 2, 2),
+            &user,
+            &global,
+            4,
+        );
+        assert_eq!(user.queued(), 2);
+    }
+    assert_eq!(user.queued(), 0);
+    assert_eq!(global.queued(), 0);
+}
+
+#[test]
+fn ignored_action_transition_flushes_process_and_thread_instances() {
+    let (process, thread) = new_test_env();
+    let (user, global) = accounts(4);
+    process
+        .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1), |info| {
+            PreparedSignal::try_accounted(info, &user, 4, &global)
+        })
+        .unwrap();
+    send_accounted(
+        &thread,
+        SignalInfo::new_user(Signo::SIGRTMIN, 2, 2),
+        &user,
+        &global,
+        4,
+    );
+    assert_eq!(user.queued(), 2);
+
+    process
+        .try_replace_action(
+            Signo::SIGRTMIN,
+            SignalAction {
+                disposition: SignalDisposition::Ignore,
+                ..SignalAction::default()
+            },
+        )
+        .unwrap();
+
+    assert!(!process.pending().has(Signo::SIGRTMIN));
+    assert!(!thread.pending().has(Signo::SIGRTMIN));
+    assert_eq!(user.queued(), 0);
+    assert_eq!(global.queued(), 0);
 }

@@ -488,6 +488,7 @@ impl CloneArgs {
                 time_ns,
             )?;
             proc_data.set_umask(old_proc_data.umask());
+            *proc_data.rlim.write() = old_proc_data.rlim.read().clone();
             proc_data.set_credentials(old_proc_data.credentials());
             proc_data.set_capability_state(old_proc_data.capability_state());
             proc_data.set_supplementary_groups(old_proc_data.try_supplementary_groups()?);

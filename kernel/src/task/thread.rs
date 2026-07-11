@@ -254,7 +254,13 @@ impl Thread {
         };
         self.store_usage_snapshot(usage);
         for signo in signals {
-            if self.signal.send_signal(SignalInfo::new_kernel(signo)) {
+            // TimeManager emits only fixed standard signals (SIGALRM,
+            // SIGVTALRM, SIGPROF, SIGXCPU, or SIGKILL), so no queued RT record
+            // or RLIMIT_SIGPENDING charge is possible here.
+            if self
+                .signal
+                .send_unqueued_signal(SignalInfo::new_kernel(signo))
+            {
                 task.interrupt();
             }
         }

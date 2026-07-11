@@ -8,11 +8,11 @@ use starry_vm::VmPtr;
 use crate::{
     file::{Directory, FD_TABLE, FileLike, PidFd, add_file_description},
     pseudofs::{ProcDirProcess, process_data_from_proc_dir},
-    syscall::signal::parse_signo,
+    syscall::signal::{parse_signo, queued_signal_required},
     task::{
         AsThread, ProcessData, PtraceCredentialMode, check_current_ptrace_access,
         check_current_signal_access, get_process_data, get_visible_task,
-        send_signal_to_process_data,
+        send_queued_signal_to_process_data, send_signal_to_process_data,
     },
 };
 
@@ -103,7 +103,7 @@ fn make_pidfd_signal_info(
 
     let signo = parse_signo(signo)?;
     let sig = unsafe { sig.vm_read_uninit()?.assume_init() };
-    if sig.signo() != signo {
+    if sig.try_signo() != Some(signo) {
         return Err(AxError::InvalidInput);
     }
     if current().as_thread().proc_data.proc.pid() != target.proc.pid()
@@ -141,6 +141,10 @@ pub fn sys_pidfd_send_signal(
         make_pidfd_signal_info(&proc_data, signo, sig)?
     };
     check_current_signal_access(&proc_data, sig.as_ref().map(SignalInfo::signo))?;
-    send_signal_to_process_data(&proc_data, sig)?;
+    if queued_signal_required(&sig) {
+        send_queued_signal_to_process_data(&proc_data, sig)?;
+    } else {
+        send_signal_to_process_data(&proc_data, sig)?;
+    }
     Ok(0)
 }

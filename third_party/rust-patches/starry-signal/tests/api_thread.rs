@@ -17,10 +17,10 @@ fn dequeue_signal() {
     let (proc, thr) = new_test_env();
 
     let sig1 = SignalInfo::new_user(Signo::SIGINT, 9, 9);
-    assert!(thr.send_signal(sig1));
+    assert!(thr.send_unqueued_signal(sig1));
 
     let sig2 = SignalInfo::new_user(Signo::SIGTERM, 9, 9);
-    assert_eq!(proc.send_signal(sig2), Some(TID));
+    assert_eq!(proc.send_unqueued_signal(sig2), Some(TID));
 
     let mask = !SignalSet::default();
     assert_eq!(thr.dequeue_signal(&mask).unwrap().signo(), Signo::SIGINT);
@@ -57,25 +57,25 @@ fn block_ignore_send_signal() {
 
     let signo = Signo::SIGINT;
     let sig = SignalInfo::new_user(signo, 0, 1);
-    assert!(thr.send_signal(sig.clone()));
+    assert!(thr.send_unqueued_signal(sig.clone()));
     assert_eq!(
         thr.dequeue_signal(&!SignalSet::default()).unwrap().signo(),
         sig.signo()
     );
 
     proc.actions.lock()[signo].disposition = SignalDisposition::Ignore;
-    assert!(!thr.send_signal(sig.clone()));
+    assert!(!thr.send_unqueued_signal(sig.clone()));
     assert!(!thr.pending().has(signo));
 
     let mut set = SignalSet::default();
     set.add(signo);
     thr.set_blocked(set);
     assert!(thr.signal_blocked(signo));
-    assert!(!thr.send_signal(sig.clone()));
+    assert!(!thr.send_unqueued_signal(sig.clone()));
     assert!(thr.pending().has(signo));
 
     proc.actions.lock()[signo].disposition = SignalDisposition::Default;
-    assert!(!thr.send_signal(sig.clone()));
+    assert!(!thr.send_unqueued_signal(sig.clone()));
     assert!(thr.pending().has(signo));
 
     let empty = SignalSet::default();
@@ -92,11 +92,11 @@ fn check_signals() {
     let signo = Signo::SIGTERM;
     let sig = SignalInfo::new_user(signo, 0, 1);
 
-    assert_eq!(proc.send_signal(sig.clone()), Some(TID));
+    assert_eq!(proc.send_unqueued_signal(sig.clone()), Some(TID));
     let delivered = thr.check_signals(&mut uctx, None).unwrap();
     assert_eq!(delivered.info.signo(), signo);
 
-    assert!(thr.send_signal(sig.clone()));
+    assert!(thr.send_unqueued_signal(sig.clone()));
     let delivered = thr.check_signals(&mut uctx, None).unwrap();
     assert_eq!(delivered.info.signo(), signo);
 }
@@ -109,14 +109,17 @@ fn check_signals_preserves_restartability_for_reset_hand() {
     unsafe extern "C" fn test_handler(_: i32) {}
 
     let signo = Signo::SIGTERM;
-    let action = &mut proc.actions.lock()[signo];
-    action.disposition = SignalDisposition::Handler(test_handler as usize);
-    action
-        .flags
-        .insert(SignalActionFlags::RESTART | SignalActionFlags::RESETHAND);
+    {
+        let mut actions = proc.actions.lock();
+        let action = &mut actions[signo];
+        action.disposition = SignalDisposition::Handler(test_handler as usize);
+        action
+            .flags
+            .insert(SignalActionFlags::RESTART | SignalActionFlags::RESETHAND);
+    }
 
     assert_eq!(
-        proc.send_signal(SignalInfo::new_user(signo, 0, 1)),
+        proc.send_unqueued_signal(SignalInfo::new_user(signo, 0, 1)),
         Some(TID)
     );
     let delivered = thr.check_signals(&mut uctx, None).unwrap();

@@ -4,11 +4,11 @@ use axtask::current;
 use memory_addr::{MemoryAddr, VirtAddr};
 use starry_process::Pid;
 use starry_signal::{SignalInfo, Signo};
-use starry_vm::VmMutPtr;
+use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::task::{
     AsThread, ProcessData, PtraceCredentialMode, check_current_ptrace_access, get_process_data,
-    get_task, notify_ptrace_attach_stop, send_signal_to_process,
+    get_task, notify_ptrace_attach_stop, reinject_ptrace_signal, send_signal_to_process,
 };
 
 const PTRACE_TRACEME: u32 = 0;
@@ -97,17 +97,16 @@ fn do_continue(target: &ProcessData, data: usize, detach: bool) -> AxResult<isiz
     let curr = current();
     let tracer_data = curr.as_thread().proc_data.clone();
     let tracer = tracer_data.proc.pid();
-    let signal = parse_signal(data)?;
-    if detach && !target.end_ptrace(tracer) {
-        return Err(AxError::NoSuchProcess);
-    }
+    let signal = parse_signal(data)?.map(|info| info.signo());
+    let (resume_result, record) = target
+        .resume_ptrace(tracer, detach)
+        .ok_or(AxError::NoSuchProcess)?;
     if detach {
         tracer_data.remove_ptrace_tracee(target.proc.pid());
     }
-    target.continue_job();
-    if let Some(signal) = signal {
-        send_signal_to_process(target.proc.pid(), Some(signal))?;
-    }
+    let reinjected = reinject_ptrace_signal(target, record, signal);
+    target.finish_ptrace_resume(resume_result);
+    reinjected?;
     Ok(0)
 }
 
@@ -223,7 +222,28 @@ fn sys_ptrace_for_target(request: u32, pid: Pid, addr: usize, data: usize) -> Ax
             Ok(0)
         }
         PTRACE_LISTEN => do_continue(&target, 0, false),
-        PTRACE_GETSIGINFO | PTRACE_SETSIGINFO | PTRACE_GETREGSET | PTRACE_SETREGSET => {
+        PTRACE_GETSIGINFO => {
+            check_tracee(&target)?;
+            let info = target.ptrace_signal_info().ok_or_else(ptrace_io_error)?;
+            (data as *mut SignalInfo).vm_write(info)?;
+            Ok(0)
+        }
+        PTRACE_SETSIGINFO => {
+            check_tracee(&target)?;
+            let info = unsafe { (data as *const SignalInfo).vm_read_uninit()?.assume_init() };
+            let signo = info.try_signo().ok_or(AxError::InvalidInput)?;
+            if target
+                .ptrace_signal_info()
+                .is_none_or(|current| current.signo() != signo)
+            {
+                return Err(AxError::InvalidInput);
+            }
+            if !target.replace_ptrace_signal_info(info) {
+                return Err(ptrace_io_error());
+            }
+            Ok(0)
+        }
+        PTRACE_GETREGSET | PTRACE_SETREGSET => {
             check_tracee(&target)?;
             Err(ptrace_io_error())
         }

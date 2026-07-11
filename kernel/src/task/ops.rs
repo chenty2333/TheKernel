@@ -905,9 +905,7 @@ fn detach_ptrace_links_on_process_exit(proc_data: &ProcessData) {
         let Ok(tracee_data) = get_process_data(tracee) else {
             continue;
         };
-        if tracee_data.end_ptrace(pid) {
-            tracee_data.continue_job();
-        }
+        tracee_data.end_ptrace(pid);
     }
 }
 
@@ -1190,6 +1188,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
         acct_process_exit(&thr.proc_data, exit_code, self_usage);
         thr.proc_data.release_executable();
         crate::syscall::cleanup_process_aio(process.pid());
+        crate::syscall::cleanup_process_mqueue_notifications(process.pid());
         let detached_fd_table = thr.proc_data.exit_fd_table();
         let closed_fds = thr.with_mut_scope(|scope| {
             crate::file::replace_process_fd_table(scope, detached_fd_table)
