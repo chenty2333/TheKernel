@@ -301,11 +301,13 @@ impl OpenCredentials {
             return Self::root();
         };
         let proc_data = &thread.proc_data;
+        let cred = proc_data.current_cred();
+        let ids = cred.ids();
         Self {
-            uid: proc_data.uid(),
-            euid: proc_data.euid(),
-            suid: proc_data.suid(),
-            fsuid: proc_data.fsuid(),
+            uid: ids.ruid,
+            euid: ids.euid,
+            suid: ids.suid,
+            fsuid: ids.fsuid,
             cgroup_ns_id: proc_data.cgroup_ns_id(),
         }
     }
@@ -430,19 +432,21 @@ impl AsyncIoCredentials {
     fn current() -> Option<Self> {
         let task = current_may_uninit()?;
         let process = &task.try_as_thread()?.proc_data;
-        let euid = process.euid();
+        let cred = process.current_cred();
+        let ids = cred.ids();
         Some(Self {
-            uid: process.uid(),
-            euid,
+            uid: ids.ruid,
+            euid: ids.euid,
             // Credentials are not yet stored as mapped kernel IDs, so retain
             // the namespace fact needed to distinguish GLOBAL_ROOT_UID from
             // UID 0 inside a child user namespace.
-            euid_is_global_root: euid == 0 && process.user_ns().is_initial(),
+            euid_is_global_root: ids.euid == 0 && cred.user_ns().is_initial(),
         })
     }
 
     fn may_signal(&self, target: &ProcessData) -> bool {
-        self.may_signal_ids(target.uid(), target.suid())
+        let ids = target.current_cred().ids();
+        self.may_signal_ids(ids.ruid, ids.suid)
     }
 
     fn may_signal_ids(&self, uid: u32, suid: u32) -> bool {

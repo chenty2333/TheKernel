@@ -157,6 +157,7 @@ pub fn add_slave(fs: Arc<SimpleFs>, pty: Arc<PtyDriver>, lease: &PtsLease) -> Ax
     let terminal = pty.terminal.clone();
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
+    let ids = proc_data.current_cred().ids();
     let device = Device::try_new(
         fs,
         NodeType::CharacterDevice,
@@ -164,7 +165,7 @@ pub fn add_slave(fs: Arc<SimpleFs>, pty: Arc<PtyDriver>, lease: &PtsLease) -> Ax
         pty,
     )?;
     device.update_metadata(MetadataUpdate {
-        owner: Some((proc_data.uid(), proc_data.gid())),
+        owner: Some((ids.ruid, ids.rgid)),
         mode: Some(NodePermission::from_bits_truncate(0o620)),
         ..Default::default()
     })?;

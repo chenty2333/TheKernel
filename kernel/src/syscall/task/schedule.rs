@@ -104,17 +104,18 @@ fn has_sched_admin_capability() -> bool {
 }
 
 fn can_manage_sched_target(task: &AxTaskRef) -> AxResult<()> {
-    if has_sched_admin_capability() {
-        return Ok(());
-    }
-
     let actor = current();
     let actor_thread = actor.as_thread();
-    let actor_euid = actor_thread.proc_data.euid();
+    let actor_cred = actor_thread.proc_data.current_cred();
+    if actor_cred.has_effective_capability(CAP_SYS_NICE) {
+        return Ok(());
+    }
+    let actor_euid = actor_cred.ids().euid;
     let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
     let target_proc = &target_thread.proc_data;
+    let target_ids = target_proc.current_cred().ids();
 
-    if actor_euid == target_proc.uid() || actor_euid == target_proc.euid() {
+    if actor_euid == target_ids.ruid || actor_euid == target_ids.euid {
         Ok(())
     } else {
         Err(AxError::OperationNotPermitted)
@@ -326,16 +327,15 @@ fn can_adjust_task_nice(task: &AxTaskRef, new_nice: i8) -> AxResult<()> {
     let actor = current();
     let actor_thread = actor.as_thread();
     let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+    let actor_euid = actor_thread.proc_data.current_cred().ids().euid;
+    let target_ids = target_thread.proc_data.current_cred().ids();
 
-    if actor_thread.proc_data.euid() != 0
-        && actor_thread.proc_data.euid() != target_thread.proc_data.uid()
-        && actor_thread.proc_data.euid() != target_thread.proc_data.euid()
-    {
+    if actor_euid != 0 && actor_euid != target_ids.ruid && actor_euid != target_ids.euid {
         return Err(AxError::OperationNotPermitted);
     }
 
     let current_nice = sched_state(task).nice;
-    if actor_thread.proc_data.euid() != 0 && new_nice < current_nice {
+    if actor_euid != 0 && new_nice < current_nice {
         return Err(AxError::PermissionDenied);
     }
 
@@ -689,7 +689,10 @@ pub fn sys_getpriority(which: u32, who: u32) -> AxResult<isize> {
             Ok(raw_priority_from_nice(min_nice_for_threads(
                 try_processes()?
                     .into_iter()
-                    .filter(|proc_data| proc_data.uid() == uid || proc_data.euid() == uid)
+                    .filter(|proc_data| {
+                        let ids = proc_data.current_cred().ids();
+                        ids.ruid == uid || ids.euid == uid
+                    })
                     .flat_map(|proc_data| proc_data.proc.thread_ids()),
             )?))
         }
@@ -734,10 +737,10 @@ pub fn sys_setpriority(which: u32, who: u32, prio: i32) -> AxResult<isize> {
             } else {
                 who
             };
-            for proc_data in try_processes()?
-                .into_iter()
-                .filter(|proc_data| proc_data.uid() == uid || proc_data.euid() == uid)
-            {
+            for proc_data in try_processes()?.into_iter().filter(|proc_data| {
+                let ids = proc_data.current_cred().ids();
+                ids.ruid == uid || ids.euid == uid
+            }) {
                 for tid in proc_data.proc.thread_ids() {
                     if let Ok(task) = get_task(tid) {
                         targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;

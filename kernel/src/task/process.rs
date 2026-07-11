@@ -17,7 +17,7 @@ use axsync::{Mutex, spin::SpinNoIrq};
 use hashbrown::HashMap;
 use linux_raw_sys::general::{
     CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_LINUX_IMMUTABLE,
-    CAP_MAC_OVERRIDE, CAP_MKNOD, CAP_SETGID, CAP_SETUID,
+    CAP_MAC_OVERRIDE, CAP_MKNOD, CAP_SETGID, CAP_SETPCAP, CAP_SETUID,
 };
 use scope_local::Scope;
 use spin::RwLock;
@@ -37,7 +37,11 @@ type SignalAccountRegistryMutex<T> = spin::Mutex<T>;
 
 use super::{
     accounting::{AtomicTaskUsage, live_process_usage},
-    creds::{CAPABILITY_WORDS, CapabilityState, Credentials, DacCredentialView},
+    creds::{
+        CAPABILITY_WORDS, CapabilityState, Cred, CredentialSlot, Credentials, DacCredentialView,
+        GroupInfo, PreparedCred, SECBIT_KEEP_CAPS, SECBIT_KEEP_CAPS_LOCKED,
+        SECBIT_NO_CAP_AMBIENT_RAISE, SECBIT_NO_SETUID_FIXUP, SECURE_ALL_BITS, SECURE_ALL_LOCKS,
+    },
     futex::FutexTable,
     jobctl::{
         ContinueResult, ExecControlState, JobControlState, PtraceControlState, StopKind,
@@ -58,13 +62,6 @@ use crate::{
 
 pub(crate) const UTS_FIELD_LEN: usize = 64;
 const PROC_NS_INO_BASE: u64 = 0x9_0000_0000;
-const SECBIT_NO_SETUID_FIXUP: u32 = 1 << 2;
-const SECBIT_KEEP_CAPS: u32 = 1 << 4;
-const SECBIT_KEEP_CAPS_LOCKED: u32 = 1 << 5;
-const SECBIT_NO_CAP_AMBIENT_RAISE: u32 = 1 << 6;
-const SECURE_ALL_BITS: u32 =
-    (1 << 0) | SECBIT_NO_SETUID_FIXUP | SECBIT_KEEP_CAPS | SECBIT_NO_CAP_AMBIENT_RAISE;
-const SECURE_ALL_LOCKS: u32 = SECURE_ALL_BITS << 1;
 static PROC_NS_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Implementation ceiling for queued RT nodes charged to one (user_ns, ruid).
@@ -594,12 +591,13 @@ pub struct ProcessData {
 
     /// The default mask for file permissions.
     umask: AtomicU32,
-    /// Process credentials shared by all threads.
-    creds: SpinNoIrq<Credentials>,
-    /// Process capabilities shared by all threads.
-    caps: SpinNoIrq<CapabilityState>,
-    /// Supplementary group IDs shared by all threads in the process.
-    supplementary_groups: SpinNoIrq<Vec<u32>>,
+    /// One atomically published immutable security identity shared by all threads.
+    ///
+    /// This preserves the kernel's current thread-group ownership model. It is
+    /// not yet Linux's per-task `task_struct::{cred, real_cred}` ownership;
+    /// `CredentialSlot` is deliberately independent so a later slice can move
+    /// it to `Thread` without introducing a second truth source here.
+    credential: CredentialSlot,
     /// Linux personality flags shared by all threads in the process.
     personality: AtomicU32,
     /// NUMA memory policy state for the single-node kernel memory model.
@@ -610,8 +608,6 @@ pub struct ProcessData {
     timerslack_current_ns: AtomicUsize,
     /// Default timer slack in nanoseconds, used when PR_SET_TIMERSLACK is 0.
     timerslack_default_ns: AtomicUsize,
-    /// no_new_privs state configured through prctl(PR_SET_NO_NEW_PRIVS).
-    no_new_privs: AtomicU32,
     /// POSIX interval timers created by this process.
     pub(crate) posix_timers: SpinNoIrq<Vec<Option<PosixTimer>>>,
 
@@ -648,8 +644,6 @@ pub struct ProcessData {
     cgroup_ns: Arc<CgroupNamespace>,
     /// Lightweight PID namespace identity for procfs namespace fd ABI.
     pid_ns: Arc<PidNamespace>,
-    /// Lightweight user namespace identity for procfs namespace fd ABI.
-    user_ns: Arc<UserNamespace>,
     /// The UTS namespace for this process.
     uts_ns: RwLock<Arc<UtsNamespace>>,
     /// The time namespace visible to this process.
@@ -718,7 +712,7 @@ impl ProcessData {
         net_ns: Arc<NetStack>,
         cgroup_ns: Arc<CgroupNamespace>,
         pid_ns: Arc<PidNamespace>,
-        user_ns: Arc<UserNamespace>,
+        credential: Arc<Cred>,
         uts_ns: Arc<UtsNamespace>,
         time_ns: Arc<TimeNamespace>,
     ) -> AxResult<Arc<Self>> {
@@ -744,12 +738,6 @@ impl ProcessData {
         let futex_table = Arc::try_new(FutexTable::new()).map_err(|_| AxError::NoMemory)?;
         let stop_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let vfork_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
-        let mut supplementary_groups = Vec::new();
-        supplementary_groups
-            .try_reserve_exact(1)
-            .map_err(|_| AxError::NoMemory)?;
-        supplementary_groups.push(0);
-
         let data = Self {
             proc,
             exe_path: RwLock::new(exe_path),
@@ -776,15 +764,12 @@ impl ProcessData {
             futex_table,
 
             umask: AtomicU32::new(0o022),
-            creds: SpinNoIrq::new(Credentials::default()),
-            caps: SpinNoIrq::new(CapabilityState::full()),
-            supplementary_groups: SpinNoIrq::new(supplementary_groups),
+            credential: CredentialSlot::new(credential),
             personality: AtomicU32::new(0),
             mempolicy: SpinNoIrq::new(MempolicyState::default()),
             pdeath_signal: AtomicU32::new(0),
             timerslack_current_ns: AtomicUsize::new(50_000),
             timerslack_default_ns: AtomicUsize::new(50_000),
-            no_new_privs: AtomicU32::new(0),
             posix_timers: SpinNoIrq::new(Vec::new()),
             exited_threads_usage: AtomicTaskUsage::new(),
             waited_children_usage: AtomicTaskUsage::new(),
@@ -803,7 +788,6 @@ impl ProcessData {
             net_ns,
             cgroup_ns,
             pid_ns,
-            user_ns,
             uts_ns: RwLock::new(uts_ns),
             time_ns: RwLock::new(time_ns.clone()),
             time_ns_for_children: RwLock::new(time_ns),
@@ -867,10 +851,6 @@ impl ProcessData {
 
     pub(crate) fn pid_ns(&self) -> Arc<PidNamespace> {
         self.pid_ns.clone()
-    }
-
-    pub(crate) fn user_ns(&self) -> Arc<UserNamespace> {
-        self.user_ns.clone()
     }
 
     pub(crate) fn replace_uts_ns(&self, uts_ns: Arc<UtsNamespace>) {
@@ -959,11 +939,17 @@ impl ProcessData {
     }
 
     pub fn no_new_privs(&self) -> bool {
-        self.no_new_privs.load(Ordering::Acquire) != 0
+        self.current_cred().no_new_privs()
     }
 
-    pub fn set_no_new_privs(&self) {
-        self.no_new_privs.store(1, Ordering::Release)
+    pub fn set_no_new_privs(&self) -> AxResult<()> {
+        let mut update = self.credential.prepare();
+        if update.old().no_new_privs() {
+            return Ok(());
+        }
+        update.builder.no_new_privs = true;
+        update.finish()?.commit();
+        Ok(())
     }
 
     /// Linux manual: A "clone" child is one which delivers no signal, or a
@@ -1029,51 +1015,38 @@ impl ProcessData {
         self.umask.swap(umask, Ordering::SeqCst)
     }
 
-    pub(crate) fn credentials(&self) -> Credentials {
-        *self.creds.lock()
+    pub(crate) fn current_cred(&self) -> Arc<Cred> {
+        self.credential.current()
     }
 
-    pub(crate) fn set_credentials(&self, creds: Credentials) {
-        *self.creds.lock() = creds;
-    }
-
-    pub(crate) fn capability_state(&self) -> CapabilityState {
-        *self.caps.lock()
-    }
-
-    pub(crate) fn set_capability_state(&self, caps: CapabilityState) {
-        *self.caps.lock() = caps;
-    }
-
-    pub fn supplementary_groups(&self) -> Vec<u32> {
-        self.supplementary_groups.lock().clone()
-    }
-
-    /// Fallibly snapshots supplementary groups without allocating under the
-    /// process credential spin lock.
-    pub fn try_supplementary_groups(&self) -> AxResult<Vec<u32>> {
-        let mut groups = Vec::new();
-        loop {
-            groups.clear();
-            let required = self.supplementary_groups.lock().len();
-            if groups.capacity() < required {
-                groups
-                    .try_reserve_exact(required)
-                    .map_err(|_| AxError::NoMemory)?;
-            }
-            let current = self.supplementary_groups.lock();
-            if groups.capacity() < current.len() {
-                drop(current);
-                continue;
-            }
-            groups.extend(current.iter().copied());
-            return Ok(groups);
+    pub fn set_supplementary_groups(&self, groups: Vec<u32>) -> AxResult<()> {
+        // Sort, deduplicate, validate the bound, and allocate the shared group
+        // owner before entering the credential writer transaction.
+        let groups = GroupInfo::try_new(groups)?;
+        let mut update = self.credential.prepare();
+        if !update.old().has_effective_capability(CAP_SETGID) {
+            return Err(AxError::OperationNotPermitted);
         }
+        if update.old().groups().as_slice() == groups.as_slice() {
+            return Ok(());
+        }
+        update.builder.groups = groups;
+        update.finish()?.commit();
+        Ok(())
     }
 
-    pub fn set_supplementary_groups(&self, groups: Vec<u32>) {
-        let old = core::mem::replace(&mut *self.supplementary_groups.lock(), groups);
-        drop(old);
+    pub(crate) fn try_update_capability_state(
+        &self,
+        update_state: impl FnOnce(CapabilityState, &mut CapabilityState) -> AxResult<()>,
+    ) -> AxResult<()> {
+        let mut update = self.credential.prepare();
+        let old = update.builder.caps;
+        update_state(old, &mut update.builder.caps)?;
+        if update.builder.caps == old {
+            return Ok(());
+        }
+        update.finish()?.commit();
+        Ok(())
     }
 
     pub fn personality(&self) -> u32 {
@@ -1154,53 +1127,56 @@ impl ProcessData {
     }
 
     pub fn uid(&self) -> u32 {
-        self.creds.lock().ruid
+        self.current_cred().ids().ruid
     }
 
     pub fn euid(&self) -> u32 {
-        self.creds.lock().euid
+        self.current_cred().ids().euid
     }
 
     pub fn gid(&self) -> u32 {
-        self.creds.lock().rgid
+        self.current_cred().ids().rgid
     }
 
     pub fn egid(&self) -> u32 {
-        self.creds.lock().egid
+        self.current_cred().ids().egid
     }
 
     pub fn suid(&self) -> u32 {
-        self.creds.lock().suid
+        self.current_cred().ids().suid
     }
 
     pub fn fsuid(&self) -> u32 {
-        self.creds.lock().fsuid
+        self.current_cred().ids().fsuid
     }
 
     pub fn sgid(&self) -> u32 {
-        self.creds.lock().sgid
+        self.current_cred().ids().sgid
     }
 
     pub fn fsgid(&self) -> u32 {
-        self.creds.lock().fsgid
+        self.current_cred().ids().fsgid
     }
 
     pub fn is_in_group(&self, gid: u32) -> bool {
-        self.egid() == gid || self.supplementary_groups.lock().contains(&gid)
+        let cred = self.current_cred();
+        cred.ids().egid == gid || cred.groups().contains(gid)
     }
 
     pub fn is_in_fs_group(&self, gid: u32) -> bool {
-        self.fsgid() == gid || self.supplementary_groups.lock().contains(&gid)
+        let cred = self.current_cred();
+        cred.ids().fsgid == gid || cred.groups().contains(gid)
     }
 
     /// Snapshot the filesystem identity and effective capabilities used by DAC.
     pub(crate) fn fs_dac_credentials(&self) -> DacCredentialView {
-        let credentials = self.credentials();
-        let capabilities = self.capability_state();
+        let cred = self.current_cred();
+        let credentials = cred.ids();
+        let capabilities = cred.capabilities();
         DacCredentialView::new(
             credentials.fsuid,
             credentials.fsgid,
-            self.supplementary_groups(),
+            cred.groups().clone(),
             capabilities.effective,
         )
     }
@@ -1212,8 +1188,9 @@ impl ProcessData {
     /// checks with the permitted set. AT_EACCESS keeps the current filesystem
     /// IDs and effective capability set, matching Linux's normal VFS view.
     pub(crate) fn access_dac_credentials(&self, effective: bool) -> DacCredentialView {
-        let credentials = self.credentials();
-        let capabilities = self.capability_state();
+        let cred = self.current_cred();
+        let credentials = cred.ids();
+        let capabilities = cred.capabilities();
         let (uid, gid, capability_set) = if effective {
             (credentials.fsuid, credentials.fsgid, capabilities.effective)
         } else {
@@ -1226,96 +1203,134 @@ impl ProcessData {
             };
             (credentials.ruid, credentials.rgid, capability_set)
         };
-        DacCredentialView::new(uid, gid, self.supplementary_groups(), capability_set)
+        DacCredentialView::new(uid, gid, cred.groups().clone(), capability_set)
     }
 
     pub fn has_effective_capability(&self, cap: u32) -> bool {
-        self.capability_state().has_effective(cap)
+        self.current_cred().has_effective_capability(cap)
     }
 
     pub fn bounding_capability_enabled(&self, cap: u32) -> AxResult<bool> {
         if CapabilityState::cap_mask(cap).is_none() {
             return Err(AxError::InvalidInput);
         }
-        Ok(self.capability_state().bounding_contains(cap))
+        Ok(self.current_cred().capabilities().bounding_contains(cap))
     }
 
     pub fn drop_bounding_capability(&self, cap: u32) -> AxResult<()> {
-        self.caps.lock().drop_bounding(cap)
+        let mut update = self.credential.prepare();
+        if !update.old().has_effective_capability(CAP_SETPCAP) {
+            return Err(AxError::OperationNotPermitted);
+        }
+        update.builder.caps.drop_bounding(cap)?;
+        update.finish()?.commit();
+        Ok(())
     }
 
     pub fn ambient_capability_enabled(&self, cap: u32) -> AxResult<bool> {
         if CapabilityState::cap_mask(cap).is_none() {
             return Err(AxError::InvalidInput);
         }
-        Ok(self.capability_state().ambient_contains(cap))
+        Ok(self.current_cred().capabilities().ambient_contains(cap))
     }
 
     pub fn raise_ambient_capability(&self, cap: u32) -> AxResult<()> {
         let Some((word, mask)) = CapabilityState::cap_mask(cap) else {
             return Err(AxError::InvalidInput);
         };
-        let mut caps = self.caps.lock();
-        if caps.securebits & SECBIT_NO_CAP_AMBIENT_RAISE != 0
-            || caps.permitted[word] & mask == 0
-            || caps.inheritable[word] & mask == 0
+        let mut update = self.credential.prepare();
+        if update.builder.caps.securebits & SECBIT_NO_CAP_AMBIENT_RAISE != 0
+            || update.builder.caps.permitted[word] & mask == 0
+            || update.builder.caps.inheritable[word] & mask == 0
         {
             return Err(AxError::OperationNotPermitted);
         }
-        caps.raise_ambient(cap)
+        update.builder.caps.raise_ambient(cap)?;
+        update.finish()?.commit();
+        Ok(())
     }
 
     pub fn lower_ambient_capability(&self, cap: u32) -> AxResult<()> {
-        self.caps.lock().lower_ambient(cap)
+        let mut update = self.credential.prepare();
+        update.builder.caps.lower_ambient(cap)?;
+        update.finish()?.commit();
+        Ok(())
     }
 
-    pub fn clear_ambient_capabilities(&self) {
-        self.caps.lock().clear_ambient();
+    pub fn clear_ambient_capabilities(&self) -> AxResult<()> {
+        let mut update = self.credential.prepare();
+        if update.builder.caps.ambient == [0; CAPABILITY_WORDS] {
+            return Ok(());
+        }
+        update.builder.caps.clear_ambient();
+        update.finish()?.commit();
+        Ok(())
     }
 
     pub fn securebits(&self) -> u32 {
-        self.caps.lock().securebits
+        self.current_cred().capabilities().securebits
     }
 
     pub fn set_securebits(&self, securebits: u32) -> AxResult<()> {
-        let mut caps = self.caps.lock();
-        if (((caps.securebits & SECURE_ALL_LOCKS) >> 1) & (caps.securebits ^ securebits)) != 0
-            || (caps.securebits & SECURE_ALL_LOCKS & !securebits) != 0
+        let mut update = self.credential.prepare();
+        if !update.old().has_effective_capability(CAP_SETPCAP) {
+            return Err(AxError::OperationNotPermitted);
+        }
+        if update.builder.caps.securebits == securebits {
+            return Ok(());
+        }
+        if (((update.builder.caps.securebits & SECURE_ALL_LOCKS) >> 1)
+            & (update.builder.caps.securebits ^ securebits))
+            != 0
+            || (update.builder.caps.securebits & SECURE_ALL_LOCKS & !securebits) != 0
             || (securebits & !(SECURE_ALL_LOCKS | SECURE_ALL_BITS)) != 0
         {
             return Err(AxError::OperationNotPermitted);
         }
-        caps.securebits = securebits;
+        update.builder.caps.securebits = securebits;
+        update.finish()?.commit();
         Ok(())
     }
 
     pub fn keep_caps(&self) -> bool {
-        self.caps.lock().securebits & SECBIT_KEEP_CAPS != 0
+        self.current_cred().capabilities().securebits & SECBIT_KEEP_CAPS != 0
     }
 
     pub fn set_keep_caps(&self, enabled: bool) -> AxResult<()> {
-        let mut caps = self.caps.lock();
-        if caps.securebits & SECBIT_KEEP_CAPS_LOCKED != 0 {
+        let mut update = self.credential.prepare();
+        if update.builder.caps.securebits & SECBIT_KEEP_CAPS_LOCKED != 0 {
             return Err(AxError::OperationNotPermitted);
         }
-        if enabled {
-            caps.securebits |= SECBIT_KEEP_CAPS;
-        } else {
-            caps.securebits &= !SECBIT_KEEP_CAPS;
+        if (update.builder.caps.securebits & SECBIT_KEEP_CAPS != 0) == enabled {
+            return Ok(());
         }
+        if enabled {
+            update.builder.caps.securebits |= SECBIT_KEEP_CAPS;
+        } else {
+            update.builder.caps.securebits &= !SECBIT_KEEP_CAPS;
+        }
+        update.finish()?.commit();
         Ok(())
     }
 
-    pub fn clear_keep_caps_on_exec(&self) {
-        self.caps.lock().securebits &= !SECBIT_KEEP_CAPS;
+    pub(crate) fn prepare_clear_keep_caps_on_exec(&self) -> AxResult<Option<PreparedCred<'_>>> {
+        let mut update = self.credential.prepare();
+        if update.builder.caps.securebits & SECBIT_KEEP_CAPS == 0 {
+            return Ok(None);
+        }
+        update.builder.caps.securebits &= !SECBIT_KEEP_CAPS;
+        Ok(Some(update.finish_exec_keep_caps_clear()?))
     }
 
-    fn fixup_capabilities_for_uid_change(&self, old: Credentials, new: Credentials) {
+    fn fixup_capabilities_for_uid_change(
+        old: Credentials,
+        new: Credentials,
+        caps: &mut CapabilityState,
+    ) {
         if old.ruid == new.ruid && old.euid == new.euid && old.suid == new.suid {
             return;
         }
 
-        let mut caps = self.caps.lock();
         if caps.securebits & SECBIT_NO_SETUID_FIXUP != 0 {
             return;
         }
@@ -1336,7 +1351,11 @@ impl ProcessData {
         }
     }
 
-    fn fixup_capabilities_for_fsuid_change(&self, old_fsuid: u32, new_fsuid: u32) {
+    fn fixup_capabilities_for_fsuid_change(
+        old_fsuid: u32,
+        new_fsuid: u32,
+        caps: &mut CapabilityState,
+    ) {
         if old_fsuid == new_fsuid {
             return;
         }
@@ -1352,7 +1371,6 @@ impl ProcessData {
             CAP_LINUX_IMMUTABLE,
         ];
 
-        let mut caps = self.caps.lock();
         if caps.securebits & SECBIT_NO_SETUID_FIXUP != 0 {
             return;
         }
@@ -1369,52 +1387,61 @@ impl ProcessData {
     }
 
     pub fn setuid(&self, uid: u32) -> AxResult<()> {
-        let can_setuid = self.has_effective_capability(CAP_SETUID);
-        let mut creds = self.creds.lock();
-        let old = *creds;
+        let mut update = self.credential.prepare();
+        let can_setuid = update.old().has_effective_capability(CAP_SETUID);
+        let old = update.builder.ids;
         if can_setuid {
-            creds.ruid = uid;
-            creds.euid = uid;
-            creds.suid = uid;
-            creds.fsuid = uid;
-            let new = *creds;
-            drop(creds);
-            self.fixup_capabilities_for_uid_change(old, new);
+            update.builder.ids.ruid = uid;
+            update.builder.ids.euid = uid;
+            update.builder.ids.suid = uid;
+            update.builder.ids.fsuid = uid;
+            Self::fixup_capabilities_for_uid_change(
+                old,
+                update.builder.ids,
+                &mut update.builder.caps,
+            );
+            update.finish()?.commit();
             return Ok(());
         }
-        if uid == creds.ruid || uid == creds.suid {
-            creds.euid = uid;
-            creds.fsuid = uid;
-            let new = *creds;
-            drop(creds);
-            self.fixup_capabilities_for_uid_change(old, new);
+        if uid == old.ruid || uid == old.suid {
+            update.builder.ids.euid = uid;
+            update.builder.ids.fsuid = uid;
+            Self::fixup_capabilities_for_uid_change(
+                old,
+                update.builder.ids,
+                &mut update.builder.caps,
+            );
+            update.finish()?.commit();
             return Ok(());
         }
         Err(AxError::OperationNotPermitted)
     }
 
     pub fn setgid(&self, gid: u32) -> AxResult<()> {
-        let can_setgid = self.has_effective_capability(CAP_SETGID);
-        let mut creds = self.creds.lock();
+        let mut update = self.credential.prepare();
+        let can_setgid = update.old().has_effective_capability(CAP_SETGID);
+        let old = update.builder.ids;
         if can_setgid {
-            creds.rgid = gid;
-            creds.egid = gid;
-            creds.sgid = gid;
-            creds.fsgid = gid;
+            update.builder.ids.rgid = gid;
+            update.builder.ids.egid = gid;
+            update.builder.ids.sgid = gid;
+            update.builder.ids.fsgid = gid;
+            update.finish()?.commit();
             return Ok(());
         }
-        if gid == creds.rgid || gid == creds.sgid {
-            creds.egid = gid;
-            creds.fsgid = gid;
+        if gid == old.rgid || gid == old.sgid {
+            update.builder.ids.egid = gid;
+            update.builder.ids.fsgid = gid;
+            update.finish()?.commit();
             return Ok(());
         }
         Err(AxError::OperationNotPermitted)
     }
 
     pub fn setreuid(&self, ruid: Option<u32>, euid: Option<u32>) -> AxResult<()> {
-        let can_setuid = self.has_effective_capability(CAP_SETUID);
-        let mut creds = self.creds.lock();
-        let old = *creds;
+        let mut update = self.credential.prepare();
+        let can_setuid = update.old().has_effective_capability(CAP_SETUID);
+        let old = update.builder.ids;
         if !can_setuid {
             if let Some(id) = ruid
                 && id != old.ruid
@@ -1433,22 +1460,21 @@ impl ProcessData {
 
         let new_ruid = ruid.unwrap_or(old.ruid);
         let new_euid = euid.unwrap_or(old.euid);
-        creds.ruid = new_ruid;
-        creds.euid = new_euid;
-        creds.fsuid = new_euid;
+        update.builder.ids.ruid = new_ruid;
+        update.builder.ids.euid = new_euid;
+        update.builder.ids.fsuid = new_euid;
         if ruid.is_some() || euid.is_some_and(|id| id != old.ruid) {
-            creds.suid = new_euid;
+            update.builder.ids.suid = new_euid;
         }
-        let new = *creds;
-        drop(creds);
-        self.fixup_capabilities_for_uid_change(old, new);
+        Self::fixup_capabilities_for_uid_change(old, update.builder.ids, &mut update.builder.caps);
+        update.finish()?.commit();
         Ok(())
     }
 
     pub fn setregid(&self, rgid: Option<u32>, egid: Option<u32>) -> AxResult<()> {
-        let can_setgid = self.has_effective_capability(CAP_SETGID);
-        let mut creds = self.creds.lock();
-        let old = *creds;
+        let mut update = self.credential.prepare();
+        let can_setgid = update.old().has_effective_capability(CAP_SETGID);
+        let old = update.builder.ids;
         if !can_setgid {
             if let Some(id) = rgid
                 && id != old.rgid
@@ -1467,12 +1493,13 @@ impl ProcessData {
 
         let new_rgid = rgid.unwrap_or(old.rgid);
         let new_egid = egid.unwrap_or(old.egid);
-        creds.rgid = new_rgid;
-        creds.egid = new_egid;
-        creds.fsgid = new_egid;
+        update.builder.ids.rgid = new_rgid;
+        update.builder.ids.egid = new_egid;
+        update.builder.ids.fsgid = new_egid;
         if rgid.is_some() || egid.is_some_and(|id| id != old.rgid) {
-            creds.sgid = new_egid;
+            update.builder.ids.sgid = new_egid;
         }
+        update.finish()?.commit();
         Ok(())
     }
 
@@ -1482,9 +1509,9 @@ impl ProcessData {
         euid: Option<u32>,
         suid: Option<u32>,
     ) -> AxResult<()> {
-        let can_setuid = self.has_effective_capability(CAP_SETUID);
-        let mut creds = self.creds.lock();
-        let old = *creds;
+        let mut update = self.credential.prepare();
+        let can_setuid = update.old().has_effective_capability(CAP_SETUID);
+        let old = update.builder.ids;
         if !can_setuid {
             for id in [ruid, euid, suid].into_iter().flatten() {
                 if id != old.ruid && id != old.euid && id != old.suid {
@@ -1494,18 +1521,17 @@ impl ProcessData {
         }
 
         if let Some(id) = ruid {
-            creds.ruid = id;
+            update.builder.ids.ruid = id;
         }
         if let Some(id) = euid {
-            creds.euid = id;
+            update.builder.ids.euid = id;
         }
         if let Some(id) = suid {
-            creds.suid = id;
+            update.builder.ids.suid = id;
         }
-        creds.fsuid = creds.euid;
-        let new = *creds;
-        drop(creds);
-        self.fixup_capabilities_for_uid_change(old, new);
+        update.builder.ids.fsuid = update.builder.ids.euid;
+        Self::fixup_capabilities_for_uid_change(old, update.builder.ids, &mut update.builder.caps);
+        update.finish()?.commit();
         Ok(())
     }
 
@@ -1515,9 +1541,9 @@ impl ProcessData {
         egid: Option<u32>,
         sgid: Option<u32>,
     ) -> AxResult<()> {
-        let can_setgid = self.has_effective_capability(CAP_SETGID);
-        let mut creds = self.creds.lock();
-        let old = *creds;
+        let mut update = self.credential.prepare();
+        let can_setgid = update.old().has_effective_capability(CAP_SETGID);
+        let old = update.builder.ids;
         if !can_setgid {
             for id in [rgid, egid, sgid].into_iter().flatten() {
                 if id != old.rgid && id != old.egid && id != old.sgid {
@@ -1527,55 +1553,66 @@ impl ProcessData {
         }
 
         if let Some(id) = rgid {
-            creds.rgid = id;
+            update.builder.ids.rgid = id;
         }
         if let Some(id) = egid {
-            creds.egid = id;
+            update.builder.ids.egid = id;
         }
         if let Some(id) = sgid {
-            creds.sgid = id;
+            update.builder.ids.sgid = id;
         }
-        creds.fsgid = creds.egid;
+        update.builder.ids.fsgid = update.builder.ids.egid;
+        update.finish()?.commit();
         Ok(())
     }
 
-    pub fn setfsuid(&self, fsuid: u32) -> u32 {
-        let can_setuid = self.has_effective_capability(CAP_SETUID);
-        let mut creds = self.creds.lock();
-        let old_fsuid = creds.fsuid;
+    pub fn setfsuid(&self, fsuid: u32) -> AxResult<u32> {
+        let mut update = self.credential.prepare();
+        let can_setuid = update.old().has_effective_capability(CAP_SETUID);
+        let old_fsuid = update.builder.ids.fsuid;
         if fsuid == u32::MAX {
-            return old_fsuid;
+            return Ok(old_fsuid);
         }
         if can_setuid
-            || fsuid == creds.ruid
-            || fsuid == creds.euid
-            || fsuid == creds.suid
-            || fsuid == creds.fsuid
+            || fsuid == update.builder.ids.ruid
+            || fsuid == update.builder.ids.euid
+            || fsuid == update.builder.ids.suid
+            || fsuid == update.builder.ids.fsuid
         {
-            creds.fsuid = fsuid;
+            update.builder.ids.fsuid = fsuid;
         }
-        let new_fsuid = creds.fsuid;
-        drop(creds);
-        self.fixup_capabilities_for_fsuid_change(old_fsuid, new_fsuid);
-        old_fsuid
+        if update.builder.ids.fsuid == old_fsuid {
+            return Ok(old_fsuid);
+        }
+        Self::fixup_capabilities_for_fsuid_change(
+            old_fsuid,
+            update.builder.ids.fsuid,
+            &mut update.builder.caps,
+        );
+        update.finish()?.commit();
+        Ok(old_fsuid)
     }
 
-    pub fn setfsgid(&self, fsgid: u32) -> u32 {
-        let can_setgid = self.has_effective_capability(CAP_SETGID);
-        let mut creds = self.creds.lock();
-        let old_fsgid = creds.fsgid;
+    pub fn setfsgid(&self, fsgid: u32) -> AxResult<u32> {
+        let mut update = self.credential.prepare();
+        let can_setgid = update.old().has_effective_capability(CAP_SETGID);
+        let old_fsgid = update.builder.ids.fsgid;
         if fsgid == u32::MAX {
-            return old_fsgid;
+            return Ok(old_fsgid);
         }
         if can_setgid
-            || fsgid == creds.rgid
-            || fsgid == creds.egid
-            || fsgid == creds.sgid
-            || fsgid == creds.fsgid
+            || fsgid == update.builder.ids.rgid
+            || fsgid == update.builder.ids.egid
+            || fsgid == update.builder.ids.sgid
+            || fsgid == update.builder.ids.fsgid
         {
-            creds.fsgid = fsgid;
+            update.builder.ids.fsgid = fsgid;
         }
-        old_fsgid
+        if update.builder.ids.fsgid == old_fsgid {
+            return Ok(old_fsgid);
+        }
+        update.finish()?.commit();
+        Ok(old_fsgid)
     }
 
     pub fn ptrace_tracer(&self) -> Option<Pid> {

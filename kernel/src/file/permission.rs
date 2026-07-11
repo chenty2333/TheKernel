@@ -382,7 +382,7 @@ mod tests {
             let word = capability as usize / u32::BITS as usize;
             effective[word] |= 1 << (capability % u32::BITS);
         }
-        DacCredentialView::new(uid, gid, groups.to_vec(), effective)
+        DacCredentialView::try_for_test(uid, gid, groups, effective).unwrap()
     }
 
     fn directory_metadata(mode: u16, uid: u32, gid: u32) -> Metadata {

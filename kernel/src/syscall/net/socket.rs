@@ -41,7 +41,8 @@ const SOCK_CLOEXEC_NONBLOCK_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
 fn current_unix_credentials() -> UnixCredentials {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    UnixCredentials::new(proc_data.proc.pid(), proc_data.euid(), proc_data.egid())
+    let ids = proc_data.current_cred().ids();
+    UnixCredentials::new(proc_data.proc.pid(), ids.euid, ids.egid)
 }
 
 fn require_bind_permissions(addr: &SocketAddrEx) -> AxResult<()> {

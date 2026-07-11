@@ -163,7 +163,8 @@ fn prepare_signal_for_target(
         return Ok(PreparedSignal::unqueued(info));
     }
     let limit = target.rlim.read()[RLIMIT_SIGPENDING].current;
-    match target.user_ns().try_signal_queue_accounts(target.uid()) {
+    let cred = target.current_cred();
+    match cred.user_ns().try_signal_queue_accounts(cred.ids().ruid) {
         Ok((per_user, global)) => {
             prepare_signal_with_accounts(info, policy, limit, &per_user, &global)
         }

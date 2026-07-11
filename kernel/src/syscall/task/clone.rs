@@ -23,8 +23,8 @@ use crate::{
     pseudofs::cgroup,
     syscall::inherit_proc_shm,
     task::{
-        AsThread, ProcessData, Thread, prepare_task_table_admission, try_new_user_task, try_tasks,
-        vm_write_in_aspace,
+        AsThread, Cred, ProcessData, Thread, prepare_task_table_admission, try_new_user_task,
+        try_tasks, vm_write_in_aspace,
     },
 };
 
@@ -157,9 +157,11 @@ bitflags! {
 }
 
 fn check_rlimit_nproc(proc_data: &ProcessData) -> AxResult<()> {
-    if proc_data.uid() == 0
-        || proc_data.has_effective_capability(CAP_SYS_RESOURCE)
-        || proc_data.has_effective_capability(CAP_SYS_ADMIN)
+    let cred = proc_data.current_cred();
+    let uid = cred.ids().ruid;
+    if uid == 0
+        || cred.has_effective_capability(CAP_SYS_RESOURCE)
+        || cred.has_effective_capability(CAP_SYS_ADMIN)
     {
         return Ok(());
     }
@@ -169,12 +171,11 @@ fn check_rlimit_nproc(proc_data: &ProcessData) -> AxResult<()> {
         return Ok(());
     }
 
-    let uid = proc_data.uid();
     let count = try_tasks()?
         .into_iter()
         .filter(|task| {
             let thread = task.as_thread();
-            !thread.pending_exit() && thread.proc_data.uid() == uid
+            !thread.pending_exit() && thread.proc_data.current_cred().ids().ruid == uid
         })
         .count() as u64;
 
@@ -415,10 +416,12 @@ impl CloneArgs {
             } else {
                 old_proc_data.pid_ns()
             };
-            let user_ns = if flags.contains(CloneFlags::NEWUSER) {
-                old_proc_data.user_ns().try_fork(old_proc_data.euid())?
+            let parent_cred = old_proc_data.current_cred();
+            let child_cred = if flags.contains(CloneFlags::NEWUSER) {
+                let user_ns = parent_cred.user_ns().try_fork(parent_cred.euid())?;
+                Cred::try_with_user_ns(&parent_cred, user_ns)?
             } else {
-                old_proc_data.user_ns()
+                parent_cred
             };
             let uts_ns = if flags.contains(CloneFlags::NEWUTS) {
                 old_proc_data.uts_ns().try_fork()?
@@ -483,22 +486,15 @@ impl CloneArgs {
                 net_ns,
                 cgroup_ns,
                 pid_ns,
-                user_ns,
+                child_cred,
                 uts_ns,
                 time_ns,
             )?;
             proc_data.set_umask(old_proc_data.umask());
             *proc_data.rlim.write() = old_proc_data.rlim.read().clone();
-            proc_data.set_credentials(old_proc_data.credentials());
-            proc_data.set_capability_state(old_proc_data.capability_state());
-            proc_data.set_supplementary_groups(old_proc_data.try_supplementary_groups()?);
             proc_data.set_heap_top(old_proc_data.get_heap_top());
             proc_data.try_inherit_mempolicy_from(old_proc_data)?;
             proc_data.inherit_timerslack_from(old_proc_data);
-            if old_proc_data.no_new_privs() {
-                proc_data.set_no_new_privs();
-            }
-
             let thread_admission = proc_data.prepare_thread(tid)?;
             (proc_data, Some(process_admission), thread_admission)
         };

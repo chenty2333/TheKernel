@@ -5,7 +5,7 @@ use axtask::current;
 use linux_raw_sys::general::{CAP_KILL, CAP_SYS_PTRACE, CAP_SYS_RESOURCE};
 use starry_signal::Signo;
 
-use super::{AsThread, Credentials, ProcessData, UserNamespace};
+use super::{AsThread, Cred, Credentials, ProcessData, UserNamespace};
 
 #[derive(Clone, Copy)]
 pub(crate) enum PtraceCredentialMode {
@@ -38,11 +38,11 @@ pub(crate) fn capability_snapshot_applies_to_user_namespace(
     has_effective_capability && user_namespace_is_same_or_descendant(actor_user_ns, target_user_ns)
 }
 
-fn has_capability_over(actor: &ProcessData, target: &ProcessData, capability: u32) -> bool {
+fn has_capability_over(actor: &Cred, target: &Cred, capability: u32) -> bool {
     capability_snapshot_applies_to_user_namespace(
         actor.has_effective_capability(capability),
-        &actor.user_ns(),
-        &target.user_ns(),
+        actor.user_ns(),
+        target.user_ns(),
     )
 }
 
@@ -64,13 +64,15 @@ pub(crate) fn check_ptrace_access(
         return Ok(());
     }
 
-    let actor_creds = actor.credentials();
+    let actor_cred = actor.current_cred();
+    let target_cred = target.current_cred();
+    let actor_creds = actor_cred.ids();
     let (caller_uid, caller_gid) = match mode {
         PtraceCredentialMode::Real => (actor_creds.ruid, actor_creds.rgid),
         PtraceCredentialMode::Fs => (actor_creds.fsuid, actor_creds.fsgid),
     };
-    if caller_id_matches_all_target_ids(caller_uid, caller_gid, target.credentials())
-        || has_capability_over(actor, target, CAP_SYS_PTRACE)
+    if caller_id_matches_all_target_ids(caller_uid, caller_gid, target_cred.ids())
+        || has_capability_over(&actor_cred, &target_cred, CAP_SYS_PTRACE)
     {
         Ok(())
     } else {
@@ -93,9 +95,11 @@ pub(crate) fn check_current_prlimit_access(target: &ProcessData) -> AxResult<()>
         return Ok(());
     }
 
-    let actor_creds = actor.credentials();
-    if caller_id_matches_all_target_ids(actor_creds.ruid, actor_creds.rgid, target.credentials())
-        || has_capability_over(actor, target, CAP_SYS_RESOURCE)
+    let actor_cred = actor.current_cred();
+    let target_cred = target.current_cred();
+    let actor_creds = actor_cred.ids();
+    if caller_id_matches_all_target_ids(actor_creds.ruid, actor_creds.rgid, target_cred.ids())
+        || has_capability_over(&actor_cred, &target_cred, CAP_SYS_RESOURCE)
     {
         Ok(())
     } else {
@@ -112,14 +116,16 @@ pub(crate) fn check_signal_access(
         return Ok(());
     }
 
-    let actor_creds = actor.credentials();
-    let target_creds = target.credentials();
+    let actor_cred = actor.current_cred();
+    let target_cred = target.current_cred();
+    let actor_creds = actor_cred.ids();
+    let target_creds = target_cred.ids();
     let ids_match = [actor_creds.ruid, actor_creds.euid]
         .into_iter()
         .any(|uid| uid == target_creds.ruid || uid == target_creds.suid);
     let same_session = signal == Some(Signo::SIGCONT)
         && actor.proc.group().session().sid() == target.proc.group().session().sid();
-    if ids_match || same_session || has_capability_over(actor, target, CAP_KILL) {
+    if ids_match || same_session || has_capability_over(&actor_cred, &target_cred, CAP_KILL) {
         Ok(())
     } else {
         Err(AxError::OperationNotPermitted)

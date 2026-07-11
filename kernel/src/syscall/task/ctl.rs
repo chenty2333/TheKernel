@@ -207,15 +207,17 @@ fn numa_target_process(pid: i32) -> AxResult<Arc<ProcessData>> {
 }
 
 fn check_numa_target_permission(target: &ProcessData) -> AxResult<()> {
-    if current_has_capability(CAP_SYS_NICE) {
-        return Ok(());
-    }
-
     let curr = current();
     let actor = &curr.as_thread().proc_data;
+    let actor_cred = actor.current_cred();
+    if actor_cred.has_effective_capability(CAP_SYS_NICE) {
+        return Ok(());
+    }
+    let actor_ids = actor_cred.ids();
+    let target_ids = target.current_cred().ids();
     if actor.proc.pid() == target.proc.pid()
-        || actor.euid() == target.uid()
-        || actor.euid() == target.euid()
+        || actor_ids.euid == target_ids.ruid
+        || actor_ids.euid == target_ids.euid
     {
         Ok(())
     } else {
@@ -614,7 +616,11 @@ pub fn sys_capget(
     }
 
     let proc_data = resolve_cap_process(header)?;
-    write_cap_data(data, header.version, proc_data.capability_state())?;
+    write_cap_data(
+        data,
+        header.version,
+        proc_data.current_cred().capabilities(),
+    )?;
     Ok(0)
 }
 
@@ -630,29 +636,28 @@ pub fn sys_capset(
     }
 
     let new_state = read_cap_data(data, header.version)?;
-    let mut old_state = proc_data.capability_state();
+    proc_data.try_update_capability_state(|old_state, proposed| {
+        if !cap_set_subset(new_state.effective, new_state.permitted)
+            || !cap_set_subset(new_state.permitted, old_state.permitted)
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
 
-    if !cap_set_subset(new_state.effective, new_state.permitted) {
-        return Err(AxError::OperationNotPermitted);
-    }
-    if !cap_set_subset(new_state.permitted, old_state.permitted) {
-        return Err(AxError::OperationNotPermitted);
-    }
+        let allowed_inheritable = if old_state.has_effective(CAP_SETPCAP) {
+            cap_set_union(old_state.inheritable, old_state.bounding)
+        } else {
+            cap_set_union(old_state.inheritable, old_state.permitted)
+        };
+        if !cap_set_subset(new_state.inheritable, allowed_inheritable) {
+            return Err(AxError::OperationNotPermitted);
+        }
 
-    let allowed_inheritable = if old_state.has_effective(CAP_SETPCAP) {
-        cap_set_union(old_state.inheritable, old_state.bounding)
-    } else {
-        cap_set_union(old_state.inheritable, old_state.permitted)
-    };
-    if !cap_set_subset(new_state.inheritable, allowed_inheritable) {
-        return Err(AxError::OperationNotPermitted);
-    }
-
-    old_state.effective = new_state.effective;
-    old_state.permitted = new_state.permitted;
-    old_state.inheritable = new_state.inheritable;
-    old_state.reconcile_ambient();
-    proc_data.set_capability_state(old_state);
+        proposed.effective = new_state.effective;
+        proposed.permitted = new_state.permitted;
+        proposed.inheritable = new_state.inheritable;
+        proposed.reconcile_ambient();
+        Ok(())
+    })?;
 
     Ok(0)
 }
@@ -926,7 +931,7 @@ pub fn sys_prctl(
             if arg2 != 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
                 return Err(AxError::InvalidInput);
             }
-            current().as_thread().proc_data.set_no_new_privs();
+            current().as_thread().proc_data.set_no_new_privs()?;
         }
         PR_GET_NO_NEW_PRIVS => {
             if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
@@ -954,7 +959,7 @@ pub fn sys_prctl(
                     if arg3 != 0 || arg4 != 0 || arg5 != 0 {
                         return Err(AxError::InvalidInput);
                     }
-                    proc_data.clear_ambient_capabilities();
+                    proc_data.clear_ambient_capabilities()?;
                 }
                 PR_CAP_AMBIENT_IS_SET => {
                     if arg4 != 0 || arg5 != 0 {
@@ -980,9 +985,6 @@ pub fn sys_prctl(
         PR_CAPBSET_DROP => {
             let curr = current();
             let proc_data = &curr.as_thread().proc_data;
-            if !proc_data.has_effective_capability(CAP_SETPCAP) {
-                return Err(AxError::OperationNotPermitted);
-            }
             proc_data.drop_bounding_capability(arg2 as u32)?;
         }
         PR_CAPBSET_READ => {
@@ -997,9 +999,6 @@ pub fn sys_prctl(
             }
             let curr = current();
             let proc_data = &curr.as_thread().proc_data;
-            if !proc_data.has_effective_capability(CAP_SETPCAP) {
-                return Err(AxError::OperationNotPermitted);
-            }
             proc_data.set_securebits(arg2 as u32)?;
         }
         PR_GET_SECUREBITS => {

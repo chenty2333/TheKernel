@@ -965,6 +965,7 @@ fn can_migrate_with_credentials(
     credentials: OpenCredentials,
     target: &crate::task::ProcessData,
 ) -> bool {
+    let target_ids = target.current_cred().ids();
     credentials.euid == 0
         || credentials.fsuid == 0
         || [
@@ -974,7 +975,7 @@ fn can_migrate_with_credentials(
             credentials.fsuid,
         ]
         .into_iter()
-        .any(|uid| uid == target.uid() || uid == target.euid() || uid == target.suid())
+        .any(|uid| uid == target_ids.ruid || uid == target_ids.euid || uid == target_ids.suid)
 }
 
 fn can_migrate_from_open_cgroup_namespace(credentials: OpenCredentials) -> bool {

@@ -329,7 +329,8 @@ pub(crate) fn set_mq_msgsize_max(value: usize) {
 fn current_ids() -> (u32, u32) {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    (proc_data.fsuid(), proc_data.fsgid())
+    let ids = proc_data.current_cred().ids();
+    (ids.fsuid, ids.fsgid)
 }
 
 fn normalize_name(name: *const c_char) -> AxResult<String> {
@@ -381,16 +382,18 @@ fn read_create_attr(attr: *const MqAttr) -> AxResult<MqAttr> {
 fn has_queue_permission(queue: &PosixMqueue, access: MqAccess) -> bool {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    if proc_data.has_effective_capability(CAP_DAC_OVERRIDE) {
+    let cred = proc_data.current_cred();
+    let ids = cred.ids();
+    if cred.has_effective_capability(CAP_DAC_OVERRIDE) {
         return true;
     }
 
     let owner_bits = (queue.mode >> 6) & 0o7;
     let group_bits = (queue.mode >> 3) & 0o7;
     let other_bits = queue.mode & 0o7;
-    let bits = if proc_data.fsuid() == queue.uid {
+    let bits = if ids.fsuid == queue.uid {
         owner_bits
-    } else if proc_data.fsgid() == queue.gid || proc_data.is_in_fs_group(queue.gid) {
+    } else if ids.fsgid == queue.gid || cred.groups().contains(queue.gid) {
         group_bits
     } else {
         other_bits
@@ -708,7 +711,8 @@ pub fn sys_mq_unlink(name: *const c_char) -> AxResult<isize> {
         let queue = queue.lock();
         let curr = current();
         let proc_data = &curr.as_thread().proc_data;
-        if proc_data.fsuid() != queue.uid && !proc_data.has_effective_capability(CAP_FOWNER) {
+        let cred = proc_data.current_cred();
+        if cred.ids().fsuid != queue.uid && !cred.has_effective_capability(CAP_FOWNER) {
             return Err(AxError::PermissionDenied);
         }
     }

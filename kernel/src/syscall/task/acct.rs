@@ -186,10 +186,11 @@ pub fn sys_acct(name: *const c_char) -> AxResult<isize> {
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
+    let ids = proc_data.current_cred().ids();
     let accounting = AccountingFile {
         file,
-        uid: proc_data.uid(),
-        gid: proc_data.gid(),
+        uid: ids.ruid,
+        gid: ids.rgid,
     };
     let _ = close_file_like(fd);
     *PROCESS_ACCOUNTING.lock() = Some(accounting);

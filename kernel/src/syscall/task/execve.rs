@@ -381,6 +381,17 @@ fn do_execve(
         executable::release(executable_key);
         return Err(err);
     }
+    // Credential allocation and invariant checks must finish before the first
+    // irreversible exec action. The prepared value remains invisible until
+    // the address-space commit below.
+    let prepared_exec_cred = match proc_data.prepare_clear_keep_caps_on_exec() {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            proc_data.end_exec(curr_tid);
+            executable::release(executable_key);
+            return Err(err);
+        }
+    };
 
     // A non-leader exec adopts the thread-group ID. Its lookup bucket was
     // admitted before de-threading, so this publication cannot fail before
@@ -404,7 +415,9 @@ fn do_execve(
     let old_aspace = proc_data.replace_aspace(new_aspace);
     set_current_user_page_table_root(new_root);
     drop(old_aspace);
-    proc_data.clear_keep_caps_on_exec();
+    if let Some(prepared) = prepared_exec_cred {
+        prepared.commit();
+    }
     curr.as_thread().set_tid(proc_data.proc.pid());
     proc_data.replace_executable(executable_key);
 

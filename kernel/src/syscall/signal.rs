@@ -159,11 +159,13 @@ fn check_zombie_signal_permission(pid: Pid, signal: Option<Signo>) -> AxResult<b
 
     let actor = current();
     let actor_proc = &actor.as_thread().proc_data;
+    let actor_cred = actor_proc.current_cred();
+    let actor_ids = actor_cred.ids();
     let snapshot = process.zombie_snapshot().ok_or(AxError::NoSuchProcess)?;
-    let allowed = [actor_proc.uid(), actor_proc.euid()]
+    let allowed = [actor_ids.ruid, actor_ids.euid]
         .into_iter()
         .any(|id| id == snapshot.uid)
-        || actor_proc.has_effective_capability(CAP_KILL)
+        || actor_cred.has_effective_capability(CAP_KILL)
         || (signal == Some(Signo::SIGCONT)
             && actor_proc.proc.group().session().sid() == process.group().session().sid());
     if allowed {

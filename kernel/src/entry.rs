@@ -14,7 +14,7 @@ use crate::{
     },
     pseudofs::{self, dev::tty::N_TTY},
     task::{
-        CgroupNamespace, PidNamespace, ProcessData, Thread, TimeNamespace, UserNamespace,
+        CgroupNamespace, Cred, PidNamespace, ProcessData, Thread, TimeNamespace, UserNamespace,
         UtsNamespace, add_task_to_table, spawn_alarm_task, try_new_user_task,
     },
 };
@@ -115,6 +115,8 @@ pub fn init(args: &[String], envs: &[String]) {
     let exit_fd_table =
         Arc::try_new(FdTable::new().expect("Failed to allocate init exit fd-table identity"))
             .expect("Failed to allocate init exit fd table");
+    let user_ns = UserNamespace::try_new_root().expect("Failed to allocate init user namespace");
+    let credential = Cred::try_root(user_ns).expect("Failed to allocate init credential");
     let proc = ProcessData::try_new(
         proc,
         exe_path,
@@ -128,7 +130,7 @@ pub fn init(args: &[String], envs: &[String]) {
         axnet::default_stack().clone(),
         CgroupNamespace::try_new_root().expect("Failed to allocate init cgroup namespace"),
         PidNamespace::try_new_root().expect("Failed to allocate init pid namespace"),
-        UserNamespace::try_new_root().expect("Failed to allocate init user namespace"),
+        credential,
         Arc::try_new(UtsNamespace::new_default()).expect("Failed to allocate init UTS namespace"),
         Arc::try_new(TimeNamespace::new_default()).expect("Failed to allocate init time namespace"),
     )

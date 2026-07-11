@@ -203,8 +203,9 @@ impl ShmInner {
 
         let curr = current();
         let proc_data = &curr.as_thread().proc_data;
-        let uid = proc_data.euid();
-        let gid = proc_data.egid();
+        let ids = proc_data.current_cred().ids();
+        let uid = ids.euid;
+        let gid = ids.egid;
         let wants_read = requested_mode & 0o444 != 0;
         let wants_write = requested_mode & 0o222 != 0;
         if wants_read && !super::has_ipc_permission(&self.shmid_ds.shm_perm, uid, gid, false) {
@@ -852,8 +853,9 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let cur_pid = proc_data.proc.pid();
-    let euid = proc_data.euid();
-    let egid = proc_data.egid();
+    let ids = proc_data.current_cred().ids();
+    let euid = ids.euid;
+    let egid = ids.egid;
 
     if huge {
         return Err(AxError::from(LinuxError::EINVAL));
@@ -938,17 +940,13 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let pid = proc_data.proc.pid();
+    let ids = proc_data.current_cred().ids();
     let (mut mapping_flags, page_num, existing_pages) = {
         let state = shm_inner.lock();
         if state.rmid {
             return Err(AxError::from(LinuxError::EIDRM));
         }
-        if !can_attach_shm(
-            &state.shmid_ds.shm_perm,
-            proc_data.euid(),
-            proc_data.egid(),
-            read_only,
-        ) {
+        if !can_attach_shm(&state.shmid_ds.shm_perm, ids.euid, ids.egid, read_only) {
             return Err(AxError::from(LinuxError::EACCES));
         }
         (
@@ -1062,8 +1060,9 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
 pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize> {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    let current_uid = proc_data.euid();
-    let current_gid = proc_data.egid();
+    let ids = proc_data.current_cred().ids();
+    let current_uid = ids.euid;
+    let current_gid = ids.egid;
     let cmd = cmd as i32;
     let _transaction = SHM_TRANSACTION.lock();
 

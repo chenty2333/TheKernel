@@ -211,8 +211,10 @@ fn current_has_capability(cap: u32) -> bool {
 
 fn current_can_preserve_setgid(gid: u32) -> bool {
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    proc_data.is_in_fs_group(gid) || proc_data.has_effective_capability(CAP_FSETID)
+    let cred = curr.as_thread().proc_data.current_cred();
+    cred.ids().fsgid == gid
+        || cred.groups().contains(gid)
+        || cred.has_effective_capability(CAP_FSETID)
 }
 
 fn chown_mode_after_update(meta: &Metadata) -> NodePermission {
@@ -228,19 +230,20 @@ fn chown_mode_after_update(meta: &Metadata) -> NodePermission {
 }
 
 fn check_chown_permission(meta: &Metadata, uid: u32, gid: u32) -> AxResult<()> {
-    if current_has_capability(CAP_CHOWN) {
-        return Ok(());
-    }
-
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
+    let cred = proc_data.current_cred();
+    if cred.has_effective_capability(CAP_CHOWN) {
+        return Ok(());
+    }
+    let ids = cred.ids();
     if uid != meta.uid {
         return Err(AxError::OperationNotPermitted);
     }
-    if proc_data.fsuid() != meta.uid {
+    if ids.fsuid != meta.uid {
         return Err(AxError::OperationNotPermitted);
     }
-    if gid != meta.gid && !proc_data.is_in_fs_group(gid) {
+    if gid != meta.gid && ids.fsgid != gid && !cred.groups().contains(gid) {
         return Err(AxError::OperationNotPermitted);
     }
     Ok(())
@@ -249,7 +252,8 @@ fn check_chown_permission(meta: &Metadata, uid: u32, gid: u32) -> AxResult<()> {
 fn check_chmod_permission(meta: &Metadata) -> AxResult<()> {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    if proc_data.fsuid() == meta.uid || proc_data.has_effective_capability(CAP_FOWNER) {
+    let cred = proc_data.current_cred();
+    if cred.ids().fsuid == meta.uid || cred.has_effective_capability(CAP_FOWNER) {
         Ok(())
     } else {
         Err(AxError::OperationNotPermitted)

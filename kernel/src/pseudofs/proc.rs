@@ -963,7 +963,9 @@ fn task_status(task: &AxTaskRef) -> String {
     };
     let ppid = proc_data.proc.parent().map_or(0, |parent| parent.pid());
     let threads = proc_data.proc.thread_count();
-    let caps = proc_data.capability_state();
+    let cred = proc_data.current_cred();
+    let ids = cred.ids();
+    let caps = cred.capabilities();
     let cpu_mask = task_cpu_mask_bits(task);
     let mem_mask = PROC_NUMA_NODEMASK;
     let cpu_width = axhal::cpu_num().max(1);
@@ -1002,19 +1004,19 @@ fn task_status(task: &AxTaskRef) -> String {
         proc_data.proc.pid(),
         task.as_thread().tid(),
         ppid,
-        proc_data.uid(),
-        proc_data.euid(),
-        proc_data.suid(),
-        proc_data.fsuid(),
-        proc_data.gid(),
-        proc_data.egid(),
-        proc_data.sgid(),
-        proc_data.fsgid(),
+        ids.ruid,
+        ids.euid,
+        ids.suid,
+        ids.fsuid,
+        ids.rgid,
+        ids.egid,
+        ids.sgid,
+        ids.fsgid,
         vm_size_kb,
         vm_rss_kb,
         locked_kb,
         threads,
-        proc_data.no_new_privs() as u8,
+        cred.no_new_privs() as u8,
         format_cap_set(caps.inheritable),
         format_cap_set(caps.permitted),
         format_cap_set(caps.effective),
@@ -1368,7 +1370,9 @@ impl ProcNamespaceFile {
             ProcNamespaceKind::TimeForChildren => {
                 ProcNamespaceObject::Time(proc_data.time_ns_for_children())
             }
-            ProcNamespaceKind::User => ProcNamespaceObject::User(proc_data.user_ns()),
+            ProcNamespaceKind::User => {
+                ProcNamespaceObject::User(proc_data.current_cred().user_ns().clone())
+            }
             ProcNamespaceKind::Uts => ProcNamespaceObject::Uts(proc_data.uts_ns()),
         };
         Self::from_object(fs, kind, object)
