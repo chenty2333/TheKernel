@@ -1,0 +1,4 @@
+#### OS COMP TEST GROUP START mystery-musl ####
+panicked at kernel/src/example.rs:1
+#### OS COMP TEST GROUP END mystery-musl ####
+shutdown

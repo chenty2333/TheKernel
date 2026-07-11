@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  per-commit:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/chenty2333/thekernel-dev:latest
+    env:
+      CI_DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Per-commit gate
+        run: ./scripts/ci/per-commit.sh
+
+      - name: Upload gate logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: per-commit-logs
+          path: .state/ci/per-commit/
+          include-hidden-files: true
+
+  # GitLab is the authoritative remote CI. This mirror becomes active only
+  # when the GitHub repository is given a self-hosted runner with both official
+  # root images mounted at /opt/oskernel/testsuites.
+  dual-arch-pr:
+    if: >-
+      ${{ vars.THEKERNEL_QEMU_CI == '1' &&
+          (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
+    runs-on:
+      - self-hosted
+      - linux
+      - thekernel-qemu
+    container:
+      image: ghcr.io/chenty2333/thekernel-dev:latest
+      options: --volume /opt/oskernel/testsuites:/opt/oskernel/testsuites:ro
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+      OSCOMP_TESTSUITE_DIR: /opt/oskernel/testsuites
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Dual-architecture release and boot gate
+        run: ./scripts/ci/pr-gate.sh
+
+      - name: Upload PR gate logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dual-arch-pr-logs
+          path: |
+            .state/ci/pr/
+            kernel-rv
+            kernel-la
+          include-hidden-files: true

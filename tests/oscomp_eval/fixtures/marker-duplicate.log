@@ -1,0 +1,7 @@
+#### OS COMP TEST GROUP START basic-musl ####
+first
+#### OS COMP TEST GROUP END basic-musl ####
+#### OS COMP TEST GROUP START basic-musl ####
+second
+#### OS COMP TEST GROUP END basic-musl ####
+shutdown

@@ -1,0 +1,6 @@
+#### OS COMP TEST GROUP START basic-musl ####
+basic output
+#### OS COMP TEST GROUP START lua-musl ####
+lua output
+#### OS COMP TEST GROUP END lua-musl ####
+shutdown
