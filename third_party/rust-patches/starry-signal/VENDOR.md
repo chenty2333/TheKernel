@@ -57,8 +57,8 @@ The current bounded-signal modernization slice additionally maintains:
   TheKernel enables the crate's `multitask` feature, making this mutex the
   sleepable `axsync::Mutex`; the short actions/pending locks only publish or
   detach already-owned state;
-- `kspin/smp` in both maintained manifests so standalone concurrent tests use
-  a real inter-CPU lock instead of the single-core no-lock specialization;
+- `kspin/smp` in the maintained `Cargo.toml` so standalone concurrent tests
+  use a real inter-CPU lock instead of the single-core no-lock specialization;
 - ABI flag and `SignalInfo` compatibility updates.
 
 The bounded queue and low-resource behavior are compared against Linux commit
@@ -100,8 +100,9 @@ signalfd as a whole have been extracted into this crate.
 All six manifest-declared integration tests, the human-readable maintained
 manifest, Cargo VCS record, and Apache-2.0 license remain present. The pristine
 registry archive is identified by the checksum above; local dependency/feature
-changes in `Cargo.toml.orig` are part of this explicit patch ledger rather than
-being attributed to upstream. The test adapter avoids a
+changes live only in the maintained `Cargo.toml` and are part of this explicit
+patch ledger rather than being attributed to upstream. `Cargo.toml.orig`
+remains the exact published manifest. The test adapter avoids a
 `MaybeUninit` convenience API unavailable on TheKernel's pinned nightly, and
 the blocked-plus-ignored test reflects Linux behavior: generation is queued
 while blocked even though it would be discarded while unblocked.
