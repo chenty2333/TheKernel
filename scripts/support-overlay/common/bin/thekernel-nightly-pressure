@@ -12,6 +12,9 @@ fail() {
 
 echo CI_NIGHTLY_PRESSURE_START
 test -x /opt/oscomp-support/bin/oscomp-hackstress || fail missing-hackstress
+test -x /opt/oscomp-support/bin/oscomp-signal-mask-alias \
+    || fail missing-signal-mask-alias
+/opt/oscomp-support/bin/oscomp-signal-mask-alias || fail signal-mask-alias
 /opt/oscomp-support/bin/oscomp-hackstress -g 2 -f 4 \
     >/tmp/ci-nightly-hackstress.log 2>&1 &
 stress_pid=$!

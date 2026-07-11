@@ -248,6 +248,9 @@ build_overlay_tools_for_arch() {
         "$REPO_ROOT/scripts/support-tools/sleep.c" \
         -o "$arch_root/overlay/bin/oscomp-sleep"
     "$cc" -O2 -static -s -std=c11 \
+        "$REPO_ROOT/scripts/support-tools/signal-mask-alias.c" \
+        -o "$arch_root/overlay/bin/oscomp-signal-mask-alias"
+    "$cc" -O2 -static -s -std=c11 \
         "$REPO_ROOT/scripts/support-tools/sync-fence.c" \
         -o "$arch_root/overlay/bin/oscomp-sync-fence"
     if [ "$arch" = la ]; then

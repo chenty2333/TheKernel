@@ -59,22 +59,28 @@ pub fn sys_rt_sigprocmask(
     let sig = &curr.as_thread().signal;
     let old = sig.blocked();
 
-    if let Some(oldset) = oldset.nullable() {
-        oldset.vm_write(old)?;
-    }
-
-    if let Some(set) = set.nullable() {
+    // Snapshot the requested mask before writing the old mask back. Linux
+    // permits `set` and `oldset` to alias; BusyBox relies on that contract in
+    // its wait path when it atomically blocks signals and saves the old mask.
+    let new = if let Some(set) = set.nullable() {
         let set = unsafe { set.vm_read_uninit()?.assume_init() };
-
-        let set = match how as u32 {
+        Some(match how as u32 {
             SIG_BLOCK => old | set,
             SIG_UNBLOCK => old & !set,
             SIG_SETMASK => set,
             _ => return Err(AxError::InvalidInput),
-        };
+        })
+    } else {
+        None
+    };
 
-        debug!("sys_rt_sigprocmask <= {set:?}");
-        sig.set_blocked(set);
+    if let Some(new) = new {
+        debug!("sys_rt_sigprocmask <= {new:?}");
+        sig.set_blocked(new);
+    }
+
+    if let Some(oldset) = oldset.nullable() {
+        oldset.vm_write(old)?;
     }
 
     Ok(0)
