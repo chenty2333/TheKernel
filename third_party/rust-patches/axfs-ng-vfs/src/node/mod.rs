@@ -2,7 +2,6 @@ mod dir;
 mod file;
 
 use alloc::{
-    borrow::ToOwned,
     string::String,
     sync::{Arc, Weak},
     vec,
@@ -12,7 +11,7 @@ use core::{
     any::{Any, TypeId},
     fmt,
     hash::{Hash, Hasher},
-    iter, mem,
+    mem,
     ops::Deref,
     ptr,
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
@@ -29,7 +28,7 @@ use smallvec::SmallVec;
 
 use crate::{
     FilesystemOps, Metadata, MetadataUpdate, Mutex, MutexGuard, NodeType, VfsError, VfsResult,
-    path::PathBuf,
+    path::{PathBuf, try_build_absolute_path},
 };
 
 bitflags! {
@@ -781,24 +780,24 @@ impl DirEntry {
         Ok(false)
     }
 
-    pub(crate) fn collect_absolute_path(&self, components: &mut Vec<String>) {
+    pub(crate) fn try_collect_absolute_path(&self, components: &mut Vec<Self>) -> VfsResult<()> {
         let mut current = self.clone();
         loop {
-            components.push(current.name().to_owned());
+            components.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+            components.push(current.clone());
             if let Some(parent) = current.parent() {
                 current = parent;
             } else {
                 break;
             }
         }
+        Ok(())
     }
 
     pub fn absolute_path(&self) -> VfsResult<PathBuf> {
-        let mut components = vec![];
-        self.collect_absolute_path(&mut components);
-        Ok(iter::once("/")
-            .chain(components.iter().map(String::as_str).rev())
-            .collect())
+        let mut components = Vec::new();
+        self.try_collect_absolute_path(&mut components)?;
+        try_build_absolute_path(&components, Self::name)
     }
 
     pub fn is_file(&self) -> bool {

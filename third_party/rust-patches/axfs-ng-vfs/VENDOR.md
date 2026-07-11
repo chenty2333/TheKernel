@@ -30,6 +30,9 @@ The published archive contains no `tests/` files, so there are no upstream test 
 - `f66f1ff` removed mount ownership cycles and defined detach/flush lifecycle.
 - `ba0a4aa` added generic pathname-walk admission rather than syscall-local prefix checks.
 - `d38fb1b` hardened fallible allocation and object lifetime boundaries.
+- The current path-snapshot slice makes component retention, capacity
+  arithmetic, and final `PathBuf` construction fallible before Linux-ABI or
+  procfs consumers render the result.
 - Maintained delta: generic dentries, mounts, pathwalk hooks, metadata, and node contracts; Linux DAC decisions are injected from the ABI layer.
 
 Commit IDs are navigation hints for the current rewritten history. The exact

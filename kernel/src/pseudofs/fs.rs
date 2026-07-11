@@ -143,8 +143,9 @@ impl SimpleFsNode {
     }
 
     /// Creates a userspace-triggered pseudo node without an abort-on-OOM slab
-    /// growth. The reserved inode is released if a later fallible constructor
-    /// step drops this node before publication.
+    /// growth. Ephemeral inode numbers are monotonic and intentionally not
+    /// reused: a later constructor failure consumes an ID, avoiding rollback
+    /// races and identity reuse without retaining any heap allocation.
     pub fn try_new(
         fs: Arc<SimpleFs>,
         node_type: NodeType,

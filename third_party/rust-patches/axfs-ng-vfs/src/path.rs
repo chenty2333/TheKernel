@@ -325,6 +325,60 @@ impl PathBuf {
     }
 }
 
+fn build_absolute_path_with<T, F, R>(
+    components_leaf_to_root: &[T],
+    component_name: F,
+    reserve: R,
+) -> VfsResult<PathBuf>
+where
+    F: Fn(&T) -> &str,
+    R: FnOnce(&mut String, usize) -> VfsResult<()>,
+{
+    let mut capacity = 1usize;
+    for component in components_leaf_to_root.iter().rev() {
+        let name = component_name(component);
+        if name.is_empty() {
+            continue;
+        }
+        capacity = capacity
+            .checked_add(usize::from(capacity != 1))
+            .and_then(|capacity| capacity.checked_add(name.len()))
+            .ok_or(VfsError::NoMemory)?;
+    }
+
+    let mut path = String::new();
+    reserve(&mut path, capacity)?;
+    path.push('/');
+    for component in components_leaf_to_root.iter().rev() {
+        let name = component_name(component);
+        if name.is_empty() {
+            continue;
+        }
+        if path.len() != 1 {
+            path.push('/');
+        }
+        path.push_str(name);
+    }
+    debug_assert!(path.len() <= capacity);
+    Ok(PathBuf::from(path))
+}
+
+/// Builds an absolute path from components collected from leaf to root.
+///
+/// The caller may retain lightweight entry handles instead of cloning every
+/// component name. Both capacity arithmetic and the only output allocation
+/// are fallible, so a userspace-triggered path snapshot reports `NoMemory`
+/// instead of reaching the kernel allocation-error handler.
+pub(crate) fn try_build_absolute_path<T>(
+    components_leaf_to_root: &[T],
+    component_name: impl Fn(&T) -> &str,
+) -> VfsResult<PathBuf> {
+    build_absolute_path_with(components_leaf_to_root, component_name, |path, capacity| {
+        path.try_reserve_exact(capacity)
+            .map_err(|_| VfsError::NoMemory)
+    })
+}
+
 impl<T: AsRef<Path>> FromIterator<T> for PathBuf {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let mut path = PathBuf::new();
@@ -389,6 +443,25 @@ mod test {
     use alloc::vec::Vec;
 
     use super::*;
+
+    #[test]
+    fn fallible_absolute_builder_preserves_order_and_reserve_error() {
+        let components = ["leaf", "parent", ""];
+        assert_eq!(
+            try_build_absolute_path(&components, |component| *component)
+                .unwrap()
+                .as_str(),
+            "/parent/leaf"
+        );
+        assert_eq!(
+            build_absolute_path_with(
+                &components,
+                |component| *component,
+                |_, _| Err(VfsError::NoMemory),
+            ),
+            Err(VfsError::NoMemory)
+        );
+    }
 
     #[test]
     fn test_back_components() {

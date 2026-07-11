@@ -1,12 +1,10 @@
 use alloc::{
-    borrow::ToOwned,
     string::String,
     sync::{Arc, Weak},
-    vec,
     vec::Vec,
 };
 use core::{
-    fmt, iter,
+    fmt,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     task::Context,
 };
@@ -21,7 +19,7 @@ use crate::{
     FilesystemIdentity, FilesystemOps, Metadata, MetadataUpdate, Mutex, MutexGuard,
     NamedCreateOptions, NodeFlags, NodePermission, NodeType, OpenOptions, ReferenceKey, TypeMap,
     VfsError, VfsResult, WeakFilesystemIdentity,
-    path::{DOT, DOTDOT, PathBuf},
+    path::{DOT, DOTDOT, PathBuf, try_build_absolute_path},
 };
 
 static MOUNT_TREE_LOCK: RwLock<()> = RwLock::new(());
@@ -49,6 +47,12 @@ fn optional_lookup<T>(result: VfsResult<T>) -> VfsResult<Option<T>> {
         Err(err) if err.canonicalize() == VfsError::NotFound => Ok(None),
         Err(err) => Err(err),
     }
+}
+
+fn try_push_path_component(components: &mut Vec<DirEntry>, entry: &DirEntry) -> VfsResult<()> {
+    components.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+    components.push(entry.clone());
+    Ok(())
 }
 
 fn reserve_non_root_mount() -> VfsResult<()> {
@@ -934,7 +938,7 @@ impl Location {
 
     pub fn absolute_path(&self) -> VfsResult<PathBuf> {
         let _tree = MOUNT_TREE_LOCK.read();
-        let mut components = vec![];
+        let mut components = Vec::new();
         let mut cur = self.clone();
         let mut visited = HashSet::new();
         visited
@@ -946,15 +950,13 @@ impl Location {
             }
             let mut entry = cur.entry.clone();
             while !entry.ptr_eq(&cur.mountpoint().root) {
-                components.push(entry.name().to_owned());
+                try_push_path_component(&mut components, &entry)?;
                 entry = entry.parent().ok_or(VfsError::InvalidInput)?;
             }
             cur = match cur.mountpoint().location_locked() {
                 Some(loc) => loc,
                 None => {
-                    return Ok(iter::once("/")
-                        .chain(components.iter().map(String::as_str).rev())
-                        .collect());
+                    return try_build_absolute_path(&components, DirEntry::name);
                 }
             };
         }
@@ -963,15 +965,13 @@ impl Location {
 
     /// Returns this entry's path relative to the root of its filesystem mount.
     pub fn path_in_mount(&self) -> VfsResult<PathBuf> {
-        let mut components = vec![];
+        let mut components = Vec::new();
         let mut entry = self.entry.clone();
         while !entry.ptr_eq(&self.mountpoint().root) {
-            components.push(entry.name().to_owned());
+            try_push_path_component(&mut components, &entry)?;
             entry = entry.parent().ok_or(VfsError::InvalidInput)?;
         }
-        Ok(iter::once("/")
-            .chain(components.iter().map(String::as_str).rev())
-            .collect())
+        try_build_absolute_path(&components, DirEntry::name)
     }
 
     pub fn ptr_eq(&self, other: &Self) -> bool {
