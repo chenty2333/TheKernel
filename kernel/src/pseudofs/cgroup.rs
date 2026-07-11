@@ -1197,6 +1197,7 @@ impl DirNodeOps for CgroupDir {
             ..Default::default()
         });
         let entry = self.try_child_entry(name, child.clone())?;
+        options.install_initial_data(&entry)?;
         self.namespace_epoch.fetch_add(1, Ordering::AcqRel);
         children.insert(owned_name, child.clone());
         let now = wall_time();

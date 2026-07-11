@@ -21,14 +21,18 @@ use axfs::{
 use axfs_ng_vfs::{
     AnonymousOptions, CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode,
     DirNodeOps, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata, MetadataUpdate,
-    NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType, Reference, RenameRequest,
-    StatFs, UnlinkRequest, VfsError, VfsResult, WeakDirEntry, path::MAX_NAME_LEN,
+    NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType, NodeUserData, Reference,
+    RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult, WeakDirEntry, path::MAX_NAME_LEN,
 };
 use axhal::{mem::total_ram_size, time::wall_time};
 use axpoll::{IoEvents, Pollable};
+#[cfg(not(test))]
 use axsync::Mutex;
 use hashbrown::{HashMap, HashSet};
+use kspin::SpinNoIrq;
 use memory_addr::PAGE_SIZE_4K;
+#[cfg(test)]
+use spin::Mutex;
 
 const TMPFS_BLOCK_SIZE: u64 = PAGE_SIZE_4K as u64;
 const STAT_BLOCK_UNIT: u64 = 512;
@@ -98,7 +102,10 @@ pub struct MemoryFs {
     namespace: Mutex<()>,
     inodes: Mutex<HashMap<u64, Arc<Inode>>>,
     next_inode: AtomicU64,
-    root: Mutex<Option<DirEntry>>,
+    // `FilesystemInner::drop` may invoke `unmount` without a current task.
+    // Keep the final root ownership move independent of axsync's sleeping
+    // mutex; clones and destruction still happen outside this guard.
+    root: SpinNoIrq<Option<DirEntry>>,
     capacity_pages: Option<u64>,
     allocated_pages: Mutex<u64>,
 }
@@ -133,7 +140,7 @@ impl MemoryFs {
             namespace: Mutex::new(()),
             inodes: Mutex::new(HashMap::new()),
             next_inode: AtomicU64::new(1),
-            root: Mutex::default(),
+            root: SpinNoIrq::new(None),
             capacity_pages: Some(capacity_bytes.div_ceil(TMPFS_BLOCK_SIZE)),
             allocated_pages: Mutex::new(0),
         })
@@ -254,7 +261,8 @@ impl FilesystemOps for MemoryFs {
     }
 
     fn unmount(&self) {
-        self.root.lock().take();
+        let root = self.root.lock().take();
+        drop(root);
     }
 }
 
@@ -735,6 +743,7 @@ struct Inode {
     anonymous_linkable: Mutex<bool>,
     content: NodeContent,
     xattrs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    user_data: NodeUserData,
 }
 
 impl Inode {
@@ -782,6 +791,7 @@ impl Inode {
             anonymous_linkable: Mutex::new(false),
             content,
             xattrs,
+            user_data: NodeUserData::new(),
         })
         .map_err(|_| VfsError::NoMemory)?;
         if let (NodeContent::Dir(dir), Some((dot_name, dotdot_name))) = (&result.content, dot_names)
@@ -1053,6 +1063,10 @@ impl NodeOps for MemoryNode {
     fn flags(&self) -> NodeFlags {
         NodeFlags::ALWAYS_CACHE
     }
+
+    fn persistent_user_data(&self) -> Option<&NodeUserData> {
+        Some(&self.inode.user_data)
+    }
 }
 
 impl FileNodeOps for MemoryNode {
@@ -1203,6 +1217,7 @@ impl DirNodeOps for MemoryNode {
         }
         let inode_ref = InodeRef::try_new_named(&self.fs, &inode)?;
         let entry = self.new_entry(name, options.node_type, inode.clone())?;
+        options.install_initial_data(&entry)?;
         self.fs.publish_inode(inode)?;
         dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
         entries.insert(cache_name, inode_ref);
@@ -1457,11 +1472,12 @@ impl Drop for MemoryNode {
 mod tests {
     use alloc::{
         string::{String, ToString},
+        sync::Arc,
         vec::Vec,
     };
 
     use axfs_ng_vfs::{
-        AnonymousOptions, CreateDisposition, DeviceId, MetadataUpdate, Mountpoint,
+        AnonymousOptions, CreateDisposition, DeviceId, InitialNodeData, MetadataUpdate, Mountpoint,
         NamedCreateOptions, NodePermission, NodeType, VfsError,
     };
 
@@ -1607,6 +1623,7 @@ mod tests {
             permission: NodePermission::from_bits_truncate(0o2640),
             owner: Some((1000, 1001)),
             rdev: Some(DeviceId(0x1234)),
+            initial_data: None,
         };
 
         let created = root
@@ -1624,7 +1641,7 @@ mod tests {
                 "device",
                 &NamedCreateOptions {
                     owner: Some((2000, 2001)),
-                    ..options
+                    ..options.clone()
                 },
                 CreateDisposition::OpenOrCreate,
             )
@@ -1638,7 +1655,7 @@ mod tests {
         let invalid = NamedCreateOptions {
             node_type: NodeType::RegularFile,
             rdev: Some(DeviceId(7)),
-            ..options
+            ..options.clone()
         };
         assert_eq!(
             root.create_named("invalid", &invalid, CreateDisposition::Exclusive)
@@ -1652,7 +1669,52 @@ mod tests {
     }
 
     #[test]
+    fn named_create_publishes_the_exact_prepared_user_data() {
+        struct Marker(u64);
+
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let marker = Arc::new(Marker(0xfeed_beef));
+        let created = root
+            .create_named(
+                "socket",
+                &NamedCreateOptions {
+                    node_type: NodeType::Socket,
+                    permission: NodePermission::from_bits_truncate(0o750),
+                    owner: Some((1000, 1001)),
+                    rdev: None,
+                    initial_data: Some(InitialNodeData::from_shared(marker.clone())),
+                },
+                CreateDisposition::Exclusive,
+            )
+            .unwrap();
+        let attached = created.entry.user_data().get::<Marker>().unwrap();
+        assert!(Arc::ptr_eq(&attached, &marker));
+        assert_eq!(attached.0, 0xfeed_beef);
+
+        let _alias = root.link("socket-alias", &created.entry).unwrap();
+        let unrelated = root
+            .create(
+                "unrelated",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        root.unlink_checked("unrelated", false, &unrelated).unwrap();
+
+        let visible = root.lookup_no_follow("socket").unwrap();
+        let visible_marker = visible.user_data().get::<Marker>().unwrap();
+        assert!(Arc::ptr_eq(&visible_marker, &marker));
+        let alias = root.lookup_no_follow("socket-alias").unwrap();
+        let alias_marker = alias.user_data().get::<Marker>().unwrap();
+        assert!(Arc::ptr_eq(&alias_marker, &marker));
+    }
+
+    #[test]
     fn open_or_create_checks_existing_before_new_inode_options() {
+        struct Marker;
+
         let fs = MemoryFs::new().unwrap();
         let mount = Mountpoint::new_root(&fs);
         let root = mount.root_location();
@@ -1672,12 +1734,14 @@ mod tests {
                     permission: NodePermission::empty(),
                     owner: Some((123, 456)),
                     rdev: Some(DeviceId(7)),
+                    initial_data: Some(InitialNodeData::from_shared(Arc::new(Marker))),
                 },
                 CreateDisposition::OpenOrCreate,
             )
             .unwrap();
         assert!(!outcome.created);
         assert_eq!(outcome.entry.inode(), created.inode());
+        assert!(outcome.entry.user_data().get::<Marker>().is_none());
     }
 
     #[test]
