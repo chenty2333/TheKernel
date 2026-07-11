@@ -69,4 +69,32 @@ else
 fi
 grep -q $'^must-timeout\ttimeout\t124\t' "$CI_LOG_DIR/status.tsv"
 
+# A guest can close the serial pipe before the throttled producer finishes.
+# The runner must preserve the replay status and leave panic/missing-marker
+# classification to validate-boot-log.sh instead of surfacing SIGPIPE 141.
+mkdir -p "$tmp/fake-bin" "$tmp/fake-work"
+cat >"$tmp/fake-bin/python3" <<'EOF'
+#!/usr/bin/env bash
+exit "${FAKE_REPLAY_STATUS:-0}"
+EOF
+chmod +x "$tmp/fake-bin/python3"
+for _ in $(seq 1 20000); do
+    printf 'echo serial-input-padding-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n'
+done >"$tmp/commands"
+env PATH="$tmp/fake-bin:$PATH" FAKE_REPLAY_STATUS=0 \
+    "$CI_DIR/boot-shell-runner.sh" rv /dev/null /dev/null \
+    "$tmp/fake-work" "$tmp/commands" 1 0 0
+if env PATH="$tmp/fake-bin:$PATH" FAKE_REPLAY_STATUS=23 \
+    "$CI_DIR/boot-shell-runner.sh" rv /dev/null /dev/null \
+    "$tmp/fake-work" "$tmp/commands" 1 0 0; then
+    printf 'test-ci-scripts: replay failure was hidden by pipe handling\n' >&2
+    exit 1
+else
+    status=$?
+    [ "$status" -eq 23 ] || {
+        printf 'test-ci-scripts: replay failure returned %s, expected 23\n' "$status" >&2
+        exit 1
+    }
+fi
+
 printf 'test-ci-scripts: PASS\n'

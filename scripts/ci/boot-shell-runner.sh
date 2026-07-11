@@ -16,6 +16,7 @@ timeout_secs=$6
 boot_wait_secs=$7
 line_delay_secs=$8
 
+set +e
 (
     sleep "$boot_wait_secs"
     while IFS= read -r line; do
@@ -31,3 +32,21 @@ line_delay_secs=$8
     --keep-workdir \
     --skip-kernel-build \
     --interactive
+pipeline_status=("${PIPESTATUS[@]}")
+set -e
+
+producer_status=${pipeline_status[0]}
+replay_status=${pipeline_status[1]}
+
+# The guest may shut down (cleanly or after a panic) before the throttled input
+# producer has written every line. In that case the producer receives SIGPIPE
+# (128 + SIGPIPE == 141). The replay result and the subsequent strict log
+# validator are authoritative: missing markers, panics, and dirty shutdowns
+# still fail, but they are no longer obscured by an incidental pipe status.
+if [ "$replay_status" -ne 0 ]; then
+    exit "$replay_status"
+fi
+case "$producer_status" in
+    0|141) exit 0 ;;
+    *) exit "$producer_status" ;;
+esac
