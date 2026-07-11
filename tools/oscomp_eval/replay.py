@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, TextIO
+from typing import Any, BinaryIO, Literal, TextIO
 
 from .config import (
     JUDGE_TIMEOUT_SECS,
@@ -690,7 +690,7 @@ def _validate_support_staging(
     return dataclass_replace(result, returncode=4, error_message=message)
 
 
-def terminate_process_group(process: subprocess.Popen[str], sig: int) -> None:
+def terminate_process_group(process: subprocess.Popen[bytes], sig: int) -> None:
     try:
         os.killpg(process.pid, sig)
     except ProcessLookupError:
@@ -700,7 +700,7 @@ def terminate_process_group(process: subprocess.Popen[str], sig: int) -> None:
 
 
 def wait_for_process(
-    process: subprocess.Popen[str],
+    process: subprocess.Popen[bytes],
     *,
     log_file: TextIO,
     log_path: Path,
@@ -708,41 +708,120 @@ def wait_for_process(
     idle_timeout_secs: int | None,
     interactive: bool,
     stop_after_marker: str | None,
+    input_after_marker: str | None,
+    input_ready_timeout_secs: int | None,
 ) -> tuple[int, str | None]:
     start = time.monotonic()
     last_output_at = start
+    input_ready = input_after_marker is None
+    input_open = input_after_marker is not None
+    pending_output = bytearray()
     assert process.stdout is not None
+    if input_after_marker is not None:
+        assert process.stdin is not None
+
+    def record_console_line(
+        raw_line: bytes,
+        *,
+        allow_stop: bool,
+    ) -> tuple[int, str] | None:
+        nonlocal input_ready, last_output_at
+        line = raw_line.decode("utf-8", errors="replace")
+        log_file.write(line)
+        log_file.flush()
+        if interactive:
+            print(line, end="")
+        last_output_at = time.monotonic()
+        exact_line = line.rstrip("\r\n")
+        if input_after_marker is not None and exact_line == input_after_marker:
+            input_ready = True
+        if allow_stop and stop_after_marker is not None and exact_line == stop_after_marker:
+            message = f"QEMU stopped after marker: {stop_after_marker}"
+            terminate_process_group(process, signal.SIGKILL)
+            process.wait()
+            process.stdout.close()
+            return INTENTIONAL_STOP_RETURN_CODE, message
+        return None
+
+    def consume_console_bytes(
+        data: bytes,
+        *,
+        final: bool = False,
+        allow_stop: bool = True,
+    ) -> tuple[int, str] | None:
+        pending_output.extend(data)
+        while True:
+            newline = pending_output.find(b"\n")
+            if newline < 0:
+                break
+            raw_line = bytes(pending_output[: newline + 1])
+            del pending_output[: newline + 1]
+            stopped = record_console_line(raw_line, allow_stop=allow_stop)
+            if stopped is not None:
+                return stopped
+        if final and pending_output:
+            raw_line = bytes(pending_output)
+            pending_output.clear()
+            return record_console_line(raw_line, allow_stop=False)
+        return None
+
     while True:
-        ready, _, _ = select.select([process.stdout], [], [], 0.1)
-        if ready:
-            line = process.stdout.readline()
-            if line:
-                log_file.write(line)
-                log_file.flush()
-                if interactive:
-                    print(line, end="")
-                last_output_at = time.monotonic()
-                if (
-                    stop_after_marker is not None
-                    and line.rstrip("\r\n") == stop_after_marker
-                ):
-                    message = f"QEMU stopped after marker: {stop_after_marker}"
-                    terminate_process_group(process, signal.SIGKILL)
-                    process.wait()
-                    process.stdout.close()
-                    return INTENTIONAL_STOP_RETURN_CODE, message
+        readers: list[BinaryIO | TextIO] = [process.stdout]
+        if input_ready and input_open:
+            readers.append(sys.stdin)
+        ready, _, _ = select.select(readers, [], [], 0.1)
+        if process.stdout in ready:
+            data = os.read(process.stdout.fileno(), 65_536)
+            if data:
+                stopped = consume_console_bytes(data)
+                if stopped is not None:
+                    return stopped
+
+        if input_ready and input_open and sys.stdin in ready:
+            data = os.read(sys.stdin.fileno(), 65_536)
+            if data:
+                try:
+                    assert process.stdin is not None
+                    process.stdin.write(data)
+                    process.stdin.flush()
+                except (BrokenPipeError, OSError, ValueError):
+                    input_open = False
+            else:
+                input_open = False
+                assert process.stdin is not None
+                process.stdin.close()
 
         returncode = process.poll()
         if returncode is not None:
-            remainder = process.stdout.read()
-            if remainder:
-                log_file.write(remainder)
-                log_file.flush()
-                if interactive:
-                    print(remainder, end="")
+            while True:
+                remainder = os.read(process.stdout.fileno(), 65_536)
+                if not remainder:
+                    break
+                consume_console_bytes(remainder, allow_stop=False)
+            consume_console_bytes(b"", final=True, allow_stop=False)
+            if input_after_marker is not None and not input_ready:
+                message = f"QEMU exited before input-ready marker: {input_after_marker}"
+                return returncode if returncode != 0 else 4, message
             return returncode, None
 
         now = time.monotonic()
+        if (
+            not input_ready
+            and input_ready_timeout_secs is not None
+            and input_ready_timeout_secs > 0
+            and now - start >= input_ready_timeout_secs
+        ):
+            message = (
+                f"QEMU input-ready timeout after {input_ready_timeout_secs}s "
+                f"waiting for marker: {input_after_marker}"
+            )
+            terminate_process_group(process, signal.SIGTERM)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                terminate_process_group(process, signal.SIGKILL)
+                process.wait()
+            return 124, message
         if timeout_secs is not None and timeout_secs > 0 and now - start >= timeout_secs:
             message = f"QEMU timed out after {timeout_secs}s"
             terminate_process_group(process, signal.SIGTERM)
@@ -779,6 +858,8 @@ def run_qemu(
     idle_timeout_secs: int | None,
     interactive: bool = False,
     stop_after_marker: str | None = None,
+    input_after_marker: str | None = None,
+    input_ready_timeout_secs: int | None = None,
     qemu_debug: str | None = None,
     qemu_debug_log_path: Path | None = None,
 ) -> ReplayResult:
@@ -786,7 +867,9 @@ def run_qemu(
     start = time.monotonic()
     error_message: str | None = None
     try:
-        stdin = None if interactive else subprocess.DEVNULL
+        stdin = subprocess.PIPE if input_after_marker is not None else (
+            None if interactive else subprocess.DEVNULL
+        )
         with log_path.open("w", encoding="utf-8", errors="ignore", buffering=1) as log_file:
             process = subprocess.Popen(
                 command,
@@ -794,8 +877,8 @@ def run_qemu(
                 stdin=stdin,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
+                text=False,
+                bufsize=0,
                 start_new_session=True,
             )
             returncode, error_message = wait_for_process(
@@ -806,7 +889,13 @@ def run_qemu(
                 idle_timeout_secs=idle_timeout_secs,
                 interactive=interactive,
                 stop_after_marker=stop_after_marker,
+                input_after_marker=input_after_marker,
+                input_ready_timeout_secs=input_ready_timeout_secs,
             )
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            if process.stdout is not None and not process.stdout.closed:
+                process.stdout.close()
     except KeyboardInterrupt:
         try:
             terminate_process_group(process, signal.SIGTERM)  # type: ignore[has-type]
@@ -845,6 +934,8 @@ def run_replay(
     interactive: bool = False,
     extra_block_image: Path | None = None,
     stop_after_marker: str | None = None,
+    input_after_marker: str | None = None,
+    input_ready_timeout_secs: int | None = None,
     verbose: bool = False,
     workdir_override: Path | None = None,
     log_path_override: Path | None = None,
@@ -857,6 +948,16 @@ def run_replay(
         not stop_after_marker or "\n" in stop_after_marker or "\r" in stop_after_marker
     ):
         raise ReplayError("stop-after marker must be one non-empty console line")
+    if input_after_marker is not None and (
+        not input_after_marker or "\n" in input_after_marker or "\r" in input_after_marker
+    ):
+        raise ReplayError("input-after marker must be one non-empty console line")
+    if input_after_marker is not None and not interactive:
+        raise ReplayError("input-after marker requires interactive replay")
+    if input_ready_timeout_secs is not None and input_after_marker is None:
+        raise ReplayError("input-ready timeout requires an input-after marker")
+    if input_ready_timeout_secs is not None and input_ready_timeout_secs <= 0:
+        raise ReplayError("input-ready timeout must be positive")
     root = repo_root()
     if not skip_kernel_build:
         subprocess.run(["make", kernel_name(selected_arch)], cwd=root, check=True)
@@ -906,6 +1007,8 @@ def run_replay(
         idle_timeout_secs=idle_timeout_secs,
         interactive=interactive,
         stop_after_marker=stop_after_marker,
+        input_after_marker=input_after_marker,
+        input_ready_timeout_secs=input_ready_timeout_secs,
         qemu_debug=qemu_debug,
         qemu_debug_log_path=qemu_debug_log_path,
     )
@@ -1372,6 +1475,8 @@ def qemu_cmd(args: argparse.Namespace) -> int:
             interactive=args.interactive,
             extra_block_image=Path(args.extra_block_image).expanduser() if args.extra_block_image else None,
             stop_after_marker=args.stop_after_marker,
+            input_after_marker=args.input_after_marker,
+            input_ready_timeout_secs=args.input_ready_timeout,
             verbose=args.verbose or truthy(os.environ.get("OSCOMP_REPLAY_VERBOSE")),
             workdir_override=Path(args.workdir).expanduser() if args.workdir else None,
             log_path_override=log_path,
@@ -1444,6 +1549,15 @@ def build_parser() -> argparse.ArgumentParser:
     qemu_parser.add_argument(
         "--stop-after-marker",
         help="abruptly kill QEMU after an exact console marker and return 75",
+    )
+    qemu_parser.add_argument(
+        "--input-after-marker",
+        help="forward interactive stdin only after this exact console line",
+    )
+    qemu_parser.add_argument(
+        "--input-ready-timeout",
+        type=int,
+        help="fail if the input-after marker is absent after this many seconds",
     )
     qemu_parser.add_argument("--timeout", type=int, default=REPLAY_TIMEOUT_FULL_SECS)
     qemu_parser.add_argument("--idle-timeout", type=int)

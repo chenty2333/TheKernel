@@ -227,6 +227,140 @@ class ReplayRunTests(unittest.TestCase):
             self.assertEqual(result.error_message, f"QEMU stopped after marker: {marker}")
             self.assertEqual(result.log_path.read_text(encoding="utf-8"), f"{marker}\n")
 
+    def test_run_qemu_forwards_input_after_immediate_ready_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = "THEKERNEL_SHELL_READY"
+            boot_output = f"SUPPORT_READY\n{marker}\n".encode()
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as commands:
+                commands.write("immediate-command\n")
+                commands.seek(0)
+                with patch("sys.stdin", commands):
+                    result = run_qemu(
+                        arch="rv",
+                        command=(
+                            sys.executable,
+                            "-u",
+                            "-c",
+                            "import os, sys; "
+                            f"os.write(sys.stdout.fileno(), {boot_output!r}); "
+                            "print('INPUT=' + sys.stdin.readline().strip(), flush=True)",
+                        ),
+                        log_path=root / "qemu.log",
+                        workdir=root,
+                        timeout_secs=5,
+                        idle_timeout_secs=None,
+                        interactive=False,
+                        input_after_marker=marker,
+                        input_ready_timeout_secs=1,
+                    )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(
+                result.log_path.read_text(encoding="utf-8").splitlines(),
+                ["SUPPORT_READY", marker, "INPUT=immediate-command"],
+            )
+
+    def test_run_qemu_does_not_forward_input_for_near_or_delayed_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = "THEKERNEL_SHELL_READY"
+            program = "\n".join(
+                (
+                    "import select, sys, time",
+                    f"print('prefix {marker}', flush=True)",
+                    "print('EARLY=' + str(bool(select.select([sys.stdin], [], [], 0)[0])), flush=True)",
+                    "time.sleep(0.2)",
+                    f"print({marker!r}, flush=True)",
+                    "print('INPUT=' + sys.stdin.readline().strip(), flush=True)",
+                )
+            )
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as commands:
+                commands.write("delayed-command\n")
+                commands.seek(0)
+                with patch("sys.stdin", commands):
+                    result = run_qemu(
+                        arch="rv",
+                        command=(sys.executable, "-u", "-c", program),
+                        log_path=root / "qemu.log",
+                        workdir=root,
+                        timeout_secs=5,
+                        idle_timeout_secs=None,
+                        interactive=False,
+                        input_after_marker=marker,
+                        input_ready_timeout_secs=1,
+                    )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(
+                result.log_path.read_text(encoding="utf-8").splitlines(),
+                [
+                    f"prefix {marker}",
+                    "EARLY=False",
+                    marker,
+                    "INPUT=delayed-command",
+                ],
+            )
+
+    def test_run_qemu_ready_marker_timeout_terminates_guest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = "THEKERNEL_SHELL_READY"
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as commands:
+                with patch("sys.stdin", commands):
+                    result = run_qemu(
+                        arch="rv",
+                        command=(
+                            sys.executable,
+                            "-u",
+                            "-c",
+                            "import time; print('still booting', flush=True); time.sleep(30)",
+                        ),
+                        log_path=root / "qemu.log",
+                        workdir=root,
+                        timeout_secs=10,
+                        idle_timeout_secs=None,
+                        interactive=False,
+                        input_after_marker=marker,
+                        input_ready_timeout_secs=1,
+                    )
+
+            self.assertEqual(result.returncode, 124)
+            self.assertLess(result.duration_ms, 5_000)
+            self.assertEqual(
+                result.error_message,
+                f"QEMU input-ready timeout after 1s waiting for marker: {marker}",
+            )
+
+    def test_run_qemu_clean_exit_without_exact_ready_marker_is_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = "THEKERNEL_SHELL_READY"
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as commands:
+                with patch("sys.stdin", commands):
+                    result = run_qemu(
+                        arch="rv",
+                        command=(
+                            sys.executable,
+                            "-u",
+                            "-c",
+                            f"print('prefix {marker}', flush=True)",
+                        ),
+                        log_path=root / "qemu.log",
+                        workdir=root,
+                        timeout_secs=5,
+                        idle_timeout_secs=None,
+                        interactive=False,
+                        input_after_marker=marker,
+                        input_ready_timeout_secs=2,
+                    )
+
+            self.assertEqual(result.returncode, 4)
+            self.assertEqual(
+                result.error_message,
+                f"QEMU exited before input-ready marker: {marker}",
+            )
+
 
 class EvaluateHelpersTests(unittest.TestCase):
     def test_score_with_extra_issues_preserves_scores(self) -> None:

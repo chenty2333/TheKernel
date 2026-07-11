@@ -179,10 +179,10 @@ for _ in $(seq 1 20000); do
 done >"$tmp/commands"
 env PATH="$tmp/fake-bin:$PATH" FAKE_REPLAY_STATUS=0 \
     "$CI_DIR/boot-shell-runner.sh" rv /dev/null /dev/null \
-    "$tmp/fake-work" "$tmp/commands" 1 0 0
+    "$tmp/fake-work" "$tmp/commands" 1 1 0
 if env PATH="$tmp/fake-bin:$PATH" FAKE_REPLAY_STATUS=23 \
     "$CI_DIR/boot-shell-runner.sh" rv /dev/null /dev/null \
-    "$tmp/fake-work" "$tmp/commands" 1 0 0; then
+    "$tmp/fake-work" "$tmp/commands" 1 1 0; then
     printf 'test-ci-scripts: replay failure was hidden by pipe handling\n' >&2
     exit 1
 else
@@ -197,8 +197,17 @@ printf 'exit\n' >"$tmp/short-commands"
 env PATH="$tmp/fake-bin:$PATH" FAKE_REPLAY_STATUS=75 \
     FAKE_REPLAY_ARGS="$tmp/replay.args" \
     "$CI_DIR/boot-shell-runner.sh" rv kernel image "$tmp/fake-work" \
-    "$tmp/short-commands" 1 0 0 support.img extra.img STOP_MARKER || status=$?
+    "$tmp/short-commands" 1 1 0 support.img extra.img STOP_MARKER || status=$?
 [ "${status:-75}" -eq 75 ]
+grep -Fxq -- '--input-after-marker' "$tmp/replay.args"
+grep -Fxq -- 'Entering TheKernel boot shell. Exit the shell to power off.' "$tmp/replay.args"
+awk '
+    $0 == "--input-ready-timeout" {
+        getline
+        found = ($0 == "1")
+    }
+    END { exit !found }
+' "$tmp/replay.args"
 grep -Fxq -- '--support-image' "$tmp/replay.args"
 grep -Fxq -- 'support.img' "$tmp/replay.args"
 grep -Fxq -- '--extra-block-image' "$tmp/replay.args"

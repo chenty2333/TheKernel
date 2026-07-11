@@ -4,7 +4,7 @@ set -euo pipefail
 if [ "$#" -lt 8 ] || [ "$#" -gt 11 ]; then
     printf '%s\n' \
         "Usage: $(basename "$0") ARCH KERNEL IMAGE WORKDIR COMMANDS TIMEOUT" \
-        '       BOOT_WAIT LINE_DELAY [SUPPORT_IMAGE [EXTRA_BLOCK_IMAGE [STOP_MARKER]]]' >&2
+        '       READY_TIMEOUT LINE_DELAY [SUPPORT_IMAGE [EXTRA_BLOCK_IMAGE [STOP_MARKER]]]' >&2
     exit 2
 fi
 
@@ -14,11 +14,12 @@ image=$3
 workdir=$4
 commands=$5
 timeout_secs=$6
-boot_wait_secs=$7
+ready_timeout_secs=$7
 line_delay_secs=$8
 support_image=${9:-}
 extra_block_image=${10:-}
 stop_marker=${11:-}
+ready_marker='Entering TheKernel boot shell. Exit the shell to power off.'
 
 replay_args=(
     --arch "$arch"
@@ -29,6 +30,8 @@ replay_args=(
     --keep-workdir
     --skip-kernel-build
     --interactive
+    --input-after-marker "$ready_marker"
+    --input-ready-timeout "$ready_timeout_secs"
 )
 [ -z "$support_image" ] || replay_args+=(--support-image "$support_image")
 [ -z "$extra_block_image" ] || replay_args+=(--extra-block-image "$extra_block_image")
@@ -36,7 +39,6 @@ replay_args=(
 
 set +e
 (
-    sleep "$boot_wait_secs"
     while IFS= read -r line; do
         printf '%s\n' "$line"
         sleep "$line_delay_secs"

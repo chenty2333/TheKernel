@@ -11,7 +11,7 @@ source "$CI_SCRIPT_DIR/lib.sh"
 
 NIGHTLY_LOG_DIR=${THEKERNEL_NIGHTLY_LOG_DIR:-$REPO_ROOT/.state/ci/nightly/adapter}
 NIGHTLY_GUEST_TIMEOUT_SECS=${THEKERNEL_NIGHTLY_GUEST_TIMEOUT_SECS:-600}
-NIGHTLY_BOOT_WAIT_SECS=${THEKERNEL_NIGHTLY_BOOT_WAIT_SECS:-35}
+NIGHTLY_READY_TIMEOUT_SECS=${THEKERNEL_NIGHTLY_READY_TIMEOUT_SECS:-120}
 NIGHTLY_LINE_DELAY_SECS=${THEKERNEL_NIGHTLY_LINE_DELAY_SECS:-0.20}
 
 nightly_fail() {
@@ -222,7 +222,7 @@ nightly_run_guest() {
         cd "$REPO_ROOT"
         "$CI_SCRIPT_DIR/boot-shell-runner.sh" \
             "$arch" "$kernel" "$image" "$run_dir" "$commands" \
-            "$NIGHTLY_GUEST_TIMEOUT_SECS" "$NIGHTLY_BOOT_WAIT_SECS" \
+            "$NIGHTLY_GUEST_TIMEOUT_SECS" "$NIGHTLY_READY_TIMEOUT_SECS" \
             "$NIGHTLY_LINE_DELAY_SECS" "$support_image" "$extra_block_image" \
             "$stop_marker"
     )

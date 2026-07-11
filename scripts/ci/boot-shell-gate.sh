@@ -10,7 +10,7 @@ ARCH=both
 LOG_DIR="$REPO_ROOT/.state/ci/boot-shell"
 TIMEOUT_SECS=${THEKERNEL_CI_BOOT_TIMEOUT_SECS:-300}
 BUILD_TIMEOUT_SECS=${THEKERNEL_CI_BUILD_TIMEOUT_SECS:-3600}
-BOOT_WAIT_SECS=${THEKERNEL_CI_BOOT_WAIT_SECS:-35}
+READY_TIMEOUT_SECS=${THEKERNEL_CI_READY_TIMEOUT_SECS:-120}
 LINE_DELAY_SECS=${THEKERNEL_CI_LINE_DELAY_SECS:-0.50}
 SKIP_BUILD=0
 RV_IMAGE=""
@@ -25,7 +25,7 @@ Options:
   --log-dir DIR          Gate logs (default: .state/ci/boot-shell)
   --timeout SECS         QEMU timeout per architecture (default: 300)
   --build-timeout SECS   Shell-kernel build timeout per arch (default: 3600)
-  --boot-wait SECS       Delay before sending serial commands (default: 35)
+  --ready-timeout SECS   Fail unless the exact boot-shell marker appears (default: 120)
   --line-delay SECS      Delay between serial command lines (default: 0.50)
   --rv-image PATH        Explicit RISC-V official root image
   --la-image PATH        Explicit LoongArch official root image
@@ -43,7 +43,7 @@ while (($#)); do
         --log-dir) LOG_DIR=${2:-}; shift 2 ;;
         --timeout) TIMEOUT_SECS=${2:-}; shift 2 ;;
         --build-timeout) BUILD_TIMEOUT_SECS=${2:-}; shift 2 ;;
-        --boot-wait) BOOT_WAIT_SECS=${2:-}; shift 2 ;;
+        --ready-timeout) READY_TIMEOUT_SECS=${2:-}; shift 2 ;;
         --line-delay) LINE_DELAY_SECS=${2:-}; shift 2 ;;
         --rv-image) RV_IMAGE=${2:-}; shift 2 ;;
         --la-image) LA_IMAGE=${2:-}; shift 2 ;;
@@ -59,7 +59,7 @@ case "$ARCH" in
 esac
 ci_require_positive_int timeout "$TIMEOUT_SECS"
 ci_require_positive_int build_timeout "$BUILD_TIMEOUT_SECS"
-ci_require_nonnegative_number boot_wait "$BOOT_WAIT_SECS"
+ci_require_positive_int ready_timeout "$READY_TIMEOUT_SECS"
 ci_require_nonnegative_number line_delay "$LINE_DELAY_SECS"
 
 case "$LOG_DIR" in
@@ -140,7 +140,7 @@ gate_arch() {
     ci_run_step "boot-qemu-$arch" "$((TIMEOUT_SECS + 90))" \
         "$SCRIPT_DIR/boot-shell-runner.sh" \
         "$arch" "$kernel" "$image" "$workdir" "$commands" \
-        "$TIMEOUT_SECS" "$BOOT_WAIT_SECS" "$LINE_DELAY_SECS"
+        "$TIMEOUT_SECS" "$READY_TIMEOUT_SECS" "$LINE_DELAY_SECS"
 
     ci_run_step "boot-validate-$arch" 30 \
         "$SCRIPT_DIR/validate-boot-log.sh" "$arch" "$workdir/qemu.log"
