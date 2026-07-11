@@ -52,7 +52,14 @@ pub fn init(args: &[String], envs: &[String]) {
     axfs::set_mount_access_policy(crate::mounts::note_mount_access);
     crate::deferred_work::init();
     crate::file::inotify::init_filesystem_release_notifications();
-    pseudofs::mount_all().expect("Failed to mount pseudofs");
+    let user_ns = UserNamespace::try_new_root().expect("Failed to allocate init user namespace");
+    let root_cred = Cred::try_root(user_ns).expect("Failed to allocate init credential");
+    let boot_credentials = root_cred.fs_dac_credentials();
+    let credential =
+        CredentialSlot::try_new(root_cred).expect("Failed to allocate init credential slot");
+    let init_net_ns = axnet::default_stack().clone();
+    pseudofs::mount_all(&boot_credentials, init_net_ns.unix_namespace())
+        .expect("Failed to mount pseudofs");
 
     let loc = FS_CONTEXT
         .lock()
@@ -115,11 +122,6 @@ pub fn init(args: &[String], envs: &[String]) {
     let exit_fd_table =
         Arc::try_new(FdTable::new().expect("Failed to allocate init exit fd-table identity"))
             .expect("Failed to allocate init exit fd table");
-    let user_ns = UserNamespace::try_new_root().expect("Failed to allocate init user namespace");
-    let credential = CredentialSlot::try_new(
-        Cred::try_root(user_ns).expect("Failed to allocate init credential"),
-    )
-    .expect("Failed to allocate init credential slot");
     let proc = ProcessData::try_new(
         proc,
         credential.clone(),
@@ -131,7 +133,7 @@ pub fn init(args: &[String], envs: &[String]) {
         exit_fd_table,
         signal_actions,
         None,
-        axnet::default_stack().clone(),
+        init_net_ns,
         CgroupNamespace::try_new_root().expect("Failed to allocate init cgroup namespace"),
         PidNamespace::try_new_root().expect("Failed to allocate init pid namespace"),
         Arc::try_new(UtsNamespace::new_default()).expect("Failed to allocate init UTS namespace"),

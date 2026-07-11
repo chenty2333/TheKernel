@@ -116,16 +116,7 @@ impl Thread {
 
     /// Snapshot the filesystem identity and effective capabilities used by DAC.
     pub(crate) fn fs_dac_credentials(&self) -> DacCredentialView {
-        let cred = self.current_cred();
-        let credentials = cred.ids();
-        let capabilities = cred.capabilities();
-        DacCredentialView::new(
-            credentials.fsuid,
-            credentials.fsgid,
-            cred.groups().clone(),
-            capabilities.effective,
-            cred.user_ns().is_initial(),
-        )
+        self.current_cred().fs_dac_credentials()
     }
 
     /// Snapshot the credentials used by access(2)/faccessat2(2).

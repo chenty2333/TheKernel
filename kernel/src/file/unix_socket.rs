@@ -25,6 +25,7 @@ fn try_owned_name(name: &str) -> AxResult<String> {
     Ok(owned)
 }
 
+#[cfg(feature = "dev-log")]
 pub(crate) fn try_path(path: &str) -> AxResult<Arc<String>> {
     Arc::try_new(try_owned_name(path)?).map_err(|_| AxError::NoMemory)
 }
@@ -110,6 +111,40 @@ pub(crate) fn bind_path(
     ) {
         warn!("Unix socket create notification failed: {error}");
     }
+    Ok(())
+}
+
+/// Binds a kernel-owned endpoint to a socket inode populated by a static
+/// pseudo-filesystem builder.
+///
+/// This is deliberately separate from Linux `bind(2)`: userspace must create
+/// a new pathname and receives `EADDRINUSE` for every pre-existing inode. Some
+/// kernel pseudo-filesystems, however, publish their complete directory tree
+/// before runtime services start and do not support named creation. The exact
+/// inode owns the transport slot, so namespace lookup remains VFS-driven.
+#[cfg(feature = "dev-log")]
+pub(crate) fn bind_precreated_path(
+    socket: &UnixSocket,
+    path: Arc<String>,
+    credentials: &DacCredentialView,
+) -> AxResult<()> {
+    let path_ref = Path::new(path.as_ref());
+    validate_pathname(path_ref)?;
+    let location = with_path_fs(AT_FDCWD, path_ref, |fs| {
+        fs.resolve_no_follow_dac(path_ref, credentials)
+    })?;
+    check_open_permissions(&location, W_OK, credentials)?;
+    if location.metadata()?.node_type != NodeType::Socket {
+        return Err(AxError::AddrInUse);
+    }
+
+    let slot = {
+        let mut data = location.user_data();
+        data.try_get_or_insert_with(BindSlot::default)?
+    };
+    let target = UnixSocketTarget::new(UnixSocketAddr::Path(path), slot)?;
+    let reservation = socket.reserve_bind(target)?;
+    reservation.commit_with_keepalive(location.entry().lifetime_token());
     Ok(())
 }
 

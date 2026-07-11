@@ -3,7 +3,7 @@ use core::{any::Any, cmp::Ordering, task::Context};
 
 use axfs_ng_vfs::{
     FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission,
-    NodeType, VfsError, VfsResult,
+    NodeType, NodeUserData, VfsError, VfsResult,
 };
 use axpoll::{IoEvents, Pollable};
 use inherit_methods_macro::inherit_methods;
@@ -78,6 +78,7 @@ pub struct SimpleFile {
     node: SimpleFsNode,
     ops: Arc<dyn SimpleFileOps>,
     flags: NodeFlags,
+    user_data: NodeUserData,
 }
 
 impl SimpleFile {
@@ -108,6 +109,7 @@ impl SimpleFile {
             node,
             ops: Arc::new(ops),
             flags,
+            user_data: NodeUserData::new(),
         })
     }
 
@@ -120,7 +122,13 @@ impl SimpleFile {
     ) -> VfsResult<Arc<Self>> {
         let ops: Arc<dyn SimpleFileOps> = Arc::try_new(ops).map_err(|_| VfsError::NoMemory)?;
         let node = SimpleFsNode::try_new(fs, ty, permission)?;
-        Arc::try_new(Self { node, ops, flags }).map_err(|_| VfsError::NoMemory)
+        Arc::try_new(Self {
+            node,
+            ops,
+            flags,
+            user_data: NodeUserData::new(),
+        })
+        .map_err(|_| VfsError::NoMemory)
     }
 
     /// Creates a dynamic link that pathwalk policy can distinguish from an
@@ -207,6 +215,10 @@ impl NodeOps for SimpleFile {
 
     fn flags(&self) -> NodeFlags {
         self.flags
+    }
+
+    fn persistent_user_data(&self) -> Option<&NodeUserData> {
+        Some(&self.user_data)
     }
 }
 

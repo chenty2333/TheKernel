@@ -15,6 +15,7 @@ use alloc::sync::Arc;
 use axerrno::LinuxResult;
 use axfs::{FS_CONTEXT, FsContext};
 use axfs_ng_vfs::{DirNodeOps, FileNodeOps, Filesystem, NodePermission, WeakDirEntry};
+use axnet::unix::UnixNamespace;
 pub use tmp::MemoryFs;
 
 pub(crate) use self::proc::{
@@ -23,7 +24,7 @@ pub(crate) use self::proc::{
     process_data_from_proc_dir,
 };
 pub use self::{device::*, dir::*, file::*, fs::*};
-use crate::mounts;
+use crate::{mounts, task::DacCredentialView};
 
 /// A callback that builds a `Arc<dyn DirNodeOps>` for a given
 /// `WeakDirEntry`.
@@ -70,8 +71,13 @@ fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> LinuxResult<()>
 }
 
 /// Mount all filesystems
-pub fn mount_all() -> LinuxResult<()> {
+pub fn mount_all(
+    boot_credentials: &DacCredentialView,
+    unix_namespace: Arc<UnixNamespace>,
+) -> LinuxResult<()> {
     info!("Initialize pseudofs...");
+    #[cfg(not(feature = "dev-log"))]
+    let _ = (boot_credentials, unix_namespace);
 
     let fs = FS_CONTEXT.lock();
     mount_at(&fs, "/dev", dev::new_devfs())?;
@@ -103,7 +109,7 @@ pub fn mount_all() -> LinuxResult<()> {
     drop(fs);
 
     #[cfg(feature = "dev-log")]
-    dev::bind_dev_log().expect("Failed to bind /dev/log");
+    dev::bind_dev_log(boot_credentials, unix_namespace).expect("Failed to bind /dev/log");
 
     Ok(())
 }

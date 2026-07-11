@@ -1,26 +1,23 @@
+use alloc::sync::Arc;
 use core::bstr::ByteStr;
 
 use axerrno::LinuxResult;
-use axfs_ng_vfs::NodePermission;
 use axnet::{
     RecvOptions, SocketOps,
-    unix::{DgramTransport, UnixSocket},
+    unix::{DgramTransport, UnixNamespace, UnixSocket},
 };
-use axtask::current;
 
-use crate::task::AsThread;
+use crate::task::DacCredentialView;
 
-pub fn bind_dev_log() -> LinuxResult<()> {
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let server = UnixSocket::new(DgramTransport::new()?, proc_data.net_ns.unix_namespace());
-    let credentials = curr.as_thread().fs_dac_credentials();
-    crate::file::unix_socket::bind_path(
+pub fn bind_dev_log(
+    credentials: &DacCredentialView,
+    unix_namespace: Arc<UnixNamespace>,
+) -> LinuxResult<()> {
+    let server = UnixSocket::new(DgramTransport::new()?, unix_namespace);
+    crate::file::unix_socket::bind_precreated_path(
         &server,
         crate::file::unix_socket::try_path("/dev/log")?,
-        &credentials,
-        NodePermission::from_bits_truncate(0o666),
-        0,
+        credentials,
     )?;
     axtask::spawn_with_name(
         move || {

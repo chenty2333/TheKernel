@@ -317,6 +317,21 @@ impl Cred {
         &self.user_ns
     }
 
+    /// Snapshot the filesystem identity and effective capabilities used by DAC.
+    ///
+    /// Keeping this on the immutable credential lets early boot and other
+    /// explicitly credentialed kernel operations avoid pretending that a
+    /// kernel task is a Linux userspace thread.
+    pub(crate) fn fs_dac_credentials(&self) -> DacCredentialView {
+        DacCredentialView::new(
+            self.ids.fsuid,
+            self.ids.fsgid,
+            self.groups.clone(),
+            self.caps.effective,
+            self.user_ns.is_initial(),
+        )
+    }
+
     /// Returns whether this credential can use `cap` over a resource which has
     /// not yet been assigned an owning user namespace. Such legacy/global
     /// resources belong to the initial namespace; child-userns capability
