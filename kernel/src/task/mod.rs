@@ -5,6 +5,7 @@ mod accounting;
 pub(crate) mod coredump;
 mod creds;
 mod futex;
+mod idmap;
 mod jobctl;
 mod ops;
 mod process;
