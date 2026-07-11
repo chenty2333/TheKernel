@@ -125,6 +125,24 @@ nightly_find_cross_compiler() {
     return 1
 }
 
+nightly_support_identity() {
+    local arch_arg=$1
+    (
+        cd "$REPO_ROOT"
+        printf 'arch=%s\n' "$arch_arg"
+        find \
+            scripts/build-oscomp-support-disk.sh \
+            scripts/support-tools \
+            scripts/support-overlay \
+            -type f -print \
+            | sort \
+            | while IFS= read -r path; do
+                printf '%s\t' "$path"
+                sha256sum "$path"
+            done
+    ) | sha256sum | awk '{ print $1 }'
+}
+
 nightly_prepare_support_image() {
     if [ -n "${THEKERNEL_NIGHTLY_SUPPORT_IMAGE:-}" ]; then
         [ -s "$THEKERNEL_NIGHTLY_SUPPORT_IMAGE" ] \
@@ -159,22 +177,7 @@ nightly_prepare_support_image() {
     list="$identity/empty-ltp.txt"
     mkdir -p "$identity"
 
-    current_identity=$(
-        (
-            cd "$REPO_ROOT"
-            {
-                printf '%s\n' "$arch_arg"
-                find \
-                    scripts/build-oscomp-support-disk.sh \
-                    scripts/support-tools \
-                    scripts/support-overlay \
-                    -type f -print
-            } | sort | while IFS= read -r path; do
-                printf '%s\t' "$path"
-                sha256sum "$path"
-            done
-        ) | sha256sum | awk '{ print $1 }'
-    )
+    current_identity=$(nightly_support_identity "$arch_arg")
     if [ -s "$image" ] \
         && [ -f "$stamp" ] \
         && [ "$(tr -d '\r\n' <"$stamp")" = "$current_identity" ]; then

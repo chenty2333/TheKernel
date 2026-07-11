@@ -133,6 +133,16 @@ if grep -Fq 'UNSUPPORTED' "$tmp/invalid-arch.log"; then
     exit 1
 fi
 
+# Support-image cache identity includes the selected architecture as data; it
+# must never try to hash the literal architecture name as a path.
+# shellcheck source=../../scripts/ci/nightly/lib.sh
+source "$CI_DIR/nightly/lib.sh"
+rv_support_identity=$(nightly_support_identity rv)
+la_support_identity=$(nightly_support_identity la)
+[[ "$rv_support_identity" =~ ^[0-9a-f]{64}$ ]]
+[[ "$la_support_identity" =~ ^[0-9a-f]{64}$ ]]
+[ "$rv_support_identity" != "$la_support_identity" ]
+
 # Verify the shared runner records and enforces a real wall-clock timeout.
 # shellcheck source=../../scripts/ci/lib.sh
 source "$CI_DIR/lib.sh"
