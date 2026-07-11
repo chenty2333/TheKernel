@@ -73,6 +73,29 @@ pub struct Device {
 }
 
 impl Device {
+    /// Fallibly creates a device for a user-triggered publication path.
+    pub fn try_new(
+        fs: Arc<SimpleFs>,
+        node_type: NodeType,
+        device_id: DeviceId,
+        ops: Arc<dyn DeviceOps>,
+    ) -> VfsResult<Arc<Self>> {
+        Self::try_new_with_permissions(fs, node_type, device_id, NodePermission::default(), ops)
+    }
+
+    /// Fallibly creates a device with explicit access permissions.
+    pub fn try_new_with_permissions(
+        fs: Arc<SimpleFs>,
+        node_type: NodeType,
+        device_id: DeviceId,
+        permissions: NodePermission,
+        ops: Arc<dyn DeviceOps>,
+    ) -> VfsResult<Arc<Self>> {
+        let node = SimpleFsNode::new(fs, node_type, permissions);
+        node.metadata.lock().rdev = device_id;
+        Arc::try_new(Self { node, ops }).map_err(|_| VfsError::NoMemory)
+    }
+
     /// Creates a new device.
     pub fn new(
         fs: Arc<SimpleFs>,
@@ -99,11 +122,6 @@ impl Device {
     /// Returns the inner device operations.
     pub fn inner(&self) -> &Arc<dyn DeviceOps> {
         &self.ops
-    }
-
-    /// Updates the device ID.
-    pub fn set_device_id(&self, device_id: DeviceId) {
-        self.node.metadata.lock().rdev = device_id;
     }
 
     /// Returns the memory mapping behavior of the device.

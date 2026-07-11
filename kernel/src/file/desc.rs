@@ -4,6 +4,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use core::{
+    any::Any,
     ops::Deref,
     ptr,
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -48,6 +49,11 @@ const FLOCK_RELEASE_BUDGET: usize = 16;
 const RECORD_LOCK_RELEASE_BUDGET: usize = 16;
 const MAX_LIVE_DESCRIPTION_CLEANUPS: usize = 65_536;
 
+/// A fallibly allocated resource whose lifetime is exactly one open file
+/// description. Subsystems use this for state which must survive `dup` but be
+/// released on the final OFD close.
+pub(crate) type DescriptionResource = Box<dyn Any + Send + Sync>;
+
 /// Preallocated final-OFD policy work.  The final Arc drop only publishes this
 /// intrusive node; lock-table scans, destructors, and waiter callbacks run in
 /// task context with fixed per-invocation budgets.
@@ -58,6 +64,7 @@ struct DescriptionCleanupWork {
     record_lock_done: bool,
     lease_done: bool,
     write_open_key: Option<ExecutableKey>,
+    resource: Option<DescriptionResource>,
     account: Option<Arc<DeferredWorkAccount>>,
 }
 
@@ -75,6 +82,7 @@ impl DescriptionCleanupWork {
             record_lock_done: false,
             lease_done: false,
             write_open_key: None,
+            resource: None,
             account: None,
         });
         if work.is_err() {
@@ -84,6 +92,10 @@ impl DescriptionCleanupWork {
     }
 
     fn run_batch(&mut self) -> bool {
+        // Arbitrary subsystem destructors may wake tasks, release VFS objects,
+        // or join a worker. They run only in the deferred policy worker, never
+        // from the context which happened to drop the final FileDescription.
+        drop(self.resource.take());
         executable::release_write_open(self.write_open_key.take());
         if !self.flock_done {
             self.flock_done = flock::release_owner_batch(self.owner, FLOCK_RELEASE_BUDGET);
@@ -227,6 +239,26 @@ pub(crate) fn drain_deferred_description_cleanup() {
         // republishing must not increment the account again.
         publish_description_cleanup(work);
     }
+}
+
+/// Host-test adapter for a description which owns only a typed resource.
+///
+/// Kernel host tests do not initialize the task scheduler required by the
+/// flock/lease tables. This helper exercises the real intrusive publication
+/// and typed-resource handoff without pretending to validate those unrelated
+/// task-context policies. Callers must create an owner with no flock, record
+/// lock, lease, executable-write key, or deferred-work account.
+#[cfg(test)]
+pub(crate) fn drain_deferred_description_resource_only_for_test() {
+    let Some(_guard) = DescriptionCleanupDrainGuard::try_enter() else {
+        return;
+    };
+    let Some(mut work) = pop_description_cleanup() else {
+        return;
+    };
+    debug_assert!(work.write_open_key.is_none());
+    debug_assert!(work.account.is_none());
+    drop(work.resource.take());
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -617,21 +649,23 @@ impl FileDescription {
         inner: Arc<dyn FileLike>,
         status_flags: u32,
     ) -> AxResult<Arc<Self>> {
-        Self::new_inner(inner, status_flags, None)
+        Self::new_inner(inner, status_flags, None, None)
     }
 
-    pub(in crate::file) fn new_with_write_open_key(
+    pub(in crate::file) fn new_with_write_open_key_and_resource(
         inner: Arc<dyn FileLike>,
         status_flags: u32,
         write_open_key: Option<ExecutableKey>,
+        resource: Option<DescriptionResource>,
     ) -> AxResult<Arc<Self>> {
-        Self::new_inner(inner, status_flags, write_open_key)
+        Self::new_inner(inner, status_flags, write_open_key, resource)
     }
 
     fn new_inner(
         inner: Arc<dyn FileLike>,
         status_flags: u32,
         write_open_key: Option<ExecutableKey>,
+        resource: Option<DescriptionResource>,
     ) -> AxResult<Arc<Self>> {
         // Before a complete FileDescription exists, this guard owns rollback.
         // Once transferred into the value, ordinary FileDescription::drop owns
@@ -642,6 +676,7 @@ impl FileDescription {
         let mut cleanup_work = DescriptionCleanupWork::try_new(id.get())?;
         let write_open_key = write_open_rollback.transfer();
         cleanup_work.write_open_key = write_open_key;
+        cleanup_work.resource = resource;
         Arc::try_new(Self {
             inner,
             open_credentials: OpenCredentials::current(),

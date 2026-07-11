@@ -12,7 +12,7 @@ use spin::{Mutex, Once, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use starry_process::Pid;
 
 use super::{
-    desc::{FileDescription, FileDescriptor, FileHandle},
+    desc::{DescriptionResource, FileDescription, FileDescriptor, FileHandle},
     executable::ExecutableKey,
     flock,
     types::FileLike,
@@ -644,15 +644,16 @@ pub fn add_file_like_with_flags(
     add_file_description(FileDescription::new_with_flags(f, status_flags)?, cloexec)
 }
 
-/// Fallibly constructs an unpublished open file description. Ownership of a
-/// retained executable-write exclusion is transferred exactly once inside the
-/// constructor, including allocation-failure rollback.
-pub(crate) fn prepare_file_description(
+/// Fallibly constructs an unpublished OFD with an attached subsystem
+/// resource. The resource is released on allocation failure, publish failure,
+/// or the final close, and is shared rather than duplicated by `dup`.
+pub(crate) fn prepare_file_description_with_resource(
     f: Arc<dyn FileLike>,
     status_flags: u32,
     write_open_key: Option<ExecutableKey>,
+    resource: Option<DescriptionResource>,
 ) -> AxResult<Arc<FileDescription>> {
-    FileDescription::new_with_write_open_key(f, status_flags, write_open_key)
+    FileDescription::new_with_write_open_key_and_resource(f, status_flags, write_open_key, resource)
 }
 
 pub(crate) fn release_posix_locks_on_close(description: &FileDescription) {
@@ -695,7 +696,7 @@ pub(crate) fn release_process_fd_table(pid: Pid, fd_table: Arc<FdTable>) {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{borrow::Cow, sync::Arc};
+    use alloc::{borrow::Cow, boxed::Box, sync::Arc};
     use core::{
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         task::Context,
@@ -705,6 +706,7 @@ mod tests {
     use linux_raw_sys::general::{F_WRLCK, SEEK_SET, flock64};
 
     use super::*;
+    use crate::file::drain_deferred_description_resource_only_for_test;
     struct DropCountingFile {
         drops: Arc<AtomicUsize>,
     }
@@ -713,6 +715,14 @@ mod tests {
         inode: flock::InodeId,
         observer: flock::RecordLockOwner,
         locks_released_before_drop: Arc<AtomicBool>,
+    }
+
+    struct DropCountingResource(Arc<AtomicUsize>);
+
+    impl Drop for DropCountingResource {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     impl Drop for DropCountingFile {
@@ -782,6 +792,43 @@ mod tests {
             .unwrap(),
             cloexec: false,
         }
+    }
+
+    #[test]
+    fn description_resource_is_shared_by_dup_and_released_on_final_close() {
+        let file_drops = Arc::new(AtomicUsize::new(0));
+        let resource_drops = Arc::new(AtomicUsize::new(0));
+        let resource = Box::try_new(DropCountingResource(resource_drops.clone())).unwrap()
+            as DescriptionResource;
+        let description = FileDescription::new_with_write_open_key_and_resource(
+            Arc::new(DropCountingFile {
+                drops: file_drops.clone(),
+            }),
+            0,
+            None,
+            Some(resource),
+        )
+        .unwrap();
+        description.mark_open_committed();
+
+        let duplicated = description.clone();
+        drop(description);
+        assert_eq!(resource_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(file_drops.load(Ordering::SeqCst), 0);
+
+        drop(duplicated);
+        assert_eq!(file_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(resource_drops.load(Ordering::SeqCst), 0);
+        for _ in 0..64 {
+            if resource_drops.load(Ordering::SeqCst) != 0 {
+                break;
+            }
+            // This owner deliberately has no flock, lease, write-open key, or
+            // cleanup account. The host harness has no scheduler, so drain
+            // only the typed resource this test is responsible for.
+            drain_deferred_description_resource_only_for_test();
+        }
+        assert_eq!(resource_drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

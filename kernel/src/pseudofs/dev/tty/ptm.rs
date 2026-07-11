@@ -8,17 +8,21 @@ use crate::pseudofs::{Device, DeviceOps, SimpleFs};
 
 pub struct Ptmx(pub Arc<SimpleFs>);
 impl Ptmx {
-    pub fn create_pty(&self) -> AxResult<(Arc<Device>, u32)> {
-        let (master, slave) = super::pty::create_pty_pair();
-        super::pts::add_slave(self.0.clone(), slave)?;
+    pub fn create_pty(&self) -> AxResult<(Arc<Device>, Arc<super::PtyDriver>, u32)> {
+        // Admission precedes worker construction. A full devpts table therefore
+        // cannot create and immediately tear down an external reader task.
+        let lease = super::pts::reserve_slave()?;
+        let (master, slave) = super::pty::create_pty_pair()?;
+        super::pts::add_slave(self.0.clone(), slave, &lease)?;
         let pty_number = master.pty_number();
-        let device = Device::new(
+        master.install_pts_lease(lease)?;
+        let device = Device::try_new(
             self.0.clone(),
             NodeType::CharacterDevice,
             DeviceId::new(128, pty_number),
-            master,
-        );
-        Ok((device, pty_number))
+            master.clone(),
+        )?;
+        Ok((device, master, pty_number))
     }
 }
 

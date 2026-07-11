@@ -175,6 +175,21 @@ impl Termios2 {
     }
 }
 
+#[cfg(test)]
+impl Termios2 {
+    pub(super) fn set_canonical_for_test(&mut self, enabled: bool) {
+        if enabled {
+            self.termios.c_lflag |= ICANON;
+        } else {
+            self.termios.c_lflag &= !ICANON;
+        }
+    }
+
+    pub(super) fn set_special_char_for_test(&mut self, index: u32, value: u8) {
+        self.termios.c_cc[index as usize] = value;
+    }
+}
+
 impl Deref for Termios2 {
     type Target = Termios;
 

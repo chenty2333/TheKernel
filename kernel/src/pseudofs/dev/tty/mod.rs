@@ -12,59 +12,100 @@ use axfs_ng_vfs::NodeFlags;
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
 use axtask::current;
+use kspin::SpinNoIrq;
+use spin::Once;
 use starry_process::{Process, Session};
 use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 
-use self::terminal::{
-    Terminal, WindowSize,
-    ldisc::{LineDiscipline, ProcessMode, TtyConfig, TtyRead, TtyWrite},
-    termios::{Termio, Termios, Termios2},
-};
 pub use self::{
     ntty::{N_TTY, NTtyDriver},
     ptm::Ptmx,
     pts::PtsDir,
     pty::PtyDriver,
 };
+use self::{
+    pts::PtsLease,
+    pty::PtyEndpoint,
+    terminal::{
+        Terminal, WindowSize,
+        ldisc::{LineDiscipline, TtyConfig, TtyRead, TtyWrite},
+        termios::{Termio, Termios, Termios2},
+    },
+};
 use crate::{
-    pseudofs::{DeviceOps, SimpleFs},
+    pseudofs::DeviceOps,
     task::{AsThread, get_process_group, send_signal_to_process_group},
 };
 
 const N_TTY_LDISC: i32 = 0;
 
-pub fn create_pty_master(fs: Arc<SimpleFs>) -> AxResult<Arc<PtyDriver>> {
-    let (master, slave) = pty::create_pty_pair();
-    pts::add_slave(fs, slave)?;
-    Ok(master)
-}
-
 /// Tty device
 pub struct Tty<R, W> {
-    this: Weak<Self>,
+    this: Once<Weak<Self>>,
     terminal: Arc<Terminal>,
     ldisc: Mutex<LineDiscipline<R, W>>,
     writer: W,
+    endpoint: Option<PtyEndpoint>,
+    pts_lease: SpinNoIrq<Option<PtsLease>>,
     is_ptm: bool,
 }
 
 impl<R: TtyRead, W: TtyWrite + Clone> Tty<R, W> {
-    fn new(terminal: Arc<Terminal>, config: TtyConfig<R, W>) -> Arc<Self> {
+    fn try_new(
+        terminal: Arc<Terminal>,
+        config: TtyConfig<R, W>,
+        endpoint: Option<PtyEndpoint>,
+    ) -> AxResult<Arc<Self>> {
         let writer = config.writer.clone();
-        let is_ptm = matches!(&config.process_mode, ProcessMode::None(_));
-        let ldisc = Mutex::new(LineDiscipline::new(terminal.clone(), config));
-        Arc::new_cyclic(|this| Self {
-            this: this.clone(),
+        let is_ptm = endpoint.as_ref().is_some_and(PtyEndpoint::is_master);
+        let ldisc = Mutex::new(LineDiscipline::try_new(terminal.clone(), config)?);
+        let tty = Arc::try_new(Self {
+            this: Once::new(),
             terminal,
             ldisc,
             writer,
+            endpoint,
+            pts_lease: SpinNoIrq::new(None),
             is_ptm,
         })
+        .map_err(|_| AxError::NoMemory)?;
+        tty.this.call_once(|| Arc::downgrade(&tty));
+        Ok(tty)
     }
 }
 
 impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
+    fn this_arc(&self) -> AxResult<Arc<Self>> {
+        self.this
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or(AxError::NotATty)
+    }
+
+    fn install_pts_lease(&self, lease: PtsLease) -> AxResult<()> {
+        let rejected = {
+            let mut current = self.pts_lease.lock();
+            if current.is_some() {
+                Some(lease)
+            } else {
+                *current = Some(lease);
+                None
+            }
+        };
+        if let Some(rejected) = rejected {
+            drop(rejected);
+            Err(AxError::BadState)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn release_pts_lease(&self) {
+        let lease = self.pts_lease.lock().take();
+        drop(lease);
+    }
+
     fn controlling_session_for_current(&self) -> AxResult<Arc<Session>> {
         let session = current().as_thread().proc_data.proc.group().session();
         let terminal_session = self
@@ -75,7 +116,7 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
         if !Arc::ptr_eq(&session, &terminal_session) {
             return Err(AxError::NotATty);
         }
-        let tty: Arc<dyn Any + Send + Sync> = self.this.upgrade().ok_or(AxError::NotATty)?;
+        let tty: Arc<dyn Any + Send + Sync> = self.this_arc()?;
         if !session
             .terminal()
             .is_some_and(|current| Arc::ptr_eq(&current, &tty))
@@ -125,20 +166,94 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
     pub fn is_locked_pty_slave(&self) -> bool {
         !self.is_ptm && self.terminal.pty_locked.load(Ordering::Acquire)
     }
+
+    fn hangup_controlling_session(&self) {
+        let Some(session) = self.terminal.job_control.session() else {
+            return;
+        };
+        if let Some(tty) = session.terminal()
+            && tty
+                .downcast_ref::<Self>()
+                .is_some_and(|other| Arc::ptr_eq(&other.terminal, &self.terminal))
+        {
+            session.unset_terminal(&tty);
+        }
+        if let Some(foreground) = self.terminal.job_control.release_session(&session) {
+            let pgid = foreground.pgid();
+            let _ = send_signal_to_process_group(pgid, Some(SignalInfo::new_kernel(Signo::SIGHUP)));
+            let _ =
+                send_signal_to_process_group(pgid, Some(SignalInfo::new_kernel(Signo::SIGCONT)));
+        }
+    }
+}
+
+pub(crate) struct PtyOpenGuard {
+    // Keep the endpoint object alive until deferred final-OFD cleanup. The
+    // underlying File may already have been dropped by then.
+    tty: Arc<PtyDriver>,
+    endpoint: PtyEndpoint,
+}
+
+impl Drop for PtyOpenGuard {
+    fn drop(&mut self) {
+        let master_final = self.endpoint.close();
+        self.tty.writer.wake_waiters();
+        if master_final {
+            self.tty.release_pts_lease();
+            self.tty.hangup_controlling_session();
+        }
+    }
+}
+
+impl Tty<pty::PtyReader, pty::PtyWriter> {
+    pub(crate) fn open_description(&self) -> AxResult<PtyOpenGuard> {
+        let endpoint = self.endpoint.clone().ok_or(AxError::BadState)?;
+        let tty = self
+            .this
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or(AxError::BadState)?;
+        endpoint.open()?;
+        Ok(PtyOpenGuard { tty, endpoint })
+    }
 }
 
 impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
     fn read_at(&self, buf: &mut [u8], _offset: u64) -> AxResult<usize> {
+        let slave_hangup = self
+            .endpoint
+            .as_ref()
+            .is_some_and(|endpoint| !endpoint.is_master() && endpoint.read_hangup());
+        if slave_hangup {
+            // A master hangup does not discard bytes which were already
+            // accepted into the raw channel or any line-discipline stage.
+            // EOF becomes visible only after the worker confirms every stage,
+            // including the public ring, has drained.
+            let mut ldisc = self.ldisc.lock();
+            return match ldisc.read(buf) {
+                Err(AxError::WouldBlock) if ldisc.input_drained() => Ok(0),
+                result => result,
+            };
+        }
         if self.is_ptm || self.terminal.job_control.current_in_foreground() {
-            self.ldisc.lock().read(buf)
+            let result = self.ldisc.lock().read(buf);
+            if matches!(result, Err(AxError::WouldBlock))
+                && self
+                    .endpoint
+                    .as_ref()
+                    .is_some_and(|endpoint| endpoint.is_master() && endpoint.read_hangup())
+            {
+                Err(AxError::Io)
+            } else {
+                result
+            }
         } else {
             Err(AxError::WouldBlock)
         }
     }
 
     fn write_at(&self, buf: &[u8], _offset: u64) -> AxResult<usize> {
-        self.writer.write(buf);
-        Ok(buf.len())
+        self.writer.write(buf)
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
@@ -151,43 +266,32 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 (arg as *mut Termio).vm_write(self.terminal.termios.lock().as_termio())?;
             }
             TCGETS => {
-                (arg as *mut Termios).vm_write(*self.terminal.termios.lock().as_ref().deref())?;
+                let termios = *self.terminal.termios.lock();
+                (arg as *mut Termios).vm_write(*termios.deref())?;
             }
             TCGETS2 => {
-                (arg as *mut Termios2).vm_write(*self.terminal.termios.lock().as_ref())?;
+                (arg as *mut Termios2).vm_write(*self.terminal.termios.lock())?;
             }
-            TCSETA | TCSETAF | TCSETAW => {
+            TCSETA => {
                 let termio = (arg as *const Termio).vm_read()?;
-                let current = self.terminal.termios.lock();
-                let next = Termios2::from_termio(termio, current.as_ref());
-                drop(current);
-                *self.terminal.termios.lock() = Arc::new(next);
-                if cmd == TCSETAF {
-                    self.ldisc.lock().drain_input();
-                }
+                let current = *self.terminal.termios.lock();
+                let next = Termios2::from_termio(termio, &current);
+                *self.terminal.termios.lock() = next;
             }
-            TCSETS | TCSETSF | TCSETSW => {
-                // TODO: drain output?
-                *self.terminal.termios.lock() =
-                    Arc::new(Termios2::new((arg as *const Termios).vm_read()?));
-                if cmd == TCSETSF {
-                    self.ldisc.lock().drain_input();
-                }
+            TCSETAF | TCSETAW => return Err(AxError::Unsupported),
+            TCSETS => {
+                *self.terminal.termios.lock() = Termios2::new((arg as *const Termios).vm_read()?);
             }
-            TCSETS2 | TCSETSF2 | TCSETSW2 => {
-                // TODO: drain output?
-                *self.terminal.termios.lock() = Arc::new((arg as *const Termios2).vm_read()?);
-                if cmd == TCSETSF2 {
-                    self.ldisc.lock().drain_input();
-                }
+            TCSETSF | TCSETSW => return Err(AxError::Unsupported),
+            TCSETS2 => {
+                *self.terminal.termios.lock() = (arg as *const Termios2).vm_read()?;
             }
+            TCSETSF2 | TCSETSW2 => return Err(AxError::Unsupported),
             FIONREAD => {
                 let readable = self.ldisc.lock().readable_len() as u32;
                 (arg as *mut u32).vm_write(readable)?;
             }
-            TIOCOUTQ => {
-                (arg as *mut u32).vm_write(0)?;
-            }
+            TIOCOUTQ => return Err(AxError::Unsupported),
             TIOCGETD => {
                 let ldisc = self.terminal.line_discipline.load(Ordering::Acquire) as i32;
                 (arg as *mut i32).vm_write(ldisc)?;
@@ -206,8 +310,7 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 _ => return Err(AxError::InvalidInput),
             },
             TCFLSH => match arg as u32 {
-                TCIFLUSH => self.ldisc.lock().drain_input(),
-                TCOFLUSH | TCIOFLUSH => return Err(AxError::Unsupported),
+                TCIFLUSH | TCOFLUSH | TCIOFLUSH => return Err(AxError::Unsupported),
                 _ => return Err(AxError::InvalidInput),
             },
             TIOCGPGRP => {
@@ -249,23 +352,23 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 (arg as *mut i32).vm_write(locked)?;
             }
             TIOCGPTN => {
+                if !self.is_ptm {
+                    return Err(AxError::NotATty);
+                }
                 (arg as *mut u32).vm_write(self.pty_number())?;
             }
             TIOCSCTTY => {
                 if arg != 0 {
                     return Err(AxError::OperationNotSupported);
                 }
-                self.this
-                    .upgrade()
-                    .ok_or(AxError::NotATty)?
+                self.this_arc()?
                     .bind_to(&current().as_thread().proc_data.proc)?;
             }
             TIOCNOTTY => {
                 let curr = current();
                 let proc = &curr.as_thread().proc_data.proc;
                 let session = proc.group().session();
-                let tty: Arc<dyn Any + Send + Sync> =
-                    self.this.upgrade().ok_or(AxError::NotATty)?;
+                let tty: Arc<dyn Any + Send + Sync> = self.this_arc()?;
                 if !session
                     .terminal()
                     .is_some_and(|current| Arc::ptr_eq(&current, &tty))
@@ -335,10 +438,28 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
 
 impl<R: TtyRead, W: TtyWrite> Pollable for Tty<R, W> {
     fn poll(&self) -> IoEvents {
-        let mut events = IoEvents::OUT | self.terminal.job_control.poll();
-        if self.is_ptm || events.contains(IoEvents::IN) {
+        let hangup_events = self
+            .endpoint
+            .as_ref()
+            .map_or(IoEvents::empty(), PtyEndpoint::hangup_events);
+        let (mut events, foreground) = if self.is_ptm {
+            // The master endpoint is never subject to slave foreground job
+            // control and must remain pollable without a current user task.
+            (IoEvents::empty(), true)
+        } else if hangup_events.contains(IoEvents::HUP) {
+            // Hangup readiness is terminal state, independent of which task
+            // happens to poll the orphaned slave.
+            (IoEvents::empty(), true)
+        } else {
+            let events = self.terminal.job_control.poll();
+            let foreground = events.contains(IoEvents::IN);
+            (events, foreground)
+        };
+        events.set(IoEvents::OUT, self.writer.poll_write());
+        if foreground {
             events.set(IoEvents::IN, self.ldisc.lock().poll_read());
         }
+        events |= hangup_events;
         events
     }
 
@@ -349,6 +470,120 @@ impl<R: TtyRead, W: TtyWrite> Pollable for Tty<R, W> {
         if events.contains(IoEvents::IN) {
             self.ldisc.lock().register_rx_waker(context.waker());
         }
+        if events.contains(IoEvents::OUT) {
+            self.writer.register_tx_waker(context.waker());
+        }
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.register(context);
+        }
+    }
+}
+
+impl<R, W> Drop for Tty<R, W> {
+    fn drop(&mut self) {
+        // Construction can publish a devpts slot before the master OFD is
+        // admitted. This fallback rolls the slot back if a later allocation
+        // fails; the normal path takes it from `PtyOpenGuard::drop`.
+        let lease = self.pts_lease.lock().take();
+        drop(lease);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{borrow::Cow, boxed::Box, sync::Arc};
+    use core::task::Context;
+
+    use axpoll::{IoEvents, Pollable};
+
+    use super::*;
+    use crate::file::{
+        DescriptionResource, FileLike, Kstat, drain_deferred_description_resource_only_for_test,
+        has_deferred_description_cleanup_work, prepare_file_description_with_resource,
+    };
+
+    struct DummyFile;
+
+    impl Pollable for DummyFile {
+        fn poll(&self) -> IoEvents {
+            IoEvents::empty()
+        }
+
+        fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+    }
+
+    impl FileLike for DummyFile {
+        fn stat(&self) -> AxResult<Kstat> {
+            Err(AxError::InvalidInput)
+        }
+
+        fn path(&self) -> Cow<'_, str> {
+            Cow::Borrowed("pty-lifecycle-test")
+        }
+
+        fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+            Ok(())
+        }
+    }
+
+    fn drain_all_description_cleanup() {
+        drain_deferred_description_resource_only_for_test();
+        assert!(!has_deferred_description_cleanup_work());
+    }
+
+    #[test]
+    fn master_dup_releases_devpts_and_hangs_up_slave_only_after_deferred_final_close() {
+        drain_all_description_cleanup();
+        let (master, slave) = pty::create_pty_pair_for_test().unwrap();
+        let (lease, slot) = pts::reserve_test_lease().unwrap();
+        master.install_pts_lease(lease).unwrap();
+        assert!(pts::test_slot_reserved(slot));
+
+        let master_open = master.open_description().unwrap();
+        let slave_open = slave.open_description().unwrap();
+
+        // The final slave OFD close, rather than a duplicated fd close, owns
+        // the master-side hangup transition.
+        drop(slave_open);
+        assert_eq!(
+            master.endpoint.as_ref().unwrap().hangup_events().bits(),
+            (IoEvents::IN | IoEvents::HUP).bits()
+        );
+        let slave_open = slave.open_description().unwrap();
+        assert!(master.endpoint.as_ref().unwrap().hangup_events().is_empty());
+
+        let resource = Box::try_new(master_open).unwrap() as DescriptionResource;
+        let file: Arc<dyn FileLike> = Arc::try_new(DummyFile).unwrap();
+        let description =
+            prepare_file_description_with_resource(file, 0, None, Some(resource)).unwrap();
+        description.mark_open_committed();
+
+        let duplicated = description.clone();
+        drop(description);
+        assert!(pts::test_slot_reserved(slot));
+        assert!(slave.endpoint.as_ref().unwrap().hangup_events().is_empty());
+
+        drop(duplicated);
+        // Final Arc drop only publishes preallocated work. The PTY guard, PTS
+        // lease, hangup, and any worker join remain deferred.
+        assert!(pts::test_slot_reserved(slot));
+        assert!(slave.endpoint.as_ref().unwrap().hangup_events().is_empty());
+
+        drain_all_description_cleanup();
+        assert!(!pts::test_slot_reserved(slot));
+        let events = slave.endpoint.as_ref().unwrap().hangup_events();
+        assert!(events.contains(IoEvents::IN | IoEvents::OUT | IoEvents::ERR | IoEvents::HUP));
+        assert_eq!(
+            TtyWrite::write(&slave.writer, b"after-hangup"),
+            Err(AxError::Io)
+        );
+
+        // The opened slave description remains valid as an object until its
+        // own final close even though its devpts name has been unlinked.
+        drop(slave_open);
+        drop(slave);
+        drop(master);
+        drain_all_description_cleanup();
     }
 }
 

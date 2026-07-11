@@ -1,6 +1,7 @@
-use alloc::{string::ToString, sync::Arc};
+use alloc::{boxed::Box, string::String, sync::Arc};
 use core::{
     ffi::{c_char, c_int},
+    fmt::Write as _,
     mem::size_of,
 };
 
@@ -19,8 +20,8 @@ use starry_signal::Signo;
 
 use crate::{
     file::{
-        AsyncIoOwner, AsyncIoOwnerType, Directory, FD_TABLE, File, FileDescription, FileLike, Pipe,
-        ReservedFd, close_file_like, dnotify, executable,
+        AsyncIoOwner, AsyncIoOwnerType, DescriptionResource, Directory, FD_TABLE, File,
+        FileDescription, FileLike, Pipe, ReservedFd, close_file_like, dnotify, executable,
         flock::{self, RecordLockOwner},
         get_file_description, get_file_like, get_typed_file,
         inotify::{
@@ -33,7 +34,8 @@ use crate::{
             check_writable_mount, initial_named_create_owner_mode,
         },
         pipe::NamedPipe,
-        prepare_file_description, replace_process_fd_table, reserve_fd, resolve_at, with_path_fs,
+        prepare_file_description_with_resource, replace_process_fd_table, reserve_fd, resolve_at,
+        with_path_fs,
     },
     mm::{UserConstPtr, UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
@@ -418,6 +420,7 @@ fn prepare_open_description(
     flags: u32,
     write_open_key: Option<executable::ExecutableKey>,
 ) -> AxResult<Arc<FileDescription>> {
+    let mut description_resource: Option<DescriptionResource> = None;
     let f: Arc<dyn FileLike> = match result {
         OpenResult::File(mut file) => {
             if flags & O_PATH == 0 && file.location().metadata()?.node_type == NodeType::Fifo {
@@ -427,28 +430,34 @@ fn prepare_open_description(
                 )?)
                 .map_err(|_| AxError::NoMemory)?
             } else {
+                let mut pty_guard = None;
                 // /dev/xx handling
-                if let Ok(device) = file.location().entry().downcast::<Device>() {
+                if flags & O_PATH == 0
+                    && let Ok(device) = file.location().entry().downcast::<Device>()
+                {
                     let inner = device.inner().as_any();
                     if let Some(ptmx) = inner.downcast_ref::<tty::Ptmx>() {
                         // Opening /dev/ptmx creates a new pseudo-terminal
-                        let (master, pty_number) = ptmx.create_pty()?;
+                        let (master, master_tty, pty_number) = ptmx.create_pty()?;
                         let pts = file
                             .location()
                             .parent()
                             .ok_or(AxError::NotFound)?
                             .lookup_no_follow("pts")?;
-                        let entry = DirEntry::new_file(
+                        let pty_name = try_pty_name(pty_number)?;
+                        let entry = DirEntry::try_new_file(
                             FileNode::new(master),
                             NodeType::CharacterDevice,
-                            Reference::new(Some(pts.entry().clone()), pty_number.to_string()),
-                        );
+                            Reference::new(Some(pts.entry().clone()), pty_name),
+                        )?;
                         let loc = Location::new(file.location().mountpoint().clone(), entry);
                         file = axfs::File::new(FileBackend::Direct(loc), file.flags());
+                        pty_guard = Some(master_tty.open_description()?);
                     } else if let Some(pty) = inner.downcast_ref::<tty::PtyDriver>() {
-                        if flags & O_PATH == 0 && pty.is_locked_pty_slave() {
+                        if pty.is_locked_pty_slave() {
                             return Err(AxError::Io);
                         }
+                        pty_guard = Some(pty.open_description()?);
                     } else if inner.is::<tty::CurrentTty>() {
                         let term = current()
                             .as_thread()
@@ -462,16 +471,24 @@ fn prepare_open_description(
                         let loc = if term.is::<tty::NTtyDriver>() {
                             dev_dir.lookup_no_follow("console")?
                         } else if let Some(pts) = term.downcast_ref::<tty::PtyDriver>() {
+                            pty_guard = Some(pts.open_description()?);
+                            let pty_name = try_pty_name(pts.pty_number())?;
                             dev_dir
                                 .lookup_no_follow("pts")?
-                                .lookup_no_follow(&pts.pty_number().to_string())?
+                                .lookup_no_follow(&pty_name)?
                         } else {
                             return Err(LinuxError::ENODEV.into());
                         };
                         file = axfs::File::new(FileBackend::Direct(loc), file.flags());
                     }
                 }
-                Arc::try_new(File::new(file)).map_err(|_| AxError::NoMemory)?
+                let file = File::new(file);
+                if let Some(guard) = pty_guard {
+                    description_resource =
+                        Some(Box::try_new(guard).map_err(|_| AxError::NoMemory)?
+                            as DescriptionResource);
+                }
+                Arc::try_new(file).map_err(|_| AxError::NoMemory)?
             }
         }
         OpenResult::Dir(dir) => Arc::try_new(Directory::new(dir)).map_err(|_| AxError::NoMemory)?,
@@ -479,7 +496,19 @@ fn prepare_open_description(
     if flags & O_NONBLOCK != 0 {
         f.set_nonblocking(true)?;
     }
-    prepare_file_description(f, open_status_flags(flags), write_open_key)
+    prepare_file_description_with_resource(
+        f,
+        open_status_flags(flags),
+        write_open_key,
+        description_resource,
+    )
+}
+
+fn try_pty_name(number: u32) -> AxResult<String> {
+    let mut name = String::new();
+    name.try_reserve_exact(10).map_err(|_| AxError::NoMemory)?;
+    write!(&mut name, "{number}").map_err(|_| AxError::NoMemory)?;
+    Ok(name)
 }
 
 fn publish_reserved_open(

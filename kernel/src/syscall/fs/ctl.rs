@@ -9,8 +9,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FileBackend, FileFlags};
 use axfs_ng_vfs::{
     CreateDisposition, DeviceId, Location, Metadata, MetadataUpdate, NamedCreateOptions,
-    NodePermission, NodeType,
-    path::{MAX_NAME_LEN, Path},
+    NodePermission, NodeType, path::Path,
 };
 use axhal::power::system_off;
 use axtask::current;
@@ -43,7 +42,6 @@ use crate::{
 };
 
 const SUPPORTED_RENAMEAT2_FLAGS: u32 = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
-const PATH_MAX: usize = 4096;
 const SUPPORTED_FCHMODAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
 const SUPPORTED_FCHOWNAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
 
@@ -143,15 +141,8 @@ fn proc_namespace_ioctl(loc: &Location, cmd: u32) -> Option<AxResult<isize>> {
     Some(result)
 }
 
-pub(super) fn validate_pathname(path: &Path) -> AxResult {
-    if path.as_str().len() >= PATH_MAX
-        || path
-            .components()
-            .any(|comp| comp.as_str().len() > MAX_NAME_LEN)
-    {
-        return Err(AxError::NameTooLong);
-    }
-    Ok(())
+pub(crate) fn validate_pathname(path: &Path) -> AxResult {
+    crate::file::validate_pathname(path)
 }
 
 fn resolve_existing_at(
@@ -437,6 +428,7 @@ pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize
                 permission: final_mode,
                 owner: Some(owner),
                 rdev: None,
+                initial_data: None,
             },
             CreateDisposition::Exclusive,
         )?
@@ -504,6 +496,7 @@ pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, dev: u64) -> AxRe
                 permission: final_mode,
                 owner: Some(owner),
                 rdev,
+                initial_data: None,
             },
             CreateDisposition::Exclusive,
         )?

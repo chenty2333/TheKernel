@@ -1,6 +1,5 @@
 //! Terminal module.
 
-use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU32};
 
 use bytemuck::AnyBitPattern;
@@ -22,7 +21,7 @@ pub struct WindowSize {
 pub struct Terminal {
     pub job_control: job::JobControl,
     pub window_size: SpinNoPreempt<WindowSize>,
-    pub termios: SpinNoPreempt<Arc<termios::Termios2>>,
+    pub termios: SpinNoPreempt<termios::Termios2>,
     pub pty_number: AtomicU32,
     pub pty_locked: AtomicBool,
     pub line_discipline: AtomicU32,
@@ -37,7 +36,7 @@ impl Default for Terminal {
                 ws_xpixel: 0,
                 ws_ypixel: 0,
             }),
-            termios: SpinNoPreempt::new(Arc::new(termios::Termios2::default())),
+            termios: SpinNoPreempt::new(termios::Termios2::default()),
             pty_number: AtomicU32::new(0),
             pty_locked: AtomicBool::new(true),
             line_discipline: AtomicU32::new(0),
@@ -45,7 +44,7 @@ impl Default for Terminal {
     }
 }
 impl Terminal {
-    pub fn load_termios(&self) -> Arc<termios::Termios2> {
-        self.termios.lock().clone()
+    pub fn load_termios(&self) -> termios::Termios2 {
+        *self.termios.lock()
     }
 }
