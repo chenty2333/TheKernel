@@ -14,7 +14,7 @@ use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::{
     __kernel_mode_t, CAP_DAC_OVERRIDE, CAP_FOWNER, O_ACCMODE, O_CLOEXEC, O_CREAT, O_EXCL,
     O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, SI_MESGQ, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD,
-    sigevent, timespec,
+    timespec,
 };
 use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
@@ -25,6 +25,7 @@ use crate::{
         get_file_description, get_typed_file,
     },
     mm::vm_load_string,
+    syscall::RawSigevent,
     task::{
         AsThread, ProcStateHint, has_pending_syscall_signal, send_signal_to_process,
         with_proc_state_hint,
@@ -373,14 +374,14 @@ fn validate_timespec(timeout: *const timespec) -> AxResult<Option<Duration>> {
     )))
 }
 
-fn validate_notify_event(event: &sigevent) -> AxResult {
-    match event.sigev_notify as u32 {
+fn validate_notify_event(event: &RawSigevent) -> AxResult {
+    match event.notify() as u32 {
         SIGEV_NONE | SIGEV_THREAD => Ok(()),
         SIGEV_SIGNAL => {
-            if event.sigev_signo == 0 {
+            if event.signo() == 0 {
                 Ok(())
-            } else if (1..=64).contains(&event.sigev_signo)
-                && Signo::from_repr(event.sigev_signo as u8).is_some()
+            } else if (1..=64).contains(&event.signo())
+                && Signo::from_repr(event.signo() as u8).is_some()
             {
                 Ok(())
             } else {
@@ -391,23 +392,23 @@ fn validate_notify_event(event: &sigevent) -> AxResult {
     }
 }
 
-fn build_notifier(event: &sigevent) -> AxResult<MqNotifier> {
+fn build_notifier(event: &RawSigevent) -> AxResult<MqNotifier> {
     validate_notify_event(event)?;
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let mut notifier = MqNotifier {
         pid: proc_data.proc.pid(),
-        notify: event.sigev_notify,
-        signo: event.sigev_signo,
-        value_int: unsafe { event.sigev_value.sival_int },
+        notify: event.notify(),
+        signo: event.signo(),
+        value_int: event.value_int(),
         thread: None,
     };
 
-    if event.sigev_notify == SIGEV_THREAD as i32 {
+    if event.notify() == SIGEV_THREAD as i32 {
         let netlink =
-            NetlinkSocket::from_fd(event.sigev_signo).map_err(|_| AxError::BadFileDescriptor)?;
-        let cookie_ptr = unsafe { event.sigev_value.sival_ptr };
-        let cookie_data = vm_load(cookie_ptr.cast::<u8>(), NOTIFY_COOKIE_LEN)?;
+            NetlinkSocket::from_fd(event.signo()).map_err(|_| AxError::BadFileDescriptor)?;
+        let cookie_ptr = event.value_ptr_address() as *const u8;
+        let cookie_data = vm_load(cookie_ptr, NOTIFY_COOKIE_LEN)?;
         let mut cookie = [0u8; NOTIFY_COOKIE_LEN];
         cookie.copy_from_slice(&cookie_data);
         notifier.thread = Some(MqThreadNotifier { netlink, cookie });
@@ -676,11 +677,11 @@ pub fn sys_mq_timedreceive(
     }
 }
 
-pub fn sys_mq_notify(fd: i32, notification: *const sigevent) -> AxResult<isize> {
+pub fn sys_mq_notify(fd: i32, notification: *const RawSigevent) -> AxResult<isize> {
     let notifier = if notification.is_null() {
         None
     } else {
-        let event = unsafe { notification.vm_read_uninit()?.assume_init() };
+        let event = RawSigevent::read_from_user(notification)?;
         Some(build_notifier(&event)?)
     };
     let file = get_mq_fd(fd)?;

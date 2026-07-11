@@ -8,13 +8,14 @@ use linux_raw_sys::general::{
     __kernel_clockid_t, CAP_SYS_TIME, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC,
     CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
     CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, SIGEV_NONE,
-    SIGEV_SIGNAL, SIGEV_THREAD, SIGEV_THREAD_ID, TIMER_ABSTIME, itimerspec, itimerval, sigevent,
-    timespec, timeval, timezone,
+    SIGEV_SIGNAL, SIGEV_THREAD, SIGEV_THREAD_ID, TIMER_ABSTIME, itimerspec, itimerval, timespec,
+    timeval, timezone,
 };
 use starry_signal::Signo;
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
+    syscall::RawSigevent,
     task::{
         AlarmClock, AsThread, ITimerType, PosixTimer, PosixTimerClock, PosixTimerNotify, TaskUsage,
         get_task, nanos_to_clock_ticks, poll_timer, register_posix_timer_alarm,
@@ -518,7 +519,7 @@ fn saturating_sub_duration(lhs: Duration, rhs: Duration) -> Duration {
     lhs.checked_sub(rhs).unwrap_or(Duration::ZERO)
 }
 
-fn decode_timer_notify(event: Option<sigevent>) -> AxResult<PosixTimerNotify> {
+fn decode_timer_notify(event: Option<RawSigevent>) -> AxResult<PosixTimerNotify> {
     let Some(event) = event else {
         return Ok(PosixTimerNotify::Signal {
             signo: Signo::SIGALRM,
@@ -526,18 +527,18 @@ fn decode_timer_notify(event: Option<sigevent>) -> AxResult<PosixTimerNotify> {
         });
     };
 
-    match event.sigev_notify as u32 {
+    match event.notify() as u32 {
         SIGEV_NONE => Ok(PosixTimerNotify::None),
         SIGEV_SIGNAL | SIGEV_THREAD => {
-            let signo = Signo::from_repr(event.sigev_signo as u8).ok_or(AxError::InvalidInput)?;
+            let signo = decode_sigevent_signo(event.signo())?;
             Ok(PosixTimerNotify::Signal {
                 signo,
                 target_tid: None,
             })
         }
         SIGEV_THREAD_ID => {
-            let signo = Signo::from_repr(event.sigev_signo as u8).ok_or(AxError::InvalidInput)?;
-            let tid = unsafe { event._sigev_un._tid };
+            let signo = decode_sigevent_signo(event.signo())?;
+            let tid = event.thread_id();
             if tid <= 0 {
                 return Err(AxError::InvalidInput);
             }
@@ -548,6 +549,11 @@ fn decode_timer_notify(event: Option<sigevent>) -> AxResult<PosixTimerNotify> {
         }
         _ => Err(AxError::InvalidInput),
     }
+}
+
+fn decode_sigevent_signo(raw: i32) -> AxResult<Signo> {
+    let raw = u8::try_from(raw).map_err(|_| AxError::InvalidInput)?;
+    Signo::from_repr(raw).ok_or(AxError::InvalidInput)
 }
 
 fn timer_absolute_deadline(
@@ -582,7 +588,7 @@ fn timer_remaining(timer: &PosixTimer) -> Duration {
 
 pub fn sys_timer_create(
     clock_id: __kernel_clockid_t,
-    sigevent_ptr: *const sigevent,
+    sigevent_ptr: *const RawSigevent,
     timerid_ptr: *mut i32,
 ) -> AxResult<isize> {
     if timerid_ptr.is_null() {
@@ -591,7 +597,7 @@ pub fn sys_timer_create(
 
     let clock = posix_timer_clock(clock_id)?;
     let notify = if let Some(ptr) = sigevent_ptr.nullable() {
-        decode_timer_notify(Some(unsafe { ptr.vm_read_uninit()?.assume_init() }))?
+        decode_timer_notify(Some(RawSigevent::read_from_user(ptr)?))?
     } else {
         decode_timer_notify(None)?
     };
@@ -974,6 +980,15 @@ mod tests {
         assert!(timex_modes_supported(ADJ_OFFSET_SINGLESHOT));
         assert!(timex_modes_supported(ADJ_OFFSET_SS_READ));
         assert!(!timex_modes_supported(ADJ_SINGLESHOT_FLAG));
+    }
+
+    #[test]
+    fn sigevent_signo_does_not_wrap_before_validation() {
+        assert_eq!(decode_sigevent_signo(1), Ok(Signo::SIGHUP));
+        assert_eq!(decode_sigevent_signo(64), Ok(Signo::SIGRT32));
+        assert_eq!(decode_sigevent_signo(0), Err(AxError::InvalidInput));
+        assert_eq!(decode_sigevent_signo(257), Err(AxError::InvalidInput));
+        assert_eq!(decode_sigevent_signo(-1), Err(AxError::InvalidInput));
     }
 }
 

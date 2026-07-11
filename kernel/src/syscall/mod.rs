@@ -12,6 +12,7 @@ mod sync;
 mod sys;
 mod task;
 mod time;
+mod usercopy;
 
 use core::time::Duration;
 
@@ -24,6 +25,7 @@ use linux_raw_sys::general::{
     FUTEX_WAIT_BITSET,
 };
 use syscalls::Sysno;
+pub(crate) use usercopy::RawSigevent;
 
 pub use self::{
     fs::*, io_mpx::*, ipc::*, mm::*, net::*, resources::*, signal::*, sync::*, sys::*, task::*,
