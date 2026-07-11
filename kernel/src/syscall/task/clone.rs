@@ -337,26 +337,12 @@ impl CloneArgs {
                     child_sched_state.class = SchedClass::Normal;
                     child_sched_state.nice = 0;
                     child_sched_state.rt_priority = 0;
-                    child_sched_state.dl_runtime = 0;
-                    child_sched_state.dl_deadline = 0;
-                    child_sched_state.dl_period = 0;
                 }
                 SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
                     if child_sched_state.nice < 0 {
                         child_sched_state.nice = 0;
                     }
                     child_sched_state.rt_priority = 0;
-                    child_sched_state.dl_runtime = 0;
-                    child_sched_state.dl_deadline = 0;
-                    child_sched_state.dl_period = 0;
-                }
-                SchedClass::Deadline => {
-                    child_sched_state.class = SchedClass::Normal;
-                    child_sched_state.nice = 0;
-                    child_sched_state.rt_priority = 0;
-                    child_sched_state.dl_runtime = 0;
-                    child_sched_state.dl_deadline = 0;
-                    child_sched_state.dl_period = 0;
                 }
             }
         }

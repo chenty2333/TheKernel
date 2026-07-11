@@ -70,14 +70,28 @@ fn sched_target(pid: i32) -> AxResult<AxTaskRef> {
     }
 }
 
-fn sched_class_from_policy(policy: i32) -> AxResult<SchedClass> {
-    match policy as u32 {
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SchedSetAbi {
+    Legacy,
+    Attr,
+}
+
+fn sched_class_for_set(policy: u32, abi: SchedSetAbi) -> AxResult<SchedClass> {
+    match policy {
         SCHED_NORMAL => Ok(SchedClass::Normal),
         SCHED_BATCH => Ok(SchedClass::Batch),
         SCHED_IDLE => Ok(SchedClass::Idle),
         SCHED_FIFO => Ok(SchedClass::Fifo),
         SCHED_RR => Ok(SchedClass::RoundRobin),
-        SCHED_DEADLINE => Ok(SchedClass::Deadline),
+        // The legacy ABI cannot carry the runtime/deadline/period tuple, so
+        // Linux rejects SCHED_DEADLINE through sched_setscheduler(2) as an
+        // invalid request. sched_setattr(2) can express the request, but this
+        // kernel has no EDF/CBS class or bandwidth admission yet; report that
+        // known capability as unsupported instead of running it as CFS.
+        SCHED_DEADLINE => match abi {
+            SchedSetAbi::Legacy => Err(AxError::InvalidInput),
+            SchedSetAbi::Attr => Err(AxError::OperationNotSupported),
+        },
         _ => Err(AxError::InvalidInput),
     }
 }
@@ -138,7 +152,6 @@ fn linux_policy_from_state(state: SchedState) -> i32 {
         SchedClass::Idle => SCHED_IDLE as i32,
         SchedClass::Fifo => SCHED_FIFO as i32,
         SchedClass::RoundRobin => SCHED_RR as i32,
-        SchedClass::Deadline => SCHED_DEADLINE as i32,
     };
 
     if state.reset_on_fork {
@@ -151,33 +164,15 @@ fn linux_policy_from_state(state: SchedState) -> i32 {
 fn state_static_priority(state: SchedState) -> i32 {
     match state.class {
         SchedClass::Fifo | SchedClass::RoundRobin => state.rt_priority as i32,
-        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle | SchedClass::Deadline => 0,
+        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => 0,
     }
 }
 
 fn state_nice(state: SchedState) -> i32 {
     match state.class {
-        SchedClass::Fifo | SchedClass::RoundRobin | SchedClass::Deadline => 0,
+        SchedClass::Fifo | SchedClass::RoundRobin => 0,
         SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => state.nice as i32,
     }
-}
-
-fn clear_deadline_state(state: &mut SchedState) {
-    state.dl_runtime = 0;
-    state.dl_deadline = 0;
-    state.dl_period = 0;
-}
-
-fn validate_deadline_attr(attr: &SchedAttr) -> AxResult<()> {
-    if attr.sched_priority != 0
-        || attr.sched_runtime == 0
-        || attr.sched_deadline == 0
-        || attr.sched_runtime > attr.sched_deadline
-        || attr.sched_deadline > attr.sched_period
-    {
-        return Err(AxError::InvalidInput);
-    }
-    Ok(())
 }
 
 fn write_sched_attr_kernel_size(attr: *const SchedAttr) -> AxResult<()> {
@@ -254,7 +249,10 @@ fn apply_sched_state(task: &AxTaskRef, state: SchedState) -> AxResult<isize> {
 
 fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult<isize> {
     let reset_on_fork = policy & SCHED_RESET_ON_FORK as i32 != 0;
-    let class = sched_class_from_policy(policy & !(SCHED_RESET_ON_FORK as i32))?;
+    let class = sched_class_for_set(
+        (policy & !(SCHED_RESET_ON_FORK as i32)) as u32,
+        SchedSetAbi::Legacy,
+    )?;
     can_manage_sched_target(task)?;
     let mut state = sched_state(task);
     state.class = class;
@@ -265,17 +263,12 @@ fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult
             }
             state.rt_priority = validate_rt_priority(priority)?;
             state.nice = 0;
-            clear_deadline_state(&mut state);
         }
         SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
             state.rt_priority = validate_static_priority(priority)?;
             if matches!(class, SchedClass::Idle) {
                 state.nice = 19;
             }
-            clear_deadline_state(&mut state);
-        }
-        SchedClass::Deadline => {
-            return Err(AxError::InvalidInput);
         }
     }
     state.reset_on_fork = reset_on_fork;
@@ -295,10 +288,6 @@ fn update_sched_param(task: &AxTaskRef, priority: i32) -> AxResult<isize> {
         SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
             validate_static_priority(priority)?;
             state.rt_priority = 0;
-            clear_deadline_state(&mut state);
-        }
-        SchedClass::Deadline => {
-            validate_static_priority(priority)?;
         }
     }
     apply_sched_state(task, state)
@@ -594,7 +583,10 @@ pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResu
         return Err(AxError::InvalidInput);
     }
 
-    let class = sched_class_from_policy(attr.sched_policy as i32)?;
+    // Reject the known-but-unimplemented class before task lookup, permission
+    // checks, or scheduler-state publication. This keeps failure free of
+    // target-dependent side effects and prevents a fake Deadline snapshot.
+    let class = sched_class_for_set(attr.sched_policy, SchedSetAbi::Attr)?;
     let task = sched_target(pid)?;
     can_manage_sched_target(&task)?;
     let mut state = sched_state(&task);
@@ -609,7 +601,6 @@ pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResu
             }
             state.rt_priority = validate_rt_priority(attr.sched_priority as i32)?;
             state.nice = 0;
-            clear_deadline_state(&mut state);
         }
         SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
             if attr.sched_runtime != 0 || attr.sched_deadline != 0 || attr.sched_period != 0 {
@@ -617,18 +608,6 @@ pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResu
             }
             state.rt_priority = validate_static_priority(attr.sched_priority as i32)?;
             state.nice = validate_nice(attr.sched_nice)?;
-            clear_deadline_state(&mut state);
-        }
-        SchedClass::Deadline => {
-            if !has_sched_admin_capability() {
-                return Err(AxError::OperationNotPermitted);
-            }
-            validate_deadline_attr(&attr)?;
-            state.rt_priority = 0;
-            state.nice = 0;
-            state.dl_runtime = attr.sched_runtime;
-            state.dl_deadline = attr.sched_deadline;
-            state.dl_period = attr.sched_period;
         }
     }
     state.reset_on_fork = attr.sched_flags & SUPPORTED_SCHED_ATTR_FLAGS != 0;
@@ -658,9 +637,9 @@ pub fn sys_sched_getattr(pid: i32, attr: *mut SchedAttr, size: u32, flags: u32) 
         },
         sched_nice: state_nice(state),
         sched_priority: state_static_priority(state) as u32,
-        sched_runtime: state.dl_runtime,
-        sched_deadline: state.dl_deadline,
-        sched_period: state.dl_period,
+        sched_runtime: 0,
+        sched_deadline: 0,
+        sched_period: 0,
         sched_util_min: 0,
         sched_util_max: 0,
     };
@@ -787,4 +766,53 @@ pub fn sys_ioprio_get(_which: u32, _who: u32) -> AxResult<isize> {
 
 pub fn sys_ioprio_set(_which: u32, _who: u32, _ioprio: u32) -> AxResult<isize> {
     Err(LinuxError::ENOSYS.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadline_setattr_is_known_but_unsupported() {
+        assert!(matches!(
+            sched_class_for_set(SCHED_DEADLINE, SchedSetAbi::Attr),
+            Err(AxError::OperationNotSupported)
+        ));
+    }
+
+    #[test]
+    fn deadline_legacy_setter_remains_invalid() {
+        assert!(matches!(
+            sched_class_for_set(SCHED_DEADLINE, SchedSetAbi::Legacy),
+            Err(AxError::InvalidInput)
+        ));
+    }
+
+    #[test]
+    fn supported_setter_policies_still_map_to_real_classes() {
+        for (policy, class) in [
+            (SCHED_NORMAL, SchedClass::Normal),
+            (SCHED_BATCH, SchedClass::Batch),
+            (SCHED_IDLE, SchedClass::Idle),
+            (SCHED_FIFO, SchedClass::Fifo),
+            (SCHED_RR, SchedClass::RoundRobin),
+        ] {
+            assert_eq!(
+                sched_class_for_set(policy, SchedSetAbi::Attr).unwrap(),
+                class
+            );
+            assert_eq!(
+                sched_class_for_set(policy, SchedSetAbi::Legacy).unwrap(),
+                class
+            );
+        }
+    }
+
+    #[test]
+    fn deadline_priority_bounds_remain_queryable() {
+        assert_eq!(
+            linux_priority_bounds(SCHED_DEADLINE as i32).unwrap(),
+            (0, 0)
+        );
+    }
 }

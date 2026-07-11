@@ -3,7 +3,7 @@ use alloc::{borrow::ToOwned, format, string::String};
 use axerrno::{AxError, AxResult};
 use axtask::{AxTaskRef, SchedClass, TaskState, sched_state};
 use linux_raw_sys::general::{
-    RLIMIT_RSS, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_IDLE, SCHED_NORMAL, SCHED_RR,
+    RLIMIT_RSS, SCHED_BATCH, SCHED_FIFO, SCHED_IDLE, SCHED_NORMAL, SCHED_RR,
 };
 use memory_addr::PAGE_SIZE_4K;
 use starry_process::Process;
@@ -55,7 +55,6 @@ fn task_sched_stat(task: &AxTaskRef) -> (i32, i8, u8, u32) {
     let sched = sched_state(task);
     let priority = match sched.class {
         SchedClass::Fifo | SchedClass::RoundRobin => -(sched.rt_priority as i32) - 1,
-        SchedClass::Deadline => -1,
         SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => 20 + sched.nice as i32,
     };
     let policy = match sched.class {
@@ -64,7 +63,6 @@ fn task_sched_stat(task: &AxTaskRef) -> (i32, i8, u8, u32) {
         SchedClass::Idle => SCHED_IDLE,
         SchedClass::Fifo => SCHED_FIFO,
         SchedClass::RoundRobin => SCHED_RR,
-        SchedClass::Deadline => SCHED_DEADLINE,
     };
     (priority, sched.nice, sched.rt_priority, policy)
 }

@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use core::{
     ops::Deref,
-    sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering},
 };
 
 use intrusive_collections::{Bound, KeyAdapter, RBTree, RBTreeAtomicLink, intrusive_adapter};
@@ -22,7 +22,6 @@ pub enum CfsTaskClass {
     Idle       = 2,
     RoundRobin = 3,
     Fifo       = 4,
-    Deadline   = 5,
 }
 
 /// Runtime scheduling parameters for a CFS task.
@@ -32,9 +31,6 @@ pub struct CfsTaskParams {
     pub nice: i8,
     pub rt_priority: u8,
     pub reset_on_fork: bool,
-    pub dl_runtime: u64,
-    pub dl_deadline: u64,
-    pub dl_period: u64,
 }
 
 impl Default for CfsTaskParams {
@@ -44,9 +40,6 @@ impl Default for CfsTaskParams {
             nice: 0,
             rt_priority: 0,
             reset_on_fork: false,
-            dl_runtime: 0,
-            dl_deadline: 0,
-            dl_period: 0,
         }
     }
 }
@@ -60,22 +53,9 @@ impl CfsTaskParams {
             }
             CfsTaskClass::Normal | CfsTaskClass::Batch => {
                 self.rt_priority = 0;
-                self.dl_runtime = 0;
-                self.dl_deadline = 0;
-                self.dl_period = 0;
             }
             CfsTaskClass::RoundRobin | CfsTaskClass::Fifo => {
                 self.nice = 0;
-                self.dl_runtime = 0;
-                self.dl_deadline = 0;
-                self.dl_period = 0;
-            }
-            CfsTaskClass::Deadline => {
-                self.nice = 0;
-                self.rt_priority = 0;
-                if self.dl_period == 0 {
-                    self.dl_period = self.dl_deadline;
-                }
             }
         }
         self
@@ -101,9 +81,6 @@ pub struct CFSTask<T> {
     class: AtomicU8,
     rt_priority: AtomicU8,
     reset_on_fork: AtomicBool,
-    dl_runtime: AtomicU64,
-    dl_deadline: AtomicU64,
-    dl_period: AtomicU64,
     rr_time_slice: AtomicIsize,
     id: AtomicIsize,
 }
@@ -137,9 +114,6 @@ impl<T> CFSTask<T> {
             class: AtomicU8::new(CfsTaskClass::Normal as u8),
             rt_priority: AtomicU8::new(0),
             reset_on_fork: AtomicBool::new(false),
-            dl_runtime: AtomicU64::new(0),
-            dl_deadline: AtomicU64::new(0),
-            dl_period: AtomicU64::new(0),
             rr_time_slice: AtomicIsize::new(RR_TIMESLICE_TICKS as isize),
             id: AtomicIsize::new(0_isize),
         }
@@ -152,7 +126,7 @@ impl<T> CFSTask<T> {
             2 => CfsTaskClass::Idle,
             3 => CfsTaskClass::RoundRobin,
             4 => CfsTaskClass::Fifo,
-            _ => CfsTaskClass::Deadline,
+            _ => CfsTaskClass::Normal,
         }
     }
 
@@ -169,7 +143,7 @@ impl<T> CFSTask<T> {
         match self.class() {
             CfsTaskClass::Idle => NICE_RANGE_POS as isize,
             CfsTaskClass::Normal | CfsTaskClass::Batch => self.nice.load(Ordering::Acquire),
-            CfsTaskClass::RoundRobin | CfsTaskClass::Fifo | CfsTaskClass::Deadline => 0,
+            CfsTaskClass::RoundRobin | CfsTaskClass::Fifo => 0,
         }
     }
 
@@ -227,9 +201,6 @@ impl<T> CFSTask<T> {
         nice: isize,
         rt_priority: u8,
         reset_on_fork: bool,
-        dl_runtime: u64,
-        dl_deadline: u64,
-        dl_period: u64,
     ) {
         let current_vruntime = self.get_vruntime();
         self.rebase_vruntime(current_vruntime);
@@ -237,9 +208,6 @@ impl<T> CFSTask<T> {
         self.class.store(class as u8, Ordering::Release);
         self.rt_priority.store(rt_priority, Ordering::Release);
         self.reset_on_fork.store(reset_on_fork, Ordering::Release);
-        self.dl_runtime.store(dl_runtime, Ordering::Release);
-        self.dl_deadline.store(dl_deadline, Ordering::Release);
-        self.dl_period.store(dl_period, Ordering::Release);
         if matches!(class, CfsTaskClass::RoundRobin | CfsTaskClass::Fifo) {
             self.reset_rr_time_slice();
         } else {
@@ -288,9 +256,6 @@ impl<T> CFSTask<T> {
             nice: self.effective_nice() as i8,
             rt_priority: if self.is_rt() { self.rt_priority() } else { 0 },
             reset_on_fork: self.reset_on_fork.load(Ordering::Acquire),
-            dl_runtime: self.dl_runtime.load(Ordering::Acquire),
-            dl_deadline: self.dl_deadline.load(Ordering::Acquire),
-            dl_period: self.dl_period.load(Ordering::Acquire),
         }
     }
 
@@ -308,24 +273,12 @@ impl<T> CFSTask<T> {
                     return false;
                 }
             }
-            CfsTaskClass::Deadline => {
-                if params.dl_runtime == 0
-                    || params.dl_deadline == 0
-                    || params.dl_runtime > params.dl_deadline
-                    || (params.dl_period != 0 && params.dl_deadline > params.dl_period)
-                {
-                    return false;
-                }
-            }
         }
         self.set_sched_params(
             params.class,
             params.nice as isize,
             params.rt_priority,
             params.reset_on_fork,
-            params.dl_runtime,
-            params.dl_deadline,
-            params.dl_period,
         );
         true
     }
@@ -454,7 +407,7 @@ impl<T> CFScheduler<T> {
             CfsTaskClass::Normal => floor.saturating_add(FAIR_PREEMPT_GRANULARITY_TICKS),
             CfsTaskClass::Batch => floor.saturating_add(FAIR_PREEMPT_GRANULARITY_TICKS + 1),
             CfsTaskClass::Idle => floor.saturating_add(FAIR_PREEMPT_GRANULARITY_TICKS + 2),
-            CfsTaskClass::RoundRobin | CfsTaskClass::Fifo | CfsTaskClass::Deadline => floor,
+            CfsTaskClass::RoundRobin | CfsTaskClass::Fifo => floor,
         }
     }
 
@@ -572,10 +525,9 @@ impl<T> BaseScheduler for CFScheduler<T> {
                     self.insert_rt_task(prev, false);
                 }
             }
-            CfsTaskClass::Normal
-            | CfsTaskClass::Batch
-            | CfsTaskClass::Idle
-            | CfsTaskClass::Deadline => self.insert_fair_task(prev),
+            CfsTaskClass::Normal | CfsTaskClass::Batch | CfsTaskClass::Idle => {
+                self.insert_fair_task(prev)
+            }
         }
     }
 
@@ -638,10 +590,7 @@ impl<T> BaseScheduler for CFScheduler<T> {
                     }
                     false
                 }
-                CfsTaskClass::Normal
-                | CfsTaskClass::Batch
-                | CfsTaskClass::Idle
-                | CfsTaskClass::Deadline => false,
+                CfsTaskClass::Normal | CfsTaskClass::Batch | CfsTaskClass::Idle => false,
             };
         }
 
@@ -683,9 +632,6 @@ impl<T> BaseScheduler for CFScheduler<T> {
                 nice: prio as i8,
                 rt_priority: 0,
                 reset_on_fork: task.reset_on_fork.load(Ordering::Acquire),
-                dl_runtime: 0,
-                dl_deadline: 0,
-                dl_period: 0,
             },
         )
     }
