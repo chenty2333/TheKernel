@@ -1,13 +1,11 @@
-use core::ffi::c_ulong;
+use core::{ffi::c_ulong, mem};
 
 use bitflags::bitflags;
-use linux_raw_sys::{
-    general::{
-        __kernel_sighandler_t, __sigrestore_t, SA_NOCLDSTOP, SA_NOCLDWAIT, SA_NODEFER, SA_ONSTACK,
-        SA_RESETHAND, SA_RESTART, SA_SIGINFO, kernel_sigaction,
-    },
-    signal_macros::sig_ign,
+use linux_raw_sys::general::{
+    SA_NOCLDSTOP, SA_NOCLDWAIT, SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SA_RESTART, SA_SIGINFO,
+    kernel_sigaction,
 };
+use starry_vm::{VmMutPtr, VmPtr, VmResult};
 
 use crate::SignalSet;
 
@@ -57,15 +55,52 @@ bitflags! {
     }
 }
 
-// FIXME: replace with `kernel_sigaction` after finishing above "TODO"s for `SignalSet`
-#[derive(Debug, Clone, Copy)]
+/// The byte-level Linux `rt_sigaction` record copied across the user boundary.
+///
+/// Function addresses deliberately remain integers here. Bindgen represents
+/// them as `Option<extern "C" fn>`, for which arbitrary userspace bytes are not
+/// a valid Rust value. This all-integer mirror can be initialized from any bit
+/// pattern and is converted only after the complete record has been copied.
 #[repr(C)]
-#[allow(non_camel_case_types)]
-pub struct k_sigaction {
-    handler: __kernel_sighandler_t,
-    flags: c_ulong,
-    restorer: __sigrestore_t,
+#[derive(Debug, Clone, Copy)]
+pub struct RawSignalAction {
+    /// `SIG_DFL` (0), `SIG_IGN` (1), or a userspace handler address.
+    pub handler: usize,
+    /// Linux `SA_*` flags.
+    pub flags: c_ulong,
+    /// Userspace restorer address on architectures that expose `sa_restorer`.
+    #[cfg(sa_restorer)]
+    pub restorer: usize,
+    /// Signals blocked while the handler runs.
     pub mask: SignalSet,
+}
+
+const _: [(); mem::size_of::<kernel_sigaction>()] = [(); mem::size_of::<RawSignalAction>()];
+const _: [(); mem::align_of::<kernel_sigaction>()] = [(); mem::align_of::<RawSignalAction>()];
+const _: [(); mem::offset_of!(kernel_sigaction, sa_handler_kernel)] =
+    [(); mem::offset_of!(RawSignalAction, handler)];
+const _: [(); mem::offset_of!(kernel_sigaction, sa_flags)] =
+    [(); mem::offset_of!(RawSignalAction, flags)];
+#[cfg(sa_restorer)]
+const _: [(); mem::offset_of!(kernel_sigaction, sa_restorer)] =
+    [(); mem::offset_of!(RawSignalAction, restorer)];
+const _: [(); mem::offset_of!(kernel_sigaction, sa_mask)] =
+    [(); mem::offset_of!(RawSignalAction, mask)];
+
+impl RawSignalAction {
+    /// Copies a complete raw action from userspace.
+    pub fn read_from_user(ptr: *const Self) -> VmResult<Self> {
+        let value = ptr.vm_read_uninit()?;
+        // SAFETY: VmIo initialized every byte before returning `Ok` and this
+        // repr(C) record contains only integer scalars plus SignalSet, which is
+        // repr(transparent) over u64. Therefore every bit pattern is valid.
+        Ok(unsafe { value.assume_init() })
+    }
+
+    /// Copies this raw action to userspace.
+    pub fn write_to_user(self, ptr: *mut Self) -> VmResult {
+        ptr.vm_write(self)
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -75,8 +110,8 @@ pub enum SignalDisposition {
     Default,
     /// Ignore the signal.
     Ignore,
-    /// Custom signal handler.
-    Handler(unsafe extern "C" fn(i32)),
+    /// Address of a custom userspace signal handler.
+    Handler(usize),
 }
 
 /// Signal action. Corresponds to `struct sigaction` in libc.
@@ -85,59 +120,43 @@ pub struct SignalAction {
     pub flags: SignalActionFlags,
     pub mask: SignalSet,
     pub disposition: SignalDisposition,
-    pub restorer: __sigrestore_t,
+    /// Optional userspace restorer address. `Some(0)` is distinct from using
+    /// the kernel-provided default restorer.
+    pub restorer: Option<usize>,
 }
 
-impl From<SignalAction> for kernel_sigaction {
+impl From<SignalAction> for RawSignalAction {
     fn from(value: SignalAction) -> Self {
-        // FIXME: Zeroable
-        let mut result: kernel_sigaction = unsafe { core::mem::zeroed() };
-
-        result.sa_flags = value.flags.bits() as _;
-        result.sa_mask = value.mask.into();
-        match &value.disposition {
-            SignalDisposition::Default => {
-                result.sa_handler_kernel = None;
-            }
-            SignalDisposition::Ignore => {
-                result.sa_handler_kernel = sig_ign();
-            }
-            SignalDisposition::Handler(handler) => {
-                result.sa_handler_kernel = Some(*handler);
-            }
-        }
+        let handler = match value.disposition {
+            SignalDisposition::Default => 0,
+            SignalDisposition::Ignore => 1,
+            SignalDisposition::Handler(handler) => handler,
+        };
         #[cfg(sa_restorer)]
-        {
-            result.sa_restorer = value.restorer;
-        }
+        let restorer = value.restorer.unwrap_or(0);
 
-        result
+        Self {
+            handler,
+            flags: value.flags.bits(),
+            #[cfg(sa_restorer)]
+            restorer,
+            mask: value.mask,
+        }
     }
 }
 
-impl From<kernel_sigaction> for SignalAction {
-    fn from(value: kernel_sigaction) -> Self {
-        let flags = SignalActionFlags::from_bits_truncate(value.sa_flags);
-        let disposition = {
-            match value.sa_handler_kernel {
-                None => {
-                    // SIG_DFL
-                    SignalDisposition::Default
-                }
-                Some(h) if h as usize == 1 => {
-                    // SIG_IGN
-                    SignalDisposition::Ignore
-                }
-                Some(h) => {
-                    // Custom signal handler
-                    SignalDisposition::Handler(h)
-                }
-            }
+impl From<RawSignalAction> for SignalAction {
+    fn from(value: RawSignalAction) -> Self {
+        let flags = SignalActionFlags::from_bits_truncate(value.flags);
+        let disposition = match value.handler {
+            0 => SignalDisposition::Default,
+            1 => SignalDisposition::Ignore,
+            handler => SignalDisposition::Handler(handler),
         };
 
         #[cfg(sa_restorer)]
         let restorer = if flags.contains(SignalActionFlags::RESTORER) {
-            value.sa_restorer
+            Some(value.restorer)
         } else {
             None
         };
@@ -146,7 +165,7 @@ impl From<kernel_sigaction> for SignalAction {
 
         SignalAction {
             flags,
-            mask: value.sa_mask.into(),
+            mask: value.mask,
             disposition,
             restorer,
         }

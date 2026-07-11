@@ -226,15 +226,13 @@ impl ThreadSignalManager {
                     return Some(SignalOSAction::CoreDump);
                 }
 
-                uctx.set_ip(handler as usize);
+                uctx.set_ip(handler);
                 uctx.set_sp(aligned_sp);
                 uctx.set_arg0(signo as _);
                 uctx.set_arg1(aligned_sp + offset_of!(SignalFrame, siginfo));
                 uctx.set_arg2(aligned_sp + offset_of!(SignalFrame, ucontext));
 
-                let restorer = action
-                    .restorer
-                    .map_or(self.proc.default_restorer, |f| f as _);
+                let restorer = action.restorer.unwrap_or(self.proc.default_restorer);
                 #[cfg(target_arch = "x86_64")]
                 {
                     let new_sp = uctx.sp() - 8;

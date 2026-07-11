@@ -36,7 +36,7 @@ fn handle_signal() {
     let sig = SignalInfo::new_user(signo, 9, 9);
 
     unsafe extern "C" fn test_handler(_: i32) {}
-    proc.actions.lock()[signo].disposition = SignalDisposition::Handler(test_handler);
+    proc.actions.lock()[signo].disposition = SignalDisposition::Handler(test_handler as usize);
 
     let initial = UserContext::new(0, initial_sp().into(), 0);
 
@@ -110,7 +110,7 @@ fn check_signals_preserves_restartability_for_reset_hand() {
 
     let signo = Signo::SIGTERM;
     let action = &mut proc.actions.lock()[signo];
-    action.disposition = SignalDisposition::Handler(test_handler);
+    action.disposition = SignalDisposition::Handler(test_handler as usize);
     action
         .flags
         .insert(SignalActionFlags::RESTART | SignalActionFlags::RESETHAND);
@@ -136,7 +136,7 @@ fn restore() {
     let sig = SignalInfo::new_user(signo, 0, 1);
 
     unsafe extern "C" fn test_handler(_: i32) {}
-    proc.actions.lock()[signo].disposition = SignalDisposition::Handler(test_handler);
+    proc.actions.lock()[signo].disposition = SignalDisposition::Handler(test_handler as usize);
 
     let initial = UserContext::new(0x219, initial_sp().into(), 0);
 
@@ -164,7 +164,7 @@ fn restore_rejects_bad_context_without_partial_commit() {
     let sig = SignalInfo::new_user(signo, 0, 1);
 
     unsafe extern "C" fn test_handler(_: i32) {}
-    proc.actions.lock()[signo].disposition = SignalDisposition::Handler(test_handler);
+    proc.actions.lock()[signo].disposition = SignalDisposition::Handler(test_handler as usize);
 
     let initial = UserContext::new(0x4000, initial_sp().into(), 0);
     let mut current = initial;
@@ -198,7 +198,7 @@ fn restore_never_blocks_sigkill_or_sigstop() {
     let sig = SignalInfo::new_user(signo, 0, 1);
 
     unsafe extern "C" fn test_handler(_: i32) {}
-    proc.actions.lock()[signo].disposition = SignalDisposition::Handler(test_handler);
+    proc.actions.lock()[signo].disposition = SignalDisposition::Handler(test_handler as usize);
 
     let mut current = UserContext::new(0x4000, initial_sp().into(), 0);
     let action = proc.actions.lock()[signo].clone();
@@ -226,7 +226,7 @@ fn restore_sanitizes_x86_privileged_flags_and_rejects_bad_cs() {
     let sig = SignalInfo::new_user(signo, 0, 1);
 
     unsafe extern "C" fn test_handler(_: i32) {}
-    proc.actions.lock()[signo].disposition = SignalDisposition::Handler(test_handler);
+    proc.actions.lock()[signo].disposition = SignalDisposition::Handler(test_handler as usize);
 
     let mut current = UserContext::new(0x4000, initial_sp().into(), 0);
     let action = proc.actions.lock()[signo].clone();

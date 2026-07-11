@@ -1,5 +1,6 @@
-use linux_raw_sys::general::kernel_sigaction;
-use starry_signal::{SignalAction, SignalActionFlags, SignalDisposition, SignalSet, Signo};
+use starry_signal::{
+    RawSignalAction, SignalAction, SignalActionFlags, SignalDisposition, SignalSet, Signo,
+};
 
 #[test]
 fn flags_bits() {
@@ -30,7 +31,7 @@ fn convert() {
         ),
         (
             SignalActionFlags::SIGINFO | SignalActionFlags::NODEFER,
-            SignalDisposition::Handler(test_handler),
+            SignalDisposition::Handler(test_handler as usize),
         ),
     ];
 
@@ -46,8 +47,8 @@ fn convert() {
             disposition: disposition.clone(),
             restorer: None,
         };
-        let ks: kernel_sigaction = action.clone().into();
-        let action2 = SignalAction::from(ks);
+        let raw = RawSignalAction::from(action.clone());
+        let action2 = SignalAction::from(raw);
 
         assert_eq!(action.flags.bits(), action2.flags.bits());
         assert_eq!(
@@ -62,10 +63,8 @@ fn convert() {
             (SignalDisposition::Default, SignalDisposition::Default) => {}
             (SignalDisposition::Ignore, SignalDisposition::Ignore) => {}
             (SignalDisposition::Handler(h1), SignalDisposition::Handler(h2)) => {
-                let p1 = *h1 as usize;
-                let p2 = *h2 as usize;
-                assert_ne!(p1, 0);
-                assert_eq!(p1, p2);
+                assert_ne!(*h1, 0);
+                assert_eq!(h1, h2);
             }
             _ => panic!(
                 "Unexpected disposition combination: {:?} -> {:?}",
@@ -73,4 +72,36 @@ fn convert() {
             ),
         }
     }
+}
+
+#[test]
+fn raw_action_classifies_arbitrary_handler_bits_without_function_pointer_validity() {
+    let raw = RawSignalAction {
+        handler: usize::MAX,
+        flags: SignalActionFlags::SIGINFO.bits(),
+        #[cfg(sa_restorer)]
+        restorer: 0,
+        mask: SignalSet::default(),
+    };
+
+    let action = SignalAction::from(raw);
+    assert!(matches!(
+        action.disposition,
+        SignalDisposition::Handler(address) if address == usize::MAX
+    ));
+}
+
+#[cfg(sa_restorer)]
+#[test]
+fn explicit_null_restorer_is_not_replaced_by_the_default() {
+    let raw = RawSignalAction {
+        handler: 0x4000,
+        flags: SignalActionFlags::RESTORER.bits(),
+        restorer: 0,
+        mask: SignalSet::default(),
+    };
+
+    let action = SignalAction::from(raw);
+    assert_eq!(action.restorer, Some(0));
+    assert_eq!(RawSignalAction::from(action).restorer, 0);
 }

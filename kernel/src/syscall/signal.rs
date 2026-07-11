@@ -9,10 +9,10 @@ use axtask::{
 };
 use linux_raw_sys::general::{
     CAP_KILL, MINSIGSTKSZ, RLIMIT_SIGPENDING, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK,
-    SIG_UNBLOCK, SS_DISABLE, SS_ONSTACK, kernel_sigaction, siginfo, timespec,
+    SIG_UNBLOCK, SS_DISABLE, SS_ONSTACK, siginfo, timespec,
 };
 use starry_process::Pid;
-use starry_signal::{SignalInfo, SignalSet, SignalStack, Signo, api::SignalFrame};
+use starry_signal::{RawSignalAction, SignalInfo, SignalSet, SignalStack, Signo, api::SignalFrame};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
@@ -75,8 +75,8 @@ pub fn sys_rt_sigprocmask(
 
 pub fn sys_rt_sigaction(
     signo: u32,
-    act: *const kernel_sigaction,
-    oldact: *mut kernel_sigaction,
+    act: *const RawSignalAction,
+    oldact: *mut RawSignalAction,
     sigsetsize: usize,
 ) -> AxResult<isize> {
     check_sigset_size(sigsetsize)?;
@@ -89,10 +89,10 @@ pub fn sys_rt_sigaction(
     let curr = current();
     let mut actions = curr.as_thread().proc_data.signal.actions.lock();
     if let Some(oldact) = oldact.nullable() {
-        oldact.vm_write(actions[signo].clone().into())?;
+        RawSignalAction::from(actions[signo].clone()).write_to_user(oldact)?;
     }
     if let Some(act) = act.nullable() {
-        let act = unsafe { act.vm_read_uninit()?.assume_init() }.into();
+        let act = RawSignalAction::read_from_user(act)?.into();
         debug!("sys_rt_sigaction <= signo: {signo:?}, act: {act:?}");
         actions[signo] = act;
     }
