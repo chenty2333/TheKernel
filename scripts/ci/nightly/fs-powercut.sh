@@ -14,7 +14,7 @@ for tool in truncate mke2fs e2fsck; do
 done
 
 mkdir -p "$NIGHTLY_LOG_DIR"
-selected_arches=$(nightly_selected_arches)
+selected_arches=$(nightly_selected_arches) || exit $?
 while IFS= read -r arch; do
     disk="$NIGHTLY_LOG_DIR/$arch-powercut.img"
     mkfs_log="$NIGHTLY_LOG_DIR/$arch-mkfs.log"

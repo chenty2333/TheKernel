@@ -115,6 +115,24 @@ env \
     "$CI_DIR/nightly-gate.sh" --log-dir "$tmp/nightly-pass" >/dev/null
 grep -q $'^pressure\tpass\t' "$tmp/nightly-pass/nightly-status.tsv"
 
+printf 'support\n' >"$tmp/fake-support.img"
+set +e
+env \
+    THEKERNEL_NIGHTLY_ARCHES=invalid \
+    THEKERNEL_NIGHTLY_SUPPORT_IMAGE="$tmp/fake-support.img" \
+    "$CI_DIR/nightly/pressure.sh" >"$tmp/invalid-arch.log" 2>&1
+status=$?
+set -e
+[ "$status" -eq 1 ] || {
+    printf 'test-ci-scripts: invalid adapter architecture returned %s, expected 1\n' "$status" >&2
+    exit 1
+}
+grep -Fq 'THEKERNEL_NIGHTLY_ARCHES must be rv, la, or both' "$tmp/invalid-arch.log"
+if grep -Fq 'UNSUPPORTED' "$tmp/invalid-arch.log"; then
+    printf 'test-ci-scripts: invalid adapter architecture was misclassified as unsupported\n' >&2
+    exit 1
+fi
+
 # Verify the shared runner records and enforces a real wall-clock timeout.
 # shellcheck source=../../scripts/ci/lib.sh
 source "$CI_DIR/lib.sh"

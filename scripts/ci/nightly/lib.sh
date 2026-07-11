@@ -136,7 +136,7 @@ nightly_prepare_support_image() {
 
     local -a arches=()
     local arch arch_arg identity image stamp list current_identity selected_arches
-    selected_arches=$(nightly_selected_arches)
+    selected_arches=$(nightly_selected_arches) || return $?
     while IFS= read -r arch; do
         arches+=("$arch")
         nightly_find_cross_compiler "$arch" >/dev/null \
@@ -206,7 +206,11 @@ nightly_run_guest() {
     local image kernel
 
     nightly_require_arch_infrastructure "$arch"
-    kernel=$(nightly_ensure_shell_kernel "$arch")
+    if kernel=$(nightly_ensure_shell_kernel "$arch"); then
+        :
+    else
+        return $?
+    fi
     image=$(ci_find_official_image "$arch") \
         || nightly_unsupported "missing official $arch root image"
     mkdir -p "$run_dir"

@@ -19,7 +19,7 @@ cleanup_peer() {
 }
 trap cleanup_peer EXIT
 
-selected_arches=$(nightly_selected_arches)
+selected_arches=$(nightly_selected_arches) || exit $?
 while IFS= read -r arch; do
     commands="$NIGHTLY_LOG_DIR/$arch.commands"
     run_dir="$NIGHTLY_LOG_DIR/$arch"

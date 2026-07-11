@@ -11,7 +11,7 @@ ci_require_positive_int pressure_iterations "$PRESSURE_ITERATIONS"
 
 mkdir -p "$NIGHTLY_LOG_DIR"
 support_image=$(nightly_prepare_support_image)
-selected_arches=$(nightly_selected_arches)
+selected_arches=$(nightly_selected_arches) || exit $?
 
 while IFS= read -r arch; do
     commands="$NIGHTLY_LOG_DIR/$arch.commands"
