@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{collections::TryReserveError, vec::Vec};
 use core::time::Duration;
 
 use axhal::uspace::UserContext;
@@ -69,7 +69,21 @@ struct RestartState {
     decision: RestartDecision,
 }
 
-#[derive(Debug, Default)]
+/// Maximum number of interrupted syscalls retained across nested signal
+/// handlers.
+///
+/// Reaching this limit does not reject signal delivery. The interrupted
+/// syscall at the overflowing depth simply remains `EINTR`, which is always a
+/// valid Linux-visible outcome for a signal interruption. Reserving the whole
+/// bounded ledger when the thread is created keeps the later admission path
+/// allocation-free while it holds the restart spin lock.
+// Sixteen nested restartable handlers are already far beyond ordinary signal
+// use. This bounds the per-thread reservation to a few KiB; it does not cap
+// signal-handler nesting itself because deeper interrupted syscalls continue
+// with `EINTR`.
+const MAX_RESTART_DEPTH: usize = 16;
+
+#[derive(Debug)]
 pub(crate) struct RestartTracker {
     signal_handler_depth: usize,
     current_restart: Option<PendingRestart>,
@@ -169,6 +183,18 @@ impl RestartClass {
 }
 
 impl RestartTracker {
+    pub(crate) fn try_new() -> Result<Self, TryReserveError> {
+        let mut restart_states = Vec::new();
+        restart_states.try_reserve_exact(MAX_RESTART_DEPTH)?;
+        Ok(Self {
+            signal_handler_depth: 0,
+            current_restart: None,
+            armed_restart_block: None,
+            restart_states,
+            resume_restored_context: false,
+        })
+    }
+
     fn enter_syscall(
         &mut self,
         uctx: &UserContext,
@@ -219,15 +245,25 @@ impl RestartTracker {
         Some(block)
     }
 
-    fn request_syscall_restart(&mut self) {
+    /// Records a restart candidate without allocating.
+    ///
+    /// `false` means that no candidate was present or that the bounded ledger
+    /// was full. In either case the syscall's existing `EINTR` result remains
+    /// authoritative.
+    fn request_syscall_restart(&mut self) -> bool {
         let Some(restart) = self.current_restart else {
-            return;
+            return false;
         };
+        if self.restart_states.len() == MAX_RESTART_DEPTH {
+            return false;
+        }
+        debug_assert!(self.restart_states.capacity() >= MAX_RESTART_DEPTH);
         self.restart_states.push(RestartState {
             action: restart.action,
             class: restart.class,
             decision: RestartDecision::Pending,
         });
+        true
     }
 
     fn finish_signal_delivery(&mut self, os_action: SignalOSAction, restartable_handler: bool) {
@@ -316,8 +352,8 @@ impl Thread {
         self.restart.lock().signal_handler_depth()
     }
 
-    pub(crate) fn request_syscall_restart(&self) {
-        self.restart.lock().request_syscall_restart();
+    pub(crate) fn request_syscall_restart(&self) -> bool {
+        self.restart.lock().request_syscall_restart()
     }
 
     pub(crate) fn install_restart_block(&self, block: RestartBlock) {
@@ -402,7 +438,7 @@ mod tests {
 
     #[test]
     fn sigreturn_without_active_handler_does_not_panic_or_mutate_state() {
-        let mut tracker = RestartTracker::default();
+        let mut tracker = RestartTracker::try_new().unwrap();
         let mut context = make_uctx(0x11, 0x77, 0x1000);
 
         tracker.complete_sigreturn(&mut context);
@@ -416,7 +452,7 @@ mod tests {
 
     #[test]
     fn handler_syscall_preserves_outer_restart_state() {
-        let mut tracker = RestartTracker::default();
+        let mut tracker = RestartTracker::try_new().unwrap();
         let outer = make_uctx(0x11, 0x3d, 0x1000);
 
         tracker.enter_syscall(&outer, false, Some(RestartClass::Sys));
@@ -442,7 +478,7 @@ mod tests {
 
     #[test]
     fn non_restart_handler_leaves_eintr_result_in_place() {
-        let mut tracker = RestartTracker::default();
+        let mut tracker = RestartTracker::try_new().unwrap();
         let outer = make_uctx(0x11, 0x3d, 0x1000);
 
         tracker.enter_syscall(&outer, false, Some(RestartClass::Sys));
@@ -461,7 +497,7 @@ mod tests {
 
     #[test]
     fn non_handler_restart_restores_syscall_before_return_to_user() {
-        let mut tracker = RestartTracker::default();
+        let mut tracker = RestartTracker::try_new().unwrap();
         let outer = make_uctx(0x11, 0x3d, 0x1000);
 
         tracker.enter_syscall(&outer, false, Some(RestartClass::Sys));
@@ -480,7 +516,7 @@ mod tests {
 
     #[test]
     fn restart_block_sigreturn_restores_restart_syscall_and_arms_block() {
-        let mut tracker = RestartTracker::default();
+        let mut tracker = RestartTracker::try_new().unwrap();
         let outer = make_uctx(0x11, Sysno::futex as usize, 0x1000);
         let block = RestartBlock::FutexWait(FutexWaitRestart {
             uaddr: 0x1234,
@@ -506,7 +542,7 @@ mod tests {
 
     #[test]
     fn begin_restart_syscall_rearms_restart_block_after_another_interrupt() {
-        let mut tracker = RestartTracker::default();
+        let mut tracker = RestartTracker::try_new().unwrap();
         let block = RestartBlock::FutexWait(FutexWaitRestart {
             uaddr: 0x1234,
             expected: 7,
@@ -527,5 +563,35 @@ mod tests {
         assert_eq!(resumed.sysno(), Sysno::restart_syscall as usize);
         assert_eq!(resumed.ip(), 0x2000 - SYSCALL_INSN_LEN);
         assert_eq!(tracker.armed_restart_block, Some(block));
+    }
+
+    #[test]
+    fn nested_restart_ledger_is_bounded_and_overflow_stays_eintr() {
+        let mut tracker = RestartTracker::try_new().unwrap();
+        let reserved_capacity = tracker.restart_states.capacity();
+
+        for depth in 0..MAX_RESTART_DEPTH {
+            let interrupted = make_uctx(depth, Sysno::read as usize, 0x2000 + depth * 8);
+            tracker.enter_syscall(&interrupted, true, Some(RestartClass::Sys));
+            assert!(tracker.request_syscall_restart());
+            tracker.finish_signal_delivery(SignalOSAction::Handler, true);
+        }
+
+        assert_eq!(tracker.restart_states.len(), MAX_RESTART_DEPTH);
+        assert_eq!(tracker.restart_states.capacity(), reserved_capacity);
+
+        let overflow = make_uctx(0xfeed, Sysno::read as usize, 0x8000);
+        tracker.enter_syscall(&overflow, true, Some(RestartClass::Sys));
+        assert!(!tracker.request_syscall_restart());
+        tracker.finish_signal_delivery(SignalOSAction::Handler, true);
+
+        let mut returned = overflow;
+        returned.set_retval((-4isize) as usize);
+        tracker.complete_sigreturn(&mut returned);
+
+        assert_eq!(returned.ip(), overflow.ip());
+        assert_eq!(returned.retval(), (-4isize) as usize);
+        assert_eq!(tracker.restart_states.len(), MAX_RESTART_DEPTH);
+        assert_eq!(tracker.restart_states.capacity(), reserved_capacity);
     }
 }

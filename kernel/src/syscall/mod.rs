@@ -111,7 +111,9 @@ fn maybe_request_syscall_restart(thr: &Thread, result: &Result<isize, AxError>) 
     if !matches!(result, Err(AxError::Interrupted)) || !has_pending_syscall_signal(thr) {
         return;
     }
-    thr.request_syscall_restart();
+    // A full bounded restart ledger intentionally leaves this interruption as
+    // EINTR; signal delivery itself must still proceed.
+    let _ = thr.request_syscall_restart();
 }
 
 /// Fast path for trivial getter syscalls that only read from the current

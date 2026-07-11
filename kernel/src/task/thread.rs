@@ -108,6 +108,7 @@ impl Thread {
         let exit_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let deferred_work =
             Arc::try_new(DeferredWorkAccount::new()).map_err(|_| AxError::NoMemory)?;
+        let restart = RestartTracker::try_new().map_err(|_| AxError::NoMemory)?;
         let thread = Box::try_new(Thread {
             signal,
             proc_data,
@@ -121,7 +122,7 @@ impl Thread {
             oom_score_adj: AtomicI32::new(200),
             accessing_user_memory: AtomicBool::new(false),
             active_scope_read_held: AtomicBool::new(false),
-            restart: SpinNoIrq::new(RestartTracker::default()),
+            restart: SpinNoIrq::new(restart),
             exit_event,
             deferred_work,
         })
