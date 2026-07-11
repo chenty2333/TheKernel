@@ -41,6 +41,23 @@ for category in ltp pressure oom-failpoint fs-powercut nonloopback-network; do
     "$CI_DIR/nightly-gate.sh" --list | grep -q "^${category}"
 done
 
+# The host-test linker must add -no-pie only to executables. Shared objects
+# include proc macros and would fail to link if the C runtime expected main.
+cat >"$tmp/fake-cc" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"$FAKE_CC_LOG"
+EOF
+chmod +x "$tmp/fake-cc"
+FAKE_CC_LOG="$tmp/shared-link.args" THEKERNEL_HOST_CC="$tmp/fake-cc" \
+    "$CI_DIR/host-test-linker.sh" -shared input.o -o output.so
+if grep -qx -- -no-pie "$tmp/shared-link.args"; then
+    printf 'test-ci-scripts: shared link received -no-pie\n' >&2
+    exit 1
+fi
+FAKE_CC_LOG="$tmp/executable-link.args" THEKERNEL_HOST_CC="$tmp/fake-cc" \
+    "$CI_DIR/host-test-linker.sh" input.o -o output
+grep -qx -- -no-pie "$tmp/executable-link.args"
+
 env \
     THEKERNEL_NIGHTLY_LTP_ENABLED=0 \
     THEKERNEL_NIGHTLY_PRESSURE_ENABLED=0 \
