@@ -564,8 +564,17 @@ static int ext4_dir_dx_get_leaf(struct ext4_hash_info *hinfo,
 	/* Walk through the index tree */
 	while (true) {
 		uint16_t cnt = ext4_dir_dx_climit_get_count((void *)entries);
-		if ((cnt == 0) || (cnt > limit))
+		if ((cnt == 0) || (cnt > limit)) {
+			/* A child block is not published into dx_blocks until this
+			 * iteration passes validation. Release that private reference
+			 * here; the caller only owns the already-published path. */
+			if (tmp_dx_blk != dx_blocks) {
+				r = ext4_block_set(inode_ref->fs->bdev, tmp_blk);
+				if (r != EOK)
+					return r;
+			}
 			return EXT4_ERR_BAD_DX_DIR;
+		}
 
 		/* Do binary search in every node */
 		p = entries + 1;
@@ -615,7 +624,9 @@ static int ext4_dir_dx_get_leaf(struct ext4_hash_info *hinfo,
 		entry_space = entry_space / sizeof(struct ext4_dir_idx_entry);
 
 		if (limit != entry_space) {
-			ext4_block_set(inode_ref->fs->bdev, tmp_blk);
+			r = ext4_block_set(inode_ref->fs->bdev, tmp_blk);
+			if (r != EOK)
+				return r;
 			return EXT4_ERR_BAD_DX_DIR;
 		}
 
@@ -700,8 +711,10 @@ static int ext4_dir_dx_next_block(struct ext4_inode_ref *inode_ref,
 
 		/* Don't forget to put old block (prevent memory leak) */
 		r = ext4_block_set(inode_ref->fs->bdev, &p->b);
-		if (r != EOK)
+		if (r != EOK) {
+			ext4_block_set(inode_ref->fs->bdev, &b);
 			return r;
+		}
 
 		memcpy(&p->b, &b, sizeof(b));
 		p->entries = ((struct ext4_dir_idx_node *)b.data)->entries;
@@ -715,20 +728,27 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 			   struct ext4_inode_ref *inode_ref, size_t name_len,
 			   const char *name)
 {
+	int rc = EOK;
+	int cleanup_rc;
+	bool root_owned = false;
+	bool leaf_owned = false;
+	struct ext4_block root_block = { 0 };
+	struct ext4_block leaf_block = { 0 };
+	struct ext4_dir_idx_block dx_blocks[2] = { 0 };
+	struct ext4_dir_idx_block *dx_block = NULL;
+
 	/* Load direct block 0 (index root) */
 	ext4_fsblk_t root_block_addr;
-	int rc2;
-	int rc;
 	rc = ext4_fs_get_inode_dblk_idx(inode_ref,  0, &root_block_addr, false);
 	if (rc != EOK)
 		return rc;
 
 	struct ext4_fs *fs = inode_ref->fs;
 
-	struct ext4_block root_block;
 	rc = ext4_trans_block_get(fs->bdev, &root_block, root_block_addr);
 	if (rc != EOK)
 		return rc;
+	root_owned = true;
 
 	if (!ext4_dir_dx_csum_verify(inode_ref, (void *)root_block.data)) {
 		ext4_dbg(DEBUG_DIR_IDX,
@@ -743,30 +763,22 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 	struct ext4_hash_info hinfo;
 	rc = ext4_dir_hinfo_init(&hinfo, &root_block, &fs->sb, name_len, name);
 	if (rc != EOK) {
-		ext4_block_set(fs->bdev, &root_block);
-		return EXT4_ERR_BAD_DX_DIR;
+		rc = EXT4_ERR_BAD_DX_DIR;
+		goto cleanup;
 	}
-
-	/*
-	 * Hardcoded number 2 means maximum height of index tree,
-	 * specified in the Linux driver.
-	 */
-	struct ext4_dir_idx_block dx_blocks[2];
-	struct ext4_dir_idx_block *dx_block;
-	struct ext4_dir_idx_block *tmp;
 
 	rc = ext4_dir_dx_get_leaf(&hinfo, inode_ref, &root_block, &dx_block,
 				  dx_blocks);
+	if (dx_blocks[0].b.buf)
+		root_owned = false;
 	if (rc != EOK) {
-		ext4_block_set(fs->bdev, &root_block);
-		return EXT4_ERR_BAD_DX_DIR;
+		goto cleanup;
 	}
 
 	do {
 		/* Load leaf block */
 		uint32_t leaf_blk_idx;
 		ext4_fsblk_t leaf_block_addr;
-		struct ext4_block b;
 
 		leaf_blk_idx = ext4_dir_dx_entry_get_block(dx_block->position);
 		rc = ext4_fs_get_inode_dblk_idx(inode_ref, leaf_blk_idx,
@@ -774,11 +786,13 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 		if (rc != EOK)
 			goto cleanup;
 
-		rc = ext4_trans_block_get(fs->bdev, &b, leaf_block_addr);
+		rc = ext4_trans_block_get(fs->bdev, &leaf_block,
+					  leaf_block_addr);
 		if (rc != EOK)
 			goto cleanup;
+		leaf_owned = true;
 
-		if (!ext4_dir_csum_verify(inode_ref, (void *)b.data)) {
+		if (!ext4_dir_csum_verify(inode_ref, (void *)leaf_block.data)) {
 			ext4_dbg(DEBUG_DIR_IDX,
 				 DBG_WARN "HTree leaf block checksum failed."
 				 "Inode: %" PRIu32", "
@@ -789,19 +803,24 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 
 		/* Linear search inside block */
 		struct ext4_dir_en *de;
-		rc = ext4_dir_find_in_block(&b, &fs->sb, name_len, name, &de);
+		rc = ext4_dir_find_in_block(&leaf_block, &fs->sb, name_len,
+					    name, &de);
 
 		/* Found => return it */
 		if (rc == EOK) {
-			result->block = b;
+			result->block = leaf_block;
 			result->dentry = de;
+			leaf_owned = false;
 			goto cleanup;
 		}
 
 		/* Not found, leave untouched */
-		rc2 = ext4_block_set(fs->bdev, &b);
-		if (rc2 != EOK)
+		cleanup_rc = ext4_block_set(fs->bdev, &leaf_block);
+		leaf_owned = false;
+		if (cleanup_rc != EOK) {
+			rc = cleanup_rc;
 			goto cleanup;
+		}
 
 		if (rc != ENOENT)
 			goto cleanup;
@@ -809,7 +828,7 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 		/* check if the next block could be checked */
 		rc = ext4_dir_dx_next_block(inode_ref, hinfo.hash, dx_block,
 					    &dx_blocks[0]);
-		if (rc < 0)
+		if (rc != EOK && rc != ENOENT)
 			goto cleanup;
 	} while (rc == ENOENT);
 
@@ -817,14 +836,27 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 	rc = ENOENT;
 
 cleanup:
+	if (leaf_owned) {
+		cleanup_rc = ext4_block_set(fs->bdev, &leaf_block);
+		if (cleanup_rc != EOK &&
+		    (rc == EOK || rc == ENOENT || rc == EXT4_ERR_BAD_DX_DIR))
+			rc = cleanup_rc;
+	}
 	/* The whole path must be released (preventing memory leak) */
-	tmp = dx_blocks;
-
-	while (tmp <= dx_block) {
-		rc2 = ext4_block_set(fs->bdev, &tmp->b);
-		if (rc == EOK && rc2 != EOK)
-			rc = rc2;
-		++tmp;
+	for (size_t i = 2; i > 0; --i) {
+		struct ext4_block *block = &dx_blocks[i - 1].b;
+		if (!block->buf)
+			continue;
+		cleanup_rc = ext4_block_set(fs->bdev, block);
+		if (cleanup_rc != EOK &&
+		    (rc == EOK || rc == ENOENT || rc == EXT4_ERR_BAD_DX_DIR))
+			rc = cleanup_rc;
+	}
+	if (root_owned) {
+		cleanup_rc = ext4_block_set(fs->bdev, &root_block);
+		if (cleanup_rc != EOK &&
+		    (rc == EOK || rc == ENOENT || rc == EXT4_ERR_BAD_DX_DIR))
+			rc = cleanup_rc;
 	}
 
 	return rc;
@@ -860,7 +892,7 @@ static int ext4_dir_dx_entry_comparator(const void *arg1, const void *arg2)
  * @param iblock      Logical number of child block
  *
  */
-static void
+static int
 ext4_dir_dx_insert_entry(struct ext4_inode_ref *inode_ref __unused,
 			 struct ext4_dir_idx_block *index_block,
 			 uint32_t hash, uint32_t iblock)
@@ -880,7 +912,7 @@ ext4_dir_dx_insert_entry(struct ext4_inode_ref *inode_ref __unused,
 	ext4_dir_dx_entry_set_hash(new_index_entry, hash);
 	ext4_dir_dx_climit_set_count(climit, count + 1);
 	ext4_dir_set_dx_csum(inode_ref, (void *)index_block->b.data);
-	ext4_trans_set_block_dirty(index_block->b.buf);
+	return ext4_trans_set_block_dirty(index_block->b.buf);
 }
 
 /**@brief Split directory entries to two parts preventing node overflow.
@@ -894,11 +926,13 @@ static int ext4_dir_dx_split_data(struct ext4_inode_ref *inode_ref,
 				  struct ext4_hash_info *hinfo,
 				  struct ext4_block *old_data_block,
 				  struct ext4_dir_idx_block *index_block,
-				  struct ext4_block *new_data_block)
+				  struct ext4_block *new_data_block,
+				  bool *metadata_may_have_changed)
 {
 	int rc = EOK;
 	struct ext4_sblock *sb = &inode_ref->fs->sb;
 	uint32_t block_size = ext4_sb_get_block_size(&inode_ref->fs->sb);
+	memset(new_data_block, 0, sizeof(*new_data_block));
 
 	/* Allocate buffer for directory entries */
 	uint8_t *entry_buffer = ext4_malloc(block_size);
@@ -918,7 +952,6 @@ static int ext4_dir_dx_split_data(struct ext4_inode_ref *inode_ref,
 	}
 
 	uint32_t idx = 0;
-	uint32_t real_size = 0;
 
 	/* Initialize hinfo */
 	struct ext4_hash_info hinfo_tmp;
@@ -950,7 +983,6 @@ static int ext4_dir_dx_split_data(struct ext4_inode_ref *inode_ref,
 			sort[idx].hash = hinfo_tmp.hash;
 
 			entry_buffer_ptr += rec_len;
-			real_size += rec_len;
 			idx++;
 		}
 
@@ -964,7 +996,11 @@ static int ext4_dir_dx_split_data(struct ext4_inode_ref *inode_ref,
 	/* Allocate new block for store the second part of entries */
 	ext4_fsblk_t new_fblock;
 	uint32_t new_iblock;
-	rc = ext4_fs_append_inode_dblk(inode_ref, &new_fblock, &new_iblock);
+	bool append_changed = false;
+	rc = ext4_fs_append_inode_dblk_status(inode_ref, &new_fblock,
+						&new_iblock, &append_changed);
+	if (append_changed && metadata_may_have_changed)
+		*metadata_may_have_changed = true;
 	if (rc != EOK) {
 		ext4_free(sort);
 		ext4_free(entry_buffer);
@@ -980,6 +1016,7 @@ static int ext4_dir_dx_split_data(struct ext4_inode_ref *inode_ref,
 		ext4_free(entry_buffer);
 		return rc;
 	}
+	*new_data_block = new_data_block_tmp;
 
 	/*
 	 * Distribute entries to two blocks (by size)
@@ -1052,17 +1089,18 @@ static int ext4_dir_dx_split_data(struct ext4_inode_ref *inode_ref,
 	}
 	ext4_dir_set_csum(inode_ref, (void *)old_data_block->data);
 	ext4_dir_set_csum(inode_ref, (void *)new_data_block_tmp.data);
-	ext4_trans_set_block_dirty(old_data_block->buf);
-	ext4_trans_set_block_dirty(new_data_block_tmp.buf);
+	rc = ext4_trans_set_block_dirty(old_data_block->buf);
+	if (rc == EOK)
+		rc = ext4_trans_set_block_dirty(new_data_block_tmp.buf);
 
 	ext4_free(sort);
 	ext4_free(entry_buffer);
 
-	ext4_dir_dx_insert_entry(inode_ref, index_block, new_hash + continued,
-				new_iblock);
+	if (rc == EOK)
+		rc = ext4_dir_dx_insert_entry(inode_ref, index_block,
+					   new_hash + continued, new_iblock);
 
-	*new_data_block = new_data_block_tmp;
-	return EOK;
+	return rc;
 }
 
 /**@brief  Split index node and maybe some parent nodes in the tree hierarchy.
@@ -1075,7 +1113,8 @@ static int
 ext4_dir_dx_split_index(struct ext4_inode_ref *ino_ref,
 			struct ext4_dir_idx_block *dx_blks,
 			struct ext4_dir_idx_block *dxb,
-			struct ext4_dir_idx_block **new_dx_block)
+			struct ext4_dir_idx_block **new_dx_block,
+			bool *metadata_may_have_changed)
 {
 	struct ext4_sblock *sb = &ino_ref->fs->sb;
 	struct ext4_dir_idx_entry *e;
@@ -1115,7 +1154,11 @@ ext4_dir_dx_split_index(struct ext4_inode_ref *ino_ref,
 		/* Add new block to directory */
 		ext4_fsblk_t new_fblk;
 		uint32_t new_iblk;
-		r = ext4_fs_append_inode_dblk(ino_ref, &new_fblk, &new_iblk);
+		bool append_changed = false;
+		r = ext4_fs_append_inode_dblk_status(
+			ino_ref, &new_fblk, &new_iblk, &append_changed);
+		if (append_changed && metadata_may_have_changed)
+			*metadata_may_have_changed = true;
 		if (r != EOK)
 			return r;
 
@@ -1180,16 +1223,22 @@ ext4_dir_dx_split_index(struct ext4_inode_ref *ino_ref,
 			}
 
 			/* Finally insert new entry */
-			ext4_dir_dx_insert_entry(ino_ref, dx_blks, hash_right,
-						 new_iblk);
+			r = ext4_dir_dx_insert_entry(ino_ref, dx_blks,
+						    hash_right, new_iblk);
 			ext4_dir_set_dx_csum(ino_ref, (void*)dx_blks[0].b.data);
 			ext4_dir_set_dx_csum(ino_ref, (void*)dx_blks[1].b.data);
-			ext4_trans_set_block_dirty(dx_blks[0].b.buf);
-			ext4_trans_set_block_dirty(dx_blks[1].b.buf);
+			if (r == EOK)
+				r = ext4_trans_set_block_dirty(dx_blks[0].b.buf);
+			if (r == EOK)
+				r = ext4_trans_set_block_dirty(dx_blks[1].b.buf);
 
 			ext4_dir_set_dx_csum(ino_ref, (void *)b.data);
-			ext4_trans_set_block_dirty(b.buf);
-			return ext4_block_set(ino_ref->fs->bdev, &b);
+			if (r == EOK)
+				r = ext4_trans_set_block_dirty(b.buf);
+			int release_rc = ext4_block_set(ino_ref->fs->bdev, &b);
+			if (r != EOK)
+				return r;
+			return release_rc;
 		} else {
 			size_t sz;
 			/* Copy data from root to child block */
@@ -1208,8 +1257,9 @@ ext4_dir_dx_split_index(struct ext4_inode_ref *ino_ref,
 			ext4_dir_dx_climit_set_count(new_root_climit, 1);
 			ext4_dir_dx_entry_set_block(e, new_iblk);
 
-			struct ext4_dir_idx_root *r = (void *)dx_blks[0].b.data;
-			r->info.indirect_levels = 1;
+			struct ext4_dir_idx_root *root =
+				(void *)dx_blks[0].b.data;
+			root->info.indirect_levels = 1;
 
 			/* Add new entry to the path */
 			dxb = dx_blks + 1;
@@ -1220,19 +1270,36 @@ ext4_dir_dx_split_index(struct ext4_inode_ref *ino_ref,
 
 			ext4_dir_set_dx_csum(ino_ref, (void*)dx_blks[0].b.data);
 			ext4_dir_set_dx_csum(ino_ref, (void*)dx_blks[1].b.data);
-			ext4_trans_set_block_dirty(dx_blks[0].b.buf);
-			ext4_trans_set_block_dirty(dx_blks[1].b.buf);
+			r = ext4_trans_set_block_dirty(dx_blks[0].b.buf);
+			if (r == EOK)
+				r = ext4_trans_set_block_dirty(dx_blks[1].b.buf);
+			if (r != EOK)
+				return r;
 		}
 	}
 
 	return EOK;
 }
 
-int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
-			  struct ext4_inode_ref *child, const char *name, uint32_t name_len)
+int ext4_dir_dx_add_entry_status(struct ext4_inode_ref *parent,
+				 struct ext4_inode_ref *child,
+				 const char *name, uint32_t name_len,
+				 bool *metadata_may_have_changed)
 {
-	int rc2 = EOK;
+	int result = EOK;
 	int r;
+	bool root_owned = false;
+	bool target_owned = false;
+	bool new_owned = false;
+	struct ext4_block root_blk = { 0 };
+	struct ext4_block target_block = { 0 };
+	struct ext4_block new_block = { 0 };
+	struct ext4_dir_idx_block dx_blks[2] = { 0 };
+	struct ext4_dir_idx_block *dx_blk = NULL;
+
+	if (metadata_may_have_changed)
+		*metadata_may_have_changed = false;
+
 	/* Get direct block 0 (index root) */
 	ext4_fsblk_t rblock_addr;
 	r =  ext4_fs_get_inode_dblk_idx(parent, 0, &rblock_addr, false);
@@ -1240,11 +1307,11 @@ int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
 		return r;
 
 	struct ext4_fs *fs = parent->fs;
-	struct ext4_block root_blk;
 
 	r = ext4_trans_block_get(fs->bdev, &root_blk, rblock_addr);
 	if (r != EOK)
 		return r;
+	root_owned = true;
 
 	if (!ext4_dir_dx_csum_verify(parent, (void*)root_blk.data)) {
 		ext4_dbg(DEBUG_DIR_IDX,
@@ -1259,22 +1326,17 @@ int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
 	struct ext4_hash_info hinfo;
 	r = ext4_dir_hinfo_init(&hinfo, &root_blk, &fs->sb, name_len, name);
 	if (r != EOK) {
-		ext4_block_set(fs->bdev, &root_blk);
-		return EXT4_ERR_BAD_DX_DIR;
+		result = EXT4_ERR_BAD_DX_DIR;
+		goto cleanup;
 	}
 
-	/*
-	 * Hardcoded number 2 means maximum height of index
-	 * tree defined in Linux.
-	 */
-	struct ext4_dir_idx_block dx_blks[2];
-	struct ext4_dir_idx_block *dx_blk;
-	struct ext4_dir_idx_block *dx_it;
-
 	r = ext4_dir_dx_get_leaf(&hinfo, parent, &root_blk, &dx_blk, dx_blks);
+	/* Once get_leaf published slot zero, that slot owns the root reference. */
+	if (dx_blks[0].b.buf)
+		root_owned = false;
 	if (r != EOK) {
-		r = EXT4_ERR_BAD_DX_DIR;
-		goto release_index;
+		result = r;
+		goto cleanup;
 	}
 
 	/* Try to insert to existing data block */
@@ -1282,21 +1344,31 @@ int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
 	ext4_fsblk_t leaf_block_addr;
 	r = ext4_fs_get_inode_dblk_idx(parent, leaf_block_idx,
 						&leaf_block_addr, false);
-	if (r != EOK)
-		goto release_index;
+	if (r != EOK) {
+		result = r;
+		goto cleanup;
+	}
 
 	/*
 	 * Check if there is needed to split index node
 	 * (and recursively also parent nodes)
 	 */
-	r = ext4_dir_dx_split_index(parent, dx_blks, dx_blk, &dx_blk);
-	if (r != EOK)
-		goto release_target_index;
+	bool split_changed = false;
+	r = ext4_dir_dx_split_index(parent, dx_blks, dx_blk, &dx_blk,
+					 &split_changed);
+	if (split_changed && metadata_may_have_changed)
+		*metadata_may_have_changed = true;
+	if (r != EOK) {
+		result = r;
+		goto cleanup;
+	}
 
-	struct ext4_block target_block;
 	r = ext4_trans_block_get(fs->bdev, &target_block, leaf_block_addr);
-	if (r != EOK)
-		goto release_index;
+	if (r != EOK) {
+		result = r;
+		goto cleanup;
+	}
+	target_owned = true;
 
 	if (!ext4_dir_csum_verify(parent,(void *)target_block.data)) {
 		ext4_dbg(DEBUG_DIR_IDX,
@@ -1310,16 +1382,24 @@ int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
 	/* Check if insert operation passed */
 	r = ext4_dir_try_insert_entry(&fs->sb, parent, &target_block, child,
 					name, name_len);
-	if (r == EOK)
-		goto release_target_index;
+	if (r != ENOSPC) {
+		if (metadata_may_have_changed)
+			*metadata_may_have_changed = true;
+		result = r;
+		goto cleanup;
+	}
 
 	/* Split entries to two blocks (includes sorting by hash value) */
-	struct ext4_block new_block;
+	split_changed = false;
 	r = ext4_dir_dx_split_data(parent, &hinfo, &target_block, dx_blk,
-				    &new_block);
+				    &new_block, &split_changed);
+	if (new_block.buf)
+		new_owned = true;
+	if (split_changed && metadata_may_have_changed)
+		*metadata_may_have_changed = true;
 	if (r != EOK) {
-		rc2 = r;
-		goto release_target_index;
+		result = r;
+		goto cleanup;
 	}
 
 	/* Where to save new entry */
@@ -1330,36 +1410,45 @@ int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
 	else
 		r = ext4_dir_try_insert_entry(&fs->sb, parent, &target_block,
 						child, name, name_len);
+	if (r != ENOSPC && metadata_may_have_changed)
+		*metadata_may_have_changed = true;
+	result = r;
 
-	/* Cleanup */
-	r = ext4_block_set(fs->bdev, &new_block);
-	if (r != EOK)
-		return r;
-
-/* Cleanup operations */
-
-release_target_index:
-	rc2 = r;
-
-	r = ext4_block_set(fs->bdev, &target_block);
-	if (r != EOK)
-		return r;
-
-release_index:
-	if (r != EOK)
-		rc2 = r;
-
-	dx_it = dx_blks;
-
-	while (dx_it <= dx_blk) {
-		r = ext4_block_set(fs->bdev, &dx_it->b);
-		if (r != EOK)
-			return r;
-
-		dx_it++;
+	/* Preserve the insertion result while releasing every initialized block. */
+cleanup:
+	if (new_owned) {
+		r = ext4_block_set(fs->bdev, &new_block);
+		if (r != EOK && (result == EOK || result == EXT4_ERR_BAD_DX_DIR))
+			result = r;
+	}
+	if (target_owned) {
+		r = ext4_block_set(fs->bdev, &target_block);
+		if (r != EOK && (result == EOK || result == EXT4_ERR_BAD_DX_DIR))
+			result = r;
+	}
+	for (size_t i = 2; i > 0; --i) {
+		struct ext4_block *block = &dx_blks[i - 1].b;
+		if (!block->buf)
+			continue;
+		r = ext4_block_set(fs->bdev, block);
+		if (r != EOK && (result == EOK || result == EXT4_ERR_BAD_DX_DIR))
+			result = r;
+	}
+	if (root_owned) {
+		r = ext4_block_set(fs->bdev, &root_blk);
+		if (r != EOK && (result == EOK || result == EXT4_ERR_BAD_DX_DIR))
+			result = r;
 	}
 
-	return rc2;
+	return result;
+}
+
+int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
+			  struct ext4_inode_ref *child,
+			  const char *name, uint32_t name_len)
+{
+	return ext4_dir_dx_add_entry_status(parent, child, name, name_len,
+					       NULL);
 }
 
 int ext4_dir_dx_reset_parent_inode(struct ext4_inode_ref *dir,

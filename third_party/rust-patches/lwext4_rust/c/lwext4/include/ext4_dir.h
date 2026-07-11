@@ -228,6 +228,19 @@ void ext4_dir_write_entry(struct ext4_sblock *sb, struct ext4_dir_en *en,
 int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 		       uint32_t name_len, struct ext4_inode_ref *child);
 
+/** Add an entry and report whether directory or allocation metadata may have
+ * changed before an error was returned. */
+int ext4_dir_add_entry_status(struct ext4_inode_ref *parent, const char *name,
+			      uint32_t name_len,
+			      struct ext4_inode_ref *child,
+			      bool *metadata_may_have_changed);
+
+/** Indexed-directory implementation used by ext4_dir_add_entry_status(). */
+int ext4_dir_dx_add_entry_status(struct ext4_inode_ref *parent,
+				 struct ext4_inode_ref *child,
+				 const char *name, uint32_t name_len,
+				 bool *metadata_may_have_changed);
+
 /**@brief Find directory entry with passed name.
  * @param result Result structure to be returned if entry found
  * @param parent Directory i-node
@@ -239,6 +252,13 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 			struct ext4_inode_ref *parent, const char *name,
 			uint32_t name_len);
 
+/** Find an entry and report metadata changes made by BAD_DX fallback even if
+ * the subsequent linear lookup fails. */
+int ext4_dir_find_entry_status(struct ext4_dir_search_result *result,
+			       struct ext4_inode_ref *parent,
+			       const char *name, uint32_t name_len,
+			       bool *metadata_may_have_changed);
+
 /**@brief Remove directory entry.
  * @param parent Directory i-node
  * @param name   Name of the entry to be removed
@@ -247,6 +267,12 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
  */
 int ext4_dir_remove_entry(struct ext4_inode_ref *parent, const char *name,
 			  uint32_t name_len);
+
+/** Remove an entry and report whether directory metadata may have changed
+ * before an error was returned. */
+int ext4_dir_remove_entry_status(struct ext4_inode_ref *parent,
+				 const char *name, uint32_t name_len,
+				 bool *metadata_may_have_changed);
 
 /**@brief Try to insert entry to concrete data block.
  * @param sb           Superblock

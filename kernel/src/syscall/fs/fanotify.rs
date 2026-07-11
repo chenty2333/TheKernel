@@ -15,7 +15,7 @@ pub fn sys_fanotify_init(flags: u32, event_f_flags: u32) -> AxResult<isize> {
     validate_init_flags(flags, event_f_flags)?;
 
     add_file_like(
-        FanotifyFile::new(flags, event_f_flags),
+        FanotifyFile::new(flags, event_f_flags)?,
         flags & FAN_CLOEXEC != 0,
     )
     .map(|fd| fd as isize)

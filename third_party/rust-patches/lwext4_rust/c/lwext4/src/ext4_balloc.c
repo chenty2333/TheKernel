@@ -349,9 +349,10 @@ int ext4_balloc_free_blocks(struct ext4_inode_ref *inode_ref,
 	return rc;
 }
 
-int ext4_balloc_alloc_block(struct ext4_inode_ref *inode_ref,
-			    ext4_fsblk_t goal,
-			    ext4_fsblk_t *fblock)
+int ext4_balloc_alloc_block_status(struct ext4_inode_ref *inode_ref,
+				   ext4_fsblk_t goal,
+				   ext4_fsblk_t *fblock,
+				   bool *metadata_may_have_changed)
 {
 	ext4_fsblk_t alloc = 0;
 	ext4_fsblk_t bmp_blk_adr;
@@ -359,6 +360,9 @@ int ext4_balloc_alloc_block(struct ext4_inode_ref *inode_ref,
 	uint64_t free_blocks;
 	int r;
 	struct ext4_sblock *sb = &inode_ref->fs->sb;
+	*fblock = 0;
+	if (metadata_may_have_changed)
+		*metadata_may_have_changed = false;
 
 	/* Load block group number for goal and relative index */
 	uint32_t bg_id = ext4_balloc_get_bgid_of_block(sb, goal);
@@ -408,10 +412,17 @@ int ext4_balloc_alloc_block(struct ext4_inode_ref *inode_ref,
 
 	/* Check if goal is free */
 	if (ext4_bmap_is_bit_clr(b.data, idx_in_bg)) {
+		if (metadata_may_have_changed)
+			*metadata_may_have_changed = true;
 		ext4_bmap_bit_set(b.data, idx_in_bg);
 		ext4_balloc_set_bitmap_csum(sb, bg_ref.block_group,
 					    b.data);
-		ext4_trans_set_block_dirty(b.buf);
+		r = ext4_trans_set_block_dirty(b.buf);
+		if (r != EOK) {
+			ext4_block_set(inode_ref->fs->bdev, &b);
+			ext4_fs_put_block_group_ref(&bg_ref);
+			return r;
+		}
 		r = ext4_block_set(inode_ref->fs->bdev, &b);
 		if (r != EOK) {
 			ext4_fs_put_block_group_ref(&bg_ref);
@@ -432,10 +443,17 @@ int ext4_balloc_alloc_block(struct ext4_inode_ref *inode_ref,
 	uint32_t tmp_idx;
 	for (tmp_idx = idx_in_bg + 1; tmp_idx < end_idx; ++tmp_idx) {
 		if (ext4_bmap_is_bit_clr(b.data, tmp_idx)) {
+			if (metadata_may_have_changed)
+				*metadata_may_have_changed = true;
 			ext4_bmap_bit_set(b.data, tmp_idx);
 
 			ext4_balloc_set_bitmap_csum(sb, bg, b.data);
-			ext4_trans_set_block_dirty(b.buf);
+			r = ext4_trans_set_block_dirty(b.buf);
+			if (r != EOK) {
+				ext4_block_set(inode_ref->fs->bdev, &b);
+				ext4_fs_put_block_group_ref(&bg_ref);
+				return r;
+			}
 			r = ext4_block_set(inode_ref->fs->bdev, &b);
 			if (r != EOK) {
 				ext4_fs_put_block_group_ref(&bg_ref);
@@ -450,9 +468,16 @@ int ext4_balloc_alloc_block(struct ext4_inode_ref *inode_ref,
 	/* Find free bit in bitmap */
 	r = ext4_bmap_bit_find_clr(b.data, idx_in_bg, blk_in_bg, &rel_blk_idx);
 	if (r == EOK) {
+		if (metadata_may_have_changed)
+			*metadata_may_have_changed = true;
 		ext4_bmap_bit_set(b.data, rel_blk_idx);
 		ext4_balloc_set_bitmap_csum(sb, bg_ref.block_group, b.data);
-		ext4_trans_set_block_dirty(b.buf);
+		r = ext4_trans_set_block_dirty(b.buf);
+		if (r != EOK) {
+			ext4_block_set(inode_ref->fs->bdev, &b);
+			ext4_fs_put_block_group_ref(&bg_ref);
+			return r;
+		}
 		r = ext4_block_set(inode_ref->fs->bdev, &b);
 		if (r != EOK) {
 			ext4_fs_put_block_group_ref(&bg_ref);
@@ -461,6 +486,11 @@ int ext4_balloc_alloc_block(struct ext4_inode_ref *inode_ref,
 
 		alloc = ext4_fs_bg_idx_to_addr(sb, rel_blk_idx, bg_id);
 		goto success;
+	}
+	if (r != ENOSPC) {
+		ext4_block_set(inode_ref->fs->bdev, &b);
+		ext4_fs_put_block_group_ref(&bg_ref);
+		return r;
 	}
 
 	/* No free block found yet */
@@ -520,9 +550,16 @@ goal_failed:
 		r = ext4_bmap_bit_find_clr(b.data, idx_in_bg, blk_in_bg,
 				&rel_blk_idx);
 		if (r == EOK) {
+			if (metadata_may_have_changed)
+				*metadata_may_have_changed = true;
 			ext4_bmap_bit_set(b.data, rel_blk_idx);
 			ext4_balloc_set_bitmap_csum(sb, bg, b.data);
-			ext4_trans_set_block_dirty(b.buf);
+			r = ext4_trans_set_block_dirty(b.buf);
+			if (r != EOK) {
+				ext4_block_set(inode_ref->fs->bdev, &b);
+				ext4_fs_put_block_group_ref(&bg_ref);
+				return r;
+			}
 			r = ext4_block_set(inode_ref->fs->bdev, &b);
 			if (r != EOK) {
 				ext4_fs_put_block_group_ref(&bg_ref);
@@ -531,6 +568,11 @@ goal_failed:
 
 			alloc = ext4_fs_bg_idx_to_addr(sb, rel_blk_idx, bgid);
 			goto success;
+		}
+		if (r != ENOSPC) {
+			ext4_block_set(inode_ref->fs->bdev, &b);
+			ext4_fs_put_block_group_ref(&bg_ref);
+			return r;
 		}
 
 		r = ext4_block_set(inode_ref->fs->bdev, &b);
@@ -580,6 +622,13 @@ success:
 
 	*fblock = alloc;
 	return r;
+}
+
+int ext4_balloc_alloc_block(struct ext4_inode_ref *inode_ref,
+			    ext4_fsblk_t goal,
+			    ext4_fsblk_t *fblock)
+{
+	return ext4_balloc_alloc_block_status(inode_ref, goal, fblock, NULL);
 }
 
 int ext4_balloc_try_alloc_block(struct ext4_inode_ref *inode_ref,

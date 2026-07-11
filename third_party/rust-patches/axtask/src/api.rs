@@ -5,12 +5,14 @@ use alloc::{
     sync::{Arc, Weak},
 };
 
+use axerrno::{AxError, AxResult};
 #[cfg(feature = "sched-cfs")]
 pub use axsched::{
     CfsTaskClass as SchedClass, CfsTaskParams as SchedState, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX,
     RT_PRIORITY_MIN,
 };
 use kernel_guard::NoPreemptIrqSave;
+use spin::Once;
 
 pub(crate) use crate::run_queue::{current_run_queue, select_run_queue};
 #[doc(cfg(all(feature = "multitask", feature = "task-ext")))]
@@ -30,6 +32,16 @@ pub type AxTaskRef = Arc<AxTask>;
 
 /// The weak reference type of a task.
 pub type WeakAxTaskRef = Weak<AxTask>;
+
+static DEFERRED_WORK_DISPATCHER: Once<fn()> = Once::new();
+
+struct DeferredWorkGuard<'a>(&'a TaskInner);
+
+impl Drop for DeferredWorkGuard<'_> {
+    fn drop(&mut self) {
+        self.0.leave_deferred_work();
+    }
+}
 
 /// The wrapper type for [`cpumask::CpuMask`] with SMP configuration.
 pub type AxCpuMask = cpumask::CpuMask<{ axconfig::plat::MAX_CPU_NUM }>;
@@ -99,6 +111,53 @@ pub fn can_block_current() -> bool {
     }
 }
 
+/// Installs the single task-context deferred-work dispatcher.
+///
+/// The hook is generic scheduler integration; subsystem policy stays in the
+/// registering kernel. It may run concurrently on different tasks or CPUs,
+/// but recursion on the same task is suppressed. The dispatcher must not panic
+/// and should bound each invocation so normal scheduling can continue.
+///
+/// Returns `false` if a different dispatcher was already installed.
+#[must_use]
+pub fn set_deferred_work_dispatcher(dispatcher: fn()) -> bool {
+    let installed = *DEFERRED_WORK_DISPATCHER.call_once(|| dispatcher);
+    core::ptr::fn_addr_eq(installed, dispatcher)
+}
+
+/// Runs deferred work outside IRQ, runqueue, and preemption-disabled critical
+/// sections.
+///
+/// Calls from unsafe contexts are ignored. The subsystem's pending source of
+/// truth must remain set so a later safe point can retry. This function does
+/// not allocate before entering the registered kernel dispatcher.
+///
+/// This only guarantees scheduler-context safety; it cannot prove that an
+/// arbitrary caller holds no subsystem lock. Dispatchers must document their
+/// own lock ordering and avoid locks that their chosen safe points can retain.
+pub fn run_deferred_work() {
+    let Some(dispatcher) = DEFERRED_WORK_DISPATCHER.get() else {
+        return;
+    };
+    let Some(curr) = current_may_uninit() else {
+        return;
+    };
+    #[cfg(feature = "preempt")]
+    if !curr.can_preempt(0) {
+        return;
+    }
+    #[cfg(all(feature = "irq", target_os = "none"))]
+    if !axhal::asm::irqs_enabled() {
+        return;
+    }
+    if !curr.try_enter_deferred_work() {
+        return;
+    }
+
+    let _guard = DeferredWorkGuard(&curr);
+    dispatcher();
+}
+
 /// Initializes the task scheduler (for the primary CPU).
 pub fn init_scheduler() {
     info!("Initialize scheduling...");
@@ -153,6 +212,15 @@ pub fn on_timer_tick() {
 
 /// Runs a pending preemption request at a voluntary kernel boundary.
 pub fn resched_if_needed() {
+    #[cfg(feature = "smp")]
+    retire_allowed_migration_current();
+    run_deferred_work();
+    #[cfg(feature = "preempt")]
+    TaskInner::current_check_preempt_pending();
+    run_deferred_work();
+    // The dispatcher may wake a worker and set need_resched. Never return to
+    // userspace or an idle-WFI caller with a wake-capable action after the last
+    // preemption check.
     #[cfg(feature = "preempt")]
     TaskInner::current_check_preempt_pending();
 }
@@ -174,6 +242,29 @@ pub fn spawn_task(task: TaskInner) -> AxTaskRef {
     let task_ref = task.into_arc();
     select_run_queue::<NoPreemptIrqSave>(&task_ref).add_task(task_ref.clone());
     task_ref
+}
+
+/// Fallibly constructs and publishes a kernel task.
+///
+/// Every scheduler implementation stores ready tasks intrusively, so the only
+/// failing steps (entry box, kernel stack, and scheduler wrapper) complete
+/// before the task becomes runnable.
+pub fn try_spawn_raw<F>(f: F, name: String, stack_size: usize) -> AxResult<AxTaskRef>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let task = TaskInner::try_new(f, name, stack_size).map_err(|_| AxError::NoMemory)?;
+    let task_ref = task.try_into_arc().map_err(|_| AxError::NoMemory)?;
+    select_run_queue::<NoPreemptIrqSave>(&task_ref).add_task(task_ref.clone());
+    Ok(task_ref)
+}
+
+/// Fallibly spawns a task with the default kernel-stack size.
+pub fn try_spawn_with_name<F>(f: F, name: String) -> AxResult<AxTaskRef>
+where
+    F: FnOnce() + Send + 'static,
+{
+    try_spawn_raw(f, name, axconfig::TASK_STACK_SIZE)
 }
 
 /// Adds the given task to the run queue with the specified scheduling state.
@@ -204,6 +295,31 @@ pub fn spawn_task_with_sched_from(
     task_ref.inherit_fair_vruntime_from(parent);
     select_run_queue::<NoPreemptIrqSave>(&task_ref).add_task(task_ref.clone());
     task_ref
+}
+
+/// Fallibly constructs and configures a task without publishing it to a run
+/// queue. This is the allocation/admission half of task creation.
+#[cfg(feature = "sched-cfs")]
+pub fn prepare_task_with_sched_from(
+    task: TaskInner,
+    sched_state: SchedState,
+    parent: &AxTaskRef,
+) -> AxResult<AxTaskRef> {
+    let task_ref = task.try_into_arc().map_err(|_| AxError::NoMemory)?;
+    if !task_ref.configure(sched_state) {
+        return Err(AxError::InvalidInput);
+    }
+    task_ref.inherit_fair_vruntime_from(parent);
+    Ok(task_ref)
+}
+
+/// Publishes a fully prepared task to its selected run queue.
+///
+/// CFS uses an intrusive ready tree, so this final lifecycle commit does not
+/// allocate and cannot report a partial-publication failure.
+#[cfg(feature = "sched-cfs")]
+pub fn publish_prepared_task(task: AxTaskRef) {
+    select_run_queue::<NoPreemptIrqSave>(&task).add_task(task);
 }
 
 /// Spawns a new task with the given parameters.
@@ -295,7 +411,11 @@ pub fn reclaim_exited_tasks() -> bool {
     if crate::run_queue::has_exited_tasks() {
         crate::run_queue::reclaim_exited_tasks_current_cpu_bounded(DEFAULT_RECLAIM_BATCH);
     }
-    crate::run_queue::has_exited_tasks()
+    let remains = crate::run_queue::has_exited_tasks();
+    // Reclaim may have run arbitrary TaskInner/TaskExt destructors. Dispatch
+    // only after the per-CPU exited queue operations have returned.
+    run_deferred_work();
+    remains
 }
 
 pub(crate) fn drive_reclaim_until_clear(
@@ -318,38 +438,95 @@ pub fn reclaim_exited_tasks_until_clear(max_yields: usize) {
     drive_reclaim_until_clear(max_yields, reclaim_exited_tasks, yield_now);
 }
 
+#[cfg(any(feature = "smp", test))]
+pub(crate) fn admit_affinity_then_publish<T, E, R>(
+    needed: bool,
+    prepare: impl FnOnce() -> Result<T, E>,
+    publish: impl FnOnce(Option<T>) -> R,
+) -> Result<R, E> {
+    let prepared = if needed { Some(prepare()?) } else { None };
+    Ok(publish(prepared))
+}
+
+#[cfg(feature = "smp")]
+fn try_prepare_migration_task(migrated: &AxTaskRef) -> AxResult<AxTaskRef> {
+    const MIGRATION_TASK_STACK_SIZE: usize = 4096;
+    const MIGRATION_TASK_NAME: &str = "migration-task";
+
+    let mut name = String::new();
+    name.try_reserve_exact(MIGRATION_TASK_NAME.len())
+        .map_err(|_| AxError::NoMemory)?;
+    name.push_str(MIGRATION_TASK_NAME);
+    let migrated = Arc::downgrade(migrated);
+    let task = TaskInner::try_new(
+        move || {
+            if let Some(migrated) = migrated.upgrade() {
+                crate::run_queue::migrate_entry(migrated);
+            }
+        },
+        name,
+        MIGRATION_TASK_STACK_SIZE,
+    )
+    .map_err(|_| AxError::NoMemory)?;
+    task.try_into_arc().map_err(|_| AxError::NoMemory)
+}
+
+#[cfg(feature = "smp")]
+fn retire_allowed_migration_current() {
+    let curr = current();
+    let retired = curr.take_allowed_migration(axhal::percpu::this_cpu_id());
+    drop(retired);
+}
+
 /// Set the affinity for the current task.
 /// [`AxCpuMask`] is used to specify the CPU affinity.
-/// Returns `true` if the affinity is set successfully.
-pub fn set_current_affinity(cpumask: AxCpuMask) -> bool {
+///
+/// Allocation needed to pre-admit a possible migration is completed before
+/// publishing the new mask. In particular, [`AxError::NoMemory`] leaves the
+/// old affinity unchanged instead of collapsing the failure into an invalid
+/// mask error at the caller.
+pub fn set_current_affinity(cpumask: AxCpuMask) -> AxResult {
     if cpumask.is_empty() {
-        false
-    } else {
-        let curr = current().clone();
+        return Err(AxError::InvalidInput);
+    }
 
-        curr.set_cpumask(cpumask);
-        // After setting the affinity, we need to check if current cpu matches
-        // the affinity. If not, we need to migrate the task to the correct CPU.
-        #[cfg(feature = "smp")]
+    let curr = current().clone();
+    #[cfg(feature = "smp")]
+    {
+        // The task can be preempted and migrated while allocation is in
+        // progress. Any restrictive mask therefore needs a helper; only the
+        // all-online-CPU mask proves that every possible resume CPU is allowed.
+        let needs_migration = cpumask != cpu_mask_full();
+        // Admission is complete before the mask becomes observable. On OOM the
+        // old affinity and any old pending helper remain untouched.
+        let displaced = admit_affinity_then_publish(
+            needs_migration,
+            || try_prepare_migration_task(&curr),
+            |migration| curr.publish_affinity(cpumask, migration),
+        )?;
+        drop(displaced);
+        retire_allowed_migration_current();
+
+        // Dropping the affinity lock may have honored a pending preemption and
+        // already migrated this task. Otherwise claim the prepared token under
+        // the runqueue guard; that safe point performs no allocation.
         if !cpumask.get(axhal::percpu::this_cpu_id()) {
-            const MIGRATION_TASK_STACK_SIZE: usize = 4096;
-            // Spawn a new migration task for migrating.
-            let migration_task = TaskInner::new(
-                move || crate::run_queue::migrate_entry(curr),
-                "migration-task".into(),
-                MIGRATION_TASK_STACK_SIZE,
-            )
-            .into_arc();
-
-            // Migrate the current task to the correct CPU using the migration task.
-            current_run_queue::<NoPreemptIrqSave>().migrate_current(migration_task);
-
-            assert!(
-                cpumask.get(axhal::percpu::this_cpu_id()),
-                "Migration failed"
-            );
+            current_run_queue::<NoPreemptIrqSave>().migrate_current_if_needed();
         }
-        true
+        if cpumask.get(axhal::percpu::this_cpu_id()) {
+            Ok(())
+        } else {
+            Err(AxError::BadState)
+        }
+    }
+
+    #[cfg(not(feature = "smp"))]
+    {
+        if !cpumask.get(0) {
+            return Err(AxError::InvalidInput);
+        }
+        curr.set_cpumask(cpumask);
+        Ok(())
     }
 }
 
@@ -359,51 +536,101 @@ pub fn set_current_affinity(cpumask: AxCpuMask) -> bool {
 /// remote ready task, the task is moved onto a run queue allowed by the new
 /// mask immediately. For a remote running task, the new mask is recorded and
 /// the task is nudged so it can self-migrate at its next scheduling point.
-pub fn set_task_affinity(task: &AxTaskRef, cpumask: AxCpuMask) -> bool {
+pub fn set_task_affinity(task: &AxTaskRef, cpumask: AxCpuMask) -> AxResult {
     if cpumask.is_empty() {
-        return false;
+        return Err(AxError::InvalidInput);
     }
 
     if current().ptr_eq(task) {
         return set_current_affinity(cpumask);
     }
 
-    task.set_cpumask(cpumask);
-
     #[cfg(feature = "smp")]
-    match task.state() {
-        TaskState::Ready => {
-            let _ =
-                crate::run_queue::task_run_queue::<NoPreemptIrqSave>(task).migrate_ready_task(task);
-            !matches!(task.state(), TaskState::Exited)
+    {
+        if matches!(task.state(), TaskState::Exited) {
+            return Err(AxError::NoSuchProcess);
         }
-        TaskState::Running => {
-            if !cpumask.get(task.cpu_id() as usize) {
-                #[cfg(feature = "preempt")]
-                task.set_preempt_pending(true);
-                task.interrupt();
+        // A Ready/Blocked task may become Running or migrate while admission is
+        // in progress. Only an all-online-CPU mask can omit the helper without
+        // reopening allocation at the scheduling safe point.
+        let needs_migration = cpumask != cpu_mask_full();
+        let (expected, displaced) = admit_affinity_then_publish(
+            needs_migration,
+            || try_prepare_migration_task(task),
+            |migration| {
+                let expected = migration.as_ref().cloned();
+                let displaced = task.publish_affinity(cpumask, migration);
+                (expected, displaced)
+            },
+        )?;
+        drop(displaced);
+
+        let (result, retire_expected) = match task.state() {
+            TaskState::Ready => {
+                let migrated = crate::run_queue::task_run_queue::<NoPreemptIrqSave>(task)
+                    .migrate_ready_task(task);
+                if !migrated {
+                    #[cfg(feature = "preempt")]
+                    task.set_preempt_pending(true);
+                    task.interrupt();
+                }
+                (!matches!(task.state(), TaskState::Exited), migrated)
             }
-            true
-        }
-        TaskState::Blocked => {
-            if !cpumask.get(task.cpu_id() as usize) {
-                task.set_cpu_id(crate::run_queue::select_run_queue_index(cpumask) as _);
+            TaskState::Running => {
+                if !cpumask.get(task.cpu_id() as usize) {
+                    #[cfg(feature = "preempt")]
+                    task.set_preempt_pending(true);
+                    task.interrupt();
+                }
+                (true, false)
             }
-            true
+            TaskState::Blocked => {
+                if !cpumask.get(task.cpu_id() as usize) {
+                    task.set_cpu_id(crate::run_queue::select_run_queue_index(cpumask) as _);
+                }
+                (true, false)
+            }
+            TaskState::Exited => (false, true),
+        };
+
+        // A successful ready-queue move no longer needs its helper. Running or
+        // racing tasks claim it themselves; the pointer check preserves a newer
+        // concurrent setaffinity token. Destruction occurs outside all locks.
+        if retire_expected && let Some(expected) = expected.as_ref() {
+            let retired = task.clear_migration_if(expected);
+            drop(retired);
         }
-        TaskState::Exited => false,
+        if result {
+            Ok(())
+        } else {
+            Err(AxError::NoSuchProcess)
+        }
     }
 
     #[cfg(not(feature = "smp"))]
     {
-        !matches!(task.state(), TaskState::Exited)
+        if !cpumask.get(0) {
+            return Err(AxError::InvalidInput);
+        }
+        task.set_cpumask(cpumask);
+        if matches!(task.state(), TaskState::Exited) {
+            Err(AxError::NoSuchProcess)
+        } else {
+            Ok(())
+        }
     }
 }
 
 /// Current task gives up the CPU time voluntarily, and switches to another
 /// ready task.
 pub fn yield_now() {
-    current_run_queue::<NoPreemptIrqSave>().yield_current()
+    #[cfg(feature = "smp")]
+    retire_allowed_migration_current();
+    run_deferred_work();
+    current_run_queue::<NoPreemptIrqSave>().yield_current();
+    run_deferred_work();
+    #[cfg(feature = "preempt")]
+    TaskInner::current_check_preempt_pending();
 }
 
 /// Current task is going to sleep for the given duration.
@@ -425,6 +652,7 @@ pub fn sleep_until(deadline: axhal::time::TimeValue) {
 
 /// Exits the current task.
 pub fn exit(exit_code: i32) -> ! {
+    run_deferred_work();
     current_run_queue::<NoPreemptIrqSave>().exit_current(exit_code)
 }
 
@@ -434,6 +662,9 @@ pub fn exit(exit_code: i32) -> ! {
 pub fn run_idle() -> ! {
     loop {
         yield_now();
+        // A dispatcher running after the yield may make a blocked task ready.
+        // Honor that wakeup before entering the architecture idle instruction.
+        resched_if_needed();
         trace!("idle task: waiting for IRQs...");
         #[cfg(feature = "irq")]
         axhal::asm::wait_for_irqs();

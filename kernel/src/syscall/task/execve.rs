@@ -1,10 +1,10 @@
-use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-    vec,
-    vec::Vec,
+use alloc::{string::String, sync::Arc, vec::Vec};
+use core::{
+    ffi::c_char,
+    future::poll_fn,
+    mem::{self, size_of},
+    task::Poll,
 };
-use core::{ffi::c_char, future::poll_fn, mem::size_of, task::Poll};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::NodeType;
@@ -23,11 +23,15 @@ use starry_vm::{VmError, vm_load_until_nul};
 use crate::task::reset_current_user_fpu_state;
 use crate::{
     config::USER_HEAP_BASE,
-    file::{FD_TABLE, ResolveAtResult, executable, fanotify, resolve_at_with_credentials},
+    file::{
+        FD_TABLE, ResolveAtResult, executable, fanotify, replace_process_fd_table,
+        resolve_at_with_credentials,
+    },
     mm::{copy_from_kernel, load_user_app_at, new_user_aspace_empty, vm_load_string},
     task::{
-        AsThread, DacCredentialView, ProcessData, Thread, add_task_alias, check_signals, get_task,
-        has_pending_fatal_signal, notify_ptrace_attach_stop, set_current_user_page_table_root,
+        AsThread, DacCredentialView, ProcessData, Thread, check_signals, get_task,
+        has_pending_fatal_signal, notify_ptrace_attach_stop, prepare_task_alias_admission,
+        set_current_user_page_table_root,
     },
 };
 
@@ -37,6 +41,10 @@ fn interrupt_exec_siblings(sibling_tids: &[Pid]) {
             task.interrupt();
         }
     }
+}
+
+fn files_preparation_covers_thread_snapshot(has_private_table: bool, threads: &[Pid]) -> bool {
+    has_private_table || threads.len() <= 1
 }
 
 fn reset_exec_signal_state(thr: &Thread) {
@@ -109,6 +117,14 @@ fn exec_arg_too_big() -> AxError {
     LinuxError::E2BIG.into()
 }
 
+fn try_copy_string(value: &str) -> AxResult<String> {
+    let mut copy = String::new();
+    copy.try_reserve_exact(value.len())
+        .map_err(|_| AxError::NoMemory)?;
+    copy.push_str(value);
+    Ok(copy)
+}
+
 fn map_exec_vm_error(err: VmError) -> AxError {
     match err {
         VmError::TooLong => exec_arg_too_big(),
@@ -168,7 +184,10 @@ fn load_exec_string_vec(
     sizer: &mut ExecArgSizer,
 ) -> AxResult<Vec<String>> {
     let ptrs = vm_load_until_nul(ptr).map_err(map_exec_vm_error)?;
-    let mut values = Vec::with_capacity(ptrs.len());
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(ptrs.len())
+        .map_err(|_| AxError::NoMemory)?;
     for ptr in ptrs {
         let value = vm_load_exec_string(ptr)?;
         sizer.push_str(&value)?;
@@ -189,7 +208,10 @@ fn load_exec_args_env(
     };
     let args = if args.is_empty() {
         sizer.push_str("")?;
-        vec![String::new()]
+        let mut args = Vec::new();
+        args.try_reserve_exact(1).map_err(|_| AxError::NoMemory)?;
+        args.push(String::new());
+        args
     } else {
         args
     };
@@ -233,8 +255,11 @@ fn do_execve(
     )?;
     fanotify::permission_check(&loc, &loc, fanotify::FAN_OPEN_PERM, loc.is_dir(), false)?;
 
-    let abs_path = loc.absolute_path()?.to_string();
-    let task_name = loc.name().to_string();
+    let abs_path = {
+        let absolute_path = loc.absolute_path()?;
+        try_copy_string(absolute_path.as_str())
+    }?;
+    let task_name = try_copy_string(loc.name())?;
     let executable_key = executable::acquire_if_not_write_open(&loc)?;
 
     let mut new_aspace = exec_or_release(executable_key, new_user_aspace_empty())?;
@@ -258,69 +283,143 @@ fn do_execve(
         false,
     );
 
+    // Everything needed by the new image is owned before de-threading or any
+    // irreversible close/address-space publication. In particular, neither
+    // the address-space handle nor the procfs cmdline may allocate after the
+    // CLOEXEC commit point.
+    let new_aspace = exec_or_release(
+        executable_key,
+        Arc::try_new(axsync::Mutex::new(new_aspace)).map_err(|_| AxError::NoMemory),
+    )?;
+    let new_root = new_aspace.lock().page_table_root();
+    let new_cmdline = exec_or_release(
+        executable_key,
+        Arc::try_new(args).map_err(|_| AxError::NoMemory),
+    )?;
+
     let curr = current();
     let thr = curr.as_thread();
     let proc_data = &thr.proc_data;
     let curr_tid = curr.id().as_u64() as Pid;
-
-    let mut exec_started = false;
-    if proc_data.proc.threads().len() > 1 {
-        if !proc_data.begin_exec(curr_tid) {
-            executable::release(executable_key);
-            return Err(AxError::Interrupted);
-        }
-        exec_started = true;
-        let sibling_tids = proc_data
-            .proc
-            .threads()
-            .into_iter()
-            .filter(|&tid| tid != curr_tid)
-            .collect::<Vec<_>>();
-        interrupt_exec_siblings(&sibling_tids);
-        if let Err(err) = wait_for_exec_group(proc_data, thr, uctx, curr_tid, &sibling_tids) {
-            proc_data.end_exec(curr_tid);
+    let new_task_alias = (curr_tid != proc_data.proc.pid()).then(|| curr.clone());
+    let task_alias_admission = match new_task_alias
+        .as_ref()
+        .map(|task| prepare_task_alias_admission(proc_data.proc.pid(), task))
+        .transpose()
+    {
+        Ok(admission) => admission,
+        Err(err) => {
             executable::release(executable_key);
             return Err(err);
         }
+    };
+
+    // Take the private files snapshot before killing sibling threads. A
+    // failure can then cancel exec without leaving the old image unexpectedly
+    // de-threaded. Multi-thread exec always needs a snapshot because this
+    // kernel represents all sibling files pointers with one process-scope
+    // Arc; a single-thread caller needs one only when CLONE_FILES shares the
+    // table with another process.
+    let has_siblings = proc_data.proc.thread_count() > 1;
+    let private_fd_table = if has_siblings || Arc::strong_count(&*FD_TABLE) > 1 {
+        match FD_TABLE.fork_copy() {
+            Ok(table) => match Arc::try_new(table) {
+                Ok(table) => Some(table),
+                Err(_) => {
+                    executable::release(executable_key);
+                    return Err(AxError::NoMemory);
+                }
+            },
+            Err(err) => {
+                executable::release(executable_key);
+                return Err(err);
+            }
+        }
+    } else {
+        None
+    };
+    let cloexec_batch = match private_fd_table.as_ref() {
+        Some(table) => table.prepare_cloexec_batch(),
+        None => FD_TABLE.prepare_cloexec_batch(),
+    };
+    let cloexec_batch = match cloexec_batch {
+        Ok(batch) => batch,
+        Err(err) => {
+            executable::release(executable_key);
+            return Err(err);
+        }
+    };
+
+    // Gate every exec, including an apparently single-threaded one. Otherwise
+    // CLONE_THREAD can publish a sibling between the preflight count and the
+    // irreversible commit. The gate freezes thread-group growth; the snapshot
+    // below then validates that the files preparation made before the gate is
+    // still sufficient. If clone won the race, abort before interrupting any
+    // sibling and let userspace retry instead of committing with a shared
+    // process-scope files pointer.
+    if !proc_data.begin_exec(curr_tid) {
+        executable::release(executable_key);
+        return Err(AxError::Interrupted);
+    }
+    let mut sibling_tids = match proc_data.proc.try_threads() {
+        Ok(threads) => threads,
+        Err(_) => {
+            proc_data.end_exec(curr_tid);
+            executable::release(executable_key);
+            return Err(AxError::NoMemory);
+        }
+    };
+    if !files_preparation_covers_thread_snapshot(private_fd_table.is_some(), &sibling_tids) {
+        proc_data.end_exec(curr_tid);
+        executable::release(executable_key);
+        return Err(AxError::Interrupted);
+    }
+    sibling_tids.retain(|&tid| tid != curr_tid);
+    interrupt_exec_siblings(&sibling_tids);
+    if let Err(err) = wait_for_exec_group(proc_data, thr, uctx, curr_tid, &sibling_tids) {
+        proc_data.end_exec(curr_tid);
+        executable::release(executable_key);
+        return Err(err);
     }
 
-    let new_aspace = Arc::new(axsync::Mutex::new(new_aspace));
-    let new_aspace_guard = new_aspace.lock();
-    let new_root = new_aspace_guard.page_table_root();
+    // A non-leader exec adopts the thread-group ID. Its lookup bucket was
+    // admitted before de-threading, so this publication cannot fail before
+    // the first irreversible close. `get_visible_task()` will not expose the
+    // alias until `set_tid()` below changes the task's visible ID.
+    if let Some(admission) = task_alias_admission {
+        admission.commit();
+    }
+
+    if let Some(private) = private_fd_table {
+        let previous = thr.with_mut_scope(|scope| replace_process_fd_table(scope, private));
+        drop(previous);
+    }
+    // The buffer was reserved before de-threading, and the selected table is
+    // either private or owned by this sole thread. Detaching all CLOEXEC slots
+    // is therefore allocation-free and cannot fail at the exec commit point.
+    drop(FD_TABLE.close_cloexec(cloexec_batch));
+    crate::file::inotify::wait_current_close_notifications();
+
     crate::syscall::cleanup_process_aio(proc_data.proc.pid());
-    let old_aspace = proc_data.replace_aspace(new_aspace.clone());
+    let old_aspace = proc_data.replace_aspace(new_aspace);
     set_current_user_page_table_root(new_root);
-    drop(new_aspace_guard);
     drop(old_aspace);
     proc_data.clear_keep_caps_on_exec();
     curr.as_thread().set_tid(proc_data.proc.pid());
-    if curr_tid != proc_data.proc.pid() {
-        let curr_task = curr.clone();
-        add_task_alias(proc_data.proc.pid(), &curr_task);
-    }
-    if exec_started {
-        proc_data.end_exec(curr_tid);
-    }
     proc_data.replace_executable(executable_key);
 
-    curr.set_name(&task_name);
+    drop(curr.replace_name(task_name));
 
-    #[cfg(target_arch = "loongarch64")]
-    {
+    let old_exe_path = {
         let mut exe_path_guard = proc_data.exe_path.write();
-        let old_exe_path = core::mem::replace(&mut *exe_path_guard, abs_path);
-        core::mem::forget(old_exe_path);
-        drop(exe_path_guard);
-
+        mem::replace(&mut *exe_path_guard, abs_path)
+    };
+    drop(old_exe_path);
+    let old_cmdline = {
         let mut cmdline_guard = proc_data.cmdline.write();
-        let old_cmdline = core::mem::replace(&mut *cmdline_guard, Arc::new(args));
-        core::mem::forget(old_cmdline);
-    }
-    #[cfg(not(target_arch = "loongarch64"))]
-    {
-        *proc_data.exe_path.write() = abs_path;
-        *proc_data.cmdline.write() = Arc::new(args);
-    }
+        mem::replace(&mut *cmdline_guard, new_cmdline)
+    };
+    drop(old_cmdline);
 
     proc_data.set_heap_top(USER_HEAP_BASE + crate::config::USER_HEAP_SIZE);
     proc_data.clear_mempolicy_ranges();
@@ -334,20 +433,10 @@ fn do_execve(
     curr.as_thread().set_clear_child_tid(0);
     curr.as_thread().set_robust_list_head(0);
 
-    // Close CLOEXEC file descriptors
-    let mut fd_table = FD_TABLE.write();
-    let mut cloexec_fds = Vec::new();
-    for it in fd_table.ids() {
-        let fd = fd_table.get(it).ok_or(AxError::BadFileDescriptor)?;
-        if fd.cloexec {
-            cloexec_fds.push(it);
-        }
-    }
-    for fd in cloexec_fds {
-        fd_table.remove(fd);
-    }
-    drop(fd_table);
-
+    // Keep CLONE_THREAD publication gated until every process-wide field of
+    // the new image has been installed. Releasing the gate at the address-space
+    // swap would let a new sibling observe a half-committed exec image.
+    proc_data.end_exec(curr_tid);
     proc_data.release_vfork();
 
     uctx.set_ip(entry_point.as_usize());
@@ -375,6 +464,18 @@ pub fn sys_execve(
         .into_file()
         .ok_or(AxError::InvalidInput)?;
     do_execve(uctx, loc, args, envs, &credentials)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::files_preparation_covers_thread_snapshot;
+
+    #[test]
+    fn exec_files_preparation_rejects_a_clone_race() {
+        assert!(files_preparation_covers_thread_snapshot(false, &[7]));
+        assert!(!files_preparation_covers_thread_snapshot(false, &[7, 8]));
+        assert!(files_preparation_covers_thread_snapshot(true, &[7, 8]));
+    }
 }
 
 pub fn sys_execveat(

@@ -1,50 +1,50 @@
-use alloc::{
-    sync::{Arc, Weak},
-    vec::Vec,
-};
+use alloc::{sync::Arc, vec::Vec};
 use core::{any::Any, fmt};
 
 use kspin::SpinNoIrq;
-use weak_map::WeakMap;
 
-use crate::{Pid, ProcessGroup};
+use crate::{Pid, ProcessError, ProcessGroup, process::try_collect_process_values};
 
 /// A [`Session`] is a collection of [`ProcessGroup`]s.
 pub struct Session {
     sid: Pid,
-    pub(crate) process_groups: SpinNoIrq<WeakMap<Pid, Weak<ProcessGroup>>>,
     terminal: SpinNoIrq<Option<Arc<dyn Any + Send + Sync>>>,
 }
 
 impl Session {
-    /// Create a new [`Session`].
-    pub(crate) fn new(sid: Pid) -> Arc<Self> {
-        Arc::new(Self {
+    /// Fallibly creates an unpublished [`Session`].
+    pub(crate) fn try_new(sid: Pid) -> Result<Arc<Self>, ProcessError> {
+        Arc::try_new(Self {
             sid,
-            process_groups: SpinNoIrq::new(WeakMap::new()),
             terminal: SpinNoIrq::new(None),
         })
+        .map_err(|_| ProcessError::NoMemory)
     }
-}
 
-impl Session {
     /// The [`Session`] ID.
     pub fn sid(&self) -> Pid {
         self.sid
     }
 
-    /// The [`ProcessGroup`]s that belong to this [`Session`].
-    pub fn process_groups(&self) -> Vec<Arc<ProcessGroup>> {
-        self.process_groups.lock().values().collect()
+    /// Fallibly snapshots the live process groups in this session.
+    pub fn try_process_groups(self: &Arc<Self>) -> Result<Vec<Arc<ProcessGroup>>, ProcessError> {
+        let mut groups = try_collect_process_values(|process| {
+            let group = process.group();
+            Arc::ptr_eq(&group.session(), self).then_some(group)
+        })?;
+        groups.sort_unstable_by_key(|group| group.pgid());
+        groups.dedup_by_key(|group| group.pgid());
+        Ok(groups)
     }
 
     /// Sets the terminal for this session.
     pub fn set_terminal_with(&self, terminal: impl FnOnce() -> Arc<dyn Any + Send + Sync>) -> bool {
+        let terminal = terminal();
         let mut guard = self.terminal.lock();
         if guard.is_some() {
             return false;
         }
-        *guard = Some(terminal());
+        *guard = Some(terminal);
         true
     }
 
@@ -52,7 +52,9 @@ impl Session {
     pub fn unset_terminal(&self, term: &Arc<dyn Any + Send + Sync>) -> bool {
         let mut guard = self.terminal.lock();
         if guard.as_ref().is_some_and(|it| Arc::ptr_eq(it, term)) {
-            *guard = None;
+            let removed = guard.take();
+            drop(guard);
+            drop(removed);
             true
         } else {
             false

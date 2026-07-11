@@ -1,6 +1,6 @@
 #[cfg(feature = "smp")]
 use alloc::sync::Weak;
-use alloc::{collections::VecDeque, sync::Arc, vec, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc};
 use core::{
     future::poll_fn,
     mem::MaybeUninit,
@@ -15,6 +15,8 @@ use kernel_guard::BaseGuard;
 use kspin::{SpinNoIrqGuard, SpinRaw};
 use lazyinit::LazyInit;
 
+#[cfg(feature = "smp")]
+use crate::task::MigrationClaim;
 use crate::{
     AxCpuMask, AxTaskRef, Scheduler, TaskInner,
     future::block_on,
@@ -61,13 +63,15 @@ struct StackCacheKey {
 
 struct StackCacheBucket {
     key: StackCacheKey,
-    stacks: Vec<TaskStack>,
+    stack: TaskStack,
 }
+
+const STACK_CACHE_SLOTS: usize = 64;
 
 struct PerCpuStackCache {
     cached_bytes: usize,
     budget_bytes: usize,
-    buckets: Vec<StackCacheBucket>,
+    slots: [Option<StackCacheBucket>; STACK_CACHE_SLOTS],
 }
 
 impl PerCpuStackCache {
@@ -75,43 +79,41 @@ impl PerCpuStackCache {
         Self {
             cached_bytes: 0,
             budget_bytes: 0,
-            buckets: Vec::new(),
+            slots: [const { None }; STACK_CACHE_SLOTS],
         }
     }
 
     fn take(&mut self, size: usize, align: usize) -> Option<TaskStack> {
         let key = StackCacheKey { size, align };
-        let index = self.buckets.iter().position(|bucket| bucket.key == key)?;
-        let bucket = &mut self.buckets[index];
-        let stack = bucket.stacks.pop();
-        if stack.is_some() {
-            self.cached_bytes = self.cached_bytes.saturating_sub(size);
-        }
-        if bucket.stacks.is_empty() {
-            self.buckets.swap_remove(index);
-        }
-        stack
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(|bucket| bucket.key == key))?;
+        let bucket = slot.take()?;
+        self.cached_bytes = self.cached_bytes.saturating_sub(size);
+        Some(bucket.stack)
     }
 
-    fn recycle(&mut self, mut stack: TaskStack) {
+    /// Returns the stack when it cannot be cached so its deallocation can occur
+    /// after the per-CPU no-IRQ lock has been released.
+    fn recycle(&mut self, mut stack: TaskStack) -> Option<TaskStack> {
         let size = stack.layout_size();
         let align = stack.layout_align();
         let budget = self.budget_bytes();
         if size == 0 || budget < size || self.cached_bytes > budget.saturating_sub(size) {
-            return;
+            return Some(stack);
         }
 
+        let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_none()) else {
+            return Some(stack);
+        };
         stack.scrub_for_cache();
-        let key = StackCacheKey { size, align };
-        if let Some(bucket) = self.buckets.iter_mut().find(|bucket| bucket.key == key) {
-            bucket.stacks.push(stack);
-        } else {
-            self.buckets.push(StackCacheBucket {
-                key,
-                stacks: vec![stack],
-            });
-        }
+        *slot = Some(StackCacheBucket {
+            key: StackCacheKey { size, align },
+            stack,
+        });
         self.cached_bytes += size;
+        None
     }
 
     fn budget_bytes(&mut self) -> usize {
@@ -147,9 +149,8 @@ pub(crate) fn take_cached_task_stack(size: usize, align: usize) -> Option<TaskSt
 }
 
 fn recycle_task_stack(stack: TaskStack) {
-    STACK_CACHE.with_current(|cache| {
-        cache.lock().recycle(stack);
-    });
+    let rejected = STACK_CACHE.with_current(|cache| cache.lock().recycle(stack));
+    drop(rejected);
 }
 
 /// An array of references to run queues, one for each CPU, indexed by cpu_id.
@@ -366,8 +367,8 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
     /// This function is used to add a new task to the scheduler.
     pub fn add_task(&mut self, task: AxTaskRef) {
         debug!(
-            "task add: {} on run_queue {}",
-            task.id_name(),
+            "task add: id={} on run_queue {}",
+            task.id().as_u64(),
             self.inner.cpu_id
         );
         assert!(task.is_ready());
@@ -384,7 +385,7 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
     /// This function does nothing if the task is not in [`TaskState::Blocked`],
     /// which means the task is already unblocked by other cores.
     pub fn unblock_task(&mut self, task: AxTaskRef, resched: bool) {
-        let task_id_name = task.id_name();
+        let task_id = task.id().as_u64();
         // Try to change the state of the task from `Blocked` to `Ready`,
         // if successful, the task will be put into this run queue,
         // otherwise, the task is already unblocked by other cores.
@@ -396,7 +397,7 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
         {
             // Since now, the task to be unblocked is in the `Ready` state.
             let cpu_id = self.inner.cpu_id;
-            debug!("task unblock: {task_id_name} on run_queue {cpu_id}");
+            debug!("task unblock: id={task_id} on run_queue {cpu_id}");
             // Note: when the task is unblocked on another CPU's run queue,
             // we just ingiore the `resched` flag.
             if resched && cpu_id == this_cpu_id() {
@@ -426,20 +427,27 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
     #[cfg(feature = "smp")]
     fn maybe_migrate_current(&mut self) -> bool {
         let curr = &self.current_task;
-        if curr.cpumask().get(self.inner.cpu_id) {
-            return false;
+        match curr.claim_migration(self.inner.cpu_id) {
+            MigrationClaim::Allowed => false,
+            MigrationClaim::Prepared(migration_task) => {
+                self.migrate_current(migration_task);
+                true
+            }
+            MigrationClaim::Missing => {
+                // All public affinity updates admit the helper before publishing
+                // an excluding mask. Keep running rather than allocating or
+                // panicking inside this runqueue/no-IRQ safe point if an internal
+                // caller ever violates that contract.
+                #[cfg(feature = "preempt")]
+                curr.set_preempt_pending(true);
+                false
+            }
         }
+    }
 
-        const MIGRATION_TASK_STACK_SIZE: usize = 4096;
-        let migrated_task = curr.clone();
-        let migration_task = TaskInner::new(
-            move || crate::run_queue::migrate_entry(migrated_task),
-            "migration-task".into(),
-            MIGRATION_TASK_STACK_SIZE,
-        )
-        .into_arc();
-        self.migrate_current(migration_task);
-        true
+    #[cfg(feature = "smp")]
+    pub(crate) fn migrate_current_if_needed(&mut self) -> bool {
+        self.maybe_migrate_current()
     }
 
     #[cfg(feature = "irq")]
@@ -463,8 +471,8 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
     /// This function will put the current task into this run queue with `Ready` state,
     /// and reschedule to the next task on this run queue.
     pub fn yield_current(&mut self) {
-        let curr = &self.current_task;
-        trace!("task yield: {}", curr.id_name());
+        let curr = self.current_task.clone();
+        trace!("task yield: id={}", curr.id().as_u64());
         assert!(curr.is_running());
 
         #[cfg(feature = "smp")]
@@ -473,7 +481,7 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         }
 
         self.inner
-            .put_task_with_state(curr.clone(), TaskState::Running, false);
+            .put_task_with_state(curr, TaskState::Running, false);
 
         self.inner.resched();
     }
@@ -488,7 +496,7 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
     #[cfg(feature = "smp")]
     pub fn migrate_current(&mut self, migration_task: AxTaskRef) {
         let curr = &self.current_task;
-        trace!("task migrate: {}", curr.id_name());
+        trace!("task migrate: id={}", curr.id().as_u64());
         assert!(curr.is_running());
 
         // Mark current task's state as `Ready`,
@@ -512,7 +520,7 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
     pub fn preempt_resched(&mut self) {
         // There is no need to disable IRQ and preemption here, because
         // they both have been disabled in `current_check_preempt_pending`.
-        let curr = &self.current_task;
+        let curr = self.current_task.clone();
         assert!(curr.is_running());
 
         // When we call `preempt_resched()`, both IRQs and preemption must
@@ -522,8 +530,8 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         let can_preempt = curr.can_preempt(1);
 
         trace!(
-            "current task is to be preempted: {}, allow={}",
-            curr.id_name(),
+            "current task id={} is to be preempted, allow={}",
+            curr.id().as_u64(),
             can_preempt
         );
         if can_preempt {
@@ -532,7 +540,7 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
                 return;
             }
             self.inner
-                .put_task_with_state(curr.clone(), TaskState::Running, true);
+                .put_task_with_state(curr, TaskState::Running, true);
             self.inner.resched();
         } else {
             curr.set_preempt_pending(true);
@@ -543,7 +551,11 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
     /// This function will never return.
     pub fn exit_current(&mut self, exit_code: i32) -> ! {
         let curr = &self.current_task;
-        debug!("task exit: {}, exit_code={}", curr.id_name(), exit_code);
+        debug!(
+            "task exit: id={}, exit_code={}",
+            curr.id().as_u64(),
+            exit_code
+        );
         assert!(curr.is_running(), "task is not running: {:?}", curr.state());
         assert!(!curr.is_idle());
         if curr.is_init() {
@@ -594,7 +606,7 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         // Note that the state may have been set as `Ready` in `unblock_task()`,
         // see `unblock_task()` for details.
 
-        debug!("task block: {}", curr.id_name());
+        debug!("task block: id={}", curr.id().as_u64());
         self.inner.resched();
     }
 
@@ -762,8 +774,8 @@ impl AxRunQueue {
             });
         assert!(
             next.is_ready(),
-            "next {} is not ready: {:?}",
-            next.id_name(),
+            "next task id={} is not ready: {:?}",
+            next.id().as_u64(),
             next.state()
         );
         self.switch_to(crate::current(), next);
@@ -777,9 +789,9 @@ impl AxRunQueue {
             "IRQs must be disabled during scheduling"
         );
         trace!(
-            "context switch: {} -> {}",
-            prev_task.id_name(),
-            next_task.id_name()
+            "context switch: id={} -> id={}",
+            prev_task.id().as_u64(),
+            next_task.id().as_u64()
         );
         #[cfg(feature = "preempt")]
         next_task.set_preempt_pending(false);
@@ -932,7 +944,7 @@ pub(crate) fn reclaim_exited_tasks_current_cpu_bounded(max_tasks: usize) -> bool
 /// then puts the task to the scheduler of target run queue.
 #[cfg(feature = "smp")]
 pub(crate) fn migrate_entry(migrated_task: AxTaskRef) {
-    let mut target = select_run_queue::<kernel_guard::NoPreemptIrqSave>(&migrated_task);
+    let target = select_run_queue::<kernel_guard::NoPreemptIrqSave>(&migrated_task);
     migrated_task.set_cpu_id(target.inner.cpu_id as _);
     target
         .inner

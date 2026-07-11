@@ -1,7 +1,6 @@
 use alloc::{
     collections::{BTreeMap, VecDeque},
     sync::Arc,
-    vec::Vec,
 };
 use core::{
     future::poll_fn,
@@ -614,19 +613,22 @@ pub fn sys_io_cancel(ctx: u64, iocb: *const Iocb, result: *mut IoEvent) -> AxRes
 }
 
 pub fn cleanup_process_aio(owner: Pid) {
-    let contexts = {
-        let mut manager = AIO_CONTEXTS.lock();
-        let ids = manager
-            .contexts
-            .iter()
-            .filter_map(|(id, context)| (context.owner == owner).then_some(*id))
-            .collect::<Vec<_>>();
-        ids.into_iter()
-            .filter_map(|id| manager.contexts.remove(&id))
-            .collect::<Vec<_>>()
-    };
+    loop {
+        // Exec and process exit call this after their irreversible lifecycle
+        // transition has begun. Detach one context at a time so cleanup never
+        // allocates a temporary ID/context vector after that commit point.
+        let context = {
+            let mut manager = AIO_CONTEXTS.lock();
+            let id = manager
+                .contexts
+                .iter()
+                .find_map(|(id, context)| (context.owner == owner).then_some(*id));
+            id.and_then(|id| manager.contexts.remove(&id))
+        };
+        let Some(context) = context else {
+            break;
+        };
 
-    for context in contexts {
         let mut state = context.state.lock();
         state.accepting = false;
         state.events.clear();

@@ -70,6 +70,11 @@ struct ext4_blockdev_iface {
 	 * @param   bdev block device.*/
 	int (*close)(struct ext4_blockdev *bdev);
 
+	/**@brief   Persist completed writes to stable storage. Optional for
+	 *          devices whose writes are already durable.
+	 * @param   bdev block device.*/
+	int (*flush)(struct ext4_blockdev *bdev);
+
 	/**@brief   Lock block device. Required in multi partition mode
 	 *          operations. Not mandatory field.
 	 * @param   bdev block device.*/
@@ -125,6 +130,9 @@ struct ext4_blockdev {
 	/**@brief   Cache write back mode reference counter*/
 	uint32_t cache_write_back;
 
+	/**@brief   First buffered writeback error not yet reported by cache flush.*/
+	int writeback_error;
+
 	/**@brief   The filesystem this block device belongs to. */
 	struct ext4_fs *fs;
 
@@ -167,6 +175,11 @@ int ext4_block_bind_bcache(struct ext4_blockdev *bdev, struct ext4_bcache *bc);
  * @param   bdev block device descriptor
  * @return  standard error code*/
 int ext4_block_fini(struct ext4_blockdev *bdev);
+
+/**@brief   Fence completed writes on the underlying device.
+ * @param   bdev block device descriptor
+ * @return  standard error code*/
+int ext4_block_flush(struct ext4_blockdev *bdev);
 
 /**@brief   Flush data in given buffer to disk.
  * @param   bdev block device descriptor

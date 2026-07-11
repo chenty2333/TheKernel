@@ -1260,10 +1260,7 @@ fn check_mandatory_truncate_lock(
     new_len: u64,
     owner: flock::RecordLockOwner,
 ) -> AxResult<()> {
-    let Ok(path) = loc.absolute_path() else {
-        return Ok(());
-    };
-    if !mounts::has_mandatory_locking(path.as_ref()) || !has_mandatory_lock_mode(loc)? {
+    if !mounts::has_mandatory_locking(loc)? || !has_mandatory_lock_mode(loc)? {
         return Ok(());
     }
 

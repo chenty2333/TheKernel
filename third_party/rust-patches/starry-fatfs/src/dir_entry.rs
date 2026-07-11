@@ -115,6 +115,18 @@ impl ShortName {
             .collect()
     }
 
+    #[cfg(feature = "alloc")]
+    fn try_to_string<E, OCC: OemCpConverter>(&self, oem_cp_converter: &OCC) -> Result<String, Error<E>> {
+        let mut result = String::new();
+        result
+            .try_reserve_exact(self.as_bytes().len().saturating_mul(3))
+            .map_err(|_| Error::NotEnoughMemory)?;
+        for byte in self.as_bytes() {
+            result.push(oem_cp_converter.decode(*byte));
+        }
+        Ok(result)
+    }
+
     fn eq_ignore_case<OCC: OemCpConverter>(&self, name: &str, oem_cp_converter: &OCC) -> bool {
         // Convert name to UTF-8 character iterator
         let byte_iter = self.as_bytes().iter().copied();
@@ -155,6 +167,16 @@ impl DirFileEntryData {
         let mut sfn_entry = self.clone();
         sfn_entry.name = new_name;
         sfn_entry
+    }
+
+    pub(crate) fn renamed_like(&self, destination: &Self) -> Self {
+        let mut renamed = self.renamed(*destination.name());
+        // Bits 3 and 4 encode the lowercase presentation of the destination
+        // short name. Preserve them along with the destination name/LFN.
+        const LOWERCASE_NAME_BITS: u8 = (1 << 3) | (1 << 4);
+        renamed.reserved_0 =
+            (renamed.reserved_0 & !LOWERCASE_NAME_BITS) | (destination.reserved_0 & LOWERCASE_NAME_BITS);
+        renamed
     }
 
     pub(crate) fn name(&self) -> &[u8; SFN_SIZE] {
@@ -271,10 +293,6 @@ impl DirFileEntryData {
         self.name[0] == DIR_ENTRY_DELETED_FLAG
     }
 
-    pub(crate) fn set_deleted(&mut self) {
-        self.name[0] = DIR_ENTRY_DELETED_FLAG;
-    }
-
     pub(crate) fn is_end(&self) -> bool {
         self.name[0] == 0
     }
@@ -350,10 +368,6 @@ impl DirLfnEntryData {
         self.order == DIR_ENTRY_DELETED_FLAG
     }
 
-    pub(crate) fn set_deleted(&mut self) {
-        self.order = DIR_ENTRY_DELETED_FLAG;
-    }
-
     pub(crate) fn is_end(&self) -> bool {
         self.order == 0
     }
@@ -366,14 +380,6 @@ pub(crate) enum DirEntryData {
 }
 
 impl DirEntryData {
-    pub(crate) fn serialize<E: IoError, W: Write<Error = Error<E>>>(&self, wrt: &mut W) -> Result<(), Error<E>> {
-        trace!("DirEntryData::serialize");
-        match self {
-            DirEntryData::File(file) => file.serialize(wrt),
-            DirEntryData::Lfn(lfn) => lfn.serialize(wrt),
-        }
-    }
-
     pub(crate) fn deserialize<E: IoError, R: Read<Error = Error<E>>>(rdr: &mut R) -> Result<Self, Error<E>> {
         trace!("DirEntryData::deserialize");
         let mut name = [0; SFN_SIZE];
@@ -439,13 +445,6 @@ impl DirEntryData {
         }
     }
 
-    pub(crate) fn set_deleted(&mut self) {
-        match self {
-            DirEntryData::File(file) => file.set_deleted(),
-            DirEntryData::Lfn(lfn) => lfn.set_deleted(),
-        }
-    }
-
     pub(crate) fn is_end(&self) -> bool {
         match self {
             DirEntryData::File(file) => file.is_end(),
@@ -472,6 +471,10 @@ impl DirEntryEditor {
 
     pub(crate) fn inner(&self) -> &DirFileEntryData {
         &self.data
+    }
+
+    pub(crate) fn position(&self) -> u64 {
+        self.pos
     }
 
     pub(crate) fn set_first_cluster(&mut self, first_cluster: Option<u32>, fat_type: FatType) {
@@ -586,6 +589,28 @@ impl<'a, IO: ReadWriteSeek, TP, OCC: OemCpConverter> DirEntry<'a, IO, TP, OCC> {
         }
 
         self.data.lowercase_name().to_string(&self.fs.options.oem_cp_converter)
+    }
+
+    /// Fallibly returns the long name, or the decoded short name when no LFN
+    /// exists. This is intended for kernel directory walks where allocation
+    /// failure must be reported rather than aborting the system.
+    #[cfg(feature = "alloc")]
+    pub fn try_file_name(&self) -> Result<String, Error<IO::Error>> {
+        #[cfg(feature = "lfn")]
+        if let Some(lfn) = self.long_file_name_as_ucs2_units() {
+            let mut result = String::new();
+            result
+                .try_reserve_exact(lfn.len().saturating_mul(3))
+                .map_err(|_| Error::NotEnoughMemory)?;
+            for decoded in char::decode_utf16(lfn.iter().copied()) {
+                result.push(decoded.unwrap_or(char::REPLACEMENT_CHARACTER));
+            }
+            return Ok(result);
+        }
+
+        self.data
+            .lowercase_name()
+            .try_to_string(&self.fs.options.oem_cp_converter)
     }
 
     /// Returns file attributes.
@@ -713,6 +738,15 @@ impl<'a, IO: ReadWriteSeek, TP, OCC: OemCpConverter> DirEntry<'a, IO, TP, OCC> {
         }
 
         self.short_name.eq_ignore_case(name, &self.fs.options.oem_cp_converter)
+    }
+
+    /// Returns the absolute on-disk position of this directory entry.
+    ///
+    /// The position identifies the live directory slot, but callers that need
+    /// reuse safety must pair it with their own generation tracking.
+    #[must_use]
+    pub fn entry_position(&self) -> u64 {
+        self.entry_pos
     }
 }
 

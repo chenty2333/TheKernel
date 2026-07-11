@@ -1,16 +1,21 @@
 use alloc::{
-    collections::{BTreeMap, BTreeSet},
     string::{String, ToString},
-    sync::Weak,
+    sync::{Arc, Weak},
     vec::Vec,
 };
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use axfs_ng_vfs::{DeviceId, Location, NodeType};
-use spin::Mutex;
+use axerrno::{AxError, AxResult};
+use axfs_ng_vfs::{
+    DeviceId, Filesystem, FilesystemIdentity, Location, Mountpoint, NodeType, TypeMap, VfsResult,
+    WeakFilesystemIdentity,
+};
+use axsync::{Mutex as BlockingMutex, MutexGuard as BlockingMutexGuard};
+use hashbrown::{HashMap, HashSet};
+use spin::{Lazy, Mutex};
 
 use crate::time::wall_time;
 
-#[derive(Clone)]
 pub struct MountRecord {
     pub mount_id: u64,
     pub parent_id: u64,
@@ -21,11 +26,111 @@ pub struct MountRecord {
     pub data: String,
     pub dev: u64,
     pub flags: u32,
-    pub expire_marked: bool,
+    pub expire_epoch: Option<u64>,
+    mountpoint: Weak<Mountpoint>,
 }
 
-static MOUNT_RECORDS: Mutex<Vec<MountRecord>> = Mutex::new(Vec::new());
-static LINUX_DEVICE_IDS: Mutex<BTreeMap<u64, (DeviceId, Weak<()>)>> = Mutex::new(BTreeMap::new());
+#[derive(Debug, Eq, PartialEq)]
+pub struct MountMetadata {
+    pub source: String,
+    pub fs_type: String,
+    pub root: String,
+    pub data: String,
+}
+
+pub struct BindSubmount {
+    pub source: Location,
+    pub relative_path: String,
+    pub metadata: MountMetadata,
+    pub flags: u32,
+}
+
+struct MountRecordIndex<'a> {
+    records: &'a [MountRecord],
+    by_id: HashMap<u64, usize>,
+    children: HashMap<u64, Vec<u64>>,
+}
+
+impl<'a> MountRecordIndex<'a> {
+    fn new(records: &'a [MountRecord]) -> AxResult<Self> {
+        let mut by_id = HashMap::new();
+        by_id
+            .try_reserve(records.len())
+            .map_err(|_| AxError::NoMemory)?;
+        let mut children = HashMap::new();
+        children
+            .try_reserve(records.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for (index, record) in records.iter().enumerate() {
+            if by_id.insert(record.mount_id, index).is_some() {
+                return Err(AxError::Io);
+            }
+            let child_ids = children.entry(record.parent_id).or_insert_with(Vec::new);
+            child_ids.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            child_ids.push(record.mount_id);
+        }
+        Ok(Self {
+            records,
+            by_id,
+            children,
+        })
+    }
+
+    fn record(&self, mount_id: u64) -> AxResult<&'a MountRecord> {
+        self.by_id
+            .get(&mount_id)
+            .map(|index| &self.records[*index])
+            .ok_or(AxError::Io)
+    }
+
+    fn subtree_ids(&self, root_mount_id: u64) -> AxResult<HashSet<u64>> {
+        self.record(root_mount_id)?;
+        let mut ids = HashSet::new();
+        ids.try_reserve(self.records.len())
+            .map_err(|_| AxError::NoMemory)?;
+        let mut pending = Vec::new();
+        pending
+            .try_reserve(self.records.len())
+            .map_err(|_| AxError::NoMemory)?;
+        pending.push(root_mount_id);
+        while let Some(mount_id) = pending.pop() {
+            if !ids.insert(mount_id) {
+                return Err(AxError::Io);
+            }
+            if let Some(children) = self.children.get(&mount_id) {
+                pending.extend(children.iter().copied());
+            }
+        }
+        Ok(ids)
+    }
+}
+
+static MOUNT_RECORDS: BlockingMutex<Vec<MountRecord>> = BlockingMutex::new(Vec::new());
+/// Linux defaults `/proc/sys/fs/mount-max` to 100,000 mounts per namespace.
+/// TheKernel currently has one global namespace, so use the same hard ceiling
+/// until mount namespace accounting is extracted into the ABI layer.
+const MAX_MOUNT_RECORDS: usize = 100_000;
+static LINUX_DEVICE_IDS: Lazy<BlockingMutex<HashMap<u64, (DeviceId, WeakFilesystemIdentity)>>> =
+    Lazy::new(|| BlockingMutex::new(HashMap::new()));
+static MOUNT_NAMESPACE_OPERATION: BlockingMutex<()> = BlockingMutex::new(());
+
+struct LinuxMountState {
+    flags: AtomicU32,
+    activity_epoch: AtomicU64,
+    readonly_floor: bool,
+    metadata: Mutex<MountMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpireProbe {
+    Retry,
+    Ready,
+}
+
+/// Serializes Linux mount-namespace mutations and constrained pathname walks.
+pub fn namespace_operation() -> BlockingMutexGuard<'static, ()> {
+    MOUNT_NAMESPACE_OPERATION.lock()
+}
 
 pub const ROOT_BLOCK_SOURCE: &str = "/dev/vda";
 pub const ROOT_BLOCK_DEVICE_ID: DeviceId = DeviceId::new(8, 0);
@@ -39,9 +144,6 @@ const MS_MANDLOCK: u32 = 0x40;
 const MS_NOSYMFOLLOW: u32 = 0x100;
 const MS_NOATIME: u32 = 0x400;
 const MS_NODIRATIME: u32 = 0x800;
-const MS_BIND: u32 = 0x1000;
-const MS_REC: u32 = 0x4000;
-const MS_RELATIME: u32 = 0x20_0000;
 const MS_STRICTATIME: u32 = 0x100_0000;
 const MS_UNBINDABLE: u32 = 1 << 17;
 const MS_PRIVATE: u32 = 1 << 18;
@@ -50,18 +152,246 @@ const MS_SHARED: u32 = 1 << 20;
 const ST_RELATIME: u32 = 0x1000;
 const ST_NOSYMFOLLOW: u32 = 0x2000;
 const RELATIME_MAX_AGE_SECS: u64 = 24 * 60 * 60;
-const PROPAGATION_FLAGS: u32 = MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED;
 
-pub fn snapshot() -> Vec<MountRecord> {
-    MOUNT_RECORDS.lock().clone()
+impl MountMetadata {
+    pub fn new(source: String, fs_type: String, root: String, data: String) -> Self {
+        Self {
+            source,
+            fs_type,
+            root,
+            data,
+        }
+    }
+
+    pub fn try_from_strs(source: &str, fs_type: &str, root: &str, data: &str) -> AxResult<Self> {
+        Ok(Self {
+            source: try_string(source)?,
+            fs_type: try_string(fs_type)?,
+            root: try_string(root)?,
+            data: try_string(data)?,
+        })
+    }
+
+    fn try_clone(&self) -> AxResult<Self> {
+        Self::try_from_strs(&self.source, &self.fs_type, &self.root, &self.data)
+    }
 }
 
-pub fn register_linux_device(vfs_device: u64, linux_device: DeviceId, lifetime: Weak<()>) {
-    if vfs_device != 0 {
-        LINUX_DEVICE_IDS
-            .lock()
-            .insert(vfs_device, (linux_device, lifetime));
+impl MountRecord {
+    fn try_clone(&self) -> AxResult<Self> {
+        Ok(Self {
+            mount_id: self.mount_id,
+            parent_id: self.parent_id,
+            root: try_string(&self.root)?,
+            source: try_string(&self.source)?,
+            target: try_string(&self.target)?,
+            fs_type: try_string(&self.fs_type)?,
+            data: try_string(&self.data)?,
+            dev: self.dev,
+            flags: self.flags,
+            expire_epoch: self.expire_epoch,
+            mountpoint: self.mountpoint.clone(),
+        })
     }
+}
+
+fn try_string(value: &str) -> AxResult<String> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| AxError::NoMemory)?;
+    owned.push_str(value);
+    Ok(owned)
+}
+
+pub fn snapshot() -> AxResult<Vec<MountRecord>> {
+    let records = MOUNT_RECORDS.lock();
+    for record in records.iter() {
+        validate_record_state(record)?;
+    }
+    let mut snapshot = Vec::new();
+    snapshot
+        .try_reserve(records.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for record in records.iter() {
+        snapshot.push(record.try_clone()?);
+    }
+    Ok(snapshot)
+}
+
+fn mount_extensions(flags: u32, metadata: MountMetadata) -> VfsResult<TypeMap> {
+    let mut extensions = TypeMap::new();
+    let retired = extensions.try_insert(LinuxMountState {
+        flags: AtomicU32::new(flags),
+        activity_epoch: AtomicU64::new(0),
+        readonly_floor: flags & MS_RDONLY != 0,
+        metadata: Mutex::new(metadata),
+    })?;
+    drop(retired);
+    Ok(extensions)
+}
+
+pub fn initialize_root_mount(
+    mountpoint: &Arc<Mountpoint>,
+    flags: u32,
+    metadata: MountMetadata,
+) -> VfsResult<()> {
+    let dev = linux_device_id(mountpoint.device()).0;
+    let record_metadata = metadata.try_clone()?;
+    let target = try_string("/")?;
+    let extensions = mount_extensions(flags, metadata)?;
+    let mut records = MOUNT_RECORDS.lock();
+    if records
+        .iter()
+        .any(|record| record.mount_id == mountpoint.mount_id())
+    {
+        return Err(AxError::AlreadyExists);
+    }
+    if records.len() >= MAX_MOUNT_RECORDS {
+        return Err(AxError::StorageFull);
+    }
+    records.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+    mountpoint.initialize_extensions(extensions)?;
+    records.push(MountRecord {
+        mount_id: mountpoint.mount_id(),
+        parent_id: 0,
+        root: record_metadata.root,
+        source: record_metadata.source,
+        target,
+        fs_type: record_metadata.fs_type,
+        data: record_metadata.data,
+        dev,
+        flags,
+        expire_epoch: None,
+        mountpoint: Arc::downgrade(mountpoint),
+    });
+    Ok(())
+}
+
+pub fn mount_with_flags(
+    target: &Location,
+    filesystem: &Filesystem,
+    flags: u32,
+    metadata: MountMetadata,
+) -> VfsResult<Arc<Mountpoint>> {
+    target.mount_with_extensions(filesystem, mount_extensions(flags, metadata)?)
+}
+
+pub fn new_detached_with_flags(
+    filesystem: &Filesystem,
+    flags: u32,
+    metadata: MountMetadata,
+) -> VfsResult<Arc<Mountpoint>> {
+    Mountpoint::new_detached_with_extensions(filesystem, mount_extensions(flags, metadata)?)
+}
+
+fn mount_state(mountpoint: &Mountpoint) -> AxResult<Arc<LinuxMountState>> {
+    mountpoint
+        .extension_shared::<LinuxMountState>()
+        .ok_or(AxError::Io)
+}
+
+fn flags_for_mountpoint(mountpoint: &Mountpoint) -> Option<u32> {
+    mountpoint
+        .extension::<LinuxMountState>()
+        .map(|state| state.flags.load(Ordering::Acquire))
+}
+
+fn activity_epoch(mountpoint: &Mountpoint) -> AxResult<u64> {
+    mountpoint
+        .extension::<LinuxMountState>()
+        .map(|state| state.activity_epoch.load(Ordering::Relaxed))
+        .ok_or(AxError::Io)
+}
+
+pub fn note_mount_access(loc: &Location) {
+    if let Some(state) = loc.mountpoint().extension::<LinuxMountState>() {
+        state.activity_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn flags_for_location(loc: &Location) -> AxResult<u32> {
+    flags_for_mountpoint(loc.mountpoint()).ok_or(AxError::Io)
+}
+
+pub fn metadata_for_location(loc: &Location) -> AxResult<MountMetadata> {
+    let state = mount_state(loc.mountpoint())?;
+    state.metadata.lock().try_clone()
+}
+
+fn joined_mount_root(base: &str, path_in_mount: &str) -> AxResult<String> {
+    if !base.starts_with('/') || !path_in_mount.starts_with('/') {
+        return Err(AxError::Io);
+    }
+    if path_in_mount == "/" {
+        return try_string(base);
+    }
+    if base == "/" {
+        return try_string(path_in_mount);
+    }
+    let mut joined = String::new();
+    joined
+        .try_reserve(base.len().saturating_add(path_in_mount.len()))
+        .map_err(|_| AxError::NoMemory)?;
+    joined.push_str(base.trim_end_matches('/'));
+    joined.push_str(path_in_mount);
+    Ok(joined)
+}
+
+pub fn clone_metadata_for_bind(loc: &Location) -> AxResult<MountMetadata> {
+    let mut metadata = metadata_for_location(loc)?;
+    let path_in_mount = loc.path_in_mount().map_err(|_| AxError::Io)?;
+    metadata.root = joined_mount_root(&metadata.root, path_in_mount.as_ref())?;
+    Ok(metadata)
+}
+
+pub fn update_detached_mount_flags(
+    root: &Arc<Mountpoint>,
+    recursive: bool,
+    mut update: impl FnMut(u32) -> AxResult<u32>,
+) -> AxResult<()> {
+    let mountpoints = if recursive {
+        root.subtree_mountpoints()?
+    } else {
+        let mut mountpoints = Vec::new();
+        mountpoints.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        mountpoints.push(root.clone());
+        mountpoints
+    };
+    let mut updates = Vec::new();
+    updates
+        .try_reserve(mountpoints.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for mountpoint in mountpoints {
+        let state = mountpoint
+            .extension_shared::<LinuxMountState>()
+            .ok_or(AxError::Io)?;
+        let next = update(state.flags.load(Ordering::Acquire))?;
+        if state.readonly_floor && next & MS_RDONLY == 0 {
+            return Err(AxError::OperationNotSupported);
+        }
+        updates.push((state, next));
+    }
+    for (state, flags) in updates {
+        state.flags.store(flags, Ordering::Release);
+    }
+    Ok(())
+}
+
+pub fn register_linux_device(identity: FilesystemIdentity, linux_device: DeviceId) -> AxResult<()> {
+    let vfs_device = identity.device();
+    if vfs_device == 0 {
+        return Ok(());
+    }
+    let mut devices = LINUX_DEVICE_IDS.lock();
+    devices.retain(|_, (_, identity)| identity.upgrade().is_some());
+    if let Some(entry) = devices.get_mut(&vfs_device) {
+        *entry = (linux_device, identity.downgrade());
+        return Ok(());
+    }
+    devices.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+    devices.insert(vfs_device, (linux_device, identity.downgrade()));
+    Ok(())
 }
 
 pub fn linux_device_id(vfs_device: u64) -> DeviceId {
@@ -70,7 +400,7 @@ pub fn linux_device_id(vfs_device: u64) -> DeviceId {
     }
 
     let mut devices = LINUX_DEVICE_IDS.lock();
-    devices.retain(|_, (_, lifetime)| lifetime.strong_count() != 0);
+    devices.retain(|_, (_, identity)| identity.upgrade().is_some());
     if let Some((device, _)) = devices.get(&vfs_device) {
         return *device;
     }
@@ -85,141 +415,431 @@ pub fn extra_block_device_id(index: usize) -> Option<DeviceId> {
     Some(DeviceId::new(8, u32::try_from(minor).ok()?))
 }
 
-pub fn record(
-    source: String,
-    target: String,
-    fs_type: String,
-    root: String,
-    vfs_device: u64,
-    mount_id: u64,
-    parent_id: u64,
-    flags: u32,
-) {
-    record_with_data(
-        source,
-        target,
-        fs_type,
-        root,
-        vfs_device,
-        mount_id,
-        parent_id,
-        flags,
-        String::new(),
-    );
-}
+pub fn attach_tree_and_record(root: &Arc<Mountpoint>, target: &Location) -> VfsResult<()> {
+    if root.is_attached() {
+        return Err(AxError::ResourceBusy);
+    }
+    let target_path = target.absolute_path().map_err(|_| AxError::Io)?;
+    let mountpoints = root.subtree_mountpoints()?;
+    let mut pending_ids = HashSet::new();
+    pending_ids
+        .try_reserve(mountpoints.len())
+        .map_err(|_| AxError::NoMemory)?;
+    let mut committed = Vec::new();
+    committed
+        .try_reserve(mountpoints.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for mountpoint in mountpoints {
+        if !pending_ids.insert(mountpoint.mount_id()) {
+            return Err(AxError::Io);
+        }
+        let state = mount_state(&mountpoint)?;
+        let flags = state.flags.load(Ordering::Acquire);
+        let metadata = state.metadata.lock().try_clone()?;
+        let (parent_id, mount_target) = if Arc::ptr_eq(&mountpoint, root) {
+            (
+                target.mountpoint().mount_id(),
+                try_string(target_path.as_ref())?,
+            )
+        } else {
+            let attachment = mountpoint.location().ok_or(AxError::Io)?;
+            let relative = mountpoint
+                .root_location()
+                .absolute_path()
+                .map_err(|_| AxError::Io)?;
+            (
+                attachment.mountpoint().mount_id(),
+                joined_path(target_path.as_ref(), relative.as_ref())?,
+            )
+        };
+        committed.push(MountRecord {
+            mount_id: mountpoint.mount_id(),
+            parent_id,
+            root: metadata.root,
+            source: metadata.source,
+            target: mount_target,
+            fs_type: metadata.fs_type,
+            data: metadata.data,
+            dev: linux_device_id(mountpoint.device()).0,
+            flags,
+            expire_epoch: None,
+            mountpoint: Arc::downgrade(&mountpoint),
+        });
+    }
 
-pub fn record_with_data(
-    source: String,
-    target: String,
-    fs_type: String,
-    root: String,
-    vfs_device: u64,
-    mount_id: u64,
-    parent_id: u64,
-    flags: u32,
-    data: String,
-) {
     let mut records = MOUNT_RECORDS.lock();
-    records.push(MountRecord {
-        mount_id,
-        parent_id,
-        root,
-        source,
-        target,
-        fs_type,
-        data,
-        dev: linux_device_id(vfs_device).0,
-        flags,
-        expire_marked: false,
-    });
-}
-
-pub fn has_record(target: &str) -> bool {
-    MOUNT_RECORDS
-        .lock()
+    let record_index = MountRecordIndex::new(&records)?;
+    validate_registered_mount_chain(&record_index, target.mountpoint())?;
+    if records
         .iter()
-        .any(|record| record.target == target)
-}
-
-pub fn records_under(path: &str) -> Vec<MountRecord> {
-    let records = MOUNT_RECORDS.lock();
+        .any(|record| pending_ids.contains(&record.mount_id))
+    {
+        return Err(axfs_ng_vfs::VfsError::AlreadyExists);
+    }
+    if records
+        .len()
+        .checked_add(committed.len())
+        .is_none_or(|total| total > MAX_MOUNT_RECORDS)
+    {
+        return Err(axfs_ng_vfs::VfsError::StorageFull);
+    }
     records
+        .try_reserve(committed.len())
+        .map_err(|_| axfs_ng_vfs::VfsError::NoMemory)?;
+    root.attach_to(target)?;
+    records.extend(committed);
+    Ok(())
+}
+
+fn validate_record_state(record: &MountRecord) -> AxResult<Arc<Mountpoint>> {
+    let mountpoint = record.mountpoint.upgrade().ok_or(AxError::Io)?;
+    if mountpoint.mount_id() != record.mount_id {
+        return Err(AxError::Io);
+    }
+    let state = mount_state(&mountpoint)?;
+    if state.flags.load(Ordering::Acquire) != record.flags {
+        return Err(AxError::Io);
+    }
+    let metadata = state.metadata.lock();
+    if metadata.source != record.source
+        || metadata.fs_type != record.fs_type
+        || metadata.root != record.root
+        || metadata.data != record.data
+    {
+        return Err(AxError::Io);
+    }
+    drop(metadata);
+    Ok(mountpoint)
+}
+
+fn validate_registered_mount(
+    index: &MountRecordIndex<'_>,
+    mount_id: u64,
+) -> AxResult<Arc<Mountpoint>> {
+    validate_record_state(index.record(mount_id)?)
+}
+
+fn validate_mount_attachment(
+    index: &MountRecordIndex<'_>,
+    mountpoint: &Arc<Mountpoint>,
+) -> AxResult<Option<Arc<Mountpoint>>> {
+    let record = index.record(mountpoint.mount_id())?;
+    let registered = validate_registered_mount(index, mountpoint.mount_id())?;
+    if !Arc::ptr_eq(&registered, mountpoint) {
+        return Err(AxError::Io);
+    }
+    if mountpoint.is_root() {
+        if record.parent_id != 0 || record.target != "/" {
+            return Err(AxError::Io);
+        }
+        return Ok(None);
+    }
+
+    let attachment = mountpoint.location().ok_or(AxError::Io)?;
+    if attachment.mountpoint().mount_id() != record.parent_id {
+        return Err(AxError::Io);
+    }
+    let parent = validate_registered_mount(index, record.parent_id)?;
+    if !Arc::ptr_eq(&parent, attachment.mountpoint()) {
+        return Err(AxError::Io);
+    }
+    let actual_target = mountpoint
+        .root_location()
+        .absolute_path()
+        .map_err(|_| AxError::Io)?;
+    if actual_target.as_ref() != record.target {
+        return Err(AxError::Io);
+    }
+    Ok(Some(parent))
+}
+
+fn validate_registered_mount_chain(
+    index: &MountRecordIndex<'_>,
+    mountpoint: &Arc<Mountpoint>,
+) -> AxResult<()> {
+    let mut current = mountpoint.clone();
+    for _ in 0..=index.records.len() {
+        let Some(parent) = validate_mount_attachment(index, &current)? else {
+            return Ok(());
+        };
+        current = parent;
+    }
+    Err(AxError::Io)
+}
+
+fn validate_registered_subtree(
+    index: &MountRecordIndex<'_>,
+    root: &Arc<Mountpoint>,
+) -> AxResult<HashSet<u64>> {
+    let root_id = root.mount_id();
+    validate_registered_mount_chain(index, root)?;
+    let ledger_ids = index.subtree_ids(root_id)?;
+    let mountpoints = root.subtree_mountpoints()?;
+    let mut topology_ids = HashSet::new();
+    topology_ids
+        .try_reserve(mountpoints.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for mountpoint in mountpoints {
+        if !topology_ids.insert(mountpoint.mount_id()) {
+            return Err(AxError::Io);
+        }
+    }
+    if topology_ids != ledger_ids {
+        return Err(AxError::Io);
+    }
+
+    let mut seen_records = HashSet::new();
+    seen_records
+        .try_reserve(ledger_ids.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for record in index
+        .records
         .iter()
-        .filter(|record| record.target != path && contains_path(path, &record.target))
-        .cloned()
-        .collect()
+        .filter(|record| ledger_ids.contains(&record.mount_id))
+    {
+        if !seen_records.insert(record.mount_id) {
+            return Err(AxError::Io);
+        }
+        let mountpoint = validate_record_state(record)?;
+        validate_mount_attachment(index, &mountpoint)?;
+    }
+    if seen_records != ledger_ids {
+        return Err(AxError::Io);
+    }
+    Ok(ledger_ids)
+}
+
+pub fn recursive_bind_submounts(source: &Location) -> AxResult<Vec<BindSubmount>> {
+    let source_mount_id = source.mountpoint().mount_id();
+    let source_path = source.absolute_path().map_err(|_| AxError::Io)?;
+    let records = MOUNT_RECORDS.lock();
+    let record_index = MountRecordIndex::new(&records)?;
+    validate_registered_subtree(&record_index, source.mountpoint())?;
+    let mut admitted = HashMap::new();
+    admitted
+        .try_reserve(records.len())
+        .map_err(|_| AxError::NoMemory)?;
+    let mut visited = HashSet::new();
+    visited
+        .try_reserve(records.len())
+        .map_err(|_| AxError::NoMemory)?;
+    let mut selected = Vec::new();
+    selected
+        .try_reserve(records.len())
+        .map_err(|_| AxError::NoMemory)?;
+    admitted.insert(source_mount_id, 0usize);
+
+    loop {
+        let old_visited = visited.len();
+        for record in records.iter() {
+            if record.mount_id == source_mount_id || visited.contains(&record.mount_id) {
+                continue;
+            }
+            let direct_child = record.parent_id == source_mount_id;
+            let Some(parent_depth) = admitted.get(&record.parent_id).copied() else {
+                continue;
+            };
+
+            let mountpoint = record.mountpoint.upgrade().ok_or(AxError::Io)?;
+            let attachment = mountpoint.location().ok_or(AxError::Io)?;
+            if attachment.mountpoint().mount_id() != record.parent_id {
+                return Err(AxError::Io);
+            }
+            if direct_child && !source.entry().is_ancestor_of(attachment.entry())? {
+                visited.insert(record.mount_id);
+                continue;
+            }
+
+            visited.insert(record.mount_id);
+            if record.flags & MS_UNBINDABLE != 0 {
+                continue;
+            }
+            let depth = parent_depth.checked_add(1).ok_or(AxError::Io)?;
+            admitted.insert(record.mount_id, depth);
+            let root_location = mountpoint.root_location();
+            let absolute = root_location.absolute_path().map_err(|_| AxError::Io)?;
+            let relative_path = path_suffix(source_path.as_ref(), absolute.as_ref())
+                .ok_or(AxError::Io)
+                .and_then(try_string)?;
+            selected.push((
+                depth,
+                BindSubmount {
+                    source: root_location,
+                    relative_path,
+                    metadata: MountMetadata::try_from_strs(
+                        &record.source,
+                        &record.fs_type,
+                        &record.root,
+                        &record.data,
+                    )?,
+                    flags: record.flags,
+                },
+            ));
+        }
+        if visited.len() == old_visited {
+            break;
+        }
+    }
+
+    selected.sort_by_key(|(depth, _)| *depth);
+    let mut mounts = Vec::new();
+    mounts
+        .try_reserve_exact(selected.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for (_, mount) in selected {
+        mounts.push(mount);
+    }
+    Ok(mounts)
 }
 
 pub fn remount_with_data(
+    target: &Location,
     source: String,
-    target: String,
     fs_type: String,
     flags: u32,
     data: String,
-) -> bool {
+) -> AxResult<()> {
     let mut records = MOUNT_RECORDS.lock();
-    if let Some(record) = records
-        .iter_mut()
-        .rev()
-        .find(|record| record.target == target)
+    let record_index = MountRecordIndex::new(&records)?;
+    validate_registered_mount_chain(&record_index, target.mountpoint())?;
+    let index = *record_index
+        .by_id
+        .get(&target.mountpoint().mount_id())
+        .ok_or(AxError::Io)?;
+    let mountpoint = validate_record_state(&records[index])?;
+    let state = mount_state(&mountpoint)?;
+    let record = &mut records[index];
+    if (!source.is_empty() && source != record.source)
+        || (!fs_type.is_empty() && fs_type != record.fs_type)
     {
-        if !source.is_empty() {
-            record.source = source;
-        }
-        if !fs_type.is_empty() {
-            record.fs_type = fs_type;
-        }
-        if !data.is_empty() {
-            record.data = data;
-        }
-        record.flags = flags;
-        record.expire_marked = false;
-        return true;
+        return Err(AxError::InvalidInput);
     }
-    false
-}
-
-pub fn update_flags_for_path(path: &str, flags: u32) -> bool {
-    let mut records = MOUNT_RECORDS.lock();
-    let Some((_, record)) = records
-        .iter_mut()
-        .enumerate()
-        .filter(|(_, record)| contains_path(&record.target, path))
-        .max_by_key(|(index, record)| (record.target.len(), *index))
-    else {
-        return false;
-    };
+    if !data.is_empty() {
+        return Err(AxError::OperationNotSupported);
+    }
+    if state.readonly_floor && flags & MS_RDONLY == 0 {
+        return Err(AxError::OperationNotSupported);
+    }
+    state.flags.store(flags, Ordering::Release);
     record.flags = flags;
-    record.expire_marked = false;
-    true
+    record.expire_epoch = None;
+    Ok(())
 }
 
-pub fn change_propagation(target: &str, flags: u32, recursive: bool) {
-    let propagation = flags & PROPAGATION_FLAGS;
-    if propagation == 0 {
-        return;
-    }
-
+pub fn try_update_flags_for_mounts(
+    root_mount_id: u64,
+    recursive: bool,
+    mut update: impl FnMut(u32) -> AxResult<u32>,
+) -> AxResult<bool> {
     let mut records = MOUNT_RECORDS.lock();
-    for record in records.iter_mut() {
-        if record.target == target || (recursive && contains_path(target, &record.target)) {
-            record.flags = (record.flags & !PROPAGATION_FLAGS) | propagation | (flags & MS_REC);
-            record.expire_marked = false;
+    let Some(updates) = prepare_mount_flag_updates(
+        &records,
+        root_mount_id,
+        recursive,
+        |record| {
+            let mountpoint = validate_record_state(record)?;
+            let state = mount_state(&mountpoint)?;
+            let current = state.flags.load(Ordering::Acquire);
+            Ok((state, current))
+        },
+        &mut update,
+    )?
+    else {
+        return Ok(false);
+    };
+
+    for (_, state, flags) in &updates {
+        if state.readonly_floor && *flags & MS_RDONLY == 0 {
+            return Err(AxError::OperationNotSupported);
         }
     }
+    for (index, state, flags) in updates {
+        state.flags.store(flags, Ordering::Release);
+        records[index].flags = flags;
+        records[index].expire_epoch = None;
+    }
+    Ok(true)
 }
 
-pub fn move_tree(root_mount_id: u64, old_target: &str, new_target: &str, new_parent_id: u64) {
+fn prepare_mount_flag_updates<S>(
+    records: &[MountRecord],
+    root_mount_id: u64,
+    recursive: bool,
+    mut current: impl FnMut(&MountRecord) -> AxResult<(S, u32)>,
+    mut update: impl FnMut(u32) -> AxResult<u32>,
+) -> AxResult<Option<Vec<(usize, S, u32)>>> {
+    if !records
+        .iter()
+        .any(|record| record.mount_id == root_mount_id)
+    {
+        return Ok(None);
+    }
+
+    let subtree = if recursive {
+        Some(subtree_mount_ids(records, root_mount_id)?)
+    } else {
+        None
+    };
+    let mut updates = Vec::new();
+    updates
+        .try_reserve(if recursive { records.len() } else { 1 })
+        .map_err(|_| AxError::NoMemory)?;
+    for (index, record) in records.iter().enumerate() {
+        let selected = record.mount_id == root_mount_id
+            || subtree
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&record.mount_id));
+        if selected {
+            let (state, flags) = current(record)?;
+            updates.push((index, state, update(flags)?));
+        }
+    }
+    Ok(Some(updates))
+}
+
+pub fn move_tree_and_records(old: &Location, target: &Location) -> AxResult<()> {
+    let root = old.mountpoint().clone();
+    let root_mount_id = root.mount_id();
+    let old_target = old.absolute_path().map_err(|_| AxError::Io)?;
+    let new_target = target.absolute_path().map_err(|_| AxError::Io)?;
+    let new_parent_id = target.mountpoint().mount_id();
+
     let mut records = MOUNT_RECORDS.lock();
-    move_tree_records(
-        &mut records,
-        root_mount_id,
-        old_target,
-        new_target,
-        new_parent_id,
-    );
+    let record_index = MountRecordIndex::new(&records)?;
+    validate_registered_mount_chain(&record_index, target.mountpoint())?;
+    let subtree = validate_registered_subtree(&record_index, &root)?;
+    let mut updates = Vec::new();
+    updates
+        .try_reserve(subtree.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for (index, record) in records.iter().enumerate() {
+        if !subtree.contains(&record.mount_id) {
+            continue;
+        }
+        let suffix = path_suffix(old_target.as_ref(), &record.target).ok_or(AxError::Io)?;
+        updates.push((
+            index,
+            joined_path(new_target.as_ref(), suffix)?,
+            record.mount_id == root_mount_id,
+        ));
+    }
+    if updates.len() != subtree.len() {
+        return Err(AxError::Io);
+    }
+
+    old.move_mount_to(target)?;
+    for (index, target, is_root) in updates {
+        let record = &mut records[index];
+        record.target = target;
+        record.expire_epoch = None;
+        if is_root {
+            record.parent_id = new_parent_id;
+        }
+    }
+    Ok(())
 }
 
+#[cfg(test)]
 fn move_tree_records(
     records: &mut [MountRecord],
     root_mount_id: u64,
@@ -227,15 +847,15 @@ fn move_tree_records(
     new_target: &str,
     new_parent_id: u64,
 ) {
-    let subtree = subtree_mount_ids(records, root_mount_id);
+    let subtree = subtree_mount_ids(records, root_mount_id).unwrap();
     for record in records.iter_mut() {
         if !subtree.contains(&record.mount_id) {
             continue;
         }
 
         if let Some(suffix) = path_suffix(old_target, &record.target) {
-            record.target = joined_path(new_target, suffix);
-            record.expire_marked = false;
+            record.target = joined_path(new_target, suffix).unwrap();
+            record.expire_epoch = None;
         }
         if record.mount_id == root_mount_id {
             record.parent_id = new_parent_id;
@@ -243,66 +863,85 @@ fn move_tree_records(
     }
 }
 
-fn subtree_mount_ids(records: &[MountRecord], root_mount_id: u64) -> BTreeSet<u64> {
-    let mut ids = BTreeSet::new();
-    ids.insert(root_mount_id);
+fn subtree_mount_ids(records: &[MountRecord], root_mount_id: u64) -> AxResult<HashSet<u64>> {
+    MountRecordIndex::new(records)?.subtree_ids(root_mount_id)
+}
 
-    loop {
-        let old_len = ids.len();
-        for record in records {
-            if ids.contains(&record.parent_id) {
-                ids.insert(record.mount_id);
+fn advance_expire_probe(
+    expire_epoch: &mut Option<u64>,
+    check_unmountable: impl FnOnce() -> AxResult<()>,
+    current_epoch: impl FnOnce() -> AxResult<u64>,
+) -> AxResult<ExpireProbe> {
+    check_unmountable()?;
+    let current_epoch = current_epoch()?;
+    if *expire_epoch == Some(current_epoch) {
+        Ok(ExpireProbe::Ready)
+    } else {
+        *expire_epoch = Some(current_epoch);
+        Ok(ExpireProbe::Retry)
+    }
+}
+
+pub fn unmount_and_remove_records(target: Location, lazy: bool, expire: bool) -> AxResult<()> {
+    let root = target.mountpoint().clone();
+    let root_mount_id = root.mount_id();
+
+    if lazy {
+        if expire {
+            return Err(AxError::InvalidInput);
+        }
+        let mut records = MOUNT_RECORDS.lock();
+        let record_index = MountRecordIndex::new(&records)?;
+        let ids = validate_registered_subtree(&record_index, &root)?;
+        target.lazy_unmount()?;
+        records.retain(|record| !ids.contains(&record.mount_id));
+        return Ok(());
+    }
+
+    let ids = {
+        let mut records = MOUNT_RECORDS.lock();
+        let record_index = MountRecordIndex::new(&records)?;
+        let ids = validate_registered_subtree(&record_index, &root)?;
+        if expire {
+            let record = records
+                .iter_mut()
+                .find(|record| record.mount_id == root_mount_id)
+                .ok_or(AxError::Io)?;
+            if advance_expire_probe(
+                &mut record.expire_epoch,
+                || target.check_unmountable(),
+                || activity_epoch(&root),
+            )? == ExpireProbe::Retry
+            {
+                return Err(AxError::WouldBlock);
             }
-        }
-        if ids.len() == old_len {
-            return ids;
-        }
-    }
-}
-
-pub fn remove_subtree(root_mount_id: u64) -> Vec<MountRecord> {
-    let mut records = MOUNT_RECORDS.lock();
-    let ids = subtree_mount_ids(&records, root_mount_id);
-    let mut removed = Vec::new();
-    let mut index = 0;
-    while index < records.len() {
-        if ids.contains(&records[index].mount_id) {
-            removed.push(records.remove(index));
         } else {
-            index += 1;
+            target.check_unmountable()?;
         }
-    }
-    removed
-}
-
-pub fn mark_expiry(target: &str) -> bool {
-    let mut records = MOUNT_RECORDS.lock();
-    let Some(record) = records
-        .iter_mut()
-        .rev()
-        .find(|record| record.target == target)
-    else {
-        return false;
+        ids
     };
-    let was_marked = record.expire_marked;
-    record.expire_marked = true;
-    was_marked
-}
 
-pub fn clear_expiry_for_path(path: &str) {
-    for record in MOUNT_RECORDS.lock().iter_mut() {
-        if contains_path(&record.target, path) {
-            record.expire_marked = false;
+    let flushed = target.prepare_unmount()?.flush()?;
+    let mut records = MOUNT_RECORDS.lock();
+    if expire {
+        let record = records
+            .iter()
+            .position(|record| record.mount_id == root_mount_id)
+            .ok_or(AxError::Io)?;
+        if advance_expire_probe(
+            &mut records[record].expire_epoch,
+            || Ok(()),
+            || activity_epoch(&root),
+        )? == ExpireProbe::Retry
+        {
+            drop(records);
+            drop(flushed);
+            return Err(AxError::WouldBlock);
         }
     }
-}
-
-fn contains_path(record_target: &str, path: &str) -> bool {
-    record_target == "/"
-        || path == record_target
-        || path
-            .strip_prefix(record_target)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+    flushed.commit()?;
+    records.retain(|record| !ids.contains(&record.mount_id));
+    Ok(())
 }
 
 fn path_suffix<'a>(base: &str, path: &'a str) -> Option<&'a str> {
@@ -316,110 +955,62 @@ fn path_suffix<'a>(base: &str, path: &'a str) -> Option<&'a str> {
     }
 }
 
-fn joined_path(base: &str, suffix: &str) -> String {
-    if suffix.is_empty() {
-        base.to_string()
-    } else if base == "/" {
-        suffix.to_string()
-    } else {
-        alloc::format!("{base}{suffix}")
+fn joined_path(base: &str, suffix: &str) -> AxResult<String> {
+    if suffix.is_empty() || suffix == "/" {
+        return try_string(base);
     }
-}
-
-pub fn shared_aliases_for(path: &str) -> Vec<String> {
-    let records = snapshot();
-    let mut seen = BTreeSet::new();
-    let mut queue = Vec::new();
-
-    seen.insert(path.to_string());
-    queue.push(path.to_string());
-
-    let mut index = 0;
-    while index < queue.len() {
-        let current = queue[index].clone();
-        index += 1;
-
-        for record in &records {
-            if record.flags & MS_BIND == 0
-                || record.flags & MS_SHARED == 0
-                || record.flags & MS_UNBINDABLE != 0
-            {
-                continue;
-            }
-            if let Some(suffix) = path_suffix(&record.source, &current) {
-                let alias = joined_path(&record.target, suffix);
-                if seen.insert(alias.clone()) {
-                    queue.push(alias);
-                }
-            }
-            if let Some(suffix) = path_suffix(&record.target, &current) {
-                let alias = joined_path(&record.source, suffix);
-                if seen.insert(alias.clone()) {
-                    queue.push(alias);
-                }
-            }
-        }
+    if base == "/" {
+        return try_string(suffix);
     }
-
-    seen.into_iter().filter(|alias| alias != path).collect()
+    let mut joined = String::new();
+    joined
+        .try_reserve(base.len().saturating_add(suffix.len()))
+        .map_err(|_| AxError::NoMemory)?;
+    joined.push_str(base);
+    joined.push_str(suffix);
+    Ok(joined)
 }
 
-pub fn effective_flags(path: &str) -> u32 {
-    let records = MOUNT_RECORDS.lock();
-    records
-        .iter()
-        .enumerate()
-        .filter(|(_, record)| contains_path(&record.target, path))
-        .max_by_key(|(index, record)| (record.target.len(), *index))
-        .map(|(_, record)| record)
-        .map_or(0, |record| record.flags)
+pub fn is_readonly(loc: &Location) -> AxResult<bool> {
+    Ok(flags_for_location(loc)? & MS_RDONLY != 0)
 }
 
-pub fn is_readonly(path: &str) -> bool {
-    effective_flags(path) & MS_RDONLY != 0
+pub fn is_nodev(loc: &Location) -> AxResult<bool> {
+    Ok(flags_for_location(loc)? & MS_NODEV != 0)
 }
 
-pub fn is_nodev(path: &str) -> bool {
-    effective_flags(path) & MS_NODEV != 0
+pub fn is_noexec(loc: &Location) -> AxResult<bool> {
+    Ok(flags_for_location(loc)? & MS_NOEXEC != 0)
 }
 
-pub fn is_noexec(path: &str) -> bool {
-    effective_flags(path) & MS_NOEXEC != 0
-}
-
-pub fn has_mandatory_locking(path: &str) -> bool {
-    effective_flags(path) & MS_MANDLOCK != 0
+pub fn has_mandatory_locking(loc: &Location) -> AxResult<bool> {
+    Ok(flags_for_location(loc)? & MS_MANDLOCK != 0)
 }
 
 pub fn should_follow_symlink(loc: &Location) -> bool {
-    let Ok(path) = loc.absolute_path() else {
-        return true;
-    };
-    effective_flags(path.as_ref()) & MS_NOSYMFOLLOW == 0
+    flags_for_mountpoint(loc.mountpoint()).is_some_and(|flags| flags & MS_NOSYMFOLLOW == 0)
+}
+
+fn uses_relatime(flags: u32) -> bool {
+    flags & (MS_NOATIME | MS_STRICTATIME) == 0
 }
 
 pub fn should_update_atime(loc: &Location) -> bool {
-    let Ok(path) = loc.absolute_path() else {
-        return true;
+    let Some(flags) = flags_for_mountpoint(loc.mountpoint()) else {
+        return false;
     };
-    let flags = effective_flags(path.as_ref());
     if flags & MS_NOATIME != 0 {
         return false;
     }
 
     let metadata = match loc.metadata() {
         Ok(metadata) => metadata,
-        Err(_) => return true,
+        Err(_) => return false,
     };
     if flags & MS_NODIRATIME != 0 && metadata.node_type == NodeType::Directory {
         return false;
     }
     if flags & MS_STRICTATIME != 0 {
-        return true;
-    }
-
-    let relatime = flags & MS_RELATIME != 0 || flags == 0;
-    if !relatime {
         return true;
     }
 
@@ -432,12 +1023,6 @@ pub fn should_update_atime(loc: &Location) -> bool {
 pub fn mount_options(flags: u32) -> String {
     let mut options = Vec::new();
     options.push(if flags & MS_RDONLY != 0 { "ro" } else { "rw" });
-    if flags & MS_BIND != 0 {
-        options.push("bind");
-    }
-    if flags & MS_REC != 0 {
-        options.push("rbind");
-    }
     if flags & MS_NOSUID != 0 {
         options.push("nosuid");
     }
@@ -475,8 +1060,8 @@ pub fn mount_options(flags: u32) -> String {
     options.join(",")
 }
 
-pub fn statfs_mount_flags(path: &str, base_flags: u32) -> u32 {
-    let mount_flags = effective_flags(path);
+pub fn statfs_mount_flags(loc: &Location, base_flags: u32) -> AxResult<u32> {
+    let mount_flags = flags_for_location(loc)?;
     let mut result = base_flags;
     result |= mount_flags
         & (MS_RDONLY
@@ -487,13 +1072,13 @@ pub fn statfs_mount_flags(path: &str, base_flags: u32) -> u32 {
             | MS_MANDLOCK
             | MS_NOATIME
             | MS_NODIRATIME);
-    if mount_flags & MS_RELATIME != 0 {
+    if uses_relatime(mount_flags) {
         result |= ST_RELATIME;
     }
     if mount_flags & MS_NOSYMFOLLOW != 0 {
         result |= ST_NOSYMFOLLOW;
     }
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -511,8 +1096,73 @@ mod tests {
             data: String::new(),
             dev: mount_id,
             flags: 0,
-            expire_marked: false,
+            expire_epoch: None,
+            mountpoint: Weak::new(),
         }
+    }
+
+    #[test]
+    fn first_expire_probe_records_the_epoch_and_retries() {
+        let mut expire_epoch = None;
+
+        assert_eq!(
+            advance_expire_probe(&mut expire_epoch, || Ok(()), || Ok(7)).unwrap(),
+            ExpireProbe::Retry
+        );
+        assert_eq!(expire_epoch, Some(7));
+    }
+
+    #[test]
+    fn unchanged_second_expire_probe_is_ready_to_commit() {
+        let mut expire_epoch = Some(7);
+
+        assert_eq!(
+            advance_expire_probe(&mut expire_epoch, || Ok(()), || Ok(7)).unwrap(),
+            ExpireProbe::Ready
+        );
+        assert_eq!(expire_epoch, Some(7));
+    }
+
+    #[test]
+    fn changed_expire_epoch_rearms_the_probe() {
+        let mut expire_epoch = Some(7);
+
+        assert_eq!(
+            advance_expire_probe(&mut expire_epoch, || Ok(()), || Ok(8)).unwrap(),
+            ExpireProbe::Retry
+        );
+        assert_eq!(expire_epoch, Some(8));
+    }
+
+    #[test]
+    fn busy_first_expire_probe_does_not_record_an_epoch() {
+        let mut expire_epoch = None;
+        let epoch_loaded = core::cell::Cell::new(false);
+
+        assert_eq!(
+            advance_expire_probe(
+                &mut expire_epoch,
+                || Err(AxError::ResourceBusy),
+                || {
+                    epoch_loaded.set(true);
+                    Ok(7)
+                },
+            ),
+            Err(AxError::ResourceBusy)
+        );
+        assert_eq!(expire_epoch, None);
+        assert!(!epoch_loaded.get());
+    }
+
+    #[test]
+    fn activity_during_the_flush_window_rearms_the_probe() {
+        let mut expire_epoch = Some(7);
+
+        assert_eq!(
+            advance_expire_probe(&mut expire_epoch, || Ok(()), || Ok(9)).unwrap(),
+            ExpireProbe::Retry
+        );
+        assert_eq!(expire_epoch, Some(9));
     }
 
     #[test]
@@ -525,8 +1175,83 @@ mod tests {
             record(5, 1, "/other"),
         ];
 
-        let ids = subtree_mount_ids(&records, 3);
-        assert_eq!(ids.into_iter().collect::<Vec<_>>(), [3, 4]);
+        let ids = subtree_mount_ids(&records, 3).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&3));
+        assert!(ids.contains(&4));
+    }
+
+    #[test]
+    fn recursive_flag_update_uses_only_the_selected_mount_subtree() {
+        let mut records = [
+            record(1, 0, "/"),
+            record(2, 1, "/mnt"),
+            record(3, 2, "/mnt/branch/nested"),
+            record(4, 2, "/mnt/other"),
+            record(5, 1, "/mnt/branch/unrelated-topology"),
+        ];
+
+        let updates = prepare_mount_flag_updates(
+            &records,
+            2,
+            true,
+            |record| Ok(((), record.flags)),
+            |flags| Ok(flags | MS_RDONLY),
+        )
+        .unwrap()
+        .unwrap();
+        for (index, (), flags) in updates {
+            records[index].flags = flags;
+        }
+
+        assert_ne!(records[1].flags & MS_RDONLY, 0);
+        assert_ne!(records[2].flags & MS_RDONLY, 0);
+        assert_ne!(records[3].flags & MS_RDONLY, 0);
+        assert_eq!(records[4].flags & MS_RDONLY, 0);
+    }
+
+    #[test]
+    fn failed_flag_preflight_does_not_mutate_any_record() {
+        let records = [
+            record(1, 0, "/"),
+            record(2, 1, "/mnt"),
+            record(3, 2, "/mnt/sub"),
+        ];
+        let before = records
+            .iter()
+            .map(|record| record.flags)
+            .collect::<Vec<_>>();
+
+        let result = prepare_mount_flag_updates(
+            &records,
+            2,
+            true,
+            |record| {
+                if record.mount_id == 3 {
+                    Err(AxError::Io)
+                } else {
+                    Ok(((), 0))
+                }
+            },
+            |flags| Ok(flags | MS_RDONLY),
+        );
+
+        assert!(matches!(result, Err(AxError::Io)));
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.flags)
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn unrelated_mount_flags_preserve_default_relatime() {
+        assert!(uses_relatime(0));
+        assert!(uses_relatime(MS_NODEV | MS_NOEXEC));
+        assert!(!uses_relatime(MS_NOATIME));
+        assert!(!uses_relatime(MS_STRICTATIME));
     }
 
     #[test]

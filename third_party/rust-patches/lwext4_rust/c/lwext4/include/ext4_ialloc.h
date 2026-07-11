@@ -74,6 +74,12 @@ int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir);
  */
 int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *index, bool is_dir);
 
+/** Allocate an inode number and report whether allocation metadata may have
+ * changed before an error was returned. */
+int ext4_ialloc_alloc_inode_status(struct ext4_fs *fs, uint32_t *index,
+				   bool is_dir,
+				   bool *metadata_may_have_changed);
+
 #ifdef __cplusplus
 }
 #endif

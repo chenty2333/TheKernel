@@ -38,7 +38,7 @@ pub use self::{
     resources::*,
     signal::*,
     stat::*,
-    thread::{AsThread, AssumeSync, Thread},
+    thread::{AsThread, Thread},
     timer::*,
     user::*,
 };

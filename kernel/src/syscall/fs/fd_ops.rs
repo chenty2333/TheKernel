@@ -1,53 +1,44 @@
-use alloc::{
-    format,
-    string::{String, ToString},
-    sync::Arc,
-};
+use alloc::{string::ToString, sync::Arc};
 use core::{
     ffi::{c_char, c_int},
     mem::size_of,
-    ops::Deref,
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs::{FS_CONTEXT, FileBackend, FileFlags, FsContext, OpenOptions, OpenResult};
+use axfs::{
+    FS_CONTEXT, FileBackend, FileFlags, FsContext, OpenOptions, OpenResult, PathwalkPolicy,
+};
 use axfs_ng_vfs::{
-    DirEntry, FileNode, Location, MetadataUpdate, NodePermission, NodeType, Reference,
-    path::{Component, Path},
+    DirEntry, FileNode, Location, MetadataUpdate, NodePermission, NodeType, Reference, path::Path,
 };
 use axio::{Seek, SeekFrom};
 use axtask::current;
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
-use spin::RwLock;
 use starry_signal::Signo;
 
 use crate::{
     file::{
-        AsyncIoOwner, Directory, FD_TABLE, File, FileDescription, FileDescriptor, FileLike, Pipe,
-        add_file_like_with_flags_and_write_open_key, close_file_like, executable,
+        AsyncIoOwner, AsyncIoOwnerType, Directory, FD_TABLE, File, FileDescription, FileLike, Pipe,
+        ReservedFd, close_file_like, dnotify, executable,
         flock::{self, RecordLockOwner},
         get_file_description, get_file_like, get_typed_file,
         inotify::{
-            location_for_fd, notify_close, notify_exact, notify_parent, notify_parent_with_name,
-            remove_dnotify_watch, set_dnotify_watch,
+            WatchKey, notify_exact, notify_parent, notify_parent_with_name,
+            wait_current_close_notifications,
         },
-        install_tmpfile_state, lease, memfd,
+        lease, memfd,
         permission::{
-            DacFsContextExt, check_create_permissions, check_open_permissions,
-            check_pathwalk_search_permission, check_writable_mount,
+            check_create_permissions, check_open_permissions, check_pathwalk_search_permission,
+            check_writable_mount, initial_named_create_owner_mode,
         },
         pipe::NamedPipe,
-        release_posix_locks_on_close, resolve_at, with_path_fs,
+        prepare_file_description, replace_process_fd_table, reserve_fd, resolve_at, with_path_fs,
     },
     mm::{UserConstPtr, UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
     syscall::fs::ctl::validate_pathname,
-    task::{
-        AX_FILE_LIMIT, AsThread, DacCredentialView, get_process_data, get_process_group,
-        get_visible_task,
-    },
+    task::{AX_FILE_LIMIT, AsThread, DacCredentialView},
     time::wall_time,
 };
 
@@ -72,9 +63,9 @@ fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32))
         }
         if flags & O_CREAT != 0 {
             options.create(true);
-        }
-        if flags & O_EXCL != 0 {
-            options.create_new(true);
+            if flags & O_EXCL != 0 {
+                options.create_new(true);
+            }
         }
         if flags & O_DIRECT != 0 {
             options.direct(true);
@@ -117,22 +108,13 @@ fn validate_async_signal(sig: c_int) -> AxResult<u8> {
         .ok_or(AxError::InvalidInput)
 }
 
-fn sync_async_io_to_file(description: &FileDescription) {
+fn sync_async_io_to_file(description: &FileDescription, fd: c_int) {
     let enabled = description.status_flags() & FASYNC != 0;
     let state = description.async_io_state();
     if let Some(pipe) = description.inner.downcast_ref::<Pipe>() {
-        pipe.set_async_io(enabled, state);
+        pipe.set_async_io(enabled, state, fd);
     } else if let Some(pipe) = description.inner.downcast_ref::<NamedPipe>() {
-        pipe.set_async_io(enabled, state);
-    }
-}
-
-fn validate_async_owner(owner: AsyncIoOwner) -> AxResult<()> {
-    match owner {
-        AsyncIoOwner::Tid(0) | AsyncIoOwner::Pid(0) | AsyncIoOwner::Pgrp(0) => Ok(()),
-        AsyncIoOwner::Tid(tid) => get_visible_task(tid).map(|_| ()),
-        AsyncIoOwner::Pid(pid) => get_process_data(pid).map(|_| ()),
-        AsyncIoOwner::Pgrp(pgid) => get_process_group(pgid).map(|_| ()),
+        pipe.set_async_io(enabled, state, fd);
     }
 }
 
@@ -145,10 +127,6 @@ fn enforce_trailing_slash_directory(path: &str, loc: &Location) -> AxResult<()> 
         return Err(AxError::NotADirectory);
     }
     Ok(())
-}
-
-fn async_owner_is_live(owner: AsyncIoOwner) -> bool {
-    validate_async_owner(owner).is_ok()
 }
 
 fn open_access_mask(flags: c_int) -> u32 {
@@ -213,8 +191,7 @@ fn enforce_special_open_rules(loc: &Location, flags: c_int, uid: u32) -> AxResul
             NodeType::CharacterDevice | NodeType::BlockDevice
         )
     {
-        let path = loc.absolute_path().map_err(|_| AxError::InvalidInput)?;
-        if crate::mounts::is_nodev(path.as_ref()) {
+        if crate::mounts::is_nodev(loc)? {
             return Err(AxError::PermissionDenied);
         }
     }
@@ -225,7 +202,6 @@ fn enforce_special_open_rules(loc: &Location, flags: c_int, uid: u32) -> AxResul
     Ok(())
 }
 
-static TMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const OPENAT2_HOW_SIZE: usize = size_of::<open_how>();
 const OPENAT2_ALLOWED_FLAGS: u64 = (O_ACCMODE
     | O_APPEND
@@ -245,6 +221,7 @@ const OPENAT2_ALLOWED_FLAGS: u64 = (O_ACCMODE
     | O_SYNC
     | O_TMPFILE
     | O_TRUNC) as u64;
+const OPENAT2_PATH_FLAGS: u32 = O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC;
 const OPENAT2_ALLOWED_RESOLVE: u64 = (RESOLVE_NO_XDEV
     | RESOLVE_NO_MAGICLINKS
     | RESOLVE_NO_SYMLINKS
@@ -262,87 +239,193 @@ struct LinuxFileHandle {
     handle_type: i32,
 }
 
-fn next_tmpfile_path(dir: &str) -> String {
-    let counter = TMPFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let suffix = format!(".tmpfile-{counter:016x}");
-    if dir.starts_with('/') && dir.trim_matches('/').is_empty() {
-        return format!("/{suffix}");
+fn validate_openat2_how(how: &open_how) -> AxResult<u32> {
+    if how.flags >> 32 != 0
+        || how.flags & !OPENAT2_ALLOWED_FLAGS != 0
+        || how.resolve & !OPENAT2_ALLOWED_RESOLVE != 0
+    {
+        return Err(AxError::InvalidInput);
     }
-    match dir.trim_end_matches('/') {
-        "" | "." => format!("./{suffix}"),
-        root => format!("{root}/{suffix}"),
+    if how.resolve & RESOLVE_BENEATH as u64 != 0 && how.resolve & RESOLVE_IN_ROOT as u64 != 0 {
+        return Err(AxError::InvalidInput);
     }
-}
 
-fn current_dir_location() -> Location {
-    FS_CONTEXT.lock().current_dir().clone()
-}
-
-fn openat_base_dir(dirfd: c_int, path: &str, resolve: u64) -> AxResult<Location> {
-    if resolve & RESOLVE_IN_ROOT as u64 != 0 {
-        return if dirfd == AT_FDCWD {
-            Ok(current_dir_location())
-        } else {
-            Ok(Directory::from_fd(dirfd)?.inner().clone())
-        };
-    }
-    if dirfd == AT_FDCWD || Path::new(path).is_absolute() {
-        Ok(current_dir_location())
-    } else {
-        Ok(Directory::from_fd(dirfd)?.inner().clone())
-    }
-}
-
-fn adjust_openat2_path(path: &str, resolve: u64) -> String {
-    if resolve & RESOLVE_IN_ROOT as u64 == 0 || !path.starts_with('/') {
-        return path.to_string();
-    }
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        ".".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn escapes_beneath(path: &Path) -> bool {
-    let mut depth = 0usize;
-    for comp in path.components() {
-        match comp {
-            Component::CurDir => {}
-            Component::Normal(_) => depth += 1,
-            Component::ParentDir => {
-                if depth == 0 {
-                    return true;
-                }
-                depth -= 1;
-            }
-            Component::RootDir => return true,
+    let mut flags = how.flags as u32;
+    let will_create = flags & (O_CREAT | __O_TMPFILE) != 0;
+    if will_create {
+        if how.mode & !0o7777 != 0 {
+            return Err(AxError::InvalidInput);
         }
+    } else if how.mode != 0 {
+        return Err(AxError::InvalidInput);
     }
-    false
+
+    if flags & (O_DIRECTORY | O_CREAT) == O_DIRECTORY | O_CREAT {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & __O_TMPFILE != 0 && (flags & O_DIRECTORY == 0 || flags & O_ACCMODE == O_RDONLY) {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & O_PATH != 0 && flags & !OPENAT2_PATH_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & __O_SYNC != 0 {
+        flags |= O_DSYNC;
+    }
+    Ok(flags)
 }
 
-fn is_magic_proc_link(loc: &Location) -> bool {
-    if loc.node_type() != NodeType::Symlink {
-        return false;
+fn normalize_legacy_open_flags(flags: i32) -> AxResult<i32> {
+    let mut flags = flags as u32;
+
+    // Linux masks non-O_PATH status bits for legacy open/openat before
+    // interpreting creative flags. In particular O_PATH|O_TMPFILE opens the
+    // directory as a path handle instead of attempting anonymous creation.
+    if flags & O_PATH != 0 {
+        flags &= OPENAT2_PATH_FLAGS;
     }
-    let Ok(path) = loc.absolute_path() else {
-        return false;
+
+    if flags & (O_DIRECTORY | O_CREAT) == O_DIRECTORY | O_CREAT {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & __O_TMPFILE != 0
+        && (flags & O_TMPFILE != O_TMPFILE || flags & O_CREAT != 0 || flags & O_ACCMODE == O_RDONLY)
+    {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & __O_SYNC != 0 {
+        flags |= O_DSYNC;
+    }
+
+    Ok(flags as i32)
+}
+
+fn openat2_context(dirfd: c_int, path: &Path, resolve: u64) -> AxResult<FsContext> {
+    let (root, current_dir) = {
+        let fs = FS_CONTEXT.lock();
+        (fs.root_dir().clone(), fs.current_dir().clone())
     };
-    let path = path.as_str();
-    path.starts_with("/proc/") && (path.ends_with("/exe") || path.contains("/fd/"))
+
+    if resolve & (RESOLVE_IN_ROOT | RESOLVE_BENEATH) as u64 != 0 {
+        let base = if dirfd == AT_FDCWD {
+            current_dir
+        } else {
+            Directory::from_fd(dirfd)?.inner().clone()
+        };
+        return Ok(FsContext::new(base));
+    }
+
+    if path.is_absolute() {
+        Ok(FsContext::new(root))
+    } else {
+        let base = if dirfd == AT_FDCWD {
+            current_dir
+        } else {
+            Directory::from_fd(dirfd)?.inner().clone()
+        };
+        FsContext::new(root).with_current_dir(base)
+    }
 }
 
-fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
-    let mut write_open_key = None;
+struct Openat2PathwalkPolicy {
+    resolve: u64,
+}
+
+impl Openat2PathwalkPolicy {
+    const fn new(resolve: u64) -> Self {
+        Self { resolve }
+    }
+}
+
+impl PathwalkPolicy for Openat2PathwalkPolicy {
+    fn follow_magic_link(&mut self, _link: &Location) -> axfs_ng_vfs::VfsResult<()> {
+        if self.resolve & (RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS) as u64 != 0 {
+            return Err(LinuxError::ELOOP.into());
+        }
+        if self.resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT) as u64 != 0 {
+            return Err(LinuxError::EXDEV.into());
+        }
+        if self.resolve & RESOLVE_NO_XDEV as u64 != 0 {
+            // A generic jump-link target identity is not exposed yet, so the
+            // walker cannot prove that following it stays on this mount.
+            return Err(LinuxError::EXDEV.into());
+        }
+        Ok(())
+    }
+
+    fn follow_symlink(&mut self, _link: &Location) -> axfs_ng_vfs::VfsResult<()> {
+        if self.resolve & RESOLVE_NO_SYMLINKS as u64 != 0 {
+            return Err(LinuxError::ELOOP.into());
+        }
+        Ok(())
+    }
+
+    fn cross_mount(&mut self, _from: &Location, _to: &Location) -> axfs_ng_vfs::VfsResult<()> {
+        if self.resolve & RESOLVE_NO_XDEV as u64 != 0 {
+            return Err(LinuxError::EXDEV.into());
+        }
+        Ok(())
+    }
+
+    fn absolute_root(&mut self, _from: &Location, _root: &Location) -> axfs_ng_vfs::VfsResult<()> {
+        if self.resolve & RESOLVE_BENEATH as u64 != 0 {
+            return Err(LinuxError::EXDEV.into());
+        }
+        Ok(())
+    }
+
+    fn escape_root(&mut self, _root: &Location) -> axfs_ng_vfs::VfsResult<()> {
+        if self.resolve & RESOLVE_BENEATH as u64 != 0 {
+            return Err(LinuxError::EXDEV.into());
+        }
+        Ok(())
+    }
+}
+
+struct ExecutableWriteReservation {
+    key: Option<executable::ExecutableKey>,
+    persistent: bool,
+}
+
+impl ExecutableWriteReservation {
+    fn acquire(loc: &Location, flags: u32) -> AxResult<Self> {
+        let needs_exclusion =
+            flags & O_PATH == 0 && (flags & O_TRUNC != 0 || flags & O_ACCMODE != O_RDONLY);
+        let key = if needs_exclusion {
+            executable::retain_write_open(loc)?
+        } else {
+            None
+        };
+        Ok(Self {
+            key,
+            persistent: flags & O_PATH == 0 && flags & O_ACCMODE != O_RDONLY,
+        })
+    }
+
+    fn transfer_persistent(&mut self) -> Option<executable::ExecutableKey> {
+        self.persistent.then(|| self.key.take()).flatten()
+    }
+}
+
+impl Drop for ExecutableWriteReservation {
+    fn drop(&mut self) {
+        executable::release_write_open(self.key.take());
+    }
+}
+
+fn prepare_open_description(
+    result: OpenResult,
+    flags: u32,
+    write_open_key: Option<executable::ExecutableKey>,
+) -> AxResult<Arc<FileDescription>> {
     let f: Arc<dyn FileLike> = match result {
         OpenResult::File(mut file) => {
             if flags & O_PATH == 0 && file.location().metadata()?.node_type == NodeType::Fifo {
-                Arc::new(crate::file::pipe::NamedPipe::open(
+                Arc::try_new(crate::file::pipe::NamedPipe::open(
                     file.location().clone(),
                     flags,
                 )?)
+                .map_err(|_| AxError::NoMemory)?
             } else {
                 // /dev/xx handling
                 if let Ok(device) = file.location().entry().downcast::<Device>() {
@@ -388,24 +471,25 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
                         file = axfs::File::new(FileBackend::Direct(loc), file.flags());
                     }
                 }
-                let file = Arc::new(File::new(file));
-                if flags & O_PATH == 0 && flags & O_ACCMODE != O_RDONLY {
-                    write_open_key = executable::retain_write_open(file.inner().location());
-                }
-                file
+                Arc::try_new(File::new(file)).map_err(|_| AxError::NoMemory)?
             }
         }
-        OpenResult::Dir(dir) => Arc::new(Directory::new(dir)),
+        OpenResult::Dir(dir) => Arc::try_new(Directory::new(dir)).map_err(|_| AxError::NoMemory)?,
     };
     if flags & O_NONBLOCK != 0 {
         f.set_nonblocking(true)?;
     }
-    add_file_like_with_flags_and_write_open_key(
-        f,
-        flags & O_CLOEXEC != 0,
-        open_status_flags(flags),
-        write_open_key,
-    )
+    prepare_file_description(f, open_status_flags(flags), write_open_key)
+}
+
+fn publish_reserved_open(
+    result: OpenResult,
+    flags: u32,
+    reservation: ReservedFd,
+    write_open_key: Option<executable::ExecutableKey>,
+) -> AxResult<i32> {
+    let description = prepare_open_description(result, flags, write_open_key)?;
+    reservation.publish(description)
 }
 
 fn name_to_handle_resolve_flags(flags: i32) -> u32 {
@@ -480,91 +564,138 @@ fn open_in_fs(
     mode: __kernel_mode_t,
     credentials: &DacCredentialView,
 ) -> AxResult<isize> {
+    open_in_fs_with_policy(
+        fs,
+        path,
+        flags,
+        mode,
+        credentials,
+        &mut Openat2PathwalkPolicy::new(0),
+    )
+}
+
+fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
+    fs: &mut FsContext,
+    path: &str,
+    flags: i32,
+    mode: __kernel_mode_t,
+    credentials: &DacCredentialView,
+    policy: &mut P,
+) -> AxResult<isize> {
     validate_pathname(Path::new(path))?;
     debug!("sys_openat <= {path:?} {flags:#o} {mode:#o}");
 
     let uid = credentials.uid();
     let gid = credentials.gid();
-    let mode = mode & !current().as_thread().proc_data.umask();
-    let resolve_options = flags_to_options(flags, mode, (uid, gid));
-    let (loc, created) = resolve_options.resolve_location_with_admission(
+    let umask = current().as_thread().proc_data.umask();
+    let requested_mode = NodePermission::from_bits_truncate(mode as u16);
+    let masked_mode = NodePermission::from_bits_truncate(requested_mode.bits() & !(umask as u16));
+    let resolve_options = flags_to_options(flags, requested_mode.bits() as _, (uid, gid));
+    // Linux reserves a numeric slot before path lookup can create a name or
+    // truncate an existing inode. The reservation is invisible until the OFD
+    // is fully constructed and published below.
+    let reservation = reserve_fd((flags as u32) & O_CLOEXEC != 0)?;
+    let (loc, created) = resolve_options.resolve_location_with_policy(
         fs,
         path,
         &mut |dir| check_pathwalk_search_permission(dir, credentials),
-        &mut |dir| check_create_permissions(dir, credentials),
+        &mut |dir, create_options| {
+            check_create_permissions(dir, credentials)?;
+            check_writable_mount(dir)?;
+            let parent = dir.metadata()?;
+            let (final_mode, owner) = initial_named_create_owner_mode(
+                &parent,
+                credentials,
+                create_options.node_type,
+                requested_mode,
+                umask,
+            );
+            create_options.permission = final_mode;
+            create_options.user = Some(owner);
+            Ok(())
+        },
+        policy,
     )?;
 
-    enforce_trailing_slash_directory(path, &loc)?;
-    enforce_special_open_rules(&loc, flags, uid)?;
-    if loc.is_dir() && invalid_directory_open(flags) {
-        return Err(AxError::IsADirectory);
-    }
-    if !created {
-        check_open_permissions(&loc, open_access_mask(flags), credentials)?;
-        check_executable_open_rules(&loc, flags)?;
-        if open_requires_writable_mount(flags) {
-            check_writable_mount(&loc)?;
-        }
-        lease::wait_for_open(&loc, flags)?;
-        if (flags as u32) & O_PATH == 0 {
-            crate::file::fanotify::permission_check(
-                &loc,
-                &loc,
-                crate::file::fanotify::FAN_OPEN_PERM,
-                loc.is_dir(),
-                false,
-            )?;
-        }
-    }
-
-    let created_parent = if created {
-        Some((
-            loc.parent().ok_or(AxError::InvalidInput)?,
-            loc.name().to_string(),
-        ))
-    } else {
-        None
-    };
-
-    let mut effective_flags = flags;
-    if !created && (flags as u32) & O_CREAT != 0 && (flags as u32) & O_EXCL == 0 {
-        effective_flags &= !(O_CREAT as i32);
-    }
-    let opened_existing = !created;
-
-    let options = flags_to_options(effective_flags, mode, (uid, gid));
-    let fd = options
-        .open_loc(loc)
-        .and_then(|it| add_to_fd(it, effective_flags as _))
-        .map(|fd| fd as isize)?;
-
-    if let Some(loc) = location_for_fd(fd as i32) {
-        if let Some((parent, name)) = created_parent {
-            let mut final_mode = NodePermission::from_bits_truncate(mode as u16);
-            let mut owner_gid = credentials.gid();
-            let parent_meta = parent.metadata()?;
-            if parent_meta.mode.contains(NodePermission::SET_GID) {
-                owner_gid = parent_meta.gid;
-            }
-            if credentials.uid() != 0
-                && credentials.gid() != owner_gid
-                && !credentials.supplementary_groups().contains(&owner_gid)
+    if created {
+        if let Some(parent) = loc.parent() {
+            if let Err(error) =
+                notify_parent_with_name(&parent, Some(&loc), loc.name(), IN_CREATE, loc.is_dir(), 0)
             {
-                final_mode.remove(NodePermission::SET_GID);
+                warn!("open create notification failed: {error}");
             }
-            loc.update_supported_metadata(MetadataUpdate {
-                owner: Some((credentials.uid(), owner_gid)),
-                mode: Some(final_mode),
-                ..Default::default()
-            })?;
-            let _ = notify_parent_with_name(&parent, Some(&loc), &name, IN_CREATE, loc.is_dir(), 0);
+        } else {
+            warn!("created open entry has no parent: {:?}", loc.name());
         }
+    }
+
+    let opened_existing = !created;
+    let open_result = (|| {
+        enforce_trailing_slash_directory(path, &loc)?;
+        enforce_special_open_rules(&loc, flags, uid)?;
+        if loc.is_dir() && invalid_directory_open(flags) {
+            return Err(AxError::IsADirectory);
+        }
+        if opened_existing {
+            check_open_permissions(&loc, open_access_mask(flags), credentials)?;
+            check_executable_open_rules(&loc, flags)?;
+            if open_requires_writable_mount(flags) {
+                check_writable_mount(&loc)?;
+            }
+            lease::wait_for_open(&loc, flags)?;
+            if (flags as u32) & O_PATH == 0 {
+                crate::file::fanotify::permission_check(
+                    &loc,
+                    &loc,
+                    crate::file::fanotify::FAN_OPEN_PERM,
+                    loc.is_dir(),
+                    false,
+                )?;
+            }
+        }
+
+        // Atomically serialize exec against write access before open_loc can
+        // truncate or otherwise mutate the inode.  A read-only O_TRUNC keeps a
+        // transient reservation only through truncate; a writable OFD
+        // transfers the reference into FileDescription cleanup.
+        let mut write_open = ExecutableWriteReservation::acquire(&loc, flags as u32)?;
+
+        let mut effective_flags = flags;
+        if created {
+            // A new regular inode is already empty. Avoid a redundant truncate
+            // after namespace publication, and ensure open_loc cannot create a
+            // second object or reinterpret the completed exclusive admission.
+            effective_flags &= !((O_CREAT | O_EXCL | O_TRUNC) as i32);
+        } else if (flags as u32) & O_CREAT != 0 && (flags as u32) & O_EXCL == 0 {
+            effective_flags &= !(O_CREAT as i32);
+        }
+
+        let options = flags_to_options(effective_flags, masked_mode.bits() as _, (uid, gid));
+        let result = options.open_loc(loc.clone())?;
         if opened_existing && (flags as u32) & O_TRUNC != 0 {
+            // Metadata failure must not occur after fd publication and turn a
+            // returned error into a hidden live descriptor.
             touch_truncated_metadata(&loc)?;
-            let _ = notify_exact(&loc, IN_MODIFY | IN_ATTRIB);
         }
-        let _ = notify_parent(&loc, IN_OPEN);
-        let _ = notify_exact(&loc, IN_OPEN);
+        publish_reserved_open(
+            result,
+            effective_flags as _,
+            reservation,
+            write_open.transfer_persistent(),
+        )
+        .map(|fd| fd as isize)
+    })();
+    let fd = open_result?;
+    if opened_existing && (flags as u32) & O_TRUNC != 0 {
+        if let Err(error) = notify_exact(&loc, IN_MODIFY | IN_ATTRIB) {
+            warn!("open truncate notification failed: {error}");
+        }
+    }
+    if let Err(error) = notify_parent(&loc, IN_OPEN) {
+        warn!("open parent notification failed: {error}");
+    }
+    if let Err(error) = notify_exact(&loc, IN_OPEN) {
+        warn!("open notification failed: {error}");
     }
 
     Ok(fd)
@@ -594,8 +725,18 @@ fn openat_inner_with_credentials(
     mode: __kernel_mode_t,
     credentials: &DacCredentialView,
 ) -> AxResult<isize> {
+    let flags = normalize_legacy_open_flags(flags)?;
     if (flags as u32 & O_TMPFILE) == O_TMPFILE {
-        return open_tmpfile(dirfd, path, flags, mode, credentials);
+        return with_path_fs(dirfd, Path::new(path), |fs| {
+            open_tmpfile_in_fs(
+                fs,
+                path,
+                flags,
+                mode,
+                credentials,
+                &mut Openat2PathwalkPolicy::new(0),
+            )
+        });
     }
 
     with_path_fs(dirfd, Path::new(path), |fs| {
@@ -603,19 +744,13 @@ fn openat_inner_with_credentials(
     })
 }
 
-fn unlink_tmpfile_backing(fd: c_int) -> AxResult<()> {
-    let loc = location_for_fd(fd).ok_or(AxError::BadFileDescriptor)?;
-    install_tmpfile_state(&loc);
-    let parent = loc.parent().ok_or(AxError::OperationNotSupported)?;
-    parent.unlink(loc.name(), false)
-}
-
-fn open_tmpfile(
-    dirfd: c_int,
+fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
+    fs: &mut FsContext,
     path: &str,
     flags: i32,
     mode: __kernel_mode_t,
     credentials: &DacCredentialView,
+    policy: &mut P,
 ) -> AxResult<isize> {
     if (flags as u32 & O_ACCMODE) == O_RDONLY {
         return Err(AxError::InvalidInput);
@@ -623,26 +758,52 @@ fn open_tmpfile(
 
     let path_ref = Path::new(path);
     validate_pathname(path_ref)?;
-    let dir_loc = with_path_fs(dirfd, path_ref, |fs| fs.resolve_dac(path_ref, credentials))?;
-    dir_loc.check_is_dir()?;
-
-    let tmp_flags = ((flags as u32) & !(O_TMPFILE | O_DIRECTORY)) | O_CREAT | O_EXCL;
-    for _ in 0..64 {
-        let tmp_path = next_tmpfile_path(path);
-        match openat_inner_with_credentials(dirfd, &tmp_path, tmp_flags as i32, mode, credentials) {
-            Ok(fd) => {
-                if let Err(err) = unlink_tmpfile_backing(fd as c_int) {
-                    let _ = close_file_like(fd as c_int);
-                    return Err(err);
-                }
-                return Ok(fd);
-            }
-            Err(AxError::AlreadyExists) => continue,
-            Err(err) => return Err(err),
-        }
+    if path_ref.as_str().is_empty() {
+        return Err(AxError::NotFound);
     }
+    let reservation = reserve_fd((flags as u32) & O_CLOEXEC != 0)?;
+    let dir_loc = if flags as u32 & O_NOFOLLOW != 0 {
+        fs.resolve_no_follow_with_policy(
+            path_ref,
+            &mut |dir| check_pathwalk_search_permission(dir, credentials),
+            policy,
+        )
+    } else {
+        fs.resolve_with_policy(
+            path_ref,
+            &mut |dir| check_pathwalk_search_permission(dir, credentials),
+            policy,
+        )
+    }?;
+    dir_loc.check_is_dir()?;
+    check_create_permissions(&dir_loc, credentials)?;
+    check_writable_mount(&dir_loc)?;
 
-    Err(AxError::AlreadyExists)
+    let parent_meta = dir_loc.metadata()?;
+    let (final_mode, owner) = initial_named_create_owner_mode(
+        &parent_meta,
+        credentials,
+        NodeType::RegularFile,
+        NodePermission::from_bits_truncate(mode as u16),
+        current().as_thread().proc_data.umask(),
+    );
+
+    let open_flags = flags as u32 & !(O_TMPFILE | O_DIRECTORY | O_EXCL);
+    let options = flags_to_options(
+        open_flags as i32,
+        final_mode.bits() as __kernel_mode_t,
+        owner,
+    );
+    let loc = options.create_anonymous_location(&dir_loc, flags as u32 & O_EXCL == 0)?;
+    let mut write_open = ExecutableWriteReservation::acquire(&loc, open_flags)?;
+    let result = options.open_loc(loc)?;
+    publish_reserved_open(
+        result,
+        open_flags,
+        reservation,
+        write_open.transfer_persistent(),
+    )
+    .map(|fd| fd as isize)
 }
 
 pub fn sys_openat(
@@ -661,112 +822,60 @@ pub fn sys_openat2(
     how_ptr: UserConstPtr<u8>,
     size: usize,
 ) -> AxResult<isize> {
-    let path = vm_load_string(path)?;
-    let curr = current();
-    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
     if size < OPENAT2_HOW_SIZE {
         return Err(AxError::InvalidInput);
+    }
+    if size > 4096 {
+        return Err(AxError::from(LinuxError::E2BIG));
     }
     let raw = how_ptr.get_as_slice(size)?;
     if size > OPENAT2_HOW_SIZE && raw[OPENAT2_HOW_SIZE..].iter().any(|&byte| byte != 0) {
         return Err(AxError::from(LinuxError::E2BIG));
     }
     let how = unsafe { (raw.as_ptr() as *const open_how).read_unaligned() };
-    if how.flags >> 32 != 0
-        || how.flags & !OPENAT2_ALLOWED_FLAGS != 0
-        || how.resolve & !OPENAT2_ALLOWED_RESOLVE != 0
-    {
-        return Err(AxError::InvalidInput);
-    }
-    if how.resolve & RESOLVE_BENEATH as u64 != 0 && how.resolve & RESOLVE_IN_ROOT as u64 != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if how.resolve & RESOLVE_CACHED as u64 != 0 {
+    let flags = validate_openat2_how(&how)? as i32;
+    let resolve_cached = how.resolve & RESOLVE_CACHED as u64 != 0;
+    if resolve_cached && flags as u32 & (O_TRUNC | O_CREAT | __O_TMPFILE) != 0 {
         return Err(AxError::from(LinuxError::EAGAIN));
     }
-    if how.mode > 0o777 {
-        return Err(AxError::InvalidInput);
-    }
-    let flags = how.flags as i32;
-    let creating = (how.flags & (O_CREAT | O_TMPFILE) as u64) != 0;
-    if !creating && how.mode != 0 {
-        return Err(AxError::InvalidInput);
-    }
 
-    let adjusted_path = adjust_openat2_path(&path, how.resolve);
-    let adjusted_ref = Path::new(&adjusted_path);
-    if how.resolve & RESOLVE_BENEATH as u64 != 0 && escapes_beneath(adjusted_ref) {
+    let path = vm_load_string(path)?;
+    let path_ref = Path::new(&path);
+    if path.is_empty() {
+        return Err(AxError::NotFound);
+    }
+    if how.resolve & RESOLVE_BENEATH as u64 != 0 && path_ref.is_absolute() {
         return Err(AxError::from(LinuxError::EXDEV));
     }
-    if path == "/proc/self/exe" {
-        if how.resolve & (RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS) as u64 != 0
-            || (flags & O_NOFOLLOW as i32 != 0 && flags & O_PATH as i32 == 0)
-        {
-            return Err(AxError::from(LinuxError::ELOOP));
-        }
-        if how.resolve & RESOLVE_NO_XDEV as u64 != 0 {
-            return Err(AxError::from(LinuxError::EXDEV));
-        }
-        let exe_path = curr.as_thread().proc_data.exe_path.read().clone();
-        return openat_inner_with_credentials(
-            AT_FDCWD,
-            &exe_path,
-            flags,
-            how.mode as __kernel_mode_t,
-            &credentials,
-        );
+    if resolve_cached {
+        return Err(AxError::from(LinuxError::EAGAIN));
     }
-
-    let base_dir = openat_base_dir(dirfd, &path, how.resolve)?;
-    match with_path_fs(dirfd, adjusted_ref, |fs| {
-        fs.resolve_no_follow_dac(&adjusted_path, &credentials)
-    }) {
-        Ok(loc) => {
-            if how.resolve & RESOLVE_NO_XDEV as u64 != 0
-                && !Arc::ptr_eq(loc.mountpoint(), base_dir.mountpoint())
-            {
-                return Err(AxError::from(LinuxError::EXDEV));
-            }
-            if how.resolve & RESOLVE_NO_SYMLINKS as u64 != 0 && loc.node_type() == NodeType::Symlink
-            {
-                return Err(AxError::from(LinuxError::ELOOP));
-            }
-            if how.resolve & RESOLVE_NO_MAGICLINKS as u64 != 0 && is_magic_proc_link(&loc) {
-                return Err(AxError::from(LinuxError::ELOOP));
-            }
-        }
-        Err(AxError::NotFound) if creating => {
-            let parent = with_path_fs(dirfd, adjusted_ref, |fs| {
-                let (parent, _) = fs.resolve_nonexistent_dac(adjusted_ref, &credentials)?;
-                Ok(parent)
-            })?;
-            if how.resolve & RESOLVE_NO_XDEV as u64 != 0
-                && !Arc::ptr_eq(parent.mountpoint(), base_dir.mountpoint())
-            {
-                return Err(AxError::from(LinuxError::EXDEV));
-            }
-        }
-        Err(err) => return Err(err),
-    }
-
-    if how.resolve & RESOLVE_IN_ROOT as u64 != 0 && Path::new(&path).is_absolute() {
-        let mut fs = FsContext::new(base_dir);
-        return open_in_fs(
+    let curr = current();
+    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+    let _mount_operation =
+        (how.resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_NO_XDEV) as u64 != 0)
+            .then(crate::mounts::namespace_operation);
+    let mut fs = openat2_context(dirfd, path_ref, how.resolve)?;
+    let mut policy = Openat2PathwalkPolicy::new(how.resolve);
+    if (flags as u32 & O_TMPFILE) == O_TMPFILE {
+        open_tmpfile_in_fs(
             &mut fs,
-            &adjusted_path,
+            &path,
             flags,
             how.mode as __kernel_mode_t,
             &credentials,
-        );
+            &mut policy,
+        )
+    } else {
+        open_in_fs_with_policy(
+            &mut fs,
+            &path,
+            flags,
+            how.mode as __kernel_mode_t,
+            &credentials,
+            &mut policy,
+        )
     }
-
-    openat_inner_with_credentials(
-        dirfd,
-        &adjusted_path,
-        flags,
-        how.mode as __kernel_mode_t,
-        &credentials,
-    )
 }
 
 /// Open a file by `filename` and insert it into the file descriptor table.
@@ -780,9 +889,8 @@ pub fn sys_open(path: *const c_char, flags: i32, mode: __kernel_mode_t) -> AxRes
 
 pub fn sys_close(fd: c_int) -> AxResult<isize> {
     debug!("sys_close <= {fd}");
-    notify_close(fd);
-    remove_dnotify_watch(fd);
     close_file_like(fd)?;
+    wait_current_close_notifications();
     Ok(0)
 }
 
@@ -802,31 +910,31 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> AxResult<isize> {
     debug!("sys_close_range <= fds: [{first}, {last}], flags: {flags:?}");
     if flags.contains(CloseRangeFlags::UNSHARE) {
         let curr = current();
-        curr.as_thread().with_mut_scope(|scope| {
-            let mut guard = FD_TABLE.scope_mut(scope);
-            if Arc::strong_count(guard.deref()) > 1 {
-                let cloned = guard.read().clone();
-                *guard = Arc::new(RwLock::new(cloned));
+        let thread = curr.as_thread();
+        let curr_tid = curr.id().as_u64() as starry_process::Pid;
+        if !thread.proc_data.begin_single_thread_scope_change(curr_tid) {
+            return Err(AxError::OperationNotSupported);
+        }
+        let result = (|| -> AxResult<()> {
+            if Arc::strong_count(&*FD_TABLE) > 1 {
+                let replacement =
+                    Arc::try_new(FD_TABLE.fork_copy()?).map_err(|_| AxError::NoMemory)?;
+                let previous =
+                    thread.with_mut_scope(|scope| replace_process_fd_table(scope, replacement));
+                drop(previous);
             }
-        });
+            Ok(())
+        })();
+        thread.proc_data.end_exec(curr_tid);
+        result?;
     }
 
     let cloexec = flags.contains(CloseRangeFlags::CLOEXEC);
-    let mut fd_table = FD_TABLE.write();
-    if let Some(max_index) = fd_table.ids().next_back() {
-        let last = last.min(max_index as u32);
-        for fd in first..=last {
-            if cloexec {
-                if let Some(f) = fd_table.get_mut(fd as _) {
-                    f.cloexec = true;
-                }
-            } else {
-                if let Some(removed) = fd_table.remove(fd as _) {
-                    remove_dnotify_watch(fd as _);
-                    release_posix_locks_on_close(&removed.description);
-                }
-            }
-        }
+    if cloexec {
+        FD_TABLE.mark_cloexec_range(first, last);
+    } else {
+        drop(FD_TABLE.close_range(first, last)?);
+        wait_current_close_notifications();
     }
 
     Ok(0)
@@ -853,24 +961,9 @@ fn dup_fd_at_least(
     }
 
     let upper_bound = max_nofile.min(AX_FILE_LIMIT);
-    let mut fd_table = FD_TABLE.write();
-    for new_fd in min_fd..upper_bound {
-        if fd_table.get(new_fd).is_some() {
-            continue;
-        }
-        fd_table
-            .add_at(
-                new_fd,
-                FileDescriptor {
-                    description: description.clone(),
-                    cloexec,
-                },
-            )
-            .map_err(|_| AxError::TooManyOpenFiles)?;
-        return Ok(new_fd as isize);
-    }
-
-    Err(AxError::TooManyOpenFiles)
+    FD_TABLE
+        .add_at_least(description, min_fd, upper_bound, cloexec)
+        .map(|fd| fd as isize)
 }
 
 fn validate_flock(lock: &flock64) -> AxResult<()> {
@@ -954,20 +1047,12 @@ pub fn sys_dup3(old_fd: c_int, new_fd: c_int, flags: c_int) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
 
-    let mut fd_table = FD_TABLE.write();
-    let mut f = fd_table
-        .get(old_fd as _)
-        .cloned()
-        .ok_or(AxError::BadFileDescriptor)?;
-    f.cloexec = flags.contains(Dup3Flags::O_CLOEXEC);
-
-    if let Some(removed) = fd_table.remove(new_fd as _) {
-        remove_dnotify_watch(new_fd);
-        release_posix_locks_on_close(&removed.description);
+    let max_nofile = current().as_thread().proc_data.rlim.read()[RLIMIT_NOFILE].current as usize;
+    if new_fd < 0 || new_fd as usize >= max_nofile.min(AX_FILE_LIMIT) {
+        return Err(AxError::BadFileDescriptor);
     }
-    fd_table
-        .add_at(new_fd as _, f)
-        .map_err(|_| AxError::BadFileDescriptor)?;
+    drop(FD_TABLE.dup_replace(old_fd, new_fd, flags.contains(Dup3Flags::O_CLOEXEC))?);
+    wait_current_close_notifications();
 
     Ok(new_fd as _)
 }
@@ -1051,24 +1136,23 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
             let description = get_file_description(fd)?;
             let owner = arg as c_int;
             let owner = if owner < 0 {
-                AsyncIoOwner::Pgrp(owner.checked_neg().ok_or(AxError::InvalidInput)? as _)
+                AsyncIoOwner::pgrp(owner.checked_neg().ok_or(AxError::InvalidInput)? as _)?
             } else {
-                AsyncIoOwner::Pid(owner as _)
+                AsyncIoOwner::pid(owner as _)?
             };
-            validate_async_owner(owner)?;
             description.set_async_io_owner(owner);
-            sync_async_io_to_file(&description);
+            sync_async_io_to_file(&description, fd);
             Ok(0)
         }
         F_GETOWN => {
             let description = get_file_description(fd)?;
             let owner = description.async_io_state().owner;
-            if !async_owner_is_live(owner) {
+            if !owner.is_live() {
                 return Ok(0);
             }
-            let owner = match owner {
-                AsyncIoOwner::Tid(pid) | AsyncIoOwner::Pid(pid) => pid as c_int,
-                AsyncIoOwner::Pgrp(pgid) => -(pgid as c_int),
+            let owner = match owner.owner_type() {
+                AsyncIoOwnerType::Tid | AsyncIoOwnerType::Pid => owner.id() as c_int,
+                AsyncIoOwnerType::Pgrp => -(owner.id() as c_int),
             };
             Ok(owner as isize)
         }
@@ -1079,52 +1163,35 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
                 return Err(AxError::NoSuchProcess);
             }
             let owner = match owner.type_ as u32 {
-                F_OWNER_TID => AsyncIoOwner::Tid(owner.pid as _),
-                F_OWNER_PID => AsyncIoOwner::Pid(owner.pid as _),
-                F_OWNER_PGRP => AsyncIoOwner::Pgrp(owner.pid as _),
+                F_OWNER_TID => AsyncIoOwner::tid(owner.pid as _)?,
+                F_OWNER_PID => AsyncIoOwner::pid(owner.pid as _)?,
+                F_OWNER_PGRP => AsyncIoOwner::pgrp(owner.pid as _)?,
                 _ => return Err(AxError::InvalidInput),
             };
-            validate_async_owner(owner)?;
             description.set_async_io_owner(owner);
-            sync_async_io_to_file(&description);
+            sync_async_io_to_file(&description, fd);
             Ok(0)
         }
         F_GETOWN_EX => {
             let description = get_file_description(fd)?;
             let owner = UserPtr::<f_owner_ex>::from(arg).get_as_mut()?;
             let state_owner = description.async_io_state().owner;
-            match state_owner {
-                AsyncIoOwner::Tid(pid) => {
-                    owner.type_ = F_OWNER_TID as _;
-                    owner.pid = if async_owner_is_live(state_owner) {
-                        pid as _
-                    } else {
-                        0
-                    };
-                }
-                AsyncIoOwner::Pid(pid) => {
-                    owner.type_ = F_OWNER_PID as _;
-                    owner.pid = if async_owner_is_live(state_owner) {
-                        pid as _
-                    } else {
-                        0
-                    };
-                }
-                AsyncIoOwner::Pgrp(pgid) => {
-                    owner.type_ = F_OWNER_PGRP as _;
-                    owner.pid = if async_owner_is_live(state_owner) {
-                        pgid as _
-                    } else {
-                        0
-                    };
-                }
-            }
+            owner.type_ = match state_owner.owner_type() {
+                AsyncIoOwnerType::Tid => F_OWNER_TID as _,
+                AsyncIoOwnerType::Pid => F_OWNER_PID as _,
+                AsyncIoOwnerType::Pgrp => F_OWNER_PGRP as _,
+            };
+            owner.pid = if state_owner.is_live() {
+                state_owner.id() as _
+            } else {
+                0
+            };
             Ok(0)
         }
         F_SETSIG => {
             let description = get_file_description(fd)?;
             description.set_async_io_signal(validate_async_signal(arg as c_int)?);
-            sync_async_io_to_file(&description);
+            sync_async_io_to_file(&description, fd);
             Ok(0)
         }
         F_GETSIG => {
@@ -1132,9 +1199,34 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
             Ok(description.async_io_state().signal as isize)
         }
         F_NOTIFY => {
+            let raw_mask = dnotify::mask_from_fcntl_arg(arg);
             let description = get_file_description(fd)?;
-            let loc = location_for_fd(fd).ok_or(AxError::BadFileDescriptor)?;
-            set_dnotify_watch(fd, &loc, arg as u32, description.async_io_state().signal)?;
+            let expected = description.id();
+            if dnotify::is_remove_mask(raw_mask) {
+                let detached =
+                    FD_TABLE.with_same_description(fd, expected, |table, _, description| {
+                        Ok(dnotify::detach_watch(table, description.id()))
+                    })?;
+                drop(detached);
+                return Ok(0);
+            }
+
+            let loc = if let Some(file) = description.inner.downcast_ref::<File>() {
+                file.inner().location().clone()
+            } else if let Some(dir) = description.inner.downcast_ref::<Directory>() {
+                dir.inner().clone()
+            } else {
+                return Err(AxError::NotADirectory);
+            };
+            if !loc.is_dir() {
+                return Err(AxError::NotADirectory);
+            }
+            let watch = WatchKey::from_location(&loc)?;
+            let mask = dnotify::converted_mask(raw_mask);
+            FD_TABLE.prepare_dnotify_cleanup()?;
+            FD_TABLE.with_same_description(fd, expected, |table, fd, description| {
+                dnotify::set_watch(table, fd, description, watch, mask)
+            })?;
             Ok(0)
         }
         F_SETFL => {
@@ -1145,7 +1237,7 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
                 .inner
                 .set_nonblocking(new_flags & O_NONBLOCK != 0)?;
             description.set_status_flags(new_flags);
-            sync_async_io_to_file(&description);
+            sync_async_io_to_file(&description, fd);
             Ok(0)
         }
         F_GETFL => {
@@ -1158,20 +1250,12 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
             Ok(ret as _)
         }
         F_GETFD => {
-            let cloexec = FD_TABLE
-                .read()
-                .get(fd as _)
-                .ok_or(AxError::BadFileDescriptor)?
-                .cloexec;
+            let cloexec = FD_TABLE.get_cloexec(fd)?;
             Ok(if cloexec { FD_CLOEXEC as _ } else { 0 })
         }
         F_SETFD => {
             let cloexec = arg & FD_CLOEXEC as usize != 0;
-            FD_TABLE
-                .write()
-                .get_mut(fd as _)
-                .ok_or(AxError::BadFileDescriptor)?
-                .cloexec = cloexec;
+            FD_TABLE.set_cloexec(fd, cloexec)?;
             Ok(0)
         }
         F_GETPIPE_SZ => {

@@ -69,6 +69,10 @@ pub fn block_on<F: IntoFuture>(f: F) -> F::Output {
         *woke.lock() = false;
         match fut.as_mut().poll(&mut cx) {
             Poll::Pending => {
+                // A generic future may retain subsystem state across Pending,
+                // so this is not a proven deferred-work safe point. Kernel
+                // entry/exit, yield, idle, and syscall boundaries perform the
+                // dispatcher wakeups instead.
                 let mut rq = current_run_queue::<NoPreemptIrqSave>();
                 let woke = woke.lock();
                 if !*woke {

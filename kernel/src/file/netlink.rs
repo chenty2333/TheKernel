@@ -284,25 +284,30 @@ impl NetlinkSocket {
     }
 
     pub fn recv(&self, dst: &mut IoDst, flags: RecvFlags) -> AxResult<usize> {
-        block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
-            let mut queue = self.queue.lock();
-            let Some(packet) = queue.front() else {
-                return Err(AxError::WouldBlock);
-            };
+        block_on(poll_io(
+            self,
+            IoEvents::IN,
+            self.nonblocking() || flags.contains(RecvFlags::DONT_WAIT),
+            || {
+                let mut queue = self.queue.lock();
+                let Some(packet) = queue.front() else {
+                    return Err(AxError::WouldBlock);
+                };
 
-            let packet_len = packet.len();
-            let copy_len = packet_len.min(dst.remaining_mut());
-            dst.write(&packet[..copy_len])?;
-            if !flags.contains(RecvFlags::PEEK) {
-                queue.pop_front();
-            }
+                let packet_len = packet.len();
+                let copy_len = packet_len.min(dst.remaining_mut());
+                dst.write(&packet[..copy_len])?;
+                if !flags.contains(RecvFlags::PEEK) {
+                    queue.pop_front();
+                }
 
-            Ok(if flags.contains(RecvFlags::TRUNCATE) {
-                packet_len
-            } else {
-                copy_len
-            })
-        }))
+                Ok(if flags.contains(RecvFlags::TRUNCATE) {
+                    packet_len
+                } else {
+                    copy_len
+                })
+            },
+        ))
     }
 
     pub fn recv_from(

@@ -26,6 +26,7 @@
 //! [3]: axsched::CFScheduler
 
 #![cfg_attr(not(test), no_std)]
+#![feature(allocator_api)]
 #![feature(doc_cfg)]
 #![feature(linkage)]
 

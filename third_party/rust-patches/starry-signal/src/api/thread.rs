@@ -1,4 +1,7 @@
-use alloc::sync::Arc;
+use alloc::{
+    alloc::AllocError,
+    sync::{Arc, Weak},
+};
 use core::{
     alloc::Layout,
     mem::offset_of,
@@ -44,10 +47,42 @@ pub struct ThreadSignalManager {
     possibly_has_signal: AtomicBool,
 }
 
+/// Removes a newly registered weak endpoint if the owning thread fails to
+/// finish construction. Successful lifecycle publication disarms the token.
+#[must_use = "dropping the token rolls back thread-signal registration"]
+pub struct ThreadSignalRegistration {
+    manager: Arc<ThreadSignalManager>,
+    tid: u32,
+    active: bool,
+}
+
+impl ThreadSignalRegistration {
+    pub fn commit(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ThreadSignalRegistration {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let expected = Arc::downgrade(&self.manager);
+        self.manager
+            .proc
+            .children
+            .lock()
+            .retain(|(tid, thread)| *tid != self.tid || !thread.ptr_eq(&expected));
+    }
+}
+
 impl ThreadSignalManager {
-    pub fn new(tid: u32, proc: Arc<ProcessSignalManager>) -> Arc<Self> {
-        let this = Arc::new(Self {
-            proc: proc.clone(),
+    /// Fallibly constructs an unregistered thread signal endpoint.
+    /// Registration is separate so callers can finish building the owning
+    /// thread object before making even a weak child entry observable.
+    pub fn try_new(proc: Arc<ProcessSignalManager>) -> Result<Arc<Self>, AllocError> {
+        Arc::try_new(Self {
+            proc,
 
             pending: SpinNoIrq::new(PendingSignals::default()),
             blocked: SpinNoIrq::new(SignalSet::default()),
@@ -55,8 +90,34 @@ impl ThreadSignalManager {
             stack: SpinNoIrq::new(SignalStack::default()),
 
             possibly_has_signal: AtomicBool::new(false),
+        })
+    }
+
+    /// Fallibly publishes this endpoint in its process signal registry.
+    pub fn try_register(
+        self: &Arc<Self>,
+        tid: u32,
+    ) -> Result<ThreadSignalRegistration, AllocError> {
+        let mut children = self.proc.children.lock();
+        children.try_reserve(1).map_err(|_| AllocError)?;
+        children.push((tid, Arc::downgrade(self)));
+        Ok(ThreadSignalRegistration {
+            manager: self.clone(),
+            tid,
+            active: true,
+        })
+    }
+
+    /// Constructs and registers a signal endpoint using the allocator's
+    /// configured OOM handler. New kernel lifecycle paths should prefer the
+    /// two fallible methods above.
+    pub fn new(tid: u32, proc: Arc<ProcessSignalManager>) -> Arc<Self> {
+        let this = Self::try_new(proc)
+            .unwrap_or_else(|_| alloc::alloc::handle_alloc_error(Layout::new::<Self>()));
+        let registration = this.try_register(tid).unwrap_or_else(|_| {
+            alloc::alloc::handle_alloc_error(Layout::new::<(u32, Weak<Self>)>())
         });
-        proc.children.lock().push((tid, Arc::downgrade(&this)));
+        registration.commit();
         this
     }
 

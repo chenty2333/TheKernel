@@ -175,7 +175,8 @@ fn matching_wait_candidates(
 ) -> AxResult<Vec<WaitCandidate>> {
     let proc = &proc_data.proc;
     let mut candidates = proc
-        .children()
+        .try_children()
+        .map_err(|_| AxError::NoMemory)?
         .into_iter()
         .filter(|child| pid.apply(child) && should_wait_for_child(child, options))
         .map(|process| WaitCandidate {

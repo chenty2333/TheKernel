@@ -46,22 +46,25 @@ impl Drop for ListenTableEntryInner {
     }
 }
 
-type ListenTableEntry = Arc<Mutex<Option<Box<ListenTableEntryInner>>>>;
-
 pub struct ListenTable {
-    tcp: Box<[ListenTableEntry]>,
+    tcp: Box<[Mutex<Option<Box<ListenTableEntryInner>>>]>,
 }
 
 impl ListenTable {
     pub fn new() -> Self {
+        Self::try_new().expect("failed to allocate TCP listen table")
+    }
+
+    /// Fallibly creates an empty bounded TCP listen table.
+    pub fn try_new() -> AxResult<Self> {
         let tcp = unsafe {
-            let mut buf = Box::new_uninit_slice(PORT_NUM);
+            let mut buf = Box::try_new_uninit_slice(PORT_NUM).map_err(|_| AxError::NoMemory)?;
             for i in 0..PORT_NUM {
-                buf[i].write(Arc::default());
+                buf[i].write(Mutex::new(None));
             }
             buf.assume_init()
         };
-        Self { tcp }
+        Ok(Self { tcp })
     }
 
     pub(crate) fn listen(
@@ -99,8 +102,8 @@ impl ListenTable {
         *self.tcp[port as usize].lock() = None;
     }
 
-    fn listen_entry(&self, port: u16) -> Arc<Mutex<Option<Box<ListenTableEntryInner>>>> {
-        self.tcp[port as usize].clone()
+    fn listen_entry(&self, port: u16) -> &Mutex<Option<Box<ListenTableEntryInner>>> {
+        &self.tcp[port as usize]
     }
 
     pub(crate) fn can_accept(&self, port: u16, socket_set: &SocketSetWrapper) -> AxResult<bool> {

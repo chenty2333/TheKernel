@@ -22,6 +22,9 @@ pub enum VmError {
     /// is not found within a predefined search limit.
     #[cfg(feature = "alloc")]
     TooLong,
+    /// Allocating the owned user-memory snapshot failed.
+    #[cfg(feature = "alloc")]
+    NoMemory,
 }
 
 impl From<VmError> for AxError {
@@ -30,6 +33,8 @@ impl From<VmError> for AxError {
             VmError::BadAddress | VmError::AccessDenied => AxError::BadAddress,
             #[cfg(feature = "alloc")]
             VmError::TooLong => AxError::NameTooLong,
+            #[cfg(feature = "alloc")]
+            VmError::NoMemory => AxError::NoMemory,
         }
     }
 }

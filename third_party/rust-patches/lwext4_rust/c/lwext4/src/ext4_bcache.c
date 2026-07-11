@@ -82,13 +82,17 @@ int ext4_bcache_init_dynamic(struct ext4_bcache *bc, uint32_t cnt,
 	return EOK;
 }
 
-void ext4_bcache_cleanup(struct ext4_bcache *bc)
+int ext4_bcache_cleanup(struct ext4_bcache *bc)
 {
+	int first_error = EOK;
 	struct ext4_buf *buf, *tmp;
 	RB_FOREACH_SAFE(buf, ext4_buf_lba, &bc->lba_root, tmp) {
-		ext4_block_flush_buf(bc->bdev, buf);
+		int r = ext4_block_flush_buf(bc->bdev, buf);
+		if (first_error == EOK && r != EOK)
+			first_error = r;
 		ext4_bcache_drop_buf(bc, buf);
 	}
+	return first_error;
 }
 
 int ext4_bcache_fini_dynamic(struct ext4_bcache *bc)
@@ -296,7 +300,11 @@ int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b)
 			    !ext4_bcache_test_flag(buf, BC_TMP))
 				ext4_bcache_insert_dirty_node(bc, buf);
 			else {
-				ext4_block_flush_buf(bc->bdev, buf);
+				int r = ext4_block_flush_buf(bc->bdev, buf);
+				if (r != EOK &&
+				    !ext4_bcache_test_flag(buf, BC_TMP) &&
+				    !buf->on_dirty_list)
+					ext4_bcache_insert_dirty_node(bc, buf);
 				ext4_bcache_clear_flag(buf, BC_FLUSH);
 			}
 		}
@@ -311,6 +319,10 @@ int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b)
 	b->lb_id = 0;
 	b->data = 0;
 
+	/* Releasing a cache reference commits the in-memory mutation even if an
+	 * immediate buffer write fails. ext4_block_flush_buf records that failure
+	 * in bdev->writeback_error, and the explicit cache flush/fsync path reports
+	 * it without making namespace mutators look uncommitted. */
 	return EOK;
 }
 

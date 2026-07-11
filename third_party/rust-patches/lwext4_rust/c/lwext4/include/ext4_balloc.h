@@ -101,6 +101,19 @@ int ext4_balloc_alloc_block(struct ext4_inode_ref *inode_ref,
 			    ext4_fsblk_t goal,
 			    ext4_fsblk_t *baddr);
 
+/**@brief   Allocate block and report whether allocation metadata may have
+ *          changed before an error was returned.
+ * @param   inode_ref inode reference
+ * @param   goal preferred allocation address
+ * @param   baddr allocated block address
+ * @param   metadata_may_have_changed set once allocation metadata is first
+ *          modified
+ * @return  standard error code*/
+int ext4_balloc_alloc_block_status(struct ext4_inode_ref *inode_ref,
+				   ext4_fsblk_t goal,
+				   ext4_fsblk_t *baddr,
+				   bool *metadata_may_have_changed);
+
 /**@brief   Try allocate selected block.
  * @param   inode_ref inode reference
  * @param   baddr block address to allocate

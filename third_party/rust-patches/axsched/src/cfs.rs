@@ -1,8 +1,10 @@
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::sync::Arc;
 use core::{
     ops::Deref,
     sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU64, Ordering},
 };
+
+use intrusive_collections::{Bound, KeyAdapter, RBTree, RBTreeAtomicLink, intrusive_adapter};
 
 use crate::{BaseScheduler, EnqueueReason};
 
@@ -83,6 +85,15 @@ impl CfsTaskParams {
 /// task for CFS
 pub struct CFSTask<T> {
     inner: T,
+    /// Intrusive ready-queue membership. Keeping the tree node in the task
+    /// makes every enqueue, wakeup, yield and preemption allocation-free.
+    ready_link: RBTreeAtomicLink,
+    /// Immutable-for-one-link-lifetime ordering snapshot. Scheduler parameters
+    /// may be inspected or changed concurrently, so the intrusive tree must not
+    /// derive its structural key from those live atomics while this link is in a
+    /// ready queue.
+    ready_class: AtomicU8,
+    ready_order: AtomicIsize,
     init_vruntime: AtomicIsize,
     delta: AtomicIsize,
     seeded_vruntime: AtomicBool,
@@ -116,6 +127,9 @@ impl<T> CFSTask<T> {
     pub const fn new(inner: T) -> Self {
         Self {
             inner,
+            ready_link: RBTreeAtomicLink::new(),
+            ready_class: AtomicU8::new(1),
+            ready_order: AtomicIsize::new(0),
             init_vruntime: AtomicIsize::new(0_isize),
             delta: AtomicIsize::new(0_isize),
             seeded_vruntime: AtomicBool::new(false),
@@ -241,6 +255,27 @@ impl<T> CFSTask<T> {
         self.delta.fetch_add(1, Ordering::Release);
     }
 
+    fn stage_ready_key(&self, class: u8, order: isize, sequence: isize) {
+        // Callers hold the destination scheduler lock and invoke this only
+        // while `ready_link` is unlinked. Once insertion publishes the link,
+        // these three fields remain untouched until that link is removed.
+        self.ready_class.store(class, Ordering::Release);
+        self.ready_order.store(order, Ordering::Release);
+        self.set_id(sequence);
+    }
+
+    fn ready_key(&self) -> (u8, isize, isize) {
+        (
+            self.ready_class.load(Ordering::Acquire),
+            self.ready_order.load(Ordering::Acquire),
+            self.get_id(),
+        )
+    }
+
+    fn ready_is_rt(&self) -> bool {
+        self.ready_class.load(Ordering::Acquire) == 0
+    }
+
     /// Returns a reference to the inner task struct.
     pub const fn inner(&self) -> &T {
         &self.inner
@@ -317,12 +352,30 @@ impl<T> Deref for CFSTask<T> {
     }
 }
 
+intrusive_adapter!(ReadyTaskAdapter<T> = Arc<CFSTask<T>>: CFSTask<T> {
+    ready_link: RBTreeAtomicLink
+});
+
+impl<'a, T> KeyAdapter<'a> for ReadyTaskAdapter<T> {
+    type Key = (u8, isize, isize);
+
+    fn get_key(&self, task: &'a CFSTask<T>) -> Self::Key {
+        task.ready_key()
+    }
+}
+
+fn rt_priority_key(priority: u8) -> isize {
+    (RT_PRIORITY_MAX - priority) as isize
+}
+
 /// A simple [Completely Fair Scheduler][1] (CFS).
 ///
 /// [1]: https://en.wikipedia.org/wiki/Completely_Fair_Scheduler
 pub struct CFScheduler<T> {
-    ready_fair_queue: BTreeMap<(isize, isize), Arc<CFSTask<T>>>, // (vruntime, taskid)
-    ready_rt_queue: BTreeMap<(u8, isize), Arc<CFSTask<T>>>,      // (priority key, queue seq)
+    /// A single intrusive tree keeps real-time tasks before fair tasks while
+    /// preserving the ordering within both classes. Unlike `BTreeMap`, it
+    /// cannot allocate at the runnable-publication point.
+    ready_queue: RBTree<ReadyTaskAdapter<T>>,
     min_vruntime: Option<isize>,
     id_pool: AtomicIsize,
     rt_front_seq: isize,
@@ -331,10 +384,9 @@ pub struct CFScheduler<T> {
 
 impl<T> CFScheduler<T> {
     /// Creates a new empty [`CFScheduler`].
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            ready_fair_queue: BTreeMap::new(),
-            ready_rt_queue: BTreeMap::new(),
+            ready_queue: RBTree::new(ReadyTaskAdapter::new()),
             min_vruntime: None,
             id_pool: AtomicIsize::new(0_isize),
             rt_front_seq: 0,
@@ -356,9 +408,11 @@ impl<T> CFScheduler<T> {
     }
 
     fn min_ready_vruntime(&self) -> Option<isize> {
-        self.ready_fair_queue
-            .first_key_value()
-            .map(|((vruntime, _), _)| *vruntime)
+        self.ready_queue
+            .lower_bound(Bound::Included(&(1, isize::MIN, isize::MIN)))
+            .get()
+            .filter(|task| !task.ready_is_rt())
+            .map(|task| task.ready_order.load(Ordering::Acquire))
     }
 
     fn refresh_min_vruntime(&mut self, current_vruntime: Option<isize>) {
@@ -386,9 +440,8 @@ impl<T> CFScheduler<T> {
 
     fn insert_fair_task(&mut self, task: Arc<CFSTask<T>>) {
         let taskid = self.next_task_id();
-        let vruntime = task.get_vruntime();
-        task.set_id(taskid);
-        self.ready_fair_queue.insert((vruntime, taskid), task);
+        task.stage_ready_key(1, task.get_vruntime(), taskid);
+        self.ready_queue.insert(task);
         self.refresh_min_vruntime(None);
     }
 
@@ -405,41 +458,38 @@ impl<T> CFScheduler<T> {
         }
     }
 
-    fn rt_priority_key(priority: u8) -> u8 {
-        RT_PRIORITY_MAX - priority
-    }
-
     fn next_rt_seq(&mut self, front: bool) -> isize {
         if front {
-            self.rt_front_seq -= 1;
+            self.rt_front_seq = self.rt_front_seq.wrapping_sub(1);
             self.rt_front_seq
         } else {
             let seq = self.rt_back_seq;
-            self.rt_back_seq += 1;
+            self.rt_back_seq = self.rt_back_seq.wrapping_add(1);
             seq
         }
     }
 
     fn insert_rt_task(&mut self, task: Arc<CFSTask<T>>, front: bool) {
         let seq = self.next_rt_seq(front);
-        let key = (Self::rt_priority_key(task.rt_priority()), seq);
-        task.set_id(seq);
-        self.ready_rt_queue.insert(key, task);
+        task.stage_ready_key(0, rt_priority_key(task.rt_priority()), seq);
+        self.ready_queue.insert(task);
     }
 
     fn has_ready_rt_with_higher_priority(&self, current_priority: u8) -> bool {
-        self.ready_rt_queue
-            .first_key_value()
-            .map(|((key, _), _)| RT_PRIORITY_MAX - *key > current_priority)
-            .unwrap_or(false)
+        self.ready_queue.front().get().is_some_and(|task| {
+            task.ready_is_rt()
+                && task.ready_order.load(Ordering::Acquire) < rt_priority_key(current_priority)
+        })
     }
 
     fn has_ready_rt_with_same_priority(&self, current_priority: u8) -> bool {
-        let key = Self::rt_priority_key(current_priority);
-        self.ready_rt_queue
-            .range((key, isize::MIN)..=(key, isize::MAX))
-            .next()
-            .is_some()
+        let key = rt_priority_key(current_priority);
+        self.ready_queue
+            .lower_bound(Bound::Included(&(0, key, isize::MIN)))
+            .get()
+            .is_some_and(|task| {
+                task.ready_is_rt() && task.ready_order.load(Ordering::Acquire) == key
+            })
     }
 
     /// Updates runtime scheduling parameters for a task.
@@ -471,27 +521,35 @@ impl<T> BaseScheduler for CFScheduler<T> {
     }
 
     fn remove_task(&mut self, task: &Self::SchedItem) -> Option<Self::SchedItem> {
-        if task.is_rt() {
-            self.ready_rt_queue
-                .remove_entry(&(Self::rt_priority_key(task.rt_priority()), task.get_id()))
-                .map(|(_, task)| task)
-        } else {
-            let removed = self
-                .ready_fair_queue
-                .remove_entry(&(task.clone().get_vruntime(), task.clone().get_id()))
-                .map(|(_, task)| task);
-            self.refresh_min_vruntime(None);
-            removed
+        if !task.ready_link.is_linked() {
+            return None;
         }
+        let key = task.ready_key();
+        let mut cursor = self.ready_queue.lower_bound_mut(Bound::Included(&key));
+        loop {
+            let found = cursor.get()?;
+            if found.ready_key() != key {
+                return None;
+            }
+            if core::ptr::eq(found, Arc::as_ptr(task)) {
+                break;
+            }
+            cursor.move_next();
+        }
+        let removed = cursor.remove();
+        if removed.is_some() && key.0 != 0 {
+            self.refresh_min_vruntime(None);
+        }
+        removed
     }
 
     fn pick_next_task(&mut self) -> Option<Self::SchedItem> {
-        if let Some((_, task)) = self.ready_rt_queue.pop_first() {
-            return Some(task);
-        }
-        let next = self.ready_fair_queue.pop_first().map(|(_, task)| task);
-        match &next {
-            Some(task) => self.refresh_min_vruntime(Some(task.get_vruntime())),
+        let next = self.ready_queue.front_mut().remove();
+        match next.as_ref() {
+            Some(task) if !task.ready_is_rt() => {
+                self.refresh_min_vruntime(Some(task.ready_order.load(Ordering::Acquire)));
+            }
+            Some(_) => {}
             None => self.refresh_min_vruntime(None),
         }
         next
@@ -587,7 +645,12 @@ impl<T> BaseScheduler for CFScheduler<T> {
             };
         }
 
-        if !self.ready_rt_queue.is_empty() {
+        if self
+            .ready_queue
+            .front()
+            .get()
+            .is_some_and(CFSTask::ready_is_rt)
+        {
             return true;
         }
 

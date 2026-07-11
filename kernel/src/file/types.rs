@@ -185,7 +185,7 @@ pub trait FileLike: Pollable + DowncastSync {
     where
         Self: Sized + 'static,
     {
-        add_file_like(Arc::new(self), cloexec)
+        add_file_like(Arc::try_new(self).map_err(|_| AxError::NoMemory)?, cloexec)
     }
 }
 impl_downcast!(sync FileLike);

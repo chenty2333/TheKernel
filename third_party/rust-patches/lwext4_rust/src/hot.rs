@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::{InodeRef, SystemHal};
+use crate::{Ext4Error, Ext4Result, InodeRef, SystemHal, ffi::ENOMEM};
 
 const HOT_INODE_CACHE_CAPACITY: usize = 16;
 const EXTENT_STATUS_CACHE_CAPACITY: usize = 64;
@@ -304,12 +304,20 @@ pub(crate) struct ExtentStatusCache {
 }
 
 impl ExtentStatusCache {
-    pub(crate) fn new() -> Self {
-        Self {
-            entries: Vec::new(),
+    pub(crate) fn try_new() -> Ext4Result<Self> {
+        let mut entries = Vec::new();
+        // Insertion temporarily grows to capacity + 1 before evicting the LRU
+        // tail. Admit that scratch slot once, outside all filesystem locks.
+        entries
+            .try_reserve_exact(EXTENT_STATUS_CACHE_CAPACITY.saturating_add(1))
+            .map_err(|_| {
+                Ext4Error::new(ENOMEM as _, "ext4 extent-status cache allocation failed")
+            })?;
+        Ok(Self {
+            entries,
             seq: 0,
             capacity: EXTENT_STATUS_CACHE_CAPACITY,
-        }
+        })
     }
 
     pub(crate) fn lookup(&mut self, lblock: u32, max_blocks: u32) -> Option<ExtentStatusRun> {
@@ -414,11 +422,15 @@ pub(crate) struct HotInodeCache<Hal: SystemHal> {
 }
 
 impl<Hal: SystemHal> HotInodeCache<Hal> {
-    pub(crate) fn new() -> Self {
-        Self {
-            entries: Vec::new(),
+    pub(crate) fn try_new() -> Ext4Result<Self> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(HOT_INODE_CACHE_CAPACITY.saturating_add(1))
+            .map_err(|_| Ext4Error::new(ENOMEM as _, "ext4 hot-inode cache allocation failed"))?;
+        Ok(Self {
+            entries,
             capacity: HOT_INODE_CACHE_CAPACITY,
-        }
+        })
     }
 
     pub(crate) fn take(&mut self, ino: u32) -> Option<InodeRef<Hal>> {
@@ -426,35 +438,43 @@ impl<Hal: SystemHal> HotInodeCache<Hal> {
         Some(self.entries.remove(idx).inode)
     }
 
-    pub(crate) fn put(&mut self, ino: u32, inode: InodeRef<Hal>) {
+    pub(crate) fn put(&mut self, ino: u32, inode: InodeRef<Hal>) -> Option<InodeRef<Hal>> {
         if self.capacity == 0 {
-            drop(inode);
             record_hot_inode_eviction();
-            return;
+            return Some(inode);
         }
+        let mut evicted = None;
         if let Some(idx) = self.entries.iter().position(|entry| entry.ino == ino) {
             let old = self.entries.remove(idx);
-            drop(old);
+            evicted = Some(old.inode);
         }
         self.entries.insert(0, HotInodeEntry { ino, inode });
         if self.entries.len() > self.capacity {
             let old = self.entries.pop();
-            drop(old);
             record_hot_inode_eviction();
+            if let Some(old) = old {
+                // A replacement and a capacity eviction cannot both happen:
+                // replacing an existing key leaves the length unchanged.
+                debug_assert!(evicted.is_none());
+                evicted = Some(old.inode);
+            }
         }
+        evicted
     }
 
-    pub(crate) fn invalidate(&mut self, ino: u32) {
+    pub(crate) fn invalidate(&mut self, ino: u32) -> Option<InodeRef<Hal>> {
         if let Some(idx) = self.entries.iter().position(|entry| entry.ino == ino) {
             let old = self.entries.remove(idx);
-            drop(old);
             record_hot_inode_drain(1);
+            Some(old.inode)
+        } else {
+            None
         }
     }
 
-    pub(crate) fn drain_all(&mut self) {
+    pub(crate) fn drain_all(&mut self) -> impl Iterator<Item = InodeRef<Hal>> + '_ {
         let count = self.entries.len();
-        self.entries.clear();
         record_hot_inode_drain(count);
+        self.entries.drain(..).map(|entry| entry.inode)
     }
 }

@@ -77,6 +77,7 @@ where
 pub struct SimpleFile {
     node: SimpleFsNode,
     ops: Arc<dyn SimpleFileOps>,
+    flags: NodeFlags,
 }
 
 impl SimpleFile {
@@ -92,11 +93,34 @@ impl SimpleFile {
         permission: NodePermission,
         ops: impl SimpleFileOps,
     ) -> Arc<Self> {
+        Self::new_with_permission_and_flags(fs, ty, permission, NodeFlags::NON_CACHEABLE, ops)
+    }
+
+    fn new_with_permission_and_flags(
+        fs: Arc<SimpleFs>,
+        ty: NodeType,
+        permission: NodePermission,
+        flags: NodeFlags,
+        ops: impl SimpleFileOps,
+    ) -> Arc<Self> {
         let node = SimpleFsNode::new(fs, ty, permission);
         Arc::new(Self {
             node,
             ops: Arc::new(ops),
+            flags,
         })
+    }
+
+    /// Creates a dynamic link that pathwalk policy can distinguish from an
+    /// ordinary filesystem symlink.
+    pub fn new_magic_link(fs: Arc<SimpleFs>, ops: impl SimpleFileOps) -> Arc<Self> {
+        Self::new_with_permission_and_flags(
+            fs,
+            NodeType::Symlink,
+            NodePermission::default(),
+            NodeFlags::NON_CACHEABLE | NodeFlags::MAGIC_LINK,
+            ops,
+        )
     }
 
     /// Creates a simple file from given file operations.
@@ -143,7 +167,7 @@ impl NodeOps for SimpleFile {
     }
 
     fn flags(&self) -> NodeFlags {
-        NodeFlags::NON_CACHEABLE
+        self.flags
     }
 }
 

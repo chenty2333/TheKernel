@@ -8,7 +8,7 @@ use core::{
 };
 
 use async_trait::async_trait;
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng::{FS_CONTEXT, OpenOptions};
 use axfs_ng_vfs::NodeType;
 use axio::{IoBuf, Read, Write};
@@ -19,6 +19,8 @@ use enum_dispatch::enum_dispatch;
 use hashbrown::HashMap;
 use lazy_static::lazy_static;
 
+#[doc(hidden)]
+pub use self::dgram::{drain_deferred_receive_cleanup_work, has_deferred_receive_cleanup_work};
 pub use self::{dgram::DgramTransport, stream::StreamTransport};
 use crate::{
     RecvOptions, SendOptions, Shutdown, Socket, SocketAddrEx, SocketFilter, SocketOps,
@@ -41,6 +43,8 @@ pub enum UnixSocketAddr {
 #[async_trait]
 #[enum_dispatch]
 pub trait TransportOps: Configurable + Pollable + Send + Sync {
+    /// Stores a deferred socket error.
+    fn set_pending_error(&self, error: LinuxError);
     /// Bind the transport to the given address.
     fn bind(&self, slot: &BindSlot, local_addr: &UnixSocketAddr) -> AxResult;
     /// Connect the transport to a remote address.
@@ -185,6 +189,10 @@ impl UnixSocket {
             Transport::Dgram(dgram) => dgram.is_connected(),
         }
     }
+
+    pub(crate) fn set_pending_error(&self, error: LinuxError) {
+        self.transport.set_pending_error(error);
+    }
 }
 impl Configurable for UnixSocket {
     fn nonblocking(&self) -> bool {
@@ -297,7 +305,7 @@ mod tests {
             .insert(name.clone(), BindSlot::default());
 
         let socket = UnixSocket {
-            transport: DgramTransport::new().into(),
+            transport: DgramTransport::new().unwrap().into(),
             local_addr: Mutex::new(UnixSocketAddr::Abstract(name.clone())),
             remote_addr: Mutex::new(UnixSocketAddr::Unnamed),
             owns_bind: AtomicBool::new(true),

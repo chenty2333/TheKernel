@@ -1,78 +1,198 @@
-use alloc::{borrow::ToOwned, string::String, sync::Arc};
-use core::{any::Any, task::Context};
+use alloc::{string::String, sync::Arc};
+use core::{
+    any::Any,
+    sync::atomic::{AtomicU64, Ordering},
+    task::Context,
+};
 
 use axfs_ng_vfs::{
-    DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode, FileNodeOps, FilesystemOps,
-    Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission, NodeType, Reference, VfsError,
+    CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps,
+    FileNode, FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NamedCreateOptions, NodeFlags,
+    NodeOps, NodePermission, NodeType, Reference, RenameRequest, UnlinkRequest, VfsError,
     VfsResult, WeakDirEntry,
 };
 use axhal::time::wall_time;
 use axpoll::{IoEvents, Pollable};
-use lwext4_rust::{FileAttr, InodeType};
+use lwext4_rust::{FileAttr, InodeToken, InodeType, ffi::ENOENT};
+use spin::Once;
 
 use super::{
     Ext4Filesystem,
     util::{LwExt4Filesystem, into_vfs_err, into_vfs_type},
 };
 
+fn combine_vfs_cleanup<T>(operation: VfsResult<T>, cleanup: VfsResult<()>) -> VfsResult<T> {
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(cleanup_err)) => {
+            log::error!("secondary ext4 VFS cleanup failure: {cleanup_err}");
+            Err(err)
+        }
+    }
+}
+
+fn try_owned(value: &str) -> VfsResult<String> {
+    let mut result = String::new();
+    result
+        .try_reserve_exact(value.len())
+        .map_err(|_| VfsError::NoMemory)?;
+    result.push_str(value);
+    Ok(result)
+}
+
+struct InodeBinding {
+    token: InodeToken,
+    namespace_epoch: Arc<AtomicU64>,
+}
+
+pub(crate) struct PreparedInodeEntry {
+    inode: Arc<Inode>,
+    entry: DirEntry,
+}
+
+impl PreparedInodeEntry {
+    pub(crate) fn bind(self, token: InodeToken, namespace_epoch: Arc<AtomicU64>) -> DirEntry {
+        self.inode.bind(token, namespace_epoch);
+        self.entry
+    }
+}
+
 pub struct Inode {
     fs: Arc<Ext4Filesystem>,
-    ino: u32,
-    this: Option<WeakDirEntry>,
+    binding: Once<InodeBinding>,
+    this: Once<WeakDirEntry>,
 }
 
 impl Inode {
-    pub(crate) fn new(fs: Arc<Ext4Filesystem>, ino: u32, this: Option<WeakDirEntry>) -> Arc<Self> {
-        Arc::new(Self { fs, ino, this })
+    pub(crate) fn try_prepare_entry(
+        fs: Arc<Ext4Filesystem>,
+        inode_type: InodeType,
+        reference: Reference,
+    ) -> VfsResult<PreparedInodeEntry> {
+        let inode = Arc::try_new(Self {
+            fs,
+            binding: Once::new(),
+            this: Once::new(),
+        })
+        .map_err(|_| VfsError::NoMemory)?;
+        let entry = if inode_type == InodeType::Directory {
+            let entry = DirEntry::try_new_dir(DirNode::new(inode.clone()), reference)?;
+            inode.this.call_once(|| entry.downgrade());
+            entry
+        } else {
+            DirEntry::try_new_file(
+                FileNode::new(inode.clone()),
+                into_vfs_type(inode_type),
+                reference,
+            )?
+        };
+        Ok(PreparedInodeEntry { inode, entry })
     }
 
-    fn create_entry(&self, entry: &lwext4_rust::DirEntry, name: impl Into<String>) -> DirEntry {
-        let reference = Reference::new(
-            self.this.as_ref().and_then(WeakDirEntry::upgrade),
-            name.into(),
-        );
-        if entry.inode_type() == InodeType::Directory {
-            DirEntry::new_dir(
-                |this| DirNode::new(Inode::new(self.fs.clone(), entry.ino(), Some(this))),
-                reference,
-            )
-        } else {
-            DirEntry::new_file(
-                FileNode::new(Inode::new(self.fs.clone(), entry.ino(), None)),
-                into_vfs_type(entry.inode_type()),
-                reference,
-            )
+    fn bind(&self, token: InodeToken, namespace_epoch: Arc<AtomicU64>) {
+        self.binding.call_once(|| InodeBinding {
+            token,
+            namespace_epoch,
+        });
+    }
+
+    fn token(&self) -> Option<InodeToken> {
+        self.binding.get().map(|binding| binding.token)
+    }
+
+    fn ino(&self) -> u32 {
+        self.token().map_or(0, InodeToken::ino)
+    }
+
+    fn try_prepare_child(
+        &self,
+        inode_type: InodeType,
+        name: String,
+    ) -> VfsResult<PreparedInodeEntry> {
+        Self::try_prepare_entry(
+            self.fs.clone(),
+            inode_type,
+            Reference::new(self.this.get().and_then(WeakDirEntry::upgrade), name),
+        )
+    }
+
+    /// Completes a retained low-level inode identity outside the ext4 spin
+    /// lock. If VFS allocation fails, the retained handle is released before
+    /// returning to the caller.
+    fn try_finish_retained_entry(
+        &self,
+        token: InodeToken,
+        namespace_epoch: Arc<AtomicU64>,
+        inode_type: InodeType,
+        name: String,
+    ) -> VfsResult<DirEntry> {
+        match self.try_prepare_child(inode_type, name) {
+            Ok(prepared) => Ok(prepared.bind(token, namespace_epoch)),
+            Err(err) => {
+                self.fs.lock().release_inode_handle(token);
+                Err(err)
+            }
         }
     }
 
-    fn lookup_locked(&self, fs: &mut LwExt4Filesystem, name: &str) -> VfsResult<DirEntry> {
-        let mut result = fs.lookup(self.ino, name).map_err(into_vfs_err)?;
-        let entry = result.entry();
-        Ok(self.create_entry(&entry, name))
+    fn try_finish_retained_name(
+        &self,
+        token: InodeToken,
+        namespace_epoch: Arc<AtomicU64>,
+        inode_type: InodeType,
+        name: &str,
+    ) -> VfsResult<DirEntry> {
+        match try_owned(name) {
+            Ok(name) => self.try_finish_retained_entry(token, namespace_epoch, inode_type, name),
+            Err(err) => {
+                self.fs.lock().release_inode_handle(token);
+                Err(err)
+            }
+        }
+    }
+
+    fn bump_namespace_epoch(&self) {
+        if let Some(binding) = self.binding.get() {
+            binding.namespace_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn namespace_epoch_handle(&self) -> Option<&Arc<AtomicU64>> {
+        self.binding.get().map(|binding| &binding.namespace_epoch)
     }
 
     fn update_ctime_locked(&self, fs: &mut LwExt4Filesystem, ino: u32) -> VfsResult<()> {
-        fs.with_inode_ref(ino, |ino| {
+        fs.with_inode_ref_mut(ino, |ino| {
             ino.update_ctime();
             Ok(())
         })
         .map_err(into_vfs_err)
     }
+
+    fn expected_token(&self, expected: &DirEntry) -> Option<InodeToken> {
+        expected
+            .downcast::<Self>()
+            .ok()
+            .and_then(|expected| Arc::ptr_eq(&self.fs, &expected.fs).then(|| expected.token()))
+            .flatten()
+    }
 }
 
 impl NodeOps for Inode {
     fn inode(&self) -> u64 {
-        self.ino as _
+        self.ino() as _
     }
 
     fn metadata(&self) -> VfsResult<Metadata> {
         let mut attr = FileAttr::default();
         self.fs
             .lock()
-            .get_attr(self.ino, &mut attr)
+            .get_attr(self.ino(), &mut attr)
             .map_err(into_vfs_err)?;
         Ok(Metadata {
-            inode: self.ino as _,
+            inode: self.ino() as _,
             device: attr.device,
             nlink: attr.nlink,
             mode: NodePermission::from_bits_truncate(attr.mode as u16),
@@ -92,7 +212,7 @@ impl NodeOps for Inode {
 
     fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()> {
         let mut fs = self.fs.lock();
-        fs.with_inode_ref(self.ino, |inode| {
+        fs.with_inode_ref_mut(self.ino(), |inode| {
             let mut status_changed = false;
             if let Some(mode) = update.mode {
                 inode.set_mode((inode.mode() & !0xfff) | (mode.bits() as u32));
@@ -127,7 +247,7 @@ impl NodeOps for Inode {
     fn len(&self) -> VfsResult<u64> {
         self.fs
             .lock()
-            .with_inode_ref(self.ino, |inode| Ok(inode.size()))
+            .with_inode_ref(self.ino(), |inode| Ok(inode.size()))
             .map_err(into_vfs_err)
     }
 
@@ -154,6 +274,14 @@ impl NodeOps for Inode {
     }
 }
 
+impl Drop for Inode {
+    fn drop(&mut self) {
+        if let Some(binding) = self.binding.get() {
+            self.fs.lock().release_inode_handle(binding.token);
+        }
+    }
+}
+
 impl FileNodeOps for Inode {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         if {
@@ -162,12 +290,12 @@ impl FileNodeOps for Inode {
         } {
             self.fs
                 .lock()
-                .read_at_aligned_hot(self.ino, buf, offset)
+                .read_at_aligned_hot(self.ino(), buf, offset)
                 .map_err(into_vfs_err)
         } else {
             self.fs
                 .lock()
-                .read_at(self.ino, buf, offset)
+                .read_at(self.ino(), buf, offset)
                 .map_err(into_vfs_err)
         }
     }
@@ -180,7 +308,7 @@ impl FileNodeOps for Inode {
         } {
             let mut fs = self.fs.lock();
             if let Some(read) = fs
-                .read_at_aligned_hot_vectored(self.ino, bufs, offset)
+                .read_at_aligned_hot_vectored(self.ino(), bufs, offset)
                 .map_err(into_vfs_err)?
             {
                 return Ok(read);
@@ -194,7 +322,7 @@ impl FileNodeOps for Inode {
                 continue;
             }
             let requested = buf.len();
-            let read = fs.read_at(self.ino, buf, offset).map_err(into_vfs_err)?;
+            let read = fs.read_at(self.ino(), buf, offset).map_err(into_vfs_err)?;
             total += read;
             offset = offset
                 .checked_add(read as u64)
@@ -213,7 +341,7 @@ impl FileNodeOps for Inode {
     ) -> VfsResult<Option<usize>> {
         let submission = {
             let mut fs = self.fs.lock();
-            fs.read_at_aligned_hot_vectored_async_submit(self.ino, bufs, offset)
+            fs.read_at_aligned_hot_vectored_async_submit(self.ino(), bufs, offset)
                 .map_err(into_vfs_err)?
         };
         let Some(submission) = submission else {
@@ -226,9 +354,9 @@ impl FileNodeOps for Inode {
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
         let mut fs = self.fs.lock();
         if fs.is_block_aligned_range(offset, buf.len()) {
-            fs.write_at_aligned_hot(self.ino, buf, offset)
+            fs.write_at_aligned_hot(self.ino(), buf, offset)
         } else {
-            fs.write_at(self.ino, buf, offset)
+            fs.write_at(self.ino(), buf, offset)
         }
         .map_err(into_vfs_err)
     }
@@ -238,7 +366,7 @@ impl FileNodeOps for Inode {
         let mut fs = self.fs.lock();
         if fs.is_block_aligned_range(offset, len)
             && let Some(written) = fs
-                .write_at_aligned_hot_vectored(self.ino, bufs, offset)
+                .write_at_aligned_hot_vectored(self.ino(), bufs, offset)
                 .map_err(into_vfs_err)?
         {
             return Ok(written);
@@ -250,7 +378,7 @@ impl FileNodeOps for Inode {
                 continue;
             }
             let requested = buf.len();
-            let written = fs.write_at(self.ino, buf, offset).map_err(into_vfs_err)?;
+            let written = fs.write_at(self.ino(), buf, offset).map_err(into_vfs_err)?;
             total += written;
             offset = offset
                 .checked_add(written as u64)
@@ -265,7 +393,7 @@ impl FileNodeOps for Inode {
     fn try_write_at_vectored_async(&self, bufs: &[&[u8]], offset: u64) -> VfsResult<Option<usize>> {
         let submission = {
             let mut fs = self.fs.lock();
-            fs.write_at_aligned_hot_vectored_async_submit(self.ino, bufs, offset)
+            fs.write_at_aligned_hot_vectored_async_submit(self.ino(), bufs, offset)
                 .map_err(into_vfs_err)?
         };
         let Some(submission) = submission else {
@@ -278,20 +406,23 @@ impl FileNodeOps for Inode {
     fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {
         let mut fs = self.fs.lock();
         let length = fs
-            .with_inode_ref(self.ino, |inode| Ok(inode.size()))
+            .with_inode_ref(self.ino(), |inode| Ok(inode.size()))
             .map_err(into_vfs_err)?;
-        let written = fs.write_at(self.ino, buf, length).map_err(into_vfs_err)?;
+        let written = fs.write_at(self.ino(), buf, length).map_err(into_vfs_err)?;
         Ok((written, length + written as u64))
     }
 
     fn set_len(&self, len: u64) -> VfsResult<()> {
-        self.fs.lock().set_len(self.ino, len).map_err(into_vfs_err)
+        self.fs
+            .lock()
+            .set_len(self.ino(), len)
+            .map_err(into_vfs_err)
     }
 
     fn set_symlink(&self, target: &str) -> VfsResult<()> {
         self.fs
             .lock()
-            .set_symlink(self.ino, target.as_bytes())
+            .set_symlink(self.ino(), target.as_bytes())
             .map_err(into_vfs_err)
     }
 }
@@ -305,100 +436,247 @@ impl Pollable for Inode {
 }
 
 impl DirNodeOps for Inode {
+    fn namespace_epoch(&self) -> u64 {
+        self.binding
+            .get()
+            .map_or(0, |binding| binding.namespace_epoch.load(Ordering::Acquire))
+    }
+
     fn read_dir(&self, offset: u64, sink: &mut dyn DirEntrySink) -> VfsResult<usize> {
         let mut fs = self.fs.lock();
-        let mut reader = fs.read_dir(self.ino, offset).map_err(into_vfs_err)?;
-        let mut count = 0;
-        while let Some(entry) = reader.current() {
-            let name = core::str::from_utf8(entry.name())
-                .map_err(|_| VfsError::InvalidData)?
-                .to_owned();
-            let ino = entry.ino() as u64;
-            let node_type = into_vfs_type(entry.inode_type());
-            reader.step().map_err(into_vfs_err)?;
-            if !sink.accept(&name, ino, node_type, reader.offset()) {
-                break;
+        let mut reader = fs.read_dir(self.ino(), offset).map_err(into_vfs_err)?;
+        let operation = (|| {
+            let mut count = 0;
+            while let Some(entry) = reader.current() {
+                let name = try_owned(
+                    core::str::from_utf8(entry.name()).map_err(|_| VfsError::InvalidData)?,
+                )?;
+                let ino = entry.ino() as u64;
+                let node_type = into_vfs_type(entry.inode_type());
+                reader.step().map_err(into_vfs_err)?;
+                if !sink.accept(&name, ino, node_type, reader.offset()) {
+                    break;
+                }
+                count += 1;
             }
-            count += 1;
-        }
-        Ok(count)
+            Ok(count)
+        })();
+        combine_vfs_cleanup(operation, reader.finish().map_err(into_vfs_err))
     }
 
     fn lookup(&self, name: &str) -> VfsResult<DirEntry> {
-        let mut fs = self.fs.lock();
-        self.lookup_locked(&mut fs, name)
+        let entry_name = try_owned(name)?;
+        let (token, namespace_epoch, inode_type) = {
+            let mut fs = self.fs.lock();
+            let (ino, inode_type) = fs.lookup_inode(self.ino(), name).map_err(into_vfs_err)?;
+            let (token, namespace_epoch) = fs.retain_inode_handle(ino).map_err(into_vfs_err)?;
+            (token, namespace_epoch, inode_type)
+        };
+        self.try_finish_retained_entry(token, namespace_epoch, inode_type, entry_name)
     }
 
-    fn create(
+    fn create_named(
         &self,
         name: &str,
-        node_type: NodeType,
-        permission: NodePermission,
-    ) -> VfsResult<DirEntry> {
-        let inode_type = match node_type {
+        options: &NamedCreateOptions,
+        disposition: CreateDisposition,
+    ) -> VfsResult<CreateOutcome<DirEntry>> {
+        let inode_type = match options.node_type {
             NodeType::Fifo => InodeType::Fifo,
             NodeType::CharacterDevice => InodeType::CharacterDevice,
             NodeType::Directory => InodeType::Directory,
             NodeType::BlockDevice => InodeType::BlockDevice,
             NodeType::RegularFile => InodeType::RegularFile,
-            NodeType::Symlink => InodeType::Symlink,
+            NodeType::Symlink => return Err(VfsError::OperationNotSupported),
             NodeType::Socket => InodeType::Socket,
-            NodeType::Unknown => {
-                return Err(VfsError::InvalidData);
+            NodeType::Unknown => return Err(VfsError::InvalidData),
+        };
+
+        // Fast existing-name path: retain the stable identity while serialized,
+        // then build its VFS node after releasing the ext4 spin lock.
+        let existing = {
+            let mut fs = self.fs.lock();
+            match fs.lookup_inode(self.ino(), name) {
+                Ok((ino, existing_type)) => {
+                    if disposition == CreateDisposition::Exclusive {
+                        return Err(VfsError::AlreadyExists);
+                    }
+                    let (token, namespace_epoch) =
+                        fs.retain_inode_handle(ino).map_err(into_vfs_err)?;
+                    Some((token, namespace_epoch, existing_type))
+                }
+                Err(err) if err.code == ENOENT as i32 && !err.metadata_may_have_changed() => None,
+                Err(err) => return Err(into_vfs_err(err)),
             }
         };
-        let mut fs = self.fs.lock();
-        if fs.lookup(self.ino, name).is_ok() {
-            return Err(VfsError::AlreadyExists);
+        if let Some((token, namespace_epoch, existing_type)) = existing {
+            let entry =
+                self.try_finish_retained_name(token, namespace_epoch, existing_type, name)?;
+            return Ok(CreateOutcome {
+                entry,
+                created: false,
+            });
         }
-        let ino = fs
-            .create(self.ino, name, inode_type, permission.bits() as _)
-            .map_err(into_vfs_err)?;
-        let now = wall_time();
-        fs.with_inode_ref(ino, |inode| {
-            inode.set_atime(&now);
-            inode.set_btime(&now);
-            inode.set_mtime(&now);
-            inode.update_ctime();
-            Ok(())
-        })
-        .map_err(into_vfs_err)?;
-        self.update_ctime_locked(&mut fs, ino)?;
 
-        let reference = Reference::new(
-            self.this.as_ref().and_then(WeakDirEntry::upgrade),
-            name.to_owned(),
-        );
-        Ok(if node_type == NodeType::Directory {
-            DirEntry::new_dir(
-                |this| DirNode::new(Inode::new(self.fs.clone(), ino, Some(this))),
-                reference,
+        let entry_name = try_owned(name)?;
+        let prepared = self.try_prepare_child(inode_type, entry_name)?;
+        let mut fs = self.fs.lock();
+        // Allocation above opened a race window. Revalidate under the same
+        // serialization used by the backend create before committing anything.
+        match fs.lookup_inode(self.ino(), name) {
+            Ok((ino, existing_type)) => {
+                if disposition == CreateDisposition::Exclusive {
+                    return Err(VfsError::AlreadyExists);
+                }
+                let (token, namespace_epoch) = fs.retain_inode_handle(ino).map_err(into_vfs_err)?;
+                drop(fs);
+                drop(prepared);
+                let entry =
+                    self.try_finish_retained_name(token, namespace_epoch, existing_type, name)?;
+                return Ok(CreateOutcome {
+                    entry,
+                    created: false,
+                });
+            }
+            Err(err) if err.code == ENOENT as i32 && !err.metadata_may_have_changed() => {}
+            Err(err) => return Err(into_vfs_err(err)),
+        }
+        self.bump_namespace_epoch();
+        let (token, namespace_epoch) = fs
+            .create(
+                self.ino(),
+                name,
+                inode_type,
+                options.permission.bits() as _,
+                options.owner,
+                options.rdev.map(|rdev| rdev.0),
+                Some(wall_time()),
             )
-        } else {
-            DirEntry::new_file(
-                FileNode::new(Inode::new(self.fs.clone(), ino, None)),
-                node_type,
-                reference,
-            )
+            .map_err(into_vfs_err)?;
+        Ok(CreateOutcome {
+            entry: prepared.bind(token, namespace_epoch),
+            created: true,
         })
+    }
+
+    fn create_symlink(
+        &self,
+        name: &str,
+        target: &str,
+        permission: NodePermission,
+        user: Option<(u32, u32)>,
+    ) -> VfsResult<DirEntry> {
+        {
+            let mut fs = self.fs.lock();
+            match fs.lookup_inode(self.ino(), name) {
+                Ok(_) => return Err(VfsError::AlreadyExists),
+                Err(err) if err.code == ENOENT as i32 && !err.metadata_may_have_changed() => {}
+                Err(err) => return Err(into_vfs_err(err)),
+            }
+        }
+        let prepared = self.try_prepare_child(InodeType::Symlink, try_owned(name)?)?;
+        let mut fs = self.fs.lock();
+        match fs.lookup_inode(self.ino(), name) {
+            Ok(_) => return Err(VfsError::AlreadyExists),
+            Err(err) if err.code == ENOENT as i32 && !err.metadata_may_have_changed() => {}
+            Err(err) => return Err(into_vfs_err(err)),
+        }
+        self.bump_namespace_epoch();
+        let (token, namespace_epoch) = fs
+            .create_symlink(
+                self.ino(),
+                name,
+                target.as_bytes(),
+                permission.bits() as _,
+                user,
+                Some(wall_time()),
+            )
+            .map_err(into_vfs_err)?;
+        Ok(prepared.bind(token, namespace_epoch))
     }
 
     fn link(&self, name: &str, node: &DirEntry) -> VfsResult<DirEntry> {
+        let target = node
+            .downcast::<Self>()
+            .map_err(|_| VfsError::CrossesDevices)?;
+        if !Arc::ptr_eq(&self.fs, &target.fs) {
+            return Err(VfsError::CrossesDevices);
+        }
+        let target_token = target.token().ok_or(VfsError::NotFound)?;
+        let inode_type = match node.node_type() {
+            NodeType::Fifo => InodeType::Fifo,
+            NodeType::CharacterDevice => InodeType::CharacterDevice,
+            NodeType::Directory => return Err(VfsError::OperationNotPermitted),
+            NodeType::BlockDevice => InodeType::BlockDevice,
+            NodeType::RegularFile => InodeType::RegularFile,
+            NodeType::Symlink => InodeType::Symlink,
+            NodeType::Socket => InodeType::Socket,
+            NodeType::Unknown => return Err(VfsError::InvalidData),
+        };
+        let prepared = self.try_prepare_child(inode_type, try_owned(name)?)?;
         let mut fs = self.fs.lock();
-        fs.link(self.ino, name, node.inode() as _)
+        let (retained_token, namespace_epoch) = fs
+            .retain_inode_handle(target_token.ino())
             .map_err(into_vfs_err)?;
-        self.update_ctime_locked(&mut fs, node.inode() as _)?;
-        self.lookup_locked(&mut fs, name)
+        if retained_token != target_token {
+            fs.release_inode_handle(retained_token);
+            return Err(VfsError::NotFound);
+        }
+        self.bump_namespace_epoch();
+        if let Err(err) = fs.link(self.ino(), name, target_token.ino()) {
+            fs.release_inode_handle(retained_token);
+            return Err(into_vfs_err(err));
+        }
+        if let Err(primary) = self.update_ctime_locked(&mut fs, target_token.ino()) {
+            // The directory entry is already committed.  A failed ctime
+            // update leaves no safe point from which another metadata
+            // operation can infer whether the link should be retried.
+            fs.release_inode_handle(retained_token);
+            fs.mark_metadata_poisoned();
+            return Err(primary);
+        }
+        Ok(prepared.bind(retained_token, namespace_epoch))
     }
 
-    fn unlink(&self, name: &str) -> VfsResult<()> {
-        self.fs.lock().unlink(self.ino, name).map_err(into_vfs_err)
-    }
-
-    fn rename(&self, src_name: &str, dst_dir: &DirNode, dst_name: &str) -> VfsResult<()> {
-        let dst_dir: Arc<Self> = dst_dir.downcast().map_err(|_| VfsError::InvalidInput)?;
+    fn unlink(&self, request: UnlinkRequest<'_>) -> VfsResult<()> {
+        let expected = match request.expected {
+            Some(expected) => Some(self.expected_token(expected).ok_or(VfsError::NotFound)?),
+            None => None,
+        };
         let mut fs = self.fs.lock();
-        fs.rename(self.ino, src_name, dst_dir.ino, dst_name)
+        self.bump_namespace_epoch();
+        fs.unlink_checked(self.ino(), request.name, expected, Some(request.is_dir))
             .map_err(into_vfs_err)
+    }
+
+    fn rename(&self, request: RenameRequest<'_>) -> VfsResult<()> {
+        let dst_dir: Arc<Self> = request
+            .dst_dir
+            .downcast()
+            .map_err(|_| VfsError::InvalidInput)?;
+        if !Arc::ptr_eq(&self.fs, &dst_dir.fs) {
+            return Err(VfsError::CrossesDevices);
+        }
+        let src = self.expected_token(request.src).ok_or(VfsError::NotFound)?;
+        let dst = request
+            .dst
+            .map(|expected| self.expected_token(expected).ok_or(VfsError::NotFound))
+            .transpose()?;
+        let src_epoch = self.namespace_epoch_handle().ok_or(VfsError::Io)?;
+        let dst_epoch = dst_dir.namespace_epoch_handle().ok_or(VfsError::Io)?;
+        let mut fs = self.fs.lock();
+        self.bump_namespace_epoch();
+        if !Arc::ptr_eq(src_epoch, dst_epoch) {
+            dst_dir.bump_namespace_epoch();
+        }
+        fs.rename(
+            self.ino(),
+            request.src_name,
+            dst_dir.ino(),
+            request.dst_name,
+            src,
+            dst,
+        )
+        .map_err(into_vfs_err)
     }
 }

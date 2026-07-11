@@ -251,17 +251,10 @@ pub fn sys_faccessat(dirfd: c_int, path: *const c_char, mode: u32) -> AxResult<i
 }
 
 fn check_readonly_write_access(loc: &Location) -> AxResult {
-    let path = loc.absolute_path().map_err(|_| AxError::InvalidInput)?;
-    if crate::mounts::is_readonly(path.as_ref()) {
+    if crate::mounts::is_readonly(loc)? {
         Err(AxError::ReadOnlyFilesystem)
     } else {
         Ok(())
-    }
-}
-
-fn note_mount_access(loc: &Location) {
-    if let Ok(path) = loc.absolute_path() {
-        mounts::clear_expiry_for_path(path.as_ref());
     }
 }
 
@@ -297,12 +290,10 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
     };
     if let Some(loc) = loc {
         if mode & X_OK != 0 && node_type == NodeType::RegularFile {
-            let path = loc.absolute_path().map_err(|_| AxError::InvalidInput)?;
-            if crate::mounts::is_noexec(path.as_ref()) {
+            if crate::mounts::is_noexec(loc)? {
                 return Err(AxError::PermissionDenied);
             }
         }
-        note_mount_access(loc);
     }
 
     if mode == 0 {
@@ -337,12 +328,7 @@ fn statfs(loc: &Location) -> AxResult<statfs> {
     };
     result.f_namelen = stat.name_length as _;
     result.f_frsize = stat.fragment_size as _;
-    result.f_flags = crate::mounts::statfs_mount_flags(
-        loc.absolute_path()
-            .map_err(|_| AxError::InvalidInput)?
-            .as_ref(),
-        stat.mount_flags,
-    ) as _;
+    result.f_flags = crate::mounts::statfs_mount_flags(loc, stat.mount_flags)? as _;
     Ok(result)
 }
 

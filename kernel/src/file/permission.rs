@@ -2,16 +2,17 @@ use alloc::borrow::Cow;
 
 use axerrno::{AxError, AxResult};
 use axfs::FsContext;
-use axfs_ng_vfs::{Location, NodePermission, NodeType, path::Path};
-use linux_raw_sys::general::{CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, R_OK, W_OK, X_OK};
+use axfs_ng_vfs::{Location, Metadata, NodePermission, NodeType, path::Path};
+use linux_raw_sys::general::{
+    CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, R_OK, W_OK, X_OK,
+};
 
 use crate::task::DacCredentialView;
 
 const STICKY_MODE_BIT: u32 = 0o1000;
 
 pub(crate) fn check_writable_mount(dir: &Location) -> AxResult {
-    let path = dir.absolute_path().map_err(|_| AxError::InvalidInput)?;
-    if crate::mounts::is_readonly(path.as_ref()) {
+    if crate::mounts::is_readonly(dir)? {
         Err(AxError::ReadOnlyFilesystem)
     } else {
         Ok(())
@@ -123,7 +124,19 @@ pub(crate) trait DacFsContextExt {
         credentials: &DacCredentialView,
     ) -> AxResult<Location>;
 
+    fn resolve_dac_unobserved(
+        &self,
+        path: impl AsRef<Path>,
+        credentials: &DacCredentialView,
+    ) -> AxResult<Location>;
+
     fn resolve_no_follow_dac(
+        &self,
+        path: impl AsRef<Path>,
+        credentials: &DacCredentialView,
+    ) -> AxResult<Location>;
+
+    fn resolve_no_follow_dac_unobserved(
         &self,
         path: impl AsRef<Path>,
         credentials: &DacCredentialView,
@@ -153,12 +166,32 @@ impl DacFsContextExt for FsContext {
         })
     }
 
+    fn resolve_dac_unobserved(
+        &self,
+        path: impl AsRef<Path>,
+        credentials: &DacCredentialView,
+    ) -> AxResult<Location> {
+        self.resolve_with_admission_unobserved(path, &mut |dir| {
+            check_pathwalk_search_permission(dir, credentials)
+        })
+    }
+
     fn resolve_no_follow_dac(
         &self,
         path: impl AsRef<Path>,
         credentials: &DacCredentialView,
     ) -> AxResult<Location> {
         self.resolve_no_follow_with_admission(path, &mut |dir| {
+            check_pathwalk_search_permission(dir, credentials)
+        })
+    }
+
+    fn resolve_no_follow_dac_unobserved(
+        &self,
+        path: impl AsRef<Path>,
+        credentials: &DacCredentialView,
+    ) -> AxResult<Location> {
+        self.resolve_no_follow_with_admission_unobserved(path, &mut |dir| {
             check_pathwalk_search_permission(dir, credentials)
         })
     }
@@ -196,6 +229,48 @@ pub(crate) fn check_create_permissions(
     credentials: &DacCredentialView,
 ) -> AxResult {
     check_directory_write_search_permissions(dir, credentials)
+}
+
+/// Computes Linux `vfs_prepare_mode()` plus `inode_init_owner()` attributes
+/// for one named inode before the generic VFS publishes its name.
+///
+/// The SGID permission check intentionally precedes umask, as it does in
+/// Linux. Directories under an SGID parent always inherit that bit; regular
+/// and special files only lose an executable SGID request when the caller is
+/// neither in the parent group nor capable of preserving set-id bits.
+pub(crate) fn initial_named_create_owner_mode(
+    parent: &Metadata,
+    credentials: &DacCredentialView,
+    node_type: NodeType,
+    requested_mode: NodePermission,
+    umask: u32,
+) -> (NodePermission, (u32, u32)) {
+    let parent_is_sgid = parent.mode.contains(NodePermission::SET_GID);
+    let in_parent_group =
+        credentials.gid() == parent.gid || credentials.supplementary_groups().contains(&parent.gid);
+    let executable_sgid = requested_mode.contains(NodePermission::SET_GID)
+        && requested_mode.contains(NodePermission::GROUP_EXEC);
+
+    let mut mode = requested_mode;
+    if node_type != NodeType::Directory
+        && parent_is_sgid
+        && executable_sgid
+        && !in_parent_group
+        && !credentials.has_capability(CAP_FSETID)
+    {
+        mode.remove(NodePermission::SET_GID);
+    }
+    mode = NodePermission::from_bits_truncate(mode.bits() & !(umask as u16));
+
+    let gid = if parent_is_sgid {
+        parent.gid
+    } else {
+        credentials.gid()
+    };
+    if node_type == NodeType::Directory && parent_is_sgid {
+        mode.insert(NodePermission::SET_GID);
+    }
+    (mode, (credentials.uid(), gid))
 }
 
 fn check_directory_write_search_permissions(
@@ -284,8 +359,7 @@ pub(crate) fn check_execute_permissions(
     loc: &Location,
     credentials: &DacCredentialView,
 ) -> AxResult {
-    let path = loc.absolute_path().map_err(|_| AxError::InvalidInput)?;
-    if crate::mounts::is_noexec(path.as_ref()) {
+    if crate::mounts::is_noexec(loc)? {
         return Err(AxError::PermissionDenied);
     }
 
@@ -309,6 +383,26 @@ mod tests {
             effective[word] |= 1 << (capability % u32::BITS);
         }
         DacCredentialView::new(uid, gid, groups.to_vec(), effective)
+    }
+
+    fn directory_metadata(mode: u16, uid: u32, gid: u32) -> Metadata {
+        Metadata {
+            device: 1,
+            inode: 1,
+            nlink: 1,
+            mode: NodePermission::from_bits_truncate(mode),
+            node_type: NodeType::Directory,
+            uid,
+            gid,
+            size: 0,
+            block_size: 4096,
+            blocks: 0,
+            rdev: axfs_ng_vfs::DeviceId(0),
+            atime: core::time::Duration::ZERO,
+            btime: core::time::Duration::ZERO,
+            mtime: core::time::Duration::ZERO,
+            ctime: core::time::Duration::ZERO,
+        }
     }
 
     #[test]
@@ -414,5 +508,46 @@ mod tests {
             X_OK,
             &credentials,
         ));
+    }
+
+    #[test]
+    fn sgid_parent_attributes_follow_linux_prepare_then_owner_order() {
+        let parent = directory_metadata(0o2770, 10, 200);
+        let unprivileged = credentials(1000, 100, &[], &[]);
+
+        let (regular_mode, regular_owner) = initial_named_create_owner_mode(
+            &parent,
+            &unprivileged,
+            NodeType::RegularFile,
+            NodePermission::from_bits_truncate(0o2670),
+            0o020,
+        );
+        assert_eq!(regular_owner, (1000, 200));
+        assert_eq!(regular_mode.bits(), 0o650);
+
+        let (directory_mode, directory_owner) = initial_named_create_owner_mode(
+            &parent,
+            &unprivileged,
+            NodeType::Directory,
+            NodePermission::from_bits_truncate(0o770),
+            0o027,
+        );
+        assert_eq!(directory_owner, (1000, 200));
+        assert_eq!(directory_mode.bits(), 0o2750);
+    }
+
+    #[test]
+    fn cap_fsetid_preserves_executable_sgid_request() {
+        let parent = directory_metadata(0o2770, 10, 200);
+        let capable = credentials(1000, 100, &[], &[CAP_FSETID]);
+        let (mode, owner) = initial_named_create_owner_mode(
+            &parent,
+            &capable,
+            NodeType::RegularFile,
+            NodePermission::from_bits_truncate(0o2670),
+            0,
+        );
+        assert_eq!(owner, (1000, 200));
+        assert_eq!(mode.bits(), 0o2670);
     }
 }

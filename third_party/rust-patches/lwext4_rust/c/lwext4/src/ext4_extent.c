@@ -488,19 +488,23 @@ static void ext4_idx_store_pblock(struct ext4_extent_index *ix, ext4_fsblk_t pb)
 }
 
 static int ext4_allocate_single_block(struct ext4_inode_ref *inode_ref,
-				      ext4_fsblk_t goal, ext4_fsblk_t *blockp)
+				      ext4_fsblk_t goal, ext4_fsblk_t *blockp,
+				      bool *mutation_started)
 {
-	return ext4_balloc_alloc_block(inode_ref, goal, blockp);
+	return ext4_balloc_alloc_block_status(inode_ref, goal, blockp,
+					     mutation_started);
 }
 
 static ext4_fsblk_t ext4_new_meta_blocks(struct ext4_inode_ref *inode_ref,
 					 ext4_fsblk_t goal,
 					 uint32_t flags __unused,
-					 uint32_t *count, int *errp)
+					 uint32_t *count,
+					 bool *mutation_started, int *errp)
 {
 	ext4_fsblk_t block = 0;
 
-	*errp = ext4_allocate_single_block(inode_ref, goal, &block);
+	*errp = ext4_allocate_single_block(inode_ref, goal, &block,
+					  mutation_started);
 	if (count)
 		*count = 1;
 	return block;
@@ -646,7 +650,7 @@ static ext4_fsblk_t ext4_ext_new_meta_block(struct ext4_inode_ref *inode_ref,
 	ext4_fsblk_t goal, newblock;
 
 	goal = ext4_ext_find_goal(inode_ref, path, to_le32(ex->first_block));
-	newblock = ext4_new_meta_blocks(inode_ref, goal, flags, NULL, err);
+	newblock = ext4_new_meta_blocks(inode_ref, goal, flags, NULL, NULL, err);
 	return newblock;
 }
 
@@ -1368,9 +1372,11 @@ static int ext4_ext_grow_indepth(struct ext4_inode_ref *inode_ref,
 	else
 		goal = ext4_fs_inode_to_goal_block(inode_ref);
 
-	newblock = ext4_new_meta_blocks(inode_ref, goal, flags, NULL, &err);
-	if (newblock == 0)
+	newblock = ext4_new_meta_blocks(inode_ref, goal, flags, NULL, NULL, &err);
+	if (err != EOK)
 		return err;
+	if (newblock == 0)
+		return EIO;
 
 	/* # */
 	err = ext4_trans_block_get_noread(inode_ref->fs->bdev, &bh, newblock);
@@ -1410,11 +1416,13 @@ static int ext4_ext_grow_indepth(struct ext4_inode_ref *inode_ref,
 	}
 	neh->depth = to_le16(to_le16(neh->depth) + 1);
 
-	ext4_trans_set_block_dirty(bh.buf);
+	err = ext4_trans_set_block_dirty(bh.buf);
+	if (err != EOK) {
+		ext4_block_set(inode_ref->fs->bdev, &bh);
+		return err;
+	}
 	inode_ref->dirty = true;
-	ext4_block_set(inode_ref->fs->bdev, &bh);
-
-	return err;
+	return ext4_block_set(inode_ref->fs->bdev, &bh);
 }
 
 static inline void ext4_ext_replace_path(struct ext4_inode_ref *inode_ref,
@@ -2010,9 +2018,12 @@ __unused static void print_path(struct ext4_extent_path *path)
 	}
 }
 
-int ext4_extent_get_blocks(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
-			   uint32_t max_blocks, ext4_fsblk_t *result,
-			   bool create, uint32_t *blocks_count)
+int ext4_extent_get_blocks_status(struct ext4_inode_ref *inode_ref,
+				  ext4_lblk_t iblock,
+				  uint32_t max_blocks,
+				  ext4_fsblk_t *result, bool create,
+				  uint32_t *blocks_count,
+				  bool *metadata_may_have_changed)
 {
 	struct ext4_extent_path *path = NULL;
 	struct ext4_extent newex, *ex;
@@ -2022,6 +2033,10 @@ int ext4_extent_get_blocks(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
 	uint32_t allocated = 0;
 	ext4_lblk_t next;
 	ext4_fsblk_t newblock;
+	bool allocation_changed = false;
+
+	if (metadata_may_have_changed)
+		*metadata_may_have_changed = false;
 
 	if (result)
 		*result = 0;
@@ -2069,6 +2084,8 @@ int ext4_extent_get_blocks(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
 				zero_range = max_blocks;
 
 			newblock = iblock - ee_block + ee_start;
+			if (metadata_may_have_changed)
+				*metadata_may_have_changed = true;
 			err = ext4_ext_zero_unwritten_range(inode_ref, newblock,
 							    zero_range);
 			if (err != EOK)
@@ -2100,9 +2117,16 @@ int ext4_extent_get_blocks(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
 
 	/* allocate new block */
 	goal = ext4_ext_find_goal(inode_ref, path, iblock);
-	newblock = ext4_new_meta_blocks(inode_ref, goal, 0, &allocated, &err);
-	if (!newblock)
+	newblock = ext4_new_meta_blocks(inode_ref, goal, 0, &allocated,
+					&allocation_changed, &err);
+	if (allocation_changed && metadata_may_have_changed)
+		*metadata_may_have_changed = true;
+	if (err != EOK)
 		goto out2;
+	if (!newblock) {
+		err = EIO;
+		goto out2;
+	}
 
 	/* try to insert new extent into found leaf and return */
 	newex.first_block = to_le32(iblock);
@@ -2110,9 +2134,9 @@ int ext4_extent_get_blocks(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
 	newex.block_count = to_le16(allocated);
 	err = ext4_ext_insert_extent(inode_ref, &path, &newex, 0);
 	if (err != EOK) {
-		/* free data blocks we just allocated */
-		ext4_ext_free_blocks(inode_ref, ext4_ext_pblock(&newex),
-				     to_le16(newex.block_count), 0);
+		/* The insert path may have linked the extent before a later dirty or
+		 * cleanup operation failed.  Do not free a block that may now be
+		 * referenced; the sticky status requires the caller to fail closed. */
 		goto out2;
 	}
 
@@ -2136,5 +2160,13 @@ out2:
 	}
 
 	return err;
+}
+
+int ext4_extent_get_blocks(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
+			   uint32_t max_blocks, ext4_fsblk_t *result,
+			   bool create, uint32_t *blocks_count)
+{
+	return ext4_extent_get_blocks_status(inode_ref, iblock, max_blocks,
+					    result, create, blocks_count, NULL);
 }
 #endif

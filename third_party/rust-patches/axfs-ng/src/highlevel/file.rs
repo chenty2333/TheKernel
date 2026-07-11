@@ -18,9 +18,11 @@ use core::{
 use axalloc::{UsageKind, global_allocator};
 use axdriver::{AsyncBlockWaitPolicy, virtio_async_block_enabled, virtio_async_block_wait_policy};
 use axfs_ng_vfs::{
-    FileNode, FilesystemOps, Location, MetadataUpdate, Mountpoint, NodeFlags, NodePermission,
-    NodeType, VfsError, VfsResult, WeakDirEntry, WritebackAnchor, path::Path,
+    FileNode, FilesystemOps, Location, Mountpoint, NodeFlags, NodePermission, NodeType, VfsError,
+    VfsResult, WeakDirEntry, WritebackAnchor, path::Path,
 };
+#[cfg(feature = "times")]
+use axfs_ng_vfs::MetadataUpdate;
 use axhal::mem::{PhysAddr, VirtAddr, total_ram_size, virt_to_phys};
 use axio::{SeekFrom, prelude::*};
 use axpoll::{IoEvents, Pollable};
@@ -29,7 +31,7 @@ use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter}
 use lru::LruCache;
 use spin::{Once, RwLock};
 
-use super::FsContext;
+use super::{FsContext, PathwalkPolicy};
 
 bitflags::bitflags! {
     /// Flags describing the access mode of an opened file.
@@ -278,13 +280,10 @@ impl OpenOptions {
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
     {
-        let mut allow_create = |_dir: &Location| Ok(());
-        let (loc, _created) = self.resolve_location_with_admission(
-            context,
-            path,
-            admission,
-            &mut allow_create,
-        )?;
+        let mut allow_create =
+            |_dir: &Location, _options: &mut axfs_ng_vfs::OpenOptions| Ok(());
+        let (loc, _created) =
+            self.resolve_location_with_admission(context, path, admission, &mut allow_create)?;
         self._open(loc)
     }
 
@@ -305,7 +304,7 @@ impl OpenOptions {
     ) -> VfsResult<(Location, bool)>
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
-        C: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        C: FnMut(&Location, &mut axfs_ng_vfs::OpenOptions) -> VfsResult<()> + ?Sized,
     {
         if !self.is_valid() {
             return Err(VfsError::InvalidInput);
@@ -324,6 +323,52 @@ impl OpenOptions {
             admission,
             create_admission,
         )
+    }
+
+    pub fn resolve_location_with_policy<F, C, P>(
+        &self,
+        context: &FsContext,
+        path: impl AsRef<Path>,
+        admission: &mut F,
+        create_admission: &mut C,
+        policy: &mut P,
+    ) -> VfsResult<(Location, bool)>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        C: FnMut(&Location, &mut axfs_ng_vfs::OpenOptions) -> VfsResult<()> + ?Sized,
+        P: PathwalkPolicy + ?Sized,
+    {
+        if !self.is_valid() {
+            return Err(VfsError::InvalidInput);
+        }
+
+        context.resolve_open_with_policy(
+            path.as_ref(),
+            &axfs_ng_vfs::OpenOptions {
+                create: self.create,
+                create_new: self.create_new,
+                node_type: self.node_type,
+                permission: NodePermission::from_bits_truncate(self.mode as _),
+                user: self.user,
+            },
+            !self.no_follow,
+            admission,
+            create_admission,
+            policy,
+        )
+    }
+
+    /// Creates an anonymous inode in `dir` using this option set.
+    pub fn create_anonymous_location(&self, dir: &Location, linkable: bool) -> VfsResult<Location> {
+        if !self.is_valid() || self.directory || self.path {
+            return Err(VfsError::InvalidInput);
+        }
+        dir.create_anonymous(&axfs_ng_vfs::AnonymousOptions {
+            node_type: self.node_type,
+            permission: NodePermission::from_bits_truncate(self.mode as _),
+            user: self.user,
+            linkable,
+        })
     }
 
     pub(crate) fn to_flags(&self) -> VfsResult<FileFlags> {
@@ -360,7 +405,7 @@ impl OpenOptions {
         if !self.read && !self.write && !self.append {
             return false;
         }
-        if self.append && self.truncate && !self.create_new {
+        if self.directory && (self.create || self.create_new) {
             return false;
         }
         true
@@ -382,7 +427,9 @@ const DIRTY_WRITEBACK_SEGMENT_PAGES: usize = 16;
 const IN_MEMORY_PAGE_CACHE_PAGES: usize = 1024;
 const ALIGNED_BYPASS_CHUNK: usize = 64 * 1024;
 const CLOSED_FILE_CACHE_RETAIN_MAX_PAGES: usize = 1024;
-static FILE_CACHE_REGISTRY: Once<Mutex<BTreeMap<(u64, u64), FileUserData>>> = Once::new();
+type CachedFileRegistryKey = (u64, u64);
+static FILE_CACHE_REGISTRY: Once<Mutex<BTreeMap<CachedFileRegistryKey, FileUserData>>> =
+    Once::new();
 static ENABLE_CACHED_FILE_IO_COUNTERS: AtomicBool = AtomicBool::new(false);
 static READ_BYPASS_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
 static READ_BYPASS_HITS: AtomicU64 = AtomicU64::new(0);
@@ -649,11 +696,33 @@ fn record_cached_file_counter(counter: &AtomicU64, value: u64) {
     }
 }
 
-fn file_cache_registry() -> &'static Mutex<BTreeMap<(u64, u64), FileUserData>> {
+fn file_cache_registry() -> &'static Mutex<BTreeMap<CachedFileRegistryKey, FileUserData>> {
     FILE_CACHE_REGISTRY.call_once(|| Mutex::new(BTreeMap::new()))
 }
 
-fn cached_file_registry_key(location: &Location) -> (u64, u64) {
+fn remove_released_cached_file_registry_entry(
+    key: CachedFileRegistryKey,
+    shared: *const CachedFileShared,
+) {
+    let retired = {
+        let mut registry = file_cache_registry().lock();
+        let matches_released_shared = registry.get(&key).is_some_and(|entry| {
+            entry.retained.is_none()
+                && entry.writeback_anchor.is_none()
+                && core::ptr::eq(entry.shared.as_ptr(), shared)
+        });
+        if matches_released_shared {
+            registry.remove(&key)
+        } else {
+            None
+        }
+    };
+    // Weak state and writeback ownership can ultimately release filesystem or
+    // inode objects. Keep every such destructor outside the registry lock.
+    drop(retired);
+}
+
+fn cached_file_registry_key(location: &Location) -> CachedFileRegistryKey {
     (location.mountpoint().device(), location.inode())
 }
 
@@ -699,7 +768,10 @@ fn cached_file_shared_for_location_or_create(location: &Location) -> Arc<CachedF
             break 'registry (shared, retired_entry, released_retained, false);
         }
 
-        let shared = Arc::new(CachedFileShared::new(cached_file_is_in_memory(location)));
+        let shared = Arc::new(CachedFileShared::new(
+            key,
+            cached_file_is_in_memory(location),
+        ));
         let retired_entry = registry.insert(key, FileUserData::new(location, &shared));
         (shared, retired_entry, released_retained, true)
     };
@@ -781,7 +853,28 @@ fn release_cached_file_writeback_anchor_if_clean(shared: &CachedFileShared) {
     drop(released);
 }
 
-type CachedFileWritebackSnapshotEntry = ((u64, u64), Arc<CachedFileShared>, WritebackAnchor);
+fn release_unlinked_cached_file_registry_ownership(
+    location: &Location,
+    shared: &Arc<CachedFileShared>,
+) {
+    let key = cached_file_registry_key(location);
+    let retired = {
+        let mut registry = file_cache_registry().lock();
+        let matches_shared = registry
+            .get(&key)
+            .is_some_and(|entry| entry.references_shared(shared));
+        matches_shared.then(|| registry.remove(&key)).flatten()
+    };
+    // Retention and writeback anchors can own filesystem or inode state whose
+    // teardown re-enters cache bookkeeping.
+    drop(retired);
+}
+
+type CachedFileWritebackSnapshotEntry = (
+    CachedFileRegistryKey,
+    Arc<CachedFileShared>,
+    WritebackAnchor,
+);
 
 fn cached_file_writeback_snapshot() -> Vec<CachedFileWritebackSnapshotEntry> {
     let (entries, deferred, retired) = {
@@ -859,7 +952,7 @@ fn release_closed_cached_file_retention(location: &Location) {
 }
 
 struct ClosedFileCacheTrimCandidate {
-    key: (u64, u64),
+    key: CachedFileRegistryKey,
     shared: Arc<CachedFileShared>,
     anchor: WritebackAnchor,
     pages: usize,
@@ -872,8 +965,8 @@ enum ClosedFileCacheRetentionDecision {
 }
 
 fn closed_file_cache_trim_candidates(
-    registry: &BTreeMap<(u64, u64), FileUserData>,
-    preserve_key: (u64, u64),
+    registry: &BTreeMap<CachedFileRegistryKey, FileUserData>,
+    preserve_key: CachedFileRegistryKey,
     current_retained_pages: usize,
     required_pages: usize,
 ) -> Vec<ClosedFileCacheTrimCandidate> {
@@ -1846,6 +1939,9 @@ struct EvictListener {
 intrusive_adapter!(EvictListenerAdapter = Box<EvictListener>: EvictListener { link: LinkedListAtomicLink });
 
 struct CachedFileShared {
+    /// Registry slot owned weakly by this shared state. Final release removes
+    /// it only when both this key and this allocation still match.
+    registry_key: CachedFileRegistryKey,
     page_cache: Mutex<LruCache<u32, PageCache>>,
     evict_listeners: Mutex<LinkedList<EvictListenerAdapter>>,
     unlinked: AtomicBool,
@@ -1860,13 +1956,14 @@ struct CachedFileShared {
 }
 
 impl CachedFileShared {
-    pub fn new(in_memory: bool) -> Self {
+    pub fn new(registry_key: CachedFileRegistryKey, in_memory: bool) -> Self {
         let capacity = if in_memory {
             in_memory_page_cache_capacity()
         } else {
             per_file_page_cache_capacity()
         };
         Self {
+            registry_key,
             page_cache: Mutex::new(new_bounded_page_cache_store(capacity)),
             evict_listeners: Mutex::new(LinkedList::default()),
             unlinked: AtomicBool::new(false),
@@ -1876,6 +1973,18 @@ impl CachedFileShared {
             writeback_lock: RwLock::new(()),
             append_lock: RwLock::new(()),
         }
+    }
+}
+
+impl Drop for CachedFileShared {
+    fn drop(&mut self) {
+        // Final Arc release makes the registered Weak impossible to upgrade.
+        // The pointer check prevents a stale release from deleting a newer
+        // shared state installed for the same filesystem/inode key.
+        remove_released_cached_file_registry_entry(
+            self.registry_key,
+            core::ptr::from_ref(self),
+        );
     }
 }
 
@@ -1926,6 +2035,13 @@ impl FileUserData {
 
     pub fn shared(&self) -> Option<Arc<CachedFileShared>> {
         self.retained.clone().or_else(|| self.shared.upgrade())
+    }
+
+    fn references_shared(&self, shared: &Arc<CachedFileShared>) -> bool {
+        self.retained.as_ref().map_or_else(
+            || core::ptr::eq(self.shared.as_ptr(), Arc::as_ptr(shared)),
+            |retained| Arc::ptr_eq(retained, shared),
+        )
     }
 
     fn has_live_shared(&self) -> bool {
@@ -2922,7 +3038,7 @@ impl Drop for CachedFile {
         }
         if self.shared.unlinked.load(Ordering::Acquire) {
             self.discard_cache();
-            release_closed_cached_file_retention(&self.inner);
+            release_unlinked_cached_file_registry_ownership(&self.inner, &self.shared);
             return;
         }
         if try_retain_closed_cached_file(&self.inner, &self.shared) {
@@ -3578,5 +3694,281 @@ impl Pollable for File {
 impl Drop for File {
     fn drop(&mut self) {
         self.flush_times();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::{Arc, Weak};
+    use core::{any::Any, sync::atomic::Ordering, task::Context, time::Duration};
+
+    use axfs_ng_vfs::{
+        DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata, MetadataUpdate,
+        Mountpoint, NodeOps, NodePermission, NodeType, Reference, StatFs, VfsResult,
+    };
+    use axpoll::{IoEvents, Pollable};
+
+    use super::{
+        CLOSED_FILE_CACHE_RETAINED_PAGES, CachedFile, CachedFileShared, FileUserData,
+        cached_file_registry_key, cached_file_shared_for_location_or_create,
+        file_cache_registry, release_unlinked_cached_file_registry_ownership,
+    };
+
+    struct RegistryTestFs {
+        this: Weak<Self>,
+    }
+
+    impl RegistryTestFs {
+        fn new() -> Arc<Self> {
+            Arc::new_cyclic(|this| Self { this: this.clone() })
+        }
+    }
+
+    impl FilesystemOps for RegistryTestFs {
+        fn name(&self) -> &str {
+            "registry-test"
+        }
+
+        fn root_dir(&self) -> DirEntry {
+            let fs = self.this.upgrade().expect("test filesystem is live");
+            DirEntry::new_file(
+                FileNode::new(Arc::new(RegistryTestFile { fs })),
+                NodeType::RegularFile,
+                Reference::root(),
+            )
+        }
+
+        fn stat(&self) -> VfsResult<StatFs> {
+            Ok(StatFs {
+                fs_type: 0,
+                block_size: 4096,
+                blocks: 0,
+                blocks_free: 0,
+                blocks_available: 0,
+                file_count: 1,
+                free_file_count: 0,
+                name_length: 255,
+                fragment_size: 4096,
+                mount_flags: 0,
+            })
+        }
+    }
+
+    struct RegistryTestFile {
+        fs: Arc<RegistryTestFs>,
+    }
+
+    impl NodeOps for RegistryTestFile {
+        fn inode(&self) -> u64 {
+            1
+        }
+
+        fn metadata(&self) -> VfsResult<Metadata> {
+            Ok(Metadata {
+                device: 0,
+                inode: 1,
+                nlink: 0,
+                mode: NodePermission::from_bits_truncate(0o600),
+                node_type: NodeType::RegularFile,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                block_size: 4096,
+                blocks: 0,
+                rdev: Default::default(),
+                atime: Duration::ZERO,
+                btime: Duration::ZERO,
+                mtime: Duration::ZERO,
+                ctime: Duration::ZERO,
+            })
+        }
+
+        fn update_metadata(&self, _update: MetadataUpdate) -> VfsResult<()> {
+            Ok(())
+        }
+
+        fn filesystem(&self) -> &dyn FilesystemOps {
+            &*self.fs
+        }
+
+        fn sync(&self, _data_only: bool) -> VfsResult<()> {
+            Ok(())
+        }
+
+        fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+            self
+        }
+    }
+
+    impl Pollable for RegistryTestFile {
+        fn poll(&self) -> IoEvents {
+            IoEvents::IN | IoEvents::OUT
+        }
+
+        fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+    }
+
+    impl FileNodeOps for RegistryTestFile {
+        fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
+            Ok(0)
+        }
+
+        fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
+            Ok(buf.len())
+        }
+
+        fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {
+            Ok((buf.len(), buf.len() as u64))
+        }
+
+        fn set_len(&self, _len: u64) -> VfsResult<()> {
+            Ok(())
+        }
+
+        fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn unlinked_last_close_releases_registry_retention_and_anchor() {
+        let fs = Filesystem::new(RegistryTestFs::new());
+        let identity = fs.identity_weak();
+        let mountpoint = Mountpoint::new_root(&fs);
+        let location = mountpoint.root_location();
+        let key = cached_file_registry_key(&location);
+        let shared = Arc::new(CachedFileShared::new(key, true));
+        shared.unlinked.store(true, Ordering::Release);
+        shared.open_handles.store(1, Ordering::Release);
+
+        let retained_pages_before = CLOSED_FILE_CACHE_RETAINED_PAGES.load(Ordering::Acquire);
+        let mut entry = FileUserData::new(&location, &shared);
+        assert!(entry.retain_closed(&location, &shared, 3).is_none());
+        entry.writeback_anchor = Some(location.writeback_anchor());
+        let retired = file_cache_registry().lock().insert(key, entry);
+        assert!(retired.is_none());
+        assert_eq!(Arc::strong_count(&shared), 2);
+        assert_eq!(
+            CLOSED_FILE_CACHE_RETAINED_PAGES.load(Ordering::Acquire),
+            retained_pages_before + 3
+        );
+
+        let cached = CachedFile {
+            inner: location,
+            shared: shared.clone(),
+            in_memory: true,
+        };
+        drop(mountpoint);
+        drop(fs);
+        drop(cached);
+
+        assert!(!file_cache_registry().lock().contains_key(&key));
+        assert_eq!(Arc::strong_count(&shared), 1);
+        assert_eq!(
+            CLOSED_FILE_CACHE_RETAINED_PAGES.load(Ordering::Acquire),
+            retained_pages_before
+        );
+        assert!(identity.upgrade().is_none());
+    }
+
+    #[test]
+    fn unlinked_registry_release_does_not_remove_replacement_shared() {
+        let fs = Filesystem::new(RegistryTestFs::new());
+        let mountpoint = Mountpoint::new_root(&fs);
+        let location = mountpoint.root_location();
+        let key = cached_file_registry_key(&location);
+        let replacement = Arc::new(CachedFileShared::new(key, true));
+        let stale = Arc::new(CachedFileShared::new(key, true));
+        let mut entry = FileUserData::new(&location, &replacement);
+        entry.writeback_anchor = Some(location.writeback_anchor());
+        let retired = file_cache_registry().lock().insert(key, entry);
+        assert!(retired.is_none());
+
+        release_unlinked_cached_file_registry_ownership(&location, &stale);
+
+        {
+            let registry = file_cache_registry().lock();
+            let entry = registry.get(&key).expect("replacement entry must remain");
+            assert!(entry.references_shared(&replacement));
+            assert!(entry.writeback_anchor.is_some());
+        }
+        let retired = file_cache_registry().lock().remove(&key);
+        drop(retired);
+    }
+
+    #[test]
+    fn released_shared_does_not_remove_replacement_registry_entry() {
+        let fs = Filesystem::new(RegistryTestFs::new());
+        let mountpoint = Mountpoint::new_root(&fs);
+        let location = mountpoint.root_location();
+        let key = cached_file_registry_key(&location);
+        let stale = Arc::new(CachedFileShared::new(key, true));
+        let replacement = Arc::new(CachedFileShared::new(key, true));
+        let retired = file_cache_registry()
+            .lock()
+            .insert(key, FileUserData::new(&location, &replacement));
+        assert!(retired.is_none());
+
+        drop(stale);
+
+        {
+            let registry = file_cache_registry().lock();
+            let entry = registry.get(&key).expect("replacement entry must remain");
+            assert!(entry.references_shared(&replacement));
+        }
+        let retired = file_cache_registry().lock().remove(&key);
+        drop(retired);
+    }
+
+    #[test]
+    fn ordinary_linked_cached_file_close_removes_dead_registry_entry() {
+        let fs = Filesystem::new(RegistryTestFs::new());
+        let mountpoint = Mountpoint::new_root(&fs);
+        let location = mountpoint.root_location();
+        let key = cached_file_registry_key(&location);
+        let cached = CachedFile::get_or_create(location);
+        assert!(file_cache_registry().lock().contains_key(&key));
+
+        drop(cached);
+
+        assert!(!file_cache_registry().lock().contains_key(&key));
+    }
+
+    #[test]
+    fn direct_only_shared_release_removes_dead_registry_entry() {
+        let fs = Filesystem::new(RegistryTestFs::new());
+        let mountpoint = Mountpoint::new_root(&fs);
+        let location = mountpoint.root_location();
+        let key = cached_file_registry_key(&location);
+        let shared = cached_file_shared_for_location_or_create(&location);
+        assert!(file_cache_registry().lock().contains_key(&key));
+
+        drop(shared);
+
+        assert!(!file_cache_registry().lock().contains_key(&key));
+    }
+
+    #[test]
+    fn final_shared_release_preserves_writeback_anchor() {
+        let fs = Filesystem::new(RegistryTestFs::new());
+        let mountpoint = Mountpoint::new_root(&fs);
+        let location = mountpoint.root_location();
+        let key = cached_file_registry_key(&location);
+        let shared = Arc::new(CachedFileShared::new(key, true));
+        let mut entry = FileUserData::new(&location, &shared);
+        entry.writeback_anchor = Some(location.writeback_anchor());
+        let retired = file_cache_registry().lock().insert(key, entry);
+        assert!(retired.is_none());
+
+        drop(shared);
+
+        {
+            let registry = file_cache_registry().lock();
+            let entry = registry.get(&key).expect("writeback anchor must remain");
+            assert!(!entry.has_live_shared());
+            assert!(entry.writeback_anchor.is_some());
+        }
+        let retired = file_cache_registry().lock().remove(&key);
+        drop(retired);
     }
 }

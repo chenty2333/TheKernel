@@ -13,14 +13,14 @@ use axhal::paging::MappingFlags;
 use axsync::Mutex;
 use axtask::{AxTaskRef, TaskInner, WeakAxTaskRef, current};
 use bytemuck::AnyBitPattern;
+use hashbrown::{HashMap, HashSet};
 use kernel_guard::NoPreemptIrqSave;
 use linux_raw_sys::general::{FUTEX_OWNER_DIED, FUTEX_TID_MASK, FUTEX_WAITERS, ROBUST_LIST_LIMIT};
 use memory_addr::{MemoryAddr, PhysAddr, VirtAddr};
-use spin::RwLock;
+use spin::Lazy;
 use starry_process::{Pid, Process, ProcessGroup, Session, ZombieSnapshot};
 use starry_signal::{SignalActionFlags, SignalDisposition, SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
-use weak_map::WeakMap;
 
 use super::{
     AsThread, FutexKey, ITimerType, ProcStateHint, ProcessData, TaskUsage, TimerState,
@@ -32,12 +32,153 @@ use crate::{
     syscall::acct_process_exit,
 };
 
-static TASK_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
-static TASK_ALIAS_TABLE: RwLock<WeakMap<Pid, WeakAxTaskRef>> = RwLock::new(WeakMap::new());
+trait RegistryWeak: Clone {
+    type Strong;
 
-static PROCESS_TABLE: RwLock<WeakMap<Pid, Weak<ProcessData>>> = RwLock::new(WeakMap::new());
+    fn downgrade(value: &Self::Strong) -> Self;
+    fn upgrade(&self) -> Option<Self::Strong>;
+    fn is_live(&self) -> bool;
+}
 
-static PROCESS_GROUP_TABLE: RwLock<WeakMap<Pid, Weak<ProcessGroup>>> = RwLock::new(WeakMap::new());
+impl<T: ?Sized> RegistryWeak for Weak<T> {
+    type Strong = Arc<T>;
+
+    fn downgrade(value: &Self::Strong) -> Self {
+        Arc::downgrade(value)
+    }
+
+    fn upgrade(&self) -> Option<Self::Strong> {
+        Weak::upgrade(self)
+    }
+
+    fn is_live(&self) -> bool {
+        self.strong_count() != 0
+    }
+}
+
+/// A weak lookup registry with explicit capacity credits.
+///
+/// `HashMap::try_reserve()` alone is not a transaction: another publisher can
+/// consume the spare bucket before a prepared clone commits. `reserved` makes
+/// that capacity unavailable to every other insertion until the admission
+/// token either commits or rolls back.
+struct WeakRegistry<W> {
+    entries: HashMap<Pid, W>,
+    reserved_keys: HashSet<Pid>,
+    reserved: usize,
+    operations: usize,
+    cleanup_due: bool,
+}
+
+/// Ceiling for each Linux-visible weak lookup index. This bounds lookup and
+/// admission metadata; it is not a replacement for RLIMIT_NPROC accounting.
+const MAX_WEAK_REGISTRY_ENTRIES: usize = 65_536;
+
+fn next_registry_reservation(live: usize, reserved: usize) -> AxResult<usize> {
+    let admitted = live.checked_add(reserved).ok_or(AxError::NoMemory)?;
+    if admitted >= MAX_WEAK_REGISTRY_ENTRIES {
+        return Err(AxError::NoMemory);
+    }
+    reserved.checked_add(1).ok_or(AxError::NoMemory)
+}
+
+impl<W> WeakRegistry<W> {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            reserved_keys: HashSet::new(),
+            reserved: 0,
+            operations: 0,
+            cleanup_due: false,
+        }
+    }
+}
+
+impl<W: RegistryWeak> WeakRegistry<W> {
+    fn take_one_stale(&mut self) -> Option<W> {
+        let key = self
+            .entries
+            .iter()
+            .find_map(|(&key, value)| (!value.is_live()).then_some(key))?;
+        self.entries.remove(&key)
+    }
+
+    fn get(&self, key: &Pid) -> Option<W::Strong> {
+        self.entries.get(key).and_then(RegistryWeak::upgrade)
+    }
+
+    fn values(&self) -> impl Iterator<Item = W::Strong> + '_ {
+        self.entries.values().filter_map(RegistryWeak::upgrade)
+    }
+
+    fn reserve_slot(&mut self, key: Pid) -> AxResult<()> {
+        if self.reserved_keys.contains(&key) {
+            return Err(AxError::ResourceBusy);
+        }
+        let live = self
+            .entries
+            .values()
+            .filter(|value| value.is_live())
+            .count();
+        let additional = next_registry_reservation(live, self.reserved)?;
+        self.entries
+            .try_reserve(additional)
+            .map_err(|_| AxError::NoMemory)?;
+        self.reserved_keys
+            .try_reserve(1)
+            .map_err(|_| AxError::NoMemory)?;
+        self.reserved_keys.insert(key);
+        self.reserved = additional;
+        self.operations = self.operations.saturating_add(1);
+        if self.operations >= 1_000 {
+            self.cleanup_due = true;
+        }
+        Ok(())
+    }
+
+    fn take_one_stale_if_due(&mut self) -> Option<W> {
+        if !self.cleanup_due {
+            return None;
+        }
+        let stale = self.take_one_stale();
+        if stale.is_none() {
+            self.operations = 0;
+            self.cleanup_due = false;
+        }
+        stale
+    }
+
+    fn release_slot(&mut self, key: Pid) {
+        if self.reserved_keys.remove(&key) {
+            self.reserved = self.reserved.saturating_sub(1);
+        }
+    }
+
+    /// Inserts against a capacity credit created by `reserve_slot()`.
+    /// No allocation is possible while the registry lock is held.
+    fn insert_reserved(&mut self, key: Pid, value: &W::Strong) -> Option<W> {
+        debug_assert!(self.reserved > 0);
+        let had_key_reservation = self.reserved_keys.remove(&key);
+        debug_assert!(had_key_reservation);
+        self.reserved -= 1;
+        self.entries.insert(key, W::downgrade(value))
+    }
+
+    fn remove(&mut self, key: &Pid) -> Option<W> {
+        self.entries.remove(key)
+    }
+}
+
+static TASK_TABLE: Lazy<Mutex<WeakRegistry<WeakAxTaskRef>>> =
+    Lazy::new(|| Mutex::new(WeakRegistry::new()));
+static TASK_ALIAS_TABLE: Lazy<Mutex<WeakRegistry<WeakAxTaskRef>>> =
+    Lazy::new(|| Mutex::new(WeakRegistry::new()));
+
+static PROCESS_TABLE: Lazy<Mutex<WeakRegistry<Weak<ProcessData>>>> =
+    Lazy::new(|| Mutex::new(WeakRegistry::new()));
+
+static PROCESS_GROUP_TABLE: Lazy<Mutex<WeakRegistry<Weak<ProcessGroup>>>> =
+    Lazy::new(|| Mutex::new(WeakRegistry::new()));
 
 fn parent_sigchld_autoreap(parent: &ProcessData) -> (bool, bool) {
     let actions = parent.signal.actions.lock();
@@ -74,7 +215,45 @@ fn notify_reaper_of_inherited_zombie(child: &Arc<Process>) {
     parent_data.child_exit_event.wake();
 }
 
-static SESSION_TABLE: RwLock<WeakMap<Pid, Weak<Session>>> = RwLock::new(WeakMap::new());
+static SESSION_TABLE: Lazy<Mutex<WeakRegistry<Weak<Session>>>> =
+    Lazy::new(|| Mutex::new(WeakRegistry::new()));
+
+#[allow(dead_code)] // reached through the feature-gated memtrack cleanup hook
+fn cleanup_registry<W: RegistryWeak>(registry: &Mutex<WeakRegistry<W>>) {
+    loop {
+        let stale = {
+            let mut registry = registry.lock();
+            let stale = registry.take_one_stale();
+            if stale.is_none() {
+                registry.operations = 0;
+                registry.cleanup_due = false;
+            }
+            stale
+        };
+        let Some(stale) = stale else {
+            break;
+        };
+        // A final weak control block may deallocate. Keep that destructor out
+        // of the registry lock and bound each locked scan to one detach.
+        drop(stale);
+    }
+}
+
+fn cleanup_registry_if_due<W: RegistryWeak>(registry: &Mutex<WeakRegistry<W>>) {
+    let stale = {
+        let mut registry = registry.lock();
+        registry.take_one_stale_if_due()
+    };
+    drop(stale);
+}
+
+struct RegistryCleanupGuard<'a, W: RegistryWeak>(&'a Mutex<WeakRegistry<W>>);
+
+impl<W: RegistryWeak> Drop for RegistryCleanupGuard<'_, W> {
+    fn drop(&mut self) {
+        cleanup_registry_if_due(self.0);
+    }
+}
 
 fn install_current_user_page_table_root(curr_ptr: *mut TaskInner, root: PhysAddr) {
     unsafe {
@@ -88,61 +267,416 @@ fn install_current_user_page_table_root(curr_ptr: *mut TaskInner, root: PhysAddr
 /// Cleanup expired entries in the task tables.
 ///
 /// This function is intended to be used during memory leak analysis to remove
-/// possible noise caused by expired entries in the [`WeakMap`].
+/// possible noise caused by expired entries in the weak registries.
 pub fn cleanup_task_tables() {
-    TASK_TABLE.write().cleanup();
-    TASK_ALIAS_TABLE.write().cleanup();
-    PROCESS_TABLE.write().cleanup();
-    PROCESS_GROUP_TABLE.write().cleanup();
-    SESSION_TABLE.write().cleanup();
+    cleanup_registry(&TASK_TABLE);
+    cleanup_registry(&TASK_ALIAS_TABLE);
+    cleanup_registry(&PROCESS_TABLE);
+    cleanup_registry(&PROCESS_GROUP_TABLE);
+    cleanup_registry(&SESSION_TABLE);
 }
 
-/// Add the task, the thread and possibly its process, process group and session
-/// to the corresponding tables.
-pub fn add_task_to_table(task: &AxTaskRef) {
+/// Fallible capacity and identity admission for all task lookup registries.
+///
+/// Holding this token guarantees that [`TaskTableAdmission::commit`] can add
+/// the task, optional visible-TID alias, process, process group and session
+/// without allocating. The strong references also keep every admitted
+/// existing identity alive until commit, so a cleanup pass cannot turn a
+/// no-op admission into a new insertion behind our back.
+pub struct TaskTableAdmission {
+    task: AxTaskRef,
+    tid: Pid,
+    visible_tid: Pid,
+    proc_data: Arc<ProcessData>,
+    pid: Pid,
+    group: Arc<ProcessGroup>,
+    pgid: Pid,
+    session: Arc<Session>,
+    sid: Pid,
+    task_slot: bool,
+    alias_slot: bool,
+    process_slot: bool,
+    group_slot: bool,
+    session_slot: bool,
+    committed: bool,
+}
+
+fn reserve_unique_task_key(table: &Mutex<WeakRegistry<WeakAxTaskRef>>, key: Pid) -> AxResult<bool> {
+    let _cleanup = RegistryCleanupGuard(table);
+    let mut table = table.lock();
+    if table.get(&key).is_some() {
+        return Err(AxError::AlreadyExists);
+    }
+    table.reserve_slot(key)?;
+    Ok(true)
+}
+
+fn reserve_process_key(key: Pid, expected: &Arc<ProcessData>) -> AxResult<bool> {
+    let _cleanup = RegistryCleanupGuard(&PROCESS_TABLE);
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(existing) = table.get(&key) {
+        return if Arc::ptr_eq(&existing, expected) {
+            Ok(false)
+        } else {
+            Err(AxError::AlreadyExists)
+        };
+    }
+    table.reserve_slot(key)?;
+    Ok(true)
+}
+
+fn reserve_group_key(key: Pid, expected: &Arc<ProcessGroup>) -> AxResult<bool> {
+    let _cleanup = RegistryCleanupGuard(&PROCESS_GROUP_TABLE);
+    let mut table = PROCESS_GROUP_TABLE.lock();
+    if let Some(existing) = table.get(&key) {
+        return if Arc::ptr_eq(&existing, expected) {
+            Ok(false)
+        } else {
+            Err(AxError::AlreadyExists)
+        };
+    }
+    table.reserve_slot(key)?;
+    Ok(true)
+}
+
+fn reserve_session_key(key: Pid, expected: &Arc<Session>) -> AxResult<bool> {
+    let _cleanup = RegistryCleanupGuard(&SESSION_TABLE);
+    let mut table = SESSION_TABLE.lock();
+    if let Some(existing) = table.get(&key) {
+        return if Arc::ptr_eq(&existing, expected) {
+            Ok(false)
+        } else {
+            Err(AxError::AlreadyExists)
+        };
+    }
+    table.reserve_slot(key)?;
+    Ok(true)
+}
+
+fn reserve_new_group_key(key: Pid) -> AxResult<bool> {
+    let _cleanup = RegistryCleanupGuard(&PROCESS_GROUP_TABLE);
+    let mut table = PROCESS_GROUP_TABLE.lock();
+    if table.get(&key).is_some() {
+        return Err(AxError::AlreadyExists);
+    }
+    table.reserve_slot(key)?;
+    Ok(true)
+}
+
+fn reserve_new_session_key(key: Pid) -> AxResult<bool> {
+    let _cleanup = RegistryCleanupGuard(&SESSION_TABLE);
+    let mut table = SESSION_TABLE.lock();
+    if table.get(&key).is_some() {
+        return Err(AxError::AlreadyExists);
+    }
+    table.reserve_slot(key)?;
+    Ok(true)
+}
+
+/// Admission token for a job-control process-group/session registry update.
+/// Callers create the Starry objects only after this token exists, then commit
+/// their lookup identities without a post-mutation allocation failure.
+pub struct ProcessGroupTableAdmission {
+    pgid: Pid,
+    sid: Pid,
+    expected_group: Option<Arc<ProcessGroup>>,
+    expected_session: Option<Arc<Session>>,
+    group_slot: bool,
+    session_slot: bool,
+    committed: bool,
+}
+
+fn prepare_process_group_table_admission(
+    pgid: Pid,
+    expected_group: Option<Arc<ProcessGroup>>,
+    sid: Pid,
+    expected_session: Option<Arc<Session>>,
+) -> AxResult<ProcessGroupTableAdmission> {
+    let mut admission = ProcessGroupTableAdmission {
+        pgid,
+        sid,
+        expected_group,
+        expected_session,
+        group_slot: false,
+        session_slot: false,
+        committed: false,
+    };
+    admission.group_slot = if let Some(group) = admission.expected_group.as_ref() {
+        reserve_group_key(pgid, group)?
+    } else {
+        reserve_new_group_key(pgid)?
+    };
+    admission.session_slot = if let Some(session) = admission.expected_session.as_ref() {
+        reserve_session_key(sid, session)?
+    } else {
+        reserve_new_session_key(sid)?
+    };
+    Ok(admission)
+}
+
+/// Admits the new process group and session created by `setsid(2)`.
+pub fn prepare_new_session_table_admission(sid: Pid) -> AxResult<ProcessGroupTableAdmission> {
+    prepare_process_group_table_admission(sid, None, sid, None)
+}
+
+/// Admits a new process group in an existing session for `setpgid(2)`.
+pub fn prepare_new_process_group_table_admission(
+    pgid: Pid,
+    session: &Arc<Session>,
+) -> AxResult<ProcessGroupTableAdmission> {
+    prepare_process_group_table_admission(pgid, None, session.sid(), Some(session.clone()))
+}
+
+impl ProcessGroupTableAdmission {
+    /// Publishes the admitted group/session pair without allocating.
+    pub fn commit(mut self, group: &Arc<ProcessGroup>, session: &Arc<Session>) {
+        debug_assert_eq!(group.pgid(), self.pgid);
+        debug_assert_eq!(session.sid(), self.sid);
+        debug_assert!(
+            self.expected_group
+                .as_ref()
+                .is_none_or(|expected| Arc::ptr_eq(expected, group))
+        );
+        debug_assert!(
+            self.expected_session
+                .as_ref()
+                .is_none_or(|expected| Arc::ptr_eq(expected, session))
+        );
+
+        let (old_group, old_session) = {
+            let mut groups = PROCESS_GROUP_TABLE.lock();
+            let mut sessions = SESSION_TABLE.lock();
+            let old_group = self
+                .group_slot
+                .then(|| groups.insert_reserved(self.pgid, group))
+                .flatten();
+            let old_session = self
+                .session_slot
+                .then(|| sessions.insert_reserved(self.sid, session))
+                .flatten();
+            self.committed = true;
+            (old_group, old_session)
+        };
+        drop((old_group, old_session));
+    }
+}
+
+impl Drop for ProcessGroupTableAdmission {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.group_slot {
+            PROCESS_GROUP_TABLE.lock().release_slot(self.pgid);
+        }
+        if self.session_slot {
+            SESSION_TABLE.lock().release_slot(self.sid);
+        }
+    }
+}
+
+/// Reserves every registry bucket needed to publish `task`.
+pub fn prepare_task_table_admission(task: &AxTaskRef) -> AxResult<TaskTableAdmission> {
     let tid = task.id().as_u64() as Pid;
     let visible_tid = task.as_thread().tid();
+    let proc_data = task.as_thread().proc_data.clone();
+    let pid = proc_data.proc.pid();
+    let group = proc_data.proc.group();
+    let pgid = group.pgid();
+    let session = group.session();
+    let sid = session.sid();
 
-    let mut task_table = TASK_TABLE.write();
-    task_table.insert(tid, task);
-    drop(task_table);
+    let mut admission = TaskTableAdmission {
+        task: task.clone(),
+        tid,
+        visible_tid,
+        proc_data,
+        pid,
+        group,
+        pgid,
+        session,
+        sid,
+        task_slot: false,
+        alias_slot: false,
+        process_slot: false,
+        group_slot: false,
+        session_slot: false,
+        committed: false,
+    };
 
+    admission.task_slot = reserve_unique_task_key(&TASK_TABLE, tid)?;
     if visible_tid != tid {
-        TASK_ALIAS_TABLE.write().insert(visible_tid, task);
+        admission.alias_slot = reserve_unique_task_key(&TASK_ALIAS_TABLE, visible_tid)?;
     }
-
-    let proc_data = &task.as_thread().proc_data;
-    let proc = &proc_data.proc;
-    let pid = proc.pid();
-    let mut proc_table = PROCESS_TABLE.write();
-    if proc_table.contains_key(&pid) {
-        return;
-    }
-    proc_table.insert(pid, proc_data);
-
-    let pg = proc.group();
-    let mut pg_table = PROCESS_GROUP_TABLE.write();
-    if pg_table.contains_key(&pg.pgid()) {
-        return;
-    }
-    pg_table.insert(pg.pgid(), &pg);
-
-    let session = pg.session();
-    let mut session_table = SESSION_TABLE.write();
-    if session_table.contains_key(&session.sid()) {
-        return;
-    }
-    session_table.insert(session.sid(), &session);
+    admission.process_slot = reserve_process_key(pid, &admission.proc_data)?;
+    admission.group_slot = reserve_group_key(pgid, &admission.group)?;
+    admission.session_slot = reserve_session_key(sid, &admission.session)?;
+    Ok(admission)
 }
 
-/// Adds an additional lookup key for a task.
-pub fn add_task_alias(alias: Pid, task: &AxTaskRef) {
-    TASK_ALIAS_TABLE.write().insert(alias, task);
+impl TaskTableAdmission {
+    /// Atomically publishes every admitted lookup identity. All insertions use
+    /// pre-reserved buckets, and displaced stale weak references are dropped
+    /// only after every registry lock has been released.
+    pub fn commit(mut self) {
+        let mut task_table = TASK_TABLE.lock();
+        let mut alias_table = TASK_ALIAS_TABLE.lock();
+        let mut process_table = PROCESS_TABLE.lock();
+        let mut group_table = PROCESS_GROUP_TABLE.lock();
+        let mut session_table = SESSION_TABLE.lock();
+
+        let old_task = self
+            .task_slot
+            .then(|| task_table.insert_reserved(self.tid, &self.task))
+            .flatten();
+        let old_alias = self
+            .alias_slot
+            .then(|| alias_table.insert_reserved(self.visible_tid, &self.task))
+            .flatten();
+        let old_process = self
+            .process_slot
+            .then(|| process_table.insert_reserved(self.pid, &self.proc_data))
+            .flatten();
+        let old_group = self
+            .group_slot
+            .then(|| group_table.insert_reserved(self.pgid, &self.group))
+            .flatten();
+        let old_session = self
+            .session_slot
+            .then(|| session_table.insert_reserved(self.sid, &self.session))
+            .flatten();
+        self.committed = true;
+
+        drop(session_table);
+        drop(group_table);
+        drop(process_table);
+        drop(alias_table);
+        drop(task_table);
+        drop((old_task, old_alias, old_process, old_group, old_session));
+    }
 }
 
-/// Lists all tasks.
-pub fn tasks() -> Vec<AxTaskRef> {
-    TASK_TABLE.read().values().collect()
+impl Drop for TaskTableAdmission {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.task_slot {
+            TASK_TABLE.lock().release_slot(self.tid);
+        }
+        if self.alias_slot {
+            TASK_ALIAS_TABLE.lock().release_slot(self.visible_tid);
+        }
+        if self.process_slot {
+            PROCESS_TABLE.lock().release_slot(self.pid);
+        }
+        if self.group_slot {
+            PROCESS_GROUP_TABLE.lock().release_slot(self.pgid);
+        }
+        if self.session_slot {
+            SESSION_TABLE.lock().release_slot(self.sid);
+        }
+    }
+}
+
+/// Add the task and all of its lookup identities to the corresponding tables.
+pub fn add_task_to_table(task: &AxTaskRef) -> AxResult<()> {
+    prepare_task_table_admission(task)?.commit();
+    Ok(())
+}
+
+/// Capacity/identity admission for an exec de-thread task alias.
+pub struct TaskAliasAdmission {
+    alias: Pid,
+    task: AxTaskRef,
+    committed: bool,
+}
+
+/// Reserves an additional lookup key without publishing it.
+pub fn prepare_task_alias_admission(alias: Pid, task: &AxTaskRef) -> AxResult<TaskAliasAdmission> {
+    reserve_unique_task_key(&TASK_ALIAS_TABLE, alias)?;
+    Ok(TaskAliasAdmission {
+        alias,
+        task: task.clone(),
+        committed: false,
+    })
+}
+
+impl TaskAliasAdmission {
+    /// Publishes the alias against its pre-reserved bucket.
+    pub fn commit(mut self) {
+        let old = TASK_ALIAS_TABLE
+            .lock()
+            .insert_reserved(self.alias, &self.task);
+        self.committed = true;
+        drop(old);
+    }
+}
+
+impl Drop for TaskAliasAdmission {
+    fn drop(&mut self) {
+        if !self.committed {
+            TASK_ALIAS_TABLE.lock().release_slot(self.alias);
+        }
+    }
+}
+
+/// Fallibly snapshots live registry values. Capacity is admitted before the
+/// lock is reacquired; the locked pass only upgrades weak references and
+/// pushes into already-owned storage.
+fn try_registry_values<W: RegistryWeak>(
+    registry: &Mutex<WeakRegistry<W>>,
+) -> AxResult<Vec<W::Strong>> {
+    let mut snapshot = Vec::new();
+    loop {
+        snapshot.clear();
+        let required = registry.lock().entries.len();
+        if snapshot.capacity() < required {
+            snapshot
+                .try_reserve_exact(required)
+                .map_err(|_| AxError::NoMemory)?;
+        }
+        let table = registry.lock();
+        let mut retry = false;
+        for task in table.values() {
+            if snapshot.len() == snapshot.capacity() {
+                retry = true;
+                break;
+            }
+            snapshot.push(task);
+        }
+        drop(table);
+        if !retry {
+            return Ok(snapshot);
+        }
+
+        let current = snapshot.capacity();
+        if current >= MAX_WEAK_REGISTRY_ENTRIES {
+            return Err(AxError::NoMemory);
+        }
+        let target = current
+            .max(1)
+            .saturating_mul(2)
+            .min(MAX_WEAK_REGISTRY_ENTRIES);
+        snapshot.clear();
+        snapshot
+            .try_reserve_exact(target)
+            .map_err(|_| AxError::NoMemory)?;
+    }
+}
+
+/// Fallibly snapshots all task references.
+pub fn try_tasks() -> AxResult<Vec<AxTaskRef>> {
+    try_registry_values(&TASK_TABLE)
+}
+
+/// Fallibly snapshots all live process runtime objects.
+pub fn try_processes() -> AxResult<Vec<Arc<ProcessData>>> {
+    try_registry_values(&PROCESS_TABLE)
+}
+
+fn try_process_groups() -> AxResult<Vec<Arc<ProcessGroup>>> {
+    try_registry_values(&PROCESS_GROUP_TABLE)
 }
 
 /// Finds the task with the given TID.
@@ -150,23 +684,25 @@ pub fn get_task(tid: Pid) -> AxResult<AxTaskRef> {
     if tid == 0 {
         return Ok(current().clone());
     }
-    TASK_TABLE
-        .read()
+    if let Some(task) = TASK_TABLE.lock().get(&tid) {
+        return Ok(task);
+    }
+    TASK_ALIAS_TABLE
+        .lock()
         .get(&tid)
-        .or_else(|| TASK_ALIAS_TABLE.read().get(&tid))
         .ok_or(AxError::NoSuchProcess)
 }
 
 /// Finds the task with the given user-visible TID.
 pub fn get_visible_task(tid: Pid) -> AxResult<AxTaskRef> {
-    if let Some(task) = TASK_ALIAS_TABLE.read().get(&tid)
+    if let Some(task) = TASK_ALIAS_TABLE.lock().get(&tid)
         && task.as_thread().tid() == tid
         && !task.as_thread().pending_exit()
     {
         return Ok(task);
     }
 
-    if let Some(task) = TASK_TABLE.read().get(&tid)
+    if let Some(task) = TASK_TABLE.lock().get(&tid)
         && task.as_thread().tid() == tid
         && !task.as_thread().pending_exit()
     {
@@ -179,13 +715,13 @@ pub fn get_visible_task(tid: Pid) -> AxResult<AxTaskRef> {
 /// Finds the task with the given user-visible TID, including tasks that have
 /// begun exiting but are still published in the task tables.
 pub fn get_visible_task_including_exiting(tid: Pid) -> AxResult<AxTaskRef> {
-    if let Some(task) = TASK_ALIAS_TABLE.read().get(&tid)
+    if let Some(task) = TASK_ALIAS_TABLE.lock().get(&tid)
         && task.as_thread().tid() == tid
     {
         return Ok(task);
     }
 
-    if let Some(task) = TASK_TABLE.read().get(&tid)
+    if let Some(task) = TASK_TABLE.lock().get(&tid)
         && task.as_thread().tid() == tid
     {
         return Ok(task);
@@ -228,12 +764,8 @@ pub fn with_proc_state_hint<R>(hint: ProcStateHint, f: impl FnOnce() -> R) -> R 
 
 /// Removes a task alias lookup key.
 pub fn remove_task_alias(alias: Pid) {
-    TASK_ALIAS_TABLE.write().remove(&alias);
-}
-
-/// Lists all processes.
-pub fn processes() -> Vec<Arc<ProcessData>> {
-    PROCESS_TABLE.read().values().collect()
+    let removed = TASK_ALIAS_TABLE.lock().remove(&alias);
+    drop(removed);
 }
 
 /// Finds the process with the given PID.
@@ -241,7 +773,7 @@ pub fn get_process_data(pid: Pid) -> AxResult<Arc<ProcessData>> {
     if pid == 0 {
         return Ok(current().as_thread().proc_data.clone());
     }
-    PROCESS_TABLE.read().get(&pid).ok_or(AxError::NoSuchProcess)
+    PROCESS_TABLE.lock().get(&pid).ok_or(AxError::NoSuchProcess)
 }
 
 /// Finds a process by PID even after its runtime [`ProcessData`] has been
@@ -251,12 +783,12 @@ pub fn get_process_including_zombie(pid: Pid) -> AxResult<Arc<Process>> {
     if pid == 0 {
         return Ok(current().as_thread().proc_data.proc.clone());
     }
-    if let Some(proc_data) = PROCESS_TABLE.read().get(&pid) {
+    if let Some(proc_data) = PROCESS_TABLE.lock().get(&pid) {
         return Ok(proc_data.proc.clone());
     }
 
-    for group in PROCESS_GROUP_TABLE.read().values() {
-        for process in group.processes() {
+    for group in try_process_groups()? {
+        for process in group.try_processes().map_err(|_| AxError::NoMemory)? {
             if process.pid() == pid {
                 return Ok(process);
             }
@@ -268,11 +800,11 @@ pub fn get_process_including_zombie(pid: Pid) -> AxResult<Arc<Process>> {
 
 /// Finds the process group with the given PGID.
 pub fn get_process_group(pgid: Pid) -> AxResult<Arc<ProcessGroup>> {
-    if let Some(group) = PROCESS_GROUP_TABLE.read().get(&pgid) {
+    if let Some(group) = PROCESS_GROUP_TABLE.lock().get(&pgid) {
         return Ok(group);
     }
 
-    let group = processes()
+    let group = try_processes()?
         .into_iter()
         .find_map(|proc_data| {
             let group = proc_data.proc.group();
@@ -280,20 +812,34 @@ pub fn get_process_group(pgid: Pid) -> AxResult<Arc<ProcessGroup>> {
         })
         .ok_or(AxError::NoSuchProcess)?;
 
-    remember_process_group(&group);
+    remember_process_group(&group)?;
     Ok(group)
 }
 
 /// Finds the session with the given SID.
 pub fn get_session(sid: Pid) -> AxResult<Arc<Session>> {
-    SESSION_TABLE.read().get(&sid).ok_or(AxError::NoSuchProcess)
+    SESSION_TABLE.lock().get(&sid).ok_or(AxError::NoSuchProcess)
 }
 
 /// Publishes a process group and its session in the lookup tables.
-pub fn remember_process_group(group: &Arc<ProcessGroup>) {
-    PROCESS_GROUP_TABLE.write().insert(group.pgid(), group);
+/// Both buckets are admitted before either identity becomes visible.
+pub fn remember_process_group(group: &Arc<ProcessGroup>) -> AxResult<()> {
     let session = group.session();
-    SESSION_TABLE.write().insert(session.sid(), &session);
+    let admission = match prepare_process_group_table_admission(
+        group.pgid(),
+        Some(group.clone()),
+        session.sid(),
+        Some(session.clone()),
+    ) {
+        Ok(admission) => admission,
+        // Another publisher already owns this exact lookup key. The caller
+        // has a strong group found from live process state, so lookup can
+        // succeed now and the concurrent token will finish the cache commit.
+        Err(AxError::ResourceBusy) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    admission.commit(group, &session);
+    Ok(())
 }
 
 /// Updates the current task's saved and active user page table root.
@@ -644,16 +1190,18 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
         acct_process_exit(&thr.proc_data, exit_code, self_usage);
         thr.proc_data.release_executable();
         crate::syscall::cleanup_process_aio(process.pid());
-        let closed_fds = thr.with_mut_scope(crate::file::close_process_fd_table);
+        let detached_fd_table = thr.proc_data.exit_fd_table();
+        let closed_fds = thr.with_mut_scope(|scope| {
+            crate::file::replace_process_fd_table(scope, detached_fd_table)
+        });
         // wait(2) may return as soon as the parent observes the zombie state.
-        // Child-owned file descriptions must be fully dropped before that point
-        // so close-time writeback and unlink interactions are complete.
-        drop(closed_fds);
+        // Release process-owned POSIX locks before the old files_struct can
+        // drop its descriptions. Their Drop path publishes IN_CLOSE/FAN_CLOSE
+        // work, which must only become observable after those locks are gone.
+        crate::file::release_process_fd_table(process.pid(), closed_fds);
+        crate::file::inotify::wait_current_close_notifications();
         detach_ptrace_links_on_process_exit(&thr.proc_data);
-        crate::syscall::SHM_MANAGER
-            .lock()
-            .clear_proc_shm(process.pid());
-        crate::file::flock::release_posix_owner(process.pid());
+        crate::syscall::clear_proc_shm(process.pid());
         if !auto_reap {
             process.publish_zombie_snapshot(ZombieSnapshot {
                 wait_status: process.exit_code(),
@@ -662,7 +1210,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
                 uid: thr.proc_data.uid(),
             });
         }
-        let inherited_zombies = process.exit();
+        process.exit(|child| notify_reaper_of_inherited_zombie(&child));
         if let Some(parent) = parent.as_ref()
             && !suppress_exit_signal
             && let Some(signo) = thr.proc_data.exit_signal
@@ -677,9 +1225,6 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
         if let Some(data) = parent_data {
             data.child_exit_event.wake();
         }
-        for child in inherited_zombies {
-            notify_reaper_of_inherited_zombie(&child);
-        }
         thr.proc_data.exit_event.wake();
         thr.proc_data.release_vfork();
     }
@@ -689,7 +1234,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
     if group_exit && !process.is_group_exited() {
         process.group_exit();
         let sig = SignalInfo::new_kernel(Signo::SIGKILL);
-        for tid in process.threads() {
+        for tid in process.thread_ids() {
             let _ = send_signal_to_thread(None, tid, Some(sig.clone()));
         }
     }
@@ -712,5 +1257,72 @@ mod tests {
     #[test]
     fn robust_owner_died_ignores_other_owner() {
         assert_eq!(robust_owner_died_word(7, 42), None);
+    }
+
+    #[test]
+    fn weak_registry_holds_capacity_and_key_credits_until_commit() {
+        let first = Arc::new(11usize);
+        let second = Arc::new(22usize);
+        let mut registry: WeakRegistry<Weak<usize>> = WeakRegistry::new();
+
+        registry.reserve_slot(1).unwrap();
+        assert_eq!(registry.reserve_slot(1), Err(AxError::ResourceBusy));
+        registry.reserve_slot(2).unwrap();
+        assert!(registry.entries.capacity() >= registry.entries.len() + registry.reserved);
+
+        assert!(registry.insert_reserved(1, &first).is_none());
+        assert_eq!(registry.get(&1).as_deref(), Some(&11));
+        assert_eq!(registry.reserved, 1);
+        assert!(registry.reserved_keys.contains(&2));
+
+        assert!(registry.insert_reserved(2, &second).is_none());
+        assert_eq!(registry.get(&2).as_deref(), Some(&22));
+        assert_eq!(registry.reserved, 0);
+        assert!(registry.reserved_keys.is_empty());
+    }
+
+    #[test]
+    fn weak_registry_rollback_releases_only_its_key_credit() {
+        let mut registry: WeakRegistry<Weak<usize>> = WeakRegistry::new();
+        registry.reserve_slot(7).unwrap();
+        registry.reserve_slot(8).unwrap();
+
+        registry.release_slot(7);
+
+        assert_eq!(registry.reserved, 1);
+        assert!(!registry.reserved_keys.contains(&7));
+        assert!(registry.reserved_keys.contains(&8));
+        assert!(registry.entries.capacity() >= registry.entries.len() + registry.reserved);
+    }
+
+    #[test]
+    fn weak_registry_ceiling_counts_live_and_reserved_admissions() {
+        assert_eq!(next_registry_reservation(0, 0), Ok(1));
+        assert_eq!(
+            next_registry_reservation(MAX_WEAK_REGISTRY_ENTRIES - 1, 0),
+            Ok(1)
+        );
+        assert_eq!(
+            next_registry_reservation(MAX_WEAK_REGISTRY_ENTRIES, 0),
+            Err(AxError::NoMemory)
+        );
+        assert_eq!(
+            next_registry_reservation(0, MAX_WEAK_REGISTRY_ENTRIES),
+            Err(AxError::NoMemory)
+        );
+    }
+
+    #[test]
+    fn stale_registry_entries_do_not_consume_live_admission() {
+        let mut registry: WeakRegistry<Weak<usize>> = WeakRegistry::new();
+        let stale = Arc::new(11usize);
+        registry.reserve_slot(1).unwrap();
+        assert!(registry.insert_reserved(1, &stale).is_none());
+        drop(stale);
+
+        registry.reserve_slot(2).unwrap();
+        assert_eq!(registry.reserved, 1);
+        registry.release_slot(2);
+        assert_eq!(registry.reserved, 0);
     }
 }

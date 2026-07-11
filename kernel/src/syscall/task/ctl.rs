@@ -1,5 +1,5 @@
 use alloc::sync::Arc;
-use core::ffi::c_char;
+use core::{ffi::c_char, mem};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::FS_CONTEXT;
@@ -15,11 +15,10 @@ use linux_raw_sys::{
     mempolicy::*,
 };
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
-use spin::RwLock;
 use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
 
 use crate::{
-    file::{FD_TABLE, File, FileDescription, FileLike},
+    file::{FD_TABLE, File, FileDescription, FileLike, replace_process_fd_table},
     mm::vm_load_string,
     pseudofs::{
         ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
@@ -308,25 +307,64 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
 
     let curr = current();
     let thread = curr.as_thread();
-    if flags & (CLONE_FILES | CLONE_FS) != 0 {
-        thread.with_mut_scope(|scope| {
-            if flags & CLONE_FILES != 0 {
-                let cloned = FD_TABLE.scope(scope).read().clone();
-                *FD_TABLE.scope_mut(scope) = Arc::new(RwLock::new(cloned));
+    if flags & UNSHARE_SUPPORTED_FLAGS != 0 {
+        // Every currently supported resource still lives in ProcessData or its
+        // process-wide Scope. Replacing one while siblings exist would unshare
+        // it for the whole thread group instead of only for the caller.
+        // Atomically gate CLONE_THREAD against the single-thread test, then
+        // prepare every fallible replacement before committing any of them.
+        let curr_tid = curr.id().as_u64() as starry_process::Pid;
+        if !thread.proc_data.begin_single_thread_scope_change(curr_tid) {
+            return Err(AxError::OperationNotSupported);
+        }
+
+        let result = (|| -> AxResult<()> {
+            let private_fd_table = if flags & CLONE_FILES != 0 && Arc::strong_count(&*FD_TABLE) > 1
+            {
+                Some(Arc::try_new(FD_TABLE.fork_copy()?).map_err(|_| AxError::NoMemory)?)
+            } else {
+                None
+            };
+            let private_fs_context = if flags & CLONE_FS != 0 && Arc::strong_count(&*FS_CONTEXT) > 1
+            {
+                let cloned = FS_CONTEXT.lock().clone();
+                Some(Arc::try_new(axsync::Mutex::new(cloned)).map_err(|_| AxError::NoMemory)?)
+            } else {
+                None
+            };
+            let private_uts_ns = if flags & CLONE_NEWUTS != 0 {
+                Some(thread.proc_data.uts_ns().try_fork()?)
+            } else {
+                None
+            };
+            let private_time_ns = if flags & CLONE_NEWTIME != 0 {
+                Some(thread.proc_data.try_unshared_time_ns()?)
+            } else {
+                None
+            };
+
+            let (old_fd_table, old_fs_context) = thread.with_mut_scope(|scope| {
+                let old_fd_table = private_fd_table
+                    .map(|replacement| replace_process_fd_table(scope, replacement));
+                let old_fs_context = private_fs_context.map(|replacement| {
+                    mem::replace(&mut *FS_CONTEXT.scope_mut(scope), replacement)
+                });
+                (old_fd_table, old_fs_context)
+            });
+            // Arc destructors can cascade into filesystem or file-description
+            // cleanup. Keep all such work outside the IRQ/preempt-off scope gate.
+            drop(old_fd_table);
+            drop(old_fs_context);
+            if let Some(uts_ns) = private_uts_ns {
+                thread.proc_data.replace_uts_ns(uts_ns);
             }
-            if flags & CLONE_FS != 0 {
-                let cloned = FS_CONTEXT.scope(scope).lock().clone();
-                *FS_CONTEXT.scope_mut(scope) = Arc::new(axsync::Mutex::new(cloned));
+            if let Some(time_ns) = private_time_ns {
+                thread.proc_data.replace_time_ns_for_children(time_ns);
             }
-        });
-    }
-    if flags & CLONE_NEWUTS != 0 {
-        thread
-            .proc_data
-            .replace_uts_ns(thread.proc_data.uts_ns().fork());
-    }
-    if flags & CLONE_NEWTIME != 0 {
-        thread.proc_data.unshare_time_ns();
+            Ok(())
+        })();
+        thread.proc_data.end_exec(curr_tid);
+        result?;
     }
 
     Ok(0)
@@ -846,7 +884,7 @@ pub fn sys_prctl(
     match option {
         PR_SET_NAME => {
             let s = vm_load_string(arg2 as *const c_char)?;
-            current().set_name(&s);
+            drop(current().replace_name(s));
         }
         PR_GET_NAME => {
             let name = current().name();

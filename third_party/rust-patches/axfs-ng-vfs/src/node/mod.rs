@@ -11,10 +11,14 @@ use alloc::{
 use bitflags::bitflags;
 use core::{
     any::{Any, TypeId},
-    fmt, iter,
+    fmt, iter, mem,
+    hash::{Hash, Hasher},
     ops::Deref,
+    ptr,
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
     task::Context,
 };
+use hashbrown::Equivalent;
 use smallvec::SmallVec;
 
 use axpoll::{IoEvents, Pollable};
@@ -54,6 +58,15 @@ bitflags! {
         /// This could prevent higher layers from attempting to add unnecessary
         /// non-blocking handling.
         const BLOCKING = 0x0008;
+
+        /// Indicates a filesystem-declared magic/jump link whose resolution
+        /// transfers to another object identity rather than following an
+        /// ordinary stored pathname.
+        ///
+        /// This is independent of whether a textual target happens to be
+        /// generated dynamically. Pathwalk policy can distinguish the semantic
+        /// capability without depending on filesystem names or path strings.
+        const MAGIC_LINK = 0x0010;
     }
 }
 
@@ -123,29 +136,139 @@ impl fmt::Debug for Node {
     }
 }
 
-pub type ReferenceKey = (usize, String);
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceKey {
+    path_hash: u64,
+    components: Vec<String>,
+    anonymous_id: Option<u64>,
+}
+
+impl Hash for ReferenceKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.path_hash.hash(state);
+        self.anonymous_id.hash(state);
+    }
+}
+
+pub struct ReferenceKeyRef<'a> {
+    reference: &'a Reference,
+}
+
+impl Hash for ReferenceKeyRef<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.reference.path_hash.hash(state);
+        self.reference.anonymous_id.hash(state);
+    }
+}
+
+impl Equivalent<ReferenceKey> for ReferenceKeyRef<'_> {
+    fn equivalent(&self, key: &ReferenceKey) -> bool {
+        if self.reference.anonymous_id != key.anonymous_id
+            || self.reference.path_hash != key.path_hash
+        {
+            return false;
+        }
+        if self.reference.anonymous_id.is_some() {
+            return true;
+        }
+
+        let mut current = Some(self.reference);
+        for expected in &key.components {
+            let Some(reference) = current else {
+                return false;
+            };
+            if reference.name != *expected {
+                return false;
+            }
+            current = reference
+                .parent
+                .as_ref()
+                .map(|parent| &parent.0.reference);
+        }
+        current.is_none()
+    }
+}
+
+static ANONYMOUS_REFERENCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct Reference {
     parent: Option<DirEntry>,
     name: String,
+    anonymous_id: Option<u64>,
+    path_hash: u64,
 }
 
 impl Reference {
+    fn extend_path_hash(mut hash: u64, name: &str) -> u64 {
+        const FNV_PRIME: u64 = 0x100000001b3;
+        for byte in name.len().to_le_bytes().iter().chain(name.as_bytes()) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
     pub fn new(parent: Option<DirEntry>, name: String) -> Self {
-        Self { parent, name }
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        let parent_hash = parent
+            .as_ref()
+            .map_or(FNV_OFFSET, |parent| parent.0.reference.path_hash);
+        let path_hash = Self::extend_path_hash(parent_hash, &name);
+        Self {
+            parent,
+            name,
+            anonymous_id: None,
+            path_hash,
+        }
     }
 
     pub fn root() -> Self {
         Self::new(None, String::new())
     }
 
-    pub fn key(&self) -> ReferenceKey {
-        let address = self
-            .parent
-            .as_ref()
-            .map_or(0, |it| Arc::as_ptr(&it.0) as usize);
-        (address, self.name.clone())
+    pub fn anonymous() -> Self {
+        let anonymous_id = ANONYMOUS_REFERENCE_ID.fetch_add(1, Ordering::Relaxed);
+        Self {
+            parent: None,
+            name: String::new(),
+            anonymous_id: Some(anonymous_id),
+            path_hash: anonymous_id,
+        }
+    }
+
+    pub fn try_key(&self) -> VfsResult<ReferenceKey> {
+        let mut components = Vec::new();
+        if self.anonymous_id.is_none() {
+            let mut current = Some(self);
+            while let Some(reference) = current {
+                components
+                    .try_reserve(1)
+                    .map_err(|_| VfsError::NoMemory)?;
+                let mut name = String::new();
+                name.try_reserve(reference.name.len())
+                    .map_err(|_| VfsError::NoMemory)?;
+                name.push_str(&reference.name);
+                components.push(name);
+                current = reference
+                    .parent
+                    .as_ref()
+                    .map(|parent| &parent.0.reference);
+            }
+        }
+        Ok(ReferenceKey {
+            path_hash: self.path_hash,
+            components,
+            anonymous_id: self.anonymous_id,
+        })
+    }
+
+    pub fn key_ref(&self) -> ReferenceKeyRef<'_> {
+        ReferenceKeyRef { reference: self }
+    }
+
+    fn is_root(&self) -> bool {
+        self.parent.is_none() && self.anonymous_id.is_none()
     }
 }
 
@@ -166,6 +289,28 @@ impl TypeMap {
         }
     }
 
+    /// Fallibly prepares both the erased value ownership and an additional
+    /// inline-map slot before publishing either. Replacing an existing type
+    /// needs no container growth, but the new `Arc` is still admitted first.
+    pub fn try_insert<T: Any + Send + Sync>(
+        &mut self,
+        value: T,
+    ) -> VfsResult<Option<Arc<T>>> {
+        let id = TypeId::of::<T>();
+        let value: Arc<dyn Any + Send + Sync> =
+            Arc::try_new(value).map_err(|_| VfsError::NoMemory)?;
+        let retired = if let Some((_, slot)) = self.0.iter_mut().find(|(existing, _)| *existing == id) {
+            Some(mem::replace(slot, value))
+        } else {
+            self.0.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+            self.0.push((id, value));
+            None
+        };
+        retired
+            .map(|value| value.downcast::<T>().map_err(|_| VfsError::Io))
+            .transpose()
+    }
+
     pub fn get<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
         self.0
             .iter()
@@ -179,6 +324,14 @@ impl TypeMap {
             .and_then(|value| value.downcast().ok())
     }
 
+    pub fn get_ref<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.0.iter().find_map(|(id, value)| {
+            (id == &TypeId::of::<T>())
+                .then(|| value.as_ref().downcast_ref::<T>())
+                .flatten()
+        })
+    }
+
     pub fn get_or_insert_with<T: Any + Send + Sync>(&mut self, f: impl FnOnce() -> T) -> Arc<T> {
         if let Some(value) = self.get::<T>() {
             value
@@ -188,6 +341,19 @@ impl TypeMap {
             self.get::<T>().unwrap()
         }
     }
+
+    pub fn try_get_or_insert_with<T: Any + Send + Sync>(
+        &mut self,
+        f: impl FnOnce() -> T,
+    ) -> VfsResult<Arc<T>> {
+        if let Some(value) = self.get::<T>() {
+            return Ok(value);
+        }
+        let retired = self.try_insert(f())?;
+        debug_assert!(retired.is_none());
+        drop(retired);
+        self.get::<T>().ok_or(VfsError::Io)
+    }
 }
 
 struct Inner {
@@ -195,6 +361,12 @@ struct Inner {
     node_type: NodeType,
     reference: Reference,
     user_data: Mutex<TypeMap>,
+    /// Set while this entry is queued, processed, or suspended below a child.
+    cleanup_active: AtomicBool,
+    /// Allocation-free link owned by the deferred-cleanup queue.
+    cleanup_next: AtomicPtr<Inner>,
+    /// Suspended parent resumed after this directory subtree is drained.
+    cleanup_return: Mutex<Option<DirEntry>>,
 }
 
 impl fmt::Debug for Inner {
@@ -217,6 +389,172 @@ impl WeakDirEntry {
     pub fn upgrade(&self) -> Option<DirEntry> {
         self.0.upgrade().map(DirEntry)
     }
+}
+
+/// One task-context pass processes at most this many directory work items.
+const DEFERRED_DENTRY_CLEANUP_BATCH: usize = 64;
+
+// Producers publish the new head with one atomic swap and then fill its link.
+// A consumer that observes this sentinel leaves the queue for the next safe
+// point instead of spinning in an arbitrary destruction context.
+const CLEANUP_LINKING: *mut Inner = 1usize as *mut Inner;
+static DEFERRED_DENTRY_CLEANUP_HEAD: AtomicPtr<Inner> = AtomicPtr::new(ptr::null_mut());
+static DEFERRED_DENTRY_CLEANUP_DRAINING: AtomicBool = AtomicBool::new(false);
+
+fn push_active_dentry_cleanup(entry: DirEntry) {
+    let raw = Arc::into_raw(entry.0) as *mut Inner;
+    // SAFETY: `raw` owns the strong Arc reference transferred to the queue.
+    // `cleanup_active` ensures this embedded link occurs at most once until a
+    // consumer removes it, and the raw Arc keeps `Inner` alive throughout.
+    unsafe {
+        (*raw)
+            .cleanup_next
+            .store(CLEANUP_LINKING, Ordering::Relaxed);
+    }
+    let previous = DEFERRED_DENTRY_CLEANUP_HEAD.swap(raw, Ordering::AcqRel);
+    // SAFETY: the queue still owns `raw`; publishing the real link completes
+    // the constant-time producer protocol described above.
+    unsafe {
+        (*raw).cleanup_next.store(previous, Ordering::Release);
+    }
+}
+
+fn pop_active_dentry_cleanup() -> Option<DirEntry> {
+    let head = DEFERRED_DENTRY_CLEANUP_HEAD.load(Ordering::Acquire);
+    if head.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null queue head owns one raw Arc, so `Inner` stays alive.
+    let next = unsafe { (*head).cleanup_next.load(Ordering::Acquire) };
+    if next == CLEANUP_LINKING {
+        return None;
+    }
+    if DEFERRED_DENTRY_CLEANUP_HEAD
+        .compare_exchange(head, next, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    // SAFETY: the successful exchange transferred the queue's one raw Arc to
+    // this consumer. No other consumer runs concurrently, and producers cannot
+    // enqueue this entry while `cleanup_active` remains set.
+    unsafe {
+        (*head)
+            .cleanup_next
+            .store(ptr::null_mut(), Ordering::Relaxed);
+        Some(DirEntry(Arc::from_raw(head)))
+    }
+}
+
+fn claim_dentry_cleanup(entry: &DirEntry) -> bool {
+    let Ok(dir) = entry.as_dir() else {
+        return false;
+    };
+    if dir.cache_is_retired() {
+        return false;
+    }
+    entry
+        .0
+        .cleanup_active
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+pub(crate) fn defer_dentry_cache_cleanup(entry: DirEntry) {
+    if claim_dentry_cleanup(&entry) {
+        push_active_dentry_cleanup(entry);
+    }
+}
+
+/// Returns whether a directory-cache reclamation root is waiting for the
+/// dedicated task-context worker.
+pub fn has_deferred_dentry_cache_cleanup_work() -> bool {
+    !DEFERRED_DENTRY_CLEANUP_HEAD
+        .load(Ordering::Acquire)
+        .is_null()
+}
+
+fn finish_dentry_cleanup(entry: DirEntry) {
+    let return_to = entry.0.cleanup_return.lock().take();
+    entry.0.cleanup_active.store(false, Ordering::Release);
+    drop(entry);
+    if let Some(parent) = return_to {
+        push_active_dentry_cleanup(parent);
+    }
+}
+
+fn process_dentry_cleanup(entry: DirEntry) -> Option<DirEntry> {
+    let Ok(dir) = entry.as_dir() else {
+        finish_dentry_cleanup(entry);
+        return None;
+    };
+    let Some((child, complete)) = dir.try_take_cache_cleanup_step() else {
+        return Some(entry);
+    };
+    if let Some(child) = child
+        && claim_dentry_cleanup(&child)
+    {
+        // A claimed child is neither queued nor processing, so its return link
+        // is empty. Keeping the parent here yields an iterative depth-first
+        // walk without recursion or a separately allocated subtree queue.
+        *child.0.cleanup_return.lock() = Some(entry);
+        push_active_dentry_cleanup(child);
+        return None;
+    }
+    if complete {
+        finish_dentry_cleanup(entry);
+    } else {
+        push_active_dentry_cleanup(entry);
+    }
+    None
+}
+
+struct DentryCleanupDrainGuard;
+
+impl Drop for DentryCleanupDrainGuard {
+    fn drop(&mut self) {
+        DEFERRED_DENTRY_CLEANUP_DRAINING.store(false, Ordering::Release);
+    }
+}
+
+/// Performs one bounded pass of deferred directory-cache reclamation.
+///
+/// Final filesystem release only publishes an intrusive work item. Consumers
+/// must call this function from a context where dropping dentries and freeing
+/// their cache allocations is safe. The fixed batch prevents a large cached
+/// tree from turning one scheduler safe point into an unbounded pause. Until a
+/// consumer runs, the queue's raw Arc deliberately keeps every pending root
+/// alive: this preserves memory safety but provides no reclamation liveness.
+///
+/// Returns whether the queue still appeared non-empty at the end of this pass.
+/// A concurrent producer may race with that advisory result; future safe
+/// points should therefore call this function unconditionally.
+pub fn drain_deferred_dentry_cache_cleanup() -> bool {
+    // Empty safe points dominate normal operation. Avoid bouncing the global
+    // single-consumer cacheline when there is no queued root. A producer that
+    // races immediately after this advisory load is still observed by a later
+    // unconditional scheduler safe point.
+    if !has_deferred_dentry_cache_cleanup_work() {
+        return false;
+    }
+    if DEFERRED_DENTRY_CLEANUP_DRAINING.swap(true, Ordering::AcqRel) {
+        return !DEFERRED_DENTRY_CLEANUP_HEAD
+            .load(Ordering::Acquire)
+            .is_null();
+    }
+    let _guard = DentryCleanupDrainGuard;
+    for _ in 0..DEFERRED_DENTRY_CLEANUP_BATCH {
+        let Some(entry) = pop_active_dentry_cleanup() else {
+            break;
+        };
+        if let Some(busy) = process_dentry_cleanup(entry) {
+            push_active_dentry_cleanup(busy);
+            break;
+        }
+    }
+    !DEFERRED_DENTRY_CLEANUP_HEAD
+        .load(Ordering::Acquire)
+        .is_null()
 }
 
 impl From<Node> for Arc<dyn NodeOps> {
@@ -245,12 +583,56 @@ impl DirEntry {
 }
 
 impl DirEntry {
+    /// Fallibly constructs a non-directory entry.
+    ///
+    /// Filesystems which cannot roll back a namespace mutation should use this
+    /// constructor to admit the dentry before committing the backend change.
+    pub fn try_new_file(
+        node: FileNode,
+        node_type: NodeType,
+        reference: Reference,
+    ) -> VfsResult<Self> {
+        Arc::try_new(Inner {
+            node: Node::File(node),
+            node_type,
+            reference,
+            user_data: Mutex::default(),
+            cleanup_active: AtomicBool::new(false),
+            cleanup_next: AtomicPtr::new(ptr::null_mut()),
+            cleanup_return: Mutex::new(None),
+        })
+        .map(Self)
+        .map_err(|_| VfsError::NoMemory)
+    }
+
+    /// Fallibly constructs a directory entry from an already allocated node.
+    ///
+    /// Unlike [`Self::new_dir`], this does not manufacture a cyclic weak
+    /// reference. Backends which need the dentry weak reference can bind
+    /// `entry.downgrade()` to their preallocated node before publication.
+    pub fn try_new_dir(node: DirNode, reference: Reference) -> VfsResult<Self> {
+        Arc::try_new(Inner {
+            node: Node::Dir(node),
+            node_type: NodeType::Directory,
+            reference,
+            user_data: Mutex::default(),
+            cleanup_active: AtomicBool::new(false),
+            cleanup_next: AtomicPtr::new(ptr::null_mut()),
+            cleanup_return: Mutex::new(None),
+        })
+        .map(Self)
+        .map_err(|_| VfsError::NoMemory)
+    }
+
     pub fn new_file(node: FileNode, node_type: NodeType, reference: Reference) -> Self {
         Self(Arc::new(Inner {
             node: Node::File(node),
             node_type,
             reference,
             user_data: Mutex::default(),
+            cleanup_active: AtomicBool::new(false),
+            cleanup_next: AtomicPtr::new(ptr::null_mut()),
+            cleanup_return: Mutex::new(None),
         }))
     }
 
@@ -260,6 +642,9 @@ impl DirEntry {
             node_type: NodeType::Directory,
             reference,
             user_data: Mutex::default(),
+            cleanup_active: AtomicBool::new(false),
+            cleanup_next: AtomicPtr::new(ptr::null_mut()),
+            cleanup_return: Mutex::new(None),
         }))
     }
 
@@ -283,8 +668,12 @@ impl DirEntry {
         WeakDirEntry(Arc::downgrade(&self.0))
     }
 
-    pub fn key(&self) -> ReferenceKey {
-        self.0.reference.key()
+    pub fn try_key(&self) -> VfsResult<ReferenceKey> {
+        self.0.reference.try_key()
+    }
+
+    pub fn key_ref(&self) -> ReferenceKeyRef<'_> {
+        self.0.reference.key_ref()
     }
 
     pub fn node_type(&self) -> NodeType {
@@ -301,7 +690,7 @@ impl DirEntry {
 
     /// Checks if the entry is a root of a mount point.
     pub fn is_root_of_mount(&self) -> bool {
-        self.0.reference.parent.is_none()
+        self.0.reference.is_root()
     }
 
     pub fn is_ancestor_of(&self, other: &Self) -> VfsResult<bool> {

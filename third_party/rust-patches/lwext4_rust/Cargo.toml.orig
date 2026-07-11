@@ -16,6 +16,7 @@ print = ["printf-compat"]
 std = []
 
 [dependencies]
+hashbrown = { version = "0.16", default-features = false, features = ["default-hasher"] }
 log = "0.4"
 printf-compat = { version = "0.3", default-features = false, optional = true }
 

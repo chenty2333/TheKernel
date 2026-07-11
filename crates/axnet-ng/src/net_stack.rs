@@ -1,7 +1,7 @@
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicI32, Ordering};
 
-use axerrno::{AxResult, ax_bail, ax_err_type};
+use axerrno::{AxError, AxResult, ax_bail, ax_err_type};
 use axsync::Mutex;
 use smoltcp::{
     iface::SocketHandle,
@@ -46,7 +46,15 @@ impl NetStack {
         socket_set: Arc<SocketSetWrapper<'static>>,
         service: Service,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Self::try_new(listen_table, socket_set, service).expect("failed to allocate network stack")
+    }
+
+    pub(crate) fn try_new(
+        listen_table: Arc<ListenTable>,
+        socket_set: Arc<SocketSetWrapper<'static>>,
+        service: Service,
+    ) -> AxResult<Arc<Self>> {
+        Arc::try_new(Self {
             listen_table,
             socket_set,
             service: Mutex::new(service),
@@ -55,6 +63,7 @@ impl NetStack {
             ipv4_conf_default_tag: AtomicI32::new(0),
             ipv4_conf_lo_tag: AtomicI32::new(0),
         })
+        .map_err(|_| AxError::NoMemory)
     }
 
     /// Create a minimal network stack with only a loopback device.
@@ -63,11 +72,17 @@ impl NetStack {
     /// The resulting stack has a single `lo` interface (127.0.0.1/8) and no
     /// external connectivity.
     pub fn new_loopback_only() -> Arc<Self> {
-        let socket_set = Arc::new(SocketSetWrapper::new());
-        let listen_table = Arc::new(ListenTable::new());
+        Self::try_new_loopback_only().expect("failed to allocate loopback network namespace")
+    }
 
-        let mut router = Router::new_loopback_only(listen_table.clone());
-        let lo_dev = router.add_device(Box::new(LoopbackDevice::new()));
+    /// Fallibly creates a minimal loopback-only network namespace.
+    pub fn try_new_loopback_only() -> AxResult<Arc<Self>> {
+        let socket_set = Arc::try_new(SocketSetWrapper::new()).map_err(|_| AxError::NoMemory)?;
+        let listen_table = Arc::try_new(ListenTable::try_new()?).map_err(|_| AxError::NoMemory)?;
+
+        let mut router = Router::try_new_loopback_only(listen_table.clone())?;
+        let loopback = Box::try_new(LoopbackDevice::try_new()?).map_err(|_| AxError::NoMemory)?;
+        let lo_dev = router.add_device(loopback);
 
         let lo_ip = Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8);
         let lo_ip6 = Ipv6Cidr::new(Ipv6Address::LOCALHOST, 128);
@@ -100,7 +115,7 @@ impl NetStack {
             }
         });
 
-        Self::new(listen_table, socket_set, service)
+        Self::try_new(listen_table, socket_set, service)
     }
 
     /// Add a network device to this stack's router.

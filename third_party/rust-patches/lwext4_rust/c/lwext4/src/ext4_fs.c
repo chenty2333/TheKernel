@@ -136,6 +136,18 @@ int ext4_fs_fini(struct ext4_fs *fs)
 	return EOK;
 }
 
+int ext4_fs_fini_error(struct ext4_fs *fs)
+{
+	if (!fs)
+		return EINVAL;
+
+	ext4_set16(&fs->sb, state, EXT4_SUPERBLOCK_STATE_ERROR_FS);
+	if (!fs->read_only)
+		return ext4_sb_write(fs->bdev, &fs->sb);
+
+	return EOK;
+}
+
 static void ext4_fs_debug_features_inc(uint32_t features_incompatible)
 {
 	if (features_incompatible & EXT4_FINCOM_COMPRESSION)
@@ -852,30 +864,43 @@ uint32_t ext4_fs_correspond_inode_mode(int filetype)
 	return EXT4_INODE_MODE_FILE;
 }
 
-int ext4_fs_alloc_inode(struct ext4_fs *fs, struct ext4_inode_ref *inode_ref,
-			int filetype)
+int ext4_fs_alloc_inode_status(struct ext4_fs *fs,
+			       struct ext4_inode_ref *inode_ref,
+			       int filetype,
+			       bool *metadata_may_have_changed)
 {
 	/* Check if newly allocated i-node will be a directory */
 	bool is_dir;
+	bool allocation_changed = false;
 	uint16_t inode_size = ext4_get16(&fs->sb, inode_size);
+	if (metadata_may_have_changed)
+		*metadata_may_have_changed = false;
 
 	is_dir = (filetype == EXT4_DE_DIR);
 
 	/* Allocate inode by allocation algorithm */
 	uint32_t index;
-	int rc = ext4_ialloc_alloc_inode(fs, &index, is_dir);
+	int rc = ext4_ialloc_alloc_inode_status(fs, &index, is_dir,
+					       &allocation_changed);
+	if (allocation_changed && metadata_may_have_changed)
+		*metadata_may_have_changed = true;
 	if (rc != EOK)
 		return rc;
 
 	/* Load i-node from on-disk i-node table */
 	rc = __ext4_fs_get_inode_ref(fs, index, inode_ref, false);
 	if (rc != EOK) {
-		ext4_ialloc_free_inode(fs, index, is_dir);
+		int rollback_rc = ext4_ialloc_free_inode(fs, index, is_dir);
+		if (rollback_rc == EOK && metadata_may_have_changed)
+			*metadata_may_have_changed = false;
 		return rc;
 	}
 
 	/* Initialize i-node */
 	struct ext4_inode *inode = inode_ref->inode;
+	uint32_t generation = ext4_inode_get_generation(inode) + 1;
+	if (!generation)
+		generation = 1;
 
 	memset(inode, 0, inode_size);
 
@@ -918,7 +943,10 @@ int ext4_fs_alloc_inode(struct ext4_fs *fs, struct ext4_inode_ref *inode_ref,
 	ext4_inode_set_del_time(inode, 0);
 	ext4_inode_set_blocks_count(&fs->sb, inode, 0);
 	ext4_inode_set_flags(inode, 0);
-	ext4_inode_set_generation(inode, 0);
+	/* Preserve a persistent inode-slot identity across reuse.  A zero
+	 * generation is reserved for legacy inodes that have never gone through
+	 * this allocator. */
+	ext4_inode_set_generation(inode, generation);
 	if (inode_size > EXT4_GOOD_OLD_INODE_SIZE) {
 		uint16_t size = ext4_get16(&fs->sb, want_extra_isize);
 		ext4_inode_set_extra_isize(&fs->sb, inode, size);
@@ -928,6 +956,12 @@ int ext4_fs_alloc_inode(struct ext4_fs *fs, struct ext4_inode_ref *inode_ref,
 	inode_ref->dirty = true;
 
 	return EOK;
+}
+
+int ext4_fs_alloc_inode(struct ext4_fs *fs, struct ext4_inode_ref *inode_ref,
+			int filetype)
+{
+	return ext4_fs_alloc_inode_status(fs, inode_ref, filetype, NULL);
 }
 
 int ext4_fs_free_inode(struct ext4_inode_ref *inode_ref)
@@ -1345,12 +1379,14 @@ int ext4_fs_indirect_find_goal(struct ext4_inode_ref *inode_ref,
 static int ext4_fs_get_inode_dblk_idx_internal(struct ext4_inode_ref *inode_ref,
 				       ext4_lblk_t iblock, ext4_fsblk_t *fblock,
 				       bool extent_create,
-				       bool support_unwritten __unused)
+				       bool support_unwritten __unused,
+				       bool *metadata_may_have_changed)
 {
 	struct ext4_fs *fs = inode_ref->fs;
 
 	/* For empty file is situation simple */
-	if (ext4_inode_get_size(&fs->sb, inode_ref->inode) == 0) {
+	if (!extent_create &&
+	    ext4_inode_get_size(&fs->sb, inode_ref->inode) == 0) {
 		*fblock = 0;
 		return EOK;
 	}
@@ -1364,8 +1400,12 @@ static int ext4_fs_get_inode_dblk_idx_internal(struct ext4_inode_ref *inode_ref,
 	    (ext4_inode_has_flag(inode_ref->inode, EXT4_INODE_FLAG_EXTENTS))) {
 
 		ext4_fsblk_t current_fsblk;
-		int rc = ext4_extent_get_blocks(inode_ref, iblock, 1,
-				&current_fsblk, extent_create, NULL);
+		bool extent_changed = false;
+		int rc = ext4_extent_get_blocks_status(
+			inode_ref, iblock, 1, &current_fsblk, extent_create, NULL,
+			&extent_changed);
+		if (extent_changed && metadata_may_have_changed)
+			*metadata_may_have_changed = true;
 		if (rc != EOK)
 			return rc;
 
@@ -1462,11 +1502,14 @@ int ext4_fs_get_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
 			       bool support_unwritten)
 {
 	return ext4_fs_get_inode_dblk_idx_internal(inode_ref, iblock, fblock,
-						   false, support_unwritten);
+						   false, support_unwritten,
+						   NULL);
 }
 
 static int ext4_fs_set_inode_data_block_index(struct ext4_inode_ref *inode_ref,
-					       ext4_lblk_t iblock, ext4_fsblk_t fblock)
+					       ext4_lblk_t iblock,
+					       ext4_fsblk_t fblock,
+					       bool *metadata_may_have_changed)
 {
 	struct ext4_fs *fs = inode_ref->fs;
 
@@ -1481,6 +1524,8 @@ static int ext4_fs_set_inode_data_block_index(struct ext4_inode_ref *inode_ref,
 
 	/* Handle simple case when we are dealing with direct reference */
 	if (iblock < EXT4_INODE_DIRECT_BLOCK_COUNT) {
+		if (metadata_may_have_changed)
+			*metadata_may_have_changed = true;
 		ext4_inode_set_direct_block(inode_ref->inode, (uint32_t)iblock,
 					    (uint32_t)fblock);
 		inode_ref->dirty = true;
@@ -1518,29 +1563,37 @@ static int ext4_fs_set_inode_data_block_index(struct ext4_inode_ref *inode_ref,
 	if (current_block == 0) {
 		/* Allocate new indirect block */
 		ext4_fsblk_t goal;
+		bool allocation_changed = false;
 		int rc = ext4_fs_indirect_find_goal(inode_ref, &goal);
 		if (rc != EOK)
 			return rc;
 
-		rc = ext4_balloc_alloc_block(inode_ref, goal, &new_blk);
+		rc = ext4_balloc_alloc_block_status(inode_ref, goal, &new_blk,
+						     &allocation_changed);
+		if (allocation_changed && metadata_may_have_changed)
+			*metadata_may_have_changed = true;
 		if (rc != EOK)
 			return rc;
 
 		/* Update i-node */
+		if (metadata_may_have_changed)
+			*metadata_may_have_changed = true;
 		ext4_inode_set_indirect_block(inode_ref->inode, l - 1,
 				(uint32_t)new_blk);
 		inode_ref->dirty = true;
 
 		/* Load newly allocated block */
 		rc = ext4_trans_block_get_noread(fs->bdev, &new_block, new_blk);
-		if (rc != EOK) {
-			ext4_balloc_free_block(inode_ref, new_blk);
+		if (rc != EOK)
 			return rc;
-		}
 
 		/* Initialize new block */
 		memset(new_block.data, 0, block_size);
-		ext4_trans_set_block_dirty(new_block.buf);
+		rc = ext4_trans_set_block_dirty(new_block.buf);
+		if (rc != EOK) {
+			ext4_block_set(fs->bdev, &new_block);
+			return rc;
+		}
 
 		/* Put back the allocated block */
 		rc = ext4_block_set(fs->bdev, &new_block);
@@ -1562,6 +1615,7 @@ static int ext4_fs_set_inode_data_block_index(struct ext4_inode_ref *inode_ref,
 		current_block = to_le32(((uint32_t *)block.data)[off_in_blk]);
 		if ((l > 1) && (current_block == 0)) {
 			ext4_fsblk_t goal;
+			bool allocation_changed = false;
 			rc = ext4_fs_indirect_find_goal(inode_ref, &goal);
 			if (rc != EOK) {
 				ext4_block_set(fs->bdev, &block);
@@ -1569,8 +1623,10 @@ static int ext4_fs_set_inode_data_block_index(struct ext4_inode_ref *inode_ref,
 			}
 
 			/* Allocate new block */
-			rc =
-			    ext4_balloc_alloc_block(inode_ref, goal, &new_blk);
+			rc = ext4_balloc_alloc_block_status(
+				inode_ref, goal, &new_blk, &allocation_changed);
+			if (allocation_changed && metadata_may_have_changed)
+				*metadata_may_have_changed = true;
 			if (rc != EOK) {
 				ext4_block_set(fs->bdev, &block);
 				return rc;
@@ -1587,7 +1643,12 @@ static int ext4_fs_set_inode_data_block_index(struct ext4_inode_ref *inode_ref,
 
 			/* Initialize allocated block */
 			memset(new_block.data, 0, block_size);
-			ext4_trans_set_block_dirty(new_block.buf);
+			rc = ext4_trans_set_block_dirty(new_block.buf);
+			if (rc != EOK) {
+				ext4_block_set(fs->bdev, &new_block);
+				ext4_block_set(fs->bdev, &block);
+				return rc;
+			}
 
 			rc = ext4_block_set(fs->bdev, &new_block);
 			if (rc != EOK) {
@@ -1597,16 +1658,28 @@ static int ext4_fs_set_inode_data_block_index(struct ext4_inode_ref *inode_ref,
 
 			/* Write block address to the parent */
 			uint32_t * p = (uint32_t * )block.data;
+			if (metadata_may_have_changed)
+				*metadata_may_have_changed = true;
 			p[off_in_blk] = to_le32((uint32_t)new_blk);
-			ext4_trans_set_block_dirty(block.buf);
+			rc = ext4_trans_set_block_dirty(block.buf);
+			if (rc != EOK) {
+				ext4_block_set(fs->bdev, &block);
+				return rc;
+			}
 			current_block = new_blk;
 		}
 
 		/* Will be finished, write the fblock address */
 		if (l == 1) {
 			uint32_t * p = (uint32_t * )block.data;
+			if (metadata_may_have_changed)
+				*metadata_may_have_changed = true;
 			p[off_in_blk] = to_le32((uint32_t)fblock);
-			ext4_trans_set_block_dirty(block.buf);
+			rc = ext4_trans_set_block_dirty(block.buf);
+			if (rc != EOK) {
+				ext4_block_set(fs->bdev, &block);
+				return rc;
+			}
 		}
 
 		rc = ext4_block_set(fs->bdev, &block);
@@ -1651,11 +1724,21 @@ static int ext4_fs_zero_data_block(struct ext4_fs *fs, ext4_fsblk_t fblock)
 	return EOK;
 }
 
-int ext4_fs_init_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
-				ext4_lblk_t iblock, ext4_fsblk_t *fblock)
+int ext4_fs_init_inode_dblk_idx_status(struct ext4_inode_ref *inode_ref,
+				       ext4_lblk_t iblock,
+				       ext4_fsblk_t *fblock,
+				       bool *metadata_may_have_changed)
 {
+	bool lookup_changed = false;
+	if (metadata_may_have_changed)
+		*metadata_may_have_changed = false;
+	*fblock = 0;
+
 	int rc = ext4_fs_get_inode_dblk_idx_internal(inode_ref, iblock, fblock,
-						    true, true);
+						    true, true,
+						    &lookup_changed);
+	if (lookup_changed && metadata_may_have_changed)
+		*metadata_may_have_changed = true;
 	if (rc != EOK || *fblock != 0)
 		return rc;
 
@@ -1667,11 +1750,15 @@ int ext4_fs_init_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
 	 */
 	ext4_fsblk_t goal;
 	ext4_fsblk_t phys_block;
+	bool allocation_changed = false;
 	rc = ext4_fs_indirect_find_goal(inode_ref, &goal);
 	if (rc != EOK)
 		return rc;
 
-	rc = ext4_balloc_alloc_block(inode_ref, goal, &phys_block);
+	rc = ext4_balloc_alloc_block_status(inode_ref, goal, &phys_block,
+					      &allocation_changed);
+	if (allocation_changed && metadata_may_have_changed)
+		*metadata_may_have_changed = true;
 	if (rc != EOK)
 		return rc;
 
@@ -1679,9 +1766,10 @@ int ext4_fs_init_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
 	if (rc != EOK)
 		goto free_block;
 
-	rc = ext4_fs_set_inode_data_block_index(inode_ref, iblock, phys_block);
+	rc = ext4_fs_set_inode_data_block_index(
+		inode_ref, iblock, phys_block, metadata_may_have_changed);
 	if (rc != EOK)
-		goto free_block;
+		return rc;
 
 	*fblock = phys_block;
 	return EOK;
@@ -1691,29 +1779,48 @@ free_block:
 	return rc;
 }
 
-
-int ext4_fs_append_inode_dblk(struct ext4_inode_ref *inode_ref,
-				      ext4_fsblk_t *fblock, ext4_lblk_t *iblock)
+int ext4_fs_init_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
+				ext4_lblk_t iblock, ext4_fsblk_t *fblock)
 {
+	return ext4_fs_init_inode_dblk_idx_status(inode_ref, iblock, fblock,
+						 NULL);
+}
+
+int ext4_fs_append_inode_dblk_status(struct ext4_inode_ref *inode_ref,
+				     ext4_fsblk_t *fblock,
+				     ext4_lblk_t *iblock,
+				     bool *metadata_may_have_changed)
+{
+	if (metadata_may_have_changed)
+		*metadata_may_have_changed = false;
+	*fblock = 0;
+	*iblock = 0;
+
 #if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
 	/* Handle extents separately */
 	if ((ext4_sb_feature_incom(&inode_ref->fs->sb, EXT4_FINCOM_EXTENTS)) &&
 	    (ext4_inode_has_flag(inode_ref->inode, EXT4_INODE_FLAG_EXTENTS))) {
 		int rc;
 		ext4_fsblk_t current_fsblk;
+		bool extent_changed = false;
 		struct ext4_sblock *sb = &inode_ref->fs->sb;
 		uint64_t inode_size = ext4_inode_get_size(sb, inode_ref->inode);
 		uint32_t block_size = ext4_sb_get_block_size(sb);
 		*iblock = (uint32_t)((inode_size + block_size - 1) / block_size);
 
-		rc = ext4_extent_get_blocks(inode_ref, *iblock, 1,
-						&current_fsblk, true, NULL);
+		rc = ext4_extent_get_blocks_status(
+			inode_ref, *iblock, 1, &current_fsblk, true, NULL,
+			&extent_changed);
+		if (extent_changed && metadata_may_have_changed)
+			*metadata_may_have_changed = true;
 		if (rc != EOK)
 			return rc;
 
 		*fblock = current_fsblk;
-		ext4_assert(*fblock);
-
+		if (metadata_may_have_changed)
+			*metadata_may_have_changed = true;
+		if (!*fblock)
+			return EIO;
 		ext4_inode_set_size(inode_ref->inode, inode_size + block_size);
 		inode_ref->dirty = true;
 
@@ -1736,23 +1843,28 @@ int ext4_fs_append_inode_dblk(struct ext4_inode_ref *inode_ref,
 
 	/* Allocate new physical block */
 	ext4_fsblk_t goal, phys_block;
+	bool allocation_changed = false;
 	int rc = ext4_fs_indirect_find_goal(inode_ref, &goal);
 	if (rc != EOK)
 		return rc;
 
-	rc = ext4_balloc_alloc_block(inode_ref, goal, &phys_block);
+	rc = ext4_balloc_alloc_block_status(inode_ref, goal, &phys_block,
+					      &allocation_changed);
+	if (allocation_changed && metadata_may_have_changed)
+		*metadata_may_have_changed = true;
 	if (rc != EOK)
 		return rc;
 
 	/* Add physical block address to the i-node */
-	rc = ext4_fs_set_inode_data_block_index(inode_ref, new_block_idx,
-						phys_block);
-	if (rc != EOK) {
-		ext4_balloc_free_block(inode_ref, phys_block);
+	rc = ext4_fs_set_inode_data_block_index(
+		inode_ref, new_block_idx, phys_block,
+		metadata_may_have_changed);
+	if (rc != EOK)
 		return rc;
-	}
 
 	/* Update i-node */
+	if (metadata_may_have_changed)
+		*metadata_may_have_changed = true;
 	ext4_inode_set_size(inode_ref->inode, inode_size + block_size);
 	inode_ref->dirty = true;
 
@@ -1760,6 +1872,13 @@ int ext4_fs_append_inode_dblk(struct ext4_inode_ref *inode_ref,
 	*iblock = new_block_idx;
 
 	return EOK;
+}
+
+int ext4_fs_append_inode_dblk(struct ext4_inode_ref *inode_ref,
+			      ext4_fsblk_t *fblock, ext4_lblk_t *iblock)
+{
+	return ext4_fs_append_inode_dblk_status(inode_ref, fblock, iblock,
+					       NULL);
 }
 
 void ext4_fs_inode_links_count_inc(struct ext4_inode_ref *inode_ref)

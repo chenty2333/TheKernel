@@ -1,4 +1,9 @@
-use alloc::{boxed::Box, string::String, sync::Arc};
+use alloc::{
+    alloc::{AllocError, handle_alloc_error},
+    boxed::Box,
+    string::String,
+    sync::Arc,
+};
 #[cfg(feature = "preempt")]
 use core::sync::atomic::AtomicUsize;
 use core::{
@@ -18,7 +23,7 @@ use axhal::context::TaskContext;
 use axhal::tls::TlsArea;
 use futures_util::task::AtomicWaker;
 use kspin::SpinNoIrq;
-use memory_addr::{VirtAddr, align_up_4k};
+use memory_addr::VirtAddr;
 
 use crate::{AxCpuMask, AxTask, AxTaskRef, future::block_on};
 
@@ -39,6 +44,29 @@ pub enum TaskState {
     Blocked = 3,
     /// Task is exited and waiting for being dropped.
     Exited  = 4,
+}
+
+struct TaskAffinity {
+    mask: AxCpuMask,
+    #[cfg(feature = "smp")]
+    pending_migration: Option<AxTaskRef>,
+}
+
+impl TaskAffinity {
+    fn new(mask: AxCpuMask) -> Self {
+        Self {
+            mask,
+            #[cfg(feature = "smp")]
+            pending_migration: None,
+        }
+    }
+}
+
+#[cfg(feature = "smp")]
+pub(crate) enum MigrationClaim {
+    Allowed,
+    Prepared(AxTaskRef),
+    Missing,
 }
 
 /// User-defined task extended data.
@@ -64,8 +92,10 @@ pub struct TaskInner {
     entry: Cell<Option<Box<dyn FnOnce()>>>,
     state: AtomicU8,
 
-    /// CPU affinity mask.
-    cpumask: SpinNoIrq<AxCpuMask>,
+    /// CPU affinity and its at-most-one pre-admitted migration helper are one
+    /// publication domain. Observing a newly disallowed CPU therefore always
+    /// implies that the no-allocation scheduling safe point can claim a helper.
+    affinity: SpinNoIrq<TaskAffinity>,
 
     /// Used to indicate the CPU ID where the task is running or will run.
     cpu_id: AtomicU32,
@@ -77,6 +107,9 @@ pub struct TaskInner {
     need_resched: AtomicBool,
     #[cfg(feature = "preempt")]
     preempt_disable_count: AtomicUsize,
+
+    /// Prevents recursive deferred-work dispatch on this task.
+    deferred_work_dispatching: AtomicBool,
 
     interrupted: AtomicBool,
     interrupt_waker: AtomicWaker,
@@ -142,23 +175,39 @@ impl TaskInner {
     where
         F: FnOnce() + Send + 'static,
     {
+        Self::try_new(entry, name, stack_size)
+            .unwrap_or_else(|_| handle_alloc_error(Layout::new::<u8>()))
+    }
+
+    /// Fallibly creates an unpublished task, including its entry ownership and
+    /// kernel stack.
+    pub fn try_new<F>(entry: F, name: String, stack_size: usize) -> Result<Self, AllocError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let stack_size = stack_size
+            .checked_add(4095)
+            .map(|size| size & !4095)
+            .filter(|size| *size != 0)
+            .ok_or(AllocError)?;
         let mut t = Self::new_common(TaskId::new(), name);
-        debug!("new task: {}", t.id_name());
-        let kstack = TaskStack::alloc(align_up_4k(stack_size));
+        debug!("new task id: {}", t.id.as_u64());
+        let kstack = TaskStack::try_alloc(stack_size)?;
+        let entry = Box::try_new(entry)?;
 
         #[cfg(feature = "tls")]
         let tls = VirtAddr::from(t.tls.tls_ptr() as usize);
         #[cfg(not(feature = "tls"))]
         let tls = VirtAddr::from(0);
 
-        t.entry = Cell::new(Some(Box::new(entry)));
+        t.entry = Cell::new(Some(entry));
         t.ctx_mut()
             .init(task_entry as *const () as usize, kstack.top(), tls);
         t.kstack = Some(kstack);
-        if t.name() == "idle" {
+        if t.name.lock().as_str() == "idle" {
             t.is_idle = true;
         }
-        t
+        Ok(t)
     }
 
     /// Gets the ID of the task.
@@ -171,9 +220,39 @@ impl TaskInner {
         self.name.lock().clone()
     }
 
+    /// Fallibly snapshots the task name without allocating under its spin lock.
+    pub fn try_name(&self) -> Result<String, AllocError> {
+        let mut name = String::new();
+        loop {
+            name.clear();
+            let required = self.name.lock().len();
+            if name.capacity() < required {
+                name.try_reserve_exact(required).map_err(|_| AllocError)?;
+            }
+            let current = self.name.lock();
+            if name.capacity() < current.len() {
+                drop(current);
+                continue;
+            }
+            name.push_str(&current);
+            return Ok(name);
+        }
+    }
+
     /// Set the name of the task.
     pub fn set_name(&self, name: &str) {
-        *self.name.lock() = String::from(name);
+        let name = String::from(name);
+        drop(self.replace_name(name));
+    }
+
+    /// Replace the task name with an already-owned string.
+    ///
+    /// Constructing the replacement before taking the task-name lock keeps
+    /// allocator work out of the spin-locked section. Returning the previous
+    /// string likewise lets callers defer its destructor until after the lock
+    /// has been released.
+    pub fn replace_name(&self, name: String) -> String {
+        core::mem::replace(&mut *self.name.lock(), name)
     }
 
     /// Get a combined string of the task ID and name.
@@ -234,7 +313,7 @@ impl TaskInner {
     /// Returns the cpu affinity mask of the task in type [`AxCpuMask`].
     #[inline]
     pub fn cpumask(&self) -> AxCpuMask {
-        *self.cpumask.lock()
+        self.affinity.lock().mask
     }
 
     /// Sets the cpu affinity mask of the task.
@@ -242,8 +321,72 @@ impl TaskInner {
     /// # Arguments
     /// `cpumask` - The cpu affinity mask to be set in type [`AxCpuMask`].
     #[inline]
-    pub fn set_cpumask(&self, cpumask: AxCpuMask) {
-        *self.cpumask.lock() = cpumask
+    pub(crate) fn set_cpumask(&self, cpumask: AxCpuMask) {
+        #[cfg(feature = "smp")]
+        let displaced = self.publish_affinity(cpumask, None);
+        #[cfg(not(feature = "smp"))]
+        {
+            self.affinity.lock().mask = cpumask;
+        }
+        #[cfg(feature = "smp")]
+        drop(displaced);
+    }
+
+    /// Atomically publishes a new mask and its already allocated migration
+    /// helper. The replaced helper is returned so its stack/entry are destroyed
+    /// after the no-IRQ affinity lock has been released.
+    #[cfg(feature = "smp")]
+    pub(crate) fn publish_affinity(
+        &self,
+        cpumask: AxCpuMask,
+        pending_migration: Option<AxTaskRef>,
+    ) -> Option<AxTaskRef> {
+        let mut affinity = self.affinity.lock();
+        affinity.mask = cpumask;
+        core::mem::replace(&mut affinity.pending_migration, pending_migration)
+    }
+
+    /// Claims the pre-admitted migration helper iff this CPU is no longer in
+    /// the published mask. No allocation or destructor runs under the lock.
+    #[cfg(feature = "smp")]
+    pub(crate) fn claim_migration(&self, cpu_id: usize) -> MigrationClaim {
+        let mut affinity = self.affinity.lock();
+        if affinity.mask.get(cpu_id) {
+            MigrationClaim::Allowed
+        } else if let Some(task) = affinity.pending_migration.take() {
+            MigrationClaim::Prepared(task)
+        } else {
+            MigrationClaim::Missing
+        }
+    }
+
+    /// Clears only the caller's own still-pending helper. A concurrent later
+    /// setaffinity publication cannot be mistaken for this token.
+    #[cfg(feature = "smp")]
+    pub(crate) fn clear_migration_if(&self, expected: &AxTaskRef) -> Option<AxTaskRef> {
+        let mut affinity = self.affinity.lock();
+        if affinity
+            .pending_migration
+            .as_ref()
+            .is_some_and(|pending| Arc::ptr_eq(pending, expected))
+        {
+            affinity.pending_migration.take()
+        } else {
+            None
+        }
+    }
+
+    /// Retires a helper which became unnecessary before it was claimed. The
+    /// returned task must be dropped by a normal task-context caller after this
+    /// lock has been released.
+    #[cfg(feature = "smp")]
+    pub(crate) fn take_allowed_migration(&self, cpu_id: usize) -> Option<AxTaskRef> {
+        let mut affinity = self.affinity.lock();
+        affinity
+            .mask
+            .get(cpu_id)
+            .then(|| affinity.pending_migration.take())
+            .flatten()
     }
 
     /// Polls whether the task has been interrupted.
@@ -292,7 +435,7 @@ impl TaskInner {
             entry: Cell::new(None),
             state: AtomicU8::new(TaskState::Ready as u8),
             // By default, the task is allowed to run on all CPUs.
-            cpumask: SpinNoIrq::new(crate::api::cpu_mask_full()),
+            affinity: SpinNoIrq::new(TaskAffinity::new(crate::api::cpu_mask_full())),
             cpu_id: AtomicU32::new(0),
             #[cfg(feature = "smp")]
             on_cpu: AtomicBool::new(false),
@@ -300,6 +443,7 @@ impl TaskInner {
             need_resched: AtomicBool::new(false),
             #[cfg(feature = "preempt")]
             preempt_disable_count: AtomicUsize::new(0),
+            deferred_work_dispatching: AtomicBool::new(false),
             interrupted: AtomicBool::new(false),
             interrupt_waker: AtomicWaker::new(),
             exit_code: AtomicI32::new(0),
@@ -336,6 +480,13 @@ impl TaskInner {
         Arc::new(AxTask::new(self))
     }
 
+    /// Fallibly constructs the scheduler-owned task object without making it
+    /// runnable. Lifecycle code can therefore complete every other admission
+    /// step before publishing a user-visible handle to the task.
+    pub(crate) fn try_into_arc(self) -> Result<AxTaskRef, alloc::alloc::AllocError> {
+        Arc::try_new(AxTask::new(self))
+    }
+
     /// Returns the current state of the task.
     #[inline]
     pub fn state(&self) -> TaskState {
@@ -370,6 +521,17 @@ impl TaskInner {
     #[inline]
     pub(crate) fn is_ready(&self) -> bool {
         matches!(self.state(), TaskState::Ready)
+    }
+
+    pub(crate) fn try_enter_deferred_work(&self) -> bool {
+        self.deferred_work_dispatching
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn leave_deferred_work(&self) {
+        self.deferred_work_dispatching
+            .store(false, Ordering::Release);
     }
 
     #[inline]
@@ -416,10 +578,16 @@ impl TaskInner {
         if curr.need_resched.load(Ordering::Acquire) && curr.can_preempt(0) {
             // Note: if we want to print log msg during `preempt_resched`, we have to
             // disable preemption here, because the axlog may cause preemption.
-            let mut rq = crate::current_run_queue::<NoPreemptIrqSave>();
-            if curr.need_resched.load(Ordering::Acquire) {
-                rq.preempt_resched()
+            {
+                let mut rq = crate::current_run_queue::<NoPreemptIrqSave>();
+                if curr.need_resched.load(Ordering::Acquire) {
+                    rq.preempt_resched()
+                }
             }
+            // The runqueue guard has been released. The runner performs its
+            // own IRQ/preemption checks, so calls originating in a still-unsafe
+            // outer context remain deferred.
+            crate::run_deferred_work();
         }
     }
 
@@ -479,7 +647,7 @@ impl fmt::Debug for TaskInner {
 
 impl Drop for TaskInner {
     fn drop(&mut self) {
-        debug!("task drop: {}", self.id_name());
+        debug!("task drop: id={}", self.id.as_u64());
     }
 }
 
@@ -489,16 +657,19 @@ pub(crate) struct TaskStack {
 }
 
 impl TaskStack {
-    pub fn alloc(size: usize) -> Self {
-        let layout = Layout::from_size_align(size, 16).unwrap();
+    pub fn try_alloc(size: usize) -> Result<Self, AllocError> {
+        if size == 0 {
+            return Err(AllocError);
+        }
+        let layout = Layout::from_size_align(size, 16).map_err(|_| AllocError)?;
         if let Some(stack) = crate::run_queue::take_cached_task_stack(layout.size(), layout.align())
         {
-            return stack;
+            return Ok(stack);
         }
-        Self {
-            ptr: NonNull::new(unsafe { alloc::alloc::alloc(layout) }).unwrap(),
+        Ok(Self {
+            ptr: NonNull::new(unsafe { alloc::alloc::alloc(layout) }).ok_or(AllocError)?,
             layout,
-        }
+        })
     }
 
     pub const fn top(&self) -> VirtAddr {
@@ -596,6 +767,13 @@ extern "C" fn task_entry() -> ! {
     // Enable irq (if feature "irq" is enabled) before running the task entry function.
     #[cfg(feature = "irq")]
     axhal::asm::enable_irqs();
+    #[cfg(feature = "smp")]
+    {
+        let task = crate::current();
+        let retired = task.take_allowed_migration(axhal::percpu::this_cpu_id());
+        drop(retired);
+    }
+    crate::run_deferred_work();
     let task = crate::current();
     if let Some(entry) = task.entry.take() {
         entry()

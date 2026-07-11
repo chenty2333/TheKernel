@@ -1,4 +1,4 @@
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use core::{
     mem::size_of,
     sync::atomic::{AtomicU32, Ordering},
@@ -24,8 +24,8 @@ use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use crate::{
     task::{
-        AlarmClock, AsThread, ProcStateHint, get_process_group, get_task, processes,
-        sleep_until_clock, with_proc_state_hint,
+        AlarmClock, AsThread, ProcStateHint, get_process_group, get_task, sleep_until_clock,
+        try_processes, with_proc_state_hint,
     },
     time::TimeValueLike,
 };
@@ -491,6 +491,10 @@ pub fn sys_sched_getaffinity(pid: i32, cpusetsize: usize, user_mask: *mut u8) ->
 }
 
 pub fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, user_mask: *const u8) -> AxResult<isize> {
+    if cpusetsize == 0 {
+        return Err(AxError::InvalidInput);
+    }
+
     let size = cpusetsize.min(axhal::cpu_num().div_ceil(8));
     let user_mask = vm_load(user_mask, size)?;
     let mut cpu_mask = AxCpuMask::new();
@@ -502,29 +506,22 @@ pub fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, user_mask: *const u8) 
     }
 
     if pid == 0 {
-        if !axtask::set_current_affinity(cpu_mask) {
-            return Err(AxError::InvalidInput);
-        }
+        axtask::set_current_affinity(cpu_mask)?;
     } else {
         let task = sched_target(pid)?;
         can_manage_sched_target(&task)?;
-        if !set_task_affinity(&task, cpu_mask) {
-            return Err(AxError::InvalidInput);
-        }
+        set_task_affinity(&task, cpu_mask)?;
     }
 
     Ok(0)
 }
 
 pub fn sys_getcpu(cpu: *mut u32, node: *mut u32) -> AxResult<isize> {
-    let curr = current();
-    let mask = curr.cpumask();
-    let mut cpu_id = axhal::percpu::this_cpu_id();
-    if !mask.get(cpu_id) {
-        cpu_id = (0..axhal::cpu_num())
-            .find(|&candidate| mask.get(candidate))
-            .ok_or(AxError::InvalidInput)?;
-    }
+    // Linux reports the CPU on which this call is actually executing.  A
+    // concurrent affinity change may have published a restrictive mask before
+    // the target reaches its migration safe point; reporting an allowed-but-
+    // fictional CPU during that window would expose shadow scheduler state.
+    let cpu_id = axhal::percpu::this_cpu_id();
     if !cpu.is_null() {
         cpu.vm_write(cpu_id as u32)?;
     }
@@ -697,11 +694,11 @@ pub fn sys_getpriority(which: u32, who: u32) -> AxResult<isize> {
                 who
             };
             let group = get_process_group(pgid)?;
+            let group_processes = group.try_processes().map_err(|_| AxError::NoMemory)?;
             Ok(raw_priority_from_nice(min_nice_for_threads(
-                group
-                    .processes()
+                group_processes
                     .into_iter()
-                    .flat_map(|proc| proc.threads()),
+                    .flat_map(|proc| proc.thread_ids()),
             )?))
         }
         PRIO_USER => {
@@ -711,10 +708,10 @@ pub fn sys_getpriority(which: u32, who: u32) -> AxResult<isize> {
                 who
             };
             Ok(raw_priority_from_nice(min_nice_for_threads(
-                processes()
+                try_processes()?
                     .into_iter()
                     .filter(|proc_data| proc_data.uid() == uid || proc_data.euid() == uid)
-                    .flat_map(|proc_data| proc_data.proc.threads()),
+                    .flat_map(|proc_data| proc_data.proc.thread_ids()),
             )?))
         }
         _ => Err(AxError::InvalidInput),
@@ -725,13 +722,16 @@ pub fn sys_setpriority(which: u32, who: u32, prio: i32) -> AxResult<isize> {
     debug!("sys_setpriority <= which: {which}, who: {who}, prio: {prio}");
 
     let new_nice = clamp_nice(prio);
-    let targets: Vec<AxTaskRef> = match which {
+    let mut targets = Vec::new();
+    match which {
         PRIO_PROCESS => {
-            if who == 0 {
-                vec![current().clone()]
+            let task = if who == 0 {
+                current().clone()
             } else {
-                vec![get_task(who)?]
-            }
+                get_task(who)?
+            };
+            targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            targets.push(task);
         }
         PRIO_PGRP => {
             let pgid = if who == 0 {
@@ -740,12 +740,14 @@ pub fn sys_setpriority(which: u32, who: u32, prio: i32) -> AxResult<isize> {
                 who
             };
             let group = get_process_group(pgid)?;
-            group
-                .processes()
-                .into_iter()
-                .flat_map(|proc| proc.threads())
-                .filter_map(|tid| get_task(tid).ok())
-                .collect()
+            for process in group.try_processes().map_err(|_| AxError::NoMemory)? {
+                for tid in process.thread_ids() {
+                    if let Ok(task) = get_task(tid) {
+                        targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                        targets.push(task);
+                    }
+                }
+            }
         }
         PRIO_USER => {
             let uid = if who == 0 {
@@ -753,15 +755,20 @@ pub fn sys_setpriority(which: u32, who: u32, prio: i32) -> AxResult<isize> {
             } else {
                 who
             };
-            processes()
+            for proc_data in try_processes()?
                 .into_iter()
                 .filter(|proc_data| proc_data.uid() == uid || proc_data.euid() == uid)
-                .flat_map(|proc_data| proc_data.proc.threads())
-                .filter_map(|tid| get_task(tid).ok())
-                .collect()
+            {
+                for tid in proc_data.proc.thread_ids() {
+                    if let Ok(task) = get_task(tid) {
+                        targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                        targets.push(task);
+                    }
+                }
+            }
         }
         _ => return Err(AxError::InvalidInput),
-    };
+    }
 
     if targets.is_empty() {
         return Err(AxError::NoSuchProcess);

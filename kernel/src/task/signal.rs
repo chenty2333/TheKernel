@@ -213,7 +213,7 @@ pub fn send_signal_to_process_data(
     proc_data: &ProcessData,
     sig: Option<SignalInfo>,
 ) -> AxResult<()> {
-    if proc_data.proc.is_zombie() || proc_data.proc.threads().is_empty() {
+    if proc_data.proc.is_zombie() || proc_data.proc.thread_count() == 0 {
         return Err(AxError::NoSuchProcess);
     }
     if let Some(sig) = sig {
@@ -227,7 +227,7 @@ pub fn send_signal_to_process_data(
 
         info!("Send signal {signo:?} to process {pid}");
         if ptrace_signal_stop(proc_data, signo) {
-            for tid in proc_data.proc.threads() {
+            for tid in proc_data.proc.thread_ids() {
                 if let Ok(task) = get_task(tid) {
                     task.interrupt();
                 }
@@ -235,7 +235,7 @@ pub fn send_signal_to_process_data(
             return Ok(());
         }
         if proc_data.signal.send_signal(sig).is_some() {
-            for tid in proc_data.proc.threads() {
+            for tid in proc_data.proc.thread_ids() {
                 let Ok(task) = get_task(tid) else {
                     continue;
                 };
@@ -258,7 +258,7 @@ pub fn send_signal_to_process_group(pgid: Pid, sig: Option<SignalInfo>) -> AxRes
 
     if let Some(sig) = sig {
         info!("Send signal {:?} to process group {}", sig.signo(), pgid);
-        for proc in pg.processes() {
+        for proc in pg.try_processes().map_err(|_| AxError::NoMemory)? {
             if proc.is_zombie() {
                 continue;
             }
@@ -367,7 +367,7 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
 
 fn interrupt_stop_siblings(proc_data: &ProcessData) {
     let curr_tid = current().id().as_u64() as Pid;
-    for tid in proc_data.proc.threads() {
+    for tid in proc_data.proc.thread_ids() {
         if tid != curr_tid {
             if let Ok(task) = get_task(tid) {
                 task.interrupt();

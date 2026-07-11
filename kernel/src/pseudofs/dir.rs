@@ -8,18 +8,32 @@ use alloc::{
 use core::any::Any;
 
 use axfs_ng_vfs::{
-    DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode, FilesystemOps, Metadata, MetadataUpdate,
-    NodeOps, NodePermission, NodeType, Reference, VfsError, VfsResult, WeakDirEntry,
+    CreateDisposition, CreateOutcome, DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode,
+    FilesystemOps, Metadata, MetadataUpdate, NamedCreateOptions, NodeOps, NodePermission, NodeType,
+    Reference, RenameRequest, UnlinkRequest, VfsError, VfsResult, WeakDirEntry,
     path::{DOT, DOTDOT},
 };
 use inherit_methods_macro::inherit_methods;
 
 use super::{DirMaker, NodeOpsMux, SimpleFs, SimpleFsNode};
 
+/// Fallible owned iterator returned by simple pseudo-directory enumerators.
+pub type ChildNames<'a> = Box<dyn Iterator<Item = Cow<'a, str>> + 'a>;
+
+/// Boxes a directory-name iterator without invoking the infallible allocation
+/// path from a user-triggered `getdents` operation.
+pub fn try_boxed_names<'a>(
+    names: impl Iterator<Item = Cow<'a, str>> + 'a,
+) -> VfsResult<ChildNames<'a>> {
+    Box::try_new(names)
+        .map(|names| names as ChildNames<'a>)
+        .map_err(|_| VfsError::NoMemory)
+}
+
 /// Operations for a simple directory.
 pub trait SimpleDirOps: Send + Sync + 'static {
     /// Get the names of all children in the directory.
-    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a>;
+    fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>>;
     /// Look up a child directory or file by name.
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux>;
 
@@ -40,8 +54,8 @@ pub trait SimpleDirOps: Send + Sync + 'static {
 }
 
 impl SimpleDirOps for DirMapping {
-    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
-        Box::new(self.0.keys().map(|s| s.as_str().into()))
+    fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
+        try_boxed_names(self.0.keys().map(|s| s.as_str().into()))
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
@@ -74,8 +88,8 @@ impl Default for DirMapping {
 pub struct ChainedDirOps<A, B>(A, B);
 
 impl<A: SimpleDirOps, B: SimpleDirOps> SimpleDirOps for ChainedDirOps<A, B> {
-    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
-        Box::new(self.0.child_names().chain(self.1.child_names()))
+    fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
+        try_boxed_names(self.0.child_names()?.chain(self.1.child_names()?))
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
@@ -147,7 +161,7 @@ impl<O: SimpleDirOps> DirNodeOps for SimpleDir<O> {
         let children = [DOT, DOTDOT]
             .into_iter()
             .map(Cow::Borrowed)
-            .chain(self.ops.child_names());
+            .chain(self.ops.child_names()?);
 
         let this_entry = self.this.upgrade().ok_or(VfsError::NotFound)?;
         let this_dir = this_entry.as_dir()?;
@@ -191,12 +205,12 @@ impl<O: SimpleDirOps> DirNodeOps for SimpleDir<O> {
         self.ops.is_cacheable()
     }
 
-    fn create(
+    fn create_named(
         &self,
         _name: &str,
-        _node_type: NodeType,
-        _permission: NodePermission,
-    ) -> VfsResult<DirEntry> {
+        _options: &NamedCreateOptions,
+        _disposition: CreateDisposition,
+    ) -> VfsResult<CreateOutcome<DirEntry>> {
         Err(VfsError::OperationNotPermitted)
     }
 
@@ -204,11 +218,11 @@ impl<O: SimpleDirOps> DirNodeOps for SimpleDir<O> {
         Err(VfsError::OperationNotPermitted)
     }
 
-    fn unlink(&self, _name: &str) -> VfsResult<()> {
+    fn unlink(&self, _request: UnlinkRequest<'_>) -> VfsResult<()> {
         Err(VfsError::OperationNotPermitted)
     }
 
-    fn rename(&self, _src_name: &str, _dst_dir: &DirNode, _dst_name: &str) -> VfsResult<()> {
+    fn rename(&self, _request: RenameRequest<'_>) -> VfsResult<()> {
         Err(VfsError::OperationNotPermitted)
     }
 }

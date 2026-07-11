@@ -12,6 +12,7 @@
 //! [smoltcp]: https://github.com/smoltcp-rs/smoltcp
 
 #![no_std]
+#![feature(allocator_api)]
 
 #[macro_use]
 extern crate log;

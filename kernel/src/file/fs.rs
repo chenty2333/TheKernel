@@ -74,16 +74,6 @@ pub(crate) fn check_resize_limit(new_len: u64) -> AxResult<()> {
     Ok(())
 }
 
-struct TmpfileState;
-
-pub(crate) fn install_tmpfile_state(loc: &Location) {
-    loc.user_data().insert(TmpfileState);
-}
-
-pub(crate) fn has_tmpfile_state(loc: &Location) -> bool {
-    loc.user_data().get::<TmpfileState>().is_some()
-}
-
 pub fn with_fs<R>(dirfd: c_int, f: impl FnOnce(&mut FsContext) -> AxResult<R>) -> AxResult<R> {
     let mut fs = FS_CONTEXT.lock();
     if dirfd == AT_FDCWD {

@@ -1,50 +1,36 @@
-use alloc::{
-    borrow::Cow,
-    string::{String, ToString},
-    sync::Arc,
-};
-use core::{
-    ffi::{c_char, c_void},
-    sync::atomic::{AtomicBool, Ordering},
-};
+use alloc::{borrow::Cow, string::String, sync::Arc};
+use core::ffi::{c_char, c_void};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{
-    FS_CONTEXT, FatMountOptions, FileFlags, OpenBlockDeviceError, block_device_is_read_only,
+    FS_CONTEXT, FatMountOptions, FsContext, OpenBlockDeviceError, block_device_is_read_only,
     block_device_names, new_block_filesystem, new_block_filesystem_with_fat_options,
     open_block_device,
 };
 use axfs_ng_vfs::{
-    DirEntry, Filesystem, FilesystemOps, NodePermission, NodeType, StatFs, VfsResult,
+    DeviceId, DirEntry, Filesystem, FilesystemOps, NodePermission, NodeType, StatFs, VfsResult,
 };
 use axpoll::{IoEvents, Pollable};
-use axsync::Mutex as BlockingMutex;
+use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::general::{
     AT_EMPTY_PATH, AT_NO_AUTOMOUNT, AT_RECURSIVE, AT_SYMLINK_NOFOLLOW, CAP_SYS_ADMIN, O_CLOEXEC,
     mount_attr,
 };
-use spin::Mutex;
 use starry_vm::VmPtr;
 
 use crate::{
     file::{
-        FD_TABLE, File, FileLike, Kstat, get_file_like, inotify::notify_unmount_device, resolve_at,
+        FileLike, Kstat, get_file_like, permission::DacFsContextExt, resolve_at_with_credentials,
+        with_path_fs,
     },
     mm::vm_load_string,
     mounts,
     pseudofs::{MemoryFs, cgroup},
-    task::AsThread,
+    task::{AsThread, DacCredentialView},
 };
 
 const FSOPEN_CLOEXEC: u32 = 0x00000001;
-/// Serializes namespace topology changes with the kernel-side mount ledger.
-///
-/// This is a blocking mutex because normal unmount may flush storage while the
-/// transaction is open. The lower VFS topology lock remains short-lived and is
-/// never held across that flush.
-static MOUNT_NAMESPACE_OPERATION: BlockingMutex<()> = BlockingMutex::new(());
-
 const FSCONFIG_SET_FLAG: u32 = 0;
 const FSCONFIG_SET_STRING: u32 = 1;
 const FSCONFIG_SET_BINARY: u32 = 2;
@@ -85,7 +71,10 @@ const MS_RDONLY: u32 = 0x1;
 const MS_NOSUID: u32 = 0x2;
 const MS_NODEV: u32 = 0x4;
 const MS_NOEXEC: u32 = 0x8;
+const MS_SYNCHRONOUS: u32 = 0x10;
 const MS_REMOUNT: u32 = 0x20;
+const MS_MANDLOCK: u32 = 0x40;
+const MS_DIRSYNC: u32 = 0x80;
 const MS_NOSYMFOLLOW: u32 = 0x100;
 const MS_NOATIME: u32 = 0x400;
 const MS_NODIRATIME: u32 = 0x800;
@@ -93,13 +82,39 @@ const MS_BIND: u32 = 0x1000;
 const MS_MOVE: u32 = 0x2000;
 const MS_REC: u32 = 0x4000;
 const MS_SILENT: u32 = 0x8000;
+const MS_POSIXACL: u32 = 1 << 16;
 const MS_UNBINDABLE: u32 = 1 << 17;
 const MS_PRIVATE: u32 = 1 << 18;
 const MS_SLAVE: u32 = 1 << 19;
 const MS_SHARED: u32 = 1 << 20;
 const MS_RELATIME: u32 = 0x20_0000;
+const MS_KERNMOUNT: u32 = 1 << 22;
+const MS_I_VERSION: u32 = 1 << 23;
 const MS_STRICTATIME: u32 = 0x100_0000;
+const MS_LAZYTIME: u32 = 1 << 25;
+const MS_INTERNAL_FLAGS: u32 = 0xfc00_0000;
+const MS_MGC_VAL: u32 = 0xc0ed_0000;
+const MS_MGC_MSK: u32 = 0xffff_0000;
 const MS_PROPAGATION_FLAGS: u32 = MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED;
+const MS_ATIME_FLAGS: u32 = MS_NOATIME | MS_NODIRATIME | MS_RELATIME | MS_STRICTATIME;
+const MS_SUPPORTED_FLAGS: u32 = MS_RDONLY
+    | MS_NOSUID
+    | MS_NODEV
+    | MS_NOEXEC
+    | MS_REMOUNT
+    | MS_MANDLOCK
+    | MS_NOSYMFOLLOW
+    | MS_NOATIME
+    | MS_NODIRATIME
+    | MS_BIND
+    | MS_MOVE
+    | MS_REC
+    | MS_SILENT
+    | MS_PROPAGATION_FLAGS
+    | MS_RELATIME
+    | MS_STRICTATIME;
+const MS_UNSUPPORTED_FLAGS: u32 =
+    MS_SYNCHRONOUS | MS_DIRSYNC | MS_POSIXACL | MS_I_VERSION | MS_LAZYTIME;
 const MS_INHERITED_BIND_FLAGS: u32 = MS_RDONLY
     | MS_NOSUID
     | MS_NODEV
@@ -108,19 +123,38 @@ const MS_INHERITED_BIND_FLAGS: u32 = MS_RDONLY
     | MS_NOATIME
     | MS_NODIRATIME
     | MS_RELATIME
-    | MS_STRICTATIME
-    | MS_PROPAGATION_FLAGS;
+    | MS_STRICTATIME;
+const MS_BIND_REMOUNT_FLAGS: u32 = MS_RDONLY
+    | MS_NOSUID
+    | MS_NODEV
+    | MS_NOEXEC
+    | MS_NOSYMFOLLOW
+    | MS_NOATIME
+    | MS_NODIRATIME
+    | MS_RELATIME
+    | MS_STRICTATIME;
 const MNT_FORCE: i32 = 0x1;
 const MNT_DETACH: i32 = 0x2;
 const MNT_EXPIRE: i32 = 0x4;
 const UMOUNT_NOFOLLOW: i32 = 0x8;
 const UMOUNT_FLAGS_VALID: i32 = MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW;
 const MOVE_MOUNT_F_EMPTY_PATH: u32 = 0x00000004;
+const MOVE_MOUNT_T_SYMLINKS: u32 = 0x00000010;
+const MOVE_MOUNT_T_EMPTY_PATH: u32 = 0x00000040;
 const MOVE_MOUNT__MASK: u32 = 0x00000077;
 const MOUNT_SETATTR_FLAGS: u32 =
     AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW;
 const MOUNT_ATTR_SIZE_VER0: usize = core::mem::size_of::<mount_attr>();
 const PAGE_SIZE: usize = 4096;
+
+fn try_string(value: &str) -> AxResult<String> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| AxError::NoMemory)?;
+    owned.push_str(value);
+    Ok(owned)
+}
 
 struct FsOpenState {
     fs_type: String,
@@ -151,11 +185,7 @@ impl Pollable for FsOpenFd {
 }
 
 struct FsMountFd {
-    fs: Filesystem,
-    source: String,
-    fs_type: String,
-    flags: Mutex<u32>,
-    attached: AtomicBool,
+    root: axfs_ng_vfs::Location,
 }
 
 struct BindFilesystem {
@@ -164,8 +194,9 @@ struct BindFilesystem {
 }
 
 impl BindFilesystem {
-    fn new(root: DirEntry, name: String, device: u64) -> Filesystem {
-        Filesystem::new_with_device(Arc::new(Self { root, name }), device)
+    fn try_new(root: DirEntry, name: String, source: &Filesystem) -> AxResult<Filesystem> {
+        let ops = Arc::try_new(Self { root, name }).map_err(|_| AxError::NoMemory)?;
+        Filesystem::try_new_view(ops, source)
     }
 }
 
@@ -230,8 +261,14 @@ fn apply_mount_attr_flags(current: u32, attr: mount_attr) -> AxResult<u32> {
     if (attr.attr_set | attr.attr_clr) & !(MOUNT_ATTR_SUPPORTED as u64) != 0 {
         return Err(AxError::InvalidInput);
     }
-    if attr.propagation != 0 || attr.userns_fd != 0 {
+    if attr.propagation & !(MS_PROPAGATION_FLAGS as u64) != 0
+        || attr.propagation.count_ones() > 1
+        || attr.userns_fd != 0
+    {
         return Err(AxError::InvalidInput);
+    }
+    if attr.propagation != 0 {
+        return Err(AxError::OperationNotSupported);
     }
     validate_mount_attr_set(set)?;
     if clear & MOUNT_ATTR__ATIME != 0 && clear & MOUNT_ATTR__ATIME != MOUNT_ATTR__ATIME {
@@ -260,21 +297,53 @@ fn current_has_capability(cap: u32) -> bool {
         .has_effective_capability(cap)
 }
 
-fn current_write_fd_on_mount(target: &axfs_ng_vfs::Location) -> bool {
-    let mountpoint = target.mountpoint().clone();
-    let table = FD_TABLE.read();
-    table.ids().any(|fd| {
-        table.get(fd).is_some_and(|entry| {
-            let file = &entry.description.inner;
-            file.downcast_ref::<File>().is_some_and(|file| {
-                Arc::ptr_eq(file.inner().location().mountpoint(), &mountpoint)
-                    && file
-                        .inner()
-                        .flags()
-                        .intersects(FileFlags::WRITE | FileFlags::APPEND)
-            })
-        })
-    })
+fn validate_mount_flags(raw: i32) -> AxResult<u32> {
+    let mut flags = raw as u32;
+    if flags & MS_MGC_MSK == MS_MGC_VAL {
+        flags &= !MS_MGC_MSK;
+    }
+    if flags & (MS_KERNMOUNT | MS_INTERNAL_FLAGS) != 0
+        || flags & !(MS_SUPPORTED_FLAGS | MS_UNSUPPORTED_FLAGS) != 0
+    {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & MS_UNSUPPORTED_FLAGS != 0 {
+        return Err(AxError::OperationNotSupported);
+    }
+    Ok(flags)
+}
+
+fn normalize_mount_atime(mut requested: u32, current: Option<u32>) -> u32 {
+    if requested & MS_REMOUNT != 0
+        && requested & MS_ATIME_FLAGS == 0
+        && let Some(current) = current
+    {
+        requested |= current & MS_ATIME_FLAGS;
+        return requested;
+    }
+
+    if requested & MS_NOATIME != 0 {
+        requested &= !MS_RELATIME;
+    } else {
+        requested |= MS_RELATIME;
+    }
+    if requested & MS_STRICTATIME != 0 {
+        requested &= !(MS_NOATIME | MS_RELATIME);
+    }
+    requested
+}
+
+fn block_device_name_for_rdev(rdev: DeviceId) -> AxResult<Option<String>> {
+    if rdev == mounts::ROOT_BLOCK_DEVICE_ID {
+        return Ok(Some(try_string(axfs::ROOT_BLOCK_DEVICE_NAME)?));
+    }
+
+    Ok(block_device_names()
+        .into_iter()
+        .enumerate()
+        .find_map(|(index, name)| {
+            (mounts::extra_block_device_id(index) == Some(rdev)).then_some(name)
+        }))
 }
 
 fn parse_tmpfs_size_component(value: &str) -> Option<u64> {
@@ -311,15 +380,12 @@ fn parse_fat_mask(value: &str) -> Option<u16> {
         .filter(|mask| *mask & !0o777 == 0)
 }
 
-fn parse_fat_mount_options(data: &str) -> AxResult<FatMountOptions> {
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    parse_fat_mount_options_with_defaults(
-        data,
-        proc_data.fsuid(),
-        proc_data.fsgid(),
-        proc_data.umask() as u16,
-    )
+fn parse_fat_mount_options(
+    data: &str,
+    credentials: &DacCredentialView,
+    umask: u16,
+) -> AxResult<FatMountOptions> {
+    parse_fat_mount_options_with_defaults(data, credentials.uid(), credentials.gid(), umask)
 }
 
 fn parse_fat_mount_options_with_defaults(
@@ -379,243 +445,96 @@ fn parse_fat_mount_options_with_defaults(
     })
 }
 
-fn tmpfs_for_mount(data: &str) -> Filesystem {
+fn tmpfs_for_mount(data: &str) -> AxResult<Filesystem> {
     MemoryFs::new_with_capacity(parse_tmpfs_size(data))
 }
 
-fn joined_mount_path(base: &str, suffix: &str) -> String {
-    if suffix.is_empty() {
-        base.to_string()
-    } else if base == "/" {
-        suffix.to_string()
-    } else {
-        alloc::format!("{base}{suffix}")
+fn bind_mount_flags(
+    source: &axfs_ng_vfs::Location,
+    target: &axfs_ng_vfs::Location,
+    requested: u32,
+) -> AxResult<u32> {
+    let source_flags = mounts::flags_for_location(source)?;
+    let target_flags = mounts::flags_for_location(target)?;
+    if (requested | source_flags | target_flags) & MS_PROPAGATION_FLAGS != 0 {
+        return Err(AxError::OperationNotSupported);
     }
+    Ok(source_flags & MS_INHERITED_BIND_FLAGS)
 }
 
-fn path_suffix<'a>(base: &str, path: &'a str) -> Option<&'a str> {
-    if path == base {
-        Some("")
-    } else {
-        path.strip_prefix(base)
-            .filter(|suffix| suffix.starts_with('/'))
-    }
-}
-
-fn parent_mount_path(path: &str) -> String {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() || trimmed == "/" {
-        return "/".to_string();
-    }
-
-    match trimmed.rfind('/') {
-        Some(0) | None => "/".to_string(),
-        Some(index) => trimmed[..index].to_string(),
-    }
-}
-
-fn bind_mount_flags(source_path: &str, target_path: &str, requested: u32) -> u32 {
-    let source_flags = mounts::effective_flags(source_path);
-    let non_propagation = MS_INHERITED_BIND_FLAGS & !MS_PROPAGATION_FLAGS;
-    let mut flags = requested & (MS_BIND | MS_REC | non_propagation);
-    flags |= source_flags & non_propagation;
-
-    let requested_propagation = requested & MS_PROPAGATION_FLAGS;
-    let target_parent = parent_mount_path(target_path);
-    let target_parent_propagation =
-        mounts::effective_flags(target_parent.as_str()) & MS_PROPAGATION_FLAGS;
-    let source_propagation = source_flags & MS_PROPAGATION_FLAGS;
-    flags
-        | if requested_propagation != 0 {
-            requested_propagation
-        } else if target_parent_propagation & MS_SHARED != 0 {
-            MS_SHARED
-        } else {
-            source_propagation
-        }
-}
-
-fn bind_filesystem_for(loc: &axfs_ng_vfs::Location, fs_type: &str) -> Filesystem {
-    BindFilesystem::new(
-        loc.entry().clone(),
-        fs_type.to_string(),
-        loc.mountpoint().device(),
-    )
-}
-
-fn propagate_shared_bind_mount(
-    source_loc: &axfs_ng_vfs::Location,
-    source_path: &str,
-    fs_type: &str,
-    mount_flags: u32,
-    target_path: &str,
-) -> AxResult<()> {
-    for alias in mounts::shared_aliases_for(target_path) {
-        if alias == source_path || mounts::has_record(&alias) {
-            continue;
-        }
-
-        let alias_target = match FS_CONTEXT.lock().resolve(&alias) {
-            Ok(target) => target,
-            Err(_) => continue,
-        };
-        if alias_target.is_dir() != source_loc.is_dir() || !alias_target.is_dir() {
-            continue;
-        }
-
-        let fs = bind_filesystem_for(source_loc, fs_type);
-        let parent_id = alias_target.mountpoint().mount_id();
-        let mountpoint = alias_target.mount(&fs)?;
-        let alias_flags = bind_mount_flags(source_path, &alias, mount_flags);
-        mounts::record(
-            source_path.to_string(),
-            alias,
-            fs_type.to_string(),
-            source_loc
-                .path_in_mount()
-                .map_err(|_| AxError::InvalidInput)?
-                .to_string(),
-            mountpoint.device(),
-            mountpoint.mount_id(),
-            parent_id,
-            alias_flags,
-        );
-    }
-
-    Ok(())
+fn bind_filesystem_for(loc: &axfs_ng_vfs::Location, fs_type: &str) -> AxResult<Filesystem> {
+    let source = loc.mountpoint().filesystem_handle();
+    BindFilesystem::try_new(loc.entry().clone(), try_string(fs_type)?, &source)
 }
 
 fn do_bind_mount(
     source: &str,
     target: &axfs_ng_vfs::Location,
-    target_path: &str,
     flags: u32,
+    credentials: &DacCredentialView,
 ) -> AxResult<()> {
     if source.is_empty() {
         return Err(AxError::InvalidInput);
     }
 
-    let source_loc = FS_CONTEXT.lock().resolve(source)?;
+    let source_loc = FS_CONTEXT.lock().resolve_dac(source, credentials)?;
     if source_loc.is_dir() != target.is_dir() {
         return Err(AxError::InvalidInput);
     }
     source_loc.check_is_dir()?;
     target.check_is_dir()?;
 
-    let source_path = source_loc
-        .absolute_path()
-        .map_err(|_| AxError::InvalidInput)?
-        .to_string();
-    let fs_type = source_loc.filesystem().name().to_string();
-    let fs = bind_filesystem_for(&source_loc, &fs_type);
-    let parent_id = target.mountpoint().mount_id();
-    let mountpoint = target.mount(&fs)?;
-    let mount_flags = bind_mount_flags(&source_path, target_path, flags);
-    mounts::record(
-        source_path.clone(),
-        target_path.to_string(),
-        fs_type.clone(),
-        source_loc
-            .path_in_mount()
-            .map_err(|_| AxError::InvalidInput)?
-            .to_string(),
-        mountpoint.device(),
-        mountpoint.mount_id(),
-        parent_id,
-        mount_flags,
-    );
-    propagate_shared_bind_mount(
-        &source_loc,
-        &source_path,
-        &fs_type,
-        mount_flags,
-        target_path,
-    )?;
+    let metadata = mounts::clone_metadata_for_bind(&source_loc)?;
+    let fs = bind_filesystem_for(&source_loc, &metadata.fs_type)?;
+    let mount_flags = bind_mount_flags(&source_loc, target, flags)?;
+    let mountpoint = mounts::new_detached_with_flags(&fs, mount_flags, metadata)?;
 
-    if flags & MS_REC == 0 {
-        return Ok(());
+    if flags & MS_REC != 0 {
+        let detached_context = FsContext::new(mountpoint.root_location());
+        let children = mounts::recursive_bind_submounts(&source_loc)?;
+        for child in children {
+            let child_target = detached_context
+                .resolve(&child.relative_path)
+                .map_err(|_| AxError::Io)?;
+            let child_source = child.source;
+            if child_source.is_dir() != child_target.is_dir() || !child_source.is_dir() {
+                return Err(AxError::Io);
+            }
+            let child_fs = bind_filesystem_for(&child_source, &child.metadata.fs_type)?;
+            let child_flags =
+                bind_mount_flags(&child_source, &child_target, child.flags | MS_BIND | MS_REC)?;
+            mounts::mount_with_flags(&child_target, &child_fs, child_flags, child.metadata)?;
+        }
     }
 
-    let mut children = mounts::records_under(&source_path);
-    children.sort_by_key(|record| record.target.len());
-    for record in children {
-        if record.flags & MS_UNBINDABLE != 0 {
-            continue;
-        }
-        let Some(suffix) = path_suffix(&source_path, &record.target) else {
-            continue;
-        };
-        let child_target_path = joined_mount_path(target_path, suffix);
-        let child_source = FS_CONTEXT.lock().resolve(&record.target)?;
-        let child_target = FS_CONTEXT.lock().resolve(&child_target_path)?;
-        if child_source.is_dir() != child_target.is_dir() || !child_source.is_dir() {
-            continue;
-        }
-        let child_fs = bind_filesystem_for(&child_source, &record.fs_type);
-        let child_parent_id = child_target.mountpoint().mount_id();
-        let child_mountpoint = child_target.mount(&child_fs)?;
-        let child_flags = bind_mount_flags(
-            &record.target,
-            &child_target_path,
-            record.flags | MS_BIND | MS_REC,
-        );
-        mounts::record_with_data(
-            record.source.clone(),
-            child_target_path.clone(),
-            record.fs_type.clone(),
-            child_source
-                .path_in_mount()
-                .map_err(|_| AxError::InvalidInput)?
-                .to_string(),
-            child_mountpoint.device(),
-            child_mountpoint.mount_id(),
-            child_parent_id,
-            child_flags,
-            record.data.clone(),
-        );
-        propagate_shared_bind_mount(
-            &child_source,
-            &record.target,
-            &record.fs_type,
-            child_flags,
-            &child_target_path,
-        )?;
-    }
-
+    mounts::attach_tree_and_record(&mountpoint, target)?;
     Ok(())
 }
 
 fn do_move_mount_old(
     source: &str,
     target: &axfs_ng_vfs::Location,
-    target_path: &str,
+    credentials: &DacCredentialView,
 ) -> AxResult<()> {
     if source.is_empty() {
         return Err(AxError::InvalidInput);
     }
 
-    let old = FS_CONTEXT.lock().resolve(source)?;
+    let old = FS_CONTEXT.lock().resolve_dac(source, credentials)?;
     if !old.is_root_of_mount() || old.is_root() || old.is_dir() != target.is_dir() {
         return Err(AxError::InvalidInput);
     }
-    let old_path = old
-        .absolute_path()
-        .map_err(|_| AxError::InvalidInput)?
-        .to_string();
-    let old_mount_id = old.mountpoint().mount_id();
-    let new_parent_id = target.mountpoint().mount_id();
-    old.move_mount_to(target)?;
-    mounts::move_tree(old_mount_id, &old_path, target_path, new_parent_id);
+    mounts::move_tree_and_records(&old, target)?;
     Ok(())
 }
 
 fn pseudo_fs_for_mount(source: &str, fs_type: &str, data: &str) -> AxResult<Option<Filesystem>> {
     Ok(match fs_type {
-        "tmpfs" => Some(tmpfs_for_mount(data)),
+        "tmpfs" => Some(tmpfs_for_mount(data)?),
         "cgroup" => Some(cgroup::new_cgroup_v1(cgroup::parse_v1_controllers(
             source, data,
-        )?)),
-        "cgroup2" => Some(cgroup::new_cgroup_v2()),
+        )?)?),
+        "cgroup2" => Some(cgroup::new_cgroup_v2()?),
         _ => None,
     })
 }
@@ -789,15 +708,27 @@ pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
     if !state.created {
         return Err(AxError::InvalidInput);
     }
-    let source = state.source.clone().unwrap_or_else(|| "none".into());
-    let fs =
-        pseudo_fs_for_mount(&source, &state.fs_type, &state.data)?.ok_or(AxError::NoSuchDevice)?;
+    let source = match state.source.as_deref() {
+        Some(source) => try_string(source)?,
+        None => try_string("none")?,
+    };
+    let fs_type = try_string(&state.fs_type)?;
+    let data = try_string(&state.data)?;
+    drop(state);
+    let fs = pseudo_fs_for_mount(&source, &fs_type, &data)?.ok_or(AxError::NoSuchDevice)?;
+    let record_data = if fs_type == "cgroup"
+        && data.is_empty()
+        && !matches!(source.as_str(), "none" | "cgroup")
+    {
+        try_string(&source)?
+    } else {
+        data
+    };
+    let metadata = mounts::MountMetadata::new(source, fs_type, try_string("/")?, record_data);
+    let mountpoint =
+        mounts::new_detached_with_flags(&fs, mount_attr_to_mount_flags(mount_attrs), metadata)?;
     FsMountFd {
-        fs,
-        source,
-        fs_type: state.fs_type.clone(),
-        flags: Mutex::new(mount_attr_to_mount_flags(mount_attrs)),
-        attached: AtomicBool::new(false),
+        root: mountpoint.root_location(),
     }
     .add_to_fd_table(flags & FSMOUNT_CLOEXEC != 0)
     .map(|new_fd| new_fd as isize)
@@ -820,30 +751,27 @@ pub fn sys_open_tree(dirfd: i32, pathname: *const c_char, flags: u32) -> AxResul
     if flags & OPEN_TREE_CLONE == 0 {
         return Err(AxError::InvalidInput);
     }
-    if !current_has_capability(CAP_SYS_ADMIN) {
+    let curr = current();
+    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+    if !credentials.has_capability(CAP_SYS_ADMIN) {
         return Err(LinuxError::EPERM.into());
     }
+    if flags & AT_RECURSIVE != 0 {
+        return Err(AxError::OperationNotSupported);
+    }
 
-    let loc = resolve_at(dirfd, Some(&path), flags)?
+    let _mount_operation = mounts::namespace_operation();
+    let loc = resolve_at_with_credentials(dirfd, Some(&path), flags, &credentials)?
         .into_file()
         .ok_or(AxError::InvalidInput)?;
     loc.check_is_dir()?;
 
-    let source = loc
-        .absolute_path()
-        .map(|path| path.to_string())
-        .unwrap_or_else(|_| path.clone());
-    let fs_type = loc.filesystem().name().to_string();
+    let metadata = mounts::clone_metadata_for_bind(&loc)?;
+    let filesystem = bind_filesystem_for(&loc, &metadata.fs_type)?;
+    let mountpoint =
+        mounts::new_detached_with_flags(&filesystem, mounts::flags_for_location(&loc)?, metadata)?;
     FsMountFd {
-        fs: bind_filesystem_for(&loc, &fs_type),
-        source,
-        fs_type,
-        flags: Mutex::new(mounts::effective_flags(
-            loc.absolute_path()
-                .map_err(|_| AxError::InvalidInput)?
-                .as_ref(),
-        )),
-        attached: AtomicBool::new(false),
+        root: mountpoint.root_location(),
     }
     .add_to_fd_table(flags & OPEN_TREE_CLOEXEC != 0)
     .map(|new_fd| new_fd as isize)
@@ -868,7 +796,9 @@ pub fn sys_mount_setattr(
     if size < MOUNT_ATTR_SIZE_VER0 {
         return Err(AxError::InvalidInput);
     }
-    if !current_has_capability(CAP_SYS_ADMIN) {
+    let curr = current();
+    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+    if !credentials.has_capability(CAP_SYS_ADMIN) {
         return Err(LinuxError::EPERM.into());
     }
 
@@ -877,23 +807,40 @@ pub fn sys_mount_setattr(
         return Ok(0);
     }
 
+    let _mount_operation = mounts::namespace_operation();
     if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
         let file = get_file_like(dirfd)?;
-        let mount_fd = file
-            .downcast_ref::<FsMountFd>()
-            .ok_or(AxError::BadFileDescriptor)?;
-        let mut mount_flags = mount_fd.flags.lock();
-        *mount_flags = apply_mount_attr_flags(*mount_flags, attr)?;
-        return Ok(0);
+        if let Some(mount_fd) = file.downcast_ref::<FsMountFd>() {
+            if mount_fd.root.mountpoint().is_attached() {
+                if !mounts::try_update_flags_for_mounts(
+                    mount_fd.root.mountpoint().mount_id(),
+                    flags & AT_RECURSIVE != 0,
+                    |current| apply_mount_attr_flags(current, attr),
+                )? {
+                    return Err(AxError::InvalidInput);
+                }
+            } else {
+                mounts::update_detached_mount_flags(
+                    mount_fd.root.mountpoint(),
+                    flags & AT_RECURSIVE != 0,
+                    |current| apply_mount_attr_flags(current, attr),
+                )?;
+            }
+            return Ok(0);
+        }
     }
 
-    let _mount_operation = MOUNT_NAMESPACE_OPERATION.lock();
-    let loc = resolve_at(dirfd, Some(&path), flags)?
+    let loc = resolve_at_with_credentials(dirfd, Some(&path), flags, &credentials)?
         .into_file()
         .ok_or(AxError::InvalidInput)?;
-    let path = loc.absolute_path().map_err(|_| AxError::InvalidInput)?;
-    let current = mounts::effective_flags(path.as_ref());
-    if !mounts::update_flags_for_path(path.as_ref(), apply_mount_attr_flags(current, attr)?) {
+    if !loc.is_root_of_mount() {
+        return Err(AxError::InvalidInput);
+    }
+    if !mounts::try_update_flags_for_mounts(
+        loc.mountpoint().mount_id(),
+        flags & AT_RECURSIVE != 0,
+        |current| apply_mount_attr_flags(current, attr),
+    )? {
         return Err(AxError::InvalidInput);
     }
     Ok(0)
@@ -916,41 +863,45 @@ pub fn sys_move_mount(
     if flags & !MOVE_MOUNT__MASK != 0 {
         return Err(AxError::InvalidInput);
     }
-    if !current_has_capability(CAP_SYS_ADMIN) {
+    let curr = current();
+    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+    if !credentials.has_capability(CAP_SYS_ADMIN) {
         return Err(LinuxError::EPERM.into());
     }
-    if flags & MOVE_MOUNT_F_EMPTY_PATH == 0 || !from_path.is_empty() {
+    if !from_path.is_empty() {
+        return Err(AxError::OperationNotSupported);
+    }
+    if flags & MOVE_MOUNT_F_EMPTY_PATH == 0 {
         return Err(AxError::NotFound);
     }
 
-    let _mount_operation = MOUNT_NAMESPACE_OPERATION.lock();
+    let _mount_operation = mounts::namespace_operation();
     let file = get_file_like(from_dirfd)?;
     let mount_fd = file
         .downcast_ref::<FsMountFd>()
         .ok_or(AxError::BadFileDescriptor)?;
 
-    let target = crate::file::with_fs(to_dirfd, |fs| fs.resolve(&to_path))?;
-    let target_path = target
-        .absolute_path()
-        .map_err(|_| AxError::InvalidInput)?
-        .to_string();
-    if mount_fd.attached.swap(true, Ordering::AcqRel) {
-        return Err(AxError::ResourceBusy);
+    let target = if to_path.is_empty() {
+        if flags & MOVE_MOUNT_T_EMPTY_PATH == 0 {
+            return Err(AxError::NotFound);
+        }
+        resolve_at_with_credentials(to_dirfd, Some(""), AT_EMPTY_PATH, &credentials)?
+            .into_file()
+            .ok_or(AxError::InvalidInput)?
+    } else {
+        with_path_fs(to_dirfd, axfs_ng_vfs::path::Path::new(&to_path), |fs| {
+            if flags & MOVE_MOUNT_T_SYMLINKS != 0 {
+                fs.resolve_dac(&to_path, &credentials)
+            } else {
+                fs.resolve_no_follow_dac(&to_path, &credentials)
+            }
+        })?
+    };
+    if mount_fd.root.mountpoint().is_attached() {
+        mounts::move_tree_and_records(&mount_fd.root, &target)?;
+    } else {
+        mounts::attach_tree_and_record(mount_fd.root.mountpoint(), &target)?;
     }
-    let parent_id = target.mountpoint().mount_id();
-    let mountpoint = target.mount(&mount_fd.fs).inspect_err(|_| {
-        mount_fd.attached.store(false, Ordering::Release);
-    })?;
-    mounts::record(
-        mount_fd.source.clone(),
-        target_path,
-        mount_fd.fs_type.clone(),
-        "/".to_string(),
-        mountpoint.device(),
-        mountpoint.mount_id(),
-        parent_id,
-        *mount_fd.flags.lock(),
-    );
     Ok(0)
 }
 
@@ -974,16 +925,16 @@ pub fn sys_mount(
     };
     debug!("sys_mount <= source: {source:?}, target: {target:?}, fs_type: {fs_type:?}");
 
-    if !current_has_capability(CAP_SYS_ADMIN) {
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let credentials = proc_data.fs_dac_credentials();
+    let umask = proc_data.umask() as u16;
+    if !credentials.has_capability(CAP_SYS_ADMIN) {
         return Err(AxError::from(LinuxError::EPERM));
     }
-    let _mount_operation = MOUNT_NAMESPACE_OPERATION.lock();
-    let target = FS_CONTEXT.lock().resolve(&target)?;
-    let target_path = target
-        .absolute_path()
-        .map_err(|_| AxError::InvalidInput)?
-        .to_string();
-    let flags_u32 = flags as u32;
+    let flags_u32 = validate_mount_flags(flags)?;
+    let _mount_operation = mounts::namespace_operation();
+    let target = FS_CONTEXT.lock().resolve_dac(&target, &credentials)?;
     let normalized_fs = if fs_type.starts_with("vfat") {
         "vfat"
     } else {
@@ -997,72 +948,101 @@ pub fn sys_mount(
     };
 
     if flags_u32 & MS_REMOUNT != 0 {
-        if !target.is_root_of_mount() && !target.is_root() {
+        if !target.is_root_of_mount() {
             return Err(AxError::InvalidInput);
         }
-        if flags_u32 & MS_RDONLY != 0 && current_write_fd_on_mount(&target) {
-            return Err(AxError::from(LinuxError::EBUSY));
+        if flags_u32 & (MS_MOVE | MS_PROPAGATION_FLAGS) != 0 {
+            return Err(AxError::OperationNotSupported);
+        }
+        let current_flags = mounts::flags_for_location(&target)?;
+        if flags_u32 & MS_BIND != 0 {
+            if flags_u32 & MS_REC != 0 {
+                return Err(AxError::OperationNotSupported);
+            }
+            let allowed = MS_REMOUNT | MS_BIND | MS_SILENT | MS_BIND_REMOUNT_FLAGS;
+            if flags_u32 & !allowed != 0 || !data.is_empty() {
+                return Err(AxError::OperationNotSupported);
+            }
+            let bind_flags =
+                normalize_mount_atime(flags_u32, Some(current_flags)) & MS_BIND_REMOUNT_FLAGS;
+            mounts::remount_with_data(
+                &target,
+                source,
+                try_string(normalized_fs)?,
+                bind_flags,
+                data,
+            )?;
+            return Ok(0);
+        }
+        let mut remount_flags = normalize_mount_atime(flags_u32, Some(current_flags));
+        remount_flags &= !(MS_REMOUNT | MS_SILENT | MS_REC);
+        if (remount_flags ^ current_flags) & MS_RDONLY != 0 {
+            return Err(AxError::OperationNotSupported);
         }
         if !data.is_empty() {
             return Err(AxError::OperationNotSupported);
         }
-        if !mounts::remount_with_data(
+        mounts::remount_with_data(
+            &target,
             source,
-            target_path,
-            normalized_fs.to_string(),
-            flags_u32,
+            try_string(normalized_fs)?,
+            remount_flags,
             data,
-        ) {
-            return Err(AxError::InvalidInput);
-        }
+        )?;
         return Ok(0);
     }
 
     if flags_u32 & MS_BIND != 0 {
-        do_bind_mount(&source, &target, &target_path, flags_u32)?;
+        do_bind_mount(&source, &target, flags_u32, &credentials)?;
         return Ok(0);
     }
 
     if flags_u32 & MS_PROPAGATION_FLAGS != 0 {
         let allowed = MS_PROPAGATION_FLAGS | MS_REC | MS_SILENT;
-        if flags_u32 & !allowed != 0 {
+        if flags_u32 & !allowed != 0 || (flags_u32 & MS_PROPAGATION_FLAGS).count_ones() != 1 {
             return Err(AxError::InvalidInput);
         }
-        mounts::change_propagation(&target_path, flags_u32, flags_u32 & MS_REC != 0);
-        return Ok(0);
+        return Err(AxError::OperationNotSupported);
     }
 
     if flags_u32 & MS_MOVE != 0 {
-        do_move_mount_old(&source, &target, &target_path)?;
+        do_move_mount_old(&source, &target, &credentials)?;
         return Ok(0);
     }
 
     if source.is_empty() || fs_type.is_empty() {
         return Err(AxError::InvalidInput);
     }
+    let mount_flags = normalize_mount_atime(flags_u32, None) & !(MS_REC | MS_SILENT);
 
     let (fs, linux_device) = if let Some(fs) = pseudo_fs_for_mount(&source, normalized_fs, &data)? {
         (fs, None)
-    } else if let Some(dev_name) = source.strip_prefix("/dev/") {
-        let device_names = block_device_names();
-        debug!("sys_mount: available extra block devices = {device_names:?}");
-        let device_index = device_names
-            .iter()
-            .position(|name| name == dev_name)
-            .ok_or(AxError::NoSuchDevice)?;
-        let linux_device =
-            mounts::extra_block_device_id(device_index).ok_or(AxError::InvalidInput)?;
-        if block_device_is_read_only(dev_name).unwrap_or(false) && flags as u32 & MS_RDONLY == 0 {
+    } else {
+        let source_loc = FS_CONTEXT.lock().resolve_dac(&source, &credentials)?;
+        let metadata = source_loc.metadata()?;
+        if metadata.node_type != NodeType::BlockDevice {
+            return Err(AxError::from(LinuxError::ENOTBLK));
+        }
+
+        if mounts::is_nodev(&source_loc)? {
             return Err(AxError::PermissionDenied);
         }
-        match open_block_device(dev_name) {
+
+        let linux_device = metadata.rdev;
+        let dev_name = block_device_name_for_rdev(linux_device)?.ok_or(AxError::NoSuchDevice)?;
+        match open_block_device(&dev_name) {
             Ok(dev) => {
                 debug!("sys_mount: opening block device {dev_name}");
+                let read_only =
+                    block_device_is_read_only(&dev_name).ok_or(AxError::NoSuchDevice)?;
+                if read_only && mount_flags & MS_RDONLY == 0 {
+                    return Err(AxError::PermissionDenied);
+                }
                 let fs = if normalized_fs == "vfat" {
                     new_block_filesystem_with_fat_options(
                         normalized_fs,
                         dev,
-                        parse_fat_mount_options(&data)?,
+                        parse_fat_mount_options(&data, &credentials, umask)?,
                     )?
                 } else {
                     if !data.is_empty() {
@@ -1081,45 +1061,27 @@ pub fn sys_mount(
                 return Err(AxError::ResourceBusy);
             }
         }
-    } else {
-        let source_loc = FS_CONTEXT.lock().resolve(&source)?;
-        if matches!(
-            source_loc.metadata()?.node_type,
-            NodeType::CharacterDevice | NodeType::RegularFile
-        ) {
-            return Err(AxError::from(LinuxError::ENOTBLK));
-        }
-        return Err(AxError::NoSuchDevice);
     };
 
-    let parent_id = target.mountpoint().mount_id();
-    let mountpoint = target.mount(&fs)?;
-    if let Some(linux_device) = linux_device {
-        mounts::register_linux_device(
-            mountpoint.device(),
-            linux_device,
-            mountpoint.filesystem_lifetime(),
-        );
-    }
     let record_data = if normalized_fs == "cgroup" && data.is_empty() {
         match source.as_str() {
             "none" | "cgroup" => String::new(),
-            _ => source.clone(),
+            _ => try_string(&source)?,
         }
     } else {
         data
     };
-    mounts::record_with_data(
+    let metadata = mounts::MountMetadata::new(
         source,
-        target_path,
-        normalized_fs.to_string(),
-        "/".to_string(),
-        mountpoint.device(),
-        mountpoint.mount_id(),
-        parent_id,
-        flags_u32,
+        try_string(normalized_fs)?,
+        try_string("/")?,
         record_data,
     );
+    let mountpoint = mounts::new_detached_with_flags(&fs, mount_flags, metadata)?;
+    if let Some(linux_device) = linux_device {
+        mounts::register_linux_device(mountpoint.filesystem_identity(), linux_device)?;
+    }
+    mounts::attach_tree_and_record(&mountpoint, &target)?;
 
     Ok(0)
 }
@@ -1130,7 +1092,9 @@ pub fn sys_umount2(target: *const c_char, flags: i32) -> AxResult<isize> {
     }
     let target = vm_load_string(target)?;
     debug!("sys_umount2 <= target: {target:?}, flags: {flags:#x}");
-    if !current_has_capability(CAP_SYS_ADMIN) {
+    let curr = current();
+    let credentials = curr.as_thread().proc_data.fs_dac_credentials();
+    if !credentials.has_capability(CAP_SYS_ADMIN) {
         return Err(AxError::from(LinuxError::EPERM));
     }
     if flags & MNT_EXPIRE != 0 && flags & (MNT_FORCE | MNT_DETACH) != 0 {
@@ -1140,11 +1104,15 @@ pub fn sys_umount2(target: *const c_char, flags: i32) -> AxResult<isize> {
         return Err(AxError::OperationNotSupported);
     }
 
-    let _mount_operation = MOUNT_NAMESPACE_OPERATION.lock();
+    let _mount_operation = mounts::namespace_operation();
     let target = if flags & UMOUNT_NOFOLLOW != 0 {
-        FS_CONTEXT.lock().resolve_no_follow(&target)?
+        FS_CONTEXT
+            .lock()
+            .resolve_no_follow_dac_unobserved(&target, &credentials)?
     } else {
-        FS_CONTEXT.lock().resolve(&target)?
+        FS_CONTEXT
+            .lock()
+            .resolve_dac_unobserved(&target, &credentials)?
     };
     if !target.is_root_of_mount() {
         return Err(AxError::InvalidInput);
@@ -1152,24 +1120,7 @@ pub fn sys_umount2(target: *const c_char, flags: i32) -> AxResult<isize> {
     if target.is_root() {
         return Err(AxError::from(LinuxError::EBUSY));
     }
-    let target_path = target
-        .absolute_path()
-        .map_err(|_| AxError::InvalidInput)?
-        .to_string();
-    if flags & MNT_EXPIRE != 0 && !mounts::mark_expiry(&target_path) {
-        return Err(AxError::from(LinuxError::EAGAIN));
-    }
-    let mount_id = target.mountpoint().mount_id();
-    let unmount_devices = target.mountpoint().subtree_devices()?;
-    if flags & MNT_DETACH != 0 {
-        target.lazy_unmount()?;
-    } else {
-        target.unmount()?;
-    }
-    mounts::remove_subtree(mount_id);
-    for device in unmount_devices {
-        notify_unmount_device(device);
-    }
+    mounts::unmount_and_remove_records(target, flags & MNT_DETACH != 0, flags & MNT_EXPIRE != 0)?;
     Ok(0)
 }
 
@@ -1207,5 +1158,36 @@ mod tests {
             parse_fat_mount_options_with_defaults("umask=0899", 0, 0, 0).unwrap_err(),
             AxError::InvalidInput
         );
+    }
+
+    #[test]
+    fn mount_flag_validation_separates_invalid_and_unsupported_bits() {
+        assert_eq!(
+            validate_mount_flags(MS_KERNMOUNT as i32).unwrap_err(),
+            AxError::InvalidInput
+        );
+        assert_eq!(
+            validate_mount_flags(MS_SYNCHRONOUS as i32).unwrap_err(),
+            AxError::OperationNotSupported
+        );
+        assert_eq!(
+            validate_mount_flags((MS_MGC_VAL | MS_RDONLY) as i32).unwrap(),
+            MS_RDONLY
+        );
+    }
+
+    #[test]
+    fn mount_atime_normalization_defaults_preserves_and_prioritizes_strict() {
+        assert_eq!(
+            normalize_mount_atime(MS_NODEV, None) & MS_RELATIME,
+            MS_RELATIME
+        );
+        assert_eq!(
+            normalize_mount_atime(MS_REMOUNT | MS_NODEV, Some(MS_NOATIME)) & MS_ATIME_FLAGS,
+            MS_NOATIME
+        );
+        let strict = normalize_mount_atime(MS_NOATIME | MS_RELATIME | MS_STRICTATIME, None);
+        assert_ne!(strict & MS_STRICTATIME, 0);
+        assert_eq!(strict & (MS_NOATIME | MS_RELATIME), 0);
     }
 }

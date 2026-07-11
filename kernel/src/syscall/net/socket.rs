@@ -162,7 +162,7 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
         (AF_UNIX, SOCK_STREAM) => {
             SocketInner::Unix(UnixSocket::new(StreamTransport::new(credentials)))
         }
-        (AF_UNIX, SOCK_DGRAM) => SocketInner::Unix(UnixSocket::new(DgramTransport::new())),
+        (AF_UNIX, SOCK_DGRAM) => SocketInner::Unix(UnixSocket::new(DgramTransport::new()?)),
         #[cfg(feature = "vsock")]
         (AF_VSOCK, SOCK_STREAM) => {
             SocketInner::Vsock(VsockSocket::new(VsockStreamTransport::new()))
@@ -344,7 +344,7 @@ pub fn sys_socketpair(
             (UnixSocket::new(sock1), UnixSocket::new(sock2))
         }
         SOCK_DGRAM => {
-            let (sock1, sock2) = DgramTransport::new_pair(credentials);
+            let (sock1, sock2) = DgramTransport::new_pair(credentials)?;
             (UnixSocket::new(sock1), UnixSocket::new(sock2))
         }
         SOCK_SEQPACKET => {

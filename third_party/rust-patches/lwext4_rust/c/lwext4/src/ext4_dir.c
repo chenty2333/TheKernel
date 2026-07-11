@@ -340,28 +340,39 @@ void ext4_dir_write_entry(struct ext4_sblock *sb, struct ext4_dir_en *en,
 	memcpy(en->name, name, name_len);
 }
 
-int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
-		       uint32_t name_len, struct ext4_inode_ref *child)
+int ext4_dir_add_entry_status(struct ext4_inode_ref *parent, const char *name,
+			      uint32_t name_len,
+			      struct ext4_inode_ref *child,
+			      bool *metadata_may_have_changed)
 {
 	int r;
 	struct ext4_fs *fs = parent->fs;
 	struct ext4_sblock *sb = &parent->fs->sb;
+	if (metadata_may_have_changed)
+		*metadata_may_have_changed = false;
 
 #if CONFIG_DIR_INDEX_ENABLE
 	/* Index adding (if allowed) */
 	if ((ext4_sb_feature_com(sb, EXT4_FCOM_DIR_INDEX)) &&
 	    (ext4_inode_has_flag(parent->inode, EXT4_INODE_FLAG_INDEX))) {
-		r = ext4_dir_dx_add_entry(parent, child, name, name_len);
+		bool dx_changed = false;
+		r = ext4_dir_dx_add_entry_status(parent, child, name, name_len,
+						 &dx_changed);
+		if (dx_changed && metadata_may_have_changed)
+			*metadata_may_have_changed = true;
 
 		/* Check if index is not corrupted */
-		if (r != EXT4_ERR_BAD_DX_DIR) {
-			if (r != EOK)
-				return r;
+		if (r != EXT4_ERR_BAD_DX_DIR)
+			return r;
 
-			return EOK;
-		}
+		/* Never run a second directory algorithm after the indexed path
+		 * may already have changed metadata. */
+		if (dx_changed)
+			return r;
 
 		/* Needed to clear dir index flag if corrupted */
+		if (metadata_may_have_changed)
+			*metadata_may_have_changed = true;
 		ext4_inode_clear_flag(parent->inode, EXT4_INODE_FLAG_INDEX);
 		parent->dirty = true;
 	}
@@ -375,7 +386,6 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 	uint32_t total_blocks = (uint32_t)(inode_size / block_size);
 
 	/* Find block, where is space for new entry and try to add */
-	bool success = false;
 	for (iblock = 0; iblock < total_blocks; ++iblock) {
 		r = ext4_fs_get_inode_dblk_idx(parent, iblock, &fblock, false);
 		if (r != EOK)
@@ -398,22 +408,30 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 		/* If adding is successful, function can finish */
 		r = ext4_dir_try_insert_entry(sb, parent, &block, child,
 						name, name_len);
-		if (r == EOK)
-			success = true;
+		if (r != ENOSPC) {
+			int release_rc;
+			if (metadata_may_have_changed)
+				*metadata_may_have_changed = true;
+			release_rc = ext4_block_set(fs->bdev, &block);
+			if (r != EOK)
+				return r;
+			return release_rc;
+		}
 
 		r = ext4_block_set(fs->bdev, &block);
 		if (r != EOK)
 			return r;
-
-		if (success)
-			return EOK;
 	}
 
 	/* No free block found - needed to allocate next data block */
 
 	iblock = 0;
 	fblock = 0;
-	r = ext4_fs_append_inode_dblk(parent, &fblock, &iblock);
+	bool append_changed = false;
+	r = ext4_fs_append_inode_dblk_status(parent, &fblock, &iblock,
+						&append_changed);
+	if (append_changed && metadata_may_have_changed)
+		*metadata_may_have_changed = true;
 	if (r != EOK)
 		return r;
 
@@ -439,18 +457,28 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 	}
 
 	ext4_dir_set_csum(parent, (void *)b.data);
-	ext4_trans_set_block_dirty(b.buf);
-	r = ext4_block_set(fs->bdev, &b);
-
-	return r;
+	r = ext4_trans_set_block_dirty(b.buf);
+	int release_rc = ext4_block_set(fs->bdev, &b);
+	if (r != EOK)
+		return r;
+	return release_rc;
 }
 
-int ext4_dir_find_entry(struct ext4_dir_search_result *result,
-			struct ext4_inode_ref *parent, const char *name,
-			uint32_t name_len)
+int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
+		       uint32_t name_len, struct ext4_inode_ref *child)
+{
+	return ext4_dir_add_entry_status(parent, name, name_len, child, NULL);
+}
+
+int ext4_dir_find_entry_status(struct ext4_dir_search_result *result,
+			       struct ext4_inode_ref *parent,
+			       const char *name, uint32_t name_len,
+			       bool *metadata_may_have_changed)
 {
 	int r;
 	struct ext4_sblock *sb = &parent->fs->sb;
+	if (metadata_may_have_changed)
+		*metadata_may_have_changed = false;
 
 	/* Entry clear */
 	result->block.lb_id = 0;
@@ -470,6 +498,8 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 		}
 
 		/* Needed to clear dir index flag if corrupted */
+		if (metadata_may_have_changed)
+			*metadata_may_have_changed = true;
 		ext4_inode_clear_flag(parent->inode, EXT4_INODE_FLAG_INDEX);
 		parent->dirty = true;
 	}
@@ -524,21 +554,38 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 	return ENOENT;
 }
 
-int ext4_dir_remove_entry(struct ext4_inode_ref *parent, const char *name,
-			  uint32_t name_len)
+int ext4_dir_find_entry(struct ext4_dir_search_result *result,
+			struct ext4_inode_ref *parent, const char *name,
+			uint32_t name_len)
+{
+	return ext4_dir_find_entry_status(result, parent, name, name_len, NULL);
+}
+
+int ext4_dir_remove_entry_status(struct ext4_inode_ref *parent,
+				 const char *name, uint32_t name_len,
+				 bool *metadata_may_have_changed)
 {
 	struct ext4_sblock *sb = &parent->fs->sb;
+	bool find_changed = false;
+	int release_rc;
+	if (metadata_may_have_changed)
+		*metadata_may_have_changed = false;
 	/* Check if removing from directory */
 	if (!ext4_inode_is_type(sb, parent->inode, EXT4_INODE_MODE_DIRECTORY))
 		return ENOTDIR;
 
 	/* Try to find entry */
 	struct ext4_dir_search_result result;
-	int rc = ext4_dir_find_entry(&result, parent, name, name_len);
+	int rc = ext4_dir_find_entry_status(&result, parent, name, name_len,
+						&find_changed);
+	if (find_changed && metadata_may_have_changed)
+		*metadata_may_have_changed = true;
 	if (rc != EOK)
 		return rc;
 
 	/* Invalidate entry */
+	if (metadata_may_have_changed)
+		*metadata_may_have_changed = true;
 	ext4_dir_en_set_inode(result.dentry, 0);
 
 	/* Store entry position in block */
@@ -557,12 +604,19 @@ int ext4_dir_remove_entry(struct ext4_inode_ref *parent, const char *name,
 
 		/* Find direct predecessor of removed entry */
 		while ((offset + de_len) < pos) {
+			if (de_len == 0 || offset + de_len > pos) {
+				rc = EIO;
+				goto release_result;
+			}
 			offset += ext4_dir_en_get_entry_len(tmp_de);
 			tmp_de = (void *)(result.block.data + offset);
 			de_len = ext4_dir_en_get_entry_len(tmp_de);
 		}
 
-		ext4_assert(de_len + offset == pos);
+		if (de_len + offset != pos) {
+			rc = EIO;
+			goto release_result;
+		}
 
 		/* Add to removed entry length to predecessor's length */
 		uint16_t del_len;
@@ -572,9 +626,19 @@ int ext4_dir_remove_entry(struct ext4_inode_ref *parent, const char *name,
 
 	ext4_dir_set_csum(parent,
 			(struct ext4_dir_en *)result.block.data);
-	ext4_trans_set_block_dirty(result.block.buf);
+	rc = ext4_trans_set_block_dirty(result.block.buf);
 
-	return ext4_dir_destroy_result(parent, &result);
+release_result:
+	release_rc = ext4_dir_destroy_result(parent, &result);
+	if (rc != EOK)
+		return rc;
+	return release_rc;
+}
+
+int ext4_dir_remove_entry(struct ext4_inode_ref *parent, const char *name,
+			  uint32_t name_len)
+{
+	return ext4_dir_remove_entry_status(parent, name, name_len, NULL);
 }
 
 int ext4_dir_try_insert_entry(struct ext4_sblock *sb,
@@ -609,9 +673,7 @@ int ext4_dir_try_insert_entry(struct ext4_sblock *sb,
 			ext4_dir_write_entry(sb, start, rec_len, child, name,
 					     name_len);
 			ext4_dir_set_csum(inode_ref, (void *)dst_blk->data);
-			ext4_trans_set_block_dirty(dst_blk->buf);
-
-			return EOK;
+			return ext4_trans_set_block_dirty(dst_blk->buf);
 		}
 
 		/* Valid entry, try to split it */
@@ -638,8 +700,7 @@ int ext4_dir_try_insert_entry(struct ext4_sblock *sb,
 
 				ext4_dir_set_csum(inode_ref,
 						  (void *)dst_blk->data);
-				ext4_trans_set_block_dirty(dst_blk->buf);
-				return EOK;
+				return ext4_trans_set_block_dirty(dst_blk->buf);
 			}
 		}
 

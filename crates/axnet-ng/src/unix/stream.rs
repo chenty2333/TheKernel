@@ -5,7 +5,7 @@ use core::{
 };
 
 use async_trait::async_trait;
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axio::{IoBuf, Read, Write};
 use axpoll::{IoEvents, PollSet, Pollable};
 use axsync::spin::SpinNoIrq as Mutex;
@@ -15,7 +15,7 @@ use ringbuf::{
 };
 
 use crate::{
-    RecvOptions, SendOptions, Shutdown,
+    RecvFlags, RecvOptions, SendFlags, SendOptions, Shutdown,
     consts::{LISTEN_QUEUE_SIZE, TCP_TX_BUF_LEN},
     general::GeneralOptions,
     options::{Configurable, GetSocketOption, SetSocketOption, UnixCredentials},
@@ -31,6 +31,19 @@ fn new_uni_channel() -> (HeapProd<u8>, HeapCons<u8>) {
     let rb = HeapRb::new(BUF_SIZE);
     rb.split()
 }
+
+fn finish_stream_send(
+    total: usize,
+    requested: usize,
+    effective_nonblocking: bool,
+) -> AxResult<usize> {
+    if total == requested || (effective_nonblocking && total != 0) {
+        Ok(total)
+    } else {
+        Err(AxError::WouldBlock)
+    }
+}
+
 fn new_channels(
     left_credentials: UnixCredentials,
     right_credentials: UnixCredentials,
@@ -179,6 +192,10 @@ impl Configurable for StreamTransport {
 }
 #[async_trait]
 impl TransportOps for StreamTransport {
+    fn set_pending_error(&self, error: LinuxError) {
+        self.general.set_pending_error(error);
+    }
+
     fn bind(&self, slot: &super::BindSlot, _local_addr: &UnixSocketAddr) -> AxResult<()> {
         let mut slot = slot.stream.lock();
         if slot.is_some() {
@@ -246,82 +263,99 @@ impl TransportOps for StreamTransport {
     }
 
     fn send(&self, mut src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {
+        if !options.cmsg.is_empty() {
+            return Err(AxError::OperationNotSupported);
+        }
+        let per_call_nonblocking = options.flags.contains(SendFlags::DONT_WAIT);
         if options.to.is_some() {
             return Err(AxError::InvalidInput);
         }
         let size = src.remaining();
         let mut total = 0;
-        let non_blocking = self.general.nonblocking();
-        self.general.send_poller(self, || {
-            let mut guard = self.channel.lock();
-            let Some(chan) = guard.as_mut() else {
-                return Err(AxError::NotConnected);
-            };
-            let Some(tx) = chan.tx.as_mut() else {
-                return Err(AxError::BrokenPipe);
-            };
-            if !tx.read_is_held() {
-                return Err(AxError::BrokenPipe);
-            }
-
-            let count = {
-                let (left, right) = tx.vacant_slices_mut();
-                // The ring buffer guarantees these vacant slices are fully
-                // writable byte ranges.
-                let left = unsafe {
-                    core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
+        let effective_nonblocking = self.general.nonblocking() || per_call_nonblocking;
+        let result = self
+            .general
+            .send_poller_with_nonblocking(self, per_call_nonblocking, || {
+                let mut guard = self.channel.lock();
+                let Some(chan) = guard.as_mut() else {
+                    return Err(AxError::NotConnected);
                 };
-                let right = unsafe {
-                    core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len())
+                let Some(tx) = chan.tx.as_mut() else {
+                    return Err(AxError::BrokenPipe);
                 };
-                let mut count = src.read(left)?;
-                if count >= left.len() {
-                    count += src.read(right)?;
+                if !tx.read_is_held() {
+                    return Err(AxError::BrokenPipe);
                 }
-                unsafe { tx.advance_write_index(count) };
-                count
-            };
-            total += count;
-            if count > 0 {
-                chan.poll_update.wake();
-            }
 
-            if count == size || non_blocking {
-                Ok(total)
-            } else {
-                Err(AxError::WouldBlock)
-            }
-        })
+                let count = {
+                    let (left, right) = tx.vacant_slices_mut();
+                    // The ring buffer guarantees these vacant slices are fully
+                    // writable byte ranges.
+                    let left = unsafe {
+                        core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
+                    };
+                    let right = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            right.as_mut_ptr().cast::<u8>(),
+                            right.len(),
+                        )
+                    };
+                    let mut count = src.read(left)?;
+                    if count >= left.len() {
+                        count += src.read(right)?;
+                    }
+                    unsafe { tx.advance_write_index(count) };
+                    count
+                };
+                total += count;
+                if count > 0 {
+                    chan.poll_update.wake();
+                }
+
+                finish_stream_send(total, size, effective_nonblocking)
+            });
+        // Once stream bytes have been queued, Linux reports that positive
+        // progress instead of a later interruption, timeout, peer close, or
+        // user-copy failure. Returning the error would invite user space to
+        // retry bytes that the peer can already observe.
+        match result {
+            Err(_) if total != 0 => Ok(total),
+            other => other,
+        }
     }
 
-    fn recv(&self, mut dst: impl Write, _options: RecvOptions) -> AxResult<usize> {
-        self.general.recv_poller(self, || {
-            let mut guard = self.channel.lock();
-            let Some(chan) = guard.as_mut() else {
-                return Err(AxError::NotConnected);
-            };
-            let Some(rx) = chan.rx.as_mut() else {
-                return Ok(0);
-            };
+    fn recv(&self, mut dst: impl Write, options: RecvOptions) -> AxResult<usize> {
+        let per_call_nonblocking = options.flags.contains(RecvFlags::DONT_WAIT);
+        self.general
+            .recv_poller_with_nonblocking(self, per_call_nonblocking, || {
+                let mut guard = self.channel.lock();
+                let Some(chan) = guard.as_mut() else {
+                    return Err(AxError::NotConnected);
+                };
+                let Some(rx) = chan.rx.as_mut() else {
+                    return Ok(0);
+                };
 
-            let count = {
-                let (left, right) = rx.as_slices();
-                let mut count = dst.write(left)?;
-                if count >= left.len() {
-                    count += dst.write(right)?;
+                let count = {
+                    let (left, right) = rx.as_slices();
+                    let mut count = dst.write(left)?;
+                    if count >= left.len() {
+                        count += dst.write(right)?;
+                    }
+                    if !options.flags.contains(RecvFlags::PEEK) {
+                        unsafe { rx.advance_read_index(count) };
+                    }
+                    count
+                };
+                if count > 0 {
+                    chan.poll_update.wake();
+                    Ok(count)
+                } else if !rx.write_is_held() {
+                    Ok(0)
+                } else {
+                    Err(AxError::WouldBlock)
                 }
-                unsafe { rx.advance_read_index(count) };
-                count
-            };
-            if count > 0 {
-                chan.poll_update.wake();
-                Ok(count)
-            } else if !rx.write_is_held() {
-                Ok(0)
-            } else {
-                Err(AxError::WouldBlock)
-            }
-        })
+            })
     }
 
     fn shutdown(&self, how: Shutdown) -> AxResult<()> {
@@ -367,7 +401,7 @@ impl Pollable for StreamTransport {
         } else if let Some((conn_tx, _)) = self.conn_rx.lock().as_ref() {
             events.set(IoEvents::IN, !conn_tx.is_empty());
         }
-        events
+        self.general.add_pending_error_event(events)
     }
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {
@@ -422,6 +456,63 @@ mod tests {
 
         assert_eq!(peer_credentials(&left_transport), right);
         assert_eq!(peer_credentials(&right_transport), left);
+    }
+
+    #[test]
+    fn stream_send_progress_uses_total_and_preserves_nonblocking_short_write() {
+        assert_eq!(finish_stream_send(7, 7, false), Ok(7));
+        assert_eq!(finish_stream_send(3, 7, true), Ok(3));
+        assert_eq!(finish_stream_send(0, 7, true), Err(AxError::WouldBlock));
+        assert_eq!(finish_stream_send(3, 7, false), Err(AxError::WouldBlock));
+    }
+
+    #[test]
+    fn per_call_nonblocking_stream_send_returns_the_queued_prefix() {
+        let credentials = UnixCredentials::new(1, 2, 3);
+        let (left, right) = StreamTransport::new_pair(credentials);
+        let flags = SendFlags::DONT_WAIT;
+
+        let prefill = alloc::vec![0x11u8; BUF_SIZE - 1];
+        assert_eq!(
+            left.send(
+                &prefill[..],
+                SendOptions {
+                    flags,
+                    ..SendOptions::default()
+                }
+            )
+            .unwrap(),
+            prefill.len()
+        );
+
+        let tail = [0x22u8, 0x33];
+        assert_eq!(
+            left.send(
+                &tail[..],
+                SendOptions {
+                    flags,
+                    ..SendOptions::default()
+                }
+            )
+            .unwrap(),
+            1
+        );
+
+        let mut received = alloc::vec![0u8; BUF_SIZE];
+        assert_eq!(
+            right
+                .recv(
+                    &mut received[..],
+                    RecvOptions {
+                        flags: RecvFlags::DONT_WAIT,
+                        ..RecvOptions::default()
+                    }
+                )
+                .unwrap(),
+            BUF_SIZE
+        );
+        assert!(received[..BUF_SIZE - 1].iter().all(|byte| *byte == 0x11));
+        assert_eq!(received[BUF_SIZE - 1], 0x22);
     }
 
     #[test]

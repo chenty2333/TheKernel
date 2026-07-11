@@ -1,16 +1,13 @@
-use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
 use axfs::FS_CONTEXT;
 use axhal::{power::system_off, uspace::UserContext};
-use axsync::Mutex;
+use axsync::{Mutex, spin::SpinNoIrq};
 use axtask::{AxTaskExt, SchedState, spawn_task_with_sched};
 use starry_process::{Pid, Process};
 
 use crate::{
-    file::{FD_TABLE, executable},
+    file::{FD_TABLE, FdTable, executable, init_fd_scope_default, try_new_process_scope},
     mm::{
         copy_from_kernel, load_user_app_trusted, mark_page_fault_thread_context_ready,
         new_user_aspace_empty,
@@ -18,7 +15,7 @@ use crate::{
     pseudofs::{self, dev::tty::N_TTY},
     task::{
         CgroupNamespace, PidNamespace, ProcessData, Thread, TimeNamespace, UserNamespace,
-        UtsNamespace, add_task_to_table, new_user_task, spawn_alarm_task,
+        UtsNamespace, add_task_to_table, spawn_alarm_task, try_new_user_task,
     },
 };
 
@@ -27,28 +24,34 @@ pub fn init(args: &[String], envs: &[String]) {
     const INIT_PID: Pid = 1;
 
     mark_page_fault_thread_context_ready();
+    init_fd_scope_default().expect("Failed to initialize real fd scope default");
 
-    axfs::set_symlink_follow_policy(crate::mounts::should_follow_symlink);
-    axfs::set_atime_update_policy(crate::mounts::should_update_atime);
     {
         let fs = FS_CONTEXT.lock();
         let root = fs.root_dir();
         crate::mounts::register_linux_device(
-            root.mountpoint().device(),
+            root.mountpoint().filesystem_identity(),
             crate::mounts::ROOT_BLOCK_DEVICE_ID,
-            root.mountpoint().filesystem_lifetime(),
-        );
-        crate::mounts::record(
-            crate::mounts::ROOT_BLOCK_SOURCE.to_string(),
-            "/".to_string(),
-            root.filesystem().name().to_string(),
-            "/".to_string(),
-            root.mountpoint().device(),
-            root.mountpoint().mount_id(),
+        )
+        .expect("Failed to register root block-device identity");
+        crate::mounts::initialize_root_mount(
+            root.mountpoint(),
             0,
-            0,
-        );
+            crate::mounts::MountMetadata::try_from_strs(
+                crate::mounts::ROOT_BLOCK_SOURCE,
+                root.filesystem().name(),
+                "/",
+                "",
+            )
+            .expect("Failed to allocate root mount metadata"),
+        )
+        .expect("Failed to initialize root mount policy");
     }
+    axfs::set_symlink_follow_policy(crate::mounts::should_follow_symlink);
+    axfs::set_atime_update_policy(crate::mounts::should_update_atime);
+    axfs::set_mount_access_policy(crate::mounts::note_mount_access);
+    crate::deferred_work::init();
+    crate::file::inotify::init_filesystem_release_notifications();
     pseudofs::mount_all().expect("Failed to mount pseudofs");
 
     let loc = FS_CONTEXT
@@ -71,30 +74,65 @@ pub fn init(args: &[String], envs: &[String]) {
         .unwrap_or_else(|e| panic!("Failed to load user app: {}", e));
 
     let uctx = UserContext::new(entry_vaddr.into(), ustack_top, 0);
-    let mut task = new_user_task(name, uctx);
+    let mut task_name = String::new();
+    task_name
+        .try_reserve_exact(name.len())
+        .expect("Failed to allocate init task name");
+    task_name.push_str(name);
+    let mut task = try_new_user_task(task_name, uctx).expect("Failed to allocate init task");
     task.ctx_mut().set_page_table_root(uspace.page_table_root());
 
     let tid = task.id().as_u64() as Pid;
-    let proc = Process::new_init(INIT_PID, None);
-    proc.add_thread(tid);
+    let proc = Process::try_new_init(INIT_PID, None).expect("Failed to allocate init process");
 
     N_TTY.bind_to(&proc).expect("Failed to bind ntty");
 
-    let proc = ProcessData::new(
+    let mut exe_path = String::new();
+    exe_path
+        .try_reserve_exact(path.as_str().len())
+        .expect("Failed to allocate init executable path");
+    exe_path.push_str(path.as_str());
+    let mut cmdline = Vec::new();
+    cmdline
+        .try_reserve_exact(args.len())
+        .expect("Failed to allocate init command line");
+    for arg in args {
+        let mut copy = String::new();
+        copy.try_reserve_exact(arg.len())
+            .expect("Failed to allocate init command-line argument");
+        copy.push_str(arg);
+        cmdline.push(copy);
+    }
+    let cmdline = Arc::try_new(cmdline).expect("Failed to allocate init command-line owner");
+    let aspace = Arc::try_new(Mutex::new(uspace)).expect("Failed to allocate init address space");
+    let signal_actions =
+        Arc::try_new(SpinNoIrq::new(Default::default())).expect("Failed to allocate init signals");
+    let init_fd_table =
+        Arc::try_new(FdTable::new().expect("Failed to allocate init fd-table identity"))
+            .expect("Failed to allocate init fd table");
+    let scope = try_new_process_scope(init_fd_table, FS_CONTEXT.clone())
+        .expect("Failed to allocate init process scope");
+    let exit_fd_table =
+        Arc::try_new(FdTable::new().expect("Failed to allocate init exit fd-table identity"))
+            .expect("Failed to allocate init exit fd table");
+    let proc = ProcessData::try_new(
         proc,
-        path.to_string(),
-        executable::acquire(&loc),
-        Arc::new(args.to_vec()),
-        Arc::new(Mutex::new(uspace)),
-        Arc::default(),
+        exe_path,
+        executable::acquire(&loc).expect("Failed to retain init executable identity"),
+        cmdline,
+        aspace,
+        scope,
+        exit_fd_table,
+        signal_actions,
         None,
         axnet::default_stack().clone(),
-        CgroupNamespace::new_root(),
-        PidNamespace::new_root(),
-        UserNamespace::new_root(),
-        Arc::new(UtsNamespace::new_default()),
-        Arc::new(TimeNamespace::new_default()),
-    );
+        CgroupNamespace::try_new_root().expect("Failed to allocate init cgroup namespace"),
+        PidNamespace::try_new_root().expect("Failed to allocate init pid namespace"),
+        UserNamespace::try_new_root().expect("Failed to allocate init user namespace"),
+        Arc::try_new(UtsNamespace::new_default()).expect("Failed to allocate init UTS namespace"),
+        Arc::try_new(TimeNamespace::new_default()).expect("Failed to allocate init time namespace"),
+    )
+    .expect("Failed to allocate init process runtime state");
 
     {
         let mut scope = proc.scope.write();
@@ -102,7 +140,13 @@ pub fn init(args: &[String], envs: &[String]) {
             .expect("Failed to add stdio");
     }
 
-    let thr = Thread::new(tid, proc);
+    let thread_admission = proc
+        .prepare_thread(tid)
+        .expect("Failed to admit init thread membership");
+    let (thr, signal_registration) =
+        Thread::try_new(tid, proc).expect("Failed to allocate init thread state");
+    signal_registration.commit();
+    thread_admission.commit();
     if INIT_PID != tid {
         thr.set_tid(INIT_PID);
     }
@@ -113,7 +157,7 @@ pub fn init(args: &[String], envs: &[String]) {
     spawn_alarm_task();
 
     let task = spawn_task_with_sched(task, SchedState::default());
-    add_task_to_table(&task);
+    add_task_to_table(&task).expect("Failed to publish init task lookup identities");
 
     // TODO: wait for all processes to finish
     let exit_code = task.join();

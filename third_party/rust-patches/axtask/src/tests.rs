@@ -1,10 +1,48 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, Once};
+
+use axerrno::AxError;
 
 use crate::{WaitQueue, api as axtask, current};
 
 static INIT: Once = Once::new();
+static DEFERRED_INIT: Once = Once::new();
 static SERIAL: Mutex<()> = Mutex::new(());
+static DEFERRED_CALLS: AtomicUsize = AtomicUsize::new(0);
+static DEFERRED_REENTER: AtomicBool = AtomicBool::new(false);
+
+fn test_deferred_dispatcher() {
+    assert!(axtask::can_block_current());
+    DEFERRED_CALLS.fetch_add(1, Ordering::Release);
+    if DEFERRED_REENTER.swap(false, Ordering::AcqRel) {
+        axtask::run_deferred_work();
+    }
+}
+
+fn other_deferred_dispatcher() {}
+
+#[test]
+fn deferred_work_runs_at_yield_and_suppresses_same_task_recursion() {
+    let _lock = SERIAL.lock();
+    INIT.call_once(axtask::init_scheduler);
+    DEFERRED_INIT.call_once(|| {
+        assert!(axtask::set_deferred_work_dispatcher(
+            test_deferred_dispatcher
+        ));
+    });
+    assert!(!axtask::set_deferred_work_dispatcher(
+        other_deferred_dispatcher
+    ));
+
+    DEFERRED_CALLS.store(0, Ordering::Release);
+    DEFERRED_REENTER.store(true, Ordering::Release);
+    axtask::run_deferred_work();
+    assert_eq!(DEFERRED_CALLS.load(Ordering::Acquire), 1);
+
+    DEFERRED_CALLS.store(0, Ordering::Release);
+    axtask::yield_now();
+    assert!(DEFERRED_CALLS.load(Ordering::Acquire) >= 2);
+}
 
 #[test]
 fn test_sched_fifo() {
@@ -164,4 +202,65 @@ fn reclaim_driver_is_bounded_when_scheduler_refs_remain() {
 
     assert_eq!(reclaim_calls, 9);
     assert_eq!(yield_calls, 8);
+}
+
+#[test]
+fn fallible_task_construction_rejects_invalid_stack_sizes() {
+    assert!(crate::TaskInner::try_new(|| {}, String::new(), 0).is_err());
+    assert!(crate::TaskInner::try_new(|| {}, String::new(), usize::MAX).is_err());
+}
+
+#[test]
+fn current_affinity_admission_failure_does_not_publish() {
+    let mut published = false;
+    let result = axtask::admit_affinity_then_publish(
+        true,
+        || Err::<usize, AxError>(AxError::NoMemory),
+        |_| published = true,
+    );
+
+    assert_eq!(result, Err(AxError::NoMemory));
+    assert!(!published);
+}
+
+#[test]
+fn remote_running_affinity_admission_failure_does_not_publish() {
+    let mut published_mask = None;
+    let requested_mask = 0b10usize;
+    let result = axtask::admit_affinity_then_publish(
+        true,
+        || Err::<usize, AxError>(AxError::NoMemory),
+        |_| published_mask = Some(requested_mask),
+    );
+
+    assert_eq!(result, Err(AxError::NoMemory));
+    assert_eq!(published_mask, None);
+}
+
+#[test]
+fn later_affinity_publication_returns_replaced_helper_for_out_of_lock_drop() {
+    struct Helper<'a>(&'a AtomicUsize, usize);
+
+    impl Drop for Helper<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    let drops = AtomicUsize::new(0);
+    let mut pending = Some(Helper(&drops, 1));
+    let displaced = axtask::admit_affinity_then_publish(
+        true,
+        || Ok::<_, ()>(Helper(&drops, 2)),
+        |replacement| core::mem::replace(&mut pending, replacement),
+    )
+    .unwrap();
+
+    assert_eq!(drops.load(Ordering::Acquire), 0);
+    assert_eq!(displaced.as_ref().map(|helper| helper.1), Some(1));
+    assert_eq!(pending.as_ref().map(|helper| helper.1), Some(2));
+    drop(displaced);
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    drop(pending);
+    assert_eq!(drops.load(Ordering::Acquire), 2);
 }

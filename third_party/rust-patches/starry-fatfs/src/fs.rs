@@ -333,6 +333,7 @@ pub struct FileSystem<IO: ReadWriteSeek, TP = DefaultTimeProvider, OCC = LossyOe
     total_clusters: u32,
     fs_info: RefCell<FsInfoSector>,
     current_status_flags: Cell<FsStatusFlags>,
+    runtime_poisoned: Cell<bool>,
 }
 
 pub trait IntoStorage<T: Read + Write + Seek> {
@@ -420,7 +421,26 @@ impl<IO: Read + Write + Seek, TP, OCC> FileSystem<IO, TP, OCC> {
             total_clusters,
             fs_info: RefCell::new(fs_info),
             current_status_flags: Cell::new(status_flags),
+            runtime_poisoned: Cell::new(false),
         })
+    }
+
+    /// Returns whether an in-memory namespace transaction encountered an I/O
+    /// failure which could not be rolled back completely.
+    pub fn is_poisoned(&self) -> bool {
+        self.runtime_poisoned.get()
+    }
+
+    pub(crate) fn mark_poisoned(&self) {
+        self.runtime_poisoned.set(true);
+    }
+
+    pub(crate) fn ensure_not_poisoned(&self) -> Result<(), Error<IO::Error>> {
+        if self.is_poisoned() {
+            Err(Error::CorruptedFileSystem)
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns a type of File Allocation Table (FAT) used by this filesystem.
@@ -512,14 +532,31 @@ impl<IO: Read + Write + Seek, TP, OCC> FileSystem<IO, TP, OCC> {
             let mut fat = self.fat_slice();
             alloc_cluster(&mut fat, self.fat_type, prev_cluster, hint, self.total_clusters)?
         };
-        if zero {
-            let mut disk = self.disk.borrow_mut();
-            disk.seek(SeekFrom::Start(self.offset_from_cluster(cluster)))?;
-            write_zeros(&mut *disk, u64::from(self.cluster_size()))?;
+        {
+            let mut fs_info = self.fs_info.borrow_mut();
+            fs_info.set_next_free_cluster(cluster + 1);
+            fs_info.map_free_clusters(|n| n - 1);
         }
-        let mut fs_info = self.fs_info.borrow_mut();
-        fs_info.set_next_free_cluster(cluster + 1);
-        fs_info.map_free_clusters(|n| n - 1);
+        if zero {
+            let zero_result = {
+                let mut disk = self.disk.borrow_mut();
+                disk.seek(SeekFrom::Start(self.offset_from_cluster(cluster)))
+                    .map_err(Error::Io)
+                    .and_then(|_| write_zeros(&mut *disk, u64::from(self.cluster_size())).map_err(Error::Io))
+            };
+            if let Err(error) = zero_result {
+                let rollback = if let Some(previous) = prev_cluster {
+                    self.truncate_cluster_chain(previous)
+                } else {
+                    self.free_cluster_chain(cluster)
+                };
+                if rollback.is_err() {
+                    self.mark_poisoned();
+                    return Err(Error::CorruptedFileSystem);
+                }
+                return Err(error);
+            }
+        }
         Ok(cluster)
     }
 

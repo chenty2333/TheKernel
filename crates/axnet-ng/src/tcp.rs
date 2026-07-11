@@ -16,7 +16,7 @@ use smoltcp::{
 };
 
 use crate::{
-    RecvFlags, RecvOptions, SendOptions, Shutdown, Socket, SocketAddrEx, SocketOps,
+    RecvFlags, RecvOptions, SendFlags, SendOptions, Shutdown, Socket, SocketAddrEx, SocketOps,
     buffer::try_zeroed_socket_buffer,
     consts::{LOOPBACK_TCP_MSS, TCP_RX_BUF_LEN, TCP_TX_BUF_LEN},
     general::GeneralOptions,
@@ -65,6 +65,10 @@ pub struct TcpSocket {
 unsafe impl Sync for TcpSocket {}
 
 impl TcpSocket {
+    pub(crate) fn set_pending_error(&self, error: LinuxError) {
+        self.general.set_pending_error(error);
+    }
+
     /// Creates a new TCP socket bound to the given network stack.
     pub fn new(stack: Arc<NetStack>) -> AxResult<Self> {
         let handle = stack.socket_set.add(new_tcp_socket()?);
@@ -472,7 +476,7 @@ impl SocketOps for TcpSocket {
         axtask::yield_now();
 
         // Here our state must be `CONNECTING`, and only one thread can run here.
-        self.general.send_poller(self, || {
+        self.general.connect_poller(self, || {
             self.stack.poll_interfaces();
             let events = self.poll_connect();
             if !events.contains(IoEvents::OUT) {
@@ -538,30 +542,35 @@ impl SocketOps for TcpSocket {
         })
     }
 
-    fn send(&self, mut src: impl Read, _options: SendOptions) -> AxResult<usize> {
+    fn send(&self, mut src: impl Read, options: SendOptions) -> AxResult<usize> {
+        if !options.cmsg.is_empty() {
+            return Err(AxError::OperationNotSupported);
+        }
+        let per_call_nonblocking = options.flags.contains(SendFlags::DONT_WAIT);
         if self.tx_closed.load(Ordering::Acquire) {
             return Err(AxError::BrokenPipe);
         }
-        self.general.send_poller(self, || {
-            self.stack.poll_interfaces();
-            self.with_smol_socket(|socket| {
-                if !socket.is_active() {
-                    Err(AxError::NotConnected)
-                } else if !socket.can_send() {
-                    Err(AxError::WouldBlock)
-                } else {
-                    // connected, and the tx buffer is not full
-                    let len = socket
-                        .send(|buffer| {
-                            let result = src.read(buffer);
-                            let len = result.unwrap_or(0);
-                            (len, result)
-                        })
-                        .map_err(|_| ax_err_type!(NotConnected, "not connected?"))??;
-                    Ok(len)
-                }
+        self.general
+            .send_poller_with_nonblocking(self, per_call_nonblocking, || {
+                self.stack.poll_interfaces();
+                self.with_smol_socket(|socket| {
+                    if !socket.is_active() {
+                        Err(AxError::NotConnected)
+                    } else if !socket.can_send() {
+                        Err(AxError::WouldBlock)
+                    } else {
+                        // connected, and the tx buffer is not full
+                        let len = socket
+                            .send(|buffer| {
+                                let result = src.read(buffer);
+                                let len = result.unwrap_or(0);
+                                (len, result)
+                            })
+                            .map_err(|_| ax_err_type!(NotConnected, "not connected?"))??;
+                        Ok(len)
+                    }
+                })
             })
-        })
     }
 
     fn recv(&self, mut dst: impl Write + IoBufMut, options: RecvOptions<'_>) -> AxResult<usize> {
@@ -573,30 +582,32 @@ impl SocketOps for TcpSocket {
             State::Listening => ax_bail!(InvalidInput, "not connected"),
             State::Connected | State::Closed | State::Busy => {}
         }
-        self.general.recv_poller(self, || {
-            self.stack.poll_interfaces();
-            self.with_smol_socket(|socket| {
-                if !socket.may_recv() {
-                    Ok(0)
-                } else if socket.recv_queue() == 0 {
-                    Err(AxError::WouldBlock)
-                } else if options.flags.contains(RecvFlags::PEEK) {
-                    dst.write(
+        let per_call_nonblocking = options.flags.contains(RecvFlags::DONT_WAIT);
+        self.general
+            .recv_poller_with_nonblocking(self, per_call_nonblocking, || {
+                self.stack.poll_interfaces();
+                self.with_smol_socket(|socket| {
+                    if !socket.may_recv() {
+                        Ok(0)
+                    } else if socket.recv_queue() == 0 {
+                        Err(AxError::WouldBlock)
+                    } else if options.flags.contains(RecvFlags::PEEK) {
+                        dst.write(
+                            socket
+                                .peek(dst.remaining_mut())
+                                .map_err(|_| ax_err_type!(NotConnected, "not connected?"))?,
+                        )
+                    } else {
                         socket
-                            .peek(dst.remaining_mut())
-                            .map_err(|_| ax_err_type!(NotConnected, "not connected?"))?,
-                    )
-                } else {
-                    socket
-                        .recv(|buf| {
-                            let result = dst.write(buf);
-                            let len = result.unwrap_or(0);
-                            (len, result)
-                        })
-                        .map_err(|_| ax_err_type!(NotConnected, "not connected?"))?
-                }
+                            .recv(|buf| {
+                                let result = dst.write(buf);
+                                let len = result.unwrap_or(0);
+                                (len, result)
+                            })
+                            .map_err(|_| ax_err_type!(NotConnected, "not connected?"))?
+                    }
+                })
             })
-        })
     }
 
     fn local_addr(&self) -> AxResult<SocketAddrEx> {
@@ -663,7 +674,7 @@ impl Pollable for TcpSocket {
         let peer_write_closed = matches!(state, State::Connected | State::Closed)
             && self.with_smol_socket(|socket| !socket.may_recv());
         events.set(IoEvents::RDHUP, peer_write_closed);
-        events
+        self.general.add_pending_error_event(events)
     }
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {

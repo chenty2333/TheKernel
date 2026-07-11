@@ -1,6 +1,7 @@
-use alloc::format;
+use alloc::string::String;
 use core::{
     ffi::c_char,
+    fmt::Write as _,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -11,7 +12,7 @@ use linux_raw_sys::general::{AT_FDCWD, MFD_CLOEXEC, O_CLOEXEC, O_CREAT, O_EXCL, 
 
 use super::fd_ops::openat_inner;
 use crate::{
-    file::{File, memfd},
+    file::{FD_TABLE, File, get_file_description, memfd},
     mm::UserConstPtr,
 };
 
@@ -19,6 +20,18 @@ const MEMFD_NAME_MAX: usize = 249;
 const MEMFD_DIR: &str = "/tmp/memfd";
 
 static MEMFD_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn memfd_path(id: u64) -> AxResult<String> {
+    let capacity = MEMFD_DIR
+        .len()
+        .checked_add(1 + ".memfd-".len() + 16)
+        .ok_or(AxError::NoMemory)?;
+    let mut path = String::new();
+    path.try_reserve_exact(capacity)
+        .map_err(|_| AxError::NoMemory)?;
+    write!(&mut path, "{MEMFD_DIR}/.memfd-{id:016x}").map_err(|_| AxError::Io)?;
+    Ok(path)
+}
 
 fn validate_memfd_name(name: UserConstPtr<c_char>) -> AxResult<()> {
     let start = name.address().as_usize();
@@ -59,11 +72,25 @@ pub fn sys_memfd_create(name: UserConstPtr<c_char>, flags: u32) -> AxResult<isiz
 
     for _ in 0..64 {
         let id = MEMFD_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = format!("{MEMFD_DIR}/.memfd-{id:016x}");
+        let path = memfd_path(id)?;
         match openat_inner(AT_FDCWD as _, &path, open_flags as i32, 0o600) {
             Ok(fd) => {
-                let file = crate::file::get_typed_file::<File>(fd as i32)?;
-                memfd::install_memfd_state(file.inner().location(), allow_sealing);
+                let description = get_file_description(fd as i32)?;
+                let expected = description.id();
+                let install = description
+                    .inner
+                    .downcast_ref::<File>()
+                    .ok_or(AxError::BadFileDescriptor)
+                    .and_then(|file| {
+                        memfd::install_memfd_state(file.inner().location(), allow_sealing).map(drop)
+                    });
+                if let Err(error) = install {
+                    drop(description);
+                    let removed = FD_TABLE.close_if_same(fd as i32, expected);
+                    drop(removed);
+                    crate::file::inotify::wait_current_close_notifications();
+                    return Err(error);
+                }
                 return Ok(fd);
             }
             Err(AxError::AlreadyExists) => continue,

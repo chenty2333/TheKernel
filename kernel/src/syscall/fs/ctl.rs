@@ -1,13 +1,5 @@
-use alloc::{
-    ffi::CString,
-    format,
-    string::{String, ToString},
-    sync::Arc,
-    vec,
-    vec::Vec,
-};
+use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
 use core::{
-    cmp::min,
     ffi::{c_char, c_int, c_void},
     mem::offset_of,
     time::Duration,
@@ -16,7 +8,8 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FS_CONTEXT, FileBackend, FileFlags};
 use axfs_ng_vfs::{
-    DeviceId, Location, Metadata, MetadataUpdate, NodePermission, NodeType,
+    CreateDisposition, DeviceId, Location, Metadata, MetadataUpdate, NamedCreateOptions,
+    NodePermission, NodeType,
     path::{MAX_NAME_LEN, Path},
 };
 use axhal::power::system_off;
@@ -29,13 +22,13 @@ use starry_vm::{VmPtr, vm_write_slice};
 
 use crate::{
     file::{
-        Directory, File, FileLike, add_file_like, get_file_like, has_tmpfile_state,
+        Directory, File, FileLike, add_file_like, get_file_like,
         inotify::location_for_fd,
         is_path_only_fd,
         permission::{
             DacFsContextExt, check_create_permissions, check_open_permissions,
             check_remove_permissions, check_rename_permissions, check_search_permissions,
-            check_writable_mount,
+            check_writable_mount, initial_named_create_owner_mode,
         },
         resolve_at_with_credentials, with_fs, with_path_fs,
     },
@@ -63,6 +56,21 @@ enum TimeUpdate {
 const SUPPORTED_UNLINKAT_FLAGS: u32 = AT_REMOVEDIR;
 const GETDENTS64_MAX_BUFFER: usize = 16 * 1024;
 
+fn try_string(value: &str) -> AxResult<String> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| AxError::NoMemory)?;
+    owned.push_str(value);
+    Ok(owned)
+}
+
+fn warn_notification(context: &str, result: AxResult<()>) {
+    if let Err(error) = result {
+        warn!("{context} notification failed: {error}");
+    }
+}
+
 fn add_proc_namespace_fd(
     template: &Location,
     kind: ProcNamespaceKind,
@@ -70,7 +78,10 @@ fn add_proc_namespace_fd(
 ) -> AxResult<isize> {
     let loc = proc_namespace_location_from_object(template, kind, object)?;
     let file = axfs::File::new(FileBackend::Direct(loc), FileFlags::READ);
-    Ok(add_file_like(Arc::new(File::new(file)), false)? as isize)
+    Ok(add_file_like(
+        Arc::try_new(File::new(file)).map_err(|_| AxError::NoMemory)?,
+        false,
+    )? as isize)
 }
 
 fn visible_pid_namespace_parent(ns: &Arc<PidNamespace>) -> Option<Arc<PidNamespace>> {
@@ -180,55 +191,6 @@ fn proc_self_fd_number(path: &str) -> Option<AxResult<i32>> {
     Some(fd.parse::<i32>().map_err(|_| AxError::NotFound))
 }
 
-fn materialize_tmpfile_link(old: &Location, new_dir: &Location, new_name: &str) -> AxResult<()> {
-    if !Arc::ptr_eq(old.mountpoint(), new_dir.mountpoint()) {
-        return Err(AxError::CrossesDevices);
-    }
-
-    let metadata = old.metadata()?;
-    let new = new_dir.create(new_name, NodeType::RegularFile, metadata.mode)?;
-    let result = (|| {
-        new.update_supported_metadata(MetadataUpdate {
-            owner: Some((metadata.uid, metadata.gid)),
-            mode: Some(metadata.mode),
-            atime: Some(metadata.atime),
-            mtime: Some(metadata.mtime),
-            ..Default::default()
-        })?;
-
-        let old_file = old.entry().as_file()?;
-        let new_file = new.entry().as_file()?;
-        let mut offset = 0;
-        let mut buf = vec![0u8; 4096];
-
-        while offset < metadata.size {
-            let len = min(buf.len(), (metadata.size - offset) as usize);
-            let read = old_file.read_at(&mut buf[..len], offset)?;
-            if read == 0 {
-                break;
-            }
-
-            let mut written = 0;
-            while written < read {
-                let count = new_file.write_at(&buf[written..read], offset + written as u64)?;
-                if count == 0 {
-                    return Err(AxError::WriteZero);
-                }
-                written += count;
-            }
-
-            offset += read as u64;
-        }
-
-        Ok(())
-    })();
-
-    if result.is_err() {
-        let _ = new_dir.unlink(new_name, false);
-    }
-    result
-}
-
 fn check_empty_fd_metadata_access(dirfd: i32, path: Option<&str>, flags: u32) -> AxResult<()> {
     if matches!(path, None | Some("")) && flags & AT_EMPTY_PATH != 0 && is_path_only_fd(dirfd)? {
         return Err(AxError::BadFileDescriptor);
@@ -319,62 +281,37 @@ fn same_entry_at(
     Ok(old.inode() == new.inode() && Arc::ptr_eq(old.mountpoint(), new.mountpoint()))
 }
 
-fn exchange_rename_entries(
-    old_dir: &Location,
-    old_name: &str,
-    new_dir: &Location,
-    new_name: &str,
-) -> AxResult<()> {
-    if old_dir.ptr_eq(new_dir) && old_name == new_name {
-        return Ok(());
-    }
-
-    let curr = current();
-    let pid = curr.as_thread().proc_data.proc.pid();
-    for attempt in 0..64 {
-        let tmp_name = format!(".renameat2-exchange-{pid}-{attempt}");
-        match old_dir.lookup_no_follow(&tmp_name) {
-            Ok(_) => continue,
-            Err(AxError::NotFound) => {}
-            Err(err) => return Err(err),
-        }
-
-        old_dir.rename(old_name, old_dir, &tmp_name)?;
-        if let Err(err) = new_dir.rename(new_name, old_dir, old_name) {
-            let _ = old_dir.rename(&tmp_name, old_dir, old_name);
-            return Err(err);
-        }
-        if let Err(err) = old_dir.rename(&tmp_name, new_dir, new_name) {
-            return Err(err);
-        }
-        return Ok(());
-    }
-
-    Err(AxError::AlreadyExists)
-}
-
 fn path_from_root(loc: Location, root: &Location) -> AxResult<String> {
     if loc.ptr_eq(root) {
-        return Ok("/".to_string());
+        return try_string("/");
     }
 
-    let loc_path = loc.absolute_path()?.to_string();
+    let loc_path = try_string(loc.absolute_path()?.as_str())?;
     if root.is_root() {
         return Ok(loc_path);
     }
 
-    let root_path = root.absolute_path()?.to_string();
+    let root_path = try_string(root.absolute_path()?.as_str())?;
     if loc_path == root_path {
-        return Ok("/".to_string());
+        return try_string("/");
     }
 
     let prefix = if root_path == "/" {
-        "/".to_string()
+        try_string("/")?
     } else {
-        format!("{root_path}/")
+        let mut prefix = try_string(&root_path)?;
+        prefix.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        prefix.push('/');
+        prefix
     };
     let rest = loc_path.strip_prefix(&prefix).ok_or(AxError::NotFound)?;
-    Ok(format!("/{rest}"))
+    let mut result = String::new();
+    result
+        .try_reserve_exact(rest.len().checked_add(1).ok_or(AxError::NoMemory)?)
+        .map_err(|_| AxError::NoMemory)?;
+    result.push('/');
+    result.push_str(rest);
+    Ok(result)
 }
 
 /// The ioctl() system call manipulates the underlying device parameters
@@ -476,34 +413,44 @@ pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    let requested_mode = NodePermission::from_bits_truncate((mode & !proc_data.umask()) as u16);
+    let requested_mode = NodePermission::from_bits_truncate(mode as u16);
     let credentials = proc_data.fs_dac_credentials();
     let path_ref = Path::new(&path);
     let (parent, name) = with_path_fs(dirfd, path_ref, |fs| {
         let (parent, name) = fs.resolve_nonexistent_dac(path_ref, &credentials)?;
         check_create_permissions(&parent, &credentials)?;
-        Ok((parent, name.to_string()))
+        Ok((parent, try_string(name)?))
     })?;
     let parent_meta = parent.metadata()?;
-    let loc = parent.create(&name, NodeType::Directory, requested_mode)?;
-    let mut final_mode = requested_mode;
-    let mut owner_gid = proc_data.fsgid();
-    if parent_meta.mode.contains(NodePermission::SET_GID) {
-        owner_gid = parent_meta.gid;
-        final_mode.insert(NodePermission::SET_GID);
-    }
-    loc.update_supported_metadata(MetadataUpdate {
-        owner: Some((proc_data.fsuid(), owner_gid)),
-        mode: Some(final_mode),
-        ..Default::default()
-    })?;
-    let _ = crate::file::inotify::notify_parent_with_name(
-        &parent,
-        Some(&loc),
-        loc.name(),
-        IN_CREATE,
-        true,
-        0,
+    let (final_mode, owner) = initial_named_create_owner_mode(
+        &parent_meta,
+        &credentials,
+        NodeType::Directory,
+        requested_mode,
+        proc_data.umask(),
+    );
+    let loc = parent
+        .create_named(
+            &name,
+            &NamedCreateOptions {
+                node_type: NodeType::Directory,
+                permission: final_mode,
+                owner: Some(owner),
+                rdev: None,
+            },
+            CreateDisposition::Exclusive,
+        )?
+        .entry;
+    warn_notification(
+        "mkdir create",
+        crate::file::inotify::notify_parent_with_name(
+            &parent,
+            Some(&loc),
+            loc.name(),
+            IN_CREATE,
+            true,
+            0,
+        ),
     );
     Ok(0)
 }
@@ -526,43 +473,51 @@ pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, dev: u64) -> AxRe
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     if matches!(node_type, NodeType::CharacterDevice | NodeType::BlockDevice)
-        && proc_data.euid() != 0
+        && !proc_data.has_effective_capability(CAP_MKNOD)
     {
         return Err(AxError::OperationNotPermitted);
     }
 
-    let requested_mode = NodePermission::from_bits_truncate((mode & !proc_data.umask()) as u16);
+    let requested_mode = NodePermission::from_bits_truncate(mode as u16);
     let credentials = proc_data.fs_dac_credentials();
     let (parent, name) = with_path_fs(dirfd, path_ref, |fs| {
         let (parent, name) = fs.resolve_nonexistent_dac(path_ref, &credentials)?;
         check_create_permissions(&parent, &credentials)?;
-        Ok((parent, name.to_string()))
+        Ok((parent, try_string(name)?))
     })?;
 
-    let loc = parent.create(&name, node_type, requested_mode)?;
-    let mut final_mode = requested_mode;
-    let mut owner_gid = proc_data.fsgid();
     let parent_meta = parent.metadata()?;
-    if parent_meta.mode.contains(NodePermission::SET_GID) {
-        owner_gid = parent_meta.gid;
-    }
-    if proc_data.fsuid() != 0 && !proc_data.is_in_fs_group(owner_gid) {
-        final_mode.remove(NodePermission::SET_GID);
-    }
-    loc.update_supported_metadata(MetadataUpdate {
-        owner: Some((proc_data.fsuid(), owner_gid)),
-        mode: Some(final_mode),
-        rdev: matches!(node_type, NodeType::CharacterDevice | NodeType::BlockDevice)
-            .then_some(DeviceId(dev)),
-        ..Default::default()
-    })?;
-    let _ = crate::file::inotify::notify_parent_with_name(
-        &parent,
-        Some(&loc),
-        &name,
-        IN_CREATE,
-        false,
-        0,
+    let (final_mode, owner) = initial_named_create_owner_mode(
+        &parent_meta,
+        &credentials,
+        node_type,
+        requested_mode,
+        proc_data.umask(),
+    );
+    let rdev = matches!(node_type, NodeType::CharacterDevice | NodeType::BlockDevice)
+        .then_some(DeviceId(dev));
+    let loc = parent
+        .create_named(
+            &name,
+            &NamedCreateOptions {
+                node_type,
+                permission: final_mode,
+                owner: Some(owner),
+                rdev,
+            },
+            CreateDisposition::Exclusive,
+        )?
+        .entry;
+    warn_notification(
+        "mknod create",
+        crate::file::inotify::notify_parent_with_name(
+            &parent,
+            Some(&loc),
+            &name,
+            IN_CREATE,
+            false,
+            0,
+        ),
     );
     Ok(0)
 }
@@ -574,12 +529,12 @@ struct DirBuffer {
 }
 
 impl DirBuffer {
-    fn new(len: usize) -> Self {
+    fn try_new(len: usize) -> AxResult<Self> {
         let len = len.min(GETDENTS64_MAX_BUFFER);
-        Self {
-            buf: vec![0; len],
-            offset: 0,
-        }
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(len).map_err(|_| AxError::NoMemory)?;
+        buf.resize(len, 0);
+        Ok(Self { buf, offset: 0 })
     }
 
     fn remaining_space(&self) -> usize {
@@ -625,7 +580,7 @@ pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
         return Err(AxError::NotFound);
     }
 
-    let mut buffer = DirBuffer::new(len);
+    let mut buffer = DirBuffer::try_new(len)?;
     let mut dir_offset = dir.offset.lock();
 
     let mut has_remaining = false;
@@ -667,7 +622,7 @@ pub fn sys_linkat(
     new_path: *const c_char,
     flags: u32,
 ) -> AxResult<isize> {
-    let old_path = old_path.nullable().map(vm_load_string).transpose()?;
+    let old_path = vm_load_string(old_path)?;
     let new_path = vm_load_string(new_path)?;
     debug!(
         "sys_linkat <= old_dirfd: {old_dirfd}, old_path: {old_path:?}, new_dirfd: {new_dirfd}, \
@@ -685,17 +640,27 @@ pub fn sys_linkat(
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let credentials = proc_data.fs_dac_credentials();
-    let old = match old_path.as_deref() {
-        Some(path) if flags & AT_SYMLINK_FOLLOW != 0 => proc_self_fd_location(path)
-            .unwrap_or_else(|| {
+    if old_path.is_empty()
+        && (flags & AT_EMPTY_PATH == 0 || !credentials.has_capability(CAP_DAC_READ_SEARCH))
+    {
+        return Err(AxError::NotFound);
+    }
+    if !old_path.is_empty() {
+        validate_pathname(Path::new(&old_path))?;
+    }
+
+    let old = match old_path.as_str() {
+        path if flags & AT_SYMLINK_FOLLOW != 0 => {
+            proc_self_fd_location(path).unwrap_or_else(|| {
                 resolve_at_with_credentials(old_dirfd, Some(path), flags, &credentials)?
                     .into_file()
                     .ok_or(AxError::BadFileDescriptor)
-            })?,
-        Some(path) if !path.is_empty() => with_path_fs(old_dirfd, Path::new(path), |fs| {
+            })?
+        }
+        path if !path.is_empty() => with_path_fs(old_dirfd, Path::new(path), |fs| {
             fs.resolve_no_follow_dac(path, &credentials)
         })?,
-        _ => resolve_at_with_credentials(old_dirfd, old_path.as_deref(), flags, &credentials)?
+        _ => resolve_at_with_credentials(old_dirfd, Some(&old_path), flags, &credentials)?
             .into_file()
             .ok_or(AxError::BadFileDescriptor)?,
     };
@@ -711,21 +676,18 @@ pub fn sys_linkat(
     if old.is_dir() {
         return Err(AxError::OperationNotPermitted);
     }
-    if has_tmpfile_state(&old) && old.filesystem().name() != "tmpfs" {
-        materialize_tmpfile_link(&old, &new_dir, new_name)?;
-    } else {
-        new_dir.link(new_name, &old)?;
-    }
-    if let Ok(loc) = new_dir.lookup_no_follow(new_name) {
-        let _ = crate::file::inotify::notify_parent_with_name(
+    let linked = new_dir.link(new_name, &old)?;
+    warn_notification(
+        "link create",
+        crate::file::inotify::notify_parent_with_name(
             &new_dir,
-            Some(&loc),
+            Some(&linked),
             new_name,
             IN_CREATE,
-            loc.is_dir(),
+            linked.is_dir(),
             0,
-        );
-    }
+        ),
+    );
     Ok(0)
 }
 
@@ -749,6 +711,7 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
         return Err(AxError::NotFound);
     }
     validate_pathname(path_ref)?;
+    let _mount_operation = mounts::namespace_operation();
 
     debug!("sys_unlinkat <= dirfd: {dirfd}, path: {path:?}, flags: {flags}");
 
@@ -758,7 +721,7 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
     let (parent_hint, name_hint) = with_path_fs(dirfd, path_ref, |fs| {
         let (parent, name) = fs.resolve_nonexistent_dac(path_ref, &credentials)?;
         check_writable_mount(&parent)?;
-        Ok((parent, name.to_string()))
+        Ok((parent, try_string(name)?))
     })?;
     let loc = parent_hint.lookup_no_follow(&name_hint)?;
     let parent = parent_hint;
@@ -770,18 +733,27 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
     if !is_dir && last_link {
         axfs::mark_cached_file_unlinked(&loc);
     }
-    let _ = crate::file::inotify::notify_parent_with_name(
-        &parent,
-        Some(&loc),
-        &name,
-        IN_DELETE,
-        is_dir,
-        0,
+    warn_notification(
+        "unlink parent",
+        crate::file::inotify::notify_parent_with_name(
+            &parent,
+            Some(&loc),
+            &name,
+            IN_DELETE,
+            is_dir,
+            0,
+        ),
     );
     if !is_dir && last_link {
-        let _ = crate::file::inotify::notify_exact(&loc, IN_ATTRIB);
+        warn_notification(
+            "unlink attribute",
+            crate::file::inotify::notify_exact(&loc, IN_ATTRIB),
+        );
     }
-    let _ = crate::file::inotify::notify_exact(&loc, IN_DELETE_SELF);
+    warn_notification(
+        "unlink self",
+        crate::file::inotify::notify_exact(&loc, IN_DELETE_SELF),
+    );
     Ok(0)
 }
 
@@ -843,18 +815,30 @@ pub fn sys_symlinkat(
     let loc = with_path_fs(new_dirfd, linkpath_ref, |fs| {
         let (parent, name) = fs.resolve_nonexistent_dac(linkpath_ref, &credentials)?;
         check_create_permissions(&parent, &credentials)?;
-        let loc = parent.create(name, NodeType::Symlink, NodePermission::default())?;
-        loc.entry().as_file()?.set_symlink(&target)?;
-        Ok(loc)
+        let parent_metadata = parent.metadata()?;
+        let owner_gid = if parent_metadata.mode.contains(NodePermission::SET_GID) {
+            parent_metadata.gid
+        } else {
+            credentials.gid()
+        };
+        parent.create_symlink(
+            name,
+            &target,
+            NodePermission::from_bits_truncate(0o777),
+            Some((credentials.uid(), owner_gid)),
+        )
     })?;
     if let Some(parent) = loc.parent() {
-        let _ = crate::file::inotify::notify_parent_with_name(
-            &parent,
-            Some(&loc),
-            loc.name(),
-            IN_CREATE,
-            loc.is_dir(),
-            0,
+        warn_notification(
+            "symlink create",
+            crate::file::inotify::notify_parent_with_name(
+                &parent,
+                Some(&loc),
+                loc.name(),
+                IN_CREATE,
+                loc.is_dir(),
+                0,
+            ),
         );
     }
     Ok(0)
@@ -957,8 +941,14 @@ pub fn sys_fchownat(
         mode: Some(mode),
         ..Default::default()
     })?;
-    let _ = crate::file::inotify::notify_parent(&loc, IN_ATTRIB);
-    let _ = crate::file::inotify::notify_exact(&loc, IN_ATTRIB);
+    warn_notification(
+        "chown parent",
+        crate::file::inotify::notify_parent(&loc, IN_ATTRIB),
+    );
+    warn_notification(
+        "chown self",
+        crate::file::inotify::notify_exact(&loc, IN_ATTRIB),
+    );
     Ok(0)
 }
 
@@ -1000,8 +990,14 @@ pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> A
         mode: Some(mode),
         ..Default::default()
     })?;
-    let _ = crate::file::inotify::notify_parent(&loc, IN_ATTRIB);
-    let _ = crate::file::inotify::notify_exact(&loc, IN_ATTRIB);
+    warn_notification(
+        "chmod parent",
+        crate::file::inotify::notify_parent(&loc, IN_ATTRIB),
+    );
+    warn_notification(
+        "chmod self",
+        crate::file::inotify::notify_exact(&loc, IN_ATTRIB),
+    );
     Ok(0)
 }
 
@@ -1173,14 +1169,15 @@ pub fn sys_renameat2(
     if flags & RENAME_EXCHANGE != 0 && flags & (RENAME_NOREPLACE | RENAME_WHITEOUT) != 0 {
         return Err(AxError::InvalidInput);
     }
-    if flags & RENAME_WHITEOUT != 0 {
-        return Err(AxError::Unsupported);
+    if flags & (RENAME_EXCHANGE | RENAME_WHITEOUT) != 0 {
+        return Err(AxError::OperationNotSupported);
     }
     if old_path.is_empty() || new_path.is_empty() {
         return Err(AxError::NotFound);
     }
     validate_pathname(old_path_ref)?;
     validate_pathname(new_path_ref)?;
+    let _mount_operation = mounts::namespace_operation();
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
@@ -1235,14 +1232,6 @@ pub fn sys_renameat2(
         return Err(AxError::AlreadyExists);
     }
 
-    if flags & RENAME_EXCHANGE != 0 {
-        let new_loc = new_existing.as_ref().ok_or(AxError::NotFound)?;
-        check_rename_permissions(&old_dir, &old_loc, &new_dir, Some(new_loc), &credentials)?;
-        check_rename_permissions(&new_dir, new_loc, &old_dir, Some(&old_loc), &credentials)?;
-        exchange_rename_entries(&old_dir, &old_name, &new_dir, &new_name)?;
-        return Ok(0);
-    }
-
     if let Some(existing) = new_existing.as_ref() {
         match (old_is_dir, existing.is_dir()) {
             (true, false) => return Err(AxError::NotADirectory),
@@ -1250,6 +1239,10 @@ pub fn sys_renameat2(
             _ => {}
         }
     }
+    let replaced_cached_file_loses_last_link = match new_existing.as_ref() {
+        Some(existing) if existing.is_file() => existing.metadata()?.nlink == 1,
+        _ => false,
+    };
 
     check_rename_permissions(
         &old_dir,
@@ -1260,25 +1253,40 @@ pub fn sys_renameat2(
     )?;
 
     old_dir.rename(&old_name, &new_dir, &new_name)?;
+    if replaced_cached_file_loses_last_link && let Some(replaced) = new_existing.as_ref() {
+        axfs::mark_cached_file_unlinked(replaced);
+    }
     let cookie = crate::file::inotify::next_rename_cookie();
-    let _ = crate::file::inotify::notify_parent_with_name(
-        &old_dir,
-        Some(&old_loc),
-        &old_name,
-        IN_MOVED_FROM,
-        old_is_dir,
-        cookie,
+    warn_notification(
+        "rename source",
+        crate::file::inotify::notify_parent_with_name(
+            &old_dir,
+            Some(&old_loc),
+            &old_name,
+            IN_MOVED_FROM,
+            old_is_dir,
+            cookie,
+        ),
     );
-    let _ = crate::file::inotify::notify_parent_with_name(
-        &new_dir,
-        Some(&old_loc),
-        &new_name,
-        IN_MOVED_TO,
-        old_is_dir,
-        cookie,
+    warn_notification(
+        "rename destination",
+        crate::file::inotify::notify_parent_with_name(
+            &new_dir,
+            Some(&old_loc),
+            &new_name,
+            IN_MOVED_TO,
+            old_is_dir,
+            cookie,
+        ),
     );
-    let _ = crate::file::inotify::notify_exact(&old_loc, IN_MOVE_SELF);
-    let _ = crate::file::inotify::notify_dnotify_rename(&old_dir, &new_dir);
+    warn_notification(
+        "rename self",
+        crate::file::inotify::notify_exact(&old_loc, IN_MOVE_SELF),
+    );
+    warn_notification(
+        "rename dnotify",
+        crate::file::inotify::notify_dnotify_rename(&old_dir, &new_dir),
+    );
     Ok(0)
 }
 

@@ -1,6 +1,7 @@
-use alloc::vec;
+use alloc::{vec, vec::Vec};
 use core::task::Waker;
 
+use axerrno::{AxError, AxResult};
 use axpoll::PollSet;
 use smoltcp::{
     storage::{PacketBuffer, PacketMetadata},
@@ -20,15 +21,26 @@ pub struct LoopbackDevice {
 }
 impl LoopbackDevice {
     pub fn new() -> Self {
-        let buffer = PacketBuffer::new(
-            vec![PacketMetadata::EMPTY; PACKET_QUEUE_LEN],
-            vec![0u8; LOOPBACK_MTU * PACKET_QUEUE_LEN],
-        );
-        Self {
+        Self::try_new().expect("failed to allocate loopback packet queue")
+    }
+
+    pub fn try_new() -> AxResult<Self> {
+        let mut metadata = Vec::new();
+        metadata
+            .try_reserve_exact(PACKET_QUEUE_LEN)
+            .map_err(|_| AxError::NoMemory)?;
+        metadata.resize(PACKET_QUEUE_LEN, PacketMetadata::EMPTY);
+        let mut storage = Vec::new();
+        storage
+            .try_reserve_exact(LOOPBACK_MTU * PACKET_QUEUE_LEN)
+            .map_err(|_| AxError::NoMemory)?;
+        storage.resize(LOOPBACK_MTU * PACKET_QUEUE_LEN, 0);
+        let buffer = PacketBuffer::new(metadata, storage);
+        Ok(Self {
             buffer,
             poll: PollSet::new(),
             stats: DeviceStats::default(),
-        }
+        })
     }
 }
 

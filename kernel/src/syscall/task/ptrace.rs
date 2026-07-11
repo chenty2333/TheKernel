@@ -66,7 +66,7 @@ fn parse_signal(data: usize) -> AxResult<Option<SignalInfo>> {
 }
 
 fn interrupt_process_threads(target: &ProcessData) {
-    for tid in target.proc.threads() {
+    for tid in target.proc.thread_ids() {
         if let Ok(task) = get_task(tid) {
             task.interrupt();
         }

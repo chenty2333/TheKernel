@@ -1,14 +1,14 @@
 use alloc::sync::Arc;
 use core::task::Context;
 
-use axerrno::{AxError, AxResult, ax_bail, ax_err_type};
+use axerrno::{AxError, AxResult, LinuxError, ax_bail, ax_err_type};
 use axio::prelude::*;
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
 
 use super::connection_manager::*;
 use crate::{
-    RecvFlags, RecvOptions, SendOptions, Shutdown,
+    RecvFlags, RecvOptions, SendFlags, SendOptions, Shutdown,
     device::*,
     general::GeneralOptions,
     options::{Configurable, GetSocketOption, SetSocketOption},
@@ -61,6 +61,10 @@ impl Configurable for VsockStreamTransport {
 }
 
 impl VsockTransportOps for VsockStreamTransport {
+    fn set_pending_error(&self, error: LinuxError) {
+        self.general.set_pending_error(error);
+    }
+
     fn bind(&self, mut local_addr: VsockAddr) -> AxResult<()> {
         self.state
             .lock(State::Idle)
@@ -193,7 +197,7 @@ impl VsockTransportOps for VsockStreamTransport {
         })?;
 
         // wait for connection established
-        self.general.send_poller(self, || {
+        self.general.connect_poller(self, || {
             let conn = self.get_connection()?;
             let state = conn.lock().state();
             match state {
@@ -204,7 +208,12 @@ impl VsockTransportOps for VsockStreamTransport {
         })
     }
 
-    fn send(&self, mut src: impl Read + IoBuf, _options: SendOptions) -> AxResult<usize> {
+    fn send(&self, mut src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {
+        if !options.cmsg.is_empty() {
+            return Err(AxError::OperationNotSupported);
+        }
+        self.general.consume_pending_error()?;
+        let per_call_nonblocking = options.flags.contains(SendFlags::DONT_WAIT);
         let conn = self.get_connection()?;
         let conn_guard = conn.lock();
 
@@ -220,6 +229,11 @@ impl VsockTransportOps for VsockStreamTransport {
         drop(conn_guard);
 
         // now virtio-driver only support non-blocking send
+        if per_call_nonblocking {
+            // The current virtio-vsock transport is already nonblocking per
+            // operation; retaining the flag here documents that no wait is
+            // introduced below.
+        }
         let result = src.write_to(&mut axio::write_fn(|buf| vsock_send(conn_id, buf)));
         conn.lock().add_tx_bytes(result.unwrap_or(0));
         result
@@ -228,47 +242,49 @@ impl VsockTransportOps for VsockStreamTransport {
     fn recv(&self, mut dst: impl Write, options: RecvOptions) -> AxResult<usize> {
         let conn = self.get_connection()?;
 
-        self.general.recv_poller(self, || {
-            let mut conn_guard = conn.lock();
+        let per_call_nonblocking = options.flags.contains(RecvFlags::DONT_WAIT);
+        self.general
+            .recv_poller_with_nonblocking(self, per_call_nonblocking, || {
+                let mut conn_guard = conn.lock();
 
-            if conn_guard.rx_closed() && conn_guard.rx_buffer_used() == 0 {
-                return Ok(0); // EOF
-            }
+                if conn_guard.rx_closed() && conn_guard.rx_buffer_used() == 0 {
+                    return Ok(0); // EOF
+                }
 
-            // should allow read when connection is closed, to read remaining data
-            if !matches!(
-                conn_guard.state(),
-                ConnectionState::Connected | ConnectionState::Closed
-            ) {
-                return Err(AxError::NotConnected);
-            }
+                // should allow read when connection is closed, to read remaining data
+                if !matches!(
+                    conn_guard.state(),
+                    ConnectionState::Connected | ConnectionState::Closed
+                ) {
+                    return Err(AxError::NotConnected);
+                }
 
-            if conn_guard.rx_buffer_used() == 0 {
-                return Err(AxError::WouldBlock);
-            }
+                if conn_guard.rx_buffer_used() == 0 {
+                    return Err(AxError::WouldBlock);
+                }
 
-            let (left, right) = conn_guard.rx_slices();
-            let mut count = dst.write(left)?;
+                let (left, right) = conn_guard.rx_slices();
+                let mut count = dst.write(left)?;
 
-            if count >= left.len() && !right.is_empty() {
-                count += dst.write(right)?;
-            }
-            if !options.flags.contains(RecvFlags::PEEK) {
-                conn_guard.advance_rx_read(count);
-            }
+                if count >= left.len() && !right.is_empty() {
+                    count += dst.write(right)?;
+                }
+                if !options.flags.contains(RecvFlags::PEEK) {
+                    conn_guard.advance_rx_read(count);
+                }
 
-            if count > 0 {
-                trace!(
-                    "Recv {} bytes from connection (buffer_remaining={}/{})",
-                    count,
-                    conn_guard.rx_buffer_used(),
-                    VSOCK_RX_BUFFER_SIZE
-                );
-                Ok(count)
-            } else {
-                Err(AxError::WouldBlock)
-            }
-        })
+                if count > 0 {
+                    trace!(
+                        "Recv {} bytes from connection (buffer_remaining={}/{})",
+                        count,
+                        conn_guard.rx_buffer_used(),
+                        VSOCK_RX_BUFFER_SIZE
+                    );
+                    Ok(count)
+                } else {
+                    Err(AxError::WouldBlock)
+                }
+            })
     }
 
     fn shutdown(&self, how: Shutdown) -> AxResult<()> {
@@ -312,7 +328,7 @@ impl VsockTransportOps for VsockStreamTransport {
 impl Pollable for VsockStreamTransport {
     fn poll(&self) -> IoEvents {
         let Ok(conn) = self.get_connection() else {
-            return IoEvents::empty();
+            return self.general.add_pending_error_event(IoEvents::empty());
         };
 
         let conn = conn.lock();
@@ -339,7 +355,7 @@ impl Pollable for VsockStreamTransport {
             _ => {}
         }
         events.set(IoEvents::RDHUP, conn.rx_closed());
-        events
+        self.general.add_pending_error_event(events)
     }
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {

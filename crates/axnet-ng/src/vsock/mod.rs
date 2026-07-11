@@ -7,7 +7,7 @@ use alloc::sync::Arc;
 use core::task::Context;
 
 pub use axdriver::prelude::{VsockAddr, VsockConnId};
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axio::{IoBuf, IoBufMut, Read, Write};
 use axpoll::{IoEvents, Pollable};
 use enum_dispatch::enum_dispatch;
@@ -21,6 +21,8 @@ use crate::{
 /// Abstract transport trait for vsock.
 #[enum_dispatch]
 pub trait VsockTransportOps: Configurable + Pollable + Send + Sync {
+    /// Stores a deferred socket error.
+    fn set_pending_error(&self, error: LinuxError);
     /// Bind the transport to a local address.
     fn bind(&self, local_addr: VsockAddr) -> AxResult;
     /// Start listening for incoming connections.
@@ -80,6 +82,10 @@ impl VsockSocket {
 
     pub fn set_filter(&self, _filter: Option<Arc<dyn crate::SocketFilter>>) -> AxResult<()> {
         Err(AxError::Unsupported)
+    }
+
+    pub(crate) fn set_pending_error(&self, error: LinuxError) {
+        self.transport.set_pending_error(error);
     }
 }
 

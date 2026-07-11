@@ -1,9 +1,10 @@
-use alloc::{collections::BTreeMap, string::String, vec::Vec};
+use alloc::{string::String, vec::Vec};
 use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::{Location, NodeType, path::Path};
 use axtask::current;
+use hashbrown::HashMap;
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, CAP_SYS_ADMIN};
 use starry_vm::vm_write_slice;
 
@@ -125,7 +126,7 @@ fn list_name_visible(loc: &Location, name: &str, can_access_trusted: bool) -> bo
 }
 
 fn set_map_xattr(
-    map: &mut BTreeMap<String, Vec<u8>>,
+    map: &mut HashMap<String, Vec<u8>>,
     name: &str,
     value: Vec<u8>,
     flags: u32,
@@ -155,22 +156,45 @@ fn set_map_xattr(
         return Err(LinuxError::ENOSPC.into());
     }
 
-    map.insert(name.into(), value);
+    if let Some(current) = map.get_mut(name) {
+        *current = value;
+        return Ok(());
+    }
+    let mut owned_name = String::new();
+    owned_name
+        .try_reserve_exact(name.len())
+        .map_err(|_| AxError::NoMemory)?;
+    owned_name.push_str(name);
+    map.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+    map.insert(owned_name, value);
     Ok(())
 }
 
-fn get_map_xattr(map: &BTreeMap<String, Vec<u8>>, name: &str) -> AxResult<Vec<u8>> {
-    map.get(name)
-        .cloned()
-        .ok_or_else(|| LinuxError::ENODATA.into())
+fn get_map_xattr(map: &HashMap<String, Vec<u8>>, name: &str) -> AxResult<Vec<u8>> {
+    let value = map.get(name).ok_or(LinuxError::ENODATA)?;
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(value.len())
+        .map_err(|_| AxError::NoMemory)?;
+    result.extend_from_slice(value);
+    Ok(result)
 }
 
 fn list_map_xattrs(
     loc: &Location,
-    map: &BTreeMap<String, Vec<u8>>,
+    map: &HashMap<String, Vec<u8>>,
     can_access_trusted: bool,
-) -> Vec<u8> {
+) -> AxResult<Vec<u8>> {
+    let required = map
+        .keys()
+        .filter(|name| list_name_visible(loc, name, can_access_trusted))
+        .try_fold(0usize, |total, name| {
+            total.checked_add(name.len().saturating_add(1))
+        })
+        .ok_or(AxError::NoMemory)?;
     let mut list = Vec::new();
+    list.try_reserve_exact(required)
+        .map_err(|_| AxError::NoMemory)?;
     for name in map.keys() {
         if !list_name_visible(loc, name, can_access_trusted) {
             continue;
@@ -178,7 +202,7 @@ fn list_map_xattrs(
         list.extend_from_slice(name.as_bytes());
         list.push(0);
     }
-    list
+    Ok(list)
 }
 
 fn set_location_xattr(loc: &Location, name: &str, value: Vec<u8>, flags: u32) -> AxResult<()> {
@@ -209,7 +233,7 @@ fn list_location_xattrs(loc: &Location) -> AxResult<Vec<u8>> {
 
     if let Some(store) = tmp::xattr_store(loc) {
         let map = store.lock();
-        return Ok(list_map_xattrs(loc, &map, can_access_trusted));
+        return list_map_xattrs(loc, &map, can_access_trusted);
     }
 
     Err(LinuxError::EOPNOTSUPP.into())

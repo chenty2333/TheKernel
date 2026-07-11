@@ -1,19 +1,20 @@
-use alloc::collections::BTreeMap;
 use core::{future::poll_fn, task::Poll, time::Duration};
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axfs::FileFlags;
 use axfs_ng_vfs::{Location, NodeType};
 use axhal::time::wall_time;
 use axpoll::PollSet;
+use axsync::Mutex;
 use axtask::{
     current,
     future::{block_on, interruptible, timeout_at},
 };
+use hashbrown::HashMap;
+use lazy_static::lazy_static;
 use linux_raw_sys::general::{
     CAP_LEASE, F_RDLCK, F_UNLCK, F_WRLCK, O_ACCMODE, O_PATH, O_RDONLY, O_TRUNC, O_WRONLY,
 };
-use spin::Mutex;
 use starry_signal::{SignalInfo, Signo};
 
 use super::{FD_TABLE, File};
@@ -44,17 +45,22 @@ struct LeaseState {
 }
 
 struct LeaseTable {
-    leases: BTreeMap<InodeId, LeaseState>,
-    waiters: PollSet,
+    leases: HashMap<InodeId, LeaseState>,
+    owners: HashMap<LeaseOwner, InodeId>,
 }
+
+const MAX_LEASES: usize = 65_536;
 
 static LEASE_BREAK_TIME_SECS: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(DEFAULT_LEASE_BREAK_TIME_SECS);
 
-static LEASE_TABLE: Mutex<LeaseTable> = Mutex::new(LeaseTable {
-    leases: BTreeMap::new(),
-    waiters: PollSet::new(),
-});
+lazy_static! {
+    static ref LEASE_TABLE: Mutex<LeaseTable> = Mutex::new(LeaseTable {
+        leases: HashMap::new(),
+        owners: HashMap::new(),
+    });
+}
+static LEASE_WAITERS: PollSet = PollSet::new();
 
 fn lease_id(loc: &Location) -> InodeId {
     (loc.mountpoint().device(), loc.inode())
@@ -157,10 +163,18 @@ fn conflict_cleared(id: InodeId, breaker_pid: u32, conflict: ConflictType) -> bo
 }
 
 fn force_break_lease(id: InodeId) {
-    let mut table = LEASE_TABLE.lock();
-    if table.leases.remove(&id).is_some() {
-        table.waiters.wake();
+    let removed = {
+        let mut table = LEASE_TABLE.lock();
+        let removed = table.leases.remove(&id);
+        if let Some(state) = removed.as_ref() {
+            table.owners.remove(&state.owner);
+        }
+        removed
+    };
+    if removed.is_some() {
+        LEASE_WAITERS.wake();
     }
+    drop(removed);
 }
 
 fn wait_for_conflict(id: InodeId, conflict: ConflictType) -> AxResult<()> {
@@ -177,7 +191,7 @@ fn wait_for_conflict(id: InodeId, conflict: ConflictType) -> AxResult<()> {
             if conflict_cleared(id, breaker_pid, conflict) {
                 Poll::Ready(())
             } else {
-                LEASE_TABLE.lock().waiters.register(cx.waker());
+                LEASE_WAITERS.register(cx.waker());
                 if conflict_cleared(id, breaker_pid, conflict) {
                     Poll::Ready(())
                 } else {
@@ -240,21 +254,26 @@ pub(crate) fn set_lease(file: &File, owner: LeaseOwner, arg: i32) -> AxResult<()
 
     let id = lease_id(loc);
     let holder_pid = current_pid();
-    let mut table = LEASE_TABLE.lock();
-
-    match arg as u32 {
-        F_UNLCK => {
-            let removed = table
+    if arg as u32 == F_UNLCK {
+        let removed = {
+            let mut table = LEASE_TABLE.lock();
+            let removed = if table
                 .leases
                 .get(&id)
                 .is_some_and(|state| state.owner == owner)
-                && table.leases.remove(&id).is_some();
-            if removed {
-                table.waiters.wake();
-            }
-            return Ok(());
+            {
+                table.owners.remove(&owner);
+                table.leases.remove(&id)
+            } else {
+                None
+            };
+            removed
+        };
+        if removed.is_some() {
+            LEASE_WAITERS.wake();
         }
-        _ => {}
+        drop(removed);
+        return Ok(());
     }
 
     let lease_type = lease_from_cmd(arg)?;
@@ -265,6 +284,8 @@ pub(crate) fn set_lease(file: &File, owner: LeaseOwner, arg: i32) -> AxResult<()
     if matches!(lease_type, LeaseType::Write) && count_open_fds_for_location(loc) > 1 {
         return Err(AxError::WouldBlock);
     }
+
+    let mut table = LEASE_TABLE.lock();
 
     if let Some(existing) = table.leases.get(&id) {
         if existing.owner != owner {
@@ -278,17 +299,34 @@ pub(crate) fn set_lease(file: &File, owner: LeaseOwner, arg: i32) -> AxResult<()
         }
     }
 
-    let state = table.leases.entry(id).or_insert(LeaseState {
-        owner,
-        holder_pid,
-        lease_type,
-        breaking: None,
-    });
-    state.owner = owner;
-    state.holder_pid = holder_pid;
-    state.lease_type = lease_type;
-    clear_breaking_if_compatible(state);
-    table.waiters.wake();
+    if !table.leases.contains_key(&id) {
+        if table.leases.len() >= MAX_LEASES {
+            return Err(LinuxError::ENOLCK.into());
+        }
+        if table.owners.contains_key(&owner) {
+            return Err(AxError::BadState);
+        }
+        table.leases.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        table.owners.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        table.owners.insert(owner, id);
+        table.leases.insert(
+            id,
+            LeaseState {
+                owner,
+                holder_pid,
+                lease_type,
+                breaking: None,
+            },
+        );
+    } else {
+        let state = table.leases.get_mut(&id).ok_or(AxError::BadState)?;
+        state.owner = owner;
+        state.holder_pid = holder_pid;
+        state.lease_type = lease_type;
+        clear_breaking_if_compatible(state);
+    }
+    drop(table);
+    LEASE_WAITERS.wake();
     Ok(())
 }
 
@@ -310,13 +348,25 @@ pub(crate) fn get_lease(file: &File) -> i32 {
 }
 
 pub(crate) fn release_owner(owner: LeaseOwner) {
-    let mut table = LEASE_TABLE.lock();
-    let before = table.leases.len();
-    table.leases.retain(|_, state| state.owner != owner);
-    let removed = table.leases.len() != before;
-    if removed {
-        table.waiters.wake();
+    let removed = {
+        let mut table = LEASE_TABLE.lock();
+        let Some(id) = table.owners.remove(&owner) else {
+            return;
+        };
+        match table.leases.remove(&id) {
+            Some(state) if state.owner == owner => Some(state),
+            Some(state) => {
+                table.leases.insert(id, state);
+                table.owners.insert(owner, id);
+                None
+            }
+            None => None,
+        }
+    };
+    if removed.is_some() {
+        LEASE_WAITERS.wake();
     }
+    drop(removed);
 }
 
 pub(crate) fn formatted_lease_break_time() -> alloc::string::String {

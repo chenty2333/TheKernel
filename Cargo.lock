@@ -549,13 +549,13 @@ dependencies = [
  "bitflags 2.11.0",
  "cfg-if",
  "chrono",
+ "hashbrown",
  "intrusive-collections",
  "kspin",
  "log",
  "lru",
  "lwext4_rust",
  "scope-local",
- "slab",
  "spin 0.10.0",
  "starry-fatfs",
 ]
@@ -902,12 +902,10 @@ dependencies = [
 [[package]]
 name = "axpoll"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36b92f85c6903350f5146216ccb7d7a7e7b4dbd6f5927a1279db03ba52a53ae7"
 dependencies = [
  "bitflags 2.11.0",
+ "kspin",
  "linux-raw-sys",
- "spin 0.10.0",
 ]
 
 [[package]]
@@ -943,6 +941,7 @@ dependencies = [
 name = "axsched"
 version = "0.3.1"
 dependencies = [
+ "intrusive-collections",
  "linked_list_r4l",
 ]
 
@@ -2122,6 +2121,7 @@ name = "lwext4_rust"
 version = "0.2.0"
 dependencies = [
  "bindgen",
+ "hashbrown",
  "log",
 ]
 
@@ -2827,8 +2827,6 @@ checksum = "e6e36312fb5ddc10d08ecdc65187402baba4ac34585cb9d1b78522ae2358d890"
 [[package]]
 name = "scope-local"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c80f3dd0611957c9384d8e5b076236a265e873b41dcae7ccc5d1ba4fe58e32ae"
 dependencies = [
  "percpu",
  "spin 0.10.0",
@@ -3103,9 +3101,10 @@ dependencies = [
 name = "starry-process"
 version = "0.2.0"
 dependencies = [
+ "intrusive-collections",
  "kspin",
  "lazyinit",
- "weak-map",
+ "spin 0.10.0",
 ]
 
 [[package]]

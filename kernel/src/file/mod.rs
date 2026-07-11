@@ -1,6 +1,7 @@
 pub(crate) mod af_alg;
 #[cfg(feature = "bpf")]
 pub mod bpf;
+pub(crate) mod dnotify;
 pub mod epoll;
 pub mod event;
 pub(crate) mod executable;
@@ -43,6 +44,6 @@ pub use self::{
     types::*,
 };
 pub(crate) use self::{
-    fs::{allowed_write_len, check_resize_limit, has_tmpfile_state, install_tmpfile_state},
+    fs::{allowed_write_len, check_resize_limit},
     metadata::{PseudoInode, anon_inode_stat},
 };

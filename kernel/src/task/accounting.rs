@@ -180,14 +180,14 @@ impl AtomicTaskUsage {
 }
 
 pub(crate) fn live_process_usage(proc_data: &super::ProcessData) -> TaskUsage {
-    proc_data.proc.threads().into_iter().fold(
-        proc_data.exited_threads_usage.snapshot(),
-        |acc, tid| {
+    proc_data
+        .proc
+        .thread_ids()
+        .fold(proc_data.exited_threads_usage.snapshot(), |acc, tid| {
             if let Ok(task) = get_task(tid) {
                 acc.saturating_add(TaskUsage::from_thread(task.as_thread()))
             } else {
                 acc
             }
-        },
-    )
+        })
 }

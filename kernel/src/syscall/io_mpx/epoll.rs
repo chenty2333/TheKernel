@@ -34,7 +34,7 @@ bitflags! {
 pub fn sys_epoll_create1(flags: u32) -> AxResult<isize> {
     let flags = EpollCreateFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
     debug!("sys_epoll_create1 <= flags: {flags:?}");
-    Epoll::new()
+    Epoll::new()?
         .add_to_fd_table(flags.contains(EpollCreateFlags::CLOEXEC))
         .map(|fd| fd as isize)
 }

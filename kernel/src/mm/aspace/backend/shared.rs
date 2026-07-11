@@ -333,6 +333,24 @@ impl Backend {
         Self::new_shared_with_may_protect(start, pages, access_flags())
     }
 
+    pub fn try_new_shared(start: VirtAddr, pages: Arc<SharedPages>) -> AxResult<Self> {
+        Self::try_new_shared_with_may_protect(start, pages, access_flags())
+    }
+
+    pub fn try_new_shared_with_may_protect(
+        start: VirtAddr,
+        pages: Arc<SharedPages>,
+        may_protect: MappingFlags,
+    ) -> AxResult<Self> {
+        let map_id = Arc::try_new(()).map_err(|_| AxError::NoMemory)?;
+        Ok(Self::Shared(SharedBackend {
+            start,
+            pages,
+            may_protect: may_protect & access_flags(),
+            map_id,
+        }))
+    }
+
     pub fn new_shared_with_may_protect(
         start: VirtAddr,
         pages: Arc<SharedPages>,

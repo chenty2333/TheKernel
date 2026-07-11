@@ -416,3 +416,54 @@ mod cfs_fork {
         );
     }
 }
+
+mod cfs_intrusive_membership {
+    use alloc::sync::Arc;
+
+    use crate::*;
+
+    #[test]
+    fn removal_from_a_different_runqueue_is_safe_and_has_no_effect() {
+        let mut owner = CFScheduler::<usize>::new();
+        let mut other = CFScheduler::<usize>::new();
+        let task = Arc::new(CFSTask::new(1));
+        let same_key_peer = Arc::new(CFSTask::new(2));
+        owner.add_task(task.clone());
+        // Per-runqueue sequence spaces intentionally overlap, so this also
+        // exercises the exact-key collision case in the wrong tree.
+        other.add_task(same_key_peer.clone());
+
+        assert!(other.remove_task(&task).is_none());
+        let removed = owner.remove_task(&task).unwrap();
+        assert!(Arc::ptr_eq(&removed, &task));
+        assert!(owner.pick_next_task().is_none());
+        let untouched = other.pick_next_task().unwrap();
+        assert!(Arc::ptr_eq(&untouched, &same_key_peer));
+    }
+
+    #[test]
+    fn linked_key_is_stable_until_remove_and_reinsert() {
+        let mut scheduler = CFScheduler::<usize>::new();
+        let task = Arc::new(CFSTask::new(1));
+        let peer = Arc::new(CFSTask::new(2));
+        scheduler.add_task(task.clone());
+        scheduler.add_task(peer.clone());
+
+        // This direct low-level mutation is deliberately stronger than the
+        // axtask API, which removes a ready task before reconfiguration. It
+        // must not mutate a key already embedded in the intrusive tree.
+        assert!(task.configure(CfsTaskParams {
+            class: CfsTaskClass::Fifo,
+            rt_priority: 99,
+            ..Default::default()
+        }));
+        let removed = scheduler.remove_task(&task).unwrap();
+        assert!(Arc::ptr_eq(&removed, &task));
+
+        scheduler.enqueue_task(removed, EnqueueReason::Wakeup);
+        let first = scheduler.pick_next_task().unwrap();
+        assert!(Arc::ptr_eq(&first, &task));
+        let second = scheduler.pick_next_task().unwrap();
+        assert!(Arc::ptr_eq(&second, &peer));
+    }
+}

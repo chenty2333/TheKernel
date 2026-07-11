@@ -61,14 +61,14 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
     /// Will panic if this is the root directory.
     pub fn truncate(&mut self) -> Result<(), Error<IO::Error>> {
         trace!("File::truncate");
+        self.fs.ensure_not_poisoned()?;
         if let Some(ref mut e) = self.entry {
             e.set_size(self.offset);
             if self.offset == 0 {
                 e.set_first_cluster(None, self.fs.fat_type());
             }
         } else {
-            // Note: we cannot handle this case because there is no size field
-            panic!("Trying to truncate a file without an entry");
+            return Err(Error::InvalidInput);
         }
         if let Some(current_cluster) = self.current_cluster {
             // current cluster is none only if offset is 0
@@ -139,6 +139,7 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
     }
 
     fn flush_dir_entry(&mut self) -> Result<(), Error<IO::Error>> {
+        self.fs.ensure_not_poisoned()?;
         if let Some(ref mut e) = self.entry {
             e.flush(self.fs)?;
         }
@@ -238,6 +239,13 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
 
     pub(crate) fn is_root_dir(&self) -> bool {
         self.entry.is_none()
+    }
+
+    /// Returns the absolute on-disk position of this file's directory entry.
+    /// The filesystem root has no entry position.
+    #[must_use]
+    pub fn entry_position(&self) -> Option<u64> {
+        self.entry.as_ref().map(DirEntryEditor::position)
     }
 }
 
@@ -345,6 +353,7 @@ where
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         trace!("File::write");
+        self.fs.ensure_not_poisoned()?;
         let cluster_size = self.fs.cluster_size();
         let offset_in_cluster = self.offset % cluster_size;
         let bytes_left_in_cluster = (cluster_size - offset_in_cluster) as usize;
@@ -385,7 +394,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
             // self.current_cluster should be a valid cluster
             match self.current_cluster {
                 Some(n) => n,
-                None => panic!("Offset inside cluster but no cluster allocated"),
+                None => return Err(Error::CorruptedFileSystem),
             }
         };
         trace!("write {} bytes in cluster {}", write_size, current_cluster);

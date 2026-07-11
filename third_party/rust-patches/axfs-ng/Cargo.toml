@@ -89,6 +89,11 @@ package = "starry-fatfs"
 [dependencies.intrusive-collections]
 version = "0.9"
 
+[dependencies.hashbrown]
+version = "0.16"
+features = ["default-hasher"]
+default-features = false
+
 [dependencies.kspin]
 version = "0.1"
 
@@ -105,10 +110,6 @@ default-features = false
 
 [dependencies.scope-local]
 version = "0.1"
-
-[dependencies.slab]
-version = "0.4"
-default-features = false
 
 [dependencies.spin]
 version = "0.10"

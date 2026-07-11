@@ -63,8 +63,15 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         record_legacy_dblk_lookup();
         unsafe {
             let mut fblock = 0u64;
-            ext4_fs_init_inode_dblk_idx(self.inner.as_mut(), block, &mut fblock)
-                .context("ext4_fs_init_inode_dblk_idx")?;
+            let mut metadata_may_have_changed = false;
+            ext4_fs_init_inode_dblk_idx_status(
+                self.inner.as_mut(),
+                block,
+                &mut fblock,
+                &mut metadata_may_have_changed,
+            )
+            .context("ext4_fs_init_inode_dblk_idx")
+            .map_err(|error| error.with_metadata_may_have_changed(metadata_may_have_changed))?;
             Ok(fblock)
         }
     }
@@ -73,8 +80,15 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         unsafe {
             let mut fblock = 0u64;
             let mut block = 0u32;
-            ext4_fs_append_inode_dblk(self.inner.as_mut(), &mut fblock, &mut block)
-                .context("ext4_fs_append_inode_dblk_idx")?;
+            let mut metadata_may_have_changed = false;
+            ext4_fs_append_inode_dblk_status(
+                self.inner.as_mut(),
+                &mut fblock,
+                &mut block,
+                &mut metadata_may_have_changed,
+            )
+            .context("ext4_fs_append_inode_dblk")
+            .map_err(|error| error.with_metadata_may_have_changed(metadata_may_have_changed))?;
             Ok((fblock, block))
         }
     }
@@ -105,15 +119,18 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         unsafe {
             let mut fblock = 0u64;
             let mut blocks = 0u32;
-            ext4_extent_get_blocks(
+            let mut metadata_may_have_changed = false;
+            ext4_extent_get_blocks_status(
                 self.inner.as_mut(),
                 block,
                 max_blocks,
                 &mut fblock,
                 create,
                 &mut blocks,
+                &mut metadata_may_have_changed,
             )
-            .context("ext4_extent_get_blocks")?;
+            .context("ext4_extent_get_blocks")
+            .map_err(|error| error.with_metadata_may_have_changed(metadata_may_have_changed))?;
             let blocks = blocks.min(max_blocks);
             record_extent_get_blocks(max_blocks, blocks, create);
             if blocks == 0 {
@@ -384,7 +401,12 @@ impl<Hal: SystemHal> InodeRef<Hal> {
 
             drop(guard);
 
-            assert!(buf.len() < block_size as usize);
+            if buf.len() >= block_size as usize {
+                return Err(Ext4Error::new(
+                    EIO as _,
+                    "ext4 read mapping left an invalid trailing segment",
+                ));
+            }
             if !buf.is_empty() {
                 let fblock = self.read_mapped_fblock(block_end)?;
                 if fblock != 0 {
@@ -507,7 +529,13 @@ impl<Hal: SystemHal> InodeRef<Hal> {
                     this.init_inode_fblock(block)
                 } else {
                     let (fblock, new_block) = this.append_inode_fblock()?;
-                    assert_eq!(block, new_block);
+                    if block != new_block {
+                        return Err(Ext4Error::new(
+                            EIO as _,
+                            "ext4 append returned an unexpected logical block",
+                        )
+                        .with_metadata_may_have_changed(true));
+                    }
                     Ok(fblock)
                 }
             };
@@ -562,7 +590,13 @@ impl<Hal: SystemHal> InodeRef<Hal> {
             }
             flush_fblock_segment(&mut buf, fblock_start, fblock_count)?;
 
-            assert!(buf.len() < block_size as usize);
+            if buf.len() >= block_size as usize {
+                return Err(Ext4Error::new(
+                    EIO as _,
+                    "ext4 write mapping left an invalid trailing segment",
+                )
+                .with_metadata_may_have_changed(true));
+            }
             if !buf.is_empty() {
                 let fblock = if let Some(run) = self.map_extent_run(block_end, 1, true)? {
                     run.fblock
@@ -628,7 +662,13 @@ impl<Hal: SystemHal> InodeRef<Hal> {
                     this.init_inode_fblock(block)
                 } else {
                     let (fblock, new_block) = this.append_inode_fblock()?;
-                    assert_eq!(block, new_block);
+                    if block != new_block {
+                        return Err(Ext4Error::new(
+                            EIO as _,
+                            "ext4 append returned an unexpected logical block",
+                        )
+                        .with_metadata_may_have_changed(true));
+                    }
                     Ok(fblock)
                 }
             };
@@ -691,7 +731,7 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         }
     }
 
-    pub fn set_symlink(&mut self, target: &[u8]) -> Ext4Result<()> {
+    pub(crate) fn initialize_symlink(&mut self, target: &[u8]) -> Ext4Result<()> {
         self.invalidate_mapping_seq();
         if ENABLE_EXTENT_STATUS_CACHE.load(core::sync::atomic::Ordering::Relaxed) {
             self.extent_status.clear();
@@ -711,13 +751,26 @@ impl<Hal: SystemHal> InodeRef<Hal> {
                 ext4_fs_inode_blocks_init(self.inner.fs, self.inner.as_mut());
                 let mut fblock: u64 = 0;
                 let mut sblock: u32 = 0;
-                ext4_fs_append_inode_dblk(self.inner.as_mut(), &mut fblock, &mut sblock)
-                    .context("ext4_fs_append_inode_dblk")?;
+                let mut metadata_may_have_changed = false;
+                ext4_fs_append_inode_dblk_status(
+                    self.inner.as_mut(),
+                    &mut fblock,
+                    &mut sblock,
+                    &mut metadata_may_have_changed,
+                )
+                .context("ext4_fs_append_inode_dblk")
+                .map_err(|error| error.with_metadata_may_have_changed(metadata_may_have_changed))?;
 
+                // Publish the allocated extent in the inode before the data
+                // write. If the write fails, the unpublished-inode rollback
+                // path can truncate back to zero without leaking this block.
+                ext4_inode_set_size(self.inner.inode, target.len() as u64);
+                self.mark_dirty();
                 let off = fblock * block_size as u64;
                 self.write_bytes(off, target)?;
             }
             ext4_inode_set_size(self.inner.inode, target.len() as u64);
+            self.mark_dirty();
         }
 
         Ok(())

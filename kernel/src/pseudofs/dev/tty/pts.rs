@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, boxed::Box, string::ToString, sync::Arc, vec::Vec};
+use alloc::{borrow::Cow, string::ToString, sync::Arc, vec::Vec};
 use core::sync::atomic::Ordering;
 
 use axerrno::{AxError, AxResult};
@@ -8,7 +8,10 @@ use flatten_objects::FlattenObjects;
 use kspin::SpinNoIrq;
 
 use crate::{
-    pseudofs::{Device, NodeOpsMux, SimpleDirOps, SimpleFs, dev::tty::pty::PtyDriver},
+    pseudofs::{
+        ChildNames, Device, NodeOpsMux, SimpleDirOps, SimpleFs, dev::tty::pty::PtyDriver,
+        try_boxed_names,
+    },
     task::AsThread,
 };
 
@@ -39,13 +42,13 @@ pub fn add_slave(fs: Arc<SimpleFs>, pty: Arc<PtyDriver>) -> AxResult<u32> {
 pub struct PtsDir;
 
 impl SimpleDirOps for PtsDir {
-    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+    fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
         let ids = PTS_TABLE
             .lock()
             .ids()
             .map(|it| Cow::Owned(it.to_string()))
             .collect::<Vec<_>>();
-        Box::new(ids.into_iter())
+        try_boxed_names(ids.into_iter())
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {

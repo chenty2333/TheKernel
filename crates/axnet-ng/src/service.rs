@@ -162,7 +162,7 @@ mod tests {
     fn test_service() -> Service {
         let socket_set = Arc::new(SocketSetWrapper::new());
         let listen_table = Arc::new(ListenTable::new());
-        let mut router = Router::new(listen_table);
+        let mut router = Router::new_loopback_only(listen_table);
         let dev = router.add_device(Box::new(LoopbackDevice::new()));
         router.add_rule(Rule::new(
             Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0).into(),
@@ -189,7 +189,7 @@ mod tests {
     fn resolve_outbound_reports_missing_route() {
         let socket_set = Arc::new(SocketSetWrapper::new());
         let listen_table = Arc::new(ListenTable::new());
-        let service = Service::new(Router::new(listen_table), socket_set);
+        let service = Service::new(Router::new_loopback_only(listen_table), socket_set);
         let err = service
             .resolve_outbound(&IpAddress::Ipv4(Ipv4Address::new(8, 8, 8, 8)), None)
             .unwrap_err();
@@ -200,7 +200,7 @@ mod tests {
     fn dont_route_rejects_gateway_routes_but_accepts_direct_routes() {
         let socket_set = Arc::new(SocketSetWrapper::new());
         let listen_table = Arc::new(ListenTable::new());
-        let mut router = Router::new(listen_table);
+        let mut router = Router::new_loopback_only(listen_table);
         let dev = router.add_device(Box::new(LoopbackDevice::new()));
         let source = IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 15));
         let destination = IpAddress::Ipv4(Ipv4Address::new(8, 8, 8, 8));
@@ -254,7 +254,7 @@ mod tests {
     fn validate_bind_addr_maps_missing_route_to_not_available() {
         let socket_set = Arc::new(SocketSetWrapper::new());
         let listen_table = Arc::new(ListenTable::new());
-        let service = Service::new(Router::new(listen_table), socket_set);
+        let service = Service::new(Router::new_loopback_only(listen_table), socket_set);
         let err = service
             .validate_bind_addr(IpAddress::Ipv4(Ipv4Address::new(10, 255, 254, 253)))
             .unwrap_err();

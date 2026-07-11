@@ -1,25 +1,26 @@
 use alloc::{
     borrow::ToOwned,
-    collections::BTreeSet,
     string::String,
     sync::{Arc, Weak},
     vec,
     vec::Vec,
 };
 use core::{
-    iter,
+    fmt, iter,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     task::Context,
 };
 
 use axpoll::{IoEvents, Pollable};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use inherit_methods_macro::inherit_methods;
-use spin::RwLock;
+use spin::{Once, RwLock};
 
 use crate::{
-    DirEntry, DirEntrySink, Filesystem, FilesystemOps, Metadata, MetadataUpdate, Mutex, MutexGuard,
-    NodeFlags, NodePermission, NodeType, OpenOptions, ReferenceKey, TypeMap, VfsError, VfsResult,
+    AnonymousOptions, CreateDisposition, CreateOutcome, DirEntry, DirEntrySink, Filesystem,
+    FilesystemIdentity, FilesystemOps, Metadata, MetadataUpdate, Mutex, MutexGuard,
+    NamedCreateOptions, NodeFlags, NodePermission, NodeType, OpenOptions, ReferenceKey, TypeMap,
+    VfsError, VfsResult, WeakFilesystemIdentity,
     path::{DOT, DOTDOT, PathBuf},
 };
 
@@ -42,6 +43,28 @@ fn mount_tree_write() -> spin::RwLockWriteGuard<'static, ()> {
     MOUNT_TREE_LOCK.upgradeable_read().upgrade()
 }
 
+fn optional_lookup<T>(result: VfsResult<T>) -> VfsResult<Option<T>> {
+    match result {
+        Ok(entry) => Ok(Some(entry)),
+        Err(err) if err.canonicalize() == VfsError::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn reserve_non_root_mount() -> VfsResult<()> {
+    ACTIVE_NON_ROOT_MOUNTS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < MAX_ACTIVE_NON_ROOT_MOUNTS).then_some(active + 1)
+        })
+        .map(|_| ())
+        .map_err(|_| VfsError::NoMemory)
+}
+
+fn release_non_root_mount_reservation() {
+    let old = ACTIVE_NON_ROOT_MOUNTS.fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(old != 0, "active mount count underflow");
+}
+
 #[derive(Debug)]
 pub struct Mountpoint {
     /// Root dir entry in the mountpoint.
@@ -58,22 +81,68 @@ pub struct Mountpoint {
     mount_id: u64,
     /// Whether this is the root mount of its namespace.
     namespace_root: bool,
-    /// Shared location handle held weakly to avoid a mount/handle cycle.
-    ///
-    /// A live handle keeps this mount and its current ancestors alive. This
-    /// preserves `..` traversal inside a lazily detached nested tree without
-    /// adding another Arc to every Location.
-    handle: Mutex<Weak<MountHandle>>,
+    /// Preallocated shared location lease. Keeping one baseline reference in
+    /// the mount avoids allocating from pathname traversal or under the mount
+    /// tree lock; `MountHandle` itself owns no reference back to this mount.
+    handle: Arc<MountHandle>,
     /// Set while a normal unmount flushes without the topology writer lock.
     unmounting: AtomicBool,
+    /// Personality-specific immutable extension set. Mutable values inside it
+    /// use their own synchronization, keeping mount-policy reads lock-free.
+    extensions: MountExtensions,
     /// Whether this mount consumed one slot in [`ACTIVE_NON_ROOT_MOUNTS`].
     counted_non_root: bool,
 }
 
+struct MountExtensions {
+    values: Once<TypeMap>,
+}
+
+impl MountExtensions {
+    fn new(initial: Option<TypeMap>) -> Self {
+        let extensions = Self {
+            values: Once::new(),
+        };
+        if let Some(initial) = initial {
+            extensions.values.call_once(|| initial);
+        }
+        extensions
+    }
+
+    fn initialize(&self, extensions: TypeMap) -> VfsResult<()> {
+        let mut installed = false;
+        self.values.call_once(|| {
+            installed = true;
+            extensions
+        });
+        if installed {
+            Ok(())
+        } else {
+            Err(VfsError::AlreadyExists)
+        }
+    }
+
+    fn get_ref<T: core::any::Any + Send + Sync>(&self) -> Option<&T> {
+        self.values.get()?.get_ref::<T>()
+    }
+
+    fn get<T: core::any::Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.values.get()?.get::<T>()
+    }
+}
+
+impl fmt::Debug for MountExtensions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MountExtensions")
+            .field("initialized", &self.values.get().is_some())
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 struct MountHandle {
-    mountpoint: Arc<Mountpoint>,
     ancestors: Mutex<Vec<Arc<Mountpoint>>>,
+    users: AtomicUsize,
     /// Serializes creation of another Location with normal-unmount commit.
     admission: RwLock<()>,
     /// Records a Location admitted during the lock-free unmount flush window.
@@ -137,17 +206,36 @@ impl MountLocation {
 }
 
 impl Mountpoint {
-    fn new(fs: &Filesystem, location_in_parent: Option<&Location>) -> Arc<Self> {
-        Self::new_with_root(fs, fs.root_dir(), location_in_parent)
+    fn new(
+        fs: &Filesystem,
+        location_in_parent: Option<&Location>,
+        extensions: Option<TypeMap>,
+    ) -> Arc<Self> {
+        Self::new_with_root(
+            fs,
+            fs.root_dir(),
+            location_in_parent,
+            extensions,
+            location_in_parent.is_none(),
+            location_in_parent.is_some(),
+        )
     }
 
     fn new_with_root(
         fs: &Filesystem,
         root: DirEntry,
         location_in_parent: Option<&Location>,
+        extensions: Option<TypeMap>,
+        namespace_root: bool,
+        counted_non_root: bool,
     ) -> Arc<Self> {
-        let namespace_root = location_in_parent.is_none();
-        Arc::new(Self {
+        let handle = Arc::new(MountHandle {
+            ancestors: Mutex::new(Vec::with_capacity(MAX_MOUNT_TREE_DEPTH)),
+            users: AtomicUsize::new(0),
+            admission: RwLock::new(()),
+            admitted_during_unmount: AtomicBool::new(false),
+        });
+        let mountpoint = Arc::new(Self {
             root,
             location: Mutex::new(location_in_parent.map(MountLocation::new)),
             children: Mutex::default(),
@@ -155,31 +243,111 @@ impl Mountpoint {
             device: fs.device(),
             mount_id: MOUNT_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             namespace_root,
-            handle: Mutex::new(Weak::new()),
+            handle,
             unmounting: AtomicBool::new(false),
-            counted_non_root: !namespace_root,
+            extensions: MountExtensions::new(extensions),
+            counted_non_root,
+        });
+        fs.retain_mount_root(&mountpoint.root);
+        mountpoint
+    }
+
+    fn try_new_with_root(
+        fs: &Filesystem,
+        root: DirEntry,
+        location_in_parent: Option<&Location>,
+        extensions: Option<TypeMap>,
+        namespace_root: bool,
+        counted_non_root: bool,
+    ) -> VfsResult<Arc<Self>> {
+        let mut ancestors = Vec::new();
+        ancestors
+            .try_reserve_exact(MAX_MOUNT_TREE_DEPTH)
+            .map_err(|_| VfsError::NoMemory)?;
+        let handle = Arc::try_new(MountHandle {
+            ancestors: Mutex::new(ancestors),
+            users: AtomicUsize::new(0),
+            admission: RwLock::new(()),
+            admitted_during_unmount: AtomicBool::new(false),
         })
+        .map_err(|_| VfsError::NoMemory)?;
+        let mountpoint = Arc::try_new(Self {
+            root,
+            location: Mutex::new(location_in_parent.map(MountLocation::new)),
+            children: Mutex::default(),
+            filesystem: fs.clone(),
+            device: fs.device(),
+            mount_id: MOUNT_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            namespace_root,
+            handle,
+            unmounting: AtomicBool::new(false),
+            extensions: MountExtensions::new(extensions),
+            counted_non_root,
+        })
+        .map_err(|_| VfsError::NoMemory)?;
+        fs.retain_mount_root(&mountpoint.root);
+        Ok(mountpoint)
     }
 
     pub fn new_root(fs: &Filesystem) -> Arc<Self> {
-        Self::new(fs, None)
+        Self::new(fs, None, None)
+    }
+
+    pub fn new_detached(fs: &Filesystem) -> VfsResult<Arc<Self>> {
+        Self::new_detached_with_extensions(fs, TypeMap::new())
+    }
+
+    pub fn new_detached_with_extensions(
+        fs: &Filesystem,
+        extensions: TypeMap,
+    ) -> VfsResult<Arc<Self>> {
+        let root = fs.root_dir();
+        reserve_non_root_mount()?;
+        match Self::try_new_with_root(
+            fs,
+            root,
+            None,
+            Some(extensions),
+            false,
+            true,
+        ) {
+            Ok(mountpoint) => Ok(mountpoint),
+            Err(error) => {
+                release_non_root_mount_reservation();
+                Err(error)
+            }
+        }
     }
 
     fn new_mounted(
         fs: &Filesystem,
         root: DirEntry,
         location_in_parent: &Location,
+        extensions: Option<TypeMap>,
     ) -> VfsResult<Arc<Self>> {
-        ACTIVE_NON_ROOT_MOUNTS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_ACTIVE_NON_ROOT_MOUNTS).then_some(active + 1)
-            })
-            .map_err(|_| VfsError::NoMemory)?;
-        Ok(Self::new_with_root(fs, root, Some(location_in_parent)))
+        reserve_non_root_mount()?;
+        match Self::try_new_with_root(
+            fs,
+            root,
+            Some(location_in_parent),
+            extensions,
+            false,
+            true,
+        ) {
+            Ok(mountpoint) => Ok(mountpoint),
+            Err(error) => {
+                release_non_root_mount_reservation();
+                Err(error)
+            }
+        }
     }
 
     pub fn root_location(self: &Arc<Self>) -> Location {
         Location::new(self.clone(), self.root.clone())
+    }
+
+    pub fn attach_to(self: &Arc<Self>, target: &Location) -> VfsResult<()> {
+        self.root_location().move_mount_to(target)
     }
 
     /// Returns the location in the parent mountpoint.
@@ -196,6 +364,11 @@ impl Mountpoint {
         self.namespace_root
     }
 
+    pub fn is_attached(&self) -> bool {
+        let _tree = MOUNT_TREE_LOCK.read();
+        self.namespace_root || self.location.lock().is_some()
+    }
+
     /// Returns the effective mountpoint.
     ///
     /// For example, first `mount /dev/sda1 /mnt` and then `mount /dev/sda2
@@ -204,18 +377,14 @@ impl Mountpoint {
     /// return `mnt2` for `mnt1.effective_mountpoint()`.
     fn effective_mountpoint_locked(self: &Arc<Self>) -> VfsResult<Arc<Mountpoint>> {
         let mut mountpoint = self.clone();
-        let mut visited = BTreeSet::new();
         for _ in 0..MAX_MOUNT_TREE_DEPTH {
-            if !visited.insert(mountpoint.mount_id) {
-                return Err(VfsError::FilesystemLoop);
-            }
             if mountpoint.unmounting.load(Ordering::Acquire) {
                 return Err(VfsError::ResourceBusy);
             }
             let next = mountpoint
                 .children
                 .lock()
-                .get(&mountpoint.root.key())
+                .get(&mountpoint.root.key_ref())
                 .cloned();
             if let Some(next) = next {
                 mountpoint = next;
@@ -223,7 +392,7 @@ impl Mountpoint {
                 return Ok(mountpoint);
             }
         }
-        Err(VfsError::ResourceBusy)
+        Err(VfsError::FilesystemLoop)
     }
 
     pub fn device(self: &Arc<Self>) -> u64 {
@@ -234,8 +403,28 @@ impl Mountpoint {
         self.mount_id
     }
 
-    pub fn filesystem_lifetime(self: &Arc<Self>) -> Weak<()> {
-        self.filesystem.lifetime_handle()
+    pub fn filesystem_identity(self: &Arc<Self>) -> FilesystemIdentity {
+        self.filesystem.identity()
+    }
+
+    pub fn filesystem_handle(self: &Arc<Self>) -> Filesystem {
+        self.filesystem.clone()
+    }
+
+    pub fn filesystem_identity_weak(self: &Arc<Self>) -> WeakFilesystemIdentity {
+        self.filesystem.identity_weak()
+    }
+
+    pub fn initialize_extensions(&self, extensions: TypeMap) -> VfsResult<()> {
+        self.extensions.initialize(extensions)
+    }
+
+    pub fn extension<T: core::any::Any + Send + Sync>(&self) -> Option<&T> {
+        self.extensions.get_ref::<T>()
+    }
+
+    pub fn extension_shared<T: core::any::Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.extensions.get::<T>()
     }
 
     pub fn writeback_anchor(&self, entry: DirEntry) -> WritebackAnchor {
@@ -246,36 +435,62 @@ impl Mountpoint {
     }
 
     /// Returns every stable filesystem identity in this mount subtree.
-    pub fn subtree_devices(self: &Arc<Self>) -> VfsResult<BTreeSet<u64>> {
+    pub fn subtree_devices(self: &Arc<Self>) -> VfsResult<Vec<u64>> {
         let _tree = MOUNT_TREE_LOCK.read();
-        Ok(self
-            .subtree_nodes_locked()?
-            .into_iter()
-            .map(|(mountpoint, _)| mountpoint.device)
-            .collect())
+        let nodes = self.subtree_nodes_locked()?;
+        let mut seen = HashSet::new();
+        seen.try_reserve(nodes.len())
+            .map_err(|_| VfsError::NoMemory)?;
+        let mut devices = Vec::new();
+        devices
+            .try_reserve(nodes.len())
+            .map_err(|_| VfsError::NoMemory)?;
+        for (mountpoint, _) in nodes {
+            if seen.insert(mountpoint.device) {
+                devices.push(mountpoint.device);
+            }
+        }
+        Ok(devices)
+    }
+
+    pub fn subtree_mountpoints(self: &Arc<Self>) -> VfsResult<Vec<Arc<Mountpoint>>> {
+        let _tree = MOUNT_TREE_LOCK.read();
+        let nodes = self.subtree_nodes_locked()?;
+        let mut mountpoints = Vec::new();
+        mountpoints
+            .try_reserve(nodes.len())
+            .map_err(|_| VfsError::NoMemory)?;
+        for (mountpoint, _) in nodes {
+            mountpoints.push(mountpoint);
+        }
+        Ok(mountpoints)
     }
 
     fn subtree_nodes_locked(self: &Arc<Self>) -> VfsResult<Vec<(Arc<Mountpoint>, usize)>> {
-        let mut pending = vec![(self.clone(), 0)];
-        let mut visited = BTreeSet::new();
+        let mut pending = Vec::new();
+        pending.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+        pending.push((self.clone(), 0));
+        let mut visited = HashSet::new();
         let mut nodes = Vec::new();
         while let Some((mountpoint, depth)) = pending.pop() {
             if depth > MAX_MOUNT_TREE_DEPTH {
                 return Err(VfsError::ResourceBusy);
             }
+            visited.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
             if !visited.insert(mountpoint.mount_id) {
                 return Err(VfsError::FilesystemLoop);
             }
             if visited.len() > MAX_ACTIVE_NON_ROOT_MOUNTS + 1 {
                 return Err(VfsError::NoMemory);
             }
-            let children = mountpoint
-                .children
-                .lock()
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            pending.extend(children.into_iter().map(|child| (child, depth + 1)));
+            let child_count = mountpoint.children.lock().len();
+            pending
+                .try_reserve(child_count)
+                .map_err(|_| VfsError::NoMemory)?;
+            for child in mountpoint.children.lock().values() {
+                pending.push((child.clone(), depth + 1));
+            }
+            nodes.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
             nodes.push((mountpoint, depth));
         }
         Ok(nodes)
@@ -285,66 +500,52 @@ impl Mountpoint {
         self.location.lock().as_ref()?.mountpoint.upgrade()
     }
 
-    fn current_ancestors_locked(&self) -> Vec<Arc<Mountpoint>> {
-        let mut ancestors = Vec::new();
-        let mut visited = BTreeSet::new();
+    fn has_mount_at_or_below_locked(&self, entry: &DirEntry) -> VfsResult<bool> {
+        let entry_is_dir = entry.is_dir();
+        for child in self.children.lock().values() {
+            let location = child.location.lock();
+            let location = location.as_ref().ok_or(VfsError::Io)?;
+            let parent = location.mountpoint.upgrade().ok_or(VfsError::Io)?;
+            if parent.mount_id != self.mount_id {
+                return Err(VfsError::Io);
+            }
+            if entry.ptr_eq(&location.entry)
+                || (entry_is_dir && entry.is_ancestor_of(&location.entry)?)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn refresh_handle_ancestors_locked(&self) {
+        let mut ancestors = self.handle.ancestors.lock();
+        ancestors.clear();
+        if self.handle.users.load(Ordering::Acquire) == 0 {
+            return;
+        }
         let mut current = self.parent_mountpoint_locked();
         for _ in 0..MAX_MOUNT_TREE_DEPTH {
             let Some(mountpoint) = current else {
                 break;
             };
-            if !visited.insert(mountpoint.mount_id) {
-                break;
-            }
             current = mountpoint.parent_mountpoint_locked();
             ancestors.push(mountpoint);
         }
-        ancestors
+        debug_assert!(current.is_none());
     }
 
     fn location_handle_locked(self: &Arc<Self>) -> Arc<MountHandle> {
-        if let Some(handle) = self.handle.lock().upgrade() {
-            return handle;
-        }
-
-        // Compute ancestry without holding the handle slot. Topology is stable
-        // under MOUNT_TREE_LOCK, and this lock order avoids handle/location
-        // inversion with unmount validation.
-        let ancestors = self.current_ancestors_locked();
-        let mut slot = self.handle.lock();
-        if let Some(handle) = slot.upgrade() {
-            return handle;
-        }
-        let handle = Arc::new(MountHandle {
-            mountpoint: self.clone(),
-            ancestors: Mutex::new(ancestors),
-            admission: RwLock::new(()),
-            admitted_during_unmount: AtomicBool::new(false),
-        });
-        *slot = Arc::downgrade(&handle);
-        handle
+        self.handle.clone()
     }
 
     fn active_location_count(&self) -> usize {
-        self.handle.lock().strong_count()
+        self.handle.users.load(Ordering::Acquire)
     }
 
-    fn refresh_active_handles_locked(self: &Arc<Self>) {
-        let mut pending = vec![self.clone()];
-        let mut visited = BTreeSet::new();
-        while let Some(mountpoint) = pending.pop() {
-            if visited.len() >= MAX_ACTIVE_NON_ROOT_MOUNTS + 1 {
-                break;
-            }
-            if !visited.insert(mountpoint.mount_id) {
-                continue;
-            }
-            let ancestors = mountpoint.current_ancestors_locked();
-            let handle = { mountpoint.handle.lock().upgrade() };
-            if let Some(handle) = handle {
-                *handle.ancestors.lock() = ancestors;
-            }
-            pending.extend(mountpoint.children.lock().values().cloned());
+    fn refresh_subtree_handles_locked(subtree: &[(Arc<Mountpoint>, usize)]) {
+        for (mountpoint, _) in subtree {
+            mountpoint.refresh_handle_ancestors_locked();
         }
     }
 
@@ -364,7 +565,10 @@ impl Mountpoint {
 
     fn attached_depth_locked(self: &Arc<Self>) -> VfsResult<usize> {
         let mut current = self.clone();
-        let mut visited = BTreeSet::new();
+        let mut visited = HashSet::new();
+        visited
+            .try_reserve(MAX_MOUNT_TREE_DEPTH.saturating_add(1))
+            .map_err(|_| VfsError::NoMemory)?;
         for depth in 0..=MAX_MOUNT_TREE_DEPTH {
             if !visited.insert(current.mount_id) {
                 return Err(VfsError::FilesystemLoop);
@@ -375,9 +579,10 @@ impl Mountpoint {
             if current.namespace_root {
                 return Ok(depth);
             }
-            current = current
-                .parent_mountpoint_locked()
-                .ok_or(VfsError::InvalidInput)?;
+            let Some(parent) = current.parent_mountpoint_locked() else {
+                return Ok(depth);
+            };
+            current = parent;
         }
         Err(VfsError::ResourceBusy)
     }
@@ -399,18 +604,15 @@ impl Mountpoint {
             return Err(VfsError::ResourceBusy);
         }
 
-        let (parent_mountpoint, key) = {
-            let location = self.location.lock();
-            let parent_location = location.as_ref().ok_or(VfsError::InvalidInput)?;
-            (
-                parent_location.mountpoint.clone(),
-                parent_location.entry.key(),
-            )
-        };
-        let parent = parent_mountpoint.upgrade().ok_or(VfsError::InvalidInput)?;
+        let location = self.location.lock();
+        let parent_location = location.as_ref().ok_or(VfsError::InvalidInput)?;
+        let parent = parent_location
+            .mountpoint
+            .upgrade()
+            .ok_or(VfsError::InvalidInput)?;
         let children = parent.children.lock();
         if !children
-            .get(&key)
+            .get(&parent_location.entry.key_ref())
             .is_some_and(|mounted| Arc::ptr_eq(mounted, self))
         {
             return Err(VfsError::InvalidInput);
@@ -421,27 +623,31 @@ impl Mountpoint {
 
     fn detach_from_parent_locked(self: &Arc<Self>, require_unused: bool) -> VfsResult<()> {
         self.validate_detach_locked(require_unused)?;
+        let subtree = self.subtree_nodes_locked()?;
 
+        self.detach_prevalidated_from_parent_locked()?;
+        Self::refresh_subtree_handles_locked(&subtree);
+        Ok(())
+    }
+
+    /// Commits one already-validated parent edge without allocating.
+    fn detach_prevalidated_from_parent_locked(self: &Arc<Self>) -> VfsResult<()> {
         let mut location = self.location.lock();
         let parent_location = location.as_ref().ok_or(VfsError::InvalidInput)?;
         let parent = parent_location
             .mountpoint
             .upgrade()
             .ok_or(VfsError::InvalidInput)?;
-        let key = parent_location.entry.key();
         let mut children = parent.children.lock();
         if !children
-            .get(&key)
+            .get(&parent_location.entry.key_ref())
             .is_some_and(|mounted| Arc::ptr_eq(mounted, self))
         {
             return Err(VfsError::InvalidInput);
         }
 
-        children.remove(&key);
+        children.remove(&parent_location.entry.key_ref());
         *location = None;
-        drop(children);
-        drop(location);
-        self.refresh_active_handles_locked();
         Ok(())
     }
 
@@ -462,14 +668,20 @@ impl Mountpoint {
     pub fn flush_all_filesystems(self: &Arc<Self>) -> VfsResult<()> {
         let filesystems = {
             let _tree = MOUNT_TREE_LOCK.read();
-            let mut seen = BTreeSet::new();
-            self.subtree_nodes_locked()?
-                .into_iter()
-                .filter_map(|(mountpoint, _)| {
-                    seen.insert(mountpoint.device)
-                        .then_some(mountpoint.filesystem.clone())
-                })
-                .collect::<Vec<_>>()
+            let nodes = self.subtree_nodes_locked()?;
+            let mut seen = HashSet::new();
+            seen.try_reserve(nodes.len())
+                .map_err(|_| VfsError::NoMemory)?;
+            let mut filesystems = Vec::new();
+            filesystems
+                .try_reserve(nodes.len())
+                .map_err(|_| VfsError::NoMemory)?;
+            for (mountpoint, _) in nodes {
+                if seen.insert(mountpoint.device) {
+                    filesystems.push(mountpoint.filesystem.clone());
+                }
+            }
+            filesystems
         };
         let mut first_error = None;
         for filesystem in filesystems {
@@ -486,34 +698,105 @@ impl Mountpoint {
 
 impl Drop for Mountpoint {
     fn drop(&mut self) {
-        if let Ok(root) = self.root.as_dir() {
-            root.forget();
-        }
         if self.counted_non_root {
-            let old = ACTIVE_NON_ROOT_MOUNTS.fetch_sub(1, Ordering::AcqRel);
-            debug_assert!(old != 0, "active mount count underflow");
+            release_non_root_mount_reservation();
         }
     }
 }
 
 #[derive(Debug)]
 pub struct Location {
+    mountpoint: Arc<Mountpoint>,
     mount: Arc<MountHandle>,
     entry: DirEntry,
+}
+
+pub struct PreparedUnmount {
+    location: Option<Location>,
+}
+
+pub struct FlushedUnmount {
+    location: Option<Location>,
+}
+
+impl PreparedUnmount {
+    pub fn flush(mut self) -> VfsResult<FlushedUnmount> {
+        let Some(location) = self.location.as_ref() else {
+            return Err(VfsError::Io);
+        };
+        location.mountpoint().filesystem.flush()?;
+        let location = self.location.take().ok_or(VfsError::Io)?;
+        Ok(FlushedUnmount {
+            location: Some(location),
+        })
+    }
+}
+
+impl Drop for PreparedUnmount {
+    fn drop(&mut self) {
+        if let Some(location) = self.location.as_ref() {
+            location.cancel_prepared_unmount();
+        }
+    }
+}
+
+impl FlushedUnmount {
+    pub fn commit(mut self) -> VfsResult<()> {
+        let location = self.location.take().ok_or(VfsError::Io)?;
+        location.commit_prepared_unmount()
+    }
+}
+
+impl Drop for FlushedUnmount {
+    fn drop(&mut self) {
+        if let Some(location) = self.location.as_ref() {
+            location.cancel_prepared_unmount();
+        }
+    }
 }
 
 impl Clone for Location {
     fn clone(&self) -> Self {
         let _admission = self.mount.admission.read();
-        if self.mount.mountpoint.unmounting.load(Ordering::Acquire) {
+        let previous = self.mount.users.fetch_add(1, Ordering::AcqRel);
+        debug_assert!(previous != usize::MAX, "mount Location count overflow");
+        if self.mountpoint.unmounting.load(Ordering::Acquire) {
             self.mount
                 .admitted_during_unmount
                 .store(true, Ordering::Release);
         }
         Self {
+            mountpoint: self.mountpoint.clone(),
             mount: self.mount.clone(),
             entry: self.entry.clone(),
         }
+    }
+}
+
+impl Drop for Location {
+    fn drop(&mut self) {
+        // Serialize the zero-to-one/one-to-zero transitions with Location
+        // admission. The last user temporarily takes the preallocated vector,
+        // drops ancestor Arcs outside its spin mutex, then returns the same
+        // allocation for the next pathwalk.
+        let _admission = self.mount.admission.write();
+        let Ok(previous) = self.mount.users.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |users| users.checked_sub(1),
+        ) else {
+            debug_assert!(false, "mount Location count underflow");
+            return;
+        };
+        if previous != 1 {
+            return;
+        }
+        let mut retired = {
+            let mut ancestors = self.mount.ancestors.lock();
+            core::mem::take(&mut *ancestors)
+        };
+        retired.clear();
+        *self.mount.ancestors.lock() = retired;
     }
 }
 
@@ -554,16 +837,20 @@ impl Location {
     fn new_locked(mountpoint: Arc<Mountpoint>, entry: DirEntry) -> Self {
         let mount = mountpoint.location_handle_locked();
         let _admission = mount.admission.read();
-        if mount.mountpoint.unmounting.load(Ordering::Acquire) {
-            mount
-                .admitted_during_unmount
-                .store(true, Ordering::Release);
+        let previous = mount.users.fetch_add(1, Ordering::AcqRel);
+        debug_assert!(previous != usize::MAX, "mount Location count overflow");
+        if previous == 0 {
+            mountpoint.refresh_handle_ancestors_locked();
+        }
+        if mountpoint.unmounting.load(Ordering::Acquire) {
+            mount.admitted_during_unmount.store(true, Ordering::Release);
         }
         // `mount` already owns the admitted handle reference. Releasing the
         // read guard before moving that reference cannot hide it from phase
         // two: the strong count remains elevated until the Location is built.
         drop(_admission);
         Self {
+            mountpoint,
             mount,
             entry,
         }
@@ -571,19 +858,22 @@ impl Location {
 
     fn wrap(&self, entry: DirEntry) -> Self {
         let _admission = self.mount.admission.read();
-        if self.mount.mountpoint.unmounting.load(Ordering::Acquire) {
+        let previous = self.mount.users.fetch_add(1, Ordering::AcqRel);
+        debug_assert!(previous != usize::MAX, "mount Location count overflow");
+        if self.mountpoint.unmounting.load(Ordering::Acquire) {
             self.mount
                 .admitted_during_unmount
                 .store(true, Ordering::Release);
         }
         Self {
+            mountpoint: self.mountpoint.clone(),
             mount: self.mount.clone(),
             entry,
         }
     }
 
     pub fn mountpoint(&self) -> &Arc<Mountpoint> {
-        &self.mount.mountpoint
+        &self.mountpoint
     }
 
     pub fn entry(&self) -> &DirEntry {
@@ -601,13 +891,9 @@ impl Location {
     pub fn parent(&self) -> Option<Self> {
         let _tree = MOUNT_TREE_LOCK.read();
         let mut current = self.clone();
-        let mut visited = BTreeSet::new();
         for _ in 0..=MAX_MOUNT_TREE_DEPTH {
             if !current.is_root_of_mount() {
                 return current.entry.parent().map(|entry| current.wrap(entry));
-            }
-            if !visited.insert(current.mountpoint().mount_id) {
-                return None;
             }
             current = current.mountpoint().location_locked()?;
         }
@@ -650,7 +936,10 @@ impl Location {
         let _tree = MOUNT_TREE_LOCK.read();
         let mut components = vec![];
         let mut cur = self.clone();
-        let mut visited = BTreeSet::new();
+        let mut visited = HashSet::new();
+        visited
+            .try_reserve(MAX_MOUNT_TREE_DEPTH.saturating_add(1))
+            .map_err(|_| VfsError::NoMemory)?;
         for _ in 0..=MAX_MOUNT_TREE_DEPTH {
             if !visited.insert(cur.mountpoint().mount_id) {
                 return Err(VfsError::FilesystemLoop);
@@ -694,7 +983,7 @@ impl Location {
         self.mountpoint()
             .children
             .lock()
-            .contains_key(&self.entry.key())
+            .contains_key(&self.entry.key_ref())
     }
 
     pub fn is_root_of_mount(&self) -> bool {
@@ -714,7 +1003,7 @@ impl Location {
             .mountpoint()
             .children
             .lock()
-            .get(&self.entry.key())
+            .get(&self.entry.key_ref())
             .cloned()
         else {
             return Ok(self);
@@ -747,6 +1036,38 @@ impl Location {
             .map(|entry| self.wrap(entry))
     }
 
+    pub fn create_named(
+        &self,
+        name: &str,
+        options: &NamedCreateOptions,
+        disposition: CreateDisposition,
+    ) -> VfsResult<CreateOutcome<Self>> {
+        self.entry
+            .as_dir()?
+            .create_named(name, options, disposition)
+            .map(|outcome| outcome.map(|entry| self.wrap(entry)))
+    }
+
+    pub fn create_anonymous(&self, options: &AnonymousOptions) -> VfsResult<Self> {
+        self.entry
+            .as_dir()?
+            .create_anonymous(options)
+            .map(|entry| self.wrap(entry))
+    }
+
+    pub fn create_symlink(
+        &self,
+        name: &str,
+        target: &str,
+        permission: NodePermission,
+        user: Option<(u32, u32)>,
+    ) -> VfsResult<Self> {
+        self.entry
+            .as_dir()?
+            .create_symlink(name, target, permission, user)
+            .map(|entry| self.wrap(entry))
+    }
+
     pub fn link(&self, name: &str, node: &Self) -> VfsResult<Self> {
         if !Arc::ptr_eq(self.mountpoint(), node.mountpoint()) {
             return Err(VfsError::CrossesDevices);
@@ -765,27 +1086,52 @@ impl Location {
         if src.is_dir() && !self.ptr_eq(dst_dir) && src.is_ancestor_of(&dst_dir.entry)? {
             return Err(VfsError::InvalidInput);
         }
-        self.entry
-            .as_dir()?
-            .rename(src_name, dst_dir.entry.as_dir()?, dst_name)
+        let dst = optional_lookup(dst_dir.entry.as_dir()?.lookup(dst_name))?;
+        {
+            let _tree = MOUNT_TREE_LOCK.read();
+            if self.mountpoint().has_mount_at_or_below_locked(&src)?
+                || match dst.as_ref() {
+                    Some(dst) => self.mountpoint().has_mount_at_or_below_locked(dst)?,
+                    None => false,
+                }
+            {
+                return Err(VfsError::ResourceBusy);
+            }
+        }
+        self.entry.as_dir()?.rename(
+            src_name,
+            &src,
+            dst_dir.entry.as_dir()?,
+            dst_name,
+            dst.as_ref(),
+        )
     }
 
     pub fn unlink(&self, name: &str, is_dir: bool) -> VfsResult<()> {
-        self.entry.as_dir()?.unlink(name, is_dir)
+        let expected = self.entry.as_dir()?.lookup(name)?;
+        self.unlink_entry_checked(name, is_dir, &expected)
     }
 
-    pub fn unlink_checked(
-        &self,
-        name: &str,
-        is_dir: bool,
-        expected: &Self,
-    ) -> VfsResult<()> {
+    pub fn unlink_checked(&self, name: &str, is_dir: bool, expected: &Self) -> VfsResult<()> {
         if !Arc::ptr_eq(self.mountpoint(), expected.mountpoint()) {
             return Err(VfsError::ResourceBusy);
         }
-        self.entry
-            .as_dir()?
-            .unlink_checked(name, is_dir, &expected.entry)
+        self.unlink_entry_checked(name, is_dir, &expected.entry)
+    }
+
+    fn unlink_entry_checked(&self, name: &str, is_dir: bool, expected: &DirEntry) -> VfsResult<()> {
+        {
+            let _tree = MOUNT_TREE_LOCK.read();
+            if self
+                .mountpoint()
+                .children
+                .lock()
+                .contains_key(&expected.key_ref())
+            {
+                return Err(VfsError::ResourceBusy);
+            }
+        }
+        self.entry.as_dir()?.unlink_checked(name, is_dir, expected)
     }
 
     pub fn open_file(&self, name: &str, options: &OpenOptions) -> VfsResult<Location> {
@@ -803,9 +1149,7 @@ impl Location {
         self.entry
             .as_dir()?
             .open_file_with_status(name, options)
-            .and_then(|(entry, created)| {
-                Ok((self.wrap(entry).resolve_mountpoint()?, created))
-            })
+            .and_then(|(entry, created)| Ok((self.wrap(entry).resolve_mountpoint()?, created)))
     }
 
     pub fn read_dir(&self, offset: u64, sink: &mut dyn DirEntrySink) -> VfsResult<usize> {
@@ -813,21 +1157,43 @@ impl Location {
     }
 
     pub fn mount(&self, fs: &Filesystem) -> VfsResult<Arc<Mountpoint>> {
+        self.mount_inner(fs, Some(TypeMap::new()))
+    }
+
+    pub fn mount_with_extensions(
+        &self,
+        fs: &Filesystem,
+        extensions: TypeMap,
+    ) -> VfsResult<Arc<Mountpoint>> {
+        self.mount_inner(fs, Some(extensions))
+    }
+
+    fn mount_inner(
+        &self,
+        fs: &Filesystem,
+        extensions: Option<TypeMap>,
+    ) -> VfsResult<Arc<Mountpoint>> {
         self.check_is_dir()?;
         // `root_dir` is an open filesystem callback. Invoke it before taking
         // the global topology writer so a backend cannot stall pathname
         // readers or re-enter the mount tree while that writer is held.
         let root = fs.root_dir();
+        // Admit the mount object and its policy extensions before taking the
+        // topology writer. Failure only drops an unpublished detached object.
+        let result = Mountpoint::new_mounted(fs, root, self, extensions)?;
         let _tree = mount_tree_write();
         let parent_depth = self.mountpoint().attached_depth_locked()?;
         if parent_depth >= MAX_MOUNT_TREE_DEPTH {
             return Err(VfsError::ResourceBusy);
         }
-        let key = self.entry.key();
-        if self.mountpoint().children.lock().contains_key(&key) {
-            return Err(VfsError::ResourceBusy);
+        let key = self.entry.try_key()?;
+        {
+            let mut children = self.mountpoint().children.lock();
+            if children.contains_key(&key) {
+                return Err(VfsError::ResourceBusy);
+            }
+            children.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
         }
-        let result = Mountpoint::new_mounted(fs, root, self)?;
         self.mountpoint()
             .children
             .lock()
@@ -867,7 +1233,10 @@ impl Location {
         }
 
         let mut current = Some(target.mountpoint().clone());
-        let mut visited = BTreeSet::new();
+        let mut visited = HashSet::new();
+        visited
+            .try_reserve(MAX_MOUNT_TREE_DEPTH.saturating_add(1))
+            .map_err(|_| VfsError::NoMemory)?;
         for _ in 0..=MAX_MOUNT_TREE_DEPTH {
             let Some(mountpoint) = current else {
                 break;
@@ -881,31 +1250,28 @@ impl Location {
             current = mountpoint.parent_mountpoint_locked();
         }
 
-        let target_key = target.entry.key();
-        if target
-            .mountpoint()
-            .children
-            .lock()
-            .contains_key(&target_key)
+        let target_key = target.entry.try_key()?;
         {
-            return Err(VfsError::ResourceBusy);
+            let mut children = target.mountpoint().children.lock();
+            if children.contains_key(&target_key) {
+                return Err(VfsError::ResourceBusy);
+            }
+            children.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
         }
-
         let mut location = self.mountpoint().location.lock();
         if let Some(old_location) = location.as_ref() {
             let old_parent = old_location
                 .mountpoint
                 .upgrade()
                 .ok_or(VfsError::InvalidInput)?;
-            let old_key = old_location.entry.key();
             let mut old_children = old_parent.children.lock();
             if !old_children
-                .get(&old_key)
+                .get(&old_location.entry.key_ref())
                 .is_some_and(|mounted| Arc::ptr_eq(mounted, self.mountpoint()))
             {
                 return Err(VfsError::InvalidInput);
             }
-            old_children.remove(&old_key);
+            old_children.remove(&old_location.entry.key_ref());
         }
 
         *location = Some(MountLocation::new(target));
@@ -915,18 +1281,27 @@ impl Location {
             .lock()
             .insert(target_key, self.mountpoint().clone());
         drop(location);
-        self.mountpoint().refresh_active_handles_locked();
+        Mountpoint::refresh_subtree_handles_locked(&subtree);
         Ok(())
     }
 
-    /// Flushes and detaches this mount when this is its only live Location.
-    ///
-    /// Consuming `self` is part of the exclusivity contract. A borrowed
-    /// `Location` can itself be shared through `Arc<Location>` without adding
-    /// another mount-handle reference, which would make a strong-count-only
-    /// busy check unable to prove that no other thread can use the same lease
-    /// during the lock-free flush window.
-    pub fn unmount(self) -> VfsResult<()> {
+    pub fn check_unmountable(&self) -> VfsResult<()> {
+        if !self.is_root_of_mount() {
+            return Err(VfsError::InvalidInput);
+        }
+        if self.mountpoint().namespace_root {
+            return Err(VfsError::ResourceBusy);
+        }
+
+        let _tree = mount_tree_write();
+        let _admission = self.mount.admission.upgradeable_read().upgrade();
+        if self.mountpoint().has_unmounting_ancestor_locked() {
+            return Err(VfsError::ResourceBusy);
+        }
+        self.mountpoint().validate_detach_locked(true)
+    }
+
+    pub fn prepare_unmount(self) -> VfsResult<PreparedUnmount> {
         if !self.is_root_of_mount() {
             return Err(VfsError::InvalidInput);
         }
@@ -947,23 +1322,38 @@ impl Location {
             self.mountpoint().unmounting.store(true, Ordering::Release);
         }
 
-        let flush_result = self.mountpoint().filesystem.flush();
+        Ok(PreparedUnmount {
+            location: Some(self),
+        })
+    }
+
+    fn cancel_prepared_unmount(&self) {
         let _tree = mount_tree_write();
         let _admission = self.mount.admission.upgradeable_read().upgrade();
-        let result = match flush_result {
-            Ok(())
-                if !self
-                    .mount
-                    .admitted_during_unmount
-                    .load(Ordering::Acquire) =>
-            {
-                self.mountpoint().detach_from_parent_locked(true)
-            }
-            Ok(()) => Err(VfsError::ResourceBusy),
-            Err(err) => Err(err),
+        self.mountpoint().unmounting.store(false, Ordering::Release);
+    }
+
+    fn commit_prepared_unmount(&self) -> VfsResult<()> {
+        let _tree = mount_tree_write();
+        let _admission = self.mount.admission.upgradeable_read().upgrade();
+        let result = if !self.mount.admitted_during_unmount.load(Ordering::Acquire) {
+            self.mountpoint().detach_from_parent_locked(true)
+        } else {
+            Err(VfsError::ResourceBusy)
         };
         self.mountpoint().unmounting.store(false, Ordering::Release);
         result
+    }
+
+    /// Flushes and detaches this mount when this is its only live Location.
+    ///
+    /// Consuming `self` is part of the exclusivity contract. A borrowed
+    /// `Location` can itself be shared through `Arc<Location>` without adding
+    /// another mount-handle reference, which would make a strong-count-only
+    /// busy check unable to prove that no other thread can use the same lease
+    /// during the lock-free flush window.
+    pub fn unmount(self) -> VfsResult<()> {
+        self.prepare_unmount()?.flush()?.commit()
     }
 
     /// Lazily detaches this mount and its descendants from the namespace.
@@ -998,6 +1388,11 @@ impl Location {
                 return Err(VfsError::ResourceBusy);
             }
             for (mountpoint, _) in &mounts {
+                if !mountpoint.namespace_root {
+                    mountpoint.validate_detach_locked(false)?;
+                }
+            }
+            for (mountpoint, _) in &mounts {
                 mountpoint.unmounting.store(true, Ordering::Release);
             }
             mounts
@@ -1020,13 +1415,28 @@ impl Location {
             return Err(err);
         }
 
+        // Revalidate every frozen edge before the first topology mutation.
+        // The leaf-to-root commit below performs no allocation or backend I/O,
+        // so resource pressure after a successful flush cannot leave a partial
+        // detach.
+        for (mountpoint, _) in &mounts {
+            if !mountpoint.namespace_root {
+                if let Err(err) = mountpoint.validate_detach_locked(false) {
+                    for (mountpoint, _) in &mounts {
+                        mountpoint.unmounting.store(false, Ordering::Release);
+                    }
+                    return Err(err);
+                }
+            }
+        }
         let mut detach_error = None;
         for (mountpoint, _) in &mounts {
             if !mountpoint.namespace_root {
-                if let Err(err) = mountpoint.detach_from_parent_locked(false) {
+                if let Err(err) = mountpoint.detach_prevalidated_from_parent_locked() {
                     detach_error = Some(err);
                     break;
                 }
+                mountpoint.refresh_handle_ancestors_locked();
             }
         }
         for (mountpoint, _) in &mounts {
@@ -1041,4 +1451,86 @@ impl Pollable for Location {
     fn poll(&self) -> IoEvents;
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{Arc as StdArc, Barrier},
+        thread,
+    };
+
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Marker(u32);
+
+    fn marker_map(value: u32) -> TypeMap {
+        let mut extensions = TypeMap::new();
+        extensions.insert(Marker(value));
+        extensions
+    }
+
+    #[test]
+    fn extensions_are_initialized_exactly_once() {
+        let extensions = MountExtensions::new(None);
+        assert!(extensions.get_ref::<Marker>().is_none());
+
+        extensions.initialize(marker_map(7)).unwrap();
+        assert_eq!(extensions.get_ref::<Marker>(), Some(&Marker(7)));
+        assert_eq!(
+            extensions.initialize(marker_map(9)),
+            Err(VfsError::AlreadyExists)
+        );
+        assert_eq!(extensions.get_ref::<Marker>(), Some(&Marker(7)));
+    }
+
+    #[test]
+    fn ordinary_mount_extensions_cannot_be_late_initialized() {
+        let extensions = MountExtensions::new(Some(TypeMap::new()));
+        assert_eq!(
+            extensions.initialize(marker_map(1)),
+            Err(VfsError::AlreadyExists)
+        );
+        assert!(extensions.get_ref::<Marker>().is_none());
+    }
+
+    #[test]
+    fn concurrent_extension_loser_observes_completed_publication() {
+        let extensions = StdArc::new(MountExtensions::new(None));
+        let barrier = StdArc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+        for value in [7, 9] {
+            let extensions = extensions.clone();
+            let barrier = barrier.clone();
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                let result = extensions.initialize(marker_map(value));
+                let observed = extensions.get_ref::<Marker>().map(|marker| marker.0);
+                (result, observed)
+            }));
+        }
+        barrier.wait();
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|(result, _)| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(result, _)| *result == Err(VfsError::AlreadyExists))
+                .count(),
+            1
+        );
+        assert!(results.iter().all(|(_, observed)| observed.is_some()));
+        assert_eq!(results[0].1, results[1].1);
+    }
+
+    #[test]
+    fn optional_lookup_only_swallows_not_found() {
+        assert_eq!(optional_lookup::<()>(Err(VfsError::NotFound)), Ok(None));
+        assert_eq!(optional_lookup::<()>(Err(VfsError::Io)), Err(VfsError::Io));
+        assert_eq!(optional_lookup(Ok(7_u8)), Ok(Some(7_u8)));
+    }
 }

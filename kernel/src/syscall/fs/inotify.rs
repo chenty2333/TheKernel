@@ -43,7 +43,7 @@ pub fn sys_inotify_init1(flags: i32) -> AxResult<isize> {
     }
 
     add_file_like(
-        InotifyFile::new(flags & IN_NONBLOCK != 0),
+        InotifyFile::new(flags & IN_NONBLOCK != 0)?,
         flags & IN_CLOEXEC != 0,
     )
     .map(|fd| fd as isize)

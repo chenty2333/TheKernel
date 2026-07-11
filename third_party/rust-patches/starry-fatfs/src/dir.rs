@@ -1,12 +1,11 @@
-#[cfg(all(not(feature = "std"), feature = "alloc", feature = "lfn"))]
-use alloc::vec::Vec;
 use core::num;
 use core::str;
 #[cfg(feature = "lfn")]
 use core::{iter, slice};
 
 use crate::dir_entry::{
-    DirEntry, DirEntryData, DirFileEntryData, DirLfnEntryData, FileAttributes, ShortName, DIR_ENTRY_SIZE,
+    DirEntry, DirEntryData, DirFileEntryData, DirLfnEntryData, FileAttributes, ShortName, DIR_ENTRY_DELETED_FLAG,
+    DIR_ENTRY_SIZE,
 };
 #[cfg(feature = "lfn")]
 use crate::dir_entry::{LFN_ENTRY_LAST_FLAG, LFN_PART_LEN};
@@ -18,6 +17,13 @@ use crate::io::{self, IoBase, Read, Seek, SeekFrom, Write};
 use crate::time::TimeProvider;
 
 const LFN_PADDING: u16 = 0xFFFF;
+const MAX_TRANSACTION_DIR_ENTRIES: usize = 21;
+
+struct EntrySnapshot {
+    start: u64,
+    len: usize,
+    entries: [[u8; DIR_ENTRY_SIZE as usize]; MAX_TRANSACTION_DIR_ENTRIES],
+}
 
 pub(crate) enum DirRawStream<'a, IO: ReadWriteSeek, TP, OCC> {
     File(File<'a, IO, TP, OCC>),
@@ -115,6 +121,13 @@ pub struct Dir<'a, IO: ReadWriteSeek, TP, OCC> {
     fs: &'a FileSystem<IO, TP, OCC>,
 }
 
+struct DirectoryParentUpdate<'a, IO: ReadWriteSeek, TP, OCC> {
+    directory: Dir<'a, IO, TP, OCC>,
+    snapshot: EntrySnapshot,
+    replacement: DirFileEntryData,
+    sfn_offset: u64,
+}
+
 impl<'a, IO: ReadWriteSeek, TP, OCC> Dir<'a, IO, TP, OCC> {
     pub(crate) fn new(stream: DirRawStream<'a, IO, TP, OCC>, fs: &'a FileSystem<IO, TP, OCC>) -> Self {
         Dir { stream, fs }
@@ -125,6 +138,16 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> Dir<'a, IO, TP, OCC> {
     #[allow(clippy::iter_not_returning_iterator)]
     pub fn iter(&self) -> DirIter<'a, IO, TP, OCC> {
         DirIter::new(self.stream.clone(), self.fs, true)
+    }
+
+    /// Returns the absolute on-disk position of this directory's parent
+    /// entry. The filesystem root has no entry position.
+    #[must_use]
+    pub fn entry_position(&self) -> Option<u64> {
+        match &self.stream {
+            DirRawStream::File(file) => file.entry_position(),
+            DirRawStream::Root(_) => None,
+        }
     }
 }
 
@@ -274,6 +297,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
     /// * `Error::Io` will be returned if the underlying storage object returned an I/O error.
     pub fn create_file(&self, path: &str) -> Result<File<'a, IO, TP, OCC>, Error<IO::Error>> {
         trace!("Dir::create_file {}", path);
+        self.fs.ensure_not_poisoned()?;
         // traverse path
         let (name, rest_opt) = split_path(path);
         if let Some(rest) = rest_opt {
@@ -307,6 +331,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
     /// * `Error::Io` will be returned if the underlying storage object returned an I/O error.
     pub fn create_dir(&self, path: &str) -> Result<Self, Error<IO::Error>> {
         trace!("Dir::create_dir {}", path);
+        self.fs.ensure_not_poisoned()?;
         // traverse path
         let (name, rest_opt) = split_path(path);
         if let Some(rest) = rest_opt {
@@ -321,12 +346,28 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
                 let cluster = self.fs.alloc_cluster(None, true)?;
                 // create entry in parent directory
                 let sfn_entry = self.create_sfn_entry(short_name, FileAttributes::DIRECTORY, Some(cluster));
-                let entry = self.write_entry(name, sfn_entry)?;
+                let entry = match self.write_entry(name, sfn_entry) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        let reclaimed = self.fs.free_cluster_chain(cluster).is_ok();
+                        return Err(self.rollback_or_poison(error, reclaimed));
+                    }
+                };
                 let dir = entry.to_dir();
                 // create special entries "." and ".."
                 let dot_sfn = ShortNameGenerator::generate_dot();
                 let sfn_entry = self.create_sfn_entry(dot_sfn, FileAttributes::DIRECTORY, entry.first_cluster());
-                dir.write_entry(".", sfn_entry)?;
+                if let Err(error) = dir.write_entry(".", sfn_entry) {
+                    let parent_removed = self
+                        .delete_range(
+                            entry.offset_range.0,
+                            usize::try_from((entry.offset_range.1 - entry.offset_range.0) / u64::from(DIR_ENTRY_SIZE))
+                                .unwrap_or(0),
+                        )
+                        .is_ok();
+                    let reclaimed = self.fs.free_cluster_chain(cluster).is_ok();
+                    return Err(self.rollback_or_poison(error, parent_removed && reclaimed));
+                }
                 let dotdot_sfn = ShortNameGenerator::generate_dotdot();
                 // cluster of the root dir shall be set to 0 in directory entries.
                 let dotdot_cluster = if self.stream.is_root_dir() {
@@ -335,7 +376,17 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
                     self.stream.first_cluster()
                 };
                 let sfn_entry = self.create_sfn_entry(dotdot_sfn, FileAttributes::DIRECTORY, dotdot_cluster);
-                dir.write_entry("..", sfn_entry)?;
+                if let Err(error) = dir.write_entry("..", sfn_entry) {
+                    let parent_removed = self
+                        .delete_range(
+                            entry.offset_range.0,
+                            usize::try_from((entry.offset_range.1 - entry.offset_range.0) / u64::from(DIR_ENTRY_SIZE))
+                                .unwrap_or(0),
+                        )
+                        .is_ok();
+                    let reclaimed = self.fs.free_cluster_chain(cluster).is_ok();
+                    return Err(self.rollback_or_poison(error, parent_removed && reclaimed));
+                }
                 Ok(dir)
             }
             // directory already exists - return it
@@ -343,7 +394,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         }
     }
 
-    fn is_empty(&self) -> Result<bool, Error<IO::Error>> {
+    pub fn is_empty(&self) -> Result<bool, Error<IO::Error>> {
         trace!("Dir::is_empty");
         // check if directory contains no files
         for r in self.iter() {
@@ -355,6 +406,137 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
             }
         }
         Ok(true)
+    }
+
+    /// Prevents further namespace mutations after an upper layer detects that
+    /// its backend rollback could not be completed.
+    #[doc(hidden)]
+    pub fn poison(&self) {
+        self.fs.mark_poisoned();
+    }
+
+    #[doc(hidden)]
+    pub fn is_poisoned(&self) -> bool {
+        self.fs.is_poisoned()
+    }
+
+    fn snapshot_entry(&self, entry: &DirEntry<'a, IO, TP, OCC>) -> Result<EntrySnapshot, Error<IO::Error>> {
+        let bytes = entry
+            .offset_range
+            .1
+            .checked_sub(entry.offset_range.0)
+            .ok_or(Error::CorruptedFileSystem)?;
+        let len = usize::try_from(bytes / u64::from(DIR_ENTRY_SIZE)).map_err(|_| Error::CorruptedFileSystem)?;
+        if bytes % u64::from(DIR_ENTRY_SIZE) != 0 || len == 0 || len > MAX_TRANSACTION_DIR_ENTRIES {
+            return Err(Error::CorruptedFileSystem);
+        }
+
+        let mut snapshot = EntrySnapshot {
+            start: entry.offset_range.0,
+            len,
+            entries: [[0; DIR_ENTRY_SIZE as usize]; MAX_TRANSACTION_DIR_ENTRIES],
+        };
+        let mut stream = self.stream.clone();
+        stream.seek(SeekFrom::Start(snapshot.start))?;
+        for bytes in snapshot.entries.iter_mut().take(snapshot.len) {
+            stream.read_exact(bytes)?;
+        }
+        Ok(snapshot)
+    }
+
+    fn restore_snapshot(&self, snapshot: &EntrySnapshot) -> Result<(), Error<IO::Error>> {
+        let mut stream = self.stream.clone();
+        stream.seek(SeekFrom::Start(snapshot.start))?;
+        for bytes in snapshot.entries.iter().take(snapshot.len) {
+            stream.write_all(bytes)?;
+        }
+        Ok(())
+    }
+
+    fn delete_snapshot(&self, snapshot: &EntrySnapshot) -> Result<(), Error<IO::Error>> {
+        let mut stream = self.stream.clone();
+        stream.seek(SeekFrom::Start(snapshot.start))?;
+        for original in snapshot.entries.iter().take(snapshot.len) {
+            let mut deleted = *original;
+            deleted[0] = DIR_ENTRY_DELETED_FLAG;
+            stream.write_all(&deleted)?;
+        }
+        Ok(())
+    }
+
+    fn delete_range(&self, start: u64, len: usize) -> Result<(), Error<IO::Error>> {
+        if len == 0 || len > MAX_TRANSACTION_DIR_ENTRIES {
+            return Err(Error::CorruptedFileSystem);
+        }
+        let mut stream = self.stream.clone();
+        stream.seek(SeekFrom::Start(start))?;
+        let mut deleted = [0_u8; DIR_ENTRY_SIZE as usize];
+        deleted[0] = DIR_ENTRY_DELETED_FLAG;
+        for _ in 0..len {
+            stream.write_all(&deleted)?;
+        }
+        Ok(())
+    }
+
+    fn rollback_or_poison<T>(&self, original: Error<T>, rollback_succeeded: bool) -> Error<T> {
+        if rollback_succeeded {
+            original
+        } else {
+            self.fs.mark_poisoned();
+            Error::CorruptedFileSystem
+        }
+    }
+
+    fn prepare_directory_parent_update(
+        &self,
+        source: &DirEntry<'a, IO, TP, OCC>,
+        dst_dir: &Dir<'a, IO, TP, OCC>,
+    ) -> Result<Option<DirectoryParentUpdate<'a, IO, TP, OCC>>, Error<IO::Error>> {
+        if !source.is_dir() {
+            return Ok(None);
+        }
+        let directory = source.to_dir();
+        let dotdot = directory.find_entry("..", Some(true), None)?;
+        let snapshot = directory.snapshot_entry(&dotdot)?;
+        let mut replacement = dotdot.data.clone();
+        let parent_cluster = if dst_dir.stream.is_root_dir() {
+            None
+        } else {
+            dst_dir.stream.first_cluster()
+        };
+        if dotdot.first_cluster() == parent_cluster {
+            return Ok(None);
+        }
+        replacement.set_first_cluster(parent_cluster, self.fs.fat_type());
+        let sfn_offset = dotdot
+            .offset_range
+            .1
+            .checked_sub(u64::from(DIR_ENTRY_SIZE))
+            .ok_or(Error::CorruptedFileSystem)?;
+        Ok(Some(DirectoryParentUpdate {
+            directory,
+            snapshot,
+            replacement,
+            sfn_offset,
+        }))
+    }
+
+    fn apply_directory_parent_update(
+        update: Option<&DirectoryParentUpdate<'a, IO, TP, OCC>>,
+    ) -> Result<(), Error<IO::Error>> {
+        let Some(update) = update else {
+            return Ok(());
+        };
+        let mut stream = update.directory.stream.clone();
+        stream.seek(SeekFrom::Start(update.sfn_offset))?;
+        update.replacement.serialize(&mut stream)
+    }
+
+    fn restore_directory_parent_update(update: Option<&DirectoryParentUpdate<'a, IO, TP, OCC>>) -> bool {
+        match update {
+            Some(update) => update.directory.restore_snapshot(&update.snapshot).is_ok(),
+            None => true,
+        }
     }
 
     /// Removes existing file or directory.
@@ -373,6 +555,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
     /// * `Error::Io` will be returned if the underlying storage object returned an I/O error.
     pub fn remove(&self, path: &str) -> Result<(), Error<IO::Error>> {
         trace!("Dir::remove {}", path);
+        self.fs.ensure_not_poisoned()?;
         // traverse path
         let (name, rest_opt) = split_path(path);
         if let Some(rest) = rest_opt {
@@ -384,20 +567,19 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         if e.is_dir() && !e.to_dir().is_empty()? {
             return Err(Error::DirectoryIsNotEmpty);
         }
-        // free data
-        if let Some(n) = e.first_cluster() {
-            self.fs.free_cluster_chain(n)?;
+        let snapshot = self.snapshot_entry(&e)?;
+        if let Err(error) = self.delete_snapshot(&snapshot) {
+            let restored = self.restore_snapshot(&snapshot).is_ok();
+            return Err(self.rollback_or_poison(error, restored));
         }
-        // free long and short name entries
-        let mut stream = self.stream.clone();
-        stream.seek(SeekFrom::Start(e.offset_range.0))?;
-        let num = ((e.offset_range.1 - e.offset_range.0) / u64::from(DIR_ENTRY_SIZE)) as usize;
-        for _ in 0..num {
-            let mut data = DirEntryData::deserialize(&mut stream)?;
-            trace!("removing dir entry {:?}", data);
-            data.set_deleted();
-            stream.seek(SeekFrom::Current(-i64::from(DIR_ENTRY_SIZE)))?;
-            data.serialize(&mut stream)?;
+        if let Some(cluster) = e.first_cluster() {
+            if self.fs.free_cluster_chain(cluster).is_err() {
+                // Once a FAT chain update fails it may be partial; restoring a
+                // directory entry that points at it would be less safe than
+                // keeping the namespace detached and poisoning the mount.
+                self.fs.mark_poisoned();
+                return Err(Error::CorruptedFileSystem);
+            }
         }
         Ok(())
     }
@@ -420,6 +602,10 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
     /// * `Error::Io` will be returned if the underlying storage object returned an I/O error.
     pub fn rename(&self, src_path: &str, dst_dir: &Dir<IO, TP, OCC>, dst_path: &str) -> Result<(), Error<IO::Error>> {
         trace!("Dir::rename {} {}", src_path, dst_path);
+        self.fs.ensure_not_poisoned()?;
+        if !core::ptr::eq(self.fs, dst_dir.fs) {
+            return Err(Error::InvalidInput);
+        }
         // traverse source path
         let (src_name, src_rest_opt) = split_path(src_path);
         if let Some(rest) = src_rest_opt {
@@ -436,10 +622,40 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         self.rename_internal(src_path, dst_dir, dst_path)
     }
 
+    /// Renames `src_path` over an existing `dst_path` without deleting the
+    /// destination before the replacement metadata is ready.
+    ///
+    /// FAT has no journal, so this cannot provide power-loss atomicity. At
+    /// runtime, however, every fallible metadata step is followed by an
+    /// explicit rollback; a failed rollback poisons the mounted filesystem.
+    pub fn rename_replace(
+        &self,
+        src_path: &str,
+        dst_dir: &Dir<IO, TP, OCC>,
+        dst_path: &str,
+    ) -> Result<(), Error<IO::Error>> {
+        trace!("Dir::rename_replace {} {}", src_path, dst_path);
+        self.fs.ensure_not_poisoned()?;
+        if !core::ptr::eq(self.fs, dst_dir.fs) {
+            return Err(Error::InvalidInput);
+        }
+        let (src_name, src_rest) = split_path(src_path);
+        if let Some(rest) = src_rest {
+            let entry = self.find_entry(src_name, Some(true), None)?;
+            return entry.to_dir().rename_replace(rest, dst_dir, dst_path);
+        }
+        let (dst_name, dst_rest) = split_path(dst_path);
+        if let Some(rest) = dst_rest {
+            let entry = dst_dir.find_entry(dst_name, Some(true), None)?;
+            return self.rename_replace(src_path, &entry.to_dir(), rest);
+        }
+        self.rename_replace_internal(src_name, dst_dir, dst_name)
+    }
+
     fn rename_internal(
         &self,
         src_name: &str,
-        dst_dir: &Dir<IO, TP, OCC>,
+        dst_dir: &Dir<'a, IO, TP, OCC>,
         dst_name: &str,
     ) -> Result<(), Error<IO::Error>> {
         trace!("Dir::rename_internal {} {}", src_name, dst_name);
@@ -461,20 +677,86 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
             // destionation file does not exist, short name has been generated
             DirEntryOrShortName::ShortName(short_name) => short_name,
         };
-        // free long and short name entries
-        let mut stream = self.stream.clone();
-        stream.seek(SeekFrom::Start(e.offset_range.0))?;
-        let num = ((e.offset_range.1 - e.offset_range.0) / u64::from(DIR_ENTRY_SIZE)) as usize;
-        for _ in 0..num {
-            let mut data = DirEntryData::deserialize(&mut stream)?;
-            trace!("removing LFN entry {:?}", data);
-            data.set_deleted();
-            stream.seek(SeekFrom::Current(-i64::from(DIR_ENTRY_SIZE)))?;
-            data.serialize(&mut stream)?;
-        }
-        // save new directory entry
+        let source_snapshot = self.snapshot_entry(&e)?;
+        let parent_update = self.prepare_directory_parent_update(&e, dst_dir)?;
+        // Publish the destination while the source is still intact. If the
+        // write fails, write_entry removes any partial target range.
         let sfn_entry = e.data.renamed(short_name);
-        dst_dir.write_entry(dst_name, sfn_entry)?;
+        let new_entry = dst_dir.write_entry(dst_name, sfn_entry)?;
+        let target_len =
+            usize::try_from((new_entry.offset_range.1 - new_entry.offset_range.0) / u64::from(DIR_ENTRY_SIZE))
+                .unwrap_or(0);
+        if let Err(error) = Self::apply_directory_parent_update(parent_update.as_ref()) {
+            let parent_restored = Self::restore_directory_parent_update(parent_update.as_ref());
+            let target_removed = dst_dir.delete_range(new_entry.offset_range.0, target_len).is_ok();
+            return Err(self.rollback_or_poison(error, parent_restored && target_removed));
+        }
+        if let Err(error) = self.delete_snapshot(&source_snapshot) {
+            let source_restored = self.restore_snapshot(&source_snapshot).is_ok();
+            let parent_restored = Self::restore_directory_parent_update(parent_update.as_ref());
+            let target_removed = dst_dir.delete_range(new_entry.offset_range.0, target_len).is_ok();
+            return Err(self.rollback_or_poison(error, source_restored && parent_restored && target_removed));
+        }
+        Ok(())
+    }
+
+    fn rename_replace_internal(
+        &self,
+        src_name: &str,
+        dst_dir: &Dir<'a, IO, TP, OCC>,
+        dst_name: &str,
+    ) -> Result<(), Error<IO::Error>> {
+        let source = self.find_entry(src_name, None, None)?;
+        let destination = dst_dir.find_entry(dst_name, None, None)?;
+        if source.is_same_entry(&destination) {
+            return Ok(());
+        }
+        if source.is_dir() != destination.is_dir() {
+            return Err(Error::InvalidInput);
+        }
+        if destination.is_dir() && !destination.to_dir().is_empty()? {
+            return Err(Error::DirectoryIsNotEmpty);
+        }
+
+        let source_snapshot = self.snapshot_entry(&source)?;
+        let destination_snapshot = dst_dir.snapshot_entry(&destination)?;
+        let parent_update = self.prepare_directory_parent_update(&source, dst_dir)?;
+        let replacement = source.data.renamed_like(&destination.data);
+        let destination_sfn_offset = destination
+            .offset_range
+            .1
+            .checked_sub(u64::from(DIR_ENTRY_SIZE))
+            .ok_or(Error::CorruptedFileSystem)?;
+        let mut destination_stream = dst_dir.stream.clone();
+        destination_stream.seek(SeekFrom::Start(destination_sfn_offset))?;
+        if let Err(error) = replacement.serialize(&mut destination_stream) {
+            let restored = dst_dir.restore_snapshot(&destination_snapshot).is_ok();
+            return Err(self.rollback_or_poison(error, restored));
+        }
+
+        if let Err(error) = Self::apply_directory_parent_update(parent_update.as_ref()) {
+            let parent_restored = Self::restore_directory_parent_update(parent_update.as_ref());
+            let destination_restored = dst_dir.restore_snapshot(&destination_snapshot).is_ok();
+            return Err(self.rollback_or_poison(error, parent_restored && destination_restored));
+        }
+
+        if let Err(error) = self.delete_snapshot(&source_snapshot) {
+            let source_restored = self.restore_snapshot(&source_snapshot).is_ok();
+            let parent_restored = Self::restore_directory_parent_update(parent_update.as_ref());
+            let destination_restored = dst_dir.restore_snapshot(&destination_snapshot).is_ok();
+            return Err(self.rollback_or_poison(error, source_restored && parent_restored && destination_restored));
+        }
+
+        if let Some(replaced_cluster) = destination.first_cluster() {
+            if Some(replaced_cluster) != source.first_cluster() && self.fs.free_cluster_chain(replaced_cluster).is_err()
+            {
+                // The namespace replacement is already complete, and a FAT
+                // chain free may itself be partial. Do not pretend rollback is
+                // possible after that point.
+                self.fs.mark_poisoned();
+                return Err(Error::CorruptedFileSystem);
+            }
+        }
         Ok(())
     }
 
@@ -537,33 +819,6 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         LfnBuffer {}
     }
 
-    #[allow(clippy::type_complexity)]
-    fn alloc_and_write_lfn_entries(
-        &self,
-        lfn_utf16: &LfnBuffer,
-        short_name: &[u8; SFN_SIZE],
-    ) -> Result<(DirRawStream<'a, IO, TP, OCC>, u64), Error<IO::Error>> {
-        // get short name checksum
-        let lfn_chsum = lfn_checksum(short_name);
-        // create LFN entries generator
-        let lfn_iter = LfnEntriesGenerator::new(lfn_utf16.as_ucs2_units(), lfn_chsum);
-        // find space for new entries (multiple LFN entries and 1 SFN entry)
-        let num_entries = lfn_iter.len() as u32 + 1;
-        let mut stream = self.find_free_entries(num_entries)?;
-        let start_pos = stream.seek(io::SeekFrom::Current(0))?;
-        // write LFN entries before SFN entry
-        for lfn_entry in lfn_iter {
-            lfn_entry.serialize(&mut stream)?;
-        }
-        Ok((stream, start_pos))
-    }
-
-    fn alloc_sfn_entry(&self) -> Result<(DirRawStream<'a, IO, TP, OCC>, u64), Error<IO::Error>> {
-        let mut stream = self.find_free_entries(1)?;
-        let start_pos = stream.seek(io::SeekFrom::Current(0))?;
-        Ok((stream, start_pos))
-    }
-
     fn write_entry(
         &self,
         name: &str,
@@ -574,23 +829,42 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         validate_long_name(name)?;
         // convert long name to UTF-16
         let lfn_utf16 = Self::encode_lfn_utf16(name);
-        // write LFN entries, except for . and .., which need to be at
-        // the first two slots and don't need LFNs anyway
-        let (mut stream, start_pos) = if name == "." || name == ".." {
-            self.alloc_sfn_entry()?
+        let special = name == "." || name == "..";
+        #[cfg(feature = "lfn")]
+        let lfn_entries = if special {
+            0
         } else {
-            self.alloc_and_write_lfn_entries(&lfn_utf16, raw_entry.name())?
+            lfn_utf16.len().div_ceil(LFN_PART_LEN)
         };
-        // write short name entry
-        raw_entry.serialize(&mut stream)?;
-        // Get position directory stream after entries were written
-        let end_pos = stream.seek(io::SeekFrom::Current(0))?;
-        // Get current absolute position on the storage
-        // Unwrapping is safe because abs_pos() returns None only if stream is at position 0. This is not
-        // the case because an entry was just written
-        // Note: if current position is on the cluster boundary then a position in the cluster containing the entry is
-        // returned
-        let end_abs_pos = stream.abs_pos().unwrap();
+        #[cfg(not(feature = "lfn"))]
+        let lfn_entries = 0;
+        let num_entries = lfn_entries + 1;
+        if num_entries > MAX_TRANSACTION_DIR_ENTRIES {
+            return Err(Error::InvalidFileNameLength);
+        }
+
+        let mut stream = self.find_free_entries(num_entries as u32)?;
+        let start_pos = stream.seek(io::SeekFrom::Current(0))?;
+        let write_result = (|| {
+            #[cfg(feature = "lfn")]
+            if !special {
+                let checksum = lfn_checksum(raw_entry.name());
+                for lfn_entry in LfnEntriesGenerator::new(lfn_utf16.as_ucs2_units(), checksum) {
+                    lfn_entry.serialize(&mut stream)?;
+                }
+            }
+            raw_entry.serialize(&mut stream)?;
+            let end_pos = stream.seek(io::SeekFrom::Current(0))?;
+            let end_abs_pos = stream.abs_pos().ok_or(Error::CorruptedFileSystem)?;
+            Ok((end_pos, end_abs_pos))
+        })();
+        let (end_pos, end_abs_pos) = match write_result {
+            Ok(result) => result,
+            Err(error) => {
+                let rollback_succeeded = self.delete_range(start_pos, num_entries).is_ok();
+                return Err(self.rollback_or_poison(error, rollback_succeeded));
+            }
+        };
         // Calculate SFN entry start position on the storage
         let start_abs_pos = end_abs_pos - u64::from(DIR_ENTRY_SIZE);
         // return new logical entry descriptor
@@ -765,59 +1039,21 @@ fn lfn_checksum(short_name: &[u8; SFN_SIZE]) -> u8 {
     chksum.0
 }
 
-#[cfg(all(feature = "lfn", feature = "alloc"))]
-#[derive(Clone)]
-pub(crate) struct LfnBuffer {
-    ucs2_units: Vec<u16>,
-}
-
 const MAX_LONG_NAME_LEN: usize = 255;
 
 #[cfg(feature = "lfn")]
 const MAX_LONG_DIR_ENTRIES: usize = (MAX_LONG_NAME_LEN + LFN_PART_LEN - 1) / LFN_PART_LEN;
 
-#[cfg(all(feature = "lfn", not(feature = "alloc")))]
 const LONG_NAME_BUFFER_LEN: usize = MAX_LONG_DIR_ENTRIES * LFN_PART_LEN;
 
-#[cfg(all(feature = "lfn", not(feature = "alloc")))]
+#[cfg(feature = "lfn")]
 #[derive(Clone)]
 pub(crate) struct LfnBuffer {
     ucs2_units: [u16; LONG_NAME_BUFFER_LEN],
     len: usize,
 }
 
-#[cfg(all(feature = "lfn", feature = "alloc"))]
-impl LfnBuffer {
-    fn new() -> Self {
-        Self {
-            ucs2_units: Vec::<u16>::new(),
-        }
-    }
-
-    fn from_ucs2_units<I: Iterator<Item = u16>>(usc2_units: I) -> Self {
-        Self {
-            ucs2_units: usc2_units.collect(),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.ucs2_units.clear();
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.ucs2_units.len()
-    }
-
-    fn set_len(&mut self, len: usize) {
-        self.ucs2_units.resize(len, 0_u16);
-    }
-
-    pub(crate) fn as_ucs2_units(&self) -> &[u16] {
-        &self.ucs2_units
-    }
-}
-
-#[cfg(all(feature = "lfn", not(feature = "alloc")))]
+#[cfg(feature = "lfn")]
 impl LfnBuffer {
     fn new() -> Self {
         Self {

@@ -1,34 +1,93 @@
 use alloc::{
-    borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
     format,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{any::Any, task::Context};
+use core::{
+    any::Any,
+    sync::atomic::{AtomicU64, Ordering},
+    task::Context,
+};
 
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{
-    DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode, FileNodeOps, Filesystem,
-    FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission, NodeType,
-    Reference, StatFs, VfsError, VfsResult, WeakDirEntry, path::MAX_NAME_LEN,
+    CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps,
+    FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata, MetadataUpdate, NamedCreateOptions,
+    NodeFlags, NodeOps, NodePermission, NodeType, Reference, RenameRequest, StatFs, UnlinkRequest,
+    VfsError, VfsResult, WeakDirEntry, path::MAX_NAME_LEN,
 };
 use axhal::time::wall_time;
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
-use slab::Slab;
+use hashbrown::{HashMap, HashSet};
+use spin::Lazy;
 use starry_process::Pid;
 use starry_signal::{SignalInfo, Signo};
 
 use super::pseudo_stat_fs;
 use crate::{
     file::{Directory, OpenCredentials, current_file_write_credentials, get_typed_file},
-    task::{AsThread, get_process_data, send_signal_to_process},
+    task::{AsThread, get_process_data, get_process_including_zombie, send_signal_to_process},
 };
 
 const CGROUP_SUPER_MAGIC: u32 = 0x27e0_eb;
 const CGROUP2_SUPER_MAGIC: u32 = 0x6367_7270;
+const MAX_CGROUP_CHILDREN: usize = 65_536;
+/// Bound recursive hierarchy walks and the number of simultaneously held
+/// descendant locks. Cgroup state is synthetic and starts empty on every boot,
+/// so enforcing this at create/move admission covers every reachable tree.
+const MAX_CGROUP_DEPTH: usize = 256;
+/// TheKernel does not yet have system-wide task accounting that can serve as
+/// a cgroup membership budget. Keep both membership indexes explicitly
+/// bounded until that accounting can own a tunable limit.
+const MAX_CGROUP_MEMBERSHIPS: usize = 65_536;
+
+fn try_reserve_cgroup_child_slot(
+    children: &mut HashMap<String, Arc<CgroupDir>>,
+    limit: usize,
+    grows: bool,
+) -> VfsResult<()> {
+    if grows && children.len() >= limit {
+        return Err(VfsError::NoMemory);
+    }
+    children.try_reserve(1).map_err(|_| VfsError::NoMemory)
+}
+
+fn try_owned(value: &str) -> VfsResult<String> {
+    let mut result = String::new();
+    result
+        .try_reserve_exact(value.len())
+        .map_err(|_| VfsError::NoMemory)?;
+    result.push_str(value);
+    Ok(result)
+}
+
+fn try_join_names<'a, I>(names: I) -> VfsResult<String>
+where
+    I: Iterator<Item = &'a str> + Clone,
+{
+    let count = names.clone().count();
+    let capacity = names
+        .clone()
+        .try_fold(0usize, |total, name| total.checked_add(name.len()))
+        .and_then(|capacity| capacity.checked_add(count.saturating_sub(1)))
+        .and_then(|capacity| capacity.checked_add(usize::from(count != 0)))
+        .ok_or(VfsError::NoMemory)?;
+    let mut out = String::new();
+    out.try_reserve_exact(capacity)
+        .map_err(|_| VfsError::NoMemory)?;
+    for (index, name) in names.enumerate() {
+        if index != 0 {
+            out.push(' ');
+        }
+        out.push_str(name);
+    }
+    if count != 0 {
+        out.push('\n');
+    }
+    Ok(out)
+}
 
 const CONTROL_FILES: &[&str] = &[
     "tasks",
@@ -41,6 +100,10 @@ const CONTROL_FILES: &[&str] = &[
     "pids.events",
     "pids.peak",
 ];
+/// One global synthetic-inode budget for a cgroup filesystem.  Per-parent
+/// child limits alone do not bound a deep tree; this keeps allocator-backed
+/// identity bookkeeping finite until cgroup memory accounting exists.
+const MAX_CGROUP_INODES: usize = (MAX_CGROUP_CHILDREN + 1) * (CONTROL_FILES.len() + 1);
 
 const ALL_CONTROLLERS: &[&str] = &["pids"];
 const KNOWN_V1_CONTROLLERS: &[&str] = &[
@@ -61,7 +124,18 @@ const KNOWN_V1_CONTROLLERS: &[&str] = &[
     "rdma",
 ];
 
-static PID_CGROUPS: Mutex<BTreeMap<Pid, Weak<CgroupDir>>> = Mutex::new(BTreeMap::new());
+struct PidMembershipRegistry {
+    /// Serializes admission and publication. Registry locks are always taken
+    /// after this lock, with the global map before per-cgroup member sets.
+    operation: Mutex<()>,
+    by_pid: Mutex<HashMap<Pid, Weak<CgroupDir>>>,
+    global_limit: usize,
+    per_cgroup_limit: usize,
+}
+
+static PID_CGROUPS: Lazy<PidMembershipRegistry> = Lazy::new(|| {
+    PidMembershipRegistry::with_limits(MAX_CGROUP_MEMBERSHIPS, MAX_CGROUP_MEMBERSHIPS)
+});
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CgroupVersion {
@@ -69,18 +143,19 @@ enum CgroupVersion {
     V2,
 }
 
-pub fn new_cgroup_v1(controllers: Vec<String>) -> Filesystem {
+pub fn new_cgroup_v1(controllers: Vec<String>) -> VfsResult<Filesystem> {
     CgroupFs::new(CgroupVersion::V1, controllers)
 }
 
-pub fn new_cgroup_v2() -> Filesystem {
-    CgroupFs::new(
-        CgroupVersion::V2,
-        ALL_CONTROLLERS
-            .iter()
-            .map(|controller| (*controller).to_string())
-            .collect(),
-    )
+pub fn new_cgroup_v2() -> VfsResult<Filesystem> {
+    let mut controllers = Vec::new();
+    controllers
+        .try_reserve_exact(ALL_CONTROLLERS.len())
+        .map_err(|_| VfsError::NoMemory)?;
+    for controller in ALL_CONTROLLERS {
+        controllers.push(try_owned(controller)?);
+    }
+    CgroupFs::new(CgroupVersion::V2, controllers)
 }
 
 pub fn parse_v1_controllers(source: &str, data: &str) -> AxResult<Vec<String>> {
@@ -88,7 +163,8 @@ pub fn parse_v1_controllers(source: &str, data: &str) -> AxResult<Vec<String>> {
     for token in source.split(',') {
         let token = token.trim();
         if ALL_CONTROLLERS.contains(&token) && !controllers.iter().any(|it| it == token) {
-            controllers.push(token.to_string());
+            controllers.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            controllers.push(try_owned(token)?);
         } else if KNOWN_V1_CONTROLLERS.contains(&token) {
             return Err(AxError::NoSuchDevice);
         }
@@ -99,7 +175,8 @@ pub fn parse_v1_controllers(source: &str, data: &str) -> AxResult<Vec<String>> {
             continue;
         }
         if ALL_CONTROLLERS.contains(&token) && !controllers.iter().any(|it| it == token) {
-            controllers.push(token.to_string());
+            controllers.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            controllers.push(try_owned(token)?);
         } else if KNOWN_V1_CONTROLLERS.contains(&token) {
             return Err(AxError::NoSuchDevice);
         } else {
@@ -107,7 +184,8 @@ pub fn parse_v1_controllers(source: &str, data: &str) -> AxResult<Vec<String>> {
         }
     }
     if controllers.is_empty() {
-        controllers.push("pids".to_string());
+        controllers.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        controllers.push(try_owned("pids")?);
     }
     Ok(controllers)
 }
@@ -135,14 +213,16 @@ struct CgroupFs {
     fs_type: u32,
     version: CgroupVersion,
     controllers: Vec<String>,
-    inodes: Mutex<Slab<()>>,
+    namespace: Mutex<()>,
+    inodes: Mutex<HashSet<u64>>,
+    next_inode: AtomicU64,
     root: Mutex<Option<DirEntry>>,
     root_dir: Mutex<Option<Arc<CgroupDir>>>,
 }
 
 impl CgroupFs {
-    fn new(version: CgroupVersion, controllers: Vec<String>) -> Filesystem {
-        let fs = Arc::new(Self {
+    fn new(version: CgroupVersion, controllers: Vec<String>) -> VfsResult<Filesystem> {
+        let fs = Arc::try_new(Self {
             name: match version {
                 CgroupVersion::V1 => "cgroup",
                 CgroupVersion::V2 => "cgroup2",
@@ -153,31 +233,40 @@ impl CgroupFs {
             },
             version,
             controllers,
-            inodes: Mutex::new(Slab::new()),
+            namespace: Mutex::new(()),
+            inodes: Mutex::new(HashSet::new()),
+            next_inode: AtomicU64::new(1),
             root: Mutex::new(None),
             root_dir: Mutex::new(None),
-        });
-        let root_dir = CgroupDir::new_root(fs.clone());
+        })
+        .map_err(|_| VfsError::NoMemory)?;
+        let filesystem = Filesystem::try_new(fs.clone())?;
+        let root_dir = CgroupDir::try_new_root(fs.clone())?;
+        let root = DirEntry::try_new_dir(DirNode::new(root_dir.clone()), Reference::root())?;
+        root_dir.bind(root.downgrade());
         *fs.root_dir.lock() = Some(root_dir.clone());
-        *fs.root.lock() = Some(DirEntry::new_dir(
-            |this| DirNode::new(root_dir.bind(this)),
-            Reference::root(),
-        ));
-        Filesystem::new(fs)
+        *fs.root.lock() = Some(root);
+        Ok(filesystem)
     }
 
-    fn alloc_inode(&self) -> u64 {
-        self.inodes.lock().insert(()) as u64 + 1
+    fn try_alloc_inode(&self) -> VfsResult<u64> {
+        let mut inodes = self.inodes.lock();
+        if inodes.len() >= MAX_CGROUP_INODES {
+            return Err(VfsError::NoMemory);
+        }
+        inodes.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+        let ino = self
+            .next_inode
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| VfsError::StorageFull)?;
+        inodes.insert(ino);
+        Ok(ino)
     }
 
     fn release_inode(&self, ino: u64) {
-        self.inodes.lock().remove(ino as usize - 1);
-    }
-
-    fn remove_pid_everywhere(&self, pid: Pid) {
-        if let Some(root) = self.root_dir.lock().clone() {
-            root.remove_pid_recursive(pid);
-        }
+        self.inodes.lock().remove(&ino);
     }
 }
 
@@ -207,8 +296,8 @@ struct CgroupNode {
 }
 
 impl CgroupNode {
-    fn new(fs: Arc<CgroupFs>, node_type: NodeType, mode: NodePermission) -> Self {
-        let ino = fs.alloc_inode();
+    fn try_new(fs: Arc<CgroupFs>, node_type: NodeType, mode: NodePermission) -> VfsResult<Self> {
+        let ino = fs.try_alloc_inode()?;
         let now = wall_time();
         let metadata = Metadata {
             device: 0,
@@ -227,11 +316,11 @@ impl CgroupNode {
             mtime: now,
             ctime: now,
         };
-        Self {
+        Ok(Self {
             fs,
             ino,
             metadata: Mutex::new(metadata),
-        }
+        })
     }
 
     fn metadata(&self) -> Metadata {
@@ -277,75 +366,156 @@ impl Drop for CgroupNode {
 
 struct CgroupDir {
     node: CgroupNode,
-    parent: Option<Weak<CgroupDir>>,
+    parent: Mutex<Option<Weak<CgroupDir>>>,
     this: Mutex<Option<WeakDirEntry>>,
-    children: Mutex<BTreeMap<String, Arc<CgroupDir>>>,
-    files: BTreeMap<String, Arc<CgroupFile>>,
-    pids: Mutex<BTreeSet<Pid>>,
+    namespace_epoch: AtomicU64,
+    children: Mutex<HashMap<String, Arc<CgroupDir>>>,
+    files: HashMap<&'static str, Arc<CgroupFile>>,
+    pids: Mutex<HashSet<Pid>>,
     pids_max: Mutex<Option<u64>>,
     pids_peak: Mutex<u64>,
     pids_events_limit: Mutex<u64>,
-    subtree_control: Mutex<BTreeSet<String>>,
+    subtree_control: Mutex<HashSet<String>>,
 }
 
 impl CgroupDir {
-    fn new_root(fs: Arc<CgroupFs>) -> Arc<Self> {
-        Self::new(fs, None)
+    fn try_new_root(fs: Arc<CgroupFs>) -> VfsResult<Arc<Self>> {
+        Self::try_new(fs, None)
     }
 
-    fn new(fs: Arc<CgroupFs>, parent: Option<Weak<CgroupDir>>) -> Arc<Self> {
+    fn try_new(fs: Arc<CgroupFs>, parent: Option<Weak<CgroupDir>>) -> VfsResult<Arc<Self>> {
         let mode = NodePermission::from_bits_truncate(0o755);
-        let files = CONTROL_FILES
-            .iter()
-            .map(|name| ((*name).to_string(), CgroupFile::new(fs.clone(), *name)))
-            .collect();
-        let dir = Arc::new(Self {
-            node: CgroupNode::new(fs, NodeType::Directory, mode),
-            parent,
+        let mut files = HashMap::new();
+        files
+            .try_reserve(CONTROL_FILES.len())
+            .map_err(|_| VfsError::NoMemory)?;
+        for &name in CONTROL_FILES {
+            files.insert(name, CgroupFile::try_new(fs.clone(), name)?);
+        }
+        let node = CgroupNode::try_new(fs, NodeType::Directory, mode)?;
+        let dir = Arc::try_new(Self {
+            node,
+            parent: Mutex::new(parent),
             this: Mutex::new(None),
-            children: Mutex::new(BTreeMap::new()),
+            namespace_epoch: AtomicU64::new(0),
+            children: Mutex::new(HashMap::new()),
             files,
-            pids: Mutex::new(BTreeSet::new()),
+            pids: Mutex::new(HashSet::new()),
             pids_max: Mutex::new(None),
             pids_peak: Mutex::new(0),
             pids_events_limit: Mutex::new(0),
-            subtree_control: Mutex::new(BTreeSet::new()),
-        });
+            subtree_control: Mutex::new(HashSet::new()),
+        })
+        .map_err(|_| VfsError::NoMemory)?;
         dir.bind_control_files();
-        dir
+        Ok(dir)
     }
 
-    fn bind(self: &Arc<Self>, this: WeakDirEntry) -> Arc<Self> {
+    fn bind(&self, this: WeakDirEntry) {
         *self.this.lock() = Some(this);
-        self.clone()
     }
 
-    fn reference(&self, name: &str) -> Reference {
-        Reference::new(
+    fn reference(&self, name: &str) -> VfsResult<Reference> {
+        Ok(Reference::new(
             self.this.lock().as_ref().and_then(WeakDirEntry::upgrade),
-            name.to_string(),
+            try_owned(name)?,
+        ))
+    }
+
+    fn try_child_entry(&self, name: &str, child: Arc<CgroupDir>) -> VfsResult<DirEntry> {
+        let entry = DirEntry::try_new_dir(DirNode::new(child.clone()), self.reference(name)?)?;
+        child.bind(entry.downgrade());
+        Ok(entry)
+    }
+
+    fn try_file_entry(&self, name: &str, file: Arc<CgroupFile>) -> VfsResult<DirEntry> {
+        DirEntry::try_new_file(
+            FileNode::new(file),
+            NodeType::RegularFile,
+            self.reference(name)?,
         )
     }
 
-    fn live_pids(&self) -> Vec<Pid> {
-        let mut pids = self.pids.lock();
-        pids.retain(|pid| get_process_data(*pid).is_ok());
-        pids.iter().copied().collect()
+    fn matches_expected_dir(&self, expected: &DirEntry, actual: &Arc<CgroupDir>) -> bool {
+        expected.downcast::<CgroupDir>().is_ok_and(|expected| {
+            Arc::ptr_eq(&self.node.fs, &expected.node.fs) && Arc::ptr_eq(&expected, actual)
+        })
     }
 
-    fn remove_pid_recursive(&self, pid: Pid) {
-        self.pids.lock().remove(&pid);
-        for child in self.children.lock().values() {
-            child.remove_pid_recursive(pid);
+    fn touch_namespace(&self, now: core::time::Duration) {
+        self.node.update_metadata(MetadataUpdate {
+            mtime: Some(now),
+            ctime: Some(now),
+            ..Default::default()
+        });
+    }
+
+    fn is_same_or_descendant_of(candidate: &Arc<Self>, ancestor: &Arc<Self>) -> bool {
+        let mut current = Some(candidate.clone());
+        for _ in 0..=MAX_CGROUP_DEPTH {
+            let Some(dir) = current else {
+                return false;
+            };
+            if Arc::ptr_eq(&dir, ancestor) {
+                return true;
+            }
+            current = dir.parent.lock().as_ref().and_then(Weak::upgrade);
         }
+        // A hierarchy deeper than the admitted bound, or a parent cycle, is
+        // malformed. Conservatively reject moves through it.
+        true
+    }
+
+    fn hierarchy_depth(&self) -> VfsResult<usize> {
+        let mut depth = 0usize;
+        let mut current = self.parent.lock().as_ref().and_then(Weak::upgrade);
+        while let Some(dir) = current {
+            depth = depth.checked_add(1).ok_or(VfsError::FilesystemLoop)?;
+            if depth > MAX_CGROUP_DEPTH {
+                return Err(VfsError::FilesystemLoop);
+            }
+            current = dir.parent.lock().as_ref().and_then(Weak::upgrade);
+        }
+        Ok(depth)
+    }
+
+    fn subtree_height(&self, remaining: usize) -> VfsResult<usize> {
+        let children = self.children.lock();
+        if children.is_empty() {
+            return Ok(0);
+        }
+        if remaining == 0 {
+            return Err(VfsError::FilesystemLoop);
+        }
+        let mut height = 0usize;
+        for child in children.values() {
+            height = height.max(
+                child
+                    .subtree_height(remaining - 1)?
+                    .checked_add(1)
+                    .ok_or(VfsError::FilesystemLoop)?,
+            );
+        }
+        Ok(height)
+    }
+
+    fn try_live_pids(&self) -> VfsResult<Vec<Pid>> {
+        let pids = self.pids.lock();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(pids.len())
+            .map_err(|_| VfsError::NoMemory)?;
+        snapshot.extend(pids.iter().copied());
+        Ok(snapshot)
     }
 
     fn recursive_live_pid_count(&self) -> usize {
-        let local = self.live_pids().len();
-        let children = self.children.lock().values().cloned().collect::<Vec<_>>();
+        let local = self.pids.lock().len();
         local
-            + children
-                .iter()
+            + self
+                .children
+                .lock()
+                .values()
                 .map(|child| child.recursive_live_pid_count())
                 .sum::<usize>()
     }
@@ -362,7 +532,7 @@ impl CgroupDir {
         let mut current = Some(self.clone());
         while let Some(dir) = current {
             dir.update_pids_peak(dir.recursive_live_pid_count());
-            current = dir.parent.as_ref().and_then(Weak::upgrade);
+            current = dir.parent.lock().as_ref().and_then(Weak::upgrade);
         }
     }
 
@@ -377,7 +547,7 @@ impl CgroupDir {
                     return Some(dir);
                 }
             }
-            current = dir.parent.as_ref().and_then(Weak::upgrade);
+            current = dir.parent.lock().as_ref().and_then(Weak::upgrade);
         }
         None
     }
@@ -396,6 +566,7 @@ impl CgroupDir {
                 .any(|controller| controller == "pids"),
             CgroupVersion::V2 => self
                 .parent
+                .lock()
                 .as_ref()
                 .and_then(Weak::upgrade)
                 .is_some_and(|parent| parent.subtree_control.lock().contains("pids")),
@@ -410,7 +581,7 @@ impl CgroupDir {
             }
             CgroupVersion::V2 => match name {
                 "cgroup.procs" | "cgroup.controllers" | "cgroup.subtree_control" => true,
-                "cgroup.kill" => self.parent.is_some(),
+                "cgroup.kill" => self.parent.lock().is_some(),
                 _ if name.starts_with("pids.") => self.pids_controller_active(),
                 _ => false,
             },
@@ -430,7 +601,7 @@ impl CgroupDir {
 
     fn v2_has_enabled_child_controllers(&self) -> bool {
         self.node.fs.version == CgroupVersion::V2
-            && self.parent.is_some()
+            && self.parent.lock().is_some()
             && !self.subtree_control.lock().is_empty()
     }
 
@@ -452,76 +623,69 @@ impl CgroupDir {
             return Err(VfsError::PermissionDenied);
         }
         let this = self.this_dir()?;
-        detach_mapped_pid(pid);
-        self.node.fs.remove_pid_everywhere(pid);
-        self.pids.lock().insert(pid);
-        PID_CGROUPS.lock().insert(pid, Arc::downgrade(&this));
-        this.update_pids_peak_hierarchy();
+        PID_CGROUPS.try_attach(&this, pid, false)?;
         Ok(())
     }
 
-    fn attach_fork_child(self: &Arc<Self>, pid: Pid) {
-        self.pids.lock().insert(pid);
-        PID_CGROUPS.lock().insert(pid, Arc::downgrade(self));
-        self.update_pids_peak_hierarchy();
+    fn attach_fork_child(self: &Arc<Self>, pid: Pid) -> AxResult<()> {
+        PID_CGROUPS.try_attach(self, pid, true)?;
+        Ok(())
     }
 
-    fn kill_attached(&self) {
-        for pid in self.live_pids() {
+    fn kill_attached(&self) -> VfsResult<()> {
+        for pid in self.try_live_pids()? {
             let _ = send_signal_to_process(pid, Some(SignalInfo::new_kernel(Signo::SIGKILL)));
         }
+        Ok(())
     }
 
-    fn kill_attached_recursive(&self) {
-        self.kill_attached();
-        let children = self.children.lock().values().cloned().collect::<Vec<_>>();
-        for child in children {
-            child.kill_attached_recursive();
+    fn kill_attached_recursive(&self) -> VfsResult<()> {
+        self.kill_attached()?;
+        for child in self.children.lock().values() {
+            child.kill_attached_recursive()?;
         }
+        Ok(())
     }
 
-    fn tasks_text(&self) -> String {
+    fn tasks_text(&self) -> VfsResult<String> {
+        let pids = self.pids.lock();
         let mut out = String::new();
-        for pid in self.live_pids() {
+        out.try_reserve_exact(pids.len().saturating_mul(22))
+            .map_err(|_| VfsError::NoMemory)?;
+        for pid in pids.iter() {
             let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{pid}\n"));
         }
-        out
+        Ok(out)
     }
 
-    fn subtree_control_text(&self) -> String {
-        let mut out = self
-            .subtree_control
-            .lock()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ");
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out
+    fn subtree_control_text(&self) -> VfsResult<String> {
+        let control = self.subtree_control.lock();
+        try_join_names(control.iter().map(String::as_str))
     }
 
-    fn available_controllers(&self) -> BTreeSet<String> {
+    fn controller_available(&self, name: &str) -> bool {
         if self.node.fs.version == CgroupVersion::V1 {
-            return BTreeSet::new();
+            return false;
         }
-        if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
-            return parent.subtree_control.lock().clone();
+        if let Some(parent) = self.parent.lock().as_ref().and_then(Weak::upgrade) {
+            return parent.subtree_control.lock().contains(name);
         }
-        self.node.fs.controllers.iter().cloned().collect()
+        self.node
+            .fs
+            .controllers
+            .iter()
+            .any(|controller| controller == name)
     }
 
-    fn controllers_text(&self) -> String {
-        let mut out = self
-            .available_controllers()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .join(" ");
-        if !out.is_empty() {
-            out.push('\n');
+    fn controllers_text(&self) -> VfsResult<String> {
+        if self.node.fs.version == CgroupVersion::V1 {
+            return Ok(String::new());
         }
-        out
+        if let Some(parent) = self.parent.lock().as_ref().and_then(Weak::upgrade) {
+            let control = parent.subtree_control.lock();
+            return try_join_names(control.iter().map(String::as_str));
+        }
+        try_join_names(self.node.fs.controllers.iter().map(String::as_str))
     }
 
     fn pids_max_text(&self) -> String {
@@ -555,9 +719,10 @@ impl CgroupDir {
 
     fn update_subtree_control(&self, data: &[u8]) -> VfsResult<()> {
         let text = core::str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
-        let available = self.available_controllers();
-        let mut enable = BTreeSet::new();
-        let mut disable = BTreeSet::new();
+        // `pids` is currently the only implemented controller. Track the last
+        // requested state directly instead of allocating transient sets and a
+        // cloned replacement tree for every write.
+        let mut pids_state = None;
         for token in text.split_ascii_whitespace() {
             if token.len() < 2 {
                 return Err(VfsError::InvalidInput);
@@ -565,53 +730,234 @@ impl CgroupDir {
             let (op, name) = token.split_at(1);
             match op {
                 "+" => {
-                    if !available.contains(name) {
+                    if !self.controller_available(name) {
                         return Err(VfsError::NotFound);
                     }
-                    enable.insert(name.to_string());
-                    disable.remove(name);
+                    if name != "pids" {
+                        return Err(VfsError::OperationNotSupported);
+                    }
+                    pids_state = Some(true);
                 }
                 "-" => {
-                    disable.insert(name.to_string());
-                    enable.remove(name);
+                    if name == "pids" {
+                        pids_state = Some(false);
+                    }
                 }
                 _ => return Err(VfsError::InvalidInput),
             }
         }
 
-        let mut next = self.subtree_control.lock().clone();
-        if self.node.fs.version == CgroupVersion::V2
-            && self.parent.is_some()
-            && enable.iter().any(|name| !next.contains(name))
-            && !self.live_pids().is_empty()
+        let Some(enable_pids) = pids_state else {
+            return Ok(());
+        };
+        let prepared_name = enable_pids.then(|| try_owned("pids")).transpose()?;
+        let mut control = self.subtree_control.lock();
+        let was_enabled = control.contains("pids");
+        if enable_pids == was_enabled {
+            return Ok(());
+        }
+        if enable_pids
+            && self.node.fs.version == CgroupVersion::V2
+            && self.parent.lock().is_some()
+            && !self.pids.lock().is_empty()
         {
             return Err(VfsError::ResourceBusy);
         }
-        for name in &disable {
-            if next.contains(name) && self.child_has_subtree_controller(name) {
-                return Err(VfsError::ResourceBusy);
-            }
+        if !enable_pids && self.child_has_subtree_controller("pids") {
+            return Err(VfsError::ResourceBusy);
         }
-        let activate_pids = enable.contains("pids") && !next.contains("pids");
-        let deactivate_pids = disable.contains("pids") && next.contains("pids");
-        for name in enable {
-            next.insert(name);
+        if enable_pids {
+            control.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+            control.insert(prepared_name.ok_or(VfsError::Io)?);
+        } else {
+            control.remove("pids");
         }
-        for name in disable {
-            next.remove(&name);
-        }
-        *self.subtree_control.lock() = next;
-        if activate_pids || deactivate_pids {
-            let children = self.children.lock().values().cloned().collect::<Vec<_>>();
-            for child in children {
-                if activate_pids {
-                    child.initialize_pids_controller();
-                } else {
-                    child.reset_pids_controller();
-                }
+        drop(control);
+        for child in self.children.lock().values() {
+            if enable_pids {
+                child.initialize_pids_controller();
+            } else {
+                child.reset_pids_controller();
             }
         }
         Ok(())
+    }
+}
+
+fn same_membership_mapping(lhs: Option<&Weak<CgroupDir>>, rhs: Option<&Weak<CgroupDir>>) -> bool {
+    match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) => Weak::ptr_eq(lhs, rhs),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+impl PidMembershipRegistry {
+    fn with_limits(global_limit: usize, per_cgroup_limit: usize) -> Self {
+        Self {
+            operation: Mutex::new(()),
+            by_pid: Mutex::new(HashMap::new()),
+            global_limit,
+            per_cgroup_limit,
+        }
+    }
+
+    fn try_attach(&self, target: &Arc<CgroupDir>, pid: Pid, charge_fork: bool) -> AxResult<bool> {
+        let _operation = self.operation.lock();
+        self.try_attach_locked(target, pid, charge_fork)
+    }
+
+    fn try_charge_from(&self, parent_pid: Pid, child_pid: Pid) -> AxResult<()> {
+        let _operation = self.operation.lock();
+        let target = {
+            let mut by_pid = self.by_pid.lock();
+            let Some(mapped) = by_pid.get(&parent_pid).cloned() else {
+                return Ok(());
+            };
+            let Some(target) = mapped.upgrade() else {
+                by_pid.remove(&parent_pid);
+                return Ok(());
+            };
+            target
+        };
+        self.try_attach_locked(&target, child_pid, true)?;
+        Ok(())
+    }
+
+    /// Reserves both indexes before changing either one. The operation lock
+    /// prevents another writer from consuming those reservations; publication
+    /// then holds the global map and every affected member set, so readers can
+    /// observe only the old state or the fully committed new state.
+    fn try_attach_locked(
+        &self,
+        target: &Arc<CgroupDir>,
+        pid: Pid,
+        charge_fork: bool,
+    ) -> AxResult<bool> {
+        let target_weak = Arc::downgrade(target);
+        let old_mapping = self.by_pid.lock().get(&pid).cloned();
+        let target_had_pid = target.pids.lock().contains(&pid);
+        if target_had_pid
+            && old_mapping
+                .as_ref()
+                .is_some_and(|old| Weak::ptr_eq(old, &target_weak))
+        {
+            return Ok(false);
+        }
+
+        if charge_fork
+            && !target_had_pid
+            && let Some(limiting) = target.limiting_dir_for_fork()
+        {
+            *limiting.pids_events_limit.lock() += 1;
+            return Err(AxError::WouldBlock);
+        }
+
+        if !target_had_pid {
+            let mut target_pids = target.pids.lock();
+            if target_pids.len() >= self.per_cgroup_limit {
+                return Err(AxError::NoMemory);
+            }
+            target_pids.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        }
+        if old_mapping.is_none() {
+            let mut by_pid = self.by_pid.lock();
+            by_pid.retain(|_, mapped| mapped.strong_count() != 0);
+            if by_pid.len() >= self.global_limit {
+                return Err(AxError::NoMemory);
+            }
+            by_pid.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        }
+
+        let mut by_pid = self.by_pid.lock();
+        if !same_membership_mapping(by_pid.get(&pid), old_mapping.as_ref()) {
+            return Err(AxError::Io);
+        }
+        let old_dir = old_mapping
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .filter(|old| !Arc::ptr_eq(old, target));
+
+        if let Some(old_dir) = old_dir {
+            let mut old_pids = old_dir.pids.lock();
+            let mut target_pids = target.pids.lock();
+            if target_pids.contains(&pid) != target_had_pid {
+                return Err(AxError::Io);
+            }
+            let inserted_target = if target_had_pid {
+                false
+            } else {
+                target_pids.insert(pid)
+            };
+            if !target_had_pid && !inserted_target {
+                return Err(AxError::Io);
+            }
+            let removed_old = old_pids.remove(&pid);
+            let replaced = by_pid.insert(pid, target_weak);
+            if !same_membership_mapping(replaced.as_ref(), old_mapping.as_ref()) {
+                if let Some(old_mapping) = old_mapping {
+                    by_pid.insert(pid, old_mapping);
+                } else {
+                    by_pid.remove(&pid);
+                }
+                if inserted_target {
+                    target_pids.remove(&pid);
+                }
+                if removed_old {
+                    old_pids.insert(pid);
+                }
+                return Err(AxError::Io);
+            }
+        } else {
+            let mut target_pids = target.pids.lock();
+            if target_pids.contains(&pid) != target_had_pid {
+                return Err(AxError::Io);
+            }
+            let inserted_target = if target_had_pid {
+                false
+            } else {
+                target_pids.insert(pid)
+            };
+            if !target_had_pid && !inserted_target {
+                return Err(AxError::Io);
+            }
+            let replaced = by_pid.insert(pid, target_weak);
+            if !same_membership_mapping(replaced.as_ref(), old_mapping.as_ref()) {
+                if let Some(old_mapping) = old_mapping {
+                    by_pid.insert(pid, old_mapping);
+                } else {
+                    by_pid.remove(&pid);
+                }
+                if inserted_target {
+                    target_pids.remove(&pid);
+                }
+                return Err(AxError::Io);
+            }
+        }
+
+        drop(by_pid);
+        target.update_pids_peak_hierarchy();
+        Ok(true)
+    }
+
+    fn detach(&self, pid: Pid) {
+        let _operation = self.operation.lock();
+        let mut by_pid = self.by_pid.lock();
+        let old = by_pid.remove(&pid).and_then(|weak| weak.upgrade());
+        if let Some(dir) = old {
+            dir.pids.lock().remove(&pid);
+        }
+    }
+
+    fn get(&self, pid: Pid) -> Option<Arc<CgroupDir>> {
+        let _operation = self.operation.lock();
+        let mut by_pid = self.by_pid.lock();
+        let mapped = by_pid.get(&pid).cloned()?;
+        let Some(dir) = mapped.upgrade() else {
+            by_pid.remove(&pid);
+            return None;
+        };
+        Some(dir)
     }
 }
 
@@ -637,13 +983,7 @@ fn can_migrate_from_open_cgroup_namespace(credentials: OpenCredentials) -> bool 
 }
 
 fn detach_mapped_pid(pid: Pid) {
-    let old = PID_CGROUPS
-        .lock()
-        .remove(&pid)
-        .and_then(|weak| weak.upgrade());
-    if let Some(dir) = old {
-        dir.pids.lock().remove(&pid);
-    }
+    PID_CGROUPS.detach(pid);
 }
 
 pub(crate) fn detach_process(pid: Pid) {
@@ -651,14 +991,9 @@ pub(crate) fn detach_process(pid: Pid) {
 }
 
 fn cgroup_for_pid(pid: Pid) -> Option<Arc<CgroupDir>> {
-    let weak = PID_CGROUPS.lock().get(&pid).cloned()?;
-    let Some(dir) = weak.upgrade() else {
-        PID_CGROUPS.lock().remove(&pid);
-        return None;
-    };
-    if get_process_data(pid).is_err() {
-        PID_CGROUPS.lock().remove(&pid);
-        dir.pids.lock().remove(&pid);
+    let dir = PID_CGROUPS.get(pid)?;
+    if get_process_including_zombie(pid).is_err() {
+        PID_CGROUPS.detach(pid);
         return None;
     }
     Some(dir)
@@ -704,15 +1039,7 @@ pub(crate) fn proc_cpuset_membership(pid: Pid) -> String {
 }
 
 pub fn try_charge_fork(parent_pid: Pid, child_pid: Pid) -> AxResult<()> {
-    let Some(dir) = cgroup_for_pid(parent_pid) else {
-        return Ok(());
-    };
-    if let Some(limiting) = dir.limiting_dir_for_fork() {
-        *limiting.pids_events_limit.lock() += 1;
-        return Err(AxError::WouldBlock);
-    }
-    dir.attach_fork_child(child_pid);
-    Ok(())
+    PID_CGROUPS.try_charge_from(parent_pid, child_pid)
 }
 
 pub fn try_charge_fork_into(cgroup_fd: i32, child_pid: Pid) -> AxResult<()> {
@@ -728,12 +1055,7 @@ pub fn try_charge_fork_into(cgroup_fd: i32, child_pid: Pid) -> AxResult<()> {
     if dir.v2_has_enabled_child_controllers() {
         return Err(AxError::ResourceBusy);
     }
-    if let Some(limiting) = dir.limiting_dir_for_fork() {
-        *limiting.pids_events_limit.lock() += 1;
-        return Err(AxError::WouldBlock);
-    }
-    dir.attach_fork_child(child_pid);
-    Ok(())
+    dir.attach_fork_child(child_pid)
 }
 
 impl NodeOps for CgroupDir {
@@ -764,138 +1086,290 @@ impl NodeOps for CgroupDir {
 }
 
 impl DirNodeOps for CgroupDir {
+    fn namespace_epoch(&self) -> u64 {
+        self.namespace_epoch.load(Ordering::Acquire)
+    }
+
     fn read_dir(&self, offset: u64, sink: &mut dyn DirEntrySink) -> VfsResult<usize> {
         let parent_ino = self
             .parent
+            .lock()
             .as_ref()
             .and_then(Weak::upgrade)
             .map_or(self.node.ino, |parent| parent.node.ino);
-        let mut entries: Vec<(Cow<'_, str>, u64, NodeType)> = Vec::new();
-        entries.push((".".into(), self.node.ino, NodeType::Directory));
-        entries.push(("..".into(), parent_ino, NodeType::Directory));
-        entries.extend(
-            self.children
-                .lock()
-                .iter()
-                .map(|(name, dir)| (Cow::Owned(name.clone()), dir.node.ino, NodeType::Directory)),
-        );
-        entries.extend(self.files.iter().filter_map(|(name, file)| {
-            self.control_file_visible(name).then(|| {
-                (
-                    Cow::Owned(name.clone()),
-                    file.node.ino,
-                    NodeType::RegularFile,
-                )
-            })
-        }));
-
+        let mut position = 0_u64;
         let mut count = 0;
-        for (index, (name, ino, node_type)) in entries.into_iter().enumerate().skip(offset as usize)
-        {
-            if !sink.accept(&name, ino, node_type, index as u64 + 1) {
-                break;
+        let mut emit = |name: &str, ino: u64, node_type: NodeType| {
+            let current = position;
+            position = position.saturating_add(1);
+            if current < offset {
+                return true;
+            }
+            if !sink.accept(name, ino, node_type, position) {
+                return false;
             }
             count += 1;
+            true
+        };
+        if !emit(".", self.node.ino, NodeType::Directory)
+            || !emit("..", parent_ino, NodeType::Directory)
+        {
+            return Ok(count);
+        }
+        for (name, dir) in self.children.lock().iter() {
+            if !emit(name, dir.node.ino, NodeType::Directory) {
+                return Ok(count);
+            }
+        }
+        for (name, file) in &self.files {
+            if self.control_file_visible(name) && !emit(name, file.node.ino, NodeType::RegularFile)
+            {
+                return Ok(count);
+            }
         }
         Ok(count)
     }
 
     fn lookup(&self, name: &str) -> VfsResult<DirEntry> {
         if let Some(child) = self.children.lock().get(name).cloned() {
-            return Ok(DirEntry::new_dir(
-                |this| DirNode::new(child.bind(this)),
-                self.reference(name),
-            ));
+            return self.try_child_entry(name, child);
         }
         if self.control_file_visible(name)
             && let Some(file) = self.files.get(name).cloned()
         {
-            return Ok(DirEntry::new_file(
-                FileNode::new(file),
-                NodeType::RegularFile,
-                self.reference(name),
-            ));
+            return self.try_file_entry(name, file);
         }
         Err(VfsError::NotFound)
     }
 
-    fn create(
+    fn create_named(
         &self,
         name: &str,
-        node_type: NodeType,
-        _permission: NodePermission,
-    ) -> VfsResult<DirEntry> {
+        options: &NamedCreateOptions,
+        disposition: CreateDisposition,
+    ) -> VfsResult<CreateOutcome<DirEntry>> {
         if name.len() > MAX_NAME_LEN {
             return Err(VfsError::NameTooLong);
         }
         if name.contains('\n') {
             return Err(VfsError::InvalidInput);
         }
-        if node_type != NodeType::Directory {
+        let _namespace = self.node.fs.namespace.lock();
+        let mut children = self.children.lock();
+        if let Some(child) = children.get(name).cloned() {
+            if disposition == CreateDisposition::Exclusive {
+                return Err(VfsError::AlreadyExists);
+            }
+            return Ok(CreateOutcome {
+                entry: self.try_child_entry(name, child)?,
+                created: false,
+            });
+        }
+        if self.files.contains_key(name) {
+            if disposition == CreateDisposition::Exclusive {
+                return Err(VfsError::AlreadyExists);
+            }
+            let file = self
+                .control_file_visible(name)
+                .then(|| self.files.get(name).cloned())
+                .flatten()
+                .ok_or(VfsError::NotFound)?;
+            return Ok(CreateOutcome {
+                entry: self.try_file_entry(name, file)?,
+                created: false,
+            });
+        }
+        if options.node_type != NodeType::Directory || options.rdev.is_some() {
             return Err(VfsError::OperationNotPermitted);
         }
-        let mut children = self.children.lock();
-        if children.contains_key(name) || self.files.contains_key(name) {
-            return Err(VfsError::AlreadyExists);
+        if self.hierarchy_depth()? >= MAX_CGROUP_DEPTH {
+            return Err(VfsError::FilesystemLoop);
         }
-        let child = Self::new(
+        try_reserve_cgroup_child_slot(&mut children, MAX_CGROUP_CHILDREN, true)?;
+        let owned_name = try_owned(name)?;
+        let child = Self::try_new(
             self.node.fs.clone(),
             Some(Arc::downgrade(&self.this_dir()?)),
-        );
-        children.insert(name.to_string(), child.clone());
-        Ok(DirEntry::new_dir(
-            |this| DirNode::new(child.bind(this)),
-            self.reference(name),
-        ))
+        )?;
+        child.node.update_metadata(MetadataUpdate {
+            mode: Some(options.permission),
+            owner: options.owner,
+            ..Default::default()
+        });
+        let entry = self.try_child_entry(name, child.clone())?;
+        self.namespace_epoch.fetch_add(1, Ordering::AcqRel);
+        children.insert(owned_name, child.clone());
+        let now = wall_time();
+        drop(children);
+        self.touch_namespace(now);
+        Ok(CreateOutcome {
+            entry,
+            created: true,
+        })
     }
 
     fn link(&self, _name: &str, _node: &DirEntry) -> VfsResult<DirEntry> {
         Err(VfsError::OperationNotPermitted)
     }
 
-    fn unlink(&self, name: &str) -> VfsResult<()> {
-        if self.files.contains_key(name) {
+    fn unlink(&self, request: UnlinkRequest<'_>) -> VfsResult<()> {
+        let _namespace = self.node.fs.namespace.lock();
+        if self.files.contains_key(request.name) {
             return Err(VfsError::OperationNotPermitted);
         }
-        let Some(child) = self.children.lock().get(name).cloned() else {
+        let mut children = self.children.lock();
+        let Some(child) = children.get(request.name).cloned() else {
             return Err(VfsError::NotFound);
         };
+        if request
+            .expected
+            .is_some_and(|expected| !self.matches_expected_dir(expected, &child))
+        {
+            return Err(VfsError::NotFound);
+        }
+        if !request.is_dir {
+            return Err(VfsError::IsADirectory);
+        }
         if child.has_real_children() {
             return Err(VfsError::DirectoryNotEmpty);
         }
-        if !child.live_pids().is_empty() {
+        if !child.pids.lock().is_empty() {
             return Err(VfsError::ResourceBusy);
         }
-        self.children.lock().remove(name);
+        self.namespace_epoch.fetch_add(1, Ordering::AcqRel);
+        children.remove(request.name);
+        let now = wall_time();
+        drop(children);
+        self.touch_namespace(now);
         Ok(())
     }
 
-    fn rename(&self, src_name: &str, dst_dir: &DirNode, dst_name: &str) -> VfsResult<()> {
-        let dst_dir = dst_dir.downcast::<Self>()?;
+    fn rename(&self, request: RenameRequest<'_>) -> VfsResult<()> {
+        let dst_dir = request.dst_dir.downcast::<Self>()?;
         if !Arc::ptr_eq(&self.node.fs, &dst_dir.node.fs) {
             return Err(VfsError::CrossesDevices);
         }
         if self.node.fs.version != CgroupVersion::V1 {
             return Err(VfsError::OperationNotPermitted);
         }
-        if self.node.ino != dst_dir.node.ino {
-            return Err(VfsError::Io);
+        if request.dst_name.len() > MAX_NAME_LEN {
+            return Err(VfsError::NameTooLong);
         }
-        if dst_name.contains('\n') {
+        if request.dst_name.contains('\n') {
             return Err(VfsError::InvalidInput);
         }
-        if self.files.contains_key(src_name) || dst_dir.files.contains_key(dst_name) {
+        let _namespace = self.node.fs.namespace.lock();
+        if self.files.contains_key(request.src_name) || dst_dir.files.contains_key(request.dst_name)
+        {
             return Err(VfsError::OperationNotPermitted);
         }
-        if dst_dir.children.lock().contains_key(dst_name) {
-            return Err(VfsError::AlreadyExists);
+        let same_parent = core::ptr::eq(self, Arc::as_ref(&dst_dir));
+
+        if same_parent {
+            let mut children = self.children.lock();
+            let child = children
+                .get(request.src_name)
+                .cloned()
+                .ok_or(VfsError::NotFound)?;
+            if !self.matches_expected_dir(request.src, &child) {
+                return Err(VfsError::NotFound);
+            }
+            let dst = children.get(request.dst_name).cloned();
+            match (request.dst, dst.as_ref()) {
+                (None, None) => {}
+                (Some(expected), Some(actual)) if self.matches_expected_dir(expected, actual) => {}
+                _ => return Err(VfsError::NotFound),
+            }
+            if dst.as_ref().is_some_and(|dst| Arc::ptr_eq(&child, dst)) {
+                return Ok(());
+            }
+            if dst.is_some() {
+                return Err(VfsError::AlreadyExists);
+            }
+
+            try_reserve_cgroup_child_slot(&mut children, MAX_CGROUP_CHILDREN, false)?;
+            let dst_name = try_owned(request.dst_name)?;
+            self.namespace_epoch.fetch_add(1, Ordering::AcqRel);
+            children.remove(request.src_name);
+            children.insert(dst_name, child);
+            let now = wall_time();
+            drop(children);
+            self.touch_namespace(now);
+            return Ok(());
         }
-        let child = self
-            .children
-            .lock()
-            .remove(src_name)
-            .ok_or(VfsError::NotFound)?;
-        dst_dir.children.lock().insert(dst_name.to_string(), child);
+
+        let src_dir = self.this_dir()?;
+        let src_is_ancestor = Self::is_same_or_descendant_of(&dst_dir, &src_dir);
+        let dst_is_ancestor = Self::is_same_or_descendant_of(&src_dir, &dst_dir);
+        let lock_src_first = if src_is_ancestor {
+            true
+        } else if dst_is_ancestor {
+            false
+        } else {
+            (Arc::as_ptr(&src_dir).cast::<()>() as usize)
+                < Arc::as_ptr(&dst_dir).cast::<()>() as usize
+        };
+        let commit = |src_children: &mut HashMap<String, Arc<CgroupDir>>,
+                      dst_children: &mut HashMap<String, Arc<CgroupDir>>|
+         -> VfsResult<(Arc<CgroupDir>, bool)> {
+            let child = src_children
+                .get(request.src_name)
+                .cloned()
+                .ok_or(VfsError::NotFound)?;
+            if !self.matches_expected_dir(request.src, &child) {
+                return Err(VfsError::NotFound);
+            }
+            let dst = dst_children.get(request.dst_name).cloned();
+            match (request.dst, dst.as_ref()) {
+                (None, None) => {}
+                (Some(expected), Some(actual)) if self.matches_expected_dir(expected, actual) => {}
+                _ => return Err(VfsError::NotFound),
+            }
+            if dst.as_ref().is_some_and(|dst| Arc::ptr_eq(&child, dst)) {
+                return Ok((child, false));
+            }
+            if dst.is_some() {
+                return Err(VfsError::AlreadyExists);
+            }
+            if Self::is_same_or_descendant_of(&dst_dir, &child) {
+                return Err(VfsError::InvalidInput);
+            }
+            let target_depth = dst_dir.hierarchy_depth()?;
+            let subtree_height = child.subtree_height(MAX_CGROUP_DEPTH)?;
+            if target_depth
+                .checked_add(1)
+                .and_then(|depth| depth.checked_add(subtree_height))
+                .is_none_or(|depth| depth > MAX_CGROUP_DEPTH)
+            {
+                return Err(VfsError::FilesystemLoop);
+            }
+
+            try_reserve_cgroup_child_slot(dst_children, MAX_CGROUP_CHILDREN, true)?;
+            let dst_name = try_owned(request.dst_name)?;
+            let new_parent = Arc::downgrade(&dst_dir);
+            self.namespace_epoch.fetch_add(1, Ordering::AcqRel);
+            dst_dir.namespace_epoch.fetch_add(1, Ordering::AcqRel);
+            src_children.remove(request.src_name);
+            dst_children.insert(dst_name, child.clone());
+            *child.parent.lock() = Some(new_parent);
+            Ok((child, true))
+        };
+        let (child, changed) = if lock_src_first {
+            let mut src_children = self.children.lock();
+            let mut dst_children = dst_dir.children.lock();
+            commit(&mut src_children, &mut dst_children)?
+        } else {
+            let mut dst_children = dst_dir.children.lock();
+            let mut src_children = self.children.lock();
+            commit(&mut src_children, &mut dst_children)?
+        };
+        if !changed {
+            return Ok(());
+        }
+        let now = wall_time();
+        self.touch_namespace(now);
+        dst_dir.touch_namespace(now);
+        child.update_pids_peak_hierarchy();
         Ok(())
     }
 
@@ -922,17 +1396,19 @@ struct CgroupFile {
 }
 
 impl CgroupFile {
-    fn new(fs: Arc<CgroupFs>, name: &'static str) -> Arc<Self> {
+    fn try_new(fs: Arc<CgroupFs>, name: &'static str) -> VfsResult<Arc<Self>> {
         let mode = NodePermission::from_bits_truncate(match name {
             "cgroup.kill" => 0o200,
             _ if is_read_only_control_file(name) => 0o444,
             _ => 0o644,
         });
-        Arc::new(Self {
-            node: CgroupNode::new(fs, NodeType::RegularFile, mode),
+        let node = CgroupNode::try_new(fs, NodeType::RegularFile, mode)?;
+        Arc::try_new(Self {
+            node,
             name,
             dir: Mutex::new(None),
         })
+        .map_err(|_| VfsError::NoMemory)
     }
 
     fn bind_dir(&self, dir: &Arc<CgroupDir>) {
@@ -956,9 +1432,9 @@ impl CgroupFile {
             return Err(VfsError::NotFound);
         }
         Ok(match self.name {
-            "tasks" | "cgroup.procs" => dir.tasks_text(),
-            "cgroup.controllers" => dir.controllers_text(),
-            "cgroup.subtree_control" => dir.subtree_control_text(),
+            "tasks" | "cgroup.procs" => dir.tasks_text()?,
+            "cgroup.controllers" => dir.controllers_text()?,
+            "cgroup.subtree_control" => dir.subtree_control_text()?,
             "cgroup.kill" => return Err(VfsError::BadFileDescriptor),
             "pids.max" => dir.pids_max_text(),
             "pids.current" => format!("{}\n", dir.recursive_live_pid_count()),
@@ -987,8 +1463,7 @@ impl CgroupFile {
                 if text.trim() != "1" {
                     return Err(VfsError::InvalidInput);
                 }
-                dir.kill_attached_recursive();
-                Ok(())
+                dir.kill_attached_recursive()
             }
             "cgroup.subtree_control" => dir.update_subtree_control(data),
             "pids.max" => dir.set_pids_max(data),
@@ -1100,6 +1575,34 @@ impl Pollable for CgroupFile {
 mod tests {
     use super::*;
 
+    fn test_cgroup_dir() -> Arc<CgroupDir> {
+        let fs = Arc::new(CgroupFs {
+            name: "test-cgroup",
+            fs_type: CGROUP_SUPER_MAGIC,
+            version: CgroupVersion::V1,
+            controllers: Vec::from(["pids".to_string()]),
+            namespace: Mutex::new(()),
+            inodes: Mutex::new(HashSet::new()),
+            next_inode: AtomicU64::new(1),
+            root: Mutex::new(None),
+            root_dir: Mutex::new(None),
+        });
+        CgroupDir::try_new_root(fs).unwrap()
+    }
+
+    fn test_cgroup_fs() -> Filesystem {
+        CgroupFs::new(CgroupVersion::V1, Vec::from(["pids".to_string()])).unwrap()
+    }
+
+    fn maps_to(registry: &PidMembershipRegistry, pid: Pid, expected: &Arc<CgroupDir>) -> bool {
+        registry
+            .by_pid
+            .lock()
+            .get(&pid)
+            .and_then(Weak::upgrade)
+            .is_some_and(|actual| Arc::ptr_eq(&actual, expected))
+    }
+
     #[test]
     fn v1_controller_parser_rejects_unimplemented_controllers() {
         assert_eq!(
@@ -1118,6 +1621,176 @@ mod tests {
             parse_v1_controllers("none", "unknown").unwrap_err(),
             AxError::InvalidInput
         );
+    }
+
+    #[test]
+    fn membership_publish_updates_both_indexes() {
+        let registry = PidMembershipRegistry::with_limits(4, 4);
+        let target = test_cgroup_dir();
+
+        assert_eq!(registry.try_attach(&target, 101, false), Ok(true));
+        assert!(target.pids.lock().contains(&101));
+        assert!(maps_to(&registry, 101, &target));
+        assert_eq!(*target.pids_peak.lock(), 1);
+    }
+
+    #[test]
+    fn target_limit_failure_preserves_old_membership() {
+        let registry = PidMembershipRegistry::with_limits(4, 1);
+        let old = test_cgroup_dir();
+        let target = test_cgroup_dir();
+        registry.try_attach(&old, 101, false).unwrap();
+        registry.try_attach(&target, 202, false).unwrap();
+
+        assert_eq!(
+            registry.try_attach(&target, 101, false),
+            Err(AxError::NoMemory)
+        );
+        assert!(old.pids.lock().contains(&101));
+        assert!(!target.pids.lock().contains(&101));
+        assert!(target.pids.lock().contains(&202));
+        assert!(maps_to(&registry, 101, &old));
+        assert!(maps_to(&registry, 202, &target));
+    }
+
+    #[test]
+    fn global_limit_failure_does_not_publish_target_membership() {
+        let registry = PidMembershipRegistry::with_limits(1, 4);
+        let old = test_cgroup_dir();
+        let target = test_cgroup_dir();
+        registry.try_attach(&old, 101, false).unwrap();
+
+        assert_eq!(
+            registry.try_attach(&target, 202, false),
+            Err(AxError::NoMemory)
+        );
+        assert!(!target.pids.lock().contains(&202));
+        assert!(maps_to(&registry, 101, &old));
+        assert_eq!(registry.by_pid.lock().len(), 1);
+    }
+
+    #[test]
+    fn migration_is_atomic_and_same_target_attach_is_idempotent() {
+        let registry = PidMembershipRegistry::with_limits(4, 4);
+        let old = test_cgroup_dir();
+        let target = test_cgroup_dir();
+        registry.try_attach(&old, 101, false).unwrap();
+
+        assert_eq!(registry.try_attach(&target, 101, false), Ok(true));
+        assert!(!old.pids.lock().contains(&101));
+        assert!(target.pids.lock().contains(&101));
+        assert!(maps_to(&registry, 101, &target));
+        assert_eq!(registry.by_pid.lock().len(), 1);
+
+        assert_eq!(registry.try_attach(&target, 101, false), Ok(false));
+        assert_eq!(target.pids.lock().len(), 1);
+        assert_eq!(registry.by_pid.lock().len(), 1);
+    }
+
+    #[test]
+    fn fork_admission_failure_does_not_publish_or_update_counters() {
+        let registry = PidMembershipRegistry::with_limits(0, 1);
+        let target = test_cgroup_dir();
+
+        assert_eq!(
+            registry.try_attach(&target, 101, true),
+            Err(AxError::NoMemory)
+        );
+        assert!(target.pids.lock().is_empty());
+        assert!(registry.by_pid.lock().is_empty());
+        assert_eq!(*target.pids_peak.lock(), 0);
+        assert_eq!(*target.pids_events_limit.lock(), 0);
+    }
+
+    #[test]
+    fn pids_max_rejection_increments_limit_event_once() {
+        let registry = PidMembershipRegistry::with_limits(1, 1);
+        let target = test_cgroup_dir();
+        *target.pids_max.lock() = Some(0);
+
+        assert_eq!(
+            registry.try_attach(&target, 101, true),
+            Err(AxError::WouldBlock)
+        );
+        assert!(target.pids.lock().is_empty());
+        assert!(registry.by_pid.lock().is_empty());
+        assert_eq!(*target.pids_peak.lock(), 0);
+        assert_eq!(*target.pids_events_limit.lock(), 1);
+    }
+
+    #[test]
+    fn child_slot_limit_rejects_growth_but_allows_same_map_rename_admission() {
+        let mut children = HashMap::new();
+        let child = test_cgroup_dir();
+        try_reserve_cgroup_child_slot(&mut children, 1, true).unwrap();
+        children.insert("child".to_string(), child);
+
+        assert_eq!(
+            try_reserve_cgroup_child_slot(&mut children, 1, true),
+            Err(VfsError::NoMemory)
+        );
+        assert_eq!(
+            try_reserve_cgroup_child_slot(&mut children, 1, false),
+            Ok(())
+        );
+        assert_eq!(children.len(), 1);
+    }
+
+    #[test]
+    fn cgroup_rename_preserves_identity_and_updates_cross_parent_membership() {
+        let fs = test_cgroup_fs();
+        let root = fs.root_dir();
+        let root_dir = root.as_dir().unwrap();
+        let mode = NodePermission::from_bits_truncate(0o755);
+        let src_parent = root_dir
+            .create("src-parent", NodeType::Directory, mode)
+            .unwrap();
+        let dst_parent = root_dir
+            .create("dst-parent", NodeType::Directory, mode)
+            .unwrap();
+        let src_dir = src_parent.as_dir().unwrap();
+        let dst_dir = dst_parent.as_dir().unwrap();
+        let child = src_dir.create("child", NodeType::Directory, mode).unwrap();
+        let wrong = src_dir.create("wrong", NodeType::Directory, mode).unwrap();
+        let src_backend = src_parent.downcast::<CgroupDir>().unwrap();
+        let dst_backend = dst_parent.downcast::<CgroupDir>().unwrap();
+        let src_epoch = src_backend.namespace_epoch();
+        let dst_epoch = dst_backend.namespace_epoch();
+
+        assert_eq!(
+            src_dir
+                .rename("child", &wrong, dst_dir, "moved", None)
+                .unwrap_err(),
+            VfsError::NotFound
+        );
+        assert_eq!(src_backend.namespace_epoch(), src_epoch);
+        assert_eq!(dst_backend.namespace_epoch(), dst_epoch);
+        assert_eq!(src_dir.lookup("child").unwrap().inode(), child.inode());
+        assert_eq!(dst_dir.lookup("moved").unwrap_err(), VfsError::NotFound);
+
+        src_dir
+            .rename("child", &child, dst_dir, "moved", None)
+            .unwrap();
+        assert_eq!(src_dir.lookup("child").unwrap_err(), VfsError::NotFound);
+        let moved = dst_dir.lookup("moved").unwrap();
+        assert_eq!(moved.inode(), child.inode());
+        let moved_backend = moved.downcast::<CgroupDir>().unwrap();
+        let parent = moved_backend
+            .parent
+            .lock()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .unwrap();
+        assert!(Arc::ptr_eq(&parent, &dst_backend));
+        assert_eq!(src_backend.namespace_epoch(), src_epoch + 1);
+        assert_eq!(dst_backend.namespace_epoch(), dst_epoch + 1);
+
+        let no_op_epoch = dst_backend.namespace_epoch();
+        dst_dir
+            .rename("moved", &moved, dst_dir, "moved", Some(&moved))
+            .unwrap();
+        assert_eq!(dst_backend.namespace_epoch(), no_op_epoch);
+        assert_eq!(dst_dir.lookup("moved").unwrap().inode(), child.inode());
     }
 }
 

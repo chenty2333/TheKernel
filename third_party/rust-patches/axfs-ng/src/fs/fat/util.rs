@@ -44,10 +44,7 @@ pub fn unix_to_dos(datetime: Duration) -> fatfs::DateTime {
     let dt = dt.naive_local();
 
     if dt.year() < 1980 {
-        return fatfs::DateTime::new(
-            fatfs::Date::new(1980, 1, 1),
-            fatfs::Time::new(0, 0, 0, 0),
-        );
+        return fatfs::DateTime::new(fatfs::Date::new(1980, 1, 1), fatfs::Time::new(0, 0, 0, 0));
     }
     if dt.year() > 2107 {
         return fatfs::DateTime::new(
@@ -133,6 +130,7 @@ pub fn into_vfs_err<E>(err: fatfs::Error<E>) -> VfsError {
         InvalidFileNameLength => VfsError::NameTooLong,
         InvalidInput => VfsError::InvalidInput,
         UnsupportedFileNameCharacter => VfsError::InvalidData,
+        NotEnoughMemory => VfsError::NoMemory,
         NotEnoughSpace => VfsError::StorageFull,
         NotFound => VfsError::NotFound,
         UnexpectedEof | WriteZero => VfsError::Io,

@@ -5,13 +5,17 @@ use core::{
     sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering},
 };
 
+use axerrno::{AxError, AxResult};
 use axpoll::PollSet;
 use axsync::spin::SpinNoIrq;
 use axtask::{TaskExt, TaskInner};
 use extern_trait::extern_trait;
 use scope_local::{ActiveScope, Scope};
 use starry_process::Pid;
-use starry_signal::{SignalInfo, api::ThreadSignalManager};
+use starry_signal::{
+    SignalInfo,
+    api::{ThreadSignalManager, ThreadSignalRegistration},
+};
 
 use super::{
     ProcessData,
@@ -19,6 +23,7 @@ use super::{
     restart::RestartTracker,
     timer::TimeManager,
 };
+use crate::deferred_work::DeferredWorkAccount;
 
 ///  A wrapper type that assumes the inner type is `Sync`.
 #[repr(transparent)]
@@ -85,13 +90,26 @@ pub struct Thread {
 
     /// Self exit event
     pub exit_event: Arc<PollSet>,
+
+    /// Final-OFD notifications published by this actor and not yet completed
+    /// by the policy worker.
+    deferred_work: Arc<DeferredWorkAccount>,
 }
 
 impl Thread {
     /// Create a new [`Thread`].
-    pub fn new(tid: u32, proc_data: Arc<ProcessData>) -> Box<Self> {
-        Box::new(Thread {
-            signal: ThreadSignalManager::new(tid, proc_data.signal.clone()),
+    pub fn try_new(
+        tid: u32,
+        proc_data: Arc<ProcessData>,
+    ) -> AxResult<(Box<Self>, ThreadSignalRegistration)> {
+        let signal = ThreadSignalManager::try_new(proc_data.signal.clone())
+            .map_err(|_| AxError::NoMemory)?;
+        let exit = Arc::try_new(AtomicBool::new(false)).map_err(|_| AxError::NoMemory)?;
+        let exit_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
+        let deferred_work =
+            Arc::try_new(DeferredWorkAccount::new()).map_err(|_| AxError::NoMemory)?;
+        let thread = Box::try_new(Thread {
+            signal,
             proc_data,
             clear_child_tid: AtomicUsize::new(0),
             visible_tid: AtomicU32::new(tid),
@@ -99,13 +117,24 @@ impl Thread {
             time: AssumeSync(RefCell::new(TimeManager::new())),
             live_usage: AtomicTaskUsage::new(),
             proc_state_hint: AtomicU8::new(ProcStateHint::None as u8),
-            exit: Arc::new(AtomicBool::new(false)),
+            exit,
             oom_score_adj: AtomicI32::new(200),
             accessing_user_memory: AtomicBool::new(false),
             active_scope_read_held: AtomicBool::new(false),
             restart: SpinNoIrq::new(RestartTracker::default()),
-            exit_event: Arc::default(),
+            exit_event,
+            deferred_work,
         })
+        .map_err(|_| AxError::NoMemory)?;
+        let registration = thread
+            .signal
+            .try_register(tid)
+            .map_err(|_| AxError::NoMemory)?;
+        Ok((thread, registration))
+    }
+
+    pub(crate) fn deferred_work_account(&self) -> Arc<DeferredWorkAccount> {
+        self.deferred_work.clone()
     }
 
     /// Get the clear child tid field.

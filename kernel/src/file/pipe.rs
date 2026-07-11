@@ -15,7 +15,7 @@ use axtask::{
     future::{block_on, poll_io},
 };
 use linux_raw_sys::{
-    general::{CAP_SYS_RESOURCE, O_ACCMODE, O_NONBLOCK, O_RDONLY, O_WRONLY},
+    general::{CAP_SYS_RESOURCE, O_ACCMODE, O_NONBLOCK, O_RDONLY, O_WRONLY, POLL_IN},
     ioctl::FIONREAD,
 };
 use memory_addr::PAGE_SIZE_4K;
@@ -26,13 +26,10 @@ use ringbuf::{
 use starry_signal::{SignalInfo, Signo};
 use starry_vm::VmMutPtr;
 
-use super::{AsyncIoOwner, AsyncIoState, FileLike, Kstat, PseudoInode, fs::location_to_kstat};
+use super::{AsyncIoState, FileLike, Kstat, PseudoInode, fs::location_to_kstat, send_sigio};
 use crate::{
     file::{IoDst, IoSrc},
-    task::{
-        AsThread, send_signal_to_process, send_signal_to_process_group,
-        send_signal_to_visible_thread,
-    },
+    task::{AsThread, send_signal_to_process},
 };
 
 const PIPE_BUF_SIZE: usize = PAGE_SIZE_4K;
@@ -191,10 +188,21 @@ struct Shared {
     writers: AtomicUsize,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone)]
 struct PipeAsyncIo {
     enabled: bool,
     state: AsyncIoState,
+    fd: i32,
+}
+
+impl Default for PipeAsyncIo {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            state: AsyncIoState::default(),
+            fd: -1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -400,9 +408,9 @@ impl Pipe {
         Ok(new_size)
     }
 
-    pub(crate) fn set_async_io(&self, enabled: bool, state: AsyncIoState) {
+    pub(crate) fn set_async_io(&self, enabled: bool, state: AsyncIoState, fd: i32) {
         if self.is_read() {
-            *self.shared.async_io.lock() = PipeAsyncIo { enabled, state };
+            *self.shared.async_io.lock() = PipeAsyncIo { enabled, state, fd };
         }
     }
 
@@ -569,30 +577,11 @@ fn raise_pipe() {
 }
 
 fn notify_async_readable(async_io: &Mutex<PipeAsyncIo>) {
-    let async_io = *async_io.lock();
+    let async_io = async_io.lock().clone();
     if !async_io.enabled {
         return;
     }
-
-    let signo = if async_io.state.signal == 0 {
-        Signo::SIGIO
-    } else {
-        Signo::from_repr(async_io.state.signal).unwrap_or(Signo::SIGIO)
-    };
-    let signal = Some(SignalInfo::new_kernel(signo));
-
-    match async_io.state.owner {
-        AsyncIoOwner::Tid(tid) if tid > 0 => {
-            let _ = send_signal_to_visible_thread(None, tid, signal);
-        }
-        AsyncIoOwner::Pid(pid) if pid > 0 => {
-            let _ = send_signal_to_process(pid, signal);
-        }
-        AsyncIoOwner::Pgrp(pgid) if pgid > 0 => {
-            let _ = send_signal_to_process_group(pgid, signal);
-        }
-        _ => {}
-    }
+    send_sigio(&async_io.state, async_io.fd, POLL_IN);
 }
 
 impl NamedPipe {
@@ -601,7 +590,7 @@ impl NamedPipe {
         let nonblocking = flags & O_NONBLOCK != 0;
         let state = {
             let mut guard = location.user_data();
-            guard.get_or_insert_with(NamedPipeState::new)
+            guard.try_get_or_insert_with(NamedPipeState::new)?
         };
 
         if access == PipeAccess::Write && nonblocking && state.reader_count() == 0 {
@@ -652,9 +641,9 @@ impl NamedPipe {
             .map_or_else(|_| "<error>".into(), |path| Cow::Owned(path.to_string()))
     }
 
-    pub(crate) fn set_async_io(&self, enabled: bool, state: AsyncIoState) {
+    pub(crate) fn set_async_io(&self, enabled: bool, state: AsyncIoState, fd: i32) {
         if self.access.can_read() {
-            *self.state.async_io.lock() = PipeAsyncIo { enabled, state };
+            *self.state.async_io.lock() = PipeAsyncIo { enabled, state, fd };
         }
     }
 }

@@ -4,7 +4,7 @@ use core::{
     mem, ptr, slice,
 };
 
-use crate::{Ext4Result, error::Context, ffi::*};
+use crate::{Ext4Error, Ext4Result, error::Context, ffi::*};
 
 /// Device block size.
 pub const EXT4_DEV_BSIZE: usize = 512;
@@ -142,15 +142,18 @@ pub struct Ext4BlockDevice<Dev: BlockDevice> {
 
 impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
     pub fn new(dev: Dev) -> Ext4Result<Self> {
-        let mut dev = Box::new(dev);
+        let allocation_error =
+            || Ext4Error::new(ENOMEM as _, "ext4 block-device allocation failed");
+        let mut dev = Box::try_new(dev).map_err(|_| allocation_error())?;
 
         // Block size buffer
-        let mut block_buf = Box::new([0u8; EXT4_DEV_BSIZE]);
-        let mut block_dev_iface = Box::new(ext4_blockdev_iface {
+        let mut block_buf = Box::try_new([0u8; EXT4_DEV_BSIZE]).map_err(|_| allocation_error())?;
+        let mut block_dev_iface = Box::try_new(ext4_blockdev_iface {
             open: Some(Self::dev_open),
             bread: Some(Self::dev_bread),
             bwrite: Some(Self::dev_bwrite),
             close: Some(Self::dev_close),
+            flush: Some(Self::dev_flush),
             lock: None,
             unlock: None,
             ph_bsize: EXT4_DEV_BSIZE as u32,
@@ -160,10 +163,12 @@ impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
             bread_ctr: 0,
             bwrite_ctr: 0,
             p_user: dev.as_mut() as *mut _ as *mut c_void,
-        });
+        })
+        .map_err(|_| allocation_error())?;
 
-        let mut block_cache_buf: Box<ext4_bcache> = Box::new(unsafe { mem::zeroed() });
-        let mut blockdev = Box::new(ext4_blockdev {
+        let mut block_cache_buf: Box<ext4_bcache> =
+            Box::try_new(unsafe { mem::zeroed() }).map_err(|_| allocation_error())?;
+        let mut blockdev = Box::try_new(ext4_blockdev {
             bdif: block_dev_iface.as_mut(),
             part_offset: 0,
             part_size: 0,
@@ -171,9 +176,11 @@ impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
             lg_bsize: 0,
             lg_bcnt: 0,
             cache_write_back: 0,
+            writeback_error: 0,
             fs: ptr::null_mut(),
             journal: ptr::null_mut(),
-        });
+        })
+        .map_err(|_| allocation_error())?;
 
         unsafe {
             ext4_block_init(blockdev.as_mut()).context("ext4_block_init")?;
@@ -294,13 +301,25 @@ impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
         debug!("close ext4 block device");
         EOK as _
     }
+
+    unsafe extern "C" fn dev_flush(bdev: *mut ext4_blockdev) -> c_int {
+        let (_bdev, _bdif, dev) = unsafe { Self::dev_read_fields(bdev) };
+        if let Err(err) = dev.flush() {
+            error!("flush failed: {err:?}");
+            return EIO as _;
+        }
+        EOK as _
+    }
 }
 
 impl<Dev: BlockDevice> Drop for Ext4BlockDevice<Dev> {
     fn drop(&mut self) {
         unsafe {
             let bdev = self.inner.as_mut();
-            ext4_block_fini(bdev);
+            let result = ext4_block_fini(bdev);
+            if result != EOK as _ {
+                error!("failed to close ext4 block device: {result}");
+            }
         }
     }
 }

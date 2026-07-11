@@ -175,8 +175,10 @@ int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
 
 	struct ext4_block b;
 	rc = ext4_trans_block_get(fs->bdev, &b, bitmap_block_addr);
-	if (rc != EOK)
+	if (rc != EOK) {
+		ext4_fs_put_block_group_ref(&bg_ref);
 		return rc;
+	}
 
 	if (!ext4_ialloc_verify_bitmap_csum(sb, bg, b.data)) {
 		ext4_dbg(DEBUG_IALLOC,
@@ -189,7 +191,12 @@ int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
 	uint32_t index_in_group = ext4_ialloc_inode_to_bgidx(sb, index);
 	ext4_bmap_bit_clr(b.data, index_in_group);
 	ext4_ialloc_set_bitmap_csum(sb, bg, b.data);
-	ext4_trans_set_block_dirty(b.buf);
+	rc = ext4_trans_set_block_dirty(b.buf);
+	if (rc != EOK) {
+		ext4_block_set(fs->bdev, &b);
+		ext4_fs_put_block_group_ref(&bg_ref);
+		return rc;
+	}
 
 	/* Put back the block with bitmap */
 	rc = ext4_block_set(fs->bdev, &b);
@@ -226,9 +233,14 @@ int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
 	return EOK;
 }
 
-int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
+int ext4_ialloc_alloc_inode_status(struct ext4_fs *fs, uint32_t *idx,
+				   bool is_dir,
+				   bool *metadata_may_have_changed)
 {
 	struct ext4_sblock *sb = &fs->sb;
+	*idx = 0;
+	if (metadata_may_have_changed)
+		*metadata_may_have_changed = false;
 
 	uint32_t bgid = fs->last_inode_bg_id;
 	uint32_t bg_count = ext4_block_group_cnt(sb);
@@ -299,15 +311,27 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
 
 				continue;
 			}
+			if (rc != EOK) {
+				ext4_block_set(fs->bdev, &b);
+				ext4_fs_put_block_group_ref(&bg_ref);
+				return rc;
+			}
 
+			if (metadata_may_have_changed)
+				*metadata_may_have_changed = true;
 			ext4_bmap_bit_set(b.data, idx_in_bg);
 
 			/* Free i-node found, save the bitmap */
 			ext4_ialloc_set_bitmap_csum(sb,bg,
 						    b.data);
-			ext4_trans_set_block_dirty(b.buf);
+			rc = ext4_trans_set_block_dirty(b.buf);
+			if (rc != EOK) {
+				ext4_block_set(fs->bdev, &b);
+				ext4_fs_put_block_group_ref(&bg_ref);
+				return rc;
+			}
 
-			ext4_block_set(fs->bdev, &b);
+			rc = ext4_block_set(fs->bdev, &b);
 			if (rc != EOK) {
 				ext4_fs_put_block_group_ref(&bg_ref);
 				return rc;
@@ -355,7 +379,7 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
 
 		/* Block group not modified, put it and jump to the next block
 		 * group */
-		ext4_fs_put_block_group_ref(&bg_ref);
+		rc = ext4_fs_put_block_group_ref(&bg_ref);
 		if (rc != EOK)
 			return rc;
 
@@ -363,6 +387,11 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
 	}
 
 	return ENOSPC;
+}
+
+int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
+{
+	return ext4_ialloc_alloc_inode_status(fs, idx, is_dir, NULL);
 }
 
 /**

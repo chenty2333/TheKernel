@@ -1,12 +1,17 @@
 use alloc::{
-    borrow::ToOwned,
     boxed::Box,
-    collections::{BTreeMap, BTreeSet},
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{any::Any, borrow::Borrow, cmp::Ordering, mem, task::Context};
+use core::{
+    any::Any,
+    borrow::Borrow,
+    cmp::Ordering,
+    mem,
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+    task::Context,
+};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{
@@ -14,22 +19,26 @@ use axfs::{
     sync_and_invalidate_cached_file_pages,
 };
 use axfs_ng_vfs::{
-    DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode, FileNodeOps, Filesystem,
-    FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission, NodeType,
-    Reference, StatFs, VfsError, VfsResult, WeakDirEntry, path::MAX_NAME_LEN,
+    AnonymousOptions, CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode,
+    DirNodeOps, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata, MetadataUpdate,
+    NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType, Reference, RenameRequest,
+    StatFs, UnlinkRequest, VfsError, VfsResult, WeakDirEntry, path::MAX_NAME_LEN,
 };
 use axhal::{mem::total_ram_size, time::wall_time};
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use memory_addr::PAGE_SIZE_4K;
-use slab::Slab;
 
 const TMPFS_BLOCK_SIZE: u64 = PAGE_SIZE_4K as u64;
 const STAT_BLOCK_UNIT: u64 = 512;
 const MIB: u64 = 1024 * 1024;
 const DEFAULT_TMPFS_MIN_BYTES: u64 = 16 * MIB;
 const DEFAULT_TMPFS_MAX_BYTES: u64 = 256 * MIB;
+/// Until tmpfs inode metadata participates in the kernel's global memory
+/// accounting, keep the live identity registry explicitly bounded.  The
+/// backing map is reserved before any inode or namespace object is published.
+const MAX_TMPFS_INODES: usize = 65_536;
 
 fn default_tmpfs_capacity_bytes() -> u64 {
     let ram = total_ram_size() as u64;
@@ -40,6 +49,15 @@ fn default_tmpfs_capacity_bytes() -> u64 {
 
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct FileName(String);
+
+fn try_owned(value: &str) -> VfsResult<String> {
+    let mut result = String::new();
+    result
+        .try_reserve_exact(value.len())
+        .map_err(|_| VfsError::NoMemory)?;
+    result.push_str(value);
+    Ok(result)
+}
 
 impl PartialOrd for FileName {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -77,7 +95,9 @@ impl Borrow<str> for FileName {
 
 /// A simple in-memory filesystem that supports basic file operations.
 pub struct MemoryFs {
-    inodes: Mutex<Slab<Arc<Inode>>>,
+    namespace: Mutex<()>,
+    inodes: Mutex<HashMap<u64, Arc<Inode>>>,
+    next_inode: AtomicU64,
     root: Mutex<Option<DirEntry>>,
     capacity_pages: Option<u64>,
     allocated_pages: Mutex<u64>,
@@ -86,17 +106,17 @@ pub struct MemoryFs {
 impl MemoryFs {
     /// Creates a new empty memory filesystem.
     #[allow(clippy::new_ret_no_self)]
-    pub fn new() -> Filesystem {
+    pub fn new() -> VfsResult<Filesystem> {
         Self::new_with_permission(NodePermission::from_bits_truncate(0o755))
     }
 
     #[allow(clippy::new_ret_no_self)]
-    pub fn new_with_permission(permission: NodePermission) -> Filesystem {
+    pub fn new_with_permission(permission: NodePermission) -> VfsResult<Filesystem> {
         Self::new_with_permission_and_capacity(permission, None)
     }
 
     #[allow(clippy::new_ret_no_self)]
-    pub fn new_with_capacity(capacity_bytes: Option<u64>) -> Filesystem {
+    pub fn new_with_capacity(capacity_bytes: Option<u64>) -> VfsResult<Filesystem> {
         Self::new_with_permission_and_capacity(
             NodePermission::from_bits_truncate(0o755),
             capacity_bytes,
@@ -107,24 +127,64 @@ impl MemoryFs {
     pub fn new_with_permission_and_capacity(
         permission: NodePermission,
         capacity_bytes: Option<u64>,
-    ) -> Filesystem {
+    ) -> VfsResult<Filesystem> {
         let capacity_bytes = capacity_bytes.unwrap_or_else(default_tmpfs_capacity_bytes);
-        let fs = Arc::new(Self {
-            inodes: Mutex::new(Slab::new()),
+        let fs = Arc::try_new(Self {
+            namespace: Mutex::new(()),
+            inodes: Mutex::new(HashMap::new()),
+            next_inode: AtomicU64::new(1),
             root: Mutex::default(),
             capacity_pages: Some(capacity_bytes.div_ceil(TMPFS_BLOCK_SIZE)),
             allocated_pages: Mutex::new(0),
-        });
-        let root_ino = Inode::new(&fs, None, NodeType::Directory, permission);
-        *fs.root.lock() = Some(DirEntry::new_dir(
-            |this| DirNode::new(MemoryNode::new(fs.clone(), root_ino, Some(this))),
+        })
+        .map_err(|_| VfsError::NoMemory)?;
+        // Allocate the generic wrapper before installing the backend's root
+        // self-reference.  If a later root allocation fails, dropping this
+        // local wrapper calls `unmount` and cannot strand an Arc cycle.
+        let filesystem = Filesystem::try_new(fs.clone())?;
+        let root_ino = fs.try_reserve_inode_number()?;
+        let root_inode =
+            Inode::try_new_unpublished(&fs, root_ino, None, NodeType::Directory, permission)?;
+        let root = MemoryNode::try_new_entry(
+            fs.clone(),
+            root_inode.clone(),
+            NodeType::Directory,
             Reference::root(),
-        ));
-        Filesystem::new(fs)
+        )?;
+        fs.publish_inode(root_inode)?;
+        *fs.root.lock() = Some(root);
+        Ok(filesystem)
     }
 
     fn get(&self, ino: u64) -> Option<Arc<Inode>> {
-        self.inodes.lock().get(ino as usize - 1).cloned()
+        self.inodes.lock().get(&ino).cloned()
+    }
+
+    /// Reserves both one backing-map slot and a non-reusable inode number.
+    /// Callers hold `namespace` across this admission and the matching
+    /// `publish_inode`, so no other creator can consume the reserved capacity.
+    fn try_reserve_inode_number(&self) -> VfsResult<u64> {
+        let mut inodes = self.inodes.lock();
+        if inodes.len() >= MAX_TMPFS_INODES {
+            return Err(VfsError::NoMemory);
+        }
+        inodes.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+        self.next_inode
+            .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| VfsError::StorageFull)
+    }
+
+    fn publish_inode(&self, inode: Arc<Inode>) -> VfsResult<()> {
+        let mut inodes = self.inodes.lock();
+        if inodes.contains_key(&inode.ino) {
+            return Err(VfsError::Io);
+        }
+        // `try_reserve_inode_number` admitted this insertion while namespace
+        // serialization prevented a competing creator from consuming it.
+        inodes.insert(inode.ino, inode);
+        Ok(())
     }
 
     fn reserve_pages(&self, pages: u64) -> AxResult<()> {
@@ -214,7 +274,7 @@ fn finalize_unlinked_inode(fs: &MemoryFs, inode: &Arc<Inode>) {
         if let NodeContent::File(file) = &inode.content {
             file.clear_storage(fs);
         }
-        inodes.remove(ino as usize - 1);
+        inodes.remove(&ino);
     }
 }
 
@@ -236,9 +296,8 @@ struct FileContent {
     /// content management to page cache.
     length: Mutex<u64>,
     symlink: Mutex<Option<String>>,
-    pages: Mutex<BTreeMap<u64, Box<[u8; PAGE_SIZE_4K]>>>,
-    allocated_pages: Mutex<BTreeSet<u64>>,
-    hole_pages: Mutex<BTreeSet<u64>>,
+    pages: Mutex<HashMap<u64, Box<[u8; PAGE_SIZE_4K]>>>,
+    allocated_pages: Mutex<HashSet<u64>>,
 }
 
 impl FileContent {
@@ -264,7 +323,6 @@ impl FileContent {
             drop(allocated);
             fs.release_pages(released);
         }
-        self.hole_pages.lock().retain(|page| *page < last_page);
     }
 
     fn clear_storage(&self, fs: &MemoryFs) {
@@ -276,7 +334,6 @@ impl FileContent {
         allocated.clear();
         drop(allocated);
         fs.release_pages(released);
-        self.hole_pages.lock().clear();
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
@@ -286,7 +343,6 @@ impl FileContent {
         }
         let total = buf.len().min((len - offset) as usize);
         let pages = self.pages.lock();
-        let holes = self.hole_pages.lock();
         let mut done = 0;
         while done < total {
             let pos = offset + done as u64;
@@ -294,9 +350,7 @@ impl FileContent {
             let page_off = (pos % TMPFS_BLOCK_SIZE) as usize;
             let chunk = (total - done).min(PAGE_SIZE_4K - page_off);
             let dst = &mut buf[done..done + chunk];
-            if holes.contains(&page) {
-                dst.fill(0);
-            } else if let Some(src) = pages.get(&page) {
+            if let Some(src) = pages.get(&page) {
                 dst.copy_from_slice(&src[page_off..page_off + chunk]);
             } else {
                 dst.fill(0);
@@ -321,24 +375,52 @@ impl FileContent {
         let new_pages = (start..end_page)
             .filter(|page| !allocated.contains(page))
             .count() as u64;
+        let missing_data_pages = (start..end_page)
+            .filter(|page| !pages.contains_key(page))
+            .count();
         fs.reserve_pages_vfs(new_pages)?;
+        let preparation = (|| {
+            let mut prepared = Vec::new();
+            prepared
+                .try_reserve_exact(missing_data_pages)
+                .map_err(|_| VfsError::NoMemory)?;
+            for page in start..end_page {
+                if !pages.contains_key(&page) {
+                    let data = Box::try_new([0; PAGE_SIZE_4K]).map_err(|_| VfsError::NoMemory)?;
+                    prepared.push((page, data));
+                }
+            }
+            pages
+                .try_reserve(prepared.len())
+                .map_err(|_| VfsError::NoMemory)?;
+            allocated
+                .try_reserve(usize::try_from(new_pages).map_err(|_| VfsError::NoMemory)?)
+                .map_err(|_| VfsError::NoMemory)?;
+            Ok::<_, VfsError>(prepared)
+        })();
+        let prepared = match preparation {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                fs.release_pages(new_pages);
+                return Err(err);
+            }
+        };
+        for (page, data) in prepared {
+            pages.insert(page, data);
+        }
         let current_len = *self.length.lock();
         if end > current_len {
             *self.length.lock() = end;
         }
-        let mut holes = self.hole_pages.lock();
         let mut done = 0;
         while done < buf.len() {
             let pos = offset + done as u64;
             let page = pos / TMPFS_BLOCK_SIZE;
             let page_off = (pos % TMPFS_BLOCK_SIZE) as usize;
             let chunk = (buf.len() - done).min(PAGE_SIZE_4K - page_off);
-            let dst = pages
-                .entry(page)
-                .or_insert_with(|| Box::new([0; PAGE_SIZE_4K]));
+            let dst = pages.get_mut(&page).ok_or(VfsError::Io)?;
             dst[page_off..page_off + chunk].copy_from_slice(&buf[done..done + chunk]);
             allocated.insert(page);
-            holes.remove(&page);
             done += chunk;
         }
         Ok(buf.len())
@@ -348,15 +430,29 @@ impl FileContent {
         let Some((start, end)) = page_range(offset, len) else {
             return Ok(());
         };
+        // Reject an impossible reservation before walking the requested page
+        // range. A sparse file may have a near-u64::MAX length, but a tmpfs
+        // operation must not spend time proportional to that unbacked hole.
+        if fs
+            .capacity_pages
+            .is_some_and(|capacity| end.saturating_sub(start) > capacity)
+        {
+            return Err(AxError::StorageFull);
+        }
         let mut allocated = self.allocated_pages.lock();
-        let mut holes = self.hole_pages.lock();
         let new_pages = (start..end)
             .filter(|page| !allocated.contains(page))
             .count() as u64;
         fs.reserve_pages(new_pages)?;
+        if allocated
+            .try_reserve(usize::try_from(new_pages).map_err(|_| AxError::NoMemory)?)
+            .is_err()
+        {
+            fs.release_pages(new_pages);
+            return Err(AxError::NoMemory);
+        }
         for page in start..end {
             allocated.insert(page);
-            holes.remove(&page);
         }
         Ok(())
     }
@@ -367,87 +463,100 @@ impl FileContent {
         };
         let mut pages = self.pages.lock();
         let mut allocated = self.allocated_pages.lock();
-        let mut holes = self.hole_pages.lock();
         let mut released = 0;
-        for page in start..end {
-            pages.remove(&page);
-            if allocated.remove(&page) {
+        // Walk only materialized state (bounded by tmpfs capacity), not every
+        // page in a potentially enormous sparse user range.
+        pages.retain(|page, _| *page < start || *page >= end);
+        allocated.retain(|page| {
+            let keep = *page < start || *page >= end;
+            if !keep {
                 released += 1;
             }
-            holes.insert(page);
-        }
+            keep
+        });
         drop(allocated);
         fs.release_pages(released);
     }
 
-    fn collapse_range(&self, fs: &MemoryFs, offset: u64, len: u64) {
+    fn collapse_range(&self, fs: &MemoryFs, offset: u64, len: u64) -> AxResult<()> {
         let Some((start, end)) = full_page_range(offset, len) else {
-            return;
+            return Ok(());
         };
         let delta = end - start;
-
-        let remap_pages = |pages: &mut BTreeSet<u64>| -> u64 {
-            let current = pages.iter().copied().collect::<Vec<_>>();
-            pages.clear();
-            let mut removed = 0;
-            for page in current {
-                if page < start {
-                    pages.insert(page);
-                } else if page < end {
-                    removed += 1;
-                } else if page >= end {
-                    pages.insert(page - delta);
-                }
-            }
-            removed
-        };
-
         let mut data_pages = self.pages.lock();
+        let mut allocated = self.allocated_pages.lock();
+        let mut remapped_data = HashMap::new();
+        remapped_data
+            .try_reserve(data_pages.len())
+            .map_err(|_| AxError::NoMemory)?;
+        let mut remapped_allocated = HashSet::new();
+        remapped_allocated
+            .try_reserve(allocated.len())
+            .map_err(|_| AxError::NoMemory)?;
         let current = mem::take(&mut *data_pages);
         for (page, data) in current {
             if page < start {
-                data_pages.insert(page, data);
+                remapped_data.insert(page, data);
             } else if page >= end {
-                data_pages.insert(page - delta, data);
+                remapped_data.insert(page - delta, data);
             }
         }
+        *data_pages = remapped_data;
+        let mut released = 0;
+        for page in mem::take(&mut *allocated) {
+            if page < start {
+                remapped_allocated.insert(page);
+            } else if page < end {
+                released += 1;
+            } else {
+                remapped_allocated.insert(page - delta);
+            }
+        }
+        *allocated = remapped_allocated;
+        drop(allocated);
         drop(data_pages);
-        let released = remap_pages(&mut self.allocated_pages.lock());
         fs.release_pages(released);
-        remap_pages(&mut self.hole_pages.lock());
+        Ok(())
     }
 
-    fn insert_range(&self, offset: u64, len: u64) {
+    fn insert_range(&self, offset: u64, len: u64) -> AxResult<()> {
         let Some((start, end)) = full_page_range(offset, len) else {
-            return;
+            return Ok(());
         };
         let delta = end - start;
-
-        let remap_pages = |pages: &mut BTreeSet<u64>| {
-            let current = pages.iter().copied().collect::<Vec<_>>();
-            pages.clear();
-            for page in current {
-                if page < start {
-                    pages.insert(page);
-                } else {
-                    pages.insert(page + delta);
-                }
-            }
-        };
-
         let mut data_pages = self.pages.lock();
+        let mut allocated = self.allocated_pages.lock();
+        if data_pages
+            .keys()
+            .chain(allocated.iter())
+            .any(|page| *page >= start && page.checked_add(delta).is_none())
+        {
+            return Err(AxError::InvalidInput);
+        }
+        let mut remapped_data = HashMap::new();
+        remapped_data
+            .try_reserve(data_pages.len())
+            .map_err(|_| AxError::NoMemory)?;
+        let mut remapped_allocated = HashSet::new();
+        remapped_allocated
+            .try_reserve(allocated.len())
+            .map_err(|_| AxError::NoMemory)?;
         let current = mem::take(&mut *data_pages);
         for (page, data) in current {
             if page < start {
-                data_pages.insert(page, data);
+                remapped_data.insert(page, data);
             } else {
-                data_pages.insert(page + delta, data);
+                remapped_data.insert(page + delta, data);
             }
         }
+        *data_pages = remapped_data;
+        for page in mem::take(&mut *allocated) {
+            remapped_allocated.insert(if page < start { page } else { page + delta });
+        }
+        *allocated = remapped_allocated;
+        drop(allocated);
         drop(data_pages);
-        remap_pages(&mut self.allocated_pages.lock());
-        remap_pages(&mut self.hole_pages.lock());
-        self.hole_pages.lock().extend(start..end);
+        Ok(())
     }
 
     fn blocks(&self) -> u64 {
@@ -460,25 +569,32 @@ impl FileContent {
         }
 
         let allocated = self.allocated_pages.lock();
-        let holes = self.hole_pages.lock();
-        let mut page = offset / TMPFS_BLOCK_SIZE;
-        let mut pos = offset;
+        let page = offset / TMPFS_BLOCK_SIZE;
         let last_page = size.div_ceil(TMPFS_BLOCK_SIZE);
 
-        while page < last_page {
-            let is_data = allocated.contains(&page) && !holes.contains(&page);
-            if seek_hole != is_data {
-                return Ok(pos.min(size));
+        if !seek_hole {
+            if allocated.contains(&page) {
+                return Ok(offset);
             }
-            page += 1;
-            pos = page * TMPFS_BLOCK_SIZE;
+            return allocated
+                .iter()
+                .copied()
+                .filter(|candidate| *candidate > page && *candidate < last_page)
+                .min()
+                .map(|candidate| candidate.saturating_mul(TMPFS_BLOCK_SIZE).min(size))
+                .ok_or_else(|| AxError::from(LinuxError::ENXIO));
         }
 
-        if seek_hole {
-            Ok(size)
-        } else {
-            Err(AxError::from(LinuxError::ENXIO))
+        if !allocated.contains(&page) {
+            return Ok(offset);
         }
+        let mut hole = page.saturating_add(1);
+        // Every successful iteration consumes one accounted page, so this is
+        // bounded by the filesystem capacity even for an enormous sparse file.
+        while hole < last_page && allocated.contains(&hole) {
+            hole = hole.saturating_add(1);
+        }
+        Ok(hole.saturating_mul(TMPFS_BLOCK_SIZE).min(size))
     }
 }
 
@@ -510,7 +626,7 @@ fn file_content_for(loc: &axfs_ng_vfs::Location) -> Option<(Arc<MemoryFs>, Arc<I
     Some((node.fs.clone(), node.inode.clone()))
 }
 
-pub fn xattr_store(loc: &axfs_ng_vfs::Location) -> Option<Arc<Mutex<BTreeMap<String, Vec<u8>>>>> {
+pub fn xattr_store(loc: &axfs_ng_vfs::Location) -> Option<Arc<Mutex<HashMap<String, Vec<u8>>>>> {
     let node = memory_node_for(loc)?;
     Some(node.inode.xattrs.clone())
 }
@@ -566,8 +682,7 @@ pub fn collapse_fallocate_range(
     if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
         return Some(Err(err));
     }
-    file.collapse_range(&fs, offset, len);
-    Some(Ok(()))
+    Some(file.collapse_range(&fs, offset, len))
 }
 
 pub fn insert_fallocate_range(
@@ -580,8 +695,7 @@ pub fn insert_fallocate_range(
     if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
         return Some(Err(err));
     }
-    file.insert_range(offset, len);
-    Some(Ok(()))
+    Some(file.insert_range(offset, len))
 }
 
 pub fn seek_data_or_hole(
@@ -594,9 +708,20 @@ pub fn seek_data_or_hole(
     Some(file.seek_data_or_hole(*file.length.lock(), offset, seek_hole))
 }
 
-#[derive(Default)]
 struct DirContent {
     entries: Mutex<HashMap<FileName, InodeRef>>,
+    namespace_epoch: AtomicU64,
+}
+
+impl DirContent {
+    fn try_new() -> VfsResult<Self> {
+        let mut entries = HashMap::new();
+        entries.try_reserve(2).map_err(|_| VfsError::NoMemory)?;
+        Ok(Self {
+            entries: Mutex::new(entries),
+            namespace_epoch: AtomicU64::new(0),
+        })
+    }
 }
 
 enum NodeContent {
@@ -607,20 +732,22 @@ enum NodeContent {
 struct Inode {
     ino: u64,
     metadata: Mutex<Metadata>,
+    anonymous_linkable: Mutex<bool>,
     content: NodeContent,
-    xattrs: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    xattrs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 impl Inode {
-    pub fn new(
+    /// Builds a complete inode without publishing it in the filesystem's live
+    /// identity map. Directory dot entries and the per-inode xattr ownership
+    /// are admitted here, so later registry/namespace insertion cannot fail.
+    fn try_new_unpublished(
         fs: &Arc<MemoryFs>,
-        parent: Option<u64>,
+        ino: u64,
+        parent: Option<&Arc<Inode>>,
         node_type: NodeType,
         permission: NodePermission,
-    ) -> Arc<Inode> {
-        let mut inodes = fs.inodes.lock();
-        let entry = inodes.vacant_entry();
-        let ino = entry.key() as u64 + 1;
+    ) -> VfsResult<Arc<Inode>> {
         let now = wall_time();
         let metadata = Metadata {
             device: 0,
@@ -640,23 +767,34 @@ impl Inode {
             ctime: now,
         };
         let content = match node_type {
-            NodeType::Directory => NodeContent::Dir(DirContent::default()),
+            NodeType::Directory => NodeContent::Dir(DirContent::try_new()?),
             _ => NodeContent::File(FileContent::default()),
         };
-        let result = Arc::new(Self {
+        let dot_names = if node_type == NodeType::Directory {
+            Some((FileName(try_owned(".")?), FileName(try_owned("..")?)))
+        } else {
+            None
+        };
+        let xattrs = Arc::try_new(Mutex::new(HashMap::new())).map_err(|_| VfsError::NoMemory)?;
+        let result = Arc::try_new(Self {
             ino,
             metadata: Mutex::new(metadata),
+            anonymous_linkable: Mutex::new(false),
             content,
-            xattrs: Arc::new(Mutex::default()),
-        });
-        entry.insert(result.clone());
-        drop(inodes);
-        if let NodeContent::Dir(dir) = &result.content {
+            xattrs,
+        })
+        .map_err(|_| VfsError::NoMemory)?;
+        if let (NodeContent::Dir(dir), Some((dot_name, dotdot_name))) = (&result.content, dot_names)
+        {
+            let dot = InodeRef::try_new_named(fs, &result)?;
+            let dotdot = InodeRef::try_new_named(fs, parent.unwrap_or(&result))?;
             let mut entries = dir.entries.lock();
-            entries.insert(".".into(), InodeRef::new(fs, ino));
-            entries.insert("..".into(), InodeRef::new(fs, parent.unwrap_or(ino)));
+            // `DirContent::try_new` reserved both nodes before this inode was
+            // visible, so these inserts cannot allocate.
+            entries.insert(dot_name, dot);
+            entries.insert(dotdot_name, dotdot);
         }
-        result
+        Ok(result)
     }
 
     fn as_file(&self) -> VfsResult<&FileContent> {
@@ -680,16 +818,33 @@ struct InodeRef {
 }
 
 impl InodeRef {
-    pub fn new(fs: &Arc<MemoryFs>, ino: u64) -> Self {
-        fs.get(ino)
-            .expect("new tmpfs inode reference")
-            .metadata
-            .lock()
-            .nlink += 1;
-        Self {
+    /// Prepares a link-count reference directly against an owned inode. This
+    /// works before that inode is in the live registry and avoids an
+    /// allocation-or-panic lookup during namespace publication.
+    fn try_new_named(fs: &Arc<MemoryFs>, inode: &Arc<Inode>) -> VfsResult<Self> {
+        let mut metadata = inode.metadata.lock();
+        metadata.nlink = metadata.nlink.checked_add(1).ok_or(VfsError::StorageFull)?;
+        drop(metadata);
+        Ok(Self {
             fs: Arc::downgrade(fs),
-            ino,
+            ino: inode.ino,
+        })
+    }
+
+    fn new_link(fs: &Arc<MemoryFs>, inode: &Arc<Inode>) -> VfsResult<Self> {
+        let mut metadata = inode.metadata.lock();
+        if metadata.nlink == 0 {
+            let mut anonymous_linkable = inode.anonymous_linkable.lock();
+            if !*anonymous_linkable {
+                return Err(VfsError::NotFound);
+            }
+            *anonymous_linkable = false;
         }
+        metadata.nlink = metadata.nlink.checked_add(1).ok_or(VfsError::StorageFull)?;
+        Ok(Self {
+            fs: Arc::downgrade(fs),
+            ino: inode.ino,
+        })
     }
 
     fn get(&self) -> Option<Arc<Inode>> {
@@ -712,32 +867,123 @@ impl Drop for InodeRef {
 struct MemoryNode {
     fs: Arc<MemoryFs>,
     inode: Arc<Inode>,
-    this: Option<WeakDirEntry>,
+    this: Mutex<Option<WeakDirEntry>>,
 }
 
 impl MemoryNode {
-    pub fn new(fs: Arc<MemoryFs>, inode: Arc<Inode>, this: Option<WeakDirEntry>) -> Arc<Self> {
-        Arc::new(Self { fs, inode, this })
+    fn try_new(fs: Arc<MemoryFs>, inode: Arc<Inode>) -> VfsResult<Arc<Self>> {
+        Arc::try_new(Self {
+            fs,
+            inode,
+            this: Mutex::new(None),
+        })
+        .map_err(|_| VfsError::NoMemory)
+    }
+
+    fn bind(&self, this: WeakDirEntry) {
+        *self.this.lock() = Some(this);
+    }
+
+    fn try_new_entry(
+        fs: Arc<MemoryFs>,
+        inode: Arc<Inode>,
+        node_type: NodeType,
+        reference: Reference,
+    ) -> VfsResult<DirEntry> {
+        let node = Self::try_new(fs, inode)?;
+        if node_type == NodeType::Directory {
+            let entry = DirEntry::try_new_dir(DirNode::new(node.clone()), reference)?;
+            node.bind(entry.downgrade());
+            Ok(entry)
+        } else {
+            DirEntry::try_new_file(FileNode::new(node), node_type, reference)
+        }
     }
 
     fn new_entry(&self, name: &str, node_type: NodeType, inode: Arc<Inode>) -> VfsResult<DirEntry> {
-        let fs = self.fs.clone();
         let reference = Reference::new(
-            self.this.as_ref().and_then(WeakDirEntry::upgrade),
-            name.to_owned(),
+            self.this.lock().as_ref().and_then(WeakDirEntry::upgrade),
+            try_owned(name)?,
         );
-        Ok(if node_type == NodeType::Directory {
-            DirEntry::new_dir(
-                |this| DirNode::new(MemoryNode::new(fs, inode, Some(this))),
-                reference,
-            )
-        } else {
-            DirEntry::new_file(
-                FileNode::new(MemoryNode::new(fs, inode, None)),
-                node_type,
-                reference,
-            )
+        Self::try_new_entry(self.fs.clone(), inode, node_type, reference)
+    }
+
+    fn matches_expected(&self, expected: &DirEntry, actual: &Arc<Inode>) -> bool {
+        expected.downcast::<Self>().is_ok_and(|expected| {
+            Arc::ptr_eq(&self.fs, &expected.fs) && Arc::ptr_eq(actual, &expected.inode)
         })
+    }
+
+    fn touch_directory(inode: &Inode, now: core::time::Duration) {
+        let mut metadata = inode.metadata.lock();
+        metadata.mtime = now;
+        metadata.ctime = now;
+    }
+
+    fn validate_rename(
+        &self,
+        request: RenameRequest<'_>,
+        src_entries: &HashMap<FileName, InodeRef>,
+        dst_entries: &HashMap<FileName, InodeRef>,
+    ) -> VfsResult<(Arc<Inode>, Option<Arc<Inode>>, bool)> {
+        let src_inode = src_entries
+            .get(request.src_name)
+            .and_then(InodeRef::get)
+            .ok_or(VfsError::NotFound)?;
+        if !self.matches_expected(request.src, &src_inode) {
+            return Err(VfsError::NotFound);
+        }
+
+        let dst_inode = dst_entries.get(request.dst_name).and_then(InodeRef::get);
+        match (request.dst, dst_inode.as_ref()) {
+            (None, None) => {}
+            (Some(expected), Some(actual)) if self.matches_expected(expected, actual) => {}
+            _ => return Err(VfsError::NotFound),
+        }
+
+        let same_object = dst_inode
+            .as_ref()
+            .is_some_and(|dst| Arc::ptr_eq(&src_inode, dst));
+        if same_object {
+            return Ok((src_inode, dst_inode, true));
+        }
+
+        let src_is_dir = src_inode.metadata.lock().node_type == NodeType::Directory;
+        let dst_is_dir = dst_inode
+            .as_ref()
+            .is_some_and(|inode| inode.metadata.lock().node_type == NodeType::Directory);
+        match (src_is_dir, dst_inode.is_some(), dst_is_dir) {
+            (true, true, false) => return Err(VfsError::NotADirectory),
+            (false, true, true) => return Err(VfsError::IsADirectory),
+            _ => {}
+        }
+        if let Some(dst_inode) = dst_inode.as_ref()
+            && let NodeContent::Dir(dir) = &dst_inode.content
+            && dir.entries.lock().len() > 2
+        {
+            return Err(VfsError::DirectoryNotEmpty);
+        }
+        Ok((src_inode, dst_inode, false))
+    }
+
+    fn retire_replaced_directory(inode: Option<&Arc<Inode>>) {
+        if let Some(inode) = inode
+            && let NodeContent::Dir(dir) = &inode.content
+        {
+            dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+            dir.entries.lock().clear();
+        }
+    }
+
+    fn new_anonymous_entry(&self, node_type: NodeType, inode: Arc<Inode>) -> VfsResult<DirEntry> {
+        if node_type == NodeType::Directory {
+            return Err(VfsError::OperationNotSupported);
+        }
+        DirEntry::try_new_file(
+            FileNode::new(Self::try_new(self.fs.clone(), inode)?),
+            node_type,
+            Reference::anonymous(),
+        )
     }
 }
 
@@ -844,8 +1090,9 @@ impl FileNodeOps for MemoryNode {
 
     fn set_symlink(&self, target: &str) -> VfsResult<()> {
         let file = self.inode.as_file()?;
+        let target = try_owned(target)?;
         *file.length.lock() = target.len() as u64;
-        *file.symlink.lock() = Some(target.to_owned());
+        *file.symlink.lock() = Some(target);
         Ok(())
     }
 }
@@ -858,6 +1105,12 @@ impl Pollable for MemoryNode {
 }
 
 impl DirNodeOps for MemoryNode {
+    fn namespace_epoch(&self) -> u64 {
+        self.inode
+            .as_dir()
+            .map_or(0, |dir| dir.namespace_epoch.load(AtomicOrdering::Acquire))
+    }
+
     fn read_dir(&self, offset: u64, sink: &mut dyn DirEntrySink) -> VfsResult<usize> {
         let mut count = 0;
         for (i, (name, entry)) in self
@@ -893,85 +1146,299 @@ impl DirNodeOps for MemoryNode {
         self.new_entry(name, node_type, inode)
     }
 
-    fn create(
+    fn create_named(
         &self,
         name: &str,
-        node_type: NodeType,
-        permission: NodePermission,
-    ) -> VfsResult<DirEntry> {
+        options: &NamedCreateOptions,
+        disposition: CreateDisposition,
+    ) -> VfsResult<CreateOutcome<DirEntry>> {
+        let _namespace = self.fs.namespace.lock();
         let dir = self.inode.as_dir()?;
         let mut entries = dir.entries.lock();
 
+        if let Some(existing) = entries.get(name) {
+            if disposition == CreateDisposition::Exclusive {
+                return Err(VfsError::AlreadyExists);
+            }
+            let inode = existing.get().ok_or(VfsError::NotFound)?;
+            let node_type = inode.metadata.lock().node_type;
+            return Ok(CreateOutcome {
+                entry: self.new_entry(name, node_type, inode)?,
+                created: false,
+            });
+        }
+        if options.node_type == NodeType::Symlink {
+            // A symbolic link must be initialized before its name is visible.
+            // Keep the generic create entry point from publishing an empty
+            // link; callers must use `create_symlink` below.
+            return Err(VfsError::OperationNotSupported);
+        }
+        if options.rdev.is_some()
+            && !matches!(
+                options.node_type,
+                NodeType::CharacterDevice | NodeType::BlockDevice
+            )
+        {
+            return Err(VfsError::InvalidInput);
+        }
+        entries.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+        let cache_name = FileName(try_owned(name)?);
+        let ino = self.fs.try_reserve_inode_number()?;
+        let inode = Inode::try_new_unpublished(
+            &self.fs,
+            ino,
+            Some(&self.inode),
+            options.node_type,
+            options.permission,
+        )?;
+        {
+            let mut metadata = inode.metadata.lock();
+            if let Some((uid, gid)) = options.owner {
+                metadata.uid = uid;
+                metadata.gid = gid;
+            }
+            if let Some(rdev) = options.rdev {
+                metadata.rdev = rdev;
+            }
+        }
+        let inode_ref = InodeRef::try_new_named(&self.fs, &inode)?;
+        let entry = self.new_entry(name, options.node_type, inode.clone())?;
+        self.fs.publish_inode(inode)?;
+        dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+        entries.insert(cache_name, inode_ref);
+        let now = wall_time();
+        drop(entries);
+        Self::touch_directory(&self.inode, now);
+        Ok(CreateOutcome {
+            entry,
+            created: true,
+        })
+    }
+
+    fn create_symlink(
+        &self,
+        name: &str,
+        target: &str,
+        permission: NodePermission,
+        user: Option<(u32, u32)>,
+    ) -> VfsResult<DirEntry> {
+        let target = try_owned(target)?;
+        let cache_name = FileName(try_owned(name)?);
+        let _namespace = self.fs.namespace.lock();
+        let dir = self.inode.as_dir()?;
+        let mut entries = dir.entries.lock();
         if entries.contains_key(name) {
             return Err(VfsError::AlreadyExists);
         }
-        let inode = Inode::new(&self.fs, Some(self.inode.ino), node_type, permission);
-        entries.insert(name.into(), InodeRef::new(&self.fs, inode.ino));
-        self.new_entry(name, node_type, inode)
+        entries.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+
+        let ino = self.fs.try_reserve_inode_number()?;
+        let inode = Inode::try_new_unpublished(
+            &self.fs,
+            ino,
+            Some(&self.inode),
+            NodeType::Symlink,
+            permission,
+        )?;
+        let file = inode.as_file()?;
+        *file.length.lock() = target.len() as u64;
+        *file.symlink.lock() = Some(target);
+        if let Some((uid, gid)) = user {
+            let mut metadata = inode.metadata.lock();
+            metadata.uid = uid;
+            metadata.gid = gid;
+        }
+        let inode_ref = InodeRef::try_new_named(&self.fs, &inode)?;
+        let entry = self.new_entry(name, NodeType::Symlink, inode.clone())?;
+        self.fs.publish_inode(inode)?;
+        dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+        entries.insert(cache_name, inode_ref);
+        let now = wall_time();
+        drop(entries);
+        Self::touch_directory(&self.inode, now);
+        Ok(entry)
+    }
+
+    fn create_anonymous(&self, options: &AnonymousOptions) -> VfsResult<DirEntry> {
+        let _namespace = self.fs.namespace.lock();
+        self.inode.as_dir()?;
+        if options.node_type == NodeType::Directory {
+            return Err(VfsError::OperationNotSupported);
+        }
+        let ino = self.fs.try_reserve_inode_number()?;
+        let inode = Inode::try_new_unpublished(
+            &self.fs,
+            ino,
+            Some(&self.inode),
+            options.node_type,
+            options.permission,
+        )?;
+        if let Some((uid, gid)) = options.user {
+            let mut metadata = inode.metadata.lock();
+            metadata.uid = uid;
+            metadata.gid = gid;
+        }
+        *inode.anonymous_linkable.lock() = options.linkable;
+        let entry = self.new_anonymous_entry(options.node_type, inode.clone())?;
+        self.fs.publish_inode(inode)?;
+        Ok(entry)
     }
 
     fn link(&self, name: &str, target: &DirEntry) -> VfsResult<DirEntry> {
+        let cache_name = FileName(try_owned(name)?);
+        let _namespace = self.fs.namespace.lock();
         let dir = self.inode.as_dir()?;
         let mut entries = dir.entries.lock();
 
         let target = target.downcast::<Self>()?;
+        if !Arc::ptr_eq(&self.fs, &target.fs) {
+            return Err(VfsError::CrossesDevices);
+        }
 
         if entries.contains_key(name) {
             return Err(VfsError::AlreadyExists);
         }
+        entries.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
         let inode = target.inode.clone();
         let node_type = target.metadata()?.node_type;
-        entries.insert(name.into(), InodeRef::new(&self.fs, inode.ino));
-        self.new_entry(name, node_type, inode)
+        if node_type == NodeType::Directory {
+            return Err(VfsError::OperationNotPermitted);
+        }
+        // Admit the dentry before consuming an anonymous inode's one-shot
+        // linkability. Once `new_link` succeeds, the reserved namespace slot
+        // makes the remaining publication infallible, so an allocation failure
+        // leaves O_TMPFILE linkability retryable.
+        let entry = self.new_entry(name, node_type, inode)?;
+        let inode_ref = InodeRef::new_link(&self.fs, &target.inode)?;
+        dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+        entries.insert(cache_name, inode_ref);
+        let now = wall_time();
+        drop(entries);
+        Self::touch_directory(&self.inode, now);
+        Ok(entry)
     }
 
-    fn unlink(&self, name: &str) -> VfsResult<()> {
+    fn unlink(&self, request: UnlinkRequest<'_>) -> VfsResult<()> {
+        let _namespace = self.fs.namespace.lock();
         let dir = self.inode.as_dir()?;
         let mut entries = dir.entries.lock();
 
-        let Some(inode) = entries.get(name).and_then(InodeRef::get) else {
+        let Some(inode) = entries.get(request.name).and_then(InodeRef::get) else {
             return Err(VfsError::NotFound);
         };
+        if request
+            .expected
+            .is_some_and(|expected| !self.matches_expected(expected, &inode))
+        {
+            return Err(VfsError::NotFound);
+        }
+        let node_type = inode.metadata.lock().node_type;
+        match (node_type == NodeType::Directory, request.is_dir) {
+            (true, false) => return Err(VfsError::IsADirectory),
+            (false, true) => return Err(VfsError::NotADirectory),
+            _ => {}
+        }
         if let NodeContent::Dir(DirContent {
             entries: child_entries,
+            namespace_epoch,
         }) = &inode.content
         {
             let mut child_entries = child_entries.lock();
             if child_entries.len() > 2 {
                 return Err(VfsError::DirectoryNotEmpty);
             }
+            namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
             child_entries.clear();
         }
+        dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
         drop(inode);
-        entries.remove(name);
+        entries.remove(request.name);
+        let now = wall_time();
+        drop(entries);
+        Self::touch_directory(&self.inode, now);
 
         Ok(())
     }
 
-    // TODO: atomicity
-    fn rename(&self, src_name: &str, dst_dir: &DirNode, dst_name: &str) -> VfsResult<()> {
-        let dst_node = dst_dir.downcast::<Self>()?;
-        if let Ok(entry) = dst_dir.lookup(dst_name) {
-            let src_entry = self.lookup(src_name)?;
-            if entry.inode() == src_entry.inode() {
+    fn rename(&self, request: RenameRequest<'_>) -> VfsResult<()> {
+        let dst_node = request.dst_dir.downcast::<Self>()?;
+        if !Arc::ptr_eq(&self.fs, &dst_node.fs) {
+            return Err(VfsError::CrossesDevices);
+        }
+        let dst_key = FileName(try_owned(request.dst_name)?);
+        let _namespace = self.fs.namespace.lock();
+        let src_dir = self.inode.as_dir()?;
+        let dst_dir = dst_node.inode.as_dir()?;
+        let same_parent = Arc::ptr_eq(&self.inode, &dst_node.inode);
+
+        if same_parent {
+            let mut entries = src_dir.entries.lock();
+            let (src_inode, dst_inode, same_object) =
+                self.validate_rename(request, &entries, &entries)?;
+            if same_object {
                 return Ok(());
             }
+            entries.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+            src_dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+            let src_ref = entries.remove(request.src_name).ok_or(VfsError::NotFound)?;
+            let old_dst = entries.remove(request.dst_name);
+            entries.insert(dst_key, src_ref);
+            Self::retire_replaced_directory(dst_inode.as_ref());
+            drop(old_dst);
+            drop(src_inode);
+            let now = wall_time();
+            drop(entries);
+            Self::touch_directory(&self.inode, now);
+            return Ok(());
         }
 
-        let src_entry = self
-            .inode
-            .as_dir()?
-            .entries
-            .lock()
-            .remove(src_name)
+        let mut src_entries = src_dir.entries.lock();
+        let mut dst_entries = dst_dir.entries.lock();
+        let (src_inode, dst_inode, same_object) =
+            self.validate_rename(request, &src_entries, &dst_entries)?;
+        if same_object {
+            return Ok(());
+        }
+        dst_entries.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+
+        let mut new_parent_ref = if src_inode.metadata.lock().node_type == NodeType::Directory {
+            Some(InodeRef::try_new_named(&self.fs, &dst_node.inode)?)
+        } else {
+            None
+        };
+        let mut child_entries = if new_parent_ref.is_some() {
+            Some(src_inode.as_dir()?.entries.lock())
+        } else {
+            None
+        };
+        let mut parent_slot = match child_entries.as_mut() {
+            Some(entries) => Some(entries.get_mut("..").ok_or(VfsError::Io)?),
+            None => None,
+        };
+
+        src_dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+        dst_dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+        let src_ref = src_entries
+            .remove(request.src_name)
             .ok_or(VfsError::NotFound)?;
-        let old_dst = dst_node
-            .inode
-            .as_dir()?
-            .entries
-            .lock()
-            .insert(dst_name.into(), src_entry);
+        let old_dst = dst_entries.remove(request.dst_name);
+        if let (Some(entry), Some(parent_ref)) = (parent_slot.as_mut(), new_parent_ref.take()) {
+            let old_parent = mem::replace(*entry, parent_ref);
+            if let NodeContent::Dir(dir) = &src_inode.content {
+                dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
+            }
+            drop(old_parent);
+        }
+        dst_entries.insert(dst_key, src_ref);
+        Self::retire_replaced_directory(dst_inode.as_ref());
         drop(old_dst);
+        drop(parent_slot);
+        drop(child_entries);
+        drop(src_entries);
+        drop(dst_entries);
+        let now = wall_time();
+        Self::touch_directory(&self.inode, now);
+        Self::touch_directory(&dst_node.inode, now);
         Ok(())
     }
 }
@@ -983,5 +1450,400 @@ impl Drop for MemoryNode {
             dir.entries.lock().clear();
         }
         release_inode(&self.fs, &self.inode, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{
+        string::{String, ToString},
+        vec::Vec,
+    };
+
+    use axfs_ng_vfs::{
+        AnonymousOptions, CreateDisposition, DeviceId, MetadataUpdate, Mountpoint,
+        NamedCreateOptions, NodePermission, NodeType, VfsError,
+    };
+
+    use super::MemoryFs;
+
+    fn directory_names(root: &axfs_ng_vfs::Location) -> Vec<String> {
+        let mut names = Vec::new();
+        root.read_dir(0, &mut |name: &str, _, _, _| {
+            names.push(name.to_string());
+            true
+        })
+        .unwrap();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn anonymous_inode_stays_hidden_until_same_inode_link() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let before = directory_names(&root);
+        let directory_options = AnonymousOptions {
+            node_type: NodeType::Directory,
+            permission: NodePermission::from_bits_truncate(0o700),
+            user: Some((1000, 1001)),
+            linkable: true,
+        };
+        assert_eq!(
+            root.create_anonymous(&directory_options).unwrap_err(),
+            axfs_ng_vfs::VfsError::OperationNotSupported
+        );
+        assert_eq!(directory_names(&root), before);
+
+        let options = AnonymousOptions {
+            node_type: NodeType::RegularFile,
+            permission: NodePermission::from_bits_truncate(0o640),
+            user: Some((1000, 1001)),
+            linkable: true,
+        };
+
+        let anonymous = root.create_anonymous(&options).unwrap();
+        let anonymous_meta = anonymous.metadata().unwrap();
+        assert_eq!(anonymous_meta.nlink, 0);
+        assert_eq!((anonymous_meta.uid, anonymous_meta.gid), (1000, 1001));
+        assert!(!anonymous.entry().is_root_of_mount());
+        assert_ne!(
+            anonymous.entry().try_key().unwrap(),
+            root.entry().try_key().unwrap()
+        );
+        assert_eq!(
+            anonymous.absolute_path().unwrap_err(),
+            axfs_ng_vfs::VfsError::InvalidInput
+        );
+        assert_eq!(directory_names(&root), before);
+
+        anonymous
+            .entry()
+            .as_file()
+            .unwrap()
+            .write_at(b"same inode", 0)
+            .unwrap();
+        let linked = root.link("published", &anonymous).unwrap();
+        let linked_meta = linked.metadata().unwrap();
+        assert_eq!(linked_meta.inode, anonymous_meta.inode);
+        assert_eq!(linked_meta.nlink, 1);
+
+        let mut contents = [0; 10];
+        linked
+            .entry()
+            .as_file()
+            .unwrap()
+            .read_at(&mut contents, 0)
+            .unwrap();
+        assert_eq!(&contents, b"same inode");
+
+        let after = directory_names(&root);
+        assert_eq!(after.len(), before.len() + 1);
+        assert!(after.iter().any(|name| name == "published"));
+        assert!(!after.iter().any(|name| name.starts_with(".tmpfile-")));
+
+        let second = root.link("published-again", &anonymous).unwrap();
+        assert_eq!(second.metadata().unwrap().nlink, 2);
+        root.unlink("published", false).unwrap();
+        root.unlink("published-again", false).unwrap();
+        assert_eq!(anonymous.metadata().unwrap().nlink, 0);
+        assert_eq!(
+            root.link("resurrected", &anonymous).unwrap_err(),
+            axfs_ng_vfs::VfsError::NotFound
+        );
+
+        let mut unpublishable_options = options;
+        unpublishable_options.linkable = false;
+        let unpublishable = root.create_anonymous(&unpublishable_options).unwrap();
+        assert_eq!(
+            root.link("exclusive", &unpublishable).unwrap_err(),
+            axfs_ng_vfs::VfsError::NotFound
+        );
+    }
+
+    #[test]
+    fn symlink_is_initialized_and_owned_before_publication() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+
+        assert_eq!(
+            root.create(
+                "empty-link",
+                NodeType::Symlink,
+                NodePermission::from_bits_truncate(0o777),
+            )
+            .unwrap_err(),
+            axfs_ng_vfs::VfsError::OperationNotSupported
+        );
+        assert_eq!(
+            root.lookup_no_follow("empty-link").unwrap_err(),
+            axfs_ng_vfs::VfsError::NotFound
+        );
+
+        let link = root
+            .create_symlink(
+                "link",
+                "target",
+                NodePermission::from_bits_truncate(0o777),
+                Some((1000, 1001)),
+            )
+            .unwrap();
+        let metadata = link.metadata().unwrap();
+        assert_eq!(metadata.node_type, NodeType::Symlink);
+        assert_eq!(metadata.mode.bits() & 0o777, 0o777);
+        assert_eq!((metadata.uid, metadata.gid), (1000, 1001));
+        assert_eq!(link.read_link().unwrap(), "target");
+    }
+
+    #[test]
+    fn named_create_initializes_attributes_before_namespace_commit() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let options = NamedCreateOptions {
+            node_type: NodeType::CharacterDevice,
+            permission: NodePermission::from_bits_truncate(0o2640),
+            owner: Some((1000, 1001)),
+            rdev: Some(DeviceId(0x1234)),
+        };
+
+        let created = root
+            .create_named("device", &options, CreateDisposition::Exclusive)
+            .unwrap();
+        assert!(created.created);
+        let metadata = created.entry.metadata().unwrap();
+        assert_eq!(metadata.node_type, NodeType::CharacterDevice);
+        assert_eq!(metadata.mode.bits(), 0o2640);
+        assert_eq!((metadata.uid, metadata.gid), (1000, 1001));
+        assert_eq!(metadata.rdev, DeviceId(0x1234));
+
+        let existing = root
+            .create_named(
+                "device",
+                &NamedCreateOptions {
+                    owner: Some((2000, 2001)),
+                    ..options
+                },
+                CreateDisposition::OpenOrCreate,
+            )
+            .unwrap();
+        assert!(!existing.created);
+        assert_eq!(existing.entry.inode(), created.entry.inode());
+        let metadata = existing.entry.metadata().unwrap();
+        assert_eq!((metadata.uid, metadata.gid), (1000, 1001));
+        assert_eq!(metadata.rdev, DeviceId(0x1234));
+
+        let invalid = NamedCreateOptions {
+            node_type: NodeType::RegularFile,
+            rdev: Some(DeviceId(7)),
+            ..options
+        };
+        assert_eq!(
+            root.create_named("invalid", &invalid, CreateDisposition::Exclusive)
+                .unwrap_err(),
+            axfs_ng_vfs::VfsError::InvalidInput
+        );
+        assert_eq!(
+            root.lookup_no_follow("invalid").unwrap_err(),
+            axfs_ng_vfs::VfsError::NotFound
+        );
+    }
+
+    #[test]
+    fn open_or_create_checks_existing_before_new_inode_options() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let created = root
+            .create(
+                "existing",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+
+        let outcome = root
+            .create_named(
+                "existing",
+                &NamedCreateOptions {
+                    node_type: NodeType::Unknown,
+                    permission: NodePermission::empty(),
+                    owner: Some((123, 456)),
+                    rdev: Some(DeviceId(7)),
+                },
+                CreateDisposition::OpenOrCreate,
+            )
+            .unwrap();
+        assert!(!outcome.created);
+        assert_eq!(outcome.entry.inode(), created.inode());
+    }
+
+    #[test]
+    fn alias_cache_observes_backend_namespace_epoch() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let parent = root
+            .create(
+                "parent",
+                NodeType::Directory,
+                NodePermission::from_bits_truncate(0o755),
+            )
+            .unwrap();
+        parent
+            .create(
+                "victim",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+
+        let alias = root
+            .entry()
+            .as_dir()
+            .unwrap()
+            .inner()
+            .lookup("parent")
+            .unwrap();
+        let alias_dir = alias.as_dir().unwrap();
+        alias_dir.lookup("victim").unwrap();
+
+        parent.unlink("victim", false).unwrap();
+        assert_eq!(alias_dir.lookup("victim").unwrap_err(), VfsError::NotFound);
+    }
+
+    #[test]
+    fn alias_unlink_uses_backend_identity_not_dentry_pointer() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let parent = root
+            .create(
+                "parent",
+                NodeType::Directory,
+                NodePermission::from_bits_truncate(0o755),
+            )
+            .unwrap();
+        parent
+            .create(
+                "victim",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+
+        let alias = root
+            .entry()
+            .as_dir()
+            .unwrap()
+            .inner()
+            .lookup("parent")
+            .unwrap();
+        let alias_dir = alias.as_dir().unwrap();
+        let expected = alias_dir.inner().lookup("victim").unwrap();
+        alias_dir
+            .unlink_checked("victim", false, &expected)
+            .unwrap();
+        assert_eq!(
+            parent.lookup_no_follow("victim").unwrap_err(),
+            VfsError::NotFound
+        );
+    }
+
+    #[test]
+    fn unlink_rejects_a_replaced_expected_identity() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let old = root
+            .create(
+                "slot",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        root.unlink("slot", false).unwrap();
+        let replacement = root
+            .create(
+                "slot",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+
+        assert_eq!(
+            root.entry()
+                .as_dir()
+                .unwrap()
+                .unlink_checked("slot", false, old.entry())
+                .unwrap_err(),
+            VfsError::NotFound
+        );
+        assert_eq!(
+            root.lookup_no_follow("slot").unwrap().inode(),
+            replacement.inode()
+        );
+    }
+
+    #[test]
+    fn rename_same_object_is_noop_and_type_matrix_is_complete() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let dir = root
+            .create(
+                "dir",
+                NodeType::Directory,
+                NodePermission::from_bits_truncate(0o755),
+            )
+            .unwrap();
+        dir.create(
+            "child",
+            NodeType::RegularFile,
+            NodePermission::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        root.create(
+            "file",
+            NodeType::RegularFile,
+            NodePermission::from_bits_truncate(0o600),
+        )
+        .unwrap();
+
+        root.rename("dir", &root, "dir").unwrap();
+        assert!(root.lookup_no_follow("dir").unwrap().is_dir());
+        assert_eq!(
+            root.rename("file", &root, "dir").unwrap_err(),
+            VfsError::IsADirectory
+        );
+        assert_eq!(
+            root.rename("dir", &root, "file").unwrap_err(),
+            VfsError::NotADirectory
+        );
+    }
+
+    #[test]
+    fn named_create_updates_parent_mtime_and_ctime() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        root.update_metadata(MetadataUpdate {
+            mtime: Some(core::time::Duration::MAX),
+            ctime: Some(core::time::Duration::MAX),
+            ..Default::default()
+        })
+        .unwrap();
+
+        root.create(
+            "child",
+            NodeType::RegularFile,
+            NodePermission::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        let metadata = root.metadata().unwrap();
+        assert_ne!(metadata.mtime, core::time::Duration::MAX);
+        assert_ne!(metadata.ctime, core::time::Duration::MAX);
     }
 }

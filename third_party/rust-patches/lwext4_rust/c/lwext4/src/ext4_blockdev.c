@@ -100,6 +100,7 @@ int ext4_block_init(struct ext4_blockdev *bdev)
 		return EOK;
 	}
 
+	bdev->writeback_error = EOK;
 	/*Low level block init*/
 	rc = bdev->bdif->open(bdev);
 	if (rc != EOK)
@@ -141,6 +142,24 @@ int ext4_block_fini(struct ext4_blockdev *bdev)
 	return bdev->bdif->close(bdev);
 }
 
+int ext4_block_flush(struct ext4_blockdev *bdev)
+{
+	ext4_assert(bdev);
+	ext4_assert(bdev->bdif);
+
+	if (!bdev->bdif->ph_refctr)
+		return EIO;
+
+	if (bdev->bdif->flush) {
+		ext4_bdif_lock(bdev);
+		int r = bdev->bdif->flush(bdev);
+		ext4_bdif_unlock(bdev);
+		return r;
+	}
+
+	return EOK;
+}
+
 int ext4_block_flush_buf(struct ext4_blockdev *bdev, struct ext4_buf *buf)
 {
 	int r;
@@ -150,6 +169,8 @@ int ext4_block_flush_buf(struct ext4_blockdev *bdev, struct ext4_buf *buf)
 	    ext4_bcache_test_flag(buf, BC_UPTODATE)) {
 		r = ext4_blocks_set_direct(bdev, buf->data, buf->lba, 1);
 		if (r) {
+			if (bdev->writeback_error == EOK)
+				bdev->writeback_error = r;
 			if (buf->end_write) {
 				bc->dont_shake = true;
 				buf->end_write(bc, buf, r, buf->end_write_arg);
@@ -443,16 +464,29 @@ int ext4_block_readbytes(struct ext4_blockdev *bdev, uint64_t off, void *buf,
 
 int ext4_block_cache_flush(struct ext4_blockdev *bdev)
 {
+	int pending_error = bdev->writeback_error;
+	bdev->writeback_error = EOK;
+
 	while (!SLIST_EMPTY(&bdev->bc->dirty_list)) {
 		int r;
 		struct ext4_buf *buf = SLIST_FIRST(&bdev->bc->dirty_list);
 		ext4_assert(buf);
 		r = ext4_block_flush_buf(bdev, buf);
-		if (r != EOK)
+		if (r != EOK) {
+			/* Report the oldest undelivered failure first. Keep a new
+			 * failure for the next flush only when an older one is returned
+			 * now; otherwise avoid reporting the same failure twice merely
+			 * because flush_buf recorded it. */
+			if (pending_error != EOK) {
+				bdev->writeback_error = r;
+				return pending_error;
+			}
+			bdev->writeback_error = EOK;
 			return r;
+		}
 
 	}
-	return EOK;
+	return pending_error;
 }
 
 int ext4_block_cache_write_back(struct ext4_blockdev *bdev, uint8_t on_off)

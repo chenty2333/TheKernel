@@ -1,14 +1,16 @@
-use alloc::{
-    collections::{BTreeMap, BTreeSet},
-    vec::Vec,
-};
+use alloc::vec::Vec;
 use core::{future::poll_fn, task::Poll};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axpoll::PollSet;
-use axtask::future::{block_on, interruptible};
+use axsync::Mutex;
+use axtask::{
+    current_may_uninit,
+    future::{block_on, interruptible},
+};
+use hashbrown::{HashMap, HashSet};
+use lazy_static::lazy_static;
 use linux_raw_sys::general::{F_RDLCK, F_UNLCK, F_WRLCK, SEEK_CUR, SEEK_END, SEEK_SET, flock64};
-use spin::Mutex;
 use starry_process::Pid;
 
 /// Inode identity: (device, inode number).
@@ -19,25 +21,27 @@ const RECORD_EOF: u64 = u64::MAX;
 
 enum FlockState {
     /// One or more open file descriptions hold shared locks.
-    Shared(BTreeSet<FlockOwner>),
+    Shared(HashSet<FlockOwner>),
     /// Exactly one open file description holds an exclusive lock.
     Exclusive(FlockOwner),
 }
 
 struct FlockTableInner {
-    locks: BTreeMap<InodeId, FlockState>,
-    owners: BTreeMap<FlockOwner, BTreeSet<InodeId>>,
-    /// Woken whenever any lock changes, so blocked acquirers can retry.
-    waiters: PollSet,
+    locks: HashMap<InodeId, FlockState>,
+    owners: HashMap<FlockOwner, HashSet<InodeId>>,
+    memberships: usize,
 }
 
-static FLOCK_TABLE: Mutex<FlockTableInner> = Mutex::new(FlockTableInner {
-    locks: BTreeMap::new(),
-    owners: BTreeMap::new(),
-    waiters: PollSet::new(),
-});
+lazy_static! {
+    static ref FLOCK_TABLE: Mutex<FlockTableInner> = Mutex::new(FlockTableInner {
+        locks: HashMap::new(),
+        owners: HashMap::new(),
+        memberships: 0,
+    });
+}
+static FLOCK_WAITERS: PollSet = PollSet::new();
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RecordLockOwner {
     Posix(Pid),
     Ofd(u64),
@@ -55,7 +59,7 @@ struct RecordLockRequest {
     range: RecordRange,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct RecordLock {
     owner: RecordLockOwner,
     ty: i16,
@@ -69,31 +73,26 @@ struct RecordLockWait {
 }
 
 struct RecordLockTableInner {
-    locks: BTreeMap<InodeId, Vec<RecordLock>>,
-    wait_requests: BTreeMap<RecordLockOwner, RecordLockWait>,
-    /// Woken whenever any record lock changes, so blocked acquirers can retry.
-    waiters: PollSet,
+    locks: HashMap<InodeId, Vec<RecordLock>>,
+    owners: HashMap<RecordLockOwner, HashSet<InodeId>>,
+    wait_requests: HashMap<RecordLockOwner, RecordLockWait>,
+    record_count: usize,
 }
 
-static RECORD_LOCK_TABLE: Mutex<RecordLockTableInner> = Mutex::new(RecordLockTableInner {
-    locks: BTreeMap::new(),
-    wait_requests: BTreeMap::new(),
-    waiters: PollSet::new(),
-});
-
-fn take_flock_waiters(table: &mut FlockTableInner) -> PollSet {
-    core::mem::replace(&mut table.waiters, PollSet::new())
+lazy_static! {
+    static ref RECORD_LOCK_TABLE: Mutex<RecordLockTableInner> = Mutex::new(RecordLockTableInner {
+        locks: HashMap::new(),
+        owners: HashMap::new(),
+        wait_requests: HashMap::new(),
+        record_count: 0,
+    });
 }
+static RECORD_LOCK_WAITERS: PollSet = PollSet::new();
 
-fn take_record_lock_waiters(table: &mut RecordLockTableInner) -> PollSet {
-    core::mem::replace(&mut table.waiters, PollSet::new())
-}
-
-fn wake_waiters(waiters: Option<PollSet>) {
-    if let Some(waiters) = waiters {
-        waiters.wake();
-    }
-}
+const MAX_FLOCK_MEMBERSHIPS: usize = 65_536;
+const MAX_RECORD_LOCKS: usize = 65_536;
+const MAX_RECORD_LOCKS_PER_INODE: usize = 256;
+const MAX_RECORD_WAIT_REQUESTS: usize = 65_536;
 
 impl RecordRange {
     fn overlaps(self, other: Self) -> bool {
@@ -152,33 +151,44 @@ fn record_lock_conflicts(
     lock.ty == F_WRLCK as i16 || req.ty == F_WRLCK as i16
 }
 
-fn record_lock_conflict_owners(
+fn record_lock_has_conflict(
     table: &RecordLockTableInner,
     id: InodeId,
     owner: RecordLockOwner,
     req: RecordLockRequest,
-) -> BTreeSet<RecordLockOwner> {
+) -> bool {
     table
         .locks
         .get(&id)
         .into_iter()
         .flat_map(|locks| locks.iter())
-        .filter(|lock| record_lock_conflicts(lock, owner, req))
-        .map(|lock| lock.owner)
-        .collect()
+        .any(|lock| record_lock_conflicts(lock, owner, req))
 }
 
 fn record_lock_would_deadlock(
     table: &RecordLockTableInner,
     owner: RecordLockOwner,
-    blockers: &BTreeSet<RecordLockOwner>,
-) -> bool {
-    let mut seen = BTreeSet::new();
-    let mut stack: Vec<RecordLockOwner> = blockers.iter().copied().collect();
+    id: InodeId,
+    req: RecordLockRequest,
+) -> AxResult<bool> {
+    let mut seen = HashSet::new();
+    seen.try_reserve(table.wait_requests.len().min(MAX_RECORD_WAIT_REQUESTS))
+        .map_err(|_| AxError::NoMemory)?;
+    let mut stack = Vec::new();
+    stack
+        .try_reserve(table.locks.get(&id).map_or(0, |locks| locks.len()))
+        .map_err(|_| AxError::NoMemory)?;
+    if let Some(locks) = table.locks.get(&id) {
+        for lock in locks {
+            if record_lock_conflicts(lock, owner, req) {
+                stack.push(lock.owner);
+            }
+        }
+    }
 
     while let Some(blocker) = stack.pop() {
         if blocker == owner {
-            return true;
+            return Ok(true);
         }
         if !matches!(blocker, RecordLockOwner::Posix(_)) {
             continue;
@@ -189,68 +199,100 @@ fn record_lock_would_deadlock(
         let Some(wait) = table.wait_requests.get(&blocker) else {
             continue;
         };
-        stack.extend(record_lock_conflict_owners(
-            table, wait.id, blocker, wait.req,
-        ));
+        if let Some(locks) = table.locks.get(&wait.id) {
+            for lock in locks {
+                if !record_lock_conflicts(lock, blocker, wait.req) {
+                    continue;
+                }
+                if stack.len() >= MAX_RECORD_WAIT_REQUESTS {
+                    // Linux's deadlock detector is intentionally bounded too.
+                    // Conservatively reject an over-deep dependency graph.
+                    return Ok(true);
+                }
+                stack.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                stack.push(lock.owner);
+            }
+        }
     }
 
-    false
+    Ok(false)
 }
 
 fn split_out_range(lock: &RecordLock, range: RecordRange, out: &mut Vec<RecordLock>) {
     if !lock.range.overlaps(range) {
-        out.push(lock.clone());
+        out.push(*lock);
         return;
     }
     if lock.range.start < range.start {
-        let mut left = lock.clone();
+        let mut left = *lock;
         left.range.end = range.start;
         out.push(left);
     }
     if range.end < lock.range.end {
-        let mut right = lock.clone();
+        let mut right = *lock;
         right.range.start = range.end;
         out.push(right);
     }
 }
 
-fn insert_record_lock(locks: &mut Vec<RecordLock>, new_lock: RecordLock) {
+fn build_record_locks(
+    locks: &[RecordLock],
+    owner: RecordLockOwner,
+    req: RecordLockRequest,
+) -> AxResult<Vec<RecordLock>> {
     let mut updated = Vec::new();
-    for lock in locks.iter() {
-        if lock.owner == new_lock.owner {
-            split_out_range(lock, new_lock.range, &mut updated);
+    let capacity = locks
+        .len()
+        .checked_mul(2)
+        .and_then(|capacity| capacity.checked_add(1))
+        .ok_or(LinuxError::ENOLCK)?;
+    updated
+        .try_reserve_exact(capacity)
+        .map_err(|_| AxError::NoMemory)?;
+    for lock in locks {
+        if lock.owner == owner {
+            split_out_range(lock, req.range, &mut updated);
         } else {
-            updated.push(lock.clone());
+            updated.push(*lock);
         }
     }
-    updated.push(new_lock);
-    updated.sort_by_key(|lock| (lock.range.start, lock.range.end, lock.owner, lock.ty));
+    if req.ty != F_UNLCK as i16 {
+        updated.push(RecordLock {
+            owner,
+            ty: req.ty,
+            range: req.range,
+        });
+        updated.sort_by_key(|lock| (lock.owner, lock.ty, lock.range.start, lock.range.end));
 
-    let mut merged: Vec<RecordLock> = Vec::new();
-    for lock in updated {
-        if let Some(last) = merged.last_mut()
-            && last.owner == lock.owner
-            && last.ty == lock.ty
-            && last.range.end >= lock.range.start
-        {
-            last.range.end = last.range.end.max(lock.range.end);
-            continue;
+        // Merge in place so the admitted temporary vector is the only
+        // allocation needed for this transaction.
+        let mut written = 0;
+        for read in 0..updated.len() {
+            let lock = updated[read];
+            if written != 0 {
+                let last = &mut updated[written - 1];
+                if last.owner == lock.owner
+                    && last.ty == lock.ty
+                    && last.range.end >= lock.range.start
+                {
+                    last.range.end = last.range.end.max(lock.range.end);
+                    continue;
+                }
+            }
+            updated[written] = lock;
+            written += 1;
         }
-        merged.push(lock);
+        updated.truncate(written);
+        updated.sort_by_key(|lock| (lock.range.start, lock.range.end, lock.owner, lock.ty));
     }
-    *locks = merged;
+    Ok(updated)
 }
 
-fn unlock_record_range(locks: &mut Vec<RecordLock>, owner: RecordLockOwner, range: RecordRange) {
-    let mut updated = Vec::new();
-    for lock in locks.iter() {
-        if lock.owner == owner {
-            split_out_range(lock, range, &mut updated);
-        } else {
-            updated.push(lock.clone());
-        }
-    }
-    *locks = updated;
+#[derive(Default)]
+struct RetiredRecordStorage {
+    locks: Option<Vec<RecordLock>>,
+    empty_locks: Option<Vec<RecordLock>>,
+    owner_ids: Option<HashSet<InodeId>>,
 }
 
 fn try_set_record_lock_inner(
@@ -258,41 +300,89 @@ fn try_set_record_lock_inner(
     id: InodeId,
     owner: RecordLockOwner,
     req: RecordLockRequest,
-) -> bool {
-    if req.ty != F_UNLCK as i16 && !record_lock_conflict_owners(table, id, owner, req).is_empty() {
-        return false;
+) -> AxResult<(bool, RetiredRecordStorage)> {
+    if req.ty != F_UNLCK as i16 && record_lock_has_conflict(table, id, owner, req) {
+        return Ok((false, RetiredRecordStorage::default()));
     }
 
-    table.wait_requests.remove(&owner);
-    let locks = table.locks.entry(id).or_default();
-    if req.ty == F_UNLCK as i16 {
-        unlock_record_range(locks, owner, req.range);
+    let old_locks = table.locks.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+    let had_owner = old_locks.iter().any(|lock| lock.owner == owner);
+    let updated = build_record_locks(old_locks, owner, req)?;
+    if updated.len() > MAX_RECORD_LOCKS_PER_INODE {
+        return Err(LinuxError::ENOLCK.into());
+    }
+    let new_count = table
+        .record_count
+        .checked_sub(old_locks.len())
+        .and_then(|count| count.checked_add(updated.len()))
+        .ok_or(LinuxError::ENOLCK)?;
+    if new_count > MAX_RECORD_LOCKS {
+        return Err(LinuxError::ENOLCK.into());
+    }
+
+    let has_owner = updated.iter().any(|lock| lock.owner == owner);
+    let mut new_owner_ids = None;
+    if !had_owner && has_owner {
+        if let Some(ids) = table.owners.get_mut(&owner) {
+            ids.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        } else {
+            table.owners.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            let mut ids = HashSet::new();
+            ids.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            new_owner_ids = Some(ids);
+        }
+    }
+    if !updated.is_empty() && !table.locks.contains_key(&id) {
+        table.locks.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+    }
+
+    if !had_owner && has_owner {
+        if let Some(ids) = new_owner_ids {
+            table.owners.insert(owner, ids);
+        }
+        let Some(ids) = table.owners.get_mut(&owner) else {
+            return Err(AxError::BadState);
+        };
+        ids.insert(id);
+    }
+
+    let mut retired = RetiredRecordStorage::default();
+    if updated.is_empty() {
+        retired.empty_locks = table.locks.remove(&id);
     } else {
-        insert_record_lock(
-            locks,
-            RecordLock {
-                owner,
-                ty: req.ty,
-                range: req.range,
-            },
-        );
+        retired.locks = table.locks.insert(id, updated);
     }
+    table.record_count = new_count;
+    table.wait_requests.remove(&owner);
 
-    if locks.is_empty() {
-        table.locks.remove(&id);
+    if had_owner && !has_owner {
+        let empty = if let Some(ids) = table.owners.get_mut(&owner) {
+            ids.remove(&id);
+            ids.is_empty()
+        } else {
+            false
+        };
+        if empty {
+            retired.owner_ids = table.owners.remove(&owner);
+        }
     }
-    true
+    Ok((true, retired))
 }
 
-fn try_set_record_lock(id: InodeId, owner: RecordLockOwner, req: RecordLockRequest) -> bool {
-    let (ok, waiters) = {
+fn try_set_record_lock(
+    id: InodeId,
+    owner: RecordLockOwner,
+    req: RecordLockRequest,
+) -> AxResult<bool> {
+    let (ok, retired) = {
         let mut table = RECORD_LOCK_TABLE.lock();
-        let ok = try_set_record_lock_inner(&mut table, id, owner, req);
-        let waiters = ok.then(|| take_record_lock_waiters(&mut table));
-        (ok, waiters)
+        try_set_record_lock_inner(&mut table, id, owner, req)?
     };
-    wake_waiters(waiters);
-    ok
+    drop(retired);
+    if ok {
+        RECORD_LOCK_WAITERS.wake();
+    }
+    Ok(ok)
 }
 
 fn record_lock_blocking(
@@ -300,42 +390,58 @@ fn record_lock_blocking(
     owner: RecordLockOwner,
     req: RecordLockRequest,
 ) -> AxResult<()> {
-    match block_on(interruptible(poll_fn(|cx| {
-        let mut table = RECORD_LOCK_TABLE.lock();
-        if try_set_record_lock_inner(&mut table, id, owner, req) {
-            let waiters = take_record_lock_waiters(&mut table);
-            drop(table);
-            wake_waiters(Some(waiters));
-            Poll::Ready(Ok(()))
-        } else {
-            let blockers = record_lock_conflict_owners(&table, id, owner, req);
-            if matches!(owner, RecordLockOwner::Posix(_))
-                && record_lock_would_deadlock(&table, owner, &blockers)
-            {
-                table.wait_requests.remove(&owner);
-                return Poll::Ready(Err(LinuxError::EDEADLK.into()));
-            }
+    let result = match block_on(interruptible(poll_fn(|cx| {
+        match try_set_record_lock(id, owner, req) {
+            Ok(true) => return Poll::Ready(Ok(())),
+            Ok(false) => {}
+            Err(error) => return Poll::Ready(Err(error)),
+        }
 
+        let admission: AxResult<()> = (|| {
+            let mut table = RECORD_LOCK_TABLE.lock();
+            if matches!(owner, RecordLockOwner::Posix(_)) {
+                match record_lock_would_deadlock(&table, owner, id, req) {
+                    Ok(true) => {
+                        table.wait_requests.remove(&owner);
+                        return Err(LinuxError::EDEADLK.into());
+                    }
+                    Ok(false) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if !table.wait_requests.contains_key(&owner) {
+                if table.wait_requests.len() >= MAX_RECORD_WAIT_REQUESTS {
+                    return Err(LinuxError::ENOLCK.into());
+                }
+                table
+                    .wait_requests
+                    .try_reserve(1)
+                    .map_err(|_| AxError::NoMemory)?;
+            }
             table
                 .wait_requests
                 .insert(owner, RecordLockWait { id, req });
-            table.waiters.register(cx.waker());
-            if try_set_record_lock_inner(&mut table, id, owner, req) {
-                let waiters = take_record_lock_waiters(&mut table);
-                drop(table);
-                wake_waiters(Some(waiters));
-                Poll::Ready(Ok(()))
-            } else {
-                Poll::Pending
-            }
+            Ok(())
+        })();
+        if let Err(error) = admission {
+            return Poll::Ready(Err(error));
+        }
+
+        // Waker clone and replacement occur without the record-table lock.
+        RECORD_LOCK_WAITERS.register(cx.waker());
+        match try_set_record_lock(id, owner, req) {
+            Ok(true) => Poll::Ready(Ok(())),
+            Ok(false) => Poll::Pending,
+            Err(error) => Poll::Ready(Err(error)),
         }
     }))) {
         Ok(res) => res,
-        Err(err) => {
-            RECORD_LOCK_TABLE.lock().wait_requests.remove(&owner);
-            Err(err.into())
-        }
+        Err(err) => Err(err.into()),
+    };
+    if result.is_err() {
+        let _ = RECORD_LOCK_TABLE.lock().wait_requests.remove(&owner);
     }
+    result
 }
 
 pub fn set_record_lock(
@@ -349,10 +455,11 @@ pub fn set_record_lock(
     let req = RecordLockRequest::from_flock(lock, file_size, current_offset)?;
     if blocking {
         record_lock_blocking(id, owner, req)
-    } else if try_set_record_lock(id, owner, req) {
-        Ok(())
     } else {
-        Err(AxError::WouldBlock)
+        match try_set_record_lock(id, owner, req)? {
+            true => Ok(()),
+            false => Err(AxError::WouldBlock),
+        }
     }
 }
 
@@ -413,114 +520,276 @@ pub fn mandatory_write_lock_conflicts(
         range,
     };
     let table = RECORD_LOCK_TABLE.lock();
-    !record_lock_conflict_owners(&table, id, requester, req).is_empty()
+    record_lock_has_conflict(&table, id, requester, req)
 }
 
 pub fn release_posix_owner(pid: Pid) {
-    release_record_owner(RecordLockOwner::Posix(pid), None);
+    while !release_record_owner_batch(RecordLockOwner::Posix(pid), 16) {
+        if current_may_uninit().is_some() {
+            axtask::yield_now();
+        }
+    }
 }
 
 pub fn release_posix_owner_on_inode(pid: Pid, id: InodeId) {
-    release_record_owner(RecordLockOwner::Posix(pid), Some(id));
+    release_record_owner_on_inode(RecordLockOwner::Posix(pid), id);
 }
 
-pub fn release_ofd_owner(owner: u64) {
-    release_record_owner(RecordLockOwner::Ofd(owner), None);
+struct RetiredRecordRelease {
+    locks: Option<Vec<RecordLock>>,
+    owner_ids: Option<HashSet<InodeId>>,
+    wait: Option<RecordLockWait>,
 }
 
-fn release_record_owner(owner: RecordLockOwner, only_id: Option<InodeId>) {
-    let mut table = RECORD_LOCK_TABLE.lock();
-    table.wait_requests.remove(&owner);
-    let ids: Vec<InodeId> = if let Some(id) = only_id {
-        Vec::from([id])
-    } else {
-        table.locks.keys().copied().collect()
-    };
-
-    let mut changed = false;
-    for id in ids {
+fn release_record_owner_on_inode(owner: RecordLockOwner, id: InodeId) {
+    let (changed, retired) = {
+        let mut table = RECORD_LOCK_TABLE.lock();
+        let wait = table.wait_requests.remove(&owner);
         let Some(locks) = table.locks.get_mut(&id) else {
-            continue;
+            return;
         };
-        let before = locks.len();
-        locks.retain(|lock| lock.owner != owner);
-        changed |= locks.len() != before;
-        if locks.is_empty() {
-            table.locks.remove(&id);
-        }
+        let (removed, empty_locks) = {
+            let before = locks.len();
+            locks.retain(|lock| lock.owner != owner);
+            (before - locks.len(), locks.is_empty())
+        };
+        table.record_count -= removed;
+        let locks = empty_locks.then(|| table.locks.remove(&id)).flatten();
+
+        let empty_owner = if let Some(ids) = table.owners.get_mut(&owner) {
+            ids.remove(&id);
+            ids.is_empty()
+        } else {
+            false
+        };
+        let owner_ids = empty_owner.then(|| table.owners.remove(&owner)).flatten();
+        (
+            removed != 0,
+            RetiredRecordRelease {
+                locks,
+                owner_ids,
+                wait,
+            },
+        )
+    };
+    let RetiredRecordRelease {
+        locks,
+        owner_ids,
+        wait,
+    } = retired;
+    drop((locks, owner_ids));
+    let _ = wait;
+    if changed {
+        RECORD_LOCK_WAITERS.wake();
     }
-    let waiters = changed.then(|| take_record_lock_waiters(&mut table));
-    drop(table);
-    wake_waiters(waiters);
 }
 
-fn remember_owner_lock(table: &mut FlockTableInner, owner: FlockOwner, id: InodeId) {
-    table.owners.entry(owner).or_default().insert(id);
-}
+fn release_record_owner_batch(owner: RecordLockOwner, budget: usize) -> bool {
+    let mut changed = false;
+    for _ in 0..budget.max(1) {
+        let (done, removed, retired) = {
+            let mut table = RECORD_LOCK_TABLE.lock();
+            let wait = table.wait_requests.remove(&owner);
+            let id = table
+                .owners
+                .get(&owner)
+                .and_then(|ids| ids.iter().next().copied());
+            if let Some(id) = id {
+                let mut removed = 0;
+                let empty_locks = if let Some(locks) = table.locks.get_mut(&id) {
+                    let before = locks.len();
+                    locks.retain(|lock| lock.owner != owner);
+                    removed = before - locks.len();
+                    locks.is_empty()
+                } else {
+                    false
+                };
+                table.record_count -= removed;
+                let locks = empty_locks.then(|| table.locks.remove(&id)).flatten();
 
-fn forget_owner_lock(table: &mut FlockTableInner, owner: FlockOwner, id: InodeId) {
-    if let Some(locks) = table.owners.get_mut(&owner) {
-        locks.remove(&id);
-        if locks.is_empty() {
-            table.owners.remove(&owner);
+                let empty_owner = if let Some(ids) = table.owners.get_mut(&owner) {
+                    ids.remove(&id);
+                    ids.is_empty()
+                } else {
+                    true
+                };
+                let owner_ids = empty_owner.then(|| table.owners.remove(&owner)).flatten();
+                (
+                    empty_owner,
+                    removed != 0,
+                    RetiredRecordRelease {
+                        locks,
+                        owner_ids,
+                        wait,
+                    },
+                )
+            } else {
+                let owner_ids = table.owners.remove(&owner);
+                (
+                    true,
+                    false,
+                    RetiredRecordRelease {
+                        locks: None,
+                        owner_ids,
+                        wait,
+                    },
+                )
+            }
+        };
+        changed |= removed;
+        let RetiredRecordRelease {
+            locks,
+            owner_ids,
+            wait,
+        } = retired;
+        drop((locks, owner_ids));
+        let _ = wait;
+        if done {
+            if changed {
+                RECORD_LOCK_WAITERS.wake();
+            }
+            return true;
         }
     }
+    if changed {
+        RECORD_LOCK_WAITERS.wake();
+    }
+    false
+}
+
+/// Removes a fixed number of inode memberships for a final OFD.  It performs
+/// no allocation and drops detached Vec/HashSet storage after releasing the
+/// table mutex.
+pub(crate) fn release_ofd_owner_batch(owner: u64, budget: usize) -> bool {
+    release_record_owner_batch(RecordLockOwner::Ofd(owner), budget)
+}
+
+fn prepare_owner_membership(
+    table: &mut FlockTableInner,
+    owner: FlockOwner,
+) -> AxResult<Option<HashSet<InodeId>>> {
+    if let Some(ids) = table.owners.get_mut(&owner) {
+        ids.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        Ok(None)
+    } else {
+        table.owners.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        let mut ids = HashSet::new();
+        ids.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        Ok(Some(ids))
+    }
+}
+
+fn commit_owner_membership(
+    table: &mut FlockTableInner,
+    owner: FlockOwner,
+    id: InodeId,
+    new_ids: Option<HashSet<InodeId>>,
+) -> AxResult<()> {
+    if let Some(ids) = new_ids {
+        table.owners.insert(owner, ids);
+    }
+    table
+        .owners
+        .get_mut(&owner)
+        .ok_or(AxError::BadState)?
+        .insert(id);
+    table.memberships += 1;
+    Ok(())
 }
 
 /// Attempt to acquire a shared lock. Returns `true` on success.
-fn try_lock_shared(id: InodeId, owner: FlockOwner) -> bool {
-    let (ok, waiters) = {
+fn try_lock_shared(id: InodeId, owner: FlockOwner) -> AxResult<bool> {
+    let (ok, changed, retired) = {
         let mut table = FLOCK_TABLE.lock();
-        match table.locks.get_mut(&id) {
+        match table.locks.get(&id) {
             None => {
-                let mut holders = BTreeSet::new();
+                if table.memberships >= MAX_FLOCK_MEMBERSHIPS {
+                    return Err(LinuxError::ENOLCK.into());
+                }
+                table.locks.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                let new_ids = prepare_owner_membership(&mut table, owner)?;
+                let mut holders = HashSet::new();
+                holders.try_reserve(1).map_err(|_| AxError::NoMemory)?;
                 holders.insert(owner);
+                commit_owner_membership(&mut table, owner, id, new_ids)?;
                 table.locks.insert(id, FlockState::Shared(holders));
-                remember_owner_lock(&mut table, owner, id);
-                (true, None)
+                (true, true, None)
             }
-            Some(FlockState::Shared(holders)) => {
+            Some(FlockState::Shared(holders)) if holders.contains(&owner) => (true, false, None),
+            Some(FlockState::Shared(_)) => {
+                if table.memberships >= MAX_FLOCK_MEMBERSHIPS {
+                    return Err(LinuxError::ENOLCK.into());
+                }
+                table
+                    .locks
+                    .get_mut(&id)
+                    .and_then(|state| match state {
+                        FlockState::Shared(holders) => Some(holders),
+                        FlockState::Exclusive(_) => None,
+                    })
+                    .ok_or(AxError::BadState)?
+                    .try_reserve(1)
+                    .map_err(|_| AxError::NoMemory)?;
+                let new_ids = prepare_owner_membership(&mut table, owner)?;
+                commit_owner_membership(&mut table, owner, id, new_ids)?;
+                let Some(FlockState::Shared(holders)) = table.locks.get_mut(&id) else {
+                    return Err(AxError::BadState);
+                };
                 holders.insert(owner);
-                remember_owner_lock(&mut table, owner, id);
-                (true, None)
+                (true, true, None)
             }
             Some(FlockState::Exclusive(current_owner)) if *current_owner == owner => {
-                let mut holders = BTreeSet::new();
+                let mut holders = HashSet::new();
+                holders.try_reserve(1).map_err(|_| AxError::NoMemory)?;
                 holders.insert(owner);
-                table.locks.insert(id, FlockState::Shared(holders));
-                remember_owner_lock(&mut table, owner, id);
-                let waiters = take_flock_waiters(&mut table);
-                (true, Some(waiters))
+                let retired = table.locks.insert(id, FlockState::Shared(holders));
+                (true, true, retired)
             }
-            Some(FlockState::Exclusive(_)) => (false, None),
+            Some(FlockState::Exclusive(_)) => (false, false, None),
         }
     };
-    wake_waiters(waiters);
-    ok
+    drop(retired);
+    if changed {
+        FLOCK_WAITERS.wake();
+    }
+    Ok(ok)
 }
 
 /// Attempt to acquire an exclusive lock. Returns `true` on success.
-fn try_lock_exclusive(id: InodeId, owner: FlockOwner) -> bool {
-    let mut table = FLOCK_TABLE.lock();
-    match table.locks.get_mut(&id) {
-        None => {
-            table.locks.insert(id, FlockState::Exclusive(owner));
-            remember_owner_lock(&mut table, owner, id);
-            true
+fn try_lock_exclusive(id: InodeId, owner: FlockOwner) -> AxResult<bool> {
+    let (ok, changed, retired) = {
+        let mut table = FLOCK_TABLE.lock();
+        match table.locks.get(&id) {
+            None => {
+                if table.memberships >= MAX_FLOCK_MEMBERSHIPS {
+                    return Err(LinuxError::ENOLCK.into());
+                }
+                table.locks.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                let new_ids = prepare_owner_membership(&mut table, owner)?;
+                commit_owner_membership(&mut table, owner, id, new_ids)?;
+                table.locks.insert(id, FlockState::Exclusive(owner));
+                (true, true, None)
+            }
+            Some(FlockState::Exclusive(current_owner)) if *current_owner == owner => {
+                (true, false, None)
+            }
+            Some(FlockState::Shared(holders)) if holders.len() == 1 && holders.contains(&owner) => {
+                let retired = table.locks.insert(id, FlockState::Exclusive(owner));
+                (true, true, retired)
+            }
+            _ => (false, false, None),
         }
-        Some(FlockState::Exclusive(current_owner)) if *current_owner == owner => true,
-        Some(FlockState::Shared(holders)) if holders.len() == 1 && holders.contains(&owner) => {
-            table.locks.insert(id, FlockState::Exclusive(owner));
-            remember_owner_lock(&mut table, owner, id);
-            true
-        }
-        _ => false,
+    };
+    drop(retired);
+    if changed {
+        FLOCK_WAITERS.wake();
     }
+    Ok(ok)
 }
 
 /// Release the lock held by `owner` on the given inode.
 pub fn flock_unlock(id: InodeId, owner: FlockOwner) {
-    let waiters = {
+    let (changed, retired_state, retired_ids) = {
         let mut table = FLOCK_TABLE.lock();
         let (changed, should_remove) = match table.locks.get_mut(&id) {
             Some(FlockState::Shared(holders)) => {
@@ -530,55 +799,93 @@ pub fn flock_unlock(id: InodeId, owner: FlockOwner) {
             Some(FlockState::Exclusive(current_owner)) if *current_owner == owner => (true, true),
             _ => (false, false),
         };
-        if changed {
-            forget_owner_lock(&mut table, owner, id);
-        }
-        if should_remove {
-            table.locks.remove(&id);
-        }
-        changed.then(|| take_flock_waiters(&mut table))
+        let empty_owner = if changed {
+            table.memberships -= 1;
+            if let Some(ids) = table.owners.get_mut(&owner) {
+                ids.remove(&id);
+                ids.is_empty()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let retired_ids = empty_owner.then(|| table.owners.remove(&owner)).flatten();
+        let retired_state = should_remove.then(|| table.locks.remove(&id)).flatten();
+        (changed, retired_state, retired_ids)
     };
-    wake_waiters(waiters);
+    drop((retired_state, retired_ids));
+    if changed {
+        FLOCK_WAITERS.wake();
+    }
 }
 
-/// Release every flock lock owned by the given open file description.
-pub fn release_owner(owner: FlockOwner) {
-    let waiters = {
-        let mut table = FLOCK_TABLE.lock();
-        let Some(owned_locks) = table.owners.remove(&owner) else {
-            return;
-        };
-
-        for id in owned_locks {
-            let should_remove = match table.locks.get_mut(&id) {
-                Some(FlockState::Shared(holders)) => {
-                    holders.remove(&owner);
-                    holders.is_empty()
+/// Releases at most `budget` flock memberships for one final OFD.  Detached
+/// HashSet/FlockState allocations are destroyed only after the table lock is
+/// released.
+pub(crate) fn release_owner_batch(owner: FlockOwner, budget: usize) -> bool {
+    let mut changed = false;
+    for _ in 0..budget.max(1) {
+        let (done, removed, retired_state, retired_ids) = {
+            let mut table = FLOCK_TABLE.lock();
+            let id = table
+                .owners
+                .get(&owner)
+                .and_then(|ids| ids.iter().next().copied());
+            if let Some(id) = id {
+                let should_remove = match table.locks.get_mut(&id) {
+                    Some(FlockState::Shared(holders)) => {
+                        holders.remove(&owner);
+                        holders.is_empty()
+                    }
+                    Some(FlockState::Exclusive(current_owner)) if *current_owner == owner => true,
+                    _ => false,
+                };
+                let removed = if let Some(ids) = table.owners.get_mut(&owner) {
+                    ids.remove(&id)
+                } else {
+                    false
+                };
+                if removed {
+                    table.memberships -= 1;
                 }
-                Some(FlockState::Exclusive(current_owner)) if *current_owner == owner => true,
-                _ => false,
-            };
-            if should_remove {
-                table.locks.remove(&id);
+                let empty_owner = table.owners.get(&owner).is_none_or(HashSet::is_empty);
+                let retired_ids = empty_owner.then(|| table.owners.remove(&owner)).flatten();
+                let retired_state = should_remove.then(|| table.locks.remove(&id)).flatten();
+                (empty_owner, removed, retired_state, retired_ids)
+            } else {
+                let retired_ids = table.owners.remove(&owner);
+                (true, false, None, retired_ids)
             }
+        };
+        changed |= removed;
+        drop((retired_state, retired_ids));
+        if done {
+            if changed {
+                FLOCK_WAITERS.wake();
+            }
+            return true;
         }
-        take_flock_waiters(&mut table)
-    };
-    wake_waiters(Some(waiters));
+    }
+    if changed {
+        FLOCK_WAITERS.wake();
+    }
+    false
 }
 
 /// Acquire a shared lock, blocking if necessary.
 fn lock_shared_blocking(id: InodeId, owner: FlockOwner) -> AxResult<()> {
     match block_on(interruptible(poll_fn(|cx| {
-        if try_lock_shared(id, owner) {
-            Poll::Ready(Ok(()))
-        } else {
-            FLOCK_TABLE.lock().waiters.register(cx.waker());
-            if try_lock_shared(id, owner) {
-                Poll::Ready(Ok(()))
-            } else {
-                Poll::Pending
-            }
+        match try_lock_shared(id, owner) {
+            Ok(true) => return Poll::Ready(Ok(())),
+            Ok(false) => {}
+            Err(error) => return Poll::Ready(Err(error)),
+        }
+        FLOCK_WAITERS.register(cx.waker());
+        match try_lock_shared(id, owner) {
+            Ok(true) => Poll::Ready(Ok(())),
+            Ok(false) => Poll::Pending,
+            Err(error) => Poll::Ready(Err(error)),
         }
     }))) {
         Ok(res) => res,
@@ -589,15 +896,16 @@ fn lock_shared_blocking(id: InodeId, owner: FlockOwner) -> AxResult<()> {
 /// Acquire an exclusive lock, blocking if necessary.
 fn lock_exclusive_blocking(id: InodeId, owner: FlockOwner) -> AxResult<()> {
     match block_on(interruptible(poll_fn(|cx| {
-        if try_lock_exclusive(id, owner) {
-            Poll::Ready(Ok(()))
-        } else {
-            FLOCK_TABLE.lock().waiters.register(cx.waker());
-            if try_lock_exclusive(id, owner) {
-                Poll::Ready(Ok(()))
-            } else {
-                Poll::Pending
-            }
+        match try_lock_exclusive(id, owner) {
+            Ok(true) => return Poll::Ready(Ok(())),
+            Ok(false) => {}
+            Err(error) => return Poll::Ready(Err(error)),
+        }
+        FLOCK_WAITERS.register(cx.waker());
+        match try_lock_exclusive(id, owner) {
+            Ok(true) => Poll::Ready(Ok(())),
+            Ok(false) => Poll::Pending,
+            Err(error) => Poll::Ready(Err(error)),
         }
     }))) {
         Ok(res) => res,
@@ -624,7 +932,7 @@ pub fn do_flock(id: InodeId, owner: FlockOwner, operation: i32) -> AxResult<()> 
     match op {
         LOCK_SH => {
             if non_blocking {
-                if try_lock_shared(id, owner) {
+                if try_lock_shared(id, owner)? {
                     Ok(())
                 } else {
                     Err(AxError::WouldBlock)
@@ -635,7 +943,7 @@ pub fn do_flock(id: InodeId, owner: FlockOwner, operation: i32) -> AxResult<()> 
         }
         LOCK_EX => {
             if non_blocking {
-                if try_lock_exclusive(id, owner) {
+                if try_lock_exclusive(id, owner)? {
                     Ok(())
                 } else {
                     Err(AxError::WouldBlock)
@@ -649,5 +957,93 @@ pub fn do_flock(id: InodeId, owner: FlockOwner, operation: i32) -> AxResult<()> 
             Ok(())
         }
         _ => Err(AxError::InvalidInput),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn whole_file_write_lock() -> flock64 {
+        flock64 {
+            l_type: F_WRLCK as _,
+            l_whence: SEEK_SET as _,
+            l_start: 0,
+            l_len: 0,
+            l_pid: 0,
+        }
+    }
+
+    #[test]
+    fn ofd_record_release_is_batched_and_removes_only_its_owner() {
+        const OWNER: u64 = u64::MAX - 100;
+        const OBSERVER: u64 = u64::MAX - 101;
+        const DEVICE: u64 = u64::MAX - 102;
+        const LOCKS: usize = 19;
+
+        let request = whole_file_write_lock();
+        for inode in 0..LOCKS as u64 {
+            set_record_lock(
+                (DEVICE, inode),
+                RecordLockOwner::Ofd(OWNER),
+                0,
+                0,
+                &request,
+                false,
+            )
+            .unwrap();
+        }
+
+        assert!(!release_ofd_owner_batch(OWNER, 4));
+        assert_eq!(
+            RECORD_LOCK_TABLE
+                .lock()
+                .owners
+                .get(&RecordLockOwner::Ofd(OWNER))
+                .map(HashSet::len),
+            Some(LOCKS - 4)
+        );
+        while !release_ofd_owner_batch(OWNER, 4) {}
+
+        assert!(
+            !RECORD_LOCK_TABLE
+                .lock()
+                .owners
+                .contains_key(&RecordLockOwner::Ofd(OWNER))
+        );
+        for inode in 0..LOCKS as u64 {
+            assert!(!mandatory_write_lock_conflicts(
+                (DEVICE, inode),
+                RecordLockOwner::Ofd(OBSERVER),
+                0,
+                0,
+            ));
+        }
+    }
+
+    #[test]
+    fn flock_release_is_batched_and_allows_immediate_reacquire() {
+        const OWNER: u64 = u64::MAX - 200;
+        const OBSERVER: u64 = u64::MAX - 201;
+        const DEVICE: u64 = u64::MAX - 202;
+        const LOCKS: usize = 21;
+        const LOCK_EX: i32 = 2;
+        const LOCK_NB: i32 = 4;
+        const LOCK_UN: i32 = 8;
+
+        for inode in 0..LOCKS as u64 {
+            do_flock((DEVICE, inode), OWNER, LOCK_EX | LOCK_NB).unwrap();
+        }
+        assert!(!release_owner_batch(OWNER, 5));
+        assert_eq!(
+            FLOCK_TABLE.lock().owners.get(&OWNER).map(HashSet::len),
+            Some(LOCKS - 5)
+        );
+        while !release_owner_batch(OWNER, 5) {}
+
+        for inode in 0..LOCKS as u64 {
+            do_flock((DEVICE, inode), OBSERVER, LOCK_EX | LOCK_NB).unwrap();
+            do_flock((DEVICE, inode), OBSERVER, LOCK_UN).unwrap();
+        }
     }
 }

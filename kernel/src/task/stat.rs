@@ -98,7 +98,7 @@ pub fn render_task_stat(task: &AxTaskRef) -> AxResult<String> {
     let ppid = proc.parent().map_or(0, |parent| parent.pid());
     let pgrp = proc.group().pgid();
     let session = proc.group().session().sid();
-    let num_threads = proc.threads().len() as u32;
+    let num_threads = proc.thread_count() as u32;
     let self_usage = process_usage(task, num_threads);
     let child_usage = proc_data.children_usage();
     let (priority, nice, rt_priority, policy) = task_sched_stat(task);

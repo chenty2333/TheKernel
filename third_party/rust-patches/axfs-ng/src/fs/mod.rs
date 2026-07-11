@@ -60,5 +60,42 @@ pub fn new_named(
         return fat::FatFilesystem::new_with_options(dev, fat_options.unwrap_or_default());
     }
 
-    Err(axfs_ng_vfs::VfsError::InvalidInput)
+    Err(axfs_ng_vfs::VfsError::NoSuchDevice)
+}
+
+/// Installs the task-context worker wakeup used by deferred filesystem
+/// teardown. The non-ext4 build has no pending backend finalizers.
+pub fn set_deferred_filesystem_finalizer_waker(waker: fn()) -> bool {
+    #[cfg(feature = "ext4")]
+    {
+        return ext4::set_deferred_finalizer_waker(waker);
+    }
+    #[cfg(not(feature = "ext4"))]
+    {
+        let _ = waker;
+        true
+    }
+}
+
+pub fn has_deferred_filesystem_finalizer_work() -> bool {
+    #[cfg(feature = "ext4")]
+    {
+        return ext4::has_deferred_finalizer_work();
+    }
+    #[cfg(not(feature = "ext4"))]
+    {
+        false
+    }
+}
+
+pub fn drain_deferred_filesystem_finalizers(between: impl FnMut()) -> usize {
+    #[cfg(feature = "ext4")]
+    {
+        return ext4::drain_deferred_finalizers(between);
+    }
+    #[cfg(not(feature = "ext4"))]
+    {
+        let _ = between;
+        0
+    }
 }

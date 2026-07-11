@@ -1,5 +1,6 @@
 use alloc::{
     borrow::Cow,
+    boxed::Box,
     collections::VecDeque,
     format,
     string::String,
@@ -10,7 +11,8 @@ use core::{
     ffi::c_int,
     future::poll_fn,
     mem::size_of,
-    sync::atomic::{AtomicBool, Ordering},
+    ptr,
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
     task::{Context, Poll},
 };
 
@@ -18,16 +20,18 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FileBackend, FileFlags};
 use axfs_ng_vfs::{Location, NodeType};
 use axpoll::{IoEvents, PollSet, Pollable};
+use axsync::Mutex as BlockingMutex;
 use axtask::{
-    current,
+    current_may_uninit,
     future::{block_on, interruptible, poll_io},
 };
 use spin::Mutex;
 
 use crate::{
     file::{
-        Directory, File, FileLike, IoDst, IoSrc, Kstat, PidFd, add_file_like,
+        Directory, File, FileDescription, FileLike, IoDst, IoSrc, Kstat, PidFd, ReservedFd,
         inotify::{WatchKey, location_for_fd},
+        reserve_fd,
     },
     task::{AsThread, get_process_data},
 };
@@ -142,6 +146,36 @@ const FANOTIFY_RESPONSE_FLAGS: u32 = FAN_AUDIT | FAN_INFO;
 const FANOTIFY_RESPONSE_VALID_MASK: u32 = FANOTIFY_RESPONSE_ACCESS | FANOTIFY_RESPONSE_FLAGS;
 const FANOTIFY_DIR_ENTRY_EVENTS: u64 = FAN_CREATE | FAN_DELETE | FAN_MOVE | FAN_RENAME;
 
+/// Identity of the task that caused an event. Deferred delivery must carry
+/// this copy-only snapshot instead of attributing the event to whichever
+/// kernel/user task happens to drain a work queue later.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FanotifyEventActor {
+    tid: c_int,
+    tgid: c_int,
+}
+
+impl FanotifyEventActor {
+    pub(crate) fn current() -> Self {
+        current_may_uninit()
+            .and_then(|task| {
+                task.try_as_thread().map(|thread| Self {
+                    tid: thread.tid() as c_int,
+                    tgid: thread.proc_data.proc.pid() as c_int,
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    fn pid_for(self, file: &FanotifyFile) -> c_int {
+        if file.flags & FAN_REPORT_TID != 0 {
+            self.tid
+        } else {
+            self.tgid
+        }
+    }
+}
+
 #[repr(C)]
 struct FanotifyEventMetadata {
     event_len: u32,
@@ -167,7 +201,7 @@ struct FanotifyResponse {
     response: u32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct FanotifyMark {
     key: WatchKey,
     mask: u64,
@@ -207,15 +241,176 @@ struct FanotifyState {
     released: bool,
 }
 
+const FANOTIFY_CLEANUP_BUDGET: usize = 64;
+
+struct FanotifyCleanupWork {
+    next: AtomicPtr<Self>,
+    queue: VecDeque<FanotifyEvent>,
+    marks: Vec<FanotifyMark>,
+    pending_permissions: Vec<FanotifyPermissionEvent>,
+}
+
+static FANOTIFY_CLEANUP_INCOMING: AtomicPtr<FanotifyCleanupWork> = AtomicPtr::new(ptr::null_mut());
+static FANOTIFY_CLEANUP_PENDING: AtomicPtr<FanotifyCleanupWork> = AtomicPtr::new(ptr::null_mut());
+static FANOTIFY_CLEANUP_DRAINING: AtomicBool = AtomicBool::new(false);
+static FANOTIFY_CLEANUP_WORKS: AtomicUsize = AtomicUsize::new(0);
+
+struct FanotifyCleanupDrainGuard;
+
+impl FanotifyCleanupDrainGuard {
+    fn try_enter() -> Option<Self> {
+        FANOTIFY_CLEANUP_DRAINING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(Self)
+    }
+}
+
+impl Drop for FanotifyCleanupDrainGuard {
+    fn drop(&mut self) {
+        FANOTIFY_CLEANUP_DRAINING.store(false, Ordering::Release);
+    }
+}
+
+struct CleanupCreditGuard(bool);
+
+impl CleanupCreditGuard {
+    fn reserve() -> AxResult<Self> {
+        FANOTIFY_CLEANUP_WORKS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                (live < MAX_USER_GROUPS).then_some(live + 1)
+            })
+            .map_err(|_| AxError::TooManyOpenFiles)?;
+        Ok(Self(true))
+    }
+
+    fn transfer(mut self) {
+        self.0 = false;
+    }
+}
+
+impl Drop for CleanupCreditGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            FANOTIFY_CLEANUP_WORKS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 pub struct FanotifyFile {
     flags: u32,
     event_f_flags: u32,
     non_blocking: AtomicBool,
     state: Mutex<FanotifyState>,
+    read_gate: BlockingMutex<()>,
+    cleanup: Mutex<Option<Box<FanotifyCleanupWork>>>,
     poll_rx: PollSet,
 }
 
-static FANOTIFY_FILES: Mutex<Vec<Weak<FanotifyFile>>> = Mutex::new(Vec::new());
+static FANOTIFY_FILES: Mutex<[Option<Weak<FanotifyFile>>; MAX_USER_GROUPS]> =
+    Mutex::new([const { None }; MAX_USER_GROUPS]);
+static FANOTIFY_MARKS: AtomicUsize = AtomicUsize::new(0);
+
+fn publish_cleanup_to(incoming: &AtomicPtr<FanotifyCleanupWork>, work: Box<FanotifyCleanupWork>) {
+    let raw = Box::into_raw(work);
+    let mut head = incoming.load(Ordering::Acquire);
+    loop {
+        // SAFETY: this producer exclusively owns `raw` until publication.
+        unsafe { (*raw).next.store(head, Ordering::Relaxed) };
+        match incoming.compare_exchange_weak(head, raw, Ordering::Release, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(observed) => head = observed,
+        }
+    }
+}
+
+fn publish_cleanup(work: Box<FanotifyCleanupWork>) {
+    publish_cleanup_to(&FANOTIFY_CLEANUP_INCOMING, work);
+}
+
+/// Reverses a detached Treiber batch into producer publication order.
+///
+/// # Safety
+///
+/// `current` must be a valid, acyclic list exclusively owned by the caller.
+unsafe fn reverse_cleanup_batch(mut current: *mut FanotifyCleanupWork) -> *mut FanotifyCleanupWork {
+    let mut reversed = ptr::null_mut();
+    while !current.is_null() {
+        let next = unsafe { (*current).next.load(Ordering::Relaxed) };
+        unsafe { (*current).next.store(reversed, Ordering::Relaxed) };
+        reversed = current;
+        current = next;
+    }
+    reversed
+}
+
+fn refill_pending_cleanup_from(
+    incoming: &AtomicPtr<FanotifyCleanupWork>,
+    pending: &AtomicPtr<FanotifyCleanupWork>,
+) {
+    if !pending.load(Ordering::Relaxed).is_null() {
+        return;
+    }
+    let incoming = incoming.swap(ptr::null_mut(), Ordering::AcqRel);
+    // SAFETY: the atomic swap detached a finite producer batch. The drainer
+    // guard guarantees that no second consumer can traverse it.
+    let detached = unsafe { reverse_cleanup_batch(incoming) };
+    pending.store(detached, Ordering::Relaxed);
+}
+
+fn pop_cleanup_from(
+    incoming: &AtomicPtr<FanotifyCleanupWork>,
+    pending: &AtomicPtr<FanotifyCleanupWork>,
+) -> Option<Box<FanotifyCleanupWork>> {
+    if pending.load(Ordering::Relaxed).is_null() {
+        refill_pending_cleanup_from(incoming, pending);
+    }
+    let head = pending.load(Ordering::Relaxed);
+    if head.is_null() {
+        return None;
+    }
+    // SAFETY: the drainer guard admits one consumer, and producers only touch
+    // the separate INCOMING stack.
+    let next = unsafe { (*head).next.load(Ordering::Relaxed) };
+    pending.store(next, Ordering::Relaxed);
+    unsafe { (*head).next.store(ptr::null_mut(), Ordering::Relaxed) };
+    Some(unsafe { Box::from_raw(head) })
+}
+
+fn pop_cleanup() -> Option<Box<FanotifyCleanupWork>> {
+    pop_cleanup_from(&FANOTIFY_CLEANUP_INCOMING, &FANOTIFY_CLEANUP_PENDING)
+}
+
+pub(crate) fn has_deferred_cleanup_work() -> bool {
+    !FANOTIFY_CLEANUP_INCOMING.load(Ordering::Acquire).is_null()
+        || !FANOTIFY_CLEANUP_PENDING.load(Ordering::Acquire).is_null()
+}
+
+pub(crate) fn drain_deferred_cleanup_work() {
+    let Some(_guard) = FanotifyCleanupDrainGuard::try_enter() else {
+        return;
+    };
+    let Some(mut work) = pop_cleanup() else {
+        return;
+    };
+    for _ in 0..FANOTIFY_CLEANUP_BUDGET {
+        if let Some(event) = work.queue.pop_front() {
+            drop(event);
+        } else if let Some(mark) = work.marks.pop() {
+            drop(mark);
+        } else if let Some(permission) = work.pending_permissions.pop() {
+            drop(permission);
+        } else {
+            break;
+        }
+    }
+    if work.queue.is_empty() && work.marks.is_empty() && work.pending_permissions.is_empty() {
+        drop(work);
+        FANOTIFY_CLEANUP_WORKS.fetch_sub(1, Ordering::AcqRel);
+    } else {
+        publish_cleanup(work);
+    }
+}
 
 pub fn validate_init_flags(flags: u32, event_f_flags: u32) -> AxResult<()> {
     if flags & !FANOTIFY_INIT_FLAGS != 0 {
@@ -228,6 +423,12 @@ pub fn validate_init_flags(flags: u32, event_f_flags: u32) -> AxResult<()> {
     }
     if flags & FAN_REPORT_PIDFD != 0 && flags & FAN_REPORT_TID != 0 {
         return Err(AxError::InvalidInput);
+    }
+    // TheKernel has no memcg/per-user accounting capable of making Linux's
+    // privileged "unlimited" modes honest. Reject them instead of exposing an
+    // unbounded kernel allocation surface.
+    if flags & (FAN_UNLIMITED_QUEUE | FAN_UNLIMITED_MARKS) != 0 {
+        return Err(AxError::OperationNotSupported);
     }
     if flags & FANOTIFY_FID_BITS != 0 && flags & (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT) != 0 {
         return Err(AxError::InvalidInput);
@@ -246,23 +447,54 @@ pub fn validate_init_flags(flags: u32, event_f_flags: u32) -> AxResult<()> {
 }
 
 impl FanotifyFile {
-    pub fn new(flags: u32, event_f_flags: u32) -> Arc<Self> {
-        let file = Arc::new(Self {
+    pub fn new(flags: u32, event_f_flags: u32) -> AxResult<Arc<Self>> {
+        // Registry slots become reusable as soon as the group Arc dies, while
+        // its deferred cleanup can outlive it. A separate transferred credit
+        // therefore bounds live groups plus cleanup backlog across churn.
+        let cleanup_credit = CleanupCreditGuard::reserve()?;
+        let mut queue = VecDeque::new();
+        // Preserve one allocation-free FAN_Q_OVERFLOW slot. Every successful
+        // event admission below keeps this spare capacity invariant.
+        queue.try_reserve_exact(1).map_err(|_| AxError::NoMemory)?;
+        let cleanup = Box::try_new(FanotifyCleanupWork {
+            next: AtomicPtr::new(ptr::null_mut()),
+            queue: VecDeque::new(),
+            marks: Vec::new(),
+            pending_permissions: Vec::new(),
+        })
+        .map_err(|_| AxError::NoMemory)?;
+        let file = Arc::try_new(Self {
             flags,
             event_f_flags,
             non_blocking: AtomicBool::new(flags & FAN_NONBLOCK != 0),
             state: Mutex::new(FanotifyState {
                 marks: Vec::new(),
-                queue: VecDeque::new(),
+                queue,
                 pending_permissions: Vec::new(),
                 overflowed: false,
                 next_permission_id: 1,
                 released: false,
             }),
+            read_gate: BlockingMutex::new(()),
+            cleanup: Mutex::new(Some(cleanup)),
             poll_rx: PollSet::new(),
+        })
+        .map_err(|_| AxError::NoMemory)?;
+        cleanup_credit.transfer();
+        let weak = Arc::downgrade(&file);
+        let mut files = FANOTIFY_FILES.lock();
+        let reusable = files.iter().position(|slot| {
+            slot.as_ref()
+                .is_none_or(|registered| registered.strong_count() == 0)
         });
-        FANOTIFY_FILES.lock().push(Arc::downgrade(&file));
-        file
+        let retired = if let Some(slot) = reusable {
+            files[slot].replace(weak)
+        } else {
+            return Err(AxError::TooManyOpenFiles);
+        };
+        drop(files);
+        drop(retired);
+        Ok(file)
     }
 
     pub fn mark(&self, flags: u32, mask: u64, loc: Option<&Location>) -> AxResult<()> {
@@ -294,26 +526,36 @@ impl FanotifyFile {
         !state.released && !state.queue.is_empty()
     }
 
-    fn enqueue_locked(
-        state: &mut FanotifyState,
-        unlimited_queue: bool,
-        event: FanotifyEvent,
-    ) -> bool {
-        if state.released {
+    fn enqueue_overflow_locked(state: &mut FanotifyState) -> bool {
+        if state.overflowed || state.released {
             return false;
         }
-        if !unlimited_queue && state.queue.len() >= MAX_QUEUED_EVENTS {
-            if !state.overflowed {
-                state.overflowed = true;
-                state.queue.push_back(FanotifyEvent {
-                    mask: FAN_Q_OVERFLOW,
-                    fd_loc: None,
-                    permission_id: None,
-                    pid: 0,
-                });
-                return true;
-            }
+        if state.queue.len() == state.queue.capacity() {
+            let Some(idx) = state
+                .queue
+                .iter()
+                .rposition(|event| event.permission_id.is_none())
+            else {
+                return false;
+            };
+            state.queue.remove(idx);
+        }
+        state.overflowed = true;
+        state.queue.push_back(FanotifyEvent {
+            mask: FAN_Q_OVERFLOW,
+            fd_loc: None,
+            permission_id: None,
+            pid: 0,
+        });
+        true
+    }
+
+    fn enqueue_locked(state: &mut FanotifyState, event: FanotifyEvent) -> bool {
+        if state.released || state.overflowed {
             return false;
+        }
+        if state.queue.len() >= MAX_QUEUED_EVENTS || state.queue.try_reserve(2).is_err() {
+            return Self::enqueue_overflow_locked(state);
         }
         state.queue.push_back(event);
         true
@@ -328,18 +570,35 @@ impl FanotifyFile {
     }
 
     pub(in crate::file) fn release(&self) {
-        let mut state = self.state.lock();
-        if state.released {
-            return;
-        }
-        state.released = true;
-        state.queue.clear();
-        for event in &mut state.pending_permissions {
-            if event.response.is_none() {
-                event.response = Some(FAN_ALLOW);
+        let (queue, marks, pending_permissions) = {
+            let mut state = self.state.lock();
+            if state.released {
+                return;
             }
+            state.released = true;
+            let queue = core::mem::take(&mut state.queue);
+            let marks = core::mem::take(&mut state.marks);
+            // Waiters treat a missing id in a released group as FAN_ALLOW, so
+            // detach the whole vector in O(1) rather than walking 16K entries
+            // from FileDescription::drop.
+            let pending_permissions = core::mem::take(&mut state.pending_permissions);
+            (queue, marks, pending_permissions)
+        };
+        let released_marks = marks.len();
+        FANOTIFY_MARKS.fetch_sub(released_marks, Ordering::AcqRel);
+        if let Some(mut work) = self.cleanup.lock().take() {
+            work.queue = queue;
+            work.marks = marks;
+            work.pending_permissions = pending_permissions;
+            publish_cleanup(work);
+        } else {
+            // This can only happen after a repeated internal release. Keep the
+            // fallback outside the state lock so even a violated invariant
+            // cannot cascade VFS destruction under a spin mutex.
+            drop(queue);
+            drop(marks);
+            drop(pending_permissions);
         }
-        drop(state);
         self.poll_rx.wake();
     }
 
@@ -416,6 +675,175 @@ impl FanotifyFile {
         self.poll_rx.wake();
         Ok(())
     }
+
+    /// Completes an event that has already been removed from the read queue.
+    /// Linux consumes fanotify events even when the subsequent userspace copy
+    /// faults. Permission events must additionally unblock the access which
+    /// generated them with a denial instead of leaving an unanswerable request
+    /// in `pending_permissions`.
+    fn finish_consumed_event(
+        &self,
+        event: &FanotifyEvent,
+        published_fd: Option<c_int>,
+        deny_permission: bool,
+    ) {
+        let mut wake = false;
+        let mut state = self.state.lock();
+        if event.mask == FAN_Q_OVERFLOW {
+            state.overflowed = false;
+        }
+        if let Some(id) = event.permission_id
+            && let Some(pending) = state.pending_permissions.iter_mut().find(|it| it.id == id)
+        {
+            if deny_permission {
+                if pending.response.is_none() {
+                    pending.response = Some(FAN_DENY);
+                    wake = true;
+                }
+            } else if let Some(fd) = published_fd {
+                pending.fd = Some(fd);
+                if fd == FAN_NOFD && pending.response.is_none() {
+                    pending.response = Some(FAN_ALLOW);
+                    wake = true;
+                }
+            }
+        }
+        drop(state);
+        if wake {
+            self.poll_rx.wake();
+        }
+    }
+
+    fn read_result_after_error(written: usize, error: AxError) -> AxResult<usize> {
+        // fanotify_read(2) returns EFAULT even after earlier records were
+        // copied. Other late failures follow the usual short-read rule.
+        if written == 0 || error == AxError::BadAddress {
+            Err(error)
+        } else {
+            Ok(written)
+        }
+    }
+
+    /// Drains currently queued records. The outer `read` method supplies the
+    /// blocking/read-serialization policy; keeping this core synchronous makes
+    /// its dequeue/copy/fd-publication transaction directly testable.
+    fn read_ready(&self, dst: &mut IoDst) -> AxResult<usize> {
+        let metadata_len = size_of::<FanotifyEventMetadata>();
+        let pidfd_info_len = size_of::<FanotifyEventInfoPidfd>();
+        if dst.remaining_mut() < metadata_len {
+            return Err(AxError::InvalidInput);
+        }
+        let mut written = 0usize;
+
+        loop {
+            let event_len = metadata_len
+                + if self.report_pidfd() {
+                    pidfd_info_len
+                } else {
+                    0
+                };
+            if dst.remaining_mut() < event_len {
+                break;
+            }
+            let Some(event) = self.state.lock().queue.pop_front() else {
+                break;
+            };
+            let event_fd = match prepared_opened_event_fd(self, event.fd_loc.as_ref()) {
+                Ok(fd) => fd,
+                Err(error) => {
+                    self.finish_consumed_event(&event, None, true);
+                    return Self::read_result_after_error(written, error);
+                }
+            };
+            let pidfd = if self.report_pidfd() {
+                Some(prepared_event_pidfd(event.pid))
+            } else {
+                None
+            };
+            let metadata = FanotifyEventMetadata {
+                event_len: event_len as u32,
+                vers: FANOTIFY_METADATA_VERSION,
+                reserved: 0,
+                metadata_len: metadata_len as u16,
+                mask: event.mask,
+                fd: event_fd.value(),
+                pid: event.pid,
+            };
+            let mut encoded =
+                [0_u8; size_of::<FanotifyEventMetadata>() + size_of::<FanotifyEventInfoPidfd>()];
+            let metadata_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&metadata as *const FanotifyEventMetadata).cast::<u8>(),
+                    metadata_len,
+                )
+            };
+            encoded[..metadata_len].copy_from_slice(metadata_bytes);
+            if let Some(pidfd) = pidfd.as_ref() {
+                let info = FanotifyEventInfoPidfd {
+                    info_type: FAN_EVENT_INFO_TYPE_PIDFD,
+                    pad: 0,
+                    len: pidfd_info_len as u16,
+                    pidfd: pidfd.value(),
+                };
+                let info_bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        (&info as *const FanotifyEventInfoPidfd).cast::<u8>(),
+                        pidfd_info_len,
+                    )
+                };
+                encoded[metadata_len..event_len].copy_from_slice(info_bytes);
+            }
+            let copy_error = match dst.write(&encoded[..event_len]) {
+                Ok(copied) if copied == event_len => None,
+                Ok(_) => Some(AxError::BadAddress),
+                Err(error) => Some(error),
+            };
+            if let Some(error) = copy_error {
+                // Dropping these unpublished reservations exactly rolls back
+                // the fd numbers before the denied permission waiter runs.
+                drop(pidfd);
+                drop(event_fd);
+                self.finish_consumed_event(&event, None, true);
+                return Self::read_result_after_error(written, error);
+            }
+
+            // fd publication is deliberately after the complete userspace
+            // record copy. ReservedFd makes this allocation-free and prevents
+            // another thread from reusing the copied number in between.
+            let published_fd = match event_fd.publish() {
+                Ok(fd) => fd,
+                Err(error) => {
+                    error!("fanotify event fd reservation commit failed: {error:?}");
+                    FAN_NOFD
+                }
+            };
+            if let Some(pidfd) = pidfd
+                && let Err(error) = pidfd.publish()
+            {
+                error!("fanotify pidfd reservation commit failed: {error:?}");
+            }
+
+            self.finish_consumed_event(&event, Some(published_fd), false);
+            written += event_len;
+        }
+
+        if written == 0 {
+            Err(AxError::WouldBlock)
+        } else {
+            Ok(written)
+        }
+    }
+}
+
+impl Drop for FanotifyFile {
+    fn drop(&mut self) {
+        // A group which never reached FileDescription::drop still owns its
+        // preallocated cleanup node directly. Published work owns the credit
+        // until the policy worker drains it instead.
+        if self.cleanup.get_mut().is_some() {
+            FANOTIFY_CLEANUP_WORKS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl FileLike for FanotifyFile {
@@ -424,83 +852,9 @@ impl FileLike for FanotifyFile {
     }
 
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
+        let _reader = self.read_gate.lock();
         block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
-            let mut state = self.state.lock();
-            let metadata_len = size_of::<FanotifyEventMetadata>();
-            let pidfd_info_len = size_of::<FanotifyEventInfoPidfd>();
-            if dst.remaining_mut() < metadata_len {
-                return Err(AxError::InvalidInput);
-            }
-            let mut written = 0usize;
-
-            while let Some(event) = state.queue.front() {
-                let event_len = metadata_len
-                    + if self.report_pidfd() {
-                        pidfd_info_len
-                    } else {
-                        0
-                    };
-                if dst.remaining_mut() < event_len {
-                    break;
-                }
-                let fd = event
-                    .fd_loc
-                    .as_ref()
-                    .map_or(FAN_NOFD, |loc| opened_event_fd(self, loc));
-                let pidfd = if self.report_pidfd() {
-                    Some(fanotify_event_pidfd(event.pid))
-                } else {
-                    None
-                };
-                let metadata = FanotifyEventMetadata {
-                    event_len: event_len as u32,
-                    vers: FANOTIFY_METADATA_VERSION,
-                    reserved: 0,
-                    metadata_len: metadata_len as u16,
-                    mask: event.mask,
-                    fd,
-                    pid: event.pid,
-                };
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        (&metadata as *const FanotifyEventMetadata).cast::<u8>(),
-                        metadata_len,
-                    )
-                };
-                dst.write(bytes)?;
-                if let Some(pidfd) = pidfd {
-                    let info = FanotifyEventInfoPidfd {
-                        info_type: FAN_EVENT_INFO_TYPE_PIDFD,
-                        pad: 0,
-                        len: pidfd_info_len as u16,
-                        pidfd,
-                    };
-                    let bytes = unsafe {
-                        core::slice::from_raw_parts(
-                            (&info as *const FanotifyEventInfoPidfd).cast::<u8>(),
-                            pidfd_info_len,
-                        )
-                    };
-                    dst.write(bytes)?;
-                }
-                let event = state.queue.pop_front().expect("queue front disappeared");
-                if let Some(id) = event.permission_id
-                    && let Some(pending) =
-                        state.pending_permissions.iter_mut().find(|it| it.id == id)
-                {
-                    pending.fd = Some(fd);
-                    if fd == FAN_NOFD && pending.response.is_none() {
-                        pending.response = Some(FAN_ALLOW);
-                    }
-                }
-                written += event_len;
-            }
-
-            if written == 0 {
-                Err(AxError::WouldBlock)
-            } else {
-                Ok(written)
-            }
+            self.read_ready(dst)
         }))
     }
 
@@ -626,11 +980,13 @@ fn mark_scope(flags: u32, loc: &Location) -> AxResult<FanotifyScope> {
 }
 
 fn flush_marks(state: &mut FanotifyState, flags: u32) {
+    let previous_len = state.marks.len();
     state.marks.retain(|mark| match mark.scope {
         FanotifyScope::Inode => flags & (FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM) != 0,
         FanotifyScope::Mount(_) => flags & FAN_MARK_MOUNT == 0,
         FanotifyScope::Filesystem(_) => flags & FAN_MARK_FILESYSTEM == 0,
     });
+    FANOTIFY_MARKS.fetch_sub(previous_len - state.marks.len(), Ordering::AcqRel);
 }
 
 fn add_mark(
@@ -651,6 +1007,15 @@ fn add_mark(
         mark.is_dir = loc.is_dir();
         return Ok(());
     }
+    if state.marks.len() >= MAX_USER_MARKS {
+        return Err(AxError::StorageFull);
+    }
+    state.marks.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+    FANOTIFY_MARKS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |marks| {
+            (marks < MAX_USER_MARKS).then_some(marks + 1)
+        })
+        .map_err(|_| AxError::StorageFull)?;
     state.marks.push(FanotifyMark {
         key,
         mask: mask & ALL_FANOTIFY_EVENT_BITS,
@@ -704,68 +1069,111 @@ fn remove_mark(
     state.marks[idx].ignored_mask &= !mask;
     if state.marks[idx].mask == 0 && state.marks[idx].ignored_mask == 0 {
         state.marks.remove(idx);
+        FANOTIFY_MARKS.fetch_sub(1, Ordering::AcqRel);
     }
     Ok(())
 }
 
-fn live_fanotify_files() -> Vec<Arc<FanotifyFile>> {
+fn fanotify_registry_slots() -> usize {
+    MAX_USER_GROUPS
+}
+
+fn live_fanotify_file(slot: usize) -> Option<Arc<FanotifyFile>> {
     let mut files = FANOTIFY_FILES.lock();
-    let mut live = Vec::new();
-    files.retain(|weak| {
-        if let Some(file) = weak.upgrade() {
-            live.push(file);
-            true
-        } else {
-            false
-        }
-    });
+    let live = files.get(slot)?.as_ref()?.upgrade();
+    let retired = if live.is_none() {
+        files[slot].take()
+    } else {
+        None
+    };
+    drop(files);
+    drop(retired);
     live
 }
 
 fn each_fanotify_file(mut f: impl FnMut(&Arc<FanotifyFile>)) {
-    for file in live_fanotify_files() {
-        f(&file);
+    // Slots are stable and callbacks run after the registry lock is released.
+    // New groups appended during a pass are observed by the next event.
+    let slots = fanotify_registry_slots();
+    for slot in 0..slots {
+        if let Some(file) = live_fanotify_file(slot) {
+            f(&file);
+        }
     }
 }
 
-fn clone_readonly_fd(loc: &Location, cloexec: bool) -> AxResult<c_int> {
-    if loc.metadata()?.node_type == NodeType::Directory {
-        return add_file_like(Arc::new(Directory::new(loc.clone())), cloexec);
-    }
-    let file = axfs::File::new(FileBackend::Direct(loc.clone()), FileFlags::READ);
-    add_file_like(Arc::new(File::new(file)), cloexec)
+struct PreparedFanotifyFd {
+    value: c_int,
+    publication: Option<(ReservedFd, Arc<FileDescription>)>,
 }
 
-fn opened_event_fd(file: &FanotifyFile, loc: &Location) -> c_int {
-    if file.report_fid() {
-        return FAN_NOFD;
+impl PreparedFanotifyFd {
+    const fn sentinel(value: c_int) -> Self {
+        Self {
+            value,
+            publication: None,
+        }
     }
-    clone_readonly_fd(
+
+    const fn value(&self) -> c_int {
+        self.value
+    }
+
+    fn publish(self) -> AxResult<c_int> {
+        match self.publication {
+            Some((reservation, description)) => reservation.publish(description),
+            None => Ok(self.value),
+        }
+    }
+}
+
+fn prepare_readonly_fd(loc: &Location, cloexec: bool) -> AxResult<PreparedFanotifyFd> {
+    let node_type = loc.metadata()?.node_type;
+    let reservation = reserve_fd(cloexec)?;
+    let file: Arc<dyn FileLike> = if node_type == NodeType::Directory {
+        Arc::try_new(Directory::new(loc.clone())).map_err(|_| AxError::NoMemory)?
+    } else {
+        let file = axfs::File::new(FileBackend::Direct(loc.clone()), FileFlags::READ);
+        Arc::try_new(File::new(file)).map_err(|_| AxError::NoMemory)?
+    };
+    let description = FileDescription::new(file)?;
+    Ok(PreparedFanotifyFd {
+        value: reservation.fd(),
+        publication: Some((reservation, description)),
+    })
+}
+
+fn prepared_opened_event_fd(
+    file: &FanotifyFile,
+    loc: Option<&Location>,
+) -> AxResult<PreparedFanotifyFd> {
+    let Some(loc) = loc.filter(|_| !file.report_fid()) else {
+        return Ok(PreparedFanotifyFd::sentinel(FAN_NOFD));
+    };
+    prepare_readonly_fd(
         loc,
         file.event_f_flags & linux_raw_sys::general::O_CLOEXEC != 0,
     )
-    .unwrap_or(FAN_NOFD)
 }
 
-fn fanotify_pid(file: &FanotifyFile) -> c_int {
-    let thread = current();
-    if file.flags & FAN_REPORT_TID != 0 {
-        thread.as_thread().tid() as c_int
-    } else {
-        thread.as_thread().proc_data.proc.pid() as c_int
-    }
-}
-
-fn fanotify_event_pidfd(pid: c_int) -> c_int {
+fn prepared_event_pidfd(pid: c_int) -> PreparedFanotifyFd {
     if pid <= 0 {
-        return FAN_NOPIDFD;
+        return PreparedFanotifyFd::sentinel(FAN_NOPIDFD);
     }
     let Ok(proc_data) = get_process_data(pid as u32) else {
-        return FAN_NOPIDFD;
+        return PreparedFanotifyFd::sentinel(FAN_NOPIDFD);
     };
-    PidFd::new_process(&proc_data)
-        .add_to_fd_table(true)
-        .unwrap_or(FAN_EPIDFD)
+    let prepared = (|| {
+        let reservation = reserve_fd(true)?;
+        let file: Arc<dyn FileLike> =
+            Arc::try_new(PidFd::new_process(&proc_data)).map_err(|_| AxError::NoMemory)?;
+        let description = FileDescription::new(file)?;
+        Ok::<_, AxError>(PreparedFanotifyFd {
+            value: reservation.fd(),
+            publication: Some((reservation, description)),
+        })
+    })();
+    prepared.unwrap_or_else(|_| PreparedFanotifyFd::sentinel(FAN_EPIDFD))
 }
 
 fn fanotify_mark_matches(
@@ -797,15 +1205,29 @@ fn enqueue_permission_event(
     state: &mut FanotifyState,
     event_loc: &Location,
     mask: u64,
+    actor: FanotifyEventActor,
 ) -> AxResult<u64> {
     if state.released {
         return Err(AxError::Interrupted);
     }
-    if file.flags & FAN_UNLIMITED_QUEUE == 0 && state.queue.len() >= MAX_QUEUED_EVENTS {
+    if state.queue.len() >= MAX_QUEUED_EVENTS
+        || state.pending_permissions.len() >= MAX_QUEUED_EVENTS
+    {
         return Err(LinuxError::EPERM.into());
     }
     let id = state.next_permission_id;
-    state.next_permission_id = state.next_permission_id.wrapping_add(1).max(1);
+    let next_permission_id = state
+        .next_permission_id
+        .checked_add(1)
+        .ok_or(AxError::OutOfRange)?;
+    state
+        .pending_permissions
+        .try_reserve(1)
+        .map_err(|_| AxError::NoMemory)?;
+    // Two spare entries before publication preserve one queue slot for a
+    // later non-permission overflow marker.
+    state.queue.try_reserve(2).map_err(|_| AxError::NoMemory)?;
+    state.next_permission_id = next_permission_id;
     state.pending_permissions.push(FanotifyPermissionEvent {
         id,
         fd: None,
@@ -815,9 +1237,28 @@ fn enqueue_permission_event(
         mask,
         fd_loc: Some(event_loc.clone()),
         permission_id: Some(id),
-        pid: fanotify_pid(file),
+        pid: actor.pid_for(file),
     });
     Ok(id)
+}
+
+fn cancel_permission_event(file: &FanotifyFile, id: u64) {
+    let mut state = file.state.lock();
+    let pending = state
+        .pending_permissions
+        .iter()
+        .position(|event| event.id == id)
+        .map(|idx| state.pending_permissions.remove(idx));
+    let queued = state
+        .queue
+        .iter()
+        .position(|event| event.permission_id == Some(id))
+        .and_then(|idx| state.queue.remove(idx));
+    drop(state);
+    // Location and any future event-owned resources are destroyed outside the
+    // spin lock. One permission id has exactly one queue entry.
+    drop(queued);
+    drop(pending);
 }
 
 fn wait_for_permission_response(file: &Arc<FanotifyFile>, id: u64) -> AxResult<()> {
@@ -862,19 +1303,27 @@ pub(crate) fn permission_check(
     is_dir: bool,
     parent_event: bool,
 ) -> AxResult<()> {
+    let actor = FanotifyEventActor::current();
     let event_key = WatchKey::from_location(event_loc)?;
     let event_mount_id = event_loc.mountpoint().mount_id();
     let watch_key = WatchKey::from_location(watch_loc)?;
-    let mut waits = Vec::new();
+    let mut waits: Vec<(Arc<FanotifyFile>, u64)> = Vec::new();
+    waits
+        .try_reserve(MAX_USER_GROUPS)
+        .map_err(|_| AxError::NoMemory)?;
 
-    for file in live_fanotify_files() {
+    let slots = fanotify_registry_slots();
+    for slot in 0..slots {
+        let Some(file) = live_fanotify_file(slot) else {
+            continue;
+        };
         let mut state = file.state.lock();
         if state.released {
             continue;
         }
-        let should_queue = state.marks.clone().into_iter().any(|mark| {
+        let should_queue = state.marks.iter().any(|mark| {
             fanotify_mark_matches(
-                &mark,
+                mark,
                 event_key,
                 event_mount_id,
                 watch_key,
@@ -884,7 +1333,16 @@ pub(crate) fn permission_check(
                 && mark.ignored_mask & mask == 0
         });
         if should_queue {
-            let id = enqueue_permission_event(&file, &mut state, event_loc, mask)?;
+            let id = match enqueue_permission_event(&file, &mut state, event_loc, mask, actor) {
+                Ok(id) => id,
+                Err(error) => {
+                    drop(state);
+                    for (queued_file, queued_id) in waits.drain(..) {
+                        cancel_permission_event(&queued_file, queued_id);
+                    }
+                    return Err(error);
+                }
+            };
             waits.push((file.clone(), id));
         }
         drop(state);
@@ -922,6 +1380,24 @@ pub(crate) fn notify(
     is_dir: bool,
     parent_event: bool,
 ) {
+    notify_with_actor(
+        event_loc,
+        watch_loc,
+        mask,
+        is_dir,
+        parent_event,
+        FanotifyEventActor::current(),
+    );
+}
+
+pub(crate) fn notify_with_actor(
+    event_loc: &Location,
+    watch_loc: &Location,
+    mask: u64,
+    is_dir: bool,
+    parent_event: bool,
+    actor: FanotifyEventActor,
+) {
     let Ok(event_key) = WatchKey::from_location(event_loc) else {
         return;
     };
@@ -929,13 +1405,38 @@ pub(crate) fn notify(
     let Ok(watch_key) = WatchKey::from_location(watch_loc) else {
         return;
     };
+    notify_with_keys_and_actor(
+        event_loc,
+        event_key,
+        event_mount_id,
+        watch_key,
+        mask,
+        is_dir,
+        parent_event,
+        actor,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn notify_with_keys_and_actor(
+    event_loc: &Location,
+    event_key: WatchKey,
+    event_mount_id: u64,
+    watch_key: WatchKey,
+    mask: u64,
+    is_dir: bool,
+    parent_event: bool,
+    actor: FanotifyEventActor,
+) {
     each_fanotify_file(|file| {
         let mut state = file.state.lock();
         if state.released {
             return;
         }
         let mut wake = false;
-        for mark in state.marks.clone() {
+        let mut mark_index = 0;
+        while mark_index < state.marks.len() {
+            let mark = state.marks[mark_index];
             if !fanotify_mark_matches(
                 &mark,
                 event_key,
@@ -944,19 +1445,15 @@ pub(crate) fn notify(
                 is_dir,
                 parent_event,
             ) {
+                mark_index += 1;
                 continue;
             }
             let event_mask = mask & mark.mask & !FAN_EVENT_ON_CHILD;
             if event_mask == 0 || mark.ignored_mask & event_mask != 0 {
                 if event_mask & FAN_MODIFY != 0 && !mark.ignored_survives_modify {
-                    if let Some(current_mark) = state
-                        .marks
-                        .iter_mut()
-                        .find(|it| it.key == mark.key && it.scope == mark.scope)
-                    {
-                        current_mark.ignored_mask = 0;
-                    }
+                    state.marks[mark_index].ignored_mask = 0;
                 }
+                mark_index += 1;
                 continue;
             }
             let fd_loc = if event_mask
@@ -969,27 +1466,144 @@ pub(crate) fn notify(
             };
             wake |= FanotifyFile::enqueue_locked(
                 &mut state,
-                file.flags & FAN_UNLIMITED_QUEUE != 0,
                 FanotifyEvent {
                     mask: event_mask,
                     fd_loc,
                     permission_id: None,
-                    pid: fanotify_pid(file),
+                    pid: actor.pid_for(file),
                 },
             );
             if event_mask & FAN_MODIFY != 0 && !mark.ignored_survives_modify {
-                if let Some(current_mark) = state
-                    .marks
-                    .iter_mut()
-                    .find(|it| it.key == mark.key && it.scope == mark.scope)
-                {
-                    current_mark.ignored_mask = 0;
-                }
+                state.marks[mark_index].ignored_mask = 0;
             }
+            mark_index += 1;
         }
         drop(state);
         if wake {
             file.poll_rx.wake();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
+    use core::{ptr, sync::atomic::AtomicPtr};
+
+    use axerrno::{AxError, AxResult};
+    use axio::{IoBufMut, Write};
+
+    use super::{
+        FAN_ACCESS, FAN_DENY, FAN_NONBLOCK, FAN_OPEN_PERM, FanotifyCleanupWork, FanotifyEvent,
+        FanotifyFile, FanotifyPermissionEvent, pop_cleanup_from, publish_cleanup_to,
+    };
+
+    struct FaultAfterWrites {
+        remaining: usize,
+        successful_writes: usize,
+    }
+
+    impl Write for FaultAfterWrites {
+        fn write(&mut self, buf: &[u8]) -> AxResult<usize> {
+            if self.successful_writes == 0 {
+                return Err(AxError::BadAddress);
+            }
+            self.successful_writes -= 1;
+            self.remaining -= buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> AxResult<()> {
+            Ok(())
+        }
+    }
+
+    impl IoBufMut for FaultAfterWrites {
+        fn remaining_mut(&self) -> usize {
+            self.remaining
+        }
+    }
+
+    fn cleanup_work(id: i32) -> Box<FanotifyCleanupWork> {
+        let mut queue = VecDeque::new();
+        queue.push_back(FanotifyEvent {
+            mask: FAN_ACCESS,
+            fd_loc: None,
+            permission_id: None,
+            pid: id,
+        });
+        Box::new(FanotifyCleanupWork {
+            next: AtomicPtr::new(ptr::null_mut()),
+            queue,
+            marks: Vec::new(),
+            pending_permissions: Vec::new(),
+        })
+    }
+
+    fn cleanup_id(work: &FanotifyCleanupWork) -> i32 {
+        work.queue.front().unwrap().pid
+    }
+
+    #[test]
+    fn cleanup_fifo_snapshot_gives_old_continuation_finite_progress() {
+        let incoming = AtomicPtr::new(ptr::null_mut());
+        let pending = AtomicPtr::new(ptr::null_mut());
+        publish_cleanup_to(&incoming, cleanup_work(1));
+        publish_cleanup_to(&incoming, cleanup_work(2));
+
+        let oldest = pop_cleanup_from(&incoming, &pending).unwrap();
+        assert_eq!(cleanup_id(&oldest), 1);
+        // A partially drained old item is republished before a new producer.
+        publish_cleanup_to(&incoming, oldest);
+        publish_cleanup_to(&incoming, cleanup_work(3));
+
+        let second = pop_cleanup_from(&incoming, &pending).unwrap();
+        assert_eq!(cleanup_id(&second), 2);
+        drop(second);
+        let continuation = pop_cleanup_from(&incoming, &pending).unwrap();
+        assert_eq!(cleanup_id(&continuation), 1);
+        drop(continuation);
+        let newest = pop_cleanup_from(&incoming, &pending).unwrap();
+        assert_eq!(cleanup_id(&newest), 3);
+        drop(newest);
+        assert!(pop_cleanup_from(&incoming, &pending).is_none());
+    }
+
+    #[test]
+    fn read_fault_consumes_event_and_denies_permission_after_prior_record() {
+        let file = FanotifyFile::new(FAN_NONBLOCK, 0).unwrap();
+        let permission_id = 7;
+        let event_len = core::mem::size_of::<super::FanotifyEventMetadata>();
+        {
+            let mut state = file.state.lock();
+            state.queue.try_reserve(2).unwrap();
+            state.pending_permissions.try_reserve(1).unwrap();
+            state.queue.push_back(FanotifyEvent {
+                mask: FAN_ACCESS,
+                fd_loc: None,
+                permission_id: None,
+                pid: 1,
+            });
+            state.queue.push_back(FanotifyEvent {
+                mask: FAN_OPEN_PERM,
+                fd_loc: None,
+                permission_id: Some(permission_id),
+                pid: 1,
+            });
+            state.pending_permissions.push(FanotifyPermissionEvent {
+                id: permission_id,
+                fd: None,
+                response: None,
+            });
+        }
+        let mut dst = FaultAfterWrites {
+            remaining: event_len * 2,
+            successful_writes: 1,
+        };
+
+        assert_eq!(file.read_ready(&mut dst), Err(AxError::BadAddress));
+        let state = file.state.lock();
+        assert!(state.queue.is_empty());
+        assert_eq!(state.pending_permissions[0].response, Some(FAN_DENY));
+    }
 }

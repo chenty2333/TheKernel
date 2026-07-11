@@ -1,7 +1,9 @@
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{DirEntry, MetadataUpdateCapabilities, VfsResult};
+use spin::Once;
+
+use crate::{DirEntry, MetadataUpdateCapabilities, Mutex, VfsResult, WeakDirEntry};
 
 pub struct StatFs {
     pub fs_type: u32,
@@ -49,8 +51,77 @@ pub trait FilesystemOps: Send + Sync {
 
 struct FilesystemInner {
     ops: Arc<dyn FilesystemOps>,
+    identity: FilesystemIdentity,
+    root_cache_owner: Arc<RootCacheOwner>,
+}
+
+struct RootCacheOwner {
+    root: Mutex<Option<WeakDirEntry>>,
+}
+
+impl RootCacheOwner {
+    fn new() -> Self {
+        Self {
+            root: Mutex::new(None),
+        }
+    }
+}
+
+impl Drop for RootCacheOwner {
+    fn drop(&mut self) {
+        let root = self.root.lock().take().and_then(|root| root.upgrade());
+        if let Some(root) = root {
+            crate::node::defer_dentry_cache_cleanup(root);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FilesystemIdentityInner {
     device: u64,
-    lifetime: Arc<()>,
+}
+
+static FILESYSTEM_RELEASE_HOOK: Once<fn(u64)> = Once::new();
+static FILESYSTEM_DEVICE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+impl Drop for FilesystemIdentityInner {
+    fn drop(&mut self) {
+        if let Some(hook) = FILESYSTEM_RELEASE_HOOK.get() {
+            hook(self.device);
+        }
+    }
+}
+
+/// Installs a callback invoked synchronously when the final strong filesystem
+/// identity is released.
+///
+/// The identity may be dropped from an arbitrary context. The callback must
+/// therefore perform only bounded, non-sleeping, allocation-free work and
+/// defer policy processing to a safe execution context.
+pub fn set_filesystem_release_hook(hook: fn(u64)) {
+    FILESYSTEM_RELEASE_HOOK.call_once(|| hook);
+}
+
+#[derive(Clone, Debug)]
+pub struct FilesystemIdentity(Arc<FilesystemIdentityInner>);
+
+impl FilesystemIdentity {
+    pub fn device(&self) -> u64 {
+        self.0.device
+    }
+
+    pub fn downgrade(&self) -> WeakFilesystemIdentity {
+        WeakFilesystemIdentity(Arc::downgrade(&self.0))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WeakFilesystemIdentity(Weak<FilesystemIdentityInner>);
+
+impl WeakFilesystemIdentity {
+    pub fn upgrade(&self) -> Option<FilesystemIdentity> {
+        self.0.upgrade().map(FilesystemIdentity)
+    }
 }
 
 impl Drop for FilesystemInner {
@@ -86,34 +157,103 @@ impl Filesystem {
     }
 
     pub fn new(ops: Arc<dyn FilesystemOps>) -> Self {
-        static DEVICE_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-        Self::new_with_device(ops, DEVICE_COUNTER.fetch_add(1, Ordering::Relaxed))
+        Self::new_with_identity_inner(
+            ops,
+            FilesystemIdentity(Arc::new(FilesystemIdentityInner {
+                device: FILESYSTEM_DEVICE_COUNTER.fetch_add(1, Ordering::Relaxed),
+            })),
+            Arc::new(RootCacheOwner::new()),
+        )
     }
 
-    /// Creates a filesystem with an existing stable device identity.
+    /// Fallibly constructs a filesystem wrapper for backends whose mount path
+    /// must report allocation failure instead of aborting the kernel.
+    pub fn try_new(ops: Arc<dyn FilesystemOps>) -> VfsResult<Self> {
+        let identity = Arc::try_new(FilesystemIdentityInner {
+            device: FILESYSTEM_DEVICE_COUNTER.fetch_add(1, Ordering::Relaxed),
+        })
+        .map(FilesystemIdentity)
+        .map_err(|_| crate::VfsError::NoMemory)?;
+        let root_cache_owner =
+            Arc::try_new(RootCacheOwner::new()).map_err(|_| crate::VfsError::NoMemory)?;
+        let inner = Arc::try_new(FilesystemInner {
+            ops,
+            identity,
+            root_cache_owner,
+        })
+        .map_err(|_| crate::VfsError::NoMemory)?;
+        Ok(Self { inner })
+    }
+
+    /// Creates an independent filesystem tree with an existing stable identity.
     ///
-    /// This is used by views such as bind mounts that expose the same
-    /// filesystem through a different root directory.
-    pub fn new_with_device(ops: Arc<dyn FilesystemOps>, device: u64) -> Self {
+    /// Sharing the identity keeps device mappings live, but does not couple the
+    /// two root-dentry cache lifetimes. Use [`Self::new_view`] when `ops`
+    /// exposes a view of an existing filesystem tree.
+    pub fn new_with_identity(ops: Arc<dyn FilesystemOps>, identity: FilesystemIdentity) -> Self {
+        Self::new_with_identity_inner(ops, identity, Arc::new(RootCacheOwner::new()))
+    }
+
+    /// Creates a filesystem view that shares the source tree's cache lifetime.
+    pub fn new_view(ops: Arc<dyn FilesystemOps>, source: &Filesystem) -> Self {
+        Self::new_with_identity_inner(
+            ops,
+            source.identity(),
+            Arc::clone(&source.inner.root_cache_owner),
+        )
+    }
+
+    /// Fallibly creates a filesystem view that shares the source tree's cache
+    /// lifetime. Runtime mount paths should use this variant so allocation
+    /// failure is reported before publishing any mount topology.
+    pub fn try_new_view(
+        ops: Arc<dyn FilesystemOps>,
+        source: &Filesystem,
+    ) -> VfsResult<Self> {
+        let inner = Arc::try_new(FilesystemInner {
+            ops,
+            identity: source.identity(),
+            root_cache_owner: Arc::clone(&source.inner.root_cache_owner),
+        })
+        .map_err(|_| crate::VfsError::NoMemory)?;
+        Ok(Self { inner })
+    }
+
+    fn new_with_identity_inner(
+        ops: Arc<dyn FilesystemOps>,
+        identity: FilesystemIdentity,
+        root_cache_owner: Arc<RootCacheOwner>,
+    ) -> Self {
         Self {
             inner: Arc::new(FilesystemInner {
                 ops,
-                device,
-                lifetime: Arc::new(()),
+                identity,
+                root_cache_owner,
             }),
+        }
+    }
+
+    pub(crate) fn retain_mount_root(&self, root: &DirEntry) {
+        let mut owner_root = self.inner.root_cache_owner.root.lock();
+        if owner_root
+            .as_ref()
+            .is_none_or(|root| root.upgrade().is_none())
+        {
+            *owner_root = Some(root.downgrade());
         }
     }
 
     /// Returns the stable identity shared by all mounts of this filesystem.
     pub fn device(&self) -> u64 {
-        self.inner.device
+        self.inner.identity.device()
     }
 
-    /// Returns a weak handle that remains live while this filesystem instance
-    /// is owned by a mount or an unattached filesystem handle.
-    pub fn lifetime_handle(&self) -> Weak<()> {
-        Arc::downgrade(&self.inner.lifetime)
+    pub fn identity(&self) -> FilesystemIdentity {
+        self.inner.identity.clone()
+    }
+
+    pub fn identity_weak(&self) -> WeakFilesystemIdentity {
+        self.inner.identity.downgrade()
     }
 }
 
@@ -121,7 +261,7 @@ impl core::fmt::Debug for Filesystem {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Filesystem")
             .field("name", &self.name())
-            .field("device", &self.inner.device)
+            .field("device", &self.inner.identity.device())
             .finish_non_exhaustive()
     }
 }

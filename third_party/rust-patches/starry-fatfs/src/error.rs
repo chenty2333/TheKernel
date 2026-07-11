@@ -22,6 +22,8 @@ pub enum Error<T> {
     CorruptedFileSystem,
     /// There is not enough free space on the storage to finish the requested operation.
     NotEnoughSpace,
+    /// A fallible userspace-independent metadata allocation could not be satisfied.
+    NotEnoughMemory,
     /// The provided file name is either too long or empty.
     InvalidFileNameLength,
     /// The provided file name contains an invalid character.
@@ -40,6 +42,7 @@ impl From<Error<std::io::Error>> for std::io::Error {
         match error {
             Error::Io(io_error) => io_error,
             Error::UnexpectedEof | Error::NotEnoughSpace => Self::new(std::io::ErrorKind::UnexpectedEof, error),
+            Error::NotEnoughMemory => Self::new(std::io::ErrorKind::OutOfMemory, error),
             Error::WriteZero => Self::new(std::io::ErrorKind::WriteZero, error),
             Error::InvalidInput
             | Error::InvalidFileNameLength
@@ -58,6 +61,7 @@ impl<T: core::fmt::Display> core::fmt::Display for Error<T> {
             Error::Io(io_error) => write!(f, "IO error: {}", io_error),
             Error::UnexpectedEof => write!(f, "Unexpected end of file"),
             Error::NotEnoughSpace => write!(f, "Not enough space"),
+            Error::NotEnoughMemory => write!(f, "Not enough memory"),
             Error::WriteZero => write!(f, "Write zero"),
             Error::InvalidInput => write!(f, "Invalid input"),
             Error::InvalidFileNameLength => write!(f, "Invalid file name length"),

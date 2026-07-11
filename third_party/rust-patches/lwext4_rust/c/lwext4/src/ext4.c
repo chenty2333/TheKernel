@@ -445,6 +445,8 @@ int ext4_umount(const char *mount_point)
 {
 	int i;
 	int r;
+	int first_error = EOK;
+	bool clean;
 	struct ext4_mountpoint *mp = 0;
 
 	for (i = 0; i < CONFIG_EXT4_MOUNTPOINTS_COUNT; ++i) {
@@ -457,19 +459,59 @@ int ext4_umount(const char *mount_point)
 	if (!mp)
 		return ENODEV;
 
-	r = ext4_fs_fini(&mp->fs);
-	if (r != EOK)
-		goto Finish;
+	/* Drain cached metadata and fence it before deciding whether the
+	 * superblock may be marked clean. Preserve the first failure while still
+	 * attempting every teardown step. */
+	r = ext4_block_cache_flush(mp->fs.bdev);
+	if (first_error == EOK && r != EOK)
+		first_error = r;
+
+	r = ext4_bcache_cleanup(mp->fs.bdev->bc);
+	if (first_error == EOK && r != EOK)
+		first_error = r;
+
+	r = ext4_block_flush(mp->fs.bdev);
+	if (first_error == EOK && r != EOK)
+		first_error = r;
+
+	clean = first_error == EOK;
+	r = clean ? ext4_fs_fini(&mp->fs) : ext4_fs_fini_error(&mp->fs);
+	if (r != EOK) {
+		if (first_error == EOK)
+			first_error = r;
+		if (clean) {
+			clean = false;
+			r = ext4_fs_fini_error(&mp->fs);
+			if (first_error == EOK && r != EOK)
+				first_error = r;
+		}
+	}
+
+	/* The superblock state is the final metadata write and needs its own
+	 * fence. If fencing a clean state fails, make one best-effort transition
+	 * back to ERROR_FS before closing the device. */
+	r = ext4_block_flush(mp->fs.bdev);
+	if (r != EOK) {
+		if (first_error == EOK)
+			first_error = r;
+		if (clean) {
+			r = ext4_fs_fini_error(&mp->fs);
+			if (first_error == EOK && r != EOK)
+				first_error = r;
+			r = ext4_block_flush(mp->fs.bdev);
+			if (first_error == EOK && r != EOK)
+				first_error = r;
+		}
+	}
 
 	mp->mounted = 0;
-
-	ext4_bcache_cleanup(mp->fs.bdev->bc);
 	ext4_bcache_fini_dynamic(mp->fs.bdev->bc);
 
 	r = ext4_block_fini(mp->fs.bdev);
-Finish:
+	if (first_error == EOK && r != EOK)
+		first_error = r;
 	mp->fs.bdev->fs = NULL;
-	return r;
+	return first_error;
 }
 
 static struct ext4_mountpoint *ext4_get_mount(const char *path)

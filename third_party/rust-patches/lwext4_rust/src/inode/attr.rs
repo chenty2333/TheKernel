@@ -82,18 +82,19 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         u16::from_le(self.raw_inode().links_count)
     }
 
-    pub fn uid(&self) -> u16 {
-        u16::from_le(self.raw_inode().uid)
+    pub fn uid(&self) -> u32 {
+        unsafe { ext4_inode_get_uid(self.inner.inode) }
     }
-    pub fn gid(&self) -> u16 {
-        u16::from_le(self.raw_inode().gid)
+    pub fn gid(&self) -> u32 {
+        unsafe { ext4_inode_get_gid(self.inner.inode) }
     }
 
-    pub fn set_owner(&mut self, uid: u16, gid: u16) {
-        let inode = self.raw_inode_mut();
-        inode.uid = u16::to_le(uid);
-        inode.gid = u16::to_le(gid);
-        self.mark_dirty();
+    pub fn set_owner(&mut self, uid: u32, gid: u32) {
+        unsafe {
+            ext4_inode_set_uid(self.inner.inode, uid);
+            ext4_inode_set_gid(self.inner.inode, gid);
+            self.mark_dirty();
+        }
     }
 
     pub fn rdev(&self) -> u64 {
@@ -158,8 +159,8 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         attr.nlink = self.nlink() as _;
         attr.mode = self.mode();
         attr.node_type = self.inode_type();
-        attr.uid = self.uid() as _;
-        attr.gid = self.gid() as _;
+        attr.uid = self.uid();
+        attr.gid = self.gid();
         attr.size = self.size();
         attr.block_size = get_block_size(self.superblock()) as _;
         attr.blocks = unsafe {

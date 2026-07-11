@@ -42,9 +42,9 @@ fn deliver_fatal_user_signal(signo: Signo) {
     }
 }
 
-/// Create a new user task.
-pub fn new_user_task(name: &str, mut uctx: UserContext) -> TaskInner {
-    TaskInner::new(
+/// Fallibly creates an unpublished user task.
+pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskInner> {
+    TaskInner::try_new(
         move || {
             let curr = axtask::current();
             info!("Enter user space: ip={:#x}, sp={:#x}", uctx.ip(), uctx.sp());
@@ -159,7 +159,11 @@ pub fn new_user_task(name: &str, mut uctx: UserContext) -> TaskInner {
                 curr.clear_interrupt();
             }
         },
-        name.into(),
+        name,
         crate::config::KERNEL_STACK_SIZE,
     )
+    .map_err(|_| AxError::NoMemory)
 }
+use alloc::string::String;
+
+use axerrno::{AxError, AxResult};

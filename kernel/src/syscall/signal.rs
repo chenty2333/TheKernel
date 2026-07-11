@@ -19,8 +19,8 @@ use crate::{
     task::{
         AsThread, ProcessData, acknowledge_posix_timer_signal, check_current_signal_access,
         check_signals, get_process_data, get_process_group, get_process_including_zombie,
-        get_visible_task, processes, send_signal_to_process, send_signal_to_process_data,
-        send_signal_to_visible_thread,
+        get_visible_task, send_signal_to_process, send_signal_to_process_data,
+        send_signal_to_visible_thread, try_processes,
     },
     time::TimeValueLike,
 };
@@ -245,21 +245,23 @@ pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
         0 => {
             let pgid = current().as_thread().proc_data.proc.group().pgid();
             let targets = get_process_group(pgid)?
-                .processes()
+                .try_processes()
+                .map_err(|_| AxError::NoMemory)?
                 .into_iter()
                 .filter_map(|process| get_process_data(process.pid()).ok());
             send_user_signal_to_targets(targets, sig)?;
         }
         -1 => {
             let curr_pid = current().as_thread().proc_data.proc.pid();
-            let targets = processes()
+            let targets = try_processes()?
                 .into_iter()
                 .filter(|proc_data| !proc_data.proc.is_init() && proc_data.proc.pid() != curr_pid);
             send_user_signal_to_targets(targets, sig)?;
         }
         ..-1 => {
             let targets = get_process_group((-pid) as Pid)?
-                .processes()
+                .try_processes()
+                .map_err(|_| AxError::NoMemory)?
                 .into_iter()
                 .filter_map(|process| get_process_data(process.pid()).ok());
             send_user_signal_to_targets(targets, sig)?;

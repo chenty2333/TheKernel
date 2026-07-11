@@ -21,24 +21,30 @@ pub fn add_stdio(fd_table: &mut FlattenObjects<FileDescriptor, AX_FILE_LIMIT>) -
 
     let tty_in = open(OpenOptions::new().read(true).write(false))?;
     let tty_out = open(OpenOptions::new().read(false).write(true))?;
+    let stdin = FileDescription::new(tty_in)?;
     fd_table
         .add(FileDescriptor {
-            description: FileDescription::new(tty_in),
+            description: stdin.clone(),
             cloexec: false,
         })
         .map_err(|_| AxError::TooManyOpenFiles)?;
+    stdin.mark_open_committed();
+    let stdout = FileDescription::new(tty_out.clone())?;
     fd_table
         .add(FileDescriptor {
-            description: FileDescription::new(tty_out.clone()),
+            description: stdout.clone(),
             cloexec: false,
         })
         .map_err(|_| AxError::TooManyOpenFiles)?;
+    stdout.mark_open_committed();
+    let stderr = FileDescription::new(tty_out)?;
     fd_table
         .add(FileDescriptor {
-            description: FileDescription::new(tty_out),
+            description: stderr.clone(),
             cloexec: false,
         })
         .map_err(|_| AxError::TooManyOpenFiles)?;
+    stderr.mark_open_committed();
 
     Ok(())
 }

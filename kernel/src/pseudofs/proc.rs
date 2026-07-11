@@ -1,6 +1,5 @@
 use alloc::{
     borrow::Cow,
-    boxed::Box,
     format,
     string::{String, ToString},
     sync::{Arc, Weak},
@@ -58,9 +57,10 @@ use crate::{
     },
     mounts,
     pseudofs::{
-        DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
+        ChildNames, DirMaker, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
         SimpleFileOperation, SimpleFs, SimpleFsNode,
         cgroup::{proc_cgroup_membership, proc_cgroups_snapshot, proc_cpuset_membership},
+        try_boxed_names,
     },
     syscall::{
         aio_max_nr, aio_nr, current_domainname_string, current_hostname_string,
@@ -80,13 +80,20 @@ use crate::{
         AsThread, Mempolicy, PidNamespace, ProcessData, PtraceCredentialMode, TimeNamespace,
         UserNamespace, UtsNamespace, check_current_ptrace_access, get_process_data,
         get_process_including_zombie, get_task, get_visible_task,
-        get_visible_task_including_exiting, nr_open_limit, processes, render_task_stat,
-        render_zombie_stat, set_nr_open_limit, task_state,
+        get_visible_task_including_exiting, nr_open_limit, render_task_stat, render_zombie_stat,
+        set_nr_open_limit, task_state, try_processes,
     },
 };
 
 const PROC_PID_MAX_DEFAULT: u32 = 4_194_304;
 const PROC_SWAPS_HEADER: &str = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+
+fn try_pid_name(pid: u32) -> VfsResult<String> {
+    let mut name = String::new();
+    name.try_reserve_exact(10).map_err(|_| VfsError::NoMemory)?;
+    write!(&mut name, "{pid}").map_err(|_| VfsError::Io)?;
+    Ok(name)
+}
 
 fn render_proc_io_stats() -> Vec<u8> {
     let mut out = render_io_stats_counters();
@@ -713,9 +720,9 @@ fn escape_mount_field(field: &str) -> String {
     escaped
 }
 
-fn render_mounts() -> String {
+fn render_mounts() -> VfsResult<String> {
     let mut out = String::new();
-    for record in mounts::snapshot() {
+    for record in mounts::snapshot()? {
         let options = record_mount_options(&record);
         let _ = writeln!(
             out,
@@ -726,12 +733,12 @@ fn render_mounts() -> String {
             options
         );
     }
-    out
+    Ok(out)
 }
 
-fn render_mountinfo() -> String {
+fn render_mountinfo() -> VfsResult<String> {
     let mut out = String::new();
-    for record in mounts::snapshot() {
+    for record in mounts::snapshot()? {
         let dev = DeviceId(record.dev);
         let options = record_mount_options(&record);
         let _ = writeln!(
@@ -749,7 +756,7 @@ fn render_mountinfo() -> String {
             options
         );
     }
-    out
+    Ok(out)
 }
 
 fn proc_task_for_pid(pid: u32) -> VfsResult<AxTaskRef> {
@@ -758,7 +765,7 @@ fn proc_task_for_pid(pid: u32) -> VfsResult<AxTaskRef> {
     }
 
     let proc_data = get_process_data(pid).map_err(|_| VfsError::NotFound)?;
-    for tid in proc_data.proc.threads() {
+    for tid in proc_data.proc.thread_ids() {
         if let Ok(task) = get_task(tid)
             && !task.as_thread().pending_exit()
         {
@@ -842,17 +849,24 @@ struct ProcessTaskDir {
 }
 
 impl SimpleDirOps for ProcessTaskDir {
-    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+    fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
         let Some(process) = self.process.upgrade() else {
-            return Box::new(iter::empty());
+            return try_boxed_names(iter::empty());
         };
-        Box::new(process.threads().into_iter().filter_map(|tid| {
-            let task = get_task(tid).ok()?;
+        let mut names = Vec::new();
+        names
+            .try_reserve_exact(process.thread_count())
+            .map_err(|_| VfsError::NoMemory)?;
+        for tid in process.thread_ids() {
+            let Ok(task) = get_task(tid) else {
+                continue;
+            };
             if task.as_thread().pending_exit() {
-                return None;
+                continue;
             }
-            Some(Cow::Owned(task.as_thread().tid().to_string()))
-        }))
+            names.push(Cow::Owned(try_pid_name(task.as_thread().tid())?));
+        }
+        try_boxed_names(names.into_iter())
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
@@ -948,7 +962,7 @@ fn task_status(task: &AxTaskRef) -> String {
         _ => "unknown",
     };
     let ppid = proc_data.proc.parent().map_or(0, |parent| parent.pid());
-    let threads = proc_data.proc.threads().len();
+    let threads = proc_data.proc.thread_count();
     let caps = proc_data.capability_state();
     let cpu_mask = task_cpu_mask_bits(task);
     let mem_mask = PROC_NUMA_NODEMASK;
@@ -1217,9 +1231,9 @@ struct ThreadFdDir {
 }
 
 impl SimpleDirOps for ThreadFdDir {
-    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+    fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
         let Some(task) = self.task.upgrade() else {
-            return Box::new(iter::empty());
+            return try_boxed_names(iter::empty());
         };
         let ids = FD_TABLE
             .scope(&task.as_thread().proc_data.scope.read())
@@ -1227,7 +1241,7 @@ impl SimpleDirOps for ThreadFdDir {
             .ids()
             .map(|id| Cow::Owned(id.to_string()))
             .collect::<Vec<_>>();
-        Box::new(ids.into_iter())
+        try_boxed_names(ids.into_iter())
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
@@ -1243,7 +1257,7 @@ impl SimpleDirOps for ThreadFdDir {
             .inner
             .path()
             .into_owned();
-        Ok(SimpleFile::new(fs, NodeType::Symlink, move || Ok(path.clone())).into())
+        Ok(SimpleFile::new_magic_link(fs, move || Ok(path.clone())).into())
     }
 
     fn is_cacheable(&self) -> bool {
@@ -1298,9 +1312,9 @@ impl ThreadFdInfoDir {
 }
 
 impl SimpleDirOps for ThreadFdInfoDir {
-    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+    fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
         let Some(task) = self.task.upgrade() else {
-            return Box::new(iter::empty());
+            return try_boxed_names(iter::empty());
         };
         let ids = FD_TABLE
             .scope(&task.as_thread().proc_data.scope.read())
@@ -1308,7 +1322,7 @@ impl SimpleDirOps for ThreadFdInfoDir {
             .ids()
             .map(|id| Cow::Owned(id.to_string()))
             .collect::<Vec<_>>();
-        Box::new(ids.into_iter())
+        try_boxed_names(ids.into_iter())
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
@@ -1426,7 +1440,7 @@ impl NodeOps for ProcNamespaceFile {
     }
 
     fn flags(&self) -> NodeFlags {
-        NodeFlags::NON_CACHEABLE
+        NodeFlags::NON_CACHEABLE | NodeFlags::MAGIC_LINK
     }
 }
 
@@ -1495,11 +1509,11 @@ struct ThreadNamespaceDir {
 }
 
 impl SimpleDirOps for ThreadNamespaceDir {
-    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+    fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
         if self.task.upgrade().is_none() {
-            return Box::new(iter::empty());
+            return try_boxed_names(iter::empty());
         }
-        Box::new(
+        try_boxed_names(
             ["pid", "time", "time_for_children", "user", "uts"]
                 .into_iter()
                 .map(Cow::Borrowed),
@@ -1776,11 +1790,11 @@ impl Pollable for ProcPagemapFile {
 }
 
 impl SimpleDirOps for ZombieProcessDir {
-    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+    fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
         if self.process.upgrade().is_some() {
-            Box::new(iter::once(Cow::Borrowed("stat")))
+            try_boxed_names(iter::once(Cow::Borrowed("stat")))
         } else {
-            Box::new(iter::empty())
+            try_boxed_names(iter::empty())
         }
     }
 
@@ -1802,8 +1816,8 @@ impl SimpleDirOps for ZombieProcessDir {
 }
 
 impl SimpleDirOps for ThreadDir {
-    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
-        Box::new(
+    fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
+        try_boxed_names(
             [
                 Some("stat"),
                 Some("status"),
@@ -1895,8 +1909,8 @@ impl SimpleDirOps for ThreadDir {
                 SimpleFile::new_regular(fs, move || Ok(render_task_numa_maps(&task))).into()
             }
             "pagemap" => ProcPagemapFile::new(fs, Arc::downgrade(&task)).into(),
-            "mounts" => SimpleFile::new_regular(fs, move || Ok(render_mounts())).into(),
-            "mountinfo" => SimpleFile::new_regular(fs, move || Ok(render_mountinfo())).into(),
+            "mounts" => SimpleFile::new_regular(fs, move || render_mounts()).into(),
+            "mountinfo" => SimpleFile::new_regular(fs, move || render_mountinfo()).into(),
             "cmdline" => SimpleFile::new_regular(fs, move || {
                 let cmdline = task.as_thread().proc_data.cmdline.read();
                 let mut buf = Vec::new();
@@ -1967,7 +1981,7 @@ impl SimpleDirOps for ThreadDir {
                 }),
             )
             .into(),
-            "exe" => SimpleFile::new(fs, NodeType::Symlink, move || {
+            "exe" => SimpleFile::new_magic_link(fs, move || {
                 Ok(task.as_thread().proc_data.exe_path.read().clone())
             })
             .into(),
@@ -2008,27 +2022,28 @@ impl SimpleDirOps for ThreadDir {
 struct ProcFsHandler(Arc<SimpleFs>);
 
 impl SimpleDirOps for ProcFsHandler {
-    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
-        Box::new(
-            processes()
-                .into_iter()
-                .filter(|proc_data| !proc_data.proc.is_zombie())
-                .map(|proc_data| proc_data.proc.pid().to_string().into())
-                .chain([Cow::Borrowed("self")]),
-        )
+    fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
+        let processes = try_processes()?;
+        let capacity = processes.len().checked_add(1).ok_or(VfsError::NoMemory)?;
+        let mut names = Vec::new();
+        names
+            .try_reserve_exact(capacity)
+            .map_err(|_| VfsError::NoMemory)?;
+        for proc_data in processes {
+            if !proc_data.proc.is_zombie() {
+                names.push(Cow::Owned(try_pid_name(proc_data.proc.pid())?));
+            }
+        }
+        names.push(Cow::Borrowed("self"));
+        try_boxed_names(names.into_iter())
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         if name == "self" {
-            let task = current().clone();
-            return Ok(NodeOpsMux::Dir(SimpleDir::new_maker(
-                self.0.clone(),
-                Arc::new(ThreadDir {
-                    fs: self.0.clone(),
-                    task: Arc::downgrade(&task),
-                    show_task_dir: true,
-                }),
-            )));
+            return Ok(SimpleFile::new(self.0.clone(), NodeType::Symlink, || {
+                Ok(current().as_thread().proc_data.proc.pid().to_string())
+            })
+            .into());
         }
 
         let pid = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
@@ -2128,13 +2143,10 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     }
 
     let mut root = DirMapping::new();
-    root.add(
-        "mounts",
-        SimpleFile::new_regular(fs.clone(), || Ok(render_mounts())),
-    );
+    root.add("mounts", SimpleFile::new_regular(fs.clone(), render_mounts));
     root.add(
         "mountinfo",
-        SimpleFile::new_regular(fs.clone(), || Ok(render_mountinfo())),
+        SimpleFile::new_regular(fs.clone(), render_mountinfo),
     );
     root.add("sysvipc", {
         let mut sysvipc = DirMapping::new();
@@ -2144,7 +2156,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         );
         sysvipc.add(
             "shm",
-            SimpleFile::new_regular(fs.clone(), || Ok(sysvipc_shm_snapshot())),
+            SimpleFile::new_regular(fs.clone(), sysvipc_shm_snapshot),
         );
         sysvipc.add(
             "sem",

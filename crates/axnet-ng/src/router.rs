@@ -1,5 +1,6 @@
-use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 
+use axerrno::{AxError, AxResult};
 use smoltcp::{
     iface::SocketSet,
     phy::{DeviceCapabilities, Medium},
@@ -9,7 +10,7 @@ use smoltcp::{
 };
 
 use crate::{
-    consts::{LOOPBACK_MTU, PACKET_QUEUE_LEN, STANDARD_MTU},
+    consts::{LOOPBACK_MTU, PACKET_QUEUE_LEN},
     device::{Device, DeviceStats, InterfaceInfo},
     listen_table::ListenTable,
 };
@@ -80,31 +81,59 @@ pub struct Router {
     pub(crate) listen_table: Arc<ListenTable>,
 }
 impl Router {
-    pub fn new(listen_table: Arc<ListenTable>) -> Self {
-        Self::new_with_mtu(listen_table, STANDARD_MTU)
-    }
-
     pub fn new_loopback_only(listen_table: Arc<ListenTable>) -> Self {
         Self::new_with_mtu(listen_table, LOOPBACK_MTU)
     }
 
+    pub fn try_new_loopback_only(listen_table: Arc<ListenTable>) -> AxResult<Self> {
+        let mut router = Self::try_new_with_mtu(listen_table, LOOPBACK_MTU)?;
+        router
+            .devices
+            .try_reserve_exact(1)
+            .map_err(|_| AxError::NoMemory)?;
+        router
+            .table
+            .rules
+            .try_reserve_exact(2)
+            .map_err(|_| AxError::NoMemory)?;
+        Ok(router)
+    }
+
     fn new_with_mtu(listen_table: Arc<ListenTable>, mtu: usize) -> Self {
-        let rx_buffer = PacketBuffer::new(
-            vec![PacketMetadata::EMPTY; PACKET_QUEUE_LEN],
-            vec![0u8; mtu * PACKET_QUEUE_LEN],
-        );
-        let tx_buffer = PacketBuffer::new(
-            vec![PacketMetadata::EMPTY; PACKET_QUEUE_LEN],
-            vec![0u8; mtu * PACKET_QUEUE_LEN],
-        );
-        Self {
+        Self::try_new_with_mtu(listen_table, mtu).expect("failed to allocate router packet queues")
+    }
+
+    fn try_new_with_mtu(listen_table: Arc<ListenTable>, mtu: usize) -> AxResult<Self> {
+        let mut rx_metadata = Vec::new();
+        rx_metadata
+            .try_reserve_exact(PACKET_QUEUE_LEN)
+            .map_err(|_| AxError::NoMemory)?;
+        rx_metadata.resize(PACKET_QUEUE_LEN, PacketMetadata::EMPTY);
+        let mut rx_storage = Vec::new();
+        rx_storage
+            .try_reserve_exact(mtu.saturating_mul(PACKET_QUEUE_LEN))
+            .map_err(|_| AxError::NoMemory)?;
+        rx_storage.resize(mtu.saturating_mul(PACKET_QUEUE_LEN), 0);
+        let rx_buffer = PacketBuffer::new(rx_metadata, rx_storage);
+        let mut tx_metadata = Vec::new();
+        tx_metadata
+            .try_reserve_exact(PACKET_QUEUE_LEN)
+            .map_err(|_| AxError::NoMemory)?;
+        tx_metadata.resize(PACKET_QUEUE_LEN, PacketMetadata::EMPTY);
+        let mut tx_storage = Vec::new();
+        tx_storage
+            .try_reserve_exact(mtu.saturating_mul(PACKET_QUEUE_LEN))
+            .map_err(|_| AxError::NoMemory)?;
+        tx_storage.resize(mtu.saturating_mul(PACKET_QUEUE_LEN), 0);
+        let tx_buffer = PacketBuffer::new(tx_metadata, tx_storage);
+        Ok(Self {
             rx_buffer,
             tx_buffer,
             mtu,
             devices: Vec::new(),
             table: RouteTable::new(),
             listen_table,
-        }
+        })
     }
 
     pub fn add_rule(&mut self, rule: Rule) {

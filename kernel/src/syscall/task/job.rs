@@ -1,8 +1,24 @@
 use axerrno::{AxError, AxResult, LinuxError};
+use axsync::Mutex;
 use axtask::current;
-use starry_process::Pid;
+use starry_process::{Pid, ProcessError};
 
-use crate::task::{AsThread, get_process_data, get_process_group, remember_process_group};
+use crate::task::{
+    AsThread, get_process_data, get_process_group, prepare_new_process_group_table_admission,
+    prepare_new_session_table_admission,
+};
+
+/// Serializes process-group/session identity admission with the corresponding
+/// Starry membership mutation. These syscalls are cold paths, and a sleepable
+/// mutex avoids holding a spin lock across object construction.
+static JOB_CONTROL_OPERATION: Mutex<()> = Mutex::new(());
+
+fn process_error(error: ProcessError) -> AxError {
+    match error {
+        ProcessError::NoMemory | ProcessError::Capacity => AxError::NoMemory,
+        ProcessError::AlreadyExists => AxError::AlreadyExists,
+    }
+}
 
 pub fn sys_getsid(pid: Pid) -> AxResult<isize> {
     let pid = if pid == 0 {
@@ -14,14 +30,16 @@ pub fn sys_getsid(pid: Pid) -> AxResult<isize> {
 }
 
 pub fn sys_setsid() -> AxResult<isize> {
+    let _operation = JOB_CONTROL_OPERATION.lock();
     let curr = current();
     let proc = &curr.as_thread().proc_data.proc;
     if proc.group().pgid() == proc.pid() {
         return Err(AxError::OperationNotPermitted);
     }
 
-    if let Some((session, group)) = proc.create_session() {
-        remember_process_group(&group);
+    let admission = prepare_new_session_table_admission(proc.pid())?;
+    if let Some((session, group)) = proc.try_create_session().map_err(process_error)? {
+        admission.commit(&group, &session);
         Ok(session.sid() as _)
     } else {
         Ok(proc.pid() as _)
@@ -38,6 +56,7 @@ pub fn sys_getpgid(pid: Pid) -> AxResult<isize> {
 }
 
 pub fn sys_setpgid(pid: i32, pgid: i32) -> AxResult<isize> {
+    let _operation = JOB_CONTROL_OPERATION.lock();
     let curr = current();
     let caller = &curr.as_thread().proc_data.proc;
 
@@ -73,8 +92,13 @@ pub fn sys_setpgid(pid: i32, pgid: i32) -> AxResult<isize> {
 
     let pgid = if pgid == 0 { proc.pid() } else { pgid as Pid };
     if pgid == proc.pid() {
-        if let Some(group) = proc.create_group() {
-            remember_process_group(&group);
+        if proc.group().pgid() == pgid {
+            return Ok(0);
+        }
+        let session = proc.group().session();
+        let admission = prepare_new_process_group_table_admission(pgid, &session)?;
+        if let Some(group) = proc.try_create_group().map_err(process_error)? {
+            admission.commit(&group, &session);
         }
         return Ok(0);
     }

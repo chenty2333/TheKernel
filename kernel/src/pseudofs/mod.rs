@@ -10,7 +10,7 @@ mod proc;
 mod sys;
 pub(crate) mod tmp;
 
-use alloc::{string::ToString, sync::Arc};
+use alloc::sync::Arc;
 
 use axerrno::LinuxResult;
 use axfs::{FS_CONTEXT, FsContext};
@@ -59,19 +59,12 @@ fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> LinuxResult<()>
         fs.create_dir(path, DIR_PERMISSION)?;
     }
     let target = fs.resolve(path)?;
-    let parent_id = target.mountpoint().mount_id();
-    let mountpoint = target.mount(&mount_fs)?;
-    let fs_type = mount_fs.name().to_string();
-    mounts::record(
-        fs_type.clone(),
-        path.to_string(),
-        fs_type,
-        "/".to_string(),
-        mountpoint.device(),
-        mountpoint.mount_id(),
-        parent_id,
+    let mountpoint = mounts::new_detached_with_flags(
+        &mount_fs,
         0,
-    );
+        mounts::MountMetadata::try_from_strs(mount_fs.name(), mount_fs.name(), "/", "")?,
+    )?;
+    mounts::attach_tree_and_record(&mountpoint, &target)?;
     info!("Mounted {} at {}", mount_fs.name(), path);
     Ok(())
 }
@@ -86,12 +79,12 @@ pub fn mount_all() -> LinuxResult<()> {
     mount_at(
         &fs,
         "/dev/shm",
-        tmp::MemoryFs::new_with_permission(tmp_permission),
+        tmp::MemoryFs::new_with_permission(tmp_permission)?,
     )?;
     mount_at(
         &fs,
         "/tmp",
-        tmp::MemoryFs::new_with_permission(tmp_permission),
+        tmp::MemoryFs::new_with_permission(tmp_permission)?,
     )?;
     if fs.resolve("/var").is_err() {
         fs.create_dir("/var", DIR_PERMISSION)?;
@@ -102,7 +95,7 @@ pub fn mount_all() -> LinuxResult<()> {
         tmp::MemoryFs::new_with_permission_and_capacity(
             tmp_permission,
             Some(VAR_TMP_CAPACITY_BYTES),
-        ),
+        )?,
     )?;
     mount_at(&fs, "/proc", proc::new_procfs())?;
 

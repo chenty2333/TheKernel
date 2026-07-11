@@ -139,6 +139,10 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
  */
 int ext4_fs_fini(struct ext4_fs *fs);
 
+/** Mark a filesystem shutdown as unclean after an unrecoverable metadata
+ * error. Unlike ext4_fs_fini(), this preserves the on-disk ERROR_FS state. */
+int ext4_fs_fini_error(struct ext4_fs *fs);
+
 /**@brief Check filesystem's features, if supported by this driver
  * Function can return EOK and set read_only flag. It mean's that
  * there are some not-supported features, that can cause problems
@@ -201,6 +205,13 @@ uint32_t ext4_fs_correspond_inode_mode(int filetype);
 int ext4_fs_alloc_inode(struct ext4_fs *fs, struct ext4_inode_ref *inode_ref,
 			int filetype);
 
+/** Allocate and initialize an inode, reporting whether allocation metadata may
+ * have changed before an error was returned. */
+int ext4_fs_alloc_inode_status(struct ext4_fs *fs,
+			       struct ext4_inode_ref *inode_ref,
+			       int filetype,
+			       bool *metadata_may_have_changed);
+
 /**@brief Release i-node and mark it as free.
  * @param inode_ref I-node to be released
  * @return Error code
@@ -249,6 +260,13 @@ int ext4_fs_get_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
 int ext4_fs_init_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
 				  ext4_lblk_t iblock, ext4_fsblk_t *fblock);
 
+/** Initialize a data-block mapping and report whether allocation, data, or
+ * mapping metadata may have changed before an error was returned. */
+int ext4_fs_init_inode_dblk_idx_status(struct ext4_inode_ref *inode_ref,
+				       ext4_lblk_t iblock,
+				       ext4_fsblk_t *fblock,
+				       bool *metadata_may_have_changed);
+
 /**@brief Append following logical block to the i-node.
  * @param inode_ref I-node to append block to
  * @param fblock    Output physical block address of newly allocated block
@@ -257,6 +275,13 @@ int ext4_fs_init_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
  */
 int ext4_fs_append_inode_dblk(struct ext4_inode_ref *inode_ref,
 			      ext4_fsblk_t *fblock, ext4_lblk_t *iblock);
+
+/** Append a data block and report whether allocation or inode metadata may
+ * have changed before an error was returned. */
+int ext4_fs_append_inode_dblk_status(struct ext4_inode_ref *inode_ref,
+				     ext4_fsblk_t *fblock,
+				     ext4_lblk_t *iblock,
+				     bool *metadata_may_have_changed);
 
 /**@brief   Increment inode link count.
  * @param   inode_ref none handle

@@ -5,6 +5,7 @@
 //! `std::fs`-like APIs.
 
 #![cfg_attr(all(not(test), not(doc)), no_std)]
+#![feature(allocator_api)]
 #![feature(doc_cfg)]
 #![allow(clippy::new_ret_no_self)]
 
@@ -24,7 +25,10 @@ use axsync::Mutex;
 use spin::Once;
 
 mod fs;
-pub use fs::FatMountOptions;
+pub use fs::{
+    FatMountOptions, drain_deferred_filesystem_finalizers,
+    has_deferred_filesystem_finalizer_work, set_deferred_filesystem_finalizer_waker,
+};
 
 mod highlevel;
 pub use highlevel::*;
@@ -1065,5 +1069,9 @@ pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
     info!("  filesystem type: {:?}", fs.name());
 
     let mp = axfs_ng_vfs::Mountpoint::new_root(&fs);
-    ROOT_FS_CONTEXT.call_once(|| FsContext::new(mp.root_location()));
+    let root_context = FsContext::new(mp.root_location());
+    ROOT_FS_CONTEXT.call_once(|| root_context.clone());
+    let shared = Arc::try_new(Mutex::new(root_context))
+        .expect("Failed to allocate root filesystem scope context");
+    ROOT_FS_SCOPE_CONTEXT.call_once(|| shared);
 }

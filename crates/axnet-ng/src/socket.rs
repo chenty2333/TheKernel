@@ -77,6 +77,8 @@ bitflags! {
     /// See [`SocketOps::send`].
     #[derive(Default, Debug, Clone, Copy)]
     pub struct SendFlags: u32 {
+        /// Do not wait for transmit capacity for this operation.
+        const DONT_WAIT = 0x01;
     }
 }
 
@@ -92,11 +94,49 @@ bitflags! {
         /// the real size of the datagram, even when it is larger than the
         /// buffer.
         const TRUNCATE = 0x02;
+        /// Do not wait for receive data for this operation.
+        const DONT_WAIT = 0x04;
     }
 }
 
 /// Type alias for ancillary control message data.
-pub type CMsgData = Box<dyn Any + Send + Sync>;
+/// Opaque ancillary data plus the amount of socket-buffer capacity retained
+/// by it.  The transport must account the charge for as long as the message is
+/// queued; otherwise zero-length datagrams carrying resource references can
+/// bypass ordinary payload-byte limits.
+pub struct CMsgData {
+    value: Box<dyn Any + Send + Sync>,
+    charge: usize,
+}
+
+impl CMsgData {
+    /// Wrap already allocated, type-erased ancillary data.
+    pub fn new<T: Any + Send + Sync>(value: Box<T>, charge: usize) -> Self {
+        Self { value, charge }
+    }
+
+    /// Returns the socket-buffer charge associated with this message.
+    pub const fn charge(&self) -> usize {
+        self.charge
+    }
+
+    /// Attempts to recover the concrete ancillary value.
+    pub fn downcast<T: Any + Send + Sync>(self) -> Result<Box<T>, Self> {
+        let Self { value, charge } = self;
+        match value.downcast::<T>() {
+            Ok(value) => Ok(value),
+            Err(value) => Err(Self { value, charge }),
+        }
+    }
+}
+
+impl Debug for CMsgData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CMsgData")
+            .field("charge", &self.charge)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Options for sending data to a socket.
 ///
@@ -222,6 +262,18 @@ impl Pollable for Socket {
 }
 
 impl Socket {
+    /// Stores an error for one-shot SO_ERROR reporting and the next operation
+    /// that consumes deferred socket errors.
+    pub fn set_pending_error(&self, error: LinuxError) {
+        match self {
+            Socket::Tcp(tcp) => tcp.set_pending_error(error),
+            Socket::Udp(udp) => udp.set_pending_error(error),
+            Socket::Unix(unix) => unix.set_pending_error(error),
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(vsock) => vsock.set_pending_error(error),
+        }
+    }
+
     pub fn set_filter(&self, filter: Option<Arc<dyn SocketFilter>>) -> AxResult<()> {
         match self {
             Socket::Unix(unix) => unix.set_filter(filter),

@@ -45,15 +45,13 @@ path = "tests/session.rs"
 [dependencies.kspin]
 version = "0.1"
 
+[dependencies.intrusive-collections]
+version = "0.9"
+
 [dependencies.lazyinit]
 version = "0.2.1"
 
-[dependencies.weak-map]
-version = "0.1"
-
-[dev-dependencies.ctor]
-version = "0.4.1"
-
-[dev-dependencies.kspin]
-version = "0.1"
-features = ["smp"]
+[dependencies.spin]
+version = "0.10"
+features = ["lazy"]
+default-features = false

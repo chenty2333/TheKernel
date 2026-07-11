@@ -184,6 +184,10 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     thr.enter_syscall(uctx, preserve_restart_state, restart_class);
 
     let result = dispatch::dispatch_syscall(sysno, uctx);
+    // Syscalls such as close, munmap, execve, and umount may release the final
+    // filesystem identity. All syscall-local handles have been dropped by this
+    // point, and policy work is safe in the current task context.
+    axtask::run_deferred_work();
     maybe_request_syscall_restart(thr, &result);
     debug!("Syscall {sysno} return {result:?}");
 

@@ -7,8 +7,8 @@ use alloc::{
 };
 
 use axfs_ng_vfs::{
-    Location, Metadata, NodePermission, NodeType, OpenOptions as VfsOpenOptions, VfsError,
-    VfsResult,
+    Location, Metadata, NodeFlags, NodePermission, NodeType, OpenOptions as VfsOpenOptions,
+    VfsError, VfsResult,
     path::{Component, Components, Path, PathBuf},
 };
 use axio::{Read, Write};
@@ -19,6 +19,50 @@ use super::File;
 
 /// Maximum number of symlinks that will be followed during path resolution.
 pub const SYMLINKS_MAX: usize = 40;
+
+/// Per-walk policy hooks for topology-sensitive path resolution.
+///
+/// The VFS reports generic traversal events; callers decide whether a
+/// symlink, mount edge, absolute restart, or attempted root escape is allowed.
+/// This keeps ABI-specific policies such as `openat2(2)` out of the generic
+/// resolver while ensuring policy and lookup share one walk.
+pub trait PathwalkPolicy {
+    fn observe_mount_access(&self) -> bool {
+        true
+    }
+
+    fn follow_magic_link(&mut self, _link: &Location) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn follow_symlink(&mut self, _link: &Location) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn cross_mount(&mut self, _from: &Location, _to: &Location) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn absolute_root(&mut self, _from: &Location, _root: &Location) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn escape_root(&mut self, _root: &Location) -> VfsResult<()> {
+        Ok(())
+    }
+}
+
+struct AllowPathwalkPolicy;
+
+impl PathwalkPolicy for AllowPathwalkPolicy {}
+
+struct UnobservedPathwalkPolicy;
+
+impl PathwalkPolicy for UnobservedPathwalkPolicy {
+    fn observe_mount_access(&self) -> bool {
+        false
+    }
+}
 
 fn allow_pathwalk(_dir: &Location) -> VfsResult<()> {
     Ok(())
@@ -31,18 +75,18 @@ pub(crate) fn path_requires_directory(path: &Path) -> bool {
 
 /// Global root filesystem context, initialized once during [`init_filesystems`](crate::init_filesystems).
 pub static ROOT_FS_CONTEXT: Once<FsContext> = Once::new();
+pub(crate) static ROOT_FS_SCOPE_CONTEXT: Once<Arc<Mutex<FsContext>>> = Once::new();
 static SYMLINK_FOLLOW_POLICY: Once<fn(&Location) -> bool> = Once::new();
 static ATIME_UPDATE_POLICY: Once<fn(&Location) -> bool> = Once::new();
+static MOUNT_ACCESS_POLICY: Once<fn(&Location)> = Once::new();
 
 scope_local::scope_local! {
     /// Task-local filesystem context, defaulting to a clone of [`ROOT_FS_CONTEXT`].
     pub static FS_CONTEXT: Arc<Mutex<FsContext>> =
-        Arc::new(Mutex::new(
-            ROOT_FS_CONTEXT
-                .get()
-                .expect("Root FS context not initialized")
-                .clone(),
-        ));
+        ROOT_FS_SCOPE_CONTEXT
+            .get()
+            .expect("Root FS scope context not initialized")
+            .clone();
 }
 
 /// A single entry returned by [`FsContext::read_dir`].
@@ -71,6 +115,37 @@ impl FsContext {
 
     pub(crate) fn should_update_atime(loc: &Location) -> bool {
         ATIME_UPDATE_POLICY.get().is_none_or(|policy| policy(loc))
+    }
+
+    fn note_mount_access(loc: &Location) {
+        if let Some(policy) = MOUNT_ACCESS_POLICY.get() {
+            policy(loc);
+        }
+    }
+
+    fn note_mount_access_with_policy<P: PathwalkPolicy + ?Sized>(loc: &Location, policy: &P) {
+        if policy.observe_mount_access() {
+            Self::note_mount_access(loc);
+        }
+    }
+
+    fn lookup_no_follow_with_policy<P: PathwalkPolicy + ?Sized>(
+        dir: &Location,
+        name: &str,
+        policy: &mut P,
+    ) -> VfsResult<Location> {
+        let loc = match dir.lookup_no_follow(name) {
+            Ok(loc) => loc,
+            Err(err) => {
+                Self::note_mount_access_with_policy(dir, policy);
+                return Err(err);
+            }
+        };
+        if !Arc::ptr_eq(dir.mountpoint(), loc.mountpoint()) {
+            policy.cross_mount(dir, &loc)?;
+            Self::note_mount_access_with_policy(&loc, policy);
+        }
+        Ok(loc)
     }
 
     /// Returns whether an absolute path resolves to this context's root entry.
@@ -145,49 +220,73 @@ impl FsContext {
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
     {
+        self.try_resolve_symlink_with_policy(loc, follow_count, admission, &mut AllowPathwalkPolicy)
+    }
+
+    pub fn try_resolve_symlink_with_policy<F, P>(
+        &self,
+        loc: Location,
+        follow_count: &mut usize,
+        admission: &mut F,
+        policy: &mut P,
+    ) -> VfsResult<Location>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        P: PathwalkPolicy + ?Sized,
+    {
         if loc.node_type() != NodeType::Symlink {
             return Ok(loc);
         }
-        if !Self::may_follow_symlink(&loc) {
+        if !Self::may_follow_symlink(&loc) || *follow_count >= SYMLINKS_MAX {
             return Err(VfsError::FilesystemLoop);
         }
-        if *follow_count >= SYMLINKS_MAX {
-            return Err(VfsError::FilesystemLoop);
+        if loc.flags().contains(NodeFlags::MAGIC_LINK) {
+            policy.follow_magic_link(&loc)?;
         }
+        policy.follow_symlink(&loc)?;
         *follow_count += 1;
         let target = loc.read_link()?;
         if target.is_empty() {
             return Err(VfsError::NotFound);
         }
-        self.resolve_path_with_admission(Path::new(&target), follow_count, admission)
+        let target = Path::new(&target);
+        self.resolve_path_with_policy(target, follow_count, admission, policy)
     }
 
-    fn lookup_with_admission<F>(
+    fn lookup_with_policy<F, P>(
         &self,
         dir: &Location,
         name: &str,
         follow_count: &mut usize,
         admission: &mut F,
+        policy: &mut P,
     ) -> VfsResult<Location>
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        P: PathwalkPolicy + ?Sized,
     {
         admission(dir)?;
-        let loc = dir.lookup_no_follow(name)?;
+        let loc = Self::lookup_no_follow_with_policy(dir, name, policy)?;
+        if loc.node_type() != NodeType::Symlink && loc.flags().contains(NodeFlags::MAGIC_LINK) {
+            policy.follow_magic_link(&loc)?;
+        }
         self.with_current_dir(dir.clone())?
-            .try_resolve_symlink_with_admission(loc, follow_count, admission)
+            .try_resolve_symlink_with_policy(loc, follow_count, admission, policy)
     }
 
-    fn resolve_components_with_admission<F>(
+    fn resolve_components_with_policy<F, P>(
         &self,
         components: Components,
         follow_count: &mut usize,
         admission: &mut F,
+        policy: &mut P,
     ) -> VfsResult<Location>
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        P: PathwalkPolicy + ?Sized,
     {
         let mut dir = self.current_dir.clone();
+        Self::note_mount_access_with_policy(&dir, policy);
         for comp in components {
             match comp {
                 Component::CurDir => {
@@ -197,30 +296,49 @@ impl FsContext {
                 Component::ParentDir => {
                     dir.check_is_dir()?;
                     admission(&dir)?;
-                    if !dir.ptr_eq(&self.root_dir) {
-                        dir = dir.parent().unwrap_or_else(|| self.root_dir.clone());
+                    if dir.ptr_eq(&self.root_dir) {
+                        policy.escape_root(&dir)?;
+                    } else {
+                        let parent = dir.parent().unwrap_or_else(|| self.root_dir.clone());
+                        let crossed_mount = !Arc::ptr_eq(dir.mountpoint(), parent.mountpoint());
+                        if crossed_mount {
+                            policy.cross_mount(&dir, &parent)?;
+                        }
+                        dir = parent;
+                        if crossed_mount {
+                            Self::note_mount_access_with_policy(&dir, policy);
+                        }
                     }
                 }
                 Component::RootDir => {
+                    policy.absolute_root(&dir, &self.root_dir)?;
+                    let crossed_mount = !Arc::ptr_eq(dir.mountpoint(), self.root_dir.mountpoint());
+                    if crossed_mount {
+                        policy.cross_mount(&dir, &self.root_dir)?;
+                    }
                     dir = self.root_dir.clone();
+                    if crossed_mount {
+                        Self::note_mount_access_with_policy(&dir, policy);
+                    }
                 }
                 Component::Normal(name) => {
-                    dir =
-                        self.lookup_with_admission(&dir, name, follow_count, admission)?;
+                    dir = self.lookup_with_policy(&dir, name, follow_count, admission, policy)?;
                 }
             }
         }
         Ok(dir)
     }
 
-    fn resolve_inner_with_admission<'a, F>(
+    fn resolve_inner_with_policy<'a, F, P>(
         &self,
         path: &'a Path,
         follow_count: &mut usize,
         admission: &mut F,
+        policy: &mut P,
     ) -> VfsResult<(Location, Option<&'a str>)>
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        P: PathwalkPolicy + ?Sized,
     {
         let entry_name = path.file_name();
         let mut components = path.components();
@@ -228,7 +346,7 @@ impl FsContext {
             components.next_back();
         }
         let dir =
-            self.resolve_components_with_admission(components, follow_count, admission)?;
+            self.resolve_components_with_policy(components, follow_count, admission, policy)?;
         dir.check_is_dir()?;
         Ok((dir, entry_name))
     }
@@ -251,35 +369,59 @@ impl FsContext {
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
     {
-        let mut follow_count = 0;
-        self.resolve_path_with_admission(path.as_ref(), &mut follow_count, admission)
+        self.resolve_with_policy(path, admission, &mut AllowPathwalkPolicy)
     }
 
-    fn resolve_path_with_admission<F>(
+    /// Resolves a path without publishing mount-activity observations.
+    ///
+    /// This is reserved for control operations, such as an expiration probe,
+    /// whose own target lookup must not count as user activity.
+    pub fn resolve_with_admission_unobserved<F>(
         &self,
-        path: &Path,
-        follow_count: &mut usize,
+        path: impl AsRef<Path>,
         admission: &mut F,
     ) -> VfsResult<Location>
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
     {
-        let (dir, name) =
-            self.resolve_inner_with_admission(path, follow_count, admission)?;
+        self.resolve_with_policy(path, admission, &mut UnobservedPathwalkPolicy)
+    }
+
+    pub fn resolve_with_policy<F, P>(
+        &self,
+        path: impl AsRef<Path>,
+        admission: &mut F,
+        policy: &mut P,
+    ) -> VfsResult<Location>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        P: PathwalkPolicy + ?Sized,
+    {
+        let mut follow_count = 0;
+        self.resolve_path_with_policy(path.as_ref(), &mut follow_count, admission, policy)
+    }
+
+    fn resolve_path_with_policy<F, P>(
+        &self,
+        path: &Path,
+        follow_count: &mut usize,
+        admission: &mut F,
+        policy: &mut P,
+    ) -> VfsResult<Location>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        P: PathwalkPolicy + ?Sized,
+    {
+        let (dir, name) = self.resolve_inner_with_policy(path, follow_count, admission, policy)?;
         let loc = match name {
-            Some(name) => self.lookup_with_admission(&dir, name, follow_count, admission),
+            Some(name) => self.lookup_with_policy(&dir, name, follow_count, admission, policy),
             None => Ok(dir),
         }?;
         if path_requires_directory(path) {
             loc.check_is_dir()?;
-            let final_component_is_dot = path
-                .as_str()
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                == Some(".");
-            if final_component_is_dot && path.file_name().is_some()
-            {
+            let final_component_is_dot =
+                path.as_str().trim_end_matches('/').rsplit('/').next() == Some(".");
+            if final_component_is_dot && path.file_name().is_some() {
                 admission(&loc)?;
             }
         }
@@ -301,18 +443,46 @@ impl FsContext {
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
     {
+        self.resolve_no_follow_with_policy(path, admission, &mut AllowPathwalkPolicy)
+    }
+
+    /// Resolves a path without following its final symlink or publishing
+    /// mount-activity observations.
+    pub fn resolve_no_follow_with_admission_unobserved<F>(
+        &self,
+        path: impl AsRef<Path>,
+        admission: &mut F,
+    ) -> VfsResult<Location>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+    {
+        self.resolve_no_follow_with_policy(path, admission, &mut UnobservedPathwalkPolicy)
+    }
+
+    pub fn resolve_no_follow_with_policy<F, P>(
+        &self,
+        path: impl AsRef<Path>,
+        admission: &mut F,
+        policy: &mut P,
+    ) -> VfsResult<Location>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        P: PathwalkPolicy + ?Sized,
+    {
         let path = path.as_ref();
         if path_requires_directory(path) {
-            return self.resolve_with_admission(path, admission);
+            let mut follow_count = 0;
+            return self.resolve_path_with_policy(path, &mut follow_count, admission, policy);
         }
-        let (dir, name) = self.resolve_inner_with_admission(path, &mut 0, admission)?;
-        match name {
+        let (dir, name) = self.resolve_inner_with_policy(path, &mut 0, admission, policy)?;
+        let loc = match name {
             Some(name) => {
                 admission(&dir)?;
-                dir.lookup_no_follow(name)
+                Self::lookup_no_follow_with_policy(&dir, name, policy)
             }
             None => Ok(dir),
-        }
+        }?;
+        Ok(loc)
     }
 
     pub(crate) fn resolve_open_with_admission<F, C>(
@@ -325,20 +495,46 @@ impl FsContext {
     ) -> VfsResult<(Location, bool)>
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
-        C: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        C: FnMut(&Location, &mut VfsOpenOptions) -> VfsResult<()> + ?Sized,
+    {
+        self.resolve_open_with_policy(
+            path,
+            options,
+            follow_final_symlink,
+            admission,
+            create_admission,
+            &mut AllowPathwalkPolicy,
+        )
+    }
+
+    pub(crate) fn resolve_open_with_policy<F, C, P>(
+        &self,
+        path: &Path,
+        options: &VfsOpenOptions,
+        follow_final_symlink: bool,
+        admission: &mut F,
+        create_admission: &mut C,
+        policy: &mut P,
+    ) -> VfsResult<(Location, bool)>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        C: FnMut(&Location, &mut VfsOpenOptions) -> VfsResult<()> + ?Sized,
+        P: PathwalkPolicy + ?Sized,
     {
         let mut follow_count = 0;
-        self.resolve_open_inner(
+        let result = self.resolve_open_inner(
             path,
             options,
             follow_final_symlink,
             &mut follow_count,
             admission,
             create_admission,
-        )
+            policy,
+        )?;
+        Ok(result)
     }
 
-    fn resolve_open_inner<F, C>(
+    fn resolve_open_inner<F, C, P>(
         &self,
         path: &Path,
         options: &VfsOpenOptions,
@@ -346,41 +542,41 @@ impl FsContext {
         follow_count: &mut usize,
         admission: &mut F,
         create_admission: &mut C,
+        policy: &mut P,
     ) -> VfsResult<(Location, bool)>
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
-        C: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        C: FnMut(&Location, &mut VfsOpenOptions) -> VfsResult<()> + ?Sized,
+        P: PathwalkPolicy + ?Sized,
     {
         if path.as_str().is_empty() {
             return Err(VfsError::NotFound);
         }
 
         if path.file_name().is_none() {
-            let loc = self.resolve_path_with_admission(path, follow_count, admission)?;
+            let loc = self.resolve_path_with_policy(path, follow_count, admission, policy)?;
             if options.create_new {
                 return Err(VfsError::AlreadyExists);
             }
             return Ok((loc, false));
         }
 
-        let (parent, name) = match self.resolve_parent_with_admission_at_count(
-            path,
-            follow_count,
-            admission,
-        ) {
-            Ok(parent_and_name) => parent_and_name,
-            Err(VfsError::InvalidInput) => {
-                let loc = self.resolve_path_with_admission(path, follow_count, admission)?;
-                if options.create_new {
-                    return Err(VfsError::AlreadyExists);
+        let (parent, name) =
+            match self.resolve_parent_with_policy_at_count(path, follow_count, admission, policy) {
+                Ok(parent_and_name) => parent_and_name,
+                Err(VfsError::InvalidInput) => {
+                    let loc =
+                        self.resolve_path_with_policy(path, follow_count, admission, policy)?;
+                    if options.create_new {
+                        return Err(VfsError::AlreadyExists);
+                    }
+                    return Ok((loc, false));
                 }
-                return Ok((loc, false));
-            }
-            Err(err) => return Err(err),
-        };
+                Err(err) => return Err(err),
+            };
         admission(&parent)?;
 
-        let loc = match parent.lookup_no_follow(&name) {
+        let loc = match Self::lookup_no_follow_with_policy(&parent, &name, policy) {
             Ok(loc) => {
                 if options.create_new {
                     return Err(VfsError::AlreadyExists);
@@ -391,8 +587,13 @@ impl FsContext {
                 if path_requires_directory(path) {
                     return Err(VfsError::IsADirectory);
                 }
-                create_admission(&parent)?;
-                let (loc, created) = parent.open_file_with_status(&name, options)?;
+                let mut create_options = options.clone();
+                create_admission(&parent, &mut create_options)?;
+                let (loc, created) = parent.open_file_with_status(&name, &create_options)?;
+                if !Arc::ptr_eq(parent.mountpoint(), loc.mountpoint()) {
+                    policy.cross_mount(&parent, &loc)?;
+                    Self::note_mount_access_with_policy(&loc, policy);
+                }
                 if created {
                     return Ok((loc, true));
                 }
@@ -402,31 +603,39 @@ impl FsContext {
         };
 
         let requires_directory = path_requires_directory(path);
+        if follow_final_symlink
+            && loc.node_type() != NodeType::Symlink
+            && loc.flags().contains(NodeFlags::MAGIC_LINK)
+        {
+            policy.follow_magic_link(&loc)?;
+        }
         if (follow_final_symlink || requires_directory) && loc.node_type() == NodeType::Symlink {
             if !Self::may_follow_symlink(&loc) || *follow_count >= SYMLINKS_MAX {
                 return Err(VfsError::FilesystemLoop);
             }
+            if loc.flags().contains(NodeFlags::MAGIC_LINK) {
+                policy.follow_magic_link(&loc)?;
+            }
+            policy.follow_symlink(&loc)?;
             *follow_count += 1;
             let target = loc.read_link()?;
             if target.is_empty() {
                 return Err(VfsError::NotFound);
             }
+            let target = Path::new(&target);
             let result = self.with_current_dir(parent)?.resolve_open_inner(
-                Path::new(&target),
+                target,
                 options,
                 follow_final_symlink,
                 follow_count,
                 admission,
                 create_admission,
+                policy,
             )?;
             if requires_directory {
                 result.0.check_is_dir()?;
-                let final_component_is_dot = path
-                    .as_str()
-                    .trim_end_matches('/')
-                    .rsplit('/')
-                    .next()
-                    == Some(".");
+                let final_component_is_dot =
+                    path.as_str().trim_end_matches('/').rsplit('/').next() == Some(".");
                 if final_component_is_dot && path.file_name().is_some() {
                     admission(&result.0)?;
                 }
@@ -436,12 +645,8 @@ impl FsContext {
 
         if requires_directory {
             loc.check_is_dir()?;
-            let final_component_is_dot = path
-                .as_str()
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                == Some(".");
+            let final_component_is_dot =
+                path.as_str().trim_end_matches('/').rsplit('/').next() == Some(".");
             if final_component_is_dot && path.file_name().is_some() {
                 admission(&loc)?;
             }
@@ -468,24 +673,43 @@ impl FsContext {
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
     {
-        self.resolve_parent_with_admission_at_count(path, &mut 0, admission)
+        self.resolve_parent_with_policy(path, admission, &mut AllowPathwalkPolicy)
     }
 
-    fn resolve_parent_with_admission_at_count<'a, F>(
+    pub fn resolve_parent_with_policy<'a, F, P>(
+        &self,
+        path: &'a Path,
+        admission: &mut F,
+        policy: &mut P,
+    ) -> VfsResult<(Location, Cow<'a, str>)>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        P: PathwalkPolicy + ?Sized,
+    {
+        self.resolve_parent_with_policy_at_count(path, &mut 0, admission, policy)
+    }
+
+    fn resolve_parent_with_policy_at_count<'a, F, P>(
         &self,
         path: &'a Path,
         follow_count: &mut usize,
         admission: &mut F,
+        policy: &mut P,
     ) -> VfsResult<(Location, Cow<'a, str>)>
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        P: PathwalkPolicy + ?Sized,
     {
-        let (dir, name) = self.resolve_inner_with_admission(path, follow_count, admission)?;
+        let (dir, name) = self.resolve_inner_with_policy(path, follow_count, admission, policy)?;
         if let Some(name) = name {
             Ok((dir, Cow::Borrowed(name)))
         } else if dir.ptr_eq(&self.root_dir) {
             Err(VfsError::InvalidInput)
         } else if let Some(parent) = dir.parent() {
+            if !Arc::ptr_eq(dir.mountpoint(), parent.mountpoint()) {
+                policy.cross_mount(&dir, &parent)?;
+                Self::note_mount_access_with_policy(&parent, policy);
+            }
             Ok((parent, Cow::Owned(dir.name().to_owned())))
         } else {
             Err(VfsError::InvalidInput)
@@ -512,7 +736,8 @@ impl FsContext {
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
     {
-        let (dir, name) = self.resolve_inner_with_admission(path, &mut 0, admission)?;
+        let (dir, name) =
+            self.resolve_inner_with_policy(path, &mut 0, admission, &mut AllowPathwalkPolicy)?;
         if let Some(name) = name {
             Ok((dir, name))
         } else if path.is_absolute() && dir.ptr_eq(&self.root_dir) {
@@ -628,12 +853,17 @@ impl FsContext {
         link_path: impl AsRef<Path>,
     ) -> VfsResult<Location> {
         let (dir, name) = self.resolve_nonexistent(link_path.as_ref())?;
-        if dir.lookup_no_follow(name).is_ok() {
-            return Err(VfsError::AlreadyExists);
+        match dir.lookup_no_follow(name) {
+            Ok(_) => return Err(VfsError::AlreadyExists),
+            Err(err) if err.canonicalize() == VfsError::NotFound => {}
+            Err(err) => return Err(err),
         }
-        let symlink = dir.create(name, NodeType::Symlink, NodePermission::default())?;
-        symlink.entry().as_file()?.set_symlink(target.as_ref())?;
-        Ok(symlink)
+        dir.create_symlink(
+            name,
+            target.as_ref(),
+            NodePermission::from_bits_truncate(0o777),
+            None,
+        )
     }
 
     /// Returns the canonical, absolute form of a path.
@@ -653,6 +883,14 @@ pub fn set_symlink_follow_policy(policy: fn(&Location) -> bool) {
 /// Installs an optional access-time update policy used by high-level file I/O.
 pub fn set_atime_update_policy(policy: fn(&Location) -> bool) {
     ATIME_UPDATE_POLICY.call_once(|| policy);
+}
+
+/// Installs an observer for mount activity discovered by high-level path walks.
+///
+/// Observations are emitted at walk start, after a mount crossing, and when a
+/// component lookup fails in a mount.
+pub fn set_mount_access_policy(policy: fn(&Location)) {
+    MOUNT_ACCESS_POLICY.call_once(|| policy);
 }
 
 /// Iterator returned by [`FsContext::read_dir`].
@@ -713,7 +951,7 @@ mod tests {
     use core::{
         any::Any,
         mem::size_of,
-        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         task::Context,
         time::Duration,
     };
@@ -723,20 +961,46 @@ mod tests {
     };
 
     use axfs_ng_vfs::{
-        DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode, FileNodeOps, Filesystem,
-        FilesystemOps, Location, Metadata, MetadataUpdate, Mountpoint, NodeOps, NodePermission,
-        NodeType, Reference, StatFs, VfsError, VfsResult, WeakDirEntry, path::Path,
+        CreateDisposition, CreateOutcome, DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode,
+        FileNodeOps, Filesystem, FilesystemOps, Location, Metadata, MetadataUpdate,
+        MetadataUpdateCapabilities, Mountpoint, NamedCreateOptions, NodeOps, NodePermission,
+        NodeType, Reference, RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult,
+        WeakDirEntry, drain_deferred_dentry_cache_cleanup, path::Path,
     };
     use axpoll::{IoEvents, Pollable};
     use spin::Once;
 
-    use super::FsContext;
+    use super::{FsContext, PathwalkPolicy, set_mount_access_policy};
     use crate::OpenOptions;
 
     // Keep normal unmount as a consuming capability operation. In particular,
     // this must not silently regress to `fn(&Location)` where `Arc<Location>`
     // aliases would be invisible to the mount-handle strong count.
     const _: fn(Location) -> VfsResult<()> = Location::unmount;
+
+    static OBSERVED_MOUNT_ID: AtomicU64 = AtomicU64::new(0);
+    static OBSERVED_MOUNT_ACCESSES: AtomicUsize = AtomicUsize::new(0);
+    static DENTRY_CLEANUP_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn drain_all_dentry_cache_cleanup() {
+        for _ in 0..1_000_000 {
+            if !drain_deferred_dentry_cache_cleanup() {
+                return;
+            }
+        }
+        panic!("deferred dentry cleanup did not converge");
+    }
+
+    fn observe_selected_mount(loc: &Location) {
+        if loc.mountpoint().mount_id() == OBSERVED_MOUNT_ID.load(Ordering::Relaxed) {
+            OBSERVED_MOUNT_ACCESSES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn select_observed_mount(loc: &Location) {
+        OBSERVED_MOUNT_ID.store(loc.mountpoint().mount_id(), Ordering::Relaxed);
+        OBSERVED_MOUNT_ACCESSES.store(0, Ordering::Relaxed);
+    }
 
     struct TestFs {
         root: Once<DirEntry>,
@@ -836,6 +1100,10 @@ mod tests {
                 fragment_size: 4096,
                 mount_flags: 0,
             })
+        }
+
+        fn metadata_update_capabilities(&self) -> MetadataUpdateCapabilities {
+            MetadataUpdateCapabilities::empty()
         }
 
         fn flush(&self) -> VfsResult<()> {
@@ -1038,15 +1306,30 @@ mod tests {
             }
         }
 
-        fn create(
+        fn create_named(
             &self,
             name: &str,
-            node_type: NodeType,
-            _permission: NodePermission,
-        ) -> VfsResult<DirEntry> {
-            Ok(match node_type {
-                NodeType::Directory => self.child(name),
-                node_type => self.file(name, node_type, ""),
+            options: &NamedCreateOptions,
+            disposition: CreateDisposition,
+        ) -> VfsResult<CreateOutcome<DirEntry>> {
+            if disposition == CreateDisposition::OpenOrCreate {
+                match self.lookup(name) {
+                    Ok(entry) => {
+                        return Ok(CreateOutcome {
+                            entry,
+                            created: false,
+                        });
+                    }
+                    Err(VfsError::NotFound) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok(CreateOutcome {
+                entry: match options.node_type {
+                    NodeType::Directory => self.child(name),
+                    node_type => self.file(name, node_type, ""),
+                },
+                created: true,
             })
         }
 
@@ -1054,11 +1337,11 @@ mod tests {
             Err(VfsError::Unsupported)
         }
 
-        fn unlink(&self, _name: &str) -> VfsResult<()> {
+        fn unlink(&self, _request: UnlinkRequest<'_>) -> VfsResult<()> {
             Err(VfsError::Unsupported)
         }
 
-        fn rename(&self, _src_name: &str, _dst_dir: &DirNode, _dst_name: &str) -> VfsResult<()> {
+        fn rename(&self, _request: RenameRequest<'_>) -> VfsResult<()> {
             Err(VfsError::Unsupported)
         }
     }
@@ -1071,6 +1354,240 @@ mod tests {
 
         assert_eq!(first.device(), second.device());
         assert_ne!(first.mount_id(), second.mount_id());
+    }
+
+    #[test]
+    fn filesystems_with_shared_identity_share_identity_lifetime() {
+        let original = Filesystem::new(TestFs::new());
+        let identity = original.identity_weak();
+        let view = Filesystem::new_with_identity(TestFs::new(), original.identity());
+
+        assert_eq!(original.device(), view.device());
+        drop(original);
+        assert!(identity.upgrade().is_some());
+        drop(view);
+        assert!(identity.upgrade().is_none());
+    }
+
+    #[test]
+    fn root_cache_cleanup_waits_for_final_filesystem_view() {
+        let _cleanup_guard = DENTRY_CLEANUP_TEST_LOCK.lock().unwrap();
+        drain_all_dentry_cache_cleanup();
+        let backend = TestFs::new();
+        let filesystem = Filesystem::new(backend.clone());
+        let root = filesystem.root_dir();
+        let child_before = root.as_dir().unwrap().lookup("child").unwrap();
+        let view = Filesystem::new_view(backend, &filesystem);
+        let mount = Mountpoint::new_root(&filesystem);
+        let view_mount = Mountpoint::new_root(&view);
+
+        drop(mount);
+        drop(view_mount);
+        let child_after_mounts = root.as_dir().unwrap().lookup("child").unwrap();
+        assert!(child_after_mounts.ptr_eq(&child_before));
+
+        drop(view);
+        let child_after_view = root.as_dir().unwrap().lookup("child").unwrap();
+        assert!(child_after_view.ptr_eq(&child_before));
+
+        drop(filesystem);
+        let child_before_deferred_drain = root.as_dir().unwrap().lookup("child").unwrap();
+        assert!(child_before_deferred_drain.ptr_eq(&child_before));
+        drain_all_dentry_cache_cleanup();
+        let child_after_final_owner = root.as_dir().unwrap().lookup("child").unwrap();
+        assert!(!child_after_final_owner.ptr_eq(&child_before));
+        let uncached_child = root.as_dir().unwrap().lookup("child").unwrap();
+        assert!(!uncached_child.ptr_eq(&child_after_final_owner));
+        drain_all_dentry_cache_cleanup();
+    }
+
+    #[test]
+    fn shared_identity_keeps_root_cache_lifetimes_independent() {
+        let _cleanup_guard = DENTRY_CLEANUP_TEST_LOCK.lock().unwrap();
+        drain_all_dentry_cache_cleanup();
+        let first = Filesystem::new(TestFs::new());
+        let second = Filesystem::new_with_identity(TestFs::new(), first.identity());
+        assert_eq!(first.device(), second.device());
+
+        let first_root = first.root_dir();
+        let second_root = second.root_dir();
+        let first_child = first_root.as_dir().unwrap().lookup("child").unwrap();
+        let second_child = second_root.as_dir().unwrap().lookup("child").unwrap();
+        let first_mount = Mountpoint::new_root(&first);
+        let second_mount = Mountpoint::new_root(&second);
+
+        drop(first_mount);
+        drop(second_mount);
+        assert!(
+            first_root
+                .as_dir()
+                .unwrap()
+                .lookup("child")
+                .unwrap()
+                .ptr_eq(&first_child)
+        );
+        assert!(
+            second_root
+                .as_dir()
+                .unwrap()
+                .lookup("child")
+                .unwrap()
+                .ptr_eq(&second_child)
+        );
+
+        drop(first);
+        drain_all_dentry_cache_cleanup();
+        assert!(
+            !first_root
+                .as_dir()
+                .unwrap()
+                .lookup("child")
+                .unwrap()
+                .ptr_eq(&first_child)
+        );
+        assert!(
+            second_root
+                .as_dir()
+                .unwrap()
+                .lookup("child")
+                .unwrap()
+                .ptr_eq(&second_child)
+        );
+
+        drop(second);
+        drain_all_dentry_cache_cleanup();
+        assert!(
+            !second_root
+                .as_dir()
+                .unwrap()
+                .lookup("child")
+                .unwrap()
+                .ptr_eq(&second_child)
+        );
+    }
+
+    #[test]
+    fn deferred_root_cache_cleanup_is_bounded_and_clears_a_deep_wide_tree() {
+        let _cleanup_guard = DENTRY_CLEANUP_TEST_LOCK.lock().unwrap();
+        drain_all_dentry_cache_cleanup();
+        let filesystem = Filesystem::new(TestFs::new());
+        let root = filesystem.root_dir();
+        let mount = Mountpoint::new_root(&filesystem);
+        let mut frontier = vec![root];
+        let mut cached = Vec::new();
+
+        for _ in 0..9 {
+            let mut next = Vec::new();
+            for parent in frontier {
+                for name in ["child", "other"] {
+                    let child = parent.as_dir().unwrap().lookup(name).unwrap();
+                    cached.push(child.downgrade());
+                    next.push(child);
+                }
+            }
+            frontier = next;
+        }
+        drop(frontier);
+        drop(mount);
+        drop(filesystem);
+
+        assert!(cached.iter().all(|entry| entry.upgrade().is_some()));
+        assert!(drain_deferred_dentry_cache_cleanup());
+        assert!(cached.iter().any(|entry| entry.upgrade().is_some()));
+        drain_all_dentry_cache_cleanup();
+        assert!(cached.iter().all(|entry| entry.upgrade().is_none()));
+    }
+
+    #[test]
+    fn concurrent_root_cache_cleanup_does_not_lose_intrusive_work_items() {
+        const FILESYSTEMS: usize = 64;
+
+        let _cleanup_guard = DENTRY_CLEANUP_TEST_LOCK.lock().unwrap();
+        drain_all_dentry_cache_cleanup();
+        let start = Arc::new(Barrier::new(FILESYSTEMS + 1));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let mut producers = Vec::new();
+
+        for _ in 0..FILESYSTEMS {
+            let start = start.clone();
+            let finished = finished.clone();
+            producers.push(thread::spawn(move || {
+                let filesystem = Filesystem::new(TestFs::new());
+                let root = filesystem.root_dir();
+                let child = root.as_dir().unwrap().lookup("child").unwrap();
+                let child_weak = child.downgrade();
+                let mount = Mountpoint::new_root(&filesystem);
+                start.wait();
+                drop(mount);
+                drop(filesystem);
+                drop(child);
+                drop(root);
+                finished.fetch_add(1, Ordering::Release);
+                child_weak
+            }));
+        }
+
+        start.wait();
+        while finished.load(Ordering::Acquire) != FILESYSTEMS {
+            drain_deferred_dentry_cache_cleanup();
+            thread::yield_now();
+        }
+        drain_all_dentry_cache_cleanup();
+
+        let cached = producers
+            .into_iter()
+            .map(|producer| producer.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(cached.iter().all(|entry| entry.upgrade().is_none()));
+    }
+
+    #[test]
+    fn detached_mount_tree_becomes_visible_in_one_root_attachment() {
+        let context = TestFs::context();
+        let target = context.resolve("/child").unwrap();
+        let detached = Mountpoint::new_detached(&Filesystem::new(TestFs::new())).unwrap();
+        let detached_context = FsContext::new(detached.root_location());
+        let nested_target = detached_context.resolve("/child").unwrap();
+        let nested = nested_target
+            .mount(&Filesystem::new(TestFs::new()))
+            .unwrap();
+
+        assert!(!target.is_mountpoint());
+        assert!(!Arc::ptr_eq(
+            context.resolve("/child").unwrap().mountpoint(),
+            &detached
+        ));
+
+        detached.attach_to(&target).unwrap();
+
+        assert!(Arc::ptr_eq(
+            context.resolve("/child").unwrap().mountpoint(),
+            &detached
+        ));
+        assert!(Arc::ptr_eq(
+            context.resolve("/child/child").unwrap().mountpoint(),
+            &nested
+        ));
+    }
+
+    #[test]
+    fn mounted_dentry_cannot_be_unlinked_renamed_or_replaced() {
+        let context = TestFs::context();
+        let target = context.resolve("/child").unwrap();
+        target.mount(&Filesystem::new(TestFs::new())).unwrap();
+        context
+            .create_dir("/replacement", NodePermission::from_bits_truncate(0o755))
+            .unwrap();
+
+        assert_eq!(context.remove_dir("/child"), Err(VfsError::ResourceBusy));
+        assert_eq!(
+            context.rename("/child", "/renamed"),
+            Err(VfsError::ResourceBusy)
+        );
+        assert_eq!(
+            context.rename("/replacement", "/child"),
+            Err(VfsError::ResourceBusy)
+        );
     }
 
     #[test]
@@ -1091,6 +1608,53 @@ mod tests {
             .unwrap();
 
         assert_eq!(visited, ["/", "/child"]);
+    }
+
+    #[test]
+    fn mount_activity_observes_walk_starts_crossings_and_failed_lookups() {
+        set_mount_access_policy(observe_selected_mount);
+        let context = TestFs::context();
+
+        select_observed_mount(context.root_dir());
+        context.resolve("/").unwrap();
+        assert_eq!(OBSERVED_MOUNT_ACCESSES.load(Ordering::Relaxed), 1);
+
+        let target = context.resolve("/child").unwrap();
+        let mounted = target.mount(&Filesystem::new(TestFs::new())).unwrap();
+        let mounted_root = mounted.root_location();
+
+        select_observed_mount(&mounted_root);
+        context.resolve("/child/child").unwrap();
+        assert_eq!(OBSERVED_MOUNT_ACCESSES.load(Ordering::Relaxed), 1);
+
+        let mounted_context = FsContext::new(mounted_root.clone());
+        select_observed_mount(&mounted_root);
+        assert_eq!(
+            mounted_context.resolve("missing").unwrap_err(),
+            VfsError::NotFound
+        );
+        assert_eq!(OBSERVED_MOUNT_ACCESSES.load(Ordering::Relaxed), 2);
+
+        select_observed_mount(&mounted_root);
+        context
+            .resolve_with_admission_unobserved("/child/child", &mut |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            context
+                .resolve_with_admission_unobserved("/child/child", &mut |dir| {
+                    if Arc::ptr_eq(dir.mountpoint(), &mounted) {
+                        Err(VfsError::PermissionDenied)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err(),
+            VfsError::PermissionDenied
+        );
+        context
+            .resolve_no_follow_with_admission_unobserved("/child", &mut |_| Ok(()))
+            .unwrap();
+        assert_eq!(OBSERVED_MOUNT_ACCESSES.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1121,6 +1685,65 @@ mod tests {
         });
 
         assert_eq!(result.unwrap_err(), VfsError::PermissionDenied);
+    }
+
+    struct RejectSymlink;
+
+    impl PathwalkPolicy for RejectSymlink {
+        fn follow_symlink(&mut self, _link: &Location) -> VfsResult<()> {
+            Err(VfsError::FilesystemLoop)
+        }
+    }
+
+    #[test]
+    fn pathwalk_policy_observes_intermediate_and_final_symlinks() {
+        let context = TestFs::context();
+        let result = context.resolve_with_policy("/jump", &mut |_| Ok(()), &mut RejectSymlink);
+        assert_eq!(result.unwrap_err(), VfsError::FilesystemLoop);
+    }
+
+    struct RejectTopologyEdges;
+
+    impl PathwalkPolicy for RejectTopologyEdges {
+        fn cross_mount(&mut self, _from: &Location, _to: &Location) -> VfsResult<()> {
+            Err(VfsError::CrossesDevices)
+        }
+
+        fn absolute_root(&mut self, _from: &Location, _root: &Location) -> VfsResult<()> {
+            Err(VfsError::CrossesDevices)
+        }
+
+        fn escape_root(&mut self, _root: &Location) -> VfsResult<()> {
+            Err(VfsError::CrossesDevices)
+        }
+    }
+
+    #[test]
+    fn pathwalk_policy_observes_mount_crossings() {
+        let context = TestFs::context();
+        let target = context.resolve("/child").unwrap();
+        target.mount(&Filesystem::new(TestFs::new())).unwrap();
+
+        let result =
+            context.resolve_with_policy("child", &mut |_| Ok(()), &mut RejectTopologyEdges);
+        assert_eq!(result.unwrap_err(), VfsError::CrossesDevices);
+    }
+
+    #[test]
+    fn pathwalk_policy_observes_absolute_restart_and_root_escape() {
+        let outer = TestFs::context();
+        let jail = FsContext::new(outer.resolve("/child").unwrap());
+
+        assert_eq!(
+            jail.resolve_with_policy("/child", &mut |_| Ok(()), &mut RejectTopologyEdges,)
+                .unwrap_err(),
+            VfsError::CrossesDevices
+        );
+        assert_eq!(
+            jail.resolve_with_policy("..", &mut |_| Ok(()), &mut RejectTopologyEdges)
+                .unwrap_err(),
+            VfsError::CrossesDevices
+        );
     }
 
     #[test]
@@ -1168,7 +1791,11 @@ mod tests {
     fn create_open_follows_a_dangling_symlink_with_one_admission_chain() {
         let context = TestFs::context();
         let mut options = OpenOptions::new();
-        options.write(true).create(true).mode(0o600).user(1000, 1000);
+        options
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .user(1000, 1000);
         let mut create_parents = Vec::new();
 
         let (loc, created) = options
@@ -1176,7 +1803,7 @@ mod tests {
                 &context,
                 "/jump-create",
                 &mut |_| Ok(()),
-                &mut |parent| {
+                &mut |parent, _options| {
                     create_parents.push(parent.absolute_path()?.as_str().to_owned());
                     Ok(())
                 },
@@ -1202,7 +1829,7 @@ mod tests {
             &context,
             "/jump-create",
             &mut |_| Ok(()),
-            &mut |_| Ok(()),
+            &mut |_, _| Ok(()),
         );
         assert_eq!(result.unwrap_err(), VfsError::AlreadyExists);
     }
@@ -1217,7 +1844,7 @@ mod tests {
             &context,
             "/bad-jump",
             &mut |_| Ok(()),
-            &mut |_| Ok(()),
+            &mut |_, _| Ok(()),
         );
         assert_eq!(result.unwrap_err(), VfsError::NotADirectory);
     }
@@ -1272,6 +1899,35 @@ mod tests {
         context.resolve("/child").unwrap().unmount().unwrap();
         assert_eq!(mounted.flushes.load(Ordering::Relaxed), 1);
         assert_eq!(mounted.unmounts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn dropping_prepared_or_flushed_unmount_releases_the_reservation() {
+        let context = TestFs::context();
+        let target = context.resolve("/child").unwrap();
+        let mounted = TestFs::new();
+        target.mount(&Filesystem::new(mounted.clone())).unwrap();
+
+        let prepared = context
+            .resolve("/child")
+            .unwrap()
+            .prepare_unmount()
+            .unwrap();
+        drop(prepared);
+        context.resolve("/child/child").unwrap();
+
+        let flushed = context
+            .resolve("/child")
+            .unwrap()
+            .prepare_unmount()
+            .unwrap()
+            .flush()
+            .unwrap();
+        drop(flushed);
+        context.resolve("/child/child").unwrap();
+        assert_eq!(mounted.flushes.load(Ordering::Relaxed), 1);
+
+        context.resolve("/child").unwrap().unmount().unwrap();
     }
 
     #[test]
@@ -1611,7 +2267,7 @@ mod tests {
             .unwrap();
 
         let alias = TestFs::new();
-        let alias_fs = Filesystem::new_with_device(alias.clone(), mounted_fs.device());
+        let alias_fs = Filesystem::new_view(alias.clone(), &mounted_fs);
         context
             .resolve("/child/child")
             .unwrap()
@@ -1673,6 +2329,18 @@ mod tests {
         let fs = TestFs::context();
         let err = fs.link("/child", "/").unwrap_err();
         assert_eq!(err.canonicalize(), VfsError::AlreadyExists);
+    }
+
+    #[test]
+    fn anonymous_create_is_honestly_unsupported_by_default() {
+        let fs = TestFs::context();
+        let mut options = OpenOptions::new();
+        options.write(true).mode(0o600);
+
+        let err = options
+            .create_anonymous_location(fs.root_dir(), true)
+            .unwrap_err();
+        assert_eq!(err.canonicalize(), VfsError::OperationNotSupported);
     }
 
     #[test]

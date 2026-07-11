@@ -27,9 +27,23 @@ fn user_namespace_is_same_or_descendant(
     false
 }
 
+/// Applies an effective capability bit captured in `actor_user_ns` to a
+/// target namespace. The simplified hierarchy grants it to the same namespace
+/// and descendants, never to ancestors or siblings.
+pub(crate) fn capability_snapshot_applies_to_user_namespace(
+    has_effective_capability: bool,
+    actor_user_ns: &Arc<UserNamespace>,
+    target_user_ns: &Arc<UserNamespace>,
+) -> bool {
+    has_effective_capability && user_namespace_is_same_or_descendant(actor_user_ns, target_user_ns)
+}
+
 fn has_capability_over(actor: &ProcessData, target: &ProcessData, capability: u32) -> bool {
-    actor.has_effective_capability(capability)
-        && user_namespace_is_same_or_descendant(&actor.user_ns(), &target.user_ns())
+    capability_snapshot_applies_to_user_namespace(
+        actor.has_effective_capability(capability),
+        &actor.user_ns(),
+        &target.user_ns(),
+    )
 }
 
 fn caller_id_matches_all_target_ids(caller_uid: u32, caller_gid: u32, target: Credentials) -> bool {
@@ -146,12 +160,25 @@ mod tests {
 
     #[test]
     fn user_namespace_capability_direction_is_parent_to_child() {
-        let root = UserNamespace::new_root();
-        let child = root.fork(1000);
-        let grandchild = child.fork(1000);
+        let root = UserNamespace::try_new_root().unwrap();
+        let child = root.try_fork(1000).unwrap();
+        let grandchild = child.try_fork(1000).unwrap();
 
-        assert!(user_namespace_is_same_or_descendant(&root, &root));
-        assert!(user_namespace_is_same_or_descendant(&root, &grandchild));
-        assert!(!user_namespace_is_same_or_descendant(&child, &root));
+        assert!(capability_snapshot_applies_to_user_namespace(
+            true, &root, &root
+        ));
+        assert!(capability_snapshot_applies_to_user_namespace(
+            true,
+            &root,
+            &grandchild
+        ));
+        assert!(!capability_snapshot_applies_to_user_namespace(
+            true, &child, &root
+        ));
+        assert!(!capability_snapshot_applies_to_user_namespace(
+            false,
+            &root,
+            &grandchild
+        ));
     }
 }

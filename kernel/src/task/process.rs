@@ -1,4 +1,4 @@
-use alloc::{format, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{format, string::String, sync::Arc, vec::Vec};
 use core::{
     sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     time::Duration,
@@ -15,7 +15,7 @@ use linux_raw_sys::general::{
 };
 use scope_local::Scope;
 use spin::RwLock;
-use starry_process::{Pid, Process};
+use starry_process::{Pid, Process, ProcessError, ThreadAdmission as StarryThreadAdmission};
 use starry_signal::{
     Signo,
     api::{ProcessSignalManager, SignalActions},
@@ -33,7 +33,10 @@ use super::{
     timer::PosixTimer,
 };
 use crate::{
-    file::executable::{self, ExecutableKey},
+    file::{
+        FdTable,
+        executable::{self, ExecutableKey},
+    },
     mm::AddrSpace,
     time::wall_time,
 };
@@ -55,18 +58,19 @@ pub(crate) struct CgroupNamespace {
 }
 
 impl CgroupNamespace {
-    pub(crate) fn new_root() -> Arc<Self> {
-        Self::new()
+    pub(crate) fn try_new_root() -> AxResult<Arc<Self>> {
+        Self::try_new()
     }
 
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
+    fn try_new() -> AxResult<Arc<Self>> {
+        Arc::try_new(Self {
             id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
         })
+        .map_err(|_| AxError::NoMemory)
     }
 
-    pub(crate) fn fork(self: &Arc<Self>) -> Arc<Self> {
-        Self::new()
+    pub(crate) fn try_fork(self: &Arc<Self>) -> AxResult<Arc<Self>> {
+        Self::try_new()
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -82,20 +86,21 @@ pub(crate) struct PidNamespace {
 }
 
 impl PidNamespace {
-    pub(crate) fn new_root() -> Arc<Self> {
-        Self::new(None, None)
+    pub(crate) fn try_new_root() -> AxResult<Arc<Self>> {
+        Self::try_new(None, None)
     }
 
-    fn new(parent: Option<Arc<Self>>, init_pid: Option<Pid>) -> Arc<Self> {
-        Arc::new(Self {
+    fn try_new(parent: Option<Arc<Self>>, init_pid: Option<Pid>) -> AxResult<Arc<Self>> {
+        Arc::try_new(Self {
             id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
             parent,
             init_pid,
         })
+        .map_err(|_| AxError::NoMemory)
     }
 
-    pub(crate) fn fork(self: &Arc<Self>, init_pid: Pid) -> Arc<Self> {
-        Self::new(Some(self.clone()), Some(init_pid))
+    pub(crate) fn try_fork(self: &Arc<Self>, init_pid: Pid) -> AxResult<Arc<Self>> {
+        Self::try_new(Some(self.clone()), Some(init_pid))
     }
 
     pub(crate) fn parent(&self) -> Option<Arc<Self>> {
@@ -123,24 +128,29 @@ pub(crate) struct UserNamespace {
 }
 
 impl UserNamespace {
-    pub(crate) fn new_root() -> Arc<Self> {
-        Self::new(None, 0)
+    pub(crate) fn try_new_root() -> AxResult<Arc<Self>> {
+        Self::try_new(None, 0)
     }
 
-    fn new(parent: Option<Arc<Self>>, owner_uid: u32) -> Arc<Self> {
-        Arc::new(Self {
+    fn try_new(parent: Option<Arc<Self>>, owner_uid: u32) -> AxResult<Arc<Self>> {
+        Arc::try_new(Self {
             id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
             parent,
             owner_uid,
         })
+        .map_err(|_| AxError::NoMemory)
     }
 
-    pub(crate) fn fork(self: &Arc<Self>, owner_uid: u32) -> Arc<Self> {
-        Self::new(Some(self.clone()), owner_uid)
+    pub(crate) fn try_fork(self: &Arc<Self>, owner_uid: u32) -> AxResult<Arc<Self>> {
+        Self::try_new(Some(self.clone()), owner_uid)
     }
 
     pub(crate) fn parent(&self) -> Option<Arc<Self>> {
         self.parent.clone()
+    }
+
+    pub(crate) fn is_initial(&self) -> bool {
+        self.parent.is_none()
     }
 
     pub(crate) fn owner_uid(&self) -> u32 {
@@ -212,10 +222,11 @@ impl UtsNamespace {
         }
     }
 
-    pub(crate) fn fork(&self) -> Arc<Self> {
-        Arc::new(Self {
+    pub(crate) fn try_fork(&self) -> AxResult<Arc<Self>> {
+        Arc::try_new(Self {
             state: SpinNoIrq::new(*self.state.lock()),
         })
+        .map_err(|_| AxError::NoMemory)
     }
 
     pub(crate) fn nodename(&self) -> Vec<u8> {
@@ -254,10 +265,11 @@ impl TimeNamespace {
         }
     }
 
-    pub(crate) fn fork(&self) -> Arc<Self> {
-        Arc::new(Self {
+    pub(crate) fn try_fork(&self) -> AxResult<Arc<Self>> {
+        Arc::try_new(Self {
             state: SpinNoIrq::new(*self.state.lock()),
         })
+        .map_err(|_| AxError::NoMemory)
     }
 
     fn offset_ns(&self, boottime: bool) -> i64 {
@@ -487,6 +499,8 @@ pub struct ProcessData {
     aspace_handle: RwLock<Arc<Mutex<AddrSpace>>>,
     /// The resource scope
     pub scope: RwLock<Scope>,
+    /// Real empty files table prepared at process creation for final exit swap.
+    exit_fd_table: Arc<FdTable>,
     /// The user heap top
     heap_top: AtomicUsize,
 
@@ -572,14 +586,61 @@ pub struct ProcessData {
     time_ns_for_children: RwLock<Arc<TimeNamespace>>,
 }
 
+fn process_error(error: ProcessError) -> AxError {
+    match error {
+        ProcessError::NoMemory | ProcessError::Capacity => AxError::NoMemory,
+        ProcessError::AlreadyExists => AxError::AlreadyExists,
+    }
+}
+
+/// Thread-group capacity held across fallible clone construction.
+pub(crate) struct ProcessThreadAdmission {
+    proc_data: Arc<ProcessData>,
+    membership: Option<StarryThreadAdmission>,
+    committed: bool,
+}
+
+impl ProcessThreadAdmission {
+    /// Publishes the reserved TID while keeping exec exclusion atomic with the
+    /// thread-group mutation.
+    pub(crate) fn commit(mut self) {
+        let mut membership = self.membership.take();
+        let mut exec_ctl = self.proc_data.exec_ctl.lock();
+        if let Some(membership) = membership.as_mut() {
+            membership.publish();
+            exec_ctl.pending_thread_additions -= 1;
+            self.committed = true;
+        }
+        drop(exec_ctl);
+        drop(membership);
+    }
+}
+
+impl Drop for ProcessThreadAdmission {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut exec_ctl = self.proc_data.exec_ctl.lock();
+        let membership = self.membership.take();
+        if membership.is_some() {
+            exec_ctl.pending_thread_additions -= 1;
+        }
+        drop(exec_ctl);
+        drop(membership);
+    }
+}
+
 impl ProcessData {
-    /// Create a new [`ProcessData`].
-    pub(crate) fn new(
+    /// Fallibly creates unpublished process runtime state.
+    pub(crate) fn try_new(
         proc: Arc<Process>,
         exe_path: String,
         executable: Option<ExecutableKey>,
         cmdline: Arc<Vec<String>>,
         aspace: Arc<Mutex<AddrSpace>>,
+        scope: Scope,
+        exit_fd_table: Arc<FdTable>,
         signal_actions: Arc<SpinNoIrq<SignalActions>>,
         exit_signal: Option<Signo>,
         net_ns: Arc<NetStack>,
@@ -588,11 +649,36 @@ impl ProcessData {
         user_ns: Arc<UserNamespace>,
         uts_ns: Arc<UtsNamespace>,
         time_ns: Arc<TimeNamespace>,
-    ) -> Arc<Self> {
+    ) -> AxResult<Arc<Self>> {
+        struct ExecutableRollback(Option<ExecutableKey>);
+
+        impl Drop for ExecutableRollback {
+            fn drop(&mut self) {
+                executable::release(self.0.take());
+            }
+        }
+
         let start_realtime_sec = wall_time().as_secs();
         let start_monotonic_ns = monotonic_time_nanos();
+        let mut executable_rollback = ExecutableRollback(executable);
+        let child_exit_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
+        let exit_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
+        let exec_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
+        let signal = Arc::try_new(ProcessSignalManager::new(
+            signal_actions,
+            crate::config::SIGNAL_TRAMPOLINE,
+        ))
+        .map_err(|_| AxError::NoMemory)?;
+        let futex_table = Arc::try_new(FutexTable::new()).map_err(|_| AxError::NoMemory)?;
+        let stop_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
+        let vfork_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
+        let mut supplementary_groups = Vec::new();
+        supplementary_groups
+            .try_reserve_exact(1)
+            .map_err(|_| AxError::NoMemory)?;
+        supplementary_groups.push(0);
 
-        Arc::new(Self {
+        let data = Self {
             proc,
             exe_path: RwLock::new(exe_path),
             executable: SpinNoIrq::new(executable),
@@ -600,29 +686,27 @@ impl ProcessData {
             start_realtime_sec,
             start_monotonic_ns,
             aspace_handle: RwLock::new(aspace),
-            scope: RwLock::new(Scope::new()),
+            scope: RwLock::new(scope),
+            exit_fd_table,
             heap_top: AtomicUsize::new(
                 crate::config::USER_HEAP_BASE + crate::config::USER_HEAP_SIZE,
             ),
 
             rlim: RwLock::default(),
 
-            child_exit_event: Arc::default(),
-            exit_event: Arc::default(),
-            exec_event: Arc::default(),
+            child_exit_event,
+            exit_event,
+            exec_event,
             exit_signal,
 
-            signal: Arc::new(ProcessSignalManager::new(
-                signal_actions,
-                crate::config::SIGNAL_TRAMPOLINE,
-            )),
+            signal,
 
-            futex_table: Arc::new(FutexTable::new()),
+            futex_table,
 
             umask: AtomicU32::new(0o022),
             creds: SpinNoIrq::new(Credentials::default()),
             caps: SpinNoIrq::new(CapabilityState::full()),
-            supplementary_groups: SpinNoIrq::new(vec![0]),
+            supplementary_groups: SpinNoIrq::new(supplementary_groups),
             personality: AtomicU32::new(0),
             mempolicy: SpinNoIrq::new(MempolicyState::default()),
             pdeath_signal: AtomicU32::new(0),
@@ -640,8 +724,8 @@ impl ProcessData {
             ptrace_tracees: SpinNoIrq::new(Vec::new()),
             exec_ctl: SpinNoIrq::new(ExecControlState::default()),
             vfork_ctl: SpinNoIrq::new(VforkControlState::default()),
-            stop_event: Arc::default(),
-            vfork_event: Arc::default(),
+            stop_event,
+            vfork_event,
 
             net_ns,
             cgroup_ns,
@@ -650,12 +734,40 @@ impl ProcessData {
             uts_ns: RwLock::new(uts_ns),
             time_ns: RwLock::new(time_ns.clone()),
             time_ns_for_children: RwLock::new(time_ns),
-        })
+        };
+        executable_rollback.0 = None;
+        Arc::try_new(data).map_err(|_| AxError::NoMemory)
+    }
+
+    /// Clones the preallocated real empty files table for final process exit.
+    pub(crate) fn exit_fd_table(&self) -> Arc<FdTable> {
+        self.exit_fd_table.clone()
     }
 
     /// Get the top address of the user heap.
     pub fn get_heap_top(&self) -> usize {
         self.heap_top.load(Ordering::Acquire)
+    }
+
+    /// Fallibly snapshots the executable path without allocator work under
+    /// the process metadata lock.
+    pub(crate) fn try_exe_path(&self) -> AxResult<String> {
+        let mut path = String::new();
+        loop {
+            path.clear();
+            let required = self.exe_path.read().len();
+            if path.capacity() < required {
+                path.try_reserve_exact(required)
+                    .map_err(|_| AxError::NoMemory)?;
+            }
+            let current = self.exe_path.read();
+            if path.capacity() < current.len() {
+                drop(current);
+                continue;
+            }
+            path.push_str(&current);
+            return Ok(path);
+        }
     }
 
     /// Returns the current address-space handle for this process.
@@ -689,7 +801,8 @@ impl ProcessData {
     }
 
     pub(crate) fn replace_uts_ns(&self, uts_ns: Arc<UtsNamespace>) {
-        *self.uts_ns.write() = uts_ns;
+        let old = core::mem::replace(&mut *self.uts_ns.write(), uts_ns);
+        drop(old);
     }
 
     pub(crate) fn time_ns(&self) -> Arc<TimeNamespace> {
@@ -701,13 +814,18 @@ impl ProcessData {
     }
 
     pub(crate) fn replace_time_ns(&self, time_ns: Arc<TimeNamespace>) {
-        *self.time_ns.write() = time_ns.clone();
-        *self.time_ns_for_children.write() = time_ns;
+        let old_current = core::mem::replace(&mut *self.time_ns.write(), time_ns.clone());
+        let old_children = core::mem::replace(&mut *self.time_ns_for_children.write(), time_ns);
+        drop((old_current, old_children));
     }
 
-    pub(crate) fn unshare_time_ns(&self) {
-        let new_ns = self.time_ns_for_children().fork();
-        *self.time_ns_for_children.write() = new_ns;
+    pub(crate) fn try_unshared_time_ns(&self) -> AxResult<Arc<TimeNamespace>> {
+        self.time_ns_for_children().try_fork()
+    }
+
+    pub(crate) fn replace_time_ns_for_children(&self, new_ns: Arc<TimeNamespace>) {
+        let old = core::mem::replace(&mut *self.time_ns_for_children.write(), new_ns);
+        drop(old);
     }
 
     pub(crate) fn start_realtime_sec(&self) -> u64 {
@@ -722,7 +840,7 @@ impl ProcessData {
         *self.executable.lock()
     }
 
-    pub(crate) fn retain_executable(&self) -> Option<ExecutableKey> {
+    pub(crate) fn retain_executable(&self) -> AxResult<Option<ExecutableKey>> {
         executable::retain(self.executable())
     }
 
@@ -858,8 +976,31 @@ impl ProcessData {
         self.supplementary_groups.lock().clone()
     }
 
+    /// Fallibly snapshots supplementary groups without allocating under the
+    /// process credential spin lock.
+    pub fn try_supplementary_groups(&self) -> AxResult<Vec<u32>> {
+        let mut groups = Vec::new();
+        loop {
+            groups.clear();
+            let required = self.supplementary_groups.lock().len();
+            if groups.capacity() < required {
+                groups
+                    .try_reserve_exact(required)
+                    .map_err(|_| AxError::NoMemory)?;
+            }
+            let current = self.supplementary_groups.lock();
+            if groups.capacity() < current.len() {
+                drop(current);
+                continue;
+            }
+            groups.extend(current.iter().copied());
+            return Ok(groups);
+        }
+    }
+
     pub fn set_supplementary_groups(&self, groups: Vec<u32>) {
-        *self.supplementary_groups.lock() = groups;
+        let old = core::mem::replace(&mut *self.supplementary_groups.lock(), groups);
+        drop(old);
     }
 
     pub fn personality(&self) -> u32 {
@@ -878,9 +1019,31 @@ impl ProcessData {
         self.mempolicy.lock().process_policy = policy;
     }
 
-    pub fn inherit_mempolicy_from(&self, parent: &Self) {
-        let parent_state = parent.mempolicy.lock().clone();
-        *self.mempolicy.lock() = parent_state;
+    pub fn try_inherit_mempolicy_from(&self, parent: &Self) -> AxResult<()> {
+        let mut ranges = Vec::new();
+        let process_policy = loop {
+            ranges.clear();
+            let required = parent.mempolicy.lock().ranges.len();
+            if ranges.capacity() < required {
+                ranges
+                    .try_reserve_exact(required)
+                    .map_err(|_| AxError::NoMemory)?;
+            }
+            let state = parent.mempolicy.lock();
+            if ranges.capacity() < state.ranges.len() {
+                drop(state);
+                continue;
+            }
+            ranges.extend(state.ranges.iter().copied());
+            break state.process_policy;
+        };
+        let parent_state = MempolicyState {
+            process_policy,
+            ranges,
+        };
+        let old = core::mem::replace(&mut *self.mempolicy.lock(), parent_state);
+        drop(old);
+        Ok(())
     }
 
     pub fn bind_mempolicy_range(&self, start: usize, size: usize, policy: Mempolicy) {
@@ -1564,11 +1727,31 @@ impl ProcessData {
         let mut exec_ctl = self.exec_ctl.lock();
         match exec_ctl.owner {
             Some(curr) => curr == owner,
-            None => {
+            None if exec_ctl.pending_thread_additions == 0 => {
                 exec_ctl.owner = Some(owner);
                 true
             }
+            None => false,
         }
+    }
+
+    /// Excludes thread creation while a process-scope pointer is replaced.
+    ///
+    /// Thread publication takes `exec_ctl` before the process thread-group
+    /// lock. Taking the locks in the same order makes the single-thread test
+    /// and gate publication atomic with respect to CLONE_THREAD: either clone
+    /// publishes first and this returns `false`, or the gate publishes first
+    /// and clone rolls back. Callers must pair success with `end_exec(owner)`.
+    pub fn begin_single_thread_scope_change(&self, owner: Pid) -> bool {
+        let mut exec_ctl = self.exec_ctl.lock();
+        if exec_ctl.owner.is_some()
+            || exec_ctl.pending_thread_additions != 0
+            || !self.proc.has_only_thread(owner)
+        {
+            return false;
+        }
+        exec_ctl.owner = Some(owner);
+        true
     }
 
     /// Returns whether this thread should exit because another thread is committing execve().
@@ -1586,20 +1769,34 @@ impl ProcessData {
         self.exec_ctl.lock().owner.is_some()
     }
 
-    /// Adds a thread to the process unless an exec de-thread phase is already
-    /// in progress.
-    pub fn try_add_thread(&self, tid: Pid) -> bool {
-        let exec_ctl = self.exec_ctl.lock();
+    /// Reserves process membership for a thread unless exec has gated creation.
+    pub(crate) fn prepare_thread(self: &Arc<Self>, tid: Pid) -> AxResult<ProcessThreadAdmission> {
+        // The intrusive membership node is allocated before entering the
+        // exec-control SpinNoIrq domain. It remains invisible until commit.
+        let membership = self.proc.prepare_thread(tid).map_err(process_error)?;
+        let mut exec_ctl = self.exec_ctl.lock();
         if exec_ctl.owner.is_some() {
-            return false;
+            drop(exec_ctl);
+            drop(membership);
+            return Err(AxError::Interrupted);
         }
-        self.proc.add_thread(tid);
-        true
+        let Some(pending) = exec_ctl.pending_thread_additions.checked_add(1) else {
+            drop(exec_ctl);
+            drop(membership);
+            return Err(AxError::NoMemory);
+        };
+        exec_ctl.pending_thread_additions = pending;
+        drop(exec_ctl);
+        Ok(ProcessThreadAdmission {
+            proc_data: self.clone(),
+            membership: Some(membership),
+            committed: false,
+        })
     }
 
     /// Returns whether the thread group has drained to the exec owner only.
     pub fn exec_ready(&self, owner: Pid) -> bool {
-        self.is_exec_owner(owner) && self.proc.threads().as_slice() == [owner]
+        self.is_exec_owner(owner) && self.proc.has_only_thread(owner)
     }
 
     /// Finishes or cancels the in-flight exec owned by `owner`.
@@ -1634,6 +1831,7 @@ impl ProcessData {
 
 impl Drop for ProcessData {
     fn drop(&mut self) {
-        executable::release(*self.executable.lock());
+        let executable = *self.executable.lock();
+        executable::release(executable);
     }
 }

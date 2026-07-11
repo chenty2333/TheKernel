@@ -104,12 +104,14 @@ axfs-ng = { path = "third_party/rust-patches/axfs-ng" }
 axfs-ng-vfs = { path = "third_party/rust-patches/axfs-ng-vfs" }
 starry-vm = { path = "third_party/rust-patches/starry-vm" }
 starry-process = { path = "third_party/rust-patches/starry-process" }
+scope-local = { path = "third_party/rust-patches/scope-local" }
 starry-signal = { path = "third_party/rust-patches/starry-signal" }
 axsched = { path = "third_party/rust-patches/axsched" }
 axtask = { path = "third_party/rust-patches/axtask" }
 axruntime = { path = "third_party/rust-patches/axruntime" }
 axplat-loongarch64-qemu-virt = { path = "third_party/rust-patches/axplat-loongarch64-qemu-virt" }
 axplat-riscv64-qemu-virt = { path = "third_party/rust-patches/axplat-riscv64-qemu-virt" }
+axpoll = { path = "third_party/rust-patches/axpoll" }
 memory_set = { path = "third_party/rust-patches/memory_set" }
 page_table_multiarch = { path = "third_party/rust-patches/page_table_multiarch" }
 kernel-elf-parser = { path = "third_party/rust-patches/kernel-elf-parser" }

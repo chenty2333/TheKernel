@@ -7,7 +7,7 @@ use axnet::{
 };
 
 pub fn bind_dev_log() -> LinuxResult<()> {
-    let server = UnixSocket::new(DgramTransport::new());
+    let server = UnixSocket::new(DgramTransport::new()?);
     server.bind(SocketAddrEx::Unix(UnixSocketAddr::Path("/dev/log".into())))?;
     axtask::spawn_with_name(
         move || {

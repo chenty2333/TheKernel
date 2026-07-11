@@ -18,7 +18,7 @@ use starry_vm::{VmMutPtr, vm_load, vm_write_slice};
 use super::sync::restart_futex_wait;
 use crate::{
     mm::system_memory_stats,
-    task::{AsThread, RestartBlock, UTS_FIELD_LEN, processes},
+    task::{AsThread, RestartBlock, UTS_FIELD_LEN, try_processes},
 };
 
 pub fn sys_getuid() -> AxResult<isize> {
@@ -293,7 +293,7 @@ pub fn sys_sysinfo(info: *mut sysinfo) -> AxResult<isize> {
         .as_secs()
         .saturating_add(u64::from(uptime.subsec_nanos() != 0));
     kinfo.uptime = uptime_secs.min(i64::MAX as u64) as _;
-    kinfo.procs = processes().len() as _;
+    kinfo.procs = try_processes()?.len() as _;
     kinfo.totalram = stats.total_bytes as _;
     kinfo.freeram = stats.free_bytes as _;
     // axfs uses a page cache, not Linux's separate block-buffer cache.
