@@ -20,3 +20,10 @@ Statuses are `draft`, `accepted`, `implemented`, `superseded`, and `rejected`.
 An RFC reaches `implemented` only after its required gates pass. A mechanism
 must not be described as supported merely because its syscall number or public
 type exists.
+
+## Index
+
+- [RFC 0000: TheKernel Modernization Program](0000-modernization-program.md)
+  (`accepted`)
+- [RFC 0001: Immutable Credentials, User-ID Mapping, and Typed Security Hooks](0001-credential-v2.md)
+  (`draft`)
