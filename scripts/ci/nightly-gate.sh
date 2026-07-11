@@ -14,27 +14,29 @@ usage() {
     cat <<'EOF'
 Usage: scripts/ci/nightly-gate.sh [--log-dir DIR] [--list]
 
-Nightly categories and command overrides:
+Nightly categories and optional command overrides:
   ltp                 THEKERNEL_NIGHTLY_LTP_COMMAND
   pressure            THEKERNEL_NIGHTLY_PRESSURE_COMMAND
   oom-failpoint       THEKERNEL_NIGHTLY_OOM_FAILPOINT_COMMAND
   fs-powercut         THEKERNEL_NIGHTLY_FS_POWERCUT_COMMAND
   nonloopback-network THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_COMMAND
 
-Each category is enabled by default. Set its corresponding *_ENABLED variable
-to 0 for an intentional SKIP. An enabled category without a real adapter is
-UNSUPPORTED, never PASS. Exit status is 1 for a failed test, 78 when tests did
-not fail but one or more categories are unsupported, and 0 only for pass/skip.
+Each category is enabled by default and has a repository-owned adapter. A
+*_COMMAND value replaces that adapter for runner-specific hardware. Set the
+corresponding *_ENABLED variable to 0 for an intentional SKIP. Adapter exit 78
+is recorded as UNSUPPORTED, never PASS. Exit status is 1 for a failed test, 78
+when tests did not fail but one or more categories are unsupported, and 0 only
+for pass/skip.
 EOF
 }
 
 list_categories() {
     cat <<'EOF'
-ltp	focused dual-architecture LTP adapter is available
-pressure	stress/pressure adapter must be supplied by the runner
-oom-failpoint	kernel allocator failpoint adapter is not implemented yet
-fs-powercut	power-cut/crash-consistency adapter is not implemented yet
-nonloopback-network	TAP or external-peer adapter is not implemented yet
+ltp	focused dual-architecture LTP replay
+pressure	dual-architecture mixed task, memory, and filesystem pressure
+oom-failpoint	deterministic ENOMEM admission and recovery replay
+fs-powercut	two-boot writable-ext4 crash recovery replay
+nonloopback-network	dual-architecture QEMU NIC to host-peer exchange
 EOF
 }
 
@@ -88,32 +90,75 @@ case_enabled() {
     esac
 }
 
-run_command_case() {
+record_adapter_status() {
+    local category=$1
+    local status=$2
+    local success_reason=$3
+    local failure_reason=$4
+    local log=$5
+
+    case "$status" in
+        0)
+            record_result "$category" pass "$success_reason" "$log"
+            ;;
+        78)
+            record_result "$category" unsupported "$failure_reason returned exit 78" "$log"
+            unsupported=$((unsupported + 1))
+            ;;
+        *)
+            record_result "$category" fail "$failure_reason failed with exit $status" "$log"
+            failures=$((failures + 1))
+            ;;
+    esac
+}
+
+run_adapter_case() {
     local category=$1
     local variable=$2
     local enabled_variable=$3
+    local adapter=$4
     local command=${!variable:-}
+    local source=repository
+    local status=0
 
     if ! case_enabled "$enabled_variable"; then
         record_result "$category" skip "disabled by $enabled_variable"
         return
     fi
-    if [ -z "$command" ]; then
-        record_result "$category" unsupported "no real runner adapter; set $variable"
-        unsupported=$((unsupported + 1))
-        return
+
+    if [ -n "$command" ]; then
+        source=configured
+        if ci_run_step "nightly-$category" "$CASE_TIMEOUT_SECS" bash -c "$command"; then
+            status=0
+        else
+            status=$?
+        fi
+    else
+        if [ ! -x "$adapter" ]; then
+            record_result "$category" fail \
+                "repository adapter is missing or not executable: $adapter"
+            failures=$((failures + 1))
+            return
+        fi
+        if ci_run_step "nightly-$category" "$CASE_TIMEOUT_SECS" \
+            env \
+                THEKERNEL_NIGHTLY_LOG_DIR="$LOG_DIR/$category" \
+                THEKERNEL_NIGHTLY_CASE_TIMEOUT_SECS="$CASE_TIMEOUT_SECS" \
+                "$adapter"; then
+            status=0
+        else
+            status=$?
+        fi
     fi
 
-    if ci_run_step "nightly-$category" "$CASE_TIMEOUT_SECS" bash -c "$command"; then
-        record_result "$category" pass 'configured adapter passed' "$CI_LOG_DIR/nightly-$category.log"
-    else
-        local status=$?
-        record_result "$category" fail "configured adapter failed with exit $status" "$CI_LOG_DIR/nightly-$category.log"
-        failures=$((failures + 1))
-    fi
+    record_adapter_status \
+        "$category" "$status" "$source adapter passed" "$source adapter" \
+        "$CI_LOG_DIR/nightly-$category.log"
 }
 
 run_ltp() {
+    local status=0
+
     if ! case_enabled THEKERNEL_NIGHTLY_LTP_ENABLED; then
         record_result ltp skip 'disabled by THEKERNEL_NIGHTLY_LTP_ENABLED'
         return
@@ -121,19 +166,23 @@ run_ltp() {
 
     if [ -n "${THEKERNEL_NIGHTLY_LTP_COMMAND:-}" ]; then
         if ci_run_step nightly-ltp "$CASE_TIMEOUT_SECS" bash -c "$THEKERNEL_NIGHTLY_LTP_COMMAND"; then
-            record_result ltp pass 'configured LTP adapter passed' "$CI_LOG_DIR/nightly-ltp.log"
+            status=0
         else
-            local status=$?
-            record_result ltp fail "configured LTP adapter failed with exit $status" "$CI_LOG_DIR/nightly-ltp.log"
-            failures=$((failures + 1))
+            status=$?
         fi
+        record_adapter_status \
+            ltp "$status" 'configured LTP adapter passed' 'configured LTP adapter' \
+            "$CI_LOG_DIR/nightly-ltp.log"
         return
     fi
 
     if [ ! -x scripts/lab ] \
         || ! ci_find_official_image rv >/dev/null \
-        || ! ci_find_official_image la >/dev/null; then
-        record_result ltp unsupported 'focused LTP adapter requires scripts/lab and both official root images'
+        || ! ci_find_official_image la >/dev/null \
+        || ! command -v qemu-system-riscv64 >/dev/null 2>&1 \
+        || ! command -v qemu-system-loongarch64 >/dev/null 2>&1; then
+        record_result ltp unsupported \
+            'focused LTP adapter requires scripts/lab, both QEMU binaries, and both official root images'
         unsupported=$((unsupported + 1))
         return
     fi
@@ -152,14 +201,18 @@ run_ltp() {
 }
 
 run_ltp
-run_command_case pressure \
-    THEKERNEL_NIGHTLY_PRESSURE_COMMAND THEKERNEL_NIGHTLY_PRESSURE_ENABLED
-run_command_case oom-failpoint \
-    THEKERNEL_NIGHTLY_OOM_FAILPOINT_COMMAND THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED
-run_command_case fs-powercut \
-    THEKERNEL_NIGHTLY_FS_POWERCUT_COMMAND THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED
-run_command_case nonloopback-network \
-    THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_COMMAND THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_ENABLED
+run_adapter_case pressure \
+    THEKERNEL_NIGHTLY_PRESSURE_COMMAND THEKERNEL_NIGHTLY_PRESSURE_ENABLED \
+    "$SCRIPT_DIR/nightly/pressure.sh"
+run_adapter_case oom-failpoint \
+    THEKERNEL_NIGHTLY_OOM_FAILPOINT_COMMAND THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED \
+    "$SCRIPT_DIR/nightly/oom-failpoint.sh"
+run_adapter_case fs-powercut \
+    THEKERNEL_NIGHTLY_FS_POWERCUT_COMMAND THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED \
+    "$SCRIPT_DIR/nightly/fs-powercut.sh"
+run_adapter_case nonloopback-network \
+    THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_COMMAND THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_ENABLED \
+    "$SCRIPT_DIR/nightly/nonloopback-network.sh"
 
 printf 'nightly summary: failures=%s unsupported=%s results=%s\n' \
     "$failures" "$unsupported" "$RESULTS"

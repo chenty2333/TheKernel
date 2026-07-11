@@ -8,9 +8,10 @@ CI_DIR="$REPO_ROOT/scripts/ci"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-for script in "$CI_DIR"/*.sh "$0"; do
+while IFS= read -r script; do
     bash -n "$script"
-done
+done < <(find "$CI_DIR" -type f -name '*.sh' -print | sort)
+bash -n "$0"
 
 python3 "$REPO_ROOT/tests/ci/test_vendor_provenance.py"
 
@@ -70,6 +71,50 @@ env \
 
 [ "$(awk -F '\t' '$2 == "skip" { count += 1 } END { print count + 0 }' "$tmp/nightly/nightly-status.tsv")" -eq 5 ]
 
+# Configured adapters retain the same three-state contract as repository
+# adapters. In particular, exit 78 must remain unsupported and make the whole
+# gate return 78; it must never be rewritten to pass.
+set +e
+env \
+    THEKERNEL_NIGHTLY_LTP_ENABLED=0 \
+    THEKERNEL_NIGHTLY_PRESSURE_COMMAND='exit 78' \
+    THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED=0 \
+    THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED=0 \
+    THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_ENABLED=0 \
+    "$CI_DIR/nightly-gate.sh" --log-dir "$tmp/nightly-unsupported" >/dev/null
+status=$?
+set -e
+[ "$status" -eq 78 ] || {
+    printf 'test-ci-scripts: unsupported adapter returned %s, expected 78\n' "$status" >&2
+    exit 1
+}
+grep -q $'^pressure\tunsupported\t' "$tmp/nightly-unsupported/nightly-status.tsv"
+
+set +e
+env \
+    THEKERNEL_NIGHTLY_LTP_ENABLED=0 \
+    THEKERNEL_NIGHTLY_PRESSURE_COMMAND='exit 9' \
+    THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED=0 \
+    THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED=0 \
+    THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_ENABLED=0 \
+    "$CI_DIR/nightly-gate.sh" --log-dir "$tmp/nightly-fail" >/dev/null
+status=$?
+set -e
+[ "$status" -eq 1 ] || {
+    printf 'test-ci-scripts: failed adapter returned %s, expected 1\n' "$status" >&2
+    exit 1
+}
+grep -q $'^pressure\tfail\t' "$tmp/nightly-fail/nightly-status.tsv"
+
+env \
+    THEKERNEL_NIGHTLY_LTP_ENABLED=0 \
+    THEKERNEL_NIGHTLY_PRESSURE_COMMAND='exit 0' \
+    THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED=0 \
+    THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED=0 \
+    THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_ENABLED=0 \
+    "$CI_DIR/nightly-gate.sh" --log-dir "$tmp/nightly-pass" >/dev/null
+grep -q $'^pressure\tpass\t' "$tmp/nightly-pass/nightly-status.tsv"
+
 # Verify the shared runner records and enforces a real wall-clock timeout.
 # shellcheck source=../../scripts/ci/lib.sh
 source "$CI_DIR/lib.sh"
@@ -94,6 +139,7 @@ grep -q $'^must-timeout\ttimeout\t124\t' "$CI_LOG_DIR/status.tsv"
 mkdir -p "$tmp/fake-bin" "$tmp/fake-work"
 cat >"$tmp/fake-bin/python3" <<'EOF'
 #!/usr/bin/env bash
+[ -z "${FAKE_REPLAY_ARGS:-}" ] || printf '%s\n' "$@" >"$FAKE_REPLAY_ARGS"
 exit "${FAKE_REPLAY_STATUS:-0}"
 EOF
 chmod +x "$tmp/fake-bin/python3"
@@ -115,5 +161,49 @@ else
         exit 1
     }
 fi
+
+printf 'exit\n' >"$tmp/short-commands"
+env PATH="$tmp/fake-bin:$PATH" FAKE_REPLAY_STATUS=75 \
+    FAKE_REPLAY_ARGS="$tmp/replay.args" \
+    "$CI_DIR/boot-shell-runner.sh" rv kernel image "$tmp/fake-work" \
+    "$tmp/short-commands" 1 0 0 support.img extra.img STOP_MARKER || status=$?
+[ "${status:-75}" -eq 75 ]
+grep -Fxq -- '--support-image' "$tmp/replay.args"
+grep -Fxq -- 'support.img' "$tmp/replay.args"
+grep -Fxq -- '--extra-block-image' "$tmp/replay.args"
+grep -Fxq -- 'extra.img' "$tmp/replay.args"
+grep -Fxq -- '--stop-after-marker' "$tmp/replay.args"
+grep -Fxq -- 'STOP_MARKER' "$tmp/replay.args"
+
+# The one-shot host peer rejects unauthenticated traffic and returns the nonce
+# only after receiving the exact guest probe.
+peer_port_file="$tmp/peer.port"
+python3 "$CI_DIR/nightly/network-peer.py" \
+    --nonce ci-unit --port-file "$peer_port_file" --timeout 10 \
+    >"$tmp/peer.log" 2>&1 &
+peer_pid=$!
+for ((attempt = 0; attempt < 100; attempt += 1)); do
+    [ -s "$peer_port_file" ] && break
+    sleep 0.01
+done
+[ -s "$peer_port_file" ]
+python3 - "$(tr -d '\r\n' <"$peer_port_file")" <<'PY'
+import socket
+import sys
+
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5) as connection:
+    connection.sendall(b"THEKERNEL_NETWORK_PROBE ci-unit\n")
+    connection.shutdown(socket.SHUT_WR)
+    assert connection.recv(4096) == b"THEKERNEL_NETWORK_REPLY ci-unit\n"
+PY
+wait "$peer_pid"
+grep -Fq 'network-peer: validated guest request' "$tmp/peer.log"
+
+# Compile both support-helper modes on the host. The guest gate supplies the
+# strict overcommit policy that makes its finite request fail deterministically.
+cc -O2 -std=c11 "$REPO_ROOT/scripts/support-tools/nightly-oom-admission.c" \
+    -o "$tmp/nightly-oom-admission"
+"$tmp/nightly-oom-admission" --expect-success 4096 >/dev/null
+"$tmp/nightly-oom-admission" --expect-failure 18446744073709551615 >/dev/null
 
 printf 'test-ci-scripts: PASS\n'

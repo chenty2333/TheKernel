@@ -72,10 +72,8 @@ nightly-system:
       when: manual
     - when: never
   # Exit 78 means one or more named test families lack real infrastructure.
-  # GitLab renders this as a warning, while exit 1 remains a hard test failure.
-  allow_failure:
-    exit_codes:
-      - 78
+  # It intentionally remains a non-passing job so a scheduled pipeline cannot
+  # hide a missing nightly capability behind a green status.
   artifacts:
     when: always
     expire_in: 30 days
