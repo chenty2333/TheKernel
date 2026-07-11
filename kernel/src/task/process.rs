@@ -191,10 +191,10 @@ const fn init_uts_state() -> UtsState {
         domainname: [0; UTS_FIELD_LEN],
         domainname_len: 0,
     };
-    state.nodename_len = copy_uts_field(&mut state.nodename, b"starry");
+    state.nodename_len = copy_uts_field(&mut state.nodename, b"thekernel");
     state.domainname_len = copy_uts_field(
         &mut state.domainname,
-        b"https://github.com/Starry-OS/StarryOS",
+        b"https://github.com/chenty2333/TheKernel",
     );
     state
 }

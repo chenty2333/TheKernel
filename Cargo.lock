@@ -3029,75 +3029,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "starry-kernel"
-version = "0.2.0-preview.2"
-dependencies = [
- "axalloc",
- "axbacktrace",
- "axconfig",
- "axdisplay",
- "axdriver",
- "axerrno 0.2.2",
- "axfeat",
- "axfs-ng",
- "axfs-ng-vfs",
- "axhal",
- "axinput",
- "axio",
- "axlog",
- "axmm",
- "axnet-ng",
- "axpoll",
- "axruntime",
- "axsync",
- "axtask",
- "bitflags 2.11.0",
- "bitmaps",
- "bytemuck",
- "cfg-if",
- "chacha20",
- "chrono",
- "downcast-rs",
- "enum_dispatch",
- "event-listener",
- "extern-trait",
- "flatten_objects",
- "gimli",
- "hashbrown",
- "indoc",
- "inherit-methods-macro",
- "kernel-elf-parser",
- "kernel_guard",
- "kspin",
- "lazy_static",
- "linkme",
- "linux-raw-sys",
- "lock_api",
- "memory_addr",
- "memory_set",
- "num_enum",
- "ouroboros",
- "page_table_multiarch",
- "percpu",
- "rand",
- "ringbuf",
- "riscv 0.16.0",
- "scope-local",
- "slab",
- "spin 0.10.0",
- "starry-process",
- "starry-signal",
- "starry-vm",
- "strum 0.28.0",
- "syscalls",
- "uluru",
- "weak-map",
- "x86",
- "xmas-elf",
- "zerocopy 0.8.41",
-]
-
-[[package]]
 name = "starry-process"
 version = "0.2.0"
 dependencies = [
@@ -3143,15 +3074,6 @@ dependencies = [
  "axerrno 0.2.2",
  "bytemuck",
  "extern-trait",
-]
-
-[[package]]
-name = "starryos"
-version = "0.2.0-preview.2"
-dependencies = [
- "axfeat",
- "axplat-riscv64-visionfive2",
- "starry-kernel",
 ]
 
 [[package]]
@@ -3260,6 +3182,84 @@ name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
+
+[[package]]
+name = "thekernel"
+version = "0.2.0-preview.2"
+dependencies = [
+ "axfeat",
+ "axplat-riscv64-visionfive2",
+ "thekernel-kernel",
+]
+
+[[package]]
+name = "thekernel-kernel"
+version = "0.2.0-preview.2"
+dependencies = [
+ "axalloc",
+ "axbacktrace",
+ "axconfig",
+ "axdisplay",
+ "axdriver",
+ "axerrno 0.2.2",
+ "axfeat",
+ "axfs-ng",
+ "axfs-ng-vfs",
+ "axhal",
+ "axinput",
+ "axio",
+ "axlog",
+ "axmm",
+ "axnet-ng",
+ "axpoll",
+ "axruntime",
+ "axsync",
+ "axtask",
+ "bitflags 2.11.0",
+ "bitmaps",
+ "bytemuck",
+ "cfg-if",
+ "chacha20",
+ "chrono",
+ "downcast-rs",
+ "enum_dispatch",
+ "event-listener",
+ "extern-trait",
+ "flatten_objects",
+ "gimli",
+ "hashbrown",
+ "indoc",
+ "inherit-methods-macro",
+ "kernel-elf-parser",
+ "kernel_guard",
+ "kspin",
+ "lazy_static",
+ "linkme",
+ "linux-raw-sys",
+ "lock_api",
+ "memory_addr",
+ "memory_set",
+ "num_enum",
+ "ouroboros",
+ "page_table_multiarch",
+ "percpu",
+ "rand",
+ "ringbuf",
+ "riscv 0.16.0",
+ "scope-local",
+ "slab",
+ "spin 0.10.0",
+ "starry-process",
+ "starry-signal",
+ "starry-vm",
+ "strum 0.28.0",
+ "syscalls",
+ "uluru",
+ "weak-map",
+ "x86",
+ "xmas-elf",
+ "zerocopy 0.8.41",
+]
 
 [[package]]
 name = "thiserror"

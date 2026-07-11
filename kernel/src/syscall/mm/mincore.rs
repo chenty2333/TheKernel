@@ -28,7 +28,7 @@ use crate::task::AsThread;
 ///
 /// # Return Value
 /// * `Ok(0)` on success
-/// * `Err(EAGAIN)` - Kernel is temporarily out of resources (not implemented in StarryOS)
+/// * `Err(EAGAIN)` - Kernel is temporarily out of resources (not implemented in TheKernel)
 /// * `Err(EFAULT)` - vec points to an invalid address (handled by vm_write_slice)
 /// * `Err(EINVAL)` - addr is not a multiple of the page size
 /// * `Err(ENOMEM)` - length is greater than (TASK_SIZE - addr), or negative length, or `addr` to `addr`+`length` contained unmapped memory

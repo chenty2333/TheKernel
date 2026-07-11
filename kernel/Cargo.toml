@@ -1,5 +1,5 @@
 [package]
-name = "starry-kernel"
+name = "thekernel-kernel"
 version.workspace = true
 edition.workspace = true
 description.workspace = true

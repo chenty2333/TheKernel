@@ -17,8 +17,8 @@ authors = [
     "朝倉水希 <asakuramizu111@gmail.com>",
     "Mivik <mivikq@gmail.com>",
 ]
-homepage = "https://github.com/Starry-OS"
-repository = "https://github.com/Starry-OS/StarryOS"
+homepage = "https://github.com/chenty2333/TheKernel"
+repository = "https://github.com/chenty2333/TheKernel"
 
 [workspace.dependencies]
 axfeat = { version = "0.3.0-preview.2" }
@@ -37,10 +37,10 @@ axruntime = { version = "0.3.0-preview.2" }
 axsync = { version = "0.3.0-preview.2" }
 axtask = { version = "0.3.0-preview.2" }
 
-starry-kernel = { path = "kernel", version = "=0.2.0-preview.2" }
+thekernel-kernel = { path = "kernel", version = "=0.2.0-preview.2" }
 
 [package]
-name = "starryos"
+name = "thekernel"
 version.workspace = true
 edition.workspace = true
 description.workspace = true
@@ -58,25 +58,25 @@ qemu = [
 
     "axfeat/display",
 
-    "starry-kernel/bpf",
-    "starry-kernel/input",
+    "thekernel-kernel/bpf",
+    "thekernel-kernel/input",
 
     # auxilary features
     "axfeat/fs-ng-times",
-    "starry-kernel/dev-log",
+    "thekernel-kernel/dev-log",
 ]
 smp = ["axfeat/smp", "axplat-riscv64-visionfive2?/smp"]
 
 vf2 = ["dep:axplat-riscv64-visionfive2", "axfeat/driver-sdmmc"]
 
 [[bin]]
-name = "starryos"
+name = "thekernel"
 path = "src/main.rs"
 required-features = ["qemu"]
 
 [dependencies]
 axfeat.workspace = true
-starry-kernel.workspace = true
+thekernel-kernel.workspace = true
 
 [dependencies.axplat-riscv64-visionfive2]
 version = "0.1.0-pre.1"

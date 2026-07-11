@@ -25,7 +25,7 @@ fn main() {
         .collect::<Vec<_>>();
     let envs = ENVS.iter().copied().map(str::to_owned).collect::<Vec<_>>();
 
-    starry_kernel::entry::init(&args, &envs);
+    thekernel_kernel::entry::init(&args, &envs);
 }
 
 #[cfg(feature = "vf2")]

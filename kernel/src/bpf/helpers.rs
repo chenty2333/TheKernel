@@ -478,7 +478,7 @@ fn helper_get_current_pid_tgid() -> u64 {
 }
 
 fn helper_get_current_uid_gid() -> u64 {
-    // StarryOS runs as root (uid=0, gid=0)
+    // TheKernel currently initializes userspace as root (uid=0, gid=0).
     0
 }
 
