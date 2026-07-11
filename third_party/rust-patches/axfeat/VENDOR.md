@@ -1,15 +1,15 @@
-# Vendored source record: `axplat-loongarch64-qemu-virt`
+# Vendored source record: `axfeat`
 
 ## Immutable published baseline
 
-- Registry package: `axplat-loongarch64-qemu-virt` `0.3.1-pre.6`
-- crates.io archive: `axplat-loongarch64-qemu-virt-0.3.1-pre.6.crate`
-- crates.io archive SHA-256: `0bb9c67d904ccf30561a6239b67411058b215cb6d6a8d3ac737e7a51230b40bf`
-- Archive URL: <https://static.crates.io/crates/axplat-loongarch64-qemu-virt/axplat-loongarch64-qemu-virt-0.3.1-pre.6.crate>
-- Repository declared by the package: <https://github.com/arceos-org/axplat_crates>.
+- Registry package: `axfeat` `0.3.0-preview.2`
+- crates.io archive: `axfeat-0.3.0-preview.2.crate`
+- crates.io archive SHA-256: `0abc9f576faa89f8ffb6a56e521fcf4eccf47fc4321afa93a3c5b769d4fbaafa`
+- Archive URL: <https://static.crates.io/crates/axfeat/axfeat-0.3.0-preview.2.crate>
+- Repository declared by the package: <https://github.com/arceos-org/arceos/tree/main/api/axfeat>.
 - Upstream tag: `not-recorded-in-published-archive`; the registry archive does not prove a tag name.
-- Cargo records exact source commit `811837d8c699941f43665510b6e30700faa0e633` with `dirty=false`.
-- Original published manifest: `Cargo.toml.orig` (SHA-256 `3822290b18860ffbfd1ec2b2cec7380440c63780b197c1dabb9960d7c54bf616`)
+- Cargo records exact source commit `6c6765c05df0550e31edb0ca82d468199f108b3f` with `dirty=false`.
+- Original published manifest: `Cargo.toml.orig` (SHA-256 `45f39b31ed0127d6490156cf0416a84085406d71b2ae8ad58a9280bb80e48d5c`)
 - Cargo source record: `.cargo_vcs_info.json`
 
 The archive checksum is the exact source baseline. A Git commit marked as
@@ -25,10 +25,9 @@ The published archive contains no `tests/` files, so there are no upstream test 
 
 ## TheKernel patch ledger
 
-- `2aee666` repaired LoongArch QEMU boot, console, interrupt, memory, and timer integration.
-- `e0a7cc1` aligned runtime packaging and platform configuration.
-- `c52dc6f` and `96df7d9` wired bounded VirtIO queue/IRQ mechanisms.
-- Maintained delta: QEMU-virt platform configuration and Layer-0 device/IRQ/timer glue only.
+- `2aee666` aligned architecture/device feature bundles.
+- `96df7d9` wired the shared/async block mechanism without placing benchmark policy in the feature crate.
+- Maintained delta: Cargo feature composition only; runtime and Linux-visible policy remain in their owning layers.
 
 Commit IDs are navigation hints for the current rewritten history. The exact
 rebase baseline is the archive checksum above; the live patch is the diff

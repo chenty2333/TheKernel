@@ -1,15 +1,15 @@
-# Vendored source record: `axplat-loongarch64-qemu-virt`
+# Vendored source record: `axnet-ng`
 
 ## Immutable published baseline
 
-- Registry package: `axplat-loongarch64-qemu-virt` `0.3.1-pre.6`
-- crates.io archive: `axplat-loongarch64-qemu-virt-0.3.1-pre.6.crate`
-- crates.io archive SHA-256: `0bb9c67d904ccf30561a6239b67411058b215cb6d6a8d3ac737e7a51230b40bf`
-- Archive URL: <https://static.crates.io/crates/axplat-loongarch64-qemu-virt/axplat-loongarch64-qemu-virt-0.3.1-pre.6.crate>
-- Repository declared by the package: <https://github.com/arceos-org/axplat_crates>.
+- Registry package: `axnet-ng` `0.3.0-preview.2`
+- crates.io archive: `axnet-ng-0.3.0-preview.2.crate`
+- crates.io archive SHA-256: `a3a33a22c3b07301d1cf096021a1f048c0d48b02d5fc034c237fb9968dc06da2`
+- Archive URL: <https://static.crates.io/crates/axnet-ng/axnet-ng-0.3.0-preview.2.crate>
+- Repository declared by the package: <https://github.com/arceos-org/arceos/tree/main/modules/axnet>.
 - Upstream tag: `not-recorded-in-published-archive`; the registry archive does not prove a tag name.
-- Cargo records exact source commit `811837d8c699941f43665510b6e30700faa0e633` with `dirty=false`.
-- Original published manifest: `Cargo.toml.orig` (SHA-256 `3822290b18860ffbfd1ec2b2cec7380440c63780b197c1dabb9960d7c54bf616`)
+- Cargo records exact source commit `6c6765c05df0550e31edb0ca82d468199f108b3f` with `dirty=false`.
+- Original published manifest: `Cargo.toml.orig` (SHA-256 `7c21d3c1b4cbdf20ef2c4c947ff7933d2898de4d88bd59f14ad30c9f5be9c744`)
 - Cargo source record: `.cargo_vcs_info.json`
 
 The archive checksum is the exact source baseline. A Git commit marked as
@@ -25,10 +25,12 @@ The published archive contains no `tests/` files, so there are no upstream test 
 
 ## TheKernel patch ledger
 
-- `2aee666` repaired LoongArch QEMU boot, console, interrupt, memory, and timer integration.
-- `e0a7cc1` aligned runtime packaging and platform configuration.
-- `c52dc6f` and `96df7d9` wired bounded VirtIO queue/IRQ mechanisms.
-- Maintained delta: QEMU-virt platform configuration and Layer-0 device/IRQ/timer glue only.
+- `1154947` imported the original local network-module snapshot.
+- `ca56928` replaced silently ignored socket-buffer options with retained state.
+- `3612f70`, `44c07cb`, and `68ddc10` repaired TCP receive/close/drain behavior.
+- `96df7d9` hardened fallible buffer replacement and subsystem boundaries.
+- `d38fb1b` added bounded Unix/network lifecycle and resource admission work.
+- Maintained delta: per-NetStack routing/namespace state, loopback and veth mechanics, bounded socket buffers, readiness/waker integration, and TCP/UDP/Unix transport fixes.
 
 Commit IDs are navigation hints for the current rewritten history. The exact
 rebase baseline is the archive checksum above; the live patch is the diff

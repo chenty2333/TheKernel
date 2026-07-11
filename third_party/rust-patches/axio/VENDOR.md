@@ -1,15 +1,15 @@
-# Vendored source record: `axplat-loongarch64-qemu-virt`
+# Vendored source record: `axio`
 
 ## Immutable published baseline
 
-- Registry package: `axplat-loongarch64-qemu-virt` `0.3.1-pre.6`
-- crates.io archive: `axplat-loongarch64-qemu-virt-0.3.1-pre.6.crate`
-- crates.io archive SHA-256: `0bb9c67d904ccf30561a6239b67411058b215cb6d6a8d3ac737e7a51230b40bf`
-- Archive URL: <https://static.crates.io/crates/axplat-loongarch64-qemu-virt/axplat-loongarch64-qemu-virt-0.3.1-pre.6.crate>
-- Repository declared by the package: <https://github.com/arceos-org/axplat_crates>.
+- Registry package: `axio` `0.3.0-pre.1`
+- crates.io archive: `axio-0.3.0-pre.1.crate`
+- crates.io archive SHA-256: `f6ce41624ae4e7ef942ebe3ac3aa3ce5d64340e8f23fb29bbd0007e9765544b4`
+- Archive URL: <https://static.crates.io/crates/axio/axio-0.3.0-pre.1.crate>
+- Repository declared by the package: <https://github.com/arceos-org/axio>.
 - Upstream tag: `not-recorded-in-published-archive`; the registry archive does not prove a tag name.
-- Cargo records exact source commit `811837d8c699941f43665510b6e30700faa0e633` with `dirty=false`.
-- Original published manifest: `Cargo.toml.orig` (SHA-256 `3822290b18860ffbfd1ec2b2cec7380440c63780b197c1dabb9960d7c54bf616`)
+- Cargo records exact source commit `9c7e15fdf9f0d7c26185c6a25044dd86811da688` with `dirty=false`.
+- Original published manifest: `Cargo.toml.orig` (SHA-256 `b2a593ee89c01d23cc99aa3b901bccbc7036b7f14f56e0e47af4dd8640316e37`)
 - Cargo source record: `.cargo_vcs_info.json`
 
 The archive checksum is the exact source baseline. A Git commit marked as
@@ -21,14 +21,15 @@ The manifest declares `GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0`, but the 
 
 ## Upstream tests
 
-The published archive contains no `tests/` files, so there are no upstream test assets to restore. Local/unit coverage is tracked as part of the maintained patch.
+All published test paths are restored. Two inferred array lengths in
+`tests/iofn.rs` are written explicitly as 5 because generic array-length
+inference is unavailable on TheKernel's pinned nightly; behavior is unchanged.
 
 ## TheKernel patch ledger
 
-- `2aee666` repaired LoongArch QEMU boot, console, interrupt, memory, and timer integration.
-- `e0a7cc1` aligned runtime packaging and platform configuration.
-- `c52dc6f` and `96df7d9` wired bounded VirtIO queue/IRQ mechanisms.
-- Maintained delta: QEMU-virt platform configuration and Layer-0 device/IRQ/timer glue only.
+- `9d4a335` replaced the unavailable integer checked-difference API for the pinned 2025-05-20 toolchain.
+- `aa98717` trimmed unrelated compatibility patches while retaining that equivalent checked arithmetic.
+- Maintained delta: one toolchain-compatible checked signed-difference helper in `Take`; all eight published integration-test paths are retained with the two pinned-toolchain adapters described above.
 
 Commit IDs are navigation hints for the current rewritten history. The exact
 rebase baseline is the archive checksum above; the live patch is the diff

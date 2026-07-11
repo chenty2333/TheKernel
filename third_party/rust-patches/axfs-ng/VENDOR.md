@@ -1,15 +1,15 @@
-# Vendored source record: `axplat-loongarch64-qemu-virt`
+# Vendored source record: `axfs-ng`
 
 ## Immutable published baseline
 
-- Registry package: `axplat-loongarch64-qemu-virt` `0.3.1-pre.6`
-- crates.io archive: `axplat-loongarch64-qemu-virt-0.3.1-pre.6.crate`
-- crates.io archive SHA-256: `0bb9c67d904ccf30561a6239b67411058b215cb6d6a8d3ac737e7a51230b40bf`
-- Archive URL: <https://static.crates.io/crates/axplat-loongarch64-qemu-virt/axplat-loongarch64-qemu-virt-0.3.1-pre.6.crate>
-- Repository declared by the package: <https://github.com/arceos-org/axplat_crates>.
+- Registry package: `axfs-ng` `0.3.0-preview.2`
+- crates.io archive: `axfs-ng-0.3.0-preview.2.crate`
+- crates.io archive SHA-256: `cda01a3d5334aef9764462e9e06639de220490f897a85749444bac4517d6edd4`
+- Archive URL: <https://static.crates.io/crates/axfs-ng/axfs-ng-0.3.0-preview.2.crate>
+- The published manifest declares no repository URL.
 - Upstream tag: `not-recorded-in-published-archive`; the registry archive does not prove a tag name.
-- Cargo records exact source commit `811837d8c699941f43665510b6e30700faa0e633` with `dirty=false`.
-- Original published manifest: `Cargo.toml.orig` (SHA-256 `3822290b18860ffbfd1ec2b2cec7380440c63780b197c1dabb9960d7c54bf616`)
+- Cargo records exact source commit `6c6765c05df0550e31edb0ca82d468199f108b3f` with `dirty=false`.
+- Original published manifest: `Cargo.toml.orig` (SHA-256 `9b07fbf8844c5029679a8c1aad36ece95aeb7782a57928acce6bdf2d155830d8`)
 - Cargo source record: `.cargo_vcs_info.json`
 
 The archive checksum is the exact source baseline. A Git commit marked as
@@ -25,10 +25,11 @@ The published archive contains no `tests/` files, so there are no upstream test 
 
 ## TheKernel patch ledger
 
-- `2aee666` repaired LoongArch QEMU boot, console, interrupt, memory, and timer integration.
-- `e0a7cc1` aligned runtime packaging and platform configuration.
-- `c52dc6f` and `96df7d9` wired bounded VirtIO queue/IRQ mechanisms.
-- Maintained delta: QEMU-virt platform configuration and Layer-0 device/IRQ/timer glue only.
+- `5f56231` normalized root/path behavior in the imported filesystem mechanism.
+- `af59bd2`, `94d35dd`, and `5017136` added tracked page-cache writeback, sync, coherence, clean-page LRU, and bounded budget work.
+- `887e9ce`, `a6899bb`, and `bbe3747` repaired truncate, mmap/COW, dirty-state, and reclamation interactions.
+- `f66f1ff`, `ba0a4aa`, and `d38fb1b` hardened mount ownership, pathname admission hooks, fallible allocation, and lifecycle boundaries.
+- Maintained delta: generic filesystem/page-cache mechanisms, tmpfs/disk adapters, coherence/writeback, resource accounting, and VFS integration.
 
 Commit IDs are navigation hints for the current rewritten history. The exact
 rebase baseline is the archive checksum above; the live patch is the diff

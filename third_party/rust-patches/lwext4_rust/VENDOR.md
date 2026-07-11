@@ -1,26 +1,45 @@
-# Vendored: lwext4_rust
+# Vendored source record: `lwext4_rust`
 
-## Upstream
+## Immutable published baseline
 
-- Source: `lwext4_rust` v0.2.0
-- Original manifest: `Cargo.toml.orig`
+- Registry package: `lwext4_rust` `0.2.0`
+- crates.io archive: `lwext4_rust-0.2.0.crate`
+- crates.io archive SHA-256: `b8518a02caf4803c6135450571d6af9bdb382880e5617adbd88c0e0eba237cbb`
+- Archive URL: <https://static.crates.io/crates/lwext4_rust/lwext4_rust-0.2.0.crate>
+- Repository declared by the package: <https://github.com/Starry-OS/lwext4_rust>.
+- Upstream tag: `not-recorded-in-published-archive`; the registry archive does not prove a tag name.
+- Cargo records exact source commit `0422ace7c91ca6639beec21c67819db8a14a324b` with `dirty=false`.
+- Original published manifest: `Cargo.toml.orig` (SHA-256 `6fd097cbf0179803c0ff7e2a709ba31cefc0f847bdec09f874d0699169d39303`)
+- Cargo source record: `.cargo_vcs_info.json`
 
-## History
+The archive checksum is the exact source baseline. A Git commit marked as
+context must never be substituted for the dirty published tree.
 
-| Commit | Description |
-|--------|-------------|
-| `01834cc5` | build: fix remote make-all kernel targets |
-| `bcb901f6` | chore: rebuild development environment around repo-local docker |
-| `0faad4f2` | fix: harden dev image downloads and unblock la bootstrap |
-| `84ce9fbd` | fix: unblock rv oscomp path through ltp |
-| `1fda473c` | fix: use distro cross toolchains for lwext4 |
-| `5eb799ad` | fix: harden oscomp kernel semantics and compatibility |
-| `d4456f44` | fix: restore repo-local make all build parity |
-| `c098032f` | fix: stabilize oscomp la evaluation flow |
+## License
 
-## Changes
+The manifest declares `GPL-2.0`; the archive license files are retained as `LICENSE.GPLv2`.
 
-Heavily patched (8 commits). Changes cover initial remote `make all` parity,
-repo-local Docker and LA bootstrap support, cross-compilation toolchain setup,
-ext4 filesystem semantics hardening, and build parity fixes.
-The current `Cargo.toml` is Cargo's auto-normalized form of `Cargo.toml.orig`.
+## Upstream tests
+
+The published archive contains no `tests/` files, so there are no upstream test assets to restore. Local/unit coverage is tracked as part of the maintained patch.
+
+## TheKernel patch ledger
+
+- `1b61d9c`, `4968cf8`, and `e80699a` repaired reproducible host/cross build integration.
+- `05f30cc`, `3c8c09a`, and `24a36ad` hardened ext4 rename, dnotify, ioctl, and filesystem semantics.
+- `c52dc6f` introduced mapped/async block integration with synchronous fallback.
+- `96df7d9` and `d38fb1b` tightened cache freshness, fallible allocation, flush/error propagation, and resource bounds.
+- Maintained delta: lwext4 C bindings, ext4 inode/file adapters, mapped-run/cache mechanisms, flush/error behavior, and build tooling.
+
+Commit IDs are navigation hints for the current rewritten history. The exact
+rebase baseline is the archive checksum above; the live patch is the diff
+between that archive and this directory. `PROVENANCE.toml` plus
+`scripts/ci/validate_vendor_provenance.py` validates the immutable assets and
+prevents an unrecorded local `[patch.crates-io]` entry.
+
+## Rebase rule
+
+Start from the verified registry archive, retain the original manifest, Cargo
+VCS record, license status, and upstream test inventory, then reapply and test
+each maintained ledger item. Do not infer API completeness from the package
+name or silently drop a patch because a later upstream tree looks similar.

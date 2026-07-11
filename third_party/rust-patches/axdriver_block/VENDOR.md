@@ -1,15 +1,15 @@
-# Vendored source record: `axplat-loongarch64-qemu-virt`
+# Vendored source record: `axdriver_block`
 
 ## Immutable published baseline
 
-- Registry package: `axplat-loongarch64-qemu-virt` `0.3.1-pre.6`
-- crates.io archive: `axplat-loongarch64-qemu-virt-0.3.1-pre.6.crate`
-- crates.io archive SHA-256: `0bb9c67d904ccf30561a6239b67411058b215cb6d6a8d3ac737e7a51230b40bf`
-- Archive URL: <https://static.crates.io/crates/axplat-loongarch64-qemu-virt/axplat-loongarch64-qemu-virt-0.3.1-pre.6.crate>
-- Repository declared by the package: <https://github.com/arceos-org/axplat_crates>.
+- Registry package: `axdriver_block` `0.1.4-preview.3`
+- crates.io archive: `axdriver_block-0.1.4-preview.3.crate`
+- crates.io archive SHA-256: `7cccf23999a9dff620ef87c08c571509d2e90cc9dc80f932381b0fd949f020f9`
+- Archive URL: <https://static.crates.io/crates/axdriver_block/axdriver_block-0.1.4-preview.3.crate>
+- Repository declared by the package: <https://github.com/arceos-org/axdriver_crates>.
 - Upstream tag: `not-recorded-in-published-archive`; the registry archive does not prove a tag name.
-- Cargo records exact source commit `811837d8c699941f43665510b6e30700faa0e633` with `dirty=false`.
-- Original published manifest: `Cargo.toml.orig` (SHA-256 `3822290b18860ffbfd1ec2b2cec7380440c63780b197c1dabb9960d7c54bf616`)
+- Cargo records context commit `eea5576b64242a3d599600786632513ee847acd2` with `dirty=true`; that commit is not an exact tree identity.
+- Original published manifest: `Cargo.toml.orig` (SHA-256 `bce3ac5d6904c627fe15004b031b28637c4eab38e270741bbb9777310f1231b0`)
 - Cargo source record: `.cargo_vcs_info.json`
 
 The archive checksum is the exact source baseline. A Git commit marked as
@@ -25,10 +25,9 @@ The published archive contains no `tests/` files, so there are no upstream test 
 
 ## TheKernel patch ledger
 
-- `2aee666` repaired LoongArch QEMU boot, console, interrupt, memory, and timer integration.
-- `e0a7cc1` aligned runtime packaging and platform configuration.
-- `c52dc6f` and `96df7d9` wired bounded VirtIO queue/IRQ mechanisms.
-- Maintained delta: QEMU-virt platform configuration and Layer-0 device/IRQ/timer glue only.
+- `c52dc6f` added the generic async/batch block request, segment, capability, and completion contract.
+- `96df7d9` hardened queue admission, fallback, fence, flush, and IRQ-facing behavior.
+- Maintained delta: bounded request/descriptor capability reporting with an honest synchronous fallback; no Linux ABI policy belongs here.
 
 Commit IDs are navigation hints for the current rewritten history. The exact
 rebase baseline is the archive checksum above; the live patch is the diff

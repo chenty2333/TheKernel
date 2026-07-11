@@ -16,13 +16,12 @@ bus-mmio = []
 bus-pci = ["dep:axdriver_pci", "dep:axhal", "dep:axconfig"]
 net = ["dep:axdriver_net"]
 block = ["dep:axdriver_block"]
-shared-block = ["block", "dep:axsync"]
 display = ["dep:axdriver_display"]
 input = ["dep:axdriver_input"]
 vsock = ["axdriver_vsock"]
 
 # Enabled by features `virtio-*`
-virtio = ["dep:axdriver_virtio", "dep:axalloc", "dep:axhal", "dep:axconfig", "dep:axmm", "dep:spin"]
+virtio = ["dep:axdriver_virtio", "dep:axalloc", "dep:axhal", "dep:axconfig"]
 
 # various types of drivers
 virtio-blk = ["block", "virtio", "axdriver_virtio/block"]
@@ -38,7 +37,7 @@ ixgbe = ["net", "axdriver_net/ixgbe", "dep:axalloc", "dep:axhal", "dep:axdma"]
 fxmac = ["net", "axdriver_net/fxmac", "dep:axalloc", "dep:axhal", "dep:axdma"]
 # more devices example: e1000 = ["net", "axdriver_net/e1000"]
 
-irq = ["axdriver_virtio?/irq"]
+irq = []
 dyn = [
     "dep:axerrno",
     "dep:axhal",
@@ -66,8 +65,6 @@ axdriver_virtio = { workspace = true, optional = true }
 axdriver_vsock = { workspace = true, optional = true }
 axerrno = { workspace = true, optional = true }
 axhal = { workspace = true, optional = true }
-axmm = { workspace = true, optional = true }
-axsync = { workspace = true, optional = true }
 axklib = { workspace = true, optional = true }
 cfg-if.workspace = true
 crate_interface.workspace = true

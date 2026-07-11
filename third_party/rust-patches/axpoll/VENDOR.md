@@ -1,15 +1,15 @@
-# Vendored source record: `axplat-loongarch64-qemu-virt`
+# Vendored source record: `axpoll`
 
 ## Immutable published baseline
 
-- Registry package: `axplat-loongarch64-qemu-virt` `0.3.1-pre.6`
-- crates.io archive: `axplat-loongarch64-qemu-virt-0.3.1-pre.6.crate`
-- crates.io archive SHA-256: `0bb9c67d904ccf30561a6239b67411058b215cb6d6a8d3ac737e7a51230b40bf`
-- Archive URL: <https://static.crates.io/crates/axplat-loongarch64-qemu-virt/axplat-loongarch64-qemu-virt-0.3.1-pre.6.crate>
-- Repository declared by the package: <https://github.com/arceos-org/axplat_crates>.
+- Registry package: `axpoll` `0.1.2`
+- crates.io archive: `axpoll-0.1.2.crate`
+- crates.io archive SHA-256: `36b92f85c6903350f5146216ccb7d7a7e7b4dbd6f5927a1279db03ba52a53ae7`
+- Archive URL: <https://static.crates.io/crates/axpoll/axpoll-0.1.2.crate>
+- Repository declared by the package: <https://github.com/Starry-OS/axpoll>.
 - Upstream tag: `not-recorded-in-published-archive`; the registry archive does not prove a tag name.
-- Cargo records exact source commit `811837d8c699941f43665510b6e30700faa0e633` with `dirty=false`.
-- Original published manifest: `Cargo.toml.orig` (SHA-256 `3822290b18860ffbfd1ec2b2cec7380440c63780b197c1dabb9960d7c54bf616`)
+- Cargo records exact source commit `86f20f6bc1b470fc21894721e72b721f49aa20b7` with `dirty=false`.
+- Original published manifest: `Cargo.toml.orig` (SHA-256 `3debbfb6c8878ea36d06d7e026e04e2828c73e58969992e4a4422852fb21f019`)
 - Cargo source record: `.cargo_vcs_info.json`
 
 The archive checksum is the exact source baseline. A Git commit marked as
@@ -21,14 +21,12 @@ The manifest declares `GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0`, but the 
 
 ## Upstream tests
 
-The published archive contains no `tests/` files, so there are no upstream test assets to restore. Local/unit coverage is tracked as part of the maintained patch.
+All published test paths are present but adapted to the maintained fork: `tests/async.rs`, `tests/tests.rs`. The immutable originals remain recoverable from the verified archive.
 
 ## TheKernel patch ledger
 
-- `2aee666` repaired LoongArch QEMU boot, console, interrupt, memory, and timer integration.
-- `e0a7cc1` aligned runtime packaging and platform configuration.
-- `c52dc6f` and `96df7d9` wired bounded VirtIO queue/IRQ mechanisms.
-- Maintained delta: QEMU-virt platform configuration and Layer-0 device/IRQ/timer glue only.
+- `d38fb1b` replaced an allocation-growing waker vector with a fixed 64-entry registry and moved clone/drop/wake work outside the IRQ-safe lock.
+- Maintained delta: bounded readiness registration, duplicate suppression, deterministic replacement wakeup, and deferred waker destruction.
 
 Commit IDs are navigation hints for the current rewritten history. The exact
 rebase baseline is the archive checksum above; the live patch is the diff
