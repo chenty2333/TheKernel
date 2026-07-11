@@ -56,21 +56,31 @@ fn new_channels(
     let (client_tx, server_rx) = new_uni_channel()?;
     let (server_tx, client_rx) = new_uni_channel()?;
     let poll_update = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
+    let left_close = Arc::try_new(AtomicU8::new(0)).map_err(|_| AxError::NoMemory)?;
+    let right_close = Arc::try_new(AtomicU8::new(0)).map_err(|_| AxError::NoMemory)?;
     Ok((
         Channel {
             tx: Some(client_tx),
             rx: Some(client_rx),
             poll_update: poll_update.clone(),
             peer_credentials: right_credentials,
+            local_close: left_close.clone(),
+            peer_close: right_close.clone(),
         },
         Channel {
             tx: Some(server_tx),
             rx: Some(server_rx),
             poll_update,
             peer_credentials: left_credentials,
+            local_close: right_close,
+            peer_close: left_close,
         },
     ))
 }
+
+const STREAM_READ_CLOSED: u8 = 1 << 0;
+const STREAM_WRITE_CLOSED: u8 = 1 << 1;
+const STREAM_BOTH_CLOSED: u8 = STREAM_READ_CLOSED | STREAM_WRITE_CLOSED;
 
 struct Channel {
     tx: Option<HeapProd<u8>>,
@@ -78,10 +88,38 @@ struct Channel {
     // TODO: granularity
     poll_update: Arc<PollSet>,
     peer_credentials: UnixCredentials,
+    local_close: Arc<AtomicU8>,
+    peer_close: Arc<AtomicU8>,
 }
 
 impl Channel {
+    fn publish_read_close(&self) {
+        self.local_close
+            .fetch_or(STREAM_READ_CLOSED, Ordering::AcqRel);
+    }
+
+    fn publish_write_close(&self) {
+        self.local_close
+            .fetch_or(STREAM_WRITE_CLOSED, Ordering::AcqRel);
+    }
+
+    fn publish_close(&self) {
+        self.local_close
+            .fetch_or(STREAM_BOTH_CLOSED, Ordering::AcqRel);
+    }
+
+    fn peer_read_closed(&self) -> bool {
+        self.peer_close.load(Ordering::Acquire) & STREAM_READ_CLOSED != 0
+            || self.tx.as_ref().is_some_and(|tx| !tx.read_is_held())
+    }
+
+    fn peer_write_closed(&self) -> bool {
+        self.peer_close.load(Ordering::Acquire) & STREAM_WRITE_CLOSED != 0
+            || self.rx.as_ref().is_some_and(|rx| !rx.write_is_held())
+    }
+
     fn close_and_wake(self) {
+        self.publish_close();
         let poll_update = self.poll_update.clone();
         drop(self);
         poll_update.wake();
@@ -530,7 +568,6 @@ impl TransportOps for StreamTransport {
                 drop(client_channel);
                 return Err(AxError::ConnectionRefused);
             }
-
             // The CAS above is the sole transition into CONNECT_RESERVED, and
             // no other operation can install a channel in that state. This is
             // therefore an infallible ownership move after listener enqueue.
@@ -588,12 +625,12 @@ impl TransportOps for StreamTransport {
                 let Some(chan) = guard.as_mut() else {
                     return Err(AxError::NotConnected);
                 };
+                if chan.peer_read_closed() {
+                    return Err(AxError::BrokenPipe);
+                }
                 let Some(tx) = chan.tx.as_mut() else {
                     return Err(AxError::BrokenPipe);
                 };
-                if !tx.read_is_held() {
-                    return Err(AxError::BrokenPipe);
-                }
 
                 let count = {
                     let (left, right) = tx.vacant_slices_mut();
@@ -642,6 +679,7 @@ impl TransportOps for StreamTransport {
                 let Some(chan) = guard.as_mut() else {
                     return Err(AxError::NotConnected);
                 };
+                let peer_write_closed = chan.peer_write_closed();
                 let Some(rx) = chan.rx.as_mut() else {
                     return Ok(0);
                 };
@@ -660,7 +698,7 @@ impl TransportOps for StreamTransport {
                 let poll_update = (count > 0).then(|| chan.poll_update.clone());
                 let result = if count > 0 {
                     Ok(count)
-                } else if !rx.write_is_held() {
+                } else if peer_write_closed {
                     Ok(0)
                 } else {
                     Err(AxError::WouldBlock)
@@ -679,12 +717,14 @@ impl TransportOps for StreamTransport {
             let channel = channel.as_mut().ok_or(AxError::NotConnected)?;
             let retired_rx = if how.has_read() {
                 self.rx_closed.store(true, Ordering::Release);
+                channel.publish_read_close();
                 channel.rx.take()
             } else {
                 None
             };
             let retired_tx = if how.has_write() {
                 self.tx_closed.store(true, Ordering::Release);
+                channel.publish_write_close();
                 channel.tx.take()
             } else {
                 None
@@ -703,8 +743,8 @@ impl Pollable for StreamTransport {
     fn poll(&self) -> IoEvents {
         let mut events = IoEvents::empty();
         if let Some(chan) = self.channel.lock().as_ref() {
-            let peer_write_closed = chan.rx.as_ref().is_some_and(|rx| !rx.write_is_held());
-            let peer_read_closed = chan.tx.as_ref().is_some_and(|tx| !tx.read_is_held());
+            let peer_write_closed = chan.peer_write_closed();
+            let peer_read_closed = chan.peer_read_closed();
             events.set(
                 IoEvents::IN,
                 self.rx_closed.load(Ordering::Acquire)
@@ -752,6 +792,12 @@ impl Drop for StreamTransport {
     fn drop(&mut self) {
         let retired_channel = self.channel.get_mut().take();
         let retired_receiver = self.conn_rx.get_mut().take();
+        if let Some(channel) = retired_channel.as_ref() {
+            channel.publish_close();
+        }
+        if let Some(receiver) = retired_receiver.as_ref() {
+            receiver.close_without_wake_and_visit(|request| request.channel.publish_close());
+        }
         let retired_poll_state = core::mem::replace(&mut self.poll_state, PollSet::new());
         // SAFETY: every constructor initializes this private field exactly
         // once, and Drop runs at most once. The worker takes over the Box so
@@ -814,6 +860,14 @@ mod tests {
 
         drop(right);
         assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        let events = left.poll();
+        assert!(events.contains(IoEvents::RDHUP));
+        assert!(events.contains(IoEvents::ERR));
+        assert!(events.contains(IoEvents::HUP));
+        assert_eq!(
+            left.send(&b"x"[..], SendOptions::default()),
+            Err(AxError::BrokenPipe)
+        );
         assert!(super::super::has_deferred_receive_cleanup_work());
         while super::super::has_deferred_receive_cleanup_work() {
             super::super::drain_deferred_receive_cleanup_work();
@@ -857,6 +911,14 @@ mod tests {
 
         drop(listener);
         assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        let immediate_events = client.poll();
+        assert!(immediate_events.contains(IoEvents::RDHUP));
+        assert!(immediate_events.contains(IoEvents::ERR));
+        assert!(immediate_events.contains(IoEvents::HUP));
+        assert_eq!(
+            client.send(&b"x"[..], SendOptions::default()),
+            Err(AxError::BrokenPipe)
+        );
         while super::super::has_deferred_receive_cleanup_work() {
             super::super::drain_deferred_receive_cleanup_work();
         }
@@ -868,6 +930,107 @@ mod tests {
         assert!(events.contains(IoEvents::HUP));
 
         drop(client);
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+    }
+
+    #[test]
+    fn listener_drop_publishes_close_beyond_one_cleanup_batch() {
+        use core::task::Waker;
+
+        let _guard = super::super::UNIX_CLEANUP_TEST_LOCK.lock();
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+
+        let credentials = UnixCredentials::new(1, 2, 3);
+        let listener = StreamTransport::new().unwrap();
+        let slot = super::super::BindSlot::default();
+        let address = UnixSocketAddr::Path(Arc::new(alloc::string::String::from(
+            "/tmp/axnet-listener-drop-batch",
+        )));
+        listener.bind(&slot, &address).unwrap();
+        listener
+            .listen(&slot, LISTEN_QUEUE_SIZE, credentials)
+            .unwrap();
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountingWake(wakes.clone())));
+        let mut context = Context::from_waker(&waker);
+        let mut clients = alloc::vec::Vec::new();
+        for _ in 0..=STREAM_CLEANUP_REQUEST_BUDGET {
+            let client = StreamTransport::new().unwrap();
+            client
+                .connect(&slot, &UnixSocketAddr::Unnamed, credentials)
+                .unwrap();
+            client.register(&mut context, IoEvents::IN | IoEvents::OUT);
+            clients.push(client);
+        }
+
+        drop(listener);
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        for client in &clients {
+            let events = client.poll();
+            assert!(events.contains(IoEvents::RDHUP));
+            assert!(events.contains(IoEvents::ERR));
+            assert!(events.contains(IoEvents::HUP));
+            assert_eq!(
+                client.send(&b"x"[..], SendOptions::default()),
+                Err(AxError::BrokenPipe)
+            );
+        }
+
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+        assert!(wakes.load(Ordering::SeqCst) > 0);
+        drop(clients);
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+    }
+
+    #[test]
+    fn peer_drop_preserves_queued_bytes_before_eof() {
+        let _guard = super::super::UNIX_CLEANUP_TEST_LOCK.lock();
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+
+        let credentials = UnixCredentials::new(1, 2, 3);
+        let (left, right) = StreamTransport::new_pair(credentials).unwrap();
+        assert_eq!(left.send(&b"data"[..], SendOptions::default()).unwrap(), 4);
+        drop(left);
+
+        let mut bytes = [0u8; 4];
+        assert_eq!(
+            right
+                .recv(
+                    &mut bytes[..],
+                    RecvOptions {
+                        flags: RecvFlags::DONT_WAIT,
+                        ..RecvOptions::default()
+                    },
+                )
+                .unwrap(),
+            4
+        );
+        assert_eq!(&bytes, b"data");
+        assert_eq!(
+            right
+                .recv(
+                    &mut bytes[..],
+                    RecvOptions {
+                        flags: RecvFlags::DONT_WAIT,
+                        ..RecvOptions::default()
+                    },
+                )
+                .unwrap(),
+            0
+        );
+
+        drop(right);
         while super::super::has_deferred_receive_cleanup_work() {
             super::super::drain_deferred_receive_cleanup_work();
         }

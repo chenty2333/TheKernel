@@ -360,8 +360,8 @@ impl Channel {
 
     fn writable_for(&self, local_buffers: &SocketBufferLimits, charge: usize) -> bool {
         if self.peer_closed.load(Ordering::Acquire) || self.data_tx.is_closed() {
-            // Let the send attempt run and report EPIPE instead of sleeping on
-            // a peer that can never wake us again.
+            // Let the send attempt run and report ECONNREFUSED instead of
+            // sleeping on a peer that can never wake us again.
             return true;
         }
         !self.data_tx.is_full()
@@ -382,7 +382,7 @@ impl Channel {
         // before consulting stale queue accounting so close can never turn a
         // full queue into an endless WouldBlock/retry loop.
         if self.peer_closed.load(Ordering::Acquire) || self.data_tx.is_closed() {
-            return Err(AxError::BrokenPipe);
+            return Err(AxError::ConnectionRefused);
         }
         let capacity = self.capacity(local_buffers);
         if charge > capacity {
@@ -395,7 +395,7 @@ impl Channel {
         let permit = match self.data_tx.try_reserve(UNIX_DGRAM_QUEUE_SLOTS) {
             Ok(permit) => permit,
             Err(ReserveError::Full) => return Err(AxError::WouldBlock),
-            Err(ReserveError::Closed) => return Err(AxError::BrokenPipe),
+            Err(ReserveError::Closed) => return Err(AxError::ConnectionRefused),
         };
 
         loop {
@@ -424,7 +424,7 @@ impl Channel {
         };
         if self.peer_closed.load(Ordering::Acquire) || self.data_tx.is_closed() {
             drop(admission);
-            return Err(AxError::BrokenPipe);
+            return Err(AxError::ConnectionRefused);
         }
         Ok(admission)
     }
@@ -451,7 +451,7 @@ impl PendingSendAdmission {
             }
             Err(PermitSendError::Closed(packet)) => {
                 drop(packet);
-                Err(AxError::BrokenPipe)
+                Err(AxError::ConnectionRefused)
             }
         }
     }
@@ -1235,6 +1235,10 @@ mod tests {
         left.shutdown(Shutdown::Write).unwrap();
         assert!(left.tx_shutdown.load(Ordering::Acquire));
         assert!(!left.poll().contains(IoEvents::OUT));
+        assert_eq!(
+            left.send(&b"x"[..], SendOptions::default()),
+            Err(AxError::BrokenPipe)
+        );
 
         right.shutdown(Shutdown::Read).unwrap();
         assert!(right.rx_shutdown.load(Ordering::Acquire));
@@ -1280,7 +1284,7 @@ mod tests {
         assert!(left.poll().contains(IoEvents::OUT));
         assert_eq!(
             left.send(&byte[..], SendOptions::default()).unwrap_err(),
-            AxError::BrokenPipe
+            AxError::ConnectionRefused
         );
         drop(left);
         drop(right);
@@ -1324,7 +1328,7 @@ mod tests {
         assert!(left.poll().contains(IoEvents::OUT));
         assert_eq!(
             left.send(&byte[..], SendOptions::default()).unwrap_err(),
-            AxError::BrokenPipe
+            AxError::ConnectionRefused
         );
 
         let mut observed_progress = false;
@@ -1398,7 +1402,7 @@ mod tests {
         assert!(left.poll().contains(IoEvents::OUT));
         assert_eq!(
             left.send(&byte[..], SendOptions::default()).unwrap_err(),
-            AxError::BrokenPipe
+            AxError::ConnectionRefused
         );
     }
 

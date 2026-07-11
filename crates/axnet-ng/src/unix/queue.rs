@@ -8,7 +8,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axpoll::PollSet;
-use axsync::Mutex;
+use axsync::spin::SpinNoIrq;
 
 struct QueueState<T> {
     items: VecDeque<T>,
@@ -19,7 +19,10 @@ struct QueueState<T> {
 
 struct Shared<T> {
     capacity: usize,
-    state: Mutex<QueueState<T>>,
+    // Every operation is bounded and allocation-free after construction.
+    // A non-sleeping lock lets final endpoint Drop publish queue closure
+    // without entering the scheduler or invoking a waker.
+    state: SpinNoIrq<QueueState<T>>,
     senders: AtomicUsize,
     receivers: AtomicUsize,
     readers: PollSet,
@@ -80,7 +83,7 @@ pub(super) fn try_bounded<T>(capacity: usize) -> AxResult<(Sender<T>, Receiver<T
         .map_err(|_| AxError::NoMemory)?;
     let shared = Arc::try_new(Shared {
         capacity,
-        state: Mutex::new(QueueState {
+        state: SpinNoIrq::new(QueueState {
             items,
             reserved: 0,
             send_closed: false,
@@ -219,15 +222,27 @@ impl<T> Receiver<T> {
     }
 
     pub(super) fn close(&self) {
-        let changed = {
+        {
             let mut state = self.shared.state.lock();
-            let changed = !state.receive_closed;
             state.receive_closed = true;
-            changed
-        };
-        if changed {
-            self.shared.readers.wake();
-            self.shared.writers.wake();
+        }
+        // The deferred finalizer calls this after Drop may already have
+        // published receive_closed without waking. Always emit the eventual
+        // wake edge, even when the state transition itself is idempotent.
+        self.shared.readers.wake();
+        self.shared.writers.wake();
+    }
+
+    /// Publishes receive closure and visits every already queued item without
+    /// removing, dropping, allocating, sleeping, or invoking a waker.
+    ///
+    /// The visitor runs under the bounded queue's non-sleeping state lock and
+    /// therefore must perform only fixed-cost close-state publication.
+    pub(super) fn close_without_wake_and_visit(&self, mut visit: impl FnMut(&T)) {
+        let mut state = self.shared.state.lock();
+        state.receive_closed = true;
+        for item in &state.items {
+            visit(item);
         }
     }
 
@@ -340,5 +355,18 @@ mod tests {
         drop(permit);
         sender.try_reserve(1).unwrap().send(7).unwrap();
         assert_eq!(receiver.try_recv(), Ok(7));
+    }
+
+    #[test]
+    fn close_without_wake_rejects_an_already_reserved_publication_and_visits_all_items() {
+        let (sender, receiver) = try_bounded(4).unwrap();
+        sender.try_send(1).unwrap();
+        sender.try_send(2).unwrap();
+        let permit = sender.try_reserve(4).unwrap();
+        let mut visited = 0;
+        receiver.close_without_wake_and_visit(|_| visited += 1);
+        assert_eq!(visited, 2);
+        assert!(matches!(permit.send(3), Err(PermitSendError::Closed(3))));
+        assert!(matches!(sender.try_reserve(4), Err(ReserveError::Closed)));
     }
 }
