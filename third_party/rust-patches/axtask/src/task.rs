@@ -264,13 +264,37 @@ impl TaskInner {
     ///
     /// It will return immediately if the task has already exited (but not dropped).
     pub fn join(&self) -> i32 {
-        block_on(poll_fn(|cx| {
-            if self.state() == TaskState::Exited {
-                return Poll::Ready(self.exit_code.load(Ordering::Acquire));
-            }
-            self.wait_for_exit.register(cx.waker());
-            Poll::Pending
-        }))
+        block_on(poll_fn(|cx| self.poll_join(cx)))
+    }
+
+    fn exited_code(&self) -> Option<i32> {
+        (self.state() == TaskState::Exited).then(|| self.exit_code.load(Ordering::Acquire))
+    }
+
+    fn poll_join(&self, cx: &mut Context<'_>) -> Poll<i32> {
+        if let Some(exit_code) = self.exited_code() {
+            return Poll::Ready(exit_code);
+        }
+
+        self.register_join_waiter_and_recheck(cx)
+    }
+
+    fn register_join_waiter_and_recheck(&self, cx: &mut Context<'_>) -> Poll<i32> {
+        self.wait_for_exit.register(cx.waker());
+
+        // Exit can race between the first state check and waker publication.
+        // Rechecking after registration makes both interleavings safe: either
+        // the registered waker observes a later exit, or this poll observes an
+        // exit whose earlier wake had no waiter to consume it.
+        self.exited_code().map_or(Poll::Pending, Poll::Ready)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_join_waiter_and_recheck_for_test(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<i32> {
+        self.register_join_waiter_and_recheck(cx)
     }
 
     /// Returns a reference to the task extended data.
@@ -593,8 +617,10 @@ impl TaskInner {
 
     /// Notify all tasks that join on this task.
     pub(crate) fn notify_exit(&self, exit_code: i32) {
-        self.set_state(TaskState::Exited);
         self.exit_code.store(exit_code, Ordering::Release);
+        // Publish the exit code before Exited. An Acquire state observation in
+        // join() must never pair the terminal state with the old exit code.
+        self.set_state(TaskState::Exited);
         self.wait_for_exit.wake();
     }
 

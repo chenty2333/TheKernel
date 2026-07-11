@@ -1,4 +1,7 @@
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::{
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    task::{Context, Poll, Waker},
+};
 use std::sync::{Mutex, Once};
 
 use axerrno::AxError;
@@ -162,6 +165,22 @@ fn test_task_join() {
     for (i, task) in tasks.into_iter().enumerate() {
         assert_eq!(task.join(), i as _);
     }
+}
+
+#[test]
+fn task_join_closes_exit_before_waker_registration_race() {
+    let task = crate::TaskInner::new_init("join-race".into());
+    let mut context = Context::from_waker(Waker::noop());
+
+    // Force exactly the lost-wake ordering: the first state check observes a
+    // live task, then exit publishes and wakes before AtomicWaker::register.
+    // No later wake exists, so only the post-registration state check can make
+    // this poll complete.
+    assert_ne!(task.state(), crate::TaskState::Exited);
+    task.notify_exit(73);
+    let result = task.register_join_waiter_and_recheck_for_test(&mut context);
+
+    assert_eq!(result, Poll::Ready(73));
 }
 
 #[test]
