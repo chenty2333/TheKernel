@@ -1,3 +1,4 @@
+use alloc::sync::Arc;
 use core::mem::size_of;
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -20,12 +21,13 @@ use linux_raw_sys::{
         SOCK_STREAM, sockaddr, socklen_t,
     },
 };
+use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
 
 use super::addr::SocketAddrExt;
 use crate::{
     file::{
-        AfAlgSocket, FileLike, NetlinkSocket, Socket, add_file_like, af_alg, close_file_like,
-        get_file_like,
+        AfAlgSocket, FileDescription, FileLike, NetlinkSocket, Socket, add_file_like, af_alg,
+        close_file_like, get_file_like, reserve_fd,
     },
     mm::{UserConstPtr, UserPtr},
     task::AsThread,
@@ -200,9 +202,14 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
         if addrlen as usize != size_of::<crate::file::netlink::SockaddrNl>() {
             return Err(AxError::InvalidInput);
         }
-        let addr = *addr
-            .cast::<crate::file::netlink::SockaddrNl>()
-            .get_as_ref()?;
+        let addr = unsafe {
+            // Every byte is copied into the MaybeUninit storage before
+            // success, and SockaddrNl contains only integer fields for which
+            // every bit pattern is valid.
+            (addr.address().as_usize() as *const crate::file::netlink::SockaddrNl)
+                .vm_read_uninit()?
+                .assume_init()
+        };
         if addr.nl_family as u32 != AF_NETLINK {
             return Err(AxError::from(LinuxError::EAFNOSUPPORT));
         }
@@ -322,7 +329,7 @@ pub fn sys_accept4(
             request.set_nonblocking(true)?;
         }
         if !addr.is_null() {
-            *addrlen.get_as_mut()? = 0;
+            (addrlen.address().as_usize() as *mut socklen_t).vm_write(0)?;
         }
         return request.add_to_fd_table(cloexec).map(|fd| fd as isize);
     }
@@ -336,7 +343,10 @@ pub fn sys_accept4(
 
     let remote_addr = socket.peer_addr()?;
     if !addr.is_null() {
-        remote_addr.write_to_user(addr, addrlen.get_as_mut()?)?;
+        let addrlen_ptr = addrlen.address().as_usize() as *mut socklen_t;
+        let mut value = addrlen_ptr.vm_read()?;
+        remote_addr.write_to_user(addr, &mut value)?;
+        addrlen_ptr.vm_write(value)?;
     }
 
     let fd = socket.add_to_fd_table(cloexec).map(|fd| fd as isize)?;
@@ -366,7 +376,6 @@ pub fn sys_socketpair(
 ) -> AxResult<isize> {
     debug!("sys_socketpair <= domain: {domain}, ty: {raw_ty}, proto: {proto}");
     let (ty, nonblocking, cloexec) = parse_socket_type(raw_ty)?;
-    let fds = fds.get_as_mut()?;
 
     if matches!(domain, AF_INET | AF_INET6) {
         return Err(inet_socketpair_error(ty, proto));
@@ -413,14 +422,25 @@ pub fn sys_socketpair(
         sock2.set_nonblocking(true)?;
     }
 
-    let fd1 = sock1.add_to_fd_table(cloexec)?;
-    let fd2 = match sock2.add_to_fd_table(cloexec) {
-        Ok(fd) => fd,
-        Err(err) => {
-            let _ = close_file_like(fd1);
-            return Err(err);
-        }
-    };
-    *fds = [fd1, fd2];
+    // Reserve both numbers before exposing either descriptor. The user copy
+    // operates on a kernel-owned array and completes before fd publication,
+    // so a concurrent unmap/remap cannot invalidate a retained Rust reference
+    // and EFAULT leaves no partially installed socket behind.
+    let reserved1 = reserve_fd(cloexec)?;
+    let reserved2 = reserve_fd(cloexec)?;
+    let description1 = FileDescription::new(
+        Arc::try_new(sock1).map_err(|_| AxError::NoMemory)? as Arc<dyn FileLike>
+    )?;
+    let description2 = FileDescription::new(
+        Arc::try_new(sock2).map_err(|_| AxError::NoMemory)? as Arc<dyn FileLike>
+    )?;
+    let fd_pair = [reserved1.fd(), reserved2.fd()];
+    vm_write_slice(fds.address().as_usize() as *mut i32, &fd_pair)?;
+
+    let fd1 = reserved1.publish(description1)?;
+    if let Err(error) = reserved2.publish(description2) {
+        let _ = close_file_like(fd1);
+        return Err(error);
+    }
     Ok(0)
 }

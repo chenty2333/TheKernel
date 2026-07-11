@@ -314,6 +314,10 @@ const fn rights_push_was_truncated(expected: usize, result: super::cmsg::RightsP
     result.installed < expected || !result.published
 }
 
+fn should_raise_sigpipe(error: AxError, flags: u32) -> bool {
+    error == AxError::BrokenPipe && flags & MSG_NOSIGNAL == 0
+}
+
 fn send_impl(
     socket: &StableMessageSocket,
     fd: i32,
@@ -365,13 +369,13 @@ fn send_impl(
         socket.send(&mut src, options)
     };
     let sent = match sent {
-        Err(AxError::BrokenPipe) => {
-            if flags & MSG_NOSIGNAL == 0 {
+        Err(error) => {
+            if should_raise_sigpipe(error, flags) {
                 raise_sigpipe();
             }
-            return Err(AxError::BrokenPipe);
+            return Err(error);
         }
-        other => other?,
+        Ok(sent) => sent,
     };
 
     Ok(sent as isize)
@@ -788,5 +792,12 @@ mod tests {
                 published: true,
             }
         ));
+    }
+
+    #[test]
+    fn datagram_peer_refusal_never_raises_sigpipe() {
+        assert!(!should_raise_sigpipe(AxError::ConnectionRefused, 0));
+        assert!(should_raise_sigpipe(AxError::BrokenPipe, 0));
+        assert!(!should_raise_sigpipe(AxError::BrokenPipe, MSG_NOSIGNAL));
     }
 }

@@ -61,7 +61,12 @@ impl Socket {
 
     pub fn set_bpf_filter(&self, prog: Option<Arc<BpfProgram>>) -> AxResult<()> {
         let filter = prog
-            .map(|prog| Arc::new(AttachedSocketFilter { prog }) as Arc<dyn axnet::SocketFilter>);
+            .map(|prog| {
+                Arc::try_new(AttachedSocketFilter { prog })
+                    .map(|filter| filter as Arc<dyn axnet::SocketFilter>)
+                    .map_err(|_| AxError::NoMemory)
+            })
+            .transpose()?;
         self.inner.set_filter(filter)
     }
 
