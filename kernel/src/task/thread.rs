@@ -24,7 +24,7 @@ use starry_signal::{
 use super::{
     ProcessData,
     accounting::{AtomicTaskUsage, TaskUsage},
-    creds::{Cred, CredentialSlot},
+    creds::CredentialSlot,
     restart::RestartTracker,
     timer::TimeManager,
 };
@@ -49,11 +49,14 @@ pub struct Thread {
     /// The process data shared by all threads in the process.
     pub proc_data: Arc<ProcessData>,
 
-    /// Atomically published immutable security identity owned by this task.
+    /// The task's single atomically published immutable security identity.
     ///
     /// A new thread or fork child starts from one caller snapshot, but owns an
     /// independent slot so later set-ID, capability, or prctl commits affect
-    /// only this task.
+    /// only this task. `Thread` is the only writer; `ProcessData` may retain an
+    /// `Arc` to the same slot solely to preserve Linux group-leader identity
+    /// after an early leader exit. There is never a second credential copy or
+    /// publication point.
     pub(in crate::task) credential: Arc<CredentialSlot>,
 
     /// The clear thread tid field
@@ -113,7 +116,7 @@ impl Thread {
     pub(crate) fn try_new(
         tid: u32,
         proc_data: Arc<ProcessData>,
-        credential: Arc<Cred>,
+        credential: Arc<CredentialSlot>,
     ) -> AxResult<(Box<Self>, ThreadSignalRegistration)> {
         let signal = ThreadSignalManager::try_new(proc_data.signal.clone())
             .map_err(|_| AxError::NoMemory)?;
@@ -122,8 +125,6 @@ impl Thread {
         let deferred_work =
             Arc::try_new(DeferredWorkAccount::new()).map_err(|_| AxError::NoMemory)?;
         let restart = RestartTracker::try_new().map_err(|_| AxError::NoMemory)?;
-        let credential =
-            Arc::try_new(CredentialSlot::new(credential)).map_err(|_| AxError::NoMemory)?;
         let thread = Box::try_new(Thread {
             signal,
             proc_data,
@@ -159,6 +160,10 @@ impl Thread {
     /// the credential object they name.
     pub(crate) fn credential_slot_weak(&self) -> Weak<CredentialSlot> {
         Arc::downgrade(&self.credential)
+    }
+
+    pub(in crate::task) fn credential_slot(&self) -> Arc<CredentialSlot> {
+        self.credential.clone()
     }
 
     /// Get the clear child tid field.

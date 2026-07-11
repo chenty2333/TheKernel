@@ -29,9 +29,9 @@ use crate::{
     },
     mm::{copy_from_kernel, load_user_app_at, new_user_aspace_empty, vm_load_string},
     task::{
-        AsThread, DacCredentialView, ProcessData, Thread, check_signals, get_task,
-        has_pending_fatal_signal, notify_ptrace_attach_stop, prepare_task_alias_admission,
-        set_current_user_page_table_root,
+        AsThread, DacCredentialView, ProcessData, Thread, check_signals,
+        commit_exec_identity_handoff, get_task, has_pending_fatal_signal,
+        notify_ptrace_attach_stop, prepare_task_alias_admission, set_current_user_page_table_root,
     },
 };
 
@@ -393,13 +393,20 @@ fn do_execve(
         }
     };
 
-    // A non-leader exec adopts the thread-group ID. Its lookup bucket was
-    // admitted before de-threading, so this publication cannot fail before
-    // the first irreversible close. `get_visible_task()` will not expose the
-    // alias until `set_tid()` below changes the task's visible ID.
-    if let Some(admission) = task_alias_admission {
-        admission.commit();
-    }
+    // A non-leader exec adopts the thread-group ID. The visible TID change and
+    // pre-reserved alias publication are one registry-locked transition, so
+    // external TID lookup observes either the old identity or the new one,
+    // never an alias/visible-TID split.
+    commit_exec_identity_handoff(
+        task_alias_admission,
+        proc_data,
+        curr_tid,
+        thr,
+        prepared_exec_cred,
+    );
+    // The executor credential, persistent group-leader binding, and any
+    // de-thread alias are now committed before the new address space becomes
+    // visible. From this point onward no remaining exec commit step can fail.
 
     if let Some(private) = private_fd_table {
         let previous = thr.with_mut_scope(|scope| replace_process_fd_table(scope, private));
@@ -415,10 +422,6 @@ fn do_execve(
     let old_aspace = proc_data.replace_aspace(new_aspace);
     set_current_user_page_table_root(new_root);
     drop(old_aspace);
-    if let Some(prepared) = prepared_exec_cred {
-        prepared.commit();
-    }
-    curr.as_thread().set_tid(proc_data.proc.pid());
     proc_data.replace_executable(executable_key);
 
     drop(curr.replace_name(task_name));

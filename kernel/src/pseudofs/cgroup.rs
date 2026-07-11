@@ -29,8 +29,7 @@ use super::pseudo_stat_fs;
 use crate::{
     file::{Directory, OpenCredentials, current_file_write_credentials, get_typed_file},
     task::{
-        AsThread, Cred, get_process_data, get_process_group_leader_task,
-        get_process_including_zombie, send_signal_to_process,
+        AsThread, Cred, get_process_data, get_process_including_zombie, send_signal_to_process,
     },
 };
 
@@ -622,9 +621,9 @@ impl CgroupDir {
         if !can_migrate_from_open_cgroup_namespace(credentials) {
             return Err(VfsError::NotFound);
         }
-        // cgroup.procs is process-directed; sample the Linux group leader once.
-        let target_task = get_process_group_leader_task(&target).map_err(|_| VfsError::NotFound)?;
-        let target_cred = target_task.as_thread().current_cred();
+        // cgroup.procs is process-directed; sample the persistent Linux group
+        // leader credential binding once, even if the original leader exited.
+        let target_cred = target.group_leader_cred();
         if !can_migrate_with_credentials(credentials, &target_cred) {
             return Err(VfsError::PermissionDenied);
         }

@@ -937,7 +937,7 @@ fn format_mask_list(mask: usize, width: usize) -> String {
 }
 
 #[rustfmt::skip]
-fn task_status(task: &AxTaskRef) -> String {
+fn task_status(task: &AxTaskRef, process_view: bool) -> String {
     let thread = task.as_thread();
     let proc_data = &thread.proc_data;
     let (vm_size_kb, vm_rss_kb, locked_kb) = {
@@ -965,7 +965,11 @@ fn task_status(task: &AxTaskRef) -> String {
     };
     let ppid = proc_data.proc.parent().map_or(0, |parent| parent.pid());
     let threads = proc_data.proc.thread_count();
-    let cred = thread.current_cred();
+    let cred = if process_view {
+        proc_data.group_leader_cred()
+    } else {
+        thread.current_cred()
+    };
     let ids = cred.ids();
     let caps = cred.capabilities();
     let cpu_mask = task_cpu_mask_bits(task);
@@ -1004,7 +1008,7 @@ fn task_status(task: &AxTaskRef) -> String {
         state,
         state_name,
         proc_data.proc.pid(),
-        task.as_thread().tid(),
+        if process_view { proc_data.proc.pid() } else { thread.tid() },
         ppid,
         ids.ruid,
         ids.euid,
@@ -1379,7 +1383,12 @@ struct ProcNamespaceFile {
 }
 
 impl ProcNamespaceFile {
-    fn new(fs: Arc<SimpleFs>, kind: ProcNamespaceKind, task: &AxTaskRef) -> Arc<Self> {
+    fn new(
+        fs: Arc<SimpleFs>,
+        kind: ProcNamespaceKind,
+        task: &AxTaskRef,
+        process_view: bool,
+    ) -> Arc<Self> {
         let thread = task.as_thread();
         let proc_data = &thread.proc_data;
         let object = match kind {
@@ -1389,7 +1398,12 @@ impl ProcNamespaceFile {
                 ProcNamespaceObject::Time(proc_data.time_ns_for_children())
             }
             ProcNamespaceKind::User => {
-                ProcNamespaceObject::User(thread.current_cred().user_ns().clone())
+                let cred = if process_view {
+                    proc_data.group_leader_cred()
+                } else {
+                    thread.current_cred()
+                };
+                ProcNamespaceObject::User(cred.user_ns().clone())
             }
             ProcNamespaceKind::Uts => ProcNamespaceObject::Uts(proc_data.uts_ns()),
         };
@@ -1528,6 +1542,7 @@ impl Pollable for ProcNamespaceFile {
 struct ThreadNamespaceDir {
     fs: Arc<SimpleFs>,
     task: WeakAxTaskRef,
+    process_view: bool,
 }
 
 impl SimpleDirOps for ThreadNamespaceDir {
@@ -1552,7 +1567,7 @@ impl SimpleDirOps for ThreadNamespaceDir {
             "uts" => ProcNamespaceKind::Uts,
             _ => return Err(VfsError::NotFound),
         };
-        Ok(ProcNamespaceFile::new(self.fs.clone(), kind, &task).into())
+        Ok(ProcNamespaceFile::new(self.fs.clone(), kind, &task, self.process_view).into())
     }
 
     fn is_cacheable(&self) -> bool {
@@ -1875,12 +1890,17 @@ impl SimpleDirOps for ThreadDir {
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         let fs = self.fs.clone();
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
+        let process_view = self.show_task_dir;
         if matches!(
             name,
             "maps" | "smaps" | "numa_maps" | "pagemap" | "exe" | "fd" | "fdinfo" | "ns"
         ) {
             let target = task.as_thread();
-            let target_cred = target.current_cred();
+            let target_cred = if process_view {
+                target.proc_data.group_leader_cred()
+            } else {
+                target.current_cred()
+            };
             check_current_ptrace_access(&target.proc_data, &target_cred, PtraceCredentialMode::Fs)
                 .map_err(|_| VfsError::PermissionDenied)?;
         }
@@ -1889,7 +1909,9 @@ impl SimpleDirOps for ThreadDir {
                 SimpleFile::new_regular(fs, move || Ok(render_task_stat(&task)?.into_bytes()))
                     .into()
             }
-            "status" => SimpleFile::new_regular(fs, move || Ok(task_status(&task))).into(),
+            "status" => {
+                SimpleFile::new_regular(fs, move || Ok(task_status(&task, process_view))).into()
+            }
             "limits" => SimpleFile::new_regular(fs, move || Ok(render_task_limits(&task))).into(),
             "oom_score_adj" => SimpleFile::new_regular(
                 fs,
@@ -2033,6 +2055,7 @@ impl SimpleDirOps for ThreadDir {
                 Arc::new(ThreadNamespaceDir {
                     fs,
                     task: Arc::downgrade(&task),
+                    process_view,
                 }),
             )
             .into(),

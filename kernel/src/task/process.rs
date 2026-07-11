@@ -33,6 +33,7 @@ type SignalAccountRegistryMutex<T> = spin::Mutex<T>;
 
 use super::{
     accounting::{AtomicTaskUsage, live_process_usage},
+    creds::{Cred, CredentialSlot, PreparedCred},
     futex::FutexTable,
     jobctl::{
         ContinueResult, ExecControlState, JobControlState, PtraceControlState, StopKind,
@@ -538,10 +539,51 @@ impl MempolicyState {
     }
 }
 
+/// Persistent binding to the task-local publication slot that currently owns
+/// Linux thread-group-leader identity.
+struct GroupLeaderCredentialBinding {
+    current: SpinNoIrq<Arc<CredentialSlot>>,
+}
+
+impl GroupLeaderCredentialBinding {
+    fn new(initial: Arc<CredentialSlot>) -> Self {
+        Self {
+            current: SpinNoIrq::new(initial),
+        }
+    }
+
+    fn current_cred(&self) -> Arc<Cred> {
+        let slot = self.current.lock().clone();
+        slot.current()
+    }
+
+    fn publish_handoff<'a>(
+        &self,
+        credential: Arc<CredentialSlot>,
+        prepared: Option<PreparedCred<'a>>,
+    ) -> GroupLeaderRetirement<'a> {
+        let mut current = self.current.lock();
+        let publication = prepared.map(PreparedCred::publish);
+        let retired = core::mem::replace(&mut *current, credential);
+        drop(current);
+        GroupLeaderRetirement {
+            _publication: publication,
+            _slot: retired,
+        }
+    }
+}
+
 /// [`Process`]-shared data.
 pub struct ProcessData {
     /// The process.
     pub proc: Arc<Process>,
+    /// Stable identity of the Linux thread-group leader credential owner.
+    ///
+    /// This is a strong reference to the leader task's sole publication slot,
+    /// not a copied credential or process-level shadow state. It deliberately
+    /// outlives an exited leader task while sibling threads keep the process
+    /// alive, matching Linux's persistent thread-group identity.
+    group_leader_credential: GroupLeaderCredentialBinding,
     /// The executable path
     pub exe_path: RwLock<String>,
     /// The inode currently held busy as this process image.
@@ -636,6 +678,15 @@ pub struct ProcessData {
     time_ns_for_children: RwLock<Arc<TimeNamespace>>,
 }
 
+/// Deferred destruction produced by an exec group-leader handoff.
+///
+/// The value must be dropped only after every registry/binding lock involved
+/// in the composite publication has been released.
+pub(crate) struct GroupLeaderRetirement<'a> {
+    _publication: Option<super::creds::CredentialPublication<'a>>,
+    _slot: Arc<CredentialSlot>,
+}
+
 fn process_error(error: ProcessError) -> AxError {
     match error {
         ProcessError::NoMemory | ProcessError::Capacity => AxError::NoMemory,
@@ -685,6 +736,7 @@ impl ProcessData {
     /// Fallibly creates unpublished process runtime state.
     pub(crate) fn try_new(
         proc: Arc<Process>,
+        group_leader_credential: Arc<CredentialSlot>,
         exe_path: String,
         executable: Option<ExecutableKey>,
         cmdline: Arc<Vec<String>>,
@@ -723,6 +775,7 @@ impl ProcessData {
         let vfork_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let data = Self {
             proc,
+            group_leader_credential: GroupLeaderCredentialBinding::new(group_leader_credential),
             exe_path: RwLock::new(exe_path),
             executable: SpinNoIrq::new(executable),
             cmdline: RwLock::new(cmdline),
@@ -776,6 +829,29 @@ impl ProcessData {
         };
         executable_rollback.0 = None;
         Arc::try_new(data).map_err(|_| AxError::NoMemory)
+    }
+
+    /// Takes one immutable snapshot from the currently bound Linux
+    /// thread-group leader slot. This remains available after a premature
+    /// leader exit and changes only during a successful non-leader exec.
+    pub(crate) fn group_leader_cred(&self) -> Arc<Cred> {
+        self.group_leader_credential.current_cred()
+    }
+
+    /// Publishes an optional exec credential and switches the group-leader
+    /// slot as one process-visible transition. Retired `Arc`s are destroyed
+    /// only after the binding lock is released.
+    pub(in crate::task) fn publish_group_leader_handoff<'a>(
+        &self,
+        owner: Pid,
+        thread: &super::Thread,
+        prepared: Option<PreparedCred<'a>>,
+    ) -> GroupLeaderRetirement<'a> {
+        debug_assert!(self.is_exec_owner(owner));
+        debug_assert_eq!(thread.proc_data.proc.pid(), self.proc.pid());
+        let credential = thread.credential_slot();
+        self.group_leader_credential
+            .publish_handoff(credential, prepared)
     }
 
     /// Clones the preallocated real empty files table for final process exit.
@@ -1504,7 +1580,71 @@ mod tests {
     use alloc::sync::Arc;
     use std::{sync::Barrier, thread, vec::Vec};
 
-    use super::{SIGNAL_QUEUE_GLOBAL_HARD_LIMIT, SIGNAL_QUEUE_PER_USER_HARD_LIMIT, UserNamespace};
+    use super::{
+        GroupLeaderCredentialBinding, SIGNAL_QUEUE_GLOBAL_HARD_LIMIT,
+        SIGNAL_QUEUE_PER_USER_HARD_LIMIT, UserNamespace,
+    };
+    use crate::task::{Cred, CredentialSlot};
+
+    fn credential_slot(uid: u32) -> Arc<CredentialSlot> {
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let slot = CredentialSlot::try_new(Cred::try_root(namespace).unwrap()).unwrap();
+        if uid != 0 {
+            let mut update = slot.prepare();
+            update.builder.ids.ruid = uid;
+            update.builder.ids.euid = uid;
+            update.builder.ids.suid = uid;
+            update.builder.ids.fsuid = uid;
+            update.finish().unwrap().commit();
+        }
+        slot
+    }
+
+    #[test]
+    fn group_leader_binding_keeps_the_single_slot_alive() {
+        let slot = credential_slot(1000);
+        let weak = Arc::downgrade(&slot);
+        let binding = GroupLeaderCredentialBinding::new(slot.clone());
+        drop(slot);
+
+        assert_eq!(binding.current_cred().ids().ruid, 1000);
+        assert!(weak.upgrade().is_some());
+        drop(binding);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn group_leader_handoff_never_exposes_the_unprepared_slot() {
+        const READS: usize = 20_000;
+
+        let old = credential_slot(1000);
+        let new = credential_slot(2000);
+        let binding = Arc::new(GroupLeaderCredentialBinding::new(old));
+        let start = Arc::new(Barrier::new(2));
+        let reader = {
+            let binding = binding.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..READS {
+                    let uid = binding.current_cred().ids().ruid;
+                    assert!(uid == 1000 || uid == 3000, "mixed handoff uid {uid}");
+                }
+            })
+        };
+
+        let mut update = new.prepare();
+        update.builder.ids.ruid = 3000;
+        update.builder.ids.euid = 3000;
+        update.builder.ids.suid = 3000;
+        update.builder.ids.fsuid = 3000;
+        let prepared = update.finish().unwrap();
+        start.wait();
+        let retirement = binding.publish_handoff(new.clone(), Some(prepared));
+        assert_eq!(binding.current_cred().ids().ruid, 3000);
+        drop(retirement);
+        reader.join().unwrap();
+    }
 
     #[test]
     fn signal_accounts_are_keyed_by_user_namespace_and_real_uid() {

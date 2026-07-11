@@ -23,8 +23,8 @@ use crate::{
     pseudofs::cgroup,
     syscall::inherit_proc_shm,
     task::{
-        AsThread, Cred, ProcessData, Thread, prepare_task_table_admission, try_new_user_task,
-        try_tasks, vm_write_in_aspace,
+        AsThread, Cred, CredentialSlot, ProcessData, Thread, prepare_task_table_admission,
+        try_new_user_task, try_tasks, vm_write_in_aspace,
     },
 };
 
@@ -253,6 +253,15 @@ impl CloneArgs {
         if flags.contains(CloneFlags::SIGHAND) && !flags.contains(CloneFlags::VM) {
             return Err(AxError::InvalidInput);
         }
+        // Linux forbids creating a user namespace inside an existing thread
+        // group or while sharing fs_struct with the parent. Either shape would
+        // make one thread group's credentials span user namespaces or let the
+        // new namespace retain a parent-owned root/cwd security context.
+        if flags.contains(CloneFlags::NEWUSER)
+            && flags.intersects(CloneFlags::THREAD | CloneFlags::PARENT | CloneFlags::FS)
+        {
+            return Err(AxError::InvalidInput);
+        }
         if flags.contains(CloneFlags::VFORK | CloneFlags::THREAD) {
             return Err(AxError::InvalidInput);
         }
@@ -366,6 +375,7 @@ impl CloneArgs {
         }
 
         let tid = new_task.id().as_u64() as Pid;
+        let child_credential = CredentialSlot::try_new(child_cred)?;
 
         let (new_proc_data, process_admission, thread_admission) = if flags
             .contains(CloneFlags::THREAD)
@@ -478,6 +488,7 @@ impl CloneArgs {
 
             let proc_data = ProcessData::try_new(
                 proc,
+                child_credential.clone(),
                 child_exe_path,
                 old_proc_data.retain_executable()?,
                 child_cmdline,
@@ -501,7 +512,8 @@ impl CloneArgs {
             (proc_data, Some(process_admission), thread_admission)
         };
         let mut rollback = CloneRollback::new(tid);
-        let (thr, signal_registration) = Thread::try_new(tid, new_proc_data.clone(), child_cred)?;
+        let (thr, signal_registration) =
+            Thread::try_new(tid, new_proc_data.clone(), child_credential)?;
         let child_aspace = new_proc_data.aspace();
         if flags.contains(CloneFlags::CHILD_CLEARTID) {
             thr.set_clear_child_tid(child_tid);
@@ -692,5 +704,46 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(args.validate_for(CloneApi::Clone), Ok(()));
+    }
+
+    #[test]
+    fn clone_validate_rejects_newuser_inside_thread_group() {
+        let args = CloneArgs {
+            flags: CloneFlags::NEWUSER
+                | CloneFlags::THREAD
+                | CloneFlags::VM
+                | CloneFlags::SIGHAND
+                | CloneFlags::FILES
+                | CloneFlags::FS,
+            ..Default::default()
+        };
+        assert_eq!(
+            args.validate_for(CloneApi::Clone),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn clone_validate_rejects_newuser_with_shared_fs() {
+        let args = CloneArgs {
+            flags: CloneFlags::NEWUSER | CloneFlags::FS,
+            ..Default::default()
+        };
+        assert_eq!(
+            args.validate_for(CloneApi::Clone),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn clone_validate_rejects_newuser_with_clone_parent() {
+        let args = CloneArgs {
+            flags: CloneFlags::NEWUSER | CloneFlags::PARENT,
+            ..Default::default()
+        };
+        assert_eq!(
+            args.validate_for(CloneApi::Clone),
+            Err(AxError::InvalidInput)
+        );
     }
 }

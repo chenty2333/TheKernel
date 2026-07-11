@@ -31,9 +31,9 @@ use super::{
 use crate::{
     deferred_work::DeferredWorkAccount,
     task::{
-        AsThread, Cred, ProcessData, get_process_data, get_process_group,
-        get_process_group_leader_task, get_visible_task, send_queued_signal_thread_inner,
-        send_queued_signal_to_process_data, send_signal_thread_inner, send_signal_to_process_data,
+        AsThread, Cred, ProcessData, get_process_data, get_process_group, get_visible_task,
+        send_queued_signal_thread_inner, send_queued_signal_to_process_data,
+        send_signal_thread_inner, send_signal_to_process_data,
     },
 };
 
@@ -588,10 +588,7 @@ pub(crate) fn send_sigio(state: &AsyncIoState, fd: i32, reason: u32) {
             let Some(process) = process.upgrade() else {
                 return;
             };
-            let Ok(target_task) = get_process_group_leader_task(&process) else {
-                return;
-            };
-            let target_cred = target_task.as_thread().current_cred();
+            let target_cred = process.group_leader_cred();
             if credentials.may_signal(&target_cred) {
                 send_sigio_to_process(&process, sigio_info(state.signal, fd, reason));
             }
@@ -607,10 +604,7 @@ pub(crate) fn send_sigio(state: &AsyncIoState, fd: i32, reason: u32) {
                 let Ok(process_data) = get_process_data(process.pid()) else {
                     return;
                 };
-                let Ok(target_task) = get_process_group_leader_task(&process_data) else {
-                    return;
-                };
-                let target_cred = target_task.as_thread().current_cred();
+                let target_cred = process_data.group_leader_cred();
                 if !Arc::ptr_eq(&process_data.proc, process)
                     || !credentials.may_signal(&target_cred)
                 {

@@ -13,7 +13,7 @@ use starry_process::Process;
 
 use crate::{
     file::{FileLike, Kstat, PseudoInode},
-    task::{AsThread, Cred, CredentialSlot, ProcessData, Thread, get_process_group_leader_task},
+    task::{Cred, CredentialSlot, ProcessData, Thread},
 };
 
 pub struct PidFd {
@@ -76,8 +76,7 @@ impl PidFd {
         if let Some(slot) = &self.thread_credential {
             Ok(slot.upgrade().ok_or(AxError::NoSuchProcess)?.current())
         } else {
-            let task = get_process_group_leader_task(&proc_data)?;
-            Ok(task.as_thread().current_cred())
+            Ok(proc_data.group_leader_cred())
         }
     }
 }

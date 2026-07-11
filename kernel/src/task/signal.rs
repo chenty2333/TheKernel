@@ -16,7 +16,7 @@ use starry_signal::{
 
 use super::{
     AsThread, ContinueResult, Cred, ProcessData, Thread, acknowledge_posix_timer_signal, do_exit,
-    get_process_data, get_process_group, get_process_group_leader_task, get_task, get_visible_task,
+    get_process_data, get_process_group, get_task, get_visible_task,
 };
 
 fn notify_tracer_or_parent_stop_continue(proc_data: &ProcessData) {
@@ -93,10 +93,7 @@ fn ptrace_signal_target_cred(
     target: &PtraceSignalTarget,
 ) -> AxResult<Arc<Cred>> {
     match target {
-        PtraceSignalTarget::Process => {
-            let task = get_process_group_leader_task(proc_data)?;
-            Ok(task.as_thread().current_cred())
-        }
+        PtraceSignalTarget::Process => Ok(proc_data.group_leader_cred()),
         PtraceSignalTarget::Thread { tid, signal } => {
             let task = get_visible_task(*tid)?;
             let thread = task.as_thread();
@@ -208,8 +205,7 @@ pub(crate) fn prepare_queued_signal_for_process(
     target: &ProcessData,
     info: SignalInfo,
 ) -> AxResult<PreparedSignal> {
-    let target_task = get_process_group_leader_task(target)?;
-    let target_cred = target_task.as_thread().current_cred();
+    let target_cred = target.group_leader_cred();
     prepare_signal_for_target(target, &target_cred, info, SignalQueuePolicy::QueueRequired)
 }
 
@@ -479,8 +475,7 @@ fn send_signal_to_process_data_with_policy(
     policy: SignalQueuePolicy,
 ) -> AxResult<bool> {
     let signo = sig.signo();
-    let target_task = get_process_group_leader_task(proc_data)?;
-    let target_cred = target_task.as_thread().current_cred();
+    let target_cred = proc_data.group_leader_cred();
     if signo == Signo::SIGCONT {
         do_continue(proc_data);
     }

@@ -26,8 +26,7 @@ use crate::{
     },
     task::{
         AsThread, CapabilityState, Mempolicy, ProcessData, PtraceCredentialMode,
-        check_current_process_ptrace_access, get_process_data, get_process_group_leader_task,
-        get_visible_task,
+        check_current_process_ptrace_access, get_process_data, get_visible_task,
     },
 };
 
@@ -212,10 +211,9 @@ fn check_numa_target_permission(target: &ProcessData) -> AxResult<()> {
         return Ok(());
     }
     let actor_ids = actor_cred.ids();
-    // NUMA process operations name a process, so Linux's group leader is the
-    // explicit credential subject; no credential is cached in ProcessData.
-    let target_task = get_process_group_leader_task(target)?;
-    let target_cred = target_task.as_thread().current_cred();
+    // NUMA process operations name a process, so Linux's persistent group
+    // leader binding is the explicit credential subject.
+    let target_cred = target.group_leader_cred();
     let target_ids = target_cred.ids();
     if actor.proc_data.proc.pid() == target.proc.pid()
         || actor_ids.euid == target_ids.ruid

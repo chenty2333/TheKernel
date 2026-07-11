@@ -11,8 +11,8 @@ use crate::{
     syscall::signal::{parse_signo, queued_signal_required},
     task::{
         AsThread, ProcessData, PtraceCredentialMode, check_current_ptrace_access,
-        check_current_signal_access, get_process_data, get_process_group_leader_task,
-        get_visible_task, send_queued_signal_to_process_data, send_signal_to_process_data,
+        check_current_signal_access, get_process_data, get_visible_task,
+        send_queued_signal_to_process_data, send_signal_to_process_data,
     },
 };
 
@@ -45,8 +45,7 @@ fn signal_target_from_fd(
         }
         Err(AxError::InvalidInput) => {
             let proc_data = process_data_from_proc_dir_fd(fd)?;
-            let task = get_process_group_leader_task(&proc_data)?;
-            let cred = task.as_thread().current_cred();
+            let cred = proc_data.group_leader_cred();
             Ok((proc_data, cred))
         }
         Err(err) => Err(err),

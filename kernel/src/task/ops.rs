@@ -23,8 +23,9 @@ use starry_signal::{SignalActionFlags, SignalDisposition, SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use super::{
-    AsThread, FutexKey, ITimerType, ProcStateHint, ProcessData, TaskUsage, TimerState,
-    futex_table_for, send_signal_thread_inner, send_signal_to_process, send_signal_to_thread,
+    AsThread, FutexKey, ITimerType, ProcStateHint, ProcessData, TaskUsage, Thread, TimerState,
+    creds::PreparedCred, futex_table_for, send_signal_thread_inner, send_signal_to_process,
+    send_signal_to_thread,
 };
 use crate::{
     mm::{AddrSpace, UserPtr, access_user_memory},
@@ -603,13 +604,45 @@ pub fn prepare_task_alias_admission(alias: Pid, task: &AxTaskRef) -> AxResult<Ta
 }
 
 impl TaskAliasAdmission {
-    /// Publishes the alias against its pre-reserved bucket.
-    pub fn commit(mut self) {
-        let old = TASK_ALIAS_TABLE
-            .lock()
-            .insert_reserved(self.alias, &self.task);
+    /// Publishes a non-leader exec's credential binding, visible TID, and
+    /// alias as one short composite transition. All retired strong references
+    /// and the credential writer guard are released after the alias and
+    /// leader-binding locks have both been dropped.
+    pub(crate) fn commit_exec_handoff(
+        mut self,
+        proc_data: &ProcessData,
+        owner: Pid,
+        thread: &Thread,
+        prepared: Option<PreparedCred<'_>>,
+    ) {
+        debug_assert!(core::ptr::eq(self.task.as_thread(), thread));
+        let mut aliases = TASK_ALIAS_TABLE.lock();
+        let retirement = proc_data.publish_group_leader_handoff(owner, thread, prepared);
+        thread.set_tid(self.alias);
+        let old = aliases.insert_reserved(self.alias, &self.task);
         self.committed = true;
+        drop(aliases);
         drop(old);
+        drop(retirement);
+    }
+}
+
+/// Commits the only externally callable exec identity transition. A
+/// non-leader exec includes the reserved alias in the same short critical
+/// section; a leader exec only republishes its existing slot after applying
+/// the prepared credential.
+pub(crate) fn commit_exec_identity_handoff(
+    admission: Option<TaskAliasAdmission>,
+    proc_data: &ProcessData,
+    owner: Pid,
+    thread: &Thread,
+    prepared: Option<PreparedCred<'_>>,
+) {
+    if let Some(admission) = admission {
+        admission.commit_exec_handoff(proc_data, owner, thread, prepared);
+    } else {
+        let retirement = proc_data.publish_group_leader_handoff(owner, thread, prepared);
+        drop(retirement);
     }
 }
 
@@ -695,11 +728,14 @@ pub fn get_task(tid: Pid) -> AxResult<AxTaskRef> {
 
 /// Finds the task with the given user-visible TID.
 pub fn get_visible_task(tid: Pid) -> AxResult<AxTaskRef> {
-    if let Some(task) = TASK_ALIAS_TABLE.lock().get(&tid)
-        && task.as_thread().tid() == tid
-        && !task.as_thread().pending_exit()
     {
-        return Ok(task);
+        let aliases = TASK_ALIAS_TABLE.lock();
+        if let Some(task) = aliases.get(&tid)
+            && task.as_thread().tid() == tid
+            && !task.as_thread().pending_exit()
+        {
+            return Ok(task);
+        }
     }
 
     if let Some(task) = TASK_TABLE.lock().get(&tid)
@@ -715,10 +751,13 @@ pub fn get_visible_task(tid: Pid) -> AxResult<AxTaskRef> {
 /// Finds the task with the given user-visible TID, including tasks that have
 /// begun exiting but are still published in the task tables.
 pub fn get_visible_task_including_exiting(tid: Pid) -> AxResult<AxTaskRef> {
-    if let Some(task) = TASK_ALIAS_TABLE.lock().get(&tid)
-        && task.as_thread().tid() == tid
     {
-        return Ok(task);
+        let aliases = TASK_ALIAS_TABLE.lock();
+        if let Some(task) = aliases.get(&tid)
+            && task.as_thread().tid() == tid
+        {
+            return Ok(task);
+        }
     }
 
     if let Some(task) = TASK_TABLE.lock().get(&tid)
@@ -774,21 +813,6 @@ pub fn get_process_data(pid: Pid) -> AxResult<Arc<ProcessData>> {
         return Ok(current().as_thread().proc_data.clone());
     }
     PROCESS_TABLE.lock().get(&pid).ok_or(AxError::NoSuchProcess)
-}
-
-/// Resolves the Linux thread-group leader for process-scoped operations.
-///
-/// `ProcessData` deliberately carries no credential. Callers that implement a
-/// process-directed ABI (rather than a TID-directed ABI) use this resolver and
-/// take exactly one credential snapshot from the returned task. An exiting
-/// leader remains the group identity while sibling threads still exist, so the
-/// lookup intentionally includes published exiting tasks.
-pub fn get_process_group_leader_task(proc_data: &ProcessData) -> AxResult<AxTaskRef> {
-    let task = get_visible_task_including_exiting(proc_data.proc.pid())?;
-    if task.as_thread().proc_data.proc.pid() != proc_data.proc.pid() {
-        return Err(AxError::NoSuchProcess);
-    }
-    Ok(task)
 }
 
 /// Finds a process by PID even after its runtime [`ProcessData`] has been
@@ -1217,11 +1241,12 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
         detach_ptrace_links_on_process_exit(&thr.proc_data);
         crate::syscall::clear_proc_shm(process.pid());
         if !auto_reap {
+            let leader_uid = thr.proc_data.group_leader_cred().ids().ruid;
             process.publish_zombie_snapshot(ZombieSnapshot {
                 wait_status: process.exit_code(),
                 self_usage: self_usage.into(),
                 child_usage: child_usage.into(),
-                uid: thr.uid(),
+                uid: leader_uid,
             });
         }
         process.exit(|child| notify_reaper_of_inherited_zombie(&child));

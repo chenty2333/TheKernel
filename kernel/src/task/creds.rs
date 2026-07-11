@@ -410,6 +410,10 @@ impl CredentialSlot {
         }
     }
 
+    pub(crate) fn try_new(initial: Arc<Cred>) -> AxResult<Arc<Self>> {
+        Arc::try_new(Self::new(initial)).map_err(|_| AxError::NoMemory)
+    }
+
     /// Takes a coherent reader reference while holding only the short
     /// publication spin lock. No allocation or destruction occurs here.
     pub(crate) fn current(&self) -> Arc<Cred> {
@@ -477,16 +481,33 @@ pub(crate) struct PreparedCred<'a> {
     proposed: Arc<Cred>,
 }
 
-impl PreparedCred<'_> {
+/// A completed pointer publication whose retired references still need to be
+/// destroyed.  Keeping those references in an explicit value lets composite
+/// operations (notably non-leader exec) publish a task credential and switch
+/// the process's group-leader binding under one short lock, while deferring
+/// potentially cascading `Arc` destruction until after that lock is released.
+pub(crate) struct CredentialPublication<'a> {
+    _guard: CredentialUpdateGuard<'a, ()>,
+    proposed: Arc<Cred>,
+    _published: Arc<Cred>,
+    _old: Arc<Cred>,
+}
+
+impl CredentialPublication<'_> {
+    pub(crate) fn proposed(&self) -> Arc<Cred> {
+        self.proposed.clone()
+    }
+}
+
+impl<'a> PreparedCred<'a> {
     #[cfg(test)]
     pub(crate) fn proposed(&self) -> &Cred {
         &self.proposed
     }
 
-    /// Atomically publishes the proposed pointer. Both the old slot ownership
-    /// and the transaction snapshot are released after the spin lock and the
-    /// writer mutex have been dropped.
-    pub(crate) fn commit(self) -> Arc<Cred> {
+    /// Atomically publishes the proposed pointer while returning ownership of
+    /// all retired references to the caller for deferred destruction.
+    pub(crate) fn publish(self) -> CredentialPublication<'a> {
         let PreparedCred {
             slot,
             guard,
@@ -498,8 +519,21 @@ impl PreparedCred<'_> {
             mem::replace(&mut *current, proposed.clone())
         };
         debug_assert!(Arc::ptr_eq(&published, &old));
-        drop(guard);
-        drop((published, old));
+        CredentialPublication {
+            _guard: guard,
+            proposed,
+            _published: published,
+            _old: old,
+        }
+    }
+
+    /// Atomically publishes the proposed pointer. Both the old slot ownership
+    /// and the transaction snapshot are released after the spin lock and the
+    /// writer mutex have been dropped.
+    pub(crate) fn commit(self) -> Arc<Cred> {
+        let publication = self.publish();
+        let proposed = publication.proposed();
+        drop(publication);
         proposed
     }
 }

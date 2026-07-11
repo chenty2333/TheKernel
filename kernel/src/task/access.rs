@@ -5,9 +5,7 @@ use axtask::current;
 use linux_raw_sys::general::{CAP_KILL, CAP_SYS_PTRACE, CAP_SYS_RESOURCE};
 use starry_signal::Signo;
 
-use super::{
-    AsThread, Cred, Credentials, ProcessData, UserNamespace, get_process_group_leader_task,
-};
+use super::{AsThread, Cred, Credentials, ProcessData, UserNamespace};
 
 #[derive(Clone, Copy)]
 pub(crate) enum PtraceCredentialMode {
@@ -107,8 +105,7 @@ pub(crate) fn check_current_process_ptrace_access(
     target: &ProcessData,
     mode: PtraceCredentialMode,
 ) -> AxResult<()> {
-    let target_task = get_process_group_leader_task(target)?;
-    let target_cred = target_task.as_thread().current_cred();
+    let target_cred = target.group_leader_cred();
     check_current_ptrace_access(target, &target_cred, mode)
 }
 
@@ -135,8 +132,7 @@ pub(crate) fn check_current_prlimit_access(
 
 /// `prlimit64(pid, ...)` is process-directed and samples the group leader once.
 pub(crate) fn check_current_process_prlimit_access(target: &ProcessData) -> AxResult<()> {
-    let target_task = get_process_group_leader_task(target)?;
-    let target_cred = target_task.as_thread().current_cred();
+    let target_cred = target.group_leader_cred();
     check_current_prlimit_access(target, &target_cred)
 }
 
@@ -182,8 +178,7 @@ pub(crate) fn check_current_process_signal_access(
     target: &ProcessData,
     signal: Option<Signo>,
 ) -> AxResult<()> {
-    let target_task = get_process_group_leader_task(target)?;
-    let target_cred = target_task.as_thread().current_cred();
+    let target_cred = target.group_leader_cred();
     check_current_signal_access(target, &target_cred, signal)
 }
 

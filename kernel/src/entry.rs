@@ -14,8 +14,8 @@ use crate::{
     },
     pseudofs::{self, dev::tty::N_TTY},
     task::{
-        CgroupNamespace, Cred, PidNamespace, ProcessData, Thread, TimeNamespace, UserNamespace,
-        UtsNamespace, add_task_to_table, spawn_alarm_task, try_new_user_task,
+        CgroupNamespace, Cred, CredentialSlot, PidNamespace, ProcessData, Thread, TimeNamespace,
+        UserNamespace, UtsNamespace, add_task_to_table, spawn_alarm_task, try_new_user_task,
     },
 };
 
@@ -116,9 +116,13 @@ pub fn init(args: &[String], envs: &[String]) {
         Arc::try_new(FdTable::new().expect("Failed to allocate init exit fd-table identity"))
             .expect("Failed to allocate init exit fd table");
     let user_ns = UserNamespace::try_new_root().expect("Failed to allocate init user namespace");
-    let credential = Cred::try_root(user_ns).expect("Failed to allocate init credential");
+    let credential = CredentialSlot::try_new(
+        Cred::try_root(user_ns).expect("Failed to allocate init credential"),
+    )
+    .expect("Failed to allocate init credential slot");
     let proc = ProcessData::try_new(
         proc,
+        credential.clone(),
         exe_path,
         executable::acquire(&loc).expect("Failed to retain init executable identity"),
         cmdline,
