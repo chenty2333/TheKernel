@@ -12,6 +12,8 @@ for script in "$CI_DIR"/*.sh "$0"; do
     bash -n "$script"
 done
 
+python3 "$REPO_ROOT/tests/ci/test_vendor_provenance.py"
+
 cat >"$tmp/pass.log" <<'EOF'
 CI_BOOT_GATE_START
 CI_BOOT_GATE_ROOTFS_OK

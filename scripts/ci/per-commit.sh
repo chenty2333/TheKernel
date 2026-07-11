@@ -13,11 +13,11 @@ usage() {
     cat <<'EOF'
 Usage: scripts/ci/per-commit.sh [--log-dir DIR] [--step-timeout SECS]
 
-Runs the reusable per-commit gate: diff whitespace checks, rustfmt, project
-tool tests, a host kernel check, and focused tests for the fallible lifecycle,
-VFS, scheduler, signal, and user-copy contracts that currently change most
-often. Broader network, filesystem, and cross-architecture behavior belongs to
-the PR and nightly gates.
+Runs the reusable per-commit gate: diff whitespace checks, rustfmt, vendored
+source provenance validation, project tool tests, a host kernel check, and
+focused tests for the fallible lifecycle, VFS, scheduler, signal, and user-copy
+contracts that currently change most often. Broader network, filesystem, and
+cross-architecture behavior belongs to the PR and nightly gates.
 
 CI_DIFF_BASE may name a merge base. When absent, the committed HEAD^..HEAD
 diff is checked in addition to staged and unstaged changes.
@@ -79,6 +79,8 @@ ci_run_step diff-check 60 bash -c '
 '
 
 ci_run_step rustfmt 180 cargo fmt --all -- --check
+ci_run_step vendor-provenance 60 python3 \
+    "$SCRIPT_DIR/validate_vendor_provenance.py" --archive-policy if-present
 ci_run_step ci-script-tests 90 "$REPO_ROOT/tests/ci/test-ci-scripts.sh"
 ci_run_step tool-tests "$STEP_TIMEOUT_SECS" make test-tools
 
