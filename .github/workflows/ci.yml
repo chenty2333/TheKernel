@@ -13,12 +13,16 @@ concurrency:
 
 permissions:
   contents: read
+  packages: read
 
 jobs:
   per-commit:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/chenty2333/thekernel-dev:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     env:
       CI_DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
       CARGO_TERM_COLOR: always
@@ -31,10 +35,11 @@ jobs:
           fetch-depth: 0
 
       - name: Per-commit gate
+        id: gate
         run: ./scripts/ci/per-commit.sh
 
       - name: Upload gate logs
-        if: always()
+        if: ${{ always() && steps.gate.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: per-commit-logs
@@ -54,6 +59,9 @@ jobs:
       - thekernel-qemu
     container:
       image: ghcr.io/chenty2333/thekernel-dev:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
       options: --volume /opt/oskernel/testsuites:/opt/oskernel/testsuites:ro
     env:
       CARGO_TERM_COLOR: always
@@ -67,10 +75,11 @@ jobs:
           fetch-depth: 0
 
       - name: Dual-architecture release and boot gate
+        id: gate
         run: ./scripts/ci/pr-gate.sh
 
       - name: Upload PR gate logs
-        if: always()
+        if: ${{ always() && steps.gate.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: dual-arch-pr-logs
