@@ -288,6 +288,33 @@ pub fn raise_signal_fatal(sig: SignalInfo) -> AxResult<()> {
     Ok(())
 }
 
+/// Forces a synchronous signal onto the current thread.
+///
+/// Linux forced signals cannot be suppressed by an ignored disposition or a
+/// blocked mask. A user handler is retained when it is already unblocked;
+/// otherwise the disposition is reset to default before enqueueing.
+pub(crate) fn force_signal_current_thread(sig: SignalInfo) {
+    let curr = current();
+    let thr = curr.as_thread();
+    let signo = sig.signo();
+    let was_blocked = thr.signal.signal_blocked(signo);
+
+    {
+        let mut actions = thr.proc_data.signal.actions.lock();
+        if was_blocked || matches!(&actions[signo].disposition, SignalDisposition::Ignore) {
+            actions[signo] = Default::default();
+        }
+    }
+
+    if was_blocked {
+        let mut blocked = thr.signal.blocked();
+        blocked.remove(signo);
+        thr.signal.set_blocked(blocked);
+    }
+
+    send_signal_thread_inner(&curr, thr, sig);
+}
+
 /// Stops the current process (all threads) due to a stop signal.
 fn do_stop(thr: &Thread, uctx: &mut UserContext, signo: u8) {
     let proc_data = &thr.proc_data;

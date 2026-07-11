@@ -1,10 +1,16 @@
 use axcpu::uspace::UserContext;
 use starry_signal::{
     SignalActionFlags, SignalDisposition, SignalInfo, SignalOSAction, SignalSet, Signo,
+    api::SignalFrame, arch::SignalContextError,
 };
 
 mod common;
 use common::*;
+
+fn copy_signal_frame(uctx: &UserContext) -> SignalFrame {
+    SignalFrame::read_from_user(uctx.sp() as *const SignalFrame)
+        .expect("signal frame must be readable from the test VM")
+}
 
 #[test]
 fn dequeue_signal() {
@@ -141,8 +147,119 @@ fn restore() {
 
     let new_sp = uctx.sp() + 8;
     uctx.set_sp(new_sp);
-    thr.restore(&mut uctx);
+    let frame = copy_signal_frame(&uctx);
+    let prepared = thr
+        .prepare_restore(&uctx, frame, |_| true, |_| true)
+        .unwrap();
+    thr.commit_restore(&mut uctx, prepared);
 
     assert_eq!(uctx.ip(), initial.ip());
     assert_eq!(uctx.sp(), initial.sp());
+}
+
+#[test]
+fn restore_rejects_bad_context_without_partial_commit() {
+    let (proc, thr) = new_test_env();
+    let signo = Signo::SIGTERM;
+    let sig = SignalInfo::new_user(signo, 0, 1);
+
+    unsafe extern "C" fn test_handler(_: i32) {}
+    proc.actions.lock()[signo].disposition = SignalDisposition::Handler(test_handler);
+
+    let initial = UserContext::new(0x4000, initial_sp().into(), 0);
+    let mut current = initial;
+    let action = proc.actions.lock()[signo].clone();
+    thr.handle_signal(&mut current, thr.blocked(), &sig, &action);
+    let frame_sp = current.sp() + 8;
+    current.set_sp(frame_sp);
+
+    let frame = copy_signal_frame(&current);
+    let handler_ip = current.ip();
+    let handler_sp = current.sp();
+    let blocked_before = thr.blocked();
+    let result = thr.prepare_restore(&current, frame, |_| false, |_| true);
+
+    assert!(matches!(
+        result,
+        Err(SignalContextError::InvalidProgramCounter)
+    ));
+    assert_eq!(current.ip(), handler_ip);
+    assert_eq!(current.sp(), handler_sp);
+    assert_eq!(
+        format!("{:?}", thr.blocked()),
+        format!("{blocked_before:?}")
+    );
+}
+
+#[test]
+fn restore_never_blocks_sigkill_or_sigstop() {
+    let (proc, thr) = new_test_env();
+    let signo = Signo::SIGTERM;
+    let sig = SignalInfo::new_user(signo, 0, 1);
+
+    unsafe extern "C" fn test_handler(_: i32) {}
+    proc.actions.lock()[signo].disposition = SignalDisposition::Handler(test_handler);
+
+    let mut current = UserContext::new(0x4000, initial_sp().into(), 0);
+    let action = proc.actions.lock()[signo].clone();
+    thr.handle_signal(&mut current, thr.blocked(), &sig, &action);
+    let frame_sp = current.sp() + 8;
+    current.set_sp(frame_sp);
+
+    let mut frame = copy_signal_frame(&current);
+    frame.ucontext_mut().sigmask.add(Signo::SIGKILL);
+    frame.ucontext_mut().sigmask.add(Signo::SIGSTOP);
+    let prepared = thr
+        .prepare_restore(&current, frame, |_| true, |_| true)
+        .unwrap();
+    thr.commit_restore(&mut current, prepared);
+
+    assert!(!thr.blocked().has(Signo::SIGKILL));
+    assert!(!thr.blocked().has(Signo::SIGSTOP));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn restore_sanitizes_x86_privileged_flags_and_rejects_bad_cs() {
+    let (proc, thr) = new_test_env();
+    let signo = Signo::SIGTERM;
+    let sig = SignalInfo::new_user(signo, 0, 1);
+
+    unsafe extern "C" fn test_handler(_: i32) {}
+    proc.actions.lock()[signo].disposition = SignalDisposition::Handler(test_handler);
+
+    let mut current = UserContext::new(0x4000, initial_sp().into(), 0);
+    let action = proc.actions.lock()[signo].clone();
+    thr.handle_signal(&mut current, thr.blocked(), &sig, &action);
+    let frame_sp = current.sp() + 8;
+    current.set_sp(frame_sp);
+
+    let mut frame = copy_signal_frame(&current);
+    let trusted_flags = current.rflags;
+    frame
+        .ucontext_mut()
+        .mcontext
+        .set_processor_flags(trusted_flags as usize | (0b11 << 12));
+    let prepared = thr
+        .prepare_restore(&current, frame.clone(), |_| true, |_| true)
+        .unwrap();
+    assert_eq!(prepared.context().rflags & (0b11 << 12), 0);
+    assert_eq!(
+        prepared.context().rflags & (1 << 9),
+        trusted_flags & (1 << 9)
+    );
+
+    frame.ucontext_mut().mcontext.set_code_segment(0);
+    assert!(matches!(
+        thr.prepare_restore(&current, frame, |_| true, |_| true),
+        Err(SignalContextError::InvalidProcessorState)
+    ));
+}
+
+#[test]
+fn signal_frame_copy_rejects_unmapped_and_unaligned_addresses() {
+    assert!(SignalFrame::read_from_user(std::ptr::dangling::<SignalFrame>()).is_err());
+
+    let unaligned = initial_sp() - 1;
+    assert!(SignalFrame::read_from_user(unaligned as *const SignalFrame).is_err());
 }

@@ -269,10 +269,6 @@ impl RestartTracker {
     }
 
     fn complete_sigreturn(&mut self, uctx: &mut UserContext) {
-        debug_assert!(
-            self.signal_handler_depth > 0,
-            "sigreturn without an active signal handler"
-        );
         if self.signal_handler_depth > 0 {
             self.signal_handler_depth -= 1;
         }
@@ -402,6 +398,20 @@ mod tests {
         assert_eq!(uctx.arg4(), 0x55);
         assert_eq!(uctx.arg5(), 0x66);
         assert_eq!(uctx.ip(), 0x1000 - SYSCALL_INSN_LEN);
+    }
+
+    #[test]
+    fn sigreturn_without_active_handler_does_not_panic_or_mutate_state() {
+        let mut tracker = RestartTracker::default();
+        let mut context = make_uctx(0x11, 0x77, 0x1000);
+
+        tracker.complete_sigreturn(&mut context);
+
+        assert_eq!(tracker.signal_handler_depth(), 0);
+        assert!(tracker.restart_states.is_empty());
+        assert_eq!(context.ip(), 0x1000);
+        assert_eq!(context.sysno(), 0x77);
+        assert_eq!(context.arg0(), 0x11);
     }
 
     #[test]

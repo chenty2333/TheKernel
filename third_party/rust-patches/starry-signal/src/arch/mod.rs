@@ -16,6 +16,17 @@ cfg_if::cfg_if! {
     }
 }
 
+/// The reason a user-provided signal context cannot be restored safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalContextError {
+    /// The saved instruction pointer is not a valid user instruction address.
+    InvalidProgramCounter,
+    /// The saved stack pointer is not a valid user stack address.
+    InvalidStackPointer,
+    /// The saved architecture status contains privileged or otherwise invalid state.
+    InvalidProcessorState,
+}
+
 pub fn signal_trampoline_address() -> usize {
     unsafe extern "C" {
         safe static signal_trampoline: [u8; 0];

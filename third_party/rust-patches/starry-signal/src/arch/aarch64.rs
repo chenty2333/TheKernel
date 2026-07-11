@@ -1,6 +1,6 @@
 use axcpu::uspace::UserContext;
 
-use crate::{SignalSet, SignalStack};
+use crate::{SignalSet, SignalStack, arch::SignalContextError};
 
 core::arch::global_asm!(
     "
@@ -42,11 +42,38 @@ impl MContext {
         }
     }
 
-    pub fn restore(&self, uctx: &mut UserContext) {
-        uctx.x = self.regs;
-        uctx.sp = self.sp;
-        uctx.elr = self.pc;
-        uctx.spsr = self.pstate;
+    pub(crate) fn prepare_restore(
+        &self,
+        current: &UserContext,
+    ) -> Result<UserContext, SignalContextError> {
+        // The native ABI returns through EL0t. Apart from NZCV, privileged
+        // PSTATE state must exactly match the kernel-created return context.
+        const USER_PSTATE_MASK: u64 = 0xf000_0000;
+        if self.pstate & !USER_PSTATE_MASK != current.spsr & !USER_PSTATE_MASK {
+            return Err(SignalContextError::InvalidProcessorState);
+        }
+
+        let mut restored = *current;
+        restored.x = self.regs;
+        restored.sp = self.sp;
+        restored.elr = self.pc;
+        restored.spsr = (current.spsr & !USER_PSTATE_MASK) | (self.pstate & USER_PSTATE_MASK);
+        Ok(restored)
+    }
+
+    /// Replaces the saved instruction pointer.
+    pub fn set_program_counter(&mut self, pc: usize) {
+        self.pc = pc as u64;
+    }
+
+    /// Replaces the saved stack pointer.
+    pub fn set_stack_pointer(&mut self, sp: usize) {
+        self.sp = sp as u64;
+    }
+
+    /// Replaces the saved PSTATE value.
+    pub fn set_processor_state(&mut self, pstate: u64) {
+        self.pstate = pstate;
     }
 }
 

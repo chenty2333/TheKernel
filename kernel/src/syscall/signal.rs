@@ -12,15 +12,15 @@ use linux_raw_sys::general::{
     SIG_UNBLOCK, SS_DISABLE, SS_ONSTACK, kernel_sigaction, siginfo, timespec,
 };
 use starry_process::Pid;
-use starry_signal::{SignalInfo, SignalSet, SignalStack, Signo};
+use starry_signal::{SignalInfo, SignalSet, SignalStack, Signo, api::SignalFrame};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     task::{
         AsThread, ProcessData, acknowledge_posix_timer_signal, check_current_signal_access,
-        check_signals, get_process_data, get_process_group, get_process_including_zombie,
-        get_visible_task, send_signal_to_process, send_signal_to_process_data,
-        send_signal_to_visible_thread, try_processes,
+        check_signals, force_signal_current_thread, get_process_data, get_process_group,
+        get_process_including_zombie, get_visible_task, send_signal_to_process,
+        send_signal_to_process_data, send_signal_to_visible_thread, try_processes,
     },
     time::TimeValueLike,
 };
@@ -368,10 +368,58 @@ pub fn sys_rt_tgsigqueueinfo(
     Ok(0)
 }
 
+#[cfg(target_arch = "x86_64")]
+const SIGNAL_PC_ALIGNMENT: usize = 1;
+#[cfg(target_arch = "riscv64")]
+const SIGNAL_PC_ALIGNMENT: usize = 2;
+#[cfg(any(target_arch = "loongarch64", target_arch = "aarch64"))]
+const SIGNAL_PC_ALIGNMENT: usize = 4;
+
+#[cfg(target_arch = "aarch64")]
+const SIGNAL_SP_ALIGNMENT: usize = 16;
+#[cfg(not(target_arch = "aarch64"))]
+const SIGNAL_SP_ALIGNMENT: usize = 1;
+
+fn valid_signal_user_address(address: usize, alignment: usize) -> bool {
+    let end = crate::config::USER_SPACE_BASE + crate::config::USER_SPACE_SIZE;
+    address >= crate::config::USER_SPACE_BASE && address < end && address % alignment == 0
+}
+
+fn reject_bad_sigreturn(reason: &str) -> AxResult<isize> {
+    warn!("rejecting invalid rt_sigreturn frame: {reason}");
+    force_signal_current_thread(SignalInfo::new_kernel(Signo::SIGSEGV));
+    Ok(0)
+}
+
 pub fn sys_rt_sigreturn(uctx: &mut UserContext) -> AxResult<isize> {
     let curr = current();
     let thr = curr.as_thread();
-    thr.signal.restore(uctx);
+
+    if !thr.in_signal_handler() {
+        return reject_bad_sigreturn("no active signal handler");
+    }
+
+    let frame = match SignalFrame::read_from_user(uctx.sp() as *const SignalFrame) {
+        Ok(frame) => frame,
+        Err(_) => return reject_bad_sigreturn("frame copy-in fault"),
+    };
+
+    let prepared = match thr.signal.prepare_restore(
+        uctx,
+        frame,
+        |pc| valid_signal_user_address(pc, SIGNAL_PC_ALIGNMENT),
+        |sp| valid_signal_user_address(sp, SIGNAL_SP_ALIGNMENT),
+    ) {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            warn!("rt_sigreturn context validation failed: {err:?}");
+            return reject_bad_sigreturn("invalid machine context");
+        }
+    };
+
+    // No operation after this point may fail: context, mask and restart state
+    // become visible only after the complete frame has passed validation.
+    thr.signal.commit_restore(uctx, prepared);
     thr.complete_sigreturn(uctx);
     Ok(uctx.retval() as isize)
 }

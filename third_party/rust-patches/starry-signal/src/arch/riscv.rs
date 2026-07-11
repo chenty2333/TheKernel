@@ -1,6 +1,6 @@
 use axcpu::{GeneralRegisters, uspace::UserContext};
 
-use crate::{SignalSet, SignalStack};
+use crate::{SignalSet, SignalStack, arch::SignalContextError};
 
 core::arch::global_asm!(
     "
@@ -32,9 +32,26 @@ impl MContext {
         }
     }
 
-    pub fn restore(&self, uctx: &mut UserContext) {
-        uctx.sepc = self.pc;
-        uctx.regs = self.regs;
+    pub(crate) fn prepare_restore(
+        &self,
+        current: &UserContext,
+    ) -> Result<UserContext, SignalContextError> {
+        let mut restored = *current;
+        restored.sepc = self.pc;
+        restored.regs = self.regs;
+        // sstatus and any future supervisor-owned trap metadata are preserved
+        // by starting from the trusted current context.
+        Ok(restored)
+    }
+
+    /// Replaces the saved instruction pointer.
+    pub fn set_program_counter(&mut self, pc: usize) {
+        self.pc = pc;
+    }
+
+    /// Replaces the saved stack pointer.
+    pub fn set_stack_pointer(&mut self, sp: usize) {
+        self.regs.sp = sp;
     }
 }
 

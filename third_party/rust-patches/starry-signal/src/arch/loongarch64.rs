@@ -1,6 +1,6 @@
 use axcpu::{GeneralRegisters, uspace::UserContext};
 
-use crate::{SignalSet, SignalStack};
+use crate::{SignalSet, SignalStack, arch::SignalContextError};
 
 core::arch::global_asm!(
     "
@@ -32,9 +32,26 @@ impl MContext {
         }
     }
 
-    pub fn restore(&self, uctx: &mut UserContext) {
-        uctx.era = self.sc_pc as _;
-        uctx.regs = self.sc_regs;
+    pub(crate) fn prepare_restore(
+        &self,
+        current: &UserContext,
+    ) -> Result<UserContext, SignalContextError> {
+        let mut restored = *current;
+        restored.era = self.sc_pc as _;
+        restored.regs = self.sc_regs;
+        // PRMD privilege/interrupt state remains the value installed by the
+        // kernel for the current user return.
+        Ok(restored)
+    }
+
+    /// Replaces the saved instruction pointer.
+    pub fn set_program_counter(&mut self, pc: usize) {
+        self.sc_pc = pc as u64;
+    }
+
+    /// Replaces the saved stack pointer.
+    pub fn set_stack_pointer(&mut self, sp: usize) {
+        self.sc_regs.sp = sp;
     }
 }
 

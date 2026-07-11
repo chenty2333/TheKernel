@@ -4,7 +4,9 @@ use std::{
 };
 
 use axcpu::uspace::UserContext;
-use starry_signal::{SignalDisposition, SignalInfo, SignalOSAction, SignalSet, Signo};
+use starry_signal::{
+    SignalDisposition, SignalInfo, SignalOSAction, SignalSet, Signo, api::SignalFrame,
+};
 
 mod common;
 use common::*;
@@ -113,7 +115,12 @@ fn concurrent_check_signals() {
 
     let new_sp = uctx.sp() + 8;
     uctx.set_sp(new_sp);
-    thr.restore(&mut uctx);
+    let frame = SignalFrame::read_from_user(uctx.sp() as *const SignalFrame)
+        .expect("signal frame must remain isolated from concurrent tests");
+    let prepared = thr
+        .prepare_restore(&uctx, frame, |_| true, |_| true)
+        .unwrap();
+    thr.commit_restore(&mut uctx, prepared);
 
     assert!(!thr.signal_blocked(Signo::SIGTERM));
 

@@ -1,6 +1,9 @@
 use std::{
     mem::MaybeUninit,
-    sync::{Arc, LazyLock, Mutex, MutexGuard},
+    sync::{
+        Arc, LazyLock, Mutex, MutexGuard,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use extern_trait::extern_trait;
@@ -13,9 +16,17 @@ static POOL: LazyLock<Mutex<Box<[u8]>>> = LazyLock::new(|| {
     Mutex::new(vec![0; size].into_boxed_slice())
 });
 
+const STACK_SLOT_SIZE: usize = 0x1_0000;
+static NEXT_STACK_SLOT: AtomicUsize = AtomicUsize::new(0);
+
 pub fn initial_sp() -> usize {
     let pool = POOL.lock().unwrap();
-    pool.as_ptr() as usize + pool.len()
+    let slot = NEXT_STACK_SLOT.fetch_add(1, Ordering::Relaxed);
+    let end = (slot + 1)
+        .checked_mul(STACK_SLOT_SIZE)
+        .expect("test stack slot overflow");
+    assert!(end <= pool.len(), "signal test stack arena exhausted");
+    pool.as_ptr() as usize + end
 }
 
 struct Vm(MutexGuard<'static, Box<[u8]>>);

@@ -1,6 +1,6 @@
 use axcpu::uspace::UserContext;
 
-use crate::{SignalSet, SignalStack};
+use crate::{SignalSet, SignalStack, arch::SignalContextError};
 
 core::arch::global_asm!(
     "
@@ -83,28 +83,78 @@ impl MContext {
         }
     }
 
-    pub fn restore(&self, uctx: &mut UserContext) {
-        uctx.r8 = self.r8 as _;
-        uctx.r9 = self.r9 as _;
-        uctx.r10 = self.r10 as _;
-        uctx.r11 = self.r11 as _;
-        uctx.r12 = self.r12 as _;
-        uctx.r13 = self.r13 as _;
-        uctx.r14 = self.r14 as _;
-        uctx.r15 = self.r15 as _;
-        uctx.rdi = self.rdi as _;
-        uctx.rsi = self.rsi as _;
-        uctx.rbp = self.rbp as _;
-        uctx.rbx = self.rbx as _;
-        uctx.rdx = self.rdx as _;
-        uctx.rax = self.rax as _;
-        uctx.rcx = self.rcx as _;
-        uctx.rsp = self.rsp as _;
-        uctx.rip = self.rip as _;
-        uctx.rflags = self.eflags as _;
-        uctx.cs = self.cs as _;
-        uctx.error_code = self.err as _;
-        uctx.vector = self.trapno as _;
+    pub(crate) fn prepare_restore(
+        &self,
+        current: &UserContext,
+    ) -> Result<UserContext, SignalContextError> {
+        // TheKernel currently supports only the native 64-bit userspace ABI.
+        // Never copy a kernel or compatibility selector out of a user frame.
+        if self.cs & 0b11 != 0b11 || self.cs as u64 != current.cs {
+            return Err(SignalContextError::InvalidProcessorState);
+        }
+
+        let mut restored = *current;
+        restored.r8 = self.r8 as _;
+        restored.r9 = self.r9 as _;
+        restored.r10 = self.r10 as _;
+        restored.r11 = self.r11 as _;
+        restored.r12 = self.r12 as _;
+        restored.r13 = self.r13 as _;
+        restored.r14 = self.r14 as _;
+        restored.r15 = self.r15 as _;
+        restored.rdi = self.rdi as _;
+        restored.rsi = self.rsi as _;
+        restored.rbp = self.rbp as _;
+        restored.rbx = self.rbx as _;
+        restored.rdx = self.rdx as _;
+        restored.rax = self.rax as _;
+        restored.rcx = self.rcx as _;
+        restored.rsp = self.rsp as _;
+        restored.rip = self.rip as _;
+
+        // Match Linux's FIX_EFLAGS model: condition/debug/alignment state is
+        // user-restorable, while IOPL, IF and reserved bits remain trusted.
+        const USER_RFLAGS_MASK: u64 = (1 << 0) // CF
+            | (1 << 2) // PF
+            | (1 << 4) // AF
+            | (1 << 6) // ZF
+            | (1 << 7) // SF
+            | (1 << 8) // TF
+            | (1 << 10) // DF
+            | (1 << 11) // OF
+            | (1 << 16) // RF
+            | (1 << 18); // AC
+        restored.rflags =
+            (current.rflags & !USER_RFLAGS_MASK) | (self.eflags as u64 & USER_RFLAGS_MASK);
+
+        // cs/ss, trap vector, error code and TLS bases are kernel-owned and
+        // intentionally preserved from `current`.
+        Ok(restored)
+    }
+
+    /// Replaces the saved instruction pointer.
+    pub fn set_program_counter(&mut self, pc: usize) {
+        self.rip = pc;
+    }
+
+    /// Replaces the saved stack pointer.
+    pub fn set_stack_pointer(&mut self, sp: usize) {
+        self.rsp = sp;
+    }
+
+    /// Replaces the saved RFLAGS value.
+    pub fn set_processor_flags(&mut self, flags: usize) {
+        self.eflags = flags;
+    }
+
+    /// Returns the saved RFLAGS value.
+    pub fn processor_flags(&self) -> usize {
+        self.eflags
+    }
+
+    /// Replaces the saved code segment selector.
+    pub fn set_code_segment(&mut self, cs: u16) {
+        self.cs = cs;
     }
 }
 

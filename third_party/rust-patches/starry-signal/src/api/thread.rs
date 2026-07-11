@@ -10,18 +10,72 @@ use core::{
 
 use axcpu::uspace::UserContext;
 use kspin::SpinNoIrq;
-use starry_vm::VmMutPtr;
+use starry_vm::{VmMutPtr, VmPtr, VmResult};
 
 use super::ProcessSignalManager;
 use crate::{
     DefaultSignalAction, PendingSignals, SignalAction, SignalActionFlags, SignalDisposition,
-    SignalInfo, SignalOSAction, SignalSet, SignalStack, Signo, arch::UContext,
+    SignalInfo, SignalOSAction, SignalSet, SignalStack, Signo,
+    arch::{SignalContextError, UContext},
 };
 
-struct SignalFrame {
+/// The userspace ABI frame created for a signal handler.
+///
+/// This contains only Linux-visible signal state. Kernel trap metadata is not
+/// serialized into userspace and therefore cannot be forged by `sigreturn`.
+#[repr(C)]
+#[derive(Clone)]
+pub struct SignalFrame {
     ucontext: UContext,
     siginfo: SignalInfo,
-    uctx: UserContext,
+}
+
+impl SignalFrame {
+    fn new(uctx: &UserContext, sigmask: SignalSet, siginfo: SignalInfo) -> Self {
+        Self {
+            ucontext: UContext::new(uctx, sigmask),
+            siginfo,
+        }
+    }
+
+    /// Returns the Linux-visible user context stored in this frame.
+    pub fn ucontext(&self) -> &UContext {
+        &self.ucontext
+    }
+
+    /// Returns a mutable Linux-visible user context, as a signal handler sees it.
+    pub fn ucontext_mut(&mut self) -> &mut UContext {
+        &mut self.ucontext
+    }
+
+    /// Copies a complete signal frame from userspace into an owned value.
+    pub fn read_from_user(ptr: *const Self) -> VmResult<Self> {
+        let frame = ptr.vm_read_uninit()?;
+        // SAFETY: VmPtr returns `Ok` only after VmIo initialized every byte of
+        // the destination. SignalFrame and every architecture's UContext and
+        // MContext are repr(C) records made solely from integer scalars and
+        // integer/byte arrays. SignalStack is {usize, u32, usize}, SignalSet is
+        // a transparent u64, and SignalInfo wraps Linux's raw repr(C) siginfo
+        // union; none contains bool, a Rust enum, a reference, or NonZero state.
+        // Raw union/pointer storage accepts arbitrary user bits. Restoration
+        // never interprets frame.siginfo (in particular, it never calls
+        // SignalInfo::signo), and prepare_restore validates every machine field
+        // that has architectural constraints before publication.
+        Ok(unsafe { frame.assume_init() })
+    }
+}
+
+/// A fully validated signal return that can be committed without failure.
+pub struct PreparedSignalRestore {
+    context: UserContext,
+    blocked: SignalSet,
+}
+
+impl PreparedSignalRestore {
+    /// Returns the validated candidate user context.
+    pub fn context(&self) -> &UserContext {
+        &self.context
+    }
 }
 
 pub struct DeliveredSignal {
@@ -166,11 +220,7 @@ impl ThreadSignalManager {
 
                 let frame_ptr = aligned_sp as *mut SignalFrame;
                 if frame_ptr
-                    .vm_write(SignalFrame {
-                        ucontext: UContext::new(uctx, restore_blocked),
-                        siginfo: sig.clone(),
-                        uctx: *uctx,
-                    })
+                    .vm_write(SignalFrame::new(uctx, restore_blocked, sig.clone()))
                     .is_err()
                 {
                     return Some(SignalOSAction::CoreDump);
@@ -260,17 +310,36 @@ impl ThreadSignalManager {
         self.check_signals_slow(uctx, restore_blocked)
     }
 
-    /// Restores the signal frame. Called by `sigreturn`.
-    pub fn restore(&self, uctx: &mut UserContext) {
-        let frame_ptr = uctx.sp() as *const SignalFrame;
-        // FIXME: remove this `unsafe`
-        let frame = unsafe { &*frame_ptr };
+    /// Validates an owned signal frame without publishing any state.
+    ///
+    /// The caller must copy the complete frame from userspace before calling
+    /// this method. Address predicates keep kernel address-space policy out of
+    /// this reusable signal crate.
+    pub fn prepare_restore(
+        &self,
+        current: &UserContext,
+        frame: SignalFrame,
+        valid_program_counter: impl FnOnce(usize) -> bool,
+        valid_stack_pointer: impl FnOnce(usize) -> bool,
+    ) -> Result<PreparedSignalRestore, SignalContextError> {
+        let context = frame.ucontext.mcontext.prepare_restore(current)?;
+        if !valid_program_counter(context.ip()) {
+            return Err(SignalContextError::InvalidProgramCounter);
+        }
+        if !valid_stack_pointer(context.sp()) {
+            return Err(SignalContextError::InvalidStackPointer);
+        }
 
-        *uctx = frame.uctx;
-        frame.ucontext.mcontext.restore(uctx);
+        let mut blocked = frame.ucontext.sigmask;
+        blocked.remove(Signo::SIGKILL);
+        blocked.remove(Signo::SIGSTOP);
+        Ok(PreparedSignalRestore { context, blocked })
+    }
 
-        *self.blocked.lock() = frame.ucontext.sigmask;
-        self.possibly_has_signal.store(true, Ordering::Release);
+    /// Commits a previously validated signal restore without failure.
+    pub fn commit_restore(&self, uctx: &mut UserContext, prepared: PreparedSignalRestore) {
+        *uctx = prepared.context;
+        self.set_blocked(prepared.blocked);
     }
 
     /// Sends a signal to the thread.
