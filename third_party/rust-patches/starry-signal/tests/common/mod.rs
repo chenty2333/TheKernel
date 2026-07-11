@@ -34,7 +34,9 @@ unsafe impl VmIo for Vm {
             return Err(VmError::BadAddress);
         }
         let slice = &self.0[offset..offset + buf.len()];
-        buf.write_copy_of_slice(slice);
+        for (dst, src) in buf.iter_mut().zip(slice) {
+            dst.write(*src);
+        }
         Ok(())
     }
 

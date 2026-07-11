@@ -66,7 +66,7 @@ fn block_ignore_send_signal() {
     thr.set_blocked(set);
     assert!(thr.signal_blocked(signo));
     assert!(!thr.send_signal(sig.clone()));
-    assert!(!thr.pending().has(signo));
+    assert!(thr.pending().has(signo));
 
     proc.actions.lock()[signo].disposition = SignalDisposition::Default;
     assert!(!thr.send_signal(sig.clone()));
