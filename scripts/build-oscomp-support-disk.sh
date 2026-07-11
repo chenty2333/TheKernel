@@ -221,6 +221,9 @@ build_overlay_tools_for_arch() {
         "$REPO_ROOT/scripts/support-tools/hackstress.c" \
         -o "$arch_root/overlay/bin/oscomp-hackstress"
     "$cc" -O2 -static -s -std=c11 \
+        "$REPO_ROOT/scripts/support-tools/nightly-oom-admission.c" \
+        -o "$arch_root/overlay/bin/oscomp-nightly-oom-admission"
+    "$cc" -O2 -static -s -std=c11 \
         "$REPO_ROOT/scripts/support-tools/hello-world.c" \
         -o "$arch_root/overlay/bin/oscomp-hello-world"
     mkdir -p "$arch_root/overlay/glibc" "$arch_root/overlay/musl"
