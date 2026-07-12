@@ -31,3 +31,5 @@ type exists.
   (`draft`)
 - [RFC 0003: Cancellable FD and Readiness Registration Contract](0003-fd-readiness-contract.md)
   (`draft`)
+- [RFC 0004: Accounted VM Pins and Generation-Safe Fault Delegation](0004-mm-pin-fault-contract.md)
+  (`draft`)
