@@ -133,13 +133,12 @@ ci_run_step kernel-setfsid-abi-tests "$STEP_TIMEOUT_SECS" \
     syscall::sys::tests::invalid_or_unmapped_setfsid_returns_old_without_calling_writer \
     -- --exact --test-threads=1
 
-ci_run_step kernel-cgroup-credential-tests "$STEP_TIMEOUT_SECS" \
+ci_run_step kernel-namespace-owner-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
     cargo test --locked --manifest-path kernel/Cargo.toml \
     --tests --features bpf --target x86_64-unknown-linux-gnu \
-    pseudofs::cgroup::tests::child_user_namespace_root_has_no_global_cgroup_migration_bypass \
-    -- --exact --test-threads=1
+    namespace_owner_ -- --test-threads=1
 
 ci_run_step axsched-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \

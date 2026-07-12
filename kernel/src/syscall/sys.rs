@@ -18,7 +18,7 @@ use starry_vm::{VmMutPtr, vm_load, vm_write_slice};
 use super::sync::restart_futex_wait;
 use crate::{
     mm::system_memory_stats,
-    task::{AsThread, RestartBlock, UTS_FIELD_LEN, try_processes},
+    task::{AsThread, RestartBlock, UTS_FIELD_LEN, ns_capable, try_processes},
 };
 
 fn setfsid_abi<Id>(
@@ -295,6 +295,18 @@ pub(crate) fn set_domainname_bytes(domainname: &[u8]) {
         .set_domainname(domainname);
 }
 
+pub(crate) fn current_can_administer_uts() -> bool {
+    let current = current();
+    let thread = current.as_thread();
+    let cred = thread.current_cred();
+    let uts_ns = thread.proc_data.uts_ns();
+    ns_capable(
+        &cred,
+        uts_ns.owner_user_ns(),
+        linux_raw_sys::general::CAP_SYS_ADMIN,
+    )
+}
+
 fn cstr_field_to_string(field: &[c_char; 65]) -> String {
     let len = field.iter().position(|&ch| ch == 0).unwrap_or(field.len());
     field[..len]
@@ -317,11 +329,7 @@ pub fn sys_uname(name: *mut new_utsname) -> AxResult<isize> {
 }
 
 pub fn sys_sethostname(name: *const u8, len: usize) -> AxResult<isize> {
-    let curr = current();
-    if !curr
-        .as_thread()
-        .has_effective_capability(linux_raw_sys::general::CAP_SYS_ADMIN)
-    {
+    if !current_can_administer_uts() {
         return Err(AxError::OperationNotPermitted);
     }
     if len > UTS_FIELD_LEN {
@@ -336,11 +344,7 @@ pub fn sys_sethostname(name: *const u8, len: usize) -> AxResult<isize> {
 }
 
 pub fn sys_setdomainname(name: *const u8, len: usize) -> AxResult<isize> {
-    let curr = current();
-    if !curr
-        .as_thread()
-        .has_effective_capability(linux_raw_sys::general::CAP_SYS_ADMIN)
-    {
+    if !current_can_administer_uts() {
         return Err(AxError::OperationNotPermitted);
     }
     if len > UTS_FIELD_LEN {

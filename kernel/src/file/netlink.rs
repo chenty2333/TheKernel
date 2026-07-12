@@ -7,7 +7,7 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::prelude::*;
-use axnet::{InterfaceInfo, InterfaceKind, IpAddress, NetStack, RecvFlags, RouteInfo};
+use axnet::{InterfaceInfo, InterfaceKind, IpAddress, RecvFlags, RouteInfo};
 use axpoll::{IoEvents, PollSet, Pollable};
 use linux_raw_sys::net::{
     AF_INET, AF_INET6, AF_NETLINK, AF_UNSPEC, SOCK_DGRAM, SOCK_RAW, sockaddr, socklen_t,
@@ -18,6 +18,7 @@ use crate::{
     file::{FileLike, IoDst, IoSrc, Kstat, PseudoInode, try_pseudo_inode_path},
     mm::UserPtr,
     readiness::block_on_poll_io,
+    task::NetworkNamespace,
 };
 
 const NETLINK_MAX_PROTOCOL: u32 = 31;
@@ -171,7 +172,7 @@ struct NetlinkState {
 
 pub struct NetlinkSocket {
     protocol: u32,
-    net_stack: Arc<NetStack>,
+    net_ns: Arc<NetworkNamespace>,
     inode: PseudoInode,
     state: Mutex<NetlinkState>,
     queue: Mutex<VecDeque<Vec<u8>>>,
@@ -190,16 +191,17 @@ impl NetlinkSocket {
         Ok(())
     }
 
-    pub fn new(protocol: u32, net_stack: Arc<NetStack>) -> Arc<Self> {
-        Arc::new(Self {
+    pub(crate) fn try_new(protocol: u32, net_ns: Arc<NetworkNamespace>) -> AxResult<Arc<Self>> {
+        Arc::try_new(Self {
             protocol,
-            net_stack,
+            net_ns,
             inode: PseudoInode::socket(),
             state: Mutex::new(NetlinkState::default()),
             queue: Mutex::new(VecDeque::new()),
             nonblocking: AtomicBool::new(false),
             poll_rx: PollSet::new(),
         })
+        .map_err(|_| AxError::NoMemory)
     }
 
     pub fn bind(&self, port_id: u32, groups: u32) -> AxResult {
@@ -382,7 +384,7 @@ impl NetlinkSocket {
             None
         };
         let port_id = self.state.lock().port_id;
-        for interface in self.net_stack.interfaces() {
+        for interface in self.net_ns.stack().interfaces() {
             for entry in address_entries(&interface) {
                 if let Some(filter) = filter
                     && ((filter.ifa_family != AF_UNSPEC as u8 && filter.ifa_family != entry.family)
@@ -404,7 +406,7 @@ impl NetlinkSocket {
             None
         };
         let port_id = self.state.lock().port_id;
-        for route in self.net_stack.routes() {
+        for route in self.net_ns.stack().routes() {
             let entry = route_entry(&route);
             if let Some(filter) = filter
                 && filter.rtm_family != AF_UNSPEC as u8
@@ -425,7 +427,7 @@ impl NetlinkSocket {
             None
         };
         let port_id = self.state.lock().port_id;
-        for interface in self.net_stack.interfaces() {
+        for interface in self.net_ns.stack().interfaces() {
             let link = link_entry(interface);
             if let Some(filter) = filter
                 && filter.ifi_index > 0
@@ -764,5 +766,28 @@ impl Pollable for NetlinkSocket {
         } else {
             axpoll::PollRegistration::empty()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use alloc::sync::Arc;
+
+    use super::NetlinkSocket;
+    use crate::task::{NetworkNamespace, UserNamespace};
+
+    #[test]
+    fn namespace_owner_netlink_socket_retains_complete_network_namespace() {
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
+        let weak = Arc::downgrade(&net_ns);
+        let socket = NetlinkSocket::try_new(0, net_ns.clone()).unwrap();
+
+        drop(net_ns);
+        assert!(weak.upgrade().is_some());
+        drop(socket);
+        assert!(weak.upgrade().is_none());
     }
 }

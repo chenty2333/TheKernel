@@ -409,7 +409,6 @@ pub(crate) struct OpenCredentials {
     pub(crate) euid: Kuid,
     pub(crate) suid: Kuid,
     pub(crate) fsuid: Kuid,
-    pub(crate) is_initial_user_ns: bool,
     pub(crate) cgroup_ns_id: u64,
 }
 
@@ -429,7 +428,6 @@ impl OpenCredentials {
             euid: ids.euid,
             suid: ids.suid,
             fsuid: ids.fsuid,
-            is_initial_user_ns: cred.user_ns().is_initial(),
             cgroup_ns_id: proc_data.cgroup_ns_id(),
         }
     }
@@ -440,7 +438,6 @@ impl OpenCredentials {
             euid: Kuid::INITIAL_ROOT,
             suid: Kuid::INITIAL_ROOT,
             fsuid: Kuid::INITIAL_ROOT,
-            is_initial_user_ns: true,
             cgroup_ns_id: 0,
         }
     }
@@ -1168,12 +1165,17 @@ impl<T: ?Sized> FileHandle<T> {
     }
 
     fn with_security_credential<R>(&self, f: impl FnOnce() -> R) -> R {
-        let Some(security_credential) = self.description.open_security_credential() else {
+        let Some(task) = current_may_uninit() else {
             return f();
         };
-        let current = current();
-        let thread = current.as_thread();
-        let previous = thread.replace_file_operation_credential(Some(security_credential));
+        let Some(thread) = task.try_as_thread() else {
+            return f();
+        };
+        // Always install this OFD's exact state, including `None`. Otherwise a
+        // nested operation on an ordinary file could inherit the immutable
+        // opener credential installed by an outer OPEN_CREDENTIAL operation.
+        let previous =
+            thread.replace_file_operation_credential(self.description.open_security_credential());
         let _guard = RestoreOnDrop::new(previous, |previous| {
             // `replace_file_operation_credential` releases its spin guard
             // before returning the displaced Arc, so its destructor cannot

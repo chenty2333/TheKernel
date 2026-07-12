@@ -63,18 +63,18 @@ use crate::{
         try_boxed_names,
     },
     syscall::{
-        aio_max_nr, aio_nr, current_domainname_string, current_hostname_string,
-        current_machine_string, current_release_string, current_sysname_string,
-        current_version_string, key_maxbytes, key_maxkeys, key_root_maxbytes, key_root_maxkeys,
-        key_users_snapshot, mq_msg_max, mq_msgsize_max, mq_queues_max, msg_next_id, msgmni_limit,
-        parse_sem_limits, proc_version_string, sched_rr_timeslice_ms, sem_limits_string,
-        sem_next_id, set_aio_max_nr, set_domainname_bytes, set_hostname_bytes, set_key_maxbytes,
-        set_key_maxkeys, set_key_root_maxbytes, set_key_root_maxkeys, set_mq_msg_max,
-        set_mq_msgsize_max, set_mq_queues_max, set_msg_next_id, set_msgmni_limit,
-        set_sched_rr_timeslice_ms, set_sem_limits, set_sem_next_id, set_shm_next_id,
-        set_shmall_limit, set_shmmax_limit, set_shmmni_limit, shm_next_id, shmall_limit,
-        shmmax_limit, shmmni_limit, sysvipc_msg_snapshot, sysvipc_sem_snapshot,
-        sysvipc_shm_snapshot,
+        aio_max_nr, aio_nr, current_can_administer_uts, current_domainname_string,
+        current_hostname_string, current_machine_string, current_release_string,
+        current_sysname_string, current_version_string, key_maxbytes, key_maxkeys,
+        key_root_maxbytes, key_root_maxkeys, key_users_snapshot, mq_msg_max, mq_msgsize_max,
+        mq_queues_max, msg_next_id, msgmni_limit, parse_sem_limits, proc_version_string,
+        sched_rr_timeslice_ms, sem_limits_string, sem_next_id, set_aio_max_nr,
+        set_domainname_bytes, set_hostname_bytes, set_key_maxbytes, set_key_maxkeys,
+        set_key_root_maxbytes, set_key_root_maxkeys, set_mq_msg_max, set_mq_msgsize_max,
+        set_mq_queues_max, set_msg_next_id, set_msgmni_limit, set_sched_rr_timeslice_ms,
+        set_sem_limits, set_sem_next_id, set_shm_next_id, set_shmall_limit, set_shmmax_limit,
+        set_shmmni_limit, shm_next_id, shmall_limit, shmmax_limit, shmmni_limit,
+        sysvipc_msg_snapshot, sysvipc_sem_snapshot, sysvipc_shm_snapshot,
     },
     task::{
         AsThread, Cred, ID_MAP_MAX_EXTENTS, IdMapInputExtent, Kgid, Kuid, Mempolicy, PidNamespace,
@@ -82,8 +82,8 @@ use crate::{
         check_current_ptrace_access, get_process_data, get_process_including_zombie, get_task,
         get_visible_task, get_visible_task_including_exiting, may_begin_gid_map_write,
         may_begin_uid_map_write, may_update_setgroups_policy, may_write_gid_map, may_write_uid_map,
-        nr_open_limit, render_task_stat, render_zombie_stat, set_nr_open_limit, task_state,
-        try_processes, validate_id_map_input,
+        nr_open_limit, ns_capable, render_task_stat, render_zombie_stat, set_nr_open_limit,
+        task_state, try_processes, validate_id_map_input,
     },
 };
 
@@ -1121,6 +1121,7 @@ fn current_net_ipv4_conf_tag(iface: &str) -> VfsResult<i32> {
         .as_thread()
         .proc_data
         .net_ns
+        .stack()
         .ipv4_conf_tag(iface)
         .ok_or(VfsError::NotFound)
 }
@@ -1130,6 +1131,7 @@ fn set_current_net_ipv4_conf_tag(iface: &str, value: i32) -> VfsResult<()> {
         .as_thread()
         .proc_data
         .net_ns
+        .stack()
         .set_ipv4_conf_tag(iface, value)
         .map_err(|_| VfsError::NotFound)
 }
@@ -1142,6 +1144,17 @@ fn proc_ipv4_conf_tag_file(iface: &'static str) -> impl crate::pseudofs::SimpleF
         SimpleFileOperation::Write(data) => {
             if data.iter().all(|byte| byte.is_ascii_whitespace()) {
                 return Ok(None);
+            }
+            let current = current();
+            let thread = current.as_thread();
+            let cred = thread.current_cred();
+            let net_ns = thread.proc_data.net_ns.clone();
+            if !ns_capable(
+                &cred,
+                net_ns.owner_user_ns(),
+                linux_raw_sys::general::CAP_NET_ADMIN,
+            ) {
+                return Err(VfsError::PermissionDenied);
             }
             let value = str::from_utf8(data)
                 .ok()
@@ -1693,6 +1706,21 @@ pub(crate) enum ProcNamespaceObject {
     Uts(Arc<UtsNamespace>),
 }
 
+impl ProcNamespaceObject {
+    /// Returns the user namespace which owns this namespace object.
+    ///
+    /// A non-initial user namespace is itself owned by its parent. The initial
+    /// user namespace has no owning namespace and no `NS_GET_USERNS` result.
+    pub(crate) fn owner_user_ns(&self) -> Option<Arc<UserNamespace>> {
+        match self {
+            Self::Pid(ns) => Some(ns.owner_user_ns().clone()),
+            Self::Time(ns) => Some(ns.owner_user_ns().clone()),
+            Self::User(ns) => ns.parent(),
+            Self::Uts(ns) => Some(ns.owner_user_ns().clone()),
+        }
+    }
+}
+
 struct ProcNamespaceFile {
     node: SimpleFsNode,
     fs: Arc<SimpleFs>,
@@ -2014,10 +2042,13 @@ fn write_timens_offsets(task: &AxTaskRef, data: &[u8]) -> VfsResult<()> {
     }
     let text = str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
     let proc_data = &task.as_thread().proc_data;
-    if !current()
-        .as_thread()
-        .has_effective_capability(linux_raw_sys::general::CAP_SYS_TIME)
-    {
+    let actor_cred = current_file_operation_security_credential().ok_or(VfsError::Io)?;
+    let time_ns = proc_data.time_ns_for_children();
+    if !ns_capable(
+        actor_cred.as_ref(),
+        time_ns.owner_user_ns(),
+        linux_raw_sys::general::CAP_SYS_TIME,
+    ) {
         return Err(VfsError::PermissionDenied);
     }
 
@@ -2031,7 +2062,6 @@ fn write_timens_offsets(task: &AxTaskRef, data: &[u8]) -> VfsResult<()> {
         return Err(VfsError::InvalidInput);
     }
 
-    let time_ns = proc_data.time_ns_for_children();
     for (clock, secs, nsecs) in parsed {
         match clock {
             CLOCK_MONOTONIC => time_ns.set_monotonic_offset(secs, nsecs),
@@ -2355,7 +2385,7 @@ impl SimpleDirOps for ThreadDir {
                 }),
             )
             .into(),
-            "timens_offsets" => SimpleFile::new_regular(
+            "timens_offsets" => SimpleFile::try_new_regular_with_open_credential(
                 fs,
                 RwFile::new(move |req| match req {
                     SimpleFileOperation::Read => Ok(Some(render_timens_offsets(&task))),
@@ -2364,7 +2394,7 @@ impl SimpleDirOps for ThreadDir {
                         Ok(None)
                     }
                 }),
-            )
+            )?
             .into(),
             "comm" => SimpleFile::new_regular(
                 fs,
@@ -2529,7 +2559,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         )
         .to_string();
         let net_ns = current().as_thread().proc_data.net_ns.clone();
-        for (name, stats) in net_ns.device_stats() {
+        for (name, stats) in net_ns.stack().device_stats() {
             let _ = writeln!(
                 output,
                 "{name:>6}: {rx_bytes:>7} {rx_packets:>7} {rx_errors:>4} {rx_dropped:>4} 0 0 0 0 \
@@ -3104,6 +3134,9 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                             format!("{}\n", current_domainname_string()).into_bytes(),
                         )),
                         SimpleFileOperation::Write(data) => {
+                            if !current_can_administer_uts() {
+                                return Err(VfsError::PermissionDenied);
+                            }
                             if let Some(value) = proc_uts_write_value(data) {
                                 set_domainname_bytes(value);
                             }
@@ -3122,6 +3155,9 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                             format!("{}\n", current_hostname_string()).into_bytes(),
                         )),
                         SimpleFileOperation::Write(data) => {
+                            if !current_can_administer_uts() {
+                                return Err(VfsError::PermissionDenied);
+                            }
                             if let Some(value) = proc_uts_write_value(data) {
                                 set_hostname_bytes(value);
                             }
@@ -3525,5 +3561,27 @@ mod tests {
             render_id_map(&child, &unmapped_viewer, true).unwrap(),
             format!("{:>10} {:>10} {:>10}\n", 0, u32::MAX, 5).into_bytes()
         );
+    }
+
+    #[test]
+    fn namespace_owner_proc_objects_map_to_explicit_owner() {
+        let root = UserNamespace::try_new_root().unwrap();
+        let child = root.try_fork(kuid(1000), kgid(1000), false).unwrap();
+
+        let pid = PidNamespace::try_new_root(child.clone()).unwrap();
+        let time = TimeNamespace::try_new_root(child.clone()).unwrap();
+        let uts = UtsNamespace::try_new_root(child.clone()).unwrap();
+        for object in [
+            ProcNamespaceObject::Pid(pid),
+            ProcNamespaceObject::Time(time),
+            ProcNamespaceObject::Uts(uts),
+        ] {
+            let owner = object.owner_user_ns().unwrap();
+            assert!(Arc::ptr_eq(&owner, &child));
+        }
+
+        let child_object = ProcNamespaceObject::User(child);
+        assert!(Arc::ptr_eq(&child_object.owner_user_ns().unwrap(), &root));
+        assert!(ProcNamespaceObject::User(root).owner_user_ns().is_none());
     }
 }

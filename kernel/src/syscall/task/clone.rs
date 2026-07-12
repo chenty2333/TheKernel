@@ -23,10 +23,10 @@ use crate::{
     readiness::block_on_poll_set_uninterruptible,
     syscall::prepare_proc_shm_inheritance,
     task::{
-        AsThread, Cred, CredentialSlot, InitialProcessThreadAdmission, PendingThreadPublication,
-        ProcessData, ProcessThreadAdmission, Thread, get_process_data, linux_pid_from_task_id,
-        prepare_task_table_admission, process_domain, send_signal_thread_inner, try_new_user_task,
-        try_tasks, vm_write_in_aspace,
+        AsThread, Cred, CredentialSlot, InitialProcessThreadAdmission, NetworkNamespace,
+        PendingThreadPublication, ProcessData, ProcessThreadAdmission, Thread, get_process_data,
+        linux_pid_from_task_id, ns_capable, prepare_task_table_admission, process_domain,
+        send_signal_thread_inner, try_new_user_task, try_tasks, vm_write_in_aspace,
     },
 };
 
@@ -39,6 +39,20 @@ fn should_yield_after_clone(flags: CloneFlags) -> bool {
             | CloneFlags::CHILD_SETTID
             | CloneFlags::CHILD_CLEARTID,
     )
+}
+
+fn clone_namespace_owner(
+    flags: CloneFlags,
+    child_cred: &Cred,
+) -> AxResult<Arc<crate::task::UserNamespace>> {
+    let owner = child_cred.user_ns().clone();
+    if flags.intersects(
+        CloneFlags::NEWCGROUP | CloneFlags::NEWUTS | CloneFlags::NEWPID | CloneFlags::NEWNET,
+    ) && !ns_capable(child_cred, &owner, CAP_SYS_ADMIN)
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
+    Ok(owner)
 }
 
 enum CloneThreadPublication {
@@ -254,16 +268,15 @@ impl CloneArgs {
         if flags.contains(CloneFlags::PIDFD | CloneFlags::THREAD) {
             return Err(AxError::InvalidInput);
         }
-        if flags.contains(CloneFlags::THREAD | CloneFlags::NEWNET) {
-            return Err(AxError::InvalidInput);
-        }
-
-        if flags.contains(CloneFlags::NEWUTS)
-            && !current()
-                .as_thread()
-                .has_effective_capability(CAP_SYS_ADMIN)
+        if flags.contains(CloneFlags::THREAD)
+            && flags.intersects(
+                CloneFlags::NEWCGROUP
+                    | CloneFlags::NEWUTS
+                    | CloneFlags::NEWPID
+                    | CloneFlags::NEWNET,
+            )
         {
-            return Err(AxError::OperationNotPermitted);
+            return Err(AxError::InvalidInput);
         }
 
         if flags.contains(CloneFlags::INTO_CGROUP) && api != CloneApi::Clone3 {
@@ -330,6 +343,7 @@ impl CloneArgs {
         } else {
             parent_cred
         };
+        let namespace_owner = clone_namespace_owner(flags, &child_cred)?;
         if old_proc_data.exec_in_progress() {
             return Err(AxError::Interrupted);
         }
@@ -425,22 +439,26 @@ impl CloneArgs {
             };
 
             let net_ns = if flags.contains(CloneFlags::NEWNET) {
-                axnet::NetStack::try_new_loopback_only()?
+                NetworkNamespace::try_new_loopback_only(namespace_owner.clone())?
             } else {
                 old_proc_data.net_ns.clone()
             };
             let cgroup_ns = if flags.contains(CloneFlags::NEWCGROUP) {
-                old_proc_data.cgroup_ns().try_fork()?
+                old_proc_data
+                    .cgroup_ns()
+                    .try_fork(namespace_owner.clone())?
             } else {
                 old_proc_data.cgroup_ns()
             };
             let pid_ns = if flags.contains(CloneFlags::NEWPID) {
-                old_proc_data.pid_ns().try_fork(tid)?
+                old_proc_data
+                    .pid_ns()
+                    .try_fork(tid, namespace_owner.clone())?
             } else {
                 old_proc_data.pid_ns()
             };
             let uts_ns = if flags.contains(CloneFlags::NEWUTS) {
-                old_proc_data.uts_ns().try_fork()?
+                old_proc_data.uts_ns().try_fork(namespace_owner)?
             } else {
                 old_proc_data.uts_ns()
             };
@@ -685,10 +703,13 @@ pub fn sys_fork(uctx: &UserContext) -> AxResult<isize> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
+
     use axerrno::AxError;
     use linux_raw_sys::general::{CLONE_DETACHED, CLONE_PIDFD};
 
-    use super::{CloneApi, CloneArgs, CloneFlags};
+    use super::{CloneApi, CloneArgs, CloneFlags, clone_namespace_owner};
+    use crate::task::{Cred, Kgid, Kuid, UserNamespace};
 
     #[test]
     fn clone_validate_allows_detached_without_pidfd() {
@@ -788,5 +809,55 @@ mod tests {
             args.validate_for(CloneApi::Clone),
             Err(AxError::InvalidInput)
         );
+    }
+
+    #[test]
+    fn namespace_owner_clone_rejects_thread_with_process_namespace_flags() {
+        let thread_flags = CloneFlags::THREAD
+            | CloneFlags::VM
+            | CloneFlags::SIGHAND
+            | CloneFlags::FILES
+            | CloneFlags::FS;
+        for namespace_flag in [
+            CloneFlags::NEWCGROUP,
+            CloneFlags::NEWUTS,
+            CloneFlags::NEWPID,
+            CloneFlags::NEWNET,
+        ] {
+            let args = CloneArgs {
+                flags: thread_flags | namespace_flag,
+                ..Default::default()
+            };
+            assert_eq!(
+                args.validate_for(CloneApi::Clone),
+                Err(AxError::InvalidInput)
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_owner_clone_uses_post_newuser_credential_snapshot() {
+        let root = UserNamespace::try_new_root().unwrap();
+        let parent_cred = Cred::try_root(root.clone()).unwrap();
+        let child = root
+            .try_fork(
+                Kuid::from_raw(1000).unwrap(),
+                Kgid::from_raw(1000).unwrap(),
+                false,
+            )
+            .unwrap();
+        let child_cred = Cred::try_with_user_ns(&parent_cred, child.clone()).unwrap();
+        let flags = CloneFlags::NEWUSER
+            | CloneFlags::NEWCGROUP
+            | CloneFlags::NEWUTS
+            | CloneFlags::NEWPID
+            | CloneFlags::NEWNET;
+
+        let owner = clone_namespace_owner(flags, &child_cred).unwrap();
+        assert!(Arc::ptr_eq(&owner, &child));
+        assert!(!Arc::ptr_eq(&owner, &root));
+
+        let inherited_owner = clone_namespace_owner(CloneFlags::NEWUTS, &child_cred).unwrap();
+        assert!(Arc::ptr_eq(&inherited_owner, &child));
     }
 }

@@ -25,9 +25,9 @@ use crate::{
         namespace_target_from_proc_file,
     },
     task::{
-        AsThread, CapabilityState, Mempolicy, ProcessData, PtraceCredentialMode,
+        AsThread, CapabilityState, Cred, Mempolicy, ProcessData, PtraceCredentialMode,
         check_current_process_ptrace_access, get_process_data, get_visible_task,
-        linux_pid_from_task_id,
+        linux_pid_from_task_id, ns_capable,
     },
 };
 
@@ -58,17 +58,16 @@ const UNSHARE_RECOGNIZED_FLAGS: u32 = UNSHARE_SUPPORTED_FLAGS
     | CLONE_NEWCGROUP
     | CLONE_NEWTIME
     | CLONE_SYSVSEM;
-const NAMESPACE_FLAGS: u32 = CLONE_NEWNS
-    | CLONE_NEWUTS
-    | CLONE_NEWIPC
-    | CLONE_NEWNET
-    | CLONE_NEWPID
-    | CLONE_NEWUSER
-    | CLONE_NEWCGROUP
-    | CLONE_NEWTIME;
-
 fn mempolicy_mode(mode_with_flags: usize) -> u32 {
     (mode_with_flags & !SUPPORTED_MODE_FLAGS) as u32
+}
+
+fn unshare_namespace_owner(flags: u32, actor: &Cred) -> AxResult<Arc<crate::task::UserNamespace>> {
+    let owner = actor.user_ns().clone();
+    if flags & (CLONE_NEWUTS | CLONE_NEWTIME) != 0 && !ns_capable(actor, &owner, CAP_SYS_ADMIN) {
+        return Err(AxError::OperationNotPermitted);
+    }
+    Ok(owner)
 }
 
 fn mempolicy_mode_flags(mode_with_flags: usize) -> usize {
@@ -301,12 +300,10 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
     if flags & !UNSHARE_SUPPORTED_FLAGS != 0 {
         return Err(AxError::OperationNotSupported);
     }
-    if flags & NAMESPACE_FLAGS != 0 && !current_has_capability(CAP_SYS_ADMIN) {
-        return Err(AxError::OperationNotPermitted);
-    }
-
     let curr = current();
     let thread = curr.as_thread();
+    let actor_cred = thread.current_cred();
+    let namespace_owner = unshare_namespace_owner(flags, &actor_cred)?;
     if flags & UNSHARE_SUPPORTED_FLAGS != 0 {
         // Every currently supported resource still lives in ProcessData or its
         // process-wide Scope. Replacing one while siblings exist would unshare
@@ -333,12 +330,21 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
                 None
             };
             let private_uts_ns = if flags & CLONE_NEWUTS != 0 {
-                Some(thread.proc_data.uts_ns().try_fork()?)
+                Some(
+                    thread
+                        .proc_data
+                        .uts_ns()
+                        .try_fork(namespace_owner.clone())?,
+                )
             } else {
                 None
             };
             let private_time_ns = if flags & CLONE_NEWTIME != 0 {
-                Some(thread.proc_data.try_unshared_time_ns()?)
+                Some(
+                    thread
+                        .proc_data
+                        .try_unshared_time_ns(namespace_owner.clone())?,
+                )
             } else {
                 None
             };
@@ -388,27 +394,43 @@ pub fn sys_setns(fd: i32, nstype: u32) -> AxResult<isize> {
     if nstype != 0 && nstype != expected_type {
         return Err(AxError::InvalidInput);
     }
-    if !current_has_capability(CAP_SYS_ADMIN) {
+    enum Replacement {
+        Uts(Arc<crate::task::UtsNamespace>),
+        Time(Arc<crate::task::TimeNamespace>),
+    }
+
+    let replacement = match (kind, object) {
+        (ProcNamespaceKind::Uts, ProcNamespaceObject::Uts(uts_ns)) => Replacement::Uts(uts_ns),
+        (
+            ProcNamespaceKind::Time | ProcNamespaceKind::TimeForChildren,
+            ProcNamespaceObject::Time(time_ns),
+        ) => Replacement::Time(time_ns),
+        (ProcNamespaceKind::Pid | ProcNamespaceKind::User, _) => {
+            return Err(LinuxError::EOPNOTSUPP.into());
+        }
+        _ => return Err(AxError::InvalidInput),
+    };
+    let owner_user_ns = match &replacement {
+        Replacement::Uts(uts_ns) => uts_ns.owner_user_ns(),
+        Replacement::Time(time_ns) => time_ns.owner_user_ns(),
+    };
+    let curr = current();
+    let thread = curr.as_thread();
+    let actor_cred = thread.current_cred();
+    if !ns_capable(&actor_cred, owner_user_ns, CAP_SYS_ADMIN) {
         return Err(AxError::OperationNotPermitted);
     }
 
-    match kind {
-        ProcNamespaceKind::Uts => {
-            let ProcNamespaceObject::Uts(uts_ns) = object else {
-                return Err(AxError::InvalidInput);
-            };
-            current().as_thread().proc_data.replace_uts_ns(uts_ns);
-            Ok(0)
-        }
-        ProcNamespaceKind::Time | ProcNamespaceKind::TimeForChildren => {
-            let ProcNamespaceObject::Time(time_ns) = object else {
-                return Err(AxError::InvalidInput);
-            };
-            current().as_thread().proc_data.replace_time_ns(time_ns);
-            Ok(0)
-        }
-        ProcNamespaceKind::Pid | ProcNamespaceKind::User => Err(LinuxError::EOPNOTSUPP.into()),
+    let curr_tid = linux_pid_from_task_id(curr.id().as_u64())?;
+    if !thread.proc_data.begin_single_thread_scope_change(curr_tid) {
+        return Err(AxError::OperationNotSupported);
     }
+    match replacement {
+        Replacement::Uts(uts_ns) => thread.proc_data.replace_uts_ns(uts_ns),
+        Replacement::Time(time_ns) => thread.proc_data.replace_time_ns(time_ns),
+    }
+    thread.proc_data.end_exec(curr_tid);
+    Ok(0)
 }
 
 fn validate_movable_node(node: i32) -> AxResult<()> {
@@ -1032,4 +1054,30 @@ pub fn sys_prctl(
     }
 
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+
+    use super::*;
+    use crate::task::{Cred, Kgid, Kuid, UserNamespace};
+
+    #[test]
+    fn namespace_owner_unshare_freezes_actor_user_namespace() {
+        let root = UserNamespace::try_new_root().unwrap();
+        let root_cred = Cred::try_root(root.clone()).unwrap();
+        let child = root
+            .try_fork(
+                Kuid::from_raw(1000).unwrap(),
+                Kgid::from_raw(1000).unwrap(),
+                false,
+            )
+            .unwrap();
+        let actor = Cred::try_with_user_ns(&root_cred, child.clone()).unwrap();
+
+        let owner = unshare_namespace_owner(CLONE_NEWUTS | CLONE_NEWTIME, &actor).unwrap();
+        assert!(Arc::ptr_eq(&owner, &child));
+        assert!(!Arc::ptr_eq(&owner, &root));
+    }
 }

@@ -3,7 +3,7 @@ use core::{ffi::c_int, ops::Deref, task::Context};
 
 use axerrno::{AxError, AxResult};
 use axnet::{
-    NetStack, RecvOptions, SendOptions, Socket as SocketInner, SocketOps,
+    RecvOptions, SendOptions, Socket as SocketInner, SocketOps,
     options::{Configurable, SetSocketOption},
 };
 use axpoll::{IoEvents, Pollable};
@@ -13,6 +13,7 @@ use super::{File, FileHandle, FileLike, Kstat, PseudoInode, try_pseudo_inode_pat
 use crate::{
     bpf::{prog::BpfProgram, vm::BpfVm},
     file::{IoDst, IoSrc, get_file_like, get_typed_file, packet::socket_ifreq_ioctl},
+    task::NetworkNamespace,
 };
 
 struct AttachedSocketFilter {
@@ -34,7 +35,7 @@ impl axnet::SocketFilter for AttachedSocketFilter {
 
 pub struct Socket {
     pub inner: SocketInner,
-    net_stack: Arc<NetStack>,
+    net_ns: Arc<NetworkNamespace>,
     inode: PseudoInode,
 }
 
@@ -47,16 +48,16 @@ impl Deref for Socket {
 }
 
 impl Socket {
-    pub fn new(inner: SocketInner, net_stack: Arc<NetStack>) -> Self {
+    pub(crate) fn new(inner: SocketInner, net_ns: Arc<NetworkNamespace>) -> Self {
         Self {
             inner,
-            net_stack,
+            net_ns,
             inode: PseudoInode::socket(),
         }
     }
 
-    pub fn net_stack(&self) -> &Arc<NetStack> {
-        &self.net_stack
+    pub(crate) fn net_namespace(&self) -> &Arc<NetworkNamespace> {
+        &self.net_ns
     }
 
     pub fn set_bpf_filter(&self, prog: Option<Arc<BpfProgram>>) -> AxResult<()> {
@@ -121,7 +122,7 @@ impl FileLike for Socket {
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
-        socket_ifreq_ioctl(&self.net_stack, cmd, arg)
+        socket_ifreq_ioctl(self.net_ns.stack(), cmd, arg)
     }
 
     fn path(&self) -> AxResult<Cow<'_, str>> {
@@ -158,5 +159,37 @@ impl Pollable for Socket {
         events: IoEvents,
     ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
         self.inner.register(context, events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use alloc::sync::Arc;
+
+    use axnet::{
+        Socket as SocketInner,
+        unix::{DgramTransport, UnixSocket},
+    };
+
+    use super::Socket;
+    use crate::task::{NetworkNamespace, UserNamespace};
+
+    #[test]
+    fn namespace_owner_ordinary_socket_retains_complete_network_namespace() {
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
+        let weak = Arc::downgrade(&net_ns);
+        let unix = UnixSocket::new(
+            DgramTransport::new().unwrap(),
+            net_ns.stack().unix_namespace(),
+        );
+        let socket = Socket::new(SocketInner::Unix(unix), net_ns.clone());
+
+        drop(net_ns);
+        assert!(weak.upgrade().is_some());
+        drop(socket);
+        assert!(weak.upgrade().is_none());
     }
 }

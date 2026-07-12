@@ -22,6 +22,7 @@ use axpoll::{IoEvents, Pollable};
 #[cfg(any(not(test), target_os = "none"))]
 use axsync::Mutex;
 use hashbrown::{HashMap, HashSet};
+use linux_raw_sys::general::CAP_SYS_ADMIN;
 use spin::Lazy;
 #[cfg(all(test, not(target_os = "none")))]
 use spin::Mutex;
@@ -30,9 +31,13 @@ use starry_signal::{SignalInfo, Signo};
 
 use super::pseudo_stat_fs;
 use crate::{
-    file::{Directory, OpenCredentials, current_file_write_credentials, get_typed_file},
+    file::{
+        Directory, OpenCredentials, current_file_operation_security_credential,
+        current_file_write_credentials, get_typed_file,
+    },
     task::{
-        AsThread, Cred, get_process_data, get_process_including_zombie, send_signal_to_process,
+        AsThread, Cred, get_process_data, get_process_including_zombie, ns_capable,
+        send_signal_to_process,
     },
 };
 
@@ -43,6 +48,10 @@ const MAX_CGROUP_CHILDREN: usize = 65_536;
 /// descendant locks. Cgroup state is synthetic and starts empty on every boot,
 /// so enforcing this at create/move admission covers every reachable tree.
 const MAX_CGROUP_DEPTH: usize = 256;
+
+fn cgroup_control_file_flags() -> NodeFlags {
+    NodeFlags::NON_CACHEABLE | NodeFlags::OPEN_CREDENTIAL
+}
 /// TheKernel does not yet have system-wide task accounting that can serve as
 /// a cgroup membership budget. Keep both membership indexes explicitly
 /// bounded until that accounting can own a tunable limit.
@@ -705,14 +714,15 @@ impl CgroupDir {
             return Err(VfsError::ResourceBusy);
         }
         let target = get_process_data(pid).map_err(|_| VfsError::NotFound)?;
-        let credentials = current_file_write_credentials().unwrap_or_else(OpenCredentials::current);
-        if !can_migrate_from_open_cgroup_namespace(credentials) {
+        let credentials = current_file_write_credentials().ok_or(VfsError::Io)?;
+        let actor_cred = current_file_operation_security_credential().ok_or(VfsError::Io)?;
+        if !can_migrate_from_open_cgroup_namespace(&credentials, &actor_cred) {
             return Err(VfsError::NotFound);
         }
         // cgroup.procs is process-directed; sample the persistent Linux group
         // leader credential binding once, even if the original leader exited.
         let target_cred = target.group_leader_cred();
-        if !can_migrate_with_credentials(credentials, &target_cred) {
+        if !can_migrate_with_credentials(&credentials, &actor_cred, &target_cred) {
             return Err(VfsError::PermissionDenied);
         }
         let this = self.this_dir()?;
@@ -1239,15 +1249,13 @@ impl Drop for CgroupForkAdmission<'_> {
     }
 }
 
-fn has_initial_root_migration_authority(credentials: OpenCredentials) -> bool {
-    credentials.is_initial_user_ns
-        && (credentials.euid == crate::task::Kuid::INITIAL_ROOT
-            || credentials.fsuid == crate::task::Kuid::INITIAL_ROOT)
-}
-
-fn can_migrate_with_credentials(credentials: OpenCredentials, target_cred: &Cred) -> bool {
+fn can_migrate_with_credentials(
+    credentials: &OpenCredentials,
+    actor_cred: &Cred,
+    target_cred: &Cred,
+) -> bool {
     let target_ids = target_cred.ids();
-    has_initial_root_migration_authority(credentials)
+    ns_capable(actor_cred, target_cred.user_ns(), CAP_SYS_ADMIN)
         || [
             credentials.uid,
             credentials.euid,
@@ -1258,9 +1266,13 @@ fn can_migrate_with_credentials(credentials: OpenCredentials, target_cred: &Cred
         .any(|uid| uid == target_ids.ruid || uid == target_ids.euid || uid == target_ids.suid)
 }
 
-fn can_migrate_from_open_cgroup_namespace(credentials: OpenCredentials) -> bool {
-    credentials.cgroup_ns_id == 0
-        || credentials.cgroup_ns_id == axtask::current().as_thread().proc_data.cgroup_ns_id()
+fn can_migrate_from_open_cgroup_namespace(
+    credentials: &OpenCredentials,
+    actor_cred: &Cred,
+) -> bool {
+    let current_ns = axtask::current().as_thread().proc_data.cgroup_ns();
+    credentials.cgroup_ns_id == current_ns.id()
+        || ns_capable(actor_cred, current_ns.owner_user_ns(), CAP_SYS_ADMIN)
 }
 
 fn detach_mapped_pid(pid: Pid) {
@@ -1836,7 +1848,7 @@ impl NodeOps for CgroupFile {
     }
 
     fn flags(&self) -> NodeFlags {
-        NodeFlags::NON_CACHEABLE
+        cgroup_control_file_flags()
     }
 }
 
@@ -1930,22 +1942,8 @@ mod tests {
     }
 
     #[test]
-    fn child_user_namespace_root_has_no_global_cgroup_migration_bypass() {
-        let child_root = OpenCredentials {
-            uid: crate::task::Kuid::INITIAL_ROOT,
-            euid: crate::task::Kuid::INITIAL_ROOT,
-            suid: crate::task::Kuid::INITIAL_ROOT,
-            fsuid: crate::task::Kuid::INITIAL_ROOT,
-            is_initial_user_ns: false,
-            cgroup_ns_id: 0,
-        };
-        assert!(!has_initial_root_migration_authority(child_root));
-
-        let initial_root = OpenCredentials {
-            is_initial_user_ns: true,
-            ..child_root
-        };
-        assert!(has_initial_root_migration_authority(initial_root));
+    fn namespace_owner_cgroup_control_files_freeze_open_credential() {
+        assert!(cgroup_control_file_flags().contains(NodeFlags::OPEN_CREDENTIAL));
     }
 
     #[test]

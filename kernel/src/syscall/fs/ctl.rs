@@ -34,7 +34,7 @@ use crate::{
         ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
         namespace_target_from_proc_file, proc_namespace_location_from_object,
     },
-    task::{AsThread, DacCredentialView, Kgid, Kuid, PidNamespace},
+    task::{AsThread, DacCredentialView, Kgid, Kuid, PidNamespace, ns_capable},
     time::{TimeValueLike, wall_time},
 };
 
@@ -80,6 +80,10 @@ fn add_proc_namespace_fd(
 }
 
 fn visible_pid_namespace_parent(ns: &Arc<PidNamespace>) -> Option<Arc<PidNamespace>> {
+    let cred = current().as_thread().current_cred();
+    if !ns_capable(&cred, ns.owner_user_ns(), CAP_SYS_ADMIN) {
+        return None;
+    }
     let parent = ns.parent()?;
     let active = current().as_thread().proc_data.pid_ns();
     let mut cursor = Some(parent.clone());
@@ -118,21 +122,16 @@ fn proc_namespace_ioctl(loc: &Location, cmd: u32) -> Option<AxResult<isize>> {
             (ProcNamespaceKind::User | ProcNamespaceKind::Uts, _) => Err(AxError::InvalidInput),
             _ => Err(AxError::InvalidInput),
         },
-        NS_GET_USERNS => match object {
-            ProcNamespaceObject::User(ns) => ns
-                .parent()
-                .map(|parent| {
-                    add_proc_namespace_fd(
-                        loc,
-                        ProcNamespaceKind::User,
-                        ProcNamespaceObject::User(parent),
-                    )
-                })
-                .unwrap_or(Err(AxError::OperationNotPermitted)),
-            ProcNamespaceObject::Pid(_)
-            | ProcNamespaceObject::Time(_)
-            | ProcNamespaceObject::Uts(_) => Err(AxError::OperationNotPermitted),
-        },
+        NS_GET_USERNS => object
+            .owner_user_ns()
+            .map(|owner| {
+                add_proc_namespace_fd(
+                    loc,
+                    ProcNamespaceKind::User,
+                    ProcNamespaceObject::User(owner),
+                )
+            })
+            .unwrap_or(Err(AxError::OperationNotPermitted)),
         _ => return None,
     };
     Some(result)

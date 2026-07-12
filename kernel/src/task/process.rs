@@ -139,26 +139,35 @@ impl Drop for UserNamespaceAdmission {
 #[derive(Clone)]
 pub(crate) struct CgroupNamespace {
     id: u64,
+    owner_user_ns: Arc<UserNamespace>,
 }
 
 impl CgroupNamespace {
-    pub(crate) fn try_new_root() -> AxResult<Arc<Self>> {
-        Self::try_new()
+    pub(crate) fn try_new_root(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
+        Self::try_new(owner_user_ns)
     }
 
-    fn try_new() -> AxResult<Arc<Self>> {
+    fn try_new(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
         Arc::try_new(Self {
             id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
+            owner_user_ns,
         })
         .map_err(|_| AxError::NoMemory)
     }
 
-    pub(crate) fn try_fork(self: &Arc<Self>) -> AxResult<Arc<Self>> {
-        Self::try_new()
+    pub(crate) fn try_fork(
+        self: &Arc<Self>,
+        owner_user_ns: Arc<UserNamespace>,
+    ) -> AxResult<Arc<Self>> {
+        Self::try_new(owner_user_ns)
     }
 
     pub(crate) fn id(&self) -> u64 {
         self.id
+    }
+
+    pub(crate) fn owner_user_ns(&self) -> &Arc<UserNamespace> {
+        &self.owner_user_ns
     }
 }
 
@@ -167,28 +176,42 @@ pub(crate) struct PidNamespace {
     id: u64,
     parent: Option<Arc<PidNamespace>>,
     init_pid: Option<Pid>,
+    owner_user_ns: Arc<UserNamespace>,
 }
 
 impl PidNamespace {
-    pub(crate) fn try_new_root() -> AxResult<Arc<Self>> {
-        Self::try_new(None, None)
+    pub(crate) fn try_new_root(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
+        Self::try_new(None, None, owner_user_ns)
     }
 
-    fn try_new(parent: Option<Arc<Self>>, init_pid: Option<Pid>) -> AxResult<Arc<Self>> {
+    fn try_new(
+        parent: Option<Arc<Self>>,
+        init_pid: Option<Pid>,
+        owner_user_ns: Arc<UserNamespace>,
+    ) -> AxResult<Arc<Self>> {
         Arc::try_new(Self {
             id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
             parent,
             init_pid,
+            owner_user_ns,
         })
         .map_err(|_| AxError::NoMemory)
     }
 
-    pub(crate) fn try_fork(self: &Arc<Self>, init_pid: Pid) -> AxResult<Arc<Self>> {
-        Self::try_new(Some(self.clone()), Some(init_pid))
+    pub(crate) fn try_fork(
+        self: &Arc<Self>,
+        init_pid: Pid,
+        owner_user_ns: Arc<UserNamespace>,
+    ) -> AxResult<Arc<Self>> {
+        Self::try_new(Some(self.clone()), Some(init_pid), owner_user_ns)
     }
 
     pub(crate) fn parent(&self) -> Option<Arc<Self>> {
         self.parent.clone()
+    }
+
+    pub(crate) fn owner_user_ns(&self) -> &Arc<UserNamespace> {
+        &self.owner_user_ns
     }
 
     pub(crate) fn visible_pid(&self, global_pid: Pid) -> Pid {
@@ -590,29 +613,38 @@ impl UtsState {
 
 pub(crate) struct UtsNamespace {
     state: SpinNoIrq<UtsState>,
+    owner_user_ns: Arc<UserNamespace>,
 }
 
 impl UtsNamespace {
-    pub(crate) fn new_default() -> Self {
-        Self {
-            state: SpinNoIrq::new(init_uts_state()),
-        }
-    }
-
-    pub(crate) fn try_fork(&self) -> AxResult<Arc<Self>> {
+    pub(crate) fn try_new_root(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
         Arc::try_new(Self {
-            state: SpinNoIrq::new(*self.state.lock()),
+            state: SpinNoIrq::new(init_uts_state()),
+            owner_user_ns,
         })
         .map_err(|_| AxError::NoMemory)
     }
 
+    pub(crate) fn try_fork(&self, owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
+        let state = *self.state.lock();
+        Arc::try_new(Self {
+            state: SpinNoIrq::new(state),
+            owner_user_ns,
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+
+    pub(crate) fn owner_user_ns(&self) -> &Arc<UserNamespace> {
+        &self.owner_user_ns
+    }
+
     pub(crate) fn nodename(&self) -> Vec<u8> {
-        let state = self.state.lock();
+        let state = *self.state.lock();
         state.nodename[..state.nodename_len].to_vec()
     }
 
     pub(crate) fn domainname(&self) -> Vec<u8> {
-        let state = self.state.lock();
+        let state = *self.state.lock();
         state.domainname[..state.domainname_len].to_vec()
     }
 
@@ -633,20 +665,29 @@ struct TimeNamespaceState {
 
 pub(crate) struct TimeNamespace {
     state: SpinNoIrq<TimeNamespaceState>,
+    owner_user_ns: Arc<UserNamespace>,
 }
 
 impl TimeNamespace {
-    pub(crate) fn new_default() -> Self {
-        Self {
-            state: SpinNoIrq::new(TimeNamespaceState::default()),
-        }
-    }
-
-    pub(crate) fn try_fork(&self) -> AxResult<Arc<Self>> {
+    pub(crate) fn try_new_root(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
         Arc::try_new(Self {
-            state: SpinNoIrq::new(*self.state.lock()),
+            state: SpinNoIrq::new(TimeNamespaceState::default()),
+            owner_user_ns,
         })
         .map_err(|_| AxError::NoMemory)
+    }
+
+    pub(crate) fn try_fork(&self, owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
+        let state = *self.state.lock();
+        Arc::try_new(Self {
+            state: SpinNoIrq::new(state),
+            owner_user_ns,
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+
+    pub(crate) fn owner_user_ns(&self) -> &Arc<UserNamespace> {
+        &self.owner_user_ns
     }
 
     fn offset_ns(&self, boottime: bool) -> i64 {
@@ -683,11 +724,46 @@ impl TimeNamespace {
     }
 
     pub(crate) fn render_offsets(&self) -> Vec<u8> {
-        let state = self.state.lock();
+        let state = *self.state.lock();
         let (mono_sec, mono_nsec) = nanos_to_offset(state.monotonic_offset_ns);
         let (boot_sec, boot_nsec) = nanos_to_offset(state.boottime_offset_ns);
         format!("monotonic  {mono_sec:10} {mono_nsec:9}\nboottime   {boot_sec:10} {boot_nsec:9}\n")
             .into_bytes()
+    }
+}
+
+/// Linux-visible network namespace identity over one generic network stack.
+///
+/// `NetStack` stays in the generic mechanism layer. The owning user namespace
+/// belongs to this Linux-ABI object so authority remains bound to the object
+/// even after the creating process exits or a socket crosses processes.
+pub(crate) struct NetworkNamespace {
+    stack: Arc<NetStack>,
+    owner_user_ns: Arc<UserNamespace>,
+}
+
+impl NetworkNamespace {
+    pub(crate) fn try_new(
+        stack: Arc<NetStack>,
+        owner_user_ns: Arc<UserNamespace>,
+    ) -> AxResult<Arc<Self>> {
+        Arc::try_new(Self {
+            stack,
+            owner_user_ns,
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+
+    pub(crate) fn try_new_loopback_only(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
+        Self::try_new(NetStack::try_new_loopback_only()?, owner_user_ns)
+    }
+
+    pub(crate) fn stack(&self) -> &Arc<NetStack> {
+        &self.stack
+    }
+
+    pub(crate) fn owner_user_ns(&self) -> &Arc<UserNamespace> {
+        &self.owner_user_ns
     }
 }
 
@@ -989,7 +1065,7 @@ pub struct ProcessData {
     pub vfork_event: Arc<PollSet>,
 
     /// The network namespace (network stack) for this process.
-    pub net_ns: Arc<NetStack>,
+    pub(crate) net_ns: Arc<NetworkNamespace>,
     /// Lightweight cgroup namespace identity for cgroup.procs open-time checks.
     cgroup_ns: Arc<CgroupNamespace>,
     /// Lightweight PID namespace identity for procfs namespace fd ABI.
@@ -1162,7 +1238,7 @@ impl ProcessData {
         exit_fd_table: Arc<FdTable>,
         signal_actions: Arc<SpinNoIrq<SignalActions>>,
         exit_signal: Option<Signo>,
-        net_ns: Arc<NetStack>,
+        net_ns: Arc<NetworkNamespace>,
         cgroup_ns: Arc<CgroupNamespace>,
         pid_ns: Arc<PidNamespace>,
         uts_ns: Arc<UtsNamespace>,
@@ -1374,8 +1450,11 @@ impl ProcessData {
         drop((old_current, old_children));
     }
 
-    pub(crate) fn try_unshared_time_ns(&self) -> AxResult<Arc<TimeNamespace>> {
-        self.time_ns_for_children().try_fork()
+    pub(crate) fn try_unshared_time_ns(
+        &self,
+        owner_user_ns: Arc<UserNamespace>,
+    ) -> AxResult<Arc<TimeNamespace>> {
+        self.time_ns_for_children().try_fork(owner_user_ns)
     }
 
     pub(crate) fn replace_time_ns_for_children(&self, new_ns: Arc<TimeNamespace>) {
@@ -2104,9 +2183,10 @@ mod tests {
     use axerrno::AxError;
 
     use super::{
-        GroupLeaderCredentialBinding, SIGNAL_QUEUE_GLOBAL_HARD_LIMIT,
-        SIGNAL_QUEUE_PER_USER_HARD_LIMIT, UserNamespace, group_exit_handoff_requires_kill,
-        init_uts_state, try_increment_bounded,
+        CgroupNamespace, GroupLeaderCredentialBinding, NetworkNamespace, PidNamespace,
+        SIGNAL_QUEUE_GLOBAL_HARD_LIMIT, SIGNAL_QUEUE_PER_USER_HARD_LIMIT, TimeNamespace,
+        UserNamespace, UtsNamespace, group_exit_handoff_requires_kill, init_uts_state,
+        try_increment_bounded,
     };
     use crate::task::{
         Cred, CredentialSlot,
@@ -2310,6 +2390,50 @@ mod tests {
             child.try_fork(kuid(1000), kgid(1000), false),
             Err(AxError::OperationNotPermitted)
         ));
+    }
+
+    #[test]
+    fn namespace_owner_objects_retain_explicit_snapshot_and_forked_state() {
+        let root = UserNamespace::try_new_root().unwrap();
+        let child = root.try_fork(kuid(1000), kgid(1000), false).unwrap();
+        let child_weak = Arc::downgrade(&child);
+
+        let cgroup_root = CgroupNamespace::try_new_root(root.clone()).unwrap();
+        let cgroup_child = cgroup_root.try_fork(child.clone()).unwrap();
+        assert!(Arc::ptr_eq(cgroup_root.owner_user_ns(), &root));
+        assert!(Arc::ptr_eq(cgroup_child.owner_user_ns(), &child));
+
+        let pid_root = PidNamespace::try_new_root(root.clone()).unwrap();
+        let pid_child = pid_root.try_fork(42, child.clone()).unwrap();
+        assert!(Arc::ptr_eq(pid_root.owner_user_ns(), &root));
+        assert!(Arc::ptr_eq(pid_child.owner_user_ns(), &child));
+
+        let uts_root = UtsNamespace::try_new_root(root.clone()).unwrap();
+        uts_root.set_nodename(b"owner-snapshot");
+        let uts_child = uts_root.try_fork(child.clone()).unwrap();
+        assert!(Arc::ptr_eq(uts_child.owner_user_ns(), &child));
+        assert_eq!(uts_child.nodename(), b"owner-snapshot");
+
+        let time_root = TimeNamespace::try_new_root(root.clone()).unwrap();
+        time_root.set_monotonic_offset(7, 11);
+        time_root.set_boottime_offset(-3, 19);
+        let time_child = time_root.try_fork(child.clone()).unwrap();
+        assert!(Arc::ptr_eq(time_child.owner_user_ns(), &child));
+        assert_eq!(time_child.render_offsets(), time_root.render_offsets());
+
+        let network_child = NetworkNamespace::try_new_loopback_only(child.clone()).unwrap();
+        assert!(Arc::ptr_eq(network_child.owner_user_ns(), &child));
+
+        drop(child);
+        assert!(child_weak.upgrade().is_some());
+        drop((
+            cgroup_child,
+            pid_child,
+            uts_child,
+            time_child,
+            network_child,
+        ));
+        assert!(child_weak.upgrade().is_none());
     }
 
     #[test]

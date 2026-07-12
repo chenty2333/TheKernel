@@ -13,7 +13,7 @@ use linux_raw_sys::{
 use crate::{
     file::{AfAlgSocket, FileLike, NetlinkSocket, Socket, af_alg, get_file_like},
     mm::{UserConstPtr, UserPtr},
-    task::AsThread,
+    task::{AsThread, ns_capable},
 };
 
 const PROTO_TCP: u32 = linux_raw_sys::net::IPPROTO_TCP as u32;
@@ -432,10 +432,8 @@ pub fn sys_setsockopt(
     if level == SOL_SOCKET {
         match optname {
             SO_SNDBUFFORCE => {
-                if !current()
-                    .as_thread()
-                    .has_effective_capability(CAP_NET_ADMIN)
-                {
+                let cred = current().as_thread().current_cred();
+                if !ns_capable(&cred, socket.net_namespace().owner_user_ns(), CAP_NET_ADMIN) {
                     return Err(LinuxError::EPERM.into());
                 }
                 let size = (*get::<u32>(optval, optlen)? as usize).min(i32::MAX as usize);
@@ -443,10 +441,8 @@ pub fn sys_setsockopt(
                 return Ok(0);
             }
             SO_RCVBUFFORCE => {
-                if !current()
-                    .as_thread()
-                    .has_effective_capability(CAP_NET_ADMIN)
-                {
+                let cred = current().as_thread().current_cred();
+                if !ns_capable(&cred, socket.net_namespace().owner_user_ns(), CAP_NET_ADMIN) {
                     return Err(LinuxError::EPERM.into());
                 }
                 let size = (*get::<u32>(optval, optlen)? as usize).min(i32::MAX as usize);

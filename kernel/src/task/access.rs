@@ -315,7 +315,10 @@ mod tests {
     use std::{sync::Barrier, thread};
 
     use super::*;
-    use crate::task::creds::{CAPABILITY_WORDS, CredentialSlot};
+    use crate::task::{
+        UtsNamespace,
+        creds::{CAPABILITY_WORDS, CredentialSlot},
+    };
 
     fn kuid(raw: u32) -> Kuid {
         Kuid::from_raw(raw).unwrap()
@@ -380,21 +383,91 @@ mod tests {
     }
 
     #[test]
-    fn user_namespace_capability_direction_is_parent_to_child() {
+    fn namespace_owner_ns_capable_follows_ancestry_not_siblings() {
         let root = UserNamespace::try_new_root().unwrap();
         let child = root.try_fork(kuid(1000), kgid(100), false).unwrap();
         let sibling = root.try_fork(kuid(2000), kgid(200), false).unwrap();
+        child
+            .publish_uid_map(
+                child
+                    .try_build_uid_map(vec![IdMapInputExtent::new(0, 1000, 1)])
+                    .unwrap(),
+            )
+            .unwrap();
+        child
+            .publish_gid_map(
+                child
+                    .try_build_gid_map(vec![IdMapInputExtent::new(0, 100, 1)])
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        let grandchild = child.try_fork(kuid(1000), kgid(100), false).unwrap();
         let root_cred = Cred::try_root(root.clone()).unwrap();
         let child_cred = Cred::try_with_user_ns(&root_cred, child.clone()).unwrap();
+        let sibling_cred = Cred::try_with_user_ns(&root_cred, sibling.clone()).unwrap();
+        let grandchild_cred = Cred::try_with_user_ns(&root_cred, grandchild.clone()).unwrap();
 
         assert!(ns_capable(&root_cred, &root, CAP_KILL));
         assert!(ns_capable(&root_cred, &child, CAP_KILL));
+        assert!(ns_capable(&root_cred, &sibling, CAP_KILL));
+        assert!(ns_capable(&root_cred, &grandchild, CAP_KILL));
+        assert!(ns_capable(&child_cred, &child, CAP_KILL));
+        assert!(ns_capable(&child_cred, &grandchild, CAP_KILL));
         assert!(!ns_capable(&child_cred, &root, CAP_KILL));
+        assert!(!ns_capable(&child_cred, &sibling, CAP_KILL));
+        assert!(ns_capable(&sibling_cred, &sibling, CAP_KILL));
+        assert!(!ns_capable(&sibling_cred, &root, CAP_KILL));
+        assert!(!ns_capable(&sibling_cred, &child, CAP_KILL));
+        assert!(!ns_capable(&sibling_cred, &grandchild, CAP_KILL));
+        assert!(ns_capable(&grandchild_cred, &grandchild, CAP_KILL));
+        assert!(!ns_capable(&grandchild_cred, &root, CAP_KILL));
+        assert!(!ns_capable(&grandchild_cred, &child, CAP_KILL));
+        assert!(!ns_capable(&grandchild_cred, &sibling, CAP_KILL));
 
         let owner_slot = CredentialSlot::new(root_cred);
         let owner = publish_ids(&owner_slot, 1000, 100);
         assert!(ns_capable(&owner, &child, CAP_KILL));
+        assert!(ns_capable(&owner, &grandchild, CAP_KILL));
         assert!(!ns_capable(&owner, &sibling, CAP_KILL));
+    }
+
+    #[test]
+    fn namespace_owner_authority_uses_object_owner_not_actor_namespace() {
+        let root = UserNamespace::try_new_root().unwrap();
+        let root_cred = Cred::try_root(root.clone()).unwrap();
+        let child = root.try_fork(kuid(1000), kgid(100), false).unwrap();
+        let sibling = root.try_fork(kuid(2000), kgid(200), false).unwrap();
+        let child_cred = Cred::try_with_user_ns(&root_cred, child.clone()).unwrap();
+        let sibling_cred = Cred::try_with_user_ns(&root_cred, sibling).unwrap();
+        let root_uts = UtsNamespace::try_new_root(root).unwrap();
+        let child_uts = UtsNamespace::try_new_root(child).unwrap();
+
+        assert!(ns_capable(
+            &root_cred,
+            root_uts.owner_user_ns(),
+            CAP_SYS_ADMIN
+        ));
+        assert!(ns_capable(
+            &root_cred,
+            child_uts.owner_user_ns(),
+            CAP_SYS_ADMIN
+        ));
+        assert!(!ns_capable(
+            &child_cred,
+            root_uts.owner_user_ns(),
+            CAP_SYS_ADMIN
+        ));
+        assert!(ns_capable(
+            &child_cred,
+            child_uts.owner_user_ns(),
+            CAP_SYS_ADMIN
+        ));
+        assert!(!ns_capable(
+            &sibling_cred,
+            child_uts.owner_user_ns(),
+            CAP_SYS_ADMIN
+        ));
     }
 
     #[test]

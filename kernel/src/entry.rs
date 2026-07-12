@@ -17,8 +17,8 @@ use crate::{
     },
     pseudofs::{self, dev::tty::N_TTY},
     task::{
-        CgroupNamespace, Cred, CredentialSlot, PidNamespace, ProcessData, Thread, TimeNamespace,
-        UserNamespace, UtsNamespace, init_process_domain, linux_pid_from_task_id,
+        CgroupNamespace, Cred, CredentialSlot, NetworkNamespace, PidNamespace, ProcessData, Thread,
+        TimeNamespace, UserNamespace, UtsNamespace, init_process_domain, linux_pid_from_task_id,
         prepare_task_table_admission, spawn_alarm_task, try_new_user_task,
     },
 };
@@ -57,13 +57,15 @@ pub fn init(args: &[String], envs: &[String]) {
     crate::deferred_work::init();
     crate::file::inotify::init_filesystem_release_notifications();
     let user_ns = UserNamespace::try_new_root().expect("Failed to allocate init user namespace");
-    let root_cred = Cred::try_root(user_ns).expect("Failed to allocate init credential");
+    let root_cred = Cred::try_root(user_ns.clone()).expect("Failed to allocate init credential");
     let boot_credentials = root_cred.fs_dac_credentials();
     let credential =
         CredentialSlot::try_new(root_cred).expect("Failed to allocate init credential slot");
-    let init_net_ns = axnet::default_stack().clone();
-    pseudofs::mount_all(&boot_credentials, init_net_ns.unix_namespace())
+    let init_net_stack = axnet::default_stack().clone();
+    pseudofs::mount_all(&boot_credentials, init_net_stack.unix_namespace())
         .expect("Failed to mount pseudofs");
+    let init_net_ns = NetworkNamespace::try_new(init_net_stack, user_ns.clone())
+        .expect("Failed to allocate init network namespace");
 
     let loc = FS_CONTEXT
         .lock()
@@ -145,10 +147,11 @@ pub fn init(args: &[String], envs: &[String]) {
         signal_actions,
         None,
         init_net_ns,
-        CgroupNamespace::try_new_root().expect("Failed to allocate init cgroup namespace"),
-        PidNamespace::try_new_root().expect("Failed to allocate init pid namespace"),
-        Arc::try_new(UtsNamespace::new_default()).expect("Failed to allocate init UTS namespace"),
-        Arc::try_new(TimeNamespace::new_default()).expect("Failed to allocate init time namespace"),
+        CgroupNamespace::try_new_root(user_ns.clone())
+            .expect("Failed to allocate init cgroup namespace"),
+        PidNamespace::try_new_root(user_ns.clone()).expect("Failed to allocate init pid namespace"),
+        UtsNamespace::try_new_root(user_ns.clone()).expect("Failed to allocate init UTS namespace"),
+        TimeNamespace::try_new_root(user_ns).expect("Failed to allocate init time namespace"),
     )
     .expect("Failed to allocate init process runtime state");
 
