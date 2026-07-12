@@ -27,3 +27,5 @@ type exists.
   (`accepted`)
 - [RFC 0001: Immutable Credentials, User-ID Mapping, and Typed Security Hooks](0001-credential-v2.md)
   (`draft`)
+- [RFC 0002: Explicit Linux Path Context over a Policy-Neutral VFS Walker](0002-vfs-path-contract.md)
+  (`draft`)
