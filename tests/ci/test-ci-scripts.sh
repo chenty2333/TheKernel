@@ -17,6 +17,7 @@ done
 bash -n "$0"
 
 python3 "$REPO_ROOT/tests/ci/test_vendor_provenance.py"
+"$SCRIPT_DIR/test-release-consumer-gate.sh"
 
 cat >"$tmp/pass.log" <<'EOF'
 CI_BOOT_GATE_START
