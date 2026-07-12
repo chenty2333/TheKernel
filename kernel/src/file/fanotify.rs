@@ -9,11 +9,10 @@ use alloc::{
 };
 use core::{
     ffi::c_int,
-    future::poll_fn,
     mem::size_of,
     ptr,
     sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
-    task::{Context, Poll},
+    task::Context,
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -21,10 +20,7 @@ use axfs::{FileBackend, FileFlags};
 use axfs_ng_vfs::{Location, NodeType};
 use axpoll::{IoEvents, PollSet, Pollable};
 use axsync::Mutex as BlockingMutex;
-use axtask::{
-    current_may_uninit,
-    future::{block_on, interruptible, poll_io},
-};
+use axtask::current_may_uninit;
 use spin::Mutex;
 
 use crate::{
@@ -33,6 +29,7 @@ use crate::{
         inotify::{WatchKey, location_for_fd},
         reserve_fd,
     },
+    readiness::{block_on_poll_io, block_on_poll_set},
     task::{AsThread, get_process_data},
 };
 
@@ -853,9 +850,9 @@ impl FileLike for FanotifyFile {
 
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
         let _reader = self.read_gate.lock();
-        block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
+        block_on_poll_io(self, IoEvents::READABLE, self.nonblocking(), || {
             self.read_ready(dst)
-        }))
+        })
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
@@ -893,14 +890,20 @@ impl FileLike for FanotifyFile {
 impl Pollable for FanotifyFile {
     fn poll(&self) -> IoEvents {
         let mut events = IoEvents::empty();
-        events.set(IoEvents::IN, self.has_events());
-        events.set(IoEvents::OUT, true);
+        events.set(IoEvents::READABLE, self.has_events());
+        events.set(IoEvents::WRITABLE, true);
         events
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.contains(IoEvents::IN) {
-            self.poll_rx.register(context.waker());
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        if events.contains(IoEvents::READABLE) {
+            axpoll::PollRegistration::single(&self.poll_rx, context.waker())
+        } else {
+            axpoll::PollRegistration::empty()
         }
     }
 }
@@ -1262,7 +1265,7 @@ fn cancel_permission_event(file: &FanotifyFile, id: u64) {
 }
 
 fn wait_for_permission_response(file: &Arc<FanotifyFile>, id: u64) -> AxResult<()> {
-    let response = block_on(interruptible(poll_fn(|cx| {
+    let response = block_on_poll_set(&file.poll_rx, || {
         let mut state = file.state.lock();
         if let Some(idx) = state
             .pending_permissions
@@ -1270,24 +1273,13 @@ fn wait_for_permission_response(file: &Arc<FanotifyFile>, id: u64) -> AxResult<(
             .position(|event| event.id == id && event.response.is_some())
         {
             let event = state.pending_permissions.remove(idx);
-            return Poll::Ready(event.response.unwrap_or(FAN_ALLOW));
+            return Ok(event.response.unwrap_or(FAN_ALLOW));
         }
         if !state.pending_permissions.iter().any(|event| event.id == id) || state.released {
-            return Poll::Ready(FAN_ALLOW);
+            return Ok(FAN_ALLOW);
         }
-        file.poll_rx.register(cx.waker());
-        if let Some(idx) = state
-            .pending_permissions
-            .iter()
-            .position(|event| event.id == id && event.response.is_some())
-        {
-            let event = state.pending_permissions.remove(idx);
-            Poll::Ready(event.response.unwrap_or(FAN_ALLOW))
-        } else {
-            Poll::Pending
-        }
-    })))
-    .map_err(|_| AxError::Interrupted)?;
+        Err(AxError::WouldBlock)
+    })?;
 
     match response & FANOTIFY_RESPONSE_ACCESS {
         FAN_ALLOW => Ok(()),

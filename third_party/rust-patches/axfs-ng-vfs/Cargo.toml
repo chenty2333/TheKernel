@@ -42,7 +42,8 @@ path = "src/lib.rs"
 version = "0.2"
 
 [dependencies.axpoll]
-version = "0.1"
+package = "thekernel-readiness-adapter"
+version = "=0.1.0"
 
 [dependencies.bitflags]
 version = "2.10"

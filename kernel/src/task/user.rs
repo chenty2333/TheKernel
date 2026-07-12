@@ -1,11 +1,11 @@
 use axhal::uspace::{ExceptionInfo, ExceptionKind, ReturnReason, UserContext};
-use axtask::TaskInner;
-use starry_process::Pid;
+use axtask::{TaskCreateError, TaskInner};
+use starry_process::{LINUX_PID_MAX, Pid, try_pid_from_task_id};
 use starry_signal::{SignalInfo, Signo};
 
 use super::{
-    AsThread, TimerState, check_signals, do_exit, has_pending_fatal_signal, raise_signal_fatal,
-    set_timer_state, wait_if_stopped,
+    AsThread, TimerState, check_signals, do_exit, fail_closed_exit, has_pending_fatal_signal,
+    raise_signal_fatal, set_timer_state, wait_if_stopped,
 };
 use crate::{mm::PageFaultResult, syscall::handle_syscall};
 
@@ -38,19 +38,22 @@ fn map_other_exception(exc_info: &ExceptionInfo) -> Signo {
 fn deliver_fatal_user_signal(signo: Signo) {
     if let Err(err) = raise_signal_fatal(SignalInfo::new_kernel(signo)) {
         error!("Failed to deliver fatal user signal {signo:?}: {err:?}");
-        do_exit(signo as i32, true);
+        if let Err(error) = do_exit(signo as i32, true) {
+            fail_closed_exit(error);
+        }
     }
 }
 
 /// Fallibly creates an unpublished user task.
 pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskInner> {
-    TaskInner::try_new(
+    TaskInner::try_new_with_id_limit(
         move || {
             let curr = axtask::current();
             info!("Enter user space: ip={:#x}, sp={:#x}", uctx.ip(), uctx.sp());
 
             let thr = curr.as_thread();
-            let tid = curr.id().as_u64() as Pid;
+            let tid = linux_pid_from_task_id(curr.id().as_u64())
+                .unwrap_or_else(|error| fail_closed_exit(error));
             while !thr.pending_exit() {
                 #[cfg(target_arch = "loongarch64")]
                 super::restore_current_user_fpu_state();
@@ -135,7 +138,9 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                     if has_pending_fatal_signal(thr) {
                         while check_signals(thr, &mut uctx, None) {}
                     } else {
-                        do_exit(0, false);
+                        if let Err(error) = do_exit(0, false) {
+                            fail_closed_exit(error);
+                        }
                         continue;
                     }
                 }
@@ -149,7 +154,9 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                     if has_pending_fatal_signal(thr) {
                         while check_signals(thr, &mut uctx, None) {}
                     } else {
-                        do_exit(0, false);
+                        if let Err(error) = do_exit(0, false) {
+                            fail_closed_exit(error);
+                        }
                         continue;
                     }
                 }
@@ -161,9 +168,46 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
         },
         name,
         crate::config::KERNEL_STACK_SIZE,
+        LINUX_PID_MAX as u64,
     )
-    .map_err(|_| AxError::NoMemory)
+    .map_err(task_create_error)
+}
+
+/// Admits one generic scheduler identity into the finite nonzero Linux PID/TID
+/// domain without truncation.
+pub(crate) fn linux_pid_from_task_id(task_id: u64) -> AxResult<Pid> {
+    try_pid_from_task_id(task_id).map_err(|_| AxError::WouldBlock)
+}
+
+fn task_create_error(error: TaskCreateError) -> AxError {
+    match error {
+        TaskCreateError::InvalidStackSize => AxError::BadState,
+        TaskCreateError::OutOfMemory => AxError::NoMemory,
+        TaskCreateError::IdentifierExhausted => AxError::WouldBlock,
+    }
 }
 use alloc::string::String;
 
 use axerrno::{AxError, AxResult};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_task_identity_exhaustion_maps_to_eagain_without_truncation() {
+        assert_eq!(linux_pid_from_task_id(0), Err(AxError::WouldBlock));
+        assert_eq!(
+            linux_pid_from_task_id(LINUX_PID_MAX as u64),
+            Ok(LINUX_PID_MAX)
+        );
+        assert_eq!(
+            linux_pid_from_task_id(LINUX_PID_MAX as u64 + 1),
+            Err(AxError::WouldBlock)
+        );
+        assert_eq!(
+            task_create_error(TaskCreateError::IdentifierExhausted),
+            AxError::WouldBlock
+        );
+    }
+}

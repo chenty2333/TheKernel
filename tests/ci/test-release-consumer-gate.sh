@@ -220,9 +220,11 @@ fi
 # registry or Git source values.
 mkdir -p \
     "$tmp/consumer/crates/axtask-compat" \
+    "$tmp/consumer/crates/process-adapter" \
     "$tmp/artifacts/thekernel-axsched-0.1.0" \
     "$tmp/artifacts/thekernel-axpoll-0.1.0" \
     "$tmp/artifacts/thekernel-axtask-0.1.0" \
+    "$tmp/artifacts/thekernel-linux-process-0.1.0" \
     "$tmp/artifacts/thekernel-linux-vfs-0.1.0" \
     "$tmp/artifacts/thekernel-linux-fd-0.1.0" \
     "$tmp/source-ax" "$tmp/source-linux-abi"
@@ -237,6 +239,7 @@ release_names = [
     "thekernel-axsched",
     "thekernel-axpoll",
     "thekernel-axtask",
+    "thekernel-linux-process",
     "thekernel-linux-vfs",
     "thekernel-linux-fd",
 ]
@@ -263,6 +266,24 @@ packages = [
             }
         ],
     },
+    {
+        "id": "thekernel-linux-process-adapter 0.1.0 (path+adapter)",
+        "name": "thekernel-linux-process-adapter",
+        "version": "0.1.0",
+        "source": None,
+        "manifest_path": str(
+            root / "consumer/crates/process-adapter/Cargo.toml"
+        ),
+        "publish": [],
+        "dependencies": [
+            {
+                "name": "thekernel-linux-process",
+                "rename": None,
+                "req": "=0.1.0",
+                "uses_default_features": False,
+            }
+        ],
+    },
 ]
 for name in release_names:
     packages.append(
@@ -277,6 +298,19 @@ for name in release_names:
 dependencies = [package["id"] for package in packages[1:]]
 nodes = [{"id": packages[0]["id"], "dependencies": dependencies}]
 nodes.extend({"id": package["id"], "dependencies": []} for package in packages[1:])
+process_adapter_id = next(
+    package["id"]
+    for package in packages
+    if package["name"] == "thekernel-linux-process-adapter"
+)
+process_core_id = next(
+    package["id"]
+    for package in packages
+    if package["name"] == "thekernel-linux-process"
+)
+next(node for node in nodes if node["id"] == process_adapter_id)["dependencies"] = [
+    process_core_id
+]
 metadata = {
     "packages": packages,
     "workspace_members": [packages[0]["id"]],
@@ -289,15 +323,89 @@ graph_args=(
     --metadata "$tmp/metadata.json"
     --consumer-root "$tmp/consumer"
     --allowed-axtask-facade "$tmp/consumer/crates/axtask-compat"
+    --allowed-process-adapter "$tmp/consumer/crates/process-adapter"
     --release-source-root "$tmp/source-ax"
     --release-source-root "$tmp/source-linux-abi"
 )
 for package in \
     thekernel-axsched thekernel-axpoll thekernel-axtask \
-    thekernel-linux-vfs thekernel-linux-fd; do
+    thekernel-linux-process thekernel-linux-vfs thekernel-linux-fd; do
     graph_args+=(--expect "$package=$tmp/artifacts/$package-0.1.0")
 done
 python3 "$CI_DIR/release-dependency-graph.py" "${graph_args[@]}" >/dev/null
+
+python3 - "$tmp/metadata.json" "$tmp" <<'PY'
+import copy
+import json
+import pathlib
+import sys
+
+metadata = json.loads(pathlib.Path(sys.argv[1]).read_text())
+root = pathlib.Path(sys.argv[2])
+adapter_name = "thekernel-linux-process-adapter"
+
+def adapter(package_set):
+    return next(package for package in package_set if package["name"] == adapter_name)
+
+def write_variant(name, value):
+    (root / f"adapter-{name}.json").write_text(json.dumps(value))
+
+wrong_path = copy.deepcopy(metadata)
+adapter(wrong_path["packages"])["manifest_path"] = str(
+    root / "consumer/crates/not-process-adapter/Cargo.toml"
+)
+write_variant("wrong-path", wrong_path)
+
+publishable = copy.deepcopy(metadata)
+adapter(publishable["packages"])["publish"] = None
+write_variant("publishable", publishable)
+
+bad_dependency = copy.deepcopy(metadata)
+adapter(bad_dependency["packages"])["dependencies"][0]["rename"] = "process-core"
+write_variant("bad-dependency", bad_dependency)
+
+unreachable = copy.deepcopy(metadata)
+adapter_id = adapter(unreachable["packages"])["id"]
+unreachable["resolve"]["nodes"][0]["dependencies"].remove(adapter_id)
+write_variant("unreachable", unreachable)
+
+missing = copy.deepcopy(metadata)
+adapter_id = adapter(missing["packages"])["id"]
+missing["packages"] = [
+    package for package in missing["packages"] if package["id"] != adapter_id
+]
+missing["resolve"]["nodes"] = [
+    node for node in missing["resolve"]["nodes"] if node["id"] != adapter_id
+]
+missing["resolve"]["nodes"][0]["dependencies"].remove(adapter_id)
+write_variant("missing", missing)
+
+duplicate = copy.deepcopy(metadata)
+second_adapter = copy.deepcopy(adapter(duplicate["packages"]))
+second_adapter["id"] = (
+    "thekernel-linux-process-adapter 0.1.0 (path+duplicate-adapter)"
+)
+second_adapter["manifest_path"] = str(
+    root / "consumer/crates/duplicate-process-adapter/Cargo.toml"
+)
+duplicate["packages"].append(second_adapter)
+duplicate["resolve"]["nodes"].append(
+    {"id": second_adapter["id"], "dependencies": []}
+)
+duplicate["resolve"]["nodes"][0]["dependencies"].append(second_adapter["id"])
+write_variant("duplicate", duplicate)
+PY
+for adapter_case in \
+    wrong-path publishable bad-dependency unreachable missing duplicate; do
+    adapter_args=("${graph_args[@]}")
+    adapter_args[1]="$tmp/adapter-$adapter_case.json"
+    if python3 "$CI_DIR/release-dependency-graph.py" "${adapter_args[@]}" \
+        >/dev/null 2>&1; then
+        printf 'test-release-consumer: invalid process adapter %s was accepted\n' \
+            "$adapter_case" >&2
+        exit 1
+    fi
+done
 
 python3 - "$tmp/metadata.json" "$tmp/legacy-metadata.json" <<'PY'
 import json
@@ -326,6 +434,61 @@ if python3 "$CI_DIR/release-dependency-graph.py" "${legacy_args[@]}" \
 fi
 if grep -Fq 'SENSITIVE_SOURCE_VALUE_MUST_NOT_BE_ECHOED' "$tmp/legacy.log"; then
     printf 'test-release-consumer: dependency diagnostic leaked credentials\n' >&2
+    exit 1
+fi
+
+python3 - "$tmp/metadata.json" "$tmp/legacy-process.json" <<'PY'
+import json
+import pathlib
+import sys
+
+metadata = json.loads(pathlib.Path(sys.argv[1]).read_text())
+legacy = {
+    "id": "starry-process 0.2.0 (path+legacy)",
+    "name": "starry-process",
+    "version": "0.2.0",
+    "source": None,
+    "manifest_path": str(
+        pathlib.Path(sys.argv[1]).parent
+        / "consumer/third_party/rust-patches/starry-process/Cargo.toml"
+    ),
+}
+metadata["packages"].append(legacy)
+metadata["resolve"]["nodes"].append({"id": legacy["id"], "dependencies": []})
+metadata["resolve"]["nodes"][0]["dependencies"].append(legacy["id"])
+pathlib.Path(sys.argv[2]).write_text(json.dumps(metadata))
+PY
+legacy_process_args=("${graph_args[@]}")
+legacy_process_args[1]="$tmp/legacy-process.json"
+if python3 "$CI_DIR/release-dependency-graph.py" "${legacy_process_args[@]}" \
+    >/dev/null 2>&1; then
+    printf 'test-release-consumer: legacy starry-process was accepted\n' >&2
+    exit 1
+fi
+
+python3 - "$tmp/metadata.json" "$tmp/duplicate-process.json" <<'PY'
+import json
+import pathlib
+import sys
+
+metadata = json.loads(pathlib.Path(sys.argv[1]).read_text())
+duplicate = {
+    "id": "thekernel-linux-process 0.1.0 (path+duplicate)",
+    "name": "thekernel-linux-process",
+    "version": "0.1.0",
+    "source": None,
+    "manifest_path": "/unexpected/thekernel-linux-process/Cargo.toml",
+}
+metadata["packages"].append(duplicate)
+metadata["resolve"]["nodes"].append({"id": duplicate["id"], "dependencies": []})
+metadata["resolve"]["nodes"][0]["dependencies"].append(duplicate["id"])
+pathlib.Path(sys.argv[2]).write_text(json.dumps(metadata))
+PY
+duplicate_process_args=("${graph_args[@]}")
+duplicate_process_args[1]="$tmp/duplicate-process.json"
+if python3 "$CI_DIR/release-dependency-graph.py" "${duplicate_process_args[@]}" \
+    >/dev/null 2>&1; then
+    printf 'test-release-consumer: duplicate Linux process core was accepted\n' >&2
     exit 1
 fi
 

@@ -28,7 +28,7 @@ use axfs_ng_vfs::{
 };
 use axhal::paging::MappingFlags;
 use axpoll::{IoEvents, Pollable};
-use axtask::{AxTaskRef, WeakAxTaskRef, current, last_task_id, set_last_task_id};
+use axtask::{AxTaskRef, WeakAxTaskRef, current};
 use inherit_methods_macro::inherit_methods;
 use linux_raw_sys::{
     general::{
@@ -41,7 +41,6 @@ use linux_raw_sys::{
     },
 };
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
-use starry_process::Process;
 use starry_vm::VmMutPtr;
 
 use crate::{
@@ -78,8 +77,8 @@ use crate::{
         sysvipc_shm_snapshot,
     },
     task::{
-        AsThread, Cred, ID_MAP_MAX_EXTENTS, IdMapInputExtent, Mempolicy, PidNamespace, ProcessData,
-        PtraceCredentialMode, TimeNamespace, UserNamespace, UtsNamespace,
+        AsThread, Cred, ID_MAP_MAX_EXTENTS, IdMapInputExtent, Mempolicy, PidNamespace, Process,
+        ProcessData, PtraceCredentialMode, TimeNamespace, UserNamespace, UtsNamespace,
         check_current_ptrace_access, get_process_data, get_process_including_zombie, get_task,
         get_visible_task, get_visible_task_including_exiting, may_begin_gid_map_write,
         may_begin_uid_map_write, may_update_setgroups_policy, may_write_gid_map, may_write_uid_map,
@@ -1087,10 +1086,16 @@ impl FileNodeOps for ProcUserNamespaceFile {
 
 impl Pollable for ProcUserNamespaceFile {
     fn poll(&self) -> IoEvents {
-        IoEvents::IN | IoEvents::OUT
+        IoEvents::READABLE | IoEvents::WRITABLE
     }
 
-    fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+    fn register<'a>(
+        &'a self,
+        _context: &mut Context<'_>,
+        _events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        axpoll::PollRegistration::empty()
+    }
 }
 
 fn real_meminfo() -> String {
@@ -1257,7 +1262,7 @@ fn task_status(
     task: &AxTaskRef,
     process_view: bool,
     viewer_user_ns: &UserNamespace,
-) -> String {
+) -> VfsResult<String> {
     let thread = task.as_thread();
     let proc_data = &thread.proc_data;
     let (vm_size_kb, vm_rss_kb, locked_kb) = {
@@ -1297,7 +1302,8 @@ fn task_status(
         .max(1) as usize;
     let cpu_allowed_list = format_mask_list(cpu_mask, cpu_width);
     let mem_allowed_list = format_mask_list(mem_mask, mem_width);
-    format!(
+    let task_name = task.try_name().map_err(|_| VfsError::NoMemory)?;
+    Ok(format!(
         "Name:\t{}\n\
         State:\t{} ({})\n\
         Tgid:\t{}\n\
@@ -1320,7 +1326,7 @@ fn task_status(
         Cpus_allowed_list:\t{}\n\
         Mems_allowed:\t{:x}\n\
         Mems_allowed_list:\t{}",
-        task.name(),
+        task_name,
         state,
         state_name,
         proc_data.proc.pid(),
@@ -1348,7 +1354,7 @@ fn task_status(
         cpu_allowed_list,
         mem_mask,
         mem_allowed_list
-    )
+    ))
 }
 
 fn format_rlimit_value(value: u64) -> String {
@@ -1575,8 +1581,8 @@ impl SimpleDirOps for ThreadFdDir {
         };
         let ids = FD_TABLE
             .scope(&task.as_thread().proc_data.scope.read())
-            .read()
-            .ids()
+            .try_fd_numbers()?
+            .into_iter()
             .map(|id| Cow::Owned(id.to_string()))
             .collect::<Vec<_>>();
         try_boxed_names(ids.into_iter())
@@ -1589,11 +1595,9 @@ impl SimpleDirOps for ThreadFdDir {
         let description = {
             let scope = task.as_thread().proc_data.scope.read();
             let scoped_table = FD_TABLE.scope(&scope);
-            let table = scoped_table.read();
-            table
-                .get(fd as _)
-                .map(|entry| entry.description.clone())
-                .ok_or(VfsError::NotFound)?
+            scoped_table
+                .get_description_number(fd)
+                .map_err(|_| VfsError::NotFound)?
         };
         let target = try_path_into_bytes(description.inner.path()?)?;
         Ok(SimpleFile::try_new_magic_link(fs, PreparedFdMagicLink { target })?.into())
@@ -1616,10 +1620,8 @@ impl ThreadFdInfoDir {
         let fd = name.parse::<usize>().map_err(|_| VfsError::NotFound)?;
         FD_TABLE
             .scope(&task.as_thread().proc_data.scope.read())
-            .read()
-            .get(fd)
-            .map(|entry| entry.description.clone())
-            .ok_or(VfsError::NotFound)
+            .get_description_number(u32::try_from(fd).map_err(|_| VfsError::NotFound)?)
+            .map_err(|_| VfsError::NotFound)
     }
 
     fn render_fdinfo(description: &FileDescription) -> String {
@@ -1657,8 +1659,8 @@ impl SimpleDirOps for ThreadFdInfoDir {
         };
         let ids = FD_TABLE
             .scope(&task.as_thread().proc_data.scope.read())
-            .read()
-            .ids()
+            .try_fd_numbers()?
+            .into_iter()
             .map(|id| Cow::Owned(id.to_string()))
             .collect::<Vec<_>>();
         try_boxed_names(ids.into_iter())
@@ -1847,10 +1849,16 @@ impl FileNodeOps for ProcNamespaceFile {
 
 impl Pollable for ProcNamespaceFile {
     fn poll(&self) -> IoEvents {
-        IoEvents::IN | IoEvents::OUT
+        IoEvents::READABLE | IoEvents::WRITABLE
     }
 
-    fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+    fn register<'a>(
+        &'a self,
+        _context: &mut Context<'_>,
+        _events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        axpoll::PollRegistration::empty()
+    }
 }
 
 struct ThreadNamespaceDir {
@@ -2137,10 +2145,16 @@ impl FileNodeOps for ProcPagemapFile {
 
 impl Pollable for ProcPagemapFile {
     fn poll(&self) -> IoEvents {
-        IoEvents::IN | IoEvents::OUT
+        IoEvents::READABLE | IoEvents::WRITABLE
     }
 
-    fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+    fn register<'a>(
+        &'a self,
+        _context: &mut Context<'_>,
+        _events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        axpoll::PollRegistration::empty()
+    }
 }
 
 impl SimpleDirOps for ZombieProcessDir {
@@ -2224,7 +2238,7 @@ impl SimpleDirOps for ThreadDir {
             }
             "status" => SimpleFile::try_new_regular_with_open_credential(fs, move || {
                 let viewer = current_file_operation_security_credential().ok_or(VfsError::Io)?;
-                Ok(task_status(&task, process_view, viewer.user_ns()))
+                task_status(&task, process_view, viewer.user_ns())
             })?
             .into(),
             "uid_map" => {
@@ -2356,7 +2370,7 @@ impl SimpleDirOps for ThreadDir {
                 fs,
                 RwFile::new(move |req| match req {
                     SimpleFileOperation::Read => {
-                        let name = task.name();
+                        let name = task.try_name().map_err(|_| VfsError::NoMemory)?;
                         let copy_len = name.len().min(15);
                         let mut bytes = Vec::with_capacity(copy_len + 1);
                         bytes.extend_from_slice(&name.as_bytes()[..copy_len]);
@@ -2374,7 +2388,8 @@ impl SimpleDirOps for ThreadDir {
                                     .map_err(|_| VfsError::InvalidInput)?
                                     .to_str()
                                     .map_err(|_| VfsError::InvalidInput)?,
-                            );
+                            )
+                            .map_err(|_| VfsError::NoMemory)?;
                         }
                         Ok(None)
                     }
@@ -2460,7 +2475,7 @@ impl SimpleDirOps for ProcFsHandler {
         }
 
         let process = get_process_including_zombie(pid).map_err(|_| VfsError::NotFound)?;
-        if !process.is_zombie() || process.zombie_snapshot().is_none() {
+        if !process.is_zombie() || process.zombie_payload().is_none() {
             return Err(VfsError::NotFound);
         }
         Ok(NodeOpsMux::Dir(SimpleDir::new_maker(
@@ -3110,28 +3125,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                             if let Some(value) = proc_uts_write_value(data) {
                                 set_hostname_bytes(value);
                             }
-                            Ok(None)
-                        }
-                    }),
-                ),
-            );
-            kernel.add(
-                "ns_last_pid",
-                SimpleFile::new_regular(
-                    fs.clone(),
-                    RwFile::new(move |req| match req {
-                        SimpleFileOperation::Read => {
-                            Ok(Some(alloc::format!("{}\n", last_task_id()).into_bytes()))
-                        }
-                        SimpleFileOperation::Write(data) => {
-                            if is_proc_truncate_write(data) {
-                                return Ok(None);
-                            }
-                            let value = write_proc_u32(data)?;
-                            if value >= PROC_PID_MAX_DEFAULT {
-                                return Err(VfsError::InvalidInput);
-                            }
-                            set_last_task_id(value.into());
                             Ok(None)
                         }
                     }),

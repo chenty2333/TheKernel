@@ -150,7 +150,8 @@ optional = true
 version = "0.3.1-pre.6"
 
 [dependencies.axtask]
-version = "=0.3.0-preview.2"
+package = "thekernel-axtask"
+version = "=0.1.0"
 optional = true
 
 [dependencies.cfg-if]

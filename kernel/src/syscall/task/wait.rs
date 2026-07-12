@@ -1,22 +1,23 @@
 use alloc::{sync::Arc, vec, vec::Vec};
-use core::{future::poll_fn, task::Poll};
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axtask::{current, future::block_on};
+use axtask::current;
 use bitflags::bitflags;
 use linux_raw_sys::general::{
     __WALL, __WCLONE, __WNOTHREAD, CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED,
     CLD_TRAPPED, P_ALL, P_PGID, P_PID, P_PIDFD, SIGCHLD, SIGCONT, WCONTINUED, WEXITED, WNOHANG,
     WNOWAIT, WUNTRACED, rusage, siginfo,
 };
-use starry_process::{Pid, Process, ZombieSnapshot};
+use starry_process::{Pid, ProcessError};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     file::{FileHandle, FileLike, PidFd},
     pseudofs::cgroup,
+    readiness::block_on_poll_set_interruptible_if,
     task::{
-        AsThread, ProcessData, StopReport, TaskUsage, get_process_data, has_pending_syscall_signal,
+        AsThread, Process, ProcessData, StopReport, TaskUsage, ZombieSnapshot, get_process_data,
+        has_pending_syscall_signal, process_domain,
     },
 };
 
@@ -90,7 +91,7 @@ enum WaitEvent {
     },
     Exited {
         child: Arc<Process>,
-        snapshot: ZombieSnapshot,
+        snapshot: Arc<ZombieSnapshot>,
     },
 }
 
@@ -135,7 +136,7 @@ impl WaitEvent {
             }
             WaitEvent::Exited { child, snapshot } => {
                 let (si_code, si_status) = decode_exit_code(snapshot.wait_status);
-                let uid = viewer_user_ns.from_kuid_munged(snapshot.uid);
+                let uid = viewer_user_ns.from_kuid_munged(snapshot.credential.ids().ruid);
                 fill_siginfo(child.pid(), uid, si_code, si_status)
             }
         }
@@ -177,24 +178,44 @@ fn should_wait_for_child(child: &Process, options: &WaitOptions) -> bool {
     }
 }
 
+fn process_error(error: ProcessError) -> AxError {
+    match error {
+        ProcessError::NoMemory | ProcessError::Capacity => AxError::NoMemory,
+        ProcessError::AlreadyExists => AxError::AlreadyExists,
+        ProcessError::NotPublished | ProcessError::NotLive => AxError::NoSuchProcess,
+        ProcessError::WrongDomain | ProcessError::NotInitialized => AxError::BadState,
+        _ => AxError::BadState,
+    }
+}
+
 fn matching_wait_candidates(
     proc_data: &ProcessData,
     pid: WaitPid,
     options: &WaitOptions,
 ) -> AxResult<Vec<WaitCandidate>> {
     let proc = &proc_data.proc;
-    let mut candidates = proc
-        .try_children()
-        .map_err(|_| AxError::NoMemory)?
-        .into_iter()
-        .filter(|child| pid.apply(child) && should_wait_for_child(child, options))
-        .map(|process| WaitCandidate {
-            process,
-            allow_exit: true,
-        })
-        .collect::<Vec<_>>();
+    let children = proc
+        .try_children(process_domain()?.registry())
+        .map_err(process_error)?;
+    let tracees = proc_data.try_ptrace_tracees()?;
+    let capacity = children
+        .len()
+        .checked_add(tracees.len())
+        .ok_or(AxError::NoMemory)?;
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(capacity)
+        .map_err(|_| AxError::NoMemory)?;
+    for process in children {
+        if pid.apply(&process) && should_wait_for_child(&process, options) {
+            candidates.push(WaitCandidate {
+                process,
+                allow_exit: true,
+            });
+        }
+    }
 
-    for tracee_pid in proc_data.ptrace_tracees() {
+    for tracee_pid in tracees {
         let Ok(tracee_data) = get_process_data(tracee_pid) else {
             proc_data.remove_ptrace_tracee(tracee_pid);
             continue;
@@ -295,7 +316,7 @@ fn select_wait_event(
             }
             let child = &candidate.process;
             if child.is_zombie()
-                && let Some(snapshot) = child.zombie_snapshot()
+                && let Some(snapshot) = child.zombie_payload()
             {
                 return Some(WaitEvent::Exited {
                     child: child.clone(),
@@ -349,6 +370,10 @@ fn restore_wait_event(event: &WaitEvent) {
         WaitEvent::Continued { proc_data, .. } => proc_data.restore_continued(),
         WaitEvent::Exited { .. } => {}
     }
+}
+
+fn reap_child(child: &Process) -> AxResult<bool> {
+    process_domain()?.reap(child).map_err(process_error)
 }
 
 pub fn sys_waitpid(
@@ -415,7 +440,7 @@ pub fn sys_waitpid(
 
             match &event {
                 WaitEvent::Exited { child, snapshot } => {
-                    let reaped = child.reap();
+                    let reaped = reap_child(child)?;
                     if !reaped {
                         return Ok(None);
                     }
@@ -435,31 +460,19 @@ pub fn sys_waitpid(
         }
     };
 
-    let result = block_on(poll_fn(|cx| {
-        if let Some(res) = check_children().transpose() {
-            return Poll::Ready(res);
-        }
-
-        if has_pending_syscall_signal(curr.as_thread()) {
-            return Poll::Ready(Err(AxError::Interrupted));
-        }
-
-        if curr.poll_interrupt(cx).is_ready() {
-            if let Some(res) = check_children().transpose() {
-                return Poll::Ready(res);
+    let result = block_on_poll_set_interruptible_if(
+        &proc_data.child_exit_event,
+        || {
+            if let Some(result) = check_children()? {
+                Ok(result)
+            } else if has_pending_syscall_signal(curr.as_thread()) {
+                Err(AxError::Interrupted)
+            } else {
+                Err(AxError::WouldBlock)
             }
-            if has_pending_syscall_signal(curr.as_thread()) {
-                return Poll::Ready(Err(AxError::Interrupted));
-            }
-        }
-
-        proc_data.child_exit_event.register(cx.waker());
-        if let Some(res) = check_children().transpose() {
-            Poll::Ready(res)
-        } else {
-            Poll::Pending
-        }
-    }));
+        },
+        || has_pending_syscall_signal(curr.as_thread()),
+    );
     let result = result?;
     axtask::reclaim_exited_tasks_until_clear(POST_WAIT_RECLAIM_YIELDS);
     Ok(result)
@@ -597,7 +610,7 @@ pub fn sys_waitid(
 
             match &event {
                 WaitEvent::Exited { child, snapshot } if !nowait => {
-                    if !child.reap() {
+                    if !reap_child(child)? {
                         return Ok(None);
                     }
                     cgroup::detach_process(child.pid());
@@ -622,31 +635,19 @@ pub fn sys_waitid(
         }
     };
 
-    let result = block_on(poll_fn(|cx| {
-        if let Some(res) = check_children().transpose() {
-            return Poll::Ready(res);
-        }
-
-        if has_pending_syscall_signal(curr.as_thread()) {
-            return Poll::Ready(Err(AxError::Interrupted));
-        }
-
-        if curr.poll_interrupt(cx).is_ready() {
-            if let Some(res) = check_children().transpose() {
-                return Poll::Ready(res);
+    let result = block_on_poll_set_interruptible_if(
+        &proc_data.child_exit_event,
+        || {
+            if let Some(result) = check_children()? {
+                Ok(result)
+            } else if has_pending_syscall_signal(curr.as_thread()) {
+                Err(AxError::Interrupted)
+            } else {
+                Err(AxError::WouldBlock)
             }
-            if has_pending_syscall_signal(curr.as_thread()) {
-                return Poll::Ready(Err(AxError::Interrupted));
-            }
-        }
-
-        proc_data.child_exit_event.register(cx.waker());
-        if let Some(res) = check_children().transpose() {
-            Poll::Ready(res)
-        } else {
-            Poll::Pending
-        }
-    }))?;
+        },
+        || has_pending_syscall_signal(curr.as_thread()),
+    )?;
     axtask::reclaim_exited_tasks_until_clear(POST_WAIT_RECLAIM_YIELDS);
     Ok(result)
 }

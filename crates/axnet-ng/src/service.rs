@@ -1,12 +1,14 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::{
+    future::Future,
     pin::Pin,
     task::{Context, Waker},
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::time::{NANOS_PER_MICROS, TimeValue, wall_time_nanos};
-use axtask::future::sleep_until;
+use axpoll::PollRegistrationError;
+use axtask::future::{TimerRegistrationError, sleep_until};
 use smoltcp::{
     iface::{Interface, SocketSet},
     time::Instant,
@@ -32,19 +34,28 @@ pub struct Service {
     pub iface: Interface,
     pub(crate) router: Router,
     pub(crate) socket_set: Arc<SocketSetWrapper<'static>>,
-    timeout: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    timeout: Option<ServiceTimeout>,
 }
+
+struct ServiceTimeout {
+    deadline: TimeValue,
+    future: Pin<Box<dyn Future<Output = Result<(), TimerRegistrationError>> + Send>>,
+}
+
 impl Service {
-    pub(crate) fn new(mut router: Router, socket_set: Arc<SocketSetWrapper<'static>>) -> Self {
+    pub(crate) fn try_new(
+        mut router: Router,
+        socket_set: Arc<SocketSetWrapper<'static>>,
+    ) -> AxResult<Self> {
         let config = smoltcp::iface::Config::new(HardwareAddress::Ip);
         let iface = Interface::new(config, &mut router, now());
 
-        Self {
+        Ok(Self {
             iface,
             router,
             socket_set,
             timeout: None,
-        }
+        })
     }
 
     pub fn poll(&mut self, sockets: &mut SocketSet) -> bool {
@@ -88,10 +99,10 @@ impl Service {
         if dont_route && rule.via.is_some() {
             return Err(AxError::from(LinuxError::ENETUNREACH));
         }
-        if let Some(bound_src) = bound_src {
-            if bound_src != rule.src {
-                return Err(AxError::from(LinuxError::EADDRNOTAVAIL));
-            }
+        if let Some(bound_src) = bound_src
+            && bound_src != rule.src
+        {
+            return Err(AxError::from(LinuxError::EADDRNOTAVAIL));
         }
         Ok(OutboundRoute {
             src_addr: bound_src.unwrap_or(rule.src),
@@ -124,30 +135,63 @@ impl Service {
         }
     }
 
-    pub fn register_waker(&mut self, mask: u64, waker: &Waker) {
+    pub fn register_waker(
+        &mut self,
+        mask: u64,
+        waker: &Waker,
+    ) -> Result<(), PollRegistrationError> {
         let next = self.iface.poll_at(now(), &self.socket_set.inner.lock());
 
         if let Some(t) = next {
             let next = TimeValue::from_micros(t.total_micros() as _);
 
-            // drop old timeout future
-            self.timeout = None;
-
-            let mut fut = Box::pin(sleep_until(next));
-            let mut cx = Context::from_waker(waker);
-
-            if fut.as_mut().poll(&mut cx).is_ready() {
-                waker.wake_by_ref();
-                return;
-            } else {
-                self.timeout = Some(fut);
+            if self
+                .timeout
+                .as_ref()
+                .is_none_or(|timeout| timeout.deadline != next)
+            {
+                let future =
+                    Box::try_new(sleep_until(next)).map_err(|_| PollRegistrationError::NoMemory)?;
+                self.timeout = Some(ServiceTimeout {
+                    deadline: next,
+                    future: Box::into_pin(future),
+                });
             }
+
+            let mut context = Context::from_waker(waker);
+            let result = self
+                .timeout
+                .as_mut()
+                .map(|timeout| timeout.future.as_mut().poll(&mut context));
+            match result {
+                Some(core::task::Poll::Ready(Ok(()))) => {
+                    self.timeout = None;
+                    waker.wake_by_ref();
+                }
+                Some(core::task::Poll::Ready(Err(error))) => {
+                    self.timeout = None;
+                    return Err(map_timer_registration_error(error));
+                }
+                Some(core::task::Poll::Pending) | None => {}
+            }
+        } else {
+            self.timeout = None;
         }
 
         for (i, device) in self.router.devices.iter().enumerate() {
             if i >= 64 || mask & (1u64 << i) != 0 {
-                device.register_waker(waker);
+                device.register_waker(waker)?;
             }
+        }
+        Ok(())
+    }
+}
+
+fn map_timer_registration_error(error: TimerRegistrationError) -> PollRegistrationError {
+    match error {
+        TimerRegistrationError::CapacityExhausted => PollRegistrationError::Quota,
+        TimerRegistrationError::TokenSpaceExhausted | TimerRegistrationError::DeadlineOverflow => {
+            PollRegistrationError::InvalidState
         }
     }
 }
@@ -170,7 +214,7 @@ mod tests {
             dev,
             Ipv4Address::new(10, 0, 2, 15).into(),
         ));
-        Service::new(router, socket_set)
+        Service::try_new(router, socket_set).unwrap()
     }
 
     #[test]
@@ -189,7 +233,8 @@ mod tests {
     fn resolve_outbound_reports_missing_route() {
         let socket_set = Arc::new(SocketSetWrapper::new());
         let listen_table = Arc::new(ListenTable::new());
-        let service = Service::new(Router::new_loopback_only(listen_table), socket_set);
+        let service =
+            Service::try_new(Router::new_loopback_only(listen_table), socket_set).unwrap();
         let err = service
             .resolve_outbound(&IpAddress::Ipv4(Ipv4Address::new(8, 8, 8, 8)), None)
             .unwrap_err();
@@ -210,7 +255,7 @@ mod tests {
             dev,
             source,
         ));
-        let service = Service::new(router, socket_set);
+        let service = Service::try_new(router, socket_set).unwrap();
 
         assert!(
             service
@@ -254,7 +299,8 @@ mod tests {
     fn validate_bind_addr_maps_missing_route_to_not_available() {
         let socket_set = Arc::new(SocketSetWrapper::new());
         let listen_table = Arc::new(ListenTable::new());
-        let service = Service::new(Router::new_loopback_only(listen_table), socket_set);
+        let service =
+            Service::try_new(Router::new_loopback_only(listen_table), socket_set).unwrap();
         let err = service
             .validate_bind_addr(IpAddress::Ipv4(Ipv4Address::new(10, 255, 254, 253)))
             .unwrap_err();

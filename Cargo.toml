@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["kernel"]
+members = [
+    "kernel",
+    "crates/axtask-compat",
+    "crates/process-adapter",
+    "crates/readiness-adapter",
+]
 exclude = ["arceos"]
 
 [workspace.package]
@@ -35,8 +40,12 @@ axmm = { version = "0.3.0-preview.2" }
 axnet = { path = "crates/axnet-ng", package = "axnet-ng" }
 axruntime = { version = "0.3.0-preview.2" }
 axsync = { version = "0.3.0-preview.2" }
-axtask = { version = "0.3.0-preview.2" }
-linux-vfs = { package = "thekernel-linux-vfs", version = "=0.1.0", path = "../thekernel-linux-abi/crates/vfs" }
+axpoll = { package = "thekernel-readiness-adapter", version = "=0.1.0", path = "crates/readiness-adapter" }
+axtask = { package = "thekernel-axtask", version = "=0.1.0" }
+linux-vfs = { package = "thekernel-linux-vfs", version = "=0.1.0" }
+thekernel-linux-fd = { version = "=0.1.0" }
+thekernel-linux-process = { version = "=0.1.0", default-features = false }
+starry-process = { package = "thekernel-linux-process-adapter", version = "=0.1.0", path = "crates/process-adapter" }
 
 thekernel-kernel = { path = "kernel", version = "=0.2.0-preview.2" }
 
@@ -104,15 +113,19 @@ axcpu = { path = "third_party/rust-patches/axcpu" }
 axfs-ng = { path = "third_party/rust-patches/axfs-ng" }
 axfs-ng-vfs = { path = "third_party/rust-patches/axfs-ng-vfs" }
 starry-vm = { path = "third_party/rust-patches/starry-vm" }
-starry-process = { path = "third_party/rust-patches/starry-process" }
 scope-local = { path = "third_party/rust-patches/scope-local" }
 starry-signal = { path = "third_party/rust-patches/starry-signal" }
-axsched = { path = "third_party/rust-patches/axsched" }
-axtask = { path = "third_party/rust-patches/axtask" }
+axtask = { path = "crates/axtask-compat" }
 axruntime = { path = "third_party/rust-patches/axruntime" }
 axplat-loongarch64-qemu-virt = { path = "third_party/rust-patches/axplat-loongarch64-qemu-virt" }
 axplat-riscv64-qemu-virt = { path = "third_party/rust-patches/axplat-riscv64-qemu-virt" }
-axpoll = { path = "third_party/rust-patches/axpoll" }
+thekernel-axsched = { path = "../thekernel-ax/crates/thekernel-axsched" }
+thekernel-axpoll = { path = "../thekernel-ax/crates/thekernel-axpoll" }
+thekernel-axtask = { path = "../thekernel-ax/crates/thekernel-axtask" }
+thekernel-linux-vfs = { path = "../thekernel-linux-abi/crates/vfs" }
+thekernel-linux-fd = { path = "../thekernel-linux-abi/crates/fd" }
+thekernel-linux-process = { path = "../thekernel-linux-abi/crates/process" }
+thekernel-readiness-adapter = { path = "crates/readiness-adapter" }
 memory_set = { path = "third_party/rust-patches/memory_set" }
 page_table_multiarch = { path = "third_party/rust-patches/page_table_multiarch" }
 kernel-elf-parser = { path = "third_party/rust-patches/kernel-elf-parser" }

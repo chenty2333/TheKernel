@@ -9,14 +9,12 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axhal::time::monotonic_time;
 use axpoll::{IoEvents, PollSet, Pollable};
-use axtask::{
-    current,
-    future::{block_on, poll_io},
-};
+use axtask::current;
 use spin::Mutex;
 
 use crate::{
     file::{FileLike, IoDst, IoSrc, Kstat, anon_inode_stat},
+    readiness::block_on_poll_io,
     task::{AlarmClock, AsThread, register_pollset_alarm},
     time::wall_time,
 };
@@ -196,7 +194,7 @@ impl FileLike for TimerFd {
             return Err(AxError::InvalidInput);
         }
 
-        block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
+        block_on_poll_io(self, IoEvents::READABLE, self.nonblocking(), || {
             let mut inner = self.inner.lock();
             let now = self.clock.host_now();
             inner.update_expirations(now);
@@ -219,7 +217,7 @@ impl FileLike for TimerFd {
             } else {
                 Err(AxError::WouldBlock)
             }
-        }))
+        })
     }
 
     fn write(&self, _src: &mut IoSrc) -> axio::Result<usize> {
@@ -248,17 +246,21 @@ impl Pollable for TimerFd {
         inner.update_expirations(now);
 
         let mut events = IoEvents::empty();
-        events.set(IoEvents::IN, inner.expirations > 0);
+        events.set(IoEvents::READABLE, inner.expirations > 0);
         events
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.contains(IoEvents::IN) {
-            self.poll_rx.register(context.waker());
-            // Ensure we get woken when the timer fires.
-            if let Some(deadline) = self.next_deadline() {
-                register_pollset_alarm(self.clock.alarm_clock(), deadline, self.poll_rx.clone());
-            }
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        if events.contains(IoEvents::READABLE) {
+            // settime and each repeating read publish the corresponding alarm;
+            // registration only owns this waiter's cancellable source slot.
+            axpoll::PollRegistration::single(&self.poll_rx, context.waker())
+        } else {
+            axpoll::PollRegistration::empty()
         }
     }
 }

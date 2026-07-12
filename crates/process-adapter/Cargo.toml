@@ -10,7 +10,5 @@ license = "Apache-2.0"
 name = "starry_process"
 path = "src/lib.rs"
 
-[dependencies.process-core]
-package = "thekernel-linux-process"
-version = "=0.1.0"
-default-features = false
+[dependencies]
+thekernel-linux-process.workspace = true

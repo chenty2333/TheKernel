@@ -3,7 +3,10 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::{
+    fmt,
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+};
 
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{
@@ -114,6 +117,18 @@ static LINUX_DEVICE_IDS: Lazy<BlockingMutex<HashMap<u64, (DeviceId, WeakFilesyst
     Lazy::new(|| BlockingMutex::new(HashMap::new()));
 static MOUNT_NAMESPACE_OPERATION: BlockingMutex<()> = BlockingMutex::new(());
 
+/// Capability proving that one pathname/mount mutation owns the shared Linux
+/// namespace serialization domain.
+pub struct NamespaceOperationGuard {
+    _guard: BlockingMutexGuard<'static, ()>,
+}
+
+impl fmt::Debug for NamespaceOperationGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("NamespaceOperationGuard")
+    }
+}
+
 struct LinuxMountState {
     flags: AtomicU32,
     activity_epoch: AtomicU64,
@@ -128,8 +143,10 @@ enum ExpireProbe {
 }
 
 /// Serializes Linux mount-namespace mutations and constrained pathname walks.
-pub fn namespace_operation() -> BlockingMutexGuard<'static, ()> {
-    MOUNT_NAMESPACE_OPERATION.lock()
+pub fn namespace_operation() -> NamespaceOperationGuard {
+    NamespaceOperationGuard {
+        _guard: MOUNT_NAMESPACE_OPERATION.lock(),
+    }
 }
 
 pub const ROOT_BLOCK_SOURCE: &str = "/dev/vda";
@@ -229,6 +246,19 @@ fn mount_extensions(flags: u32, metadata: MountMetadata) -> VfsResult<TypeMap> {
     })?;
     drop(retired);
     Ok(extensions)
+}
+
+#[cfg(test)]
+pub(crate) fn initialize_test_mount(mountpoint: &Arc<Mountpoint>, flags: u32) -> VfsResult<()> {
+    mountpoint.initialize_extensions(mount_extensions(
+        flags,
+        MountMetadata {
+            source: String::new(),
+            fs_type: String::new(),
+            root: String::new(),
+            data: String::new(),
+        },
+    )?)
 }
 
 pub fn initialize_root_mount(

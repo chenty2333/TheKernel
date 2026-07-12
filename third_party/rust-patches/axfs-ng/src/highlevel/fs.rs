@@ -1024,7 +1024,7 @@ mod tests {
         NodeType, Reference, RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult,
         WeakDirEntry, drain_deferred_dentry_cache_cleanup, path::Path,
     };
-    use axpoll::{IoEvents, Pollable};
+    use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
     use spin::Once;
 
     use super::{FsContext, PathwalkComponent, PathwalkPolicy, set_mount_access_policy};
@@ -1264,10 +1264,16 @@ mod tests {
 
     impl Pollable for TestFile {
         fn poll(&self) -> IoEvents {
-            IoEvents::IN | IoEvents::OUT
+            IoEvents::READABLE | IoEvents::WRITABLE
         }
 
-        fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+        fn register<'a>(
+            &'a self,
+            _context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+            PollRegistration::empty()
+        }
     }
 
     impl FileNodeOps for TestFile {

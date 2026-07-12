@@ -50,6 +50,12 @@ pub(crate) fn bind_path(
 ) -> AxResult<()> {
     let path_ref = Path::new(path.as_ref());
     validate_pathname(path_ref)?;
+    // This specialized socket/filesystem composite transaction is independent
+    // of MutationTransaction: UnixBindReservation keeps transport admission
+    // hidden and reversible, while the backend publishes fully initialized
+    // inode data exactly once. The shared guard keeps final path admission,
+    // writable-mount validation, and publication atomic against remount RO.
+    let _mount_operation = mounts::namespace_operation();
 
     // Linux maps any pre-existing final component (including a symlink or a
     // non-socket inode) to EADDRINUSE. The exclusive backend create below is

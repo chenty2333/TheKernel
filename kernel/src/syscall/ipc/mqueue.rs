@@ -13,7 +13,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axpoll::{IoEvents, Pollable};
+use axpoll::{IoEvents, PollSet, Pollable, poll_io};
 #[cfg(not(test))]
 use axsync::Mutex;
 use axtask::current;
@@ -39,11 +39,10 @@ use crate::{
     mm::vm_load_string,
     syscall::RawSigevent,
     task::{
-        AsThread, ProcStateHint, ProcessData, has_pending_syscall_signal,
-        prepare_queued_signal_for_process, send_prepared_signal_to_process_data,
-        with_proc_state_hint,
+        AsThread, ProcStateHint, ProcessData, prepare_queued_signal_for_process,
+        send_prepared_signal_to_process_data, with_proc_state_hint,
     },
-    time::{TimeValueLike, wall_time},
+    time::TimeValueLike,
 };
 
 const MQ_PRIO_MAX: u32 = 32768;
@@ -52,7 +51,6 @@ const DEFAULT_MQ_MSGSIZE: isize = 8192;
 const DEFAULT_QUEUES_MAX: usize = 256;
 const DEFAULT_MSG_MAX: usize = 1024;
 const DEFAULT_MSGSIZE_MAX: usize = 1 << 20;
-const MQ_WAIT_SLICE: Duration = Duration::from_millis(10);
 const MQ_NAME_MAX: usize = 255;
 const NOTIFY_COOKIE_LEN: usize = 32;
 const NOTIFY_WOKENUP: u8 = 1;
@@ -120,7 +118,12 @@ struct PosixMqueue {
     messages: Vec<MqMessage>,
     next_sequence: u64,
     notifier: Option<MqNotifier>,
-    waiters: Arc<axtask::WaitQueue>,
+    readiness: Arc<MqReadiness>,
+}
+
+struct MqReadiness {
+    readable: PollSet,
+    writable: PollSet,
 }
 
 struct MqManager {
@@ -139,6 +142,7 @@ struct MqNotificationRegistry {
 
 pub struct MqFd {
     queue: Arc<Mutex<PosixMqueue>>,
+    readiness: Arc<MqReadiness>,
     access: MqAccess,
     nonblocking: AtomicUsize,
 }
@@ -167,20 +171,36 @@ impl MqNotificationRegistry {
 }
 
 impl PosixMqueue {
-    fn new(name: String, mode: __kernel_mode_t, uid: u32, gid: u32, attr: MqAttr) -> Self {
-        Self {
+    fn new(
+        name: String,
+        mode: __kernel_mode_t,
+        uid: u32,
+        gid: u32,
+        attr: MqAttr,
+    ) -> AxResult<Self> {
+        let maxmsg = attr.mq_maxmsg as usize;
+        let mut messages = Vec::new();
+        messages
+            .try_reserve_exact(maxmsg)
+            .map_err(|_| AxError::NoMemory)?;
+        let readiness = Arc::try_new(MqReadiness {
+            readable: PollSet::new(),
+            writable: PollSet::new(),
+        })
+        .map_err(|_| AxError::NoMemory)?;
+        Ok(Self {
             inode: PseudoInode::mqueue(mode, uid, gid),
             name,
             mode,
             uid,
             gid,
-            maxmsg: attr.mq_maxmsg as usize,
+            maxmsg,
             msgsize: attr.mq_msgsize as usize,
-            messages: Vec::new(),
+            messages,
             next_sequence: 0,
             notifier: None,
-            waiters: Arc::new(axtask::WaitQueue::new()),
-        }
+            readiness,
+        })
     }
 
     fn attr(&self, flags: isize) -> MqAttr {
@@ -249,8 +269,10 @@ impl MqAccess {
 
 impl MqFd {
     fn new(queue: Arc<Mutex<PosixMqueue>>, access: MqAccess, nonblocking: bool) -> Self {
+        let readiness = Arc::clone(&queue.lock().readiness);
         Self {
             queue,
+            readiness,
             access,
             nonblocking: AtomicUsize::new(nonblocking as usize),
         }
@@ -300,13 +322,27 @@ impl Pollable for MqFd {
     fn poll(&self) -> IoEvents {
         let queue = self.queue.lock();
         let mut events = IoEvents::empty();
-        events.set(IoEvents::IN, queue.messages.len() > 0);
-        events.set(IoEvents::OUT, queue.messages.len() < queue.maxmsg);
+        events.set(IoEvents::READABLE, queue.messages.len() > 0);
+        events.set(IoEvents::WRITABLE, queue.messages.len() < queue.maxmsg);
         events
     }
 
-    fn register(&self, context: &mut Context<'_>, _events: IoEvents) {
-        let _ = context;
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        let read = self.access.can_read() && events.contains(IoEvents::READABLE);
+        let write = self.access.can_write() && events.contains(IoEvents::WRITABLE);
+        let mut prepared =
+            axpoll::PreparedPollRegistration::try_new(read as usize + write as usize)?;
+        if read {
+            prepared.arm(&self.readiness.readable, context.waker())?;
+        }
+        if write {
+            prepared.arm(&self.readiness.writable, context.waker())?;
+        }
+        prepared.commit()
     }
 }
 
@@ -512,34 +548,23 @@ fn build_notifier(event: &RawSigevent) -> AxResult<MqNotifier> {
     Ok(notifier)
 }
 
-fn wall_time_duration() -> Duration {
-    let now = wall_time();
-    Duration::new(now.as_secs(), now.subsec_nanos())
-}
-
-fn wait_for_queue(waiters: Arc<axtask::WaitQueue>, deadline: Option<Duration>) -> AxResult {
-    let current = current();
-    let thread = current.as_thread();
-    if has_pending_syscall_signal(thread) {
-        return Err(AxError::Interrupted);
-    }
-    if let Some(deadline) = deadline
-        && wall_time_duration() >= deadline
-    {
-        return Err(AxError::TimedOut);
-    }
-
-    let sleep_for = deadline
-        .map(|deadline| {
-            deadline
-                .saturating_sub(wall_time_duration())
-                .min(MQ_WAIT_SLICE)
-        })
-        .unwrap_or(MQ_WAIT_SLICE);
+fn wait_mq_operation<T>(
+    file: &MqFd,
+    events: IoEvents,
+    deadline: Option<Duration>,
+    operation: impl FnMut() -> AxResult<T>,
+) -> AxResult<T> {
     with_proc_state_hint(ProcStateHint::Interruptible, || {
-        waiters.wait_timeout(sleep_for);
-    });
-    Ok(())
+        let result =
+            axtask::future::block_on(axtask::future::interruptible(axtask::future::timeout_at(
+                deadline,
+                poll_io(file, events, file.is_nonblocking(), operation),
+            )))
+            .map_err(AxError::from)?
+            .map_err(AxError::from)?;
+        let result = result.map_err(AxError::from)?;
+        result.map_err(crate::readiness::poll_io_error)
+    })
 }
 
 fn send_thread_notification(thread: &MqThreadNotifier, state: u8) {
@@ -671,13 +696,14 @@ pub fn sys_mq_open(
             let attr = read_create_attr(attr)?;
             let (uid, gid) = current_ids();
             let create_mode = (mode & !current().as_thread().proc_data.umask()) & 0o777;
-            let queue = Arc::new(Mutex::new(PosixMqueue::new(
+            let queue = Arc::try_new(Mutex::new(PosixMqueue::new(
                 name.clone(),
                 create_mode,
                 uid,
                 gid,
                 attr,
-            )));
+            )?))
+            .map_err(|_| AxError::NoMemory)?;
             manager.queues.insert(name.clone(), queue.clone());
             (queue, true)
         }
@@ -722,10 +748,7 @@ pub fn sys_mq_unlink(name: *const c_char) -> AxResult<isize> {
         }
     }
     let removed = MQ_MANAGER.lock().queues.remove(&name);
-    if let Some(queue) = removed {
-        let guard = queue.lock();
-        guard.waiters.notify_all(false);
-    }
+    drop(removed);
     Ok(0)
 }
 
@@ -754,29 +777,26 @@ pub fn sys_mq_timedsend(
         vm_load(msg_ptr, msg_len)?
     };
 
-    loop {
-        let waiters = {
+    let mut data = Some(data);
+    wait_mq_operation(&file, IoEvents::WRITABLE, deadline, || {
+        let (notifier, readiness) = {
             let mut queue = file.queue.lock();
-            if queue.messages.len() < queue.maxmsg {
-                let was_empty = queue.insert_message(msg_prio, data);
-                let notifier = if was_empty {
-                    queue.notifier.take()
-                } else {
-                    None
-                };
-                let waiters = queue.waiters.clone();
-                waiters.notify_all(false);
-                drop(queue);
-                maybe_notify(notifier);
-                return Ok(0);
-            }
-            if file.is_nonblocking() {
+            if queue.messages.len() >= queue.maxmsg {
                 return Err(AxError::WouldBlock);
             }
-            queue.waiters.clone()
+            let payload = data.take().ok_or(AxError::BadState)?;
+            let was_empty = queue.insert_message(msg_prio, payload);
+            let notifier = if was_empty {
+                queue.notifier.take()
+            } else {
+                None
+            };
+            (notifier, Arc::clone(&queue.readiness))
         };
-        wait_for_queue(waiters, deadline)?;
-    }
+        readiness.readable.wake();
+        maybe_notify(notifier);
+        Ok(0)
+    })
 }
 
 pub fn sys_mq_timedreceive(
@@ -792,30 +812,25 @@ pub fn sys_mq_timedreceive(
         return Err(AxError::BadFileDescriptor);
     }
 
-    loop {
-        let waiters = {
+    wait_mq_operation(&file, IoEvents::READABLE, deadline, || {
+        let (message, readiness) = {
             let mut queue = file.queue.lock();
-            if !queue.messages.is_empty() {
-                if msg_len < queue.msgsize {
-                    return Err(AxError::from(LinuxError::EMSGSIZE));
-                }
-                let message = queue.pop_message().ok_or(AxError::InvalidInput)?;
-                let waiters = queue.waiters.clone();
-                waiters.notify_all(false);
-                drop(queue);
-                vm_write_slice(msg_ptr, &message.data)?;
-                if !msg_prio.is_null() {
-                    msg_prio.vm_write(message.priority)?;
-                }
-                return Ok(message.data.len() as isize);
-            }
-            if file.is_nonblocking() {
+            if queue.messages.is_empty() {
                 return Err(AxError::WouldBlock);
             }
-            queue.waiters.clone()
+            if msg_len < queue.msgsize {
+                return Err(AxError::from(LinuxError::EMSGSIZE));
+            }
+            let message = queue.pop_message().ok_or(AxError::BadState)?;
+            (message, Arc::clone(&queue.readiness))
         };
-        wait_for_queue(waiters, deadline)?;
-    }
+        vm_write_slice(msg_ptr, &message.data)?;
+        if !msg_prio.is_null() {
+            msg_prio.vm_write(message.priority)?;
+        }
+        readiness.writable.wake();
+        Ok(message.data.len() as isize)
+    })
 }
 
 pub fn sys_mq_notify(fd: i32, notification: *const RawSigevent) -> AxResult<isize> {
@@ -925,13 +940,16 @@ mod tests {
         Arc<starry_signal::SignalQueueAccount>,
         Arc<starry_signal::SignalQueueAccount>,
     ) {
-        let queue = Arc::new(Mutex::new(PosixMqueue::new(
-            String::from("registry-account-test"),
-            0o600,
-            pid,
-            0,
-            default_attr(),
-        )));
+        let queue = Arc::new(Mutex::new(
+            PosixMqueue::new(
+                String::from("registry-account-test"),
+                0o600,
+                pid,
+                0,
+                default_attr(),
+            )
+            .unwrap(),
+        ));
         let token = new_notification_token().unwrap();
         let per_user = starry_signal::SignalQueueAccount::try_new(4).unwrap();
         let global = starry_signal::SignalQueueAccount::try_new(4).unwrap();
@@ -961,13 +979,9 @@ mod tests {
     }
 
     fn install_inert_notification(pid: u32) -> (Arc<Mutex<PosixMqueue>>, Arc<MqNotificationToken>) {
-        let queue = Arc::new(Mutex::new(PosixMqueue::new(
-            String::from("registry-test"),
-            0o600,
-            pid,
-            0,
-            default_attr(),
-        )));
+        let queue = Arc::new(Mutex::new(
+            PosixMqueue::new(String::from("registry-test"), 0o600, pid, 0, default_attr()).unwrap(),
+        ));
         let token = new_notification_token().unwrap();
         queue.lock().notifier = Some(MqNotifier {
             pid,

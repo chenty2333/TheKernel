@@ -25,7 +25,7 @@ use axfs_ng_vfs::{
 };
 use axhal::mem::{PhysAddr, VirtAddr, total_ram_size, virt_to_phys};
 use axio::{SeekFrom, prelude::*};
-use axpoll::{IoEvents, Pollable};
+use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use axsync::Mutex;
 use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter};
 use lru::LruCache;
@@ -3707,7 +3707,11 @@ impl Pollable for File {
         self.inner.location().poll()
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
         self.inner.location().register(context, events)
     }
 }
@@ -3738,7 +3742,7 @@ mod tests {
         VfsResult,
     };
     use axio::Cursor;
-    use axpoll::{IoEvents, Pollable};
+    use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
     use axsync::Mutex;
 
     use super::{
@@ -3818,10 +3822,16 @@ mod tests {
 
     impl Pollable for AppendTestFile {
         fn poll(&self) -> IoEvents {
-            IoEvents::IN | IoEvents::OUT
+            IoEvents::READABLE | IoEvents::WRITABLE
         }
 
-        fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+        fn register<'a>(
+            &'a self,
+            _context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+            PollRegistration::empty()
+        }
     }
 
     impl FileNodeOps for AppendTestFile {
@@ -4017,10 +4027,16 @@ mod tests {
 
     impl Pollable for RegistryTestFile {
         fn poll(&self) -> IoEvents {
-            IoEvents::IN | IoEvents::OUT
+            IoEvents::READABLE | IoEvents::WRITABLE
         }
 
-        fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+        fn register<'a>(
+            &'a self,
+            _context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+            PollRegistration::empty()
+        }
     }
 
     impl FileNodeOps for RegistryTestFile {

@@ -10,10 +10,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::Location;
 use axpoll::{IoEvents, PollSet, Pollable};
 use axsync::Mutex;
-use axtask::{
-    current,
-    future::{block_on, poll_io},
-};
+use axtask::current;
 use linux_raw_sys::{
     general::{CAP_SYS_RESOURCE, O_ACCMODE, O_NONBLOCK, O_RDONLY, O_WRONLY, POLL_IN},
     ioctl::FIONREAD,
@@ -32,6 +29,7 @@ use super::{
 };
 use crate::{
     file::{IoDst, IoSrc},
+    readiness::block_on_poll_io,
     task::{AsThread, send_signal_to_process},
 };
 
@@ -303,11 +301,15 @@ struct NamedPipeOpenWaiter<'a> {
 
 impl Pollable for NamedPipeOpenWaiter<'_> {
     fn poll(&self) -> IoEvents {
-        IoEvents::IN
+        IoEvents::READABLE
     }
 
-    fn register(&self, context: &mut Context<'_>, _events: IoEvents) {
-        self.state.poll_open.register(context.waker());
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        _events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        axpoll::PollRegistration::single(&self.state.poll_open, context.waker())
     }
 }
 
@@ -424,7 +426,7 @@ impl Pipe {
             return Ok(0);
         }
 
-        block_on(poll_io(self, IoEvents::IN, nonblocking, || {
+        block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
             let read = read_pipe_buffer(&self.shared.buffer, dst)?;
             if read.len > 0 {
                 notify_pipe_writable(&self.shared.poll_tx, read);
@@ -434,7 +436,7 @@ impl Pipe {
             } else {
                 Err(AxError::WouldBlock)
             }
-        }))
+        })
     }
 
     pub fn vmsplice_write(&self, src: &mut IoSrc, nonblocking: bool) -> AxResult<usize> {
@@ -445,7 +447,7 @@ impl Pipe {
             return Ok(0);
         }
 
-        block_on(poll_io(self, IoEvents::OUT, nonblocking, || {
+        block_on_poll_io(self, IoEvents::WRITABLE, nonblocking, || {
             if self.closed() {
                 raise_pipe();
                 return Err(AxError::BrokenPipe);
@@ -458,7 +460,7 @@ impl Pipe {
             } else {
                 Err(AxError::WouldBlock)
             }
-        }))
+        })
     }
 
     pub fn tee_to(&self, out: &Self, len: usize, nonblocking: bool) -> AxResult<usize> {
@@ -481,22 +483,31 @@ impl Pipe {
             fn poll(&self) -> IoEvents {
                 let mut events = IoEvents::empty();
                 let src = self.src.shared.buffer.lock();
-                events.set(IoEvents::IN, src.occupied_len() > 0);
+                events.set(IoEvents::READABLE, src.occupied_len() > 0);
                 drop(src);
                 let dst = self.dst.shared.buffer.lock();
-                events.set(IoEvents::OUT, pipe_poll_writable(&dst));
+                events.set(IoEvents::WRITABLE, pipe_poll_writable(&dst));
                 events
             }
 
-            fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-                if events.contains(IoEvents::IN) {
-                    self.src.shared.poll_rx.register(context.waker());
+            fn register<'a>(
+                &'a self,
+                context: &mut Context<'_>,
+                events: IoEvents,
+            ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+                let read = events.contains(IoEvents::READABLE);
+                let write = events.contains(IoEvents::WRITABLE);
+                let mut prepared =
+                    axpoll::PreparedPollRegistration::try_new(2 + read as usize + write as usize)?;
+                if read {
+                    prepared.arm(&self.src.shared.poll_rx, context.waker())?;
                 }
-                if events.contains(IoEvents::OUT) {
-                    self.dst.shared.poll_tx.register(context.waker());
+                if write {
+                    prepared.arm(&self.dst.shared.poll_tx, context.waker())?;
                 }
-                self.src.shared.poll_close.register(context.waker());
-                self.dst.shared.poll_close.register(context.waker());
+                prepared.arm(&self.src.shared.poll_close, context.waker())?;
+                prepared.arm(&self.dst.shared.poll_close, context.waker())?;
+                prepared.commit()
             }
         }
 
@@ -505,9 +516,9 @@ impl Pipe {
             dst: out,
         };
         let mut total_copied = 0usize;
-        block_on(poll_io(
+        block_on_poll_io(
             &poller,
-            IoEvents::IN | IoEvents::OUT,
+            IoEvents::READABLE | IoEvents::WRITABLE,
             nonblocking,
             || {
                 if out.closed() {
@@ -557,7 +568,7 @@ impl Pipe {
                     Err(AxError::WouldBlock)
                 }
             },
-        ))
+        )
     }
 }
 
@@ -605,21 +616,21 @@ impl NamedPipe {
             state: state.as_ref(),
         };
         let wait_result = if access.waits_for_writer(nonblocking) {
-            block_on(poll_io(&waiter, IoEvents::IN, false, || {
+            block_on_poll_io(&waiter, IoEvents::READABLE, false, || {
                 if state.writer_count() > 0 {
                     Ok(())
                 } else {
                     Err(AxError::WouldBlock)
                 }
-            }))
+            })
         } else if access.waits_for_reader(nonblocking) {
-            block_on(poll_io(&waiter, IoEvents::IN, false, || {
+            block_on_poll_io(&waiter, IoEvents::READABLE, false, || {
                 if state.reader_count() > 0 {
                     Ok(())
                 } else {
                     Err(AxError::WouldBlock)
                 }
-            }))
+            })
         } else {
             Ok(())
         };
@@ -659,7 +670,7 @@ impl FileLike for Pipe {
         }
 
         let nonblocking = self.nonblocking();
-        block_on(poll_io(self, IoEvents::IN, nonblocking, || {
+        block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
             let read = read_pipe_buffer(&self.shared.buffer, dst)?;
             if read.len > 0 {
                 notify_pipe_writable(&self.shared.poll_tx, read);
@@ -669,7 +680,7 @@ impl FileLike for Pipe {
             } else {
                 Err(AxError::WouldBlock)
             }
-        }))
+        })
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
@@ -685,7 +696,7 @@ impl FileLike for Pipe {
         let mut total_written = 0;
         let nonblocking = self.nonblocking();
 
-        block_on(poll_io(self, IoEvents::OUT, nonblocking, || {
+        block_on_poll_io(self, IoEvents::WRITABLE, nonblocking, || {
             if self.closed() {
                 raise_pipe();
                 return Err(AxError::BrokenPipe);
@@ -700,7 +711,7 @@ impl FileLike for Pipe {
                 }
             }
             Err(AxError::WouldBlock)
-        }))
+        })
     }
 
     fn stat(&self) -> AxResult<Kstat> {
@@ -736,23 +747,32 @@ impl Pollable for Pipe {
         let mut events = IoEvents::empty();
         let buf = self.shared.buffer.lock();
         if self.read_side {
-            events.set(IoEvents::IN, buf.occupied_len() > 0);
-            events.set(IoEvents::HUP, self.closed());
+            events.set(IoEvents::READABLE, buf.occupied_len() > 0);
+            events.set(IoEvents::HANGUP, self.closed());
         } else {
-            events.set(IoEvents::OUT, pipe_poll_writable(&buf));
-            events.set(IoEvents::ERR, self.closed());
+            events.set(IoEvents::WRITABLE, pipe_poll_writable(&buf));
+            events.set(IoEvents::ERROR, self.closed());
         }
         events
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.contains(IoEvents::IN) {
-            self.shared.poll_rx.register(context.waker());
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        let read = events.contains(IoEvents::READABLE);
+        let write = events.contains(IoEvents::WRITABLE);
+        let mut prepared =
+            axpoll::PreparedPollRegistration::try_new(1 + read as usize + write as usize)?;
+        if read {
+            prepared.arm(&self.shared.poll_rx, context.waker())?;
         }
-        if events.contains(IoEvents::OUT) {
-            self.shared.poll_tx.register(context.waker());
+        if write {
+            prepared.arm(&self.shared.poll_tx, context.waker())?;
         }
-        self.shared.poll_close.register(context.waker());
+        prepared.arm(&self.shared.poll_close, context.waker())?;
+        prepared.commit()
     }
 }
 
@@ -765,7 +785,7 @@ impl FileLike for NamedPipe {
             return Ok(0);
         }
 
-        block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
+        block_on_poll_io(self, IoEvents::READABLE, self.nonblocking(), || {
             let read = {
                 let cons = self.state.buffer.lock();
                 let (left, right) = cons.as_slices();
@@ -784,7 +804,7 @@ impl FileLike for NamedPipe {
             } else {
                 Err(AxError::WouldBlock)
             }
-        }))
+        })
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
@@ -798,7 +818,7 @@ impl FileLike for NamedPipe {
 
         let atomic_len = (size <= PIPE_BUF_SIZE).then_some(size);
         let mut total_written = 0;
-        block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
+        block_on_poll_io(self, IoEvents::WRITABLE, self.nonblocking(), || {
             if self.state.reader_count() == 0 {
                 raise_pipe();
                 return Err(AxError::BrokenPipe);
@@ -814,7 +834,7 @@ impl FileLike for NamedPipe {
                 }
             }
             Err(AxError::WouldBlock)
-        }))
+        })
     }
 
     fn stat(&self) -> AxResult<Kstat> {
@@ -850,33 +870,40 @@ impl Pollable for NamedPipe {
         let mut events = IoEvents::empty();
         let buf = self.state.buffer.lock();
         if self.access.can_read() {
-            events.set(IoEvents::IN, buf.occupied_len() > 0);
-            events.set(IoEvents::HUP, self.state.writer_count() == 0);
+            events.set(IoEvents::READABLE, buf.occupied_len() > 0);
+            events.set(IoEvents::HANGUP, self.state.writer_count() == 0);
         }
         if self.access.can_write() {
             events.set(
-                IoEvents::OUT,
+                IoEvents::WRITABLE,
                 self.state.reader_count() > 0 && pipe_poll_writable(&buf),
             );
-            events.set(IoEvents::ERR, self.state.reader_count() == 0);
+            events.set(IoEvents::ERROR, self.state.reader_count() == 0);
         }
         events
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if self.access.can_read() {
-            if events.contains(IoEvents::IN) {
-                self.state.poll_rx.register(context.waker());
-            }
-            if events.contains(IoEvents::HUP) {
-                self.state.poll_open.register(context.waker());
-            }
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        let read = self.access.can_read() && events.contains(IoEvents::READABLE);
+        let write = self.access.can_write() && events.contains(IoEvents::WRITABLE);
+        let open = (self.access.can_read() && events.contains(IoEvents::HANGUP))
+            || self.access.can_write();
+        let mut prepared = axpoll::PreparedPollRegistration::try_new(
+            read as usize + write as usize + open as usize,
+        )?;
+        if read {
+            prepared.arm(&self.state.poll_rx, context.waker())?;
         }
-        if self.access.can_write() {
-            if events.contains(IoEvents::OUT) {
-                self.state.poll_tx.register(context.waker());
-            }
-            self.state.poll_open.register(context.waker());
+        if write {
+            prepared.arm(&self.state.poll_tx, context.waker())?;
         }
+        if open {
+            prepared.arm(&self.state.poll_open, context.waker())?;
+        }
+        prepared.commit()
     }
 }

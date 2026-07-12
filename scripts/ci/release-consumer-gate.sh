@@ -6,8 +6,8 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-AX_REPO=${THEKERNEL_AX_REPO:-/home/ava/Desktop/thekernel-ax}
-LINUX_ABI_REPO=${THEKERNEL_LINUX_ABI_REPO:-/home/ava/Desktop/thekernel-linux-abi}
+AX_REPO=${THEKERNEL_AX_REPO:-$REPO_ROOT/../thekernel-ax}
+LINUX_ABI_REPO=${THEKERNEL_LINUX_ABI_REPO:-$REPO_ROOT/../thekernel-linux-abi}
 AX_EXPECTED_HEAD=${THEKERNEL_AX_EXPECTED_HEAD:-}
 LINUX_ABI_EXPECTED_HEAD=${THEKERNEL_LINUX_ABI_EXPECTED_HEAD:-}
 EXPECTED_RELEASE_SET=${THEKERNEL_EXPECTED_RELEASE_SET:-}
@@ -31,6 +31,7 @@ CONSUMED_PACKAGES=(
     thekernel-axsched
     thekernel-axpoll
     thekernel-axtask
+    thekernel-linux-process
     thekernel-linux-vfs
     thekernel-linux-fd
 )
@@ -41,7 +42,7 @@ Usage: scripts/ci/release-consumer-gate.sh [OPTIONS]
 
 Packages the clean thekernel-ax and thekernel-linux-abi release workspaces,
 validates and safely extracts the exact .crate archives, retargets a temporary
-copy of TheKernel to those artifacts, rejects legacy or source-workspace ax
+copy of TheKernel to those artifacts, rejects legacy or source-workspace
 instances, and builds the RISC-V and LoongArch evaluator kernels.
 
 Options:
@@ -343,6 +344,7 @@ python3 "$SCRIPT_DIR/rewrite-release-consumer.py" \
     --replace "../thekernel-ax/crates/thekernel-axsched=../artifacts/thekernel-axsched-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axpoll=../artifacts/thekernel-axpoll-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axtask=../artifacts/thekernel-axtask-$VERSION" \
+    --replace "../thekernel-linux-abi/crates/process=../artifacts/thekernel-linux-process-$VERSION" \
     --replace "../thekernel-linux-abi/crates/vfs=../artifacts/thekernel-linux-vfs-$VERSION" \
     --replace "../thekernel-linux-abi/crates/fd=../artifacts/thekernel-linux-fd-$VERSION" \
     --forbid-text '../thekernel-ax/' \
@@ -363,6 +365,7 @@ graph_args=(
     --metadata "$metadata_path"
     --consumer-root "$consumer_root"
     --allowed-axtask-facade "$consumer_root/crates/axtask-compat"
+    --allowed-process-adapter "$consumer_root/crates/process-adapter"
     --release-source-root "$AX_REPO"
     --release-source-root "$LINUX_ABI_REPO"
 )

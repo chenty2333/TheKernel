@@ -30,7 +30,10 @@ pub(crate) use self::{
     idmap::{ID_MAP_MAX_EXTENTS, IdMapInputExtent, validate_id_map_input},
     jobctl::{ContinueResult, StopReport},
     process::{
-        CgroupNamespace, PidNamespace, TimeNamespace, UTS_FIELD_LEN, UserNamespace, UtsNamespace,
+        CgroupNamespace, CommittedProcessExit, InitialProcessThreadAdmission,
+        PendingThreadPublication, PidNamespace, Process, ProcessGroup, ProcessThreadAdmission,
+        Session, ThreadExitTransition, TimeNamespace, UTS_FIELD_LEN, UserNamespace, UtsNamespace,
+        ZombieSnapshot, init_process_domain, process_domain, process_error,
     },
     restart::*,
     thread::ProcStateHint,

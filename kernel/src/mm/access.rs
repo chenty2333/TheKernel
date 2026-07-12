@@ -1139,7 +1139,10 @@ fn prepare_user_io_pin(
 
     let delay_ms = user_io_pin_test_delay_ms();
     if delay_ms != 0 && user_io_pin_counters_enabled() {
-        sleep(Duration::from_millis(delay_ms));
+        if sleep(Duration::from_millis(delay_ms)).is_err() {
+            reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+            return None;
+        }
     }
 
     Some(PreparedUserIoPin {

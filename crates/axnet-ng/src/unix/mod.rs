@@ -13,7 +13,7 @@ use core::{
 use async_trait::async_trait;
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::{IoBuf, Read, Write};
-use axpoll::{IoEvents, Pollable};
+use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use axsync::{Mutex, spin::SpinNoIrq};
 use axtask::future::{block_on, interruptible};
 use enum_dispatch::enum_dispatch;
@@ -87,7 +87,11 @@ impl Pollable for Transport {
         }
     }
 
-    fn register(&self, context: &mut core::task::Context<'_>, events: IoEvents) {
+    fn register<'a>(
+        &'a self,
+        context: &mut core::task::Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
         match self {
             Transport::Stream(stream) => stream.register(context, events),
             Transport::Dgram(dgram) => dgram.register(context, events),
@@ -736,7 +740,7 @@ impl SocketOps for UnixSocket {
     }
 
     fn accept(&self) -> AxResult<Socket> {
-        let (transport, peer_addr) = block_on(interruptible(self.transport.accept()))??;
+        let (transport, peer_addr) = block_on(interruptible(self.transport.accept()))???;
         Ok(Socket::Unix(Self {
             transport,
             namespace: self.namespace.clone(),
@@ -796,8 +800,12 @@ impl Pollable for UnixSocket {
         self.transport.poll()
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        self.transport.register(context, events);
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+        self.transport.register(context, events)
     }
 }
 
@@ -1028,9 +1036,9 @@ mod tests {
 
         drop(reservation);
         let events = client.poll();
-        assert!(events.contains(IoEvents::RDHUP));
-        assert!(events.contains(IoEvents::ERR));
-        assert!(events.contains(IoEvents::HUP));
+        assert!(events.contains(IoEvents::READ_HANGUP));
+        assert!(events.contains(IoEvents::ERROR));
+        assert!(events.contains(IoEvents::HANGUP));
         assert!(!target.slot.is_active());
         assert!(target.slot.stream.lock().is_none());
     }

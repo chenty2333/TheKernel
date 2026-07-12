@@ -15,6 +15,14 @@ permissions:
   contents: read
   packages: read
 
+env:
+  # Non-secret repository variables. Refs must be exact published 40-hex
+  # commits; an unset or unavailable input intentionally fails provisioning.
+  THEKERNEL_AX_REPOSITORY: ${{ vars.THEKERNEL_AX_REPOSITORY }}
+  THEKERNEL_AX_REF: ${{ vars.THEKERNEL_AX_REF }}
+  THEKERNEL_LINUX_ABI_REPOSITORY: ${{ vars.THEKERNEL_LINUX_ABI_REPOSITORY }}
+  THEKERNEL_LINUX_ABI_REF: ${{ vars.THEKERNEL_LINUX_ABI_REF }}
+
 jobs:
   per-commit:
     runs-on: ubuntu-latest
@@ -36,6 +44,9 @@ jobs:
 
       - name: Trust checkout in job container
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Provision pinned maintained siblings
+        run: ./scripts/ci/provision-maintained-siblings.sh
 
       - name: Per-commit gate
         id: gate
@@ -79,6 +90,9 @@ jobs:
 
       - name: Trust checkout in job container
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Provision pinned maintained siblings
+        run: ./scripts/ci/provision-maintained-siblings.sh
 
       - name: Dual-architecture release and boot gate
         id: gate

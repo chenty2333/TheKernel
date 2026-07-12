@@ -2016,7 +2016,7 @@ impl SendFile {
             SendFile::Direct(file) => file.poll(),
             SendFile::Offset(file, ..) => file.poll(),
         }
-        .contains(IoEvents::IN)
+        .contains(IoEvents::READABLE)
     }
 
     fn read(&mut self, mut buf: &mut [u8]) -> AxResult<usize> {
@@ -2518,10 +2518,16 @@ mod tests {
 
     impl Pollable for IoContractNode {
         fn poll(&self) -> IoEvents {
-            IoEvents::IN | IoEvents::OUT
+            IoEvents::READABLE | IoEvents::WRITABLE
         }
 
-        fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+        fn register<'a>(
+            &'a self,
+            _context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+            axpoll::PollRegistration::empty()
+        }
     }
 
     impl FileNodeOps for IoContractNode {

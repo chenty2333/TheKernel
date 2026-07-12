@@ -6,8 +6,11 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axpoll::{IoEvents, Pollable};
-use axtask::future::{block_on, interruptible, timeout_at};
+use axpoll::{
+    IoEvents, NestedRegistrationError, PollRegistration, PollRegistrationError, Pollable,
+    PreparedPollRegistration, RegisterError,
+};
+use axtask::future::{TimeoutError, block_on, interruptible, timeout_at};
 
 use crate::{
     net_stack::NetStack,
@@ -15,6 +18,44 @@ use crate::{
 };
 
 const READY_RETRY_BUDGET: usize = 16;
+
+pub(crate) fn poll_registration_error(error: PollRegistrationError) -> AxError {
+    match error {
+        PollRegistrationError::NoMemory => AxError::NoMemory,
+        PollRegistrationError::Quota
+        | PollRegistrationError::Source {
+            error: RegisterError::Full,
+            ..
+        } => AxError::ResourceBusy,
+        PollRegistrationError::Source {
+            error: RegisterError::TokenSpaceExhausted,
+            ..
+        } => AxError::OutOfRange,
+        PollRegistrationError::Source {
+            error: RegisterError::Closed,
+            ..
+        }
+        | PollRegistrationError::TopologyCapacity { .. }
+        | PollRegistrationError::InvalidState => AxError::BadState,
+        PollRegistrationError::Nested { error, .. } => nested_registration_error(error),
+        _ => AxError::BadState,
+    }
+}
+
+fn nested_registration_error(error: NestedRegistrationError) -> AxError {
+    match error {
+        NestedRegistrationError::NoMemory => AxError::NoMemory,
+        NestedRegistrationError::Quota | NestedRegistrationError::Source(RegisterError::Full) => {
+            AxError::ResourceBusy
+        }
+        NestedRegistrationError::Source(RegisterError::TokenSpaceExhausted) => AxError::OutOfRange,
+        NestedRegistrationError::Source(RegisterError::Closed)
+        | NestedRegistrationError::TopologyCapacity { .. }
+        | NestedRegistrationError::Nested
+        | NestedRegistrationError::InvalidState => AxError::BadState,
+        _ => AxError::BadState,
+    }
+}
 
 const fn receive_timeout_error() -> AxError {
     // Linux reports expiry of SO_RCVTIMEO as EAGAIN/EWOULDBLOCK. ETIMEDOUT is
@@ -108,7 +149,7 @@ impl GeneralOptions {
     /// manufacture a wakeup that Linux does not provide.
     pub fn add_pending_error_event(&self, events: IoEvents) -> IoEvents {
         if self.pending_error.load(Ordering::Acquire) != 0 {
-            events | IoEvents::ERR
+            events | IoEvents::ERROR
         } else {
             events
         }
@@ -130,10 +171,13 @@ impl GeneralOptions {
         self.device_mask.load(Ordering::Acquire)
     }
 
-    pub fn register_waker(&self, stack: &NetStack, waker: &Waker) {
-        stack
-            .get_service()
-            .register_waker(self.device_mask(), waker);
+    pub fn arm_waker<'a>(
+        &self,
+        stack: &'a NetStack,
+        prepared: &mut PreparedPollRegistration<'a>,
+        waker: &Waker,
+    ) -> Result<(), PollRegistrationError> {
+        stack.arm_readiness(prepared, self.device_mask(), waker)
     }
 
     pub fn connect_poller<P: Pollable, F: FnMut() -> AxResult<T>, T>(
@@ -143,7 +187,7 @@ impl GeneralOptions {
     ) -> AxResult<T> {
         self.run_poller(
             pollable,
-            IoEvents::OUT,
+            IoEvents::WRITABLE,
             self.send_timeout(),
             PollBehavior {
                 timeout_error: AxError::TimedOut,
@@ -165,7 +209,7 @@ impl GeneralOptions {
         // a failed nonblocking connect remains observable through SO_ERROR.
         self.run_poller(
             pollable,
-            IoEvents::OUT,
+            IoEvents::WRITABLE,
             self.send_timeout(),
             PollBehavior {
                 timeout_error: AxError::TimedOut,
@@ -192,7 +236,7 @@ impl GeneralOptions {
     ) -> AxResult<T> {
         self.run_poller(
             pollable,
-            IoEvents::IN,
+            IoEvents::READABLE,
             self.recv_timeout(),
             PollBehavior {
                 timeout_error: receive_timeout_error(),
@@ -236,7 +280,7 @@ impl GeneralOptions {
                 return Err(behavior.timeout_error);
             }
             let events = pollable.poll();
-            if events.intersects(interest | IoEvents::ALWAYS_POLL) {
+            if events.intersects(interest | IoEvents::ALWAYS) {
                 ready_retries += 1;
                 if ready_retries >= READY_RETRY_BUDGET {
                     axtask::yield_now();
@@ -246,24 +290,47 @@ impl GeneralOptions {
             }
             ready_retries = 0;
 
+            let mut registration: Option<PollRegistration<'_>> = None;
             match block_on(timeout_at(
                 deadline,
                 interruptible(poll_fn(|cx| {
-                    if pollable.poll().intersects(interest | IoEvents::ALWAYS_POLL) {
-                        return Poll::Ready(());
+                    if pollable.poll().intersects(interest | IoEvents::ALWAYS) {
+                        registration.take();
+                        return Poll::Ready(Ok(()));
                     }
 
-                    pollable.register(cx, interest);
-                    if pollable.poll().intersects(interest | IoEvents::ALWAYS_POLL) {
-                        Poll::Ready(())
+                    let needs_registration = if let Some(retained) = registration.as_mut() {
+                        if retained.update(cx.waker()).is_ok() {
+                            false
+                        } else {
+                            retained.cancel();
+                            true
+                        }
+                    } else {
+                        true
+                    };
+                    if needs_registration {
+                        match pollable.register(cx, interest) {
+                            Ok(retained) => registration = Some(retained),
+                            Err(error) => {
+                                return Poll::Ready(Err(poll_registration_error(error)));
+                            }
+                        }
+                    }
+                    if pollable.poll().intersects(interest | IoEvents::ALWAYS) {
+                        registration.take();
+                        Poll::Ready(Ok(()))
                     } else {
                         Poll::Pending
                     }
                 })),
             )) {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => return Err(AxError::Interrupted),
-                Err(_) => return Err(behavior.timeout_error),
+                Ok(Ok(Ok(Ok(())))) => {}
+                Ok(Ok(Ok(Err(error)))) => return Err(error),
+                Ok(Ok(Err(_))) => return Err(AxError::Interrupted),
+                Ok(Err(TimeoutError::Elapsed(_))) => return Err(behavior.timeout_error),
+                Ok(Err(TimeoutError::Timer(error))) => return Err(error.into()),
+                Err(error) => return Err(error.into()),
             }
         }
     }
@@ -336,10 +403,16 @@ mod tests {
 
     impl Pollable for Ready {
         fn poll(&self) -> IoEvents {
-            IoEvents::OUT
+            IoEvents::WRITABLE
         }
 
-        fn register(&self, _context: &mut core::task::Context<'_>, _events: IoEvents) {}
+        fn register<'a>(
+            &'a self,
+            _context: &mut core::task::Context<'_>,
+            _events: IoEvents,
+        ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+            PollRegistration::empty()
+        }
     }
 
     #[test]
@@ -368,12 +441,37 @@ mod tests {
     }
 
     #[test]
+    fn nested_registration_keeps_resource_failure_category() {
+        assert_eq!(
+            poll_registration_error(PollRegistrationError::Nested {
+                index: 4,
+                error: NestedRegistrationError::NoMemory,
+            }),
+            AxError::NoMemory
+        );
+        assert_eq!(
+            poll_registration_error(PollRegistrationError::Nested {
+                index: 4,
+                error: NestedRegistrationError::Source(RegisterError::Full),
+            }),
+            AxError::ResourceBusy
+        );
+        assert_eq!(
+            poll_registration_error(PollRegistrationError::Nested {
+                index: 4,
+                error: NestedRegistrationError::Source(RegisterError::TokenSpaceExhausted),
+            }),
+            AxError::OutOfRange
+        );
+    }
+
+    #[test]
     fn pending_error_sets_readiness_and_precedes_send_attempt() {
         let options = GeneralOptions::new();
         options.set_pending_error(LinuxError::ECONNREFUSED);
-        let events = options.add_pending_error_event(IoEvents::OUT);
-        assert!(events.contains(IoEvents::OUT));
-        assert!(events.contains(IoEvents::ERR));
+        let events = options.add_pending_error_event(IoEvents::WRITABLE);
+        assert!(events.contains(IoEvents::WRITABLE));
+        assert!(events.contains(IoEvents::ERROR));
 
         let mut attempted = false;
         let error = options
@@ -384,9 +482,9 @@ mod tests {
             .unwrap_err();
         assert_eq!(LinuxError::from(error), LinuxError::ECONNREFUSED);
         assert!(!attempted);
-        let events = options.add_pending_error_event(IoEvents::OUT);
-        assert!(events.contains(IoEvents::OUT));
-        assert!(!events.contains(IoEvents::ERR));
+        let events = options.add_pending_error_event(IoEvents::WRITABLE);
+        assert!(events.contains(IoEvents::WRITABLE));
+        assert!(!events.contains(IoEvents::ERROR));
 
         assert_eq!(
             options.send_poller_with_nonblocking(&Ready, false, || Ok(1usize)),

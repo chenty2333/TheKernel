@@ -1,19 +1,69 @@
-use alloc::{collections::VecDeque, string::ToString};
+use alloc::string::String;
 use core::{
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    time::Duration,
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll},
 };
 
 use axdriver::prelude::*;
 use axerrno::{AxError, AxResult, ax_bail};
+use axpoll::{RegisterError, UpdateError};
 use axsync::Mutex;
-use axtask::future::{block_on, interruptible};
+use axtask::future::{
+    IrqWakerRegisterError, IrqWakerToken, IrqWakerUpdateError, block_on, cancel_irq_waker,
+    interruptible, register_irq_waker, update_irq_waker,
+};
 
 use crate::vsock::connection_manager::VSOCK_CONN_MANAGER;
 
 // we need a global and static only one vsock device
 static VSOCK_DEVICE: Mutex<Option<AxVsockDevice>> = Mutex::new(None);
-static PENDING_EVENTS: Mutex<VecDeque<VsockDriverEvent>> = Mutex::new(VecDeque::new());
+static VSOCK_IRQ: Mutex<Option<usize>> = Mutex::new(None);
+
+const PENDING_EVENT_CAPACITY: usize = 256;
+
+struct PendingEvents {
+    slots: [Option<VsockDriverEvent>; PENDING_EVENT_CAPACITY],
+    head: usize,
+    len: usize,
+}
+
+impl PendingEvents {
+    const fn new() -> Self {
+        Self {
+            slots: [const { None }; PENDING_EVENT_CAPACITY],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn push_back(&mut self, event: VsockDriverEvent) -> Result<(), VsockDriverEvent> {
+        if self.len == PENDING_EVENT_CAPACITY {
+            return Err(event);
+        }
+        let index = (self.head + self.len) % PENDING_EVENT_CAPACITY;
+        self.slots[index] = Some(event);
+        self.len += 1;
+        Ok(())
+    }
+
+    fn pop_front(&mut self) -> Option<VsockDriverEvent> {
+        if self.len == 0 {
+            return None;
+        }
+        let event = self.slots[self.head].take();
+        self.head = (self.head + 1) % PENDING_EVENT_CAPACITY;
+        self.len -= 1;
+        event
+    }
+
+    const fn len(&self) -> usize {
+        self.len
+    }
+}
+
+static PENDING_EVENTS: Mutex<PendingEvents> = Mutex::new(PendingEvents::new());
 
 const VSOCK_RX_TMPBUF_SIZE: usize = 0x1000; // 4KiB buffer for vsock receive
 
@@ -23,66 +73,56 @@ pub fn register_vsock_device(dev: AxVsockDevice) -> AxResult {
     if guard.is_some() {
         ax_bail!(AlreadyExists, "vsock device already registered");
     }
+    let irq = dev.irq_num().ok_or(AxError::OperationNotSupported)?;
+    // This wrapper exclusively owns the discovered vsock device and its IRQ
+    // capability. Generic waker registration never enables hardware.
+    axhal::irq::set_enable(irq, true);
     *guard = Some(dev);
+    *VSOCK_IRQ.lock() = Some(irq);
     drop(guard);
     Ok(())
 }
 
 static POLL_REF_COUNT: Mutex<usize> = Mutex::new(0);
 static POLL_TASK_RUNNING: AtomicBool = AtomicBool::new(false);
-static POLL_FREQUENCY: PollFrequencyController = PollFrequencyController::new();
+static EVENT_TASK: Mutex<Option<axtask::AxTaskRef>> = Mutex::new(None);
 
-struct PollFrequencyController {
-    consecutive_idle: AtomicU64,
+fn rollback_poll_charge(count: &mut usize) -> AxResult<()> {
+    let previous = count.checked_sub(1).ok_or(AxError::BadState)?;
+    *count = previous;
+    Ok(())
 }
 
-impl PollFrequencyController {
-    const fn new() -> Self {
-        Self {
-            consecutive_idle: AtomicU64::new(0),
-        }
-    }
-
-    fn current_interval(&self) -> Duration {
-        let idle = self.consecutive_idle.load(Ordering::Relaxed);
-        let interval_us = match idle {
-            0..=3 => 100,     //  3 ：100μs
-            4..=10 => 500,    // 4-10 ：500μs
-            11..=20 => 2_000, // 11-20 ：2ms
-            _ => 10_000,      // 20+ ：10ms
-        };
-        Duration::from_micros(interval_us)
-    }
-
-    fn on_event(&self) {
-        self.consecutive_idle.store(0, Ordering::Release);
-    }
-
-    fn on_idle(&self) {
-        self.consecutive_idle.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn stats(&self) -> (u64, u64) {
-        let idle = self.consecutive_idle.load(Ordering::Relaxed);
-        let interval = self.current_interval().as_micros() as u64;
-        (idle, interval)
-    }
-}
-
-pub fn start_vsock_poll() {
+fn rollback_vsock_poll_charge() -> AxResult<()> {
     let mut count = POLL_REF_COUNT.lock();
-    *count += 1;
+    rollback_poll_charge(&mut count)
+}
+
+pub fn start_vsock_poll() -> AxResult<()> {
+    let mut count = POLL_REF_COUNT.lock();
+    *count = count.checked_add(1).ok_or(AxError::OutOfRange)?;
     let new_count = *count;
-    debug!("start_vsock_poll: ref_count -> {}", new_count);
-    if new_count == 1 {
-        if !POLL_TASK_RUNNING.swap(true, Ordering::SeqCst) {
-            drop(count);
-            debug!("Starting vsock poll task");
-            axtask::spawn_with_name(vsock_poll_loop, "vsock-poll".to_string());
-        } else {
-            warn!("Poll task already running!");
+    debug!("start_vsock_poll: ref_count -> {new_count}");
+    if !POLL_TASK_RUNNING.swap(true, Ordering::SeqCst) {
+        drop(count);
+        debug!("Starting IRQ-backed vsock event task");
+        let mut name = String::new();
+        if name.try_reserve_exact("vsock-event".len()).is_err() {
+            POLL_TASK_RUNNING.store(false, Ordering::SeqCst);
+            rollback_vsock_poll_charge()?;
+            return Err(AxError::NoMemory);
+        }
+        name.push_str("vsock-event");
+        match axtask::spawn_with_name(vsock_poll_loop, name) {
+            Ok(task) => *EVENT_TASK.lock() = Some(task),
+            Err(error) => {
+                POLL_TASK_RUNNING.store(false, Ordering::SeqCst);
+                rollback_vsock_poll_charge()?;
+                return Err(error);
+            }
         }
     }
+    Ok(())
 }
 
 pub fn stop_vsock_poll() {
@@ -97,51 +137,134 @@ pub fn stop_vsock_poll() {
     debug!("stop_vsock_poll: ref_count -> {new_count}");
 }
 
-fn vsock_poll_loop() {
-    loop {
-        let ref_count = *POLL_REF_COUNT.lock();
-        if ref_count == 0 {
-            POLL_TASK_RUNNING.store(false, Ordering::SeqCst);
-            debug!("Vsock poll task exiting (no active connections)");
-            break;
-        }
-        let _ = block_on(interruptible(poll_interfaces_adaptive()));
+/// Wakes the event task after userspace frees receive-buffer capacity needed
+/// by a bounded deferred driver event.
+pub fn notify_vsock_rx_capacity() {
+    if let Some(task) = EVENT_TASK.lock().as_ref() {
+        task.interrupt();
     }
 }
 
-async fn poll_interfaces_adaptive() -> AxResult<()> {
-    let has_events = poll_vsock_interfaces()?;
+fn vsock_poll_loop() {
+    let Some(irq) = *VSOCK_IRQ.lock() else {
+        warn!("vsock event task started without an IRQ source");
+        POLL_TASK_RUNNING.store(false, Ordering::SeqCst);
+        return;
+    };
+    loop {
+        match block_on(interruptible(VsockEventWait::new(irq))) {
+            Ok(Ok(Ok(()))) => axtask::yield_now(),
+            Ok(Ok(Err(error))) => {
+                warn!("vsock IRQ wait failed: {error:?}");
+                break;
+            }
+            Ok(Err(_)) => {
+                axtask::current().clear_interrupt();
+            }
+            Err(error) => {
+                warn!("vsock poll task could not block: {error:?}");
+                break;
+            }
+        }
+    }
+    EVENT_TASK.lock().take();
+    POLL_TASK_RUNNING.store(false, Ordering::SeqCst);
+}
 
-    if has_events {
-        POLL_FREQUENCY.on_event();
-    } else {
-        POLL_FREQUENCY.on_idle();
+struct VsockEventWait {
+    irq: usize,
+    token: Option<IrqWakerToken>,
+}
+
+impl VsockEventWait {
+    const fn new(irq: usize) -> Self {
+        Self { irq, token: None }
     }
 
-    let interval = POLL_FREQUENCY.current_interval();
-
-    let (idle_count, interval_us) = POLL_FREQUENCY.stats();
-    if idle_count > 0 && idle_count % 10 == 0 {
-        trace!("Poll frequency: idle_count={idle_count}, interval={interval_us}μs",);
+    fn cancel(&mut self) {
+        if let Some(token) = self.token.take() {
+            cancel_irq_waker(token);
+        }
     }
-    axtask::future::sleep(interval).await;
-    Ok(())
+}
+
+impl Future for VsockEventWait {
+    type Output = AxResult<()>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let irq_consumed = if let Some(token) = self.token {
+            match update_irq_waker(token, context.waker()) {
+                Ok(()) => false,
+                Err(IrqWakerUpdateError::Registration(UpdateError::InvalidToken)) => {
+                    self.token = None;
+                    true
+                }
+                Err(IrqWakerUpdateError::Registration(UpdateError::Closed))
+                | Err(IrqWakerUpdateError::InvalidSource) => {
+                    self.cancel();
+                    return Poll::Ready(Err(AxError::BadState));
+                }
+            }
+        } else {
+            match register_irq_waker(self.irq, context.waker()) {
+                Ok(token) => self.token = Some(token),
+                Err(error) => return Poll::Ready(Err(map_irq_wait_error(error))),
+            }
+            false
+        };
+
+        match poll_vsock_interfaces() {
+            Ok(true) => {
+                self.cancel();
+                Poll::Ready(Ok(()))
+            }
+            Ok(false) if irq_consumed => Poll::Ready(Ok(())),
+            Ok(false) => Poll::Pending,
+            Err(error) => {
+                self.cancel();
+                Poll::Ready(Err(error))
+            }
+        }
+    }
+}
+
+impl Drop for VsockEventWait {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+fn map_irq_wait_error(error: IrqWakerRegisterError) -> AxError {
+    match error {
+        IrqWakerRegisterError::Waiter(RegisterError::Full)
+        | IrqWakerRegisterError::SourceCapacityExhausted
+        | IrqWakerRegisterError::HookInstallationInProgress => AxError::ResourceBusy,
+        IrqWakerRegisterError::Waiter(RegisterError::TokenSpaceExhausted) => AxError::OutOfRange,
+        IrqWakerRegisterError::Waiter(RegisterError::Closed)
+        | IrqWakerRegisterError::HookUnavailable => AxError::BadState,
+    }
 }
 
 fn poll_vsock_interfaces() -> AxResult<bool> {
     let mut guard = VSOCK_DEVICE.lock();
     let dev = guard.as_mut().ok_or(AxError::NotFound)?;
     let mut event_count = 0;
-    let mut buf = alloc::vec![0; VSOCK_RX_TMPBUF_SIZE];
+    let mut buf = [0; VSOCK_RX_TMPBUF_SIZE];
 
-    // Process pending events first
-    // Use core::mem::take to atomically move all events out and empty the global queue
-    let pending_events = core::mem::take(&mut *PENDING_EVENTS.lock());
-    for event in pending_events {
+    // Process at most the fixed pending capacity before polling fresh device
+    // events. Events requeued for backpressure are deferred to the next
+    // bounded worker iteration.
+    let pending_budget = PENDING_EVENTS.lock().len();
+    event_count += pending_budget;
+    for _ in 0..pending_budget {
+        let Some(event) = PENDING_EVENTS.lock().pop_front() else {
+            break;
+        };
         handle_vsock_event(event, dev, &mut buf);
     }
 
-    loop {
+    const DRIVER_EVENT_BUDGET: usize = 256;
+    for _ in 0..DRIVER_EVENT_BUDGET {
         match dev.poll_event() {
             Ok(None) => break, // no more events
             Ok(Some(event)) => {
@@ -149,8 +272,7 @@ fn poll_vsock_interfaces() -> AxResult<bool> {
                 handle_vsock_event(event, dev, &mut buf);
             }
             Err(e) => {
-                info!("Failed to poll vsock event: {e:?}");
-                break;
+                return Err(map_dev_err(e));
             }
         }
     }
@@ -177,17 +299,44 @@ fn handle_vsock_event(event: VsockDriverEvent, dev: &mut AxVsockDevice, buf: &mu
             };
 
             if free_space == 0 {
-                PENDING_EVENTS
+                if PENDING_EVENTS
                     .lock()
-                    .push_back(VsockDriverEvent::Received(conn_id, len));
+                    .push_back(VsockDriverEvent::Received(conn_id, len))
+                    .is_err()
+                {
+                    warn!("bounded vsock deferred-event queue is full; aborting {conn_id:?}");
+                    if let Err(error) = dev.abort(conn_id) {
+                        warn!("failed to abort overflowed vsock connection: {error:?}");
+                    }
+                    if let Err(error) = manager.on_disconnected(conn_id) {
+                        warn!("failed to publish overflow disconnect: {error:?}");
+                    }
+                }
                 return;
             }
 
-            let max_read = core::cmp::min(free_space, buf.len());
+            let max_read = free_space.min(buf.len()).min(len);
             match dev.recv(conn_id, &mut buf[..max_read]) {
                 Ok(read_len) => {
                     if let Err(e) = manager.on_data_received(conn_id, &buf[..read_len]) {
                         info!("Failed to handle received data: conn_id={conn_id:?}, error={e:?}",);
+                    }
+                    if read_len < len
+                        && PENDING_EVENTS
+                            .lock()
+                            .push_back(VsockDriverEvent::Received(conn_id, len - read_len))
+                            .is_err()
+                    {
+                        warn!(
+                            "bounded vsock deferred-event queue overflowed a partial receive; \
+                             aborting {conn_id:?}"
+                        );
+                        if let Err(error) = dev.abort(conn_id) {
+                            warn!("failed to abort overflowed vsock connection: {error:?}");
+                        }
+                        if let Err(error) = manager.on_disconnected(conn_id) {
+                            warn!("failed to publish overflow disconnect: {error:?}");
+                        }
                     }
                 }
                 Err(e) => {
@@ -210,10 +359,7 @@ fn handle_vsock_event(event: VsockDriverEvent, dev: &mut AxVsockDevice, buf: &mu
 
         VsockDriverEvent::CreditUpdate(conn_id) => {
             if let Err(e) = manager.on_credit_update(conn_id) {
-                warn!(
-                    "Failed to handle credit update: {:?}, error={:?}",
-                    conn_id, e
-                );
+                warn!("Failed to handle credit update: {conn_id:?}, error={e:?}");
             }
         }
 
@@ -232,9 +378,12 @@ fn map_dev_err(e: DevError) -> AxError {
     match e {
         DevError::AlreadyExists => AxError::AlreadyExists,
         DevError::Again => AxError::WouldBlock,
+        DevError::BadState => AxError::BadState,
         DevError::InvalidParam => AxError::InvalidInput,
         DevError::Io => AxError::Io,
-        _ => AxError::BadState,
+        DevError::NoMemory => AxError::NoMemory,
+        DevError::ResourceBusy => AxError::ResourceBusy,
+        DevError::Unsupported => AxError::Unsupported,
     }
 }
 
@@ -258,7 +407,7 @@ pub fn vsock_send(conn_id: VsockConnId, buf: &[u8]) -> AxResult<usize> {
                 let manager = VSOCK_CONN_MANAGER.lock();
                 if let Some(conn) = manager.get_connection(conn_id) {
                     drop(manager);
-                    conn.lock().wait_for_tx();
+                    conn.lock().wait_for_tx()?;
                 };
             }
             Err(e) => return Err(map_dev_err(e)),
@@ -277,4 +426,20 @@ pub fn vsock_guest_cid() -> AxResult<u64> {
     let mut guard = VSOCK_DEVICE.lock();
     let dev = guard.as_mut().ok_or(AxError::NotFound)?;
     Ok(dev.guest_cid())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_charge_rollback_is_exact_and_preserves_underflow_state() {
+        let mut count = 2;
+        rollback_poll_charge(&mut count).unwrap();
+        assert_eq!(count, 1);
+
+        let mut empty = 0;
+        assert_eq!(rollback_poll_charge(&mut empty), Err(AxError::BadState));
+        assert_eq!(empty, 0);
+    }
 }

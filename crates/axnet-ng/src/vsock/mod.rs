@@ -9,7 +9,7 @@ use core::task::Context;
 pub use axdriver::prelude::{VsockAddr, VsockConnId};
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::{IoBuf, IoBufMut, Read, Write};
-use axpoll::{IoEvents, Pollable};
+use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use enum_dispatch::enum_dispatch;
 
 pub use self::stream::VsockStreamTransport;
@@ -59,7 +59,11 @@ impl Pollable for VsockTransport {
         }
     }
 
-    fn register(&self, context: &mut core::task::Context<'_>, events: IoEvents) {
+    fn register<'a>(
+        &'a self,
+        context: &mut core::task::Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
         match self {
             VsockTransport::Stream(stream) => stream.register(context, events),
             // VsockTransport::Dgram(dgram) => dgram.register(context, events),
@@ -155,7 +159,11 @@ impl Pollable for VsockSocket {
         self.transport.poll()
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        self.transport.register(context, events);
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+        self.transport.register(context, events)
     }
 }

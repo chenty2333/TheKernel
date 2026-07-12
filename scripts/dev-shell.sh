@@ -15,6 +15,8 @@ Usage:
 Environment:
   OSKERNEL_DEV_IMAGE         Docker image tag (default: thekernel-dev:local)
   OSCOMP_TESTSUITE_HOST_DIR  Host path mounted read-only at /opt/oskernel/testsuites
+  THEKERNEL_AX_REPO          Maintained thekernel-ax checkout (default: ../thekernel-ax)
+  THEKERNEL_LINUX_ABI_REPO   Maintained Linux ABI checkout (default: ../thekernel-linux-abi)
 EOF
 }
 
@@ -60,6 +62,38 @@ export LOCAL_UID="$(id -u)"
 export LOCAL_GID="$(id -g)"
 
 run_args=(run --rm --remove-orphans)
+
+canonical_sibling() {
+    local label=$1
+    local path=$2
+    case "$path" in
+        /*) ;;
+        *) path="$REPO_ROOT/$path" ;;
+    esac
+    [ -d "$path" ] || {
+        printf 'dev-shell: missing %s checkout: %s\n' "$label" "$path" >&2
+        exit 2
+    }
+    path=$(cd -- "$path" && pwd -P)
+    [ -f "$path/Cargo.toml" ] || {
+        printf 'dev-shell: %s checkout has no Cargo.toml: %s\n' "$label" "$path" >&2
+        exit 2
+    }
+    printf '%s\n' "$path"
+}
+
+# Cargo resolves the maintained sibling patches from /workspace/.. inside the
+# container. Bind the exact developer checkouts at those resulting absolute
+# paths so normal container builds exercise the same sources as host checks.
+ax_repo=$(canonical_sibling \
+    thekernel-ax "${THEKERNEL_AX_REPO:-$REPO_ROOT/../thekernel-ax}")
+linux_abi_repo=$(canonical_sibling \
+    thekernel-linux-abi \
+    "${THEKERNEL_LINUX_ABI_REPO:-$REPO_ROOT/../thekernel-linux-abi}")
+run_args+=(
+    --volume "$ax_repo:/thekernel-ax:ro,z"
+    --volume "$linux_abi_repo:/thekernel-linux-abi:ro,z"
+)
 
 # A linked worktree stores a small `.git` file whose gitdir points into the
 # primary checkout. The regular /workspace bind does not include that external

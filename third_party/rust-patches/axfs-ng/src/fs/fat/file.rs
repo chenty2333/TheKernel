@@ -5,7 +5,7 @@ use axfs_ng_vfs::{
     DirEntry, FileNode, FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps,
     NodeType, Reference, VfsError, VfsResult,
 };
-use axpoll::{IoEvents, Pollable};
+use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use fatfs::{Read, Seek, SeekFrom, Write};
 
 use super::{
@@ -209,10 +209,16 @@ impl FileNodeOps for FatFileNode {
 
 impl Pollable for FatFileNode {
     fn poll(&self) -> IoEvents {
-        IoEvents::IN | IoEvents::OUT
+        IoEvents::READABLE | IoEvents::WRITABLE
     }
 
-    fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+    fn register<'a>(
+        &'a self,
+        _context: &mut Context<'_>,
+        _events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+        PollRegistration::empty()
+    }
 }
 
 impl Drop for FatFileNode {

@@ -2,7 +2,12 @@ use alloc::{string::String, vec};
 use core::task::Waker;
 
 use axdriver::prelude::*;
-use axtask::future::register_irq_waker;
+use axpoll::{PollRegistrationError, RegisterError, UpdateError};
+use axsync::spin::SpinNoIrq;
+use axtask::future::{
+    IrqWakerRegisterError, IrqWakerToken, IrqWakerUpdateError, cancel_irq_waker,
+    register_irq_waker, update_irq_waker,
+};
 use hashbrown::HashMap;
 use smoltcp::{
     storage::{PacketBuffer, PacketMetadata},
@@ -28,9 +33,11 @@ struct Neighbor {
 pub struct EthernetDevice {
     name: String,
     inner: AxNetDevice,
+    irq: Option<usize>,
     neighbors: HashMap<IpAddress, Option<Neighbor>>,
     ip: Ipv4Cidr,
     stats: DeviceStats,
+    irq_registration: SpinNoIrq<Option<IrqWakerToken>>,
 
     pending_packets: PacketBuffer<'static, IpAddress>,
 }
@@ -38,6 +45,13 @@ impl EthernetDevice {
     const NEIGHBOR_TTL: Duration = Duration::from_secs(60);
 
     pub fn new(name: String, inner: AxNetDevice, ip: Ipv4Cidr) -> Self {
+        let irq = inner.irq_num();
+        if let Some(irq) = irq {
+            // `EthernetDevice` owns the probed NIC and therefore owns the
+            // platform interrupt capability. Waker registration is a generic
+            // dispatch mechanism and deliberately does not enable hardware.
+            axhal::irq::set_enable(irq, true);
+        }
         let pending_packets = PacketBuffer::new(
             vec![PacketMetadata::EMPTY; ETHERNET_MAX_PENDING_PACKETS],
             vec![
@@ -49,9 +63,11 @@ impl EthernetDevice {
         Self {
             name,
             inner,
+            irq,
             neighbors: HashMap::new(),
             ip,
             stats: DeviceStats::default(),
+            irq_registration: SpinNoIrq::new(None),
 
             pending_packets,
         }
@@ -74,7 +90,7 @@ impl EthernetDevice {
     {
         if let Err(err) = inner.recycle_tx_buffers() {
             stats.record_tx_error();
-            warn!("recycle_tx_buffers failed: {:?}", err);
+            warn!("recycle_tx_buffers failed: {err:?}");
             return;
         }
 
@@ -88,7 +104,7 @@ impl EthernetDevice {
             Ok(buf) => buf,
             Err(err) => {
                 stats.record_tx_drop();
-                warn!("alloc_tx_buffer failed: {:?}", err);
+                warn!("alloc_tx_buffer failed: {err:?}");
                 return;
             }
         };
@@ -106,7 +122,7 @@ impl EthernetDevice {
             Err(err) => {
                 stats.record_tx_error();
                 stats.record_tx_drop();
-                warn!("transmit failed: {:?}", err);
+                warn!("transmit failed: {err:?}");
             }
         }
     }
@@ -155,10 +171,10 @@ impl EthernetDevice {
 
     fn request_arp(&mut self, target_ip: IpAddress) {
         let IpAddress::Ipv4(target_ipv4) = target_ip else {
-            warn!("IPv6 address ARP is not supported: {}", target_ip);
+            warn!("IPv6 address ARP is not supported: {target_ip}");
             return;
         };
-        debug!("Requesting ARP for {}", target_ipv4);
+        debug!("Requesting ARP for {target_ipv4}");
 
         let arp_repr = ArpRepr::EthernetIpv4 {
             operation: ArpOperation::Request,
@@ -217,7 +233,7 @@ impl EthernetDevice {
                 return;
             }
 
-            debug!("ARP: {} -> {}", source_protocol_addr, source_hardware_addr);
+            debug!("ARP: {source_protocol_addr} -> {source_hardware_addr}");
             self.neighbors.insert(
                 IpAddress::Ipv4(source_protocol_addr),
                 Some(Neighbor {
@@ -310,7 +326,7 @@ impl Device for EthernetDevice {
                 Err(err) => {
                     if !matches!(err, DevError::Again) {
                         self.stats.record_rx_error();
-                        warn!("receive failed: {:?}", err);
+                        warn!("receive failed: {err:?}");
                     }
                     return false;
                 }
@@ -325,7 +341,7 @@ impl Device for EthernetDevice {
             let result = self.handle_frame(rx_buf.packet(), buffer, timestamp);
             if let Err(err) = self.inner.recycle_rx_buffer(rx_buf) {
                 self.stats.record_rx_error();
-                warn!("recycle_rx_buffer failed: {:?}", err);
+                warn!("recycle_rx_buffer failed: {err:?}");
                 return false;
             }
             if result {
@@ -385,9 +401,51 @@ impl Device for EthernetDevice {
         false
     }
 
-    fn register_waker(&self, waker: &Waker) {
-        if let Some(irq) = self.inner.irq_num() {
-            register_irq_waker(irq, waker);
+    fn register_waker(&self, waker: &Waker) -> Result<(), PollRegistrationError> {
+        let Some(irq) = self.irq else {
+            return Ok(());
+        };
+
+        let mut registration = self.irq_registration.lock();
+        if let Some(token) = *registration {
+            match update_irq_waker(token, waker) {
+                Ok(()) => return Ok(()),
+                Err(IrqWakerUpdateError::Registration(UpdateError::InvalidToken)) => {
+                    *registration = None;
+                }
+                Err(IrqWakerUpdateError::Registration(UpdateError::Closed)) => {
+                    return Err(PollRegistrationError::Source {
+                        index: 0,
+                        error: RegisterError::Closed,
+                    });
+                }
+                Err(IrqWakerUpdateError::InvalidSource) => {
+                    return Err(PollRegistrationError::InvalidState);
+                }
+            }
+        }
+
+        *registration = Some(register_irq_waker(irq, waker).map_err(map_irq_register_error)?);
+        Ok(())
+    }
+}
+
+fn map_irq_register_error(error: IrqWakerRegisterError) -> PollRegistrationError {
+    match error {
+        IrqWakerRegisterError::Waiter(error) => PollRegistrationError::Source { index: 0, error },
+        IrqWakerRegisterError::SourceCapacityExhausted
+        | IrqWakerRegisterError::HookInstallationInProgress => PollRegistrationError::Quota,
+        IrqWakerRegisterError::HookUnavailable => PollRegistrationError::InvalidState,
+    }
+}
+
+impl Drop for EthernetDevice {
+    fn drop(&mut self) {
+        if let Some(token) = self.irq_registration.get_mut().take() {
+            cancel_irq_waker(token);
+        }
+        if let Some(irq) = self.irq {
+            axhal::irq::set_enable(irq, false);
         }
     }
 }

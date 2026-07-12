@@ -1,17 +1,15 @@
 use alloc::vec::Vec;
-use core::{future::poll_fn, task::Poll};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axpoll::PollSet;
 use axsync::Mutex;
-use axtask::{
-    current_may_uninit,
-    future::{block_on, interruptible},
-};
+use axtask::current_may_uninit;
 use hashbrown::{HashMap, HashSet};
 use lazy_static::lazy_static;
 use linux_raw_sys::general::{F_RDLCK, F_UNLCK, F_WRLCK, SEEK_CUR, SEEK_END, SEEK_SET, flock64};
 use starry_process::Pid;
+
+use crate::readiness::block_on_poll_set;
 
 /// Inode identity: (device, inode number).
 pub(crate) type InodeId = (u64, u64);
@@ -390,11 +388,11 @@ fn record_lock_blocking(
     owner: RecordLockOwner,
     req: RecordLockRequest,
 ) -> AxResult<()> {
-    let result = match block_on(interruptible(poll_fn(|cx| {
+    let result = block_on_poll_set(&RECORD_LOCK_WAITERS, || {
         match try_set_record_lock(id, owner, req) {
-            Ok(true) => return Poll::Ready(Ok(())),
+            Ok(true) => return Ok(()),
             Ok(false) => {}
-            Err(error) => return Poll::Ready(Err(error)),
+            Err(error) => return Err(error),
         }
 
         let admission: AxResult<()> = (|| {
@@ -424,20 +422,10 @@ fn record_lock_blocking(
             Ok(())
         })();
         if let Err(error) = admission {
-            return Poll::Ready(Err(error));
+            return Err(error);
         }
-
-        // Waker clone and replacement occur without the record-table lock.
-        RECORD_LOCK_WAITERS.register(cx.waker());
-        match try_set_record_lock(id, owner, req) {
-            Ok(true) => Poll::Ready(Ok(())),
-            Ok(false) => Poll::Pending,
-            Err(error) => Poll::Ready(Err(error)),
-        }
-    }))) {
-        Ok(res) => res,
-        Err(err) => Err(err.into()),
-    };
+        Err(AxError::WouldBlock)
+    });
     if result.is_err() {
         let _ = RECORD_LOCK_TABLE.lock().wait_requests.remove(&owner);
     }
@@ -875,42 +863,26 @@ pub(crate) fn release_owner_batch(owner: FlockOwner, budget: usize) -> bool {
 
 /// Acquire a shared lock, blocking if necessary.
 fn lock_shared_blocking(id: InodeId, owner: FlockOwner) -> AxResult<()> {
-    match block_on(interruptible(poll_fn(|cx| {
+    block_on_poll_set(&FLOCK_WAITERS, || {
         match try_lock_shared(id, owner) {
-            Ok(true) => return Poll::Ready(Ok(())),
+            Ok(true) => return Ok(()),
             Ok(false) => {}
-            Err(error) => return Poll::Ready(Err(error)),
+            Err(error) => return Err(error),
         }
-        FLOCK_WAITERS.register(cx.waker());
-        match try_lock_shared(id, owner) {
-            Ok(true) => Poll::Ready(Ok(())),
-            Ok(false) => Poll::Pending,
-            Err(error) => Poll::Ready(Err(error)),
-        }
-    }))) {
-        Ok(res) => res,
-        Err(err) => Err(err.into()),
-    }
+        Err(AxError::WouldBlock)
+    })
 }
 
 /// Acquire an exclusive lock, blocking if necessary.
 fn lock_exclusive_blocking(id: InodeId, owner: FlockOwner) -> AxResult<()> {
-    match block_on(interruptible(poll_fn(|cx| {
+    block_on_poll_set(&FLOCK_WAITERS, || {
         match try_lock_exclusive(id, owner) {
-            Ok(true) => return Poll::Ready(Ok(())),
+            Ok(true) => return Ok(()),
             Ok(false) => {}
-            Err(error) => return Poll::Ready(Err(error)),
+            Err(error) => return Err(error),
         }
-        FLOCK_WAITERS.register(cx.waker());
-        match try_lock_exclusive(id, owner) {
-            Ok(true) => Poll::Ready(Ok(())),
-            Ok(false) => Poll::Pending,
-            Err(error) => Poll::Ready(Err(error)),
-        }
-    }))) {
-        Ok(res) => res,
-        Err(err) => Err(err.into()),
-    }
+        Err(AxError::WouldBlock)
+    })
 }
 
 /// Perform a flock operation on the given inode identity.

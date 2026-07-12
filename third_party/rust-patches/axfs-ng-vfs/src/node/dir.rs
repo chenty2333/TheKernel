@@ -173,6 +173,19 @@ pub struct RenameRequest<'a> {
     pub dst: Option<&'a DirEntry>,
 }
 
+/// Snapshot of one directory namespace used to revalidate a prepared
+/// Linux-visible mutation before publication.
+///
+/// `cache_generation` covers mutations started through this VFS object while
+/// `backend_epoch` covers the same directory reached through another alias.
+/// Exact source/destination identities remain the final authority inside the
+/// backend's namespace lock.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct NamespaceGeneration {
+    cache_generation: u64,
+    backend_epoch: u64,
+}
+
 /// Options for opening (or creating) a directory entry.
 ///
 /// See [`DirNode::open_file`] for more details.
@@ -320,6 +333,19 @@ impl DirNode {
         self.cache_generation
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1)
+    }
+
+    /// Captures the current local and backend namespace generations.
+    pub fn namespace_generation(&self) -> NamespaceGeneration {
+        NamespaceGeneration {
+            cache_generation: self.cache_generation.load(Ordering::Acquire),
+            backend_epoch: self.ops.namespace_epoch(),
+        }
+    }
+
+    /// Returns whether no namespace mutation has invalidated `generation`.
+    pub fn namespace_generation_is_current(&self, generation: NamespaceGeneration) -> bool {
+        self.namespace_generation() == generation
     }
 
     fn prepare_cache_name(&self, name: &str) -> Option<String> {

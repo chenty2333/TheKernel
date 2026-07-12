@@ -98,7 +98,8 @@ version = "=0.3.0-preview.2"
 optional = true
 
 [dependencies.axtask]
-version = "=0.3.0-preview.2"
+package = "thekernel-axtask"
+version = "=0.1.0"
 optional = true
 
 [dependencies.log]

@@ -10,7 +10,7 @@ use core::{
 use axdriver::prelude::VsockAddr;
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::prelude::*;
-use axpoll::{IoEvents, Pollable};
+use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use bitflags::bitflags;
 use enum_dispatch::enum_dispatch;
 
@@ -250,7 +250,11 @@ impl Pollable for Socket {
         }
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
         match self {
             Socket::Tcp(tcp) => tcp.register(context, events),
             Socket::Udp(udp) => udp.register(context, events),

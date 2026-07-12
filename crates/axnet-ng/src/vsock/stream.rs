@@ -3,7 +3,9 @@ use core::task::Context;
 
 use axerrno::{AxError, AxResult, LinuxError, ax_bail, ax_err_type};
 use axio::prelude::*;
-use axpoll::{IoEvents, Pollable};
+use axpoll::{
+    IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable, PreparedPollRegistration,
+};
 use axsync::Mutex;
 
 use super::connection_manager::*;
@@ -22,6 +24,7 @@ pub struct VsockStreamTransport {
     connection: Mutex<Option<Arc<Mutex<Connection>>>>,
     state: StateLock,
     general: GeneralOptions,
+    poll_state: PollSet,
 }
 
 impl VsockStreamTransport {
@@ -32,6 +35,7 @@ impl VsockStreamTransport {
             connection: Mutex::new(None),
             state: StateLock::new(State::Idle),
             general: GeneralOptions::new(),
+            poll_state: PollSet::new(),
         }
     }
 
@@ -76,13 +80,14 @@ impl VsockTransportOps for VsockStreamTransport {
                 }
                 let conn_id = VsockConnId::listening(local_addr.port);
                 let conn =
-                    manager.create_connection(conn_id, local_addr, None, ConnectionState::Idle);
+                    manager.create_connection(conn_id, local_addr, None, ConnectionState::Idle)?;
 
                 *self.conn_id.lock() = Some(conn_id);
                 *self.connection.lock() = Some(conn);
-                trace!("Vsock binding to {:?}", local_addr);
+                trace!("Vsock binding to {local_addr:?}");
                 Ok(())
             })?;
+        self.poll_state.wake();
         Ok(())
     }
 
@@ -101,9 +106,11 @@ impl VsockTransportOps for VsockStreamTransport {
             vsock_listen(local_addr)?;
             // set state
             conn.lock().set_state(ConnectionState::Listening);
-            trace!("Vsock listening on {:?}", local_addr);
+            trace!("Vsock listening on {local_addr:?}");
             Ok(())
-        })
+        })?;
+        self.poll_state.wake();
+        Ok(())
     }
 
     fn accept(&self) -> AxResult<(VsockTransport, VsockAddr)> {
@@ -131,6 +138,7 @@ impl VsockTransportOps for VsockStreamTransport {
                 connection: Mutex::new(Some(conn)),
                 state: StateLock::new(State::Connected),
                 general: GeneralOptions::default(),
+                poll_state: PollSet::new(),
             };
 
             Ok((VsockTransport::Stream(new_transport), peer_addr))
@@ -183,7 +191,7 @@ impl VsockTransportOps for VsockStreamTransport {
                 local_addr,
                 Some(peer_addr),
                 ConnectionState::Connecting,
-            );
+            )?;
 
             *self.conn_id.lock() = Some(conn_id);
             *self.connection.lock() = Some(conn.clone());
@@ -192,9 +200,11 @@ impl VsockTransportOps for VsockStreamTransport {
 
             // driver connect
             vsock_connect(conn_id)?;
-            debug!("Vsock connecting from {} to {:?}", local_port, peer_addr);
+            debug!("Vsock connecting from {local_port} to {peer_addr:?}");
             Ok(())
         })?;
+
+        self.poll_state.wake();
 
         // wait for connection established
         self.general.connect_poller(self, || {
@@ -307,6 +317,12 @@ impl VsockTransportOps for VsockStreamTransport {
             }
         }
         conn.set_state(ConnectionState::Closed);
+        let rx_poll = conn.rx_poll_source();
+        let connect_poll = conn.connect_poll_source();
+        drop(conn);
+        rx_poll.wake();
+        connect_poll.wake();
+        self.poll_state.wake();
         Ok(())
     }
 
@@ -339,58 +355,86 @@ impl Pollable for VsockStreamTransport {
                 // if there is a pending connection, set IN
                 if let Some(conn_id) = *self.conn_id.lock() {
                     events.set(
-                        IoEvents::IN,
+                        IoEvents::READABLE,
                         VSOCK_CONN_MANAGER.lock().can_accept(conn_id.local_port),
                     );
                 }
             }
             ConnectionState::Connected | ConnectionState::Closed => {
-                events.set(IoEvents::IN, conn.rx_buffer_used() > 0 || conn.rx_closed());
-                events.set(IoEvents::OUT, !conn.tx_closed());
+                events.set(
+                    IoEvents::READABLE,
+                    conn.rx_buffer_used() > 0 || conn.rx_closed(),
+                );
+                events.set(IoEvents::WRITABLE, !conn.tx_closed());
             }
             ConnectionState::Connecting => {
                 // if connected, set OUT
-                events.set(IoEvents::OUT, conn.state() == ConnectionState::Connected);
+                events.set(
+                    IoEvents::WRITABLE,
+                    conn.state() == ConnectionState::Connected,
+                );
             }
             _ => {}
         }
-        events.set(IoEvents::RDHUP, conn.rx_closed());
+        events.set(IoEvents::READ_HANGUP, conn.rx_closed());
         self.general.add_pending_error_event(events)
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if let Ok(conn) = self.get_connection() {
-            let mut conn = conn.lock();
-            match conn.state() {
-                ConnectionState::Listening => {
-                    if events.contains(IoEvents::IN) {
-                        conn.register_accept_poll(context);
-                    }
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+        let dynamic_source = if let Ok(connection) = self.get_connection() {
+            let connection = connection.lock();
+            let state = connection.state();
+            let local_port = connection.local_addr().port;
+            let rx_source = connection.rx_poll_source();
+            let connect_source = connection.connect_poll_source();
+            drop(connection);
+
+            match state {
+                ConnectionState::Listening if events.contains(IoEvents::READABLE) => {
+                    let queue = VSOCK_CONN_MANAGER
+                        .lock()
+                        .get_listen_queue(local_port)
+                        .ok_or(PollRegistrationError::InvalidState)?;
+                    Some(queue.lock().poll_source())
                 }
-                ConnectionState::Connected => {
-                    if events.contains(IoEvents::IN) {
-                        conn.register_rx_poll(context);
-                    }
-                    if events.contains(IoEvents::OUT) {
-                        warn!(
-                            "VsockStreamTransport: OUT event on connected socket is not supported"
-                        );
-                    }
+                ConnectionState::Connected | ConnectionState::Closed
+                    if events.intersects(
+                        IoEvents::READABLE
+                            | IoEvents::READ_HANGUP
+                            | IoEvents::ERROR
+                            | IoEvents::HANGUP,
+                    ) =>
+                {
+                    Some(rx_source)
                 }
-                ConnectionState::Connecting => {
-                    if events.contains(IoEvents::OUT) {
-                        conn.register_connect_poll(context);
-                    }
+                ConnectionState::Connecting if events.contains(IoEvents::WRITABLE) => {
+                    Some(connect_source)
                 }
-                _ => {}
+                _ => None,
             }
+        } else {
+            None
+        };
+
+        let mut prepared =
+            PreparedPollRegistration::try_new(1 + usize::from(dynamic_source.is_some()))?;
+        if let Some(source) = dynamic_source {
+            prepared.arm_owned(source, context.waker())?;
         }
+        prepared.arm(&self.poll_state, context.waker())?;
+        prepared.commit()
     }
 }
 
 impl Drop for VsockStreamTransport {
     fn drop(&mut self) {
-        let _ = self.shutdown(Shutdown::Both);
+        if let Err(error) = self.shutdown(Shutdown::Both) {
+            warn!("failed to shut down dropped vsock stream: {error:?}");
+        }
 
         if let Some(conn_id) = *self.conn_id.lock() {
             VSOCK_CONN_MANAGER.lock().remove_connection(conn_id);

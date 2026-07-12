@@ -6,7 +6,7 @@ use alloc::{
 };
 use core::{
     any::Any,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     task::Context,
 };
 
@@ -19,9 +19,12 @@ use axfs_ng_vfs::{
 };
 use axhal::time::wall_time;
 use axpoll::{IoEvents, Pollable};
+#[cfg(any(not(test), target_os = "none"))]
 use axsync::Mutex;
 use hashbrown::{HashMap, HashSet};
 use spin::Lazy;
+#[cfg(all(test, not(target_os = "none")))]
+use spin::Mutex;
 use starry_process::Pid;
 use starry_signal::{SignalInfo, Signo};
 
@@ -130,9 +133,57 @@ struct PidMembershipRegistry {
     /// Serializes admission and publication. Registry locks are always taken
     /// after this lock, with the global map before per-cgroup member sets.
     operation: Mutex<()>,
-    by_pid: Mutex<HashMap<Pid, Weak<CgroupDir>>>,
+    by_pid: Mutex<HashMap<Pid, CgroupMembership>>,
     global_limit: usize,
     per_cgroup_limit: usize,
+}
+
+/// One publication bit shared by the global PID index and the target cgroup.
+///
+/// Fork preparation installs both index entries with this bit clear. Readers
+/// filter on the bit, while capacity and identity writers still account the
+/// reserved entries. The consuming admission commit is therefore one release
+/// store: it cannot allocate, fail halfway through, or expose only one index.
+struct CgroupMembershipPublication {
+    visible: AtomicBool,
+}
+
+impl CgroupMembershipPublication {
+    const fn new(visible: bool) -> Self {
+        Self {
+            visible: AtomicBool::new(visible),
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        self.visible.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone)]
+struct CgroupMembership {
+    target: Weak<CgroupDir>,
+    publication: Arc<CgroupMembershipPublication>,
+}
+
+impl CgroupMembership {
+    fn is_visible(&self) -> bool {
+        self.publication.is_visible()
+    }
+}
+
+/// Invisible, fully admitted cgroup membership for one fork child.
+///
+/// The token holds no registry lock while clone constructs the child. Dropping
+/// it removes the exact hidden entries from both indexes; consuming it with
+/// [`commit`](Self::commit) publishes both through their shared atomic bit.
+#[must_use = "dropping a cgroup fork admission rolls back the hidden membership"]
+pub(crate) struct CgroupForkAdmission<'a> {
+    registry: &'a PidMembershipRegistry,
+    child_pid: Pid,
+    target: Option<Arc<CgroupDir>>,
+    publication: Option<Arc<CgroupMembershipPublication>>,
+    committed: bool,
 }
 
 static PID_CGROUPS: Lazy<PidMembershipRegistry> = Lazy::new(|| {
@@ -373,7 +424,10 @@ struct CgroupDir {
     namespace_epoch: AtomicU64,
     children: Mutex<HashMap<String, Arc<CgroupDir>>>,
     files: HashMap<&'static str, Arc<CgroupFile>>,
-    pids: Mutex<HashSet<Pid>>,
+    /// PID entries include invisible fork reservations. Every user-visible
+    /// reader filters the shared publication bit; writers count all entries so
+    /// a pending fork cannot overbook capacity or let this directory disappear.
+    pids: Mutex<HashMap<Pid, Arc<CgroupMembershipPublication>>>,
     pids_max: Mutex<Option<u64>>,
     pids_peak: Mutex<u64>,
     pids_events_limit: Mutex<u64>,
@@ -402,7 +456,7 @@ impl CgroupDir {
             namespace_epoch: AtomicU64::new(0),
             children: Mutex::new(HashMap::new()),
             files,
-            pids: Mutex::new(HashSet::new()),
+            pids: Mutex::new(HashMap::new()),
             pids_max: Mutex::new(None),
             pids_peak: Mutex::new(0),
             pids_events_limit: Mutex::new(0),
@@ -507,18 +561,40 @@ impl CgroupDir {
         snapshot
             .try_reserve_exact(pids.len())
             .map_err(|_| VfsError::NoMemory)?;
-        snapshot.extend(pids.iter().copied());
+        snapshot.extend(
+            pids.iter()
+                .filter(|(_, publication)| publication.is_visible())
+                .map(|(&pid, _)| pid),
+        );
         Ok(snapshot)
     }
 
     fn recursive_live_pid_count(&self) -> usize {
-        let local = self.pids.lock().len();
+        let local = self
+            .pids
+            .lock()
+            .values()
+            .filter(|publication| publication.is_visible())
+            .count();
         local
             + self
                 .children
                 .lock()
                 .values()
                 .map(|child| child.recursive_live_pid_count())
+                .sum::<usize>()
+    }
+
+    /// Counts both published members and invisible fork admissions. This is
+    /// used only for admission/limit decisions, never for cgroup reader output.
+    fn recursive_admitted_pid_count(&self) -> usize {
+        let local = self.pids.lock().len();
+        local
+            + self
+                .children
+                .lock()
+                .values()
+                .map(|child| child.recursive_admitted_pid_count())
                 .sum::<usize>()
     }
 
@@ -538,13 +614,25 @@ impl CgroupDir {
         }
     }
 
+    /// Accounts exactly the child owned by one still-hidden fork admission.
+    /// Other pending children remain excluded until their own serialized
+    /// commit, so peak never gets ahead by more than a child that is about to
+    /// be published and can never lag behind pids.current.
+    fn update_pids_peak_for_pending_child(self: &Arc<Self>) {
+        let mut current = Some(self.clone());
+        while let Some(dir) = current {
+            dir.update_pids_peak(dir.recursive_live_pid_count() + 1);
+            current = dir.parent.lock().as_ref().and_then(Weak::upgrade);
+        }
+    }
+
     fn limiting_dir_for_fork(self: &Arc<Self>) -> Option<Arc<CgroupDir>> {
         let mut current = Some(self.clone());
         while let Some(dir) = current {
             if dir.pids_controller_active() {
                 let limit = *dir.pids_max.lock();
                 if let Some(limit) = limit
-                    && dir.recursive_live_pid_count() as u64 + 1 > limit
+                    && dir.recursive_admitted_pid_count() as u64 + 1 > limit
                 {
                     return Some(dir);
                 }
@@ -632,11 +720,6 @@ impl CgroupDir {
         Ok(())
     }
 
-    fn attach_fork_child(self: &Arc<Self>, pid: Pid) -> AxResult<()> {
-        PID_CGROUPS.try_attach(self, pid, true)?;
-        Ok(())
-    }
-
     fn kill_attached(&self) -> VfsResult<()> {
         for pid in self.try_live_pids()? {
             let _ = send_signal_to_process(pid, Some(SignalInfo::new_kernel(Signo::SIGKILL)));
@@ -657,7 +740,11 @@ impl CgroupDir {
         let mut out = String::new();
         out.try_reserve_exact(pids.len().saturating_mul(22))
             .map_err(|_| VfsError::NoMemory)?;
-        for pid in pids.iter() {
+        for pid in pids
+            .iter()
+            .filter(|(_, publication)| publication.is_visible())
+            .map(|(&pid, _)| pid)
+        {
             let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{pid}\n"));
         }
         Ok(out)
@@ -724,6 +811,10 @@ impl CgroupDir {
 
     fn update_subtree_control(&self, data: &[u8]) -> VfsResult<()> {
         let text = core::str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
+        // Availability validation and the eventual controller reset belong to
+        // the same membership operation. Otherwise a parent can disable pids
+        // after a child validates `+pids` but before the child publishes it.
+        let _operation = PID_CGROUPS.operation.lock();
         // `pids` is currently the only implemented controller. Track the last
         // requested state directly instead of allocating transient sets and a
         // cloned replacement tree for every write.
@@ -756,6 +847,10 @@ impl CgroupDir {
             return Ok(());
         };
         let prepared_name = enable_pids.then(|| try_owned("pids")).transpose()?;
+        // Membership publication, topology changes, controller reset, and
+        // pids.current/pids.peak reads share this operation domain. In
+        // particular, a pending fork cannot publish across a controller reset
+        // or observe an ancestor chain that is concurrently being renamed.
         let mut control = self.subtree_control.lock();
         let was_enabled = control.contains("pids");
         if enable_pids == was_enabled {
@@ -789,9 +884,12 @@ impl CgroupDir {
     }
 }
 
-fn same_membership_mapping(lhs: Option<&Weak<CgroupDir>>, rhs: Option<&Weak<CgroupDir>>) -> bool {
+fn same_membership_mapping(lhs: Option<&CgroupMembership>, rhs: Option<&CgroupMembership>) -> bool {
     match (lhs, rhs) {
-        (Some(lhs), Some(rhs)) => Weak::ptr_eq(lhs, rhs),
+        (Some(lhs), Some(rhs)) => {
+            Weak::ptr_eq(&lhs.target, &rhs.target)
+                && Arc::ptr_eq(&lhs.publication, &rhs.publication)
+        }
         (None, None) => true,
         _ => false,
     }
@@ -812,21 +910,104 @@ impl PidMembershipRegistry {
         self.try_attach_locked(target, pid, charge_fork)
     }
 
-    fn try_charge_from(&self, parent_pid: Pid, child_pid: Pid) -> AxResult<()> {
+    fn prepare_charge_from(
+        &self,
+        parent_pid: Pid,
+        child_pid: Pid,
+    ) -> AxResult<CgroupForkAdmission<'_>> {
         let _operation = self.operation.lock();
         let target = {
             let mut by_pid = self.by_pid.lock();
             let Some(mapped) = by_pid.get(&parent_pid).cloned() else {
-                return Ok(());
+                return Ok(CgroupForkAdmission::untracked(self, child_pid));
             };
-            let Some(target) = mapped.upgrade() else {
+            if !mapped.is_visible() {
+                return Err(AxError::ResourceBusy);
+            }
+            let Some(target) = mapped.target.upgrade() else {
                 by_pid.remove(&parent_pid);
-                return Ok(());
+                return Ok(CgroupForkAdmission::untracked(self, child_pid));
             };
             target
         };
-        self.try_attach_locked(&target, child_pid, true)?;
-        Ok(())
+        self.prepare_fork_attach_locked(&target, child_pid)
+    }
+
+    fn prepare_fork_attach(
+        &self,
+        target: &Arc<CgroupDir>,
+        child_pid: Pid,
+    ) -> AxResult<CgroupForkAdmission<'_>> {
+        let _operation = self.operation.lock();
+        self.prepare_fork_attach_locked(target, child_pid)
+    }
+
+    fn prepare_fork_attach_locked(
+        &self,
+        target: &Arc<CgroupDir>,
+        child_pid: Pid,
+    ) -> AxResult<CgroupForkAdmission<'_>> {
+        if target.v2_has_enabled_child_controllers() {
+            return Err(AxError::ResourceBusy);
+        }
+        if let Some(limiting) = target.limiting_dir_for_fork() {
+            let mut events = limiting.pids_events_limit.lock();
+            *events = events.checked_add(1).ok_or(AxError::BadState)?;
+            return Err(AxError::WouldBlock);
+        }
+
+        let publication =
+            Arc::try_new(CgroupMembershipPublication::new(false)).map_err(|_| AxError::NoMemory)?;
+        let mut by_pid = self.by_pid.lock();
+        by_pid.retain(|_, membership| {
+            !membership.is_visible() || membership.target.strong_count() != 0
+        });
+        if let Some(existing) = by_pid.get(&child_pid) {
+            return Err(if existing.is_visible() {
+                AxError::AlreadyExists
+            } else {
+                AxError::ResourceBusy
+            });
+        }
+        if by_pid.len() >= self.global_limit {
+            return Err(AxError::NoMemory);
+        }
+        by_pid.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+
+        let mut target_pids = target.pids.lock();
+        if target_pids.contains_key(&child_pid) {
+            return Err(AxError::BadState);
+        }
+        if target_pids.len() >= self.per_cgroup_limit {
+            return Err(AxError::NoMemory);
+        }
+        target_pids.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+
+        let previous_target = target_pids.insert(child_pid, publication.clone());
+        if let Some(previous_target) = previous_target {
+            target_pids.insert(child_pid, previous_target);
+            return Err(AxError::BadState);
+        }
+        let membership = CgroupMembership {
+            target: Arc::downgrade(target),
+            publication: publication.clone(),
+        };
+        let previous_global = by_pid.insert(child_pid, membership);
+        if let Some(previous_global) = previous_global {
+            by_pid.insert(child_pid, previous_global);
+            target_pids.remove(&child_pid);
+            return Err(AxError::BadState);
+        }
+        drop(target_pids);
+        drop(by_pid);
+
+        Ok(CgroupForkAdmission {
+            registry: self,
+            child_pid,
+            target: Some(target.clone()),
+            publication: Some(publication),
+            committed: false,
+        })
     }
 
     /// Reserves both indexes before changing either one. The operation lock
@@ -839,108 +1020,120 @@ impl PidMembershipRegistry {
         pid: Pid,
         charge_fork: bool,
     ) -> AxResult<bool> {
-        let target_weak = Arc::downgrade(target);
-        let old_mapping = self.by_pid.lock().get(&pid).cloned();
-        let target_had_pid = target.pids.lock().contains(&pid);
-        if target_had_pid
-            && old_mapping
-                .as_ref()
-                .is_some_and(|old| Weak::ptr_eq(old, &target_weak))
+        if target.v2_has_enabled_child_controllers() {
+            return Err(AxError::ResourceBusy);
+        }
+        let mut by_pid = self.by_pid.lock();
+        by_pid.retain(|_, membership| {
+            !membership.is_visible() || membership.target.strong_count() != 0
+        });
+        let old_mapping = by_pid.get(&pid).cloned();
+        if old_mapping
+            .as_ref()
+            .is_some_and(|mapping| !mapping.is_visible())
         {
-            return Ok(false);
+            return Err(AxError::ResourceBusy);
+        }
+        let target_weak = Arc::downgrade(target);
+        {
+            let target_pids = target.pids.lock();
+            if let Some(existing) = target_pids.get(&pid) {
+                if !existing.is_visible() {
+                    return Err(AxError::ResourceBusy);
+                }
+                if old_mapping.as_ref().is_some_and(|old| {
+                    Weak::ptr_eq(&old.target, &target_weak)
+                        && Arc::ptr_eq(&old.publication, existing)
+                }) {
+                    return Ok(false);
+                }
+                return Err(AxError::BadState);
+            }
         }
 
-        if charge_fork
-            && !target_had_pid
-            && let Some(limiting) = target.limiting_dir_for_fork()
-        {
-            *limiting.pids_events_limit.lock() += 1;
+        if charge_fork && let Some(limiting) = target.limiting_dir_for_fork() {
+            let mut events = limiting.pids_events_limit.lock();
+            *events = events.checked_add(1).ok_or(AxError::BadState)?;
             return Err(AxError::WouldBlock);
         }
-
-        if !target_had_pid {
-            let mut target_pids = target.pids.lock();
-            if target_pids.len() >= self.per_cgroup_limit {
-                return Err(AxError::NoMemory);
-            }
-            target_pids.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        let mut target_pids = target.pids.lock();
+        if target_pids.len() >= self.per_cgroup_limit {
+            return Err(AxError::NoMemory);
         }
+        target_pids.try_reserve(1).map_err(|_| AxError::NoMemory)?;
         if old_mapping.is_none() {
-            let mut by_pid = self.by_pid.lock();
-            by_pid.retain(|_, mapped| mapped.strong_count() != 0);
             if by_pid.len() >= self.global_limit {
                 return Err(AxError::NoMemory);
             }
             by_pid.try_reserve(1).map_err(|_| AxError::NoMemory)?;
         }
 
-        let mut by_pid = self.by_pid.lock();
         if !same_membership_mapping(by_pid.get(&pid), old_mapping.as_ref()) {
             return Err(AxError::Io);
         }
         let old_dir = old_mapping
             .as_ref()
-            .and_then(Weak::upgrade)
+            .and_then(|old| old.target.upgrade())
             .filter(|old| !Arc::ptr_eq(old, target));
+        let publication =
+            Arc::try_new(CgroupMembershipPublication::new(true)).map_err(|_| AxError::NoMemory)?;
+        let replacement = CgroupMembership {
+            target: target_weak,
+            publication: publication.clone(),
+        };
 
+        let mut removed_old_publication = None;
         if let Some(old_dir) = old_dir {
             let mut old_pids = old_dir.pids.lock();
-            let mut target_pids = target.pids.lock();
-            if target_pids.contains(&pid) != target_had_pid {
+            let Some(old_publication) = old_mapping.as_ref().map(|old| &old.publication) else {
                 return Err(AxError::Io);
-            }
-            let inserted_target = if target_had_pid {
-                false
-            } else {
-                target_pids.insert(pid)
             };
-            if !target_had_pid && !inserted_target {
+            if !old_pids
+                .get(&pid)
+                .is_some_and(|current| Arc::ptr_eq(current, old_publication))
+            {
                 return Err(AxError::Io);
             }
-            let removed_old = old_pids.remove(&pid);
-            let replaced = by_pid.insert(pid, target_weak);
+            removed_old_publication = old_pids.remove(&pid);
+            let inserted_target = target_pids.insert(pid, publication.clone());
+            if inserted_target.is_some() {
+                if let Some(old_publication) = removed_old_publication.take() {
+                    old_pids.insert(pid, old_publication);
+                }
+                return Err(AxError::BadState);
+            }
+            let replaced = by_pid.insert(pid, replacement.clone());
             if !same_membership_mapping(replaced.as_ref(), old_mapping.as_ref()) {
                 if let Some(old_mapping) = old_mapping {
                     by_pid.insert(pid, old_mapping);
                 } else {
                     by_pid.remove(&pid);
                 }
-                if inserted_target {
-                    target_pids.remove(&pid);
-                }
-                if removed_old {
-                    old_pids.insert(pid);
+                target_pids.remove(&pid);
+                if let Some(old_publication) = removed_old_publication.take() {
+                    old_pids.insert(pid, old_publication);
                 }
                 return Err(AxError::Io);
             }
         } else {
-            let mut target_pids = target.pids.lock();
-            if target_pids.contains(&pid) != target_had_pid {
-                return Err(AxError::Io);
+            if target_pids.insert(pid, publication.clone()).is_some() {
+                return Err(AxError::BadState);
             }
-            let inserted_target = if target_had_pid {
-                false
-            } else {
-                target_pids.insert(pid)
-            };
-            if !target_had_pid && !inserted_target {
-                return Err(AxError::Io);
-            }
-            let replaced = by_pid.insert(pid, target_weak);
+            let replaced = by_pid.insert(pid, replacement);
             if !same_membership_mapping(replaced.as_ref(), old_mapping.as_ref()) {
                 if let Some(old_mapping) = old_mapping {
                     by_pid.insert(pid, old_mapping);
                 } else {
                     by_pid.remove(&pid);
                 }
-                if inserted_target {
-                    target_pids.remove(&pid);
-                }
+                target_pids.remove(&pid);
                 return Err(AxError::Io);
             }
         }
 
+        drop(target_pids);
         drop(by_pid);
+        drop(removed_old_publication);
         target.update_pids_peak_hierarchy();
         Ok(true)
     }
@@ -948,21 +1141,101 @@ impl PidMembershipRegistry {
     fn detach(&self, pid: Pid) {
         let _operation = self.operation.lock();
         let mut by_pid = self.by_pid.lock();
-        let old = by_pid.remove(&pid).and_then(|weak| weak.upgrade());
-        if let Some(dir) = old {
-            dir.pids.lock().remove(&pid);
+        let Some(current) = by_pid.get(&pid).cloned() else {
+            return;
+        };
+        if !current.is_visible() {
+            return;
         }
+        let removed = by_pid.remove(&pid);
+        let target = current.target.upgrade();
+        if let Some(dir) = target.as_ref() {
+            let mut pids = dir.pids.lock();
+            if pids
+                .get(&pid)
+                .is_some_and(|publication| Arc::ptr_eq(publication, &current.publication))
+            {
+                pids.remove(&pid);
+            } else {
+                error!("cgroup PID {pid} lost its exact target membership during detach");
+            }
+        }
+        drop(by_pid);
+        drop((removed, target));
     }
 
     fn get(&self, pid: Pid) -> Option<Arc<CgroupDir>> {
         let _operation = self.operation.lock();
         let mut by_pid = self.by_pid.lock();
         let mapped = by_pid.get(&pid).cloned()?;
-        let Some(dir) = mapped.upgrade() else {
+        if !mapped.is_visible() {
+            return None;
+        }
+        let Some(dir) = mapped.target.upgrade() else {
             by_pid.remove(&pid);
             return None;
         };
         Some(dir)
+    }
+}
+
+impl<'a> CgroupForkAdmission<'a> {
+    fn untracked(registry: &'a PidMembershipRegistry, child_pid: Pid) -> Self {
+        Self {
+            registry,
+            child_pid,
+            target: None,
+            publication: None,
+            committed: false,
+        }
+    }
+
+    /// Makes the already installed pair of hidden index entries visible.
+    /// This is a single release publication and cannot allocate or fail.
+    pub(crate) fn commit(mut self) {
+        let _operation = self.registry.operation.lock();
+        if let Some(target) = self.target.as_ref() {
+            target.update_pids_peak_for_pending_child();
+        }
+        if let Some(publication) = self.publication.as_ref() {
+            publication.visible.store(true, Ordering::Release);
+        }
+        self.committed = true;
+    }
+}
+
+impl Drop for CgroupForkAdmission<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let (Some(target), Some(publication)) = (&self.target, &self.publication) else {
+            return;
+        };
+
+        let _operation = self.registry.operation.lock();
+        let target_weak = Arc::downgrade(target);
+        let mut by_pid = self.registry.by_pid.lock();
+        let mut pids = target.pids.lock();
+        let exact_global = by_pid.get(&self.child_pid).is_some_and(|membership| {
+            Arc::ptr_eq(&membership.publication, publication)
+                && Weak::ptr_eq(&membership.target, &target_weak)
+        });
+        let exact_target = pids
+            .get(&self.child_pid)
+            .is_some_and(|current| Arc::ptr_eq(current, publication));
+        if !exact_global || !exact_target {
+            error!(
+                "cgroup fork admission for PID {} lost an exact hidden reservation",
+                self.child_pid
+            );
+            return;
+        }
+        let removed_global = by_pid.remove(&self.child_pid);
+        let removed_target = pids.remove(&self.child_pid);
+        drop(pids);
+        drop(by_pid);
+        drop((removed_global, removed_target));
     }
 }
 
@@ -1041,11 +1314,23 @@ pub(crate) fn proc_cpuset_membership(pid: Pid) -> String {
         .unwrap_or_else(|| "/\n".to_string())
 }
 
-pub fn try_charge_fork(parent_pid: Pid, child_pid: Pid) -> AxResult<()> {
-    PID_CGROUPS.try_charge_from(parent_pid, child_pid)
+/// Prepares an invisible fork-child membership inherited from `parent_pid`.
+///
+/// Clone should retain the returned token through every fallible construction
+/// step, then call [`CgroupForkAdmission::commit`] in its final publication
+/// phase. Dropping the token precisely removes both hidden reservations.
+pub(crate) fn prepare_fork_charge(
+    parent_pid: Pid,
+    child_pid: Pid,
+) -> AxResult<CgroupForkAdmission<'static>> {
+    PID_CGROUPS.prepare_charge_from(parent_pid, child_pid)
 }
 
-pub fn try_charge_fork_into(cgroup_fd: i32, child_pid: Pid) -> AxResult<()> {
+/// Prepares an invisible fork-child membership in the cgroup named by an fd.
+pub(crate) fn prepare_fork_charge_into(
+    cgroup_fd: i32,
+    child_pid: Pid,
+) -> AxResult<CgroupForkAdmission<'static>> {
     let dir_file = get_typed_file::<Directory>(cgroup_fd)?;
     let dir = dir_file
         .inner()
@@ -1058,7 +1343,7 @@ pub fn try_charge_fork_into(cgroup_fd: i32, child_pid: Pid) -> AxResult<()> {
     if dir.v2_has_enabled_child_controllers() {
         return Err(AxError::ResourceBusy);
     }
-    dir.attach_fork_child(child_pid)
+    PID_CGROUPS.prepare_fork_attach(&dir, child_pid)
 }
 
 impl NodeOps for CgroupDir {
@@ -1218,6 +1503,11 @@ impl DirNodeOps for CgroupDir {
 
     fn unlink(&self, request: UnlinkRequest<'_>) -> VfsResult<()> {
         let _namespace = self.node.fs.namespace.lock();
+        // Fork admission uses the same operation before installing a hidden
+        // member. Holding it from the emptiness check through namespace
+        // removal prevents an admission from targeting a just-detached
+        // cgroup between those two steps.
+        let _operation = PID_CGROUPS.operation.lock();
         if self.files.contains_key(request.name) {
             return Err(VfsError::OperationNotPermitted);
         }
@@ -1263,6 +1553,10 @@ impl DirNodeOps for CgroupDir {
             return Err(VfsError::InvalidInput);
         }
         let _namespace = self.node.fs.namespace.lock();
+        // Keep the parent chain stable while fork publication accounts
+        // pids.peak. The lock order is namespace -> membership operation ->
+        // directory/member locks; membership paths never acquire namespace.
+        let _operation = PID_CGROUPS.operation.lock();
         if self.files.contains_key(request.src_name) || dst_dir.files.contains_key(request.dst_name)
         {
             return Err(VfsError::OperationNotPermitted);
@@ -1432,6 +1726,11 @@ impl CgroupFile {
 
     fn read_text(&self) -> VfsResult<String> {
         let dir = self.dir()?;
+        // Whole-file snapshots linearize with membership publication,
+        // migration, parent rename, and controller reset. This prevents a
+        // reader from observing pids.current after the member becomes visible
+        // but pids.peak before its monotonic update.
+        let _operation = PID_CGROUPS.operation.lock();
         if !dir.control_file_visible(self.name) {
             return Err(VfsError::NotFound);
         }
@@ -1450,6 +1749,16 @@ impl CgroupFile {
 
     fn write_text(&self, data: &[u8]) -> VfsResult<()> {
         let dir = self.dir()?;
+        if self.name == "pids.max" {
+            // File visibility and the new limit must be one operation with
+            // controller reset and fork admission. A stale open control file
+            // cannot recreate a limit after its parent disabled pids.
+            let _operation = PID_CGROUPS.operation.lock();
+            if !dir.control_file_visible(self.name) {
+                return Err(VfsError::NotFound);
+            }
+            return dir.set_pids_max(data);
+        }
         if !dir.control_file_visible(self.name) {
             return Err(VfsError::NotFound);
         }
@@ -1470,7 +1779,6 @@ impl CgroupFile {
                 dir.kill_attached_recursive()
             }
             "cgroup.subtree_control" => dir.update_subtree_control(data),
-            "pids.max" => dir.set_pids_max(data),
             "cgroup.controllers" | "pids.current" | "pids.events" | "pids.peak" => {
                 Err(VfsError::BadFileDescriptor)
             }
@@ -1564,19 +1872,27 @@ impl FileNodeOps for CgroupFile {
 impl Pollable for CgroupFile {
     fn poll(&self) -> IoEvents {
         if self.name == "cgroup.kill" {
-            IoEvents::OUT
+            IoEvents::WRITABLE
         } else if is_read_only_control_file(self.name) {
-            IoEvents::IN
+            IoEvents::READABLE
         } else {
-            IoEvents::IN | IoEvents::OUT
+            IoEvents::READABLE | IoEvents::WRITABLE
         }
     }
 
-    fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+    fn register<'a>(
+        &'a self,
+        _context: &mut Context<'_>,
+        _events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        axpoll::PollRegistration::empty()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
 
     fn test_cgroup_dir() -> Arc<CgroupDir> {
@@ -1603,7 +1919,8 @@ mod tests {
             .by_pid
             .lock()
             .get(&pid)
-            .and_then(Weak::upgrade)
+            .filter(|membership| membership.is_visible())
+            .and_then(|membership| membership.target.upgrade())
             .is_some_and(|actual| Arc::ptr_eq(&actual, expected))
     }
 
@@ -1633,9 +1950,151 @@ mod tests {
         let target = test_cgroup_dir();
 
         assert_eq!(registry.try_attach(&target, 101, false), Ok(true));
-        assert!(target.pids.lock().contains(&101));
+        assert!(target.pids.lock().contains_key(&101));
         assert!(maps_to(&registry, 101, &target));
         assert_eq!(*target.pids_peak.lock(), 1);
+    }
+
+    #[test]
+    fn fork_admission_stays_invisible_to_readers_until_one_commit() {
+        let registry = PidMembershipRegistry::with_limits(4, 4);
+        let target = test_cgroup_dir();
+        registry.try_attach(&target, 101, false).unwrap();
+        let admission = registry.prepare_charge_from(101, 202).unwrap();
+
+        // Both capacity/identity slots exist, but cgroup.procs, cgroup.kill,
+        // pids.current, and the reverse PID lookup all use these filtered
+        // reader paths and must still observe only the parent.
+        assert_eq!(registry.by_pid.lock().len(), 2);
+        assert_eq!(target.pids.lock().len(), 2);
+        assert!(registry.get(202).is_none());
+        assert_eq!(target.try_live_pids().unwrap(), [101]);
+        assert_eq!(target.tasks_text().unwrap(), "101\n");
+        assert_eq!(target.recursive_live_pid_count(), 1);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..256 {
+                    assert!(registry.get(202).is_none());
+                    assert_eq!(target.try_live_pids().unwrap(), [101]);
+                    assert!(!target.tasks_text().unwrap().contains("202"));
+                    std::thread::yield_now();
+                }
+            });
+        });
+
+        admission.commit();
+        assert!(maps_to(&registry, 202, &target));
+        let mut visible = target.try_live_pids().unwrap();
+        visible.sort_unstable();
+        assert_eq!(visible, [101, 202]);
+        assert!(target.tasks_text().unwrap().contains("202\n"));
+        assert_eq!(target.recursive_live_pid_count(), 2);
+        assert_eq!(*target.pids_peak.lock(), 2);
+    }
+
+    #[test]
+    fn dropped_fork_admission_refunds_exact_hidden_slots_and_capacity() {
+        let registry = PidMembershipRegistry::with_limits(2, 2);
+        let target = test_cgroup_dir();
+        registry.try_attach(&target, 101, false).unwrap();
+
+        let first = registry.prepare_charge_from(101, 202).unwrap();
+        assert_eq!(
+            registry.prepare_charge_from(101, 303).err(),
+            Some(AxError::NoMemory)
+        );
+        drop(first);
+
+        assert!(!registry.by_pid.lock().contains_key(&202));
+        assert!(!target.pids.lock().contains_key(&202));
+        assert_eq!(target.recursive_live_pid_count(), 1);
+        assert_eq!(*target.pids_peak.lock(), 1);
+
+        registry.prepare_charge_from(101, 303).unwrap().commit();
+        assert!(maps_to(&registry, 303, &target));
+        assert_eq!(target.recursive_live_pid_count(), 2);
+    }
+
+    #[test]
+    fn fork_drop_keeps_both_indexes_when_target_identity_changes() {
+        let registry = PidMembershipRegistry::with_limits(4, 4);
+        let target = test_cgroup_dir();
+        registry.try_attach(&target, 101, false).unwrap();
+        let admission = registry.prepare_charge_from(101, 202).unwrap();
+
+        target
+            .pids
+            .lock()
+            .insert(202, Arc::new(CgroupMembershipPublication::new(false)));
+        drop(admission);
+
+        assert!(registry.by_pid.lock().contains_key(&202));
+        assert!(target.pids.lock().contains_key(&202));
+        assert_eq!(registry.by_pid.lock().len(), 2);
+        assert_eq!(target.pids.lock().len(), 2);
+    }
+
+    #[test]
+    fn fork_drop_keeps_both_indexes_when_global_identity_changes() {
+        let registry = PidMembershipRegistry::with_limits(4, 4);
+        let target = test_cgroup_dir();
+        registry.try_attach(&target, 101, false).unwrap();
+        let admission = registry.prepare_charge_from(101, 202).unwrap();
+
+        registry.by_pid.lock().get_mut(&202).unwrap().publication =
+            Arc::new(CgroupMembershipPublication::new(false));
+        drop(admission);
+
+        assert!(registry.by_pid.lock().contains_key(&202));
+        assert!(target.pids.lock().contains_key(&202));
+        assert_eq!(registry.by_pid.lock().len(), 2);
+        assert_eq!(target.pids.lock().len(), 2);
+    }
+
+    #[test]
+    fn pending_fork_is_charged_to_pids_max_without_becoming_visible() {
+        let registry = PidMembershipRegistry::with_limits(4, 4);
+        let target = test_cgroup_dir();
+        registry.try_attach(&target, 101, false).unwrap();
+        *target.pids_max.lock() = Some(2);
+
+        let pending = registry.prepare_charge_from(101, 202).unwrap();
+        assert_eq!(target.recursive_live_pid_count(), 1);
+        assert_eq!(
+            registry.prepare_charge_from(101, 303).err(),
+            Some(AxError::WouldBlock)
+        );
+        assert_eq!(*target.pids_events_limit.lock(), 1);
+
+        drop(pending);
+        registry.prepare_charge_from(101, 303).unwrap().commit();
+        assert!(maps_to(&registry, 303, &target));
+    }
+
+    #[test]
+    fn concurrent_fork_commits_keep_peak_at_or_above_current() {
+        let registry = PidMembershipRegistry::with_limits(4, 4);
+        let target = test_cgroup_dir();
+        registry.try_attach(&target, 101, false).unwrap();
+        let first = registry.prepare_charge_from(101, 202).unwrap();
+        let second = registry.prepare_charge_from(101, 303).unwrap();
+        let barrier = std::sync::Barrier::new(3);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                first.commit();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                second.commit();
+            });
+            barrier.wait();
+        });
+
+        assert_eq!(target.recursive_live_pid_count(), 3);
+        assert_eq!(*target.pids_peak.lock(), 3);
     }
 
     #[test]
@@ -1650,9 +2109,9 @@ mod tests {
             registry.try_attach(&target, 101, false),
             Err(AxError::NoMemory)
         );
-        assert!(old.pids.lock().contains(&101));
-        assert!(!target.pids.lock().contains(&101));
-        assert!(target.pids.lock().contains(&202));
+        assert!(old.pids.lock().contains_key(&101));
+        assert!(!target.pids.lock().contains_key(&101));
+        assert!(target.pids.lock().contains_key(&202));
         assert!(maps_to(&registry, 101, &old));
         assert!(maps_to(&registry, 202, &target));
     }
@@ -1668,7 +2127,7 @@ mod tests {
             registry.try_attach(&target, 202, false),
             Err(AxError::NoMemory)
         );
-        assert!(!target.pids.lock().contains(&202));
+        assert!(!target.pids.lock().contains_key(&202));
         assert!(maps_to(&registry, 101, &old));
         assert_eq!(registry.by_pid.lock().len(), 1);
     }
@@ -1681,8 +2140,8 @@ mod tests {
         registry.try_attach(&old, 101, false).unwrap();
 
         assert_eq!(registry.try_attach(&target, 101, false), Ok(true));
-        assert!(!old.pids.lock().contains(&101));
-        assert!(target.pids.lock().contains(&101));
+        assert!(!old.pids.lock().contains_key(&101));
+        assert!(target.pids.lock().contains_key(&101));
         assert!(maps_to(&registry, 101, &target));
         assert_eq!(registry.by_pid.lock().len(), 1);
 
@@ -1795,6 +2254,31 @@ mod tests {
             .unwrap();
         assert_eq!(dst_backend.namespace_epoch(), no_op_epoch);
         assert_eq!(dst_dir.lookup("moved").unwrap().inode(), child.inode());
+    }
+
+    #[test]
+    fn cgroup_unlink_rejects_a_hidden_fork_membership() {
+        let fs = test_cgroup_fs();
+        let root = fs.root_dir();
+        let root_dir = root.as_dir().unwrap();
+        let child = root_dir
+            .create(
+                "child",
+                NodeType::Directory,
+                NodePermission::from_bits_truncate(0o755),
+            )
+            .unwrap();
+        let child_backend = child.downcast::<CgroupDir>().unwrap();
+        child_backend
+            .pids
+            .lock()
+            .insert(202, Arc::new(CgroupMembershipPublication::new(false)));
+
+        assert_eq!(
+            root_dir.unlink("child", true).unwrap_err(),
+            VfsError::ResourceBusy
+        );
+        assert_eq!(root_dir.lookup("child").unwrap().inode(), child.inode());
     }
 }
 

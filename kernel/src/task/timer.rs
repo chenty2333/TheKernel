@@ -15,11 +15,15 @@ use core::{
     time::Duration,
 };
 
-use axerrno::LinuxError;
+use axerrno::{AxError, AxResult, LinuxError};
 use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time_nanos};
 use axpoll::PollSet;
-use axtask::{WeakAxTaskRef, current, future::block_on, register_timer_callback};
+use axtask::{
+    TimerCallbackRegisterError, TimerCallbackToken, WeakAxTaskRef, cancel_timer_callback, current,
+    future::block_on, register_timer_callback,
+};
 use event_listener::{Event, listener};
+use kernel_guard::NoPreempt;
 use kspin::SpinNoIrq;
 use lazy_static::lazy_static;
 use linux_raw_sys::general::{RLIM_INFINITY, RLIMIT_CPU, SI_TIMER};
@@ -333,8 +337,8 @@ lazy_static! {
         SpinNoIrq::new(ClockTimerRuntime::default());
 }
 
-static CLOCK_TIMER_CALLBACK_REGISTERED: [AtomicBool; axconfig::plat::MAX_CPU_NUM] =
-    [const { AtomicBool::new(false) }; axconfig::plat::MAX_CPU_NUM];
+static CLOCK_TIMER_CALLBACK_TOKENS: [SpinNoIrq<Option<TimerCallbackToken>>;
+    axconfig::plat::MAX_CPU_NUM] = [const { SpinNoIrq::new(None) }; axconfig::plat::MAX_CPU_NUM];
 
 static NEXT_POSIX_TIMER_SIGNAL_TOKEN: AtomicU32 = AtomicU32::new(1);
 const POSIX_TIMER_RETRY_INITIAL: Duration = Duration::from_millis(1);
@@ -630,7 +634,7 @@ enum AlarmWait {
     NewTimer,
 }
 
-async fn alarm_task(clock: AlarmClock) {
+async fn alarm_task(clock: AlarmClock) -> AxResult<()> {
     loop {
         // Register before inspecting the queues so a newly inserted earlier
         // deadline cannot race past us and get delayed until a stale timeout.
@@ -646,24 +650,37 @@ async fn alarm_task(clock: AlarmClock) {
             continue;
         };
 
-        let _ = wait_until_or_alarm(clock, deadline, listener).await;
+        let _ = wait_until_or_alarm(clock, deadline, listener).await?;
     }
 }
 
 /// Spawns the alarm task.
-pub fn spawn_alarm_task() {
+pub fn spawn_alarm_task() -> Result<(), axerrno::AxError> {
     info!("Initialize alarm...");
-    ensure_clock_timer_runtime();
+    ensure_clock_timer_runtime()?;
     axtask::spawn_raw(
-        || block_on(alarm_task(AlarmClock::Realtime)),
+        || match block_on(alarm_task(AlarmClock::Realtime)) {
+            Ok(Ok(())) => error!("Realtime alarm worker ended unexpectedly"),
+            Ok(Err(error)) => error!("Realtime alarm timer stopped: {error}"),
+            Err(error) => {
+                error!("Realtime alarm worker stopped: {error}");
+            }
+        },
         "alarm_realtime".to_owned(),
         axconfig::TASK_STACK_SIZE,
-    );
+    )?;
     axtask::spawn_raw(
-        || block_on(alarm_task(AlarmClock::Monotonic)),
+        || match block_on(alarm_task(AlarmClock::Monotonic)) {
+            Ok(Ok(())) => error!("Monotonic alarm worker ended unexpectedly"),
+            Ok(Err(error)) => error!("Monotonic alarm timer stopped: {error}"),
+            Err(error) => {
+                error!("Monotonic alarm worker stopped: {error}");
+            }
+        },
         "alarm_monotonic".to_owned(),
         axconfig::TASK_STACK_SIZE,
-    );
+    )?;
+    Ok(())
 }
 
 fn alarm_list(clock: AlarmClock) -> &'static Mutex<BinaryHeap<Entry>> {
@@ -687,16 +704,90 @@ fn timer_runtime(clock: AlarmClock) -> &'static SpinNoIrq<ClockTimerRuntime> {
     }
 }
 
-fn ensure_clock_timer_runtime() {
+fn map_timer_callback_register_error(error: TimerCallbackRegisterError) -> AxError {
+    match error {
+        TimerCallbackRegisterError::NoMemory => AxError::NoMemory,
+        TimerCallbackRegisterError::CapacityExhausted => AxError::ResourceBusy,
+        TimerCallbackRegisterError::TokenSpaceExhausted => AxError::OutOfRange,
+    }
+}
+
+fn retain_first_callback_token<T>(slot: &mut Option<T>, token: T) -> Option<T> {
+    if slot.is_none() {
+        *slot = Some(token);
+        None
+    } else {
+        Some(token)
+    }
+}
+
+fn ensure_clock_timer_runtime() -> AxResult<()> {
+    // Keep the outer per-CPU token slot and axtask's internally sampled owner
+    // CPU identical even if this task's affinity changes concurrently.
+    let _cpu_guard = NoPreempt::new();
     let cpu_id = axhal::percpu::this_cpu_id();
-    if CLOCK_TIMER_CALLBACK_REGISTERED[cpu_id]
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
+    let owner = &CLOCK_TIMER_CALLBACK_TOKENS[cpu_id];
+    if owner.lock().is_some() {
+        return Ok(());
+    }
+
+    let token = match register_timer_callback(|_| {
+        wake_clock_timers(AlarmClock::Realtime);
+        wake_clock_timers(AlarmClock::Monotonic);
+    }) {
+        Ok(token) => token,
+        Err(error) => {
+            // A concurrent caller may have completed registration while this
+            // call was rejected. In that case the current CPU already has the
+            // exact persistent owner and no failure needs to escape.
+            if owner.lock().is_some() {
+                return Ok(());
+            }
+            return Err(map_timer_callback_register_error(error));
+        }
+    };
+
+    let duplicate = {
+        let mut retained = owner.lock();
+        retain_first_callback_token(&mut retained, token)
+    };
+    if let Some(duplicate) = duplicate
+        && !cancel_timer_callback(duplicate)
     {
-        register_timer_callback(|_| {
-            wake_clock_timers(AlarmClock::Realtime);
-            wake_clock_timers(AlarmClock::Monotonic);
-        });
+        error!("failed to cancel duplicate clock timer callback on CPU {cpu_id}");
+        return Err(AxError::BadState);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod clock_timer_callback_tests {
+    use super::*;
+
+    #[test]
+    fn first_callback_token_is_retained_and_duplicates_are_returned() {
+        let mut owner = None;
+        assert_eq!(retain_first_callback_token(&mut owner, 7_u8), None);
+        assert_eq!(owner, Some(7));
+        assert_eq!(retain_first_callback_token(&mut owner, 11_u8), Some(11));
+        assert_eq!(owner, Some(7));
+    }
+
+    #[test]
+    fn callback_registration_failures_keep_distinct_kernel_errors() {
+        assert_eq!(
+            map_timer_callback_register_error(TimerCallbackRegisterError::NoMemory),
+            AxError::NoMemory
+        );
+        assert_eq!(
+            map_timer_callback_register_error(TimerCallbackRegisterError::CapacityExhausted),
+            AxError::ResourceBusy
+        );
+        assert_eq!(
+            map_timer_callback_register_error(TimerCallbackRegisterError::TokenSpaceExhausted),
+            AxError::OutOfRange
+        );
     }
 }
 
@@ -1116,28 +1207,38 @@ fn process_due(clock: AlarmClock) -> bool {
     progressed
 }
 
-async fn wait_until_or_alarm<L>(clock: AlarmClock, deadline: Duration, mut listener: L) -> AlarmWait
+async fn wait_until_or_alarm<L>(
+    clock: AlarmClock,
+    deadline: Duration,
+    mut listener: L,
+) -> AxResult<AlarmWait>
 where
     L: Future<Output = ()> + Unpin,
 {
     let mut sleeper = core::pin::pin!(sleep_until_clock(clock, deadline));
     poll_fn(|cx| {
         if Pin::new(&mut listener).poll(cx).is_ready() {
-            return Poll::Ready(AlarmWait::NewTimer);
+            return Poll::Ready(Ok(AlarmWait::NewTimer));
         }
-        if sleeper.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(AlarmWait::DeadlineReached);
+        match sleeper.as_mut().poll(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(AlarmWait::DeadlineReached)),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
         }
-        Poll::Pending
     })
     .await
 }
 
-pub async fn sleep_until_clock(clock: AlarmClock, deadline: Duration) {
-    ensure_clock_timer_runtime();
+pub async fn sleep_until_clock(clock: AlarmClock, deadline: Duration) -> AxResult<()> {
+    let now = clock.now();
+    if deadline <= now {
+        return Ok(());
+    }
+    ensure_clock_timer_runtime()?;
     let key = timer_runtime(clock).lock().add(clock.now(), deadline);
     update_clock_timer_deadline();
     if let Some(key) = key {
         ClockTimerFuture { clock, key }.await;
     }
+    Ok(())
 }

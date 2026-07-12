@@ -20,10 +20,7 @@ use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{Location, WeakFilesystemIdentity, path::MAX_NAME_LEN};
 use axpoll::{IoEvents, PollSet, Pollable};
 use axsync::Mutex as BlockingMutex;
-use axtask::{
-    current_may_uninit,
-    future::{block_on, poll_io},
-};
+use axtask::current_may_uninit;
 use linux_raw_sys::{
     general::{
         IN_ACCESS, IN_ALL_EVENTS, IN_ATTRIB, IN_CLOSE_NOWRITE, IN_CLOSE_WRITE, IN_DELETE_SELF,
@@ -38,6 +35,7 @@ use starry_vm::VmMutPtr;
 use crate::{
     deferred_work::DeferredWorkAccount,
     file::{Directory, File, FileLike, IoDst, Kstat, fanotify::FanotifyEventActor, get_file_like},
+    readiness::block_on_poll_io,
     task::AsThread,
 };
 
@@ -762,9 +760,9 @@ impl FileLike for InotifyFile {
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
         axtask::run_deferred_work();
         let _reader = self.read_gate.lock();
-        block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
+        block_on_poll_io(self, IoEvents::READABLE, self.nonblocking(), || {
             self.read_ready(dst)
-        }))
+        })
     }
 
     fn nonblocking(&self) -> bool {
@@ -795,15 +793,22 @@ impl Pollable for InotifyFile {
     fn poll(&self) -> IoEvents {
         axtask::run_deferred_work();
         let mut events = IoEvents::empty();
-        events.set(IoEvents::IN, self.has_events());
+        events.set(IoEvents::READABLE, self.has_events());
         events
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.contains(IoEvents::IN) {
-            self.poll_rx.register(context.waker());
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        if events.contains(IoEvents::READABLE) {
+            let registration = axpoll::PollRegistration::single(&self.poll_rx, context.waker())?;
             // Register first so a release racing with poll cannot be missed.
             axtask::run_deferred_work();
+            Ok(registration)
+        } else {
+            axpoll::PollRegistration::empty()
         }
     }
 }

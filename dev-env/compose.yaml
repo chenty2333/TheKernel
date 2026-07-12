@@ -14,6 +14,8 @@ x-common-volumes: &common-volumes
   - type: bind
     source: ..
     target: /workspace
+    bind:
+      selinux: z
   - type: volume
     source: thekernel-home
     target: /home/oskernel

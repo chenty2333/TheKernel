@@ -8,6 +8,7 @@ source "$SCRIPT_DIR/lib.sh"
 
 LOG_DIR="$REPO_ROOT/.state/ci/pr"
 BUILD_TIMEOUT_SECS=${THEKERNEL_CI_BUILD_TIMEOUT_SECS:-3600}
+RELEASE_CONSUMER_TIMEOUT_SECS=${THEKERNEL_CI_RELEASE_CONSUMER_TIMEOUT_SECS:-$BUILD_TIMEOUT_SECS}
 BOOT_GATE_TIMEOUT_SECS=${THEKERNEL_CI_BOOT_GATE_TIMEOUT_SECS:-900}
 SKIP_BUILD=0
 
@@ -15,9 +16,15 @@ usage() {
     cat <<'EOF'
 Usage: scripts/ci/pr-gate.sh [--log-dir DIR] [--skip-build]
 
-Builds both release evaluator kernels and both release boot-shell kernels, then
-runs the strict dual-architecture boot-shell marker gate. This job requires the
-official RISC-V and LoongArch root images; missing infrastructure is a failure.
+Validates the exact maintained-sibling release artifacts, builds both release
+evaluator kernels and both release boot-shell kernels, then runs the strict
+dual-architecture boot-shell marker gate. This job requires the official
+RISC-V and LoongArch root images; missing infrastructure is a failure.
+
+The normal build path requires THEKERNEL_AX_REF and THEKERNEL_LINUX_ABI_REF to
+be the exact 40-hex commits provisioned by CI. --skip-build reuses existing
+kernels and skips the release-consumer artifact gate together with compilation.
+The verified release set is saved below the PR log directory for CI artifacts.
 EOF
 }
 
@@ -42,6 +49,22 @@ export CI_LOG_DIR="$LOG_DIR"
 ci_prepare_log_dir "$CI_LOG_DIR"
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
+    ci_require_positive_int release_consumer_timeout "$RELEASE_CONSUMER_TIMEOUT_SECS"
+    RELEASE_SET="$LOG_DIR/release-consumer/release-set.tsv"
+    rm -f -- "$RELEASE_SET"
+    AX_REF=${THEKERNEL_AX_REF:-}
+    LINUX_ABI_REF=${THEKERNEL_LINUX_ABI_REF:-}
+    [[ "$AX_REF" =~ ^[0-9a-f]{40}$ ]] \
+        || ci_die 'THEKERNEL_AX_REF must be the provisioned exact 40-hex commit'
+    [[ "$LINUX_ABI_REF" =~ ^[0-9a-f]{40}$ ]] \
+        || ci_die 'THEKERNEL_LINUX_ABI_REF must be the provisioned exact 40-hex commit'
+
+    ci_run_step release-consumer "$RELEASE_CONSUMER_TIMEOUT_SECS" \
+        "$SCRIPT_DIR/release-consumer-gate.sh" \
+        --arch both \
+        --ax-head "$AX_REF" \
+        --linux-abi-head "$LINUX_ABI_REF" \
+        --output-release-set "$RELEASE_SET"
     ci_run_step release-kernels "$BUILD_TIMEOUT_SECS" make kernels
     ci_run_step release-shell-kernels "$BUILD_TIMEOUT_SECS" \
         make kernel-rv-shell kernel-la-shell

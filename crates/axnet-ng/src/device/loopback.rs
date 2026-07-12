@@ -11,12 +11,13 @@ use smoltcp::{
 
 use crate::{
     consts::{LOOPBACK_MTU, PACKET_QUEUE_LEN},
-    device::{Device, DeviceStats, InterfaceKind},
+    device::{Device, DevicePollBridge, DeviceStats, InterfaceKind},
 };
 
 pub struct LoopbackDevice {
     buffer: PacketBuffer<'static, ()>,
     poll: PollSet,
+    poll_bridge: DevicePollBridge,
     stats: DeviceStats,
 }
 impl LoopbackDevice {
@@ -39,6 +40,7 @@ impl LoopbackDevice {
         Ok(Self {
             buffer,
             poll: PollSet::new(),
+            poll_bridge: DevicePollBridge::new(),
             stats: DeviceStats::default(),
         })
     }
@@ -96,16 +98,19 @@ impl Device for LoopbackDevice {
             }
             Err(_) => {
                 self.stats.record_tx_drop();
-                warn!(
-                    "Loopback device buffer is full, dropping packet to {}",
-                    next_hop
-                );
+                warn!("Loopback device buffer is full, dropping packet to {next_hop}");
                 false
             }
         }
     }
 
-    fn register_waker(&self, waker: &Waker) {
-        self.poll.register(waker);
+    fn register_waker(&self, waker: &Waker) -> Result<(), axpoll::PollRegistrationError> {
+        self.poll_bridge.refresh(&self.poll, waker)
+    }
+}
+
+impl Drop for LoopbackDevice {
+    fn drop(&mut self) {
+        self.poll_bridge.cancel(&self.poll);
     }
 }

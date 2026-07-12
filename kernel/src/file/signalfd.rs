@@ -7,10 +7,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet, Pollable};
-use axtask::{
-    current,
-    future::{block_on, poll_io},
-};
+use axtask::current;
 use linux_raw_sys::general::{SI_MESGQ, SI_QUEUE, SI_SIGIO, SI_TIMER};
 use spin::RwLock;
 use starry_signal::{SignalInfo, SignalSet};
@@ -18,6 +15,7 @@ use zerocopy::{Immutable, IntoBytes};
 
 use crate::{
     file::{FileLike, IoDst, IoSrc, Kstat, anon_inode_stat},
+    readiness::block_on_poll_io,
     task::{AsThread, acknowledge_posix_timer_signal},
 };
 
@@ -229,7 +227,7 @@ impl FileLike for Signalfd {
         }
         let proc_data = current().as_thread().proc_data.clone();
 
-        block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
+        block_on_poll_io(self, IoEvents::READABLE, self.nonblocking(), || {
             if let Some(sig_info) = self.dequeue_signal() {
                 acknowledge_posix_timer_signal(&proc_data, &sig_info);
                 // Convert SignalInfo to SignalfdSiginfo
@@ -248,7 +246,7 @@ impl FileLike for Signalfd {
             } else {
                 Err(AxError::WouldBlock)
             }
-        }))
+        })
     }
 
     fn write(&self, _src: &mut IoSrc) -> AxResult<usize> {
@@ -273,13 +271,19 @@ impl FileLike for Signalfd {
 impl Pollable for Signalfd {
     fn poll(&self) -> IoEvents {
         let mut events = IoEvents::empty();
-        events.set(IoEvents::IN, self.has_pending_signals());
+        events.set(IoEvents::READABLE, self.has_pending_signals());
         events
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.contains(IoEvents::IN) {
-            self.poll_rx.register(context.waker());
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        if events.contains(IoEvents::READABLE) {
+            axpoll::PollRegistration::single(&self.poll_rx, context.waker())
+        } else {
+            axpoll::PollRegistration::empty()
         }
     }
 }

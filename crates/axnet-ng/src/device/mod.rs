@@ -1,6 +1,8 @@
 use alloc::{string::String, vec::Vec};
 use core::task::Waker;
 
+use axpoll::{PollRegistrationError, PollSet, RegisterError, RegistrationToken, UpdateError};
+use axsync::spin::SpinNoIrq;
 use smoltcp::{
     storage::PacketBuffer,
     time::Instant,
@@ -18,6 +20,54 @@ pub use loopback::*;
 pub use veth::*;
 #[cfg(feature = "vsock")]
 pub use vsock::*;
+
+/// Retains exactly one bridge registration from a device-local wake source to
+/// the stack-wide readiness source. A consumed one-shot token is replaced on
+/// the next check/arm pass; an unchanged live token is updated in place.
+pub(crate) struct DevicePollBridge {
+    token: SpinNoIrq<Option<RegistrationToken>>,
+}
+
+impl DevicePollBridge {
+    pub(crate) const fn new() -> Self {
+        Self {
+            token: SpinNoIrq::new(None),
+        }
+    }
+
+    pub(crate) fn refresh(
+        &self,
+        source: &PollSet,
+        waker: &Waker,
+    ) -> Result<(), PollRegistrationError> {
+        let mut token = self.token.lock();
+        if let Some(current) = *token {
+            match source.update(current, waker) {
+                Ok(()) => return Ok(()),
+                Err(UpdateError::InvalidToken) => *token = None,
+                Err(UpdateError::Closed) => {
+                    return Err(PollRegistrationError::Source {
+                        index: 0,
+                        error: RegisterError::Closed,
+                    });
+                }
+            }
+        }
+
+        *token = Some(
+            source
+                .register(waker)
+                .map_err(|error| PollRegistrationError::Source { index: 0, error })?,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn cancel(&self, source: &PollSet) {
+        if let Some(token) = self.token.lock().take() {
+            source.cancel(token);
+        }
+    }
+}
 
 /// The link-layer class of a network interface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,5 +157,7 @@ pub trait Device: Send + Sync {
     /// up packet processing.
     fn send(&mut self, next_hop: IpAddress, packet: &[u8], timestamp: Instant) -> bool;
 
-    fn register_waker(&self, waker: &Waker);
+    /// Refreshes the retained bridge from this device's wake source to the
+    /// stack readiness source.
+    fn register_waker(&self, waker: &Waker) -> Result<(), PollRegistrationError>;
 }

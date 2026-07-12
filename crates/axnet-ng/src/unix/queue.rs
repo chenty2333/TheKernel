@@ -3,12 +3,14 @@ use core::{
     future::Future,
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
 
 use axerrno::{AxError, AxResult};
-use axpoll::PollSet;
+use axpoll::{PollRegistration, PollSet};
 use axsync::spin::SpinNoIrq;
+
+use crate::general::poll_registration_error;
 
 struct QueueState<T> {
     items: VecDeque<T>,
@@ -25,8 +27,8 @@ struct Shared<T> {
     state: SpinNoIrq<QueueState<T>>,
     senders: AtomicUsize,
     receivers: AtomicUsize,
-    readers: PollSet,
-    writers: PollSet,
+    readers: Arc<PollSet>,
+    writers: Arc<PollSet>,
 }
 
 pub(super) struct Sender<T> {
@@ -81,6 +83,8 @@ pub(super) fn try_bounded<T>(capacity: usize) -> AxResult<(Sender<T>, Receiver<T
     items
         .try_reserve_exact(capacity)
         .map_err(|_| AxError::NoMemory)?;
+    let readers = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
+    let writers = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
     let shared = Arc::try_new(Shared {
         capacity,
         state: SpinNoIrq::new(QueueState {
@@ -91,8 +95,8 @@ pub(super) fn try_bounded<T>(capacity: usize) -> AxResult<(Sender<T>, Receiver<T
         }),
         senders: AtomicUsize::new(1),
         receivers: AtomicUsize::new(1),
-        readers: PollSet::new(),
-        writers: PollSet::new(),
+        readers,
+        writers,
     })
     .map_err(|_| AxError::NoMemory)?;
     Ok((
@@ -163,8 +167,8 @@ impl<T> Sender<T> {
         self.shared.state.lock().receive_closed
     }
 
-    pub(super) fn register_write(&self, waker: &Waker) {
-        self.shared.writers.register(waker);
+    pub(super) fn write_poll_source(&self) -> Arc<PollSet> {
+        self.shared.writers.clone()
     }
 }
 
@@ -218,7 +222,10 @@ impl<T> Receiver<T> {
     }
 
     pub(super) fn recv(&self) -> Recv<'_, T> {
-        Recv { receiver: self }
+        Recv {
+            receiver: self,
+            registration: None,
+        }
     }
 
     pub(super) fn close(&self) {
@@ -255,8 +262,8 @@ impl<T> Receiver<T> {
         self.shared.state.lock().items.len()
     }
 
-    pub(super) fn register_read(&self, waker: &Waker) {
-        self.shared.readers.register(waker);
+    pub(super) fn read_poll_source(&self) -> Arc<PollSet> {
+        self.shared.readers.clone()
     }
 
     pub(super) fn wake_writers(&self) {
@@ -310,20 +317,51 @@ impl<T> Drop for SendPermit<T> {
 
 pub(super) struct Recv<'a, T> {
     receiver: &'a Receiver<T>,
+    registration: Option<PollRegistration<'a>>,
 }
 
 impl<T> Future for Recv<'_, T> {
-    type Output = Result<T, TryRecvError>;
+    type Output = AxResult<T>;
 
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         match self.receiver.try_recv() {
-            Ok(item) => Poll::Ready(Ok(item)),
-            Err(TryRecvError::Closed) => Poll::Ready(Err(TryRecvError::Closed)),
+            Ok(item) => {
+                self.registration.take();
+                Poll::Ready(Ok(item))
+            }
+            Err(TryRecvError::Closed) => {
+                self.registration.take();
+                Poll::Ready(Err(AxError::ConnectionReset))
+            }
             Err(TryRecvError::Empty) => {
-                self.receiver.register_read(context.waker());
+                let needs_registration = if let Some(registration) = self.registration.as_mut() {
+                    if registration.update(context.waker()).is_ok() {
+                        false
+                    } else {
+                        registration.cancel();
+                        true
+                    }
+                } else {
+                    true
+                };
+                if needs_registration {
+                    let source = self.receiver.read_poll_source();
+                    match PollRegistration::single_owned(source, context.waker()) {
+                        Ok(registration) => self.registration = Some(registration),
+                        Err(error) => {
+                            return Poll::Ready(Err(poll_registration_error(error)));
+                        }
+                    }
+                }
                 match self.receiver.try_recv() {
-                    Ok(item) => Poll::Ready(Ok(item)),
-                    Err(TryRecvError::Closed) => Poll::Ready(Err(TryRecvError::Closed)),
+                    Ok(item) => {
+                        self.registration.take();
+                        Poll::Ready(Ok(item))
+                    }
+                    Err(TryRecvError::Closed) => {
+                        self.registration.take();
+                        Poll::Ready(Err(AxError::ConnectionReset))
+                    }
                     Err(TryRecvError::Empty) => Poll::Pending,
                 }
             }
@@ -333,7 +371,27 @@ impl<T> Future for Recv<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use core::task::Waker;
+
     use super::*;
+
+    #[test]
+    fn recv_future_retains_updates_and_releases_one_source_token() {
+        let (sender, receiver) = try_bounded(1).unwrap();
+        let readers = receiver.read_poll_source();
+        let mut recv = receiver.recv();
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(Pin::new(&mut recv).poll(&mut context).is_pending());
+        assert_eq!(readers.len(), 1);
+        assert!(Pin::new(&mut recv).poll(&mut context).is_pending());
+        assert_eq!(readers.len(), 1);
+
+        sender.try_send(7).unwrap();
+        assert!(readers.is_empty());
+        assert_eq!(Pin::new(&mut recv).poll(&mut context), Poll::Ready(Ok(7)));
+        assert!(readers.is_empty());
+    }
 
     #[test]
     fn queue_is_bounded_and_receiver_close_is_observable() {

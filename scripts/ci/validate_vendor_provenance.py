@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate provenance for every local [patch.crates-io] package."""
+"""Validate vendored patches and classify maintained/local path overrides."""
 
 from __future__ import annotations
 
@@ -22,12 +22,42 @@ LICENSE_STATUSES = {"archive-files", "declared-only", "recovered-after-release"}
 TEST_STATUSES = {"none-published", "restored-exact", "restored-adapted"}
 COMMIT_KINDS = {"exact", "context"}
 
+# These path patches are maintained source inputs, not vendored crates.io
+# forks. Exact path matching is intentional: a typo or a same-name substitute
+# must fall back to the normal provenance requirement instead of inheriting an
+# exemption by package name alone.
+MAINTAINED_SIBLING_PATCHES = {
+    "thekernel-axsched": ("../thekernel-ax/crates/thekernel-axsched", "0.1.0"),
+    "thekernel-axpoll": ("../thekernel-ax/crates/thekernel-axpoll", "0.1.0"),
+    "thekernel-axtask": ("../thekernel-ax/crates/thekernel-axtask", "0.1.0"),
+    "thekernel-linux-vfs": ("../thekernel-linux-abi/crates/vfs", "0.1.0"),
+    "thekernel-linux-fd": ("../thekernel-linux-abi/crates/fd", "0.1.0"),
+    "thekernel-linux-process": ("../thekernel-linux-abi/crates/process", "0.1.0"),
+}
+MAINTAINED_WORKSPACE_DEPENDENCIES = {
+    "linux-vfs": ("thekernel-linux-vfs", "=0.1.0"),
+}
+LOCAL_ADAPTER_PATCHES = {
+    "axtask": ("crates/axtask-compat", "0.3.0-preview.2"),
+    "thekernel-readiness-adapter": ("crates/readiness-adapter", "0.1.0"),
+}
+
+# The active `axtask` patch is now a local facade, while the former crates.io
+# source remains intentionally retained for historical baseline auditing.
+# No other maintained sibling or adapter may acquire a provenance record merely
+# to bypass its exact non-vendor classification.
+RETAINED_NON_VENDOR_BASELINES = {
+    "axtask": "third_party/rust-patches/axtask",
+}
+
 
 @dataclass(frozen=True)
 class ValidationResult:
     errors: tuple[str, ...]
     archive_checks: int
     package_checks: int
+    maintained_checks: int = 0
+    adapter_checks: int = 0
 
 
 def sha256(data: bytes) -> str:
@@ -72,6 +102,129 @@ def patched_paths(root_manifest: Mapping[str, object]) -> dict[str, str]:
             raise ValueError(f"patch {patch_name!r} has an invalid path")
         result[str(patch_name)] = PurePosixPath(path).as_posix()
     return result
+
+
+def validate_maintained_workspace_dependencies(
+    root_manifest: Mapping[str, object],
+    patches: Mapping[str, str],
+    errors: list[str],
+) -> None:
+    workspace = root_manifest.get("workspace", {})
+    if not isinstance(workspace, Mapping):
+        errors.append("root [workspace] table is not a mapping")
+        return
+    dependencies = workspace.get("dependencies", {})
+    if not isinstance(dependencies, Mapping):
+        errors.append("root [workspace.dependencies] table is not a mapping")
+        return
+
+    for alias, (expected_package, expected_version) in (
+        MAINTAINED_WORKSPACE_DEPENDENCIES.items()
+    ):
+        spec = dependencies.get(alias)
+        if spec is None:
+            continue
+        if not isinstance(spec, Mapping):
+            errors.append(
+                f"workspace dependency {alias} must use an explicit dependency table"
+            )
+            continue
+        if spec.get("package") != expected_package:
+            errors.append(
+                f"workspace dependency {alias} package is {spec.get('package')!r}, "
+                f"expected {expected_package!r}"
+            )
+        if spec.get("version") != expected_version:
+            errors.append(
+                f"workspace dependency {alias} version is {spec.get('version')!r}, "
+                f"expected exact {expected_version!r}"
+            )
+        if "path" in spec:
+            errors.append(
+                f"workspace dependency {alias} must use the maintained sibling patch, "
+                "not a direct path"
+            )
+        if expected_package not in patches:
+            errors.append(
+                f"workspace dependency {alias} requires maintained sibling patch "
+                f"{expected_package}"
+            )
+
+
+def classify_patches(
+    patches: Mapping[str, str], errors: list[str]
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    vendored: dict[str, str] = {}
+    maintained: dict[str, str] = {}
+    adapters: dict[str, str] = {}
+    for name, path in patches.items():
+        if name in MAINTAINED_SIBLING_PATCHES:
+            expected, _ = MAINTAINED_SIBLING_PATCHES[name]
+            if path == expected:
+                maintained[name] = path
+            else:
+                errors.append(
+                    f"maintained sibling patch {name} uses {path!r}, expected {expected!r}"
+                )
+                vendored[name] = path
+            continue
+        if name in LOCAL_ADAPTER_PATCHES:
+            expected, _ = LOCAL_ADAPTER_PATCHES[name]
+            if path == expected:
+                adapters[name] = path
+            else:
+                errors.append(
+                    f"local adapter patch {name} uses {path!r}, expected {expected!r}"
+                )
+                vendored[name] = path
+            continue
+        vendored[name] = path
+    return vendored, maintained, adapters
+
+
+def validate_non_vendor_patch(
+    root: Path,
+    name: str,
+    path: str,
+    *,
+    expected_version: str,
+    local_adapter: bool,
+    errors: list[str],
+) -> None:
+    kind = "local adapter" if local_adapter else "maintained sibling"
+    label = f"{name} ({path})"
+    crate_dir = (root / path).resolve()
+    if not crate_dir.is_dir():
+        errors.append(f"{label}: {kind} directory does not exist")
+        return
+    try:
+        package = current_package(crate_dir)
+    except ValueError as exc:
+        errors.append(str(exc))
+        return
+    if package.get("name") != name:
+        errors.append(
+            f"{label}: {kind} package name is {package.get('name')!r}"
+        )
+    if package.get("version") != expected_version:
+        errors.append(
+            f"{label}: {kind} version is {package.get('version')!r}, "
+            f"expected {expected_version!r}"
+        )
+    if local_adapter:
+        try:
+            crate_dir.relative_to(root)
+        except ValueError:
+            errors.append(f"{label}: local adapter escapes the repository")
+        if package.get("publish") is not False:
+            errors.append(f"{label}: local adapter must set publish = false")
+    else:
+        try:
+            crate_dir.relative_to(root)
+        except ValueError:
+            pass
+        else:
+            errors.append(f"{label}: maintained sibling resolves inside the repository")
 
 
 def archive_search_dirs(root: Path, explicit: Sequence[Path]) -> list[Path]:
@@ -267,10 +420,13 @@ def validate_repository(
     errors: list[str] = []
     root = root.resolve()
     try:
-        patches = patched_paths(load_toml(root / "Cargo.toml"))
+        root_manifest = load_toml(root / "Cargo.toml")
+        patches = patched_paths(root_manifest)
         registry = load_toml(root / REGISTRY_REL)
     except ValueError as exc:
         return ValidationResult((str(exc),), 0, 0)
+
+    validate_maintained_workspace_dependencies(root_manifest, patches, errors)
 
     if registry.get("schema") != 1:
         errors.append(f"{REGISTRY_REL}: schema must be 1")
@@ -296,37 +452,70 @@ def validate_repository(
         records[patch] = record
 
     if selected:
-        unknown = selected - patches.keys()
+        unknown = selected - (patches.keys() | records.keys())
         if unknown:
             errors.append(f"unknown selected patch names: {', '.join(sorted(unknown))}")
-        missing_selected = (selected & patches.keys()) - records.keys()
-        if missing_selected:
-            errors.append(
-                "missing provenance records: " + ", ".join(sorted(missing_selected))
-            )
         patches = {key: value for key, value in patches.items() if key in selected}
         records = {key: value for key, value in records.items() if key in selected}
-    else:
-        missing = patches.keys() - records.keys()
-        extra = records.keys() - patches.keys()
-        if missing:
-            errors.append(f"missing provenance records: {', '.join(sorted(missing))}")
-        if extra:
-            errors.append(f"records without local patches: {', '.join(sorted(extra))}")
+
+    vendored_patches, maintained_patches, adapter_patches = classify_patches(
+        patches, errors
+    )
+    non_vendor_records = (
+        maintained_patches.keys() | adapter_patches.keys()
+    ) & records.keys()
+    for patch_name in sorted(non_vendor_records):
+        recorded_path = records[patch_name].get("path")
+        allowed_path = RETAINED_NON_VENDOR_BASELINES.get(patch_name)
+        if recorded_path != allowed_path:
+            errors.append(
+                f"{patch_name}: non-vendor patch has an unexpected provenance record"
+            )
+    missing = vendored_patches.keys() - records.keys()
+    if missing:
+        errors.append(f"missing provenance records: {', '.join(sorted(missing))}")
 
     search_dirs = archive_search_dirs(root, archive_dirs)
     archive_checks = 0
     package_checks = 0
+    maintained_checks = 0
+    adapter_checks = 0
 
-    for patch_name, patch_path in sorted(patches.items()):
-        label = f"{patch_name} ({patch_path})"
-        record = records.get(patch_name)
-        if record is None:
+    for patch_name, patch_path in sorted(maintained_patches.items()):
+        _, expected_version = MAINTAINED_SIBLING_PATCHES[patch_name]
+        validate_non_vendor_patch(
+            root,
+            patch_name,
+            patch_path,
+            expected_version=expected_version,
+            local_adapter=False,
+            errors=errors,
+        )
+        maintained_checks += 1
+
+    for patch_name, patch_path in sorted(adapter_patches.items()):
+        _, expected_version = LOCAL_ADAPTER_PATCHES[patch_name]
+        validate_non_vendor_patch(
+            root,
+            patch_name,
+            patch_path,
+            expected_version=expected_version,
+            local_adapter=True,
+            errors=errors,
+        )
+        adapter_checks += 1
+
+    for patch_name, record in sorted(records.items()):
+        patch_path = record.get("path")
+        if not isinstance(patch_path, str) or not patch_path:
+            errors.append(f"{patch_name}: recorded path must be a non-empty string")
             continue
+        label = f"{patch_name} ({patch_path})"
         package_checks += 1
 
-        if record.get("path") != patch_path:
-            errors.append(f"{label}: recorded path is {record.get('path')!r}")
+        active_path = vendored_patches.get(patch_name)
+        if active_path is not None and active_path != patch_path:
+            errors.append(f"{label}: active patch path is {active_path!r}")
         if record.get("source") != "crates.io":
             errors.append(f"{label}: source must be 'crates.io'")
 
@@ -497,7 +686,13 @@ def validate_repository(
             validate_archive(record, crate_dir, archive_to_check, errors, label)
             archive_checks += 1
 
-    return ValidationResult(tuple(errors), archive_checks, package_checks)
+    return ValidationResult(
+        tuple(errors),
+        archive_checks,
+        package_checks,
+        maintained_checks,
+        adapter_checks,
+    )
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -544,13 +739,18 @@ def main(argv: Sequence[str] = ()) -> int:
             print(f"vendor-provenance: ERROR: {error}", file=sys.stderr)
         print(
             f"vendor-provenance: FAIL ({len(result.errors)} errors, "
-            f"{result.package_checks} packages, {result.archive_checks} archives)",
+            f"{result.package_checks} vendored packages, "
+            f"{result.maintained_checks} maintained siblings, "
+            f"{result.adapter_checks} local adapters, "
+            f"{result.archive_checks} archives)",
             file=sys.stderr,
         )
         return 1
     if not args.quiet:
         print(
-            f"vendor-provenance: PASS ({result.package_checks} packages, "
+            f"vendor-provenance: PASS ({result.package_checks} vendored packages, "
+            f"{result.maintained_checks} maintained siblings, "
+            f"{result.adapter_checks} local adapters, "
             f"{result.archive_checks} archives)"
         )
     return 0

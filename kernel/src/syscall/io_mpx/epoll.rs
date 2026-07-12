@@ -1,17 +1,19 @@
 use alloc::sync::Arc;
-use core::time::Duration;
+use core::{mem::size_of, time::Duration};
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::UserContext;
 use axpoll::IoEvents;
-use axtask::future::{self, block_on, poll_io};
+use axtask::future::{self, block_on};
 use bitflags::bitflags;
 use linux_raw_sys::general::{
-    EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, epoll_event, timespec,
+    EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLLET, EPOLLONESHOT, epoll_event,
+    timespec,
 };
 use starry_signal::SignalSet;
+use starry_vm::VmMutPtr;
 
-use super::wait_io_result;
+use super::{flatten_blocked_timeout, io_to_linux_epoll, linux_epoll_events, wait_io_result};
 use crate::{
     file::{
         FileLike,
@@ -29,6 +31,15 @@ bitflags! {
     pub struct EpollCreateFlags: u32 {
         const CLOEXEC = EPOLL_CLOEXEC;
     }
+}
+
+fn checked_epoll_event_ptr(base: usize, index: usize) -> AxResult<*mut epoll_event> {
+    let offset = index
+        .checked_mul(size_of::<epoll_event>())
+        .ok_or(AxError::BadAddress)?;
+    base.checked_add(offset)
+        .map(|address| address as *mut epoll_event)
+        .ok_or(AxError::BadAddress)
 }
 
 pub fn sys_epoll_create1(flags: u32) -> AxResult<isize> {
@@ -59,9 +70,9 @@ pub fn sys_epoll_ctl(
 
     let parse_event = || -> AxResult<(EpollEvent, EpollFlags)> {
         let event = event.get_as_ref()?;
-        let events = IoEvents::from_bits_truncate(event.events);
-        let flags =
-            EpollFlags::from_bits(event.events & !events.bits()).ok_or(AxError::InvalidInput)?;
+        let flag_bits = event.events & (EPOLLET | EPOLLONESHOT);
+        let events = linux_epoll_events(event.events & !flag_bits)?;
+        let flags = EpollFlags::from_bits(flag_bits).ok_or(AxError::InvalidInput)?;
         Ok((
             EpollEvent {
                 events,
@@ -73,12 +84,12 @@ pub fn sys_epoll_ctl(
     match op {
         EPOLL_CTL_ADD => {
             let (mut event, flags) = parse_event()?;
-            event.events |= IoEvents::ALWAYS_POLL;
+            event.events |= IoEvents::ALWAYS;
             epoll.add(fd, event, flags)?;
         }
         EPOLL_CTL_MOD => {
             let (mut event, flags) = parse_event()?;
-            event.events |= IoEvents::ALWAYS_POLL;
+            event.events |= IoEvents::ALWAYS;
             epoll.modify(fd, event, flags)?;
         }
         EPOLL_CTL_DEL => {
@@ -106,20 +117,53 @@ fn do_epoll_wait(
     if maxevents <= 0 {
         return Err(AxError::InvalidInput);
     }
-    let events = events.get_as_mut_slice(maxevents as usize)?;
     let sigmask = nullable!(sigmask.get_as_ref())?.copied();
     let deadline = timeout.map(|dur| axhal::time::wall_time().saturating_add(dur));
     let mut wait_once = || {
-        block_on(future::timeout(
+        flatten_blocked_timeout(block_on(future::timeout(
             deadline.map(|end| end.saturating_sub(axhal::time::wall_time())),
             async {
-                poll_io(epoll.as_ref(), IoEvents::IN, false, || {
-                    epoll.poll_events(events)
-                })
+                crate::readiness::interruptible_poll_io(
+                    epoll.as_ref(),
+                    IoEvents::READABLE,
+                    false,
+                    || {
+                        let batch = epoll.prepare_events(maxevents as usize)?;
+                        let events_base = events.address().as_usize();
+                        let mut copied = 0;
+                        while copied < batch.len() {
+                            let Some(source) = batch.event(copied) else {
+                                return if copied == 0 {
+                                    Err(AxError::BadState)
+                                } else {
+                                    Ok(batch.complete_prefix(copied))
+                                };
+                            };
+                            let event = epoll_event {
+                                events: io_to_linux_epoll(source.events),
+                                data: source.user_data,
+                            };
+                            let copy_result = checked_epoll_event_ptr(events_base, copied)
+                                .and_then(|destination| {
+                                    destination.vm_write(event).map_err(AxError::from)
+                                });
+                            if let Err(error) = copy_result {
+                                return if copied == 0 {
+                                    let _ = batch.complete_prefix(0);
+                                    Err(error)
+                                } else {
+                                    Ok(batch.complete_prefix(copied))
+                                };
+                            }
+                            copied += 1;
+                        }
+                        Ok(batch.complete_prefix(copied))
+                    },
+                )
                 .await
                 .map(|n| n as isize)
             },
-        ))
+        )))
     };
 
     wait_io_result(uctx, sigmask, &mut wait_once)
@@ -171,4 +215,26 @@ pub fn sys_epoll_pwait2(
         sigmask,
         sigsetsize,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn epoll_copyout_address_arithmetic_never_wraps() {
+        let event_size = size_of::<epoll_event>();
+        assert_eq!(
+            checked_epoll_event_ptr(usize::MAX - event_size, 1).unwrap() as usize,
+            usize::MAX
+        );
+        assert_eq!(
+            checked_epoll_event_ptr(usize::MAX - event_size + 1, 1),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(
+            checked_epoll_event_ptr(0, usize::MAX),
+            Err(AxError::BadAddress)
+        );
+    }
 }

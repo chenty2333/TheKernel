@@ -45,7 +45,7 @@ use crate::{
     mm::{UserConstPtr, UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
     syscall::fs::ctl::validate_pathname,
-    task::{AX_FILE_LIMIT, AsThread, DacCredentialView},
+    task::{AX_FILE_LIMIT, AsThread, DacCredentialView, linux_pid_from_task_id},
     time::wall_time,
 };
 
@@ -235,6 +235,13 @@ const OPENAT2_ALLOWED_RESOLVE: u64 = (RESOLVE_NO_XDEV
     | RESOLVE_BENEATH
     | RESOLVE_IN_ROOT
     | RESOLVE_CACHED) as u64;
+
+const OPEN_NAMESPACE_RESOLVE_FLAGS: u64 =
+    (RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_NO_XDEV) as u64;
+
+const fn open_requires_namespace_operation(flags: u32, resolve: u64) -> bool {
+    flags & (O_CREAT | __O_TMPFILE | O_TRUNC) != 0 || resolve & OPEN_NAMESPACE_RESOLVE_FLAGS != 0
+}
 
 const MAX_FILE_HANDLE_SZ: u32 = 128;
 const NAME_TO_HANDLE_ALLOWED_FLAGS: i32 = (AT_EMPTY_PATH | AT_SYMLINK_FOLLOW) as i32;
@@ -821,6 +828,11 @@ fn openat_inner_with_credentials(
     security: OpenPathSecurityContext,
 ) -> AxResult<isize> {
     let flags = normalize_legacy_open_flags(flags)?;
+    // Named/anonymous creation is a specialized VFS+FD transaction: the FD
+    // slot stays private until open construction succeeds, and the namespace
+    // guard keeps writable-mount admission stable through inode publication.
+    let _mount_namespace =
+        open_requires_namespace_operation(flags as u32, 0).then(crate::mounts::namespace_operation);
     if (flags as u32 & O_TMPFILE) == O_TMPFILE {
         let mut policy = Openat2PathwalkPolicy::legacy()?;
         return with_path_fs(dirfd, Path::new(path), |fs| {
@@ -954,9 +966,11 @@ pub fn sys_openat2(
     let security = OpenPathSecurityContext {
         umask: thread.proc_data.umask(),
     };
-    let mount_namespace =
-        (how.resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_NO_XDEV) as u64 != 0)
-            .then(crate::mounts::namespace_operation);
+    // Use one guard for both scoped pathwalk and creation. Combining the
+    // predicates before acquisition avoids recursively locking the non-
+    // reentrant namespace mutex when openat2 requests both.
+    let mount_namespace = open_requires_namespace_operation(flags as u32, how.resolve)
+        .then(crate::mounts::namespace_operation);
     let mut fs = openat2_context(dirfd, path_ref, how.resolve)?;
     let context = LinuxPathContext::new(
         credentials,
@@ -1029,7 +1043,7 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> AxResult<isize> {
     if flags.contains(CloseRangeFlags::UNSHARE) {
         let curr = current();
         let thread = curr.as_thread();
-        let curr_tid = curr.id().as_u64() as starry_process::Pid;
+        let curr_tid = linux_pid_from_task_id(curr.id().as_u64())?;
         if !thread.proc_data.begin_single_thread_scope_change(curr_tid) {
             return Err(AxError::OperationNotSupported);
         }
@@ -1406,4 +1420,28 @@ pub fn sys_flock(fd: c_int, operation: c_int) -> AxResult<isize> {
 
     crate::file::flock::do_flock((stat.dev, stat.ino), description.flock_owner(), operation)?;
     Ok(0)
+}
+
+#[cfg(test)]
+mod namespace_operation_tests {
+    use super::*;
+
+    #[test]
+    fn creative_open_and_scoped_walk_share_one_namespace_lock_domain() {
+        assert!(!open_requires_namespace_operation(O_RDONLY, 0));
+        assert!(open_requires_namespace_operation(O_CREAT | O_WRONLY, 0));
+        assert!(open_requires_namespace_operation(O_TRUNC | O_WRONLY, 0));
+        assert!(open_requires_namespace_operation(
+            __O_TMPFILE | O_DIRECTORY | O_WRONLY,
+            0
+        ));
+
+        for resolve in [RESOLVE_BENEATH, RESOLVE_IN_ROOT, RESOLVE_NO_XDEV] {
+            assert!(open_requires_namespace_operation(O_RDONLY, resolve as u64));
+            assert!(open_requires_namespace_operation(
+                O_CREAT | O_WRONLY,
+                resolve as u64
+            ));
+        }
+    }
 }

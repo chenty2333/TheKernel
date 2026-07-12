@@ -61,7 +61,10 @@ pub fn rust_main_secondary(cpu_id: usize) -> ! {
     axhal::init_later_secondary(cpu_id);
 
     #[cfg(feature = "multitask")]
-    axtask::init_scheduler_secondary();
+    if let Err(error) = axtask::init_scheduler_secondary() {
+        error!("Secondary task scheduler initialization failed: {error:?}");
+        axhal::power::system_off();
+    }
 
     #[cfg(feature = "ipi")]
     axipi::init();

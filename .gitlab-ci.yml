@@ -17,6 +17,10 @@ default:
   interruptible: true
   before_script:
     - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    # Configure these as non-secret project/group variables with exact
+    # published 40-hex commits. Missing inputs intentionally fail every gate
+    # that would otherwise consume an absent sibling checkout.
+    - ./scripts/ci/provision-maintained-siblings.sh
   cache:
     key: "thekernel-${CI_COMMIT_REF_SLUG}"
     paths:
