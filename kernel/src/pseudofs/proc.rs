@@ -77,8 +77,8 @@ use crate::{
         sysvipc_shm_snapshot,
     },
     task::{
-        AsThread, Cred, ID_MAP_MAX_EXTENTS, IdMapInputExtent, Mempolicy, PidNamespace, Process,
-        ProcessData, PtraceCredentialMode, TimeNamespace, UserNamespace, UtsNamespace,
+        AsThread, Cred, ID_MAP_MAX_EXTENTS, IdMapInputExtent, Kgid, Kuid, Mempolicy, PidNamespace,
+        Process, ProcessData, PtraceCredentialMode, TimeNamespace, UserNamespace, UtsNamespace,
         check_current_ptrace_access, get_process_data, get_process_including_zombie, get_task,
         get_visible_task, get_visible_task_including_exiting, may_begin_gid_map_write,
         may_begin_uid_map_write, may_update_setgroups_policy, may_write_gid_map, may_write_uid_map,
@@ -898,8 +898,8 @@ impl ProcUserNamespaceFile {
         fs: Arc<SimpleFs>,
         namespace: Arc<UserNamespace>,
         kind: ProcUserNamespaceFileKind,
-        owner_uid: u32,
-        owner_gid: u32,
+        owner_uid: Kuid,
+        owner_gid: Kgid,
     ) -> VfsResult<Arc<Self>> {
         let node = SimpleFsNode::try_new(
             fs,
@@ -908,8 +908,8 @@ impl ProcUserNamespaceFile {
         )?;
         {
             let mut metadata = node.metadata.lock();
-            metadata.uid = owner_uid;
-            metadata.gid = owner_gid;
+            metadata.uid = owner_uid.into_raw();
+            metadata.gid = owner_gid.into_raw();
         }
         Arc::try_new(Self {
             node,
@@ -1835,7 +1835,7 @@ impl FileNodeOps for ProcNamespaceFile {
             NS_GET_OWNER_UID => match &self.object {
                 ProcNamespaceObject::User(ns) => {
                     let viewer = current().as_thread().current_cred();
-                    let owner = viewer.user_ns().from_kuid_munged(ns.owner_uid());
+                    let owner = viewer.user_ns().from_kuid_munged(ns.owner_kuid());
                     (arg as *mut u32).vm_write(owner)?;
                     Ok(0)
                 }
@@ -3432,6 +3432,14 @@ mod tests {
 
     use super::*;
 
+    fn kuid(raw: u32) -> Kuid {
+        Kuid::from_raw(raw).unwrap()
+    }
+
+    fn kgid(raw: u32) -> Kgid {
+        Kgid::from_raw(raw).unwrap()
+    }
+
     #[test]
     fn id_map_parser_enforces_linux_record_bounds() {
         assert_eq!(
@@ -3487,7 +3495,7 @@ mod tests {
     #[test]
     fn id_map_render_uses_frozen_viewer_namespace() {
         let root = UserNamespace::try_new_root().unwrap();
-        let parent = root.try_fork(1000, 1000, true).unwrap();
+        let parent = root.try_fork(kuid(1000), kgid(1000), true).unwrap();
         let parent_uid_map = parent
             .try_build_uid_map(vec![IdMapInputExtent::new(100, 1000, 20)])
             .unwrap();
@@ -3497,7 +3505,7 @@ mod tests {
         parent.publish_uid_map(parent_uid_map).unwrap();
         parent.publish_gid_map(parent_gid_map, false).unwrap();
 
-        let child = parent.try_fork(1005, 1005, false).unwrap();
+        let child = parent.try_fork(kuid(1005), kgid(1005), false).unwrap();
         let child_uid_map = child
             .try_build_uid_map(vec![IdMapInputExtent::new(0, 105, 5)])
             .unwrap();
@@ -3512,7 +3520,7 @@ mod tests {
             format!("{:>10} {:>10} {:>10}\n", 0, 1005, 5).into_bytes()
         );
 
-        let unmapped_viewer = root.try_fork(2000, 2000, false).unwrap();
+        let unmapped_viewer = root.try_fork(kuid(2000), kgid(2000), false).unwrap();
         assert_eq!(
             render_id_map(&child, &unmapped_viewer, true).unwrap(),
             format!("{:>10} {:>10} {:>10}\n", 0, u32::MAX, 5).into_bytes()

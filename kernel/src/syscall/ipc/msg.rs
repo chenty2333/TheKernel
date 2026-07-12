@@ -475,8 +475,8 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
     let thread = current.as_thread();
     let proc_data = &thread.proc_data;
     let ids = thread.current_cred().ids();
-    let current_uid = ids.euid;
-    let current_gid = ids.egid;
+    let current_uid = ids.euid.into_raw();
+    let current_gid = ids.egid.into_raw();
     let current_pid = proc_data.proc.pid();
 
     let mut msg_manager = MSG_MANAGER.lock();
@@ -567,8 +567,8 @@ pub fn sys_msgsnd(
     let thread = current.as_thread();
     let proc_data = &thread.proc_data;
     let ids = thread.current_cred().ids();
-    let current_uid = ids.euid;
-    let current_gid = ids.egid;
+    let current_uid = ids.euid.into_raw();
+    let current_gid = ids.egid.into_raw();
     let current_pid = proc_data.proc.pid();
     let flags = MsgSndFlags::from_bits_truncate(msgflg);
 
@@ -684,8 +684,8 @@ pub fn sys_msgrcv(
     let thread = current.as_thread();
     let proc_data = &thread.proc_data;
     let ids = thread.current_cred().ids();
-    let current_uid = ids.euid;
-    let current_gid = ids.egid;
+    let current_uid = ids.euid.into_raw();
+    let current_gid = ids.egid.into_raw();
     let current_pid = proc_data.proc.pid();
 
     // Check validity of flag combinations
@@ -791,10 +791,12 @@ pub fn sys_msgrcv(
 pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
     //  Get current process information
     let current = current();
-    let ids = current.as_thread().current_cred().ids();
-    let current_uid = ids.euid;
-    let current_gid = ids.egid;
-    let is_privileged = current_uid == 0; // root user check
+    let cred = current.as_thread().current_cred();
+    let ids = cred.ids();
+    let current_kuid = ids.euid;
+    let current_uid = current_kuid.into_raw();
+    let current_gid = ids.egid.into_raw();
+    let is_privileged = cred.is_initial_root_euid();
 
     // Validate command code
     if cmd != IPC_STAT

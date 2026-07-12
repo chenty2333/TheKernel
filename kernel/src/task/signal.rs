@@ -13,7 +13,7 @@ use starry_signal::{
 
 use super::{
     AsThread, ContinueResult, Cred, ProcessData, Thread, acknowledge_posix_timer_signal, do_exit,
-    fail_closed_exit, get_process_data, get_process_group, get_task, get_visible_task, idmap::Kuid,
+    fail_closed_exit, get_process_data, get_process_group, get_task, get_visible_task,
     linux_pid_from_task_id, process_domain, process_error,
 };
 use crate::readiness::block_on_poll_set;
@@ -181,7 +181,7 @@ fn prepare_signal_for_target(
         return Ok(PreparedSignal::unqueued(info));
     }
     let limit = target.rlim.read()[RLIMIT_SIGPENDING].current;
-    let real_uid = Kuid::from_raw(target_cred.ids().ruid).ok_or(AxError::InvalidInput)?;
+    let real_uid = target_cred.ids().ruid;
     match target_cred.user_ns().try_signal_queue_accounts(real_uid) {
         Ok((per_user, global)) => {
             prepare_signal_with_accounts(info, policy, limit, &per_user, &global)

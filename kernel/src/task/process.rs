@@ -241,8 +241,8 @@ impl UserNamespace {
             id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
             level: 0,
             parent: None,
-            owner: Kuid::from_raw(0).ok_or(AxError::InvalidInput)?,
-            _group: Kgid::from_raw(0).ok_or(AxError::InvalidInput)?,
+            owner: Kuid::INITIAL_ROOT,
+            _group: Kgid::INITIAL_ROOT,
             parent_could_setfcap: true,
             uid_map: SpinNoIrq::new(identity.clone()),
             gid_map: SpinNoIrq::new(identity),
@@ -259,8 +259,8 @@ impl UserNamespace {
 
     pub(crate) fn try_fork(
         self: &Arc<Self>,
-        owner_uid: u32,
-        owner_gid: u32,
+        owner: Kuid,
+        group: Kgid,
         parent_could_setfcap: bool,
     ) -> AxResult<Arc<Self>> {
         // Linux rejects creation once the parent nesting level is already
@@ -268,8 +268,6 @@ impl UserNamespace {
         if self.level > 32 {
             return Err(axerrno::LinuxError::ENOSPC.into());
         }
-        let owner = Kuid::from_raw(owner_uid).ok_or(AxError::InvalidInput)?;
-        let group = Kgid::from_raw(owner_gid).ok_or(AxError::InvalidInput)?;
         if self.kernel_uid_to_user(owner).is_none() || self.kernel_gid_to_user(group).is_none() {
             return Err(AxError::OperationNotPermitted);
         }
@@ -308,10 +306,6 @@ impl UserNamespace {
 
     pub(crate) fn is_initial(&self) -> bool {
         self.parent.is_none()
-    }
-
-    pub(crate) fn owner_uid(&self) -> u32 {
-        self.owner.into_raw()
     }
 
     pub(crate) fn owner_kuid(&self) -> Kuid {
@@ -476,28 +470,30 @@ impl UserNamespace {
         self.gid_map().kernel_gid_to_user(gid)
     }
 
-    pub(crate) fn make_kuid(&self, uid: u32) -> Option<u32> {
-        UserUid::from_raw(uid)
-            .and_then(|uid| self.user_uid_to_kernel(uid))
-            .map(Kuid::into_raw)
+    pub(crate) fn make_kuid(&self, uid: u32) -> Option<Kuid> {
+        UserUid::from_raw(uid).and_then(|uid| self.user_uid_to_kernel(uid))
     }
 
-    pub(crate) fn make_kgid(&self, gid: u32) -> Option<u32> {
-        UserGid::from_raw(gid)
-            .and_then(|gid| self.user_gid_to_kernel(gid))
-            .map(Kgid::into_raw)
+    pub(crate) fn root_kuid(&self) -> Option<Kuid> {
+        self.user_uid_to_kernel(UserUid::ROOT)
     }
 
-    pub(crate) fn from_kuid_munged(&self, uid: u32) -> u32 {
-        Kuid::from_raw(uid)
-            .and_then(|uid| self.kernel_uid_to_user(uid))
+    pub(crate) fn make_kgid(&self, gid: u32) -> Option<Kgid> {
+        UserGid::from_raw(gid).and_then(|gid| self.user_gid_to_kernel(gid))
+    }
+
+    pub(crate) fn root_kgid(&self) -> Option<Kgid> {
+        self.user_gid_to_kernel(UserGid::ROOT)
+    }
+
+    pub(crate) fn from_kuid_munged(&self, uid: Kuid) -> u32 {
+        self.kernel_uid_to_user(uid)
             .map(UserUid::into_raw)
             .unwrap_or(Self::OVERFLOW_ID)
     }
 
-    pub(crate) fn from_kgid_munged(&self, gid: u32) -> u32 {
-        Kgid::from_raw(gid)
-            .and_then(|gid| self.kernel_gid_to_user(gid))
+    pub(crate) fn from_kgid_munged(&self, gid: Kgid) -> u32 {
+        self.kernel_gid_to_user(gid)
             .map(UserGid::into_raw)
             .unwrap_or(Self::OVERFLOW_ID)
     }
@@ -2114,17 +2110,22 @@ mod tests {
     };
     use crate::task::{
         Cred, CredentialSlot,
-        idmap::{IdMapInputExtent, Kuid},
+        idmap::{IdMapInputExtent, Kgid, Kuid},
     };
 
     fn kuid(raw: u32) -> Kuid {
         Kuid::from_raw(raw).unwrap()
     }
 
+    fn kgid(raw: u32) -> Kgid {
+        Kgid::from_raw(raw).unwrap()
+    }
+
     fn credential_slot(uid: u32) -> Arc<CredentialSlot> {
         let namespace = UserNamespace::try_new_root().unwrap();
         let slot = CredentialSlot::try_new(Cred::try_root(namespace).unwrap()).unwrap();
         if uid != 0 {
+            let uid = kuid(uid);
             let mut update = slot.prepare();
             update.builder.ids.ruid = uid;
             update.builder.ids.euid = uid;
@@ -2168,7 +2169,7 @@ mod tests {
         let binding = GroupLeaderCredentialBinding::new(slot.clone());
         drop(slot);
 
-        assert_eq!(binding.current_cred().ids().ruid, 1000);
+        assert_eq!(binding.current_cred().ids().ruid, kuid(1000));
         assert!(weak.upgrade().is_some());
         drop(binding);
         assert!(weak.upgrade().is_none());
@@ -2189,20 +2190,23 @@ mod tests {
                 start.wait();
                 for _ in 0..READS {
                     let uid = binding.current_cred().ids().ruid;
-                    assert!(uid == 1000 || uid == 3000, "mixed handoff uid {uid}");
+                    assert!(
+                        uid == kuid(1000) || uid == kuid(3000),
+                        "mixed handoff uid {uid:?}"
+                    );
                 }
             })
         };
 
         let mut update = new.prepare();
-        update.builder.ids.ruid = 3000;
-        update.builder.ids.euid = 3000;
-        update.builder.ids.suid = 3000;
-        update.builder.ids.fsuid = 3000;
+        update.builder.ids.ruid = kuid(3000);
+        update.builder.ids.euid = kuid(3000);
+        update.builder.ids.suid = kuid(3000);
+        update.builder.ids.fsuid = kuid(3000);
         let prepared = update.finish().unwrap();
         start.wait();
         let retirement = binding.publish_handoff(new.clone(), Some(prepared));
-        assert_eq!(binding.current_cred().ids().ruid, 3000);
+        assert_eq!(binding.current_cred().ids().ruid, kuid(3000));
         drop(retirement);
         reader.join().unwrap();
     }
@@ -2227,7 +2231,7 @@ mod tests {
     #[test]
     fn descendant_user_namespaces_share_the_root_global_account_only() {
         let root = UserNamespace::try_new_root().unwrap();
-        let child = root.try_fork(1000, 1000, false).unwrap();
+        let child = root.try_fork(kuid(1000), kgid(1000), false).unwrap();
         child
             .publish_uid_map(
                 child
@@ -2243,7 +2247,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let grandchild = child.try_fork(1000, 1000, false).unwrap();
+        let grandchild = child.try_fork(kuid(1000), kgid(1000), false).unwrap();
 
         let (root_user, root_global) = root.try_signal_queue_accounts(kuid(1000)).unwrap();
         let (child_user, child_global) = child.try_signal_queue_accounts(kuid(1000)).unwrap();
@@ -2259,7 +2263,7 @@ mod tests {
     #[test]
     fn user_namespace_maps_publish_once_and_setgroups_deny_is_irreversible() {
         let root = UserNamespace::try_new_root().unwrap();
-        let child = root.try_fork(1000, 1000, false).unwrap();
+        let child = root.try_fork(kuid(1000), kgid(1000), false).unwrap();
         assert!(child.uid_map().is_empty());
         assert!(child.gid_map().is_empty());
 
@@ -2301,9 +2305,9 @@ mod tests {
     #[test]
     fn nested_user_namespace_owner_must_be_mapped_in_parent() {
         let root = UserNamespace::try_new_root().unwrap();
-        let child = root.try_fork(1000, 1000, false).unwrap();
+        let child = root.try_fork(kuid(1000), kgid(1000), false).unwrap();
         assert!(matches!(
-            child.try_fork(1000, 1000, false),
+            child.try_fork(kuid(1000), kgid(1000), false),
             Err(AxError::OperationNotPermitted)
         ));
     }

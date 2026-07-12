@@ -20,7 +20,7 @@ use starry_signal::{SignalInfo, Signo};
 use super::{FD_TABLE, File};
 use crate::{
     readiness::{poll_io_error, poll_set_io},
-    task::{AsThread, send_signal_to_process},
+    task::{AsThread, Kuid, send_signal_to_process},
 };
 
 type InodeId = (u64, u64);
@@ -110,7 +110,8 @@ fn current_pid() -> u32 {
 fn current_can_set_lease(owner_uid: u32) -> bool {
     current().try_as_thread().is_some_and(|thr| {
         let cred = thr.current_cred();
-        cred.ids().fsuid == owner_uid || cred.has_effective_capability(CAP_LEASE)
+        Kuid::from_raw(owner_uid) == Some(cred.ids().fsuid)
+            || cred.has_effective_capability(CAP_LEASE)
     })
 }
 

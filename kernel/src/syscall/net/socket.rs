@@ -42,7 +42,11 @@ fn current_unix_credentials() -> UnixCredentials {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let ids = curr.as_thread().current_cred().ids();
-    UnixCredentials::new(proc_data.proc.pid(), ids.euid, ids.egid)
+    UnixCredentials::new(
+        proc_data.proc.pid(),
+        ids.euid.into_raw(),
+        ids.egid.into_raw(),
+    )
 }
 
 fn require_bind_permissions(addr: &SocketAddrEx) -> AxResult<()> {
@@ -50,11 +54,12 @@ fn require_bind_permissions(addr: &SocketAddrEx) -> AxResult<()> {
         return Ok(());
     };
 
-    if ip_addr.port() != 0
-        && ip_addr.port() < FIRST_UNPRIVILEGED_PORT
-        && current().as_thread().euid() != 0
-    {
-        return Err(AxError::from(LinuxError::EACCES));
+    if ip_addr.port() != 0 && ip_addr.port() < FIRST_UNPRIVILEGED_PORT {
+        let current = current();
+        let cred = current.as_thread().current_cred();
+        if !cred.is_initial_root_euid() {
+            return Err(AxError::from(LinuxError::EACCES));
+        }
     }
 
     Ok(())

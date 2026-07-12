@@ -5,7 +5,10 @@ use axerrno::{AxError, AxResult};
 use axsync::spin::SpinNoIrq;
 use linux_raw_sys::general::{CAP_LAST_CAP, NGROUPS_MAX};
 
-use super::process::UserNamespace;
+use super::{
+    idmap::{Kgid, Kuid},
+    process::UserNamespace,
+};
 
 #[cfg(not(test))]
 type CredentialUpdateMutex<T> = axsync::Mutex<T>;
@@ -44,16 +47,31 @@ pub(in crate::task) const SECURE_ALL_BITS: u32 =
     (1 << 0) | SECBIT_NO_SETUID_FIXUP | SECBIT_KEEP_CAPS | SECBIT_NO_CAP_AMBIENT_RAISE;
 pub(in crate::task) const SECURE_ALL_LOCKS: u32 = SECURE_ALL_BITS << 1;
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct Credentials {
-    pub(crate) ruid: u32,
-    pub(crate) euid: u32,
-    pub(crate) suid: u32,
-    pub(crate) fsuid: u32,
-    pub(crate) rgid: u32,
-    pub(crate) egid: u32,
-    pub(crate) sgid: u32,
-    pub(crate) fsgid: u32,
+    pub(crate) ruid: Kuid,
+    pub(crate) euid: Kuid,
+    pub(crate) suid: Kuid,
+    pub(crate) fsuid: Kuid,
+    pub(crate) rgid: Kgid,
+    pub(crate) egid: Kgid,
+    pub(crate) sgid: Kgid,
+    pub(crate) fsgid: Kgid,
+}
+
+impl Credentials {
+    pub(crate) const fn root() -> Self {
+        Self {
+            ruid: Kuid::INITIAL_ROOT,
+            euid: Kuid::INITIAL_ROOT,
+            suid: Kuid::INITIAL_ROOT,
+            fsuid: Kuid::INITIAL_ROOT,
+            rgid: Kgid::INITIAL_ROOT,
+            egid: Kgid::INITIAL_ROOT,
+            sgid: Kgid::INITIAL_ROOT,
+            fsgid: Kgid::INITIAL_ROOT,
+        }
+    }
 }
 
 /// Immutable, sorted supplementary-group storage shared by credential snapshots.
@@ -63,11 +81,11 @@ pub(crate) struct Credentials {
 /// views share group storage instead of cloning a `Vec` while resolving paths.
 #[derive(Debug)]
 pub(crate) struct GroupInfo {
-    groups: Vec<u32>,
+    groups: Vec<Kgid>,
 }
 
 impl GroupInfo {
-    pub(crate) fn try_new(mut groups: Vec<u32>) -> AxResult<Arc<Self>> {
+    pub(crate) fn try_new(mut groups: Vec<Kgid>) -> AxResult<Arc<Self>> {
         if groups.len() > NGROUPS_MAX as usize {
             return Err(AxError::InvalidInput);
         }
@@ -76,11 +94,11 @@ impl GroupInfo {
         Arc::try_new(Self { groups }).map_err(|_| AxError::NoMemory)
     }
 
-    pub(crate) fn as_slice(&self) -> &[u32] {
+    pub(crate) fn as_slice(&self) -> &[Kgid] {
         &self.groups
     }
 
-    pub(crate) fn contains(&self, gid: u32) -> bool {
+    pub(crate) fn contains(&self, gid: Kgid) -> bool {
         self.groups.binary_search(&gid).is_ok()
     }
 }
@@ -91,8 +109,8 @@ impl GroupInfo {
 /// shares its immutable group storage without a fallible per-operation clone.
 #[derive(Debug, Clone)]
 pub(crate) struct DacCredentialView {
-    uid: u32,
-    gid: u32,
+    uid: Kuid,
+    gid: Kgid,
     groups: Arc<GroupInfo>,
     effective: [u32; CAPABILITY_WORDS],
     capabilities_apply_to_initial_user_ns: bool,
@@ -100,8 +118,8 @@ pub(crate) struct DacCredentialView {
 
 impl DacCredentialView {
     pub(crate) fn new(
-        uid: u32,
-        gid: u32,
+        uid: Kuid,
+        gid: Kgid,
         groups: Arc<GroupInfo>,
         effective: [u32; CAPABILITY_WORDS],
         capabilities_apply_to_initial_user_ns: bool,
@@ -115,15 +133,15 @@ impl DacCredentialView {
         }
     }
 
-    pub(crate) fn uid(&self) -> u32 {
+    pub(crate) fn uid(&self) -> Kuid {
         self.uid
     }
 
-    pub(crate) fn gid(&self) -> u32 {
+    pub(crate) fn gid(&self) -> Kgid {
         self.gid
     }
 
-    pub(crate) fn supplementary_groups(&self) -> &[u32] {
+    pub(crate) fn supplementary_groups(&self) -> &[Kgid] {
         self.groups.as_slice()
     }
 
@@ -138,17 +156,29 @@ impl DacCredentialView {
     }
 
     #[cfg(test)]
+    pub(crate) fn selected_capability(&self, cap: u32) -> bool {
+        let Some((word, mask)) = CapabilityState::cap_mask(cap) else {
+            return false;
+        };
+        self.effective[word] & mask != 0
+    }
+
+    #[cfg(test)]
     pub(crate) fn try_for_test(
         uid: u32,
         gid: u32,
         source_groups: &[u32],
         effective: [u32; CAPABILITY_WORDS],
     ) -> AxResult<Self> {
+        let uid = Kuid::from_raw(uid).ok_or(AxError::InvalidInput)?;
+        let gid = Kgid::from_raw(gid).ok_or(AxError::InvalidInput)?;
         let mut groups = Vec::new();
         groups
             .try_reserve_exact(source_groups.len())
             .map_err(|_| AxError::NoMemory)?;
-        groups.extend_from_slice(source_groups);
+        for group in source_groups {
+            groups.push(Kgid::from_raw(*group).ok_or(AxError::InvalidInput)?);
+        }
         Ok(Self::new(
             uid,
             gid,
@@ -267,10 +297,10 @@ impl Cred {
     pub(crate) fn try_root(user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
         let mut groups = Vec::new();
         groups.try_reserve_exact(1).map_err(|_| AxError::NoMemory)?;
-        groups.push(0);
+        groups.push(Kgid::INITIAL_ROOT);
         let groups = GroupInfo::try_new(groups)?;
         Arc::try_new(Self {
-            ids: Credentials::default(),
+            ids: Credentials::root(),
             groups,
             caps: CapabilityState::full(),
             no_new_privs: false,
@@ -338,6 +368,18 @@ impl Cred {
     /// bits must never silently become host authority.
     pub(crate) fn has_effective_capability(&self, cap: u32) -> bool {
         self.user_ns.is_initial() && self.has_effective_capability_in_own_user_ns(cap)
+    }
+
+    /// Preserves legacy UID-0 authority for global objects which do not yet
+    /// carry an owning user namespace. A child namespace may map its root to
+    /// kernel ID 0, so the typed ID comparison alone is not sufficient.
+    pub(crate) fn is_initial_root_euid(&self) -> bool {
+        self.user_ns.is_initial() && self.ids.euid == Kuid::INITIAL_ROOT
+    }
+
+    /// Real-UID counterpart of [`Self::is_initial_root_euid`].
+    pub(crate) fn is_initial_root_ruid(&self) -> bool {
+        self.user_ns.is_initial() && self.ids.ruid == Kuid::INITIAL_ROOT
     }
 
     /// Tests the capability set relative to this credential's own user
@@ -585,6 +627,14 @@ mod tests {
 
     use super::*;
 
+    fn kuid(raw: u32) -> Kuid {
+        Kuid::from_raw(raw).unwrap()
+    }
+
+    fn kgid(raw: u32) -> Kgid {
+        Kgid::from_raw(raw).unwrap()
+    }
+
     fn slot() -> Arc<CredentialSlot> {
         let namespace = UserNamespace::try_new_root().unwrap();
         Arc::new(CredentialSlot::new(Cred::try_root(namespace).unwrap()))
@@ -595,11 +645,12 @@ mod tests {
     }
 
     fn publish_raw_setuid(slot: &CredentialSlot, uid: u32) {
+        let kernel_uid = kuid(uid);
         let mut update = slot.prepare();
-        update.builder.ids.ruid = uid;
-        update.builder.ids.euid = uid;
-        update.builder.ids.suid = uid;
-        update.builder.ids.fsuid = uid;
+        update.builder.ids.ruid = kernel_uid;
+        update.builder.ids.euid = kernel_uid;
+        update.builder.ids.suid = kernel_uid;
+        update.builder.ids.fsuid = kernel_uid;
         if uid != 0 {
             update.builder.caps.effective = [0; CAPABILITY_WORDS];
             update.builder.caps.permitted = [0; CAPABILITY_WORDS];
@@ -615,8 +666,8 @@ mod tests {
 
         publish_raw_setuid(&first, 1000);
 
-        assert_eq!(first.current().ids().euid, 1000);
-        assert_eq!(second.current().ids().euid, 0);
+        assert_eq!(first.current().ids().euid, kuid(1000));
+        assert_eq!(second.current().ids().euid, Kuid::INITIAL_ROOT);
     }
 
     #[test]
@@ -654,12 +705,12 @@ mod tests {
         publish_raw_setuid(&caller, 1000);
 
         let child = inherited_slot(&caller);
-        assert_eq!(child.current().ids().euid, 1000);
-        assert_eq!(unrelated_sibling.current().ids().euid, 0);
+        assert_eq!(child.current().ids().euid, kuid(1000));
+        assert_eq!(unrelated_sibling.current().ids().euid, Kuid::INITIAL_ROOT);
 
         publish_raw_setuid(&caller, 2000);
-        assert_eq!(caller.current().ids().euid, 2000);
-        assert_eq!(child.current().ids().euid, 1000);
+        assert_eq!(caller.current().ids().euid, kuid(2000));
+        assert_eq!(child.current().ids().euid, kuid(1000));
     }
 
     #[test]
@@ -680,12 +731,12 @@ mod tests {
         // the executing Thread or the slot captured by this transaction.
         prepared.commit();
 
-        assert_eq!(executor.current().ids().euid, 1000);
+        assert_eq!(executor.current().ids().euid, kuid(1000));
         assert_eq!(
             executor.current().capabilities().securebits & SECBIT_KEEP_CAPS,
             0
         );
-        assert_eq!(leader.current().ids().euid, 2000);
+        assert_eq!(leader.current().ids().euid, kuid(2000));
     }
 
     #[test]
@@ -693,14 +744,14 @@ mod tests {
         let slot = slot();
         let original = slot.current();
         let mut update = slot.prepare();
-        update.builder.ids.ruid = 1000;
+        update.builder.ids.ruid = kuid(1000);
         let prepared = update.finish().unwrap();
-        assert_eq!(prepared.proposed().ids().ruid, 1000);
+        assert_eq!(prepared.proposed().ids().ruid, kuid(1000));
         drop(prepared);
 
         let observed = slot.current();
         assert!(Arc::ptr_eq(&original, &observed));
-        assert_eq!(observed.ids().ruid, 0);
+        assert_eq!(observed.ids().ruid, Kuid::INITIAL_ROOT);
     }
 
     #[test]
@@ -765,14 +816,14 @@ mod tests {
 
     #[test]
     fn group_info_is_sorted_deduplicated_and_bounded() {
-        let groups = GroupInfo::try_new(vec![300, 100, 300, 200]).unwrap();
-        assert_eq!(groups.as_slice(), [100, 200, 300]);
+        let groups = GroupInfo::try_new(vec![kgid(300), kgid(100), kgid(300), kgid(200)]).unwrap();
+        assert_eq!(groups.as_slice(), [kgid(100), kgid(200), kgid(300)]);
 
         let mut too_many = Vec::new();
         too_many
             .try_reserve_exact(NGROUPS_MAX as usize + 1)
             .unwrap();
-        too_many.resize(NGROUPS_MAX as usize + 1, 1);
+        too_many.resize(NGROUPS_MAX as usize + 1, kgid(1));
         assert_eq!(
             GroupInfo::try_new(too_many).err(),
             Some(AxError::InvalidInput)
@@ -783,6 +834,8 @@ mod tests {
     fn entering_new_user_namespace_resets_namespace_relative_capabilities() {
         let root_ns = UserNamespace::try_new_root().unwrap();
         let slot = CredentialSlot::new(Cred::try_root(root_ns.clone()).unwrap());
+        assert!(slot.current().is_initial_root_euid());
+        assert!(slot.current().is_initial_root_ruid());
         let mut update = slot.prepare();
         update.builder.caps.effective = [0; CAPABILITY_WORDS];
         update.builder.caps.permitted = [0; CAPABILITY_WORDS];
@@ -790,7 +843,9 @@ mod tests {
         update.builder.no_new_privs = true;
         let old = update.finish().unwrap().commit();
 
-        let child_ns = root_ns.try_fork(0, 0, false).unwrap();
+        let child_ns = root_ns
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
+            .unwrap();
         let child = Cred::try_with_user_ns(&old, child_ns.clone()).unwrap();
         let caps = child.capabilities();
         assert!(Arc::ptr_eq(child.user_ns(), &child_ns));
@@ -804,6 +859,8 @@ mod tests {
         assert_eq!(caps.securebits, 0);
         assert!(child.has_effective_capability_in_own_user_ns(CAP_DAC_OVERRIDE));
         assert!(!child.has_effective_capability(CAP_DAC_OVERRIDE));
+        assert!(!child.is_initial_root_euid());
+        assert!(!child.is_initial_root_ruid());
 
         let ids = child.ids();
         let dac = DacCredentialView::new(
@@ -831,7 +888,7 @@ mod tests {
                 for value in 1..=UPDATES {
                     round.wait();
                     let mut update = slot.prepare();
-                    update.builder.ids.ruid = value;
+                    update.builder.ids.ruid = kuid(value);
                     update.finish().unwrap().commit();
                     finish.wait();
                 }
@@ -843,7 +900,7 @@ mod tests {
                 for value in 1..=UPDATES {
                     round.wait();
                     let mut update = slot.prepare();
-                    update.builder.ids.rgid = 10_000 + value;
+                    update.builder.ids.rgid = kgid(10_000 + value);
                     update.finish().unwrap().commit();
                     finish.wait();
                 }
@@ -853,8 +910,8 @@ mod tests {
         uid_writer.join().unwrap();
         gid_writer.join().unwrap();
         let ids = slot.current().ids();
-        assert_eq!(ids.ruid, UPDATES);
-        assert_eq!(ids.rgid, 10_000 + UPDATES);
+        assert_eq!(ids.ruid, kuid(UPDATES));
+        assert_eq!(ids.rgid, kgid(10_000 + UPDATES));
     }
 
     #[test]
@@ -864,16 +921,16 @@ mod tests {
 
         let slot = slot();
         let root_ns = slot.current().user_ns().clone();
-        let child_ns = root_ns.try_fork(1000, 100, false).unwrap();
+        let child_ns = root_ns.try_fork(kuid(1000), kgid(100), false).unwrap();
 
         let publish = |slot: &CredentialSlot, first: bool| {
             let mut update = slot.prepare();
             let (id, group, cap, securebits, namespace) = if first {
-                (1000, 100, CAP_CHOWN, 0, root_ns.clone())
+                (kuid(1000), kgid(100), CAP_CHOWN, 0, root_ns.clone())
             } else {
                 (
-                    2000,
-                    200,
+                    kuid(2000),
+                    kgid(200),
                     CAP_DAC_OVERRIDE,
                     SECBIT_KEEP_CAPS,
                     child_ns.clone(),
@@ -916,16 +973,16 @@ mod tests {
                         let cred = slot.current();
                         let ids = cred.ids();
                         let caps = cred.capabilities();
-                        let first = ids.ruid == 1000
-                            && ids.rgid == 100
-                            && cred.groups().as_slice() == [100]
+                        let first = ids.ruid == kuid(1000)
+                            && ids.rgid == kgid(100)
+                            && cred.groups().as_slice() == [kgid(100)]
                             && caps.effective[0] == 1 << CAP_CHOWN
                             && caps.permitted[0] == 1 << CAP_CHOWN
                             && caps.securebits == 0
                             && Arc::ptr_eq(cred.user_ns(), &root_ns);
-                        let second = ids.ruid == 2000
-                            && ids.rgid == 200
-                            && cred.groups().as_slice() == [200]
+                        let second = ids.ruid == kuid(2000)
+                            && ids.rgid == kgid(200)
+                            && cred.groups().as_slice() == [kgid(200)]
                             && caps.effective[0] == 1 << CAP_DAC_OVERRIDE
                             && caps.permitted[0] == 1 << CAP_DAC_OVERRIDE
                             && caps.securebits == SECBIT_KEEP_CAPS

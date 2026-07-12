@@ -21,6 +21,20 @@ use crate::{
     task::{AsThread, RestartBlock, UTS_FIELD_LEN, try_processes},
 };
 
+fn setfsid_abi<Id>(
+    raw: u32,
+    old: Id,
+    make: impl FnOnce(u32) -> Option<Id>,
+    set: impl FnOnce(Id) -> AxResult<Id>,
+    visible: impl Fn(Id) -> u32,
+) -> AxResult<isize> {
+    let old_visible = visible(old);
+    let Some(requested) = make(raw) else {
+        return Ok(old_visible as isize);
+    };
+    Ok(visible(set(requested)?) as isize)
+}
+
 pub fn sys_getuid() -> AxResult<isize> {
     let cred = current().as_thread().current_cred();
     Ok(cred.user_ns().from_kuid_munged(cred.ids().ruid) as isize)
@@ -98,12 +112,13 @@ pub fn sys_setfsuid(fsuid: u32) -> AxResult<isize> {
     let thread = curr.as_thread();
     let cred = thread.current_cred();
     let namespace = cred.user_ns().clone();
-    let old = namespace.from_kuid_munged(cred.ids().fsuid);
-    let Some(fsuid) = namespace.make_kuid(fsuid) else {
-        return Ok(old as isize);
-    };
-    let old = thread.setfsuid(fsuid)?;
-    Ok(namespace.from_kuid_munged(old) as isize)
+    setfsid_abi(
+        fsuid,
+        cred.ids().fsuid,
+        |raw| namespace.make_kuid(raw),
+        |fsuid| thread.setfsuid(fsuid),
+        |old| namespace.from_kuid_munged(old),
+    )
 }
 
 pub fn sys_setfsgid(fsgid: u32) -> AxResult<isize> {
@@ -111,12 +126,13 @@ pub fn sys_setfsgid(fsgid: u32) -> AxResult<isize> {
     let thread = curr.as_thread();
     let cred = thread.current_cred();
     let namespace = cred.user_ns().clone();
-    let old = namespace.from_kgid_munged(cred.ids().fsgid);
-    let Some(fsgid) = namespace.make_kgid(fsgid) else {
-        return Ok(old as isize);
-    };
-    let old = thread.setfsgid(fsgid)?;
-    Ok(namespace.from_kgid_munged(old) as isize)
+    setfsid_abi(
+        fsgid,
+        cred.ids().fsgid,
+        |raw| namespace.make_kgid(raw),
+        |fsgid| thread.setfsgid(fsgid),
+        |old| namespace.from_kgid_munged(old),
+    )
 }
 
 pub fn sys_getgroups(size: usize, list: *mut u32) -> AxResult<isize> {
@@ -158,16 +174,17 @@ pub fn sys_setgroups(size: usize, list: *const u32) -> AxResult<isize> {
     if size > NGROUPS_MAX as usize {
         return Err(AxError::InvalidInput);
     }
-    let mut groups = if size == 0 {
+    let raw_groups = if size == 0 {
         vec![]
     } else {
         vm_load(list, size)?
     };
-    for gid in &mut groups {
-        *gid = cred
-            .user_ns()
-            .make_kgid(*gid)
-            .ok_or(AxError::InvalidInput)?;
+    let mut groups = Vec::new();
+    groups
+        .try_reserve_exact(raw_groups.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for gid in raw_groups {
+        groups.push(cred.user_ns().make_kgid(gid).ok_or(AxError::InvalidInput)?);
     }
     curr.as_thread().set_supplementary_groups(groups)?;
     Ok(0)
@@ -514,4 +531,93 @@ pub fn sys_riscv_hwprobe(
 pub fn sys_riscv_flush_icache() -> AxResult<isize> {
     riscv::asm::fence_i();
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use core::cell::Cell;
+
+    use super::*;
+    use crate::task::{IdMapInputExtent, Kgid, Kuid, UserNamespace};
+
+    fn mapped_child_namespace() -> alloc::sync::Arc<UserNamespace> {
+        let initial = UserNamespace::try_new_root().unwrap();
+        let child = initial
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
+            .unwrap();
+        child
+            .publish_uid_map(
+                child
+                    .try_build_uid_map(vec![IdMapInputExtent::new(0, 1000, 2)])
+                    .unwrap(),
+            )
+            .unwrap();
+        child
+            .publish_gid_map(
+                child
+                    .try_build_gid_map(vec![IdMapInputExtent::new(0, 100, 2)])
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        child
+    }
+
+    #[test]
+    fn invalid_or_unmapped_setfsid_returns_old_without_calling_writer() {
+        let namespace = mapped_child_namespace();
+        let old_uid = Kuid::from_raw(1000).unwrap();
+        let old_gid = Kgid::from_raw(100).unwrap();
+
+        for raw in [u32::MAX, 2] {
+            let uid_writes = Cell::new(0);
+            let result = setfsid_abi(
+                raw,
+                old_uid,
+                |raw| namespace.make_kuid(raw),
+                |requested| {
+                    uid_writes.set(uid_writes.get() + 1);
+                    Ok(requested)
+                },
+                |old| namespace.from_kuid_munged(old),
+            )
+            .unwrap();
+            assert_eq!(result, 0);
+            assert_eq!(uid_writes.get(), 0);
+
+            let gid_writes = Cell::new(0);
+            let result = setfsid_abi(
+                raw,
+                old_gid,
+                |raw| namespace.make_kgid(raw),
+                |requested| {
+                    gid_writes.set(gid_writes.get() + 1);
+                    Ok(requested)
+                },
+                |old| namespace.from_kgid_munged(old),
+            )
+            .unwrap();
+            assert_eq!(result, 0);
+            assert_eq!(gid_writes.get(), 0);
+        }
+
+        let initial = UserNamespace::try_new_root().unwrap();
+        let empty = initial
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
+            .unwrap();
+        let writes = Cell::new(0);
+        let result = setfsid_abi(
+            0,
+            old_uid,
+            |raw| empty.make_kuid(raw),
+            |requested| {
+                writes.set(writes.get() + 1);
+                Ok(requested)
+            },
+            |old| empty.from_kuid_munged(old),
+        )
+        .unwrap();
+        assert_eq!(result, 65_534);
+        assert_eq!(writes.get(), 0);
+    }
 }

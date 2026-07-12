@@ -138,7 +138,7 @@ fn check_rlimit_nproc(thread: &Thread) -> AxResult<()> {
     let proc_data = &thread.proc_data;
     let cred = thread.current_cred();
     let uid = cred.ids().ruid;
-    if uid == 0
+    if cred.is_initial_root_ruid()
         || cred.has_effective_capability(CAP_SYS_RESOURCE)
         || cred.has_effective_capability(CAP_SYS_ADMIN)
     {

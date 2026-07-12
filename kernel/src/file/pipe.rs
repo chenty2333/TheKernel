@@ -57,7 +57,9 @@ fn pipe_capacity_limit() -> usize {
 
 fn default_pipe_capacity() -> usize {
     match current().try_as_thread() {
-        Some(thr) if thr.euid() != 0 => RING_BUFFER_INIT_SIZE.min(pipe_capacity_limit()),
+        Some(thr) if !thr.current_cred().is_initial_root_euid() => {
+            RING_BUFFER_INIT_SIZE.min(pipe_capacity_limit())
+        }
         _ => RING_BUFFER_INIT_SIZE,
     }
 }

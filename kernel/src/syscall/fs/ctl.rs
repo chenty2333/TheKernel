@@ -34,7 +34,7 @@ use crate::{
         ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
         namespace_target_from_proc_file, proc_namespace_location_from_object,
     },
-    task::{AsThread, DacCredentialView, PidNamespace},
+    task::{AsThread, DacCredentialView, Kgid, Kuid, PidNamespace},
     time::{TimeValueLike, wall_time},
 };
 
@@ -204,6 +204,9 @@ fn current_has_capability(cap: u32) -> bool {
 }
 
 fn current_can_preserve_setgid(gid: u32) -> bool {
+    let Some(gid) = Kgid::from_raw(gid) else {
+        return false;
+    };
     let curr = current();
     let cred = curr.as_thread().current_cred();
     cred.ids().fsgid == gid
@@ -233,10 +236,14 @@ fn check_chown_permission(meta: &Metadata, uid: u32, gid: u32) -> AxResult<()> {
     if uid != meta.uid {
         return Err(AxError::OperationNotPermitted);
     }
-    if ids.fsuid != meta.uid {
+    if Kuid::from_raw(meta.uid) != Some(ids.fsuid) {
         return Err(AxError::OperationNotPermitted);
     }
-    if gid != meta.gid && ids.fsgid != gid && !cred.groups().contains(gid) {
+    let target_gid = Kgid::from_raw(gid);
+    if gid != meta.gid
+        && target_gid != Some(ids.fsgid)
+        && !target_gid.is_some_and(|gid| cred.groups().contains(gid))
+    {
         return Err(AxError::OperationNotPermitted);
     }
     Ok(())
@@ -245,7 +252,9 @@ fn check_chown_permission(meta: &Metadata, uid: u32, gid: u32) -> AxResult<()> {
 fn check_chmod_permission(meta: &Metadata) -> AxResult<()> {
     let curr = current();
     let cred = curr.as_thread().current_cred();
-    if cred.ids().fsuid == meta.uid || cred.has_effective_capability(CAP_FOWNER) {
+    if Kuid::from_raw(meta.uid) == Some(cred.ids().fsuid)
+        || cred.has_effective_capability(CAP_FOWNER)
+    {
         Ok(())
     } else {
         Err(AxError::OperationNotPermitted)
@@ -965,7 +974,9 @@ fn update_times(
     }
 
     let meta = loc.metadata()?;
-    if credentials.uid() != meta.uid && !credentials.has_capability(CAP_FOWNER) {
+    if Kuid::from_raw(meta.uid) != Some(credentials.uid())
+        && !credentials.has_capability(CAP_FOWNER)
+    {
         if (atime_intent, mtime_intent) != (TimeUpdate::Now, TimeUpdate::Now) {
             return Err(AxError::OperationNotPermitted);
         }

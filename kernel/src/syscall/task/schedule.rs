@@ -358,15 +358,17 @@ fn can_adjust_task_nice(task: &AxTaskRef, new_nice: i8) -> AxResult<()> {
     let actor = current();
     let actor_thread = actor.as_thread();
     let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
-    let actor_euid = actor_thread.current_cred().ids().euid;
+    let actor_cred = actor_thread.current_cred();
+    let actor_euid = actor_cred.ids().euid;
+    let actor_is_root = actor_cred.is_initial_root_euid();
     let target_ids = target_thread.current_cred().ids();
 
-    if actor_euid != 0 && actor_euid != target_ids.ruid && actor_euid != target_ids.euid {
+    if !actor_is_root && actor_euid != target_ids.ruid && actor_euid != target_ids.euid {
         return Err(AxError::OperationNotPermitted);
     }
 
     let current_nice = sched_state(task).nice;
-    if actor_euid != 0 && new_nice < current_nice {
+    if !actor_is_root && new_nice < current_nice {
         return Err(AxError::PermissionDenied);
     }
 
@@ -738,10 +740,12 @@ pub fn sys_getpriority(which: u32, who: u32) -> AxResult<isize> {
             )?))
         }
         PRIO_USER => {
+            let current = current();
+            let cred = current.as_thread().current_cred();
             let uid = if who == 0 {
-                current().as_thread().uid()
+                cred.ids().ruid
             } else {
-                who
+                cred.user_ns().make_kuid(who).ok_or(AxError::InvalidInput)?
             };
             Ok(raw_priority_from_nice(min_nice_for_threads(
                 try_tasks()?.into_iter().filter_map(|task| {
@@ -790,10 +794,12 @@ pub fn sys_setpriority(which: u32, who: u32, prio: i32) -> AxResult<isize> {
             }
         }
         PRIO_USER => {
+            let current = current();
+            let cred = current.as_thread().current_cred();
             let uid = if who == 0 {
-                current().as_thread().uid()
+                cred.ids().ruid
             } else {
-                who
+                cred.user_ns().make_kuid(who).ok_or(AxError::InvalidInput)?
             };
             for task in try_tasks()? {
                 let Some(thread) = task.try_as_thread() else {

@@ -27,7 +27,7 @@ pub(crate) use self::{
         may_begin_uid_map_write, may_update_setgroups_policy, may_write_gid_map, may_write_uid_map,
     },
     creds::{CapabilityState, Cred, CredentialSlot, Credentials, DacCredentialView},
-    idmap::{ID_MAP_MAX_EXTENTS, IdMapInputExtent, validate_id_map_input},
+    idmap::{ID_MAP_MAX_EXTENTS, IdMapInputExtent, Kgid, Kuid, validate_id_map_input},
     jobctl::{ContinueResult, StopReport},
     process::{
         CgroupNamespace, CommittedProcessExit, InitialProcessThreadAdmission,

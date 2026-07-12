@@ -683,8 +683,8 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
     validate_pathname(Path::new(path))?;
     debug!("sys_openat <= {path:?} {flags:#o} {mode:#o}");
 
-    let uid = credentials.uid();
-    let gid = credentials.gid();
+    let uid = credentials.uid().into_raw();
+    let gid = credentials.gid().into_raw();
     let requested_mode = NodePermission::from_bits_truncate(mode as u16);
     let masked_mode = NodePermission::from_bits_truncate(requested_mode.bits() & !(umask as u16));
     let resolve_options = flags_to_options(flags, requested_mode.bits() as _, (uid, gid));

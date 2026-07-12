@@ -97,5 +97,5 @@ fn current_fs_owner() -> (u32, u32) {
         return (0, 0);
     };
     let ids = thread.current_cred().ids();
-    (ids.fsuid, ids.fsgid)
+    (ids.fsuid.into_raw(), ids.fsgid.into_raw())
 }

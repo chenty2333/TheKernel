@@ -13,7 +13,7 @@ use linux_vfs::{
     initial_create_attributes as linux_initial_create_attributes,
 };
 
-use crate::task::DacCredentialView;
+use crate::task::{DacCredentialView, Kgid};
 
 static INITIAL_USER_NAMESPACE_DAC_DOMAIN: () = ();
 
@@ -23,15 +23,15 @@ impl DacCredentials for DacCredentialView {
     type UserNamespace = ();
 
     fn fs_user_id(&self) -> Self::UserId {
-        self.uid()
+        self.uid().into_raw()
     }
 
     fn fs_group_id(&self) -> Self::GroupId {
-        self.gid()
+        self.gid().into_raw()
     }
 
     fn is_in_group(&self, group: Self::GroupId) -> bool {
-        self.supplementary_groups().contains(&group)
+        Kgid::from_raw(group).is_some_and(|group| self.supplementary_groups().contains(&group))
     }
 
     fn has_capability(&self, _owner: &Self::UserNamespace, capability: DacCapability) -> bool {

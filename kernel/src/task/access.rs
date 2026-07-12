@@ -30,9 +30,7 @@ pub(crate) fn ns_capable(
     capability: u32,
 ) -> bool {
     let actor_user_ns = actor.user_ns();
-    let Some(actor_euid) = Kuid::from_raw(actor.ids().euid) else {
-        return false;
-    };
+    let actor_euid = actor.ids().euid;
     let mut namespace = target_user_ns.clone();
     loop {
         if Arc::ptr_eq(&namespace, actor_user_ns) {
@@ -96,8 +94,8 @@ fn single_unprivileged_uid_mapping(
     else {
         return false;
     };
-    Kuid::from_raw(opener.ids().euid)
-        .is_some_and(|euid| target.owner_kuid() == euid && parent_uid == euid)
+    let euid = opener.ids().euid;
+    target.owner_kuid() == euid && parent_uid == euid
 }
 
 fn single_unprivileged_gid_mapping(
@@ -117,11 +115,8 @@ fn single_unprivileged_gid_mapping(
     else {
         return false;
     };
-    let Some(opener_euid) = Kuid::from_raw(opener.ids().euid) else {
-        return false;
-    };
-    Kgid::from_raw(opener.ids().egid)
-        .is_some_and(|egid| target.owner_kuid() == opener_euid && parent_gid == egid)
+    let opener_ids = opener.ids();
+    target.owner_kuid() == opener_ids.euid && parent_gid == opener_ids.egid
 }
 
 /// Linux `new_idmap_permitted()` policy for `/proc/PID/uid_map`.
@@ -172,7 +167,11 @@ fn has_capability_over(actor: &Cred, target: &Cred, capability: u32) -> bool {
     ns_capable(actor, target.user_ns(), capability)
 }
 
-fn caller_id_matches_all_target_ids(caller_uid: u32, caller_gid: u32, target: Credentials) -> bool {
+fn caller_id_matches_all_target_ids(
+    caller_uid: Kuid,
+    caller_gid: Kgid,
+    target: Credentials,
+) -> bool {
     caller_uid == target.ruid
         && caller_uid == target.euid
         && caller_uid == target.suid
@@ -318,7 +317,17 @@ mod tests {
     use super::*;
     use crate::task::creds::{CAPABILITY_WORDS, CredentialSlot};
 
+    fn kuid(raw: u32) -> Kuid {
+        Kuid::from_raw(raw).unwrap()
+    }
+
+    fn kgid(raw: u32) -> Kgid {
+        Kgid::from_raw(raw).unwrap()
+    }
+
     fn publish_ids(slot: &CredentialSlot, uid: u32, gid: u32) -> Arc<Cred> {
+        let uid = kuid(uid);
+        let gid = kgid(gid);
         let mut update = slot.prepare();
         update.builder.ids = Credentials {
             ruid: uid,
@@ -340,28 +349,41 @@ mod tests {
     #[test]
     fn ptrace_id_match_requires_all_target_ids() {
         let mut target = Credentials {
-            ruid: 1000,
-            euid: 1000,
-            suid: 1000,
-            rgid: 100,
-            egid: 100,
-            sgid: 100,
-            ..Default::default()
+            ruid: kuid(1000),
+            euid: kuid(1000),
+            suid: kuid(1000),
+            fsuid: kuid(1000),
+            rgid: kgid(100),
+            egid: kgid(100),
+            sgid: kgid(100),
+            fsgid: kgid(100),
         };
-        assert!(caller_id_matches_all_target_ids(1000, 100, target));
+        assert!(caller_id_matches_all_target_ids(
+            kuid(1000),
+            kgid(100),
+            target
+        ));
 
-        target.suid = 0;
-        assert!(!caller_id_matches_all_target_ids(1000, 100, target));
-        target.suid = 1000;
-        target.egid = 200;
-        assert!(!caller_id_matches_all_target_ids(1000, 100, target));
+        target.suid = Kuid::INITIAL_ROOT;
+        assert!(!caller_id_matches_all_target_ids(
+            kuid(1000),
+            kgid(100),
+            target
+        ));
+        target.suid = kuid(1000);
+        target.egid = kgid(200);
+        assert!(!caller_id_matches_all_target_ids(
+            kuid(1000),
+            kgid(100),
+            target
+        ));
     }
 
     #[test]
     fn user_namespace_capability_direction_is_parent_to_child() {
         let root = UserNamespace::try_new_root().unwrap();
-        let child = root.try_fork(1000, 100, false).unwrap();
-        let sibling = root.try_fork(2000, 200, false).unwrap();
+        let child = root.try_fork(kuid(1000), kgid(100), false).unwrap();
+        let sibling = root.try_fork(kuid(2000), kgid(200), false).unwrap();
         let root_cred = Cred::try_root(root.clone()).unwrap();
         let child_cred = Cred::try_with_user_ns(&root_cred, child.clone()).unwrap();
 
@@ -379,7 +401,7 @@ mod tests {
     fn setgroups_open_allows_capable_ancestors_but_idmap_write_does_not() {
         let root = UserNamespace::try_new_root().unwrap();
         let root_cred = Cred::try_root(root.clone()).unwrap();
-        let child = root.try_fork(1000, 100, false).unwrap();
+        let child = root.try_fork(kuid(1000), kgid(100), false).unwrap();
         child
             .publish_uid_map(
                 child
@@ -395,7 +417,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let grandchild = child.try_fork(1000, 100, false).unwrap();
+        let grandchild = child.try_fork(kuid(1000), kgid(100), false).unwrap();
 
         assert!(may_update_setgroups_policy(&root_cred, &grandchild));
         assert!(!may_write_uid_map(
@@ -412,7 +434,7 @@ mod tests {
         let root_cred = Cred::try_root(root.clone()).unwrap();
         let owner_slot = CredentialSlot::new(root_cred.clone());
         let owner = publish_ids(&owner_slot, 1000, 100);
-        let child = root.try_fork(1000, 100, false).unwrap();
+        let child = root.try_fork(kuid(1000), kgid(100), false).unwrap();
         let child_opener = Cred::try_with_user_ns(&owner, child.clone()).unwrap();
 
         let uid_row = [IdMapInputExtent::new(0, 1000, 1)];

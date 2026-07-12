@@ -41,6 +41,22 @@ typed_id!(Kgid);
 typed_id!(UserUid);
 typed_id!(UserGid);
 
+impl Kuid {
+    pub(crate) const INITIAL_ROOT: Self = Self(0);
+}
+
+impl Kgid {
+    pub(crate) const INITIAL_ROOT: Self = Self(0);
+}
+
+impl UserUid {
+    pub(crate) const ROOT: Self = Self(0);
+}
+
+impl UserGid {
+    pub(crate) const ROOT: Self = Self(0);
+}
+
 /// One userspace map row before its lower range is resolved through the
 /// parent namespace.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

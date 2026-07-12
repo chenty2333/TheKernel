@@ -187,8 +187,8 @@ pub fn sys_acct(name: *const c_char) -> AxResult<isize> {
     let ids = curr.as_thread().current_cred().ids();
     let accounting = AccountingFile {
         file,
-        uid: ids.ruid,
-        gid: ids.rgid,
+        uid: ids.ruid.into_raw(),
+        gid: ids.rgid.into_raw(),
     };
     let _ = close_file_like(fd);
     *PROCESS_ACCOUNTING.lock() = Some(accounting);

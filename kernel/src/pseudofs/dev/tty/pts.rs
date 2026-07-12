@@ -164,7 +164,7 @@ pub fn add_slave(fs: Arc<SimpleFs>, pty: Arc<PtyDriver>, lease: &PtsLease) -> Ax
         pty,
     )?;
     device.update_metadata(MetadataUpdate {
-        owner: Some((ids.ruid, ids.rgid)),
+        owner: Some((ids.ruid.into_raw(), ids.rgid.into_raw())),
         mode: Some(NodePermission::from_bits_truncate(0o620)),
         ..Default::default()
     })?;

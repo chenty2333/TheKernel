@@ -36,8 +36,8 @@ use super::{
 use crate::{
     deferred_work::DeferredWorkAccount,
     task::{
-        AsThread, Cred, ProcessData, ProcessGroup, Thread, get_process_data, get_process_group,
-        get_visible_task, process_domain, send_queued_signal_thread_inner,
+        AsThread, Cred, Kuid, ProcessData, ProcessGroup, Thread, get_process_data,
+        get_process_group, get_visible_task, process_domain, send_queued_signal_thread_inner,
         send_queued_signal_to_process_data, send_signal_thread_inner, send_signal_to_process_data,
     },
 };
@@ -404,16 +404,17 @@ impl Drop for DescriptorCloseRegistration {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct OpenCredentials {
-    pub uid: u32,
-    pub euid: u32,
-    pub suid: u32,
-    pub fsuid: u32,
-    pub cgroup_ns_id: u64,
+pub(crate) struct OpenCredentials {
+    pub(crate) uid: Kuid,
+    pub(crate) euid: Kuid,
+    pub(crate) suid: Kuid,
+    pub(crate) fsuid: Kuid,
+    pub(crate) is_initial_user_ns: bool,
+    pub(crate) cgroup_ns_id: u64,
 }
 
 impl OpenCredentials {
-    pub fn current() -> Self {
+    pub(crate) fn current() -> Self {
         let Some(task) = current_may_uninit() else {
             return Self::root();
         };
@@ -428,22 +429,24 @@ impl OpenCredentials {
             euid: ids.euid,
             suid: ids.suid,
             fsuid: ids.fsuid,
+            is_initial_user_ns: cred.user_ns().is_initial(),
             cgroup_ns_id: proc_data.cgroup_ns_id(),
         }
     }
 
     const fn root() -> Self {
         Self {
-            uid: 0,
-            euid: 0,
-            suid: 0,
-            fsuid: 0,
+            uid: Kuid::INITIAL_ROOT,
+            euid: Kuid::INITIAL_ROOT,
+            suid: Kuid::INITIAL_ROOT,
+            fsuid: Kuid::INITIAL_ROOT,
+            is_initial_user_ns: true,
             cgroup_ns_id: 0,
         }
     }
 }
 
-pub fn current_file_write_credentials() -> Option<OpenCredentials> {
+pub(crate) fn current_file_write_credentials() -> Option<OpenCredentials> {
     current_may_uninit().and_then(|task| {
         task.try_as_thread()
             .and_then(Thread::file_write_credentials)
@@ -561,8 +564,8 @@ impl AsyncIoOwner {
 
 #[derive(Clone)]
 struct AsyncIoCredentials {
-    uid: u32,
-    euid: u32,
+    uid: Kuid,
+    euid: Kuid,
     euid_is_global_root: bool,
 }
 
@@ -575,10 +578,7 @@ impl AsyncIoCredentials {
         Some(Self {
             uid: ids.ruid,
             euid: ids.euid,
-            // Credentials are not yet stored as mapped kernel IDs, so retain
-            // the namespace fact needed to distinguish GLOBAL_ROOT_UID from
-            // UID 0 inside a child user namespace.
-            euid_is_global_root: ids.euid == 0 && cred.user_ns().is_initial(),
+            euid_is_global_root: ids.euid == Kuid::INITIAL_ROOT && cred.user_ns().is_initial(),
         })
     }
 
@@ -587,7 +587,7 @@ impl AsyncIoCredentials {
         self.may_signal_ids(ids.ruid, ids.suid)
     }
 
-    fn may_signal_ids(&self, uid: u32, suid: u32) -> bool {
+    fn may_signal_ids(&self, uid: Kuid, suid: Kuid) -> bool {
         // Match Linux fs/fcntl.c::sigio_perm(): f_owner snapshots the setter's
         // real/effective kernel UIDs, and delivery admits an exact target
         // real/saved-UID match or the historical global-root effective UID.
@@ -875,7 +875,7 @@ impl FileDescription {
         self.id
     }
 
-    pub fn open_credentials(&self) -> OpenCredentials {
+    pub(crate) fn open_credentials(&self) -> OpenCredentials {
         self.open_credentials
     }
 
@@ -1210,6 +1210,10 @@ mod tests {
 
     use super::*;
 
+    fn kuid(raw: u32) -> Kuid {
+        Kuid::from_raw(raw).unwrap()
+    }
+
     #[test]
     fn descriptor_publication_charges_commit_and_rollback_exactly() {
         let mut lifetime = DescriptorLifetimeState::default();
@@ -1352,39 +1356,39 @@ mod tests {
     #[test]
     fn sigio_permission_uses_linux_fown_uid_snapshot() {
         let credentials = AsyncIoCredentials {
-            uid: 1000,
-            euid: 1001,
+            uid: kuid(1000),
+            euid: kuid(1001),
             euid_is_global_root: false,
         };
 
-        assert!(credentials.may_signal_ids(1000, 2000));
-        assert!(credentials.may_signal_ids(2000, 1001));
-        assert!(credentials.may_signal_ids(2000, 1000));
-        assert!(!credentials.may_signal_ids(2000, 3000));
+        assert!(credentials.may_signal_ids(kuid(1000), kuid(2000)));
+        assert!(credentials.may_signal_ids(kuid(2000), kuid(1001)));
+        assert!(credentials.may_signal_ids(kuid(2000), kuid(1000)));
+        assert!(!credentials.may_signal_ids(kuid(2000), kuid(3000)));
     }
 
     #[test]
     fn sigio_permission_preserves_linux_global_root_euid_rule() {
         let effective_root = AsyncIoCredentials {
-            uid: 4000,
-            euid: 0,
+            uid: kuid(4000),
+            euid: Kuid::INITIAL_ROOT,
             euid_is_global_root: true,
         };
-        assert!(effective_root.may_signal_ids(2000, 3000));
+        assert!(effective_root.may_signal_ids(kuid(2000), kuid(3000)));
 
         let real_root_only = AsyncIoCredentials {
-            uid: 0,
-            euid: 4000,
+            uid: Kuid::INITIAL_ROOT,
+            euid: kuid(4000),
             euid_is_global_root: false,
         };
-        assert!(!real_root_only.may_signal_ids(2000, 3000));
+        assert!(!real_root_only.may_signal_ids(kuid(2000), kuid(3000)));
 
         let user_namespace_root = AsyncIoCredentials {
-            uid: 4000,
-            euid: 0,
+            uid: kuid(4000),
+            euid: Kuid::INITIAL_ROOT,
             euid_is_global_root: false,
         };
-        assert!(!user_namespace_root.may_signal_ids(2000, 3000));
+        assert!(!user_namespace_root.may_signal_ids(kuid(2000), kuid(3000)));
     }
 
     #[test]

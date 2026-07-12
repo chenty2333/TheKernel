@@ -301,7 +301,8 @@ pub fn sys_get_robust_list(
     let task = if tid == 0 || tid == current_tid {
         current_task.clone()
     } else {
-        if current_thread.euid() != 0 {
+        let cred = current_thread.current_cred();
+        if !cred.is_initial_root_euid() {
             return Err(AxError::OperationNotPermitted);
         }
         get_visible_task(tid)?

@@ -264,13 +264,13 @@ impl KernelMutationRequest for SymlinkRequest<'_> {
         let owner_gid = if parent_metadata.mode.contains(NodePermission::SET_GID) {
             parent_metadata.gid
         } else {
-            reservation.credentials.gid()
+            reservation.credentials.gid().into_raw()
         };
         reservation.name.parent.create_symlink(
             &reservation.name.name,
             &reservation.target,
             NodePermission::from_bits_truncate(0o777),
-            Some((reservation.credentials.uid(), owner_gid)),
+            Some((reservation.credentials.uid().into_raw(), owner_gid)),
         )
     }
 }

@@ -394,7 +394,12 @@ fn parse_fat_mount_options(
     credentials: &DacCredentialView,
     umask: u16,
 ) -> AxResult<FatMountOptions> {
-    parse_fat_mount_options_with_defaults(data, credentials.uid(), credentials.gid(), umask)
+    parse_fat_mount_options_with_defaults(
+        data,
+        credentials.uid().into_raw(),
+        credentials.gid().into_raw(),
+        umask,
+    )
 }
 
 fn parse_fat_mount_options_with_defaults(

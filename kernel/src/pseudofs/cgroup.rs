@@ -1239,10 +1239,15 @@ impl Drop for CgroupForkAdmission<'_> {
     }
 }
 
+fn has_initial_root_migration_authority(credentials: OpenCredentials) -> bool {
+    credentials.is_initial_user_ns
+        && (credentials.euid == crate::task::Kuid::INITIAL_ROOT
+            || credentials.fsuid == crate::task::Kuid::INITIAL_ROOT)
+}
+
 fn can_migrate_with_credentials(credentials: OpenCredentials, target_cred: &Cred) -> bool {
     let target_ids = target_cred.ids();
-    credentials.euid == 0
-        || credentials.fsuid == 0
+    has_initial_root_migration_authority(credentials)
         || [
             credentials.uid,
             credentials.euid,
@@ -1922,6 +1927,25 @@ mod tests {
             .filter(|membership| membership.is_visible())
             .and_then(|membership| membership.target.upgrade())
             .is_some_and(|actual| Arc::ptr_eq(&actual, expected))
+    }
+
+    #[test]
+    fn child_user_namespace_root_has_no_global_cgroup_migration_bypass() {
+        let child_root = OpenCredentials {
+            uid: crate::task::Kuid::INITIAL_ROOT,
+            euid: crate::task::Kuid::INITIAL_ROOT,
+            suid: crate::task::Kuid::INITIAL_ROOT,
+            fsuid: crate::task::Kuid::INITIAL_ROOT,
+            is_initial_user_ns: false,
+            cgroup_ns_id: 0,
+        };
+        assert!(!has_initial_root_migration_authority(child_root));
+
+        let initial_root = OpenCredentials {
+            is_initial_user_ns: true,
+            ..child_root
+        };
+        assert!(has_initial_root_migration_authority(initial_root));
     }
 
     #[test]

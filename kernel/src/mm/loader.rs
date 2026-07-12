@@ -349,12 +349,14 @@ impl ElfLoader {
         let (uid, euid, gid, egid) = current_may_uninit()
             .and_then(|task| {
                 let thread = task.try_as_thread()?;
-                let ids = thread.current_cred().ids();
+                let cred = thread.current_cred();
+                let ids = cred.ids();
+                let user_ns = cred.user_ns();
                 Some((
-                    ids.ruid as usize,
-                    ids.euid as usize,
-                    ids.rgid as usize,
-                    ids.egid as usize,
+                    user_ns.from_kuid_munged(ids.ruid) as usize,
+                    user_ns.from_kuid_munged(ids.euid) as usize,
+                    user_ns.from_kgid_munged(ids.rgid) as usize,
+                    user_ns.from_kgid_munged(ids.egid) as usize,
                 ))
             })
             .unwrap_or((0, 0, 0, 0));

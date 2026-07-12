@@ -608,8 +608,8 @@ fn current_key_ids() -> CurrentKeyIds {
     CurrentKeyIds {
         tid: thread.tid(),
         pid: thread.proc_data.proc.pid(),
-        uid: ids.euid,
-        gid: ids.egid,
+        uid: ids.euid.into_raw(),
+        gid: ids.egid.into_raw(),
     }
 }
 

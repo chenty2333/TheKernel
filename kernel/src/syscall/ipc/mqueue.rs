@@ -39,7 +39,7 @@ use crate::{
     mm::vm_load_string,
     syscall::RawSigevent,
     task::{
-        AsThread, ProcStateHint, ProcessData, prepare_queued_signal_for_process,
+        AsThread, Kgid, Kuid, ProcStateHint, ProcessData, prepare_queued_signal_for_process,
         send_prepared_signal_to_process_data, with_proc_state_hint,
     },
     time::TimeValueLike,
@@ -373,7 +373,7 @@ pub(crate) fn set_mq_msgsize_max(value: usize) {
 fn current_ids() -> (u32, u32) {
     let curr = current();
     let ids = curr.as_thread().current_cred().ids();
-    (ids.fsuid, ids.fsgid)
+    (ids.fsuid.into_raw(), ids.fsgid.into_raw())
 }
 
 fn normalize_name(name: *const c_char) -> AxResult<String> {
@@ -433,9 +433,11 @@ fn has_queue_permission(queue: &PosixMqueue, access: MqAccess) -> bool {
     let owner_bits = (queue.mode >> 6) & 0o7;
     let group_bits = (queue.mode >> 3) & 0o7;
     let other_bits = queue.mode & 0o7;
-    let bits = if ids.fsuid == queue.uid {
+    let bits = if Kuid::from_raw(queue.uid) == Some(ids.fsuid) {
         owner_bits
-    } else if ids.fsgid == queue.gid || cred.groups().contains(queue.gid) {
+    } else if Kgid::from_raw(queue.gid) == Some(ids.fsgid)
+        || Kgid::from_raw(queue.gid).is_some_and(|gid| cred.groups().contains(gid))
+    {
         group_bits
     } else {
         other_bits
@@ -532,7 +534,7 @@ fn build_notifier(event: &RawSigevent) -> AxResult<MqNotifier> {
         unsafe {
             let rt = &mut info.0.__bindgen_anon_1.__bindgen_anon_1._sifields._rt;
             rt._pid = proc_data.proc.pid() as _;
-            rt._uid = curr.as_thread().uid() as _;
+            rt._uid = curr.as_thread().current_cred().ids().ruid.into_raw() as _;
             rt._sigval = linux_raw_sys::general::sigval_t {
                 sival_ptr: event.value_ptr_address() as *mut linux_raw_sys::ctypes::c_void,
             };
@@ -743,7 +745,9 @@ pub fn sys_mq_unlink(name: *const c_char) -> AxResult<isize> {
         let queue = queue.lock();
         let curr = current();
         let cred = curr.as_thread().current_cred();
-        if cred.ids().fsuid != queue.uid && !cred.has_effective_capability(CAP_FOWNER) {
+        if Kuid::from_raw(queue.uid) != Some(cred.ids().fsuid)
+            && !cred.has_effective_capability(CAP_FOWNER)
+        {
             return Err(AxError::PermissionDenied);
         }
     }
