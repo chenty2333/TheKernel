@@ -29,3 +29,5 @@ type exists.
   (`draft`)
 - [RFC 0002: Explicit Linux Path Context over a Policy-Neutral VFS Walker](0002-vfs-path-contract.md)
   (`draft`)
+- [RFC 0003: Cancellable FD and Readiness Registration Contract](0003-fd-readiness-contract.md)
+  (`draft`)
