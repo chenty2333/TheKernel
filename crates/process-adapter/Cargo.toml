@@ -1,0 +1,16 @@
+[package]
+name = "thekernel-linux-process-adapter"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "TheKernel zombie payload and type aliases over the explicit Linux process domain"
+license = "Apache-2.0"
+
+[lib]
+name = "starry_process"
+path = "src/lib.rs"
+
+[dependencies.process-core]
+package = "thekernel-linux-process"
+version = "=0.1.0"
+default-features = false
