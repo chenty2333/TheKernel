@@ -6,33 +6,101 @@ use axfs_ng_vfs::{Location, Metadata, NodePermission, NodeType, path::Path};
 use linux_raw_sys::general::{
     CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, R_OK, W_OK, X_OK,
 };
+use linux_vfs::{
+    Access, DacCapability, DacCredentials, DacError, NodeKind as LinuxNodeKind,
+    NodeMetadata as LinuxNodeMetadata, check_dac as check_linux_dac,
+    check_sticky_mutation as check_linux_sticky_mutation,
+    initial_create_attributes as linux_initial_create_attributes,
+};
 
 use crate::task::DacCredentialView;
 
-const STICKY_MODE_BIT: u32 = 0o1000;
+static INITIAL_USER_NAMESPACE_DAC_DOMAIN: () = ();
+
+impl DacCredentials for DacCredentialView {
+    type UserId = u32;
+    type GroupId = u32;
+    type UserNamespace = ();
+
+    fn fs_user_id(&self) -> Self::UserId {
+        self.uid()
+    }
+
+    fn fs_group_id(&self) -> Self::GroupId {
+        self.gid()
+    }
+
+    fn is_in_group(&self, group: Self::GroupId) -> bool {
+        self.supplementary_groups().contains(&group)
+    }
+
+    fn has_capability(&self, _owner: &Self::UserNamespace, capability: DacCapability) -> bool {
+        self.has_capability(match capability {
+            DacCapability::Override => CAP_DAC_OVERRIDE,
+            DacCapability::ReadSearch => CAP_DAC_READ_SEARCH,
+            DacCapability::Fowner => CAP_FOWNER,
+            DacCapability::Fsetid => CAP_FSETID,
+            _ => return false,
+        })
+    }
+}
+
+fn linux_node_kind(node_type: NodeType) -> LinuxNodeKind {
+    match node_type {
+        NodeType::Unknown => LinuxNodeKind::Unknown,
+        NodeType::Fifo => LinuxNodeKind::Fifo,
+        NodeType::CharacterDevice => LinuxNodeKind::CharacterDevice,
+        NodeType::Directory => LinuxNodeKind::Directory,
+        NodeType::BlockDevice => LinuxNodeKind::BlockDevice,
+        NodeType::RegularFile => LinuxNodeKind::Regular,
+        NodeType::Symlink => LinuxNodeKind::Symlink,
+        NodeType::Socket => LinuxNodeKind::Socket,
+    }
+}
+
+fn linux_access(requested: u32) -> Access {
+    let mut access = Access::NONE;
+    if requested & R_OK != 0 {
+        access |= Access::READ;
+    }
+    if requested & W_OK != 0 {
+        access |= Access::WRITE;
+    }
+    if requested & X_OK != 0 {
+        access |= Access::EXECUTE;
+    }
+    access
+}
+
+fn linux_node_metadata(
+    mode: u32,
+    owner_uid: u32,
+    owner_gid: u32,
+    node_type: NodeType,
+) -> LinuxNodeMetadata<'static, u32, u32, ()> {
+    LinuxNodeMetadata {
+        mode: mode as u16,
+        owner_user: owner_uid,
+        owner_group: owner_gid,
+        kind: linux_node_kind(node_type),
+        owner_user_namespace: &INITIAL_USER_NAMESPACE_DAC_DOMAIN,
+        ids_mapped: true,
+    }
+}
+
+fn map_dac_error(error: DacError) -> AxError {
+    match error {
+        DacError::AccessDenied => AxError::PermissionDenied,
+        DacError::StickyDenied => AxError::OperationNotPermitted,
+        _ => AxError::PermissionDenied,
+    }
+}
 
 pub(crate) fn check_writable_mount(dir: &Location) -> AxResult {
     if crate::mounts::is_readonly(dir)? {
         Err(AxError::ReadOnlyFilesystem)
     } else {
         Ok(())
-    }
-}
-
-pub(crate) fn granted_access_bits(
-    perm: u32,
-    owner_uid: u32,
-    owner_gid: u32,
-    uid: u32,
-    gid: u32,
-    supplementary_groups: &[u32],
-) -> u32 {
-    if uid == owner_uid {
-        (perm >> 6) & 0o7
-    } else if gid == owner_gid || supplementary_groups.contains(&owner_gid) {
-        (perm >> 3) & 0o7
-    } else {
-        perm & 0o7
     }
 }
 
@@ -44,35 +112,12 @@ fn dac_access_allowed(
     requested: u32,
     credentials: &DacCredentialView,
 ) -> bool {
-    let requested = requested & 0o7;
-    if requested == 0 {
-        return true;
-    }
-
-    let granted = granted_access_bits(
-        perm,
-        owner_uid,
-        owner_gid,
-        credentials.uid(),
-        credentials.gid(),
-        credentials.supplementary_groups(),
-    );
-    if granted & requested == requested {
-        return true;
-    }
-
-    if node_type == NodeType::Directory {
-        if requested & W_OK == 0 && credentials.has_capability(CAP_DAC_READ_SEARCH) {
-            return true;
-        }
-        return credentials.has_capability(CAP_DAC_OVERRIDE);
-    }
-
-    if requested == R_OK && credentials.has_capability(CAP_DAC_READ_SEARCH) {
-        return true;
-    }
-
-    (requested & X_OK == 0 || perm & 0o111 != 0) && credentials.has_capability(CAP_DAC_OVERRIDE)
+    check_linux_dac(
+        &linux_node_metadata(perm, owner_uid, owner_gid, node_type),
+        linux_access(requested),
+        credentials,
+    )
+    .is_ok()
 }
 
 pub(crate) fn check_dac_permissions(
@@ -245,32 +290,22 @@ pub(crate) fn initial_named_create_owner_mode(
     requested_mode: NodePermission,
     umask: u32,
 ) -> (NodePermission, (u32, u32)) {
-    let parent_is_sgid = parent.mode.contains(NodePermission::SET_GID);
-    let in_parent_group =
-        credentials.gid() == parent.gid || credentials.supplementary_groups().contains(&parent.gid);
-    let executable_sgid = requested_mode.contains(NodePermission::SET_GID)
-        && requested_mode.contains(NodePermission::GROUP_EXEC);
-
-    let mut mode = requested_mode;
-    if node_type != NodeType::Directory
-        && parent_is_sgid
-        && executable_sgid
-        && !in_parent_group
-        && !credentials.has_capability(CAP_FSETID)
-    {
-        mode.remove(NodePermission::SET_GID);
-    }
-    mode = NodePermission::from_bits_truncate(mode.bits() & !(umask as u16));
-
-    let gid = if parent_is_sgid {
-        parent.gid
-    } else {
-        credentials.gid()
-    };
-    if node_type == NodeType::Directory && parent_is_sgid {
-        mode.insert(NodePermission::SET_GID);
-    }
-    (mode, (credentials.uid(), gid))
+    let attributes = linux_initial_create_attributes(
+        &linux_node_metadata(
+            parent.mode.bits() as u32,
+            parent.uid,
+            parent.gid,
+            parent.node_type,
+        ),
+        linux_node_kind(node_type),
+        requested_mode.bits(),
+        umask as u16,
+        credentials,
+    );
+    (
+        NodePermission::from_bits_truncate(attributes.mode),
+        (attributes.user, attributes.group),
+    )
 }
 
 fn check_directory_write_search_permissions(
@@ -296,19 +331,23 @@ fn check_sticky_delete_permissions(
     credentials: &DacCredentialView,
 ) -> AxResult {
     let dir_stat = dir.metadata()?;
-    if dir_stat.mode.bits() as u32 & STICKY_MODE_BIT == 0 {
-        return Ok(());
-    }
-
     let target_stat = target.metadata()?;
-    if credentials.uid() == dir_stat.uid
-        || credentials.uid() == target_stat.uid
-        || credentials.has_capability(CAP_FOWNER)
-    {
-        return Ok(());
-    }
-
-    Err(AxError::OperationNotPermitted)
+    check_linux_sticky_mutation(
+        &linux_node_metadata(
+            dir_stat.mode.bits() as u32,
+            dir_stat.uid,
+            dir_stat.gid,
+            dir_stat.node_type,
+        ),
+        &linux_node_metadata(
+            target_stat.mode.bits() as u32,
+            target_stat.uid,
+            target_stat.gid,
+            target_stat.node_type,
+        ),
+        credentials,
+    )
+    .map_err(map_dac_error)
 }
 
 pub(crate) fn check_remove_permissions(

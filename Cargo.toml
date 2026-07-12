@@ -36,6 +36,7 @@ axnet = { path = "crates/axnet-ng", package = "axnet-ng" }
 axruntime = { version = "0.3.0-preview.2" }
 axsync = { version = "0.3.0-preview.2" }
 axtask = { version = "0.3.0-preview.2" }
+linux-vfs = { package = "thekernel-linux-vfs", version = "=0.1.0", path = "../thekernel-linux-abi-vfs/crates/vfs" }
 
 thekernel-kernel = { path = "kernel", version = "=0.2.0-preview.2" }
 

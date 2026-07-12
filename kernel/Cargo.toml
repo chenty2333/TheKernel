@@ -75,6 +75,7 @@ kernel-elf-parser = "0.3.4"
 kspin = "0.1"
 lazy_static = { version = "1.5", features = ["spin_no_std"] }
 linkme = "0.3"
+linux-vfs.workspace = true
 linux-raw-sys = { version = "0.12", default-features = false, features = [
     "no_std",
     "general",

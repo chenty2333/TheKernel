@@ -3231,12 +3231,17 @@ dependencies = [
  "starry-vm",
  "strum 0.28.0",
  "syscalls",
+ "thekernel-linux-vfs",
  "uluru",
  "weak-map",
  "x86",
  "xmas-elf",
  "zerocopy 0.8.41",
 ]
+
+[[package]]
+name = "thekernel-linux-vfs"
+version = "0.1.0"
 
 [[package]]
 name = "thiserror"

@@ -110,6 +110,9 @@ ci_run_step scope-local-tests "$STEP_TIMEOUT_SECS" \
 ci_run_step axfs-vfs-tests "$STEP_TIMEOUT_SECS" \
     "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/axfs-ng-vfs/Cargo.toml \
     --features spin/spin_mutex,spin/once
+ci_run_step axfs-pathwalk-policy-tests "$STEP_TIMEOUT_SECS" \
+    "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/axfs-ng/Cargo.toml \
+    pathwalk_policy_receives_real_components_and_final_position -- --test-threads=1
 ci_run_step axsched-tests "$STEP_TIMEOUT_SECS" \
     "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/axsched/Cargo.toml
 ci_run_step process-tests "$STEP_TIMEOUT_SECS" \
