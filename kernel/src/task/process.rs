@@ -534,6 +534,13 @@ impl thekernel_linux_cred::UserNamespaceView for UserNamespace {
     }
 }
 
+impl thekernel_linux_cred::ExecUserNamespaceView for UserNamespace {
+    fn exec_id_map_snapshot(&self) -> (Arc<IdMap>, Arc<IdMap>) {
+        let state = self.map_state.lock();
+        (state.uid_map(), state.gid_map())
+    }
+}
+
 #[derive(Clone, Copy)]
 struct UtsState {
     nodename: [u8; UTS_FIELD_LEN],
@@ -1917,7 +1924,7 @@ impl ProcessData {
         debug_assert_eq!(thread.proc_data.proc.pid(), self.proc.pid());
         let credential = thread.credential_slot();
         let effects = prepared.effects();
-        if effects.clear_pdeath_signal {
+        if effects.clear_pdeath_signal() {
             // Linux pdeath_signal is task-local: only the executor crosses
             // this credential transition, never its former siblings.
             thread.set_pdeath_signal(0);

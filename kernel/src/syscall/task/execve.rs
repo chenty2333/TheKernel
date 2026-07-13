@@ -27,10 +27,11 @@ use crate::{
     },
     readiness::block_on_poll_set,
     task::{
-        AsThread, DacCredentialView, ExecCredentialRequest, FileCapabilities, Kgid, Kuid,
-        ProcessAccessState, ProcessData, Thread, UserNamespace, check_signals,
-        commit_exec_identity_handoff, fail_closed_exit, get_task, has_pending_fatal_signal,
-        linux_pid_from_task_id, notify_ptrace_attach_stop, prepare_task_alias_admission,
+        AsThread, DacCredentialView, ExecCredentialInput, ExecFileOwner, ExecImageReadability,
+        ExecMountPrivilege, ExecTraceState, FileCapabilities, Kgid, Kuid, ProcessAccessState,
+        ProcessData, Thread, UserNamespace, check_signals, commit_exec_identity_handoff,
+        fail_closed_exit, get_task, has_pending_fatal_signal, linux_pid_from_task_id,
+        map_exec_dumpability, notify_ptrace_attach_stop, prepare_task_alias_admission,
         process_error, set_current_user_page_table_root,
     },
 };
@@ -45,20 +46,6 @@ fn interrupt_exec_siblings(sibling_tids: &[Pid]) {
 
 fn files_preparation_covers_thread_snapshot(has_private_table: bool, threads: &[Pid]) -> bool {
     has_private_table || threads.len() <= 1
-}
-
-fn requested_setid_transition(
-    mode: u16,
-    file_uid: Option<Kuid>,
-    file_gid: Option<Kgid>,
-) -> (bool, bool) {
-    // Linux bprm_fill_uid() ignores both bits when either inode ID cannot be
-    // represented, and S_ISGID additionally requires group execute.
-    let ids_mapped = file_uid.is_some() && file_gid.is_some();
-    (
-        ids_mapped && mode & 0o4000 != 0,
-        ids_mapped && mode & 0o2010 == 0o2010,
-    )
 }
 
 fn exec_file_capabilities(
@@ -93,21 +80,17 @@ where
     current_count == snapshot.len() && current.eq(snapshot.iter().copied())
 }
 
-fn ptrace_suppresses_exec_privilege(proc_data: &ProcessData) -> bool {
+fn exec_trace_state(proc_data: &ProcessData) -> ExecTraceState {
     // Linux binds ptracer_cred at attach time. The current ptrace session does
     // not retain that immutable actor credential yet, so consulting the
     // tracer's mutable current credential could incorrectly grant privilege
     // after attach. Suppress every active session until ptracer_cred is part
     // of the relationship token.
-    proc_data.ptrace_tracer().is_some()
-}
-
-fn prepared_ptrace_facts_stale(
-    gains_file_privilege: bool,
-    was_suppressed: bool,
-    suppresses_now: bool,
-) -> bool {
-    gains_file_privilege && !was_suppressed && suppresses_now
+    if proc_data.ptrace_tracer().is_some() {
+        ExecTraceState::SuppressingPrivilege
+    } else {
+        ExecTraceState::NotSuppressingPrivilege
+    }
 }
 
 fn reset_exec_signal_state(thr: &Thread) {
@@ -329,36 +312,40 @@ fn do_execve(
         let path = prepared_app.credential_source.absolute_path()?;
         try_copy_string(path.as_str())?
     };
-    let pre_exec_cred = thr.current_cred();
-    let file_uid = Kuid::from_raw(source_metadata.uid)
-        .filter(|uid| pre_exec_cred.user_ns().kernel_uid_to_user(*uid).is_some());
-    let file_gid = Kgid::from_raw(source_metadata.gid)
-        .filter(|gid| pre_exec_cred.user_ns().kernel_gid_to_user(*gid).is_some());
-    let (set_uid, set_gid) = requested_setid_transition(source_mode, file_uid, file_gid);
+    let file_owner = Kuid::from_raw(source_metadata.uid)
+        .zip(Kgid::from_raw(source_metadata.gid))
+        .map(|(uid, gid)| ExecFileOwner::new(uid, gid));
     let nosuid = crate::mounts::is_nosuid(&prepared_app.credential_source)?;
     let file_capabilities = exec_file_capabilities(nosuid, || {
         crate::syscall::security_capabilities_for_exec(&prepared_app.credential_source)
     })?;
-    let request = ExecCredentialRequest {
-        file_uid,
-        file_gid,
-        set_uid,
-        set_gid,
-        nosuid,
-        ptrace_suppresses_privilege: ptrace_suppresses_exec_privilege(proc_data),
-        executable_unreadable: prepared_app.image_access.executable_unreadable(),
+    let input = ExecCredentialInput::new(
+        source_mode,
+        file_owner,
+        if nosuid {
+            ExecMountPrivilege::NoSuid
+        } else {
+            ExecMountPrivilege::Honor
+        },
+        exec_trace_state(proc_data),
+        if prepared_app.image_access.executable_unreadable() {
+            ExecImageReadability::Unreadable
+        } else {
+            ExecImageReadability::Readable
+        },
         file_capabilities,
-    };
+    );
     let credential_lease = prepared_app.take_credential_lease()?;
-    let prepared_exec_cred = thr.prepare_exec_credential_with(request, |context| {
-        crate::task::security::dispatch_exec_credential(&context)
-    })?;
+    let prepared_exec_cred = thr.prepare_exec_credential(input)?;
     let effects = prepared_exec_cred.effects();
     let mm_owner_user_ns = exec_mm_owner_user_ns(
         prepared_exec_cred.proposed_user_ns(),
         prepared_app.image_access,
     );
-    let new_access_state = ProcessAccessState::try_new(effects.dumpability, mm_owner_user_ns)?;
+    let new_access_state = ProcessAccessState::try_new(
+        map_exec_dumpability(effects.dumpability()),
+        mm_owner_user_ns,
+    )?;
 
     // The proposed identity, not the old current credential, owns all five
     // identity/security auxv entries installed into the new stack.
@@ -367,7 +354,7 @@ fn do_execve(
         abs_path.as_str(),
         &envs,
         prepared_app,
-        effects.aux_identity,
+        effects.aux_identity(),
     )?;
     let entry_point = loaded.entry_point;
     let user_stack_base = loaded.stack_pointer;
@@ -430,11 +417,9 @@ fn do_execve(
         proc_data.proc.thread_count(),
         proc_data.proc.thread_ids(),
     ) || !files_preparation_covers_thread_snapshot(private_fd_table.is_some(), &sibling_tids)
-        || prepared_ptrace_facts_stale(
-            effects.gains_file_privilege,
-            effects.ptrace_suppressed,
-            ptrace_suppresses_exec_privilege(proc_data),
-        )
+        || prepared_exec_cred
+            .revalidation()
+            .is_stale(exec_trace_state(proc_data))
     {
         proc_data.end_exec(curr_tid);
         return Err(AxError::Interrupted);
@@ -552,8 +537,7 @@ mod tests {
 
     use super::{
         exact_exec_thread_snapshot, exec_file_capabilities, exec_mm_owner_user_ns,
-        files_preparation_covers_thread_snapshot, prepared_ptrace_facts_stale,
-        requested_setid_transition,
+        files_preparation_covers_thread_snapshot,
     };
     use crate::{
         mm::ExecImageAccess,
@@ -580,26 +564,6 @@ mod tests {
     fn exec_thread_snapshot_rejects_same_count_tid_aba() {
         assert!(exact_exec_thread_snapshot(&[7, 8], 2, [7, 8].into_iter()));
         assert!(!exact_exec_thread_snapshot(&[7, 8], 2, [7, 9].into_iter()));
-    }
-
-    #[test]
-    fn privileged_exec_rejects_new_suppressing_ptrace_relation() {
-        assert!(prepared_ptrace_facts_stale(true, false, true));
-        assert!(!prepared_ptrace_facts_stale(false, false, true));
-        assert!(!prepared_ptrace_facts_stale(true, true, true));
-        assert!(!prepared_ptrace_facts_stale(true, false, false));
-    }
-
-    #[test]
-    fn setgid_exec_requires_group_execute_and_both_mapped_ids() {
-        let uid = Kuid::from_raw(1000);
-        let gid = Kgid::from_raw(1000);
-        assert_eq!(requested_setid_transition(0o6010, uid, gid), (true, true));
-        assert_eq!(requested_setid_transition(0o6000, uid, gid), (true, false));
-        assert_eq!(
-            requested_setid_transition(0o6010, uid, None),
-            (false, false)
-        );
     }
 
     #[test]

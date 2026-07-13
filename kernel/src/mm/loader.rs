@@ -715,11 +715,11 @@ pub(crate) fn finish_prepared_user_app(
         .try_reserve_exact(5)
         .map_err(|_| AxError::NoMemory)?;
     prepared.auxv.extend([
-        AuxEntry::new(AuxType::UID, identity.uid),
-        AuxEntry::new(AuxType::EUID, identity.euid),
-        AuxEntry::new(AuxType::GID, identity.gid),
-        AuxEntry::new(AuxType::EGID, identity.egid),
-        AuxEntry::new(AuxType::SECURE, usize::from(identity.secure)),
+        AuxEntry::new(AuxType::UID, identity.uid().into_raw() as usize),
+        AuxEntry::new(AuxType::EUID, identity.euid().into_raw() as usize),
+        AuxEntry::new(AuxType::GID, identity.gid().into_raw() as usize),
+        AuxEntry::new(AuxType::EGID, identity.egid().into_raw() as usize),
+        AuxEntry::new(AuxType::SECURE, usize::from(identity.is_secure())),
     ]);
     let (entry_point, stack_pointer) = install_loaded_user_app(
         uspace,

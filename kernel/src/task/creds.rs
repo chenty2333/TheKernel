@@ -6,11 +6,12 @@ use axsync::spin::SpinNoIrq;
 pub(crate) use thekernel_linux_cred::{
     CAPABILITY_VALID_MASK, CAPABILITY_WORDS, CredentialIds as Credentials,
     FsCredentialSnapshot as DacCredentialView, GroupInfo, SECBIT_KEEP_CAPS,
-    SECBIT_KEEP_CAPS_LOCKED, SECBIT_NO_CAP_AMBIENT_RAISE, SECBIT_NO_SETUID_FIXUP, SECBIT_NOROOT,
-    SECURE_ALL_BITS, SECURE_ALL_LOCKS,
+    SECBIT_KEEP_CAPS_LOCKED, SECBIT_NO_CAP_AMBIENT_RAISE, SECBIT_NO_SETUID_FIXUP, SECURE_ALL_BITS,
+    SECURE_ALL_LOCKS,
 };
 use thekernel_linux_cred::{
-    CapabilitySets, Credential, CredentialTransitionMode, credential_cap_is_subset,
+    CapabilitySets, Credential, CredentialTransitionMode, ExecCredentialProposal,
+    credential_cap_is_subset,
 };
 
 use super::{cred_error, process::UserNamespace};
@@ -142,12 +143,7 @@ impl CredBuilder {
         }
     }
 
-    fn try_build(self, old: &Cred, exec_clears_keep_caps: bool) -> AxResult<Arc<Cred>> {
-        let mode = if exec_clears_keep_caps {
-            CredentialTransitionMode::ExecClearsKeepCaps
-        } else {
-            CredentialTransitionMode::Normal
-        };
+    fn try_build(self, old: &Cred) -> AxResult<Arc<Cred>> {
         let caps = self.caps.try_into_committed()?;
         Credential::try_from_transition(
             old,
@@ -156,7 +152,7 @@ impl CredBuilder {
             caps,
             self.no_new_privs,
             old.user_ns().clone(),
-            mode,
+            CredentialTransitionMode::Normal,
         )
         .map_err(cred_error)
     }
@@ -260,16 +256,20 @@ impl<'a> CredentialUpdate<'a> {
         &self.old
     }
 
+    pub(in crate::task) fn old_arc(&self) -> &Arc<Cred> {
+        &self.old
+    }
+
     /// Finalizes all invariants and performs the only fallible allocation for
     /// the replacement object. Dropping the returned value aborts cleanly.
-    fn finish_inner(self, exec_clears_keep_caps: bool) -> AxResult<PreparedCred<'a>> {
+    fn finish_inner(self) -> AxResult<PreparedCred<'a>> {
         let CredentialUpdate {
             slot,
             guard,
             old,
             builder,
         } = self;
-        let proposed = builder.try_build(&old, exec_clears_keep_caps)?;
+        let proposed = builder.try_build(&old)?;
         Ok(PreparedCred {
             slot,
             guard,
@@ -279,11 +279,30 @@ impl<'a> CredentialUpdate<'a> {
     }
 
     pub(crate) fn finish(self) -> AxResult<PreparedCred<'a>> {
-        self.finish_inner(false)
+        self.finish_inner()
     }
 
-    pub(in crate::task) fn finish_exec_keep_caps_clear(self) -> AxResult<PreparedCred<'a>> {
-        self.finish_inner(true)
+    /// Accepts only an external exec proposal derived from this transaction's
+    /// exact old `Arc`. Equal-looking credentials from another slot or writer
+    /// snapshot are rejected before they can reach the publication token.
+    pub(in crate::task) fn finish_exec_proposal(
+        self,
+        proposal: ExecCredentialProposal<UserNamespace>,
+    ) -> AxResult<PreparedCred<'a>> {
+        let CredentialUpdate {
+            slot,
+            guard,
+            old,
+            builder,
+        } = self;
+        let proposed = proposal.try_into_proposed(&old).map_err(cred_error)?;
+        drop(builder);
+        Ok(PreparedCred {
+            slot,
+            guard,
+            old,
+            proposed,
+        })
     }
 }
 
@@ -314,10 +333,6 @@ impl CredentialPublication<'_> {
 }
 
 impl<'a> PreparedCred<'a> {
-    pub(in crate::task) fn old(&self) -> &Cred {
-        &self.old
-    }
-
     /// Linux lowers process dumpability and clears the parent-death signal
     /// when an effective/filesystem ID changes or the proposed permitted
     /// authority is not contained by the old credential. The process layer
@@ -479,9 +494,20 @@ mod tests {
         enable_keep_caps.builder.caps.securebits |= SECBIT_KEEP_CAPS;
         enable_keep_caps.finish().unwrap().commit();
 
-        let mut exec = executor.prepare();
-        exec.builder.caps.securebits &= !SECBIT_KEEP_CAPS;
-        let prepared = exec.finish_exec_keep_caps_clear().unwrap();
+        let exec = executor.prepare();
+        let input = thekernel_linux_cred::ExecCredentialInput::new(
+            0,
+            Some(thekernel_linux_cred::ExecFileOwner::new(
+                Kuid::INITIAL_ROOT,
+                Kgid::INITIAL_ROOT,
+            )),
+            thekernel_linux_cred::ExecMountPrivilege::Honor,
+            thekernel_linux_cred::ExecTraceState::NotSuppressingPrivilege,
+            thekernel_linux_cred::ExecImageReadability::Readable,
+            None,
+        );
+        let proposal = thekernel_linux_cred::derive_exec_credential(exec.old_arc(), input).unwrap();
+        let prepared = exec.finish_exec_proposal(proposal).unwrap();
         // Exec de-threading may rebind the visible TID, but it never replaces
         // the executing Thread or the slot captured by this transaction.
         prepared.commit();

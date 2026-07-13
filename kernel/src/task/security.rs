@@ -11,7 +11,8 @@ use axerrno::{AxError, AxResult};
 use linux_raw_sys::general::{CAP_SYS_NICE, CAP_SYS_PTRACE};
 
 use super::{
-    Cred, ExecCredentialSecurityContext, UserNamespace, creds::CAPABILITY_WORDS, ns_capable,
+    Cred, ExecCredentialSecurityContext, UserNamespace, creds::CAPABILITY_WORDS,
+    exec_cred::authorize_commoncap_exec, ns_capable,
 };
 
 const SECURITY_HOOK_LIMIT: usize = 8;
@@ -352,31 +353,12 @@ fn commoncap_ptrace_traceme(context: &PtraceTracemeContext<'_>) -> AxResult<()> 
     }
 }
 
-fn permitted_is_subset(left: &Cred, right: &Cred) -> bool {
-    let left = left.capabilities().permitted();
-    let right = right.capabilities().permitted();
-    left.iter()
-        .zip(right.iter())
-        .all(|(left, right)| left & !right == 0)
-}
-
 /// Validates the invariants that must still hold after commoncap's exec
 /// credential algebra has produced its proposed value. Keeping this in the
 /// production registry prevents an allow-by-default closure at the exec call
 /// site from becoming the effective policy.
 fn commoncap_exec_credential(context: &ExecCredentialSecurityContext<'_>) -> AxResult<()> {
-    if !Arc::ptr_eq(context.old.user_ns(), context.proposed.user_ns())
-        || context.old.no_new_privs() != context.proposed.no_new_privs()
-    {
-        return Err(AxError::OperationNotPermitted);
-    }
-
-    if (context.old.no_new_privs() || context.request.ptrace_suppresses_privilege)
-        && !permitted_is_subset(context.proposed, context.old)
-    {
-        return Err(AxError::OperationNotPermitted);
-    }
-    Ok(())
+    authorize_commoncap_exec(context)
 }
 
 fn valid_rlimit_nice(rlimit_nice: u64) -> Option<u64> {
@@ -611,28 +593,22 @@ mod tests {
         Ok(())
     }
 
-    fn exec_request(ptrace_suppresses_privilege: bool) -> crate::task::ExecCredentialRequest {
-        crate::task::ExecCredentialRequest {
-            file_uid: None,
-            file_gid: None,
-            set_uid: false,
-            set_gid: false,
-            nosuid: false,
-            ptrace_suppresses_privilege,
-            executable_unreadable: false,
-            file_capabilities: None,
-        }
-    }
-
-    fn exec_effects() -> crate::task::ExecCredentialEffects {
-        crate::task::ExecCredentialEffects {
-            aux_identity: crate::task::ExecAuxIdentity::trusted_boot(),
-            dumpability: crate::task::Dumpability::UserDumpable,
-            clear_pdeath_signal: false,
-            secure_exec: false,
-            ptrace_suppressed: false,
-            gains_file_privilege: false,
-        }
+    fn exec_proposal(
+        credential: &Arc<Cred>,
+        trace_state: crate::task::ExecTraceState,
+    ) -> thekernel_linux_cred::ExecCredentialProposal<UserNamespace> {
+        let input = crate::task::ExecCredentialInput::new(
+            0,
+            Some(crate::task::ExecFileOwner::new(
+                Kuid::INITIAL_ROOT,
+                Kgid::INITIAL_ROOT,
+            )),
+            crate::task::ExecMountPrivilege::Honor,
+            trace_state,
+            crate::task::ExecImageReadability::Readable,
+            None,
+        );
+        thekernel_linux_cred::derive_exec_credential(credential, input).unwrap()
     }
 
     #[test]
@@ -683,13 +659,11 @@ mod tests {
     fn exec_security_hook_stack_short_circuits_on_first_denial() {
         let namespace = UserNamespace::try_new_root().unwrap();
         let credential = Cred::try_root(namespace).unwrap();
-        let request = exec_request(false);
-        let context = ExecCredentialSecurityContext {
-            old: &credential,
-            proposed: &credential,
-            request: &request,
-            effects: exec_effects(),
-        };
+        let proposal = exec_proposal(
+            &credential,
+            crate::task::ExecTraceState::NotSuppressingPrivilege,
+        );
+        let context = ExecCredentialSecurityContext::new(&proposal);
         let hooks = StaticHookRegistry::new([
             deny_exec_first as ExecCredentialHook,
             exec_must_not_run as ExecCredentialHook,
@@ -701,22 +675,17 @@ mod tests {
     }
 
     #[test]
-    fn production_exec_commoncap_rejects_ptrace_capability_gain() {
+    fn production_exec_commoncap_accepts_valid_external_proposal() {
         let namespace = UserNamespace::try_new_root().unwrap();
         let root = Cred::try_root(namespace).unwrap();
         let unprivileged = credential_with_caps(&root, &[], &[]);
-        let request = exec_request(true);
-        let context = ExecCredentialSecurityContext {
-            old: &unprivileged,
-            proposed: &root,
-            request: &request,
-            effects: exec_effects(),
-        };
-
-        assert_eq!(
-            dispatch_exec_credential(&context),
-            Err(AxError::OperationNotPermitted)
+        let proposal = exec_proposal(
+            &unprivileged,
+            crate::task::ExecTraceState::SuppressingPrivilege,
         );
+        let context = ExecCredentialSecurityContext::new(&proposal);
+
+        dispatch_exec_credential(&context).unwrap();
     }
 
     #[test]

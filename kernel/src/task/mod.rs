@@ -36,8 +36,9 @@ pub(crate) use self::{
     },
     creds::{CapabilityState, Cred, CredentialSlot, Credentials, DacCredentialView},
     exec_cred::{
-        ExecAuxIdentity, ExecCredentialEffects, ExecCredentialRequest,
-        ExecCredentialSecurityContext, PreparedExecCredential, parse_file_capabilities,
+        ExecAuxIdentity, ExecCredentialInput, ExecCredentialSecurityContext, ExecFileOwner,
+        ExecImageReadability, ExecMountPrivilege, ExecTraceState, PreparedExecCredential,
+        map_exec_dumpability, parse_file_capabilities,
     },
     jobctl::{ContinueResult, PtraceSession, StopReport},
     process::{
