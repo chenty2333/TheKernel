@@ -23,6 +23,9 @@ use starry_signal::{
     SignalInfo, SignalQueueAccount, Signo,
     api::{ProcessSignalManager, SignalActions},
 };
+use thekernel_linux_cred::{
+    USER_NAMESPACE_OVERFLOW_ID, UserNamespaceDomain, UserNamespaceMapState,
+};
 
 // Host unit tests do not initialize the kernel scheduler/current task. Keep
 // the production registry sleepable, but let ownership/admission tests execute
@@ -31,11 +34,6 @@ use starry_signal::{
 type SignalAccountRegistryMutex<T> = axsync::Mutex<T>;
 #[cfg(test)]
 type SignalAccountRegistryMutex<T> = spin::Mutex<T>;
-
-#[cfg(not(test))]
-type UserNamespaceStateMutex<T> = axsync::Mutex<T>;
-#[cfg(test)]
-type UserNamespaceStateMutex<T> = spin::Mutex<T>;
 
 use super::{
     IdMap, IdMapInputExtent, Kgid, Kuid, UserGid, UserUid,
@@ -236,53 +234,26 @@ impl PidNamespace {
     }
 }
 
-#[derive(Clone, Copy)]
-struct UserNamespaceMapState {
-    uid_written: bool,
-    gid_written: bool,
-    setgroups_allowed: bool,
-}
-
 pub(crate) struct UserNamespace {
     _admission: UserNamespaceAdmission,
     id: u64,
-    level: u32,
-    parent: Option<Arc<UserNamespace>>,
-    owner: Kuid,
-    // Linux records the creator's group even though current namespace
-    // capability and NS_GET_OWNER_UID rules consume only the owner UID.
-    _group: Kgid,
-    parent_could_setfcap: bool,
-    uid_map: SpinNoIrq<Arc<IdMap>>,
-    gid_map: SpinNoIrq<Arc<IdMap>>,
-    map_state: UserNamespaceStateMutex<UserNamespaceMapState>,
+    domain: UserNamespaceDomain<UserNamespace>,
+    map_state: SpinNoIrq<UserNamespaceMapState>,
     signal_accounts: SignalAccountRegistryMutex<HashMap<Kuid, Weak<SignalQueueAccount>>>,
     global_signal_account: Arc<SignalQueueAccount>,
 }
 
 impl UserNamespace {
-    const OVERFLOW_ID: u32 = 65_534;
-
     pub(crate) fn try_new_root() -> AxResult<Arc<Self>> {
-        let identity = IdMap::try_identity().map_err(cred_error)?;
+        let map_state = UserNamespaceMapState::try_initial().map_err(cred_error)?;
         let global_signal_account = SignalQueueAccount::try_new(SIGNAL_QUEUE_GLOBAL_HARD_LIMIT)
             .map_err(|_| AxError::NoMemory)?;
         let admission = UserNamespaceAdmission::try_new()?;
         Arc::try_new(Self {
             _admission: admission,
             id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
-            level: 0,
-            parent: None,
-            owner: Kuid::INITIAL_ROOT,
-            _group: Kgid::INITIAL_ROOT,
-            parent_could_setfcap: true,
-            uid_map: SpinNoIrq::new(identity.clone()),
-            gid_map: SpinNoIrq::new(identity),
-            map_state: UserNamespaceStateMutex::new(UserNamespaceMapState {
-                uid_written: true,
-                gid_written: true,
-                setgroups_allowed: true,
-            }),
+            domain: UserNamespaceDomain::initial(),
+            map_state: SpinNoIrq::new(map_state),
             signal_accounts: SignalAccountRegistryMutex::new(HashMap::new()),
             global_signal_account,
         })
@@ -295,33 +266,26 @@ impl UserNamespace {
         group: Kgid,
         parent_could_setfcap: bool,
     ) -> AxResult<Arc<Self>> {
-        // Linux rejects creation once the parent nesting level is already
-        // above 32. Keep the same finite ancestry walk bound.
-        if self.level > 32 {
-            return Err(axerrno::LinuxError::ENOSPC.into());
-        }
-        if self.kernel_uid_to_user(owner).is_none() || self.kernel_gid_to_user(group).is_none() {
-            return Err(AxError::OperationNotPermitted);
-        }
-        let uid_map = IdMap::try_empty().map_err(cred_error)?;
-        let gid_map = IdMap::try_empty().map_err(cred_error)?;
-        let setgroups_allowed = self.map_state.lock().setgroups_allowed;
+        let (uid_map, gid_map, setgroups_allowed) = {
+            let state = self.map_state.lock();
+            (state.uid_map(), state.gid_map(), state.setgroups_allowed())
+        };
+        let domain = UserNamespaceDomain::try_child(
+            self,
+            &uid_map,
+            &gid_map,
+            owner,
+            group,
+            parent_could_setfcap,
+        )
+        .map_err(cred_error)?;
+        let map_state = UserNamespaceMapState::try_child(setgroups_allowed).map_err(cred_error)?;
         let admission = UserNamespaceAdmission::try_new()?;
         Arc::try_new(Self {
             _admission: admission,
             id: PROC_NS_ID.fetch_add(1, Ordering::Relaxed),
-            level: self.level + 1,
-            parent: Some(self.clone()),
-            owner,
-            _group: group,
-            parent_could_setfcap,
-            uid_map: SpinNoIrq::new(uid_map),
-            gid_map: SpinNoIrq::new(gid_map),
-            map_state: UserNamespaceStateMutex::new(UserNamespaceMapState {
-                uid_written: false,
-                gid_written: false,
-                setgroups_allowed,
-            }),
+            domain,
+            map_state: SpinNoIrq::new(map_state),
             signal_accounts: SignalAccountRegistryMutex::new(HashMap::new()),
             global_signal_account: self.global_signal_account.clone(),
         })
@@ -329,36 +293,36 @@ impl UserNamespace {
     }
 
     pub(crate) fn parent(&self) -> Option<Arc<Self>> {
-        self.parent.clone()
+        self.domain.parent()
     }
 
     pub(crate) fn is_initial(&self) -> bool {
-        self.parent.is_none()
+        self.domain.is_initial()
     }
 
     pub(crate) fn owner_kuid(&self) -> Kuid {
-        self.owner
+        self.domain.owner_kuid()
     }
 
     pub(crate) fn parent_could_setfcap(&self) -> bool {
-        self.parent_could_setfcap
+        self.domain.parent_could_setfcap()
     }
 
     pub(crate) fn uid_map(&self) -> Arc<IdMap> {
-        self.uid_map.lock().clone()
+        self.map_state.lock().uid_map()
     }
 
     pub(crate) fn gid_map(&self) -> Arc<IdMap> {
-        self.gid_map.lock().clone()
+        self.map_state.lock().gid_map()
     }
 
-    fn map_display_namespace<'a>(self: &'a Arc<Self>, viewer: &'a Arc<Self>) -> &'a Arc<Self> {
+    fn map_display_namespace(self: &Arc<Self>, viewer: &Arc<Self>) -> Arc<Self> {
         // Linux uses seq_user_ns() for map reads, except that a task reading
         // its own namespace map sees lower IDs in the immediate parent.
         if Arc::ptr_eq(self, viewer) {
-            self.parent.as_ref().unwrap_or(viewer)
+            self.parent().unwrap_or_else(|| viewer.clone())
         } else {
-            viewer
+            viewer.clone()
         }
     }
 
@@ -381,7 +345,7 @@ impl UserNamespace {
     }
 
     pub(crate) fn try_build_uid_map(&self, input: Vec<IdMapInputExtent>) -> AxResult<Arc<IdMap>> {
-        let parent = self.parent.as_ref().ok_or(AxError::OperationNotPermitted)?;
+        let parent = self.parent().ok_or(AxError::OperationNotPermitted)?;
         let parent_map = parent.uid_map();
         IdMap::try_from_parent(input, &parent_map).map_err(cred_error)
     }
@@ -390,13 +354,13 @@ impl UserNamespace {
         &self,
         input: &[IdMapInputExtent],
     ) -> AxResult<Arc<IdMap>> {
-        let parent = self.parent.as_ref().ok_or(AxError::OperationNotPermitted)?;
+        let parent = self.parent().ok_or(AxError::OperationNotPermitted)?;
         let parent_map = parent.uid_map();
         IdMap::try_from_parent_slice(input, &parent_map).map_err(cred_error)
     }
 
     pub(crate) fn try_build_gid_map(&self, input: Vec<IdMapInputExtent>) -> AxResult<Arc<IdMap>> {
-        let parent = self.parent.as_ref().ok_or(AxError::OperationNotPermitted)?;
+        let parent = self.parent().ok_or(AxError::OperationNotPermitted)?;
         let parent_map = parent.gid_map();
         IdMap::try_from_parent(input, &parent_map).map_err(cred_error)
     }
@@ -405,81 +369,59 @@ impl UserNamespace {
         &self,
         input: &[IdMapInputExtent],
     ) -> AxResult<Arc<IdMap>> {
-        let parent = self.parent.as_ref().ok_or(AxError::OperationNotPermitted)?;
+        let parent = self.parent().ok_or(AxError::OperationNotPermitted)?;
         let parent_map = parent.gid_map();
         IdMap::try_from_parent_slice(input, &parent_map).map_err(cred_error)
     }
 
     /// Publishes a fully built UID map exactly once. Construction and parent
-    /// resolution happen before the namespace state mutex, and retired map
-    /// ownership is dropped after both locks have been released.
+    /// resolution happen before the short map-state guard. The core borrows
+    /// `map` and clones it into an empty slot, so no map ownership is retired or
+    /// returned by the guarded operation.
     pub(crate) fn publish_uid_map(&self, map: Arc<IdMap>) -> AxResult<()> {
-        if map.is_empty() {
-            return Err(AxError::InvalidInput);
-        }
-        let mut state = self.map_state.lock();
-        if state.uid_written {
-            return Err(AxError::OperationNotPermitted);
-        }
-        let retired = core::mem::replace(&mut *self.uid_map.lock(), map);
-        state.uid_written = true;
-        drop(state);
-        drop(retired);
-        Ok(())
+        let result = {
+            let mut state = self.map_state.lock();
+            state.try_publish_uid_map(&map)
+        };
+        result.map_err(cred_error)
     }
 
     /// Publishes a fully built GID map exactly once. Unprivileged callers pass
-    /// `require_setgroups_denied`; that check is made in the same state
-    /// transaction as publication, closing the deny/write race.
+    /// `require_setgroups_denied`; that check is made under the same map-state
+    /// guard as publication, closing the deny/write race.
     pub(crate) fn publish_gid_map(
         &self,
         map: Arc<IdMap>,
         require_setgroups_denied: bool,
     ) -> AxResult<()> {
-        if map.is_empty() {
-            return Err(AxError::InvalidInput);
-        }
-        let mut state = self.map_state.lock();
-        if state.gid_written || (require_setgroups_denied && state.setgroups_allowed) {
-            return Err(AxError::OperationNotPermitted);
-        }
-        let retired = core::mem::replace(&mut *self.gid_map.lock(), map);
-        state.gid_written = true;
-        drop(state);
-        drop(retired);
-        Ok(())
+        let result = {
+            let mut state = self.map_state.lock();
+            state.try_publish_gid_map(&map, require_setgroups_denied)
+        };
+        result.map_err(cred_error)
     }
 
     pub(crate) fn setgroups_allowed(&self) -> bool {
-        self.map_state.lock().setgroups_allowed
+        self.map_state.lock().setgroups_allowed()
     }
 
     pub(crate) fn uid_map_written(&self) -> bool {
-        self.map_state.lock().uid_written
+        self.map_state.lock().uid_map_written()
     }
 
     pub(crate) fn gid_map_written(&self) -> bool {
-        self.map_state.lock().gid_written
+        self.map_state.lock().gid_map_written()
     }
 
     pub(crate) fn may_setgroups(&self) -> bool {
-        let state = self.map_state.lock();
-        state.gid_written && state.setgroups_allowed
+        self.map_state.lock().may_setgroups()
     }
 
     pub(crate) fn update_setgroups_policy(&self, allow: bool) -> AxResult<()> {
-        let mut state = self.map_state.lock();
-        if allow {
-            if !state.setgroups_allowed {
-                return Err(AxError::OperationNotPermitted);
-            }
-        } else {
-            if state.gid_written {
-                return Err(AxError::OperationNotPermitted);
-            }
-            state.setgroups_allowed = false;
-        }
-        Ok(())
+        self.map_state
+            .lock()
+            .try_update_setgroups_policy(allow)
+            .map_err(cred_error)
     }
 
     pub(crate) fn user_uid_to_kernel(&self, uid: UserUid) -> Option<Kuid> {
@@ -517,13 +459,13 @@ impl UserNamespace {
     pub(crate) fn from_kuid_munged(&self, uid: Kuid) -> u32 {
         self.kernel_uid_to_user(uid)
             .map(UserUid::into_raw)
-            .unwrap_or(Self::OVERFLOW_ID)
+            .unwrap_or(USER_NAMESPACE_OVERFLOW_ID)
     }
 
     pub(crate) fn from_kgid_munged(&self, gid: Kgid) -> u32 {
         self.kernel_gid_to_user(gid)
             .map(UserGid::into_raw)
-            .unwrap_or(Self::OVERFLOW_ID)
+            .unwrap_or(USER_NAMESPACE_OVERFLOW_ID)
     }
 
     /// Returns the RT signal queue accounts for a real UID in this namespace.
@@ -572,15 +514,15 @@ impl UserNamespace {
 
 impl thekernel_linux_cred::UserNamespaceView for UserNamespace {
     fn parent(self: &Arc<Self>) -> Option<Arc<Self>> {
-        self.parent.clone()
+        self.domain.parent()
     }
 
     fn level(&self) -> u32 {
-        self.level
+        self.domain.level()
     }
 
     fn owner_kuid(&self) -> Kuid {
-        self.owner
+        self.domain.owner_kuid()
     }
 
     fn root_kuid(&self) -> Option<Kuid> {
@@ -588,7 +530,7 @@ impl thekernel_linux_cred::UserNamespaceView for UserNamespace {
     }
 
     fn is_initial(&self) -> bool {
-        self.parent.is_none()
+        self.domain.is_initial()
     }
 }
 
@@ -3190,7 +3132,7 @@ mod tests {
         snapshot_group_credential_image, try_increment_bounded,
     };
     use crate::task::{
-        CapabilityState, Cred, CredentialSlot, IdMapInputExtent, Kgid, Kuid,
+        CapabilityState, Cred, CredentialSlot, IdMap, IdMapInputExtent, Kgid, Kuid,
         jobctl::{JobControlState, PtraceControlState, PtraceSession, StopKind, StopState},
     };
 
@@ -3841,6 +3783,204 @@ mod tests {
             child.update_setgroups_policy(false),
             Err(AxError::OperationNotPermitted)
         );
+    }
+
+    #[test]
+    fn concurrent_uid_map_publish_has_exactly_one_winner() {
+        let root = UserNamespace::try_new_root().unwrap();
+        let child = root.try_fork(kuid(1000), kgid(1000), false).unwrap();
+        let first = child
+            .try_build_uid_map(vec![IdMapInputExtent::new(0, 1000, 1)])
+            .unwrap();
+        let second = child
+            .try_build_uid_map(vec![IdMapInputExtent::new(1, 2000, 1)])
+            .unwrap();
+        let start = Arc::new(Barrier::new(2));
+
+        let first_publisher = {
+            let child = child.clone();
+            let map = first.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                child.publish_uid_map(map)
+            })
+        };
+        let second_publisher = {
+            let child = child.clone();
+            let map = second.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                child.publish_uid_map(map)
+            })
+        };
+
+        let mut successes = 0;
+        let mut duplicate_rejections = 0;
+        for result in [
+            first_publisher.join().unwrap(),
+            second_publisher.join().unwrap(),
+        ] {
+            match result {
+                Ok(()) => successes += 1,
+                Err(AxError::OperationNotPermitted) => duplicate_rejections += 1,
+                other => panic!("unexpected UID map publication result: {other:?}"),
+            }
+        }
+        assert_eq!(successes, 1);
+        assert_eq!(duplicate_rejections, 1);
+
+        let published = child.uid_map();
+        assert!(Arc::ptr_eq(&published, &first) || Arc::ptr_eq(&published, &second));
+    }
+
+    #[test]
+    fn uid_map_reader_race_observes_only_empty_or_complete_immutable_snapshots() {
+        const READS: usize = 20_000;
+
+        fn assert_complete(map: &IdMap) {
+            assert_eq!(map.len(), 2);
+            assert_eq!(
+                map.kernel_uid_to_user(kuid(1000)).map(|uid| uid.into_raw()),
+                Some(0)
+            );
+            assert_eq!(
+                map.kernel_uid_to_user(kuid(1001)).map(|uid| uid.into_raw()),
+                Some(1)
+            );
+            assert_eq!(
+                map.kernel_uid_to_user(kuid(2000)).map(|uid| uid.into_raw()),
+                Some(100)
+            );
+            assert_eq!(
+                map.kernel_uid_to_user(kuid(2001)).map(|uid| uid.into_raw()),
+                Some(101)
+            );
+            assert_eq!(map.kernel_uid_to_user(kuid(1500)), None);
+        }
+
+        let root = UserNamespace::try_new_root().unwrap();
+        let child = root.try_fork(kuid(1000), kgid(1000), false).unwrap();
+        let replacement = child
+            .try_build_uid_map(vec![
+                IdMapInputExtent::new(0, 1000, 2),
+                IdMapInputExtent::new(100, 2000, 2),
+            ])
+            .unwrap();
+        let empty_snapshot = child.uid_map();
+        assert!(empty_snapshot.is_empty());
+
+        let start = Arc::new(Barrier::new(2));
+        let publisher = {
+            let child = child.clone();
+            let replacement = replacement.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                child.publish_uid_map(replacement)
+            })
+        };
+
+        start.wait();
+        for index in 0..READS {
+            let snapshot = child.uid_map();
+            if !snapshot.is_empty() {
+                assert_complete(&snapshot);
+            }
+            if index % 64 == 0 {
+                thread::yield_now();
+            }
+        }
+        publisher.join().unwrap().unwrap();
+
+        assert!(empty_snapshot.is_empty());
+        let published = child.uid_map();
+        assert!(Arc::ptr_eq(&published, &replacement));
+        assert_complete(&published);
+    }
+
+    #[test]
+    fn setgroups_deny_race_preserves_gid_gate_and_failed_publish_is_retryable() {
+        const RACES: usize = 64;
+        const SAMPLES_PER_RACE: usize = 128;
+
+        // Exercise the publication-first result deterministically: failure
+        // keeps the slot empty, and the exact prebuilt map can be retried after
+        // the irreversible deny transition.
+        let retry_root = UserNamespace::try_new_root().unwrap();
+        let retry_child = retry_root.try_fork(kuid(1000), kgid(1000), false).unwrap();
+        let retry_map = retry_child
+            .try_build_gid_map(vec![IdMapInputExtent::new(0, 1000, 1)])
+            .unwrap();
+        assert_eq!(
+            retry_child.publish_gid_map(retry_map.clone(), true),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert!(!retry_child.gid_map_written());
+        retry_child.update_setgroups_policy(false).unwrap();
+        retry_child
+            .publish_gid_map(retry_map.clone(), true)
+            .unwrap();
+        assert!(Arc::ptr_eq(&retry_child.gid_map(), &retry_map));
+
+        for _ in 0..RACES {
+            let root = UserNamespace::try_new_root().unwrap();
+            let child = root.try_fork(kuid(1000), kgid(1000), false).unwrap();
+            let map = child
+                .try_build_gid_map(vec![IdMapInputExtent::new(0, 1000, 1)])
+                .unwrap();
+            let start = Arc::new(Barrier::new(3));
+
+            let deny = {
+                let child = child.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    child.update_setgroups_policy(false)
+                })
+            };
+            let publish = {
+                let child = child.clone();
+                let map = map.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    child.publish_gid_map(map, true)
+                })
+            };
+
+            start.wait();
+            for sample in 0..SAMPLES_PER_RACE {
+                let state = child.map_state.lock();
+                assert!(
+                    !state.setgroups_allowed() || !state.gid_map_written(),
+                    "require-denied GID map became visible while setgroups was allowed"
+                );
+                drop(state);
+                if sample % 16 == 0 {
+                    thread::yield_now();
+                }
+            }
+
+            deny.join().unwrap().unwrap();
+            let publish_result = publish.join().unwrap();
+            assert!(!child.setgroups_allowed());
+            match publish_result {
+                Ok(()) => assert!(child.gid_map_written()),
+                Err(AxError::OperationNotPermitted) => {
+                    assert!(!child.gid_map_written());
+                    child.publish_gid_map(map.clone(), true).unwrap();
+                }
+                other => panic!("unexpected GID map publication result: {other:?}"),
+            }
+            let state = child.map_state.lock();
+            assert!(!state.setgroups_allowed());
+            assert!(state.gid_map_written());
+            assert!(!state.may_setgroups());
+            drop(state);
+            assert!(Arc::ptr_eq(&child.gid_map(), &map));
+        }
     }
 
     #[test]

@@ -63,6 +63,7 @@ pub(crate) fn cred_error(error: CredError) -> axerrno::AxError {
         CredError::InvalidInput => axerrno::AxError::InvalidInput,
         CredError::NotPermitted => axerrno::AxError::OperationNotPermitted,
         CredError::NoMemory => axerrno::AxError::NoMemory,
+        CredError::Capacity => axerrno::LinuxError::ENOSPC.into(),
         _ => axerrno::AxError::OperationNotPermitted,
     }
 }
