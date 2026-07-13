@@ -6,6 +6,10 @@
 //! allocate, register, remove, or silently skip a module.
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
+#[cfg(test)]
+extern crate std;
+#[cfg(test)]
+use core::cell::Cell;
 use core::{any::Any, fmt, marker::PhantomData};
 
 use axerrno::{AxError, AxResult};
@@ -44,6 +48,40 @@ pub(in crate::task) enum CredentialStateTransition {
     Normal,
     UserNamespace,
     Exec,
+}
+
+/// Immutable facts delivered to one module after a credential replacement
+/// has become visible.  The callback sees the exact old/new core values and
+/// the exact typed states that were preflighted before publication; it must
+/// never resample a task's current credential.
+struct CredentialPostCommitContext<'a, S> {
+    old_credential: &'a CoreCred,
+    old_state: &'a S,
+    new_credential: &'a CoreCred,
+    new_state: &'a S,
+    transition: CredentialStateTransition,
+}
+
+impl<'a, S> CredentialPostCommitContext<'a, S> {
+    const fn old_credential(&self) -> &'a CoreCred {
+        self.old_credential
+    }
+
+    const fn old_state(&self) -> &'a S {
+        self.old_state
+    }
+
+    const fn new_credential(&self) -> &'a CoreCred {
+        self.new_credential
+    }
+
+    const fn new_state(&self) -> &'a S {
+        self.new_state
+    }
+
+    const fn transition(&self) -> CredentialStateTransition {
+        self.transition
+    }
 }
 
 /// Opaque proof that the complete boot-time module stack was frozen and
@@ -317,6 +355,28 @@ trait SecurityModule: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Observes one successfully published credential replacement.
+    ///
+    /// This is an infallible Linux-LSM-style atomic notification. It runs in
+    /// frozen registry order after every credential publication, process-
+    /// security, image, group-leader, and task-alias lock has been released.
+    /// The credential writer mutex is also released before entry. The method
+    /// must not allocate, block, fail, panic, resample `current()`, reenter a
+    /// credential update, or acquire task/process/image/alias locks. Work that
+    /// can sleep must use a resource reserved before publication and perform
+    /// only an allocation-free handoff here. Registry order is guaranteed
+    /// within this exact transition; notifications from other slots or a
+    /// later transaction may run concurrently, so module-owned aggregation
+    /// must already be concurrency-safe without allocating here. This hook is
+    /// for replacement of an already-live slot (`Normal` and `Exec`) only;
+    /// initial, fork-child, and user-namespace object publication require
+    /// distinct lifecycle notifications and do not masquerade as a commit.
+    fn credential_committed(
+        &self,
+        _context: CredentialPostCommitContext<'_, Self::CredentialState>,
+    ) {
+    }
+
     /// Releases one module state through the module runtime that created it.
     /// The owner wrapper invokes this directly and never consults a registry.
     ///
@@ -408,6 +468,14 @@ trait ErasedSecurityModule: Send + Sync {
         proposed_state: &dyn ErasedOwnedCredentialState,
         transition: CredentialStateTransition,
     ) -> AxResult<()>;
+    fn credential_committed(
+        &self,
+        old_credential: &CoreCred,
+        old_state: &dyn ErasedOwnedCredentialState,
+        new_credential: &CoreCred,
+        new_state: &dyn ErasedOwnedCredentialState,
+        transition: CredentialStateTransition,
+    );
     fn ptrace_access(&self, context: &PtraceAccessContext<'_>) -> AxResult<()>;
     fn ptrace_access_with_credential_state(
         &self,
@@ -560,6 +628,35 @@ impl<M: SecurityModule> ErasedSecurityModule for M {
         )
     }
 
+    fn credential_committed(
+        &self,
+        old_credential: &CoreCred,
+        old_state: &dyn ErasedOwnedCredentialState,
+        new_credential: &CoreCred,
+        new_state: &dyn ErasedOwnedCredentialState,
+        transition: CredentialStateTransition,
+    ) {
+        // A PendingCredentialPostCommit is created only after a complete
+        // release-build preflight of both immutable state vectors. Repeating
+        // a fallible downcast after publication would introduce a failure
+        // branch at a point where rollback is impossible, so this adapter may
+        // rely on that linear token's invariant.
+        let old_state = owned_credential_state(self, old_state)
+            .expect("preflighted old credential state changed before notification");
+        let new_state = owned_credential_state(self, new_state)
+            .expect("preflighted new credential state changed before notification");
+        SecurityModule::credential_committed(
+            self,
+            CredentialPostCommitContext {
+                old_credential,
+                old_state,
+                new_credential,
+                new_state,
+                transition,
+            },
+        );
+    }
+
     fn ptrace_access(&self, context: &PtraceAccessContext<'_>) -> AxResult<()> {
         SecurityModule::ptrace_access(self, context)
     }
@@ -633,6 +730,43 @@ impl<M: SecurityModule> ErasedSecurityModule for M {
     }
 }
 
+#[cfg(test)]
+fn assert_post_commit_callback_locks_released() {
+    assert!(!super::creds::credential_writer_lock_held());
+    assert!(!super::creds::credential_publication_lock_held());
+    assert!(!super::process::process_security_lock_held());
+    assert!(!super::process::process_image_lock_held());
+    assert!(!super::process::group_leader_lock_held());
+    assert!(!super::process::ptrace_action_lock_held());
+    assert!(!super::ops::task_alias_lock_held());
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static COMMONCAP_COMMIT_COUNT: Cell<u32> = const { Cell::new(0) };
+    static COMMONCAP_COMMIT_OLD_UID: Cell<u32> = const { Cell::new(0) };
+    static COMMONCAP_COMMIT_NEW_UID: Cell<u32> = const { Cell::new(0) };
+    static COMMONCAP_COMMIT_TRANSITION: Cell<u32> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(in crate::task) fn reset_commoncap_post_commit_probe() {
+    COMMONCAP_COMMIT_COUNT.with(|value| value.set(0));
+    COMMONCAP_COMMIT_OLD_UID.with(|value| value.set(0));
+    COMMONCAP_COMMIT_NEW_UID.with(|value| value.set(0));
+    COMMONCAP_COMMIT_TRANSITION.with(|value| value.set(0));
+}
+
+#[cfg(test)]
+pub(in crate::task) fn commoncap_post_commit_probe() -> (u32, u32, u32, u32) {
+    (
+        COMMONCAP_COMMIT_COUNT.with(Cell::get),
+        COMMONCAP_COMMIT_OLD_UID.with(Cell::get),
+        COMMONCAP_COMMIT_NEW_UID.with(Cell::get),
+        COMMONCAP_COMMIT_TRANSITION.with(Cell::get),
+    )
+}
+
 struct CommoncapModule;
 
 impl SecurityModule for CommoncapModule {
@@ -655,6 +789,38 @@ impl SecurityModule for CommoncapModule {
         _transition: CredentialStateTransition,
     ) -> AxResult<Self::CredentialState> {
         Ok(())
+    }
+
+    fn credential_committed(
+        &self,
+        context: CredentialPostCommitContext<'_, Self::CredentialState>,
+    ) {
+        #[cfg(test)]
+        {
+            assert_post_commit_callback_locks_released();
+            COMMONCAP_COMMIT_COUNT.with(|value| value.set(value.get() + 1));
+            COMMONCAP_COMMIT_OLD_UID
+                .with(|value| value.set(context.old_credential().ids().ruid.into_raw()));
+            COMMONCAP_COMMIT_NEW_UID
+                .with(|value| value.set(context.new_credential().ids().ruid.into_raw()));
+            let transition = match context.transition() {
+                CredentialStateTransition::Fork => 1,
+                CredentialStateTransition::Normal => 1 << 1,
+                CredentialStateTransition::UserNamespace => 1 << 2,
+                CredentialStateTransition::Exec => 1 << 3,
+            };
+            COMMONCAP_COMMIT_TRANSITION.with(|value| value.set(transition));
+        }
+        // Commoncap has no post-publication work today. Touch every immutable
+        // fact here so the no-op implementation still exercises the complete
+        // typed context in production builds.
+        let _ = (
+            context.old_credential(),
+            context.old_state(),
+            context.new_credential(),
+            context.new_state(),
+            context.transition(),
+        );
     }
 
     fn ptrace_access(&self, context: &PtraceAccessContext<'_>) -> AxResult<()> {
@@ -923,6 +1089,56 @@ impl Drop for CredentialSecurityState {
     }
 }
 
+/// Linear, pre-publication proof for one post-commit notification pass.
+///
+/// The exact old/new composite credentials are retained by this token, so a
+/// later writer cannot make the callback observe a different transition. A
+/// dropped unpublished token is an ordinary abort and emits no notification.
+#[must_use = "a published credential must consume its post-commit notification token"]
+pub(in crate::task) struct PendingCredentialPostCommit {
+    registry: FrozenSecurityRegistry,
+    old: Arc<Cred>,
+    new: Arc<Cred>,
+    transition: CredentialStateTransition,
+}
+
+impl PendingCredentialPostCommit {
+    pub(in crate::task) fn try_new(
+        old: &Arc<Cred>,
+        new: &Arc<Cred>,
+        transition: CredentialStateTransition,
+    ) -> AxResult<Self> {
+        if !matches!(
+            transition,
+            CredentialStateTransition::Normal | CredentialStateTransition::Exec
+        ) {
+            return Err(AxError::BadState);
+        }
+        let registry = old.security().registry();
+        registry
+            .registry()
+            .validate_credential_post_commit_pair(old, new)?;
+        Ok(Self {
+            registry,
+            old: old.clone(),
+            new: new.clone(),
+            transition,
+        })
+    }
+
+    pub(in crate::task) fn notify(self) {
+        let Self {
+            registry,
+            old,
+            new,
+            transition,
+        } = self;
+        registry
+            .registry()
+            .notify_credential_committed(&old, &new, transition);
+    }
+}
+
 impl SecurityRegistry {
     fn validate_erased_slots(&self, slots: &[OwnedModuleCredState]) -> AxResult<()> {
         if slots.len() != self.modules.len() {
@@ -954,6 +1170,43 @@ impl SecurityRegistry {
 
     fn credential_slots<'a>(&self, credential: &'a Cred) -> AxResult<&'a [OwnedModuleCredState]> {
         self.security_slots(credential.security())
+    }
+
+    /// Performs the complete fallible layout, ModuleId, erased-type, and
+    /// exact-runtime validation for both sides before publication. No module
+    /// callback has run if either (including a late) slot is malformed.
+    fn validate_credential_post_commit_pair(&self, old: &Cred, new: &Cred) -> AxResult<()> {
+        self.credential_slots(old)?;
+        self.credential_slots(new)?;
+        Ok(())
+    }
+
+    /// Dispatches an already-preflighted, immutable pair in registry order.
+    /// Publication cannot be rolled back, so this pass is intentionally
+    /// infallible and has no allocation or short-circuit path.
+    fn notify_credential_committed(
+        &self,
+        old: &Cred,
+        new: &Cred,
+        transition: CredentialStateTransition,
+    ) {
+        let old_slots = &old.security().slots;
+        let new_slots = &new.security().slots;
+        debug_assert_eq!(old_slots.len(), self.modules.len());
+        debug_assert_eq!(new_slots.len(), self.modules.len());
+        for ((registered, old_state), new_state) in
+            self.modules.iter().zip(old_slots).zip(new_slots)
+        {
+            debug_assert_eq!(registered.id, old_state.module_id);
+            debug_assert_eq!(registered.id, new_state.module_id);
+            registered.module.credential_committed(
+                old.core(),
+                old_state.erased.as_ref(),
+                new.core(),
+                new_state.erased.as_ref(),
+                transition,
+            );
+        }
     }
 
     fn try_empty_credential_state(
@@ -1308,7 +1561,7 @@ pub(crate) fn dispatch_scheduler(context: &SecuritySchedulerContext<'_>) -> AxRe
 mod tests {
     extern crate std;
 
-    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::{
         sync::{Barrier, Mutex, MutexGuard},
         thread,
@@ -1334,6 +1587,12 @@ mod tests {
     static CRED_STATE_INIT_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_PREPARE_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_AUTHORIZE_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_COMMIT_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_COMMIT_GENERATION_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_COMMIT_TRANSITION_MASK: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_COMMIT_OLD_UID: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_COMMIT_NEW_UID: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_DROP_AT_COMMIT: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_DROP_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_DISPATCH_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_EXEC_TRACE: AtomicU32 = AtomicU32::new(0);
@@ -1361,6 +1620,12 @@ mod tests {
             &CRED_STATE_INIT_TRACE,
             &CRED_STATE_PREPARE_TRACE,
             &CRED_STATE_AUTHORIZE_TRACE,
+            &CRED_STATE_COMMIT_TRACE,
+            &CRED_STATE_COMMIT_GENERATION_TRACE,
+            &CRED_STATE_COMMIT_TRANSITION_MASK,
+            &CRED_STATE_COMMIT_OLD_UID,
+            &CRED_STATE_COMMIT_NEW_UID,
+            &CRED_STATE_DROP_AT_COMMIT,
             &CRED_STATE_DROP_TRACE,
             &CRED_STATE_DISPATCH_TRACE,
             &CRED_STATE_EXEC_TRACE,
@@ -1379,6 +1644,7 @@ mod tests {
     struct ProbeCredentialState {
         key: u32,
         generation: u32,
+        committed: AtomicBool,
     }
 
     struct CredentialStateProbeModule<const KEY: u64>;
@@ -1397,7 +1663,11 @@ mod tests {
             if CRED_STATE_FAIL_INIT_KEY.load(Ordering::SeqCst) == key {
                 return Err(AxError::NoMemory);
             }
-            Ok(ProbeCredentialState { key, generation: 0 })
+            Ok(ProbeCredentialState {
+                key,
+                generation: 0,
+                committed: AtomicBool::new(true),
+            })
         }
 
         fn try_prepare_credential(
@@ -1423,6 +1693,7 @@ mod tests {
             Ok(ProbeCredentialState {
                 key,
                 generation: old_state.generation + 1,
+                committed: AtomicBool::new(false),
             })
         }
 
@@ -1443,6 +1714,48 @@ mod tests {
                 return Err(AxError::PermissionDenied);
             }
             Ok(())
+        }
+
+        fn credential_committed(
+            &self,
+            context: CredentialPostCommitContext<'_, Self::CredentialState>,
+        ) {
+            assert_post_commit_callback_locks_released();
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(context.old_state().key, key);
+            assert_eq!(context.new_state().key, key);
+            assert!(context.old_state().committed.load(Ordering::SeqCst));
+            assert!(!context.new_state().committed.swap(true, Ordering::SeqCst));
+            assert_eq!(
+                context.new_state().generation,
+                context.old_state().generation + 1
+            );
+            append_trace(&CRED_STATE_COMMIT_TRACE, key);
+            if key == 2 {
+                append_trace(
+                    &CRED_STATE_COMMIT_GENERATION_TRACE,
+                    context.new_state().generation,
+                );
+                CRED_STATE_COMMIT_OLD_UID.store(
+                    context.old_credential().ids().ruid.into_raw(),
+                    Ordering::SeqCst,
+                );
+                CRED_STATE_COMMIT_NEW_UID.store(
+                    context.new_credential().ids().ruid.into_raw(),
+                    Ordering::SeqCst,
+                );
+                CRED_STATE_DROP_AT_COMMIT.store(
+                    CRED_STATE_DROP_TRACE.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+            }
+            let transition_bit = match context.transition() {
+                CredentialStateTransition::Fork => 1,
+                CredentialStateTransition::Normal => 1 << 1,
+                CredentialStateTransition::UserNamespace => 1 << 2,
+                CredentialStateTransition::Exec => 1 << 3,
+            };
+            CRED_STATE_COMMIT_TRANSITION_MASK.fetch_or(transition_bit, Ordering::SeqCst);
         }
 
         fn ptrace_access_with_credential_state(
@@ -1511,6 +1824,9 @@ mod tests {
 
         fn free_credential(&self, state: Self::CredentialState) {
             assert!(!credential_publication_lock_held());
+            if state.committed.load(Ordering::SeqCst) {
+                assert_post_commit_callback_locks_released();
+            }
             append_trace(&CRED_STATE_DROP_TRACE, state.key);
         }
     }
@@ -2708,6 +3024,7 @@ mod tests {
         let state = ProbeCredentialState {
             key: 2,
             generation: 0,
+            committed: AtomicBool::new(false),
         };
 
         assert!(matches!(
@@ -2860,6 +3177,7 @@ mod tests {
             );
         }
         assert_eq!(CRED_STATE_EXEC_TRACE.load(Ordering::SeqCst), 2);
+        assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 0);
         drop(draft);
         assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
         assert_eq!(old.ids().euid, Kuid::INITIAL_ROOT);
@@ -2936,6 +3254,7 @@ mod tests {
             ProbeCredentialState {
                 key: 3,
                 generation: 0,
+                committed: AtomicBool::new(true),
             },
         )
         .unwrap();
@@ -2962,6 +3281,7 @@ mod tests {
             ProbeCredentialState {
                 key: 2,
                 generation: 0,
+                committed: AtomicBool::new(true),
             },
         )
         .unwrap();
@@ -2981,6 +3301,148 @@ mod tests {
             Err(AxError::OperationNotPermitted)
         );
         assert_eq!(CRED_STATE_DISPATCH_TRACE.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn ordinary_post_commit_notifies_once_in_order_before_retirement() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let old = Cred::try_root_with_registry(registry, namespace).unwrap();
+        let slot = CredentialSlot::new(old.clone());
+        CRED_STATE_COMMIT_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_DROP_TRACE.store(0, Ordering::SeqCst);
+
+        let mut update = slot.prepare();
+        update.builder.ids.ruid = Kuid::from_raw(1000).unwrap();
+        let prepared = update.finish().unwrap();
+        assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 0);
+
+        let publication = prepared.publish();
+        assert_eq!(slot.current().ids().ruid, Kuid::from_raw(1000).unwrap());
+        assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 0);
+
+        let (new, retirement) = publication.complete_post_commit();
+        assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(
+            CRED_STATE_COMMIT_TRANSITION_MASK.load(Ordering::SeqCst),
+            1 << 1
+        );
+        assert_eq!(CRED_STATE_COMMIT_GENERATION_TRACE.load(Ordering::SeqCst), 1);
+        assert_eq!(CRED_STATE_COMMIT_OLD_UID.load(Ordering::SeqCst), 0);
+        assert_eq!(CRED_STATE_COMMIT_NEW_UID.load(Ordering::SeqCst), 1000);
+        assert_eq!(CRED_STATE_DROP_AT_COMMIT.load(Ordering::SeqCst), 0);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 0);
+        assert!(Arc::ptr_eq(&slot.current(), &new));
+
+        drop(old);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 0);
+        drop(retirement);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
+        drop(new);
+        drop(slot);
+    }
+
+    #[test]
+    fn exec_post_commit_notifies_once_with_exec_transition() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let old = Cred::try_root_with_registry(registry, namespace).unwrap();
+        let slot = CredentialSlot::new(old.clone());
+        CRED_STATE_COMMIT_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_DROP_TRACE.store(0, Ordering::SeqCst);
+
+        let update = slot.prepare();
+        let draft = exec_draft(&old, crate::task::ExecTraceState::NotSuppressingPrivilege);
+        dispatch_exec_credential(&ExecCredentialSecurityContext::new(&draft)).unwrap();
+        let prepared = update.finish_exec_draft(draft).unwrap();
+        let publication = prepared.publish();
+        assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 0);
+
+        let (new, retirement) = publication.complete_post_commit();
+        assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(
+            CRED_STATE_COMMIT_TRANSITION_MASK.load(Ordering::SeqCst),
+            1 << 3
+        );
+        assert_eq!(CRED_STATE_COMMIT_GENERATION_TRACE.load(Ordering::SeqCst), 1);
+        assert_eq!(CRED_STATE_DROP_AT_COMMIT.load(Ordering::SeqCst), 0);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 0);
+
+        drop(old);
+        drop(retirement);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
+        drop(new);
+        drop(slot);
+    }
+
+    #[test]
+    fn failed_or_aborted_replacements_emit_no_post_commit_notification() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let old = Cred::try_root_with_registry(registry, namespace).unwrap();
+        let slot = CredentialSlot::new(old.clone());
+
+        CRED_STATE_FAIL_PREPARE_KEY.store(3, Ordering::SeqCst);
+        assert_eq!(slot.prepare().finish().err(), Some(AxError::NoMemory));
+        assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 0);
+
+        CRED_STATE_FAIL_PREPARE_KEY.store(0, Ordering::SeqCst);
+        CRED_STATE_DENY_KEY.store(2, Ordering::SeqCst);
+        assert_eq!(
+            slot.prepare().finish().err(),
+            Some(AxError::PermissionDenied)
+        );
+        assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 0);
+
+        CRED_STATE_DENY_KEY.store(0, Ordering::SeqCst);
+        drop(slot.prepare().finish().unwrap());
+        assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 0);
+
+        let update = slot.prepare();
+        let draft = exec_draft(&old, crate::task::ExecTraceState::NotSuppressingPrivilege);
+        drop(update.finish_exec_draft(draft).unwrap());
+        assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn malformed_late_post_commit_slot_fails_before_any_notification() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let old = Cred::try_root_with_registry(registry, namespace).unwrap();
+        let core = old.core_arc().clone();
+        let mut malformed_security = registry.try_init_credential_state(&core).unwrap();
+        malformed_security.slots[2].module_id = ModuleId(7);
+        let malformed = Cred::try_from_prepared_parts(core, malformed_security).unwrap();
+
+        assert!(matches!(
+            PendingCredentialPostCommit::try_new(
+                &old,
+                &malformed,
+                CredentialStateTransition::Normal,
+            ),
+            Err(AxError::OperationNotPermitted)
+        ));
+        assert!(matches!(
+            PendingCredentialPostCommit::try_new(&old, &old, CredentialStateTransition::Fork,),
+            Err(AxError::BadState)
+        ));
+        assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "published credential dropped without post-commit notification")]
+    fn dropping_a_published_pending_notification_fails_stop() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let old = Cred::try_root_with_registry(registry, namespace).unwrap();
+        let slot = CredentialSlot::new(old);
+        let publication = slot.prepare().finish().unwrap().publish();
+        drop(publication);
     }
 
     #[test]

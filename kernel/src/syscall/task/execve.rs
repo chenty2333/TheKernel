@@ -48,6 +48,14 @@ fn files_preparation_covers_thread_snapshot(has_private_table: bool, threads: &[
     has_private_table || threads.len() <= 1
 }
 
+/// Releases the later ptrace/process action gate before any exec retirement
+/// can run credential/image destructors. Kept as one audited boundary so a
+/// future refactor cannot accidentally reverse the two drops.
+fn release_exec_action_then_retirement<A, R>(action: A, retirement: R) {
+    drop(action);
+    drop(retirement);
+}
+
 fn exec_file_capabilities(
     nosuid: bool,
     read: impl FnOnce() -> AxResult<Option<FileCapabilities>>,
@@ -445,7 +453,7 @@ fn do_execve(
     // A non-leader exec adopts the thread-group ID. The visible TID, reserved
     // alias, credential/group-leader binding, address space, and access owner
     // become visible as one composite transition. No fallible commit remains.
-    let exec_retirement = commit_exec_identity_handoff(
+    let exec_commit = commit_exec_identity_handoff(
         task_alias_admission,
         proc_data,
         curr_tid,
@@ -454,6 +462,11 @@ fn do_execve(
         new_aspace,
         new_access_state,
     );
+    // Image, group-leader, and task-alias publication locks are now absent.
+    // Notify before taking the ptrace-action lock, while the returned
+    // retirement continues to own the old credential and old image through
+    // the hardware page-table-root switch below.
+    let exec_retirement = exec_commit.complete_post_commit();
     // Freeze the relationship which observed the exec commit while the exec
     // gate still excludes a fresh attach. The action gate keeps that exact
     // relationship stable through stop publication; a later attachment must
@@ -464,9 +477,6 @@ fn do_execve(
         .finish()
         .unwrap_or_else(|error| fail_closed_exit(error));
     set_current_user_page_table_root(new_root);
-    // The old page tables and credential owners stay alive until both the
-    // saved task context and hardware root name the new image.
-    drop(exec_retirement);
     proc_data.replace_executable(executable_key);
 
     drop(curr.replace_name(task_name));
@@ -506,7 +516,11 @@ fn do_execve(
     {
         notify_ptrace_attach_stop(proc_data);
     }
-    drop(exec_ptrace_action);
+    // The old page tables and credential owners stayed alive until the saved
+    // task context and hardware root both named the new image. Release them
+    // only after the later ptrace/process action lock is gone as well, so a
+    // final module-state free callback never runs under that lock.
+    release_exec_action_then_retirement(exec_ptrace_action, exec_retirement);
     Ok(0)
 }
 
@@ -532,12 +546,13 @@ pub fn sys_execve(
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
 
     use axerrno::AxError;
 
     use super::{
         exact_exec_thread_snapshot, exec_file_capabilities, exec_mm_owner_user_ns,
-        files_preparation_covers_thread_snapshot,
+        files_preparation_covers_thread_snapshot, release_exec_action_then_retirement,
     };
     use crate::{
         mm::ExecImageAccess,
@@ -583,6 +598,37 @@ mod tests {
         assert!(files_preparation_covers_thread_snapshot(false, &[7]));
         assert!(!files_preparation_covers_thread_snapshot(false, &[7, 8]));
         assert!(files_preparation_covers_thread_snapshot(true, &[7, 8]));
+    }
+
+    #[test]
+    fn exec_action_gate_is_released_before_retired_owners() {
+        struct DropTrace<'a> {
+            trace: &'a AtomicU32,
+            value: u32,
+        }
+
+        impl Drop for DropTrace<'_> {
+            fn drop(&mut self) {
+                self.trace
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
+                        Some(old * 10 + self.value)
+                    })
+                    .unwrap();
+            }
+        }
+
+        let trace = AtomicU32::new(0);
+        release_exec_action_then_retirement(
+            DropTrace {
+                trace: &trace,
+                value: 1,
+            },
+            DropTrace {
+                trace: &trace,
+                value: 2,
+            },
+        );
+        assert_eq!(trace.load(Ordering::SeqCst), 12);
     }
 }
 

@@ -42,7 +42,7 @@ pub(crate) use self::{
     },
     jobctl::{ContinueResult, PtraceSession, StopReport},
     process::{
-        CgroupNamespace, CommittedProcessExit, Dumpability, ExecImageRetirement,
+        CgroupNamespace, CommittedProcessExit, Dumpability, ExecImageCommit,
         InitialProcessThreadAdmission, MempolicySnapshot, NetworkNamespace,
         PendingThreadPublication, PidNamespace, Process, ProcessAccessState, ProcessGroup,
         ProcessImageAccessSnapshot, ProcessReparentBatch, ProcessThreadAdmission,

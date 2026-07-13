@@ -199,7 +199,11 @@ mod tests {
     use thekernel_linux_cred::{CAPABILITY_WORDS, GroupInfo};
 
     use super::*;
-    use crate::task::{CredentialSlot, Credentials, Kgid, Kuid, creds::CapabilityState};
+    use crate::task::{
+        CredentialSlot, Credentials, Kgid, Kuid,
+        creds::CapabilityState,
+        security::{commoncap_post_commit_probe, reset_commoncap_post_commit_probe},
+    };
 
     fn unprivileged_slot() -> Arc<CredentialSlot> {
         let namespace = UserNamespace::try_new_root().unwrap();
@@ -264,6 +268,7 @@ mod tests {
     fn authorizer_denial_and_dropped_preparation_are_zero_effect_rollbacks() {
         let slot = unprivileged_slot();
         let old = slot.current();
+        reset_commoncap_post_commit_probe();
 
         let denied = prepare_exec_update(slot.prepare(), setuid_root_input(), |_| {
             Err(AxError::OperationNotPermitted)
@@ -279,12 +284,14 @@ mod tests {
         );
         drop(prepared);
         assert!(Arc::ptr_eq(&old, &slot.current()));
+        assert_eq!(commoncap_post_commit_probe().0, 0);
     }
 
     #[test]
     fn privileged_exec_revalidates_a_new_suppressing_ptrace_relation() {
         let slot = unprivileged_slot();
         let old = slot.current();
+        reset_commoncap_post_commit_probe();
         let proposal =
             thekernel_linux_cred::derive_exec_credential(old.core_arc(), setuid_root_input())
                 .unwrap();
@@ -310,6 +317,16 @@ mod tests {
                 .revalidation()
                 .is_stale(ExecTraceState::SuppressingPrivilege)
         );
+
+        let prepared =
+            prepare_exec_update(slot.prepare(), setuid_root_input(), |_| Ok(())).unwrap();
+        assert!(
+            prepared
+                .revalidation()
+                .is_stale(ExecTraceState::SuppressingPrivilege)
+        );
+        drop(prepared);
+        assert_eq!(commoncap_post_commit_probe().0, 0);
     }
 
     #[test]

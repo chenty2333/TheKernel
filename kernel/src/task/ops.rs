@@ -2,6 +2,10 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+#[cfg(test)]
+extern crate std;
+#[cfg(test)]
+use core::cell::Cell;
 use core::{
     alloc::Layout,
     ffi::c_long,
@@ -23,12 +27,11 @@ use starry_signal::{SignalActionFlags, SignalDisposition, SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use super::{
-    AsThread, CommittedProcessExit, ExecImageRetirement, FutexKey, ITimerType,
-    PreparedExecCredential, ProcStateHint, Process, ProcessAccessState, ProcessData, ProcessGroup,
-    ProcessReparentBatch, Session, TaskParentNode, TaskUsage, Thread, ThreadExitTransition,
-    TimerState, futex_table_for, lock_task_parent_publication, process_domain,
-    send_signal_thread_inner, send_signal_to_process, send_signal_to_process_data,
-    send_signal_to_thread, user::linux_pid_from_task_id,
+    AsThread, CommittedProcessExit, ExecImageCommit, FutexKey, ITimerType, PreparedExecCredential,
+    ProcStateHint, Process, ProcessAccessState, ProcessData, ProcessGroup, ProcessReparentBatch,
+    Session, TaskParentNode, TaskUsage, Thread, ThreadExitTransition, TimerState, futex_table_for,
+    lock_task_parent_publication, process_domain, send_signal_thread_inner, send_signal_to_process,
+    send_signal_to_process_data, send_signal_to_thread, user::linux_pid_from_task_id,
 };
 use crate::{
     mm::{AddrSpace, UserPtr, access_user_memory},
@@ -177,6 +180,38 @@ static TASK_TABLE: Lazy<Mutex<WeakRegistry<WeakAxTaskRef>>> =
     Lazy::new(|| Mutex::new(WeakRegistry::new()));
 static TASK_ALIAS_TABLE: Lazy<Mutex<WeakRegistry<WeakAxTaskRef>>> =
     Lazy::new(|| Mutex::new(WeakRegistry::new()));
+
+#[cfg(test)]
+std::thread_local! {
+    static TASK_ALIAS_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+struct TaskAliasLockProbe;
+
+#[cfg(test)]
+impl TaskAliasLockProbe {
+    fn new() -> Self {
+        TASK_ALIAS_LOCK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TaskAliasLockProbe {
+    fn drop(&mut self) {
+        TASK_ALIAS_LOCK_DEPTH.with(|depth| {
+            let held = depth.get();
+            debug_assert!(held != 0);
+            depth.set(held - 1);
+        });
+    }
+}
+
+#[cfg(test)]
+pub(in crate::task) fn task_alias_lock_held() -> bool {
+    TASK_ALIAS_LOCK_DEPTH.with(|depth| depth.get() != 0)
+}
 
 static PROCESS_TABLE: Lazy<Mutex<WeakRegistry<Weak<ProcessData>>>> =
     Lazy::new(|| Mutex::new(WeakRegistry::new()));
@@ -448,15 +483,19 @@ impl TaskAliasAdmission {
         prepared: PreparedExecCredential<'a>,
         new_aspace: Arc<Mutex<AddrSpace>>,
         new_access_state: Arc<ProcessAccessState>,
-    ) -> ExecImageRetirement<'a> {
+    ) -> ExecImageCommit<'a> {
         debug_assert!(core::ptr::eq(self.task.as_thread(), thread));
         let mut aliases = TASK_ALIAS_TABLE.lock();
+        #[cfg(test)]
+        let alias_lock_probe = TaskAliasLockProbe::new();
         let retirement =
             proc_data.publish_exec_image(owner, thread, prepared, new_aspace, new_access_state);
         thread.set_tid(self.alias);
         let old = aliases.insert_reserved(self.alias, &self.task);
         self.committed = true;
         drop(aliases);
+        #[cfg(test)]
+        drop(alias_lock_probe);
         drop(old);
         retirement
     }
@@ -474,7 +513,7 @@ pub(crate) fn commit_exec_identity_handoff<'a>(
     prepared: PreparedExecCredential<'a>,
     new_aspace: Arc<Mutex<AddrSpace>>,
     new_access_state: Arc<ProcessAccessState>,
-) -> ExecImageRetirement<'a> {
+) -> ExecImageCommit<'a> {
     if let Some(admission) = admission {
         admission.commit_exec_handoff(
             proc_data,

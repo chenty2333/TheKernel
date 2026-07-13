@@ -5,6 +5,10 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+#[cfg(test)]
+extern crate std;
+#[cfg(test)]
+use core::cell::Cell;
 use core::{
     sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     time::Duration,
@@ -34,6 +38,75 @@ use thekernel_linux_cred::{
 type SignalAccountRegistryMutex<T> = axsync::Mutex<T>;
 #[cfg(test)]
 type SignalAccountRegistryMutex<T> = spin::Mutex<T>;
+
+#[cfg(test)]
+std::thread_local! {
+    static PROCESS_SECURITY_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static PROCESS_IMAGE_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static GROUP_LEADER_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static PTRACE_ACTION_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum PostCommitLockKind {
+    ProcessSecurity,
+    ProcessImage,
+    GroupLeader,
+    PtraceAction,
+}
+
+#[cfg(test)]
+struct PostCommitLockProbe(PostCommitLockKind);
+
+#[cfg(test)]
+impl PostCommitLockProbe {
+    fn new(kind: PostCommitLockKind) -> Self {
+        post_commit_lock_depth(kind, |depth| depth.set(depth.get() + 1));
+        Self(kind)
+    }
+}
+
+#[cfg(test)]
+impl Drop for PostCommitLockProbe {
+    fn drop(&mut self) {
+        post_commit_lock_depth(self.0, |depth| {
+            let held = depth.get();
+            debug_assert!(held != 0);
+            depth.set(held - 1);
+        });
+    }
+}
+
+#[cfg(test)]
+fn post_commit_lock_depth(kind: PostCommitLockKind, apply: impl FnOnce(&Cell<u32>)) {
+    match kind {
+        PostCommitLockKind::ProcessSecurity => PROCESS_SECURITY_LOCK_DEPTH.with(apply),
+        PostCommitLockKind::ProcessImage => PROCESS_IMAGE_LOCK_DEPTH.with(apply),
+        PostCommitLockKind::GroupLeader => GROUP_LEADER_LOCK_DEPTH.with(apply),
+        PostCommitLockKind::PtraceAction => PTRACE_ACTION_LOCK_DEPTH.with(apply),
+    }
+}
+
+#[cfg(test)]
+pub(in crate::task) fn process_security_lock_held() -> bool {
+    PROCESS_SECURITY_LOCK_DEPTH.with(|depth| depth.get() != 0)
+}
+
+#[cfg(test)]
+pub(in crate::task) fn process_image_lock_held() -> bool {
+    PROCESS_IMAGE_LOCK_DEPTH.with(|depth| depth.get() != 0)
+}
+
+#[cfg(test)]
+pub(in crate::task) fn group_leader_lock_held() -> bool {
+    GROUP_LEADER_LOCK_DEPTH.with(|depth| depth.get() != 0)
+}
+
+#[cfg(test)]
+pub(in crate::task) fn ptrace_action_lock_held() -> bool {
+    PTRACE_ACTION_LOCK_DEPTH.with(|depth| depth.get() != 0)
+}
 
 use super::{
     IdMap, IdMapInputExtent, Kgid, Kuid, UserGid, UserUid,
@@ -952,14 +1025,18 @@ impl GroupLeaderCredentialBinding {
         &self,
         credential: Arc<CredentialSlot>,
         prepared: Option<PreparedCred<'a>>,
-    ) -> GroupLeaderRetirement<'a> {
+    ) -> GroupLeaderCommit<'a> {
         let mut current = self.current.lock();
+        #[cfg(test)]
+        let group_lock_probe = PostCommitLockProbe::new(PostCommitLockKind::GroupLeader);
         let publication = prepared.map(PreparedCred::publish);
         let retired = core::mem::replace(&mut *current, credential);
         drop(current);
-        GroupLeaderRetirement {
-            _publication: publication,
-            _slot: retired,
+        #[cfg(test)]
+        drop(group_lock_probe);
+        GroupLeaderCommit {
+            publication,
+            retired_slot: retired,
         }
     }
 }
@@ -1035,12 +1112,16 @@ impl ProcessAccessState {
         pdeath_signal: &AtomicU32,
     ) -> super::creds::CredentialPublication<'a> {
         let mut security = self.security.lock();
+        #[cfg(test)]
+        let security_lock_probe = PostCommitLockProbe::new(PostCommitLockKind::ProcessSecurity);
         if prepared.requires_dumpability_drop() {
             security.dumpability = Dumpability::NotDumpable;
             pdeath_signal.store(0, Ordering::Release);
         }
         let publication = prepared.publish();
         drop(security);
+        #[cfg(test)]
+        drop(security_lock_probe);
         publication
     }
 }
@@ -1210,12 +1291,16 @@ fn replace_process_image_with_group_handoff<'a, A>(
     prepared: Option<PreparedCred<'a>>,
     new_image: ProcessImageBinding<A>,
     finish_image_publication: impl FnOnce(),
-) -> (GroupLeaderRetirement<'a>, ProcessImageBinding<A>) {
+) -> (GroupLeaderCommit<'a>, ProcessImageBinding<A>) {
     let mut image = image_binding.write();
+    #[cfg(test)]
+    let image_lock_probe = PostCommitLockProbe::new(PostCommitLockKind::ProcessImage);
     let group_leader = group_leader.publish_handoff(credential, prepared);
     let retired_image = core::mem::replace(&mut *image, new_image);
     finish_image_publication();
     drop(image);
+    #[cfg(test)]
+    drop(image_lock_probe);
     (group_leader, retired_image)
 }
 
@@ -1367,6 +1452,15 @@ impl Iterator for PtraceReverseLinkDrain {
     }
 }
 
+/// Serializes ptrace relationship actions. The wrapper is zero-cost in
+/// production and carries a host-test lock-depth probe used by credential
+/// post-commit callbacks.
+pub(crate) struct PtraceActionGuard<'a> {
+    _guard: axsync::MutexGuard<'a, ()>,
+    #[cfg(test)]
+    _probe: PostCommitLockProbe,
+}
+
 /// [`Process`]-shared data.
 pub struct ProcessData {
     /// The process.
@@ -1516,19 +1610,66 @@ fn ptrace_lifecycle_first_key(left: usize, right: usize) -> bool {
     left < right
 }
 
-/// Deferred destruction produced by an exec group-leader handoff.
-///
-/// The value must be dropped only after every registry/binding lock involved
-/// in the composite publication has been released.
-pub(crate) struct GroupLeaderRetirement<'a> {
-    _publication: Option<super::creds::CredentialPublication<'a>>,
+/// An exec group-leader handoff whose pointer publication is complete but
+/// whose credential post-commit notification has not run yet.
+struct GroupLeaderCommit<'a> {
+    publication: Option<super::creds::CredentialPublication<'a>>,
+    retired_slot: Arc<CredentialSlot>,
+}
+
+impl GroupLeaderCommit<'_> {
+    fn complete_post_commit(self) -> GroupLeaderRetirement {
+        let Self {
+            publication,
+            retired_slot,
+        } = self;
+        let credential = publication.map(|publication| {
+            let (new, retirement) = publication.complete_post_commit();
+            // The published slot retains the new credential. This owner is
+            // needed only through the callback itself.
+            drop(new);
+            retirement
+        });
+        GroupLeaderRetirement {
+            _credential: credential,
+            _slot: retired_slot,
+        }
+    }
+}
+
+/// Old group-leader and credential ownership retained after notification.
+struct GroupLeaderRetirement {
+    _credential: Option<super::creds::CredentialRetirement>,
     _slot: Arc<CredentialSlot>,
 }
 
-/// Retired image and credential ownership from one exec publication. The
-/// caller keeps this alive until after switching the hardware page-table root.
-pub(crate) struct ExecImageRetirement<'a> {
-    _group_leader: GroupLeaderRetirement<'a>,
+/// An exec image/credential publication returned only after image,
+/// group-leader, and task-alias locks have been released. The caller must run
+/// post-commit notification before acquiring later process locks.
+#[must_use = "exec publication must complete its credential notification"]
+pub(crate) struct ExecImageCommit<'a> {
+    group_leader: GroupLeaderCommit<'a>,
+    image: LiveProcessImageBinding,
+}
+
+impl ExecImageCommit<'_> {
+    pub(crate) fn complete_post_commit(self) -> ExecImageRetirement {
+        let Self {
+            group_leader,
+            image,
+        } = self;
+        ExecImageRetirement {
+            _group_leader: group_leader.complete_post_commit(),
+            _image: image,
+        }
+    }
+}
+
+/// Retired image and credential ownership after notification. The caller
+/// keeps this alive until after switching the hardware page-table root.
+#[must_use = "exec retirement must outlive the page-table switch and process action locks"]
+pub(crate) struct ExecImageRetirement {
+    _group_leader: GroupLeaderRetirement,
     _image: LiveProcessImageBinding,
 }
 
@@ -1900,12 +2041,16 @@ impl ProcessData {
         pdeath_signal: &AtomicU32,
     ) -> Arc<Cred> {
         let image = self.image_binding.read();
+        #[cfg(test)]
+        let image_lock_probe = PostCommitLockProbe::new(PostCommitLockKind::ProcessImage);
         let publication = image
             .access_state
             .publish_credential(prepared, pdeath_signal);
-        let proposed = publication.proposed();
         drop(image);
-        drop(publication);
+        #[cfg(test)]
+        drop(image_lock_probe);
+        let (proposed, retirement) = publication.complete_post_commit();
+        drop(retirement);
         proposed
     }
 
@@ -1919,7 +2064,7 @@ impl ProcessData {
         prepared: PreparedExecCredential<'a>,
         new_aspace: Arc<Mutex<AddrSpace>>,
         new_access_state: Arc<ProcessAccessState>,
-    ) -> ExecImageRetirement<'a> {
+    ) -> ExecImageCommit<'a> {
         debug_assert!(self.is_exec_owner(owner));
         debug_assert_eq!(thread.proc_data.proc.pid(), self.proc.pid());
         let credential = thread.credential_slot();
@@ -1941,9 +2086,9 @@ impl ProcessData {
             },
             || self.mempolicy.lock().ranges.clear(),
         );
-        ExecImageRetirement {
-            _group_leader: group_leader,
-            _image: retired_image,
+        ExecImageCommit {
+            group_leader,
+            image: retired_image,
         }
     }
 
@@ -2314,8 +2459,15 @@ impl ProcessData {
         })
     }
 
-    pub(crate) fn lock_ptrace_actions(&self) -> axsync::MutexGuard<'_, ()> {
-        self.ptrace_actions.lock()
+    pub(crate) fn lock_ptrace_actions(&self) -> PtraceActionGuard<'_> {
+        let guard = self.ptrace_actions.lock();
+        #[cfg(test)]
+        let probe = PostCommitLockProbe::new(PostCommitLockKind::PtraceAction);
+        PtraceActionGuard {
+            _guard: guard,
+            #[cfg(test)]
+            _probe: probe,
+        }
     }
 
     pub fn ptrace_tracer(&self) -> Option<Pid> {
@@ -3141,6 +3293,7 @@ mod tests {
     use crate::task::{
         CapabilityState, Cred, CredentialSlot, IdMap, IdMapInputExtent, Kgid, Kuid,
         jobctl::{JobControlState, PtraceControlState, PtraceSession, StopKind, StopState},
+        security::{commoncap_post_commit_probe, reset_commoncap_post_commit_probe},
     };
 
     fn kuid(raw: u32) -> Kuid {
@@ -3188,7 +3341,9 @@ mod tests {
                 _ => update.builder.ids.fsgid = kgid(1000),
             }
             let publication = state.publish_credential(update.finish().unwrap(), &pdeath);
-            drop(publication);
+            let (proposed, retirement) = publication.complete_post_commit();
+            drop(proposed);
+            drop(retirement);
             assert_eq!(state.dumpability(), Dumpability::NotDumpable);
             assert_eq!(pdeath.load(Ordering::Acquire), 0);
         }
@@ -3208,7 +3363,9 @@ mod tests {
         gain.builder.caps.permitted[word] |= mask;
         gain.builder.caps.effective[word] |= mask;
         let publication = state.publish_credential(gain.finish().unwrap(), &pdeath);
-        drop(publication);
+        let (proposed, retirement) = publication.complete_post_commit();
+        drop(proposed);
+        drop(retirement);
         assert_eq!(state.dumpability(), Dumpability::NotDumpable);
         assert_eq!(pdeath.load(Ordering::Acquire), 0);
     }
@@ -3228,7 +3385,9 @@ mod tests {
                 _ => update.builder.ids.sgid = kgid(1000),
             }
             let publication = state.publish_credential(update.finish().unwrap(), &pdeath);
-            drop(publication);
+            let (proposed, retirement) = publication.complete_post_commit();
+            drop(proposed);
+            drop(retirement);
             assert_eq!(state.dumpability(), Dumpability::UserDumpable);
             assert_eq!(pdeath.load(Ordering::Acquire), 7);
         }
@@ -3269,7 +3428,11 @@ mod tests {
                     gain.builder.ids.euid = stronger;
                     gain.builder.ids.suid = stronger;
                     gain.builder.ids.fsuid = stronger;
-                    drop(state.publish_credential(gain.finish().unwrap(), &pdeath));
+                    let (proposed, retirement) = state
+                        .publish_credential(gain.finish().unwrap(), &pdeath)
+                        .complete_post_commit();
+                    drop(proposed);
+                    drop(retirement);
                     stronger_ready.wait();
                     stronger_sampled.wait();
 
@@ -3278,7 +3441,11 @@ mod tests {
                     restore.builder.ids.euid = initial;
                     restore.builder.ids.suid = initial;
                     restore.builder.ids.fsuid = initial;
-                    drop(state.publish_credential(restore.finish().unwrap(), &pdeath));
+                    let (proposed, retirement) = state
+                        .publish_credential(restore.finish().unwrap(), &pdeath)
+                        .complete_post_commit();
+                    drop(proposed);
+                    drop(retirement);
                     state.set_dumpability(Dumpability::UserDumpable);
                 }
             })
@@ -3556,9 +3723,12 @@ mod tests {
     fn process_access_group_leader_exec_handoff_is_image_coherent() {
         let old_slot = credential_slot(1000);
         let new_slot = credential_slot(2000);
+        let executor_old = new_slot.current();
+        let executor_old_weak = Arc::downgrade(&executor_old);
         let old_owner = old_slot.current().user_ns().clone();
         let new_owner = new_slot.current().user_ns().clone();
         let old_state = ProcessAccessState::try_new(Dumpability::UserDumpable, old_owner).unwrap();
+        let old_state_weak = Arc::downgrade(&old_state);
         let clone_vm_peer_state = old_state.clone();
         let new_state = ProcessAccessState::try_new(Dumpability::NotDumpable, new_owner).unwrap();
         let image = Arc::new(spin::RwLock::new(ProcessImageBinding {
@@ -3607,8 +3777,10 @@ mod tests {
         update.builder.ids.suid = kuid(3000);
         update.builder.ids.fsuid = kuid(3000);
         let prepared = update.finish().unwrap();
+        drop(executor_old);
+        reset_commoncap_post_commit_probe();
         old_seen.wait();
-        let retirement = replace_process_image_with_group_handoff(
+        let (commit, retired_image) = replace_process_image_with_group_handoff(
             &image,
             &group,
             new_slot.clone(),
@@ -3623,12 +3795,22 @@ mod tests {
                 reset_under_image_lock.store(true, Ordering::Release);
             },
         );
+        let retirement = commit.complete_post_commit();
+        assert_eq!(commoncap_post_commit_probe(), (1, 2000, 3000, 1 << 1));
+        assert!(executor_old_weak.upgrade().is_some());
+        assert!(old_state_weak.upgrade().is_some());
+        assert_eq!(clone_vm_peer_state.dumpability(), Dumpability::UserDumpable);
+        drop(clone_vm_peer_state);
+        assert!(old_state_weak.upgrade().is_some());
         drop(retirement);
+        assert!(executor_old_weak.upgrade().is_none());
+        assert!(old_state_weak.upgrade().is_some());
+        drop(retired_image);
+        assert!(old_state_weak.upgrade().is_none());
         assert!(reset_under_image_lock.load(Ordering::Acquire));
         assert!(mempolicy.lock().ranges.is_empty());
         let current_state = image.read().access_state.clone();
-        assert!(!Arc::ptr_eq(&current_state, &clone_vm_peer_state));
-        assert_eq!(clone_vm_peer_state.dumpability(), Dumpability::UserDumpable);
+        assert_eq!(current_state.dumpability(), Dumpability::NotDumpable);
         new_ready.wait();
         reader.join().unwrap();
     }
@@ -3695,8 +3877,9 @@ mod tests {
         update.builder.ids.fsuid = kuid(3000);
         let prepared = update.finish().unwrap();
         start.wait();
-        let retirement = binding.publish_handoff(new.clone(), Some(prepared));
+        let commit = binding.publish_handoff(new.clone(), Some(prepared));
         assert_eq!(binding.current_cred().ids().ruid, kuid(3000));
+        let retirement = commit.complete_post_commit();
         drop(retirement);
         reader.join().unwrap();
     }

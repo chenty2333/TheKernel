@@ -22,7 +22,10 @@ use super::{
     cred_error,
     exec_cred::ExecCredentialDraft,
     process::UserNamespace,
-    security::{CredentialSecurityState, CredentialStateTransition, FrozenSecurityRegistry},
+    security::{
+        CredentialSecurityState, CredentialStateTransition, FrozenSecurityRegistry,
+        PendingCredentialPostCommit,
+    },
 };
 
 pub(in crate::task) type CoreCred = Credential<UserNamespace>;
@@ -192,16 +195,54 @@ impl Cred {
 #[cfg(not(test))]
 type CredentialUpdateMutex<T> = axsync::Mutex<T>;
 #[cfg(test)]
-type CredentialUpdateMutex<T> = spin::Mutex<T>;
+struct CredentialUpdateMutex<T>(spin::Mutex<T>);
 
 #[cfg(not(test))]
 type CredentialUpdateGuard<'a, T> = axsync::MutexGuard<'a, T>;
 #[cfg(test)]
-type CredentialUpdateGuard<'a, T> = spin::MutexGuard<'a, T>;
+struct CredentialUpdateGuard<'a, T> {
+    _guard: spin::MutexGuard<'a, T>,
+}
+
+#[cfg(test)]
+impl<T> CredentialUpdateMutex<T> {
+    fn new(value: T) -> Self {
+        Self(spin::Mutex::new(value))
+    }
+
+    fn lock(&self) -> CredentialUpdateGuard<'_, T> {
+        let guard = self.0.lock();
+        CREDENTIAL_WRITER_LOCK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        CredentialUpdateGuard { _guard: guard }
+    }
+
+    fn try_lock(&self) -> Option<CredentialUpdateGuard<'_, T>> {
+        let guard = self.0.try_lock()?;
+        CREDENTIAL_WRITER_LOCK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Some(CredentialUpdateGuard { _guard: guard })
+    }
+}
+
+#[cfg(test)]
+impl<T> Drop for CredentialUpdateGuard<'_, T> {
+    fn drop(&mut self) {
+        CREDENTIAL_WRITER_LOCK_DEPTH.with(|depth| {
+            let held = depth.get();
+            debug_assert!(held != 0);
+            depth.set(held - 1);
+        });
+    }
+}
 
 #[cfg(test)]
 std::thread_local! {
+    static CREDENTIAL_WRITER_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
     static CREDENTIAL_PUBLICATION_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(in crate::task) fn credential_writer_lock_held() -> bool {
+    CREDENTIAL_WRITER_LOCK_DEPTH.with(|depth| depth.get() != 0)
 }
 
 #[cfg(test)]
@@ -460,11 +501,17 @@ impl<'a> CredentialUpdate<'a> {
             builder,
         } = self;
         let (proposed, effects) = builder.try_build(&old)?;
+        let post_commit = PendingCredentialPostCommit::try_new(
+            &old,
+            &proposed,
+            CredentialStateTransition::Normal,
+        )?;
         Ok(PreparedCred {
             slot,
             guard,
             old,
             proposed,
+            post_commit,
             requires_dumpability_drop: effects.requires_dumpability_drop(),
         })
     }
@@ -489,12 +536,15 @@ impl<'a> CredentialUpdate<'a> {
         let requires_dumpability_drop = draft.proposal().effects().clear_pdeath_signal();
         let (proposed_core, proposed_security) = draft.try_into_parts(&old)?;
         let proposed = Cred::try_from_prepared_parts(proposed_core, proposed_security)?;
+        let post_commit =
+            PendingCredentialPostCommit::try_new(&old, &proposed, CredentialStateTransition::Exec)?;
         drop(builder);
         Ok(PreparedCred {
             slot,
             guard,
             old,
             proposed,
+            post_commit,
             requires_dumpability_drop,
         })
     }
@@ -506,24 +556,69 @@ pub(crate) struct PreparedCred<'a> {
     guard: CredentialUpdateGuard<'a, ()>,
     old: Arc<Cred>,
     proposed: Arc<Cred>,
+    post_commit: PendingCredentialPostCommit,
     requires_dumpability_drop: bool,
 }
 
-/// A completed pointer publication whose retired references still need to be
-/// destroyed.  Keeping those references in an explicit value lets composite
-/// operations (notably non-leader exec) publish a task credential and switch
-/// the process's group-leader binding under one short lock, while deferring
-/// potentially cascading `Arc` destruction until after that lock is released.
+/// A completed pointer publication whose mandatory post-commit notification
+/// has not run yet. Callers must first release every enclosing process/image/
+/// alias lock and then consume this value with `complete_post_commit`.
+#[must_use = "published credentials must complete their post-commit notification"]
 pub(crate) struct CredentialPublication<'a> {
-    _guard: CredentialUpdateGuard<'a, ()>,
-    proposed: Arc<Cred>,
+    guard: Option<CredentialUpdateGuard<'a, ()>>,
+    proposed: Option<Arc<Cred>>,
+    published: Option<Arc<Cred>>,
+    old: Option<Arc<Cred>>,
+    post_commit: Option<PendingCredentialPostCommit>,
+}
+
+/// Exact old ownership retained after notification until the caller reaches
+/// its destruction-safe boundary. Exec carries this value past the hardware
+/// page-table-root switch; ordinary transitions may drop it immediately.
+#[must_use = "retired credential ownership must reach its destruction-safe boundary"]
+pub(crate) struct CredentialRetirement {
     _published: Arc<Cred>,
     _old: Arc<Cred>,
 }
 
-impl CredentialPublication<'_> {
-    pub(crate) fn proposed(&self) -> Arc<Cred> {
-        self.proposed.clone()
+impl<'a> CredentialPublication<'a> {
+    /// Releases the sleepable writer mutex, runs the infallible ordered
+    /// notification while exact old/new composites are alive, and returns a
+    /// separate retirement owner. Every publication/process/image/alias lock
+    /// must already be absent when this method is called.
+    pub(crate) fn complete_post_commit(mut self) -> (Arc<Cred>, CredentialRetirement) {
+        let guard = self.guard.take().expect("credential writer guard is live");
+        let proposed = self
+            .proposed
+            .take()
+            .expect("published proposed credential is live");
+        let published = self
+            .published
+            .take()
+            .expect("retired slot credential is live");
+        let old = self.old.take().expect("transaction old credential is live");
+        let post_commit = self
+            .post_commit
+            .take()
+            .expect("post-commit notification is pending");
+        drop(guard);
+        post_commit.notify();
+        (
+            proposed,
+            CredentialRetirement {
+                _published: published,
+                _old: old,
+            },
+        )
+    }
+}
+
+impl Drop for CredentialPublication<'_> {
+    fn drop(&mut self) {
+        assert!(
+            self.post_commit.is_none(),
+            "published credential dropped without post-commit notification"
+        );
     }
 }
 
@@ -549,6 +644,7 @@ impl<'a> PreparedCred<'a> {
             guard,
             old,
             proposed,
+            post_commit,
             requires_dumpability_drop: _,
         } = self;
         let published = {
@@ -566,10 +662,11 @@ impl<'a> PreparedCred<'a> {
         };
         debug_assert!(Arc::ptr_eq(&published, &old));
         CredentialPublication {
-            _guard: guard,
-            proposed,
-            _published: published,
-            _old: old,
+            guard: Some(guard),
+            proposed: Some(proposed),
+            published: Some(published),
+            old: Some(old),
+            post_commit: Some(post_commit),
         }
     }
 
@@ -578,8 +675,8 @@ impl<'a> PreparedCred<'a> {
     /// writer mutex have been dropped.
     pub(crate) fn commit(self) -> Arc<Cred> {
         let publication = self.publish();
-        let proposed = publication.proposed();
-        drop(publication);
+        let (proposed, retirement) = publication.complete_post_commit();
+        drop(retirement);
         proposed
     }
 }
