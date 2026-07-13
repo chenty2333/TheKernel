@@ -11,12 +11,11 @@ use axerrno::{AxError, AxResult};
 use linux_raw_sys::general::CAP_SETUID;
 
 use super::{
-    Dumpability, Thread, UserNamespace,
+    Dumpability, Kgid, Kuid, Thread, UserNamespace,
     creds::{
         CAPABILITY_VALID_MASK, CAPABILITY_WORDS, CapabilityState, Cred, CredentialUpdate,
         Credentials, PreparedCred, SECBIT_KEEP_CAPS, SECBIT_NOROOT,
     },
-    idmap::{Kgid, Kuid},
 };
 
 const VFS_CAP_REVISION_MASK: u32 = 0xff00_0000;
@@ -201,7 +200,7 @@ fn derive_exec_credential(
     request: ExecCredentialRequest,
 ) -> AxResult<DerivedExecCredential> {
     let old_ids = old.ids();
-    let old_caps = old.capabilities();
+    let old_caps = CapabilityState::from_committed(old.capabilities());
     let root_kuid = old.user_ns().root_kuid();
 
     // Linux applies set-ID before commoncap's unsafe-exec downgrade. nosuid
@@ -962,7 +961,7 @@ mod tests {
         update.finish().unwrap().commit();
 
         let prepared = prepare_exec_update(slot.prepare(), ordinary_request(), |_| Ok(())).unwrap();
-        let proposed = prepared.prepared.proposed().capabilities().securebits;
+        let proposed = prepared.prepared.proposed().capabilities().securebits();
         assert_eq!(proposed & SECBIT_KEEP_CAPS, 0);
         assert_ne!(proposed & super::super::creds::SECBIT_KEEP_CAPS_LOCKED, 0);
         assert_ne!(proposed & SECBIT_NOROOT, 0);
@@ -972,11 +971,7 @@ mod tests {
     fn namespaced_v3_rootid_must_name_current_or_ancestor_root() {
         let root = UserNamespace::try_new_root().unwrap();
         let child = root
-            .try_fork(
-                Kuid::from_raw(1000).unwrap(),
-                Kgid::from_raw(1000).unwrap(),
-                false,
-            )
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
             .unwrap();
         child
             .publish_uid_map(
@@ -994,7 +989,8 @@ mod tests {
                 true,
             )
             .unwrap();
-        let child_cred = Cred::try_with_user_ns(&root_slot().current(), child).unwrap();
+        let root_cred = Cred::try_root(root).unwrap();
+        let child_cred = Cred::try_with_user_ns(&root_cred, child).unwrap();
 
         let mut request = ordinary_request();
         request.file_capabilities = Some(FileCapabilities::new(

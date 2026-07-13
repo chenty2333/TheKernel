@@ -38,11 +38,12 @@ type UserNamespaceStateMutex<T> = axsync::Mutex<T>;
 type UserNamespaceStateMutex<T> = spin::Mutex<T>;
 
 use super::{
+    IdMap, IdMapInputExtent, Kgid, Kuid, UserGid, UserUid,
     accounting::{AtomicTaskUsage, live_process_usage},
+    cred_error,
     creds::{Cred, CredentialSlot, PreparedCred},
     exec_cred::PreparedExecCredential,
     futex::FutexTable,
-    idmap::{IdMap, IdMapInputExtent, Kgid, Kuid, UserGid, UserUid},
     jobctl::{
         ContinueResult, ExecControlState, JobControlState, PtraceControlState, PtraceSession,
         StopKind, StopReport, StopState, VforkControlState,
@@ -263,7 +264,7 @@ impl UserNamespace {
     const OVERFLOW_ID: u32 = 65_534;
 
     pub(crate) fn try_new_root() -> AxResult<Arc<Self>> {
-        let identity = IdMap::try_identity()?;
+        let identity = IdMap::try_identity().map_err(cred_error)?;
         let global_signal_account = SignalQueueAccount::try_new(SIGNAL_QUEUE_GLOBAL_HARD_LIMIT)
             .map_err(|_| AxError::NoMemory)?;
         let admission = UserNamespaceAdmission::try_new()?;
@@ -302,8 +303,8 @@ impl UserNamespace {
         if self.kernel_uid_to_user(owner).is_none() || self.kernel_gid_to_user(group).is_none() {
             return Err(AxError::OperationNotPermitted);
         }
-        let uid_map = IdMap::try_empty()?;
-        let gid_map = IdMap::try_empty()?;
+        let uid_map = IdMap::try_empty().map_err(cred_error)?;
+        let gid_map = IdMap::try_empty().map_err(cred_error)?;
         let setgroups_allowed = self.map_state.lock().setgroups_allowed;
         let admission = UserNamespaceAdmission::try_new()?;
         Arc::try_new(Self {
@@ -329,10 +330,6 @@ impl UserNamespace {
 
     pub(crate) fn parent(&self) -> Option<Arc<Self>> {
         self.parent.clone()
-    }
-
-    pub(crate) fn level(&self) -> u32 {
-        self.level
     }
 
     pub(crate) fn is_initial(&self) -> bool {
@@ -371,7 +368,7 @@ impl UserNamespace {
     ) -> AxResult<Vec<IdMapInputExtent>> {
         let map = self.uid_map();
         let lower_map = self.map_display_namespace(viewer).uid_map();
-        map.try_extents_for_lower(&lower_map)
+        map.try_extents_for_lower(&lower_map).map_err(cred_error)
     }
 
     pub(crate) fn try_gid_map_rows(
@@ -380,13 +377,13 @@ impl UserNamespace {
     ) -> AxResult<Vec<IdMapInputExtent>> {
         let map = self.gid_map();
         let lower_map = self.map_display_namespace(viewer).gid_map();
-        map.try_extents_for_lower(&lower_map)
+        map.try_extents_for_lower(&lower_map).map_err(cred_error)
     }
 
     pub(crate) fn try_build_uid_map(&self, input: Vec<IdMapInputExtent>) -> AxResult<Arc<IdMap>> {
         let parent = self.parent.as_ref().ok_or(AxError::OperationNotPermitted)?;
         let parent_map = parent.uid_map();
-        IdMap::try_from_parent(input, &parent_map)
+        IdMap::try_from_parent(input, &parent_map).map_err(cred_error)
     }
 
     pub(crate) fn try_build_uid_map_from_slice(
@@ -395,13 +392,13 @@ impl UserNamespace {
     ) -> AxResult<Arc<IdMap>> {
         let parent = self.parent.as_ref().ok_or(AxError::OperationNotPermitted)?;
         let parent_map = parent.uid_map();
-        IdMap::try_from_parent_slice(input, &parent_map)
+        IdMap::try_from_parent_slice(input, &parent_map).map_err(cred_error)
     }
 
     pub(crate) fn try_build_gid_map(&self, input: Vec<IdMapInputExtent>) -> AxResult<Arc<IdMap>> {
         let parent = self.parent.as_ref().ok_or(AxError::OperationNotPermitted)?;
         let parent_map = parent.gid_map();
-        IdMap::try_from_parent(input, &parent_map)
+        IdMap::try_from_parent(input, &parent_map).map_err(cred_error)
     }
 
     pub(crate) fn try_build_gid_map_from_slice(
@@ -410,7 +407,7 @@ impl UserNamespace {
     ) -> AxResult<Arc<IdMap>> {
         let parent = self.parent.as_ref().ok_or(AxError::OperationNotPermitted)?;
         let parent_map = parent.gid_map();
-        IdMap::try_from_parent_slice(input, &parent_map)
+        IdMap::try_from_parent_slice(input, &parent_map).map_err(cred_error)
     }
 
     /// Publishes a fully built UID map exactly once. Construction and parent
@@ -570,6 +567,28 @@ impl UserNamespace {
 
     pub(crate) fn proc_inode(&self) -> u64 {
         PROC_NS_INO_BASE + self.id.saturating_mul(8)
+    }
+}
+
+impl thekernel_linux_cred::UserNamespaceView for UserNamespace {
+    fn parent(self: &Arc<Self>) -> Option<Arc<Self>> {
+        self.parent.clone()
+    }
+
+    fn level(&self) -> u32 {
+        self.level
+    }
+
+    fn owner_kuid(&self) -> Kuid {
+        self.owner
+    }
+
+    fn root_kuid(&self) -> Option<Kuid> {
+        UserNamespace::root_kuid(self)
+    }
+
+    fn is_initial(&self) -> bool {
+        self.parent.is_none()
     }
 }
 
@@ -3171,8 +3190,7 @@ mod tests {
         snapshot_group_credential_image, try_increment_bounded,
     };
     use crate::task::{
-        CapabilityState, Cred, CredentialSlot,
-        idmap::{IdMapInputExtent, Kgid, Kuid},
+        CapabilityState, Cred, CredentialSlot, IdMapInputExtent, Kgid, Kuid,
         jobctl::{JobControlState, PtraceControlState, PtraceSession, StopKind, StopState},
     };
 

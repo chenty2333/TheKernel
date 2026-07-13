@@ -353,7 +353,7 @@ impl CloneArgs {
                 ids.egid,
                 parent_cred.has_effective_capability_in_own_user_ns(CAP_SETFCAP),
             )?;
-            Cred::try_with_user_ns(&parent_cred, user_ns)?
+            Cred::try_with_user_ns(&parent_cred, user_ns).map_err(crate::task::cred_error)?
         } else {
             parent_cred
         };
@@ -908,11 +908,7 @@ mod tests {
         let root = UserNamespace::try_new_root().unwrap();
         let parent_cred = Cred::try_root(root.clone()).unwrap();
         let child = root
-            .try_fork(
-                Kuid::from_raw(1000).unwrap(),
-                Kgid::from_raw(1000).unwrap(),
-                false,
-            )
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
             .unwrap();
         let child_cred = Cred::try_with_user_ns(&parent_cred, child.clone()).unwrap();
         let flags = CloneFlags::NEWUSER

@@ -11,9 +11,7 @@ use axerrno::{AxError, AxResult};
 use linux_raw_sys::general::{CAP_SYS_NICE, CAP_SYS_PTRACE};
 
 use super::{
-    Cred, ExecCredentialSecurityContext, UserNamespace,
-    creds::{CAPABILITY_VALID_MASK, CAPABILITY_WORDS},
-    ns_capable,
+    Cred, ExecCredentialSecurityContext, UserNamespace, creds::CAPABILITY_WORDS, ns_capable,
 };
 
 const SECURITY_HOOK_LIMIT: usize = 8;
@@ -311,15 +309,15 @@ fn selected_actor_capabilities(
 ) -> [u32; CAPABILITY_WORDS] {
     let capabilities = actor.capabilities();
     match credential_kind {
-        PtraceCredentialKind::Real => capabilities.permitted,
-        PtraceCredentialKind::Fs => capabilities.effective,
+        PtraceCredentialKind::Real => capabilities.permitted(),
+        PtraceCredentialKind::Fs => capabilities.effective(),
     }
 }
 
 /// Linux commoncap ptrace rule over frozen actor and target credentials.
 fn commoncap_allows(actor: &Cred, target: &Cred, credential_kind: PtraceCredentialKind) -> bool {
     let selected_actor = selected_actor_capabilities(actor, credential_kind);
-    let target_permitted = target.capabilities().permitted;
+    let target_permitted = target.capabilities().permitted();
     (Arc::ptr_eq(actor.user_ns(), target.user_ns())
         && target_permitted
             .iter()
@@ -354,27 +352,11 @@ fn commoncap_ptrace_traceme(context: &PtraceTracemeContext<'_>) -> AxResult<()> 
     }
 }
 
-fn capability_sets_valid(credential: &Cred) -> bool {
-    let capabilities = credential.capabilities();
-    (0..CAPABILITY_WORDS).all(|word| {
-        let all = capabilities.effective[word]
-            | capabilities.permitted[word]
-            | capabilities.inheritable[word]
-            | capabilities.bounding[word]
-            | capabilities.ambient[word];
-        all & !CAPABILITY_VALID_MASK[word] == 0
-            && capabilities.effective[word] & !capabilities.permitted[word] == 0
-            && capabilities.ambient[word]
-                & !(capabilities.permitted[word] & capabilities.inheritable[word])
-                == 0
-    })
-}
-
 fn permitted_is_subset(left: &Cred, right: &Cred) -> bool {
-    left.capabilities()
-        .permitted
-        .iter()
-        .zip(right.capabilities().permitted.iter())
+    let left = left.capabilities().permitted();
+    let right = right.capabilities().permitted();
+    left.iter()
+        .zip(right.iter())
         .all(|(left, right)| left & !right == 0)
 }
 
@@ -383,8 +365,7 @@ fn permitted_is_subset(left: &Cred, right: &Cred) -> bool {
 /// production registry prevents an allow-by-default closure at the exec call
 /// site from becoming the effective policy.
 fn commoncap_exec_credential(context: &ExecCredentialSecurityContext<'_>) -> AxResult<()> {
-    if !capability_sets_valid(context.proposed)
-        || !Arc::ptr_eq(context.old.user_ns(), context.proposed.user_ns())
+    if !Arc::ptr_eq(context.old.user_ns(), context.proposed.user_ns())
         || context.old.no_new_privs() != context.proposed.no_new_privs()
     {
         return Err(AxError::OperationNotPermitted);
@@ -816,7 +797,8 @@ mod tests {
                 false,
             )
             .unwrap();
-        let target = Cred::try_with_user_ns(&root, child_namespace.clone()).unwrap();
+        let target_parent = credential_with_identity_and_caps(&root, 1000, &[], &[]);
+        let target = Cred::try_with_user_ns(&target_parent, child_namespace.clone()).unwrap();
         let actor = credential_with_caps(&root, &[CAP_SYS_PTRACE], &[CAP_SYS_PTRACE]);
         let unprivileged_actor = credential_with_caps(&root, &[CAP_SYS_PTRACE], &[]);
         let image = Arc::new(());
@@ -846,11 +828,7 @@ mod tests {
         let root_namespace = UserNamespace::try_new_root().unwrap();
         let root = Cred::try_root(root_namespace.clone()).unwrap();
         let child_namespace = root_namespace
-            .try_fork(
-                Kuid::from_raw(1000).unwrap(),
-                Kgid::from_raw(1000).unwrap(),
-                false,
-            )
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
             .unwrap();
         let target = Cred::try_with_user_ns(&root, child_namespace).unwrap();
         let first_image = Arc::new(());
@@ -874,7 +852,8 @@ mod tests {
                 false,
             )
             .unwrap();
-        let child_root = Cred::try_with_user_ns(&root, child_namespace).unwrap();
+        let child_parent = credential_with_identity_and_caps(&root, 1000, &[], &[]);
+        let child_root = Cred::try_with_user_ns(&child_parent, child_namespace).unwrap();
         let actor =
             credential_with_identity_and_caps(&child_root, 1000, &[CAP_SYS_NICE], &[CAP_SYS_NICE]);
 
@@ -894,11 +873,7 @@ mod tests {
         let root_namespace = UserNamespace::try_new_root().unwrap();
         let actor = Cred::try_root(root_namespace.clone()).unwrap();
         let child_namespace = root_namespace
-            .try_fork(
-                Kuid::from_raw(1000).unwrap(),
-                Kgid::from_raw(1000).unwrap(),
-                false,
-            )
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
             .unwrap();
         let child_root = Cred::try_with_user_ns(&actor, child_namespace).unwrap();
         let target = credential_with_identity_and_caps(&child_root, 1000, &[], &[]);

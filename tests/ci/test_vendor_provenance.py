@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import tarfile
 import tempfile
@@ -146,6 +147,33 @@ class VendorProvenanceTests(unittest.TestCase):
             'foo = { path = "vendor/foo" }\n'
             'thekernel-linux-vfs = { path = '
             '"../thekernel-linux-abi/crates/vfs" }\n',
+            encoding="utf-8",
+        )
+        return temporary, fixture
+
+    def make_linux_cred_fixture(
+        self,
+    ) -> tuple[tempfile.TemporaryDirectory[str], Fixture]:
+        temporary = tempfile.TemporaryDirectory()
+        fixture = Fixture(Path(temporary.name) / "consumer")
+        sibling = (
+            Path(temporary.name)
+            / "thekernel-linux-abi/crates/cred/Cargo.toml"
+        )
+        sibling.parent.mkdir(parents=True)
+        sibling.write_text(
+            '[package]\nname = "thekernel-linux-cred"\nversion = "0.1.0"\n',
+            encoding="utf-8",
+        )
+        (fixture.root / "Cargo.toml").write_text(
+            '[workspace]\n'
+            '[workspace.dependencies]\n'
+            'thekernel-linux-cred = { version = "=0.1.0", '
+            'default-features = false }\n'
+            '[patch.crates-io]\n'
+            'foo = { path = "vendor/foo" }\n'
+            'thekernel-linux-cred = { path = '
+            '"../thekernel-linux-abi/crates/cred" }\n',
             encoding="utf-8",
         )
         return temporary, fixture
@@ -323,6 +351,122 @@ class VendorProvenanceTests(unittest.TestCase):
             result.errors,
         )
 
+    def test_linux_cred_direct_dependency_and_patch_are_classified(self) -> None:
+        temporary, fixture = self.make_linux_cred_fixture()
+        self.addCleanup(temporary.cleanup)
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.maintained_checks, 1)
+
+    def test_linux_cred_maintained_patch_rejects_wrong_path(self) -> None:
+        temporary, fixture = self.make_linux_cred_fixture()
+        self.addCleanup(temporary.cleanup)
+        manifest = (fixture.root / "Cargo.toml").read_text(encoding="utf-8")
+        (fixture.root / "Cargo.toml").write_text(
+            manifest.replace(
+                "../thekernel-linux-abi/crates/cred",
+                "../thekernel-linux-abi/crates/not-cred",
+            ),
+            encoding="utf-8",
+        )
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertTrue(
+            any(
+                "maintained sibling patch thekernel-linux-cred" in error
+                for error in result.errors
+            ),
+            result.errors,
+        )
+
+    def test_linux_cred_workspace_dependency_requires_exact_version(self) -> None:
+        temporary, fixture = self.make_linux_cred_fixture()
+        self.addCleanup(temporary.cleanup)
+        manifest = (fixture.root / "Cargo.toml").read_text(encoding="utf-8")
+        (fixture.root / "Cargo.toml").write_text(
+            manifest.replace('version = "=0.1.0"', 'version = "0.1.0"'),
+            encoding="utf-8",
+        )
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertTrue(
+            any(
+                "workspace dependency thekernel-linux-cred version" in error
+                for error in result.errors
+            ),
+            result.errors,
+        )
+
+    def test_linux_cred_patch_requires_direct_workspace_dependency(self) -> None:
+        temporary, fixture = self.make_linux_cred_fixture()
+        self.addCleanup(temporary.cleanup)
+        manifest = (fixture.root / "Cargo.toml").read_text(encoding="utf-8")
+        (fixture.root / "Cargo.toml").write_text(
+            manifest.replace(
+                'thekernel-linux-cred = { version = "=0.1.0", '
+                'default-features = false }\n',
+                "",
+            ),
+            encoding="utf-8",
+        )
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertTrue(
+            any(
+                "maintained sibling patch thekernel-linux-cred requires "
+                "workspace dependency thekernel-linux-cred" in error
+                for error in result.errors
+            ),
+            result.errors,
+        )
+
+    def test_linux_cred_repo_override_preserves_canonical_patch_contract(self) -> None:
+        temporary, fixture = self.make_linux_cred_fixture()
+        self.addCleanup(temporary.cleanup)
+        canonical_sibling = Path(temporary.name) / "thekernel-linux-abi"
+        override = Path(temporary.name) / "linux-abi-integration"
+        override_manifest = override / "crates/cred/Cargo.toml"
+        override_manifest.parent.mkdir(parents=True)
+        override_manifest.write_text(
+            '[package]\nname = "thekernel-linux-cred"\nversion = "0.1.0"\n',
+            encoding="utf-8",
+        )
+        for path in sorted(canonical_sibling.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                path.rmdir()
+        canonical_sibling.rmdir()
+
+        result = validator.validate_repository(
+            fixture.root,
+            archive_policy="skip",
+            linux_abi_repo=override,
+        )
+        self.assertEqual(result.errors, ())
+
+        manifest = (fixture.root / "Cargo.toml").read_text(encoding="utf-8")
+        (fixture.root / "Cargo.toml").write_text(
+            manifest.replace(
+                "../thekernel-linux-abi/crates/cred",
+                "../linux-abi-integration/crates/cred",
+            ),
+            encoding="utf-8",
+        )
+        noncanonical = validator.validate_repository(
+            fixture.root,
+            archive_policy="skip",
+            linux_abi_repo=override,
+        )
+        self.assertTrue(
+            any(
+                "maintained sibling patch thekernel-linux-cred" in error
+                for error in noncanonical.errors
+            ),
+            noncanonical.errors,
+        )
+
     def test_non_vendor_patch_rejects_a_fabricated_provenance_record(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -401,7 +545,14 @@ class VendorProvenanceTests(unittest.TestCase):
         )
 
     def test_repository_inventory_passes_without_archive_cache(self) -> None:
-        result = validator.validate_repository(REPO_ROOT, archive_policy="skip")
+        ax_repo = os.environ.get("THEKERNEL_AX_REPO")
+        linux_abi_repo = os.environ.get("THEKERNEL_LINUX_ABI_REPO")
+        result = validator.validate_repository(
+            REPO_ROOT,
+            archive_policy="skip",
+            ax_repo=(Path(ax_repo) if ax_repo else None),
+            linux_abi_repo=(Path(linux_abi_repo) if linux_abi_repo else None),
+        )
         self.assertEqual(result.errors, ())
         self.assertEqual(result.package_checks, 26)
 

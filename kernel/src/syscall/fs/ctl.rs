@@ -1314,10 +1314,11 @@ pub fn sys_vhangup() -> AxResult<isize> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
+    use alloc::{vec, vec::Vec};
     use core::time::Duration;
 
     use axfs_ng_vfs::Mountpoint;
+    use thekernel_linux_cred::{FsCredentialSnapshot, GroupInfo, Kgid, Kuid};
 
     use super::*;
 
@@ -1327,7 +1328,20 @@ mod tests {
             let word = capability as usize / u32::BITS as usize;
             effective[word] |= 1 << (capability % u32::BITS);
         }
-        DacCredentialView::try_for_test(uid, gid, groups, effective).unwrap()
+        let mut supplementary_groups = Vec::new();
+        supplementary_groups
+            .try_reserve_exact(groups.len())
+            .unwrap();
+        for &group in groups {
+            supplementary_groups.push(Kgid::from_raw(group).unwrap());
+        }
+        FsCredentialSnapshot::new(
+            Kuid::from_raw(uid).unwrap(),
+            Kgid::from_raw(gid).unwrap(),
+            GroupInfo::try_new(supplementary_groups).unwrap(),
+            effective,
+            true,
+        )
     }
 
     fn metadata(uid: u32, gid: u32, mode: u16) -> Metadata {

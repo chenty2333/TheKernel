@@ -992,7 +992,7 @@ impl ProcUserNamespaceFile {
                     return Err(VfsError::OperationNotPermitted);
                 }
                 let rows = parse_id_map_rows(data)?;
-                validate_id_map_input(&rows)?;
+                validate_id_map_input(&rows).map_err(crate::task::cred_error)?;
                 let actor = current().as_thread().current_cred();
                 if !may_write_uid_map(&actor, &opener, &self.namespace, &rows) {
                     return Err(VfsError::OperationNotPermitted);
@@ -1005,7 +1005,7 @@ impl ProcUserNamespaceFile {
                     return Err(VfsError::OperationNotPermitted);
                 }
                 let rows = parse_id_map_rows(data)?;
-                validate_id_map_input(&rows)?;
+                validate_id_map_input(&rows).map_err(crate::task::cred_error)?;
                 let actor = current().as_thread().current_cred();
                 if !may_write_gid_map(&actor, &opener, &self.namespace, &rows) {
                     return Err(VfsError::OperationNotPermitted);
@@ -1397,11 +1397,11 @@ fn task_status(
         locked_kb,
         threads,
         cred.no_new_privs() as u8,
-        format_cap_set(caps.inheritable),
-        format_cap_set(caps.permitted),
-        format_cap_set(caps.effective),
-        format_cap_set(caps.bounding),
-        format_cap_set(caps.ambient),
+        format_cap_set(caps.inheritable()),
+        format_cap_set(caps.permitted()),
+        format_cap_set(caps.effective()),
+        format_cap_set(caps.bounding()),
+        format_cap_set(caps.ambient()),
         cpu_mask,
         cpu_allowed_list,
         mem_mask,

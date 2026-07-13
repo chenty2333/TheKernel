@@ -17,25 +17,27 @@ use crate::task::{DacCredentialView, Kgid};
 
 static INITIAL_USER_NAMESPACE_DAC_DOMAIN: () = ();
 
-impl DacCredentials for DacCredentialView {
+struct KernelDacCredentials<'a>(&'a DacCredentialView);
+
+impl DacCredentials for KernelDacCredentials<'_> {
     type UserId = u32;
     type GroupId = u32;
     type UserNamespace = ();
 
     fn fs_user_id(&self) -> Self::UserId {
-        self.uid().into_raw()
+        self.0.uid().into_raw()
     }
 
     fn fs_group_id(&self) -> Self::GroupId {
-        self.gid().into_raw()
+        self.0.gid().into_raw()
     }
 
     fn is_in_group(&self, group: Self::GroupId) -> bool {
-        Kgid::from_raw(group).is_some_and(|group| self.supplementary_groups().contains(&group))
+        Kgid::from_raw(group).is_some_and(|group| self.0.supplementary_groups().contains(&group))
     }
 
     fn has_capability(&self, _owner: &Self::UserNamespace, capability: DacCapability) -> bool {
-        self.has_capability(match capability {
+        self.0.has_capability(match capability {
             DacCapability::Override => CAP_DAC_OVERRIDE,
             DacCapability::ReadSearch => CAP_DAC_READ_SEARCH,
             DacCapability::Fowner => CAP_FOWNER,
@@ -115,7 +117,7 @@ fn dac_access_allowed(
     check_linux_dac(
         &linux_node_metadata(perm, owner_uid, owner_gid, node_type),
         linux_access(requested),
-        credentials,
+        &KernelDacCredentials(credentials),
     )
     .is_ok()
 }
@@ -300,7 +302,7 @@ pub(crate) fn initial_named_create_owner_mode(
         linux_node_kind(node_type),
         requested_mode.bits(),
         umask as u16,
-        credentials,
+        &KernelDacCredentials(credentials),
     );
     (
         NodePermission::from_bits_truncate(attributes.mode),
@@ -345,7 +347,7 @@ fn check_sticky_delete_permissions(
             target_stat.gid,
             target_stat.node_type,
         ),
-        credentials,
+        &KernelDacCredentials(credentials),
     )
     .map_err(map_dac_error)
 }
@@ -413,6 +415,10 @@ pub(crate) fn check_execute_permissions(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
+    use thekernel_linux_cred::{FsCredentialSnapshot, GroupInfo, Kgid, Kuid};
+
     use super::*;
 
     fn credentials(uid: u32, gid: u32, groups: &[u32], capabilities: &[u32]) -> DacCredentialView {
@@ -421,7 +427,20 @@ mod tests {
             let word = capability as usize / u32::BITS as usize;
             effective[word] |= 1 << (capability % u32::BITS);
         }
-        DacCredentialView::try_for_test(uid, gid, groups, effective).unwrap()
+        let mut supplementary_groups = Vec::new();
+        supplementary_groups
+            .try_reserve_exact(groups.len())
+            .unwrap();
+        for &group in groups {
+            supplementary_groups.push(Kgid::from_raw(group).unwrap());
+        }
+        FsCredentialSnapshot::new(
+            Kuid::from_raw(uid).unwrap(),
+            Kgid::from_raw(gid).unwrap(),
+            GroupInfo::try_new(supplementary_groups).unwrap(),
+            effective,
+            true,
+        )
     }
 
     fn directory_metadata(mode: u16, uid: u32, gid: u32) -> Metadata {

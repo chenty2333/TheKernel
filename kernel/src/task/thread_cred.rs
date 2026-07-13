@@ -7,13 +7,12 @@ use linux_raw_sys::general::{
 };
 
 use super::{
-    Thread,
+    Kgid, Kuid, Thread,
     creds::{
         CAPABILITY_WORDS, CapabilityState, Cred, CredentialSlot, Credentials, DacCredentialView,
         GroupInfo, PreparedCred, SECBIT_KEEP_CAPS, SECBIT_KEEP_CAPS_LOCKED,
         SECBIT_NO_CAP_AMBIENT_RAISE, SECBIT_NO_SETUID_FIXUP, SECURE_ALL_BITS, SECURE_ALL_LOCKS,
     },
-    idmap::{Kgid, Kuid},
 };
 
 fn access_dac_credentials_for(cred: &Cred, effective: bool) -> DacCredentialView {
@@ -21,12 +20,16 @@ fn access_dac_credentials_for(cred: &Cred, effective: bool) -> DacCredentialView
     let capabilities = cred.capabilities();
     let root_kuid = cred.user_ns().root_kuid();
     let (uid, gid, capability_set) = if effective {
-        (credentials.fsuid, credentials.fsgid, capabilities.effective)
+        (
+            credentials.fsuid,
+            credentials.fsgid,
+            capabilities.effective(),
+        )
     } else {
-        let capability_set = if capabilities.securebits & SECBIT_NO_SETUID_FIXUP != 0 {
-            capabilities.effective
+        let capability_set = if capabilities.securebits() & SECBIT_NO_SETUID_FIXUP != 0 {
+            capabilities.effective()
         } else if root_kuid == Some(credentials.ruid) {
-            capabilities.permitted
+            capabilities.permitted()
         } else {
             [0; CAPABILITY_WORDS]
         };
@@ -123,7 +126,7 @@ impl Thread {
     pub(crate) fn set_supplementary_groups(&self, groups: Vec<Kgid>) -> AxResult<()> {
         // Sort, deduplicate, validate the bound, and allocate the shared group
         // owner before entering the credential writer transaction.
-        let groups = GroupInfo::try_new(groups)?;
+        let groups = GroupInfo::try_new(groups).map_err(super::cred_error)?;
         let mut update = self.credential.prepare();
         if !update.old().user_ns().may_setgroups()
             || !update
@@ -237,7 +240,7 @@ impl Thread {
     }
 
     pub fn securebits(&self) -> u32 {
-        self.current_cred().capabilities().securebits
+        self.current_cred().capabilities().securebits()
     }
 
     pub fn set_securebits(&self, securebits: u32) -> AxResult<()> {
@@ -265,7 +268,7 @@ impl Thread {
     }
 
     pub fn keep_caps(&self) -> bool {
-        self.current_cred().capabilities().securebits & SECBIT_KEEP_CAPS != 0
+        self.current_cred().capabilities().securebits() & SECBIT_KEEP_CAPS != 0
     }
 
     pub fn set_keep_caps(&self, enabled: bool) -> AxResult<()> {
@@ -615,7 +618,9 @@ mod tests {
     fn mapped_child_credential() -> (Arc<UserNamespace>, Arc<Cred>) {
         let initial = UserNamespace::try_new_root().unwrap();
         let initial_cred = Cred::try_root(initial.clone()).unwrap();
-        let child = initial.try_fork(kuid(1000), kgid(100), false).unwrap();
+        let child = initial
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
+            .unwrap();
         child
             .publish_uid_map(
                 child

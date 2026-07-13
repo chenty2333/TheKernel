@@ -543,16 +543,23 @@ pub(crate) fn rename(
 
 #[cfg(test)]
 mod tests {
-    use alloc::sync::Arc;
+    use alloc::{sync::Arc, vec::Vec};
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use axfs_ng_vfs::Mountpoint;
+    use thekernel_linux_cred::{FsCredentialSnapshot, GroupInfo, Kgid, Kuid};
 
     use super::*;
     use crate::pseudofs::tmp::MemoryFs;
 
     fn credentials() -> DacCredentialView {
-        DacCredentialView::try_for_test(0, 0, &[], [0; 2]).unwrap()
+        FsCredentialSnapshot::new(
+            Kuid::INITIAL_ROOT,
+            Kgid::INITIAL_ROOT,
+            GroupInfo::try_new(Vec::new()).unwrap(),
+            [0; 2],
+            true,
+        )
     }
 
     fn memory_root() -> Location {

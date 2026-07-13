@@ -536,7 +536,9 @@ mod credential_caller_tests {
     fn credential_caller_ns_capable_follows_ancestor_direction() {
         let root_ns = UserNamespace::try_new_root().unwrap();
         let root_cred = Cred::try_root(root_ns.clone()).unwrap();
-        let child_ns = root_ns.try_fork(kuid(1000), kgid(1000), false).unwrap();
+        let child_ns = root_ns
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
+            .unwrap();
         let child_cred = Cred::try_with_user_ns(&root_cred, child_ns.clone()).unwrap();
 
         let child_over_root = IpcAccessContext::new(child_cred, root_ns.clone());

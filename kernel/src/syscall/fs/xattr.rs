@@ -656,11 +656,7 @@ mod tests {
         ));
 
         let child_namespace = root_namespace
-            .try_fork(
-                Kuid::from_raw(1000).unwrap(),
-                Kgid::from_raw(1000).unwrap(),
-                true,
-            )
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, true)
             .unwrap();
         let child = Cred::try_with_user_ns(&root, child_namespace).unwrap();
         assert!(!credential_can_set_file_capabilities(

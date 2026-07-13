@@ -8,9 +8,8 @@ use linux_raw_sys::general::{
 use starry_signal::Signo;
 
 use super::{
-    AsThread, Cred, Credentials, Dumpability, ProcessData, ProcessImageAccessSnapshot, Thread,
-    UserNamespace,
-    idmap::{IdMapInputExtent, Kgid, Kuid, UserGid, UserUid},
+    AsThread, Cred, Credentials, Dumpability, IdMapInputExtent, Kgid, Kuid, ProcessData,
+    ProcessImageAccessSnapshot, Thread, UserGid, UserNamespace, UserUid,
     security::{
         ProcessImageSecurityRef, PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind,
         SecuritySubject, dispatch_ptrace_access,
@@ -45,35 +44,14 @@ impl PtraceAccessMode {
     }
 }
 
-/// Linux `ns_capable()` topology over one immutable actor snapshot.
-///
-/// Effective capabilities apply in the actor's own user namespace and all of
-/// its descendants. In addition, the kernel-global owner of a direct child
-/// namespace has every capability in that child and its descendants even if
-/// the corresponding bit is absent from the actor's effective set.
+/// Compatibility adapter for the Linux-credential crate's namespace-relative
+/// capability rule.
 pub(crate) fn ns_capable(
     actor: &Cred,
     target_user_ns: &Arc<UserNamespace>,
     capability: u32,
 ) -> bool {
-    let actor_user_ns = actor.user_ns();
-    let actor_euid = actor.ids().euid;
-    let mut namespace = target_user_ns.clone();
-    loop {
-        if Arc::ptr_eq(&namespace, actor_user_ns) {
-            return actor.has_effective_capability_in_own_user_ns(capability);
-        }
-        if namespace.level() <= actor_user_ns.level() {
-            return false;
-        }
-        let Some(parent) = namespace.parent() else {
-            return false;
-        };
-        if Arc::ptr_eq(&parent, actor_user_ns) && namespace.owner_kuid() == actor_euid {
-            return true;
-        }
-        namespace = parent;
-    }
+    thekernel_linux_cred::ns_capable(actor, target_user_ns, capability)
 }
 
 fn idmap_writer_parent(opener: &Cred, target: &Arc<UserNamespace>) -> Option<Arc<UserNamespace>> {
@@ -472,8 +450,12 @@ mod tests {
             PtraceAccessMode::AttachReal,
         ));
 
-        let child_a = root_ns.try_fork(kuid(1000), kgid(1000), false).unwrap();
-        let child_b = root_ns.try_fork(kuid(1001), kgid(1001), false).unwrap();
+        let child_a = root_ns
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
+            .unwrap();
+        let child_b = root_ns
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
+            .unwrap();
         let sibling_actor = Cred::try_with_user_ns(&root_cred, child_a).unwrap();
         let sibling_target = Cred::try_with_user_ns(&root_cred, child_b.clone()).unwrap();
         assert!(!ptrace_core_allows(
@@ -566,9 +548,13 @@ mod tests {
             .unwrap();
         let grandchild = child.try_fork(kuid(1000), kgid(100), false).unwrap();
         let root_cred = Cred::try_root(root.clone()).unwrap();
-        let child_cred = Cred::try_with_user_ns(&root_cred, child.clone()).unwrap();
-        let sibling_cred = Cred::try_with_user_ns(&root_cred, sibling.clone()).unwrap();
-        let grandchild_cred = Cred::try_with_user_ns(&root_cred, grandchild.clone()).unwrap();
+        let owner_slot = CredentialSlot::new(root_cred.clone());
+        let owner = publish_ids(&owner_slot, 1000, 100);
+        let sibling_owner_slot = CredentialSlot::new(root_cred.clone());
+        let sibling_owner = publish_ids(&sibling_owner_slot, 2000, 200);
+        let child_cred = Cred::try_with_user_ns(&owner, child.clone()).unwrap();
+        let sibling_cred = Cred::try_with_user_ns(&sibling_owner, sibling.clone()).unwrap();
+        let grandchild_cred = Cred::try_with_user_ns(&child_cred, grandchild.clone()).unwrap();
 
         assert!(ns_capable(&root_cred, &root, CAP_KILL));
         assert!(ns_capable(&root_cred, &child, CAP_KILL));
@@ -587,8 +573,6 @@ mod tests {
         assert!(!ns_capable(&grandchild_cred, &child, CAP_KILL));
         assert!(!ns_capable(&grandchild_cred, &sibling, CAP_KILL));
 
-        let owner_slot = CredentialSlot::new(root_cred);
-        let owner = publish_ids(&owner_slot, 1000, 100);
         assert!(ns_capable(&owner, &child, CAP_KILL));
         assert!(ns_capable(&owner, &grandchild, CAP_KILL));
         assert!(!ns_capable(&owner, &sibling, CAP_KILL));
@@ -624,10 +608,14 @@ mod tests {
         let root_target = publish_ids(&root_target_slot, 3000, 300);
         let child = root.try_fork(kuid(1000), kgid(100), false).unwrap();
         let sibling = root.try_fork(kuid(2000), kgid(200), false).unwrap();
-        let child_actor = Cred::try_with_user_ns(&root_cred, child.clone()).unwrap();
+        let child_parent_slot = CredentialSlot::new(root_cred.clone());
+        let child_parent = publish_ids(&child_parent_slot, 1000, 100);
+        let child_actor = Cred::try_with_user_ns(&child_parent, child.clone()).unwrap();
         let child_target_slot = CredentialSlot::new(child_actor.clone());
         let child_target = publish_ids(&child_target_slot, 3000, 300);
-        let sibling_cred = Cred::try_with_user_ns(&root_cred, sibling).unwrap();
+        let sibling_parent_slot = CredentialSlot::new(root_cred.clone());
+        let sibling_parent = publish_ids(&sibling_parent_slot, 2000, 200);
+        let sibling_cred = Cred::try_with_user_ns(&sibling_parent, sibling).unwrap();
         let sibling_target_slot = CredentialSlot::new(sibling_cred);
         let sibling_target = publish_ids(&sibling_target_slot, 3000, 300);
 
@@ -643,8 +631,12 @@ mod tests {
         let root_cred = Cred::try_root(root.clone()).unwrap();
         let child = root.try_fork(kuid(1000), kgid(100), false).unwrap();
         let sibling = root.try_fork(kuid(2000), kgid(200), false).unwrap();
-        let child_cred = Cred::try_with_user_ns(&root_cred, child.clone()).unwrap();
-        let sibling_cred = Cred::try_with_user_ns(&root_cred, sibling).unwrap();
+        let child_parent_slot = CredentialSlot::new(root_cred.clone());
+        let child_parent = publish_ids(&child_parent_slot, 1000, 100);
+        let sibling_parent_slot = CredentialSlot::new(root_cred.clone());
+        let sibling_parent = publish_ids(&sibling_parent_slot, 2000, 200);
+        let child_cred = Cred::try_with_user_ns(&child_parent, child.clone()).unwrap();
+        let sibling_cred = Cred::try_with_user_ns(&sibling_parent, sibling).unwrap();
         let root_uts = UtsNamespace::try_new_root(root).unwrap();
         let child_uts = UtsNamespace::try_new_root(child).unwrap();
 

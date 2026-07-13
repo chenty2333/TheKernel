@@ -3205,6 +3205,7 @@ dependencies = [
  "strum 0.28.0",
  "syscalls",
  "thekernel-axtask",
+ "thekernel-linux-cred",
  "thekernel-linux-fd",
  "thekernel-linux-process-adapter",
  "thekernel-linux-vfs",
@@ -3214,6 +3215,13 @@ dependencies = [
  "x86",
  "xmas-elf",
  "zerocopy 0.8.41",
+]
+
+[[package]]
+name = "thekernel-linux-cred"
+version = "0.1.0"
+dependencies = [
+ "linux-raw-sys",
 ]
 
 [[package]]

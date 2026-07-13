@@ -16,6 +16,7 @@ use linux_raw_sys::{
 };
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
+use thekernel_linux_cred::CapabilitySets;
 
 use crate::{
     file::{FD_TABLE, File, FileDescription, FileLike, replace_process_fd_table},
@@ -638,13 +639,16 @@ fn validate_cap_header(
 fn write_cap_data(
     data: *mut __user_cap_data_struct,
     version: u32,
-    state: CapabilityState,
+    state: CapabilitySets,
 ) -> AxResult<()> {
+    let effective = state.effective();
+    let permitted = state.permitted();
+    let inheritable = state.inheritable();
     for index in 0..cap_data_words(version) {
         data.wrapping_add(index).vm_write(__user_cap_data_struct {
-            effective: state.effective[index],
-            permitted: state.permitted[index],
-            inheritable: state.inheritable[index],
+            effective: effective[index],
+            permitted: permitted[index],
+            inheritable: inheritable[index],
         })?;
     }
     Ok(())
@@ -1194,11 +1198,7 @@ mod tests {
         let root = UserNamespace::try_new_root().unwrap();
         let root_cred = Cred::try_root(root.clone()).unwrap();
         let child = root
-            .try_fork(
-                Kuid::from_raw(1000).unwrap(),
-                Kgid::from_raw(1000).unwrap(),
-                false,
-            )
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
             .unwrap();
         let actor = Cred::try_with_user_ns(&root_cred, child.clone()).unwrap();
 

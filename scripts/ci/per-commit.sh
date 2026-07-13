@@ -95,8 +95,12 @@ ci_run_step diff-check 60 bash -c '
 
 ci_run_step rustfmt 180 cargo fmt --all -- --check
 ci_run_step vendor-provenance 60 python3 \
-    "$SCRIPT_DIR/validate_vendor_provenance.py" --archive-policy if-present
-ci_run_step ci-script-tests 90 "$REPO_ROOT/tests/ci/test-ci-scripts.sh"
+    "$SCRIPT_DIR/validate_vendor_provenance.py" --archive-policy if-present \
+    --ax-repo "$AX_REPO" --linux-abi-repo "$LINUX_ABI_REPO"
+ci_run_step ci-script-tests 90 \
+    env THEKERNEL_AX_REPO="$AX_REPO" \
+    THEKERNEL_LINUX_ABI_REPO="$LINUX_ABI_REPO" \
+    "$REPO_ROOT/tests/ci/test-ci-scripts.sh"
 ci_run_step tool-tests "$STEP_TIMEOUT_SECS" make test-tools
 
 ci_run_step kernel-host-check "$STEP_TIMEOUT_SECS" \
@@ -297,6 +301,14 @@ ci_run_step axtask-core-tests "$STEP_TIMEOUT_SECS" \
     cargo test --locked --manifest-path "$AX_REPO/Cargo.toml" \
     -p thekernel-axtask --no-default-features \
     --features multitask,sched-cfs,test
+ci_run_step credential-core-tests "$STEP_TIMEOUT_SECS" \
+    env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
+    cargo test --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
+    -p thekernel-linux-cred
+ci_run_step credential-core-check "$STEP_TIMEOUT_SECS" \
+    env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
+    cargo check --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
+    -p thekernel-linux-cred --no-default-features
 ci_run_step process-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \

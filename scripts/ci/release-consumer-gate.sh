@@ -22,6 +22,7 @@ LINUX_ABI_REPOSITORY=https://github.com/chenty2333/thekernel-linux-abi
 AX_PACKAGES=(thekernel-axsched thekernel-axpoll thekernel-axtask)
 LINUX_ABI_PACKAGES=(
     thekernel-linux-usercopy
+    thekernel-linux-cred
     thekernel-linux-process
     thekernel-linux-signal
     thekernel-linux-vfs
@@ -31,6 +32,7 @@ CONSUMED_PACKAGES=(
     thekernel-axsched
     thekernel-axpoll
     thekernel-axtask
+    thekernel-linux-cred
     thekernel-linux-process
     thekernel-linux-vfs
     thekernel-linux-fd
@@ -248,6 +250,7 @@ printf '[release-consumer] package thekernel-linux-abi at %.12s\n' \
         cargo "+$PACKAGE_TOOLCHAIN" -Z package-workspace package \
             --locked --no-verify \
             -p thekernel-linux-usercopy \
+            -p thekernel-linux-cred \
             -p thekernel-linux-process \
             -p thekernel-linux-signal \
             -p thekernel-linux-vfs \
@@ -344,6 +347,7 @@ python3 "$SCRIPT_DIR/rewrite-release-consumer.py" \
     --replace "../thekernel-ax/crates/thekernel-axsched=../artifacts/thekernel-axsched-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axpoll=../artifacts/thekernel-axpoll-$VERSION" \
     --replace "../thekernel-ax/crates/thekernel-axtask=../artifacts/thekernel-axtask-$VERSION" \
+    --replace "../thekernel-linux-abi/crates/cred=../artifacts/thekernel-linux-cred-$VERSION" \
     --replace "../thekernel-linux-abi/crates/process=../artifacts/thekernel-linux-process-$VERSION" \
     --replace "../thekernel-linux-abi/crates/vfs=../artifacts/thekernel-linux-vfs-$VERSION" \
     --replace "../thekernel-linux-abi/crates/fd=../artifacts/thekernel-linux-fd-$VERSION" \

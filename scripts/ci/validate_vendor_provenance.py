@@ -33,9 +33,20 @@ MAINTAINED_SIBLING_PATCHES = {
     "thekernel-linux-vfs": ("../thekernel-linux-abi/crates/vfs", "0.1.0"),
     "thekernel-linux-fd": ("../thekernel-linux-abi/crates/fd", "0.1.0"),
     "thekernel-linux-process": ("../thekernel-linux-abi/crates/process", "0.1.0"),
+    "thekernel-linux-cred": ("../thekernel-linux-abi/crates/cred", "0.1.0"),
+}
+MAINTAINED_SIBLING_REPO_PATHS = {
+    "thekernel-axsched": ("ax", Path("crates/thekernel-axsched")),
+    "thekernel-axpoll": ("ax", Path("crates/thekernel-axpoll")),
+    "thekernel-axtask": ("ax", Path("crates/thekernel-axtask")),
+    "thekernel-linux-vfs": ("linux-abi", Path("crates/vfs")),
+    "thekernel-linux-fd": ("linux-abi", Path("crates/fd")),
+    "thekernel-linux-process": ("linux-abi", Path("crates/process")),
+    "thekernel-linux-cred": ("linux-abi", Path("crates/cred")),
 }
 MAINTAINED_WORKSPACE_DEPENDENCIES = {
     "linux-vfs": ("thekernel-linux-vfs", "=0.1.0"),
+    "thekernel-linux-cred": ("thekernel-linux-cred", "=0.1.0"),
 }
 LOCAL_ADAPTER_PATCHES = {
     "axtask": ("crates/axtask-compat", "0.3.0-preview.2"),
@@ -123,15 +134,21 @@ def validate_maintained_workspace_dependencies(
     ):
         spec = dependencies.get(alias)
         if spec is None:
+            if expected_package in patches:
+                errors.append(
+                    f"maintained sibling patch {expected_package} requires "
+                    f"workspace dependency {alias}"
+                )
             continue
         if not isinstance(spec, Mapping):
             errors.append(
                 f"workspace dependency {alias} must use an explicit dependency table"
             )
             continue
-        if spec.get("package") != expected_package:
+        declared_package = spec.get("package", alias)
+        if declared_package != expected_package:
             errors.append(
-                f"workspace dependency {alias} package is {spec.get('package')!r}, "
+                f"workspace dependency {alias} package is {declared_package!r}, "
                 f"expected {expected_package!r}"
             )
         if spec.get("version") != expected_version:
@@ -189,11 +206,16 @@ def validate_non_vendor_patch(
     *,
     expected_version: str,
     local_adapter: bool,
+    crate_dir_override: Path | None = None,
     errors: list[str],
 ) -> None:
     kind = "local adapter" if local_adapter else "maintained sibling"
     label = f"{name} ({path})"
-    crate_dir = (root / path).resolve()
+    crate_dir = (
+        crate_dir_override.resolve()
+        if crate_dir_override is not None
+        else (root / path).resolve()
+    )
     if not crate_dir.is_dir():
         errors.append(f"{label}: {kind} directory does not exist")
         return
@@ -416,6 +438,8 @@ def validate_repository(
     archive_policy: str = "if-present",
     archive_dirs: Sequence[Path] = (),
     selected: frozenset[str] = frozenset(),
+    ax_repo: Path | None = None,
+    linux_abi_repo: Path | None = None,
 ) -> ValidationResult:
     errors: list[str] = []
     root = root.resolve()
@@ -483,12 +507,20 @@ def validate_repository(
 
     for patch_name, patch_path in sorted(maintained_patches.items()):
         _, expected_version = MAINTAINED_SIBLING_PATCHES[patch_name]
+        repo_kind, repo_relative = MAINTAINED_SIBLING_REPO_PATHS[patch_name]
+        sibling_repo = ax_repo if repo_kind == "ax" else linux_abi_repo
+        crate_dir_override = (
+            sibling_repo.resolve() / repo_relative
+            if sibling_repo is not None
+            else None
+        )
         validate_non_vendor_patch(
             root,
             patch_name,
             patch_path,
             expected_version=expected_version,
             local_adapter=False,
+            crate_dir_override=crate_dir_override,
             errors=errors,
         )
         maintained_checks += 1
@@ -722,6 +754,22 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default=[],
         help="validate only this patched package (repeatable)",
     )
+    parser.add_argument(
+        "--ax-repo",
+        type=Path,
+        help=(
+            "maintained thekernel-ax workspace to inspect while retaining "
+            "canonical manifest patch paths"
+        ),
+    )
+    parser.add_argument(
+        "--linux-abi-repo",
+        type=Path,
+        help=(
+            "maintained thekernel-linux-abi workspace to inspect while "
+            "retaining canonical manifest patch paths"
+        ),
+    )
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args(argv)
 
@@ -733,6 +781,8 @@ def main(argv: Sequence[str] = ()) -> int:
         archive_policy=args.archive_policy,
         archive_dirs=args.archive_dir,
         selected=frozenset(args.package),
+        ax_repo=args.ax_repo,
+        linux_abi_repo=args.linux_abi_repo,
     )
     if result.errors:
         for error in result.errors:

@@ -43,6 +43,7 @@ axsync = { version = "0.3.0-preview.2" }
 axpoll = { package = "thekernel-readiness-adapter", version = "=0.1.0", path = "crates/readiness-adapter" }
 axtask = { package = "thekernel-axtask", version = "=0.1.0" }
 linux-vfs = { package = "thekernel-linux-vfs", version = "=0.1.0" }
+thekernel-linux-cred = { version = "=0.1.0", default-features = false }
 thekernel-linux-fd = { version = "=0.1.0" }
 thekernel-linux-process = { version = "=0.1.0", default-features = false }
 starry-process = { package = "thekernel-linux-process-adapter", version = "=0.1.0", path = "crates/process-adapter" }
@@ -122,6 +123,7 @@ axplat-riscv64-qemu-virt = { path = "third_party/rust-patches/axplat-riscv64-qem
 thekernel-axsched = { path = "../thekernel-ax/crates/thekernel-axsched" }
 thekernel-axpoll = { path = "../thekernel-ax/crates/thekernel-axpoll" }
 thekernel-axtask = { path = "../thekernel-ax/crates/thekernel-axtask" }
+thekernel-linux-cred = { path = "../thekernel-linux-abi/crates/cred" }
 thekernel-linux-vfs = { path = "../thekernel-linux-abi/crates/vfs" }
 thekernel-linux-fd = { path = "../thekernel-linux-abi/crates/fd" }
 thekernel-linux-process = { path = "../thekernel-linux-abi/crates/process" }

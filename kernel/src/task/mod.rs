@@ -6,7 +6,6 @@ pub(crate) mod coredump;
 mod creds;
 mod exec_cred;
 mod futex;
-mod idmap;
 mod jobctl;
 mod ops;
 mod process;
@@ -21,6 +20,11 @@ mod timer;
 mod user;
 
 // Re-exports from split sub-modules — keep the old `crate::task::*` paths unchanged.
+pub(crate) use thekernel_linux_cred::{
+    CredError, ID_MAP_MAX_EXTENTS, IdMap, IdMapInputExtent, Kgid, Kuid, UserGid, UserUid,
+    validate_id_map_input,
+};
+
 pub(crate) use self::{
     access::{
         PtraceAccessMode, check_current_process_prlimit_access,
@@ -36,7 +40,6 @@ pub(crate) use self::{
         ExecCredentialSecurityContext, FileCapabilities, PreparedExecCredential,
         SECURITY_CAPABILITY_XATTR_NAME, parse_file_capabilities,
     },
-    idmap::{ID_MAP_MAX_EXTENTS, IdMapInputExtent, Kgid, Kuid, validate_id_map_input},
     jobctl::{ContinueResult, PtraceSession, StopReport},
     process::{
         CgroupNamespace, CommittedProcessExit, Dumpability, ExecImageRetirement,
@@ -53,6 +56,16 @@ pub(crate) use self::{
         TaskParentPublicationGuard, lock_task_parent_publication,
     },
 };
+
+/// Maps policy-neutral credential errors at the kernel adapter boundary.
+pub(crate) fn cred_error(error: CredError) -> axerrno::AxError {
+    match error {
+        CredError::InvalidInput => axerrno::AxError::InvalidInput,
+        CredError::NotPermitted => axerrno::AxError::OperationNotPermitted,
+        CredError::NoMemory => axerrno::AxError::NoMemory,
+        _ => axerrno::AxError::OperationNotPermitted,
+    }
+}
 pub use self::{
     accounting::*,
     futex::*,
