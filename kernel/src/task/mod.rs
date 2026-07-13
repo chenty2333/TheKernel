@@ -21,8 +21,8 @@ mod user;
 
 // Re-exports from split sub-modules — keep the old `crate::task::*` paths unchanged.
 pub(crate) use thekernel_linux_cred::{
-    CredError, ID_MAP_MAX_EXTENTS, IdMap, IdMapInputExtent, Kgid, Kuid, UserGid, UserUid,
-    validate_id_map_input,
+    CredError, FileCapabilities, ID_MAP_MAX_EXTENTS, IdMap, IdMapInputExtent, Kgid, Kuid,
+    SECURITY_CAPABILITY_XATTR_NAME, UserGid, UserUid, validate_id_map_input,
 };
 
 pub(crate) use self::{
@@ -37,8 +37,7 @@ pub(crate) use self::{
     creds::{CapabilityState, Cred, CredentialSlot, Credentials, DacCredentialView},
     exec_cred::{
         ExecAuxIdentity, ExecCredentialEffects, ExecCredentialRequest,
-        ExecCredentialSecurityContext, FileCapabilities, PreparedExecCredential,
-        SECURITY_CAPABILITY_XATTR_NAME, parse_file_capabilities,
+        ExecCredentialSecurityContext, PreparedExecCredential, parse_file_capabilities,
     },
     jobctl::{ContinueResult, PtraceSession, StopReport},
     process::{
