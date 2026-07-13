@@ -9,13 +9,21 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
-use axsync::Mutex;
 use kspin::SpinNoIrq;
 
 use crate::{
     DefaultSignalAction, DetachedSignal, PendingSignals, PreparedSignal, SignalAction,
     SignalActionFlags, SignalDisposition, SignalInfo, SignalSet, Signo, api::ThreadSignalManager,
 };
+
+// Host-side kernel tests unify `axsync/multitask` through the wider kernel
+// graph but cannot safely construct an ArceOS task context. Let those tests
+// force this one serialization lock back to its spin-backed implementation;
+// real kernel targets keep the sleepable mutex selected by `multitask`.
+#[cfg(any(not(feature = "spin-action-update"), target_os = "none"))]
+type ActionUpdateMutex<T> = axsync::Mutex<T>;
+#[cfg(all(feature = "spin-action-update", not(target_os = "none")))]
+type ActionUpdateMutex<T> = SpinNoIrq<T>;
 
 /// Signal actions for a process.
 #[derive(Clone)]
@@ -55,6 +63,7 @@ pub(crate) struct RegisteredThread {
 const REGISTRATION_PENDING: u8 = 0;
 const REGISTRATION_ACTIVE: u8 = 1;
 const REGISTRATION_CANCELLED: u8 = 2;
+const REGISTRATION_RETAINED: u8 = 3;
 
 impl RegisteredThread {
     pub(crate) fn try_new(
@@ -76,9 +85,21 @@ impl RegisteredThread {
         self.state.store(REGISTRATION_CANCELLED, Ordering::Release);
     }
 
+    pub(crate) fn retain_pending_only(&self) {
+        self.state.store(REGISTRATION_RETAINED, Ordering::Release);
+    }
+
+    pub(crate) fn matches(&self, tid: u32, thread: *const ThreadSignalManager) -> bool {
+        self.tid == tid && self.thread.as_ptr() == thread
+    }
+
     pub(crate) fn is_live(&self) -> bool {
         self.state.load(Ordering::Acquire) != REGISTRATION_CANCELLED
             && self.thread.strong_count() != 0
+    }
+
+    pub(crate) fn claims_tid(&self, tid: u32) -> bool {
+        self.tid == tid && self.is_live()
     }
 
     fn upgrade(&self) -> Option<(u32, Arc<ThreadSignalManager>)> {
@@ -86,6 +107,16 @@ impl RegisteredThread {
             return None;
         }
         self.thread.upgrade().map(|thread| (self.tid, thread))
+    }
+
+    fn upgrade_for_action_update(&self) -> Option<Arc<ThreadSignalManager>> {
+        if !matches!(
+            self.state.load(Ordering::Acquire),
+            REGISTRATION_ACTIVE | REGISTRATION_RETAINED
+        ) {
+            return None;
+        }
+        self.thread.upgrade()
     }
 }
 
@@ -107,6 +138,11 @@ pub struct ProcessSignalManager {
     /// The process-level shared pending signals
     pending: SpinNoIrq<PendingSignals>,
 
+    /// Publication state for the shared pending endpoint. Final process exit
+    /// retains existing records but rejects late direct publication; reap then
+    /// cancels and drains the queue.
+    lifecycle: SpinNoIrq<u8>,
+
     /// The signal actions
     pub actions: Arc<SpinNoIrq<SignalActions>>,
 
@@ -116,15 +152,62 @@ pub struct ProcessSignalManager {
     /// Thread-level signal managers.
     pub(crate) children: SpinNoIrq<Option<Arc<ThreadRegistry>>>,
 
-    /// Serializes registry publication with action transitions. This is a
-    /// sleepable mutex when the crate's `multitask` feature is enabled, so
-    /// immutable snapshots are allocated without holding a SpinNoIrq guard.
-    pub(crate) action_update: Mutex<()>,
+    /// Serializes registry publication with action transitions. Real kernel
+    /// targets use the sleepable mutex selected by `multitask`; the explicit
+    /// host-test override is spin-backed because no ArceOS task exists there.
+    /// Immutable snapshots are allocated without holding a SpinNoIrq guard.
+    pub(crate) action_update: ActionUpdateMutex<()>,
 
     pub(crate) possibly_has_signal: AtomicBool,
 }
 
+const PROCESS_ENDPOINT_ACTIVE: u8 = 1;
+const PROCESS_ENDPOINT_RETAINED: u8 = 2;
+const PROCESS_ENDPOINT_CANCELLED: u8 = 3;
+const JOB_CONTROL_STOP_SIGNALS: [Signo; 4] = [
+    Signo::SIGSTOP,
+    Signo::SIGTSTP,
+    Signo::SIGTTIN,
+    Signo::SIGTTOU,
+];
+
 impl ProcessSignalManager {
+    pub(crate) fn has_generation_effect(signo: Signo) -> bool {
+        signo == Signo::SIGCONT || JOB_CONTROL_STOP_SIGNALS.contains(&signo)
+    }
+
+    /// Applies Linux's generation-time SIGCONT/stop queue cancellation while
+    /// the caller owns `action_update`. ACTIVE and RETAINED endpoints are both
+    /// included; cancelled endpoints cannot retain meaningful pending state.
+    pub(crate) fn apply_generation_effect_locked(
+        &self,
+        signo: Signo,
+        detached: &mut DetachedSignal,
+    ) {
+        let flush = if signo == Signo::SIGCONT {
+            &JOB_CONTROL_STOP_SIGNALS[..]
+        } else if JOB_CONTROL_STOP_SIGNALS.contains(&signo) {
+            core::slice::from_ref(&Signo::SIGCONT)
+        } else {
+            return;
+        };
+
+        for &pending_signo in flush {
+            self.detach_signal_into(pending_signo, detached);
+        }
+        let registry = self.children_registry_snapshot();
+        if let Some(registry) = registry.as_deref() {
+            for entry in registry {
+                if let Some(thread) = entry.upgrade_for_action_update() {
+                    for &pending_signo in flush {
+                        thread.detach_signal_into(pending_signo, detached);
+                    }
+                }
+            }
+        }
+        drop(registry);
+    }
+
     fn action_ignored(actions: &SignalActions, signo: Signo) -> bool {
         match &actions[signo].disposition {
             SignalDisposition::Ignore => true,
@@ -139,12 +222,43 @@ impl ProcessSignalManager {
     pub fn new(actions: Arc<SpinNoIrq<SignalActions>>, default_restorer: usize) -> Self {
         Self {
             pending: SpinNoIrq::new(PendingSignals::default()),
+            lifecycle: SpinNoIrq::new(PROCESS_ENDPOINT_ACTIVE),
             actions,
             default_restorer,
             children: SpinNoIrq::new(None),
-            action_update: Mutex::new(()),
+            action_update: ActionUpdateMutex::new(()),
             possibly_has_signal: AtomicBool::new(false),
         }
+    }
+
+    /// Freezes the shared pending endpoint at final process exit. Existing
+    /// records remain charged through zombie lifetime, while a sender that
+    /// prepared concurrently must fail its commit-side state recheck.
+    pub fn retain_pending_only(&self) {
+        let update = self.action_update.lock();
+        let mut lifecycle = self.lifecycle.lock();
+        if *lifecycle == PROCESS_ENDPOINT_ACTIVE {
+            *lifecycle = PROCESS_ENDPOINT_RETAINED;
+        }
+        drop(lifecycle);
+        drop(update);
+    }
+
+    /// Cancels the shared endpoint and releases every retained queue record.
+    /// Queue ownership is destroyed only after the lifecycle and pending guards
+    /// have been released.
+    pub fn retire_pending(&self) {
+        let update = self.action_update.lock();
+        let mut lifecycle = self.lifecycle.lock();
+        if *lifecycle == PROCESS_ENDPOINT_CANCELLED {
+            return;
+        }
+        *lifecycle = PROCESS_ENDPOINT_CANCELLED;
+        let detached = self.pending.lock().take_all();
+        self.possibly_has_signal.store(false, Ordering::Release);
+        drop(lifecycle);
+        drop(update);
+        drop(detached);
     }
 
     pub(crate) fn children_registry_snapshot(&self) -> Option<Arc<ThreadRegistry>> {
@@ -159,7 +273,7 @@ impl ProcessSignalManager {
 
         if let Some(registry) = registry.as_deref() {
             for entry in registry {
-                if let Some((_, child)) = entry.upgrade() {
+                if let Some(child) = entry.upgrade_for_action_update() {
                     snapshot.push(child);
                 }
             }
@@ -273,43 +387,94 @@ impl ProcessSignalManager {
         prepare: impl FnOnce(SignalInfo) -> Result<PreparedSignal, E>,
     ) -> Result<ProcessSignalSendOutcome, E> {
         let signo = sig.signo();
-        if self.signal_ignored(signo) && !self.blocked_by_any_thread(signo) {
-            return Ok(ProcessSignalSendOutcome {
-                published: false,
-                wake_tid: None,
-            });
-        }
+        let inactive = || ProcessSignalSendOutcome {
+            published: false,
+            wake_tid: None,
+        };
 
-        let already_pending = !signo.is_realtime() && self.pending.lock().set.has(signo);
-        let mut published = false;
-        if !already_pending {
-            let mut prepared = Some(prepare(sig)?);
-            let outcome = {
-                let actions = self.actions.lock();
-                if Self::action_ignored(&actions, signo) && !self.blocked_by_any_thread(signo) {
-                    None
-                } else {
-                    let mut pending = self.pending.lock();
-                    Some(pending.publish(prepared.take().unwrap()))
+        {
+            // Generation-time cancellation may detach accounted RT nodes from
+            // several queues. Declare this before every guard so early-return
+            // drop order also destroys those nodes only after all guards.
+            let mut generation_detached = DetachedSignal::empty();
+            let generation = Self::has_generation_effect(signo).then(|| self.action_update.lock());
+            let mut lifecycle = self.lifecycle.lock();
+            if *lifecycle != PROCESS_ENDPOINT_ACTIVE {
+                return Ok(inactive());
+            }
+            if generation.is_some() {
+                // Process endpoint state transitions take action_update too,
+                // so it is safe to release the spin gate while walking and
+                // detaching every shared/private queue.
+                drop(lifecycle);
+                self.apply_generation_effect_locked(signo, &mut generation_detached);
+                lifecycle = self.lifecycle.lock();
+                if *lifecycle != PROCESS_ENDPOINT_ACTIVE {
+                    return Ok(inactive());
                 }
-            };
-            // A disposition transition can make a prepared node unnecessary.
-            // Release it only after the action and pending guards are gone.
-            drop(prepared);
-            let Some(outcome) = outcome else {
+            }
+            let actions = self.actions.lock();
+            if Self::action_ignored(&actions, signo) && !self.blocked_by_any_thread(signo) {
+                return Ok(inactive());
+            }
+            if !signo.is_realtime() && self.pending.lock().set.has(signo) {
+                self.possibly_has_signal.store(true, Ordering::Release);
                 return Ok(ProcessSignalSendOutcome {
                     published: false,
-                    wake_tid: None,
+                    wake_tid: self.wake_thread_for(signo),
                 });
-            };
-            // A racing standard sender may have filled the fixed slot after
-            // preflight. Release its unused charge outside the pending lock.
-            published = outcome.finish();
+            }
         }
-        self.possibly_has_signal.store(true, Ordering::Release);
+
+        let mut prepared = Some(prepare(sig)?);
+        let mut generation_detached = DetachedSignal::empty();
+        let generation = Self::has_generation_effect(signo).then(|| self.action_update.lock());
+        let mut lifecycle = self.lifecycle.lock();
+        if *lifecycle != PROCESS_ENDPOINT_ACTIVE {
+            drop(lifecycle);
+            drop(generation);
+            drop(prepared);
+            drop(generation_detached);
+            return Ok(inactive());
+        }
+        if generation.is_some() {
+            drop(lifecycle);
+            self.apply_generation_effect_locked(signo, &mut generation_detached);
+            lifecycle = self.lifecycle.lock();
+            if *lifecycle != PROCESS_ENDPOINT_ACTIVE {
+                drop(lifecycle);
+                drop(generation);
+                drop(prepared);
+                drop(generation_detached);
+                return Ok(inactive());
+            }
+        }
+        let actions = self.actions.lock();
+        let ignored = Self::action_ignored(&actions, signo) && !self.blocked_by_any_thread(signo);
+        let outcome = if ignored {
+            None
+        } else {
+            let mut pending = self.pending.lock();
+            if !signo.is_realtime() && pending.set.has(signo) {
+                None
+            } else {
+                Some(pending.publish(prepared.take().unwrap()))
+            }
+        };
+        drop(actions);
+        drop(lifecycle);
+        drop(generation);
+        // A disposition transition, final exit, or standard-signal race can
+        // make the prepared node unnecessary. Release it outside every guard.
+        drop(prepared);
+        drop(generation_detached);
+        let published = outcome.is_some_and(|outcome| outcome.finish());
+        if !ignored {
+            self.possibly_has_signal.store(true, Ordering::Release);
+        }
         Ok(ProcessSignalSendOutcome {
             published,
-            wake_tid: self.wake_thread_for(signo),
+            wake_tid: (!ignored).then(|| self.wake_thread_for(signo)).flatten(),
         })
     }
 
@@ -349,5 +514,16 @@ impl ProcessSignalManager {
             self.possibly_has_signal.store(false, Ordering::Release);
         }
         drop(detached);
+    }
+
+    fn detach_signal_into(&self, signo: Signo, detached: &mut DetachedSignal) {
+        let empty = {
+            let mut pending = self.pending.lock();
+            pending.detach_signal_into(signo, detached);
+            pending.set.is_empty()
+        };
+        if empty {
+            self.possibly_has_signal.store(false, Ordering::Release);
+        }
     }
 }

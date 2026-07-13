@@ -83,6 +83,6 @@ pub fn new_unregistered_test_env() -> (
 
 pub fn new_test_env() -> (Arc<ProcessSignalManager>, Arc<ThreadSignalManager>) {
     let (proc, thr, registration) = new_unregistered_test_env();
-    registration.commit();
+    registration.commit().unwrap();
     (proc, thr)
 }

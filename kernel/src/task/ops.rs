@@ -30,8 +30,9 @@ use super::{
     AsThread, CommittedProcessExit, ExecImageCommit, FutexKey, ITimerType, PreparedExecCredential,
     ProcStateHint, Process, ProcessAccessState, ProcessData, ProcessGroup, ProcessReparentBatch,
     Session, TaskParentNode, TaskUsage, Thread, ThreadExitTransition, TimerState, futex_table_for,
-    lock_task_parent_publication, process_domain, send_signal_thread_inner, send_signal_to_process,
-    send_signal_to_process_data, send_signal_to_thread, user::linux_pid_from_task_id,
+    lock_task_parent_publication, process_domain, reap_process, send_signal_thread_inner,
+    send_signal_to_process, send_signal_to_process_data, send_signal_to_thread,
+    user::linux_pid_from_task_id,
 };
 use crate::{
     mm::{AddrSpace, UserPtr, access_user_memory},
@@ -216,12 +217,35 @@ pub(in crate::task) fn task_alias_lock_held() -> bool {
 static PROCESS_TABLE: Lazy<Mutex<WeakRegistry<Weak<ProcessData>>>> =
     Lazy::new(|| Mutex::new(WeakRegistry::new()));
 
+fn sigchld_autoreap_policy(
+    disposition: &SignalDisposition,
+    flags: SignalActionFlags,
+) -> (bool, bool) {
+    let ignored = matches!(disposition, SignalDisposition::Ignore);
+    let no_cldwait = flags.contains(SignalActionFlags::NOCLDWAIT);
+    (ignored || no_cldwait, ignored)
+}
+
 fn parent_sigchld_autoreap(parent: &ProcessData) -> (bool, bool) {
     let actions = parent.signal.actions.lock();
     let action = &actions[Signo::SIGCHLD];
-    let ignored = matches!(action.disposition, SignalDisposition::Ignore);
-    let no_cldwait = action.flags.contains(SignalActionFlags::NOCLDWAIT);
-    (ignored || no_cldwait, ignored)
+    sigchld_autoreap_policy(&action.disposition, action.flags)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildExitCompletionStep {
+    Notify,
+    Reap,
+}
+
+fn child_exit_completion_steps(
+    auto_reap: bool,
+    suppress_exit_signal: bool,
+) -> [Option<ChildExitCompletionStep>; 2] {
+    [
+        (!suppress_exit_signal).then_some(ChildExitCompletionStep::Notify),
+        auto_reap.then_some(ChildExitCompletionStep::Reap),
+    ]
 }
 
 fn notify_reaper_of_inherited_zombie(child: &Arc<Process>) {
@@ -238,27 +262,30 @@ fn notify_reaper_of_inherited_zombie(child: &Arc<Process>) {
         (false, false)
     };
 
-    if auto_reap {
-        match process_domain()
-            .and_then(|domain| domain.reap(&child).map_err(process_lifecycle_error))
-        {
-            Ok(true) => cgroup::detach_process(child.pid()),
-            Ok(false) => error!(
-                "inherited zombie {} was already reaped during autoreap",
-                child.pid()
-            ),
-            Err(error) => error!(
-                "failed to autoreap inherited zombie {}: {}",
-                child.pid(),
-                error
-            ),
+    for step in child_exit_completion_steps(auto_reap, suppress_exit_signal)
+        .into_iter()
+        .flatten()
+    {
+        match step {
+            ChildExitCompletionStep::Notify => {
+                if let Some(signo) = child.exit_signal().and_then(Signo::from_repr) {
+                    let _ =
+                        send_signal_to_process(parent.pid(), Some(SignalInfo::new_kernel(signo)));
+                }
+            }
+            ChildExitCompletionStep::Reap => match reap_process(&child) {
+                Ok(true) => cgroup::detach_process(child.pid()),
+                Ok(false) => error!(
+                    "inherited zombie {} was already reaped during autoreap",
+                    child.pid()
+                ),
+                Err(error) => error!(
+                    "failed to autoreap inherited zombie {}: {}",
+                    child.pid(),
+                    error
+                ),
+            },
         }
-        parent_data.child_exit_event.wake();
-        return;
-    }
-
-    if !suppress_exit_signal && let Some(signo) = child.exit_signal().and_then(Signo::from_repr) {
-        let _ = send_signal_to_process(parent.pid(), Some(SignalInfo::new_kernel(signo)));
     }
     parent_data.child_exit_event.wake();
 }
@@ -1057,6 +1084,7 @@ fn publish_final_process_exit(
         self_usage.into(),
         child_usage.into(),
         proc_data.group_leader_cred(),
+        proc_data.group_leader_signal_owner(),
         |child| notify_reaper_of_inherited_zombie(&child),
         |batch| reparent_exact_children_from_core_batch(departing, task_parent_publication, batch),
     )
@@ -1219,6 +1247,17 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         .map(|exit| thr.proc_data.prepare_zombie_exit(exit))
         .transpose()?;
     if final_exit.is_some() {
+        // Freeze shared generation before zombie publication. A concurrent
+        // sender that prepared outside the endpoint lock must fail its commit
+        // recheck, while existing shared records remain charged until reap.
+        thr.proc_data.signal.retain_pending_only();
+    }
+    // The exact task is no longer a routing candidate. Preserve only an
+    // exited group leader's private pending queue; ordinary dead threads are
+    // fully deactivated. Action changes can still flush retained records.
+    thr.signal
+        .retire_registration(tid, visible_tid == process.pid());
+    if final_exit.is_some() {
         // The final core admission plus this ProcessData lifecycle guard now
         // exclude every new fork/thread publication. The exact node and its
         // Weak<ProcessData> endpoint remain discoverable from its parent's
@@ -1343,22 +1382,31 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
             (false, false)
         };
 
-        if let Some(parent) = parent.as_ref()
-            && !suppress_exit_signal
-            && let Some(signo) = thr.proc_data.exit_signal
+        for step in child_exit_completion_steps(auto_reap, suppress_exit_signal)
+            .into_iter()
+            .flatten()
         {
-            let _ = send_signal_to_process(parent.pid(), Some(SignalInfo::new_kernel(signo)));
-        }
-        if auto_reap {
-            match process_domain()
-                .and_then(|domain| domain.reap(process).map_err(process_lifecycle_error))
-            {
-                Ok(true) => cgroup::detach_process(process.pid()),
-                Ok(false) => error!(
-                    "process {} was already reaped during final autoreap",
-                    process.pid()
-                ),
-                Err(error) => error!("failed to autoreap process {}: {}", process.pid(), error),
+            match step {
+                ChildExitCompletionStep::Notify => {
+                    if let Some(parent) = parent.as_ref()
+                        && let Some(signo) = thr.proc_data.exit_signal
+                    {
+                        let _ = send_signal_to_process(
+                            parent.pid(),
+                            Some(SignalInfo::new_kernel(signo)),
+                        );
+                    }
+                }
+                ChildExitCompletionStep::Reap => match reap_process(process) {
+                    Ok(true) => cgroup::detach_process(process.pid()),
+                    Ok(false) => error!(
+                        "process {} was already reaped during final autoreap",
+                        process.pid()
+                    ),
+                    Err(error) => {
+                        error!("failed to autoreap process {}: {}", process.pid(), error)
+                    }
+                },
             }
         }
         if let Some(data) = parent_data {
@@ -1367,11 +1415,13 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         thr.proc_data.exit_event.wake();
         thr.proc_data.release_vfork();
     }
+    // Publish exact task exit before releasing lifecycle serialization. A
+    // thread-pidfd resolver must never observe removed membership paired with
+    // a still-live task flag and retry the retired task identity.
+    thr.set_exit();
     drop(lifecycle);
     thr.proc_data.exec_event.wake();
     thr.exit_event.wake();
-
-    thr.set_exit();
     Ok(())
 }
 
@@ -1409,6 +1459,48 @@ mod tests {
         assert_eq!(
             process_lifecycle_error(ProcessError::Busy),
             AxError::ResourceBusy
+        );
+    }
+
+    #[test]
+    fn sigchld_autoreap_policy_distinguishes_default_ignore_and_no_cldwait() {
+        let none = SignalActionFlags::empty();
+        let no_cldwait = SignalActionFlags::NOCLDWAIT;
+
+        assert_eq!(
+            sigchld_autoreap_policy(&SignalDisposition::Default, none),
+            (false, false)
+        );
+        assert_eq!(
+            sigchld_autoreap_policy(&SignalDisposition::Ignore, none),
+            (true, true)
+        );
+        assert_eq!(
+            sigchld_autoreap_policy(&SignalDisposition::Default, no_cldwait),
+            (true, false)
+        );
+        assert_eq!(
+            sigchld_autoreap_policy(&SignalDisposition::Handler(0x1000), no_cldwait),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn sigchld_inherited_no_cldwait_notifies_before_reap() {
+        assert_eq!(
+            child_exit_completion_steps(true, false),
+            [
+                Some(ChildExitCompletionStep::Notify),
+                Some(ChildExitCompletionStep::Reap),
+            ]
+        );
+        assert_eq!(
+            child_exit_completion_steps(true, true),
+            [None, Some(ChildExitCompletionStep::Reap)]
+        );
+        assert_eq!(
+            child_exit_completion_steps(false, false),
+            [Some(ChildExitCompletionStep::Notify), None]
         );
     }
 

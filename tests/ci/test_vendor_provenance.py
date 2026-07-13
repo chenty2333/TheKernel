@@ -554,7 +554,7 @@ class VendorProvenanceTests(unittest.TestCase):
             linux_abi_repo=(Path(linux_abi_repo) if linux_abi_repo else None),
         )
         self.assertEqual(result.errors, ())
-        self.assertEqual(result.package_checks, 26)
+        self.assertEqual(result.package_checks, 27)
 
 
 if __name__ == "__main__":

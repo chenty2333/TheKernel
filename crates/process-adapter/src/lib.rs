@@ -2,9 +2,9 @@
 //!
 //! The reusable crate keeps zombie state generic and requires an explicit
 //! [`ProcessDomain`]. TheKernel records Linux wait status, CPU accounting, and
-//! an immutable credential/namespace owner in that payload. The generic
-//! credential parameter keeps this adapter below the kernel's `Cred` type
-//! without reducing authority to a raw UID or a shadow registry.
+//! an immutable credential/namespace owner plus a consumer-defined reap owner
+//! in that payload. Generic parameters keep this adapter below the kernel's
+//! `Cred` and signal types without reducing authority to raw shadow state.
 
 #![no_std]
 #![feature(allocator_api)]
@@ -65,7 +65,7 @@ impl ProcessUsage {
 /// immutable reference-counted credential which already owns its user
 /// namespace; other consumers may choose an equivalent stable object.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ZombieSnapshot<C> {
+pub struct ZombieSnapshot<C, R = ()> {
     /// Linux wait status.
     pub wait_status: i32,
     /// CPU usage charged directly to the exited process.
@@ -74,21 +74,25 @@ pub struct ZombieSnapshot<C> {
     pub child_usage: ProcessUsage,
     /// Complete immutable credential and namespace provenance at exit.
     pub credential: C,
+    /// Consumer-owned resource retained until successful reap.
+    pub reap_owner: R,
 }
 
-impl<C> ZombieSnapshot<C> {
+impl<C, R> ZombieSnapshot<C, R> {
     /// Creates the complete durable payload published by process exit.
     pub const fn new(
         wait_status: i32,
         self_usage: ProcessUsage,
         child_usage: ProcessUsage,
         credential: C,
+        reap_owner: R,
     ) -> Self {
         Self {
             wait_status,
             self_usage,
             child_usage,
             credential,
+            reap_owner,
         }
     }
 
@@ -111,15 +115,15 @@ pub enum PreparedZombieSnapshotError {
 /// A process creates and owns this value while its runtime state is still
 /// unpublished. [`initialize`](Self::initialize) consumes the sole owner,
 /// writes the complete exit payload in place, and returns the same allocation
-/// as `Arc<ZombieSnapshot<C>>`. No allocation occurs during that transition.
+/// as `Arc<ZombieSnapshot<C, R>>`. No allocation occurs during that transition.
 /// Dropping an uninitialized preparation simply releases its allocation; no
 /// `C` value exists and no partially initialized payload is dropped.
 #[must_use = "dropping prepared zombie storage releases it without publishing a snapshot"]
-pub struct PreparedZombieSnapshot<C> {
-    storage: Arc<MaybeUninit<ZombieSnapshot<C>>>,
+pub struct PreparedZombieSnapshot<C, R = ()> {
+    storage: Arc<MaybeUninit<ZombieSnapshot<C, R>>>,
 }
 
-impl<C> PreparedZombieSnapshot<C> {
+impl<C, R> PreparedZombieSnapshot<C, R> {
     /// Allocates the reference-counted storage needed by the eventual exit
     /// snapshot, reporting OOM before process publication.
     pub fn try_new() -> Result<Self, PreparedZombieSnapshotError> {
@@ -127,7 +131,7 @@ impl<C> PreparedZombieSnapshot<C> {
     }
 
     fn try_new_with<E>(
-        allocate: impl FnOnce() -> Result<Arc<MaybeUninit<ZombieSnapshot<C>>>, E>,
+        allocate: impl FnOnce() -> Result<Arc<MaybeUninit<ZombieSnapshot<C, R>>>, E>,
     ) -> Result<Self, PreparedZombieSnapshotError> {
         allocate()
             .map(|storage| Self { storage })
@@ -147,25 +151,27 @@ impl<C> PreparedZombieSnapshot<C> {
         self_usage: ProcessUsage,
         child_usage: ProcessUsage,
         credential: C,
-    ) -> Arc<ZombieSnapshot<C>> {
-        let snapshot = ZombieSnapshot::new(wait_status, self_usage, child_usage, credential);
+        reap_owner: R,
+    ) -> Arc<ZombieSnapshot<C, R>> {
+        let snapshot =
+            ZombieSnapshot::new(wait_status, self_usage, child_usage, credential, reap_owner);
         let storage = Arc::into_raw(self.storage);
 
         // SAFETY:
         // - `storage` came directly from `Arc::into_raw`, and the private,
         //   non-`Clone` preparation never exposes the `Arc`, so this consuming
         //   method owns the only reference that can access the pointee;
-        // - `MaybeUninit<ZombieSnapshot<C>>` has the same size and alignment as
-        //   `ZombieSnapshot<C>`, and `write` initializes the entire value before
+        // - `MaybeUninit<ZombieSnapshot<C, R>>` has the same size and alignment
+        //   as `ZombieSnapshot<C, R>`, and `write` initializes the entire value before
         //   the `Arc` is reconstructed with the initialized pointee type;
         // - no operation between `into_raw` and `from_raw` can panic, and the
         //   raw pointer is reconstructed exactly once.
         unsafe {
             storage
                 .cast_mut()
-                .cast::<ZombieSnapshot<C>>()
+                .cast::<ZombieSnapshot<C, R>>()
                 .write(snapshot);
-            Arc::from_raw(storage.cast::<ZombieSnapshot<C>>())
+            Arc::from_raw(storage.cast::<ZombieSnapshot<C, R>>())
         }
     }
 
@@ -175,7 +181,7 @@ impl<C> PreparedZombieSnapshot<C> {
     /// The core token is obtained before this reservation is consumed. After
     /// binding, final payload initialization and zombie publication are one
     /// infallible consuming operation.
-    pub fn bind_exit(self, exit: ProcessExitAdmission<C>) -> PreparedZombieExit<C> {
+    pub fn bind_exit(self, exit: ProcessExitAdmission<C, R>) -> PreparedZombieExit<C, R> {
         PreparedZombieExit {
             storage: self,
             exit,
@@ -184,12 +190,12 @@ impl<C> PreparedZombieSnapshot<C> {
 }
 
 /// Type-bound prepared payload plus validated process-exit transaction.
-pub struct PreparedZombieExit<C> {
-    storage: PreparedZombieSnapshot<C>,
-    exit: ProcessExitAdmission<C>,
+pub struct PreparedZombieExit<C, R = ()> {
+    storage: PreparedZombieSnapshot<C, R>,
+    exit: ProcessExitAdmission<C, R>,
 }
 
-impl<C> PreparedZombieExit<C> {
+impl<C, R> PreparedZombieExit<C, R> {
     /// Initializes the durable payload and publishes the zombie transition
     /// without allocation or a recoverable error.
     pub fn commit(
@@ -198,11 +204,12 @@ impl<C> PreparedZombieExit<C> {
         self_usage: ProcessUsage,
         child_usage: ProcessUsage,
         credential: C,
-        inherited_zombie: impl FnMut(Arc<Process<C>>),
-    ) -> CommittedProcessExit<C> {
-        let snapshot = self
-            .storage
-            .initialize(wait_status, self_usage, child_usage, credential);
+        reap_owner: R,
+        inherited_zombie: impl FnMut(Arc<Process<C, R>>),
+    ) -> CommittedProcessExit<C, R> {
+        let snapshot =
+            self.storage
+                .initialize(wait_status, self_usage, child_usage, credential, reap_owner);
         self.exit.commit(snapshot, inherited_zombie)
     }
 
@@ -220,12 +227,13 @@ impl<C> PreparedZombieExit<C> {
         self_usage: ProcessUsage,
         child_usage: ProcessUsage,
         credential: C,
-        inherited_zombie: impl FnMut(Arc<Process<C>>),
-        reparent_batch: impl FnMut(&ProcessReparentBatch<C>),
-    ) -> CommittedProcessExit<C> {
-        let snapshot = self
-            .storage
-            .initialize(wait_status, self_usage, child_usage, credential);
+        reap_owner: R,
+        inherited_zombie: impl FnMut(Arc<Process<C, R>>),
+        reparent_batch: impl FnMut(&ProcessReparentBatch<C, R>),
+    ) -> CommittedProcessExit<C, R> {
+        let snapshot =
+            self.storage
+                .initialize(wait_status, self_usage, child_usage, credential, reap_owner);
         self.exit
             .commit_with_reparent_handoff(snapshot, inherited_zombie, reparent_batch)
     }
@@ -268,39 +276,47 @@ pub const fn try_pid_from_task_id(task_id: u64) -> Result<Pid, LinuxTaskIdError>
     }
 }
 
-/// TheKernel process object parameterized by retained credential provenance.
-pub type Process<C> = thekernel_linux_process::Process<ZombieSnapshot<C>>;
-/// TheKernel process group parameterized by retained credential provenance.
-pub type ProcessGroup<C> = thekernel_linux_process::ProcessGroup<ZombieSnapshot<C>>;
-/// TheKernel session parameterized by retained credential provenance.
-pub type Session<C> = thekernel_linux_process::Session<ZombieSnapshot<C>>;
+/// TheKernel process object parameterized by credential and reap provenance.
+pub type Process<C, R = ()> = thekernel_linux_process::Process<ZombieSnapshot<C, R>>;
+/// TheKernel process group parameterized by credential and reap provenance.
+pub type ProcessGroup<C, R = ()> = thekernel_linux_process::ProcessGroup<ZombieSnapshot<C, R>>;
+/// TheKernel session parameterized by credential and reap provenance.
+pub type Session<C, R = ()> = thekernel_linux_process::Session<ZombieSnapshot<C, R>>;
 /// TheKernel explicit process-domain owner.
-pub type ProcessDomain<C> = thekernel_linux_process::ProcessDomain<ZombieSnapshot<C>>;
+pub type ProcessDomain<C, R = ()> = thekernel_linux_process::ProcessDomain<ZombieSnapshot<C, R>>;
 /// Read-only registry handle supplied by the explicit domain.
-pub type ProcessRegistry<C> = thekernel_linux_process::ProcessRegistry<ZombieSnapshot<C>>;
+pub type ProcessRegistry<C, R = ()> =
+    thekernel_linux_process::ProcessRegistry<ZombieSnapshot<C, R>>;
 /// Unpublished process admission transaction.
-pub type ProcessAdmission<C> = thekernel_linux_process::ProcessAdmission<ZombieSnapshot<C>>;
+pub type ProcessAdmission<C, R = ()> =
+    thekernel_linux_process::ProcessAdmission<ZombieSnapshot<C, R>>;
 /// Type-bound unpublished process plus initial-thread publication transaction.
-pub type InitialProcessAdmission<C> =
-    thekernel_linux_process::InitialProcessAdmission<ZombieSnapshot<C>>;
+pub type InitialProcessAdmission<C, R = ()> =
+    thekernel_linux_process::InitialProcessAdmission<ZombieSnapshot<C, R>>;
 /// Fully validated final process-exit transaction.
-pub type ProcessExitAdmission<C> = thekernel_linux_process::ProcessExitAdmission<ZombieSnapshot<C>>;
+pub type ProcessExitAdmission<C, R = ()> =
+    thekernel_linux_process::ProcessExitAdmission<ZombieSnapshot<C, R>>;
 /// Completed zombie publication with its linearized notification parent.
-pub type CommittedProcessExit<C> = thekernel_linux_process::CommittedProcessExit<ZombieSnapshot<C>>;
+pub type CommittedProcessExit<C, R = ()> =
+    thekernel_linux_process::CommittedProcessExit<ZombieSnapshot<C, R>>;
 /// One authoritative bounded child-to-reaper handoff batch.
-pub type ProcessReparentBatch<C> = thekernel_linux_process::ProcessReparentBatch<ZombieSnapshot<C>>;
+pub type ProcessReparentBatch<C, R = ()> =
+    thekernel_linux_process::ProcessReparentBatch<ZombieSnapshot<C, R>>;
 /// One process moved by an authoritative reparent handoff batch.
-pub type ReparentedProcess<C> = thekernel_linux_process::ReparentedProcess<ZombieSnapshot<C>>;
+pub type ReparentedProcess<C, R = ()> =
+    thekernel_linux_process::ReparentedProcess<ZombieSnapshot<C, R>>;
 /// Domain-coordinated live-thread removal and final-exit admission result.
-pub type ThreadExitTransition<C> = thekernel_linux_process::ThreadExitTransition<ZombieSnapshot<C>>;
+pub type ThreadExitTransition<C, R = ()> =
+    thekernel_linux_process::ThreadExitTransition<ZombieSnapshot<C, R>>;
 /// Unpublished thread admission transaction.
-pub type ThreadAdmission<C> = thekernel_linux_process::ThreadAdmission<ZombieSnapshot<C>>;
+pub type ThreadAdmission<C, R = ()> =
+    thekernel_linux_process::ThreadAdmission<ZombieSnapshot<C, R>>;
 /// Ordered live-thread iterator.
-pub type ThreadIds<C> = thekernel_linux_process::ThreadIds<ZombieSnapshot<C>>;
+pub type ThreadIds<C, R = ()> = thekernel_linux_process::ThreadIds<ZombieSnapshot<C, R>>;
 /// PID-ordered iterator over the explicit domain's published processes.
-pub type Processes<'a, C> = thekernel_linux_process::Processes<'a, ZombieSnapshot<C>>;
+pub type Processes<'a, C, R = ()> = thekernel_linux_process::Processes<'a, ZombieSnapshot<C, R>>;
 /// Newly created session and process-group pair.
-pub type CreatedSession<C> = thekernel_linux_process::CreatedSession<ZombieSnapshot<C>>;
+pub type CreatedSession<C, R = ()> = thekernel_linux_process::CreatedSession<ZombieSnapshot<C, R>>;
 
 pub use thekernel_linux_process::{
     ExitOutcome, PROCESS_MEMBERSHIP_LIMIT, ProcessError, ThreadExitOutcome,
@@ -385,6 +401,7 @@ mod tests {
             ProcessUsage::with_maxrss(u64::MAX, 2, 8),
             ProcessUsage::with_maxrss(1, 3, 13),
             credential(0),
+            (),
         );
         assert_eq!(
             snapshot.total_usage(),
@@ -416,6 +433,7 @@ mod tests {
             ProcessUsage::new(10, 20),
             ProcessUsage::new(30, 40),
             credential,
+            (),
         );
 
         assert_eq!(Arc::as_ptr(&snapshot), reserved);
@@ -499,6 +517,7 @@ mod tests {
                 ProcessUsage::new(10, 20),
                 ProcessUsage::new(30, 40),
                 credential(1000),
+                (),
                 drop,
             );
         assert_eq!(outcome.outcome(), ExitOutcome::BecameZombie);
@@ -512,6 +531,7 @@ mod tests {
             ProcessUsage::default(),
             ProcessUsage::default(),
             credential(0),
+            (),
         ));
         assert_eq!(
             domain.exit(&child, replacement, drop),
@@ -542,6 +562,7 @@ mod tests {
                 ProcessUsage::new(10, 20),
                 ProcessUsage::new(30, 40),
                 credential(1000),
+                (),
                 drop,
                 |batch| {
                     for moved in batch.reparented() {

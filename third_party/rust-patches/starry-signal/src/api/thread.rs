@@ -24,6 +24,25 @@ pub struct ThreadSignalSendOutcome {
     pub wake: bool,
 }
 
+/// Why a thread endpoint could not complete registry admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadRegistrationError {
+    /// Allocating the registry entry or immutable replacement failed.
+    NoMemory,
+    /// This endpoint already owns a registration identity.
+    AlreadyRegistered,
+    /// Another live endpoint in the process already owns this thread ID.
+    TidInUse,
+    /// Retirement cancelled this admission before it could be committed.
+    Cancelled,
+}
+
+impl From<AllocError> for ThreadRegistrationError {
+    fn from(_: AllocError) -> Self {
+        Self::NoMemory
+    }
+}
+
 /// The userspace ABI frame created for a signal handler.
 ///
 /// This contains only Linux-visible signal state. Kernel trap metadata is not
@@ -96,6 +115,14 @@ pub struct ThreadSignalManager {
 
     /// The pending signals
     pending: SpinNoIrq<PendingSignals>,
+    /// Publication state for the exact private endpoint.
+    ///
+    /// This gate linearizes direct send with exit retirement. Registry state
+    /// alone is insufficient because an exact task or pidfd sender may retain
+    /// an `Arc<ThreadSignalManager>` after routing has been disabled.
+    lifecycle: SpinNoIrq<u8>,
+    /// The one registry identity currently admitted for this endpoint.
+    registration: SpinNoIrq<Option<Arc<RegisteredThread>>>,
     /// The set of signals currently blocked from delivery.
     blocked: SpinNoIrq<SignalSet>,
     /// Temporarily preserved mask while a synchronous wait unblocks signals.
@@ -109,28 +136,82 @@ pub struct ThreadSignalManager {
 /// Deactivates a newly registered endpoint if the owning thread fails to
 /// finish construction. Successful lifecycle publication disarms the token.
 ///
-/// Rollback is one atomic store. It neither takes a lock nor destroys the
-/// endpoint; the next registry publication compacts inactive entries.
+/// Rollback deactivates only this token's exact registry entry and clears the
+/// manager-owned identity only if it still points to that entry. Any final Arc
+/// destruction happens after the IRQ-disabled lifecycle guards are released.
 #[must_use = "dropping the token rolls back thread-signal registration"]
 pub struct ThreadSignalRegistration {
     entry: Arc<RegisteredThread>,
-    process: Arc<ProcessSignalManager>,
+    thread: Arc<ThreadSignalManager>,
     rollback: bool,
 }
 
+const ENDPOINT_PENDING: u8 = 0;
+const ENDPOINT_ACTIVE: u8 = 1;
+const ENDPOINT_RETAINED: u8 = 2;
+const ENDPOINT_CANCELLED: u8 = 3;
+
+#[derive(Clone, Copy)]
+enum EndpointSendMode {
+    Active,
+    Retained,
+}
+
+impl EndpointSendMode {
+    const fn accepts(self, state: u8) -> bool {
+        matches!(
+            (self, state),
+            (Self::Active, ENDPOINT_ACTIVE) | (Self::Retained, ENDPOINT_RETAINED)
+        )
+    }
+}
+
 impl ThreadSignalRegistration {
-    pub fn commit(mut self) {
-        let update = self.process.action_update.lock();
+    /// Activates this exact admitted identity unless retirement won first.
+    pub fn commit(mut self) -> Result<(), ThreadRegistrationError> {
+        let update = self.thread.proc.action_update.lock();
+        let mut lifecycle = self.thread.lifecycle.lock();
+        let still_admitted = self
+            .thread
+            .registration
+            .lock()
+            .as_ref()
+            .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry));
+        if !still_admitted || *lifecycle != ENDPOINT_PENDING {
+            drop(lifecycle);
+            drop(update);
+            return Err(ThreadRegistrationError::Cancelled);
+        }
+        *lifecycle = ENDPOINT_ACTIVE;
         self.entry.activate();
         self.rollback = false;
+        drop(lifecycle);
         drop(update);
+        Ok(())
     }
 }
 
 impl Drop for ThreadSignalRegistration {
     fn drop(&mut self) {
         if self.rollback {
+            let mut lifecycle = self.thread.lifecycle.lock();
             self.entry.deactivate();
+            let removed = {
+                let mut registration = self.thread.registration.lock();
+                if registration
+                    .as_ref()
+                    .is_some_and(|entry| Arc::ptr_eq(entry, &self.entry))
+                {
+                    *lifecycle = ENDPOINT_CANCELLED;
+                    registration.take()
+                } else {
+                    None
+                }
+            };
+            drop(lifecycle);
+            // The final registry-entry owner may deallocate. Release it only
+            // after every IRQ-disabled state guard has left scope.
+            drop(removed);
         }
     }
 }
@@ -144,6 +225,8 @@ impl ThreadSignalManager {
             proc,
 
             pending: SpinNoIrq::new(PendingSignals::default()),
+            lifecycle: SpinNoIrq::new(ENDPOINT_PENDING),
+            registration: SpinNoIrq::new(None),
             blocked: SpinNoIrq::new(SignalSet::default()),
             real_blocked: SpinNoIrq::new(None),
             stack: SpinNoIrq::new(SignalStack::default()),
@@ -156,16 +239,30 @@ impl ThreadSignalManager {
     pub fn try_register(
         self: &Arc<Self>,
         tid: u32,
-    ) -> Result<ThreadSignalRegistration, AllocError> {
-        let entry = RegisteredThread::try_new(tid, self)?;
+    ) -> Result<ThreadSignalRegistration, ThreadRegistrationError> {
         let update = self.proc.action_update.lock();
+        if self.registration.lock().is_some() {
+            return Err(ThreadRegistrationError::AlreadyRegistered);
+        }
         let registry = self.proc.children_registry_snapshot();
-        let len = registry.as_deref().map_or(0, Vec::len);
-        let capacity = len.checked_add(1).ok_or(AllocError)?;
+        let mut live = 0usize;
+        if let Some(registry) = registry.as_deref() {
+            for registered in registry {
+                if registered.is_live() {
+                    if registered.claims_tid(tid) {
+                        return Err(ThreadRegistrationError::TidInUse);
+                    }
+                    live += 1;
+                }
+            }
+        }
+        let capacity = live
+            .checked_add(1)
+            .ok_or(ThreadRegistrationError::NoMemory)?;
         let mut replacement = Vec::new();
         replacement
             .try_reserve_exact(capacity)
-            .map_err(|_| AllocError)?;
+            .map_err(|_| ThreadRegistrationError::NoMemory)?;
         if let Some(registry) = registry.as_deref() {
             for registered in registry {
                 if registered.is_live() {
@@ -173,8 +270,18 @@ impl ThreadSignalManager {
                 }
             }
         }
+        let entry = RegisteredThread::try_new(tid, self)?;
         replacement.push(entry.clone());
-        let replacement = Arc::try_new(replacement).map_err(|_| AllocError)?;
+        let replacement =
+            Arc::try_new(replacement).map_err(|_| ThreadRegistrationError::NoMemory)?;
+
+        {
+            let mut lifecycle = self.lifecycle.lock();
+            let mut registration = self.registration.lock();
+            debug_assert!(registration.is_none());
+            *lifecycle = ENDPOINT_PENDING;
+            *registration = Some(entry.clone());
+        }
 
         let previous = {
             let mut children = self.proc.children.lock();
@@ -189,9 +296,44 @@ impl ThreadSignalManager {
         drop(registry);
         Ok(ThreadSignalRegistration {
             entry,
-            process: self.proc.clone(),
+            thread: self.clone(),
             rollback: true,
         })
+    }
+
+    /// Removes an exited task from process-directed routing while optionally
+    /// retaining its private pending queue for Linux's unreaped group-leader
+    /// identity. Retained endpoints still participate in disposition-driven
+    /// pending flushes, but can never be selected as a live wake target.
+    pub fn retire_registration(&self, tid: u32, retain_private_pending: bool) {
+        let update = self.proc.action_update.lock();
+        let registry = self.proc.children_registry_snapshot();
+        let entry = registry.as_deref().and_then(|registry| {
+            registry
+                .iter()
+                .find(|entry| entry.matches(tid, self as *const Self))
+        });
+        let mut detached = None;
+        if let Some(entry) = entry {
+            let mut lifecycle = self.lifecycle.lock();
+            if retain_private_pending {
+                if *lifecycle == ENDPOINT_ACTIVE {
+                    entry.retain_pending_only();
+                    *lifecycle = ENDPOINT_RETAINED;
+                }
+            } else {
+                entry.deactivate();
+                *lifecycle = ENDPOINT_CANCELLED;
+                detached = Some(self.pending.lock().take_all());
+                self.possibly_has_signal.store(false, Ordering::Release);
+            }
+            drop(lifecycle);
+        }
+        drop(registry);
+        drop(update);
+        // Queue-account Arcs and RT nodes are destroyed only after the
+        // lifecycle, registry, and action-update guards have been released.
+        drop(detached);
     }
 
     /// Dequeues a signal from the thread's pending signals.
@@ -412,51 +554,142 @@ impl ThreadSignalManager {
         sig: SignalInfo,
         prepare: impl FnOnce(SignalInfo) -> Result<PreparedSignal, E>,
     ) -> Result<ThreadSignalSendOutcome, E> {
-        let signo = sig.signo();
-        let blocked = self.signal_blocked(signo);
-        if self.proc.signal_ignored(signo) && !blocked && !self.signal_real_blocked(signo) {
-            return Ok(ThreadSignalSendOutcome {
-                published: false,
-                wake: false,
-            });
-        }
+        self.try_send_signal_for_endpoint(EndpointSendMode::Active, sig, prepare)
+    }
 
-        let already_pending = !signo.is_realtime() && self.pending.lock().set.has(signo);
-        let mut published = false;
-        if !already_pending {
-            let mut prepared = Some(prepare(sig)?);
-            let outcome = {
-                let actions = self.proc.actions.lock();
-                let blocked = self.signal_blocked(signo);
-                let ignored = match &actions[signo].disposition {
-                    SignalDisposition::Ignore => true,
-                    SignalDisposition::Default => {
-                        matches!(signo.default_action(), DefaultSignalAction::Ignore)
-                    }
-                    SignalDisposition::Handler(_) => false,
-                };
-                if ignored && !blocked && !self.signal_real_blocked(signo) {
-                    None
-                } else {
-                    let mut pending = self.pending.lock();
-                    Some(pending.publish(prepared.take().unwrap()))
+    /// Sends directly to an exited group leader's retained private endpoint.
+    ///
+    /// Normal exact-thread sends accept only an active endpoint. Keeping this
+    /// operation separate prevents a stale task or pidfd `Arc` from publishing
+    /// after ordinary thread retirement while preserving Linux's unreaped
+    /// group-leader pending queue.
+    #[must_use = "the caller must handle queue-admission failure"]
+    pub fn try_send_retained_signal_with<E>(
+        &self,
+        sig: SignalInfo,
+        prepare: impl FnOnce(SignalInfo) -> Result<PreparedSignal, E>,
+    ) -> Result<ThreadSignalSendOutcome, E> {
+        self.try_send_signal_for_endpoint(EndpointSendMode::Retained, sig, prepare)
+    }
+
+    fn try_send_signal_for_endpoint<E>(
+        &self,
+        mode: EndpointSendMode,
+        sig: SignalInfo,
+        prepare: impl FnOnce(SignalInfo) -> Result<PreparedSignal, E>,
+    ) -> Result<ThreadSignalSendOutcome, E> {
+        let signo = sig.signo();
+        let inactive = || ThreadSignalSendOutcome {
+            published: false,
+            wake: false,
+        };
+
+        // Fast preflight avoids queue allocation for an inactive, ignored, or
+        // already-coalesced endpoint. Exit retirement takes the same lifecycle
+        // gate through state change and drain.
+        {
+            let mut generation_detached = DetachedSignal::empty();
+            let generation = ProcessSignalManager::has_generation_effect(signo)
+                .then(|| self.proc.action_update.lock());
+            let mut lifecycle = self.lifecycle.lock();
+            if !mode.accepts(*lifecycle) {
+                return Ok(inactive());
+            }
+            if generation.is_some() {
+                // Registration retirement takes action_update before this
+                // endpoint gate, allowing the queue walk to run without any
+                // outer spin guard while preserving exact endpoint state.
+                drop(lifecycle);
+                self.proc
+                    .apply_generation_effect_locked(signo, &mut generation_detached);
+                lifecycle = self.lifecycle.lock();
+                if !mode.accepts(*lifecycle) {
+                    return Ok(inactive());
                 }
+            }
+            let actions = self.proc.actions.lock();
+            let blocked = self.signal_blocked(signo);
+            let ignored = match &actions[signo].disposition {
+                SignalDisposition::Ignore => true,
+                SignalDisposition::Default => {
+                    matches!(signo.default_action(), DefaultSignalAction::Ignore)
+                }
+                SignalDisposition::Handler(_) => false,
             };
-            // Drop a node made obsolete by a disposition transition only
-            // after releasing every signal-state spin guard.
-            drop(prepared);
-            let Some(outcome) = outcome else {
+            if ignored && !blocked && !self.signal_real_blocked(signo) {
+                return Ok(inactive());
+            }
+            if !signo.is_realtime() && self.pending.lock().set.has(signo) {
+                self.possibly_has_signal.store(true, Ordering::Release);
                 return Ok(ThreadSignalSendOutcome {
                     published: false,
-                    wake: false,
+                    wake: !blocked,
                 });
-            };
-            published = outcome.finish();
+            }
         }
-        self.possibly_has_signal.store(true, Ordering::Release);
+
+        // Preparation is deliberately outside every spin guard. Retirement
+        // may win here; the commit-side lifecycle recheck then rejects and
+        // releases the prepared queue charge without publication.
+        let mut prepared = Some(prepare(sig)?);
+        let mut generation_detached = DetachedSignal::empty();
+        let generation = ProcessSignalManager::has_generation_effect(signo)
+            .then(|| self.proc.action_update.lock());
+        let mut lifecycle = self.lifecycle.lock();
+        if !mode.accepts(*lifecycle) {
+            drop(lifecycle);
+            drop(generation);
+            drop(prepared);
+            drop(generation_detached);
+            return Ok(inactive());
+        }
+        if generation.is_some() {
+            drop(lifecycle);
+            self.proc
+                .apply_generation_effect_locked(signo, &mut generation_detached);
+            lifecycle = self.lifecycle.lock();
+            if !mode.accepts(*lifecycle) {
+                drop(lifecycle);
+                drop(generation);
+                drop(prepared);
+                drop(generation_detached);
+                return Ok(inactive());
+            }
+        }
+        let actions = self.proc.actions.lock();
+        let blocked = self.signal_blocked(signo);
+        let ignored = match &actions[signo].disposition {
+            SignalDisposition::Ignore => true,
+            SignalDisposition::Default => {
+                matches!(signo.default_action(), DefaultSignalAction::Ignore)
+            }
+            SignalDisposition::Handler(_) => false,
+        };
+        let ignored = ignored && !blocked && !self.signal_real_blocked(signo);
+        let outcome = if ignored {
+            None
+        } else {
+            let mut pending = self.pending.lock();
+            if !signo.is_realtime() && pending.set.has(signo) {
+                None
+            } else {
+                Some(pending.publish(prepared.take().unwrap()))
+            }
+        };
+        drop(actions);
+        drop(lifecycle);
+        drop(generation);
+        // Drop a node made obsolete by retirement, disposition transition, or
+        // standard-signal coalescing only after every signal-state guard.
+        drop(prepared);
+        drop(generation_detached);
+        let published = outcome.is_some_and(|outcome| outcome.finish());
+        if !ignored {
+            self.possibly_has_signal.store(true, Ordering::Release);
+        }
         Ok(ThreadSignalSendOutcome {
             published,
-            wake: !blocked,
+            wake: !ignored && !blocked,
         })
     }
 

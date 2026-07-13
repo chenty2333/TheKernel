@@ -25,7 +25,7 @@ use spin::{Once, RwLock};
 use starry_process::{Pid, ProcessError};
 use starry_signal::{
     SignalInfo, SignalQueueAccount, Signo,
-    api::{ProcessSignalManager, SignalActions},
+    api::{ProcessSignalManager, SignalActions, ThreadSignalManager},
 };
 use thekernel_linux_cred::{
     USER_NAMESPACE_OVERFLOW_ID, UserNamespaceDomain, UserNamespaceMapState,
@@ -133,32 +133,66 @@ use crate::{
     time::wall_time,
 };
 
-/// Linux process identity bound to the immutable group-leader credential
-/// retained in the durable zombie payload.
-pub(crate) type Process = starry_process::Process<Arc<Cred>>;
+/// Immutable registration token for the private signal endpoint currently
+/// owning Linux thread-group-leader identity.
+#[derive(Clone)]
+pub(crate) struct GroupLeaderSignalIdentity {
+    registration_tid: Pid,
+    manager: Arc<ThreadSignalManager>,
+}
+
+impl GroupLeaderSignalIdentity {
+    fn new(registration_tid: Pid, manager: Arc<ThreadSignalManager>) -> Self {
+        Self {
+            registration_tid,
+            manager,
+        }
+    }
+
+    fn same_endpoint(&self, other: &Self) -> bool {
+        self.registration_tid == other.registration_tid
+            && Arc::ptr_eq(&self.manager, &other.manager)
+    }
+}
+
+/// Shared owner moved through exec handoff and retained in the durable zombie
+/// payload. Successful reap takes the sole endpoint from this slot even when a
+/// pidfd or wait event still owns the surrounding snapshot.
+pub(crate) type GroupLeaderSignalOwner = Arc<SpinNoIrq<Option<GroupLeaderSignalIdentity>>>;
+
+/// Linux process identity bound to immutable exit credential and signal-owner
+/// provenance retained in the durable zombie payload.
+pub(crate) type Process = starry_process::Process<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Linux process-group identity in the kernel-owned process domain.
-pub(crate) type ProcessGroup = starry_process::ProcessGroup<Arc<Cred>>;
+pub(crate) type ProcessGroup = starry_process::ProcessGroup<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Linux session identity in the kernel-owned process domain.
-pub(crate) type Session = starry_process::Session<Arc<Cred>>;
+pub(crate) type Session = starry_process::Session<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Durable process-exit payload used by wait, procfs, and permission paths.
-pub(crate) type ZombieSnapshot = starry_process::ZombieSnapshot<Arc<Cred>>;
+pub(crate) type ZombieSnapshot = starry_process::ZombieSnapshot<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Fallibly reserved storage consumed by the final process exit.
-pub(crate) type PreparedZombieSnapshot = starry_process::PreparedZombieSnapshot<Arc<Cred>>;
+pub(crate) type PreparedZombieSnapshot =
+    starry_process::PreparedZombieSnapshot<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Prepared payload bound to a validated final-exit transaction.
-pub(crate) type PreparedZombieExit = starry_process::PreparedZombieExit<Arc<Cred>>;
+pub(crate) type PreparedZombieExit =
+    starry_process::PreparedZombieExit<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Fully validated final process-exit transaction.
-pub(crate) type ProcessExitAdmission = starry_process::ProcessExitAdmission<Arc<Cred>>;
+pub(crate) type ProcessExitAdmission =
+    starry_process::ProcessExitAdmission<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Completed final-exit transaction with its linearized parent and reaper.
-pub(crate) type CommittedProcessExit = starry_process::CommittedProcessExit<Arc<Cred>>;
+pub(crate) type CommittedProcessExit =
+    starry_process::CommittedProcessExit<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Authoritative bounded process child-to-reaper handoff from the core.
-pub(crate) type ProcessReparentBatch = starry_process::ProcessReparentBatch<Arc<Cred>>;
+pub(crate) type ProcessReparentBatch =
+    starry_process::ProcessReparentBatch<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Domain-coordinated thread removal and optional final-exit reservation.
-pub(crate) type ThreadExitTransition = starry_process::ThreadExitTransition<Arc<Cred>>;
+pub(crate) type ThreadExitTransition =
+    starry_process::ThreadExitTransition<Arc<Cred>, GroupLeaderSignalOwner>;
 /// Type-bound unpublished process plus initial-thread publication transaction.
-pub(crate) type InitialProcessAdmission = starry_process::InitialProcessAdmission<Arc<Cred>>;
+pub(crate) type InitialProcessAdmission =
+    starry_process::InitialProcessAdmission<Arc<Cred>, GroupLeaderSignalOwner>;
 /// The kernel's sole process lifecycle and topology owner.
-pub(crate) type ProcessDomain = starry_process::ProcessDomain<Arc<Cred>>;
-type StarryThreadAdmission = starry_process::ThreadAdmission<Arc<Cred>>;
+pub(crate) type ProcessDomain = starry_process::ProcessDomain<Arc<Cred>, GroupLeaderSignalOwner>;
+type StarryThreadAdmission = starry_process::ThreadAdmission<Arc<Cred>, GroupLeaderSignalOwner>;
 
 static PROCESS_DOMAIN: Once<ProcessDomain> = Once::new();
 
@@ -170,6 +204,45 @@ pub(crate) fn init_process_domain() -> AxResult<&'static ProcessDomain> {
 /// Returns the process domain after boot initialization.
 pub(crate) fn process_domain() -> AxResult<&'static ProcessDomain> {
     PROCESS_DOMAIN.get().ok_or(AxError::BadState)
+}
+
+/// Reaps one zombie and releases its private/shared signal queues exactly once.
+///
+/// The core deliberately retains caller payloads after registry unlink because
+/// pidfds and wait events may still own snapshot Arcs. The shared owner slot is
+/// therefore taken only after a successful core reap and before any manager or
+/// queue ownership is destroyed.
+pub(crate) fn reap_process(process: &Process) -> AxResult<bool> {
+    let snapshot = process.zombie_payload();
+    let reaped = process_domain()?.reap(process).map_err(process_error)?;
+    if !reaped {
+        return Ok(false);
+    }
+
+    let snapshot = snapshot.ok_or(AxError::BadState)?;
+    retire_group_leader_signal_owner(&snapshot.reap_owner);
+    Ok(true)
+}
+
+/// Releases the endpoint and both private/shared pending queues retained by a
+/// durable zombie payload. Taking the slot first makes duplicate release a
+/// no-op and ensures an independently retained snapshot Arc cannot prolong
+/// signal-queue accounting after the process has been reaped.
+fn retire_group_leader_signal_owner(owner: &GroupLeaderSignalOwner) -> bool {
+    let leader = owner.lock().take();
+    if let Some(leader) = leader {
+        leader
+            .manager
+            .retire_registration(leader.registration_tid, false);
+        // Keep cleanup explicit even if a corrupted/stale registry entry made
+        // exact retirement a no-op. The endpoint lifecycle normally guarantees
+        // this second drain is empty.
+        leader.manager.flush_pending();
+        leader.manager.process().retire_pending();
+        true
+    } else {
+        false
+    }
 }
 
 pub(crate) const UTS_FIELD_LEN: usize = 64;
@@ -1003,17 +1076,19 @@ impl MempolicyState {
     }
 }
 
-/// Persistent binding to the task-local publication slot that currently owns
-/// Linux thread-group-leader identity.
-struct GroupLeaderCredentialBinding {
+/// Persistent binding to the credential slot and private signal endpoint that
+/// currently own Linux thread-group-leader identity.
+struct GroupLeaderIdentityBinding {
     current: SpinNoIrq<Arc<CredentialSlot>>,
+    signal: GroupLeaderSignalOwner,
 }
 
-impl GroupLeaderCredentialBinding {
-    fn new(initial: Arc<CredentialSlot>) -> Self {
-        Self {
+impl GroupLeaderIdentityBinding {
+    fn try_new(initial: Arc<CredentialSlot>) -> AxResult<Self> {
+        Ok(Self {
             current: SpinNoIrq::new(initial),
-        }
+            signal: Arc::try_new(SpinNoIrq::new(None)).map_err(|_| AxError::NoMemory)?,
+        })
     }
 
     fn current_cred(&self) -> Arc<Cred> {
@@ -1021,22 +1096,70 @@ impl GroupLeaderCredentialBinding {
         slot.current()
     }
 
+    fn bind_initial_signal(
+        &self,
+        registration_tid: Pid,
+        signal: Arc<ThreadSignalManager>,
+    ) -> AxResult<()> {
+        let mut current = self.signal.lock();
+        if current.is_some() {
+            return Err(AxError::BadState);
+        }
+        *current = Some(GroupLeaderSignalIdentity::new(registration_tid, signal));
+        Ok(())
+    }
+
+    fn current_cred_and_signal(&self) -> AxResult<(Arc<Cred>, Arc<ThreadSignalManager>)> {
+        let current = self.current.lock();
+        let signal_guard = self.signal.lock();
+        let slot = current.clone();
+        let signal = signal_guard
+            .as_ref()
+            .map(|identity| identity.manager.clone())
+            .ok_or(AxError::BadState)?;
+        drop(signal_guard);
+        drop(current);
+        Ok((slot.current(), signal))
+    }
+
+    fn signal_matches(&self, expected: &Arc<ThreadSignalManager>) -> bool {
+        self.signal
+            .lock()
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.manager, expected))
+    }
+
+    fn signal_owner(&self) -> GroupLeaderSignalOwner {
+        self.signal.clone()
+    }
+
     fn publish_handoff<'a>(
         &self,
         credential: Arc<CredentialSlot>,
+        signal: Option<GroupLeaderSignalIdentity>,
         prepared: Option<PreparedCred<'a>>,
     ) -> GroupLeaderCommit<'a> {
         let mut current = self.current.lock();
+        let mut current_signal = signal.as_ref().map(|_| self.signal.lock());
         #[cfg(test)]
         let group_lock_probe = PostCommitLockProbe::new(PostCommitLockKind::GroupLeader);
         let publication = prepared.map(PreparedCred::publish);
         let retired = core::mem::replace(&mut *current, credential);
+        let retired_signal = match (current_signal.as_mut(), signal) {
+            (Some(current), Some(signal)) => match current.as_ref() {
+                Some(existing) if existing.same_endpoint(&signal) => None,
+                _ => core::mem::replace(&mut **current, Some(signal)),
+            },
+            _ => None,
+        };
+        drop(current_signal);
         drop(current);
         #[cfg(test)]
         drop(group_lock_probe);
         GroupLeaderCommit {
             publication,
             retired_slot: retired,
+            retired_signal,
         }
     }
 }
@@ -1194,7 +1317,7 @@ fn snapshot_credential_image<A: Clone>(
 
 fn snapshot_group_credential_image<A: Clone>(
     image_binding: &RwLock<ProcessImageBinding<A>>,
-    group_leader: &GroupLeaderCredentialBinding,
+    group_leader: &GroupLeaderIdentityBinding,
 ) -> (
     Arc<Cred>,
     Dumpability,
@@ -1286,8 +1409,9 @@ fn ptrace_inactive_image_snapshot_if_session<A: Clone>(
 
 fn replace_process_image_with_group_handoff<'a, A>(
     image_binding: &RwLock<ProcessImageBinding<A>>,
-    group_leader: &GroupLeaderCredentialBinding,
+    group_leader: &GroupLeaderIdentityBinding,
     credential: Arc<CredentialSlot>,
+    signal: Option<GroupLeaderSignalIdentity>,
     prepared: Option<PreparedCred<'a>>,
     new_image: ProcessImageBinding<A>,
     finish_image_publication: impl FnOnce(),
@@ -1295,7 +1419,7 @@ fn replace_process_image_with_group_handoff<'a, A>(
     let mut image = image_binding.write();
     #[cfg(test)]
     let image_lock_probe = PostCommitLockProbe::new(PostCommitLockKind::ProcessImage);
-    let group_leader = group_leader.publish_handoff(credential, prepared);
+    let group_leader = group_leader.publish_handoff(credential, signal, prepared);
     let retired_image = core::mem::replace(&mut *image, new_image);
     finish_image_publication();
     drop(image);
@@ -1471,13 +1595,14 @@ pub struct ProcessData {
     /// The only allocation needed to publish this process's durable zombie
     /// payload. It is reserved before the process becomes visible.
     prepared_zombie_snapshot: SpinNoIrq<Option<PreparedZombieSnapshot>>,
-    /// Stable identity of the Linux thread-group leader credential owner.
+    /// Stable identity of the Linux thread-group leader.
     ///
-    /// This is a strong reference to the leader task's sole publication slot,
-    /// not a copied credential or process-level shadow state. It deliberately
-    /// outlives an exited leader task while sibling threads keep the process
-    /// alive, matching Linux's persistent thread-group identity.
-    group_leader_credential: GroupLeaderCredentialBinding,
+    /// These are strong references to the leader task's sole credential slot
+    /// and private signal endpoint, not copied process-level shadow state.
+    /// They deliberately outlive an exited leader task while sibling threads
+    /// keep the process alive, matching Linux's persistent PID identity,
+    /// queued-signal accounting, and exec handoff behavior.
+    group_leader_identity: GroupLeaderIdentityBinding,
     /// The executable path
     pub exe_path: RwLock<String>,
     /// The inode currently held busy as this process image.
@@ -1615,6 +1740,7 @@ fn ptrace_lifecycle_first_key(left: usize, right: usize) -> bool {
 struct GroupLeaderCommit<'a> {
     publication: Option<super::creds::CredentialPublication<'a>>,
     retired_slot: Arc<CredentialSlot>,
+    retired_signal: Option<GroupLeaderSignalIdentity>,
 }
 
 impl GroupLeaderCommit<'_> {
@@ -1622,6 +1748,7 @@ impl GroupLeaderCommit<'_> {
         let Self {
             publication,
             retired_slot,
+            retired_signal,
         } = self;
         let credential = publication.map(|publication| {
             let (new, retirement) = publication.complete_post_commit();
@@ -1630,9 +1757,18 @@ impl GroupLeaderCommit<'_> {
             drop(new);
             retirement
         });
+        if let Some(retired) = retired_signal.as_ref() {
+            // A nonleader exec replaces Linux's old group-leader task. Disable
+            // exact publication and drain its private queue before retaining
+            // the Arc for the caller's post-switch destruction boundary.
+            retired
+                .manager
+                .retire_registration(retired.registration_tid, false);
+        }
         GroupLeaderRetirement {
             _credential: credential,
             _slot: retired_slot,
+            _signal: retired_signal,
         }
     }
 }
@@ -1641,6 +1777,7 @@ impl GroupLeaderCommit<'_> {
 struct GroupLeaderRetirement {
     _credential: Option<super::creds::CredentialRetirement>,
     _slot: Arc<CredentialSlot>,
+    _signal: Option<GroupLeaderSignalIdentity>,
 }
 
 /// An exec image/credential publication returned only after image,
@@ -1853,11 +1990,12 @@ impl ProcessData {
         let futex_table = Arc::try_new(FutexTable::new()).map_err(|_| AxError::NoMemory)?;
         let stop_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let vfork_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
+        let group_leader_identity = GroupLeaderIdentityBinding::try_new(group_leader_credential)?;
         let data = Self {
             proc,
             process_lifecycle: Mutex::new(()),
             prepared_zombie_snapshot: SpinNoIrq::new(Some(prepared_zombie_snapshot)),
-            group_leader_credential: GroupLeaderCredentialBinding::new(group_leader_credential),
+            group_leader_identity,
             exe_path: RwLock::new(exe_path),
             executable: SpinNoIrq::new(executable),
             cmdline: RwLock::new(cmdline),
@@ -1945,14 +2083,47 @@ impl ProcessData {
     /// thread-group leader slot. This remains available after a premature
     /// leader exit and changes only during a successful non-leader exec.
     pub(crate) fn group_leader_cred(&self) -> Arc<Cred> {
-        self.group_leader_credential.current_cred()
+        self.group_leader_identity.current_cred()
+    }
+
+    /// Binds the initial leader's private signal queue before process
+    /// publication. Later non-leader exec replaces it atomically with the
+    /// credential-owner handoff.
+    pub(crate) fn bind_initial_group_leader_signal(
+        &self,
+        registration_tid: Pid,
+        signal: Arc<ThreadSignalManager>,
+    ) -> AxResult<()> {
+        self.group_leader_identity
+            .bind_initial_signal(registration_tid, signal)
+    }
+
+    /// Freezes the persistent leader credential and private pending queue as
+    /// one identity snapshot for an exited-leader signal operation.
+    pub(crate) fn group_leader_signal_identity(
+        &self,
+    ) -> AxResult<(Arc<Cred>, Arc<ThreadSignalManager>)> {
+        self.group_leader_identity.current_cred_and_signal()
+    }
+
+    pub(crate) fn group_leader_signal_identity_matches(
+        &self,
+        expected: &Arc<ThreadSignalManager>,
+    ) -> bool {
+        self.group_leader_identity.signal_matches(expected)
+    }
+
+    /// Returns the preallocated shared owner published into this process's
+    /// eventual zombie snapshot.
+    pub(crate) fn group_leader_signal_owner(&self) -> GroupLeaderSignalOwner {
+        self.group_leader_identity.signal_owner()
     }
 
     /// Takes process-directed identity, dumpability, and image through one
     /// coherent snapshot of the persistent group-leader binding.
     pub(crate) fn group_leader_image_access_snapshot(&self) -> ProcessImageAccessSnapshot {
         let (credential, dumpability, owner_user_ns, aspace, access_state) =
-            snapshot_group_credential_image(&self.image_binding, &self.group_leader_credential);
+            snapshot_group_credential_image(&self.image_binding, &self.group_leader_identity);
         ProcessImageAccessSnapshot {
             credential,
             dumpability,
@@ -2077,8 +2248,12 @@ impl ProcessData {
         let prepared = prepared.into_prepared();
         let (group_leader, retired_image) = replace_process_image_with_group_handoff(
             &self.image_binding,
-            &self.group_leader_credential,
+            &self.group_leader_identity,
             credential,
+            Some(GroupLeaderSignalIdentity::new(
+                thread.kernel_tid(),
+                thread.signal.clone(),
+            )),
             Some(prepared),
             ProcessImageBinding {
                 aspace: new_aspace,
@@ -3277,17 +3452,22 @@ mod tests {
     use axerrno::AxError;
     use axsync::spin::SpinNoIrq;
     use linux_raw_sys::general::CAP_CHOWN;
+    use starry_signal::{
+        PreparedSignal, SignalInfo, SignalQueueAccount, Signo,
+        api::{ProcessSignalManager, SignalActions, ThreadSignalManager},
+    };
 
     use super::{
-        CgroupNamespace, Dumpability, GroupLeaderCredentialBinding, Mempolicy, MempolicyRange,
-        MempolicySnapshot, MempolicyState, NetworkNamespace, PTRACE_REVERSE_LINK_HARD_LIMIT,
-        PidNamespace, PreparedPtraceReverseLink, ProcessAccessState, ProcessImageBinding,
-        PtraceReverseLinkDrain, PtraceReverseLinkNode, PtraceReverseLinks,
-        SIGNAL_QUEUE_GLOBAL_HARD_LIMIT, SIGNAL_QUEUE_PER_USER_HARD_LIMIT, TimeNamespace,
-        UserNamespace, UtsNamespace, coredump_image_snapshot, group_exit_handoff_requires_kill,
-        init_uts_state, ptrace_image_snapshot_if_owned, ptrace_image_snapshot_if_session,
-        ptrace_inactive_image_snapshot_if_session, ptrace_lifecycle_first_key,
-        replace_process_image_with_group_handoff, snapshot_credential_image,
+        CgroupNamespace, Dumpability, GroupLeaderIdentityBinding, GroupLeaderSignalIdentity,
+        Mempolicy, MempolicyRange, MempolicySnapshot, MempolicyState, NetworkNamespace,
+        PTRACE_REVERSE_LINK_HARD_LIMIT, PidNamespace, PreparedPtraceReverseLink,
+        ProcessAccessState, ProcessImageBinding, PtraceReverseLinkDrain, PtraceReverseLinkNode,
+        PtraceReverseLinks, SIGNAL_QUEUE_GLOBAL_HARD_LIMIT, SIGNAL_QUEUE_PER_USER_HARD_LIMIT,
+        TimeNamespace, UserNamespace, UtsNamespace, coredump_image_snapshot,
+        group_exit_handoff_requires_kill, init_uts_state, ptrace_image_snapshot_if_owned,
+        ptrace_image_snapshot_if_session, ptrace_inactive_image_snapshot_if_session,
+        ptrace_lifecycle_first_key, replace_process_image_with_group_handoff,
+        retire_group_leader_signal_owner, snapshot_credential_image,
         snapshot_group_credential_image, try_increment_bounded,
     };
     use crate::task::{
@@ -3317,6 +3497,49 @@ mod tests {
             update.finish().unwrap().commit();
         }
         slot
+    }
+
+    fn thread_signal_manager() -> Arc<ThreadSignalManager> {
+        let actions = Arc::new(SpinNoIrq::new(SignalActions::default()));
+        let process = Arc::new(ProcessSignalManager::new(actions, 0));
+        ThreadSignalManager::try_new(process).unwrap()
+    }
+
+    fn registered_thread_signal_manager(
+        process: Arc<ProcessSignalManager>,
+        tid: u32,
+    ) -> Arc<ThreadSignalManager> {
+        let thread = ThreadSignalManager::try_new(process).unwrap();
+        thread.try_register(tid).unwrap().commit().unwrap();
+        thread
+    }
+
+    fn enqueue_accounted_signal(
+        thread: &ThreadSignalManager,
+        signo: Signo,
+        per_user: &Arc<SignalQueueAccount>,
+        global: &Arc<SignalQueueAccount>,
+    ) {
+        let outcome = thread
+            .try_send_signal_with(SignalInfo::new_user(signo, 0, 1), |info| {
+                PreparedSignal::try_accounted(info, per_user, u64::MAX, global)
+            })
+            .unwrap();
+        assert!(outcome.published);
+    }
+
+    fn enqueue_accounted_process_signal(
+        process: &ProcessSignalManager,
+        signo: Signo,
+        per_user: &Arc<SignalQueueAccount>,
+        global: &Arc<SignalQueueAccount>,
+    ) {
+        let outcome = process
+            .try_send_signal_with(SignalInfo::new_user(signo, 0, 1), |info| {
+                PreparedSignal::try_accounted(info, per_user, u64::MAX, global)
+            })
+            .unwrap();
+        assert!(outcome.published);
     }
 
     #[test]
@@ -3471,7 +3694,7 @@ mod tests {
             aspace: 7usize,
             access_state: state,
         });
-        let group = GroupLeaderCredentialBinding::new(leader);
+        let group = GroupLeaderIdentityBinding::try_new(leader).unwrap();
 
         let (exact_cred, exact_dumpability, exact_image, _) =
             snapshot_credential_image(&image, &exact);
@@ -3745,7 +3968,7 @@ mod tests {
         };
         let mempolicy = SpinNoIrq::new(mempolicy);
         let reset_under_image_lock = AtomicBool::new(false);
-        let group = Arc::new(GroupLeaderCredentialBinding::new(old_slot));
+        let group = Arc::new(GroupLeaderIdentityBinding::try_new(old_slot).unwrap());
         let old_seen = Arc::new(Barrier::new(2));
         let new_ready = Arc::new(Barrier::new(2));
         let reader = {
@@ -3784,6 +4007,7 @@ mod tests {
             &image,
             &group,
             new_slot.clone(),
+            None,
             Some(prepared),
             ProcessImageBinding {
                 aspace: 2,
@@ -3838,7 +4062,7 @@ mod tests {
     fn group_leader_binding_keeps_the_single_slot_alive() {
         let slot = credential_slot(1000);
         let weak = Arc::downgrade(&slot);
-        let binding = GroupLeaderCredentialBinding::new(slot.clone());
+        let binding = GroupLeaderIdentityBinding::try_new(slot.clone()).unwrap();
         drop(slot);
 
         assert_eq!(binding.current_cred().ids().ruid, kuid(1000));
@@ -3848,12 +4072,146 @@ mod tests {
     }
 
     #[test]
+    fn group_leader_binding_handoffs_private_signal_identity_with_credential() {
+        let old_slot = credential_slot(1000);
+        let new_slot = credential_slot(2000);
+        let old_signal = thread_signal_manager();
+        let new_signal = thread_signal_manager();
+        let old_signal_weak = Arc::downgrade(&old_signal);
+        let binding = GroupLeaderIdentityBinding::try_new(old_slot).unwrap();
+
+        binding.bind_initial_signal(9, old_signal.clone()).unwrap();
+        assert!(binding.bind_initial_signal(10, new_signal.clone()).is_err());
+        let (credential, signal) = binding.current_cred_and_signal().unwrap();
+        assert_eq!(credential.ids().ruid, kuid(1000));
+        assert!(Arc::ptr_eq(&signal, &old_signal));
+        drop((credential, signal, old_signal));
+
+        let commit = binding.publish_handoff(
+            new_slot,
+            Some(GroupLeaderSignalIdentity::new(10, new_signal.clone())),
+            None,
+        );
+        let (credential, signal) = binding.current_cred_and_signal().unwrap();
+        assert_eq!(credential.ids().ruid, kuid(2000));
+        assert!(Arc::ptr_eq(&signal, &new_signal));
+        assert!(old_signal_weak.upgrade().is_some());
+        drop((credential, signal));
+
+        let retirement = commit.complete_post_commit();
+        assert!(old_signal_weak.upgrade().is_some());
+        drop(retirement);
+        assert!(old_signal_weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn group_leader_successful_reap_releases_private_and_shared_signal_charges_once() {
+        let actions = Arc::new(SpinNoIrq::new(SignalActions::default()));
+        let process = Arc::new(ProcessSignalManager::new(actions, 0));
+        let leader = registered_thread_signal_manager(process.clone(), 9);
+        let per_user = SignalQueueAccount::try_new(4).unwrap();
+        let global = SignalQueueAccount::try_new(4).unwrap();
+
+        enqueue_accounted_signal(&leader, Signo::SIGRTMIN, &per_user, &global);
+        enqueue_accounted_process_signal(&process, Signo::SIGRTMIN, &per_user, &global);
+        assert_eq!((per_user.queued(), global.queued()), (2, 2));
+
+        // Final exit preserves both queues through zombie lifetime.
+        leader.retire_registration(9, true);
+        process.retain_pending_only();
+        assert_eq!((per_user.queued(), global.queued()), (2, 2));
+
+        let owner = Arc::new(SpinNoIrq::new(Some(GroupLeaderSignalIdentity::new(
+            9,
+            leader.clone(),
+        ))));
+        let retained_snapshot_owner = owner.clone();
+        assert!(retire_group_leader_signal_owner(&owner));
+        assert_eq!((per_user.queued(), global.queued()), (0, 0));
+        assert!(retained_snapshot_owner.lock().is_none());
+        assert!(!retire_group_leader_signal_owner(&retained_snapshot_owner));
+        assert_eq!((per_user.queued(), global.queued()), (0, 0));
+    }
+
+    #[test]
+    fn group_leader_exec_replacement_retires_old_but_preserves_same_endpoint() {
+        let actions = Arc::new(SpinNoIrq::new(SignalActions::default()));
+        let process = Arc::new(ProcessSignalManager::new(actions, 0));
+        let old_signal = registered_thread_signal_manager(process.clone(), 9);
+        let new_signal = registered_thread_signal_manager(process, 10);
+        let old_slot = credential_slot(1000);
+        let new_slot = credential_slot(2000);
+        let binding = GroupLeaderIdentityBinding::try_new(old_slot).unwrap();
+        binding.bind_initial_signal(9, old_signal.clone()).unwrap();
+        let old_user = SignalQueueAccount::try_new(2).unwrap();
+        let old_global = SignalQueueAccount::try_new(2).unwrap();
+        enqueue_accounted_signal(&old_signal, Signo::SIGRTMIN, &old_user, &old_global);
+
+        let replacement = binding.publish_handoff(
+            new_slot.clone(),
+            Some(GroupLeaderSignalIdentity::new(10, new_signal.clone())),
+            None,
+        );
+        assert_eq!(old_user.queued(), 1);
+        drop(replacement.complete_post_commit());
+        assert_eq!((old_user.queued(), old_global.queued()), (0, 0));
+
+        let new_user = SignalQueueAccount::try_new(2).unwrap();
+        let new_global = SignalQueueAccount::try_new(2).unwrap();
+        enqueue_accounted_signal(&new_signal, Signo::SIGRTMIN, &new_user, &new_global);
+        let same_endpoint = binding.publish_handoff(
+            new_slot,
+            Some(GroupLeaderSignalIdentity::new(10, new_signal.clone())),
+            None,
+        );
+        drop(same_endpoint.complete_post_commit());
+        assert_eq!((new_user.queued(), new_global.queued()), (1, 1));
+        new_signal.retire_registration(10, false);
+        assert_eq!((new_user.queued(), new_global.queued()), (0, 0));
+    }
+
+    #[test]
+    fn group_leader_repeated_exec_handoffs_retire_each_registration_tid() {
+        let actions = Arc::new(SpinNoIrq::new(SignalActions::default()));
+        let process = Arc::new(ProcessSignalManager::new(actions, 0));
+        let first = registered_thread_signal_manager(process.clone(), 9);
+        let second = registered_thread_signal_manager(process.clone(), 10);
+        let third = registered_thread_signal_manager(process, 11);
+        let binding = GroupLeaderIdentityBinding::try_new(credential_slot(1000)).unwrap();
+        binding.bind_initial_signal(9, first.clone()).unwrap();
+
+        drop(
+            binding
+                .publish_handoff(
+                    credential_slot(2000),
+                    Some(GroupLeaderSignalIdentity::new(10, second.clone())),
+                    None,
+                )
+                .complete_post_commit(),
+        );
+        drop(
+            binding
+                .publish_handoff(
+                    credential_slot(3000),
+                    Some(GroupLeaderSignalIdentity::new(11, third.clone())),
+                    None,
+                )
+                .complete_post_commit(),
+        );
+
+        assert!(!first.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 0, 1)));
+        assert!(!second.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 0, 1)));
+        assert!(third.send_unqueued_signal(SignalInfo::new_user(Signo::SIGTERM, 0, 1)));
+        third.retire_registration(11, false);
+    }
+
+    #[test]
     fn group_leader_handoff_never_exposes_the_unprepared_slot() {
         const READS: usize = 20_000;
 
         let old = credential_slot(1000);
         let new = credential_slot(2000);
-        let binding = Arc::new(GroupLeaderCredentialBinding::new(old));
+        let binding = Arc::new(GroupLeaderIdentityBinding::try_new(old).unwrap());
         let start = Arc::new(Barrier::new(2));
         let reader = {
             let binding = binding.clone();
@@ -3877,7 +4235,7 @@ mod tests {
         update.builder.ids.fsuid = kuid(3000);
         let prepared = update.finish().unwrap();
         start.wait();
-        let commit = binding.publish_handoff(new.clone(), Some(prepared));
+        let commit = binding.publish_handoff(new.clone(), None, Some(prepared));
         assert_eq!(binding.current_cred().ids().ruid, kuid(3000));
         let retirement = commit.complete_post_commit();
         drop(retirement);

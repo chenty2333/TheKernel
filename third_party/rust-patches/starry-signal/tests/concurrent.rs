@@ -11,7 +11,8 @@ use std::{
 use axcpu::uspace::UserContext;
 use starry_signal::{
     PreparedSignal, SignalAction, SignalDisposition, SignalInfo, SignalOSAction,
-    SignalQueueAccount, SignalQueueError, SignalSet, Signo, api::SignalFrame,
+    SignalQueueAccount, SignalQueueError, SignalSet, Signo,
+    api::{SignalFrame, ThreadSignalManager},
 };
 
 mod common;
@@ -239,15 +240,134 @@ fn ignore_transition_linearizes_with_prepared_realtime_publication() {
 }
 
 #[test]
+fn ordinary_retirement_rejects_a_prepared_private_realtime_commit() {
+    let (_process, signal) = new_test_env();
+    let user = SignalQueueAccount::try_new(1).unwrap();
+    let global = SignalQueueAccount::try_new(1).unwrap();
+    let prepared = Arc::new(Barrier::new(2));
+    let publish = Arc::new(Barrier::new(2));
+
+    let sender = {
+        let signal = signal.clone();
+        let user = user.clone();
+        let global = global.clone();
+        let prepared_barrier = prepared.clone();
+        let publish_barrier = publish.clone();
+        thread::spawn(move || {
+            signal
+                .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1), |info| {
+                    let signal = PreparedSignal::try_accounted(info, &user, 1, &global)?;
+                    prepared_barrier.wait();
+                    publish_barrier.wait();
+                    Ok::<_, SignalQueueError>(signal)
+                })
+                .unwrap()
+        })
+    };
+
+    prepared.wait();
+    signal.retire_registration(TID, false);
+    publish.wait();
+
+    let outcome = sender.join().unwrap();
+    assert!(!outcome.published);
+    assert!(!outcome.wake);
+    assert!(!signal.pending().has(Signo::SIGRTMIN));
+    assert_eq!(user.queued(), 0);
+    assert_eq!(global.queued(), 0);
+}
+
+#[test]
+fn retained_retirement_rejects_a_prepared_private_realtime_commit() {
+    let (_process, signal) = new_test_env();
+    signal.retire_registration(TID, true);
+    let user = SignalQueueAccount::try_new(1).unwrap();
+    let global = SignalQueueAccount::try_new(1).unwrap();
+    let prepared = Arc::new(Barrier::new(2));
+    let publish = Arc::new(Barrier::new(2));
+
+    let sender = {
+        let signal = signal.clone();
+        let user = user.clone();
+        let global = global.clone();
+        let prepared_barrier = prepared.clone();
+        let publish_barrier = publish.clone();
+        thread::spawn(move || {
+            signal
+                .try_send_retained_signal_with(
+                    SignalInfo::new_user(Signo::SIGRTMIN, 1, 1),
+                    |info| {
+                        let signal = PreparedSignal::try_accounted(info, &user, 1, &global)?;
+                        prepared_barrier.wait();
+                        publish_barrier.wait();
+                        Ok::<_, SignalQueueError>(signal)
+                    },
+                )
+                .unwrap()
+        })
+    };
+
+    prepared.wait();
+    signal.retire_registration(TID, false);
+    publish.wait();
+
+    let outcome = sender.join().unwrap();
+    assert!(!outcome.published);
+    assert!(!outcome.wake);
+    assert!(!signal.pending().has(Signo::SIGRTMIN));
+    assert_eq!(user.queued(), 0);
+    assert_eq!(global.queued(), 0);
+}
+
+#[test]
+fn final_process_retention_rejects_a_prepared_shared_realtime_commit() {
+    let (process, _signal) = new_test_env();
+    let user = SignalQueueAccount::try_new(1).unwrap();
+    let global = SignalQueueAccount::try_new(1).unwrap();
+    let prepared = Arc::new(Barrier::new(2));
+    let publish = Arc::new(Barrier::new(2));
+
+    let sender = {
+        let process = process.clone();
+        let user = user.clone();
+        let global = global.clone();
+        let prepared_barrier = prepared.clone();
+        let publish_barrier = publish.clone();
+        thread::spawn(move || {
+            process
+                .try_send_signal_with(SignalInfo::new_user(Signo::SIGRTMIN, 1, 1), |info| {
+                    let signal = PreparedSignal::try_accounted(info, &user, 1, &global)?;
+                    prepared_barrier.wait();
+                    publish_barrier.wait();
+                    Ok::<_, SignalQueueError>(signal)
+                })
+                .unwrap()
+        })
+    };
+
+    prepared.wait();
+    process.retain_pending_only();
+    publish.wait();
+
+    let outcome = sender.join().unwrap();
+    assert!(!outcome.published);
+    assert_eq!(outcome.wake_tid, None);
+    assert!(!process.pending().has(Signo::SIGRTMIN));
+    assert_eq!(user.queued(), 0);
+    assert_eq!(global.queued(), 0);
+}
+
+#[test]
 fn action_update_does_not_fail_under_registration_churn() {
-    let (process, signal) = new_test_env();
+    let (process, _signal) = new_test_env();
     let running = Arc::new(AtomicBool::new(true));
     let churn = {
-        let signal = signal.clone();
+        let process = process.clone();
         let running = running.clone();
         thread::spawn(move || {
             let mut tid = 100;
             while running.load(Ordering::Acquire) {
+                let signal = ThreadSignalManager::try_new(process.clone()).unwrap();
                 if let Ok(registration) = signal.try_register(tid) {
                     drop(registration);
                 }
@@ -283,7 +403,7 @@ fn registration_commit_linearizes_with_ignored_action_flush() {
             let start = start.clone();
             thread::spawn(move || {
                 start.wait();
-                registration.commit();
+                registration.commit().unwrap();
                 committed_tx.send(()).unwrap();
             })
         };

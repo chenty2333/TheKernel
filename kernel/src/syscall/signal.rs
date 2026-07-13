@@ -4,7 +4,7 @@ use core::{future::poll_fn, task::Poll};
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::uspace::UserContext;
 use axtask::{
-    current,
+    AxTaskRef, current,
     future::{self, block_on},
 };
 use linux_raw_sys::general::{
@@ -13,18 +13,22 @@ use linux_raw_sys::general::{
 };
 use starry_process::Pid;
 use starry_signal::{
-    RawSignalAction, SignalAction, SignalInfo, SignalSet, SignalStack, Signo, api::SignalFrame,
+    RawSignalAction, SignalAction, SignalInfo, SignalSet, SignalStack, Signo,
+    api::{SignalFrame, ThreadSignalManager},
 };
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     task::{
-        AsThread, ProcessData, acknowledge_posix_timer_signal, check_current_process_signal_access,
-        check_current_signal_access, check_signals, force_signal_current_thread, get_process_data,
-        get_process_group, get_process_including_zombie, get_visible_task, process_domain,
-        process_error, send_queued_signal_to_process_data, send_queued_signal_to_visible_thread,
-        send_signal_to_process, send_signal_to_process_data, send_signal_to_visible_thread,
-        signal_credential_allows, try_processes,
+        AsThread, Cred, Process, ProcessData, SignalDeliveryScope, SignalNumber,
+        SignalSecurityOperation, SignalSecuritySource, SignalTargetKind,
+        acknowledge_posix_timer_signal, check_current_pinned_process_identity_signal_access,
+        check_current_pinned_process_signal_access, check_current_pinned_thread_signal_access,
+        check_current_zombie_signal_access, check_signals, force_signal_current_thread,
+        generate_signal_for_exited_leader, get_process_data, get_process_group,
+        get_process_including_zombie, get_visible_task, process_domain, process_error,
+        send_authorized_signal_thread_inner, send_queued_signal_to_process_data_with_credential,
+        send_signal_to_process_data_with_credential,
     },
     time::TimeValueLike,
 };
@@ -153,131 +157,796 @@ pub(crate) fn queued_signal_required(signal: &Option<SignalInfo>) -> bool {
         .is_some_and(|info| info.signo().is_realtime() && info.code() != SI_USER as i32)
 }
 
-fn check_signal_permission(pid: Pid, signal: Option<Signo>) -> AxResult<()> {
-    let target = get_process_data(pid)?;
-    check_current_process_signal_access(&target, signal)
+pub(crate) fn signal_operation(
+    signal: Option<Signo>,
+    source: SignalSecuritySource,
+    delivery_scope: SignalDeliveryScope,
+) -> AxResult<SignalSecurityOperation> {
+    let signal = signal
+        .map(|signal| SignalNumber::try_new(signal as u32).ok_or(AxError::InvalidInput))
+        .transpose()?;
+    Ok(SignalSecurityOperation::from_optional_signal(
+        signal,
+        source,
+        delivery_scope,
+    ))
 }
 
-fn check_zombie_signal_permission(pid: Pid, signal: Option<Signo>) -> AxResult<bool> {
-    let process = get_process_including_zombie(pid)?;
-    if !process.is_zombie() {
+struct AuthorizedProcessSignalTarget {
+    process: Arc<ProcessData>,
+    credential: Arc<Cred>,
+    selection: AuthorizedProcessSelection,
+}
+
+enum AuthorizedProcessSelection {
+    NamedTask {
+        task: AxTaskRef,
+        expected_visible_tid: Pid,
+    },
+    StableLeader {
+        signal: Arc<ThreadSignalManager>,
+    },
+}
+
+const PROCESS_SIGNAL_HANDOFF_RETRIES: usize = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthorizedProcessSignalDelivery {
+    Complete,
+    RetryHandoff,
+    NamedTaskGone,
+    DeliveryFailed(AxError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessSignalPostHook {
+    CompleteProbe,
+    Deliver,
+    RetryHandoff,
+    NamedTaskGone,
+}
+
+const fn process_signal_post_hook(
+    has_signal: bool,
+    named_task_valid: Option<bool>,
+    leader_matches: bool,
+) -> ProcessSignalPostHook {
+    if !has_signal {
+        ProcessSignalPostHook::CompleteProbe
+    } else if let Some(valid) = named_task_valid {
+        if valid {
+            ProcessSignalPostHook::Deliver
+        } else {
+            ProcessSignalPostHook::NamedTaskGone
+        }
+    } else if leader_matches {
+        ProcessSignalPostHook::Deliver
+    } else {
+        ProcessSignalPostHook::RetryHandoff
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SignalTargetAuthorizationError {
+    MissingTarget,
+    Failed(AxError),
+}
+
+impl SignalTargetAuthorizationError {
+    const fn into_ax_error(self) -> AxError {
+        match self {
+            Self::MissingTarget => AxError::NoSuchProcess,
+            Self::Failed(error) => error,
+        }
+    }
+}
+
+fn authorize_process_signal_target(
+    pid: Pid,
+    operation: SignalSecurityOperation,
+) -> Result<AuthorizedProcessSignalTarget, SignalTargetAuthorizationError> {
+    if pid == 0 {
+        return Err(SignalTargetAuthorizationError::MissingTarget);
+    }
+    match get_visible_task(pid) {
+        Ok(task) => {
+            let thread = task
+                .try_as_thread()
+                .ok_or(SignalTargetAuthorizationError::Failed(
+                    AxError::NoSuchProcess,
+                ))?;
+            let process = thread.proc_data.clone();
+            let (credential, selection) = if pid != process.proc.pid() {
+                let credential = thread.current_cred();
+                check_current_pinned_thread_signal_access(
+                    thread,
+                    &task,
+                    &credential,
+                    pid,
+                    SignalTargetKind::ProcessTask,
+                    operation,
+                )
+                .map_err(SignalTargetAuthorizationError::Failed)?;
+                (
+                    credential,
+                    AuthorizedProcessSelection::NamedTask {
+                        task,
+                        expected_visible_tid: pid,
+                    },
+                )
+            } else {
+                let (credential, signal) = process
+                    .group_leader_signal_identity()
+                    .map_err(SignalTargetAuthorizationError::Failed)?;
+                check_current_pinned_process_signal_access(
+                    &process,
+                    &credential,
+                    SignalTargetKind::Process,
+                    operation,
+                )
+                .map_err(SignalTargetAuthorizationError::Failed)?;
+                (
+                    credential,
+                    AuthorizedProcessSelection::StableLeader { signal },
+                )
+            };
+            Ok(AuthorizedProcessSignalTarget {
+                process,
+                credential,
+                selection,
+            })
+        }
+        Err(AxError::NoSuchProcess) => {
+            let process = get_process_data(pid).map_err(|error| {
+                if error == AxError::NoSuchProcess {
+                    SignalTargetAuthorizationError::MissingTarget
+                } else {
+                    SignalTargetAuthorizationError::Failed(error)
+                }
+            })?;
+            let (credential, leader_signal) = process
+                .group_leader_signal_identity()
+                .map_err(SignalTargetAuthorizationError::Failed)?;
+            check_current_pinned_process_signal_access(
+                &process,
+                &credential,
+                SignalTargetKind::Process,
+                operation,
+            )
+            .map_err(SignalTargetAuthorizationError::Failed)?;
+            Ok(AuthorizedProcessSignalTarget {
+                process,
+                credential,
+                selection: AuthorizedProcessSelection::StableLeader {
+                    signal: leader_signal,
+                },
+            })
+        }
+        Err(error) => Err(SignalTargetAuthorizationError::Failed(error)),
+    }
+}
+
+fn send_signal_to_authorized_process(
+    target: &AuthorizedProcessSignalTarget,
+    signal: Option<SignalInfo>,
+    queue_required: bool,
+) -> AuthorizedProcessSignalDelivery {
+    let Some(signal) = signal else {
+        debug_assert_eq!(
+            process_signal_post_hook(false, None, false),
+            ProcessSignalPostHook::CompleteProbe
+        );
+        return AuthorizedProcessSignalDelivery::Complete;
+    };
+    let lifecycle = target.process.lock_process_lifecycle();
+    let post_hook = match &target.selection {
+        AuthorizedProcessSelection::NamedTask {
+            task,
+            expected_visible_tid,
+        } => {
+            let thread = task.as_thread();
+            let valid = thread.tid() == *expected_visible_tid
+                && Arc::ptr_eq(&thread.proc_data, &target.process)
+                && !thread.exit.load(core::sync::atomic::Ordering::Acquire)
+                && target
+                    .process
+                    .proc
+                    .thread_ids()
+                    .any(|tid| tid == thread.kernel_tid());
+            process_signal_post_hook(true, Some(valid), true)
+        }
+        AuthorizedProcessSelection::StableLeader { signal } => process_signal_post_hook(
+            true,
+            None,
+            target.process.group_leader_signal_identity_matches(signal),
+        ),
+    };
+    match post_hook {
+        ProcessSignalPostHook::CompleteProbe => {
+            drop(lifecycle);
+            return AuthorizedProcessSignalDelivery::Complete;
+        }
+        ProcessSignalPostHook::RetryHandoff => {
+            drop(lifecycle);
+            return AuthorizedProcessSignalDelivery::RetryHandoff;
+        }
+        ProcessSignalPostHook::NamedTaskGone => {
+            drop(lifecycle);
+            return AuthorizedProcessSignalDelivery::NamedTaskGone;
+        }
+        ProcessSignalPostHook::Deliver => {}
+    }
+    let result = if queue_required {
+        send_queued_signal_to_process_data_with_credential(
+            &target.process,
+            &target.credential,
+            Some(signal),
+        )
+        .map(|_| ())
+    } else {
+        send_signal_to_process_data_with_credential(
+            &target.process,
+            &target.credential,
+            Some(signal),
+        )
+    };
+    drop(lifecycle);
+    match result {
+        Ok(()) => AuthorizedProcessSignalDelivery::Complete,
+        Err(error) => AuthorizedProcessSignalDelivery::DeliveryFailed(error),
+    }
+}
+
+fn check_zombie_process_signal_permission(
+    process: &Arc<Process>,
+    operation: SignalSecurityOperation,
+) -> AxResult<bool> {
+    if !process.is_zombie() || !exact_process_is_published(process)? {
         return Ok(false);
     }
 
-    let actor = current();
-    let actor_thread = actor.as_thread();
-    let actor_proc = &actor_thread.proc_data;
-    let actor_cred = actor_thread.current_cred();
     let snapshot = process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
-    let allowed = signal_credential_allows(&actor_cred, &snapshot.credential)
-        || (signal == Some(Signo::SIGCONT)
-            && actor_proc.proc.group().session().sid() == process.group().session().sid());
-    if allowed {
-        Ok(true)
-    } else {
-        Err(AxError::OperationNotPermitted)
+    check_current_zombie_signal_access(&process, &snapshot.credential, operation)?;
+    Ok(true)
+}
+
+fn zombie_signal_succeeds(pid: Pid, operation: SignalSecurityOperation) -> AxResult<bool> {
+    let process = get_process_including_zombie(pid)?;
+    check_zombie_process_signal_permission(&process, operation)
+}
+
+const fn exited_leader_identity_matches(tgid: Option<Pid>, tid: Pid, process_pid: Pid) -> bool {
+    if tid != process_pid {
+        return false;
+    }
+    match tgid {
+        Some(tgid) => tgid == process_pid,
+        None => true,
     }
 }
 
-fn zombie_signal_succeeds(pid: Pid, signal: Option<Signo>) -> AxResult<bool> {
-    check_zombie_signal_permission(pid, signal)
+struct AuthorizedExitedLeaderSignalTarget {
+    _process: Arc<Process>,
+    runtime: Option<Arc<ProcessData>>,
+    leader_signal: Option<Arc<ThreadSignalManager>>,
+    credential: Arc<Cred>,
+}
+
+fn authorize_exited_leader_signal_target(
+    tgid: Option<Pid>,
+    tid: Pid,
+    operation: SignalSecurityOperation,
+) -> AxResult<Option<AuthorizedExitedLeaderSignalTarget>> {
+    let process = get_process_including_zombie(tid)?;
+    if !exited_leader_identity_matches(tgid, tid, process.pid())
+        || !exact_process_is_published(&process)?
+    {
+        return Ok(None);
+    }
+    let (runtime, leader_signal, credential) = if process.is_zombie() {
+        (
+            None,
+            None,
+            process
+                .zombie_payload()
+                .map(|snapshot| snapshot.credential.clone())
+                .ok_or(AxError::NoSuchProcess)?,
+        )
+    } else {
+        match get_process_data(process.pid()) {
+            Ok(process_data) if Arc::ptr_eq(&process_data.proc, &process) => {
+                let (credential, leader_signal) = process_data.group_leader_signal_identity()?;
+                (Some(process_data), Some(leader_signal), credential)
+            }
+            Ok(_) => return Err(AxError::NoSuchProcess),
+            Err(AxError::NoSuchProcess) if process.is_zombie() => (
+                None,
+                None,
+                process
+                    .zombie_payload()
+                    .map(|snapshot| snapshot.credential.clone())
+                    .ok_or(AxError::NoSuchProcess)?,
+            ),
+            Err(error) => return Err(error),
+        }
+    };
+    if !exact_process_is_published(&process)? {
+        return Ok(None);
+    }
+    check_current_pinned_process_identity_signal_access(
+        &process,
+        &credential,
+        SignalTargetKind::ExitedLeader,
+        operation,
+    )?;
+    Ok(Some(AuthorizedExitedLeaderSignalTarget {
+        _process: process,
+        runtime,
+        leader_signal,
+        credential,
+    }))
 }
 
 fn signal_signo(signal: &Option<SignalInfo>) -> Option<Signo> {
     signal.as_ref().map(SignalInfo::signo)
 }
 
-fn send_user_signal_to_targets(
-    targets: impl IntoIterator<Item = Arc<ProcessData>>,
-    signal: Option<SignalInfo>,
+enum GroupSignalTarget {
+    Live(AuthorizedProcessSignalTarget),
+    Zombie {
+        process: Arc<Process>,
+        credential: Arc<Cred>,
+    },
+}
+
+fn exact_process_is_published(process: &Arc<Process>) -> AxResult<bool> {
+    Ok(process_domain()?
+        .registry()
+        .get(process.pid())
+        .is_some_and(|published| Arc::ptr_eq(&published, process)))
+}
+
+fn reduce_process_signal_delivery_result(
+    result: AxResult<()>,
+    exact_zombie_is_published: bool,
+    named_nonleader: bool,
 ) -> AxResult<()> {
-    let signo = signal_signo(&signal);
-    let mut had_target = false;
-    let mut had_permission = false;
-    let mut delivered = false;
-    let mut first_error = None;
-
-    for target in targets {
-        had_target = true;
-        if check_current_process_signal_access(&target, signo).is_err() {
-            continue;
-        }
-        had_permission = true;
-        match send_signal_to_process_data(&target, signal.clone()) {
-            Ok(()) => delivered = true,
-            Err(err) if first_error.is_none() => first_error = Some(err),
-            Err(_) => {}
-        }
-    }
-
-    if delivered || (signal.is_none() && had_permission) {
-        Ok(())
-    } else if !had_target {
-        Err(AxError::NoSuchProcess)
-    } else if !had_permission {
-        Err(AxError::OperationNotPermitted)
-    } else {
-        Err(first_error.unwrap_or(AxError::NoSuchProcess))
+    match result {
+        // Linux retries process-directed sends across final exit. Treat the
+        // signal as delivered while the same unreaped zombie still owns the
+        // numeric TGID, but never after reap, pid reuse, or when the original
+        // numeric name was a nonleader TID whose private pid identity died.
+        Err(AxError::NoSuchProcess) if exact_zombie_is_published && !named_nonleader => Ok(()),
+        result => result,
     }
 }
 
-fn check_visible_thread_signal_access(
-    tgid: Option<Pid>,
-    tid: Pid,
-    signal: Option<Signo>,
+fn complete_process_signal_delivery(
+    process: &Arc<Process>,
+    result: AxResult<()>,
+    named_nonleader: bool,
 ) -> AxResult<()> {
-    let task = get_visible_task(tid)?;
-    let thread = task.try_as_thread().ok_or(AxError::OperationNotPermitted)?;
-    if tgid.is_some_and(|tgid| thread.proc_data.proc.pid() != tgid) {
+    let exact_zombie_is_published = if !named_nonleader
+        && matches!(&result, Err(AxError::NoSuchProcess))
+        && process.is_zombie()
+    {
+        exact_process_is_published(process)?
+    } else {
+        false
+    };
+    reduce_process_signal_delivery_result(result, exact_zombie_is_published, named_nonleader)
+}
+
+fn send_signal_to_exact_process_with_attempts(
+    process: Arc<Process>,
+    signal: Option<SignalInfo>,
+    operation: SignalSecurityOperation,
+    queue_required: bool,
+    attempts: usize,
+) -> AxResult<()> {
+    debug_assert!(attempts != 0);
+    for attempt in 0..attempts {
+        match resolve_group_signal_target(process.clone())? {
+            GroupSignalTarget::Live(target) => {
+                if !exact_process_is_published(&target.process.proc)? {
+                    return Err(AxError::NoSuchProcess);
+                }
+                check_current_pinned_process_signal_access(
+                    &target.process,
+                    &target.credential,
+                    SignalTargetKind::Process,
+                    operation,
+                )?;
+                match send_signal_to_authorized_process(&target, signal.clone(), queue_required) {
+                    AuthorizedProcessSignalDelivery::Complete => return Ok(()),
+                    AuthorizedProcessSignalDelivery::RetryHandoff if attempt + 1 < attempts => {
+                        continue;
+                    }
+                    AuthorizedProcessSignalDelivery::RetryHandoff
+                    | AuthorizedProcessSignalDelivery::NamedTaskGone => {
+                        return Err(AxError::NoSuchProcess);
+                    }
+                    AuthorizedProcessSignalDelivery::DeliveryFailed(error) => {
+                        return complete_process_signal_delivery(&process, Err(error), false);
+                    }
+                }
+            }
+            GroupSignalTarget::Zombie {
+                process,
+                credential,
+            } => {
+                if !exact_process_is_published(&process)? {
+                    return Err(AxError::NoSuchProcess);
+                }
+                check_current_zombie_signal_access(&process, &credential, operation)?;
+                return Ok(());
+            }
+        }
+    }
+    Err(AxError::NoSuchProcess)
+}
+
+fn complete_initial_process_signal(
+    target: AuthorizedProcessSignalTarget,
+    signal: Option<SignalInfo>,
+    operation: SignalSecurityOperation,
+    queue_required: bool,
+) -> AxResult<()> {
+    let process = target.process.proc.clone();
+    let named_nonleader = matches!(
+        &target.selection,
+        AuthorizedProcessSelection::NamedTask { .. }
+    );
+    match send_signal_to_authorized_process(&target, signal.clone(), queue_required) {
+        AuthorizedProcessSignalDelivery::Complete => Ok(()),
+        AuthorizedProcessSignalDelivery::RetryHandoff => {
+            send_signal_to_exact_process_with_attempts(
+                process,
+                signal,
+                operation,
+                queue_required,
+                PROCESS_SIGNAL_HANDOFF_RETRIES,
+            )
+        }
+        AuthorizedProcessSignalDelivery::NamedTaskGone => Err(AxError::NoSuchProcess),
+        AuthorizedProcessSignalDelivery::DeliveryFailed(error) => {
+            complete_process_signal_delivery(&process, Err(error), named_nonleader)
+        }
+    }
+}
+
+fn resolve_group_signal_target(process: Arc<Process>) -> AxResult<GroupSignalTarget> {
+    if !exact_process_is_published(&process)? {
         return Err(AxError::NoSuchProcess);
     }
-    let target_cred = thread.current_cred();
-    check_current_signal_access(&thread.proc_data, &target_cred, signal)
+    if process.is_zombie() {
+        let snapshot = process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
+        return Ok(GroupSignalTarget::Zombie {
+            process,
+            credential: snapshot.credential.clone(),
+        });
+    }
+    let process_data = match get_process_data(process.pid()) {
+        Ok(process_data) if Arc::ptr_eq(&process_data.proc, &process) => process_data,
+        Ok(_) => return Err(AxError::NoSuchProcess),
+        Err(_error) if process.is_zombie() => {
+            let snapshot = process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
+            return Ok(GroupSignalTarget::Zombie {
+                process,
+                credential: snapshot.credential.clone(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let (credential, leader_signal) = process_data.group_leader_signal_identity()?;
+    Ok(GroupSignalTarget::Live(AuthorizedProcessSignalTarget {
+        process: process_data,
+        credential,
+        selection: AuthorizedProcessSelection::StableLeader {
+            signal: leader_signal,
+        },
+    }))
+}
+
+#[derive(Clone, Copy)]
+enum SignalTargetAggregation {
+    ProcessGroup,
+    Broadcast,
+}
+
+struct SignalTargetResultReducer {
+    aggregation: SignalTargetAggregation,
+    saw_target: bool,
+    any_success: bool,
+    last_error: AxError,
+    broadcast_result: Option<AxResult<()>>,
+}
+
+impl SignalTargetResultReducer {
+    const fn new(aggregation: SignalTargetAggregation) -> Self {
+        Self {
+            aggregation,
+            saw_target: false,
+            any_success: false,
+            last_error: AxError::NoSuchProcess,
+            broadcast_result: None,
+        }
+    }
+
+    fn record(&mut self, result: AxResult<()>) {
+        self.saw_target = true;
+        match result {
+            Ok(()) => {
+                self.any_success = true;
+                if matches!(self.aggregation, SignalTargetAggregation::Broadcast) {
+                    self.broadcast_result = Some(Ok(()));
+                }
+            }
+            Err(error) => {
+                self.last_error = error;
+                if matches!(self.aggregation, SignalTargetAggregation::Broadcast)
+                    && error != AxError::OperationNotPermitted
+                {
+                    self.broadcast_result = Some(Err(error));
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> AxResult<()> {
+        match self.aggregation {
+            SignalTargetAggregation::ProcessGroup => {
+                if self.any_success {
+                    Ok(())
+                } else {
+                    Err(self.last_error)
+                }
+            }
+            // Linux's historical kill(-1) reducer starts at success and lets
+            // every result except EPERM replace it. Thus an existing set of
+            // entirely forbidden targets still returns success.
+            SignalTargetAggregation::Broadcast => self.broadcast_result.unwrap_or_else(|| {
+                if self.saw_target {
+                    Ok(())
+                } else {
+                    Err(AxError::NoSuchProcess)
+                }
+            }),
+        }
+    }
+}
+
+fn send_user_signal_to_targets(
+    targets: impl IntoIterator<Item = Arc<Process>>,
+    signal: Option<SignalInfo>,
+    operation: SignalSecurityOperation,
+    aggregation: SignalTargetAggregation,
+) -> AxResult<()> {
+    let mut reducer = SignalTargetResultReducer::new(aggregation);
+
+    for process in targets {
+        // The Arc is this iteration's tasklist-style identity pin. Retry only
+        // the same process once when de-thread replaces its leader token; never
+        // redirect to a reused numeric PID or retry a security-hook failure.
+        let result = send_signal_to_exact_process_with_attempts(
+            process,
+            signal.clone(),
+            operation,
+            false,
+            PROCESS_SIGNAL_HANDOFF_RETRIES + 1,
+        );
+        reducer.record(result);
+    }
+
+    reducer.finish()
+}
+
+struct AuthorizedThreadSignalTarget {
+    task: AxTaskRef,
+    credential: Arc<Cred>,
+    visible_tid: Pid,
+}
+
+enum AuthorizedNumericThreadSignalTarget {
+    Live(AuthorizedThreadSignalTarget),
+    ExitedLeader(AuthorizedExitedLeaderSignalTarget),
+}
+
+fn authorize_visible_thread_signal_target(
+    tgid: Option<Pid>,
+    tid: Pid,
+    operation: SignalSecurityOperation,
+) -> Result<AuthorizedThreadSignalTarget, SignalTargetAuthorizationError> {
+    let task = get_visible_task(tid).map_err(|error| {
+        if error == AxError::NoSuchProcess {
+            SignalTargetAuthorizationError::MissingTarget
+        } else {
+            SignalTargetAuthorizationError::Failed(error)
+        }
+    })?;
+    let thread = task
+        .try_as_thread()
+        .ok_or(SignalTargetAuthorizationError::Failed(
+            AxError::OperationNotPermitted,
+        ))?;
+    if tgid.is_some_and(|tgid| thread.proc_data.proc.pid() != tgid) {
+        return Err(SignalTargetAuthorizationError::MissingTarget);
+    }
+    let credential = thread.current_cred();
+    check_current_pinned_thread_signal_access(
+        thread,
+        &task,
+        &credential,
+        tid,
+        SignalTargetKind::Thread,
+        operation,
+    )
+    .map_err(SignalTargetAuthorizationError::Failed)?;
+    Ok(AuthorizedThreadSignalTarget {
+        task,
+        credential,
+        visible_tid: tid,
+    })
+}
+
+fn authorize_numeric_thread_signal_target(
+    tgid: Option<Pid>,
+    tid: Pid,
+    operation: SignalSecurityOperation,
+) -> AxResult<AuthorizedNumericThreadSignalTarget> {
+    match authorize_visible_thread_signal_target(tgid, tid, operation) {
+        Ok(target) => Ok(AuthorizedNumericThreadSignalTarget::Live(target)),
+        Err(SignalTargetAuthorizationError::MissingTarget) => {
+            authorize_exited_leader_signal_target(tgid, tid, operation)?
+                .map(AuthorizedNumericThreadSignalTarget::ExitedLeader)
+                .ok_or(AxError::NoSuchProcess)
+        }
+        Err(error) => Err(error.into_ax_error()),
+    }
+}
+
+/// Publishes to the exact task object retained across authorization. Numeric
+/// TID lookup is deliberately absent here: a retired TID must not redirect an
+/// already-authorized request to a newly published task with the same number.
+pub(crate) fn send_signal_to_authorized_thread(
+    task: &AxTaskRef,
+    target_cred: &Cred,
+    expected_visible_tid: Pid,
+    signal: Option<SignalInfo>,
+    queue_required: bool,
+) -> AxResult<()> {
+    let thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+    let Some(signal) = signal else {
+        return Ok(());
+    };
+    let lifecycle = thread.proc_data.lock_process_lifecycle();
+    if thread.tid() != expected_visible_tid
+        || thread.exit.load(core::sync::atomic::Ordering::Acquire)
+        || !thread
+            .proc_data
+            .proc
+            .thread_ids()
+            .any(|tid| tid == thread.kernel_tid())
+    {
+        return Err(AxError::NoSuchProcess);
+    }
+    let result =
+        send_authorized_signal_thread_inner(task, thread, target_cred, signal, queue_required)
+            .map(|_| ());
+    drop(lifecycle);
+    result
+}
+
+fn send_signal_to_authorized_numeric_thread(
+    target: AuthorizedNumericThreadSignalTarget,
+    signal: Option<SignalInfo>,
+    queue_required: bool,
+) -> AxResult<()> {
+    match target {
+        AuthorizedNumericThreadSignalTarget::Live(target) => {
+            complete_specific_thread_signal(send_signal_to_authorized_thread(
+                &target.task,
+                &target.credential,
+                target.visible_tid,
+                signal,
+                queue_required,
+            ))
+        }
+        AuthorizedNumericThreadSignalTarget::ExitedLeader(target) => {
+            match (target.runtime, target.leader_signal) {
+                (Some(runtime), Some(leader_signal)) => {
+                    let lifecycle = runtime.lock_process_lifecycle();
+                    if !runtime.group_leader_signal_identity_matches(&leader_signal) {
+                        drop(lifecycle);
+                        return Ok(());
+                    }
+                    let result = generate_signal_for_exited_leader(
+                        &runtime,
+                        &leader_signal,
+                        &target.credential,
+                        signal,
+                        queue_required,
+                    );
+                    drop(lifecycle);
+                    result
+                }
+                (None, None) => Ok(()),
+                _ => Err(AxError::BadState),
+            }
+        }
+    }
+}
+
+fn complete_specific_thread_signal(result: AxResult<()>) -> AxResult<()> {
+    match result {
+        // Linux's do_send_specific() treats a task which disappears after
+        // authorization as having died just after receiving its private
+        // signal. pidfd_send_signal does not use this reducer.
+        Err(AxError::NoSuchProcess) => Ok(()),
+        result => result,
+    }
 }
 
 pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
     debug!("sys_kill: pid = {pid}, signo = {signo}");
     let sig = make_siginfo(signo, SI_USER as _)?;
     let permission_signal = signal_signo(&sig);
+    let operation = signal_operation(
+        permission_signal,
+        SignalSecuritySource::Kill,
+        SignalDeliveryScope::ThreadGroup,
+    )?;
 
     match pid {
         1.. => {
-            let target = pid as Pid;
-            match check_signal_permission(target, permission_signal) {
-                Ok(()) => match send_signal_to_process(target, sig) {
-                    Ok(()) => {}
-                    Err(AxError::NoSuchProcess)
-                        if zombie_signal_succeeds(target, permission_signal)? => {}
-                    Err(err) => return Err(err),
-                },
-                Err(AxError::NoSuchProcess)
-                    if zombie_signal_succeeds(target, permission_signal)? => {}
-                Err(err) => return Err(err),
+            let pid = pid as Pid;
+            match authorize_process_signal_target(pid, operation) {
+                Ok(target) => {
+                    complete_initial_process_signal(target, sig, operation, false)?;
+                }
+                Err(SignalTargetAuthorizationError::MissingTarget)
+                    if zombie_signal_succeeds(pid, operation)? => {}
+                Err(error) => return Err(error.into_ax_error()),
             }
         }
         0 => {
-            let pgid = current().as_thread().proc_data.proc.group().pgid();
-            let targets = get_process_group(pgid)?
+            let group = current().as_thread().proc_data.proc.group();
+            let targets = group
                 .try_processes(process_domain()?.registry())
-                .map_err(process_error)?
-                .into_iter()
-                .filter_map(|process| get_process_data(process.pid()).ok());
-            send_user_signal_to_targets(targets, sig)?;
+                .map_err(process_error)?;
+            send_user_signal_to_targets(
+                targets,
+                sig,
+                operation,
+                SignalTargetAggregation::ProcessGroup,
+            )?;
         }
         -1 => {
-            let curr_pid = current().as_thread().proc_data.proc.pid();
-            let targets = try_processes()?
-                .into_iter()
-                .filter(|proc_data| !proc_data.proc.is_init() && proc_data.proc.pid() != curr_pid);
-            send_user_signal_to_targets(targets, sig)?;
-        }
-        ..-1 => {
-            let targets = get_process_group((-pid) as Pid)?
-                .try_processes(process_domain()?.registry())
+            let current_process = current().as_thread().proc_data.proc.clone();
+            let targets = process_domain()?
+                .registry()
+                .try_processes()
                 .map_err(process_error)?
                 .into_iter()
-                .filter_map(|process| get_process_data(process.pid()).ok());
-            send_user_signal_to_targets(targets, sig)?;
+                .filter(|process| !process.is_init() && !Arc::ptr_eq(process, &current_process));
+            send_user_signal_to_targets(
+                targets,
+                sig,
+                operation,
+                SignalTargetAggregation::Broadcast,
+            )?;
+        }
+        ..-1 => {
+            let pgid = pid.checked_neg().ok_or(AxError::NoSuchProcess)? as Pid;
+            let targets = get_process_group(pgid)?
+                .try_processes(process_domain()?.registry())
+                .map_err(process_error)?;
+            send_user_signal_to_targets(
+                targets,
+                sig,
+                operation,
+                SignalTargetAggregation::ProcessGroup,
+            )?;
         }
     }
     Ok(0)
@@ -288,8 +957,13 @@ pub fn sys_tkill(tid: i32, signo: u32) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
     let sig = make_siginfo(signo, SI_TKILL)?;
-    check_visible_thread_signal_access(None, tid as Pid, signal_signo(&sig))?;
-    send_queued_signal_to_visible_thread(None, tid as Pid, sig)?;
+    let operation = signal_operation(
+        signal_signo(&sig),
+        SignalSecuritySource::Thread,
+        SignalDeliveryScope::Thread,
+    )?;
+    let target = authorize_numeric_thread_signal_target(None, tid as Pid, operation)?;
+    send_signal_to_authorized_numeric_thread(target, sig, true)?;
     Ok(0)
 }
 
@@ -298,68 +972,60 @@ pub fn sys_tgkill(tgid: i32, tid: i32, signo: u32) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
     let sig = make_siginfo(signo, SI_TKILL)?;
-    check_visible_thread_signal_access(Some(tgid as Pid), tid as Pid, signal_signo(&sig))?;
-    send_queued_signal_to_visible_thread(Some(tgid as Pid), tid as Pid, sig)?;
+    let operation = signal_operation(
+        signal_signo(&sig),
+        SignalSecuritySource::Thread,
+        SignalDeliveryScope::Thread,
+    )?;
+    let target = authorize_numeric_thread_signal_target(Some(tgid as Pid), tid as Pid, operation)?;
+    send_signal_to_authorized_numeric_thread(target, sig, true)?;
     Ok(0)
 }
 
-pub(crate) fn make_queue_signal_info(
+struct QueuedSignalRequest {
+    signal: Option<SignalInfo>,
+    code: i32,
+}
+
+fn make_queue_signal_info(
     target_tid: Pid,
     signo: u32,
     sig: *const SignalInfo,
-) -> AxResult<Option<SignalInfo>> {
-    if signo == 0 {
-        return Ok(None);
-    }
-
-    let signo = parse_signo(signo)?;
+) -> AxResult<QueuedSignalRequest> {
     let mut sig = unsafe { sig.vm_read_uninit()?.assume_init() };
-    sig.set_signo(signo);
-    let target_process_pid = get_visible_task(target_tid)
-        .ok()
-        .and_then(|task| {
-            task.try_as_thread()
-                .map(|thread| thread.proc_data.proc.pid())
-        })
-        .unwrap_or(target_tid);
-    if (sig.code() >= 0 || sig.code() == SI_TKILL)
-        && current_visible_tid() != target_tid
-        && current().as_thread().proc_data.proc.pid() != target_process_pid
-    {
+    let signo = (signo != 0).then(|| parse_signo(signo)).transpose()?;
+    if (sig.code() >= 0 || sig.code() == SI_TKILL) && current_visible_tid() != target_tid {
         return Err(AxError::OperationNotPermitted);
     }
-    Ok(Some(sig))
+    let code = sig.code();
+    if let Some(signo) = signo {
+        sig.set_signo(signo);
+        Ok(QueuedSignalRequest {
+            signal: Some(sig),
+            code,
+        })
+    } else {
+        Ok(QueuedSignalRequest { signal: None, code })
+    }
 }
 
 pub fn sys_rt_sigqueueinfo(pid: Pid, signo: u32, sig: *const SignalInfo) -> AxResult<isize> {
-    let sig = make_queue_signal_info(pid, signo, sig)?;
-    let permission_signal = signal_signo(&sig);
+    let request = make_queue_signal_info(pid, signo, sig)?;
+    let permission_signal = signal_signo(&request.signal);
+    let operation = signal_operation(
+        permission_signal,
+        SignalSecuritySource::Queued { code: request.code },
+        SignalDeliveryScope::ThreadGroup,
+    )?;
+    let sig = request.signal;
     let queue_required = queued_signal_required(&sig);
-    if let Ok(task) = get_visible_task(pid) {
-        let thread = task.try_as_thread().ok_or(AxError::OperationNotPermitted)?;
-        let target_cred = thread.current_cred();
-        check_current_signal_access(&thread.proc_data, &target_cred, permission_signal)?;
-        if thread.proc_data.proc.pid() == pid {
-            if queue_required {
-                send_queued_signal_to_process_data(&thread.proc_data, sig)?;
-            } else {
-                send_signal_to_process_data(&thread.proc_data, sig)?;
-            }
-        } else {
-            if queue_required {
-                send_queued_signal_to_visible_thread(None, pid, sig)?;
-            } else {
-                send_signal_to_visible_thread(None, pid, sig)?;
-            }
+    match authorize_process_signal_target(pid, operation) {
+        Ok(target) => {
+            complete_initial_process_signal(target, sig, operation, queue_required)?;
         }
-    } else {
-        let target = get_process_data(pid)?;
-        check_current_process_signal_access(&target, permission_signal)?;
-        if queue_required {
-            send_queued_signal_to_process_data(&target, sig)?;
-        } else {
-            send_signal_to_process_data(&target, sig)?;
-        }
+        Err(SignalTargetAuthorizationError::MissingTarget)
+            if zombie_signal_succeeds(pid, operation)? => {}
+        Err(error) => return Err(error.into_ax_error()),
     }
     Ok(0)
 }
@@ -374,13 +1040,16 @@ pub fn sys_rt_tgsigqueueinfo(
         return Err(AxError::InvalidInput);
     }
 
-    let sig = make_queue_signal_info(tid as Pid, signo, sig)?;
-    check_visible_thread_signal_access(Some(tgid as Pid), tid as Pid, signal_signo(&sig))?;
-    if queued_signal_required(&sig) {
-        send_queued_signal_to_visible_thread(Some(tgid as Pid), tid as Pid, sig)?;
-    } else {
-        send_signal_to_visible_thread(Some(tgid as Pid), tid as Pid, sig)?;
-    }
+    let request = make_queue_signal_info(tid as Pid, signo, sig)?;
+    let operation = signal_operation(
+        signal_signo(&request.signal),
+        SignalSecuritySource::Queued { code: request.code },
+        SignalDeliveryScope::Thread,
+    )?;
+    let sig = request.signal;
+    let queue_required = queued_signal_required(&sig);
+    let target = authorize_numeric_thread_signal_target(Some(tgid as Pid), tid as Pid, operation)?;
+    send_signal_to_authorized_numeric_thread(target, sig, queue_required)?;
     Ok(0)
 }
 
@@ -624,7 +1293,23 @@ mod tests {
     use linux_raw_sys::general::{MINSIGSTKSZ, SI_TKILL, SI_USER, SS_DISABLE, SS_ONSTACK};
     use starry_signal::{SignalInfo, SignalStack, Signo};
 
-    use super::{parse_signo, prepare_sigaltstack_update, queued_signal_required};
+    use super::{
+        ProcessSignalPostHook, SignalTargetAggregation, SignalTargetAuthorizationError,
+        SignalTargetResultReducer, complete_specific_thread_signal, exited_leader_identity_matches,
+        parse_signo, prepare_sigaltstack_update, process_signal_post_hook, queued_signal_required,
+        reduce_process_signal_delivery_result,
+    };
+
+    fn reduce_target_results(
+        aggregation: SignalTargetAggregation,
+        results: impl IntoIterator<Item = Result<(), AxError>>,
+    ) -> Result<(), AxError> {
+        let mut reducer = SignalTargetResultReducer::new(aggregation);
+        for result in results {
+            reducer.record(result);
+        }
+        reducer.finish()
+    }
 
     #[test]
     fn signal_numbers_are_range_checked_before_narrowing() {
@@ -654,6 +1339,150 @@ mod tests {
             SI_TKILL,
             1,
         ))));
+    }
+
+    #[test]
+    fn process_group_signal_reducer_keeps_the_first_success_sticky() {
+        assert_eq!(
+            reduce_target_results(
+                SignalTargetAggregation::ProcessGroup,
+                [
+                    Err(AxError::OperationNotPermitted),
+                    Ok(()),
+                    Err(AxError::InvalidInput),
+                ],
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            reduce_target_results(
+                SignalTargetAggregation::ProcessGroup,
+                [
+                    Err(AxError::OperationNotPermitted),
+                    Err(AxError::InvalidInput),
+                ],
+            ),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            reduce_target_results(SignalTargetAggregation::ProcessGroup, core::iter::empty(),),
+            Err(AxError::NoSuchProcess)
+        );
+    }
+
+    #[test]
+    fn broadcast_signal_reducer_matches_linux_historical_eperm_rule() {
+        assert_eq!(
+            reduce_target_results(
+                SignalTargetAggregation::Broadcast,
+                [
+                    Err(AxError::OperationNotPermitted),
+                    Err(AxError::OperationNotPermitted),
+                ],
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            reduce_target_results(
+                SignalTargetAggregation::Broadcast,
+                [Ok(()), Err(AxError::InvalidInput)],
+            ),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            reduce_target_results(
+                SignalTargetAggregation::Broadcast,
+                [
+                    Err(AxError::InvalidInput),
+                    Err(AxError::OperationNotPermitted),
+                ],
+            ),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            reduce_target_results(SignalTargetAggregation::Broadcast, core::iter::empty(),),
+            Err(AxError::NoSuchProcess)
+        );
+    }
+
+    #[test]
+    fn specific_thread_signal_reducer_only_absorbs_post_authorization_esrch() {
+        assert_eq!(
+            complete_specific_thread_signal(Err(AxError::NoSuchProcess)),
+            Ok(())
+        );
+        assert_eq!(
+            complete_specific_thread_signal(Err(AxError::WouldBlock)),
+            Err(AxError::WouldBlock)
+        );
+        assert_eq!(complete_specific_thread_signal(Ok(())), Ok(()));
+    }
+
+    #[test]
+    fn process_signal_post_hook_distinguishes_probe_handoff_and_named_task_loss() {
+        assert_eq!(
+            process_signal_post_hook(false, None, false),
+            ProcessSignalPostHook::CompleteProbe
+        );
+        assert_eq!(
+            process_signal_post_hook(true, None, true),
+            ProcessSignalPostHook::Deliver
+        );
+        assert_eq!(
+            process_signal_post_hook(true, None, false),
+            ProcessSignalPostHook::RetryHandoff
+        );
+        assert_eq!(
+            process_signal_post_hook(true, Some(true), false),
+            ProcessSignalPostHook::Deliver
+        );
+        assert_eq!(
+            process_signal_post_hook(true, Some(false), true),
+            ProcessSignalPostHook::NamedTaskGone
+        );
+    }
+
+    #[test]
+    fn process_signal_esrch_only_completes_for_the_exact_published_zombie() {
+        assert_eq!(
+            reduce_process_signal_delivery_result(Err(AxError::NoSuchProcess), true, false),
+            Ok(())
+        );
+        assert_eq!(
+            reduce_process_signal_delivery_result(Err(AxError::NoSuchProcess), false, false),
+            Err(AxError::NoSuchProcess)
+        );
+        assert_eq!(
+            reduce_process_signal_delivery_result(Err(AxError::NoSuchProcess), true, true),
+            Err(AxError::NoSuchProcess)
+        );
+        assert_eq!(
+            reduce_process_signal_delivery_result(Err(AxError::WouldBlock), true, false),
+            Err(AxError::WouldBlock)
+        );
+        assert_eq!(
+            reduce_process_signal_delivery_result(Ok(()), false, false),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn exited_thread_fallback_only_names_the_retained_group_leader_identity() {
+        assert!(exited_leader_identity_matches(None, 41, 41));
+        assert!(exited_leader_identity_matches(Some(41), 41, 41));
+        assert!(!exited_leader_identity_matches(None, 42, 41));
+        assert!(!exited_leader_identity_matches(Some(40), 41, 41));
+    }
+
+    #[test]
+    fn policy_esrch_never_becomes_a_missing_target_fallback() {
+        let policy = SignalTargetAuthorizationError::Failed(AxError::NoSuchProcess);
+        assert_ne!(policy, SignalTargetAuthorizationError::MissingTarget);
+        assert_eq!(policy.into_ax_error(), AxError::NoSuchProcess);
+        assert_eq!(
+            SignalTargetAuthorizationError::MissingTarget.into_ax_error(),
+            AxError::NoSuchProcess
+        );
     }
 
     #[test]

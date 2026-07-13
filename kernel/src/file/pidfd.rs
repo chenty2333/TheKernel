@@ -9,10 +9,15 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet, Pollable};
+use axtask::{AxTaskRef, WeakAxTaskRef};
+use spin::Once;
+use starry_process::Pid;
 
 use crate::{
     file::{FileLike, Kstat, PseudoInode},
-    task::{Cred, CredentialSlot, Process, ProcessData, ProcessImageAccessSnapshot, Thread},
+    task::{
+        AsThread, Cred, CredentialSlot, Process, ProcessData, ProcessImageAccessSnapshot, Thread,
+    },
 };
 
 pub struct PidFd {
@@ -22,6 +27,8 @@ pub struct PidFd {
     exit_event: Arc<PollSet>,
     thread_exit: Option<Arc<AtomicBool>>,
     thread_credential: Option<Weak<CredentialSlot>>,
+    thread_task: Option<Once<WeakAxTaskRef>>,
+    thread_tid: Option<Pid>,
 
     non_blocking: AtomicBool,
 }
@@ -34,12 +41,17 @@ impl PidFd {
             exit_event: proc_data.exit_event.clone(),
             thread_exit: None,
             thread_credential: None,
+            thread_task: None,
+            thread_tid: None,
 
             non_blocking: AtomicBool::new(false),
         }
     }
 
-    pub fn new_thread(thread: &Thread) -> Self {
+    /// Builds a thread pidfd before its scheduler task is published. The clone
+    /// path binds the exact task with [`Self::bind_thread_task`] before the file
+    /// descriptor itself becomes visible.
+    pub(crate) fn new_thread_unbound(thread: &Thread) -> Self {
         Self {
             inode: PseudoInode::pidfd(),
             proc_data: Arc::downgrade(&thread.proc_data),
@@ -47,8 +59,52 @@ impl PidFd {
             exit_event: thread.exit_event.clone(),
             thread_exit: Some(thread.exit.clone()),
             thread_credential: Some(thread.credential_slot_weak()),
+            thread_task: Some(Once::new()),
+            thread_tid: Some(thread.tid()),
 
             non_blocking: AtomicBool::new(false),
+        }
+    }
+
+    /// Builds a thread pidfd for an already-existing exact task.
+    pub fn new_thread(task: &AxTaskRef) -> AxResult<Self> {
+        let pidfd = Self::new_thread_unbound(task.as_thread());
+        pidfd.bind_thread_task(task)?;
+        Ok(pidfd)
+    }
+
+    /// Binds the exact scheduler task named by a not-yet-published thread
+    /// pidfd. This is a one-shot construction operation, never a numeric-TID
+    /// lookup or a rebinding point.
+    pub(crate) fn bind_thread_task(&self, task: &AxTaskRef) -> AxResult<()> {
+        let binding = self
+            .thread_task
+            .as_ref()
+            .ok_or(AxError::OperationNotPermitted)?;
+        let thread = task.try_as_thread().ok_or(AxError::OperationNotPermitted)?;
+        let expected_exit = self
+            .thread_exit
+            .as_ref()
+            .ok_or(AxError::OperationNotPermitted)?;
+        let expected_tid = self.thread_tid.ok_or(AxError::OperationNotPermitted)?;
+        if !Arc::ptr_eq(&thread.exit, expected_exit)
+            || thread.tid() != expected_tid
+            || !self
+                .proc_data
+                .upgrade()
+                .is_some_and(|process| Arc::ptr_eq(&process, &thread.proc_data))
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+        binding.call_once(|| Arc::downgrade(task));
+        let bound = binding
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or(AxError::NoSuchProcess)?;
+        if Arc::ptr_eq(&bound, task) {
+            Ok(())
+        } else {
+            Err(AxError::OperationNotPermitted)
         }
     }
 
@@ -60,7 +116,72 @@ impl PidFd {
         {
             return Err(AxError::NoSuchProcess);
         }
-        self.proc_data.upgrade().ok_or(AxError::NoSuchProcess)
+        let process = self.proc_data.upgrade().ok_or(AxError::NoSuchProcess)?;
+        if self
+            .thread_exit
+            .as_ref()
+            .is_some_and(|exit| exit.load(Ordering::Acquire))
+        {
+            return Err(AxError::NoSuchProcess);
+        }
+        Ok(process)
+    }
+
+    /// Pins the exact task named by a thread pidfd across authorization and
+    /// publication. Process pidfds return `None`. Exit is sampled both before
+    /// and after the weak-task upgrade so an exit racing resolution fails
+    /// closed instead of falling back to a reused numeric TID.
+    pub(crate) fn signal_thread_task(&self) -> AxResult<Option<AxTaskRef>> {
+        let Some(binding) = &self.thread_task else {
+            return Ok(None);
+        };
+        let expected_tid = self.thread_tid.ok_or(AxError::OperationNotPermitted)?;
+        let exit = self
+            .thread_exit
+            .as_ref()
+            .ok_or(AxError::OperationNotPermitted)?;
+        if exit.load(Ordering::Acquire) {
+            return Err(AxError::NoSuchProcess);
+        }
+        let task = binding
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or(AxError::NoSuchProcess)?;
+        let thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+        if !Arc::ptr_eq(&thread.exit, exit)
+            || thread.tid() != expected_tid
+            || exit.load(Ordering::Acquire)
+        {
+            return Err(AxError::NoSuchProcess);
+        }
+        Ok(Some(task))
+    }
+
+    /// Returns the stable PID identity captured by a thread pidfd.
+    pub(crate) const fn signal_thread_tid(&self) -> Option<Pid> {
+        self.thread_tid
+    }
+
+    /// Resolves the one exited thread identity Linux keeps signalable through
+    /// a thread pidfd: the thread-group leader. A nonleader disappears when
+    /// its exact task exits, while the leader's pid identity remains published
+    /// until the whole process is reaped.
+    pub(crate) fn signal_exited_leader_process(&self) -> AxResult<Option<Arc<Process>>> {
+        let Some(tid) = self.thread_tid else {
+            return Ok(None);
+        };
+        let exit = self
+            .thread_exit
+            .as_ref()
+            .ok_or(AxError::OperationNotPermitted)?;
+        if !exit.load(Ordering::Acquire) {
+            return Err(AxError::NoSuchProcess);
+        }
+        let process = self.process()?;
+        if tid != process.pid() {
+            return Err(AxError::NoSuchProcess);
+        }
+        Ok(Some(process))
     }
 
     pub fn process(&self) -> AxResult<Arc<Process>> {
@@ -73,7 +194,15 @@ impl PidFd {
     pub fn credential_snapshot(&self) -> AxResult<Arc<Cred>> {
         let proc_data = self.process_data()?;
         if let Some(slot) = &self.thread_credential {
-            Ok(slot.upgrade().ok_or(AxError::NoSuchProcess)?.current())
+            let credential = slot.upgrade().ok_or(AxError::NoSuchProcess)?.current();
+            if self
+                .thread_exit
+                .as_ref()
+                .is_some_and(|exit| exit.load(Ordering::Acquire))
+            {
+                return Err(AxError::NoSuchProcess);
+            }
+            Ok(credential)
         } else {
             Ok(proc_data.group_leader_cred())
         }

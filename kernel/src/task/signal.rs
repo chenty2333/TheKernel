@@ -326,18 +326,18 @@ pub fn with_blocked_signals<R>(
 fn send_signal_thread_inner_with(
     task: &TaskInner,
     thr: &Thread,
+    target_cred: &Cred,
     sig: SignalInfo,
     policy: SignalQueuePolicy,
 ) -> AxResult<bool> {
     let signo = sig.signo();
-    let target_cred = thr.current_cred();
     if signo == Signo::SIGCONT {
         do_continue(&thr.proc_data);
     }
 
     if thr.proc_data.ptrace_tracer().is_some() && !matches!(signo, Signo::SIGKILL | Signo::SIGCONT)
     {
-        let prepared = prepare_signal_for_target(&thr.proc_data, &target_cred, sig, policy)?;
+        let prepared = prepare_signal_for_target(&thr.proc_data, target_cred, sig, policy)?;
         match try_ptrace_signal_stop(&thr.proc_data, PtraceSignalRecord::thread(thr, prepared)) {
             Ok(()) => {
                 task.interrupt();
@@ -355,7 +355,7 @@ fn send_signal_thread_inner_with(
     }
 
     let outcome = thr.signal.try_send_signal_with(sig, |info| {
-        prepare_signal_for_target(&thr.proc_data, &target_cred, info, policy)
+        prepare_signal_for_target(&thr.proc_data, target_cred, info, policy)
     })?;
     if outcome.wake {
         task.interrupt();
@@ -364,7 +364,14 @@ fn send_signal_thread_inner_with(
 }
 
 pub(crate) fn send_signal_thread_inner(task: &TaskInner, thr: &Thread, sig: SignalInfo) {
-    let _ = send_signal_thread_inner_with(task, thr, sig, SignalQueuePolicy::BestEffortKill);
+    let target_cred = thr.current_cred();
+    let _ = send_signal_thread_inner_with(
+        task,
+        thr,
+        &target_cred,
+        sig,
+        SignalQueuePolicy::BestEffortKill,
+    );
 }
 
 /// Sends a resolved thread-directed signal with mandatory RT admission.
@@ -373,7 +380,66 @@ pub(crate) fn send_queued_signal_thread_inner(
     thr: &Thread,
     sig: SignalInfo,
 ) -> AxResult<bool> {
-    send_signal_thread_inner_with(task, thr, sig, SignalQueuePolicy::QueueRequired)
+    let target_cred = thr.current_cred();
+    send_signal_thread_inner_with(
+        task,
+        thr,
+        &target_cred,
+        sig,
+        SignalQueuePolicy::QueueRequired,
+    )
+}
+
+/// Publishes a userspace-authorized thread-directed request using the exact
+/// immutable credential snapshot which passed the security hook.
+pub(crate) fn send_authorized_signal_thread_inner(
+    task: &TaskInner,
+    thr: &Thread,
+    target_cred: &Cred,
+    sig: SignalInfo,
+    queue_required: bool,
+) -> AxResult<bool> {
+    let policy = if queue_required {
+        SignalQueuePolicy::QueueRequired
+    } else {
+        SignalQueuePolicy::BestEffortKill
+    };
+    send_signal_thread_inner_with(task, thr, target_cred, sig, policy)
+}
+
+/// Completes generation of a thread-directed signal for a retained exited
+/// group leader while sibling threads keep the process alive.
+///
+/// Linux still applies generation-time group effects (notably SIGCONT) and RT
+/// queue admission. The persistent group-leader signal manager retains that
+/// private pending record until exec replaces the leader identity or final
+/// process exit releases the runtime; it is never redirected into the shared
+/// process queue or a surviving sibling.
+pub(crate) fn generate_signal_for_exited_leader(
+    proc_data: &ProcessData,
+    leader_signal: &ThreadSignalManager,
+    target_cred: &Cred,
+    signal: Option<SignalInfo>,
+    queue_required: bool,
+) -> AxResult<()> {
+    if proc_data.proc.is_zombie() || proc_data.proc.thread_count() == 0 {
+        return Ok(());
+    }
+    let Some(signal) = signal else {
+        return Ok(());
+    };
+    if signal.signo() == Signo::SIGCONT {
+        do_continue(proc_data);
+    }
+    let policy = if queue_required {
+        SignalQueuePolicy::QueueRequired
+    } else {
+        SignalQueuePolicy::BestEffortKill
+    };
+    leader_signal.try_send_retained_signal_with(signal, |info| {
+        prepare_signal_for_target(proc_data, target_cred, info, policy)
+    })?;
+    Ok(())
 }
 
 /// Sends a signal to a thread.
@@ -477,17 +543,17 @@ fn publish_prepared_process(
 
 fn send_signal_to_process_data_with_policy(
     proc_data: &ProcessData,
+    target_cred: &Cred,
     sig: SignalInfo,
     policy: SignalQueuePolicy,
 ) -> AxResult<bool> {
     let signo = sig.signo();
-    let target_cred = proc_data.group_leader_cred();
     if signo == Signo::SIGCONT {
         do_continue(proc_data);
     }
 
     if proc_data.ptrace_tracer().is_some() && !matches!(signo, Signo::SIGKILL | Signo::SIGCONT) {
-        let prepared = prepare_signal_for_target(proc_data, &target_cred, sig, policy)?;
+        let prepared = prepare_signal_for_target(proc_data, target_cred, sig, policy)?;
         match try_ptrace_signal_stop(proc_data, PtraceSignalRecord::process(prepared)) {
             Ok(()) => return Ok(true),
             Err(record) => {
@@ -498,7 +564,7 @@ fn send_signal_to_process_data_with_policy(
     }
 
     let outcome = proc_data.signal.try_send_signal_with(sig, |info| {
-        prepare_signal_for_target(proc_data, &target_cred, info, policy)
+        prepare_signal_for_target(proc_data, target_cred, info, policy)
     })?;
     wake_process_signal_target(proc_data, signo, outcome.wake_tid.is_some());
     Ok(outcome.published)
@@ -513,11 +579,39 @@ pub fn send_signal_to_process_data(
         return Err(AxError::NoSuchProcess);
     }
     if let Some(sig) = sig {
+        let target_cred = proc_data.group_leader_cred();
         let signo = sig.signo();
         info!("Send signal {signo:?} to process {}", proc_data.proc.pid());
-        send_signal_to_process_data_with_policy(proc_data, sig, SignalQueuePolicy::BestEffortKill)?;
+        send_signal_to_process_data_with_policy(
+            proc_data,
+            &target_cred,
+            sig,
+            SignalQueuePolicy::BestEffortKill,
+        )?;
     }
 
+    Ok(())
+}
+
+/// Process-directed counterpart retaining the exact task credential used by
+/// authorization and sigqueue accounting. The task may be a non-leader while
+/// publication still targets its shared thread-group pending queue.
+pub(crate) fn send_signal_to_process_data_with_credential(
+    proc_data: &ProcessData,
+    target_cred: &Cred,
+    sig: Option<SignalInfo>,
+) -> AxResult<()> {
+    if proc_data.proc.is_zombie() || proc_data.proc.thread_count() == 0 {
+        return Err(AxError::NoSuchProcess);
+    }
+    if let Some(sig) = sig {
+        send_signal_to_process_data_with_policy(
+            proc_data,
+            target_cred,
+            sig,
+            SignalQueuePolicy::BestEffortKill,
+        )?;
+    }
     Ok(())
 }
 
@@ -530,8 +624,31 @@ pub(crate) fn send_queued_signal_to_process_data(
         return Err(AxError::NoSuchProcess);
     }
     if let Some(sig) = sig {
+        let target_cred = proc_data.group_leader_cred();
         return send_signal_to_process_data_with_policy(
             proc_data,
+            &target_cred,
+            sig,
+            SignalQueuePolicy::QueueRequired,
+        );
+    }
+    Ok(false)
+}
+
+/// Mandatory-queue variant using the same exact credential snapshot as the
+/// userspace authorization hook.
+pub(crate) fn send_queued_signal_to_process_data_with_credential(
+    proc_data: &ProcessData,
+    target_cred: &Cred,
+    sig: Option<SignalInfo>,
+) -> AxResult<bool> {
+    if proc_data.proc.is_zombie() || proc_data.proc.thread_count() == 0 {
+        return Err(AxError::NoSuchProcess);
+    }
+    if let Some(sig) = sig {
+        return send_signal_to_process_data_with_policy(
+            proc_data,
+            target_cred,
             sig,
             SignalQueuePolicy::QueueRequired,
         );

@@ -37,14 +37,25 @@ The current bounded-signal modernization slice additionally maintains:
 
 - restartability metadata returned with delivered signals;
 - fallible thread-signal endpoint allocation and explicit registration tokens;
-- pending/active/cancelled registry publication, so rollback entries are never
-  selected for delivery;
+- one explicit registration identity per thread endpoint and per live TID;
+  admission commit and rollback are identity-conditional, so a stale token
+  cannot activate, cancel, or split the state of another registration;
+- separate registry and exact-endpoint pending/active/retained/cancelled gates;
+  ordinary direct sends accept only active endpoints, while an explicit
+  retained-only API names an unreaped exited leader without restoring process
+  routing or wake eligibility;
+- an active/retained/cancelled process-shared endpoint: final exit freezes new
+  publication while preserving charged zombie state, and successful reap
+  cancels and drains private and shared ownership exactly once;
 - one fixed inline information slot per standard signal and intrusive FIFO
   nodes only for real-time signals;
 - shared atomic queue accounts, rollback-safe double charging, and exact
   refund on dequeue, per-signal flush, manager teardown, or allocation failure;
 - allocation-free publication under the pending spin lock: allocation,
   account-Arc acquisition, and unused-node destruction all happen outside;
+- commit-side lifecycle revalidation after preparation, so retirement racing
+  an accounted real-time send rejects publication and refunds both queue
+  charges outside signal-state guards;
 - an explicit publication outcome, separating a record owned by this send
   from ignored or coalesced signals while retaining wakeup selection;
 - transferable pre-publication ownership for `PreparedSignal`, allowing
@@ -53,10 +64,14 @@ The current bounded-signal modernization slice additionally maintains:
 - complete pre-publication siginfo inspection and same-signo replacement on
   `PreparedSignal`; replacement retains the admitted queue node and both
   account charges instead of degrading retained state to a signal number;
-- a copy-on-write thread registry plus an `action_update` writer mutex.
-  TheKernel enables the crate's `multitask` feature, making this mutex the
-  sleepable `axsync::Mutex`; the short actions/pending locks only publish or
-  detach already-owned state;
+- Linux generation-time job-control effects: `SIGCONT` clears stop signals and
+  stop generation clears `SIGCONT` across shared, active-private, and
+  retained-private queues under `action_update`; detached queue ownership is
+  destroyed only after the serialization and spin guards are released;
+- a copy-on-write thread registry plus an `action_update` writer mutex. Real
+  TheKernel targets enable `multitask` and use the sleepable `axsync::Mutex`;
+  the host-only `spin-action-update` override isolates unit tests from ArceOS
+  scheduler initialization without changing `target_os = "none"` behavior;
 - `kspin/smp` in the maintained `Cargo.toml` so standalone concurrent tests
   use a real inter-CPU lock instead of the single-core no-lock specialization;
 - overflow-safe alternate-stack bounds, dynamically derived `SS_ONSTACK`
@@ -116,9 +131,9 @@ Linux updates dispositions under a pre-existing `sighand->siglock` without
 allocating. This fork snapshots the fallible thread registry before committing
 an ignored-action flush, so `try_register` and `try_replace_action` can still
 report allocation failure. It does not expose a contention retry failure or
-silently perform a partial flush. TheKernel explicitly enables `multitask`;
-featureless standalone builds retain axsync's SpinNoIrq fallback and are used
-only as the no-runtime test/build baseline.
+silently perform a partial flush. TheKernel's real kernel targets explicitly
+enable `multitask`; featureless standalone builds retain axsync's SpinNoIrq
+fallback, and host kernel tests use the narrower `spin-action-update` override.
 
 When rebasing, use the verified crate archive as the pristine baseline and
 preserve the explicit registration/rollback contract. Do not infer safety or

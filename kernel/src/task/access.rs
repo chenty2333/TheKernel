@@ -1,18 +1,19 @@
 use alloc::sync::Arc;
 
 use axerrno::{AxError, AxResult};
-use axtask::current;
+use axtask::{AxTaskRef, current};
 use linux_raw_sys::general::{
-    CAP_KILL, CAP_SETFCAP, CAP_SETGID, CAP_SETUID, CAP_SYS_ADMIN, CAP_SYS_PTRACE, CAP_SYS_RESOURCE,
+    CAP_SETFCAP, CAP_SETGID, CAP_SETUID, CAP_SYS_ADMIN, CAP_SYS_PTRACE, CAP_SYS_RESOURCE,
 };
-use starry_signal::Signo;
+use starry_process::Pid;
 
 use super::{
-    AsThread, Cred, Credentials, Dumpability, IdMapInputExtent, Kgid, Kuid, ProcessData,
+    AsThread, Cred, Credentials, Dumpability, IdMapInputExtent, Kgid, Kuid, Process, ProcessData,
     ProcessImageAccessSnapshot, Thread, UserGid, UserNamespace, UserUid,
     security::{
         ProcessImageSecurityRef, PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind,
-        dispatch_ptrace_access,
+        SecuritySignalContext, SignalSecurityOperation, SignalTargetKind, SignalTargetSecurityRef,
+        dispatch_ptrace_access, dispatch_signal,
     },
 };
 
@@ -326,56 +327,112 @@ pub(crate) fn check_current_process_prlimit_access(target: &ProcessData) -> AxRe
     check_current_prlimit_access(target, &target_cred)
 }
 
-pub(crate) fn check_signal_access(
-    actor: &ProcessData,
+fn check_signal_access(
+    actor: &Arc<Process>,
     actor_cred: &Cred,
-    target: &ProcessData,
+    target: &Arc<Process>,
     target_cred: &Cred,
-    signal: Option<Signo>,
+    target_object: &SignalTargetSecurityRef<'_>,
+    operation: SignalSecurityOperation,
 ) -> AxResult<()> {
-    if actor.proc.pid() == target.proc.pid() {
-        return Ok(());
-    }
+    let same_thread_group = Arc::ptr_eq(actor, target);
+    let actor_group = actor.group();
+    let target_group = target.group();
+    let actor_session = actor_group.session();
+    let target_session = target_group.session();
+    let same_session = Arc::ptr_eq(&actor_session, &target_session);
+    drop((actor_session, target_session, actor_group, target_group));
 
-    let same_session = signal == Some(Signo::SIGCONT)
-        && actor.proc.group().session().sid() == target.proc.group().session().sid();
-    if signal_credential_allows(actor_cred, target_cred) || same_session {
-        Ok(())
-    } else {
-        Err(AxError::OperationNotPermitted)
-    }
+    let context = SecuritySignalContext::authorize(
+        actor_cred,
+        target_cred,
+        target_object,
+        operation,
+        same_thread_group,
+        same_session,
+    )?;
+    dispatch_signal(&context)
 }
 
-/// Frozen Linux signal-credential policy shared by live and zombie targets.
-/// Process identity and SIGCONT session exceptions remain with their callers.
-pub(crate) fn signal_credential_allows(actor: &Cred, target: &Cred) -> bool {
-    let actor_ids = actor.ids();
-    let target_ids = target.ids();
-    [actor_ids.ruid, actor_ids.euid]
-        .into_iter()
-        .any(|uid| uid == target_ids.ruid || uid == target_ids.suid)
-        || has_capability_over(actor, target, CAP_KILL)
-}
-
-pub(crate) fn check_current_signal_access(
-    target: &ProcessData,
+/// Authorizes an exact task object with a credential snapshot already pinned
+/// by its owning handle (notably a thread pidfd).
+pub(crate) fn check_current_pinned_thread_signal_access(
+    target: &Thread,
+    target_owner: &AxTaskRef,
     target_cred: &Cred,
-    signal: Option<Signo>,
+    expected_visible_tid: Pid,
+    kind: SignalTargetKind,
+    operation: SignalSecurityOperation,
+) -> AxResult<()> {
+    if target.tid() != expected_visible_tid {
+        return Err(AxError::NoSuchProcess);
+    }
+    let current = current();
+    let actor = current.as_thread();
+    let actor_cred = actor.current_cred();
+    let target_object = SignalTargetSecurityRef::new(
+        target_owner,
+        target.kernel_tid(),
+        expected_visible_tid,
+        kind,
+    );
+    check_signal_access(
+        &actor.proc_data.proc,
+        &actor_cred,
+        &target.proc_data.proc,
+        target_cred,
+        &target_object,
+        operation,
+    )
+}
+
+/// Authorizes a process or pidfd target using a credential snapshot already
+/// pinned by the caller's object lookup.
+pub(crate) fn check_current_pinned_process_identity_signal_access(
+    target: &Arc<Process>,
+    target_cred: &Cred,
+    kind: SignalTargetKind,
+    operation: SignalSecurityOperation,
 ) -> AxResult<()> {
     let current = current();
     let actor = current.as_thread();
     let actor_cred = actor.current_cred();
-    check_signal_access(&actor.proc_data, &actor_cred, target, target_cred, signal)
+    let pid = target.pid();
+    let target_object = SignalTargetSecurityRef::new(target, pid, pid, kind);
+    check_signal_access(
+        &actor.proc_data.proc,
+        &actor_cred,
+        target,
+        target_cred,
+        &target_object,
+        operation,
+    )
 }
 
-/// Process-directed signal permission follows the Linux group leader. Exact
-/// TID signal paths must pass the selected thread snapshot directly.
-pub(crate) fn check_current_process_signal_access(
+/// Authorizes a live process or pidfd target using a credential snapshot
+/// already pinned by the caller's object lookup.
+pub(crate) fn check_current_pinned_process_signal_access(
     target: &ProcessData,
-    signal: Option<Signo>,
+    target_cred: &Cred,
+    kind: SignalTargetKind,
+    operation: SignalSecurityOperation,
 ) -> AxResult<()> {
-    let target_cred = target.group_leader_cred();
-    check_current_signal_access(target, &target_cred, signal)
+    check_current_pinned_process_identity_signal_access(&target.proc, target_cred, kind, operation)
+}
+
+/// Authorizes a durable zombie target through the same typed policy stack as
+/// live process, thread, and pidfd paths.
+pub(crate) fn check_current_zombie_signal_access(
+    target: &Arc<Process>,
+    target_cred: &Cred,
+    operation: SignalSecurityOperation,
+) -> AxResult<()> {
+    check_current_pinned_process_identity_signal_access(
+        target,
+        target_cred,
+        SignalTargetKind::Zombie,
+        operation,
+    )
 }
 
 #[cfg(test)]
@@ -385,9 +442,11 @@ mod tests {
     use alloc::vec;
     use std::{sync::Barrier, thread};
 
+    use linux_raw_sys::general::CAP_KILL;
+
     use super::*;
     use crate::task::{
-        UtsNamespace,
+        SignalSecuritySource, UtsNamespace,
         creds::{CAPABILITY_WORDS, CredentialSlot},
     };
 
@@ -607,7 +666,20 @@ mod tests {
         target_update.builder.caps.inheritable = [0; CAPABILITY_WORDS];
         target_update.builder.caps.ambient = [0; CAPABILITY_WORDS];
         let saved_uid_target = target_update.finish().unwrap().commit();
-        assert!(signal_credential_allows(&actor, &saved_uid_target));
+        let probe = SignalSecurityOperation::probe(
+            SignalSecuritySource::Kill,
+            crate::task::SignalDeliveryScope::ThreadGroup,
+        );
+        assert!(
+            thekernel_linux_cred::authorize_signal_core(
+                actor.core(),
+                saved_uid_target.core(),
+                probe,
+                false,
+                false,
+            )
+            .is_ok()
+        );
 
         let root_target_slot = CredentialSlot::new(root_cred.clone());
         let root_target = publish_ids(&root_target_slot, 3000, 300);
@@ -624,10 +696,103 @@ mod tests {
         let sibling_target_slot = CredentialSlot::new(sibling_cred);
         let sibling_target = publish_ids(&sibling_target_slot, 3000, 300);
 
-        assert!(!signal_credential_allows(&child_actor, &root_target));
-        assert!(signal_credential_allows(&root_cred, &child_target));
-        assert!(signal_credential_allows(&child_actor, &child_target));
-        assert!(!signal_credential_allows(&child_actor, &sibling_target));
+        assert!(
+            thekernel_linux_cred::authorize_signal_core(
+                child_actor.core(),
+                root_target.core(),
+                probe,
+                false,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            thekernel_linux_cred::authorize_signal_core(
+                root_cred.core(),
+                child_target.core(),
+                probe,
+                false,
+                false,
+            )
+            .is_ok()
+        );
+        assert!(
+            thekernel_linux_cred::authorize_signal_core(
+                child_actor.core(),
+                child_target.core(),
+                probe,
+                false,
+                false,
+            )
+            .is_ok()
+        );
+        assert!(
+            thekernel_linux_cred::authorize_signal_core(
+                child_actor.core(),
+                sibling_target.core(),
+                probe,
+                false,
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn credential_caller_signal_authorization_keeps_one_frozen_target_snapshot() {
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let root = Cred::try_root(namespace).unwrap();
+        let actor_slot = CredentialSlot::new(root.clone());
+        let target_slot = Arc::new(CredentialSlot::new(root));
+        let actor = publish_ids(&actor_slot, 1000, 100);
+        let frozen_target = publish_ids(&target_slot, 1000, 100);
+        let operation = SignalSecurityOperation::probe(
+            SignalSecuritySource::Kill,
+            crate::task::SignalDeliveryScope::ThreadGroup,
+        );
+
+        let start = Arc::new(Barrier::new(2));
+        let finish = Arc::new(Barrier::new(2));
+        let writer = {
+            let target_slot = target_slot.clone();
+            let start = start.clone();
+            let finish = finish.clone();
+            thread::spawn(move || {
+                start.wait();
+                for uid in 2000..3000 {
+                    publish_ids(&target_slot, uid, 200);
+                }
+                finish.wait();
+            })
+        };
+
+        start.wait();
+        for _ in 0..2000 {
+            assert!(
+                thekernel_linux_cred::authorize_signal_core(
+                    actor.core(),
+                    frozen_target.core(),
+                    operation,
+                    false,
+                    false,
+                )
+                .is_ok()
+            );
+        }
+        finish.wait();
+        writer.join().unwrap();
+
+        let fresh_target = target_slot.current();
+        assert!(
+            thekernel_linux_cred::authorize_signal_core(
+                actor.core(),
+                fresh_target.core(),
+                operation,
+                false,
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[test]

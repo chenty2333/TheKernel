@@ -17,7 +17,7 @@ use crate::{
     readiness::block_on_poll_set_interruptible_if,
     task::{
         AsThread, Process, ProcessData, PtraceSession, StopReport, TaskUsage, ZombieSnapshot,
-        get_process_data, has_pending_syscall_signal, process_domain,
+        get_process_data, has_pending_syscall_signal, process_domain, reap_process,
     },
 };
 
@@ -394,7 +394,7 @@ fn restore_wait_event(event: &WaitEvent) {
 }
 
 fn reap_child(child: &Process) -> AxResult<bool> {
-    process_domain()?.reap(child).map_err(process_error)
+    reap_process(child)
 }
 
 pub fn sys_waitpid(

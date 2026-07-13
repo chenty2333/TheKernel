@@ -179,8 +179,10 @@ pub fn init(args: &[String], envs: &[String]) {
     let thread_admission = proc
         .prepare_thread(tid)
         .expect("Failed to admit init thread membership");
-    let (thr, signal_registration) =
-        Thread::try_new(tid, proc, credential).expect("Failed to allocate init thread state");
+    let (thr, signal_registration) = Thread::try_new(tid, proc.clone(), credential)
+        .expect("Failed to allocate init thread state");
+    proc.bind_initial_group_leader_signal(tid, thr.signal.clone())
+        .expect("Failed to bind init group-leader signal identity");
     if INIT_PID != tid {
         thr.set_tid(INIT_PID);
     }
@@ -192,7 +194,9 @@ pub fn init(args: &[String], envs: &[String]) {
         reserve_prepared_task(task.clone()).expect("Failed to reserve init runqueue publication");
     let task_table_admission =
         prepare_task_table_admission(&task).expect("Failed to reserve init lookup identities");
-    signal_registration.commit();
+    signal_registration
+        .commit()
+        .expect("private init signal registration was cancelled before publication");
     let thread_completion =
         task_table_admission.commit_with_publication(|| thread_admission.commit());
     let published_task = publish_prepared_task(task_publication);

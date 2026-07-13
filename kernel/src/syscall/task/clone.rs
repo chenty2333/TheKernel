@@ -74,6 +74,10 @@ enum CloneThreadPublication {
 }
 
 impl CloneThreadPublication {
+    const fn is_initial(&self) -> bool {
+        matches!(self, Self::Initial(_))
+    }
+
     fn commit(self) -> PendingThreadPublication {
         match self {
             Self::Live(admission) => admission.commit(),
@@ -563,6 +567,9 @@ impl CloneArgs {
         };
         let (thr, signal_registration) =
             Thread::try_new(tid, new_proc_data.clone(), child_credential)?;
+        if thread_publication.is_initial() {
+            new_proc_data.bind_initial_group_leader_signal(tid, thr.signal.clone())?;
+        }
         let task_parent_choice = if flags.intersects(CloneFlags::PARENT | CloneFlags::THREAD) {
             TaskParentChoice::Inherit(calling_thread.task_parent_node().clone())
         } else {
@@ -576,14 +583,17 @@ impl CloneArgs {
         let mut pending_pidfd = if flags.contains(CloneFlags::PIDFD) {
             let reservation = reserve_fd(true)?;
             let pidfd_obj = if flags.contains(CloneFlags::THREAD) {
-                PidFd::new_thread(&thr)
+                PidFd::new_thread_unbound(&thr)
             } else {
                 PidFd::new_process(&new_proc_data)
             };
-            let pidfd_file: Arc<dyn crate::file::FileLike> =
-                Arc::try_new(pidfd_obj).map_err(|_| AxError::NoMemory)?;
+            let pidfd_obj = Arc::try_new(pidfd_obj).map_err(|_| AxError::NoMemory)?;
+            let thread_pidfd = flags
+                .contains(CloneFlags::THREAD)
+                .then(|| pidfd_obj.clone());
+            let pidfd_file: Arc<dyn crate::file::FileLike> = pidfd_obj;
             let description = FileDescription::new(pidfd_file)?;
-            Some(reservation.prepare_publication(description)?)
+            Some((reservation.prepare_publication(description)?, thread_pidfd))
         } else {
             None
         };
@@ -611,11 +621,14 @@ impl CloneArgs {
         // task/process/group/session lookup bucket before copying the pidfd
         // number or publishing it into a possibly shared files_struct.
         let task = prepare_task_with_sched_from(new_task, child_sched_state, &curr)?;
+        if let Some((_, Some(pidfd))) = pending_pidfd.as_ref() {
+            pidfd.bind_thread_task(&task)?;
+        }
         let task_publication =
             reserve_prepared_task(task.clone()).map_err(|error| error.into_ax_error())?;
         let task_table_admission = prepare_task_table_admission(&task)?;
 
-        if let Some(publication) = pending_pidfd.as_ref() {
+        if let Some((publication, _)) = pending_pidfd.as_ref() {
             let fd = publication.fd();
             (pidfd as *mut i32).vm_write(fd)?;
         }
@@ -638,7 +651,9 @@ impl CloneArgs {
         // infallible publication step. Publish the exact signal endpoint and
         // core process/thread identity with TASK_TABLE before any fd or
         // secondary global index.
-        signal_registration.commit();
+        signal_registration
+            .commit()
+            .expect("private child signal registration was cancelled before publication");
         let thread_completion =
             task_table_admission.commit_with_publication(|| thread_publication.commit());
         drop(task_parent_publication);
@@ -654,7 +669,7 @@ impl CloneArgs {
         if let Some(admission) = shm_admission {
             admission.commit();
         }
-        if let Some(publication) = pending_pidfd.take() {
+        if let Some((publication, _)) = pending_pidfd.take() {
             publication.commit();
         }
 

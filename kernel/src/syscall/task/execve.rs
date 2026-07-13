@@ -453,6 +453,10 @@ fn do_execve(
     // A non-leader exec adopts the thread-group ID. The visible TID, reserved
     // alias, credential/group-leader binding, address space, and access owner
     // become visible as one composite transition. No fallible commit remains.
+    // Process lifecycle serialization also keeps a signal operation from
+    // publishing through the old thread-pid identity after this handoff.
+    // Security post-commit notification remains below, after the guard drops.
+    let lifecycle = proc_data.lock_process_lifecycle();
     let exec_commit = commit_exec_identity_handoff(
         task_alias_admission,
         proc_data,
@@ -462,6 +466,7 @@ fn do_execve(
         new_aspace,
         new_access_state,
     );
+    drop(lifecycle);
     // Image, group-leader, and task-alias publication locks are now absent.
     // Notify before taking the ptrace-action lock, while the returned
     // retirement continues to own the old credential and old image through

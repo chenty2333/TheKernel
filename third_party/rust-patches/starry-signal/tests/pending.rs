@@ -13,7 +13,7 @@ fn new_test_env() -> (Arc<ProcessSignalManager>, Arc<ThreadSignalManager>) {
         0,
     ));
     let thread = ThreadSignalManager::try_new(process.clone()).unwrap();
-    thread.try_register(7).unwrap().commit();
+    thread.try_register(7).unwrap().commit().unwrap();
     (process, thread)
 }
 

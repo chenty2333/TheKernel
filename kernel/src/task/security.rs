@@ -15,12 +15,15 @@ use core::{any::Any, fmt, marker::PhantomData};
 use axerrno::{AxError, AxResult};
 use spin::Once;
 use thekernel_linux_cred::{
-    AuthorizationError, commoncap_ptrace_access as external_commoncap_ptrace_access,
+    AuthorizationError, authorize_signal_core as external_authorize_signal_core,
+    commoncap_ptrace_access as external_commoncap_ptrace_access,
     commoncap_ptrace_traceme as external_commoncap_ptrace_traceme,
     commoncap_scheduler as external_commoncap_scheduler,
 };
 pub(crate) use thekernel_linux_cred::{
     PtraceAccessKind, PtraceCredentialKind, SchedulerSecurityOperation,
+    SignalCoreAuthorizationReason, SignalDeliveryScope, SignalNumber, SignalSecurityOperation,
+    SignalSecuritySource,
 };
 
 use super::{
@@ -191,6 +194,72 @@ type CorePtraceTracemeContext<'a> =
     thekernel_linux_cred::PtraceTracemeContext<'a, UserNamespace, ProcessImageSecurityRef<'a>>;
 type CoreSchedulerSecurityContext<'a> =
     thekernel_linux_cred::SchedulerSecurityContext<'a, UserNamespace>;
+type CoreSignalSecurityContext<'a> =
+    thekernel_linux_cred::SignalSecurityContext<'a, UserNamespace, SignalTargetSecurityRef<'a>>;
+
+/// Kind of exact kernel object selected for one userspace signal request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SignalTargetKind {
+    /// Linux thread-group/process target.
+    Process,
+    /// Exact task selected by PID for thread-group/shared-queue delivery.
+    ProcessTask,
+    /// One exact live thread target.
+    Thread,
+    /// Retained thread-group leader PID identity after its task has exited.
+    ExitedLeader,
+    /// Durable process identity after final exit.
+    Zombie,
+    /// Exact process named by a process pidfd (or supported proc-dir fd).
+    PidFdProcess,
+    /// Exact task named by a thread pidfd.
+    PidFdThread,
+}
+
+/// Opaque stable identity for one process/thread/zombie selected before signal
+/// authorization. The borrowed `Arc` pins numeric-ID reuse out of the hook
+/// window; `stable_id` distinguishes threads within one live process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SignalTargetSecurityRef<'a> {
+    owner_pointer: *const (),
+    stable_id: u32,
+    visible_id: u32,
+    kind: SignalTargetKind,
+    _target: PhantomData<&'a ()>,
+}
+
+impl<'a> SignalTargetSecurityRef<'a> {
+    pub(in crate::task) fn new<T>(
+        owner: &'a Arc<T>,
+        stable_id: u32,
+        visible_id: u32,
+        kind: SignalTargetKind,
+    ) -> Self {
+        Self {
+            owner_pointer: Arc::as_ptr(owner).cast(),
+            stable_id,
+            visible_id,
+            kind,
+            _target: PhantomData,
+        }
+    }
+
+    pub(crate) const fn stable_id(self) -> u32 {
+        self.stable_id
+    }
+
+    pub(crate) const fn visible_id(self) -> u32 {
+        self.visible_id
+    }
+
+    pub(crate) const fn kind(self) -> SignalTargetKind {
+        self.kind
+    }
+
+    pub(in crate::task) fn owner_matches<T>(self, owner: &Arc<T>) -> bool {
+        self.owner_pointer == Arc::as_ptr(owner).cast()
+    }
+}
 
 /// Kernel context retaining the exact composite actor and target credentials.
 /// Commoncap sees the policy-neutral core view; other modules receive their
@@ -312,6 +381,59 @@ impl<'a> SecuritySchedulerContext<'a> {
 
     pub(crate) const fn owner_match(&self) -> bool {
         self.core.owner_match()
+    }
+}
+
+/// Kernel wrapper retaining the exact composite actor/target credentials and
+/// their module states around one already-core-authorized signal request.
+pub(crate) struct SecuritySignalContext<'a> {
+    actor: &'a Cred,
+    target: &'a Cred,
+    core: CoreSignalSecurityContext<'a>,
+}
+
+impl<'a> SecuritySignalContext<'a> {
+    pub(in crate::task) fn authorize(
+        actor: &'a Cred,
+        target: &'a Cred,
+        target_object: &'a SignalTargetSecurityRef<'a>,
+        operation: SignalSecurityOperation,
+        same_thread_group: bool,
+        same_session: bool,
+    ) -> AxResult<Self> {
+        let authorization = external_authorize_signal_core(
+            actor.core(),
+            target.core(),
+            operation,
+            same_thread_group,
+            same_session,
+        )
+        .map_err(authorization_error)?;
+        Ok(Self {
+            actor,
+            target,
+            core: CoreSignalSecurityContext::new(authorization, target_object),
+        })
+    }
+
+    pub(crate) const fn actor(&self) -> &'a Cred {
+        self.actor
+    }
+
+    pub(crate) const fn target(&self) -> &'a Cred {
+        self.target
+    }
+
+    pub(crate) const fn target_object(&self) -> &'a SignalTargetSecurityRef<'a> {
+        self.core.target_object()
+    }
+
+    pub(crate) const fn operation(&self) -> SignalSecurityOperation {
+        self.core.operation()
+    }
+
+    pub(crate) const fn core_reason(&self) -> SignalCoreAuthorizationReason {
+        self.core.core_reason()
     }
 }
 
@@ -443,6 +565,20 @@ trait SecurityModule: Send + Sync + 'static {
         let _ = (actor_state, target_state);
         self.scheduler(context)
     }
+
+    fn signal(&self, _context: &SecuritySignalContext<'_>) -> AxResult<()> {
+        Ok(())
+    }
+
+    fn signal_with_credential_state(
+        &self,
+        context: &SecuritySignalContext<'_>,
+        actor_state: &Self::CredentialState,
+        target_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        let _ = (actor_state, target_state);
+        self.signal(context)
+    }
 }
 
 /// Object-safe runtime view of a source-facing module. The adapter keeps the
@@ -501,6 +637,13 @@ trait ErasedSecurityModule: Send + Sync {
     fn scheduler_with_credential_state(
         &self,
         context: &SecuritySchedulerContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+        target_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
+    fn signal(&self, context: &SecuritySignalContext<'_>) -> AxResult<()>;
+    fn signal_with_credential_state(
+        &self,
+        context: &SecuritySignalContext<'_>,
         actor_state: &dyn ErasedOwnedCredentialState,
         target_state: &dyn ErasedOwnedCredentialState,
     ) -> AxResult<()>;
@@ -722,6 +865,24 @@ impl<M: SecurityModule> ErasedSecurityModule for M {
         target_state: &dyn ErasedOwnedCredentialState,
     ) -> AxResult<()> {
         SecurityModule::scheduler_with_credential_state(
+            self,
+            context,
+            owned_credential_state(self, actor_state)?,
+            owned_credential_state(self, target_state)?,
+        )
+    }
+
+    fn signal(&self, context: &SecuritySignalContext<'_>) -> AxResult<()> {
+        SecurityModule::signal(self, context)
+    }
+
+    fn signal_with_credential_state(
+        &self,
+        context: &SecuritySignalContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+        target_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::signal_with_credential_state(
             self,
             context,
             owned_credential_state(self, actor_state)?,
@@ -1411,6 +1572,34 @@ impl SecurityRegistry {
         }
         Ok(())
     }
+
+    fn dispatch_signal(&self, context: &SecuritySignalContext<'_>) -> AxResult<()> {
+        for (index, registered) in self.modules.iter().enumerate() {
+            debug_assert_eq!(usize::from(registered.id.0), index);
+            registered.module.signal(context)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_signal_with_credential_state(
+        &self,
+        context: &SecuritySignalContext<'_>,
+    ) -> AxResult<()> {
+        let actor = self.credential_slots(context.actor())?;
+        let target = self.credential_slots(context.target())?;
+        for ((registered, actor_state), target_state) in self.modules.iter().zip(actor).zip(target)
+        {
+            if registered.id != actor_state.module_id || registered.id != target_state.module_id {
+                return Err(AxError::OperationNotPermitted);
+            }
+            registered.module.signal_with_credential_state(
+                context,
+                actor_state.erased.as_ref(),
+                target_state.erased.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 impl FrozenSecurityRegistry {
@@ -1557,11 +1746,23 @@ pub(crate) fn dispatch_scheduler(context: &SecuritySchedulerContext<'_>) -> AxRe
         .dispatch_scheduler_with_credential_state(context)
 }
 
+/// Runs the frozen signal policy hooks after Linux core signal permission has
+/// admitted the exact actor/target pair. The first denial is returned without
+/// invoking later modules.
+pub(crate) fn dispatch_signal(context: &SecuritySignalContext<'_>) -> AxResult<()> {
+    context
+        .actor()
+        .security()
+        .registry()
+        .registry()
+        .dispatch_signal_with_credential_state(context)
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
 
-    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::{
         sync::{Barrier, Mutex, MutexGuard},
         thread,
@@ -1581,7 +1782,8 @@ mod tests {
     static TRACEME_DENY_HOOK_TRACE: AtomicU32 = AtomicU32::new(0);
     static EXEC_DENY_HOOK_TRACE: AtomicU32 = AtomicU32::new(0);
     static SCHEDULER_DENY_HOOK_TRACE: AtomicU32 = AtomicU32::new(0);
-    static WHOLE_MODULE_HOOK_TRACE: AtomicU32 = AtomicU32::new(0);
+    static SIGNAL_DENY_HOOK_TRACE: AtomicU32 = AtomicU32::new(0);
+    static WHOLE_MODULE_HOOK_TRACE: AtomicU64 = AtomicU64::new(0);
     static MODULE_DROP_TRACE: AtomicU32 = AtomicU32::new(0);
     static RESERVED_MODULE_INIT_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_INIT_TRACE: AtomicU32 = AtomicU32::new(0);
@@ -1822,6 +2024,21 @@ mod tests {
             Ok(())
         }
 
+        fn signal_with_credential_state(
+            &self,
+            context: &SecuritySignalContext<'_>,
+            actor_state: &Self::CredentialState,
+            target_state: &Self::CredentialState,
+        ) -> AxResult<()> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(actor_state.key, key);
+            assert_eq!(target_state.key, key);
+            assert!(core::ptr::eq(context.actor(), context.target()));
+            assert_eq!(context.target_object().kind(), SignalTargetKind::Process);
+            CRED_STATE_HOOK_MASK.fetch_or(1 << 4, Ordering::SeqCst);
+            Ok(())
+        }
+
         fn free_credential(&self, state: Self::CredentialState) {
             assert!(!credential_publication_lock_held());
             if state.committed.load(Ordering::SeqCst) {
@@ -1835,12 +2052,14 @@ mod tests {
     type TestPtraceTracemeHook = for<'a> fn(&PtraceTracemeContext<'a>) -> AxResult<()>;
     type TestExecCredentialHook = for<'a> fn(&ExecCredentialSecurityContext<'a>) -> AxResult<()>;
     type TestSchedulerHook = for<'a> fn(&SecuritySchedulerContext<'a>) -> AxResult<()>;
+    type TestSignalHook = for<'a> fn(&SecuritySignalContext<'a>) -> AxResult<()>;
 
     struct TestSecurityModule<const KEY: u64> {
         ptrace_access: Option<TestPtraceAccessHook>,
         ptrace_traceme: Option<TestPtraceTracemeHook>,
         exec_credential: Option<TestExecCredentialHook>,
         scheduler: Option<TestSchedulerHook>,
+        signal: Option<TestSignalHook>,
     }
 
     impl<const KEY: u64> TestSecurityModule<KEY> {
@@ -1850,6 +2069,7 @@ mod tests {
                 ptrace_traceme: None,
                 exec_credential: None,
                 scheduler: None,
+                signal: None,
             }
         }
     }
@@ -1890,6 +2110,10 @@ mod tests {
 
         fn scheduler(&self, context: &SecuritySchedulerContext<'_>) -> AxResult<()> {
             self.scheduler.map_or(Ok(()), |hook| hook(context))
+        }
+
+        fn signal(&self, context: &SecuritySignalContext<'_>) -> AxResult<()> {
+            self.signal.map_or(Ok(()), |hook| hook(context))
         }
     }
 
@@ -1961,6 +2185,11 @@ mod tests {
             WHOLE_MODULE_HOOK_TRACE.fetch_add(1 << 24, Ordering::SeqCst);
             Ok(())
         }
+
+        fn signal(&self, _context: &SecuritySignalContext<'_>) -> AxResult<()> {
+            WHOLE_MODULE_HOOK_TRACE.fetch_add(1 << 32, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     struct FailingWholeHookModule;
@@ -2004,6 +2233,11 @@ mod tests {
 
         fn scheduler(&self, _context: &SecuritySchedulerContext<'_>) -> AxResult<()> {
             WHOLE_MODULE_HOOK_TRACE.fetch_add(1 << 24, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn signal(&self, _context: &SecuritySignalContext<'_>) -> AxResult<()> {
+            WHOLE_MODULE_HOOK_TRACE.fetch_add(1 << 32, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -2107,11 +2341,25 @@ mod tests {
         let draft = exec_draft(&root, crate::task::ExecTraceState::NotSuppressingPrivilege);
         let exec = ExecCredentialSecurityContext::new(&draft);
         let scheduler = scheduler_context(&root, &root, SchedulerSecurityOperation::SetAffinity);
+        let signal_target = SignalTargetSecurityRef::new(&image, 1, 1, SignalTargetKind::Process);
+        let signal = SecuritySignalContext::authorize(
+            &root,
+            &root,
+            &signal_target,
+            SignalSecurityOperation::probe(
+                SignalSecuritySource::Kill,
+                SignalDeliveryScope::ThreadGroup,
+            ),
+            true,
+            true,
+        )
+        .unwrap();
 
         registry.dispatch_ptrace_access(&access).unwrap();
         registry.dispatch_ptrace_traceme(&traceme).unwrap();
         registry.dispatch_exec_credential(&exec).unwrap();
         registry.dispatch_scheduler(&scheduler).unwrap();
+        registry.dispatch_signal(&signal).unwrap();
     }
 
     fn capability_set(capabilities: &[u32]) -> [u32; CAPABILITY_WORDS] {
@@ -2243,6 +2491,24 @@ mod tests {
 
     fn scheduler_must_not_run(_: &SecuritySchedulerContext<'_>) -> AxResult<()> {
         SCHEDULER_DENY_HOOK_TRACE.store(2, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn deny_signal_first(context: &SecuritySignalContext<'_>) -> AxResult<()> {
+        assert_eq!(context.target_object().kind(), SignalTargetKind::Zombie);
+        assert_eq!(
+            context.operation(),
+            SignalSecurityOperation::probe(
+                SignalSecuritySource::Kill,
+                SignalDeliveryScope::ThreadGroup,
+            )
+        );
+        SIGNAL_DENY_HOOK_TRACE.store(1, Ordering::SeqCst);
+        Err(AxError::PermissionDenied)
+    }
+
+    fn signal_must_not_run(_: &SecuritySignalContext<'_>) -> AxResult<()> {
+        SIGNAL_DENY_HOOK_TRACE.store(2, Ordering::SeqCst);
         Ok(())
     }
 
@@ -2504,7 +2770,10 @@ mod tests {
 
         WHOLE_MODULE_HOOK_TRACE.store(0, Ordering::SeqCst);
         dispatch_all_hook_families(&registry);
-        assert_eq!(WHOLE_MODULE_HOOK_TRACE.load(Ordering::SeqCst), 0x0101_0101);
+        assert_eq!(
+            WHOLE_MODULE_HOOK_TRACE.load(Ordering::SeqCst),
+            0x01_0101_0101
+        );
 
         let mut builder = test_registry_builder();
         assert_eq!(
@@ -2975,6 +3244,84 @@ mod tests {
     }
 
     #[test]
+    fn signal_policy_hooks_run_after_core_allow_and_stop_on_first_denial() {
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let root = Cred::try_root(namespace).unwrap();
+        let owner = Arc::new(());
+        let target = SignalTargetSecurityRef::new(&owner, 91, 91, SignalTargetKind::Zombie);
+        let context = SecuritySignalContext::authorize(
+            &root,
+            &root,
+            &target,
+            SignalSecurityOperation::probe(
+                SignalSecuritySource::Kill,
+                SignalDeliveryScope::ThreadGroup,
+            ),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            context.core_reason(),
+            SignalCoreAuthorizationReason::CredentialMatch
+        );
+        assert!(core::ptr::eq(context.actor(), root.as_ref()));
+        assert!(core::ptr::eq(context.target(), root.as_ref()));
+        assert_eq!(context.target_object().stable_id(), 91);
+        assert_eq!(context.target_object().visible_id(), 91);
+        assert!(context.target_object().owner_matches(&owner));
+        assert!(!context.target_object().owner_matches(&Arc::new(())));
+
+        let mut builder = test_registry_builder();
+        builder
+            .try_register_initialized(TestSecurityModule::<1> {
+                signal: Some(deny_signal_first),
+                ..TestSecurityModule::empty()
+            })
+            .unwrap();
+        builder
+            .try_register_initialized(TestSecurityModule::<2> {
+                signal: Some(signal_must_not_run),
+                ..TestSecurityModule::empty()
+            })
+            .unwrap();
+        let registry = builder.freeze();
+
+        SIGNAL_DENY_HOOK_TRACE.store(0, Ordering::SeqCst);
+        assert_eq!(
+            registry.dispatch_signal(&context),
+            Err(AxError::PermissionDenied)
+        );
+        assert_eq!(SIGNAL_DENY_HOOK_TRACE.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn denied_signal_core_never_constructs_a_policy_context() {
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let root = Cred::try_root(namespace).unwrap();
+        let actor = credential_with_identity_and_caps(&root, 1000, &[], &[]);
+        let target = credential_with_identity_and_caps(&root, 2000, &[], &[]);
+        let owner = Arc::new(());
+        let target_object = SignalTargetSecurityRef::new(&owner, 7, 7, SignalTargetKind::Process);
+
+        assert_eq!(
+            SecuritySignalContext::authorize(
+                &actor,
+                &target,
+                &target_object,
+                SignalSecurityOperation::probe(
+                    SignalSecuritySource::Kill,
+                    SignalDeliveryScope::ThreadGroup,
+                ),
+                false,
+                false,
+            )
+            .err(),
+            Some(AxError::OperationNotPermitted)
+        );
+    }
+
+    #[test]
     fn composite_root_initializes_and_reverse_drops_every_module_state() {
         let _probe_guard = reset_credential_state_probes();
         let registry = probe_registry();
@@ -3129,6 +3476,20 @@ mod tests {
             crate::task::ExecTraceState::NotSuppressingPrivilege,
         );
         let exec = ExecCredentialSecurityContext::new(&draft);
+        let signal_target = SignalTargetSecurityRef::new(&image, 44, 44, SignalTargetKind::Process);
+        let signal = SecuritySignalContext::authorize(
+            &credential,
+            &credential,
+            &signal_target,
+            SignalSecurityOperation::send(
+                SignalNumber::try_new(15).unwrap(),
+                SignalSecuritySource::Kill,
+                SignalDeliveryScope::ThreadGroup,
+            ),
+            true,
+            false,
+        )
+        .unwrap();
         CRED_STATE_DISPATCH_TRACE.store(0, Ordering::SeqCst);
         CRED_STATE_HOOK_MASK.store(0, Ordering::SeqCst);
 
@@ -3136,8 +3497,9 @@ mod tests {
         dispatch_ptrace_traceme(&traceme).unwrap();
         dispatch_scheduler(&scheduler).unwrap();
         dispatch_exec_credential(&exec).unwrap();
+        dispatch_signal(&signal).unwrap();
         assert_eq!(CRED_STATE_DISPATCH_TRACE.load(Ordering::SeqCst), 23);
-        assert_eq!(CRED_STATE_HOOK_MASK.load(Ordering::SeqCst), 0b1111);
+        assert_eq!(CRED_STATE_HOOK_MASK.load(Ordering::SeqCst), 0b1_1111);
     }
 
     #[test]
@@ -3201,13 +3563,32 @@ mod tests {
             PtraceAccessKind::Read,
             PtraceCredentialKind::Real,
         );
+        let signal_target = SignalTargetSecurityRef::new(&image, 31, 31, SignalTargetKind::Process);
+        let signal = SecuritySignalContext::authorize(
+            &actor,
+            &target,
+            &signal_target,
+            SignalSecurityOperation::probe(
+                SignalSecuritySource::Kill,
+                SignalDeliveryScope::ThreadGroup,
+            ),
+            false,
+            false,
+        )
+        .unwrap();
         CRED_STATE_DISPATCH_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_HOOK_MASK.store(0, Ordering::SeqCst);
 
         assert_eq!(
             dispatch_ptrace_access(&context),
             Err(AxError::OperationNotPermitted)
         );
         assert_eq!(CRED_STATE_DISPATCH_TRACE.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            dispatch_signal(&signal),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_HOOK_MASK.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -3218,7 +3599,7 @@ mod tests {
         let actor = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
         let core = actor.core_arc().clone();
         let mut malformed_security = registry.try_init_credential_state(&core).unwrap();
-        malformed_security.slots[1].module_id = ModuleId(7);
+        malformed_security.slots[2].module_id = ModuleId(7);
         let malformed = Cred::try_from_prepared_parts(core, malformed_security).unwrap();
         let image = Arc::new(());
         let image_ref = ProcessImageSecurityRef::new(&namespace, &image);
@@ -3230,13 +3611,32 @@ mod tests {
             PtraceAccessKind::Read,
             PtraceCredentialKind::Real,
         );
+        let signal_target = SignalTargetSecurityRef::new(&image, 32, 32, SignalTargetKind::Process);
+        let signal = SecuritySignalContext::authorize(
+            &actor,
+            &malformed,
+            &signal_target,
+            SignalSecurityOperation::probe(
+                SignalSecuritySource::Kill,
+                SignalDeliveryScope::ThreadGroup,
+            ),
+            false,
+            false,
+        )
+        .unwrap();
         CRED_STATE_DISPATCH_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_HOOK_MASK.store(0, Ordering::SeqCst);
 
         assert_eq!(
             dispatch_ptrace_access(&context),
             Err(AxError::OperationNotPermitted)
         );
         assert_eq!(CRED_STATE_DISPATCH_TRACE.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            dispatch_signal(&signal),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_HOOK_MASK.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -3268,12 +3668,31 @@ mod tests {
             PtraceAccessKind::Read,
             PtraceCredentialKind::Real,
         );
+        let signal_target = SignalTargetSecurityRef::new(&image, 33, 33, SignalTargetKind::Process);
+        let wrong_type_signal = SecuritySignalContext::authorize(
+            &actor,
+            &wrong_type,
+            &signal_target,
+            SignalSecurityOperation::probe(
+                SignalSecuritySource::Kill,
+                SignalDeliveryScope::ThreadGroup,
+            ),
+            false,
+            false,
+        )
+        .unwrap();
         CRED_STATE_DISPATCH_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_HOOK_MASK.store(0, Ordering::SeqCst);
         assert_eq!(
             dispatch_ptrace_access(&context),
             Err(AxError::OperationNotPermitted)
         );
         assert_eq!(CRED_STATE_DISPATCH_TRACE.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            dispatch_signal(&wrong_type_signal),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_HOOK_MASK.load(Ordering::SeqCst), 0);
 
         let mut wrong_runtime_security = registry.try_init_credential_state(actor.core()).unwrap();
         wrong_runtime_security.slots[1].erased = try_own_credential_state(
@@ -3296,11 +3715,28 @@ mod tests {
             PtraceAccessKind::Read,
             PtraceCredentialKind::Real,
         );
+        let wrong_runtime_signal = SecuritySignalContext::authorize(
+            &actor,
+            &wrong_runtime,
+            &signal_target,
+            SignalSecurityOperation::probe(
+                SignalSecuritySource::Kill,
+                SignalDeliveryScope::ThreadGroup,
+            ),
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             dispatch_ptrace_access(&context),
             Err(AxError::OperationNotPermitted)
         );
         assert_eq!(CRED_STATE_DISPATCH_TRACE.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            dispatch_signal(&wrong_runtime_signal),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_HOOK_MASK.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use scope_local::{ActiveScope, Scope};
 use starry_process::Pid;
 use starry_signal::{
     SignalInfo,
-    api::{ThreadSignalManager, ThreadSignalRegistration},
+    api::{ThreadRegistrationError, ThreadSignalManager, ThreadSignalRegistration},
 };
 
 use super::{
@@ -832,7 +832,12 @@ impl Thread {
         let registration = thread
             .signal
             .try_register(tid)
-            .map_err(|_| AxError::NoMemory)?;
+            .map_err(|error| match error {
+                ThreadRegistrationError::NoMemory => AxError::NoMemory,
+                ThreadRegistrationError::AlreadyRegistered
+                | ThreadRegistrationError::TidInUse
+                | ThreadRegistrationError::Cancelled => AxError::BadState,
+            })?;
         Ok((thread, registration))
     }
 
