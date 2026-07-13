@@ -229,11 +229,50 @@ trap 'exit 143' TERM
 archive_root="$work_dir/archives"
 artifact_root="$work_dir/artifacts"
 consumer_root="$work_dir/consumer"
-mkdir -p "$archive_root/ax" "$archive_root/linux-abi" "$artifact_root" "$consumer_root"
+package_source_root="$work_dir/package-sources"
+mkdir -p \
+    "$archive_root/ax" \
+    "$archive_root/linux-abi" \
+    "$artifact_root" \
+    "$consumer_root" \
+    "$package_source_root"
+
+# Cargo only emits .cargo_vcs_info.json when the package path has a complete
+# repository identity. A linked worktree bind-mounted at a container alias can
+# pass Git's HEAD checks while Cargo sees no VCS root, changing the release
+# bytes. Package from detached clones of the already-verified clean sources so
+# normal checkouts, linked worktrees, and container aliases are reproducible.
+clone_release_source() {
+    local label=$1
+    local source=$2
+    local expected_head=$3
+    local destination=$4
+    local cloned_head
+
+    git clone --quiet --no-checkout --no-local -- "$source" "$destination" \
+        || ci_die "failed to clone verified $label source"
+    git -C "$destination" checkout --quiet --detach "$expected_head" \
+        || ci_die "failed to check out verified $label HEAD"
+    cloned_head=$(git -C "$destination" rev-parse --verify HEAD^{commit}) \
+        || ci_die "cloned $label source has no valid HEAD"
+    [ "$cloned_head" = "$expected_head" ] \
+        || ci_die "cloned $label HEAD changed before packaging"
+    [ -z "$(git -C "$destination" status --porcelain=v1 --untracked-files=all)" ] \
+        || ci_die "cloned $label source is not clean"
+}
+
+ax_package_repo="$package_source_root/thekernel-ax"
+linux_abi_package_repo="$package_source_root/thekernel-linux-abi"
+clone_release_source thekernel-ax "$AX_REPO" "$AX_HEAD" "$ax_package_repo"
+clone_release_source \
+    thekernel-linux-abi \
+    "$LINUX_ABI_REPO" \
+    "$LINUX_ABI_HEAD" \
+    "$linux_abi_package_repo"
 
 printf '[release-consumer] package thekernel-ax at %.12s\n' "$AX_HEAD"
 (
-    cd "$AX_REPO"
+    cd "$ax_package_repo"
     CARGO_TARGET_DIR="$archive_root/ax" \
         cargo "+$PACKAGE_TOOLCHAIN" -Z package-workspace package \
             --locked --no-verify \
@@ -245,7 +284,7 @@ printf '[release-consumer] package thekernel-ax at %.12s\n' "$AX_HEAD"
 printf '[release-consumer] package thekernel-linux-abi at %.12s\n' \
     "$LINUX_ABI_HEAD"
 (
-    cd "$LINUX_ABI_REPO"
+    cd "$linux_abi_package_repo"
     CARGO_TARGET_DIR="$archive_root/linux-abi" \
         cargo "+$PACKAGE_TOOLCHAIN" -Z package-workspace package \
             --locked --no-verify \

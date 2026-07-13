@@ -86,8 +86,10 @@ run_args+=(
 )
 
 # A linked worktree stores a small `.git` file whose gitdir points into the
-# primary checkout. Mount each external common directory at the same absolute
-# path so Git commands work for the consumer and either maintained sibling.
+# primary checkout. A bind of only the worktree does not include that external
+# directory, so Git commands inside the container would otherwise fail. Mount
+# each external common directory read-only at the same absolute path. Normal
+# checkouts already carry their own .git directory and need no extra mount.
 mount_linked_git_common_dir() {
     local checkout=$1
     local git_common_dir

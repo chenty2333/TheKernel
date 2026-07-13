@@ -28,14 +28,23 @@ mkdir -p \
     "$dev_fixture/dev-env" \
     "$dev_fixture/fake-bin" \
     "$tmp/dev-ax" \
-    "$tmp/dev-linux-abi" \
+    "$tmp/dev-linux-abi-primary" \
     "$tmp/dev-rootfs"
 cp "$REPO_ROOT/scripts/dev-shell.sh" "$dev_fixture/scripts/"
 : >"$dev_fixture/dev-env/versions.env"
 : >"$dev_fixture/dev-env/compose.yaml"
 : >"$tmp/dev-ax/Cargo.toml"
-: >"$tmp/dev-linux-abi/Cargo.toml"
 git -C "$dev_fixture" init --quiet
+: >"$tmp/dev-linux-abi-primary/Cargo.toml"
+git -C "$tmp/dev-linux-abi-primary" init --quiet
+git -C "$tmp/dev-linux-abi-primary" add Cargo.toml
+git -C "$tmp/dev-linux-abi-primary" \
+    -c user.name=CI -c user.email=ci@example.invalid \
+    commit --quiet -m fixture
+git -C "$tmp/dev-linux-abi-primary" worktree add --quiet --detach \
+    "$tmp/dev-linux-abi" HEAD
+# The linked checkout must carry the package manifest expected by dev-shell.
+[ -f "$tmp/dev-linux-abi/Cargo.toml" ]
 cat >"$dev_fixture/fake-bin/docker" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >"$DEV_SHELL_DOCKER_ARGS"
@@ -50,6 +59,9 @@ env \
     "$dev_fixture/scripts/dev-shell.sh" -- make kernel-rv
 grep -Fxq -- "$tmp/dev-ax:/thekernel-ax:ro,z" "$tmp/dev-shell.args"
 grep -Fxq -- "$tmp/dev-linux-abi:/thekernel-linux-abi:ro,z" \
+    "$tmp/dev-shell.args"
+grep -Fxq -- \
+    "$tmp/dev-linux-abi-primary/.git:$tmp/dev-linux-abi-primary/.git:ro,z" \
     "$tmp/dev-shell.args"
 grep -Fxq -- 'make' "$tmp/dev-shell.args"
 grep -Fxq -- 'kernel-rv' "$tmp/dev-shell.args"
