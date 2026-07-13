@@ -51,7 +51,7 @@ pub(crate) fn ns_capable(
     target_user_ns: &Arc<UserNamespace>,
     capability: u32,
 ) -> bool {
-    thekernel_linux_cred::ns_capable(actor, target_user_ns, capability)
+    thekernel_linux_cred::ns_capable(actor.core(), target_user_ns, capability)
 }
 
 fn idmap_writer_parent(opener: &Cred, target: &Arc<UserNamespace>) -> Option<Arc<UserNamespace>> {

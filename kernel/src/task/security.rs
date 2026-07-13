@@ -5,8 +5,8 @@
 //! Runtime dispatch only walks that immutable declaration order: it cannot
 //! allocate, register, remove, or silently skip a module.
 
-use alloc::{sync::Arc, vec::Vec};
-use core::{fmt, marker::PhantomData};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use core::{any::Any, fmt, marker::PhantomData};
 
 use axerrno::{AxError, AxResult};
 use spin::Once;
@@ -19,7 +19,9 @@ pub(crate) use thekernel_linux_cred::{
     PtraceAccessKind, PtraceCredentialKind, SchedulerSecurityOperation,
 };
 
-use super::{ExecCredentialSecurityContext, UserNamespace, exec_cred::authorize_commoncap_exec};
+use super::{
+    ExecCredentialSecurityContext, UserNamespace, creds::Cred, exec_cred::authorize_commoncap_exec,
+};
 
 const SECURITY_MODULE_LIMIT: usize = 8;
 const COMMONCAP_MODULE_KEY: ModuleKey = ModuleKey(0);
@@ -30,6 +32,35 @@ struct ModuleKey(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ModuleId(u8);
+
+type CoreCred = thekernel_linux_cred::Credential<UserNamespace>;
+
+/// The way an unpublished composite credential was derived from its exact
+/// immutable predecessor. Modules may use this to keep fork, namespace, exec,
+/// and ordinary transition state distinct without learning syscall details.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::task) enum CredentialStateTransition {
+    Fork,
+    Normal,
+    UserNamespace,
+    Exec,
+}
+
+/// Opaque proof that the complete boot-time module stack was frozen and
+/// published. Credentials retain this exact identity for their whole life;
+/// state preparation and dispatch never rediscover it through a global.
+#[derive(Clone, Copy)]
+pub(crate) struct FrozenSecurityRegistry(&'static SecurityRegistry);
+
+impl FrozenSecurityRegistry {
+    fn registry(self) -> &'static SecurityRegistry {
+        self.0
+    }
+
+    pub(in crate::task) fn same_registry(self, other: Self) -> bool {
+        core::ptr::eq(self.0, other.0)
+    }
+}
 
 /// Boot-time registry construction and publication failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,14 +147,135 @@ impl<'a> ProcessImageSecurityRef<'a> {
     }
 }
 
-/// External typed security contexts specialized to TheKernel's namespace and
-/// exact pinned process-image token. The registry and dispatch remain local.
-pub(crate) type PtraceAccessContext<'a> =
+type CorePtraceAccessContext<'a> =
     thekernel_linux_cred::PtraceAccessContext<'a, UserNamespace, ProcessImageSecurityRef<'a>>;
-pub(crate) type PtraceTracemeContext<'a> =
+type CorePtraceTracemeContext<'a> =
     thekernel_linux_cred::PtraceTracemeContext<'a, UserNamespace, ProcessImageSecurityRef<'a>>;
-pub(crate) type SecuritySchedulerContext<'a> =
+type CoreSchedulerSecurityContext<'a> =
     thekernel_linux_cred::SchedulerSecurityContext<'a, UserNamespace>;
+
+/// Kernel context retaining the exact composite actor and target credentials.
+/// Commoncap sees the policy-neutral core view; other modules receive their
+/// own typed state at the same dense registry index.
+pub(crate) struct PtraceAccessContext<'a> {
+    actor: &'a Cred,
+    target: &'a Cred,
+    core: CorePtraceAccessContext<'a>,
+}
+
+impl<'a> PtraceAccessContext<'a> {
+    pub(crate) fn new(
+        actor: &'a Cred,
+        target: &'a Cred,
+        target_image_owner_user_ns: &'a Arc<UserNamespace>,
+        target_object: &'a ProcessImageSecurityRef<'a>,
+        access_kind: PtraceAccessKind,
+        credential_kind: PtraceCredentialKind,
+    ) -> Self {
+        Self {
+            actor,
+            target,
+            core: CorePtraceAccessContext::new(
+                actor.core(),
+                target.core(),
+                target_image_owner_user_ns,
+                target_object,
+                access_kind,
+                credential_kind,
+            ),
+        }
+    }
+
+    fn core(&self) -> &CorePtraceAccessContext<'a> {
+        &self.core
+    }
+
+    pub(crate) const fn actor(&self) -> &'a Cred {
+        self.actor
+    }
+
+    pub(crate) const fn target(&self) -> &'a Cred {
+        self.target
+    }
+
+    pub(crate) const fn access_kind(&self) -> PtraceAccessKind {
+        self.core.access_kind()
+    }
+}
+
+pub(crate) struct PtraceTracemeContext<'a> {
+    parent_actor: &'a Cred,
+    child_target: &'a Cred,
+    core: CorePtraceTracemeContext<'a>,
+}
+
+impl<'a> PtraceTracemeContext<'a> {
+    pub(crate) fn new(
+        parent_actor: &'a Cred,
+        child_target: &'a Cred,
+        child_image_owner_user_ns: &'a Arc<UserNamespace>,
+        child_object: &'a ProcessImageSecurityRef<'a>,
+    ) -> Self {
+        Self {
+            parent_actor,
+            child_target,
+            core: CorePtraceTracemeContext::new(
+                parent_actor.core(),
+                child_target.core(),
+                child_image_owner_user_ns,
+                child_object,
+            ),
+        }
+    }
+
+    fn core(&self) -> &CorePtraceTracemeContext<'a> {
+        &self.core
+    }
+
+    pub(crate) const fn parent_actor(&self) -> &'a Cred {
+        self.parent_actor
+    }
+
+    pub(crate) const fn child_target(&self) -> &'a Cred {
+        self.child_target
+    }
+}
+
+pub(crate) struct SecuritySchedulerContext<'a> {
+    actor: &'a Cred,
+    target: &'a Cred,
+    core: CoreSchedulerSecurityContext<'a>,
+}
+
+impl<'a> SecuritySchedulerContext<'a> {
+    pub(crate) fn new(
+        actor: &'a Cred,
+        target: &'a Cred,
+        operation: SchedulerSecurityOperation,
+    ) -> Self {
+        Self {
+            actor,
+            target,
+            core: CoreSchedulerSecurityContext::new(actor.core(), target.core(), operation),
+        }
+    }
+
+    fn core(&self) -> &CoreSchedulerSecurityContext<'a> {
+        &self.core
+    }
+
+    pub(crate) const fn actor(&self) -> &'a Cred {
+        self.actor
+    }
+
+    pub(crate) const fn target(&self) -> &'a Cred {
+        self.target
+    }
+
+    pub(crate) const fn owner_match(&self) -> bool {
+        self.core.owner_match()
+    }
+}
 
 /// One security module owns every hook family as one registration unit.
 ///
@@ -133,52 +285,351 @@ pub(crate) type SecuritySchedulerContext<'a> =
 /// resources if a later registry step fails.
 trait SecurityModule: Send + Sync + 'static {
     const KEY: ModuleKey;
+    type CredentialState: Send + Sync + 'static;
 
     fn try_boot_init() -> Result<Self, RegistryBuildError>
     where
         Self: Sized;
 
+    /// Constructs this module's state for the initial root credential.
+    fn try_init_credential(&self, credential: &CoreCred) -> AxResult<Self::CredentialState>;
+
+    /// Constructs a complete unpublished replacement state from the exact
+    /// old composite credential. This is the only fallible state callback.
+    fn try_prepare_credential(
+        &self,
+        old_credential: &CoreCred,
+        old_state: &Self::CredentialState,
+        proposed_credential: &CoreCred,
+        transition: CredentialStateTransition,
+    ) -> AxResult<Self::CredentialState>;
+
+    /// Authorizes one fully prepared old/new state pair. Dispatch is ordered
+    /// and deny-first; a denial drops every proposed state before publication.
+    fn authorize_credential(
+        &self,
+        _old_credential: &CoreCred,
+        _old_state: &Self::CredentialState,
+        _proposed_credential: &CoreCred,
+        _proposed_state: &Self::CredentialState,
+        _transition: CredentialStateTransition,
+    ) -> AxResult<()> {
+        Ok(())
+    }
+
+    /// Releases one module state through the module runtime that created it.
+    /// The owner wrapper invokes this directly and never consults a registry.
+    ///
+    /// This is a Linux-LSM-style atomic teardown callback: it must not block,
+    /// allocate, reenter credential update, or acquire task/process/image
+    /// locks. Rollback may call it while the sleepable credential-writer mutex
+    /// is owned, but never under credential publication, image, alias, or
+    /// registry spin locks. Committed retired states are freed after the writer
+    /// mutex as well. A module needing sleepable cleanup must transfer an owned
+    /// token to an independently preallocated deferred-work mechanism.
+    fn free_credential(&self, state: Self::CredentialState) {
+        drop(state);
+    }
+
     fn ptrace_access(&self, _context: &PtraceAccessContext<'_>) -> AxResult<()> {
         Ok(())
+    }
+
+    fn ptrace_access_with_credential_state(
+        &self,
+        context: &PtraceAccessContext<'_>,
+        _actor_state: &Self::CredentialState,
+        _target_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        self.ptrace_access(context)
     }
 
     fn ptrace_traceme(&self, _context: &PtraceTracemeContext<'_>) -> AxResult<()> {
         Ok(())
     }
 
+    fn ptrace_traceme_with_credential_state(
+        &self,
+        context: &PtraceTracemeContext<'_>,
+        _parent_state: &Self::CredentialState,
+        _child_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        self.ptrace_traceme(context)
+    }
+
     fn exec_credential(&self, _context: &ExecCredentialSecurityContext<'_>) -> AxResult<()> {
         Ok(())
     }
 
+    fn exec_credential_with_credential_state(
+        &self,
+        context: &ExecCredentialSecurityContext<'_>,
+        _old_state: &Self::CredentialState,
+        _proposed_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        self.exec_credential(context)
+    }
+
     fn scheduler(&self, _context: &SecuritySchedulerContext<'_>) -> AxResult<()> {
         Ok(())
+    }
+
+    fn scheduler_with_credential_state(
+        &self,
+        context: &SecuritySchedulerContext<'_>,
+        actor_state: &Self::CredentialState,
+        target_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        let _ = (actor_state, target_state);
+        self.scheduler(context)
     }
 }
 
 /// Object-safe runtime view of a source-facing module. The adapter keeps the
 /// compile-time key and fallible initializer out of dispatch's trait object.
 trait ErasedSecurityModule: Send + Sync {
+    fn validate_credential_state(&self, state: &dyn ErasedOwnedCredentialState) -> AxResult<()>;
+    fn try_init_credential(
+        self: Arc<Self>,
+        credential: &CoreCred,
+    ) -> AxResult<Box<dyn ErasedOwnedCredentialState>>;
+    fn try_prepare_credential(
+        self: Arc<Self>,
+        old_credential: &CoreCred,
+        old_state: &dyn ErasedOwnedCredentialState,
+        proposed_credential: &CoreCred,
+        transition: CredentialStateTransition,
+    ) -> AxResult<Box<dyn ErasedOwnedCredentialState>>;
+    fn authorize_credential(
+        &self,
+        old_credential: &CoreCred,
+        old_state: &dyn ErasedOwnedCredentialState,
+        proposed_credential: &CoreCred,
+        proposed_state: &dyn ErasedOwnedCredentialState,
+        transition: CredentialStateTransition,
+    ) -> AxResult<()>;
     fn ptrace_access(&self, context: &PtraceAccessContext<'_>) -> AxResult<()>;
+    fn ptrace_access_with_credential_state(
+        &self,
+        context: &PtraceAccessContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+        target_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
     fn ptrace_traceme(&self, context: &PtraceTracemeContext<'_>) -> AxResult<()>;
+    fn ptrace_traceme_with_credential_state(
+        &self,
+        context: &PtraceTracemeContext<'_>,
+        parent_state: &dyn ErasedOwnedCredentialState,
+        child_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
     fn exec_credential(&self, context: &ExecCredentialSecurityContext<'_>) -> AxResult<()>;
+    fn exec_credential_with_credential_state(
+        &self,
+        context: &ExecCredentialSecurityContext<'_>,
+        old_state: &dyn ErasedOwnedCredentialState,
+        proposed_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
     fn scheduler(&self, context: &SecuritySchedulerContext<'_>) -> AxResult<()>;
+    fn scheduler_with_credential_state(
+        &self,
+        context: &SecuritySchedulerContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+        target_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
+}
+
+trait ErasedOwnedCredentialState: Any + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// Keeps the creating runtime alive until its last credential state is freed.
+/// Its explicit `Drop` callback means teardown never has to look up a module
+/// by ID in global or registry-owned storage.
+struct OwnedCredentialState<M: SecurityModule> {
+    module: Arc<M>,
+    state: Option<M::CredentialState>,
+}
+
+impl<M: SecurityModule> OwnedCredentialState<M> {
+    fn state(&self) -> &M::CredentialState {
+        self.state
+            .as_ref()
+            .expect("owned credential state was already released")
+    }
+}
+
+impl<M: SecurityModule> ErasedOwnedCredentialState for OwnedCredentialState<M> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl<M: SecurityModule> Drop for OwnedCredentialState<M> {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            self.module.free_credential(state);
+        }
+    }
+}
+
+fn try_own_credential_state<M: SecurityModule>(
+    module: Arc<M>,
+    state: M::CredentialState,
+) -> AxResult<Box<dyn ErasedOwnedCredentialState>> {
+    try_own_credential_state_with(module, state, |state| {
+        Box::try_new(state).map_err(|_| AxError::NoMemory)
+    })
+}
+
+fn try_own_credential_state_with<M, F>(
+    module: Arc<M>,
+    state: M::CredentialState,
+    allocate: F,
+) -> AxResult<Box<dyn ErasedOwnedCredentialState>>
+where
+    M: SecurityModule,
+    F: FnOnce(OwnedCredentialState<M>) -> AxResult<Box<OwnedCredentialState<M>>>,
+{
+    let state = allocate(OwnedCredentialState {
+        module,
+        state: Some(state),
+    })?;
+    Ok(state)
+}
+
+fn owned_credential_state<'a, M: SecurityModule>(
+    module: &M,
+    state: &'a dyn ErasedOwnedCredentialState,
+) -> AxResult<&'a M::CredentialState> {
+    let state = state
+        .as_any()
+        .downcast_ref::<OwnedCredentialState<M>>()
+        .ok_or(AxError::OperationNotPermitted)?;
+    if !core::ptr::eq(module, Arc::as_ptr(&state.module)) {
+        return Err(AxError::OperationNotPermitted);
+    }
+    Ok(state.state())
 }
 
 impl<M: SecurityModule> ErasedSecurityModule for M {
+    fn validate_credential_state(&self, state: &dyn ErasedOwnedCredentialState) -> AxResult<()> {
+        owned_credential_state(self, state).map(|_| ())
+    }
+
+    fn try_init_credential(
+        self: Arc<Self>,
+        credential: &CoreCred,
+    ) -> AxResult<Box<dyn ErasedOwnedCredentialState>> {
+        let state = SecurityModule::try_init_credential(self.as_ref(), credential)?;
+        try_own_credential_state(self, state)
+    }
+
+    fn try_prepare_credential(
+        self: Arc<Self>,
+        old_credential: &CoreCred,
+        old_state: &dyn ErasedOwnedCredentialState,
+        proposed_credential: &CoreCred,
+        transition: CredentialStateTransition,
+    ) -> AxResult<Box<dyn ErasedOwnedCredentialState>> {
+        let old_state = owned_credential_state(self.as_ref(), old_state)?;
+        let proposed_state = SecurityModule::try_prepare_credential(
+            self.as_ref(),
+            old_credential,
+            old_state,
+            proposed_credential,
+            transition,
+        )?;
+        try_own_credential_state(self, proposed_state)
+    }
+
+    fn authorize_credential(
+        &self,
+        old_credential: &CoreCred,
+        old_state: &dyn ErasedOwnedCredentialState,
+        proposed_credential: &CoreCred,
+        proposed_state: &dyn ErasedOwnedCredentialState,
+        transition: CredentialStateTransition,
+    ) -> AxResult<()> {
+        SecurityModule::authorize_credential(
+            self,
+            old_credential,
+            owned_credential_state(self, old_state)?,
+            proposed_credential,
+            owned_credential_state(self, proposed_state)?,
+            transition,
+        )
+    }
+
     fn ptrace_access(&self, context: &PtraceAccessContext<'_>) -> AxResult<()> {
         SecurityModule::ptrace_access(self, context)
+    }
+
+    fn ptrace_access_with_credential_state(
+        &self,
+        context: &PtraceAccessContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+        target_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::ptrace_access_with_credential_state(
+            self,
+            context,
+            owned_credential_state(self, actor_state)?,
+            owned_credential_state(self, target_state)?,
+        )
     }
 
     fn ptrace_traceme(&self, context: &PtraceTracemeContext<'_>) -> AxResult<()> {
         SecurityModule::ptrace_traceme(self, context)
     }
 
+    fn ptrace_traceme_with_credential_state(
+        &self,
+        context: &PtraceTracemeContext<'_>,
+        parent_state: &dyn ErasedOwnedCredentialState,
+        child_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::ptrace_traceme_with_credential_state(
+            self,
+            context,
+            owned_credential_state(self, parent_state)?,
+            owned_credential_state(self, child_state)?,
+        )
+    }
+
     fn exec_credential(&self, context: &ExecCredentialSecurityContext<'_>) -> AxResult<()> {
         SecurityModule::exec_credential(self, context)
     }
 
+    fn exec_credential_with_credential_state(
+        &self,
+        context: &ExecCredentialSecurityContext<'_>,
+        old_state: &dyn ErasedOwnedCredentialState,
+        proposed_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::exec_credential_with_credential_state(
+            self,
+            context,
+            owned_credential_state(self, old_state)?,
+            owned_credential_state(self, proposed_state)?,
+        )
+    }
+
     fn scheduler(&self, context: &SecuritySchedulerContext<'_>) -> AxResult<()> {
         SecurityModule::scheduler(self, context)
+    }
+
+    fn scheduler_with_credential_state(
+        &self,
+        context: &SecuritySchedulerContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+        target_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::scheduler_with_credential_state(
+            self,
+            context,
+            owned_credential_state(self, actor_state)?,
+            owned_credential_state(self, target_state)?,
+        )
     }
 }
 
@@ -186,17 +637,32 @@ struct CommoncapModule;
 
 impl SecurityModule for CommoncapModule {
     const KEY: ModuleKey = COMMONCAP_MODULE_KEY;
+    type CredentialState = ();
 
     fn try_boot_init() -> Result<Self, RegistryBuildError> {
         Ok(Self)
     }
 
+    fn try_init_credential(&self, _credential: &CoreCred) -> AxResult<Self::CredentialState> {
+        Ok(())
+    }
+
+    fn try_prepare_credential(
+        &self,
+        _old_credential: &CoreCred,
+        _old_state: &Self::CredentialState,
+        _proposed_credential: &CoreCred,
+        _transition: CredentialStateTransition,
+    ) -> AxResult<Self::CredentialState> {
+        Ok(())
+    }
+
     fn ptrace_access(&self, context: &PtraceAccessContext<'_>) -> AxResult<()> {
-        external_commoncap_ptrace_access(context).map_err(authorization_error)
+        external_commoncap_ptrace_access(context.core()).map_err(authorization_error)
     }
 
     fn ptrace_traceme(&self, context: &PtraceTracemeContext<'_>) -> AxResult<()> {
-        external_commoncap_ptrace_traceme(context).map_err(authorization_error)
+        external_commoncap_ptrace_traceme(context.core()).map_err(authorization_error)
     }
 
     /// Validates the invariants that must still hold after commoncap's exec
@@ -208,7 +674,7 @@ impl SecurityModule for CommoncapModule {
     }
 
     fn scheduler(&self, context: &SecuritySchedulerContext<'_>) -> AxResult<()> {
-        external_commoncap_scheduler(context).map_err(authorization_error)
+        external_commoncap_scheduler(context.core()).map_err(authorization_error)
     }
 }
 
@@ -218,9 +684,24 @@ struct NoopPolicyModule;
 
 impl SecurityModule for NoopPolicyModule {
     const KEY: ModuleKey = NOOP_POLICY_MODULE_KEY;
+    type CredentialState = ();
 
     fn try_boot_init() -> Result<Self, RegistryBuildError> {
         Ok(Self)
+    }
+
+    fn try_init_credential(&self, _credential: &CoreCred) -> AxResult<Self::CredentialState> {
+        Ok(())
+    }
+
+    fn try_prepare_credential(
+        &self,
+        _old_credential: &CoreCred,
+        _old_state: &Self::CredentialState,
+        _proposed_credential: &CoreCred,
+        _transition: CredentialStateTransition,
+    ) -> AxResult<Self::CredentialState> {
+        Ok(())
     }
 }
 
@@ -401,7 +882,168 @@ struct SecurityRegistry {
     modules: Vec<RegisteredModule>,
 }
 
+struct OwnedModuleCredState {
+    module_id: ModuleId,
+    erased: Box<dyn ErasedOwnedCredentialState>,
+}
+
+/// Complete immutable per-module state carried by one composite credential.
+/// The layout identity and dense ModuleId order are checked before every
+/// prepare/authorize pass, so a foreign or malformed state fails closed.
+pub(in crate::task) struct CredentialSecurityState {
+    registry: FrozenSecurityRegistry,
+    slots: Vec<OwnedModuleCredState>,
+}
+
+impl CredentialSecurityState {
+    pub(in crate::task) fn registry(&self) -> FrozenSecurityRegistry {
+        self.registry
+    }
+
+    fn validate_for(&self, registry: FrozenSecurityRegistry) -> AxResult<()> {
+        if !self.registry.same_registry(registry)
+            || self.slots.len() != registry.registry().modules.len()
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+        for (index, slot) in self.slots.iter().enumerate() {
+            if usize::from(slot.module_id.0) != index
+                || registry.registry().modules[index].id != slot.module_id
+            {
+                return Err(AxError::OperationNotPermitted);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CredentialSecurityState {
+    fn drop(&mut self) {
+        while self.slots.pop().is_some() {}
+    }
+}
+
 impl SecurityRegistry {
+    fn validate_erased_slots(&self, slots: &[OwnedModuleCredState]) -> AxResult<()> {
+        if slots.len() != self.modules.len() {
+            return Err(AxError::OperationNotPermitted);
+        }
+        for (registered, slot) in self.modules.iter().zip(slots) {
+            if registered.id != slot.module_id {
+                return Err(AxError::OperationNotPermitted);
+            }
+            registered
+                .module
+                .validate_credential_state(slot.erased.as_ref())?;
+        }
+        Ok(())
+    }
+
+    fn security_slots<'a>(
+        &self,
+        security: &'a CredentialSecurityState,
+    ) -> AxResult<&'a [OwnedModuleCredState]> {
+        let registry = security.registry();
+        if !core::ptr::eq(self, registry.registry()) {
+            return Err(AxError::OperationNotPermitted);
+        }
+        security.validate_for(registry)?;
+        self.validate_erased_slots(&security.slots)?;
+        Ok(&security.slots)
+    }
+
+    fn credential_slots<'a>(&self, credential: &'a Cred) -> AxResult<&'a [OwnedModuleCredState]> {
+        self.security_slots(credential.security())
+    }
+
+    fn try_empty_credential_state(
+        &'static self,
+        registry: FrozenSecurityRegistry,
+    ) -> AxResult<CredentialSecurityState> {
+        self.try_empty_credential_state_with_reservation(registry, self.modules.len())
+    }
+
+    fn try_empty_credential_state_with_reservation(
+        &'static self,
+        registry: FrozenSecurityRegistry,
+        reservation: usize,
+    ) -> AxResult<CredentialSecurityState> {
+        if !core::ptr::eq(self, registry.registry()) {
+            return Err(AxError::OperationNotPermitted);
+        }
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(reservation)
+            .map_err(|_| AxError::NoMemory)?;
+        Ok(CredentialSecurityState { registry, slots })
+    }
+
+    fn try_init_credential_state(
+        &'static self,
+        registry: FrozenSecurityRegistry,
+        credential: &CoreCred,
+    ) -> AxResult<CredentialSecurityState> {
+        let mut candidate = self.try_empty_credential_state(registry)?;
+        for registered in &self.modules {
+            let erased = registered.module.clone().try_init_credential(credential)?;
+            candidate.slots.push(OwnedModuleCredState {
+                module_id: registered.id,
+                erased,
+            });
+        }
+        candidate.validate_for(registry)?;
+        self.validate_erased_slots(&candidate.slots)?;
+        Ok(candidate)
+    }
+
+    fn try_prepare_credential_state(
+        &'static self,
+        registry: FrozenSecurityRegistry,
+        old_credential: &CoreCred,
+        old_state: &CredentialSecurityState,
+        proposed_credential: &CoreCred,
+        transition: CredentialStateTransition,
+    ) -> AxResult<CredentialSecurityState> {
+        old_state.validate_for(registry)?;
+        self.validate_erased_slots(&old_state.slots)?;
+        let mut candidate = self.try_empty_credential_state(registry)?;
+        for (registered, old_slot) in self.modules.iter().zip(&old_state.slots) {
+            if registered.id != old_slot.module_id {
+                return Err(AxError::OperationNotPermitted);
+            }
+            let erased = registered.module.clone().try_prepare_credential(
+                old_credential,
+                old_slot.erased.as_ref(),
+                proposed_credential,
+                transition,
+            )?;
+            candidate.slots.push(OwnedModuleCredState {
+                module_id: registered.id,
+                erased,
+            });
+        }
+        candidate.validate_for(registry)?;
+        self.validate_erased_slots(&candidate.slots)?;
+
+        // Authorization is a separate, allocation-free pass over a complete
+        // proposal. First denial aborts and reverse-drops the whole candidate.
+        for ((registered, old_slot), proposed_slot) in self
+            .modules
+            .iter()
+            .zip(&old_state.slots)
+            .zip(&candidate.slots)
+        {
+            registered.module.authorize_credential(
+                old_credential,
+                old_slot.erased.as_ref(),
+                proposed_credential,
+                proposed_slot.erased.as_ref(),
+                transition,
+            )?;
+        }
+        Ok(candidate)
+    }
+
     fn dispatch_ptrace_access(&self, context: &PtraceAccessContext<'_>) -> AxResult<()> {
         for (index, registered) in self.modules.iter().enumerate() {
             debug_assert_eq!(usize::from(registered.id.0), index);
@@ -410,10 +1052,50 @@ impl SecurityRegistry {
         Ok(())
     }
 
+    fn dispatch_ptrace_access_with_credential_state(
+        &self,
+        context: &PtraceAccessContext<'_>,
+    ) -> AxResult<()> {
+        let actor = self.credential_slots(context.actor())?;
+        let target = self.credential_slots(context.target())?;
+        for ((registered, actor_state), target_state) in self.modules.iter().zip(actor).zip(target)
+        {
+            if registered.id != actor_state.module_id || registered.id != target_state.module_id {
+                return Err(AxError::OperationNotPermitted);
+            }
+            registered.module.ptrace_access_with_credential_state(
+                context,
+                actor_state.erased.as_ref(),
+                target_state.erased.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+
     fn dispatch_ptrace_traceme(&self, context: &PtraceTracemeContext<'_>) -> AxResult<()> {
         for (index, registered) in self.modules.iter().enumerate() {
             debug_assert_eq!(usize::from(registered.id.0), index);
             registered.module.ptrace_traceme(context)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_ptrace_traceme_with_credential_state(
+        &self,
+        context: &PtraceTracemeContext<'_>,
+    ) -> AxResult<()> {
+        let parent = self.credential_slots(context.parent_actor())?;
+        let child = self.credential_slots(context.child_target())?;
+        for ((registered, parent_state), child_state) in self.modules.iter().zip(parent).zip(child)
+        {
+            if registered.id != parent_state.module_id || registered.id != child_state.module_id {
+                return Err(AxError::OperationNotPermitted);
+            }
+            registered.module.ptrace_traceme_with_credential_state(
+                context,
+                parent_state.erased.as_ref(),
+                child_state.erased.as_ref(),
+            )?;
         }
         Ok(())
     }
@@ -429,12 +1111,77 @@ impl SecurityRegistry {
         Ok(())
     }
 
+    fn dispatch_exec_credential_with_credential_state(
+        &self,
+        context: &ExecCredentialSecurityContext<'_>,
+    ) -> AxResult<()> {
+        let old = self.credential_slots(context.old())?;
+        let proposed = self.security_slots(context.draft().proposed_security())?;
+        for ((registered, old_state), proposed_state) in self.modules.iter().zip(old).zip(proposed)
+        {
+            if registered.id != old_state.module_id || registered.id != proposed_state.module_id {
+                return Err(AxError::OperationNotPermitted);
+            }
+            registered.module.exec_credential_with_credential_state(
+                context,
+                old_state.erased.as_ref(),
+                proposed_state.erased.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+
     fn dispatch_scheduler(&self, context: &SecuritySchedulerContext<'_>) -> AxResult<()> {
         for (index, registered) in self.modules.iter().enumerate() {
             debug_assert_eq!(usize::from(registered.id.0), index);
             registered.module.scheduler(context)?;
         }
         Ok(())
+    }
+
+    fn dispatch_scheduler_with_credential_state(
+        &self,
+        context: &SecuritySchedulerContext<'_>,
+    ) -> AxResult<()> {
+        let actor = self.credential_slots(context.actor())?;
+        let target = self.credential_slots(context.target())?;
+        for ((registered, actor_state), target_state) in self.modules.iter().zip(actor).zip(target)
+        {
+            if registered.id != actor_state.module_id || registered.id != target_state.module_id {
+                return Err(AxError::OperationNotPermitted);
+            }
+            registered.module.scheduler_with_credential_state(
+                context,
+                actor_state.erased.as_ref(),
+                target_state.erased.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl FrozenSecurityRegistry {
+    pub(in crate::task) fn try_init_credential_state(
+        self,
+        credential: &CoreCred,
+    ) -> AxResult<CredentialSecurityState> {
+        self.registry().try_init_credential_state(self, credential)
+    }
+
+    pub(in crate::task) fn try_prepare_credential_state(
+        self,
+        old_credential: &CoreCred,
+        old_state: &CredentialSecurityState,
+        proposed_credential: &CoreCred,
+        transition: CredentialStateTransition,
+    ) -> AxResult<CredentialSecurityState> {
+        self.registry().try_prepare_credential_state(
+            self,
+            old_credential,
+            old_state,
+            proposed_credential,
+            transition,
+        )
     }
 }
 
@@ -475,6 +1222,7 @@ impl SecurityRegistryPublication {
         }
     }
 
+    #[cfg(test)]
     fn get(&self) -> Option<&SecurityRegistry> {
         self.registry.get()
     }
@@ -492,46 +1240,44 @@ fn try_build_builtin_registry() -> Result<SecurityRegistry, RegistryBuildError> 
 }
 
 /// Builds, freezes, and publishes the complete registry before userspace.
-pub(crate) fn init() -> Result<(), RegistryBuildError> {
-    SECURITY_REGISTRY.try_publish_with(try_build_builtin_registry)?;
-    Ok(())
+pub(crate) fn init() -> Result<FrozenSecurityRegistry, RegistryBuildError> {
+    let registry = SECURITY_REGISTRY.try_publish_with(try_build_builtin_registry)?;
+    Ok(FrozenSecurityRegistry(registry))
 }
 
+#[cfg(test)]
+pub(in crate::task) fn test_frozen_registry() -> FrozenSecurityRegistry {
+    FrozenSecurityRegistry(
+        TEST_SECURITY_REGISTRY
+            .call_once(|| try_build_builtin_registry().expect("failed to build test registry")),
+    )
+}
+
+#[cfg(test)]
 fn require_published_registry(registry: Option<&SecurityRegistry>) -> AxResult<&SecurityRegistry> {
     registry.ok_or(AxError::OperationNotPermitted)
-}
-
-fn registry_for_dispatch() -> AxResult<&'static SecurityRegistry> {
-    match require_published_registry(SECURITY_REGISTRY.get()) {
-        Ok(registry) => return Ok(registry),
-        Err(error) => {
-            #[cfg(not(test))]
-            return Err(error);
-
-            #[cfg(test)]
-            let _ = error;
-        }
-    }
-
-    // Host unit tests do not execute `entry::init`; keep their policy complete
-    // without weakening the non-test boot contract or the one-shot publisher.
-    #[cfg(test)]
-    {
-        return Ok(TEST_SECURITY_REGISTRY
-            .call_once(|| try_build_builtin_registry().expect("failed to build test registry")));
-    }
 }
 
 /// Runs the frozen ptrace access hooks in declaration order.
 /// The first denial is returned immediately.
 pub(crate) fn dispatch_ptrace_access(context: &PtraceAccessContext<'_>) -> AxResult<()> {
-    registry_for_dispatch()?.dispatch_ptrace_access(context)
+    context
+        .actor()
+        .security()
+        .registry()
+        .registry()
+        .dispatch_ptrace_access_with_credential_state(context)
 }
 
 /// Runs the frozen traceme hooks in declaration order.
 /// The first denial is returned immediately.
 pub(crate) fn dispatch_ptrace_traceme(context: &PtraceTracemeContext<'_>) -> AxResult<()> {
-    registry_for_dispatch()?.dispatch_ptrace_traceme(context)
+    context
+        .parent_actor()
+        .security()
+        .registry()
+        .registry()
+        .dispatch_ptrace_traceme_with_credential_state(context)
 }
 
 /// Runs the frozen exec-credential hooks in declaration order.
@@ -539,13 +1285,23 @@ pub(crate) fn dispatch_ptrace_traceme(context: &PtraceTracemeContext<'_>) -> AxR
 pub(crate) fn dispatch_exec_credential(
     context: &ExecCredentialSecurityContext<'_>,
 ) -> AxResult<()> {
-    registry_for_dispatch()?.dispatch_exec_credential(context)
+    context
+        .old()
+        .security()
+        .registry()
+        .registry()
+        .dispatch_exec_credential_with_credential_state(context)
 }
 
 /// Runs the frozen scheduler hooks in declaration order.
 /// The first denial is returned immediately.
 pub(crate) fn dispatch_scheduler(context: &SecuritySchedulerContext<'_>) -> AxResult<()> {
-    registry_for_dispatch()?.dispatch_scheduler(context)
+    context
+        .actor()
+        .security()
+        .registry()
+        .registry()
+        .dispatch_scheduler_with_credential_state(context)
 }
 
 #[cfg(test)]
@@ -553,13 +1309,17 @@ mod tests {
     extern crate std;
 
     use core::sync::atomic::{AtomicU32, Ordering};
-    use std::{sync::Barrier, thread};
+    use std::{
+        sync::{Barrier, Mutex, MutexGuard},
+        thread,
+    };
 
     use linux_raw_sys::general::{CAP_CHOWN, CAP_SYS_NICE, CAP_SYS_PTRACE};
 
     use super::*;
     use crate::task::{
-        CapabilityState, Cred, CredentialSlot, Credentials, Kgid, Kuid, creds::CAPABILITY_WORDS,
+        CapabilityState, Cred, CredentialSlot, Credentials, Kgid, Kuid,
+        creds::{CAPABILITY_WORDS, credential_publication_lock_held},
     };
 
     static ORDER_HOOK_TRACE: AtomicU32 = AtomicU32::new(0);
@@ -571,6 +1331,189 @@ mod tests {
     static WHOLE_MODULE_HOOK_TRACE: AtomicU32 = AtomicU32::new(0);
     static MODULE_DROP_TRACE: AtomicU32 = AtomicU32::new(0);
     static RESERVED_MODULE_INIT_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_INIT_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_PREPARE_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_AUTHORIZE_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_DROP_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_DISPATCH_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_EXEC_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_HOOK_MASK: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_TRANSITION_MASK: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_FAIL_INIT_KEY: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_FAIL_PREPARE_KEY: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_DENY_KEY: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_EXEC_DENY_KEY: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+    fn append_trace(trace: &AtomicU32, value: u32) {
+        trace
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
+                Some(old * 10 + value)
+            })
+            .unwrap();
+    }
+
+    fn reset_credential_state_probes() -> MutexGuard<'static, ()> {
+        let guard = CRED_STATE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for trace in [
+            &CRED_STATE_INIT_TRACE,
+            &CRED_STATE_PREPARE_TRACE,
+            &CRED_STATE_AUTHORIZE_TRACE,
+            &CRED_STATE_DROP_TRACE,
+            &CRED_STATE_DISPATCH_TRACE,
+            &CRED_STATE_EXEC_TRACE,
+            &CRED_STATE_HOOK_MASK,
+            &CRED_STATE_TRANSITION_MASK,
+            &CRED_STATE_FAIL_INIT_KEY,
+            &CRED_STATE_FAIL_PREPARE_KEY,
+            &CRED_STATE_DENY_KEY,
+            &CRED_STATE_EXEC_DENY_KEY,
+        ] {
+            trace.store(0, Ordering::SeqCst);
+        }
+        guard
+    }
+
+    struct ProbeCredentialState {
+        key: u32,
+        generation: u32,
+    }
+
+    struct CredentialStateProbeModule<const KEY: u64>;
+
+    impl<const KEY: u64> SecurityModule for CredentialStateProbeModule<KEY> {
+        const KEY: ModuleKey = ModuleKey(KEY);
+        type CredentialState = ProbeCredentialState;
+
+        fn try_boot_init() -> Result<Self, RegistryBuildError> {
+            Ok(Self)
+        }
+
+        fn try_init_credential(&self, _credential: &CoreCred) -> AxResult<Self::CredentialState> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            append_trace(&CRED_STATE_INIT_TRACE, key);
+            if CRED_STATE_FAIL_INIT_KEY.load(Ordering::SeqCst) == key {
+                return Err(AxError::NoMemory);
+            }
+            Ok(ProbeCredentialState { key, generation: 0 })
+        }
+
+        fn try_prepare_credential(
+            &self,
+            _old_credential: &CoreCred,
+            old_state: &Self::CredentialState,
+            _proposed_credential: &CoreCred,
+            transition: CredentialStateTransition,
+        ) -> AxResult<Self::CredentialState> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(old_state.key, key);
+            let transition_bit = match transition {
+                CredentialStateTransition::Fork => 1,
+                CredentialStateTransition::Normal => 1 << 1,
+                CredentialStateTransition::UserNamespace => 1 << 2,
+                CredentialStateTransition::Exec => 1 << 3,
+            };
+            CRED_STATE_TRANSITION_MASK.fetch_or(transition_bit, Ordering::SeqCst);
+            append_trace(&CRED_STATE_PREPARE_TRACE, key);
+            if CRED_STATE_FAIL_PREPARE_KEY.load(Ordering::SeqCst) == key {
+                return Err(AxError::NoMemory);
+            }
+            Ok(ProbeCredentialState {
+                key,
+                generation: old_state.generation + 1,
+            })
+        }
+
+        fn authorize_credential(
+            &self,
+            _old_credential: &CoreCred,
+            old_state: &Self::CredentialState,
+            _proposed_credential: &CoreCred,
+            proposed_state: &Self::CredentialState,
+            _transition: CredentialStateTransition,
+        ) -> AxResult<()> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(old_state.key, key);
+            assert_eq!(proposed_state.key, key);
+            assert_eq!(proposed_state.generation, old_state.generation + 1);
+            append_trace(&CRED_STATE_AUTHORIZE_TRACE, key);
+            if CRED_STATE_DENY_KEY.load(Ordering::SeqCst) == key {
+                return Err(AxError::PermissionDenied);
+            }
+            Ok(())
+        }
+
+        fn ptrace_access_with_credential_state(
+            &self,
+            context: &PtraceAccessContext<'_>,
+            actor_state: &Self::CredentialState,
+            target_state: &Self::CredentialState,
+        ) -> AxResult<()> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(actor_state.key, key);
+            assert_eq!(target_state.key, key);
+            assert!(core::ptr::eq(context.actor(), context.target()));
+            append_trace(&CRED_STATE_DISPATCH_TRACE, key);
+            CRED_STATE_HOOK_MASK.fetch_or(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn ptrace_traceme_with_credential_state(
+            &self,
+            context: &PtraceTracemeContext<'_>,
+            parent_state: &Self::CredentialState,
+            child_state: &Self::CredentialState,
+        ) -> AxResult<()> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(parent_state.key, key);
+            assert_eq!(child_state.key, key);
+            assert!(core::ptr::eq(
+                context.parent_actor(),
+                context.child_target()
+            ));
+            CRED_STATE_HOOK_MASK.fetch_or(1 << 1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn exec_credential_with_credential_state(
+            &self,
+            _context: &ExecCredentialSecurityContext<'_>,
+            old_state: &Self::CredentialState,
+            proposed_state: &Self::CredentialState,
+        ) -> AxResult<()> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(old_state.key, key);
+            assert_eq!(proposed_state.key, key);
+            assert_eq!(proposed_state.generation, old_state.generation + 1);
+            append_trace(&CRED_STATE_EXEC_TRACE, key);
+            CRED_STATE_HOOK_MASK.fetch_or(1 << 2, Ordering::SeqCst);
+            if CRED_STATE_EXEC_DENY_KEY.load(Ordering::SeqCst) == key {
+                return Err(AxError::PermissionDenied);
+            }
+            Ok(())
+        }
+
+        fn scheduler_with_credential_state(
+            &self,
+            context: &SecuritySchedulerContext<'_>,
+            actor_state: &Self::CredentialState,
+            target_state: &Self::CredentialState,
+        ) -> AxResult<()> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(actor_state.key, key);
+            assert_eq!(target_state.key, key);
+            assert!(core::ptr::eq(context.actor(), context.target()));
+            CRED_STATE_HOOK_MASK.fetch_or(1 << 3, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn free_credential(&self, state: Self::CredentialState) {
+            assert!(!credential_publication_lock_held());
+            append_trace(&CRED_STATE_DROP_TRACE, state.key);
+        }
+    }
 
     type TestPtraceAccessHook = for<'a> fn(&PtraceAccessContext<'a>) -> AxResult<()>;
     type TestPtraceTracemeHook = for<'a> fn(&PtraceTracemeContext<'a>) -> AxResult<()>;
@@ -597,9 +1540,24 @@ mod tests {
 
     impl<const KEY: u64> SecurityModule for TestSecurityModule<KEY> {
         const KEY: ModuleKey = ModuleKey(KEY);
+        type CredentialState = ();
 
         fn try_boot_init() -> Result<Self, RegistryBuildError> {
             Ok(Self::empty())
+        }
+
+        fn try_init_credential(&self, _credential: &CoreCred) -> AxResult<Self::CredentialState> {
+            Ok(())
+        }
+
+        fn try_prepare_credential(
+            &self,
+            _old_credential: &CoreCred,
+            _old_state: &Self::CredentialState,
+            _proposed_credential: &CoreCred,
+            _transition: CredentialStateTransition,
+        ) -> AxResult<Self::CredentialState> {
+            Ok(())
         }
 
         fn ptrace_access(&self, context: &PtraceAccessContext<'_>) -> AxResult<()> {
@@ -623,9 +1581,24 @@ mod tests {
 
     impl<const KEY: u64> SecurityModule for FailingModule<KEY> {
         const KEY: ModuleKey = ModuleKey(KEY);
+        type CredentialState = ();
 
         fn try_boot_init() -> Result<Self, RegistryBuildError> {
             Err(RegistryBuildError::ModuleInitFailed)
+        }
+
+        fn try_init_credential(&self, _credential: &CoreCred) -> AxResult<Self::CredentialState> {
+            Ok(())
+        }
+
+        fn try_prepare_credential(
+            &self,
+            _old_credential: &CoreCred,
+            _old_state: &Self::CredentialState,
+            _proposed_credential: &CoreCred,
+            _transition: CredentialStateTransition,
+        ) -> AxResult<Self::CredentialState> {
+            Ok(())
         }
     }
 
@@ -633,9 +1606,24 @@ mod tests {
 
     impl SecurityModule for WholeHookModule {
         const KEY: ModuleKey = ModuleKey(10);
+        type CredentialState = ();
 
         fn try_boot_init() -> Result<Self, RegistryBuildError> {
             Ok(Self)
+        }
+
+        fn try_init_credential(&self, _credential: &CoreCred) -> AxResult<Self::CredentialState> {
+            Ok(())
+        }
+
+        fn try_prepare_credential(
+            &self,
+            _old_credential: &CoreCred,
+            _old_state: &Self::CredentialState,
+            _proposed_credential: &CoreCred,
+            _transition: CredentialStateTransition,
+        ) -> AxResult<Self::CredentialState> {
+            Ok(())
         }
 
         fn ptrace_access(&self, _context: &PtraceAccessContext<'_>) -> AxResult<()> {
@@ -663,9 +1651,24 @@ mod tests {
 
     impl SecurityModule for FailingWholeHookModule {
         const KEY: ModuleKey = ModuleKey(11);
+        type CredentialState = ();
 
         fn try_boot_init() -> Result<Self, RegistryBuildError> {
             Err(RegistryBuildError::ModuleInitFailed)
+        }
+
+        fn try_init_credential(&self, _credential: &CoreCred) -> AxResult<Self::CredentialState> {
+            Ok(())
+        }
+
+        fn try_prepare_credential(
+            &self,
+            _old_credential: &CoreCred,
+            _old_state: &Self::CredentialState,
+            _proposed_credential: &CoreCred,
+            _transition: CredentialStateTransition,
+        ) -> AxResult<Self::CredentialState> {
+            Ok(())
         }
 
         fn ptrace_access(&self, _context: &PtraceAccessContext<'_>) -> AxResult<()> {
@@ -693,10 +1696,25 @@ mod tests {
 
     impl SecurityModule for ReservedKeyModule {
         const KEY: ModuleKey = COMMONCAP_MODULE_KEY;
+        type CredentialState = ();
 
         fn try_boot_init() -> Result<Self, RegistryBuildError> {
             RESERVED_MODULE_INIT_TRACE.fetch_add(1, Ordering::SeqCst);
             Ok(Self)
+        }
+
+        fn try_init_credential(&self, _credential: &CoreCred) -> AxResult<Self::CredentialState> {
+            Ok(())
+        }
+
+        fn try_prepare_credential(
+            &self,
+            _old_credential: &CoreCred,
+            _old_state: &Self::CredentialState,
+            _proposed_credential: &CoreCred,
+            _transition: CredentialStateTransition,
+        ) -> AxResult<Self::CredentialState> {
+            Ok(())
         }
     }
 
@@ -704,9 +1722,24 @@ mod tests {
 
     impl<const KEY: u64> SecurityModule for DroppingModule<KEY> {
         const KEY: ModuleKey = ModuleKey(KEY);
+        type CredentialState = ();
 
         fn try_boot_init() -> Result<Self, RegistryBuildError> {
             Ok(Self)
+        }
+
+        fn try_init_credential(&self, _credential: &CoreCred) -> AxResult<Self::CredentialState> {
+            Ok(())
+        }
+
+        fn try_prepare_credential(
+            &self,
+            _old_credential: &CoreCred,
+            _old_state: &Self::CredentialState,
+            _proposed_credential: &CoreCred,
+            _transition: CredentialStateTransition,
+        ) -> AxResult<Self::CredentialState> {
+            Ok(())
         }
     }
 
@@ -728,6 +1761,18 @@ mod tests {
             .unwrap()
     }
 
+    fn probe_registry() -> FrozenSecurityRegistry {
+        let mut builder = test_registry_builder();
+        builder
+            .try_register::<CredentialStateProbeModule<2>>()
+            .unwrap();
+        builder
+            .try_register::<CredentialStateProbeModule<3>>()
+            .unwrap();
+        let registry = Box::try_new(builder.freeze()).unwrap();
+        FrozenSecurityRegistry(Box::leak(registry))
+    }
+
     fn dispatch_all_hook_families(registry: &SecurityRegistry) {
         let namespace = UserNamespace::try_new_root().unwrap();
         let root = Cred::try_root(namespace.clone()).unwrap();
@@ -743,8 +1788,8 @@ mod tests {
         );
         let traceme =
             PtraceTracemeContext::new(&root, &root, image_ref.owner_user_ns(), &image_ref);
-        let proposal = exec_proposal(&root, crate::task::ExecTraceState::NotSuppressingPrivilege);
-        let exec = ExecCredentialSecurityContext::new(&proposal);
+        let draft = exec_draft(&root, crate::task::ExecTraceState::NotSuppressingPrivilege);
+        let exec = ExecCredentialSecurityContext::new(&draft);
         let scheduler = scheduler_context(&root, &root, SchedulerSecurityOperation::SetAffinity);
 
         registry.dispatch_ptrace_access(&access).unwrap();
@@ -885,10 +1930,10 @@ mod tests {
         Ok(())
     }
 
-    fn exec_proposal(
+    fn exec_draft(
         credential: &Arc<Cred>,
         trace_state: crate::task::ExecTraceState,
-    ) -> thekernel_linux_cred::ExecCredentialProposal<UserNamespace> {
+    ) -> crate::task::exec_cred::ExecCredentialDraft {
         let input = crate::task::ExecCredentialInput::new(
             0,
             Some(crate::task::ExecFileOwner::new(
@@ -900,7 +1945,7 @@ mod tests {
             crate::task::ExecImageReadability::Readable,
             None,
         );
-        thekernel_linux_cred::derive_exec_credential(credential, input).unwrap()
+        crate::task::exec_cred::ExecCredentialDraft::try_new(credential, input).unwrap()
     }
 
     #[test]
@@ -1230,11 +2275,11 @@ mod tests {
     fn exec_security_hook_stack_short_circuits_on_first_denial() {
         let namespace = UserNamespace::try_new_root().unwrap();
         let credential = Cred::try_root(namespace).unwrap();
-        let proposal = exec_proposal(
+        let draft = exec_draft(
             &credential,
             crate::task::ExecTraceState::NotSuppressingPrivilege,
         );
-        let context = ExecCredentialSecurityContext::new(&proposal);
+        let context = ExecCredentialSecurityContext::new(&draft);
         let mut builder = test_registry_builder();
         builder
             .try_register_initialized(TestSecurityModule::<1> {
@@ -1294,11 +2339,11 @@ mod tests {
         let namespace = UserNamespace::try_new_root().unwrap();
         let root = Cred::try_root(namespace).unwrap();
         let unprivileged = credential_with_caps(&root, &[], &[]);
-        let proposal = exec_proposal(
+        let draft = exec_draft(
             &unprivileged,
             crate::task::ExecTraceState::SuppressingPrivilege,
         );
-        let context = ExecCredentialSecurityContext::new(&proposal);
+        let context = ExecCredentialSecurityContext::new(&draft);
 
         dispatch_exec_credential(&context).unwrap();
     }
@@ -1611,6 +2656,348 @@ mod tests {
             Err(AxError::PermissionDenied)
         );
         assert_eq!(SCHEDULER_DENY_HOOK_TRACE.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn composite_root_initializes_and_reverse_drops_every_module_state() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let credential = Cred::try_root_with_registry(registry, namespace).unwrap();
+
+        assert_eq!(CRED_STATE_INIT_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(credential.security().slots.len(), 3);
+        drop(credential);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
+    }
+
+    #[test]
+    fn initial_state_failure_reverse_rolls_back_without_a_credential() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        CRED_STATE_FAIL_INIT_KEY.store(3, Ordering::SeqCst);
+        let namespace = UserNamespace::try_new_root().unwrap();
+
+        assert_eq!(
+            Cred::try_root_with_registry(registry, namespace).err(),
+            Some(AxError::NoMemory)
+        );
+        assert_eq!(CRED_STATE_INIT_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn credential_state_vector_reservation_failure_is_zero_effect() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+
+        assert!(matches!(
+            registry
+                .registry()
+                .try_empty_credential_state_with_reservation(registry, usize::MAX),
+            Err(AxError::NoMemory)
+        ));
+        assert_eq!(CRED_STATE_INIT_TRACE.load(Ordering::SeqCst), 0);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn credential_state_owner_allocation_failure_frees_typed_candidate() {
+        let _probe_guard = reset_credential_state_probes();
+        let module = Arc::new(CredentialStateProbeModule::<2>);
+        let state = ProbeCredentialState {
+            key: 2,
+            generation: 0,
+        };
+
+        assert!(matches!(
+            try_own_credential_state_with(module, state, |_| Err(AxError::NoMemory)),
+            Err(AxError::NoMemory)
+        ));
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn outer_credential_allocation_failure_reverse_drops_complete_state() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let core = CoreCred::try_root(namespace).unwrap();
+        let security = registry.try_init_credential_state(&core).unwrap();
+        CRED_STATE_DROP_TRACE.store(0, Ordering::SeqCst);
+
+        assert!(matches!(
+            Cred::try_from_prepared_parts_with_allocator(core, security, |_| {
+                Err(AxError::NoMemory)
+            }),
+            Err(AxError::NoMemory)
+        ));
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
+    }
+
+    #[test]
+    fn module_prepare_failure_reverse_rolls_back_and_preserves_exact_old() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let old = Cred::try_root_with_registry(registry, namespace).unwrap();
+        CRED_STATE_PREPARE_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_DROP_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_FAIL_PREPARE_KEY.store(3, Ordering::SeqCst);
+
+        assert_eq!(
+            Cred::try_clone_for_fork(&old).err(),
+            Some(AxError::NoMemory)
+        );
+        assert_eq!(CRED_STATE_PREPARE_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(CRED_STATE_TRANSITION_MASK.load(Ordering::SeqCst), 1);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 2);
+        assert_eq!(old.ids().euid, Kuid::INITIAL_ROOT);
+
+        CRED_STATE_DROP_TRACE.store(0, Ordering::SeqCst);
+        drop(old);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
+    }
+
+    #[test]
+    fn module_authorization_denial_drops_complete_candidate_in_reverse() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let old = Cred::try_root_with_registry(registry, namespace).unwrap();
+        CRED_STATE_PREPARE_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_AUTHORIZE_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_DROP_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_DENY_KEY.store(2, Ordering::SeqCst);
+
+        assert_eq!(
+            Cred::try_clone_for_fork(&old).err(),
+            Some(AxError::PermissionDenied)
+        );
+        assert_eq!(CRED_STATE_PREPARE_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(CRED_STATE_AUTHORIZE_TRACE.load(Ordering::SeqCst), 2);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
+        assert_eq!(old.ids().euid, Kuid::INITIAL_ROOT);
+    }
+
+    #[test]
+    fn state_aware_dispatch_uses_exact_layout_and_typed_slots() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let credential = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
+        let image = Arc::new(());
+        let image_ref = ProcessImageSecurityRef::new(&namespace, &image);
+        let context = PtraceAccessContext::new(
+            &credential,
+            &credential,
+            image_ref.owner_user_ns(),
+            &image_ref,
+            PtraceAccessKind::Read,
+            PtraceCredentialKind::Real,
+        );
+        let traceme = PtraceTracemeContext::new(
+            &credential,
+            &credential,
+            image_ref.owner_user_ns(),
+            &image_ref,
+        );
+        let scheduler = SecuritySchedulerContext::new(
+            &credential,
+            &credential,
+            SchedulerSecurityOperation::SetAffinity,
+        );
+        let draft = exec_draft(
+            &credential,
+            crate::task::ExecTraceState::NotSuppressingPrivilege,
+        );
+        let exec = ExecCredentialSecurityContext::new(&draft);
+        CRED_STATE_DISPATCH_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_HOOK_MASK.store(0, Ordering::SeqCst);
+
+        dispatch_ptrace_access(&context).unwrap();
+        dispatch_ptrace_traceme(&traceme).unwrap();
+        dispatch_scheduler(&scheduler).unwrap();
+        dispatch_exec_credential(&exec).unwrap();
+        assert_eq!(CRED_STATE_DISPATCH_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(CRED_STATE_HOOK_MASK.load(Ordering::SeqCst), 0b1111);
+    }
+
+    #[test]
+    fn namespace_and_exec_use_distinct_state_prepare_contracts() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let old = Cred::try_root_with_registry(registry, namespace).unwrap();
+        let ids = old.ids();
+        let child_namespace = old.user_ns().try_fork(ids.euid, ids.egid, false).unwrap();
+        CRED_STATE_TRANSITION_MASK.store(0, Ordering::SeqCst);
+
+        let child = Cred::try_with_user_ns(&old, child_namespace).unwrap();
+        assert_eq!(CRED_STATE_TRANSITION_MASK.load(Ordering::SeqCst), 1 << 2);
+        drop(child);
+
+        CRED_STATE_TRANSITION_MASK.store(0, Ordering::SeqCst);
+        let draft = exec_draft(&old, crate::task::ExecTraceState::NotSuppressingPrivilege);
+        assert_eq!(CRED_STATE_TRANSITION_MASK.load(Ordering::SeqCst), 1 << 3);
+        drop(draft);
+    }
+
+    #[test]
+    fn exec_hook_denial_releases_all_proposed_states_and_keeps_old() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let old = Cred::try_root_with_registry(registry, namespace).unwrap();
+        CRED_STATE_DROP_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_EXEC_DENY_KEY.store(2, Ordering::SeqCst);
+        let draft = exec_draft(&old, crate::task::ExecTraceState::NotSuppressingPrivilege);
+        {
+            let context = ExecCredentialSecurityContext::new(&draft);
+            assert_eq!(
+                dispatch_exec_credential(&context),
+                Err(AxError::PermissionDenied)
+            );
+        }
+        assert_eq!(CRED_STATE_EXEC_TRACE.load(Ordering::SeqCst), 2);
+        drop(draft);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
+        assert_eq!(old.ids().euid, Kuid::INITIAL_ROOT);
+    }
+
+    #[test]
+    fn foreign_layout_dispatch_fails_before_any_module_hook() {
+        let _probe_guard = reset_credential_state_probes();
+        let actor_registry = probe_registry();
+        let target_registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root_with_registry(actor_registry, namespace.clone()).unwrap();
+        let target = Cred::try_root_with_registry(target_registry, namespace.clone()).unwrap();
+        let image = Arc::new(());
+        let image_ref = ProcessImageSecurityRef::new(&namespace, &image);
+        let context = PtraceAccessContext::new(
+            &actor,
+            &target,
+            image_ref.owner_user_ns(),
+            &image_ref,
+            PtraceAccessKind::Read,
+            PtraceCredentialKind::Real,
+        );
+        CRED_STATE_DISPATCH_TRACE.store(0, Ordering::SeqCst);
+
+        assert_eq!(
+            dispatch_ptrace_access(&context),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_DISPATCH_TRACE.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn malformed_module_index_dispatch_fails_closed_before_hooks() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
+        let core = actor.core_arc().clone();
+        let mut malformed_security = registry.try_init_credential_state(&core).unwrap();
+        malformed_security.slots[1].module_id = ModuleId(7);
+        let malformed = Cred::try_from_prepared_parts(core, malformed_security).unwrap();
+        let image = Arc::new(());
+        let image_ref = ProcessImageSecurityRef::new(&namespace, &image);
+        let context = PtraceAccessContext::new(
+            &actor,
+            &malformed,
+            image_ref.owner_user_ns(),
+            &image_ref,
+            PtraceAccessKind::Read,
+            PtraceCredentialKind::Real,
+        );
+        CRED_STATE_DISPATCH_TRACE.store(0, Ordering::SeqCst);
+
+        assert_eq!(
+            dispatch_ptrace_access(&context),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_DISPATCH_TRACE.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn wrong_state_type_or_runtime_fails_preflight_before_hooks() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
+        let image = Arc::new(());
+        let image_ref = ProcessImageSecurityRef::new(&namespace, &image);
+
+        let mut wrong_type_security = registry.try_init_credential_state(actor.core()).unwrap();
+        wrong_type_security.slots[1].erased = try_own_credential_state(
+            Arc::new(CredentialStateProbeModule::<3>),
+            ProbeCredentialState {
+                key: 3,
+                generation: 0,
+            },
+        )
+        .unwrap();
+        let wrong_type =
+            Cred::try_from_prepared_parts(actor.core_arc().clone(), wrong_type_security).unwrap();
+        let context = PtraceAccessContext::new(
+            &actor,
+            &wrong_type,
+            image_ref.owner_user_ns(),
+            &image_ref,
+            PtraceAccessKind::Read,
+            PtraceCredentialKind::Real,
+        );
+        CRED_STATE_DISPATCH_TRACE.store(0, Ordering::SeqCst);
+        assert_eq!(
+            dispatch_ptrace_access(&context),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_DISPATCH_TRACE.load(Ordering::SeqCst), 0);
+
+        let mut wrong_runtime_security = registry.try_init_credential_state(actor.core()).unwrap();
+        wrong_runtime_security.slots[1].erased = try_own_credential_state(
+            Arc::new(CredentialStateProbeModule::<2>),
+            ProbeCredentialState {
+                key: 2,
+                generation: 0,
+            },
+        )
+        .unwrap();
+        let wrong_runtime =
+            Cred::try_from_prepared_parts(actor.core_arc().clone(), wrong_runtime_security)
+                .unwrap();
+        let context = PtraceAccessContext::new(
+            &actor,
+            &wrong_runtime,
+            image_ref.owner_user_ns(),
+            &image_ref,
+            PtraceAccessKind::Read,
+            PtraceCredentialKind::Real,
+        );
+        assert_eq!(
+            dispatch_ptrace_access(&context),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_DISPATCH_TRACE.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn retired_module_state_is_freed_outside_publication_spin_lock() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let credential = Cred::try_root_with_registry(registry, namespace).unwrap();
+        let slot = CredentialSlot::new(credential);
+        CRED_STATE_DROP_TRACE.store(0, Ordering::SeqCst);
+
+        let proposed = slot.prepare().finish().unwrap().commit();
+        assert_eq!(CRED_STATE_TRANSITION_MASK.load(Ordering::SeqCst), 1 << 1);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
+        assert!(!credential_publication_lock_held());
+        drop(proposed);
+        drop(slot);
     }
 
     #[test]

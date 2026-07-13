@@ -336,8 +336,9 @@ impl CloneArgs {
         let calling_thread = curr.as_thread();
         let calling_tid = linux_pid_from_task_id(curr.id().as_u64())?;
         let old_proc_data = &calling_thread.proc_data;
-        // Both CLONE_THREAD and fork inherit exactly one immutable snapshot
-        // from the calling task. Each child receives its own publication slot.
+        // Every branch derives from one immutable calling-task snapshot.
+        // Threads share its exact composite identity; a new process gets a
+        // separately prepared module-state clone in its own outer credential.
         let (parent_cred, parent_dumpability, parent_aspace, parent_access_state) =
             old_proc_data.fork_image_credential_snapshot(calling_thread);
         let child_cred = if flags.contains(CloneFlags::NEWUSER) {
@@ -353,9 +354,11 @@ impl CloneArgs {
                 ids.egid,
                 parent_cred.has_effective_capability_in_own_user_ns(CAP_SETFCAP),
             )?;
-            Cred::try_with_user_ns(&parent_cred, user_ns).map_err(crate::task::cred_error)?
-        } else {
+            Cred::try_with_user_ns(&parent_cred, user_ns)?
+        } else if flags.contains(CloneFlags::THREAD) {
             parent_cred
+        } else {
+            Cred::try_clone_for_fork(&parent_cred)?
         };
         let namespace_owner = clone_namespace_owner(flags, &child_cred)?;
         if old_proc_data.exec_in_progress() {

@@ -1,5 +1,10 @@
 use alloc::sync::Arc;
+#[cfg(test)]
+use core::cell::Cell;
 use core::mem;
+
+#[cfg(test)]
+extern crate std;
 
 use axerrno::{AxError, AxResult};
 use axsync::spin::SpinNoIrq;
@@ -9,14 +14,180 @@ pub(crate) use thekernel_linux_cred::{
     SECBIT_KEEP_CAPS_LOCKED, SECBIT_NO_CAP_AMBIENT_RAISE, SECBIT_NO_SETUID_FIXUP, SECURE_ALL_BITS,
     SECURE_ALL_LOCKS,
 };
-use thekernel_linux_cred::{
-    CapabilitySets, Credential, CredentialTransitionMode, ExecCredentialProposal,
-    credential_cap_is_subset,
+use thekernel_linux_cred::{CapabilitySets, Credential, CredentialTransitionEffects};
+
+#[cfg(test)]
+use super::security::test_frozen_registry;
+use super::{
+    cred_error,
+    exec_cred::ExecCredentialDraft,
+    process::UserNamespace,
+    security::{CredentialSecurityState, CredentialStateTransition, FrozenSecurityRegistry},
 };
 
-use super::{cred_error, process::UserNamespace};
+pub(in crate::task) type CoreCred = Credential<UserNamespace>;
 
-pub(crate) type Cred = Credential<UserNamespace>;
+/// Kernel-owned composite credential. The module state field is intentionally
+/// declared first so every free callback runs while the Linux credential core
+/// is still alive. Readers and publication always move one outer `Arc<Cred>`.
+pub(crate) struct Cred {
+    security: CredentialSecurityState,
+    core: Arc<CoreCred>,
+}
+
+impl Cred {
+    fn try_from_parts(
+        core: Arc<CoreCred>,
+        security: CredentialSecurityState,
+    ) -> AxResult<Arc<Self>> {
+        Self::try_from_parts_with_allocator(core, security, |credential| {
+            Arc::try_new(credential).map_err(|_| AxError::NoMemory)
+        })
+    }
+
+    fn try_from_parts_with_allocator<F>(
+        core: Arc<CoreCred>,
+        security: CredentialSecurityState,
+        allocate: F,
+    ) -> AxResult<Arc<Self>>
+    where
+        F: FnOnce(Self) -> AxResult<Arc<Self>>,
+    {
+        allocate(Self { security, core })
+    }
+
+    pub(in crate::task) fn try_from_prepared_parts(
+        core: Arc<CoreCred>,
+        security: CredentialSecurityState,
+    ) -> AxResult<Arc<Self>> {
+        Self::try_from_parts(core, security)
+    }
+
+    #[cfg(test)]
+    pub(in crate::task) fn try_from_prepared_parts_with_allocator<F>(
+        core: Arc<CoreCred>,
+        security: CredentialSecurityState,
+        allocate: F,
+    ) -> AxResult<Arc<Self>>
+    where
+        F: FnOnce(Self) -> AxResult<Arc<Self>>,
+    {
+        Self::try_from_parts_with_allocator(core, security, allocate)
+    }
+
+    pub(crate) fn try_root_with_registry(
+        registry: FrozenSecurityRegistry,
+        user_ns: Arc<UserNamespace>,
+    ) -> AxResult<Arc<Self>> {
+        let core = CoreCred::try_root(user_ns).map_err(cred_error)?;
+        let security = registry.try_init_credential_state(&core)?;
+        Self::try_from_parts(core, security)
+    }
+
+    /// Unit-test fixtures do not execute the architecture entry path. Their
+    /// complete built-in registry is isolated from production publication.
+    #[cfg(test)]
+    pub(crate) fn try_root(user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
+        Self::try_root_with_registry(test_frozen_registry(), user_ns)
+    }
+
+    pub(crate) fn try_clone_for_fork(old: &Arc<Self>) -> AxResult<Arc<Self>> {
+        let registry = old.security.registry();
+        let security = registry.try_prepare_credential_state(
+            old.core(),
+            &old.security,
+            old.core(),
+            CredentialStateTransition::Fork,
+        )?;
+        Self::try_from_parts(old.core.clone(), security)
+    }
+
+    pub(crate) fn try_with_user_namespace(
+        old: &Arc<Self>,
+        user_ns: Arc<UserNamespace>,
+    ) -> AxResult<Arc<Self>> {
+        let core = CoreCred::try_with_user_namespace(old.core(), user_ns).map_err(cred_error)?;
+        Self::try_from_core_transition(old, core, CredentialStateTransition::UserNamespace)
+    }
+
+    pub(crate) fn try_with_user_ns(
+        old: &Arc<Self>,
+        user_ns: Arc<UserNamespace>,
+    ) -> AxResult<Arc<Self>> {
+        Self::try_with_user_namespace(old, user_ns)
+    }
+
+    fn try_from_core_transition(
+        old: &Arc<Self>,
+        core: Arc<CoreCred>,
+        transition: CredentialStateTransition,
+    ) -> AxResult<Arc<Self>> {
+        let security = Self::try_prepare_security_transition(old, &core, transition)?;
+        Self::try_from_parts(core, security)
+    }
+
+    pub(in crate::task) fn try_prepare_security_transition(
+        old: &Arc<Self>,
+        proposed_core: &CoreCred,
+        transition: CredentialStateTransition,
+    ) -> AxResult<CredentialSecurityState> {
+        let registry = old.security.registry();
+        registry.try_prepare_credential_state(old.core(), &old.security, proposed_core, transition)
+    }
+
+    pub(in crate::task) fn core(&self) -> &CoreCred {
+        &self.core
+    }
+
+    pub(in crate::task) fn core_arc(&self) -> &Arc<CoreCred> {
+        &self.core
+    }
+
+    pub(in crate::task) fn security(&self) -> &CredentialSecurityState {
+        &self.security
+    }
+
+    pub(crate) fn ids(&self) -> Credentials {
+        self.core.ids()
+    }
+
+    pub(crate) fn groups(&self) -> &Arc<GroupInfo> {
+        self.core.groups()
+    }
+
+    pub(crate) fn capabilities(&self) -> CapabilitySets {
+        self.core.capabilities()
+    }
+
+    pub(crate) fn no_new_privs(&self) -> bool {
+        self.core.no_new_privs()
+    }
+
+    pub(crate) fn user_ns(&self) -> &Arc<UserNamespace> {
+        self.core.user_ns()
+    }
+
+    pub(crate) fn fs_dac_credentials(&self) -> DacCredentialView {
+        self.core.fs_dac_credentials()
+    }
+
+    pub(crate) fn has_effective_capability(&self, capability: u32) -> bool {
+        self.core.has_effective_capability(capability)
+    }
+
+    pub(crate) fn has_effective_capability_in_own_user_ns(&self, capability: u32) -> bool {
+        self.core
+            .has_effective_capability_in_own_user_ns(capability)
+    }
+
+    pub(crate) fn is_initial_root_euid(&self) -> bool {
+        self.core.is_initial_root_euid()
+    }
+
+    pub(crate) fn is_initial_root_ruid(&self) -> bool {
+        self.core.is_initial_root_ruid()
+    }
+}
 
 #[cfg(not(test))]
 type CredentialUpdateMutex<T> = axsync::Mutex<T>;
@@ -27,6 +198,16 @@ type CredentialUpdateMutex<T> = spin::Mutex<T>;
 type CredentialUpdateGuard<'a, T> = axsync::MutexGuard<'a, T>;
 #[cfg(test)]
 type CredentialUpdateGuard<'a, T> = spin::MutexGuard<'a, T>;
+
+#[cfg(test)]
+std::thread_local! {
+    static CREDENTIAL_PUBLICATION_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(in crate::task) fn credential_publication_lock_held() -> bool {
+    CREDENTIAL_PUBLICATION_LOCK_DEPTH.with(|depth| depth.get() != 0)
+}
 
 /// Kernel-local mutable capability draft used only while a credential writer
 /// owns the sleepable update transaction. Committed capability state is always
@@ -143,18 +324,27 @@ impl CredBuilder {
         }
     }
 
-    fn try_build(self, old: &Cred) -> AxResult<Arc<Cred>> {
+    fn try_build(self, old: &Arc<Cred>) -> AxResult<(Arc<Cred>, CredentialTransitionEffects)> {
         let caps = self.caps.try_into_committed()?;
-        Credential::try_from_transition(
-            old,
+        let prepared_core = CoreCred::try_prepare_transition(
+            old.core_arc(),
             self.ids,
             self.groups,
             caps,
             self.no_new_privs,
-            old.user_ns().clone(),
-            CredentialTransitionMode::Normal,
         )
-        .map_err(cred_error)
+        .map_err(cred_error)?;
+        let effects = prepared_core.effects();
+        let security = Cred::try_prepare_security_transition(
+            old,
+            prepared_core.proposed(),
+            CredentialStateTransition::Normal,
+        )?;
+        let core = prepared_core
+            .try_into_proposed(old.core_arc())
+            .map_err(cred_error)?;
+        let proposed = Cred::try_from_prepared_parts(core, security)?;
+        Ok((proposed, effects))
     }
 }
 
@@ -269,12 +459,13 @@ impl<'a> CredentialUpdate<'a> {
             old,
             builder,
         } = self;
-        let proposed = builder.try_build(&old)?;
+        let (proposed, effects) = builder.try_build(&old)?;
         Ok(PreparedCred {
             slot,
             guard,
             old,
             proposed,
+            requires_dumpability_drop: effects.requires_dumpability_drop(),
         })
     }
 
@@ -285,9 +476,9 @@ impl<'a> CredentialUpdate<'a> {
     /// Accepts only an external exec proposal derived from this transaction's
     /// exact old `Arc`. Equal-looking credentials from another slot or writer
     /// snapshot are rejected before they can reach the publication token.
-    pub(in crate::task) fn finish_exec_proposal(
+    pub(in crate::task) fn finish_exec_draft(
         self,
-        proposal: ExecCredentialProposal<UserNamespace>,
+        draft: ExecCredentialDraft,
     ) -> AxResult<PreparedCred<'a>> {
         let CredentialUpdate {
             slot,
@@ -295,13 +486,16 @@ impl<'a> CredentialUpdate<'a> {
             old,
             builder,
         } = self;
-        let proposed = proposal.try_into_proposed(&old).map_err(cred_error)?;
+        let requires_dumpability_drop = draft.proposal().effects().clear_pdeath_signal();
+        let (proposed_core, proposed_security) = draft.try_into_parts(&old)?;
+        let proposed = Cred::try_from_prepared_parts(proposed_core, proposed_security)?;
         drop(builder);
         Ok(PreparedCred {
             slot,
             guard,
             old,
             proposed,
+            requires_dumpability_drop,
         })
     }
 }
@@ -312,6 +506,7 @@ pub(crate) struct PreparedCred<'a> {
     guard: CredentialUpdateGuard<'a, ()>,
     old: Arc<Cred>,
     proposed: Arc<Cred>,
+    requires_dumpability_drop: bool,
 }
 
 /// A completed pointer publication whose retired references still need to be
@@ -339,13 +534,7 @@ impl<'a> PreparedCred<'a> {
     /// consumes this before publication so readers cannot observe stronger
     /// authority with stale, more permissive image state.
     pub(crate) fn requires_dumpability_drop(&self) -> bool {
-        let old = self.old.ids();
-        let proposed = self.proposed.ids();
-        old.euid != proposed.euid
-            || old.egid != proposed.egid
-            || old.fsuid != proposed.fsuid
-            || old.fsgid != proposed.fsgid
-            || !credential_cap_is_subset(&self.old, &self.proposed)
+        self.requires_dumpability_drop
     }
 
     pub(in crate::task) fn proposed(&self) -> &Cred {
@@ -360,10 +549,20 @@ impl<'a> PreparedCred<'a> {
             guard,
             old,
             proposed,
+            requires_dumpability_drop: _,
         } = self;
         let published = {
             let mut current = slot.current.lock();
-            mem::replace(&mut *current, proposed.clone())
+            #[cfg(test)]
+            CREDENTIAL_PUBLICATION_LOCK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+            assert!(
+                Arc::ptr_eq(&*current, &old),
+                "credential publication lost its exact old composite"
+            );
+            let published = mem::replace(&mut *current, proposed.clone());
+            #[cfg(test)]
+            CREDENTIAL_PUBLICATION_LOCK_DEPTH.with(|depth| depth.set(depth.get() - 1));
+            published
         };
         debug_assert!(Arc::ptr_eq(&published, &old));
         CredentialPublication {
@@ -484,6 +683,23 @@ mod tests {
     }
 
     #[test]
+    fn process_fork_clones_outer_state_while_sharing_immutable_core() {
+        let slot = slot();
+        let parent = slot.current();
+        let child = Cred::try_clone_for_fork(&parent).unwrap();
+
+        assert!(!Arc::ptr_eq(&parent, &child));
+        assert!(Arc::ptr_eq(parent.core_arc(), child.core_arc()));
+        assert!(
+            parent
+                .security()
+                .registry()
+                .same_registry(child.security().registry())
+        );
+        assert_eq!(parent.ids(), child.ids());
+    }
+
+    #[test]
     fn non_leader_exec_commit_stays_bound_to_executing_task_slot() {
         let leader = slot();
         let executor = inherited_slot(&leader);
@@ -506,8 +722,8 @@ mod tests {
             thekernel_linux_cred::ExecImageReadability::Readable,
             None,
         );
-        let proposal = thekernel_linux_cred::derive_exec_credential(exec.old_arc(), input).unwrap();
-        let prepared = exec.finish_exec_proposal(proposal).unwrap();
+        let draft = ExecCredentialDraft::try_new(exec.old_arc(), input).unwrap();
+        let prepared = exec.finish_exec_draft(draft).unwrap();
         // Exec de-threading may rebind the visible TID, but it never replaces
         // the executing Thread or the slot captured by this transaction.
         prepared.commit();

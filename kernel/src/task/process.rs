@@ -1370,7 +1370,7 @@ impl Iterator for PtraceReverseLinkDrain {
 /// [`Process`]-shared data.
 pub struct ProcessData {
     /// The process.
-    pub proc: Arc<Process>,
+    pub(crate) proc: Arc<Process>,
     /// Serializes child admission through publication against final exit and
     /// reparenting for this process.
     process_lifecycle: Mutex<()>,

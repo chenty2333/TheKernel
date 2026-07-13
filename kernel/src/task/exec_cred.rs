@@ -17,7 +17,8 @@ use thekernel_linux_cred::{
 
 use super::{
     Dumpability, FileCapabilities, Thread, UserNamespace, cred_error,
-    creds::{Cred, CredentialUpdate, PreparedCred},
+    creds::{CoreCred, Cred, CredentialUpdate, PreparedCred},
+    security::{CredentialSecurityState, CredentialStateTransition},
 };
 
 /// Maps the policy-neutral parser error at the kernel adapter boundary.
@@ -35,38 +36,96 @@ pub(crate) const fn map_exec_dumpability(value: ExecDumpability) -> Dumpability 
     }
 }
 
-/// Typed authorization view over one opaque, exact-old-bound proposal.
-///
-/// The proposal is only borrowed. A hook cannot extract its proposed `Arc` or
-/// publish it; successful authorization returns control to the writer
-/// transaction, which consumes it through the exact-old check.
-pub(crate) struct ExecCredentialSecurityContext<'a> {
-    proposal: &'a ExecCredentialProposal<UserNamespace>,
+/// Kernel-owned exec proposal. It binds the ABI crate's exact old core to the
+/// exact old outer composite and carries every fully prepared module state.
+pub(in crate::task) struct ExecCredentialDraft {
+    expected_old: Arc<Cred>,
+    proposal: ExecCredentialProposal<UserNamespace>,
+    proposed_security: CredentialSecurityState,
 }
 
-impl<'a> ExecCredentialSecurityContext<'a> {
-    pub(in crate::task) fn new(proposal: &'a ExecCredentialProposal<UserNamespace>) -> Self {
-        Self { proposal }
-    }
-
-    pub(in crate::task) const fn proposal(&self) -> &ExecCredentialProposal<UserNamespace> {
-        self.proposal
+impl ExecCredentialDraft {
+    pub(in crate::task) fn try_new(old: &Arc<Cred>, input: ExecCredentialInput) -> AxResult<Self> {
+        let proposal = derive_exec_credential(old.core_arc(), input).map_err(cred_error)?;
+        let proposed_security = Cred::try_prepare_security_transition(
+            old,
+            proposal.proposed(),
+            CredentialStateTransition::Exec,
+        )?;
+        Ok(Self {
+            expected_old: old.clone(),
+            proposal,
+            proposed_security,
+        })
     }
 
     pub(in crate::task) fn old(&self) -> &Cred {
-        self.proposal.old()
+        &self.expected_old
     }
 
-    pub(in crate::task) fn proposed(&self) -> &Cred {
+    pub(in crate::task) fn proposal(&self) -> &ExecCredentialProposal<UserNamespace> {
+        &self.proposal
+    }
+
+    pub(in crate::task) fn proposed_core(&self) -> &CoreCred {
         self.proposal.proposed()
     }
 
-    pub(in crate::task) const fn input(&self) -> ExecCredentialInput {
-        self.proposal.input()
+    pub(in crate::task) fn proposed_security(&self) -> &CredentialSecurityState {
+        &self.proposed_security
     }
 
-    pub(in crate::task) const fn effects(&self) -> ExecCredentialEffects {
-        self.proposal.effects()
+    pub(in crate::task) fn try_into_parts(
+        self,
+        expected_old: &Arc<Cred>,
+    ) -> AxResult<(Arc<CoreCred>, CredentialSecurityState)> {
+        if !Arc::ptr_eq(&self.expected_old, expected_old) {
+            return Err(axerrno::AxError::OperationNotPermitted);
+        }
+        let core = self
+            .proposal
+            .try_into_proposed(expected_old.core_arc())
+            .map_err(cred_error)?;
+        Ok((core, self.proposed_security))
+    }
+}
+
+/// Typed authorization view over one opaque, exact-old-bound draft.
+///
+/// The draft is only borrowed. A hook cannot extract its proposed core/state
+/// owners or publish them; successful authorization returns control to the
+/// writer transaction, which consumes both exact-old checks.
+pub(crate) struct ExecCredentialSecurityContext<'a> {
+    draft: &'a ExecCredentialDraft,
+}
+
+impl<'a> ExecCredentialSecurityContext<'a> {
+    pub(in crate::task) fn new(draft: &'a ExecCredentialDraft) -> Self {
+        Self { draft }
+    }
+
+    pub(in crate::task) fn proposal(&self) -> &ExecCredentialProposal<UserNamespace> {
+        self.draft.proposal()
+    }
+
+    pub(in crate::task) fn old(&self) -> &Cred {
+        self.draft.old()
+    }
+
+    pub(in crate::task) fn proposed(&self) -> &CoreCred {
+        self.draft.proposed_core()
+    }
+
+    pub(in crate::task) fn draft(&self) -> &ExecCredentialDraft {
+        self.draft
+    }
+
+    pub(in crate::task) fn input(&self) -> ExecCredentialInput {
+        self.draft.proposal().input()
+    }
+
+    pub(in crate::task) fn effects(&self) -> ExecCredentialEffects {
+        self.draft.proposal().effects()
     }
 }
 
@@ -107,11 +166,11 @@ fn prepare_exec_update<'a>(
     input: ExecCredentialInput,
     authorize: impl FnOnce(ExecCredentialSecurityContext<'_>) -> AxResult<()>,
 ) -> AxResult<PreparedExecCredential<'a>> {
-    let proposal = derive_exec_credential(update.old_arc(), input).map_err(cred_error)?;
-    authorize(ExecCredentialSecurityContext::new(&proposal))?;
-    let effects = proposal.effects();
-    let revalidation = proposal.revalidation();
-    let prepared = update.finish_exec_proposal(proposal)?;
+    let draft = ExecCredentialDraft::try_new(update.old_arc(), input)?;
+    authorize(ExecCredentialSecurityContext::new(&draft))?;
+    let effects = draft.proposal().effects();
+    let revalidation = draft.proposal().revalidation();
+    let prepared = update.finish_exec_draft(draft)?;
     Ok(PreparedExecCredential {
         prepared,
         effects,
@@ -227,7 +286,8 @@ mod tests {
         let slot = unprivileged_slot();
         let old = slot.current();
         let proposal =
-            thekernel_linux_cred::derive_exec_credential(&old, setuid_root_input()).unwrap();
+            thekernel_linux_cred::derive_exec_credential(old.core_arc(), setuid_root_input())
+                .unwrap();
         assert!(
             proposal
                 .revalidation()
@@ -243,7 +303,8 @@ mod tests {
             None,
         );
         let proposal =
-            thekernel_linux_cred::derive_exec_credential(&old, already_suppressed).unwrap();
+            thekernel_linux_cred::derive_exec_credential(old.core_arc(), already_suppressed)
+                .unwrap();
         assert!(
             !proposal
                 .revalidation()
@@ -252,29 +313,16 @@ mod tests {
     }
 
     #[test]
-    fn proposal_from_equal_looking_distinct_old_arc_is_rejected() {
+    fn draft_from_shared_core_distinct_outer_credential_is_rejected() {
         let first = unprivileged_slot();
         let first_old = first.current();
-        let duplicate = thekernel_linux_cred::Credential::try_from_transition(
-            &first_old,
-            first_old.ids(),
-            first_old.groups().clone(),
-            first_old.capabilities(),
-            first_old.no_new_privs(),
-            first_old.user_ns().clone(),
-            thekernel_linux_cred::CredentialTransitionMode::Normal,
-        )
-        .unwrap();
+        let duplicate = Cred::try_clone_for_fork(&first_old).unwrap();
         assert!(!Arc::ptr_eq(&first_old, &duplicate));
+        assert!(Arc::ptr_eq(first_old.core_arc(), duplicate.core_arc()));
         let second = CredentialSlot::try_new(duplicate.clone()).unwrap();
-        let proposal =
-            thekernel_linux_cred::derive_exec_credential(&first_old, setuid_root_input()).unwrap();
+        let draft = ExecCredentialDraft::try_new(&first_old, setuid_root_input()).unwrap();
 
-        let error = second
-            .prepare()
-            .finish_exec_proposal(proposal)
-            .err()
-            .unwrap();
+        let error = second.prepare().finish_exec_draft(draft).err().unwrap();
         assert_eq!(error, AxError::OperationNotPermitted);
         assert!(Arc::ptr_eq(&first_old, &first.current()));
         assert!(Arc::ptr_eq(&duplicate, &second.current()));
