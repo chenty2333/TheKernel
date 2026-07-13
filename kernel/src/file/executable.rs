@@ -438,8 +438,9 @@ fn release_credential_write_in(table: &mut ExecutableTable, key: ExecutableKey) 
     }
 }
 
-/// Pins the final executable's content and privilege metadata while exec
-/// derives and authorizes its replacement credential.
+/// Pins one executable component's content and privilege metadata while the
+/// loader inspects and authorizes it. Non-terminal leases are transient; the
+/// terminal ELF lease continues through credential derivation and commit.
 ///
 /// The lease owns one active-executable reference as well, so content writers
 /// remain excluded. Metadata writers use [`with_credential_metadata_unpinned`]

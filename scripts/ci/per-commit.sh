@@ -131,6 +131,13 @@ ci_run_step kernel-thread-credential-tests "$STEP_TIMEOUT_SECS" \
     --tests --features bpf --target x86_64-unknown-linux-gnu \
     task::thread_cred::tests -- --test-threads=1
 
+ci_run_step kernel-composite-credential-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    task::creds::tests -- --test-threads=1
+
 ci_run_step kernel-exec-credential-algebra-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
@@ -216,6 +223,13 @@ ci_run_step kernel-exec-transition-tests "$STEP_TIMEOUT_SECS" \
     cargo test --locked --manifest-path kernel/Cargo.toml \
     --tests --features bpf --target x86_64-unknown-linux-gnu \
     syscall::task::execve::tests -- --test-threads=1
+
+ci_run_step kernel-exec-orchestration-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    task::process::tests::leader_and_nonleader_exec_orchestration_ -- --test-threads=1
 
 ci_run_step kernel-file-capability-xattr-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \

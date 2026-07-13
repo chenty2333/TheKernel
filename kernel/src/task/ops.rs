@@ -27,18 +27,25 @@ use starry_signal::{SignalActionFlags, SignalDisposition, SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use super::{
-    AsThread, CommittedProcessExit, ExecImageCommit, FutexKey, ITimerType, PreparedExecCredential,
-    ProcStateHint, Process, ProcessAccessState, ProcessData, ProcessGroup, ProcessReparentBatch,
-    Session, TaskParentNode, TaskUsage, Thread, ThreadExitTransition, TimerState, futex_table_for,
-    lock_task_parent_publication, process_domain, reap_process, send_signal_thread_inner,
-    send_signal_to_process, send_signal_to_process_data, send_signal_to_thread,
-    user::linux_pid_from_task_id,
+    AsThread, CommittedProcessExit, CommittingExecCredential, ExecImageCommit, FutexKey,
+    ITimerType, ProcStateHint, Process, ProcessAccessState, ProcessData, ProcessGroup,
+    ProcessReparentBatch, Session, TaskParentNode, TaskUsage, Thread, ThreadExitTransition,
+    TimerState, futex_table_for, lock_task_parent_publication, process_domain, reap_process,
+    send_signal_thread_inner, send_signal_to_process, send_signal_to_process_data,
+    send_signal_to_thread, user::linux_pid_from_task_id,
 };
 use crate::{
     mm::{AddrSpace, UserPtr, access_user_memory},
     pseudofs::cgroup,
     syscall::acct_process_exit,
 };
+
+#[cfg(not(test))]
+type RegistryMutex<T> = axsync::Mutex<T>;
+// Host unit tests do not initialize an axtask current-task slot, which the
+// sleepable production mutex requires even when uncontended.
+#[cfg(test)]
+type RegistryMutex<T> = spin::Mutex<T>;
 
 trait RegistryWeak: Clone {
     type Strong;
@@ -177,10 +184,10 @@ impl<W: RegistryWeak> WeakRegistry<W> {
     }
 }
 
-static TASK_TABLE: Lazy<Mutex<WeakRegistry<WeakAxTaskRef>>> =
-    Lazy::new(|| Mutex::new(WeakRegistry::new()));
-static TASK_ALIAS_TABLE: Lazy<Mutex<WeakRegistry<WeakAxTaskRef>>> =
-    Lazy::new(|| Mutex::new(WeakRegistry::new()));
+static TASK_TABLE: Lazy<RegistryMutex<WeakRegistry<WeakAxTaskRef>>> =
+    Lazy::new(|| RegistryMutex::new(WeakRegistry::new()));
+static TASK_ALIAS_TABLE: Lazy<RegistryMutex<WeakRegistry<WeakAxTaskRef>>> =
+    Lazy::new(|| RegistryMutex::new(WeakRegistry::new()));
 
 #[cfg(test)]
 std::thread_local! {
@@ -214,8 +221,19 @@ pub(in crate::task) fn task_alias_lock_held() -> bool {
     TASK_ALIAS_LOCK_DEPTH.with(|depth| depth.get() != 0)
 }
 
-static PROCESS_TABLE: Lazy<Mutex<WeakRegistry<Weak<ProcessData>>>> =
-    Lazy::new(|| Mutex::new(WeakRegistry::new()));
+/// Releases the ptrace/process action gate before the full-image callback. The
+/// callback result is returned so retired owners can remain live through the
+/// later exec/vfork gate release instead of being destroyed inside this call.
+pub(crate) fn release_exec_action_then_complete<A, R>(
+    action: A,
+    complete: impl FnOnce() -> R,
+) -> R {
+    drop(action);
+    complete()
+}
+
+static PROCESS_TABLE: Lazy<RegistryMutex<WeakRegistry<Weak<ProcessData>>>> =
+    Lazy::new(|| RegistryMutex::new(WeakRegistry::new()));
 
 fn sigchld_autoreap_policy(
     disposition: &SignalDisposition,
@@ -291,7 +309,7 @@ fn notify_reaper_of_inherited_zombie(child: &Arc<Process>) {
 }
 
 #[allow(dead_code)] // reached through the feature-gated memtrack cleanup hook
-fn cleanup_registry<W: RegistryWeak>(registry: &Mutex<WeakRegistry<W>>) {
+fn cleanup_registry<W: RegistryWeak>(registry: &RegistryMutex<WeakRegistry<W>>) {
     loop {
         let stale = {
             let mut registry = registry.lock();
@@ -311,7 +329,7 @@ fn cleanup_registry<W: RegistryWeak>(registry: &Mutex<WeakRegistry<W>>) {
     }
 }
 
-fn cleanup_registry_if_due<W: RegistryWeak>(registry: &Mutex<WeakRegistry<W>>) {
+fn cleanup_registry_if_due<W: RegistryWeak>(registry: &RegistryMutex<WeakRegistry<W>>) {
     let stale = {
         let mut registry = registry.lock();
         registry.take_one_stale_if_due()
@@ -319,7 +337,7 @@ fn cleanup_registry_if_due<W: RegistryWeak>(registry: &Mutex<WeakRegistry<W>>) {
     drop(stale);
 }
 
-struct RegistryCleanupGuard<'a, W: RegistryWeak>(&'a Mutex<WeakRegistry<W>>);
+struct RegistryCleanupGuard<'a, W: RegistryWeak>(&'a RegistryMutex<WeakRegistry<W>>);
 
 impl<W: RegistryWeak> Drop for RegistryCleanupGuard<'_, W> {
     fn drop(&mut self) {
@@ -373,7 +391,10 @@ fn validate_lookup_key(key: Pid) -> AxResult<()> {
     }
 }
 
-fn reserve_unique_task_key(table: &Mutex<WeakRegistry<WeakAxTaskRef>>, key: Pid) -> AxResult<bool> {
+fn reserve_unique_task_key(
+    table: &RegistryMutex<WeakRegistry<WeakAxTaskRef>>,
+    key: Pid,
+) -> AxResult<bool> {
     validate_lookup_key(key)?;
     let _cleanup = RegistryCleanupGuard(table);
     let mut table = table.lock();
@@ -507,25 +528,66 @@ impl TaskAliasAdmission {
         proc_data: &ProcessData,
         owner: Pid,
         thread: &Thread,
-        prepared: PreparedExecCredential<'a>,
+        committing: CommittingExecCredential<'a>,
         new_aspace: Arc<Mutex<AddrSpace>>,
         new_access_state: Arc<ProcessAccessState>,
     ) -> ExecImageCommit<'a> {
         debug_assert!(core::ptr::eq(self.task.as_thread(), thread));
-        let mut aliases = TASK_ALIAS_TABLE.lock();
-        #[cfg(test)]
-        let alias_lock_probe = TaskAliasLockProbe::new();
-        let retirement =
-            proc_data.publish_exec_image(owner, thread, prepared, new_aspace, new_access_state);
-        thread.set_tid(self.alias);
-        let old = aliases.insert_reserved(self.alias, &self.task);
-        self.committed = true;
-        drop(aliases);
-        #[cfg(test)]
-        drop(alias_lock_probe);
-        drop(old);
-        retirement
+        let alias = self.alias;
+        let task = &self.task;
+        commit_exec_alias_publication(
+            &mut self.committed,
+            || {
+                proc_data.publish_exec_image(
+                    owner,
+                    thread,
+                    committing,
+                    new_aspace,
+                    new_access_state,
+                )
+            },
+            |aliases| {
+                thread.set_tid(alias);
+                aliases.insert_reserved(alias, task)
+            },
+        )
     }
+}
+
+/// Runs the non-leader image and alias publication under the real alias-table
+/// critical section. Keeping this sequencing in one helper lets host tests
+/// exercise the lock/notification/retirement boundary without constructing a
+/// scheduler-owned `AxTaskRef` or publishing global process runtime state.
+fn commit_exec_alias_publication<R>(
+    committed: &mut bool,
+    publish_image: impl FnOnce() -> R,
+    publish_alias: impl FnOnce(&mut WeakRegistry<WeakAxTaskRef>) -> Option<WeakAxTaskRef>,
+) -> R {
+    let mut aliases = TASK_ALIAS_TABLE.lock();
+    #[cfg(test)]
+    let alias_lock_probe = TaskAliasLockProbe::new();
+    let retirement = publish_image();
+    let old = publish_alias(&mut aliases);
+    *committed = true;
+    drop(aliases);
+    #[cfg(test)]
+    drop(alias_lock_probe);
+    drop(old);
+    retirement
+}
+
+#[cfg(test)]
+pub(in crate::task) fn commit_exec_alias_publication_for_test<R>(
+    publish_image: impl FnOnce() -> R,
+    publish_alias: impl FnOnce(),
+) -> R {
+    let mut committed = false;
+    let retirement = commit_exec_alias_publication(&mut committed, publish_image, |_aliases| {
+        publish_alias();
+        None
+    });
+    assert!(committed);
+    retirement
 }
 
 /// Commits the only externally callable exec identity transition. A
@@ -537,7 +599,7 @@ pub(crate) fn commit_exec_identity_handoff<'a>(
     proc_data: &ProcessData,
     owner: Pid,
     thread: &Thread,
-    prepared: PreparedExecCredential<'a>,
+    committing: CommittingExecCredential<'a>,
     new_aspace: Arc<Mutex<AddrSpace>>,
     new_access_state: Arc<ProcessAccessState>,
 ) -> ExecImageCommit<'a> {
@@ -546,12 +608,12 @@ pub(crate) fn commit_exec_identity_handoff<'a>(
             proc_data,
             owner,
             thread,
-            prepared,
+            committing,
             new_aspace,
             new_access_state,
         )
     } else {
-        proc_data.publish_exec_image(owner, thread, prepared, new_aspace, new_access_state)
+        proc_data.publish_exec_image(owner, thread, committing, new_aspace, new_access_state)
     }
 }
 
@@ -567,7 +629,7 @@ impl Drop for TaskAliasAdmission {
 /// lock is reacquired; the locked pass only upgrades weak references and
 /// pushes into already-owned storage.
 fn try_registry_values<W: RegistryWeak>(
-    registry: &Mutex<WeakRegistry<W>>,
+    registry: &RegistryMutex<WeakRegistry<W>>,
 ) -> AxResult<Vec<W::Strong>> {
     let mut snapshot = Vec::new();
     loop {

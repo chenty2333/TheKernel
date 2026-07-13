@@ -10,6 +10,7 @@ use axhal::{
     mem::virt_to_phys,
     paging::{MappingFlags, PageSize},
 };
+#[cfg(not(test))]
 use axsync::Mutex;
 use kernel_elf_parser::{
     AuxEntry, AuxType, ELFHeaders, ELFHeadersBuilder, ELFParser, app_stack_region,
@@ -17,6 +18,8 @@ use kernel_elf_parser::{
 use linux_raw_sys::general::R_OK;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use ouroboros::self_referencing;
+#[cfg(test)]
+use spin::Mutex;
 use uluru::LRUCache;
 
 use crate::{
@@ -26,7 +29,11 @@ use crate::{
         permission::{DacFsContextExt, check_execute_permissions, check_open_permissions},
     },
     mm::aspace::{AddrSpace, Backend},
-    task::{DacCredentialView, ExecAuxIdentity},
+    task::{
+        Cred, DacCredentialView, ExecAuxIdentity, ExecExecutableRole, ExecFileIdentity,
+        ExecFileOwner, ExecFileSecurityObject, Kgid, Kuid, UserNamespace,
+        security::{ExecExecutableSecurityContext, dispatch_exec_executable},
+    },
 };
 
 const BINPRM_BUF_SIZE: usize = 256;
@@ -39,12 +46,26 @@ enum ExecAccess<'a> {
     TrustedBoot,
     User {
         credentials: &'a DacCredentialView,
+        actor: &'a Cred,
+        filesystem_owner_user_ns: &'a alloc::sync::Arc<UserNamespace>,
         all_readable: &'a Cell<bool>,
+        #[cfg(test)]
+        test_resolver: Option<&'a dyn Fn(&str) -> AxResult<Location>>,
+        #[cfg(test)]
+        component_observer: Option<&'a dyn Fn(&ExecFileSecurityObject) -> AxResult>,
     },
 }
 
 impl ExecAccess<'_> {
     fn resolve(self, path: &str) -> AxResult<Location> {
+        #[cfg(test)]
+        if let Self::User {
+            test_resolver: Some(resolve),
+            ..
+        } = self
+        {
+            return resolve(path);
+        }
         let fs = FS_CONTEXT.lock();
         match self {
             Self::TrustedBoot => fs.resolve(path),
@@ -52,22 +73,49 @@ impl ExecAccess<'_> {
         }
     }
 
-    fn check_location(self, loc: &Location) -> AxResult {
+    fn check_location(
+        self,
+        loc: &Location,
+        role: ExecExecutableRole,
+    ) -> AxResult<Option<ExecFileSecurityObject>> {
         match self {
-            Self::TrustedBoot => Ok(()),
+            Self::TrustedBoot => Ok(None),
             Self::User {
                 credentials,
+                actor,
+                filesystem_owner_user_ns,
                 all_readable,
+                #[cfg(test)]
+                component_observer,
+                ..
             } => {
                 check_execute_permissions(loc, credentials)?;
-                match check_open_permissions(loc, R_OK, credentials) {
-                    Ok(()) => Ok(()),
+                let readable = match check_open_permissions(loc, R_OK, credentials) {
+                    Ok(()) => true,
                     Err(AxError::PermissionDenied) => {
                         all_readable.set(false);
-                        Ok(())
+                        false
                     }
-                    Err(error) => Err(error),
+                    Err(error) => return Err(error),
+                };
+                let metadata = loc.metadata()?;
+                let owner = Kuid::from_raw(metadata.uid)
+                    .zip(Kgid::from_raw(metadata.gid))
+                    .map(|(uid, gid)| ExecFileOwner::new(uid, gid));
+                let object = ExecFileSecurityObject::new(
+                    ExecFileIdentity::new(loc.mountpoint().device(), loc.inode()),
+                    filesystem_owner_user_ns.clone(),
+                    owner,
+                    metadata.mode.bits(),
+                    readable,
+                    role,
+                );
+                dispatch_exec_executable(&ExecExecutableSecurityContext::new(actor, &object))?;
+                #[cfg(test)]
+                if let Some(observe) = component_observer {
+                    observe(&object)?;
                 }
+                Ok(Some(object))
             }
         }
     }
@@ -96,6 +144,7 @@ pub(crate) struct PreparedUserApp {
     auxv: Vec<AuxEntry>,
     arguments: Vec<String>,
     pub(crate) credential_source: Location,
+    pub(crate) credential_source_security: Option<ExecFileSecurityObject>,
     credential_lease: Option<CredentialReadLease>,
     pub(crate) image_access: ExecImageAccess,
 }
@@ -103,6 +152,12 @@ pub(crate) struct PreparedUserApp {
 impl PreparedUserApp {
     pub(crate) fn take_credential_lease(&mut self) -> AxResult<CredentialReadLease> {
         self.credential_lease.take().ok_or(AxError::BadState)
+    }
+
+    pub(crate) fn take_credential_source_security(&mut self) -> AxResult<ExecFileSecurityObject> {
+        self.credential_source_security
+            .take()
+            .ok_or(AxError::BadState)
     }
 }
 
@@ -263,12 +318,12 @@ struct ElfCacheEntry {
 }
 
 impl ElfCacheEntry {
-    fn load(loc: Location) -> AxResult<Result<Self, Vec<u8>>> {
+    fn load(loc: Location, target: &ExecLoadTarget<'_>) -> AxResult<Result<Self, Vec<u8>>> {
         let file_len = loc.metadata()?.size;
         let cache = CachedFile::get_or_create(loc);
 
         let mut data = vec![0; 4096];
-        let read = cache.read_at(&mut data[..], 0)?;
+        let read = target.read_at(&cache, &mut data[..], 0)?;
         data.truncate(read);
         match ElfCacheEntry::try_new_or_recover::<AxError>(cache.clone(), data, |data| {
             let builder = ELFHeadersBuilder::new(data).map_err(map_elf_error)?;
@@ -285,7 +340,7 @@ impl ElfCacheEntry {
                 let mut buf = Vec::new();
                 buf.try_reserve_exact(len).map_err(|_| AxError::NoMemory)?;
                 buf.resize(len, 0);
-                if cache.read_at(&mut buf[..], range.start)? != len {
+                if target.read_at(&cache, &mut buf[..], range.start)? != len {
                     return Err(AxError::InvalidExecutable);
                 }
                 builder.build(&buf)
@@ -304,10 +359,72 @@ struct LoadedElfImage {
     entry_point: VirtAddr,
     auxv: Vec<AuxEntry>,
     credential_source: Location,
+    credential_source_security: Option<ExecFileSecurityObject>,
     credential_lease: CredentialReadLease,
 }
 
 type LoadResult = Result<LoadedElfImage, Vec<u8>>;
+
+enum ExecLoadTarget<'a> {
+    Mapped(&'a mut AddrSpace),
+    #[cfg(test)]
+    Probe,
+}
+
+impl ExecLoadTarget<'_> {
+    fn read_at(&self, cache: &CachedFile, buf: &mut [u8], offset: u64) -> AxResult<usize> {
+        match self {
+            Self::Mapped(_) => cache.read_at(buf, offset).map_err(Into::into),
+            #[cfg(test)]
+            Self::Probe => cache
+                .location()
+                .entry()
+                .as_file()?
+                .read_at(buf, offset)
+                .map_err(Into::into),
+        }
+    }
+
+    fn reset_image(&mut self) -> AxResult {
+        match self {
+            Self::Mapped(uspace) => {
+                uspace.clear();
+                map_trampoline(uspace)
+            }
+            #[cfg(test)]
+            Self::Probe => Ok(()),
+        }
+    }
+
+    fn map_images(
+        &mut self,
+        elf: &ElfCacheEntry,
+        ldso: Option<&ElfCacheEntry>,
+    ) -> AxResult<(VirtAddr, Vec<AuxEntry>)> {
+        match self {
+            Self::Mapped(uspace) => {
+                let elf = map_elf(uspace, crate::config::USER_SPACE_BASE, elf)?;
+                let ldso = ldso
+                    .map(|elf| map_elf(uspace, crate::config::USER_INTERP_BASE, elf))
+                    .transpose()?;
+                let entry = VirtAddr::from_usize(
+                    ldso.as_ref()
+                        .map_or_else(|| elf.entry(), |ldso| ldso.entry()),
+                );
+                let auxv = elf
+                    .aux_vector(PAGE_SIZE_4K, ldso.map(|elf| elf.base()))
+                    .collect();
+                Ok((entry, auxv))
+            }
+            // Host tests have neither a kernel page-cache allocator nor a
+            // usable page table. Probe mode still performs the real VFS, ELF,
+            // interpreter, security, and lease flow, skipping only cached
+            // backing and address-space mapping.
+            #[cfg(test)]
+            Self::Probe => Ok((VirtAddr::from_usize(0), Vec::new())),
+        }
+    }
+}
 
 impl ElfLoader {
     const fn new() -> Self {
@@ -316,28 +433,32 @@ impl ElfLoader {
 
     fn load_path(
         &mut self,
-        uspace: &mut AddrSpace,
+        target: &mut ExecLoadTarget<'_>,
         path: &str,
         access: ExecAccess<'_>,
+        role: ExecExecutableRole,
     ) -> AxResult<LoadResult> {
         let loc = access.resolve(path)?;
-        self.load_location(uspace, loc, access)
+        self.load_location(target, loc, access, role)
     }
 
     fn load_location(
         &mut self,
-        uspace: &mut AddrSpace,
+        target: &mut ExecLoadTarget<'_>,
         loc: Location,
         access: ExecAccess<'_>,
+        role: ExecExecutableRole,
     ) -> AxResult<LoadResult> {
         // Pin content and privilege metadata before the first admission,
-        // header, cache, or metadata read from this candidate. Script leases
+        // header, cache, or metadata read from this candidate. User security
+        // dispatch occurs under the outer ELF_LOADER mutex, whose hook contract
+        // forbids blocking, allocation, and loader/VFS reentry. Script leases
         // drop on the non-ELF return; the final ELF lease is returned to exec.
         let credential_lease = CredentialReadLease::acquire(&loc)?;
-        access.check_location(&loc)?;
+        let credential_source_security = access.check_location(&loc, role)?;
 
         if !self.0.touch(|e| e.borrow_cache().location().ptr_eq(&loc)) {
-            match ElfCacheEntry::load(loc)? {
+            match ElfCacheEntry::load(loc, target)? {
                 Ok(e) => {
                     self.0.insert(e);
                 }
@@ -347,8 +468,7 @@ impl ElfLoader {
             }
         }
 
-        uspace.clear();
-        map_trampoline(uspace)?;
+        target.reset_image()?;
 
         let entry = self.0.front().ok_or(AxError::BadState)?;
         let executable_loc = entry.borrow_cache().location().clone();
@@ -371,7 +491,7 @@ impl ElfLoader {
             let interp_len =
                 usize::try_from(header.file_size).map_err(|_| AxError::InvalidExecutable)?;
             let mut data = vec![0; interp_len];
-            let read = cache.read_at(&mut data[..], header.offset)?;
+            let read = target.read_at(cache, &mut data[..], header.offset)?;
             if read != data.len() {
                 return Err(AxError::InvalidExecutable);
             }
@@ -389,12 +509,13 @@ impl ElfLoader {
         let (elf, ldso, ldso_lease) = if let Some(ldso) = ldso {
             let loc = access.resolve(&ldso)?;
             let lease = CredentialReadLease::acquire(&loc)?;
-            access.check_location(&loc)?;
+            let _dynamic_linker_security =
+                access.check_location(&loc, ExecExecutableRole::DynamicLinker)?;
             if loc.ptr_eq(&executable_loc) {
                 return Err(AxError::InvalidExecutable);
             }
             if !self.0.touch(|e| e.borrow_cache().location().ptr_eq(&loc)) {
-                let e = ElfCacheEntry::load(loc)?
+                let e = ElfCacheEntry::load(loc, target)?
                     .map_err(|_| AxError::from(axerrno::LinuxError::ELIBBAD))?;
                 self.0.insert(e);
             }
@@ -407,21 +528,11 @@ impl ElfLoader {
             (entry, None, None)
         };
 
-        let elf = map_elf(uspace, crate::config::USER_SPACE_BASE, elf)?;
-        let ldso = ldso
-            .map(|elf| map_elf(uspace, crate::config::USER_INTERP_BASE, elf))
-            .transpose()?;
+        let (entry_point, mut auxv) = target.map_images(elf, ldso)?;
         // The PT_INTERP lease is needed through its last content/backing map
         // use, but it never becomes the credential source.
         drop(ldso_lease);
 
-        let entry = VirtAddr::from_usize(
-            ldso.as_ref()
-                .map_or_else(|| elf.entry(), |ldso| ldso.entry()),
-        );
-        let mut auxv = elf
-            .aux_vector(PAGE_SIZE_4K, ldso.map(|elf| elf.base()))
-            .collect::<Vec<_>>();
         auxv.extend([
             AuxEntry::new(AuxType::FLAGS, 0),
             AuxEntry::new(AuxType::HWCAP, 0),
@@ -430,9 +541,10 @@ impl ElfLoader {
         ]);
 
         Ok(Ok(LoadedElfImage {
-            entry_point: entry,
+            entry_point,
             auxv,
             credential_source: executable_loc,
+            credential_source_security,
             credential_lease,
         }))
     }
@@ -596,7 +708,7 @@ fn install_loaded_user_app(
 }
 
 fn prepare_loaded_user_app(
-    uspace: &mut AddrSpace,
+    target: &mut ExecLoadTarget<'_>,
     path: &str,
     args: &[String],
     load_result: AxResult<LoadResult>,
@@ -615,11 +727,12 @@ fn prepare_loaded_user_app(
 
             let new_args = script_interpreter_args(&shebang, path, args)?;
             return prepare_user_app_path(
-                uspace,
+                target,
                 shebang.interpreter,
                 &new_args,
                 access,
                 script_depth + 1,
+                ExecExecutableRole::ScriptInterpreter,
             );
         }
         Err(err) => return Err(err),
@@ -630,6 +743,7 @@ fn prepare_loaded_user_app(
         auxv: loaded.auxv,
         arguments: try_copy_args(args, 0)?,
         credential_source: loaded.credential_source,
+        credential_source_security: loaded.credential_source_security,
         credential_lease: Some(loaded.credential_lease),
         image_access: ExecImageAccess {
             all_readable: match access {
@@ -641,14 +755,15 @@ fn prepare_loaded_user_app(
 }
 
 fn prepare_user_app_path(
-    uspace: &mut AddrSpace,
+    target: &mut ExecLoadTarget<'_>,
     path: &str,
     args: &[String],
     access: ExecAccess<'_>,
     script_depth: usize,
+    role: ExecExecutableRole,
 ) -> AxResult<PreparedUserApp> {
-    let load_result = ELF_LOADER.lock().load_path(uspace, path, access);
-    prepare_loaded_user_app(uspace, path, args, load_result, access, script_depth)
+    let load_result = ELF_LOADER.lock().load_path(target, path, access, role);
+    prepare_loaded_user_app(target, path, args, load_result, access, script_depth)
 }
 
 /// Load a trusted early-boot app without Linux DAC admission.
@@ -666,7 +781,17 @@ pub(crate) fn load_user_app_trusted(
         .ok_or(AxError::InvalidInput)?;
 
     ELF_LOADER.lock().0.clear();
-    let prepared = prepare_user_app_path(uspace, path, args, ExecAccess::TrustedBoot, 0)?;
+    let prepared = {
+        let mut target = ExecLoadTarget::Mapped(uspace);
+        prepare_user_app_path(
+            &mut target,
+            path,
+            args,
+            ExecAccess::TrustedBoot,
+            0,
+            ExecExecutableRole::Requested,
+        )?
+    };
     let loaded = finish_prepared_user_app(
         uspace,
         path,
@@ -688,6 +813,8 @@ pub(crate) fn prepare_user_app_at(
     args: &[String],
     _envs: &[String],
     credentials: &DacCredentialView,
+    actor: &Cred,
+    filesystem_owner_user_ns: &alloc::sync::Arc<UserNamespace>,
 ) -> AxResult<PreparedUserApp> {
     // The cache has no VFS content-generation cookie. Never let headers from
     // an earlier exec be paired with the current lease-protected backing.
@@ -695,10 +822,20 @@ pub(crate) fn prepare_user_app_at(
     let all_readable = Cell::new(true);
     let access = ExecAccess::User {
         credentials,
+        actor,
+        filesystem_owner_user_ns,
         all_readable: &all_readable,
+        #[cfg(test)]
+        test_resolver: None,
+        #[cfg(test)]
+        component_observer: None,
     };
-    let load_result = ELF_LOADER.lock().load_location(uspace, loc, access);
-    prepare_loaded_user_app(uspace, path, args, load_result, access, 0)
+    let mut target = ExecLoadTarget::Mapped(uspace);
+    let load_result =
+        ELF_LOADER
+            .lock()
+            .load_location(&mut target, loc, access, ExecExecutableRole::Requested);
+    prepare_loaded_user_app(&mut target, path, args, load_result, access, 0)
 }
 
 /// Installs the new user stack only after exec credential derivation has
@@ -738,7 +875,234 @@ pub(crate) fn finish_prepared_user_app(
 
 #[cfg(test)]
 mod tests {
+    use core::cell::RefCell;
+
+    use axfs_ng_vfs::{Mountpoint, NodePermission, NodeType};
+
     use super::*;
+    use crate::{file::executable, pseudofs::tmp::MemoryFs, task::UserNamespace};
+
+    fn create_test_file(root: &Location, name: &str, contents: &[u8]) -> Location {
+        let location = root
+            .create(
+                name,
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o755),
+            )
+            .unwrap();
+        assert_eq!(
+            location
+                .entry()
+                .as_file()
+                .unwrap()
+                .write_at(contents, 0)
+                .unwrap(),
+            contents.len()
+        );
+        location
+    }
+
+    fn dynamic_elf_with_interp(path: &[u8]) -> Vec<u8> {
+        assert_eq!(path.last(), Some(&0));
+        let mut bytes = include_bytes!(
+            "../../../third_party/rust-patches/kernel-elf-parser/tests/ld-linux-x86-64.so.2"
+        )
+        .to_vec();
+        let note_index = {
+            let elf = xmas_elf::ElfFile::new(&bytes).unwrap();
+            elf.program_iter()
+                .position(|header| header.get_type() == Ok(xmas_elf::program::Type::Note))
+                .unwrap()
+        };
+        let ph_offset = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
+        let ph_entry_size = u16::from_le_bytes(bytes[54..56].try_into().unwrap()) as usize;
+        assert_eq!(ph_entry_size, 56);
+        let header = ph_offset + note_index * ph_entry_size;
+        let path_offset = bytes.len() as u64;
+        bytes.extend_from_slice(path);
+        bytes[header..header + 4].copy_from_slice(&3u32.to_le_bytes());
+        bytes[header + 8..header + 16].copy_from_slice(&path_offset.to_le_bytes());
+        bytes[header + 32..header + 40].copy_from_slice(&(path.len() as u64).to_le_bytes());
+        bytes[header + 40..header + 48].copy_from_slice(&(path.len() as u64).to_le_bytes());
+        bytes
+    }
+
+    fn create_test_loader_chain() -> (Location, Location, Location) {
+        let fs = MemoryFs::new_with_capacity(Some(1024 * 1024)).unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        crate::mounts::initialize_test_mount(&mount, 0).unwrap();
+        let root = mount.root_location();
+        let script = create_test_file(&root, "script", b"#!/interp\n");
+        let interpreter = create_test_file(&root, "interp", &dynamic_elf_with_interp(b"/ld.so\0"));
+        let dynamic_linker = create_test_file(
+            &root,
+            "ld.so",
+            include_bytes!(
+                "../../../third_party/rust-patches/kernel-elf-parser/tests/ld-linux-x86-64.so.2"
+            ),
+        );
+        (script, interpreter, dynamic_linker)
+    }
+
+    fn assert_write_open_available(location: &Location) {
+        let key = executable::retain_write_open(location).unwrap();
+        executable::release_write_open(key);
+    }
+
+    #[test]
+    fn real_loader_chain_preserves_roles_terminal_source_and_lease_refunds() {
+        executable::init().unwrap();
+        let (script, interpreter, dynamic_linker) = create_test_loader_chain();
+        let device = script.mountpoint().device();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root(namespace.clone()).unwrap();
+        let credentials = actor.fs_dac_credentials();
+        let all_readable = Cell::new(true);
+        let observed = RefCell::new(Vec::new());
+        let resolve = |path: &str| match path {
+            "/interp" => Ok(interpreter.clone()),
+            "/ld.so" => Ok(dynamic_linker.clone()),
+            _ => Err(AxError::NotFound),
+        };
+        let observe = |object: &ExecFileSecurityObject| {
+            observed
+                .borrow_mut()
+                .push((object.role(), object.identity()));
+            Ok(())
+        };
+        let access = ExecAccess::User {
+            credentials: &credentials,
+            actor: &actor,
+            filesystem_owner_user_ns: &namespace,
+            all_readable: &all_readable,
+            test_resolver: Some(&resolve),
+            component_observer: Some(&observe),
+        };
+        ELF_LOADER.lock().0.clear();
+        let mut target = ExecLoadTarget::Probe;
+        let load_result = ELF_LOADER.lock().load_location(
+            &mut target,
+            script.clone(),
+            access,
+            ExecExecutableRole::Requested,
+        );
+        let prepared = prepare_loaded_user_app(
+            &mut target,
+            "/script",
+            &["/script".into()],
+            load_result,
+            access,
+            0,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "loader chain failed after {:?}: {error:?}",
+                observed.borrow().as_slice()
+            )
+        });
+
+        assert_eq!(
+            observed.borrow().as_slice(),
+            [
+                (
+                    ExecExecutableRole::Requested,
+                    ExecFileIdentity::new(device, script.inode()),
+                ),
+                (
+                    ExecExecutableRole::ScriptInterpreter,
+                    ExecFileIdentity::new(device, interpreter.inode()),
+                ),
+                (
+                    ExecExecutableRole::DynamicLinker,
+                    ExecFileIdentity::new(device, dynamic_linker.inode()),
+                ),
+            ]
+        );
+        assert!(prepared.credential_source.ptr_eq(&interpreter));
+        let source = prepared.credential_source_security.as_ref().unwrap();
+        assert_eq!(source.role(), ExecExecutableRole::ScriptInterpreter);
+        assert_eq!(
+            source.identity(),
+            ExecFileIdentity::new(device, interpreter.inode())
+        );
+        assert_write_open_available(&script);
+        assert_write_open_available(&dynamic_linker);
+        assert_eq!(
+            executable::retain_write_open(&interpreter),
+            Err(axerrno::LinuxError::ETXTBSY.into())
+        );
+
+        drop(prepared);
+        ELF_LOADER.lock().0.clear();
+        for location in [&script, &interpreter, &dynamic_linker] {
+            assert_write_open_available(location);
+        }
+    }
+
+    #[test]
+    fn real_loader_chain_denial_refunds_every_component_lease() {
+        executable::init().unwrap();
+        let (script, interpreter, dynamic_linker) = create_test_loader_chain();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root(namespace.clone()).unwrap();
+        let credentials = actor.fs_dac_credentials();
+        let resolve = |path: &str| match path {
+            "/interp" => Ok(interpreter.clone()),
+            "/ld.so" => Ok(dynamic_linker.clone()),
+            _ => Err(AxError::NotFound),
+        };
+
+        for denied_role in [
+            ExecExecutableRole::Requested,
+            ExecExecutableRole::ScriptInterpreter,
+            ExecExecutableRole::DynamicLinker,
+        ] {
+            let all_readable = Cell::new(true);
+            let deny_component = |object: &ExecFileSecurityObject| {
+                if object.role() == denied_role {
+                    Err(AxError::PermissionDenied)
+                } else {
+                    Ok(())
+                }
+            };
+            let access = ExecAccess::User {
+                credentials: &credentials,
+                actor: &actor,
+                filesystem_owner_user_ns: &namespace,
+                all_readable: &all_readable,
+                test_resolver: Some(&resolve),
+                component_observer: Some(&deny_component),
+            };
+            ELF_LOADER.lock().0.clear();
+            let mut target = ExecLoadTarget::Probe;
+            let load_result = ELF_LOADER.lock().load_location(
+                &mut target,
+                script.clone(),
+                access,
+                ExecExecutableRole::Requested,
+            );
+            let result = prepare_loaded_user_app(
+                &mut target,
+                "/script",
+                &["/script".into()],
+                load_result,
+                access,
+                0,
+            );
+            let error = result
+                .err()
+                .unwrap_or_else(|| panic!("{denied_role:?} denial unexpectedly succeeded"));
+            assert!(
+                matches!(error, AxError::PermissionDenied),
+                "{denied_role:?} denial returned {error:?}"
+            );
+
+            ELF_LOADER.lock().0.clear();
+            for location in [&script, &interpreter, &dynamic_linker] {
+                assert_write_open_available(location);
+            }
+        }
+    }
 
     #[test]
     fn process_access_exec_image_facts_track_complete_chain_readability() {

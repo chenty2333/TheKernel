@@ -636,6 +636,14 @@ impl<'a> PreparedCred<'a> {
         &self.proposed
     }
 
+    pub(in crate::task) fn old_arc(&self) -> &Arc<Cred> {
+        &self.old
+    }
+
+    pub(in crate::task) fn proposed_arc(&self) -> &Arc<Cred> {
+        &self.proposed
+    }
+
     /// Atomically publishes the proposed pointer while returning ownership of
     /// all retired references to the caller for deferred destruction.
     pub(crate) fn publish(self) -> CredentialPublication<'a> {
@@ -819,7 +827,18 @@ mod tests {
             thekernel_linux_cred::ExecImageReadability::Readable,
             None,
         );
-        let draft = ExecCredentialDraft::try_new(exec.old_arc(), input).unwrap();
+        let source = crate::task::ExecFileSecurityObject::new(
+            crate::task::ExecFileIdentity::new(1, 2),
+            exec.old().user_ns().clone(),
+            Some(crate::task::ExecFileOwner::new(
+                Kuid::INITIAL_ROOT,
+                Kgid::INITIAL_ROOT,
+            )),
+            0o755,
+            true,
+            crate::task::ExecExecutableRole::Requested,
+        );
+        let draft = ExecCredentialDraft::try_new(exec.old_arc(), input, source).unwrap();
         let prepared = exec.finish_exec_draft(draft).unwrap();
         // Exec de-threading may rebind the visible TID, but it never replaces
         // the executing Thread or the slot captured by this transaction.

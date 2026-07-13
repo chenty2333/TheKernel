@@ -27,7 +27,9 @@ pub(crate) use thekernel_linux_cred::{
 };
 
 use super::{
-    ExecCredentialSecurityContext, UserNamespace, creds::Cred, exec_cred::authorize_commoncap_exec,
+    ExecCommitRuntime, ExecCredentialSecurityContext, ExecFileSecurityObject, UserNamespace,
+    creds::{Cred, PreparedCred},
+    exec_cred::{ExecCredentialEffects, authorize_commoncap_exec},
 };
 
 const SECURITY_MODULE_LIMIT: usize = 8;
@@ -437,6 +439,122 @@ impl<'a> SecuritySignalContext<'a> {
     }
 }
 
+/// One already-resolved executable component checked during binary-handler
+/// discovery. The exact immutable actor credential and stable object facts are
+/// supplied by the loader; hooks cannot resample `current()` or repeat lookup.
+pub(crate) struct ExecExecutableSecurityContext<'a> {
+    actor: &'a Cred,
+    executable: &'a ExecFileSecurityObject,
+}
+
+impl<'a> ExecExecutableSecurityContext<'a> {
+    pub(crate) const fn new(actor: &'a Cred, executable: &'a ExecFileSecurityObject) -> Self {
+        Self { actor, executable }
+    }
+
+    pub(crate) const fn actor(&self) -> &'a Cred {
+        self.actor
+    }
+
+    pub(crate) const fn executable(&self) -> &'a ExecFileSecurityObject {
+        self.executable
+    }
+}
+
+/// Immutable facts shared by the infallible exec committing and committed
+/// notifications. Both phases observe the same exact old/new composite
+/// credentials, terminal credential source, and derived effects.
+struct ExecCommitSecurityFacts<'a> {
+    old: &'a Cred,
+    new: &'a Cred,
+    source: &'a ExecFileSecurityObject,
+    effects: ExecCredentialEffects,
+    runtime: &'a ExecCommitRuntime,
+}
+
+impl<'a> ExecCommitSecurityFacts<'a> {
+    const fn new(
+        old: &'a Cred,
+        new: &'a Cred,
+        source: &'a ExecFileSecurityObject,
+        effects: ExecCredentialEffects,
+        runtime: &'a ExecCommitRuntime,
+    ) -> Self {
+        Self {
+            old,
+            new,
+            source,
+            effects,
+            runtime,
+        }
+    }
+
+    const fn old(&self) -> &'a Cred {
+        self.old
+    }
+
+    const fn new_credential(&self) -> &'a Cred {
+        self.new
+    }
+
+    const fn source(&self) -> &'a ExecFileSecurityObject {
+        self.source
+    }
+
+    const fn effects(&self) -> ExecCredentialEffects {
+        self.effects
+    }
+
+    const fn runtime(&self) -> &'a ExecCommitRuntime {
+        self.runtime
+    }
+}
+
+macro_rules! exec_commit_context {
+    ($name:ident) => {
+        pub(crate) struct $name<'a> {
+            facts: ExecCommitSecurityFacts<'a>,
+        }
+
+        impl<'a> $name<'a> {
+            const fn new(
+                old: &'a Cred,
+                new: &'a Cred,
+                source: &'a ExecFileSecurityObject,
+                effects: ExecCredentialEffects,
+                runtime: &'a ExecCommitRuntime,
+            ) -> Self {
+                Self {
+                    facts: ExecCommitSecurityFacts::new(old, new, source, effects, runtime),
+                }
+            }
+
+            pub(crate) const fn old(&self) -> &'a Cred {
+                self.facts.old()
+            }
+
+            pub(crate) const fn new_credential(&self) -> &'a Cred {
+                self.facts.new_credential()
+            }
+
+            pub(crate) const fn source(&self) -> &'a ExecFileSecurityObject {
+                self.facts.source()
+            }
+
+            pub(crate) const fn effects(&self) -> ExecCredentialEffects {
+                self.facts.effects()
+            }
+
+            pub(crate) const fn runtime(&self) -> &'a ExecCommitRuntime {
+                self.facts.runtime()
+            }
+        }
+    };
+}
+
+exec_commit_context!(ExecCommittingSecurityContext);
+exec_commit_context!(ExecCommittedSecurityContext);
+
 /// One security module owns every hook family as one registration unit.
 ///
 /// The defaults are explicit no-ops so a module cannot be partially inserted
@@ -552,6 +670,53 @@ trait SecurityModule: Send + Sync + 'static {
         self.exec_credential(context)
     }
 
+    /// Authorizes one executable component after DAC/open admission and before
+    /// its binary handler or mapping is used. This fallible hook is invoked for
+    /// the requested object, every shebang interpreter, and `PT_INTERP`.
+    ///
+    /// Dispatch currently runs inside the global ELF-loader cache mutex. A hook
+    /// must not block, allocate, resample task state, or reenter loader/VFS
+    /// operations. Any fallible policy state must be reserved before dispatch.
+    fn exec_executable(&self, _context: &ExecExecutableSecurityContext<'_>) -> AxResult<()> {
+        Ok(())
+    }
+
+    fn exec_executable_with_credential_state(
+        &self,
+        context: &ExecExecutableSecurityContext<'_>,
+        _actor_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        self.exec_executable(context)
+    }
+
+    /// Observes the exec point of no return after CLOEXEC/AIO cleanup and
+    /// immediately before composite credential/image publication. This hook is
+    /// infallible and allocation-free. The credential writer mutex is still
+    /// held, but no publication/process/image/alias spin lock is held.
+    /// Implementations must not block, allocate, resample task state, or
+    /// reenter credential/VFS/loader operations.
+    fn exec_committing(
+        &self,
+        _context: &ExecCommittingSecurityContext<'_>,
+        _old_state: &Self::CredentialState,
+        _new_state: &Self::CredentialState,
+    ) {
+    }
+
+    /// Observes the complete installed exec image after the generic credential
+    /// notification, hardware page-table-root switch, executable/metadata and
+    /// userspace-context installation, ptrace exec stop, and release of every
+    /// writer/publication/process/image/alias/action lock. It must remain
+    /// infallible and allocation-free and must not resample or reenter task,
+    /// credential, VFS, or loader operations.
+    fn exec_committed(
+        &self,
+        _context: &ExecCommittedSecurityContext<'_>,
+        _old_state: &Self::CredentialState,
+        _new_state: &Self::CredentialState,
+    ) {
+    }
+
     fn scheduler(&self, _context: &SecuritySchedulerContext<'_>) -> AxResult<()> {
         Ok(())
     }
@@ -633,6 +798,23 @@ trait ErasedSecurityModule: Send + Sync {
         old_state: &dyn ErasedOwnedCredentialState,
         proposed_state: &dyn ErasedOwnedCredentialState,
     ) -> AxResult<()>;
+    fn exec_executable_with_credential_state(
+        &self,
+        context: &ExecExecutableSecurityContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
+    fn exec_committing(
+        &self,
+        context: &ExecCommittingSecurityContext<'_>,
+        old_state: &dyn ErasedOwnedCredentialState,
+        new_state: &dyn ErasedOwnedCredentialState,
+    );
+    fn exec_committed(
+        &self,
+        context: &ExecCommittedSecurityContext<'_>,
+        old_state: &dyn ErasedOwnedCredentialState,
+        new_state: &dyn ErasedOwnedCredentialState,
+    );
     fn scheduler(&self, context: &SecuritySchedulerContext<'_>) -> AxResult<()>;
     fn scheduler_with_credential_state(
         &self,
@@ -852,6 +1034,44 @@ impl<M: SecurityModule> ErasedSecurityModule for M {
             owned_credential_state(self, old_state)?,
             owned_credential_state(self, proposed_state)?,
         )
+    }
+
+    fn exec_executable_with_credential_state(
+        &self,
+        context: &ExecExecutableSecurityContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::exec_executable_with_credential_state(
+            self,
+            context,
+            owned_credential_state(self, actor_state)?,
+        )
+    }
+
+    fn exec_committing(
+        &self,
+        context: &ExecCommittingSecurityContext<'_>,
+        old_state: &dyn ErasedOwnedCredentialState,
+        new_state: &dyn ErasedOwnedCredentialState,
+    ) {
+        let old_state = owned_credential_state(self, old_state)
+            .expect("preflighted old exec credential state changed before committing");
+        let new_state = owned_credential_state(self, new_state)
+            .expect("preflighted new exec credential state changed before committing");
+        SecurityModule::exec_committing(self, context, old_state, new_state);
+    }
+
+    fn exec_committed(
+        &self,
+        context: &ExecCommittedSecurityContext<'_>,
+        old_state: &dyn ErasedOwnedCredentialState,
+        new_state: &dyn ErasedOwnedCredentialState,
+    ) {
+        let old_state = owned_credential_state(self, old_state)
+            .expect("preflighted old exec credential state changed before committed callback");
+        let new_state = owned_credential_state(self, new_state)
+            .expect("preflighted new exec credential state changed before committed callback");
+        SecurityModule::exec_committed(self, context, old_state, new_state);
     }
 
     fn scheduler(&self, context: &SecuritySchedulerContext<'_>) -> AxResult<()> {
@@ -1300,6 +1520,124 @@ impl PendingCredentialPostCommit {
     }
 }
 
+/// Linear preflight for the exec-only committing/committed hook pair.
+///
+/// It retains the exact old/new credentials and terminal credential source.
+/// Dropping this value before `committing()` is a normal exec rollback and
+/// emits no lifecycle notification.
+#[must_use = "an admitted exec must either abort or enter the committing phase"]
+pub(in crate::task) struct PendingExecSecurity {
+    registry: FrozenSecurityRegistry,
+    old: Arc<Cred>,
+    new: Arc<Cred>,
+    source: ExecFileSecurityObject,
+    effects: ExecCredentialEffects,
+}
+
+impl PendingExecSecurity {
+    pub(in crate::task) fn try_new(
+        prepared: &PreparedCred<'_>,
+        source: ExecFileSecurityObject,
+        effects: ExecCredentialEffects,
+    ) -> AxResult<Self> {
+        let old = prepared.old_arc();
+        let new = prepared.proposed_arc();
+        let registry = old.security().registry();
+        registry
+            .registry()
+            .validate_credential_post_commit_pair(old, new)?;
+        Ok(Self {
+            registry,
+            old: old.clone(),
+            new: new.clone(),
+            source,
+            effects,
+        })
+    }
+
+    pub(in crate::task) fn committing(self, runtime: ExecCommitRuntime) -> CommittingExecSecurity {
+        let context = ExecCommittingSecurityContext::new(
+            &self.old,
+            &self.new,
+            &self.source,
+            self.effects,
+            &runtime,
+        );
+        self.registry.registry().notify_exec_committing(&context);
+        CommittingExecSecurity {
+            registry: self.registry,
+            old: Some(self.old),
+            new: Some(self.new),
+            source: Some(self.source),
+            effects: self.effects,
+            runtime: Some(runtime),
+            armed: true,
+        }
+    }
+}
+
+/// Exec lifecycle after the point-of-no-return callback and before the
+/// matching committed callback. Composite image publication carries this
+/// token so committed notification cannot be forgotten or detached from the
+/// exact credentials which were installed.
+#[must_use = "a committing exec must complete its committed notification"]
+pub(in crate::task) struct CommittingExecSecurity {
+    registry: FrozenSecurityRegistry,
+    old: Option<Arc<Cred>>,
+    new: Option<Arc<Cred>>,
+    source: Option<ExecFileSecurityObject>,
+    effects: ExecCredentialEffects,
+    runtime: Option<ExecCommitRuntime>,
+    armed: bool,
+}
+
+impl CommittingExecSecurity {
+    pub(in crate::task) fn committed(mut self) -> CompletedExecSecurity {
+        let old = self
+            .old
+            .take()
+            .expect("committing exec old credential is live");
+        let new = self
+            .new
+            .take()
+            .expect("committing exec new credential is live");
+        let source = self.source.take().expect("committing exec source is live");
+        let runtime = self
+            .runtime
+            .take()
+            .expect("committing exec runtime facts are live");
+        let context =
+            ExecCommittedSecurityContext::new(&old, &new, &source, self.effects, &runtime);
+        self.registry.registry().notify_exec_committed(&context);
+        self.armed = false;
+        CompletedExecSecurity {
+            _old: old,
+            _new: new,
+            _source: source,
+            _runtime: runtime,
+        }
+    }
+}
+
+impl Drop for CommittingExecSecurity {
+    fn drop(&mut self) {
+        assert!(
+            !self.armed,
+            "committing exec dropped without committed security notification"
+        );
+    }
+}
+
+/// Exact exec security facts retained after the full-image callback until the
+/// caller has released the exec and vfork publication gates.
+#[must_use = "completed exec security ownership must reach the retirement boundary"]
+pub(in crate::task) struct CompletedExecSecurity {
+    _old: Arc<Cred>,
+    _new: Arc<Cred>,
+    _source: ExecFileSecurityObject,
+    _runtime: ExecCommitRuntime,
+}
+
 impl SecurityRegistry {
     fn validate_erased_slots(&self, slots: &[OwnedModuleCredState]) -> AxResult<()> {
         if slots.len() != self.modules.len() {
@@ -1545,6 +1883,58 @@ impl SecurityRegistry {
         Ok(())
     }
 
+    fn dispatch_exec_executable_with_credential_state(
+        &self,
+        context: &ExecExecutableSecurityContext<'_>,
+    ) -> AxResult<()> {
+        let actor = self.credential_slots(context.actor())?;
+        for (registered, actor_state) in self.modules.iter().zip(actor) {
+            if registered.id != actor_state.module_id {
+                return Err(AxError::OperationNotPermitted);
+            }
+            registered
+                .module
+                .exec_executable_with_credential_state(context, actor_state.erased.as_ref())?;
+        }
+        Ok(())
+    }
+
+    /// Runs a preflighted infallible phase over exact old/new module states.
+    /// `PendingExecSecurity::try_new` has already validated every erased slot,
+    /// so no failure branch can appear after exec crosses its point of no
+    /// return.
+    fn notify_exec_committing(&self, context: &ExecCommittingSecurityContext<'_>) {
+        let old = &context.old().security().slots;
+        let new = &context.new_credential().security().slots;
+        debug_assert_eq!(old.len(), self.modules.len());
+        debug_assert_eq!(new.len(), self.modules.len());
+        for ((registered, old_state), new_state) in self.modules.iter().zip(old).zip(new) {
+            debug_assert_eq!(registered.id, old_state.module_id);
+            debug_assert_eq!(registered.id, new_state.module_id);
+            registered.module.exec_committing(
+                context,
+                old_state.erased.as_ref(),
+                new_state.erased.as_ref(),
+            );
+        }
+    }
+
+    fn notify_exec_committed(&self, context: &ExecCommittedSecurityContext<'_>) {
+        let old = &context.old().security().slots;
+        let new = &context.new_credential().security().slots;
+        debug_assert_eq!(old.len(), self.modules.len());
+        debug_assert_eq!(new.len(), self.modules.len());
+        for ((registered, old_state), new_state) in self.modules.iter().zip(old).zip(new) {
+            debug_assert_eq!(registered.id, old_state.module_id);
+            debug_assert_eq!(registered.id, new_state.module_id);
+            registered.module.exec_committed(
+                context,
+                old_state.erased.as_ref(),
+                new_state.erased.as_ref(),
+            );
+        }
+    }
+
     fn dispatch_scheduler(&self, context: &SecuritySchedulerContext<'_>) -> AxResult<()> {
         for (index, registered) in self.modules.iter().enumerate() {
             debug_assert_eq!(usize::from(registered.id.0), index);
@@ -1735,6 +2125,20 @@ pub(crate) fn dispatch_exec_credential(
         .dispatch_exec_credential_with_credential_state(context)
 }
 
+/// Runs typed executable-component hooks for the already-resolved object in
+/// declaration order. Denial happens before the loader consumes that
+/// component and drops every transient executable lease on unwind.
+pub(crate) fn dispatch_exec_executable(
+    context: &ExecExecutableSecurityContext<'_>,
+) -> AxResult<()> {
+    context
+        .actor()
+        .security()
+        .registry()
+        .registry()
+        .dispatch_exec_executable_with_credential_state(context)
+}
+
 /// Runs the frozen scheduler hooks in declaration order.
 /// The first denial is returned immediately.
 pub(crate) fn dispatch_scheduler(context: &SecuritySchedulerContext<'_>) -> AxResult<()> {
@@ -1772,7 +2176,8 @@ mod tests {
 
     use super::*;
     use crate::task::{
-        CapabilityState, Cred, CredentialSlot, Credentials, Kgid, Kuid,
+        CapabilityState, Cred, CredentialSlot, Credentials, ExecCommitRuntime, ExecFileIdentity,
+        ExecImageIdentity, Kgid, Kuid,
         creds::{CAPABILITY_WORDS, credential_publication_lock_held},
     };
 
@@ -1798,12 +2203,17 @@ mod tests {
     static CRED_STATE_DROP_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_DISPATCH_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_EXEC_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_EXECUTABLE_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_EXECUTABLE_ROLE_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_EXEC_COMMITTING_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_EXEC_COMMITTED_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_HOOK_MASK: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_TRANSITION_MASK: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_FAIL_INIT_KEY: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_FAIL_PREPARE_KEY: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_DENY_KEY: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_EXEC_DENY_KEY: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_EXECUTABLE_DENY_KEY: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_TEST_SERIAL: Mutex<()> = Mutex::new(());
 
     fn append_trace(trace: &AtomicU32, value: u32) {
@@ -1831,12 +2241,17 @@ mod tests {
             &CRED_STATE_DROP_TRACE,
             &CRED_STATE_DISPATCH_TRACE,
             &CRED_STATE_EXEC_TRACE,
+            &CRED_STATE_EXECUTABLE_TRACE,
+            &CRED_STATE_EXECUTABLE_ROLE_TRACE,
+            &CRED_STATE_EXEC_COMMITTING_TRACE,
+            &CRED_STATE_EXEC_COMMITTED_TRACE,
             &CRED_STATE_HOOK_MASK,
             &CRED_STATE_TRANSITION_MASK,
             &CRED_STATE_FAIL_INIT_KEY,
             &CRED_STATE_FAIL_PREPARE_KEY,
             &CRED_STATE_DENY_KEY,
             &CRED_STATE_EXEC_DENY_KEY,
+            &CRED_STATE_EXECUTABLE_DENY_KEY,
         ] {
             trace.store(0, Ordering::SeqCst);
         }
@@ -2010,6 +2425,99 @@ mod tests {
             Ok(())
         }
 
+        fn exec_executable_with_credential_state(
+            &self,
+            context: &ExecExecutableSecurityContext<'_>,
+            actor_state: &Self::CredentialState,
+        ) -> AxResult<()> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(actor_state.key, key);
+            assert!(actor_state.committed.load(Ordering::SeqCst));
+            let executable = context.executable();
+            assert_eq!(executable.identity(), ExecFileIdentity::new(17, 23));
+            assert_eq!(executable.identity().device(), 17);
+            assert_eq!(executable.identity().inode(), 23);
+            assert!(Arc::ptr_eq(
+                executable.owner_user_ns(),
+                context.actor().user_ns()
+            ));
+            assert!(executable.readable());
+            if key == 2 {
+                let role = match executable.role() {
+                    crate::task::ExecExecutableRole::Requested => 1,
+                    crate::task::ExecExecutableRole::ScriptInterpreter => 2,
+                    crate::task::ExecExecutableRole::DynamicLinker => 3,
+                };
+                append_trace(&CRED_STATE_EXECUTABLE_ROLE_TRACE, role);
+            }
+            append_trace(&CRED_STATE_EXECUTABLE_TRACE, key);
+            CRED_STATE_HOOK_MASK.fetch_or(1 << 5, Ordering::SeqCst);
+            if CRED_STATE_EXECUTABLE_DENY_KEY.load(Ordering::SeqCst) == key {
+                return Err(AxError::PermissionDenied);
+            }
+            Ok(())
+        }
+
+        fn exec_committing(
+            &self,
+            context: &ExecCommittingSecurityContext<'_>,
+            old_state: &Self::CredentialState,
+            new_state: &Self::CredentialState,
+        ) {
+            assert!(super::super::creds::credential_writer_lock_held());
+            assert!(!super::super::creds::credential_publication_lock_held());
+            assert!(!super::super::process::process_security_lock_held());
+            assert!(!super::super::process::process_image_lock_held());
+            assert!(!super::super::process::group_leader_lock_held());
+            assert!(!super::super::process::ptrace_action_lock_held());
+            assert!(!super::super::ops::task_alias_lock_held());
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(old_state.key, key);
+            assert_eq!(new_state.key, key);
+            assert!(old_state.committed.load(Ordering::SeqCst));
+            assert!(!new_state.committed.load(Ordering::SeqCst));
+            assert_eq!(context.source().identity(), ExecFileIdentity::new(17, 23));
+            assert_eq!(context.runtime().process_id(), 41);
+            assert_eq!(context.runtime().executing_tid(), 43);
+            assert_eq!(context.runtime().post_exec_tid(), 41);
+            assert_ne!(context.runtime().image_identity().as_usize(), 0);
+            assert!(Arc::ptr_eq(
+                context.runtime().image_owner_user_ns(),
+                context.new_credential().user_ns()
+            ));
+            assert_eq!(
+                context.effects().dumpability(),
+                crate::task::exec_cred::ExecDumpability::UserDumpable
+            );
+            append_trace(&CRED_STATE_EXEC_COMMITTING_TRACE, key);
+        }
+
+        fn exec_committed(
+            &self,
+            context: &ExecCommittedSecurityContext<'_>,
+            old_state: &Self::CredentialState,
+            new_state: &Self::CredentialState,
+        ) {
+            assert_post_commit_callback_locks_released();
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(old_state.key, key);
+            assert_eq!(new_state.key, key);
+            assert!(old_state.committed.load(Ordering::SeqCst));
+            assert!(new_state.committed.load(Ordering::SeqCst));
+            assert_eq!(context.source().identity(), ExecFileIdentity::new(17, 23));
+            assert_eq!(context.runtime().process_id(), 41);
+            assert_ne!(context.runtime().image_identity().as_usize(), 0);
+            assert_eq!(
+                context.effects().dumpability(),
+                crate::task::exec_cred::ExecDumpability::UserDumpable
+            );
+            assert!(Arc::ptr_eq(
+                context.runtime().image_owner_user_ns(),
+                context.new_credential().user_ns()
+            ));
+            append_trace(&CRED_STATE_EXEC_COMMITTED_TRACE, key);
+        }
+
         fn scheduler_with_credential_state(
             &self,
             context: &SecuritySchedulerContext<'_>,
@@ -2181,6 +2689,11 @@ mod tests {
             Ok(())
         }
 
+        fn exec_executable(&self, _context: &ExecExecutableSecurityContext<'_>) -> AxResult<()> {
+            WHOLE_MODULE_HOOK_TRACE.fetch_add(1 << 40, Ordering::SeqCst);
+            Ok(())
+        }
+
         fn scheduler(&self, _context: &SecuritySchedulerContext<'_>) -> AxResult<()> {
             WHOLE_MODULE_HOOK_TRACE.fetch_add(1 << 24, Ordering::SeqCst);
             Ok(())
@@ -2319,13 +2832,19 @@ mod tests {
         builder
             .try_register::<CredentialStateProbeModule<3>>()
             .unwrap();
-        let registry = Box::try_new(builder.freeze()).unwrap();
+        freeze_test_registry(builder.freeze())
+    }
+
+    fn freeze_test_registry(registry: SecurityRegistry) -> FrozenSecurityRegistry {
+        let registry = Box::try_new(registry).unwrap();
         FrozenSecurityRegistry(Box::leak(registry))
     }
 
-    fn dispatch_all_hook_families(registry: &SecurityRegistry) {
+    fn dispatch_all_hook_families(registry: SecurityRegistry) {
+        let registry = freeze_test_registry(registry);
         let namespace = UserNamespace::try_new_root().unwrap();
-        let root = Cred::try_root(namespace.clone()).unwrap();
+        let root = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
+        let dispatch = registry.registry();
         let image = Arc::new(());
         let image_ref = ProcessImageSecurityRef::new(&namespace, &image);
         let access = PtraceAccessContext::new(
@@ -2340,6 +2859,7 @@ mod tests {
             PtraceTracemeContext::new(&root, &root, image_ref.owner_user_ns(), &image_ref);
         let draft = exec_draft(&root, crate::task::ExecTraceState::NotSuppressingPrivilege);
         let exec = ExecCredentialSecurityContext::new(&draft);
+        let executable = ExecExecutableSecurityContext::new(&root, draft.source());
         let scheduler = scheduler_context(&root, &root, SchedulerSecurityOperation::SetAffinity);
         let signal_target = SignalTargetSecurityRef::new(&image, 1, 1, SignalTargetKind::Process);
         let signal = SecuritySignalContext::authorize(
@@ -2355,11 +2875,14 @@ mod tests {
         )
         .unwrap();
 
-        registry.dispatch_ptrace_access(&access).unwrap();
-        registry.dispatch_ptrace_traceme(&traceme).unwrap();
-        registry.dispatch_exec_credential(&exec).unwrap();
-        registry.dispatch_scheduler(&scheduler).unwrap();
-        registry.dispatch_signal(&signal).unwrap();
+        dispatch.dispatch_ptrace_access(&access).unwrap();
+        dispatch.dispatch_ptrace_traceme(&traceme).unwrap();
+        dispatch.dispatch_exec_credential(&exec).unwrap();
+        dispatch
+            .dispatch_exec_executable_with_credential_state(&executable)
+            .unwrap();
+        dispatch.dispatch_scheduler(&scheduler).unwrap();
+        dispatch.dispatch_signal(&signal).unwrap();
     }
 
     fn capability_set(capabilities: &[u32]) -> [u32; CAPABILITY_WORDS] {
@@ -2527,7 +3050,18 @@ mod tests {
             crate::task::ExecImageReadability::Readable,
             None,
         );
-        crate::task::exec_cred::ExecCredentialDraft::try_new(credential, input).unwrap()
+        let source = crate::task::ExecFileSecurityObject::new(
+            crate::task::ExecFileIdentity::new(17, 23),
+            credential.user_ns().clone(),
+            Some(crate::task::ExecFileOwner::new(
+                Kuid::INITIAL_ROOT,
+                Kgid::INITIAL_ROOT,
+            )),
+            0o755,
+            true,
+            crate::task::ExecExecutableRole::Requested,
+        );
+        crate::task::exec_cred::ExecCredentialDraft::try_new(credential, input, source).unwrap()
     }
 
     #[test]
@@ -2769,10 +3303,10 @@ mod tests {
         let registry = builder.freeze();
 
         WHOLE_MODULE_HOOK_TRACE.store(0, Ordering::SeqCst);
-        dispatch_all_hook_families(&registry);
+        dispatch_all_hook_families(registry);
         assert_eq!(
             WHOLE_MODULE_HOOK_TRACE.load(Ordering::SeqCst),
-            0x01_0101_0101
+            0x01_0101_0101_01
         );
 
         let mut builder = test_registry_builder();
@@ -2783,7 +3317,7 @@ mod tests {
         let registry = builder.freeze();
 
         WHOLE_MODULE_HOOK_TRACE.store(0, Ordering::SeqCst);
-        dispatch_all_hook_families(&registry);
+        dispatch_all_hook_families(registry);
         assert_eq!(WHOLE_MODULE_HOOK_TRACE.load(Ordering::SeqCst), 0);
     }
 
@@ -3476,6 +4010,7 @@ mod tests {
             crate::task::ExecTraceState::NotSuppressingPrivilege,
         );
         let exec = ExecCredentialSecurityContext::new(&draft);
+        let executable = ExecExecutableSecurityContext::new(&credential, draft.source());
         let signal_target = SignalTargetSecurityRef::new(&image, 44, 44, SignalTargetKind::Process);
         let signal = SecuritySignalContext::authorize(
             &credential,
@@ -3497,9 +4032,11 @@ mod tests {
         dispatch_ptrace_traceme(&traceme).unwrap();
         dispatch_scheduler(&scheduler).unwrap();
         dispatch_exec_credential(&exec).unwrap();
+        dispatch_exec_executable(&executable).unwrap();
         dispatch_signal(&signal).unwrap();
         assert_eq!(CRED_STATE_DISPATCH_TRACE.load(Ordering::SeqCst), 23);
-        assert_eq!(CRED_STATE_HOOK_MASK.load(Ordering::SeqCst), 0b1_1111);
+        assert_eq!(CRED_STATE_EXECUTABLE_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(CRED_STATE_HOOK_MASK.load(Ordering::SeqCst), 0b11_1111);
     }
 
     #[test]
@@ -3543,6 +4080,57 @@ mod tests {
         drop(draft);
         assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
         assert_eq!(old.ids().euid, Kuid::INITIAL_ROOT);
+    }
+
+    #[test]
+    fn executable_component_hook_denial_short_circuits_in_registry_order() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root_with_registry(registry, namespace).unwrap();
+        let draft = exec_draft(&actor, crate::task::ExecTraceState::NotSuppressingPrivilege);
+        let context = ExecExecutableSecurityContext::new(&actor, draft.source());
+        CRED_STATE_EXECUTABLE_DENY_KEY.store(2, Ordering::SeqCst);
+
+        assert_eq!(
+            dispatch_exec_executable(&context),
+            Err(AxError::PermissionDenied)
+        );
+        assert_eq!(CRED_STATE_EXECUTABLE_TRACE.load(Ordering::SeqCst), 2);
+        assert_eq!(CRED_STATE_EXEC_COMMITTING_TRACE.load(Ordering::SeqCst), 0);
+        assert_eq!(CRED_STATE_EXEC_COMMITTED_TRACE.load(Ordering::SeqCst), 0);
+        assert!(core::ptr::eq(context.actor(), actor.as_ref()));
+    }
+
+    #[test]
+    fn executable_component_roles_preserve_exec_chain_order() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
+
+        for role in [
+            crate::task::ExecExecutableRole::Requested,
+            crate::task::ExecExecutableRole::ScriptInterpreter,
+            crate::task::ExecExecutableRole::DynamicLinker,
+        ] {
+            let executable = crate::task::ExecFileSecurityObject::new(
+                ExecFileIdentity::new(17, 23),
+                namespace.clone(),
+                Some(crate::task::ExecFileOwner::new(
+                    Kuid::INITIAL_ROOT,
+                    Kgid::INITIAL_ROOT,
+                )),
+                0o755,
+                true,
+                role,
+            );
+            dispatch_exec_executable(&ExecExecutableSecurityContext::new(&actor, &executable))
+                .unwrap();
+        }
+
+        assert_eq!(CRED_STATE_EXECUTABLE_ROLE_TRACE.load(Ordering::SeqCst), 123);
+        assert_eq!(CRED_STATE_EXECUTABLE_TRACE.load(Ordering::SeqCst), 232_323);
     }
 
     #[test]
@@ -3811,6 +4399,99 @@ mod tests {
         assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
         drop(new);
         drop(slot);
+    }
+
+    #[test]
+    fn exec_lifecycle_notifies_committing_then_generic_then_full_committed() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let old = Cred::try_root_with_registry(registry, namespace).unwrap();
+        let slot = CredentialSlot::new(old.clone());
+        let update = slot.prepare();
+        let draft = exec_draft(&old, crate::task::ExecTraceState::NotSuppressingPrivilege);
+        dispatch_exec_credential(&ExecCredentialSecurityContext::new(&draft)).unwrap();
+        let source = draft.source().clone();
+        let effects = draft.proposal().effects();
+        let prepared = update.finish_exec_draft(draft).unwrap();
+        let pending = PendingExecSecurity::try_new(&prepared, source, effects).unwrap();
+        let image = Arc::new(());
+        let runtime = ExecCommitRuntime::new(
+            41,
+            43,
+            41,
+            ExecImageIdentity::from_arc(&image),
+            old.user_ns().clone(),
+        );
+
+        let committing = pending.committing(runtime);
+        assert_eq!(CRED_STATE_EXEC_COMMITTING_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 0);
+        assert_eq!(CRED_STATE_EXEC_COMMITTED_TRACE.load(Ordering::SeqCst), 0);
+
+        let publication = prepared.publish();
+        let (new, retirement) = publication.complete_post_commit();
+        assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(CRED_STATE_EXEC_COMMITTED_TRACE.load(Ordering::SeqCst), 0);
+
+        let completed = committing.committed();
+        assert_eq!(CRED_STATE_EXEC_COMMITTED_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 0);
+        drop(old);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 0);
+        drop(retirement);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 0);
+        drop(completed);
+        assert_eq!(CRED_STATE_DROP_TRACE.load(Ordering::SeqCst), 32);
+        drop(new);
+        drop(slot);
+    }
+
+    #[test]
+    fn aborting_a_prepared_exec_emits_no_commit_phase_notification() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let old = Cred::try_root_with_registry(registry, namespace).unwrap();
+        let slot = CredentialSlot::new(old.clone());
+        let update = slot.prepare();
+        let draft = exec_draft(&old, crate::task::ExecTraceState::NotSuppressingPrivilege);
+        let source = draft.source().clone();
+        let effects = draft.proposal().effects();
+        let prepared = update.finish_exec_draft(draft).unwrap();
+        let pending = PendingExecSecurity::try_new(&prepared, source, effects).unwrap();
+
+        drop(pending);
+        drop(prepared);
+        assert_eq!(CRED_STATE_EXEC_COMMITTING_TRACE.load(Ordering::SeqCst), 0);
+        assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 0);
+        assert_eq!(CRED_STATE_EXEC_COMMITTED_TRACE.load(Ordering::SeqCst), 0);
+        assert!(Arc::ptr_eq(&old, &slot.current()));
+    }
+
+    #[test]
+    #[should_panic(expected = "committing exec dropped without committed security notification")]
+    fn dropping_an_armed_exec_commit_token_fails_stop() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let old = Cred::try_root_with_registry(registry, namespace).unwrap();
+        let slot = CredentialSlot::new(old.clone());
+        let update = slot.prepare();
+        let draft = exec_draft(&old, crate::task::ExecTraceState::NotSuppressingPrivilege);
+        let source = draft.source().clone();
+        let effects = draft.proposal().effects();
+        let prepared = update.finish_exec_draft(draft).unwrap();
+        let pending = PendingExecSecurity::try_new(&prepared, source, effects).unwrap();
+        let image = Arc::new(());
+        let runtime = ExecCommitRuntime::new(
+            41,
+            43,
+            41,
+            ExecImageIdentity::from_arc(&image),
+            old.user_ns().clone(),
+        );
+        drop(pending.committing(runtime));
     }
 
     #[test]

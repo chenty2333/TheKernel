@@ -113,7 +113,7 @@ use super::{
     accounting::{AtomicTaskUsage, live_process_usage},
     cred_error,
     creds::{Cred, CredentialSlot, PreparedCred},
-    exec_cred::PreparedExecCredential,
+    exec_cred::CommittingExecCredential,
     futex::FutexTable,
     jobctl::{
         ContinueResult, ExecControlState, JobControlState, PtraceControlState, PtraceSession,
@@ -127,7 +127,7 @@ use super::{
 use crate::{
     file::{
         FdTable,
-        executable::{self, ExecutableKey},
+        executable::{self, CredentialReadLease, ExecutableKey},
     },
     mm::AddrSpace,
     time::wall_time,
@@ -1787,6 +1787,8 @@ struct GroupLeaderRetirement {
 pub(crate) struct ExecImageCommit<'a> {
     group_leader: GroupLeaderCommit<'a>,
     image: LiveProcessImageBinding,
+    security: super::security::CommittingExecSecurity,
+    credential_lease: CredentialReadLease,
 }
 
 impl ExecImageCommit<'_> {
@@ -1794,20 +1796,78 @@ impl ExecImageCommit<'_> {
         let Self {
             group_leader,
             image,
+            security,
+            credential_lease,
         } = self;
         ExecImageRetirement {
             _group_leader: group_leader.complete_post_commit(),
             _image: image,
+            security: Some(security),
+            credential_lease: Some(credential_lease),
         }
     }
 }
 
-/// Retired image and credential ownership after notification. The caller
-/// keeps this alive until after switching the hardware page-table root.
-#[must_use = "exec retirement must outlive the page-table switch and process action locks"]
+/// Retired image and credential ownership after the generic credential
+/// notification but before the full-image committed notification.
+#[must_use = "exec retirement must finish its executable lease and full-image notification"]
 pub(crate) struct ExecImageRetirement {
     _group_leader: GroupLeaderRetirement,
     _image: LiveProcessImageBinding,
+    security: Option<super::security::CommittingExecSecurity>,
+    credential_lease: Option<CredentialReadLease>,
+}
+
+impl ExecImageRetirement {
+    /// Converts the source metadata/content lease into the persistent active
+    /// executable reference installed in the new process image. The pending
+    /// exec notification and old image remain owned by this token.
+    pub(crate) fn finish_executable_lease(&mut self) -> AxResult<Option<ExecutableKey>> {
+        self.credential_lease
+            .take()
+            .ok_or(AxError::BadState)?
+            .finish()
+    }
+
+    /// Emits the full-image committed notification and returns the still-owned
+    /// retirement state. The caller must already have installed the hardware
+    /// root, executable identity, metadata, signal state, and user context and
+    /// released the ptrace action gate; it drops the returned owner only after
+    /// releasing the exec and vfork gates.
+    pub(crate) fn complete_exec_committed(mut self) -> CompletedExecImageRetirement {
+        assert!(
+            self.credential_lease.is_none(),
+            "exec committed before executable lease conversion"
+        );
+        let security = self
+            .security
+            .take()
+            .expect("exec committed security notification is pending")
+            .committed();
+        let Self {
+            _group_leader,
+            _image,
+            security: pending_security,
+            credential_lease,
+        } = self;
+        debug_assert!(pending_security.is_none());
+        debug_assert!(credential_lease.is_none());
+        CompletedExecImageRetirement {
+            _group_leader,
+            _image,
+            _security: security,
+        }
+    }
+}
+
+/// Old image and exact security ownership retained after the full-image hook.
+/// Exec drops this only after new thread admission and the vfork parent are
+/// released to observe the completed image.
+#[must_use = "completed exec retirement must outlive exec and vfork gate release"]
+pub(crate) struct CompletedExecImageRetirement {
+    _group_leader: GroupLeaderRetirement,
+    _image: LiveProcessImageBinding,
+    _security: super::security::CompletedExecSecurity,
 }
 
 pub(crate) fn process_error(error: ProcessError) -> AxError {
@@ -2232,20 +2292,19 @@ impl ProcessData {
         &self,
         owner: Pid,
         thread: &super::Thread,
-        prepared: PreparedExecCredential<'a>,
+        committing: CommittingExecCredential<'a>,
         new_aspace: Arc<Mutex<AddrSpace>>,
         new_access_state: Arc<ProcessAccessState>,
     ) -> ExecImageCommit<'a> {
         debug_assert!(self.is_exec_owner(owner));
         debug_assert_eq!(thread.proc_data.proc.pid(), self.proc.pid());
         let credential = thread.credential_slot();
-        let effects = prepared.effects();
+        let (prepared, effects, security, credential_lease) = committing.into_parts();
         if effects.clear_pdeath_signal() {
             // Linux pdeath_signal is task-local: only the executor crosses
             // this credential transition, never its former siblings.
             thread.set_pdeath_signal(0);
         }
-        let prepared = prepared.into_prepared();
         let (group_leader, retired_image) = replace_process_image_with_group_handoff(
             &self.image_binding,
             &self.group_leader_identity,
@@ -2264,6 +2323,8 @@ impl ProcessData {
         ExecImageCommit {
             group_leader,
             image: retired_image,
+            security,
+            credential_lease,
         }
     }
 
@@ -3406,10 +3467,7 @@ impl ProcessData {
 
     /// Finishes or cancels the in-flight exec owned by `owner`.
     pub fn end_exec(&self, owner: Pid) {
-        let mut exec_ctl = self.exec_ctl.lock();
-        if exec_ctl.owner == Some(owner) {
-            exec_ctl.owner = None;
-            drop(exec_ctl);
+        if release_exec_control_owner(&self.exec_ctl, owner) {
             self.exec_event.wake();
         }
     }
@@ -3426,12 +3484,23 @@ impl ProcessData {
 
     /// Releases a blocked vfork parent after execve commits or the last thread exits.
     pub fn release_vfork(&self) {
-        let mut vfork_ctl = self.vfork_ctl.lock();
-        if vfork_ctl.parent_tid.take().is_some() {
-            drop(vfork_ctl);
+        if release_vfork_control_parent(&self.vfork_ctl) {
             self.vfork_event.wake();
         }
     }
+}
+
+fn release_exec_control_owner(exec_ctl: &SpinNoIrq<ExecControlState>, owner: Pid) -> bool {
+    let mut exec_ctl = exec_ctl.lock();
+    if exec_ctl.owner != Some(owner) {
+        return false;
+    }
+    exec_ctl.owner = None;
+    true
+}
+
+fn release_vfork_control_parent(vfork_ctl: &SpinNoIrq<VforkControlState>) -> bool {
+    vfork_ctl.lock().parent_tid.take().is_some()
 }
 
 impl Drop for ProcessData {
@@ -3466,13 +3535,20 @@ mod tests {
         TimeNamespace, UserNamespace, UtsNamespace, coredump_image_snapshot,
         group_exit_handoff_requires_kill, init_uts_state, ptrace_image_snapshot_if_owned,
         ptrace_image_snapshot_if_session, ptrace_inactive_image_snapshot_if_session,
-        ptrace_lifecycle_first_key, replace_process_image_with_group_handoff,
-        retire_group_leader_signal_owner, snapshot_credential_image,
-        snapshot_group_credential_image, try_increment_bounded,
+        ptrace_lifecycle_first_key, release_exec_control_owner, release_vfork_control_parent,
+        replace_process_image_with_group_handoff, retire_group_leader_signal_owner,
+        snapshot_credential_image, snapshot_group_credential_image, try_increment_bounded,
     };
     use crate::task::{
         CapabilityState, Cred, CredentialSlot, IdMap, IdMapInputExtent, Kgid, Kuid,
-        jobctl::{JobControlState, PtraceControlState, PtraceSession, StopKind, StopState},
+        jobctl::{
+            ExecControlState, JobControlState, PtraceControlState, PtraceSession, StopKind,
+            StopState, VforkControlState,
+        },
+        ops::{
+            commit_exec_alias_publication_for_test, release_exec_action_then_complete,
+            task_alias_lock_held,
+        },
         security::{commoncap_post_commit_probe, reset_commoncap_post_commit_probe},
     };
 
@@ -4037,6 +4113,219 @@ mod tests {
         assert_eq!(current_state.dumpability(), Dumpability::NotDumpable);
         new_ready.wait();
         reader.join().unwrap();
+    }
+
+    // Host tests cannot construct the scheduler-owned AxTaskRef/ProcessData
+    // graph without booting global kernel runtime. This is intentionally a
+    // structural test of the production publication, alias-lock, action-drop,
+    // gate-state, and retirement primitives, not an end-to-end do_execve test.
+    #[test]
+    fn leader_and_nonleader_exec_primitives_retain_owners_through_gates() {
+        struct ActionGate {
+            trace: Arc<SpinNoIrq<Vec<&'static str>>>,
+        }
+
+        impl Drop for ActionGate {
+            fn drop(&mut self) {
+                self.trace.lock().push("action-released");
+            }
+        }
+
+        fn run(nonleader: bool) {
+            let leader_tid = 41;
+            let executor_tid = if nonleader { 42 } else { leader_tid };
+            let trace = Arc::new(SpinNoIrq::new(Vec::new()));
+
+            let old_slot = credential_slot(1000);
+            let old_slot_weak = Arc::downgrade(&old_slot);
+            let executor_slot = if nonleader {
+                credential_slot(2000)
+            } else {
+                old_slot.clone()
+            };
+            let old_leader_credential = old_slot.current();
+            let old_leader_credential_weak = Arc::downgrade(&old_leader_credential);
+            let old_executor_credential = executor_slot.current();
+            let old_executor_credential_weak = Arc::downgrade(&old_executor_credential);
+            let old_owner = old_leader_credential.user_ns().clone();
+            let new_owner = old_executor_credential.user_ns().clone();
+
+            let old_signal = thread_signal_manager();
+            let old_signal_weak = Arc::downgrade(&old_signal);
+            let new_signal = if nonleader {
+                thread_signal_manager()
+            } else {
+                old_signal.clone()
+            };
+            let group = GroupLeaderIdentityBinding::try_new(old_slot.clone()).unwrap();
+            group
+                .bind_initial_signal(leader_tid, old_signal.clone())
+                .unwrap();
+
+            let old_state =
+                ProcessAccessState::try_new(Dumpability::UserDumpable, old_owner).unwrap();
+            let old_state_weak = Arc::downgrade(&old_state);
+            let new_state =
+                ProcessAccessState::try_new(Dumpability::NotDumpable, new_owner).unwrap();
+            let expected_new_state = new_state.clone();
+            let old_image = Arc::new(());
+            let old_image_weak = Arc::downgrade(&old_image);
+            let image = spin::RwLock::new(ProcessImageBinding {
+                aspace: old_image.clone(),
+                access_state: old_state.clone(),
+            });
+
+            drop((old_slot, old_leader_credential, old_executor_credential));
+            drop((old_signal, old_state, old_image));
+
+            let mut update = executor_slot.prepare();
+            update.builder.ids.ruid = kuid(3000);
+            update.builder.ids.euid = kuid(3000);
+            update.builder.ids.suid = kuid(3000);
+            update.builder.ids.fsuid = kuid(3000);
+            let prepared = update.finish().unwrap();
+            let visible_tid = AtomicU32::new(executor_tid);
+            let new_image = Arc::new(());
+            let expected_new_image = new_image.clone();
+            let exec_ctl = SpinNoIrq::new(ExecControlState {
+                owner: Some(executor_tid),
+                ..ExecControlState::default()
+            });
+            let vfork_ctl = SpinNoIrq::new(VforkControlState {
+                parent_tid: Some(7),
+            });
+
+            reset_commoncap_post_commit_probe();
+            let publish_image = || {
+                trace.lock().push("image-published");
+                assert_eq!(task_alias_lock_held(), nonleader);
+                assert_eq!(exec_ctl.lock().owner, Some(executor_tid));
+                assert_eq!(vfork_ctl.lock().parent_tid, Some(7));
+                replace_process_image_with_group_handoff(
+                    &image,
+                    &group,
+                    executor_slot.clone(),
+                    Some(GroupLeaderSignalIdentity::new(executor_tid, new_signal)),
+                    Some(prepared),
+                    ProcessImageBinding {
+                        aspace: new_image,
+                        access_state: new_state,
+                    },
+                    || {},
+                )
+            };
+            let (commit, retired_image) = if nonleader {
+                commit_exec_alias_publication_for_test(publish_image, || {
+                    assert!(task_alias_lock_held());
+                    visible_tid.store(leader_tid, Ordering::Release);
+                    trace.lock().push("alias-published");
+                })
+            } else {
+                publish_image()
+            };
+
+            assert!(!task_alias_lock_held());
+            assert_eq!(
+                visible_tid.load(Ordering::Acquire),
+                if nonleader { leader_tid } else { executor_tid }
+            );
+            let (published_cred, dumpability, _, published_image, published_state) =
+                snapshot_group_credential_image(&image, &group);
+            assert!(Arc::ptr_eq(&published_cred, &executor_slot.current()));
+            assert_eq!(published_cred.ids().euid, kuid(3000));
+            assert_eq!(dumpability, Dumpability::NotDumpable);
+            assert!(Arc::ptr_eq(&published_image, &expected_new_image));
+            assert!(Arc::ptr_eq(&published_state, &expected_new_state));
+            assert!(old_leader_credential_weak.upgrade().is_some());
+            assert!(old_executor_credential_weak.upgrade().is_some());
+            assert!(old_state_weak.upgrade().is_some());
+            assert!(old_image_weak.upgrade().is_some());
+
+            let retirement = commit.complete_post_commit();
+            trace.lock().push("credential-committed");
+            let (count, old_uid, new_uid, _) = commoncap_post_commit_probe();
+            assert_eq!(count, 1);
+            assert_eq!(old_uid, if nonleader { 2000 } else { 1000 });
+            assert_eq!(new_uid, 3000);
+            assert!(old_leader_credential_weak.upgrade().is_some());
+            assert!(old_executor_credential_weak.upgrade().is_some());
+            assert!(old_state_weak.upgrade().is_some());
+            assert!(old_image_weak.upgrade().is_some());
+            if nonleader {
+                assert!(old_signal_weak.upgrade().is_some());
+            }
+
+            let completed = release_exec_action_then_complete(
+                ActionGate {
+                    trace: trace.clone(),
+                },
+                || {
+                    assert_eq!(exec_ctl.lock().owner, Some(executor_tid));
+                    assert_eq!(vfork_ctl.lock().parent_tid, Some(7));
+                    trace.lock().push("full-image-committed");
+                    (retirement, retired_image)
+                },
+            );
+            assert_eq!(exec_ctl.lock().owner, Some(executor_tid));
+            assert_eq!(vfork_ctl.lock().parent_tid, Some(7));
+            assert!(old_leader_credential_weak.upgrade().is_some());
+            assert!(old_executor_credential_weak.upgrade().is_some());
+            assert!(old_state_weak.upgrade().is_some());
+            assert!(old_image_weak.upgrade().is_some());
+
+            assert!(release_exec_control_owner(&exec_ctl, executor_tid));
+            trace.lock().push("exec-gate-released");
+            assert_eq!(exec_ctl.lock().owner, None);
+            assert_eq!(vfork_ctl.lock().parent_tid, Some(7));
+            assert!(old_leader_credential_weak.upgrade().is_some());
+            assert!(old_image_weak.upgrade().is_some());
+            assert!(release_vfork_control_parent(&vfork_ctl));
+            trace.lock().push("vfork-gate-released");
+            assert_eq!(vfork_ctl.lock().parent_tid, None);
+            assert!(old_leader_credential_weak.upgrade().is_some());
+            assert!(old_image_weak.upgrade().is_some());
+
+            drop(completed);
+            trace.lock().push("retirement-dropped");
+            assert!(old_leader_credential_weak.upgrade().is_none());
+            assert!(old_executor_credential_weak.upgrade().is_none());
+            assert!(old_state_weak.upgrade().is_none());
+            assert!(old_image_weak.upgrade().is_none());
+            if nonleader {
+                assert!(old_slot_weak.upgrade().is_none());
+                assert!(old_signal_weak.upgrade().is_none());
+            } else {
+                assert!(old_slot_weak.upgrade().is_some());
+                assert!(old_signal_weak.upgrade().is_some());
+            }
+
+            let expected = if nonleader {
+                vec![
+                    "image-published",
+                    "alias-published",
+                    "credential-committed",
+                    "action-released",
+                    "full-image-committed",
+                    "exec-gate-released",
+                    "vfork-gate-released",
+                    "retirement-dropped",
+                ]
+            } else {
+                vec![
+                    "image-published",
+                    "credential-committed",
+                    "action-released",
+                    "full-image-committed",
+                    "exec-gate-released",
+                    "vfork-gate-released",
+                    "retirement-dropped",
+                ]
+            };
+            assert_eq!(*trace.lock(), expected);
+        }
+
+        run(false);
+        run(true);
     }
 
     #[test]

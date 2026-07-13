@@ -27,12 +27,13 @@ use crate::{
     },
     readiness::block_on_poll_set,
     task::{
-        AsThread, DacCredentialView, ExecCredentialInput, ExecFileOwner, ExecImageReadability,
-        ExecMountPrivilege, ExecTraceState, FileCapabilities, Kgid, Kuid, ProcessAccessState,
-        ProcessData, Thread, UserNamespace, check_signals, commit_exec_identity_handoff,
-        fail_closed_exit, get_task, has_pending_fatal_signal, linux_pid_from_task_id,
-        map_exec_dumpability, notify_ptrace_attach_stop, prepare_task_alias_admission,
-        process_error, set_current_user_page_table_root,
+        AsThread, DacCredentialView, ExecCommitRuntime, ExecCredentialInput, ExecImageIdentity,
+        ExecImageReadability, ExecMountPrivilege, ExecTraceState, FileCapabilities,
+        ProcessAccessState, ProcessData, Thread, UserNamespace, check_signals,
+        commit_exec_identity_handoff, fail_closed_exit, get_task, has_pending_fatal_signal,
+        linux_pid_from_task_id, map_exec_dumpability, notify_ptrace_attach_stop,
+        prepare_task_alias_admission, process_error, release_exec_action_then_complete,
+        set_current_user_page_table_root,
     },
 };
 
@@ -46,14 +47,6 @@ fn interrupt_exec_siblings(sibling_tids: &[Pid]) {
 
 fn files_preparation_covers_thread_snapshot(has_private_table: bool, threads: &[Pid]) -> bool {
     has_private_table || threads.len() <= 1
-}
-
-/// Releases the later ptrace/process action gate before any exec retirement
-/// can run credential/image destructors. Kept as one audited boundary so a
-/// future refactor cannot accidentally reverse the two drops.
-fn release_exec_action_then_retirement<A, R>(action: A, retirement: R) {
-    drop(action);
-    drop(retirement);
 }
 
 fn exec_file_capabilities(
@@ -75,6 +68,14 @@ fn exec_mm_owner_user_ns(
     // the unreadable inode. Filesystems here have neither superblock user_ns
     // nor idmapped mounts, so their conservative owner is the initial user ns.
     let mut owner = proposed_user_ns.clone();
+    while let Some(parent) = owner.parent() {
+        owner = parent;
+    }
+    owner
+}
+
+fn initial_user_namespace(namespace: &Arc<UserNamespace>) -> Arc<UserNamespace> {
+    let mut owner = namespace.clone();
     while let Some(parent) = owner.parent() {
         owner = parent;
     }
@@ -279,6 +280,7 @@ fn do_execve(
     loc: axfs_ng_vfs::Location,
     args: Vec<String>,
     envs: Vec<String>,
+    actor: &Arc<crate::task::Cred>,
     credentials: &DacCredentialView,
 ) -> AxResult<isize> {
     let curr = current();
@@ -302,6 +304,7 @@ fn do_execve(
     let proc_data = &thr.proc_data;
     let mut new_aspace = new_user_aspace_empty()?;
     copy_from_kernel(&mut new_aspace)?;
+    let filesystem_owner_user_ns = initial_user_namespace(actor.user_ns());
     let mut prepared_app = prepare_user_app_at(
         &mut new_aspace,
         loc.clone(),
@@ -309,20 +312,20 @@ fn do_execve(
         &args,
         &envs,
         credentials,
+        actor,
+        &filesystem_owner_user_ns,
     )?;
 
     // Only the terminal ELF (the shebang interpreter when the initial object
     // is a script) supplies set-ID and file-capability privilege. PT_INTERP is
     // part of the readability/content chain but is never a credential source.
-    let source_metadata = prepared_app.credential_source.metadata()?;
-    let source_mode = source_metadata.mode.bits();
+    let source_security = prepared_app.take_credential_source_security()?;
+    let source_mode = source_security.mode();
     let final_exe_path = {
         let path = prepared_app.credential_source.absolute_path()?;
         try_copy_string(path.as_str())?
     };
-    let file_owner = Kuid::from_raw(source_metadata.uid)
-        .zip(Kgid::from_raw(source_metadata.gid))
-        .map(|(uid, gid)| ExecFileOwner::new(uid, gid));
+    let file_owner = source_security.owner();
     let nosuid = crate::mounts::is_nosuid(&prepared_app.credential_source)?;
     let file_capabilities = exec_file_capabilities(nosuid, || {
         crate::syscall::security_capabilities_for_exec(&prepared_app.credential_source)
@@ -344,7 +347,7 @@ fn do_execve(
         file_capabilities,
     );
     let credential_lease = prepared_app.take_credential_lease()?;
-    let prepared_exec_cred = thr.prepare_exec_credential(input)?;
+    let prepared_exec_cred = thr.prepare_exec_credential(actor, input, source_security)?;
     let effects = prepared_exec_cred.effects();
     let mm_owner_user_ns = exec_mm_owner_user_ns(
         prepared_exec_cred.proposed_user_ns(),
@@ -450,6 +453,19 @@ fn do_execve(
 
     crate::syscall::cleanup_process_aio(proc_data.proc.pid());
 
+    // This is the Linux bprm_committing_creds analogue. Sibling teardown,
+    // CLOEXEC, and AIO cleanup have crossed the point of no return; the hook is
+    // infallible and the resulting typestate is the only value accepted by
+    // composite credential/image publication.
+    let exec_runtime = ExecCommitRuntime::new(
+        proc_data.proc.pid(),
+        curr_tid,
+        proc_data.proc.pid(),
+        ExecImageIdentity::from_arc(&new_aspace),
+        new_access_state.owner_user_ns().clone(),
+    );
+    let committing_exec_cred = prepared_exec_cred.begin_commit(credential_lease, exec_runtime);
+
     // A non-leader exec adopts the thread-group ID. The visible TID, reserved
     // alias, credential/group-leader binding, address space, and access owner
     // become visible as one composite transition. No fallible commit remains.
@@ -462,7 +478,7 @@ fn do_execve(
         proc_data,
         curr_tid,
         thr,
-        prepared_exec_cred,
+        committing_exec_cred,
         new_aspace,
         new_access_state,
     );
@@ -471,15 +487,15 @@ fn do_execve(
     // Notify before taking the ptrace-action lock, while the returned
     // retirement continues to own the old credential and old image through
     // the hardware page-table-root switch below.
-    let exec_retirement = exec_commit.complete_post_commit();
+    let mut exec_retirement = exec_commit.complete_post_commit();
     // Freeze the relationship which observed the exec commit while the exec
     // gate still excludes a fresh attach. The action gate keeps that exact
     // relationship stable through stop publication; a later attachment must
     // not inherit this already-committed exec event.
     let exec_ptrace_action = proc_data.lock_ptrace_actions();
     let exec_ptrace_session = proc_data.ptrace_active_session();
-    let executable_key = credential_lease
-        .finish()
+    let executable_key = exec_retirement
+        .finish_executable_lease()
         .unwrap_or_else(|error| fail_closed_exit(error));
     set_current_user_page_table_root(new_root);
     proc_data.replace_executable(executable_key);
@@ -508,12 +524,6 @@ fn do_execve(
     curr.as_thread().set_clear_child_tid(0);
     curr.as_thread().set_robust_list_head(0);
 
-    // Keep CLONE_THREAD publication gated until every process-wide field of
-    // the new image has been installed. Releasing the gate at the address-space
-    // swap would let a new sibling observe a half-committed exec image.
-    proc_data.end_exec(curr_tid);
-    proc_data.release_vfork();
-
     uctx.set_ip(entry_point.as_usize());
     uctx.set_sp(user_stack_base.as_usize());
     if let Some(session) = exec_ptrace_session
@@ -521,11 +531,18 @@ fn do_execve(
     {
         notify_ptrace_attach_stop(proc_data);
     }
-    // The old page tables and credential owners stayed alive until the saved
-    // task context and hardware root both named the new image. Release them
-    // only after the later ptrace/process action lock is gone as well, so a
-    // final module-state free callback never runs under that lock.
-    release_exec_action_then_retirement(exec_ptrace_action, exec_retirement);
+    // The old page tables and exact credential/security owners stay alive while
+    // the saved task context and hardware root both name the new image. Release
+    // the ptrace action gate before the full-image callback, but retain those
+    // owners through the exec/vfork publication gates below.
+    let completed_exec_retirement = release_exec_action_then_complete(exec_ptrace_action, || {
+        exec_retirement.complete_exec_committed()
+    });
+    // Keep CLONE_THREAD publication and the vfork parent gated until the
+    // complete new image and its late committed notification are visible.
+    proc_data.end_exec(curr_tid);
+    proc_data.release_vfork();
+    drop(completed_exec_retirement);
     Ok(0)
 }
 
@@ -540,12 +557,14 @@ pub fn sys_execve(
 
     debug!("sys_execve <= path: {path:?}, args: {args:?}, envs: {envs:?}");
 
-    // Credential locks precede FS_CONTEXT for the whole pathname operation.
-    let credentials = current().as_thread().fs_dac_credentials();
+    // Freeze one immutable actor snapshot before path resolution; that same
+    // Arc supplies DAC, component hooks, and credential derivation throughout.
+    let actor = current().as_thread().current_cred();
+    let credentials = actor.fs_dac_credentials();
     let loc = resolve_at_with_credentials(AT_FDCWD, Some(&path), 0, &credentials)?
         .into_file()
         .ok_or(AxError::InvalidInput)?;
-    do_execve(uctx, loc, args, envs, &credentials)
+    do_execve(uctx, loc, args, envs, &actor, &credentials)
 }
 
 #[cfg(test)]
@@ -557,11 +576,11 @@ mod tests {
 
     use super::{
         exact_exec_thread_snapshot, exec_file_capabilities, exec_mm_owner_user_ns,
-        files_preparation_covers_thread_snapshot, release_exec_action_then_retirement,
+        files_preparation_covers_thread_snapshot,
     };
     use crate::{
         mm::ExecImageAccess,
-        task::{Kgid, Kuid, UserNamespace},
+        task::{Kgid, Kuid, UserNamespace, release_exec_action_then_complete},
     };
 
     #[test]
@@ -623,16 +642,21 @@ mod tests {
         }
 
         let trace = AtomicU32::new(0);
-        release_exec_action_then_retirement(
+        let retirement = release_exec_action_then_complete(
             DropTrace {
                 trace: &trace,
                 value: 1,
             },
-            DropTrace {
-                trace: &trace,
-                value: 2,
+            || {
+                assert_eq!(trace.load(Ordering::SeqCst), 1);
+                DropTrace {
+                    trace: &trace,
+                    value: 2,
+                }
             },
         );
+        assert_eq!(trace.load(Ordering::SeqCst), 1);
+        drop(retirement);
         assert_eq!(trace.load(Ordering::SeqCst), 12);
     }
 }
@@ -657,7 +681,8 @@ pub fn sys_execveat(
     );
 
     // Use one pre-exec view for the initial path and every interpreter lookup.
-    let credentials = current().as_thread().fs_dac_credentials();
+    let actor = current().as_thread().current_cred();
+    let credentials = actor.fs_dac_credentials();
     let resolved = if path.is_empty() {
         if (flags as u32) & AT_EMPTY_PATH == 0 {
             return Err(AxError::NotFound);
@@ -675,5 +700,5 @@ pub fn sys_execveat(
         return Err(axerrno::LinuxError::ELOOP.into());
     }
 
-    do_execve(uctx, loc, args, envs, &credentials)
+    do_execve(uctx, loc, args, envs, &actor, &credentials)
 }
