@@ -61,6 +61,10 @@ pub fn init(args: &[String], envs: &[String]) {
     axfs::set_mount_access_policy(crate::mounts::note_mount_access);
     crate::deferred_work::init();
     crate::file::inotify::init_filesystem_release_notifications();
+    if let Err(error) = crate::task::security::init() {
+        error!("failed to initialize frozen security registry: {error}");
+        system_off();
+    }
     let user_ns = UserNamespace::try_new_root().expect("Failed to allocate init user namespace");
     let root_cred = Cred::try_root(user_ns.clone()).expect("Failed to allocate init credential");
     let boot_credentials = root_cred.fs_dac_credentials();
