@@ -1102,6 +1102,9 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
         None
     };
     if let Some(file) = regular_file {
+        if len != 0 {
+            file.killpriv_for_content_mutation()?;
+        }
         if let Some(written) = f.with_write_credentials(|| {
             if let Some(written) = try_regular_file_write_user_slice(file, buf as *const u8, len)? {
                 return Ok(Some(written));
@@ -1142,6 +1145,9 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> 
         }
         let offset = current_write_offset(file.inner())?;
         validate_direct_iov(file.as_ref(), &iov, offset)?;
+        if iov.len() != 0 {
+            file.killpriv_for_content_mutation()?;
+        }
         let written = file.with_write_credentials(|| {
             if let Some(written) = try_regular_file_writev_user_segments(file.as_ref(), &iov)? {
                 return Ok(written);
@@ -1446,6 +1452,9 @@ fn do_pwritev(
         positioned_write_file(fd)?
     };
     let io = IoVectorBuf::new(iov, iovcnt)?;
+    if io.len() != 0 {
+        file.killpriv_for_content_mutation()?;
+    }
     let written = file.with_write_credentials(|| {
         if offset == -1 {
             let appending = file.inner().flags().contains(FileFlags::APPEND);
@@ -1572,20 +1581,28 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
     check_open_permissions(&loc, W_OK as u32, &credentials)?;
     check_writable_mount(&loc)?;
     check_resize_limit(length as u64)?;
-    executable::check_not_active(&loc)?;
-    lease::wait_for_truncate(&loc)?;
-    memfd::check_resize(&loc, length as u64)?;
-    check_mandatory_truncate_lock(
-        &loc,
-        length as u64,
-        flock::RecordLockOwner::Posix(proc_data.proc.pid()),
-    )?;
-    let file = OpenOptions::new()
-        .write(true)
-        .open_loc(loc.clone())?
-        .into_file()?;
-    file.access(FileFlags::WRITE)?.set_len(length as _)?;
-    touch_modified_metadata(&loc)?;
+    // Unlike fd-backed mutations, path truncate has no persistent open-file
+    // description carrying the ETXTBSY reference. Hold a transient write
+    // reservation across every check and publication after admission so exec
+    // credential sampling cannot start in the old check-then-truncate gap.
+    let write_open_key = executable::retain_write_open(&loc)?;
+    let truncate = (|| {
+        lease::wait_for_truncate(&loc)?;
+        memfd::check_resize(&loc, length as u64)?;
+        check_mandatory_truncate_lock(
+            &loc,
+            length as u64,
+            flock::RecordLockOwner::Posix(proc_data.proc.pid()),
+        )?;
+        let file = OpenOptions::new()
+            .write(true)
+            .open_loc(loc.clone())?
+            .into_file()?;
+        file.access(FileFlags::WRITE)?.set_len(length as _)?;
+        touch_modified_metadata(&loc)
+    })();
+    executable::release_write_open(write_open_key);
+    truncate?;
     let _ = notify_exact(&loc, IN_MODIFY | IN_ATTRIB);
     Ok(0)
 }
@@ -1696,6 +1713,9 @@ pub fn sys_fallocate(
                 return Err(AxError::OperationNotPermitted);
             }
             let hole_len = end.min(size).saturating_sub(offset);
+            if hole_len != 0 {
+                f.killpriv_for_content_mutation()?;
+            }
             write_zero_range(file, offset, hole_len)?;
             if let Some(result) = tmp::punch_hole_fallocate_range(&loc, offset, len) {
                 result?;
@@ -1709,6 +1729,7 @@ pub fn sys_fallocate(
             if seals & linux_raw_sys::general::F_SEAL_WRITE != 0 {
                 return Err(AxError::OperationNotPermitted);
             }
+            f.killpriv_for_content_mutation()?;
             let zero_end = if mode & FALLOC_FL_KEEP_SIZE != 0 {
                 end.min(size)
             } else {
@@ -1905,6 +1926,7 @@ pub fn sys_pwrite64(
     if len == 0 {
         return Ok(0);
     }
+    f.killpriv_for_content_mutation()?;
     let write = f.with_write_credentials(|| {
         if f.inner().flags().contains(FileFlags::APPEND) {
             let append_offset = f.inner().location().len()?;
@@ -2045,6 +2067,7 @@ impl SendFile {
                     return Ok(0);
                 }
                 memfd::check_write(file.inner().location(), off, allowed)?;
+                file.killpriv_for_content_mutation()?;
                 let bytes_written =
                     file.with_write_credentials(|| file.inner().write_at(&buf[..allowed], off))?;
                 offset.vm_write(checked_offset_advance(off, bytes_written)?)?;

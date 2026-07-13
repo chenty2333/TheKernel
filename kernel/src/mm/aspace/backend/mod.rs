@@ -184,6 +184,13 @@ impl MappingBackend for Backend {
             return false;
         };
         let mut cursor = pt.cursor();
+        if let Backend::File(file) = self {
+            if let Err(err) = file.protect_range(range, new_flags, &mut cursor) {
+                warn!("Failed to protect file area: {:?}", err);
+                return false;
+            }
+            return true;
+        }
         if let Err(err) = BackendOps::on_protect(self, range, new_flags, &mut cursor) {
             warn!("Failed to protect area: {:?}", err);
             return false;

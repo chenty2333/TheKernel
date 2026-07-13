@@ -205,6 +205,30 @@ impl<C> PreparedZombieExit<C> {
             .initialize(wait_status, self_usage, child_usage, credential);
         self.exit.commit(snapshot, inherited_zombie)
     }
+
+    /// Initializes the durable payload, publishes the zombie transition, and
+    /// forwards each authoritative core child-to-reaper batch after the core
+    /// has released all of its topology guards.
+    ///
+    /// Different batches may name different reapers when a subreaper changes
+    /// state between bounded core topology sections. Consumers must therefore
+    /// use the identity supplied with each batch instead of independently
+    /// repeating Linux reaper selection.
+    pub fn commit_with_reparent_handoff(
+        self,
+        wait_status: i32,
+        self_usage: ProcessUsage,
+        child_usage: ProcessUsage,
+        credential: C,
+        inherited_zombie: impl FnMut(Arc<Process<C>>),
+        reparent_batch: impl FnMut(&ProcessReparentBatch<C>),
+    ) -> CommittedProcessExit<C> {
+        let snapshot = self
+            .storage
+            .initialize(wait_status, self_usage, child_usage, credential);
+        self.exit
+            .commit_with_reparent_handoff(snapshot, inherited_zombie, reparent_batch)
+    }
 }
 
 /// Process identifier, also used for thread, group, and session identifiers.
@@ -263,6 +287,10 @@ pub type InitialProcessAdmission<C> =
 pub type ProcessExitAdmission<C> = thekernel_linux_process::ProcessExitAdmission<ZombieSnapshot<C>>;
 /// Completed zombie publication with its linearized notification parent.
 pub type CommittedProcessExit<C> = thekernel_linux_process::CommittedProcessExit<ZombieSnapshot<C>>;
+/// One authoritative bounded child-to-reaper handoff batch.
+pub type ProcessReparentBatch<C> = thekernel_linux_process::ProcessReparentBatch<ZombieSnapshot<C>>;
+/// One process moved by an authoritative reparent handoff batch.
+pub type ReparentedProcess<C> = thekernel_linux_process::ReparentedProcess<ZombieSnapshot<C>>;
 /// Domain-coordinated live-thread removal and final-exit admission result.
 pub type ThreadExitTransition<C> = thekernel_linux_process::ThreadExitTransition<ZombieSnapshot<C>>;
 /// Unpublished thread admission transaction.
@@ -493,6 +521,38 @@ mod tests {
         assert_eq!(domain.reap(&child), Ok(true));
         assert_eq!(domain.reap(&child), Ok(false));
         assert!(domain.registry().get(2).is_none());
+    }
+
+    #[test]
+    fn prepared_exit_forwards_authoritative_reparent_handoff() {
+        let (domain, init) = initialized_domain(8);
+        let parent = fork_with_initial_thread(&domain, &init, 2);
+        let child = fork_with_initial_thread(&domain, &parent, 3);
+        let exit = match domain.exit_thread(&parent, 2, 0x2a00).unwrap() {
+            ThreadExitTransition::FinalThread(exit) => exit,
+            _ => panic!("single-thread parent must prepare final exit"),
+        };
+
+        let mut mapping = Vec::new();
+        let outcome = PreparedZombieSnapshot::try_new()
+            .unwrap()
+            .bind_exit(exit)
+            .commit_with_reparent_handoff(
+                parent.exit_code(),
+                ProcessUsage::new(10, 20),
+                ProcessUsage::new(30, 40),
+                credential(1000),
+                drop,
+                |batch| {
+                    for moved in batch.reparented() {
+                        mapping.push((moved.child().pid(), batch.reaper().pid()));
+                    }
+                },
+            );
+
+        assert_eq!(outcome.outcome(), ExitOutcome::BecameZombie);
+        assert_eq!(mapping, [(child.pid(), init.pid())]);
+        assert!(Arc::ptr_eq(&child.parent().unwrap(), &init));
     }
 
     #[test]

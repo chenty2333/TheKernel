@@ -4,6 +4,7 @@ mod access;
 mod accounting;
 pub(crate) mod coredump;
 mod creds;
+mod exec_cred;
 mod futex;
 mod idmap;
 mod jobctl;
@@ -11,6 +12,7 @@ mod ops;
 mod process;
 mod resources;
 mod restart;
+pub(crate) mod security;
 mod signal;
 mod stat;
 mod thread;
@@ -26,20 +28,30 @@ pub(crate) use self::{
         check_current_ptrace_image_snapshot, check_current_signal_access,
         check_current_thread_ptrace_image_access, may_begin_gid_map_write, may_begin_uid_map_write,
         may_update_setgroups_policy, may_write_gid_map, may_write_uid_map, ns_capable,
+        signal_credential_allows,
     },
     creds::{CapabilityState, Cred, CredentialSlot, Credentials, DacCredentialView},
+    exec_cred::{
+        ExecAuxIdentity, ExecCredentialEffects, ExecCredentialRequest,
+        ExecCredentialSecurityContext, FileCapabilities, PreparedExecCredential,
+        SECURITY_CAPABILITY_XATTR_NAME, parse_file_capabilities,
+    },
     idmap::{ID_MAP_MAX_EXTENTS, IdMapInputExtent, Kgid, Kuid, validate_id_map_input},
-    jobctl::{ContinueResult, StopReport},
+    jobctl::{ContinueResult, PtraceSession, StopReport},
     process::{
         CgroupNamespace, CommittedProcessExit, Dumpability, ExecImageRetirement,
         InitialProcessThreadAdmission, MempolicySnapshot, NetworkNamespace,
         PendingThreadPublication, PidNamespace, Process, ProcessAccessState, ProcessGroup,
-        ProcessImageAccessSnapshot, ProcessThreadAdmission, Session, ThreadExitTransition,
-        TimeNamespace, UTS_FIELD_LEN, UserNamespace, UtsNamespace, ZombieSnapshot,
-        init_process_domain, process_domain, process_error,
+        ProcessImageAccessSnapshot, ProcessReparentBatch, ProcessThreadAdmission,
+        PtraceReverseLink, Session, ThreadExitTransition, TimeNamespace, UTS_FIELD_LEN,
+        UserNamespace, UtsNamespace, ZombieSnapshot, init_process_domain, process_domain,
+        process_error,
     },
     restart::*,
-    thread::ProcStateHint,
+    thread::{
+        ProcStateHint, TaskParentChoice, TaskParentCredentialPin, TaskParentNode,
+        TaskParentPublicationGuard, lock_task_parent_publication,
+    },
 };
 pub use self::{
     accounting::*,

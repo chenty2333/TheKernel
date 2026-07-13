@@ -125,6 +125,127 @@ ci_run_step kernel-thread-credential-tests "$STEP_TIMEOUT_SECS" \
     --tests --features bpf --target x86_64-unknown-linux-gnu \
     task::thread_cred::tests -- --test-threads=1
 
+ci_run_step kernel-exec-credential-algebra-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    task::exec_cred::tests -- --test-threads=1
+
+ci_run_step kernel-security-hook-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    task::security::tests -- --test-threads=1
+
+ci_run_step kernel-credential-caller-test-discovery "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    bash -c '
+        set -euo pipefail
+        output=$(cargo test --locked --manifest-path kernel/Cargo.toml \
+            --tests --features bpf --target x86_64-unknown-linux-gnu \
+            credential_caller_ -- --list)
+        printf "%s\n" "$output"
+        count=$(printf "%s\n" "$output" | awk "/: test$/ { count++ } END { print count + 0 }")
+        if [ "$count" -lt 22 ]; then
+            printf "credential-caller discovery: expected at least 22 tests, found %s\n" "$count" >&2
+            exit 1
+        fi
+    '
+
+ci_run_step kernel-credential-caller-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    credential_caller_ -- --test-threads=1
+
+ci_run_step kernel-executable-lease-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    file::executable::tests -- --test-threads=1
+
+ci_run_step kernel-exec-loader-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    mm::loader::tests -- --test-threads=1
+
+ci_run_step kernel-exec-transition-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    syscall::task::execve::tests -- --test-threads=1
+
+ci_run_step kernel-file-capability-xattr-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    syscall::fs::xattr::tests -- --test-threads=1
+
+ci_run_step kernel-credential-metadata-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    syscall::fs::ctl::tests -- --test-threads=1
+
+ci_run_step kernel-file-write-killpriv-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    file::fs::tests -- --test-threads=1
+
+ci_run_step kernel-memfd-seal-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    file::memfd::tests -- --test-threads=1
+
+ci_run_step kernel-tmpfs-killpriv-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    pseudofs::tmp::tests -- --test-threads=1
+
+ci_run_step kernel-file-mapping-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    mm::aspace::backend::file::tests -- --test-threads=1
+
+ci_run_step kernel-task-parent-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    task::thread::task_parent_tests -- --test-threads=1
+
+ci_run_step kernel-ptrace-action-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    syscall::task::ptrace::tests -- --test-threads=1
+
+ci_run_step kernel-ptrace-wait-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    syscall::task::wait::tests -- --test-threads=1
+
 ci_run_step kernel-setfsid-abi-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
@@ -150,8 +271,8 @@ ci_run_step kernel-process-access-test-discovery "$STEP_TIMEOUT_SECS" \
             process_access_ -- --list)
         printf "%s\n" "$output"
         count=$(printf "%s\n" "$output" | awk "/: test$/ { count++ } END { print count + 0 }")
-        if [ "$count" -lt 11 ]; then
-            printf "process-access discovery: expected at least 11 tests, found %s\n" "$count" >&2
+        if [ "$count" -lt 25 ]; then
+            printf "process-access discovery: expected at least 25 tests, found %s\n" "$count" >&2
             exit 1
         fi
     '
@@ -192,6 +313,8 @@ ci_run_step readiness-adapter-tests "$STEP_TIMEOUT_SECS" \
     cargo test --locked -p thekernel-readiness-adapter
 ci_run_step process-adapter-tests "$STEP_TIMEOUT_SECS" \
     cargo test --locked -p thekernel-linux-process-adapter
+ci_run_step memory-set-tests "$STEP_TIMEOUT_SECS" \
+    "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/memory_set/Cargo.toml
 ci_run_step scope-local-tests "$STEP_TIMEOUT_SECS" \
     "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/scope-local/Cargo.toml
 ci_run_step axfs-vfs-tests "$STEP_TIMEOUT_SECS" \

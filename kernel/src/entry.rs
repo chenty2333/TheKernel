@@ -28,6 +28,10 @@ use crate::{
 pub fn init(args: &[String], envs: &[String]) {
     const INIT_PID: Pid = 1;
 
+    if let Err(error) = executable::init() {
+        error!("failed to initialize bounded executable registry: {error}");
+        system_off();
+    }
     mark_page_fault_thread_context_ready();
     init_fd_scope_default().expect("Failed to initialize real fd scope default");
 

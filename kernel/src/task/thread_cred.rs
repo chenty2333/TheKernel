@@ -285,15 +285,6 @@ impl Thread {
         Ok(())
     }
 
-    pub(crate) fn prepare_clear_keep_caps_on_exec(&self) -> AxResult<Option<PreparedCred<'_>>> {
-        let mut update = self.credential.prepare();
-        if update.builder.caps.securebits & SECBIT_KEEP_CAPS == 0 {
-            return Ok(None);
-        }
-        update.builder.caps.securebits &= !SECBIT_KEEP_CAPS;
-        Ok(Some(update.finish_exec_keep_caps_clear()?))
-    }
-
     fn fixup_capabilities_for_uid_change(
         root_kuid: Option<Kuid>,
         old: Credentials,

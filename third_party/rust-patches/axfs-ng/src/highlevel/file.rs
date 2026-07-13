@@ -26,9 +26,12 @@ use axfs_ng_vfs::{
 use axhal::mem::{PhysAddr, VirtAddr, total_ram_size, virt_to_phys};
 use axio::{SeekFrom, prelude::*};
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
+#[cfg(target_os = "none")]
 use axsync::Mutex;
 use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter};
 use lru::LruCache;
+#[cfg(not(target_os = "none"))]
+use spin::Mutex;
 use spin::{Once, RwLock};
 
 use super::{FsContext, PathwalkPolicy};

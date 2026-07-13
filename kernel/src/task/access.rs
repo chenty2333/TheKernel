@@ -11,6 +11,10 @@ use super::{
     AsThread, Cred, Credentials, Dumpability, ProcessData, ProcessImageAccessSnapshot, Thread,
     UserNamespace,
     idmap::{IdMapInputExtent, Kgid, Kuid, UserGid, UserUid},
+    security::{
+        ProcessImageSecurityRef, PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind,
+        SecuritySubject, dispatch_ptrace_access,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,6 +27,21 @@ pub(crate) enum PtraceAccessMode {
 impl PtraceAccessMode {
     fn uses_fs_credentials(self) -> bool {
         matches!(self, Self::ReadFs)
+    }
+
+    fn access_kind(self) -> PtraceAccessKind {
+        match self {
+            Self::ReadReal | Self::ReadFs => PtraceAccessKind::Read,
+            Self::AttachReal => PtraceAccessKind::Attach,
+        }
+    }
+
+    fn credential_kind(self) -> PtraceCredentialKind {
+        if self.uses_fs_credentials() {
+            PtraceCredentialKind::Fs
+        } else {
+            PtraceCredentialKind::Real
+        }
     }
 }
 
@@ -188,7 +207,10 @@ fn caller_id_matches_all_target_ids(
         && caller_gid == target.sgid
 }
 
-fn ptrace_credential_allows(
+/// Linux ptrace core identity and dumpability gates. The independent
+/// commoncap permitted-set rule runs through the typed hook stack only after
+/// these checks admit the exact frozen image.
+fn ptrace_core_allows(
     actor_cred: &Cred,
     target_cred: &Cred,
     target_dumpability: Dumpability,
@@ -214,46 +236,44 @@ fn ptrace_credential_allows(
         return false;
     }
 
-    // Linux commoncap requires the target permitted set to be contained by the
-    // caller's selected capability set in the same user namespace, unless the
-    // caller has CAP_SYS_PTRACE over the target credential namespace.
-    let actor_caps = actor_cred.capabilities();
-    let target_caps = target_cred.capabilities();
-    let selected_actor_caps = if mode.uses_fs_credentials() {
-        actor_caps.effective
-    } else {
-        actor_caps.permitted
-    };
-    (Arc::ptr_eq(actor_cred.user_ns(), target_cred.user_ns())
-        && target_caps
-            .permitted
-            .iter()
-            .zip(selected_actor_caps.iter())
-            .all(|(target, actor)| target & !actor == 0))
-        || has_capability_over(actor_cred, target_cred, CAP_SYS_PTRACE)
+    true
 }
 
 fn check_ptrace_access(
     actor: &ProcessData,
     actor_cred: &Cred,
     target: &ProcessData,
-    target_cred: &Cred,
-    target_dumpability: Dumpability,
-    target_owner_user_ns: &Arc<UserNamespace>,
+    target_image: &ProcessImageAccessSnapshot,
     mode: PtraceAccessMode,
 ) -> AxResult<()> {
     if actor.proc.pid() == target.proc.pid() {
         return Ok(());
     }
 
-    if ptrace_credential_allows(
+    if ptrace_core_allows(
         actor_cred,
-        target_cred,
-        target_dumpability,
-        target_owner_user_ns,
+        target_image.credential(),
+        target_image.dumpability(),
+        target_image.owner_user_ns(),
         mode,
     ) {
-        Ok(())
+        let context = PtraceAccessContext::new(
+            SecuritySubject::new(actor_cred),
+            SecuritySubject::new(target_image.credential()),
+            ProcessImageSecurityRef::new(target_image.owner_user_ns(), target_image.aspace()),
+            mode.access_kind(),
+            mode.credential_kind(),
+        );
+        // Snapshot acquisition releases the image/access locks before this
+        // function is entered. Dispatch is allocation-free and runs before
+        // any ptrace publication spin lock is acquired.
+        dispatch_ptrace_access(&context).map_err(|error| {
+            if mode == PtraceAccessMode::ReadFs {
+                AxError::PermissionDenied
+            } else {
+                error
+            }
+        })
     } else {
         Err(if mode == PtraceAccessMode::ReadFs {
             AxError::PermissionDenied
@@ -271,15 +291,7 @@ pub(crate) fn check_current_ptrace_image_snapshot(
     let current = current();
     let actor = current.as_thread();
     let actor_cred = actor.current_cred();
-    check_ptrace_access(
-        &actor.proc_data,
-        &actor_cred,
-        target,
-        snapshot.credential(),
-        snapshot.dumpability(),
-        snapshot.owner_user_ns(),
-        mode,
-    )
+    check_ptrace_access(&actor.proc_data, &actor_cred, target, snapshot, mode)
 }
 
 pub(crate) fn check_current_thread_ptrace_image_access(
@@ -344,18 +356,24 @@ pub(crate) fn check_signal_access(
         return Ok(());
     }
 
-    let actor_creds = actor_cred.ids();
-    let target_creds = target_cred.ids();
-    let ids_match = [actor_creds.ruid, actor_creds.euid]
-        .into_iter()
-        .any(|uid| uid == target_creds.ruid || uid == target_creds.suid);
     let same_session = signal == Some(Signo::SIGCONT)
         && actor.proc.group().session().sid() == target.proc.group().session().sid();
-    if ids_match || same_session || has_capability_over(actor_cred, target_cred, CAP_KILL) {
+    if signal_credential_allows(actor_cred, target_cred) || same_session {
         Ok(())
     } else {
         Err(AxError::OperationNotPermitted)
     }
+}
+
+/// Frozen Linux signal-credential policy shared by live and zombie targets.
+/// Process identity and SIGCONT session exceptions remain with their callers.
+pub(crate) fn signal_credential_allows(actor: &Cred, target: &Cred) -> bool {
+    let actor_ids = actor.ids();
+    let target_ids = target.ids();
+    [actor_ids.ruid, actor_ids.euid]
+        .into_iter()
+        .any(|uid| uid == target_ids.ruid || uid == target_ids.suid)
+        || has_capability_over(actor, target, CAP_KILL)
 }
 
 pub(crate) fn check_current_signal_access(
@@ -430,14 +448,14 @@ mod tests {
         let actor = publish_ids(&actor_slot, 1000, 100);
         let target = publish_ids(&target_slot, 1000, 100);
 
-        assert!(ptrace_credential_allows(
+        assert!(ptrace_core_allows(
             &actor,
             &target,
             Dumpability::UserDumpable,
             &root_ns,
             PtraceAccessMode::AttachReal,
         ));
-        assert!(!ptrace_credential_allows(
+        assert!(!ptrace_core_allows(
             &actor,
             &target,
             Dumpability::NotDumpable,
@@ -446,7 +464,7 @@ mod tests {
         ));
 
         let privileged_actor = root_cred.clone();
-        assert!(ptrace_credential_allows(
+        assert!(ptrace_core_allows(
             &privileged_actor,
             &target,
             Dumpability::NotDumpable,
@@ -458,7 +476,7 @@ mod tests {
         let child_b = root_ns.try_fork(kuid(1001), kgid(1001), false).unwrap();
         let sibling_actor = Cred::try_with_user_ns(&root_cred, child_a).unwrap();
         let sibling_target = Cred::try_with_user_ns(&root_cred, child_b.clone()).unwrap();
-        assert!(!ptrace_credential_allows(
+        assert!(!ptrace_core_allows(
             &sibling_actor,
             &sibling_target,
             Dumpability::NotDumpable,
@@ -472,13 +490,25 @@ mod tests {
         target_gain.builder.caps.permitted[word] |= mask;
         target_gain.builder.caps.effective[word] |= mask;
         let target_with_cap = target_gain.finish().unwrap().commit();
-        assert!(!ptrace_credential_allows(
+        assert!(ptrace_core_allows(
             &actor,
             &target_with_cap,
             Dumpability::UserDumpable,
             &root_ns,
             PtraceAccessMode::AttachReal,
         ));
+        let image = Arc::new(());
+        let context = PtraceAccessContext::new(
+            SecuritySubject::new(&actor),
+            SecuritySubject::new(&target_with_cap),
+            ProcessImageSecurityRef::new(&root_ns, &image),
+            PtraceAccessKind::Attach,
+            PtraceCredentialKind::Real,
+        );
+        assert_eq!(
+            dispatch_ptrace_access(&context),
+            Err(AxError::OperationNotPermitted)
+        );
     }
 
     #[test]
@@ -562,6 +592,49 @@ mod tests {
         assert!(ns_capable(&owner, &child, CAP_KILL));
         assert!(ns_capable(&owner, &grandchild, CAP_KILL));
         assert!(!ns_capable(&owner, &sibling, CAP_KILL));
+    }
+
+    #[test]
+    fn credential_caller_signal_policy_covers_saved_uid_and_target_namespace() {
+        let root = UserNamespace::try_new_root().unwrap();
+        let root_cred = Cred::try_root(root.clone()).unwrap();
+
+        let actor_slot = CredentialSlot::new(root_cred.clone());
+        let actor = publish_ids(&actor_slot, 1000, 100);
+        let target_slot = CredentialSlot::new(root_cred.clone());
+        let mut target_update = target_slot.prepare();
+        target_update.builder.ids = Credentials {
+            ruid: kuid(2000),
+            euid: kuid(2000),
+            suid: kuid(1000),
+            fsuid: kuid(2000),
+            rgid: kgid(200),
+            egid: kgid(200),
+            sgid: kgid(200),
+            fsgid: kgid(200),
+        };
+        target_update.builder.caps.effective = [0; CAPABILITY_WORDS];
+        target_update.builder.caps.permitted = [0; CAPABILITY_WORDS];
+        target_update.builder.caps.inheritable = [0; CAPABILITY_WORDS];
+        target_update.builder.caps.ambient = [0; CAPABILITY_WORDS];
+        let saved_uid_target = target_update.finish().unwrap().commit();
+        assert!(signal_credential_allows(&actor, &saved_uid_target));
+
+        let root_target_slot = CredentialSlot::new(root_cred.clone());
+        let root_target = publish_ids(&root_target_slot, 3000, 300);
+        let child = root.try_fork(kuid(1000), kgid(100), false).unwrap();
+        let sibling = root.try_fork(kuid(2000), kgid(200), false).unwrap();
+        let child_actor = Cred::try_with_user_ns(&root_cred, child.clone()).unwrap();
+        let child_target_slot = CredentialSlot::new(child_actor.clone());
+        let child_target = publish_ids(&child_target_slot, 3000, 300);
+        let sibling_cred = Cred::try_with_user_ns(&root_cred, sibling).unwrap();
+        let sibling_target_slot = CredentialSlot::new(sibling_cred);
+        let sibling_target = publish_ids(&sibling_target_slot, 3000, 300);
+
+        assert!(!signal_credential_allows(&child_actor, &root_target));
+        assert!(signal_credential_allows(&root_cred, &child_target));
+        assert!(signal_credential_allows(&child_actor, &child_target));
+        assert!(!signal_credential_allows(&child_actor, &sibling_target));
     }
 
     #[test]
@@ -718,7 +791,7 @@ mod tests {
 
         start.wait();
         for _ in 0..2000 {
-            assert!(ptrace_credential_allows(
+            assert!(ptrace_core_allows(
                 &actor,
                 &frozen_target,
                 Dumpability::UserDumpable,
@@ -730,7 +803,7 @@ mod tests {
         writer.join().unwrap();
 
         let fresh_target = target_slot.current();
-        assert!(!ptrace_credential_allows(
+        assert!(!ptrace_core_allows(
             &actor,
             &fresh_target,
             Dumpability::UserDumpable,

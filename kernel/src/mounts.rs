@@ -344,6 +344,11 @@ pub fn flags_for_location(loc: &Location) -> AxResult<u32> {
     flags_for_mountpoint(loc.mountpoint()).ok_or(AxError::Io)
 }
 
+/// Returns whether privilege transitions are disabled for this exact mount.
+pub(crate) fn is_nosuid(loc: &Location) -> AxResult<bool> {
+    Ok(flags_for_location(loc)? & MS_NOSUID != 0)
+}
+
 pub fn metadata_for_location(loc: &Location) -> AxResult<MountMetadata> {
     let state = mount_state(loc.mountpoint())?;
     state.metadata.lock().try_clone()

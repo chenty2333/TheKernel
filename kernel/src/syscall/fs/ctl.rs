@@ -20,7 +20,7 @@ use starry_vm::{VmPtr, vm_write_slice};
 
 use crate::{
     file::{
-        Directory, File, FileLike, add_file_like, get_file_like,
+        Directory, File, FileLike, add_file_like, executable, get_file_like,
         inotify::location_for_fd,
         is_path_only_fd, namespace_mutation,
         permission::{
@@ -32,7 +32,7 @@ use crate::{
     mounts,
     pseudofs::{
         ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
-        namespace_target_from_proc_file, proc_namespace_location_from_object,
+        namespace_target_from_proc_file, proc_namespace_location_from_object, tmp,
     },
     task::{AsThread, DacCredentialView, Kgid, Kuid, PidNamespace, ns_capable},
     time::{TimeValueLike, wall_time},
@@ -202,62 +202,104 @@ fn current_has_capability(cap: u32) -> bool {
     current().as_thread().has_effective_capability(cap)
 }
 
-fn current_can_preserve_setgid(gid: u32) -> bool {
+fn credentials_can_preserve_setgid(credentials: &DacCredentialView, gid: u32) -> bool {
     let Some(gid) = Kgid::from_raw(gid) else {
         return false;
     };
-    let curr = current();
-    let cred = curr.as_thread().current_cred();
-    cred.ids().fsgid == gid
-        || cred.groups().contains(gid)
-        || cred.has_effective_capability(CAP_FSETID)
+    credentials.gid() == gid
+        || credentials.supplementary_groups().contains(&gid)
+        || credentials.has_capability(CAP_FSETID)
 }
 
-fn chown_mode_after_update(meta: &Metadata) -> NodePermission {
+fn chown_mode_after_update(meta: &Metadata, credentials: &DacCredentialView) -> NodePermission {
     let mut mode = meta.mode;
     if meta.node_type == NodeType::Directory {
         return mode;
     }
     mode.remove(NodePermission::SET_UID);
-    if mode.contains(NodePermission::GROUP_EXEC) || !current_can_preserve_setgid(meta.gid) {
+    if mode.contains(NodePermission::GROUP_EXEC)
+        || !credentials_can_preserve_setgid(credentials, meta.gid)
+    {
         mode.remove(NodePermission::SET_GID);
     }
     mode
 }
 
-fn check_chown_permission(meta: &Metadata, uid: u32, gid: u32) -> AxResult<()> {
-    let curr = current();
-    let cred = curr.as_thread().current_cred();
-    if cred.has_effective_capability(CAP_CHOWN) {
+fn check_chown_permission(
+    meta: &Metadata,
+    uid: u32,
+    gid: u32,
+    credentials: &DacCredentialView,
+) -> AxResult<()> {
+    if credentials.has_capability(CAP_CHOWN) {
         return Ok(());
     }
-    let ids = cred.ids();
     if uid != meta.uid {
         return Err(AxError::OperationNotPermitted);
     }
-    if Kuid::from_raw(meta.uid) != Some(ids.fsuid) {
+    if Kuid::from_raw(meta.uid) != Some(credentials.uid()) {
         return Err(AxError::OperationNotPermitted);
     }
     let target_gid = Kgid::from_raw(gid);
     if gid != meta.gid
-        && target_gid != Some(ids.fsgid)
-        && !target_gid.is_some_and(|gid| cred.groups().contains(gid))
+        && target_gid != Some(credentials.gid())
+        && !target_gid.is_some_and(|gid| credentials.supplementary_groups().contains(&gid))
     {
         return Err(AxError::OperationNotPermitted);
     }
     Ok(())
 }
 
-fn check_chmod_permission(meta: &Metadata) -> AxResult<()> {
-    let curr = current();
-    let cred = curr.as_thread().current_cred();
-    if Kuid::from_raw(meta.uid) == Some(cred.ids().fsuid)
-        || cred.has_effective_capability(CAP_FOWNER)
+fn check_chmod_permission(meta: &Metadata, credentials: &DacCredentialView) -> AxResult<()> {
+    if Kuid::from_raw(meta.uid) == Some(credentials.uid()) || credentials.has_capability(CAP_FOWNER)
     {
         Ok(())
     } else {
         Err(AxError::OperationNotPermitted)
     }
+}
+
+/// Derives one chown update exclusively from the metadata snapshot read while
+/// the inode privilege-metadata writer gate is held.
+fn prepare_chown_metadata_update(
+    meta: &Metadata,
+    requested_uid: i32,
+    requested_gid: i32,
+    credentials: &DacCredentialView,
+) -> AxResult<MetadataUpdate> {
+    let uid = if requested_uid == -1 {
+        meta.uid
+    } else {
+        requested_uid as u32
+    };
+    let gid = if requested_gid == -1 {
+        meta.gid
+    } else {
+        requested_gid as u32
+    };
+    check_chown_permission(meta, uid, gid, credentials)?;
+    Ok(MetadataUpdate {
+        owner: Some((uid, gid)),
+        mode: Some(chown_mode_after_update(meta, credentials)),
+        ..Default::default()
+    })
+}
+
+/// Chmod counterpart to [`prepare_chown_metadata_update`].
+fn prepare_chmod_metadata_update(
+    meta: &Metadata,
+    requested_mode: u32,
+    credentials: &DacCredentialView,
+) -> AxResult<MetadataUpdate> {
+    check_chmod_permission(meta, credentials)?;
+    let mut mode = NodePermission::from_bits_truncate(requested_mode as u16);
+    if !credentials_can_preserve_setgid(credentials, meta.gid) {
+        mode.remove(NodePermission::SET_GID);
+    }
+    Ok(MetadataUpdate {
+        mode: Some(mode),
+        ..Default::default()
+    })
 }
 
 fn path_from_root(loc: Location, root: &Location) -> AxResult<String> {
@@ -881,17 +923,16 @@ pub fn sys_fchownat(
     let loc = resolve_at_with_credentials(dirfd, path.as_deref(), flags, &credentials)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
-    let meta = loc.metadata()?;
-
-    let uid = if uid == -1 { meta.uid } else { uid as _ };
-    let gid = if gid == -1 { meta.gid } else { gid as _ };
-    check_writable_mount(&loc)?;
-    check_chown_permission(&meta, uid, gid)?;
-    let mode = chown_mode_after_update(&meta);
-    loc.update_metadata(MetadataUpdate {
-        owner: Some((uid, gid)),
-        mode: Some(mode),
-        ..Default::default()
+    executable::with_credential_metadata_unpinned(&loc, || {
+        check_writable_mount(&loc)?;
+        // Linux v6.6 chown_common() adds ATTR_KILL_PRIV for every
+        // non-directory chown, including (-1, -1) or same-value requests;
+        // setattr_prepare() then requires killpriv before publication.
+        tmp::with_file_capability_killpriv(&loc, || {
+            let meta = loc.metadata()?;
+            let update = prepare_chown_metadata_update(&meta, uid, gid, &credentials)?;
+            loc.update_metadata(update)
+        })
     })?;
     warn_notification(
         "chown parent",
@@ -931,16 +972,11 @@ pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> A
     let loc = resolve_at_with_credentials(dirfd, path.as_deref(), flags, &credentials)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
-    let meta = loc.metadata()?;
-    check_writable_mount(&loc)?;
-    let mut mode = NodePermission::from_bits_truncate(mode as u16);
-    check_chmod_permission(&meta)?;
-    if !current_can_preserve_setgid(meta.gid) {
-        mode.remove(NodePermission::SET_GID);
-    }
-    loc.update_metadata(MetadataUpdate {
-        mode: Some(mode),
-        ..Default::default()
+    executable::with_credential_metadata_unpinned(&loc, || {
+        check_writable_mount(&loc)?;
+        let meta = loc.metadata()?;
+        let update = prepare_chmod_metadata_update(&meta, mode, &credentials)?;
+        loc.update_metadata(update)
     })?;
     warn_notification(
         "chmod parent",
@@ -1274,4 +1310,116 @@ pub fn sys_vhangup() -> AxResult<isize> {
         return Err(AxError::OperationNotPermitted);
     }
     Err(LinuxError::EOPNOTSUPP.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+    use core::time::Duration;
+
+    use axfs_ng_vfs::Mountpoint;
+
+    use super::*;
+
+    fn credentials(uid: u32, gid: u32, groups: &[u32], capabilities: &[u32]) -> DacCredentialView {
+        let mut effective = [0; 2];
+        for &capability in capabilities {
+            let word = capability as usize / u32::BITS as usize;
+            effective[word] |= 1 << (capability % u32::BITS);
+        }
+        DacCredentialView::try_for_test(uid, gid, groups, effective).unwrap()
+    }
+
+    fn metadata(uid: u32, gid: u32, mode: u16) -> Metadata {
+        Metadata {
+            device: 0,
+            inode: 1,
+            nlink: 1,
+            mode: NodePermission::from_bits_truncate(mode),
+            node_type: NodeType::RegularFile,
+            uid,
+            gid,
+            size: 0,
+            block_size: 4096,
+            blocks: 0,
+            rdev: DeviceId::default(),
+            atime: Duration::ZERO,
+            btime: Duration::ZERO,
+            mtime: Duration::ZERO,
+            ctime: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn chown_authorization_uses_the_snapshot_read_inside_the_writer_gate() {
+        let actor = credentials(1000, 100, &[], &[]);
+        let stale_owner = metadata(1000, 100, 0o6755);
+        assert!(prepare_chown_metadata_update(&stale_owner, -1, -1, &actor).is_ok());
+
+        // A concurrent chown may replace the pre-gate snapshot. The helper
+        // must be fed the fresh in-gate snapshot and reject the old owner.
+        let fresh_owner = metadata(2000, 100, 0o6755);
+        assert_eq!(
+            prepare_chown_metadata_update(&fresh_owner, -1, -1, &actor).unwrap_err(),
+            AxError::OperationNotPermitted
+        );
+    }
+
+    #[test]
+    fn chmod_authorization_uses_the_snapshot_read_inside_the_writer_gate() {
+        let actor = credentials(1000, 100, &[], &[]);
+        assert!(prepare_chmod_metadata_update(&metadata(1000, 100, 0o755), 0o700, &actor).is_ok());
+        assert_eq!(
+            prepare_chmod_metadata_update(&metadata(2000, 100, 0o755), 0o700, &actor).unwrap_err(),
+            AxError::OperationNotPermitted
+        );
+    }
+
+    #[test]
+    fn metadata_derivation_uses_fresh_gid_for_omitted_ids_and_setgid() {
+        let actor = credentials(1000, 100, &[], &[]);
+        let fresh = metadata(1000, 200, 0o6755);
+
+        let chown = prepare_chown_metadata_update(&fresh, -1, -1, &actor).unwrap();
+        assert_eq!(chown.owner, Some((1000, 200)));
+        assert_eq!(
+            chown.mode.unwrap().bits(),
+            NodePermission::from_bits_truncate(0o0755).bits()
+        );
+
+        let chmod = prepare_chmod_metadata_update(&fresh, 0o2755, &actor).unwrap();
+        assert!(!chmod.mode.unwrap().contains(NodePermission::SET_GID));
+
+        let group_member = credentials(1000, 100, &[200], &[]);
+        let chmod = prepare_chmod_metadata_update(&fresh, 0o2755, &group_member).unwrap();
+        assert!(chmod.mode.unwrap().contains(NodePermission::SET_GID));
+    }
+
+    #[test]
+    fn successful_same_or_omitted_chown_still_kills_file_capability() {
+        let fs = crate::pseudofs::tmp::MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let file = mount
+            .root_location()
+            .create(
+                "chown-killpriv",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o755),
+            )
+            .unwrap();
+        let store = crate::pseudofs::tmp::xattr_store(&file).unwrap();
+        let capability = crate::task::SECURITY_CAPABILITY_XATTR_NAME;
+        let actor = credentials(0, 0, &[], &[CAP_CHOWN]);
+
+        for (uid, gid) in [(-1, -1), (0, 0)] {
+            store.lock().insert(capability.into(), vec![1, 2, 3]);
+            crate::pseudofs::tmp::with_file_capability_killpriv(&file, || {
+                let metadata = file.metadata()?;
+                let update = prepare_chown_metadata_update(&metadata, uid, gid, &actor)?;
+                file.update_metadata(update)
+            })
+            .unwrap();
+            assert!(!store.lock().contains_key(capability));
+        }
+    }
 }

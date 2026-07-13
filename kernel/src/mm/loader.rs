@@ -11,7 +11,6 @@ use axhal::{
     paging::{MappingFlags, PageSize},
 };
 use axsync::Mutex;
-use axtask::current_may_uninit;
 use kernel_elf_parser::{
     AuxEntry, AuxType, ELFHeaders, ELFHeadersBuilder, ELFParser, app_stack_region,
 };
@@ -22,9 +21,12 @@ use uluru::LRUCache;
 
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
-    file::permission::{DacFsContextExt, check_execute_permissions, check_open_permissions},
+    file::{
+        executable::CredentialReadLease,
+        permission::{DacFsContextExt, check_execute_permissions, check_open_permissions},
+    },
     mm::aspace::{AddrSpace, Backend},
-    task::{AsThread, DacCredentialView},
+    task::{DacCredentialView, ExecAuxIdentity},
 };
 
 const BINPRM_BUF_SIZE: usize = 256;
@@ -38,7 +40,6 @@ enum ExecAccess<'a> {
     User {
         credentials: &'a DacCredentialView,
         all_readable: &'a Cell<bool>,
-        has_setid_bits: &'a Cell<bool>,
     },
 }
 
@@ -57,12 +58,8 @@ impl ExecAccess<'_> {
             Self::User {
                 credentials,
                 all_readable,
-                has_setid_bits,
             } => {
                 check_execute_permissions(loc, credentials)?;
-                if loc.metadata()?.mode.bits() & 0o6000 != 0 {
-                    has_setid_bits.set(true);
-                }
                 match check_open_permissions(loc, R_OK, credentials) {
                     Ok(()) => Ok(()),
                     Err(AxError::PermissionDenied) => {
@@ -81,27 +78,38 @@ impl ExecAccess<'_> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ExecImageAccess {
     all_readable: bool,
-    has_setid_bits: bool,
 }
 
 impl ExecImageAccess {
-    pub(crate) fn allows_user_dumpable(self) -> bool {
-        self.all_readable && !self.has_setid_bits
+    pub(crate) fn executable_unreadable(self) -> bool {
+        !self.all_readable
     }
 
     #[cfg(test)]
-    pub(crate) const fn for_test(all_readable: bool, has_setid_bits: bool) -> Self {
-        Self {
-            all_readable,
-            has_setid_bits,
-        }
+    pub(crate) const fn for_test(all_readable: bool) -> Self {
+        Self { all_readable }
+    }
+}
+
+pub(crate) struct PreparedUserApp {
+    entry_point: VirtAddr,
+    auxv: Vec<AuxEntry>,
+    arguments: Vec<String>,
+    pub(crate) credential_source: Location,
+    credential_lease: Option<CredentialReadLease>,
+    pub(crate) image_access: ExecImageAccess,
+}
+
+impl PreparedUserApp {
+    pub(crate) fn take_credential_lease(&mut self) -> AxResult<CredentialReadLease> {
+        self.credential_lease.take().ok_or(AxError::BadState)
     }
 }
 
 pub(crate) struct LoadedUserApp {
     pub(crate) entry_point: VirtAddr,
     pub(crate) stack_pointer: VirtAddr,
-    pub(crate) image_access: ExecImageAccess,
+    pub(crate) arguments: Vec<String>,
 }
 
 /// Creates a new empty user address space.
@@ -292,7 +300,14 @@ impl ElfCacheEntry {
 
 struct ElfLoader(LRUCache<ElfCacheEntry, 32>);
 
-type LoadResult = Result<(VirtAddr, Vec<AuxEntry>), Vec<u8>>;
+struct LoadedElfImage {
+    entry_point: VirtAddr,
+    auxv: Vec<AuxEntry>,
+    credential_source: Location,
+    credential_lease: CredentialReadLease,
+}
+
+type LoadResult = Result<LoadedElfImage, Vec<u8>>;
 
 impl ElfLoader {
     const fn new() -> Self {
@@ -315,6 +330,10 @@ impl ElfLoader {
         loc: Location,
         access: ExecAccess<'_>,
     ) -> AxResult<LoadResult> {
+        // Pin content and privilege metadata before the first admission,
+        // header, cache, or metadata read from this candidate. Script leases
+        // drop on the non-ELF return; the final ELF lease is returned to exec.
+        let credential_lease = CredentialReadLease::acquire(&loc)?;
         access.check_location(&loc)?;
 
         if !self.0.touch(|e| e.borrow_cache().location().ptr_eq(&loc)) {
@@ -367,8 +386,9 @@ impl ElfLoader {
             None
         };
 
-        let (elf, ldso) = if let Some(ldso) = ldso {
+        let (elf, ldso, ldso_lease) = if let Some(ldso) = ldso {
             let loc = access.resolve(&ldso)?;
+            let lease = CredentialReadLease::acquire(&loc)?;
             access.check_location(&loc)?;
             if loc.ptr_eq(&executable_loc) {
                 return Err(AxError::InvalidExecutable);
@@ -382,35 +402,23 @@ impl ElfLoader {
             let mut iter = self.0.iter();
             let ldso = iter.next().ok_or(AxError::BadState)?;
             let elf = iter.next().ok_or(AxError::InvalidExecutable)?;
-            (elf, Some(ldso))
+            (elf, Some(ldso), Some(lease))
         } else {
-            (entry, None)
+            (entry, None, None)
         };
 
         let elf = map_elf(uspace, crate::config::USER_SPACE_BASE, elf)?;
         let ldso = ldso
             .map(|elf| map_elf(uspace, crate::config::USER_INTERP_BASE, elf))
             .transpose()?;
+        // The PT_INTERP lease is needed through its last content/backing map
+        // use, but it never becomes the credential source.
+        drop(ldso_lease);
 
         let entry = VirtAddr::from_usize(
             ldso.as_ref()
                 .map_or_else(|| elf.entry(), |ldso| ldso.entry()),
         );
-        let (uid, euid, gid, egid) = current_may_uninit()
-            .and_then(|task| {
-                let thread = task.try_as_thread()?;
-                let cred = thread.current_cred();
-                let ids = cred.ids();
-                let user_ns = cred.user_ns();
-                Some((
-                    user_ns.from_kuid_munged(ids.ruid) as usize,
-                    user_ns.from_kuid_munged(ids.euid) as usize,
-                    user_ns.from_kgid_munged(ids.rgid) as usize,
-                    user_ns.from_kgid_munged(ids.egid) as usize,
-                ))
-            })
-            .unwrap_or((0, 0, 0, 0));
-        let secure = usize::from(uid != euid || gid != egid);
         let mut auxv = elf
             .aux_vector(PAGE_SIZE_4K, ldso.map(|elf| elf.base()))
             .collect::<Vec<_>>();
@@ -419,14 +427,14 @@ impl ElfLoader {
             AuxEntry::new(AuxType::HWCAP, 0),
             AuxEntry::new(AuxType::CLKTCK, 100),
             AuxEntry::new(AuxType::PLATFORM, 0),
-            AuxEntry::new(AuxType::UID, uid),
-            AuxEntry::new(AuxType::EUID, euid),
-            AuxEntry::new(AuxType::GID, gid),
-            AuxEntry::new(AuxType::EGID, egid),
-            AuxEntry::new(AuxType::SECURE, secure),
         ]);
 
-        Ok(Ok((entry, auxv)))
+        Ok(Ok(LoadedElfImage {
+            entry_point: entry,
+            auxv,
+            credential_source: executable_loc,
+            credential_lease,
+        }))
     }
 }
 
@@ -490,15 +498,43 @@ fn parse_shebang(data: &[u8]) -> AxResult<Option<Shebang<'_>>> {
     }))
 }
 
-fn script_interpreter_args(shebang: &Shebang<'_>, path: &str, args: &[String]) -> Vec<String> {
-    let mut new_args = Vec::with_capacity(args.len().saturating_add(2));
-    new_args.push(shebang.interpreter.to_owned());
-    if let Some(optional_arg) = shebang.optional_arg {
-        new_args.push(optional_arg.to_owned());
+fn try_copy_string(value: &str) -> AxResult<String> {
+    let mut copy = String::new();
+    copy.try_reserve_exact(value.len())
+        .map_err(|_| AxError::NoMemory)?;
+    copy.push_str(value);
+    Ok(copy)
+}
+
+fn try_copy_args(args: &[String], extra: usize) -> AxResult<Vec<String>> {
+    let capacity = args.len().checked_add(extra).ok_or(AxError::NoMemory)?;
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(capacity)
+        .map_err(|_| AxError::NoMemory)?;
+    for argument in args {
+        copy.push(try_copy_string(argument)?);
     }
-    new_args.push(path.to_owned());
-    new_args.extend(args.iter().skip(1).cloned());
+    Ok(copy)
+}
+
+fn script_interpreter_args(
+    shebang: &Shebang<'_>,
+    path: &str,
+    args: &[String],
+) -> AxResult<Vec<String>> {
+    let mut new_args = Vec::new();
     new_args
+        .try_reserve_exact(args.len().checked_add(2).ok_or(AxError::NoMemory)?)
+        .map_err(|_| AxError::NoMemory)?;
+    new_args.push(try_copy_string(shebang.interpreter)?);
+    if let Some(optional_arg) = shebang.optional_arg {
+        new_args.push(try_copy_string(optional_arg)?);
+    }
+    new_args.push(try_copy_string(path)?);
+    for argument in args.iter().skip(1) {
+        new_args.push(try_copy_string(argument)?);
+    }
+    Ok(new_args)
 }
 
 /// Clear the ELF cache.
@@ -559,18 +595,16 @@ fn install_loaded_user_app(
     Ok((entry, user_sp))
 }
 
-fn finish_load_user_app(
+fn prepare_loaded_user_app(
     uspace: &mut AddrSpace,
     path: &str,
-    execfn: &str,
     args: &[String],
-    envs: &[String],
     load_result: AxResult<LoadResult>,
     access: ExecAccess<'_>,
     script_depth: usize,
-) -> AxResult<(VirtAddr, VirtAddr)> {
-    let (entry, auxv) = match load_result {
-        Ok(Ok((entry, auxv))) => (entry, auxv),
+) -> AxResult<PreparedUserApp> {
+    let loaded = match load_result {
+        Ok(Ok(loaded)) => loaded,
         Ok(Err(data)) => {
             let Some(shebang) = parse_shebang(&data)? else {
                 return Err(AxError::InvalidExecutable);
@@ -579,13 +613,11 @@ fn finish_load_user_app(
                 return Err(axerrno::LinuxError::ELOOP.into());
             }
 
-            let new_args = script_interpreter_args(&shebang, path, args);
-            return load_user_app_path(
+            let new_args = script_interpreter_args(&shebang, path, args)?;
+            return prepare_user_app_path(
                 uspace,
                 shebang.interpreter,
-                execfn,
                 &new_args,
-                envs,
                 access,
                 script_depth + 1,
             );
@@ -593,35 +625,36 @@ fn finish_load_user_app(
         Err(err) => return Err(err),
     };
 
-    install_loaded_user_app(uspace, execfn, args, envs, entry, &auxv)
+    Ok(PreparedUserApp {
+        entry_point: loaded.entry_point,
+        auxv: loaded.auxv,
+        arguments: try_copy_args(args, 0)?,
+        credential_source: loaded.credential_source,
+        credential_lease: Some(loaded.credential_lease),
+        image_access: ExecImageAccess {
+            all_readable: match access {
+                ExecAccess::TrustedBoot => true,
+                ExecAccess::User { all_readable, .. } => all_readable.get(),
+            },
+        },
+    })
 }
 
-fn load_user_app_path(
+fn prepare_user_app_path(
     uspace: &mut AddrSpace,
     path: &str,
-    execfn: &str,
     args: &[String],
-    envs: &[String],
     access: ExecAccess<'_>,
     script_depth: usize,
-) -> AxResult<(VirtAddr, VirtAddr)> {
+) -> AxResult<PreparedUserApp> {
     let load_result = ELF_LOADER.lock().load_path(uspace, path, access);
-    finish_load_user_app(
-        uspace,
-        path,
-        execfn,
-        args,
-        envs,
-        load_result,
-        access,
-        script_depth,
-    )
+    prepare_loaded_user_app(uspace, path, args, load_result, access, script_depth)
 }
 
 /// Load a trusted early-boot app without Linux DAC admission.
 ///
 /// This raw path API is only for boot before a Linux credential-bearing thread
-/// exists. User-originated exec must use [`load_user_app_at`].
+/// exists. User-originated exec must use [`prepare_user_app_at`].
 pub(crate) fn load_user_app_trusted(
     uspace: &mut AddrSpace,
     path: Option<&str>,
@@ -632,38 +665,74 @@ pub(crate) fn load_user_app_trusted(
         .or_else(|| args.first().map(String::as_str))
         .ok_or(AxError::InvalidInput)?;
 
-    load_user_app_path(uspace, path, path, args, envs, ExecAccess::TrustedBoot, 0)
+    ELF_LOADER.lock().0.clear();
+    let prepared = prepare_user_app_path(uspace, path, args, ExecAccess::TrustedBoot, 0)?;
+    let loaded = finish_prepared_user_app(
+        uspace,
+        path,
+        envs,
+        prepared,
+        ExecAuxIdentity::trusted_boot(),
+    )?;
+    Ok((loaded.entry_point, loaded.stack_pointer))
 }
 
 /// Load an already resolved executable location into the user address space.
 ///
 /// The same pre-exec credential view checks the final target, `PT_INTERP`, and
 /// every shebang interpreter lookup.
-pub(crate) fn load_user_app_at(
+pub(crate) fn prepare_user_app_at(
     uspace: &mut AddrSpace,
     loc: Location,
     path: &str,
     args: &[String],
-    envs: &[String],
+    _envs: &[String],
     credentials: &DacCredentialView,
-) -> AxResult<LoadedUserApp> {
+) -> AxResult<PreparedUserApp> {
+    // The cache has no VFS content-generation cookie. Never let headers from
+    // an earlier exec be paired with the current lease-protected backing.
+    ELF_LOADER.lock().0.clear();
     let all_readable = Cell::new(true);
-    let has_setid_bits = Cell::new(false);
     let access = ExecAccess::User {
         credentials,
         all_readable: &all_readable,
-        has_setid_bits: &has_setid_bits,
     };
     let load_result = ELF_LOADER.lock().load_location(uspace, loc, access);
-    let (entry_point, stack_pointer) =
-        finish_load_user_app(uspace, path, path, args, envs, load_result, access, 0)?;
+    prepare_loaded_user_app(uspace, path, args, load_result, access, 0)
+}
+
+/// Installs the new user stack only after exec credential derivation has
+/// supplied the exact proposed identity and secure-exec bit for auxv.
+pub(crate) fn finish_prepared_user_app(
+    uspace: &mut AddrSpace,
+    execfn: &str,
+    envs: &[String],
+    mut prepared: PreparedUserApp,
+    identity: ExecAuxIdentity,
+) -> AxResult<LoadedUserApp> {
+    prepared
+        .auxv
+        .try_reserve_exact(5)
+        .map_err(|_| AxError::NoMemory)?;
+    prepared.auxv.extend([
+        AuxEntry::new(AuxType::UID, identity.uid),
+        AuxEntry::new(AuxType::EUID, identity.euid),
+        AuxEntry::new(AuxType::GID, identity.gid),
+        AuxEntry::new(AuxType::EGID, identity.egid),
+        AuxEntry::new(AuxType::SECURE, usize::from(identity.secure)),
+    ]);
+    let (entry_point, stack_pointer) = install_loaded_user_app(
+        uspace,
+        execfn,
+        &prepared.arguments,
+        envs,
+        prepared.entry_point,
+        &prepared.auxv,
+    )?;
     Ok(LoadedUserApp {
         entry_point,
         stack_pointer,
-        image_access: ExecImageAccess {
-            all_readable: all_readable.get(),
-            has_setid_bits: has_setid_bits.get(),
-        },
+        arguments: prepared.arguments,
     })
 }
 
@@ -672,26 +741,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn process_access_exec_image_facts_require_readable_non_setid_chain() {
+    fn process_access_exec_image_facts_track_complete_chain_readability() {
+        assert!(!ExecImageAccess { all_readable: true }.executable_unreadable());
         assert!(
             ExecImageAccess {
-                all_readable: true,
-                has_setid_bits: false,
+                all_readable: false
             }
-            .allows_user_dumpable()
+            .executable_unreadable()
         );
-        for facts in [
-            ExecImageAccess {
-                all_readable: false,
-                has_setid_bits: false,
-            },
-            ExecImageAccess {
-                all_readable: true,
-                has_setid_bits: true,
-            },
-        ] {
-            assert!(!facts.allows_user_dumpable());
-        }
     }
 
     #[test]
@@ -708,7 +765,7 @@ mod tests {
         let shebang = parse_shebang(b"#!  /bin/sh\t-e  \n").unwrap().unwrap();
         let args = vec!["original-argv-zero".to_owned(), "tail".to_owned()];
         assert_eq!(
-            script_interpreter_args(&shebang, "/tmp/test.sh", &args),
+            script_interpreter_args(&shebang, "/tmp/test.sh", &args).unwrap(),
             ["/bin/sh", "-e", "/tmp/test.sh", "tail"]
         );
     }

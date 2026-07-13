@@ -36,15 +36,16 @@ const fn capability_valid_mask_word(word: usize) -> u32 {
     }
 }
 
-const CAPABILITY_VALID_MASK: [u32; CAPABILITY_WORDS] =
+pub(in crate::task) const CAPABILITY_VALID_MASK: [u32; CAPABILITY_WORDS] =
     [capability_valid_mask_word(0), capability_valid_mask_word(1)];
 
+pub(in crate::task) const SECBIT_NOROOT: u32 = 1 << 0;
 pub(in crate::task) const SECBIT_NO_SETUID_FIXUP: u32 = 1 << 2;
 pub(in crate::task) const SECBIT_KEEP_CAPS: u32 = 1 << 4;
 pub(in crate::task) const SECBIT_KEEP_CAPS_LOCKED: u32 = 1 << 5;
 pub(in crate::task) const SECBIT_NO_CAP_AMBIENT_RAISE: u32 = 1 << 6;
 pub(in crate::task) const SECURE_ALL_BITS: u32 =
-    (1 << 0) | SECBIT_NO_SETUID_FIXUP | SECBIT_KEEP_CAPS | SECBIT_NO_CAP_AMBIENT_RAISE;
+    SECBIT_NOROOT | SECBIT_NO_SETUID_FIXUP | SECBIT_KEEP_CAPS | SECBIT_NO_CAP_AMBIENT_RAISE;
 pub(in crate::task) const SECURE_ALL_LOCKS: u32 = SECURE_ALL_BITS << 1;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -347,20 +348,6 @@ impl Cred {
         &self.user_ns
     }
 
-    #[cfg(test)]
-    pub(crate) fn try_with_euid_for_test(current: &Arc<Self>, euid: Kuid) -> AxResult<Arc<Self>> {
-        let mut ids = current.ids;
-        ids.euid = euid;
-        Arc::try_new(Self {
-            ids,
-            groups: current.groups.clone(),
-            caps: current.caps,
-            no_new_privs: current.no_new_privs,
-            user_ns: current.user_ns.clone(),
-        })
-        .map_err(|_| AxError::NoMemory)
-    }
-
     /// Snapshot the filesystem identity and effective capabilities used by DAC.
     ///
     /// Keeping this on the immutable credential lets early boot and other
@@ -524,6 +511,26 @@ pub(crate) struct CredentialSlot {
     current: SpinNoIrq<Arc<Cred>>,
 }
 
+/// Pins one credential slot against publication while a security decision is
+/// carried into a later composite operation. The sleepable update guard is
+/// held for the lifetime of this value; the current-pointer spin lock is used
+/// only to clone the immutable credential object.
+pub(crate) struct CredentialSnapshotGuard<'a> {
+    slot: &'a CredentialSlot,
+    _update: CredentialUpdateGuard<'a, ()>,
+    credential: Arc<Cred>,
+}
+
+impl CredentialSnapshotGuard<'_> {
+    pub(crate) fn slot(&self) -> &CredentialSlot {
+        self.slot
+    }
+
+    pub(crate) fn credential(&self) -> &Arc<Cred> {
+        &self.credential
+    }
+}
+
 impl CredentialSlot {
     pub(crate) fn new(initial: Arc<Cred>) -> Self {
         Self {
@@ -540,6 +547,30 @@ impl CredentialSlot {
     /// publication spin lock. No allocation or destruction occurs here.
     pub(crate) fn current(&self) -> Arc<Cred> {
         self.current.lock().clone()
+    }
+
+    pub(crate) fn lock_snapshot(&self) -> CredentialSnapshotGuard<'_> {
+        let update = self.update.lock();
+        let credential = self.current();
+        CredentialSnapshotGuard {
+            slot: self,
+            _update: update,
+            credential,
+        }
+    }
+
+    /// Attempts to pin this slot without sleeping.
+    ///
+    /// Composite graph/lifecycle transactions use this form when waiting for
+    /// a concurrent credential writer would invert their outer lock order.
+    pub(crate) fn try_lock_snapshot(&self) -> Option<CredentialSnapshotGuard<'_>> {
+        let update = self.update.try_lock()?;
+        let credential = self.current();
+        Some(CredentialSnapshotGuard {
+            slot: self,
+            _update: update,
+            credential,
+        })
     }
 
     /// Serializes a complete prepare/authorize/commit transaction.
@@ -622,6 +653,10 @@ impl CredentialPublication<'_> {
 }
 
 impl<'a> PreparedCred<'a> {
+    pub(in crate::task) fn old(&self) -> &Cred {
+        &self.old
+    }
+
     /// Linux lowers process dumpability and clears the parent-death signal
     /// when an effective/filesystem ID changes or the proposed permitted
     /// authority is not contained by the old credential. The process layer
@@ -637,8 +672,7 @@ impl<'a> PreparedCred<'a> {
             || !credential_cap_is_subset(&self.old, &self.proposed)
     }
 
-    #[cfg(test)]
-    pub(crate) fn proposed(&self) -> &Cred {
+    pub(in crate::task) fn proposed(&self) -> &Cred {
         &self.proposed
     }
 
@@ -811,6 +845,21 @@ mod tests {
         let observed = slot.current();
         assert!(Arc::ptr_eq(&original, &observed));
         assert_eq!(observed.ids().ruid, Kuid::INITIAL_ROOT);
+    }
+
+    #[test]
+    fn process_access_credential_snapshot_guard_pins_authorized_object() {
+        let slot = slot();
+        let original = slot.current();
+        let guard = slot.lock_snapshot();
+        assert!(core::ptr::eq(guard.slot(), &*slot));
+        assert!(Arc::ptr_eq(guard.credential(), &original));
+        drop(guard);
+
+        let mut update = slot.prepare();
+        update.builder.ids.ruid = kuid(1000);
+        update.finish().unwrap().commit();
+        assert!(!Arc::ptr_eq(&slot.current(), &original));
     }
 
     #[test]

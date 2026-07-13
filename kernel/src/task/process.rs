@@ -1,4 +1,5 @@
 use alloc::{
+    boxed::Box,
     format,
     string::String,
     sync::{Arc, Weak},
@@ -39,14 +40,16 @@ type UserNamespaceStateMutex<T> = spin::Mutex<T>;
 use super::{
     accounting::{AtomicTaskUsage, live_process_usage},
     creds::{Cred, CredentialSlot, PreparedCred},
+    exec_cred::PreparedExecCredential,
     futex::FutexTable,
     idmap::{IdMap, IdMapInputExtent, Kgid, Kuid, UserGid, UserUid},
     jobctl::{
-        ContinueResult, ExecControlState, JobControlState, PtraceControlState, StopKind,
-        StopReport, StopState, VforkControlState,
+        ContinueResult, ExecControlState, JobControlState, PtraceControlState, PtraceSession,
+        StopKind, StopReport, StopState, VforkControlState,
     },
     resources::Rlimits,
     signal::PtraceSignalRecord,
+    thread::{TaskParentPublicationGuard, lock_task_parent_publication},
     timer::PosixTimer,
 };
 use crate::{
@@ -75,6 +78,8 @@ pub(crate) type PreparedZombieExit = starry_process::PreparedZombieExit<Arc<Cred
 pub(crate) type ProcessExitAdmission = starry_process::ProcessExitAdmission<Arc<Cred>>;
 /// Completed final-exit transaction with its linearized parent and reaper.
 pub(crate) type CommittedProcessExit = starry_process::CommittedProcessExit<Arc<Cred>>;
+/// Authoritative bounded process child-to-reaper handoff from the core.
+pub(crate) type ProcessReparentBatch = starry_process::ProcessReparentBatch<Arc<Cred>>;
 /// Domain-coordinated thread removal and optional final-exit reservation.
 pub(crate) type ThreadExitTransition = starry_process::ThreadExitTransition<Arc<Cred>>;
 /// Type-bound unpublished process plus initial-thread publication transaction.
@@ -108,6 +113,9 @@ pub(crate) const SIGNAL_QUEUE_GLOBAL_HARD_LIMIT: usize = 16_384;
 /// Hard ceiling for simultaneously retained user namespaces. Namespace fds
 /// can outlive their creator, so RLIMIT_NPROC alone is not a lifetime bound.
 pub(crate) const USER_NAMESPACE_HARD_LIMIT: usize = 4_096;
+/// Maximum number of live or publication-reserved reverse ptrace links owned
+/// by one tracer process.
+pub(crate) const PTRACE_REVERSE_LINK_HARD_LIMIT: usize = 4_096;
 static LIVE_USER_NAMESPACES: AtomicUsize = AtomicUsize::new(0);
 
 fn try_increment_bounded(counter: &AtomicUsize, limit: usize) -> bool {
@@ -1086,6 +1094,8 @@ pub(crate) struct ProcessImageAccessSnapshot {
     dumpability: Dumpability,
     owner_user_ns: Arc<UserNamespace>,
     aspace: Arc<Mutex<AddrSpace>>,
+    access_state: Arc<ProcessAccessState>,
+    exact_target: Option<(Pid, Arc<CredentialSlot>)>,
 }
 
 impl ProcessImageAccessSnapshot {
@@ -1101,8 +1111,20 @@ impl ProcessImageAccessSnapshot {
         &self.owner_user_ns
     }
 
+    /// Borrows the exact image identity presented to an authorization hook.
+    pub(crate) fn aspace(&self) -> &Arc<Mutex<AddrSpace>> {
+        &self.aspace
+    }
+
     pub(crate) fn into_aspace(self) -> Arc<Mutex<AddrSpace>> {
         self.aspace
+    }
+
+    fn exact_target_matches(&self, target: &super::Thread) -> bool {
+        let Some((tid, slot)) = &self.exact_target else {
+            return false;
+        };
+        *tid == target.kernel_tid() && Arc::ptr_eq(slot, &target.credential_slot())
     }
 }
 
@@ -1124,16 +1146,23 @@ fn snapshot_credential_image<A: Clone>(
 fn snapshot_group_credential_image<A: Clone>(
     image_binding: &RwLock<ProcessImageBinding<A>>,
     group_leader: &GroupLeaderCredentialBinding,
-) -> (Arc<Cred>, Dumpability, Arc<UserNamespace>, A) {
+) -> (
+    Arc<Cred>,
+    Dumpability,
+    Arc<UserNamespace>,
+    A,
+    Arc<ProcessAccessState>,
+) {
     let image = image_binding.read();
     let security = image.access_state.security.lock();
     let credential = group_leader.current_cred();
     let dumpability = security.dumpability;
     let owner_user_ns = image.access_state.owner_user_ns.clone();
     let aspace = image.aspace.clone();
+    let access_state = image.access_state.clone();
     drop(security);
     drop(image);
-    (credential, dumpability, owner_user_ns, aspace)
+    (credential, dumpability, owner_user_ns, aspace, access_state)
 }
 
 fn coredump_image_snapshot<A: Clone>(image_binding: &RwLock<ProcessImageBinding<A>>) -> Option<A> {
@@ -1146,23 +1175,63 @@ fn coredump_image_snapshot<A: Clone>(image_binding: &RwLock<ProcessImageBinding<
     snapshot
 }
 
+fn ptrace_image_snapshot_if_session<A: Clone>(
+    ptrace_ctl: &SpinNoIrq<PtraceControlState>,
+    image_binding: &RwLock<ProcessImageBinding<A>>,
+    session: PtraceSession,
+) -> Option<A> {
+    // Keep the global ptrace/image order aligned with relationship
+    // publication: image first, then ptrace control. Holding both gates across
+    // the clone gives remote-memory operations one linearization point and
+    // prevents a detach/reattach ABA without deadlocking a competing attach
+    // which has already pinned the image and is waiting for ptrace control.
+    let image = image_binding.read();
+    let ptrace_ctl = ptrace_ctl.lock();
+    if ptrace_ctl.active_session() != Some(session) {
+        return None;
+    }
+    let snapshot = image.aspace.clone();
+    drop(ptrace_ctl);
+    drop(image);
+    Some(snapshot)
+}
+
 fn ptrace_image_snapshot_if_owned<A: Clone>(
     ptrace_ctl: &SpinNoIrq<PtraceControlState>,
     image_binding: &RwLock<ProcessImageBinding<A>>,
     tracer: Pid,
-) -> Option<A> {
-    // Keep this order stable: ptrace ownership first, then the process image.
-    // Holding both gates across the clone gives ptrace memory operations one
-    // linearization point and prevents a detach/reattach ABA between a
-    // successful ownership check and image acquisition.
+) -> Option<(PtraceSession, A)> {
+    let image = image_binding.read();
     let ptrace_ctl = ptrace_ctl.lock();
-    if ptrace_ctl.tracer != Some(tracer) {
+    let session = ptrace_ctl
+        .active_session()
+        .filter(|session| session.tracer == tracer)?;
+    let snapshot = image.aspace.clone();
+    drop(ptrace_ctl);
+    drop(image);
+    Some((session, snapshot))
+}
+
+fn ptrace_inactive_image_snapshot_if_session<A: Clone>(
+    ptrace_ctl: &SpinNoIrq<PtraceControlState>,
+    job_ctl: &SpinNoIrq<JobControlState>,
+    image_binding: &RwLock<ProcessImageBinding<A>>,
+    session: PtraceSession,
+) -> Option<A> {
+    // Preserve the image -> ptrace order used by every image/session
+    // snapshot, then include the job-control gate in the same
+    // linearization point. A successful clone therefore belongs to this
+    // exact stopped relationship, never merely to a reused tracer PID.
+    let image = image_binding.read();
+    let ptrace_ctl = ptrace_ctl.lock();
+    let job_ctl = job_ctl.lock();
+    if ptrace_ctl.active_session() != Some(session) || !job_ctl.is_ptrace_inactive_for(session) {
         return None;
     }
-    let image = image_binding.read();
     let snapshot = image.aspace.clone();
-    drop(image);
+    drop(job_ctl);
     drop(ptrace_ctl);
+    drop(image);
     Some(snapshot)
 }
 
@@ -1180,6 +1249,154 @@ fn replace_process_image_with_group_handoff<'a, A>(
     finish_image_publication();
     drop(image);
     (group_leader, retired_image)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PtraceReverseLink {
+    tracee: Pid,
+    session: PtraceSession,
+}
+
+impl PtraceReverseLink {
+    pub(crate) fn new(tracee: Pid, session: PtraceSession) -> Self {
+        Self { tracee, session }
+    }
+
+    pub(crate) fn tracee(self) -> Pid {
+        self.tracee
+    }
+
+    pub(crate) fn session(self) -> PtraceSession {
+        self.session
+    }
+}
+
+struct PtraceReverseLinkNode {
+    tracee: Pid,
+    session: PtraceSession,
+    next: Option<Box<Self>>,
+}
+
+#[derive(Default)]
+struct PtraceReverseLinks {
+    head: Option<Box<PtraceReverseLinkNode>>,
+    len: usize,
+    reservations: usize,
+    closed: bool,
+}
+
+impl PtraceReverseLinks {
+    fn try_reserve(&mut self) -> AxResult<()> {
+        if self.closed {
+            return Err(AxError::NoSuchProcess);
+        }
+        let Some(total) = self.len.checked_add(self.reservations) else {
+            return Err(AxError::NoMemory);
+        };
+        if total >= PTRACE_REVERSE_LINK_HARD_LIMIT {
+            return Err(AxError::NoMemory);
+        }
+        let Some(reservations) = self.reservations.checked_add(1) else {
+            return Err(AxError::NoMemory);
+        };
+        self.reservations = reservations;
+        Ok(())
+    }
+
+    fn cancel_reservation(&mut self) {
+        let old = self.reservations;
+        debug_assert!(old != 0);
+        if old != 0 {
+            self.reservations = old - 1;
+        }
+    }
+
+    /// Allocation-free partition used when one tracer task exits while its
+    /// thread group remains live. Nodes are only relinked under the spin lock;
+    /// the returned chain is consumed and destroyed after the guard drops.
+    fn drain_task(&mut self, tracer_kernel_tid: Pid) -> Option<Box<PtraceReverseLinkNode>> {
+        let mut source = self.head.take();
+        let mut retained = None;
+        let mut drained = None;
+        let mut retained_len = 0usize;
+        while let Some(mut node) = source {
+            source = node.next.take();
+            if node.session.tracer_kernel_tid == tracer_kernel_tid {
+                node.next = drained.take();
+                drained = Some(node);
+            } else {
+                retained_len += 1;
+                node.next = retained.take();
+                retained = Some(node);
+            }
+        }
+        self.head = retained;
+        self.len = retained_len;
+        drained
+    }
+}
+
+/// Preallocated and hard-limit-accounted reverse-link publication token.
+///
+/// Allocation happens before the reservation spin lock is acquired. Dropping
+/// an unpublished token releases its reservation and node outside the lock.
+pub(crate) struct PreparedPtraceReverseLink<'a> {
+    owner: &'a SpinNoIrq<PtraceReverseLinks>,
+    tracer: Pid,
+    tracer_kernel_tid: Pid,
+    node: Option<Box<PtraceReverseLinkNode>>,
+    reserved: bool,
+}
+
+impl PreparedPtraceReverseLink<'_> {
+    fn publish(mut self, session: PtraceSession) -> Result<(), (AxError, Self)> {
+        let Some(mut node) = self.node.take() else {
+            return Err((AxError::BadState, self));
+        };
+        node.session = session;
+        let mut links = self.owner.lock();
+        if !self.reserved || links.reservations == 0 || links.closed {
+            drop(links);
+            self.node = Some(node);
+            return Err((AxError::BadState, self));
+        }
+        node.next = links.head.take();
+        links.head = Some(node);
+        links.len += 1;
+        links.cancel_reservation();
+        self.reserved = false;
+        drop(links);
+        Ok(())
+    }
+}
+
+impl Drop for PreparedPtraceReverseLink<'_> {
+    fn drop(&mut self) {
+        if self.reserved {
+            let mut links = self.owner.lock();
+            links.cancel_reservation();
+            self.reserved = false;
+            drop(links);
+        }
+        // `node` is deliberately dropped only after the spin guard above.
+    }
+}
+
+pub(crate) struct PtraceReverseLinkDrain {
+    next: Option<Box<PtraceReverseLinkNode>>,
+}
+
+impl Iterator for PtraceReverseLinkDrain {
+    type Item = PtraceReverseLink;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut node = self.next.take()?;
+        self.next = node.next.take();
+        Some(PtraceReverseLink {
+            tracee: node.tracee,
+            session: node.session,
+        })
+    }
 }
 
 /// [`Process`]-shared data.
@@ -1263,10 +1480,17 @@ pub struct ProcessData {
     job_ctl: SpinNoIrq<JobControlState>,
     /// ptrace ownership and options shared by all threads in the process.
     ptrace_ctl: SpinNoIrq<PtraceControlState>,
+    /// Sleepable outer gate for ptrace relationship actions.
+    ///
+    /// Syscall operations hold this across exact-session/state validation and
+    /// their use (including userspace copies or address-space locking). Spin
+    /// guards remain short-lived inside the gate. This prevents a sibling
+    /// tracer thread from CONT/DETACH racing a PEEK/POKE or state mutation.
+    ptrace_actions: Mutex<()>,
     /// Exact queued signal retained while stopped at a ptrace delivery boundary.
     ptrace_signal: Mutex<Option<PtraceSignalRecord>>,
-    /// Processes currently traced by this process.
-    ptrace_tracees: SpinNoIrq<Vec<Pid>>,
+    /// Bounded, preallocated reverse links for processes traced by this one.
+    ptrace_tracees: SpinNoIrq<PtraceReverseLinks>,
     /// Multi-thread exec coordination state.
     exec_ctl: SpinNoIrq<ExecControlState>,
     /// CLONE_VFORK coordination state.
@@ -1288,6 +1512,40 @@ pub struct ProcessData {
     time_ns: RwLock<Arc<TimeNamespace>>,
     /// The time namespace inherited by children created after unshare/setns.
     time_ns_for_children: RwLock<Arc<TimeNamespace>>,
+}
+
+/// Composite outer gate for ptrace relationship publication.
+///
+/// Exit owns `process_lifecycle` before it removes a core thread membership
+/// and later takes `ptrace_actions` during relationship cleanup. Publishing in
+/// the same order prevents an attach from racing past the only exit cleanup or
+/// deadlocking it with the inverse `ptrace_actions -> process_lifecycle` order.
+pub(crate) struct PtracePublicationGuard<'a> {
+    owner: &'a ProcessData,
+    tracer_owner: Option<&'a ProcessData>,
+    // Fields are declared in release order: action users leave before a new
+    // lifecycle transition can enter.
+    _actions: axsync::MutexGuard<'a, ()>,
+    task_parent: TaskParentPublicationGuard<'static>,
+    _second_lifecycle: Option<axsync::MutexGuard<'a, ()>>,
+    _first_lifecycle: axsync::MutexGuard<'a, ()>,
+}
+
+impl PtracePublicationGuard<'_> {
+    pub(crate) fn task_parent_publication(&self) -> &TaskParentPublicationGuard<'static> {
+        &self.task_parent
+    }
+}
+
+fn ptrace_lifecycle_first(left: &ProcessData, right: &ProcessData) -> bool {
+    ptrace_lifecycle_first_key(
+        left as *const ProcessData as usize,
+        right as *const ProcessData as usize,
+    )
+}
+
+fn ptrace_lifecycle_first_key(left: usize, right: usize) -> bool {
+    left < right
 }
 
 /// Deferred destruction produced by an exec group-leader handoff.
@@ -1530,8 +1788,9 @@ impl ProcessData {
 
             job_ctl: SpinNoIrq::new(JobControlState::default()),
             ptrace_ctl: SpinNoIrq::new(PtraceControlState::default()),
+            ptrace_actions: Mutex::new(()),
             ptrace_signal: Mutex::new(None),
-            ptrace_tracees: SpinNoIrq::new(Vec::new()),
+            ptrace_tracees: SpinNoIrq::new(PtraceReverseLinks::default()),
             exec_ctl: SpinNoIrq::new(ExecControlState::default()),
             vfork_ctl: SpinNoIrq::new(VforkControlState::default()),
             stop_event,
@@ -1583,13 +1842,15 @@ impl ProcessData {
     /// Takes process-directed identity, dumpability, and image through one
     /// coherent snapshot of the persistent group-leader binding.
     pub(crate) fn group_leader_image_access_snapshot(&self) -> ProcessImageAccessSnapshot {
-        let (credential, dumpability, owner_user_ns, aspace) =
+        let (credential, dumpability, owner_user_ns, aspace, access_state) =
             snapshot_group_credential_image(&self.image_binding, &self.group_leader_credential);
         ProcessImageAccessSnapshot {
             credential,
             dumpability,
             owner_user_ns,
             aspace,
+            access_state,
+            exact_target: None,
         }
     }
 
@@ -1614,6 +1875,8 @@ impl ProcessData {
             dumpability,
             owner_user_ns: access_state.owner_user_ns.clone(),
             aspace,
+            access_state,
+            exact_target: Some((thread.kernel_tid(), slot)),
         })
     }
 
@@ -1628,6 +1891,8 @@ impl ProcessData {
             dumpability,
             owner_user_ns: access_state.owner_user_ns.clone(),
             aspace,
+            access_state,
+            exact_target: None,
         }
     }
 
@@ -1676,31 +1941,32 @@ impl ProcessData {
         proposed
     }
 
-    /// Publishes an optional exec credential and switches the group-leader
-    /// slot as one process-visible transition. Retired `Arc`s are destroyed
-    /// only after the binding lock is released.
+    /// Publishes the mandatory fully derived exec credential and switches the
+    /// group-leader slot as one process-visible transition. Retired `Arc`s are
+    /// destroyed only after the binding lock is released.
     pub(in crate::task) fn publish_exec_image<'a>(
         &self,
         owner: Pid,
         thread: &super::Thread,
-        prepared: Option<PreparedCred<'a>>,
+        prepared: PreparedExecCredential<'a>,
         new_aspace: Arc<Mutex<AddrSpace>>,
         new_access_state: Arc<ProcessAccessState>,
     ) -> ExecImageRetirement<'a> {
         debug_assert!(self.is_exec_owner(owner));
         debug_assert_eq!(thread.proc_data.proc.pid(), self.proc.pid());
         let credential = thread.credential_slot();
-        if prepared
-            .as_ref()
-            .is_some_and(PreparedCred::requires_dumpability_drop)
-        {
+        let effects = prepared.effects();
+        if effects.clear_pdeath_signal {
+            // Linux pdeath_signal is task-local: only the executor crosses
+            // this credential transition, never its former siblings.
             thread.set_pdeath_signal(0);
         }
+        let prepared = prepared.into_prepared();
         let (group_leader, retired_image) = replace_process_image_with_group_handoff(
             &self.image_binding,
             &self.group_leader_credential,
             credential,
-            prepared,
+            Some(prepared),
             ProcessImageBinding {
                 aspace: new_aspace,
                 access_state: new_access_state,
@@ -2035,45 +2301,268 @@ impl ProcessData {
 }
 
 impl ProcessData {
+    /// Acquires the fixed ptrace publication order used by attach/traceme and
+    /// process exit: lifecycle first, then the sleepable action gate.
+    pub(crate) fn lock_ptrace_publication(&self) -> PtracePublicationGuard<'_> {
+        let lifecycle = self.process_lifecycle.lock();
+        let task_parent = lock_task_parent_publication();
+        let actions = self.ptrace_actions.lock();
+        PtracePublicationGuard {
+            owner: self,
+            tracer_owner: None,
+            _actions: actions,
+            task_parent,
+            _second_lifecycle: None,
+            _first_lifecycle: lifecycle,
+        }
+    }
+
+    /// Pins both the tracee and exact prospective tracer process against task
+    /// exit/reparenting. Distinct ProcessData lifecycle locks use immutable
+    /// object-address order, followed by the tracee action gate.
+    pub(crate) fn lock_ptrace_traceme_publication<'a>(
+        &'a self,
+        tracer: &'a ProcessData,
+    ) -> AxResult<PtracePublicationGuard<'a>> {
+        if core::ptr::eq(self, tracer) {
+            return Err(AxError::OperationNotPermitted);
+        }
+        let (first_owner, second_owner) = if ptrace_lifecycle_first(self, tracer) {
+            (self, tracer)
+        } else {
+            (tracer, self)
+        };
+        let first_lifecycle = first_owner.process_lifecycle.lock();
+        let second_lifecycle = second_owner.process_lifecycle.lock();
+        let task_parent = lock_task_parent_publication();
+        let actions = self.ptrace_actions.lock();
+        Ok(PtracePublicationGuard {
+            owner: self,
+            tracer_owner: Some(tracer),
+            _actions: actions,
+            task_parent,
+            _second_lifecycle: Some(second_lifecycle),
+            _first_lifecycle: first_lifecycle,
+        })
+    }
+
+    pub(crate) fn lock_ptrace_actions(&self) -> axsync::MutexGuard<'_, ()> {
+        self.ptrace_actions.lock()
+    }
+
     pub fn ptrace_tracer(&self) -> Option<Pid> {
         self.ptrace_ctl.lock().tracer
     }
 
-    pub fn ptrace_options(&self) -> u32 {
-        self.ptrace_ctl.lock().options
+    pub(crate) fn ptrace_active_session(&self) -> Option<PtraceSession> {
+        self.ptrace_ctl.lock().active_session()
     }
 
-    pub fn ptrace_event_message(&self) -> usize {
-        self.ptrace_ctl.lock().event_message
+    pub(crate) fn ptrace_session_if_traced_by(
+        &self,
+        tracer: Pid,
+        tracer_kernel_tid: Pid,
+    ) -> Option<PtraceSession> {
+        self.ptrace_ctl
+            .lock()
+            .active_session_if_owned_by(tracer, tracer_kernel_tid)
     }
 
-    pub fn ptrace_set_options(&self, options: u32) {
-        self.ptrace_ctl.lock().options = options;
+    pub(crate) fn ptrace_session_if_traced_by_process(&self, tracer: Pid) -> Option<PtraceSession> {
+        self.ptrace_ctl
+            .lock()
+            .active_session()
+            .filter(|session| session.tracer == tracer)
     }
 
-    pub fn ptrace_set_event_message(&self, event_message: usize) {
-        self.ptrace_ctl.lock().event_message = event_message;
+    /// Returns the caller-owned relationship only when its exact generation
+    /// also owns the current ptrace stop.
+    pub(crate) fn ptrace_inactive_session_if_traced_by(
+        &self,
+        tracer: Pid,
+        tracer_kernel_tid: Pid,
+    ) -> Option<PtraceSession> {
+        let ptrace_ctl = self.ptrace_ctl.lock();
+        let session = ptrace_ctl.active_session_if_owned_by(tracer, tracer_kernel_tid)?;
+        let job_ctl = self.job_ctl.lock();
+        job_ctl.is_ptrace_inactive_for(session).then_some(session)
     }
 
-    pub fn is_traced_by(&self, tracer: Pid) -> bool {
-        self.ptrace_tracer() == Some(tracer)
-    }
-
-    /// Pins the current process image only if `tracer` still owns this ptrace
-    /// session at the same linearization point.
-    pub(crate) fn ptrace_image_if_traced_by(&self, tracer: Pid) -> Option<Arc<Mutex<AddrSpace>>> {
-        ptrace_image_snapshot_if_owned(&self.ptrace_ctl, &self.image_binding, tracer)
-    }
-
-    pub fn begin_ptrace(&self, tracer: Pid) -> bool {
+    pub(crate) fn ptrace_set_options(&self, session: PtraceSession, options: u32) -> bool {
         let mut ptrace_ctl = self.ptrace_ctl.lock();
-        if ptrace_ctl.tracer.is_some() {
+        let job_ctl = self.job_ctl.lock();
+        if ptrace_ctl.active_session() != Some(session) || !job_ctl.is_ptrace_inactive_for(session)
+        {
             return false;
         }
-        ptrace_ctl.tracer = Some(tracer);
-        ptrace_ctl.options = 0;
-        ptrace_ctl.event_message = 0;
+        ptrace_ctl.options = options;
         true
+    }
+
+    pub(crate) fn ptrace_event_message(&self, session: PtraceSession) -> Option<usize> {
+        let ptrace_ctl = self.ptrace_ctl.lock();
+        let job_ctl = self.job_ctl.lock();
+        (ptrace_ctl.active_session() == Some(session) && job_ctl.is_ptrace_inactive_for(session))
+            .then_some(ptrace_ctl.event_message)
+    }
+
+    pub(crate) fn ptrace_set_event_message(
+        &self,
+        session: PtraceSession,
+        event_message: usize,
+    ) -> bool {
+        let mut ptrace_ctl = self.ptrace_ctl.lock();
+        if ptrace_ctl.active_session() != Some(session) {
+            return false;
+        }
+        ptrace_ctl.event_message = event_message;
+        true
+    }
+
+    /// Pins the image only if the exact relationship still owns an inactive
+    /// ptrace stop at the image/session/job-control linearization point.
+    pub(crate) fn ptrace_inactive_image_if_session(
+        &self,
+        session: PtraceSession,
+    ) -> Option<Arc<Mutex<AddrSpace>>> {
+        ptrace_inactive_image_snapshot_if_session(
+            &self.ptrace_ctl,
+            &self.job_ctl,
+            &self.image_binding,
+            session,
+        )
+    }
+
+    pub(crate) fn try_prepare_ptrace_reverse_link(
+        &self,
+        tracee: Pid,
+        tracer_kernel_tid: Pid,
+    ) -> AxResult<PreparedPtraceReverseLink<'_>> {
+        let node = Box::try_new(PtraceReverseLinkNode {
+            tracee,
+            session: PtraceSession {
+                tracer: 0,
+                tracer_kernel_tid: 0,
+                generation: 0,
+            },
+            next: None,
+        })
+        .map_err(|_| AxError::NoMemory)?;
+        let mut links = self.ptrace_tracees.lock();
+        let admitted = links.try_reserve();
+        drop(links);
+        admitted?;
+        Ok(PreparedPtraceReverseLink {
+            owner: &self.ptrace_tracees,
+            tracer: self.proc.pid(),
+            tracer_kernel_tid,
+            node: Some(node),
+            reserved: true,
+        })
+    }
+
+    /// Publishes both directions of one ptrace relationship after revalidating
+    /// the exact hook-authorized task/image snapshot. Hooks run before this
+    /// method; the fixed lock order here is exec gate, image, access security,
+    /// exact credential slot, ptrace control, then tracer reverse links.
+    pub(crate) fn publish_ptrace_relationship(
+        &self,
+        publication: &PtracePublicationGuard<'_>,
+        target: &super::Thread,
+        tracer: Pid,
+        tracer_kernel_tid: Pid,
+        seized: bool,
+        initial_options: u32,
+        authorized: &ProcessImageAccessSnapshot,
+        reverse_link: PreparedPtraceReverseLink<'_>,
+    ) -> AxResult<PtraceSession> {
+        if !core::ptr::eq(publication.owner, self) {
+            return Err(AxError::BadState);
+        }
+        if let Some(tracer_owner) = publication.tracer_owner
+            && (tracer_owner.proc.pid() != tracer
+                || !tracer_owner
+                    .proc
+                    .thread_ids()
+                    .any(|tid| tid == tracer_kernel_tid))
+        {
+            return Err(AxError::NoSuchProcess);
+        }
+        if reverse_link.tracer != tracer
+            || reverse_link.tracer_kernel_tid != tracer_kernel_tid
+            || reverse_link
+                .node
+                .as_ref()
+                .is_none_or(|node| node.tracee != self.proc.pid())
+        {
+            return Err(AxError::BadState);
+        }
+        if !core::ptr::eq(&*target.proc_data, self)
+            || target.exit.load(Ordering::Acquire)
+            || !self.proc.thread_ids().any(|tid| tid == target.kernel_tid())
+        {
+            return Err(AxError::NoSuchProcess);
+        }
+        let exec_ctl = self.exec_ctl.lock();
+        if exec_ctl.group_exit || target.exit.load(Ordering::Acquire) {
+            return Err(AxError::NoSuchProcess);
+        }
+        if exec_ctl.owner.is_some() {
+            return Err(AxError::OperationNotPermitted);
+        }
+        let image = self.image_binding.read();
+        if !Arc::ptr_eq(&image.aspace, &authorized.aspace)
+            || !Arc::ptr_eq(&image.access_state, &authorized.access_state)
+            || !authorized.exact_target_matches(target)
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+        let security = image.access_state.security.lock();
+        if security.dumpability != authorized.dumpability
+            || !Arc::ptr_eq(&image.access_state.owner_user_ns, &authorized.owner_user_ns)
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+        let current_credential = target.credential_slot().current();
+        if !Arc::ptr_eq(&current_credential, &authorized.credential)
+            || target.exit.load(Ordering::Acquire)
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+        let mut ptrace_ctl = self.ptrace_ctl.lock();
+        let old_generation = ptrace_ctl.generation;
+        let Some(session) =
+            ptrace_ctl.try_begin(tracer, tracer_kernel_tid, seized, initial_options)
+        else {
+            return Err(if ptrace_ctl.tracer.is_some() {
+                AxError::OperationNotPermitted
+            } else {
+                AxError::OutOfRange
+            });
+        };
+        if let Err((error, reverse_link)) = reverse_link.publish(session) {
+            ptrace_ctl.tracer = None;
+            ptrace_ctl.tracer_kernel_tid = 0;
+            ptrace_ctl.generation = old_generation;
+            ptrace_ctl.seized = false;
+            ptrace_ctl.options = 0;
+            ptrace_ctl.event_message = 0;
+            drop(ptrace_ctl);
+            drop(current_credential);
+            drop(security);
+            drop(image);
+            drop(exec_ctl);
+            // The preallocated node and reservation token are destroyed only
+            // after every publication spin/image guard has been released.
+            drop(reverse_link);
+            return Err(error);
+        }
+        drop(ptrace_ctl);
+        drop(current_credential);
+        drop(security);
+        drop(image);
+        drop(exec_ctl);
+        Ok(session)
     }
 
     /// Stops at a signal-delivery boundary while transferring exact queue
@@ -2086,31 +2575,54 @@ impl ProcessData {
         let mut pending = self.ptrace_signal.lock();
         let ptrace_ctl = self.ptrace_ctl.lock();
         let mut job_ctl = self.job_ctl.lock();
-        if ptrace_ctl.tracer.is_none() || job_ctl.state != StopState::Running || pending.is_some() {
+        let Some(session) = ptrace_ctl.active_session() else {
+            return Err(record);
+        };
+        if job_ctl.state != StopState::Running || pending.is_some() {
             return Err(record);
         }
 
         job_ctl.state = StopState::Stopped;
         job_ctl.stop_signal = record.info().signo() as u8;
         job_ctl.stop_kind = StopKind::Ptrace;
+        job_ctl.ptrace_session = Some(session);
         job_ctl.stop_reported = false;
         job_ctl.continued = false;
         *pending = Some(record);
         Ok(())
     }
 
-    pub(crate) fn ptrace_signal_info(&self) -> Option<SignalInfo> {
-        self.ptrace_signal
-            .lock()
-            .as_ref()
-            .map(|record| record.info().clone())
+    pub(crate) fn ptrace_signal_info(&self, session: PtraceSession) -> Option<SignalInfo> {
+        let pending = self.ptrace_signal.lock();
+        let ptrace_ctl = self.ptrace_ctl.lock();
+        let job_ctl = self.job_ctl.lock();
+        if ptrace_ctl.active_session() != Some(session) || !job_ctl.is_ptrace_inactive_for(session)
+        {
+            return None;
+        }
+        pending.as_ref().map(|record| record.info().clone())
     }
 
-    pub(crate) fn replace_ptrace_signal_info(&self, info: SignalInfo) -> bool {
+    pub(crate) fn replace_ptrace_signal_info(
+        &self,
+        session: PtraceSession,
+        info: SignalInfo,
+    ) -> AxResult<()> {
         let mut pending = self.ptrace_signal.lock();
-        pending
-            .as_mut()
-            .is_some_and(|record| record.replace_info(info).is_some())
+        let ptrace_ctl = self.ptrace_ctl.lock();
+        let job_ctl = self.job_ctl.lock();
+        if ptrace_ctl.active_session() != Some(session) || !job_ctl.is_ptrace_inactive_for(session)
+        {
+            return Err(AxError::NoSuchProcess);
+        }
+        let record = pending.as_mut().ok_or(AxError::InvalidInput)?;
+        if record.info().signo() != info.try_signo().ok_or(AxError::InvalidInput)? {
+            return Err(AxError::InvalidInput);
+        }
+        record
+            .replace_info(info)
+            .map(|_| ())
+            .ok_or(AxError::InvalidInput)
     }
 
     /// Resumes a ptrace stop and atomically takes its retained signal record.
@@ -2118,38 +2630,110 @@ impl ProcessData {
     /// no new delivery stop can appear between resume and detach.
     pub(crate) fn resume_ptrace(
         &self,
-        tracer: Pid,
+        session: PtraceSession,
         detach: bool,
+    ) -> Option<(ContinueResult, Option<PtraceSignalRecord>)> {
+        self.resume_ptrace_inner(session, detach, true)
+    }
+
+    fn resume_ptrace_inner(
+        &self,
+        session: PtraceSession,
+        detach: bool,
+        require_inactive: bool,
     ) -> Option<(ContinueResult, Option<PtraceSignalRecord>)> {
         let mut pending = self.ptrace_signal.lock();
         let mut ptrace_ctl = self.ptrace_ctl.lock();
-        if ptrace_ctl.tracer != Some(tracer) {
+        if ptrace_ctl.active_session() != Some(session) {
             return None;
-        }
-        if detach {
-            *ptrace_ctl = PtraceControlState::default();
         }
 
         let mut job_ctl = self.job_ctl.lock();
+        if require_inactive && !job_ctl.is_ptrace_inactive_for(session) {
+            return None;
+        }
+        if detach {
+            let cleared = ptrace_ctl.clear_session(session);
+            debug_assert!(cleared);
+        }
+
         let result = match job_ctl.state {
             StopState::Running => ContinueResult::None,
-            StopState::Stopping => {
+            StopState::Stopping if !require_inactive && job_ctl.stop_kind == StopKind::Ptrace => {
                 job_ctl.state = StopState::Running;
+                job_ctl.ptrace_session = None;
                 ContinueResult::CanceledStopping
             }
+            StopState::Stopping => ContinueResult::None,
             StopState::Stopped => {
-                job_ctl.state = StopState::Running;
-                if job_ctl.stop_kind == StopKind::JobControl {
-                    job_ctl.continued = true;
+                if job_ctl.is_ptrace_inactive_for(session) {
+                    job_ctl.state = StopState::Running;
+                    job_ctl.ptrace_session = None;
+                    ContinueResult::ResumedStopped
+                } else {
+                    ContinueResult::None
                 }
-                ContinueResult::ResumedStopped
             }
         };
-        let record = pending.take();
+        let record = if result == ContinueResult::None && !require_inactive {
+            None
+        } else {
+            pending.take()
+        };
         drop(job_ctl);
         drop(ptrace_ctl);
         drop(pending);
         Some((result, record))
+    }
+
+    /// Publishes one stop only for the exact relationship which requested it.
+    /// A stale attach/exec completion cannot stop a later reattachment that
+    /// happens to use the same numeric tracer PID.
+    pub(crate) fn ptrace_stop(&self, session: PtraceSession, signo: u8) -> bool {
+        let ptrace_ctl = self.ptrace_ctl.lock();
+        if ptrace_ctl.active_session() != Some(session) {
+            return false;
+        }
+        let mut job_ctl = self.job_ctl.lock();
+        if job_ctl.is_ptrace_inactive_for(session) {
+            return false;
+        }
+        if job_ctl.stop_kind == StopKind::Ptrace && job_ctl.state != StopState::Running {
+            return false;
+        }
+        job_ctl.state = StopState::Stopped;
+        job_ctl.stop_signal = signo;
+        job_ctl.stop_kind = StopKind::Ptrace;
+        job_ctl.ptrace_session = Some(session);
+        job_ctl.stop_reported = false;
+        job_ctl.continued = false;
+        true
+    }
+
+    /// Applies `PTRACE_INTERRUPT` to an exact seized relationship. Unlike
+    /// ordinary actions this is allowed while the tracee is running.
+    pub(crate) fn ptrace_interrupt(&self, session: PtraceSession, signo: u8) -> Option<bool> {
+        let ptrace_ctl = self.ptrace_ctl.lock();
+        if ptrace_ctl.active_session() != Some(session) || !ptrace_ctl.seized {
+            return None;
+        }
+        let mut job_ctl = self.job_ctl.lock();
+        if job_ctl.is_ptrace_inactive_for(session) {
+            // Linux queues a second trap when INTERRUPT races an existing
+            // ptrace stop. Until that pending-trap state is represented, fail
+            // closed instead of reporting a success that CONT would lose.
+            return None;
+        }
+        if job_ctl.stop_kind == StopKind::Ptrace && job_ctl.state != StopState::Running {
+            return None;
+        }
+        job_ctl.state = StopState::Stopped;
+        job_ctl.stop_signal = signo;
+        job_ctl.stop_kind = StopKind::Ptrace;
+        job_ctl.ptrace_session = Some(session);
+        job_ctl.stop_reported = false;
+        job_ctl.continued = false;
+        Some(true)
     }
 
     /// Publishes the wake only after the caller has resolved the retained
@@ -2161,8 +2745,8 @@ impl ProcessData {
         }
     }
 
-    pub fn end_ptrace(&self, tracer: Pid) -> bool {
-        let Some((result, record)) = self.resume_ptrace(tracer, true) else {
+    pub(crate) fn end_ptrace(&self, session: PtraceSession) -> bool {
+        let Some((result, record)) = self.resume_ptrace_inner(session, true, false) else {
             return false;
         };
         if let Some(record) = record {
@@ -2173,59 +2757,90 @@ impl ProcessData {
         true
     }
 
-    pub fn clear_ptrace(&self) -> Option<Pid> {
-        let (tracer, record) = {
+    pub(crate) fn clear_ptrace(&self) -> Option<PtraceSession> {
+        let (session, record) = {
             let mut pending = self.ptrace_signal.lock();
             let mut ptrace_ctl = self.ptrace_ctl.lock();
-            let tracer = ptrace_ctl.tracer;
-            *ptrace_ctl = PtraceControlState::default();
-            (tracer, pending.take())
+            let session = ptrace_ctl.clear_active();
+            (session, pending.take())
         };
         if let Some(record) = record {
             super::timer::acknowledge_posix_timer_signal(self, record.info());
             drop(record);
         }
-        tracer
+        session
     }
 
-    pub fn try_ptrace_tracees(&self) -> AxResult<Vec<Pid>> {
+    pub(crate) fn try_ptrace_tracees(&self) -> AxResult<Vec<PtraceReverseLink>> {
         let mut snapshot = Vec::new();
         loop {
-            let required = self.ptrace_tracees.lock().len();
+            let required = self.ptrace_tracees.lock().len;
             if snapshot.capacity() < required {
                 snapshot
                     .try_reserve_exact(required)
                     .map_err(|_| AxError::NoMemory)?;
             }
             let tracees = self.ptrace_tracees.lock();
-            if snapshot.capacity() < tracees.len() {
+            if snapshot.capacity() < tracees.len {
                 drop(tracees);
                 continue;
             }
             snapshot.clear();
-            for &pid in tracees.iter() {
-                snapshot.push(pid);
+            let mut cursor = tracees.head.as_deref();
+            while let Some(node) = cursor {
+                snapshot.push(PtraceReverseLink {
+                    tracee: node.tracee,
+                    session: node.session,
+                });
+                cursor = node.next.as_deref();
             }
             return Ok(snapshot);
         }
     }
 
-    pub fn add_ptrace_tracee(&self, tracee: Pid) {
+    pub(crate) fn remove_ptrace_tracee(&self, link: PtraceReverseLink) -> bool {
         let mut tracees = self.ptrace_tracees.lock();
-        if !tracees.contains(&tracee) {
-            tracees.push(tracee);
-        }
+        let mut cursor = &mut tracees.head;
+        let removed = loop {
+            match cursor {
+                Some(node) if node.tracee == link.tracee && node.session == link.session => {
+                    let mut removed = cursor.take();
+                    if let Some(node) = removed.as_mut() {
+                        *cursor = node.next.take();
+                    }
+                    tracees.len -= 1;
+                    break removed;
+                }
+                Some(node) => cursor = &mut node.next,
+                None => break None,
+            }
+        };
+        let found = removed.is_some();
+        drop(tracees);
+        drop(removed);
+        found
     }
 
-    pub fn remove_ptrace_tracee(&self, tracee: Pid) {
-        self.ptrace_tracees.lock().retain(|pid| *pid != tracee);
+    pub(crate) fn clear_ptrace_tracees(&self) -> PtraceReverseLinkDrain {
+        let mut tracees = self.ptrace_tracees.lock();
+        let next = tracees.head.take();
+        tracees.len = 0;
+        // Final tracer cleanup closes publication before releasing the lock.
+        // Already-prepared tokens will observe this bit and refund their
+        // reservations instead of recreating a reverse link after the drain.
+        tracees.closed = true;
+        drop(tracees);
+        PtraceReverseLinkDrain { next }
     }
 
-    pub fn clear_ptrace_tracees(&self) -> Vec<Pid> {
+    pub(crate) fn clear_ptrace_tracees_for_task(
+        &self,
+        tracer_kernel_tid: Pid,
+    ) -> PtraceReverseLinkDrain {
         let mut tracees = self.ptrace_tracees.lock();
-        let old = tracees.clone();
-        tracees.clear();
-        old
+        let next = tracees.drain_task(tracer_kernel_tid);
+        drop(tracees);
+        PtraceReverseLinkDrain { next }
     }
 
     fn stop_state(&self) -> StopState {
@@ -2251,6 +2866,7 @@ impl ProcessData {
         job_ctl.state = StopState::Stopping;
         job_ctl.stop_signal = signo;
         job_ctl.stop_kind = StopKind::JobControl;
+        job_ctl.ptrace_session = None;
         true
     }
 
@@ -2261,20 +2877,7 @@ impl ProcessData {
             return false;
         }
         job_ctl.state = StopState::Stopped;
-        job_ctl.stop_reported = false;
-        job_ctl.continued = false;
-        true
-    }
-
-    /// Stops a traced process at a signal-delivery or attach boundary.
-    pub fn ptrace_stop(&self, signo: u8) -> bool {
-        let mut job_ctl = self.job_ctl.lock();
-        if job_ctl.state != StopState::Running {
-            return false;
-        }
-        job_ctl.state = StopState::Stopped;
-        job_ctl.stop_signal = signo;
-        job_ctl.stop_kind = StopKind::Ptrace;
+        job_ctl.ptrace_session = None;
         job_ctl.stop_reported = false;
         job_ctl.continued = false;
         true
@@ -2289,6 +2892,7 @@ impl ProcessData {
                 StopState::Running => ContinueResult::None,
                 StopState::Stopping => {
                     job_ctl.state = StopState::Running;
+                    job_ctl.ptrace_session = None;
                     ContinueResult::CanceledStopping
                 }
                 StopState::Stopped => {
@@ -2296,6 +2900,7 @@ impl ProcessData {
                         return ContinueResult::None;
                     }
                     job_ctl.state = StopState::Running;
+                    job_ctl.ptrace_session = None;
                     if job_ctl.stop_kind == StopKind::JobControl {
                         job_ctl.continued = true;
                     }
@@ -2318,44 +2923,37 @@ impl ProcessData {
     }
 
     /// Takes the current stopped status for waitpid reporting, if it has not been reported yet.
-    pub(crate) fn take_stop_status(&self) -> Option<StopReport> {
+    pub(crate) fn take_stop_status(
+        &self,
+        expected_ptrace_session: Option<PtraceSession>,
+    ) -> Option<StopReport> {
         let mut job_ctl = self.job_ctl.lock();
-        if job_ctl.state == StopState::Stopped && !job_ctl.stop_reported {
-            job_ctl.stop_reported = true;
-            Some(StopReport {
-                signal: job_ctl.stop_signal,
-                traced: job_ctl.stop_kind == StopKind::Ptrace,
-            })
-        } else {
-            None
-        }
+        let report = job_ctl.stop_report_for(expected_ptrace_session)?;
+        job_ctl.stop_reported = true;
+        Some(report)
     }
 
     /// Peeks at the stopped status without consuming it (for WNOWAIT).
-    pub(crate) fn peek_stop_status(&self) -> Option<StopReport> {
+    pub(crate) fn peek_stop_status(
+        &self,
+        expected_ptrace_session: Option<PtraceSession>,
+    ) -> Option<StopReport> {
         let job_ctl = self.job_ctl.lock();
-        if job_ctl.state == StopState::Stopped && !job_ctl.stop_reported {
-            Some(StopReport {
-                signal: job_ctl.stop_signal,
-                traced: job_ctl.stop_kind == StopKind::Ptrace,
-            })
-        } else {
-            None
-        }
+        job_ctl.stop_report_for(expected_ptrace_session)
     }
 
     /// Claims the pending stop report so a waiter can complete userspace copies first.
-    pub(crate) fn claim_stop_status(&self) -> Option<StopReport> {
-        self.take_stop_status()
+    pub(crate) fn claim_stop_status(
+        &self,
+        expected_ptrace_session: Option<PtraceSession>,
+    ) -> Option<StopReport> {
+        self.take_stop_status(expected_ptrace_session)
     }
 
     /// Restores a previously claimed stop report after a failed userspace copy.
     pub(crate) fn restore_stop_status(&self, report: StopReport) {
         let mut job_ctl = self.job_ctl.lock();
-        if job_ctl.state == StopState::Stopped
-            && job_ctl.stop_signal == report.signal
-            && (job_ctl.stop_kind == StopKind::Ptrace) == report.traced
-        {
+        if job_ctl.current_stop_report() == Some(report) {
             job_ctl.stop_reported = false;
         }
     }
@@ -2552,7 +3150,7 @@ impl Drop for ProcessData {
 mod tests {
     extern crate std;
 
-    use alloc::{sync::Arc, vec};
+    use alloc::{boxed::Box, sync::Arc, vec};
     use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
     use std::{sync::Barrier, thread, vec::Vec};
 
@@ -2562,17 +3160,20 @@ mod tests {
 
     use super::{
         CgroupNamespace, Dumpability, GroupLeaderCredentialBinding, Mempolicy, MempolicyRange,
-        MempolicySnapshot, MempolicyState, NetworkNamespace, PidNamespace, ProcessAccessState,
-        ProcessImageBinding, SIGNAL_QUEUE_GLOBAL_HARD_LIMIT, SIGNAL_QUEUE_PER_USER_HARD_LIMIT,
-        TimeNamespace, UserNamespace, UtsNamespace, coredump_image_snapshot,
-        group_exit_handoff_requires_kill, init_uts_state, ptrace_image_snapshot_if_owned,
+        MempolicySnapshot, MempolicyState, NetworkNamespace, PTRACE_REVERSE_LINK_HARD_LIMIT,
+        PidNamespace, PreparedPtraceReverseLink, ProcessAccessState, ProcessImageBinding,
+        PtraceReverseLinkDrain, PtraceReverseLinkNode, PtraceReverseLinks,
+        SIGNAL_QUEUE_GLOBAL_HARD_LIMIT, SIGNAL_QUEUE_PER_USER_HARD_LIMIT, TimeNamespace,
+        UserNamespace, UtsNamespace, coredump_image_snapshot, group_exit_handoff_requires_kill,
+        init_uts_state, ptrace_image_snapshot_if_owned, ptrace_image_snapshot_if_session,
+        ptrace_inactive_image_snapshot_if_session, ptrace_lifecycle_first_key,
         replace_process_image_with_group_handoff, snapshot_credential_image,
         snapshot_group_credential_image, try_increment_bounded,
     };
     use crate::task::{
         CapabilityState, Cred, CredentialSlot,
         idmap::{IdMapInputExtent, Kgid, Kuid},
-        jobctl::PtraceControlState,
+        jobctl::{JobControlState, PtraceControlState, PtraceSession, StopKind, StopState},
     };
 
     fn kuid(raw: u32) -> Kuid {
@@ -2740,7 +3341,7 @@ mod tests {
 
         let (exact_cred, exact_dumpability, exact_image, _) =
             snapshot_credential_image(&image, &exact);
-        let (leader_cred, leader_dumpability, _, leader_image) =
+        let (leader_cred, leader_dumpability, _, leader_image, _) =
             snapshot_group_credential_image(&image, &group);
         assert_eq!(exact_cred.ids().euid, kuid(2000));
         assert_eq!(leader_cred.ids().euid, kuid(1000));
@@ -2780,23 +3381,185 @@ mod tests {
         let ptrace_ctl = SpinNoIrq::new(PtraceControlState::default());
 
         assert_eq!(ptrace_image_snapshot_if_owned(&ptrace_ctl, &image, 7), None);
-        ptrace_ctl.lock().tracer = Some(7);
+        let first = ptrace_ctl.lock().try_begin(7, 70, false, 0).unwrap();
         assert_eq!(ptrace_image_snapshot_if_owned(&ptrace_ctl, &image, 8), None);
         assert_eq!(
-            ptrace_image_snapshot_if_owned(&ptrace_ctl, &image, 7),
+            ptrace_image_snapshot_if_session(&ptrace_ctl, &image, first),
             Some(41)
+        );
+        assert_eq!(
+            ptrace_image_snapshot_if_owned(&ptrace_ctl, &image, 7),
+            Some((
+                PtraceSession {
+                    tracer: 7,
+                    tracer_kernel_tid: 70,
+                    generation: 1
+                },
+                41
+            ))
         );
 
         // A detached session cannot retain its earlier authorization. After
         // reattach, the same tracer PID observes only the newly bound image.
-        *ptrace_ctl.lock() = PtraceControlState::default();
+        assert!(ptrace_ctl.lock().clear_session(first));
         image.write().aspace = 42;
         assert_eq!(ptrace_image_snapshot_if_owned(&ptrace_ctl, &image, 7), None);
-        ptrace_ctl.lock().tracer = Some(7);
+        let second = ptrace_ctl.lock().try_begin(7, 70, false, 0).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            ptrace_image_snapshot_if_session(&ptrace_ctl, &image, first),
+            None
+        );
         assert_eq!(
             ptrace_image_snapshot_if_owned(&ptrace_ctl, &image, 7),
-            Some(42)
+            Some((
+                PtraceSession {
+                    tracer: 7,
+                    tracer_kernel_tid: 70,
+                    generation: 2
+                },
+                42
+            ))
         );
+    }
+
+    #[test]
+    fn process_access_ptrace_remote_image_requires_exact_inactive_session() {
+        let owner = UserNamespace::try_new_root().unwrap();
+        let state = ProcessAccessState::try_new(Dumpability::UserDumpable, owner).unwrap();
+        let image = spin::RwLock::new(ProcessImageBinding {
+            aspace: 41usize,
+            access_state: state,
+        });
+        let ptrace_ctl = SpinNoIrq::new(PtraceControlState::default());
+        let job_ctl = SpinNoIrq::new(JobControlState::default());
+
+        let first = ptrace_ctl.lock().try_begin(7, 70, false, 0).unwrap();
+        assert_eq!(
+            ptrace_inactive_image_snapshot_if_session(&ptrace_ctl, &job_ctl, &image, first),
+            None
+        );
+        {
+            let mut job = job_ctl.lock();
+            job.state = StopState::Stopped;
+            job.stop_kind = StopKind::Ptrace;
+            job.ptrace_session = Some(first);
+        }
+        assert_eq!(
+            ptrace_inactive_image_snapshot_if_session(&ptrace_ctl, &job_ctl, &image, first),
+            Some(41)
+        );
+
+        assert!(ptrace_ctl.lock().clear_session(first));
+        let second = ptrace_ctl.lock().try_begin(7, 70, false, 0).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            ptrace_inactive_image_snapshot_if_session(&ptrace_ctl, &job_ctl, &image, second),
+            None
+        );
+        job_ctl.lock().ptrace_session = Some(second);
+        assert_eq!(
+            ptrace_inactive_image_snapshot_if_session(&ptrace_ctl, &job_ctl, &image, second),
+            Some(41)
+        );
+    }
+
+    #[test]
+    fn process_access_ptrace_generation_exhaustion_never_wraps_or_saturates() {
+        let mut state = PtraceControlState {
+            generation: u64::MAX,
+            ..PtraceControlState::default()
+        };
+        assert_eq!(state.try_begin(7, 70, false, 0), None);
+        assert_eq!(state.active_session(), None);
+        assert_eq!(state.generation, u64::MAX);
+    }
+
+    #[test]
+    fn process_access_ptrace_reverse_link_abort_and_limit_roll_back() {
+        let links = SpinNoIrq::new(PtraceReverseLinks::default());
+        links.lock().try_reserve().unwrap();
+        let token = PreparedPtraceReverseLink {
+            owner: &links,
+            tracer: 7,
+            tracer_kernel_tid: 70,
+            node: Some(Box::new(PtraceReverseLinkNode {
+                tracee: 9,
+                session: PtraceSession {
+                    tracer: 0,
+                    tracer_kernel_tid: 0,
+                    generation: 0,
+                },
+                next: None,
+            })),
+            reserved: true,
+        };
+        drop(token);
+        assert_eq!(links.lock().reservations, 0);
+
+        links.lock().len = PTRACE_REVERSE_LINK_HARD_LIMIT;
+        assert_eq!(links.lock().try_reserve(), Err(AxError::NoMemory));
+        assert_eq!(links.lock().reservations, 0);
+
+        links.lock().len = 0;
+        links.lock().closed = true;
+        assert_eq!(links.lock().try_reserve(), Err(AxError::NoSuchProcess));
+        assert_eq!(links.lock().reservations, 0);
+    }
+
+    #[test]
+    fn process_access_ptrace_reverse_links_drain_exact_tracer_task() {
+        fn session(tracer_kernel_tid: u32, generation: u64) -> PtraceSession {
+            PtraceSession {
+                tracer: 7,
+                tracer_kernel_tid,
+                generation,
+            }
+        }
+
+        let links = SpinNoIrq::new(PtraceReverseLinks {
+            head: Some(Box::new(PtraceReverseLinkNode {
+                tracee: 11,
+                session: session(70, 1),
+                next: Some(Box::new(PtraceReverseLinkNode {
+                    tracee: 12,
+                    session: session(71, 2),
+                    next: Some(Box::new(PtraceReverseLinkNode {
+                        tracee: 13,
+                        session: session(70, 3),
+                        next: None,
+                    })),
+                })),
+            })),
+            len: 3,
+            reservations: 1,
+            closed: false,
+        });
+
+        let drained = links.lock().drain_task(70);
+        let drained: Vec<_> = PtraceReverseLinkDrain { next: drained }.collect();
+        assert_eq!(drained.len(), 2);
+        assert!(
+            drained
+                .iter()
+                .all(|link| link.session().tracer_kernel_tid == 70)
+        );
+
+        let links = links.lock();
+        assert_eq!(links.len, 1);
+        assert_eq!(links.reservations, 1);
+        assert!(!links.closed);
+        let retained = links.head.as_ref().unwrap();
+        assert_eq!(retained.tracee, 12);
+        assert_eq!(retained.session.tracer_kernel_tid, 71);
+        assert!(retained.next.is_none());
+    }
+
+    #[test]
+    fn process_access_ptrace_dual_lifecycle_order_is_total() {
+        assert!(ptrace_lifecycle_first_key(0x1000, 0x2000));
+        assert!(!ptrace_lifecycle_first_key(0x2000, 0x1000));
+        assert!(!ptrace_lifecycle_first_key(0x1000, 0x1000));
     }
 
     #[test]
@@ -2854,7 +3617,7 @@ mod tests {
             let old_seen = old_seen.clone();
             let new_ready = new_ready.clone();
             thread::spawn(move || {
-                let (cred, dumpability, _, aspace) =
+                let (cred, dumpability, _, aspace, _) =
                     snapshot_group_credential_image(&image, &group);
                 assert_eq!(
                     (cred.ids().euid, dumpability, aspace),
@@ -2862,7 +3625,7 @@ mod tests {
                 );
                 old_seen.wait();
                 new_ready.wait();
-                let (cred, dumpability, _, aspace) =
+                let (cred, dumpability, _, aspace, _) =
                     snapshot_group_credential_image(&image, &group);
                 assert_eq!(
                     (cred.ids().euid, dumpability, aspace),

@@ -1,3 +1,8 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use memory_addr::{MemoryAddr, VirtAddr, va_range};
 
 use crate::{MappingBackend, MappingError, MemoryArea, MemorySet};
@@ -12,6 +17,12 @@ struct MockBackend;
 
 #[derive(Clone)]
 struct MergeBackend;
+
+#[derive(Clone)]
+struct FailingProtectBackend {
+    calls: Arc<AtomicUsize>,
+    fail_at: usize,
+}
 
 type MockMemorySet = MemorySet<MockBackend>;
 type MergeMemorySet = MemorySet<MergeBackend>;
@@ -83,6 +94,34 @@ impl MappingBackend for MergeBackend {
 
     fn can_merge(&self, _other: &Self) -> bool {
         true
+    }
+}
+
+impl MappingBackend for FailingProtectBackend {
+    type Addr = VirtAddr;
+    type Flags = MockFlags;
+    type PageTable = MockPageTable;
+
+    fn map(&self, start: VirtAddr, size: usize, flags: MockFlags, pt: &mut MockPageTable) -> bool {
+        MockBackend.map(start, size, flags, pt)
+    }
+
+    fn unmap(&self, start: VirtAddr, size: usize, pt: &mut MockPageTable) -> bool {
+        MockBackend.unmap(start, size, pt)
+    }
+
+    fn protect(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        new_flags: MockFlags,
+        pt: &mut MockPageTable,
+    ) -> bool {
+        let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+        if call == self.fail_at {
+            return false;
+        }
+        MockBackend.protect(start, size, new_flags, pt)
     }
 }
 
@@ -353,6 +392,48 @@ fn test_protect() {
     for &e in &pt[0..MAX_ADDR] {
         assert_eq!(e, 0);
     }
+}
+
+#[test]
+fn protect_failure_rolls_back_page_table_and_preserves_area_tree() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend = FailingProtectBackend {
+        calls: calls.clone(),
+        fail_at: 2,
+    };
+    let mut set = MemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+
+    assert_ok!(set.map(
+        MemoryArea::new(0x1000.into(), 0x1000, 1, backend.clone()),
+        &mut pt,
+        false,
+    ));
+    assert_ok!(set.map(
+        MemoryArea::new(0x3000.into(), 0x1000, 2, backend),
+        &mut pt,
+        false,
+    ));
+
+    assert_err!(
+        set.protect(0x1800.into(), 0x2000, |_| Some(7), &mut pt),
+        BadState
+    );
+
+    let areas: Vec<_> = set
+        .iter()
+        .map(|area| (area.start(), area.end(), area.flags()))
+        .collect();
+    assert_eq!(
+        areas,
+        vec![
+            (VirtAddr::from(0x1000), VirtAddr::from(0x2000), 1),
+            (VirtAddr::from(0x3000), VirtAddr::from(0x4000), 2),
+        ]
+    );
+    assert!(pt[0x1000..0x2000].iter().all(|&flags| flags == 1));
+    assert!(pt[0x3000..0x4000].iter().all(|&flags| flags == 2));
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
 }
 
 #[test]

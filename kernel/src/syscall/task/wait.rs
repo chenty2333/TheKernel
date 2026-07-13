@@ -16,8 +16,8 @@ use crate::{
     pseudofs::cgroup,
     readiness::block_on_poll_set_interruptible_if,
     task::{
-        AsThread, Process, ProcessData, StopReport, TaskUsage, ZombieSnapshot, get_process_data,
-        has_pending_syscall_signal, process_domain,
+        AsThread, Process, ProcessData, PtraceSession, StopReport, TaskUsage, ZombieSnapshot,
+        get_process_data, has_pending_syscall_signal, process_domain,
     },
 };
 
@@ -76,6 +76,7 @@ impl WaitPid {
 struct WaitCandidate {
     process: Arc<Process>,
     allow_exit: bool,
+    expected_ptrace_session: Option<PtraceSession>,
 }
 
 #[derive(Clone)]
@@ -122,7 +123,7 @@ impl WaitEvent {
                 fill_siginfo(
                     *pid,
                     uid,
-                    if stop.traced {
+                    if stop.traced() {
                         CLD_TRAPPED
                     } else {
                         CLD_STOPPED
@@ -211,32 +212,38 @@ fn matching_wait_candidates(
             candidates.push(WaitCandidate {
                 process,
                 allow_exit: true,
+                expected_ptrace_session: None,
             });
         }
     }
 
-    for tracee_pid in tracees {
+    for reverse_link in tracees {
+        let tracee_pid = reverse_link.tracee();
         let Ok(tracee_data) = get_process_data(tracee_pid) else {
-            proc_data.remove_ptrace_tracee(tracee_pid);
+            proc_data.remove_ptrace_tracee(reverse_link);
             continue;
         };
-        if !tracee_data.is_traced_by(proc.pid()) {
-            proc_data.remove_ptrace_tracee(tracee_pid);
+        if tracee_data.ptrace_session_if_traced_by_process(proc.pid())
+            != Some(reverse_link.session())
+        {
+            proc_data.remove_ptrace_tracee(reverse_link);
             continue;
         }
         let tracee = &tracee_data.proc;
         if !pid.apply(tracee) {
             continue;
         }
-        if candidates
-            .iter()
-            .any(|candidate| candidate.process.pid() == tracee.pid())
+        if let Some(candidate) = candidates
+            .iter_mut()
+            .find(|candidate| candidate.process.pid() == tracee.pid())
         {
+            candidate.expected_ptrace_session = Some(reverse_link.session());
             continue;
         }
         candidates.push(WaitCandidate {
             process: tracee.clone(),
             allow_exit: false,
+            expected_ptrace_session: Some(reverse_link.session()),
         });
     }
 
@@ -272,9 +279,14 @@ fn pidfd_wait_candidate(
         return Err(AxError::from(LinuxError::ECHILD));
     }
 
+    let expected_ptrace_session = get_process_data(target.pid())
+        .ok()
+        .and_then(|target| target.ptrace_session_if_traced_by_process(proc.pid()));
+
     Ok(WaitCandidate {
         process: target,
         allow_exit: true,
+        expected_ptrace_session,
     })
 }
 
@@ -285,8 +297,9 @@ fn select_wait_event(
 ) -> Option<WaitEvent> {
     for candidate in candidates {
         if let Ok(proc_data) = get_process_data(candidate.process.pid())
-            && let Some(stop) = proc_data.peek_stop_status()
-            && (stop.traced || options.contains(WaitOptions::WUNTRACED))
+            && let Some(stop) = proc_data.peek_stop_status(candidate.expected_ptrace_session)
+            && wait_candidate_accepts_stop(candidate.expected_ptrace_session, stop)
+            && (stop.traced() || options.contains(WaitOptions::WUNTRACED))
         {
             return Some(WaitEvent::Stopped {
                 pid: candidate.process.pid(),
@@ -327,6 +340,14 @@ fn select_wait_event(
     }
 
     None
+}
+
+fn wait_candidate_accepts_stop(
+    expected_ptrace_session: Option<PtraceSession>,
+    stop: StopReport,
+) -> bool {
+    stop.ptrace_session
+        .is_none_or(|session| Some(session) == expected_ptrace_session)
 }
 
 fn write_waitpid_event(
@@ -413,7 +434,8 @@ pub fn sys_waitpid(
                 WaitEvent::Stopped {
                     stop, proc_data, ..
                 } => {
-                    let Some(claimed_stop) = proc_data.claim_stop_status() else {
+                    let Some(claimed_stop) = proc_data.claim_stop_status(stop.ptrace_session)
+                    else {
                         return Ok(None);
                     };
                     if claimed_stop != *stop {
@@ -582,7 +604,8 @@ pub fn sys_waitid(
                     WaitEvent::Stopped {
                         stop, proc_data, ..
                     } => {
-                        let Some(claimed_stop) = proc_data.claim_stop_status() else {
+                        let Some(claimed_stop) = proc_data.claim_stop_status(stop.ptrace_session)
+                        else {
                             return Ok(None);
                         };
                         if claimed_stop != *stop {
@@ -650,4 +673,42 @@ pub fn sys_waitid(
     )?;
     axtask::reclaim_exited_tasks_until_clear(POST_WAIT_RECLAIM_YIELDS);
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_candidate_accepts_stop;
+    use crate::task::{PtraceSession, StopReport};
+
+    #[test]
+    fn process_access_wait_candidate_does_not_cross_ptrace_generations() {
+        let old = PtraceSession {
+            tracer: 7,
+            tracer_kernel_tid: 70,
+            generation: 1,
+        };
+        let new = PtraceSession {
+            tracer: 7,
+            tracer_kernel_tid: 70,
+            generation: 2,
+        };
+        let old_stop = StopReport {
+            signal: 19,
+            ptrace_session: Some(old),
+        };
+        let new_stop = StopReport {
+            signal: 19,
+            ptrace_session: Some(new),
+        };
+        let job_control_stop = StopReport {
+            signal: 19,
+            ptrace_session: None,
+        };
+
+        assert!(wait_candidate_accepts_stop(Some(old), old_stop));
+        assert!(!wait_candidate_accepts_stop(Some(old), new_stop));
+        assert!(!wait_candidate_accepts_stop(None, old_stop));
+        assert!(wait_candidate_accepts_stop(None, job_control_stop));
+        assert!(wait_candidate_accepts_stop(Some(new), job_control_stop));
+    }
 }

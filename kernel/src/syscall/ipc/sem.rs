@@ -17,8 +17,8 @@ use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use super::{
     GETALL, GETNCNT, GETPID, GETVAL, GETZCNT, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID,
-    IPC_SET, IPC_STAT, IpcPerm, SEM_INFO, SEM_STAT, SEM_STAT_ANY, SETALL, SETVAL,
-    has_ipc_permission, next_ipc_id,
+    IPC_SET, IPC_STAT, IpcAccess, IpcAccessContext, IpcPerm, IpcPermissionUpdateRequest, SEM_INFO,
+    SEM_STAT, SEM_STAT_ANY, SETALL, SETVAL, next_ipc_id,
 };
 use crate::{
     task::{AsThread, ProcStateHint, has_pending_syscall_signal, with_proc_state_hint},
@@ -205,12 +205,12 @@ impl SemArray {
         self.semid_ds.sem_ctime = ipc_time_secs();
     }
 
-    fn readable(&self, uid: u32, gid: u32) -> bool {
-        has_ipc_permission(&self.semid_ds.sem_perm, uid, gid, false)
+    fn readable(&self, context: &IpcAccessContext) -> bool {
+        context.allows(&self.semid_ds.sem_perm, IpcAccess::Read)
     }
 
-    fn writable(&self, uid: u32, gid: u32) -> bool {
-        has_ipc_permission(&self.semid_ds.sem_perm, uid, gid, true)
+    fn writable(&self, context: &IpcAccessContext) -> bool {
+        context.allows(&self.semid_ds.sem_perm, IpcAccess::Write)
     }
 }
 
@@ -285,10 +285,6 @@ fn allocate_sem_id(manager: &SemManager) -> i32 {
             }
         }
     }
-}
-
-fn admin_ipc_permission(perm: &IpcPerm, uid: u32) -> bool {
-    uid == 0 || perm.uid == uid || perm.cuid == uid
 }
 
 pub(crate) fn semmni_limit() -> usize {
@@ -413,9 +409,9 @@ fn strip_ipc64(cmd: i32) -> i32 {
 
 pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
     let current = current();
-    let ids = current.as_thread().current_cred().ids();
-    let current_uid = ids.euid.into_raw();
-    let current_gid = ids.egid.into_raw();
+    let context = IpcAccessContext::for_initial_user_namespace(current.as_thread().current_cred());
+    let current_uid = context.effective_uid_raw();
+    let current_gid = context.effective_gid_raw();
     let create = (semflg & IPC_CREAT) != 0;
     let excl = (semflg & IPC_EXCL) != 0;
 
@@ -436,7 +432,7 @@ pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
         if nsems > 0 && nsems as usize > array.nsems() {
             return Err(AxError::from(LinuxError::EINVAL));
         }
-        if !array.readable(current_uid, current_gid) {
+        if !array.readable(&context) {
             return Err(AxError::from(LinuxError::EACCES));
         }
         return Ok(semid as isize);
@@ -470,9 +466,8 @@ pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
 
 pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isize> {
     let current_task = current();
-    let ids = current_task.as_thread().current_cred().ids();
-    let current_uid = ids.euid.into_raw();
-    let current_gid = ids.egid.into_raw();
+    let context =
+        IpcAccessContext::for_initial_user_namespace(current_task.as_thread().current_cred());
     let cmd = strip_ipc64(cmd);
 
     if cmd == IPC_INFO {
@@ -494,7 +489,7 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
         if array.removed {
             return Err(AxError::from(LinuxError::EINVAL));
         }
-        if cmd == SEM_STAT && !array.readable(current_uid, current_gid) {
+        if cmd == SEM_STAT && !array.readable(&context) {
             return Err(AxError::from(LinuxError::EACCES));
         }
         (arg as *mut SemidDs).vm_write(array.semid_ds)?;
@@ -507,6 +502,16 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
             .get_array_by_semid(semid)
             .ok_or(AxError::from(LinuxError::EINVAL))?
     };
+    let set_request: Option<IpcPermissionUpdateRequest> = if cmd == IPC_SET {
+        let user_ds = (arg as *const SemidDs).vm_read()?;
+        Some(context.map_permission_update(
+            user_ds.sem_perm.uid,
+            user_ds.sem_perm.gid,
+            user_ds.sem_perm.mode,
+        )?)
+    } else {
+        None
+    };
     let mut array = array.lock();
     if array.removed {
         return Err(AxError::from(LinuxError::EINVAL));
@@ -514,26 +519,23 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
 
     match cmd {
         IPC_STAT => {
-            if !array.readable(current_uid, current_gid) {
+            if !array.readable(&context) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
             (arg as *mut SemidDs).vm_write(array.semid_ds)?;
             Ok(0)
         }
         IPC_SET => {
-            if !admin_ipc_permission(&array.semid_ds.sem_perm, current_uid) {
-                return Err(AxError::from(LinuxError::EPERM));
-            }
-            let user_ds = (arg as *const SemidDs).vm_read()?;
-            array.semid_ds.sem_perm.uid = user_ds.sem_perm.uid;
-            array.semid_ds.sem_perm.gid = user_ds.sem_perm.gid;
-            array.semid_ds.sem_perm.mode = (array.semid_ds.sem_perm.mode & !IPC_MODE_MASK)
-                | (user_ds.sem_perm.mode & IPC_MODE_MASK);
+            let prepared = context.prepare_permission_update(
+                &array.semid_ds.sem_perm,
+                set_request.expect("IPC_SET request was prepared before locking"),
+            )?;
+            prepared.commit(&mut array.semid_ds.sem_perm);
             array.mark_changed();
             Ok(0)
         }
         IPC_RMID => {
-            if !admin_ipc_permission(&array.semid_ds.sem_perm, current_uid) {
+            if !context.may_control(&array.semid_ds.sem_perm) {
                 return Err(AxError::from(LinuxError::EPERM));
             }
             array.removed = true;
@@ -545,35 +547,35 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
             Ok(0)
         }
         GETVAL => {
-            if !array.readable(current_uid, current_gid) {
+            if !array.readable(&context) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
             let index = validate_semnum(&array, semnum)?;
             Ok(array.sems[index].value as isize)
         }
         GETPID => {
-            if !array.readable(current_uid, current_gid) {
+            if !array.readable(&context) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
             let index = validate_semnum(&array, semnum)?;
             Ok(array.sems[index].pid as isize)
         }
         GETNCNT => {
-            if !array.readable(current_uid, current_gid) {
+            if !array.readable(&context) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
             let index = validate_semnum(&array, semnum)?;
             Ok(array.sems[index].ncnt as isize)
         }
         GETZCNT => {
-            if !array.readable(current_uid, current_gid) {
+            if !array.readable(&context) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
             let index = validate_semnum(&array, semnum)?;
             Ok(array.sems[index].zcnt as isize)
         }
         GETALL => {
-            if !array.readable(current_uid, current_gid) {
+            if !array.readable(&context) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
             let values = array.sems.iter().map(|sem| sem.value).collect::<Vec<_>>();
@@ -582,7 +584,7 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
             Ok(0)
         }
         SETVAL => {
-            if !array.writable(current_uid, current_gid) {
+            if !array.writable(&context) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
             let value = arg as c_int;
@@ -600,7 +602,7 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> AxResult<isi
             Ok(0)
         }
         SETALL => {
-            if !array.writable(current_uid, current_gid) {
+            if !array.writable(&context) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
             let values = copy_sem_values_from_user(arg, array.nsems())?;
@@ -885,9 +887,7 @@ pub fn sys_semtimedop(
     let ops = vm_load(sops, nsops)?;
     let current = current();
     let proc_data = &current.as_thread().proc_data;
-    let ids = current.as_thread().current_cred().ids();
-    let current_uid = ids.euid.into_raw();
-    let current_gid = ids.egid.into_raw();
+    let context = IpcAccessContext::for_initial_user_namespace(current.as_thread().current_cred());
     let current_pid = proc_data.proc.pid() as __kernel_pid_t;
     let needs_write = ops.iter().any(|op| op.sem_op != 0);
 
@@ -907,9 +907,9 @@ pub fn sys_semtimedop(
                 return Err(AxError::from(LinuxError::EIDRM));
             }
             let has_permission = if needs_write {
-                array.writable(current_uid, current_gid)
+                array.writable(&context)
             } else {
-                array.readable(current_uid, current_gid)
+                array.readable(&context)
             };
             if !has_permission {
                 return Err(AxError::from(LinuxError::EACCES));

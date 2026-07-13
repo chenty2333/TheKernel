@@ -228,6 +228,13 @@ pub struct File {
     nonblock: AtomicBool,
 }
 
+fn killpriv_before_content_write(loc: &Location, requested: usize) -> AxResult<()> {
+    if requested == 0 {
+        return Ok(());
+    }
+    crate::pseudofs::tmp::kill_file_capability(loc)
+}
+
 impl File {
     pub fn new(inner: axfs::File) -> Self {
         Self {
@@ -238,6 +245,13 @@ impl File {
 
     pub fn inner(&self) -> &axfs::File {
         &self.inner
+    }
+
+    /// Revokes tmpfs file capabilities before a real content mutation. The
+    /// open-file-description's write admission keeps setcap excluded from this
+    /// point until the cached mutation has completed or the writer is closed.
+    pub(crate) fn killpriv_for_content_mutation(&self) -> AxResult<()> {
+        killpriv_before_content_write(self.inner.location(), 1)
     }
 
     fn is_blocking(&self) -> bool {
@@ -293,6 +307,7 @@ impl FileLike for File {
         }
 
         if let Some(buf) = limited {
+            killpriv_before_content_write(inner.location(), buf.len())?;
             let mut cursor = Cursor::new(buf.as_slice());
             if likely(self.is_blocking()) {
                 inner.write(&mut cursor)
@@ -301,12 +316,15 @@ impl FileLike for File {
                     inner.write(&mut cursor)
                 })
             }
-        } else if likely(self.is_blocking()) {
-            inner.write(src)
         } else {
-            block_on_poll_io(self, IoEvents::WRITABLE, self.nonblocking(), || {
-                inner.write(&mut *src)
-            })
+            killpriv_before_content_write(inner.location(), len)?;
+            if likely(self.is_blocking()) {
+                inner.write(src)
+            } else {
+                block_on_poll_io(self, IoEvents::WRITABLE, self.nonblocking(), || {
+                    inner.write(&mut *src)
+                })
+            }
         }
     }
 
@@ -432,5 +450,44 @@ impl Pollable for Directory {
         _events: IoEvents,
     ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
         axpoll::PollRegistration::empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use axfs_ng_vfs::{Mountpoint, NodePermission, NodeType};
+
+    use super::*;
+    use crate::pseudofs::tmp;
+
+    #[test]
+    fn cached_write_hook_kills_capability_before_mutation_but_empty_write_does_not() {
+        let fs = tmp::MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let loc = mount
+            .root_location()
+            .create(
+                "cached-killpriv",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o755),
+            )
+            .unwrap();
+        loc.entry()
+            .as_file()
+            .unwrap()
+            .write_at(b"original", 0)
+            .unwrap();
+        let xattrs = tmp::xattr_store(&loc).unwrap();
+
+        xattrs
+            .lock()
+            .insert("security.capability".into(), vec![1, 2, 3]);
+        killpriv_before_content_write(&loc, 0).unwrap();
+        assert!(xattrs.lock().contains_key("security.capability"));
+
+        killpriv_before_content_write(&loc, b"attacker".len()).unwrap();
+        assert!(!xattrs.lock().contains_key("security.capability"));
     }
 }

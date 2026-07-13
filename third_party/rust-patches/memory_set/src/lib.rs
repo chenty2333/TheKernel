@@ -10,15 +10,15 @@ mod set;
 #[cfg(test)]
 mod tests;
 
-pub use self::area::MemoryArea;
-pub use self::backend::MappingBackend;
-pub use self::set::MemorySet;
+pub use self::{area::MemoryArea, backend::MappingBackend, set::MemorySet};
 
 /// Error type for memory mapping operations.
 #[derive(Debug, Eq, PartialEq)]
 pub enum MappingError {
     /// Invalid parameter (e.g., `addr`, `size`, `flags`, etc.)
     InvalidParam,
+    /// Metadata staging could not reserve the required memory.
+    NoMemory,
     /// The given range overlaps with an existing mapping.
     AlreadyExists,
     /// The backend page table is in a bad state.
@@ -30,6 +30,7 @@ impl From<MappingError> for axerrno::AxError {
     fn from(err: MappingError) -> Self {
         match err {
             MappingError::InvalidParam => axerrno::AxError::InvalidInput,
+            MappingError::NoMemory => axerrno::AxError::NoMemory,
             MappingError::AlreadyExists => axerrno::AxError::AlreadyExists,
             MappingError::BadState => axerrno::AxError::BadState,
         }

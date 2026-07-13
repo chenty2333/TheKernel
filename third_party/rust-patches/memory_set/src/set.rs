@@ -10,6 +10,15 @@ use memory_addr::{AddrRange, MemoryAddr};
 
 use crate::{MappingBackend, MappingError, MappingResult, MemoryArea};
 
+struct ProtectAction<A, F> {
+    area_start: A,
+    start: A,
+    end: A,
+    old_end: A,
+    old_flags: F,
+    new_flags: F,
+}
+
 /// A container that maintains memory mappings ([`MemoryArea`]).
 pub struct MemorySet<B: MappingBackend> {
     areas: BTreeMap<B::Addr, MemoryArea<B>>,
@@ -335,59 +344,124 @@ impl<B: MappingBackend> MemorySet<B> {
         page_table: &mut B::PageTable,
     ) -> MappingResult {
         let end = start.checked_add(size).ok_or(MappingError::InvalidParam)?;
-        let mut to_insert = Vec::new();
-        for (&area_start, area) in self.areas.iter_mut() {
+        if start == end {
+            return Ok(());
+        }
+        let mut actions = Vec::new();
+
+        // Include the one area that may start before the requested range, then
+        // walk only the overlapping suffix instead of cloning the whole set.
+        let first_start = self
+            .areas
+            .range(..=start)
+            .next_back()
+            .filter(|(_, area)| area.end() > start)
+            .map(|(&area_start, _)| area_start)
+            .unwrap_or(start);
+        for (&area_start, area) in self.areas.range(first_start..end) {
             let area_end = area.end();
-
-            if let Some(new_flags) = update_flags(area.flags()) {
-                if area_start >= end {
-                    // [ prot ]
-                    //          [ area ]
-                    break;
-                } else if area_end <= start {
-                    //          [ prot ]
-                    // [ area ]
-                    // Do nothing
-                } else if area_start >= start && area_end <= end {
-                    // [   prot   ]
-                    //   [ area ]
-                    area.protect_area(new_flags, page_table)?;
-                    area.set_flags(new_flags);
-                } else if area_start < start && area_end > end {
-                    //        [ prot ]
-                    // [ left | area | right ]
-                    let right_part = area.split(end).unwrap();
-                    area.set_end(start);
-
-                    let mut middle_part =
-                        MemoryArea::new(start, size, area.flags(), area.backend().clone());
-                    middle_part.protect_area(new_flags, page_table)?;
-                    middle_part.set_flags(new_flags);
-
-                    to_insert.push((right_part.start(), right_part));
-                    to_insert.push((middle_part.start(), middle_part));
-                } else if area_end > end {
-                    // [    prot ]
-                    //   [  area | right ]
-                    let right_part = area.split(end).unwrap();
-                    area.protect_area(new_flags, page_table)?;
-                    area.set_flags(new_flags);
-
-                    to_insert.push((right_part.start(), right_part));
-                } else {
-                    //        [ prot    ]
-                    // [ left |  area ]
-                    let mut right_part = area.split(start).unwrap();
-                    right_part.protect_area(new_flags, page_table)?;
-                    right_part.set_flags(new_flags);
-
-                    to_insert.push((right_part.start(), right_part));
-                }
+            if area_end > start {
+                let Some(new_flags) = update_flags(area.flags()) else {
+                    continue;
+                };
+                actions.try_reserve(1).map_err(|_| MappingError::NoMemory)?;
+                actions.push(ProtectAction {
+                    area_start,
+                    start: area_start.max(start),
+                    end: area_end.min(end),
+                    old_end: area_end,
+                    old_flags: area.flags(),
+                    new_flags,
+                });
             }
         }
-        self.areas.extend(to_insert);
-        self.merge_adjacent_at(start);
-        self.merge_adjacent_at(end);
+
+        // Pre-split only affected areas. Every BTreeMap insertion (and thus
+        // every infallible node allocation imposed by alloc::BTreeMap) occurs
+        // before the first backend/PTE mutation. The original node at
+        // `area_start` is retained as an in-place rollback anchor.
+        for action in &actions {
+            let has_left = action.area_start < action.start;
+            let has_right = action.end < action.old_end;
+            let (middle_backend, right_backend) = {
+                let area = self.areas.get(&action.area_start).unwrap();
+                (
+                    has_left.then(|| area.backend().clone()),
+                    has_right.then(|| area.backend().clone()),
+                )
+            };
+            self.areas
+                .get_mut(&action.area_start)
+                .unwrap()
+                .set_end(if has_left { action.start } else { action.end });
+
+            if let Some(backend) = middle_backend {
+                let middle = MemoryArea::new(
+                    action.start,
+                    action.end.sub_addr(action.start),
+                    action.new_flags,
+                    backend,
+                );
+                assert!(self.areas.insert(middle.start(), middle).is_none());
+            }
+            if let Some(backend) = right_backend {
+                let right = MemoryArea::new(
+                    action.end,
+                    action.old_end.sub_addr(action.end),
+                    action.old_flags,
+                    backend,
+                );
+                assert!(self.areas.insert(right.start(), right).is_none());
+            }
+        }
+
+        for (index, action) in actions.iter().enumerate() {
+            let backend = self.areas.get(&action.start).unwrap().backend();
+            if !backend.protect(
+                action.start,
+                action.end.sub_addr(action.start),
+                action.new_flags,
+                page_table,
+            ) {
+                // A backend may have changed a prefix before reporting
+                // failure. Best-effort rollback includes the failing action;
+                // stateful backends can retain a fail-closed lease if their
+                // own rollback cannot prove that write access is gone.
+                for rollback in actions[..=index].iter().rev() {
+                    let backend = self.areas.get(&rollback.start).unwrap().backend();
+                    let _ = backend.protect(
+                        rollback.start,
+                        rollback.end.sub_addr(rollback.start),
+                        rollback.old_flags,
+                        page_table,
+                    );
+                }
+                for staged in actions.iter().rev() {
+                    if staged.area_start < staged.start {
+                        drop(self.areas.remove(&staged.start).unwrap());
+                    }
+                    if staged.end < staged.old_end {
+                        drop(self.areas.remove(&staged.end).unwrap());
+                    }
+                    self.areas
+                        .get_mut(&staged.area_start)
+                        .unwrap()
+                        .set_end(staged.old_end);
+                }
+                return Err(MappingError::BadState);
+            }
+        }
+
+        for action in &actions {
+            self.areas
+                .get_mut(&action.start)
+                .unwrap()
+                .set_flags(action.new_flags);
+        }
+        for action in actions {
+            self.merge_adjacent_at(action.start);
+            self.merge_adjacent_at(action.end);
+        }
         Ok(())
     }
 }

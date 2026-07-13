@@ -8,8 +8,8 @@ use axtask::{
     future::{self, block_on},
 };
 use linux_raw_sys::general::{
-    CAP_KILL, MINSIGSTKSZ, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SS_DISABLE,
-    SS_ONSTACK, siginfo, timespec,
+    MINSIGSTKSZ, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SS_DISABLE, SS_ONSTACK,
+    siginfo, timespec,
 };
 use starry_process::Pid;
 use starry_signal::{
@@ -24,7 +24,7 @@ use crate::{
         get_process_group, get_process_including_zombie, get_visible_task, process_domain,
         process_error, send_queued_signal_to_process_data, send_queued_signal_to_visible_thread,
         send_signal_to_process, send_signal_to_process_data, send_signal_to_visible_thread,
-        try_processes,
+        signal_credential_allows, try_processes,
     },
     time::TimeValueLike,
 };
@@ -168,13 +168,8 @@ fn check_zombie_signal_permission(pid: Pid, signal: Option<Signo>) -> AxResult<b
     let actor_thread = actor.as_thread();
     let actor_proc = &actor_thread.proc_data;
     let actor_cred = actor_thread.current_cred();
-    let actor_ids = actor_cred.ids();
     let snapshot = process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
-    let target_ids = snapshot.credential.ids();
-    let allowed = [actor_ids.ruid, actor_ids.euid]
-        .into_iter()
-        .any(|id| id == target_ids.ruid)
-        || actor_cred.has_effective_capability(CAP_KILL)
+    let allowed = signal_credential_allows(&actor_cred, &snapshot.credential)
         || (signal == Some(Signo::SIGCONT)
             && actor_proc.proc.group().session().sid() == process.group().session().sid());
     if allowed {

@@ -61,7 +61,7 @@ impl<B: MappingBackend> MemoryArea<B> {
 }
 
 impl<B: MappingBackend> MemoryArea<B> {
-    /// Changes the flags.
+    /// Changes the flags after the backend has committed the protection.
     pub(crate) fn set_flags(&mut self, new_flags: B::Flags) {
         self.flags = new_flags;
     }
@@ -83,18 +83,6 @@ impl<B: MappingBackend> MemoryArea<B> {
     pub(crate) fn unmap_area(&self, page_table: &mut B::PageTable) -> MappingResult {
         self.backend
             .unmap(self.start(), self.size(), page_table)
-            .then_some(())
-            .ok_or(MappingError::BadState)
-    }
-
-    /// Changes the flags in the page table.
-    pub(crate) fn protect_area(
-        &mut self,
-        new_flags: B::Flags,
-        page_table: &mut B::PageTable,
-    ) -> MappingResult {
-        self.backend
-            .protect(self.start(), self.size(), new_flags, page_table)
             .then_some(())
             .ok_or(MappingError::BadState)
     }

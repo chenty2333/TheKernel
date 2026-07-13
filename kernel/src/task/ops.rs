@@ -23,11 +23,12 @@ use starry_signal::{SignalActionFlags, SignalDisposition, SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use super::{
-    AsThread, CommittedProcessExit, ExecImageRetirement, FutexKey, ITimerType, ProcStateHint,
-    Process, ProcessAccessState, ProcessData, ProcessGroup, Session, TaskUsage, Thread,
-    ThreadExitTransition, TimerState, creds::PreparedCred, futex_table_for, process_domain,
-    send_signal_thread_inner, send_signal_to_process, send_signal_to_thread,
-    user::linux_pid_from_task_id,
+    AsThread, CommittedProcessExit, ExecImageRetirement, FutexKey, ITimerType,
+    PreparedExecCredential, ProcStateHint, Process, ProcessAccessState, ProcessData, ProcessGroup,
+    ProcessReparentBatch, Session, TaskParentNode, TaskUsage, Thread, ThreadExitTransition,
+    TimerState, futex_table_for, lock_task_parent_publication, process_domain,
+    send_signal_thread_inner, send_signal_to_process, send_signal_to_process_data,
+    send_signal_to_thread, user::linux_pid_from_task_id,
 };
 use crate::{
     mm::{AddrSpace, UserPtr, access_user_memory},
@@ -444,7 +445,7 @@ impl TaskAliasAdmission {
         proc_data: &ProcessData,
         owner: Pid,
         thread: &Thread,
-        prepared: Option<PreparedCred<'a>>,
+        prepared: PreparedExecCredential<'a>,
         new_aspace: Arc<Mutex<AddrSpace>>,
         new_access_state: Arc<ProcessAccessState>,
     ) -> ExecImageRetirement<'a> {
@@ -470,7 +471,7 @@ pub(crate) fn commit_exec_identity_handoff<'a>(
     proc_data: &ProcessData,
     owner: Pid,
     thread: &Thread,
-    prepared: Option<PreparedCred<'a>>,
+    prepared: PreparedExecCredential<'a>,
     new_aspace: Arc<Mutex<AddrSpace>>,
     new_access_state: Arc<ProcessAccessState>,
 ) -> ExecImageRetirement<'a> {
@@ -749,18 +750,31 @@ pub fn vm_write_in_aspace<T: Copy>(
 
 fn detach_ptrace_links_on_process_exit(proc_data: &ProcessData) {
     let pid = proc_data.proc.pid();
-    if let Some(tracer) = proc_data.clear_ptrace()
-        && let Ok(tracer_data) = get_process_data(tracer)
+    let traced_session = {
+        let _ptrace_action = proc_data.lock_ptrace_actions();
+        proc_data.clear_ptrace()
+    };
+    if let Some(session) = traced_session
+        && let Ok(tracer_data) = get_process_data(session.tracer)
     {
-        tracer_data.remove_ptrace_tracee(pid);
+        tracer_data.remove_ptrace_tracee(super::PtraceReverseLink::new(pid, session));
     }
 
-    for tracee in proc_data.clear_ptrace_tracees() {
-        let Ok(tracee_data) = get_process_data(tracee) else {
+    detach_ptrace_reverse_links(proc_data.clear_ptrace_tracees());
+}
+
+fn detach_ptrace_reverse_links(links: super::process::PtraceReverseLinkDrain) {
+    for link in links {
+        let Ok(tracee_data) = get_process_data(link.tracee()) else {
             continue;
         };
-        tracee_data.end_ptrace(pid);
+        let _ptrace_action = tracee_data.lock_ptrace_actions();
+        tracee_data.end_ptrace(link.session());
     }
+}
+
+fn detach_ptrace_links_on_thread_exit(proc_data: &ProcessData, tracer_kernel_tid: Pid) {
+    detach_ptrace_reverse_links(proc_data.clear_ptrace_tracees_for_task(tracer_kernel_tid));
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -993,16 +1007,19 @@ fn process_lifecycle_error(error: ProcessError) -> AxError {
 fn publish_final_process_exit(
     proc_data: &ProcessData,
     process: &Arc<Process>,
+    departing: &Thread,
+    task_parent_publication: &super::TaskParentPublicationGuard<'_>,
     exit: super::process::PreparedZombieExit,
     self_usage: TaskUsage,
     child_usage: TaskUsage,
 ) -> CommittedProcessExit {
-    exit.commit(
+    exit.commit_with_reparent_handoff(
         process.exit_code(),
         self_usage.into(),
         child_usage.into(),
         proc_data.group_leader_cred(),
         |child| notify_reaper_of_inherited_zombie(&child),
+        |batch| reparent_exact_children_from_core_batch(departing, task_parent_publication, batch),
     )
 }
 
@@ -1018,6 +1035,89 @@ fn remove_current_thread(
     process_domain()?
         .exit_thread(process, tid, exit_code)
         .map_err(process_lifecycle_error)
+}
+
+fn exact_parent_thread_in_process(
+    process: &Arc<Process>,
+    departing_kernel_tid: Option<Pid>,
+) -> Option<Arc<TaskParentNode>> {
+    if !process.is_live() {
+        return None;
+    }
+    for tid in process.thread_ids() {
+        if departing_kernel_tid == Some(tid) {
+            continue;
+        }
+        let Ok(task) = get_task(tid) else {
+            continue;
+        };
+        let Some(thread) = task.try_as_thread() else {
+            continue;
+        };
+        if thread.kernel_tid() == tid && Arc::ptr_eq(&thread.proc_data.proc, process) {
+            return Some(thread.task_parent_node().clone());
+        }
+    }
+    None
+}
+
+fn exact_parent_init_reaper(departing_kernel_tid: Option<Pid>) -> Option<Arc<TaskParentNode>> {
+    let init = process_domain().ok()?.init_process()?;
+    exact_parent_thread_in_process(&init, departing_kernel_tid)
+}
+
+fn reparent_exact_children_from_core_batch(
+    departing: &Thread,
+    publication: &super::TaskParentPublicationGuard<'_>,
+    batch: &ProcessReparentBatch,
+) {
+    let reaper = exact_parent_thread_in_process(batch.reaper(), Some(departing.kernel_tid()))
+        .expect("core-selected process reaper has no exact live task endpoint");
+
+    for moved in batch.reparented() {
+        let authoritative_parent = moved
+            .child()
+            .parent()
+            .expect("core-reparented child has no authoritative parent");
+        assert!(
+            Arc::ptr_eq(&authoritative_parent, batch.reaper()),
+            "core child parent changed while exact-parent publication was gated"
+        );
+        drop(authoritative_parent);
+    }
+
+    departing.reparent_task_parent_children_matching(
+        publication,
+        &reaper,
+        |child| {
+            let Some(child_data) = child.process_data() else {
+                return false;
+            };
+            batch
+                .reparented()
+                .any(|moved| Arc::ptr_eq(&child_data.proc, moved.child()))
+        },
+        deliver_exact_parent_death,
+    );
+}
+
+fn deliver_exact_parent_death(child: Arc<TaskParentNode>, raw_signo: u32) {
+    let Ok(raw_signo) = u8::try_from(raw_signo) else {
+        return;
+    };
+    let Some(signo) = Signo::from_repr(raw_signo) else {
+        return;
+    };
+    let Some(proc_data) = child.process_data() else {
+        return;
+    };
+    // Linux v6.6 `forget_original_parent()` reads the task-local
+    // `pdeath_signal` from this exact child, then uses
+    // `group_send_sig_info(..., PIDTYPE_TGID)`. Retain the ABA-safe
+    // ProcessData resolved through that child and perform the same
+    // process-directed delivery without a second numeric-PID lookup.
+    // https://elixir.bootlin.com/linux/v6.6/source/kernel/exit.c#L675
+    let _ = send_signal_to_process_data(&proc_data, Some(SignalInfo::new_kernel(signo)));
 }
 
 pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
@@ -1046,6 +1146,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         }
     }
     let lifecycle = thr.proc_data.lock_process_lifecycle();
+    let mut task_parent_publication = Some(lock_task_parent_publication());
     let final_exit = match remove_current_thread(process, tid, exit_code) {
         Ok(ThreadExitTransition::NotFound) => {
             error!(
@@ -1053,6 +1154,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
                 tid,
                 process.pid()
             );
+            drop(task_parent_publication.take());
             drop(lifecycle);
             return Err(AxError::BadState);
         }
@@ -1065,6 +1167,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
                 process.pid(),
                 error
             );
+            drop(task_parent_publication.take());
             drop(lifecycle);
             return Err(error);
         }
@@ -1076,6 +1179,41 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     let final_exit = final_exit
         .map(|exit| thr.proc_data.prepare_zombie_exit(exit))
         .transpose()?;
+    if final_exit.is_some() {
+        // The final core admission plus this ProcessData lifecycle guard now
+        // exclude every new fork/thread publication. The exact node and its
+        // Weak<ProcessData> endpoint remain discoverable from its parent's
+        // intrusive child list while lengthy teardown runs without the global
+        // graph gate. Reacquire the gate for core commit, batch handoff, and
+        // exact-node retirement below.
+        drop(task_parent_publication.take());
+    }
+
+    // ptrace ownership is task-exact even though reverse-link storage is
+    // process-owned. Remove and detach every relationship created by this
+    // immutable kernel TID before a non-final thread can disappear. The
+    // partition is allocation-free and all tracee work happens after its spin
+    // lock has been released.
+    detach_ptrace_links_on_thread_exit(&thr.proc_data, thr.kernel_tid());
+
+    // A non-final task death is independent of process liveness: notify its
+    // exact children now and move them to a live sibling. Process lifecycle
+    // serialization keeps the sibling live through this section; init is an
+    // explicit defensive fallback. Final-process reparenting is deferred until
+    // the process domain performs its authoritative subreaper/init transition.
+    if final_exit.is_none() {
+        let sibling_reaper = exact_parent_thread_in_process(process, Some(thr.kernel_tid()));
+        let init_reaper = exact_parent_init_reaper(Some(thr.kernel_tid()));
+        thr.exit_task_parent(
+            task_parent_publication
+                .as_ref()
+                .expect("task-parent publication guard is retained through exact exit"),
+            sibling_reaper,
+            init_reaper,
+            deliver_exact_parent_death,
+        );
+        drop(task_parent_publication.take());
+    }
 
     let clear_child_tid = thr.clear_child_tid() as *mut u32;
     let aspace = thr.proc_data.aspace();
@@ -1131,9 +1269,25 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         crate::file::inotify::wait_current_close_notifications();
         detach_ptrace_links_on_process_exit(&thr.proc_data);
         crate::syscall::clear_proc_shm(process.pid());
-        let committed =
-            publish_final_process_exit(&thr.proc_data, process, exit, self_usage, child_usage);
+        task_parent_publication = Some(lock_task_parent_publication());
+        let task_parent_guard = task_parent_publication
+            .as_ref()
+            .expect("final exit retains the task-parent publication guard");
+        let committed = publish_final_process_exit(
+            &thr.proc_data,
+            process,
+            thr,
+            task_parent_guard,
+            exit,
+            self_usage,
+            child_usage,
+        );
         debug_assert_eq!(committed.outcome(), ExitOutcome::BecameZombie);
+        assert!(
+            thr.finish_task_parent_exit(task_parent_guard),
+            "authoritative process reparent handoff left exact children behind"
+        );
+        drop(task_parent_publication.take());
         remove_process_runtime(&thr.proc_data);
 
         let parent = committed.notification_parent().cloned();

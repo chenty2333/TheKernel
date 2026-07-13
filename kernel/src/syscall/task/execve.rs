@@ -19,16 +19,17 @@ use crate::task::reset_current_user_fpu_state;
 use crate::{
     config::USER_HEAP_BASE,
     file::{
-        FD_TABLE, ResolveAtResult, executable, fanotify, replace_process_fd_table,
-        resolve_at_with_credentials,
+        FD_TABLE, ResolveAtResult, fanotify, replace_process_fd_table, resolve_at_with_credentials,
     },
     mm::{
-        ExecImageAccess, copy_from_kernel, load_user_app_at, new_user_aspace_empty, vm_load_string,
+        ExecImageAccess, copy_from_kernel, finish_prepared_user_app, new_user_aspace_empty,
+        prepare_user_app_at, vm_load_string,
     },
     readiness::block_on_poll_set,
     task::{
-        AsThread, Cred, DacCredentialView, Dumpability, ProcessAccessState, ProcessData, Thread,
-        check_signals, commit_exec_identity_handoff, get_task, has_pending_fatal_signal,
+        AsThread, DacCredentialView, ExecCredentialRequest, FileCapabilities, Kgid, Kuid,
+        ProcessAccessState, ProcessData, Thread, UserNamespace, check_signals,
+        commit_exec_identity_handoff, fail_closed_exit, get_task, has_pending_fatal_signal,
         linux_pid_from_task_id, notify_ptrace_attach_stop, prepare_task_alias_admission,
         process_error, set_current_user_page_table_root,
     },
@@ -46,18 +47,67 @@ fn files_preparation_covers_thread_snapshot(has_private_table: bool, threads: &[
     has_private_table || threads.len() <= 1
 }
 
-fn exec_dumpability(credential: &Cred, image_access: ExecImageAccess) -> Dumpability {
-    let ids = credential.ids();
-    if image_access.allows_user_dumpable()
-        && ids.ruid == ids.euid
-        && ids.rgid == ids.egid
-        && ids.fsuid == ids.euid
-        && ids.fsgid == ids.egid
-    {
-        Dumpability::UserDumpable
-    } else {
-        Dumpability::NotDumpable
+fn requested_setid_transition(
+    mode: u16,
+    file_uid: Option<Kuid>,
+    file_gid: Option<Kgid>,
+) -> (bool, bool) {
+    // Linux bprm_fill_uid() ignores both bits when either inode ID cannot be
+    // represented, and S_ISGID additionally requires group execute.
+    let ids_mapped = file_uid.is_some() && file_gid.is_some();
+    (
+        ids_mapped && mode & 0o4000 != 0,
+        ids_mapped && mode & 0o2010 == 0o2010,
+    )
+}
+
+fn exec_file_capabilities(
+    nosuid: bool,
+    read: impl FnOnce() -> AxResult<Option<FileCapabilities>>,
+) -> AxResult<Option<FileCapabilities>> {
+    if nosuid { Ok(None) } else { read() }
+}
+
+fn exec_mm_owner_user_ns(
+    proposed_user_ns: &Arc<UserNamespace>,
+    image_access: ExecImageAccess,
+) -> Arc<UserNamespace> {
+    if !image_access.executable_unreadable() {
+        return proposed_user_ns.clone();
     }
+
+    // Linux would_dump() raises mm->user_ns to an ancestor able to dominate
+    // the unreadable inode. Filesystems here have neither superblock user_ns
+    // nor idmapped mounts, so their conservative owner is the initial user ns.
+    let mut owner = proposed_user_ns.clone();
+    while let Some(parent) = owner.parent() {
+        owner = parent;
+    }
+    owner
+}
+
+fn exact_exec_thread_snapshot<I>(snapshot: &[Pid], current_count: usize, current: I) -> bool
+where
+    I: Iterator<Item = Pid>,
+{
+    current_count == snapshot.len() && current.eq(snapshot.iter().copied())
+}
+
+fn ptrace_suppresses_exec_privilege(proc_data: &ProcessData) -> bool {
+    // Linux binds ptracer_cred at attach time. The current ptrace session does
+    // not retain that immutable actor credential yet, so consulting the
+    // tracer's mutable current credential could incorrectly grant privilege
+    // after attach. Suppress every active session until ptracer_cred is part
+    // of the relationship token.
+    proc_data.ptrace_tracer().is_some()
+}
+
+fn prepared_ptrace_facts_stale(
+    gains_file_privilege: bool,
+    was_suppressed: bool,
+    suppresses_now: bool,
+) -> bool {
+    gains_file_privilege && !was_suppressed && suppresses_now
 }
 
 fn reset_exec_signal_state(thr: &Thread) {
@@ -233,19 +283,6 @@ fn load_exec_args_env(
     Ok((args, envs))
 }
 
-fn exec_or_release<T>(
-    executable_key: Option<executable::ExecutableKey>,
-    result: AxResult<T>,
-) -> AxResult<T> {
-    match result {
-        Ok(value) => Ok(value),
-        Err(err) => {
-            executable::release(executable_key);
-            Err(err)
-        }
-    }
-}
-
 fn do_execve(
     uctx: &mut UserContext,
     loc: axfs_ng_vfs::Location,
@@ -255,7 +292,6 @@ fn do_execve(
 ) -> AxResult<isize> {
     let curr = current();
     let curr_tid = linux_pid_from_task_id(curr.id().as_u64())?;
-    executable::check_not_write_open(&loc)?;
     fanotify::permission_check(
         &loc,
         &loc,
@@ -270,20 +306,68 @@ fn do_execve(
         try_copy_string(absolute_path.as_str())
     }?;
     let task_name = try_copy_string(loc.name())?;
-    let executable_key = executable::acquire_if_not_write_open(&loc)?;
 
-    let mut new_aspace = exec_or_release(executable_key, new_user_aspace_empty())?;
-    exec_or_release(executable_key, copy_from_kernel(&mut new_aspace))?;
-    let loaded = exec_or_release(
-        executable_key,
-        load_user_app_at(
-            &mut new_aspace,
-            loc.clone(),
-            abs_path.as_str(),
-            &args,
-            &envs,
-            credentials,
-        ),
+    let thr = curr.as_thread();
+    let proc_data = &thr.proc_data;
+    let mut new_aspace = new_user_aspace_empty()?;
+    copy_from_kernel(&mut new_aspace)?;
+    let mut prepared_app = prepare_user_app_at(
+        &mut new_aspace,
+        loc.clone(),
+        abs_path.as_str(),
+        &args,
+        &envs,
+        credentials,
+    )?;
+
+    // Only the terminal ELF (the shebang interpreter when the initial object
+    // is a script) supplies set-ID and file-capability privilege. PT_INTERP is
+    // part of the readability/content chain but is never a credential source.
+    let source_metadata = prepared_app.credential_source.metadata()?;
+    let source_mode = source_metadata.mode.bits();
+    let final_exe_path = {
+        let path = prepared_app.credential_source.absolute_path()?;
+        try_copy_string(path.as_str())?
+    };
+    let pre_exec_cred = thr.current_cred();
+    let file_uid = Kuid::from_raw(source_metadata.uid)
+        .filter(|uid| pre_exec_cred.user_ns().kernel_uid_to_user(*uid).is_some());
+    let file_gid = Kgid::from_raw(source_metadata.gid)
+        .filter(|gid| pre_exec_cred.user_ns().kernel_gid_to_user(*gid).is_some());
+    let (set_uid, set_gid) = requested_setid_transition(source_mode, file_uid, file_gid);
+    let nosuid = crate::mounts::is_nosuid(&prepared_app.credential_source)?;
+    let file_capabilities = exec_file_capabilities(nosuid, || {
+        crate::syscall::security_capabilities_for_exec(&prepared_app.credential_source)
+    })?;
+    let request = ExecCredentialRequest {
+        file_uid,
+        file_gid,
+        set_uid,
+        set_gid,
+        nosuid,
+        ptrace_suppresses_privilege: ptrace_suppresses_exec_privilege(proc_data),
+        executable_unreadable: prepared_app.image_access.executable_unreadable(),
+        file_capabilities,
+    };
+    let credential_lease = prepared_app.take_credential_lease()?;
+    let prepared_exec_cred = thr.prepare_exec_credential_with(request, |context| {
+        crate::task::security::dispatch_exec_credential(&context)
+    })?;
+    let effects = prepared_exec_cred.effects();
+    let mm_owner_user_ns = exec_mm_owner_user_ns(
+        prepared_exec_cred.proposed_user_ns(),
+        prepared_app.image_access,
+    );
+    let new_access_state = ProcessAccessState::try_new(effects.dumpability, mm_owner_user_ns)?;
+
+    // The proposed identity, not the old current credential, owns all five
+    // identity/security auxv entries installed into the new stack.
+    let loaded = finish_prepared_user_app(
+        &mut new_aspace,
+        abs_path.as_str(),
+        &envs,
+        prepared_app,
+        effects.aux_identity,
     )?;
     let entry_point = loaded.entry_point;
     let user_stack_base = loaded.stack_pointer;
@@ -299,36 +383,19 @@ fn do_execve(
     // irreversible close/address-space publication. In particular, neither
     // the address-space handle nor the procfs cmdline may allocate after the
     // CLOEXEC commit point.
-    let new_aspace = exec_or_release(
-        executable_key,
-        Arc::try_new(axsync::Mutex::new(new_aspace)).map_err(|_| AxError::NoMemory),
-    )?;
+    let new_aspace = Arc::try_new(axsync::Mutex::new(new_aspace)).map_err(|_| AxError::NoMemory)?;
     let new_root = new_aspace.lock().page_table_root();
-    let new_cmdline = exec_or_release(
-        executable_key,
-        Arc::try_new(args).map_err(|_| AxError::NoMemory),
-    )?;
-
-    let thr = curr.as_thread();
-    let proc_data = &thr.proc_data;
-    let pre_exec_cred = thr.current_cred();
-    let new_dumpability = exec_dumpability(&pre_exec_cred, loaded.image_access);
-    let new_access_state = exec_or_release(
-        executable_key,
-        ProcessAccessState::try_new(new_dumpability, pre_exec_cred.user_ns().clone()),
-    )?;
+    let new_cmdline = Arc::try_new(loaded.arguments).map_err(|_| AxError::NoMemory)?;
     let new_task_alias = (!thr.is_thread_group_leader()).then(|| curr.clone());
-    let task_alias_admission = match new_task_alias
+    let task_alias_admission = new_task_alias
         .as_ref()
         .map(|task| prepare_task_alias_admission(proc_data.proc.pid(), task))
-        .transpose()
-    {
-        Ok(admission) => admission,
-        Err(err) => {
-            executable::release(executable_key);
-            return Err(err);
-        }
-    };
+        .transpose()?;
+
+    // This fallible registry snapshot is also prepared before begin_exec.
+    // After the gate closes, an allocation-free ordered TID recheck detects
+    // both count changes and same-count exit/clone ABA before de-threading.
+    let mut sibling_tids = proc_data.proc.try_threads().map_err(process_error)?;
 
     // Take the private files snapshot before killing sibling threads. A
     // failure can then cancel exec without leaving the old image unexpectedly
@@ -336,21 +403,9 @@ fn do_execve(
     // kernel represents all sibling files pointers with one process-scope
     // Arc; a single-thread caller needs one only when CLONE_FILES shares the
     // table with another process.
-    let has_siblings = proc_data.proc.thread_count() > 1;
+    let has_siblings = sibling_tids.len() > 1;
     let private_fd_table = if has_siblings || Arc::strong_count(&*FD_TABLE) > 1 {
-        match FD_TABLE.fork_copy() {
-            Ok(table) => match Arc::try_new(table) {
-                Ok(table) => Some(table),
-                Err(_) => {
-                    executable::release(executable_key);
-                    return Err(AxError::NoMemory);
-                }
-            },
-            Err(err) => {
-                executable::release(executable_key);
-                return Err(err);
-            }
-        }
+        Some(Arc::try_new(FD_TABLE.fork_copy()?).map_err(|_| AxError::NoMemory)?)
     } else {
         None
     };
@@ -358,24 +413,7 @@ fn do_execve(
         Some(table) => table.prepare_cloexec(),
         None => FD_TABLE.prepare_cloexec(),
     };
-    let cloexec = match cloexec {
-        Ok(prepared) => prepared,
-        Err(err) => {
-            executable::release(executable_key);
-            return Err(err);
-        }
-    };
-
-    // Credential allocation and invariant checks must finish before the first
-    // irreversible de-threading action. The prepared value remains invisible
-    // until the composite image publication below.
-    let prepared_exec_cred = match thr.prepare_clear_keep_caps_on_exec() {
-        Ok(prepared) => prepared,
-        Err(err) => {
-            executable::release(executable_key);
-            return Err(err);
-        }
-    };
+    let cloexec = cloexec?;
 
     // Gate every exec, including an apparently single-threaded one. Otherwise
     // CLONE_THREAD can publish a sibling between the preflight count and the
@@ -385,27 +423,26 @@ fn do_execve(
     // sibling and let userspace retry instead of committing with a shared
     // process-scope files pointer.
     if !proc_data.begin_exec(curr_tid) {
-        executable::release(executable_key);
         return Err(AxError::Interrupted);
     }
-    let mut sibling_tids = match proc_data.proc.try_threads().map_err(process_error) {
-        Ok(threads) => threads,
-        Err(error) => {
-            proc_data.end_exec(curr_tid);
-            executable::release(executable_key);
-            return Err(error);
-        }
-    };
-    if !files_preparation_covers_thread_snapshot(private_fd_table.is_some(), &sibling_tids) {
+    if !exact_exec_thread_snapshot(
+        &sibling_tids,
+        proc_data.proc.thread_count(),
+        proc_data.proc.thread_ids(),
+    ) || !files_preparation_covers_thread_snapshot(private_fd_table.is_some(), &sibling_tids)
+        || prepared_ptrace_facts_stale(
+            effects.gains_file_privilege,
+            effects.ptrace_suppressed,
+            ptrace_suppresses_exec_privilege(proc_data),
+        )
+    {
         proc_data.end_exec(curr_tid);
-        executable::release(executable_key);
         return Err(AxError::Interrupted);
     }
     sibling_tids.retain(|&tid| tid != curr_tid);
     interrupt_exec_siblings(&sibling_tids);
     if let Err(err) = wait_for_exec_group(proc_data, thr, uctx, curr_tid, &sibling_tids) {
         proc_data.end_exec(curr_tid);
-        executable::release(executable_key);
         return Err(err);
     }
     if let Some(private) = private_fd_table {
@@ -432,6 +469,15 @@ fn do_execve(
         new_aspace,
         new_access_state,
     );
+    // Freeze the relationship which observed the exec commit while the exec
+    // gate still excludes a fresh attach. The action gate keeps that exact
+    // relationship stable through stop publication; a later attachment must
+    // not inherit this already-committed exec event.
+    let exec_ptrace_action = proc_data.lock_ptrace_actions();
+    let exec_ptrace_session = proc_data.ptrace_active_session();
+    let executable_key = credential_lease
+        .finish()
+        .unwrap_or_else(|error| fail_closed_exit(error));
     set_current_user_page_table_root(new_root);
     // The old page tables and credential owners stay alive until both the
     // saved task context and hardware root name the new image.
@@ -442,7 +488,7 @@ fn do_execve(
 
     let old_exe_path = {
         let mut exe_path_guard = proc_data.exe_path.write();
-        mem::replace(&mut *exe_path_guard, abs_path)
+        mem::replace(&mut *exe_path_guard, final_exe_path)
     };
     drop(old_exe_path);
     let old_cmdline = {
@@ -470,9 +516,12 @@ fn do_execve(
 
     uctx.set_ip(entry_point.as_usize());
     uctx.set_sp(user_stack_base.as_usize());
-    if proc_data.ptrace_tracer().is_some() && proc_data.ptrace_stop(Signo::SIGTRAP as u8) {
+    if let Some(session) = exec_ptrace_session
+        && proc_data.ptrace_stop(session, Signo::SIGTRAP as u8)
+    {
         notify_ptrace_attach_stop(proc_data);
     }
+    drop(exec_ptrace_action);
     Ok(0)
 }
 
@@ -497,34 +546,71 @@ pub fn sys_execve(
 
 #[cfg(test)]
 mod tests {
-    use super::{exec_dumpability, files_preparation_covers_thread_snapshot};
+    use alloc::sync::Arc;
+
+    use axerrno::AxError;
+
+    use super::{
+        exact_exec_thread_snapshot, exec_file_capabilities, exec_mm_owner_user_ns,
+        files_preparation_covers_thread_snapshot, prepared_ptrace_facts_stale,
+        requested_setid_transition,
+    };
     use crate::{
         mm::ExecImageAccess,
-        task::{Cred, Dumpability, Kuid, UserNamespace},
+        task::{Kgid, Kuid, UserNamespace},
     };
 
     #[test]
-    fn process_access_exec_dumpability_requires_unprivileged_readable_image() {
-        let namespace = UserNamespace::try_new_root().unwrap();
-        let root = Cred::try_root(namespace).unwrap();
-        assert_eq!(
-            exec_dumpability(&root, ExecImageAccess::for_test(true, false)),
-            Dumpability::UserDumpable
-        );
-        assert_eq!(
-            exec_dumpability(&root, ExecImageAccess::for_test(false, false)),
-            Dumpability::NotDumpable
-        );
-        assert_eq!(
-            exec_dumpability(&root, ExecImageAccess::for_test(true, true)),
-            Dumpability::NotDumpable
-        );
+    fn unreadable_exec_chain_uses_initial_mm_owner_namespace() {
+        let initial = UserNamespace::try_new_root().unwrap();
+        let child = initial
+            .try_fork(
+                Kuid::from_raw(1000).unwrap(),
+                Kgid::from_raw(1000).unwrap(),
+                false,
+            )
+            .unwrap();
+        let readable = exec_mm_owner_user_ns(&child, ExecImageAccess::for_test(true));
+        assert!(Arc::ptr_eq(&readable, &child));
+        let unreadable = exec_mm_owner_user_ns(&child, ExecImageAccess::for_test(false));
+        assert!(Arc::ptr_eq(&unreadable, &initial));
+    }
 
-        let mismatched =
-            Cred::try_with_euid_for_test(&root, Kuid::from_raw(1000).unwrap()).unwrap();
+    #[test]
+    fn exec_thread_snapshot_rejects_same_count_tid_aba() {
+        assert!(exact_exec_thread_snapshot(&[7, 8], 2, [7, 8].into_iter()));
+        assert!(!exact_exec_thread_snapshot(&[7, 8], 2, [7, 9].into_iter()));
+    }
+
+    #[test]
+    fn privileged_exec_rejects_new_suppressing_ptrace_relation() {
+        assert!(prepared_ptrace_facts_stale(true, false, true));
+        assert!(!prepared_ptrace_facts_stale(false, false, true));
+        assert!(!prepared_ptrace_facts_stale(true, true, true));
+        assert!(!prepared_ptrace_facts_stale(true, false, false));
+    }
+
+    #[test]
+    fn setgid_exec_requires_group_execute_and_both_mapped_ids() {
+        let uid = Kuid::from_raw(1000);
+        let gid = Kgid::from_raw(1000);
+        assert_eq!(requested_setid_transition(0o6010, uid, gid), (true, true));
+        assert_eq!(requested_setid_transition(0o6000, uid, gid), (true, false));
         assert_eq!(
-            exec_dumpability(&mismatched, ExecImageAccess::for_test(true, false)),
-            Dumpability::NotDumpable
+            requested_setid_transition(0o6010, uid, None),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn nosuid_skips_even_malformed_file_capability_payload() {
+        assert_eq!(
+            exec_file_capabilities(true, || Err(AxError::InvalidInput)),
+            Ok(None)
+        );
+        assert_eq!(
+            exec_file_capabilities(false, || Err(AxError::InvalidInput)),
+            Err(AxError::InvalidInput)
         );
     }
 

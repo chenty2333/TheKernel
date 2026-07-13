@@ -25,9 +25,9 @@ use crate::{
     task::{
         AsThread, Cred, CredentialSlot, Dumpability, InitialProcessThreadAdmission,
         NetworkNamespace, PendingThreadPublication, ProcessAccessState, ProcessData,
-        ProcessThreadAdmission, Thread, get_process_data, linux_pid_from_task_id, ns_capable,
-        prepare_task_table_admission, process_domain, send_signal_thread_inner, try_new_user_task,
-        try_tasks, vm_write_in_aspace,
+        ProcessThreadAdmission, TaskParentChoice, Thread, get_process_data, linux_pid_from_task_id,
+        lock_task_parent_publication, ns_capable, prepare_task_table_admission, process_domain,
+        send_signal_thread_inner, try_new_user_task, try_tasks, vm_write_in_aspace,
     },
 };
 
@@ -406,9 +406,18 @@ impl CloneArgs {
         } else {
             Some(old_proc_data.clone())
         };
-        let fork_lifecycle = fork_parent_data
-            .as_ref()
-            .map(|parent| parent.lock_process_lifecycle());
+        // CLONE_THREAD has no new process parent, but its reserved core
+        // membership must still exclude the current process's final exit until
+        // exact-parent, core, and TASK_TABLE publication complete. This keeps
+        // the common path out of the core's defensive Busy result for an
+        // unpublished membership.
+        let fork_lifecycle = if flags.contains(CloneFlags::THREAD) {
+            Some(old_proc_data.lock_process_lifecycle())
+        } else {
+            fork_parent_data
+                .as_ref()
+                .map(|parent| parent.lock_process_lifecycle())
+        };
 
         let (new_proc_data, thread_publication) = if flags.contains(CloneFlags::THREAD) {
             new_task
@@ -551,6 +560,11 @@ impl CloneArgs {
         };
         let (thr, signal_registration) =
             Thread::try_new(tid, new_proc_data.clone(), child_credential)?;
+        let task_parent_choice = if flags.intersects(CloneFlags::PARENT | CloneFlags::THREAD) {
+            TaskParentChoice::Inherit(calling_thread.task_parent_node().clone())
+        } else {
+            TaskParentChoice::Caller(calling_thread.task_parent_node().clone())
+        };
         thr.set_sched_reset_on_fork(child_reset_on_fork);
         let child_aspace = new_proc_data.aspace();
         if flags.contains(CloneFlags::CHILD_CLEARTID) {
@@ -607,6 +621,16 @@ impl CloneArgs {
             new_proc_data.begin_vfork(calling_tid);
         }
 
+        // Exact real-parent publication linearizes against parent-task exit.
+        // The node, hard-limit charge, and intrusive links were all reserved
+        // while the child was private, so this step is allocation-free and
+        // infallible even for a root/no-parent inheritance relation. This is
+        // deliberately after the last fallible admission and before the first
+        // global identity publication.
+        let task_parent_publication = lock_task_parent_publication();
+        task.as_thread()
+            .publish_task_parent(&task_parent_publication, task_parent_choice);
+
         // From this point onward every operation is an allocation-free,
         // infallible publication step. Publish the exact signal endpoint and
         // core process/thread identity with TASK_TABLE before any fd or
@@ -614,6 +638,7 @@ impl CloneArgs {
         signal_registration.commit();
         let thread_completion =
             task_table_admission.commit_with_publication(|| thread_publication.commit());
+        drop(task_parent_publication);
 
         // TASK_TABLE is the primary runtime lookup. Cgroup and SysV SHM hidden
         // entries become visible only after it, so their readers can never

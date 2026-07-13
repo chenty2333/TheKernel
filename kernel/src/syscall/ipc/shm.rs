@@ -22,9 +22,10 @@ use spin::Mutex;
 use starry_process::Pid;
 
 use super::{
-    IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcPerm, SHM_DEST,
-    SHM_INFO, SHM_LOCK, SHM_LOCKED, SHM_STAT, SHM_STAT_ANY, SHM_UNLOCK, SHMMIN, next_ipc_id,
-    shmall_limit, shmmax_limit, shmmni_limit,
+    IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcAccess,
+    IpcAccessContext, IpcPerm, IpcPermissionUpdateRequest, SHM_DEST, SHM_INFO, SHM_LOCK,
+    SHM_LOCKED, SHM_STAT, SHM_STAT_ANY, SHM_UNLOCK, SHMMIN, next_ipc_id, shmall_limit,
+    shmmax_limit, shmmni_limit,
 };
 use crate::{
     mm::{Backend, SharedPages, UserPtr, nullable},
@@ -75,13 +76,8 @@ struct ShmUsageInfo {
     swap_successes: c_ulong,
 }
 
-fn admin_ipc_permission(perm: &IpcPerm, uid: u32) -> bool {
-    uid == 0 || perm.uid == uid || perm.cuid == uid
-}
-
-fn can_attach_shm(perm: &IpcPerm, uid: u32, gid: u32, read_only: bool) -> bool {
-    super::has_ipc_permission(perm, uid, gid, false)
-        && (read_only || super::has_ipc_permission(perm, uid, gid, true))
+fn can_attach_shm(context: &IpcAccessContext, perm: &IpcPerm, read_only: bool) -> bool {
+    context.allows(perm, IpcAccess::Read) && (read_only || context.allows(perm, IpcAccess::Write))
 }
 
 bitflags::bitflags! {
@@ -242,21 +238,22 @@ impl ShmInner {
 
     /// Updates the pid of last shmop and checks if the size and mapping flags
     /// match.
-    pub fn try_update(&mut self, size: usize, requested_mode: __kernel_mode_t) -> AxResult<isize> {
+    fn try_update(
+        &self,
+        context: &IpcAccessContext,
+        size: usize,
+        requested_mode: __kernel_mode_t,
+    ) -> AxResult<isize> {
         if size > self.shmid_ds.shm_segsz as usize {
             return Err(AxError::InvalidInput);
         }
 
-        let curr = current();
-        let ids = curr.as_thread().current_cred().ids();
-        let uid = ids.euid.into_raw();
-        let gid = ids.egid.into_raw();
         let wants_read = requested_mode & 0o444 != 0;
         let wants_write = requested_mode & 0o222 != 0;
-        if wants_read && !super::has_ipc_permission(&self.shmid_ds.shm_perm, uid, gid, false) {
+        if wants_read && !context.allows(&self.shmid_ds.shm_perm, IpcAccess::Read) {
             return Err(AxError::PermissionDenied);
         }
-        if wants_write && !super::has_ipc_permission(&self.shmid_ds.shm_perm, uid, gid, true) {
+        if wants_write && !context.allows(&self.shmid_ds.shm_perm, IpcAccess::Write) {
             return Err(AxError::PermissionDenied);
         }
         Ok(self.shmid as isize)
@@ -1513,11 +1510,12 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
     }
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
+    let thread = curr.as_thread();
+    let proc_data = &thread.proc_data;
     let cur_pid = proc_data.proc.pid();
-    let ids = curr.as_thread().current_cred().ids();
-    let euid = ids.euid.into_raw();
-    let egid = ids.egid.into_raw();
+    let context = IpcAccessContext::for_initial_user_namespace(thread.current_cred());
+    let euid = context.effective_uid_raw();
+    let egid = context.effective_gid_raw();
 
     if huge {
         return Err(AxError::from(LinuxError::EINVAL));
@@ -1537,8 +1535,8 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
             if create && excl {
                 return Err(AxError::from(LinuxError::EEXIST));
             }
-            let mut shm_inner = shm_inner.lock();
-            return shm_inner.try_update(size, perm_mode);
+            let shm_inner = shm_inner.lock();
+            return shm_inner.try_update(&context, size, perm_mode);
         }
         if !create {
             return Err(AxError::from(LinuxError::ENOENT));
@@ -1600,20 +1598,16 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
     let read_only = shm_flg.contains(ShmAtFlags::SHM_RDONLY);
 
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
+    let thread = curr.as_thread();
+    let proc_data = &thread.proc_data;
     let pid = proc_data.proc.pid();
-    let ids = curr.as_thread().current_cred().ids();
+    let context = IpcAccessContext::for_initial_user_namespace(thread.current_cred());
     let (mut mapping_flags, page_num, existing_pages) = {
         let state = shm_inner.lock();
         if state.rmid {
             return Err(AxError::from(LinuxError::EIDRM));
         }
-        if !can_attach_shm(
-            &state.shmid_ds.shm_perm,
-            ids.euid.into_raw(),
-            ids.egid.into_raw(),
-            read_only,
-        ) {
+        if !can_attach_shm(&context, &state.shmid_ds.shm_perm, read_only) {
             return Err(AxError::from(LinuxError::EACCES));
         }
         (
@@ -1704,9 +1698,7 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
 
 pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize> {
     let curr = current();
-    let ids = curr.as_thread().current_cred().ids();
-    let current_uid = ids.euid.into_raw();
-    let current_gid = ids.egid.into_raw();
+    let context = IpcAccessContext::for_initial_user_namespace(curr.as_thread().current_cred());
     let cmd = cmd as i32;
     let _transaction = SHM_TRANSACTION.lock();
 
@@ -1749,9 +1741,7 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
         .ok_or(AxError::InvalidInput)?;
     if cmd == SHM_STAT || cmd == SHM_STAT_ANY {
         let state = shm_inner.lock();
-        if cmd == SHM_STAT
-            && !super::has_ipc_permission(&state.shmid_ds.shm_perm, current_uid, current_gid, false)
-        {
+        if cmd == SHM_STAT && !context.allows(&state.shmid_ds.shm_perm, IpcAccess::Read) {
             return Err(AxError::from(LinuxError::EACCES));
         }
         let snapshot = state.visible_snapshot();
@@ -1760,21 +1750,28 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
         return Ok(shmid as isize);
     }
 
-    if cmd == IPC_SET {
-        if !admin_ipc_permission(&shm_inner.lock().shmid_ds.shm_perm, current_uid) {
-            return Err(AxError::from(LinuxError::EPERM));
-        }
+    let set_request: Option<IpcPermissionUpdateRequest> = if cmd == IPC_SET {
         let user_ds = *buf.get_as_mut()?;
+        Some(context.map_permission_update(
+            user_ds.shm_perm.uid,
+            user_ds.shm_perm.gid,
+            user_ds.shm_perm.mode,
+        )?)
+    } else {
+        None
+    };
+
+    if cmd == IPC_SET {
         let mut state = shm_inner.lock();
-        state.shmid_ds.shm_perm.uid = user_ds.shm_perm.uid;
-        state.shmid_ds.shm_perm.gid = user_ds.shm_perm.gid;
-        state.shmid_ds.shm_perm.mode = (state.shmid_ds.shm_perm.mode
-            & !(IPC_MODE_MASK as c_ushort))
-            | (user_ds.shm_perm.mode & IPC_MODE_MASK as c_ushort);
+        let prepared = context.prepare_permission_update(
+            &state.shmid_ds.shm_perm,
+            set_request.expect("IPC_SET request was prepared before locking"),
+        )?;
+        prepared.commit(&mut state.shmid_ds.shm_perm);
         state.shmid_ds.shm_ctime = wall_time().as_secs() as __kernel_time_t;
     } else if cmd == IPC_STAT {
         let state = shm_inner.lock();
-        if !super::has_ipc_permission(&state.shmid_ds.shm_perm, current_uid, current_gid, false) {
+        if !context.allows(&state.shmid_ds.shm_perm, IpcAccess::Read) {
             return Err(AxError::from(LinuxError::EACCES));
         }
         let snapshot = state.visible_snapshot();
@@ -1785,7 +1782,7 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
     } else if cmd == IPC_RMID {
         let remove = {
             let mut state = shm_inner.lock();
-            if !admin_ipc_permission(&state.shmid_ds.shm_perm, current_uid) {
+            if !context.may_control(&state.shmid_ds.shm_perm) {
                 return Err(AxError::from(LinuxError::EPERM));
             }
             state.set_removed(true);
@@ -1798,13 +1795,13 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
         }
     } else if cmd == SHM_LOCK {
         let mut state = shm_inner.lock();
-        if !admin_ipc_permission(&state.shmid_ds.shm_perm, current_uid) {
+        if !context.may_control(&state.shmid_ds.shm_perm) {
             return Err(AxError::from(LinuxError::EPERM));
         }
         state.set_locked(true);
     } else if cmd == SHM_UNLOCK {
         let mut state = shm_inner.lock();
-        if !admin_ipc_permission(&state.shmid_ds.shm_perm, current_uid) {
+        if !context.may_control(&state.shmid_ds.shm_perm) {
             return Err(AxError::from(LinuxError::EPERM));
         }
         state.set_locked(false);

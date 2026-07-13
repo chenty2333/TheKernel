@@ -18,8 +18,9 @@ use starry_process::Pid;
 use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use super::{
-    IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcPerm, MSG_INFO,
-    MSG_STAT, MSG_STAT_ANY, has_ipc_permission, next_ipc_id,
+    IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcAccess,
+    IpcAccessContext, IpcPerm, IpcPermissionUpdateRequest, MSG_INFO, MSG_STAT, MSG_STAT_ANY,
+    PreparedIpcPermissionUpdate, next_ipc_id,
 };
 use crate::{
     task::{AsThread, ProcStateHint, has_pending_syscall_signal, with_proc_state_hint},
@@ -333,6 +334,45 @@ pub const MSGMNB: usize = 16384;
 /// Maximum size of a single message
 pub const MSGMAX: usize = 8192;
 
+#[derive(Clone, Copy)]
+struct MsgSetRequest {
+    permission: IpcPermissionUpdateRequest,
+    qbytes: __kernel_size_t,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedMsgSet {
+    permission: PreparedIpcPermissionUpdate,
+    qbytes: __kernel_size_t,
+    ctime: __kernel_time_t,
+}
+
+impl PreparedMsgSet {
+    fn prepare(
+        context: &IpcAccessContext,
+        current: &msqid_ds,
+        request: MsgSetRequest,
+        ctime: __kernel_time_t,
+    ) -> AxResult<Self> {
+        let permission =
+            context.prepare_permission_update(&current.msg_perm, request.permission)?;
+        if request.qbytes > MSGMNB as __kernel_size_t && !context.may_raise_resource_limit() {
+            return Err(AxError::OperationNotPermitted);
+        }
+        Ok(Self {
+            permission,
+            qbytes: request.qbytes,
+            ctime,
+        })
+    }
+
+    fn commit(self, queue: &mut MessageQueue) {
+        self.permission.commit(&mut queue.msqid_ds.msg_perm);
+        queue.msqid_ds.msg_qbytes = self.qbytes;
+        queue.msqid_ds.msg_ctime = self.ctime;
+    }
+}
+
 /// Global message queue manager
 pub static MSG_MANAGER: Mutex<MsgManager> = Mutex::new(MsgManager::new());
 static MSGMNI_LIMIT: AtomicUsize = AtomicUsize::new(MSGMNI);
@@ -474,9 +514,9 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
     let current = current();
     let thread = current.as_thread();
     let proc_data = &thread.proc_data;
-    let ids = thread.current_cred().ids();
-    let current_uid = ids.euid.into_raw();
-    let current_gid = ids.egid.into_raw();
+    let context = IpcAccessContext::for_initial_user_namespace(thread.current_cred());
+    let current_uid = context.effective_uid_raw();
+    let current_gid = context.effective_gid_raw();
     let current_pid = proc_data.proc.pid();
 
     let mut msg_manager = MSG_MANAGER.lock();
@@ -508,12 +548,7 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
         let msg_queue = msg_queue.lock();
 
         // Check permissions
-        if !has_ipc_permission(
-            &msg_queue.msqid_ds.msg_perm,
-            current_uid,
-            current_gid,
-            false,
-        ) {
+        if !context.allows(&msg_queue.msqid_ds.msg_perm, IpcAccess::Read) {
             return Err(AxError::from(LinuxError::EACCES)); // EACCES
         }
 
@@ -566,9 +601,7 @@ pub fn sys_msgsnd(
     let current = current();
     let thread = current.as_thread();
     let proc_data = &thread.proc_data;
-    let ids = thread.current_cred().ids();
-    let current_uid = ids.euid.into_raw();
-    let current_gid = ids.egid.into_raw();
+    let context = IpcAccessContext::for_initial_user_namespace(thread.current_cred());
     let current_pid = proc_data.proc.pid();
     let flags = MsgSndFlags::from_bits_truncate(msgflg);
 
@@ -595,12 +628,7 @@ pub fn sys_msgsnd(
         let waiters = {
             let mut msg_queue = msg_queue.lock();
 
-            if !has_ipc_permission(
-                &msg_queue.msqid_ds.msg_perm,
-                current_uid as _,
-                current_gid as _,
-                true,
-            ) {
+            if !context.allows(&msg_queue.msqid_ds.msg_perm, IpcAccess::Write) {
                 return Err(AxError::from(LinuxError::EACCES)); // EACCES
             }
 
@@ -683,9 +711,7 @@ pub fn sys_msgrcv(
     let current = current();
     let thread = current.as_thread();
     let proc_data = &thread.proc_data;
-    let ids = thread.current_cred().ids();
-    let current_uid = ids.euid.into_raw();
-    let current_gid = ids.egid.into_raw();
+    let context = IpcAccessContext::for_initial_user_namespace(thread.current_cred());
     let current_pid = proc_data.proc.pid();
 
     // Check validity of flag combinations
@@ -711,12 +737,7 @@ pub fn sys_msgrcv(
             let mut msg_queue = msg_queue.lock();
 
             // Permission check
-            if !has_ipc_permission(
-                &msg_queue.msqid_ds.msg_perm,
-                current_uid as _,
-                current_gid as _,
-                false,
-            ) {
+            if !context.allows(&msg_queue.msqid_ds.msg_perm, IpcAccess::Read) {
                 return Err(AxError::from(LinuxError::EACCES)); // EACCES
             }
 
@@ -789,14 +810,8 @@ pub fn sys_msgrcv(
 }
 
 pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
-    //  Get current process information
     let current = current();
-    let cred = current.as_thread().current_cred();
-    let ids = cred.ids();
-    let current_kuid = ids.euid;
-    let current_uid = current_kuid.into_raw();
-    let current_gid = ids.egid.into_raw();
-    let is_privileged = cred.is_initial_root_euid();
+    let context = IpcAccessContext::for_initial_user_namespace(current.as_thread().current_cred());
 
     // Validate command code
     if cmd != IPC_STAT
@@ -839,14 +854,7 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
             .and_then(|(actual_msqid, queue)| {
                 let guard = queue.lock();
 
-                if cmd == MSG_STAT
-                    && !has_ipc_permission(
-                        &guard.msqid_ds.msg_perm,
-                        current_uid,
-                        current_gid,
-                        false, // read permission check
-                    )
-                {
+                if cmd == MSG_STAT && !context.allows(&guard.msqid_ds.msg_perm, IpcAccess::Read) {
                     return Err(AxError::from(LinuxError::EACCES));
                 }
 
@@ -866,6 +874,23 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
             .ok_or(AxError::from(LinuxError::EINVAL))? // EINVAL - Queue does not exist
     };
 
+    // IPC_SET is a prepare/authorize/commit transaction. Potentially faulting
+    // usercopy and namespace ID mapping happen before the live queue lock is
+    // acquired. No queue field is changed until every check has succeeded.
+    let set_request = if cmd == IPC_SET {
+        let user_buf = (buf as *const msqid_ds).vm_read()?;
+        Some(MsgSetRequest {
+            permission: context.map_permission_update(
+                user_buf.msg_perm.uid,
+                user_buf.msg_perm.gid,
+                user_buf.msg_perm.mode,
+            )?,
+            qbytes: user_buf.msg_qbytes,
+        })
+    } else {
+        None
+    };
+
     // Lock the internal structure of the queue
     let mut msg_queue = msg_queue.lock();
     // Check if the queue is marked as removed
@@ -874,12 +899,7 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
     }
     if cmd == IPC_STAT {
         // Check read permissions
-        if !has_ipc_permission(
-            &msg_queue.msqid_ds.msg_perm,
-            current_uid,
-            current_gid,
-            false,
-        ) {
+        if !context.allows(&msg_queue.msqid_ds.msg_perm, IpcAccess::Read) {
             return Err(AxError::from(LinuxError::EACCES)); // EACCES
         }
 
@@ -890,34 +910,18 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
         return Ok(0);
     }
 
-    // Check permissions (owner, creator, or privileged user)
-    let is_owner = current_uid == msg_queue.msqid_ds.msg_perm.uid;
-    let is_creator = current_uid == msg_queue.msqid_ds.msg_perm.cuid;
-
-    if !is_privileged && !is_owner && !is_creator {
+    if !context.may_control(&msg_queue.msqid_ds.msg_perm) {
         return Err(AxError::from(LinuxError::EPERM)); // EPERM
     }
 
     if cmd == IPC_SET {
-        // Read new settings from user space
-        let ptr = buf as *const msqid_ds;
-        let user_buf = ptr.vm_read()?;
-
-        // Update permission information (fields allowed by man-page)
-        msg_queue.msqid_ds.msg_perm.uid = user_buf.msg_perm.uid;
-        msg_queue.msqid_ds.msg_perm.gid = user_buf.msg_perm.gid;
-        msg_queue.msqid_ds.msg_perm.mode = user_buf.msg_perm.mode & 0o777; // Only take permission bits
-
-        // Update queue size limit (requires privilege check)
-        if user_buf.msg_qbytes != msg_queue.msqid_ds.msg_qbytes {
-            if user_buf.msg_qbytes > MSGMNB as _ && !is_privileged {
-                return Err(AxError::from(LinuxError::EPERM)); // EPERM - requires privilege to exceed MSGMNB
-            }
-            msg_queue.msqid_ds.msg_qbytes = user_buf.msg_qbytes;
-        }
-
-        // Update modification time
-        msg_queue.msqid_ds.msg_ctime = ipc_time_secs();
+        let prepared = PreparedMsgSet::prepare(
+            &context,
+            &msg_queue.msqid_ds,
+            set_request.expect("IPC_SET request was prepared before locking"),
+            ipc_time_secs(),
+        )?;
+        prepared.commit(&mut msg_queue);
         msg_queue.waiters.notify_all(false);
 
         return Ok(0);
@@ -940,4 +944,70 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, buf: usize) -> AxResult<isize> {
     // operations are sufficient and these are not POSIX standard They can be
     // implemented later to support tools like ipcs
     Err(AxError::from(LinuxError::EINVAL)) // EINVAL
+}
+
+#[cfg(test)]
+mod credential_caller_tests {
+    use super::*;
+    use crate::task::{Cred, UserNamespace};
+
+    #[test]
+    fn credential_caller_msg_set_resource_failure_rolls_back_every_field() {
+        let root_ns = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root(root_ns.clone()).unwrap();
+        let mut context = IpcAccessContext::new(actor, root_ns);
+        context.authority.resource_override = false;
+
+        let mut queue = MessageQueue::new(1, 0o600, 1, 0, 0);
+        queue.msqid_ds.msg_ctime = 41;
+        let before = (
+            queue.msqid_ds.msg_perm.uid,
+            queue.msqid_ds.msg_perm.gid,
+            queue.msqid_ds.msg_perm.mode,
+            queue.msqid_ds.msg_qbytes,
+            queue.msqid_ds.msg_ctime,
+        );
+        let request = MsgSetRequest {
+            permission: context.map_permission_update(0, 0, 0o666).unwrap(),
+            qbytes: MSGMNB as __kernel_size_t + 1,
+        };
+
+        let result = PreparedMsgSet::prepare(&context, &queue.msqid_ds, request, 99)
+            .map(|prepared| prepared.commit(&mut queue));
+        assert_eq!(result, Err(AxError::OperationNotPermitted));
+        assert_eq!(
+            (
+                queue.msqid_ds.msg_perm.uid,
+                queue.msqid_ds.msg_perm.gid,
+                queue.msqid_ds.msg_perm.mode,
+                queue.msqid_ds.msg_qbytes,
+                queue.msqid_ds.msg_ctime,
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn credential_caller_cap_sys_resource_only_lifts_qbytes_ceiling() {
+        let root_ns = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root(root_ns.clone()).unwrap();
+        let mut context = IpcAccessContext::new(actor, root_ns);
+        context.authority = super::super::IpcAuthority {
+            resource_override: true,
+            ..super::super::IpcAuthority::NONE
+        };
+        let request = MsgSetRequest {
+            permission: context.map_permission_update(0, 0, 0o600).unwrap(),
+            qbytes: MSGMNB as __kernel_size_t + 1,
+        };
+
+        let owned = MessageQueue::new(1, 0o600, 1, 0, 0);
+        assert!(PreparedMsgSet::prepare(&context, &owned.msqid_ds, request, 99).is_ok());
+
+        let foreign = MessageQueue::new(1, 0o600, 1, 2000, 200);
+        assert!(matches!(
+            PreparedMsgSet::prepare(&context, &foreign.msqid_ds, request, 99),
+            Err(AxError::OperationNotPermitted)
+        ));
+    }
 }

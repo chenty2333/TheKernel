@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use core::{
     mem::size_of,
     sync::atomic::{AtomicU32, Ordering},
@@ -14,8 +14,8 @@ use axtask::{
     sched_state, set_sched_state, set_task_affinity,
 };
 use linux_raw_sys::general::{
-    __kernel_clockid_t, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID,
-    CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, SCHED_BATCH,
+    __kernel_clockid_t, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
+    CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, RLIMIT_NICE, SCHED_BATCH,
     SCHED_DEADLINE, SCHED_FIFO, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE, SCHED_NORMAL,
     SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
 };
@@ -24,7 +24,11 @@ use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use crate::{
     task::{
-        AlarmClock, AsThread, ProcStateHint, get_process_group, get_task, process_domain,
+        AlarmClock, AsThread, Cred, ProcStateHint, get_process_group, get_task, process_domain,
+        security::{
+            SchedulerSecurityOperation, SecuritySchedulerContext, SecuritySubject,
+            dispatch_scheduler, scheduler_owner_matches,
+        },
         sleep_until_clock, try_tasks, with_proc_state_hint,
     },
     time::TimeValueLike,
@@ -96,26 +100,54 @@ fn sched_class_for_set(policy: u32, abi: SchedSetAbi) -> AxResult<SchedClass> {
     }
 }
 
-fn has_sched_admin_capability() -> bool {
-    current().as_thread().has_effective_capability(CAP_SYS_NICE)
+struct SchedulerAuthoritySnapshot {
+    actor: Arc<Cred>,
+    target: Arc<Cred>,
+    owner_match: bool,
 }
 
-fn can_manage_sched_target(task: &AxTaskRef) -> AxResult<()> {
-    let actor = current();
-    let actor_thread = actor.as_thread();
-    let actor_cred = actor_thread.current_cred();
-    if actor_cred.has_effective_capability(CAP_SYS_NICE) {
-        return Ok(());
+impl SchedulerAuthoritySnapshot {
+    fn new(actor: Arc<Cred>, target: Arc<Cred>) -> Self {
+        let owner_match = scheduler_owner_matches(&actor, &target);
+        Self {
+            actor,
+            target,
+            owner_match,
+        }
     }
-    let actor_euid = actor_cred.ids().euid;
-    let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
-    let target_ids = target_thread.current_cred().ids();
 
-    if actor_euid == target_ids.ruid || actor_euid == target_ids.euid {
-        Ok(())
-    } else {
-        Err(AxError::OperationNotPermitted)
+    fn authorize(&self, operation: SchedulerSecurityOperation) -> AxResult<()> {
+        dispatch_scheduler(&SecuritySchedulerContext::new(
+            SecuritySubject::new(&self.actor),
+            SecuritySubject::new(&self.target),
+            operation,
+            self.owner_match,
+        ))
     }
+}
+
+fn scheduler_actor_snapshot() -> (AxTaskRef, Arc<Cred>) {
+    let actor = current();
+    let credential = actor.as_thread().current_cred();
+    (actor.clone(), credential)
+}
+
+fn scheduler_target_credential(
+    actor_task: &AxTaskRef,
+    actor_cred: &Arc<Cred>,
+    task: &AxTaskRef,
+) -> AxResult<Arc<Cred>> {
+    if Arc::ptr_eq(actor_task, task) {
+        return Ok(actor_cred.clone());
+    }
+    let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+    Ok(target_thread.current_cred())
+}
+
+fn scheduler_authority_snapshot(task: &AxTaskRef) -> AxResult<SchedulerAuthoritySnapshot> {
+    let (actor_task, actor_cred) = scheduler_actor_snapshot();
+    let target_cred = scheduler_target_credential(&actor_task, &actor_cred, task)?;
+    Ok(SchedulerAuthoritySnapshot::new(actor_cred, target_cred))
 }
 
 fn validate_static_priority(priority: i32) -> AxResult<u8> {
@@ -282,14 +314,14 @@ fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult
         SchedSetAbi::Legacy,
     )?;
     let thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
-    can_manage_sched_target(task)?;
+    let authority = scheduler_authority_snapshot(task)?;
+    authority.authorize(SchedulerSecurityOperation::SetPolicy {
+        realtime: matches!(class, SchedClass::Fifo | SchedClass::RoundRobin),
+    })?;
     let mut state = sched_state(task);
     state.class = class;
     match class {
         SchedClass::Fifo | SchedClass::RoundRobin => {
-            if !has_sched_admin_capability() {
-                return Err(AxError::OperationNotPermitted);
-            }
             state.rt_priority = validate_rt_priority(priority)?;
             state.nice = 0;
         }
@@ -308,13 +340,12 @@ fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult
 }
 
 fn update_sched_param(task: &AxTaskRef, priority: i32) -> AxResult<isize> {
-    can_manage_sched_target(task)?;
     let mut state = sched_state(task);
+    let realtime = matches!(state.class, SchedClass::Fifo | SchedClass::RoundRobin);
+    scheduler_authority_snapshot(task)?
+        .authorize(SchedulerSecurityOperation::SetParam { realtime })?;
     match state.class {
         SchedClass::Fifo | SchedClass::RoundRobin => {
-            if !has_sched_admin_capability() {
-                return Err(AxError::OperationNotPermitted);
-            }
             state.rt_priority = validate_rt_priority(priority)?;
         }
         SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
@@ -354,31 +385,36 @@ fn clamp_nice(prio: i32) -> i8 {
     prio.clamp(-20, 19) as i8
 }
 
-fn can_adjust_task_nice(task: &AxTaskRef, new_nice: i8) -> AxResult<()> {
-    let actor = current();
-    let actor_thread = actor.as_thread();
-    let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
-    let actor_cred = actor_thread.current_cred();
-    let actor_euid = actor_cred.ids().euid;
-    let actor_is_root = actor_cred.is_initial_root_euid();
-    let target_ids = target_thread.current_cred().ids();
-
-    if !actor_is_root && actor_euid != target_ids.ruid && actor_euid != target_ids.euid {
-        return Err(AxError::OperationNotPermitted);
-    }
-
-    let current_nice = sched_state(task).nice;
-    if !actor_is_root && new_nice < current_nice {
-        return Err(AxError::PermissionDenied);
-    }
-
-    Ok(())
+struct SchedulerNiceTarget {
+    task: AxTaskRef,
+    credential: Arc<Cred>,
 }
 
-fn set_task_nice(task: &AxTaskRef, new_nice: i8) -> AxResult<()> {
-    can_adjust_task_nice(task, new_nice)?;
+fn scheduler_nice_target(
+    actor_task: &AxTaskRef,
+    actor_cred: &Arc<Cred>,
+    task: AxTaskRef,
+) -> AxResult<SchedulerNiceTarget> {
+    let credential = scheduler_target_credential(actor_task, actor_cred, &task)?;
+    Ok(SchedulerNiceTarget { task, credential })
+}
 
+fn set_task_nice(
+    actor_cred: &Arc<Cred>,
+    target: &SchedulerNiceTarget,
+    new_nice: i8,
+) -> AxResult<()> {
+    let task = &target.task;
+    let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
     let mut state = sched_state(task);
+    let rlimit_nice = target_thread.proc_data.rlim.read()[RLIMIT_NICE].current;
+    SchedulerAuthoritySnapshot::new(actor_cred.clone(), target.credential.clone()).authorize(
+        SchedulerSecurityOperation::SetNice {
+            current_nice: state.nice,
+            requested_nice: new_nice,
+            rlimit_nice,
+        },
+    )?;
     state.nice = new_nice;
     apply_sched_state(task, state).map(|_| ())
 }
@@ -546,11 +582,12 @@ pub fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, user_mask: *const u8) 
         }
     }
 
+    let task = sched_target(pid)?;
+    scheduler_authority_snapshot(&task)?.authorize(SchedulerSecurityOperation::SetAffinity)?;
+
     if pid == 0 {
         axtask::set_current_affinity(cpu_mask)?;
     } else {
-        let task = sched_target(pid)?;
-        can_manage_sched_target(&task)?;
         set_task_affinity(&task, cpu_mask)?;
     }
 
@@ -641,16 +678,17 @@ pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResu
     let class = sched_class_for_set(attr.sched_policy, SchedSetAbi::Attr)?;
     let task = sched_target(pid)?;
     let thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
-    can_manage_sched_target(&task)?;
+    let authority = scheduler_authority_snapshot(&task)?;
+    authority.authorize(SchedulerSecurityOperation::SetPolicy {
+        realtime: matches!(class, SchedClass::Fifo | SchedClass::RoundRobin),
+    })?;
     let mut state = sched_state(&task);
+    let old_nice = state.nice;
     state.class = class;
     match class {
         SchedClass::Fifo | SchedClass::RoundRobin => {
             if attr.sched_runtime != 0 || attr.sched_deadline != 0 || attr.sched_period != 0 {
                 return Err(AxError::InvalidInput);
-            }
-            if !has_sched_admin_capability() {
-                return Err(AxError::OperationNotPermitted);
             }
             state.rt_priority = validate_rt_priority(attr.sched_priority as i32)?;
             state.nice = 0;
@@ -660,7 +698,14 @@ pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResu
                 return Err(AxError::InvalidInput);
             }
             state.rt_priority = validate_static_priority(attr.sched_priority as i32)?;
-            state.nice = validate_nice(attr.sched_nice)?;
+            let requested_nice = validate_nice(attr.sched_nice)?;
+            let rlimit_nice = thread.proc_data.rlim.read()[RLIMIT_NICE].current;
+            authority.authorize(SchedulerSecurityOperation::SetNice {
+                current_nice: old_nice,
+                requested_nice,
+                rlimit_nice,
+            })?;
+            state.nice = requested_nice;
         }
     }
     let reset_on_fork = attr.sched_flags & SUPPORTED_SCHED_ATTR_FLAGS != 0;
@@ -763,20 +808,22 @@ pub fn sys_setpriority(which: u32, who: u32, prio: i32) -> AxResult<isize> {
     debug!("sys_setpriority <= which: {which}, who: {who}, prio: {prio}");
 
     let new_nice = clamp_nice(prio);
+    let (actor_task, actor_cred) = scheduler_actor_snapshot();
     let mut targets = Vec::new();
     match which {
         PRIO_PROCESS => {
             let task = if who == 0 {
-                current().clone()
+                actor_task.clone()
             } else {
                 get_task(who)?
             };
+            let target = scheduler_nice_target(&actor_task, &actor_cred, task)?;
             targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-            targets.push(task);
+            targets.push(target);
         }
         PRIO_PGRP => {
             let pgid = if who == 0 {
-                current().as_thread().proc_data.proc.group().pgid()
+                actor_task.as_thread().proc_data.proc.group().pgid()
             } else {
                 who
             };
@@ -787,28 +834,31 @@ pub fn sys_setpriority(which: u32, who: u32, prio: i32) -> AxResult<isize> {
             {
                 for tid in process.thread_ids() {
                     if let Ok(task) = get_task(tid) {
+                        let target = scheduler_nice_target(&actor_task, &actor_cred, task)?;
                         targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-                        targets.push(task);
+                        targets.push(target);
                     }
                 }
             }
         }
         PRIO_USER => {
-            let current = current();
-            let cred = current.as_thread().current_cred();
             let uid = if who == 0 {
-                cred.ids().ruid
+                actor_cred.ids().ruid
             } else {
-                cred.user_ns().make_kuid(who).ok_or(AxError::InvalidInput)?
+                actor_cred
+                    .user_ns()
+                    .make_kuid(who)
+                    .ok_or(AxError::InvalidInput)?
             };
             for task in try_tasks()? {
-                let Some(thread) = task.try_as_thread() else {
+                if task.try_as_thread().is_none() {
                     continue;
-                };
-                let ids = thread.current_cred().ids();
+                }
+                let target = scheduler_nice_target(&actor_task, &actor_cred, task)?;
+                let ids = target.credential.ids();
                 if ids.ruid == uid || ids.euid == uid {
                     targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-                    targets.push(task);
+                    targets.push(target);
                 }
             }
         }
@@ -819,8 +869,8 @@ pub fn sys_setpriority(which: u32, who: u32, prio: i32) -> AxResult<isize> {
         return Err(AxError::NoSuchProcess);
     }
 
-    for task in &targets {
-        set_task_nice(task, new_nice)?;
+    for target in &targets {
+        set_task_nice(&actor_cred, target, new_nice)?;
     }
 
     Ok(0)

@@ -35,6 +35,10 @@ use memory_addr::PAGE_SIZE_4K;
 use spin::Mutex;
 
 const TMPFS_BLOCK_SIZE: u64 = PAGE_SIZE_4K as u64;
+// Kept provider-local so tmpfs content mutation does not depend on the Linux
+// credential module. This is the only privilege-bearing xattr exec currently
+// consumes from the tmpfs store.
+const FILE_CAPABILITY_XATTR: &str = "security.capability";
 const STAT_BLOCK_UNIT: u64 = 512;
 const MIB: u64 = 1024 * 1024;
 const DEFAULT_TMPFS_MIN_BYTES: u64 = 16 * MIB;
@@ -639,6 +643,29 @@ pub fn xattr_store(loc: &axfs_ng_vfs::Location) -> Option<Arc<Mutex<HashMap<Stri
     Some(node.inode.xattrs.clone())
 }
 
+/// Removes tmpfs file capabilities as one inode transaction. Locations without
+/// a tmpfs xattr provider are successful no-ops because exec likewise treats
+/// their hidden capability metadata as unsupported.
+pub fn kill_file_capability(loc: &axfs_ng_vfs::Location) -> AxResult<()> {
+    if let Some(node) = memory_node_for(loc) {
+        node.inode.kill_file_capability();
+    }
+    Ok(())
+}
+
+/// Runs an ownership/metadata update and successful file-capability removal
+/// under the same tmpfs inode xattr lock. A future fallible xattr provider must
+/// return its clearing error here before `operation` publishes metadata.
+pub fn with_file_capability_killpriv<T>(
+    loc: &axfs_ng_vfs::Location,
+    operation: impl FnOnce() -> AxResult<T>,
+) -> AxResult<T> {
+    let Some(node) = memory_node_for(loc) else {
+        return operation();
+    };
+    node.inode.with_file_capability_killpriv(operation)
+}
+
 pub fn reserve_fallocate_range(
     loc: &axfs_ng_vfs::Location,
     offset: u64,
@@ -650,20 +677,20 @@ pub fn reserve_fallocate_range(
     if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
         return Some(Err(err));
     }
-    if extend {
-        let Some(end) = offset.checked_add(len) else {
-            return Some(Err(AxError::InvalidInput));
-        };
-        let extend_to = (end > *file.length.lock()).then_some(end);
-        let result = file.reserve_range(&fs, offset, len);
-        if result.is_ok() {
-            if let Some(end) = extend_to {
+    Some(inode.with_file_capability_killpriv(|| {
+        if extend {
+            let end = offset.checked_add(len).ok_or(AxError::InvalidInput)?;
+            let extend_to = (end > *file.length.lock()).then_some(end);
+            let result = file.reserve_range(&fs, offset, len);
+            if result.is_ok()
+                && let Some(end) = extend_to
+            {
                 file.set_len(&fs, end);
             }
+            return result;
         }
-        return Some(result);
-    }
-    Some(file.reserve_range(&fs, offset, len))
+        file.reserve_range(&fs, offset, len)
+    }))
 }
 
 pub fn punch_hole_fallocate_range(
@@ -676,8 +703,10 @@ pub fn punch_hole_fallocate_range(
     if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
         return Some(Err(err));
     }
-    file.punch_hole(&fs, offset, len);
-    Some(Ok(()))
+    Some(inode.with_file_capability_killpriv(|| {
+        file.punch_hole(&fs, offset, len);
+        Ok(())
+    }))
 }
 
 pub fn collapse_fallocate_range(
@@ -690,7 +719,7 @@ pub fn collapse_fallocate_range(
     if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
         return Some(Err(err));
     }
-    Some(file.collapse_range(&fs, offset, len))
+    Some(inode.with_file_capability_killpriv(|| file.collapse_range(&fs, offset, len)))
 }
 
 pub fn insert_fallocate_range(
@@ -703,7 +732,7 @@ pub fn insert_fallocate_range(
     if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
         return Some(Err(err));
     }
-    Some(file.insert_range(offset, len))
+    Some(inode.with_file_capability_killpriv(|| file.insert_range(offset, len)))
 }
 
 pub fn seek_data_or_hole(
@@ -747,6 +776,31 @@ struct Inode {
 }
 
 impl Inode {
+    /// Serializes a content or ownership mutation with the tmpfs xattr store.
+    /// On success, the file-capability record is removed before the inode lock
+    /// is released. The removed allocation is destroyed only after unlock.
+    fn with_file_capability_killpriv<T, E>(
+        &self,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let (result, retired) = {
+            let mut xattrs = self.xattrs.lock();
+            let result = operation();
+            let retired = result
+                .as_ref()
+                .ok()
+                .and_then(|_| xattrs.remove(FILE_CAPABILITY_XATTR));
+            (result, retired)
+        };
+        drop(retired);
+        result
+    }
+
+    fn kill_file_capability(&self) {
+        let retired = self.xattrs.lock().remove(FILE_CAPABILITY_XATTR);
+        drop(retired);
+    }
+
     /// Builds a complete inode without publishing it in the filesystem's live
     /// identity map. Directory dot entries and the per-inode xattr ownership
     /// are admitted here, so later registry/namespace insertion cannot fail.
@@ -1087,19 +1141,34 @@ impl FileNodeOps for MemoryNode {
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
-        self.inode.as_file()?.write_at(&self.fs, buf, offset)
+        let file = self.inode.as_file()?;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.inode
+            .with_file_capability_killpriv(|| file.write_at(&self.fs, buf, offset))
     }
 
     fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {
         let file = self.inode.as_file()?;
+        if buf.is_empty() {
+            return Ok((0, *file.length.lock()));
+        }
         let offset = *file.length.lock();
-        let written = file.write_at(&self.fs, buf, offset)?;
+        let written = self
+            .inode
+            .with_file_capability_killpriv(|| file.write_at(&self.fs, buf, offset))?;
         Ok((written, offset + written as u64))
     }
 
     fn set_len(&self, len: u64) -> VfsResult<()> {
-        self.inode.as_file()?.set_len(&self.fs, len);
-        Ok(())
+        let file = self.inode.as_file()?;
+        // Linux do_truncate() requests ATTR_KILL_PRIV even when the requested
+        // length equals i_size, so a successful truncate is a killpriv event.
+        self.inode.with_file_capability_killpriv(|| {
+            file.set_len(&self.fs, len);
+            Ok(())
+        })
     }
 
     fn set_symlink(&self, target: &str) -> VfsResult<()> {
@@ -1479,15 +1548,44 @@ mod tests {
     use alloc::{
         string::{String, ToString},
         sync::Arc,
+        vec,
         vec::Vec,
     };
 
+    use axerrno::AxError;
     use axfs_ng_vfs::{
         AnonymousOptions, CreateDisposition, DeviceId, InitialNodeData, MetadataUpdate, Mountpoint,
         NamedCreateOptions, NodePermission, NodeType, VfsError,
     };
 
-    use super::MemoryFs;
+    use super::{FILE_CAPABILITY_XATTR, MemoryFs, with_file_capability_killpriv, xattr_store};
+
+    fn regular_file(name: &str) -> axfs_ng_vfs::Location {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        mount
+            .root_location()
+            .create(
+                name,
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o755),
+            )
+            .unwrap()
+    }
+
+    fn install_test_file_capability(file: &axfs_ng_vfs::Location) {
+        xattr_store(file)
+            .unwrap()
+            .lock()
+            .insert(FILE_CAPABILITY_XATTR.to_string(), vec![1, 2, 3]);
+    }
+
+    fn has_test_file_capability(file: &axfs_ng_vfs::Location) -> bool {
+        xattr_store(file)
+            .unwrap()
+            .lock()
+            .contains_key(FILE_CAPABILITY_XATTR)
+    }
 
     fn directory_names(root: &axfs_ng_vfs::Location) -> Vec<String> {
         let mut names = Vec::new();
@@ -1498,6 +1596,36 @@ mod tests {
         .unwrap();
         names.sort();
         names
+    }
+
+    #[test]
+    fn successful_content_and_size_mutations_kill_file_capabilities() {
+        let file = regular_file("killpriv-content");
+        let node = file.entry().as_file().unwrap();
+
+        install_test_file_capability(&file);
+        assert_eq!(node.write_at(&[], 0).unwrap(), 0);
+        assert!(has_test_file_capability(&file));
+
+        assert_eq!(node.write_at(b"content", 0).unwrap(), 7);
+        assert!(!has_test_file_capability(&file));
+
+        install_test_file_capability(&file);
+        let unchanged = node.len().unwrap();
+        node.set_len(unchanged).unwrap();
+        assert!(!has_test_file_capability(&file));
+    }
+
+    #[test]
+    fn failed_inode_transaction_preserves_file_capability() {
+        let file = regular_file("killpriv-failure");
+        install_test_file_capability(&file);
+
+        assert_eq!(
+            with_file_capability_killpriv(&file, || Err::<(), _>(AxError::StorageFull)),
+            Err(AxError::StorageFull)
+        );
+        assert!(has_test_file_capability(&file));
     }
 
     #[test]

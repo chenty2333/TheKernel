@@ -13,8 +13,9 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     task::{
-        AlarmClock, AsThread, FutexHandle, FutexKey, FutexWaitRestart, RestartBlock,
-        futex_table_for, get_visible_task, wait_on_any_futex_if,
+        AlarmClock, AsThread, FutexHandle, FutexKey, FutexWaitRestart, PtraceAccessMode,
+        RestartBlock, check_current_thread_ptrace_image_access, futex_table_for, get_visible_task,
+        wait_on_any_futex_if,
     },
     time::TimeValueLike,
 };
@@ -298,19 +299,28 @@ pub fn sys_get_robust_list(
     let current_task = current();
     let current_thread = current_task.as_thread();
     let current_tid = current_thread.tid();
-    let task = if tid == 0 || tid == current_tid {
-        current_task.clone()
-    } else {
-        let cred = current_thread.current_cred();
-        if !cred.is_initial_root_euid() {
-            return Err(AxError::OperationNotPermitted);
+    let (task, authorized_image) = match robust_list_access_mode(tid, current_tid) {
+        None => (current_task.clone(), None),
+        Some(mode) => {
+            let task = get_visible_task(tid)?;
+            let target = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+            let authorized = check_current_thread_ptrace_image_access(target, mode)?;
+            (task, Some(authorized))
         }
-        get_visible_task(tid)?
     };
-    head.vm_write(task.as_thread().robust_list_head() as _)?;
+    let target = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+    head.vm_write(target.robust_list_head() as _)?;
     size.vm_write(size_of::<robust_list_head>())?;
+    // Retain the exact credential/image authorization through both the target
+    // read and userspace result publication. This prevents the caller from
+    // authorizing one task image and then silently resampling another.
+    drop(authorized_image);
 
     Ok(0)
+}
+
+fn robust_list_access_mode(tid: u32, current_tid: u32) -> Option<PtraceAccessMode> {
+    (tid != 0 && tid != current_tid).then_some(PtraceAccessMode::ReadReal)
 }
 
 pub fn sys_set_robust_list(head: *const robust_list_head, size: usize) -> AxResult<isize> {
@@ -320,4 +330,19 @@ pub fn sys_set_robust_list(head: *const robust_list_head, size: usize) -> AxResu
     current().as_thread().set_robust_list_head(head.addr());
 
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PtraceAccessMode, robust_list_access_mode};
+
+    #[test]
+    fn credential_caller_robust_list_uses_read_real_only_for_other_tid() {
+        assert_eq!(robust_list_access_mode(0, 41), None);
+        assert_eq!(robust_list_access_mode(41, 41), None);
+        assert_eq!(
+            robust_list_access_mode(42, 41),
+            Some(PtraceAccessMode::ReadReal)
+        );
+    }
 }
