@@ -12,7 +12,7 @@ use super::{
     ProcessImageAccessSnapshot, Thread, UserGid, UserNamespace, UserUid,
     security::{
         ProcessImageSecurityRef, PtraceAccessContext, PtraceAccessKind, PtraceCredentialKind,
-        SecuritySubject, dispatch_ptrace_access,
+        dispatch_ptrace_access,
     },
 };
 
@@ -235,10 +235,13 @@ fn check_ptrace_access(
         target_image.owner_user_ns(),
         mode,
     ) {
+        let target_image_ref =
+            ProcessImageSecurityRef::new(target_image.owner_user_ns(), target_image.aspace());
         let context = PtraceAccessContext::new(
-            SecuritySubject::new(actor_cred),
-            SecuritySubject::new(target_image.credential()),
-            ProcessImageSecurityRef::new(target_image.owner_user_ns(), target_image.aspace()),
+            actor_cred,
+            target_image.credential(),
+            target_image_ref.owner_user_ns(),
+            &target_image_ref,
             mode.access_kind(),
             mode.credential_kind(),
         );
@@ -480,10 +483,12 @@ mod tests {
             PtraceAccessMode::AttachReal,
         ));
         let image = Arc::new(());
+        let image_ref = ProcessImageSecurityRef::new(&root_ns, &image);
         let context = PtraceAccessContext::new(
-            SecuritySubject::new(&actor),
-            SecuritySubject::new(&target_with_cap),
-            ProcessImageSecurityRef::new(&root_ns, &image),
+            &actor,
+            &target_with_cap,
+            image_ref.owner_user_ns(),
+            &image_ref,
             PtraceAccessKind::Attach,
             PtraceCredentialKind::Real,
         );

@@ -8,42 +8,25 @@ use alloc::sync::Arc;
 use core::marker::PhantomData;
 
 use axerrno::{AxError, AxResult};
-use linux_raw_sys::general::{CAP_SYS_NICE, CAP_SYS_PTRACE};
-
-use super::{
-    Cred, ExecCredentialSecurityContext, UserNamespace, creds::CAPABILITY_WORDS,
-    exec_cred::authorize_commoncap_exec, ns_capable,
+use thekernel_linux_cred::{
+    AuthorizationError, commoncap_ptrace_access as external_commoncap_ptrace_access,
+    commoncap_ptrace_traceme as external_commoncap_ptrace_traceme,
+    commoncap_scheduler as external_commoncap_scheduler,
 };
+pub(crate) use thekernel_linux_cred::{
+    PtraceAccessKind, PtraceCredentialKind, SchedulerSecurityOperation,
+};
+
+use super::{ExecCredentialSecurityContext, UserNamespace, exec_cred::authorize_commoncap_exec};
 
 const SECURITY_HOOK_LIMIT: usize = 8;
 
-/// The ptrace operation class visible to security policy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PtraceAccessKind {
-    Read,
-    Attach,
-}
-
-/// The caller credential view selected by a ptrace-style operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PtraceCredentialKind {
-    Real,
-    Fs,
-}
-
-/// One immutable credential snapshot presented to security policy.
-#[derive(Clone, Copy)]
-pub(crate) struct SecuritySubject<'a> {
-    credential: &'a Cred,
-}
-
-impl<'a> SecuritySubject<'a> {
-    pub(crate) const fn new(credential: &'a Cred) -> Self {
-        Self { credential }
-    }
-
-    pub(crate) const fn credential(self) -> &'a Cred {
-        self.credential
+/// Maps policy-neutral authorization failures at the kernel adapter boundary.
+pub(crate) const fn authorization_error(error: AuthorizationError) -> AxError {
+    match error {
+        AuthorizationError::NotPermitted => AxError::OperationNotPermitted,
+        AuthorizationError::AccessDenied => AxError::PermissionDenied,
+        _ => AxError::OperationNotPermitted,
     }
 }
 
@@ -95,161 +78,14 @@ impl<'a> ProcessImageSecurityRef<'a> {
     }
 }
 
-/// Complete immutable input to a ptrace access hook stack.
-#[derive(Clone, Copy)]
-pub(crate) struct PtraceAccessContext<'a> {
-    actor: SecuritySubject<'a>,
-    target: SecuritySubject<'a>,
-    target_image: ProcessImageSecurityRef<'a>,
-    access_kind: PtraceAccessKind,
-    credential_kind: PtraceCredentialKind,
-}
-
-impl<'a> PtraceAccessContext<'a> {
-    pub(crate) const fn new(
-        actor: SecuritySubject<'a>,
-        target: SecuritySubject<'a>,
-        target_image: ProcessImageSecurityRef<'a>,
-        access_kind: PtraceAccessKind,
-        credential_kind: PtraceCredentialKind,
-    ) -> Self {
-        Self {
-            actor,
-            target,
-            target_image,
-            access_kind,
-            credential_kind,
-        }
-    }
-
-    pub(crate) const fn actor(self) -> SecuritySubject<'a> {
-        self.actor
-    }
-
-    pub(crate) const fn target(self) -> SecuritySubject<'a> {
-        self.target
-    }
-
-    pub(crate) const fn target_image(self) -> ProcessImageSecurityRef<'a> {
-        self.target_image
-    }
-
-    pub(crate) const fn access_kind(self) -> PtraceAccessKind {
-        self.access_kind
-    }
-
-    pub(crate) const fn credential_kind(self) -> PtraceCredentialKind {
-        self.credential_kind
-    }
-}
-
-/// Complete immutable input to a `PTRACE_TRACEME` hook stack.
-///
-/// The parent is the prospective tracer (actor); the calling child is the
-/// trace target. Keeping those directions in the field and accessor names
-/// avoids the easy-to-miss reversal in a traceme implementation.
-#[derive(Clone, Copy)]
-pub(crate) struct PtraceTracemeContext<'a> {
-    parent_actor: SecuritySubject<'a>,
-    child_target: SecuritySubject<'a>,
-    child_image: ProcessImageSecurityRef<'a>,
-}
-
-impl<'a> PtraceTracemeContext<'a> {
-    pub(crate) const fn new(
-        parent_actor: SecuritySubject<'a>,
-        child_target: SecuritySubject<'a>,
-        child_image: ProcessImageSecurityRef<'a>,
-    ) -> Self {
-        Self {
-            parent_actor,
-            child_target,
-            child_image,
-        }
-    }
-
-    pub(crate) const fn parent_actor(self) -> SecuritySubject<'a> {
-        self.parent_actor
-    }
-
-    pub(crate) const fn child_target(self) -> SecuritySubject<'a> {
-        self.child_target
-    }
-
-    pub(crate) const fn child_image(self) -> ProcessImageSecurityRef<'a> {
-        self.child_image
-    }
-}
-
-/// One Linux-visible scheduler mutation presented to security policy.
-///
-/// The operation carries only immutable, already-sampled facts. In
-/// particular, a hook never re-reads the target task, its resource limits, or
-/// either credential slot while deciding whether the mutation is allowed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SchedulerSecurityOperation {
-    /// Change the scheduling policy. Real-time classes require
-    /// `CAP_SYS_NICE` even when actor and target ownership matches.
-    SetPolicy { realtime: bool },
-    /// Change the parameters of the target's current policy.
-    SetParam { realtime: bool },
-    /// Change the target CPU-affinity mask.
-    SetAffinity,
-    /// Change the target nice value using one frozen target RLIMIT_NICE.
-    SetNice {
-        current_nice: i8,
-        requested_nice: i8,
-        rlimit_nice: u64,
-    },
-}
-
-/// Complete immutable input to one scheduler authority decision.
-#[derive(Clone, Copy)]
-pub(crate) struct SecuritySchedulerContext<'a> {
-    actor: SecuritySubject<'a>,
-    target: SecuritySubject<'a>,
-    operation: SchedulerSecurityOperation,
-    owner_match: bool,
-}
-
-impl<'a> SecuritySchedulerContext<'a> {
-    pub(crate) const fn new(
-        actor: SecuritySubject<'a>,
-        target: SecuritySubject<'a>,
-        operation: SchedulerSecurityOperation,
-        owner_match: bool,
-    ) -> Self {
-        Self {
-            actor,
-            target,
-            operation,
-            owner_match,
-        }
-    }
-
-    pub(crate) const fn actor(self) -> SecuritySubject<'a> {
-        self.actor
-    }
-
-    pub(crate) const fn target(self) -> SecuritySubject<'a> {
-        self.target
-    }
-
-    pub(crate) const fn operation(self) -> SchedulerSecurityOperation {
-        self.operation
-    }
-
-    pub(crate) const fn owner_match(self) -> bool {
-        self.owner_match
-    }
-}
-
-/// Linux scheduler ownership relation over two frozen credentials.
-pub(crate) fn scheduler_owner_matches(actor: &Cred, target: &Cred) -> bool {
-    let actor_euid = actor.ids().euid;
-    let target_ids = target.ids();
-    actor_euid == target_ids.ruid || actor_euid == target_ids.euid
-}
+/// External typed security contexts specialized to TheKernel's namespace and
+/// exact pinned process-image token. The registry and dispatch remain local.
+pub(crate) type PtraceAccessContext<'a> =
+    thekernel_linux_cred::PtraceAccessContext<'a, UserNamespace, ProcessImageSecurityRef<'a>>;
+pub(crate) type PtraceTracemeContext<'a> =
+    thekernel_linux_cred::PtraceTracemeContext<'a, UserNamespace, ProcessImageSecurityRef<'a>>;
+pub(crate) type SecuritySchedulerContext<'a> =
+    thekernel_linux_cred::SchedulerSecurityContext<'a, UserNamespace>;
 
 type PtraceAccessHook = for<'a> fn(&PtraceAccessContext<'a>) -> AxResult<()>;
 type PtraceTracemeHook = for<'a> fn(&PtraceTracemeContext<'a>) -> AxResult<()>;
@@ -304,53 +140,12 @@ impl<const N: usize> StaticHookRegistry<SchedulerHook, N> {
     }
 }
 
-fn selected_actor_capabilities(
-    actor: &Cred,
-    credential_kind: PtraceCredentialKind,
-) -> [u32; CAPABILITY_WORDS] {
-    let capabilities = actor.capabilities();
-    match credential_kind {
-        PtraceCredentialKind::Real => capabilities.permitted(),
-        PtraceCredentialKind::Fs => capabilities.effective(),
-    }
-}
-
-/// Linux commoncap ptrace rule over frozen actor and target credentials.
-fn commoncap_allows(actor: &Cred, target: &Cred, credential_kind: PtraceCredentialKind) -> bool {
-    let selected_actor = selected_actor_capabilities(actor, credential_kind);
-    let target_permitted = target.capabilities().permitted();
-    (Arc::ptr_eq(actor.user_ns(), target.user_ns())
-        && target_permitted
-            .iter()
-            .zip(selected_actor.iter())
-            .all(|(target, actor)| target & !actor == 0))
-        || ns_capable(actor, target.user_ns(), CAP_SYS_PTRACE)
-}
-
 fn commoncap_ptrace_access(context: &PtraceAccessContext<'_>) -> AxResult<()> {
-    if commoncap_allows(
-        context.actor().credential(),
-        context.target().credential(),
-        context.credential_kind(),
-    ) {
-        Ok(())
-    } else {
-        Err(AxError::OperationNotPermitted)
-    }
+    external_commoncap_ptrace_access(context).map_err(authorization_error)
 }
 
 fn commoncap_ptrace_traceme(context: &PtraceTracemeContext<'_>) -> AxResult<()> {
-    // PTRACE_TRACEME always evaluates the prospective parent tracer's real
-    // (permitted) capability view over the calling child target.
-    if commoncap_allows(
-        context.parent_actor().credential(),
-        context.child_target().credential(),
-        PtraceCredentialKind::Real,
-    ) {
-        Ok(())
-    } else {
-        Err(AxError::OperationNotPermitted)
-    }
+    external_commoncap_ptrace_traceme(context).map_err(authorization_error)
 }
 
 /// Validates the invariants that must still hold after commoncap's exec
@@ -361,57 +156,8 @@ fn commoncap_exec_credential(context: &ExecCredentialSecurityContext<'_>) -> AxR
     authorize_commoncap_exec(context)
 }
 
-fn valid_rlimit_nice(rlimit_nice: u64) -> Option<u64> {
-    // Linux RLIMIT_NICE is limited to [0, 40]. The current generic rlimit
-    // table historically initializes unspecified resources to infinity and
-    // does not validate this resource on write. Treat an out-of-domain value
-    // as no nice-raising authority instead of turning that legacy default into
-    // an ambient CAP_SYS_NICE equivalent.
-    (rlimit_nice <= 40).then_some(rlimit_nice)
-}
-
-fn nice_to_rlimit(nice: i8) -> Option<u64> {
-    (-20..=19)
-        .contains(&nice)
-        .then_some((20_i32 - nice as i32) as u64)
-}
-
-fn rlimit_allows_nice(rlimit_nice: u64, requested_nice: i8) -> bool {
-    let Some(rlimit_nice) = valid_rlimit_nice(rlimit_nice) else {
-        return false;
-    };
-    nice_to_rlimit(requested_nice).is_some_and(|required| required <= rlimit_nice)
-}
-
-/// Linux commoncap scheduler rule over one frozen actor/target pair.
 fn commoncap_scheduler(context: &SecuritySchedulerContext<'_>) -> AxResult<()> {
-    let actor = context.actor().credential();
-    let target = context.target().credential();
-    let capable = ns_capable(actor, target.user_ns(), CAP_SYS_NICE);
-
-    if !context.owner_match() && !capable {
-        return Err(AxError::OperationNotPermitted);
-    }
-
-    match context.operation() {
-        SchedulerSecurityOperation::SetPolicy { realtime }
-        | SchedulerSecurityOperation::SetParam { realtime }
-            if realtime && !capable =>
-        {
-            Err(AxError::OperationNotPermitted)
-        }
-        SchedulerSecurityOperation::SetNice {
-            current_nice,
-            requested_nice,
-            rlimit_nice,
-        } if requested_nice < current_nice
-            && !capable
-            && !rlimit_allows_nice(rlimit_nice, requested_nice) =>
-        {
-            Err(AxError::PermissionDenied)
-        }
-        _ => Ok(()),
-    }
+    external_commoncap_scheduler(context).map_err(authorization_error)
 }
 
 const PTRACE_ACCESS_HOOKS: StaticHookRegistry<PtraceAccessHook, 1> =
@@ -458,7 +204,9 @@ mod tests {
     use linux_raw_sys::general::{CAP_CHOWN, CAP_SYS_NICE, CAP_SYS_PTRACE};
 
     use super::*;
-    use crate::task::{CapabilityState, CredentialSlot, Credentials, Kgid, Kuid};
+    use crate::task::{
+        CapabilityState, Cred, CredentialSlot, Credentials, Kgid, Kuid, creds::CAPABILITY_WORDS,
+    };
 
     static ORDER_HOOK_TRACE: AtomicU32 = AtomicU32::new(0);
     static DENY_HOOK_TRACE: AtomicU32 = AtomicU32::new(0);
@@ -517,25 +265,20 @@ mod tests {
         target: &'a Cred,
         operation: SchedulerSecurityOperation,
     ) -> SecuritySchedulerContext<'a> {
-        SecuritySchedulerContext::new(
-            SecuritySubject::new(actor),
-            SecuritySubject::new(target),
-            operation,
-            scheduler_owner_matches(actor, target),
-        )
+        SecuritySchedulerContext::new(actor, target, operation)
     }
 
     fn access_context<'a>(
         actor: &'a Cred,
         target: &'a Cred,
-        owner_user_ns: &'a Arc<UserNamespace>,
-        image: &'a Arc<()>,
+        image: &'a ProcessImageSecurityRef<'a>,
         credential_kind: PtraceCredentialKind,
     ) -> PtraceAccessContext<'a> {
         PtraceAccessContext::new(
-            SecuritySubject::new(actor),
-            SecuritySubject::new(target),
-            ProcessImageSecurityRef::new(owner_user_ns, image),
+            actor,
+            target,
+            image.owner_user_ns(),
+            image,
             PtraceAccessKind::Attach,
             credential_kind,
         )
@@ -563,8 +306,8 @@ mod tests {
     }
 
     fn record_traceme_direction(context: &PtraceTracemeContext<'_>) -> AxResult<()> {
-        let parent = context.parent_actor().credential().ids().euid;
-        let child = context.child_target().credential().ids().euid;
+        let parent = context.parent_actor().ids().euid;
+        let child = context.child_target().ids().euid;
         if parent == Kuid::INITIAL_ROOT && child == Kuid::from_raw(1000).unwrap() {
             TRACEME_DIRECTION.store(1, Ordering::SeqCst);
             Ok(())
@@ -616,10 +359,12 @@ mod tests {
         let namespace = UserNamespace::try_new_root().unwrap();
         let credential = Cred::try_root(namespace.clone()).unwrap();
         let image = Arc::new(());
+        let image_ref = ProcessImageSecurityRef::new(&namespace, &image);
         let context = PtraceAccessContext::new(
-            SecuritySubject::new(&credential),
-            SecuritySubject::new(&credential),
-            ProcessImageSecurityRef::new(&namespace, &image),
+            &credential,
+            &credential,
+            image_ref.owner_user_ns(),
+            &image_ref,
             PtraceAccessKind::Read,
             PtraceCredentialKind::Real,
         );
@@ -638,11 +383,11 @@ mod tests {
         let namespace = UserNamespace::try_new_root().unwrap();
         let credential = Cred::try_root(namespace.clone()).unwrap();
         let image = Arc::new(());
+        let image_ref = ProcessImageSecurityRef::new(&namespace, &image);
         let context = access_context(
             &credential,
             &credential,
-            &namespace,
-            &image,
+            &image_ref,
             PtraceCredentialKind::Real,
         );
         let hooks = StaticHookRegistry::new([
@@ -695,12 +440,12 @@ mod tests {
         let actor = credential_with_caps(&root, &[CAP_CHOWN], &[]);
         let target = credential_with_caps(&root, &[CAP_CHOWN], &[]);
         let image = Arc::new(());
+        let image_ref = ProcessImageSecurityRef::new(&namespace, &image);
 
         dispatch_ptrace_access(&access_context(
             &actor,
             &target,
-            &namespace,
-            &image,
+            &image_ref,
             PtraceCredentialKind::Real,
         ))
         .unwrap();
@@ -708,8 +453,7 @@ mod tests {
             dispatch_ptrace_access(&access_context(
                 &actor,
                 &target,
-                &namespace,
-                &image,
+                &image_ref,
                 PtraceCredentialKind::Fs,
             )),
             Err(AxError::OperationNotPermitted)
@@ -735,11 +479,9 @@ mod tests {
         child_update.builder.ids.fsgid = child_gid;
         let child = child_update.finish().unwrap().commit();
         let image = Arc::new(());
-        let context = PtraceTracemeContext::new(
-            SecuritySubject::new(&parent),
-            SecuritySubject::new(&child),
-            ProcessImageSecurityRef::new(&namespace, &image),
-        );
+        let image_ref = ProcessImageSecurityRef::new(&namespace, &image);
+        let context =
+            PtraceTracemeContext::new(&parent, &child, image_ref.owner_user_ns(), &image_ref);
 
         // Reversing actor and target would incorrectly allow this relation:
         // the child's CAP_CHOWN set contains the empty parent set.
@@ -771,12 +513,12 @@ mod tests {
         let actor = credential_with_caps(&root, &[CAP_SYS_PTRACE], &[CAP_SYS_PTRACE]);
         let unprivileged_actor = credential_with_caps(&root, &[CAP_SYS_PTRACE], &[]);
         let image = Arc::new(());
+        let image_ref = ProcessImageSecurityRef::new(&child_namespace, &image);
 
         dispatch_ptrace_access(&access_context(
             &actor,
             &target,
-            &child_namespace,
-            &image,
+            &image_ref,
             PtraceCredentialKind::Real,
         ))
         .unwrap();
@@ -784,8 +526,7 @@ mod tests {
             dispatch_ptrace_access(&access_context(
                 &unprivileged_actor,
                 &target,
-                &child_namespace,
-                &image,
+                &image_ref,
                 PtraceCredentialKind::Real,
             )),
             Err(AxError::OperationNotPermitted)
@@ -957,14 +698,8 @@ mod tests {
         target_update.builder.ids.euid = actor_uid;
         target_update.finish().unwrap().commit();
 
-        assert_eq!(
-            context.actor().credential().ids().euid,
-            Kuid::from_raw(1000).unwrap()
-        );
-        assert_eq!(
-            context.target().credential().ids().euid,
-            Kuid::from_raw(2000).unwrap()
-        );
+        assert_eq!(context.actor().ids().euid, Kuid::from_raw(1000).unwrap());
+        assert_eq!(context.target().ids().euid, Kuid::from_raw(2000).unwrap());
         assert!(!context.owner_match());
         assert_eq!(
             dispatch_scheduler(&context),
@@ -988,14 +723,14 @@ mod tests {
     }
 
     #[test]
-    fn credential_caller_nice_to_rlimit_boundaries_are_exact_and_bounded() {
-        assert_eq!(nice_to_rlimit(-20), Some(40));
-        assert_eq!(nice_to_rlimit(19), Some(1));
-        assert_eq!(nice_to_rlimit(-21), None);
-        assert_eq!(nice_to_rlimit(20), None);
-        assert!(!rlimit_allows_nice(0, 19));
-        assert!(rlimit_allows_nice(1, 19));
-        assert!(rlimit_allows_nice(40, -20));
-        assert!(!rlimit_allows_nice(u64::MAX, 19));
+    fn authorization_errors_map_to_linux_errno_classes() {
+        assert_eq!(
+            authorization_error(AuthorizationError::NotPermitted),
+            AxError::OperationNotPermitted
+        );
+        assert_eq!(
+            authorization_error(AuthorizationError::AccessDenied),
+            AxError::PermissionDenied
+        );
     }
 }

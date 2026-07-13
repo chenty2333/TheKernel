@@ -25,10 +25,7 @@ use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 use crate::{
     task::{
         AlarmClock, AsThread, Cred, ProcStateHint, get_process_group, get_task, process_domain,
-        security::{
-            SchedulerSecurityOperation, SecuritySchedulerContext, SecuritySubject,
-            dispatch_scheduler, scheduler_owner_matches,
-        },
+        security::{SchedulerSecurityOperation, SecuritySchedulerContext, dispatch_scheduler},
         sleep_until_clock, try_tasks, with_proc_state_hint,
     },
     time::TimeValueLike,
@@ -103,25 +100,18 @@ fn sched_class_for_set(policy: u32, abi: SchedSetAbi) -> AxResult<SchedClass> {
 struct SchedulerAuthoritySnapshot {
     actor: Arc<Cred>,
     target: Arc<Cred>,
-    owner_match: bool,
 }
 
 impl SchedulerAuthoritySnapshot {
     fn new(actor: Arc<Cred>, target: Arc<Cred>) -> Self {
-        let owner_match = scheduler_owner_matches(&actor, &target);
-        Self {
-            actor,
-            target,
-            owner_match,
-        }
+        Self { actor, target }
     }
 
     fn authorize(&self, operation: SchedulerSecurityOperation) -> AxResult<()> {
         dispatch_scheduler(&SecuritySchedulerContext::new(
-            SecuritySubject::new(&self.actor),
-            SecuritySubject::new(&self.target),
+            &self.actor,
+            &self.target,
             operation,
-            self.owner_match,
         ))
     }
 }

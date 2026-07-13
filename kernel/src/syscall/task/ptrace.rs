@@ -10,9 +10,7 @@ use crate::task::{
     AsThread, ProcessData, PtraceAccessMode, PtraceReverseLink, PtraceSession,
     TaskParentCredentialPin, Thread, check_current_thread_ptrace_image_access, get_task,
     get_visible_task, notify_ptrace_attach_stop, reinject_ptrace_signal,
-    security::{
-        ProcessImageSecurityRef, PtraceTracemeContext, SecuritySubject, dispatch_ptrace_traceme,
-    },
+    security::{ProcessImageSecurityRef, PtraceTracemeContext, dispatch_ptrace_traceme},
     send_signal_to_process,
 };
 
@@ -280,10 +278,13 @@ fn sys_ptrace_traceme() -> AxResult<isize> {
     let parent_task = resolve_exact_parent()?;
     let authorized_image = proc_data.thread_image_access_snapshot(child)?;
 
+    let child_image_ref =
+        ProcessImageSecurityRef::new(authorized_image.owner_user_ns(), authorized_image.aspace());
     let context = PtraceTracemeContext::new(
-        SecuritySubject::new(parent_snapshot.credential()),
-        SecuritySubject::new(authorized_image.credential()),
-        ProcessImageSecurityRef::new(authorized_image.owner_user_ns(), authorized_image.aspace()),
+        parent_snapshot.credential(),
+        authorized_image.credential(),
+        child_image_ref.owner_user_ns(),
+        &child_image_ref,
     );
     // All process-image locks used to create `authorized_image` have already
     // been released, and reverse-link/ptrace spin locks are acquired only
