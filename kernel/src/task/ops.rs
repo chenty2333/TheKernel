@@ -23,10 +23,11 @@ use starry_signal::{SignalActionFlags, SignalDisposition, SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use super::{
-    AsThread, CommittedProcessExit, FutexKey, ITimerType, ProcStateHint, Process, ProcessData,
-    ProcessGroup, Session, TaskUsage, Thread, ThreadExitTransition, TimerState,
-    creds::PreparedCred, futex_table_for, process_domain, send_signal_thread_inner,
-    send_signal_to_process, send_signal_to_thread, user::linux_pid_from_task_id,
+    AsThread, CommittedProcessExit, ExecImageRetirement, FutexKey, ITimerType, ProcStateHint,
+    Process, ProcessAccessState, ProcessData, ProcessGroup, Session, TaskUsage, Thread,
+    ThreadExitTransition, TimerState, creds::PreparedCred, futex_table_for, process_domain,
+    send_signal_thread_inner, send_signal_to_process, send_signal_to_thread,
+    user::linux_pid_from_task_id,
 };
 use crate::{
     mm::{AddrSpace, UserPtr, access_user_memory},
@@ -438,22 +439,25 @@ impl TaskAliasAdmission {
     /// alias as one short composite transition. All retired strong references
     /// and the credential writer guard are released after the alias and
     /// leader-binding locks have both been dropped.
-    pub(crate) fn commit_exec_handoff(
+    pub(crate) fn commit_exec_handoff<'a>(
         mut self,
         proc_data: &ProcessData,
         owner: Pid,
         thread: &Thread,
-        prepared: Option<PreparedCred<'_>>,
-    ) {
+        prepared: Option<PreparedCred<'a>>,
+        new_aspace: Arc<Mutex<AddrSpace>>,
+        new_access_state: Arc<ProcessAccessState>,
+    ) -> ExecImageRetirement<'a> {
         debug_assert!(core::ptr::eq(self.task.as_thread(), thread));
         let mut aliases = TASK_ALIAS_TABLE.lock();
-        let retirement = proc_data.publish_group_leader_handoff(owner, thread, prepared);
+        let retirement =
+            proc_data.publish_exec_image(owner, thread, prepared, new_aspace, new_access_state);
         thread.set_tid(self.alias);
         let old = aliases.insert_reserved(self.alias, &self.task);
         self.committed = true;
         drop(aliases);
         drop(old);
-        drop(retirement);
+        retirement
     }
 }
 
@@ -461,18 +465,26 @@ impl TaskAliasAdmission {
 /// non-leader exec includes the reserved alias in the same short critical
 /// section; a leader exec only republishes its existing slot after applying
 /// the prepared credential.
-pub(crate) fn commit_exec_identity_handoff(
+pub(crate) fn commit_exec_identity_handoff<'a>(
     admission: Option<TaskAliasAdmission>,
     proc_data: &ProcessData,
     owner: Pid,
     thread: &Thread,
-    prepared: Option<PreparedCred<'_>>,
-) {
+    prepared: Option<PreparedCred<'a>>,
+    new_aspace: Arc<Mutex<AddrSpace>>,
+    new_access_state: Arc<ProcessAccessState>,
+) -> ExecImageRetirement<'a> {
     if let Some(admission) = admission {
-        admission.commit_exec_handoff(proc_data, owner, thread, prepared);
+        admission.commit_exec_handoff(
+            proc_data,
+            owner,
+            thread,
+            prepared,
+            new_aspace,
+            new_access_state,
+        )
     } else {
-        let retirement = proc_data.publish_group_leader_handoff(owner, thread, prepared);
-        drop(retirement);
+        proc_data.publish_exec_image(owner, thread, prepared, new_aspace, new_access_state)
     }
 }
 

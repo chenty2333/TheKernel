@@ -105,7 +105,7 @@ impl Thread {
             return Ok(());
         }
         update.builder.no_new_privs = true;
-        update.finish()?.commit();
+        self.commit_credential(update.finish()?);
         Ok(())
     }
 }
@@ -113,6 +113,11 @@ impl Thread {
 impl Thread {
     pub(crate) fn current_cred(&self) -> Arc<Cred> {
         self.credential.current()
+    }
+
+    fn commit_credential<'a>(&self, prepared: PreparedCred<'a>) -> Arc<Cred> {
+        self.proc_data
+            .publish_credential(prepared, self.pdeath_signal_state())
     }
 
     pub(crate) fn set_supplementary_groups(&self, groups: Vec<Kgid>) -> AxResult<()> {
@@ -131,7 +136,7 @@ impl Thread {
             return Ok(());
         }
         update.builder.groups = groups;
-        update.finish()?.commit();
+        self.commit_credential(update.finish()?);
         Ok(())
     }
 
@@ -145,7 +150,7 @@ impl Thread {
         if update.builder.caps == old {
             return Ok(());
         }
-        update.finish()?.commit();
+        self.commit_credential(update.finish()?);
         Ok(())
     }
 }
@@ -187,7 +192,7 @@ impl Thread {
             return Err(AxError::OperationNotPermitted);
         }
         update.builder.caps.drop_bounding(cap)?;
-        update.finish()?.commit();
+        self.commit_credential(update.finish()?);
         Ok(())
     }
 
@@ -210,14 +215,14 @@ impl Thread {
             return Err(AxError::OperationNotPermitted);
         }
         update.builder.caps.raise_ambient(cap)?;
-        update.finish()?.commit();
+        self.commit_credential(update.finish()?);
         Ok(())
     }
 
     pub fn lower_ambient_capability(&self, cap: u32) -> AxResult<()> {
         let mut update = self.credential.prepare();
         update.builder.caps.lower_ambient(cap)?;
-        update.finish()?.commit();
+        self.commit_credential(update.finish()?);
         Ok(())
     }
 
@@ -227,7 +232,7 @@ impl Thread {
             return Ok(());
         }
         update.builder.caps.clear_ambient();
-        update.finish()?.commit();
+        self.commit_credential(update.finish()?);
         Ok(())
     }
 
@@ -255,7 +260,7 @@ impl Thread {
             return Err(AxError::OperationNotPermitted);
         }
         update.builder.caps.securebits = securebits;
-        update.finish()?.commit();
+        self.commit_credential(update.finish()?);
         Ok(())
     }
 
@@ -276,7 +281,7 @@ impl Thread {
         } else {
             update.builder.caps.securebits &= !SECBIT_KEEP_CAPS;
         }
-        update.finish()?.commit();
+        self.commit_credential(update.finish()?);
         Ok(())
     }
 
@@ -380,7 +385,7 @@ impl Thread {
                 update.builder.ids,
                 &mut update.builder.caps,
             );
-            update.finish()?.commit();
+            self.commit_credential(update.finish()?);
             return Ok(());
         }
         if uid == old.ruid || uid == old.suid {
@@ -392,7 +397,7 @@ impl Thread {
                 update.builder.ids,
                 &mut update.builder.caps,
             );
-            update.finish()?.commit();
+            self.commit_credential(update.finish()?);
             return Ok(());
         }
         Err(AxError::OperationNotPermitted)
@@ -409,13 +414,13 @@ impl Thread {
             update.builder.ids.egid = gid;
             update.builder.ids.sgid = gid;
             update.builder.ids.fsgid = gid;
-            update.finish()?.commit();
+            self.commit_credential(update.finish()?);
             return Ok(());
         }
         if gid == old.rgid || gid == old.sgid {
             update.builder.ids.egid = gid;
             update.builder.ids.fsgid = gid;
-            update.finish()?.commit();
+            self.commit_credential(update.finish()?);
             return Ok(());
         }
         Err(AxError::OperationNotPermitted)
@@ -458,7 +463,7 @@ impl Thread {
             update.builder.ids,
             &mut update.builder.caps,
         );
-        update.finish()?.commit();
+        self.commit_credential(update.finish()?);
         Ok(())
     }
 
@@ -492,7 +497,7 @@ impl Thread {
         if rgid.is_some() || egid.is_some_and(|id| id != old.rgid) {
             update.builder.ids.sgid = new_egid;
         }
-        update.finish()?.commit();
+        self.commit_credential(update.finish()?);
         Ok(())
     }
 
@@ -532,7 +537,7 @@ impl Thread {
             update.builder.ids,
             &mut update.builder.caps,
         );
-        update.finish()?.commit();
+        self.commit_credential(update.finish()?);
         Ok(())
     }
 
@@ -565,14 +570,14 @@ impl Thread {
             update.builder.ids.sgid = id;
         }
         update.builder.ids.fsgid = update.builder.ids.egid;
-        update.finish()?.commit();
+        self.commit_credential(update.finish()?);
         Ok(())
     }
 
     pub(crate) fn setfsuid(&self, fsuid: Kuid) -> AxResult<Kuid> {
         let (old_fsuid, update) = prepare_setfsuid_update(&self.credential, fsuid)?;
         if let Some(update) = update {
-            update.commit();
+            self.commit_credential(update);
         }
         Ok(old_fsuid)
     }
@@ -580,7 +585,7 @@ impl Thread {
     pub(crate) fn setfsgid(&self, fsgid: Kgid) -> AxResult<Kgid> {
         let (old_fsgid, update) = prepare_setfsgid_update(&self.credential, fsgid)?;
         if let Some(update) = update {
-            update.commit();
+            self.commit_credential(update);
         }
         Ok(old_fsgid)
     }

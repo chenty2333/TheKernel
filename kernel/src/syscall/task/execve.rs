@@ -22,13 +22,15 @@ use crate::{
         FD_TABLE, ResolveAtResult, executable, fanotify, replace_process_fd_table,
         resolve_at_with_credentials,
     },
-    mm::{copy_from_kernel, load_user_app_at, new_user_aspace_empty, vm_load_string},
+    mm::{
+        ExecImageAccess, copy_from_kernel, load_user_app_at, new_user_aspace_empty, vm_load_string,
+    },
     readiness::block_on_poll_set,
     task::{
-        AsThread, DacCredentialView, ProcessData, Thread, check_signals,
-        commit_exec_identity_handoff, get_task, has_pending_fatal_signal, linux_pid_from_task_id,
-        notify_ptrace_attach_stop, prepare_task_alias_admission, process_error,
-        set_current_user_page_table_root,
+        AsThread, Cred, DacCredentialView, Dumpability, ProcessAccessState, ProcessData, Thread,
+        check_signals, commit_exec_identity_handoff, get_task, has_pending_fatal_signal,
+        linux_pid_from_task_id, notify_ptrace_attach_stop, prepare_task_alias_admission,
+        process_error, set_current_user_page_table_root,
     },
 };
 
@@ -42,6 +44,20 @@ fn interrupt_exec_siblings(sibling_tids: &[Pid]) {
 
 fn files_preparation_covers_thread_snapshot(has_private_table: bool, threads: &[Pid]) -> bool {
     has_private_table || threads.len() <= 1
+}
+
+fn exec_dumpability(credential: &Cred, image_access: ExecImageAccess) -> Dumpability {
+    let ids = credential.ids();
+    if image_access.allows_user_dumpable()
+        && ids.ruid == ids.euid
+        && ids.rgid == ids.egid
+        && ids.fsuid == ids.euid
+        && ids.fsgid == ids.egid
+    {
+        Dumpability::UserDumpable
+    } else {
+        Dumpability::NotDumpable
+    }
 }
 
 fn reset_exec_signal_state(thr: &Thread) {
@@ -258,7 +274,7 @@ fn do_execve(
 
     let mut new_aspace = exec_or_release(executable_key, new_user_aspace_empty())?;
     exec_or_release(executable_key, copy_from_kernel(&mut new_aspace))?;
-    let (entry_point, user_stack_base) = exec_or_release(
+    let loaded = exec_or_release(
         executable_key,
         load_user_app_at(
             &mut new_aspace,
@@ -269,6 +285,8 @@ fn do_execve(
             credentials,
         ),
     )?;
+    let entry_point = loaded.entry_point;
+    let user_stack_base = loaded.stack_pointer;
     fanotify::notify(
         &loc,
         &loc,
@@ -293,6 +311,12 @@ fn do_execve(
 
     let thr = curr.as_thread();
     let proc_data = &thr.proc_data;
+    let pre_exec_cred = thr.current_cred();
+    let new_dumpability = exec_dumpability(&pre_exec_cred, loaded.image_access);
+    let new_access_state = exec_or_release(
+        executable_key,
+        ProcessAccessState::try_new(new_dumpability, pre_exec_cred.user_ns().clone()),
+    )?;
     let new_task_alias = (!thr.is_thread_group_leader()).then(|| curr.clone());
     let task_alias_admission = match new_task_alias
         .as_ref()
@@ -342,6 +366,17 @@ fn do_execve(
         }
     };
 
+    // Credential allocation and invariant checks must finish before the first
+    // irreversible de-threading action. The prepared value remains invisible
+    // until the composite image publication below.
+    let prepared_exec_cred = match thr.prepare_clear_keep_caps_on_exec() {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            executable::release(executable_key);
+            return Err(err);
+        }
+    };
+
     // Gate every exec, including an apparently single-threaded one. Otherwise
     // CLONE_THREAD can publish a sibling between the preflight count and the
     // irreversible commit. The gate freezes thread-group growth; the snapshot
@@ -373,33 +408,6 @@ fn do_execve(
         executable::release(executable_key);
         return Err(err);
     }
-    // Credential allocation and invariant checks must finish before the first
-    // irreversible exec action. The prepared value remains invisible until
-    // the address-space commit below.
-    let prepared_exec_cred = match thr.prepare_clear_keep_caps_on_exec() {
-        Ok(prepared) => prepared,
-        Err(err) => {
-            proc_data.end_exec(curr_tid);
-            executable::release(executable_key);
-            return Err(err);
-        }
-    };
-
-    // A non-leader exec adopts the thread-group ID. The visible TID change and
-    // pre-reserved alias publication are one registry-locked transition, so
-    // external TID lookup observes either the old identity or the new one,
-    // never an alias/visible-TID split.
-    commit_exec_identity_handoff(
-        task_alias_admission,
-        proc_data,
-        curr_tid,
-        thr,
-        prepared_exec_cred,
-    );
-    // The executor credential, persistent group-leader binding, and any
-    // de-thread alias are now committed before the new address space becomes
-    // visible. From this point onward no remaining exec commit step can fail.
-
     if let Some(private) = private_fd_table {
         let previous = thr.with_mut_scope(|scope| replace_process_fd_table(scope, private));
         drop(previous);
@@ -411,9 +419,23 @@ fn do_execve(
     crate::file::inotify::wait_current_close_notifications();
 
     crate::syscall::cleanup_process_aio(proc_data.proc.pid());
-    let old_aspace = proc_data.replace_aspace(new_aspace);
+
+    // A non-leader exec adopts the thread-group ID. The visible TID, reserved
+    // alias, credential/group-leader binding, address space, and access owner
+    // become visible as one composite transition. No fallible commit remains.
+    let exec_retirement = commit_exec_identity_handoff(
+        task_alias_admission,
+        proc_data,
+        curr_tid,
+        thr,
+        prepared_exec_cred,
+        new_aspace,
+        new_access_state,
+    );
     set_current_user_page_table_root(new_root);
-    drop(old_aspace);
+    // The old page tables and credential owners stay alive until both the
+    // saved task context and hardware root name the new image.
+    drop(exec_retirement);
     proc_data.replace_executable(executable_key);
 
     drop(curr.replace_name(task_name));
@@ -430,7 +452,6 @@ fn do_execve(
     drop(old_cmdline);
 
     proc_data.set_heap_top(USER_HEAP_BASE + crate::config::USER_HEAP_SIZE);
-    proc_data.clear_mempolicy_ranges();
 
     #[cfg(target_arch = "loongarch64")]
     reset_current_user_fpu_state();
@@ -476,7 +497,36 @@ pub fn sys_execve(
 
 #[cfg(test)]
 mod tests {
-    use super::files_preparation_covers_thread_snapshot;
+    use super::{exec_dumpability, files_preparation_covers_thread_snapshot};
+    use crate::{
+        mm::ExecImageAccess,
+        task::{Cred, Dumpability, Kuid, UserNamespace},
+    };
+
+    #[test]
+    fn process_access_exec_dumpability_requires_unprivileged_readable_image() {
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let root = Cred::try_root(namespace).unwrap();
+        assert_eq!(
+            exec_dumpability(&root, ExecImageAccess::for_test(true, false)),
+            Dumpability::UserDumpable
+        );
+        assert_eq!(
+            exec_dumpability(&root, ExecImageAccess::for_test(false, false)),
+            Dumpability::NotDumpable
+        );
+        assert_eq!(
+            exec_dumpability(&root, ExecImageAccess::for_test(true, true)),
+            Dumpability::NotDumpable
+        );
+
+        let mismatched =
+            Cred::try_with_euid_for_test(&root, Kuid::from_raw(1000).unwrap()).unwrap();
+        assert_eq!(
+            exec_dumpability(&mismatched, ExecImageAccess::for_test(true, false)),
+            Dumpability::NotDumpable
+        );
+    }
 
     #[test]
     fn exec_files_preparation_rejects_a_clone_race() {

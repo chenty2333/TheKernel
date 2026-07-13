@@ -23,10 +23,11 @@ use crate::{
     readiness::block_on_poll_set_uninterruptible,
     syscall::prepare_proc_shm_inheritance,
     task::{
-        AsThread, Cred, CredentialSlot, InitialProcessThreadAdmission, NetworkNamespace,
-        PendingThreadPublication, ProcessData, ProcessThreadAdmission, Thread, get_process_data,
-        linux_pid_from_task_id, ns_capable, prepare_task_table_admission, process_domain,
-        send_signal_thread_inner, try_new_user_task, try_tasks, vm_write_in_aspace,
+        AsThread, Cred, CredentialSlot, Dumpability, InitialProcessThreadAdmission,
+        NetworkNamespace, PendingThreadPublication, ProcessAccessState, ProcessData,
+        ProcessThreadAdmission, Thread, get_process_data, linux_pid_from_task_id, ns_capable,
+        prepare_task_table_admission, process_domain, send_signal_thread_inner, try_new_user_task,
+        try_tasks, vm_write_in_aspace,
     },
 };
 
@@ -53,6 +54,18 @@ fn clone_namespace_owner(
         return Err(AxError::OperationNotPermitted);
     }
     Ok(owner)
+}
+
+fn clone_process_access_state(
+    flags: CloneFlags,
+    parent_dumpability: Dumpability,
+    parent: Arc<ProcessAccessState>,
+) -> AxResult<Arc<ProcessAccessState>> {
+    if flags.contains(CloneFlags::VM) {
+        Ok(parent)
+    } else {
+        ProcessAccessState::try_new(parent_dumpability, parent.owner_user_ns().clone())
+    }
 }
 
 enum CloneThreadPublication {
@@ -325,7 +338,8 @@ impl CloneArgs {
         let old_proc_data = &calling_thread.proc_data;
         // Both CLONE_THREAD and fork inherit exactly one immutable snapshot
         // from the calling task. Each child receives its own publication slot.
-        let parent_cred = calling_thread.current_cred();
+        let (parent_cred, parent_dumpability, parent_aspace, parent_access_state) =
+            old_proc_data.fork_image_credential_snapshot(calling_thread);
         let child_cred = if flags.contains(CloneFlags::NEWUSER) {
             // Match Linux current_chrooted(): creating a user namespace from
             // a restricted filesystem root must not create authority which
@@ -399,7 +413,7 @@ impl CloneArgs {
         let (new_proc_data, thread_publication) = if flags.contains(CloneFlags::THREAD) {
             new_task
                 .ctx_mut()
-                .set_page_table_root(old_proc_data.aspace().lock().page_table_root());
+                .set_page_table_root(parent_aspace.lock().page_table_root());
             let proc_data = old_proc_data.clone();
             let thread_admission = proc_data.prepare_thread(tid)?;
             (proc_data, CloneThreadPublication::Live(thread_admission))
@@ -415,9 +429,8 @@ impl CloneArgs {
             let proc = process_admission.process().clone();
 
             let aspace = if flags.contains(CloneFlags::VM) {
-                old_proc_data.aspace()
+                parent_aspace
             } else {
-                let parent_aspace = old_proc_data.aspace();
                 let aspace = {
                     let mut parent_guard = parent_aspace.lock();
                     parent_guard.try_clone()?
@@ -425,6 +438,8 @@ impl CloneArgs {
                 copy_from_kernel(&mut aspace.lock())?;
                 aspace
             };
+            let access_state =
+                clone_process_access_state(flags, parent_dumpability, parent_access_state)?;
             new_task
                 .ctx_mut()
                 .set_page_table_root(aspace.lock().page_table_root());
@@ -515,6 +530,7 @@ impl CloneArgs {
                 old_proc_data.retain_executable()?,
                 child_cmdline,
                 aspace,
+                access_state,
                 scope,
                 exit_fd_table,
                 signal_actions,
@@ -708,8 +724,35 @@ mod tests {
     use axerrno::AxError;
     use linux_raw_sys::general::{CLONE_DETACHED, CLONE_PIDFD};
 
-    use super::{CloneApi, CloneArgs, CloneFlags, clone_namespace_owner};
-    use crate::task::{Cred, Kgid, Kuid, UserNamespace};
+    use super::{
+        CloneApi, CloneArgs, CloneFlags, clone_namespace_owner, clone_process_access_state,
+    };
+    use crate::task::{Cred, Dumpability, Kgid, Kuid, ProcessAccessState, UserNamespace};
+
+    #[test]
+    fn process_access_clone_vm_shares_and_fork_copies_image_owner() {
+        let owner = UserNamespace::try_new_root().unwrap();
+        let parent = ProcessAccessState::try_new(Dumpability::UserDumpable, owner.clone()).unwrap();
+        let shared = clone_process_access_state(
+            CloneFlags::VM | CloneFlags::NEWUSER,
+            parent.dumpability(),
+            parent.clone(),
+        )
+        .unwrap();
+        let forked =
+            clone_process_access_state(CloneFlags::empty(), parent.dumpability(), parent.clone())
+                .unwrap();
+
+        assert!(Arc::ptr_eq(&parent, &shared));
+        assert!(!Arc::ptr_eq(&parent, &forked));
+        assert!(Arc::ptr_eq(parent.owner_user_ns(), &owner));
+        assert!(Arc::ptr_eq(shared.owner_user_ns(), &owner));
+        assert!(Arc::ptr_eq(forked.owner_user_ns(), &owner));
+
+        parent.set_dumpability_for_test(Dumpability::NotDumpable);
+        assert_eq!(shared.dumpability(), Dumpability::NotDumpable);
+        assert_eq!(forked.dumpability(), Dumpability::UserDumpable);
+    }
 
     #[test]
     fn clone_validate_allows_detached_without_pidfd() {

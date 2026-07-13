@@ -13,8 +13,8 @@ use crate::{
     file::{FileLike, PidFd},
     mm::{AddrSpace, IoVec, check_user_readable, checked_align_up_4k},
     task::{
-        AsThread, Cred, ProcessData, PtraceCredentialMode, check_current_ptrace_access,
-        get_visible_task,
+        AsThread, PtraceAccessMode, check_current_ptrace_image_snapshot,
+        check_current_thread_ptrace_image_access, get_visible_task,
     },
 };
 
@@ -68,12 +68,7 @@ fn read_iovecs(iovs: *const IoVec, iovcnt: usize) -> AxResult<(Vec<UserIoVec>, u
     Ok((result, total))
 }
 
-fn check_process_vm_permission(target: &ProcessData, target_cred: &Cred) -> AxResult<()> {
-    check_current_ptrace_access(target, target_cred, PtraceCredentialMode::Real)
-}
-
-fn check_process_madvise_permission(target: &ProcessData, target_cred: &Cred) -> AxResult<()> {
-    check_process_vm_permission(target, target_cred)?;
+fn check_process_madvise_capability() -> AxResult<()> {
     let curr = current();
     if curr.as_thread().has_effective_capability(CAP_SYS_NICE) {
         Ok(())
@@ -110,8 +105,10 @@ fn validate_remote_range(
     Ok(())
 }
 
-fn validate_remote_iovecs(target: &ProcessData, remote: &[UserIoVec]) -> AxResult<()> {
-    let aspace_handle = target.aspace();
+fn validate_remote_iovecs(
+    aspace_handle: &Arc<Mutex<AddrSpace>>,
+    remote: &[UserIoVec],
+) -> AxResult<()> {
     let mut aspace = aspace_handle.lock();
     for iov in remote {
         validate_remote_range(&mut aspace, iov.base, iov.len, MappingFlags::READ)?;
@@ -165,7 +162,7 @@ fn copy_to_remote(
 }
 
 fn process_vm_copy(
-    target: &ProcessData,
+    aspace_handle: &Arc<Mutex<AddrSpace>>,
     local: &[UserIoVec],
     remote: &[UserIoVec],
     max_len: usize,
@@ -175,7 +172,6 @@ fn process_vm_copy(
         return Ok(0);
     }
 
-    let aspace_handle = target.aspace();
     let mut scratch = vec![0u8; PROCESS_VM_COPY_CHUNK.min(max_len)];
     let mut local_index = 0usize;
     let mut remote_index = 0usize;
@@ -211,14 +207,14 @@ fn process_vm_copy(
 
         let copy_result = match op {
             ProcessVmOp::ReadRemote => copy_from_remote(
-                &aspace_handle,
+                aspace_handle,
                 remote_addr,
                 local_addr,
                 copy_len,
                 &mut scratch,
             ),
             ProcessVmOp::WriteRemote => copy_to_remote(
-                &aspace_handle,
+                aspace_handle,
                 local_addr,
                 remote_addr,
                 copy_len,
@@ -269,10 +265,10 @@ fn sys_process_vm_rw(
 
     let target_task = get_visible_task(pid as u32)?;
     let target_thread = target_task.as_thread();
-    let target_cred = target_thread.current_cred();
-    let target = target_thread.proc_data.clone();
-    check_process_vm_permission(&target, &target_cred)?;
-    process_vm_copy(&target, &local, &remote, copy_len, op)
+    let target_image =
+        check_current_thread_ptrace_image_access(target_thread, PtraceAccessMode::AttachReal)?;
+    let target_aspace = target_image.into_aspace();
+    process_vm_copy(&target_aspace, &local, &remote, copy_len, op)
 }
 
 pub fn sys_process_vm_readv(
@@ -337,9 +333,11 @@ pub fn sys_process_madvise(
 
     let pidfd = PidFd::from_fd(pidfd)?;
     let target = pidfd.process_data()?;
-    let target_cred = pidfd.credential_snapshot()?;
-    check_process_madvise_permission(&target, &target_cred)?;
-    validate_remote_iovecs(&target, &remote)?;
+    let target_image = pidfd.image_access_snapshot()?;
+    check_current_ptrace_image_snapshot(&target, &target_image, PtraceAccessMode::ReadFs)?;
+    check_process_madvise_capability()?;
+    let target_aspace = target_image.into_aspace();
+    validate_remote_iovecs(&target_aspace, &remote)?;
     Ok(total_len as isize)
 }
 

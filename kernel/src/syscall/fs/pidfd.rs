@@ -10,9 +10,9 @@ use crate::{
     pseudofs::{ProcDirProcess, process_data_from_proc_dir},
     syscall::signal::{parse_signo, queued_signal_required},
     task::{
-        AsThread, ProcessData, PtraceCredentialMode, check_current_ptrace_access,
-        check_current_signal_access, get_process_data, get_visible_task,
-        send_queued_signal_to_process_data, send_signal_to_process_data,
+        AsThread, ProcessData, ProcessImageAccessSnapshot, PtraceAccessMode,
+        check_current_ptrace_image_snapshot, check_current_signal_access, get_process_data,
+        get_visible_task, send_queued_signal_to_process_data, send_signal_to_process_data,
     },
 };
 
@@ -52,9 +52,16 @@ fn signal_target_from_fd(
     }
 }
 
-fn check_pidfd_getfd_permission(pidfd: &PidFd, target: &ProcessData) -> AxResult<()> {
-    let target_cred = pidfd.credential_snapshot()?;
-    check_current_ptrace_access(target, &target_cred, PtraceCredentialMode::Real)
+fn check_pidfd_getfd_permission(
+    pidfd: &PidFd,
+    target: &ProcessData,
+) -> AxResult<ProcessImageAccessSnapshot> {
+    if target.exec_in_progress() {
+        return Err(AxError::OperationNotPermitted);
+    }
+    let target_image = pidfd.image_access_snapshot()?;
+    check_current_ptrace_image_snapshot(target, &target_image, PtraceAccessMode::AttachReal)?;
+    Ok(target_image)
 }
 
 bitflags! {
@@ -94,10 +101,13 @@ pub fn sys_pidfd_getfd(pidfd: i32, target_fd: i32, flags: u32) -> AxResult<isize
     }
     let pidfd = PidFd::from_fd(pidfd)?;
     let proc_data = pidfd.process_data()?;
-    check_pidfd_getfd_permission(&pidfd, &proc_data)?;
+    let authorized_image = check_pidfd_getfd_permission(&pidfd, &proc_data)?.into_aspace();
     let description = FD_TABLE
         .scope(&proc_data.scope.read())
         .get_description(target_fd)?;
+    if proc_data.exec_in_progress() || !proc_data.image_matches(&authorized_image) {
+        return Err(AxError::OperationNotPermitted);
+    }
     add_file_description(description, true).map(|fd| fd as isize)
 }
 

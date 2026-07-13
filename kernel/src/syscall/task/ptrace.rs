@@ -7,7 +7,7 @@ use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::task::{
-    AsThread, Cred, ProcessData, PtraceCredentialMode, check_current_ptrace_access,
+    AsThread, ProcessData, PtraceAccessMode, Thread, check_current_thread_ptrace_image_access,
     get_process_data, get_task, get_visible_task, notify_ptrace_attach_stop,
     reinject_ptrace_signal, send_signal_to_process,
 };
@@ -45,16 +45,29 @@ fn current_pid() -> Pid {
     current().as_thread().proc_data.proc.pid()
 }
 
-fn check_ptrace_permission(target: &ProcessData, target_cred: &Cred) -> AxResult<()> {
-    check_current_ptrace_access(target, target_cred, PtraceCredentialMode::Real)
-}
-
 fn check_tracee(target: &ProcessData) -> AxResult<()> {
     if target.is_traced_by(current_pid()) {
         Ok(())
     } else {
         Err(AxError::NoSuchProcess)
     }
+}
+
+/// Runs one remote-memory operation against the image that was current after
+/// this tracer's session was verified.
+///
+/// The owned address-space handle deliberately stays in this scope so an exec
+/// publication cannot make the operation re-sample a different image between
+/// validation/population and the final transfer.
+fn with_pinned_tracee_aspace<T>(
+    target: &ProcessData,
+    operation: impl FnOnce(&mut crate::mm::AddrSpace) -> AxResult<T>,
+) -> AxResult<T> {
+    let aspace_handle = target
+        .ptrace_image_if_traced_by(current_pid())
+        .ok_or(AxError::NoSuchProcess)?;
+    let mut aspace = aspace_handle.lock();
+    operation(&mut aspace)
 }
 
 fn parse_signal(data: usize) -> AxResult<Option<SignalInfo>> {
@@ -74,15 +87,25 @@ fn interrupt_process_threads(target: &ProcessData) {
     }
 }
 
-fn do_attach(target: &ProcessData, target_cred: &Cred, seize_only: bool) -> AxResult<isize> {
+fn do_attach(target_thread: &Thread, seize_only: bool) -> AxResult<isize> {
     let curr = current();
     let tracer_data = curr.as_thread().proc_data.clone();
     let tracer = tracer_data.proc.pid();
+    let target = &target_thread.proc_data;
     if target.proc.pid() == tracer {
         return Err(AxError::OperationNotPermitted);
     }
-    check_ptrace_permission(target, target_cred)?;
+    if target.exec_in_progress() {
+        return Err(AxError::OperationNotPermitted);
+    }
+    let authorized_image =
+        check_current_thread_ptrace_image_access(target_thread, PtraceAccessMode::AttachReal)?
+            .into_aspace();
     if !target.begin_ptrace(tracer) {
+        return Err(AxError::OperationNotPermitted);
+    }
+    if target.exec_in_progress() || !target.image_matches(&authorized_image) {
+        target.end_ptrace(tracer);
         return Err(AxError::OperationNotPermitted);
     }
     tracer_data.add_ptrace_tracee(target.proc.pid());
@@ -112,7 +135,7 @@ fn do_continue(target: &ProcessData, data: usize, detach: bool) -> AxResult<isiz
 }
 
 fn validate_remote_access(
-    target: &ProcessData,
+    aspace: &mut crate::mm::AddrSpace,
     addr: usize,
     len: usize,
     flags: MappingFlags,
@@ -123,8 +146,6 @@ fn validate_remote_access(
     let page_end = VirtAddr::from_usize(
         crate::mm::checked_align_up_4k(end.as_usize()).ok_or_else(ptrace_io_error)?,
     );
-    let aspace_handle = target.aspace();
-    let mut aspace = aspace_handle.lock();
     if !aspace.can_access_range(start, len, flags) {
         return Err(ptrace_io_error());
     }
@@ -134,27 +155,25 @@ fn validate_remote_access(
 }
 
 fn peek_word(target: &ProcessData, addr: usize) -> AxResult<isize> {
-    check_tracee(target)?;
-    let mut word = [0u8; size_of::<usize>()];
-    validate_remote_access(target, addr, word.len(), MappingFlags::READ)?;
-    target
-        .aspace()
-        .lock()
-        .read(VirtAddr::from_usize(addr), &mut word)
-        .map_err(|_| ptrace_io_error())?;
-    Ok(usize::from_ne_bytes(word) as isize)
+    with_pinned_tracee_aspace(target, |aspace| {
+        let mut word = [0u8; size_of::<usize>()];
+        validate_remote_access(aspace, addr, word.len(), MappingFlags::READ)?;
+        aspace
+            .read(VirtAddr::from_usize(addr), &mut word)
+            .map_err(|_| ptrace_io_error())?;
+        Ok(usize::from_ne_bytes(word) as isize)
+    })
 }
 
 fn poke_word(target: &ProcessData, addr: usize, data: usize) -> AxResult<isize> {
-    check_tracee(target)?;
-    let word = data.to_ne_bytes();
-    validate_remote_access(target, addr, word.len(), MappingFlags::WRITE)?;
-    target
-        .aspace()
-        .lock()
-        .write(VirtAddr::from_usize(addr), &word)
-        .map_err(|_| ptrace_io_error())?;
-    Ok(0)
+    with_pinned_tracee_aspace(target, |aspace| {
+        let word = data.to_ne_bytes();
+        validate_remote_access(aspace, addr, word.len(), MappingFlags::WRITE)?;
+        aspace
+            .write(VirtAddr::from_usize(addr), &word)
+            .map_err(|_| ptrace_io_error())?;
+        Ok(0)
+    })
 }
 
 fn sys_ptrace_traceme() -> AxResult<isize> {
@@ -176,15 +195,17 @@ fn sys_ptrace_traceme() -> AxResult<isize> {
 fn sys_ptrace_for_target(request: u32, pid: Pid, addr: usize, data: usize) -> AxResult<isize> {
     let target_task = get_visible_task(pid)?;
     let target_thread = target_task.as_thread();
-    let target_cred = target_thread.current_cred();
     let target = target_thread.proc_data.clone();
     match request {
-        PTRACE_ATTACH => do_attach(&target, &target_cred, false),
+        PTRACE_ATTACH => do_attach(target_thread, false),
         PTRACE_SEIZE => {
+            if addr != 0 {
+                return Err(ptrace_io_error());
+            }
             if data & !PTRACE_O_MASK != 0 {
                 return Err(AxError::InvalidInput);
             }
-            let result = do_attach(&target, &target_cred, true)?;
+            let result = do_attach(target_thread, true)?;
             target.ptrace_set_options(data as u32);
             Ok(result)
         }

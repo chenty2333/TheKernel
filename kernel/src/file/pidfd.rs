@@ -12,7 +12,7 @@ use axpoll::{IoEvents, PollSet, Pollable};
 
 use crate::{
     file::{FileLike, Kstat, PseudoInode},
-    task::{Cred, CredentialSlot, Process, ProcessData, Thread},
+    task::{Cred, CredentialSlot, Process, ProcessData, ProcessImageAccessSnapshot, Thread},
 };
 
 pub struct PidFd {
@@ -76,6 +76,28 @@ impl PidFd {
             Ok(slot.upgrade().ok_or(AxError::NoSuchProcess)?.current())
         } else {
             Ok(proc_data.group_leader_cred())
+        }
+    }
+
+    /// Pins the exact process image and access identity named by this pidfd.
+    /// Thread pidfds preserve their task-local credential slot and reject an
+    /// exit racing either side of the snapshot; process pidfds use the
+    /// persistent Linux group-leader binding.
+    pub(crate) fn image_access_snapshot(&self) -> AxResult<ProcessImageAccessSnapshot> {
+        let proc_data = self.process_data()?;
+        if let Some(slot) = &self.thread_credential {
+            let slot = slot.upgrade().ok_or(AxError::NoSuchProcess)?;
+            let snapshot = proc_data.credential_image_access_snapshot(&slot);
+            if self
+                .thread_exit
+                .as_ref()
+                .is_some_and(|exit| exit.load(Ordering::Acquire))
+            {
+                return Err(AxError::NoSuchProcess);
+            }
+            Ok(snapshot)
+        } else {
+            Ok(proc_data.group_leader_image_access_snapshot())
         }
     }
 }

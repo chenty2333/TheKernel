@@ -140,6 +140,29 @@ ci_run_step kernel-namespace-owner-tests "$STEP_TIMEOUT_SECS" \
     --tests --features bpf --target x86_64-unknown-linux-gnu \
     namespace_owner_ -- --test-threads=1
 
+ci_run_step kernel-process-access-test-discovery "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    bash -c '
+        set -euo pipefail
+        output=$(cargo test --locked --manifest-path kernel/Cargo.toml \
+            --tests --features bpf --target x86_64-unknown-linux-gnu \
+            process_access_ -- --list)
+        printf "%s\n" "$output"
+        count=$(printf "%s\n" "$output" | awk "/: test$/ { count++ } END { print count + 0 }")
+        if [ "$count" -lt 11 ]; then
+            printf "process-access discovery: expected at least 11 tests, found %s\n" "$count" >&2
+            exit 1
+        fi
+    '
+
+ci_run_step kernel-process-access-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    process_access_ -- --test-threads=1
+
 ci_run_step axsched-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$AX_REPO/Cargo.toml" \

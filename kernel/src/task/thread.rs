@@ -82,6 +82,10 @@ pub struct Thread {
     /// but after a non-leader execve() it is rebound to the process ID.
     visible_tid: AtomicU32,
 
+    /// Signal delivered to this task when its parent dies. Linux keeps this in
+    /// `task_struct`, not in thread-group shared process state.
+    pdeath_signal: AtomicU32,
+
     /// The head of the robust list
     robust_list_head: AtomicUsize,
 
@@ -148,6 +152,7 @@ impl Thread {
             file_write_credentials: SpinNoIrq::new(None),
             clear_child_tid: AtomicUsize::new(0),
             visible_tid: AtomicU32::new(tid),
+            pdeath_signal: AtomicU32::new(0),
             robust_list_head: AtomicUsize::new(0),
             time: AssumeSync(RefCell::new(TimeManager::new())),
             live_usage: AtomicTaskUsage::new(),
@@ -233,6 +238,18 @@ impl Thread {
     /// Set the user-visible thread ID.
     pub fn set_tid(&self, tid: Pid) {
         self.visible_tid.store(tid, Ordering::Release);
+    }
+
+    pub(crate) fn pdeath_signal(&self) -> u32 {
+        self.pdeath_signal.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_pdeath_signal(&self, signo: u32) {
+        self.pdeath_signal.store(signo, Ordering::Release);
+    }
+
+    pub(in crate::task) fn pdeath_signal_state(&self) -> &AtomicU32 {
+        &self.pdeath_signal
     }
 
     pub(crate) fn sched_reset_on_fork(&self) -> bool {

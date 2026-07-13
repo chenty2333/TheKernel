@@ -14,7 +14,7 @@ use axdriver::{
     set_virtio_async_block_merge_write_enabled, set_virtio_async_block_wait_policy,
     set_virtio_io_counters_enabled, virtio_io_counters_snapshot,
 };
-use axerrno::LinuxError;
+use axerrno::{AxError, LinuxError};
 use axfs::{
     async_block_queue_interrupt_selftest, async_block_queue_irq_first_wait_selftest,
     async_block_queue_read_selftest, async_block_queue_read_write_selftest,
@@ -28,12 +28,13 @@ use axfs_ng_vfs::{
 };
 use axhal::paging::MappingFlags;
 use axpoll::{IoEvents, Pollable};
+use axsync::Mutex;
 use axtask::{AxTaskRef, WeakAxTaskRef, current};
 use inherit_methods_macro::inherit_methods;
 use linux_raw_sys::{
     general::{
-        CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS,
-        RLIM_INFINITY, RLIM_NLIMITS,
+        CAP_SYS_ADMIN, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER,
+        CLONE_NEWUTS, RLIM_INFINITY, RLIM_NLIMITS,
     },
     ioctl::{NS_GET_NSTYPE, NS_GET_OWNER_UID, NS_GET_PARENT, NS_GET_USERNS},
     mempolicy::{
@@ -49,8 +50,8 @@ use crate::{
         fanotify::FanotifyFile, inotify::InotifyFile, lease, pipe, try_path_into_bytes,
     },
     mm::{
-        Backend, BackendOps, USER_IO_PIN_TEST_DELAY_MS_MAX, commit_limit_bytes, committed_as_bytes,
-        overcommit_memory_policy, overcommit_ratio, reset_user_io_pin_counters,
+        AddrSpace, Backend, BackendOps, USER_IO_PIN_TEST_DELAY_MS_MAX, commit_limit_bytes,
+        committed_as_bytes, overcommit_memory_policy, overcommit_ratio, reset_user_io_pin_counters,
         set_overcommit_memory_policy, set_overcommit_ratio, set_user_io_async_direct_enabled,
         set_user_io_pin_counters_enabled, set_user_io_pin_test_delay_ms, system_memory_stats,
         user_io_pin_counters_snapshot,
@@ -77,13 +78,15 @@ use crate::{
         sysvipc_msg_snapshot, sysvipc_sem_snapshot, sysvipc_shm_snapshot,
     },
     task::{
-        AsThread, Cred, ID_MAP_MAX_EXTENTS, IdMapInputExtent, Kgid, Kuid, Mempolicy, PidNamespace,
-        Process, ProcessData, PtraceCredentialMode, TimeNamespace, UserNamespace, UtsNamespace,
-        check_current_ptrace_access, get_process_data, get_process_including_zombie, get_task,
-        get_visible_task, get_visible_task_including_exiting, may_begin_gid_map_write,
-        may_begin_uid_map_write, may_update_setgroups_policy, may_write_gid_map, may_write_uid_map,
-        nr_open_limit, ns_capable, render_task_stat, render_zombie_stat, set_nr_open_limit,
-        task_state, try_processes, validate_id_map_input,
+        AsThread, Cred, ID_MAP_MAX_EXTENTS, IdMapInputExtent, Kgid, Kuid, Mempolicy,
+        MempolicySnapshot, PidNamespace, Process, ProcessData, ProcessImageAccessSnapshot,
+        PtraceAccessMode, TimeNamespace, UserNamespace, UtsNamespace,
+        check_current_ptrace_image_snapshot, check_current_thread_ptrace_image_access,
+        get_process_data, get_process_including_zombie, get_task, get_visible_task,
+        get_visible_task_including_exiting, may_begin_gid_map_write, may_begin_uid_map_write,
+        may_update_setgroups_policy, may_write_gid_map, may_write_uid_map, nr_open_limit,
+        ns_capable, render_task_stat, render_zombie_stat, set_nr_open_limit, task_state,
+        try_processes, validate_id_map_input,
     },
 };
 
@@ -787,6 +790,42 @@ fn proc_subject_cred(task: &AxTaskRef, process_view: bool) -> Arc<Cred> {
     }
 }
 
+fn proc_image_access(
+    task: &AxTaskRef,
+    process_view: bool,
+) -> VfsResult<ProcessImageAccessSnapshot> {
+    let target = task.as_thread();
+    if process_view {
+        let snapshot = target.proc_data.group_leader_image_access_snapshot();
+        check_current_ptrace_image_snapshot(&target.proc_data, &snapshot, PtraceAccessMode::ReadFs)
+            .map_err(|_| VfsError::PermissionDenied)?;
+        Ok(snapshot)
+    } else {
+        check_current_thread_ptrace_image_access(target, PtraceAccessMode::ReadFs)
+            .map_err(|_| VfsError::PermissionDenied)
+    }
+}
+
+fn proc_fd_image_access(task: &AxTaskRef, process_view: bool) -> VfsResult<Arc<Mutex<AddrSpace>>> {
+    let proc_data = &task.as_thread().proc_data;
+    if proc_data.exec_in_progress() {
+        return Err(VfsError::PermissionDenied);
+    }
+    Ok(proc_image_access(task, process_view)?.into_aspace())
+}
+
+fn validate_proc_fd_image(
+    task: &AxTaskRef,
+    authorized_image: &Arc<Mutex<AddrSpace>>,
+) -> VfsResult<()> {
+    let proc_data = &task.as_thread().proc_data;
+    if proc_data.exec_in_progress() || !proc_data.image_matches(authorized_image) {
+        Err(VfsError::PermissionDenied)
+    } else {
+        Ok(())
+    }
+}
+
 fn parse_id_map_rows(data: &[u8]) -> VfsResult<Vec<IdMapInputExtent>> {
     if data.is_empty() || data.len() >= PAGE_SIZE_4K {
         return Err(VfsError::InvalidInput);
@@ -1401,9 +1440,7 @@ fn render_task_limits(task: &AxTaskRef) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn render_task_maps(task: &AxTaskRef, include_smaps: bool) -> String {
-    let thr = task.as_thread();
-    let aspace_handle = thr.proc_data.aspace();
+fn render_task_maps(aspace_handle: &Arc<Mutex<AddrSpace>>, include_smaps: bool) -> String {
     let aspace = aspace_handle.lock();
     let mut out = String::new();
 
@@ -1523,10 +1560,10 @@ fn is_user_stack_area(start: usize, end: usize) -> bool {
     start < stack_top && end > stack_bottom
 }
 
-fn render_task_numa_maps(task: &AxTaskRef) -> String {
-    let thr = task.as_thread();
-    let proc_data = &thr.proc_data;
-    let aspace_handle = proc_data.aspace();
+fn render_task_numa_maps(
+    policy: &MempolicySnapshot,
+    aspace_handle: &Arc<Mutex<AddrSpace>>,
+) -> String {
     let aspace = aspace_handle.lock();
     let mut out = String::new();
 
@@ -1536,9 +1573,7 @@ fn render_task_numa_maps(task: &AxTaskRef) -> String {
         }
         let start = area.start().as_usize();
         let end = start + area.size();
-        let policy = proc_data
-            .mempolicy_for_addr(start)
-            .unwrap_or_else(|| proc_data.mempolicy());
+        let policy = policy.policy_for_addr(start);
         let policy_text = numa_policy_text(policy);
         let page_size = area.backend().page_size() as usize;
         let mut resident_pages = 0usize;
@@ -1571,15 +1606,26 @@ fn render_task_numa_maps(task: &AxTaskRef) -> String {
 struct ThreadFdDir {
     fs: Arc<SimpleFs>,
     task: WeakAxTaskRef,
+    process_view: bool,
 }
 
 struct PreparedFdMagicLink {
-    target: Vec<u8>,
+    fd: u32,
+    task: WeakAxTaskRef,
+    process_view: bool,
 }
 
 impl SimpleFileOps for PreparedFdMagicLink {
     fn read_all(&self) -> VfsResult<Cow<'_, [u8]>> {
-        Ok(Cow::Borrowed(&self.target))
+        let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
+        let authorized_image = proc_fd_image_access(&task, self.process_view)?;
+        let description = FD_TABLE
+            .scope(&task.as_thread().proc_data.scope.read())
+            .get_description_number(self.fd)
+            .map_err(|_| VfsError::NotFound)?;
+        let target = try_path_into_bytes(description.inner.path()?)?;
+        validate_proc_fd_image(&task, &authorized_image)?;
+        Ok(Cow::Owned(target))
     }
 
     fn write_all(&self, _data: &[u8]) -> VfsResult<()> {
@@ -1592,28 +1638,39 @@ impl SimpleDirOps for ThreadFdDir {
         let Some(task) = self.task.upgrade() else {
             return try_boxed_names(iter::empty());
         };
+        let authorized_image = proc_fd_image_access(&task, self.process_view)?;
         let ids = FD_TABLE
             .scope(&task.as_thread().proc_data.scope.read())
             .try_fd_numbers()?
             .into_iter()
             .map(|id| Cow::Owned(id.to_string()))
             .collect::<Vec<_>>();
+        validate_proc_fd_image(&task, &authorized_image)?;
         try_boxed_names(ids.into_iter())
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         let fs = self.fs.clone();
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
+        let authorized_image = proc_fd_image_access(&task, self.process_view)?;
         let fd = name.parse::<u32>().map_err(|_| VfsError::NotFound)?;
-        let description = {
+        {
             let scope = task.as_thread().proc_data.scope.read();
             let scoped_table = FD_TABLE.scope(&scope);
             scoped_table
                 .get_description_number(fd)
-                .map_err(|_| VfsError::NotFound)?
-        };
-        let target = try_path_into_bytes(description.inner.path()?)?;
-        Ok(SimpleFile::try_new_magic_link(fs, PreparedFdMagicLink { target })?.into())
+                .map_err(|_| VfsError::NotFound)?;
+        }
+        validate_proc_fd_image(&task, &authorized_image)?;
+        Ok(SimpleFile::try_new_magic_link(
+            fs,
+            PreparedFdMagicLink {
+                fd,
+                task: Arc::downgrade(&task),
+                process_view: self.process_view,
+            },
+        )?
+        .into())
     }
 
     fn is_cacheable(&self) -> bool {
@@ -1625,16 +1682,20 @@ impl SimpleDirOps for ThreadFdDir {
 struct ThreadFdInfoDir {
     fs: Arc<SimpleFs>,
     task: WeakAxTaskRef,
+    process_view: bool,
 }
 
 impl ThreadFdInfoDir {
     fn description_for(&self, name: &str) -> VfsResult<Arc<FileDescription>> {
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
+        let authorized_image = proc_fd_image_access(&task, self.process_view)?;
         let fd = name.parse::<usize>().map_err(|_| VfsError::NotFound)?;
-        FD_TABLE
+        let description = FD_TABLE
             .scope(&task.as_thread().proc_data.scope.read())
             .get_description_number(u32::try_from(fd).map_err(|_| VfsError::NotFound)?)
-            .map_err(|_| VfsError::NotFound)
+            .map_err(|_| VfsError::NotFound)?;
+        validate_proc_fd_image(&task, &authorized_image)?;
+        Ok(description)
     }
 
     fn render_fdinfo(description: &FileDescription) -> String {
@@ -1670,12 +1731,14 @@ impl SimpleDirOps for ThreadFdInfoDir {
         let Some(task) = self.task.upgrade() else {
             return try_boxed_names(iter::empty());
         };
+        let authorized_image = proc_fd_image_access(&task, self.process_view)?;
         let ids = FD_TABLE
             .scope(&task.as_thread().proc_data.scope.read())
             .try_fd_numbers()?
             .into_iter()
             .map(|id| Cow::Owned(id.to_string()))
             .collect::<Vec<_>>();
+        validate_proc_fd_image(&task, &authorized_image)?;
         try_boxed_names(ids.into_iter())
     }
 
@@ -1897,9 +1960,10 @@ struct ThreadNamespaceDir {
 
 impl SimpleDirOps for ThreadNamespaceDir {
     fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
-        if self.task.upgrade().is_none() {
+        let Some(task) = self.task.upgrade() else {
             return try_boxed_names(iter::empty());
-        }
+        };
+        drop(proc_image_access(&task, self.process_view)?);
         try_boxed_names(
             ["pid", "time", "time_for_children", "user", "uts"]
                 .into_iter()
@@ -1909,6 +1973,7 @@ impl SimpleDirOps for ThreadNamespaceDir {
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
+        drop(proc_image_access(&task, self.process_view)?);
         let kind = match name {
             "pid" => ProcNamespaceKind::Pid,
             "time" => ProcNamespaceKind::Time,
@@ -2074,25 +2139,24 @@ fn write_timens_offsets(task: &AxTaskRef, data: &[u8]) -> VfsResult<()> {
 
 struct ProcPagemapFile {
     node: SimpleFsNode,
-    task: WeakAxTaskRef,
+    aspace: Arc<Mutex<AddrSpace>>,
+    show_pfn: bool,
 }
 
 impl ProcPagemapFile {
-    fn new(fs: Arc<SimpleFs>, task: WeakAxTaskRef) -> Arc<Self> {
+    fn new(fs: Arc<SimpleFs>, aspace: Arc<Mutex<AddrSpace>>, show_pfn: bool) -> Arc<Self> {
         Arc::new(Self {
             node: SimpleFsNode::new(
                 fs,
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o444),
             ),
-            task,
+            aspace,
+            show_pfn,
         })
     }
 
     fn pagemap_entry(&self, vpn: u64) -> u64 {
-        let Some(task) = self.task.upgrade() else {
-            return 0;
-        };
         let Some(vaddr) = vpn
             .checked_mul(PAGE_SIZE_4K as u64)
             .and_then(|addr| usize::try_from(addr).ok())
@@ -2100,10 +2164,16 @@ impl ProcPagemapFile {
         else {
             return 0;
         };
-        let aspace_handle = task.as_thread().proc_data.aspace();
-        let aspace = aspace_handle.lock();
+        let aspace = self.aspace.lock();
         match aspace.page_table().query(vaddr) {
-            Ok((paddr, ..)) => (1u64 << 63) | (paddr.as_usize() as u64 / PAGE_SIZE_4K as u64),
+            Ok((paddr, ..)) => {
+                let pfn = if self.show_pfn {
+                    paddr.as_usize() as u64 / PAGE_SIZE_4K as u64
+                } else {
+                    0
+                };
+                (1u64 << 63) | pfn
+            }
             Err(_) => 0,
         }
     }
@@ -2252,15 +2322,6 @@ impl SimpleDirOps for ThreadDir {
         let fs = self.fs.clone();
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
         let process_view = self.show_task_dir;
-        if matches!(
-            name,
-            "maps" | "smaps" | "numa_maps" | "pagemap" | "exe" | "fd" | "fdinfo" | "ns"
-        ) {
-            let target = task.as_thread();
-            let target_cred = proc_subject_cred(&task, process_view);
-            check_current_ptrace_access(&target.proc_data, &target_cred, PtraceCredentialMode::Fs)
-                .map_err(|_| VfsError::PermissionDenied)?;
-        }
         Ok(match name {
             "stat" => {
                 SimpleFile::new_regular(fs, move || Ok(render_task_stat(&task)?.into_bytes()))
@@ -2344,15 +2405,32 @@ impl SimpleDirOps for ThreadDir {
             )
             .into(),
             "maps" => {
-                SimpleFile::new_regular(fs, move || Ok(render_task_maps(&task, false))).into()
+                let aspace = proc_image_access(&task, process_view)?.into_aspace();
+                SimpleFile::new_regular(fs, move || Ok(render_task_maps(&aspace, false))).into()
             }
             "smaps" => {
-                SimpleFile::new_regular(fs, move || Ok(render_task_maps(&task, true))).into()
+                let aspace = proc_image_access(&task, process_view)?.into_aspace();
+                SimpleFile::new_regular(fs, move || Ok(render_task_maps(&aspace, true))).into()
             }
             "numa_maps" => {
-                SimpleFile::new_regular(fs, move || Ok(render_task_numa_maps(&task))).into()
+                let aspace = proc_image_access(&task, process_view)?.into_aspace();
+                let proc_data = task.as_thread().proc_data.clone();
+                let policy = proc_data
+                    .try_mempolicy_snapshot_for_image(&aspace)
+                    .map_err(|err| match err {
+                        AxError::NoMemory => VfsError::NoMemory,
+                        _ => VfsError::PermissionDenied,
+                    })?;
+                SimpleFile::new_regular(fs, move || Ok(render_task_numa_maps(&policy, &aspace)))
+                    .into()
             }
-            "pagemap" => ProcPagemapFile::new(fs, Arc::downgrade(&task)).into(),
+            "pagemap" => {
+                let aspace = proc_image_access(&task, process_view)?.into_aspace();
+                let show_pfn = current()
+                    .as_thread()
+                    .has_effective_capability(CAP_SYS_ADMIN);
+                ProcPagemapFile::new(fs, aspace, show_pfn).into()
+            }
             "mounts" => SimpleFile::new_regular(fs, move || render_mounts()).into(),
             "mountinfo" => SimpleFile::new_regular(fs, move || render_mountinfo()).into(),
             "cmdline" => SimpleFile::new_regular(fs, move || {
@@ -2426,34 +2504,48 @@ impl SimpleDirOps for ThreadDir {
                 }),
             )
             .into(),
-            "exe" => SimpleFile::new_magic_link(fs, move || {
-                Ok(task.as_thread().proc_data.exe_path.read().clone())
-            })
-            .into(),
-            "fd" => SimpleDir::new_maker(
-                fs.clone(),
+            "exe" => {
+                drop(proc_image_access(&task, process_view)?);
+                SimpleFile::new_magic_link(fs, move || {
+                    let image = proc_image_access(&task, process_view)?.into_aspace();
+                    let proc_data = &task.as_thread().proc_data;
+                    if proc_data.exec_in_progress() {
+                        return Err(VfsError::PermissionDenied);
+                    }
+                    let path = proc_data.exe_path.read().clone();
+                    if proc_data.exec_in_progress() || !proc_data.image_matches(&image) {
+                        return Err(VfsError::PermissionDenied);
+                    }
+                    Ok(path)
+                })
+                .into()
+            }
+            "fd" => SimpleDir::new_maker(fs.clone(), {
+                drop(proc_fd_image_access(&task, process_view)?);
                 Arc::new(ThreadFdDir {
                     fs,
                     task: Arc::downgrade(&task),
-                }),
-            )
+                    process_view,
+                })
+            })
             .into(),
-            "fdinfo" => SimpleDir::new_maker(
-                fs.clone(),
+            "fdinfo" => SimpleDir::new_maker(fs.clone(), {
+                drop(proc_fd_image_access(&task, process_view)?);
                 Arc::new(ThreadFdInfoDir {
                     fs,
                     task: Arc::downgrade(&task),
-                }),
-            )
+                    process_view,
+                })
+            })
             .into(),
-            "ns" => SimpleDir::new_maker(
-                fs.clone(),
+            "ns" => SimpleDir::new_maker(fs.clone(), {
+                drop(proc_image_access(&task, process_view)?);
                 Arc::new(ThreadNamespaceDir {
                     fs,
                     task: Arc::downgrade(&task),
                     process_view,
-                }),
-            )
+                })
+            })
             .into(),
             _ => return Err(VfsError::NotFound),
         })

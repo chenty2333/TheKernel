@@ -1,7 +1,7 @@
 //! User address space management.
 
 use alloc::{borrow::ToOwned, string::String, vec, vec::Vec};
-use core::ffi::CStr;
+use core::{cell::Cell, ffi::CStr};
 
 use axerrno::{AxError, AxResult};
 use axfs::{CachedFile, FS_CONTEXT};
@@ -15,13 +15,14 @@ use axtask::current_may_uninit;
 use kernel_elf_parser::{
     AuxEntry, AuxType, ELFHeaders, ELFHeadersBuilder, ELFParser, app_stack_region,
 };
+use linux_raw_sys::general::R_OK;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use ouroboros::self_referencing;
 use uluru::LRUCache;
 
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
-    file::permission::{DacFsContextExt, check_execute_permissions},
+    file::permission::{DacFsContextExt, check_execute_permissions, check_open_permissions},
     mm::aspace::{AddrSpace, Backend},
     task::{AsThread, DacCredentialView},
 };
@@ -34,7 +35,11 @@ const MAX_SCRIPT_RECURSION: usize = 5;
 #[derive(Clone, Copy)]
 enum ExecAccess<'a> {
     TrustedBoot,
-    User(&'a DacCredentialView),
+    User {
+        credentials: &'a DacCredentialView,
+        all_readable: &'a Cell<bool>,
+        has_setid_bits: &'a Cell<bool>,
+    },
 }
 
 impl ExecAccess<'_> {
@@ -42,16 +47,61 @@ impl ExecAccess<'_> {
         let fs = FS_CONTEXT.lock();
         match self {
             Self::TrustedBoot => fs.resolve(path),
-            Self::User(credentials) => fs.resolve_dac(path, credentials),
+            Self::User { credentials, .. } => fs.resolve_dac(path, credentials),
         }
     }
 
     fn check_location(self, loc: &Location) -> AxResult {
         match self {
             Self::TrustedBoot => Ok(()),
-            Self::User(credentials) => check_execute_permissions(loc, credentials),
+            Self::User {
+                credentials,
+                all_readable,
+                has_setid_bits,
+            } => {
+                check_execute_permissions(loc, credentials)?;
+                if loc.metadata()?.mode.bits() & 0o6000 != 0 {
+                    has_setid_bits.set(true);
+                }
+                match check_open_permissions(loc, R_OK, credentials) {
+                    Ok(()) => Ok(()),
+                    Err(AxError::PermissionDenied) => {
+                        all_readable.set(false);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
         }
     }
+}
+
+/// Security facts collected across the complete executable chain, including
+/// shebang interpreters and `PT_INTERP` dynamic linkers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExecImageAccess {
+    all_readable: bool,
+    has_setid_bits: bool,
+}
+
+impl ExecImageAccess {
+    pub(crate) fn allows_user_dumpable(self) -> bool {
+        self.all_readable && !self.has_setid_bits
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(all_readable: bool, has_setid_bits: bool) -> Self {
+        Self {
+            all_readable,
+            has_setid_bits,
+        }
+    }
+}
+
+pub(crate) struct LoadedUserApp {
+    pub(crate) entry_point: VirtAddr,
+    pub(crate) stack_pointer: VirtAddr,
+    pub(crate) image_access: ExecImageAccess,
 }
 
 /// Creates a new empty user address space.
@@ -596,15 +646,53 @@ pub(crate) fn load_user_app_at(
     args: &[String],
     envs: &[String],
     credentials: &DacCredentialView,
-) -> AxResult<(VirtAddr, VirtAddr)> {
-    let access = ExecAccess::User(credentials);
+) -> AxResult<LoadedUserApp> {
+    let all_readable = Cell::new(true);
+    let has_setid_bits = Cell::new(false);
+    let access = ExecAccess::User {
+        credentials,
+        all_readable: &all_readable,
+        has_setid_bits: &has_setid_bits,
+    };
     let load_result = ELF_LOADER.lock().load_location(uspace, loc, access);
-    finish_load_user_app(uspace, path, path, args, envs, load_result, access, 0)
+    let (entry_point, stack_pointer) =
+        finish_load_user_app(uspace, path, path, args, envs, load_result, access, 0)?;
+    Ok(LoadedUserApp {
+        entry_point,
+        stack_pointer,
+        image_access: ExecImageAccess {
+            all_readable: all_readable.get(),
+            has_setid_bits: has_setid_bits.get(),
+        },
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_access_exec_image_facts_require_readable_non_setid_chain() {
+        assert!(
+            ExecImageAccess {
+                all_readable: true,
+                has_setid_bits: false,
+            }
+            .allows_user_dumpable()
+        );
+        for facts in [
+            ExecImageAccess {
+                all_readable: false,
+                has_setid_bits: false,
+            },
+            ExecImageAccess {
+                all_readable: true,
+                has_setid_bits: true,
+            },
+        ] {
+            assert!(!facts.allows_user_dumpable());
+        }
+    }
 
     #[test]
     fn shebang_keeps_one_optional_argument() {

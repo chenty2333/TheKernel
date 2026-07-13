@@ -225,10 +225,15 @@ pub fn check_signals(
             }
         }
         SignalOSAction::CoreDump => {
-            if let Err(e) = super::coredump::generate_core_dump(thr, uctx, signo as u8) {
-                warn!("Core dump failed: {e:?}");
-            }
-            if let Err(error) = do_exit((signo as i32) | 0x80, true) {
+            let dumped = match super::coredump::generate_core_dump(thr, uctx, signo as u8) {
+                Ok(dumped) => dumped,
+                Err(error) => {
+                    warn!("Core dump failed: {error:?}");
+                    false
+                }
+            };
+            let exit_code = (signo as i32) | if dumped { 0x80 } else { 0 };
+            if let Err(error) = do_exit(exit_code, true) {
                 fail_closed_exit(error);
             }
         }

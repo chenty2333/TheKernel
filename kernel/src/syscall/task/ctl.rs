@@ -25,7 +25,7 @@ use crate::{
         namespace_target_from_proc_file,
     },
     task::{
-        AsThread, CapabilityState, Cred, Mempolicy, ProcessData, PtraceCredentialMode,
+        AsThread, CapabilityState, Cred, Dumpability, Mempolicy, ProcessData, PtraceAccessMode,
         check_current_process_ptrace_access, get_process_data, get_visible_task,
         linux_pid_from_task_id, ns_capable,
     },
@@ -232,12 +232,34 @@ fn kcmp_target_process(pid: i32) -> AxResult<Arc<ProcessData>> {
     get_process_data(pid as u32)
 }
 
-fn check_kcmp_permission(target: &ProcessData) -> AxResult<()> {
-    check_current_process_ptrace_access(target, PtraceCredentialMode::Real)
-}
-
 fn kcmp_result(equal: bool) -> isize {
     if equal { 0 } else { 1 }
+}
+
+struct KcmpAuthorizedImage<T> {
+    pinned: T,
+}
+
+impl<T> KcmpAuthorizedImage<T> {
+    fn new(pinned: T) -> Self {
+        Self { pinned }
+    }
+
+    fn pinned(&self) -> &T {
+        &self.pinned
+    }
+}
+
+fn validate_kcmp_fd_image<T>(
+    authorized: &KcmpAuthorizedImage<T>,
+    exec_in_progress: bool,
+    image_matches: impl FnOnce(&T) -> bool,
+) -> AxResult<()> {
+    if exec_in_progress || !image_matches(authorized.pinned()) {
+        Err(AxError::OperationNotPermitted)
+    } else {
+        Ok(())
+    }
 }
 
 fn kcmp_file_description(proc_data: &ProcessData, fd: usize) -> AxResult<Arc<FileDescription>> {
@@ -251,27 +273,50 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, type_: i32, idx1: usize, idx2: usize) -> A
 
     let proc1 = kcmp_target_process(pid1)?;
     let proc2 = kcmp_target_process(pid2)?;
-    check_kcmp_permission(&proc1)?;
-    check_kcmp_permission(&proc2)?;
+    let image1 = KcmpAuthorizedImage::new(
+        check_current_process_ptrace_access(&proc1, PtraceAccessMode::ReadReal)?.into_aspace(),
+    );
+    let image2 = KcmpAuthorizedImage::new(
+        check_current_process_ptrace_access(&proc2, PtraceAccessMode::ReadReal)?.into_aspace(),
+    );
 
     match type_ {
         KCMP_FILE => {
-            let file1 = kcmp_file_description(&proc1, idx1)?;
-            let file2 = kcmp_file_description(&proc2, idx2)?;
+            validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
+                proc1.image_matches(image)
+            })?;
+            validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
+                proc2.image_matches(image)
+            })?;
+            let file1 = kcmp_file_description(&proc1, idx1);
+            let file2 = kcmp_file_description(&proc2, idx2);
+            validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
+                proc1.image_matches(image)
+            })?;
+            validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
+                proc2.image_matches(image)
+            })?;
+            let file1 = file1?;
+            let file2 = file2?;
             Ok(kcmp_result(Arc::ptr_eq(&file1, &file2)))
         }
-        KCMP_VM => {
-            let aspace1 = proc1.aspace();
-            let aspace2 = proc2.aspace();
-            Ok(kcmp_result(Arc::ptr_eq(&aspace1, &aspace2)))
-        }
+        KCMP_VM => Ok(kcmp_result(Arc::ptr_eq(image1.pinned(), image2.pinned()))),
         KCMP_FILES => {
-            let scope1 = proc1.scope.read();
-            let scope2 = proc2.scope.read();
-            Ok(kcmp_result(Arc::ptr_eq(
-                &*FD_TABLE.scope(&scope1),
-                &*FD_TABLE.scope(&scope2),
-            )))
+            validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
+                proc1.image_matches(image)
+            })?;
+            validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
+                proc2.image_matches(image)
+            })?;
+            let files1 = Arc::clone(&*FD_TABLE.scope(&proc1.scope.read()));
+            let files2 = Arc::clone(&*FD_TABLE.scope(&proc2.scope.read()));
+            validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
+                proc1.image_matches(image)
+            })?;
+            validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
+                proc2.image_matches(image)
+            })?;
+            Ok(kcmp_result(Arc::ptr_eq(&files1, &files2)))
         }
         KCMP_FS => {
             let scope1 = proc1.scope.read();
@@ -909,6 +954,25 @@ pub fn sys_migrate_pages(
     Ok(0)
 }
 
+fn parse_pr_set_dumpable_args(
+    arg2: usize,
+    _arg3: usize,
+    _arg4: usize,
+    _arg5: usize,
+) -> AxResult<Dumpability> {
+    Dumpability::try_from(arg2)
+}
+
+fn pr_get_dumpable_value(
+    dumpability: Dumpability,
+    _arg2: usize,
+    _arg3: usize,
+    _arg4: usize,
+    _arg5: usize,
+) -> isize {
+    dumpability as isize
+}
+
 /// prctl() is called with a first argument describing what to do, and further
 /// arguments with a significance depending on the first one.
 /// The first argument can be:
@@ -941,17 +1005,29 @@ pub fn sys_prctl(
             buf[..len].copy_from_slice(&name.as_bytes()[..len]);
             vm_write_slice(arg2 as _, &buf)?;
         }
+        PR_SET_DUMPABLE => {
+            current()
+                .as_thread()
+                .proc_data
+                .set_dumpability(parse_pr_set_dumpable_args(arg2, arg3, arg4, arg5)?);
+        }
+        PR_GET_DUMPABLE => {
+            return Ok(pr_get_dumpable_value(
+                current().as_thread().proc_data.dumpability(),
+                arg2,
+                arg3,
+                arg4,
+                arg5,
+            ));
+        }
         PR_SET_PDEATHSIG => {
             if arg2 > 64 {
                 return Err(AxError::InvalidInput);
             }
-            current()
-                .as_thread()
-                .proc_data
-                .set_pdeath_signal(arg2 as u32);
+            current().as_thread().set_pdeath_signal(arg2 as u32);
         }
         PR_GET_PDEATHSIG => {
-            (arg2 as *mut i32).vm_write(current().as_thread().proc_data.pdeath_signal() as i32)?;
+            (arg2 as *mut i32).vm_write(current().as_thread().pdeath_signal() as i32)?;
         }
         PR_SET_CHILD_SUBREAPER => {
             current()
@@ -1062,6 +1138,56 @@ mod tests {
 
     use super::*;
     use crate::task::{Cred, Kgid, Kuid, UserNamespace};
+
+    #[test]
+    fn process_access_prctl_dumpable_validates_value_only() {
+        assert_eq!(
+            parse_pr_set_dumpable_args(0, 7, 8, 9),
+            Ok(Dumpability::NotDumpable)
+        );
+        assert_eq!(
+            parse_pr_set_dumpable_args(1, usize::MAX, 8, 9),
+            Ok(Dumpability::UserDumpable)
+        );
+        assert_eq!(
+            parse_pr_set_dumpable_args(2, 0, 0, 0),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            parse_pr_set_dumpable_args(usize::MAX, 0, 0, 0),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            pr_get_dumpable_value(Dumpability::UserDumpable, 1, 2, 3, 4),
+            1
+        );
+    }
+
+    #[test]
+    fn process_access_kcmp_keeps_and_validates_the_authorized_image() {
+        let authorized = Arc::new(());
+        let old_image = authorized.clone();
+        let replacement = Arc::new(());
+        let authorized = KcmpAuthorizedImage::new(authorized);
+
+        assert!(Arc::ptr_eq(authorized.pinned(), &old_image));
+        assert_eq!(
+            validate_kcmp_fd_image(&authorized, false, |image| {
+                Arc::ptr_eq(image, &old_image)
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            validate_kcmp_fd_image(&authorized, false, |image| {
+                Arc::ptr_eq(image, &replacement)
+            }),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(
+            validate_kcmp_fd_image(&authorized, true, |_| true),
+            Err(AxError::OperationNotPermitted)
+        );
+    }
 
     #[test]
     fn namespace_owner_unshare_freezes_actor_user_namespace() {

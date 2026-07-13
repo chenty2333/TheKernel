@@ -808,6 +808,27 @@ struct MempolicyState {
     ranges: Vec<MempolicyRange>,
 }
 
+/// Immutable NUMA-policy view bound to one process image.
+///
+/// `/proc/PID/numa_maps` keeps this snapshot together with its pinned address
+/// space so a later exec cannot pair the old VMAs with the new image's policy
+/// state (or the inverse).
+#[derive(Clone, Debug)]
+pub(crate) struct MempolicySnapshot {
+    process_policy: Mempolicy,
+    ranges: Vec<MempolicyRange>,
+}
+
+impl MempolicySnapshot {
+    pub(crate) fn policy_for_addr(&self, addr: usize) -> Mempolicy {
+        self.ranges
+            .iter()
+            .rev()
+            .find(|range| addr >= range.start && addr < range.end)
+            .map_or(self.process_policy, |range| range.policy)
+    }
+}
+
 impl Default for MempolicyState {
     fn default() -> Self {
         Self {
@@ -967,6 +988,200 @@ impl GroupLeaderCredentialBinding {
     }
 }
 
+/// Linux process dumpability values implemented by this kernel.
+///
+/// `SUID_DUMP_ROOT` remains unsupported until core-pattern ownership and the
+/// corresponding sysctl policy exist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum Dumpability {
+    NotDumpable  = 0,
+    UserDumpable = 1,
+}
+
+impl TryFrom<usize> for Dumpability {
+    type Error = AxError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::NotDumpable),
+            1 => Ok(Self::UserDumpable),
+            _ => Err(AxError::InvalidInput),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProcessSecurityState {
+    dumpability: Dumpability,
+}
+
+/// Credential/dumpability publication barrier owned by one Linux address
+/// space. Processes created with `CLONE_VM` share this owner; ordinary fork
+/// receives a new owner initialized from the same snapshot.
+pub(crate) struct ProcessAccessState {
+    owner_user_ns: Arc<UserNamespace>,
+    security: SpinNoIrq<ProcessSecurityState>,
+}
+
+impl ProcessAccessState {
+    pub(crate) fn try_new(
+        dumpability: Dumpability,
+        owner_user_ns: Arc<UserNamespace>,
+    ) -> AxResult<Arc<Self>> {
+        Arc::try_new(Self {
+            owner_user_ns,
+            security: SpinNoIrq::new(ProcessSecurityState { dumpability }),
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+
+    pub(crate) fn owner_user_ns(&self) -> &Arc<UserNamespace> {
+        &self.owner_user_ns
+    }
+
+    pub(crate) fn dumpability(&self) -> Dumpability {
+        self.security.lock().dumpability
+    }
+
+    fn set_dumpability(&self, dumpability: Dumpability) {
+        self.security.lock().dumpability = dumpability;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_dumpability_for_test(&self, dumpability: Dumpability) {
+        self.set_dumpability(dumpability);
+    }
+
+    fn publish_credential<'a>(
+        &self,
+        prepared: PreparedCred<'a>,
+        pdeath_signal: &AtomicU32,
+    ) -> super::creds::CredentialPublication<'a> {
+        let mut security = self.security.lock();
+        if prepared.requires_dumpability_drop() {
+            security.dumpability = Dumpability::NotDumpable;
+            pdeath_signal.store(0, Ordering::Release);
+        }
+        let publication = prepared.publish();
+        drop(security);
+        publication
+    }
+}
+
+/// Address space and the exact access-state owner governing it.
+///
+/// Keeping the pair under one lock makes exec replace both atomically and
+/// prevents process_vm from authorizing one image and then operating on a
+/// later image.
+struct ProcessImageBinding<A> {
+    aspace: A,
+    access_state: Arc<ProcessAccessState>,
+}
+
+type LiveProcessImageBinding = ProcessImageBinding<Arc<Mutex<AddrSpace>>>;
+
+pub(crate) struct ProcessImageAccessSnapshot {
+    credential: Arc<Cred>,
+    dumpability: Dumpability,
+    owner_user_ns: Arc<UserNamespace>,
+    aspace: Arc<Mutex<AddrSpace>>,
+}
+
+impl ProcessImageAccessSnapshot {
+    pub(crate) fn credential(&self) -> &Cred {
+        &self.credential
+    }
+
+    pub(crate) fn dumpability(&self) -> Dumpability {
+        self.dumpability
+    }
+
+    pub(crate) fn owner_user_ns(&self) -> &Arc<UserNamespace> {
+        &self.owner_user_ns
+    }
+
+    pub(crate) fn into_aspace(self) -> Arc<Mutex<AddrSpace>> {
+        self.aspace
+    }
+}
+
+fn snapshot_credential_image<A: Clone>(
+    image_binding: &RwLock<ProcessImageBinding<A>>,
+    slot: &CredentialSlot,
+) -> (Arc<Cred>, Dumpability, A, Arc<ProcessAccessState>) {
+    let image = image_binding.read();
+    let security = image.access_state.security.lock();
+    let credential = slot.current();
+    let dumpability = security.dumpability;
+    let aspace = image.aspace.clone();
+    let access_state = image.access_state.clone();
+    drop(security);
+    drop(image);
+    (credential, dumpability, aspace, access_state)
+}
+
+fn snapshot_group_credential_image<A: Clone>(
+    image_binding: &RwLock<ProcessImageBinding<A>>,
+    group_leader: &GroupLeaderCredentialBinding,
+) -> (Arc<Cred>, Dumpability, Arc<UserNamespace>, A) {
+    let image = image_binding.read();
+    let security = image.access_state.security.lock();
+    let credential = group_leader.current_cred();
+    let dumpability = security.dumpability;
+    let owner_user_ns = image.access_state.owner_user_ns.clone();
+    let aspace = image.aspace.clone();
+    drop(security);
+    drop(image);
+    (credential, dumpability, owner_user_ns, aspace)
+}
+
+fn coredump_image_snapshot<A: Clone>(image_binding: &RwLock<ProcessImageBinding<A>>) -> Option<A> {
+    let image = image_binding.read();
+    let security = image.access_state.security.lock();
+    let snapshot =
+        (security.dumpability == Dumpability::UserDumpable).then(|| image.aspace.clone());
+    drop(security);
+    drop(image);
+    snapshot
+}
+
+fn ptrace_image_snapshot_if_owned<A: Clone>(
+    ptrace_ctl: &SpinNoIrq<PtraceControlState>,
+    image_binding: &RwLock<ProcessImageBinding<A>>,
+    tracer: Pid,
+) -> Option<A> {
+    // Keep this order stable: ptrace ownership first, then the process image.
+    // Holding both gates across the clone gives ptrace memory operations one
+    // linearization point and prevents a detach/reattach ABA between a
+    // successful ownership check and image acquisition.
+    let ptrace_ctl = ptrace_ctl.lock();
+    if ptrace_ctl.tracer != Some(tracer) {
+        return None;
+    }
+    let image = image_binding.read();
+    let snapshot = image.aspace.clone();
+    drop(image);
+    drop(ptrace_ctl);
+    Some(snapshot)
+}
+
+fn replace_process_image_with_group_handoff<'a, A>(
+    image_binding: &RwLock<ProcessImageBinding<A>>,
+    group_leader: &GroupLeaderCredentialBinding,
+    credential: Arc<CredentialSlot>,
+    prepared: Option<PreparedCred<'a>>,
+    new_image: ProcessImageBinding<A>,
+    finish_image_publication: impl FnOnce(),
+) -> (GroupLeaderRetirement<'a>, ProcessImageBinding<A>) {
+    let mut image = image_binding.write();
+    let group_leader = group_leader.publish_handoff(credential, prepared);
+    let retired_image = core::mem::replace(&mut *image, new_image);
+    finish_image_publication();
+    drop(image);
+    (group_leader, retired_image)
+}
+
 /// [`Process`]-shared data.
 pub struct ProcessData {
     /// The process.
@@ -994,9 +1209,8 @@ pub struct ProcessData {
     start_realtime_sec: u64,
     /// Monotonic process creation timestamp, in nanoseconds.
     start_monotonic_ns: u64,
-    /// The virtual memory address space.
-    // TODO: scopify
-    aspace_handle: RwLock<Arc<Mutex<AddrSpace>>>,
+    /// Executable address space and its coherent process-access owner.
+    image_binding: RwLock<LiveProcessImageBinding>,
     /// The resource scope
     pub scope: RwLock<Scope>,
     /// Real empty files table prepared at process creation for final exit swap.
@@ -1028,8 +1242,6 @@ pub struct ProcessData {
     personality: AtomicU32,
     /// NUMA memory policy state for the single-node kernel memory model.
     mempolicy: SpinNoIrq<MempolicyState>,
-    /// Parent-death signal configured through prctl(PR_SET_PDEATHSIG).
-    pdeath_signal: AtomicU32,
     /// Current timer slack in nanoseconds.
     timerslack_current_ns: AtomicUsize,
     /// Default timer slack in nanoseconds, used when PR_SET_TIMERSLACK is 0.
@@ -1085,6 +1297,13 @@ pub struct ProcessData {
 pub(crate) struct GroupLeaderRetirement<'a> {
     _publication: Option<super::creds::CredentialPublication<'a>>,
     _slot: Arc<CredentialSlot>,
+}
+
+/// Retired image and credential ownership from one exec publication. The
+/// caller keeps this alive until after switching the hardware page-table root.
+pub(crate) struct ExecImageRetirement<'a> {
+    _group_leader: GroupLeaderRetirement<'a>,
+    _image: LiveProcessImageBinding,
 }
 
 pub(crate) fn process_error(error: ProcessError) -> AxError {
@@ -1234,6 +1453,7 @@ impl ProcessData {
         executable: Option<ExecutableKey>,
         cmdline: Arc<Vec<String>>,
         aspace: Arc<Mutex<AddrSpace>>,
+        access_state: Arc<ProcessAccessState>,
         scope: Scope,
         exit_fd_table: Arc<FdTable>,
         signal_actions: Arc<SpinNoIrq<SignalActions>>,
@@ -1276,7 +1496,10 @@ impl ProcessData {
             cmdline: RwLock::new(cmdline),
             start_realtime_sec,
             start_monotonic_ns,
-            aspace_handle: RwLock::new(aspace),
+            image_binding: RwLock::new(ProcessImageBinding {
+                aspace,
+                access_state,
+            }),
             scope: RwLock::new(scope),
             exit_fd_table,
             heap_top: AtomicUsize::new(
@@ -1297,7 +1520,6 @@ impl ProcessData {
             umask: AtomicU32::new(0o022),
             personality: AtomicU32::new(0),
             mempolicy: SpinNoIrq::new(MempolicyState::default()),
-            pdeath_signal: AtomicU32::new(0),
             timerslack_current_ns: AtomicUsize::new(50_000),
             timerslack_default_ns: AtomicUsize::new(50_000),
             posix_timers: SpinNoIrq::new(Vec::new()),
@@ -1358,20 +1580,137 @@ impl ProcessData {
         self.group_leader_credential.current_cred()
     }
 
+    /// Takes process-directed identity, dumpability, and image through one
+    /// coherent snapshot of the persistent group-leader binding.
+    pub(crate) fn group_leader_image_access_snapshot(&self) -> ProcessImageAccessSnapshot {
+        let (credential, dumpability, owner_user_ns, aspace) =
+            snapshot_group_credential_image(&self.image_binding, &self.group_leader_credential);
+        ProcessImageAccessSnapshot {
+            credential,
+            dumpability,
+            owner_user_ns,
+            aspace,
+        }
+    }
+
+    /// Takes one exact live task identity with the image/access owner it
+    /// names. Callers must operate on the returned address-space handle.
+    pub(crate) fn thread_image_access_snapshot(
+        &self,
+        thread: &super::Thread,
+    ) -> AxResult<ProcessImageAccessSnapshot> {
+        debug_assert!(core::ptr::eq(&*thread.proc_data, self));
+        if thread.exit.load(Ordering::Acquire) {
+            return Err(AxError::NoSuchProcess);
+        }
+        let slot = thread.credential_slot();
+        let (credential, dumpability, aspace, access_state) =
+            snapshot_credential_image(&self.image_binding, &slot);
+        if thread.exit.load(Ordering::Acquire) {
+            return Err(AxError::NoSuchProcess);
+        }
+        Ok(ProcessImageAccessSnapshot {
+            credential,
+            dumpability,
+            owner_user_ns: access_state.owner_user_ns.clone(),
+            aspace,
+        })
+    }
+
+    pub(crate) fn credential_image_access_snapshot(
+        &self,
+        slot: &CredentialSlot,
+    ) -> ProcessImageAccessSnapshot {
+        let (credential, dumpability, aspace, access_state) =
+            snapshot_credential_image(&self.image_binding, slot);
+        ProcessImageAccessSnapshot {
+            credential,
+            dumpability,
+            owner_user_ns: access_state.owner_user_ns.clone(),
+            aspace,
+        }
+    }
+
+    pub(crate) fn dumpability(&self) -> Dumpability {
+        let image = self.image_binding.read();
+        let dumpability = image.access_state.dumpability();
+        drop(image);
+        dumpability
+    }
+
+    pub(crate) fn set_dumpability(&self, dumpability: Dumpability) {
+        let image = self.image_binding.read();
+        image.access_state.set_dumpability(dumpability);
+        drop(image);
+    }
+
+    pub(crate) fn fork_image_credential_snapshot(
+        &self,
+        thread: &super::Thread,
+    ) -> (
+        Arc<Cred>,
+        Dumpability,
+        Arc<Mutex<AddrSpace>>,
+        Arc<ProcessAccessState>,
+    ) {
+        debug_assert!(core::ptr::eq(&*thread.proc_data, self));
+        let slot = thread.credential_slot();
+        let (credential, dumpability, aspace, access_state) =
+            snapshot_credential_image(&self.image_binding, &slot);
+        (credential, dumpability, aspace, access_state)
+    }
+
+    /// The sole normal-task credential publication path.
+    pub(in crate::task) fn publish_credential<'a>(
+        &self,
+        prepared: PreparedCred<'a>,
+        pdeath_signal: &AtomicU32,
+    ) -> Arc<Cred> {
+        let image = self.image_binding.read();
+        let publication = image
+            .access_state
+            .publish_credential(prepared, pdeath_signal);
+        let proposed = publication.proposed();
+        drop(image);
+        drop(publication);
+        proposed
+    }
+
     /// Publishes an optional exec credential and switches the group-leader
     /// slot as one process-visible transition. Retired `Arc`s are destroyed
     /// only after the binding lock is released.
-    pub(in crate::task) fn publish_group_leader_handoff<'a>(
+    pub(in crate::task) fn publish_exec_image<'a>(
         &self,
         owner: Pid,
         thread: &super::Thread,
         prepared: Option<PreparedCred<'a>>,
-    ) -> GroupLeaderRetirement<'a> {
+        new_aspace: Arc<Mutex<AddrSpace>>,
+        new_access_state: Arc<ProcessAccessState>,
+    ) -> ExecImageRetirement<'a> {
         debug_assert!(self.is_exec_owner(owner));
         debug_assert_eq!(thread.proc_data.proc.pid(), self.proc.pid());
         let credential = thread.credential_slot();
-        self.group_leader_credential
-            .publish_handoff(credential, prepared)
+        if prepared
+            .as_ref()
+            .is_some_and(PreparedCred::requires_dumpability_drop)
+        {
+            thread.set_pdeath_signal(0);
+        }
+        let (group_leader, retired_image) = replace_process_image_with_group_handoff(
+            &self.image_binding,
+            &self.group_leader_credential,
+            credential,
+            prepared,
+            ProcessImageBinding {
+                aspace: new_aspace,
+                access_state: new_access_state,
+            },
+            || self.mempolicy.lock().ranges.clear(),
+        );
+        ExecImageRetirement {
+            _group_leader: group_leader,
+            _image: retired_image,
+        }
     }
 
     /// Clones the preallocated real empty files table for final process exit.
@@ -1407,12 +1746,18 @@ impl ProcessData {
 
     /// Returns the current address-space handle for this process.
     pub fn aspace(&self) -> Arc<Mutex<AddrSpace>> {
-        self.aspace_handle.read().clone()
+        self.image_binding.read().aspace.clone()
     }
 
-    /// Rebinds the process to a new address-space handle and returns the old one.
-    pub fn replace_aspace(&self, aspace: Arc<Mutex<AddrSpace>>) -> Arc<Mutex<AddrSpace>> {
-        core::mem::replace(&mut *self.aspace_handle.write(), aspace)
+    pub(crate) fn image_matches(&self, aspace: &Arc<Mutex<AddrSpace>>) -> bool {
+        Arc::ptr_eq(&self.image_binding.read().aspace, aspace)
+    }
+
+    /// Pins the current image only when the same coherent access snapshot is
+    /// user-dumpable. The returned Arc remains bound to that image across any
+    /// later exec publication.
+    pub(crate) fn coredump_aspace(&self) -> Option<Arc<Mutex<AddrSpace>>> {
+        coredump_image_snapshot(&self.image_binding)
     }
 
     pub(crate) fn uts_ns(&self) -> Arc<UtsNamespace> {
@@ -1490,14 +1835,6 @@ impl ProcessData {
     /// Set the top address of the user heap.
     pub fn set_heap_top(&self, top: usize) {
         self.heap_top.store(top, Ordering::Release)
-    }
-
-    pub fn pdeath_signal(&self) -> u32 {
-        self.pdeath_signal.load(Ordering::Acquire)
-    }
-
-    pub fn set_pdeath_signal(&self, signo: u32) {
-        self.pdeath_signal.store(signo, Ordering::Release)
     }
 
     pub fn timerslack_ns(&self) -> usize {
@@ -1598,6 +1935,39 @@ impl ProcessData {
         self.mempolicy.lock().process_policy
     }
 
+    /// Fallibly freezes NUMA policy for an already-authorized image.
+    ///
+    /// Allocation happens before taking the image publication lock. The
+    /// second capacity check fails closed if a concurrent policy update grew
+    /// the range vector; callers may retry the open operation explicitly.
+    pub(crate) fn try_mempolicy_snapshot_for_image(
+        &self,
+        expected_aspace: &Arc<Mutex<AddrSpace>>,
+    ) -> AxResult<MempolicySnapshot> {
+        let required = self.mempolicy.lock().ranges.len();
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(required)
+            .map_err(|_| AxError::NoMemory)?;
+
+        let image = self.image_binding.read();
+        if !Arc::ptr_eq(&image.aspace, expected_aspace) {
+            return Err(AxError::ResourceBusy);
+        }
+        let state = self.mempolicy.lock();
+        if ranges.capacity() < state.ranges.len() {
+            return Err(AxError::ResourceBusy);
+        }
+        ranges.extend(state.ranges.iter().copied());
+        let snapshot = MempolicySnapshot {
+            process_policy: state.process_policy,
+            ranges,
+        };
+        drop(state);
+        drop(image);
+        Ok(snapshot)
+    }
+
     pub fn set_mempolicy(&self, policy: Mempolicy) {
         self.mempolicy.lock().process_policy = policy;
     }
@@ -1687,6 +2057,12 @@ impl ProcessData {
 
     pub fn is_traced_by(&self, tracer: Pid) -> bool {
         self.ptrace_tracer() == Some(tracer)
+    }
+
+    /// Pins the current process image only if `tracer` still owns this ptrace
+    /// session at the same linearization point.
+    pub(crate) fn ptrace_image_if_traced_by(&self, tracer: Pid) -> Option<Arc<Mutex<AddrSpace>>> {
+        ptrace_image_snapshot_if_owned(&self.ptrace_ctl, &self.image_binding, tracer)
     }
 
     pub fn begin_ptrace(&self, tracer: Pid) -> bool {
@@ -2177,20 +2553,26 @@ mod tests {
     extern crate std;
 
     use alloc::{sync::Arc, vec};
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
     use std::{sync::Barrier, thread, vec::Vec};
 
     use axerrno::AxError;
+    use axsync::spin::SpinNoIrq;
+    use linux_raw_sys::general::CAP_CHOWN;
 
     use super::{
-        CgroupNamespace, GroupLeaderCredentialBinding, NetworkNamespace, PidNamespace,
-        SIGNAL_QUEUE_GLOBAL_HARD_LIMIT, SIGNAL_QUEUE_PER_USER_HARD_LIMIT, TimeNamespace,
-        UserNamespace, UtsNamespace, group_exit_handoff_requires_kill, init_uts_state,
-        try_increment_bounded,
+        CgroupNamespace, Dumpability, GroupLeaderCredentialBinding, Mempolicy, MempolicyRange,
+        MempolicySnapshot, MempolicyState, NetworkNamespace, PidNamespace, ProcessAccessState,
+        ProcessImageBinding, SIGNAL_QUEUE_GLOBAL_HARD_LIMIT, SIGNAL_QUEUE_PER_USER_HARD_LIMIT,
+        TimeNamespace, UserNamespace, UtsNamespace, coredump_image_snapshot,
+        group_exit_handoff_requires_kill, init_uts_state, ptrace_image_snapshot_if_owned,
+        replace_process_image_with_group_handoff, snapshot_credential_image,
+        snapshot_group_credential_image, try_increment_bounded,
     };
     use crate::task::{
-        Cred, CredentialSlot,
+        CapabilityState, Cred, CredentialSlot,
         idmap::{IdMapInputExtent, Kgid, Kuid},
+        jobctl::PtraceControlState,
     };
 
     fn kuid(raw: u32) -> Kuid {
@@ -2221,6 +2603,304 @@ mod tests {
         let state = init_uts_state();
         assert_eq!(&state.nodename[..state.nodename_len], b"thekernel");
         assert_eq!(&state.domainname[..state.domainname_len], b"(none)");
+    }
+
+    #[test]
+    fn process_access_identity_and_capability_gain_lower_dumpability_and_clear_pdeath() {
+        for field in 0..4 {
+            let namespace = UserNamespace::try_new_root().unwrap();
+            let slot = CredentialSlot::try_new(Cred::try_root(namespace.clone()).unwrap()).unwrap();
+            let state = ProcessAccessState::try_new(Dumpability::UserDumpable, namespace).unwrap();
+            let pdeath = AtomicU32::new(9);
+            let mut update = slot.prepare();
+            match field {
+                0 => update.builder.ids.euid = kuid(1000),
+                1 => update.builder.ids.egid = kgid(1000),
+                2 => update.builder.ids.fsuid = kuid(1000),
+                _ => update.builder.ids.fsgid = kgid(1000),
+            }
+            let publication = state.publish_credential(update.finish().unwrap(), &pdeath);
+            drop(publication);
+            assert_eq!(state.dumpability(), Dumpability::NotDumpable);
+            assert_eq!(pdeath.load(Ordering::Acquire), 0);
+        }
+
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let slot = CredentialSlot::try_new(Cred::try_root(namespace.clone()).unwrap()).unwrap();
+        let mut lower = slot.prepare();
+        lower.builder.caps.effective = [0; 2];
+        lower.builder.caps.permitted = [0; 2];
+        lower.builder.caps.inheritable = [0; 2];
+        lower.builder.caps.ambient = [0; 2];
+        lower.finish().unwrap().commit();
+        let state = ProcessAccessState::try_new(Dumpability::UserDumpable, namespace).unwrap();
+        let pdeath = AtomicU32::new(12);
+        let (word, mask) = CapabilityState::cap_mask(CAP_CHOWN).unwrap();
+        let mut gain = slot.prepare();
+        gain.builder.caps.permitted[word] |= mask;
+        gain.builder.caps.effective[word] |= mask;
+        let publication = state.publish_credential(gain.finish().unwrap(), &pdeath);
+        drop(publication);
+        assert_eq!(state.dumpability(), Dumpability::NotDumpable);
+        assert_eq!(pdeath.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn process_access_real_and_saved_id_only_changes_do_not_lower_dumpability() {
+        for field in 0..4 {
+            let namespace = UserNamespace::try_new_root().unwrap();
+            let slot = CredentialSlot::try_new(Cred::try_root(namespace.clone()).unwrap()).unwrap();
+            let state = ProcessAccessState::try_new(Dumpability::UserDumpable, namespace).unwrap();
+            let pdeath = AtomicU32::new(7);
+            let mut update = slot.prepare();
+            match field {
+                0 => update.builder.ids.ruid = kuid(1000),
+                1 => update.builder.ids.suid = kuid(1000),
+                2 => update.builder.ids.rgid = kgid(1000),
+                _ => update.builder.ids.sgid = kgid(1000),
+            }
+            let publication = state.publish_credential(update.finish().unwrap(), &pdeath);
+            drop(publication);
+            assert_eq!(state.dumpability(), Dumpability::UserDumpable);
+            assert_eq!(pdeath.load(Ordering::Acquire), 7);
+        }
+    }
+
+    #[test]
+    fn process_access_snapshot_never_pairs_new_identity_with_user_dumpable() {
+        const WRITES: usize = 2_000;
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let slot = CredentialSlot::try_new(Cred::try_root(namespace.clone()).unwrap()).unwrap();
+        let initial = kuid(1000);
+        let stronger = kuid(2000);
+        let mut update = slot.prepare();
+        update.builder.ids.ruid = initial;
+        update.builder.ids.euid = initial;
+        update.builder.ids.suid = initial;
+        update.builder.ids.fsuid = initial;
+        update.finish().unwrap().commit();
+
+        let state = ProcessAccessState::try_new(Dumpability::UserDumpable, namespace).unwrap();
+        let binding = Arc::new(spin::RwLock::new(ProcessImageBinding {
+            aspace: 1usize,
+            access_state: state.clone(),
+        }));
+        let pdeath = Arc::new(AtomicU32::new(1));
+        let stronger_ready = Arc::new(Barrier::new(2));
+        let stronger_sampled = Arc::new(Barrier::new(2));
+        let writer = {
+            let slot = slot.clone();
+            let state = state.clone();
+            let pdeath = pdeath.clone();
+            let stronger_ready = stronger_ready.clone();
+            let stronger_sampled = stronger_sampled.clone();
+            thread::spawn(move || {
+                for _ in 0..WRITES {
+                    let mut gain = slot.prepare();
+                    gain.builder.ids.ruid = stronger;
+                    gain.builder.ids.euid = stronger;
+                    gain.builder.ids.suid = stronger;
+                    gain.builder.ids.fsuid = stronger;
+                    drop(state.publish_credential(gain.finish().unwrap(), &pdeath));
+                    stronger_ready.wait();
+                    stronger_sampled.wait();
+
+                    let mut restore = slot.prepare();
+                    restore.builder.ids.ruid = initial;
+                    restore.builder.ids.euid = initial;
+                    restore.builder.ids.suid = initial;
+                    restore.builder.ids.fsuid = initial;
+                    drop(state.publish_credential(restore.finish().unwrap(), &pdeath));
+                    state.set_dumpability(Dumpability::UserDumpable);
+                }
+            })
+        };
+
+        for _ in 0..WRITES {
+            stronger_ready.wait();
+            let (credential, dumpability, ..) = snapshot_credential_image(&binding, &slot);
+            assert_eq!(credential.ids().euid, stronger);
+            assert_eq!(dumpability, Dumpability::NotDumpable);
+            stronger_sampled.wait();
+        }
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn process_access_exact_slot_and_group_leader_view_are_distinct() {
+        let leader = credential_slot(1000);
+        let exact = credential_slot(2000);
+        let owner = leader.current().user_ns().clone();
+        let state = ProcessAccessState::try_new(Dumpability::UserDumpable, owner).unwrap();
+        let image = spin::RwLock::new(ProcessImageBinding {
+            aspace: 7usize,
+            access_state: state,
+        });
+        let group = GroupLeaderCredentialBinding::new(leader);
+
+        let (exact_cred, exact_dumpability, exact_image, _) =
+            snapshot_credential_image(&image, &exact);
+        let (leader_cred, leader_dumpability, _, leader_image) =
+            snapshot_group_credential_image(&image, &group);
+        assert_eq!(exact_cred.ids().euid, kuid(2000));
+        assert_eq!(leader_cred.ids().euid, kuid(1000));
+        assert_eq!(exact_dumpability, Dumpability::UserDumpable);
+        assert_eq!(leader_dumpability, Dumpability::UserDumpable);
+        assert_eq!(exact_image, leader_image);
+    }
+
+    #[test]
+    fn process_access_coredump_pins_only_the_coherent_dumpable_image() {
+        let owner = UserNamespace::try_new_root().unwrap();
+        let state = ProcessAccessState::try_new(Dumpability::UserDumpable, owner.clone()).unwrap();
+        let image = spin::RwLock::new(ProcessImageBinding {
+            aspace: 41usize,
+            access_state: state.clone(),
+        });
+        assert_eq!(coredump_image_snapshot(&image), Some(41));
+        state.set_dumpability(Dumpability::NotDumpable);
+        assert_eq!(coredump_image_snapshot(&image), None);
+
+        let replacement = ProcessAccessState::try_new(Dumpability::UserDumpable, owner).unwrap();
+        *image.write() = ProcessImageBinding {
+            aspace: 42,
+            access_state: replacement,
+        };
+        assert_eq!(coredump_image_snapshot(&image), Some(42));
+    }
+
+    #[test]
+    fn process_access_ptrace_session_and_image_pin_share_one_snapshot() {
+        let owner = UserNamespace::try_new_root().unwrap();
+        let state = ProcessAccessState::try_new(Dumpability::UserDumpable, owner).unwrap();
+        let image = spin::RwLock::new(ProcessImageBinding {
+            aspace: 41usize,
+            access_state: state,
+        });
+        let ptrace_ctl = SpinNoIrq::new(PtraceControlState::default());
+
+        assert_eq!(ptrace_image_snapshot_if_owned(&ptrace_ctl, &image, 7), None);
+        ptrace_ctl.lock().tracer = Some(7);
+        assert_eq!(ptrace_image_snapshot_if_owned(&ptrace_ctl, &image, 8), None);
+        assert_eq!(
+            ptrace_image_snapshot_if_owned(&ptrace_ctl, &image, 7),
+            Some(41)
+        );
+
+        // A detached session cannot retain its earlier authorization. After
+        // reattach, the same tracer PID observes only the newly bound image.
+        *ptrace_ctl.lock() = PtraceControlState::default();
+        image.write().aspace = 42;
+        assert_eq!(ptrace_image_snapshot_if_owned(&ptrace_ctl, &image, 7), None);
+        ptrace_ctl.lock().tracer = Some(7);
+        assert_eq!(
+            ptrace_image_snapshot_if_owned(&ptrace_ctl, &image, 7),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn process_access_numa_policy_snapshot_is_immutable_and_range_specific() {
+        let snapshot = MempolicySnapshot {
+            process_policy: Mempolicy::new(0, 1),
+            ranges: vec![
+                MempolicyRange {
+                    start: 0x1000,
+                    end: 0x5000,
+                    policy: Mempolicy::new(2, 2),
+                },
+                MempolicyRange {
+                    start: 0x2000,
+                    end: 0x3000,
+                    policy: Mempolicy::new(3, 4),
+                },
+            ],
+        };
+
+        assert_eq!(snapshot.policy_for_addr(0), Mempolicy::new(0, 1));
+        assert_eq!(snapshot.policy_for_addr(0x1800), Mempolicy::new(2, 2));
+        assert_eq!(snapshot.policy_for_addr(0x2800), Mempolicy::new(3, 4));
+    }
+
+    #[test]
+    fn process_access_group_leader_exec_handoff_is_image_coherent() {
+        let old_slot = credential_slot(1000);
+        let new_slot = credential_slot(2000);
+        let old_owner = old_slot.current().user_ns().clone();
+        let new_owner = new_slot.current().user_ns().clone();
+        let old_state = ProcessAccessState::try_new(Dumpability::UserDumpable, old_owner).unwrap();
+        let clone_vm_peer_state = old_state.clone();
+        let new_state = ProcessAccessState::try_new(Dumpability::NotDumpable, new_owner).unwrap();
+        let image = Arc::new(spin::RwLock::new(ProcessImageBinding {
+            aspace: 1usize,
+            access_state: old_state,
+        }));
+        let mempolicy = MempolicyState {
+            process_policy: Mempolicy::new(0, 1),
+            ranges: vec![MempolicyRange {
+                start: 0x1000,
+                end: 0x2000,
+                policy: Mempolicy::new(2, 2),
+            }],
+        };
+        let mempolicy = SpinNoIrq::new(mempolicy);
+        let reset_under_image_lock = AtomicBool::new(false);
+        let group = Arc::new(GroupLeaderCredentialBinding::new(old_slot));
+        let old_seen = Arc::new(Barrier::new(2));
+        let new_ready = Arc::new(Barrier::new(2));
+        let reader = {
+            let image = image.clone();
+            let group = group.clone();
+            let old_seen = old_seen.clone();
+            let new_ready = new_ready.clone();
+            thread::spawn(move || {
+                let (cred, dumpability, _, aspace) =
+                    snapshot_group_credential_image(&image, &group);
+                assert_eq!(
+                    (cred.ids().euid, dumpability, aspace),
+                    (kuid(1000), Dumpability::UserDumpable, 1)
+                );
+                old_seen.wait();
+                new_ready.wait();
+                let (cred, dumpability, _, aspace) =
+                    snapshot_group_credential_image(&image, &group);
+                assert_eq!(
+                    (cred.ids().euid, dumpability, aspace),
+                    (kuid(3000), Dumpability::NotDumpable, 2)
+                );
+            })
+        };
+
+        let mut update = new_slot.prepare();
+        update.builder.ids.ruid = kuid(3000);
+        update.builder.ids.euid = kuid(3000);
+        update.builder.ids.suid = kuid(3000);
+        update.builder.ids.fsuid = kuid(3000);
+        let prepared = update.finish().unwrap();
+        old_seen.wait();
+        let retirement = replace_process_image_with_group_handoff(
+            &image,
+            &group,
+            new_slot.clone(),
+            Some(prepared),
+            ProcessImageBinding {
+                aspace: 2,
+                access_state: new_state,
+            },
+            || {
+                assert!(image.try_read().is_none());
+                mempolicy.lock().ranges.clear();
+                reset_under_image_lock.store(true, Ordering::Release);
+            },
+        );
+        drop(retirement);
+        assert!(reset_under_image_lock.load(Ordering::Acquire));
+        assert!(mempolicy.lock().ranges.is_empty());
+        let current_state = image.read().access_state.clone();
+        assert!(!Arc::ptr_eq(&current_state, &clone_vm_peer_state));
+        assert_eq!(clone_vm_peer_state.dumpability(), Dumpability::UserDumpable);
+        new_ready.wait();
+        reader.join().unwrap();
     }
 
     #[test]

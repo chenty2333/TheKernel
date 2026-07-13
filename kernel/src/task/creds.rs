@@ -347,6 +347,20 @@ impl Cred {
         &self.user_ns
     }
 
+    #[cfg(test)]
+    pub(crate) fn try_with_euid_for_test(current: &Arc<Self>, euid: Kuid) -> AxResult<Arc<Self>> {
+        let mut ids = current.ids;
+        ids.euid = euid;
+        Arc::try_new(Self {
+            ids,
+            groups: current.groups.clone(),
+            caps: current.caps,
+            no_new_privs: current.no_new_privs,
+            user_ns: current.user_ns.clone(),
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+
     /// Snapshot the filesystem identity and effective capabilities used by DAC.
     ///
     /// Keeping this on the immutable credential lets early boot and other
@@ -388,6 +402,36 @@ impl Cred {
     pub(crate) fn has_effective_capability_in_own_user_ns(&self, cap: u32) -> bool {
         self.caps.has_effective(cap)
     }
+}
+
+/// Linux `cred_cap_issubset(set, subset)` over this kernel's immutable
+/// credential and user-namespace model.
+///
+/// A credential in the same namespace is no stronger when its permitted set
+/// is a subset. Across namespaces, authority is contained only when `set` is
+/// the parent of `subset` (or one of its ancestors) and `set`'s effective UID
+/// owns the child namespace at that boundary.
+fn credential_cap_is_subset(set: &Cred, subset: &Cred) -> bool {
+    if Arc::ptr_eq(set.user_ns(), subset.user_ns()) {
+        return subset
+            .caps
+            .permitted
+            .iter()
+            .zip(set.caps.permitted.iter())
+            .all(|(subset, set)| subset & !set == 0);
+    }
+
+    let mut subset_ns = subset.user_ns().clone();
+    while !subset_ns.is_initial() {
+        let Some(parent) = subset_ns.parent() else {
+            return false;
+        };
+        if Arc::ptr_eq(set.user_ns(), &parent) && subset_ns.owner_kuid() == set.ids.euid {
+            return true;
+        }
+        subset_ns = parent;
+    }
+    false
 }
 
 /// Mutable, unpublished copy of a credential transaction.
@@ -578,6 +622,21 @@ impl CredentialPublication<'_> {
 }
 
 impl<'a> PreparedCred<'a> {
+    /// Linux lowers process dumpability and clears the parent-death signal
+    /// when an effective/filesystem ID changes or the proposed permitted
+    /// authority is not contained by the old credential. The process layer
+    /// consumes this before publication so readers cannot observe stronger
+    /// authority with stale, more permissive image state.
+    pub(crate) fn requires_dumpability_drop(&self) -> bool {
+        let old = self.old.ids;
+        let proposed = self.proposed.ids;
+        old.euid != proposed.euid
+            || old.egid != proposed.egid
+            || old.fsuid != proposed.fsuid
+            || old.fsgid != proposed.fsgid
+            || !credential_cap_is_subset(&self.old, &self.proposed)
+    }
+
     #[cfg(test)]
     pub(crate) fn proposed(&self) -> &Cred {
         &self.proposed

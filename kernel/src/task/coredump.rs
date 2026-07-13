@@ -4,7 +4,7 @@
 //! (NT_PRSTATUS with register state) and PT_LOAD segments for each
 //! user-accessible memory area.
 
-use alloc::{format, vec};
+use alloc::{format, vec, vec::Vec};
 
 use axerrno::{AxError, AxResult};
 use axfs::{FS_CONTEXT, File, OpenOptions};
@@ -220,30 +220,41 @@ fn fill_gregs(uctx: &UserContext, regs: &mut [u64; NUM_GREGS + 1]) {
 ///
 /// This is best-effort: errors are returned but callers should not treat
 /// a failed core dump as fatal.
-pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResult<()> {
+pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResult<bool> {
     let proc_data = &thr.proc_data;
     let pid = proc_data.proc.pid();
     let core_limit = proc_data.rlim.read()[RLIMIT_CORE].current;
     if core_limit == 0 {
         info!("Skipping core dump for pid {pid}: RLIMIT_CORE=0");
-        return Ok(());
+        return Ok(false);
     }
     let core_limit = if core_limit == RLIM_INFINITY as u64 {
         usize::MAX
     } else {
         core_limit.try_into().unwrap_or(usize::MAX)
     };
+    let Some(aspace_handle) = proc_data.coredump_aspace() else {
+        info!("Skipping core dump for pid {pid}: process image is not dumpable");
+        return Ok(false);
+    };
     let path = format!("/tmp/core.{}", pid);
-
-    let aspace_handle = proc_data.aspace();
     let aspace = aspace_handle.lock();
 
     // Collect user-accessible memory areas.
-    let areas: alloc::vec::Vec<_> = aspace
+    let user_area_count = aspace
         .areas()
         .filter(|a| a.flags().contains(MappingFlags::USER))
-        .map(|a| (a.start(), a.size(), a.flags()))
-        .collect();
+        .count();
+    let mut areas = Vec::new();
+    areas
+        .try_reserve_exact(user_area_count)
+        .map_err(|_| AxError::NoMemory)?;
+    for area in aspace
+        .areas()
+        .filter(|area| area.flags().contains(MappingFlags::USER))
+    {
+        areas.push((area.start(), area.size(), area.flags()));
+    }
 
     let num_loads = areas.len();
     let num_phdrs = 1 + num_loads; // 1 PT_NOTE + N PT_LOAD
@@ -312,8 +323,10 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
     // ---- Open file ----
     let file = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        // Exclusive creation rejects both pre-existing files and dangling
+        // symlinks, so a privileged dump cannot overwrite or follow an
+        // attacker-prepared `/tmp/core.<pid>` path.
+        .create_new(true)
         .open(&FS_CONTEXT.lock(), &path)?
         .into_file()?;
 
@@ -405,5 +418,5 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
     } else {
         info!("Core dump written to {path} ({file_offset} bytes)");
     }
-    Ok(())
+    Ok(true)
 }

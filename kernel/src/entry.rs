@@ -17,9 +17,10 @@ use crate::{
     },
     pseudofs::{self, dev::tty::N_TTY},
     task::{
-        CgroupNamespace, Cred, CredentialSlot, NetworkNamespace, PidNamespace, ProcessData, Thread,
-        TimeNamespace, UserNamespace, UtsNamespace, init_process_domain, linux_pid_from_task_id,
-        prepare_task_table_admission, spawn_alarm_task, try_new_user_task,
+        CgroupNamespace, Cred, CredentialSlot, Dumpability, NetworkNamespace, PidNamespace,
+        ProcessAccessState, ProcessData, Thread, TimeNamespace, UserNamespace, UtsNamespace,
+        init_process_domain, linux_pid_from_task_id, prepare_task_table_admission,
+        spawn_alarm_task, try_new_user_task,
     },
 };
 
@@ -124,6 +125,8 @@ pub fn init(args: &[String], envs: &[String]) {
     }
     let cmdline = Arc::try_new(cmdline).expect("Failed to allocate init command-line owner");
     let aspace = Arc::try_new(Mutex::new(uspace)).expect("Failed to allocate init address space");
+    let access_state = ProcessAccessState::try_new(Dumpability::UserDumpable, user_ns.clone())
+        .expect("Failed to allocate init process access state");
     let signal_actions =
         Arc::try_new(SpinNoIrq::new(Default::default())).expect("Failed to allocate init signals");
     let init_fd_table =
@@ -142,6 +145,7 @@ pub fn init(args: &[String], envs: &[String]) {
         executable::acquire(&loc).expect("Failed to retain init executable identity"),
         cmdline,
         aspace,
+        access_state,
         scope,
         exit_fd_table,
         signal_actions,
