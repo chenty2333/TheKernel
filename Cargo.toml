@@ -118,6 +118,7 @@ scope-local = { path = "third_party/rust-patches/scope-local" }
 starry-signal = { path = "third_party/rust-patches/starry-signal" }
 axtask = { path = "crates/axtask-compat" }
 axruntime = { path = "third_party/rust-patches/axruntime" }
+axsync = { path = "third_party/rust-patches/axsync" }
 axplat-loongarch64-qemu-virt = { path = "third_party/rust-patches/axplat-loongarch64-qemu-virt" }
 axplat-riscv64-qemu-virt = { path = "third_party/rust-patches/axplat-riscv64-qemu-virt" }
 thekernel-axsched = { path = "../thekernel-ax/crates/thekernel-axsched" }

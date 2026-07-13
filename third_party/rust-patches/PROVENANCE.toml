@@ -339,6 +339,32 @@ vendor_record = "VENDOR.md"
 patch_ledger = "VENDOR.md"
 
 [[package]]
+patch = "axsync"
+path = "third_party/rust-patches/axsync"
+name = "axsync"
+version = "0.3.0-preview.2"
+source = "crates.io"
+archive = "axsync-0.3.0-preview.2.crate"
+archive_url = "https://static.crates.io/crates/axsync/axsync-0.3.0-preview.2.crate"
+archive_sha256 = "4fb8e90184332ae787f483a256561c6c4eecc4b5b41e06d3850fbd524a8c6a98"
+repository = "https://github.com/arceos-org/arceos/tree/main/modules/axsync"
+upstream_tag = "not-recorded-in-published-archive"
+source_commit = "6c6765c05df0550e31edb0ca82d468199f108b3f"
+source_commit_kind = "exact"
+vcs_dirty = false
+original_manifest = "Cargo.toml.orig"
+original_manifest_sha256 = "4c2cdeec36fa0f3fedfdb08b4304d3f031eae66f05d55ba434a66284d479da1b"
+cargo_vcs_info = ".cargo_vcs_info.json"
+cargo_vcs_info_sha256 = "45fcb63ef2ed6ca07f5650bed8397258433266934dee2864748b95b02b7a3663"
+license_expression = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
+license_status = "declared-only"
+license_files = []
+upstream_tests_status = "none-published"
+upstream_test_files = []
+vendor_record = "VENDOR.md"
+patch_ledger = "VENDOR.md"
+
+[[package]]
 patch = "axsched"
 path = "third_party/rust-patches/axsched"
 name = "axsched"

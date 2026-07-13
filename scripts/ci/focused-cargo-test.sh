@@ -3,6 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+AX_REPO=$(cd -- "${THEKERNEL_AX_REPO:-$REPO_ROOT/../thekernel-ax}" && pwd -P)
+LINUX_ABI_REPO=$(
+    cd -- "${THEKERNEL_LINUX_ABI_REPO:-$REPO_ROOT/../thekernel-linux-abi}" && pwd -P
+)
 
 if [ "$#" -lt 1 ]; then
     printf 'Usage: %s MANIFEST [CARGO-TEST-ARGS...]\n' "$(basename "$0")" >&2
@@ -45,7 +49,10 @@ fi
 {
     printf '\n[workspace]\nresolver = "2"\n\n'
     sed -n '/^\[patch\.crates-io\]/,$p' "$REPO_ROOT/Cargo.toml" \
-        | sed "s#path = \"#path = \"$REPO_ROOT/#g"
+        | sed "s#path = \"#path = \"$REPO_ROOT/#g" \
+        | sed \
+            -e "s#$REPO_ROOT/../thekernel-ax/#$AX_REPO/#g" \
+            -e "s#$REPO_ROOT/../thekernel-linux-abi/#$LINUX_ABI_REPO/#g"
 } >>"$work_dir/Cargo.toml"
 cp "$REPO_ROOT/Cargo.lock" "$work_dir/Cargo.lock"
 

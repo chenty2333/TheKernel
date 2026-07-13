@@ -67,6 +67,8 @@ canonical_workspace() {
 
 AX_REPO=$(canonical_workspace thekernel-ax "$AX_REPO")
 LINUX_ABI_REPO=$(canonical_workspace thekernel-linux-abi "$LINUX_ABI_REPO")
+export THEKERNEL_AX_REPO="$AX_REPO"
+export THEKERNEL_LINUX_ABI_REPO="$LINUX_ABI_REPO"
 SIBLING_TARGET_DIR="$REPO_ROOT/target/ci-maintained-siblings"
 
 # lwext4's host build script probes generic tool names. Pin those names instead
@@ -325,6 +327,9 @@ ci_run_step readiness-adapter-tests "$STEP_TIMEOUT_SECS" \
     cargo test --locked -p thekernel-readiness-adapter
 ci_run_step process-adapter-tests "$STEP_TIMEOUT_SECS" \
     cargo test --locked -p thekernel-linux-process-adapter
+ci_run_step axsync-tests "$STEP_TIMEOUT_SECS" \
+    "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/axsync/Cargo.toml \
+    --features multitask -- --test-threads=1
 ci_run_step memory-set-tests "$STEP_TIMEOUT_SECS" \
     "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/memory_set/Cargo.toml
 ci_run_step scope-local-tests "$STEP_TIMEOUT_SECS" \
