@@ -180,6 +180,13 @@ ci_run_step kernel-sigchld-autoreap-tests "$STEP_TIMEOUT_SECS" \
     --tests --features bpf --target x86_64-unknown-linux-gnu \
     task::ops::tests::sigchld_ -- --test-threads=1
 
+ci_run_step kernel-group-exit-signal-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    task::ops::tests::group_exit_signals_only_peer_threads -- --test-threads=1
+
 ci_run_step kernel-credential-caller-test-discovery "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \

@@ -1156,6 +1156,13 @@ fn begin_group_exit(proc_data: &ProcessData, exit_code: i32) -> bool {
     proc_data.begin_group_exit(exit_code)
 }
 
+/// Linux `zap_other_threads()` targets only peers in the exiting thread
+/// group. Queueing SIGKILL back to the caller would leave a second fatal
+/// event behind after its exit transaction has already removed the TID.
+const fn is_group_exit_peer(current_tid: Pid, candidate_tid: Pid) -> bool {
+    candidate_tid != current_tid
+}
+
 fn remove_current_thread(
     process: &Arc<Process>,
     tid: Pid,
@@ -1270,8 +1277,10 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     let started_group_exit = group_exit && begin_group_exit(&thr.proc_data, exit_code);
     if started_group_exit {
         let sig = SignalInfo::new_kernel(Signo::SIGKILL);
-        for tid in process.thread_ids() {
-            let _ = send_signal_to_thread(None, tid, Some(sig.clone()));
+        for peer_tid in process.thread_ids() {
+            if is_group_exit_peer(tid, peer_tid) {
+                let _ = send_signal_to_thread(Some(process.pid()), peer_tid, Some(sig.clone()));
+            }
         }
     }
     let lifecycle = thr.proc_data.lock_process_lifecycle();
@@ -1522,6 +1531,12 @@ mod tests {
             process_lifecycle_error(ProcessError::Busy),
             AxError::ResourceBusy
         );
+    }
+
+    #[test]
+    fn group_exit_signals_only_peer_threads() {
+        assert!(!is_group_exit_peer(17, 17));
+        assert!(is_group_exit_peer(17, 18));
     }
 
     #[test]

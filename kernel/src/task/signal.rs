@@ -211,6 +211,9 @@ pub fn check_signals(
     uctx: &mut UserContext,
     restore_blocked: Option<SignalSet>,
 ) -> bool {
+    if thr.pending_exit() {
+        return false;
+    }
     let Some(delivered) = thr.signal.check_signals(uctx, restore_blocked) else {
         return false;
     };
