@@ -152,6 +152,63 @@ ci_run_step kernel-security-hook-tests "$STEP_TIMEOUT_SECS" \
     --tests --features bpf --target x86_64-unknown-linux-gnu \
     task::security::tests -- --test-threads=1
 
+ci_run_step kernel-file-open-security-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    syscall::fs::fd_ops::namespace_operation_tests -- --test-threads=1
+
+ci_run_step kernel-opath-capability-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    opath -- --test-threads=1
+
+ci_run_step kernel-open-description-status-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    status_snapshot_is_authoritative_without_an_axfs_append_mirror \
+    -- --test-threads=1
+
+ci_run_step kernel-file-lease-open-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    file::lease::tests -- --test-threads=1
+
+ci_run_step kernel-pipe-status-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    file::pipe::tests -- --test-threads=1
+
+ci_run_step kernel-mandatory-lock-range-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    file::flock::tests::mandatory_ -- --test-threads=1
+
+ci_run_step kernel-write-transfer-status-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    syscall::fs::io::tests -- --test-threads=1
+
+ci_run_step kernel-mmap-file-status-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    syscall::mm::mmap::tests -- --test-threads=1
+
 ci_run_step kernel-signal-syscall-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
@@ -389,6 +446,13 @@ ci_run_step axfs-vfs-tests "$STEP_TIMEOUT_SECS" \
 ci_run_step axfs-pathwalk-policy-tests "$STEP_TIMEOUT_SECS" \
     "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/axfs-ng/Cargo.toml \
     pathwalk_policy_receives_real_components_and_final_position -- --test-threads=1
+ci_run_step axfs-file-open-contract-tests "$STEP_TIMEOUT_SECS" \
+    "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/axfs-ng/Cargo.toml \
+    highlevel::file::tests -- --test-threads=1
+ci_run_step axnet-operation-snapshot-tests "$STEP_TIMEOUT_SECS" \
+    env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    "$SCRIPT_DIR/focused-cargo-test.sh" crates/axnet-ng/Cargo.toml \
+    --features axtask/test general::tests -- --test-threads=1
 ci_run_step signal-tests "$STEP_TIMEOUT_SECS" \
     "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/starry-signal/Cargo.toml \
     -- --test-threads=1
