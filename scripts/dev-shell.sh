@@ -13,8 +13,9 @@ Usage:
   scripts/dev-shell.sh --service builder -- COMMAND [ARGS...]
 
 Environment:
-  OSKERNEL_DEV_IMAGE         Docker image tag (default: thekernel-dev:local)
-  OSCOMP_TESTSUITE_HOST_DIR  Host path mounted read-only at /opt/oskernel/testsuites
+  THEKERNEL_DEV_IMAGE        Docker image tag (default: thekernel-dev:local)
+  THEKERNEL_ROOTFS_HOST_DIR  Optional host rootfs directory mounted read-only
+                             at /opt/thekernel/rootfs
 EOF
 }
 
@@ -37,25 +38,14 @@ if [[ $# -eq 0 ]]; then
     set -- bash
 fi
 
-testsuite_host_dir="${OSCOMP_TESTSUITE_HOST_DIR:-}"
-if [[ -z "$testsuite_host_dir" ]]; then
-    for candidate in \
-        "$HOME/kernel-image" \
-        "$HOME/testsuits-for-oskernel"; do
-        if [[ -d "$candidate" ]]; then
-            testsuite_host_dir="$candidate"
-            break
-        fi
-    done
+rootfs_host_dir="${THEKERNEL_ROOTFS_HOST_DIR:-}"
+if [[ -z "$rootfs_host_dir" ]]; then
+    rootfs_host_dir="$REPO_ROOT/.state/empty-rootfs"
+    mkdir -p "$rootfs_host_dir"
 fi
 
-if [[ -z "$testsuite_host_dir" ]]; then
-    testsuite_host_dir="$REPO_ROOT/.state/empty-testsuites"
-    mkdir -p "$testsuite_host_dir"
-fi
-
-export OSCOMP_TESTSUITE_HOST_DIR="$testsuite_host_dir"
-export OSKERNEL_DEV_IMAGE="${OSKERNEL_DEV_IMAGE:-thekernel-dev:local}"
+export THEKERNEL_ROOTFS_HOST_DIR="$rootfs_host_dir"
+export THEKERNEL_DEV_IMAGE="${THEKERNEL_DEV_IMAGE:-thekernel-dev:local}"
 export LOCAL_UID="$(id -u)"
 export LOCAL_GID="$(id -g)"
 

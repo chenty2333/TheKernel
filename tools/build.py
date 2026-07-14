@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project-local builder for TheKernel evaluator artifacts."""
+"""Content-addressed builder for TheKernel kernel artifacts."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ REPO_FOR_IMPORTS = Path(__file__).resolve().parents[1]
 if str(REPO_FOR_IMPORTS) not in sys.path:
     sys.path.insert(0, str(REPO_FOR_IMPORTS))
 
-from tools.oscomp_eval.paths import repo_root as find_repo_root  # noqa: E402
+from tools.project_paths import repo_root as find_repo_root  # noqa: E402
 
 
 CACHE_VERSION = 3
@@ -47,15 +47,6 @@ KERNEL_ENV: Mapping[str, str] = {
     "LTO": "",
     "MODE": "release",
 }
-
-SUPPORT_ENV_KEYS = (
-    "OSCOMP_RV_CC",
-    "OSCOMP_LA_CC",
-    "OSCOMP_LA_GLIBC_CC",
-    "OSCOMP_RV_LIBGCC",
-    "OSCOMP_LA_LIBGCC",
-)
-
 
 class BuildError(RuntimeError):
     """Raised when an artifact cannot be produced."""
@@ -88,12 +79,9 @@ class KernelRequest:
 
 
 @dataclass(frozen=True)
-class SupportDiskRequest:
-    arch: Literal["rv", "la", "both"]
+class RootfsRequest:
+    arch: Literal["rv", "la"]
     root: Path
-    plan: Path | None = None
-    cases: Path | None = None
-    ltp_list: Path | None = None
 
 
 class FileDigestStore:
@@ -184,8 +172,8 @@ def kernel_cache_dir(root: Path | None = None) -> Path:
     return build_cache_root(root) / "kernels"
 
 
-def support_disk_cache_dir(root: Path | None = None) -> Path:
-    return build_cache_root(root) / "support-disks"
+def rootfs_cache_dir(root: Path | None = None) -> Path:
+    return build_cache_root(root) / "rootfs"
 
 
 def sha256_text(text: str) -> str:
@@ -404,7 +392,7 @@ def kernel_input_specs(req: KernelRequest) -> list[InputSpec]:
     ]
 
 
-def make_kernel_request(mode: Literal["eval", "shell"], arch: str, root: Path) -> KernelRequest:
+def make_kernel_request(mode: Literal["release", "shell"], arch: str, root: Path) -> KernelRequest:
     arch_alias = normalize_short_arch(arch)
     full_arch: Literal["riscv64", "loongarch64"] = "riscv64" if arch_alias == "rv" else "loongarch64"
     name = "kernel-rv" if arch_alias == "rv" else "kernel-la"
@@ -476,7 +464,7 @@ def kernel_build_env(req: KernelRequest) -> dict[str, str]:
 
 def ensure_kernel(
     *,
-    mode: Literal["eval", "shell"],
+    mode: Literal["release", "shell"],
     arch: str,
     root: Path | None = None,
     output: Path | None = None,
@@ -496,7 +484,7 @@ def ensure_kernel(
         verbose=verbose,
     )
     if output is None:
-        if mode == "eval":
+        if mode == "release":
             output = root / ("kernel-rv" if arch_alias == "rv" else "kernel-la")
         else:
             output = root / ".state" / "shell" / ("kernel-rv" if arch_alias == "rv" else "kernel-la")
@@ -504,61 +492,53 @@ def ensure_kernel(
     return BuildResult(result.kind, result.name, result.cache_path, output, result.identity, result.hit)
 
 
-def support_disk_params(req: SupportDiskRequest) -> dict[str, str]:
-    params = {
+def rootfs_params(req: RootfsRequest) -> dict[str, str]:
+    prefix_name = (
+        "THEKERNEL_RV_CROSS_COMPILE"
+        if req.arch == "rv"
+        else "THEKERNEL_LA_CROSS_COMPILE"
+    )
+    default_prefix = (
+        "riscv64-linux-gnu-" if req.arch == "rv" else "loongarch64-linux-musl-"
+    )
+    prefix = os.environ.get(prefix_name, default_prefix)
+    return {
         "arch": req.arch,
-        "plan": path_token(req.plan, req.root),
-        "cases": path_token(req.cases, req.root),
-        "ltp_list": path_token(req.ltp_list, req.root),
+        "cross_compile": prefix,
+        "cc": capture([f"{prefix}gcc", "--version"], max_lines=1),
+        "mke2fs": capture(["mke2fs", "-V"], max_lines=2),
+        "source_date_epoch": os.environ.get("SOURCE_DATE_EPOCH") or "1704067200",
     }
-    for key in SUPPORT_ENV_KEYS:
-        params[key] = os.environ.get(key, "")
-    return params
 
 
-def support_disk_input_specs(req: SupportDiskRequest) -> list[InputSpec]:
-    specs = [
+def rootfs_input_specs(_req: RootfsRequest) -> list[InputSpec]:
+    return [
         InputSpec("file", "tools/build.py"),
-        InputSpec("file", "scripts/build-oscomp-support-disk.sh"),
-        InputSpec("tree", "scripts/support-tools"),
-        InputSpec("tree", "scripts/support-overlay"),
-        InputSpec("file", rel_or_abs(req.ltp_list, req.root) if req.ltp_list else "ltp_test.txt"),
-        InputSpec("optional_tree", ".state/ltp-lab/refs/testsuits-for-oskernel/scripts"),
+        InputSpec("file", "scripts/build-rootfs.sh"),
+        InputSpec("file", "tests/rootfs/busybox-1.36.1.config"),
+        InputSpec("file", "LICENSE"),
+        InputSpec("file", "NOTICE"),
+        InputSpec("file", "PROVENANCE.md"),
+        InputSpec("file", "dev-env/Dockerfile"),
+        InputSpec("file", "dev-env/versions.env"),
+        InputSpec("tree", "tests/guest"),
     ]
-    if req.plan is not None:
-        specs.append(InputSpec("file", rel_or_abs(req.plan, req.root)))
-    if req.cases is not None:
-        specs.append(InputSpec("file", rel_or_abs(req.cases, req.root)))
-    return specs
 
 
-def support_disk_command(req: SupportDiskRequest, output: Path) -> list[str]:
+def rootfs_build(req: RootfsRequest, output: Path, *, verbose: bool = False) -> None:
     command = [
         "bash",
-        str(req.root / "scripts" / "build-oscomp-support-disk.sh"),
+        str(req.root / "scripts" / "build-rootfs.sh"),
         "--arch",
         req.arch,
         "--output",
         str(output),
-        "--test-list",
-        str(req.ltp_list if req.ltp_list is not None else req.root / "ltp_test.txt"),
     ]
-    if req.plan is not None:
-        command.extend(["--plan-override", str(req.plan)])
-    if req.cases is not None:
-        command.extend(["--cases-override", str(req.cases)])
-    return command
-
-
-def support_disk_build(req: SupportDiskRequest, output: Path, *, verbose: bool = False) -> None:
-    command = support_disk_command(req, output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    env = os.environ.copy()
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
     completed = subprocess.run(
         command,
         cwd=req.root,
-        env=env,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         check=False,
         text=True,
         stdout=None if verbose else subprocess.PIPE,
@@ -568,68 +548,42 @@ def support_disk_build(req: SupportDiskRequest, output: Path, *, verbose: bool =
         detail = ""
         if not verbose and completed.stdout:
             detail = f": {completed.stdout.strip()}"
-        raise BuildError(f"support-disk builder failed ({completed.returncode}): {' '.join(command)}{detail}")
+        raise BuildError(
+            f"rootfs builder failed ({completed.returncode}): {' '.join(command)}{detail}"
+        )
 
 
-def ensure_support_disk(
+def ensure_rootfs(
     *,
     arch: str,
     root: Path | None = None,
     output: Path | None = None,
-    plan: Path | None = None,
-    cases: Path | None = None,
-    ltp_list: Path | None = None,
-    verbose: bool = False,
-) -> BuildResult:
-    root = (root or find_repo_root()).resolve()
-    arch_alias = normalize_support_arch(arch)
-    req = SupportDiskRequest(
-        arch=arch_alias,  # type: ignore[arg-type]
-        root=root,
-        plan=plan.expanduser() if plan is not None else None,
-        cases=cases.expanduser() if cases is not None else None,
-        ltp_list=ltp_list.expanduser() if ltp_list is not None else None,
-    )
-    validate_support_disk_request(req)
-    result = ensure_cached_artifact(
-        kind="support-disk",
-        name=f"support-{arch_alias}",
-        params=support_disk_params(req),
-        input_specs=support_disk_input_specs(req),
-        cache_path_for_identity=lambda identity: support_disk_cache_dir(root) / f"support-{arch_alias}-{identity[:16]}.img",
-        build=lambda cache_path: support_disk_build(req, cache_path, verbose=verbose),
-        root=root,
-        verbose=verbose,
-    )
-    if output is not None:
-        materialize_file(result.cache_path, output, prefer_hardlink=False, root=root)
-        return BuildResult(result.kind, result.name, result.cache_path, output, result.identity, result.hit)
-    return result
-
-
-def validate_support_disk_request(req: SupportDiskRequest) -> None:
-    ltp_list = req.ltp_list if req.ltp_list is not None else req.root / "ltp_test.txt"
-    if not ltp_list.is_file():
-        raise BuildError(f"ltp list does not exist: {ltp_list}")
-    if req.plan is not None and not req.plan.is_file():
-        raise BuildError(f"plan does not exist: {req.plan}")
-    if req.cases is not None and not req.cases.is_file():
-        raise BuildError(f"cases does not exist: {req.cases}")
-
-
-def ensure_eval_disk(
-    *,
-    arch: str,
-    root: Path | None = None,
     verbose: bool = False,
 ) -> BuildResult:
     root = (root or find_repo_root()).resolve()
     arch_alias = normalize_short_arch(arch)
-    return ensure_support_disk(
-        arch=arch_alias,
+    req = RootfsRequest(arch=arch_alias, root=root)
+    result = ensure_cached_artifact(
+        kind="rootfs",
+        name=f"rootfs-{arch_alias}",
+        params=rootfs_params(req),
+        input_specs=rootfs_input_specs(req),
+        cache_path_for_identity=lambda identity: rootfs_cache_dir(root)
+        / f"rootfs-{arch_alias}-{identity[:16]}.img",
+        build=lambda cache_path: rootfs_build(req, cache_path, verbose=verbose),
         root=root,
-        output=root / ("disk.img" if arch_alias == "rv" else "disk-la.img"),
         verbose=verbose,
+    )
+    if output is None:
+        output = root / ".state" / "rootfs" / f"rootfs-{arch_alias}.img"
+    materialize_file(result.cache_path, output, prefer_hardlink=False, root=root)
+    return BuildResult(
+        result.kind,
+        result.name,
+        result.cache_path,
+        output,
+        result.identity,
+        result.hit,
     )
 
 
@@ -710,18 +664,6 @@ def capture(argv: list[str], *, max_lines: int | None = None) -> str:
     return text.strip()
 
 
-def path_token(path: Path | None, root: Path) -> str:
-    return rel_or_abs(path, root) if path is not None else ""
-
-
-def rel_or_abs(path: Path, root: Path) -> str:
-    path = path.expanduser()
-    try:
-        return path.resolve().relative_to(root.resolve()).as_posix()
-    except ValueError:
-        return str(path.resolve())
-
-
 def normalize_short_arch(value: str) -> Literal["rv", "la"]:
     if value in ("rv", "riscv64"):
         return "rv"
@@ -730,25 +672,11 @@ def normalize_short_arch(value: str) -> Literal["rv", "la"]:
     raise ValueError(f"unsupported arch: {value}")
 
 
-def normalize_support_arch(value: str) -> str:
-    if value in ("rv", "riscv64"):
-        return "rv"
-    if value in ("la", "loongarch64"):
-        return "la"
-    if value in ("both", "all"):
-        return "both"
-    raise ValueError(f"unsupported support-disk arch: {value}")
-
-
-def path_arg(value: str | None) -> Path | None:
-    return Path(value).expanduser() if value else None
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python3 tools/build.py")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    kernel = sub.add_parser("kernel", help="build/reuse evaluator kernel")
+    kernel = sub.add_parser("kernel", help="build or reuse a release kernel")
     kernel.add_argument("arch", choices=("rv", "la", "riscv64", "loongarch64"))
     kernel.add_argument("--verbose", action="store_true")
     kernel.set_defaults(func=kernel_cmd)
@@ -758,24 +686,19 @@ def build_parser() -> argparse.ArgumentParser:
     shell.add_argument("--verbose", action="store_true")
     shell.set_defaults(func=shell_cmd)
 
-    disk = sub.add_parser("disk", help="build/reuse evaluator support disk")
-    disk.add_argument("arch", choices=("rv", "la", "riscv64", "loongarch64"))
-    disk.add_argument("--verbose", action="store_true")
-    disk.set_defaults(func=disk_cmd)
+    rootfs = sub.add_parser(
+        "rootfs", help="build or reuse a project test root filesystem"
+    )
+    rootfs.add_argument("arch", choices=("rv", "la", "riscv64", "loongarch64"))
+    rootfs.add_argument("--output", help="materialize the image at an explicit path")
+    rootfs.add_argument("--verbose", action="store_true")
+    rootfs.set_defaults(func=rootfs_cmd)
 
-    support = sub.add_parser("support", help="build/reuse a focused support disk")
-    support.add_argument("arch", choices=("rv", "la", "both", "riscv64", "loongarch64"))
-    support.add_argument("--output", help="materialize support disk to this path")
-    support.add_argument("--ltp-list", help="LTP list path")
-    support.add_argument("--plan", help="focused group/libc plan path")
-    support.add_argument("--cases", help="focused case filter path")
-    support.add_argument("--verbose", action="store_true")
-    support.set_defaults(func=support_cmd)
     return parser
 
 
 def kernel_cmd(args: argparse.Namespace) -> int:
-    result = ensure_kernel(mode="eval", arch=args.arch, verbose=args.verbose)
+    result = ensure_kernel(mode="release", arch=args.arch, verbose=args.verbose)
     if args.verbose:
         print(result.output_path)
     return 0
@@ -788,22 +711,9 @@ def shell_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
-def disk_cmd(args: argparse.Namespace) -> int:
-    result = ensure_eval_disk(arch=args.arch, verbose=args.verbose)
-    if args.verbose:
-        print(result.output_path)
-    return 0
-
-
-def support_cmd(args: argparse.Namespace) -> int:
-    result = ensure_support_disk(
-        arch=args.arch,
-        output=path_arg(args.output),
-        plan=path_arg(args.plan),
-        cases=path_arg(args.cases),
-        ltp_list=path_arg(args.ltp_list),
-        verbose=args.verbose,
-    )
+def rootfs_cmd(args: argparse.Namespace) -> int:
+    output = Path(args.output).expanduser() if args.output else None
+    result = ensure_rootfs(arch=args.arch, output=output, verbose=args.verbose)
     if args.verbose:
         print(result.output_path)
     return 0

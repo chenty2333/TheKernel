@@ -151,7 +151,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
 
     // Fast path for time-read syscalls: they don't block and aren't
     // restartable, so skip the per-syscall set_timer_state/enter_syscall/restart
-    // bookkeeping (the dominant cyclictest per-cycle cost). clock_gettime is
+    // bookkeeping on the nonblocking time-read fast path. clock_gettime is
     // gated to the non-CPUTIME clocks; CPUTIME clocks fall through to the full
     // path for accurate CPU-time accounting. Signal delivery and preemption
     // still run in the user-mode loop after handle_syscall returns.

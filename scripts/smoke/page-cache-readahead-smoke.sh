@@ -8,16 +8,16 @@ source "$SCRIPT_DIR/lib.sh"
 
 ARCH=rv
 WORKDIR=""
-SUPPORT_IMAGE=""
-SUPPORT_IMAGE_EXPLICIT=0
+ROOTFS_IMAGE=""
+ROOTFS_IMAGE_EXPLICIT=0
 TIMEOUT_SECS=260
-BOOT_WAIT_SECS=${OSCOMP_SMOKE_BOOT_WAIT_SECS:-35}
-LINE_DELAY_SECS=${OSCOMP_SMOKE_LINE_DELAY_SECS:-0.75}
+BOOT_WAIT_SECS=${THEKERNEL_SMOKE_BOOT_WAIT_SECS:-35}
+LINE_DELAY_SECS=${THEKERNEL_SMOKE_LINE_DELAY_SECS:-0.75}
 SKIP_KERNEL_BUILD=1
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--arch {rv|la}] [--workdir DIR] [--support-image IMG]
+Usage: $(basename "$0") [--arch {rv|la}] [--workdir DIR] [--rootfs IMG]
                          [--timeout SECS] [--boot-wait SECS] [--line-delay SECS]
                          [--build-kernel]
 
@@ -44,9 +44,9 @@ while (($#)); do
             WORKDIR=${2:-}
             shift 2
             ;;
-        --support-image)
-            SUPPORT_IMAGE=${2:-}
-            SUPPORT_IMAGE_EXPLICIT=1
+        --rootfs)
+            ROOTFS_IMAGE=${2:-}
+            ROOTFS_IMAGE_EXPLICIT=1
             shift 2
             ;;
         --timeout)
@@ -75,9 +75,29 @@ while (($#)); do
     esac
 done
 
+case "$ARCH" in
+    rv|la) ;;
+    *) die "--arch must be rv or la" ;;
+esac
+case "$TIMEOUT_SECS" in
+    ''|*[!0-9]*) die "--timeout must be a non-negative integer" ;;
+esac
+
+if [ -z "$WORKDIR" ]; then
+    WORKDIR="$REPO_ROOT/.state/page-cache-readahead-current/auto-smoke-$ARCH"
+elif [[ "$WORKDIR" != /* ]]; then
+    WORKDIR="$REPO_ROOT/$WORKDIR"
+fi
+
+if [ -z "$ROOTFS_IMAGE" ]; then
+    ROOTFS_IMAGE="$REPO_ROOT/.state/rootfs/rootfs-$ARCH.img"
+elif [[ "$ROOTFS_IMAGE" != /* ]]; then
+    ROOTFS_IMAGE="$REPO_ROOT/$ROOTFS_IMAGE"
+fi
+
 cd "$REPO_ROOT"
 mkdir -p "$REPO_ROOT/.state/page-cache-readahead-current"
-smoke_build_support_image_if_needed "$ARCH" "$SUPPORT_IMAGE" "$SUPPORT_IMAGE_EXPLICIT"
+smoke_build_rootfs_if_needed "$ARCH" "$ROOTFS_IMAGE" "$ROOTFS_IMAGE_EXPLICIT"
 
 rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR"
@@ -102,7 +122,7 @@ echo PAGECACHE_READAHEAD_SMOKE_DONE
 exit
 EOF
 
-readarray -d '' -t kernel_args < <(smoke_replay_kernel_args "$ARCH" "$SKIP_KERNEL_BUILD")
+readarray -d '' -t kernel_args < <(smoke_runner_artifact_args "$ARCH" "$SKIP_KERNEL_BUILD")
 (
     sleep "$BOOT_WAIT_SECS"
     while IFS= read -r line; do
@@ -115,14 +135,15 @@ readarray -d '' -t kernel_args < <(smoke_replay_kernel_args "$ARCH" "$SKIP_KERNE
         printf '%s\n' "$line"
         sleep "$LINE_DELAY_SECS"
     done <"$COMMANDS_FILE"
-) | python3 -m tools.oscomp_eval.replay qemu \
+) | python3 -m tools.qemu_runner run \
     --arch "$ARCH" \
     "${kernel_args[@]}" \
-    --support-image "$SUPPORT_IMAGE" \
+    --rootfs "$ROOTFS_IMAGE" \
     --timeout "$TIMEOUT_SECS" \
     --workdir "$WORKDIR" \
-    --keep-workdir \
-    --interactive
+    --log "$WORKDIR/qemu.log" \
+    --interactive \
+    --input-after-marker THEKERNEL_SHELL_READY
 
 LOG="$WORKDIR/qemu.log"
 [ -f "$LOG" ] || die "missing QEMU log: $LOG"

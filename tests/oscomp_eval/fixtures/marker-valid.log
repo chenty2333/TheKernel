@@ -1,9 +1,0 @@
-booting kernel
-#### OS COMP TEST GROUP START basic-musl ####
-brk pass
-open pass
-#### OS COMP TEST GROUP END basic-musl ####
-#### OS COMP TEST GROUP START lua-glibc ####
-lua ok
-#### OS COMP TEST GROUP END lua-glibc ####
-poweroff

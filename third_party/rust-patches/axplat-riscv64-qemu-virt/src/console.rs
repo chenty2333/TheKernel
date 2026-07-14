@@ -14,7 +14,7 @@ pub(crate) fn init_early() {
     unsafe {
         // QEMU/OpenSBI already provides a usable NS16550A UART. Avoid
         // rewriting DLL/DLM here: on this platform that divisor-latch write is
-        // visible as a leading 0x03 byte on the score-facing serial stream.
+        // visible as a leading 0x03 byte on the serial output stream.
         write_volatile((base + 3) as *mut u8, 0x03);
         write_volatile((base + 1) as *mut u8, 0x00);
         write_volatile((base + 2) as *mut u8, 0xC7);

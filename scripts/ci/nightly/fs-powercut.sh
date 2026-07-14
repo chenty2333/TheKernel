@@ -14,7 +14,6 @@ for tool in truncate mke2fs e2fsck; do
 done
 
 mkdir -p "$NIGHTLY_LOG_DIR"
-support_image=$(nightly_prepare_support_image)
 selected_arches=$(nightly_selected_arches) || exit $?
 while IFS= read -r arch; do
     disk="$NIGHTLY_LOG_DIR/$arch-powercut.img"
@@ -32,11 +31,11 @@ while IFS= read -r arch; do
         "$disk" >"$mkfs_log" 2>&1
 
     printf '%s\n' \
-        '/opt/oscomp-support/bin/thekernel-nightly-fs-powercut-phase1' \
+        '/opt/thekernel-tests/bin/thekernel-nightly-fs-powercut-phase1' \
         >"$phase1_commands"
 
     if nightly_run_guest \
-        "$arch" "$phase1_commands" "$phase1_dir" "$support_image" "$disk" \
+        "$arch" "$phase1_commands" "$phase1_dir" "$disk" \
         CI_NIGHTLY_FS_POWERCUT_ARMED; then
         phase1_status=0
     else
@@ -51,11 +50,11 @@ while IFS= read -r arch; do
         CI_NIGHTLY_FS_POWERCUT_ARMED
 
     printf '%s\n' \
-        '/opt/oscomp-support/bin/thekernel-nightly-fs-powercut-phase2; exit' \
+        '/opt/thekernel-tests/bin/thekernel-nightly-fs-powercut-phase2; exit' \
         >"$phase2_commands"
 
     nightly_run_guest \
-        "$arch" "$phase2_commands" "$phase2_dir" "$support_image" "$disk"
+        "$arch" "$phase2_commands" "$phase2_dir" "$disk"
     nightly_validate_guest_log \
         "$phase2_dir/qemu.log" clean \
         CI_NIGHTLY_FS_POWERCUT_PHASE2_START \

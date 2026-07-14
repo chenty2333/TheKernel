@@ -1,2 +1,0 @@
-#!/bin/sh
-exec "${OSCOMP_SUPPORT_BIN:-/opt/oscomp-support/bin}/oscomp-ltp-musl-compat-case" nftw6401 "$@"

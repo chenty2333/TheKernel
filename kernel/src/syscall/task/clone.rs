@@ -228,7 +228,6 @@ impl CloneArgs {
             CloneFlags::NEWNS
                 | CloneFlags::NEWIPC
                 | CloneFlags::IO
-                | CloneFlags::SYSVSEM
                 | CloneFlags::PTRACE
                 | CloneFlags::UNTRACED,
         ) {
@@ -248,6 +247,13 @@ impl CloneArgs {
         // sibling's descriptor table or cwd/root state.
         if flags.contains(CloneFlags::THREAD) && !flags.contains(CloneFlags::FILES | CloneFlags::FS)
         {
+            return Err(AxError::OperationNotSupported);
+        }
+        // NPTL thread creation includes CLONE_SYSVSEM. Threads already share
+        // one ProcessData, and SEM_UNDO operations remain explicitly
+        // unsupported, so no representable undo state can diverge. A
+        // non-thread clone would require a separately shared undo-list object.
+        if flags.contains(CloneFlags::SYSVSEM) && !flags.contains(CloneFlags::THREAD) {
             return Err(AxError::OperationNotSupported);
         }
         if flags.contains(CloneFlags::SIGHAND) && !flags.contains(CloneFlags::VM) {
@@ -711,10 +717,23 @@ mod tests {
                 | CloneFlags::VM
                 | CloneFlags::SIGHAND
                 | CloneFlags::FILES
-                | CloneFlags::FS,
+                | CloneFlags::FS
+                | CloneFlags::SYSVSEM,
             ..Default::default()
         };
         assert_eq!(args.validate_for(CloneApi::Clone), Ok(()));
+    }
+
+    #[test]
+    fn clone_validate_rejects_process_sysvsem_without_shared_undo_state() {
+        let args = CloneArgs {
+            flags: CloneFlags::SYSVSEM,
+            ..Default::default()
+        };
+        assert_eq!(
+            args.validate_for(CloneApi::Clone),
+            Err(AxError::OperationNotSupported)
+        );
     }
 
     #[test]

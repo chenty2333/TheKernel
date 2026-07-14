@@ -17,6 +17,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN apt-get -o Acquire::Retries=5 update \
  && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
       build-essential \
+      bzip2 \
       ca-certificates \
       curl \
       git \
@@ -73,12 +74,14 @@ RUN apt-get -o Acquire::Retries=5 update \
       binutils-aarch64-linux-gnu \
       binutils-riscv64-linux-gnu \
       build-essential \
+      bzip2 \
       ca-certificates \
       clang \
       cmake \
       curl \
       dosfstools \
       e2fsprogs \
+      fakeroot \
       file \
       gawk \
       gcc-aarch64-linux-gnu \
@@ -155,11 +158,11 @@ RUN export RUSTUP_HOME="${RUSTUP_HOME}" CARGO_HOME="${CARGO_HOME}"; \
 
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
-ENV HOME=/home/oskernel
+ENV HOME=/home/thekernel
 ENV RUSTUP_HOME=${RUSTUP_HOME}
 ENV CARGO_HOME=${CARGO_HOME}
 ENV RUSTUP_TOOLCHAIN=${RUST_TOOLCHAIN}
-ENV OSKERNEL_QEMU_VERSION=${QEMU_VERSION}
+ENV THEKERNEL_QEMU_VERSION=${QEMU_VERSION}
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 ENV PATH=${CARGO_HOME}/bin:/usr/local/cross-compat/bin:/opt/loongarch64-linux-musl-cross/bin:/opt/qemu-${QEMU_VERSION}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -168,12 +171,12 @@ RUN printf '%s\n' \
     > /etc/profile.d/thekernel-dev-path.sh
 
 COPY entrypoint.sh /usr/local/bin/thekernel-dev-entrypoint
-COPY check-image.sh /usr/local/bin/oskernel-image-check
+COPY check-image.sh /usr/local/bin/thekernel-dev-check
 
-RUN chmod +x /usr/local/bin/thekernel-dev-entrypoint /usr/local/bin/oskernel-image-check \
- && mkdir -p /workspace /home/oskernel /opt/oskernel/testsuites \
- && groupadd -g 1000 oskernel || true \
- && useradd -m -u 1000 -g 1000 -s /bin/bash oskernel || true
+RUN chmod +x /usr/local/bin/thekernel-dev-entrypoint /usr/local/bin/thekernel-dev-check \
+ && mkdir -p /workspace /home/thekernel /opt/thekernel/rootfs \
+ && groupadd -g 1000 thekernel || true \
+ && useradd -m -u 1000 -g 1000 -s /bin/bash thekernel || true
 
 WORKDIR /workspace
 

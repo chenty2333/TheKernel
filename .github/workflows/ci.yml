@@ -19,7 +19,7 @@ jobs:
   per-commit:
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/chenty2333/thekernel-dev:latest
+      image: ${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:latest', github.repository_owner) }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -49,9 +49,8 @@ jobs:
           path: .state/ci/per-commit/
           include-hidden-files: true
 
-  # GitLab is the authoritative remote CI. This mirror becomes active only
-  # when the GitHub repository is given a self-hosted runner with both official
-  # root images mounted at /opt/oskernel/testsuites.
+  # Full dual-architecture boot remains on the self-hosted QEMU runner. Root
+  # images are built from this repository by the gate itself.
   dual-arch-pr:
     if: >-
       ${{ vars.THEKERNEL_QEMU_CI == '1' &&
@@ -61,16 +60,14 @@ jobs:
       - linux
       - thekernel-qemu
     container:
-      image: ghcr.io/chenty2333/thekernel-dev:latest
+      image: ${{ vars.THEKERNEL_DEV_IMAGE || format('ghcr.io/{0}/thekernel-dev:latest', github.repository_owner) }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-      options: --volume /opt/oskernel/testsuites:/opt/oskernel/testsuites:ro
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
       PYTHONDONTWRITEBYTECODE: "1"
-      OSCOMP_TESTSUITE_DIR: /opt/oskernel/testsuites
     steps:
       - name: Checkout
         uses: actions/checkout@v6

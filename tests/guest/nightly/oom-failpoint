@@ -1,0 +1,20 @@
+#!/bin/sh
+
+failure_bytes=${1:-67108864}
+case "$failure_bytes" in
+    ''|*[!0-9]*|0) echo 'CI_NIGHTLY_OOM_FAILPOINT_FAIL invalid-size'; exit 1 ;;
+esac
+
+fail() {
+    echo "CI_NIGHTLY_OOM_FAILPOINT_FAIL $1"
+    exit 1
+}
+
+echo CI_NIGHTLY_OOM_FAILPOINT_START
+tool=/opt/thekernel-tests/bin/thekernel-oom-admission
+test -x "$tool" || fail missing-tool
+"$tool" --strict-overcommit-failure "$failure_bytes" || fail admission
+printf 'oom-recovery\n' >/tmp/ci-nightly-oom-recovery || fail recovery-write
+test "$(cat /tmp/ci-nightly-oom-recovery)" = oom-recovery || fail recovery-read
+rm -f /tmp/ci-nightly-oom-recovery
+echo CI_NIGHTLY_OOM_FAILPOINT_PASS

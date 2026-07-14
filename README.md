@@ -1,341 +1,166 @@
 # TheKernel
 
-TheKernel is an OSComp 2026 operating-system design entry: a Rust-based
-kernel for the RISC-V and LoongArch evaluator targets, with Linux ABI
-compatibility for the official test suite.
+TheKernel is a Rust operating-system kernel that provides a Linux-compatible
+userspace ABI on top of ArceOS components. It targets RISC-V and LoongArch QEMU
+platforms and is being evolved toward reusable, explicitly layered kernel
+components rather than syscall-local implementations.
 
-## OSComp 2026 Documents
+The repository is currently a preview. It has broad syscall and subsystem
+coverage, but it is not yet a drop-in Linux replacement and its public crate
+boundaries are still being stabilized.
 
-- Technical report: [docs/oscomp2026_report.pdf](docs/oscomp2026_report.pdf)
-- Presentation slides: [docs/oscomp2026_slides.pdf](docs/oscomp2026_slides.pdf)
+## Architecture
 
-## Project
+The code follows five ownership layers:
 
-- Author: 陈天意 <hi@tychen.cc>
-- Upstream baseline: StarryOS commit
-  [`2e075accf4fb0aefdd1d252ebd9ccf29727d9923`](https://github.com/Starry-OS/StarryOS/tree/2e075accf4fb0aefdd1d252ebd9ccf29727d9923).
-- Source code license: Apache License 2.0, see [LICENSE](LICENSE) and
-  [NOTICE](NOTICE).
-- Technical documents, presentation slides, and other defense materials:
-  Creative Commons Attribution-ShareAlike 4.0 International
-  ([CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)).
+1. architecture and HAL primitives;
+2. generic task, driver, filesystem, and network mechanisms;
+3. reusable Linux ABI support for process, VFS, fd, readiness, credentials,
+   memory, and related semantics;
+4. thin syscall argument handling and subsystem composition;
+5. project build, boot, test, and diagnostic tooling.
 
-Third-party code under `third_party/` and vendored patch directories keeps its
-upstream copyright notices and license terms.
+Linux-visible policy should not leak into generic `ax-*` mechanisms, and
+syscall bodies should not duplicate rules owned by the ABI-support layer.
 
-## Environment
+## Development Environment
 
-Build, boot, replay, and smoke commands should run inside the repo development
-container. The host may not have the RISC-V or LoongArch cross toolchains; a
-host-side build failure such as `no usable cross toolchain found for
-architecture riscv64` means the command was run outside the dev shell.
-
-Build the development container image once:
+The supported build environment is the repository development container. Build
+it once, verify the pinned toolchains, and then enter a shell:
 
 ```bash
 make dev-image
-```
-
-Check the toolchain contract inside the image:
-
-```bash
 make dev-check
-```
-
-Open a development shell:
-
-```bash
 make dev-shell
 ```
 
-Run a repository command inside the container:
-
-```bash
-make dev-shell DEV_CMD='make kernels'
-```
-
-Open the privileged builder service:
-
-```bash
-make dev-shell-root
-```
-
-## Build
-
-Build evaluator artifacts from the host:
+From the host, a one-shot command can be run with:
 
 ```bash
 make dev-shell DEV_CMD='make all'
 ```
 
-Build from inside an already-open `make dev-shell`:
+Inside an already-open development shell, run the inner `make` command
+directly.
+
+## Build
+
+Build both release-mode kernel images:
 
 ```bash
 make all
 ```
 
-Both forms produce the evaluator artifacts at the repository root:
+The materialized artifacts are:
 
 - `kernel-rv`
 - `kernel-la`
-- `disk.img` (RISC-V support disk)
-- `disk-la.img`
 
-High-frequency kernel rebuilds keep Cargo target caches under
-`.state/<arch>/target`. Kernel and support-disk outputs are reused from
-`.state/build-cache/` when their build inputs have not changed.
-Evaluator and shell kernels use fixed build profiles; top-level `make` targets
-do not accept ad-hoc kernel feature or debug toggles.
-
-The build cache is content-addressed. Touching a source file without changing
-its content does not force a new final artifact. If kernel source content
-changes, the final ELF identity changes, but Cargo still reuses
-`.state/<arch>/target` and rebuilds only the affected Rust units and link steps
-that Cargo considers stale. Support disks use a separate content key; unchanged
-support scripts, overlays, plans, case filters, and LTP lists do not rebuild or
-rewrite `disk.img` / `disk-la.img`.
-
-Build only the kernel artifacts:
+Build one architecture or the complete kernel artifact set explicitly:
 
 ```bash
-make dev-shell DEV_CMD='make kernels'
-make dev-shell DEV_CMD='make kernel-rv'
-make dev-shell DEV_CMD='make kernel-la'
+make kernel-rv
+make kernel-la
+make artifacts
 ```
 
-Rebuild only a support disk:
+`make artifacts` produces only those two kernel images; it does not build or
+publish test fixtures. Kernel and rootfs outputs use a content-addressed cache
+under `.state/build-cache/`; Cargo target caches remain under
+`.state/<arch>/target`.
+
+## Root Filesystem
+
+The project test rootfs is built from a checksum-pinned BusyBox release plus
+TheKernel-owned init and guest test programs:
 
 ```bash
-make dev-shell DEV_CMD='make disk.img'
-make dev-shell DEV_CMD='make disk-la.img'
+make test-fixtures
+make rootfs-rv
+make rootfs-la
 ```
 
-Inside `make dev-shell`, run the inner `make ...` commands directly.
-
-`make clean` removes root evaluator artifacts (`kernel-rv`, `kernel-la`,
-`disk.img`, `disk-la.img`), replay outputs (`.state/replay`,
-`.state/oscomp-replay`, `.state/oscomp-eval/runs`), arch build outputs
-(`.state/<arch>/out` and `logs`), and shell kernels (`.state/shell`). It keeps Cargo target caches
-(`.state/<arch>/target`), the build cache (`.state/build-cache`), decompressed
-test images (`.state/oscomp-image-cache`), and lab state (`.state/oscomp-lab`,
-`.state/ltp-lab`). `make clean-all` removes all `.state` data.
-
-Make and repo script entrypoints set `PYTHONDONTWRITEBYTECODE=1`, so normal
-build, replay, lab, smoke, and test runs do not create Python `__pycache__`
-directories.
-
-## Local Evaluator
-
-The local evaluator is centered on `tools/oscomp_eval/replay.py`.
-
-| Entry | Purpose |
-| --- | --- |
-| `make replay` | Build artifacts, run RV/LA in parallel, judge, score |
-| `make replay ARCH=rv` / `make replay ARCH=la` | Build one architecture, run QEMU, judge, score |
-| `scripts/oscomp.sh score-logs` | Offline scoring from existing console logs |
-| `scripts/lab` | Focused replay for one group or LTP case |
-| `scripts/ltp-lab.py` via `scripts/oscomp.sh ltp-lab` | LTP campaign inventory, replay, and cleanup |
-
-Default replay timeouts live in `tools/oscomp_eval/config.py`:
-
-- `REPLAY_TIMEOUT_FULL_SECS = 7000` for full `make replay-*`
-- `REPLAY_TIMEOUT_FOCUSED_SECS = 3600` for `scripts/lab run`
-- `REPLAY_TIMEOUT_SMOKE_SECS = 240` for boot-shell smoke scripts
-
-## Replay
-
-Build the matching artifacts, run both architectures in QEMU, judge the console
-logs, and write the local score:
-
-```bash
-make dev-shell DEV_CMD='make replay'
-```
-
-Inside `make dev-shell`:
-
-```bash
-make replay
-```
-
-Single-architecture replay:
-
-```bash
-make replay ARCH=rv
-make replay ARCH=la
-```
-
-Each replay writes a numbered run under `.state/replay/<id>/`. The evaluator-
-visible console logs are `rv.out` and `la.out`; these are the kernel serial
-outputs used for local judging. `score.json` includes the total score, issues,
-run name, run id, status, arches, git commit/dirty state, artifact digests, and
-log paths. Replay runs do not write `report.md`, `manifest.json`, artifact
-indexes, or retained marker/judge intermediate output.
-
-The latest replay is linked as `.state/replay/latest`. Normal replay garbage
-collection keeps the newest 5 numbered runs and every 10th older run. Use
-`KEEP=1` for a run that should never be removed by replay garbage collection:
-
-```bash
-make dev-shell DEV_CMD='make replay NAME="memory_sys_improve" KEEP=1'
-```
-
-QEMU internal debug logging is off by default. Enable a small guest-error log
-only when needed:
-
-```bash
-make dev-shell DEV_CMD='make replay ARCH=rv QEMU_LOG=1'
-make dev-shell DEV_CMD='make replay ARCH=rv QEMU_TRACE=int'
-make dev-shell DEV_CMD='make replay ARCH=rv QEMU_TRACE=cpu'
-```
-
-Those commands create `rv_qemu.log` or `la_qemu.log` next to the matching
-`.out` file. The `_qemu.log` files are QEMU internal diagnostics, not the
-evaluator-visible kernel output.
-
-Raw `.img` test images are attached with QEMU snapshot mode. The support disk is
-attached read-only. Compressed `.gz` or `.xz` test images are decompressed once
-into `.state/oscomp-image-cache/` and reused by later replays.
-
-`make replay ARCH=both` launches RV and LA replays in parallel. `make all`
-remains the official evaluator build entrypoint and does not run QEMU.
-
-Validate official image layout inside the dev shell:
-
-```bash
-./scripts/oscomp.sh verify --arch rv
-./scripts/oscomp.sh verify --arch la
-```
-
-## Local Scoring
-
-Replay and lab console logs can be parsed, judged, and scored without starting
-QEMU:
-
-```bash
-./scripts/oscomp.sh validate-output --log .state/replay/latest/rv.out --arch rv
-./scripts/oscomp.sh judge-log --arch rv --log .state/replay/latest/rv.out --out .state/oscomp-eval/runs/manual-rv/rv
-./scripts/oscomp.sh score-logs \
-  --rv-log .state/path/to/rv.log \
-  --la-log .state/path/to/la.log \
-  --name manual-score
-./scripts/oscomp.sh inspect-run --json .state/oscomp-eval/runs/manual-score
-```
-
-For direct parser debugging, use `python3 -m tools.oscomp_eval markers`.
-
-Support disks can be checked explicitly:
-
-```bash
-./scripts/oscomp.sh support-check --arch rv --image disk.img
-./scripts/oscomp.sh support-check --arch la --image disk-la.img
-```
-
-Offline scoring commands write `score.json` and per-arch marker/judge artifacts.
-Use `inspect-run --json` to check those artifacts without mutating the run
-directory. Normal replay runs keep only `score.json`, `rv.out` / `la.out`, and
-optional `rv_qemu.log` / `la_qemu.log`.
-
-Focused and case-level runs are handled by `scripts/lab`; `make replay` is only
-for the full local evaluator flow.
-
-Refresh the vendored official judge snapshot from an explicit local checkout:
-
-```bash
-./scripts/oscomp.sh official-refresh \
-  --source /home/ava/Desktop/autotest-for-oskernel
-```
-
-## Focused Lab
-
-Use `scripts/lab` for focused replay runs. It writes the guest plan and optional
-case filter payload under `.state/oscomp-lab/`, builds or reuses the focused
-support image from `.state/build-cache/support-disks/`, then uses the same
-underlying replay, judge, and score path as the full local evaluator.
-
-```bash
-make dev-shell DEV_CMD='make lab-list'
-make dev-shell DEV_CMD='make lab-explain ARCH=rv SELECT=ltp-glibc:openat01'
-make dev-shell DEV_CMD='make lab-run ARCH=rv SELECT=ltp-glibc:openat01'
-make dev-shell DEV_CMD='make lab-run ARCH=rv SELECT=basic-musl'
-```
-
-Equivalent direct form:
-
-```bash
-make dev-shell DEV_CMD='./scripts/lab list'
-make dev-shell DEV_CMD='./scripts/lab explain --arch rv --select ltp-glibc:openat01'
-make dev-shell DEV_CMD='./scripts/lab run --arch rv --select ltp-glibc:openat01'
-```
-
-Selectors use `GROUP-LIBC[:EXPR]`. `ltp` supports exact case names,
-`prefix=...`, and `regex=...`. Other groups run at group level.
-
-Use `scripts/oscomp.sh ltp-lab` for broader LTP campaign workflows. That path is
-separate from `scripts/lab` and keeps state under `.state/ltp-lab/`.
-
-Exit codes:
-
-- `0`: command completed without score-facing issues.
-- `1`: command completed and wrote artifacts, but validation, judging, scoring,
-  or replay status found issues.
-- `2`: invalid command line, missing input, or unsupported configuration.
-- `3`: infrastructure failure such as missing QEMU, image, runner, or toolchain.
-- `4`: internal evaluator error with traceback written to stderr.
-- `124`: replay timeout.
-- `130`: interrupted by the user.
+The first build downloads BusyBox 1.36.1 into `.state/source-cache/`. The
+resulting ext4 images contain the same semantic helpers used by local smoke and
+nightly system tests. These repository-built images live under `.state/rootfs/`
+and are local/CI fixtures, not published kernel release artifacts. No external
+test image is required. The generated image contains its applicable project
+and BusyBox notices; see
+[PROVENANCE.md](PROVENANCE.md) before redistributing a generated image.
 
 ## Boot
 
-Boot an interactive local shell:
+Boot an interactive project rootfs on either architecture:
 
 ```bash
-make dev-shell DEV_CMD='make shell-rv'
-make dev-shell DEV_CMD='make shell-la'
+make shell-rv
+make shell-la
 ```
 
-These targets build a `boot-shell` kernel (`kernel-*-shell`) that injects
-`OSCOMP_BOOT_SHELL=1` at compile time. The shell uses the official test image
-as the first disk so `/musl/busybox` and the usual userland layout are present.
-The image is attached with QEMU snapshot mode, so the shell does not rewrite or
-copy the test image.
+Exit the guest shell to trigger a clean kernel shutdown. Additional generic
+runner options can be passed through `SHELL_ARGS`.
 
-Inside `make dev-shell`, run `make shell-rv` or `make shell-la` directly. Exit
-the guest shell with `exit`; the kernel then powers off.
-
-Use `SHELL_ARGS` for explicit shell boot flags:
+The underlying runner accepts only explicit artifacts and keeps architecture
+topology, image modes, timeouts, serial capture, and interaction separate from
+test policy:
 
 ```bash
-make dev-shell DEV_CMD='make shell-rv SHELL_ARGS="--image path/to/sdcard-rv.img"'
+python3 -m tools.qemu_runner run \
+  --arch rv \
+  --kernel kernel-rv \
+  --rootfs .state/rootfs/rootfs-rv.img \
+  --timeout 300
 ```
 
-## Smoke
+## Verification
 
-Targeted smoke checks are available through the smoke dispatcher:
+Run the project semantic init on both architectures:
 
 ```bash
-make dev-shell DEV_CMD='make smoke-list'
-make dev-shell DEV_CMD='make smoke NAME=lwext4-io-boost ARCH=rv'
+make system-test
 ```
 
-Boot-shell smokes share helpers in `scripts/smoke/lib.sh`. They build or reuse
-`kernel-rv-shell` / `kernel-la-shell`, attach a support disk for guest tools,
-and feed scripted commands into `python3 -m tools.oscomp_eval.replay qemu
---interactive`. They do not rely on `OSCOMP_BOOT_SHELL` env overrides baked
-into the support disk.
-
-`phase9-la-depth-gate` is different: it exercises the eval `kernel-la` path for
-LoongArch async-depth gates.
-
-## Tests
-
-Run tool tests inside the development container:
+The system test covers PID 1 and child `execve` transitions, rootfs mutation,
+tmpfs mount lifecycle, procfs reads, process creation, wait, pipes, and clean
+shutdown. Targeted subsystem smokes exercise more specialized storage,
+writeback, interrupt, mapped-I/O, pinning, and page-cache contracts:
 
 ```bash
-make dev-shell DEV_CMD='make test-tools'
+make smoke-list
+make smoke NAME=lwext4-io-boost ARCH=rv
 ```
 
-## Notes
+Run host-side tool and contract tests:
 
-- Kernel behavior lives mainly under `kernel/`.
-- `src/init.sh` is guest-side runner logic embedded into the kernel image.
-- Runtime, replay, lab, and smoke state live under `.state`.
+```bash
+make test-tools
+scripts/ci/per-commit.sh
+```
+
+The PR gate builds both architectures and boots the project rootfs. Nightly
+adapters add mixed pressure, deterministic allocation failure, ext4 power-cut
+recovery, and non-loopback network coverage.
+
+## Repository Layout
+
+- `kernel/`: Linux-compatible kernel and syscall integration.
+- `crates/`: maintained generic and reusable components.
+- `third_party/rust-patches/`: pinned upstream sources with provenance records.
+- `make/`: architecture build machinery.
+- `tools/build.py`: content-addressed kernel and rootfs builder.
+- `tools/qemu_runner/`: policy-neutral dual-architecture QEMU runner.
+- `tests/guest/`: project init, guest helpers, and nightly programs.
+- `scripts/ci/` and `scripts/smoke/`: repository verification workflows.
+
+## Cleaning
+
+`make clean` removes materialized kernels and run/build outputs while retaining
+the content and Cargo caches. `make clean-all` removes all generated `.state`
+data.
+
+## License and Provenance
+
+TheKernel source is distributed under Apache-2.0; see [LICENSE](LICENSE),
+[NOTICE](NOTICE), and [PROVENANCE.md](PROVENANCE.md). Third-party and vendored
+directories retain their upstream license terms, authorship, immutable source
+records, and patch provenance.

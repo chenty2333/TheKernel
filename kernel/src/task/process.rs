@@ -539,10 +539,7 @@ const fn init_uts_state() -> UtsState {
         domainname_len: 0,
     };
     state.nodename_len = copy_uts_field(&mut state.nodename, b"thekernel");
-    state.domainname_len = copy_uts_field(
-        &mut state.domainname,
-        b"https://github.com/chenty2333/TheKernel",
-    );
+    state.domainname_len = copy_uts_field(&mut state.domainname, b"(none)");
     state
 }
 
@@ -1873,7 +1870,7 @@ mod tests {
 
     use super::{
         GroupLeaderCredentialBinding, SIGNAL_QUEUE_GLOBAL_HARD_LIMIT,
-        SIGNAL_QUEUE_PER_USER_HARD_LIMIT, UserNamespace, try_increment_bounded,
+        SIGNAL_QUEUE_PER_USER_HARD_LIMIT, UserNamespace, init_uts_state, try_increment_bounded,
     };
     use crate::task::{
         Cred, CredentialSlot,
@@ -1896,6 +1893,13 @@ mod tests {
             update.finish().unwrap().commit();
         }
         slot
+    }
+
+    #[test]
+    fn default_uts_identity_is_product_neutral() {
+        let state = init_uts_state();
+        assert_eq!(&state.nodename[..state.nodename_len], b"thekernel");
+        assert_eq!(&state.domainname[..state.domainname_len], b"(none)");
     }
 
     #[test]

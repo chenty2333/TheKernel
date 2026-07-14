@@ -11,7 +11,7 @@ trap 'rm -rf "$tmp"' EXIT
 while IFS= read -r script; do
     bash -n "$script"
 done < <(find "$CI_DIR" -type f -name '*.sh' -print | sort)
-for script in "$REPO_ROOT"/scripts/support-overlay/common/bin/thekernel-nightly-*; do
+for script in "$REPO_ROOT"/tests/guest/nightly/*; do
     sh -n "$script"
 done
 bash -n "$0"
@@ -36,6 +36,14 @@ if "$CI_DIR/validate-boot-log.sh" la "$tmp/fail.log" >/dev/null 2>&1; then
     exit 1
 fi
 
+cp "$tmp/pass.log" "$tmp/idle-timeout.log"
+printf 'qemu-runner: QEMU idle timeout after 30s without console output\n' \
+    >>"$tmp/idle-timeout.log"
+if "$CI_DIR/validate-boot-log.sh" rv "$tmp/idle-timeout.log" >/dev/null 2>&1; then
+    printf 'test-ci-scripts: QEMU idle timeout was accepted\n' >&2
+    exit 1
+fi
+
 cp "$tmp/pass.log" "$tmp/missing.log"
 sed -i '/CI_BOOT_GATE_BIND_OK/d' "$tmp/missing.log"
 if "$CI_DIR/validate-boot-log.sh" rv "$tmp/missing.log" >/dev/null 2>&1; then
@@ -43,7 +51,7 @@ if "$CI_DIR/validate-boot-log.sh" rv "$tmp/missing.log" >/dev/null 2>&1; then
     exit 1
 fi
 
-for category in ltp pressure oom-failpoint fs-powercut nonloopback-network; do
+for category in pressure oom-failpoint fs-powercut nonloopback-network; do
     "$CI_DIR/nightly-gate.sh" --list | grep -q "^${category}"
 done
 
@@ -65,21 +73,19 @@ FAKE_CC_LOG="$tmp/executable-link.args" THEKERNEL_HOST_CC="$tmp/fake-cc" \
 grep -qx -- -no-pie "$tmp/executable-link.args"
 
 env \
-    THEKERNEL_NIGHTLY_LTP_ENABLED=0 \
     THEKERNEL_NIGHTLY_PRESSURE_ENABLED=0 \
     THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED=0 \
     THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED=0 \
     THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_ENABLED=0 \
     "$CI_DIR/nightly-gate.sh" --log-dir "$tmp/nightly" >/dev/null
 
-[ "$(awk -F '\t' '$2 == "skip" { count += 1 } END { print count + 0 }' "$tmp/nightly/nightly-status.tsv")" -eq 5 ]
+[ "$(awk -F '\t' '$2 == "skip" { count += 1 } END { print count + 0 }' "$tmp/nightly/nightly-status.tsv")" -eq 4 ]
 
 # Configured adapters retain the same three-state contract as repository
 # adapters. In particular, exit 78 must remain unsupported and make the whole
 # gate return 78; it must never be rewritten to pass.
 set +e
 env \
-    THEKERNEL_NIGHTLY_LTP_ENABLED=0 \
     THEKERNEL_NIGHTLY_PRESSURE_COMMAND='exit 78' \
     THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED=0 \
     THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED=0 \
@@ -95,7 +101,6 @@ grep -q $'^pressure\tunsupported\t' "$tmp/nightly-unsupported/nightly-status.tsv
 
 set +e
 env \
-    THEKERNEL_NIGHTLY_LTP_ENABLED=0 \
     THEKERNEL_NIGHTLY_PRESSURE_COMMAND='exit 9' \
     THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED=0 \
     THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED=0 \
@@ -110,7 +115,6 @@ set -e
 grep -q $'^pressure\tfail\t' "$tmp/nightly-fail/nightly-status.tsv"
 
 env \
-    THEKERNEL_NIGHTLY_LTP_ENABLED=0 \
     THEKERNEL_NIGHTLY_PRESSURE_COMMAND='exit 0' \
     THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED=0 \
     THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED=0 \
@@ -118,11 +122,9 @@ env \
     "$CI_DIR/nightly-gate.sh" --log-dir "$tmp/nightly-pass" >/dev/null
 grep -q $'^pressure\tpass\t' "$tmp/nightly-pass/nightly-status.tsv"
 
-printf 'support\n' >"$tmp/fake-support.img"
 set +e
 env \
     THEKERNEL_NIGHTLY_ARCHES=invalid \
-    THEKERNEL_NIGHTLY_SUPPORT_IMAGE="$tmp/fake-support.img" \
     "$CI_DIR/nightly/pressure.sh" >"$tmp/invalid-arch.log" 2>&1
 status=$?
 set -e
@@ -135,16 +137,6 @@ if grep -Fq 'UNSUPPORTED' "$tmp/invalid-arch.log"; then
     printf 'test-ci-scripts: invalid adapter architecture was misclassified as unsupported\n' >&2
     exit 1
 fi
-
-# Support-image cache identity includes the selected architecture as data; it
-# must never try to hash the literal architecture name as a path.
-# shellcheck source=../../scripts/ci/nightly/lib.sh
-source "$CI_DIR/nightly/lib.sh"
-rv_support_identity=$(nightly_support_identity rv)
-la_support_identity=$(nightly_support_identity la)
-[[ "$rv_support_identity" =~ ^[0-9a-f]{64}$ ]]
-[[ "$la_support_identity" =~ ^[0-9a-f]{64}$ ]]
-[ "$rv_support_identity" != "$la_support_identity" ]
 
 # Verify the shared runner records and enforces a real wall-clock timeout.
 # shellcheck source=../../scripts/ci/lib.sh
@@ -165,55 +157,53 @@ fi
 grep -q $'^must-timeout\ttimeout\t124\t' "$CI_LOG_DIR/status.tsv"
 
 # A guest can close the serial pipe before the throttled producer finishes.
-# The runner must preserve the replay status and leave panic/missing-marker
+# The runner must preserve the QEMU status and leave panic/missing-marker
 # classification to validate-boot-log.sh instead of surfacing SIGPIPE 141.
 mkdir -p "$tmp/fake-bin" "$tmp/fake-work"
 cat >"$tmp/fake-bin/python3" <<'EOF'
 #!/usr/bin/env bash
-[ -z "${FAKE_REPLAY_ARGS:-}" ] || printf '%s\n' "$@" >"$FAKE_REPLAY_ARGS"
-exit "${FAKE_REPLAY_STATUS:-0}"
+[ -z "${FAKE_QEMU_RUNNER_ARGS:-}" ] || printf '%s\n' "$@" >"$FAKE_QEMU_RUNNER_ARGS"
+exit "${FAKE_QEMU_RUNNER_STATUS:-0}"
 EOF
 chmod +x "$tmp/fake-bin/python3"
 for _ in $(seq 1 20000); do
     printf 'echo serial-input-padding-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n'
 done >"$tmp/commands"
-env PATH="$tmp/fake-bin:$PATH" FAKE_REPLAY_STATUS=0 \
+env PATH="$tmp/fake-bin:$PATH" FAKE_QEMU_RUNNER_STATUS=0 \
     "$CI_DIR/boot-shell-runner.sh" rv /dev/null /dev/null \
     "$tmp/fake-work" "$tmp/commands" 1 1 0
-if env PATH="$tmp/fake-bin:$PATH" FAKE_REPLAY_STATUS=23 \
+if env PATH="$tmp/fake-bin:$PATH" FAKE_QEMU_RUNNER_STATUS=23 \
     "$CI_DIR/boot-shell-runner.sh" rv /dev/null /dev/null \
     "$tmp/fake-work" "$tmp/commands" 1 1 0; then
-    printf 'test-ci-scripts: replay failure was hidden by pipe handling\n' >&2
+    printf 'test-ci-scripts: QEMU runner failure was hidden by pipe handling\n' >&2
     exit 1
 else
     status=$?
     [ "$status" -eq 23 ] || {
-        printf 'test-ci-scripts: replay failure returned %s, expected 23\n' "$status" >&2
+        printf 'test-ci-scripts: QEMU runner failure returned %s, expected 23\n' "$status" >&2
         exit 1
     }
 fi
 
 printf 'exit\n' >"$tmp/short-commands"
-env PATH="$tmp/fake-bin:$PATH" FAKE_REPLAY_STATUS=75 \
-    FAKE_REPLAY_ARGS="$tmp/replay.args" \
+env PATH="$tmp/fake-bin:$PATH" FAKE_QEMU_RUNNER_STATUS=75 \
+    FAKE_QEMU_RUNNER_ARGS="$tmp/qemu-runner.args" \
     "$CI_DIR/boot-shell-runner.sh" rv kernel image "$tmp/fake-work" \
-    "$tmp/short-commands" 1 1 0 support.img extra.img STOP_MARKER || status=$?
+    "$tmp/short-commands" 1 1 0 extra.img STOP_MARKER || status=$?
 [ "${status:-75}" -eq 75 ]
-grep -Fxq -- '--input-after-marker' "$tmp/replay.args"
-grep -Fxq -- 'Entering TheKernel boot shell. Exit the shell to power off.' "$tmp/replay.args"
+grep -Fxq -- '--input-after-marker' "$tmp/qemu-runner.args"
+grep -Fxq -- 'THEKERNEL_SHELL_READY' "$tmp/qemu-runner.args"
 awk '
-    $0 == "--input-ready-timeout" {
+    $0 == "--ready-timeout" {
         getline
         found = ($0 == "1")
     }
     END { exit !found }
-' "$tmp/replay.args"
-grep -Fxq -- '--support-image' "$tmp/replay.args"
-grep -Fxq -- 'support.img' "$tmp/replay.args"
-grep -Fxq -- '--extra-block-image' "$tmp/replay.args"
-grep -Fxq -- 'extra.img' "$tmp/replay.args"
-grep -Fxq -- '--stop-after-marker' "$tmp/replay.args"
-grep -Fxq -- 'STOP_MARKER' "$tmp/replay.args"
+' "$tmp/qemu-runner.args"
+grep -Fxq -- '--extra-block' "$tmp/qemu-runner.args"
+grep -Fxq -- 'extra.img' "$tmp/qemu-runner.args"
+grep -Fxq -- '--stop-after-marker' "$tmp/qemu-runner.args"
+grep -Fxq -- 'STOP_MARKER' "$tmp/qemu-runner.args"
 
 # The one-shot host peer rejects unauthenticated traffic and returns the nonce
 # only after receiving the exact guest probe.
@@ -239,9 +229,9 @@ PY
 wait "$peer_pid"
 grep -Fq 'network-peer: validated guest request' "$tmp/peer.log"
 
-# Compile both support-helper modes on the host. The guest gate supplies the
+# Compile both project guest-helper modes on the host. The guest gate supplies the
 # strict overcommit policy that makes its finite request fail deterministically.
-cc -O2 -std=c11 "$REPO_ROOT/scripts/support-tools/nightly-oom-admission.c" \
+cc -O2 -std=c11 "$REPO_ROOT/tests/guest/tools/oom-admission.c" \
     -o "$tmp/nightly-oom-admission"
 "$tmp/nightly-oom-admission" --expect-success 4096 >/dev/null
 "$tmp/nightly-oom-admission" --expect-failure 18446744073709551615 >/dev/null

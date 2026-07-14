@@ -89,36 +89,3 @@ ci_run_step() {
     fi
     return "$status"
 }
-
-ci_find_official_image() {
-    local arch=$1
-    local base
-    case "$arch" in
-        rv) base=sdcard-rv.img ;;
-        la) base=sdcard-la.img ;;
-        *) return 2 ;;
-    esac
-
-    local -a roots=()
-    [ -z "${OSCOMP_TESTSUITE_DIR:-}" ] || roots+=("$OSCOMP_TESTSUITE_DIR")
-    roots+=(
-        /home/dia/kernel-image
-        "$HOME/kernel-image"
-        "$HOME/testsuits-for-oskernel"
-        /coursegrader/testdata
-        /opt/oskernel/testsuites
-    )
-
-    local root suffix candidate
-    for root in "${roots[@]}"; do
-        [ -d "$root" ] || continue
-        for suffix in '' .xz .gz; do
-            candidate="$root/$base$suffix"
-            if [ -f "$candidate" ]; then
-                printf '%s\n' "$candidate"
-                return 0
-            fi
-        done
-    done
-    return 1
-}

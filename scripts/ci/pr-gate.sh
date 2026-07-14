@@ -15,9 +15,9 @@ usage() {
     cat <<'EOF'
 Usage: scripts/ci/pr-gate.sh [--log-dir DIR] [--skip-build]
 
-Builds both release evaluator kernels and both release boot-shell kernels, then
-runs the strict dual-architecture boot-shell marker gate. This job requires the
-official RISC-V and LoongArch root images; missing infrastructure is a failure.
+Builds both release-mode kernels, both boot-shell kernels, and the
+repository-built rootfs fixtures, then runs the strict dual-architecture
+boot-shell marker gate.
 EOF
 }
 
@@ -44,12 +44,14 @@ ci_prepare_log_dir "$CI_LOG_DIR"
 if [ "$SKIP_BUILD" -eq 0 ]; then
     ci_run_step release-kernels "$BUILD_TIMEOUT_SECS" make kernels
     ci_run_step release-shell-kernels "$BUILD_TIMEOUT_SECS" \
-        make kernel-rv-shell kernel-la-shell
+        make kernel-rv-shell kernel-la-shell rootfs
 else
     [ -s kernel-rv ] || ci_die 'missing kernel-rv for --skip-build'
     [ -s kernel-la ] || ci_die 'missing kernel-la for --skip-build'
     [ -s .state/shell/kernel-rv ] || ci_die 'missing shell RISC-V kernel for --skip-build'
     [ -s .state/shell/kernel-la ] || ci_die 'missing shell LoongArch kernel for --skip-build'
+    [ -s .state/rootfs/rootfs-rv.img ] || ci_die 'missing RISC-V rootfs for --skip-build'
+    [ -s .state/rootfs/rootfs-la.img ] || ci_die 'missing LoongArch rootfs for --skip-build'
 fi
 
 ci_run_step dual-arch-boot "$BOOT_GATE_TIMEOUT_SECS" \

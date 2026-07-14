@@ -8,23 +8,23 @@ source "$SCRIPT_DIR/lib.sh"
 
 ARCH=rv
 WORKDIR=""
-SUPPORT_IMAGE=""
-SUPPORT_IMAGE_EXPLICIT=0
+ROOTFS_IMAGE=""
+ROOTFS_IMAGE_EXPLICIT=0
 TIMEOUT_SECS=240
-BOOT_WAIT_SECS=${OSCOMP_SMOKE_BOOT_WAIT_SECS:-35}
-LINE_DELAY_SECS=${OSCOMP_SMOKE_LINE_DELAY_SECS:-0.75}
+BOOT_WAIT_SECS=${THEKERNEL_SMOKE_BOOT_WAIT_SECS:-35}
+LINE_DELAY_SECS=${THEKERNEL_SMOKE_LINE_DELAY_SECS:-0.75}
 SKIP_KERNEL_BUILD=1
 WAIT_POLICY=hybrid
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--arch {rv|la}] [--workdir DIR] [--support-image IMG]
+Usage: $(basename "$0") [--arch {rv|la}] [--workdir DIR] [--rootfs IMG]
                          [--timeout SECS] [--boot-wait SECS] [--line-delay SECS]
                          [--wait-policy {hybrid|irq_first}] [--build-kernel]
 
 Runs a targeted user-direct async I/O smoke. The smoke enables the async block
-queue plus user_direct_async, then runs the oscomp-io-pin-safety --async-direct
-support tool to cover aligned pinned read/write, readv/writev, fallback cases,
+queue plus user_direct_async, then runs the thekernel-io-pin-safety --async-direct
+guest tool to cover aligned pinned read/write, readv/writev, fallback cases,
 and advisory signal-after-submit accounting in irq-first mode.
 
 EOF
@@ -45,9 +45,9 @@ while (($#)); do
             WORKDIR=${2:-}
             shift 2
             ;;
-        --support-image)
-            SUPPORT_IMAGE=${2:-}
-            SUPPORT_IMAGE_EXPLICIT=1
+        --rootfs)
+            ROOTFS_IMAGE=${2:-}
+            ROOTFS_IMAGE_EXPLICIT=1
             shift 2
             ;;
         --timeout)
@@ -80,9 +80,34 @@ while (($#)); do
     esac
 done
 
+case "$ARCH" in
+    rv|la) ;;
+    *) die "--arch must be rv or la" ;;
+esac
+case "$WAIT_POLICY" in
+    hybrid|irq_first) ;;
+    interrupt_first) WAIT_POLICY=irq_first ;;
+    *) die "--wait-policy must be hybrid or irq_first" ;;
+esac
+case "$TIMEOUT_SECS" in
+    ''|*[!0-9]*) die "--timeout must be a non-negative integer" ;;
+esac
+
+if [ -z "$WORKDIR" ]; then
+    WORKDIR="$REPO_ROOT/.state/user-direct-async-current/auto-smoke-$ARCH"
+elif [[ "$WORKDIR" != /* ]]; then
+    WORKDIR="$REPO_ROOT/$WORKDIR"
+fi
+
+if [ -z "$ROOTFS_IMAGE" ]; then
+    ROOTFS_IMAGE="$REPO_ROOT/.state/rootfs/rootfs-$ARCH.img"
+elif [[ "$ROOTFS_IMAGE" != /* ]]; then
+    ROOTFS_IMAGE="$REPO_ROOT/$ROOTFS_IMAGE"
+fi
+
 cd "$REPO_ROOT"
 mkdir -p "$REPO_ROOT/.state/user-direct-async-current"
-smoke_build_support_image_if_needed "$ARCH" "$SUPPORT_IMAGE" "$SUPPORT_IMAGE_EXPLICIT"
+smoke_build_rootfs_if_needed "$ARCH" "$ROOTFS_IMAGE" "$ROOTFS_IMAGE_EXPLICIT"
 
 rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR"
@@ -100,7 +125,7 @@ echo async_block_wait=__WAIT_POLICY__ > /proc/io_stats
 echo user_direct_async_on > /proc/io_stats
 echo lwext4_async_read_on > /proc/io_stats
 echo reset > /proc/io_stats
-/opt/oscomp-support/bin/oscomp-io-pin-safety __ASYNC_DIRECT_ARG__
+/opt/thekernel-tests/bin/thekernel-io-pin-safety __ASYNC_DIRECT_ARG__
 tool_rc=$?
 cat /proc/io_stats
 echo user_direct_async_off > /proc/io_stats
@@ -118,21 +143,22 @@ else
     sed -i "s/__ASYNC_DIRECT_ARG__/--async-direct-no-signal/g" "$COMMANDS_FILE"
 fi
 
-readarray -d '' -t kernel_args < <(smoke_replay_kernel_args "$ARCH" "$SKIP_KERNEL_BUILD")
+readarray -d '' -t kernel_args < <(smoke_runner_artifact_args "$ARCH" "$SKIP_KERNEL_BUILD")
 (
     sleep "$BOOT_WAIT_SECS"
     while IFS= read -r line; do
         printf '%s\n' "$line"
         sleep "$LINE_DELAY_SECS"
     done <"$COMMANDS_FILE"
-) | python3 -m tools.oscomp_eval.replay qemu \
+) | python3 -m tools.qemu_runner run \
     --arch "$ARCH" \
     "${kernel_args[@]}" \
-    --support-image "$SUPPORT_IMAGE" \
+    --rootfs "$ROOTFS_IMAGE" \
     --timeout "$TIMEOUT_SECS" \
     --workdir "$WORKDIR" \
-    --keep-workdir \
-    --interactive
+    --log "$WORKDIR/qemu.log" \
+    --interactive \
+    --input-after-marker THEKERNEL_SHELL_READY
 
 LOG="$WORKDIR/qemu.log"
 [ -f "$LOG" ] || die "missing QEMU log: $LOG"

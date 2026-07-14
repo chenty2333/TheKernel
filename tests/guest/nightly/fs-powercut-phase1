@@ -1,0 +1,26 @@
+#!/bin/sh
+
+fail() {
+    echo "CI_NIGHTLY_FS_POWERCUT_FAIL $1"
+    exit 1
+}
+
+echo CI_NIGHTLY_FS_POWERCUT_PHASE1_START
+device=
+for candidate in /dev/vdb /dev/sdb /dev/vdc /dev/sdc; do
+    if [ -e "$candidate" ]; then
+        device=$candidate
+        break
+    fi
+done
+test -n "$device" || fail missing-device
+mkdir -p /mnt/ci-powercut || fail mkdir
+/bin/busybox mount -t ext4 "$device" /mnt/ci-powercut || fail mount-phase1
+printf 'generation=1\n' >/mnt/ci-powercut/durable.new || fail durable-write
+/bin/busybox sync || fail durable-sync-1
+/bin/busybox mv /mnt/ci-powercut/durable.new /mnt/ci-powercut/durable \
+    || fail durable-rename
+/bin/busybox sync || fail durable-sync-2
+printf 'may-or-may-not-survive\n' >/mnt/ci-powercut/volatile || fail volatile-write
+echo CI_NIGHTLY_FS_POWERCUT_ARMED
+/bin/busybox sleep 3600

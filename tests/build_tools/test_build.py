@@ -3,114 +3,22 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stderr
-from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 from tools.build import (
     FileDigestStore,
-    SupportDiskRequest,
-    ensure_support_disk,
+    RootfsRequest,
+    ensure_rootfs,
     hash_params,
     kernel_params,
-    main,
     KernelRequest,
+    rootfs_params,
 )
-from tools.oscomp_eval.paths import repo_root
+from tools.project_paths import repo_root
 
 
-def _minimal_support_tree(root: Path) -> None:
-    (root / "scripts" / "support-tools").mkdir(parents=True)
-    (root / "scripts" / "support-overlay").mkdir(parents=True)
-    (root / "scripts" / "build-oscomp-support-disk.sh").write_text("#!/bin/sh\n", encoding="utf-8")
-    (root / "scripts" / "support-tools" / "tool.c").write_text("int main(){}\n", encoding="utf-8")
-    (root / "scripts" / "support-overlay" / "note").write_text("overlay\n", encoding="utf-8")
-    (root / "tools").mkdir()
-    (root / "tools" / "build.py").write_text("# build helper\n", encoding="utf-8")
-    (root / "ltp_test.txt").write_text("fork06\n", encoding="utf-8")
-
-
-class BuildSupportDiskCacheTests(unittest.TestCase):
-    def test_params_change_causes_miss(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _minimal_support_tree(root)
-            builds: list[Path] = []
-
-            def fake_build(req: SupportDiskRequest, output: Path, **_: object) -> None:
-                builds.append(output)
-                output.parent.mkdir(parents=True, exist_ok=True)
-                output.write_bytes(b"image-v1")
-
-            with patch("tools.build.support_disk_build", side_effect=fake_build):
-                first = ensure_support_disk(arch="rv", root=root, output=root / "disk.img")
-                second = ensure_support_disk(arch="rv", root=root, output=root / "disk.img")
-                third = ensure_support_disk(arch="la", root=root, output=root / "disk-la.img")
-
-            self.assertFalse(first.hit)
-            self.assertTrue(second.hit)
-            self.assertFalse(third.hit)
-            self.assertEqual(len(builds), 2)
-            self.assertIn(".state/build-cache/support-disks", str(first.cache_path))
-            self.assertTrue((root / "disk.img").is_file())
-            self.assertFalse((root / ".state" / "build-cache" / "records").exists())
-
-    def test_touch_same_content_is_hit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _minimal_support_tree(root)
-            builds: list[int] = []
-
-            def fake_build(req: SupportDiskRequest, output: Path, **_: object) -> None:
-                builds.append(1)
-                output.parent.mkdir(parents=True, exist_ok=True)
-                output.write_bytes(b"image")
-
-            with patch("tools.build.support_disk_build", side_effect=fake_build):
-                ensure_support_disk(arch="rv", root=root, output=root / "disk.img")
-                (root / "scripts" / "support-tools" / "tool.c").touch()
-                result = ensure_support_disk(arch="rv", root=root, output=root / "disk.img")
-
-            self.assertTrue(result.hit)
-            self.assertEqual(len(builds), 1)
-
-    def test_overlay_content_change_is_miss(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _minimal_support_tree(root)
-            builds: list[int] = []
-
-            def fake_build(req: SupportDiskRequest, output: Path, **_: object) -> None:
-                builds.append(1)
-                output.parent.mkdir(parents=True, exist_ok=True)
-                output.write_bytes(b"image")
-
-            with patch("tools.build.support_disk_build", side_effect=fake_build):
-                ensure_support_disk(arch="rv", root=root, output=root / "disk.img")
-                (root / "scripts" / "support-overlay" / "note").write_text("changed\n", encoding="utf-8")
-                result = ensure_support_disk(arch="rv", root=root, output=root / "disk.img")
-
-            self.assertFalse(result.hit)
-            self.assertEqual(len(builds), 2)
-
-    def test_identity_ignores_materialized_output_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _minimal_support_tree(root)
-
-            def fake_build(req: SupportDiskRequest, output: Path, **_: object) -> None:
-                output.parent.mkdir(parents=True, exist_ok=True)
-                output.write_bytes(b"image")
-
-            with patch("tools.build.support_disk_build", side_effect=fake_build):
-                a = ensure_support_disk(arch="rv", root=root, output=root / "a.img")
-                b = ensure_support_disk(arch="rv", root=root, output=root / "b.img")
-
-            self.assertEqual(a.identity, b.identity)
-            self.assertEqual(a.cache_path, b.cache_path)
-            self.assertTrue(b.hit)
-
+class BuildCacheTests(unittest.TestCase):
     def test_file_digest_store_reuses_hash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -125,6 +33,57 @@ class BuildSupportDiskCacheTests(unittest.TestCase):
             third = store.digest_file(path)
             self.assertNotEqual(first, third)
             store.close()
+
+    def test_rootfs_identity_ignores_materialized_output_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            (root / "tests" / "guest").mkdir(parents=True)
+            (root / "tests" / "rootfs").mkdir(parents=True)
+            (root / "tools").mkdir()
+            (root / "dev-env").mkdir()
+            (root / "scripts" / "build-rootfs.sh").write_text(
+                "#!/bin/sh\n", encoding="utf-8"
+            )
+            (root / "tests" / "guest" / "shell-init.sh").write_text(
+                "#!/bin/sh\n", encoding="utf-8"
+            )
+            busybox_config = root / "tests" / "rootfs" / "busybox-1.36.1.config"
+            busybox_config.write_text("CONFIG_STATIC=y\n", encoding="utf-8")
+            (root / "tools" / "build.py").write_text(
+                "# builder\n", encoding="utf-8"
+            )
+            for metadata in ("LICENSE", "NOTICE", "PROVENANCE.md"):
+                (root / metadata).write_text(f"{metadata}\n", encoding="utf-8")
+            (root / "dev-env" / "Dockerfile").write_text(
+                "FROM scratch\n", encoding="utf-8"
+            )
+            (root / "dev-env" / "versions.env").write_text(
+                "TOOLCHAIN_VERSION=test\n", encoding="utf-8"
+            )
+
+            builds: list[Path] = []
+
+            def fake_build(req: RootfsRequest, output: Path, **_: object) -> None:
+                builds.append(output)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(b"rootfs")
+
+            with patch("tools.build.rootfs_build", side_effect=fake_build):
+                first = ensure_rootfs(arch="rv", root=root, output=root / "a.img")
+                second = ensure_rootfs(arch="rv", root=root, output=root / "b.img")
+                busybox_config.write_text(
+                    "CONFIG_STATIC=y\nCONFIG_FEATURE_TEST=y\n", encoding="utf-8"
+                )
+                third = ensure_rootfs(arch="rv", root=root, output=root / "c.img")
+
+            self.assertEqual(first.identity, second.identity)
+            self.assertEqual(first.cache_path, second.cache_path)
+            self.assertFalse(first.hit)
+            self.assertTrue(second.hit)
+            self.assertNotEqual(second.identity, third.identity)
+            self.assertFalse(third.hit)
+            self.assertEqual(len(builds), 2)
 
 
 class BuildKernelParamTests(unittest.TestCase):
@@ -145,9 +104,84 @@ class BuildKernelParamTests(unittest.TestCase):
             self.assertEqual(params["strip"], "rust-objcopy --strip-all")
             self.assertEqual(hash_params(params), hash_params(dict(params)))
 
+    def test_rootfs_params_normalize_source_date_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "tools.build.capture", return_value="tool-version"
+        ):
+            request = RootfsRequest(arch="rv", root=Path(tmp))
+            with patch.dict("os.environ", {"SOURCE_DATE_EPOCH": ""}):
+                self.assertEqual(rootfs_params(request)["source_date_epoch"], "1704067200")
+            with patch.dict("os.environ", {"SOURCE_DATE_EPOCH": "123456789"}):
+                self.assertEqual(rootfs_params(request)["source_date_epoch"], "123456789")
+
+
+class ProductBootBoundaryTests(unittest.TestCase):
+    def test_release_and_shell_kernels_have_distinct_init_processes(self) -> None:
+        root = repo_root()
+        source = (root / "src" / "main.rs").read_text(encoding="utf-8")
+        self.assertIn('SYSTEM_CMDLINE: &[&str] = &["/sbin/init"]', source)
+        self.assertIn(
+            'SHELL_CMDLINE: &[&str] = &["/bin/busybox", "sh", '
+            '"/etc/thekernel/shell-init.sh"]',
+            source,
+        )
+        self.assertNotIn("THEKERNEL_BOOT_MODE", source)
+
+    def test_rootfs_installs_a_real_system_init_after_busybox(self) -> None:
+        root = repo_root()
+        source = (root / "scripts" / "build-rootfs.sh").read_text(encoding="utf-8")
+        remove = source.index('rm -f "$STAGE/sbin/init"')
+        compile_init = source.index('-o "$STAGE/sbin/init"')
+        self.assertLess(remove, compile_init)
+        self.assertIn("tests/guest/shell-init.sh", source)
+        self.assertNotIn("tests/guest/init.sh", source)
+        self.assertIn("tests/rootfs/busybox-${BUSYBOX_VERSION}.config", source)
+        self.assertIn("silentoldconfig", source)
+        self.assertNotIn(" defconfig", source)
+        self.assertIn("mke2fs -q -F -t ext4 -b 4096", source)
+
+    def test_smoke_scripts_define_a_default_workdir(self) -> None:
+        root = repo_root()
+        for script in sorted((root / "scripts" / "smoke").glob("*-smoke.sh")):
+            source = script.read_text(encoding="utf-8")
+            if 'WORKDIR=""' in source:
+                self.assertIn('if [ -z "$WORKDIR" ]', source, msg=script.name)
+
+    def test_smoke_scripts_validate_cli_before_building(self) -> None:
+        root = repo_root()
+        scripts = sorted((root / "scripts" / "smoke").glob("*-smoke.sh"))
+        for script in scripts:
+            for args, error in (
+                (("--arch", "invalid"), "--arch must be rv or la"),
+                (("--timeout", "invalid"), "--timeout must be a non-negative integer"),
+            ):
+                result = subprocess.run(
+                    [str(script), *args],
+                    cwd=root,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 1, msg=script.name)
+                self.assertIn(error, result.stderr, msg=script.name)
+
+        for name in ("lwext4-async-read-smoke.sh", "user-direct-async-smoke.sh"):
+            script = root / "scripts" / "smoke" / name
+            result = subprocess.run(
+                [str(script), "--wait-policy", "invalid"],
+                cwd=root,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1, msg=name)
+            self.assertIn("--wait-policy must be hybrid or irq_first", result.stderr)
+
 
 class BuildCliTests(unittest.TestCase):
-    def test_help_documents_short_commands(self) -> None:
+    def test_help_documents_product_commands(self) -> None:
         root = repo_root()
         result = subprocess.run(
             ["python3", "tools/build.py", "--help"],
@@ -160,18 +194,52 @@ class BuildCliTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("kernel", result.stdout)
-        self.assertIn("support", result.stdout)
-        self.assertNotIn("eval-kernel", result.stdout)
-        self.assertNotIn("support-disk", result.stdout)
-        self.assertNotIn("--recipe", result.stdout)
+        self.assertIn("shell", result.stdout)
+        self.assertIn("rootfs", result.stdout)
 
-    def test_main_rejects_missing_ltp_list(self) -> None:
-        with patch("tools.build.find_repo_root", return_value=Path("/tmp/missing-thekernel")):
-            stderr = StringIO()
-            with redirect_stderr(stderr):
-                code = main(["support", "rv", "--ltp-list", "/tmp/does-not-exist"])
-        self.assertEqual(code, 2)
-        self.assertIn("ltp list does not exist", stderr.getvalue())
+    def test_clean_dry_run_removes_outputs_but_preserves_caches(self) -> None:
+        root = repo_root()
+        result = subprocess.run(
+            ["make", "--no-print-directory", "-n", "clean"],
+            cwd=root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        for path in (
+            root / ".state" / "ci",
+            root / ".state" / "rootfs",
+            root / ".state" / "rootfs-build",
+            root / ".state" / "system-test",
+            root / ".state" / "riscv64" / ".axconfig.toml",
+            root / ".state" / "riscv64" / ".axconfig.old.toml",
+            root / ".state" / "loongarch64" / ".axconfig.toml",
+            root / ".state" / "loongarch64" / ".axconfig.old.toml",
+        ):
+            self.assertIn(str(path), result.stdout)
+        self.assertIn(str(root / ".state" / "*-current"), result.stdout)
+        for path in (
+            root / ".state" / "build-cache",
+            root / ".state" / "source-cache",
+            root / ".state" / "riscv64" / "target",
+            root / ".state" / "loongarch64" / "target",
+        ):
+            self.assertNotIn(str(path), result.stdout)
+
+    def test_clean_all_dry_run_does_not_require_an_application(self) -> None:
+        root = repo_root()
+        result = subprocess.run(
+            ["make", "--no-print-directory", "-n", "clean-all"],
+            cwd=root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn(f'rm -rf "{root / ".state"}"', result.stdout)
 
 
 if __name__ == "__main__":

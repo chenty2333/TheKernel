@@ -8,7 +8,8 @@ the full license text.
 
 This repository includes and modifies code derived from StarryOS, ArceOS, and
 other third-party components. Third-party files retain their upstream copyright
-notices and license terms.
+notices and license terms. Exact source lineage and generated-test-rootfs
+boundaries are recorded in PROVENANCE.md.
 
 Original Project Contributors:
  - "Azure-stars <Azure_stars@126.com>"

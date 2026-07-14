@@ -17,9 +17,7 @@
 *.swp
 *.swo
 *.log
-!tests/oscomp_eval/fixtures/*.log
 *.pcap
-score.txt
 *out
 __pycache__/
 *.pyc

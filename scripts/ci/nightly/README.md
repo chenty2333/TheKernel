@@ -30,6 +30,6 @@ models sudden VM process loss after explicit durable writes; storage devices
 with volatile caches still require hardware-appropriate flush/fence testing.
 
 `THEKERNEL_NIGHTLY_ARCHES` accepts `rv`, `la`, or `both` (the default). Missing
-QEMU binaries, official images, cross compilers, or filesystem tools cause
+QEMU binaries, cross compilers, rootfs build tools, or filesystem tools cause
 exit `78`. A runner may provide a category-specific `*_COMMAND` override for
 hardware-only testing; its exit `78` retains the same unsupported meaning.

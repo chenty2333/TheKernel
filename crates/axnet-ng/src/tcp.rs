@@ -166,10 +166,8 @@ impl TcpSocket {
             | smol::State::LastAck
             | smol::State::TimeWait => {
                 // Linux connect() succeeds once the handshake completed, even
-                // if the peer closes immediately afterwards. LTP accept02
-                // hits this race by accept()ing and closing the server-side
-                // socket right away, so treat post-handshake terminal states
-                // as a successful connect.
+                // if the peer closes immediately afterwards. Preserve a
+                // successful handshake across that post-connect close race.
                 self.state.set(State::Connected); // connected
                 self.general.clear_pending_error();
                 if let Some(remote) = socket.remote_endpoint() {

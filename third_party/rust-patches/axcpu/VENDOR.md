@@ -26,7 +26,7 @@ The published archive contains no `tests/` files, so there are no upstream test 
 ## TheKernel patch ledger
 
 - `7f198eb` repaired and optimized the LoongArch user-copy path.
-- `2aee666` stabilized LoongArch CPU initialization for the evaluator/runtime path.
+- `2aee666` corrected the LoongArch docs.rs target triple.
 - `5641ef3` retained architecture-level copy/alignment improvements.
 - Maintained delta: LoongArch user-copy assembly, unaligned access handling, and architecture initialization only; Linux user-copy policy remains above this crate.
 

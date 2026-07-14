@@ -8,14 +8,12 @@ source "$SCRIPT_DIR/lib.sh"
 
 LOG_DIR="$REPO_ROOT/.state/ci/nightly"
 CASE_TIMEOUT_SECS=${THEKERNEL_NIGHTLY_CASE_TIMEOUT_SECS:-7200}
-LTP_SELECT=${THEKERNEL_NIGHTLY_LTP_SELECT:-ltp-glibc:getrandom01}
 
 usage() {
     cat <<'EOF'
 Usage: scripts/ci/nightly-gate.sh [--log-dir DIR] [--list]
 
 Nightly categories and optional command overrides:
-  ltp                 THEKERNEL_NIGHTLY_LTP_COMMAND
   pressure            THEKERNEL_NIGHTLY_PRESSURE_COMMAND
   oom-failpoint       THEKERNEL_NIGHTLY_OOM_FAILPOINT_COMMAND
   fs-powercut         THEKERNEL_NIGHTLY_FS_POWERCUT_COMMAND
@@ -32,7 +30,6 @@ EOF
 
 list_categories() {
     cat <<'EOF'
-ltp	focused dual-architecture LTP replay
 pressure	dual-architecture mixed task, memory, and filesystem pressure
 oom-failpoint	deterministic ENOMEM admission and recovery replay
 fs-powercut	two-boot writable-ext4 crash recovery replay
@@ -156,51 +153,6 @@ run_adapter_case() {
         "$CI_LOG_DIR/nightly-$category.log"
 }
 
-run_ltp() {
-    local status=0
-
-    if ! case_enabled THEKERNEL_NIGHTLY_LTP_ENABLED; then
-        record_result ltp skip 'disabled by THEKERNEL_NIGHTLY_LTP_ENABLED'
-        return
-    fi
-
-    if [ -n "${THEKERNEL_NIGHTLY_LTP_COMMAND:-}" ]; then
-        if ci_run_step nightly-ltp "$CASE_TIMEOUT_SECS" bash -c "$THEKERNEL_NIGHTLY_LTP_COMMAND"; then
-            status=0
-        else
-            status=$?
-        fi
-        record_adapter_status \
-            ltp "$status" 'configured LTP adapter passed' 'configured LTP adapter' \
-            "$CI_LOG_DIR/nightly-ltp.log"
-        return
-    fi
-
-    if [ ! -x scripts/lab ] \
-        || ! ci_find_official_image rv >/dev/null \
-        || ! ci_find_official_image la >/dev/null \
-        || ! command -v qemu-system-riscv64 >/dev/null 2>&1 \
-        || ! command -v qemu-system-loongarch64 >/dev/null 2>&1; then
-        record_result ltp unsupported \
-            'focused LTP adapter requires scripts/lab, both QEMU binaries, and both official root images'
-        unsupported=$((unsupported + 1))
-        return
-    fi
-
-    if ci_run_step nightly-ltp "$CASE_TIMEOUT_SECS" bash -c '
-        set -euo pipefail
-        ./scripts/lab run --arch rv --select "$1"
-        ./scripts/lab run --arch la --select "$1"
-    ' _ "$LTP_SELECT"; then
-        record_result ltp pass "dual-arch $LTP_SELECT passed" "$CI_LOG_DIR/nightly-ltp.log"
-    else
-        local status=$?
-        record_result ltp fail "dual-arch $LTP_SELECT failed with exit $status" "$CI_LOG_DIR/nightly-ltp.log"
-        failures=$((failures + 1))
-    fi
-}
-
-run_ltp
 run_adapter_case pressure \
     THEKERNEL_NIGHTLY_PRESSURE_COMMAND THEKERNEL_NIGHTLY_PRESSURE_ENABLED \
     "$SCRIPT_DIR/nightly/pressure.sh"

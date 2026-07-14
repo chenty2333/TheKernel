@@ -8,7 +8,7 @@
 
 TheKernel will evolve through small, dependency-ordered vertical slices. The
 program separates generic mechanisms, Linux-visible policy, syscall glue, and
-evaluator policy before deciding a crate or repository home.
+test/profile policy before deciding a crate or repository home.
 
 The work proceeds in nine tracks:
 
@@ -100,7 +100,7 @@ Until then, public surfaces remain 0.x, sealed where practical, and
 Branding, provenance, CI infrastructure, semantic changes, performance
 mechanisms, and physical crate moves use separate commits. Each checkpoint is
 independently reviewable and revertible. Benchmark results may justify
-investigation, but benchmark names and evaluator output shapes must not affect
+investigation, but benchmark names and harness output shapes must not affect
 kernel semantics.
 
 ## Repository policy

@@ -26,7 +26,7 @@ All published test paths are present but adapted to the maintained fork: `tests/
 ## TheKernel patch ledger
 
 - `61becfd` aligned auxiliary-vector and user-stack layout for static glibc.
-- `bafce29` repaired loader behavior exposed by RISC-V LTP.
+- `bafce29` normalized empty argv and added independent `AT_EXECFN` storage.
 - `96df7d9` added fallible/checked loader and stack construction boundaries.
 - Maintained delta: ELF metadata parsing, checked user-stack construction, and static/dynamic loader test adaptations.
 

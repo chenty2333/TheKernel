@@ -1,6 +1,6 @@
 # Necessary dependencies for the build system.
 #
-# The default rv/la evaluator path should work without host-global
+# The default RISC-V/LoongArch build should work without host-global
 # cargo-axplat or axconfig-gen installations. Fall back to the repo-local
 # helper when axconfig-gen is absent, and only require Rust binutils for goals
 # that actually invoke them.
@@ -16,7 +16,7 @@ endif
 
 ifneq ($(filter build all run justrun debug,$(or $(MAKECMDGOALS), $(.DEFAULT_GOAL))),)
   ifeq ($(shell command -v rust-objcopy >/dev/null 2>&1; echo $$?),1)
-    $(error missing rust-objcopy; use the repo-local dev image, preinstall cargo-binutils, or build via the ELF-only evaluator path)
+    $(error missing rust-objcopy; use the repo-local dev image or preinstall cargo-binutils)
   endif
 endif
 

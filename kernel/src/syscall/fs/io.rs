@@ -55,8 +55,8 @@ const SPLICE_F_ALL: u32 = SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SP
 const SYNC_FILE_RANGE_WAIT_BEFORE: u32 = 0x01;
 const SYNC_FILE_RANGE_WRITE: u32 = 0x02;
 const SYNC_FILE_RANGE_WAIT_AFTER: u32 = 0x04;
-// Regular-file O_DIRECT is constrained by logical sector alignment. LTP
-// exercises 512-byte offset and 1 KiB transfer cases.
+// Regular-file O_DIRECT is constrained by logical sector alignment. Valid
+// 512-byte offsets and 1 KiB transfers must not inherit a 4 KiB alignment.
 const DIRECT_IO_ALIGNMENT: usize = 512;
 const USER_SLICE_FAST_MIN: usize = 4096;
 const USER_IOV_FAST_MAX_SEGMENTS: usize = 64;

@@ -11,9 +11,8 @@ Usage:
   scripts/smoke.sh list
   scripts/smoke.sh NAME [ARGS...]
 
-Boot-shell smokes build or reuse kernel-*-shell and drive commands through
-tools.oscomp_eval.replay qemu --interactive. phase9-la-depth-gate uses the
-eval kernel-la path instead.
+Semantic smokes build or reuse kernel-*-shell plus the repository-built rootfs,
+then drive commands through the generic QEMU runner.
 
 Smoke names:
   async-block-queue
@@ -22,7 +21,6 @@ Smoke names:
   lwext4-async-read
   lwext4-io-boost
   page-cache-readahead
-  phase9-la-depth-gate
   user-direct-async
 EOF
 }
@@ -35,7 +33,6 @@ script_for() {
         lwext4-async-read) printf '%s\n' "$SMOKE_DIR/lwext4-async-read-smoke.sh" ;;
         lwext4-io-boost) printf '%s\n' "$SMOKE_DIR/lwext4-io-boost-smoke.sh" ;;
         page-cache-readahead) printf '%s\n' "$SMOKE_DIR/page-cache-readahead-smoke.sh" ;;
-        phase9-la-depth-gate) printf '%s\n' "$SMOKE_DIR/phase9-la-depth-gate.sh" ;;
         user-direct-async) printf '%s\n' "$SMOKE_DIR/user-direct-async-smoke.sh" ;;
         *) return 1 ;;
     esac

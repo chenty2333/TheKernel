@@ -1,10 +1,10 @@
 name: thekernel-dev
 
 x-common-env: &common-env
-  HOME: /home/oskernel
+  HOME: /home/thekernel
   CARGO_HOME: /usr/local/cargo
   RUSTUP_HOME: /usr/local/rustup
-  OSCOMP_TESTSUITE_DIR: /opt/oskernel/testsuites
+  THEKERNEL_ROOTFS_DIR: /opt/thekernel/rootfs
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   PYTHONDONTWRITEBYTECODE: "1"
   LOCAL_UID: "${LOCAL_UID:-1000}"
@@ -14,17 +14,21 @@ x-common-volumes: &common-volumes
   - type: bind
     source: ..
     target: /workspace
+    bind:
+      selinux: z
   - type: volume
     source: thekernel-home
-    target: /home/oskernel
+    target: /home/thekernel
   - type: bind
-    source: ${OSCOMP_TESTSUITE_HOST_DIR}
-    target: /opt/oskernel/testsuites
+    source: ${THEKERNEL_ROOTFS_HOST_DIR}
+    target: /opt/thekernel/rootfs
     read_only: true
+    bind:
+      selinux: z
 
 services:
   dev:
-    image: ${OSKERNEL_DEV_IMAGE}
+    image: ${THEKERNEL_DEV_IMAGE}
     build:
       context: .
       dockerfile: Dockerfile
@@ -43,7 +47,7 @@ services:
     volumes: *common-volumes
 
   builder:
-    image: ${OSKERNEL_DEV_IMAGE}
+    image: ${THEKERNEL_DEV_IMAGE}
     build:
       context: .
       dockerfile: Dockerfile

@@ -211,6 +211,14 @@ impl Thread {
         self.visible_tid.load(Ordering::Acquire)
     }
 
+    /// Whether this task currently owns the Linux-visible thread-group ID.
+    ///
+    /// Scheduler task IDs are an internal allocation detail and can differ
+    /// from the visible TID, including for PID 1 and after de-threading exec.
+    pub(crate) fn is_thread_group_leader(&self) -> bool {
+        self.tid() == self.proc_data.proc.pid()
+    }
+
     /// Set the clear child tid field.
     pub fn set_clear_child_tid(&self, clear_child_tid: usize) {
         self.clear_child_tid

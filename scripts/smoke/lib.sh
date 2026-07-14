@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 
-# Shared boot-shell smoke helpers.
-# Boot shell mode uses kernel-*-shell artifacts (boot-shell feature), not
-# OSCOMP_BOOT_SHELL env overrides on the support disk.
+# Shared repository-built rootfs boot-shell smoke helpers.
 
-SMOKE_REPLAY_TIMEOUT_SECS=240
+SMOKE_RUN_TIMEOUT_SECS=240
 
 smoke_kernel_shell_make_target() {
     case "$1" in
@@ -22,9 +20,9 @@ smoke_kernel_shell_path() {
     esac
 }
 
-smoke_build_support_image_if_needed() {
+smoke_build_rootfs_if_needed() {
     local arch=$1
-    local support_image=$2
+    local rootfs_image=$2
     local explicit=$3
 
     # Explicit caller-provided image path: do not rebuild or replace it.
@@ -32,10 +30,10 @@ smoke_build_support_image_if_needed() {
         return 0
     fi
 
-    mkdir -p "$(dirname -- "$support_image")"
+    mkdir -p "$(dirname -- "$rootfs_image")"
     PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-        python3 "$REPO_ROOT/tools/build.py" support "$arch" \
-        --output "$support_image"
+        python3 "$REPO_ROOT/tools/build.py" rootfs "$arch" \
+        --output "$rootfs_image"
 }
 
 smoke_ensure_shell_kernel() {
@@ -51,11 +49,11 @@ smoke_ensure_shell_kernel() {
     printf '%s\n' "$kernel_path"
 }
 
-smoke_replay_kernel_args() {
+smoke_runner_artifact_args() {
     local arch=$1
     local skip_build=$2
     local kernel_path
 
     kernel_path=$(smoke_ensure_shell_kernel "$arch" "$skip_build")
-    printf '%s\0%s\0%s\0' --kernel "$kernel_path" --skip-kernel-build
+    printf '%s\0%s\0' --kernel "$kernel_path"
 }

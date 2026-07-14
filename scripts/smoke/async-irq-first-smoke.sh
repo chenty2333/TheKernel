@@ -8,17 +8,17 @@ source "$SCRIPT_DIR/lib.sh"
 
 ARCH=rv
 WORKDIR=""
-SUPPORT_IMAGE=""
-SUPPORT_IMAGE_EXPLICIT=0
+ROOTFS_IMAGE=""
+ROOTFS_IMAGE_EXPLICIT=0
 EXTRA_IMAGE=""
 TIMEOUT_SECS=220
-BOOT_WAIT_SECS=${OSCOMP_SMOKE_BOOT_WAIT_SECS:-35}
-LINE_DELAY_SECS=${OSCOMP_SMOKE_LINE_DELAY_SECS:-0.75}
+BOOT_WAIT_SECS=${THEKERNEL_SMOKE_BOOT_WAIT_SECS:-35}
+LINE_DELAY_SECS=${THEKERNEL_SMOKE_LINE_DELAY_SECS:-0.75}
 SKIP_KERNEL_BUILD=1
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--arch {rv|la}] [--workdir DIR] [--support-image IMG]
+Usage: $(basename "$0") [--arch {rv|la}] [--workdir DIR] [--rootfs IMG]
                          [--extra-image IMG] [--timeout SECS] [--build-kernel]
 
 Runs a targeted async block wait-policy smoke. It switches to the default-off
@@ -44,9 +44,9 @@ while (($#)); do
             WORKDIR=${2:-}
             shift 2
             ;;
-        --support-image)
-            SUPPORT_IMAGE=${2:-}
-            SUPPORT_IMAGE_EXPLICIT=1
+        --rootfs)
+            ROOTFS_IMAGE=${2:-}
+            ROOTFS_IMAGE_EXPLICIT=1
             shift 2
             ;;
         --extra-image)
@@ -93,10 +93,10 @@ elif [[ "$WORKDIR" != /* ]]; then
     WORKDIR="$REPO_ROOT/$WORKDIR"
 fi
 
-if [ -z "$SUPPORT_IMAGE" ]; then
-    SUPPORT_IMAGE="$REPO_ROOT/.state/async-irq-first-current/support-$ARCH.img"
-elif [[ "$SUPPORT_IMAGE" != /* ]]; then
-    SUPPORT_IMAGE="$REPO_ROOT/$SUPPORT_IMAGE"
+if [ -z "$ROOTFS_IMAGE" ]; then
+    ROOTFS_IMAGE="$REPO_ROOT/.state/rootfs/rootfs-$ARCH.img"
+elif [[ "$ROOTFS_IMAGE" != /* ]]; then
+    ROOTFS_IMAGE="$REPO_ROOT/$ROOTFS_IMAGE"
 fi
 
 if [ -z "$EXTRA_IMAGE" ]; then
@@ -107,7 +107,7 @@ fi
 
 cd "$REPO_ROOT"
 mkdir -p "$REPO_ROOT/.state/async-irq-first-current"
-smoke_build_support_image_if_needed "$ARCH" "$SUPPORT_IMAGE" "$SUPPORT_IMAGE_EXPLICIT"
+smoke_build_rootfs_if_needed "$ARCH" "$ROOTFS_IMAGE" "$ROOTFS_IMAGE_EXPLICIT"
 
 mkdir -p "$(dirname -- "$EXTRA_IMAGE")"
 rm -f "$EXTRA_IMAGE"
@@ -143,22 +143,23 @@ echo ASYNC_IRQ_FIRST_SMOKE_DONE
 exit
 EOF
 
-readarray -d '' -t kernel_args < <(smoke_replay_kernel_args "$ARCH" "$SKIP_KERNEL_BUILD")
+readarray -d '' -t kernel_args < <(smoke_runner_artifact_args "$ARCH" "$SKIP_KERNEL_BUILD")
 (
     sleep "$BOOT_WAIT_SECS"
     while IFS= read -r line; do
         printf '%s\n' "$line"
         sleep "$LINE_DELAY_SECS"
     done <"$COMMANDS_FILE"
-) | python3 -m tools.oscomp_eval.replay qemu \
+) | python3 -m tools.qemu_runner run \
     --arch "$ARCH" \
     "${kernel_args[@]}" \
-    --support-image "$SUPPORT_IMAGE" \
-    --extra-block-image "$EXTRA_IMAGE" \
+    --rootfs "$ROOTFS_IMAGE" \
+    --extra-block "$EXTRA_IMAGE" \
     --timeout "$TIMEOUT_SECS" \
     --workdir "$WORKDIR" \
-    --keep-workdir \
-    --interactive
+    --log "$WORKDIR/qemu.log" \
+    --interactive \
+    --input-after-marker THEKERNEL_SHELL_READY
 
 LOG="$WORKDIR/qemu.log"
 [ -f "$LOG" ] || die "missing QEMU log: $LOG"

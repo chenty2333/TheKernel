@@ -9,7 +9,6 @@ source "$SCRIPT_DIR/lib.sh"
 command -v python3 >/dev/null 2>&1 || nightly_unsupported 'missing python3 host peer'
 command -v sha256sum >/dev/null 2>&1 || nightly_unsupported 'missing sha256sum'
 mkdir -p "$NIGHTLY_LOG_DIR"
-support_image=$(nightly_prepare_support_image)
 
 peer_pid=
 cleanup_peer() {
@@ -50,10 +49,10 @@ while IFS= read -r arch; do
     esac
 
     printf '%s %s %s; exit\n' \
-        /opt/oscomp-support/bin/thekernel-nightly-network "$port" "$nonce" \
+        /opt/thekernel-tests/bin/thekernel-nightly-network "$port" "$nonce" \
         >"$commands"
 
-    nightly_run_guest "$arch" "$commands" "$run_dir" "$support_image"
+    nightly_run_guest "$arch" "$commands" "$run_dir"
     if wait "$peer_pid"; then
         peer_pid=
     else

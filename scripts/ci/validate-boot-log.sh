@@ -42,7 +42,7 @@ if ! grep -Eq '^System is shutting down[[:space:]]*$' "$log"; then
 fi
 
 if grep -Eq \
-    '^CI_BOOT_GATE_FAIL([[:space:]].*)?[[:space:]]*$|Kernel panic|panicked at|BUG:|Oops:|QEMU timed out after|replay idle timeout' \
+    '^CI_BOOT_GATE_FAIL([[:space:]].*)?[[:space:]]*$|Kernel panic|panicked at|BUG:|Oops:|QEMU timed out after|QEMU idle timeout after' \
     "$log"; then
     printf 'boot-log[%s]: failure, panic, or timeout marker found\n' "$arch" >&2
     exit 1

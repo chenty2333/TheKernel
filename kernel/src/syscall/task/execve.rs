@@ -301,7 +301,7 @@ fn do_execve(
     let thr = curr.as_thread();
     let proc_data = &thr.proc_data;
     let curr_tid = curr.id().as_u64() as Pid;
-    let new_task_alias = (curr_tid != proc_data.proc.pid()).then(|| curr.clone());
+    let new_task_alias = (!thr.is_thread_group_leader()).then(|| curr.clone());
     let task_alias_admission = match new_task_alias
         .as_ref()
         .map(|task| prepare_task_alias_admission(proc_data.proc.pid(), task))

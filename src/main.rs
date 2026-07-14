@@ -6,15 +6,28 @@ extern crate alloc;
 
 use alloc::{borrow::ToOwned, vec::Vec};
 
-const INIT_SCRIPT: &str = include_str!("init.sh");
-
-pub const CMDLINE: &[&str] = &["/musl/busybox", "sh", "-c", INIT_SCRIPT];
-
-#[cfg(feature = "boot-shell")]
-pub const ENVS: &[&str] = &["OSCOMP_BOOT_SHELL=1", "THEKERNEL_BOOT_MODE=shell"];
+pub const SYSTEM_CMDLINE: &[&str] = &["/sbin/init"];
+pub const SHELL_CMDLINE: &[&str] = &["/bin/busybox", "sh", "/etc/thekernel/shell-init.sh"];
 
 #[cfg(not(feature = "boot-shell"))]
-pub const ENVS: &[&str] = &["THEKERNEL_BOOT_MODE=eval"];
+pub const CMDLINE: &[&str] = SYSTEM_CMDLINE;
+
+#[cfg(feature = "boot-shell")]
+pub const CMDLINE: &[&str] = SHELL_CMDLINE;
+
+#[cfg(feature = "boot-shell")]
+pub const ENVS: &[&str] = &[
+    "HOME=/root",
+    "PATH=/opt/thekernel-tests/bin:/sbin:/bin:/usr/sbin:/usr/bin",
+    "TERM=vt100",
+];
+
+#[cfg(not(feature = "boot-shell"))]
+pub const ENVS: &[&str] = &[
+    "HOME=/",
+    "PATH=/opt/thekernel-tests/bin:/sbin:/bin:/usr/sbin:/usr/bin",
+    "TERM=vt100",
+];
 
 #[unsafe(no_mangle)]
 fn main() {

@@ -41,8 +41,8 @@ impl MemIf for MemIfImpl {
         &[
             (0, 0x200000), // boot_info + fdt
             // Keep a dedicated low-memory carveout for LA virtio DMA. The
-            // support disk path is sensitive to queue/bounce-buffer aliasing
-            // and cache-attribute churn when it shares pages with the generic
+            // block I/O path is sensitive to queue/bounce-buffer aliasing and
+            // cache-attribute churn when it shares pages with the generic
             // allocator.
             (VIRTIO_DMA_POOL_BASE, VIRTIO_DMA_POOL_SIZE),
         ]
