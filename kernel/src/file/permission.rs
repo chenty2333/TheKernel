@@ -1,4 +1,4 @@
-use alloc::borrow::Cow;
+use alloc::{borrow::Cow, sync::Arc};
 
 use axerrno::{AxError, AxResult};
 use axfs::FsContext;
@@ -12,8 +12,15 @@ use linux_vfs::{
     check_sticky_mutation as check_linux_sticky_mutation,
     initial_create_attributes as linux_initial_create_attributes,
 };
+use thekernel_linux_cred::{FileOpenOperation, InodePermissionAccess};
 
-use crate::task::{DacCredentialView, Kgid};
+use crate::task::{
+    Cred, DacCredentialView, Kgid, UserNamespace,
+    security::{
+        FileOpenSecurityContext, InodePermissionSecurityContext, InodeSecurityRef,
+        dispatch_file_open, dispatch_inode_permission,
+    },
+};
 
 static INITIAL_USER_NAMESPACE_DAC_DOMAIN: () = ();
 
@@ -142,6 +149,162 @@ pub(crate) fn check_dac_permissions(
     } else {
         Err(AxError::PermissionDenied)
     }
+}
+
+fn inode_permission_access(requested: u32) -> AxResult<Option<InodePermissionAccess>> {
+    if requested == 0 {
+        return Ok(None);
+    }
+    if requested & !(R_OK | W_OK | X_OK) != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let mut bits = 0;
+    if requested & R_OK != 0 {
+        bits |= InodePermissionAccess::READ.bits();
+    }
+    if requested & W_OK != 0 {
+        bits |= InodePermissionAccess::WRITE.bits();
+    }
+    if requested & X_OK != 0 {
+        bits |= InodePermissionAccess::EXECUTE.bits();
+    }
+    InodePermissionAccess::try_from_bits(bits)
+        .map(Some)
+        .ok_or(AxError::InvalidInput)
+}
+
+/// Runs Linux DAC and the frozen typed inode hook against one metadata
+/// snapshot. The outer composite actor is kept separate from the exact DAC
+/// view so real-ID access checks can eventually use the same hook contract
+/// without fabricating a replacement module-state vector.
+pub(crate) fn check_inode_permissions(
+    loc: &Location,
+    requested: u32,
+    actor: &Cred,
+    credentials: &DacCredentialView,
+    filesystem_owner_user_ns: &Arc<UserNamespace>,
+) -> AxResult {
+    let Some(access) = inode_permission_access(requested)? else {
+        return Ok(());
+    };
+    let metadata = loc.metadata()?;
+    check_inode_permissions_with_metadata(
+        loc,
+        &metadata,
+        requested,
+        access,
+        actor,
+        credentials,
+        filesystem_owner_user_ns,
+    )
+}
+
+fn check_inode_permissions_with_metadata(
+    loc: &Location,
+    metadata: &Metadata,
+    requested: u32,
+    access: InodePermissionAccess,
+    actor: &Cred,
+    credentials: &DacCredentialView,
+    filesystem_owner_user_ns: &Arc<UserNamespace>,
+) -> AxResult {
+    check_dac_permissions(
+        metadata.mode.bits() as u32,
+        metadata.uid,
+        metadata.gid,
+        metadata.node_type,
+        requested,
+        credentials,
+    )?;
+    let object = InodeSecurityRef::new(loc, &metadata);
+    dispatch_inode_permission(&InodePermissionSecurityContext::new(
+        actor,
+        credentials,
+        filesystem_owner_user_ns,
+        &object,
+        access,
+    ))
+}
+
+/// Runs the typed file-open hook for the exact pre-open location. Callers
+/// invoke this before `OpenOptions::open_loc`, so a denial cannot leave an
+/// `O_TRUNC` side effect or a visible file description behind.
+pub(crate) fn authorize_file_open(
+    loc: &Location,
+    actor: &Cred,
+    credentials: &DacCredentialView,
+    filesystem_owner_user_ns: &Arc<UserNamespace>,
+    operation: FileOpenOperation,
+) -> AxResult {
+    let metadata = loc.metadata()?;
+    let object = InodeSecurityRef::new(loc, &metadata);
+    dispatch_file_open(&FileOpenSecurityContext::new(
+        actor,
+        credentials,
+        filesystem_owner_user_ns,
+        &object,
+        operation,
+    ))
+}
+
+pub(crate) fn check_pathwalk_search_permission_with_security(
+    dir: &Location,
+    actor: &Cred,
+    credentials: &DacCredentialView,
+    filesystem_owner_user_ns: &Arc<UserNamespace>,
+) -> AxResult {
+    check_inode_permissions(dir, X_OK, actor, credentials, filesystem_owner_user_ns)
+}
+
+pub(crate) fn check_create_permissions_with_security(
+    dir: &Location,
+    actor: &Cred,
+    credentials: &DacCredentialView,
+    filesystem_owner_user_ns: &Arc<UserNamespace>,
+) -> AxResult {
+    check_writable_mount(dir)?;
+    check_inode_permissions(
+        dir,
+        W_OK | X_OK,
+        actor,
+        credentials,
+        filesystem_owner_user_ns,
+    )
+}
+
+pub(crate) fn check_open_permissions_with_security(
+    loc: &Location,
+    mask: u32,
+    actor: &Cred,
+    credentials: &DacCredentialView,
+    filesystem_owner_user_ns: &Arc<UserNamespace>,
+) -> AxResult {
+    check_inode_permissions(loc, mask, actor, credentials, filesystem_owner_user_ns)
+}
+
+pub(crate) fn check_execute_permissions_with_security(
+    loc: &Location,
+    actor: &Cred,
+    credentials: &DacCredentialView,
+    filesystem_owner_user_ns: &Arc<UserNamespace>,
+) -> AxResult {
+    if crate::mounts::is_noexec(loc)? {
+        return Err(AxError::PermissionDenied);
+    }
+
+    let metadata = loc.metadata()?;
+    if metadata.node_type != NodeType::RegularFile {
+        return Err(AxError::PermissionDenied);
+    }
+    check_inode_permissions_with_metadata(
+        loc,
+        &metadata,
+        X_OK,
+        InodePermissionAccess::EXECUTE,
+        actor,
+        credentials,
+        filesystem_owner_user_ns,
+    )
 }
 
 pub(crate) fn check_pathwalk_search_permission(
@@ -394,23 +557,6 @@ pub(crate) fn check_open_permissions(
         mask,
         credentials,
     )
-}
-
-pub(crate) fn check_execute_permissions(
-    loc: &Location,
-    credentials: &DacCredentialView,
-) -> AxResult {
-    if crate::mounts::is_noexec(loc)? {
-        return Err(AxError::PermissionDenied);
-    }
-
-    let stat = loc.metadata()?;
-    if stat.node_type != NodeType::RegularFile {
-        return Err(AxError::PermissionDenied);
-    }
-
-    let perm = stat.mode.bits() as u32 & NodePermission::all().bits() as u32;
-    check_dac_permissions(perm, stat.uid, stat.gid, stat.node_type, X_OK, credentials)
 }
 
 #[cfg(test)]

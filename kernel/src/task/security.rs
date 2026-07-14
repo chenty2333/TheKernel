@@ -13,6 +13,7 @@ use core::cell::Cell;
 use core::{any::Any, fmt, marker::PhantomData};
 
 use axerrno::{AxError, AxResult};
+use axfs_ng_vfs::{Location, Metadata, NodeType};
 use spin::Once;
 use thekernel_linux_cred::{
     AuthorizationError, authorize_signal_core as external_authorize_signal_core,
@@ -21,14 +22,14 @@ use thekernel_linux_cred::{
     commoncap_scheduler as external_commoncap_scheduler,
 };
 pub(crate) use thekernel_linux_cred::{
-    PtraceAccessKind, PtraceCredentialKind, SchedulerSecurityOperation,
-    SignalCoreAuthorizationReason, SignalDeliveryScope, SignalNumber, SignalSecurityOperation,
-    SignalSecuritySource,
+    FileOpenAccess, FileOpenOperation, InodePermissionAccess, PtraceAccessKind,
+    PtraceCredentialKind, SchedulerSecurityOperation, SignalCoreAuthorizationReason,
+    SignalDeliveryScope, SignalNumber, SignalSecurityOperation, SignalSecuritySource,
 };
 
 use super::{
     ExecCommitRuntime, ExecCredentialSecurityContext, ExecFileSecurityObject, UserNamespace,
-    creds::{Cred, PreparedCred},
+    creds::{Cred, DacCredentialView, PreparedCred},
     exec_cred::{ExecCredentialEffects, authorize_commoncap_exec},
 };
 
@@ -190,6 +191,111 @@ impl<'a> ProcessImageSecurityRef<'a> {
     }
 }
 
+/// Stable Linux-facing identity for one pinned VFS location.
+///
+/// A mount ID is retained separately from the backing device/inode pair so
+/// bind-style mount aliases cannot be collapsed accidentally by policy.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct InodeIdentity {
+    mount_id: u64,
+    device: u64,
+    inode: u64,
+}
+
+impl InodeIdentity {
+    const fn new(mount_id: u64, device: u64, inode: u64) -> Self {
+        Self {
+            mount_id,
+            device,
+            inode,
+        }
+    }
+
+    pub(crate) const fn mount_id(self) -> u64 {
+        self.mount_id
+    }
+
+    pub(crate) const fn device(self) -> u64 {
+        self.device
+    }
+
+    pub(crate) const fn inode(self) -> u64 {
+        self.inode
+    }
+}
+
+/// Frozen, lookup-free inode facts bound to one borrowed VFS location.
+///
+/// Construction projects the metadata snapshot supplied by the caller. The
+/// retained lifetime prevents a hook context from outliving the pinned
+/// `Location`, while the type deliberately exposes no location handle or VFS
+/// method through which a module could repeat lookup.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InodeSecurityRef<'location> {
+    identity: InodeIdentity,
+    mode: u16,
+    node_kind: NodeType,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    _location: PhantomData<&'location Location>,
+}
+
+impl<'location> InodeSecurityRef<'location> {
+    pub(crate) fn new(location: &'location Location, metadata: &Metadata) -> Self {
+        Self {
+            identity: InodeIdentity::new(
+                location.mountpoint().mount_id(),
+                metadata.device,
+                metadata.inode,
+            ),
+            mode: metadata.mode.bits(),
+            node_kind: metadata.node_type,
+            uid: metadata.uid,
+            gid: metadata.gid,
+            size: metadata.size,
+            _location: PhantomData,
+        }
+    }
+
+    pub(crate) const fn identity(&self) -> InodeIdentity {
+        self.identity
+    }
+
+    pub(crate) const fn mode(&self) -> u16 {
+        self.mode
+    }
+
+    pub(crate) const fn node_kind(&self) -> NodeType {
+        self.node_kind
+    }
+
+    pub(crate) const fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    pub(crate) const fn gid(&self) -> u32 {
+        self.gid
+    }
+
+    pub(crate) const fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+/// Returns the initial ancestor which owns ordinary, non-idmapped VFS objects.
+///
+/// The explicit seam can later be replaced by per-superblock or idmapped-mount
+/// ownership without teaching typed hook contexts to infer object ownership
+/// from the actor credential.
+pub(crate) fn initial_user_namespace(namespace: &Arc<UserNamespace>) -> Arc<UserNamespace> {
+    let mut initial = namespace.clone();
+    while let Some(parent) = initial.parent() {
+        initial = parent;
+    }
+    initial
+}
+
 type CorePtraceAccessContext<'a> =
     thekernel_linux_cred::PtraceAccessContext<'a, UserNamespace, ProcessImageSecurityRef<'a>>;
 type CorePtraceTracemeContext<'a> =
@@ -198,6 +304,13 @@ type CoreSchedulerSecurityContext<'a> =
     thekernel_linux_cred::SchedulerSecurityContext<'a, UserNamespace>;
 type CoreSignalSecurityContext<'a> =
     thekernel_linux_cred::SignalSecurityContext<'a, UserNamespace, SignalTargetSecurityRef<'a>>;
+type CoreInodePermissionContext<'context, 'location> = thekernel_linux_cred::InodePermissionContext<
+    'context,
+    UserNamespace,
+    InodeSecurityRef<'location>,
+>;
+type CoreFileOpenContext<'context, 'location> =
+    thekernel_linux_cred::FileOpenContext<'context, UserNamespace, InodeSecurityRef<'location>>;
 
 /// Kind of exact kernel object selected for one userspace signal request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -439,6 +552,110 @@ impl<'a> SecuritySignalContext<'a> {
     }
 }
 
+/// Kernel wrapper retaining the exact composite actor and module state around
+/// one leaf-typed inode permission context.
+pub(crate) struct InodePermissionSecurityContext<'context, 'location> {
+    actor: &'context Cred,
+    core: CoreInodePermissionContext<'context, 'location>,
+}
+
+impl<'context, 'location> InodePermissionSecurityContext<'context, 'location> {
+    pub(crate) fn new(
+        actor: &'context Cred,
+        dac_credential: &'context DacCredentialView,
+        target_owner_user_ns: &'context Arc<UserNamespace>,
+        target_object: &'context InodeSecurityRef<'location>,
+        access: InodePermissionAccess,
+    ) -> Self {
+        Self {
+            actor,
+            core: CoreInodePermissionContext::new(
+                actor.core(),
+                dac_credential,
+                target_owner_user_ns,
+                target_object,
+                access,
+            ),
+        }
+    }
+
+    fn core(&self) -> &CoreInodePermissionContext<'context, 'location> {
+        &self.core
+    }
+
+    pub(crate) const fn actor(&self) -> &'context Cred {
+        self.actor
+    }
+
+    pub(crate) const fn dac_credential(&self) -> &'context DacCredentialView {
+        self.core.dac_credential()
+    }
+
+    pub(crate) const fn target_owner_user_ns(&self) -> &'context Arc<UserNamespace> {
+        self.core.target_owner_user_ns()
+    }
+
+    pub(crate) const fn target_object(&self) -> &'context InodeSecurityRef<'location> {
+        self.core.target_object()
+    }
+
+    pub(crate) const fn access(&self) -> InodePermissionAccess {
+        self.core.access()
+    }
+}
+
+/// Kernel wrapper retaining the exact composite actor and module state around
+/// one leaf-typed file-open context.
+pub(crate) struct FileOpenSecurityContext<'context, 'location> {
+    actor: &'context Cred,
+    core: CoreFileOpenContext<'context, 'location>,
+}
+
+impl<'context, 'location> FileOpenSecurityContext<'context, 'location> {
+    pub(crate) fn new(
+        actor: &'context Cred,
+        dac_credential: &'context DacCredentialView,
+        target_owner_user_ns: &'context Arc<UserNamespace>,
+        target_object: &'context InodeSecurityRef<'location>,
+        operation: FileOpenOperation,
+    ) -> Self {
+        Self {
+            actor,
+            core: CoreFileOpenContext::new(
+                actor.core(),
+                dac_credential,
+                target_owner_user_ns,
+                target_object,
+                operation,
+            ),
+        }
+    }
+
+    fn core(&self) -> &CoreFileOpenContext<'context, 'location> {
+        &self.core
+    }
+
+    pub(crate) const fn actor(&self) -> &'context Cred {
+        self.actor
+    }
+
+    pub(crate) const fn dac_credential(&self) -> &'context DacCredentialView {
+        self.core.dac_credential()
+    }
+
+    pub(crate) const fn target_owner_user_ns(&self) -> &'context Arc<UserNamespace> {
+        self.core.target_owner_user_ns()
+    }
+
+    pub(crate) const fn target_object(&self) -> &'context InodeSecurityRef<'location> {
+        self.core.target_object()
+    }
+
+    pub(crate) const fn operation(&self) -> FileOpenOperation {
+        self.core.operation()
+    }
+}
+
 /// One already-resolved executable component checked during binary-handler
 /// discovery. The exact immutable actor credential and stable object facts are
 /// supplied by the loader; hooks cannot resample `current()` or repeat lookup.
@@ -631,6 +848,42 @@ trait SecurityModule: Send + Sync + 'static {
         drop(state);
     }
 
+    /// Authorizes one exact inode after the caller has completed Linux DAC.
+    ///
+    /// Dispatch may run inside the filesystem-context and pathwalk lock
+    /// domains. Implementations must remain allocation-free and nonblocking,
+    /// must not call `current()`, and must not reenter VFS lookup, credential
+    /// update, or security dispatch.
+    fn inode_permission(&self, _context: &InodePermissionSecurityContext<'_, '_>) -> AxResult<()> {
+        Ok(())
+    }
+
+    fn inode_permission_with_credential_state(
+        &self,
+        context: &InodePermissionSecurityContext<'_, '_>,
+        _actor_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        self.inode_permission(context)
+    }
+
+    /// Authorizes one exact, fully resolved location before the open
+    /// transaction publishes an fd, persistent executable-write reservation,
+    /// filesystem-open side effect, fanotify open permission, POSIX lease
+    /// conflict handling, or truncate. Dispatch is deny-first and stops on the
+    /// first error. Implementations must not allocate, block, call `current()`,
+    /// or reenter VFS, open, credential, or security operations.
+    fn file_open(&self, _context: &FileOpenSecurityContext<'_, '_>) -> AxResult<()> {
+        Ok(())
+    }
+
+    fn file_open_with_credential_state(
+        &self,
+        context: &FileOpenSecurityContext<'_, '_>,
+        _actor_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        self.file_open(context)
+    }
+
     fn ptrace_access(&self, _context: &PtraceAccessContext<'_>) -> AxResult<()> {
         Ok(())
     }
@@ -777,6 +1030,18 @@ trait ErasedSecurityModule: Send + Sync {
         new_state: &dyn ErasedOwnedCredentialState,
         transition: CredentialStateTransition,
     );
+    fn inode_permission(&self, context: &InodePermissionSecurityContext<'_, '_>) -> AxResult<()>;
+    fn inode_permission_with_credential_state(
+        &self,
+        context: &InodePermissionSecurityContext<'_, '_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
+    fn file_open(&self, context: &FileOpenSecurityContext<'_, '_>) -> AxResult<()>;
+    fn file_open_with_credential_state(
+        &self,
+        context: &FileOpenSecurityContext<'_, '_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
     fn ptrace_access(&self, context: &PtraceAccessContext<'_>) -> AxResult<()>;
     fn ptrace_access_with_credential_state(
         &self,
@@ -980,6 +1245,38 @@ impl<M: SecurityModule> ErasedSecurityModule for M {
                 transition,
             },
         );
+    }
+
+    fn inode_permission(&self, context: &InodePermissionSecurityContext<'_, '_>) -> AxResult<()> {
+        SecurityModule::inode_permission(self, context)
+    }
+
+    fn inode_permission_with_credential_state(
+        &self,
+        context: &InodePermissionSecurityContext<'_, '_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::inode_permission_with_credential_state(
+            self,
+            context,
+            owned_credential_state(self, actor_state)?,
+        )
+    }
+
+    fn file_open(&self, context: &FileOpenSecurityContext<'_, '_>) -> AxResult<()> {
+        SecurityModule::file_open(self, context)
+    }
+
+    fn file_open_with_credential_state(
+        &self,
+        context: &FileOpenSecurityContext<'_, '_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::file_open_with_credential_state(
+            self,
+            context,
+            owned_credential_state(self, actor_state)?,
+        )
     }
 
     fn ptrace_access(&self, context: &PtraceAccessContext<'_>) -> AxResult<()> {
@@ -1796,6 +2093,57 @@ impl SecurityRegistry {
         Ok(candidate)
     }
 
+    fn dispatch_inode_permission(
+        &self,
+        context: &InodePermissionSecurityContext<'_, '_>,
+    ) -> AxResult<()> {
+        for (index, registered) in self.modules.iter().enumerate() {
+            debug_assert_eq!(usize::from(registered.id.0), index);
+            registered.module.inode_permission(context)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_inode_permission_with_credential_state(
+        &self,
+        context: &InodePermissionSecurityContext<'_, '_>,
+    ) -> AxResult<()> {
+        let actor = self.credential_slots(context.actor())?;
+        for (registered, actor_state) in self.modules.iter().zip(actor) {
+            if registered.id != actor_state.module_id {
+                return Err(AxError::OperationNotPermitted);
+            }
+            registered
+                .module
+                .inode_permission_with_credential_state(context, actor_state.erased.as_ref())?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_file_open(&self, context: &FileOpenSecurityContext<'_, '_>) -> AxResult<()> {
+        for (index, registered) in self.modules.iter().enumerate() {
+            debug_assert_eq!(usize::from(registered.id.0), index);
+            registered.module.file_open(context)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_file_open_with_credential_state(
+        &self,
+        context: &FileOpenSecurityContext<'_, '_>,
+    ) -> AxResult<()> {
+        let actor = self.credential_slots(context.actor())?;
+        for (registered, actor_state) in self.modules.iter().zip(actor) {
+            if registered.id != actor_state.module_id {
+                return Err(AxError::OperationNotPermitted);
+            }
+            registered
+                .module
+                .file_open_with_credential_state(context, actor_state.erased.as_ref())?;
+        }
+        Ok(())
+    }
+
     fn dispatch_ptrace_access(&self, context: &PtraceAccessContext<'_>) -> AxResult<()> {
         for (index, registered) in self.modules.iter().enumerate() {
             debug_assert_eq!(usize::from(registered.id.0), index);
@@ -2090,6 +2438,44 @@ fn require_published_registry(registry: Option<&SecurityRegistry>) -> AxResult<&
     registry.ok_or(AxError::OperationNotPermitted)
 }
 
+/// Runs typed inode-permission hooks after the caller has completed DAC
+/// admission over the exact frozen object. The first denial is returned
+/// immediately.
+///
+/// The current call-site contract is the open/pathwalk vertical slice, not a
+/// claim that every VFS permission path has already migrated. Dispatch may be
+/// inside filesystem-context/pathwalk lock domains, so hooks are
+/// allocation-free, nonblocking, and forbidden from VFS/current/credential
+/// reentry.
+pub(crate) fn dispatch_inode_permission(
+    context: &InodePermissionSecurityContext<'_, '_>,
+) -> AxResult<()> {
+    context
+        .actor()
+        .security()
+        .registry()
+        .registry()
+        .dispatch_inode_permission_with_credential_state(context)
+}
+
+/// Runs typed file-open hooks for one already-resolved, still-unpublished open
+/// transaction. The first denial is returned immediately.
+///
+/// This entry point serves the current open vertical slice rather than every
+/// possible kernel-internal file construction. Callers invoke it before fd,
+/// persistent executable-write reservation, fanotify open permission, POSIX
+/// lease conflict handling, filesystem-open, or truncate side effects become
+/// visible. Hooks are allocation-free, nonblocking, and forbidden from
+/// VFS/current/credential or nested open reentry.
+pub(crate) fn dispatch_file_open(context: &FileOpenSecurityContext<'_, '_>) -> AxResult<()> {
+    context
+        .actor()
+        .security()
+        .registry()
+        .registry()
+        .dispatch_file_open_with_credential_state(context)
+}
+
 /// Runs the frozen ptrace access hooks in declaration order.
 /// The first denial is returned immediately.
 pub(crate) fn dispatch_ptrace_access(context: &PtraceAccessContext<'_>) -> AxResult<()> {
@@ -2172,13 +2558,17 @@ mod tests {
         thread,
     };
 
+    use axfs_ng_vfs::{Mountpoint, NodePermission};
     use linux_raw_sys::general::{CAP_CHOWN, CAP_SYS_NICE, CAP_SYS_PTRACE};
 
     use super::*;
-    use crate::task::{
-        CapabilityState, Cred, CredentialSlot, Credentials, ExecCommitRuntime, ExecFileIdentity,
-        ExecImageIdentity, Kgid, Kuid,
-        creds::{CAPABILITY_WORDS, credential_publication_lock_held},
+    use crate::{
+        pseudofs::tmp::MemoryFs,
+        task::{
+            CapabilityState, Cred, CredentialSlot, Credentials, ExecCommitRuntime,
+            ExecFileIdentity, ExecImageIdentity, Kgid, Kuid,
+            creds::{CAPABILITY_WORDS, credential_publication_lock_held},
+        },
     };
 
     static ORDER_HOOK_TRACE: AtomicU32 = AtomicU32::new(0);
@@ -2186,6 +2576,8 @@ mod tests {
     static TRACEME_DIRECTION: AtomicU32 = AtomicU32::new(0);
     static TRACEME_DENY_HOOK_TRACE: AtomicU32 = AtomicU32::new(0);
     static EXEC_DENY_HOOK_TRACE: AtomicU32 = AtomicU32::new(0);
+    static INODE_HOOK_TRACE: AtomicU32 = AtomicU32::new(0);
+    static FILE_OPEN_HOOK_TRACE: AtomicU32 = AtomicU32::new(0);
     static SCHEDULER_DENY_HOOK_TRACE: AtomicU32 = AtomicU32::new(0);
     static SIGNAL_DENY_HOOK_TRACE: AtomicU32 = AtomicU32::new(0);
     static WHOLE_MODULE_HOOK_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -2202,6 +2594,8 @@ mod tests {
     static CRED_STATE_DROP_AT_COMMIT: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_DROP_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_DISPATCH_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_INODE_PERMISSION_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_FILE_OPEN_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_EXEC_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_EXECUTABLE_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_EXECUTABLE_ROLE_TRACE: AtomicU32 = AtomicU32::new(0);
@@ -2240,6 +2634,8 @@ mod tests {
             &CRED_STATE_DROP_AT_COMMIT,
             &CRED_STATE_DROP_TRACE,
             &CRED_STATE_DISPATCH_TRACE,
+            &CRED_STATE_INODE_PERMISSION_TRACE,
+            &CRED_STATE_FILE_OPEN_TRACE,
             &CRED_STATE_EXEC_TRACE,
             &CRED_STATE_EXECUTABLE_TRACE,
             &CRED_STATE_EXECUTABLE_ROLE_TRACE,
@@ -2256,6 +2652,31 @@ mod tests {
             trace.store(0, Ordering::SeqCst);
         }
         guard
+    }
+
+    fn security_test_inode() -> Location {
+        let filesystem =
+            MemoryFs::new_with_permission(NodePermission::from_bits_truncate(0o755)).unwrap();
+        let mount = Mountpoint::new_root(&filesystem);
+        crate::mounts::initialize_test_mount(&mount, 0).unwrap();
+        mount
+            .root_location()
+            .create(
+                "security-hook",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o640),
+            )
+            .unwrap()
+    }
+
+    fn security_test_dac(uid: u32, gid: u32) -> DacCredentialView {
+        DacCredentialView::new(
+            Kuid::from_raw(uid).unwrap(),
+            Kgid::from_raw(gid).unwrap(),
+            thekernel_linux_cred::GroupInfo::try_new(Vec::new()).unwrap(),
+            [0; CAPABILITY_WORDS],
+            true,
+        )
     }
 
     struct ProbeCredentialState {
@@ -2373,6 +2794,56 @@ mod tests {
                 CredentialStateTransition::Exec => 1 << 3,
             };
             CRED_STATE_COMMIT_TRANSITION_MASK.fetch_or(transition_bit, Ordering::SeqCst);
+        }
+
+        fn inode_permission_with_credential_state(
+            &self,
+            context: &InodePermissionSecurityContext<'_, '_>,
+            actor_state: &Self::CredentialState,
+        ) -> AxResult<()> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(actor_state.key, key);
+            assert!(actor_state.committed.load(Ordering::SeqCst));
+            assert!(core::ptr::eq(
+                context.core().actor(),
+                context.actor().core()
+            ));
+            assert!(core::ptr::eq(
+                context.core().dac_credential(),
+                context.dac_credential()
+            ));
+            assert!(core::ptr::eq(
+                context.core().target_object(),
+                context.target_object()
+            ));
+            append_trace(&CRED_STATE_INODE_PERMISSION_TRACE, key);
+            CRED_STATE_HOOK_MASK.fetch_or(1 << 6, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn file_open_with_credential_state(
+            &self,
+            context: &FileOpenSecurityContext<'_, '_>,
+            actor_state: &Self::CredentialState,
+        ) -> AxResult<()> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(actor_state.key, key);
+            assert!(actor_state.committed.load(Ordering::SeqCst));
+            assert!(core::ptr::eq(
+                context.core().actor(),
+                context.actor().core()
+            ));
+            assert!(core::ptr::eq(
+                context.core().dac_credential(),
+                context.dac_credential()
+            ));
+            assert!(core::ptr::eq(
+                context.core().target_object(),
+                context.target_object()
+            ));
+            append_trace(&CRED_STATE_FILE_OPEN_TRACE, key);
+            CRED_STATE_HOOK_MASK.fetch_or(1 << 7, Ordering::SeqCst);
+            Ok(())
         }
 
         fn ptrace_access_with_credential_state(
@@ -2556,6 +3027,11 @@ mod tests {
         }
     }
 
+    type TestInodePermissionHook = for<'context, 'location> fn(
+        &InodePermissionSecurityContext<'context, 'location>,
+    ) -> AxResult<()>;
+    type TestFileOpenHook =
+        for<'context, 'location> fn(&FileOpenSecurityContext<'context, 'location>) -> AxResult<()>;
     type TestPtraceAccessHook = for<'a> fn(&PtraceAccessContext<'a>) -> AxResult<()>;
     type TestPtraceTracemeHook = for<'a> fn(&PtraceTracemeContext<'a>) -> AxResult<()>;
     type TestExecCredentialHook = for<'a> fn(&ExecCredentialSecurityContext<'a>) -> AxResult<()>;
@@ -2563,6 +3039,8 @@ mod tests {
     type TestSignalHook = for<'a> fn(&SecuritySignalContext<'a>) -> AxResult<()>;
 
     struct TestSecurityModule<const KEY: u64> {
+        inode_permission: Option<TestInodePermissionHook>,
+        file_open: Option<TestFileOpenHook>,
         ptrace_access: Option<TestPtraceAccessHook>,
         ptrace_traceme: Option<TestPtraceTracemeHook>,
         exec_credential: Option<TestExecCredentialHook>,
@@ -2573,6 +3051,8 @@ mod tests {
     impl<const KEY: u64> TestSecurityModule<KEY> {
         const fn empty() -> Self {
             Self {
+                inode_permission: None,
+                file_open: None,
                 ptrace_access: None,
                 ptrace_traceme: None,
                 exec_credential: None,
@@ -2602,6 +3082,17 @@ mod tests {
             _transition: CredentialStateTransition,
         ) -> AxResult<Self::CredentialState> {
             Ok(())
+        }
+
+        fn inode_permission(
+            &self,
+            context: &InodePermissionSecurityContext<'_, '_>,
+        ) -> AxResult<()> {
+            self.inode_permission.map_or(Ok(()), |hook| hook(context))
+        }
+
+        fn file_open(&self, context: &FileOpenSecurityContext<'_, '_>) -> AxResult<()> {
+            self.file_open.map_or(Ok(()), |hook| hook(context))
         }
 
         fn ptrace_access(&self, context: &PtraceAccessContext<'_>) -> AxResult<()> {
@@ -2674,6 +3165,19 @@ mod tests {
             Ok(())
         }
 
+        fn inode_permission(
+            &self,
+            _context: &InodePermissionSecurityContext<'_, '_>,
+        ) -> AxResult<()> {
+            WHOLE_MODULE_HOOK_TRACE.fetch_add(1 << 48, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn file_open(&self, _context: &FileOpenSecurityContext<'_, '_>) -> AxResult<()> {
+            WHOLE_MODULE_HOOK_TRACE.fetch_add(1 << 56, Ordering::SeqCst);
+            Ok(())
+        }
+
         fn ptrace_access(&self, _context: &PtraceAccessContext<'_>) -> AxResult<()> {
             WHOLE_MODULE_HOOK_TRACE.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -2726,6 +3230,19 @@ mod tests {
             _proposed_credential: &CoreCred,
             _transition: CredentialStateTransition,
         ) -> AxResult<Self::CredentialState> {
+            Ok(())
+        }
+
+        fn inode_permission(
+            &self,
+            _context: &InodePermissionSecurityContext<'_, '_>,
+        ) -> AxResult<()> {
+            WHOLE_MODULE_HOOK_TRACE.fetch_add(1 << 48, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn file_open(&self, _context: &FileOpenSecurityContext<'_, '_>) -> AxResult<()> {
+            WHOLE_MODULE_HOOK_TRACE.fetch_add(1 << 56, Ordering::SeqCst);
             Ok(())
         }
 
@@ -2845,6 +3362,25 @@ mod tests {
         let namespace = UserNamespace::try_new_root().unwrap();
         let root = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
         let dispatch = registry.registry();
+        let inode_location = security_test_inode();
+        let inode_metadata = inode_location.metadata().unwrap();
+        let inode_object = InodeSecurityRef::new(&inode_location, &inode_metadata);
+        let dac_credential = root.fs_dac_credentials();
+        let owner_user_ns = initial_user_namespace(root.user_ns());
+        let inode_permission = InodePermissionSecurityContext::new(
+            &root,
+            &dac_credential,
+            &owner_user_ns,
+            &inode_object,
+            InodePermissionAccess::READ,
+        );
+        let file_open = FileOpenSecurityContext::new(
+            &root,
+            &dac_credential,
+            &owner_user_ns,
+            &inode_object,
+            FileOpenOperation::new(FileOpenAccess::Read, false, false, false, false).unwrap(),
+        );
         let image = Arc::new(());
         let image_ref = ProcessImageSecurityRef::new(&namespace, &image);
         let access = PtraceAccessContext::new(
@@ -2875,6 +3411,10 @@ mod tests {
         )
         .unwrap();
 
+        dispatch
+            .dispatch_inode_permission(&inode_permission)
+            .unwrap();
+        dispatch.dispatch_file_open(&file_open).unwrap();
         dispatch.dispatch_ptrace_access(&access).unwrap();
         dispatch.dispatch_ptrace_traceme(&traceme).unwrap();
         dispatch.dispatch_exec_credential(&exec).unwrap();
@@ -2953,6 +3493,48 @@ mod tests {
             PtraceAccessKind::Attach,
             credential_kind,
         )
+    }
+
+    fn ordered_inode_first(context: &InodePermissionSecurityContext<'_, '_>) -> AxResult<()> {
+        assert_eq!(context.access(), InodePermissionAccess::READ);
+        assert_eq!(INODE_HOOK_TRACE.swap(1, Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    fn ordered_inode_second(_context: &InodePermissionSecurityContext<'_, '_>) -> AxResult<()> {
+        assert_eq!(INODE_HOOK_TRACE.swap(2, Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    fn deny_inode_first(_context: &InodePermissionSecurityContext<'_, '_>) -> AxResult<()> {
+        INODE_HOOK_TRACE.store(3, Ordering::SeqCst);
+        Err(AxError::PermissionDenied)
+    }
+
+    fn inode_must_not_run(_context: &InodePermissionSecurityContext<'_, '_>) -> AxResult<()> {
+        INODE_HOOK_TRACE.store(4, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn ordered_file_open_first(context: &FileOpenSecurityContext<'_, '_>) -> AxResult<()> {
+        assert_eq!(context.operation().access(), FileOpenAccess::Read);
+        assert_eq!(FILE_OPEN_HOOK_TRACE.swap(1, Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    fn ordered_file_open_second(_context: &FileOpenSecurityContext<'_, '_>) -> AxResult<()> {
+        assert_eq!(FILE_OPEN_HOOK_TRACE.swap(2, Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    fn deny_file_open_first(_context: &FileOpenSecurityContext<'_, '_>) -> AxResult<()> {
+        FILE_OPEN_HOOK_TRACE.store(3, Ordering::SeqCst);
+        Err(AxError::PermissionDenied)
+    }
+
+    fn file_open_must_not_run(_context: &FileOpenSecurityContext<'_, '_>) -> AxResult<()> {
+        FILE_OPEN_HOOK_TRACE.store(4, Ordering::SeqCst);
+        Ok(())
     }
 
     fn ordered_first(context: &PtraceAccessContext<'_>) -> AxResult<()> {
@@ -3297,6 +3879,71 @@ mod tests {
     }
 
     #[test]
+    fn inode_and_file_contexts_bind_exact_actor_dac_owner_and_frozen_object() {
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let child_namespace = namespace
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, true)
+            .unwrap();
+        let credential = Cred::try_root(namespace.clone()).unwrap();
+        let location = security_test_inode();
+        let mut metadata = location.metadata().unwrap();
+        metadata.mode = NodePermission::from_bits_truncate(0o6754);
+        metadata.uid = 1001;
+        metadata.gid = 1002;
+        metadata.size = 0x1234_5678;
+        let expected_device = metadata.device;
+        let expected_inode = metadata.inode;
+        let expected_mount_id = location.mountpoint().mount_id();
+        let object = InodeSecurityRef::new(&location, &metadata);
+        metadata.mode = NodePermission::empty();
+        metadata.uid = 0;
+        metadata.gid = 0;
+        metadata.size = 0;
+
+        let dac_credential = security_test_dac(2001, 2002);
+        let owner_user_ns = initial_user_namespace(&child_namespace);
+        assert!(Arc::ptr_eq(&owner_user_ns, &namespace));
+        let inode = InodePermissionSecurityContext::new(
+            &credential,
+            &dac_credential,
+            &owner_user_ns,
+            &object,
+            InodePermissionAccess::READ | InodePermissionAccess::EXECUTE,
+        );
+        assert!(core::ptr::eq(inode.actor(), credential.as_ref()));
+        assert!(core::ptr::eq(inode.dac_credential(), &dac_credential));
+        assert!(Arc::ptr_eq(inode.target_owner_user_ns(), &namespace));
+        assert!(core::ptr::eq(inode.target_object(), &object));
+        assert!(core::ptr::eq(inode.core().actor(), credential.core()));
+        assert_eq!(inode.core().access(), inode.access());
+        assert_eq!(object.identity().mount_id(), expected_mount_id);
+        assert_eq!(object.identity().device(), expected_device);
+        assert_eq!(object.identity().inode(), expected_inode);
+        assert_eq!(object.mode(), 0o6754);
+        assert_eq!(object.node_kind(), NodeType::RegularFile);
+        assert_eq!(object.uid(), 1001);
+        assert_eq!(object.gid(), 1002);
+        assert_eq!(object.size(), 0x1234_5678);
+
+        let operation =
+            FileOpenOperation::new(FileOpenAccess::ReadWrite, true, true, true, false).unwrap();
+        let open = FileOpenSecurityContext::new(
+            &credential,
+            &dac_credential,
+            &owner_user_ns,
+            &object,
+            operation,
+        );
+        assert!(core::ptr::eq(open.actor(), credential.as_ref()));
+        assert!(core::ptr::eq(open.dac_credential(), &dac_credential));
+        assert!(Arc::ptr_eq(open.target_owner_user_ns(), &namespace));
+        assert!(core::ptr::eq(open.target_object(), &object));
+        assert!(core::ptr::eq(open.core().actor(), credential.core()));
+        assert_eq!(open.core().operation(), open.operation());
+        assert_eq!(open.operation(), operation);
+    }
+
+    #[test]
     fn whole_module_registration_is_atomic_across_every_hook_family() {
         let mut builder = test_registry_builder();
         builder.try_register::<WholeHookModule>().unwrap();
@@ -3306,7 +3953,7 @@ mod tests {
         dispatch_all_hook_families(registry);
         assert_eq!(
             WHOLE_MODULE_HOOK_TRACE.load(Ordering::SeqCst),
-            0x01_0101_0101_01
+            0x0101_0101_0101_0101
         );
 
         let mut builder = test_registry_builder();
@@ -3319,6 +3966,83 @@ mod tests {
         WHOLE_MODULE_HOOK_TRACE.store(0, Ordering::SeqCst);
         dispatch_all_hook_families(registry);
         assert_eq!(WHOLE_MODULE_HOOK_TRACE.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn inode_and_file_hook_stacks_order_and_short_circuit_denials() {
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let credential = Cred::try_root(namespace.clone()).unwrap();
+        let location = security_test_inode();
+        let metadata = location.metadata().unwrap();
+        let object = InodeSecurityRef::new(&location, &metadata);
+        let dac_credential = credential.fs_dac_credentials();
+        let owner_user_ns = initial_user_namespace(&namespace);
+        let inode = InodePermissionSecurityContext::new(
+            &credential,
+            &dac_credential,
+            &owner_user_ns,
+            &object,
+            InodePermissionAccess::READ,
+        );
+        let open = FileOpenSecurityContext::new(
+            &credential,
+            &dac_credential,
+            &owner_user_ns,
+            &object,
+            FileOpenOperation::new(FileOpenAccess::Read, false, false, false, false).unwrap(),
+        );
+
+        let mut builder = test_registry_builder();
+        builder
+            .try_register_initialized(TestSecurityModule::<1> {
+                inode_permission: Some(ordered_inode_first),
+                file_open: Some(ordered_file_open_first),
+                ..TestSecurityModule::empty()
+            })
+            .unwrap();
+        builder
+            .try_register_initialized(TestSecurityModule::<2> {
+                inode_permission: Some(ordered_inode_second),
+                file_open: Some(ordered_file_open_second),
+                ..TestSecurityModule::empty()
+            })
+            .unwrap();
+        let registry = builder.freeze();
+        INODE_HOOK_TRACE.store(0, Ordering::SeqCst);
+        FILE_OPEN_HOOK_TRACE.store(0, Ordering::SeqCst);
+        registry.dispatch_inode_permission(&inode).unwrap();
+        registry.dispatch_file_open(&open).unwrap();
+        assert_eq!(INODE_HOOK_TRACE.load(Ordering::SeqCst), 2);
+        assert_eq!(FILE_OPEN_HOOK_TRACE.load(Ordering::SeqCst), 2);
+
+        let mut builder = test_registry_builder();
+        builder
+            .try_register_initialized(TestSecurityModule::<1> {
+                inode_permission: Some(deny_inode_first),
+                file_open: Some(deny_file_open_first),
+                ..TestSecurityModule::empty()
+            })
+            .unwrap();
+        builder
+            .try_register_initialized(TestSecurityModule::<2> {
+                inode_permission: Some(inode_must_not_run),
+                file_open: Some(file_open_must_not_run),
+                ..TestSecurityModule::empty()
+            })
+            .unwrap();
+        let registry = builder.freeze();
+        INODE_HOOK_TRACE.store(0, Ordering::SeqCst);
+        FILE_OPEN_HOOK_TRACE.store(0, Ordering::SeqCst);
+        assert_eq!(
+            registry.dispatch_inode_permission(&inode),
+            Err(AxError::PermissionDenied)
+        );
+        assert_eq!(
+            registry.dispatch_file_open(&open),
+            Err(AxError::PermissionDenied)
+        );
+        assert_eq!(INODE_HOOK_TRACE.load(Ordering::SeqCst), 3);
+        assert_eq!(FILE_OPEN_HOOK_TRACE.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -3985,6 +4709,25 @@ mod tests {
         let registry = probe_registry();
         let namespace = UserNamespace::try_new_root().unwrap();
         let credential = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
+        let inode_location = security_test_inode();
+        let inode_metadata = inode_location.metadata().unwrap();
+        let inode_object = InodeSecurityRef::new(&inode_location, &inode_metadata);
+        let dac_credential = credential.fs_dac_credentials();
+        let owner_user_ns = initial_user_namespace(&namespace);
+        let inode_permission = InodePermissionSecurityContext::new(
+            &credential,
+            &dac_credential,
+            &owner_user_ns,
+            &inode_object,
+            InodePermissionAccess::READ,
+        );
+        let file_open = FileOpenSecurityContext::new(
+            &credential,
+            &dac_credential,
+            &owner_user_ns,
+            &inode_object,
+            FileOpenOperation::new(FileOpenAccess::Read, false, false, false, false).unwrap(),
+        );
         let image = Arc::new(());
         let image_ref = ProcessImageSecurityRef::new(&namespace, &image);
         let context = PtraceAccessContext::new(
@@ -4029,6 +4772,8 @@ mod tests {
         CRED_STATE_DISPATCH_TRACE.store(0, Ordering::SeqCst);
         CRED_STATE_HOOK_MASK.store(0, Ordering::SeqCst);
 
+        dispatch_inode_permission(&inode_permission).unwrap();
+        dispatch_file_open(&file_open).unwrap();
         dispatch_ptrace_access(&context).unwrap();
         dispatch_ptrace_traceme(&traceme).unwrap();
         dispatch_scheduler(&scheduler).unwrap();
@@ -4036,8 +4781,10 @@ mod tests {
         dispatch_exec_executable(&executable).unwrap();
         dispatch_signal(&signal).unwrap();
         assert_eq!(CRED_STATE_DISPATCH_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(CRED_STATE_INODE_PERMISSION_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(CRED_STATE_FILE_OPEN_TRACE.load(Ordering::SeqCst), 23);
         assert_eq!(CRED_STATE_EXECUTABLE_TRACE.load(Ordering::SeqCst), 23);
-        assert_eq!(CRED_STATE_HOOK_MASK.load(Ordering::SeqCst), 0b11_1111);
+        assert_eq!(CRED_STATE_HOOK_MASK.load(Ordering::SeqCst), 0xff);
     }
 
     #[test]
@@ -4325,6 +5072,60 @@ mod tests {
             dispatch_signal(&wrong_runtime_signal),
             Err(AxError::OperationNotPermitted)
         );
+        assert_eq!(CRED_STATE_HOOK_MASK.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn inode_and_file_dispatch_fail_closed_on_wrong_actor_state() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
+        let mut malformed_security = registry.try_init_credential_state(actor.core()).unwrap();
+        malformed_security.slots[1].erased = try_own_credential_state(
+            Arc::new(CredentialStateProbeModule::<3>),
+            ProbeCredentialState {
+                key: 3,
+                generation: 0,
+                committed: AtomicBool::new(true),
+            },
+        )
+        .unwrap();
+        let malformed =
+            Cred::try_from_prepared_parts(actor.core_arc().clone(), malformed_security).unwrap();
+        let location = security_test_inode();
+        let metadata = location.metadata().unwrap();
+        let object = InodeSecurityRef::new(&location, &metadata);
+        let dac_credential = malformed.fs_dac_credentials();
+        let owner_user_ns = initial_user_namespace(&namespace);
+        let inode = InodePermissionSecurityContext::new(
+            &malformed,
+            &dac_credential,
+            &owner_user_ns,
+            &object,
+            InodePermissionAccess::WRITE,
+        );
+        let open = FileOpenSecurityContext::new(
+            &malformed,
+            &dac_credential,
+            &owner_user_ns,
+            &object,
+            FileOpenOperation::new(FileOpenAccess::Write, false, false, false, false).unwrap(),
+        );
+        CRED_STATE_INODE_PERMISSION_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_FILE_OPEN_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_HOOK_MASK.store(0, Ordering::SeqCst);
+
+        assert_eq!(
+            dispatch_inode_permission(&inode),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(
+            dispatch_file_open(&open),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_INODE_PERMISSION_TRACE.load(Ordering::SeqCst), 0);
+        assert_eq!(CRED_STATE_FILE_OPEN_TRACE.load(Ordering::SeqCst), 0);
         assert_eq!(CRED_STATE_HOOK_MASK.load(Ordering::SeqCst), 0);
     }
 

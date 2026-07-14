@@ -26,7 +26,10 @@ use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
     file::{
         executable::CredentialReadLease,
-        permission::{DacFsContextExt, check_execute_permissions, check_open_permissions},
+        permission::{
+            check_execute_permissions_with_security, check_open_permissions_with_security,
+            check_pathwalk_search_permission_with_security,
+        },
     },
     mm::aspace::{AddrSpace, Backend},
     task::{
@@ -69,7 +72,19 @@ impl ExecAccess<'_> {
         let fs = FS_CONTEXT.lock();
         match self {
             Self::TrustedBoot => fs.resolve(path),
-            Self::User { credentials, .. } => fs.resolve_dac(path, credentials),
+            Self::User {
+                credentials,
+                actor,
+                filesystem_owner_user_ns,
+                ..
+            } => fs.resolve_with_admission(path, &mut |directory| {
+                check_pathwalk_search_permission_with_security(
+                    directory,
+                    actor,
+                    credentials,
+                    filesystem_owner_user_ns,
+                )
+            }),
         }
     }
 
@@ -89,8 +104,19 @@ impl ExecAccess<'_> {
                 component_observer,
                 ..
             } => {
-                check_execute_permissions(loc, credentials)?;
-                let readable = match check_open_permissions(loc, R_OK, credentials) {
+                check_execute_permissions_with_security(
+                    loc,
+                    actor,
+                    credentials,
+                    filesystem_owner_user_ns,
+                )?;
+                let readable = match check_open_permissions_with_security(
+                    loc,
+                    R_OK,
+                    actor,
+                    credentials,
+                    filesystem_owner_user_ns,
+                ) {
                     Ok(()) => true,
                     Err(AxError::PermissionDenied) => {
                         all_readable.set(false);
