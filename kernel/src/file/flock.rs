@@ -45,16 +45,65 @@ pub enum RecordLockOwner {
     Ofd(u64),
 }
 
-#[derive(Clone, Copy)]
+/// Record-lock identities which one fd-backed I/O operation owns at the same
+/// time. POSIX locks are process-owned while OFD locks follow the exact open
+/// file description, so mandatory access must exempt both in one table scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MandatoryOwners {
+    posix: RecordLockOwner,
+    ofd: RecordLockOwner,
+}
+
+impl MandatoryOwners {
+    pub const fn new(pid: Pid, ofd: u64) -> Self {
+        Self {
+            posix: RecordLockOwner::Posix(pid),
+            ofd: RecordLockOwner::Ofd(ofd),
+        }
+    }
+
+    fn contains(self, owner: RecordLockOwner) -> bool {
+        owner == self.posix || owner == self.ofd
+    }
+}
+
+/// Access type used by Linux mandatory record-lock admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MandatoryAccess {
+    Read,
+    Write,
+}
+
+impl MandatoryAccess {
+    const fn lock_type(self) -> i16 {
+        match self {
+            Self::Read => F_RDLCK as i16,
+            Self::Write => F_WRLCK as i16,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RecordRange {
     start: u64,
     end: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RecordLockRequest {
     ty: i16,
     range: RecordRange,
+}
+
+/// A stable conflict description which can be rechecked after callers have
+/// released their position, pipe, socket, and ordered transfer-attempt locks.
+/// Its fields remain private so a waiter can only originate from a real table
+/// query performed by [`mandatory_access_conflict`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MandatoryLockWait {
+    id: InodeId,
+    owners: MandatoryOwners,
+    req: RecordLockRequest,
 }
 
 #[derive(Clone, Copy)]
@@ -161,6 +210,31 @@ fn record_lock_has_conflict(
         .into_iter()
         .flat_map(|locks| locks.iter())
         .any(|lock| record_lock_conflicts(lock, owner, req))
+}
+
+fn mandatory_record_lock_conflicts(
+    lock: &RecordLock,
+    owners: MandatoryOwners,
+    req: RecordLockRequest,
+) -> bool {
+    if owners.contains(lock.owner) || !lock.range.overlaps(req.range) {
+        return false;
+    }
+    lock.ty == F_WRLCK as i16 || req.ty == F_WRLCK as i16
+}
+
+fn mandatory_lock_has_conflict(
+    table: &RecordLockTableInner,
+    id: InodeId,
+    owners: MandatoryOwners,
+    req: RecordLockRequest,
+) -> bool {
+    table
+        .locks
+        .get(&id)
+        .into_iter()
+        .flat_map(|locks| locks.iter())
+        .any(|lock| mandatory_record_lock_conflicts(lock, owners, req))
 }
 
 fn record_lock_would_deadlock(
@@ -484,6 +558,79 @@ pub fn get_record_lock(
         lock.l_type = F_UNLCK as _;
     }
     Ok(())
+}
+
+/// Checks one non-empty fd-backed I/O range for mandatory lock conflicts.
+///
+/// The range is half-open (`start..start + len`), unlike `struct flock` where
+/// a zero length means through EOF. Consequently zero-length I/O is admitted
+/// without consulting the lock table. A conflict returns a typed token which
+/// can be passed to [`wait_for_mandatory_access`] only after higher-level I/O
+/// transaction locks have been released.
+pub fn mandatory_access_conflict(
+    id: InodeId,
+    owners: MandatoryOwners,
+    access: MandatoryAccess,
+    start: u64,
+    len: u64,
+) -> AxResult<Option<MandatoryLockWait>> {
+    if len == 0 {
+        return Ok(None);
+    }
+    start.checked_add(len).ok_or(AxError::InvalidInput)?;
+    let table = RECORD_LOCK_TABLE.lock();
+    mandatory_access_conflict_in(&table, id, owners, access, start, len)
+}
+
+fn mandatory_access_conflict_in(
+    table: &RecordLockTableInner,
+    id: InodeId,
+    owners: MandatoryOwners,
+    access: MandatoryAccess,
+    start: u64,
+    len: u64,
+) -> AxResult<Option<MandatoryLockWait>> {
+    if len == 0 {
+        return Ok(None);
+    }
+    let end = start.checked_add(len).ok_or(AxError::InvalidInput)?;
+    let req = RecordLockRequest {
+        ty: access.lock_type(),
+        range: RecordRange { start, end },
+    };
+    Ok(
+        mandatory_lock_has_conflict(table, id, owners, req).then_some(MandatoryLockWait {
+            id,
+            owners,
+            req,
+        }),
+    )
+}
+
+fn recheck_mandatory_access(wait: MandatoryLockWait) -> AxResult<()> {
+    let table = RECORD_LOCK_TABLE.lock();
+    recheck_mandatory_access_in(&table, wait)
+}
+
+fn recheck_mandatory_access_in(
+    table: &RecordLockTableInner,
+    wait: MandatoryLockWait,
+) -> AxResult<()> {
+    if mandatory_lock_has_conflict(table, wait.id, wait.owners, wait.req) {
+        Err(AxError::WouldBlock)
+    } else {
+        Ok(())
+    }
+}
+
+/// Interruptibly waits until the conflict represented by `wait` is gone.
+///
+/// `block_on_poll_set` supplies the check-arm-check protocol, so an unlock
+/// between the original query and waiter registration cannot be lost. This
+/// access waiter deliberately does not enter `wait_requests`; that graph is
+/// reserved for record-lock acquisition and POSIX deadlock detection.
+pub fn wait_for_mandatory_access(wait: MandatoryLockWait) -> AxResult<()> {
+    block_on_poll_set(&RECORD_LOCK_WAITERS, || recheck_mandatory_access(wait))
 }
 
 pub fn mandatory_write_lock_conflicts(
@@ -934,16 +1081,197 @@ pub fn do_flock(id: InodeId, owner: FlockOwner, operation: i32) -> AxResult<()> 
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::*;
 
-    fn whole_file_write_lock() -> flock64 {
+    fn test_record_lock(owner: RecordLockOwner, ty: u32, start: u64, end: u64) -> RecordLock {
+        RecordLock {
+            owner,
+            ty: ty as _,
+            range: RecordRange { start, end },
+        }
+    }
+
+    fn test_record_table(id: InodeId, locks: Vec<RecordLock>) -> RecordLockTableInner {
+        let record_count = locks.len();
+        let mut table = RecordLockTableInner {
+            locks: HashMap::new(),
+            owners: HashMap::new(),
+            wait_requests: HashMap::new(),
+            record_count,
+        };
+        assert!(table.locks.insert(id, locks).is_none());
+        table
+    }
+
+    fn range_lock(ty: u32, start: i64, len: i64) -> flock64 {
         flock64 {
-            l_type: F_WRLCK as _,
+            l_type: ty as _,
             l_whence: SEEK_SET as _,
-            l_start: 0,
-            l_len: 0,
+            l_start: start,
+            l_len: len,
             l_pid: 0,
         }
+    }
+
+    fn whole_file_write_lock() -> flock64 {
+        range_lock(F_WRLCK, 0, 0)
+    }
+
+    #[test]
+    fn mandatory_access_exempts_posix_and_endpoint_ofd_together() {
+        const PID: Pid = u32::MAX - 100;
+        const OFD: u64 = u64::MAX - 300;
+        const OTHER_OFD: u64 = u64::MAX - 301;
+        const DEVICE: u64 = u64::MAX - 302;
+        const ID: InodeId = (DEVICE, 1);
+
+        let table = test_record_table(
+            ID,
+            Vec::from([
+                test_record_lock(RecordLockOwner::Posix(PID), F_WRLCK, 0, 4),
+                test_record_lock(RecordLockOwner::Ofd(OFD), F_WRLCK, 4, 8),
+            ]),
+        );
+
+        assert_eq!(
+            mandatory_access_conflict_in(
+                &table,
+                ID,
+                MandatoryOwners::new(PID, OFD),
+                MandatoryAccess::Read,
+                0,
+                8,
+            ),
+            Ok(None)
+        );
+        assert!(
+            mandatory_access_conflict_in(
+                &table,
+                ID,
+                MandatoryOwners::new(PID, OTHER_OFD),
+                MandatoryAccess::Read,
+                0,
+                8,
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            mandatory_access_conflict_in(
+                &table,
+                ID,
+                MandatoryOwners::new(PID - 1, OFD),
+                MandatoryAccess::Read,
+                0,
+                8,
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn mandatory_access_uses_read_and_write_conflict_rules() {
+        const PID: Pid = u32::MAX - 110;
+        const OFD: u64 = u64::MAX - 310;
+        const FOREIGN: u64 = u64::MAX - 311;
+        const DEVICE: u64 = u64::MAX - 312;
+        const ID: InodeId = (DEVICE, 1);
+        let owners = MandatoryOwners::new(PID, OFD);
+
+        let table = test_record_table(
+            ID,
+            Vec::from([
+                test_record_lock(RecordLockOwner::Ofd(FOREIGN), F_RDLCK, 4, 8),
+                test_record_lock(RecordLockOwner::Ofd(FOREIGN), F_WRLCK, 8, 12),
+            ]),
+        );
+        assert_eq!(
+            mandatory_access_conflict_in(&table, ID, owners, MandatoryAccess::Read, 0, 8),
+            Ok(None)
+        );
+        assert!(
+            mandatory_access_conflict_in(&table, ID, owners, MandatoryAccess::Write, 0, 8)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            mandatory_access_conflict_in(&table, ID, owners, MandatoryAccess::Write, 0, 4),
+            Ok(None)
+        );
+
+        assert!(
+            mandatory_access_conflict_in(&table, ID, owners, MandatoryAccess::Read, 8, 4)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            mandatory_access_conflict_in(&table, ID, owners, MandatoryAccess::Read, 12, 4),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn mandatory_access_range_is_empty_at_zero_and_rejects_overflow() {
+        const PID: Pid = u32::MAX - 120;
+        const OFD: u64 = u64::MAX - 320;
+        const DEVICE: u64 = u64::MAX - 321;
+        let owners = MandatoryOwners::new(PID, OFD);
+        let table = test_record_table((DEVICE, 1), Vec::new());
+
+        assert_eq!(
+            mandatory_access_conflict_in(
+                &table,
+                (DEVICE, 1),
+                owners,
+                MandatoryAccess::Write,
+                u64::MAX,
+                0,
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            mandatory_access_conflict_in(
+                &table,
+                (DEVICE, 1),
+                owners,
+                MandatoryAccess::Write,
+                u64::MAX,
+                1,
+            ),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn mandatory_wait_token_rechecks_the_same_conflict() {
+        const PID: Pid = u32::MAX - 130;
+        const OFD: u64 = u64::MAX - 330;
+        const FOREIGN: u64 = u64::MAX - 331;
+        const DEVICE: u64 = u64::MAX - 332;
+        const ID: InodeId = (DEVICE, 1);
+        let owners = MandatoryOwners::new(PID, OFD);
+
+        let mut table = test_record_table(
+            ID,
+            Vec::from([test_record_lock(
+                RecordLockOwner::Ofd(FOREIGN),
+                F_RDLCK,
+                0,
+                8,
+            )]),
+        );
+        let wait = mandatory_access_conflict_in(&table, ID, owners, MandatoryAccess::Write, 0, 8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recheck_mandatory_access_in(&table, wait),
+            Err(AxError::WouldBlock)
+        );
+        table.locks.remove(&ID);
+        assert_eq!(recheck_mandatory_access_in(&table, wait), Ok(()));
     }
 
     #[test]
