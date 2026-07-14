@@ -57,6 +57,17 @@ bitflags::bitflags! {
     }
 }
 
+/// Selects where an ordinary write commits independently of a file's mutable
+/// default append status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritePlacement {
+    /// Write at the open file description's current position and advance it.
+    Current,
+    /// Atomically append at the file's end and move the description position
+    /// to the resulting end.
+    End,
+}
+
 /// Results returned by [`OpenOptions::open`].
 pub enum OpenResult {
     /// The opened path is a regular file.
@@ -107,6 +118,7 @@ pub struct OpenOptions {
     no_atime: bool,
     user: Option<(u32, u32)>,
     path: bool,
+    no_data: bool,
     node_type: NodeType,
     // system-specific
     mode: u32,
@@ -129,6 +141,7 @@ impl OpenOptions {
             no_atime: false,
             user: None,
             path: false,
+            no_data: false,
             node_type: NodeType::RegularFile,
             // system-specific
             mode: 0o666,
@@ -207,6 +220,16 @@ impl OpenOptions {
         self
     }
 
+    /// Opens the object without granting data read or write access.
+    ///
+    /// This is distinct from a path-only handle: filesystem open callbacks
+    /// still run and non-data operations such as metadata queries or device
+    /// control may remain available to the embedding kernel.
+    pub fn no_data(&mut self, no_data: bool) -> &mut Self {
+        self.no_data = no_data;
+        self
+    }
+
     /// Sets the node type for the file.
     ///
     /// This will only be used if the file is created.
@@ -221,7 +244,7 @@ impl OpenOptions {
         self
     }
 
-    fn _open(&self, loc: Location) -> VfsResult<OpenResult> {
+    fn _open(&self, loc: Location, apply_truncate: bool) -> VfsResult<OpenResult> {
         let flags = self.to_flags()?;
 
         if self.directory {
@@ -235,10 +258,16 @@ impl OpenOptions {
         {
             return Err(VfsError::IsADirectory);
         }
-        loc.open(
-            flags.contains(FileFlags::READ),
-            flags.contains(FileFlags::WRITE),
-        )?;
+        // A path-only handle names an object but does not open the underlying
+        // filesystem file. This mirrors Linux O_PATH: no filesystem open
+        // callback, device/FIFO side effect, or ordinary open notification is
+        // implied by constructing the handle.
+        if !flags.contains(FileFlags::PATH) {
+            loc.open(
+                flags.contains(FileFlags::READ),
+                flags.contains(FileFlags::WRITE),
+            )?;
+        }
         Ok(if loc.is_dir() {
             OpenResult::Dir(loc)
         } else {
@@ -257,7 +286,7 @@ impl OpenOptions {
             } else {
                 FileBackend::new_direct(loc)
             };
-            if self.truncate {
+            if self.truncate && apply_truncate {
                 backend.set_len(0)?;
             }
             OpenResult::File(File::new(backend, flags))
@@ -269,7 +298,22 @@ impl OpenOptions {
         if !self.is_valid() {
             return Err(VfsError::InvalidInput);
         }
-        self._open(loc)
+        self._open(loc, true)
+    }
+
+    /// Opens a resolved location while deferring an `O_TRUNC`-style length
+    /// mutation to the caller.
+    ///
+    /// This lets an embedding kernel construct and reserve every fallible
+    /// open-file-description resource before the destructive truncate commit.
+    /// The returned file has completed the filesystem open callback but has
+    /// not had its length changed; callers that requested truncation must
+    /// explicitly commit it through the returned file backend.
+    pub fn open_loc_deferred_truncate(&self, loc: Location) -> VfsResult<OpenResult> {
+        if !self.is_valid() {
+            return Err(VfsError::InvalidInput);
+        }
+        self._open(loc, false)
     }
 
     /// Opens a file at the given path relative to the provided [`FsContext`].
@@ -290,7 +334,7 @@ impl OpenOptions {
         let mut allow_create = |_dir: &Location, _options: &mut axfs_ng_vfs::OpenOptions| Ok(());
         let (loc, _created) =
             self.resolve_location_with_admission(context, path, admission, &mut allow_create)?;
-        self._open(loc)
+        self._open(loc, true)
     }
 
     /// Resolves or creates the exact location that an open operation would
@@ -381,13 +425,17 @@ impl OpenOptions {
         if self.path {
             return Ok(FileFlags::PATH);
         }
-        let mut flags = match (self.read, self.write, self.append) {
-            (true, false, false) => FileFlags::READ,
-            (false, true, false) => FileFlags::WRITE,
-            (true, true, false) => FileFlags::READ | FileFlags::WRITE,
-            (false, _, true) => FileFlags::WRITE | FileFlags::APPEND,
-            (true, _, true) => FileFlags::READ | FileFlags::WRITE | FileFlags::APPEND,
-            (false, false, false) => return Err(VfsError::InvalidInput),
+        let mut flags = if self.no_data {
+            FileFlags::empty()
+        } else {
+            match (self.read, self.write, self.append) {
+                (true, false, false) => FileFlags::READ,
+                (false, true, false) => FileFlags::WRITE,
+                (true, true, false) => FileFlags::READ | FileFlags::WRITE,
+                (false, _, true) => FileFlags::WRITE | FileFlags::APPEND,
+                (true, _, true) => FileFlags::READ | FileFlags::WRITE | FileFlags::APPEND,
+                (false, false, false) => return Err(VfsError::InvalidInput),
+            }
         };
         if self.no_atime {
             flags |= FileFlags::NOATIME;
@@ -403,12 +451,16 @@ impl OpenOptions {
             return !self.read
                 && !self.write
                 && !self.append
+                && !self.no_data
                 && !self.truncate
                 && !self.create
                 && !self.create_new
                 && !self.no_atime;
         }
-        if !self.read && !self.write && !self.append {
+        if self.no_data && (self.read || self.write || self.append) {
+            return false;
+        }
+        if !self.no_data && !self.read && !self.write && !self.append {
             return false;
         }
         if self.directory && (self.create || self.create_new) {
@@ -1957,7 +2009,7 @@ struct CachedFileShared {
     direct_io_lock: RwLock<()>,
     /// Serializes dirty writeback with truncate/cache length transitions.
     writeback_lock: RwLock<()>,
-    /// Serializes O_APPEND writes across all cached handles for this inode.
+    /// Serializes O_APPEND transaction boundaries across handles for this inode.
     append_lock: RwLock<()>,
 }
 
@@ -2949,6 +3001,34 @@ impl CachedFile {
             .map(|written| (written, len + written as u64))
     }
 
+    /// Appends one scatter list as a single inode append transaction.
+    ///
+    /// Empty slices are ignored. A short element stops the transaction, and
+    /// an error keeps the same propagation semantics as repeated scalar
+    /// appends, but no other cached or direct writer can enter between two
+    /// nonempty elements.
+    pub fn append_vectored(&self, src: &[&[u8]]) -> VfsResult<(usize, u64)> {
+        let _direct_guard = self.shared.direct_io_lock.read();
+        let _append_guard = self.shared.append_lock.write();
+        let file = self.inner.entry().as_file()?;
+        let mut total = 0usize;
+        let mut end = file.len()?;
+
+        for buf in src.iter().copied() {
+            if buf.is_empty() {
+                continue;
+            }
+            let requested = buf.len();
+            let written = self.write_at_locked(buf, end)?;
+            total += written;
+            end += written as u64;
+            if written < requested || written == 0 {
+                break;
+            }
+        }
+        Ok((total, end))
+    }
+
     /// Truncates or extends the file to `len` bytes.
     pub fn set_len(&self, len: u64) -> VfsResult<()> {
         let _direct_guard = self.shared.direct_io_lock.read();
@@ -3286,6 +3366,55 @@ impl FileBackend {
         }
     }
 
+    /// Appends one scatter list without releasing the inode append domain
+    /// between nonempty elements.
+    pub fn append_vectored(&self, src: &[&[u8]]) -> VfsResult<(usize, u64)> {
+        match self {
+            Self::Cached(cached) => cached.append_vectored(src),
+            Self::Direct(loc) => {
+                let shared = Self::direct_io_shared(loc);
+                let _direct_guard = shared.direct_io_lock.write();
+                let _append_guard = shared.append_lock.write();
+                Self::sync_direct_cache(loc)?;
+                let file = loc.entry().as_file()?;
+                let mut total = 0usize;
+                let mut end = file.len()?;
+
+                // The lower async vectored API is positioned I/O, not an
+                // append operation. Keep using FileNodeOps::append so a
+                // filesystem's own EOF/inode rules remain in force; the
+                // shared high-level guards make all chunks and iovecs one
+                // transaction relative to every other axfs writer.
+                for buf in src.iter().copied() {
+                    if buf.is_empty() {
+                        continue;
+                    }
+                    let requested = buf.len();
+                    let mut element_written = 0usize;
+                    while element_written < requested {
+                        let limit = (requested - element_written).min(Self::DIRECT_IO_CHUNK);
+                        let chunk = &buf[element_written..element_written + limit];
+                        let (written, new_end) = file.append(chunk)?;
+                        total += written;
+                        element_written += written;
+                        end = new_end;
+                        if written < limit || written == 0 {
+                            break;
+                        }
+                    }
+                    if element_written < requested || element_written == 0 {
+                        break;
+                    }
+                }
+
+                if total > 0 {
+                    Self::sync_direct_cache(loc)?;
+                }
+                Ok((total, end))
+            }
+        }
+    }
+
     /// Returns a reference to the underlying [`Location`].
     pub fn location(&self) -> &Location {
         match self {
@@ -3326,7 +3455,14 @@ impl FileBackend {
 /// Provides `std::fs::File`-like interface.
 pub struct File {
     inner: FileBackend,
+    /// Mutable open-file-description append status. Access admission remains
+    /// in `flags`; toggling append must never manufacture write authority.
+    append: AtomicBool,
     flags: FileFlags,
+    /// Serializes operations which observe and later commit the current
+    /// position without requiring the position spin lock to remain held while
+    /// an external transfer consumer runs.
+    position_transaction: Mutex<()>,
     position: Option<Mutex<u64>>,
     #[cfg(feature = "times")]
     access_flags: AtomicU8,
@@ -3365,20 +3501,16 @@ impl File {
         let position = if inner.location().flags().contains(NodeFlags::STREAM) {
             None
         } else {
-            let inode_append = flags.contains(FileFlags::APPEND)
-                && !inner
-                    .location()
-                    .flags()
-                    .contains(NodeFlags::POSITIONED_APPEND);
-            Some(Mutex::new(if inode_append {
-                inner.location().len().unwrap_or_default()
-            } else {
-                0
-            }))
+            // O_APPEND changes where each write commits; it does not seek the
+            // newly opened description to EOF. Clearing append before the
+            // first write must therefore expose the initial offset zero.
+            Some(Mutex::new(0))
         };
         Self {
             inner,
-            flags,
+            append: AtomicBool::new(flags.contains(FileFlags::APPEND)),
+            flags: flags & !FileFlags::APPEND,
+            position_transaction: Mutex::new(()),
             position,
             #[cfg(feature = "times")]
             access_flags: AtomicU8::new(0),
@@ -3406,7 +3538,13 @@ impl File {
 
     /// Checks that the file has the required `flags` and returns the backend.
     pub fn access(&self, flags: FileFlags) -> VfsResult<&FileBackend> {
-        if self.flags.contains(flags) && !self.is_path() {
+        let requires_append = flags.contains(FileFlags::APPEND);
+        let required_access = flags & !FileFlags::APPEND;
+        if self.flags.contains(required_access)
+            && (!requires_append
+                || (self.flags.contains(FileFlags::WRITE) && self.append_enabled()))
+            && !self.is_path()
+        {
             Ok(&self.inner)
         } else {
             Err(VfsError::BadFileDescriptor)
@@ -3420,7 +3558,19 @@ impl File {
 
     /// Returns the access flags this file was opened with.
     pub fn flags(&self) -> FileFlags {
-        self.flags
+        let mut flags = self.flags;
+        flags.set(FileFlags::APPEND, self.append_enabled());
+        flags
+    }
+
+    /// Updates append status for this open file description without changing
+    /// its immutable read/write access mode.
+    pub fn set_append(&self, append: bool) {
+        self.append.store(append, Ordering::Release);
+    }
+
+    fn append_enabled(&self) -> bool {
+        self.append.load(Ordering::Acquire)
     }
 
     /// Returns a reference to the underlying [`FileBackend`].
@@ -3436,6 +3586,7 @@ impl File {
 
     /// Reads a number of bytes starting from a given offset.
     pub fn read_at(&self, dst: impl Write + IoBufMut, offset: u64) -> VfsResult<usize> {
+        #[cfg(feature = "times")]
         let requested = dst.remaining_mut();
         let read = self.access(FileFlags::READ)?.read_at(dst, offset)?;
         #[cfg(feature = "times")]
@@ -3450,6 +3601,7 @@ impl File {
     }
 
     pub fn read_at_slice(&self, dst: &mut [u8], offset: u64) -> VfsResult<usize> {
+        #[cfg(feature = "times")]
         let requested = dst.len();
         let read = self.access(FileFlags::READ)?.read_at_slice(dst, offset)?;
         #[cfg(feature = "times")]
@@ -3464,6 +3616,7 @@ impl File {
     }
 
     pub fn read_at_vectored_slice(&self, dst: &mut [&mut [u8]], offset: u64) -> VfsResult<usize> {
+        #[cfg(feature = "times")]
         let requested = dst.iter().map(|buf| buf.len()).sum::<usize>();
         let read = self
             .access(FileFlags::READ)?
@@ -3512,6 +3665,55 @@ impl File {
         Ok(written)
     }
 
+    fn write_at_end_with_new_end(&self, src: impl Read + IoBuf) -> VfsResult<(usize, u64)> {
+        let result = self.access(FileFlags::WRITE)?.append(src)?;
+        #[cfg(feature = "times")]
+        if result.0 > 0 {
+            self.record_time_flags(2);
+            self.flush_times();
+        }
+        Ok(result)
+    }
+
+    fn write_vectored_at_end_with_new_end(&self, src: &[&[u8]]) -> VfsResult<(usize, Option<u64>)> {
+        let backend = self.access(FileFlags::WRITE)?;
+        if !src.iter().any(|buf| !buf.is_empty()) {
+            return Ok((0, None));
+        }
+        let (total, new_end) = backend.append_vectored(src)?;
+        #[cfg(feature = "times")]
+        if total > 0 {
+            self.record_time_flags(2);
+            self.flush_times();
+        }
+        Ok((total, Some(new_end)))
+    }
+
+    /// Atomically appends data without reading or changing this [`File`]'s
+    /// current position.
+    ///
+    /// This is the positioned counterpart of
+    /// [`write_with_placement`](Self::write_with_placement) with
+    /// [`WritePlacement::End`].
+    pub fn write_at_end(&self, src: impl Read + IoBuf) -> VfsResult<usize> {
+        self.write_at_end_with_new_end(src)
+            .map(|(written, _)| written)
+    }
+
+    /// Atomically appends a byte slice without changing this [`File`]'s
+    /// current position.
+    pub fn write_at_end_slice(&self, src: &[u8]) -> VfsResult<usize> {
+        self.write_at_end_with_new_end(src)
+            .map(|(written, _)| written)
+    }
+
+    /// Atomically appends a vectored input without changing this [`File`]'s
+    /// current position.
+    pub fn write_at_end_vectored_slice(&self, src: &[&[u8]]) -> VfsResult<usize> {
+        self.write_vectored_at_end_with_new_end(src)
+            .map(|(written, _)| written)
+    }
+
     /// Attempts to sync OS-internal file content and metadata to disk.
     ///
     /// If `data_only` is `true`, only the file data is synced, not the
@@ -3523,6 +3725,7 @@ impl File {
 
     /// Reads data from the current position, advancing the cursor.
     pub fn read(&self, dst: impl Write + IoBufMut) -> axio::Result<usize> {
+        let _transaction = self.position_transaction.lock();
         if let Some(pos) = self.position.as_ref() {
             let mut pos = pos.lock();
             self.read_at(dst, *pos).inspect(|n| {
@@ -3534,6 +3737,7 @@ impl File {
     }
 
     pub fn read_slice(&self, dst: &mut [u8]) -> axio::Result<usize> {
+        let _transaction = self.position_transaction.lock();
         if let Some(pos) = self.position.as_ref() {
             let mut pos = pos.lock();
             self.read_at_slice(dst, *pos).inspect(|n| {
@@ -3544,7 +3748,174 @@ impl File {
         }
     }
 
+    /// Reads from the current position and advances it by exactly the prefix
+    /// accepted by `consume`.
+    ///
+    /// The position lock remains held across the callback. This is intended
+    /// for transfer operations such as sendfile which must not consume source
+    /// bytes before the destination accepts them. If the callback fails, the
+    /// position is unchanged; a short accepted prefix advances by only that
+    /// prefix. Stream nodes without an open-file-description position are not
+    /// representable by this transaction and return `InvalidInput`.
+    pub fn read_slice_then(
+        &self,
+        dst: &mut [u8],
+        consume: impl FnOnce(&[u8]) -> axio::Result<usize>,
+    ) -> axio::Result<usize> {
+        self.read_slice_at_current_then(dst, |data, _offset| consume(data))
+    }
+
+    /// Reads at one frozen current position and commits exactly the prefix
+    /// accepted by `consume`.
+    ///
+    /// The current-position transaction remains owned across `consume`, but
+    /// the small position lock is released first. The callback receives the
+    /// frozen offset so a higher layer can implement a same-description
+    /// transfer through positioned backend I/O without recursively acquiring
+    /// this transaction.
+    pub fn read_slice_at_current_then(
+        &self,
+        dst: &mut [u8],
+        consume: impl FnOnce(&[u8], u64) -> axio::Result<usize>,
+    ) -> axio::Result<usize> {
+        self.read_slice_at_current_checked_then(dst, |_| Ok(()), consume)
+    }
+
+    /// Runs a short, nonblocking callback against one frozen current position.
+    ///
+    /// This is a generic admission primitive for higher layers which need the
+    /// exact current offset without performing backend I/O or advancing it.
+    pub fn with_current_position<T>(
+        &self,
+        inspect: impl FnOnce(u64) -> axio::Result<T>,
+    ) -> axio::Result<T> {
+        let _transaction = self.position_transaction.lock();
+        let pos = self.position.as_ref().ok_or(VfsError::InvalidInput)?;
+        let offset = *pos.lock();
+        inspect(offset)
+    }
+
+    /// Runs one complete operation against a frozen current position and
+    /// commits its accepted prefix exactly once.
+    ///
+    /// `operation` receives the initial position and must use positioned I/O;
+    /// recursively calling a current-position method on this file would try to
+    /// acquire the same transaction again. `max_advance` is validated before
+    /// the callback can mutate external state, while the returned advance is
+    /// checked against that bound before the cursor is committed. An error
+    /// leaves the cursor unchanged.
+    pub fn with_current_position_transaction<T>(
+        &self,
+        max_advance: usize,
+        operation: impl FnOnce(u64) -> axio::Result<(T, usize)>,
+    ) -> axio::Result<T> {
+        let _transaction = self.position_transaction.lock();
+        let pos = self.position.as_ref().ok_or(VfsError::InvalidInput)?;
+        let offset = *pos.lock();
+        let max_advance = u64::try_from(max_advance).map_err(|_| VfsError::InvalidInput)?;
+        offset
+            .checked_add(max_advance)
+            .ok_or(VfsError::InvalidInput)?;
+
+        let (value, advance) = operation(offset)?;
+        let advance = u64::try_from(advance).map_err(|_| VfsError::InvalidInput)?;
+        if advance > max_advance {
+            return Err(VfsError::InvalidInput);
+        }
+        *pos.lock() = offset.checked_add(advance).ok_or(VfsError::InvalidInput)?;
+        Ok(value)
+    }
+
+    /// Reads at one frozen current position after a caller-supplied admission
+    /// check, then commits exactly the prefix accepted by `consume`.
+    ///
+    /// `admit` runs while the current-position transaction is held but before
+    /// backend read side effects. It must be short and nonblocking. This keeps
+    /// higher-layer range policy outside axfs while giving that policy the same
+    /// position snapshot used by the eventual read.
+    pub fn read_slice_at_current_checked_then(
+        &self,
+        dst: &mut [u8],
+        admit: impl FnOnce(u64) -> axio::Result<()>,
+        consume: impl FnOnce(&[u8], u64) -> axio::Result<usize>,
+    ) -> axio::Result<usize> {
+        let mut state = ();
+        self.read_slice_at_current_checked_with(
+            dst,
+            &mut state,
+            |_state, offset| admit(offset),
+            |_state, data, offset| consume(data, offset),
+        )
+    }
+
+    /// Stateful form of [`read_slice_at_current_checked_then`](Self::read_slice_at_current_checked_then).
+    ///
+    /// Both phases receive the same caller-owned state sequentially. This is
+    /// useful when admission and consumption operate on one destination
+    /// transaction which cannot be mutably captured by two closures at once.
+    pub fn read_slice_at_current_checked_with<S>(
+        &self,
+        dst: &mut [u8],
+        state: &mut S,
+        admit: impl FnOnce(&mut S, u64) -> axio::Result<()>,
+        consume: impl FnOnce(&mut S, &[u8], u64) -> axio::Result<usize>,
+    ) -> axio::Result<usize> {
+        let _transaction = self.position_transaction.lock();
+        let pos = self.position.as_ref().ok_or(VfsError::InvalidInput)?;
+        let offset = *pos.lock();
+        admit(state, offset)?;
+        let read = self.read_at_slice(dst, offset)?;
+        // Reject an impossible position before the destination callback can
+        // mutate externally visible state.
+        offset
+            .checked_add(read as u64)
+            .ok_or(VfsError::InvalidInput)?;
+        if read == 0 {
+            return Ok(0);
+        }
+        let consumed = consume(state, &dst[..read], offset)?;
+        if consumed > read {
+            return Err(VfsError::InvalidInput);
+        }
+        *pos.lock() = offset
+            .checked_add(consumed as u64)
+            .ok_or(VfsError::InvalidInput)?;
+        Ok(consumed)
+    }
+
+    /// Runs one positioned write callback at a frozen current position and
+    /// advances the cursor by exactly the prefix it reports as committed.
+    ///
+    /// The callback owns the actual write so an embedding layer can perform
+    /// policy admission and positioned backend I/O without recursively taking
+    /// this transaction. It must not block while holding unrelated endpoint
+    /// transactions.
+    pub fn write_slice_at_current_then(
+        &self,
+        src: &[u8],
+        write: impl FnOnce(&[u8], u64) -> axio::Result<usize>,
+    ) -> axio::Result<usize> {
+        let _transaction = self.position_transaction.lock();
+        let pos = self.position.as_ref().ok_or(VfsError::InvalidInput)?;
+        let offset = *pos.lock();
+        offset
+            .checked_add(src.len() as u64)
+            .ok_or(VfsError::InvalidInput)?;
+        if src.is_empty() {
+            return Ok(0);
+        }
+        let written = write(src, offset)?;
+        if written > src.len() {
+            return Err(VfsError::InvalidInput);
+        }
+        *pos.lock() = offset
+            .checked_add(written as u64)
+            .ok_or(VfsError::InvalidInput)?;
+        Ok(written)
+    }
+
     pub fn read_vectored_slice(&self, dst: &mut [&mut [u8]]) -> axio::Result<usize> {
+        let _transaction = self.position_transaction.lock();
         if let Some(pos) = self.position.as_ref() {
             let mut pos = pos.lock();
             self.read_at_vectored_slice(dst, *pos).inspect(|n| {
@@ -3555,107 +3926,125 @@ impl File {
         }
     }
 
-    /// Writes data at the current position (or appends), advancing the cursor.
-    pub fn write(&self, src: impl Read + IoBuf) -> axio::Result<usize> {
+    /// Writes data using an explicit placement decision.
+    ///
+    /// `placement` is consumed as the decision for this operation and does
+    /// not consult the mutable default append status. Nodes marked
+    /// [`NodeFlags::POSITIONED_APPEND`] retain their special ordinary-write
+    /// behavior: [`WritePlacement::End`] uses and advances their current
+    /// position instead of invoking the inode append operation.
+    pub fn write_with_placement(
+        &self,
+        src: impl Read + IoBuf,
+        placement: WritePlacement,
+    ) -> axio::Result<usize> {
+        let _transaction = self.position_transaction.lock();
         if let Some(pos) = self.position.as_ref() {
             let mut pos = pos.lock();
-            if let Ok(f) = self.access(FileFlags::APPEND) {
-                if f.location().flags().contains(NodeFlags::POSITIONED_APPEND) {
-                    self.write_at(src, *pos).inspect(|written| {
-                        *pos += *written as u64;
-                    })
-                } else {
-                    f.append(src)
-                        .inspect(|(written, _)| {
-                            #[cfg(feature = "times")]
-                            if *written > 0 {
-                                self.record_time_flags(2);
-                                self.flush_times();
-                            }
-                        })
-                        .map(|(written, new_size)| {
-                            *pos = new_size;
-                            written
-                        })
-                }
-            } else {
+            if placement == WritePlacement::Current
+                || self
+                    .location()
+                    .flags()
+                    .contains(NodeFlags::POSITIONED_APPEND)
+            {
                 self.write_at(src, *pos).inspect(|n| {
                     *pos += *n as u64;
                 })
+            } else {
+                self.write_at_end_with_new_end(src)
+                    .map(|(written, new_end)| {
+                        *pos = new_end;
+                        written
+                    })
             }
         } else {
             self.write_at(src, 0)
         }
     }
 
-    pub fn write_slice(&self, src: &[u8]) -> axio::Result<usize> {
+    /// Writes a byte slice using an explicit placement decision.
+    pub fn write_slice_with_placement(
+        &self,
+        src: &[u8],
+        placement: WritePlacement,
+    ) -> axio::Result<usize> {
+        let _transaction = self.position_transaction.lock();
         if let Some(pos) = self.position.as_ref() {
             let mut pos = pos.lock();
-            if let Ok(f) = self.access(FileFlags::APPEND) {
-                if f.location().flags().contains(NodeFlags::POSITIONED_APPEND) {
-                    self.write_at_slice(src, *pos).inspect(|written| {
-                        *pos += *written as u64;
-                    })
-                } else {
-                    f.append(src)
-                        .inspect(|(written, _)| {
-                            #[cfg(feature = "times")]
-                            if *written > 0 {
-                                self.record_time_flags(2);
-                                self.flush_times();
-                            }
-                        })
-                        .map(|(written, new_size)| {
-                            *pos = new_size;
-                            written
-                        })
-                }
-            } else {
+            if placement == WritePlacement::Current
+                || self
+                    .location()
+                    .flags()
+                    .contains(NodeFlags::POSITIONED_APPEND)
+            {
                 self.write_at_slice(src, *pos).inspect(|n| {
                     *pos += *n as u64;
                 })
+            } else {
+                self.write_at_end_with_new_end(src)
+                    .map(|(written, new_end)| {
+                        *pos = new_end;
+                        written
+                    })
             }
         } else {
             self.write_at_slice(src, 0)
         }
     }
 
-    pub fn write_vectored_slice(&self, src: &[&[u8]]) -> axio::Result<usize> {
+    /// Writes vectored input using an explicit placement decision.
+    pub fn write_vectored_slice_with_placement(
+        &self,
+        src: &[&[u8]],
+        placement: WritePlacement,
+    ) -> axio::Result<usize> {
+        let _transaction = self.position_transaction.lock();
         if let Some(pos) = self.position.as_ref() {
             let mut pos = pos.lock();
-            if let Ok(f) = self.access(FileFlags::APPEND) {
-                if f.location().flags().contains(NodeFlags::POSITIONED_APPEND) {
-                    return self
-                        .write_at_vectored_slice(src, *pos)
-                        .inspect(|written| *pos += *written as u64);
-                }
-                let mut total = 0usize;
-                for buf in src.iter().copied() {
-                    if buf.is_empty() {
-                        continue;
-                    }
-                    let requested = buf.len();
-                    let (written, new_size) = f.append(buf)?;
-                    #[cfg(feature = "times")]
-                    if written > 0 {
-                        self.record_time_flags(2);
-                        self.flush_times();
-                    }
-                    *pos = new_size;
-                    total += written;
-                    if written < requested || written == 0 {
-                        break;
-                    }
-                }
-                Ok(total)
-            } else {
+            if placement == WritePlacement::Current
+                || self
+                    .location()
+                    .flags()
+                    .contains(NodeFlags::POSITIONED_APPEND)
+            {
                 self.write_at_vectored_slice(src, *pos).inspect(|n| {
                     *pos += *n as u64;
                 })
+            } else {
+                self.write_vectored_at_end_with_new_end(src)
+                    .map(|(written, new_end)| {
+                        if let Some(new_end) = new_end {
+                            *pos = new_end;
+                        }
+                        written
+                    })
             }
         } else {
             self.write_at_vectored_slice(src, 0)
         }
+    }
+
+    fn default_write_placement(&self) -> WritePlacement {
+        if self.append_enabled() {
+            WritePlacement::End
+        } else {
+            WritePlacement::Current
+        }
+    }
+
+    /// Writes data using the file's mutable default append status.
+    pub fn write(&self, src: impl Read + IoBuf) -> axio::Result<usize> {
+        self.write_with_placement(src, self.default_write_placement())
+    }
+
+    /// Writes a byte slice using the file's mutable default append status.
+    pub fn write_slice(&self, src: &[u8]) -> axio::Result<usize> {
+        self.write_slice_with_placement(src, self.default_write_placement())
+    }
+
+    /// Writes vectored input using the file's mutable default append status.
+    pub fn write_vectored_slice(&self, src: &[&[u8]]) -> axio::Result<usize> {
+        self.write_vectored_slice_with_placement(src, self.default_write_placement())
     }
 
     /// Flushes any internally buffered data. Currently a no-op.
@@ -3684,6 +4073,7 @@ impl Write for &File {
 impl Seek for &File {
     fn seek(&mut self, pos: SeekFrom) -> axio::Result<u64> {
         self.access(FileFlags::empty())?;
+        let _transaction = self.position_transaction.lock();
 
         if let Some(guard) = self.position.as_ref() {
             let mut guard = guard.lock();
@@ -3734,9 +4124,13 @@ mod tests {
     };
     use core::{
         any::Any,
-        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+        sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         task::Context,
         time::Duration,
+    };
+    use std::{
+        sync::{Barrier, Mutex as StdMutex, mpsc},
+        thread,
     };
 
     use axfs_ng_vfs::{
@@ -3744,29 +4138,53 @@ mod tests {
         Mountpoint, NodeFlags, NodeOps, NodePermission, NodeType, Reference, StatFs, VfsError,
         VfsResult,
     };
-    use axio::Cursor;
+    use axio::{Cursor, Seek, SeekFrom};
     use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
     use axsync::Mutex;
 
     use super::{
         CLOSED_FILE_CACHE_RETAINED_PAGES, CachedFile, CachedFileShared, File, FileBackend,
-        FileFlags, FileUserData, cached_file_registry_key,
+        FileFlags, FileUserData, OpenOptions, WritePlacement, cached_file_registry_key,
         cached_file_shared_for_location_or_create, file_cache_registry,
         release_unlinked_cached_file_registry_ownership,
     };
 
+    #[test]
+    fn no_data_open_options_emit_no_data_access_flags() {
+        let mut options = OpenOptions::new();
+        options.no_data(true).direct(true).no_atime(true);
+        let flags = options.to_flags().unwrap();
+        assert!(!flags.intersects(FileFlags::READ | FileFlags::WRITE | FileFlags::PATH));
+        assert!(flags.contains(FileFlags::DIRECT | FileFlags::NOATIME));
+
+        options.read(true);
+        assert!(!options.is_valid());
+    }
+
     struct AppendTestState {
+        read_offsets: Mutex<Vec<u64>>,
         write_offsets: Mutex<Vec<u64>>,
         append_calls: AtomicUsize,
+        open_calls: AtomicUsize,
         inode_len: AtomicU64,
+        append_limit: AtomicUsize,
+        fail_append_call: AtomicUsize,
+        yield_after_append: AtomicBool,
+        append_markers: StdMutex<Vec<u8>>,
     }
 
     impl AppendTestState {
         fn new(inode_len: u64) -> Arc<Self> {
             Arc::new(Self {
+                read_offsets: Mutex::new(Vec::new()),
                 write_offsets: Mutex::new(Vec::new()),
                 append_calls: AtomicUsize::new(0),
+                open_calls: AtomicUsize::new(0),
                 inode_len: AtomicU64::new(inode_len),
+                append_limit: AtomicUsize::new(usize::MAX),
+                fail_append_call: AtomicUsize::new(usize::MAX),
+                yield_after_append: AtomicBool::new(false),
+                append_markers: StdMutex::new(Vec::new()),
             })
         }
     }
@@ -3814,6 +4232,11 @@ mod tests {
             Ok(())
         }
 
+        fn open(&self, _read: bool, _write: bool) -> VfsResult<()> {
+            self.state.open_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
         fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
             self
         }
@@ -3838,8 +4261,16 @@ mod tests {
     }
 
     impl FileNodeOps for AppendTestFile {
-        fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
-            Ok(0)
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+            self.state.read_offsets.lock().push(offset);
+            let data = b"abcdefgh";
+            let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidInput)?;
+            if offset >= data.len() {
+                return Ok(0);
+            }
+            let read = buf.len().min(data.len() - offset);
+            buf[..read].copy_from_slice(&data[offset..offset + read]);
+            Ok(read)
         }
 
         fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
@@ -3851,12 +4282,23 @@ mod tests {
         }
 
         fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {
-            self.state.append_calls.fetch_add(1, Ordering::AcqRel);
-            let written = buf.len();
+            let call = self.state.append_calls.fetch_add(1, Ordering::AcqRel);
+            if call == self.state.fail_append_call.load(Ordering::Acquire) {
+                return Err(VfsError::InvalidInput);
+            }
+            if let Some(marker) = buf.first().copied() {
+                self.state.append_markers.lock().unwrap().push(marker);
+            }
+            let written = buf
+                .len()
+                .min(self.state.append_limit.load(Ordering::Acquire));
             let old_len = self
                 .state
                 .inode_len
                 .fetch_add(written as u64, Ordering::AcqRel);
+            if self.state.yield_after_append.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
             Ok((written, old_len + written as u64))
         }
 
@@ -3870,21 +4312,441 @@ mod tests {
         }
     }
 
-    fn append_test_file(flags: NodeFlags, inode_len: u64) -> (File, Arc<AppendTestState>) {
+    fn append_test_file_with_access(
+        flags: NodeFlags,
+        inode_len: u64,
+        access: FileFlags,
+    ) -> (File, Arc<AppendTestState>) {
         let state = AppendTestState::new(inode_len);
         let fs = Filesystem::new(RegistryTestFs::new_for_append(flags, state.clone()));
         let mountpoint = Mountpoint::new_root(&fs);
         let location = mountpoint.root_location();
-        let file = File::new(
-            FileBackend::Direct(location),
-            FileFlags::WRITE | FileFlags::APPEND,
-        );
+        let file = File::new(FileBackend::Direct(location), access);
         (file, state)
+    }
+
+    fn append_test_file(flags: NodeFlags, inode_len: u64) -> (File, Arc<AppendTestState>) {
+        append_test_file_with_access(flags, inode_len, FileFlags::WRITE | FileFlags::APPEND)
+    }
+
+    #[test]
+    fn deferred_open_leaves_truncate_for_the_prepared_consumer_to_commit() {
+        let state = AppendTestState::new(41);
+        let fs = Filesystem::new(RegistryTestFs::new_for_append(
+            NodeFlags::NON_CACHEABLE,
+            state.clone(),
+        ));
+        let location = Mountpoint::new_root(&fs).root_location();
+        let mut options = OpenOptions::new();
+        options.write(true).truncate(true).direct(true);
+
+        let file = options
+            .open_loc_deferred_truncate(location)
+            .unwrap()
+            .into_file()
+            .unwrap();
+        assert_eq!(state.inode_len.load(Ordering::Acquire), 41);
+
+        file.backend().unwrap().set_len(0).unwrap();
+        assert_eq!(state.inode_len.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn path_only_open_skips_the_filesystem_open_callback() {
+        let state = AppendTestState::new(0);
+        let fs = Filesystem::new(RegistryTestFs::new_for_append(
+            NodeFlags::NON_CACHEABLE,
+            state.clone(),
+        ));
+        let location = Mountpoint::new_root(&fs).root_location();
+        let mut options = OpenOptions::new();
+        options.path(true);
+
+        let result = options.open_loc(location).unwrap().into_file().unwrap();
+        assert!(result.is_path());
+        assert_eq!(state.open_calls.load(Ordering::Acquire), 0);
     }
 
     fn assert_positioned_append_offsets(state: &AppendTestState) {
         assert_eq!(&*state.write_offsets.lock(), &[0, 2]);
         assert_eq!(state.append_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn explicit_current_ignores_default_append_for_all_write_forms() {
+        let (file, state) = append_test_file(NodeFlags::NON_CACHEABLE, 41);
+        let mut src = Cursor::new(&b"abcd"[..]);
+        assert_eq!(
+            file.write_with_placement(&mut src, WritePlacement::Current),
+            Ok(2)
+        );
+        assert_eq!(&*state.write_offsets.lock(), &[0]);
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 0);
+
+        let (file, state) = append_test_file(NodeFlags::NON_CACHEABLE, 41);
+        assert_eq!(
+            file.write_slice_with_placement(b"abcd", WritePlacement::Current),
+            Ok(2)
+        );
+        assert_eq!(&*state.write_offsets.lock(), &[0]);
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 0);
+
+        let (file, state) = append_test_file(NodeFlags::NON_CACHEABLE, 41);
+        assert_eq!(
+            file.write_vectored_slice_with_placement(&[b"abcd", b"ef"], WritePlacement::Current,),
+            Ok(2)
+        );
+        assert_eq!(&*state.write_offsets.lock(), &[0]);
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn current_position_transfer_commits_only_destination_prefix() {
+        let (file, state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 8, FileFlags::READ);
+        let mut buf = [0u8; 4];
+
+        assert_eq!(
+            file.read_slice_then(&mut buf, |data| {
+                assert_eq!(data, b"abcd");
+                Ok(2)
+            }),
+            Ok(2)
+        );
+        assert_eq!(
+            file.read_slice_then(&mut buf, |data| {
+                assert_eq!(data, b"cdef");
+                Err(VfsError::InvalidInput)
+            }),
+            Err(VfsError::InvalidInput)
+        );
+        assert_eq!(
+            file.read_slice_then(&mut buf, |data| {
+                assert_eq!(data, b"cdef");
+                Ok(data.len())
+            }),
+            Ok(4)
+        );
+        assert_eq!(file.read_slice(&mut buf), Ok(2));
+        assert_eq!(&buf[..2], b"gh");
+        assert_eq!(&*state.read_offsets.lock(), &[0, 2, 2, 6]);
+    }
+
+    #[test]
+    fn checked_current_read_rejects_before_backend_io_and_cursor_commit() {
+        let (file, state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 8, FileFlags::READ);
+        let mut buf = [0u8; 4];
+
+        assert_eq!(
+            file.read_slice_at_current_checked_then(
+                &mut buf,
+                |offset| {
+                    assert_eq!(offset, 0);
+                    Err(VfsError::PermissionDenied)
+                },
+                |_data, _offset| unreachable!(),
+            ),
+            Err(VfsError::PermissionDenied)
+        );
+        assert!(state.read_offsets.lock().is_empty());
+        assert_eq!(file.read_slice(&mut buf), Ok(4));
+        assert_eq!(&buf, b"abcd");
+        assert_eq!(&*state.read_offsets.lock(), &[0]);
+    }
+
+    #[test]
+    fn current_write_callback_uses_frozen_offset_and_commits_only_its_prefix() {
+        let (file, state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 8, FileFlags::WRITE);
+
+        assert_eq!(
+            file.with_current_position(|offset| {
+                assert_eq!(offset, 0);
+                Ok(offset)
+            }),
+            Ok(0)
+        );
+
+        assert_eq!(
+            file.write_slice_at_current_then(b"abcd", |data, offset| {
+                assert_eq!(offset, 0);
+                file.write_at_slice(data, offset)
+            }),
+            Ok(2)
+        );
+        assert_eq!(
+            file.write_slice_at_current_then(b"ef", |_data, offset| {
+                assert_eq!(offset, 2);
+                Err(VfsError::PermissionDenied)
+            }),
+            Err(VfsError::PermissionDenied)
+        );
+        let mut handle = &file;
+        assert_eq!(handle.seek(SeekFrom::Current(0)), Ok(2));
+        assert_eq!(&*state.write_offsets.lock(), &[0]);
+    }
+
+    #[test]
+    fn operation_position_transaction_commits_once_and_rolls_back_errors() {
+        let (file, _state) = append_test_file_with_access(
+            NodeFlags::NON_CACHEABLE,
+            16,
+            FileFlags::READ | FileFlags::WRITE,
+        );
+
+        assert_eq!(
+            file.with_current_position_transaction(8, |offset| {
+                assert_eq!(offset, 0);
+                // Model two internal chunks without publishing the intermediate
+                // cursor to lseek/read/write users of this description.
+                Ok((17, 6))
+            }),
+            Ok(17)
+        );
+        let mut handle = &file;
+        assert_eq!(handle.seek(SeekFrom::Current(0)), Ok(6));
+
+        assert_eq!(
+            file.with_current_position_transaction(4, |offset| {
+                assert_eq!(offset, 6);
+                Err::<((), usize), _>(VfsError::PermissionDenied)
+            }),
+            Err(VfsError::PermissionDenied)
+        );
+        assert_eq!(handle.seek(SeekFrom::Current(0)), Ok(6));
+        assert_eq!(
+            file.with_current_position_transaction(4, |_offset| Ok(((), 5))),
+            Err(VfsError::InvalidInput)
+        );
+        assert_eq!(handle.seek(SeekFrom::Current(0)), Ok(6));
+    }
+
+    #[test]
+    fn operation_position_transaction_hides_intermediate_cursor_from_concurrent_read() {
+        let (file, _state) = append_test_file_with_access(
+            NodeFlags::NON_CACHEABLE,
+            16,
+            FileFlags::READ | FileFlags::WRITE,
+        );
+        let file = Arc::new(file);
+        let (holding_tx, holding_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let transfer_file = file.clone();
+        let transfer = thread::spawn(move || {
+            transfer_file
+                .with_current_position_transaction(8, |offset| {
+                    assert_eq!(offset, 0);
+                    holding_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    // Model multiple positioned chunks whose aggregate cursor
+                    // update must not become visible until this callback ends.
+                    Ok(((), 6))
+                })
+                .unwrap();
+        });
+        holding_rx.recv().unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let observer_file = file.clone();
+        let observer = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let mut buf = [0u8; 2];
+            let read = observer_file.read_slice(&mut buf).unwrap();
+            let mut handle = observer_file.as_ref();
+            let position = handle.seek(SeekFrom::Current(0)).unwrap();
+            observed_tx.send((read, buf, position)).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert_eq!(
+            observed_rx.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+
+        release_tx.send(()).unwrap();
+        transfer.join().unwrap();
+        let (read, buf, position) = observed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        observer.join().unwrap();
+        assert_eq!(read, 2);
+        assert_eq!(&buf, b"gh");
+        assert_eq!(position, 8);
+    }
+
+    #[test]
+    fn same_description_transfer_can_write_at_its_frozen_position() {
+        let (file, state) = append_test_file_with_access(
+            NodeFlags::NON_CACHEABLE,
+            8,
+            FileFlags::READ | FileFlags::WRITE,
+        );
+        let mut buf = [0u8; 4];
+
+        assert_eq!(
+            file.read_slice_at_current_then(&mut buf, |data, offset| {
+                assert_eq!(data, b"abcd");
+                assert_eq!(offset, 0);
+                file.write_at_slice(data, offset)
+            }),
+            Ok(2)
+        );
+        let mut handle = &file;
+        assert_eq!(handle.seek(SeekFrom::Current(0)), Ok(2));
+        assert_eq!(&*state.read_offsets.lock(), &[0]);
+        assert_eq!(&*state.write_offsets.lock(), &[0]);
+    }
+
+    #[test]
+    fn explicit_end_ignores_non_append_default_for_all_write_forms() {
+        let (file, state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 41, FileFlags::WRITE);
+        let mut src = Cursor::new(&b"ab"[..]);
+        assert_eq!(
+            file.write_with_placement(&mut src, WritePlacement::End),
+            Ok(2)
+        );
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 1);
+        assert_eq!(state.inode_len.load(Ordering::Acquire), 43);
+
+        let (file, state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 41, FileFlags::WRITE);
+        assert_eq!(
+            file.write_slice_with_placement(b"abc", WritePlacement::End),
+            Ok(3)
+        );
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 1);
+        assert_eq!(state.inode_len.load(Ordering::Acquire), 44);
+
+        let (file, state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 41, FileFlags::WRITE);
+        assert_eq!(
+            file.write_vectored_slice_with_placement(&[b"ab", b"c"], WritePlacement::End),
+            Ok(3)
+        );
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 2);
+        assert_eq!(state.inode_len.load(Ordering::Acquire), 44);
+        assert_eq!(
+            file.write_slice_with_placement(b"x", WritePlacement::Current),
+            Err(VfsError::InvalidInput)
+        );
+        assert_eq!(&*state.write_offsets.lock(), &[44]);
+    }
+
+    #[test]
+    fn vectored_append_preserves_partial_and_error_position_semantics() {
+        let (file, state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 41, FileFlags::WRITE);
+        state.append_limit.store(1, Ordering::Release);
+        assert_eq!(
+            file.write_vectored_slice_with_placement(&[b"ab", b"cd"], WritePlacement::End),
+            Ok(1)
+        );
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 1);
+        assert_eq!(state.inode_len.load(Ordering::Acquire), 42);
+        assert_eq!(
+            file.write_slice_with_placement(b"x", WritePlacement::Current),
+            Err(VfsError::InvalidInput)
+        );
+        assert_eq!(&*state.write_offsets.lock(), &[42]);
+
+        let (file, state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 41, FileFlags::WRITE);
+        state.fail_append_call.store(1, Ordering::Release);
+        assert_eq!(
+            file.write_vectored_slice_with_placement(&[b"ab", b"cd"], WritePlacement::End),
+            Err(VfsError::InvalidInput)
+        );
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 2);
+        assert_eq!(state.inode_len.load(Ordering::Acquire), 43);
+        assert_eq!(
+            file.write_slice_with_placement(b"x", WritePlacement::Current),
+            Ok(1)
+        );
+        assert_eq!(&*state.write_offsets.lock(), &[0]);
+    }
+
+    #[test]
+    fn concurrent_vectored_appends_keep_each_scatter_list_contiguous() {
+        const WRITES: usize = 512;
+
+        let state = AppendTestState::new(0);
+        state.yield_after_append.store(true, Ordering::Release);
+        let fs = Filesystem::new(RegistryTestFs::new_for_append(
+            NodeFlags::NON_CACHEABLE,
+            state.clone(),
+        ));
+        let location = Mountpoint::new_root(&fs).root_location();
+        let left = Arc::new(File::new(
+            FileBackend::Direct(location.clone()),
+            FileFlags::WRITE,
+        ));
+        let right = Arc::new(File::new(FileBackend::Direct(location), FileFlags::WRITE));
+        let start = Arc::new(Barrier::new(3));
+
+        let left_thread = {
+            let file = left.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..WRITES {
+                    file.write_at_end_vectored_slice(&[b"A", b"a"]).unwrap();
+                }
+            })
+        };
+        let right_thread = {
+            let file = right.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..WRITES {
+                    file.write_at_end_vectored_slice(&[b"B", b"b"]).unwrap();
+                }
+            })
+        };
+        start.wait();
+        left_thread.join().unwrap();
+        right_thread.join().unwrap();
+
+        let markers = state.append_markers.lock().unwrap();
+        assert_eq!(markers.len(), WRITES * 4);
+        assert!(
+            markers
+                .chunks_exact(2)
+                .all(|pair| pair == b"Aa" || pair == b"Bb")
+        );
+        assert_eq!(state.inode_len.load(Ordering::Acquire), (WRITES * 4) as u64);
+    }
+
+    #[test]
+    fn positioned_end_writes_do_not_change_ofd_position() {
+        let (file, state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 41, FileFlags::WRITE);
+        let mut src = Cursor::new(&b"ab"[..]);
+        assert_eq!(file.write_at_end(&mut src), Ok(2));
+        assert_eq!(
+            file.write_slice_with_placement(b"x", WritePlacement::Current),
+            Ok(1)
+        );
+        assert_eq!(&*state.write_offsets.lock(), &[0]);
+
+        let (file, state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 41, FileFlags::WRITE);
+        assert_eq!(file.write_at_end_slice(b"ab"), Ok(2));
+        assert_eq!(
+            file.write_slice_with_placement(b"x", WritePlacement::Current),
+            Ok(1)
+        );
+        assert_eq!(&*state.write_offsets.lock(), &[0]);
+
+        let (file, state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 41, FileFlags::WRITE);
+        assert_eq!(file.write_at_end_vectored_slice(&[b"a", b"b"]), Ok(2));
+        assert_eq!(
+            file.write_slice_with_placement(b"x", WritePlacement::Current),
+            Ok(1)
+        );
+        assert_eq!(&*state.write_offsets.lock(), &[0]);
     }
 
     #[test]
@@ -3920,6 +4782,41 @@ mod tests {
         assert_eq!(state.append_calls.load(Ordering::Acquire), 1);
         assert!(state.write_offsets.lock().is_empty());
         assert_eq!(state.inode_len.load(Ordering::Acquire), 44);
+    }
+
+    #[test]
+    fn append_status_can_change_without_changing_write_authority() {
+        let (file, state) = append_test_file(NodeFlags::NON_CACHEABLE, 41);
+        file.set_append(false);
+        assert_eq!(file.write_slice(b"abc"), Ok(2));
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 0);
+        assert_eq!(&*state.write_offsets.lock(), &[0]);
+
+        let (file, state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 41, FileFlags::WRITE);
+        file.set_append(true);
+        assert!(file.flags().contains(FileFlags::APPEND));
+        assert_eq!(file.write_slice(b"abc"), Ok(3));
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 1);
+
+        let (file, state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 41, FileFlags::WRITE);
+        file.set_append(true);
+        file.set_append(false);
+        assert!(!file.flags().contains(FileFlags::APPEND));
+        assert_eq!(file.write_slice(b"abc"), Ok(2));
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 0);
+        assert_eq!(&*state.write_offsets.lock(), &[0]);
+
+        let (file, _state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 41, FileFlags::READ);
+        file.set_append(true);
+        assert!(file.flags().contains(FileFlags::APPEND));
+        assert!(matches!(
+            file.access(FileFlags::APPEND),
+            Err(VfsError::BadFileDescriptor)
+        ));
+        assert_eq!(file.write_slice(b"x"), Err(VfsError::BadFileDescriptor));
     }
 
     struct RegistryTestFs {
