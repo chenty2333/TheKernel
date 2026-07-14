@@ -751,7 +751,7 @@ struct Inode {
     metadata: Mutex<Metadata>,
     anonymous_linkable: Mutex<bool>,
     content: NodeContent,
-    xattrs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    xattrs: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
     user_data: NodeUserData,
 }
 
@@ -1095,7 +1095,7 @@ impl NodeOps for MemoryNode {
 }
 
 impl XattrProvider for MemoryNode {
-    fn get_xattr(&self, name: &str) -> VfsResult<Vec<u8>> {
+    fn get_xattr(&self, name: &[u8]) -> VfsResult<Vec<u8>> {
         let xattrs = self.inode.xattrs.lock();
         let value = xattrs
             .get(name)
@@ -1116,17 +1116,17 @@ impl XattrProvider for MemoryNode {
             .try_reserve_exact(required)
             .map_err(|_| VfsError::NoMemory)?;
         for name in xattrs.keys() {
-            result.extend_from_slice(name.as_bytes());
+            result.extend_from_slice(name);
             result.push(0);
         }
         Ok(result)
     }
 
-    fn set_xattr(&self, name: &str, value: &[u8], mode: XattrSetMode) -> VfsResult<()> {
+    fn set_xattr(&self, name: &[u8], value: &[u8], mode: XattrSetMode) -> VfsResult<()> {
         // Admit allocations independent of the map before taking the inode
         // lock. The existence decision itself remains serialized with
         // publication.
-        let owned_name = try_owned(name)?;
+        let owned_name = try_owned_bytes(name)?;
         let owned_value = try_owned_bytes(value)?;
         let replacement_size = name
             .len()
@@ -1143,7 +1143,7 @@ impl XattrProvider for MemoryNode {
         }
 
         let used_without_replaced = xattrs.iter().try_fold(0usize, |used, (key, old)| {
-            if key == name {
+            if key.as_slice() == name {
                 return Ok(used);
             }
             key.len()
@@ -1171,7 +1171,7 @@ impl XattrProvider for MemoryNode {
         Ok(())
     }
 
-    fn remove_xattr(&self, name: &str) -> VfsResult<()> {
+    fn remove_xattr(&self, name: &[u8]) -> VfsResult<()> {
         let retired = self
             .inode
             .xattrs
@@ -1675,27 +1675,27 @@ mod tests {
             .unwrap();
         let alias = root.link("xattr-alias", &file).unwrap();
 
-        assert_eq!(file.get_xattr("user.key"), Err(LinuxError::ENODATA.into()));
-        file.set_xattr("user.key", b"first", XattrSetMode::Create)
+        assert_eq!(file.get_xattr(b"user.key"), Err(LinuxError::ENODATA.into()));
+        file.set_xattr(b"user.key", b"first", XattrSetMode::Create)
             .unwrap();
-        assert_eq!(alias.get_xattr("user.key").unwrap(), b"first");
+        assert_eq!(alias.get_xattr(b"user.key").unwrap(), b"first");
 
         assert_eq!(
-            alias.set_xattr("user.key", b"wrong", XattrSetMode::Create),
+            alias.set_xattr(b"user.key", b"wrong", XattrSetMode::Create),
             Err(LinuxError::EEXIST.into())
         );
-        assert_eq!(file.get_xattr("user.key").unwrap(), b"first");
+        assert_eq!(file.get_xattr(b"user.key").unwrap(), b"first");
         assert_eq!(
-            file.set_xattr("user.missing", b"wrong", XattrSetMode::Replace),
+            file.set_xattr(b"user.missing", b"wrong", XattrSetMode::Replace),
             Err(LinuxError::ENODATA.into())
         );
 
         alias
-            .set_xattr("user.key", b"second", XattrSetMode::Replace)
+            .set_xattr(b"user.key", b"second", XattrSetMode::Replace)
             .unwrap();
-        file.set_xattr("security.test", b"value", XattrSetMode::Upsert)
+        file.set_xattr(b"security.test", b"value", XattrSetMode::Upsert)
             .unwrap();
-        assert_eq!(file.get_xattr("user.key").unwrap(), b"second");
+        assert_eq!(file.get_xattr(b"user.key").unwrap(), b"second");
 
         let listed = alias.list_xattrs().unwrap();
         let mut names = listed
@@ -1706,11 +1706,44 @@ mod tests {
         names.sort_unstable();
         assert_eq!(names, ["security.test", "user.key"]);
 
-        alias.remove_xattr("user.key").unwrap();
+        alias.remove_xattr(b"user.key").unwrap();
         assert_eq!(
-            file.remove_xattr("user.key"),
+            file.remove_xattr(b"user.key"),
             Err(LinuxError::ENODATA.into())
         );
+    }
+
+    #[test]
+    fn xattr_provider_preserves_raw_names_through_list_and_remove() {
+        let file = regular_file("raw-xattr-names");
+        let raw_name = b"user.raw-\xff-name";
+        let mut boundary_name = b"user.".to_vec();
+        boundary_name.resize(255, 0xfe);
+        assert_eq!(boundary_name.len(), 255);
+
+        file.set_xattr(raw_name, b"raw", XattrSetMode::Create)
+            .unwrap();
+        file.set_xattr(&boundary_name, b"boundary", XattrSetMode::Create)
+            .unwrap();
+        assert_eq!(file.get_xattr(raw_name).unwrap(), b"raw");
+        assert_eq!(file.get_xattr(&boundary_name).unwrap(), b"boundary");
+
+        let listed = file.list_xattrs().unwrap();
+        let names = listed
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&raw_name.as_slice()));
+        assert!(names.contains(&boundary_name.as_slice()));
+
+        file.remove_xattr(raw_name).unwrap();
+        file.remove_xattr(&boundary_name).unwrap();
+        assert_eq!(file.get_xattr(raw_name), Err(LinuxError::ENODATA.into()));
+        assert_eq!(
+            file.get_xattr(&boundary_name),
+            Err(LinuxError::ENODATA.into())
+        );
+        assert!(file.list_xattrs().unwrap().is_empty());
     }
 
     #[test]
@@ -1731,13 +1764,13 @@ mod tests {
         let first = file.clone();
         let first = thread::spawn(move || {
             first_start.wait();
-            first.set_xattr("user.atomic", b"first", XattrSetMode::Create)
+            first.set_xattr(b"user.atomic", b"first", XattrSetMode::Create)
         });
         let second_start = start.clone();
         let second = alias.clone();
         let second = thread::spawn(move || {
             second_start.wait();
-            second.set_xattr("user.atomic", b"second", XattrSetMode::Create)
+            second.set_xattr(b"user.atomic", b"second", XattrSetMode::Create)
         });
         start.wait();
 
@@ -1750,7 +1783,7 @@ mod tests {
                 .count(),
             1
         );
-        let value = file.get_xattr("user.atomic").unwrap();
+        let value = file.get_xattr(b"user.atomic").unwrap();
         assert!(value.as_slice() == b"first" || value.as_slice() == b"second");
     }
 
@@ -1760,11 +1793,11 @@ mod tests {
         let oversized = vec![0; TMPFS_XATTR_SIZE_MAX];
 
         assert_eq!(
-            file.set_xattr("user.too-large", &oversized, XattrSetMode::Create),
+            file.set_xattr(b"user.too-large", &oversized, XattrSetMode::Create),
             Err(LinuxError::ENOSPC.into())
         );
         assert_eq!(
-            file.get_xattr("user.too-large"),
+            file.get_xattr(b"user.too-large"),
             Err(LinuxError::ENODATA.into())
         );
     }

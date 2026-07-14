@@ -18,8 +18,8 @@ struct ParsedXattrName {
     len: usize,
 }
 
-fn parse_xattr_name(name: &str) -> Ext4Result<ParsedXattrName> {
-    if name.as_bytes().contains(&0) {
+fn parse_xattr_name(name: &[u8]) -> Ext4Result<ParsedXattrName> {
+    if name.contains(&0) {
         return Err(Ext4Error::new(EINVAL as _, "xattr name contains NUL"));
     }
 
@@ -64,7 +64,7 @@ fn try_zeroed(len: usize) -> Ext4Result<Vec<u8>> {
 }
 
 impl<Hal: SystemHal> InodeRef<Hal> {
-    fn xattr_size(&self, name: &str) -> Ext4Result<usize> {
+    fn xattr_size(&self, name: &[u8]) -> Ext4Result<usize> {
         let name = parse_xattr_name(name)?;
         let mut required = 0;
         unsafe {
@@ -82,7 +82,7 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         Ok(required)
     }
 
-    pub fn has_xattr(&self, name: &str) -> Ext4Result<bool> {
+    pub fn has_xattr(&self, name: &[u8]) -> Ext4Result<bool> {
         match self.xattr_size(name) {
             Ok(_) => Ok(true),
             Err(error) if error.code == ENODATA as i32 => Ok(false),
@@ -90,7 +90,7 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         }
     }
 
-    pub fn get_xattr(&self, name: &str) -> Ext4Result<Vec<u8>> {
+    pub fn get_xattr(&self, name: &[u8]) -> Ext4Result<Vec<u8>> {
         let name = parse_xattr_name(name)?;
         let mut required = 0;
         unsafe {
@@ -163,25 +163,25 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         Ok(names)
     }
 
-    pub fn set_xattr(&mut self, name: &str, value: &[u8]) -> Ext4Result<()> {
-		let name = parse_xattr_name(name)?;
-		let mut metadata_may_have_changed = false;
-		unsafe {
-			ext4_xattr_set_status(
-				self.inner.as_mut(),
-				name.index,
-				name.name,
-				name.len,
-				value.as_ptr().cast(),
-				value.len(),
-				&mut metadata_may_have_changed,
-			)
-		}
-		.context("ext4_xattr_set")
-		.map_err(|error| error.with_metadata_may_have_changed(metadata_may_have_changed))
+    pub fn set_xattr(&mut self, name: &[u8], value: &[u8]) -> Ext4Result<()> {
+        let name = parse_xattr_name(name)?;
+        let mut metadata_may_have_changed = false;
+        unsafe {
+            ext4_xattr_set_status(
+                self.inner.as_mut(),
+                name.index,
+                name.name,
+                name.len,
+                value.as_ptr().cast(),
+                value.len(),
+                &mut metadata_may_have_changed,
+            )
+        }
+        .context("ext4_xattr_set")
+        .map_err(|error| error.with_metadata_may_have_changed(metadata_may_have_changed))
     }
 
-    pub fn remove_xattr(&mut self, name: &str) -> Ext4Result<()> {
+    pub fn remove_xattr(&mut self, name: &[u8]) -> Ext4Result<()> {
         let name = parse_xattr_name(name)?;
         unsafe { ext4_xattr_remove(self.inner.as_mut(), name.index, name.name, name.len) }
             .context("ext4_xattr_remove")
@@ -372,35 +372,35 @@ mod tests {
         );
     }
 
-    fn suffix<'a>(parsed: &ParsedXattrName, source: &'a str) -> &'a [u8] {
+    fn suffix<'a>(parsed: &ParsedXattrName, source: &'a [u8]) -> &'a [u8] {
         if parsed.len == 0 {
             return &[];
         }
         let bytes = unsafe { slice::from_raw_parts(parsed.name.cast::<u8>(), parsed.len) };
         let offset = bytes.as_ptr() as usize - source.as_ptr() as usize;
-        &source.as_bytes()[offset..offset + parsed.len]
+        &source[offset..offset + parsed.len]
     }
 
     #[test]
     fn parser_preserves_ext4_namespace_indexes_and_suffixes() {
-        let user = "user.key";
+        let user = b"user.key";
         let parsed = parse_xattr_name(user).unwrap();
         assert_eq!(parsed.index, 1);
         assert_eq!(suffix(&parsed, user), b"key");
 
-        let acl = "system.posix_acl_access";
+        let acl = b"system.posix_acl_access";
         let parsed = parse_xattr_name(acl).unwrap();
         assert_eq!(parsed.index, 2);
         assert_eq!(suffix(&parsed, acl), b"");
 
-        let richacl = "system.richacl";
+        let richacl = b"system.richacl";
         let parsed = parse_xattr_name(richacl).unwrap();
         assert_eq!(parsed.index, 8);
         assert_eq!(suffix(&parsed, richacl), b"");
 
-        assert_eq!(parse_xattr_name("user.").unwrap_err().code, EINVAL as i32);
+        assert_eq!(parse_xattr_name(b"user.").unwrap_err().code, EINVAL as i32);
         assert_eq!(
-            parse_xattr_name("unknown.value").unwrap_err().code,
+            parse_xattr_name(b"unknown.value").unwrap_err().code,
             EINVAL as i32
         );
     }
@@ -423,15 +423,87 @@ mod tests {
         let ino = token.ino();
 
         fs.with_inode_ref_mut(ino, |inode| {
-            assert!(!inode.has_xattr("user.first")?);
-            inode.set_xattr("user.first", b"published")?;
-            assert_eq!(inode.get_xattr("user.first")?, b"published");
+            assert!(!inode.has_xattr(b"user.first")?);
+            inode.set_xattr(b"user.first", b"published")?;
+            assert_eq!(inode.get_xattr(b"user.first")?, b"published");
             Ok(())
         })
         .unwrap();
 
         fs.release_inode_handle(token);
         fs.shutdown().unwrap();
+    }
+
+    #[test]
+    fn raw_xattr_names_survive_real_ext4_reopen_and_remove() {
+        let image = formatted_ext4_image();
+        let raw_name = b"user.raw-\xff-name";
+        let mut boundary_name = b"user.".to_vec();
+        boundary_name.resize(255, 0xfe);
+        assert_eq!(boundary_name.len(), 255);
+
+        let mut fs = open_test_fs(&image);
+        let (token, _) = fs
+            .create(
+                EXT4_ROOT_INO,
+                "raw-xattr-names",
+                InodeType::RegularFile,
+                0o600,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let ino = token.ino();
+        fs.with_inode_ref_mut(ino, |inode| {
+            inode.set_xattr(raw_name, b"raw")?;
+            inode.set_xattr(&boundary_name, b"boundary")?;
+            assert_eq!(inode.get_xattr(raw_name)?, b"raw");
+            assert_eq!(inode.get_xattr(&boundary_name)?, b"boundary");
+            Ok(())
+        })
+        .unwrap();
+        fs.release_inode_handle(token);
+        fs.shutdown().unwrap();
+        drop(fs);
+
+        let mut fs = open_test_fs(&image);
+        let (ino, _) = fs.lookup_inode(EXT4_ROOT_INO, "raw-xattr-names").unwrap();
+        fs.with_inode_ref_mut(ino, |inode| {
+            assert_eq!(inode.get_xattr(raw_name)?, b"raw");
+            assert_eq!(inode.get_xattr(&boundary_name)?, b"boundary");
+            let listed = inode.list_xattrs()?;
+            let names = listed
+                .split(|byte| *byte == 0)
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>();
+            assert!(names.contains(&raw_name.as_slice()));
+            assert!(names.contains(&boundary_name.as_slice()));
+
+            inode.remove_xattr(raw_name)?;
+            inode.remove_xattr(&boundary_name)?;
+            assert!(!inode.has_xattr(raw_name)?);
+            assert!(!inode.has_xattr(&boundary_name)?);
+            assert!(inode.list_xattrs()?.is_empty());
+            Ok(())
+        })
+        .unwrap();
+        fs.shutdown().unwrap();
+        drop(fs);
+
+        let mut fs = open_test_fs(&image);
+        let (ino, _) = fs.lookup_inode(EXT4_ROOT_INO, "raw-xattr-names").unwrap();
+        fs.with_inode_ref(ino, |inode| {
+            assert!(!inode.has_xattr(raw_name)?);
+            assert!(!inode.has_xattr(&boundary_name)?);
+            assert!(inode.list_xattrs()?.is_empty());
+            Ok(())
+        })
+        .unwrap();
+        fs.shutdown().unwrap();
+        drop(fs);
+
+        assert_clean_ext4_image(&image);
     }
 
     #[test]
@@ -450,21 +522,21 @@ mod tests {
             )
             .unwrap();
         let ino = token.ino();
-        fs.with_inode_ref_mut(ino, |inode| inode.set_xattr("user.keep", b"old"))
+        fs.with_inode_ref_mut(ino, |inode| inode.set_xattr(b"user.keep", b"old"))
             .unwrap();
 
         let oversized = vec![0x5a; 8 * 1024];
         let error = fs
-            .with_inode_ref_mut(ino, |inode| inode.set_xattr("user.keep", &oversized))
+            .with_inode_ref_mut(ino, |inode| inode.set_xattr(b"user.keep", &oversized))
             .unwrap_err();
         assert_eq!(error.code, ENOSPC as i32);
         assert!(!error.metadata_may_have_changed());
 
-        fs.with_inode_ref_mut(ino, |inode| inode.set_xattr("user.after", b"usable"))
+        fs.with_inode_ref_mut(ino, |inode| inode.set_xattr(b"user.after", b"usable"))
             .unwrap();
         fs.with_inode_ref(ino, |inode| {
-            assert_eq!(inode.get_xattr("user.keep")?, b"old");
-            assert_eq!(inode.get_xattr("user.after")?, b"usable");
+            assert_eq!(inode.get_xattr(b"user.keep")?, b"old");
+            assert_eq!(inode.get_xattr(b"user.after")?, b"usable");
             Ok(())
         })
         .unwrap();
@@ -489,11 +561,11 @@ mod tests {
             )
             .unwrap();
         let ino = token.ino();
-        fs.with_inode_ref_mut(ino, |inode| inode.set_xattr("user.value", b"complete"))
+        fs.with_inode_ref_mut(ino, |inode| inode.set_xattr(b"user.value", b"complete"))
             .unwrap();
 
         fs.with_inode_ref(ino, |inode| {
-            let name = parse_xattr_name("user.value")?;
+            let name = parse_xattr_name(b"user.value")?;
             let mut output = [0xcc; 2];
             let mut required = 0;
             let result = unsafe {
@@ -525,21 +597,21 @@ mod tests {
         let (first, _) = fs.lookup_inode(EXT4_ROOT_INO, "a").unwrap();
         let (second, _) = fs.lookup_inode(EXT4_ROOT_INO, "b").unwrap();
         fs.with_inode_ref(first, |inode| {
-            assert_eq!(inode.get_xattr("user.shared")?, vec![0; 1024]);
+            assert_eq!(inode.get_xattr(b"user.shared")?, vec![0; 1024]);
             Ok(())
         })
         .unwrap();
         fs.with_inode_ref_mut(first, |inode| {
-            inode.set_xattr("user.shared", &vec![0x5a; 1024])
+            inode.set_xattr(b"user.shared", &vec![0x5a; 1024])
         })
         .unwrap();
         fs.with_inode_ref(first, |inode| {
-            assert_eq!(inode.get_xattr("user.shared")?, vec![0x5a; 1024]);
+            assert_eq!(inode.get_xattr(b"user.shared")?, vec![0x5a; 1024]);
             Ok(())
         })
         .unwrap();
         fs.with_inode_ref(second, |inode| {
-            assert_eq!(inode.get_xattr("user.shared")?, vec![0; 1024]);
+            assert_eq!(inode.get_xattr(b"user.shared")?, vec![0; 1024]);
             Ok(())
         })
         .unwrap();
@@ -567,8 +639,8 @@ mod tests {
         let ino = token.ino();
         let first_large = vec![0x5a; 1024];
         fs.with_inode_ref_mut(ino, |inode| {
-            inode.set_xattr("user.inline", b"disk-backed")?;
-            inode.set_xattr("user.external", &first_large)
+            inode.set_xattr(b"user.inline", b"disk-backed")?;
+            inode.set_xattr(b"user.external", &first_large)
         })
         .unwrap();
         fs.release_inode_handle(token);
@@ -579,8 +651,8 @@ mod tests {
         let (ino, node_type) = fs.lookup_inode(EXT4_ROOT_INO, "xattr-persistence").unwrap();
         assert_eq!(node_type, InodeType::RegularFile);
         fs.with_inode_ref(ino, |inode| {
-            assert_eq!(inode.get_xattr("user.inline")?, b"disk-backed");
-            assert_eq!(inode.get_xattr("user.external")?, first_large);
+            assert_eq!(inode.get_xattr(b"user.inline")?, b"disk-backed");
+            assert_eq!(inode.get_xattr(b"user.external")?, first_large);
             let listed = inode.list_xattrs()?;
             let mut names = listed
                 .split(|byte| *byte == 0)
@@ -594,8 +666,8 @@ mod tests {
 
         let second_large = vec![0xa5; 1536];
         fs.with_inode_ref_mut(ino, |inode| {
-            inode.remove_xattr("user.inline")?;
-            inode.set_xattr("user.external", &second_large)
+            inode.remove_xattr(b"user.inline")?;
+            inode.set_xattr(b"user.external", &second_large)
         })
         .unwrap();
         fs.shutdown().unwrap();
@@ -604,8 +676,8 @@ mod tests {
         let mut fs = open_test_fs(&image);
         let (ino, _) = fs.lookup_inode(EXT4_ROOT_INO, "xattr-persistence").unwrap();
         fs.with_inode_ref(ino, |inode| {
-            assert!(!inode.has_xattr("user.inline")?);
-            assert_eq!(inode.get_xattr("user.external")?, second_large);
+            assert!(!inode.has_xattr(b"user.inline")?);
+            assert_eq!(inode.get_xattr(b"user.external")?, second_large);
             assert_eq!(inode.list_xattrs()?, b"user.external\0");
             Ok(())
         })

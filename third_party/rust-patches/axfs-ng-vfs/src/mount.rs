@@ -939,7 +939,7 @@ impl Location {
         self.entry.xattr_provider()
     }
 
-    pub fn get_xattr(&self, name: &str) -> VfsResult<Vec<u8>> {
+    pub fn get_xattr(&self, name: &[u8]) -> VfsResult<Vec<u8>> {
         self.xattr_provider()
             .ok_or_else(unsupported_xattr)?
             .get_xattr(name)
@@ -951,13 +951,13 @@ impl Location {
             .list_xattrs()
     }
 
-    pub fn set_xattr(&self, name: &str, value: &[u8], mode: XattrSetMode) -> VfsResult<()> {
+    pub fn set_xattr(&self, name: &[u8], value: &[u8], mode: XattrSetMode) -> VfsResult<()> {
         self.xattr_provider()
             .ok_or_else(unsupported_xattr)?
             .set_xattr(name, value, mode)
     }
 
-    pub fn remove_xattr(&self, name: &str) -> VfsResult<()> {
+    pub fn remove_xattr(&self, name: &[u8]) -> VfsResult<()> {
         self.xattr_provider()
             .ok_or_else(unsupported_xattr)?
             .remove_xattr(name)
@@ -1948,7 +1948,7 @@ mod tests {
         let root = mount.root_location();
 
         assert_eq!(
-            LinuxError::from(root.get_xattr("user.key").unwrap_err()),
+            LinuxError::from(root.get_xattr(b"user.key").unwrap_err()),
             LinuxError::EOPNOTSUPP
         );
         assert_eq!(
@@ -1957,13 +1957,13 @@ mod tests {
         );
         assert_eq!(
             LinuxError::from(
-                root.set_xattr("user.key", b"value", XattrSetMode::Upsert)
+                root.set_xattr(b"user.key", b"value", XattrSetMode::Upsert)
                     .unwrap_err()
             ),
             LinuxError::EOPNOTSUPP
         );
         assert_eq!(
-            LinuxError::from(root.remove_xattr("user.key").unwrap_err()),
+            LinuxError::from(root.remove_xattr(b"user.key").unwrap_err()),
             LinuxError::EOPNOTSUPP
         );
     }

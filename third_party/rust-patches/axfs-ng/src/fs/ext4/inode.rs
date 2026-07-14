@@ -330,7 +330,7 @@ impl NodeOps for Inode {
 }
 
 impl XattrProvider for Inode {
-    fn get_xattr(&self, name: &str) -> VfsResult<alloc::vec::Vec<u8>> {
+    fn get_xattr(&self, name: &[u8]) -> VfsResult<alloc::vec::Vec<u8>> {
         self.fs
             .lock()
             .with_inode_ref(self.ino(), |inode| inode.get_xattr(name))
@@ -344,7 +344,7 @@ impl XattrProvider for Inode {
             .map_err(into_vfs_err)
     }
 
-    fn set_xattr(&self, name: &str, value: &[u8], mode: XattrSetMode) -> VfsResult<()> {
+    fn set_xattr(&self, name: &[u8], value: &[u8], mode: XattrSetMode) -> VfsResult<()> {
         self.fs
             .lock()
             .with_inode_ref_mut(self.ino(), |inode| {
@@ -355,7 +355,7 @@ impl XattrProvider for Inode {
             .map_err(into_vfs_err)
     }
 
-    fn remove_xattr(&self, name: &str) -> VfsResult<()> {
+    fn remove_xattr(&self, name: &[u8]) -> VfsResult<()> {
         self.fs
             .lock()
             .with_inode_ref_mut(self.ino(), |inode| inode.remove_xattr(name))
@@ -804,8 +804,6 @@ impl DirNodeOps for Inode {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[cfg(feature = "test-ramdisk")]
     use core::sync::atomic::AtomicBool;
     #[cfg(feature = "test-ramdisk")]
@@ -818,6 +816,8 @@ mod tests {
     use axdriver::{AxBlockDevice, SharedBlockDevice};
     #[cfg(feature = "test-ramdisk")]
     use axfs_ng_vfs::Mountpoint;
+
+    use super::*;
 
     #[cfg(feature = "test-ramdisk")]
     fn formatted_ext4_device() -> crate::MountedBlockDevice {
@@ -901,7 +901,7 @@ mod tests {
 
     #[cfg(feature = "test-ramdisk")]
     #[test]
-    fn ext4_xattr_first_vfs_set_on_a_fresh_inode_is_persistent() {
+    fn ext4_xattr_provider_preserves_raw_name_bytes() {
         let filesystem = Ext4Filesystem::new(formatted_ext4_device()).unwrap();
         let mount = Mountpoint::new_root(&filesystem);
         let root = mount.root_location();
@@ -913,9 +913,31 @@ mod tests {
             )
             .unwrap();
 
-        file.set_xattr("user.first", b"provider", XattrSetMode::Create)
+        let raw_name = b"user.raw-\xff-name";
+        let mut boundary_name = b"user.".to_vec();
+        boundary_name.resize(255, 0xfe);
+        assert_eq!(boundary_name.len(), 255);
+
+        file.set_xattr(b"user.first", b"provider", XattrSetMode::Create)
             .unwrap();
-        assert_eq!(file.get_xattr("user.first").unwrap(), b"provider");
+        file.set_xattr(raw_name, b"raw", XattrSetMode::Create)
+            .unwrap();
+        file.set_xattr(&boundary_name, b"boundary", XattrSetMode::Create)
+            .unwrap();
+        assert_eq!(file.get_xattr(b"user.first").unwrap(), b"provider");
+        assert_eq!(file.get_xattr(raw_name).unwrap(), b"raw");
+        assert_eq!(file.get_xattr(&boundary_name).unwrap(), b"boundary");
+        let listed = file.list_xattrs().unwrap();
+        let names = listed
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+            .collect::<alloc::vec::Vec<_>>();
+        assert!(names.contains(&b"user.first".as_slice()));
+        assert!(names.contains(&raw_name.as_slice()));
+        assert!(names.contains(&boundary_name.as_slice()));
+
+        file.remove_xattr(raw_name).unwrap();
+        file.remove_xattr(&boundary_name).unwrap();
         assert_eq!(file.list_xattrs().unwrap(), b"user.first\0");
 
         drop(file);

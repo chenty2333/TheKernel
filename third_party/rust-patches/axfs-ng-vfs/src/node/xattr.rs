@@ -21,16 +21,18 @@ pub enum XattrSetMode {
 /// serialization boundary. In particular, implementations must keep a size
 /// probe and snapshot copy together, and must serialize a create/replace
 /// existence decision with the corresponding mutation.
+///
+/// Names are opaque bytes. Namespace interpretation and ABI-specific length
+/// limits belong above this generic storage contract.
 pub trait XattrProvider: Send + Sync {
-    fn get_xattr(&self, name: &str) -> VfsResult<Vec<u8>>;
+    fn get_xattr(&self, name: &[u8]) -> VfsResult<Vec<u8>>;
 
-    /// Returns the Linux `listxattr` byte representation: complete names,
-    /// separated and terminated by NUL bytes.
+    /// Returns complete names separated and terminated by NUL bytes.
     fn list_xattrs(&self) -> VfsResult<Vec<u8>>;
 
-    fn set_xattr(&self, name: &str, value: &[u8], mode: XattrSetMode) -> VfsResult<()>;
+    fn set_xattr(&self, name: &[u8], value: &[u8], mode: XattrSetMode) -> VfsResult<()>;
 
-    fn remove_xattr(&self, name: &str) -> VfsResult<()>;
+    fn remove_xattr(&self, name: &[u8]) -> VfsResult<()>;
 }
 
 pub(crate) fn unsupported_xattr() -> VfsError {
