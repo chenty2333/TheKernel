@@ -1845,7 +1845,7 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
     // reservation across every check and publication after admission so exec
     // credential sampling cannot start in the old check-then-truncate gap.
     let write_open_key = executable::retain_write_open(&loc)?;
-    let truncate = (|| {
+    let truncate: AxResult<()> = (|| {
         let _lease_admission = lease::admit_truncate(&loc)?;
         memfd::check_resize(&loc, length as u64)?;
         check_mandatory_truncate_lock(
@@ -1857,8 +1857,11 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
             .write(true)
             .open_loc(loc.clone())?
             .into_file()?;
-        file.access(FileFlags::WRITE)?.set_len(length as _)?;
-        touch_modified_metadata(&loc)
+        File::set_len_with_killpriv(file.access(FileFlags::WRITE)?, length as _)?;
+        if let Err(error) = touch_modified_metadata(&loc) {
+            warn!("truncate metadata update failed after size mutation: {error}");
+        }
+        Ok(())
     })();
     executable::release_write_open(write_open_key);
     truncate?;
@@ -1899,8 +1902,10 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
         f.open_file_description_key(),
         status.nonblocking(),
     )?;
-    backend.set_len(length as _)?;
-    touch_modified_metadata(f.inner().location())?;
+    File::set_len_with_killpriv(backend, length as _)?;
+    if let Err(error) = touch_modified_metadata(f.inner().location()) {
+        warn!("ftruncate metadata update failed after size mutation: {error}");
+    }
     notify_write(fd);
     let _ = notify_exact(f.inner().location(), IN_ATTRIB);
     Ok(0)
@@ -1958,6 +1963,7 @@ pub fn sys_fallocate(
         0 => {
             check_resize_limit(size.max(end))?;
             memfd::check_resize(&loc, size.max(end))?;
+            File::killpriv_before_file_mutation(&loc)?;
             if let Some(result) = tmp::reserve_fallocate_range(&loc, offset, len, true) {
                 result?;
             } else {
@@ -1965,6 +1971,7 @@ pub fn sys_fallocate(
             }
         }
         FALLOC_FL_KEEP_SIZE => {
+            File::killpriv_before_file_mutation(&loc)?;
             if let Some(result) = tmp::reserve_fallocate_range(&loc, offset, len, false) {
                 result?;
             }
@@ -1973,16 +1980,13 @@ pub fn sys_fallocate(
             if seals & linux_raw_sys::general::F_SEAL_WRITE != 0 {
                 return Err(AxError::OperationNotPermitted);
             }
-            let hole_len = end.min(size).saturating_sub(offset);
-            if hole_len != 0 {
-                f.killpriv_for_content_mutation()?;
-            }
-            write_zero_range(file, offset, hole_len)?;
-            if let Some(result) = tmp::punch_hole_fallocate_range(&loc, offset, len) {
-                result?;
-            } else {
+            if !tmp::supports_fallocate_range(&loc) {
                 return Err(AxError::OperationNotSupported);
             }
+            let hole_len = end.min(size).saturating_sub(offset);
+            File::killpriv_before_file_mutation(&loc)?;
+            write_zero_range(file, offset, hole_len)?;
+            tmp::punch_hole_fallocate_range(&loc, offset, len).ok_or(AxError::BadState)??;
         }
         mode if mode == FALLOC_FL_ZERO_RANGE
             || mode == (FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE) =>
@@ -1990,16 +1994,18 @@ pub fn sys_fallocate(
             if seals & linux_raw_sys::general::F_SEAL_WRITE != 0 {
                 return Err(AxError::OperationNotPermitted);
             }
-            f.killpriv_for_content_mutation()?;
             let zero_end = if mode & FALLOC_FL_KEEP_SIZE != 0 {
                 end.min(size)
             } else {
                 check_resize_limit(size.max(end))?;
                 memfd::check_resize(&loc, size.max(end))?;
-                backend.set_len(size.max(end))?;
                 end
             };
             let zero_len = zero_end.saturating_sub(offset);
+            File::killpriv_before_file_mutation(&loc)?;
+            if mode & FALLOC_FL_KEEP_SIZE == 0 {
+                backend.set_len(size.max(end))?;
+            }
             write_zero_range(file, offset, zero_len)?;
             if let Some(result) = tmp::reserve_fallocate_range(&loc, offset, zero_len, false) {
                 result?;
@@ -2017,6 +2023,7 @@ pub fn sys_fallocate(
                 return Err(AxError::OperationNotPermitted);
             }
             memfd::check_resize(&loc, size - len)?;
+            File::killpriv_before_file_mutation(&loc)?;
             if let Some(result) = tmp::collapse_fallocate_range(&loc, offset, len) {
                 result?;
             } else {
@@ -2041,6 +2048,7 @@ pub fn sys_fallocate(
                 .ok_or_else(|| AxError::from(LinuxError::EFBIG))?;
             check_resize_limit(new_size)?;
             memfd::check_resize(&loc, new_size)?;
+            File::killpriv_before_file_mutation(&loc)?;
             backend.set_len(new_size)?;
             if let Some(result) = tmp::insert_fallocate_range(&loc, offset, len) {
                 result?;
@@ -2052,7 +2060,9 @@ pub fn sys_fallocate(
         _ => return Err(AxError::InvalidInput),
     }
 
-    touch_modified_metadata(&loc)?;
+    if let Err(error) = touch_modified_metadata(&loc) {
+        warn!("fallocate metadata update failed after file mutation: {error}");
+    }
     let _ = notify_exact(&loc, IN_MODIFY | IN_ATTRIB);
     Ok(0)
 }
@@ -3982,6 +3992,7 @@ mod tests {
     use axfs_ng_vfs::{
         DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata, MetadataUpdate,
         Mountpoint, NodeOps, NodePermission, NodeType, Reference, StatFs, VfsError, VfsResult,
+        XattrProvider, XattrSetMode,
     };
 
     use super::*;
@@ -3991,7 +4002,9 @@ mod tests {
         flags: NodeFlags,
         size: u64,
         fail_open: AtomicBool,
+        fail_remove_xattr: AtomicBool,
         open_calls: AtomicUsize,
+        remove_xattr_calls: AtomicUsize,
         set_len_calls: AtomicUsize,
     }
 
@@ -4002,7 +4015,9 @@ mod tests {
                 flags,
                 size,
                 fail_open: AtomicBool::new(false),
+                fail_remove_xattr: AtomicBool::new(false),
                 open_calls: AtomicUsize::new(0),
+                remove_xattr_calls: AtomicUsize::new(0),
                 set_len_calls: AtomicUsize::new(0),
             })
         }
@@ -4100,6 +4115,33 @@ mod tests {
         fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
             self
         }
+
+        fn xattr_provider(&self) -> Option<&dyn XattrProvider> {
+            Some(self)
+        }
+    }
+
+    impl XattrProvider for IoContractNode {
+        fn get_xattr(&self, _name: &str) -> VfsResult<Vec<u8>> {
+            Err(LinuxError::ENODATA.into())
+        }
+
+        fn list_xattrs(&self) -> VfsResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        fn set_xattr(&self, _name: &str, _value: &[u8], _mode: XattrSetMode) -> VfsResult<()> {
+            Ok(())
+        }
+
+        fn remove_xattr(&self, _name: &str) -> VfsResult<()> {
+            self.fs.remove_xattr_calls.fetch_add(1, Ordering::AcqRel);
+            if self.fs.fail_remove_xattr.load(Ordering::Acquire) {
+                Err(VfsError::Io)
+            } else {
+                Err(LinuxError::ENODATA.into())
+            }
+        }
     }
 
     impl Pollable for IoContractNode {
@@ -4167,6 +4209,26 @@ mod tests {
             Err(VfsError::PermissionDenied)
         ));
         assert_eq!(fs.open_calls.load(Ordering::Acquire), 1);
+        assert_eq!(fs.set_len_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn killpriv_failure_rejects_before_truncate_side_effects() {
+        let fs = IoContractFs::new(NodeFlags::NON_CACHEABLE, 17);
+        fs.fail_remove_xattr.store(true, Ordering::Release);
+        let mut options = OpenOptions::new();
+        options.write(true);
+        let file = options
+            .open_loc(fs.location())
+            .unwrap()
+            .into_file()
+            .unwrap();
+
+        assert_eq!(
+            File::set_len_with_killpriv(file.backend().unwrap(), 0),
+            Err(AxError::Io)
+        );
+        assert_eq!(fs.remove_xattr_calls.load(Ordering::Acquire), 1);
         assert_eq!(fs.set_len_calls.load(Ordering::Acquire), 0);
     }
 

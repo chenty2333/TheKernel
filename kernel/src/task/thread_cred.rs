@@ -9,9 +9,10 @@ use linux_raw_sys::general::{
 use super::{
     Kgid, Kuid, Thread,
     creds::{
-        CAPABILITY_WORDS, CapabilityState, Cred, CredentialSlot, Credentials, DacCredentialView,
-        GroupInfo, PreparedCred, SECBIT_KEEP_CAPS, SECBIT_KEEP_CAPS_LOCKED,
-        SECBIT_NO_CAP_AMBIENT_RAISE, SECBIT_NO_SETUID_FIXUP, SECURE_ALL_BITS, SECURE_ALL_LOCKS,
+        CAPABILITY_WORDS, CapabilityState, Cred, CredentialSlot, CredentialSnapshotGuard,
+        Credentials, DacCredentialView, GroupInfo, PreparedCred, SECBIT_KEEP_CAPS,
+        SECBIT_KEEP_CAPS_LOCKED, SECBIT_NO_CAP_AMBIENT_RAISE, SECBIT_NO_SETUID_FIXUP,
+        SECURE_ALL_BITS, SECURE_ALL_LOCKS,
     },
 };
 
@@ -116,6 +117,21 @@ impl Thread {
 impl Thread {
     pub(crate) fn current_cred(&self) -> Arc<Cred> {
         self.credential.current()
+    }
+
+    /// Pins this task's exact immutable credential across a composite
+    /// authorization/publication operation.  Callers must acquire this before
+    /// ptrace/image spin gates so credential publication keeps its established
+    /// writer -> image lock order.
+    pub(crate) fn lock_credential_snapshot(&self) -> CredentialSnapshotGuard<'_> {
+        self.credential.lock_snapshot()
+    }
+
+    /// Nonblocking counterpart used while a ptrace publication already owns
+    /// lifecycle/task-parent gates.  A busy writer makes the caller release
+    /// those outer gates and retry instead of inverting the lock order.
+    pub(crate) fn try_lock_credential_snapshot(&self) -> Option<CredentialSnapshotGuard<'_>> {
+        self.credential.try_lock_snapshot()
     }
 
     fn commit_credential<'a>(&self, prepared: PreparedCred<'a>) -> Arc<Cred> {

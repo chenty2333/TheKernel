@@ -56,6 +56,12 @@ fn pipe_capacity_limit() -> usize {
 }
 
 fn default_pipe_capacity() -> usize {
+    // Host unit tests do not initialize the scheduler/current-task slot. The
+    // fallback is the same default used when no Linux thread policy applies.
+    #[cfg(test)]
+    if axtask::current_may_uninit().is_none() {
+        return RING_BUFFER_INIT_SIZE;
+    }
     match current().try_as_thread() {
         Some(thr) if !thr.current_cred().is_initial_root_euid() => {
             RING_BUFFER_INIT_SIZE.min(pipe_capacity_limit())
@@ -962,6 +968,10 @@ fn notify_async_readable(async_io: &Mutex<PipeAsyncIo>) {
 }
 
 impl NamedPipe {
+    pub(crate) fn location(&self) -> &Location {
+        &self.location
+    }
+
     pub(crate) fn open(location: Location, flags: u32) -> AxResult<Self> {
         let access = PipeAccess::from_flags(flags)?;
         let nonblocking = flags & O_NONBLOCK != 0;

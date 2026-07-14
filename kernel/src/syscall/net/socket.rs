@@ -27,7 +27,7 @@ use super::addr::SocketAddrExt;
 use crate::{
     file::{
         AfAlgSocket, FileDescription, FileLike, NetlinkSocket, Socket, add_file_like_with_flags,
-        af_alg, close_file_like, get_file_like, reserve_fd,
+        af_alg, close_file_like, get_file_like, permission::VfsSecurityContext, reserve_fd,
     },
     mm::{UserConstPtr, UserPtr},
     task::{AsThread, NetworkNamespace, ns_capable},
@@ -249,11 +249,11 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
     {
         let curr = current();
         let proc_data = &curr.as_thread().proc_data;
-        let credentials = curr.as_thread().fs_dac_credentials();
+        let security = VfsSecurityContext::new(curr.as_thread().current_cred());
         crate::file::unix_socket::bind_path(
             unix,
             path.clone(),
-            &credentials,
+            &security,
             NodePermission::from_bits_truncate(0o777),
             proc_data.umask(),
         )?;

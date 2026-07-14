@@ -5,6 +5,8 @@
 #![feature(allocator_api)]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 #[macro_use]
 extern crate log;

@@ -29,10 +29,10 @@ use starry_vm::{VmMutPtr, VmPtr};
 use super::{
     AsThread, CommittedProcessExit, CommittingExecCredential, ExecImageCommit, FutexKey,
     ITimerType, ProcStateHint, Process, ProcessAccessState, ProcessData, ProcessGroup,
-    ProcessReparentBatch, Session, TaskParentNode, TaskUsage, Thread, ThreadExitTransition,
-    TimerState, futex_table_for, lock_task_parent_publication, process_domain, reap_process,
-    send_signal_thread_inner, send_signal_to_process, send_signal_to_process_data,
-    send_signal_to_thread, user::linux_pid_from_task_id,
+    ProcessReparentBatch, PtraceRelationshipSnapshot, Session, TaskParentNode, TaskUsage, Thread,
+    ThreadExitTransition, TimerState, futex_table_for, lock_task_parent_publication,
+    process_domain, reap_process, send_signal_thread_inner, send_signal_to_process,
+    send_signal_to_process_data, send_signal_to_thread, user::linux_pid_from_task_id,
 };
 use crate::{
     mm::{AddrSpace, UserPtr, access_user_memory},
@@ -876,33 +876,59 @@ pub fn vm_write_in_aspace<T: Copy>(
     with_current_user_page_table_root(root, || ptr.vm_write(value)).map_err(Into::into)
 }
 
-fn detach_ptrace_links_on_process_exit(proc_data: &ProcessData) {
+struct ProcessPtraceExitRetirements {
+    _traced_relationship: Option<PtraceRelationshipSnapshot>,
+    _reverse_links: super::process::PtraceReverseLinkDrain,
+}
+
+#[derive(Default)]
+struct ExitPtraceRetirements {
+    thread_reverse_links: Option<super::process::PtraceReverseLinkDrain>,
+    process: Option<ProcessPtraceExitRetirements>,
+}
+
+fn detach_ptrace_links_on_process_exit(proc_data: &ProcessData) -> ProcessPtraceExitRetirements {
     let pid = proc_data.proc.pid();
-    let traced_session = {
-        let _ptrace_action = proc_data.lock_ptrace_actions();
-        proc_data.clear_ptrace()
+    let traced_relationship = {
+        let ptrace_action = proc_data.lock_ptrace_actions();
+        let relationship = proc_data.clear_ptrace();
+        drop(ptrace_action);
+        relationship
     };
-    if let Some(session) = traced_session
-        && let Ok(tracer_data) = get_process_data(session.tracer)
-    {
-        tracer_data.remove_ptrace_tracee(super::PtraceReverseLink::new(pid, session));
+    if let Some(relationship) = traced_relationship.as_ref() {
+        let session = relationship.session();
+        if let Ok(tracer_data) = get_process_data(session.tracer) {
+            tracer_data.remove_ptrace_tracee(super::PtraceReverseLink::new(pid, session));
+        }
     }
 
-    detach_ptrace_reverse_links(proc_data.clear_ptrace_tracees());
+    let reverse_links = detach_ptrace_reverse_links(proc_data.clear_ptrace_tracees());
+    ProcessPtraceExitRetirements {
+        _traced_relationship: traced_relationship,
+        _reverse_links: reverse_links,
+    }
 }
 
-fn detach_ptrace_reverse_links(links: super::process::PtraceReverseLinkDrain) {
-    for link in links {
+fn detach_ptrace_reverse_links(
+    mut links: super::process::PtraceReverseLinkDrain,
+) -> super::process::PtraceReverseLinkDrain {
+    while links.retain_next_retirement(|link| {
         let Ok(tracee_data) = get_process_data(link.tracee()) else {
-            continue;
+            return None;
         };
-        let _ptrace_action = tracee_data.lock_ptrace_actions();
-        tracee_data.end_ptrace(link.session());
-    }
+        let ptrace_action = tracee_data.lock_ptrace_actions();
+        let retired_relationship = tracee_data.end_ptrace(link.session());
+        drop(ptrace_action);
+        retired_relationship
+    }) {}
+    links
 }
 
-fn detach_ptrace_links_on_thread_exit(proc_data: &ProcessData, tracer_kernel_tid: Pid) {
-    detach_ptrace_reverse_links(proc_data.clear_ptrace_tracees_for_task(tracer_kernel_tid));
+fn detach_ptrace_links_on_thread_exit(
+    proc_data: &ProcessData,
+    tracer_kernel_tid: Pid,
+) -> super::process::PtraceReverseLinkDrain {
+    detach_ptrace_reverse_links(proc_data.clear_ptrace_tracees_for_task(tracer_kernel_tid))
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -1283,6 +1309,10 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
             }
         }
     }
+    // Declared before the outer guards so every early unwind also releases
+    // lifecycle/task-parent serialization before any retained credential.
+    // Normal exit performs the same order explicitly at the end below.
+    let mut ptrace_retirements = ExitPtraceRetirements::default();
     let lifecycle = thr.proc_data.lock_process_lifecycle();
     let mut task_parent_publication = Some(lock_task_parent_publication());
     let final_exit = match remove_current_thread(process, tid, exit_code) {
@@ -1343,7 +1373,10 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // immutable kernel TID before a non-final thread can disappear. The
     // partition is allocation-free and all tracee work happens after its spin
     // lock has been released.
-    detach_ptrace_links_on_thread_exit(&thr.proc_data, thr.kernel_tid());
+    ptrace_retirements.thread_reverse_links = Some(detach_ptrace_links_on_thread_exit(
+        &thr.proc_data,
+        thr.kernel_tid(),
+    ));
 
     // A non-final task death is independent of process liveness: notify its
     // exact children now and move them to a live sibling. Process lifecycle
@@ -1416,7 +1449,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         // work, which must only become observable after those locks are gone.
         crate::file::release_process_fd_table(process.pid(), closed_fds);
         crate::file::inotify::wait_current_close_notifications();
-        detach_ptrace_links_on_process_exit(&thr.proc_data);
+        ptrace_retirements.process = Some(detach_ptrace_links_on_process_exit(&thr.proc_data));
         crate::syscall::clear_proc_shm(process.pid());
         task_parent_publication = Some(lock_task_parent_publication());
         let task_parent_guard = task_parent_publication
@@ -1490,7 +1523,12 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // thread-pidfd resolver must never observe removed membership paired with
     // a still-live task flag and retry the retired task identity.
     thr.set_exit();
+    // Both non-final and final paths have released their graph gate by here.
+    // Keep this defensive take adjacent to lifecycle release so future exit
+    // edits cannot accidentally move credential free callbacks back under it.
+    drop(task_parent_publication.take());
     drop(lifecycle);
+    drop(ptrace_retirements);
     thr.proc_data.exec_event.wake();
     thr.exit_event.wake();
     Ok(())

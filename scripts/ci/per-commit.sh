@@ -152,6 +152,13 @@ ci_run_step kernel-security-hook-tests "$STEP_TIMEOUT_SECS" \
     --tests --features bpf --target x86_64-unknown-linux-gnu \
     task::security::tests -- --test-threads=1
 
+ci_run_step kernel-named-create-transaction-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    file::namespace_mutation::tests -- --test-threads=1
+
 ci_run_step kernel-file-open-security-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
@@ -302,6 +309,13 @@ ci_run_step kernel-file-capability-xattr-tests "$STEP_TIMEOUT_SECS" \
     --tests --features bpf --target x86_64-unknown-linux-gnu \
     syscall::fs::xattr::tests -- --test-threads=1
 
+ci_run_step kernel-xattr-provider-policy-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf --target x86_64-unknown-linux-gnu \
+    file::xattr_provider::tests -- --test-threads=1
+
 ci_run_step kernel-credential-metadata-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
@@ -443,12 +457,31 @@ ci_run_step scope-local-tests "$STEP_TIMEOUT_SECS" \
 ci_run_step axfs-vfs-tests "$STEP_TIMEOUT_SECS" \
     "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/axfs-ng-vfs/Cargo.toml \
     --features spin/spin_mutex,spin/once
+ci_run_step axfs-ext4-xattr-provider-tests "$STEP_TIMEOUT_SECS" \
+	"${host_tool_env[@]}" \
+    "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/axfs-ng/Cargo.toml \
+	--features ext4,std,test-ramdisk \
+    fs::ext4::inode::tests::ext4_xattr_ -- --test-threads=1
 ci_run_step axfs-pathwalk-policy-tests "$STEP_TIMEOUT_SECS" \
     "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/axfs-ng/Cargo.toml \
-    pathwalk_policy_receives_real_components_and_final_position -- --test-threads=1
+    highlevel::fs::tests::pathwalk_ -- --test-threads=1
+ci_run_step axfs-final-component-resolution-tests "$STEP_TIMEOUT_SECS" \
+    "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/axfs-ng/Cargo.toml \
+    preserving_final_parent_resolution -- --test-threads=1
 ci_run_step axfs-file-open-contract-tests "$STEP_TIMEOUT_SECS" \
     "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/axfs-ng/Cargo.toml \
     highlevel::file::tests -- --test-threads=1
+ci_run_step axfs-named-create-admission-tests "$STEP_TIMEOUT_SECS" \
+    "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/axfs-ng/Cargo.toml \
+    highlevel::fs::tests::create_open -- --test-threads=1
+ci_run_step lwext4-namespace-timestamp-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/lwext4_rust/Cargo.toml \
+    --no-default-features --features std fs::tests -- --test-threads=1
+ci_run_step lwext4-xattr-persistence-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    "$SCRIPT_DIR/focused-cargo-test.sh" third_party/rust-patches/lwext4_rust/Cargo.toml \
+    --no-default-features --features std inode::xattr::tests -- --test-threads=1
 ci_run_step axnet-operation-snapshot-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
     "$SCRIPT_DIR/focused-cargo-test.sh" crates/axnet-ng/Cargo.toml \

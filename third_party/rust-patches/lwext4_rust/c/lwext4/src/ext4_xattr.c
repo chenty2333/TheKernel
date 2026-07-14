@@ -229,8 +229,8 @@ static const struct xattr_prefix prefix_tbl[] = {
     {"system.posix_acl_default", EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT},
     {"trusted.", EXT4_XATTR_INDEX_TRUSTED},
     {"security.", EXT4_XATTR_INDEX_SECURITY},
-    {"system.", EXT4_XATTR_INDEX_SYSTEM},
     {"system.richacl", EXT4_XATTR_INDEX_RICHACL},
+    {"system.", EXT4_XATTR_INDEX_SYSTEM},
     {NULL, 0},
 };
 
@@ -257,6 +257,8 @@ const char *ext4_extract_xattr_name(const char *full_name, size_t full_name_len,
 		    !memcmp(full_name, prefix_tbl[i].prefix, prefix_len)) {
 			bool require_name =
 			    prefix_tbl[i].prefix[prefix_len - 1] == '.';
+			if (!require_name && full_name_len != prefix_len)
+				continue;
 			*name_index = prefix_tbl[i].name_index;
 			if (name_len)
 				*name_len = full_name_len - prefix_len;
@@ -631,6 +633,28 @@ static bool ext4_xattr_is_ibody_valid(struct ext4_inode_ref *inode_ref)
 	return true;
 }
 
+/*
+ * A newly allocated inode has a valid extra-isize field, while the xattr
+ * portion itself remains zero until the first attribute is installed.  That
+ * state is an empty store, not corrupt metadata.  Keep the all-zero test
+ * separate from validation so a non-zero header with a bad magic value still
+ * fails closed.
+ */
+static bool ext4_xattr_is_ibody_uninitialized(struct ext4_inode_ref *inode_ref)
+{
+	struct ext4_fs *fs = inode_ref->fs;
+	size_t inode_size = ext4_get16(&fs->sb, inode_size);
+	const uint8_t *cursor =
+	    (const uint8_t *)EXT4_XATTR_IHDR(&fs->sb, inode_ref->inode);
+	const uint8_t *end = (const uint8_t *)inode_ref->inode + inode_size;
+
+	for (; cursor < end; cursor++) {
+		if (*cursor)
+			return false;
+	}
+	return true;
+}
+
 /**
  * @brief An EA entry finder for inode buffer
  */
@@ -673,11 +697,14 @@ static void ext4_xattr_ibody_initialize(struct ext4_inode_ref *inode_ref)
  * @param inode_ref Inode reference
  * @param block xattr block buffer
  */
-static void ext4_xattr_block_initialize(struct ext4_inode_ref *inode_ref,
-					struct ext4_block *block)
+static int ext4_xattr_block_initialize(struct ext4_inode_ref *inode_ref,
+					       struct ext4_block *block)
 {
 	struct ext4_xattr_header *header;
 	struct ext4_fs *fs = inode_ref->fs;
+	int ret = ext4_trans_set_block_dirty(block->buf);
+	if (ret != EOK)
+		return ret;
 
 	memset(block->data, 0, ext4_sb_get_block_size(&fs->sb));
 
@@ -685,8 +712,7 @@ static void ext4_xattr_block_initialize(struct ext4_inode_ref *inode_ref,
 	header->h_magic = to_le32(EXT4_XATTR_MAGIC);
 	header->h_refcount = to_le32(1);
 	header->h_blocks = to_le32(1);
-
-	ext4_trans_set_block_dirty(block->buf);
+	return EOK;
 }
 
 static void ext4_xattr_block_init_search(struct ext4_inode_ref *inode_ref,
@@ -767,9 +793,14 @@ static int ext4_xattr_ibody_find_entry(struct ext4_inode_ref *inode_ref,
 		return EOK;
 	}
 
-	/* Check the validity of the buffer */
-	if (!ext4_xattr_is_ibody_valid(inode_ref))
+	/* Check the validity of the buffer. */
+	if (!ext4_xattr_is_ibody_valid(inode_ref)) {
+		if (ext4_xattr_is_ibody_uninitialized(inode_ref)) {
+			finder->s.not_found = true;
+			return EOK;
+		}
 		return EIO;
+	}
 
 	iheader = EXT4_XATTR_IHDR(&fs->sb, inode_ref->inode);
 	finder->s.base = EXT4_XATTR_IFIRST(iheader);
@@ -786,9 +817,11 @@ static int ext4_xattr_ibody_find_entry(struct ext4_inode_ref *inode_ref,
  *
  * @return Error code
  */
-static int ext4_xattr_try_alloc_block(struct ext4_inode_ref *inode_ref)
+static int ext4_xattr_try_alloc_block(struct ext4_inode_ref *inode_ref,
+				      bool *metadata_may_have_changed)
 {
 	int ret = EOK;
+	bool allocation_changed = false;
 
 	ext4_fsblk_t xattr_block = 0;
 	xattr_block =
@@ -801,9 +834,13 @@ static int ext4_xattr_try_alloc_block(struct ext4_inode_ref *inode_ref)
 	if (!xattr_block) {
 		ext4_fsblk_t goal = ext4_fs_inode_to_goal_block(inode_ref);
 
-		ret = ext4_balloc_alloc_block(inode_ref, goal, &xattr_block);
-		if (ret != EOK)
+		ret = ext4_balloc_alloc_block_status(inode_ref, goal, &xattr_block,
+						      &allocation_changed);
+		if (ret != EOK) {
+			if (metadata_may_have_changed)
+				*metadata_may_have_changed = allocation_changed;
 			goto Finish;
+		}
 
 		ext4_inode_set_file_acl(inode_ref->inode, &inode_ref->fs->sb,
 					xattr_block);
@@ -820,8 +857,9 @@ Finish:
  *
  * @return Error code
  */
-static void ext4_xattr_try_free_block(struct ext4_inode_ref *inode_ref)
+static int ext4_xattr_try_free_block(struct ext4_inode_ref *inode_ref)
 {
+	int ret = EOK;
 	ext4_fsblk_t xattr_block;
 	xattr_block =
 	    ext4_inode_get_file_acl(inode_ref->inode, &inode_ref->fs->sb);
@@ -831,9 +869,10 @@ static void ext4_xattr_try_free_block(struct ext4_inode_ref *inode_ref)
 	if (xattr_block) {
 		ext4_inode_set_file_acl(inode_ref->inode, &inode_ref->fs->sb,
 					0);
-		ext4_balloc_free_block(inode_ref, xattr_block);
+		ret = ext4_balloc_free_block(inode_ref, xattr_block);
 		inode_ref->dirty = true;
 	}
+	return ret;
 }
 
 /**
@@ -868,6 +907,11 @@ int ext4_xattr_list(struct ext4_inode_ref *inode_ref,
 	 * If there is extra inode space and the xattr buffer in the
 	 * inode is valid.
 	 */
+	if (extra_isize && !ext4_xattr_is_ibody_valid(inode_ref) &&
+	    !ext4_xattr_is_ibody_uninitialized(inode_ref)) {
+		ret = EIO;
+		goto out;
+	}
 	if (extra_isize && ext4_xattr_is_ibody_valid(inode_ref)) {
 		iheader = EXT4_XATTR_IHDR(&fs->sb, inode_ref->inode);
 		entry = EXT4_XATTR_IFIRST(iheader);
@@ -980,6 +1024,105 @@ out:
 	return ret;
 }
 
+static int ext4_xattr_append_list_name(struct ext4_xattr_entry *entry,
+				       char **cursor, size_t *remaining,
+				       size_t *total, bool *too_small)
+{
+	const char *prefix;
+	size_t prefix_len;
+	size_t name_len = entry->e_name_len;
+	size_t required;
+
+	prefix = ext4_get_xattr_name_prefix(entry->e_name_index, &prefix_len);
+	/* Unknown indexes are filesystem-internal and have no stable full name. */
+	if (!prefix)
+		return EOK;
+	if (prefix_len > (size_t)-1 - name_len - 1)
+		return ERANGE;
+	required = prefix_len + name_len + 1;
+	if (*cursor && !*too_small) {
+		if (*remaining < required) {
+			*too_small = true;
+		} else {
+			memcpy(*cursor, prefix, prefix_len);
+			memcpy(*cursor + prefix_len, EXT4_XATTR_NAME(entry), name_len);
+			(*cursor)[prefix_len + name_len] = 0;
+			*cursor += required;
+			*remaining -= required;
+		}
+	}
+	*total += required;
+	return EOK;
+}
+
+/**
+ * @brief Write complete, NUL-terminated xattr names without constructing the
+ *        alignment-sensitive linked-list representation of ext4_xattr_list.
+ */
+int ext4_xattr_list_names(struct ext4_inode_ref *inode_ref, char *list,
+			  size_t size, size_t *list_len)
+{
+	int ret = EOK;
+	struct ext4_fs *fs = inode_ref->fs;
+	struct ext4_xattr_ibody_header *iheader;
+	struct ext4_xattr_entry *entry;
+	struct ext4_block block;
+	bool block_loaded = false;
+	bool too_small = false;
+	ext4_fsblk_t xattr_block;
+	size_t extra_isize;
+	size_t remaining = size;
+	size_t total = 0;
+	char *cursor = list;
+
+	extra_isize = ext4_inode_get_extra_isize(&fs->sb, inode_ref->inode);
+	xattr_block = ext4_inode_get_file_acl(inode_ref->inode, &fs->sb);
+	if (extra_isize && !ext4_xattr_is_ibody_valid(inode_ref) &&
+	    !ext4_xattr_is_ibody_uninitialized(inode_ref)) {
+		ret = EIO;
+		goto out;
+	}
+	if (extra_isize && ext4_xattr_is_ibody_valid(inode_ref)) {
+		iheader = EXT4_XATTR_IHDR(&fs->sb, inode_ref->inode);
+		entry = EXT4_XATTR_IFIRST(iheader);
+		for (; !EXT4_XATTR_IS_LAST_ENTRY(entry);
+		     entry = EXT4_XATTR_NEXT(entry)) {
+			ret = ext4_xattr_append_list_name(entry, &cursor, &remaining,
+						  &total, &too_small);
+			if (ret != EOK)
+				goto out;
+		}
+	}
+
+	if (xattr_block) {
+		ret = ext4_trans_block_get(fs->bdev, &block, xattr_block);
+		if (ret != EOK)
+			goto out;
+		block_loaded = true;
+		if (!ext4_xattr_is_block_valid(inode_ref, &block)) {
+			ret = EIO;
+			goto out;
+		}
+		entry = EXT4_XATTR_BFIRST(&block);
+		for (; !EXT4_XATTR_IS_LAST_ENTRY(entry);
+		     entry = EXT4_XATTR_NEXT(entry)) {
+			ret = ext4_xattr_append_list_name(entry, &cursor, &remaining,
+						  &total, &too_small);
+			if (ret != EOK)
+				goto out;
+		}
+	}
+
+	if (too_small)
+		ret = ERANGE;
+out:
+	if ((ret == EOK || ret == ERANGE) && list_len)
+		*list_len = total;
+	if (block_loaded)
+		ext4_block_set(fs->bdev, &block);
+	return ret;
+}
+
 /**
  * @brief Query EA entry's value with given name-index and name
  *
@@ -1026,8 +1169,11 @@ int ext4_xattr_get(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 		if (buf_len && buf) {
 			void *data_loc =
 			    (char *)ibody_finder.s.base + value_offs;
-			memcpy(buf, data_loc,
-			       (buf_len < value_len) ? buf_len : value_len);
+			if (buf_len < value_len) {
+				ret = ERANGE;
+				goto out;
+			}
+			memcpy(buf, data_loc, value_len);
 		}
 	} else {
 		struct ext4_block block;
@@ -1062,8 +1208,10 @@ int ext4_xattr_get(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 		if (buf_len && buf) {
 			void *data_loc =
 			    (char *)block_finder.s.base + value_offs;
-			memcpy(buf, data_loc,
-			       (buf_len < value_len) ? buf_len : value_len);
+			if (buf_len < value_len)
+				ret = ERANGE;
+			else
+				memcpy(buf, data_loc, value_len);
 		}
 
 		/*
@@ -1074,16 +1222,16 @@ int ext4_xattr_get(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 	}
 
 out:
-	if (ret == EOK && data_len)
+	if ((ret == EOK || ret == ERANGE) && data_len)
 		*data_len = value_len;
 
 	return ret;
 }
 
 /**
- * @brief Try to copy the content of an xattr block to a newly-allocated
- * 	  block. If the operation fails, the block buffer provided by
- * 	  caller will be freed
+ * @brief Try to copy the content of a shared xattr block to a newly-allocated
+ * 	  block. The caller always retains ownership of the original buffer and,
+ * 	  on success, receives ownership of the new buffer.
  *
  * @param inode_ref Inode reference
  * @param block The block buffer reference
@@ -1096,9 +1244,12 @@ out:
 static int ext4_xattr_copy_new_block(struct ext4_inode_ref *inode_ref,
 				     struct ext4_block *block,
 				     struct ext4_block *new_block,
-				     ext4_fsblk_t *orig_block, bool *allocated)
+				     ext4_fsblk_t *orig_block, bool *allocated,
+				     bool *metadata_may_have_changed)
 {
 	int ret = EOK;
+	bool allocation_changed = false;
+	bool new_block_loaded = false;
 	ext4_fsblk_t xattr_block = 0;
 	struct ext4_xattr_header *header;
 	struct ext4_fs *fs = inode_ref->fs;
@@ -1109,17 +1260,43 @@ static int ext4_xattr_copy_new_block(struct ext4_inode_ref *inode_ref,
 
 	if (allocated)
 		*allocated = false;
+	if (metadata_may_have_changed)
+		*metadata_may_have_changed = false;
 
 	/* Only do copy when a block is referenced by more than one inode. */
 	if (to_le32(header->h_refcount) > 1) {
 		ext4_fsblk_t goal = ext4_fs_inode_to_goal_block(inode_ref);
+		uint64_t orig_inode_blocks = ext4_inode_get_blocks_count(
+		    &fs->sb, inode_ref->inode);
+		uint32_t xattr_inode_blocks =
+		    ext4_sb_get_block_size(&fs->sb) / EXT4_INODE_BLOCK_SIZE;
+
+		if (orig_inode_blocks < xattr_inode_blocks)
+			return EIO;
 
 		/* Allocate a new block to be used by this inode */
-		ret = ext4_balloc_alloc_block(inode_ref, goal, &xattr_block);
+		ret = ext4_balloc_alloc_block_status(inode_ref, goal, &xattr_block,
+						      &allocation_changed);
+		if (ret != EOK) {
+			if (metadata_may_have_changed)
+				*metadata_may_have_changed = allocation_changed;
+			goto out;
+		}
+
+		ret = ext4_trans_block_get(fs->bdev, new_block, xattr_block);
+		if (ret != EOK)
+			goto out;
+		new_block_loaded = true;
+		ret = ext4_trans_set_block_dirty(block->buf);
+		if (ret != EOK)
+			goto out;
+		ret = ext4_trans_set_block_dirty(new_block->buf);
 		if (ret != EOK)
 			goto out;
 
-		ret = ext4_trans_block_get(fs->bdev, new_block, xattr_block);
+		/* COW replaces an already-accounted xattr block for this inode. */
+		ret = ext4_inode_set_blocks_count(&fs->sb, inode_ref->inode,
+						  orig_inode_blocks);
 		if (ret != EOK)
 			goto out;
 
@@ -1132,19 +1309,35 @@ static int ext4_xattr_copy_new_block(struct ext4_inode_ref *inode_ref,
 		 * by one
 		 */
 		header->h_refcount = to_le32(to_le32(header->h_refcount) - 1);
-		ext4_trans_set_block_dirty(block->buf);
-		ext4_trans_set_block_dirty(new_block->buf);
+		ext4_xattr_set_block_checksum(inode_ref, block->lb_id, header);
 
 		header = EXT4_XATTR_BHDR(new_block);
 		header->h_refcount = to_le32(1);
+		ext4_xattr_set_block_checksum(inode_ref, new_block->lb_id, header);
 
 		if (allocated)
 			*allocated = true;
+		new_block_loaded = false;
 	}
 out:
+	if (ret != EOK && new_block_loaded) {
+		int release_ret = ext4_block_set(fs->bdev, new_block);
+		if (release_ret != EOK) {
+			if (metadata_may_have_changed)
+				*metadata_may_have_changed = true;
+			ret = release_ret;
+		}
+	}
 	if (xattr_block) {
-		if (ret != EOK)
-			ext4_balloc_free_block(inode_ref, xattr_block);
+		if (ret != EOK) {
+			int cleanup_ret =
+			    ext4_balloc_free_block(inode_ref, xattr_block);
+			if (cleanup_ret != EOK) {
+				if (metadata_may_have_changed)
+					*metadata_may_have_changed = true;
+				ret = cleanup_ret;
+			}
+		}
 		else {
 			/*
 			 * Modify the in-inode pointer to point to the new xattr block
@@ -1214,59 +1407,84 @@ int ext4_xattr_remove(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 		}
 		use_block = true;
 	}
+	if (ibody_finder.s.not_found && !xattr_block) {
+		ret = ENODATA;
+		goto out;
+	}
 
 	if (use_block) {
 		bool allocated = false;
-		struct ext4_block new_block;
+		bool active_loaded = false;
+		struct ext4_block active_block;
 
 		/*
 		 * There will be no effect when the xattr block is only referenced
 		 * once.
 		 */
-		ret = ext4_xattr_copy_new_block(inode_ref, &block, &new_block,
-						&xattr_block, &allocated);
+		ret = ext4_xattr_copy_new_block(inode_ref, &block, &active_block,
+						&xattr_block, &allocated, NULL);
 		if (ret != EOK)
 			goto out;
 
+		active_loaded = true;
 		if (!allocated) {
-			/* Prevent double-freeing */
+			/* Ownership of the original reference moves to active_block. */
 			block_loaded = false;
-			new_block = block;
+			active_block = block;
 		}
 
 		ret = ext4_xattr_block_find_entry(inode_ref, &block_finder,
-						  &new_block);
+						  &active_block);
 		if (ret != EOK)
-			goto out;
+			goto release_active;
+		if (block_finder.s.not_found) {
+			ret = EIO;
+			goto release_active;
+		}
+		ret = ext4_trans_set_block_dirty(active_block.buf);
+		if (ret != EOK)
+			goto release_active;
 
 		/* Now remove the entry */
-		ext4_xattr_set_entry(&i, &block_finder.s, false);
+		ret = ext4_xattr_set_entry(&i, &block_finder.s, false);
+		if (ret != EOK)
+			goto release_active;
 
 		if (ext4_xattr_is_empty(&block_finder.s)) {
-			ext4_block_set(fs->bdev, &new_block);
-			ext4_xattr_try_free_block(inode_ref);
+			ret = ext4_block_set(fs->bdev, &active_block);
+			active_loaded = false;
+			if (ret != EOK)
+				goto out;
+			ret = ext4_xattr_try_free_block(inode_ref);
 		} else {
 			struct ext4_xattr_header *header =
-			    EXT4_XATTR_BHDR(&new_block);
-			header = EXT4_XATTR_BHDR(&new_block);
+			    EXT4_XATTR_BHDR(&active_block);
 			ext4_assert(block_finder.s.first);
 			ext4_xattr_rehash(header, block_finder.s.first);
 			ext4_xattr_set_block_checksum(inode_ref,
-						      block.lb_id,
+						      active_block.lb_id,
 						      header);
+		}
 
-			ext4_trans_set_block_dirty(new_block.buf);
-			ext4_block_set(fs->bdev, &new_block);
+	release_active:
+		if (active_loaded) {
+			int release_ret = ext4_block_set(fs->bdev, &active_block);
+			if (release_ret != EOK)
+				ret = release_ret;
 		}
 
 	} else {
 		/* Now remove the entry */
-		ext4_xattr_set_entry(&i, &block_finder.s, false);
-		inode_ref->dirty = true;
+		ret = ext4_xattr_set_entry(&i, &ibody_finder.s, false);
+		if (ret == EOK)
+			inode_ref->dirty = true;
 	}
 out:
-	if (block_loaded)
-		ext4_block_set(fs->bdev, &block);
+	if (block_loaded) {
+		int release_ret = ext4_block_set(fs->bdev, &block);
+		if (release_ret != EOK)
+			ret = release_ret;
+	}
 
 	return ret;
 }
@@ -1279,16 +1497,31 @@ out:
  *
  * @return Error code
  */
+static bool ext4_xattr_fits_empty_block(struct ext4_inode_ref *inode_ref,
+					struct ext4_xattr_info *i)
+{
+	size_t block_size = ext4_sb_get_block_size(&inode_ref->fs->sb);
+	size_t fixed = sizeof(struct ext4_xattr_header) + sizeof(uint32_t);
+	size_t name_size = EXT4_XATTR_LEN(i->name_len);
+	size_t value_size = EXT4_XATTR_SIZE(i->value_len);
+
+	return fixed <= block_size && name_size <= block_size - fixed &&
+	       value_size <= block_size - fixed - name_size;
+}
+
 static int ext4_xattr_block_set(struct ext4_inode_ref *inode_ref,
-				struct ext4_xattr_info *i,
-				bool no_insert)
+				struct ext4_xattr_info *i, bool no_insert,
+				bool *metadata_may_have_changed)
 {
 	int ret = EOK;
 	bool allocated = false;
+	bool partial = false;
 	struct ext4_fs *fs = inode_ref->fs;
 	struct ext4_block block, new_block;
 	ext4_fsblk_t orig_xattr_block;
 
+	if (metadata_may_have_changed)
+		*metadata_may_have_changed = false;
 	orig_xattr_block = ext4_inode_get_file_acl(inode_ref->inode, &fs->sb);
 
 	ext4_assert(i->value);
@@ -1296,45 +1529,58 @@ static int ext4_xattr_block_set(struct ext4_inode_ref *inode_ref,
 		struct ext4_xattr_search s;
 		struct ext4_xattr_header *header;
 
-		/* If insertion of new entry is not allowed... */
-		if (no_insert) {
-			ret = ENODATA;
-			goto out;
-		}
+		if (no_insert)
+			return ENODATA;
+		/* Reject an impossible value before allocating any metadata. */
+		if (!ext4_xattr_fits_empty_block(inode_ref, i))
+			return ENOSPC;
 
-		ret = ext4_xattr_try_alloc_block(inode_ref);
+		ret = ext4_xattr_try_alloc_block(inode_ref, &partial);
 		if (ret != EOK)
 			goto out;
 
 		orig_xattr_block =
 		    ext4_inode_get_file_acl(inode_ref->inode, &fs->sb);
 		ret = ext4_trans_block_get(fs->bdev, &block, orig_xattr_block);
-		if (ret != EOK) {
-			ext4_xattr_try_free_block(inode_ref);
-			goto out;
-		}
-
-		ext4_xattr_block_initialize(inode_ref, &block);
-		ext4_xattr_block_init_search(inode_ref, &s, &block);
-
-		ret = ext4_xattr_set_entry(i, &s, false);
-		if (ret == EOK) {
-			header = EXT4_XATTR_BHDR(&block);
-
-			ext4_assert(s.here);
-			ext4_assert(s.first);
-			ext4_xattr_compute_hash(header, s.here);
-			ext4_xattr_rehash(header, s.first);
-			ext4_xattr_set_block_checksum(inode_ref,
-						      block.lb_id,
-						      header);
-			ext4_trans_set_block_dirty(block.buf);
-		}
-		ext4_block_set(fs->bdev, &block);
 		if (ret != EOK)
-			ext4_xattr_try_free_block(inode_ref);
+			goto rollback_new_block;
 
-	} else {
+		ret = ext4_xattr_block_initialize(inode_ref, &block);
+		if (ret == EOK) {
+			ext4_xattr_block_init_search(inode_ref, &s, &block);
+			ret = ext4_xattr_set_entry(i, &s, false);
+			if (ret == EOK) {
+				header = EXT4_XATTR_BHDR(&block);
+				ext4_assert(s.here);
+				ext4_assert(s.first);
+				ext4_xattr_compute_hash(header, s.here);
+				ext4_xattr_rehash(header, s.first);
+				ext4_xattr_set_block_checksum(inode_ref, block.lb_id,
+							      header);
+			}
+		}
+		{
+			int release_ret = ext4_block_set(fs->bdev, &block);
+			if (release_ret != EOK) {
+				partial = true;
+				ret = release_ret;
+			}
+		}
+		if (ret == EOK)
+			goto out;
+
+	rollback_new_block:
+		{
+			int cleanup_ret = ext4_xattr_try_free_block(inode_ref);
+			if (cleanup_ret != EOK) {
+				partial = true;
+				ret = cleanup_ret;
+			}
+		}
+		goto out;
+	}
+
+	{
 		struct ext4_xattr_finder finder;
 		struct ext4_xattr_header *header;
 		finder.i = *i;
@@ -1342,67 +1588,78 @@ static int ext4_xattr_block_set(struct ext4_inode_ref *inode_ref,
 		if (ret != EOK)
 			goto out;
 
-		header = EXT4_XATTR_BHDR(&block);
-
-		/*
-		 * Consider the following case when insertion of new
-		 * entry is not allowed
-		 */
-		if (to_le32(header->h_refcount) > 1 && no_insert) {
-			/*
-			 * There are other people referencing the
-			 * same xattr block
-			 */
-			ret = ext4_xattr_block_find_entry(inode_ref, &finder, &block);
-			if (ret != EOK) {
-				ext4_block_set(fs->bdev, &block);
-				goto out;
-			}
-			if (finder.s.not_found) {
-				ext4_block_set(fs->bdev, &block);
-				ret = ENODATA;
-				goto out;
-			}
+		/* Validate, find, and capacity-check before a shared-block COW. */
+		ret = ext4_xattr_block_find_entry(inode_ref, &finder, &block);
+		if (ret != EOK)
+			goto release_original;
+		if (no_insert && finder.s.not_found) {
+			ret = ENODATA;
+			goto release_original;
 		}
+		ret = ext4_xattr_set_entry(i, &finder.s, true);
+		if (ret != EOK)
+			goto release_original;
 
-		/*
-		 * There will be no effect when the xattr block is only referenced
-		 * once.
-		 */
 		ret = ext4_xattr_copy_new_block(inode_ref, &block, &new_block,
-						&orig_xattr_block, &allocated);
-		if (ret != EOK) {
-			ext4_block_set(fs->bdev, &block);
-			goto out;
-		}
+						&orig_xattr_block, &allocated,
+						&partial);
+		if (ret != EOK)
+			goto release_original;
 
 		if (allocated) {
-			ext4_block_set(fs->bdev, &block);
-			new_block = block;
+			/* The inode now names a new block and both refcounts changed. */
+			partial = true;
+			int release_ret = ext4_block_set(fs->bdev, &block);
+			if (release_ret != EOK) {
+				int new_release_ret =
+				    ext4_block_set(fs->bdev, &new_block);
+				ret = new_release_ret != EOK ? new_release_ret
+								 : release_ret;
+				goto out;
+			}
+			block = new_block;
+			finder.i = *i;
+			ret = ext4_xattr_block_find_entry(inode_ref, &finder, &block);
+			if (ret != EOK)
+				goto release_active;
 		}
 
-		ret = ext4_xattr_block_find_entry(inode_ref, &finder, &block);
-		if (ret != EOK) {
-			ext4_block_set(fs->bdev, &block);
-			goto out;
-		}
-
+		ret = ext4_trans_set_block_dirty(block.buf);
+		if (ret != EOK)
+			goto release_active;
 		ret = ext4_xattr_set_entry(i, &finder.s, false);
 		if (ret == EOK) {
 			header = EXT4_XATTR_BHDR(&block);
-
 			ext4_assert(finder.s.here);
 			ext4_assert(finder.s.first);
 			ext4_xattr_compute_hash(header, finder.s.here);
 			ext4_xattr_rehash(header, finder.s.first);
-			ext4_xattr_set_block_checksum(inode_ref,
-						      block.lb_id,
-						      header);
-			ext4_trans_set_block_dirty(block.buf);
+			ext4_xattr_set_block_checksum(inode_ref, block.lb_id, header);
 		}
-		ext4_block_set(fs->bdev, &block);
+
+release_active:
+		{
+			int release_ret = ext4_block_set(fs->bdev, &block);
+			if (release_ret != EOK) {
+				partial = true;
+				ret = release_ret;
+			}
+		}
+		goto out;
+
+release_original:
+		{
+			int release_ret = ext4_block_set(fs->bdev, &block);
+			if (release_ret != EOK) {
+				partial = true;
+				ret = release_ret;
+			}
+		}
 	}
+
 out:
+	if (ret != EOK && metadata_may_have_changed)
+		*metadata_may_have_changed = partial;
 	return ret;
 }
 
@@ -1428,43 +1685,73 @@ static int ext4_xattr_block_remove(struct ext4_inode_ref *inode_ref,
 	orig_xattr_block = ext4_inode_get_file_acl(inode_ref->inode, &fs->sb);
 
 	ext4_assert(orig_xattr_block);
+	finder.i = *i;
 	ret = ext4_trans_block_get(fs->bdev, &block, orig_xattr_block);
 	if (ret != EOK)
 		goto out;
+	ret = ext4_xattr_block_find_entry(inode_ref, &finder, &block);
+	if (ret != EOK)
+		goto release_original;
+	if (finder.s.not_found) {
+		ret = EIO;
+		goto release_original;
+	}
 
 	/*
 	 * There will be no effect when the xattr block is only referenced
 	 * once.
 	 */
 	ret = ext4_xattr_copy_new_block(inode_ref, &block, &new_block,
-					&orig_xattr_block, &allocated);
-	if (ret != EOK) {
-		ext4_block_set(fs->bdev, &block);
-		goto out;
-	}
+					&orig_xattr_block, &allocated, NULL);
+	if (ret != EOK)
+		goto release_original;
 
 	if (allocated) {
-		ext4_block_set(fs->bdev, &block);
+		int release_ret = ext4_block_set(fs->bdev, &block);
+		if (release_ret != EOK) {
+			int new_release_ret = ext4_block_set(fs->bdev, &new_block);
+			ret = new_release_ret != EOK ? new_release_ret : release_ret;
+			goto out;
+		}
 		block = new_block;
 	}
 
-	ext4_xattr_block_find_entry(inode_ref, &finder, &block);
-
-	if (!finder.s.not_found) {
-		i->value = NULL;
-		ret = ext4_xattr_set_entry(i, &finder.s, false);
-		i->value = value;
-
-		header = EXT4_XATTR_BHDR(&block);
-		ext4_assert(finder.s.first);
-		ext4_xattr_rehash(header, finder.s.first);
-		ext4_xattr_set_block_checksum(inode_ref,
-					      block.lb_id,
-					      header);
-		ext4_trans_set_block_dirty(block.buf);
+	ret = ext4_xattr_block_find_entry(inode_ref, &finder, &block);
+	if (ret != EOK)
+		goto release_active;
+	if (finder.s.not_found) {
+		ret = EIO;
+		goto release_active;
 	}
+	ret = ext4_trans_set_block_dirty(block.buf);
+	if (ret != EOK)
+		goto release_active;
 
-	ext4_block_set(fs->bdev, &block);
+	i->value = NULL;
+	ret = ext4_xattr_set_entry(i, &finder.s, false);
+	i->value = value;
+	if (ret != EOK)
+		goto release_active;
+
+	header = EXT4_XATTR_BHDR(&block);
+	ext4_assert(finder.s.first);
+	ext4_xattr_rehash(header, finder.s.first);
+	ext4_xattr_set_block_checksum(inode_ref, block.lb_id, header);
+
+	release_active:
+	{
+		int release_ret = ext4_block_set(fs->bdev, &block);
+		if (release_ret != EOK)
+			ret = release_ret;
+	}
+	goto out;
+
+	release_original:
+	{
+		int release_ret = ext4_block_set(fs->bdev, &block);
+		if (release_ret != EOK)
+			ret = release_ret;
+	}
 out:
 	return ret;
 }
@@ -1481,11 +1768,14 @@ out:
  *
  * @return Error code
  */
-int ext4_xattr_set(struct ext4_inode_ref *inode_ref, uint8_t name_index,
-		   const char *name, size_t name_len, const void *value,
-		   size_t value_len)
+int ext4_xattr_set_status(struct ext4_inode_ref *inode_ref,
+			  uint8_t name_index, const char *name,
+			  size_t name_len, const void *value,
+			  size_t value_len,
+			  bool *metadata_may_have_changed)
 {
 	int ret = EOK;
+	bool partial = false;
 	struct ext4_fs *fs = inode_ref->fs;
 	struct ext4_xattr_finder ibody_finder;
 	struct ext4_xattr_info i;
@@ -1493,6 +1783,8 @@ int ext4_xattr_set(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 	ext4_fsblk_t orig_xattr_block;
 	size_t extra_isize =
 	    ext4_inode_get_extra_isize(&fs->sb, inode_ref->inode);
+	if (metadata_may_have_changed)
+		*metadata_may_have_changed = false;
 
 	i.name_index = name_index;
 	i.name = name;
@@ -1509,20 +1801,27 @@ int ext4_xattr_set(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 	 * finder is still valid and can be used to insert entry.
 	 */
 	ret = ext4_xattr_ibody_find_entry(inode_ref, &ibody_finder);
-	if (ret != EOK) {
+	if (ret != EOK)
+		goto out;
+	if (extra_isize && !ibody_finder.s.base) {
 		ext4_xattr_ibody_initialize(inode_ref);
-		ext4_xattr_ibody_find_entry(inode_ref, &ibody_finder);
+		ret = ext4_xattr_ibody_find_entry(inode_ref, &ibody_finder);
+		if (ret != EOK)
+			goto out;
 	}
 
 	if (ibody_finder.s.not_found) {
 		if (orig_xattr_block) {
-			block_found = true;
-			ret = ext4_xattr_block_set(inode_ref, &i, true);
-			if (ret == ENOSPC)
+			ret = ext4_xattr_block_set(inode_ref, &i, true, &partial);
+			if (ret != EOK && partial)
+				goto out;
+			if (ret == ENOSPC) {
+				block_found = true;
 				goto try_insert;
-			else if (ret == ENODATA)
+			} else if (ret == ENODATA) {
+				block_found = false;
 				goto try_insert;
-			else if (ret != EOK)
+			} else if (ret != EOK)
 				goto out;
 
 		} else
@@ -1536,25 +1835,44 @@ int ext4_xattr_set(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 		else
 			ret = ENOSPC;
 
-		if (ret == ENOSPC) {
-			if (!block_found) {
-				ret = ext4_xattr_block_set(inode_ref, &i, false);
-				ibody_finder.i.value = NULL;
-				ext4_xattr_set_entry(&ibody_finder.i,
-						     &ibody_finder.s, false);
-				inode_ref->dirty = true;
-			}
+			if (ret == ENOSPC) {
+				if (!block_found) {
+					ret = ext4_xattr_block_set(inode_ref, &i, false,
+								    &partial);
+					if (ret == EOK) {
+						ibody_finder.i.value = NULL;
+						ret = ext4_xattr_set_entry(
+						    &ibody_finder.i, &ibody_finder.s, false);
+						if (ret == EOK)
+							inode_ref->dirty = true;
+						else
+							partial = true;
+					}
+				}
 
 		} else if (ret == EOK) {
-			if (block_found)
+			if (block_found) {
 				ret = ext4_xattr_block_remove(inode_ref, &i);
+				if (ret != EOK)
+					partial = true;
+			}
 
 			inode_ref->dirty = true;
 		}
 	}
 
 out:
+	if (ret != EOK && metadata_may_have_changed)
+		*metadata_may_have_changed = partial;
 	return ret;
+}
+
+int ext4_xattr_set(struct ext4_inode_ref *inode_ref, uint8_t name_index,
+		   const char *name, size_t name_len, const void *value,
+		   size_t value_len)
+{
+	return ext4_xattr_set_status(inode_ref, name_index, name, name_len,
+				     value, value_len, NULL);
 }
 
 #endif

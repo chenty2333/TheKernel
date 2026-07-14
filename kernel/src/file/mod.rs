@@ -19,9 +19,11 @@ pub(crate) mod packet;
 pub(crate) mod permission;
 mod pidfd;
 pub(crate) mod pipe;
+pub(crate) mod privilege_metadata;
 pub mod signalfd;
 pub mod timerfd;
 pub(crate) mod unix_socket;
+pub(crate) mod xattr_provider;
 
 mod desc;
 mod fd_table;
@@ -35,8 +37,8 @@ pub use self::{
     desc::*,
     fd_table::*,
     fs::{
-        Directory, File, ResolveAtResult, is_path_only_fd, resolve_at, resolve_at_with_credentials,
-        with_fs, with_path_fs,
+        Directory, File, ResolveAtResult, resolve_at, resolve_at_with_credentials, with_fs,
+        with_path_fs,
     },
     net::Socket,
     netlink::NetlinkSocket,
@@ -46,6 +48,9 @@ pub use self::{
     types::*,
 };
 pub(crate) use self::{
-    fs::{allowed_write_len, check_resize_limit, validate_pathname},
+    fs::{
+        allowed_write_len, check_resize_limit, resolve_at_with_security, validate_pathname,
+        validate_symlink_target,
+    },
     metadata::{PseudoInode, anon_inode_stat},
 };

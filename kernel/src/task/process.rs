@@ -112,12 +112,13 @@ use super::{
     IdMap, IdMapInputExtent, Kgid, Kuid, UserGid, UserUid,
     accounting::{AtomicTaskUsage, live_process_usage},
     cred_error,
-    creds::{Cred, CredentialSlot, PreparedCred},
+    creds::{Cred, CredentialSlot, CredentialSnapshotGuard, PreparedCred},
     exec_cred::CommittingExecCredential,
     futex::FutexTable,
     jobctl::{
-        ContinueResult, ExecControlState, JobControlState, PtraceControlState, PtraceSession,
-        StopKind, StopReport, StopState, VforkControlState,
+        ContinueResult, ExecControlState, JobControlState, PtraceControlState,
+        PtraceRelationshipOrigin, PtraceRelationshipSnapshot, PtraceSession, StopKind, StopReport,
+        StopState, VforkControlState,
     },
     resources::Rlimits,
     signal::PtraceSignalRecord,
@@ -1451,6 +1452,10 @@ impl PtraceReverseLink {
 struct PtraceReverseLinkNode {
     tracee: Pid,
     session: PtraceSession,
+    /// Relationship owner retired while consuming an exit drain. Reusing the
+    /// already allocated reverse-link node carries credential destruction to
+    /// the caller's post-lifecycle boundary without allocating under locks.
+    retired_relationship: Option<PtraceRelationshipSnapshot>,
     next: Option<Box<Self>>,
 }
 
@@ -1561,6 +1566,31 @@ impl Drop for PreparedPtraceReverseLink<'_> {
 
 pub(crate) struct PtraceReverseLinkDrain {
     next: Option<Box<PtraceReverseLinkNode>>,
+    retained: Option<Box<PtraceReverseLinkNode>>,
+}
+
+impl PtraceReverseLinkDrain {
+    /// Consumes one reverse link and retains both its preallocated node and an
+    /// optional detached relationship until this drain itself is dropped.
+    /// Exit uses this to move credential free callbacks beyond process
+    /// lifecycle and task-parent publication gates without a new allocation.
+    pub(crate) fn retain_next_retirement(
+        &mut self,
+        retire: impl FnOnce(PtraceReverseLink) -> Option<PtraceRelationshipSnapshot>,
+    ) -> bool {
+        let Some(mut node) = self.next.take() else {
+            return false;
+        };
+        self.next = node.next.take();
+        let link = PtraceReverseLink {
+            tracee: node.tracee,
+            session: node.session,
+        };
+        node.retired_relationship = retire(link);
+        node.next = self.retained.take();
+        self.retained = Some(node);
+        true
+    }
 }
 
 impl Iterator for PtraceReverseLinkDrain {
@@ -1569,10 +1599,25 @@ impl Iterator for PtraceReverseLinkDrain {
     fn next(&mut self) -> Option<Self::Item> {
         let mut node = self.next.take()?;
         self.next = node.next.take();
+        debug_assert!(node.retired_relationship.is_none());
         Some(PtraceReverseLink {
             tracee: node.tracee,
             session: node.session,
         })
+    }
+}
+
+impl Drop for PtraceReverseLinkDrain {
+    fn drop(&mut self) {
+        fn drop_chain(mut next: Option<Box<PtraceReverseLinkNode>>) {
+            while let Some(mut node) = next {
+                next = node.next.take();
+                drop(node);
+            }
+        }
+
+        drop_chain(self.next.take());
+        drop_chain(self.retained.take());
     }
 }
 
@@ -2707,11 +2752,25 @@ impl ProcessData {
     }
 
     pub fn ptrace_tracer(&self) -> Option<Pid> {
-        self.ptrace_ctl.lock().tracer
+        self.ptrace_ctl
+            .lock()
+            .active_session()
+            .map(|session| session.tracer)
     }
 
     pub(crate) fn ptrace_active_session(&self) -> Option<PtraceSession> {
         self.ptrace_ctl.lock().active_session()
+    }
+
+    /// Atomically snapshots both the exact ptrace generation and Linux's
+    /// immutable relationship-time `ptracer_cred`. Exec and other privilege
+    /// consumers must not combine `ptrace_tracer()` with a later PID
+    /// credential lookup.
+    pub(crate) fn ptrace_relationship_snapshot(&self) -> Option<PtraceRelationshipSnapshot> {
+        let ptrace_ctl = self.ptrace_ctl.lock();
+        let relationship = ptrace_ctl.active_relationship();
+        drop(ptrace_ctl);
+        relationship
     }
 
     pub(crate) fn ptrace_session_if_traced_by(
@@ -2801,6 +2860,7 @@ impl ProcessData {
                 tracer_kernel_tid: 0,
                 generation: 0,
             },
+            retired_relationship: None,
             next: None,
         })
         .map_err(|_| AxError::NoMemory)?;
@@ -2818,15 +2878,18 @@ impl ProcessData {
     }
 
     /// Publishes both directions of one ptrace relationship after revalidating
-    /// the exact hook-authorized task/image snapshot. Hooks run before this
-    /// method; the fixed lock order here is exec gate, image, access security,
-    /// exact credential slot, ptrace control, then tracer reverse links.
+    /// the exact hook-authorized tasks, actor credential, and target image.
+    /// The ptracer credential guard is acquired before the publication gate;
+    /// the fixed order inside is exec gate, image, access security, exact
+    /// target credential, ptrace control, then tracer reverse links.
     pub(crate) fn publish_ptrace_relationship(
         &self,
         publication: &PtracePublicationGuard<'_>,
         target: &super::Thread,
-        tracer: Pid,
-        tracer_kernel_tid: Pid,
+        ptracer: &super::Thread,
+        authorized_ptracer: &CredentialSnapshotGuard<'_>,
+        origin: PtraceRelationshipOrigin,
+        relationship_credential: &CredentialSnapshotGuard<'_>,
         seized: bool,
         initial_options: u32,
         authorized: &ProcessImageAccessSnapshot,
@@ -2835,14 +2898,36 @@ impl ProcessData {
         if !core::ptr::eq(publication.owner, self) {
             return Err(AxError::BadState);
         }
+        let tracer = ptracer.proc_data.proc.pid();
+        let tracer_kernel_tid = ptracer.kernel_tid();
         if let Some(tracer_owner) = publication.tracer_owner
-            && (tracer_owner.proc.pid() != tracer
+            && (!core::ptr::eq(tracer_owner, &*ptracer.proc_data)
+                || tracer_owner.proc.pid() != tracer
                 || !tracer_owner
                     .proc
                     .thread_ids()
                     .any(|tid| tid == tracer_kernel_tid))
         {
             return Err(AxError::NoSuchProcess);
+        }
+        let ptracer_slot = ptracer.credential_slot();
+        if ptracer.exit.load(Ordering::Acquire)
+            || !ptracer
+                .proc_data
+                .proc
+                .thread_ids()
+                .any(|tid| tid == tracer_kernel_tid)
+            || !core::ptr::eq(authorized_ptracer.slot(), &*ptracer_slot)
+        {
+            return Err(AxError::NoSuchProcess);
+        }
+        let relationship_owner = match origin {
+            PtraceRelationshipOrigin::Attach => ptracer,
+            PtraceRelationshipOrigin::Traceme => target,
+        };
+        let relationship_slot = relationship_owner.credential_slot();
+        if !core::ptr::eq(relationship_credential.slot(), &*relationship_slot) {
+            return Err(AxError::BadState);
         }
         if reverse_link.tracer != tracer
             || reverse_link.tracer_kernel_tid != tracer_kernel_tid
@@ -2885,24 +2970,39 @@ impl ProcessData {
         {
             return Err(AxError::OperationNotPermitted);
         }
+        if origin == PtraceRelationshipOrigin::Traceme
+            && !Arc::ptr_eq(relationship_credential.credential(), &authorized.credential)
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+        if origin == PtraceRelationshipOrigin::Attach
+            && !Arc::ptr_eq(
+                relationship_credential.credential(),
+                authorized_ptracer.credential(),
+            )
+        {
+            return Err(AxError::BadState);
+        }
         let mut ptrace_ctl = self.ptrace_ctl.lock();
         let old_generation = ptrace_ctl.generation;
-        let Some(session) =
-            ptrace_ctl.try_begin(tracer, tracer_kernel_tid, seized, initial_options)
-        else {
-            return Err(if ptrace_ctl.tracer.is_some() {
+        let Some(session) = ptrace_ctl.try_begin(
+            tracer,
+            tracer_kernel_tid,
+            seized,
+            initial_options,
+            origin,
+            relationship_credential.credential(),
+        ) else {
+            return Err(if ptrace_ctl.active_session().is_some() {
                 AxError::OperationNotPermitted
             } else {
                 AxError::OutOfRange
             });
         };
         if let Err((error, reverse_link)) = reverse_link.publish(session) {
-            ptrace_ctl.tracer = None;
-            ptrace_ctl.tracer_kernel_tid = 0;
-            ptrace_ctl.generation = old_generation;
-            ptrace_ctl.seized = false;
-            ptrace_ctl.options = 0;
-            ptrace_ctl.event_message = 0;
+            let retired_relationship = ptrace_ctl
+                .rollback_begin(session, old_generation)
+                .expect("new ptrace relationship owns rollback session");
             drop(ptrace_ctl);
             drop(current_credential);
             drop(security);
@@ -2910,7 +3010,13 @@ impl ProcessData {
             drop(exec_ctl);
             // The preallocated node and reservation token are destroyed only
             // after every publication spin/image guard has been released.
+            // The relationship credential follows the same destruction-safe
+            // boundary because its free hooks may not run under those gates.
+            // The typed `relationship_credential` guard still owns the same
+            // Arc until the caller releases the outer publication guard, so
+            // this rollback drop also cannot be the final free callback.
             drop(reverse_link);
+            drop(retired_relationship);
             return Err(error);
         }
         drop(ptrace_ctl);
@@ -2988,7 +3094,11 @@ impl ProcessData {
         &self,
         session: PtraceSession,
         detach: bool,
-    ) -> Option<(ContinueResult, Option<PtraceSignalRecord>)> {
+    ) -> Option<(
+        ContinueResult,
+        Option<PtraceSignalRecord>,
+        Option<PtraceRelationshipSnapshot>,
+    )> {
         self.resume_ptrace_inner(session, detach, true)
     }
 
@@ -2997,7 +3107,11 @@ impl ProcessData {
         session: PtraceSession,
         detach: bool,
         require_inactive: bool,
-    ) -> Option<(ContinueResult, Option<PtraceSignalRecord>)> {
+    ) -> Option<(
+        ContinueResult,
+        Option<PtraceSignalRecord>,
+        Option<PtraceRelationshipSnapshot>,
+    )> {
         let mut pending = self.ptrace_signal.lock();
         let mut ptrace_ctl = self.ptrace_ctl.lock();
         if ptrace_ctl.active_session() != Some(session) {
@@ -3008,10 +3122,11 @@ impl ProcessData {
         if require_inactive && !job_ctl.is_ptrace_inactive_for(session) {
             return None;
         }
-        if detach {
-            let cleared = ptrace_ctl.clear_session(session);
-            debug_assert!(cleared);
-        }
+        let retired_relationship = detach.then(|| {
+            ptrace_ctl
+                .clear_session(session)
+                .expect("validated ptrace session must clear")
+        });
 
         let result = match job_ctl.state {
             StopState::Running => ContinueResult::None,
@@ -3039,7 +3154,10 @@ impl ProcessData {
         drop(job_ctl);
         drop(ptrace_ctl);
         drop(pending);
-        Some((result, record))
+        // The caller carries `retired_relationship` past any sleepable outer
+        // ptrace-action guard before dropping it. Credential security free
+        // hooks may run when this was the final owner.
+        Some((result, record, retired_relationship))
     }
 
     /// Publishes one stop only for the exact relationship which requested it.
@@ -3101,30 +3219,31 @@ impl ProcessData {
         }
     }
 
-    pub(crate) fn end_ptrace(&self, session: PtraceSession) -> bool {
-        let Some((result, record)) = self.resume_ptrace_inner(session, true, false) else {
-            return false;
-        };
+    pub(crate) fn end_ptrace(&self, session: PtraceSession) -> Option<PtraceRelationshipSnapshot> {
+        let (result, record, retired_relationship) =
+            self.resume_ptrace_inner(session, true, false)?;
         if let Some(record) = record {
             super::timer::acknowledge_posix_timer_signal(self, record.info());
             drop(record);
         }
         self.finish_ptrace_resume(result);
-        true
+        Some(retired_relationship.expect("end_ptrace always detaches the validated relationship"))
     }
 
-    pub(crate) fn clear_ptrace(&self) -> Option<PtraceSession> {
-        let (session, record) = {
+    pub(crate) fn clear_ptrace(&self) -> Option<PtraceRelationshipSnapshot> {
+        let (relationship, record) = {
             let mut pending = self.ptrace_signal.lock();
             let mut ptrace_ctl = self.ptrace_ctl.lock();
-            let session = ptrace_ctl.clear_active();
-            (session, pending.take())
+            let relationship = ptrace_ctl.clear_active();
+            (relationship, pending.take())
         };
         if let Some(record) = record {
             super::timer::acknowledge_posix_timer_signal(self, record.info());
             drop(record);
         }
-        session
+        // The process-exit caller keeps this owner until its outer
+        // ptrace-action guard is gone.
+        relationship
     }
 
     pub(crate) fn try_ptrace_tracees(&self) -> AxResult<Vec<PtraceReverseLink>> {
@@ -3186,7 +3305,10 @@ impl ProcessData {
         // reservations instead of recreating a reverse link after the drain.
         tracees.closed = true;
         drop(tracees);
-        PtraceReverseLinkDrain { next }
+        PtraceReverseLinkDrain {
+            next,
+            retained: None,
+        }
     }
 
     pub(crate) fn clear_ptrace_tracees_for_task(
@@ -3196,7 +3318,10 @@ impl ProcessData {
         let mut tracees = self.ptrace_tracees.lock();
         let next = tracees.drain_task(tracer_kernel_tid);
         drop(tracees);
-        PtraceReverseLinkDrain { next }
+        PtraceReverseLinkDrain {
+            next,
+            retained: None,
+        }
     }
 
     fn stop_state(&self) -> StopState {
@@ -3542,8 +3667,8 @@ mod tests {
     use crate::task::{
         CapabilityState, Cred, CredentialSlot, IdMap, IdMapInputExtent, Kgid, Kuid,
         jobctl::{
-            ExecControlState, JobControlState, PtraceControlState, PtraceSession, StopKind,
-            StopState, VforkControlState,
+            ExecControlState, JobControlState, PtraceControlState, PtraceRelationshipOrigin,
+            PtraceSession, StopKind, StopState, VforkControlState,
         },
         ops::{
             commit_exec_alias_publication_for_test, release_exec_action_then_complete,
@@ -3812,9 +3937,20 @@ mod tests {
             access_state: state,
         });
         let ptrace_ctl = SpinNoIrq::new(PtraceControlState::default());
+        let ptracer_cred = credential_slot(1000).current();
 
         assert_eq!(ptrace_image_snapshot_if_owned(&ptrace_ctl, &image, 7), None);
-        let first = ptrace_ctl.lock().try_begin(7, 70, false, 0).unwrap();
+        let first = ptrace_ctl
+            .lock()
+            .try_begin(
+                7,
+                70,
+                false,
+                0,
+                PtraceRelationshipOrigin::Attach,
+                &ptracer_cred,
+            )
+            .unwrap();
         assert_eq!(ptrace_image_snapshot_if_owned(&ptrace_ctl, &image, 8), None);
         assert_eq!(
             ptrace_image_snapshot_if_session(&ptrace_ctl, &image, first),
@@ -3834,10 +3970,22 @@ mod tests {
 
         // A detached session cannot retain its earlier authorization. After
         // reattach, the same tracer PID observes only the newly bound image.
-        assert!(ptrace_ctl.lock().clear_session(first));
+        let retired_first = ptrace_ctl.lock().clear_session(first);
+        assert!(retired_first.is_some());
+        drop(retired_first);
         image.write().aspace = 42;
         assert_eq!(ptrace_image_snapshot_if_owned(&ptrace_ctl, &image, 7), None);
-        let second = ptrace_ctl.lock().try_begin(7, 70, false, 0).unwrap();
+        let second = ptrace_ctl
+            .lock()
+            .try_begin(
+                7,
+                70,
+                false,
+                0,
+                PtraceRelationshipOrigin::Attach,
+                &ptracer_cred,
+            )
+            .unwrap();
         assert_ne!(first, second);
         assert_eq!(
             ptrace_image_snapshot_if_session(&ptrace_ctl, &image, first),
@@ -3857,6 +4005,114 @@ mod tests {
     }
 
     #[test]
+    fn process_access_ptrace_relationship_freezes_and_retires_exact_ptracer_credential() {
+        let ptracer_slot = credential_slot(1000);
+        let attached_credential = ptracer_slot.current();
+        let attached_credential_weak = Arc::downgrade(&attached_credential);
+        let ptrace_ctl = SpinNoIrq::new(PtraceControlState::default());
+        let first = ptrace_ctl
+            .lock()
+            .try_begin(
+                7,
+                70,
+                false,
+                0,
+                PtraceRelationshipOrigin::Attach,
+                &attached_credential,
+            )
+            .unwrap();
+
+        // A later credential publication by the ptracer must not rewrite the
+        // already-published relationship's authorization provenance.
+        let replacement = ptracer_slot
+            .replace_fs_ids_for_test(kuid(2000), kgid(2000))
+            .unwrap();
+        let relationship = {
+            let control = ptrace_ctl.lock();
+            let relationship = control.active_relationship().unwrap();
+            drop(control);
+            relationship
+        };
+        assert_eq!(relationship.session(), first);
+        assert!(Arc::ptr_eq(
+            relationship.ptracer_cred(),
+            &attached_credential
+        ));
+        assert!(!Arc::ptr_eq(relationship.ptracer_cred(), &replacement));
+
+        drop(attached_credential);
+        let retired = {
+            let mut control = ptrace_ctl.lock();
+            control.clear_session(first).unwrap()
+        };
+        assert_eq!(retired.session(), first);
+        assert!(attached_credential_weak.upgrade().is_some());
+
+        // Reattachment binds only the replacement credential.  The old owner
+        // remains alive through the explicit retirement and snapshot values,
+        // both of which are now outside the ptrace control spin guard.
+        let second = ptrace_ctl
+            .lock()
+            .try_begin(
+                7,
+                70,
+                false,
+                0,
+                PtraceRelationshipOrigin::Attach,
+                &replacement,
+            )
+            .unwrap();
+        let current = ptrace_ctl.lock().active_relationship().unwrap();
+        assert_ne!(current.session(), first);
+        assert_eq!(current.session(), second);
+        assert!(Arc::ptr_eq(current.ptracer_cred(), &replacement));
+
+        drop(relationship);
+        assert!(attached_credential_weak.upgrade().is_some());
+        drop(retired);
+        assert!(attached_credential_weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn process_access_ptrace_traceme_stores_calling_tracee_credential_not_parent_actor() {
+        let parent_credential = credential_slot(1000).current();
+        let child_slot = credential_slot(2000);
+        let child_at_traceme = child_slot.current();
+        let ptrace_ctl = SpinNoIrq::new(PtraceControlState::default());
+
+        // The session identifies the real parent as tracer, but Linux
+        // ptrace_link(current, real_parent) records current_cred(): the child
+        // which called PTRACE_TRACEME. The parent remains only the hook actor.
+        let session = ptrace_ctl
+            .lock()
+            .try_begin(
+                7,
+                70,
+                false,
+                0,
+                PtraceRelationshipOrigin::Traceme,
+                &child_at_traceme,
+            )
+            .unwrap();
+        let relationship = ptrace_ctl.lock().active_relationship().unwrap();
+        assert_eq!(relationship.session(), session);
+        assert_eq!(relationship.origin(), PtraceRelationshipOrigin::Traceme);
+        assert!(Arc::ptr_eq(relationship.ptracer_cred(), &child_at_traceme));
+        assert!(!Arc::ptr_eq(
+            relationship.ptracer_cred(),
+            &parent_credential
+        ));
+
+        let child_after_traceme = child_slot
+            .replace_fs_ids_for_test(kuid(3000), kgid(3000))
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            relationship.ptracer_cred(),
+            &child_after_traceme
+        ));
+    }
+
+    #[test]
     fn process_access_ptrace_remote_image_requires_exact_inactive_session() {
         let owner = UserNamespace::try_new_root().unwrap();
         let state = ProcessAccessState::try_new(Dumpability::UserDumpable, owner).unwrap();
@@ -3866,8 +4122,19 @@ mod tests {
         });
         let ptrace_ctl = SpinNoIrq::new(PtraceControlState::default());
         let job_ctl = SpinNoIrq::new(JobControlState::default());
+        let ptracer_cred = credential_slot(1000).current();
 
-        let first = ptrace_ctl.lock().try_begin(7, 70, false, 0).unwrap();
+        let first = ptrace_ctl
+            .lock()
+            .try_begin(
+                7,
+                70,
+                false,
+                0,
+                PtraceRelationshipOrigin::Attach,
+                &ptracer_cred,
+            )
+            .unwrap();
         assert_eq!(
             ptrace_inactive_image_snapshot_if_session(&ptrace_ctl, &job_ctl, &image, first),
             None
@@ -3883,8 +4150,20 @@ mod tests {
             Some(41)
         );
 
-        assert!(ptrace_ctl.lock().clear_session(first));
-        let second = ptrace_ctl.lock().try_begin(7, 70, false, 0).unwrap();
+        let retired_first = ptrace_ctl.lock().clear_session(first);
+        assert!(retired_first.is_some());
+        drop(retired_first);
+        let second = ptrace_ctl
+            .lock()
+            .try_begin(
+                7,
+                70,
+                false,
+                0,
+                PtraceRelationshipOrigin::Attach,
+                &ptracer_cred,
+            )
+            .unwrap();
         assert_ne!(first, second);
         assert_eq!(
             ptrace_inactive_image_snapshot_if_session(&ptrace_ctl, &job_ctl, &image, second),
@@ -3899,11 +4178,20 @@ mod tests {
 
     #[test]
     fn process_access_ptrace_generation_exhaustion_never_wraps_or_saturates() {
-        let mut state = PtraceControlState {
-            generation: u64::MAX,
-            ..PtraceControlState::default()
-        };
-        assert_eq!(state.try_begin(7, 70, false, 0), None);
+        let mut state = PtraceControlState::default();
+        state.generation = u64::MAX;
+        let ptracer_cred = credential_slot(1000).current();
+        assert_eq!(
+            state.try_begin(
+                7,
+                70,
+                false,
+                0,
+                PtraceRelationshipOrigin::Attach,
+                &ptracer_cred,
+            ),
+            None
+        );
         assert_eq!(state.active_session(), None);
         assert_eq!(state.generation, u64::MAX);
     }
@@ -3923,6 +4211,7 @@ mod tests {
                     tracer_kernel_tid: 0,
                     generation: 0,
                 },
+                retired_relationship: None,
                 next: None,
             })),
             reserved: true,
@@ -3954,12 +4243,15 @@ mod tests {
             head: Some(Box::new(PtraceReverseLinkNode {
                 tracee: 11,
                 session: session(70, 1),
+                retired_relationship: None,
                 next: Some(Box::new(PtraceReverseLinkNode {
                     tracee: 12,
                     session: session(71, 2),
+                    retired_relationship: None,
                     next: Some(Box::new(PtraceReverseLinkNode {
                         tracee: 13,
                         session: session(70, 3),
+                        retired_relationship: None,
                         next: None,
                     })),
                 })),
@@ -3970,7 +4262,11 @@ mod tests {
         });
 
         let drained = links.lock().drain_task(70);
-        let drained: Vec<_> = PtraceReverseLinkDrain { next: drained }.collect();
+        let drained: Vec<_> = PtraceReverseLinkDrain {
+            next: drained,
+            retained: None,
+        }
+        .collect();
         assert_eq!(drained.len(), 2);
         assert!(
             drained
@@ -3986,6 +4282,57 @@ mod tests {
         assert_eq!(retained.tracee, 12);
         assert_eq!(retained.session.tracer_kernel_tid, 71);
         assert!(retained.next.is_none());
+    }
+
+    #[test]
+    fn process_access_ptrace_exit_drain_retains_credential_until_outer_drop_boundary() {
+        let ptracer_slot = credential_slot(1000);
+        let attached_credential = ptracer_slot.current();
+        let attached_credential_weak = Arc::downgrade(&attached_credential);
+        let mut control = PtraceControlState::default();
+        let session = control
+            .try_begin(
+                7,
+                70,
+                false,
+                0,
+                PtraceRelationshipOrigin::Attach,
+                &attached_credential,
+            )
+            .unwrap();
+        let mut retirement = control.clear_session(session);
+        assert!(retirement.is_some());
+
+        // Remove every non-exit owner. The old credential must then live only
+        // in the relationship retirement moved into the preallocated reverse
+        // node below.
+        let replacement = ptracer_slot
+            .replace_fs_ids_for_test(kuid(2000), kgid(2000))
+            .unwrap();
+        drop(replacement);
+        drop(attached_credential);
+
+        let mut drain = PtraceReverseLinkDrain {
+            next: Some(Box::new(PtraceReverseLinkNode {
+                tracee: 9,
+                session,
+                retired_relationship: None,
+                next: None,
+            })),
+            retained: None,
+        };
+        assert!(drain.retain_next_retirement(|link| {
+            assert_eq!(link.session(), session);
+            retirement.take()
+        }));
+        assert!(retirement.is_none());
+        assert!(attached_credential_weak.upgrade().is_some());
+
+        // do_exit performs this drop only after lifecycle and task-parent
+        // guards. The drain, rather than a temporary loop local, is therefore
+        // the deterministic final owner.
+        drop(drain);
+        assert!(attached_credential_weak.upgrade().is_none());
     }
 
     #[test]

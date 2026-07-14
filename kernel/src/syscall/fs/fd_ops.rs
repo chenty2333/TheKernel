@@ -36,9 +36,10 @@ use crate::{
         },
         lease, memfd,
         permission::{
-            authorize_file_open, check_create_permissions_with_security,
-            check_open_permissions_with_security, check_pathwalk_search_permission_with_security,
-            check_writable_mount, initial_named_create_owner_mode,
+            VfsSecurityContext, authorize_file_open, authorize_named_inode_create,
+            check_create_permissions_with_security, check_open_permissions_with_security,
+            check_pathwalk_search_permission_with_security, check_writable_mount,
+            initial_named_create_owner_mode,
         },
         pipe::NamedPipe,
         prepare_file_description_with_open_lease, replace_process_fd_table, reserve_fd, resolve_at,
@@ -47,10 +48,7 @@ use crate::{
     mm::{UserConstPtr, UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
     syscall::fs::{ctl::validate_pathname, io::check_mandatory_fd_truncate_lock},
-    task::{
-        AX_FILE_LIMIT, AsThread, Cred, DacCredentialView, UserNamespace, linux_pid_from_task_id,
-        ns_capable, security::initial_user_namespace,
-    },
+    task::{AX_FILE_LIMIT, AsThread, Cred, linux_pid_from_task_id, ns_capable},
     time::wall_time,
 };
 
@@ -225,10 +223,10 @@ fn enforce_special_open_rules(
     let flags = flags as u32;
     let metadata = loc.metadata()?;
 
-    let owner_match = security.credentials.uid().into_raw() == metadata.uid;
+    let owner_match = security.credentials().uid().into_raw() == metadata.uid;
     let fowner_capable = ns_capable(
-        &security.actor,
-        &security.filesystem_owner_user_ns,
+        security.actor(),
+        security.filesystem_owner_user_ns(),
         CAP_FOWNER,
     );
     if !noatime_allowed(flags, owner_match, fowner_capable) {
@@ -395,22 +393,32 @@ struct Openat2PathwalkPolicy {
 
 #[derive(Clone)]
 struct OpenPathSecurityContext {
-    actor: Arc<Cred>,
-    credentials: DacCredentialView,
-    filesystem_owner_user_ns: Arc<UserNamespace>,
+    vfs: VfsSecurityContext,
     umask: u32,
 }
 
 impl OpenPathSecurityContext {
     fn new(actor: Arc<Cred>, umask: u32) -> Self {
-        let credentials = actor.fs_dac_credentials();
-        let filesystem_owner_user_ns = initial_user_namespace(actor.user_ns());
         Self {
-            actor,
-            credentials,
-            filesystem_owner_user_ns,
+            vfs: VfsSecurityContext::new(actor),
             umask,
         }
+    }
+
+    fn actor(&self) -> &Cred {
+        self.vfs.actor()
+    }
+
+    fn credentials(&self) -> &crate::task::DacCredentialView {
+        self.vfs.credentials()
+    }
+
+    fn filesystem_owner_user_ns(&self) -> &Arc<crate::task::UserNamespace> {
+        self.vfs.filesystem_owner_user_ns()
+    }
+
+    fn vfs_security(&self) -> &VfsSecurityContext {
+        &self.vfs
     }
 }
 
@@ -554,6 +562,7 @@ fn prepare_open_description(
     flags: u32,
     write_open_key: Option<executable::ExecutableKey>,
     open_lease_admission: lease::OpenLeaseAdmission,
+    open_credential: Arc<Cred>,
 ) -> AxResult<Arc<FileDescription>> {
     let mut description_resource: Option<DescriptionResource> = None;
     let f: Arc<dyn FileLike> = match result {
@@ -637,6 +646,7 @@ fn prepare_open_description(
         write_open_key,
         description_resource,
         open_lease_admission,
+        open_credential,
     )
 }
 
@@ -656,6 +666,18 @@ fn open_loc_after_admission<R>(
     Ok((result, resource))
 }
 
+fn commit_open_truncate(file: &File, loc: &Location) -> AxResult<()> {
+    File::set_len_with_killpriv(file.inner().backend()?, 0)?;
+    // A post-truncate metadata failure cannot be reported without lying that
+    // this destructive open left the inode untouched. Filesystems should
+    // update truncate timestamps as part of set_len; retain this compatibility
+    // update as best effort.
+    if let Err(error) = touch_truncated_metadata(loc) {
+        warn!("open truncate metadata update failed: {error}");
+    }
+    Ok(())
+}
+
 fn try_pty_name(number: u32) -> AxResult<String> {
     let mut name = String::new();
     name.try_reserve_exact(10).map_err(|_| AxError::NoMemory)?;
@@ -669,9 +691,15 @@ fn publish_reserved_open(
     reservation: ReservedFd,
     write_open_key: Option<executable::ExecutableKey>,
     open_lease_admission: lease::OpenLeaseAdmission,
+    open_credential: Arc<Cred>,
 ) -> AxResult<i32> {
-    let description =
-        prepare_open_description(result, flags, write_open_key, open_lease_admission)?;
+    let description = prepare_open_description(
+        result,
+        flags,
+        write_open_key,
+        open_lease_admission,
+        open_credential,
+    )?;
     reservation.publish(description)
 }
 
@@ -764,7 +792,7 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
     validate_pathname(Path::new(path))?;
     debug!("sys_openat <= {path:?} {flags:#o} {mode:#o}");
 
-    let credentials = &security.credentials;
+    let credentials = security.credentials();
     let uid = credentials.uid().into_raw();
     let gid = credentials.gid().into_raw();
     let requested_mode = NodePermission::from_bits_truncate(mode as u16);
@@ -781,17 +809,17 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
         &mut |dir| {
             check_pathwalk_search_permission_with_security(
                 dir,
-                &security.actor,
+                security.actor(),
                 credentials,
-                &security.filesystem_owner_user_ns,
+                security.filesystem_owner_user_ns(),
             )
         },
-        &mut |dir, create_options| {
+        &mut |dir, name, create_options| {
             check_create_permissions_with_security(
                 dir,
-                &security.actor,
+                security.actor(),
                 credentials,
-                &security.filesystem_owner_user_ns,
+                security.filesystem_owner_user_ns(),
             )?;
             let parent = dir.metadata()?;
             let (final_mode, owner) = initial_named_create_owner_mode(
@@ -801,6 +829,15 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
                 requested_mode,
                 security.umask,
             );
+            authorize_named_inode_create(
+                dir,
+                &parent,
+                name,
+                create_options.node_type,
+                final_mode,
+                None,
+                security.vfs_security(),
+            )?;
             create_options.permission = final_mode;
             create_options.user = Some(owner);
             Ok(())
@@ -834,9 +871,9 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
             check_open_permissions_with_security(
                 &loc,
                 open_access_mask(flags),
-                &security.actor,
+                security.actor(),
                 credentials,
-                &security.filesystem_owner_user_ns,
+                security.filesystem_owner_user_ns(),
             )?;
             if open_requires_writable_mount(flags) {
                 check_writable_mount(&loc)?;
@@ -875,9 +912,9 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
                 };
                 authorize_file_open(
                     candidate,
-                    &security.actor,
+                    security.actor(),
                     credentials,
-                    &security.filesystem_owner_user_ns,
+                    security.filesystem_owner_user_ns(),
                     operation,
                 )
             },
@@ -918,6 +955,7 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
             effective_flags as _,
             write_open.transfer_persistent(),
             lease_admission,
+            security.vfs_security().actor_arc().clone(),
         )?;
         let publication = reservation.prepare_publication(description.clone())?;
         if truncates_regular {
@@ -932,22 +970,16 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
                 .inner
                 .downcast_ref::<File>()
                 .ok_or(AxError::BadState)?;
-            file.inner().backend()?.set_len(0)?;
-            // A post-truncate metadata failure cannot be reported without
-            // lying that this destructive open left the inode untouched.
-            // Filesystems should update truncate timestamps as part of
-            // set_len; retain this compatibility update as best effort.
-            if let Err(error) = touch_truncated_metadata(&loc) {
-                warn!("open truncate metadata update failed: {error}");
-            }
+            commit_open_truncate(file, &loc)?;
         }
         let fd = publication.commit() as isize;
         Ok(fd)
     })();
     let fd = open_result?;
-    // Notifications remain after the full transaction so a failed open has
-    // no synthetic residue. On the successful path preserve Linux's relative
-    // ordering: the open event precedes truncate mutation notifications.
+    // The open/truncate notifications below remain after the full open
+    // transaction so a failed open has no synthetic open residue. On the
+    // successful path preserve Linux's relative ordering: the open event
+    // precedes truncate mutation notifications.
     if (flags as u32) & O_PATH == 0 {
         if let Err(error) = notify_parent(&loc, IN_OPEN) {
             warn!("open parent notification failed: {error}");
@@ -1025,7 +1057,7 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
     if path_ref.as_str().is_empty() {
         return Err(AxError::NotFound);
     }
-    let credentials = &security.credentials;
+    let credentials = security.credentials();
     let reservation = reserve_fd((flags as u32) & O_CLOEXEC != 0)?;
     let dir_loc = if flags as u32 & O_NOFOLLOW != 0 {
         fs.resolve_no_follow_with_policy(
@@ -1033,9 +1065,9 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
             &mut |dir| {
                 check_pathwalk_search_permission_with_security(
                     dir,
-                    &security.actor,
+                    security.actor(),
                     credentials,
-                    &security.filesystem_owner_user_ns,
+                    security.filesystem_owner_user_ns(),
                 )
             },
             policy,
@@ -1046,9 +1078,9 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
             &mut |dir| {
                 check_pathwalk_search_permission_with_security(
                     dir,
-                    &security.actor,
+                    security.actor(),
                     credentials,
-                    &security.filesystem_owner_user_ns,
+                    security.filesystem_owner_user_ns(),
                 )
             },
             policy,
@@ -1057,9 +1089,9 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
     dir_loc.check_is_dir()?;
     check_create_permissions_with_security(
         &dir_loc,
-        &security.actor,
+        security.actor(),
         credentials,
-        &security.filesystem_owner_user_ns,
+        security.filesystem_owner_user_ns(),
     )?;
 
     let parent_meta = dir_loc.metadata()?;
@@ -1091,9 +1123,9 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
         |candidate| {
             authorize_file_open(
                 candidate,
-                &security.actor,
+                security.actor(),
                 credentials,
-                &security.filesystem_owner_user_ns,
+                security.filesystem_owner_user_ns(),
                 file_open_operation,
             )
         },
@@ -1124,6 +1156,7 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
         reservation,
         write_open.transfer_persistent(),
         lease_admission,
+        security.vfs_security().actor_arc().clone(),
     )?;
     if let Err(error) = notify_exact(&loc, IN_OPEN) {
         warn!("tmpfile open notification failed: {error}");
@@ -1791,6 +1824,39 @@ mod namespace_operation_tests {
         assert!(matches!(result, Err(AxError::PermissionDenied)));
         assert!(!prepared.load(Ordering::SeqCst));
         assert_eq!(node.len().unwrap(), b"retained".len() as u64);
+    }
+
+    #[test]
+    fn admitted_open_truncate_revokes_capability_before_size_commit() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let loc = mount
+            .root_location()
+            .create(
+                "open-truncate-killpriv",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let node = loc.entry().as_file().unwrap();
+        node.write_at(b"truncate me", 0).unwrap();
+        loc.set_xattr(
+            crate::task::SECURITY_CAPABILITY_XATTR_NAME,
+            &[1, 2, 3],
+            axfs_ng_vfs::XattrSetMode::Upsert,
+        )
+        .unwrap();
+
+        let options = flags_to_options(O_RDONLY as i32 | O_TRUNC as i32, 0o600, (0, 0));
+        let result = options.open_loc_deferred_truncate(loc.clone()).unwrap();
+        let file = File::new(result.into_file().unwrap());
+        commit_open_truncate(&file, &loc).unwrap();
+
+        assert_eq!(node.len().unwrap(), 0);
+        assert_eq!(
+            crate::file::xattr_provider::read_security_capability(&loc).unwrap(),
+            None
+        );
     }
 
     #[test]

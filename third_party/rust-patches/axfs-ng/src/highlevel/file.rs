@@ -331,7 +331,8 @@ impl OpenOptions {
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
     {
-        let mut allow_create = |_dir: &Location, _options: &mut axfs_ng_vfs::OpenOptions| Ok(());
+        let mut allow_create =
+            |_dir: &Location, _name: &str, _options: &mut axfs_ng_vfs::OpenOptions| Ok(());
         let (loc, _created) =
             self.resolve_location_with_admission(context, path, admission, &mut allow_create)?;
         self._open(loc, true)
@@ -343,8 +344,9 @@ impl OpenOptions {
     ///
     /// A dangling final symlink is followed recursively when creation is
     /// enabled. The same path-admission callback and symlink budget are kept
-    /// for the whole operation. `create_admission` is invoked on the actual
-    /// directory immediately before a missing final component may be created.
+    /// for the whole operation. `create_admission` is invoked with the actual
+    /// directory and final name immediately before a missing component may be
+    /// created.
     pub fn resolve_location_with_admission<F, C>(
         &self,
         context: &FsContext,
@@ -354,7 +356,7 @@ impl OpenOptions {
     ) -> VfsResult<(Location, bool)>
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
-        C: FnMut(&Location, &mut axfs_ng_vfs::OpenOptions) -> VfsResult<()> + ?Sized,
+        C: FnMut(&Location, &str, &mut axfs_ng_vfs::OpenOptions) -> VfsResult<()> + ?Sized,
     {
         if !self.is_valid() {
             return Err(VfsError::InvalidInput);
@@ -385,7 +387,7 @@ impl OpenOptions {
     ) -> VfsResult<(Location, bool)>
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
-        C: FnMut(&Location, &mut axfs_ng_vfs::OpenOptions) -> VfsResult<()> + ?Sized,
+        C: FnMut(&Location, &str, &mut axfs_ng_vfs::OpenOptions) -> VfsResult<()> + ?Sized,
         P: PathwalkPolicy + ?Sized,
     {
         if !self.is_valid() {

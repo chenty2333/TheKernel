@@ -29,6 +29,7 @@ license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
 ext4 = ["dep:lwext4_rust"]
 fat = ["dep:fatfs"]
 std = ["lwext4_rust?/std"]
+test-ramdisk = ["axdriver/ramdisk"]
 times = []
 
 [lib]

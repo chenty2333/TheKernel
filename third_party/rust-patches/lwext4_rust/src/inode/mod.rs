@@ -1,6 +1,7 @@
 mod attr;
 mod dir;
 mod file;
+mod xattr;
 
 use alloc::boxed::Box;
 use core::{marker::PhantomData, mem};

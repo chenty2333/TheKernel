@@ -9,8 +9,9 @@ use linux_raw_sys::general::{AT_FDCWD, IN_CREATE, W_OK};
 
 use super::{
     permission::{
-        DacFsContextExt, check_create_permissions, check_open_permissions,
-        initial_named_create_owner_mode,
+        DacFsContextExt, NamedCreateTerminalType, SecurityFsContextExt, VfsSecurityContext,
+        authorize_named_inode_create, check_create_permissions_with_frozen_metadata,
+        check_open_permissions, initial_named_create_owner_mode,
     },
     validate_pathname, with_path_fs,
 };
@@ -38,86 +39,105 @@ fn map_bind_create_error(error: AxError) -> AxError {
     }
 }
 
+fn check_bind_name_available(parent: &axfs_ng_vfs::Location, name: &str) -> AxResult<()> {
+    match parent.lookup_no_follow_in_mount(name) {
+        Ok(_) => Err(AxError::AlreadyExists),
+        Err(AxError::NotFound) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Creates and binds a Linux pathname Unix socket with one frozen credential
 /// view. Transport admission is private and reversible until the filesystem
 /// backend has initialized the exact slot and atomically published the name.
 pub(crate) fn bind_path(
     socket: &UnixSocket,
     path: Arc<String>,
-    credentials: &DacCredentialView,
+    security: &VfsSecurityContext,
     requested_mode: NodePermission,
     umask: u32,
 ) -> AxResult<()> {
-    let path_ref = Path::new(path.as_ref());
-    validate_pathname(path_ref)?;
-    // This specialized socket/filesystem composite transaction is independent
-    // of MutationTransaction: UnixBindReservation keeps transport admission
-    // hidden and reversible, while the backend publishes fully initialized
-    // inode data exactly once. The shared guard keeps final path admission,
-    // writable-mount validation, and publication atomic against remount RO.
-    let _mount_operation = mounts::namespace_operation();
+    let result = (|| {
+        let path_ref = Path::new(path.as_ref());
+        validate_pathname(path_ref)?;
+        // This specialized socket/filesystem composite transaction is independent
+        // of MutationTransaction: UnixBindReservation keeps transport admission
+        // hidden and reversible, while the backend publishes fully initialized
+        // inode data exactly once. The shared guard keeps final path admission,
+        // writable-mount validation, and publication atomic against remount RO.
+        let _mount_operation = mounts::namespace_operation();
 
-    // Linux maps any pre-existing final component (including a symlink or a
-    // non-socket inode) to EADDRINUSE. The exclusive backend create below is
-    // still authoritative for a concurrent creator.
-    let existing = with_path_fs(AT_FDCWD, path_ref, |fs| {
-        match fs.resolve_no_follow_dac(path_ref, credentials) {
-            Ok(_) => Ok(true),
-            Err(AxError::NotFound) => Ok(false),
-            Err(error) => Err(error),
+        let (parent, name) = with_path_fs(AT_FDCWD, path_ref, |fs| {
+            let (parent, name) = fs.resolve_named_create_security(
+                path_ref,
+                security,
+                NamedCreateTerminalType::NonDirectory,
+            )?;
+            // Linux maps every pre-existing final component (including a
+            // symlink, non-socket inode, trailing-slash target, or covered
+            // mountpoint) to EADDRINUSE. Keep this exact lookup in the parent
+            // mount so a mounted root cannot replace the covered inode seen by
+            // the subsequent exclusive create.
+            check_bind_name_available(&parent, name)?;
+            Ok((parent, try_owned_name(name)?))
+        })?;
+        let parent_metadata = parent.metadata()?;
+        check_create_permissions_with_frozen_metadata(&parent, &parent_metadata, security)?;
+        if !parent.supports_named_create(NodeType::Socket) {
+            return Err(AxError::OperationNotPermitted);
         }
-    })?;
-    if existing {
-        return Err(AxError::AddrInUse);
-    }
-
-    let (parent, name) = with_path_fs(AT_FDCWD, path_ref, |fs| {
-        let (parent, name) = fs.resolve_nonexistent_dac(path_ref, credentials)?;
-        check_create_permissions(&parent, credentials)?;
-        Ok((parent, try_owned_name(name)?))
-    })?;
-    let (mode, owner) = initial_named_create_owner_mode(
-        &parent.metadata()?,
-        credentials,
-        NodeType::Socket,
-        requested_mode,
-        umask,
-    );
-
-    let slot = Arc::try_new(BindSlot::default()).map_err(|_| AxError::NoMemory)?;
-    let target = UnixSocketTarget::new(UnixSocketAddr::Path(path), slot.clone())?;
-    let reservation: UnixBindReservation<'_> = socket.reserve_bind(target)?;
-    let initial_data = InitialNodeData::from_shared(slot);
-
-    let location = parent
-        .create_named(
+        let (mode, owner) = initial_named_create_owner_mode(
+            &parent_metadata,
+            security.credentials(),
+            NodeType::Socket,
+            requested_mode,
+            umask,
+        );
+        authorize_named_inode_create(
+            &parent,
+            &parent_metadata,
             &name,
-            &NamedCreateOptions {
-                node_type: NodeType::Socket,
-                permission: mode,
-                owner: Some(owner),
-                rdev: None,
-                initial_data: Some(initial_data),
-            },
-            CreateDisposition::Exclusive,
-        )
-        .map_err(AxError::from)
-        .map_err(map_bind_create_error)?;
+            NodeType::Socket,
+            mode,
+            None,
+            security,
+        )?;
 
-    // No fallible work is permitted after the backend makes the initialized
-    // name visible. Committing only moves/clones already admitted ownership.
-    reservation.commit_with_keepalive(location.entry.entry().lifetime_token());
-    if let Err(error) = crate::file::inotify::notify_parent_with_name(
-        &parent,
-        Some(&location.entry),
-        location.entry.name(),
-        IN_CREATE,
-        false,
-        0,
-    ) {
-        warn!("Unix socket create notification failed: {error}");
-    }
-    Ok(())
+        let slot = Arc::try_new(BindSlot::default()).map_err(|_| AxError::NoMemory)?;
+        let target = UnixSocketTarget::new(UnixSocketAddr::Path(path), slot.clone())?;
+        let reservation: UnixBindReservation<'_> = socket.reserve_bind(target)?;
+        let initial_data = InitialNodeData::from_shared(slot);
+
+        let location = parent
+            .create_named(
+                &name,
+                &NamedCreateOptions {
+                    node_type: NodeType::Socket,
+                    permission: mode,
+                    owner: Some(owner),
+                    rdev: None,
+                    initial_data: Some(initial_data),
+                },
+                CreateDisposition::Exclusive,
+            )
+            .map_err(AxError::from)?;
+
+        // No fallible work is permitted after the backend makes the initialized
+        // name visible. Committing only moves/clones already admitted ownership.
+        reservation.commit_with_keepalive(location.entry.entry().lifetime_token());
+        if let Err(error) = crate::file::inotify::notify_parent_with_name(
+            &parent,
+            Some(&location.entry),
+            location.entry.name(),
+            IN_CREATE,
+            false,
+            0,
+        ) {
+            warn!("Unix socket create notification failed: {error}");
+        }
+        Ok(())
+    })();
+    result.map_err(map_bind_create_error)
 }
 
 /// Binds a kernel-owned endpoint to a socket inode populated by a static
@@ -187,6 +207,8 @@ pub(crate) fn resolve_peer(
 
 #[cfg(test)]
 mod tests {
+    use axfs_ng_vfs::{Mountpoint, NodeType};
+
     use super::*;
 
     #[test]
@@ -198,6 +220,49 @@ mod tests {
         assert_eq!(
             map_bind_create_error(AxError::PermissionDenied),
             AxError::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn bind_availability_checks_the_exact_covered_name() {
+        let filesystem = crate::pseudofs::tmp::MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&filesystem);
+        crate::mounts::initialize_test_mount(&mount, 0).unwrap();
+        let root = mount.root_location();
+        root.create(
+            "file",
+            NodeType::RegularFile,
+            NodePermission::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        root.create_symlink(
+            "symlink",
+            "target",
+            NodePermission::from_bits_truncate(0o777),
+            Some((0, 0)),
+        )
+        .unwrap();
+        let covered = root
+            .create(
+                "covered",
+                NodeType::Directory,
+                NodePermission::from_bits_truncate(0o700),
+            )
+            .unwrap();
+        let child_filesystem = crate::pseudofs::tmp::MemoryFs::new().unwrap();
+        covered.mount(&child_filesystem).unwrap();
+
+        assert_eq!(check_bind_name_available(&root, "missing"), Ok(()));
+        for name in ["file", "symlink", "covered"] {
+            let error = check_bind_name_available(&root, name).unwrap_err();
+            assert_eq!(error, AxError::AlreadyExists);
+            assert_eq!(map_bind_create_error(error), AxError::AddrInUse);
+        }
+        assert!(root.lookup_no_follow("covered").unwrap().is_root_of_mount());
+        assert!(
+            root.lookup_no_follow_in_mount("covered")
+                .unwrap()
+                .same_node(&covered)
         );
     }
 }

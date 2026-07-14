@@ -7,9 +7,10 @@ use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::task::{
-    AsThread, ProcessData, PtraceAccessMode, PtraceReverseLink, PtraceSession,
-    TaskParentCredentialPin, Thread, check_current_thread_ptrace_image_access, get_task,
-    get_visible_task, notify_ptrace_attach_stop, reinject_ptrace_signal,
+    AsThread, ProcessData, PtraceAccessMode, PtraceRelationshipOrigin, PtraceRelationshipSnapshot,
+    PtraceReverseLink, PtraceSession, TaskParentCredentialPin, Thread,
+    check_thread_ptrace_image_access_with_actor, get_task, get_visible_task,
+    notify_ptrace_attach_stop, reinject_ptrace_signal,
     security::{ProcessImageSecurityRef, PtraceTracemeContext, dispatch_ptrace_traceme},
     send_signal_to_process,
 };
@@ -155,9 +156,14 @@ fn interrupt_process_threads(target: &ProcessData) {
 
 fn do_attach(target_thread: &Thread, seized: bool, initial_options: u32) -> AxResult<isize> {
     let curr = current();
-    let tracer_data = curr.as_thread().proc_data.clone();
+    let ptracer = curr.as_thread();
+    // Pin the exact actor before core/LSM authorization.  The same guard is
+    // carried through relationship publication, so a concurrent credential
+    // transition cannot turn an admitted actor into a different stored one.
+    let ptracer_credential = ptracer.lock_credential_snapshot();
+    let tracer_data = ptracer.proc_data.clone();
     let tracer = tracer_data.proc.pid();
-    let tracer_kernel_tid = curr.as_thread().kernel_tid();
+    let tracer_kernel_tid = ptracer.kernel_tid();
     let target = &target_thread.proc_data;
     if target.proc.pid() == tracer {
         return Err(AxError::OperationNotPermitted);
@@ -165,16 +171,22 @@ fn do_attach(target_thread: &Thread, seized: bool, initial_options: u32) -> AxRe
     if target.exec_in_progress() {
         return Err(AxError::OperationNotPermitted);
     }
-    let authorized_image =
-        check_current_thread_ptrace_image_access(target_thread, PtraceAccessMode::AttachReal)?;
+    let authorized_image = check_thread_ptrace_image_access_with_actor(
+        ptracer,
+        ptracer_credential.credential(),
+        target_thread,
+        PtraceAccessMode::AttachReal,
+    )?;
     let reverse_link =
         tracer_data.try_prepare_ptrace_reverse_link(target.proc.pid(), tracer_kernel_tid)?;
     let publication = target.lock_ptrace_publication();
     let session = target.publish_ptrace_relationship(
         &publication,
         target_thread,
-        tracer,
-        tracer_kernel_tid,
+        ptracer,
+        &ptracer_credential,
+        PtraceRelationshipOrigin::Attach,
+        &ptracer_credential,
         seized,
         initial_options,
         &authorized_image,
@@ -193,11 +205,11 @@ fn do_continue(
     session: PtraceSession,
     data: usize,
     detach: bool,
-) -> AxResult<isize> {
+) -> AxResult<PtraceContinueOutcome> {
     let curr = current();
     let tracer_data = curr.as_thread().proc_data.clone();
     let signal = parse_signal(data)?.map(|info| info.signo());
-    let (resume_result, record) = target
+    let (resume_result, record, retired_relationship) = target
         .resume_ptrace(session, detach)
         .ok_or(AxError::NoSuchProcess)?;
     if detach {
@@ -205,8 +217,30 @@ fn do_continue(
     }
     let reinjected = reinject_ptrace_signal(target, record, signal);
     target.finish_ptrace_resume(resume_result);
-    reinjected?;
-    Ok(0)
+    Ok(PtraceContinueOutcome {
+        result: reinjected.map(|()| 0),
+        retired_relationship,
+    })
+}
+
+/// Carries a detached relationship beyond the syscall's sleepable ptrace
+/// action guard. Finishing earlier could run credential free hooks while that
+/// guard is still held.
+#[must_use = "detached relationship retirement must cross the ptrace action guard"]
+struct PtraceContinueOutcome {
+    result: AxResult<isize>,
+    retired_relationship: Option<PtraceRelationshipSnapshot>,
+}
+
+impl PtraceContinueOutcome {
+    fn finish(self) -> AxResult<isize> {
+        let Self {
+            result,
+            retired_relationship,
+        } = self;
+        drop(retired_relationship);
+        result
+    }
 }
 
 fn validate_remote_access(
@@ -298,9 +332,9 @@ fn sys_ptrace_traceme() -> AxResult<isize> {
         parent_data
             .try_prepare_ptrace_reverse_link(proc_data.proc.pid(), parent_snapshot.kernel_tid())?,
     );
-    // Reservation is fallible and may sleep. Re-resolve the immutable task
-    // identity and revalidate the exact credential object used by the hook
-    // immediately before relationship publication.
+    // Reservation is fallible and may sleep. Re-resolve the immutable parent
+    // task and hook-actor credential, then separately pin the calling child's
+    // current credential which Linux stores as ptracer_cred for TRACEME.
     drop(parent_task);
     loop {
         let publication = proc_data.lock_ptrace_traceme_publication(&parent_data)?;
@@ -320,17 +354,26 @@ fn sys_ptrace_traceme() -> AxResult<isize> {
 
         match child.try_lock_task_parent_security_snapshot(graph, &parent_snapshot) {
             TaskParentCredentialPin::Pinned(parent_credential) => {
-                let parent_pid = parent_data.proc.pid();
+                let Some(child_credential) = child.try_lock_credential_snapshot() else {
+                    drop(parent_credential);
+                    drop(parent_task);
+                    drop(publication);
+                    yield_now();
+                    continue;
+                };
                 let result = proc_data.publish_ptrace_relationship(
                     &publication,
                     child,
-                    parent_pid,
-                    parent_snapshot.kernel_tid(),
+                    parent,
+                    &parent_credential,
+                    PtraceRelationshipOrigin::Traceme,
+                    &child_credential,
                     false,
                     0,
                     &authorized_image,
                     reverse_link.take().expect("reserved ptrace reverse link"),
                 );
+                drop(child_credential);
                 drop(parent_credential);
                 drop(parent_task);
                 drop(publication);
@@ -375,15 +418,17 @@ fn sys_ptrace_for_target(request: u32, pid: Pid, addr: usize, data: usize) -> Ax
     // ptrace/image/job-control spin checks remain short, while the relationship
     // cannot be resumed or detached by a sibling tracer thread during remote
     // memory or usercopy.
-    let _ptrace_action = target.lock_ptrace_actions();
+    let ptrace_action = target.lock_ptrace_actions();
     match request {
         PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP => {
             let session = check_inactive_tracee(&target)?;
-            do_continue(&target, session, data, false)
+            do_continue(&target, session, data, false)?.finish()
         }
         PTRACE_DETACH => {
             let session = check_inactive_tracee(&target)?;
-            do_continue(&target, session, data, true)
+            let outcome = do_continue(&target, session, data, true)?;
+            drop(ptrace_action);
+            outcome.finish()
         }
         PTRACE_KILL => {
             check_tracee(&target)?;

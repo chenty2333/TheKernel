@@ -8,7 +8,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::NodeType;
 use axhal::uspace::UserContext;
 use axtask::current;
-use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
+use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, CAP_SYS_PTRACE};
 use memory_addr::PAGE_SIZE_4K;
 use starry_process::Pid;
 use starry_signal::{SignalAction, SignalDisposition, Signo};
@@ -19,7 +19,8 @@ use crate::task::reset_current_user_fpu_state;
 use crate::{
     config::USER_HEAP_BASE,
     file::{
-        FD_TABLE, ResolveAtResult, fanotify, replace_process_fd_table, resolve_at_with_credentials,
+        FD_TABLE, ResolveAtResult, fanotify, permission::VfsSecurityContext,
+        replace_process_fd_table, resolve_at_with_security,
     },
     mm::{
         ExecImageAccess, copy_from_kernel, finish_prepared_user_app, new_user_aspace_empty,
@@ -27,13 +28,13 @@ use crate::{
     },
     readiness::block_on_poll_set,
     task::{
-        AsThread, DacCredentialView, ExecCommitRuntime, ExecCredentialInput, ExecImageIdentity,
+        AsThread, Cred, ExecCommitRuntime, ExecCredentialInput, ExecImageIdentity,
         ExecImageReadability, ExecMountPrivilege, ExecTraceState, FileCapabilities,
-        ProcessAccessState, ProcessData, Thread, UserNamespace, check_signals,
-        commit_exec_identity_handoff, fail_closed_exit, get_task, has_pending_fatal_signal,
-        linux_pid_from_task_id, map_exec_dumpability, notify_ptrace_attach_stop,
-        prepare_task_alias_admission, process_error, release_exec_action_then_complete,
-        set_current_user_page_table_root,
+        ProcessAccessState, ProcessData, PtraceRelationshipSnapshot, Thread, UserNamespace,
+        check_signals, commit_exec_identity_handoff, fail_closed_exit, get_task,
+        has_pending_fatal_signal, linux_pid_from_task_id, map_exec_dumpability,
+        notify_ptrace_attach_stop, ns_capable, prepare_task_alias_admission, process_error,
+        release_exec_action_then_complete, set_current_user_page_table_root,
     },
 };
 
@@ -74,14 +75,6 @@ fn exec_mm_owner_user_ns(
     owner
 }
 
-fn initial_user_namespace(namespace: &Arc<UserNamespace>) -> Arc<UserNamespace> {
-    let mut owner = namespace.clone();
-    while let Some(parent) = owner.parent() {
-        owner = parent;
-    }
-    owner
-}
-
 fn exact_exec_thread_snapshot<I>(snapshot: &[Pid], current_count: usize, current: I) -> bool
 where
     I: Iterator<Item = Pid>,
@@ -89,16 +82,80 @@ where
     current_count == snapshot.len() && current.eq(snapshot.iter().copied())
 }
 
-fn exec_trace_state(proc_data: &ProcessData) -> ExecTraceState {
-    // Linux binds ptracer_cred at attach time. The current ptrace session does
-    // not retain that immutable actor credential yet, so consulting the
-    // tracer's mutable current credential could incorrectly grant privilege
-    // after attach. Suppress every active session until ptracer_cred is part
-    // of the relationship token.
-    if proc_data.ptrace_tracer().is_some() {
-        ExecTraceState::SuppressingPrivilege
-    } else {
-        ExecTraceState::NotSuppressingPrivilege
+/// Owns the process-wide exec/attach/thread-admission gate.
+///
+/// The gate is claimed only after the loader has frozen the old-image inputs,
+/// but before ptrace state or executable privilege metadata is sampled. Every
+/// fallible preparation below that point therefore releases it automatically,
+/// while a successful exec keeps it through the complete image publication.
+#[must_use = "dropping the admission guard releases the exec gate"]
+struct ExecAdmission<'a> {
+    proc_data: &'a ProcessData,
+    owner: Pid,
+    armed: bool,
+}
+
+impl<'a> ExecAdmission<'a> {
+    fn try_begin(proc_data: &'a ProcessData, owner: Pid) -> Option<Self> {
+        proc_data.begin_exec(owner).then_some(Self {
+            proc_data,
+            owner,
+            armed: true,
+        })
+    }
+
+    fn release(mut self) {
+        self.proc_data.end_exec(self.owner);
+        self.armed = false;
+    }
+}
+
+impl Drop for ExecAdmission<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.proc_data.end_exec(self.owner);
+        }
+    }
+}
+
+fn classify_exec_trace_state(
+    ptracer_credential: Option<&Cred>,
+    target_user_ns: &Arc<UserNamespace>,
+) -> ExecTraceState {
+    // Linux asks whether the relationship's frozen ptracer_cred is capable in
+    // the proposed exec credential's user namespace. Exec derivation preserves
+    // the actor's exact namespace Arc, so callers pass actor.user_ns() here;
+    // the executable/MM owner namespace is deliberately unrelated.
+    match ptracer_credential {
+        Some(ptracer) if !ns_capable(ptracer, target_user_ns, CAP_SYS_PTRACE) => {
+            ExecTraceState::SuppressingPrivilege
+        }
+        Some(_) | None => ExecTraceState::NotSuppressingPrivilege,
+    }
+}
+
+fn exec_trace_state(
+    relationship: Option<&PtraceRelationshipSnapshot>,
+    target_user_ns: &Arc<UserNamespace>,
+) -> ExecTraceState {
+    classify_exec_trace_state(
+        relationship.map(|relationship| relationship.ptracer_cred().as_ref()),
+        target_user_ns,
+    )
+}
+
+fn exec_ptrace_relationship_is_stable(
+    prepared: Option<&PtraceRelationshipSnapshot>,
+    current: Option<&PtraceRelationshipSnapshot>,
+) -> bool {
+    match (prepared, current) {
+        (None, None) | (Some(_), None) => true,
+        (Some(prepared), Some(current)) => {
+            prepared.session() == current.session()
+                && prepared.origin() == current.origin()
+                && Arc::ptr_eq(prepared.ptracer_cred(), current.ptracer_cred())
+        }
+        (None, Some(_)) => false,
     }
 }
 
@@ -280,9 +337,10 @@ fn do_execve(
     loc: axfs_ng_vfs::Location,
     args: Vec<String>,
     envs: Vec<String>,
-    actor: &Arc<crate::task::Cred>,
-    credentials: &DacCredentialView,
+    security: &VfsSecurityContext,
 ) -> AxResult<isize> {
+    let actor = security.actor_arc();
+    let credentials = security.credentials();
     let curr = current();
     let curr_tid = linux_pid_from_task_id(curr.id().as_u64())?;
     fanotify::permission_check(
@@ -304,7 +362,6 @@ fn do_execve(
     let proc_data = &thr.proc_data;
     let mut new_aspace = new_user_aspace_empty()?;
     copy_from_kernel(&mut new_aspace)?;
-    let filesystem_owner_user_ns = initial_user_namespace(actor.user_ns());
     let mut prepared_app = prepare_user_app_at(
         &mut new_aspace,
         loc.clone(),
@@ -313,8 +370,17 @@ fn do_execve(
         &envs,
         credentials,
         actor,
-        &filesystem_owner_user_ns,
+        security.filesystem_owner_user_ns(),
     )?;
+
+    // Linearize against PTRACE_ATTACH/PTRACE_SEIZE and thread publication
+    // before sampling either the trace relationship or terminal privilege
+    // metadata. If attach published first, this exec observes that exact
+    // relationship. If this gate published first, a later attach is rejected
+    // until the new image is completely visible.
+    let exec_admission =
+        ExecAdmission::try_begin(proc_data, curr_tid).ok_or(AxError::Interrupted)?;
+    let exec_ptrace_relationship = proc_data.ptrace_relationship_snapshot();
 
     // Only the terminal ELF (the shebang interpreter when the initial object
     // is a script) supplies set-ID and file-capability privilege. PT_INTERP is
@@ -328,7 +394,7 @@ fn do_execve(
     let file_owner = source_security.owner();
     let nosuid = crate::mounts::is_nosuid(&prepared_app.credential_source)?;
     let file_capabilities = exec_file_capabilities(nosuid, || {
-        crate::syscall::security_capabilities_for_exec(&prepared_app.credential_source)
+        crate::file::xattr_provider::security_capabilities_for_exec(&prepared_app.credential_source)
     })?;
     let input = ExecCredentialInput::new(
         source_mode,
@@ -338,7 +404,7 @@ fn do_execve(
         } else {
             ExecMountPrivilege::Honor
         },
-        exec_trace_state(proc_data),
+        exec_trace_state(exec_ptrace_relationship.as_ref(), actor.user_ns()),
         if prepared_app.image_access.executable_unreadable() {
             ExecImageReadability::Unreadable
         } else {
@@ -390,9 +456,9 @@ fn do_execve(
         .map(|task| prepare_task_alias_admission(proc_data.proc.pid(), task))
         .transpose()?;
 
-    // This fallible registry snapshot is also prepared before begin_exec.
-    // After the gate closes, an allocation-free ordered TID recheck detects
-    // both count changes and same-count exit/clone ABA before de-threading.
+    // This fallible registry snapshot is prepared while the exec gate excludes
+    // new threads. The allocation-free ordered TID recheck still detects a
+    // sibling exit before de-threading without resampling a different set.
     let mut sibling_tids = proc_data.proc.try_threads().map_err(process_error)?;
 
     // Take the private files snapshot before killing sibling threads. A
@@ -413,32 +479,36 @@ fn do_execve(
     };
     let cloexec = cloexec?;
 
-    // Gate every exec, including an apparently single-threaded one. Otherwise
-    // CLONE_THREAD can publish a sibling between the preflight count and the
-    // irreversible commit. The gate freezes thread-group growth; the snapshot
-    // below then validates that the files preparation made before the gate is
-    // still sufficient. If clone won the race, abort before interrupting any
-    // sibling and let userspace retry instead of committing with a shared
-    // process-scope files pointer.
-    if !proc_data.begin_exec(curr_tid) {
-        return Err(AxError::Interrupted);
-    }
     if !exact_exec_thread_snapshot(
         &sibling_tids,
         proc_data.proc.thread_count(),
         proc_data.proc.thread_ids(),
     ) || !files_preparation_covers_thread_snapshot(private_fd_table.is_some(), &sibling_tids)
-        || prepared_exec_cred
-            .revalidation()
-            .is_stale(exec_trace_state(proc_data))
     {
-        proc_data.end_exec(curr_tid);
         return Err(AxError::Interrupted);
+    }
+    // A fresh relationship cannot publish after ExecAdmission has linearized.
+    // Detach is harmless (and may leave a conservative suppression decision),
+    // but a different exact session/credential is an internal invariant
+    // failure rather than a retry-shaped EINTR.
+    let current_ptrace_relationship = proc_data.ptrace_relationship_snapshot();
+    if !exec_ptrace_relationship_is_stable(
+        exec_ptrace_relationship.as_ref(),
+        current_ptrace_relationship.as_ref(),
+    ) {
+        return Err(AxError::OperationNotPermitted);
+    }
+    // Keep the ABI crate's privilege-sensitive check as a second fail-closed
+    // assertion over the exact relationship classification.
+    if prepared_exec_cred.revalidation().is_stale(exec_trace_state(
+        current_ptrace_relationship.as_ref(),
+        actor.user_ns(),
+    )) {
+        return Err(AxError::OperationNotPermitted);
     }
     sibling_tids.retain(|&tid| tid != curr_tid);
     interrupt_exec_siblings(&sibling_tids);
     if let Err(err) = wait_for_exec_group(proc_data, thr, uctx, curr_tid, &sibling_tids) {
-        proc_data.end_exec(curr_tid);
         return Err(err);
     }
     if let Some(private) = private_fd_table {
@@ -540,7 +610,7 @@ fn do_execve(
     });
     // Keep CLONE_THREAD publication and the vfork parent gated until the
     // complete new image and its late committed notification are visible.
-    proc_data.end_exec(curr_tid);
+    exec_admission.release();
     proc_data.release_vfork();
     drop(completed_exec_retirement);
     Ok(0)
@@ -559,12 +629,11 @@ pub fn sys_execve(
 
     // Freeze one immutable actor snapshot before path resolution; that same
     // Arc supplies DAC, component hooks, and credential derivation throughout.
-    let actor = current().as_thread().current_cred();
-    let credentials = actor.fs_dac_credentials();
-    let loc = resolve_at_with_credentials(AT_FDCWD, Some(&path), 0, &credentials)?
+    let security = VfsSecurityContext::new(current().as_thread().current_cred());
+    let loc = resolve_at_with_security(AT_FDCWD, Some(&path), 0, &security)?
         .into_file()
         .ok_or(AxError::InvalidInput)?;
-    do_execve(uctx, loc, args, envs, &actor, &credentials)
+    do_execve(uctx, loc, args, envs, &security)
 }
 
 #[cfg(test)]
@@ -573,15 +642,25 @@ mod tests {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     use axerrno::AxError;
+    use linux_raw_sys::general::CAP_SYS_PTRACE;
 
     use super::{
-        exact_exec_thread_snapshot, exec_file_capabilities, exec_mm_owner_user_ns,
-        files_preparation_covers_thread_snapshot,
+        classify_exec_trace_state, exact_exec_thread_snapshot, exec_file_capabilities,
+        exec_mm_owner_user_ns, files_preparation_covers_thread_snapshot,
     };
     use crate::{
         mm::ExecImageAccess,
-        task::{Kgid, Kuid, UserNamespace, release_exec_action_then_complete},
+        task::{
+            Cred, CredentialSlot, ExecTraceState, Kgid, Kuid, UserNamespace,
+            release_exec_action_then_complete,
+        },
     };
+
+    fn without_effective_ptrace(credential: Arc<Cred>) -> Arc<Cred> {
+        let slot = CredentialSlot::new(credential);
+        slot.replace_capabilities_for_test(&[CAP_SYS_PTRACE], &[])
+            .unwrap()
+    }
 
     #[test]
     fn unreadable_exec_chain_uses_initial_mm_owner_namespace() {
@@ -622,6 +701,69 @@ mod tests {
         assert!(files_preparation_covers_thread_snapshot(false, &[7]));
         assert!(!files_preparation_covers_thread_snapshot(false, &[7, 8]));
         assert!(files_preparation_covers_thread_snapshot(true, &[7, 8]));
+    }
+
+    #[test]
+    fn exec_ptrace_privilege_uses_effective_attach_credential() {
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let capable = Cred::try_root(namespace.clone()).unwrap();
+        assert_eq!(
+            classify_exec_trace_state(Some(&capable), &namespace),
+            ExecTraceState::NotSuppressingPrivilege
+        );
+
+        // Keeping CAP_SYS_PTRACE only in the permitted set is insufficient:
+        // Linux ptracer_capable() uses the frozen credential's effective set.
+        let permitted_only = without_effective_ptrace(capable);
+        assert_eq!(
+            classify_exec_trace_state(Some(&permitted_only), &namespace),
+            ExecTraceState::SuppressingPrivilege
+        );
+
+        let tracer_slot = CredentialSlot::new(permitted_only.clone());
+        let attach_time = tracer_slot.current();
+        let current = tracer_slot
+            .replace_capabilities_for_test(&[CAP_SYS_PTRACE], &[CAP_SYS_PTRACE])
+            .unwrap();
+        assert_eq!(
+            classify_exec_trace_state(Some(&attach_time), &namespace),
+            ExecTraceState::SuppressingPrivilege
+        );
+        assert_eq!(
+            classify_exec_trace_state(Some(&current), &namespace),
+            ExecTraceState::NotSuppressingPrivilege
+        );
+        assert_eq!(
+            classify_exec_trace_state(None, &namespace),
+            ExecTraceState::NotSuppressingPrivilege
+        );
+    }
+
+    #[test]
+    fn exec_ptrace_capability_follows_target_namespace_direction() {
+        let initial = UserNamespace::try_new_root().unwrap();
+        let child = initial
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
+            .unwrap();
+        let sibling = initial
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
+            .unwrap();
+        let initial_ptracer = Cred::try_root(initial.clone()).unwrap();
+        let child_ptracer = Cred::try_with_user_namespace(&initial_ptracer, child.clone()).unwrap();
+        let sibling_ptracer = Cred::try_with_user_namespace(&initial_ptracer, sibling).unwrap();
+
+        assert_eq!(
+            classify_exec_trace_state(Some(&initial_ptracer), &child),
+            ExecTraceState::NotSuppressingPrivilege
+        );
+        assert_eq!(
+            classify_exec_trace_state(Some(&child_ptracer), &initial),
+            ExecTraceState::SuppressingPrivilege
+        );
+        assert_eq!(
+            classify_exec_trace_state(Some(&sibling_ptracer), &child),
+            ExecTraceState::SuppressingPrivilege
+        );
     }
 
     #[test]
@@ -681,15 +823,14 @@ pub fn sys_execveat(
     );
 
     // Use one pre-exec view for the initial path and every interpreter lookup.
-    let actor = current().as_thread().current_cred();
-    let credentials = actor.fs_dac_credentials();
+    let security = VfsSecurityContext::new(current().as_thread().current_cred());
     let resolved = if path.is_empty() {
         if (flags as u32) & AT_EMPTY_PATH == 0 {
             return Err(AxError::NotFound);
         }
-        resolve_at_with_credentials(dirfd, None, flags as u32, &credentials)?
+        resolve_at_with_security(dirfd, None, flags as u32, &security)?
     } else {
-        resolve_at_with_credentials(dirfd, Some(path.as_str()), flags as u32, &credentials)?
+        resolve_at_with_security(dirfd, Some(path.as_str()), flags as u32, &security)?
     };
 
     let loc = match resolved {
@@ -700,5 +841,5 @@ pub fn sys_execveat(
         return Err(axerrno::LinuxError::ELOOP.into());
     }
 
-    do_execve(uctx, loc, args, envs, &actor, &credentials)
+    do_execve(uctx, loc, args, envs, &security)
 }

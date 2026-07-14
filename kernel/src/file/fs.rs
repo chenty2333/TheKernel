@@ -7,7 +7,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs::{FS_CONTEXT, FsContext, WritePlacement};
+use axfs::{FS_CONTEXT, FileBackend, FsContext, WritePlacement};
 use axfs_ng_vfs::{
     DirEntrySink, Location, Metadata, NodeFlags,
     path::{MAX_NAME_LEN, Path},
@@ -22,8 +22,9 @@ use linux_raw_sys::general::{
 use starry_signal::{SignalInfo, Signo};
 
 use super::{
-    FileHandle, FileLike, Kstat, OfdIoStatus, get_file_description, get_file_like, get_typed_file,
-    permission::DacFsContextExt, try_owned_path,
+    FileHandle, FileLike, Kstat, OfdIoStatus, get_file_like, get_typed_file,
+    permission::{DacFsContextExt, SecurityFsContextExt, VfsSecurityContext},
+    try_owned_path,
 };
 use crate::{
     file::{IoDst, IoSrc, memfd},
@@ -32,7 +33,6 @@ use crate::{
     task::{AsThread, DacCredentialView, send_signal_to_process},
 };
 
-const O_PATH_STATUS_FLAG: u32 = linux_raw_sys::general::O_PATH;
 const PATH_MAX: usize = 4096;
 
 pub(crate) fn validate_pathname(path: &Path) -> AxResult {
@@ -41,6 +41,20 @@ pub(crate) fn validate_pathname(path: &Path) -> AxResult {
             .components()
             .any(|component| component.as_str().len() > MAX_NAME_LEN)
     {
+        Err(AxError::NameTooLong)
+    } else {
+        Ok(())
+    }
+}
+
+/// Validates the uninterpreted target accepted by Linux `symlink(2)`.
+///
+/// Unlike a destination pathname, the target is stored verbatim and its
+/// components are not subject to `NAME_MAX` during creation.
+pub(crate) fn validate_symlink_target(target: &str) -> AxResult {
+    if target.is_empty() {
+        Err(AxError::NotFound)
+    } else if target.len() >= PATH_MAX {
         Err(AxError::NameTooLong)
     } else {
         Ok(())
@@ -176,16 +190,48 @@ pub fn resolve_at_with_credentials(
     }
 }
 
-pub fn is_path_only_fd(fd: c_int) -> AxResult<bool> {
-    if get_file_description(fd)?.status_flags() & O_PATH_STATUS_FLAG != 0 {
-        return Ok(true);
+/// Resolves one path or metadata fd with a single frozen composite actor.
+///
+/// Pathname traversal runs both Linux DAC and the typed inode-permission hook
+/// stack for every searched directory. The final inode is deliberately left
+/// to the operation-specific hook (for example `inode_setattr`) so callers do
+/// not manufacture a generic read/write permission request that Linux never
+/// performs for that operation.
+pub(crate) fn resolve_at_with_security(
+    dirfd: c_int,
+    path: Option<&str>,
+    flags: u32,
+    security: &VfsSecurityContext,
+) -> AxResult<ResolveAtResult> {
+    match path {
+        Some("") | None => {
+            if flags & AT_EMPTY_PATH == 0 {
+                return Err(AxError::NotFound);
+            }
+            if dirfd == AT_FDCWD {
+                return Ok(ResolveAtResult::File(
+                    FS_CONTEXT.lock().current_dir().clone(),
+                ));
+            }
+            let file_like = get_file_like(dirfd)?;
+            let file = file_like.clone();
+            Ok(if let Some(file) = file.downcast_ref::<File>() {
+                ResolveAtResult::File(file.inner().location().clone())
+            } else if let Some(directory) = file.downcast_ref::<Directory>() {
+                ResolveAtResult::File(directory.inner().clone())
+            } else {
+                ResolveAtResult::Other(file_like)
+            })
+        }
+        Some(path) => with_path_fs(dirfd, Path::new(path), |fs| {
+            if flags & AT_SYMLINK_NOFOLLOW != 0 {
+                fs.resolve_no_follow_security(path, security)
+            } else {
+                fs.resolve_security(path, security)
+            }
+            .map(ResolveAtResult::File)
+        }),
     }
-
-    if let Ok(file) = get_typed_file::<File>(fd) {
-        return Ok(file.inner().flags().contains(axfs::FileFlags::PATH));
-    }
-
-    Ok(false)
 }
 
 pub fn metadata_to_kstat(metadata: &Metadata) -> Kstat {
@@ -232,7 +278,7 @@ fn killpriv_before_content_write(loc: &Location, requested: usize) -> AxResult<(
     if requested == 0 {
         return Ok(());
     }
-    crate::pseudofs::tmp::kill_file_capability(loc)
+    File::killpriv_before_file_mutation(loc)
 }
 
 impl File {
@@ -247,9 +293,18 @@ impl File {
         &self.inner
     }
 
-    /// Revokes tmpfs file capabilities before a real content mutation. The
-    /// open-file-description's write admission keeps setcap excluded from this
-    /// point until the cached mutation has completed or the writer is closed.
+    pub(crate) fn killpriv_before_file_mutation(loc: &Location) -> AxResult<()> {
+        super::xattr_provider::remove_security_capability_if_present(loc)
+    }
+
+    pub(crate) fn set_len_with_killpriv(backend: &FileBackend, len: u64) -> AxResult<()> {
+        Self::killpriv_before_file_mutation(backend.location())?;
+        backend.set_len(len)
+    }
+
+    /// Revokes executable privilege metadata before a real content mutation.
+    /// The open-file-description's write admission keeps setcap excluded from
+    /// this point until the mutation has completed or the writer is closed.
     pub(crate) fn killpriv_for_content_mutation(&self) -> AxResult<()> {
         killpriv_before_content_write(self.inner.location(), 1)
     }
@@ -504,7 +559,7 @@ impl Pollable for Directory {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{sync::Arc, vec};
+    use alloc::sync::Arc;
 
     use axfs_ng_vfs::{DirEntrySink, Mountpoint, NodePermission, NodeType};
     use linux_raw_sys::general::{O_DIRECTORY, O_PATH};
@@ -590,15 +645,49 @@ mod tests {
             .unwrap()
             .write_at(b"original", 0)
             .unwrap();
-        let xattrs = tmp::xattr_store(&loc).unwrap();
+        let node = loc.entry().as_file().unwrap();
+        loc.set_xattr(
+            "security.capability",
+            &[1, 2, 3],
+            axfs_ng_vfs::XattrSetMode::Upsert,
+        )
+        .unwrap();
+        // Layer 1 stores generic xattrs and must not interpret privilege names.
+        node.write_at(b"provider-neutral", 0).unwrap();
+        node.set_len(node.len().unwrap()).unwrap();
+        assert!(
+            crate::file::xattr_provider::read_security_capability(&loc)
+                .unwrap()
+                .is_some()
+        );
 
-        xattrs
-            .lock()
-            .insert("security.capability".into(), vec![1, 2, 3]);
         killpriv_before_content_write(&loc, 0).unwrap();
-        assert!(xattrs.lock().contains_key("security.capability"));
+        assert!(
+            crate::file::xattr_provider::read_security_capability(&loc)
+                .unwrap()
+                .is_some()
+        );
 
         killpriv_before_content_write(&loc, b"attacker".len()).unwrap();
-        assert!(!xattrs.lock().contains_key("security.capability"));
+        assert_eq!(
+            crate::file::xattr_provider::read_security_capability(&loc).unwrap(),
+            None
+        );
+
+        loc.set_xattr(
+            "security.capability",
+            &[1, 2, 3],
+            axfs_ng_vfs::XattrSetMode::Upsert,
+        )
+        .unwrap();
+        let mut options = axfs::OpenOptions::new();
+        options.write(true);
+        let file = options.open_loc(loc.clone()).unwrap().into_file().unwrap();
+        File::set_len_with_killpriv(file.backend().unwrap(), 0).unwrap();
+        assert_eq!(node.len().unwrap(), 0);
+        assert_eq!(
+            crate::file::xattr_provider::read_security_capability(&loc).unwrap(),
+            None
+        );
     }
 }

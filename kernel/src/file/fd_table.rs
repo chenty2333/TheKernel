@@ -811,6 +811,7 @@ pub(crate) fn prepare_file_description_with_open_lease(
     write_open_key: Option<ExecutableKey>,
     resource: Option<DescriptionResource>,
     open_lease_admission: super::lease::OpenLeaseAdmission,
+    vfs_open_credential: Arc<crate::task::Cred>,
 ) -> AxResult<Arc<FileDescription>> {
     FileDescription::new_with_open_lease_admission_and_resource(
         f,
@@ -818,6 +819,7 @@ pub(crate) fn prepare_file_description_with_open_lease(
         write_open_key,
         resource,
         open_lease_admission,
+        vfs_open_credential,
     )
 }
 

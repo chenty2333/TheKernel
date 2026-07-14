@@ -13,10 +13,7 @@ use axsync::Mutex;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{AddrSpace, Backend, BackendOps, PopulateCallback, page_table_flags, pages_in};
-use crate::{
-    file::{executable, memfd},
-    pseudofs::tmp,
-};
+use crate::file::{executable, memfd};
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 struct FileFutexKey {
@@ -66,7 +63,10 @@ fn transition_writable_mapping(
             return Err(error);
         }
     }
-    if active && let Err(error) = tmp::kill_file_capability(location) {
+    if active
+        && let Err(error) =
+            crate::file::xattr_provider::remove_security_capability_if_present(location)
+    {
         if !was_executable_mapping_active && let Some(registration) = executable_mapping {
             let _ = registration.set_active(false);
         }
@@ -955,7 +955,6 @@ impl Backend {
 mod tests {
     extern crate std;
 
-    use alloc::vec;
     use core::sync::atomic::AtomicBool;
     use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
 
@@ -1056,17 +1055,18 @@ mod tests {
     }
 
     fn install_capability(loc: &Location) {
-        crate::pseudofs::tmp::xattr_store(loc)
-            .unwrap()
-            .lock()
-            .insert("security.capability".into(), vec![1, 2, 3]);
+        loc.set_xattr(
+            "security.capability",
+            &[1, 2, 3],
+            axfs_ng_vfs::XattrSetMode::Upsert,
+        )
+        .unwrap();
     }
 
     fn has_capability(loc: &Location) -> bool {
-        crate::pseudofs::tmp::xattr_store(loc)
+        crate::file::xattr_provider::read_security_capability(loc)
             .unwrap()
-            .lock()
-            .contains_key("security.capability")
+            .is_some()
     }
 
     #[test]

@@ -60,6 +60,56 @@ fn inode_needs_truncate_on_unlink(ty: InodeType) -> bool {
     )
 }
 
+fn apply_hardlink_timestamps<Hal: SystemHal>(
+    parent: &mut InodeRef<Hal>,
+    source: &mut InodeRef<Hal>,
+    now: &Duration,
+) {
+    source.set_ctime(now);
+    parent.set_mtime(now);
+    parent.set_ctime(now);
+}
+
+fn apply_unlink_timestamps<Hal: SystemHal>(
+    parent: &mut InodeRef<Hal>,
+    victim: &mut InodeRef<Hal>,
+    now: &Duration,
+) {
+    victim.set_ctime(now);
+    parent.set_mtime(now);
+    parent.set_ctime(now);
+}
+
+fn apply_rename_timestamps<Hal: SystemHal>(
+    source: &mut InodeRef<Hal>,
+    replaced: Option<&mut InodeRef<Hal>>,
+    old_parent: &mut InodeRef<Hal>,
+    new_parent: Option<&mut InodeRef<Hal>>,
+    now: &Duration,
+) {
+    source.set_ctime(now);
+    if let Some(replaced) = replaced {
+        replaced.set_ctime(now);
+    }
+    old_parent.set_mtime(now);
+    old_parent.set_ctime(now);
+    if let Some(new_parent) = new_parent {
+        new_parent.set_mtime(now);
+        new_parent.set_ctime(now);
+    }
+}
+
+fn rename_requires_destination_parent_link_growth(
+    source_type: InodeType,
+    source_parent: u32,
+    destination_parent: u32,
+    destination_type: Option<InodeType>,
+) -> bool {
+    source_type == InodeType::Directory
+        && source_parent != destination_parent
+        && destination_type != Some(InodeType::Directory)
+}
+
 fn runs_align_segments(runs: &[MappedRun], segments: impl IntoIterator<Item = usize>) -> bool {
     let mut run_index = 0usize;
     let mut run_remaining = runs.first().map(|run| run.bytes).unwrap_or(0);
@@ -418,6 +468,41 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
 
     fn clone_ref(&mut self, inode: &InodeRef<Hal>) -> Ext4Result<InodeRef<Hal>> {
         self.inode_ref(inode.ino())
+    }
+
+    fn apply_committed_rename_timestamps(
+        &mut self,
+        source: &mut InodeRef<Hal>,
+        replaced: Option<InodeToken>,
+        old_parent: &mut InodeRef<Hal>,
+        new_parent: Option<&mut InodeRef<Hal>>,
+        timestamp: Option<Duration>,
+    ) -> Ext4Result<()> {
+        let Some(now) = timestamp else {
+            return Ok(());
+        };
+        let mut replaced_ref = match replaced {
+            Some(expected) => {
+                // RenameRequest keeps the exact replaced VFS entry retained
+                // through this backend call, so unlink cannot reap the inode
+                // before its committed ctime update.
+                let actual = self.inode_ref(expected.ino())?;
+                if actual.token() != expected {
+                    let error = Ext4Error::new(
+                        EIO as _,
+                        "stale ext4 rename victim during timestamp commit",
+                    );
+                    return combine_operation_and_release(Err(error), actual.finish());
+                }
+                Some(actual)
+            }
+            None => None,
+        };
+        apply_rename_timestamps(source, replaced_ref.as_mut(), old_parent, new_parent, &now);
+        match replaced_ref {
+            Some(replaced) => replaced.finish(),
+            None => Ok(()),
+        }
     }
 
     pub fn lookup_inode(&mut self, parent: u32, name: &str) -> Ext4Result<(u32, InodeType)> {
@@ -1437,6 +1522,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         dst_name: &str,
         expected_src: InodeToken,
         expected_dst: Option<InodeToken>,
+        timestamp: Option<Duration>,
     ) -> Ext4Result {
         self.ensure_metadata_writable()?;
         self.drain_hot_inodes()?;
@@ -1490,6 +1576,50 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             }
         };
 
+        let replaced_token = dst.map(|(token, _)| token);
+        let destination_type = dst.map(|(_, inode_type)| inode_type);
+        if src_type == InodeType::Directory && src_dir != dst_dir {
+            // Validate the old `..` relationship before replacement unlink or
+            // any transferred-name publication. The post-commit lookup below
+            // can then fail only on an underlying metadata I/O fault, which is
+            // handled by the existing poisoned-filesystem boundary.
+            let parent_validation = (|| {
+                let mut result = self.clone_ref(&src_ref)?.lookup("..")?;
+                let points_to_source_parent = result.entry()?.ino() == src_dir;
+                let validation = if points_to_source_parent {
+                    Ok(())
+                } else {
+                    Err(Ext4Error::new(
+                        EIO as _,
+                        "ext4 rename source has an invalid parent entry",
+                    ))
+                };
+                combine_operation_and_release(validation, result.finish())
+            })();
+            let parent_validation = self.observe_metadata_result(parent_validation);
+            if let Err(error) = parent_validation {
+                return combine_operation_and_release(Err(error), src_ref.finish());
+            }
+        }
+        if rename_requires_destination_parent_link_growth(
+            src_type,
+            src_dir,
+            dst_dir,
+            destination_type,
+        ) {
+            // A cross-parent directory move grows the destination parent's
+            // link count unless an existing destination directory first
+            // releases one link. Admit that growth before any namespace
+            // mutation so EXT4_LINK_MAX cannot wrap or leave a removed victim.
+            let destination_parent = self.inode_ref(dst_dir)?;
+            let admission = destination_parent.ensure_can_inc_nlink();
+            let admission = combine_operation_and_release(admission, destination_parent.finish());
+            if let Err(error) = admission {
+                return combine_operation_and_release(Err(error), src_ref.finish());
+            }
+        }
+
+        let had_replacement = dst.is_some();
         let mut mutation_started = false;
         let mut namespace_committed = false;
         if let Some((dst_token, dst_type)) = dst {
@@ -1498,48 +1628,116 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
                 dst_name,
                 Some(dst_token),
                 Some(dst_type == InodeType::Directory),
+                None,
             ) {
                 return combine_operation_and_release(Err(err), src_ref.finish());
             }
             mutation_started = true;
         }
+        let source_nlink = src_ref.nlink();
         let operation = (|| {
-            // These admissions intentionally remain after replacement unlink
-            // so the directory references observe its updated link counts.
-            // Keeping them inside the mutation-state closure makes every
-            // failure after that unlink explicitly fail closed.
+            // Replacement unlink can surface a post-commit cleanup failure as
+            // filesystem poison. Stop before publishing the transferred name,
+            // while still routing the result through the fail-closed rename
+            // completion path below.
             self.ensure_metadata_writable()?;
-            let mut src_dir_ref = self.inode_ref(src_dir)?;
-            let mut dst_dir_ref = match self.inode_ref(dst_dir) {
-                Ok(dst_dir_ref) => dst_dir_ref,
-                Err(error) => {
-                    return combine_operation_and_release(Err(error), src_dir_ref.finish());
-                }
-            };
-
-            let operation = (|| {
-                if src_ref.is_dir() {
+            if src_dir == dst_dir {
+                // The parent and the moved directory's `..` relationship do not
+                // change for an in-directory rename. Use one inode reference so a
+                // stale duplicate cannot overwrite parent metadata, and do not
+                // perturb the parent's link count.
+                let mut parent_ref = self.inode_ref(src_dir)?;
+                let operation = (|| {
+                    if let Err(error) = parent_ref.add_transferred_entry(dst_name, &mut src_ref) {
+                        mutation_started |= error.metadata_may_have_changed();
+                        return Err(error);
+                    }
                     mutation_started = true;
-                    let mut result = self.clone_ref(&src_ref)?.lookup("..")?;
-                    result.set_entry_ino(dst_dir)?;
-                    result.finish()?;
-                    src_dir_ref.dec_parent_dir_nlink();
-                    dst_dir_ref.inc_nlink();
-                }
-                dst_dir_ref.add_entry(dst_name, &mut src_ref)?;
-                mutation_started = true;
-                src_dir_ref.remove_entry(src_name, &mut src_ref)?;
-                // Both externally visible rename decisions are now complete:
-                // the destination names the source inode and the old source
-                // name is gone. Later inode-reference finish failures may
-                // poison metadata, but must not turn this committed rename
-                // into a retryable syscall error.
-                namespace_committed = true;
-                Ok(())
-            })();
-            let operation = combine_operation_and_release(operation, src_dir_ref.finish());
-            combine_operation_and_release(operation, dst_dir_ref.finish())
+                    if let Err(error) = parent_ref.remove_transferred_entry(src_name) {
+                        if !had_replacement && !error.metadata_may_have_changed() {
+                            match parent_ref.remove_transferred_entry(dst_name) {
+                                Ok(()) => mutation_started = false,
+                                Err(rollback_error) => {
+                                    return Err(preserve_operation_error(
+                                        error,
+                                        Err(rollback_error),
+                                    ));
+                                }
+                            }
+                        }
+                        return Err(error);
+                    }
+                    // Both externally visible rename decisions are now complete:
+                    // the destination names the source inode and the old source
+                    // name is gone. Later inode-reference finish failures may
+                    // poison metadata, but must not turn this committed rename
+                    // into a retryable syscall error.
+                    namespace_committed = true;
+                    self.apply_committed_rename_timestamps(
+                        &mut src_ref,
+                        replaced_token,
+                        &mut parent_ref,
+                        None,
+                        timestamp,
+                    )?;
+                    Ok(())
+                })();
+                combine_operation_and_release(operation, parent_ref.finish())
+            } else {
+                let mut src_dir_ref = self.inode_ref(src_dir)?;
+                let mut dst_dir_ref = match self.inode_ref(dst_dir) {
+                    Ok(dst_dir_ref) => dst_dir_ref,
+                    Err(error) => {
+                        return combine_operation_and_release(Err(error), src_dir_ref.finish());
+                    }
+                };
+
+                let operation = (|| {
+                    if let Err(error) = dst_dir_ref.add_transferred_entry(dst_name, &mut src_ref) {
+                        mutation_started |= error.metadata_may_have_changed();
+                        return Err(error);
+                    }
+                    mutation_started = true;
+                    if let Err(error) = src_dir_ref.remove_transferred_entry(src_name) {
+                        if !had_replacement && !error.metadata_may_have_changed() {
+                            match dst_dir_ref.remove_transferred_entry(dst_name) {
+                                Ok(()) => mutation_started = false,
+                                Err(rollback_error) => {
+                                    return Err(preserve_operation_error(
+                                        error,
+                                        Err(rollback_error),
+                                    ));
+                                }
+                            }
+                        }
+                        return Err(error);
+                    }
+                    namespace_committed = true;
+
+                    if src_ref.is_dir() {
+                        // Change `..` and parent directory link counts only for an
+                        // actual cross-parent directory move. Destination-parent
+                        // growth was admitted before any mutation above.
+                        let mut result = self.clone_ref(&src_ref)?.lookup("..")?;
+                        result.set_entry_ino(dst_dir)?;
+                        result.finish()?;
+                        src_dir_ref.dec_parent_dir_nlink();
+                        dst_dir_ref.inc_nlink();
+                    }
+                    self.apply_committed_rename_timestamps(
+                        &mut src_ref,
+                        replaced_token,
+                        &mut src_dir_ref,
+                        Some(&mut dst_dir_ref),
+                        timestamp,
+                    )?;
+                    Ok(())
+                })();
+                let operation = combine_operation_and_release(operation, src_dir_ref.finish());
+                combine_operation_and_release(operation, dst_dir_ref.finish())
+            }
         })();
+        debug_assert_eq!(src_ref.nlink(), source_nlink);
         let operation = combine_operation_and_release(operation, src_ref.finish());
         let operation = complete_namespace_operation(
             &mut self.metadata_poisoned,
@@ -1577,16 +1775,16 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             let operation = combine_operation_and_release(operation, dir_ref.finish());
             return self.observe_metadata_result(operation);
         }
-        if let Some(ctime) = ctime {
-            child_ref.set_ctime(&ctime);
+        if let Some(now) = ctime {
+            apply_hardlink_timestamps(&mut dir_ref, &mut child_ref, &now);
         }
 
-        // add_entry has committed the name and link-count decision. The ctime
-        // update shares the same dirty child reference and lower finish
-        // sequence, so no separate fallible metadata operation can escape
-        // after publication. A finish failure poisons the filesystem and is
-        // logged, while the already committed link remains a successful
-        // namespace operation.
+        // add_entry has committed the name and link-count decision. Source
+        // ctime and destination-parent mtime/ctime share the same dirty inode
+        // references and lower finish sequence, so no separate fallible
+        // metadata operation can escape after publication. A finish failure
+        // poisons the filesystem and is logged, while the already committed
+        // link remains a successful namespace operation.
         let release = combine_operation_and_release(child_ref.finish(), dir_ref.finish());
         finish_committed_namespace_step(
             &mut self.metadata_poisoned,
@@ -1597,15 +1795,20 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
     }
 
     pub fn unlink(&mut self, dir: u32, name: &str) -> Ext4Result {
-        self.unlink_checked(dir, name, None, None)
+        self.unlink_checked(dir, name, None, None, None)
     }
 
+    /// Removes one directory entry after validating its stable identity and
+    /// type. A VFS caller may supply one timestamp for the committed unlink;
+    /// internal rename and rollback callers pass `None` to retain their own
+    /// timestamp policy.
     pub fn unlink_checked(
         &mut self,
         dir: u32,
         name: &str,
         expected: Option<InodeToken>,
         is_dir: Option<bool>,
+        timestamp: Option<Duration>,
     ) -> Ext4Result {
         self.ensure_metadata_writable()?;
         self.drain_hot_inodes()?;
@@ -1701,6 +1904,9 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         if child_ref.is_dir() {
             dir_ref.dec_parent_dir_nlink();
             child_ref.dec_nlink();
+        }
+        if let Some(now) = timestamp {
+            apply_unlink_timestamps(&mut dir_ref, &mut child_ref, &now);
         }
         if child_ref.nlink() == 0 {
             let Some(state) = self.inode_handles.get_mut(&token) else {
@@ -1886,6 +2092,13 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
 mod tests {
     use super::*;
 
+    fn timestamp_test_inode(fs: &mut ext4_fs, inode: &mut ext4_inode) -> InodeRef<DummyHal> {
+        let mut reference = InodeRef::try_uninitialized().unwrap();
+        reference.inner.fs = fs;
+        reference.inner.inode = inode;
+        reference
+    }
+
     #[test]
     fn special_inodes_skip_truncate_during_unlink() {
         assert!(inode_needs_truncate_on_unlink(InodeType::RegularFile));
@@ -1895,6 +2108,187 @@ mod tests {
         assert!(!inode_needs_truncate_on_unlink(InodeType::Fifo));
         assert!(!inode_needs_truncate_on_unlink(InodeType::CharacterDevice));
         assert!(!inode_needs_truncate_on_unlink(InodeType::BlockDevice));
+    }
+
+    #[test]
+    fn hard_link_timestamp_update_covers_source_and_destination_parent() {
+        let mut fs = unsafe { mem::zeroed::<ext4_fs>() };
+        let mut parent_inode = unsafe { mem::zeroed::<ext4_inode>() };
+        let mut source_inode = unsafe { mem::zeroed::<ext4_inode>() };
+        let mut parent = timestamp_test_inode(&mut fs, &mut parent_inode);
+        let mut source = timestamp_test_inode(&mut fs, &mut source_inode);
+        let sentinel = Duration::new(1, 2);
+        let now = Duration::new(42, 123_456_789);
+        parent.set_mtime(&sentinel);
+        parent.set_ctime(&sentinel);
+        source.set_ctime(&sentinel);
+
+        apply_hardlink_timestamps(&mut parent, &mut source, &now);
+
+        let mut parent_attr = FileAttr::default();
+        parent.get_attr(&mut parent_attr);
+        let mut source_attr = FileAttr::default();
+        source.get_attr(&mut source_attr);
+        assert_eq!(source_attr.ctime, now);
+        assert_eq!(parent_attr.mtime, now);
+        assert_eq!(parent_attr.ctime, now);
+    }
+
+    #[test]
+    fn unlink_timestamp_update_covers_victim_and_parent_without_changing_nlink() {
+        let mut fs = unsafe { mem::zeroed::<ext4_fs>() };
+        let mut parent_inode = unsafe { mem::zeroed::<ext4_inode>() };
+        let mut victim_inode = unsafe { mem::zeroed::<ext4_inode>() };
+        let mut parent = timestamp_test_inode(&mut fs, &mut parent_inode);
+        let mut victim = timestamp_test_inode(&mut fs, &mut victim_inode);
+        let sentinel = Duration::new(1, 2);
+        let now = Duration::new(42, 123_456_789);
+        parent.set_nlink(7);
+        victim.set_nlink(2);
+        parent.set_mtime(&sentinel);
+        parent.set_ctime(&sentinel);
+        victim.set_ctime(&sentinel);
+
+        apply_unlink_timestamps(&mut parent, &mut victim, &now);
+
+        let mut parent_attr = FileAttr::default();
+        parent.get_attr(&mut parent_attr);
+        let mut victim_attr = FileAttr::default();
+        victim.get_attr(&mut victim_attr);
+        assert_eq!(parent_attr.nlink, 7);
+        assert_eq!(victim_attr.nlink, 2);
+        assert_eq!(victim_attr.ctime, now);
+        assert_eq!(parent_attr.mtime, now);
+        assert_eq!(parent_attr.ctime, now);
+    }
+
+    #[test]
+    fn rename_timestamp_update_covers_every_changed_inode_without_changing_nlinks() {
+        let mut fs = unsafe { mem::zeroed::<ext4_fs>() };
+        let mut source_inode = unsafe { mem::zeroed::<ext4_inode>() };
+        let mut victim_inode = unsafe { mem::zeroed::<ext4_inode>() };
+        let mut old_parent_inode = unsafe { mem::zeroed::<ext4_inode>() };
+        let mut new_parent_inode = unsafe { mem::zeroed::<ext4_inode>() };
+        let mut source = timestamp_test_inode(&mut fs, &mut source_inode);
+        let mut victim = timestamp_test_inode(&mut fs, &mut victim_inode);
+        let mut old_parent = timestamp_test_inode(&mut fs, &mut old_parent_inode);
+        let mut new_parent = timestamp_test_inode(&mut fs, &mut new_parent_inode);
+        let sentinel = Duration::new(1, 2);
+        let now = Duration::new(42, 123_456_789);
+        source.set_nlink(EXT4_LINK_MAX as u16);
+        victim.set_nlink(3);
+        old_parent.set_nlink(11);
+        new_parent.set_nlink(13);
+        source.set_ctime(&sentinel);
+        victim.set_ctime(&sentinel);
+        old_parent.set_mtime(&sentinel);
+        old_parent.set_ctime(&sentinel);
+        new_parent.set_mtime(&sentinel);
+        new_parent.set_ctime(&sentinel);
+
+        apply_rename_timestamps(
+            &mut source,
+            Some(&mut victim),
+            &mut old_parent,
+            Some(&mut new_parent),
+            &now,
+        );
+
+        let mut source_attr = FileAttr::default();
+        source.get_attr(&mut source_attr);
+        let mut victim_attr = FileAttr::default();
+        victim.get_attr(&mut victim_attr);
+        let mut old_parent_attr = FileAttr::default();
+        old_parent.get_attr(&mut old_parent_attr);
+        let mut new_parent_attr = FileAttr::default();
+        new_parent.get_attr(&mut new_parent_attr);
+        assert_eq!(source_attr.ctime, now);
+        assert_eq!(victim_attr.ctime, now);
+        assert_eq!(old_parent_attr.mtime, now);
+        assert_eq!(old_parent_attr.ctime, now);
+        assert_eq!(new_parent_attr.mtime, now);
+        assert_eq!(new_parent_attr.ctime, now);
+        assert_eq!(source_attr.nlink, EXT4_LINK_MAX as u64);
+        assert_eq!(victim_attr.nlink, 3);
+        assert_eq!(old_parent_attr.nlink, 11);
+        assert_eq!(new_parent_attr.nlink, 13);
+    }
+
+    #[test]
+    fn same_parent_rename_timestamp_update_does_not_touch_a_second_parent() {
+        let mut fs = unsafe { mem::zeroed::<ext4_fs>() };
+        let mut source_inode = unsafe { mem::zeroed::<ext4_inode>() };
+        let mut parent_inode = unsafe { mem::zeroed::<ext4_inode>() };
+        let mut untouched_inode = unsafe { mem::zeroed::<ext4_inode>() };
+        let mut source = timestamp_test_inode(&mut fs, &mut source_inode);
+        let mut parent = timestamp_test_inode(&mut fs, &mut parent_inode);
+        let mut untouched = timestamp_test_inode(&mut fs, &mut untouched_inode);
+        let sentinel = Duration::new(1, 2);
+        let now = Duration::new(42, 123_456_789);
+        source.set_ctime(&sentinel);
+        parent.set_mtime(&sentinel);
+        parent.set_ctime(&sentinel);
+        untouched.set_mtime(&sentinel);
+        untouched.set_ctime(&sentinel);
+
+        apply_rename_timestamps(&mut source, None, &mut parent, None, &now);
+
+        let mut parent_attr = FileAttr::default();
+        parent.get_attr(&mut parent_attr);
+        let mut untouched_attr = FileAttr::default();
+        untouched.get_attr(&mut untouched_attr);
+        assert_eq!(parent_attr.mtime, now);
+        assert_eq!(parent_attr.ctime, now);
+        assert_eq!(untouched_attr.mtime, sentinel);
+        assert_eq!(untouched_attr.ctime, sentinel);
+    }
+
+    #[test]
+    fn rename_parent_link_growth_is_admitted_only_when_the_topology_grows() {
+        assert!(!rename_requires_destination_parent_link_growth(
+            InodeType::Directory,
+            10,
+            10,
+            None,
+        ));
+        assert!(rename_requires_destination_parent_link_growth(
+            InodeType::Directory,
+            10,
+            20,
+            None,
+        ));
+        assert!(!rename_requires_destination_parent_link_growth(
+            InodeType::Directory,
+            10,
+            20,
+            Some(InodeType::Directory),
+        ));
+        assert!(!rename_requires_destination_parent_link_growth(
+            InodeType::RegularFile,
+            10,
+            20,
+            None,
+        ));
+    }
+
+    #[test]
+    fn rename_parent_link_limit_admission_does_not_wrap_the_inode() {
+        let mut fs = unsafe { mem::zeroed::<ext4_fs>() };
+        let mut parent_inode = unsafe { mem::zeroed::<ext4_inode>() };
+        let mut parent = timestamp_test_inode(&mut fs, &mut parent_inode);
+        let sentinel = Duration::new(1, 2);
+        parent.set_nlink(EXT4_LINK_MAX as u16);
+        parent.set_mtime(&sentinel);
+        parent.set_ctime(&sentinel);
+
+        let error = parent.ensure_can_inc_nlink().unwrap_err();
+
+        let mut parent_attr = FileAttr::default();
+        parent.get_attr(&mut parent_attr);
+        assert_eq!(error.code, EMLINK as i32);
+        assert_eq!(parent.nlink(), EXT4_LINK_MAX as u16);
+        assert_eq!(parent_attr.mtime, sentinel);
+        assert_eq!(parent_attr.ctime, sentinel);
     }
 
     #[test]

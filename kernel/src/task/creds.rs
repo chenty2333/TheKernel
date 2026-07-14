@@ -23,8 +23,8 @@ use super::{
     exec_cred::ExecCredentialDraft,
     process::UserNamespace,
     security::{
-        CredentialSecurityState, CredentialStateTransition, FrozenSecurityRegistry,
-        PendingCredentialPostCommit,
+        CredentialMutationKind, CredentialSecurityState, CredentialStateTransition,
+        FrozenSecurityRegistry, PendingCredentialPostCommit,
     },
 };
 
@@ -174,6 +174,13 @@ impl Cred {
     pub(crate) fn has_effective_capability_in_own_user_ns(&self, capability: u32) -> bool {
         self.core
             .has_effective_capability_in_own_user_ns(capability)
+    }
+
+    /// Returns whether both composites wrap the same immutable Linux
+    /// credential core. Fork may rebuild kernel-owned security state around a
+    /// shared core, so outer `Arc` identity is intentionally too strict.
+    pub(crate) fn same_linux_credential(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.core, &other.core)
     }
 
     pub(crate) fn is_initial_root_euid(&self) -> bool {
@@ -358,7 +365,14 @@ impl CredBuilder {
         }
     }
 
-    fn try_build(self, old: &Arc<Cred>) -> AxResult<(Arc<Cred>, CredentialTransitionEffects)> {
+    fn try_build(
+        self,
+        old: &Arc<Cred>,
+    ) -> AxResult<(
+        Arc<Cred>,
+        CredentialTransitionEffects,
+        CredentialStateTransition,
+    )> {
         let caps = self.caps.try_into_committed()?;
         let prepared_core = CoreCred::try_prepare_transition(
             old.core_arc(),
@@ -369,16 +383,17 @@ impl CredBuilder {
         )
         .map_err(cred_error)?;
         let effects = prepared_core.effects();
-        let security = Cred::try_prepare_security_transition(
-            old,
+        let transition = CredentialStateTransition::Mutation(CredentialMutationKind::between(
+            old.core(),
             prepared_core.proposed(),
-            CredentialStateTransition::Normal,
-        )?;
+        ));
+        let security =
+            Cred::try_prepare_security_transition(old, prepared_core.proposed(), transition)?;
         let core = prepared_core
             .try_into_proposed(old.core_arc())
             .map_err(cred_error)?;
         let proposed = Cred::try_from_prepared_parts(core, security)?;
-        Ok((proposed, effects))
+        Ok((proposed, effects, transition))
     }
 }
 
@@ -466,6 +481,45 @@ impl CredentialSlot {
             builder,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn replace_fs_ids_for_test(
+        &self,
+        fsuid: thekernel_linux_cred::Kuid,
+        fsgid: thekernel_linux_cred::Kgid,
+    ) -> AxResult<Arc<Cred>> {
+        let mut update = self.prepare();
+        update.builder.ids.fsuid = fsuid;
+        update.builder.ids.fsgid = fsgid;
+        Ok(update.finish()?.commit())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_capabilities_for_test(
+        &self,
+        permitted: &[u32],
+        effective: &[u32],
+    ) -> AxResult<Arc<Cred>> {
+        fn insert_capability(set: &mut [u32; CAPABILITY_WORDS], capability: u32) -> AxResult<()> {
+            let (word, mask) =
+                CapabilityState::cap_mask(capability).ok_or(AxError::InvalidInput)?;
+            set[word] |= mask;
+            Ok(())
+        }
+
+        let mut update = self.prepare();
+        update.builder.caps.permitted = [0; CAPABILITY_WORDS];
+        update.builder.caps.effective = [0; CAPABILITY_WORDS];
+        update.builder.caps.inheritable = [0; CAPABILITY_WORDS];
+        update.builder.caps.ambient = [0; CAPABILITY_WORDS];
+        for &capability in permitted {
+            insert_capability(&mut update.builder.caps.permitted, capability)?;
+        }
+        for &capability in effective {
+            insert_capability(&mut update.builder.caps.effective, capability)?;
+        }
+        Ok(update.finish()?.commit())
+    }
 }
 
 pub(crate) struct CredentialUpdate<'a> {
@@ -493,12 +547,8 @@ impl<'a> CredentialUpdate<'a> {
             old,
             builder,
         } = self;
-        let (proposed, effects) = builder.try_build(&old)?;
-        let post_commit = PendingCredentialPostCommit::try_new(
-            &old,
-            &proposed,
-            CredentialStateTransition::Normal,
-        )?;
+        let (proposed, effects, transition) = builder.try_build(&old)?;
+        let post_commit = PendingCredentialPostCommit::try_new(&old, &proposed, transition)?;
         Ok(PreparedCred {
             slot,
             guard,
@@ -788,6 +838,7 @@ mod tests {
 
         assert!(!Arc::ptr_eq(&parent, &child));
         assert!(Arc::ptr_eq(parent.core_arc(), child.core_arc()));
+        assert!(parent.same_linux_credential(&child));
         assert!(
             parent
                 .security()

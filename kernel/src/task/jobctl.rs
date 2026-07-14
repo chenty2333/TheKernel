@@ -1,4 +1,8 @@
+use alloc::sync::Arc;
+
 use starry_process::Pid;
+
+use super::Cred;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -128,10 +132,46 @@ pub(crate) struct PtraceSession {
     pub(crate) generation: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Linux chooses the stored `ptracer_cred` source from the operation which
+/// creates the relationship.  ATTACH/SEIZE store the tracer's credential,
+/// while TRACEME's `ptrace_link(current, real_parent)` stores the calling
+/// tracee's current credential even though its parent is the hook actor.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum PtraceRelationshipOrigin {
+    Attach,
+    Traceme,
+}
+
+/// One atomically observed ptrace relationship and the immutable credential
+/// which authorized its publication.
+///
+/// This is Linux's relationship-time `ptracer_cred`: ATTACH/SEIZE capture the
+/// exact ptracer task, while TRACEME captures the calling tracee. Consumers
+/// must use this owner together with `session`; looking the tracer up by PID
+/// later could observe a different credential or a recycled task identity.
+#[derive(Clone)]
+pub(crate) struct PtraceRelationshipSnapshot {
+    session: PtraceSession,
+    origin: PtraceRelationshipOrigin,
+    ptracer_cred: Arc<Cred>,
+}
+
+impl PtraceRelationshipSnapshot {
+    pub(crate) const fn session(&self) -> PtraceSession {
+        self.session
+    }
+
+    pub(crate) const fn origin(&self) -> PtraceRelationshipOrigin {
+        self.origin
+    }
+
+    pub(crate) fn ptracer_cred(&self) -> &Arc<Cred> {
+        &self.ptracer_cred
+    }
+}
+
 pub(in crate::task) struct PtraceControlState {
-    pub(in crate::task) tracer: Option<Pid>,
-    pub(in crate::task) tracer_kernel_tid: Pid,
+    relationship: Option<PtraceRelationshipSnapshot>,
     /// Last generation successfully published. Never reset on detach.
     pub(in crate::task) generation: u64,
     /// Whether the current relationship was created by `PTRACE_SEIZE`.
@@ -142,11 +182,16 @@ pub(in crate::task) struct PtraceControlState {
 
 impl PtraceControlState {
     pub(in crate::task) fn active_session(&self) -> Option<PtraceSession> {
-        self.tracer.map(|tracer| PtraceSession {
-            tracer,
-            tracer_kernel_tid: self.tracer_kernel_tid,
-            generation: self.generation,
-        })
+        self.relationship
+            .as_ref()
+            .map(PtraceRelationshipSnapshot::session)
+    }
+
+    /// Clones the session and its relationship-time credential under one state
+    /// observation.  The clone is destroyed by the caller after the ptrace
+    /// control guard is released.
+    pub(in crate::task) fn active_relationship(&self) -> Option<PtraceRelationshipSnapshot> {
+        self.relationship.clone()
     }
 
     pub(in crate::task) fn active_session_if_owned_by(
@@ -165,8 +210,10 @@ impl PtraceControlState {
         tracer_kernel_tid: Pid,
         seized: bool,
         initial_options: u32,
+        origin: PtraceRelationshipOrigin,
+        ptracer_cred: &Arc<Cred>,
     ) -> Option<PtraceSession> {
-        if self.tracer.is_some() {
+        if self.relationship.is_some() {
             return None;
         }
         let generation = self.generation.checked_add(1)?;
@@ -175,8 +222,11 @@ impl PtraceControlState {
             tracer_kernel_tid,
             generation,
         };
-        self.tracer = Some(tracer);
-        self.tracer_kernel_tid = tracer_kernel_tid;
+        self.relationship = Some(PtraceRelationshipSnapshot {
+            session,
+            origin,
+            ptracer_cred: ptracer_cred.clone(),
+        });
         self.generation = generation;
         self.seized = seized;
         self.options = initial_options;
@@ -184,31 +234,48 @@ impl PtraceControlState {
         Some(session)
     }
 
-    pub(in crate::task) fn clear_session(&mut self, session: PtraceSession) -> bool {
+    /// Removes an exact relationship without destroying its credential under
+    /// the caller's ptrace/job-control spin guards.  The returned retirement
+    /// owner must be dropped only after those guards have been released.
+    pub(in crate::task) fn clear_session(
+        &mut self,
+        session: PtraceSession,
+    ) -> Option<PtraceRelationshipSnapshot> {
         if self.active_session() != Some(session) {
-            return false;
+            return None;
         }
-        self.tracer = None;
-        self.tracer_kernel_tid = 0;
+        let relationship = self.relationship.take();
         self.seized = false;
         self.options = 0;
         self.event_message = 0;
-        true
+        relationship
     }
 
-    pub(in crate::task) fn clear_active(&mut self) -> Option<PtraceSession> {
+    pub(in crate::task) fn clear_active(&mut self) -> Option<PtraceRelationshipSnapshot> {
         let session = self.active_session()?;
-        let cleared = self.clear_session(session);
-        debug_assert!(cleared);
-        Some(session)
+        let relationship = self.clear_session(session);
+        debug_assert!(relationship.is_some());
+        relationship
+    }
+
+    /// Aborts a relationship whose reverse link could not be published.  Its
+    /// generation never became externally visible, so restore the previous
+    /// value while carrying the credential owner out to a safe drop boundary.
+    pub(in crate::task) fn rollback_begin(
+        &mut self,
+        session: PtraceSession,
+        previous_generation: u64,
+    ) -> Option<PtraceRelationshipSnapshot> {
+        let relationship = self.clear_session(session)?;
+        self.generation = previous_generation;
+        Some(relationship)
     }
 }
 
 impl Default for PtraceControlState {
     fn default() -> Self {
         Self {
-            tracer: None,
-            tracer_kernel_tid: 0,
+            relationship: None,
             generation: 0,
             seized: false,
             options: 0,
@@ -231,20 +298,48 @@ pub(in crate::task) struct VforkControlState {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobControlState, PtraceControlState, StopKind, StopState};
+    use alloc::sync::Arc;
+
+    use super::{
+        JobControlState, PtraceControlState, PtraceRelationshipOrigin, StopKind, StopState,
+    };
+    use crate::task::{Cred, UserNamespace};
+
+    fn credential() -> Arc<Cred> {
+        Cred::try_root(UserNamespace::try_new_root().unwrap()).unwrap()
+    }
 
     #[test]
     fn process_access_ptrace_seize_publishes_options_with_relationship() {
         let mut control = PtraceControlState::default();
-        let session = control.try_begin(7, 70, true, 0x40).unwrap();
+        let ptracer_cred = credential();
+        let session = control
+            .try_begin(
+                7,
+                70,
+                true,
+                0x40,
+                PtraceRelationshipOrigin::Attach,
+                &ptracer_cred,
+            )
+            .unwrap();
         assert_eq!(control.active_session(), Some(session));
         assert_eq!(control.active_session_if_owned_by(7, 70), Some(session));
         assert_eq!(control.active_session_if_owned_by(7, 71), None);
         assert!(control.seized);
         assert_eq!(control.options, 0x40);
 
-        assert!(control.clear_session(session));
-        let attached = control.try_begin(7, 70, false, 0).unwrap();
+        assert!(control.clear_session(session).is_some());
+        let attached = control
+            .try_begin(
+                7,
+                70,
+                false,
+                0,
+                PtraceRelationshipOrigin::Attach,
+                &ptracer_cred,
+            )
+            .unwrap();
         assert_ne!(attached, session);
         assert!(!control.seized);
         assert_eq!(control.options, 0);
@@ -253,7 +348,17 @@ mod tests {
     #[test]
     fn process_access_ptrace_inactive_and_wait_report_require_exact_generation() {
         let mut control = PtraceControlState::default();
-        let old = control.try_begin(7, 70, false, 0).unwrap();
+        let ptracer_cred = credential();
+        let old = control
+            .try_begin(
+                7,
+                70,
+                false,
+                0,
+                PtraceRelationshipOrigin::Attach,
+                &ptracer_cred,
+            )
+            .unwrap();
         let mut job = JobControlState {
             state: StopState::Stopped,
             stop_signal: 19,
@@ -266,8 +371,17 @@ mod tests {
         let old_report = job.stop_report_for(Some(old)).unwrap();
         assert!(old_report.traced());
 
-        assert!(control.clear_session(old));
-        let new = control.try_begin(7, 70, false, 0).unwrap();
+        assert!(control.clear_session(old).is_some());
+        let new = control
+            .try_begin(
+                7,
+                70,
+                false,
+                0,
+                PtraceRelationshipOrigin::Attach,
+                &ptracer_cred,
+            )
+            .unwrap();
         assert_ne!(new, old);
         assert!(!job.is_ptrace_inactive_for(new));
         assert_eq!(job.stop_report_for(Some(new)), None);

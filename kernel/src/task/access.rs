@@ -280,8 +280,30 @@ pub(crate) fn check_current_thread_ptrace_image_access(
     target: &Thread,
     mode: PtraceAccessMode,
 ) -> AxResult<ProcessImageAccessSnapshot> {
+    let current = current();
+    let actor = current.as_thread();
+    let actor_cred = actor.current_cred();
+    check_thread_ptrace_image_access_with_actor(actor, &actor_cred, target, mode)
+}
+
+/// Authorizes one exact target image with a caller-supplied immutable actor
+/// credential.  Relationship publishers use this form while holding the
+/// actor's credential snapshot guard, so the core rule, security hook, and
+/// later ptrace state all consume the same `Arc<Cred>`.
+pub(crate) fn check_thread_ptrace_image_access_with_actor(
+    actor: &Thread,
+    actor_cred: &Cred,
+    target: &Thread,
+    mode: PtraceAccessMode,
+) -> AxResult<ProcessImageAccessSnapshot> {
     let snapshot = target.proc_data.thread_image_access_snapshot(target)?;
-    check_current_ptrace_image_snapshot(&target.proc_data, &snapshot, mode)?;
+    check_ptrace_access(
+        &actor.proc_data,
+        actor_cred,
+        &target.proc_data,
+        &snapshot,
+        mode,
+    )?;
     Ok(snapshot)
 }
 

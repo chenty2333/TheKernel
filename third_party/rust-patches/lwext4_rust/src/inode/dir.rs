@@ -105,8 +105,11 @@ impl<Hal: SystemHal> InodeRef<Hal> {
         Ok(false)
     }
 
-    pub(crate) fn add_entry(&mut self, name: &str, entry: &mut InodeRef<Hal>) -> Ext4Result {
-        entry.ensure_can_inc_nlink()?;
+    fn add_entry_without_link_count(
+        &mut self,
+        name: &str,
+        entry: &mut InodeRef<Hal>,
+    ) -> Ext4Result {
         unsafe {
             let mut metadata_may_have_changed = false;
             ext4_dir_add_entry_status(
@@ -119,10 +122,17 @@ impl<Hal: SystemHal> InodeRef<Hal> {
             .context("ext4_dir_add_entry")
             .map_err(|error| error.with_metadata_may_have_changed(metadata_may_have_changed))?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn add_entry(&mut self, name: &str, entry: &mut InodeRef<Hal>) -> Ext4Result {
+        entry.ensure_can_inc_nlink()?;
+        self.add_entry_without_link_count(name, entry)?;
         entry.inc_nlink();
         Ok(())
     }
-    pub(crate) fn remove_entry(&mut self, name: &str, entry: &mut InodeRef<Hal>) -> Ext4Result {
+
+    fn remove_entry_without_link_count(&mut self, name: &str) -> Ext4Result {
         unsafe {
             let mut metadata_may_have_changed = false;
             ext4_dir_remove_entry_status(
@@ -134,8 +144,33 @@ impl<Hal: SystemHal> InodeRef<Hal> {
             .context("ext4_dir_remove_entry")
             .map_err(|error| error.with_metadata_may_have_changed(metadata_may_have_changed))?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn remove_entry(&mut self, name: &str, entry: &mut InodeRef<Hal>) -> Ext4Result {
+        self.remove_entry_without_link_count(name)?;
         entry.dec_nlink();
         Ok(())
+    }
+
+    /// Publishes the destination half of a rename without creating a new hard
+    /// link to `entry`.
+    ///
+    /// Rename transfers an existing directory entry. Reusing `add_entry`
+    /// would first increment the source inode's link count and can therefore
+    /// fail spuriously when that inode already has `EXT4_LINK_MAX` links.
+    pub(crate) fn add_transferred_entry(
+        &mut self,
+        name: &str,
+        entry: &mut InodeRef<Hal>,
+    ) -> Ext4Result {
+        self.add_entry_without_link_count(name, entry)
+    }
+
+    /// Removes the source half of a rename without dropping a hard link from
+    /// `entry`; the matching destination entry already owns that link.
+    pub(crate) fn remove_transferred_entry(&mut self, name: &str) -> Ext4Result {
+        self.remove_entry_without_link_count(name)
     }
 }
 

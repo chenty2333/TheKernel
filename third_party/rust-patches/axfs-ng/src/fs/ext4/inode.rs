@@ -9,11 +9,14 @@ use axfs_ng_vfs::{
     CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps,
     FileNode, FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NamedCreateOptions, NodeFlags,
     NodeOps, NodePermission, NodeType, NodeUserData, Reference, RenameRequest, UnlinkRequest,
-    VfsError, VfsResult, WeakDirEntry,
+    VfsError, VfsResult, WeakDirEntry, XattrProvider, XattrSetMode,
 };
 use axhal::time::wall_time;
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
-use lwext4_rust::{FileAttr, InodeToken, InodeType, ffi::ENOENT};
+use lwext4_rust::{
+    Ext4Error, FileAttr, InodeToken, InodeType,
+    ffi::{EEXIST, ENODATA, ENOENT},
+};
 use spin::Once;
 
 use super::{
@@ -40,6 +43,26 @@ fn try_owned(value: &str) -> VfsResult<String> {
         .map_err(|_| VfsError::NoMemory)?;
     result.push_str(value);
     Ok(result)
+}
+
+fn admit_xattr_set_mode(mode: XattrSetMode, exists: bool) -> lwext4_rust::Ext4Result<()> {
+    match (mode, exists) {
+        (XattrSetMode::Create, true) => Err(Ext4Error::new(EEXIST as _, "xattr already exists")),
+        (XattrSetMode::Replace, false) => Err(Ext4Error::new(ENODATA as _, "xattr does not exist")),
+        _ => Ok(()),
+    }
+}
+
+const fn ext4_named_create_inode_type(node_type: NodeType) -> Option<InodeType> {
+    match node_type {
+        NodeType::Fifo => Some(InodeType::Fifo),
+        NodeType::CharacterDevice => Some(InodeType::CharacterDevice),
+        NodeType::Directory => Some(InodeType::Directory),
+        NodeType::BlockDevice => Some(InodeType::BlockDevice),
+        NodeType::RegularFile => Some(InodeType::RegularFile),
+        NodeType::Socket => Some(InodeType::Socket),
+        NodeType::Symlink | NodeType::Unknown => None,
+    }
 }
 
 struct InodeBinding {
@@ -300,6 +323,44 @@ impl NodeOps for Inode {
     fn persistent_user_data(&self) -> Option<&NodeUserData> {
         self.runtime.get().map(Arc::as_ref)
     }
+
+    fn xattr_provider(&self) -> Option<&dyn XattrProvider> {
+        Some(self)
+    }
+}
+
+impl XattrProvider for Inode {
+    fn get_xattr(&self, name: &str) -> VfsResult<alloc::vec::Vec<u8>> {
+        self.fs
+            .lock()
+            .with_inode_ref(self.ino(), |inode| inode.get_xattr(name))
+            .map_err(into_vfs_err)
+    }
+
+    fn list_xattrs(&self) -> VfsResult<alloc::vec::Vec<u8>> {
+        self.fs
+            .lock()
+            .with_inode_ref(self.ino(), |inode| inode.list_xattrs())
+            .map_err(into_vfs_err)
+    }
+
+    fn set_xattr(&self, name: &str, value: &[u8], mode: XattrSetMode) -> VfsResult<()> {
+        self.fs
+            .lock()
+            .with_inode_ref_mut(self.ino(), |inode| {
+                let exists = inode.has_xattr(name)?;
+                admit_xattr_set_mode(mode, exists)?;
+                inode.set_xattr(name, value)
+            })
+            .map_err(into_vfs_err)
+    }
+
+    fn remove_xattr(&self, name: &str) -> VfsResult<()> {
+        self.fs
+            .lock()
+            .with_inode_ref_mut(self.ino(), |inode| inode.remove_xattr(name))
+            .map_err(into_vfs_err)
+    }
 }
 
 impl Drop for Inode {
@@ -470,6 +531,30 @@ impl Pollable for Inode {
 }
 
 impl DirNodeOps for Inode {
+    fn supports_named_create(&self, node_type: NodeType) -> bool {
+        ext4_named_create_inode_type(node_type).is_some()
+    }
+
+    fn supports_symlink(&self) -> bool {
+        true
+    }
+
+    fn supports_hard_links(&self) -> bool {
+        true
+    }
+
+    fn supports_unlink(&self) -> bool {
+        true
+    }
+
+    fn supports_rmdir(&self) -> bool {
+        true
+    }
+
+    fn supports_rename(&self) -> bool {
+        true
+    }
+
     fn namespace_epoch(&self) -> u64 {
         self.binding
             .get()
@@ -515,15 +600,12 @@ impl DirNodeOps for Inode {
         options: &NamedCreateOptions,
         disposition: CreateDisposition,
     ) -> VfsResult<CreateOutcome<DirEntry>> {
-        let inode_type = match options.node_type {
-            NodeType::Fifo => InodeType::Fifo,
-            NodeType::CharacterDevice => InodeType::CharacterDevice,
-            NodeType::Directory => InodeType::Directory,
-            NodeType::BlockDevice => InodeType::BlockDevice,
-            NodeType::RegularFile => InodeType::RegularFile,
-            NodeType::Symlink => return Err(VfsError::OperationNotSupported),
-            NodeType::Socket => InodeType::Socket,
-            NodeType::Unknown => return Err(VfsError::InvalidData),
+        let inode_type = match ext4_named_create_inode_type(options.node_type) {
+            Some(inode_type) => inode_type,
+            None if options.node_type == NodeType::Symlink => {
+                return Err(VfsError::OperationNotSupported);
+            }
+            None => return Err(VfsError::InvalidData),
         };
 
         // Fast existing-name path: retain the stable identity while serialized,
@@ -675,8 +757,15 @@ impl DirNodeOps for Inode {
         };
         let mut fs = self.fs.lock();
         self.bump_namespace_epoch();
-        fs.unlink_checked(self.ino(), request.name, expected, Some(request.is_dir))
-            .map_err(into_vfs_err)
+        let now = wall_time();
+        fs.unlink_checked(
+            self.ino(),
+            request.name,
+            expected,
+            Some(request.is_dir),
+            Some(now),
+        )
+        .map_err(into_vfs_err)
     }
 
     fn rename(&self, request: RenameRequest<'_>) -> VfsResult<()> {
@@ -699,6 +788,7 @@ impl DirNodeOps for Inode {
         if !Arc::ptr_eq(src_epoch, dst_epoch) {
             dst_dir.bump_namespace_epoch();
         }
+        let now = wall_time();
         fs.rename(
             self.ino(),
             request.src_name,
@@ -706,7 +796,133 @@ impl DirNodeOps for Inode {
             request.dst_name,
             src,
             dst,
+            Some(now),
         )
         .map_err(into_vfs_err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "test-ramdisk")]
+    use core::sync::atomic::AtomicBool;
+    #[cfg(feature = "test-ramdisk")]
+    use std::{
+        fs::{self, OpenOptions},
+        process::Command,
+    };
+
+    #[cfg(feature = "test-ramdisk")]
+    use axdriver::{AxBlockDevice, SharedBlockDevice};
+    #[cfg(feature = "test-ramdisk")]
+    use axfs_ng_vfs::Mountpoint;
+
+    #[cfg(feature = "test-ramdisk")]
+    fn formatted_ext4_device() -> crate::MountedBlockDevice {
+        let path = std::env::temp_dir().join(format!(
+            "axfs-ext4-xattr-{}-{}.img",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(16 * 1024 * 1024).unwrap();
+        drop(file);
+        let status = Command::new("mke2fs")
+            .args([
+                "-q",
+                "-t",
+                "ext4",
+                "-F",
+                "-b",
+                "4096",
+                "-O",
+                "none,has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,\
+                 large_file,huge_file,dir_nlink,extra_isize,metadata_csum",
+            ])
+            .arg(&path)
+            .status()
+            .expect("mke2fs is required for the axfs ext4 provider test");
+        assert!(status.success());
+        let image = fs::read(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        crate::MountedBlockDevice {
+            device: SharedBlockDevice::new(AxBlockDevice::from(image.as_slice())),
+            mounted: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    #[test]
+    fn ext4_named_create_capabilities_match_backend_primitives() {
+        for node_type in [
+            NodeType::Fifo,
+            NodeType::CharacterDevice,
+            NodeType::Directory,
+            NodeType::BlockDevice,
+            NodeType::RegularFile,
+            NodeType::Socket,
+        ] {
+            assert!(ext4_named_create_inode_type(node_type).is_some());
+        }
+        assert!(ext4_named_create_inode_type(NodeType::Symlink).is_none());
+        assert!(ext4_named_create_inode_type(NodeType::Unknown).is_none());
+    }
+
+    #[test]
+    fn ext4_xattr_modes_preserve_linux_existence_errors() {
+        for (mode, exists) in [
+            (XattrSetMode::Upsert, false),
+            (XattrSetMode::Upsert, true),
+            (XattrSetMode::Create, false),
+            (XattrSetMode::Replace, true),
+        ] {
+            assert!(admit_xattr_set_mode(mode, exists).is_ok());
+        }
+        assert_eq!(
+            admit_xattr_set_mode(XattrSetMode::Create, true)
+                .unwrap_err()
+                .code,
+            EEXIST as i32
+        );
+        assert_eq!(
+            admit_xattr_set_mode(XattrSetMode::Replace, false)
+                .unwrap_err()
+                .code,
+            ENODATA as i32
+        );
+    }
+
+    #[cfg(feature = "test-ramdisk")]
+    #[test]
+    fn ext4_xattr_first_vfs_set_on_a_fresh_inode_is_persistent() {
+        let filesystem = Ext4Filesystem::new(formatted_ext4_device()).unwrap();
+        let mount = Mountpoint::new_root(&filesystem);
+        let root = mount.root_location();
+        let file = root
+            .create(
+                "first-xattr",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+
+        file.set_xattr("user.first", b"provider", XattrSetMode::Create)
+            .unwrap();
+        assert_eq!(file.get_xattr("user.first").unwrap(), b"provider");
+        assert_eq!(file.list_xattrs().unwrap(), b"user.first\0");
+
+        drop(file);
+        drop(root);
+        drop(mount);
+        drop(filesystem);
+        while axfs_ng_vfs::drain_deferred_dentry_cache_cleanup() {}
+        crate::drain_deferred_filesystem_finalizers(|| {});
     }
 }

@@ -87,6 +87,9 @@ const char *ext4_get_xattr_name_prefix(uint8_t name_index,
 int ext4_xattr_list(struct ext4_inode_ref *inode_ref,
 		    struct ext4_xattr_list_entry *list, size_t *list_len);
 
+int ext4_xattr_list_names(struct ext4_inode_ref *inode_ref, char *list,
+			  size_t size, size_t *list_len);
+
 int ext4_xattr_get(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 		   const char *name, size_t name_len, void *buf, size_t buf_len,
 		   size_t *data_len);
@@ -97,6 +100,12 @@ int ext4_xattr_remove(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 int ext4_xattr_set(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 		   const char *name, size_t name_len, const void *value,
 		   size_t value_len);
+
+int ext4_xattr_set_status(struct ext4_inode_ref *inode_ref,
+			  uint8_t name_index, const char *name,
+			  size_t name_len, const void *value,
+			  size_t value_len,
+			  bool *metadata_may_have_changed);
 
 #ifdef __cplusplus
 }

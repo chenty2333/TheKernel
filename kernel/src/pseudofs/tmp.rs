@@ -22,7 +22,8 @@ use axfs_ng_vfs::{
     AnonymousOptions, CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode,
     DirNodeOps, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata, MetadataUpdate,
     NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType, NodeUserData, Reference,
-    RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult, WeakDirEntry, path::MAX_NAME_LEN,
+    RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult, WeakDirEntry, XattrProvider,
+    XattrSetMode, path::MAX_NAME_LEN,
 };
 use axhal::{mem::total_ram_size, time::wall_time};
 use axpoll::{IoEvents, Pollable};
@@ -35,10 +36,6 @@ use memory_addr::PAGE_SIZE_4K;
 use spin::Mutex;
 
 const TMPFS_BLOCK_SIZE: u64 = PAGE_SIZE_4K as u64;
-// Kept provider-local so tmpfs content mutation does not depend on the Linux
-// credential module. This is the only privilege-bearing xattr exec currently
-// consumes from the tmpfs store.
-const FILE_CAPABILITY_XATTR: &str = "security.capability";
 const STAT_BLOCK_UNIT: u64 = 512;
 const MIB: u64 = 1024 * 1024;
 const DEFAULT_TMPFS_MIN_BYTES: u64 = 16 * MIB;
@@ -47,6 +44,7 @@ const DEFAULT_TMPFS_MAX_BYTES: u64 = 256 * MIB;
 /// accounting, keep the live identity registry explicitly bounded.  The
 /// backing map is reserved before any inode or namespace object is published.
 const MAX_TMPFS_INODES: usize = 65_536;
+const TMPFS_XATTR_SIZE_MAX: usize = 65_536;
 
 fn default_tmpfs_capacity_bytes() -> u64 {
     let ram = total_ram_size() as u64;
@@ -64,6 +62,15 @@ fn try_owned(value: &str) -> VfsResult<String> {
         .try_reserve_exact(value.len())
         .map_err(|_| VfsError::NoMemory)?;
     result.push_str(value);
+    Ok(result)
+}
+
+fn try_owned_bytes(value: &[u8]) -> VfsResult<Vec<u8>> {
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(value.len())
+        .map_err(|_| VfsError::NoMemory)?;
+    result.extend_from_slice(value);
     Ok(result)
 }
 
@@ -628,42 +635,17 @@ fn full_page_range(offset: u64, len: u64) -> Option<(u64, u64)> {
     (start_page < end_page).then_some((start_page, end_page))
 }
 
-fn memory_node_for(loc: &axfs_ng_vfs::Location) -> Option<Arc<MemoryNode>> {
-    loc.entry().downcast::<MemoryNode>().ok()
-}
-
 fn file_content_for(loc: &axfs_ng_vfs::Location) -> Option<(Arc<MemoryFs>, Arc<Inode>)> {
     let node = loc.entry().downcast::<MemoryNode>().ok()?;
     node.inode.as_file().ok()?;
     Some((node.fs.clone(), node.inode.clone()))
 }
 
-pub fn xattr_store(loc: &axfs_ng_vfs::Location) -> Option<Arc<Mutex<HashMap<String, Vec<u8>>>>> {
-    let node = memory_node_for(loc)?;
-    Some(node.inode.xattrs.clone())
-}
-
-/// Removes tmpfs file capabilities as one inode transaction. Locations without
-/// a tmpfs xattr provider are successful no-ops because exec likewise treats
-/// their hidden capability metadata as unsupported.
-pub fn kill_file_capability(loc: &axfs_ng_vfs::Location) -> AxResult<()> {
-    if let Some(node) = memory_node_for(loc) {
-        node.inode.kill_file_capability();
-    }
-    Ok(())
-}
-
-/// Runs an ownership/metadata update and successful file-capability removal
-/// under the same tmpfs inode xattr lock. A future fallible xattr provider must
-/// return its clearing error here before `operation` publishes metadata.
-pub fn with_file_capability_killpriv<T>(
-    loc: &axfs_ng_vfs::Location,
-    operation: impl FnOnce() -> AxResult<T>,
-) -> AxResult<T> {
-    let Some(node) = memory_node_for(loc) else {
-        return operation();
-    };
-    node.inode.with_file_capability_killpriv(operation)
+/// Reports whether this location exposes tmpfs range-mutation primitives.
+/// Upper layers use this to reject unsupported operations before emulation can
+/// modify file contents.
+pub fn supports_fallocate_range(loc: &axfs_ng_vfs::Location) -> bool {
+    file_content_for(loc).is_some()
 }
 
 pub fn reserve_fallocate_range(
@@ -677,20 +659,20 @@ pub fn reserve_fallocate_range(
     if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
         return Some(Err(err));
     }
-    Some(inode.with_file_capability_killpriv(|| {
-        if extend {
-            let end = offset.checked_add(len).ok_or(AxError::InvalidInput)?;
-            let extend_to = (end > *file.length.lock()).then_some(end);
-            let result = file.reserve_range(&fs, offset, len);
-            if result.is_ok()
-                && let Some(end) = extend_to
-            {
-                file.set_len(&fs, end);
-            }
-            return result;
+    if extend {
+        let Some(end) = offset.checked_add(len) else {
+            return Some(Err(AxError::InvalidInput));
+        };
+        let extend_to = (end > *file.length.lock()).then_some(end);
+        let result = file.reserve_range(&fs, offset, len);
+        if result.is_ok()
+            && let Some(end) = extend_to
+        {
+            file.set_len(&fs, end);
         }
-        file.reserve_range(&fs, offset, len)
-    }))
+        return Some(result);
+    }
+    Some(file.reserve_range(&fs, offset, len))
 }
 
 pub fn punch_hole_fallocate_range(
@@ -703,10 +685,8 @@ pub fn punch_hole_fallocate_range(
     if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
         return Some(Err(err));
     }
-    Some(inode.with_file_capability_killpriv(|| {
-        file.punch_hole(&fs, offset, len);
-        Ok(())
-    }))
+    file.punch_hole(&fs, offset, len);
+    Some(Ok(()))
 }
 
 pub fn collapse_fallocate_range(
@@ -719,7 +699,7 @@ pub fn collapse_fallocate_range(
     if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
         return Some(Err(err));
     }
-    Some(inode.with_file_capability_killpriv(|| file.collapse_range(&fs, offset, len)))
+    Some(file.collapse_range(&fs, offset, len))
 }
 
 pub fn insert_fallocate_range(
@@ -732,7 +712,7 @@ pub fn insert_fallocate_range(
     if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
         return Some(Err(err));
     }
-    Some(inode.with_file_capability_killpriv(|| file.insert_range(offset, len)))
+    Some(file.insert_range(offset, len))
 }
 
 pub fn seek_data_or_hole(
@@ -776,31 +756,6 @@ struct Inode {
 }
 
 impl Inode {
-    /// Serializes a content or ownership mutation with the tmpfs xattr store.
-    /// On success, the file-capability record is removed before the inode lock
-    /// is released. The removed allocation is destroyed only after unlock.
-    fn with_file_capability_killpriv<T, E>(
-        &self,
-        operation: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, E> {
-        let (result, retired) = {
-            let mut xattrs = self.xattrs.lock();
-            let result = operation();
-            let retired = result
-                .as_ref()
-                .ok()
-                .and_then(|_| xattrs.remove(FILE_CAPABILITY_XATTR));
-            (result, retired)
-        };
-        drop(retired);
-        result
-    }
-
-    fn kill_file_capability(&self) {
-        let retired = self.xattrs.lock().remove(FILE_CAPABILITY_XATTR);
-        drop(retired);
-    }
-
     /// Builds a complete inode without publishing it in the filesystem's live
     /// identity map. Directory dot entries and the per-inode xattr ownership
     /// are admitted here, so later registry/namespace insertion cannot fail.
@@ -895,7 +850,11 @@ impl InodeRef {
         })
     }
 
-    fn new_link(fs: &Arc<MemoryFs>, inode: &Arc<Inode>) -> VfsResult<Self> {
+    fn new_link(
+        fs: &Arc<MemoryFs>,
+        inode: &Arc<Inode>,
+        ctime: core::time::Duration,
+    ) -> VfsResult<Self> {
         let mut metadata = inode.metadata.lock();
         if metadata.nlink == 0 {
             let mut anonymous_linkable = inode.anonymous_linkable.lock();
@@ -905,6 +864,7 @@ impl InodeRef {
             *anonymous_linkable = false;
         }
         metadata.nlink = metadata.nlink.checked_add(1).ok_or(VfsError::StorageFull)?;
+        metadata.ctime = ctime;
         Ok(Self {
             fs: Arc::downgrade(fs),
             ino: inode.ino,
@@ -982,6 +942,13 @@ impl MemoryNode {
         let mut metadata = inode.metadata.lock();
         metadata.mtime = now;
         metadata.ctime = now;
+    }
+
+    fn touch_renamed_inodes(source: &Inode, victim: Option<&Inode>, now: core::time::Duration) {
+        source.metadata.lock().ctime = now;
+        if let Some(victim) = victim {
+            victim.metadata.lock().ctime = now;
+        }
     }
 
     fn validate_rename(
@@ -1121,6 +1088,99 @@ impl NodeOps for MemoryNode {
     fn persistent_user_data(&self) -> Option<&NodeUserData> {
         Some(&self.inode.user_data)
     }
+
+    fn xattr_provider(&self) -> Option<&dyn XattrProvider> {
+        Some(self)
+    }
+}
+
+impl XattrProvider for MemoryNode {
+    fn get_xattr(&self, name: &str) -> VfsResult<Vec<u8>> {
+        let xattrs = self.inode.xattrs.lock();
+        let value = xattrs
+            .get(name)
+            .ok_or_else(|| VfsError::from(LinuxError::ENODATA))?;
+        try_owned_bytes(value)
+    }
+
+    fn list_xattrs(&self) -> VfsResult<Vec<u8>> {
+        let xattrs = self.inode.xattrs.lock();
+        let required = xattrs.keys().try_fold(0usize, |required, name| {
+            required
+                .checked_add(name.len())
+                .and_then(|required| required.checked_add(1))
+                .ok_or(VfsError::NoMemory)
+        })?;
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(required)
+            .map_err(|_| VfsError::NoMemory)?;
+        for name in xattrs.keys() {
+            result.extend_from_slice(name.as_bytes());
+            result.push(0);
+        }
+        Ok(result)
+    }
+
+    fn set_xattr(&self, name: &str, value: &[u8], mode: XattrSetMode) -> VfsResult<()> {
+        // Admit allocations independent of the map before taking the inode
+        // lock. The existence decision itself remains serialized with
+        // publication.
+        let owned_name = try_owned(name)?;
+        let owned_value = try_owned_bytes(value)?;
+        let replacement_size = name
+            .len()
+            .checked_add(1)
+            .and_then(|size| size.checked_add(value.len()))
+            .ok_or_else(|| VfsError::from(LinuxError::ENOSPC))?;
+
+        let mut xattrs = self.inode.xattrs.lock();
+        let exists = xattrs.contains_key(name);
+        match (mode, exists) {
+            (XattrSetMode::Create, true) => return Err(LinuxError::EEXIST.into()),
+            (XattrSetMode::Replace, false) => return Err(LinuxError::ENODATA.into()),
+            _ => {}
+        }
+
+        let used_without_replaced = xattrs.iter().try_fold(0usize, |used, (key, old)| {
+            if key == name {
+                return Ok(used);
+            }
+            key.len()
+                .checked_add(1)
+                .and_then(|size| size.checked_add(old.len()))
+                .and_then(|size| used.checked_add(size))
+                .ok_or_else(|| VfsError::from(LinuxError::ENOSPC))
+        })?;
+        if used_without_replaced
+            .checked_add(replacement_size)
+            .is_none_or(|used| used > TMPFS_XATTR_SIZE_MAX)
+        {
+            return Err(LinuxError::ENOSPC.into());
+        }
+
+        let retired = if let Some(current) = xattrs.get_mut(name) {
+            Some(mem::replace(current, owned_value))
+        } else {
+            xattrs.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+            xattrs.insert(owned_name, owned_value);
+            None
+        };
+        drop(xattrs);
+        drop(retired);
+        Ok(())
+    }
+
+    fn remove_xattr(&self, name: &str) -> VfsResult<()> {
+        let retired = self
+            .inode
+            .xattrs
+            .lock()
+            .remove_entry(name)
+            .ok_or_else(|| VfsError::from(LinuxError::ENODATA))?;
+        drop(retired);
+        Ok(())
+    }
 }
 
 impl FileNodeOps for MemoryNode {
@@ -1142,11 +1202,7 @@ impl FileNodeOps for MemoryNode {
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
         let file = self.inode.as_file()?;
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        self.inode
-            .with_file_capability_killpriv(|| file.write_at(&self.fs, buf, offset))
+        file.write_at(&self.fs, buf, offset)
     }
 
     fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {
@@ -1155,20 +1211,14 @@ impl FileNodeOps for MemoryNode {
             return Ok((0, *file.length.lock()));
         }
         let offset = *file.length.lock();
-        let written = self
-            .inode
-            .with_file_capability_killpriv(|| file.write_at(&self.fs, buf, offset))?;
+        let written = file.write_at(&self.fs, buf, offset)?;
         Ok((written, offset + written as u64))
     }
 
     fn set_len(&self, len: u64) -> VfsResult<()> {
         let file = self.inode.as_file()?;
-        // Linux do_truncate() requests ATTR_KILL_PRIV even when the requested
-        // length equals i_size, so a successful truncate is a killpriv event.
-        self.inode.with_file_capability_killpriv(|| {
-            file.set_len(&self.fs, len);
-            Ok(())
-        })
+        file.set_len(&self.fs, len);
+        Ok(())
     }
 
     fn set_symlink(&self, target: &str) -> VfsResult<()> {
@@ -1194,6 +1244,38 @@ impl Pollable for MemoryNode {
 }
 
 impl DirNodeOps for MemoryNode {
+    fn supports_named_create(&self, node_type: NodeType) -> bool {
+        matches!(
+            node_type,
+            NodeType::Fifo
+                | NodeType::CharacterDevice
+                | NodeType::Directory
+                | NodeType::BlockDevice
+                | NodeType::RegularFile
+                | NodeType::Socket
+        )
+    }
+
+    fn supports_symlink(&self) -> bool {
+        true
+    }
+
+    fn supports_hard_links(&self) -> bool {
+        true
+    }
+
+    fn supports_unlink(&self) -> bool {
+        true
+    }
+
+    fn supports_rmdir(&self) -> bool {
+        true
+    }
+
+    fn supports_rename(&self) -> bool {
+        true
+    }
+
     fn namespace_epoch(&self) -> u64 {
         self.inode
             .as_dir()
@@ -1256,10 +1338,11 @@ impl DirNodeOps for MemoryNode {
                 created: false,
             });
         }
-        if options.node_type == NodeType::Symlink {
-            // A symbolic link must be initialized before its name is visible.
-            // Keep the generic create entry point from publishing an empty
-            // link; callers must use `create_symlink` below.
+        if !self.supports_named_create(options.node_type) {
+            // A symbolic link must be initialized through `create_symlink`,
+            // and unknown inode types have no tmpfs representation. Keep both
+            // classes out of generic named publication even for direct backend
+            // callers that bypass the VFS capability seam.
             return Err(VfsError::OperationNotSupported);
         }
         if options.rdev.is_some()
@@ -1399,10 +1482,10 @@ impl DirNodeOps for MemoryNode {
         // makes the remaining publication infallible, so an allocation failure
         // leaves O_TMPFILE linkability retryable.
         let entry = self.new_entry(name, node_type, inode)?;
-        let inode_ref = InodeRef::new_link(&self.fs, &target.inode)?;
+        let now = wall_time();
+        let inode_ref = InodeRef::new_link(&self.fs, &target.inode, now)?;
         dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
         entries.insert(cache_name, inode_ref);
-        let now = wall_time();
         drop(entries);
         Self::touch_directory(&self.inode, now);
         Ok(entry)
@@ -1441,9 +1524,9 @@ impl DirNodeOps for MemoryNode {
             child_entries.clear();
         }
         dir.namespace_epoch.fetch_add(1, AtomicOrdering::AcqRel);
-        drop(inode);
         entries.remove(request.name);
         let now = wall_time();
+        inode.metadata.lock().ctime = now;
         drop(entries);
         Self::touch_directory(&self.inode, now);
 
@@ -1475,8 +1558,9 @@ impl DirNodeOps for MemoryNode {
             entries.insert(dst_key, src_ref);
             Self::retire_replaced_directory(dst_inode.as_ref());
             drop(old_dst);
-            drop(src_inode);
             let now = wall_time();
+            Self::touch_renamed_inodes(&src_inode, dst_inode.as_deref(), now);
+            drop(src_inode);
             drop(entries);
             Self::touch_directory(&self.inode, now);
             return Ok(());
@@ -1527,6 +1611,7 @@ impl DirNodeOps for MemoryNode {
         drop(src_entries);
         drop(dst_entries);
         let now = wall_time();
+        Self::touch_renamed_inodes(&src_inode, dst_inode.as_deref(), now);
         Self::touch_directory(&self.inode, now);
         Self::touch_directory(&dst_node.inode, now);
         Ok(())
@@ -1545,20 +1630,23 @@ impl Drop for MemoryNode {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use alloc::{
         string::{String, ToString},
         sync::Arc,
         vec,
         vec::Vec,
     };
+    use std::{sync::Barrier, thread};
 
-    use axerrno::AxError;
+    use axerrno::LinuxError;
     use axfs_ng_vfs::{
         AnonymousOptions, CreateDisposition, DeviceId, InitialNodeData, MetadataUpdate, Mountpoint,
-        NamedCreateOptions, NodePermission, NodeType, VfsError,
+        NamedCreateOptions, NodePermission, NodeType, VfsError, XattrSetMode,
     };
 
-    use super::{FILE_CAPABILITY_XATTR, MemoryFs, with_file_capability_killpriv, xattr_store};
+    use super::{MemoryFs, TMPFS_XATTR_SIZE_MAX};
 
     fn regular_file(name: &str) -> axfs_ng_vfs::Location {
         let fs = MemoryFs::new().unwrap();
@@ -1573,18 +1661,112 @@ mod tests {
             .unwrap()
     }
 
-    fn install_test_file_capability(file: &axfs_ng_vfs::Location) {
-        xattr_store(file)
-            .unwrap()
-            .lock()
-            .insert(FILE_CAPABILITY_XATTR.to_string(), vec![1, 2, 3]);
+    #[test]
+    fn xattr_provider_serializes_modes_and_persists_across_hard_links() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let file = root
+            .create(
+                "xattr-source",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let alias = root.link("xattr-alias", &file).unwrap();
+
+        assert_eq!(file.get_xattr("user.key"), Err(LinuxError::ENODATA.into()));
+        file.set_xattr("user.key", b"first", XattrSetMode::Create)
+            .unwrap();
+        assert_eq!(alias.get_xattr("user.key").unwrap(), b"first");
+
+        assert_eq!(
+            alias.set_xattr("user.key", b"wrong", XattrSetMode::Create),
+            Err(LinuxError::EEXIST.into())
+        );
+        assert_eq!(file.get_xattr("user.key").unwrap(), b"first");
+        assert_eq!(
+            file.set_xattr("user.missing", b"wrong", XattrSetMode::Replace),
+            Err(LinuxError::ENODATA.into())
+        );
+
+        alias
+            .set_xattr("user.key", b"second", XattrSetMode::Replace)
+            .unwrap();
+        file.set_xattr("security.test", b"value", XattrSetMode::Upsert)
+            .unwrap();
+        assert_eq!(file.get_xattr("user.key").unwrap(), b"second");
+
+        let listed = alias.list_xattrs().unwrap();
+        let mut names = listed
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+            .map(|name| core::str::from_utf8(name).unwrap())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["security.test", "user.key"]);
+
+        alias.remove_xattr("user.key").unwrap();
+        assert_eq!(
+            file.remove_xattr("user.key"),
+            Err(LinuxError::ENODATA.into())
+        );
     }
 
-    fn has_test_file_capability(file: &axfs_ng_vfs::Location) -> bool {
-        xattr_store(file)
-            .unwrap()
-            .lock()
-            .contains_key(FILE_CAPABILITY_XATTR)
+    #[test]
+    fn concurrent_xattr_create_has_one_atomic_winner_across_aliases() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let file = root
+            .create(
+                "xattr-create-source",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let alias = root.link("xattr-create-alias", &file).unwrap();
+        let start = Arc::new(Barrier::new(3));
+        let first_start = start.clone();
+        let first = file.clone();
+        let first = thread::spawn(move || {
+            first_start.wait();
+            first.set_xattr("user.atomic", b"first", XattrSetMode::Create)
+        });
+        let second_start = start.clone();
+        let second = alias.clone();
+        let second = thread::spawn(move || {
+            second_start.wait();
+            second.set_xattr("user.atomic", b"second", XattrSetMode::Create)
+        });
+        start.wait();
+
+        let results = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == Err(LinuxError::EEXIST.into()))
+                .count(),
+            1
+        );
+        let value = file.get_xattr("user.atomic").unwrap();
+        assert!(value.as_slice() == b"first" || value.as_slice() == b"second");
+    }
+
+    #[test]
+    fn xattr_provider_reports_inode_capacity_as_enospc_without_publication() {
+        let file = regular_file("provider-capacity");
+        let oversized = vec![0; TMPFS_XATTR_SIZE_MAX];
+
+        assert_eq!(
+            file.set_xattr("user.too-large", &oversized, XattrSetMode::Create),
+            Err(LinuxError::ENOSPC.into())
+        );
+        assert_eq!(
+            file.get_xattr("user.too-large"),
+            Err(LinuxError::ENODATA.into())
+        );
     }
 
     fn directory_names(root: &axfs_ng_vfs::Location) -> Vec<String> {
@@ -1599,33 +1781,244 @@ mod tests {
     }
 
     #[test]
-    fn successful_content_and_size_mutations_kill_file_capabilities() {
-        let file = regular_file("killpriv-content");
-        let node = file.entry().as_file().unwrap();
+    fn mutation_capabilities_are_explicit_and_mount_identity_is_exact() {
+        let fs = MemoryFs::new().unwrap();
+        let first_mount = Mountpoint::new_root(&fs);
+        let second_mount = Mountpoint::new_root(&fs);
+        let first_root = first_mount.root_location();
+        let second_root = second_mount.root_location();
+        let file = first_root
+            .create(
+                "file",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
 
-        install_test_file_capability(&file);
-        assert_eq!(node.write_at(&[], 0).unwrap(), 0);
-        assert!(has_test_file_capability(&file));
-
-        assert_eq!(node.write_at(b"content", 0).unwrap(), 7);
-        assert!(!has_test_file_capability(&file));
-
-        install_test_file_capability(&file);
-        let unchanged = node.len().unwrap();
-        node.set_len(unchanged).unwrap();
-        assert!(!has_test_file_capability(&file));
+        assert!(first_root.supports_hard_links());
+        assert!(first_root.supports_unlink());
+        assert!(first_root.supports_rmdir());
+        assert!(first_root.supports_rename());
+        for node_type in [
+            NodeType::Fifo,
+            NodeType::CharacterDevice,
+            NodeType::Directory,
+            NodeType::BlockDevice,
+            NodeType::RegularFile,
+            NodeType::Socket,
+        ] {
+            assert!(first_root.supports_named_create(node_type));
+        }
+        assert!(!first_root.supports_named_create(NodeType::Symlink));
+        assert!(!first_root.supports_named_create(NodeType::Unknown));
+        assert!(first_root.supports_symlink());
+        assert!(first_root.same_mount(&file));
+        assert!(!first_root.same_mount(&second_root));
+        assert_eq!(first_mount.device(), second_mount.device());
+        assert_ne!(first_mount.mount_id(), second_mount.mount_id());
     }
 
     #[test]
-    fn failed_inode_transaction_preserves_file_capability() {
-        let file = regular_file("killpriv-failure");
-        install_test_file_capability(&file);
+    fn hard_link_updates_source_ctime_and_parent_times_together() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let source = root
+            .create(
+                "timestamp-source",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let sentinel = core::time::Duration::MAX;
+        root.update_metadata(MetadataUpdate {
+            mtime: Some(sentinel),
+            ctime: Some(sentinel),
+            ..Default::default()
+        })
+        .unwrap();
+        source
+            .update_metadata(MetadataUpdate {
+                ctime: Some(sentinel),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let linked = root.link("timestamp-link", &source).unwrap();
+        let source_metadata = source.metadata().unwrap();
+        let linked_metadata = linked.metadata().unwrap();
+        let parent_metadata = root.metadata().unwrap();
+
+        assert_ne!(source_metadata.ctime, sentinel);
+        assert_eq!(linked_metadata.ctime, source_metadata.ctime);
+        assert_eq!(parent_metadata.mtime, source_metadata.ctime);
+        assert_eq!(parent_metadata.ctime, source_metadata.ctime);
+    }
+
+    fn metadata_state(
+        location: &axfs_ng_vfs::Location,
+    ) -> (
+        u64,
+        core::time::Duration,
+        core::time::Duration,
+        core::time::Duration,
+        core::time::Duration,
+    ) {
+        let metadata = location.metadata().unwrap();
+        (
+            metadata.nlink,
+            metadata.atime,
+            metadata.btime,
+            metadata.mtime,
+            metadata.ctime,
+        )
+    }
+
+    fn install_removal_timestamp_sentinels(
+        parent: &axfs_ng_vfs::Location,
+        victim: &axfs_ng_vfs::Location,
+    ) {
+        let sentinel = core::time::Duration::MAX;
+        parent
+            .update_metadata(MetadataUpdate {
+                mtime: Some(sentinel),
+                ctime: Some(sentinel),
+                ..Default::default()
+            })
+            .unwrap();
+        victim
+            .update_metadata(MetadataUpdate {
+                ctime: Some(sentinel),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn unlink_updates_ctime_for_nonlast_and_last_links_with_one_parent_timestamp() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let source = root
+            .create(
+                "unlink-first",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let alias = root.link("unlink-last", &source).unwrap();
+        assert_eq!(source.metadata().unwrap().nlink, 2);
+
+        install_removal_timestamp_sentinels(&root, &source);
+        root.unlink_checked("unlink-first", false, &source).unwrap();
+        let source_metadata = source.metadata().unwrap();
+        let parent_metadata = root.metadata().unwrap();
+        assert_eq!(source_metadata.nlink, 1);
+        assert_ne!(source_metadata.ctime, core::time::Duration::MAX);
+        assert_eq!(parent_metadata.mtime, source_metadata.ctime);
+        assert_eq!(parent_metadata.ctime, source_metadata.ctime);
+
+        install_removal_timestamp_sentinels(&root, &source);
+        root.unlink_checked("unlink-last", false, &alias).unwrap();
+        let source_metadata = source.metadata().unwrap();
+        let parent_metadata = root.metadata().unwrap();
+        assert_eq!(source_metadata.nlink, 0);
+        assert_ne!(source_metadata.ctime, core::time::Duration::MAX);
+        assert_eq!(parent_metadata.mtime, source_metadata.ctime);
+        assert_eq!(parent_metadata.ctime, source_metadata.ctime);
+    }
+
+    #[test]
+    fn rmdir_updates_victim_and_parent_times_without_changing_link_count_semantics() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let directory = root
+            .create(
+                "empty-directory",
+                NodeType::Directory,
+                NodePermission::from_bits_truncate(0o700),
+            )
+            .unwrap();
+        let parent_nlink = root.metadata().unwrap().nlink;
+        assert_eq!(directory.metadata().unwrap().nlink, 2);
+
+        install_removal_timestamp_sentinels(&root, &directory);
+        root.unlink_checked("empty-directory", true, &directory)
+            .unwrap();
+
+        let victim_metadata = directory.metadata().unwrap();
+        let parent_metadata = root.metadata().unwrap();
+        assert_eq!(victim_metadata.nlink, 0);
+        assert_eq!(parent_metadata.nlink, parent_nlink - 1);
+        assert_ne!(victim_metadata.ctime, core::time::Duration::MAX);
+        assert_eq!(parent_metadata.mtime, victim_metadata.ctime);
+        assert_eq!(parent_metadata.ctime, victim_metadata.ctime);
+    }
+
+    #[test]
+    fn failed_unlink_admission_preserves_timestamps_and_link_counts() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let victim = root
+            .create(
+                "victim",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let wrong_identity = root
+            .create(
+                "wrong-identity",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        install_removal_timestamp_sentinels(&root, &victim);
+        let parent_before = metadata_state(&root);
+        let victim_before = metadata_state(&victim);
 
         assert_eq!(
-            with_file_capability_killpriv(&file, || Err::<(), _>(AxError::StorageFull)),
-            Err(AxError::StorageFull)
+            root.unlink_checked("victim", false, &wrong_identity)
+                .unwrap_err(),
+            VfsError::NotFound
         );
-        assert!(has_test_file_capability(&file));
+        assert_eq!(metadata_state(&root), parent_before);
+        assert_eq!(metadata_state(&victim), victim_before);
+
+        assert_eq!(
+            root.unlink_checked("victim", true, &victim).unwrap_err(),
+            VfsError::NotADirectory
+        );
+        assert_eq!(metadata_state(&root), parent_before);
+        assert_eq!(metadata_state(&victim), victim_before);
+
+        let directory = root
+            .create(
+                "nonempty-directory",
+                NodeType::Directory,
+                NodePermission::from_bits_truncate(0o700),
+            )
+            .unwrap();
+        directory
+            .create(
+                "child",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        install_removal_timestamp_sentinels(&root, &directory);
+        let parent_before = metadata_state(&root);
+        let directory_before = metadata_state(&directory);
+
+        assert_eq!(
+            root.unlink_checked("nonempty-directory", true, &directory)
+                .unwrap_err(),
+            VfsError::DirectoryNotEmpty
+        );
+        assert_eq!(metadata_state(&root), parent_before);
+        assert_eq!(metadata_state(&directory), directory_before);
     }
 
     #[test]
@@ -1725,7 +2118,7 @@ mod tests {
                 NodePermission::from_bits_truncate(0o777),
             )
             .unwrap_err(),
-            axfs_ng_vfs::VfsError::OperationNotSupported
+            axfs_ng_vfs::VfsError::OperationNotPermitted
         );
         assert_eq!(
             root.lookup_no_follow("empty-link").unwrap_err(),
@@ -1864,7 +2257,7 @@ mod tests {
             .create_named(
                 "existing",
                 &NamedCreateOptions {
-                    node_type: NodeType::Unknown,
+                    node_type: NodeType::RegularFile,
                     permission: NodePermission::empty(),
                     owner: Some((123, 456)),
                     rdev: Some(DeviceId(7)),
@@ -2020,6 +2413,142 @@ mod tests {
             root.rename("dir", &root, "file").unwrap_err(),
             VfsError::NotADirectory
         );
+    }
+
+    #[test]
+    fn rename_replacement_uses_one_timestamp_for_source_victim_and_parent() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let source = root
+            .create(
+                "source",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let victim = root
+            .create(
+                "victim",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let sentinel = core::time::Duration::MAX;
+        root.update_metadata(MetadataUpdate {
+            mtime: Some(sentinel),
+            ctime: Some(sentinel),
+            ..Default::default()
+        })
+        .unwrap();
+        for inode in [&source, &victim] {
+            inode
+                .update_metadata(MetadataUpdate {
+                    ctime: Some(sentinel),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        root.rename("source", &root, "victim").unwrap();
+
+        let source_metadata = source.metadata().unwrap();
+        let victim_metadata = victim.metadata().unwrap();
+        let parent_metadata = root.metadata().unwrap();
+        assert_eq!(source_metadata.nlink, 1);
+        assert_eq!(victim_metadata.nlink, 0);
+        assert_ne!(source_metadata.ctime, sentinel);
+        assert_eq!(victim_metadata.ctime, source_metadata.ctime);
+        assert_eq!(parent_metadata.mtime, source_metadata.ctime);
+        assert_eq!(parent_metadata.ctime, source_metadata.ctime);
+    }
+
+    #[test]
+    fn cross_parent_rename_uses_one_timestamp_for_all_affected_inodes() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let mode = NodePermission::from_bits_truncate(0o700);
+        let old_parent = root.create("old", NodeType::Directory, mode).unwrap();
+        let new_parent = root.create("new", NodeType::Directory, mode).unwrap();
+        let source = old_parent
+            .create("source", NodeType::RegularFile, mode)
+            .unwrap();
+        let victim = new_parent
+            .create("victim", NodeType::RegularFile, mode)
+            .unwrap();
+        let sentinel = core::time::Duration::MAX;
+        for parent in [&old_parent, &new_parent] {
+            parent
+                .update_metadata(MetadataUpdate {
+                    mtime: Some(sentinel),
+                    ctime: Some(sentinel),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        for inode in [&source, &victim] {
+            inode
+                .update_metadata(MetadataUpdate {
+                    ctime: Some(sentinel),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        old_parent.rename("source", &new_parent, "victim").unwrap();
+
+        let source_metadata = source.metadata().unwrap();
+        let victim_metadata = victim.metadata().unwrap();
+        let old_parent_metadata = old_parent.metadata().unwrap();
+        let new_parent_metadata = new_parent.metadata().unwrap();
+        assert_eq!(source_metadata.nlink, 1);
+        assert_eq!(victim_metadata.nlink, 0);
+        assert_ne!(source_metadata.ctime, sentinel);
+        assert_eq!(victim_metadata.ctime, source_metadata.ctime);
+        assert_eq!(old_parent_metadata.mtime, source_metadata.ctime);
+        assert_eq!(old_parent_metadata.ctime, source_metadata.ctime);
+        assert_eq!(new_parent_metadata.mtime, source_metadata.ctime);
+        assert_eq!(new_parent_metadata.ctime, source_metadata.ctime);
+    }
+
+    #[test]
+    fn failed_rename_preserves_inode_and_parent_metadata() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let root = mount.root_location();
+        let source = root
+            .create(
+                "source",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let victim = root
+            .create(
+                "victim",
+                NodeType::Directory,
+                NodePermission::from_bits_truncate(0o700),
+            )
+            .unwrap();
+        install_removal_timestamp_sentinels(&root, &source);
+        victim
+            .update_metadata(MetadataUpdate {
+                ctime: Some(core::time::Duration::MAX),
+                ..Default::default()
+            })
+            .unwrap();
+        let parent_before = metadata_state(&root);
+        let source_before = metadata_state(&source);
+        let victim_before = metadata_state(&victim);
+
+        assert_eq!(
+            root.rename("source", &root, "victim").unwrap_err(),
+            VfsError::IsADirectory
+        );
+        assert_eq!(metadata_state(&root), parent_before);
+        assert_eq!(metadata_state(&source), source_before);
+        assert_eq!(metadata_state(&victim), victim_before);
     }
 
     #[test]

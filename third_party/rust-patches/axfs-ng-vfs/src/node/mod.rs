@@ -1,5 +1,6 @@
 mod dir;
 mod file;
+mod xattr;
 
 use alloc::{
     string::String,
@@ -25,6 +26,7 @@ pub use file::*;
 use hashbrown::Equivalent;
 use inherit_methods_macro::inherit_methods;
 use smallvec::SmallVec;
+pub use xattr::*;
 
 use crate::{
     FilesystemOps, Metadata, MetadataUpdate, Mutex, MutexGuard, NodeType, VfsError, VfsResult,
@@ -134,6 +136,13 @@ pub trait NodeOps: Send + Sync + 'static {
     /// socket endpoints) must return the same cell from every lookup and
     /// hardlink alias of that inode generation.
     fn persistent_user_data(&self) -> Option<&NodeUserData> {
+        None
+    }
+
+    /// Returns the stable per-inode extended-attribute provider, when this
+    /// backend has one. A missing provider means honest `EOPNOTSUPP` rather
+    /// than an ephemeral VFS-side store.
+    fn xattr_provider(&self) -> Option<&dyn XattrProvider> {
         None
     }
 }
@@ -773,6 +782,10 @@ impl DirEntry {
             metadata.node_type = self.0.node_type;
             metadata
         })
+    }
+
+    pub(crate) fn xattr_provider(&self) -> Option<&dyn XattrProvider> {
+        self.0.node.xattr_provider()
     }
 
     pub fn downcast<T: NodeOps>(&self) -> VfsResult<Arc<T>> {

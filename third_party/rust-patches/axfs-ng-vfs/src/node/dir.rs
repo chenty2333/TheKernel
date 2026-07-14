@@ -126,6 +126,66 @@ pub trait DirNodeOps: NodeOps {
         Err(VfsError::OperationNotSupported)
     }
 
+    /// Returns whether this directory backend can atomically publish a named
+    /// inode of `node_type` through [`Self::create_named`].
+    ///
+    /// This is a pure, immutable mechanism capability. It must not inspect a
+    /// particular name, perform permission checks, or mutate namespace state.
+    /// Backends opt in by type; the fail-closed default prevents a higher layer
+    /// from running policy hooks for an operation that cannot be published.
+    /// Symbolic-link publication has the separate [`Self::supports_symlink`]
+    /// capability because it must install its target before publication.
+    fn supports_named_create(&self, _node_type: NodeType) -> bool {
+        false
+    }
+
+    /// Returns whether this directory backend can atomically initialize and
+    /// publish a symbolic link through [`Self::create_symlink`].
+    ///
+    /// This is a pure mechanism capability. Linux permission, security-hook,
+    /// and errno policy belong to a higher layer.
+    fn supports_symlink(&self) -> bool {
+        false
+    }
+
+    /// Returns whether this directory backend implements same-inode hard-link
+    /// publication.
+    ///
+    /// This is a pure, immutable mechanism capability. It must not perform
+    /// permission checks, inspect credentials, or decide whether one particular
+    /// source inode may be linked. Backends opt in explicitly so higher layers
+    /// can avoid running policy hooks for an operation the filesystem cannot
+    /// perform at all.
+    fn supports_hard_links(&self) -> bool {
+        false
+    }
+
+    /// Returns whether this directory backend implements removal of
+    /// non-directory entries.
+    ///
+    /// This is a pure mechanism capability. It must not inspect a particular
+    /// name or victim, perform permission checks, or mutate namespace state.
+    fn supports_unlink(&self) -> bool {
+        false
+    }
+
+    /// Returns whether this directory backend implements directory removal.
+    ///
+    /// This is a pure mechanism capability. In particular, it must not perform
+    /// the per-victim emptiness check owned by [`Self::unlink`].
+    fn supports_rmdir(&self) -> bool {
+        false
+    }
+
+    /// Returns whether this directory backend implements ordinary rename.
+    ///
+    /// This is a fail-closed mechanism capability. It must not inspect one
+    /// particular source/destination, perform permission checks, or mutate
+    /// namespace state. Linux-ABI flag policy remains in a higher layer.
+    fn supports_rename(&self) -> bool {
+        false
+    }
+
     /// Creates a link to a node. The filesystem must atomically reject a
     /// zero-link inode unless it still owns anonymous publication state.
     fn link(&self, name: &str, node: &DirEntry) -> VfsResult<DirEntry>;
@@ -500,6 +560,38 @@ impl DirNode {
         self.ops.read_dir(offset, sink)
     }
 
+    /// Returns whether this directory backend implements named publication for
+    /// `node_type`.
+    pub fn supports_named_create(&self, node_type: NodeType) -> bool {
+        self.ops.supports_named_create(node_type)
+    }
+
+    /// Returns whether this directory backend implements symbolic-link
+    /// publication.
+    pub fn supports_symlink(&self) -> bool {
+        self.ops.supports_symlink()
+    }
+
+    /// Returns whether this directory backend implements hard links.
+    pub fn supports_hard_links(&self) -> bool {
+        self.ops.supports_hard_links()
+    }
+
+    /// Returns whether this directory backend implements non-directory removal.
+    pub fn supports_unlink(&self) -> bool {
+        self.ops.supports_unlink()
+    }
+
+    /// Returns whether this directory backend implements directory removal.
+    pub fn supports_rmdir(&self) -> bool {
+        self.ops.supports_rmdir()
+    }
+
+    /// Returns whether the backend implements ordinary rename.
+    pub fn supports_rename(&self) -> bool {
+        self.ops.supports_rename()
+    }
+
     /// Creates a link to a node.
     pub fn link(&self, name: &str, node: &DirEntry) -> VfsResult<DirEntry> {
         verify_entry_name(name)?;
@@ -552,6 +644,9 @@ impl DirNode {
         disposition: CreateDisposition,
     ) -> VfsResult<CreateOutcome<DirEntry>> {
         verify_entry_name(name)?;
+        if !self.supports_named_create(options.node_type) {
+            return Err(VfsError::OperationNotPermitted);
+        }
         let cache_name = self.prepare_cache_name(name);
         let generation = self.begin_name_mutation(name);
         let outcome = self.ops.create_named(name, options, disposition)?;
@@ -598,6 +693,9 @@ impl DirNode {
         user: Option<(u32, u32)>,
     ) -> VfsResult<DirEntry> {
         verify_entry_name(name)?;
+        if !self.supports_symlink() {
+            return Err(VfsError::OperationNotPermitted);
+        }
         let cache_name = self.prepare_cache_name(name);
         let generation = self.begin_name_mutation(name);
         let entry = self.ops.create_symlink(name, target, permission, user)?;
@@ -621,6 +719,9 @@ impl DirNode {
         dst_name: &str,
         dst: Option<&DirEntry>,
     ) -> VfsResult<()> {
+        if !self.supports_rename() {
+            return Err(VfsError::OperationNotPermitted);
+        }
         verify_entry_name(src_name)?;
         verify_entry_name(dst_name)?;
         self.begin_name_mutation(src_name);
@@ -717,6 +818,160 @@ impl DirNode {
 
 #[cfg(test)]
 mod tests {
-    // Backend-transaction behavior is exercised by concrete filesystem tests;
-    // the generic VFS no longer performs pointer-identity validation itself.
+    use alloc::sync::Arc;
+    use core::{
+        any::Any,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+    use crate::{
+        CreateOutcome, FilesystemOps, Metadata, MetadataUpdate, NodeOps, Reference, RenameRequest,
+        UnlinkRequest,
+    };
+
+    #[derive(Default)]
+    struct DefaultMutationCapabilities {
+        named_create_calls: AtomicUsize,
+        symlink_calls: AtomicUsize,
+    }
+
+    impl NodeOps for DefaultMutationCapabilities {
+        fn inode(&self) -> u64 {
+            0
+        }
+
+        fn metadata(&self) -> VfsResult<Metadata> {
+            unreachable!()
+        }
+
+        fn update_metadata(&self, _update: MetadataUpdate) -> VfsResult<()> {
+            unreachable!()
+        }
+
+        fn filesystem(&self) -> &dyn FilesystemOps {
+            unreachable!()
+        }
+
+        fn sync(&self, _data_only: bool) -> VfsResult<()> {
+            unreachable!()
+        }
+
+        fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+            self
+        }
+    }
+
+    impl DirNodeOps for DefaultMutationCapabilities {
+        fn read_dir(&self, _offset: u64, _sink: &mut dyn DirEntrySink) -> VfsResult<usize> {
+            unreachable!()
+        }
+
+        fn lookup(&self, _name: &str) -> VfsResult<DirEntry> {
+            unreachable!()
+        }
+
+        fn create_named(
+            &self,
+            _name: &str,
+            _options: &NamedCreateOptions,
+            _disposition: CreateDisposition,
+        ) -> VfsResult<CreateOutcome<DirEntry>> {
+            self.named_create_calls.fetch_add(1, Ordering::Relaxed);
+            Err(VfsError::Unsupported)
+        }
+
+        fn create_symlink(
+            &self,
+            _name: &str,
+            _target: &str,
+            _permission: NodePermission,
+            _user: Option<(u32, u32)>,
+        ) -> VfsResult<DirEntry> {
+            self.symlink_calls.fetch_add(1, Ordering::Relaxed);
+            Err(VfsError::Unsupported)
+        }
+
+        fn link(&self, _name: &str, _node: &DirEntry) -> VfsResult<DirEntry> {
+            unreachable!()
+        }
+
+        fn unlink(&self, _request: UnlinkRequest<'_>) -> VfsResult<()> {
+            unreachable!()
+        }
+
+        fn rename(&self, _request: RenameRequest<'_>) -> VfsResult<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn mutation_capabilities_are_fail_closed_by_default() {
+        let backend = Arc::new(DefaultMutationCapabilities::default());
+        let entry =
+            DirEntry::try_new_dir(DirNode::new(backend.clone()), Reference::anonymous()).unwrap();
+        let directory = entry.as_dir().unwrap();
+
+        for node_type in [
+            NodeType::Unknown,
+            NodeType::Fifo,
+            NodeType::CharacterDevice,
+            NodeType::Directory,
+            NodeType::BlockDevice,
+            NodeType::RegularFile,
+            NodeType::Symlink,
+            NodeType::Socket,
+        ] {
+            assert!(!backend.supports_named_create(node_type));
+            assert!(!directory.supports_named_create(node_type));
+        }
+        assert!(!backend.supports_symlink());
+        assert!(!directory.supports_symlink());
+        assert!(!backend.supports_hard_links());
+        assert!(!backend.supports_unlink());
+        assert!(!backend.supports_rmdir());
+        assert!(!backend.supports_rename());
+        assert!(!directory.supports_hard_links());
+        assert!(!directory.supports_unlink());
+        assert!(!directory.supports_rmdir());
+        assert!(!directory.supports_rename());
+
+        let generation = directory.namespace_generation();
+        let create_options = NamedCreateOptions {
+            node_type: NodeType::RegularFile,
+            permission: NodePermission::from_bits_truncate(0o600),
+            owner: None,
+            rdev: None,
+            initial_data: None,
+        };
+        assert_eq!(
+            directory
+                .create_named("file", &create_options, CreateDisposition::Exclusive)
+                .unwrap_err(),
+            VfsError::OperationNotPermitted
+        );
+        assert!(directory.namespace_generation_is_current(generation));
+        assert_eq!(backend.named_create_calls.load(Ordering::Relaxed), 0);
+
+        assert_eq!(
+            directory
+                .create_symlink(
+                    "link",
+                    "target",
+                    NodePermission::from_bits_truncate(0o777),
+                    None,
+                )
+                .unwrap_err(),
+            VfsError::OperationNotPermitted
+        );
+        assert!(directory.namespace_generation_is_current(generation));
+        assert_eq!(backend.symlink_calls.load(Ordering::Relaxed), 0);
+
+        assert_eq!(
+            directory
+                .rename("source", &entry, directory, "target", None)
+                .unwrap_err(),
+            VfsError::OperationNotPermitted
+        );
+    }
 }

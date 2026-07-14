@@ -9,7 +9,7 @@ use alloc::{
 use axfs_ng_vfs::{
     Location, Metadata, NodeFlags, NodePermission, NodeType, OpenOptions as VfsOpenOptions,
     VfsError, VfsResult,
-    path::{Component, Components, Path, PathBuf},
+    path::{Component, Components, FinalComponent, FinalComponentKind, Path, PathBuf},
 };
 use axio::{Read, Write};
 use axsync::Mutex;
@@ -551,7 +551,7 @@ impl FsContext {
     ) -> VfsResult<(Location, bool)>
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
-        C: FnMut(&Location, &mut VfsOpenOptions) -> VfsResult<()> + ?Sized,
+        C: FnMut(&Location, &str, &mut VfsOpenOptions) -> VfsResult<()> + ?Sized,
     {
         self.resolve_open_with_policy(
             path,
@@ -574,7 +574,7 @@ impl FsContext {
     ) -> VfsResult<(Location, bool)>
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
-        C: FnMut(&Location, &mut VfsOpenOptions) -> VfsResult<()> + ?Sized,
+        C: FnMut(&Location, &str, &mut VfsOpenOptions) -> VfsResult<()> + ?Sized,
         P: PathwalkPolicy + ?Sized,
     {
         let mut follow_count = 0;
@@ -602,7 +602,7 @@ impl FsContext {
     ) -> VfsResult<(Location, bool)>
     where
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
-        C: FnMut(&Location, &mut VfsOpenOptions) -> VfsResult<()> + ?Sized,
+        C: FnMut(&Location, &str, &mut VfsOpenOptions) -> VfsResult<()> + ?Sized,
         P: PathwalkPolicy + ?Sized,
     {
         if path.as_str().is_empty() {
@@ -645,7 +645,7 @@ impl FsContext {
                     return Err(VfsError::IsADirectory);
                 }
                 let mut create_options = options.clone();
-                create_admission(&parent, &mut create_options)?;
+                create_admission(&parent, &name, &mut create_options)?;
                 let (loc, created) = parent.open_file_with_status(&name, &create_options)?;
                 if !Arc::ptr_eq(parent.mountpoint(), loc.mountpoint()) {
                     policy.cross_mount(&parent, &loc)?;
@@ -710,6 +710,43 @@ impl FsContext {
         }
 
         Ok((loc, false))
+    }
+
+    /// Resolves every true parent component while preserving the final syntax.
+    ///
+    /// Unlike create-facing parent helpers, this method never normalizes a
+    /// terminal `.` or `..` into an earlier named component. It also retains
+    /// trailing-separator directory intent for a normal name. The caller owns
+    /// operation-specific policy and error mapping for the returned
+    /// [`FinalComponent`].
+    pub fn resolve_parent_preserving_final<'a>(
+        &self,
+        path: &'a Path,
+    ) -> VfsResult<(Location, FinalComponent<'a>)> {
+        self.resolve_parent_preserving_final_with_admission(path, &mut allow_pathwalk)
+    }
+
+    /// Resolves every true parent component with per-directory admission while
+    /// preserving the borrowed final-component classification.
+    pub fn resolve_parent_preserving_final_with_admission<'a, F>(
+        &self,
+        path: &'a Path,
+        admission: &mut F,
+    ) -> VfsResult<(Location, FinalComponent<'a>)>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+    {
+        let (parent_path, final_component) =
+            path.split_final_component().ok_or(VfsError::NotFound)?;
+        let parent = self.resolve_components_with_policy(
+            parent_path.components(),
+            &mut 0,
+            admission,
+            &mut AllowPathwalkPolicy,
+        )?;
+        parent.check_is_dir()?;
+        admission(&parent)?;
+        Ok((parent, final_component))
     }
 
     /// Taking current node as root directory, resolves a path starting from
@@ -845,20 +882,25 @@ impl FsContext {
 
     /// Removes a file from the filesystem.
     pub fn remove_file(&self, path: impl AsRef<Path>) -> VfsResult<()> {
-        let entry = self.resolve_no_follow(path.as_ref())?;
-        entry
-            .parent()
-            .ok_or(VfsError::IsADirectory)?
-            .unlink(entry.name(), false)
+        let path = path.as_ref();
+        let (parent, final_component) = self.resolve_parent_preserving_final(path)?;
+        if final_component.requires_directory() {
+            self.resolve(path)?;
+            return Err(VfsError::IsADirectory);
+        }
+        let FinalComponentKind::Normal(name) = final_component.kind() else {
+            return Err(VfsError::IsADirectory);
+        };
+        parent.unlink(name, false)
     }
 
     /// Removes a directory from the filesystem.
     pub fn remove_dir(&self, path: impl AsRef<Path>) -> VfsResult<()> {
-        let entry = self.resolve_no_follow(path.as_ref())?;
-        entry
-            .parent()
-            .ok_or(VfsError::ResourceBusy)?
-            .unlink(entry.name(), true)
+        let (parent, final_component) = self.resolve_parent_preserving_final(path.as_ref())?;
+        let FinalComponentKind::Normal(name) = final_component.kind() else {
+            return Err(VfsError::InvalidInput);
+        };
+        parent.unlink(name, true)
     }
 
     /// Renames a file or directory to a new name, replacing the original file
@@ -866,24 +908,42 @@ impl FsContext {
     pub fn rename(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> VfsResult<()> {
         let from = from.as_ref();
         let to = to.as_ref();
-        let src = self.resolve_no_follow(from);
-
-        if self.path_refers_to_root(from) {
-            if self.path_refers_to_root(to) {
-                return Err(VfsError::ResourceBusy);
-            }
-            self.resolve_parent(to)?;
-            return Err(VfsError::ResourceBusy);
+        let (src_dir, src_final) = self.resolve_parent_preserving_final(from)?;
+        let (dst_dir, dst_final) = self.resolve_parent_preserving_final(to)?;
+        if !src_dir.same_mount(&dst_dir) {
+            return Err(VfsError::CrossesDevices);
         }
-
-        if self.path_refers_to_root(to) {
-            src?;
+        let FinalComponentKind::Normal(src_name) = src_final.kind() else {
             return Err(VfsError::ResourceBusy);
-        }
+        };
+        let FinalComponentKind::Normal(dst_name) = dst_final.kind() else {
+            return Err(VfsError::ResourceBusy);
+        };
 
-        let (src_dir, src_name) = self.resolve_parent(from)?;
-        let (dst_dir, dst_name) = self.resolve_parent(to)?;
-        src_dir.rename(&src_name, &dst_dir, &dst_name)
+        let src = src_dir.lookup_no_follow_in_mount(src_name)?;
+        let dst = match dst_dir.lookup_no_follow_in_mount(dst_name) {
+            Ok(dst) => Some(dst),
+            Err(VfsError::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+        src_dir.validate_rename_ancestry_checked(&src, &dst_dir, dst.as_ref())?;
+        if (src_final.requires_directory() || dst_final.requires_directory()) && !src.is_dir() {
+            return Err(VfsError::NotADirectory);
+        }
+        if dst_final.requires_directory()
+            && dst
+                .as_ref()
+                .is_some_and(|destination| !destination.is_dir())
+        {
+            return Err(VfsError::NotADirectory);
+        }
+        if dst.as_ref().is_some_and(|dst| dst.same_node(&src)) {
+            return Ok(());
+        }
+        if !src_dir.supports_rename() {
+            return Err(VfsError::OperationNotPermitted);
+        }
+        src_dir.rename_checked(src_name, &src, &dst_dir, dst_name, dst.as_ref())
     }
 
     /// Creates a new, empty directory at the provided path.
@@ -1022,7 +1082,8 @@ mod tests {
         FileNodeOps, Filesystem, FilesystemOps, Location, Metadata, MetadataUpdate,
         MetadataUpdateCapabilities, Mountpoint, NamedCreateOptions, NodeOps, NodePermission,
         NodeType, Reference, RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult,
-        WeakDirEntry, drain_deferred_dentry_cache_cleanup, path::Path,
+        WeakDirEntry, drain_deferred_dentry_cache_cleanup,
+        path::{FinalComponentKind, Path},
     };
     use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
     use spin::Once;
@@ -1064,6 +1125,7 @@ mod tests {
         flushes: AtomicUsize,
         unmounts: AtomicUsize,
         fail_flush: AtomicBool,
+        rename_supported: AtomicBool,
         flush_gate: StdMutex<Option<Arc<FlushGate>>>,
     }
 
@@ -1104,6 +1166,7 @@ mod tests {
                 flushes: AtomicUsize::new(0),
                 unmounts: AtomicUsize::new(0),
                 fail_flush: AtomicBool::new(false),
+                rename_supported: AtomicBool::new(true),
                 flush_gate: StdMutex::new(None),
             });
             let root = DirEntry::new_dir(
@@ -1113,6 +1176,8 @@ mod tests {
                         DirNode::new(Arc::new(TestDir {
                             fs: fs.clone(),
                             this,
+                            ino: 1,
+                            rename_supported: true,
                         }))
                     }
                 },
@@ -1184,11 +1249,24 @@ mod tests {
     struct TestDir {
         fs: Arc<TestFs>,
         this: WeakDirEntry,
+        ino: u64,
+        rename_supported: bool,
     }
 
     impl TestDir {
+        fn child_inode(&self, name: &str) -> u64 {
+            let mut hash = self.ino ^ 0xcbf2_9ce4_8422_2325;
+            for byte in name.as_bytes() {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash.max(2)
+        }
+
         fn child(&self, name: &str) -> DirEntry {
             let parent = self.this.upgrade();
+            let ino = self.child_inode(name);
+            let rename_supported = name != "rename-disabled";
             DirEntry::new_dir(
                 {
                     let fs = self.fs.clone();
@@ -1196,6 +1274,8 @@ mod tests {
                         DirNode::new(Arc::new(TestDir {
                             fs: fs.clone(),
                             this,
+                            ino,
+                            rename_supported,
                         }))
                     }
                 },
@@ -1207,6 +1287,7 @@ mod tests {
             DirEntry::new_file(
                 FileNode::new(Arc::new(TestFile {
                     fs: self.fs.clone(),
+                    ino: self.child_inode(name),
                     contents: contents.as_bytes().to_vec(),
                 })),
                 node_type,
@@ -1217,18 +1298,19 @@ mod tests {
 
     struct TestFile {
         fs: Arc<TestFs>,
+        ino: u64,
         contents: Vec<u8>,
     }
 
     impl NodeOps for TestFile {
         fn inode(&self) -> u64 {
-            2
+            self.ino
         }
 
         fn metadata(&self) -> VfsResult<Metadata> {
             Ok(Metadata {
                 device: 0,
-                inode: 2,
+                inode: self.ino,
                 nlink: 1,
                 mode: NodePermission::from_bits_truncate(0o755),
                 node_type: NodeType::RegularFile,
@@ -1306,13 +1388,13 @@ mod tests {
 
     impl NodeOps for TestDir {
         fn inode(&self) -> u64 {
-            1
+            self.ino
         }
 
         fn metadata(&self) -> VfsResult<Metadata> {
             Ok(Metadata {
                 device: 0,
-                inode: 1,
+                inode: self.ino,
                 nlink: 1,
                 mode: NodePermission::from_bits_truncate(0o755),
                 node_type: NodeType::Directory,
@@ -1347,12 +1429,25 @@ mod tests {
     }
 
     impl DirNodeOps for TestDir {
+        fn supports_named_create(&self, node_type: NodeType) -> bool {
+            matches!(node_type, NodeType::Directory | NodeType::RegularFile)
+        }
+
+        fn supports_rename(&self) -> bool {
+            self.rename_supported && self.fs.rename_supported.load(Ordering::Relaxed)
+        }
+
         fn read_dir(&self, offset: u64, sink: &mut dyn DirEntrySink) -> VfsResult<usize> {
+            let parent_ino = self
+                .this
+                .upgrade()
+                .and_then(|entry| entry.parent())
+                .map_or(self.ino, |parent| parent.inode());
             let mut read = 0;
-            if offset == 0 && sink.accept(".", 1, NodeType::Directory, 1) {
+            if offset == 0 && sink.accept(".", self.ino, NodeType::Directory, 1) {
                 read += 1;
             }
-            if offset <= 1 && sink.accept("..", 1, NodeType::Directory, 2) {
+            if offset <= 1 && sink.accept("..", parent_ino, NodeType::Directory, 2) {
                 read += 1;
             }
             Ok(read)
@@ -1360,7 +1455,7 @@ mod tests {
 
         fn lookup(&self, name: &str) -> VfsResult<DirEntry> {
             match name {
-                "child" | "other" => Ok(self.child(name)),
+                "child" | "other" | "rename-disabled" => Ok(self.child(name)),
                 "file" => Ok(self.file(name, NodeType::RegularFile, "")),
                 "jump" => Ok(self.file(name, NodeType::Symlink, "/child/child")),
                 "jump-create" => Ok(self.file(name, NodeType::Symlink, "/child/new")),
@@ -1645,6 +1740,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(context.remove_dir("/child"), Err(VfsError::ResourceBusy));
+        assert_eq!(context.remove_dir("/child/"), Err(VfsError::ResourceBusy));
         assert_eq!(
             context.rename("/child", "/renamed"),
             Err(VfsError::ResourceBusy)
@@ -1656,8 +1752,44 @@ mod tests {
     }
 
     #[test]
-    fn location_stays_two_pointer_words() {
-        assert_eq!(size_of::<Location>(), size_of::<usize>() * 2);
+    fn remove_dir_rejects_non_normal_final_components() {
+        let context = TestFs::context();
+
+        for path in ["/child/.", "/child/..", "/"] {
+            assert_eq!(context.remove_dir(path), Err(VfsError::InvalidInput));
+        }
+        assert_eq!(context.remove_dir(""), Err(VfsError::NotFound));
+    }
+
+    #[test]
+    fn remove_file_preserves_mount_and_directory_intent_errors() {
+        let mounted_context = TestFs::context();
+        let target = mounted_context.resolve("/child").unwrap();
+        target.mount(&Filesystem::new(TestFs::new())).unwrap();
+        let context = TestFs::context();
+
+        assert_eq!(
+            (
+                mounted_context.remove_file("/child"),
+                context.remove_file("/file/"),
+                context.remove_file("/child/."),
+                context.remove_file("/"),
+            ),
+            (
+                Err(VfsError::ResourceBusy),
+                Err(VfsError::NotADirectory),
+                Err(VfsError::IsADirectory),
+                Err(VfsError::IsADirectory),
+            )
+        );
+    }
+
+    #[test]
+    fn location_stays_three_pointer_words() {
+        // Mount lifecycle ownership deliberately split the directly owned
+        // mountpoint from its shared admission/accounting handle. Together
+        // with the dentry, Location therefore contains three pointer words.
+        assert_eq!(size_of::<Location>(), size_of::<usize>() * 3);
     }
 
     #[test]
@@ -1806,11 +1938,8 @@ mod tests {
         assert!(final_walk.components.iter().any(|name| name == "child"));
 
         let mut intermediate_walk = ObserveWalk::default();
-        let _ = context.resolve_with_policy(
-            "/jump/missing",
-            &mut |_| Ok(()),
-            &mut intermediate_walk,
-        );
+        let _ =
+            context.resolve_with_policy("/jump/missing", &mut |_| Ok(()), &mut intermediate_walk);
         assert_eq!(intermediate_walk.final_symlinks, [false]);
     }
 
@@ -1881,6 +2010,95 @@ mod tests {
     }
 
     #[test]
+    fn preserving_final_parent_resolution_keeps_normal_and_special_components() {
+        let context = TestFs::context();
+
+        let (parent, final_component) = context
+            .resolve_parent_preserving_final(Path::new("/file"))
+            .unwrap();
+        assert_eq!(parent.absolute_path().unwrap().as_str(), "/");
+        assert_eq!(final_component.kind(), FinalComponentKind::Normal("file"));
+        assert!(!final_component.requires_directory());
+
+        let (parent, final_component) = context
+            .resolve_parent_preserving_final(Path::new("/file/"))
+            .unwrap();
+        assert_eq!(parent.absolute_path().unwrap().as_str(), "/");
+        assert_eq!(final_component.kind(), FinalComponentKind::Normal("file"));
+        assert!(final_component.requires_directory());
+
+        for (path, kind) in [
+            (".", FinalComponentKind::Dot),
+            ("..", FinalComponentKind::DotDot),
+            ("/", FinalComponentKind::Root),
+        ] {
+            let (parent, final_component) = context
+                .resolve_parent_preserving_final(Path::new(path))
+                .unwrap();
+            assert_eq!(parent.absolute_path().unwrap().as_str(), "/");
+            assert_eq!(final_component.kind(), kind);
+            assert!(final_component.requires_directory());
+        }
+    }
+
+    #[test]
+    fn preserving_final_parent_resolution_walks_nested_directory_before_dot() {
+        let context = TestFs::context();
+        let mut visited = Vec::new();
+
+        let (parent, final_component) = context
+            .resolve_parent_preserving_final_with_admission(
+                Path::new("/child/child/."),
+                &mut |dir| {
+                    visited.push(dir.absolute_path()?.as_str().to_owned());
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(parent.absolute_path().unwrap().as_str(), "/child/child");
+        assert_eq!(final_component.kind(), FinalComponentKind::Dot);
+        assert!(final_component.requires_directory());
+        assert_eq!(visited, ["/", "/child", "/child/child"]);
+    }
+
+    #[test]
+    fn preserving_final_parent_resolution_propagates_exact_parent_denial_once() {
+        let context = TestFs::context();
+        let mut visited = Vec::new();
+        let mut exact_parent_admissions = 0;
+
+        let result = context.resolve_parent_preserving_final_with_admission(
+            Path::new("/child/child/."),
+            &mut |dir| {
+                let path = dir.absolute_path()?.as_str().to_owned();
+                visited.push(path.clone());
+                if path == "/child/child" {
+                    exact_parent_admissions += 1;
+                    Err(VfsError::PermissionDenied)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(result.unwrap_err(), VfsError::PermissionDenied);
+        assert_eq!(visited, ["/", "/child", "/child/child"]);
+        assert_eq!(exact_parent_admissions, 1);
+    }
+
+    #[test]
+    fn preserving_final_parent_resolution_rejects_file_before_dot() {
+        let context = TestFs::context();
+        assert_eq!(
+            context
+                .resolve_parent_preserving_final(Path::new("/file/."))
+                .unwrap_err(),
+            VfsError::NotADirectory
+        );
+    }
+
+    #[test]
     fn no_follow_still_follows_a_symlink_before_a_trailing_slash() {
         let context = TestFs::context();
         assert!(context.resolve_no_follow("/jump/").unwrap().is_dir());
@@ -1908,15 +2126,16 @@ mod tests {
             .create(true)
             .mode(0o600)
             .user(1000, 1000);
-        let mut create_parents = Vec::new();
+        let mut create_targets = Vec::new();
 
         let (loc, created) = options
             .resolve_location_with_admission(
                 &context,
                 "/jump-create",
                 &mut |_| Ok(()),
-                &mut |parent, _options| {
-                    create_parents.push(parent.absolute_path()?.as_str().to_owned());
+                &mut |parent, name, _options| {
+                    create_targets
+                        .push((parent.absolute_path()?.as_str().to_owned(), name.to_owned()));
                     Ok(())
                 },
             )
@@ -1924,7 +2143,60 @@ mod tests {
 
         assert!(created);
         assert_eq!(loc.absolute_path().unwrap().as_str(), "/child/new");
-        assert_eq!(create_parents, ["/child"]);
+        assert_eq!(create_targets, [("/child".to_owned(), "new".to_owned())]);
+    }
+
+    #[test]
+    fn create_open_does_not_admit_an_existing_final_component() {
+        let context = TestFs::context();
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).mode(0o600);
+        let mut create_admissions = 0;
+
+        let (loc, created) = options
+            .resolve_location_with_admission(&context, "/file", &mut |_| Ok(()), &mut |_, _, _| {
+                create_admissions += 1;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!created);
+        assert_eq!(loc.absolute_path().unwrap().as_str(), "/file");
+        assert_eq!(create_admissions, 0);
+    }
+
+    #[test]
+    fn create_open_denial_publishes_no_name() {
+        let context = TestFs::context();
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).mode(0o600);
+        let mut create_admissions = 0;
+        let generation = context.root_dir().namespace_generation().unwrap();
+
+        let result = options.resolve_location_with_admission(
+            &context,
+            "/denied-create",
+            &mut |_| Ok(()),
+            &mut |parent, name, _| {
+                create_admissions += 1;
+                assert_eq!(parent.absolute_path()?.as_str(), "/");
+                assert_eq!(name, "denied-create");
+                Err(VfsError::PermissionDenied)
+            },
+        );
+
+        assert_eq!(result.unwrap_err(), VfsError::PermissionDenied);
+        assert_eq!(create_admissions, 1);
+        assert!(
+            context
+                .root_dir()
+                .namespace_generation_is_current(generation)
+                .unwrap()
+        );
+        assert_eq!(
+            context.resolve_no_follow("/denied-create").unwrap_err(),
+            VfsError::NotFound
+        );
     }
 
     #[test]
@@ -1941,7 +2213,7 @@ mod tests {
             &context,
             "/jump-create",
             &mut |_| Ok(()),
-            &mut |_, _| Ok(()),
+            &mut |_, _, _| Ok(()),
         );
         assert_eq!(result.unwrap_err(), VfsError::AlreadyExists);
     }
@@ -1956,7 +2228,7 @@ mod tests {
             &context,
             "/bad-jump",
             &mut |_| Ok(()),
-            &mut |_, _| Ok(()),
+            &mut |_, _, _| Ok(()),
         );
         assert_eq!(result.unwrap_err(), VfsError::NotADirectory);
     }
@@ -2456,6 +2728,54 @@ mod tests {
     }
 
     #[test]
+    fn rename_is_fail_closed_at_location_and_context_seams() {
+        let backend = TestFs::new();
+        backend.rename_supported.store(false, Ordering::Relaxed);
+        let mount = Mountpoint::new_root(&Filesystem::new(backend));
+        let fs = FsContext::new(mount.root_location());
+        let root = fs.root_dir();
+
+        assert!(!root.supports_rename());
+        assert_eq!(
+            root.rename("file", root, "renamed").unwrap_err(),
+            VfsError::OperationNotPermitted
+        );
+        assert_eq!(
+            fs.rename("/file", "/renamed").unwrap_err(),
+            VfsError::OperationNotPermitted
+        );
+    }
+
+    #[test]
+    fn rename_capability_is_owned_by_the_source_directory() {
+        let fs = TestFs::context();
+        let root = fs.root_dir();
+        let destination = fs.resolve("/rename-disabled").unwrap();
+
+        assert!(root.supports_rename());
+        assert!(!destination.supports_rename());
+        assert_eq!(
+            fs.rename("/file", "/rename-disabled/renamed").unwrap_err(),
+            VfsError::Unsupported
+        );
+    }
+
+    #[test]
+    fn checked_same_inode_mountpoint_rename_is_a_generation_stable_noop() {
+        let fs = TestFs::context();
+        let root = fs.root_dir();
+        let covered = root.lookup_no_follow_in_mount("child").unwrap();
+        covered.mount(&Filesystem::new(TestFs::new())).unwrap();
+        let generation = root.namespace_generation().unwrap();
+
+        root.rename_checked("child", &covered, root, "child", Some(&covered))
+            .unwrap();
+
+        assert!(root.namespace_generation_is_current(generation).unwrap());
+        assert!(covered.is_mountpoint());
+    }
+
+    #[test]
     fn rename_to_root_reports_resource_busy() {
         let fs = TestFs::context();
         let err = fs.rename("/child", "/").unwrap_err();
@@ -2463,10 +2783,24 @@ mod tests {
     }
 
     #[test]
-    fn rename_missing_source_to_root_reports_not_found() {
+    fn rename_special_destination_precedes_missing_final_source_lookup() {
         let fs = TestFs::context();
         let err = fs.rename("/missing", "/").unwrap_err();
-        assert_eq!(err.canonicalize(), VfsError::NotFound);
+        assert_eq!(err.canonicalize(), VfsError::ResourceBusy);
+
+        for destination in ["/child/.", "/child/.."] {
+            let err = fs.rename("/missing", destination).unwrap_err();
+            assert_eq!(err.canonicalize(), VfsError::ResourceBusy);
+        }
+    }
+
+    #[test]
+    fn rename_special_source_never_aliases_an_earlier_component() {
+        let fs = TestFs::context();
+        for source in ["/child/.", "/child/.."] {
+            let err = fs.rename(source, "/other").unwrap_err();
+            assert_eq!(err.canonicalize(), VfsError::ResourceBusy);
+        }
     }
 
     #[test]

@@ -40,6 +40,54 @@ impl<'a> Component<'a> {
     }
 }
 
+/// The final syntactic component of a pathname before any normalization.
+///
+/// Namespace-removal callers need to distinguish `name`, `.`, `..`, and the
+/// root itself. In particular, treating `dir/.` as though its final component
+/// were `dir` can turn a rejected operation into deletion of the wrong entry.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum FinalComponentKind<'a> {
+    /// A named directory entry.
+    Normal(&'a str),
+    /// The current-directory component (`.`).
+    Dot,
+    /// The parent-directory component (`..`).
+    DotDot,
+    /// A pathname made entirely from root separators.
+    Root,
+}
+
+/// Borrowed classification of one pathname's final syntactic component.
+///
+/// `requires_directory` preserves directory intent which would otherwise be
+/// lost when trailing separators are skipped. It is true for `name/` and for
+/// the intrinsically directory-valued `.`, `..`, and root components. The type
+/// carries no ABI-specific error policy.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct FinalComponent<'a> {
+    kind: FinalComponentKind<'a>,
+    requires_directory: bool,
+}
+
+impl<'a> FinalComponent<'a> {
+    const fn new(kind: FinalComponentKind<'a>, requires_directory: bool) -> Self {
+        Self {
+            kind,
+            requires_directory,
+        }
+    }
+
+    /// Returns the unnormalized final-component kind.
+    pub const fn kind(self) -> FinalComponentKind<'a> {
+        self.kind
+    }
+
+    /// Returns whether the pathname syntax requires a directory at the end.
+    pub const fn requires_directory(self) -> bool {
+        self.requires_directory
+    }
+}
+
 /// An iterator over the [`Component`]s of a [`Path`].
 ///
 /// This corresponds to [`std::path::Components`].
@@ -176,6 +224,45 @@ impl Path {
             Component::Normal(p) => Some(p),
             _ => None,
         })
+    }
+
+    /// Splits off the final syntactic component without normalizing it.
+    ///
+    /// The returned parent is a borrowed prefix of this pathname. Resolving
+    /// that prefix walks every true parent component: for example, `a/b/.`
+    /// yields parent `a/b/` plus [`FinalComponentKind::Dot`], while `file/`
+    /// yields an empty parent plus `Normal("file")` with directory intent.
+    /// Empty paths have no final component.
+    pub fn split_final_component(&self) -> Option<(&Path, FinalComponent<'_>)> {
+        let raw = self.as_str();
+        if raw.is_empty() {
+            return None;
+        }
+
+        let without_trailing_slashes = raw.trim_end_matches('/');
+        if without_trailing_slashes.is_empty() {
+            return Some((
+                Path::new(raw),
+                FinalComponent::new(FinalComponentKind::Root, true),
+            ));
+        }
+
+        let final_start = without_trailing_slashes
+            .rfind('/')
+            .map_or(0, |separator| separator + 1);
+        let final_name = &without_trailing_slashes[final_start..];
+        let kind = match final_name {
+            DOT => FinalComponentKind::Dot,
+            DOTDOT => FinalComponentKind::DotDot,
+            name => FinalComponentKind::Normal(name),
+        };
+        let requires_directory = without_trailing_slashes.len() != raw.len()
+            || !matches!(kind, FinalComponentKind::Normal(_));
+
+        Some((
+            Path::new(&raw[..final_start]),
+            FinalComponent::new(kind, requires_directory),
+        ))
     }
 
     /// Creates an owned [`PathBuf`] with path adjoined to `self`.
@@ -479,5 +566,37 @@ mod test {
         assert_eq!(Some("c"), Path::new("../a/b/c").file_name());
         assert_eq!(Some("b"), Path::new("a/b/.").file_name());
         assert_eq!(None, Path::new("a/..").file_name());
+    }
+
+    fn assert_final_component(
+        raw: &str,
+        expected_parent: &str,
+        expected_kind: FinalComponentKind<'_>,
+        requires_directory: bool,
+    ) {
+        let (parent, final_component) = Path::new(raw).split_final_component().unwrap();
+        assert_eq!(parent.as_str(), expected_parent);
+        assert_eq!(final_component.kind(), expected_kind);
+        assert_eq!(final_component.requires_directory(), requires_directory);
+    }
+
+    #[test]
+    fn final_component_classification_preserves_destructive_syntax() {
+        assert_eq!(Path::new("").split_final_component(), None);
+        assert_final_component("file", "", FinalComponentKind::Normal("file"), false);
+        assert_final_component("file/", "", FinalComponentKind::Normal("file"), true);
+        assert_final_component(
+            "dir/file///",
+            "dir/",
+            FinalComponentKind::Normal("file"),
+            true,
+        );
+        assert_final_component(".", "", FinalComponentKind::Dot, true);
+        assert_final_component("..", "", FinalComponentKind::DotDot, true);
+        assert_final_component("/", "/", FinalComponentKind::Root, true);
+        assert_final_component("///", "///", FinalComponentKind::Root, true);
+        assert_final_component("a/b/.", "a/b/", FinalComponentKind::Dot, true);
+        assert_final_component("file/.", "file/", FinalComponentKind::Dot, true);
+        assert_final_component("a/b/..", "a/b/", FinalComponentKind::DotDot, true);
     }
 }

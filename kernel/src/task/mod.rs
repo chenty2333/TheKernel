@@ -32,8 +32,9 @@ pub(crate) use self::{
         check_current_pinned_process_signal_access, check_current_pinned_thread_signal_access,
         check_current_process_prlimit_access, check_current_process_ptrace_access,
         check_current_ptrace_image_snapshot, check_current_thread_ptrace_image_access,
-        check_current_zombie_signal_access, may_begin_gid_map_write, may_begin_uid_map_write,
-        may_update_setgroups_policy, may_write_gid_map, may_write_uid_map, ns_capable,
+        check_current_zombie_signal_access, check_thread_ptrace_image_access_with_actor,
+        may_begin_gid_map_write, may_begin_uid_map_write, may_update_setgroups_policy,
+        may_write_gid_map, may_write_uid_map, ns_capable,
     },
     creds::{CapabilityState, Cred, CredentialSlot, Credentials, DacCredentialView},
     exec_cred::{
@@ -42,7 +43,10 @@ pub(crate) use self::{
         ExecFileSecurityObject, ExecImageIdentity, ExecImageReadability, ExecMountPrivilege,
         ExecTraceState, map_exec_dumpability, parse_file_capabilities,
     },
-    jobctl::{ContinueResult, PtraceSession, StopReport},
+    jobctl::{
+        ContinueResult, PtraceRelationshipOrigin, PtraceRelationshipSnapshot, PtraceSession,
+        StopReport,
+    },
     process::{
         CgroupNamespace, CommittedProcessExit, Dumpability, ExecImageCommit,
         InitialProcessThreadAdmission, MempolicySnapshot, NetworkNamespace,

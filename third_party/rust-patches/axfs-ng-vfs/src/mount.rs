@@ -18,8 +18,10 @@ use crate::{
     AnonymousOptions, CreateDisposition, CreateOutcome, DirEntry, DirEntrySink, Filesystem,
     FilesystemIdentity, FilesystemOps, Metadata, MetadataUpdate, Mutex, MutexGuard,
     NamedCreateOptions, NamespaceGeneration, NodeFlags, NodePermission, NodeType, OpenOptions,
-    ReferenceKey, TypeMap, VfsError, VfsResult, WeakFilesystemIdentity,
+    ReferenceKey, TypeMap, VfsError, VfsResult, WeakFilesystemIdentity, XattrProvider,
+    XattrSetMode,
     path::{DOT, DOTDOT, PathBuf, try_build_absolute_path},
+    unsupported_xattr,
 };
 
 static MOUNT_TREE_LOCK: RwLock<()> = RwLock::new(());
@@ -53,6 +55,27 @@ fn try_push_path_component(components: &mut Vec<DirEntry>, entry: &DirEntry) -> 
     components.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
     components.push(entry.clone());
     Ok(())
+}
+
+/// Checks directory ancestry by stable backend inode identity instead of
+/// dentry allocation identity.
+///
+/// A cache may replace a dentry wrapper while an open directory handle keeps
+/// the old wrapper. Directory hard links are forbidden, so inode identity is
+/// unambiguous within one exact mount. Backends exposing only synthetic inode
+/// values must keep rename disabled until they provide a stable identity.
+fn entry_is_same_or_ancestor_by_inode(ancestor: &DirEntry, descendant: &DirEntry) -> bool {
+    let ancestor_inode = ancestor.inode();
+    let mut current = descendant.clone();
+    loop {
+        if current.inode() == ancestor_inode {
+            return true;
+        }
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        current = parent;
+    }
 }
 
 fn reserve_non_root_mount() -> VfsResult<()> {
@@ -499,8 +522,8 @@ impl Mountpoint {
             if parent.mount_id != self.mount_id {
                 return Err(VfsError::Io);
             }
-            if entry.ptr_eq(&location.entry)
-                || (entry_is_dir && entry.is_ancestor_of(&location.entry)?)
+            if entry.inode() == location.entry.inode()
+                || (entry_is_dir && entry_is_same_or_ancestor_by_inode(entry, &location.entry))
             {
                 return Ok(true);
             }
@@ -912,6 +935,34 @@ impl Location {
         Ok(metadata)
     }
 
+    fn xattr_provider(&self) -> Option<&dyn XattrProvider> {
+        self.entry.xattr_provider()
+    }
+
+    pub fn get_xattr(&self, name: &str) -> VfsResult<Vec<u8>> {
+        self.xattr_provider()
+            .ok_or_else(unsupported_xattr)?
+            .get_xattr(name)
+    }
+
+    pub fn list_xattrs(&self) -> VfsResult<Vec<u8>> {
+        self.xattr_provider()
+            .ok_or_else(unsupported_xattr)?
+            .list_xattrs()
+    }
+
+    pub fn set_xattr(&self, name: &str, value: &[u8], mode: XattrSetMode) -> VfsResult<()> {
+        self.xattr_provider()
+            .ok_or_else(unsupported_xattr)?
+            .set_xattr(name, value, mode)
+    }
+
+    pub fn remove_xattr(&self, name: &str) -> VfsResult<()> {
+        self.xattr_provider()
+            .ok_or_else(unsupported_xattr)?
+            .remove_xattr(name)
+    }
+
     /// Captures the namespace generations of this directory.
     pub fn namespace_generation(&self) -> VfsResult<NamespaceGeneration> {
         Ok(self.entry.as_dir()?.namespace_generation())
@@ -985,6 +1036,15 @@ impl Location {
         Arc::ptr_eq(self.mountpoint(), other.mountpoint()) && self.entry.ptr_eq(&other.entry)
     }
 
+    /// Returns whether both locations belong to the exact same mount instance.
+    ///
+    /// Distinct bind or filesystem views may share a stable filesystem identity
+    /// while remaining distinct mounts, so filesystem/device identity is not a
+    /// substitute for this topology check.
+    pub fn same_mount(&self, other: &Self) -> bool {
+        Arc::ptr_eq(self.mountpoint(), other.mountpoint())
+    }
+
     /// Returns whether both handles name the same backend inode in this mount.
     ///
     /// Directory cache generations may replace a dentry wrapper after an
@@ -1030,14 +1090,31 @@ impl Location {
         Ok(Self::new_locked(mountpoint, entry))
     }
 
-    pub fn lookup_no_follow(&self, name: &str) -> VfsResult<Self> {
+    /// Looks up a final component without crossing a child mount attached to it.
+    ///
+    /// For an ordinary name, the returned location wraps the covered dentry in
+    /// this directory's exact mount. Higher-level namespace-mutation preflight
+    /// can therefore inspect the covered inode's type and security state before
+    /// separately rejecting mutation of a mountpoint. No operation policy or
+    /// ABI-visible error mapping is applied here.
+    pub fn lookup_no_follow_in_mount(&self, name: &str) -> VfsResult<Self> {
         match name {
             DOT => Ok(self.clone()),
             DOTDOT => Ok(self.parent().unwrap_or_else(|| self.clone())),
-            _ => {
-                let loc = self.wrap(self.entry.as_dir()?.lookup(name)?);
-                loc.resolve_mountpoint()
-            }
+            _ => self
+                .entry
+                .as_dir()?
+                .lookup(name)
+                .map(|entry| self.wrap(entry)),
+        }
+    }
+
+    pub fn lookup_no_follow(&self, name: &str) -> VfsResult<Self> {
+        match name {
+            // Preserve parent traversal out of a mount root. Resolving the
+            // resulting covered mountpoint would immediately cross back in.
+            DOT | DOTDOT => self.lookup_no_follow_in_mount(name),
+            _ => self.lookup_no_follow_in_mount(name)?.resolve_mountpoint(),
         }
     }
 
@@ -1085,8 +1162,44 @@ impl Location {
             .map(|entry| self.wrap(entry))
     }
 
+    /// Returns whether this directory backend implements named publication for
+    /// `node_type`.
+    pub fn supports_named_create(&self, node_type: NodeType) -> bool {
+        self.entry
+            .as_dir()
+            .is_ok_and(|dir| dir.supports_named_create(node_type))
+    }
+
+    /// Returns whether this directory backend implements symbolic-link
+    /// publication.
+    pub fn supports_symlink(&self) -> bool {
+        self.entry.as_dir().is_ok_and(|dir| dir.supports_symlink())
+    }
+
+    /// Returns whether this directory backend implements hard links.
+    pub fn supports_hard_links(&self) -> bool {
+        self.entry
+            .as_dir()
+            .is_ok_and(|dir| dir.supports_hard_links())
+    }
+
+    /// Returns whether this directory backend implements non-directory removal.
+    pub fn supports_unlink(&self) -> bool {
+        self.entry.as_dir().is_ok_and(|dir| dir.supports_unlink())
+    }
+
+    /// Returns whether this directory backend implements directory removal.
+    pub fn supports_rmdir(&self) -> bool {
+        self.entry.as_dir().is_ok_and(|dir| dir.supports_rmdir())
+    }
+
+    /// Returns whether this directory backend implements ordinary rename.
+    pub fn supports_rename(&self) -> bool {
+        self.entry.as_dir().is_ok_and(|dir| dir.supports_rename())
+    }
+
     pub fn link(&self, name: &str, node: &Self) -> VfsResult<Self> {
-        if !Arc::ptr_eq(self.mountpoint(), node.mountpoint()) {
+        if !self.same_mount(node) {
             return Err(VfsError::CrossesDevices);
         }
         self.entry
@@ -1121,17 +1234,12 @@ impl Location {
         dst_name: &str,
         dst: Option<&Self>,
     ) -> VfsResult<()> {
-        if !Arc::ptr_eq(self.mountpoint(), src.mountpoint())
-            || !Arc::ptr_eq(self.mountpoint(), dst_dir.mountpoint())
-            || dst.is_some_and(|dst| !Arc::ptr_eq(dst_dir.mountpoint(), dst.mountpoint()))
-        {
-            return Err(VfsError::CrossesDevices);
+        self.validate_rename_ancestry_checked(src, dst_dir, dst)?;
+        if dst.is_some_and(|dst| dst.same_node(src)) {
+            return Ok(());
         }
-        if src.entry.is_dir()
-            && !self.ptr_eq(dst_dir)
-            && src.entry.is_ancestor_of(&dst_dir.entry)?
-        {
-            return Err(VfsError::InvalidInput);
+        if !self.supports_rename() {
+            return Err(VfsError::OperationNotPermitted);
         }
         {
             let _tree = MOUNT_TREE_LOCK.read();
@@ -1151,6 +1259,42 @@ impl Location {
             dst_name,
             dst.map(|dst| &dst.entry),
         )
+    }
+
+    /// Validates the exact-mount and directory-ancestry constraints that must
+    /// be decided before a higher-level rename policy hook runs.
+    ///
+    /// The backend repeats these checks during publication because directory
+    /// topology may still race after a nonblocking policy hook. Mountpoint
+    /// rejection is intentionally not part of this pre-hook seam: Linux's
+    /// `vfs_rename()` invokes `security_inode_rename()` before its local
+    /// mountpoint check.
+    pub fn validate_rename_ancestry_checked(
+        &self,
+        src: &Self,
+        dst_dir: &Self,
+        dst: Option<&Self>,
+    ) -> VfsResult<()> {
+        if !Arc::ptr_eq(self.mountpoint(), src.mountpoint())
+            || !Arc::ptr_eq(self.mountpoint(), dst_dir.mountpoint())
+            || dst.is_some_and(|dst| !Arc::ptr_eq(dst_dir.mountpoint(), dst.mountpoint()))
+        {
+            return Err(VfsError::CrossesDevices);
+        }
+        if src.entry.is_dir()
+            && !self.ptr_eq(dst_dir)
+            && entry_is_same_or_ancestor_by_inode(&src.entry, &dst_dir.entry)
+        {
+            return Err(VfsError::InvalidInput);
+        }
+        if let Some(dst) = dst
+            && dst.entry.is_dir()
+            && !self.ptr_eq(dst_dir)
+            && entry_is_same_or_ancestor_by_inode(&dst.entry, &self.entry)
+        {
+            return Err(VfsError::DirectoryNotEmpty);
+        }
+        Ok(())
     }
 
     pub fn unlink(&self, name: &str, is_dir: bool) -> VfsResult<()> {
@@ -1505,12 +1649,19 @@ impl Pollable for Location {
 
 #[cfg(test)]
 mod tests {
+    use core::{any::Any, time::Duration};
     use std::{
         sync::{Arc as StdArc, Barrier},
         thread,
     };
 
+    use axerrno::LinuxError;
+
     use super::*;
+    use crate::{
+        DirNode, DirNodeOps, MetadataUpdateCapabilities, NodeOps, Reference, RenameRequest, StatFs,
+        UnlinkRequest,
+    };
 
     #[derive(Debug, PartialEq, Eq)]
     struct Marker(u32);
@@ -1519,6 +1670,209 @@ mod tests {
         let mut extensions = TypeMap::new();
         extensions.insert(Marker(value));
         extensions
+    }
+
+    struct LookupTestFs {
+        root: Once<DirEntry>,
+        root_inode: u64,
+    }
+
+    impl LookupTestFs {
+        fn new(root_inode: u64) -> Arc<Self> {
+            let filesystem = Arc::new(Self {
+                root: Once::new(),
+                root_inode,
+            });
+            let root = DirEntry::new_dir(
+                {
+                    let filesystem = filesystem.clone();
+                    move |this| {
+                        DirNode::new(Arc::new(LookupTestDir {
+                            inode: filesystem.root_inode,
+                            filesystem: filesystem.clone(),
+                            this,
+                        }))
+                    }
+                },
+                Reference::root(),
+            );
+            filesystem.root.call_once(|| root);
+            filesystem
+        }
+    }
+
+    impl FilesystemOps for LookupTestFs {
+        fn name(&self) -> &str {
+            "lookup-test"
+        }
+
+        fn root_dir(&self) -> DirEntry {
+            self.root.get().unwrap().clone()
+        }
+
+        fn stat(&self) -> VfsResult<StatFs> {
+            Ok(StatFs {
+                fs_type: 0,
+                block_size: 4096,
+                blocks: 0,
+                blocks_free: 0,
+                blocks_available: 0,
+                file_count: 3,
+                free_file_count: 0,
+                name_length: 255,
+                fragment_size: 4096,
+                mount_flags: 0,
+            })
+        }
+
+        fn metadata_update_capabilities(&self) -> MetadataUpdateCapabilities {
+            MetadataUpdateCapabilities::empty()
+        }
+    }
+
+    struct LookupTestDir {
+        inode: u64,
+        filesystem: Arc<LookupTestFs>,
+        this: crate::WeakDirEntry,
+    }
+
+    impl LookupTestDir {
+        fn child(&self, name: &str, inode: u64) -> DirEntry {
+            DirEntry::new_dir(
+                {
+                    let filesystem = self.filesystem.clone();
+                    move |this| {
+                        DirNode::new(Arc::new(Self {
+                            inode,
+                            filesystem: filesystem.clone(),
+                            this,
+                        }))
+                    }
+                },
+                Reference::new(self.this.upgrade(), name.into()),
+            )
+        }
+    }
+
+    impl NodeOps for LookupTestDir {
+        fn inode(&self) -> u64 {
+            self.inode
+        }
+
+        fn metadata(&self) -> VfsResult<Metadata> {
+            Ok(Metadata {
+                device: 0,
+                inode: self.inode,
+                nlink: 1,
+                mode: NodePermission::from_bits_truncate(0o755),
+                node_type: NodeType::Directory,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                block_size: 4096,
+                blocks: 0,
+                rdev: Default::default(),
+                atime: Duration::ZERO,
+                btime: Duration::ZERO,
+                mtime: Duration::ZERO,
+                ctime: Duration::ZERO,
+            })
+        }
+
+        fn update_metadata(&self, _update: MetadataUpdate) -> VfsResult<()> {
+            Ok(())
+        }
+
+        fn filesystem(&self) -> &dyn FilesystemOps {
+            &*self.filesystem
+        }
+
+        fn sync(&self, _data_only: bool) -> VfsResult<()> {
+            Ok(())
+        }
+
+        fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+            self
+        }
+    }
+
+    impl DirNodeOps for LookupTestDir {
+        fn read_dir(&self, _offset: u64, _sink: &mut dyn DirEntrySink) -> VfsResult<usize> {
+            Ok(0)
+        }
+
+        fn lookup(&self, name: &str) -> VfsResult<DirEntry> {
+            match name {
+                "child" => Ok(self.child(name, self.filesystem.root_inode + 1)),
+                "other" => Ok(self.child(name, self.filesystem.root_inode + 2)),
+                _ => Err(VfsError::NotFound),
+            }
+        }
+
+        fn create_named(
+            &self,
+            _name: &str,
+            _options: &NamedCreateOptions,
+            _disposition: CreateDisposition,
+        ) -> VfsResult<CreateOutcome<DirEntry>> {
+            Err(VfsError::Unsupported)
+        }
+
+        fn link(&self, _name: &str, _node: &DirEntry) -> VfsResult<DirEntry> {
+            Err(VfsError::Unsupported)
+        }
+
+        fn unlink(&self, _request: UnlinkRequest<'_>) -> VfsResult<()> {
+            Err(VfsError::Unsupported)
+        }
+
+        fn rename(&self, _request: RenameRequest<'_>) -> VfsResult<()> {
+            Err(VfsError::Unsupported)
+        }
+    }
+
+    #[test]
+    fn in_mount_lookup_exposes_a_covered_dentry_without_crossing() {
+        let parent_filesystem = Filesystem::new(LookupTestFs::new(100));
+        let parent_mount = Mountpoint::new_root(&parent_filesystem);
+        let parent = parent_mount.root_location();
+        let covered_before_mount = parent.lookup_no_follow_in_mount("child").unwrap();
+        let child_filesystem = Filesystem::new(LookupTestFs::new(200));
+        let child_mount = covered_before_mount.mount(&child_filesystem).unwrap();
+
+        let ordinary = parent.lookup_no_follow("child").unwrap();
+        let covered = parent.lookup_no_follow_in_mount("child").unwrap();
+
+        assert!(Arc::ptr_eq(ordinary.mountpoint(), &child_mount));
+        assert!(ordinary.is_root_of_mount());
+        assert_eq!(ordinary.inode(), 200);
+        assert!(covered.same_mount(&parent));
+        assert_eq!(covered.inode(), 101);
+        assert!(covered.is_mountpoint());
+        assert!(!ordinary.same_mount(&covered));
+
+        let ordinary_other = parent.lookup_no_follow("other").unwrap();
+        let in_mount_other = parent.lookup_no_follow_in_mount("other").unwrap();
+        assert!(ordinary_other.ptr_eq(&in_mount_other));
+        assert!(!in_mount_other.is_mountpoint());
+    }
+
+    #[test]
+    fn rename_ancestry_preflight_preserves_both_trap_error_classes() {
+        let filesystem = Filesystem::new(LookupTestFs::new(300));
+        let mount = Mountpoint::new_root(&filesystem);
+        let root = mount.root_location();
+        let child = root.lookup_no_follow_in_mount("child").unwrap();
+        let grandchild = child.lookup_no_follow_in_mount("other").unwrap();
+
+        assert_eq!(
+            root.validate_rename_ancestry_checked(&child, &grandchild, None),
+            Err(VfsError::InvalidInput)
+        );
+        assert_eq!(
+            child.validate_rename_ancestry_checked(&grandchild, &root, Some(&child)),
+            Err(VfsError::DirectoryNotEmpty)
+        );
     }
 
     #[test]
@@ -1585,5 +1939,32 @@ mod tests {
         assert_eq!(optional_lookup::<()>(Err(VfsError::NotFound)), Ok(None));
         assert_eq!(optional_lookup::<()>(Err(VfsError::Io)), Err(VfsError::Io));
         assert_eq!(optional_lookup(Ok(7_u8)), Ok(Some(7_u8)));
+    }
+
+    #[test]
+    fn default_node_xattrs_are_honestly_unsupported() {
+        let filesystem = Filesystem::new(LookupTestFs::new(100));
+        let mount = Mountpoint::new_root(&filesystem);
+        let root = mount.root_location();
+
+        assert_eq!(
+            LinuxError::from(root.get_xattr("user.key").unwrap_err()),
+            LinuxError::EOPNOTSUPP
+        );
+        assert_eq!(
+            LinuxError::from(root.list_xattrs().unwrap_err()),
+            LinuxError::EOPNOTSUPP
+        );
+        assert_eq!(
+            LinuxError::from(
+                root.set_xattr("user.key", b"value", XattrSetMode::Upsert)
+                    .unwrap_err()
+            ),
+            LinuxError::EOPNOTSUPP
+        );
+        assert_eq!(
+            LinuxError::from(root.remove_xattr("user.key").unwrap_err()),
+            LinuxError::EOPNOTSUPP
+        );
     }
 }

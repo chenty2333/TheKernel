@@ -1391,6 +1391,18 @@ impl NodeOps for CgroupDir {
 }
 
 impl DirNodeOps for CgroupDir {
+    fn supports_named_create(&self, node_type: NodeType) -> bool {
+        node_type == NodeType::Directory
+    }
+
+    fn supports_rmdir(&self) -> bool {
+        true
+    }
+
+    fn supports_rename(&self) -> bool {
+        self.node.fs.version == CgroupVersion::V1
+    }
+
     fn namespace_epoch(&self) -> u64 {
         self.namespace_epoch.load(Ordering::Acquire)
     }
@@ -1606,9 +1618,13 @@ impl DirNodeOps for CgroupDir {
             let dst_name = try_owned(request.dst_name)?;
             self.namespace_epoch.fetch_add(1, Ordering::AcqRel);
             children.remove(request.src_name);
-            children.insert(dst_name, child);
+            children.insert(dst_name, child.clone());
             let now = wall_time();
             drop(children);
+            child.node.update_metadata(MetadataUpdate {
+                ctime: Some(now),
+                ..Default::default()
+            });
             self.touch_namespace(now);
             return Ok(());
         }
@@ -1682,6 +1698,10 @@ impl DirNodeOps for CgroupDir {
             return Ok(());
         }
         let now = wall_time();
+        child.node.update_metadata(MetadataUpdate {
+            ctime: Some(now),
+            ..Default::default()
+        });
         self.touch_namespace(now);
         dst_dir.touch_namespace(now);
         child.update_pids_peak_hierarchy();
@@ -1929,6 +1949,44 @@ mod tests {
 
     fn test_cgroup_fs() -> Filesystem {
         CgroupFs::new(CgroupVersion::V1, Vec::from(["pids".to_string()])).unwrap()
+    }
+
+    fn metadata_state(
+        entry: &DirEntry,
+    ) -> (
+        u64,
+        core::time::Duration,
+        core::time::Duration,
+        core::time::Duration,
+        core::time::Duration,
+    ) {
+        let metadata = entry.metadata().unwrap();
+        (
+            metadata.nlink,
+            metadata.atime,
+            metadata.btime,
+            metadata.mtime,
+            metadata.ctime,
+        )
+    }
+
+    fn install_rename_timestamp_sentinels(parents: &[&DirEntry], source: &DirEntry) {
+        let sentinel = core::time::Duration::MAX;
+        for parent in parents {
+            parent
+                .update_metadata(MetadataUpdate {
+                    mtime: Some(sentinel),
+                    ctime: Some(sentinel),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        source
+            .update_metadata(MetadataUpdate {
+                ctime: Some(sentinel),
+                ..Default::default()
+            })
+            .unwrap();
     }
 
     fn maps_to(registry: &PidMembershipRegistry, pid: Pid, expected: &Arc<CgroupDir>) -> bool {
@@ -2279,6 +2337,115 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_v1_rename_uses_one_timestamp_for_source_and_parents() {
+        let fs = test_cgroup_fs();
+        let root = fs.root_dir();
+        let root_dir = root.as_dir().unwrap();
+        let mode = NodePermission::from_bits_truncate(0o755);
+        let old_parent = root_dir
+            .create("old-parent", NodeType::Directory, mode)
+            .unwrap();
+        let new_parent = root_dir
+            .create("new-parent", NodeType::Directory, mode)
+            .unwrap();
+        let old_dir = old_parent.as_dir().unwrap();
+        let new_dir = new_parent.as_dir().unwrap();
+        let source = old_dir.create("source", NodeType::Directory, mode).unwrap();
+        install_rename_timestamp_sentinels(&[&old_parent, &new_parent], &source);
+
+        old_dir
+            .rename("source", &source, new_dir, "renamed", None)
+            .unwrap();
+
+        let source_metadata = source.metadata().unwrap();
+        let old_parent_metadata = old_parent.metadata().unwrap();
+        let new_parent_metadata = new_parent.metadata().unwrap();
+        assert_ne!(source_metadata.ctime, core::time::Duration::MAX);
+        assert_eq!(old_parent_metadata.mtime, source_metadata.ctime);
+        assert_eq!(old_parent_metadata.ctime, source_metadata.ctime);
+        assert_eq!(new_parent_metadata.mtime, source_metadata.ctime);
+        assert_eq!(new_parent_metadata.ctime, source_metadata.ctime);
+    }
+
+    #[test]
+    fn cgroup_v1_same_parent_rename_touches_source_and_parent_together() {
+        let fs = test_cgroup_fs();
+        let root = fs.root_dir();
+        let root_dir = root.as_dir().unwrap();
+        let source = root_dir
+            .create(
+                "source",
+                NodeType::Directory,
+                NodePermission::from_bits_truncate(0o755),
+            )
+            .unwrap();
+        install_rename_timestamp_sentinels(&[&root], &source);
+
+        root_dir
+            .rename("source", &source, root_dir, "renamed", None)
+            .unwrap();
+
+        let source_metadata = source.metadata().unwrap();
+        let parent_metadata = root.metadata().unwrap();
+        assert_ne!(source_metadata.ctime, core::time::Duration::MAX);
+        assert_eq!(parent_metadata.mtime, source_metadata.ctime);
+        assert_eq!(parent_metadata.ctime, source_metadata.ctime);
+    }
+
+    #[test]
+    fn failed_and_unsupported_cgroup_rename_preserve_metadata() {
+        let fs = test_cgroup_fs();
+        let root = fs.root_dir();
+        let root_dir = root.as_dir().unwrap();
+        let mode = NodePermission::from_bits_truncate(0o755);
+        let source = root_dir
+            .create("source", NodeType::Directory, mode)
+            .unwrap();
+        let victim = root_dir
+            .create("victim", NodeType::Directory, mode)
+            .unwrap();
+        install_rename_timestamp_sentinels(&[&root], &source);
+        victim
+            .update_metadata(MetadataUpdate {
+                ctime: Some(core::time::Duration::MAX),
+                ..Default::default()
+            })
+            .unwrap();
+        let parent_before = metadata_state(&root);
+        let source_before = metadata_state(&source);
+        let victim_before = metadata_state(&victim);
+
+        assert_eq!(
+            root_dir
+                .rename("source", &source, root_dir, "victim", Some(&victim))
+                .unwrap_err(),
+            VfsError::AlreadyExists
+        );
+        assert_eq!(metadata_state(&root), parent_before);
+        assert_eq!(metadata_state(&source), source_before);
+        assert_eq!(metadata_state(&victim), victim_before);
+
+        let v2 = new_cgroup_v2().unwrap();
+        let v2_root = v2.root_dir();
+        let v2_root_dir = v2_root.as_dir().unwrap();
+        let v2_source = v2_root_dir
+            .create("source", NodeType::Directory, mode)
+            .unwrap();
+        install_rename_timestamp_sentinels(&[&v2_root], &v2_source);
+        let v2_parent_before = metadata_state(&v2_root);
+        let v2_source_before = metadata_state(&v2_source);
+
+        assert_eq!(
+            v2_root_dir
+                .rename("source", &v2_source, v2_root_dir, "renamed", None)
+                .unwrap_err(),
+            VfsError::OperationNotPermitted
+        );
+        assert_eq!(metadata_state(&v2_root), v2_parent_before);
+        assert_eq!(metadata_state(&v2_source), v2_source_before);
+    }
+
+    #[test]
     fn cgroup_unlink_rejects_a_hidden_fork_membership() {
         let fs = test_cgroup_fs();
         let root = fs.root_dir();
@@ -2301,6 +2468,40 @@ mod tests {
             VfsError::ResourceBusy
         );
         assert_eq!(root_dir.lookup("child").unwrap().inode(), child.inode());
+    }
+
+    #[test]
+    fn cgroup_mutation_capabilities_match_versioned_backends() {
+        let fs = test_cgroup_fs();
+        let root = fs.root_dir();
+        let root_dir = root.as_dir().unwrap();
+
+        assert!(!root_dir.supports_unlink());
+        assert!(root_dir.supports_rmdir());
+        assert!(root_dir.supports_rename());
+        assert!(root_dir.supports_named_create(NodeType::Directory));
+        for node_type in [
+            NodeType::Unknown,
+            NodeType::Fifo,
+            NodeType::CharacterDevice,
+            NodeType::BlockDevice,
+            NodeType::RegularFile,
+            NodeType::Symlink,
+            NodeType::Socket,
+        ] {
+            assert!(!root_dir.supports_named_create(node_type));
+        }
+        assert!(!root_dir.supports_symlink());
+
+        let v2 = new_cgroup_v2().unwrap();
+        let v2_root = v2.root_dir();
+        let v2_root_dir = v2_root.as_dir().unwrap();
+        assert!(!v2_root_dir.supports_unlink());
+        assert!(v2_root_dir.supports_rmdir());
+        assert!(!v2_root_dir.supports_rename());
+        assert!(v2_root_dir.supports_named_create(NodeType::Directory));
+        assert!(!v2_root_dir.supports_named_create(NodeType::RegularFile));
+        assert!(!v2_root_dir.supports_symlink());
     }
 }
 

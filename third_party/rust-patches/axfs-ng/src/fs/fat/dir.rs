@@ -34,6 +34,14 @@ fn try_clone_string(value: &str) -> VfsResult<String> {
     Ok(result)
 }
 
+const fn fat_named_create_is_directory(node_type: NodeType) -> Option<bool> {
+    match node_type {
+        NodeType::RegularFile => Some(false),
+        NodeType::Directory => Some(true),
+        _ => None,
+    }
+}
+
 pub struct FatDirNode {
     fs: Arc<FatFilesystem>,
     pub(crate) inner: FsRef<Option<ff::Dir<'static>>>,
@@ -246,6 +254,18 @@ impl NodeOps for FatDirNode {
 }
 
 impl DirNodeOps for FatDirNode {
+    fn supports_named_create(&self, node_type: NodeType) -> bool {
+        fat_named_create_is_directory(node_type).is_some()
+    }
+
+    fn supports_unlink(&self) -> bool {
+        true
+    }
+
+    fn supports_rmdir(&self) -> bool {
+        true
+    }
+
     fn namespace_epoch(&self) -> u64 {
         self.state.namespace_epoch().load(Ordering::Acquire)
     }
@@ -323,11 +343,8 @@ impl DirNodeOps for FatDirNode {
                 });
             }
         }
-        let create_directory = match options.node_type {
-            NodeType::RegularFile => false,
-            NodeType::Directory => true,
-            _ => return Err(VfsError::OperationNotSupported),
-        };
+        let create_directory = fat_named_create_is_directory(options.node_type)
+            .ok_or(VfsError::OperationNotSupported)?;
         let reference_name = try_ascii_lowercase(name)?;
         let reference = Reference::new(Some(self.this_entry()?), reference_name);
         let admission = self.fs.prepare_entry_state()?;
@@ -563,5 +580,32 @@ impl DirNodeOps for FatDirNode {
 impl Drop for FatDirNode {
     fn drop(&mut self) {
         self.fs.release_inode(self.inode);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fat_named_create_capabilities_match_backend_primitives() {
+        assert_eq!(
+            fat_named_create_is_directory(NodeType::RegularFile),
+            Some(false)
+        );
+        assert_eq!(
+            fat_named_create_is_directory(NodeType::Directory),
+            Some(true)
+        );
+        for node_type in [
+            NodeType::Unknown,
+            NodeType::Fifo,
+            NodeType::CharacterDevice,
+            NodeType::BlockDevice,
+            NodeType::Symlink,
+            NodeType::Socket,
+        ] {
+            assert!(fat_named_create_is_directory(node_type).is_none());
+        }
     }
 }

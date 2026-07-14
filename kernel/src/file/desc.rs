@@ -810,6 +810,10 @@ impl OfdIoStatus {
 pub struct FileDescription {
     pub inner: Arc<dyn FileLike>,
     open_credentials: OpenCredentials,
+    /// Exact Linux credential captured when this open file description was
+    /// created. Linux `file::f_cred` is shared by dup/fork with the OFD and is
+    /// distinct from credentials installed only for pseudo-file I/O.
+    vfs_open_credential: Option<Arc<Cred>>,
     open_security_credential: Option<Arc<Cred>>,
     /// Immutable lock-free cache of the identity also carried by `ofd`.
     /// Keeping this copy avoids taking the OFD state lock inside dnotify and
@@ -856,7 +860,7 @@ impl FileDescription {
         inner: Arc<dyn FileLike>,
         status_flags: u32,
     ) -> AxResult<Arc<Self>> {
-        Self::new_inner(inner, status_flags, None, None, None)
+        Self::new_inner(inner, status_flags, None, None, None, None)
     }
 
     pub(in crate::file) fn new_with_write_open_key_and_resource(
@@ -865,7 +869,7 @@ impl FileDescription {
         write_open_key: Option<ExecutableKey>,
         resource: Option<DescriptionResource>,
     ) -> AxResult<Arc<Self>> {
-        Self::new_inner(inner, status_flags, write_open_key, resource, None)
+        Self::new_inner(inner, status_flags, write_open_key, resource, None, None)
     }
 
     pub(in crate::file) fn new_with_open_lease_admission_and_resource(
@@ -874,6 +878,7 @@ impl FileDescription {
         write_open_key: Option<ExecutableKey>,
         resource: Option<DescriptionResource>,
         open_lease_admission: lease::OpenLeaseAdmission,
+        vfs_open_credential: Arc<Cred>,
     ) -> AxResult<Arc<Self>> {
         Self::new_inner(
             inner,
@@ -881,6 +886,7 @@ impl FileDescription {
             write_open_key,
             resource,
             Some(open_lease_admission),
+            Some(vfs_open_credential),
         )
     }
 
@@ -890,6 +896,7 @@ impl FileDescription {
         write_open_key: Option<ExecutableKey>,
         resource: Option<DescriptionResource>,
         open_lease_admission: Option<lease::OpenLeaseAdmission>,
+        vfs_open_credential: Option<Arc<Cred>>,
     ) -> AxResult<Arc<Self>> {
         // Before a complete FileDescription exists, this guard owns rollback.
         // Once transferred into the value, ordinary FileDescription::drop owns
@@ -916,6 +923,10 @@ impl FileDescription {
         let write_open_key = write_open_rollback.transfer();
         cleanup_work.write_open_key = write_open_key;
         cleanup_work.resource = resource;
+        let vfs_open_credential = vfs_open_credential.or_else(|| {
+            current_may_uninit()
+                .and_then(|task| task.try_as_thread().map(|thread| thread.current_cred()))
+        });
         let needs_open_security_credential = inner.downcast_ref::<File>().is_some_and(|file| {
             file.inner()
                 .location()
@@ -923,14 +934,12 @@ impl FileDescription {
                 .contains(NodeFlags::OPEN_CREDENTIAL)
         });
         let open_security_credential = needs_open_security_credential
-            .then(|| {
-                current_may_uninit()
-                    .and_then(|task| task.try_as_thread().map(|thread| thread.current_cred()))
-            })
+            .then(|| vfs_open_credential.clone())
             .flatten();
         Arc::try_new(Self {
             inner,
             open_credentials: OpenCredentials::current(),
+            vfs_open_credential,
             open_security_credential,
             id,
             ofd: Mutex::new(OpenFileDescriptionState::new_external(
@@ -962,6 +971,10 @@ impl FileDescription {
 
     pub(crate) fn open_security_credential(&self) -> Option<Arc<Cred>> {
         self.open_security_credential.clone()
+    }
+
+    pub(crate) fn vfs_open_credential(&self) -> Option<Arc<Cred>> {
+        self.vfs_open_credential.clone()
     }
 
     /// Samples authoritative mutable OFD status under the short transition
@@ -1682,6 +1695,33 @@ mod tests {
         )));
         let description = FileDescription::new_with_flags(path_file, O_PATH).unwrap();
         assert!(description.notification_work.is_none());
+    }
+
+    #[test]
+    fn explicit_vfs_open_credential_is_retained_by_exact_identity() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let loc = mount
+            .root_location()
+            .create(
+                "credential-bound-open",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let file: Arc<dyn FileLike> = Arc::new(File::new(axfs::File::new(
+            FileBackend::Direct(loc),
+            FileFlags::READ,
+        )));
+        let namespace = crate::task::UserNamespace::try_new_root().unwrap();
+        let credential = Cred::try_root(namespace).unwrap();
+        let description =
+            FileDescription::new_inner(file, 0, None, None, None, Some(credential.clone()))
+                .unwrap();
+
+        let retained = description.vfs_open_credential().unwrap();
+        assert!(Arc::ptr_eq(&retained, &credential));
+        assert!(description.open_security_credential().is_none());
     }
 
     #[test]

@@ -13,7 +13,9 @@ use axfs_ng_vfs::{
     DeviceId, Filesystem, FilesystemIdentity, Location, Mountpoint, NodeType, TypeMap, VfsResult,
     WeakFilesystemIdentity,
 };
-use axsync::{Mutex as BlockingMutex, MutexGuard as BlockingMutexGuard};
+use axsync::Mutex as BlockingMutex;
+#[cfg(not(test))]
+use axsync::MutexGuard as BlockingMutexGuard;
 use hashbrown::{HashMap, HashSet};
 use spin::{Lazy, Mutex};
 
@@ -115,12 +117,24 @@ static MOUNT_RECORDS: BlockingMutex<Vec<MountRecord>> = BlockingMutex::new(Vec::
 const MAX_MOUNT_RECORDS: usize = 100_000;
 static LINUX_DEVICE_IDS: Lazy<BlockingMutex<HashMap<u64, (DeviceId, WeakFilesystemIdentity)>>> =
     Lazy::new(|| BlockingMutex::new(HashMap::new()));
-static MOUNT_NAMESPACE_OPERATION: BlockingMutex<()> = BlockingMutex::new(());
 
-/// Capability proving that one pathname/mount mutation owns the shared Linux
-/// namespace serialization domain.
+// Host tests do not initialize the scheduler/current-task slot required by the
+// sleepable production mutex, even when that mutex is uncontended.
+#[cfg(not(test))]
+type NamespaceOperationMutex = BlockingMutex<()>;
+#[cfg(test)]
+type NamespaceOperationMutex = Mutex<()>;
+#[cfg(not(test))]
+type NamespaceOperationMutexGuard = BlockingMutexGuard<'static, ()>;
+#[cfg(test)]
+type NamespaceOperationMutexGuard = spin::MutexGuard<'static, ()>;
+
+static MOUNT_NAMESPACE_OPERATION: NamespaceOperationMutex = NamespaceOperationMutex::new(());
+
+/// Capability proving that one pathname, mount, or creation-relevant metadata
+/// mutation owns the shared Linux namespace serialization domain.
 pub struct NamespaceOperationGuard {
-    _guard: BlockingMutexGuard<'static, ()>,
+    _guard: NamespaceOperationMutexGuard,
 }
 
 impl fmt::Debug for NamespaceOperationGuard {
@@ -142,7 +156,8 @@ enum ExpireProbe {
     Ready,
 }
 
-/// Serializes Linux mount-namespace mutations and constrained pathname walks.
+/// Serializes Linux mount/pathname mutations, constrained pathname walks, and
+/// mode/owner writes which must not race named-create admission.
 pub fn namespace_operation() -> NamespaceOperationGuard {
     NamespaceOperationGuard {
         _guard: MOUNT_NAMESPACE_OPERATION.lock(),
