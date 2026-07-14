@@ -11,7 +11,7 @@ use linux_raw_sys::{
 };
 
 use crate::{
-    file::{AfAlgSocket, FileLike, NetlinkSocket, Socket, af_alg, get_file_like},
+    file::{FileLike, PinnedSocketDescription, SocketBackendKind, af_alg},
     mm::{UserConstPtr, UserPtr},
     task::{AsThread, ns_capable},
 };
@@ -71,14 +71,6 @@ struct IptEntryHeader {
     next_offset: u16,
     comefrom: u32,
     counters: XtCounters,
-}
-
-fn socket_fd_error(fd: i32, err: AxError) -> AxError {
-    if err != AxError::BadFileDescriptor || get_file_like(fd).is_err() {
-        err
-    } else {
-        AxError::NotASocket
-    }
 }
 
 mod conv {
@@ -346,15 +338,16 @@ pub fn sys_getsockopt(
         val.cast().get_as_mut()
     }
 
-    if let Ok(socket) = NetlinkSocket::from_fd(fd) {
+    let pinned = PinnedSocketDescription::from_fd(fd)?;
+    if pinned.backend()? == SocketBackendKind::Netlink {
         if level != SOL_NETLINK {
             return Err(AxError::from(LinuxError::ENOPROTOOPT));
         }
-        *get::<u32>(optval, optlen)? = socket.get_option(optname)?;
+        *get::<u32>(optval, optlen)? = pinned.netlink()?.get_option(optname)?;
         return Ok(0);
     }
 
-    let socket = Socket::from_fd(fd).map_err(|err| socket_fd_error(fd, err))?;
+    let socket = pinned.network()?;
     macro_rules! dispatch {
         ($which:ident) => {
             socket.get_option(GetSocketOption::$which(get(optval, optlen)?))?;
@@ -398,7 +391,8 @@ pub fn sys_setsockopt(
         val.cast().get_as_ref()
     }
 
-    if let Ok(socket) = AfAlgSocket::from_fd(fd) {
+    let pinned = PinnedSocketDescription::from_fd(fd)?;
+    if pinned.backend()? == SocketBackendKind::AfAlg {
         if level != af_alg::SOL_ALG {
             return Err(AxError::from(LinuxError::ENOPROTOOPT));
         }
@@ -406,19 +400,21 @@ pub fn sys_setsockopt(
             return Err(AxError::from(LinuxError::ENOPROTOOPT));
         }
         let key = optval.get_as_slice(optlen as usize)?;
-        socket.set_alg_key(key)?;
+        pinned.af_alg()?.set_alg_key(key)?;
         return Ok(0);
     }
 
-    if let Ok(socket) = NetlinkSocket::from_fd(fd) {
+    if pinned.backend()? == SocketBackendKind::Netlink {
         if level != SOL_NETLINK {
             return Err(AxError::from(LinuxError::ENOPROTOOPT));
         }
-        socket.set_option(optname, *get::<u32>(optval, optlen)?)?;
+        pinned
+            .netlink()?
+            .set_option(optname, *get::<u32>(optval, optlen)?)?;
         return Ok(0);
     }
 
-    let socket = Socket::from_fd(fd).map_err(|err| socket_fd_error(fd, err))?;
+    let socket = pinned.network()?;
     if level == SOL_IPV6 && optname == IPV6_ADDRFORM {
         if *get::<i32>(optval, optlen)? as u32 != AF_INET {
             return Err(AxError::from(LinuxError::EAFNOSUPPORT));

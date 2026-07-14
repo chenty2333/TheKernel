@@ -1,4 +1,4 @@
-use alloc::{sync::Arc, vec::Vec};
+use alloc::vec::Vec;
 use core::{
     mem::{MaybeUninit, size_of},
     net::Ipv4Addr,
@@ -14,7 +14,7 @@ use axnet::{
 };
 use axtask::current;
 use linux_raw_sys::{
-    general::{O_NONBLOCK, O_PATH, timespec},
+    general::timespec,
     net::{
         MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_NOSIGNAL, MSG_OOB, MSG_PEEK,
         MSG_TRUNC, MSG_WAITALL, cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t,
@@ -25,9 +25,7 @@ use starry_vm::{vm_read_slice, vm_write_slice};
 
 use super::addr::SocketAddrExt;
 use crate::{
-    file::{
-        AfAlgSocket, File, FileDescription, FileLike, NetlinkSocket, Socket, get_file_description,
-    },
+    file::{FileLike, PinnedSocketDescription, SocketBackendKind},
     mm::{
         IoVec, IoVectorBuf, UserConstPtr, UserPtr, VmBytes, VmBytesMut, check_user_readable,
         check_user_writable,
@@ -47,100 +45,28 @@ const SUPPORTED_RECVMSG_FLAGS: u32 =
     MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_WAITALL | MSG_CMSG_CLOEXEC | MSG_ERRQUEUE | MSG_OOB;
 const SUPPORTED_SENDMSG_FLAGS: u32 = MSG_DONTWAIT | MSG_NOSIGNAL | MSG_OOB;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MessageSocketKind {
-    AfAlg,
-    Netlink,
-    Network,
+fn remember_socket_error(socket: &PinnedSocketDescription, error: AxError) {
+    if socket.backend() == Ok(SocketBackendKind::Network)
+        && let Ok(socket) = socket.network()
+    {
+        socket.set_pending_error(LinuxError::from(error));
+    }
 }
 
-/// One stable open-file-description snapshot for a whole mmsg operation.
-///
-/// Linux resolves the numeric fd once at syscall entry. Keeping the OFD alive
-/// here prevents a `CLONE_FILES` sibling from redirecting later batch elements
-/// (or a deferred error) by closing and reusing the same number.
-struct StableMessageSocket {
-    description: Arc<FileDescription>,
-    kind: MessageSocketKind,
-    nonblocking: bool,
-}
-
-impl StableMessageSocket {
-    fn from_fd(fd: i32) -> AxResult<Self> {
-        Self::from_description(get_file_description(fd)?)
+fn take_pending_socket_error(socket: &PinnedSocketDescription) -> AxResult {
+    if socket.backend()? != SocketBackendKind::Network {
+        return Ok(());
     }
-
-    fn from_description(description: Arc<FileDescription>) -> AxResult<Self> {
-        if description.status_flags() & O_PATH != 0 {
-            return Err(AxError::BadFileDescriptor);
-        }
-        let kind = if description.inner.downcast_ref::<AfAlgSocket>().is_some() {
-            MessageSocketKind::AfAlg
-        } else if description.inner.downcast_ref::<NetlinkSocket>().is_some() {
-            MessageSocketKind::Netlink
-        } else if description.inner.downcast_ref::<Socket>().is_some() {
-            MessageSocketKind::Network
-        } else {
-            if description
-                .inner
-                .downcast_ref::<File>()
-                .is_some_and(|file| file.inner().is_path())
-            {
-                return Err(AxError::BadFileDescriptor);
-            }
-            return Err(AxError::NotASocket);
-        };
-        let nonblocking = description.status_flags() & O_NONBLOCK != 0;
-        Ok(Self {
-            description,
-            kind,
-            nonblocking,
-        })
+    let mut error = 0;
+    socket
+        .network()?
+        .get_option(GetSocketOption::Error(&mut error))?;
+    if error == 0 {
+        return Ok(());
     }
-
-    fn af_alg(&self) -> AxResult<&AfAlgSocket> {
-        self.description
-            .inner
-            .downcast_ref::<AfAlgSocket>()
-            .ok_or(AxError::BadState)
-    }
-
-    fn netlink(&self) -> AxResult<&NetlinkSocket> {
-        self.description
-            .inner
-            .downcast_ref::<NetlinkSocket>()
-            .ok_or(AxError::BadState)
-    }
-
-    fn network(&self) -> AxResult<&Socket> {
-        self.description
-            .inner
-            .downcast_ref::<Socket>()
-            .ok_or(AxError::BadState)
-    }
-
-    fn remember_error(&self, error: AxError) {
-        if self.kind == MessageSocketKind::Network
-            && let Ok(socket) = self.network()
-        {
-            socket.set_pending_error(LinuxError::from(error));
-        }
-    }
-
-    fn take_pending_error(&self) -> AxResult {
-        if self.kind != MessageSocketKind::Network {
-            return Ok(());
-        }
-        let mut error = 0;
-        self.network()?
-            .get_option(GetSocketOption::Error(&mut error))?;
-        if error == 0 {
-            return Ok(());
-        }
-        Err(LinuxError::try_from(error)
-            .map_err(|_| AxError::BadState)?
-            .into())
-    }
+    Err(LinuxError::try_from(error)
+        .map_err(|_| AxError::BadState)?
+        .into())
 }
 
 fn admitted_sendmmsg_vlen(vlen: u32) -> Option<usize> {
@@ -309,11 +235,11 @@ fn recvmmsg_defers_error(error: AxError) -> bool {
     error != AxError::WouldBlock
 }
 
-fn remember_recvmmsg_error(socket: &StableMessageSocket, error: AxError) {
+fn remember_recvmmsg_error(socket: &PinnedSocketDescription, error: AxError) {
     if !recvmmsg_defers_error(error) {
         return;
     }
-    socket.remember_error(error);
+    remember_socket_error(socket, error);
 }
 
 const fn rights_push_was_truncated(expected: usize, result: super::cmsg::RightsPushResult) -> bool {
@@ -325,7 +251,7 @@ fn should_raise_sigpipe(error: AxError, flags: u32) -> bool {
 }
 
 fn send_impl(
-    socket: &StableMessageSocket,
+    socket: &PinnedSocketDescription,
     fd: i32,
     mut src: impl Read + IoBuf,
     flags: u32,
@@ -334,7 +260,7 @@ fn send_impl(
     cmsg: Vec<CMsgData>,
 ) -> AxResult<isize> {
     let send_flags = validate_sendmsg_flags(flags)?;
-    if socket.kind == MessageSocketKind::Netlink {
+    if socket.backend()? == SocketBackendKind::Netlink {
         let socket = socket.netlink()?;
         debug!("sys_send <= fd: {fd}, flags: {flags}, netlink");
         if !cmsg.is_empty() {
@@ -351,10 +277,10 @@ fn send_impl(
 
     debug!("sys_send <= fd: {fd}, flags: {flags}, addr: {addr:?}");
 
-    if socket.kind != MessageSocketKind::Network {
+    if socket.backend()? != SocketBackendKind::Network {
         return Err(AxError::NotASocket);
     }
-    let nonblocking = socket.nonblocking;
+    let nonblocking = socket.nonblocking();
     let socket = socket.network()?;
     let pathname = match (&socket.inner, &addr) {
         (AxSocket::Unix(_), Some(SocketAddrEx::Unix(UnixSocketAddr::Path(path)))) => {
@@ -400,7 +326,7 @@ pub fn sys_sendto(
     if len != 0 {
         check_user_readable(buf as usize, len)?;
     }
-    let socket = StableMessageSocket::from_fd(fd)?;
+    let socket = PinnedSocketDescription::from_fd(fd)?;
     send_impl(
         &socket,
         fd,
@@ -413,13 +339,13 @@ pub fn sys_sendto(
 }
 
 fn sendmsg_with_socket(
-    socket: &StableMessageSocket,
+    socket: &PinnedSocketDescription,
     fd: i32,
     msg: UserConstPtr<msghdr>,
     flags: u32,
 ) -> AxResult<isize> {
     let msg = read_user_copy(msg)?;
-    if socket.kind == MessageSocketKind::AfAlg {
+    if socket.backend()? == SocketBackendKind::AfAlg {
         let socket = socket.af_alg()?;
         debug!("sys_sendmsg <= fd: {fd}, flags: {flags}, af_alg");
         if flags != 0 {
@@ -444,12 +370,12 @@ fn sendmsg_with_socket(
 }
 
 pub fn sys_sendmsg(fd: i32, msg: UserConstPtr<msghdr>, flags: u32) -> AxResult<isize> {
-    let socket = StableMessageSocket::from_fd(fd)?;
+    let socket = PinnedSocketDescription::from_fd(fd)?;
     sendmsg_with_socket(&socket, fd, msg, flags)
 }
 
 fn recv_impl(
-    socket: &StableMessageSocket,
+    socket: &PinnedSocketDescription,
     fd: i32,
     mut dst: impl Write + IoBufMut,
     recv_flags: RecvFlags,
@@ -460,8 +386,8 @@ fn recv_impl(
 ) -> AxResult<(isize, bool)> {
     debug!("sys_recv <= fd: {fd}, flags: {recv_flags:?}");
 
-    if socket.kind == MessageSocketKind::Netlink {
-        let nonblocking = socket.nonblocking;
+    if socket.backend()? == SocketBackendKind::Netlink {
+        let nonblocking = socket.nonblocking();
         let netlink = socket.netlink()?;
         let recv =
             netlink.recv_from_with_nonblocking(&mut dst, recv_flags, addr, addrlen, nonblocking)?;
@@ -469,10 +395,10 @@ fn recv_impl(
         return Ok((recv as isize, false));
     }
 
-    if socket.kind != MessageSocketKind::Network {
+    if socket.backend()? != SocketBackendKind::Network {
         return Err(AxError::NotASocket);
     }
-    let nonblocking = socket.nonblocking;
+    let nonblocking = socket.nonblocking();
     let socket = socket.network()?;
     let mut cmsg = Vec::new();
 
@@ -540,7 +466,7 @@ pub fn sys_recvfrom(
             addrlen_ptr.address().as_usize(),
         ))?)
     };
-    let socket = StableMessageSocket::from_fd(fd)?;
+    let socket = PinnedSocketDescription::from_fd(fd)?;
     let (recv, _control_truncated) = recv_impl(
         &socket,
         fd,
@@ -558,7 +484,7 @@ pub fn sys_recvfrom(
 }
 
 fn recvmsg_with_socket(
-    socket: &StableMessageSocket,
+    socket: &PinnedSocketDescription,
     fd: i32,
     msg: UserPtr<msghdr>,
     flags: u32,
@@ -622,14 +548,14 @@ fn recvmsg_with_socket(
 
 pub fn sys_recvmsg(fd: i32, msg: UserPtr<msghdr>, flags: u32) -> AxResult<isize> {
     let recv_flags = validate_recvmsg_flags(flags)?;
-    let socket = StableMessageSocket::from_fd(fd)?;
+    let socket = PinnedSocketDescription::from_fd(fd)?;
     recvmsg_with_socket(&socket, fd, msg, flags, recv_flags)
 }
 
 pub fn sys_sendmmsg(fd: i32, msgvec: UserPtr<mmsghdr>, vlen: u32, flags: u32) -> AxResult<isize> {
     // Linux validates and pins the socket even when there are no elements; a
     // zero vlen only suppresses access to msgvec itself.
-    let socket = StableMessageSocket::from_fd(fd)?;
+    let socket = PinnedSocketDescription::from_fd(fd)?;
     let Some(vlen) = admitted_sendmmsg_vlen(vlen) else {
         return Ok(0);
     };
@@ -682,13 +608,13 @@ pub fn sys_recvmmsg(
     // The timeout object is imported before Linux enters do_recvmmsg(), even
     // for vlen zero. Pin the endpoint next, then skip only msgvec processing.
     let has_timeout = recvmmsg_has_timeout(timeout)?;
-    let socket = StableMessageSocket::from_fd(fd)?;
+    let socket = PinnedSocketDescription::from_fd(fd)?;
     // do_recvmmsg() consumes sk_err before checking vlen, so a zero-length
     // batch still reports (and clears) a deferred error from an earlier batch.
     // MSG_ERRQUEUE is the exception: it reads the error queue rather than
     // consuming the ordinary one-shot socket error.
     if recvmmsg_consumes_pending_error(flags) {
-        socket.take_pending_error()?;
+        take_pending_socket_error(&socket)?;
     }
     let Some(vlen) = admitted_recvmmsg_vlen(vlen) else {
         return Ok(0);

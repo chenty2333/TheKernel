@@ -5,7 +5,7 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use super::addr::SocketAddrExt;
 use crate::{
-    file::{FileLike, NetlinkSocket, Socket},
+    file::{PinnedSocketDescription, SocketBackendKind},
     mm::UserPtr,
 };
 
@@ -29,13 +29,14 @@ pub fn sys_getsockname(
     addrlen: UserPtr<socklen_t>,
 ) -> AxResult<isize> {
     let mut length = read_socklen(addrlen)?;
-    if let Ok(socket) = NetlinkSocket::from_fd(fd) {
-        socket.write_local_addr(addr, &mut length)?;
+    let pinned = PinnedSocketDescription::from_fd(fd)?;
+    if pinned.backend()? == SocketBackendKind::Netlink {
+        pinned.netlink()?.write_local_addr(addr, &mut length)?;
         write_socklen(addrlen, length)?;
         return Ok(0);
     }
 
-    let socket = Socket::from_fd(fd)?;
+    let socket = pinned.network()?;
     let local_addr = socket.local_addr()?;
     debug!("sys_getsockname <= fd: {fd}, addr: {local_addr:?}");
 
@@ -50,7 +51,8 @@ pub fn sys_getpeername(
     addrlen: UserPtr<socklen_t>,
 ) -> AxResult<isize> {
     let mut length = read_socklen(addrlen)?;
-    let socket = Socket::from_fd(fd)?;
+    let pinned = PinnedSocketDescription::from_fd(fd)?;
+    let socket = pinned.network()?;
     let peer_addr = socket.peer_addr()?;
     debug!("sys_getpeername <= fd: {fd}, addr: {peer_addr:?}");
 

@@ -28,6 +28,7 @@ pub(crate) mod xattr_provider;
 mod desc;
 mod fd_table;
 mod metadata;
+mod socket;
 mod stdio;
 mod types;
 
@@ -53,4 +54,5 @@ pub(crate) use self::{
         validate_symlink_target,
     },
     metadata::{PseudoInode, anon_inode_stat},
+    socket::{PinnedSocketDescription, SocketBackendKind},
 };
