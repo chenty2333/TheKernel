@@ -113,13 +113,6 @@ impl Cred {
         Self::try_from_core_transition(old, core, CredentialStateTransition::UserNamespace)
     }
 
-    pub(crate) fn try_with_user_ns(
-        old: &Arc<Self>,
-        user_ns: Arc<UserNamespace>,
-    ) -> AxResult<Arc<Self>> {
-        Self::try_with_user_namespace(old, user_ns)
-    }
-
     fn try_from_core_transition(
         old: &Arc<Self>,
         core: Arc<CoreCred>,
@@ -171,7 +164,7 @@ impl Cred {
     }
 
     pub(crate) fn fs_dac_credentials(&self) -> DacCredentialView {
-        self.core.fs_dac_credentials()
+        self.core.fs_credential_snapshot()
     }
 
     pub(crate) fn has_effective_capability(&self, capability: u32) -> bool {

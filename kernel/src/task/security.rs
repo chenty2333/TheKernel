@@ -3551,7 +3551,8 @@ mod tests {
             )
             .unwrap();
         let target_parent = credential_with_identity_and_caps(&root, 1000, &[], &[]);
-        let target = Cred::try_with_user_ns(&target_parent, child_namespace.clone()).unwrap();
+        let target =
+            Cred::try_with_user_namespace(&target_parent, child_namespace.clone()).unwrap();
         let actor = credential_with_caps(&root, &[CAP_SYS_PTRACE], &[CAP_SYS_PTRACE]);
         let unprivileged_actor = credential_with_caps(&root, &[CAP_SYS_PTRACE], &[]);
         let image = Arc::new(());
@@ -3582,7 +3583,7 @@ mod tests {
         let child_namespace = root_namespace
             .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
             .unwrap();
-        let target = Cred::try_with_user_ns(&root, child_namespace).unwrap();
+        let target = Cred::try_with_user_namespace(&root, child_namespace).unwrap();
         let first_image = Arc::new(());
         let second_image = Arc::new(());
         let first = ProcessImageSecurityRef::new(&root_namespace, &first_image);
@@ -3605,7 +3606,7 @@ mod tests {
             )
             .unwrap();
         let child_parent = credential_with_identity_and_caps(&root, 1000, &[], &[]);
-        let child_root = Cred::try_with_user_ns(&child_parent, child_namespace).unwrap();
+        let child_root = Cred::try_with_user_namespace(&child_parent, child_namespace).unwrap();
         let actor =
             credential_with_identity_and_caps(&child_root, 1000, &[CAP_SYS_NICE], &[CAP_SYS_NICE]);
 
@@ -3627,7 +3628,7 @@ mod tests {
         let child_namespace = root_namespace
             .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
             .unwrap();
-        let child_root = Cred::try_with_user_ns(&actor, child_namespace).unwrap();
+        let child_root = Cred::try_with_user_namespace(&actor, child_namespace).unwrap();
         let target = credential_with_identity_and_caps(&child_root, 1000, &[], &[]);
 
         dispatch_scheduler(&scheduler_context(
@@ -4049,7 +4050,7 @@ mod tests {
         let child_namespace = old.user_ns().try_fork(ids.euid, ids.egid, false).unwrap();
         CRED_STATE_TRANSITION_MASK.store(0, Ordering::SeqCst);
 
-        let child = Cred::try_with_user_ns(&old, child_namespace).unwrap();
+        let child = Cred::try_with_user_namespace(&old, child_namespace).unwrap();
         assert_eq!(CRED_STATE_TRANSITION_MASK.load(Ordering::SeqCst), 1 << 2);
         drop(child);
 

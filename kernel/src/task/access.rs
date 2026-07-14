@@ -518,8 +518,8 @@ mod tests {
         let child_b = root_ns
             .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
             .unwrap();
-        let sibling_actor = Cred::try_with_user_ns(&root_cred, child_a).unwrap();
-        let sibling_target = Cred::try_with_user_ns(&root_cred, child_b.clone()).unwrap();
+        let sibling_actor = Cred::try_with_user_namespace(&root_cred, child_a).unwrap();
+        let sibling_target = Cred::try_with_user_namespace(&root_cred, child_b.clone()).unwrap();
         assert!(!ptrace_core_allows(
             &sibling_actor,
             &sibling_target,
@@ -616,9 +616,10 @@ mod tests {
         let owner = publish_ids(&owner_slot, 1000, 100);
         let sibling_owner_slot = CredentialSlot::new(root_cred.clone());
         let sibling_owner = publish_ids(&sibling_owner_slot, 2000, 200);
-        let child_cred = Cred::try_with_user_ns(&owner, child.clone()).unwrap();
-        let sibling_cred = Cred::try_with_user_ns(&sibling_owner, sibling.clone()).unwrap();
-        let grandchild_cred = Cred::try_with_user_ns(&child_cred, grandchild.clone()).unwrap();
+        let child_cred = Cred::try_with_user_namespace(&owner, child.clone()).unwrap();
+        let sibling_cred = Cred::try_with_user_namespace(&sibling_owner, sibling.clone()).unwrap();
+        let grandchild_cred =
+            Cred::try_with_user_namespace(&child_cred, grandchild.clone()).unwrap();
 
         assert!(ns_capable(&root_cred, &root, CAP_KILL));
         assert!(ns_capable(&root_cred, &child, CAP_KILL));
@@ -687,12 +688,12 @@ mod tests {
         let sibling = root.try_fork(kuid(2000), kgid(200), false).unwrap();
         let child_parent_slot = CredentialSlot::new(root_cred.clone());
         let child_parent = publish_ids(&child_parent_slot, 1000, 100);
-        let child_actor = Cred::try_with_user_ns(&child_parent, child.clone()).unwrap();
+        let child_actor = Cred::try_with_user_namespace(&child_parent, child.clone()).unwrap();
         let child_target_slot = CredentialSlot::new(child_actor.clone());
         let child_target = publish_ids(&child_target_slot, 3000, 300);
         let sibling_parent_slot = CredentialSlot::new(root_cred.clone());
         let sibling_parent = publish_ids(&sibling_parent_slot, 2000, 200);
-        let sibling_cred = Cred::try_with_user_ns(&sibling_parent, sibling).unwrap();
+        let sibling_cred = Cred::try_with_user_namespace(&sibling_parent, sibling).unwrap();
         let sibling_target_slot = CredentialSlot::new(sibling_cred);
         let sibling_target = publish_ids(&sibling_target_slot, 3000, 300);
 
@@ -805,8 +806,8 @@ mod tests {
         let child_parent = publish_ids(&child_parent_slot, 1000, 100);
         let sibling_parent_slot = CredentialSlot::new(root_cred.clone());
         let sibling_parent = publish_ids(&sibling_parent_slot, 2000, 200);
-        let child_cred = Cred::try_with_user_ns(&child_parent, child.clone()).unwrap();
-        let sibling_cred = Cred::try_with_user_ns(&sibling_parent, sibling).unwrap();
+        let child_cred = Cred::try_with_user_namespace(&child_parent, child.clone()).unwrap();
+        let sibling_cred = Cred::try_with_user_namespace(&sibling_parent, sibling).unwrap();
         let root_uts = UtsNamespace::try_new_root(root).unwrap();
         let child_uts = UtsNamespace::try_new_root(child).unwrap();
 
@@ -875,7 +876,7 @@ mod tests {
         let owner_slot = CredentialSlot::new(root_cred.clone());
         let owner = publish_ids(&owner_slot, 1000, 100);
         let child = root.try_fork(kuid(1000), kgid(100), false).unwrap();
-        let child_opener = Cred::try_with_user_ns(&owner, child.clone()).unwrap();
+        let child_opener = Cred::try_with_user_namespace(&owner, child.clone()).unwrap();
 
         let uid_row = [IdMapInputExtent::new(0, 1000, 1)];
         assert!(may_write_uid_map(

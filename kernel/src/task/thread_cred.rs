@@ -637,8 +637,9 @@ mod tests {
             )
             .unwrap();
 
-        let slot =
-            CredentialSlot::new(Cred::try_with_user_ns(&initial_cred, child.clone()).unwrap());
+        let slot = CredentialSlot::new(
+            Cred::try_with_user_namespace(&initial_cred, child.clone()).unwrap(),
+        );
         let mut update = slot.prepare();
         update.builder.ids = ids(kuid(1000), kgid(100));
         let cred = update.finish().unwrap().commit();

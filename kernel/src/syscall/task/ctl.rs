@@ -1200,7 +1200,7 @@ mod tests {
         let child = root
             .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
             .unwrap();
-        let actor = Cred::try_with_user_ns(&root_cred, child.clone()).unwrap();
+        let actor = Cred::try_with_user_namespace(&root_cred, child.clone()).unwrap();
 
         let owner = unshare_namespace_owner(CLONE_NEWUTS | CLONE_NEWTIME, &actor).unwrap();
         assert!(Arc::ptr_eq(&owner, &child));

@@ -358,7 +358,7 @@ impl CloneArgs {
                 ids.egid,
                 parent_cred.has_effective_capability_in_own_user_ns(CAP_SETFCAP),
             )?;
-            Cred::try_with_user_ns(&parent_cred, user_ns)?
+            Cred::try_with_user_namespace(&parent_cred, user_ns)?
         } else if flags.contains(CloneFlags::THREAD) {
             parent_cred
         } else {
@@ -928,7 +928,7 @@ mod tests {
         let child = root
             .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
             .unwrap();
-        let child_cred = Cred::try_with_user_ns(&parent_cred, child.clone()).unwrap();
+        let child_cred = Cred::try_with_user_namespace(&parent_cred, child.clone()).unwrap();
         let flags = CloneFlags::NEWUSER
             | CloneFlags::NEWCGROUP
             | CloneFlags::NEWUTS

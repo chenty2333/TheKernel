@@ -539,7 +539,7 @@ mod credential_caller_tests {
         let child_ns = root_ns
             .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
             .unwrap();
-        let child_cred = Cred::try_with_user_ns(&root_cred, child_ns.clone()).unwrap();
+        let child_cred = Cred::try_with_user_namespace(&root_cred, child_ns.clone()).unwrap();
 
         let child_over_root = IpcAccessContext::new(child_cred, root_ns.clone());
         assert!(!child_over_root.authority.access_override);
