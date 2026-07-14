@@ -3,7 +3,7 @@ use core::{ffi::c_int, ops::Deref, task::Context};
 
 use axerrno::{AxError, AxResult};
 use axnet::{
-    RecvOptions, SendOptions, Socket as SocketInner, SocketOps,
+    RecvOptions, SendOptions, Socket as SocketInner, SocketOps, SocketTransferDirection,
     options::{Configurable, SetSocketOption},
 };
 use axpoll::{IoEvents, Pollable};
@@ -60,6 +60,44 @@ impl Socket {
         &self.net_ns
     }
 
+    pub(crate) fn read_with_nonblocking(
+        &self,
+        dst: &mut IoDst,
+        nonblocking: bool,
+    ) -> AxResult<usize> {
+        self.recv(
+            dst,
+            RecvOptions {
+                nonblocking_override: Some(nonblocking),
+                ..RecvOptions::default()
+            },
+        )
+    }
+
+    pub(crate) fn write_with_nonblocking(
+        &self,
+        src: &mut IoSrc,
+        nonblocking: bool,
+    ) -> AxResult<usize> {
+        self.send(
+            src,
+            SendOptions {
+                nonblocking_override: Some(nonblocking),
+                ..SendOptions::default()
+            },
+        )
+    }
+
+    pub(crate) fn retry_transfer<T>(
+        &self,
+        direction: SocketTransferDirection,
+        effective_nonblocking: bool,
+        attempt: impl FnMut() -> AxResult<T>,
+    ) -> AxResult<T> {
+        self.inner
+            .retry_transfer(direction, effective_nonblocking, attempt)
+    }
+
     pub fn set_bpf_filter(&self, prog: Option<Arc<BpfProgram>>) -> AxResult<()> {
         let filter = prog
             .map(|prog| {
@@ -101,11 +139,11 @@ impl Socket {
 
 impl FileLike for Socket {
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
-        self.recv(dst, RecvOptions::default())
+        self.read_with_nonblocking(dst, self.nonblocking())
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
-        self.send(src, SendOptions::default())
+        self.write_with_nonblocking(src, self.nonblocking())
     }
 
     fn stat(&self) -> AxResult<Kstat> {

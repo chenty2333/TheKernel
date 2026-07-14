@@ -149,6 +149,19 @@ pub struct SendOptions {
     pub flags: SendFlags,
     /// Ancillary control messages.
     pub cmsg: Vec<CMsgData>,
+    /// Exact per-operation nonblocking state captured by a caller.
+    ///
+    /// `None` samples the socket's ordinary mutable state at operation entry.
+    /// `Some(false)` deliberately overrides a concurrently changed backend
+    /// mirror; [`SendFlags::DONT_WAIT`] still forces nonblocking behavior.
+    pub nonblocking_override: Option<bool>,
+}
+
+impl SendOptions {
+    pub(crate) fn effective_nonblocking(&self, socket_nonblocking: bool) -> bool {
+        self.flags.contains(SendFlags::DONT_WAIT)
+            || self.nonblocking_override.unwrap_or(socket_nonblocking)
+    }
 }
 
 /// Options for receiving data from a socket.
@@ -162,6 +175,17 @@ pub struct RecvOptions<'a> {
     pub flags: RecvFlags,
     /// If set, ancillary control messages are appended here.
     pub cmsg: Option<&'a mut Vec<CMsgData>>,
+    /// Exact per-operation nonblocking state captured by a caller.
+    ///
+    /// `None` samples the socket's ordinary mutable state at operation entry.
+    /// [`RecvFlags::DONT_WAIT`] always forces nonblocking behavior.
+    pub nonblocking_override: Option<bool>,
+}
+impl RecvOptions<'_> {
+    pub(crate) fn effective_nonblocking(&self, socket_nonblocking: bool) -> bool {
+        self.flags.contains(RecvFlags::DONT_WAIT)
+            || self.nonblocking_override.unwrap_or(socket_nonblocking)
+    }
 }
 impl Debug for RecvOptions<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -181,6 +205,15 @@ pub enum Shutdown {
     Write,
     /// Shut down both halves.
     Both,
+}
+
+/// Socket endpoint direction used by a composite transfer retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SocketTransferDirection {
+    /// The socket supplies bytes to another endpoint.
+    Receive,
+    /// The socket accepts bytes from another endpoint.
+    Send,
 }
 impl Shutdown {
     /// Returns `true` if the read half should be shut down.
@@ -266,6 +299,33 @@ impl Pollable for Socket {
 }
 
 impl Socket {
+    /// Runs a composite transfer attempt under this socket's directional
+    /// blocking, timeout, pending-error, and readiness policy.
+    ///
+    /// `Err(AxError::WouldBlock)` from `attempt` means that this socket endpoint
+    /// needs readiness and is retried by the socket poller. A caller can encode
+    /// an opposite-endpoint `WouldBlock` as any successful `T`; that completes
+    /// the poller so the outer transfer driver can attribute and wait on the
+    /// other endpoint without resetting this socket operation's deadline.
+    pub fn retry_transfer<T>(
+        &self,
+        direction: SocketTransferDirection,
+        effective_nonblocking: bool,
+        mut attempt: impl FnMut() -> AxResult<T>,
+    ) -> AxResult<T> {
+        match self {
+            Socket::Tcp(tcp) => tcp.retry_transfer(direction, effective_nonblocking, &mut attempt),
+            Socket::Udp(udp) => udp.retry_transfer(direction, effective_nonblocking, &mut attempt),
+            Socket::Unix(unix) => {
+                unix.retry_transfer(direction, effective_nonblocking, &mut attempt)
+            }
+            #[cfg(feature = "vsock")]
+            Socket::Vsock(vsock) => {
+                vsock.retry_transfer(direction, effective_nonblocking, &mut attempt)
+            }
+        }
+    }
+
     /// Stores an error for one-shot SO_ERROR reporting and the next operation
     /// that consumes deferred socket errors.
     pub fn set_pending_error(&self, error: LinuxError) {

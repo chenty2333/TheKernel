@@ -20,7 +20,7 @@ use smoltcp::{
 use spin::RwLock;
 
 use crate::{
-    RecvFlags, RecvOptions, SendFlags, SendOptions, Shutdown, SocketAddrEx, SocketOps,
+    RecvFlags, RecvOptions, SendOptions, Shutdown, SocketAddrEx, SocketOps,
     buffer::{
         normalized_socket_buffer_size, try_filled_buffer, try_zeroed_socket_buffer,
         udp_packet_slots,
@@ -80,6 +80,16 @@ pub struct UdpSocket {
 impl UdpSocket {
     pub(crate) fn set_pending_error(&self, error: LinuxError) {
         self.general.set_pending_error(error);
+    }
+
+    pub(crate) fn retry_transfer<T>(
+        &self,
+        direction: crate::SocketTransferDirection,
+        effective_nonblocking: bool,
+        attempt: &mut impl FnMut() -> AxResult<T>,
+    ) -> AxResult<T> {
+        self.general
+            .transfer_poller(self, direction, effective_nonblocking, attempt)
     }
 
     /// Creates a new UDP socket bound to the given network stack.
@@ -302,7 +312,7 @@ impl SocketOps for UdpSocket {
         if !options.cmsg.is_empty() {
             return Err(AxError::OperationNotSupported);
         }
-        let per_call_nonblocking = options.flags.contains(SendFlags::DONT_WAIT);
+        let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
         if self.tx_shutdown.load(Ordering::Acquire) {
             return Err(AxError::BrokenPipe);
         }
@@ -340,9 +350,10 @@ impl SocketOps for UdpSocket {
             )))?;
         }
         self.remember_reported_local_addr(source_addr);
-        let sent = self
-            .general
-            .send_poller_with_nonblocking(self, per_call_nonblocking, || {
+        let sent = self.general.send_poller_with_effective_nonblocking(
+            self,
+            effective_nonblocking,
+            || {
                 self.stack.poll_interfaces();
                 self.with_smol_socket(|socket| {
                     if !socket.is_open() {
@@ -370,7 +381,8 @@ impl SocketOps for UdpSocket {
                         Ok(payload.len())
                     }
                 })
-            })?;
+            },
+        )?;
 
         // Push freshly queued datagrams through the interface/router path so
         // loopback receivers observe readiness immediately.
@@ -393,14 +405,14 @@ impl SocketOps for UdpSocket {
             Any(&'a mut SocketAddrEx),
             Expecting(IpEndpoint),
         }
+        let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
         let mut expected_remote = match options.from {
             Some(addr) => ExpectedRemote::Any(addr),
             None => ExpectedRemote::Expecting(self.remote_endpoint()?.0),
         };
 
-        let per_call_nonblocking = options.flags.contains(RecvFlags::DONT_WAIT);
         self.general
-            .recv_poller_with_nonblocking(self, per_call_nonblocking, || {
+            .recv_poller_with_effective_nonblocking(self, effective_nonblocking, || {
                 self.stack.poll_interfaces();
                 self.with_smol_socket(|socket| {
                     if !socket.is_open() {

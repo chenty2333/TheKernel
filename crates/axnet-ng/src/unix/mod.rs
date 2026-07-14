@@ -100,6 +100,20 @@ impl Pollable for Transport {
 }
 
 impl Transport {
+    fn retry_transfer<T>(
+        &self,
+        direction: crate::SocketTransferDirection,
+        effective_nonblocking: bool,
+        attempt: &mut impl FnMut() -> AxResult<T>,
+    ) -> AxResult<T> {
+        match self {
+            Self::Stream(stream) => {
+                stream.retry_transfer(direction, effective_nonblocking, attempt)
+            }
+            Self::Dgram(dgram) => dgram.retry_transfer(direction, effective_nonblocking, attempt),
+        }
+    }
+
     fn rollback_bind(&self, slot: &BindSlot) {
         match self {
             Self::Stream(stream) => stream.rollback_bind(slot),
@@ -510,6 +524,16 @@ impl UnixSocket {
         }
     }
 
+    pub(crate) fn retry_transfer<T>(
+        &self,
+        direction: crate::SocketTransferDirection,
+        effective_nonblocking: bool,
+        attempt: &mut impl FnMut() -> AxResult<T>,
+    ) -> AxResult<T> {
+        self.transport
+            .retry_transfer(direction, effective_nonblocking, attempt)
+    }
+
     #[cfg(test)]
     fn is_bound(&self) -> bool {
         self.bind_state.load(Ordering::Acquire) != ENDPOINT_UNBOUND
@@ -692,6 +716,11 @@ impl UnixSocket {
             Transport::Stream(stream) => stream.is_connected(),
             Transport::Dgram(dgram) => dgram.is_connected(),
         }
+    }
+
+    /// Reports whether this socket preserves datagram message boundaries.
+    pub fn is_datagram(&self) -> bool {
+        matches!(&self.transport, Transport::Dgram(_))
     }
 
     pub(crate) fn set_pending_error(&self, error: LinuxError) {
@@ -1005,6 +1034,7 @@ mod tests {
                     cmsg: alloc::vec![
                         CMsgData::new(Box::new(RollbackDropProbe(drops.clone())), 1,)
                     ],
+                    nonblocking_override: None,
                 },
                 target.clone(),
             )

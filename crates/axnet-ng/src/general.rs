@@ -13,6 +13,7 @@ use axpoll::{
 use axtask::future::{TimeoutError, block_on, interruptible, timeout_at};
 
 use crate::{
+    SocketTransferDirection,
     net_stack::NetStack,
     options::{Configurable, GetSocketOption, SetSocketOption},
 };
@@ -67,7 +68,7 @@ const fn receive_timeout_error() -> AxError {
 #[derive(Clone, Copy)]
 struct PollBehavior {
     timeout_error: AxError,
-    per_call_nonblocking: bool,
+    effective_nonblocking: bool,
     consume_pending_error: bool,
 }
 
@@ -191,17 +192,17 @@ impl GeneralOptions {
             self.send_timeout(),
             PollBehavior {
                 timeout_error: AxError::TimedOut,
-                per_call_nonblocking: false,
+                effective_nonblocking: self.nonblocking(),
                 consume_pending_error: false,
             },
             f,
         )
     }
 
-    pub fn send_poller_with_nonblocking<P: Pollable, F: FnMut() -> AxResult<T>, T>(
+    pub fn send_poller_with_effective_nonblocking<P: Pollable, F: FnMut() -> AxResult<T>, T>(
         &self,
         pollable: &P,
-        per_call_nonblocking: bool,
+        effective_nonblocking: bool,
         f: F,
     ) -> AxResult<T> {
         // Linux's data-send paths consume sk_err before attempting to publish
@@ -213,7 +214,7 @@ impl GeneralOptions {
             self.send_timeout(),
             PollBehavior {
                 timeout_error: AxError::TimedOut,
-                per_call_nonblocking,
+                effective_nonblocking,
                 consume_pending_error: true,
             },
             f,
@@ -234,17 +235,47 @@ impl GeneralOptions {
         per_call_nonblocking: bool,
         f: F,
     ) -> AxResult<T> {
+        self.recv_poller_with_effective_nonblocking(
+            pollable,
+            self.nonblocking() || per_call_nonblocking,
+            f,
+        )
+    }
+
+    pub fn recv_poller_with_effective_nonblocking<P: Pollable, F: FnMut() -> AxResult<T>, T>(
+        &self,
+        pollable: &P,
+        effective_nonblocking: bool,
+        f: F,
+    ) -> AxResult<T> {
         self.run_poller(
             pollable,
             IoEvents::READABLE,
             self.recv_timeout(),
             PollBehavior {
                 timeout_error: receive_timeout_error(),
-                per_call_nonblocking,
+                effective_nonblocking,
                 consume_pending_error: true,
             },
             f,
         )
+    }
+
+    pub fn transfer_poller<P: Pollable, F: FnMut() -> AxResult<T>, T>(
+        &self,
+        pollable: &P,
+        direction: SocketTransferDirection,
+        effective_nonblocking: bool,
+        f: F,
+    ) -> AxResult<T> {
+        match direction {
+            SocketTransferDirection::Receive => {
+                self.recv_poller_with_effective_nonblocking(pollable, effective_nonblocking, f)
+            }
+            SocketTransferDirection::Send => {
+                self.send_poller_with_effective_nonblocking(pollable, effective_nonblocking, f)
+            }
+        }
     }
 
     fn run_poller<P: Pollable, F: FnMut() -> AxResult<T>, T>(
@@ -267,8 +298,7 @@ impl GeneralOptions {
                 self.consume_pending_error()?;
             }
             match f() {
-                Err(AxError::WouldBlock)
-                    if !self.nonblocking() && !behavior.per_call_nonblocking => {}
+                Err(AxError::WouldBlock) if !behavior.effective_nonblocking => {}
                 other => return other,
             }
 
@@ -397,7 +427,7 @@ impl Configurable for GeneralOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::options::{Configurable, GetSocketOption};
+    use crate::options::{Configurable, GetSocketOption, SetSocketOption};
 
     struct Ready;
 
@@ -475,7 +505,7 @@ mod tests {
 
         let mut attempted = false;
         let error = options
-            .send_poller_with_nonblocking(&Ready, false, || {
+            .send_poller_with_effective_nonblocking(&Ready, false, || {
                 attempted = true;
                 Ok(1usize)
             })
@@ -487,7 +517,7 @@ mod tests {
         assert!(!events.contains(IoEvents::ERROR));
 
         assert_eq!(
-            options.send_poller_with_nonblocking(&Ready, false, || Ok(1usize)),
+            options.send_poller_with_effective_nonblocking(&Ready, false, || Ok(1usize)),
             Ok(1)
         );
     }
@@ -497,7 +527,7 @@ mod tests {
         let options = GeneralOptions::new();
         let mut attempts = 0;
         let error = options
-            .send_poller_with_nonblocking(&Ready, false, || {
+            .send_poller_with_effective_nonblocking(&Ready, false, || {
                 attempts += 1;
                 options.set_pending_error(LinuxError::ECONNREFUSED);
                 Err::<usize, _>(AxError::WouldBlock)
@@ -506,5 +536,82 @@ mod tests {
 
         assert_eq!(LinuxError::from(error), LinuxError::ECONNREFUSED);
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn exact_nonblocking_override_is_not_resampled_from_backend() {
+        let options = GeneralOptions::new();
+        options
+            .set_option(SetSocketOption::NonBlocking(&true))
+            .unwrap();
+        let mut attempts = 0;
+        assert_eq!(
+            options.send_poller_with_effective_nonblocking(&Ready, false, || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(AxError::WouldBlock)
+                } else {
+                    Ok(7usize)
+                }
+            }),
+            Ok(7)
+        );
+        assert_eq!(attempts, 2);
+
+        options
+            .set_option(SetSocketOption::NonBlocking(&false))
+            .unwrap();
+        attempts = 0;
+        assert_eq!(
+            options.send_poller_with_effective_nonblocking(&Ready, true, || {
+                attempts += 1;
+                Err::<usize, _>(AxError::WouldBlock)
+            }),
+            Err(AxError::WouldBlock)
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum TransferAttempt {
+        OppositeEndpointBlocked,
+    }
+
+    #[test]
+    fn transfer_poller_returns_wrapped_opposite_endpoint_block() {
+        let options = GeneralOptions::new();
+        let mut attempts = 0;
+
+        let outcome = options
+            .transfer_poller(&Ready, SocketTransferDirection::Send, false, || {
+                attempts += 1;
+                Ok(TransferAttempt::OppositeEndpointBlocked)
+            })
+            .unwrap();
+
+        assert_eq!(outcome, TransferAttempt::OppositeEndpointBlocked);
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn transfer_poller_consumes_pending_error_for_both_directions() {
+        for direction in [
+            SocketTransferDirection::Receive,
+            SocketTransferDirection::Send,
+        ] {
+            let options = GeneralOptions::new();
+            options.set_pending_error(LinuxError::ECONNRESET);
+            let mut attempted = false;
+
+            let error = options
+                .transfer_poller(&Ready, direction, false, || {
+                    attempted = true;
+                    Ok(())
+                })
+                .unwrap_err();
+
+            assert_eq!(LinuxError::from(error), LinuxError::ECONNRESET);
+            assert!(!attempted);
+        }
     }
 }

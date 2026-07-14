@@ -19,7 +19,7 @@ use ringbuf::{
 };
 
 use crate::{
-    RecvFlags, RecvOptions, SendFlags, SendOptions, Shutdown,
+    RecvFlags, RecvOptions, SendOptions, Shutdown,
     consts::{LISTEN_QUEUE_SIZE, TCP_TX_BUF_LEN},
     general::GeneralOptions,
     options::{Configurable, GetSocketOption, SetSocketOption, UnixCredentials},
@@ -402,6 +402,16 @@ impl StreamTransport {
         StreamTransport::new_channel(None)
     }
 
+    pub(super) fn retry_transfer<T>(
+        &self,
+        direction: crate::SocketTransferDirection,
+        effective_nonblocking: bool,
+        attempt: &mut impl FnMut() -> AxResult<T>,
+    ) -> AxResult<T> {
+        self.general
+            .transfer_poller(self, direction, effective_nonblocking, attempt)
+    }
+
     fn new_channel(channel: Option<Channel>) -> AxResult<Self> {
         let drop_cleanup = DeferredStreamCleanup::try_new()?;
         Ok(Self::new_channel_with_cleanup(channel, drop_cleanup))
@@ -655,16 +665,16 @@ impl TransportOps for StreamTransport {
         if !options.cmsg.is_empty() {
             return Err(AxError::OperationNotSupported);
         }
-        let per_call_nonblocking = options.flags.contains(SendFlags::DONT_WAIT);
+        let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
         if options.to.is_some() {
             return Err(AxError::InvalidInput);
         }
         let size = src.remaining();
         let mut total = 0;
-        let effective_nonblocking = self.general.nonblocking() || per_call_nonblocking;
-        let result = self
-            .general
-            .send_poller_with_nonblocking(self, per_call_nonblocking, || {
+        let result = self.general.send_poller_with_effective_nonblocking(
+            self,
+            effective_nonblocking,
+            || {
                 let mut guard = self.channel.lock();
                 let Some(chan) = guard.as_mut() else {
                     return Err(AxError::NotConnected);
@@ -704,7 +714,8 @@ impl TransportOps for StreamTransport {
                     poll_update.wake();
                 }
                 result
-            });
+            },
+        );
         // Once stream bytes have been queued, Linux reports that positive
         // progress instead of a later interruption, timeout, peer close, or
         // user-copy failure. Returning the error would invite user space to
@@ -716,9 +727,9 @@ impl TransportOps for StreamTransport {
     }
 
     fn recv(&self, mut dst: impl Write, options: RecvOptions) -> AxResult<usize> {
-        let per_call_nonblocking = options.flags.contains(RecvFlags::DONT_WAIT);
+        let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
         self.general
-            .recv_poller_with_nonblocking(self, per_call_nonblocking, || {
+            .recv_poller_with_effective_nonblocking(self, effective_nonblocking, || {
                 let mut guard = self.channel.lock();
                 let Some(chan) = guard.as_mut() else {
                     return Err(AxError::NotConnected);
@@ -881,6 +892,7 @@ impl Drop for StreamTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SendFlags;
 
     struct CountingWake(Arc<AtomicUsize>);
 

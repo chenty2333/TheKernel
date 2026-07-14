@@ -16,7 +16,7 @@ use axsync::{Mutex, spin::SpinNoIrq};
 use spin::RwLock;
 
 use crate::{
-    CMsgData, RecvFlags, RecvOptions, SendFlags, SendOptions, Shutdown, SocketAddrEx,
+    CMsgData, RecvFlags, RecvOptions, SendOptions, Shutdown, SocketAddrEx,
     buffer::SocketBufferLimits,
     consts::{TCP_RX_BUF_LEN, TCP_TX_BUF_LEN},
     general::GeneralOptions,
@@ -553,6 +553,16 @@ pub struct DgramTransport {
     tx_shutdown: AtomicBool,
 }
 impl DgramTransport {
+    pub(super) fn retry_transfer<T>(
+        &self,
+        direction: crate::SocketTransferDirection,
+        effective_nonblocking: bool,
+        attempt: &mut impl FnMut() -> AxResult<T>,
+    ) -> AxResult<T> {
+        self.general
+            .transfer_poller(self, direction, effective_nonblocking, attempt)
+    }
+
     /// Create a new unconnected datagram transport.
     pub fn new() -> AxResult<Self> {
         let data_rx = ReceiveState::try_new(None)?;
@@ -662,7 +672,7 @@ impl DgramTransport {
     fn send_via_channel(
         &self,
         mut src: impl Read + IoBuf,
-        flags: SendFlags,
+        effective_nonblocking: bool,
         cmsg: Vec<CMsgData>,
         channel: Channel,
     ) -> AxResult<usize> {
@@ -689,9 +699,9 @@ impl DgramTransport {
             local_poll: &self.poll_state,
             charge,
         };
-        let admission = self.general.send_poller_with_nonblocking(
+        let admission = self.general.send_poller_with_effective_nonblocking(
             &pollable,
-            flags.contains(SendFlags::DONT_WAIT),
+            effective_nonblocking,
             || {
                 if self.tx_shutdown.load(Ordering::Acquire) {
                     Err(AxError::BrokenPipe)
@@ -732,11 +742,17 @@ impl DgramTransport {
         options: SendOptions,
         slot: &BindSlot,
     ) -> AxResult<usize> {
-        let SendOptions { to, flags, cmsg } = options;
+        let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
+        let SendOptions { to, cmsg, .. } = options;
         if !matches!(to, Some(SocketAddrEx::Unix(UnixSocketAddr::Path(_)))) {
             return Err(AxError::InvalidInput);
         }
-        self.send_via_channel(src, flags, cmsg, Self::channel_from_slot(slot)?)
+        self.send_via_channel(
+            src,
+            effective_nonblocking,
+            cmsg,
+            Self::channel_from_slot(slot)?,
+        )
     }
 
     pub fn set_filter(&self, filter: Option<Arc<dyn SocketFilter>>) -> AxResult<()> {
@@ -905,7 +921,8 @@ impl TransportOps for DgramTransport {
     }
 
     fn send(&self, src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {
-        let SendOptions { to, flags, cmsg } = options;
+        let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
+        let SendOptions { to, cmsg, .. } = options;
         let channel = if let Some(addr) = to {
             let addr = addr.into_unix()?;
             match addr {
@@ -920,7 +937,7 @@ impl TransportOps for DgramTransport {
                 .cloned()
                 .ok_or(AxError::NotConnected)?
         };
-        self.send_via_channel(src, flags, cmsg, channel)
+        self.send_via_channel(src, effective_nonblocking, cmsg, channel)
     }
 
     fn recv(&self, mut dst: impl Write, mut options: RecvOptions) -> AxResult<usize> {
@@ -934,9 +951,11 @@ impl TransportOps for DgramTransport {
         if options.flags.contains(RecvFlags::PEEK) {
             return Err(AxError::OperationNotSupported);
         }
-        let per_call_nonblocking = options.flags.contains(RecvFlags::DONT_WAIT);
-        self.general
-            .recv_poller_with_nonblocking(self, per_call_nonblocking, move || {
+        let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
+        self.general.recv_poller_with_effective_nonblocking(
+            self,
+            effective_nonblocking,
+            move || {
                 let (packet, queued_bytes, completion) = {
                     let mut guard = self.data_rx.lock();
                     let Some((rx, queued_bytes)) = guard.receiver_parts_mut() else {
@@ -992,7 +1011,8 @@ impl TransportOps for DgramTransport {
                 } else {
                     count
                 })
-            })
+            },
+        )
     }
 
     fn shutdown(&self, how: Shutdown) -> AxResult<()> {
@@ -1099,6 +1119,7 @@ mod tests {
     use alloc::string::String;
 
     use super::*;
+    use crate::SendFlags;
 
     struct GatedThreadWake {
         thread: std::thread::Thread,

@@ -18,7 +18,7 @@ use smoltcp::{
 };
 
 use crate::{
-    RecvFlags, RecvOptions, SendFlags, SendOptions, Shutdown, Socket, SocketAddrEx, SocketOps,
+    RecvFlags, RecvOptions, SendOptions, Shutdown, Socket, SocketAddrEx, SocketOps,
     buffer::try_zeroed_socket_buffer,
     consts::{LOOPBACK_TCP_MSS, TCP_RX_BUF_LEN, TCP_TX_BUF_LEN},
     general::GeneralOptions,
@@ -69,6 +69,16 @@ unsafe impl Sync for TcpSocket {}
 impl TcpSocket {
     pub(crate) fn set_pending_error(&self, error: LinuxError) {
         self.general.set_pending_error(error);
+    }
+
+    pub(crate) fn retry_transfer<T>(
+        &self,
+        direction: crate::SocketTransferDirection,
+        effective_nonblocking: bool,
+        attempt: &mut impl FnMut() -> AxResult<T>,
+    ) -> AxResult<T> {
+        self.general
+            .transfer_poller(self, direction, effective_nonblocking, attempt)
     }
 
     /// Creates a new TCP socket bound to the given network stack.
@@ -543,12 +553,12 @@ impl SocketOps for TcpSocket {
         if !options.cmsg.is_empty() {
             return Err(AxError::OperationNotSupported);
         }
-        let per_call_nonblocking = options.flags.contains(SendFlags::DONT_WAIT);
+        let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
         if self.tx_closed.load(Ordering::Acquire) {
             return Err(AxError::BrokenPipe);
         }
         self.general
-            .send_poller_with_nonblocking(self, per_call_nonblocking, || {
+            .send_poller_with_effective_nonblocking(self, effective_nonblocking, || {
                 self.stack.poll_interfaces();
                 self.with_smol_socket(|socket| {
                     if !socket.is_active() {
@@ -579,9 +589,9 @@ impl SocketOps for TcpSocket {
             State::Listening => ax_bail!(InvalidInput, "not connected"),
             State::Connected | State::Closed | State::Busy => {}
         }
-        let per_call_nonblocking = options.flags.contains(RecvFlags::DONT_WAIT);
+        let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
         self.general
-            .recv_poller_with_nonblocking(self, per_call_nonblocking, || {
+            .recv_poller_with_effective_nonblocking(self, effective_nonblocking, || {
                 self.stack.poll_interfaces();
                 self.with_smol_socket(|socket| {
                     if !socket.may_recv() {

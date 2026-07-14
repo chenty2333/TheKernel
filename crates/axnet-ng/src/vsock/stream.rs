@@ -10,7 +10,7 @@ use axsync::Mutex;
 
 use super::connection_manager::*;
 use crate::{
-    RecvFlags, RecvOptions, SendFlags, SendOptions, Shutdown,
+    RecvFlags, RecvOptions, SendOptions, Shutdown,
     device::*,
     general::GeneralOptions,
     options::{Configurable, GetSocketOption, SetSocketOption},
@@ -37,6 +37,16 @@ impl VsockStreamTransport {
             general: GeneralOptions::new(),
             poll_state: PollSet::new(),
         }
+    }
+
+    pub(super) fn retry_transfer<T>(
+        &self,
+        direction: crate::SocketTransferDirection,
+        effective_nonblocking: bool,
+        attempt: &mut impl FnMut() -> AxResult<T>,
+    ) -> AxResult<T> {
+        self.general
+            .transfer_poller(self, direction, effective_nonblocking, attempt)
     }
 
     fn get_connection(&self) -> AxResult<Arc<Mutex<Connection>>> {
@@ -223,7 +233,7 @@ impl VsockTransportOps for VsockStreamTransport {
             return Err(AxError::OperationNotSupported);
         }
         self.general.consume_pending_error()?;
-        let per_call_nonblocking = options.flags.contains(SendFlags::DONT_WAIT);
+        let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
         let conn = self.get_connection()?;
         let conn_guard = conn.lock();
 
@@ -239,7 +249,7 @@ impl VsockTransportOps for VsockStreamTransport {
         drop(conn_guard);
 
         // now virtio-driver only support non-blocking send
-        if per_call_nonblocking {
+        if effective_nonblocking {
             // The current virtio-vsock transport is already nonblocking per
             // operation; retaining the flag here documents that no wait is
             // introduced below.
@@ -252,9 +262,9 @@ impl VsockTransportOps for VsockStreamTransport {
     fn recv(&self, mut dst: impl Write, options: RecvOptions) -> AxResult<usize> {
         let conn = self.get_connection()?;
 
-        let per_call_nonblocking = options.flags.contains(RecvFlags::DONT_WAIT);
+        let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
         self.general
-            .recv_poller_with_nonblocking(self, per_call_nonblocking, || {
+            .recv_poller_with_effective_nonblocking(self, effective_nonblocking, || {
                 let mut conn_guard = conn.lock();
 
                 if conn_guard.rx_closed() && conn_guard.rx_buffer_used() == 0 {

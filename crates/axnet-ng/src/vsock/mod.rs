@@ -71,6 +71,21 @@ impl Pollable for VsockTransport {
     }
 }
 
+impl VsockTransport {
+    fn retry_transfer<T>(
+        &self,
+        direction: crate::SocketTransferDirection,
+        effective_nonblocking: bool,
+        attempt: &mut impl FnMut() -> AxResult<T>,
+    ) -> AxResult<T> {
+        match self {
+            Self::Stream(stream) => {
+                stream.retry_transfer(direction, effective_nonblocking, attempt)
+            }
+        }
+    }
+}
+
 /// A network socket using the vsock protocol.
 pub struct VsockSocket {
     transport: VsockTransport,
@@ -90,6 +105,16 @@ impl VsockSocket {
 
     pub(crate) fn set_pending_error(&self, error: LinuxError) {
         self.transport.set_pending_error(error);
+    }
+
+    pub(crate) fn retry_transfer<T>(
+        &self,
+        direction: crate::SocketTransferDirection,
+        effective_nonblocking: bool,
+        attempt: &mut impl FnMut() -> AxResult<T>,
+    ) -> AxResult<T> {
+        self.transport
+            .retry_transfer(direction, effective_nonblocking, attempt)
     }
 }
 

@@ -286,10 +286,19 @@ impl NetlinkSocket {
     }
 
     pub fn recv(&self, dst: &mut IoDst, flags: RecvFlags) -> AxResult<usize> {
+        self.recv_with_nonblocking(dst, flags, self.nonblocking())
+    }
+
+    pub(crate) fn recv_with_nonblocking(
+        &self,
+        dst: &mut IoDst,
+        flags: RecvFlags,
+        nonblocking: bool,
+    ) -> AxResult<usize> {
         block_on_poll_io(
             self,
             IoEvents::READABLE,
-            self.nonblocking() || flags.contains(RecvFlags::DONT_WAIT),
+            nonblocking || flags.contains(RecvFlags::DONT_WAIT),
             || {
                 let mut queue = self.queue.lock();
                 let Some(packet) = queue.front() else {
@@ -312,14 +321,15 @@ impl NetlinkSocket {
         )
     }
 
-    pub fn recv_from(
+    pub(crate) fn recv_from_with_nonblocking(
         &self,
         dst: &mut IoDst,
         flags: RecvFlags,
         addr: UserPtr<sockaddr>,
         addrlen: Option<&mut socklen_t>,
+        nonblocking: bool,
     ) -> AxResult<usize> {
-        let recv = self.recv(dst, flags)?;
+        let recv = self.recv_with_nonblocking(dst, flags, nonblocking)?;
         if let Some(addrlen) = addrlen {
             write_netlink_kernel_addr(addr, addrlen)?;
         }

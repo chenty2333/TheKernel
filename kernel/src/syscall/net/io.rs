@@ -14,7 +14,7 @@ use axnet::{
 };
 use axtask::current;
 use linux_raw_sys::{
-    general::{O_PATH, timespec},
+    general::{O_NONBLOCK, O_PATH, timespec},
     net::{
         MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_NOSIGNAL, MSG_OOB, MSG_PEEK,
         MSG_TRUNC, MSG_WAITALL, cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t,
@@ -62,6 +62,7 @@ enum MessageSocketKind {
 struct StableMessageSocket {
     description: Arc<FileDescription>,
     kind: MessageSocketKind,
+    nonblocking: bool,
 }
 
 impl StableMessageSocket {
@@ -89,7 +90,12 @@ impl StableMessageSocket {
             }
             return Err(AxError::NotASocket);
         };
-        Ok(Self { description, kind })
+        let nonblocking = description.status_flags() & O_NONBLOCK != 0;
+        Ok(Self {
+            description,
+            kind,
+            nonblocking,
+        })
     }
 
     fn af_alg(&self) -> AxResult<&AfAlgSocket> {
@@ -348,6 +354,7 @@ fn send_impl(
     if socket.kind != MessageSocketKind::Network {
         return Err(AxError::NotASocket);
     }
+    let nonblocking = socket.nonblocking;
     let socket = socket.network()?;
     let pathname = match (&socket.inner, &addr) {
         (AxSocket::Unix(_), Some(SocketAddrEx::Unix(UnixSocketAddr::Path(path)))) => {
@@ -359,6 +366,7 @@ fn send_impl(
         to: addr,
         flags: send_flags,
         cmsg,
+        nonblocking_override: Some(nonblocking),
     };
     let sent = if let (AxSocket::Unix(unix), Some(path)) = (&socket.inner, pathname) {
         let curr = current();
@@ -453,8 +461,10 @@ fn recv_impl(
     debug!("sys_recv <= fd: {fd}, flags: {recv_flags:?}");
 
     if socket.kind == MessageSocketKind::Netlink {
-        let socket = socket.netlink()?;
-        let recv = socket.recv_from(&mut dst, recv_flags, addr, addrlen)?;
+        let nonblocking = socket.nonblocking;
+        let netlink = socket.netlink()?;
+        let recv =
+            netlink.recv_from_with_nonblocking(&mut dst, recv_flags, addr, addrlen, nonblocking)?;
         debug!("sys_recv => fd: {fd}, netlink recv: {recv}");
         return Ok((recv as isize, false));
     }
@@ -462,6 +472,7 @@ fn recv_impl(
     if socket.kind != MessageSocketKind::Network {
         return Err(AxError::NotASocket);
     }
+    let nonblocking = socket.nonblocking;
     let socket = socket.network()?;
     let mut cmsg = Vec::new();
 
@@ -473,6 +484,7 @@ fn recv_impl(
             from: remote_addr.as_mut(),
             flags: recv_flags,
             cmsg: Some(&mut cmsg),
+            nonblocking_override: Some(nonblocking),
         },
     )?;
 
