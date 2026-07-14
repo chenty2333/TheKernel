@@ -59,7 +59,8 @@ version = "0.3.0-pre.1"
 features = ["alloc"]
 
 [dependencies.axpoll]
-version = "0.1"
+package = "thekernel-readiness-adapter"
+version = "=0.1.0"
 
 [dependencies.axsync]
 version = "=0.3.0-preview.2"

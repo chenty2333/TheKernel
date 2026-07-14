@@ -12,13 +12,13 @@ use axfs_ng_vfs::{
     VfsError, VfsResult, WeakDirEntry,
 };
 use axhal::time::wall_time;
-use axpoll::{IoEvents, Pollable};
+use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use lwext4_rust::{FileAttr, InodeToken, InodeType, ffi::ENOENT};
 use spin::Once;
 
 use super::{
     Ext4Filesystem, RuntimeReservation,
-    util::{LwExt4Filesystem, into_vfs_err, into_vfs_type},
+    util::{into_vfs_err, into_vfs_type},
 };
 
 fn combine_vfs_cleanup<T>(operation: VfsResult<T>, cleanup: VfsResult<()>) -> VfsResult<T> {
@@ -193,14 +193,6 @@ impl Inode {
 
     fn namespace_epoch_handle(&self) -> Option<&Arc<AtomicU64>> {
         self.binding.get().map(|binding| &binding.namespace_epoch)
-    }
-
-    fn update_ctime_locked(&self, fs: &mut LwExt4Filesystem, ino: u32) -> VfsResult<()> {
-        fs.with_inode_ref_mut(ino, |ino| {
-            ino.update_ctime();
-            Ok(())
-        })
-        .map_err(into_vfs_err)
     }
 
     fn expected_token(&self, expected: &DirEntry) -> Option<InodeToken> {
@@ -465,10 +457,16 @@ impl FileNodeOps for Inode {
 
 impl Pollable for Inode {
     fn poll(&self) -> IoEvents {
-        IoEvents::IN | IoEvents::OUT
+        IoEvents::READABLE | IoEvents::WRITABLE
     }
 
-    fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+    fn register<'a>(
+        &'a self,
+        _context: &mut Context<'_>,
+        _events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+        PollRegistration::empty()
+    }
 }
 
 impl DirNodeOps for Inode {
@@ -663,17 +661,9 @@ impl DirNodeOps for Inode {
             return Err(VfsError::NotFound);
         }
         self.bump_namespace_epoch();
-        if let Err(err) = fs.link(self.ino(), name, target_token.ino()) {
+        if let Err(err) = fs.link(self.ino(), name, target_token.ino(), Some(wall_time())) {
             fs.release_inode_handle(retained_token);
             return Err(into_vfs_err(err));
-        }
-        if let Err(primary) = self.update_ctime_locked(&mut fs, target_token.ino()) {
-            // The directory entry is already committed.  A failed ctime
-            // update leaves no safe point from which another metadata
-            // operation can infer whether the link should be retried.
-            fs.release_inode_handle(retained_token);
-            fs.mark_metadata_poisoned();
-            return Err(primary);
         }
         Ok(prepared.bind(retained_token, namespace_epoch))
     }

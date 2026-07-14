@@ -7,7 +7,9 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError, ax_bail, ax_err_type};
 use axio::prelude::*;
-use axpoll::{IoEvents, PollSet, Pollable};
+use axpoll::{
+    IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable, PreparedPollRegistration,
+};
 use smoltcp::{
     iface::SocketHandle,
     socket::tcp as smol,
@@ -182,7 +184,7 @@ impl TcpSocket {
                 true
             }
         });
-        events.set(IoEvents::OUT, writable);
+        events.set(IoEvents::WRITABLE, writable);
         events
     }
 
@@ -190,11 +192,11 @@ impl TcpSocket {
         let mut events = IoEvents::empty();
         self.with_smol_socket(|socket| {
             events.set(
-                IoEvents::IN,
+                IoEvents::READABLE,
                 !self.rx_closed.load(Ordering::Acquire)
                     && (!socket.may_recv() || socket.can_recv()),
             );
-            events.set(IoEvents::OUT, !socket.may_send() || socket.can_send());
+            events.set(IoEvents::WRITABLE, !socket.may_send() || socket.can_send());
         });
         events
     }
@@ -207,7 +209,7 @@ impl TcpSocket {
                 .can_accept(endpoint.port, &self.stack.socket_set)
                 .unwrap_or(false)
         });
-        events.set(IoEvents::IN, can_accept);
+        events.set(IoEvents::READABLE, can_accept);
         events
     }
 
@@ -446,10 +448,7 @@ impl SocketOps for TcpSocket {
                 } else if bound_endpoint.port == remote_endpoint.port {
                     ax_bail!(ConnectionRefused, "same local/remote port");
                 }
-                info!(
-                    "TCP connection from {} to {}",
-                    bound_endpoint, remote_endpoint
-                );
+                info!("TCP connection from {bound_endpoint} to {remote_endpoint}");
 
                 self.with_service_and_smol_socket(|service, socket| {
                     socket.set_bound_endpoint(bound_endpoint);
@@ -477,7 +476,7 @@ impl SocketOps for TcpSocket {
         self.general.connect_poller(self, || {
             self.stack.poll_interfaces();
             let events = self.poll_connect();
-            if !events.contains(IoEvents::OUT) {
+            if !events.contains(IoEvents::WRITABLE) {
                 Err(AxError::WouldBlock)
             } else if self.state() == State::Connected {
                 Ok(())
@@ -510,7 +509,7 @@ impl SocketOps for TcpSocket {
             self.stack
                 .listen_table
                 .listen(bound_endpoint, backlog, &self.stack.socket_set)?;
-            debug!("listening on {}", bound_endpoint);
+            debug!("listening on {bound_endpoint}");
             Ok(())
         })
     }
@@ -666,22 +665,33 @@ impl Pollable for TcpSocket {
         };
         let local_read_closed = self.rx_closed.load(Ordering::Acquire);
         events.set(
-            IoEvents::IN,
-            events.contains(IoEvents::IN) || local_read_closed,
+            IoEvents::READABLE,
+            events.contains(IoEvents::READABLE) || local_read_closed,
         );
         let peer_write_closed = matches!(state, State::Connected | State::Closed)
             && self.with_smol_socket(|socket| !socket.may_recv());
-        events.set(IoEvents::RDHUP, peer_write_closed);
+        events.set(IoEvents::READ_HANGUP, peer_write_closed);
         self.general.add_pending_error_event(events)
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.intersects(IoEvents::IN | IoEvents::OUT | IoEvents::RDHUP) {
-            self.general.register_waker(&self.stack, context.waker());
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+        let network =
+            events.intersects(IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::READ_HANGUP);
+        let local_close = events.intersects(IoEvents::READABLE | IoEvents::READ_HANGUP);
+        let mut prepared =
+            PreparedPollRegistration::try_new(usize::from(network) + usize::from(local_close))?;
+        if network {
+            self.general
+                .arm_waker(&self.stack, &mut prepared, context.waker())?;
         }
-        if events.contains(IoEvents::RDHUP) {
-            self.poll_rx_closed.register(context.waker());
+        if local_close {
+            prepared.arm(&self.poll_rx_closed, context.waker())?;
         }
+        prepared.commit()
     }
 }
 

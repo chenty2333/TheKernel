@@ -3,9 +3,7 @@ use alloc::{
     sync::Arc,
 };
 use core::{
-    future::poll_fn,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
-    task::Poll,
     time::Duration,
 };
 
@@ -26,6 +24,7 @@ use super::{sys_fdatasync, sys_fsync, sys_pread64, sys_preadv, sys_pwrite64, sys
 use crate::{
     file::{FileHandle, event::EventFd, get_typed_file},
     mm::IoVec,
+    readiness::{block_on_poll_set_uninterruptible, poll_io_error, poll_set_io},
     task::{AsThread, with_blocked_signals},
 };
 
@@ -438,17 +437,13 @@ pub fn sys_io_destroy(ctx: u64) -> AxResult<isize> {
         manager.contexts.remove(&ctx);
         context
     };
-    block_on(poll_fn(|cx| {
+    block_on_poll_set_uninterruptible(&context.waiters, || {
         if context.state.lock().in_flight == 0 {
-            return Poll::Ready(());
-        }
-        context.waiters.register(cx.waker());
-        if context.state.lock().in_flight == 0 {
-            Poll::Ready(())
+            Ok(())
         } else {
-            Poll::Pending
+            Err(AxError::WouldBlock)
         }
-    }));
+    })?;
     context.state.lock().events.clear();
     release_aio_events(context.max_events);
     Ok(0)
@@ -548,24 +543,24 @@ pub fn sys_io_getevents(
     let wait_result = if min_nr == 0 || enough_events() {
         WaitResult::Ready
     } else {
-        let wait = poll_fn(|cx| {
-            let state = context.state.lock();
-            if state.events.len() >= min_nr || !state.accepting {
-                return Poll::Ready(());
-            }
-            drop(state);
-            context.waiters.register(cx.waker());
-            let state = context.state.lock();
-            if state.events.len() >= min_nr || !state.accepting {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        });
-        match block_on(future::timeout(timeout, interruptible(wait))) {
-            Ok(Ok(())) => WaitResult::Ready,
+        let wait = async {
+            poll_set_io(&context.waiters, || {
+                let state = context.state.lock();
+                if state.events.len() >= min_nr || !state.accepting {
+                    Ok(())
+                } else {
+                    Err(AxError::WouldBlock)
+                }
+            })
+            .await
+            .map_err(poll_io_error)
+        };
+        match block_on(future::timeout(timeout, interruptible(wait))).map_err(AxError::from)? {
+            Ok(Ok(Ok(()))) => WaitResult::Ready,
+            Ok(Ok(Err(error))) => return Err(error),
             Ok(Err(_)) => WaitResult::Interrupted,
-            Err(_) => WaitResult::TimedOut,
+            Err(future::TimeoutError::Elapsed(_)) => WaitResult::TimedOut,
+            Err(future::TimeoutError::Timer(error)) => return Err(error.into()),
         }
     };
 

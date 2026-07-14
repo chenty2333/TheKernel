@@ -2,16 +2,10 @@ use alloc::sync::Arc;
 
 use axerrno::{AxError, AxResult};
 use axfs::{FS_CONTEXT, OpenOptions};
-use flatten_objects::FlattenObjects;
 
-use super::{
-    desc::{FileDescription, FileDescriptor},
-    fs::File,
-};
-use crate::task::AX_FILE_LIMIT;
+use super::{FdTable, desc::FileDescription, fs::File};
 
-pub fn add_stdio(fd_table: &mut FlattenObjects<FileDescriptor, AX_FILE_LIMIT>) -> AxResult<()> {
-    assert_eq!(fd_table.count(), 0);
+pub fn add_stdio(fd_table: &FdTable) -> AxResult<()> {
     let cx = FS_CONTEXT.lock();
     let open = |options: &mut OpenOptions| {
         AxResult::Ok(Arc::new(File::new(
@@ -22,29 +16,16 @@ pub fn add_stdio(fd_table: &mut FlattenObjects<FileDescriptor, AX_FILE_LIMIT>) -
     let tty_in = open(OpenOptions::new().read(true).write(false))?;
     let tty_out = open(OpenOptions::new().read(false).write(true))?;
     let stdin = FileDescription::new(tty_in)?;
-    fd_table
-        .add(FileDescriptor {
-            description: stdin.clone(),
-            cloexec: false,
-        })
-        .map_err(|_| AxError::TooManyOpenFiles)?;
-    stdin.mark_open_committed();
     let stdout = FileDescription::new(tty_out.clone())?;
-    fd_table
-        .add(FileDescriptor {
-            description: stdout.clone(),
-            cloexec: false,
-        })
-        .map_err(|_| AxError::TooManyOpenFiles)?;
-    stdout.mark_open_committed();
     let stderr = FileDescription::new(tty_out)?;
-    fd_table
-        .add(FileDescriptor {
-            description: stderr.clone(),
-            cloexec: false,
-        })
-        .map_err(|_| AxError::TooManyOpenFiles)?;
-    stderr.mark_open_committed();
+    drop(cx);
+
+    if fd_table.add_at_least(stdin, 0, 1, false)? != 0
+        || fd_table.add_at_least(stdout, 1, 2, false)? != 1
+        || fd_table.add_at_least(stderr, 2, 3, false)? != 2
+    {
+        return Err(AxError::BadState);
+    }
 
     Ok(())
 }

@@ -17,6 +17,200 @@ done
 bash -n "$0"
 
 python3 "$REPO_ROOT/tests/ci/test_vendor_provenance.py"
+"$SCRIPT_DIR/test-release-consumer-gate.sh"
+
+# The developer container must see maintained sibling checkouts at the exact
+# absolute paths produced by Cargo's ../thekernel-* patch dependencies. Keep
+# this test Docker-free by capturing the final compose invocation.
+dev_fixture="$tmp/dev-fixture"
+mkdir -p \
+    "$dev_fixture/scripts" \
+    "$dev_fixture/dev-env" \
+    "$dev_fixture/fake-bin" \
+    "$tmp/dev-ax" \
+    "$tmp/dev-linux-abi" \
+    "$tmp/dev-rootfs"
+cp "$REPO_ROOT/scripts/dev-shell.sh" "$dev_fixture/scripts/"
+: >"$dev_fixture/dev-env/versions.env"
+: >"$dev_fixture/dev-env/compose.yaml"
+: >"$tmp/dev-ax/Cargo.toml"
+: >"$tmp/dev-linux-abi/Cargo.toml"
+git -C "$dev_fixture" init --quiet
+cat >"$dev_fixture/fake-bin/docker" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"$DEV_SHELL_DOCKER_ARGS"
+EOF
+chmod +x "$dev_fixture/fake-bin/docker"
+env \
+    PATH="$dev_fixture/fake-bin:$PATH" \
+    DEV_SHELL_DOCKER_ARGS="$tmp/dev-shell.args" \
+    THEKERNEL_ROOTFS_HOST_DIR="$tmp/dev-rootfs" \
+    THEKERNEL_AX_REPO="$tmp/dev-ax" \
+    THEKERNEL_LINUX_ABI_REPO="$tmp/dev-linux-abi" \
+    "$dev_fixture/scripts/dev-shell.sh" -- make kernel-rv
+grep -Fxq -- "$tmp/dev-ax:/thekernel-ax:ro,z" "$tmp/dev-shell.args"
+grep -Fxq -- "$tmp/dev-linux-abi:/thekernel-linux-abi:ro,z" \
+    "$tmp/dev-shell.args"
+grep -Fxq -- 'make' "$tmp/dev-shell.args"
+grep -Fxq -- 'kernel-rv' "$tmp/dev-shell.args"
+if env \
+    PATH="$dev_fixture/fake-bin:$PATH" \
+    DEV_SHELL_DOCKER_ARGS="$tmp/dev-shell-missing.args" \
+    THEKERNEL_ROOTFS_HOST_DIR="$tmp/dev-rootfs" \
+    THEKERNEL_AX_REPO="$tmp/missing-dev-ax" \
+    THEKERNEL_LINUX_ABI_REPO="$tmp/dev-linux-abi" \
+    "$dev_fixture/scripts/dev-shell.sh" -- true >/dev/null 2>&1; then
+    printf 'test-ci-scripts: dev shell accepted a missing maintained sibling\n' >&2
+    exit 1
+fi
+[ ! -e "$tmp/dev-shell-missing.args" ]
+
+# Hosted CI must consume exact, retrievable sibling commits without mutating an
+# arbitrary pre-existing checkout. Local repositories keep this deterministic
+# and exercise the same fetch-by-commit path as the hosted jobs.
+make_sibling_fixture() {
+    local path=$1
+    local package=$2
+    mkdir -p "$path/src"
+    git -C "$path" init --quiet
+    printf '[package]\nname = "%s"\nversion = "0.1.0"\n' "$package" \
+        >"$path/Cargo.toml"
+    printf '#![no_std]\n' >"$path/src/lib.rs"
+    git -C "$path" add Cargo.toml src/lib.rs
+    git -C "$path" -c user.name=CI -c user.email=ci@example.invalid \
+        commit --quiet -m fixture
+    git -C "$path" rev-parse HEAD
+}
+
+ax_fixture_head=$(make_sibling_fixture "$tmp/source-ax" thekernel-ax-fixture)
+linux_abi_fixture_head=$(
+    make_sibling_fixture "$tmp/source-linux-abi" thekernel-linux-abi-fixture
+)
+provision_env=(
+    THEKERNEL_AX_REPOSITORY="$tmp/source-ax"
+    THEKERNEL_AX_REF="$ax_fixture_head"
+    THEKERNEL_LINUX_ABI_REPOSITORY="$tmp/source-linux-abi"
+    THEKERNEL_LINUX_ABI_REF="$linux_abi_fixture_head"
+    THEKERNEL_AX_REPO="$tmp/checkouts/thekernel-ax"
+    THEKERNEL_LINUX_ABI_REPO="$tmp/checkouts/thekernel-linux-abi"
+)
+env "${provision_env[@]}" \
+    "$CI_DIR/provision-maintained-siblings.sh" >/dev/null
+env "${provision_env[@]}" \
+    "$CI_DIR/provision-maintained-siblings.sh" >/dev/null
+[ "$(git -C "$tmp/checkouts/thekernel-ax" rev-parse HEAD)" = "$ax_fixture_head" ]
+[ "$(git -C "$tmp/checkouts/thekernel-linux-abi" rev-parse HEAD)" = \
+    "$linux_abi_fixture_head" ]
+[ -z "$(git -C "$tmp/checkouts/thekernel-ax" status --porcelain=v1)" ]
+
+if env "${provision_env[@]}" THEKERNEL_AX_REF=main \
+    "$CI_DIR/provision-maintained-siblings.sh" >/dev/null 2>&1; then
+    printf 'test-ci-scripts: non-commit sibling ref was accepted\n' >&2
+    exit 1
+fi
+mkdir -p "$tmp/unmanaged-linux-abi"
+if env "${provision_env[@]}" \
+    THEKERNEL_LINUX_ABI_REPO="$tmp/unmanaged-linux-abi" \
+    "$CI_DIR/provision-maintained-siblings.sh" >/dev/null 2>&1; then
+    printf 'test-ci-scripts: unmanaged sibling checkout was changed\n' >&2
+    exit 1
+fi
+if THEKERNEL_AX_REPOSITORY= THEKERNEL_AX_REF="$ax_fixture_head" \
+    THEKERNEL_LINUX_ABI_REPOSITORY="$tmp/source-linux-abi" \
+    THEKERNEL_LINUX_ABI_REF="$linux_abi_fixture_head" \
+    "$CI_DIR/provision-maintained-siblings.sh" >/dev/null 2>&1; then
+    printf 'test-ci-scripts: missing sibling repository was accepted\n' >&2
+    exit 1
+fi
+
+# The PR source-build branch must audit exact sibling release artifacts before
+# invoking make, preserve the release set under its normal artifact log tree,
+# and skip both operations when --skip-build is requested.
+pr_fixture="$tmp/pr-fixture"
+mkdir -p "$pr_fixture/scripts/ci" "$pr_fixture/fake-bin"
+cp "$CI_DIR/pr-gate.sh" "$CI_DIR/lib.sh" "$pr_fixture/scripts/ci/"
+cat >"$pr_fixture/scripts/ci/release-consumer-gate.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'release-consumer %s\n' "$*" >>"$PR_FIXTURE_TRACE"
+output=
+while (($#)); do
+    case "$1" in
+        --output-release-set) output=${2:-}; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[ -n "$output" ]
+mkdir -p "$(dirname -- "$output")"
+printf 'package\tversion\tsha256\trepository_head\n' >"$output"
+EOF
+cat >"$pr_fixture/scripts/ci/boot-shell-gate.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'boot %s\n' "$*" >>"$PR_FIXTURE_TRACE"
+EOF
+cat >"$pr_fixture/fake-bin/make" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'make %s\n' "$*" >>"$PR_FIXTURE_TRACE"
+case "$*" in
+    kernels) printf fixture >kernel-rv; printf fixture >kernel-la ;;
+    'kernel-rv-shell kernel-la-shell rootfs')
+        mkdir -p .state/shell .state/rootfs
+        printf fixture >.state/shell/kernel-rv
+        printf fixture >.state/shell/kernel-la
+        printf fixture >.state/rootfs/rootfs-rv.img
+        printf fixture >.state/rootfs/rootfs-la.img
+        ;;
+esac
+EOF
+chmod +x \
+    "$pr_fixture/scripts/ci/release-consumer-gate.sh" \
+    "$pr_fixture/scripts/ci/boot-shell-gate.sh" \
+    "$pr_fixture/fake-bin/make"
+
+pr_trace="$tmp/pr-gate.trace"
+ax_exact=1111111111111111111111111111111111111111
+linux_abi_exact=2222222222222222222222222222222222222222
+env PATH="$pr_fixture/fake-bin:$PATH" \
+    PR_FIXTURE_TRACE="$pr_trace" \
+    THEKERNEL_AX_REF="$ax_exact" \
+    THEKERNEL_LINUX_ABI_REF="$linux_abi_exact" \
+    "$pr_fixture/scripts/ci/pr-gate.sh" \
+    --log-dir "$tmp/pr-gate-logs" >/dev/null
+grep -Fxq \
+    "release-consumer --arch both --ax-head $ax_exact --linux-abi-head $linux_abi_exact --output-release-set $tmp/pr-gate-logs/release-consumer/release-set.tsv" \
+    "$pr_trace"
+[ "$(sed -n '1p' "$pr_trace")" = \
+    "release-consumer --arch both --ax-head $ax_exact --linux-abi-head $linux_abi_exact --output-release-set $tmp/pr-gate-logs/release-consumer/release-set.tsv" ]
+[ "$(sed -n '2p' "$pr_trace")" = 'make kernels' ]
+[ "$(sed -n '3p' "$pr_trace")" = 'make kernel-rv-shell kernel-la-shell rootfs' ]
+[ -s "$tmp/pr-gate-logs/release-consumer/release-set.tsv" ]
+grep -q $'^release-consumer\tpass\t0\t' "$tmp/pr-gate-logs/status.tsv"
+
+: >"$pr_trace"
+if env PATH="$pr_fixture/fake-bin:$PATH" \
+    PR_FIXTURE_TRACE="$pr_trace" \
+    THEKERNEL_AX_REF=main \
+    THEKERNEL_LINUX_ABI_REF="$linux_abi_exact" \
+    "$pr_fixture/scripts/ci/pr-gate.sh" \
+    --log-dir "$tmp/pr-gate-invalid-ref-logs" >/dev/null 2>&1; then
+    printf 'test-ci-scripts: PR gate accepted a non-exact sibling ref\n' >&2
+    exit 1
+fi
+[ ! -s "$pr_trace" ]
+
+env -u THEKERNEL_AX_REF -u THEKERNEL_LINUX_ABI_REF \
+    PATH="$pr_fixture/fake-bin:$PATH" \
+    PR_FIXTURE_TRACE="$pr_trace" \
+    "$pr_fixture/scripts/ci/pr-gate.sh" \
+    --skip-build --log-dir "$tmp/pr-gate-skip-logs" >/dev/null
+[ "$(wc -l <"$pr_trace")" -eq 1 ]
+grep -Fq 'boot --arch both --skip-build' "$pr_trace"
+if grep -Eq '^(release-consumer|make) ' "$pr_trace"; then
+    printf 'test-ci-scripts: --skip-build ran release or source build\n' >&2
+    exit 1
+fi
 
 cat >"$tmp/pass.log" <<'EOF'
 CI_BOOT_GATE_START

@@ -300,15 +300,18 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         ),
     );
     if axdisplay::has_display() {
-        root.add(
-            "fb0",
-            Device::new(
-                fs.clone(),
-                NodeType::CharacterDevice,
-                DeviceId::new(29, 0),
-                Arc::new(fb::FrameBuffer::new()),
+        match fb::FrameBuffer::try_new() {
+            Ok(framebuffer) => root.add(
+                "fb0",
+                Device::new(
+                    fs.clone(),
+                    NodeType::CharacterDevice,
+                    DeviceId::new(29, 0),
+                    Arc::new(framebuffer),
+                ),
             ),
-        );
+            Err(error) => error!("Failed to initialize framebuffer device: {error}"),
+        }
     }
 
     root.add(

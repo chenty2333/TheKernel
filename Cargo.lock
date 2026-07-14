@@ -436,9 +436,9 @@ dependencies = [
  "axdriver_input",
  "axdriver_net",
  "axhal",
- "axtask",
  "log",
  "spin 0.9.8",
+ "thekernel-axtask",
  "virtio-drivers",
 ]
 
@@ -495,11 +495,10 @@ dependencies = [
  "axhal",
  "axinput",
  "axlog",
- "axnet",
  "axruntime",
  "axsync",
- "axtask",
  "kspin",
+ "thekernel-axtask",
 ]
 
 [[package]]
@@ -532,7 +531,6 @@ dependencies = [
  "axfs-ng-vfs",
  "axhal",
  "axio",
- "axpoll",
  "axsync",
  "bitflags 2.11.0",
  "cfg-if",
@@ -546,6 +544,7 @@ dependencies = [
  "scope-local",
  "spin 0.10.0",
  "starry-fatfs",
+ "thekernel-readiness-adapter",
 ]
 
 [[package]]
@@ -553,7 +552,6 @@ name = "axfs-ng-vfs"
 version = "0.1.1"
 dependencies = [
  "axerrno 0.2.2",
- "axpoll",
  "bitflags 2.11.0",
  "cfg-if",
  "hashbrown",
@@ -561,6 +559,7 @@ dependencies = [
  "log",
  "smallvec",
  "spin 0.10.0",
+ "thekernel-readiness-adapter",
 ]
 
 [[package]]
@@ -685,25 +684,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "axnet"
-version = "0.3.0-preview.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b03ce184f77f748369b6fa315385e2093c159d1a08d6ce18beec9fad6d2c27f6"
-dependencies = [
- "axdriver",
- "axerrno 0.2.2",
- "axhal",
- "axio",
- "axsync",
- "axtask",
- "cfg-if",
- "lazyinit",
- "log",
- "spin 0.10.0",
- "starry-smoltcp",
-]
-
-[[package]]
 name = "axnet-ng"
 version = "0.3.0-preview.2"
 dependencies = [
@@ -713,9 +693,7 @@ dependencies = [
  "axerrno 0.2.2",
  "axhal",
  "axio",
- "axpoll",
  "axsync",
- "axtask",
  "bitflags 2.11.0",
  "cfg-if",
  "enum_dispatch",
@@ -727,6 +705,8 @@ dependencies = [
  "ringbuf",
  "spin 0.10.0",
  "starry-smoltcp",
+ "thekernel-axtask",
+ "thekernel-readiness-adapter",
 ]
 
 [[package]]
@@ -886,15 +866,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "axpoll"
-version = "0.1.2"
-dependencies = [
- "bitflags 2.11.0",
- "kspin",
- "linux-raw-sys",
-]
-
-[[package]]
 name = "axruntime"
 version = "0.3.0-preview.2"
 dependencies = [
@@ -910,10 +881,8 @@ dependencies = [
  "axklib",
  "axlog",
  "axmm",
- "axnet",
  "axnet-ng",
  "axplat",
- "axtask",
  "cfg-if",
  "chrono",
  "crate_interface 0.1.4",
@@ -921,14 +890,7 @@ dependencies = [
  "indoc",
  "kernel_guard",
  "percpu",
-]
-
-[[package]]
-name = "axsched"
-version = "0.3.1"
-dependencies = [
- "intrusive-collections",
- "linked_list_r4l",
+ "thekernel-axtask",
 ]
 
 [[package]]
@@ -947,24 +909,7 @@ dependencies = [
 name = "axtask"
 version = "0.3.0-preview.2"
 dependencies = [
- "axconfig",
- "axerrno 0.2.2",
- "axhal",
- "axpoll",
- "axsched",
- "cfg-if",
- "cpumask",
- "crate_interface 0.1.4",
- "event-listener",
- "extern-trait",
- "futures-util",
- "kernel_guard",
- "kspin",
- "lazyinit",
- "log",
- "memory_addr",
- "percpu",
- "spin 0.10.0",
+ "thekernel-axtask",
 ]
 
 [[package]]
@@ -3005,16 +2950,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "starry-process"
-version = "0.2.0"
-dependencies = [
- "intrusive-collections",
- "kspin",
- "lazyinit",
- "spin 0.10.0",
-]
-
-[[package]]
 name = "starry-signal"
 version = "0.3.0"
 dependencies = [
@@ -3170,6 +3105,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "thekernel-axpoll"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "kspin",
+]
+
+[[package]]
+name = "thekernel-axsched"
+version = "0.1.0"
+dependencies = [
+ "intrusive-collections",
+ "linked_list_r4l",
+]
+
+[[package]]
+name = "thekernel-axtask"
+version = "0.1.0"
+dependencies = [
+ "axconfig",
+ "axerrno 0.2.2",
+ "axhal",
+ "cfg-if",
+ "cpumask",
+ "crate_interface 0.1.4",
+ "event-listener",
+ "extern-trait",
+ "futures-util",
+ "kernel_guard",
+ "kspin",
+ "lazyinit",
+ "log",
+ "memory_addr",
+ "percpu",
+ "spin 0.10.0",
+ "thekernel-axpoll",
+ "thekernel-axsched",
+ "x86_64",
+]
+
+[[package]]
 name = "thekernel-kernel"
 version = "0.2.0-preview.2"
 dependencies = [
@@ -3188,10 +3164,8 @@ dependencies = [
  "axlog",
  "axmm",
  "axnet-ng",
- "axpoll",
  "axruntime",
  "axsync",
- "axtask",
  "bitflags 2.11.0",
  "bitmaps",
  "bytemuck",
@@ -3226,16 +3200,52 @@ dependencies = [
  "scope-local",
  "slab",
  "spin 0.10.0",
- "starry-process",
  "starry-signal",
  "starry-vm",
  "strum 0.28.0",
  "syscalls",
+ "thekernel-axtask",
+ "thekernel-linux-fd",
+ "thekernel-linux-process-adapter",
+ "thekernel-linux-vfs",
+ "thekernel-readiness-adapter",
  "uluru",
  "weak-map",
  "x86",
  "xmas-elf",
  "zerocopy 0.8.41",
+]
+
+[[package]]
+name = "thekernel-linux-fd"
+version = "0.1.0"
+
+[[package]]
+name = "thekernel-linux-process"
+version = "0.1.0"
+dependencies = [
+ "intrusive-collections",
+ "kspin",
+]
+
+[[package]]
+name = "thekernel-linux-process-adapter"
+version = "0.1.0"
+dependencies = [
+ "thekernel-linux-process",
+]
+
+[[package]]
+name = "thekernel-linux-vfs"
+version = "0.1.0"
+
+[[package]]
+name = "thekernel-readiness-adapter"
+version = "0.1.0"
+dependencies = [
+ "axerrno 0.2.2",
+ "thekernel-axpoll",
+ "thekernel-linux-fd",
 ]
 
 [[package]]

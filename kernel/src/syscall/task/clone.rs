@@ -1,18 +1,17 @@
 use alloc::sync::Arc;
-use core::{future::poll_fn, task::Poll};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::FS_CONTEXT;
 use axhal::uspace::UserContext;
 use axtask::{
-    AxTaskExt, SchedClass, current, future::block_on, prepare_task_with_sched_from,
-    publish_prepared_task, reclaim_exited_tasks, sched_state, yield_now,
+    AxTaskExt, SchedClass, current, prepare_task_with_sched_from, publish_prepared_task,
+    reclaim_exited_tasks, reserve_prepared_task, sched_state, yield_now,
 };
 use bitflags::bitflags;
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::*;
 use starry_process::{Pid, ProcessError};
-use starry_signal::Signo;
+use starry_signal::{SignalInfo, Signo};
 use starry_vm::VmMutPtr;
 
 #[cfg(target_arch = "loongarch64")]
@@ -21,10 +20,13 @@ use crate::{
     file::{FD_TABLE, FdTable, FileDescription, PidFd, reserve_fd, try_new_process_scope},
     mm::copy_from_kernel,
     pseudofs::cgroup,
-    syscall::inherit_proc_shm,
+    readiness::block_on_poll_set_uninterruptible,
+    syscall::prepare_proc_shm_inheritance,
     task::{
-        AsThread, Cred, CredentialSlot, ProcessData, Thread, prepare_task_table_admission,
-        try_new_user_task, try_tasks, vm_write_in_aspace,
+        AsThread, Cred, CredentialSlot, InitialProcessThreadAdmission, PendingThreadPublication,
+        ProcessData, ProcessThreadAdmission, Thread, get_process_data, linux_pid_from_task_id,
+        prepare_task_table_admission, process_domain, send_signal_thread_inner, try_new_user_task,
+        try_tasks, vm_write_in_aspace,
     },
 };
 
@@ -39,49 +41,20 @@ fn should_yield_after_clone(flags: CloneFlags) -> bool {
     )
 }
 
-/// Rolls back every process/thread registry publication made before a clone
-/// becomes runnable. Process and thread membership have their own unpublished
-/// admission tokens; this guard owns external cgroup/SHM side effects only.
-struct CloneRollback {
-    tid: Pid,
-    inherited_shm: bool,
-    charged_cgroup: bool,
-    armed: bool,
+enum CloneThreadPublication {
+    Live(ProcessThreadAdmission),
+    Initial(InitialProcessThreadAdmission),
 }
 
-impl CloneRollback {
-    fn new(tid: Pid) -> Self {
-        Self {
-            tid,
-            inherited_shm: false,
-            charged_cgroup: false,
-            armed: true,
-        }
-    }
-
-    fn note_shm_inheritance(&mut self) {
-        self.inherited_shm = true;
-    }
-
-    fn note_cgroup_charge(&mut self) {
-        self.charged_cgroup = true;
-    }
-
-    fn commit(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for CloneRollback {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if self.charged_cgroup {
-            cgroup::detach_process(self.tid);
-        }
-        if self.inherited_shm {
-            crate::syscall::clear_proc_shm(self.tid);
+impl CloneThreadPublication {
+    fn commit(self) -> PendingThreadPublication {
+        match self {
+            Self::Live(admission) => admission.commit(),
+            Self::Initial(admission) => {
+                let (process, completion) = admission.commit();
+                drop(process);
+                completion
+            }
         }
     }
 }
@@ -90,6 +63,11 @@ fn map_process_error(error: ProcessError) -> AxError {
     match error {
         ProcessError::NoMemory | ProcessError::Capacity => AxError::NoMemory,
         ProcessError::AlreadyExists => AxError::AlreadyExists,
+        ProcessError::NotPublished | ProcessError::NotLive | ProcessError::NotInitialized => {
+            AxError::NoSuchProcess
+        }
+        ProcessError::WrongDomain => AxError::BadState,
+        _ => AxError::BadState,
     }
 }
 
@@ -207,18 +185,14 @@ pub(super) enum CloneApi {
 }
 
 impl CloneArgs {
-    fn wait_for_vfork(proc_data: &ProcessData) {
-        block_on(poll_fn(|cx| {
+    fn wait_for_vfork(proc_data: &ProcessData) -> AxResult<()> {
+        block_on_poll_set_uninterruptible(&proc_data.vfork_event, || {
             if !proc_data.vfork_in_progress() {
-                return Poll::Ready(());
-            }
-            proc_data.vfork_event.register(cx.waker());
-            if !proc_data.vfork_in_progress() {
-                Poll::Ready(())
+                Ok(())
             } else {
-                Poll::Pending
+                Err(AxError::WouldBlock)
             }
-        }));
+        })
     }
 
     pub(super) fn validate_for(&self, api: CloneApi) -> AxResult<()> {
@@ -334,6 +308,7 @@ impl CloneArgs {
 
         let curr = current();
         let calling_thread = curr.as_thread();
+        let calling_tid = linux_pid_from_task_id(curr.id().as_u64())?;
         let old_proc_data = &calling_thread.proc_data;
         // Both CLONE_THREAD and fork inherit exactly one immutable snapshot
         // from the calling task. Each child receives its own publication slot.
@@ -367,8 +342,9 @@ impl CloneArgs {
         check_rlimit_nproc(calling_thread)?;
 
         let mut child_sched_state = sched_state(&curr);
-        if !flags.contains(CloneFlags::THREAD) && child_sched_state.reset_on_fork {
-            child_sched_state.reset_on_fork = false;
+        let parent_reset_on_fork = calling_thread.sched_reset_on_fork();
+        let child_reset_on_fork = flags.contains(CloneFlags::THREAD) && parent_reset_on_fork;
+        if !flags.contains(CloneFlags::THREAD) && parent_reset_on_fork {
             match child_sched_state.class {
                 SchedClass::Fifo | SchedClass::RoundRobin => {
                     child_sched_state.class = SchedClass::Normal;
@@ -391,26 +367,36 @@ impl CloneArgs {
             copy_current_user_fpu_state_to(new_task.ctx_mut());
         }
 
-        let tid = new_task.id().as_u64() as Pid;
+        let tid = linux_pid_from_task_id(new_task.id().as_u64())?;
         let child_credential = CredentialSlot::try_new(child_cred)?;
 
-        let (new_proc_data, process_admission, thread_admission) = if flags
-            .contains(CloneFlags::THREAD)
-        {
+        let fork_parent_data = if flags.contains(CloneFlags::THREAD) {
+            None
+        } else if flags.contains(CloneFlags::PARENT) {
+            let parent = old_proc_data.proc.parent().ok_or(AxError::InvalidInput)?;
+            Some(get_process_data(parent.pid())?)
+        } else {
+            Some(old_proc_data.clone())
+        };
+        let fork_lifecycle = fork_parent_data
+            .as_ref()
+            .map(|parent| parent.lock_process_lifecycle());
+
+        let (new_proc_data, thread_publication) = if flags.contains(CloneFlags::THREAD) {
             new_task
                 .ctx_mut()
                 .set_page_table_root(old_proc_data.aspace().lock().page_table_root());
             let proc_data = old_proc_data.clone();
             let thread_admission = proc_data.prepare_thread(tid)?;
-            (proc_data, None, thread_admission)
+            (proc_data, CloneThreadPublication::Live(thread_admission))
         } else {
-            let parent = if flags.contains(CloneFlags::PARENT) {
-                old_proc_data.proc.parent().ok_or(AxError::InvalidInput)?
-            } else {
-                old_proc_data.proc.clone()
-            };
-            let process_admission = parent
-                .prepare_fork(tid, exit_signal.map(|signo| signo as u8))
+            let parent = fork_parent_data.as_ref().ok_or(AxError::BadState)?;
+            let prepared_zombie_snapshot = ProcessData::try_prepare_zombie_snapshot()?;
+            let process_admission = process_domain()?
+                .prepare_fork(&parent.proc, tid, exit_signal.map(|signo| signo as u8))
+                .map_err(map_process_error)?;
+            let process_admission = process_admission
+                .prepare_initial_thread(tid)
                 .map_err(map_process_error)?;
             let proc = process_admission.process().clone();
 
@@ -505,6 +491,7 @@ impl CloneArgs {
 
             let proc_data = ProcessData::try_new(
                 proc,
+                prepared_zombie_snapshot,
                 child_credential.clone(),
                 child_exe_path,
                 old_proc_data.retain_executable()?,
@@ -525,12 +512,12 @@ impl CloneArgs {
             proc_data.set_heap_top(old_proc_data.get_heap_top());
             proc_data.try_inherit_mempolicy_from(old_proc_data)?;
             proc_data.inherit_timerslack_from(old_proc_data);
-            let thread_admission = proc_data.prepare_thread(tid)?;
-            (proc_data, Some(process_admission), thread_admission)
+            let thread_admission = proc_data.prepare_initial_thread(process_admission)?;
+            (proc_data, CloneThreadPublication::Initial(thread_admission))
         };
-        let mut rollback = CloneRollback::new(tid);
         let (thr, signal_registration) =
             Thread::try_new(tid, new_proc_data.clone(), child_credential)?;
+        thr.set_sched_reset_on_fork(child_reset_on_fork);
         let child_aspace = new_proc_data.aspace();
         if flags.contains(CloneFlags::CHILD_CLEARTID) {
             thr.set_clear_child_tid(child_tid);
@@ -545,60 +532,82 @@ impl CloneArgs {
             let pidfd_file: Arc<dyn crate::file::FileLike> =
                 Arc::try_new(pidfd_obj).map_err(|_| AxError::NoMemory)?;
             let description = FileDescription::new(pidfd_file)?;
-            Some((reservation, description))
+            Some(reservation.prepare_publication(description)?)
         } else {
             None
         };
-        if !flags.contains(CloneFlags::THREAD) {
-            let charge_result = if let Some(fd) = cgroup_fd {
-                cgroup::try_charge_fork_into(fd, tid)
+        let cgroup_admission = if !flags.contains(CloneFlags::THREAD) {
+            Some(if let Some(fd) = cgroup_fd {
+                cgroup::prepare_fork_charge_into(fd, tid)?
             } else {
-                cgroup::try_charge_fork(old_proc_data.proc.pid(), tid)
-            };
-            charge_result?;
-            rollback.note_cgroup_charge();
-        }
+                cgroup::prepare_fork_charge(old_proc_data.proc.pid(), tid)?
+            })
+        } else {
+            None
+        };
 
-        if !flags.contains(CloneFlags::THREAD) {
-            inherit_proc_shm(old_proc_data.proc.pid(), new_proc_data.proc.pid())?;
-            rollback.note_shm_inheritance();
-        }
+        let shm_admission = (!flags.contains(CloneFlags::THREAD))
+            .then(|| {
+                prepare_proc_shm_inheritance(old_proc_data.proc.pid(), new_proc_data.proc.pid())
+            })
+            .transpose()?;
 
-        // The task extension must exist before the pidfd becomes visible. If
-        // publication fails, dropping `new_task` and the armed rollback token
-        // tears down the complete unpublished child.
+        // The task extension must exist before any process identity becomes
+        // visible. Every admission token below rolls itself back on failure.
         *new_task.task_ext_mut() = Some(AxTaskExt::from_impl(thr));
 
         // Fallibly allocate/configure the scheduler object and reserve every
         // task/process/group/session lookup bucket before copying the pidfd
         // number or publishing it into a possibly shared files_struct.
         let task = prepare_task_with_sched_from(new_task, child_sched_state, &curr)?;
+        let task_publication =
+            reserve_prepared_task(task.clone()).map_err(|error| error.into_ax_error())?;
         let task_table_admission = prepare_task_table_admission(&task)?;
 
-        if let Some((reservation, _)) = pending_pidfd.as_ref() {
-            let fd = reservation.fd();
+        if let Some(publication) = pending_pidfd.as_ref() {
+            let fd = publication.fd();
             (pidfd as *mut i32).vm_write(fd)?;
         }
 
         if flags.contains(CloneFlags::VFORK) {
-            new_proc_data.begin_vfork(curr.id().as_u64() as Pid);
-        }
-
-        if let Some((reservation, description)) = pending_pidfd.take() {
-            reservation.publish(description)?;
+            new_proc_data.begin_vfork(calling_tid);
         }
 
         // From this point onward every operation is an allocation-free,
-        // infallible publication step. Disarm before lookup/runqueue commit,
-        // where another CPU could otherwise observe the child concurrently
-        // with rollback.
+        // infallible publication step. Publish the exact signal endpoint and
+        // core process/thread identity with TASK_TABLE before any fd or
+        // secondary global index.
         signal_registration.commit();
-        thread_admission.commit();
-        if let Some(process_admission) = process_admission {
-            process_admission.commit();
+        let thread_completion =
+            task_table_admission.commit_with_publication(|| thread_publication.commit());
+
+        // TASK_TABLE is the primary runtime lookup. Cgroup and SysV SHM hidden
+        // entries become visible only after it, so their readers can never
+        // observe an unpublished child PID. PIDFD follows the same ordering:
+        // once visible through a shared files_struct, signal/core/task lookup is
+        // already complete. The prepared task remains off-runqueue throughout.
+        if let Some(admission) = cgroup_admission {
+            admission.commit();
         }
-        rollback.commit();
-        task_table_admission.commit();
+        if let Some(admission) = shm_admission {
+            admission.commit();
+        }
+        if let Some(publication) = pending_pidfd.take() {
+            publication.commit();
+        }
+
+        // Exact handoff with group_exit: if its first scan ran before this TID
+        // entered TASK_TABLE, the permanent gate is sampled after TASK_TABLE
+        // publication and SIGKILL is queued directly to this prepared Thread
+        // before the task can enter the runqueue. If group_exit linearizes after
+        // this sample, its scan can already resolve this exact task-table entry.
+        if thread_completion.must_terminate_for_group_exit() {
+            send_signal_thread_inner(
+                &task,
+                task.as_thread(),
+                SignalInfo::new_kernel(Signo::SIGKILL),
+            );
+        }
 
         // Linux performs both TID stores only after child construction has
         // succeeded, and neither copy fault cancels an otherwise successful
@@ -611,7 +620,11 @@ impl CloneArgs {
         if flags.contains(CloneFlags::CHILD_SETTID) && child_tid != 0 {
             let _ = vm_write_in_aspace(&child_aspace, child_tid as *mut Pid, tid);
         }
-        publish_prepared_task(task);
+        let published_task = publish_prepared_task(task_publication);
+        debug_assert!(Arc::ptr_eq(&published_task, &task));
+        drop(published_task);
+        thread_completion.finish();
+        drop(fork_lifecycle);
         // Thread/vfork-style clones often rely on immediate child progress for
         // futex or parent/child tid handshakes. Plain fork children are seeded
         // behind the parent in CFS, so the parent can finish post-fork setup
@@ -621,7 +634,7 @@ impl CloneArgs {
         }
 
         if flags.contains(CloneFlags::VFORK) {
-            Self::wait_for_vfork(&new_proc_data);
+            Self::wait_for_vfork(&new_proc_data)?;
         }
 
         Ok(tid as _)

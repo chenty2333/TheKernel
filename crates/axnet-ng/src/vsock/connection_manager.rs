@@ -7,7 +7,7 @@ use axtask::WaitQueue;
 use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
 
 use super::{VsockAddr, VsockConnId};
-use crate::device::{start_vsock_poll, stop_vsock_poll};
+use crate::device::{notify_vsock_rx_capacity, start_vsock_poll, stop_vsock_poll};
 
 pub const VSOCK_RX_BUFFER_SIZE: usize = 64 * 1024; // 64KB receive buffer
 const VSOCK_ACCEPT_QUEUE_SIZE: usize = 128; // accept queue size
@@ -33,11 +33,11 @@ pub struct Connection {
     rx_consumer: HeapCons<u8>,
 
     /// wait queues for tx due to InsufficientBufferSpaceInPeer
-    tx_wait_queue: WaitQueue,
+    tx_wait_queue: Arc<WaitQueue>,
 
     /// Waker lists
-    rx_wakers: PollSet,
-    connect_wakers: PollSet,
+    rx_wakers: Arc<PollSet>,
+    connect_wakers: Arc<PollSet>,
 
     /// closed flags
     rx_closed: bool,
@@ -50,45 +50,38 @@ pub struct Connection {
 }
 
 impl Connection {
-    fn new(local_addr: VsockAddr, peer_addr: Option<VsockAddr>, state: ConnectionState) -> Self {
-        let rb = HeapRb::<u8>::new(VSOCK_RX_BUFFER_SIZE);
+    fn try_new(
+        local_addr: VsockAddr,
+        peer_addr: Option<VsockAddr>,
+        state: ConnectionState,
+    ) -> AxResult<Self> {
+        let rb = HeapRb::<u8>::try_new(VSOCK_RX_BUFFER_SIZE).map_err(|_| AxError::NoMemory)?;
         let (rx_producer, rx_consumer) = rb.split();
-        Self {
+        Ok(Self {
             state,
             local_addr,
             peer_addr,
             rx_producer,
             rx_consumer,
-            tx_wait_queue: WaitQueue::default(),
-            rx_wakers: PollSet::new(),
-            connect_wakers: PollSet::new(),
+            tx_wait_queue: Arc::try_new(WaitQueue::default()).map_err(|_| AxError::NoMemory)?,
+            rx_wakers: Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?,
+            connect_wakers: Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?,
             rx_closed: false,
             tx_closed: false,
             rx_bytes: 0,
             tx_bytes: 0,
             dropped_bytes: 0,
-        }
+        })
     }
 
-    /// Register a waker for accept events.
-    pub fn register_accept_poll(&mut self, context: &mut core::task::Context<'_>) {
-        // found listen queue
-        let manager = VSOCK_CONN_MANAGER.lock();
-        let queue = manager
-            .get_listen_queue(self.local_addr.port)
-            .expect("listen queue not found");
-        drop(manager);
-        queue.lock().register_poll(context);
+    /// Returns the stable receive-readiness source.
+    pub fn rx_poll_source(&self) -> Arc<PollSet> {
+        self.rx_wakers.clone()
     }
 
-    /// Register a waker for receive events.
-    pub fn register_rx_poll(&mut self, context: &mut core::task::Context<'_>) {
-        self.rx_wakers.register(context.waker());
-    }
-
-    /// Register a waker for connect events.
-    pub fn register_connect_poll(&mut self, _context: &mut core::task::Context<'_>) {
-        self.connect_wakers.register(_context.waker());
+    /// Returns the stable connection-completion source.
+    pub fn connect_poll_source(&self) -> Arc<PollSet> {
+        self.connect_wakers.clone()
     }
 
     /// Get the free space in the receive buffer
@@ -110,11 +103,11 @@ impl Connection {
 
         if to_write > 0 {
             let written = self.rx_producer.push_slice(&data[..to_write]);
-            self.rx_bytes += written;
+            self.rx_bytes = self.rx_bytes.saturating_add(written);
 
             if written < data.len() {
                 let dropped = data.len() - written;
-                self.dropped_bytes += dropped;
+                self.dropped_bytes = self.dropped_bytes.saturating_add(dropped);
                 info!(
                     "Vsock connection {:?} rx buffer full, dropped {} bytes",
                     (self.local_addr, self.peer_addr),
@@ -123,7 +116,7 @@ impl Connection {
             }
             written
         } else {
-            self.dropped_bytes += data.len();
+            self.dropped_bytes = self.dropped_bytes.saturating_add(data.len());
             info!(
                 "Vsock connection {:?} rx buffer full, dropped {} bytes",
                 (self.local_addr, self.peer_addr),
@@ -134,14 +127,16 @@ impl Connection {
     }
 
     #[inline]
-    pub fn wait_for_tx(&self) {
+    pub fn wait_for_tx(&self) -> AxResult<()> {
         self.tx_wait_queue
-            .wait_timeout(core::time::Duration::from_millis(10));
+            .wait_timeout(core::time::Duration::from_millis(10))
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     #[inline]
-    pub fn tx_wait_queue_notify(&mut self) {
-        self.tx_wait_queue.notify_all(true);
+    pub fn tx_wait_source(&self) -> Arc<WaitQueue> {
+        self.tx_wait_queue.clone()
     }
 
     #[inline]
@@ -154,21 +149,14 @@ impl Connection {
         unsafe {
             self.rx_consumer.advance_read_index(count);
         }
+        if count != 0 {
+            notify_vsock_rx_capacity();
+        }
     }
 
     #[inline]
     pub fn add_tx_bytes(&mut self, count: usize) {
-        self.tx_bytes += count;
-    }
-
-    #[inline]
-    pub fn wake_rx(&mut self) {
-        self.rx_wakers.wake();
-    }
-
-    #[inline]
-    pub fn wake_connect(&mut self) {
-        self.connect_wakers.wake();
+        self.tx_bytes = self.tx_bytes.saturating_add(count);
     }
 
     #[inline]
@@ -219,10 +207,11 @@ pub struct AcceptQueue {
 }
 
 impl AcceptQueue {
-    pub fn new() -> Self {
-        let rb = HeapRb::<VsockConnId>::new(VSOCK_ACCEPT_QUEUE_SIZE);
+    pub fn try_new() -> AxResult<Self> {
+        let rb = HeapRb::<VsockConnId>::try_new(VSOCK_ACCEPT_QUEUE_SIZE)
+            .map_err(|_| AxError::NoMemory)?;
         let (producer, consumer) = rb.split();
-        Self { producer, consumer }
+        Ok(Self { producer, consumer })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -247,27 +236,27 @@ impl AcceptQueue {
 /// listen queue
 pub struct ListenQueue {
     pub accept_queue: AcceptQueue,
-    pub wakers: PollSet,
+    pub wakers: Arc<PollSet>,
     pub local_addr: VsockAddr,
     backlog: usize,
 }
 
 impl ListenQueue {
-    pub fn new(local_addr: VsockAddr, backlog: usize) -> Self {
-        Self {
-            accept_queue: AcceptQueue::new(),
-            wakers: PollSet::new(),
+    pub fn try_new(local_addr: VsockAddr, backlog: usize) -> AxResult<Self> {
+        Ok(Self {
+            accept_queue: AcceptQueue::try_new()?,
+            wakers: Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?,
             local_addr,
             backlog: backlog.clamp(1, VSOCK_ACCEPT_QUEUE_SIZE),
-        }
+        })
     }
 
     pub fn wake(&mut self) {
         self.wakers.wake();
     }
 
-    pub fn register_poll(&mut self, context: &mut core::task::Context<'_>) {
-        self.wakers.register(context.waker());
+    pub fn poll_source(&self) -> Arc<PollSet> {
+        self.wakers.clone()
     }
 }
 
@@ -327,7 +316,8 @@ impl VsockConnectionManager {
             ax_bail!(AddrInUse, "port already in use");
         }
 
-        let queue = Arc::new(Mutex::new(ListenQueue::new(local_addr, backlog)));
+        let queue = Arc::try_new(Mutex::new(ListenQueue::try_new(local_addr, backlog)?))
+            .map_err(|_| AxError::NoMemory)?;
         self.listen_queues.insert(local_addr.port, queue);
         Ok(())
     }
@@ -335,7 +325,7 @@ impl VsockConnectionManager {
     /// stop listening
     pub fn unlisten(&mut self, port: u32) {
         self.listen_queues.remove(&port);
-        debug!("Vsock unlisten on port {}", port);
+        debug!("Vsock unlisten on port {port}");
     }
 
     /// check if port accept
@@ -356,7 +346,7 @@ impl VsockConnectionManager {
 
         let peer_addr = conn.lock().peer_addr.ok_or(AxError::NotFound)?;
 
-        debug!("Accepted connection: {:?} from {:?}", conn_id, peer_addr);
+        debug!("Accepted connection: {conn_id:?} from {peer_addr:?}");
         Ok((conn_id, peer_addr))
     }
 
@@ -367,20 +357,16 @@ impl VsockConnectionManager {
         local_addr: VsockAddr,
         peer_addr: Option<VsockAddr>,
         state: ConnectionState,
-    ) -> Arc<Mutex<Connection>> {
-        let conn = Connection::new(local_addr, peer_addr, state);
-        let conn = Arc::new(Mutex::new(conn));
+    ) -> AxResult<Arc<Mutex<Connection>>> {
         if self.connections.contains_key(&conn_id) {
-            info!("Connection {:?} already exists, overwriting", conn_id);
-        } else {
-            start_vsock_poll();
+            return Err(AxError::AlreadyExists);
         }
+        let conn = Connection::try_new(local_addr, peer_addr, state)?;
+        let conn = Arc::try_new(Mutex::new(conn)).map_err(|_| AxError::NoMemory)?;
+        start_vsock_poll()?;
         self.connections.insert(conn_id, conn.clone());
-        debug!(
-            "Created connection {:?}: local={:?}, peer={:?}",
-            conn_id, local_addr, peer_addr
-        );
-        conn
+        debug!("Created connection {conn_id:?}: local={local_addr:?}, peer={peer_addr:?}");
+        Ok(conn)
     }
 
     /// get a connection by id
@@ -413,7 +399,7 @@ impl VsockConnectionManager {
 
         // check if connection already exists
         if self.connections.contains_key(&conn_id) {
-            warn!("Connection {:?} already exists, ignoring request", conn_id);
+            warn!("Connection {conn_id:?} already exists, ignoring request");
             return Ok(());
         }
 
@@ -423,7 +409,7 @@ impl VsockConnectionManager {
             local_addr,
             Some(conn_id.peer_addr),
             ConnectionState::Connected,
-        );
+        )?;
 
         // enqueue connection to accept queue
         let mut queue_guard = queue.lock();
@@ -459,8 +445,11 @@ impl VsockConnectionManager {
 
         let mut conn_guard = conn.lock();
         let written = conn_guard.push_rx_data(data);
+        let rx_poll = conn_guard.rx_poll_source();
+        let buffer_used = conn_guard.rx_buffer_used();
+        drop(conn_guard);
         if written > 0 {
-            conn_guard.wake_rx();
+            rx_poll.wake();
         }
 
         trace!(
@@ -468,7 +457,7 @@ impl VsockConnectionManager {
             data.len(),
             conn_id,
             written,
-            conn_guard.rx_buffer_used(),
+            buffer_used,
             VSOCK_RX_BUFFER_SIZE
         );
         Ok(())
@@ -481,8 +470,12 @@ impl VsockConnectionManager {
             conn_guard.state = ConnectionState::Closed;
             conn_guard.rx_closed = true;
             conn_guard.tx_closed = true;
-            conn_guard.wake_rx();
-            trace!("Connection {:?} disconnected", conn_id);
+            let rx_poll = conn_guard.rx_poll_source();
+            let connect_poll = conn_guard.connect_poll_source();
+            drop(conn_guard);
+            rx_poll.wake();
+            connect_poll.wake();
+            trace!("Connection {conn_id:?} disconnected");
         }
         Ok(())
     }
@@ -492,8 +485,10 @@ impl VsockConnectionManager {
         if let Some(conn) = self.connections.get(&conn_id) {
             let mut conn_guard = conn.lock();
             conn_guard.state = ConnectionState::Connected;
-            conn_guard.wake_connect();
-            trace!("Connection {:?} established", conn_id);
+            let connect_poll = conn_guard.connect_poll_source();
+            drop(conn_guard);
+            connect_poll.wake();
+            trace!("Connection {conn_id:?} established");
         }
         Ok(())
     }
@@ -504,9 +499,9 @@ impl VsockConnectionManager {
     /// notify which tasks failed to be sent due to credit not being updated
     pub fn on_credit_update(&mut self, conn_id: VsockConnId) -> AxResult<()> {
         if let Some(conn) = self.connections.get(&conn_id) {
-            let mut conn_guard = conn.lock();
-            conn_guard.tx_wait_queue_notify();
-            trace!("Connection {:?} tx wait queue notified", conn_id);
+            let wait_queue = conn.lock().tx_wait_source();
+            wait_queue.notify_all(true);
+            trace!("Connection {conn_id:?} tx wait queue notified");
         }
         Ok(())
     }

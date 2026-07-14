@@ -1,0 +1,16 @@
+[package]
+name = "thekernel-readiness-adapter"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "TheKernel object-readiness adapter over bounded ax and Linux FD contracts"
+license = "Apache-2.0"
+
+[lib]
+name = "axpoll"
+path = "src/lib.rs"
+
+[dependencies]
+axerrno = "0.2"
+axpoll-core = { package = "thekernel-axpoll", version = "=0.1.0" }
+thekernel-linux-fd = { version = "=0.1.0", features = ["alloc"] }

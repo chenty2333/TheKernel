@@ -7,21 +7,23 @@ use core::{
     any::Any,
     ops::Deref,
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering},
     task::Context,
 };
 
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::NodeFlags;
-use axpoll::{IoEvents, Pollable};
+use axpoll::{IoEvents, PollSet, Pollable, RegisterError, RegistrationToken};
 use axtask::{WeakAxTaskRef, current, current_may_uninit};
+use kspin::SpinNoIrq;
 use linux_raw_sys::general::{
     POLL_ERR, POLL_HUP, POLL_IN, POLL_MSG, POLL_OUT, POLL_PRI, POLLERR, POLLHUP, POLLIN, POLLMSG,
     POLLOUT, POLLPRI, POLLRDBAND, POLLRDNORM, POLLWRBAND, POLLWRNORM, SI_SIGIO,
 };
 use spin::Mutex;
-use starry_process::{Pid, ProcessGroup};
+use starry_process::Pid;
 use starry_signal::{SignalInfo, Signo};
+use thekernel_linux_fd::{ExternalOffset, OfdId, OpenFileDescriptionState};
 
 use super::{
     executable::{self, ExecutableKey},
@@ -34,9 +36,9 @@ use super::{
 use crate::{
     deferred_work::DeferredWorkAccount,
     task::{
-        AsThread, Cred, ProcessData, Thread, get_process_data, get_process_group, get_visible_task,
-        send_queued_signal_thread_inner, send_queued_signal_to_process_data,
-        send_signal_thread_inner, send_signal_to_process_data,
+        AsThread, Cred, ProcessData, ProcessGroup, Thread, get_process_data, get_process_group,
+        get_visible_task, process_domain, send_queued_signal_thread_inner,
+        send_queued_signal_to_process_data, send_signal_thread_inner, send_signal_to_process_data,
     },
 };
 
@@ -51,6 +53,7 @@ static DESCRIPTION_CLEANUP_CREDITS: AtomicUsize = AtomicUsize::new(0);
 const FLOCK_RELEASE_BUDGET: usize = 16;
 const RECORD_LOCK_RELEASE_BUDGET: usize = 16;
 const MAX_LIVE_DESCRIPTION_CLEANUPS: usize = 65_536;
+const DESCRIPTION_CLOSE_WAITER_SLOTS: usize = 64;
 
 /// A fallibly allocated resource whose lifetime is exactly one open file
 /// description. Subsystems use this for state which must survive `dup` but be
@@ -265,20 +268,138 @@ pub(crate) fn drain_deferred_description_resource_only_for_test() {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct FileDescriptionId(u64);
+pub(crate) struct FileDescriptionId(OfdId);
 
 impl FileDescriptionId {
     pub(crate) const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    pub(crate) const fn linux_id(self) -> OfdId {
         self.0
     }
 
     fn allocate() -> AxResult<Self> {
-        FILE_DESCRIPTION_ID
+        let raw = FILE_DESCRIPTION_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
-            .map(Self)
-            .map_err(|_| AxError::TooManyOpenFiles)
+            .map_err(|_| AxError::TooManyOpenFiles)?;
+        OfdId::new(raw).map(Self).ok_or(AxError::BadState)
+    }
+}
+
+#[derive(Default)]
+struct DescriptorLifetimeState {
+    references: usize,
+    pending_publications: usize,
+    ever_published: bool,
+    terminal: bool,
+    close_source: Option<Arc<PollSet<DESCRIPTION_CLOSE_WAITER_SLOTS>>>,
+}
+
+impl DescriptorLifetimeState {
+    fn admit_publication(&mut self) -> AxResult<()> {
+        self.references
+            .checked_add(self.pending_publications)
+            .and_then(|total| total.checked_add(1))
+            .ok_or(AxError::TooManyOpenFiles)?;
+        self.pending_publications += 1;
+        Ok(())
+    }
+
+    fn commit_publication(&mut self) {
+        // A unique DescriptorPublication is created only after one successful
+        // admission, so both exact operations are proven by that charge.
+        self.pending_publications -= 1;
+        self.references += 1;
+        self.ever_published = true;
+    }
+
+    fn rollback_publication(&mut self) -> Option<Arc<PollSet<DESCRIPTION_CLOSE_WAITER_SLOTS>>> {
+        // The active token uniquely owns one pending charge.
+        self.pending_publications -= 1;
+        self.terminal_source_if_quiescent()
+    }
+
+    fn terminal_source_if_quiescent(
+        &mut self,
+    ) -> Option<Arc<PollSet<DESCRIPTION_CLOSE_WAITER_SLOTS>>> {
+        if self.ever_published
+            && self.references == 0
+            && self.pending_publications == 0
+            && !self.terminal
+        {
+            self.terminal = true;
+            self.close_source.clone()
+        } else {
+            None
+        }
+    }
+}
+
+/// Admission for publishing one descriptor which refers to an OFD.
+///
+/// The pending charge prevents a concurrent last close from retiring epoll
+/// interests between fd-table admission and publication. Dropping an
+/// uncommitted value rolls that charge back and performs terminal notification
+/// if it was the last possible publication.
+#[must_use = "descriptor publication must be committed or rolled back"]
+pub(crate) struct DescriptorPublication {
+    description: Arc<FileDescription>,
+    active: bool,
+}
+
+impl DescriptorPublication {
+    pub(crate) fn commit(mut self) {
+        let mut lifetime = self.description.descriptor_lifetime.lock();
+        lifetime.commit_publication();
+        self.active = false;
+    }
+}
+
+impl Drop for DescriptorPublication {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let close_source = {
+            let mut lifetime = self.description.descriptor_lifetime.lock();
+            lifetime.rollback_publication()
+        };
+        if let Some(source) = close_source {
+            source.close();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum DescriptorCloseRegistrationError {
+    NoMemory,
+    Full,
+    Closed,
+    TokenSpaceExhausted,
+}
+
+/// Owned, generation-safe notification for the terminal descriptor close of
+/// one OFD. It does not retain a `FileDescription`, so the observer cannot
+/// become a second source of OFD lifetime truth.
+pub(crate) struct DescriptorCloseRegistration {
+    source: Arc<PollSet<DESCRIPTION_CLOSE_WAITER_SLOTS>>,
+    token: Option<RegistrationToken>,
+}
+
+impl DescriptorCloseRegistration {
+    pub(crate) fn cancel(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.source.cancel(token);
+        }
+    }
+}
+
+impl Drop for DescriptorCloseRegistration {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
@@ -423,7 +544,13 @@ impl AsyncIoOwner {
                 .is_some_and(|process| process.proc.is_live()),
             Self::Pgrp { group, .. } => group
                 .upgrade()
-                .is_some_and(|group| group.any_process(|process| !process.is_zombie())),
+                .and_then(|group| {
+                    let domain = process_domain().ok()?;
+                    group
+                        .any_process(domain.registry(), |process| !process.is_zombie())
+                        .ok()
+                })
+                .unwrap_or(false),
         }
     }
 
@@ -608,7 +735,11 @@ pub(crate) fn send_sigio(state: &AsyncIoState, fd: i32, reason: u32) {
             let Some(group) = group.upgrade() else {
                 return;
             };
-            group.for_each_process(|process| {
+            let Ok(domain) = process_domain() else {
+                error!("process domain unavailable while delivering process-group SIGIO");
+                return;
+            };
+            if let Err(error) = group.for_each_process(domain.registry(), |process| {
                 if process.is_zombie() {
                     return;
                 }
@@ -622,7 +753,13 @@ pub(crate) fn send_sigio(state: &AsyncIoState, fd: i32, reason: u32) {
                     return;
                 }
                 send_sigio_to_process(&process_data, sigio_info(state.signal, fd, reason));
-            });
+            }) {
+                error!(
+                    "failed to enumerate process group {} for SIGIO: {}",
+                    group.pgid(),
+                    error
+                );
+            }
         }
     }
 }
@@ -631,9 +768,13 @@ pub struct FileDescription {
     pub inner: Arc<dyn FileLike>,
     open_credentials: OpenCredentials,
     open_security_credential: Option<Arc<Cred>>,
+    /// Immutable lock-free cache of the identity also carried by `ofd`.
+    /// Keeping this copy avoids taking the OFD state lock inside dnotify and
+    /// flock lock domains; it can never diverge because identities do not
+    /// mutate after construction.
     id: FileDescriptionId,
-    status_flags: AtomicU32,
-    async_io: Mutex<AsyncIoState>,
+    ofd: Mutex<OpenFileDescriptionState<AsyncIoState, ExternalOffset>>,
+    descriptor_lifetime: SpinNoIrq<DescriptorLifetimeState>,
     open_committed: AtomicBool,
     notification_work: Option<Box<super::inotify::CloseWork>>,
     cleanup_work: Option<Box<DescriptionCleanupWork>>,
@@ -713,8 +854,12 @@ impl FileDescription {
             open_credentials: OpenCredentials::current(),
             open_security_credential,
             id,
-            status_flags: AtomicU32::new(status_flags),
-            async_io: Mutex::new(AsyncIoState::default()),
+            ofd: Mutex::new(OpenFileDescriptionState::new_external(
+                id.linux_id(),
+                status_flags,
+                AsyncIoState::default(),
+            )),
+            descriptor_lifetime: SpinNoIrq::new(DescriptorLifetimeState::default()),
             open_committed: AtomicBool::new(false),
             notification_work,
             cleanup_work: Some(cleanup_work),
@@ -739,45 +884,168 @@ impl FileDescription {
     }
 
     pub fn status_flags(&self) -> u32 {
-        self.status_flags.load(Ordering::Relaxed)
+        self.ofd.lock().status_flags()
     }
 
     pub fn set_status_flags(&self, flags: u32) {
-        self.status_flags.store(flags, Ordering::Relaxed);
+        self.ofd.lock().commit_status_flags(flags);
     }
 
     pub fn async_io_state(&self) -> AsyncIoState {
-        self.async_io.lock().clone()
+        self.ofd.lock().async_owner().clone()
     }
 
     pub fn set_async_io_owner(&self, owner: AsyncIoOwner) {
         let credentials = (!owner.is_none())
             .then(AsyncIoCredentials::current)
             .flatten();
-        let mut state = self.async_io.lock();
+        let mut ofd = self.ofd.lock();
+        let state = ofd.async_owner_mut();
         state.owner = owner;
         state.credentials = credentials;
     }
 
     pub(crate) fn ensure_async_io_owner(&self, owner: AsyncIoOwner) {
-        let mut state = self.async_io.lock();
+        let credentials = AsyncIoCredentials::current();
+        let mut ofd = self.ofd.lock();
+        let state = ofd.async_owner_mut();
         if state.owner.is_none() {
-            state.credentials = AsyncIoCredentials::current();
+            state.credentials = credentials;
             state.owner = owner;
         }
     }
 
     pub fn set_async_io_signal(&self, signal: u8) {
-        self.async_io.lock().signal = signal;
+        self.ofd.lock().async_owner_mut().signal = signal;
     }
 
     pub(crate) fn mark_open_committed(&self) {
         self.open_committed.store(true, Ordering::Release);
     }
+
+    pub(crate) fn begin_descriptor_publication(
+        self: &Arc<Self>,
+    ) -> AxResult<DescriptorPublication> {
+        let retired_source = {
+            let mut lifetime = self.descriptor_lifetime.lock();
+            let retired_source = if lifetime.terminal {
+                if lifetime.references != 0 || lifetime.pending_publications != 0 {
+                    return Err(AxError::BadState);
+                }
+                // SCM_RIGHTS and other explicitly retained OFD owners may
+                // publish a descriptor after the preceding descriptor epoch
+                // reached zero. Old epoll watches stay terminal; the new epoch
+                // receives a fresh close source and cannot revive stale
+                // generation tokens.
+                lifetime.terminal = false;
+                lifetime.close_source.take()
+            } else {
+                None
+            };
+            lifetime.admit_publication()?;
+            retired_source
+        };
+        drop(retired_source);
+        Ok(DescriptorPublication {
+            description: Arc::clone(self),
+            active: true,
+        })
+    }
+
+    pub(crate) fn descriptor_closed(&self) {
+        let close_source = {
+            let mut lifetime = self.descriptor_lifetime.lock();
+            let Some(references) = lifetime.references.checked_sub(1) else {
+                error!("descriptor close observed an unaccounted OFD reference");
+                lifetime.terminal = true;
+                return;
+            };
+            lifetime.references = references;
+            lifetime.terminal_source_if_quiescent()
+        };
+        if let Some(source) = close_source {
+            source.close();
+        }
+    }
+
+    fn descriptor_close_source(
+        &self,
+    ) -> Result<Arc<PollSet<DESCRIPTION_CLOSE_WAITER_SLOTS>>, DescriptorCloseRegistrationError>
+    {
+        {
+            let lifetime = self.descriptor_lifetime.lock();
+            if lifetime.terminal {
+                return Err(DescriptorCloseRegistrationError::Closed);
+            }
+            if let Some(source) = lifetime.close_source.as_ref() {
+                return Ok(source.clone());
+            }
+        }
+
+        let candidate =
+            Arc::try_new(PollSet::new()).map_err(|_| DescriptorCloseRegistrationError::NoMemory)?;
+        let mut lifetime = self.descriptor_lifetime.lock();
+        if lifetime.terminal {
+            return Err(DescriptorCloseRegistrationError::Closed);
+        }
+        if let Some(source) = lifetime.close_source.as_ref() {
+            Ok(source.clone())
+        } else {
+            lifetime.close_source = Some(candidate.clone());
+            Ok(candidate)
+        }
+    }
+
+    pub(crate) fn register_descriptor_close(
+        &self,
+        waker: &core::task::Waker,
+    ) -> Result<DescriptorCloseRegistration, DescriptorCloseRegistrationError> {
+        let source = self.descriptor_close_source()?;
+        let token = source.register(waker).map_err(|error| match error {
+            RegisterError::Full => DescriptorCloseRegistrationError::Full,
+            RegisterError::Closed => DescriptorCloseRegistrationError::Closed,
+            RegisterError::TokenSpaceExhausted => {
+                DescriptorCloseRegistrationError::TokenSpaceExhausted
+            }
+        })?;
+        Ok(DescriptorCloseRegistration {
+            source,
+            token: Some(token),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn descriptor_reference_count(&self) -> usize {
+        self.descriptor_lifetime.lock().references
+    }
+
+    #[cfg(test)]
+    pub(crate) fn descriptor_pending_publication_count(&self) -> usize {
+        self.descriptor_lifetime.lock().pending_publications
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_committed_for_test(&self) -> bool {
+        self.open_committed.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for FileDescription {
     fn drop(&mut self) {
+        let close_source = {
+            let mut lifetime = self.descriptor_lifetime.lock();
+            if lifetime.references != 0 || lifetime.pending_publications != 0 {
+                error!(
+                    "FileDescription dropped with {} descriptor references and {} publications",
+                    lifetime.references, lifetime.pending_publications
+                );
+            }
+            lifetime.terminal = true;
+            lifetime.close_source.take()
+        };
+        if let Some(source) = close_source {
+            source.close();
+        }
         if self.open_committed.load(Ordering::Acquire)
             && let Some(work) = self.notification_work.take()
         {
@@ -829,8 +1097,12 @@ impl Pollable for FileDescription {
         self.inner.poll()
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        self.inner.register(context, events);
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        self.inner.register(context, events)
     }
 }
 
@@ -885,6 +1157,12 @@ impl<T, F: FnMut(T)> Drop for RestoreOnDrop<T, F> {
 }
 
 impl<T: ?Sized> FileHandle<T> {
+    /// Returns the stable key shared by handles for the same Linux open file
+    /// description, including handles reached through `dup` or table cloning.
+    pub(crate) fn open_file_description_key(&self) -> u64 {
+        self.description.id().get()
+    }
+
     pub fn status_flags(&self) -> u32 {
         self.description.status_flags()
     }
@@ -924,7 +1202,6 @@ impl<T: ?Sized> FileHandle<T> {
 #[derive(Clone)]
 pub struct FileDescriptor {
     pub description: Arc<FileDescription>,
-    pub cloexec: bool,
 }
 
 #[cfg(test)]
@@ -932,6 +1209,51 @@ mod tests {
     extern crate std;
 
     use super::*;
+
+    #[test]
+    fn descriptor_publication_charges_commit_and_rollback_exactly() {
+        let mut lifetime = DescriptorLifetimeState::default();
+        lifetime.admit_publication().unwrap();
+        lifetime.admit_publication().unwrap();
+        assert_eq!(lifetime.references, 0);
+        assert_eq!(lifetime.pending_publications, 2);
+
+        lifetime.commit_publication();
+        assert_eq!(lifetime.references, 1);
+        assert_eq!(lifetime.pending_publications, 1);
+        assert!(lifetime.ever_published);
+
+        assert!(lifetime.rollback_publication().is_none());
+        assert_eq!(lifetime.references, 1);
+        assert_eq!(lifetime.pending_publications, 0);
+    }
+
+    #[test]
+    fn descriptor_publication_rejects_overflow_without_saturation() {
+        let mut lifetime = DescriptorLifetimeState {
+            references: usize::MAX - 1,
+            ..DescriptorLifetimeState::default()
+        };
+
+        lifetime.admit_publication().unwrap();
+        assert_eq!(lifetime.admit_publication(), Err(AxError::TooManyOpenFiles));
+        lifetime.commit_publication();
+        assert_eq!(lifetime.references, usize::MAX);
+        assert_eq!(lifetime.pending_publications, 0);
+    }
+
+    #[test]
+    fn final_pending_rollback_retires_an_empty_published_epoch() {
+        let mut lifetime = DescriptorLifetimeState {
+            ever_published: true,
+            ..DescriptorLifetimeState::default()
+        };
+        lifetime.admit_publication().unwrap();
+
+        assert!(lifetime.rollback_publication().is_none());
+        assert_eq!(lifetime.pending_publications, 0);
+        assert!(lifetime.terminal);
+    }
 
     #[test]
     fn restore_guard_unwinds_nested_overrides_in_lifo_order() {

@@ -7,7 +7,6 @@ use alloc::{
 use core::{
     fmt::Write as _,
     sync::atomic::{AtomicI32, AtomicUsize, Ordering},
-    time::Duration,
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -26,8 +25,6 @@ use crate::{
     task::{AsThread, ProcStateHint, has_pending_syscall_signal, with_proc_state_hint},
     time::wall_time,
 };
-
-const MSG_WAIT_SLICE: Duration = Duration::from_millis(10);
 
 fn ipc_time_secs() -> __kernel_time_t {
     wall_time().as_secs() as __kernel_time_t
@@ -123,17 +120,33 @@ impl MessageQueue {
     /// Add a message to the queue
     pub fn enqueue_message(&mut self, mtype: i64, data: Vec<u8>) -> AxResult<()> {
         let data_len = data.len();
-        // Check queue size limits
-        if self.total_bytes + data_len > self.msqid_ds.msg_qbytes as usize {
+        if message_queue_would_exceed(self, data_len) {
             return Err(AxError::from(LinuxError::ENOSPC)); // ENOSPC
         }
+        self.messages
+            .try_reserve(1)
+            .map_err(|_| AxError::NoMemory)?;
+        let total_bytes = self
+            .total_bytes
+            .checked_add(data_len)
+            .ok_or(AxError::NoMemory)?;
+        let msg_cbytes = self
+            .msqid_ds
+            .msg_cbytes
+            .checked_add(data_len as __kernel_size_t)
+            .ok_or(AxError::NoMemory)?;
+        let msg_qnum = self
+            .msqid_ds
+            .msg_qnum
+            .checked_add(1)
+            .ok_or(AxError::NoMemory)?;
 
         let message = Message { mtype, data };
 
         self.messages.push_back(message);
-        self.total_bytes += data_len;
-        self.msqid_ds.msg_cbytes += data_len as __kernel_size_t;
-        self.msqid_ds.msg_qnum += 1;
+        self.total_bytes = total_bytes;
+        self.msqid_ds.msg_cbytes = msg_cbytes;
+        self.msqid_ds.msg_qnum = msg_qnum;
 
         Ok(())
     }
@@ -208,6 +221,19 @@ impl MessageQueue {
 
         Ok(removed_msg)
     }
+}
+
+fn message_queue_would_exceed(queue: &MessageQueue, data_len: usize) -> bool {
+    let byte_limit = queue.msqid_ds.msg_qbytes as usize;
+    let would_exceed_bytes = queue
+        .total_bytes
+        .checked_add(data_len)
+        .is_none_or(|total| total > byte_limit);
+    let would_exceed_messages = usize::try_from(queue.msqid_ds.msg_qnum)
+        .ok()
+        .and_then(|messages| messages.checked_add(1))
+        .is_none_or(|messages| messages > byte_limit);
+    would_exceed_bytes || would_exceed_messages
 }
 
 /// Message queue manager
@@ -584,12 +610,7 @@ pub fn sys_msgsnd(
 
             // Note: According to Linux manpage, both byte count and message count
             // are limited by msg_qbytes field (this appears to be the actual behavior)
-            let would_exceed_bytes =
-                msg_queue.total_bytes + data_vec.len() > msg_queue.msqid_ds.msg_qbytes as usize;
-            let would_exceed_messages =
-                (msg_queue.msqid_ds.msg_qnum + 1) as usize > msg_queue.msqid_ds.msg_qbytes as usize;
-
-            if !would_exceed_bytes && !would_exceed_messages {
+            if !message_queue_would_exceed(&msg_queue, data_vec.len()) {
                 msg_queue.enqueue_message(mtype, data_vec)?;
                 msg_queue.msqid_ds.msg_lspid = current_pid as _;
                 msg_queue.msqid_ds.msg_stime = ipc_time_secs();
@@ -608,8 +629,14 @@ pub fn sys_msgsnd(
             return Err(AxError::Interrupted);
         }
         with_proc_state_hint(ProcStateHint::Interruptible, || {
-            waiters.wait_timeout(MSG_WAIT_SLICE);
-        });
+            waiters.wait_until_interruptible(|| {
+                let queue = msg_queue.lock();
+                queue.mark_removed
+                    || !message_queue_would_exceed(&queue, data_vec.len())
+                    || has_pending_syscall_signal(thread)
+            })
+        })
+        .map_err(AxError::from)?;
     }
 }
 
@@ -750,8 +777,14 @@ pub fn sys_msgrcv(
             return Err(AxError::Interrupted);
         }
         with_proc_state_hint(ProcStateHint::Interruptible, || {
-            waiters.wait_timeout(MSG_WAIT_SLICE);
-        });
+            waiters.wait_until_interruptible(|| {
+                let queue = msg_queue.lock();
+                queue.mark_removed
+                    || find_msgrcv_message(&queue, msgtyp, &flags).is_some()
+                    || has_pending_syscall_signal(thread)
+            })
+        })
+        .map_err(AxError::from)?;
     }
 }
 

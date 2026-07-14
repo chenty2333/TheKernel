@@ -188,7 +188,9 @@ fn rearm_timer(now_ns: u64) {
 #[cfg(all(feature = "irq", feature = "multitask"))]
 pub fn set_early_timer_deadline(deadline: Option<axhal::time::TimeValue>) {
     let _guard = kernel_guard::IrqSave::new();
-    let deadline_ns = deadline.map_or(u64::MAX, |deadline| deadline.as_nanos().min(u128::from(u64::MAX)) as u64);
+    let deadline_ns = deadline.map_or(u64::MAX, |deadline| {
+        deadline.as_nanos().min(u128::from(u64::MAX)) as u64
+    });
     // Safety: `IrqSave` pins us to the current CPU while updating its local timer state.
     unsafe { EARLY_DEADLINE.write_current_raw(deadline_ns) };
     rearm_timer(axhal::time::monotonic_time_nanos());
@@ -304,7 +306,10 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     axhal::init_later(cpu_id, arg);
 
     #[cfg(feature = "multitask")]
-    axtask::init_scheduler();
+    if let Err(error) = axtask::init_scheduler() {
+        error!("Primary task scheduler initialization failed: {error:?}");
+        axhal::power::system_off();
+    }
 
     #[cfg(feature = "axdriver")]
     {
@@ -322,7 +327,10 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
 
         cfg_if::cfg_if! {
             if #[cfg(feature = "net-ng")] {
-                axnet_ng::init_network(all_devices.net);
+                if let Err(error) = axnet_ng::init_network(all_devices.net) {
+                    error!("Network subsystem initialization failed: {error:?}");
+                    axhal::power::system_off();
+                }
 
                 #[cfg(feature = "vsock")]
                 axnet_ng::init_vsock(all_devices.vsock);

@@ -9,11 +9,10 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet, Pollable};
-use starry_process::Process;
 
 use crate::{
     file::{FileLike, Kstat, PseudoInode},
-    task::{Cred, CredentialSlot, ProcessData, Thread},
+    task::{Cred, CredentialSlot, Process, ProcessData, Thread},
 };
 
 pub struct PidFd {
@@ -109,13 +108,19 @@ impl Pollable for PidFd {
                 .upgrade()
                 .is_none_or(|process| process.is_zombie())
         };
-        events.set(IoEvents::IN, exited);
+        events.set(IoEvents::READABLE, exited);
         events
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.contains(IoEvents::IN) {
-            self.exit_event.register(context.waker());
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        if events.contains(IoEvents::READABLE) {
+            axpoll::PollRegistration::single(&self.exit_event, context.waker())
+        } else {
+            axpoll::PollRegistration::empty()
         }
     }
 }

@@ -16,8 +16,8 @@ use axpoll::PollSet;
 use axsync::{Mutex, spin::SpinNoIrq};
 use hashbrown::HashMap;
 use scope_local::Scope;
-use spin::RwLock;
-use starry_process::{Pid, Process, ProcessError, ThreadAdmission as StarryThreadAdmission};
+use spin::{Once, RwLock};
+use starry_process::{Pid, ProcessError};
 use starry_signal::{
     SignalInfo, SignalQueueAccount, Signo,
     api::{ProcessSignalManager, SignalActions},
@@ -57,6 +57,43 @@ use crate::{
     mm::AddrSpace,
     time::wall_time,
 };
+
+/// Linux process identity bound to the immutable group-leader credential
+/// retained in the durable zombie payload.
+pub(crate) type Process = starry_process::Process<Arc<Cred>>;
+/// Linux process-group identity in the kernel-owned process domain.
+pub(crate) type ProcessGroup = starry_process::ProcessGroup<Arc<Cred>>;
+/// Linux session identity in the kernel-owned process domain.
+pub(crate) type Session = starry_process::Session<Arc<Cred>>;
+/// Durable process-exit payload used by wait, procfs, and permission paths.
+pub(crate) type ZombieSnapshot = starry_process::ZombieSnapshot<Arc<Cred>>;
+/// Fallibly reserved storage consumed by the final process exit.
+pub(crate) type PreparedZombieSnapshot = starry_process::PreparedZombieSnapshot<Arc<Cred>>;
+/// Prepared payload bound to a validated final-exit transaction.
+pub(crate) type PreparedZombieExit = starry_process::PreparedZombieExit<Arc<Cred>>;
+/// Fully validated final process-exit transaction.
+pub(crate) type ProcessExitAdmission = starry_process::ProcessExitAdmission<Arc<Cred>>;
+/// Completed final-exit transaction with its linearized parent and reaper.
+pub(crate) type CommittedProcessExit = starry_process::CommittedProcessExit<Arc<Cred>>;
+/// Domain-coordinated thread removal and optional final-exit reservation.
+pub(crate) type ThreadExitTransition = starry_process::ThreadExitTransition<Arc<Cred>>;
+/// Type-bound unpublished process plus initial-thread publication transaction.
+pub(crate) type InitialProcessAdmission = starry_process::InitialProcessAdmission<Arc<Cred>>;
+/// The kernel's sole process lifecycle and topology owner.
+pub(crate) type ProcessDomain = starry_process::ProcessDomain<Arc<Cred>>;
+type StarryThreadAdmission = starry_process::ThreadAdmission<Arc<Cred>>;
+
+static PROCESS_DOMAIN: Once<ProcessDomain> = Once::new();
+
+/// Initializes the sole kernel-owned process domain before publishing init.
+pub(crate) fn init_process_domain() -> AxResult<&'static ProcessDomain> {
+    PROCESS_DOMAIN.try_call_once(|| ProcessDomain::try_new().map_err(process_error))
+}
+
+/// Returns the process domain after boot initialization.
+pub(crate) fn process_domain() -> AxResult<&'static ProcessDomain> {
+    PROCESS_DOMAIN.get().ok_or(AxError::BadState)
+}
 
 pub(crate) const UTS_FIELD_LEN: usize = 64;
 const PROC_NS_INO_BASE: u64 = 0x9_0000_0000;
@@ -862,6 +899,12 @@ impl GroupLeaderCredentialBinding {
 pub struct ProcessData {
     /// The process.
     pub proc: Arc<Process>,
+    /// Serializes child admission through publication against final exit and
+    /// reparenting for this process.
+    process_lifecycle: Mutex<()>,
+    /// The only allocation needed to publish this process's durable zombie
+    /// payload. It is reserved before the process becomes visible.
+    prepared_zombie_snapshot: SpinNoIrq<Option<PreparedZombieSnapshot>>,
     /// Stable identity of the Linux thread-group leader credential owner.
     ///
     /// This is a strong reference to the leader task's sole publication slot,
@@ -972,48 +1015,140 @@ pub(crate) struct GroupLeaderRetirement<'a> {
     _slot: Arc<CredentialSlot>,
 }
 
-fn process_error(error: ProcessError) -> AxError {
+pub(crate) fn process_error(error: ProcessError) -> AxError {
     match error {
         ProcessError::NoMemory | ProcessError::Capacity => AxError::NoMemory,
         ProcessError::AlreadyExists => AxError::AlreadyExists,
+        ProcessError::NotPublished | ProcessError::NotLive | ProcessError::NotInitialized => {
+            AxError::NoSuchProcess
+        }
+        ProcessError::Busy => AxError::ResourceBusy,
+        ProcessError::WrongDomain => AxError::BadState,
+        _ => AxError::BadState,
     }
 }
 
-/// Thread-group capacity held across fallible clone construction.
-pub(crate) struct ProcessThreadAdmission {
+/// Exec exclusion charge held across fallible clone construction.
+struct PendingThreadAddition {
     proc_data: Arc<ProcessData>,
-    membership: Option<StarryThreadAdmission>,
-    committed: bool,
+    armed: bool,
+}
+
+impl PendingThreadAddition {
+    fn finish_locked(&mut self, exec_ctl: &mut ExecControlState) -> bool {
+        debug_assert!(exec_ctl.pending_thread_additions != 0);
+        exec_ctl.pending_thread_additions -= 1;
+        self.armed = false;
+        exec_ctl.pending_thread_additions == 0
+    }
+
+    fn finish(mut self) {
+        let proc_data = self.proc_data.clone();
+        let mut exec_ctl = proc_data.exec_ctl.lock();
+        let wake = self.finish_locked(&mut exec_ctl);
+        drop(exec_ctl);
+        if wake {
+            proc_data.exec_event.wake();
+        }
+    }
+}
+
+impl Drop for PendingThreadAddition {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let proc_data = self.proc_data.clone();
+        let mut exec_ctl = proc_data.exec_ctl.lock();
+        let wake = self.finish_locked(&mut exec_ctl);
+        drop(exec_ctl);
+        if wake {
+            proc_data.exec_event.wake();
+        }
+    }
+}
+
+/// Completion guard for a thread whose core identity is published but whose
+/// signal/task-table/runqueue transaction is still externally incomplete.
+#[must_use = "thread publication remains pending until this guard is finished"]
+pub(crate) struct PendingThreadPublication {
+    pending: PendingThreadAddition,
+    group_exited_at_core: bool,
+}
+
+const fn group_exit_handoff_requires_kill(core_observed: bool, late_gate_observed: bool) -> bool {
+    core_observed || late_gate_observed
+}
+
+impl PendingThreadPublication {
+    /// Samples the permanent group-exit gate after TASK_TABLE publication.
+    ///
+    /// If core publication itself observed group exit, or the gate linearized
+    /// between that point and this late sample, the exact prepared task must
+    /// receive SIGKILL before entering the runqueue.
+    pub(crate) fn must_terminate_for_group_exit(&self) -> bool {
+        // `group_exit_in_progress` acquires exec_ctl again after TASK_TABLE
+        // publication. This is deliberately not a cached core-commit result:
+        // it covers group_exit linearizing after core publication but before
+        // TASK_TABLE, when the first TID scan cannot resolve the task yet.
+        group_exit_handoff_requires_kill(
+            self.group_exited_at_core,
+            self.pending.proc_data.group_exit_in_progress(),
+        )
+    }
+
+    /// Makes the completed task/runqueue publication visible to exec/group-exit.
+    pub(crate) fn finish(self) {
+        self.pending.finish();
+    }
+}
+
+/// Live-process thread membership held across fallible clone construction.
+pub(crate) struct ProcessThreadAdmission {
+    // Drop the core reservation before making exec observe no pending clone.
+    membership: StarryThreadAdmission,
+    pending: PendingThreadAddition,
 }
 
 impl ProcessThreadAdmission {
     /// Publishes the reserved TID while keeping exec exclusion atomic with the
     /// thread-group mutation.
-    pub(crate) fn commit(mut self) {
-        let mut membership = self.membership.take();
-        let mut exec_ctl = self.proc_data.exec_ctl.lock();
-        if let Some(membership) = membership.as_mut() {
-            membership.publish();
-            exec_ctl.pending_thread_additions -= 1;
-            self.committed = true;
+    pub(crate) fn commit(self) -> PendingThreadPublication {
+        let Self {
+            membership,
+            pending,
+        } = self;
+        let outcome = membership.commit_infallible();
+        PendingThreadPublication {
+            pending,
+            group_exited_at_core: outcome == starry_process::ThreadPublicationOutcome::GroupExited,
         }
-        drop(exec_ctl);
-        drop(membership);
     }
 }
 
-impl Drop for ProcessThreadAdmission {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        let mut exec_ctl = self.proc_data.exec_ctl.lock();
-        let membership = self.membership.take();
-        if membership.is_some() {
-            exec_ctl.pending_thread_additions -= 1;
-        }
-        drop(exec_ctl);
-        drop(membership);
+/// Unpublished process plus initial thread held across runtime construction.
+pub(crate) struct InitialProcessThreadAdmission {
+    // Roll back the core composite before making exec observe no pending clone.
+    publication: InitialProcessAdmission,
+    pending: PendingThreadAddition,
+}
+
+impl InitialProcessThreadAdmission {
+    /// Publishes the type-bound process/initial-thread pair before making exec
+    /// observe that clone construction has completed.
+    pub(crate) fn commit(self) -> (Arc<Process>, PendingThreadPublication) {
+        let Self {
+            publication,
+            pending,
+        } = self;
+        let process = publication.commit();
+        (
+            process,
+            PendingThreadPublication {
+                pending,
+                group_exited_at_core: false,
+            },
+        )
     }
 }
 
@@ -1021,6 +1156,7 @@ impl ProcessData {
     /// Fallibly creates unpublished process runtime state.
     pub(crate) fn try_new(
         proc: Arc<Process>,
+        prepared_zombie_snapshot: PreparedZombieSnapshot,
         group_leader_credential: Arc<CredentialSlot>,
         exe_path: String,
         executable: Option<ExecutableKey>,
@@ -1060,6 +1196,8 @@ impl ProcessData {
         let vfork_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let data = Self {
             proc,
+            process_lifecycle: Mutex::new(()),
+            prepared_zombie_snapshot: SpinNoIrq::new(Some(prepared_zombie_snapshot)),
             group_leader_credential: GroupLeaderCredentialBinding::new(group_leader_credential),
             exe_path: RwLock::new(exe_path),
             executable: SpinNoIrq::new(executable),
@@ -1114,6 +1252,31 @@ impl ProcessData {
         };
         executable_rollback.0 = None;
         Arc::try_new(data).map_err(|_| AxError::NoMemory)
+    }
+
+    /// Reserves the fixed-cost zombie payload allocation before process
+    /// publication. Final exit only fills this storage and cannot allocate.
+    pub(crate) fn try_prepare_zombie_snapshot() -> AxResult<PreparedZombieSnapshot> {
+        PreparedZombieSnapshot::try_new().map_err(|_| AxError::NoMemory)
+    }
+
+    /// Serializes fork admission through commit against final exit.
+    pub(crate) fn lock_process_lifecycle(&self) -> axsync::MutexGuard<'_, ()> {
+        self.process_lifecycle.lock()
+    }
+
+    /// Binds this process's sole payload reservation only after the process
+    /// domain has validated and exclusively reserved final exit.
+    pub(crate) fn prepare_zombie_exit(
+        &self,
+        exit: ProcessExitAdmission,
+    ) -> AxResult<PreparedZombieExit> {
+        let prepared = self
+            .prepared_zombie_snapshot
+            .lock()
+            .take()
+            .ok_or(AxError::BadState)?;
+        Ok(prepared.bind_exit(exit))
     }
 
     /// Takes one immutable snapshot from the currently bound Linux
@@ -1574,8 +1737,26 @@ impl ProcessData {
         tracer
     }
 
-    pub fn ptrace_tracees(&self) -> Vec<Pid> {
-        self.ptrace_tracees.lock().clone()
+    pub fn try_ptrace_tracees(&self) -> AxResult<Vec<Pid>> {
+        let mut snapshot = Vec::new();
+        loop {
+            let required = self.ptrace_tracees.lock().len();
+            if snapshot.capacity() < required {
+                snapshot
+                    .try_reserve_exact(required)
+                    .map_err(|_| AxError::NoMemory)?;
+            }
+            let tracees = self.ptrace_tracees.lock();
+            if snapshot.capacity() < tracees.len() {
+                drop(tracees);
+                continue;
+            }
+            snapshot.clear();
+            for &pid in tracees.iter() {
+                snapshot.push(pid);
+            }
+            return Ok(snapshot);
+        }
     }
 
     pub fn add_ptrace_tracee(&self, tracee: Pid) {
@@ -1747,6 +1928,9 @@ impl ProcessData {
     /// Begins a multi-thread exec de-threading phase.
     pub fn begin_exec(&self, owner: Pid) -> bool {
         let mut exec_ctl = self.exec_ctl.lock();
+        if exec_ctl.group_exit {
+            return false;
+        }
         match exec_ctl.owner {
             Some(curr) => curr == owner,
             None if exec_ctl.pending_thread_additions == 0 => {
@@ -1766,7 +1950,8 @@ impl ProcessData {
     /// and clone rolls back. Callers must pair success with `end_exec(owner)`.
     pub fn begin_single_thread_scope_change(&self, owner: Pid) -> bool {
         let mut exec_ctl = self.exec_ctl.lock();
-        if exec_ctl.owner.is_some()
+        if exec_ctl.group_exit
+            || exec_ctl.owner.is_some()
             || exec_ctl.pending_thread_additions != 0
             || !self.proc.has_only_thread(owner)
         {
@@ -1791,28 +1976,82 @@ impl ProcessData {
         self.exec_ctl.lock().owner.is_some()
     }
 
+    /// Closes thread admission for a group-wide exit and cancels any exec gate.
+    ///
+    /// The first caller atomically establishes both the kernel admission gate
+    /// and core group-exit state, then returns `true` so it can scan currently
+    /// published TIDs. A pre-gate clone that publishes after that scan observes
+    /// this permanent gate before runqueue insertion and self-arms SIGKILL.
+    pub(crate) fn begin_group_exit(&self, exit_code: i32) -> bool {
+        let mut exec_ctl = self.exec_ctl.lock();
+        if exec_ctl.group_exit {
+            return false;
+        }
+        exec_ctl.group_exit = true;
+        let cancelled_exec = exec_ctl.owner.take().is_some();
+        let established = self.proc.group_exit(exit_code);
+        debug_assert!(established, "kernel group-exit gate lost core ownership");
+        drop(exec_ctl);
+        if cancelled_exec {
+            self.exec_event.wake();
+        }
+        true
+    }
+
+    /// Returns whether the permanent group-exit gate has linearized.
+    pub(crate) fn group_exit_in_progress(&self) -> bool {
+        self.exec_ctl.lock().group_exit
+    }
+
     /// Reserves process membership for a thread unless exec has gated creation.
     pub(crate) fn prepare_thread(self: &Arc<Self>, tid: Pid) -> AxResult<ProcessThreadAdmission> {
         // The intrusive membership node is allocated before entering the
         // exec-control SpinNoIrq domain. It remains invisible until commit.
-        let membership = self.proc.prepare_thread(tid).map_err(process_error)?;
+        let membership = process_domain()?
+            .prepare_thread(&self.proc, tid)
+            .map_err(process_error)?;
+        self.prepare_thread_membership(membership)
+    }
+
+    /// Binds an unpublished fork's initial thread reservation to this runtime
+    /// object while preserving the exec/thread-addition exclusion contract.
+    pub(crate) fn prepare_initial_thread(
+        self: &Arc<Self>,
+        publication: InitialProcessAdmission,
+    ) -> AxResult<InitialProcessThreadAdmission> {
+        let pending = self.prepare_thread_addition()?;
+        Ok(InitialProcessThreadAdmission {
+            publication,
+            pending,
+        })
+    }
+
+    fn prepare_thread_membership(
+        self: &Arc<Self>,
+        membership: StarryThreadAdmission,
+    ) -> AxResult<ProcessThreadAdmission> {
+        let pending = self.prepare_thread_addition()?;
+        Ok(ProcessThreadAdmission {
+            membership,
+            pending,
+        })
+    }
+
+    fn prepare_thread_addition(self: &Arc<Self>) -> AxResult<PendingThreadAddition> {
         let mut exec_ctl = self.exec_ctl.lock();
-        if exec_ctl.owner.is_some() {
+        if exec_ctl.owner.is_some() || exec_ctl.group_exit {
             drop(exec_ctl);
-            drop(membership);
             return Err(AxError::Interrupted);
         }
         let Some(pending) = exec_ctl.pending_thread_additions.checked_add(1) else {
             drop(exec_ctl);
-            drop(membership);
             return Err(AxError::NoMemory);
         };
         exec_ctl.pending_thread_additions = pending;
         drop(exec_ctl);
-        Ok(ProcessThreadAdmission {
+        Ok(PendingThreadAddition {
             proc_data: self.clone(),
-            membership: Some(membership),
-            committed: false,
+            armed: true,
         })
     }
 
@@ -1870,7 +2109,8 @@ mod tests {
 
     use super::{
         GroupLeaderCredentialBinding, SIGNAL_QUEUE_GLOBAL_HARD_LIMIT,
-        SIGNAL_QUEUE_PER_USER_HARD_LIMIT, UserNamespace, init_uts_state, try_increment_bounded,
+        SIGNAL_QUEUE_PER_USER_HARD_LIMIT, UserNamespace, group_exit_handoff_requires_kill,
+        init_uts_state, try_increment_bounded,
     };
     use crate::task::{
         Cred, CredentialSlot,
@@ -1911,6 +2151,14 @@ mod tests {
         assert_eq!(counter.fetch_sub(1, Ordering::Release), 2);
         assert!(try_increment_bounded(&counter, 2));
         assert_eq!(counter.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn late_group_exit_gate_covers_core_to_task_table_window() {
+        assert!(!group_exit_handoff_requires_kill(false, false));
+        assert!(group_exit_handoff_requires_kill(true, false));
+        assert!(group_exit_handoff_requires_kill(false, true));
+        assert!(group_exit_handoff_requires_kill(true, true));
     }
 
     #[test]

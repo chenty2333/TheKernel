@@ -1,4 +1,4 @@
-use core::{future::poll_fn, task::Poll, time::Duration};
+use core::time::Duration;
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::FileFlags;
@@ -18,7 +18,10 @@ use linux_raw_sys::general::{
 use starry_signal::{SignalInfo, Signo};
 
 use super::{FD_TABLE, File};
-use crate::task::{AsThread, send_signal_to_process};
+use crate::{
+    readiness::{poll_io_error, poll_set_io},
+    task::{AsThread, send_signal_to_process},
+};
 
 type InodeId = (u64, u64);
 type LeaseOwner = u64;
@@ -118,19 +121,12 @@ fn file_open_has_write(file: &File) -> bool {
 
 fn count_open_fds_for_location(loc: &Location) -> usize {
     let id = lease_id(loc);
-    let table = FD_TABLE.read();
-    table
-        .ids()
-        .filter(|fd| {
-            table.get(*fd).is_some_and(|entry| {
-                entry
-                    .description
-                    .inner
-                    .downcast_ref::<File>()
-                    .is_some_and(|file| lease_id(file.inner().location()) == id)
-            })
-        })
-        .count()
+    FD_TABLE.count_descriptions(|description| {
+        description
+            .inner
+            .downcast_ref::<File>()
+            .is_some_and(|file| lease_id(file.inner().location()) == id)
+    })
 }
 
 fn update_breaking_state(state: &mut LeaseState, conflict: ConflictType) -> bool {
@@ -186,27 +182,26 @@ fn wait_for_conflict(id: InodeId, conflict: ConflictType) -> AxResult<()> {
         let _ = send_signal_to_process(holder_pid, Some(SignalInfo::new_kernel(Signo::SIGIO)));
     }
 
-    match block_on(interruptible(timeout_at(
-        Some(deadline),
-        poll_fn(|cx| {
+    match block_on(interruptible(timeout_at(Some(deadline), async {
+        poll_set_io(&LEASE_WAITERS, || {
             if conflict_cleared(id, breaker_pid, conflict) {
-                Poll::Ready(())
+                Ok(())
             } else {
-                LEASE_WAITERS.register(cx.waker());
-                if conflict_cleared(id, breaker_pid, conflict) {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
+                Err(AxError::WouldBlock)
             }
-        }),
-    ))) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => {
+        })
+        .await
+        .map_err(poll_io_error)
+    }))) {
+        Err(error) => Err(error.into()),
+        Ok(Err(_)) => Err(AxError::Interrupted),
+        Ok(Ok(Ok(Ok(())))) => Ok(()),
+        Ok(Ok(Ok(Err(error)))) => Err(error),
+        Ok(Ok(Err(axtask::future::TimeoutError::Elapsed(_)))) => {
             force_break_lease(id);
             Ok(())
         }
-        Err(_) => Err(AxError::Interrupted),
+        Ok(Ok(Err(axtask::future::TimeoutError::Timer(error)))) => Err(error.into()),
     }
 }
 

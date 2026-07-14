@@ -20,6 +20,19 @@ use super::File;
 /// Maximum number of symlinks that will be followed during path resolution.
 pub const SYMLINKS_MAX: usize = 40;
 
+/// One pathname component observed by a per-walk policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathwalkComponent<'a> {
+    /// Filesystem root separator.
+    Root,
+    /// Current-directory component (`.`).
+    Current,
+    /// Parent-directory component (`..`).
+    Parent,
+    /// Named component.
+    Normal(&'a str),
+}
+
 /// Per-walk policy hooks for topology-sensitive path resolution.
 ///
 /// The VFS reports generic traversal events; callers decide whether a
@@ -27,15 +40,23 @@ pub const SYMLINKS_MAX: usize = 40;
 /// This keeps ABI-specific policies such as `openat2(2)` out of the generic
 /// resolver while ensuring policy and lookup share one walk.
 pub trait PathwalkPolicy {
+    fn component(
+        &mut self,
+        _directory: &Location,
+        _component: PathwalkComponent<'_>,
+    ) -> VfsResult<()> {
+        Ok(())
+    }
+
     fn observe_mount_access(&self) -> bool {
         true
     }
 
-    fn follow_magic_link(&mut self, _link: &Location) -> VfsResult<()> {
+    fn follow_magic_link(&mut self, _link: &Location, _final_component: bool) -> VfsResult<()> {
         Ok(())
     }
 
-    fn follow_symlink(&mut self, _link: &Location) -> VfsResult<()> {
+    fn follow_symlink(&mut self, _link: &Location, _final_component: bool) -> VfsResult<()> {
         Ok(())
     }
 
@@ -234,6 +255,21 @@ impl FsContext {
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
         P: PathwalkPolicy + ?Sized,
     {
+        self.try_resolve_symlink_with_policy_at(loc, follow_count, admission, policy, true)
+    }
+
+    fn try_resolve_symlink_with_policy_at<F, P>(
+        &self,
+        loc: Location,
+        follow_count: &mut usize,
+        admission: &mut F,
+        policy: &mut P,
+        final_component: bool,
+    ) -> VfsResult<Location>
+    where
+        F: FnMut(&Location) -> VfsResult<()> + ?Sized,
+        P: PathwalkPolicy + ?Sized,
+    {
         if loc.node_type() != NodeType::Symlink {
             return Ok(loc);
         }
@@ -241,9 +277,9 @@ impl FsContext {
             return Err(VfsError::FilesystemLoop);
         }
         if loc.flags().contains(NodeFlags::MAGIC_LINK) {
-            policy.follow_magic_link(&loc)?;
+            policy.follow_magic_link(&loc, final_component)?;
         }
-        policy.follow_symlink(&loc)?;
+        policy.follow_symlink(&loc, final_component)?;
         *follow_count += 1;
         let target = loc.read_link()?;
         if target.is_empty() {
@@ -257,6 +293,7 @@ impl FsContext {
         &self,
         dir: &Location,
         name: &str,
+        final_component: bool,
         follow_count: &mut usize,
         admission: &mut F,
         policy: &mut P,
@@ -265,13 +302,20 @@ impl FsContext {
         F: FnMut(&Location) -> VfsResult<()> + ?Sized,
         P: PathwalkPolicy + ?Sized,
     {
+        policy.component(dir, PathwalkComponent::Normal(name))?;
         admission(dir)?;
         let loc = Self::lookup_no_follow_with_policy(dir, name, policy)?;
         if loc.node_type() != NodeType::Symlink && loc.flags().contains(NodeFlags::MAGIC_LINK) {
-            policy.follow_magic_link(&loc)?;
+            policy.follow_magic_link(&loc, final_component)?;
         }
         self.with_current_dir(dir.clone())?
-            .try_resolve_symlink_with_policy(loc, follow_count, admission, policy)
+            .try_resolve_symlink_with_policy_at(
+                loc,
+                follow_count,
+                admission,
+                policy,
+                final_component,
+            )
     }
 
     fn resolve_components_with_policy<F, P>(
@@ -290,10 +334,12 @@ impl FsContext {
         for comp in components {
             match comp {
                 Component::CurDir => {
+                    policy.component(&dir, PathwalkComponent::Current)?;
                     dir.check_is_dir()?;
                     admission(&dir)?;
                 }
                 Component::ParentDir => {
+                    policy.component(&dir, PathwalkComponent::Parent)?;
                     dir.check_is_dir()?;
                     admission(&dir)?;
                     if dir.ptr_eq(&self.root_dir) {
@@ -311,6 +357,7 @@ impl FsContext {
                     }
                 }
                 Component::RootDir => {
+                    policy.component(&dir, PathwalkComponent::Root)?;
                     policy.absolute_root(&dir, &self.root_dir)?;
                     let crossed_mount = !Arc::ptr_eq(dir.mountpoint(), self.root_dir.mountpoint());
                     if crossed_mount {
@@ -322,7 +369,14 @@ impl FsContext {
                     }
                 }
                 Component::Normal(name) => {
-                    dir = self.lookup_with_policy(&dir, name, follow_count, admission, policy)?;
+                    dir = self.lookup_with_policy(
+                        &dir,
+                        name,
+                        false,
+                        follow_count,
+                        admission,
+                        policy,
+                    )?;
                 }
             }
         }
@@ -414,7 +468,9 @@ impl FsContext {
     {
         let (dir, name) = self.resolve_inner_with_policy(path, follow_count, admission, policy)?;
         let loc = match name {
-            Some(name) => self.lookup_with_policy(&dir, name, follow_count, admission, policy),
+            Some(name) => {
+                self.lookup_with_policy(&dir, name, true, follow_count, admission, policy)
+            }
             None => Ok(dir),
         }?;
         if path_requires_directory(path) {
@@ -575,6 +631,7 @@ impl FsContext {
                 Err(err) => return Err(err),
             };
         admission(&parent)?;
+        policy.component(&parent, PathwalkComponent::Normal(&name))?;
 
         let loc = match Self::lookup_no_follow_with_policy(&parent, &name, policy) {
             Ok(loc) => {
@@ -607,16 +664,16 @@ impl FsContext {
             && loc.node_type() != NodeType::Symlink
             && loc.flags().contains(NodeFlags::MAGIC_LINK)
         {
-            policy.follow_magic_link(&loc)?;
+            policy.follow_magic_link(&loc, true)?;
         }
         if (follow_final_symlink || requires_directory) && loc.node_type() == NodeType::Symlink {
             if !Self::may_follow_symlink(&loc) || *follow_count >= SYMLINKS_MAX {
                 return Err(VfsError::FilesystemLoop);
             }
             if loc.flags().contains(NodeFlags::MAGIC_LINK) {
-                policy.follow_magic_link(&loc)?;
+                policy.follow_magic_link(&loc, true)?;
             }
-            policy.follow_symlink(&loc)?;
+            policy.follow_symlink(&loc, true)?;
             *follow_count += 1;
             let target = loc.read_link()?;
             if target.is_empty() {
@@ -967,10 +1024,10 @@ mod tests {
         NodeType, Reference, RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult,
         WeakDirEntry, drain_deferred_dentry_cache_cleanup, path::Path,
     };
-    use axpoll::{IoEvents, Pollable};
+    use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
     use spin::Once;
 
-    use super::{FsContext, PathwalkPolicy, set_mount_access_policy};
+    use super::{FsContext, PathwalkComponent, PathwalkPolicy, set_mount_access_policy};
     use crate::OpenOptions;
 
     // Keep normal unmount as a consuming capability operation. In particular,
@@ -1207,10 +1264,16 @@ mod tests {
 
     impl Pollable for TestFile {
         fn poll(&self) -> IoEvents {
-            IoEvents::IN | IoEvents::OUT
+            IoEvents::READABLE | IoEvents::WRITABLE
         }
 
-        fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+        fn register<'a>(
+            &'a self,
+            _context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+            PollRegistration::empty()
+        }
     }
 
     impl FileNodeOps for TestFile {
@@ -1692,7 +1755,7 @@ mod tests {
     struct RejectSymlink;
 
     impl PathwalkPolicy for RejectSymlink {
-        fn follow_symlink(&mut self, _link: &Location) -> VfsResult<()> {
+        fn follow_symlink(&mut self, _link: &Location, _final_component: bool) -> VfsResult<()> {
             Err(VfsError::FilesystemLoop)
         }
     }
@@ -1702,6 +1765,53 @@ mod tests {
         let context = TestFs::context();
         let result = context.resolve_with_policy("/jump", &mut |_| Ok(()), &mut RejectSymlink);
         assert_eq!(result.unwrap_err(), VfsError::FilesystemLoop);
+    }
+
+    #[derive(Default)]
+    struct ObserveWalk {
+        components: Vec<String>,
+        final_symlinks: Vec<bool>,
+    }
+
+    impl PathwalkPolicy for ObserveWalk {
+        fn component(
+            &mut self,
+            _directory: &Location,
+            component: PathwalkComponent<'_>,
+        ) -> VfsResult<()> {
+            self.components.push(match component {
+                PathwalkComponent::Root => "/".to_owned(),
+                PathwalkComponent::Current => ".".to_owned(),
+                PathwalkComponent::Parent => "..".to_owned(),
+                PathwalkComponent::Normal(name) => name.to_owned(),
+            });
+            Ok(())
+        }
+
+        fn follow_symlink(&mut self, _link: &Location, final_component: bool) -> VfsResult<()> {
+            self.final_symlinks.push(final_component);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pathwalk_policy_receives_real_components_and_final_position() {
+        let context = TestFs::context();
+        let mut final_walk = ObserveWalk::default();
+        context
+            .resolve_with_policy("/jump", &mut |_| Ok(()), &mut final_walk)
+            .unwrap();
+        assert_eq!(final_walk.final_symlinks, [true]);
+        assert!(final_walk.components.iter().any(|name| name == "jump"));
+        assert!(final_walk.components.iter().any(|name| name == "child"));
+
+        let mut intermediate_walk = ObserveWalk::default();
+        let _ = context.resolve_with_policy(
+            "/jump/missing",
+            &mut |_| Ok(()),
+            &mut intermediate_walk,
+        );
+        assert_eq!(intermediate_walk.final_symlinks, [false]);
     }
 
     struct RejectTopologyEdges;

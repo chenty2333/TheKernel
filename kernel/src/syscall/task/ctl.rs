@@ -27,6 +27,7 @@ use crate::{
     task::{
         AsThread, CapabilityState, Mempolicy, ProcessData, PtraceCredentialMode,
         check_current_process_ptrace_access, get_process_data, get_visible_task,
+        linux_pid_from_task_id,
     },
 };
 
@@ -243,10 +244,7 @@ fn kcmp_result(equal: bool) -> isize {
 fn kcmp_file_description(proc_data: &ProcessData, fd: usize) -> AxResult<Arc<FileDescription>> {
     FD_TABLE
         .scope(&proc_data.scope.read())
-        .read()
-        .get(fd)
-        .map(|entry| entry.description.clone())
-        .ok_or(AxError::BadFileDescriptor)
+        .get_description_number(u32::try_from(fd).map_err(|_| AxError::BadFileDescriptor)?)
 }
 
 pub fn sys_kcmp(pid1: i32, pid2: i32, type_: i32, idx1: usize, idx2: usize) -> AxResult<isize> {
@@ -315,7 +313,7 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
         // it for the whole thread group instead of only for the caller.
         // Atomically gate CLONE_THREAD against the single-thread test, then
         // prepare every fallible replacement before committing any of them.
-        let curr_tid = curr.id().as_u64() as starry_process::Pid;
+        let curr_tid = linux_pid_from_task_id(curr.id().as_u64())?;
         if !thread.proc_data.begin_single_thread_scope_change(curr_tid) {
             return Err(AxError::OperationNotSupported);
         }
@@ -912,7 +910,10 @@ pub fn sys_prctl(
             drop(current().replace_name(s));
         }
         PR_GET_NAME => {
-            let name = current().name();
+            let name = current().try_name().map_err(|error| match error {
+                axtask::TaskNameError::OutOfMemory => AxError::NoMemory,
+                axtask::TaskNameError::ConcurrentMutation => AxError::ResourceBusy,
+            })?;
             let len = name.len().min(15);
             let mut buf = [0; 16];
             buf[..len].copy_from_slice(&name.as_bytes()[..len]);

@@ -1,12 +1,9 @@
 use alloc::sync::{Arc, Weak};
-use core::{convert::Infallible, future::poll_fn, task::Poll};
+use core::convert::Infallible;
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::UserContext;
-use axtask::{
-    TaskInner, current,
-    future::{block_on, interruptible},
-};
+use axtask::{TaskInner, current};
 use linux_raw_sys::general::{RLIMIT_SIGPENDING, SI_TIMER};
 use starry_process::Pid;
 use starry_signal::{
@@ -16,8 +13,10 @@ use starry_signal::{
 
 use super::{
     AsThread, ContinueResult, Cred, ProcessData, Thread, acknowledge_posix_timer_signal, do_exit,
-    get_process_data, get_process_group, get_task, get_visible_task, idmap::Kuid,
+    fail_closed_exit, get_process_data, get_process_group, get_task, get_visible_task, idmap::Kuid,
+    linux_pid_from_task_id, process_domain, process_error,
 };
+use crate::readiness::block_on_poll_set;
 
 fn notify_tracer_or_parent_stop_continue(proc_data: &ProcessData) {
     let notify_pid = proc_data
@@ -221,13 +220,17 @@ pub fn check_signals(
     thr.finish_signal_delivery(delivered.os_action, delivered.restartable_handler);
     match delivered.os_action {
         SignalOSAction::Terminate => {
-            do_exit(signo as i32, true);
+            if let Err(error) = do_exit(signo as i32, true) {
+                fail_closed_exit(error);
+            }
         }
         SignalOSAction::CoreDump => {
             if let Err(e) = super::coredump::generate_core_dump(thr, uctx, signo as u8) {
                 warn!("Core dump failed: {e:?}");
             }
-            do_exit((signo as i32) | 0x80, true);
+            if let Err(error) = do_exit((signo as i32) | 0x80, true) {
+                fail_closed_exit(error);
+            }
         }
         SignalOSAction::Stop => {
             do_stop(thr, uctx, signo as u8);
@@ -660,7 +663,10 @@ pub fn send_signal_to_process_group(pgid: Pid, sig: Option<SignalInfo>) -> AxRes
 
     if let Some(sig) = sig {
         info!("Send signal {:?} to process group {}", sig.signo(), pgid);
-        for proc in pg.try_processes().map_err(|_| AxError::NoMemory)? {
+        for proc in pg
+            .try_processes(process_domain()?.registry())
+            .map_err(process_error)?
+        {
             if proc.is_zombie() {
                 continue;
             }
@@ -684,7 +690,7 @@ pub fn raise_signal_fatal(sig: SignalInfo) -> AxResult<()> {
         task.interrupt();
     } else {
         // No task wants to handle the signal, abort the task
-        do_exit(signo as i32, true);
+        do_exit(signo as i32, true)?;
     }
 
     Ok(())
@@ -764,30 +770,22 @@ fn do_continue(proc_data: &ProcessData) {
 /// and from the user task main loop (sibling threads).
 pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
     let proc_data = &thr.proc_data;
-    let tid = current().id().as_u64() as Pid;
+    let tid = linux_pid_from_task_id(current().id().as_u64())
+        .unwrap_or_else(|error| fail_closed_exit(error));
     while !thr.pending_exit()
         && !proc_data.should_exit_for_exec(tid)
         && proc_data.should_wait_for_stop()
     {
-        match block_on(interruptible(poll_fn(|cx| {
+        match block_on_poll_set(&proc_data.stop_event, || {
             if !proc_data.should_wait_for_stop()
                 || thr.pending_exit()
                 || proc_data.should_exit_for_exec(tid)
             {
-                Poll::Ready(())
+                Ok(())
             } else {
-                proc_data.stop_event.register(cx.waker());
-                // Re-check after registration to avoid missed wake-ups.
-                if !proc_data.should_wait_for_stop()
-                    || thr.pending_exit()
-                    || proc_data.should_exit_for_exec(tid)
-                {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
+                Err(AxError::WouldBlock)
             }
-        }))) {
+        }) {
             Ok(()) => {}
             Err(_) => handle_stopped_interrupt(thr, uctx),
         }
@@ -795,7 +793,8 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
 }
 
 fn interrupt_stop_siblings(proc_data: &ProcessData) {
-    let curr_tid = current().id().as_u64() as Pid;
+    let curr_tid = linux_pid_from_task_id(current().id().as_u64())
+        .unwrap_or_else(|error| fail_closed_exit(error));
     for tid in proc_data.proc.thread_ids() {
         if tid != curr_tid {
             if let Ok(task) = get_task(tid) {
@@ -806,7 +805,8 @@ fn interrupt_stop_siblings(proc_data: &ProcessData) {
 }
 
 fn handle_stopped_interrupt(thr: &Thread, uctx: &mut UserContext) {
-    let tid = current().id().as_u64() as Pid;
+    let tid = linux_pid_from_task_id(current().id().as_u64())
+        .unwrap_or_else(|error| fail_closed_exit(error));
     if thr.proc_data.should_exit_for_exec(tid) {
         if has_pending_fatal_signal(thr) {
             while check_signals(thr, uctx, None) {}

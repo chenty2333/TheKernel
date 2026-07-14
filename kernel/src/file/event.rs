@@ -6,9 +6,11 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet, Pollable};
-use axtask::future::{block_on, poll_io};
 
-use crate::file::{FileLike, IoDst, IoSrc, Kstat, anon_inode_stat};
+use crate::{
+    file::{FileLike, IoDst, IoSrc, Kstat, anon_inode_stat},
+    readiness::block_on_poll_io,
+};
 
 pub struct EventFd {
     count: AtomicU64,
@@ -55,7 +57,7 @@ impl FileLike for EventFd {
             return Err(AxError::InvalidInput);
         }
 
-        block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
+        block_on_poll_io(self, IoEvents::READABLE, self.nonblocking(), || {
             let result = self
                 .count
                 .fetch_update(Ordering::Release, Ordering::Acquire, |count| {
@@ -74,7 +76,7 @@ impl FileLike for EventFd {
                 }
                 Err(_) => Err(AxError::WouldBlock),
             }
-        }))
+        })
     }
 
     fn write(&self, src: &mut IoSrc) -> axio::Result<usize> {
@@ -89,7 +91,7 @@ impl FileLike for EventFd {
             return Err(AxError::InvalidInput);
         }
 
-        block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
+        block_on_poll_io(self, IoEvents::WRITABLE, self.nonblocking(), || {
             let result = self
                 .count
                 .fetch_update(Ordering::Release, Ordering::Acquire, |count| {
@@ -106,7 +108,7 @@ impl FileLike for EventFd {
                 }
                 Err(_) => Err(AxError::WouldBlock),
             }
-        }))
+        })
     }
 
     fn nonblocking(&self) -> bool {
@@ -127,18 +129,27 @@ impl Pollable for EventFd {
     fn poll(&self) -> IoEvents {
         let mut events = IoEvents::empty();
         let count = self.count.load(Ordering::Acquire);
-        events.set(IoEvents::IN, count > 0);
-        events.set(IoEvents::ERR, count == u64::MAX);
-        events.set(IoEvents::OUT, u64::MAX - 1 > count);
+        events.set(IoEvents::READABLE, count > 0);
+        events.set(IoEvents::ERROR, count == u64::MAX);
+        events.set(IoEvents::WRITABLE, u64::MAX - 1 > count);
         events
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.intersects(IoEvents::IN | IoEvents::ERR) {
-            self.poll_rx.register(context.waker());
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        let read = events.intersects(IoEvents::READABLE | IoEvents::ERROR);
+        let write = events.contains(IoEvents::WRITABLE);
+        let mut prepared =
+            axpoll::PreparedPollRegistration::try_new(read as usize + write as usize)?;
+        if read {
+            prepared.arm(&self.poll_rx, context.waker())?;
         }
-        if events.contains(IoEvents::OUT) {
-            self.poll_tx.register(context.waker());
+        if write {
+            prepared.arm(&self.poll_tx, context.waker())?;
         }
+        prepared.commit()
     }
 }

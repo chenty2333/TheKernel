@@ -10,7 +10,10 @@ use axdriver_block::{
     BlockAsyncOp, BlockDriverOps, BlockQueueCaps, BlockQueueRequest, BlockRequestHandle,
     BlockSegment, BlockSegmentDirection, BlockSubmitReport,
 };
-use axtask::WaitQueue;
+use axtask::{
+    WaitError, WaitQueue,
+    future::{BlockOnError, TimerRegistrationError},
+};
 use spin::Mutex;
 use virtio_drivers::{
     Hal,
@@ -43,6 +46,21 @@ const ASYNC_WRITE_SEGMENTS_INDIRECT_MERGED: usize = 8;
 static IRQ_FIRST_WAIT_QUEUE: WaitQueue = WaitQueue::new();
 #[cfg(feature = "irq")]
 static REGISTERED_IRQS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn wait_error_to_dev(error: WaitError) -> DevError {
+    match error {
+        WaitError::Block(BlockOnError::Busy) => DevError::ResourceBusy,
+        WaitError::Block(
+            BlockOnError::GenerationExhausted | BlockOnError::StateLost,
+        ) => DevError::BadState,
+        WaitError::Interrupted => DevError::Again,
+        WaitError::Timer(TimerRegistrationError::CapacityExhausted) => DevError::ResourceBusy,
+        WaitError::Timer(
+            TimerRegistrationError::TokenSpaceExhausted
+            | TimerRegistrationError::DeadlineOverflow,
+        ) => DevError::BadState,
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -349,7 +367,9 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         }
         record_blk_async_wait_sleep();
         let mut wait_error = None;
-        let timed_out = self.wait_queue.wait_timeout_until(
+        let timed_out = self
+            .wait_queue
+            .wait_timeout_until(
             Duration::from_micros(ASYNC_WAIT_TIMEOUT_US),
             || {
                 let mut inner = self.inner.lock();
@@ -375,7 +395,8 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
                 Self::notify_completion_waiters(&self.wait_queue, drained);
                 is_ready || wait_error.is_some()
             },
-        );
+        )
+            .map_err(wait_error_to_dev)?;
         if let Some(err) = wait_error {
             return Err(err);
         }
@@ -393,31 +414,33 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         record_blk_async_irq_first_wait();
         record_blk_async_wait_sleep();
         let mut wait_error = None;
-        IRQ_FIRST_WAIT_QUEUE.wait_until(|| {
-            let mut inner = self.inner.lock();
-            let _ = inner.ack_interrupt();
-            let drained = match inner.drain_pending_completions() {
-                Ok(drained) => drained,
-                Err(err) => {
-                    wait_error = Some(as_dev_err(err));
-                    0
-                }
-            };
-            let is_ready = if wait_error.is_none() {
-                match ready(&mut inner) {
-                    Ok(is_ready) => is_ready,
+        IRQ_FIRST_WAIT_QUEUE
+            .wait_until(|| {
+                let mut inner = self.inner.lock();
+                let _ = inner.ack_interrupt();
+                let drained = match inner.drain_pending_completions() {
+                    Ok(drained) => drained,
                     Err(err) => {
-                        wait_error = Some(err);
-                        true
+                        wait_error = Some(as_dev_err(err));
+                        0
                     }
-                }
-            } else {
-                true
-            };
-            drop(inner);
-            Self::notify_completion_waiters(&self.wait_queue, drained);
-            is_ready || wait_error.is_some()
-        });
+                };
+                let is_ready = if wait_error.is_none() {
+                    match ready(&mut inner) {
+                        Ok(is_ready) => is_ready,
+                        Err(err) => {
+                            wait_error = Some(err);
+                            true
+                        }
+                    }
+                } else {
+                    true
+                };
+                drop(inner);
+                Self::notify_completion_waiters(&self.wait_queue, drained);
+                is_ready || wait_error.is_some()
+            })
+            .map_err(wait_error_to_dev)?;
         if let Some(err) = wait_error {
             return Err(err);
         }

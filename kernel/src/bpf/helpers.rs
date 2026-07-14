@@ -484,7 +484,10 @@ fn helper_get_current_uid_gid() -> u64 {
 
 fn helper_get_current_comm(buf_ptr: u64, buf_size: u64, hctx: &mut HelperContext) -> AxResult<u64> {
     let curr = current();
-    let name = curr.name();
+    let name = curr.try_name().map_err(|error| match error {
+        axtask::TaskNameError::OutOfMemory => AxError::NoMemory,
+        axtask::TaskNameError::ConcurrentMutation => AxError::ResourceBusy,
+    })?;
     let name_bytes = name.as_bytes();
 
     let out_size = (buf_size as usize).min(16); // TASK_COMM_LEN = 16

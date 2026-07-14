@@ -2,7 +2,7 @@ use core::{any::Any, slice};
 
 #[allow(unused_imports)]
 use axdriver::prelude::DisplayDriverOps;
-use axerrno::{AxError, LinuxError};
+use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::{NodeFlags, VfsError, VfsResult};
 use axhal::mem::virt_to_phys;
 use memory_addr::{PhysAddrRange, VirtAddr};
@@ -78,13 +78,13 @@ struct FixScreenInfo {
     pub reserved: [u16; 2], // Reserved for future compatibility
 }
 
-async fn refresh_task() {
+async fn refresh_task() -> AxResult<()> {
     let delay = core::time::Duration::from_secs_f32(1. / 60.);
     loop {
         if !axdisplay::framebuffer_flush() {
             warn!("Failed to refresh framebuffer");
         }
-        axtask::future::sleep(delay).await;
+        axtask::future::sleep(delay).await.map_err(AxError::from)?;
     }
 }
 
@@ -93,16 +93,22 @@ pub struct FrameBuffer {
     size: usize,
 }
 impl FrameBuffer {
-    pub fn new() -> Self {
+    pub fn try_new() -> Result<Self, AxError> {
         axtask::spawn_with_name(
-            || axtask::future::block_on(refresh_task()),
+            || match axtask::future::block_on(refresh_task()) {
+                Ok(Ok(())) => error!("Framebuffer refresh worker ended unexpectedly"),
+                Ok(Err(error)) => {
+                    error!("Framebuffer refresh timer stopped: {error}")
+                }
+                Err(error) => error!("Framebuffer refresh worker stopped: {error}"),
+            },
             "fb-refresh".into(),
-        );
+        )?;
         let info = axdisplay::framebuffer_info();
-        Self {
+        Ok(Self {
             base: VirtAddr::from(info.fb_base_vaddr),
             size: info.fb_size,
-        }
+        })
     }
 
     #[allow(clippy::mut_from_ref)]

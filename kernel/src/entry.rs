@@ -3,8 +3,11 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use axfs::FS_CONTEXT;
 use axhal::{power::system_off, uspace::UserContext};
 use axsync::{Mutex, spin::SpinNoIrq};
-use axtask::{AxTaskExt, SchedState, spawn_task_with_sched};
-use starry_process::{Pid, Process};
+use axtask::{
+    AxTaskExt, SchedState, current, prepare_task_with_sched_from, publish_prepared_task,
+    reserve_prepared_task,
+};
+use starry_process::Pid;
 
 use crate::{
     file::{FD_TABLE, FdTable, executable, init_fd_scope_default, try_new_process_scope},
@@ -15,7 +18,8 @@ use crate::{
     pseudofs::{self, dev::tty::N_TTY},
     task::{
         CgroupNamespace, Cred, CredentialSlot, PidNamespace, ProcessData, Thread, TimeNamespace,
-        UserNamespace, UtsNamespace, add_task_to_table, spawn_alarm_task, try_new_user_task,
+        UserNamespace, UtsNamespace, init_process_domain, linux_pid_from_task_id,
+        prepare_task_table_admission, spawn_alarm_task, try_new_user_task,
     },
 };
 
@@ -89,8 +93,14 @@ pub fn init(args: &[String], envs: &[String]) {
     let mut task = try_new_user_task(task_name, uctx).expect("Failed to allocate init task");
     task.ctx_mut().set_page_table_root(uspace.page_table_root());
 
-    let tid = task.id().as_u64() as Pid;
-    let proc = Process::try_new_init(INIT_PID, None).expect("Failed to allocate init process");
+    let tid = linux_pid_from_task_id(task.id().as_u64())
+        .expect("init task identity must fit the Linux PID domain");
+    let process_domain = init_process_domain().expect("Failed to allocate process domain");
+    let prepared_zombie_snapshot =
+        ProcessData::try_prepare_zombie_snapshot().expect("Failed to reserve init zombie snapshot");
+    let proc = process_domain
+        .try_new_init(INIT_PID, None)
+        .expect("Failed to allocate init process");
 
     N_TTY.bind_to(&proc).expect("Failed to bind ntty");
 
@@ -124,6 +134,7 @@ pub fn init(args: &[String], envs: &[String]) {
             .expect("Failed to allocate init exit fd table");
     let proc = ProcessData::try_new(
         proc,
+        prepared_zombie_snapshot,
         credential.clone(),
         exe_path,
         executable::acquire(&loc).expect("Failed to retain init executable identity"),
@@ -143,8 +154,7 @@ pub fn init(args: &[String], envs: &[String]) {
 
     {
         let mut scope = proc.scope.write();
-        crate::file::add_stdio(&mut FD_TABLE.scope_mut(&mut scope).write())
-            .expect("Failed to add stdio");
+        crate::file::add_stdio(&FD_TABLE.scope_mut(&mut scope)).expect("Failed to add stdio");
     }
 
     let thread_admission = proc
@@ -152,23 +162,32 @@ pub fn init(args: &[String], envs: &[String]) {
         .expect("Failed to admit init thread membership");
     let (thr, signal_registration) =
         Thread::try_new(tid, proc, credential).expect("Failed to allocate init thread state");
-    signal_registration.commit();
-    thread_admission.commit();
     if INIT_PID != tid {
         thr.set_tid(INIT_PID);
     }
     *task.task_ext_mut() = Some(AxTaskExt::from_impl(thr));
 
+    let task = prepare_task_with_sched_from(task, SchedState::default(), &current())
+        .expect("Failed to prepare init scheduler state");
+    let task_publication =
+        reserve_prepared_task(task.clone()).expect("Failed to reserve init runqueue publication");
+    let task_table_admission =
+        prepare_task_table_admission(&task).expect("Failed to reserve init lookup identities");
+    signal_registration.commit();
+    let thread_completion =
+        task_table_admission.commit_with_publication(|| thread_admission.commit());
+    let published_task = publish_prepared_task(task_publication);
+    debug_assert!(Arc::ptr_eq(&published_task, &task));
+    drop(published_task);
+    thread_completion.finish();
+
     // Keep the init process user-visible as PID 1. Kernel-only alarm workers can
     // consume later scheduler task IDs without changing that ABI.
-    spawn_alarm_task();
-
-    let task = spawn_task_with_sched(task, SchedState::default());
-    add_task_to_table(&task).expect("Failed to publish init task lookup identities");
+    spawn_alarm_task().expect("Failed to start alarm workers");
 
     // TODO: wait for all processes to finish
-    let exit_code = task.join();
-    info!("Init process exited with code: {exit_code:?}");
+    let exit_code = task.join().expect("Failed to join init task");
+    info!("Init process exited with code: {exit_code}");
 
     let cx = FS_CONTEXT.lock();
     cx.root_dir()

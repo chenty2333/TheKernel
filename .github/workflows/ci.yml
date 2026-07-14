@@ -15,6 +15,14 @@ permissions:
   contents: read
   packages: read
 
+env:
+  # Maintained sibling inputs are source-controlled immutable release
+  # candidates. Local development may still override their checkout paths.
+  THEKERNEL_AX_REPOSITORY: https://github.com/chenty2333/thekernel-ax.git
+  THEKERNEL_AX_REF: aa746a3898fdf3f85ed1270e460a41b9cbd5e6cf
+  THEKERNEL_LINUX_ABI_REPOSITORY: https://github.com/chenty2333/thekernel-linux-abi.git
+  THEKERNEL_LINUX_ABI_REF: e3e8c2b1f8b40ef5c9694981f17f71d1ff7d0c39
+
 jobs:
   per-commit:
     runs-on: ubuntu-latest
@@ -36,6 +44,9 @@ jobs:
 
       - name: Trust checkout in job container
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Provision pinned maintained siblings
+        run: ./scripts/ci/provision-maintained-siblings.sh
 
       - name: Per-commit gate
         id: gate
@@ -76,6 +87,9 @@ jobs:
 
       - name: Trust checkout in job container
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Provision pinned maintained siblings
+        run: ./scripts/ci/provision-maintained-siblings.sh
 
       - name: Dual-architecture release and boot gate
         id: gate

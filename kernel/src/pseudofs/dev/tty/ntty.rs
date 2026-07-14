@@ -2,12 +2,11 @@ use alloc::{boxed::Box, sync::Arc};
 use core::task::Waker;
 
 use axerrno::{AxError, AxResult};
-use axtask::future::register_irq_waker;
 use lazy_static::lazy_static;
 
 use super::{
     Tty,
-    terminal::ldisc::{ProcessMode, TtyConfig, TtyRead, TtyWrite},
+    terminal::ldisc::{ExternalRegistration, ProcessMode, TtyConfig, TtyRead, TtyWrite},
 };
 
 pub type NTtyDriver = Tty<Console, Console>;
@@ -34,8 +33,11 @@ lazy_static! {
 fn new_n_tty() -> Arc<NTtyDriver> {
     let terminal = Arc::try_new(Default::default()).expect("failed to allocate console terminal");
     let process_mode = if let Some(irq) = axhal::console::irq_num() {
+        // The console device is the IRQ capability owner. The generic waiter
+        // registry only attaches and cancels callbacks.
+        axhal::irq::set_enable(irq, true);
         ProcessMode::External(
-            Box::try_new(move |waker: &Waker| register_irq_waker(irq, waker))
+            Box::try_new(move |waker: &Waker| ExternalRegistration::irq(irq, waker))
                 .map_err(|_| AxError::NoMemory)
                 .expect("failed to allocate console tty registration"),
         )

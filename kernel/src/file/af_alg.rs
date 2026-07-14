@@ -344,10 +344,16 @@ impl FileLike for AfAlgSocket {
 
 impl Pollable for AfAlgSocket {
     fn poll(&self) -> IoEvents {
-        IoEvents::IN | IoEvents::OUT
+        IoEvents::READABLE | IoEvents::WRITABLE
     }
 
-    fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+    fn register<'a>(
+        &'a self,
+        _context: &mut Context<'_>,
+        _events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        axpoll::PollRegistration::empty()
+    }
 }
 
 #[derive(Default)]

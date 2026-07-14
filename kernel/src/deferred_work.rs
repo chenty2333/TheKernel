@@ -1,12 +1,10 @@
 use alloc::string::String;
-use core::{
-    future::poll_fn,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    task::Poll,
-};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use axerrno::{AxError, AxResult};
 use axpoll::PollSet;
-use axtask::future::block_on;
+
+use crate::readiness::block_on_poll_set_uninterruptible;
 
 /// Per-actor completion accounting for policy work published from an
 /// allocation-free Drop path.  The account is allocated with the user thread,
@@ -80,23 +78,22 @@ fn finalizer_work_pending() -> bool {
         || axfs::has_deferred_filesystem_finalizer_work()
 }
 
-fn wait_for_worker(wake: &PollSet, mut pending: impl FnMut() -> bool) {
-    block_on(poll_fn(|cx| {
+fn wait_for_worker(wake: &PollSet, mut pending: impl FnMut() -> bool) -> AxResult<()> {
+    block_on_poll_set_uninterruptible(wake, || {
         if pending() {
-            return Poll::Ready(());
-        }
-        wake.register(cx.waker());
-        if pending() {
-            Poll::Ready(())
+            Ok(())
         } else {
-            Poll::Pending
+            Err(AxError::WouldBlock)
         }
-    }));
+    })
 }
 
 fn policy_worker() {
     loop {
-        wait_for_worker(&POLICY_WORKER_WAKE, policy_work_pending);
+        if let Err(error) = wait_for_worker(&POLICY_WORKER_WAKE, policy_work_pending) {
+            error!("policy deferred-work worker stopped: {error}");
+            return;
+        }
         while policy_work_pending() {
             axfs_ng_vfs::drain_deferred_dentry_cache_cleanup();
             axnet::unix::drain_deferred_receive_cleanup_work();
@@ -114,7 +111,10 @@ fn policy_worker() {
 
 fn filesystem_finalizer_worker() {
     loop {
-        wait_for_worker(&FINALIZER_WORKER_WAKE, finalizer_work_pending);
+        if let Err(error) = wait_for_worker(&FINALIZER_WORKER_WAKE, finalizer_work_pending) {
+            error!("filesystem finalizer worker stopped: {error}");
+            return;
+        }
         while axfs::drain_deferred_filesystem_finalizers(axtask::yield_now) != 0 {
             // New work published while one finite FIFO batch was being drained
             // remains on the shared queue for the next iteration.

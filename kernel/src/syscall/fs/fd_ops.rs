@@ -7,7 +7,8 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{
-    FS_CONTEXT, FileBackend, FileFlags, FsContext, OpenOptions, OpenResult, PathwalkPolicy,
+    FS_CONTEXT, FileBackend, FileFlags, FsContext, OpenOptions, OpenResult, PathwalkComponent,
+    PathwalkPolicy,
 };
 use axfs_ng_vfs::{
     DirEntry, FileNode, Location, MetadataUpdate, NodePermission, NodeType, Reference, path::Path,
@@ -16,6 +17,10 @@ use axio::{Seek, SeekFrom};
 use axtask::current;
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
+use linux_vfs::{
+    LimitKind, Openat2Policy, PathContext as LinuxPathContext, PathContextError, PathLimitError,
+    PathLimits, ResolveFlags, TopologyEvent, WalkBudget, WalkError,
+};
 use starry_signal::Signo;
 
 use crate::{
@@ -40,7 +45,7 @@ use crate::{
     mm::{UserConstPtr, UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
     syscall::fs::ctl::validate_pathname,
-    task::{AX_FILE_LIMIT, AsThread, DacCredentialView},
+    task::{AX_FILE_LIMIT, AsThread, DacCredentialView, linux_pid_from_task_id},
     time::wall_time,
 };
 
@@ -231,6 +236,13 @@ const OPENAT2_ALLOWED_RESOLVE: u64 = (RESOLVE_NO_XDEV
     | RESOLVE_IN_ROOT
     | RESOLVE_CACHED) as u64;
 
+const OPEN_NAMESPACE_RESOLVE_FLAGS: u64 =
+    (RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_NO_XDEV) as u64;
+
+const fn open_requires_namespace_operation(flags: u32, resolve: u64) -> bool {
+    flags & (O_CREAT | __O_TMPFILE | O_TRUNC) != 0 || resolve & OPEN_NAMESPACE_RESOLVE_FLAGS != 0
+}
+
 const MAX_FILE_HANDLE_SZ: u32 = 128;
 const NAME_TO_HANDLE_ALLOWED_FLAGS: i32 = (AT_EMPTY_PATH | AT_SYMLINK_FOLLOW) as i32;
 
@@ -330,57 +342,116 @@ fn openat2_context(dirfd: c_int, path: &Path, resolve: u64) -> AxResult<FsContex
 }
 
 struct Openat2PathwalkPolicy {
-    resolve: u64,
+    inner: Openat2Policy,
+    budget: WalkBudget,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OpenPathSecurityContext {
+    umask: u32,
 }
 
 impl Openat2PathwalkPolicy {
-    const fn new(resolve: u64) -> Self {
-        Self { resolve }
+    fn legacy() -> AxResult<Self> {
+        Self::from_parts(
+            Openat2Policy::new(ResolveFlags::EMPTY),
+            PathLimits::LINUX_DEFAULT,
+        )
+    }
+
+    fn from_parts(inner: Openat2Policy, limits: PathLimits) -> AxResult<Self> {
+        Ok(Self {
+            inner,
+            budget: WalkBudget::new(limits).map_err(|_| AxError::InvalidInput)?,
+        })
+    }
+
+    fn authorize(&self, event: TopologyEvent<'_, Location>) -> axfs_ng_vfs::VfsResult<()> {
+        self.inner
+            .authorize(event)
+            .map(|_| ())
+            .map_err(Self::map_walk_error)
+    }
+
+    fn account(result: Result<(), WalkError>) -> axfs_ng_vfs::VfsResult<()> {
+        result.map_err(Self::map_walk_error)
+    }
+
+    fn map_walk_error(error: WalkError) -> axfs_ng_vfs::VfsError {
+        let linux_error = match error {
+            WalkError::CrossDevice => LinuxError::EXDEV,
+            WalkError::SymbolicLinkLoop => LinuxError::ELOOP,
+            WalkError::RetryWithoutCached => LinuxError::EAGAIN,
+            WalkError::Limit(PathLimitError {
+                kind: LimitKind::PathBytes | LimitKind::ComponentBytes,
+                ..
+            }) => LinuxError::ENAMETOOLONG,
+            WalkError::Limit(_) => LinuxError::ELOOP,
+            _ => LinuxError::EINVAL,
+        };
+        linux_error.into()
     }
 }
 
 impl PathwalkPolicy for Openat2PathwalkPolicy {
-    fn follow_magic_link(&mut self, _link: &Location) -> axfs_ng_vfs::VfsResult<()> {
-        if self.resolve & (RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS) as u64 != 0 {
-            return Err(LinuxError::ELOOP.into());
-        }
-        if self.resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT) as u64 != 0 {
-            return Err(LinuxError::EXDEV.into());
-        }
-        if self.resolve & RESOLVE_NO_XDEV as u64 != 0 {
-            // A generic jump-link target identity is not exposed yet, so the
-            // walker cannot prove that following it stays on this mount.
-            return Err(LinuxError::EXDEV.into());
-        }
-        Ok(())
+    fn component(
+        &mut self,
+        _directory: &Location,
+        component: PathwalkComponent<'_>,
+    ) -> axfs_ng_vfs::VfsResult<()> {
+        let bytes = match component {
+            PathwalkComponent::Root | PathwalkComponent::Current => 1,
+            PathwalkComponent::Parent => 2,
+            PathwalkComponent::Normal(name) => name.len(),
+        };
+        Self::account(self.budget.component(bytes))
     }
 
-    fn follow_symlink(&mut self, _link: &Location) -> axfs_ng_vfs::VfsResult<()> {
-        if self.resolve & RESOLVE_NO_SYMLINKS as u64 != 0 {
-            return Err(LinuxError::ELOOP.into());
+    fn follow_magic_link(
+        &mut self,
+        link: &Location,
+        final_component: bool,
+    ) -> axfs_ng_vfs::VfsResult<()> {
+        if link.node_type() != NodeType::Symlink {
+            Self::account(self.budget.symlink())?;
         }
-        Ok(())
+        self.authorize(TopologyEvent::FollowMagicLink {
+            link,
+            final_component,
+            // axfs currently does not expose the jump target before follow,
+            // so NO_XDEV must conservatively reject instead of fake success.
+            target_stays_on_mount: false,
+        })
     }
 
-    fn cross_mount(&mut self, _from: &Location, _to: &Location) -> axfs_ng_vfs::VfsResult<()> {
-        if self.resolve & RESOLVE_NO_XDEV as u64 != 0 {
-            return Err(LinuxError::EXDEV.into());
-        }
-        Ok(())
+    fn follow_symlink(
+        &mut self,
+        link: &Location,
+        final_component: bool,
+    ) -> axfs_ng_vfs::VfsResult<()> {
+        Self::account(self.budget.symlink())?;
+        self.authorize(TopologyEvent::FollowSymlink {
+            link,
+            final_component,
+        })
     }
 
-    fn absolute_root(&mut self, _from: &Location, _root: &Location) -> axfs_ng_vfs::VfsResult<()> {
-        if self.resolve & RESOLVE_BENEATH as u64 != 0 {
-            return Err(LinuxError::EXDEV.into());
-        }
-        Ok(())
+    fn cross_mount(&mut self, from: &Location, to: &Location) -> axfs_ng_vfs::VfsResult<()> {
+        Self::account(self.budget.mount_crossing())?;
+        self.authorize(TopologyEvent::CrossMount { from, to })
     }
 
-    fn escape_root(&mut self, _root: &Location) -> axfs_ng_vfs::VfsResult<()> {
-        if self.resolve & RESOLVE_BENEATH as u64 != 0 {
-            return Err(LinuxError::EXDEV.into());
-        }
-        Ok(())
+    fn absolute_root(&mut self, from: &Location, root: &Location) -> axfs_ng_vfs::VfsResult<()> {
+        Self::account(self.budget.restart())?;
+        // `openat2_context` installs the dirfd as `FsContext::root_dir` for
+        // IN_ROOT, so RestartAtOperationRoot is already the walker's action.
+        self.authorize(TopologyEvent::AbsoluteRestart { from, root })
+    }
+
+    fn escape_root(&mut self, root: &Location) -> axfs_ng_vfs::VfsResult<()> {
+        // FsContext clamps `..` at its root; policy still decides whether the
+        // scoped operation permits that action.
+        self.authorize(TopologyEvent::EscapeRoot { root })
     }
 }
 
@@ -594,15 +665,10 @@ fn open_in_fs(
     flags: i32,
     mode: __kernel_mode_t,
     credentials: &DacCredentialView,
+    umask: u32,
 ) -> AxResult<isize> {
-    open_in_fs_with_policy(
-        fs,
-        path,
-        flags,
-        mode,
-        credentials,
-        &mut Openat2PathwalkPolicy::new(0),
-    )
+    let mut policy = Openat2PathwalkPolicy::legacy()?;
+    open_in_fs_with_policy(fs, path, flags, mode, credentials, umask, &mut policy)
 }
 
 fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
@@ -611,6 +677,7 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
     flags: i32,
     mode: __kernel_mode_t,
     credentials: &DacCredentialView,
+    umask: u32,
     policy: &mut P,
 ) -> AxResult<isize> {
     validate_pathname(Path::new(path))?;
@@ -618,7 +685,6 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
 
     let uid = credentials.uid();
     let gid = credentials.gid();
-    let umask = current().as_thread().proc_data.umask();
     let requested_mode = NodePermission::from_bits_truncate(mode as u16);
     let masked_mode = NodePermission::from_bits_truncate(requested_mode.bits() & !(umask as u16));
     let resolve_options = flags_to_options(flags, requested_mode.bits() as _, (uid, gid));
@@ -745,8 +811,12 @@ pub(crate) fn openat_inner(
     mode: __kernel_mode_t,
 ) -> AxResult<isize> {
     let curr = current();
-    let credentials = curr.as_thread().fs_dac_credentials();
-    openat_inner_with_credentials(dirfd, path, flags, mode, &credentials)
+    let thread = curr.as_thread();
+    let credentials = thread.fs_dac_credentials();
+    let security = OpenPathSecurityContext {
+        umask: thread.proc_data.umask(),
+    };
+    openat_inner_with_credentials(dirfd, path, flags, mode, &credentials, security)
 }
 
 fn openat_inner_with_credentials(
@@ -755,9 +825,16 @@ fn openat_inner_with_credentials(
     flags: i32,
     mode: __kernel_mode_t,
     credentials: &DacCredentialView,
+    security: OpenPathSecurityContext,
 ) -> AxResult<isize> {
     let flags = normalize_legacy_open_flags(flags)?;
+    // Named/anonymous creation is a specialized VFS+FD transaction: the FD
+    // slot stays private until open construction succeeds, and the namespace
+    // guard keeps writable-mount admission stable through inode publication.
+    let _mount_namespace =
+        open_requires_namespace_operation(flags as u32, 0).then(crate::mounts::namespace_operation);
     if (flags as u32 & O_TMPFILE) == O_TMPFILE {
+        let mut policy = Openat2PathwalkPolicy::legacy()?;
         return with_path_fs(dirfd, Path::new(path), |fs| {
             open_tmpfile_in_fs(
                 fs,
@@ -765,13 +842,14 @@ fn openat_inner_with_credentials(
                 flags,
                 mode,
                 credentials,
-                &mut Openat2PathwalkPolicy::new(0),
+                security.umask,
+                &mut policy,
             )
         });
     }
 
     with_path_fs(dirfd, Path::new(path), |fs| {
-        open_in_fs(fs, path, flags, mode, credentials)
+        open_in_fs(fs, path, flags, mode, credentials, security.umask)
     })
 }
 
@@ -781,6 +859,7 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
     flags: i32,
     mode: __kernel_mode_t,
     credentials: &DacCredentialView,
+    umask: u32,
     policy: &mut P,
 ) -> AxResult<isize> {
     if (flags as u32 & O_ACCMODE) == O_RDONLY {
@@ -816,7 +895,7 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
         credentials,
         NodeType::RegularFile,
         NodePermission::from_bits_truncate(mode as u16),
-        current().as_thread().proc_data.umask(),
+        umask,
     );
 
     let open_flags = flags as u32 & !(O_TMPFILE | O_DIRECTORY | O_EXCL);
@@ -882,19 +961,40 @@ pub fn sys_openat2(
         return Err(AxError::from(LinuxError::EAGAIN));
     }
     let curr = current();
-    let credentials = curr.as_thread().fs_dac_credentials();
-    let _mount_operation =
-        (how.resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_NO_XDEV) as u64 != 0)
-            .then(crate::mounts::namespace_operation);
+    let thread = curr.as_thread();
+    let credentials = thread.fs_dac_credentials();
+    let security = OpenPathSecurityContext {
+        umask: thread.proc_data.umask(),
+    };
+    // Use one guard for both scoped pathwalk and creation. Combining the
+    // predicates before acquisition avoids recursively locking the non-
+    // reentrant namespace mutex when openat2 requests both.
+    let mount_namespace = open_requires_namespace_operation(flags as u32, how.resolve)
+        .then(crate::mounts::namespace_operation);
     let mut fs = openat2_context(dirfd, path_ref, how.resolve)?;
-    let mut policy = Openat2PathwalkPolicy::new(how.resolve);
+    let context = LinuxPathContext::new(
+        credentials,
+        mount_namespace,
+        fs.root_dir().clone(),
+        fs.current_dir().clone(),
+        how.resolve,
+        security,
+        PathLimits::LINUX_DEFAULT,
+    )
+    .map_err(|error| match error {
+        PathContextError::Resolve(_) | PathContextError::Limits(_) => AxError::InvalidInput,
+        _ => AxError::InvalidInput,
+    })?;
+    let mut policy =
+        Openat2PathwalkPolicy::from_parts(*context.resolve_policy(), context.limits())?;
     if (flags as u32 & O_TMPFILE) == O_TMPFILE {
         open_tmpfile_in_fs(
             &mut fs,
             &path,
             flags,
             how.mode as __kernel_mode_t,
-            &credentials,
+            context.credentials(),
+            context.security_hooks().umask,
             &mut policy,
         )
     } else {
@@ -903,7 +1003,8 @@ pub fn sys_openat2(
             &path,
             flags,
             how.mode as __kernel_mode_t,
-            &credentials,
+            context.credentials(),
+            context.security_hooks().umask,
             &mut policy,
         )
     }
@@ -942,7 +1043,7 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> AxResult<isize> {
     if flags.contains(CloseRangeFlags::UNSHARE) {
         let curr = current();
         let thread = curr.as_thread();
-        let curr_tid = curr.id().as_u64() as starry_process::Pid;
+        let curr_tid = linux_pid_from_task_id(curr.id().as_u64())?;
         if !thread.proc_data.begin_single_thread_scope_change(curr_tid) {
             return Err(AxError::OperationNotSupported);
         }
@@ -1319,4 +1420,28 @@ pub fn sys_flock(fd: c_int, operation: c_int) -> AxResult<isize> {
 
     crate::file::flock::do_flock((stat.dev, stat.ino), description.flock_owner(), operation)?;
     Ok(0)
+}
+
+#[cfg(test)]
+mod namespace_operation_tests {
+    use super::*;
+
+    #[test]
+    fn creative_open_and_scoped_walk_share_one_namespace_lock_domain() {
+        assert!(!open_requires_namespace_operation(O_RDONLY, 0));
+        assert!(open_requires_namespace_operation(O_CREAT | O_WRONLY, 0));
+        assert!(open_requires_namespace_operation(O_TRUNC | O_WRONLY, 0));
+        assert!(open_requires_namespace_operation(
+            __O_TMPFILE | O_DIRECTORY | O_WRONLY,
+            0
+        ));
+
+        for resolve in [RESOLVE_BENEATH, RESOLVE_IN_ROOT, RESOLVE_NO_XDEV] {
+            assert!(open_requires_namespace_operation(O_RDONLY, resolve as u64));
+            assert!(open_requires_namespace_operation(
+                O_CREAT | O_WRONLY,
+                resolve as u64
+            ));
+        }
+    }
 }

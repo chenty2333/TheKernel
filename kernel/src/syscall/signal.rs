@@ -21,8 +21,8 @@ use crate::{
     task::{
         AsThread, ProcessData, acknowledge_posix_timer_signal, check_current_process_signal_access,
         check_current_signal_access, check_signals, force_signal_current_thread, get_process_data,
-        get_process_group, get_process_including_zombie, get_visible_task,
-        send_queued_signal_to_process_data, send_queued_signal_to_visible_thread,
+        get_process_group, get_process_including_zombie, get_visible_task, process_domain,
+        process_error, send_queued_signal_to_process_data, send_queued_signal_to_visible_thread,
         send_signal_to_process, send_signal_to_process_data, send_signal_to_visible_thread,
         try_processes,
     },
@@ -169,10 +169,11 @@ fn check_zombie_signal_permission(pid: Pid, signal: Option<Signo>) -> AxResult<b
     let actor_proc = &actor_thread.proc_data;
     let actor_cred = actor_thread.current_cred();
     let actor_ids = actor_cred.ids();
-    let snapshot = process.zombie_snapshot().ok_or(AxError::NoSuchProcess)?;
+    let snapshot = process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
+    let target_ids = snapshot.credential.ids();
     let allowed = [actor_ids.ruid, actor_ids.euid]
         .into_iter()
-        .any(|id| id == snapshot.uid)
+        .any(|id| id == target_ids.ruid)
         || actor_cred.has_effective_capability(CAP_KILL)
         || (signal == Some(Signo::SIGCONT)
             && actor_proc.proc.group().session().sid() == process.group().session().sid());
@@ -262,8 +263,8 @@ pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
         0 => {
             let pgid = current().as_thread().proc_data.proc.group().pgid();
             let targets = get_process_group(pgid)?
-                .try_processes()
-                .map_err(|_| AxError::NoMemory)?
+                .try_processes(process_domain()?.registry())
+                .map_err(process_error)?
                 .into_iter()
                 .filter_map(|process| get_process_data(process.pid()).ok());
             send_user_signal_to_targets(targets, sig)?;
@@ -277,8 +278,8 @@ pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
         }
         ..-1 => {
             let targets = get_process_group((-pid) as Pid)?
-                .try_processes()
-                .map_err(|_| AxError::NoMemory)?
+                .try_processes(process_domain()?.registry())
+                .map_err(process_error)?
                 .into_iter()
                 .filter_map(|process| get_process_data(process.pid()).ok());
             send_user_signal_to_targets(targets, sig)?;
@@ -491,11 +492,23 @@ pub fn sys_rt_sigtimedwait(
         }
     });
 
-    let Ok(sig) = block_on(future::timeout(timeout, fut)) else {
-        // Timeout
-        signal.set_real_blocked(None);
-        signal.set_blocked(old_blocked);
-        return Err(AxError::WouldBlock);
+    let sig = match block_on(future::timeout(timeout, fut)) {
+        Ok(Ok(sig)) => sig,
+        Ok(Err(future::TimeoutError::Elapsed(_))) => {
+            signal.set_real_blocked(None);
+            signal.set_blocked(old_blocked);
+            return Err(AxError::WouldBlock);
+        }
+        Ok(Err(future::TimeoutError::Timer(error))) => {
+            signal.set_real_blocked(None);
+            signal.set_blocked(old_blocked);
+            return Err(error.into());
+        }
+        Err(error) => {
+            signal.set_real_blocked(None);
+            signal.set_blocked(old_blocked);
+            return Err(error.into());
+        }
     };
     let Some(sig) = sig else {
         // Interrupted
@@ -543,7 +556,8 @@ pub fn sys_rt_sigsuspend(
             // signal. Poll again so the current waker is registered before the
             // task blocks; otherwise the next signal can be lost.
         }
-    }));
+    }))
+    .map_err(AxError::from)?;
 
     // sigsuspend always returns -EINTR
     Err(AxError::Interrupted)

@@ -6,10 +6,9 @@ use linux_raw_sys::general::{
     RLIMIT_RSS, SCHED_BATCH, SCHED_FIFO, SCHED_IDLE, SCHED_NORMAL, SCHED_RR,
 };
 use memory_addr::PAGE_SIZE_4K;
-use starry_process::Process;
 use starry_signal::Signo;
 
-use crate::task::{AsThread, ProcStateHint, TaskUsage, nanos_to_clock_ticks};
+use crate::task::{AsThread, ProcStateHint, Process, TaskUsage, nanos_to_clock_ticks};
 
 pub(crate) fn task_state(task: &AxTaskRef) -> char {
     let thread = task.as_thread();
@@ -90,7 +89,10 @@ pub fn render_task_stat(task: &AxTaskRef) -> AxResult<String> {
     let proc_data = &thread.proc_data;
     let proc = &proc_data.proc;
     let pid = proc.pid();
-    let comm = task.name();
+    let comm = task.try_name().map_err(|error| match error {
+        axtask::TaskNameError::OutOfMemory => AxError::NoMemory,
+        axtask::TaskNameError::ConcurrentMutation => AxError::ResourceBusy,
+    })?;
     let comm = comm[..comm.len().min(16)].to_owned();
     let state = task_state(task);
     let ppid = proc.parent().map_or(0, |parent| parent.pid());
@@ -119,7 +121,7 @@ pub fn render_task_stat(task: &AxTaskRef) -> AxResult<String> {
 }
 
 pub fn render_zombie_stat(process: &Process) -> AxResult<String> {
-    let snapshot = process.zombie_snapshot().ok_or(AxError::NoSuchProcess)?;
+    let snapshot = process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
     let pid = process.pid();
     let comm = "zombie";
     let state = 'Z';

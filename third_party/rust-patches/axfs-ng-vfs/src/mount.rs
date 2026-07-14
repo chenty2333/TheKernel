@@ -9,7 +9,7 @@ use core::{
     task::Context,
 };
 
-use axpoll::{IoEvents, Pollable};
+use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use hashbrown::{HashMap, HashSet};
 use inherit_methods_macro::inherit_methods;
 use spin::{Once, RwLock};
@@ -17,8 +17,8 @@ use spin::{Once, RwLock};
 use crate::{
     AnonymousOptions, CreateDisposition, CreateOutcome, DirEntry, DirEntrySink, Filesystem,
     FilesystemIdentity, FilesystemOps, Metadata, MetadataUpdate, Mutex, MutexGuard,
-    NamedCreateOptions, NodeFlags, NodePermission, NodeType, OpenOptions, ReferenceKey, TypeMap,
-    VfsError, VfsResult, WeakFilesystemIdentity,
+    NamedCreateOptions, NamespaceGeneration, NodeFlags, NodePermission, NodeType, OpenOptions,
+    ReferenceKey, TypeMap, VfsError, VfsResult, WeakFilesystemIdentity,
     path::{DOT, DOTDOT, PathBuf, try_build_absolute_path},
 };
 
@@ -307,14 +307,7 @@ impl Mountpoint {
     ) -> VfsResult<Arc<Self>> {
         let root = fs.root_dir();
         reserve_non_root_mount()?;
-        match Self::try_new_with_root(
-            fs,
-            root,
-            None,
-            Some(extensions),
-            false,
-            true,
-        ) {
+        match Self::try_new_with_root(fs, root, None, Some(extensions), false, true) {
             Ok(mountpoint) => Ok(mountpoint),
             Err(error) => {
                 release_non_root_mount_reservation();
@@ -330,14 +323,7 @@ impl Mountpoint {
         extensions: Option<TypeMap>,
     ) -> VfsResult<Arc<Self>> {
         reserve_non_root_mount()?;
-        match Self::try_new_with_root(
-            fs,
-            root,
-            Some(location_in_parent),
-            extensions,
-            false,
-            true,
-        ) {
+        match Self::try_new_with_root(fs, root, Some(location_in_parent), extensions, false, true) {
             Ok(mountpoint) => Ok(mountpoint),
             Err(error) => {
                 release_non_root_mount_reservation();
@@ -784,11 +770,13 @@ impl Drop for Location {
         // drops ancestor Arcs outside its spin mutex, then returns the same
         // allocation for the next pathwalk.
         let _admission = self.mount.admission.write();
-        let Ok(previous) = self.mount.users.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |users| users.checked_sub(1),
-        ) else {
+        let Ok(previous) =
+            self.mount
+                .users
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |users| {
+                    users.checked_sub(1)
+                })
+        else {
             debug_assert!(false, "mount Location count underflow");
             return;
         };
@@ -924,6 +912,23 @@ impl Location {
         Ok(metadata)
     }
 
+    /// Captures the namespace generations of this directory.
+    pub fn namespace_generation(&self) -> VfsResult<NamespaceGeneration> {
+        Ok(self.entry.as_dir()?.namespace_generation())
+    }
+
+    /// Returns whether a prepared directory mutation still observes the same
+    /// local and backend namespace generations.
+    pub fn namespace_generation_is_current(
+        &self,
+        generation: NamespaceGeneration,
+    ) -> VfsResult<bool> {
+        Ok(self
+            .entry
+            .as_dir()?
+            .namespace_generation_is_current(generation))
+    }
+
     /// Applies only fields the backing filesystem can persist.
     ///
     /// This is intended for inode initialization and kernel-maintained
@@ -978,6 +983,16 @@ impl Location {
 
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(self.mountpoint(), other.mountpoint()) && self.entry.ptr_eq(&other.entry)
+    }
+
+    /// Returns whether both handles name the same backend inode in this mount.
+    ///
+    /// Directory cache generations may replace a dentry wrapper after an
+    /// unrelated mutation, so pointer equality is too strict for transaction
+    /// revalidation. Filesystem backends remain responsible for checking any
+    /// stronger generation token under their namespace lock before commit.
+    pub fn same_node(&self, other: &Self) -> bool {
+        Arc::ptr_eq(self.mountpoint(), other.mountpoint()) && self.inode() == other.inode()
     }
 
     pub fn is_mountpoint(&self) -> bool {
@@ -1085,15 +1100,44 @@ impl Location {
             return Err(VfsError::CrossesDevices);
         }
         let src = self.entry.as_dir()?.lookup(src_name)?;
-        if src.is_dir() && !self.ptr_eq(dst_dir) && src.is_ancestor_of(&dst_dir.entry)? {
+        let dst = optional_lookup(dst_dir.entry.as_dir()?.lookup(dst_name))?;
+        let src = self.wrap(src);
+        let dst = dst.map(|entry| dst_dir.wrap(entry));
+        self.rename_checked(src_name, &src, dst_dir, dst_name, dst.as_ref())
+    }
+
+    /// Renames only the exact source and destination identities prepared by a
+    /// higher-level transaction.
+    ///
+    /// Mount topology is checked before entering the filesystem backend. A
+    /// caller that coordinates mount syscalls separately may retain that
+    /// higher-level guard through this operation without carrying the VFS spin
+    /// lock across filesystem I/O.
+    pub fn rename_checked(
+        &self,
+        src_name: &str,
+        src: &Self,
+        dst_dir: &Self,
+        dst_name: &str,
+        dst: Option<&Self>,
+    ) -> VfsResult<()> {
+        if !Arc::ptr_eq(self.mountpoint(), src.mountpoint())
+            || !Arc::ptr_eq(self.mountpoint(), dst_dir.mountpoint())
+            || dst.is_some_and(|dst| !Arc::ptr_eq(dst_dir.mountpoint(), dst.mountpoint()))
+        {
+            return Err(VfsError::CrossesDevices);
+        }
+        if src.entry.is_dir()
+            && !self.ptr_eq(dst_dir)
+            && src.entry.is_ancestor_of(&dst_dir.entry)?
+        {
             return Err(VfsError::InvalidInput);
         }
-        let dst = optional_lookup(dst_dir.entry.as_dir()?.lookup(dst_name))?;
         {
             let _tree = MOUNT_TREE_LOCK.read();
-            if self.mountpoint().has_mount_at_or_below_locked(&src)?
-                || match dst.as_ref() {
-                    Some(dst) => self.mountpoint().has_mount_at_or_below_locked(dst)?,
+            if self.mountpoint().has_mount_at_or_below_locked(&src.entry)?
+                || match dst {
+                    Some(dst) => self.mountpoint().has_mount_at_or_below_locked(&dst.entry)?,
                     None => false,
                 }
             {
@@ -1102,10 +1146,10 @@ impl Location {
         }
         self.entry.as_dir()?.rename(
             src_name,
-            &src,
+            &src.entry,
             dst_dir.entry.as_dir()?,
             dst_name,
-            dst.as_ref(),
+            dst.map(|dst| &dst.entry),
         )
     }
 
@@ -1452,7 +1496,11 @@ impl Location {
 impl Pollable for Location {
     fn poll(&self) -> IoEvents;
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents);
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError>;
 }
 
 #[cfg(test)]
@@ -1517,7 +1565,10 @@ mod tests {
             .into_iter()
             .map(|thread| thread.join().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(results.iter().filter(|(result, _)| result.is_ok()).count(), 1);
+        assert_eq!(
+            results.iter().filter(|(result, _)| result.is_ok()).count(),
+            1
+        );
         assert_eq!(
             results
                 .iter()

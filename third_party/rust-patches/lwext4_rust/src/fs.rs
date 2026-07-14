@@ -85,6 +85,52 @@ fn segments_are_device_block_sized(segments: impl IntoIterator<Item = usize>) ->
         .all(|len| len == 0 || len % EXT4_DEV_BSIZE == 0)
 }
 
+fn fail_closed_after_started_mutation<T>(
+    metadata_poisoned: &mut bool,
+    mutation_started: bool,
+    result: Ext4Result<T>,
+) -> Ext4Result<T> {
+    if mutation_started && result.is_err() {
+        *metadata_poisoned = true;
+    }
+    result
+}
+
+fn finish_committed_namespace_step(
+    metadata_poisoned: &mut bool,
+    context: &'static str,
+    result: Ext4Result<()>,
+) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            // The namespace decision is already externally visible. Reporting
+            // an ordinary operation error would invite an unsafe retry while
+            // an outer transaction can only release private reservations.
+            // Preserve the committed syscall outcome, but stop every later
+            // metadata mutation and make the writeback failure observable.
+            *metadata_poisoned = true;
+            log::error!("{context} failed after ext4 namespace commit: {error}");
+            false
+        }
+    }
+}
+
+fn complete_namespace_operation(
+    metadata_poisoned: &mut bool,
+    mutation_started: bool,
+    namespace_committed: bool,
+    committed_context: &'static str,
+    result: Ext4Result<()>,
+) -> Ext4Result<()> {
+    if namespace_committed {
+        finish_committed_namespace_step(metadata_poisoned, committed_context, result);
+        Ok(())
+    } else {
+        fail_closed_after_started_mutation(metadata_poisoned, mutation_started, result)
+    }
+}
+
 pub struct Ext4Filesystem<Hal: SystemHal, Dev: BlockDevice> {
     inner: Box<ext4_fs>,
     bdev: Ext4BlockDevice<Dev>,
@@ -1445,6 +1491,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         };
 
         let mut mutation_started = false;
+        let mut namespace_committed = false;
         if let Some((dst_token, dst_type)) = dst {
             if let Err(err) = self.unlink_checked(
                 dst_dir,
@@ -1456,33 +1503,61 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             }
             mutation_started = true;
         }
-        self.ensure_metadata_writable()?;
-        let mut src_dir_ref = self.inode_ref(src_dir)?;
-        let mut dst_dir_ref = self.inode_ref(dst_dir)?;
-
         let operation = (|| {
-            if src_ref.is_dir() {
+            // These admissions intentionally remain after replacement unlink
+            // so the directory references observe its updated link counts.
+            // Keeping them inside the mutation-state closure makes every
+            // failure after that unlink explicitly fail closed.
+            self.ensure_metadata_writable()?;
+            let mut src_dir_ref = self.inode_ref(src_dir)?;
+            let mut dst_dir_ref = match self.inode_ref(dst_dir) {
+                Ok(dst_dir_ref) => dst_dir_ref,
+                Err(error) => {
+                    return combine_operation_and_release(Err(error), src_dir_ref.finish());
+                }
+            };
+
+            let operation = (|| {
+                if src_ref.is_dir() {
+                    mutation_started = true;
+                    let mut result = self.clone_ref(&src_ref)?.lookup("..")?;
+                    result.set_entry_ino(dst_dir)?;
+                    result.finish()?;
+                    src_dir_ref.dec_parent_dir_nlink();
+                    dst_dir_ref.inc_nlink();
+                }
+                dst_dir_ref.add_entry(dst_name, &mut src_ref)?;
                 mutation_started = true;
-                let mut result = self.clone_ref(&src_ref)?.lookup("..")?;
-                result.set_entry_ino(dst_dir)?;
-                result.finish()?;
-                src_dir_ref.dec_parent_dir_nlink();
-                dst_dir_ref.inc_nlink();
-            }
-            dst_dir_ref.add_entry(dst_name, &mut src_ref)?;
-            mutation_started = true;
-            src_dir_ref.remove_entry(src_name, &mut src_ref)
+                src_dir_ref.remove_entry(src_name, &mut src_ref)?;
+                // Both externally visible rename decisions are now complete:
+                // the destination names the source inode and the old source
+                // name is gone. Later inode-reference finish failures may
+                // poison metadata, but must not turn this committed rename
+                // into a retryable syscall error.
+                namespace_committed = true;
+                Ok(())
+            })();
+            let operation = combine_operation_and_release(operation, src_dir_ref.finish());
+            combine_operation_and_release(operation, dst_dir_ref.finish())
         })();
         let operation = combine_operation_and_release(operation, src_ref.finish());
-        let operation = combine_operation_and_release(operation, src_dir_ref.finish());
-        let operation = combine_operation_and_release(operation, dst_dir_ref.finish());
-        if operation.is_err() && mutation_started {
-            self.metadata_poisoned = true;
-        }
+        let operation = complete_namespace_operation(
+            &mut self.metadata_poisoned,
+            mutation_started,
+            namespace_committed,
+            "rename metadata finish",
+            operation,
+        );
         self.observe_metadata_result(operation)
     }
 
-    pub fn link(&mut self, dir: u32, name: &str, child: u32) -> Ext4Result {
+    pub fn link(
+        &mut self,
+        dir: u32,
+        name: &str,
+        child: u32,
+        ctime: Option<Duration>,
+    ) -> Ext4Result {
         self.ensure_metadata_writable()?;
         self.drain_hot_inodes()?;
         self.reap_pending_unlinked_inodes(NAMESPACE_REAP_BUDGET)?;
@@ -1497,10 +1572,28 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             ));
         }
         let mut dir_ref = self.inode_ref(dir)?;
-        let operation = dir_ref.add_entry(name, &mut child_ref);
-        let operation = combine_operation_and_release(operation, child_ref.finish());
-        let operation = combine_operation_and_release(operation, dir_ref.finish());
-        self.observe_metadata_result(operation)
+        if let Err(error) = dir_ref.add_entry(name, &mut child_ref) {
+            let operation = combine_operation_and_release::<()>(Err(error), child_ref.finish());
+            let operation = combine_operation_and_release(operation, dir_ref.finish());
+            return self.observe_metadata_result(operation);
+        }
+        if let Some(ctime) = ctime {
+            child_ref.set_ctime(&ctime);
+        }
+
+        // add_entry has committed the name and link-count decision. The ctime
+        // update shares the same dirty child reference and lower finish
+        // sequence, so no separate fallible metadata operation can escape
+        // after publication. A finish failure poisons the filesystem and is
+        // logged, while the already committed link remains a successful
+        // namespace operation.
+        let release = combine_operation_and_release(child_ref.finish(), dir_ref.finish());
+        finish_committed_namespace_step(
+            &mut self.metadata_poisoned,
+            "hard-link metadata finish",
+            release,
+        );
+        Ok(())
     }
 
     pub fn unlink(&mut self, dir: u32, name: &str) -> Ext4Result {
@@ -1570,6 +1663,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             } else {
                 None
             };
+        let mut mutation_started = false;
         if inode_type == InodeType::Directory {
             // According to `ext4_trunc_dir`
             let bs = get_block_size(&self.inner.as_mut().sb);
@@ -1578,6 +1672,10 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
                 let operation = combine_operation_and_release::<()>(Err(err), child_ref.finish());
                 return combine_operation_and_release(operation, dir_ref.finish());
             }
+            // Directory contents are already cleared. Even if removing the
+            // parent entry later fails cleanly, retrying this operation would
+            // build on a partially applied directory mutation.
+            mutation_started = true;
         }
 
         let published_handle_state = prepared_handle_state.is_some();
@@ -1587,13 +1685,17 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
 
         if let Err(err) = dir_ref.remove_entry(name, &mut child_ref) {
             let metadata_may_have_changed = err.metadata_may_have_changed();
-            if metadata_may_have_changed {
-                self.metadata_poisoned = true;
-            } else if published_handle_state {
+            if !metadata_may_have_changed && !mutation_started && published_handle_state {
                 self.inode_handles.remove(&token);
             }
             let operation = combine_operation_and_release::<()>(Err(err), child_ref.finish());
-            return combine_operation_and_release(operation, dir_ref.finish());
+            let operation = combine_operation_and_release(operation, dir_ref.finish());
+            let operation = fail_closed_after_started_mutation(
+                &mut self.metadata_poisoned,
+                mutation_started,
+                operation,
+            );
+            return self.observe_metadata_result(operation);
         }
 
         if child_ref.is_dir() {
@@ -1602,10 +1704,15 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         }
         if child_ref.nlink() == 0 {
             let Some(state) = self.inode_handles.get_mut(&token) else {
-                self.metadata_poisoned = true;
                 let err = Ext4Error::new(EIO as _, "missing retained inode state during unlink");
                 let operation = combine_operation_and_release::<()>(Err(err), child_ref.finish());
-                return combine_operation_and_release(operation, dir_ref.finish());
+                let operation = combine_operation_and_release(operation, dir_ref.finish());
+                finish_committed_namespace_step(
+                    &mut self.metadata_poisoned,
+                    "unlink retained-inode bookkeeping",
+                    operation,
+                );
+                return Ok(());
             };
             state.pending_delete = Some(PendingDelete::Ready(inode_type));
             unsafe {
@@ -1618,9 +1725,18 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             .get(&token)
             .is_some_and(|state| state.handles == 0 && state.pending_delete.is_some());
         let release = combine_operation_and_release(child_ref.finish(), dir_ref.finish());
-        self.observe_metadata_result(release)?;
-        if no_handles {
-            self.reap_pending_unlinked_inodes(NAMESPACE_REAP_BUDGET)?;
+        let released = finish_committed_namespace_step(
+            &mut self.metadata_poisoned,
+            "unlink metadata finish",
+            release,
+        );
+        if released && no_handles {
+            let reap = self.reap_pending_unlinked_inodes(NAMESPACE_REAP_BUDGET);
+            finish_committed_namespace_step(
+                &mut self.metadata_poisoned,
+                "unlink deferred inode reap",
+                reap.map(|_| ()),
+            );
         }
         Ok(())
     }
@@ -1823,6 +1939,53 @@ mod tests {
             state.pending_delete,
             Some(PendingDelete::Ready(InodeType::RegularFile))
         );
+    }
+
+    #[test]
+    fn namespace_failure_order_is_fail_closed_after_mutation_starts() {
+        let clean_error = Ext4Error::new(EIO as _, "pre-publication failure");
+        let mut poisoned = false;
+        assert!(
+            fail_closed_after_started_mutation(&mut poisoned, false, Err::<(), _>(clean_error))
+                .is_err()
+        );
+        assert!(!poisoned);
+
+        let partial_error = Ext4Error::new(EIO as _, "partial namespace mutation");
+        assert!(
+            fail_closed_after_started_mutation(&mut poisoned, true, Err::<(), _>(partial_error))
+                .is_err()
+        );
+        assert!(poisoned);
+    }
+
+    #[test]
+    fn committed_namespace_cleanup_failure_poison_is_not_retryable() {
+        let mut poisoned = false;
+        assert!(!finish_committed_namespace_step(
+            &mut poisoned,
+            "test committed mutation",
+            Err(Ext4Error::new(EIO as _, "post-commit writeback failure")),
+        ));
+        assert!(poisoned);
+    }
+
+    #[test]
+    fn rename_cleanup_failure_after_namespace_commit_is_not_retryable() {
+        let mut poisoned = false;
+        let result = complete_namespace_operation(
+            &mut poisoned,
+            true,
+            true,
+            "rename metadata finish",
+            Err(Ext4Error::new(
+                EIO as _,
+                "rename post-commit finish failure",
+            )),
+        );
+
+        assert!(result.is_ok());
+        assert!(poisoned);
     }
 }
 

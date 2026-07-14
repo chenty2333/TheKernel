@@ -4,8 +4,7 @@ use axtask::current;
 use starry_process::{Pid, ProcessError};
 
 use crate::task::{
-    AsThread, get_process_data, get_process_group, prepare_new_process_group_table_admission,
-    prepare_new_session_table_admission,
+    AsThread, get_process_data, get_process_group, get_process_including_zombie, process_domain,
 };
 
 /// Serializes process-group/session identity admission with the corresponding
@@ -17,6 +16,11 @@ fn process_error(error: ProcessError) -> AxError {
     match error {
         ProcessError::NoMemory | ProcessError::Capacity => AxError::NoMemory,
         ProcessError::AlreadyExists => AxError::AlreadyExists,
+        ProcessError::NotPublished | ProcessError::NotLive | ProcessError::NotInitialized => {
+            AxError::NoSuchProcess
+        }
+        ProcessError::WrongDomain => AxError::BadState,
+        _ => AxError::BadState,
     }
 }
 
@@ -26,7 +30,7 @@ pub fn sys_getsid(pid: Pid) -> AxResult<isize> {
     } else {
         pid
     };
-    Ok(get_process_data(pid)?.proc.group().session().sid() as _)
+    Ok(get_process_including_zombie(pid)?.group().session().sid() as _)
 }
 
 pub fn sys_setsid() -> AxResult<isize> {
@@ -37,9 +41,10 @@ pub fn sys_setsid() -> AxResult<isize> {
         return Err(AxError::OperationNotPermitted);
     }
 
-    let admission = prepare_new_session_table_admission(proc.pid())?;
-    if let Some((session, group)) = proc.try_create_session().map_err(process_error)? {
-        admission.commit(&group, &session);
+    if let Some((session, _group)) = process_domain()?
+        .try_create_session(proc)
+        .map_err(process_error)?
+    {
         Ok(session.sid() as _)
     } else {
         Ok(proc.pid() as _)
@@ -52,7 +57,7 @@ pub fn sys_getpgid(pid: Pid) -> AxResult<isize> {
     } else {
         pid
     };
-    Ok(get_process_data(pid)?.proc.group().pgid() as _)
+    Ok(get_process_including_zombie(pid)?.group().pgid() as _)
 }
 
 pub fn sys_setpgid(pid: i32, pgid: i32) -> AxResult<isize> {
@@ -67,7 +72,11 @@ pub fn sys_setpgid(pid: i32, pgid: i32) -> AxResult<isize> {
     let proc = if pid == 0 {
         caller.clone()
     } else if pid > 0 {
-        get_process_data(pid as Pid)?.proc.clone()
+        let target = get_process_data(pid as Pid)?;
+        if !target.proc.is_live() {
+            return Err(AxError::from(LinuxError::ESRCH));
+        }
+        target.proc.clone()
     } else {
         return Err(AxError::from(LinuxError::ESRCH));
     };
@@ -95,11 +104,9 @@ pub fn sys_setpgid(pid: i32, pgid: i32) -> AxResult<isize> {
         if proc.group().pgid() == pgid {
             return Ok(0);
         }
-        let session = proc.group().session();
-        let admission = prepare_new_process_group_table_admission(pgid, &session)?;
-        if let Some(group) = proc.try_create_group().map_err(process_error)? {
-            admission.commit(&group, &session);
-        }
+        process_domain()?
+            .try_create_group(&proc)
+            .map_err(process_error)?;
         return Ok(0);
     }
 
@@ -107,7 +114,10 @@ pub fn sys_setpgid(pid: i32, pgid: i32) -> AxResult<isize> {
     if !alloc::sync::Arc::ptr_eq(&group.session(), &caller_session) {
         return Err(AxError::OperationNotPermitted);
     }
-    if !proc.move_to_group(&group) {
+    if !process_domain()?
+        .move_to_group(&proc, &group)
+        .map_err(process_error)?
+    {
         return Err(AxError::OperationNotPermitted);
     }
 

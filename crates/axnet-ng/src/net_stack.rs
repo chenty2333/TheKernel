@@ -1,7 +1,11 @@
-use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicI32, Ordering};
+use alloc::{boxed::Box, string::String, sync::Arc, task::Wake, vec::Vec};
+use core::{
+    sync::atomic::{AtomicI32, Ordering},
+    task::Waker,
+};
 
 use axerrno::{AxError, AxResult, ax_bail, ax_err_type};
+use axpoll::{PollRegistrationError, PollSet, PreparedPollRegistration};
 use axsync::Mutex;
 use smoltcp::{
     iface::SocketHandle,
@@ -32,10 +36,24 @@ pub struct NetStack {
     pub(crate) listen_table: Arc<ListenTable>,
     pub(crate) socket_set: Arc<SocketSetWrapper<'static>>,
     pub(crate) service: Mutex<Service>,
+    poll_source: Arc<PollSet>,
+    poll_waker: Waker,
     pub(crate) tcp_ephemeral_port: Mutex<u16>,
     pub(crate) udp_ephemeral_port: Mutex<u16>,
     ipv4_conf_default_tag: AtomicI32,
     ipv4_conf_lo_tag: AtomicI32,
+}
+
+struct NetPollWake(Arc<PollSet>);
+
+impl Wake for NetPollWake {
+    fn wake(self: Arc<Self>) {
+        self.0.as_ref().wake();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.as_ref().wake();
+    }
 }
 
 const PORT_START: u16 = 0xc000;
@@ -57,11 +75,17 @@ impl NetStack {
         service: Service,
     ) -> AxResult<Arc<Self>> {
         let unix_namespace = UnixNamespace::try_new()?;
+        let poll_source = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
+        let poll_wake =
+            Arc::try_new(NetPollWake(poll_source.clone())).map_err(|_| AxError::NoMemory)?;
+        let poll_waker = Waker::from(poll_wake);
         Arc::try_new(Self {
             unix_namespace,
             listen_table,
             socket_set,
             service: Mutex::new(service),
+            poll_source,
+            poll_waker,
             tcp_ephemeral_port: Mutex::new(PORT_START),
             udp_ephemeral_port: Mutex::new(PORT_START),
             ipv4_conf_default_tag: AtomicI32::new(0),
@@ -109,16 +133,16 @@ impl NetStack {
             lo_ip6.address().into(),
         ));
 
-        let mut service = Service::new(router, socket_set.clone());
+        let mut service = Service::try_new(router, socket_set.clone())?;
         service.iface.update_ip_addrs(|addrs| {
             let lo_ip = lo_ip.into();
-            if !addrs.iter().any(|existing| *existing == lo_ip) {
+            if !addrs.contains(&lo_ip) {
                 addrs
                     .push(lo_ip)
                     .expect("loopback address insertion should succeed");
             }
             let lo_ip6 = lo_ip6.into();
-            if !addrs.iter().any(|existing| *existing == lo_ip6) {
+            if !addrs.contains(&lo_ip6) {
                 addrs
                     .push(lo_ip6)
                     .expect("loopback IPv6 address insertion should succeed");
@@ -193,6 +217,21 @@ impl NetStack {
     /// Acquire a lock on the Service.
     pub(crate) fn get_service(&self) -> axsync::MutexGuard<'_, Service> {
         self.service.lock()
+    }
+
+    /// Arms this stack's stable network source into caller-reserved aggregate
+    /// storage after refreshing every selected hardware/protocol bridge.
+    pub(crate) fn arm_readiness<'a>(
+        &'a self,
+        prepared: &mut PreparedPollRegistration<'a>,
+        device_mask: u64,
+        waker: &Waker,
+    ) -> Result<(), PollRegistrationError> {
+        self.service
+            .lock()
+            .register_waker(device_mask, &self.poll_waker)?;
+        prepared.arm(&self.poll_source, waker)?;
+        Ok(())
     }
 
     /// Lock the service before the socket set to avoid AB-BA deadlocks.

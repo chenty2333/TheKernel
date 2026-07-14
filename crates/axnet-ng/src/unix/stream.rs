@@ -9,7 +9,9 @@ use core::{
 use async_trait::async_trait;
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::{IoBuf, Read, Write};
-use axpoll::{IoEvents, PollSet, Pollable};
+use axpoll::{
+    IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable, PreparedPollRegistration,
+};
 use axsync::{Mutex, spin::SpinNoIrq};
 use ringbuf::{
     HeapCons, HeapProd, HeapRb,
@@ -480,16 +482,15 @@ impl Configurable for StreamTransport {
         use GetSocketOption as O;
 
         if self.general.get_option_inner(opt)? {
-            if let O::Error(error) = opt {
-                if **error == 0
-                    && self
-                        .channel
-                        .lock()
-                        .as_ref()
-                        .is_some_and(Channel::take_peer_reset)
-                {
-                    **error = LinuxError::ECONNRESET.code();
-                }
+            if let O::Error(error) = opt
+                && **error == 0
+                && self
+                    .channel
+                    .lock()
+                    .as_ref()
+                    .is_some_and(Channel::take_peer_reset)
+            {
+                **error = LinuxError::ECONNRESET.code();
             }
             return Ok(true);
         }
@@ -640,7 +641,7 @@ impl TransportOps for StreamTransport {
         let ConnRequest {
             channel,
             addr: peer_addr,
-        } = rx.recv().await.map_err(|_| AxError::ConnectionReset)?;
+        } = rx.recv().await?;
         Ok((
             Transport::Stream(StreamTransport::new_channel_with_cleanup(
                 Some(channel),
@@ -793,47 +794,63 @@ impl Pollable for StreamTransport {
             let peer_read_closed = chan.peer_read_closed();
             let peer_reset_pending = chan.peer_reset_pending();
             events.set(
-                IoEvents::IN,
+                IoEvents::READABLE,
                 self.rx_closed.load(Ordering::Acquire)
                     || peer_write_closed
                     || chan.rx.as_ref().is_some_and(|rx| rx.occupied_len() > 0),
             );
             events.set(
-                IoEvents::OUT,
+                IoEvents::WRITABLE,
                 !self.tx_closed.load(Ordering::Acquire)
                     && chan
                         .tx
                         .as_ref()
                         .is_some_and(|tx| peer_read_closed || tx.vacant_len() > 0),
             );
-            events.set(IoEvents::ERR, peer_reset_pending);
-            events.set(IoEvents::RDHUP, peer_write_closed);
-            events.set(IoEvents::HUP, peer_read_closed && peer_write_closed);
+            events.set(IoEvents::ERROR, peer_reset_pending);
+            events.set(IoEvents::READ_HANGUP, peer_write_closed);
+            events.set(IoEvents::HANGUP, peer_read_closed && peer_write_closed);
         } else if let Some(conn_rx) = self.conn_rx.lock().as_ref() {
-            events.set(IoEvents::IN, !conn_rx.is_empty());
+            events.set(IoEvents::READABLE, !conn_rx.is_empty());
         }
         self.general.add_pending_error_event(events)
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
         let channel_poll = self
             .channel
             .lock()
             .as_ref()
             .map(|channel| channel.poll_update.clone());
-        if let Some(channel_poll) = channel_poll {
-            if events.intersects(
-                IoEvents::IN | IoEvents::OUT | IoEvents::ERR | IoEvents::HUP | IoEvents::RDHUP,
-            ) {
-                channel_poll.register(context.waker());
-            }
-        } else if events.contains(IoEvents::IN) {
-            let receiver = self.conn_rx.lock().clone();
-            if let Some(receiver) = receiver {
-                receiver.register_read(context.waker());
-            }
+        let channel_poll = channel_poll.filter(|_| {
+            events.intersects(
+                IoEvents::READABLE
+                    | IoEvents::WRITABLE
+                    | IoEvents::ERROR
+                    | IoEvents::HANGUP
+                    | IoEvents::READ_HANGUP,
+            )
+        });
+        let listener_poll = if channel_poll.is_none() && events.contains(IoEvents::READABLE) {
+            self.conn_rx.lock().as_ref().map(Receiver::read_poll_source)
+        } else {
+            None
+        };
+        let maximum =
+            1 + usize::from(channel_poll.is_some()) + usize::from(listener_poll.is_some());
+        let mut prepared = PreparedPollRegistration::try_new(maximum)?;
+        if let Some(source) = channel_poll {
+            prepared.arm_owned(source, context.waker())?;
         }
-        self.poll_state.register(context.waker());
+        if let Some(source) = listener_poll {
+            prepared.arm_owned(source, context.waker())?;
+        }
+        prepared.arm(&self.poll_state, context.waker())?;
+        prepared.commit()
     }
 }
 
@@ -894,7 +911,7 @@ mod tests {
     }
 
     fn closed_stream_events() -> IoEvents {
-        IoEvents::IN | IoEvents::OUT | IoEvents::HUP | IoEvents::RDHUP
+        IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::HANGUP | IoEvents::READ_HANGUP
     }
 
     #[test]
@@ -918,7 +935,9 @@ mod tests {
         let mut context = Context::from_waker(&waker);
         // poll(2) must wake for its unconditional ERR/HUP interests even when
         // user space did not request IN or OUT.
-        left.register(&mut context, IoEvents::ERR | IoEvents::HUP);
+        let registration = left
+            .register(&mut context, IoEvents::ERROR | IoEvents::HANGUP)
+            .unwrap();
 
         drop(right);
         assert_eq!(wakes.load(Ordering::SeqCst), 0);
@@ -937,6 +956,7 @@ mod tests {
         assert_eq!(left.poll().bits(), closed_stream_events().bits());
         assert_eq!(socket_error(&left), 0);
 
+        drop(registration);
         drop(left);
         while super::super::has_deferred_receive_cleanup_work() {
             super::super::drain_deferred_receive_cleanup_work();
@@ -970,14 +990,16 @@ mod tests {
         let wakes = Arc::new(AtomicUsize::new(0));
         let waker = Waker::from(Arc::new(CountingWake(wakes.clone())));
         let mut context = Context::from_waker(&waker);
-        client.register(&mut context, IoEvents::IN | IoEvents::OUT);
+        let registration = client
+            .register(&mut context, IoEvents::READABLE | IoEvents::WRITABLE)
+            .unwrap();
 
         drop(listener);
         assert_eq!(wakes.load(Ordering::SeqCst), 0);
         let immediate_events = client.poll();
         assert_eq!(
             immediate_events.bits(),
-            (closed_stream_events() | IoEvents::ERR).bits()
+            (closed_stream_events() | IoEvents::ERROR).bits()
         );
         assert_eq!(socket_error(&client), LinuxError::ECONNRESET.code());
         assert_eq!(socket_error(&client), 0);
@@ -1006,6 +1028,7 @@ mod tests {
         assert_eq!(events.bits(), closed_stream_events().bits());
         assert_eq!(socket_error(&client), 0);
 
+        drop(registration);
         drop(client);
         while super::super::has_deferred_receive_cleanup_work() {
             super::super::drain_deferred_receive_cleanup_work();
@@ -1036,13 +1059,13 @@ mod tests {
 
         assert_eq!(
             client.poll().bits(),
-            (closed_stream_events() | IoEvents::ERR).bits()
+            (closed_stream_events() | IoEvents::ERROR).bits()
         );
         assert_eq!(
             client.send(&b"x"[..], SendOptions::default()),
             Err(AxError::BrokenPipe)
         );
-        assert!(client.poll().contains(IoEvents::ERR));
+        assert!(client.poll().contains(IoEvents::ERROR));
 
         let mut byte = [0u8; 1];
         assert_eq!(
@@ -1103,17 +1126,22 @@ mod tests {
             client
                 .connect(&slot, &UnixSocketAddr::Unnamed, credentials)
                 .unwrap();
-            client.register(&mut context, IoEvents::IN | IoEvents::OUT);
             clients.push(client);
         }
+
+        let _registrations = clients
+            .iter()
+            .map(|client| client.register(&mut context, IoEvents::READABLE | IoEvents::WRITABLE))
+            .collect::<Result<alloc::vec::Vec<_>, _>>()
+            .unwrap();
 
         drop(listener);
         assert_eq!(wakes.load(Ordering::SeqCst), 0);
         for client in &clients {
             let events = client.poll();
-            assert!(events.contains(IoEvents::RDHUP));
-            assert!(events.contains(IoEvents::ERR));
-            assert!(events.contains(IoEvents::HUP));
+            assert!(events.contains(IoEvents::READ_HANGUP));
+            assert!(events.contains(IoEvents::ERROR));
+            assert!(events.contains(IoEvents::HANGUP));
             assert_eq!(
                 client.send(&b"x"[..], SendOptions::default()),
                 Err(AxError::BrokenPipe)
@@ -1124,6 +1152,7 @@ mod tests {
             super::super::drain_deferred_receive_cleanup_work();
         }
         assert!(wakes.load(Ordering::SeqCst) > 0);
+        drop(_registrations);
         drop(clients);
         while super::super::has_deferred_receive_cleanup_work() {
             super::super::drain_deferred_receive_cleanup_work();
@@ -1313,7 +1342,7 @@ mod tests {
         );
         left.shutdown(Shutdown::Write).unwrap();
         assert!(left.channel.lock().as_ref().unwrap().tx.is_none());
-        assert!(right.poll().contains(IoEvents::RDHUP));
+        assert!(right.poll().contains(IoEvents::READ_HANGUP));
 
         let mut byte = [0u8; 1];
         let mut right_channel = right.channel.lock();

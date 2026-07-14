@@ -187,7 +187,13 @@ impl Pollable for FsOpenFd {
         IoEvents::empty()
     }
 
-    fn register(&self, _context: &mut core::task::Context<'_>, _events: IoEvents) {}
+    fn register<'a>(
+        &'a self,
+        _context: &mut core::task::Context<'_>,
+        _events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        axpoll::PollRegistration::empty()
+    }
 }
 
 struct FsMountFd {
@@ -562,7 +568,13 @@ impl Pollable for FsMountFd {
         IoEvents::empty()
     }
 
-    fn register(&self, _context: &mut core::task::Context<'_>, _events: IoEvents) {}
+    fn register<'a>(
+        &'a self,
+        _context: &mut core::task::Context<'_>,
+        _events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        axpoll::PollRegistration::empty()
+    }
 }
 
 pub fn sys_fsopen(fs_name: *const c_char, flags: u32) -> AxResult<isize> {

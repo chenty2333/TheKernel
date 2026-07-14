@@ -15,10 +15,7 @@ use axfs_ng_vfs::{
 use axio::{Cursor, IoBuf, Seek, SeekFrom};
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
-use axtask::{
-    current,
-    future::{block_on, poll_io},
-};
+use axtask::current;
 use linux_raw_sys::general::{
     AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, RLIM_INFINITY, RLIMIT_FSIZE,
 };
@@ -31,6 +28,7 @@ use super::{
 use crate::{
     file::{IoDst, IoSrc, memfd},
     mounts,
+    readiness::block_on_poll_io,
     task::{AsThread, DacCredentialView, send_signal_to_process},
 };
 
@@ -258,9 +256,9 @@ impl FileLike for File {
         if likely(self.is_blocking()) {
             inner.read(dst)
         } else {
-            block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
+            block_on_poll_io(self, IoEvents::READABLE, self.nonblocking(), || {
                 inner.read(&mut *dst)
-            }))
+            })
         }
     }
 
@@ -299,16 +297,16 @@ impl FileLike for File {
             if likely(self.is_blocking()) {
                 inner.write(&mut cursor)
             } else {
-                block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
+                block_on_poll_io(self, IoEvents::WRITABLE, self.nonblocking(), || {
                     inner.write(&mut cursor)
-                }))
+                })
             }
         } else if likely(self.is_blocking()) {
             inner.write(src)
         } else {
-            block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
+            block_on_poll_io(self, IoEvents::WRITABLE, self.nonblocking(), || {
                 inner.write(&mut *src)
-            }))
+            })
         }
     }
 
@@ -359,8 +357,12 @@ impl Pollable for File {
         self.inner().location().poll()
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        self.inner().location().register(context, events);
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        self.inner().location().register(context, events)
     }
 }
 
@@ -421,8 +423,14 @@ impl FileLike for Directory {
 }
 impl Pollable for Directory {
     fn poll(&self) -> IoEvents {
-        IoEvents::IN | IoEvents::OUT
+        IoEvents::READABLE | IoEvents::WRITABLE
     }
 
-    fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+    fn register<'a>(
+        &'a self,
+        _context: &mut Context<'_>,
+        _events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        axpoll::PollRegistration::empty()
+    }
 }

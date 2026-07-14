@@ -99,6 +99,10 @@ pub struct Thread {
     /// Best-effort user-visible blocking state used by procfs.
     proc_state_hint: AtomicU8,
 
+    /// Linux `SCHED_RESET_ON_FORK` policy, deliberately kept out of the
+    /// generic scheduler mechanism.
+    sched_reset_on_fork: AtomicBool,
+
     /// The OOM score adjustment value.
     oom_score_adj: AtomicI32,
 
@@ -148,6 +152,7 @@ impl Thread {
             time: AssumeSync(RefCell::new(TimeManager::new())),
             live_usage: AtomicTaskUsage::new(),
             proc_state_hint: AtomicU8::new(ProcStateHint::None as u8),
+            sched_reset_on_fork: AtomicBool::new(false),
             exit,
             oom_score_adj: AtomicI32::new(200),
             accessing_user_memory: AtomicBool::new(false),
@@ -228,6 +233,14 @@ impl Thread {
     /// Set the user-visible thread ID.
     pub fn set_tid(&self, tid: Pid) {
         self.visible_tid.store(tid, Ordering::Release);
+    }
+
+    pub(crate) fn sched_reset_on_fork(&self) -> bool {
+        self.sched_reset_on_fork.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_sched_reset_on_fork(&self, enabled: bool) {
+        self.sched_reset_on_fork.store(enabled, Ordering::Release);
     }
 
     /// Temporarily releases the active-scope read lock so the current thread

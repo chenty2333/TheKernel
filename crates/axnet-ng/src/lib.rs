@@ -47,6 +47,7 @@ mod wrapper;
 use alloc::{borrow::ToOwned, boxed::Box, sync::Arc};
 
 use axdriver::{AxDeviceContainer, prelude::*};
+use axerrno::{AxError, AxResult};
 use smoltcp::wire::{EthernetAddress, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr};
 pub use smoltcp::wire::{IpAddress, IpCidr};
 use spin::Once;
@@ -81,14 +82,15 @@ pub fn default_stack() -> &'static Arc<NetStack> {
 ///
 /// Returns the default [`NetStack`] and also stores it internally so it can
 /// be retrieved later via [`default_stack`].
-pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) -> Arc<NetStack> {
+pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) -> AxResult<Arc<NetStack>> {
     info!("Initialize network subsystem...");
 
-    let socket_set = Arc::new(SocketSetWrapper::new());
-    let listen_table = Arc::new(ListenTable::new());
+    let socket_set = Arc::try_new(SocketSetWrapper::new()).map_err(|_| AxError::NoMemory)?;
+    let listen_table = Arc::try_new(ListenTable::try_new()?).map_err(|_| AxError::NoMemory)?;
 
-    let mut router = Router::new_loopback_only(listen_table.clone());
-    let lo_dev = router.add_device(Box::new(LoopbackDevice::new()));
+    let mut router = Router::try_new_loopback_only(listen_table.clone())?;
+    let loopback = Box::try_new(LoopbackDevice::try_new()?).map_err(|_| AxError::NoMemory)?;
+    let lo_dev = router.add_device(loopback);
 
     let lo_ip = Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8);
     let lo_ip6 = Ipv6Cidr::new(Ipv6Address::LOCALHOST, 128);
@@ -125,8 +127,8 @@ pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) -> Arc<NetStac
         ));
 
         info!("eth0:");
-        info!("  mac:  {}", eth0_address);
-        info!("  ip:   {}", eth0_ip);
+        info!("  mac:  {eth0_address}");
+        info!("  ip:   {eth0_ip}");
 
         Some(eth0_ip)
     } else {
@@ -138,23 +140,23 @@ pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) -> Arc<NetStac
         info!("Device: {}", dev.name());
     }
 
-    let mut service = Service::new(router, socket_set.clone());
+    let mut service = Service::try_new(router, socket_set.clone())?;
     service.iface.update_ip_addrs(|ip_addrs| {
         let lo_ip = lo_ip.into();
-        if !ip_addrs.iter().any(|existing| *existing == lo_ip) {
+        if !ip_addrs.contains(&lo_ip) {
             ip_addrs
                 .push(lo_ip)
                 .expect("loopback address insertion should succeed");
         }
         let lo_ip6 = lo_ip6.into();
-        if !ip_addrs.iter().any(|existing| *existing == lo_ip6) {
+        if !ip_addrs.contains(&lo_ip6) {
             ip_addrs
                 .push(lo_ip6)
                 .expect("loopback IPv6 address insertion should succeed");
         }
         if let Some(eth0_ip) = eth0_ip {
             let eth0_ip = eth0_ip.into();
-            if !ip_addrs.iter().any(|existing| *existing == eth0_ip) {
+            if !ip_addrs.contains(&eth0_ip) {
                 ip_addrs
                     .push(eth0_ip)
                     .expect("eth0 address insertion should succeed");
@@ -162,20 +164,20 @@ pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) -> Arc<NetStac
         }
     });
 
-    let stack = NetStack::new(listen_table, socket_set, service);
+    let stack = NetStack::try_new(listen_table, socket_set, service)?;
     DEFAULT_STACK.call_once(|| stack.clone());
-    stack
+    Ok(stack)
 }
 
 /// Initializes the default network stack in loopback-only mode.
 ///
 /// This keeps the full socket stack available for localhost-based tests while
 /// intentionally ignoring any discovered NIC devices.
-pub fn init_network_loopback_only() -> Arc<NetStack> {
+pub fn init_network_loopback_only() -> AxResult<Arc<NetStack>> {
     info!("Initialize network subsystem (loopback-only)...");
-    let stack = NetStack::new_loopback_only();
+    let stack = NetStack::try_new_loopback_only()?;
     DEFAULT_STACK.call_once(|| stack.clone());
-    stack
+    Ok(stack)
 }
 
 /// Init vsock subsystem by vsock devices.
@@ -186,7 +188,7 @@ pub fn init_vsock(mut vsock_devs: AxDeviceContainer<AxVsockDevice>) {
     if let Some(dev) = vsock_devs.take_one() {
         info!("  use vsock 0: {:?}", dev.device_name());
         if let Err(e) = register_vsock_device(dev) {
-            warn!("Failed to initialize vsock device: {:?}", e);
+            warn!("Failed to initialize vsock device: {e:?}");
         }
     } else {
         debug!("  No vsock device found!");

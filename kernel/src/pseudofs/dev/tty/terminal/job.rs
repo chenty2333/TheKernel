@@ -5,9 +5,8 @@ use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::current;
 use kspin::SpinNoIrq;
-use starry_process::{ProcessGroup, Session};
 
-use crate::task::AsThread;
+use crate::task::{AsThread, ProcessGroup, Session};
 
 pub struct JobControl {
     foreground: SpinNoIrq<Weak<ProcessGroup>>,
@@ -28,6 +27,10 @@ impl JobControl {
             session: SpinNoIrq::new(Weak::new()),
             poll_fg: PollSet::new(),
         }
+    }
+
+    pub(crate) fn poll_source(&self) -> &PollSet {
+        &self.poll_fg
     }
 
     pub fn current_in_foreground(&self) -> bool {
@@ -140,13 +143,19 @@ impl JobControl {
 impl Pollable for JobControl {
     fn poll(&self) -> IoEvents {
         let mut events = IoEvents::empty();
-        events.set(IoEvents::IN, self.current_in_foreground());
+        events.set(IoEvents::READABLE, self.current_in_foreground());
         events
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.contains(IoEvents::IN) {
-            self.poll_fg.register(context.waker());
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        if events.contains(IoEvents::READABLE) {
+            axpoll::PollRegistration::single(&self.poll_fg, context.waker())
+        } else {
+            axpoll::PollRegistration::empty()
         }
     }
 }

@@ -71,6 +71,7 @@ pub(in crate::task) struct PtraceControlState {
 pub(in crate::task) struct ExecControlState {
     pub(in crate::task) owner: Option<Pid>,
     pub(in crate::task) pending_thread_additions: usize,
+    pub(in crate::task) group_exit: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

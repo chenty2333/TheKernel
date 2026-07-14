@@ -9,7 +9,6 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axio::prelude::*;
 use axnet::{InterfaceInfo, InterfaceKind, IpAddress, NetStack, RecvFlags, RouteInfo};
 use axpoll::{IoEvents, PollSet, Pollable};
-use axtask::future::{block_on, poll_io};
 use linux_raw_sys::net::{
     AF_INET, AF_INET6, AF_NETLINK, AF_UNSPEC, SOCK_DGRAM, SOCK_RAW, sockaddr, socklen_t,
 };
@@ -18,6 +17,7 @@ use spin::Mutex;
 use crate::{
     file::{FileLike, IoDst, IoSrc, Kstat, PseudoInode, try_pseudo_inode_path},
     mm::UserPtr,
+    readiness::block_on_poll_io,
 };
 
 const NETLINK_MAX_PROTOCOL: u32 = 31;
@@ -284,9 +284,9 @@ impl NetlinkSocket {
     }
 
     pub fn recv(&self, dst: &mut IoDst, flags: RecvFlags) -> AxResult<usize> {
-        block_on(poll_io(
+        block_on_poll_io(
             self,
-            IoEvents::IN,
+            IoEvents::READABLE,
             self.nonblocking() || flags.contains(RecvFlags::DONT_WAIT),
             || {
                 let mut queue = self.queue.lock();
@@ -307,7 +307,7 @@ impl NetlinkSocket {
                     copy_len
                 })
             },
-        ))
+        )
     }
 
     pub fn recv_from(
@@ -749,14 +749,20 @@ fn align4(value: usize) -> usize {
 
 impl Pollable for NetlinkSocket {
     fn poll(&self) -> IoEvents {
-        let mut events = IoEvents::OUT;
-        events.set(IoEvents::IN, !self.queue.lock().is_empty());
+        let mut events = IoEvents::WRITABLE;
+        events.set(IoEvents::READABLE, !self.queue.lock().is_empty());
         events
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.contains(IoEvents::IN) {
-            self.poll_rx.register(context.waker());
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        if events.contains(IoEvents::READABLE) {
+            axpoll::PollRegistration::single(&self.poll_rx, context.waker())
+        } else {
+            axpoll::PollRegistration::empty()
         }
     }
 }

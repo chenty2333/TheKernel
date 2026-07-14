@@ -9,12 +9,11 @@ use core::{any::Any, ops::Deref, sync::atomic::Ordering, task::Context};
 
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::NodeFlags;
-use axpoll::{IoEvents, Pollable};
+use axpoll::{IoEvents, PollSet, Pollable};
 use axsync::Mutex;
 use axtask::current;
 use kspin::SpinNoIrq;
 use spin::Once;
-use starry_process::{Process, Session};
 use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 
@@ -35,7 +34,7 @@ use self::{
 };
 use crate::{
     pseudofs::DeviceOps,
-    task::{AsThread, get_process_group, send_signal_to_process_group},
+    task::{AsThread, Process, Session, get_process_group, send_signal_to_process_group},
 };
 
 const N_TTY_LDISC: i32 = 0;
@@ -45,6 +44,7 @@ pub struct Tty<R, W> {
     this: Once<Weak<Self>>,
     terminal: Arc<Terminal>,
     ldisc: Mutex<LineDiscipline<R, W>>,
+    read_waiters: Option<Arc<PollSet>>,
     writer: W,
     endpoint: Option<PtyEndpoint>,
     pts_lease: SpinNoIrq<Option<PtsLease>>,
@@ -59,11 +59,14 @@ impl<R: TtyRead, W: TtyWrite + Clone> Tty<R, W> {
     ) -> AxResult<Arc<Self>> {
         let writer = config.writer.clone();
         let is_ptm = endpoint.as_ref().is_some_and(PtyEndpoint::is_master);
-        let ldisc = Mutex::new(LineDiscipline::try_new(terminal.clone(), config)?);
+        let ldisc = LineDiscipline::try_new(terminal.clone(), config)?;
+        let read_waiters = ldisc.readiness_source().cloned();
+        let ldisc = Mutex::new(ldisc);
         let tty = Arc::try_new(Self {
             this: Once::new(),
             terminal,
             ldisc,
+            read_waiters,
             writer,
             endpoint,
             pts_lease: SpinNoIrq::new(None),
@@ -453,36 +456,61 @@ impl<R: TtyRead, W: TtyWrite> Pollable for Tty<R, W> {
             // The master endpoint is never subject to slave foreground job
             // control and must remain pollable without a current user task.
             (IoEvents::empty(), true)
-        } else if hangup_events.contains(IoEvents::HUP) {
+        } else if hangup_events.contains(IoEvents::HANGUP) {
             // Hangup readiness is terminal state, independent of which task
             // happens to poll the orphaned slave.
             (IoEvents::empty(), true)
         } else {
             let events = self.terminal.job_control.poll();
-            let foreground = events.contains(IoEvents::IN);
+            let foreground = events.contains(IoEvents::READABLE);
             (events, foreground)
         };
-        events.set(IoEvents::OUT, self.writer.poll_write());
+        events.set(IoEvents::WRITABLE, self.writer.poll_write());
         if foreground {
-            events.set(IoEvents::IN, self.ldisc.lock().poll_read());
+            events.set(IoEvents::READABLE, self.ldisc.lock().poll_read());
         }
         events |= hangup_events;
         events
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if !self.is_ptm {
-            self.terminal.job_control.register(context, events);
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        let job = !self.is_ptm && events.contains(IoEvents::READABLE);
+        let read = events.contains(IoEvents::READABLE) && self.read_waiters.is_some();
+        let write_source = events
+            .contains(IoEvents::WRITABLE)
+            .then(|| self.writer.tx_poll_source())
+            .flatten();
+        let endpoint = self.endpoint.as_ref();
+
+        if events.contains(IoEvents::READABLE) && self.read_waiters.is_none() {
+            // A manually polled transport has no honest wake source. Reject
+            // blocking registration instead of manufacturing a busy loop.
+            return Err(axpoll::PollRegistrationError::InvalidState);
         }
-        if events.contains(IoEvents::IN) {
-            self.ldisc.lock().register_rx_waker(context.waker());
+
+        let mut prepared = axpoll::PreparedPollRegistration::try_new(
+            job as usize
+                + read as usize
+                + write_source.is_some() as usize
+                + endpoint.is_some() as usize,
+        )?;
+        if job {
+            prepared.arm(self.terminal.job_control.poll_source(), context.waker())?;
         }
-        if events.contains(IoEvents::OUT) {
-            self.writer.register_tx_waker(context.waker());
+        if let Some(source) = self.read_waiters.as_deref().filter(|_| read) {
+            prepared.arm(source, context.waker())?;
         }
-        if let Some(endpoint) = &self.endpoint {
-            endpoint.register(context);
+        if let Some(source) = write_source {
+            prepared.arm(source, context.waker())?;
         }
+        if let Some(endpoint) = endpoint {
+            prepared.arm(endpoint.poll_source(), context.waker())?;
+        }
+        prepared.commit()
     }
 }
 
@@ -516,7 +544,13 @@ mod tests {
             IoEvents::empty()
         }
 
-        fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+        fn register<'a>(
+            &'a self,
+            _context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+            axpoll::PollRegistration::empty()
+        }
     }
 
     impl FileLike for DummyFile {
@@ -554,7 +588,7 @@ mod tests {
         drop(slave_open);
         assert_eq!(
             master.endpoint.as_ref().unwrap().hangup_events().bits(),
-            (IoEvents::IN | IoEvents::HUP).bits()
+            (IoEvents::READABLE | IoEvents::HANGUP).bits()
         );
         let slave_open = slave.open_description().unwrap();
         assert!(master.endpoint.as_ref().unwrap().hangup_events().is_empty());
@@ -579,7 +613,9 @@ mod tests {
         drain_all_description_cleanup();
         assert!(!pts::test_slot_reserved(slot));
         let events = slave.endpoint.as_ref().unwrap().hangup_events();
-        assert!(events.contains(IoEvents::IN | IoEvents::OUT | IoEvents::ERR | IoEvents::HUP));
+        assert!(events.contains(
+            IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::ERROR | IoEvents::HANGUP
+        ));
         assert_eq!(
             TtyWrite::write(&slave.writer, b"after-hangup"),
             Err(AxError::Io)

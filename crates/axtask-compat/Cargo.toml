@@ -1,0 +1,27 @@
+[package]
+name = "axtask"
+version = "0.3.0-preview.2"
+edition = "2024"
+publish = false
+description = "Transitional package-name facade for TheKernel's maintained axtask"
+license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
+
+[lib]
+name = "axtask"
+path = "src/lib.rs"
+
+[features]
+default = []
+multitask = ["axtask-core/multitask"]
+task-ext = ["axtask-core/task-ext"]
+irq = ["axtask-core/irq"]
+tls = ["axtask-core/tls"]
+preempt = ["axtask-core/preempt"]
+smp = ["axtask-core/smp"]
+sched-fifo = ["axtask-core/sched-fifo"]
+sched-rr = ["axtask-core/sched-rr"]
+sched-cfs = ["axtask-core/sched-cfs"]
+test = ["axtask-core/test"]
+
+[dependencies]
+axtask-core = { package = "thekernel-axtask", version = "=0.1.0" }

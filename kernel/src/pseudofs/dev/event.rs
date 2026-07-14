@@ -1,4 +1,4 @@
-use alloc::{format, sync::Arc};
+use alloc::{format, sync::Arc, task::Wake};
 use core::{any::Any, task::Context, time::Duration};
 
 #[allow(unused_imports)]
@@ -7,8 +7,11 @@ use axdriver::prelude::{
 };
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::{DeviceId, NodeFlags, NodeType, VfsResult};
-use axpoll::{IoEvents, Pollable};
+use axpoll::{IoEvents, PollRegistrationError, PollSet, Pollable, RegisterError};
 use axsync::Mutex;
+use axtask::future::{
+    IrqWakerRegisterError, IrqWakerToken, cancel_irq_waker, register_irq_waker, update_irq_waker,
+};
 use bitmaps::Bitmap;
 use linux_raw_sys::{
     general::{__kernel_old_time_t, __kernel_suseconds_t},
@@ -55,6 +58,22 @@ impl Inner {
 pub struct EventDev {
     inner: Mutex<Inner>,
     ev_bits: Bitmap<{ EventType::COUNT as usize }>,
+    irq: Option<usize>,
+    irq_waiters: Arc<PollSet>,
+    irq_waker: core::task::Waker,
+    irq_registration: spin::Mutex<Option<IrqWakerToken>>,
+}
+
+struct InputIrqWake(Arc<PollSet>);
+
+impl Wake for InputIrqWake {
+    fn wake(self: Arc<Self>) {
+        PollSet::wake(self.0.as_ref());
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        PollSet::wake(self.0.as_ref());
+    }
 }
 
 impl EventDev {
@@ -84,6 +103,15 @@ impl EventDev {
         // } else {
         //     warn!("failure");
         // }
+        let irq = device.irq_num();
+        // Input-device construction is the IRQ capability owner. Readiness
+        // registration only attaches bounded waiters and never toggles the
+        // controller as a hidden side effect.
+        if let Some(irq) = irq {
+            axhal::irq::set_enable(irq, true);
+        }
+        let irq_waiters = Arc::new(PollSet::new());
+        let irq_waker = core::task::Waker::from(Arc::new(InputIrqWake(Arc::clone(&irq_waiters))));
         Self {
             inner: Mutex::new(Inner {
                 device,
@@ -91,7 +119,38 @@ impl EventDev {
                 key_state: Bitmap::new(),
             }),
             ev_bits,
+            irq,
+            irq_waiters,
+            irq_waker,
+            irq_registration: spin::Mutex::new(None),
         }
+    }
+
+    fn ensure_irq_bridge(&self) -> Result<(), PollRegistrationError> {
+        let irq = self.irq.ok_or(PollRegistrationError::InvalidState)?;
+        let mut registration = self.irq_registration.lock();
+        if let Some(token) = *registration {
+            if update_irq_waker(token, &self.irq_waker).is_ok() {
+                return Ok(());
+            }
+            *registration = None;
+        }
+        let token = register_irq_waker(irq, &self.irq_waker).map_err(|error| match error {
+            IrqWakerRegisterError::Waiter(error) => {
+                PollRegistrationError::Source { index: 0, error }
+            }
+            IrqWakerRegisterError::SourceCapacityExhausted
+            | IrqWakerRegisterError::HookInstallationInProgress => PollRegistrationError::Source {
+                index: 0,
+                error: RegisterError::Full,
+            },
+            IrqWakerRegisterError::HookUnavailable => PollRegistrationError::Source {
+                index: 0,
+                error: RegisterError::Closed,
+            },
+        })?;
+        *registration = Some(token);
+        Ok(())
     }
 
     fn get_event_bits(&self, arg: usize, size: usize, ty: u8) -> AxResult<usize> {
@@ -305,15 +364,31 @@ impl DeviceOps for EventDev {
 impl Pollable for EventDev {
     fn poll(&self) -> IoEvents {
         let mut events = IoEvents::empty();
-        events.set(IoEvents::IN, self.inner.lock().has_event());
+        events.set(IoEvents::READABLE, self.inner.lock().has_event());
         events
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.contains(IoEvents::IN)
-            && let Some(irq) = self.inner.lock().device.irq_num()
-        {
-            axtask::future::register_irq_waker(irq, context.waker());
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, PollRegistrationError> {
+        if !events.contains(IoEvents::READABLE) {
+            return axpoll::PollRegistration::empty();
+        }
+        let registration = axpoll::PollRegistration::single(&self.irq_waiters, context.waker())?;
+        self.ensure_irq_bridge()?;
+        Ok(registration)
+    }
+}
+
+impl Drop for EventDev {
+    fn drop(&mut self) {
+        if let Some(token) = self.irq_registration.get_mut().take() {
+            cancel_irq_waker(token);
+        }
+        if let Some(irq) = self.irq {
+            axhal::irq::set_enable(irq, false);
         }
     }
 }

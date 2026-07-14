@@ -18,7 +18,7 @@ use core::{
     task::Context,
 };
 
-use axpoll::{IoEvents, Pollable};
+use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use bitflags::bitflags;
 pub use dir::*;
 pub use file::*;
@@ -929,14 +929,18 @@ impl Pollable for DirEntry {
     fn poll(&self) -> IoEvents {
         match &self.0.node {
             Node::File(file) => file.poll(),
-            Node::Dir(_dir) => IoEvents::IN | IoEvents::OUT,
+            Node::Dir(_dir) => IoEvents::READABLE | IoEvents::WRITABLE,
         }
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
         match &self.0.node {
             Node::File(file) => file.register(context, events),
-            Node::Dir(_) => {}
+            Node::Dir(_) => PollRegistration::empty(),
         }
     }
 }

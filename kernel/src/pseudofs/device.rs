@@ -193,13 +193,19 @@ impl Pollable for Device {
         if let Some(pollable) = self.ops.as_pollable() {
             pollable.poll()
         } else {
-            IoEvents::IN | IoEvents::OUT
+            IoEvents::READABLE | IoEvents::WRITABLE
         }
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
         if let Some(pollable) = self.ops.as_pollable() {
-            pollable.register(context, events);
+            pollable.register(context, events)
+        } else {
+            axpoll::PollRegistration::empty()
         }
     }
 }

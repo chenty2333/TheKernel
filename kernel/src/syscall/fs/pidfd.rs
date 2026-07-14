@@ -95,15 +95,10 @@ pub fn sys_pidfd_getfd(pidfd: i32, target_fd: i32, flags: u32) -> AxResult<isize
     let pidfd = PidFd::from_fd(pidfd)?;
     let proc_data = pidfd.process_data()?;
     check_pidfd_getfd_permission(&pidfd, &proc_data)?;
-    FD_TABLE
+    let description = FD_TABLE
         .scope(&proc_data.scope.read())
-        .read()
-        .get(target_fd as usize)
-        .ok_or(AxError::BadFileDescriptor)
-        .and_then(|fd| {
-            let fd = add_file_description(fd.description.clone(), true)?;
-            Ok(fd as isize)
-        })
+        .get_description(target_fd)?;
+    add_file_description(description, true).map(|fd| fd as isize)
 }
 
 fn make_pidfd_signal_info(

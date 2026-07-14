@@ -2,11 +2,12 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{
     fmt::Write as _,
     hash::Hash,
-    sync::atomic::{AtomicI32, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, Ordering},
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::paging::{MappingFlags, PageSize};
+#[cfg(any(not(test), target_os = "none"))]
 use axsync::Mutex;
 use axtask::current;
 use hashbrown::HashMap;
@@ -16,6 +17,8 @@ use linux_raw_sys::{
     general::*,
 };
 use memory_addr::{PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
+#[cfg(all(test, not(target_os = "none")))]
+use spin::Mutex;
 use starry_process::Pid;
 
 use super::{
@@ -154,13 +157,56 @@ impl ShmidDs {
     }
 }
 
+/// One visibility bit shared by every manager/segment index installed for a
+/// fork-child SHM inheritance transaction.
+struct ShmForkPublication {
+    visible: AtomicBool,
+}
+
+impl ShmForkPublication {
+    const fn new(visible: bool) -> Self {
+        Self {
+            visible: AtomicBool::new(visible),
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        self.visible.load(Ordering::Acquire)
+    }
+}
+
+/// One process-local attachment map with an independently controlled
+/// publication point. Normal shmat buckets start visible; fork preparation
+/// installs hidden buckets sharing one [`ShmForkPublication`].
+struct ProcessAttachmentMap<T> {
+    publication: Arc<ShmForkPublication>,
+    entries: HashMap<usize, ShmAttachment<T>>,
+}
+
+impl<T> ProcessAttachmentMap<T> {
+    fn is_visible(&self) -> bool {
+        self.publication.is_visible()
+    }
+}
+
+struct ShmAttachment<T> {
+    publication: Arc<ShmForkPublication>,
+    value: T,
+}
+
+impl<T> ShmAttachment<T> {
+    fn is_visible(&self) -> bool {
+        self.publication.is_visible()
+    }
+}
+
 /// This struct is used to maintain the shmem in kernel.
 pub struct ShmInner {
     /// Shared memory segment identifier.
     pub shmid: i32,
     /// Number of pages in the shared memory segment.
     pub page_num: usize,
-    va_ranges: HashMap<Pid, HashMap<usize, VirtAddrRange>>,
+    va_ranges: HashMap<Pid, ProcessAttachmentMap<VirtAddrRange>>,
     /// physical pages
     pub phys_pages: Option<Arc<SharedPages>>,
     /// whether remove on last detach, see shm_ctl
@@ -224,15 +270,49 @@ impl ShmInner {
     /// Returns the number of processes currently attached to this shared memory
     /// segment.
     pub fn attach_count(&self) -> usize {
-        self.va_ranges.values().map(HashMap::len).sum()
+        self.va_ranges
+            .values()
+            .filter(|ranges| ranges.is_visible())
+            .map(|ranges| {
+                ranges
+                    .entries
+                    .values()
+                    .filter(|attachment| attachment.is_visible())
+                    .count()
+            })
+            .sum()
+    }
+
+    /// Returns the ABI-visible segment metadata. The attachment count is
+    /// derived from published buckets so an in-flight fork reservation can
+    /// never leak through IPC_STAT or /proc/sysvipc/shm.
+    fn visible_snapshot(&self) -> ShmidDs {
+        let mut snapshot = self.shmid_ds;
+        snapshot.shm_nattch = self.attach_count() as c_ulong;
+        snapshot
+    }
+
+    fn refresh_cached_attach_count(&mut self) {
+        self.shmid_ds.shm_nattch = self.attach_count() as c_ulong;
+    }
+
+    /// Returns whether a live attachment or an invisible fork reservation owns
+    /// this segment. IPC_RMID may hide the key immediately, but final page and
+    /// shmid destruction must wait for both forms of ownership to disappear.
+    fn has_attachment_owners(&self) -> bool {
+        self.va_ranges
+            .values()
+            .any(|ranges| !ranges.entries.is_empty())
     }
 
     /// Returns the virtual address range associated with an attach address.
     pub fn get_addr_range(&self, pid: Pid, vaddr: VirtAddr) -> Option<VirtAddrRange> {
         self.va_ranges
             .get(&pid)
-            .and_then(|ranges| ranges.get(&vaddr.as_usize()))
-            .cloned()
+            .filter(|ranges| ranges.is_visible())
+            .and_then(|ranges| ranges.entries.get(&vaddr.as_usize()))
+            .filter(|attachment| attachment.is_visible())
+            .map(|attachment| attachment.value)
     }
 
     fn try_reserve_process_attaches(&mut self, pid: Pid, additional: usize) -> AxResult<()> {
@@ -244,11 +324,22 @@ impl ShmInner {
             ranges
                 .try_reserve(additional)
                 .map_err(|_| AxError::NoMemory)?;
-            self.va_ranges.insert(pid, ranges);
+            let publication =
+                Arc::try_new(ShmForkPublication::new(true)).map_err(|_| AxError::NoMemory)?;
+            self.va_ranges.insert(
+                pid,
+                ProcessAttachmentMap {
+                    publication,
+                    entries: ranges,
+                },
+            );
         } else {
-            self.va_ranges
-                .get_mut(&pid)
-                .ok_or(AxError::Io)?
+            let ranges = self.va_ranges.get_mut(&pid).ok_or(AxError::Io)?;
+            if !ranges.is_visible() {
+                return Err(AxError::ResourceBusy);
+            }
+            ranges
+                .entries
                 .try_reserve(additional)
                 .map_err(|_| AxError::NoMemory)?;
         }
@@ -256,43 +347,33 @@ impl ShmInner {
     }
 
     fn cancel_empty_process_reservation(&mut self, pid: Pid) {
-        if self.va_ranges.get(&pid).is_some_and(HashMap::is_empty) {
+        if self
+            .va_ranges
+            .get(&pid)
+            .is_some_and(|ranges| ranges.is_visible() && ranges.entries.is_empty())
+        {
             self.va_ranges.remove(&pid);
         }
-    }
-
-    /// Called by sys_shmat after capacity and address-space publication have
-    /// both succeeded. This commit performs no allocation.
-    pub fn attach_process(&mut self, pid: Pid, va_range: VirtAddrRange) {
-        let old = self
-            .va_ranges
-            .get_mut(&pid)
-            .expect("reserved SysV SHM process bucket")
-            .insert(va_range.start.as_usize(), va_range);
-        debug_assert!(old.is_none());
-        self.shmid_ds.shm_nattch += 1;
-        self.shmid_ds.shm_lpid = pid as __kernel_pid_t;
-        self.shmid_ds.shm_atime = wall_time().as_secs() as __kernel_time_t;
-    }
-
-    pub fn inherit_process(&mut self, pid: Pid, va_range: VirtAddrRange) {
-        let old = self
-            .va_ranges
-            .get_mut(&pid)
-            .expect("reserved inherited SysV SHM process bucket")
-            .insert(va_range.start.as_usize(), va_range);
-        debug_assert!(old.is_none());
-        self.shmid_ds.shm_nattch += 1;
     }
 
     /// Called by sys_shmdt
     pub fn detach_process(&mut self, pid: Pid, vaddr: VirtAddr) -> Option<VirtAddrRange> {
         let ranges = self.va_ranges.get_mut(&pid)?;
-        let va_range = ranges.remove(&vaddr.as_usize())?;
-        if ranges.is_empty() {
+        if !ranges.is_visible() {
+            return None;
+        }
+        if !ranges
+            .entries
+            .get(&vaddr.as_usize())
+            .is_some_and(ShmAttachment::is_visible)
+        {
+            return None;
+        }
+        let va_range = ranges.entries.remove(&vaddr.as_usize())?.value;
+        if ranges.entries.is_empty() {
             self.va_ranges.remove(&pid);
         }
-        self.shmid_ds.shm_nattch -= 1;
+        self.refresh_cached_attach_count();
         self.shmid_ds.shm_lpid = pid as __kernel_pid_t;
         self.shmid_ds.shm_dtime = wall_time().as_secs() as __kernel_time_t;
         Some(va_range)
@@ -400,8 +481,9 @@ pub struct ShmManager {
     /// Total pages reserved by live segments, including segments awaiting
     /// their final detach after IPC_RMID.
     total_pages: usize,
-    /// pid -> attach address -> shm_id
-    pid_vaddr_shmid: HashMap<Pid, HashMap<usize, i32>>,
+    /// pid -> attach address -> shm_id. Hidden fork buckets are charged here
+    /// but filtered by every reader until their shared publication bit flips.
+    pid_vaddr_shmid: HashMap<Pid, ProcessAttachmentMap<i32>>,
     attachment_count: usize,
 }
 
@@ -452,18 +534,24 @@ impl ShmManager {
     pub fn get_shmid_by_vaddr(&self, pid: Pid, vaddr: VirtAddr) -> Option<i32> {
         self.pid_vaddr_shmid
             .get(&pid)
-            .and_then(|map| map.get(&vaddr.as_usize()))
-            .cloned()
+            .filter(|map| map.is_visible())
+            .and_then(|map| map.entries.get(&vaddr.as_usize()))
+            .filter(|attachment| attachment.is_visible())
+            .map(|attachment| attachment.value)
     }
 
     // used by garbage collection
     #[allow(dead_code)]
     fn find_vaddr_by_shmid(&self, pid: Pid, shmid: i32) -> Option<VirtAddr> {
-        self.pid_vaddr_shmid.get(&pid).and_then(|map| {
-            map.iter()
-                .find(|(_, id)| **id == shmid)
-                .map(|(&vaddr, _)| VirtAddr::from(vaddr))
-        })
+        self.pid_vaddr_shmid
+            .get(&pid)
+            .filter(|map| map.is_visible())
+            .and_then(|map| {
+                map.entries
+                    .iter()
+                    .find(|(_, attachment)| attachment.is_visible() && attachment.value == shmid)
+                    .map(|(&vaddr, _)| VirtAddr::from(vaddr))
+            })
     }
 
     fn try_reserve_segment(&mut self, has_key: bool) -> AxResult<()> {
@@ -525,11 +613,22 @@ impl ShmManager {
             attachments
                 .try_reserve(additional)
                 .map_err(|_| AxError::NoMemory)?;
-            self.pid_vaddr_shmid.insert(pid, attachments);
+            let publication =
+                Arc::try_new(ShmForkPublication::new(true)).map_err(|_| AxError::NoMemory)?;
+            self.pid_vaddr_shmid.insert(
+                pid,
+                ProcessAttachmentMap {
+                    publication,
+                    entries: attachments,
+                },
+            );
         } else {
-            self.pid_vaddr_shmid
-                .get_mut(&pid)
-                .ok_or(AxError::Io)?
+            let attachments = self.pid_vaddr_shmid.get_mut(&pid).ok_or(AxError::Io)?;
+            if !attachments.is_visible() {
+                return Err(AxError::ResourceBusy);
+            }
+            attachments
+                .entries
                 .try_reserve(additional)
                 .map_err(|_| AxError::NoMemory)?;
         }
@@ -540,21 +639,9 @@ impl ShmManager {
         if self
             .pid_vaddr_shmid
             .get(&pid)
-            .is_some_and(HashMap::is_empty)
+            .is_some_and(|attachments| attachments.is_visible() && attachments.entries.is_empty())
         {
             self.pid_vaddr_shmid.remove(&pid);
-        }
-    }
-
-    /// Commits a mapping after the process bucket has reserved capacity.
-    pub fn insert_shmid_vaddr(&mut self, pid: Pid, shmid: i32, vaddr: VirtAddr) {
-        let old = self
-            .pid_vaddr_shmid
-            .get_mut(&pid)
-            .expect("reserved SysV SHM manager process bucket")
-            .insert(vaddr.as_usize(), shmid);
-        if old.is_none() {
-            self.attachment_count = self.attachment_count.saturating_add(1);
         }
     }
 
@@ -562,10 +649,21 @@ impl ShmManager {
     pub fn remove_shmaddr(&mut self, pid: Pid, shmaddr: VirtAddr) {
         let mut empty: bool = false;
         if let Some(map) = self.pid_vaddr_shmid.get_mut(&pid) {
-            if map.remove(&shmaddr.as_usize()).is_some() {
-                self.attachment_count = self.attachment_count.saturating_sub(1);
+            if !map.is_visible() {
+                return;
             }
-            empty = map.is_empty();
+            let key = shmaddr.as_usize();
+            if !map.entries.get(&key).is_some_and(ShmAttachment::is_visible) {
+                return;
+            }
+            if map.entries.remove(&key).is_some() {
+                if let Some(next) = self.attachment_count.checked_sub(1) {
+                    self.attachment_count = next;
+                } else {
+                    error!("SysV SHM manager attachment underflow detaching PID {pid}");
+                }
+            }
+            empty = map.entries.is_empty();
         }
         if empty {
             self.pid_vaddr_shmid.remove(&pid);
@@ -574,24 +672,38 @@ impl ShmManager {
 
     // called when a process exit
     fn remove_pid(&mut self, pid: Pid) {
+        let visible = self.pid_vaddr_shmid.get(&pid).is_some_and(|attachments| {
+            attachments.is_visible() && attachments.entries.values().all(ShmAttachment::is_visible)
+        });
+        if !visible {
+            return;
+        }
         if let Some(attachments) = self.pid_vaddr_shmid.remove(&pid) {
-            self.attachment_count = self.attachment_count.saturating_sub(attachments.len());
+            if let Some(next) = self.attachment_count.checked_sub(attachments.entries.len()) {
+                self.attachment_count = next;
+            } else {
+                error!("SysV SHM manager attachment underflow clearing PID {pid}");
+            }
         }
     }
 
     /// Removes the shared memory segment.
-    pub fn remove_shmid(&mut self, shmid: i32, page_num: usize) {
-        self.key_shmid.remove_by_value(&shmid);
-        if self.shmid_inner.remove(&shmid).is_some() {
-            let Some(total_pages) = self.total_pages.checked_sub(page_num) else {
-                error!("SysV SHM page accounting underflow removing segment {shmid}");
-                self.total_pages = 0;
-                return;
-            };
-            self.total_pages = total_pages;
+    pub fn remove_shmid(&mut self, shmid: i32, page_num: usize) -> AxResult<()> {
+        if !self.shmid_inner.contains_key(&shmid) {
+            return Ok(());
         }
+        let total_pages = self
+            .total_pages
+            .checked_sub(page_num)
+            .ok_or(AxError::BadState)?;
+        self.key_shmid.remove_by_value(&shmid);
+        if self.shmid_inner.remove(&shmid).is_none() {
+            return Err(AxError::BadState);
+        }
+        self.total_pages = total_pages;
         // Per-process attach maps are cleaned on shmdt/exit. IPC_RMID only
         // removes the segment once the last attach has gone away.
+        Ok(())
     }
 }
 
@@ -604,33 +716,508 @@ lazy_static! {
 }
 static SHM_NEXT_ID: AtomicI32 = AtomicI32::new(-1);
 
-struct InheritedGroup {
+/// Fully allocated, reader-hidden metadata for one ordinary shmat operation.
+/// The address-space mapping is the only remaining fallible step; commit is a
+/// single publication store plus an internal cached-count refresh.
+#[must_use = "dropping a shmat admission rolls back its hidden metadata"]
+struct ShmatAdmission<'a> {
+    manager: &'a Mutex<ShmManager>,
     inner: Arc<Mutex<ShmInner>>,
-    ranges: HashMap<usize, VirtAddrRange>,
+    pid: Pid,
+    shmid: i32,
+    vaddr: VirtAddr,
+    publication: Arc<ShmForkPublication>,
+    committed: bool,
 }
 
-pub fn inherit_proc_shm(parent_pid: Pid, child_pid: Pid) -> AxResult<()> {
-    let _transaction = SHM_TRANSACTION.lock();
-    let required = SHM_MANAGER
-        .lock()
-        .pid_vaddr_shmid
-        .get(&parent_pid)
-        .map_or(0, HashMap::len);
-    if required == 0 {
-        return Ok(());
+impl ShmatAdmission<'_> {
+    fn commit(mut self) {
+        let mut state = self.inner.lock();
+        // Manager admission bounds visible plus hidden attachments at 65,536,
+        // so adding this exact prepared entry is representable on every target.
+        state.shmid_ds.shm_nattch = (state.attach_count() + 1) as c_ulong;
+        state.shmid_ds.shm_lpid = self.pid as __kernel_pid_t;
+        state.shmid_ds.shm_atime = wall_time().as_secs() as __kernel_time_t;
+        drop(state);
+        self.publication.visible.store(true, Ordering::Release);
+        self.committed = true;
     }
+}
+
+impl Drop for ShmatAdmission<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+
+        let exact_manager = {
+            let manager = self.manager.lock();
+            manager
+                .pid_vaddr_shmid
+                .get(&self.pid)
+                .and_then(|attachments| attachments.entries.get(&self.vaddr.as_usize()))
+                .is_some_and(|attachment| {
+                    !attachment.is_visible()
+                        && Arc::ptr_eq(&attachment.publication, &self.publication)
+                        && attachment.value == self.shmid
+                })
+        };
+        let exact_segment = {
+            let state = self.inner.lock();
+            state
+                .va_ranges
+                .get(&self.pid)
+                .and_then(|ranges| ranges.entries.get(&self.vaddr.as_usize()))
+                .is_some_and(|attachment| {
+                    !attachment.is_visible()
+                        && Arc::ptr_eq(&attachment.publication, &self.publication)
+                })
+        };
+        if !exact_manager || !exact_segment {
+            error!(
+                "SysV SHM shmat admission for PID {} at {:#x} lost an exact two-index reservation",
+                self.pid,
+                self.vaddr.as_usize()
+            );
+            return;
+        }
+
+        let removed_manager = {
+            let mut manager = self.manager.lock();
+            let mut remove_bucket = false;
+            let removed =
+                manager
+                    .pid_vaddr_shmid
+                    .get_mut(&self.pid)
+                    .and_then(|attachments| {
+                        let exact = attachments.entries.get(&self.vaddr.as_usize()).is_some_and(
+                            |attachment| {
+                                !attachment.is_visible()
+                                    && Arc::ptr_eq(&attachment.publication, &self.publication)
+                                    && attachment.value == self.shmid
+                            },
+                        );
+                        let removed = exact
+                            .then(|| attachments.entries.remove(&self.vaddr.as_usize()))
+                            .flatten();
+                        remove_bucket = attachments.entries.is_empty();
+                        removed
+                    });
+            if remove_bucket {
+                manager.pid_vaddr_shmid.remove(&self.pid);
+            }
+            removed
+        };
+
+        let (removed_segment, remove_segment) = {
+            let mut state = self.inner.lock();
+            let mut remove_bucket = false;
+            let removed = state.va_ranges.get_mut(&self.pid).and_then(|ranges| {
+                let exact = ranges
+                    .entries
+                    .get(&self.vaddr.as_usize())
+                    .is_some_and(|attachment| {
+                        !attachment.is_visible()
+                            && Arc::ptr_eq(&attachment.publication, &self.publication)
+                    });
+                let removed = exact
+                    .then(|| ranges.entries.remove(&self.vaddr.as_usize()))
+                    .flatten();
+                remove_bucket = ranges.entries.is_empty();
+                removed
+            });
+            if remove_bucket {
+                state.va_ranges.remove(&self.pid);
+            }
+            let removed_exact = removed.is_some();
+            if !removed_exact {
+                error!(
+                    "SysV SHM shmat admission lost segment reservation for PID {} at {:#x}",
+                    self.pid,
+                    self.vaddr.as_usize()
+                );
+            }
+            (
+                removed_exact,
+                (removed_exact && state.rmid && !state.has_attachment_owners())
+                    .then_some((state.shmid, state.page_num)),
+            )
+        };
+        if removed_manager.is_none() || !removed_segment {
+            error!(
+                "SysV SHM shmat admission for PID {} at {:#x} changed during exact rollback",
+                self.pid,
+                self.vaddr.as_usize()
+            );
+            return;
+        }
+        let refunded = {
+            let mut manager = self.manager.lock();
+            if let Some(next) = manager.attachment_count.checked_sub(1) {
+                manager.attachment_count = next;
+                true
+            } else {
+                error!("SysV SHM shmat rollback attachment underflow");
+                false
+            }
+        };
+        if refunded
+            && let Some((shmid, page_num)) = remove_segment
+            && let Err(error) = self.manager.lock().remove_shmid(shmid, page_num)
+        {
+            error!("failed to finalize removed SysV SHM segment {shmid}: {error:?}");
+        }
+    }
+}
+
+fn prepare_shmat_admission_in<'a>(
+    manager: &'a Mutex<ShmManager>,
+    inner: Arc<Mutex<ShmInner>>,
+    pid: Pid,
+    shmid: i32,
+    va_range: VirtAddrRange,
+) -> AxResult<ShmatAdmission<'a>> {
+    let publication =
+        Arc::try_new(ShmForkPublication::new(false)).map_err(|_| AxError::NoMemory)?;
+    let vaddr = va_range.start;
+    let next_attachment_count = {
+        let mut manager = manager.lock();
+        manager.try_reserve_process_attaches(pid, 1)?;
+        let Some(attachments) = manager.pid_vaddr_shmid.get(&pid) else {
+            manager.cancel_empty_process_reservation(pid);
+            return Err(AxError::BadState);
+        };
+        if !attachments.is_visible() || attachments.entries.contains_key(&vaddr.as_usize()) {
+            manager.cancel_empty_process_reservation(pid);
+            return Err(AxError::AlreadyExists);
+        }
+        let Some(next) = manager
+            .attachment_count
+            .checked_add(1)
+            .filter(|count| *count <= MAX_SHM_ATTACHMENTS)
+        else {
+            manager.cancel_empty_process_reservation(pid);
+            return Err(AxError::NoMemory);
+        };
+        next
+    };
+
+    if let Err(error) = inner.lock().try_reserve_process_attaches(pid, 1) {
+        manager.lock().cancel_empty_process_reservation(pid);
+        return Err(error);
+    }
+    {
+        let state = inner.lock();
+        let Some(ranges) = state.va_ranges.get(&pid) else {
+            drop(state);
+            inner.lock().cancel_empty_process_reservation(pid);
+            manager.lock().cancel_empty_process_reservation(pid);
+            return Err(AxError::BadState);
+        };
+        if !ranges.is_visible() || ranges.entries.contains_key(&vaddr.as_usize()) {
+            drop(state);
+            inner.lock().cancel_empty_process_reservation(pid);
+            manager.lock().cancel_empty_process_reservation(pid);
+            return Err(AxError::AlreadyExists);
+        }
+    }
+
+    {
+        let mut state = inner.lock();
+        let Some(ranges) = state.va_ranges.get_mut(&pid) else {
+            drop(state);
+            inner.lock().cancel_empty_process_reservation(pid);
+            manager.lock().cancel_empty_process_reservation(pid);
+            return Err(AxError::BadState);
+        };
+        let previous = ranges.entries.insert(
+            vaddr.as_usize(),
+            ShmAttachment {
+                publication: publication.clone(),
+                value: va_range,
+            },
+        );
+        if let Some(previous) = previous {
+            ranges.entries.insert(vaddr.as_usize(), previous);
+            drop(state);
+            inner.lock().cancel_empty_process_reservation(pid);
+            manager.lock().cancel_empty_process_reservation(pid);
+            return Err(AxError::BadState);
+        }
+    }
+
+    let previous_manager = {
+        let mut manager = manager.lock();
+        let Some(attachments) = manager.pid_vaddr_shmid.get_mut(&pid) else {
+            drop(manager);
+            if let Some(ranges) = inner.lock().va_ranges.get_mut(&pid) {
+                ranges.entries.remove(&vaddr.as_usize());
+            }
+            inner.lock().cancel_empty_process_reservation(pid);
+            return Err(AxError::BadState);
+        };
+        let previous = attachments.entries.insert(
+            vaddr.as_usize(),
+            ShmAttachment {
+                publication: publication.clone(),
+                value: shmid,
+            },
+        );
+        if previous.is_none() {
+            manager.attachment_count = next_attachment_count;
+        }
+        previous
+    };
+    if let Some(previous) = previous_manager {
+        if let Some(attachments) = manager.lock().pid_vaddr_shmid.get_mut(&pid) {
+            attachments.entries.insert(vaddr.as_usize(), previous);
+        }
+        if let Some(ranges) = inner.lock().va_ranges.get_mut(&pid) {
+            ranges.entries.remove(&vaddr.as_usize());
+        }
+        inner.lock().cancel_empty_process_reservation(pid);
+        manager.lock().cancel_empty_process_reservation(pid);
+        return Err(AxError::BadState);
+    }
+
+    Ok(ShmatAdmission {
+        manager,
+        inner,
+        pid,
+        shmid,
+        vaddr,
+        publication,
+        committed: false,
+    })
+}
+
+struct InheritedGroup {
+    inner: Arc<Mutex<ShmInner>>,
+    ranges: HashMap<usize, ShmAttachment<VirtAddrRange>>,
+}
+
+struct InheritedReservation {
+    inner: Arc<Mutex<ShmInner>>,
+    count: usize,
+}
+
+/// Invisible, fully allocated SysV SHM inheritance for one fork child.
+///
+/// Prepare installs manager and per-segment buckets sharing one clear
+/// publication bit. All regular readers and cleanup paths ignore those buckets,
+/// while IPC_RMID retains the segment as an internal in-flight owner. Commit is
+/// allocation-free and makes every bucket visible through one release store;
+/// Drop removes the exact hidden buckets and releases their accounting charge.
+#[must_use = "dropping a SysV SHM fork admission rolls back hidden inheritance"]
+pub(crate) struct ProcShmForkAdmission<'a> {
+    transaction: &'a Mutex<()>,
+    manager: &'a Mutex<ShmManager>,
+    child_pid: Pid,
+    publication: Option<Arc<ShmForkPublication>>,
+    groups: Vec<InheritedReservation>,
+    committed: bool,
+}
+
+impl<'a> ProcShmForkAdmission<'a> {
+    fn empty(transaction: &'a Mutex<()>, manager: &'a Mutex<ShmManager>, child_pid: Pid) -> Self {
+        Self {
+            transaction,
+            manager,
+            child_pid,
+            publication: None,
+            groups: Vec::new(),
+            committed: false,
+        }
+    }
+
+    /// Publishes every prepared manager/segment bucket in one release step.
+    /// ABI readers derive nattch from published buckets; the subsequent cache
+    /// refreshes are internal, allocation-free, and serialized from syscalls.
+    pub(crate) fn commit(mut self) {
+        let _transaction = self.transaction.lock();
+        if let Some(publication) = self.publication.as_ref() {
+            for group in &self.groups {
+                let mut state = group.inner.lock();
+                // The manager-wide admission charge proves this exact sum is
+                // bounded and representable before the final publication.
+                state.shmid_ds.shm_nattch = (state.attach_count() + group.count) as c_ulong;
+            }
+            publication.visible.store(true, Ordering::Release);
+        }
+        self.committed = true;
+    }
+}
+
+impl Drop for ProcShmForkAdmission<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let Some(publication) = self.publication.as_ref() else {
+            return;
+        };
+
+        let _transaction = self.transaction.lock();
+        let exact_manager = {
+            let manager = self.manager.lock();
+            manager
+                .pid_vaddr_shmid
+                .get(&self.child_pid)
+                .is_some_and(|attachments| {
+                    !attachments.is_visible()
+                        && Arc::ptr_eq(&attachments.publication, publication)
+                        && attachments.entries.values().all(|attachment| {
+                            !attachment.is_visible()
+                                && Arc::ptr_eq(&attachment.publication, publication)
+                        })
+                })
+        };
+        let exact_segments = self.groups.iter().all(|group| {
+            let state = group.inner.lock();
+            state.va_ranges.get(&self.child_pid).is_some_and(|ranges| {
+                !ranges.is_visible()
+                    && Arc::ptr_eq(&ranges.publication, publication)
+                    && ranges.entries.values().all(|attachment| {
+                        !attachment.is_visible()
+                            && Arc::ptr_eq(&attachment.publication, publication)
+                    })
+            })
+        });
+        if !exact_manager || !exact_segments {
+            error!(
+                "SysV SHM fork admission for PID {} lost an exact manager/segment reservation",
+                self.child_pid
+            );
+            return;
+        }
+
+        let removed_manager = {
+            let mut manager = self.manager.lock();
+            let exact = manager
+                .pid_vaddr_shmid
+                .get(&self.child_pid)
+                .is_some_and(|attachments| {
+                    !attachments.is_visible()
+                        && Arc::ptr_eq(&attachments.publication, publication)
+                        && attachments.entries.values().all(|attachment| {
+                            !attachment.is_visible()
+                                && Arc::ptr_eq(&attachment.publication, publication)
+                        })
+                });
+            let removed = exact
+                .then(|| manager.pid_vaddr_shmid.remove(&self.child_pid))
+                .flatten();
+            removed
+        };
+
+        if removed_manager.is_none() {
+            error!(
+                "SysV SHM fork admission for PID {} lost its manager reservation",
+                self.child_pid
+            );
+            return;
+        }
+        let mut all_segments_removed = true;
+        for group in &self.groups {
+            let (removed_segment, remove_segment) = {
+                let mut state = group.inner.lock();
+                let exact = state.va_ranges.get(&self.child_pid).is_some_and(|ranges| {
+                    !ranges.is_visible()
+                        && Arc::ptr_eq(&ranges.publication, publication)
+                        && ranges.entries.values().all(|attachment| {
+                            !attachment.is_visible()
+                                && Arc::ptr_eq(&attachment.publication, publication)
+                        })
+                });
+                let removed = exact
+                    .then(|| state.va_ranges.remove(&self.child_pid))
+                    .flatten();
+                if removed.is_none() {
+                    error!(
+                        "SysV SHM fork admission for PID {} lost segment {} reservation",
+                        self.child_pid, state.shmid
+                    );
+                }
+                let removed_exact = removed.is_some();
+                (
+                    removed_exact,
+                    (removed_exact && state.rmid && !state.has_attachment_owners())
+                        .then_some((state.shmid, state.page_num)),
+                )
+            };
+            all_segments_removed &= removed_segment;
+            if let Some((shmid, page_num)) = remove_segment {
+                if let Err(error) = self.manager.lock().remove_shmid(shmid, page_num) {
+                    error!("failed to finalize removed SysV SHM segment {shmid}: {error:?}");
+                }
+            }
+        }
+        if all_segments_removed && let Some(attachments) = removed_manager {
+            let mut manager = self.manager.lock();
+            if let Some(next) = manager
+                .attachment_count
+                .checked_sub(attachments.entries.len())
+            {
+                manager.attachment_count = next;
+            } else {
+                error!(
+                    "SysV SHM fork rollback underflow for PID {}",
+                    self.child_pid
+                );
+            }
+        }
+    }
+}
+
+fn prepare_proc_shm_inheritance_in<'a>(
+    transaction: &'a Mutex<()>,
+    manager: &'a Mutex<ShmManager>,
+    parent_pid: Pid,
+    child_pid: Pid,
+) -> AxResult<ProcShmForkAdmission<'a>> {
+    let _transaction = transaction.lock();
+    let required = {
+        let manager = manager.lock();
+        if manager.pid_vaddr_shmid.contains_key(&child_pid) {
+            return Err(AxError::AlreadyExists);
+        }
+        manager
+            .pid_vaddr_shmid
+            .get(&parent_pid)
+            .filter(|attachments| attachments.is_visible())
+            .map_or(0, |attachments| {
+                attachments
+                    .entries
+                    .values()
+                    .filter(|attachment| attachment.is_visible())
+                    .count()
+            })
+    };
+    if required == 0 {
+        return Ok(ProcShmForkAdmission::empty(transaction, manager, child_pid));
+    }
+
+    let publication =
+        Arc::try_new(ShmForkPublication::new(false)).map_err(|_| AxError::NoMemory)?;
 
     let mut source = Vec::new();
     source
         .try_reserve_exact(required)
         .map_err(|_| AxError::NoMemory)?;
     {
-        let manager = SHM_MANAGER.lock();
+        let manager = manager.lock();
         let attachments = manager
             .pid_vaddr_shmid
             .get(&parent_pid)
+            .filter(|attachments| attachments.is_visible())
             .ok_or(AxError::Io)?;
-        source.extend(attachments.iter().map(|(&vaddr, &shmid)| (shmid, vaddr)));
+        source.extend(
+            attachments
+                .entries
+                .iter()
+                .filter(|(_, attachment)| attachment.is_visible())
+                .map(|(&vaddr, attachment)| (attachment.value, vaddr)),
+        );
     }
     source.sort_unstable_by_key(|&(shmid, vaddr)| (shmid, vaddr));
 
@@ -643,7 +1230,13 @@ pub fn inherit_proc_shm(parent_pid: Pid, child_pid: Pid) -> AxResult<()> {
         .try_reserve(source.len())
         .map_err(|_| AxError::NoMemory)?;
     for &(shmid, vaddr) in &source {
-        inherited.insert(vaddr, shmid);
+        inherited.insert(
+            vaddr,
+            ShmAttachment {
+                publication: publication.clone(),
+                value: shmid,
+            },
+        );
     }
     let mut index = 0;
     while index < source.len() {
@@ -652,7 +1245,7 @@ pub fn inherit_proc_shm(parent_pid: Pid, child_pid: Pid) -> AxResult<()> {
             .iter()
             .position(|&(candidate, _)| candidate != shmid)
             .map_or(source.len(), |offset| index + offset);
-        let inner = SHM_MANAGER
+        let inner = manager
             .lock()
             .get_inner_by_shmid(shmid)
             .ok_or(AxError::Io)?;
@@ -673,59 +1266,123 @@ pub fn inherit_proc_shm(parent_pid: Pid, child_pid: Pid) -> AxResult<()> {
                 let range = state
                     .get_addr_range(parent_pid, VirtAddr::from(vaddr))
                     .ok_or(AxError::Io)?;
-                ranges.insert(vaddr, range);
+                ranges.insert(
+                    vaddr,
+                    ShmAttachment {
+                        publication: publication.clone(),
+                        value: range,
+                    },
+                );
             }
         }
         groups.push(InheritedGroup { inner, ranges });
         index = end;
     }
 
-    {
-        let mut manager = SHM_MANAGER.lock();
-        if manager
+    let next_attachment_count = {
+        let mut manager = manager.lock();
+        let next = manager
             .attachment_count
             .checked_add(inherited.len())
-            .is_none_or(|total| total > MAX_SHM_ATTACHMENTS)
-        {
-            return Err(AxError::NoMemory);
-        }
+            .filter(|total| *total <= MAX_SHM_ATTACHMENTS)
+            .ok_or(AxError::NoMemory)?;
         if manager.pid_vaddr_shmid.contains_key(&child_pid) {
-            return Err(AxError::Io);
+            return Err(AxError::AlreadyExists);
         }
         manager
             .pid_vaddr_shmid
             .try_reserve(1)
             .map_err(|_| AxError::NoMemory)?;
-    }
+        next
+    };
 
-    let inherited_count = inherited.len();
-    {
-        let mut manager = SHM_MANAGER.lock();
-        manager.pid_vaddr_shmid.insert(child_pid, inherited);
-        manager.attachment_count += inherited_count;
-    }
+    let mut reservations: Vec<InheritedReservation> = Vec::new();
+    reservations
+        .try_reserve_exact(groups.len())
+        .map_err(|_| AxError::NoMemory)?;
+
     for group in groups {
         let count = group.ranges.len();
         let mut state = group.inner.lock();
-        let old = state.va_ranges.insert(child_pid, group.ranges);
-        debug_assert!(old.is_none(), "duplicate inherited SysV SHM process bucket");
-        // Global admission caps all attachments at 65,536, so this update is
-        // both allocation-free and arithmetically exact on every target.
-        state.shmid_ds.shm_nattch += count as c_ulong;
+        let previous = state.va_ranges.insert(
+            child_pid,
+            ProcessAttachmentMap {
+                publication: publication.clone(),
+                entries: group.ranges,
+            },
+        );
+        if let Some(previous) = previous {
+            state.va_ranges.insert(child_pid, previous);
+            drop(state);
+            for reservation in &reservations {
+                reservation.inner.lock().va_ranges.remove(&child_pid);
+            }
+            return Err(AxError::BadState);
+        }
+        drop(state);
+        reservations.push(InheritedReservation {
+            inner: group.inner,
+            count,
+        });
     }
-    Ok(())
+
+    let previous_manager = {
+        let mut manager = manager.lock();
+        let previous = manager.pid_vaddr_shmid.insert(
+            child_pid,
+            ProcessAttachmentMap {
+                publication: publication.clone(),
+                entries: inherited,
+            },
+        );
+        if previous.is_none() {
+            manager.attachment_count = next_attachment_count;
+        }
+        previous
+    };
+    if let Some(previous) = previous_manager {
+        manager.lock().pid_vaddr_shmid.insert(child_pid, previous);
+        for reservation in &reservations {
+            reservation.inner.lock().va_ranges.remove(&child_pid);
+        }
+        return Err(AxError::BadState);
+    }
+
+    Ok(ProcShmForkAdmission {
+        transaction,
+        manager,
+        child_pid,
+        publication: Some(publication),
+        groups: reservations,
+        committed: false,
+    })
 }
 
-pub fn clear_proc_shm(pid: Pid) {
-    let _transaction = SHM_TRANSACTION.lock();
+/// Prepares a fork child's SysV SHM inheritance without exposing it to any
+/// manager, segment, IPC_STAT, or cleanup reader.
+pub(crate) fn prepare_proc_shm_inheritance(
+    parent_pid: Pid,
+    child_pid: Pid,
+) -> AxResult<ProcShmForkAdmission<'static>> {
+    prepare_proc_shm_inheritance_in(&SHM_TRANSACTION, &SHM_MANAGER, parent_pid, child_pid)
+}
+
+fn clear_proc_shm_in(transaction: &Mutex<()>, manager: &Mutex<ShmManager>, pid: Pid) {
+    let _transaction = transaction.lock();
     loop {
         let detached = {
-            let mut manager = SHM_MANAGER.lock();
+            let mut manager = manager.lock();
             let next = manager
                 .pid_vaddr_shmid
                 .get(&pid)
-                .and_then(|attachments| attachments.iter().next())
-                .map(|(&vaddr, &shmid)| (vaddr, shmid));
+                .filter(|attachments| attachments.is_visible())
+                .and_then(|attachments| {
+                    attachments
+                        .entries
+                        .iter()
+                        .find(|(_, attachment)| attachment.is_visible())
+                })
+                .map(|(&vaddr, attachment)| (vaddr, attachment.value));
             let Some((vaddr, shmid)) = next else {
                 manager.remove_pid(pid);
                 break;
@@ -740,12 +1397,18 @@ pub fn clear_proc_shm(pid: Pid) {
         let remove = {
             let mut state = inner.lock();
             state.detach_process(pid, vaddr);
-            (state.rmid && state.attach_count() == 0).then_some(state.page_num)
+            (state.rmid && !state.has_attachment_owners()).then_some(state.page_num)
         };
         if let Some(page_num) = remove {
-            SHM_MANAGER.lock().remove_shmid(shmid, page_num);
+            if let Err(error) = manager.lock().remove_shmid(shmid, page_num) {
+                error!("failed to finalize removed SysV SHM segment {shmid}: {error:?}");
+            }
         }
     }
+}
+
+pub fn clear_proc_shm(pid: Pid) {
+    clear_proc_shm_in(&SHM_TRANSACTION, &SHM_MANAGER, pid)
 }
 
 fn allocate_shm_id(shm_manager: &ShmManager) -> i32 {
@@ -804,7 +1467,7 @@ pub(crate) fn sysvipc_shm_snapshot() -> AxResult<String> {
     out.push_str(HEADER);
     for (shmid, shm_inner) in segments {
         let shm_inner = shm_inner.lock();
-        let ds = shm_inner.shmid_ds;
+        let ds = shm_inner.visible_snapshot();
         let rss_bytes = shm_inner.page_num.saturating_mul(PAGE_SIZE_4K);
         writeln!(
             out,
@@ -1024,35 +1687,13 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
         (pages, backend, true)
     };
 
-    {
-        let mut manager = SHM_MANAGER.lock();
-        if manager.get_shmid_by_vaddr(pid, start_addr).is_some() {
-            return Err(AxError::InvalidInput);
-        }
-        manager.try_reserve_process_attaches(pid, 1)?;
+    let admission =
+        prepare_shmat_admission_in(&SHM_MANAGER, shm_inner.clone(), pid, shmid, va_range)?;
+    aspace.map(start_addr, length, mapping_flags, false, backend)?;
+    if first_attach {
+        shm_inner.lock().map_to_phys(pages);
     }
-    if let Err(error) = shm_inner.lock().try_reserve_process_attaches(pid, 1) {
-        SHM_MANAGER.lock().cancel_empty_process_reservation(pid);
-        return Err(error);
-    }
-
-    if let Err(error) = aspace.map(start_addr, length, mapping_flags, false, backend) {
-        drop(aspace);
-        shm_inner.lock().cancel_empty_process_reservation(pid);
-        SHM_MANAGER.lock().cancel_empty_process_reservation(pid);
-        return Err(error);
-    }
-
-    {
-        let mut state = shm_inner.lock();
-        if first_attach {
-            state.map_to_phys(pages);
-        }
-        state.attach_process(pid, va_range);
-    }
-    SHM_MANAGER
-        .lock()
-        .insert_shmid_vaddr(pid, shmid, start_addr);
+    admission.commit();
     Ok(start_addr.as_usize() as isize)
 }
 
@@ -1108,7 +1749,7 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
         {
             return Err(AxError::from(LinuxError::EACCES));
         }
-        let snapshot = state.shmid_ds;
+        let snapshot = state.visible_snapshot();
         drop(state);
         *buf.get_as_mut()? = snapshot;
         return Ok(shmid as isize);
@@ -1131,7 +1772,7 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
         if !super::has_ipc_permission(&state.shmid_ds.shm_perm, current_uid, current_gid, false) {
             return Err(AxError::from(LinuxError::EACCES));
         }
-        let snapshot = state.shmid_ds;
+        let snapshot = state.visible_snapshot();
         drop(state);
         if let Some(shmid_ds) = nullable!(buf.get_as_mut())? {
             *shmid_ds = snapshot;
@@ -1143,12 +1784,12 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
                 return Err(AxError::from(LinuxError::EPERM));
             }
             state.set_removed(true);
-            (state.attach_count() == 0).then_some(state.page_num)
+            (!state.has_attachment_owners()).then_some(state.page_num)
         };
         let mut manager = SHM_MANAGER.lock();
         manager.remove_key_by_shmid(shmid);
         if let Some(page_num) = remove {
-            manager.remove_shmid(shmid, page_num);
+            manager.remove_shmid(shmid, page_num)?;
         }
     } else if cmd == SHM_LOCK {
         let mut state = shm_inner.lock();
@@ -1216,10 +1857,10 @@ pub fn sys_shmdt(shmaddr: usize) -> AxResult<isize> {
     let remove = {
         let mut state = shm_inner.lock();
         state.detach_process(pid, shmaddr);
-        (state.rmid && state.attach_count() == 0).then_some(state.page_num)
+        (state.rmid && !state.has_attachment_owners()).then_some(state.page_num)
     };
     if let Some(page_num) = remove {
-        SHM_MANAGER.lock().remove_shmid(shmid, page_num);
+        SHM_MANAGER.lock().remove_shmid(shmid, page_num)?;
     }
 
     Ok(0)
@@ -1227,7 +1868,14 @@ pub fn sys_shmdt(shmaddr: usize) -> AxResult<isize> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+
+    const PARENT_PID: Pid = 11;
+    const CHILD_PID: Pid = 12;
+    const SHMID: i32 = 7;
+    const ATTACH_ADDR: usize = 0x4000;
 
     fn test_segment(key: i32, shmid: i32, page_num: usize) -> Arc<Mutex<ShmInner>> {
         Arc::new(Mutex::new(ShmInner {
@@ -1264,6 +1912,31 @@ mod tests {
         }))
     }
 
+    fn attachment_range() -> VirtAddrRange {
+        VirtAddrRange::new(
+            VirtAddr::from(ATTACH_ADDR),
+            VirtAddr::from(ATTACH_ADDR + PAGE_SIZE_4K),
+        )
+    }
+
+    fn inheritance_fixture() -> (Mutex<()>, Mutex<ShmManager>, Arc<Mutex<ShmInner>>) {
+        let inner = test_segment(IPC_PRIVATE, SHMID, 1);
+        let mut manager = ShmManager::new();
+        manager.try_reserve_segment(false).unwrap();
+        manager.insert_shmid_inner(SHMID, 1, inner.clone()).unwrap();
+        let manager = Mutex::new(manager);
+        prepare_shmat_admission_in(
+            &manager,
+            inner.clone(),
+            PARENT_PID,
+            SHMID,
+            attachment_range(),
+        )
+        .unwrap()
+        .commit();
+        (Mutex::new(()), manager, inner)
+    }
+
     #[test]
     fn rmid_unlinks_key_but_retains_pages_until_final_removal() {
         let key = 42;
@@ -1284,9 +1957,195 @@ mod tests {
         assert!(manager.contains_shmid(shmid));
         assert_eq!(manager.total_page_count(), page_num);
 
-        manager.remove_shmid(shmid, page_num);
+        manager.remove_shmid(shmid, page_num).unwrap();
         assert!(!manager.contains_shmid(shmid));
         assert_eq!(manager.total_page_count(), 0);
+    }
+
+    #[test]
+    fn remove_shmid_underflow_preserves_segment_key_and_page_charge() {
+        let key = 42;
+        let shmid = 7;
+        let page_num = 3;
+        let inner = test_segment(key, shmid, page_num);
+        let mut manager = ShmManager::new();
+        manager.try_reserve_segment(true).unwrap();
+        manager.insert_shmid_inner(shmid, page_num, inner).unwrap();
+        manager.insert_key_shmid(key, shmid);
+        manager.total_pages = page_num - 1;
+
+        assert_eq!(
+            manager.remove_shmid(shmid, page_num),
+            Err(AxError::BadState)
+        );
+        assert!(manager.contains_shmid(shmid));
+        assert_eq!(manager.get_shmid_by_key(key), Some(shmid));
+        assert_eq!(manager.total_page_count(), page_num - 1);
+    }
+
+    #[test]
+    fn shmat_admission_is_hidden_then_commits_or_rolls_back_exactly() {
+        let inner = test_segment(IPC_PRIVATE, SHMID, 1);
+        let mut manager = ShmManager::new();
+        manager.try_reserve_segment(false).unwrap();
+        manager.insert_shmid_inner(SHMID, 1, inner.clone()).unwrap();
+        let manager = Mutex::new(manager);
+
+        let admission = prepare_shmat_admission_in(
+            &manager,
+            inner.clone(),
+            PARENT_PID,
+            SHMID,
+            attachment_range(),
+        )
+        .unwrap();
+        assert_eq!(manager.lock().attachment_count, 1);
+        assert_eq!(
+            manager
+                .lock()
+                .get_shmid_by_vaddr(PARENT_PID, VirtAddr::from(ATTACH_ADDR)),
+            None
+        );
+        let state = inner.lock();
+        assert_eq!(state.attach_count(), 0);
+        assert_eq!(state.visible_snapshot().shm_nattch, 0);
+        assert!(state.has_attachment_owners());
+        drop(state);
+        assert_eq!(
+            prepare_shmat_admission_in(
+                &manager,
+                inner.clone(),
+                PARENT_PID,
+                SHMID,
+                attachment_range(),
+            )
+            .err(),
+            Some(AxError::AlreadyExists)
+        );
+
+        drop(admission);
+        assert_eq!(manager.lock().attachment_count, 0);
+        assert!(!manager.lock().pid_vaddr_shmid.contains_key(&PARENT_PID));
+        assert!(!inner.lock().va_ranges.contains_key(&PARENT_PID));
+
+        prepare_shmat_admission_in(
+            &manager,
+            inner.clone(),
+            PARENT_PID,
+            SHMID,
+            attachment_range(),
+        )
+        .unwrap()
+        .commit();
+        assert_eq!(manager.lock().attachment_count, 1);
+        assert_eq!(
+            manager
+                .lock()
+                .get_shmid_by_vaddr(PARENT_PID, VirtAddr::from(ATTACH_ADDR)),
+            Some(SHMID)
+        );
+        assert_eq!(inner.lock().attach_count(), 1);
+        assert_eq!(inner.lock().visible_snapshot().shm_nattch, 1);
+    }
+
+    #[test]
+    fn pending_shmat_owns_rmid_segment_until_exact_drop() {
+        let inner = test_segment(IPC_PRIVATE, SHMID, 1);
+        let mut manager = ShmManager::new();
+        manager.try_reserve_segment(false).unwrap();
+        manager.insert_shmid_inner(SHMID, 1, inner.clone()).unwrap();
+        let manager = Mutex::new(manager);
+        let admission = prepare_shmat_admission_in(
+            &manager,
+            inner.clone(),
+            PARENT_PID,
+            SHMID,
+            attachment_range(),
+        )
+        .unwrap();
+
+        inner.lock().set_removed(true);
+        assert!(inner.lock().has_attachment_owners());
+        assert!(manager.lock().contains_shmid(SHMID));
+
+        drop(admission);
+
+        assert!(!manager.lock().contains_shmid(SHMID));
+        assert_eq!(manager.lock().attachment_count, 0);
+        assert_eq!(manager.lock().total_page_count(), 0);
+    }
+
+    #[test]
+    fn shmat_drop_does_not_finalize_rmid_after_identity_mismatch() {
+        let inner = test_segment(IPC_PRIVATE, SHMID, 1);
+        let mut manager = ShmManager::new();
+        manager.try_reserve_segment(false).unwrap();
+        manager.insert_shmid_inner(SHMID, 1, inner.clone()).unwrap();
+        let manager = Mutex::new(manager);
+        let admission = prepare_shmat_admission_in(
+            &manager,
+            inner.clone(),
+            PARENT_PID,
+            SHMID,
+            attachment_range(),
+        )
+        .unwrap();
+        inner.lock().set_removed(true);
+
+        manager
+            .lock()
+            .pid_vaddr_shmid
+            .get_mut(&PARENT_PID)
+            .unwrap()
+            .entries
+            .get_mut(&ATTACH_ADDR)
+            .unwrap()
+            .publication = Arc::new(ShmForkPublication::new(false));
+
+        drop(admission);
+
+        let manager = manager.lock();
+        assert!(manager.contains_shmid(SHMID));
+        assert_eq!(manager.total_page_count(), 1);
+        assert_eq!(manager.attachment_count, 1);
+        assert!(manager.pid_vaddr_shmid.contains_key(&PARENT_PID));
+        assert!(inner.lock().va_ranges.contains_key(&PARENT_PID));
+    }
+
+    #[test]
+    fn shmat_drop_retains_charge_when_segment_identity_changes() {
+        let inner = test_segment(IPC_PRIVATE, SHMID, 1);
+        let mut manager = ShmManager::new();
+        manager.try_reserve_segment(false).unwrap();
+        manager.insert_shmid_inner(SHMID, 1, inner.clone()).unwrap();
+        let manager = Mutex::new(manager);
+        let admission = prepare_shmat_admission_in(
+            &manager,
+            inner.clone(),
+            PARENT_PID,
+            SHMID,
+            attachment_range(),
+        )
+        .unwrap();
+        inner.lock().set_removed(true);
+
+        inner
+            .lock()
+            .va_ranges
+            .get_mut(&PARENT_PID)
+            .unwrap()
+            .entries
+            .get_mut(&ATTACH_ADDR)
+            .unwrap()
+            .publication = Arc::new(ShmForkPublication::new(false));
+        drop(admission);
+
+        let manager = manager.lock();
+        assert!(manager.contains_shmid(SHMID));
+        assert_eq!(manager.total_page_count(), 1);
+        assert_eq!(manager.attachment_count, 1);
+        assert!(manager.pid_vaddr_shmid.contains_key(&PARENT_PID));
+        assert!(inner.lock().va_ranges.contains_key(&PARENT_PID));
     }
 
     #[test]
@@ -1298,14 +2157,29 @@ mod tests {
             manager
                 .pid_vaddr_shmid
                 .get(&pid)
-                .is_some_and(HashMap::is_empty)
+                .is_some_and(|attachments| attachments.entries.is_empty())
         );
         manager.cancel_empty_process_reservation(pid);
         assert!(!manager.pid_vaddr_shmid.contains_key(&pid));
 
         manager.try_reserve_process_attaches(pid, 2).unwrap();
-        manager.insert_shmid_vaddr(pid, 1, VirtAddr::from(0x1000));
-        manager.insert_shmid_vaddr(pid, 2, VirtAddr::from(0x2000));
+        let publication = Arc::new(ShmForkPublication::new(true));
+        let attachments = manager.pid_vaddr_shmid.get_mut(&pid).unwrap();
+        attachments.entries.insert(
+            0x1000,
+            ShmAttachment {
+                publication: publication.clone(),
+                value: 1,
+            },
+        );
+        attachments.entries.insert(
+            0x2000,
+            ShmAttachment {
+                publication,
+                value: 2,
+            },
+        );
+        manager.attachment_count = 2;
         assert_eq!(manager.attachment_count, 2);
         manager.remove_shmaddr(pid, VirtAddr::from(0x1000));
         assert_eq!(manager.attachment_count, 1);
@@ -1313,5 +2187,190 @@ mod tests {
         manager.remove_shmaddr(pid, VirtAddr::from(0x2000));
         assert_eq!(manager.attachment_count, 0);
         assert!(!manager.pid_vaddr_shmid.contains_key(&pid));
+    }
+
+    #[test]
+    fn fork_prepare_is_hidden_from_every_reader_until_commit() {
+        let (transaction, manager, inner) = inheritance_fixture();
+        let admission =
+            prepare_proc_shm_inheritance_in(&transaction, &manager, PARENT_PID, CHILD_PID).unwrap();
+
+        assert_eq!(manager.lock().attachment_count, 2);
+        assert!(
+            manager
+                .lock()
+                .pid_vaddr_shmid
+                .get(&CHILD_PID)
+                .is_some_and(|attachments| !attachments.is_visible())
+        );
+        assert!(
+            inner
+                .lock()
+                .va_ranges
+                .get(&CHILD_PID)
+                .is_some_and(|ranges| !ranges.is_visible())
+        );
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..256 {
+                    let _transaction = transaction.lock();
+                    assert_eq!(
+                        manager
+                            .lock()
+                            .get_shmid_by_vaddr(CHILD_PID, VirtAddr::from(ATTACH_ADDR)),
+                        None
+                    );
+                    let state = inner.lock();
+                    assert_eq!(
+                        state.get_addr_range(CHILD_PID, VirtAddr::from(ATTACH_ADDR)),
+                        None
+                    );
+                    assert_eq!(state.attach_count(), 1);
+                    assert_eq!(state.visible_snapshot().shm_nattch, 1);
+                    std::thread::yield_now();
+                }
+            });
+        });
+
+        // Process-exit cleanup must ignore the hidden child bucket as well.
+        clear_proc_shm_in(&transaction, &manager, CHILD_PID);
+        assert!(manager.lock().pid_vaddr_shmid.contains_key(&CHILD_PID));
+        assert!(inner.lock().va_ranges.contains_key(&CHILD_PID));
+
+        admission.commit();
+
+        assert_eq!(
+            manager
+                .lock()
+                .get_shmid_by_vaddr(CHILD_PID, VirtAddr::from(ATTACH_ADDR)),
+            Some(SHMID)
+        );
+        let state = inner.lock();
+        assert!(
+            state
+                .get_addr_range(CHILD_PID, VirtAddr::from(ATTACH_ADDR))
+                .is_some()
+        );
+        assert_eq!(state.attach_count(), 2);
+        assert_eq!(state.visible_snapshot().shm_nattch, 2);
+        assert_eq!(state.shmid_ds.shm_nattch, 2);
+    }
+
+    #[test]
+    fn dropped_fork_prepare_refunds_exact_manager_and_segment_reservations() {
+        let (transaction, manager, inner) = inheritance_fixture();
+        let admission =
+            prepare_proc_shm_inheritance_in(&transaction, &manager, PARENT_PID, CHILD_PID).unwrap();
+        assert_eq!(manager.lock().attachment_count, 2);
+        assert_eq!(inner.lock().attach_count(), 1);
+
+        drop(admission);
+
+        let manager_state = manager.lock();
+        assert_eq!(manager_state.attachment_count, 1);
+        assert!(!manager_state.pid_vaddr_shmid.contains_key(&CHILD_PID));
+        drop(manager_state);
+        let state = inner.lock();
+        assert!(!state.va_ranges.contains_key(&CHILD_PID));
+        assert_eq!(state.attach_count(), 1);
+        assert_eq!(state.shmid_ds.shm_nattch, 1);
+        drop(state);
+
+        prepare_proc_shm_inheritance_in(&transaction, &manager, PARENT_PID, CHILD_PID)
+            .unwrap()
+            .commit();
+        assert_eq!(manager.lock().attachment_count, 2);
+        assert_eq!(inner.lock().attach_count(), 2);
+    }
+
+    #[test]
+    fn fork_drop_retains_all_capacity_when_one_segment_identity_changes() {
+        let (transaction, manager, inner) = inheritance_fixture();
+        let admission =
+            prepare_proc_shm_inheritance_in(&transaction, &manager, PARENT_PID, CHILD_PID).unwrap();
+
+        inner
+            .lock()
+            .va_ranges
+            .get_mut(&CHILD_PID)
+            .unwrap()
+            .publication = Arc::new(ShmForkPublication::new(false));
+        drop(admission);
+
+        let manager_state = manager.lock();
+        assert_eq!(manager_state.attachment_count, 2);
+        assert!(manager_state.pid_vaddr_shmid.contains_key(&CHILD_PID));
+        assert!(manager_state.contains_shmid(SHMID));
+        drop(manager_state);
+        assert!(inner.lock().va_ranges.contains_key(&CHILD_PID));
+    }
+
+    #[test]
+    fn pending_inheritance_keeps_rmid_segment_alive_then_commit_publishes_child() {
+        let (transaction, manager, inner) = inheritance_fixture();
+        let admission =
+            prepare_proc_shm_inheritance_in(&transaction, &manager, PARENT_PID, CHILD_PID).unwrap();
+
+        {
+            let _transaction = transaction.lock();
+            inner.lock().set_removed(true);
+            manager
+                .lock()
+                .remove_shmaddr(PARENT_PID, VirtAddr::from(ATTACH_ADDR));
+            let mut state = inner.lock();
+            assert!(
+                state
+                    .detach_process(PARENT_PID, VirtAddr::from(ATTACH_ADDR))
+                    .is_some()
+            );
+            assert_eq!(state.attach_count(), 0);
+            assert_eq!(state.visible_snapshot().shm_nattch, 0);
+            assert!(state.has_attachment_owners());
+        }
+        assert!(manager.lock().contains_shmid(SHMID));
+
+        admission.commit();
+
+        assert_eq!(manager.lock().attachment_count, 1);
+        let state = inner.lock();
+        assert!(state.rmid);
+        assert_eq!(state.attach_count(), 1);
+        assert_eq!(state.visible_snapshot().shm_nattch, 1);
+        assert!(
+            state
+                .get_addr_range(CHILD_PID, VirtAddr::from(ATTACH_ADDR))
+                .is_some()
+        );
+        drop(state);
+
+        clear_proc_shm_in(&transaction, &manager, CHILD_PID);
+        assert!(!manager.lock().contains_shmid(SHMID));
+        assert_eq!(manager.lock().attachment_count, 0);
+    }
+
+    #[test]
+    fn dropping_pending_inheritance_finalizes_rmid_segment_after_parent_detach() {
+        let (transaction, manager, inner) = inheritance_fixture();
+        let admission =
+            prepare_proc_shm_inheritance_in(&transaction, &manager, PARENT_PID, CHILD_PID).unwrap();
+
+        {
+            let _transaction = transaction.lock();
+            inner.lock().set_removed(true);
+            manager
+                .lock()
+                .remove_shmaddr(PARENT_PID, VirtAddr::from(ATTACH_ADDR));
+            let mut state = inner.lock();
+            state.detach_process(PARENT_PID, VirtAddr::from(ATTACH_ADDR));
+            assert!(state.has_attachment_owners());
+        }
+
+        drop(admission);
+
+        let manager = manager.lock();
+        assert!(!manager.contains_shmid(SHMID));
+        assert_eq!(manager.total_page_count(), 0);
+        assert_eq!(manager.attachment_count, 0);
     }
 }

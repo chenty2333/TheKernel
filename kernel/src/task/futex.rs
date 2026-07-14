@@ -216,6 +216,14 @@ fn setup_error_or_wake(registrations: &[WaitRegistration], err: AxError) -> AxRe
     }
 }
 
+fn clock_timeout_error(result: Poll<AxResult<()>>) -> Option<AxError> {
+    match result {
+        Poll::Ready(Ok(())) => Some(AxError::TimedOut),
+        Poll::Ready(Err(error)) => Some(error),
+        Poll::Pending => None,
+    }
+}
+
 impl WaitQueue {
     /// Creates a new `WaitQueue`.
     pub fn new() -> Self {
@@ -315,8 +323,8 @@ impl WaitQueue {
                     if let Poll::Ready(result) = wait.as_mut().poll(cx) {
                         return Poll::Ready(result);
                     }
-                    if sleeper.as_mut().poll(cx).is_ready() {
-                        return Poll::Ready(Err(AxError::TimedOut));
+                    if let Some(error) = clock_timeout_error(sleeper.as_mut().poll(cx)) {
+                        return Poll::Ready(Err(error));
                     }
                     Poll::Pending
                 })
@@ -339,6 +347,7 @@ impl WaitQueue {
             }
             Poll::Pending
         }))
+        .map_err(AxError::from)?
     }
 
     /// Wakes up at most `count` tasks whose bitset intersects with the given
@@ -507,8 +516,8 @@ pub fn wait_on_any_futex_if(
                 if let Poll::Ready(result) = wait.as_mut().poll(cx) {
                     return Poll::Ready(result);
                 }
-                if sleeper.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(Err(AxError::TimedOut));
+                if let Some(error) = clock_timeout_error(sleeper.as_mut().poll(cx)) {
+                    return Poll::Ready(Err(error));
                 }
                 Poll::Pending
             })
@@ -531,6 +540,7 @@ pub fn wait_on_any_futex_if(
         }
         Poll::Pending
     }))
+    .map_err(AxError::from)?
 }
 
 #[cfg(test)]
@@ -545,8 +555,26 @@ mod tests {
 
     fn init_scheduler() {
         INIT.call_once(|| {
-            axtask::init_scheduler();
+            if let Err(error) = axtask::init_scheduler() {
+                assert!(
+                    axtask::current_may_uninit().is_some(),
+                    "host scheduler initialization failed: {error:?}"
+                );
+            }
         });
+    }
+
+    #[test]
+    fn timer_registration_failure_is_not_reported_as_timeout() {
+        assert_eq!(
+            clock_timeout_error(Poll::Ready(Err(AxError::NoMemory))),
+            Some(AxError::NoMemory)
+        );
+        assert_eq!(
+            clock_timeout_error(Poll::Ready(Ok(()))),
+            Some(AxError::TimedOut)
+        );
+        assert_eq!(clock_timeout_error(Poll::Pending), None);
     }
 
     #[test]

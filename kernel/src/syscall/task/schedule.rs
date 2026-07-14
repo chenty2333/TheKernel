@@ -9,8 +9,8 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axhal::time::TimeValue;
 use axtask::{
     AxCpuMask, AxTaskRef, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN, SchedClass,
-    SchedState, current,
-    future::{block_on, interruptible},
+    SchedState, TaskSchedError, current,
+    future::{BlockOnError, Interrupted, block_on, interruptible},
     sched_state, set_sched_state, set_task_affinity,
 };
 use linux_raw_sys::general::{
@@ -19,13 +19,13 @@ use linux_raw_sys::general::{
     SCHED_DEADLINE, SCHED_FIFO, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE, SCHED_NORMAL,
     SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
 };
-use starry_process::Pid;
+use starry_process::{Pid, ProcessError};
 use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use crate::{
     task::{
-        AlarmClock, AsThread, ProcStateHint, get_process_group, get_task, sleep_until_clock,
-        try_tasks, with_proc_state_hint,
+        AlarmClock, AsThread, ProcStateHint, get_process_group, get_task, process_domain,
+        sleep_until_clock, try_tasks, with_proc_state_hint,
     },
     time::TimeValueLike,
 };
@@ -142,7 +142,12 @@ fn validate_nice(nice: i32) -> AxResult<i8> {
     }
 }
 
-fn linux_policy_from_state(state: SchedState) -> i32 {
+fn sched_reset_on_fork(task: &AxTaskRef) -> bool {
+    task.try_as_thread()
+        .is_some_and(|thread| thread.sched_reset_on_fork())
+}
+
+fn linux_policy_from_state(task: &AxTaskRef, state: SchedState) -> i32 {
     let base = match state.class {
         SchedClass::Normal => SCHED_NORMAL as i32,
         SchedClass::Batch => SCHED_BATCH as i32,
@@ -151,7 +156,7 @@ fn linux_policy_from_state(state: SchedState) -> i32 {
         SchedClass::RoundRobin => SCHED_RR as i32,
     };
 
-    if state.reset_on_fork {
+    if sched_reset_on_fork(task) {
         base | SCHED_RESET_ON_FORK as i32
     } else {
         base
@@ -237,10 +242,36 @@ pub fn set_sched_rr_timeslice_ms(value: i32) {
 }
 
 fn apply_sched_state(task: &AxTaskRef, state: SchedState) -> AxResult<isize> {
-    if set_sched_state(task, state) {
-        Ok(0)
-    } else {
-        Err(AxError::NoSuchProcess)
+    set_sched_state(task, state).map_err(|error| match error {
+        TaskSchedError::Unsupported => AxError::OperationNotSupported,
+        TaskSchedError::TaskExited => AxError::NoSuchProcess,
+        TaskSchedError::RunQueueUnavailable(_) => AxError::BadState,
+        TaskSchedError::Scheduler(_) => AxError::InvalidInput,
+    })?;
+    Ok(0)
+}
+
+fn apply_sched_state_with_reset<T>(
+    target: Option<&T>,
+    apply: impl FnOnce() -> AxResult<isize>,
+    store_reset: impl FnOnce(&T),
+) -> AxResult<isize> {
+    let target = target.ok_or(AxError::NoSuchProcess)?;
+    let result = apply()?;
+    store_reset(target);
+    Ok(result)
+}
+
+fn process_error(error: ProcessError) -> AxError {
+    match error {
+        ProcessError::NoMemory | ProcessError::Capacity => AxError::NoMemory,
+        ProcessError::AlreadyExists => AxError::AlreadyExists,
+        ProcessError::NotPublished | ProcessError::NotLive | ProcessError::NotInitialized => {
+            AxError::NoSuchProcess
+        }
+        ProcessError::Busy => AxError::ResourceBusy,
+        ProcessError::WrongDomain => AxError::BadState,
+        _ => AxError::BadState,
     }
 }
 
@@ -250,6 +281,7 @@ fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult
         (policy & !(SCHED_RESET_ON_FORK as i32)) as u32,
         SchedSetAbi::Legacy,
     )?;
+    let thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
     can_manage_sched_target(task)?;
     let mut state = sched_state(task);
     state.class = class;
@@ -268,8 +300,11 @@ fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult
             }
         }
     }
-    state.reset_on_fork = reset_on_fork;
-    apply_sched_state(task, state)
+    apply_sched_state_with_reset(
+        Some(thread),
+        || apply_sched_state(task, state),
+        |thread| thread.set_sched_reset_on_fork(reset_on_fork),
+    )
 }
 
 fn update_sched_param(task: &AxTaskRef, priority: i32) -> AxResult<isize> {
@@ -351,33 +386,52 @@ pub fn sys_sched_yield() -> AxResult<isize> {
     Ok(0)
 }
 
-fn sleep_relative(dur: TimeValue) -> TimeValue {
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ClockSleepOutcome {
+    Completed,
+    Interrupted,
+}
+
+fn flatten_clock_sleep_result(
+    result: Result<Result<AxResult<()>, Interrupted>, BlockOnError>,
+) -> AxResult<ClockSleepOutcome> {
+    match result {
+        Err(error) => Err(error.into()),
+        Ok(Err(_)) => Ok(ClockSleepOutcome::Interrupted),
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Ok(Ok(()))) => Ok(ClockSleepOutcome::Completed),
+    }
+}
+
+fn sleep_relative(dur: TimeValue) -> AxResult<TimeValue> {
     debug!("sleep_impl <= {dur:?}");
 
     if dur.is_zero() {
-        return dur;
+        return Ok(dur);
     }
     let start = AlarmClock::Monotonic.now();
     let deadline = start.checked_add(dur).unwrap_or(Duration::MAX);
 
     // We detect EINTR manually if the slept time is not enough.
-    let _ = with_proc_state_hint(ProcStateHint::Interruptible, || {
+    let result = with_proc_state_hint(ProcStateHint::Interruptible, || {
         block_on(interruptible(sleep_until_clock(
             AlarmClock::Monotonic,
             deadline,
         )))
     });
+    let _ = flatten_clock_sleep_result(result)?;
 
-    AlarmClock::Monotonic.now() - start
+    Ok(AlarmClock::Monotonic.now() - start)
 }
 
-fn sleep_absolute(clock: AlarmClock, deadline: TimeValue) -> bool {
+fn sleep_absolute(clock: AlarmClock, deadline: TimeValue) -> AxResult<bool> {
     debug!("sleep_absolute <= clock: {clock:?}, deadline: {deadline:?}");
 
-    let _ = with_proc_state_hint(ProcStateHint::Interruptible, || {
+    let result = with_proc_state_hint(ProcStateHint::Interruptible, || {
         block_on(interruptible(sleep_until_clock(clock, deadline)))
     });
-    clock.now() >= deadline
+    let _ = flatten_clock_sleep_result(result)?;
+    Ok(clock.now() >= deadline)
 }
 
 fn remaining_relative_sleep(req: TimeValue, actual: TimeValue) -> Option<TimeValue> {
@@ -394,7 +448,7 @@ pub fn sys_nanosleep(req: *const timespec, rem: *mut timespec) -> AxResult<isize
     let req = unsafe { req.vm_read_uninit()?.assume_init() }.try_into_time_value()?;
     debug!("sys_nanosleep <= req: {req:?}");
 
-    let actual = sleep_relative(req);
+    let actual = sleep_relative(req)?;
 
     if let Some(diff) = remaining_relative_sleep(req, actual) {
         debug!("sys_nanosleep => rem: {diff:?}");
@@ -442,13 +496,13 @@ pub fn sys_clock_nanosleep(
                 .host_boottime_deadline(req),
             _ => req,
         };
-        if sleep_absolute(clock, deadline) {
+        if sleep_absolute(clock, deadline)? {
             Ok(0)
         } else {
             Err(AxError::Interrupted)
         }
     } else {
-        let actual = sleep_relative(req);
+        let actual = sleep_relative(req)?;
 
         if let Some(diff) = remaining_relative_sleep(req, actual) {
             debug!("sys_clock_nanosleep => rem: {diff:?}");
@@ -518,7 +572,7 @@ pub fn sys_getcpu(cpu: *mut u32, node: *mut u32) -> AxResult<isize> {
 
 pub fn sys_sched_getscheduler(pid: i32) -> AxResult<isize> {
     let task = sched_target(pid)?;
-    Ok(linux_policy_from_state(sched_state(&task)) as isize)
+    Ok(linux_policy_from_state(&task, sched_state(&task)) as isize)
 }
 
 pub fn sys_sched_setparam(pid: i32, param: *const SchedParam) -> AxResult<isize> {
@@ -584,6 +638,7 @@ pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResu
     // target-dependent side effects and prevents a fake Deadline snapshot.
     let class = sched_class_for_set(attr.sched_policy, SchedSetAbi::Attr)?;
     let task = sched_target(pid)?;
+    let thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
     can_manage_sched_target(&task)?;
     let mut state = sched_state(&task);
     state.class = class;
@@ -606,8 +661,12 @@ pub fn sys_sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> AxResu
             state.nice = validate_nice(attr.sched_nice)?;
         }
     }
-    state.reset_on_fork = attr.sched_flags & SUPPORTED_SCHED_ATTR_FLAGS != 0;
-    apply_sched_state(&task, state)
+    let reset_on_fork = attr.sched_flags & SUPPORTED_SCHED_ATTR_FLAGS != 0;
+    apply_sched_state_with_reset(
+        Some(thread),
+        || apply_sched_state(&task, state),
+        |thread| thread.set_sched_reset_on_fork(reset_on_fork),
+    )
 }
 
 pub fn sys_sched_getattr(pid: i32, attr: *mut SchedAttr, size: u32, flags: u32) -> AxResult<isize> {
@@ -625,8 +684,8 @@ pub fn sys_sched_getattr(pid: i32, attr: *mut SchedAttr, size: u32, flags: u32) 
     let state = sched_state(&task);
     let mut out = SchedAttr {
         size: out_size.min(size_of::<SchedAttr>()) as u32,
-        sched_policy: linux_policy_from_state(state) as u32 & !(SCHED_RESET_ON_FORK as u32),
-        sched_flags: if state.reset_on_fork {
+        sched_policy: linux_policy_from_state(&task, state) as u32 & !(SCHED_RESET_ON_FORK as u32),
+        sched_flags: if sched_reset_on_fork(&task) {
             SUPPORTED_SCHED_ATTR_FLAGS
         } else {
             0
@@ -669,7 +728,9 @@ pub fn sys_getpriority(which: u32, who: u32) -> AxResult<isize> {
                 who
             };
             let group = get_process_group(pgid)?;
-            let group_processes = group.try_processes().map_err(|_| AxError::NoMemory)?;
+            let group_processes = group
+                .try_processes(process_domain()?.registry())
+                .map_err(process_error)?;
             Ok(raw_priority_from_nice(min_nice_for_threads(
                 group_processes
                     .into_iter()
@@ -716,7 +777,10 @@ pub fn sys_setpriority(which: u32, who: u32, prio: i32) -> AxResult<isize> {
                 who
             };
             let group = get_process_group(pgid)?;
-            for process in group.try_processes().map_err(|_| AxError::NoMemory)? {
+            for process in group
+                .try_processes(process_domain()?.registry())
+                .map_err(process_error)?
+            {
                 for tid in process.thread_ids() {
                     if let Ok(task) = get_task(tid) {
                         targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;
@@ -766,7 +830,37 @@ pub fn sys_ioprio_set(_which: u32, _who: u32, _ioprio: u32) -> AxResult<isize> {
 
 #[cfg(test)]
 mod tests {
+    use core::cell::Cell;
+
     use super::*;
+
+    #[test]
+    fn clock_sleep_result_preserves_timer_registration_failure() {
+        assert_eq!(
+            flatten_clock_sleep_result(Ok(Ok(Err(AxError::NoMemory)))),
+            Err(AxError::NoMemory)
+        );
+    }
+
+    #[test]
+    fn clock_sleep_result_distinguishes_interrupt_from_completion() {
+        assert_eq!(
+            flatten_clock_sleep_result(Ok(Err(Interrupted))),
+            Ok(ClockSleepOutcome::Interrupted)
+        );
+        assert_eq!(
+            flatten_clock_sleep_result(Ok(Ok(Ok(())))),
+            Ok(ClockSleepOutcome::Completed)
+        );
+    }
+
+    #[test]
+    fn clock_sleep_result_preserves_block_session_failure() {
+        assert_eq!(
+            flatten_clock_sleep_result(Err(BlockOnError::Busy)),
+            Err(AxError::ResourceBusy)
+        );
+    }
 
     #[test]
     fn deadline_setattr_is_known_but_unsupported() {
@@ -782,6 +876,36 @@ mod tests {
             sched_class_for_set(SCHED_DEADLINE, SchedSetAbi::Legacy),
             Err(AxError::InvalidInput)
         ));
+    }
+
+    #[test]
+    fn scheduler_update_rejects_missing_target_before_any_store() {
+        let state_updates = Cell::new(0);
+        let flag_updates = Cell::new(0);
+        let result = apply_sched_state_with_reset::<()>(
+            None,
+            || {
+                state_updates.set(state_updates.get() + 1);
+                Ok(0)
+            },
+            |_| flag_updates.set(flag_updates.get() + 1),
+        );
+        assert_eq!(result, Err(AxError::NoSuchProcess));
+        assert_eq!(state_updates.get(), 0);
+        assert_eq!(flag_updates.get(), 0);
+    }
+
+    #[test]
+    fn scheduler_failure_never_partially_stores_reset_on_fork() {
+        let target = ();
+        let flag_updates = Cell::new(0);
+        let result = apply_sched_state_with_reset(
+            Some(&target),
+            || Err(AxError::NoSuchProcess),
+            |_| flag_updates.set(flag_updates.get() + 1),
+        );
+        assert_eq!(result, Err(AxError::NoSuchProcess));
+        assert_eq!(flag_updates.get(), 0);
     }
 
     #[test]

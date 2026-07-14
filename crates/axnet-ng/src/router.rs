@@ -207,7 +207,7 @@ impl Router {
                         }
                     } else {
                         let Some(rule) = self.table.lookup(&dst_addr) else {
-                            warn!("No route found for destination: {}", dst_addr);
+                            warn!("No route found for destination: {dst_addr}");
                             continue;
                         };
                         let src_addr = IpAddress::Ipv4(packet.src_addr());
@@ -241,7 +241,7 @@ impl Router {
                         }
                     } else {
                         let Some(rule) = self.table.lookup(&dst_addr) else {
-                            warn!("No route found for destination: {}", dst_addr);
+                            warn!("No route found for destination: {dst_addr}");
                             continue;
                         };
                         let src_addr = IpAddress::Ipv6(packet.src_addr());

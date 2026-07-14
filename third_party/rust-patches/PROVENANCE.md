@@ -1,9 +1,20 @@
 # Local crate provenance policy
 
-Every local path in the root `[patch.crates-io]` table is a maintained fork,
-not anonymous copied source. `PROVENANCE.toml` is the machine-readable
-inventory; each package directory also retains a human `VENDOR.md`, the
+Every crates.io-derived tree under `third_party/rust-patches` is a maintained
+fork, not anonymous copied source. `PROVENANCE.toml` is the machine-readable
+inventory even when a retained fork is no longer reachable from the active
+Cargo graph; each package directory also retains a human `VENDOR.md`, the
 published `Cargo.toml.orig`, and Cargo's `.cargo_vcs_info.json`.
+
+The root patch table also contains two explicitly classified non-vendor
+families. Maintained sibling release crates come from exact paths in
+`../thekernel-ax` or `../thekernel-linux-abi`; unpublished compatibility
+adapters come from `crates/`. They do not claim a crates.io baseline and must
+not receive fabricated vendor records. The validator checks their exact path,
+package identity, version, and, for local adapters, `publish = false`.
+The former crates.io `axtask` record remains audited only for its retained
+`third_party/rust-patches/axtask` tree; it is the sole explicit historical
+name collision with an active non-vendor patch.
 
 The crates.io archive SHA-256 is the immutable source identity. Cargo's VCS
 commit is exact only when the archive records `dirty=false`. When
@@ -44,9 +55,10 @@ python3 scripts/ci/validate_vendor_provenance.py \
 The validator also searches `$CARGO_HOME/registry/cache/*`, the repository
 `.state/` directory, and every directory in
 `$THEKERNEL_VENDOR_ARCHIVE_DIR`. The per-commit gate verifies every archive
-that is present and always enforces the patch/record bijection, original
-manifest hashes, VCS identity, license status, upstream-test inventory, and
-human patch ledger.
+that is present, requires every active vendor patch to have a record, continues
+auditing inactive retained vendor records, and enforces original-manifest
+hashes, VCS identity, license status, upstream-test inventory, and the human
+patch ledger.
 
 ## Maintaining a fork
 

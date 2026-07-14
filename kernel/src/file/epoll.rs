@@ -1,237 +1,209 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn/>
-// Copyright (C) 2025 Azure-stars <Azure_stars@126.com>
-// Copyright (C) 2025 Yuekai Jia <equation618@gmail.com>
-// See LICENSES for license details.
-//
-// This file has been modified by KylinSoft on 2025.
 
 use alloc::{
     borrow::Cow,
-    collections::vec_deque::VecDeque,
     sync::{Arc, Weak},
     task::Wake,
     vec::Vec,
 };
 use core::{
-    array,
-    hash::{Hash, Hasher},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     task::{Context, Waker},
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axpoll::{IoEvents, Pollable};
-use axsync::Mutex;
+use axpoll::{IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable};
 use bitflags::bitflags;
 use hashbrown::HashMap;
-use kspin::{SpinNoIrq, SpinNoPreempt};
-use linux_raw_sys::general::{EPOLLET, EPOLLONESHOT, epoll_event};
+use kspin::SpinNoIrq;
+use linux_raw_sys::general::{EPOLLET, EPOLLONESHOT};
+use ouroboros::self_referencing;
 use spin::Once;
+use thekernel_linux_fd::{
+    DeliveryOutcome, EpollCore, EpollError, EpollGraph, EpollGraphId, EpollGraphLimits, EpollId,
+    EpollInterest as LinuxEpollInterest, EpollKey, EpollToken, FdNumber, GraphEdgeToken,
+    GraphError, GraphNodeToken, InterestMask, InterestMode, NotifyOutcome, ReadyEvent, ReadyMask,
+};
 
-use crate::file::{FileDescription, FileLike, FileLikeKind, Kstat, get_file_description};
+use super::{
+    FileDescription, FileLike, FileLikeKind, Kstat,
+    desc::{DescriptorCloseRegistration, DescriptorCloseRegistrationError},
+    get_file_description,
+};
+use crate::task::AX_FILE_LIMIT;
 
 const EPOLL_MAX_NESTS: usize = 5;
-const EPOLL_MAX_INTERESTS: usize = 16_384;
-const EPOLL_MAX_REVERSE_PARENTS: usize = 16_384;
+const EPOLL_CORE_CAPACITY: usize = AX_FILE_LIMIT;
+const EPOLL_GLOBAL_CORE_SLOTS: usize = 65_536;
+const EPOLL_GRAPH_NODES: usize = 64;
+const EPOLL_GRAPH_EDGES: usize = 16_384;
 const EPOLL_GRAPH_WALK_LIMIT: usize = 65_536;
 const EPOLL_WAITER_SLOTS: usize = 64;
-static EPOLL_GRAPH_LOCK: Mutex<()> = Mutex::new(());
 
-struct GraphWalkBudget {
-    remaining: usize,
-}
+const EPOLL_FAULT_NONE: u8 = 0;
+const EPOLL_FAULT_PENDING_OVERFLOW: u8 = 1;
+const EPOLL_FAULT_CORE_INVARIANT: u8 = 2;
 
-impl GraphWalkBudget {
-    const fn new() -> Self {
-        Self {
-            remaining: EPOLL_GRAPH_WALK_LIMIT,
+static NEXT_EPOLL_ID: AtomicU64 = AtomicU64::new(1);
+static EPOLL_CORE_SLOTS: AtomicUsize = AtomicUsize::new(0);
+static EPOLL_GRAPH: Once<SpinNoIrq<EpollGraph>> = Once::new();
+
+fn map_graph_error(error: GraphError) -> AxError {
+    match error {
+        GraphError::NoMemory => AxError::NoMemory,
+        GraphError::Capacity | GraphError::ParentLimit | GraphError::GenerationExhausted => {
+            LinuxError::ENOSPC.into()
         }
-    }
-
-    fn visit(&mut self) -> AxResult<()> {
-        self.remaining = self
-            .remaining
-            .checked_sub(1)
-            .ok_or_else(|| AxError::from(LinuxError::ELOOP))?;
-        Ok(())
+        GraphError::SelfCycle => AxError::InvalidInput,
+        GraphError::Cycle | GraphError::Nesting | GraphError::WalkLimit => LinuxError::ELOOP.into(),
+        GraphError::DuplicateNode | GraphError::Busy | GraphError::StaleToken => AxError::BadState,
+        GraphError::Unbounded => AxError::InvalidInput,
+        _ => AxError::BadState,
     }
 }
 
-struct ReadyWaiterSet {
-    entries: [Option<Waker>; EPOLL_WAITER_SLOTS],
-    cursor: usize,
-}
-
-impl Default for ReadyWaiterSet {
-    fn default() -> Self {
-        Self {
-            entries: array::from_fn(|_| None),
-            cursor: 0,
+fn map_epoll_error(error: EpollError) -> AxError {
+    match error {
+        EpollError::NoMemory => AxError::NoMemory,
+        EpollError::Capacity | EpollError::GenerationExhausted | EpollError::ReadyQueueFull => {
+            LinuxError::ENOSPC.into()
         }
+        EpollError::Duplicate => AxError::AlreadyExists,
+        EpollError::NotFound | EpollError::StaleToken => AxError::NotFound,
+        EpollError::UnsupportedMode => AxError::OperationNotSupported,
+        EpollError::RescanRequired => AxError::WouldBlock,
+        _ => AxError::BadState,
     }
 }
 
-impl ReadyWaiterSet {
-    fn register(&mut self, waker: &Waker, owned: Waker) -> (Option<Waker>, Option<Waker>) {
-        if self
-            .entries
-            .iter()
-            .flatten()
-            .any(|registered| registered.will_wake(waker))
-        {
-            return (None, Some(owned));
-        }
-
-        let slot = self.cursor;
-        self.cursor = (self.cursor + 1) % EPOLL_WAITER_SLOTS;
-        (self.entries[slot].replace(owned), None)
-    }
-
-    fn take_all(&mut self) -> [Option<Waker>; EPOLL_WAITER_SLOTS] {
-        self.cursor = 0;
-        array::from_fn(|index| self.entries[index].take())
+fn map_descriptor_close_error(error: DescriptorCloseRegistrationError) -> AxError {
+    match error {
+        DescriptorCloseRegistrationError::NoMemory => AxError::NoMemory,
+        DescriptorCloseRegistrationError::Closed => AxError::BadFileDescriptor,
+        DescriptorCloseRegistrationError::Full
+        | DescriptorCloseRegistrationError::TokenSpaceExhausted => LinuxError::ENOSPC.into(),
     }
 }
 
-/// Fixed-capacity epoll waiters. Registration and wake never allocate, and
-/// duplicate registrations from the same task or parent epoll are coalesced.
-struct ReadyWaiters(SpinNoIrq<ReadyWaiterSet>);
+fn allocate_epoll_id() -> AxResult<EpollId> {
+    let raw = NEXT_EPOLL_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .map_err(|_| AxError::TooManyOpenFiles)?;
+    EpollId::new(raw).ok_or(AxError::BadState)
+}
 
-impl Default for ReadyWaiters {
-    fn default() -> Self {
-        Self(SpinNoIrq::new(ReadyWaiterSet::default()))
+fn graph_domain() -> AxResult<&'static SpinNoIrq<EpollGraph>> {
+    EPOLL_GRAPH.try_call_once(|| {
+        let id = EpollGraphId::new(1).ok_or(AxError::BadState)?;
+        let limits = EpollGraphLimits::try_new(
+            EPOLL_GRAPH_NODES,
+            EPOLL_GRAPH_EDGES,
+            EPOLL_GRAPH_NODES,
+            EPOLL_MAX_NESTS,
+            EPOLL_GRAPH_WALK_LIMIT,
+        )
+        .map_err(map_graph_error)?;
+        EpollGraph::try_new(id, limits)
+            .map(SpinNoIrq::new)
+            .map_err(map_graph_error)
+    })
+}
+
+struct EpollCoreCharge(usize);
+
+impl EpollCoreCharge {
+    fn try_new(slots: usize) -> AxResult<Self> {
+        EPOLL_CORE_SLOTS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(slots)
+                    .filter(|next| *next <= EPOLL_GLOBAL_CORE_SLOTS)
+            })
+            .map_err(|_| AxError::from(LinuxError::ENOSPC))?;
+        Ok(Self(slots))
     }
 }
 
-impl ReadyWaiters {
-    fn register(&self, waker: &Waker) {
-        // RawWaker clone/drop can execute type-specific code. Keep both out of
-        // the IRQ-safe slot lock; the lock only compares identities and swaps
-        // already-owned values.
-        let owned = waker.clone();
-        let (retired, duplicate) = self.0.lock().register(waker, owned);
-        drop(duplicate);
-        if let Some(retired) = retired {
-            retired.wake();
-        }
-    }
-
-    fn wake(&self) -> usize {
-        let waiters = self.0.lock().take_all();
-        let mut count = 0;
-        for waker in waiters.into_iter().flatten() {
-            count += 1;
-            waker.wake();
-        }
-        count
-    }
-}
-
-impl Drop for ReadyWaiters {
+impl Drop for EpollCoreCharge {
     fn drop(&mut self) {
-        self.wake();
+        EPOLL_CORE_SLOTS.fetch_sub(self.0, Ordering::AcqRel);
     }
 }
 
-struct ParentEntry {
-    parent: Weak<EpollInner>,
-    edge_count: usize,
-}
-
-#[derive(Default)]
-struct ParentRegistry {
-    entries: HashMap<usize, ParentEntry>,
-}
-
-impl ParentRegistry {
-    fn try_admit(&mut self, parent_id: usize) -> AxResult<()> {
-        if let Some(entry) = self.entries.get(&parent_id) {
-            entry.edge_count.checked_add(1).ok_or(AxError::NoMemory)?;
-            return Ok(());
-        }
-        if self.entries.len() >= EPOLL_MAX_REVERSE_PARENTS {
-            return Err(LinuxError::ENOSPC.into());
-        }
-        self.entries.try_reserve(1).map_err(|_| AxError::NoMemory)
+fn interest_from_io(events: IoEvents) -> AxResult<InterestMask> {
+    if events.contains(IoEvents::MESSAGE) {
+        // Linux defines EPOLLMSG but does not implement a useful readiness
+        // contract for it. The 0.1 core therefore rejects it explicitly.
+        return Err(AxError::OperationNotSupported);
     }
-
-    /// Commit an admission performed while the global graph lock was held.
-    /// Concurrent deletion can only reduce counts and never consumes the
-    /// reserved vacant capacity.
-    fn add_admitted(
-        &mut self,
-        parent_id: usize,
-        parent: &Arc<EpollInner>,
-    ) -> AxResult<Option<ParentEntry>> {
-        if let Some(entry) = self.entries.get_mut(&parent_id) {
-            entry.edge_count = entry.edge_count.checked_add(1).ok_or(AxError::NoMemory)?;
-            return Ok(None);
-        }
-        Ok(self.entries.insert(
-            parent_id,
-            ParentEntry {
-                parent: Arc::downgrade(parent),
-                edge_count: 1,
-            },
-        ))
-    }
-
-    fn remove(&mut self, parent_id: usize) -> Option<ParentEntry> {
-        let entry = self.entries.get_mut(&parent_id)?;
-        if entry.edge_count > 1 {
-            entry.edge_count -= 1;
-            return None;
-        }
-        self.entries.remove(&parent_id)
-    }
-}
-
-struct ReverseParentRegistration {
-    child: Weak<EpollInner>,
-    parent_id: usize,
-    committed: AtomicBool,
-}
-
-impl ReverseParentRegistration {
-    fn new(child: Weak<EpollInner>, parent_id: usize) -> Self {
-        Self {
-            child,
-            parent_id,
-            committed: AtomicBool::new(false),
+    let mut bits = 0;
+    for (event, interest) in [
+        (IoEvents::READABLE, InterestMask::IN),
+        (IoEvents::PRIORITY, InterestMask::PRI),
+        (IoEvents::WRITABLE, InterestMask::OUT),
+        (IoEvents::READ_NORMAL, InterestMask::READ_NORMAL),
+        (IoEvents::READ_BAND, InterestMask::READ_BAND),
+        (IoEvents::WRITE_NORMAL, InterestMask::WRITE_NORMAL),
+        (IoEvents::WRITE_BAND, InterestMask::WRITE_BAND),
+        (IoEvents::READ_HANGUP, InterestMask::READ_HANGUP),
+    ] {
+        if events.contains(event) {
+            bits |= interest.bits();
         }
     }
+    InterestMask::from_bits(bits).ok_or(AxError::InvalidInput)
+}
 
-    fn commit(&self) {
-        self.committed.store(true, Ordering::Release);
-    }
-
-    fn disarm(&self) -> bool {
-        self.committed.swap(false, Ordering::AcqRel)
-    }
-
-    fn release(&self) {
-        if self.disarm()
-            && let Some(child) = self.child.upgrade()
-        {
-            child.remove_parent(self.parent_id);
+fn ready_from_io(events: IoEvents) -> ReadyMask {
+    let mut bits = 0;
+    for (event, ready) in [
+        (IoEvents::READABLE, ReadyMask::IN),
+        (IoEvents::PRIORITY, ReadyMask::PRI),
+        (IoEvents::WRITABLE, ReadyMask::OUT),
+        (IoEvents::ERROR, ReadyMask::ERROR),
+        (IoEvents::HANGUP, ReadyMask::HANGUP),
+        (IoEvents::READ_NORMAL, ReadyMask::READ_NORMAL),
+        (IoEvents::READ_BAND, ReadyMask::READ_BAND),
+        (IoEvents::WRITE_NORMAL, ReadyMask::WRITE_NORMAL),
+        (IoEvents::WRITE_BAND, ReadyMask::WRITE_BAND),
+        (IoEvents::READ_HANGUP, ReadyMask::READ_HANGUP),
+    ] {
+        if events.contains(event) {
+            bits |= ready.bits();
         }
     }
+    ReadyMask::from_bits_retain(bits)
 }
 
-impl Drop for ReverseParentRegistration {
-    fn drop(&mut self) {
-        self.release();
+fn io_from_ready(events: ReadyMask) -> IoEvents {
+    let mut io = IoEvents::empty();
+    for (ready, event) in [
+        (ReadyMask::IN, IoEvents::READABLE),
+        (ReadyMask::PRI, IoEvents::PRIORITY),
+        (ReadyMask::OUT, IoEvents::WRITABLE),
+        (ReadyMask::ERROR, IoEvents::ERROR),
+        (ReadyMask::HANGUP, IoEvents::HANGUP),
+        (ReadyMask::READ_NORMAL, IoEvents::READ_NORMAL),
+        (ReadyMask::READ_BAND, IoEvents::READ_BAND),
+        (ReadyMask::WRITE_NORMAL, IoEvents::WRITE_NORMAL),
+        (ReadyMask::WRITE_BAND, IoEvents::WRITE_BAND),
+        (ReadyMask::READ_HANGUP, IoEvents::READ_HANGUP),
+    ] {
+        if !(events & ready).is_empty() {
+            io |= event;
+        }
     }
+    io
 }
 
+#[derive(Clone, Copy, Default)]
 pub struct EpollEvent {
     pub events: IoEvents,
     pub user_data: u64,
 }
 
 bitflags! {
-    /// Flags for the entries in the `epoll` instance.
     #[derive(Debug, Clone, Copy, Default)]
     pub struct EpollFlags: u32 {
         const EDGE_TRIGGER = EPOLLET;
@@ -239,587 +211,806 @@ bitflags! {
     }
 }
 
-/// Interest trigger mode
-#[derive(Debug, Clone, Copy)]
-enum TriggerMode {
-    /// Level-triggered: until the condition is cleared
-    Level,
-    /// Edge-triggered: only notify when the condition changes
-    Edge,
-    /// One-shot: notify only once
-    OneShot { fired: bool },
-}
-
-impl TriggerMode {
-    fn from_flags(flags: EpollFlags) -> Self {
-        if flags.contains(EpollFlags::ONESHOT) {
-            TriggerMode::OneShot { fired: false }
-        } else if flags.contains(EpollFlags::EDGE_TRIGGER) {
-            TriggerMode::Edge
-        } else {
-            TriggerMode::Level
-        }
-    }
-
-    // return should notify and new mode
-    fn should_notify(&self) -> (bool, Self) {
-        match self {
-            TriggerMode::Level => {
-                // LT: always notify
-                (true, *self)
-            }
-            // if we could wake, we need notify
-            TriggerMode::Edge => (true, TriggerMode::Edge),
-            TriggerMode::OneShot { fired } => {
-                // ONESHOT: 只触发一次
-                if *fired {
-                    (false, *self)
-                } else {
-                    (true, TriggerMode::OneShot { fired: true })
-                }
-            }
-        }
-    }
-
-    fn is_enabled(&self) -> bool {
-        match self {
-            TriggerMode::OneShot { fired } => !fired,
-            _ => true,
-        }
-    }
-}
-
-enum ConsumeResult {
-    // success and should keep in ready list
-    EventAndKeep(EpollEvent),
-    // success and hould remove ready list
-    EventAndRemove(EpollEvent),
-    // no event and should remove ready list
-    NoEvent,
-}
-
-#[derive(Clone)]
-struct EntryKey {
-    fd: i32,
+#[self_referencing]
+struct OwnedInterestRegistration {
     file: Arc<FileDescription>,
-}
-impl EntryKey {
-    fn new(fd: i32) -> AxResult<Self> {
-        Ok(Self {
-            fd,
-            file: get_file_description(fd)?,
-        })
-    }
-
-    #[inline]
-    fn get_file(&self) -> &FileDescription {
-        self.file.as_ref()
-    }
+    #[borrows(file)]
+    #[covariant]
+    registration: PollRegistration<'this>,
 }
 
-impl Hash for EntryKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        (self.fd, Arc::as_ptr(&self.file)).hash(state);
-    }
+#[derive(Default)]
+struct RegistrationState {
+    arming: bool,
+    woke_during_arm: bool,
+    registration: Option<OwnedInterestRegistration>,
 }
-impl PartialEq for EntryKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.fd == other.fd && Arc::ptr_eq(&self.file, &other.file)
+
+#[derive(Default)]
+struct TokenPublicationState {
+    source_woke: bool,
+    target_closed: bool,
+}
+
+struct EpollWakePort {
+    poll_ready: PollSet<EPOLL_WAITER_SLOTS>,
+    callback_pending: AtomicBool,
+}
+
+impl EpollWakePort {
+    /// Publishes callback work without reaching the epoll graph or state lock.
+    fn publish_callback(&self) {
+        self.callback_pending.store(true, Ordering::Release);
+        self.poll_ready.wake();
     }
 }
 
-impl Eq for EntryKey {}
+struct InterestCallbackState {
+    wake_port: Weak<EpollWakePort>,
+    source_enabled: AtomicBool,
+    source_woke: AtomicBool,
+    target_closed: AtomicBool,
+}
 
-struct EpollInterest {
-    key: EntryKey,
-    event: EpollEvent,
-    mode: SpinNoPreempt<TriggerMode>,
-    waker: Once<Waker>,
-    waker_armed: AtomicBool,
+impl InterestCallbackState {
+    fn publish_source_wake(&self) {
+        self.source_woke.store(true, Ordering::Release);
+        if let Some(port) = self.wake_port.upgrade() {
+            port.publish_callback();
+        }
+    }
+
+    fn publish_target_close(&self) {
+        self.source_enabled.store(false, Ordering::Release);
+        self.target_closed.store(true, Ordering::Release);
+        if let Some(port) = self.wake_port.upgrade() {
+            port.publish_callback();
+        }
+    }
+}
+
+struct InterestControl {
+    file: Arc<FileDescription>,
+    poll_events: IoEvents,
+    one_shot: bool,
     active: AtomicBool,
-    in_ready_queue: AtomicBool,
-    rescan_pending: AtomicBool,
-    wake_sequence: AtomicU64,
-    reverse_parent: Option<ReverseParentRegistration>,
+    callback: Arc<InterestCallbackState>,
+    pending: AtomicBool,
+    waker: Once<Waker>,
+    registration: SpinNoIrq<RegistrationState>,
+    close_registration: SpinNoIrq<Option<DescriptorCloseRegistration>>,
 }
 
-impl EpollInterest {
-    fn new(
-        key: EntryKey,
-        event: EpollEvent,
-        flags: EpollFlags,
-        reverse_parent: Option<ReverseParentRegistration>,
-    ) -> Self {
-        Self {
-            key,
-            event,
-            mode: SpinNoPreempt::new(TriggerMode::from_flags(flags)),
-            waker: Once::new(),
-            waker_armed: AtomicBool::new(false),
-            active: AtomicBool::new(true),
-            in_ready_queue: AtomicBool::new(false),
-            rescan_pending: AtomicBool::new(false),
-            wake_sequence: AtomicU64::new(0),
-            reverse_parent,
-        }
-    }
+struct InterestWake(Arc<InterestCallbackState>);
+struct InterestCloseWake(Arc<InterestCallbackState>);
 
-    #[inline]
-    fn is_enabled(&self) -> bool {
-        self.is_active() && self.mode.lock().is_enabled()
-    }
-
-    fn install_waker(&self, waker: Waker) {
-        self.waker.call_once(|| waker);
-    }
-
-    fn registered_waker(&self) -> Option<&Waker> {
-        self.waker.get()
-    }
-
-    #[inline]
-    fn try_arm_waker(&self) -> bool {
-        self.waker_armed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-
-    #[inline]
-    fn disarm_waker(&self) {
-        self.waker_armed.store(false, Ordering::Release);
-    }
-
-    #[inline]
-    fn is_active(&self) -> bool {
-        self.active.load(Ordering::Acquire)
-    }
-
-    #[inline]
-    fn is_in_queue(&self) -> bool {
-        self.in_ready_queue.load(Ordering::Acquire)
-    }
-
-    #[inline]
-    fn try_mark_in_queue(&self) -> bool {
-        self.in_ready_queue
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-
-    #[inline]
-    fn mark_not_in_queue(&self) {
-        self.in_ready_queue.store(false, Ordering::Release);
-    }
-
-    #[inline]
-    fn needs_rescan(&self) -> bool {
-        self.rescan_pending.load(Ordering::Acquire)
-    }
-
-    #[inline]
-    fn mark_for_rescan(&self) {
-        self.rescan_pending.store(true, Ordering::Release);
-    }
-
-    #[inline]
-    fn clear_rescan(&self) {
-        self.rescan_pending.store(false, Ordering::Release);
-    }
-
-    #[inline]
-    fn wake_sequence(&self) -> u64 {
-        self.wake_sequence.load(Ordering::Acquire)
-    }
-
-    fn deactivate(&self) {
-        self.active.store(false, Ordering::Release);
-        self.disarm_waker();
-        self.mark_not_in_queue();
-        self.clear_rescan();
-    }
-
-    fn commit_reverse_parent(&self) {
-        if let Some(registration) = &self.reverse_parent {
-            registration.commit();
-        }
-    }
-
-    fn transfer_reverse_parent_to(&self, replacement: &Self) {
-        if let (Some(current), Some(replacement)) =
-            (&self.reverse_parent, &replacement.reverse_parent)
-            && current.disarm()
-        {
-            replacement.commit();
-        }
-    }
-
-    fn release_reverse_parent(&self) {
-        if let Some(registration) = &self.reverse_parent {
-            registration.release();
-        }
-    }
-
-    fn consume(&self, file: &dyn FileLike) -> ConsumeResult {
-        if !self.is_active() {
-            return ConsumeResult::NoEvent;
-        }
-        let current_events = file.poll();
-        let matched = current_events & self.event.events;
-
-        // not ready
-        if matched.is_empty() {
-            return ConsumeResult::NoEvent;
-        }
-
-        let mut mode = self.mode.lock();
-        let (should_notify, new_mode) = mode.should_notify();
-        *mode = new_mode;
-        trace!(
-            "consume fd: {} matches {:?} should notify: {} ",
-            self.key.fd, matched, should_notify
-        );
-
-        if !should_notify {
-            return ConsumeResult::NoEvent;
-        }
-
-        // create event
-        let event = EpollEvent {
-            events: matched,
-            user_data: self.event.user_data,
-        };
-
-        // shoud still keep in ready?
-        match *mode {
-            TriggerMode::Level => ConsumeResult::EventAndKeep(event),
-            TriggerMode::Edge | TriggerMode::OneShot { .. } => ConsumeResult::EventAndRemove(event),
-        }
-    }
-}
-
-struct InterestWaker {
-    epoll: Weak<EpollInner>,
-    interest: Weak<EpollInterest>,
-}
-
-impl Wake for InterestWaker {
+impl Wake for InterestWake {
     fn wake(self: Arc<Self>) {
         self.wake_by_ref();
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        // Hold the owning epoll first so its interests map keeps a successfully
-        // upgraded interest alive until this callback has finished.
-        let Some(epoll) = self.epoll.upgrade() else {
-            return;
-        };
-        let Some(interest) = self.interest.upgrade() else {
-            return;
-        };
-        // axpoll registrations are consumed by wake(). Rearming is owned by
-        // the next task-context poll, so repeated LT scans cannot accumulate
-        // duplicate copies of this same waker in the source wait set.
-        interest.disarm_waker();
-
-        epoll.enqueue_from_waker(&interest);
+        self.0.publish_source_wake();
     }
 }
 
-#[derive(Default)]
-struct ReadyQueue {
-    entries: VecDeque<Weak<EpollInterest>>,
-}
-
-impl ReadyQueue {
-    /// Keep room for every published interest plus one spare slot. The spare
-    /// lets a rescan rotate a popped level-triggered entry behind an overflowed
-    /// entry without allocating in a wake path.
-    fn try_admit_interest(&mut self, interest_count_after: usize) -> AxResult<()> {
-        let required = interest_count_after
-            .checked_add(1)
-            .ok_or(AxError::NoMemory)?;
-        let additional = required.saturating_sub(self.entries.len());
-        self.entries
-            .try_reserve(additional)
-            .map_err(|_| AxError::NoMemory)
+impl Wake for InterestCloseWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
     }
 
-    fn push_back_noalloc(
-        &mut self,
-        interest: Weak<EpollInterest>,
-    ) -> Result<(), Weak<EpollInterest>> {
-        if self.entries.len() == self.entries.capacity() {
-            return Err(interest);
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.publish_target_close();
+    }
+}
+
+impl InterestControl {
+    fn try_new(
+        wake_port: &Arc<EpollWakePort>,
+        file: Arc<FileDescription>,
+        poll_events: IoEvents,
+        one_shot: bool,
+    ) -> AxResult<Arc<Self>> {
+        let callback = Arc::try_new(InterestCallbackState {
+            wake_port: Arc::downgrade(wake_port),
+            source_enabled: AtomicBool::new(true),
+            source_woke: AtomicBool::new(false),
+            target_closed: AtomicBool::new(false),
+        })
+        .map_err(|_| AxError::NoMemory)?;
+        let control = Arc::try_new(Self {
+            file,
+            poll_events,
+            one_shot,
+            active: AtomicBool::new(true),
+            callback: Arc::clone(&callback),
+            pending: AtomicBool::new(false),
+            waker: Once::new(),
+            registration: SpinNoIrq::new(RegistrationState::default()),
+            close_registration: SpinNoIrq::new(None),
+        })
+        .map_err(|_| AxError::NoMemory)?;
+        let wake =
+            Arc::try_new(InterestWake(Arc::clone(&callback))).map_err(|_| AxError::NoMemory)?;
+        control.waker.call_once(|| Waker::from(wake));
+        let close_wake =
+            Arc::try_new(InterestCloseWake(callback)).map_err(|_| AxError::NoMemory)?;
+        let close_waker = Waker::from(close_wake);
+        let close_registration = control
+            .file
+            .register_descriptor_close(&close_waker)
+            .map_err(map_descriptor_close_error)?;
+        *control.close_registration.lock() = Some(close_registration);
+        Ok(control)
+    }
+
+    fn is_source_enabled(&self) -> bool {
+        self.active.load(Ordering::Acquire) && self.callback.source_enabled.load(Ordering::Acquire)
+    }
+
+    fn begin_registration(&self) -> bool {
+        let mut state = self.registration.lock();
+        if !self.is_source_enabled() || state.arming || state.registration.is_some() {
+            return false;
         }
-        self.entries.push_back(interest);
-        Ok(())
+        state.arming = true;
+        state.woke_during_arm = false;
+        true
     }
 
-    fn pop_front(&mut self) -> Option<Weak<EpollInterest>> {
-        self.entries.pop_front()
+    fn finish_registration(&self, registration: OwnedInterestRegistration) {
+        let retired = {
+            let mut state = self.registration.lock();
+            state.arming = false;
+            if self.is_source_enabled() && !state.woke_during_arm {
+                state.registration = Some(registration);
+                None
+            } else {
+                Some(registration)
+            }
+        };
+        drop(retired);
     }
 
-    fn remove(&mut self, interest: &Arc<EpollInterest>) -> Option<Weak<EpollInterest>> {
-        let interest = Arc::as_ptr(interest);
-        let position = self
-            .entries
-            .iter()
-            .position(|queued| queued.as_ptr() == interest)?;
-        self.entries.remove(position)
+    fn abort_registration(&self) {
+        let mut state = self.registration.lock();
+        state.arming = false;
+        state.woke_during_arm = false;
+    }
+
+    fn registration_fired(&self) {
+        let retired = {
+            let mut state = self.registration.lock();
+            if state.arming {
+                state.woke_during_arm = true;
+                None
+            } else {
+                state.registration.take()
+            }
+        };
+        drop(retired);
+    }
+
+    fn cancel_registration(&self) {
+        let retired = self.registration.lock().registration.take();
+        drop(retired);
+    }
+
+    fn ensure_armed(&self) -> AxResult<()> {
+        if !self.is_source_enabled() || !self.begin_registration() {
+            return Ok(());
+        }
+        let Some(waker) = self.waker.get() else {
+            self.abort_registration();
+            return Err(AxError::BadState);
+        };
+        let file = Arc::clone(&self.file);
+        let events = self.poll_events;
+        match OwnedInterestRegistration::try_new(file, |file| {
+            let mut context = Context::from_waker(waker);
+            file.register(&mut context, events)
+        }) {
+            Ok(registration) => {
+                self.finish_registration(registration);
+                Ok(())
+            }
+            Err(error) => {
+                self.abort_registration();
+                Err(crate::readiness::registration_error(error))
+            }
+        }
+    }
+
+    fn check_arm_check(&self) -> AxResult<ReadyMask> {
+        if !self.is_source_enabled() {
+            return Ok(ReadyMask::EMPTY);
+        }
+        let before = self.file.poll();
+        self.ensure_armed()?;
+        let after = self.file.poll();
+        Ok(ready_from_io(before | after))
+    }
+
+    fn publish_token(&self) -> TokenPublicationState {
+        TokenPublicationState {
+            source_woke: self.take_source_wake_hint(),
+            target_closed: self.take_target_close_hint(),
+        }
+    }
+
+    fn take_source_wake_hint(&self) -> bool {
+        self.callback.source_woke.swap(false, Ordering::AcqRel)
+    }
+
+    fn take_target_close_hint(&self) -> bool {
+        self.callback.target_closed.swap(false, Ordering::AcqRel)
+    }
+
+    fn disable_after_one_shot(&self) {
+        if self.one_shot {
+            self.callback.source_enabled.store(false, Ordering::Release);
+            self.cancel_registration();
+            self.pending.store(false, Ordering::Release);
+        }
+    }
+
+    fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+        self.callback.source_enabled.store(false, Ordering::Release);
+        self.callback.source_woke.store(false, Ordering::Release);
+        self.callback.target_closed.store(false, Ordering::Release);
+        self.pending.store(false, Ordering::Release);
+        self.cancel_registration();
+        let close_registration = self.close_registration.lock().take();
+        drop(close_registration);
+    }
+}
+
+struct PendingQueue {
+    items: Vec<Option<EpollToken>>,
+    head: usize,
+    len: usize,
+}
+
+impl PendingQueue {
+    fn try_new(capacity: usize) -> AxResult<Self> {
+        let mut items = Vec::new();
+        items
+            .try_reserve_exact(capacity)
+            .map_err(|_| AxError::NoMemory)?;
+        items.resize(capacity, None);
+        Ok(Self {
+            items,
+            head: 0,
+            len: 0,
+        })
     }
 
     fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len == 0
     }
 
-    fn len(&self) -> usize {
-        self.entries.len()
+    fn push(&mut self, token: EpollToken) -> Result<(), ()> {
+        if self.items.is_empty() || self.len == self.items.len() {
+            return Err(());
+        }
+        let index = (self.head + self.len) % self.items.len();
+        self.items[index] = Some(token);
+        self.len += 1;
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<EpollToken> {
+        if self.len == 0 {
+            return None;
+        }
+        let token = self.items[self.head].take();
+        self.head = (self.head + 1) % self.items.len();
+        self.len -= 1;
+        token
+    }
+
+    fn remove(&mut self, token: EpollToken) {
+        if self.len == 0 {
+            return;
+        }
+        let capacity = self.items.len();
+        let mut retained = 0;
+        for read in 0..self.len {
+            let index = (self.head + read) % capacity;
+            let item = self.items[index].take();
+            if item != Some(token) {
+                let write = (self.head + retained) % capacity;
+                self.items[write] = item;
+                retained += 1;
+            }
+        }
+        self.len = retained;
+    }
+}
+
+struct InterestRecord {
+    key: EpollKey,
+    token: EpollToken,
+    edge: GraphEdgeToken,
+    control: Arc<InterestControl>,
+}
+
+struct EpollState {
+    core: EpollCore<u64, Arc<InterestControl>>,
+    by_key: HashMap<EpollKey, EpollToken>,
+    by_slot: Vec<Option<InterestRecord>>,
+    pending: PendingQueue,
+}
+
+impl EpollState {
+    fn try_new(id: EpollId) -> AxResult<Self> {
+        let core = EpollCore::try_new(id, EPOLL_CORE_CAPACITY).map_err(map_epoll_error)?;
+        let mut by_key = HashMap::new();
+        by_key
+            .try_reserve(EPOLL_CORE_CAPACITY)
+            .map_err(|_| AxError::NoMemory)?;
+        let mut by_slot = Vec::new();
+        by_slot
+            .try_reserve_exact(EPOLL_CORE_CAPACITY)
+            .map_err(|_| AxError::NoMemory)?;
+        by_slot.resize_with(EPOLL_CORE_CAPACITY, || None);
+        Ok(Self {
+            core,
+            by_key,
+            by_slot,
+            pending: PendingQueue::try_new(EPOLL_CORE_CAPACITY)?,
+        })
+    }
+
+    fn record(&self, token: EpollToken) -> Option<&InterestRecord> {
+        self.by_slot
+            .get(token.slot())?
+            .as_ref()
+            .filter(|record| record.token == token)
     }
 }
 
 struct EpollInner {
-    /// Reverse graph edges are weak so an acyclic forward eventpoll graph does
-    /// not acquire a second ownership direction. Counts cover duplicate fds
-    /// that refer to the same child epoll.
-    // A stale source callback may hold the final interest Arc after DEL and
-    // release its reverse token from IRQ context.
-    parents: SpinNoIrq<ParentRegistry>,
-    interests: SpinNoPreempt<HashMap<EntryKey, Arc<EpollInterest>>>,
-    /// Interest wakers may run from IRQ context, so every lock they touch must
-    /// disable local interrupts rather than only disabling preemption.
-    ready_queue: SpinNoIrq<ReadyQueue>,
-    /// A coalesced hint that one or more interests could not enter the ready
-    /// queue. Per-interest bits retain the exact work; this flag is only the
-    /// allocation-free readiness/wakeup summary.
-    rescan_needed: AtomicBool,
-    poll_ready: ReadyWaiters,
-}
-
-impl Default for EpollInner {
-    fn default() -> Self {
-        Self {
-            parents: SpinNoIrq::new(ParentRegistry::default()),
-            interests: SpinNoPreempt::new(HashMap::new()),
-            ready_queue: SpinNoIrq::new(ReadyQueue::default()),
-            rescan_needed: AtomicBool::new(false),
-            poll_ready: ReadyWaiters::default(),
-        }
-    }
+    node: GraphNodeToken,
+    state: SpinNoIrq<EpollState>,
+    wake_port: Arc<EpollWakePort>,
+    fault: AtomicU8,
+    _charge: EpollCoreCharge,
 }
 
 impl EpollInner {
-    fn remove_parent(&self, parent_id: usize) {
-        let retired = self.parents.lock().remove(parent_id);
-        drop(retired);
+    fn try_new() -> AxResult<Arc<Self>> {
+        let id = allocate_epoll_id()?;
+        let charge = EpollCoreCharge::try_new(EPOLL_CORE_CAPACITY)?;
+        let state = EpollState::try_new(id)?;
+        let wake_port = Arc::try_new(EpollWakePort {
+            poll_ready: PollSet::new(),
+            callback_pending: AtomicBool::new(false),
+        })
+        .map_err(|_| AxError::NoMemory)?;
+        let node = graph_domain()?
+            .lock()
+            .register(id)
+            .map_err(map_graph_error)?;
+        Arc::try_new(Self {
+            node,
+            state: SpinNoIrq::new(state),
+            wake_port,
+            fault: AtomicU8::new(EPOLL_FAULT_NONE),
+            _charge: charge,
+        })
+        .map_err(|_| AxError::NoMemory)
     }
 
-    fn parent_inners(&self) -> AxResult<Vec<Arc<EpollInner>>> {
-        let mut parents = Vec::new();
-        loop {
-            let required = self.parents.lock().entries.len();
-            if parents.capacity() < required {
-                parents
-                    .try_reserve(required)
-                    .map_err(|_| AxError::NoMemory)?;
-            }
+    fn set_fault(&self, fault: u8) {
+        let _ = self.fault.compare_exchange(
+            EPOLL_FAULT_NONE,
+            fault,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.wake_port.poll_ready.wake();
+    }
 
-            let registry = self.parents.lock();
-            if registry.entries.len() > parents.capacity() {
-                drop(registry);
-                continue;
-            }
-            for entry in registry.entries.values() {
-                if let Some(parent) = entry.parent.upgrade() {
-                    parents.push(parent);
-                }
-            }
-            return Ok(parents);
+    fn check_fault(&self) -> AxResult<()> {
+        match self.fault.load(Ordering::Acquire) {
+            EPOLL_FAULT_NONE => Ok(()),
+            EPOLL_FAULT_PENDING_OVERFLOW | EPOLL_FAULT_CORE_INVARIANT | _ => Err(AxError::BadState),
         }
     }
 
-    fn max_parent_depth(
-        &self,
-        stack: &mut Vec<usize>,
-        budget: &mut GraphWalkBudget,
-    ) -> AxResult<usize> {
-        budget.visit()?;
-        let id = self as *const Self as usize;
-        if stack.contains(&id) || stack.len() > EPOLL_MAX_NESTS {
-            return Ok(EPOLL_MAX_NESTS.saturating_add(1));
-        }
-
-        stack.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-        stack.push(id);
-        let result = (|| {
-            let mut max_depth = 0usize;
-            for parent in self.parent_inners()? {
-                let depth = parent.max_parent_depth(stack, budget)?.saturating_add(1);
-                max_depth = max_depth.max(depth);
-            }
-            Ok(max_depth)
-        })();
-        stack.pop();
-        result
-    }
-
-    fn enqueue_ready(&self, interest: &Arc<EpollInterest>, record_wake: bool) {
-        let mut queued = false;
-        let mut requested_rescan = false;
-        {
-            let mut queue = self.ready_queue.lock();
-            if record_wake {
-                interest.wake_sequence.fetch_add(1, Ordering::AcqRel);
-            }
-            // A file waker may run in interrupt context. Do not take the
-            // trigger-mode spin lock here; a harmless stale one-shot wake is
-            // filtered by consume() in task context.
-            if !interest.is_active() || interest.is_in_queue() {
-                return;
-            }
-
-            if interest.try_mark_in_queue() {
-                match queue.push_back_noalloc(Arc::downgrade(interest)) {
-                    Ok(()) => {
-                        interest.clear_rescan();
-                        queued = true;
-                    }
-                    Err(_) => {
-                        interest.mark_not_in_queue();
-                        interest.mark_for_rescan();
-                        requested_rescan = !self.rescan_needed.swap(true, Ordering::AcqRel);
-                    }
-                }
-            }
-        }
-
-        if queued {
-            trace!(
-                "Epoll: fd={} added to ready queue, events={:?} wake up poller",
-                interest.key.fd, interest.event.events
-            );
-            self.poll_ready.wake();
-        } else if requested_rescan {
-            trace!(
-                "Epoll: fd={} requested allocation-free ready rescan",
-                interest.key.fd
-            );
-            self.poll_ready.wake();
-        }
-    }
-
-    fn enqueue_from_waker(&self, interest: &Arc<EpollInterest>) {
-        self.enqueue_ready(interest, true);
-    }
-
-    /// Move as many overflowed interests as possible into already admitted
-    /// queue storage. This scans bounded, published state once and never polls
-    /// a child while either epoll spin lock is held.
-    fn refill_from_rescan(&self) {
-        if !self.rescan_needed.load(Ordering::Acquire) {
+    fn enqueue_pending(&self, token: EpollToken, control: &InterestControl) {
+        if !control.is_source_enabled() {
             return;
         }
-
-        let interests = self.interests.lock();
-        let mut queue = self.ready_queue.lock();
-        for interest in interests.values() {
-            if !interest.needs_rescan() {
-                continue;
-            }
-            if !interest.is_enabled() || interest.is_in_queue() {
-                interest.clear_rescan();
-                continue;
-            }
-            if interest.try_mark_in_queue() {
-                match queue.push_back_noalloc(Arc::downgrade(interest)) {
-                    Ok(()) => interest.clear_rescan(),
-                    Err(_) => {
-                        interest.mark_not_in_queue();
-                        break;
-                    }
-                }
-            }
+        let mut state = self.state.lock();
+        let valid = state
+            .record(token)
+            .is_some_and(|record| core::ptr::eq(record.control.as_ref(), control));
+        if !valid
+            || control
+                .pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
         }
-        let pending = interests.values().any(|interest| interest.needs_rescan());
-        self.rescan_needed.store(pending, Ordering::Release);
+        if state.pending.push(token).is_err() {
+            control.pending.store(false, Ordering::Release);
+            drop(state);
+            error!("epoll pending source queue violated admitted capacity");
+            self.set_fault(EPOLL_FAULT_PENDING_OVERFLOW);
+            return;
+        }
+        drop(state);
+        self.wake_port.poll_ready.wake();
     }
 
-    /// The admitted-capacity invariant makes this a last-resort path. Keeping
-    /// it explicit means a future invariant regression still produces bounded
-    /// rescan work instead of a lost edge, allocator panic, or busy loop.
-    fn take_rescan_direct(&self) -> Option<(Arc<EpollInterest>, u64)> {
-        if !self.rescan_needed.load(Ordering::Acquire) {
-            return None;
+    fn requeue_pending(&self, token: EpollToken, control: &Arc<InterestControl>) {
+        let mut state = self.state.lock();
+        let valid = state
+            .record(token)
+            .is_some_and(|record| Arc::ptr_eq(&record.control, control));
+        if !valid
+            || control
+                .pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
         }
-
-        let interests = self.interests.lock();
-        let _queue = self.ready_queue.lock();
-        let mut selected = None;
-        for interest in interests.values() {
-            if !interest.needs_rescan() {
-                continue;
-            }
-            if !interest.is_enabled() || interest.is_in_queue() {
-                interest.clear_rescan();
-                continue;
-            }
-            if interest.try_mark_in_queue() {
-                interest.clear_rescan();
-                selected = Some((Arc::clone(interest), interest.wake_sequence()));
-                break;
-            }
+        if state.pending.push(token).is_err() {
+            control.pending.store(false, Ordering::Release);
+            drop(state);
+            self.set_fault(EPOLL_FAULT_PENDING_OVERFLOW);
+        } else {
+            drop(state);
+            self.wake_port.poll_ready.wake();
         }
-        let pending = interests.values().any(|interest| interest.needs_rescan());
-        self.rescan_needed.store(pending, Ordering::Release);
-        selected
     }
 
-    /// Requeue an LT interest without growing the queue. If the spare-capacity
-    /// invariant is unexpectedly unavailable, rotate this interest through
-    /// the coalesced rescan path and let the current wait return promptly.
-    fn requeue_consumed(&self, interest: &Arc<EpollInterest>) -> bool {
-        let mut requested_rescan = false;
-        let requeued = {
-            let mut queue = self.ready_queue.lock();
-            if !interest.is_enabled() {
-                interest.mark_not_in_queue();
-                false
-            } else {
-                match queue.push_back_noalloc(Arc::downgrade(interest)) {
-                    Ok(()) => {
-                        interest.clear_rescan();
-                        true
-                    }
-                    Err(_) => {
-                        interest.mark_not_in_queue();
-                        interest.mark_for_rescan();
-                        requested_rescan = !self.rescan_needed.swap(true, Ordering::AcqRel);
-                        false
-                    }
-                }
+    fn notify_ready(&self, token: EpollToken, ready: ReadyMask) -> AxResult<()> {
+        if ready.is_empty() {
+            return Ok(());
+        }
+        let outcome = {
+            let mut state = self.state.lock();
+            if state.record(token).is_none() {
+                return Ok(());
+            }
+            state.core.notify(token, ready)
+        };
+        match outcome {
+            Ok(NotifyOutcome::Enqueued) => {
+                self.wake_port.poll_ready.wake();
+                Ok(())
+            }
+            Ok(NotifyOutcome::Coalesced | NotifyOutcome::Ignored) => Ok(()),
+            Err(EpollError::ReadyQueueFull) => {
+                self.wake_port.poll_ready.wake();
+                Ok(())
+            }
+            Err(EpollError::StaleToken) => Ok(()),
+            Err(error) => Err(map_epoll_error(error)),
+        }
+    }
+
+    fn remove_closed_target(&self, token: EpollToken, control: &InterestControl) {
+        let domain = match graph_domain() {
+            Ok(domain) => domain,
+            Err(error) => {
+                error!("epoll close teardown could not access graph domain: {error:?}");
+                self.set_fault(EPOLL_FAULT_CORE_INVARIANT);
+                return;
             }
         };
-        if requested_rescan {
-            self.poll_ready.wake();
+        let mut graph = domain.lock();
+        let mut state = self.state.lock();
+        let valid = state
+            .record(token)
+            .is_some_and(|record| core::ptr::eq(record.control.as_ref(), control));
+        if !valid {
+            return;
         }
-        requeued
+        let retired = match state.core.remove(token) {
+            Ok(retired) => retired,
+            Err(error) => {
+                drop(state);
+                drop(graph);
+                error!("epoll close teardown lost core token: {error:?}");
+                self.set_fault(EPOLL_FAULT_CORE_INVARIANT);
+                return;
+            }
+        };
+        let Some(record) = state.by_slot.get_mut(token.slot()).and_then(Option::take) else {
+            drop(state);
+            drop(graph);
+            drop(retired);
+            self.set_fault(EPOLL_FAULT_CORE_INVARIANT);
+            return;
+        };
+        state.by_key.remove(&record.key);
+        state.pending.remove(token);
+        let graph_result = graph.remove_interest(record.edge);
+        drop(state);
+        drop(graph);
+
+        record.control.deactivate();
+        let (_, _, _, _, retired_control) = retired.into_parts();
+        drop(retired_control);
+        drop(record);
+        if let Err(error) = graph_result {
+            error!("epoll close graph teardown failed: {error:?}");
+            self.set_fault(EPOLL_FAULT_CORE_INVARIANT);
+        }
     }
 
-    fn release_consumed(&self, interest: &Arc<EpollInterest>, observed_wakes: u64) {
-        interest.mark_not_in_queue();
-        interest.clear_rescan();
-        if interest.is_enabled() && interest.wake_sequence() != observed_wakes {
-            // A callback raced while the popped token still owned the
-            // in-ready bit. Re-publish that coalesced wake after releasing the
-            // token; a callback racing after this point can publish itself.
-            self.enqueue_ready(interest, false);
+    fn drain_callback_hints(&self) {
+        // Callback publication is lock-free. Task context scans the finite
+        // per-epoll interest table and owns every registration/core/graph
+        // mutation and destructor which follows from those hints.
+        if !self
+            .wake_port
+            .callback_pending
+            .swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        for slot in 0..EPOLL_CORE_CAPACITY {
+            let Some((token, control)) = ({
+                let state = self.state.lock();
+                state.by_slot.get(slot).and_then(|record| {
+                    record
+                        .as_ref()
+                        .map(|record| (record.token, Arc::clone(&record.control)))
+                })
+            }) else {
+                continue;
+            };
+
+            if control.take_target_close_hint() {
+                control.take_source_wake_hint();
+                self.remove_closed_target(token, &control);
+            } else if control.take_source_wake_hint() {
+                control.registration_fired();
+                self.enqueue_pending(token, &control);
+            }
         }
     }
 
-    fn refresh_rescan_hint_locked(&self, interests: &HashMap<EntryKey, Arc<EpollInterest>>) {
-        self.rescan_needed.store(
-            interests.values().any(|interest| interest.needs_rescan()),
-            Ordering::Release,
-        );
+    fn drain_pending(&self) -> AxResult<()> {
+        self.drain_callback_hints();
+        self.check_fault()?;
+        loop {
+            let next = {
+                let mut state = self.state.lock();
+                let Some(token) = state.pending.pop() else {
+                    return Ok(());
+                };
+                let Some(control) = state
+                    .record(token)
+                    .map(|record| Arc::clone(&record.control))
+                else {
+                    continue;
+                };
+                control.pending.store(false, Ordering::Release);
+                (token, control)
+            };
+            let (token, control) = next;
+            match control.check_arm_check() {
+                Ok(ready) => self.notify_ready(token, ready)?,
+                Err(error) => {
+                    self.requeue_pending(token, &control);
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn recover_core(&self) -> AxResult<()> {
+        loop {
+            let progress = {
+                let mut state = self.state.lock();
+                let Some(token) = state.core.rescan_token() else {
+                    return Ok(());
+                };
+                state
+                    .core
+                    .rescan_ready(token, EPOLL_CORE_CAPACITY)
+                    .map_err(map_epoll_error)?
+            };
+            if progress.complete {
+                self.wake_port.poll_ready.wake();
+                return Ok(());
+            }
+        }
+    }
+
+    fn has_ready(&self) -> bool {
+        if self.fault.load(Ordering::Acquire) != EPOLL_FAULT_NONE
+            || self.wake_port.callback_pending.load(Ordering::Acquire)
+        {
+            return true;
+        }
+        let mut state = self.state.lock();
+        if !state.pending.is_empty() || state.core.needs_rescan() {
+            return true;
+        }
+        !matches!(state.core.prepare_delivery(), Ok(None))
+    }
+
+    fn prepare_deliveries(self: &Arc<Self>, maximum: usize) -> AxResult<EpollBatch> {
+        self.drain_pending()?;
+        self.recover_core()?;
+        self.check_fault()?;
+
+        let limit = maximum.min(EPOLL_CORE_CAPACITY);
+        let mut deliveries = Vec::new();
+        deliveries
+            .try_reserve_exact(limit)
+            .map_err(|_| AxError::NoMemory)?;
+        while deliveries.len() < limit {
+            let next = {
+                let mut state = self.state.lock();
+                let Some(ready) = state.core.begin_delivery().map_err(map_epoll_error)? else {
+                    break;
+                };
+                let token = ready.delivery.interest();
+                let Some(control) = state
+                    .record(token)
+                    .map(|record| Arc::clone(&record.control))
+                else {
+                    let _ = state
+                        .core
+                        .finish_delivery(ready.delivery, DeliveryOutcome::Fault);
+                    drop(state);
+                    self.set_fault(EPOLL_FAULT_CORE_INVARIANT);
+                    return Err(AxError::BadState);
+                };
+                PreparedDelivery { ready, control }
+            };
+            if let Err(error) = next.control.ensure_armed() {
+                let mut state = self.state.lock();
+                let _ = state
+                    .core
+                    .finish_delivery(next.ready.delivery, DeliveryOutcome::Fault);
+                drop(state);
+                self.wake_port.poll_ready.wake();
+                return Err(error);
+            }
+            deliveries.push(next);
+        }
+        if deliveries.is_empty() {
+            Err(AxError::WouldBlock)
+        } else {
+            Ok(EpollBatch {
+                inner: Arc::clone(self),
+                deliveries: Some(deliveries),
+            })
+        }
+    }
+
+    fn finish_deliveries(&self, deliveries: Vec<PreparedDelivery>, copied_prefix: usize) {
+        for (index, delivery) in deliveries.into_iter().enumerate() {
+            let copied = index < copied_prefix;
+            let outcome = delivery_outcome(index, copied_prefix, || {
+                ready_from_io(delivery.control.file.poll())
+            });
+            let result = self
+                .state
+                .lock()
+                .core
+                .finish_delivery(delivery.ready.delivery, outcome);
+            match result {
+                Ok(()) | Err(EpollError::StaleToken) => {}
+                Err(EpollError::ReadyQueueFull) => {
+                    self.wake_port.poll_ready.wake();
+                }
+                Err(error) => {
+                    error!("epoll delivery completion invariant failed: {error:?}");
+                    self.set_fault(EPOLL_FAULT_CORE_INVARIANT);
+                }
+            }
+            if copied {
+                delivery.control.disable_after_one_shot();
+            }
+        }
+        if self.has_ready() {
+            self.wake_port.poll_ready.wake();
+        }
+    }
+}
+
+impl Drop for EpollInner {
+    fn drop(&mut self) {
+        let state = self.state.get_mut();
+        loop {
+            let Some(slot) = state.by_slot.iter().position(Option::is_some) else {
+                break;
+            };
+            let Some(record) = state.by_slot[slot].take() else {
+                error!("epoll adapter slot disappeared during exclusive teardown");
+                break;
+            };
+            state.by_key.remove(&record.key);
+            state.pending.remove(record.token);
+            let retired = state.core.remove(record.token).ok();
+            let graph_result = graph_domain().and_then(|domain| {
+                domain
+                    .lock()
+                    .remove_interest(record.edge)
+                    .map_err(map_graph_error)
+            });
+            if let Err(error) = graph_result {
+                error!("epoll graph edge cleanup failed: {error:?}");
+            }
+            record.control.deactivate();
+            drop(record);
+            drop(retired);
+        }
+        if let Err(error) = graph_domain()
+            .and_then(|domain| domain.lock().unregister(self.node).map_err(map_graph_error))
+        {
+            error!("epoll graph node cleanup failed: {error:?}");
+        }
+    }
+}
+
+struct PreparedDelivery {
+    ready: ReadyEvent<u64>,
+    control: Arc<InterestControl>,
+}
+
+fn delivery_outcome(
+    index: usize,
+    copied_prefix: usize,
+    still_ready: impl FnOnce() -> ReadyMask,
+) -> DeliveryOutcome {
+    if index < copied_prefix {
+        DeliveryOutcome::Copied {
+            still_ready: still_ready(),
+        }
+    } else {
+        DeliveryOutcome::Fault
+    }
+}
+
+pub struct EpollBatch {
+    inner: Arc<EpollInner>,
+    deliveries: Option<Vec<PreparedDelivery>>,
+}
+
+impl EpollBatch {
+    pub fn len(&self) -> usize {
+        self.deliveries.as_ref().map_or(0, Vec::len)
+    }
+
+    /// Returns one already-prepared event without changing delivery ownership.
+    pub fn event(&self, index: usize) -> Option<EpollEvent> {
+        self.deliveries
+            .as_ref()?
+            .get(index)
+            .map(|delivery| EpollEvent {
+                events: io_from_ready(delivery.ready.events),
+                user_data: delivery.ready.user_data,
+            })
+    }
+
+    /// Commits the copied prefix and faults/requeues every remaining delivery.
+    pub fn complete_prefix(mut self, copied: usize) -> usize {
+        let deliveries = self.deliveries.take().unwrap_or_default();
+        let copied = copied.min(deliveries.len());
+        self.inner.finish_deliveries(deliveries, copied);
+        copied
+    }
+}
+
+impl Drop for EpollBatch {
+    fn drop(&mut self) {
+        if let Some(deliveries) = self.deliveries.take() {
+            self.inner.finish_deliveries(deliveries, 0);
+        }
     }
 }
 
@@ -830,395 +1021,235 @@ pub struct Epoll {
 impl Epoll {
     pub fn new() -> AxResult<Self> {
         Ok(Self {
-            inner: Arc::try_new(EpollInner::default()).map_err(|_| AxError::NoMemory)?,
+            inner: EpollInner::try_new()?,
         })
     }
 
-    #[inline]
-    fn id(&self) -> usize {
-        Arc::as_ptr(&self.inner) as usize
-    }
-
-    fn child_descriptions(&self) -> AxResult<Vec<Arc<FileDescription>>> {
-        let mut children = Vec::new();
-        loop {
-            let required = self.inner.interests.lock().len();
-            if children.capacity() < required {
-                children
-                    .try_reserve(required)
-                    .map_err(|_| AxError::NoMemory)?;
-            }
-
-            let interests = self.inner.interests.lock();
-            if interests.len() > children.capacity() {
-                drop(interests);
-                continue;
-            }
-            for key in interests.keys() {
-                children.push(Arc::clone(&key.file));
-            }
-            return Ok(children);
-        }
-    }
-
-    fn reaches_epoll_id(
-        &self,
-        target_id: usize,
-        stack: &mut Vec<usize>,
-        budget: &mut GraphWalkBudget,
-    ) -> AxResult<bool> {
-        budget.visit()?;
-        let id = self.id();
-        if id == target_id {
-            return Ok(true);
-        }
-        if stack.contains(&id) {
-            return Ok(false);
-        }
-
-        stack.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-        stack.push(id);
-        let result = (|| {
-            for child in self.child_descriptions()? {
-                if let Some(epoll) = child.inner.downcast_ref::<Epoll>()
-                    && epoll.reaches_epoll_id(target_id, stack, budget)?
-                {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        })();
-        stack.pop();
-        result
-    }
-
-    fn max_nested_depth(
-        &self,
-        stack: &mut Vec<usize>,
-        budget: &mut GraphWalkBudget,
-    ) -> AxResult<usize> {
-        budget.visit()?;
-        let id = self.id();
-        if stack.contains(&id) || stack.len() > EPOLL_MAX_NESTS {
-            return Ok(EPOLL_MAX_NESTS.saturating_add(1));
-        }
-
-        stack.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-        stack.push(id);
-        let result = (|| {
-            let mut max_depth = 0usize;
-            for child in self.child_descriptions()? {
-                let depth = if let Some(epoll) = child.inner.downcast_ref::<Epoll>() {
-                    epoll.max_nested_depth(stack, budget)?.saturating_add(1)
-                } else {
-                    1
-                };
-                max_depth = max_depth.max(depth);
-            }
-            Ok(max_depth)
-        })();
-        stack.pop();
-        result
-    }
-
-    fn validate_combined_depth(parent_depth: usize, child_depth: usize) -> AxResult<()> {
-        if parent_depth
-            .checked_add(child_depth)
-            .is_none_or(|depth| depth > EPOLL_MAX_NESTS)
-        {
-            return Err(LinuxError::ELOOP.into());
-        }
-        Ok(())
-    }
-
-    fn validate_add_target(&self, key: &EntryKey) -> AxResult<()> {
-        match FileLikeKind::from_file_like(key.get_file()) {
-            FileLikeKind::Regular | FileLikeKind::Directory => {
-                return Err(LinuxError::EPERM.into());
-            }
-            FileLikeKind::Fifo | FileLikeKind::Socket | FileLikeKind::Other => {}
-        }
-
-        let mut parent_stack = Vec::new();
-        let parent_depth = self
-            .inner
-            .max_parent_depth(&mut parent_stack, &mut GraphWalkBudget::new())?;
-
-        let Some(epoll) = key.get_file().inner.downcast_ref::<Epoll>() else {
-            return Self::validate_combined_depth(parent_depth, 1);
+    fn target(fd: i32) -> AxResult<(EpollKey, Arc<FileDescription>)> {
+        let number = FdNumber::from_i32(fd).ok_or(AxError::BadFileDescriptor)?;
+        let file = get_file_description(fd)?;
+        let key = EpollKey {
+            ofd: file.id().linux_id(),
+            fd: number,
         };
-
-        if epoll.id() == self.id() {
-            return Err(AxError::InvalidInput);
-        }
-        let mut stack = Vec::new();
-        let child_depth = epoll
-            .max_nested_depth(&mut stack, &mut GraphWalkBudget::new())?
-            .saturating_add(1);
-        Self::validate_combined_depth(parent_depth, child_depth)?;
-
-        if epoll.reaches_epoll_id(self.id(), &mut stack, &mut GraphWalkBudget::new())? {
-            return Err(LinuxError::ELOOP.into());
-        }
-
-        Ok(())
+        Ok((key, file))
     }
 
-    fn try_new_interest(
-        &self,
-        key: EntryKey,
-        event: EpollEvent,
-        flags: EpollFlags,
-    ) -> AxResult<Arc<EpollInterest>> {
-        let reverse_parent =
-            key.get_file().inner.downcast_ref::<Epoll>().map(|child| {
-                ReverseParentRegistration::new(Arc::downgrade(&child.inner), self.id())
-            });
-        let interest = Arc::try_new(EpollInterest::new(key, event, flags, reverse_parent))
-            .map_err(|_| AxError::NoMemory)?;
-        let waker = Waker::from(
-            Arc::try_new(InterestWaker {
-                epoll: Arc::downgrade(&self.inner),
-                interest: Arc::downgrade(&interest),
-            })
-            .map_err(|_| AxError::NoMemory)?,
-        );
-        interest.install_waker(waker);
-        Ok(interest)
+    fn validate_target(file: &FileDescription) -> AxResult<()> {
+        match FileLikeKind::from_file_like(file) {
+            FileLikeKind::Regular | FileLikeKind::Directory => Err(LinuxError::EPERM.into()),
+            FileLikeKind::Fifo | FileLikeKind::Socket | FileLikeKind::Other => Ok(()),
+        }
     }
 
-    // only register waker, not add to ready queue
-    fn register_waker_only(&self, interest: &Arc<EpollInterest>) {
-        if !interest.is_enabled() || !interest.try_arm_waker() {
-            return;
-        }
-
-        let Some(waker) = interest.registered_waker() else {
-            interest.disarm_waker();
-            return;
-        };
-        if !interest.is_enabled() {
-            interest.disarm_waker();
-            return;
-        }
-
-        let mut context = Context::from_waker(waker);
-        interest
-            .key
-            .get_file()
-            .register(&mut context, interest.event.events);
-    }
-
-    // for add/modify
-    fn check_and_register_waker(&self, interest: &Arc<EpollInterest>) {
-        if !interest.is_enabled() {
-            return;
-        }
-
-        let file = interest.key.get_file();
-        let current = file.poll() & interest.event.events;
-
-        if !current.is_empty() {
-            self.inner.enqueue_ready(interest, false);
-        } else {
-            self.register_waker_only(interest);
-
-            let current = file.poll() & interest.event.events;
-            if !current.is_empty() {
-                self.inner.enqueue_ready(interest, false);
-            }
-        }
+    fn child_node(file: &FileDescription) -> Option<GraphNodeToken> {
+        file.inner
+            .downcast_ref::<Epoll>()
+            .map(|child| child.inner.node)
     }
 
     pub fn add(&self, fd: i32, event: EpollEvent, flags: EpollFlags) -> AxResult<()> {
-        let key = EntryKey::new(fd)?;
-        let interest = self.try_new_interest(key.clone(), event, flags)?;
-        let child_inner = key
-            .get_file()
-            .inner
-            .downcast_ref::<Epoll>()
-            .map(|child| Arc::clone(&child.inner));
-        // Linux serializes graph validation with edge publication. Without a
-        // global transaction, concurrent A<-B and B<-A additions can both pass
-        // their snapshots and create an uncollectable FileDescription cycle.
-        let _graph = EPOLL_GRAPH_LOCK.lock();
-        self.validate_add_target(&key)?;
-
-        // Phase 1: make every allocation fallible before either graph
-        // direction becomes visible. Deletes and modifies cannot consume the
-        // reserved forward/queue capacity while graph additions are globally
-        // serialized.
-        let interest_count_after = {
-            let mut interests = self.inner.interests.lock();
-            if interests.contains_key(&key) {
-                return Err(AxError::AlreadyExists);
-            }
-            if interests.len() >= EPOLL_MAX_INTERESTS {
-                return Err(LinuxError::ENOSPC.into());
-            }
-            let count = interests.len().checked_add(1).ok_or(AxError::NoMemory)?;
-            interests.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-            count
+        let (key, file) = Self::target(fd)?;
+        Self::validate_target(&file)?;
+        let interest = interest_from_io(event.events)?;
+        let mode = InterestMode {
+            edge: flags.contains(EpollFlags::EDGE_TRIGGER),
+            one_shot: flags.contains(EpollFlags::ONESHOT),
+            exclusive: false,
         };
-        self.inner
-            .ready_queue
-            .lock()
-            .try_admit_interest(interest_count_after)?;
-        if let Some(child) = &child_inner {
-            child.parents.lock().try_admit(self.id())?;
-        }
+        let control = InterestControl::try_new(
+            &self.inner.wake_port,
+            Arc::clone(&file),
+            event.events,
+            mode.one_shot,
+        )?;
+        let initial_ready = match control.check_arm_check() {
+            Ok(ready) => ready,
+            Err(error) => {
+                control.deactivate();
+                return Err(error);
+            }
+        };
 
-        // Phase 2: publish reverse ownership first and then the strong forward
-        // edge. There are no fallible operations after reverse publication.
-        let mut interests = self.inner.interests.lock();
-        if interests.contains_key(&key) {
+        let child = Self::child_node(&file);
+        let domain = graph_domain()?;
+        let mut graph = domain.lock();
+        let mut state = self.inner.state.lock();
+        if state.by_key.contains_key(&key) {
+            drop(state);
+            drop(graph);
+            control.deactivate();
             return Err(AxError::AlreadyExists);
         }
-        let retired_parent = if let Some(child) = &child_inner {
-            let mut parents = child.parents.lock();
-            let retired = parents.add_admitted(self.id(), &self.inner)?;
-            interest.commit_reverse_parent();
-            retired
-        } else {
-            None
+        let edge = match graph.add_interest(self.inner.node, child) {
+            Ok(edge) => edge,
+            Err(error) => {
+                drop(state);
+                drop(graph);
+                control.deactivate();
+                return Err(map_graph_error(error));
+            }
         };
-        let replaced = interests.insert(key, Arc::clone(&interest));
-        drop(interests);
-        drop(replaced);
-        drop(retired_parent);
-        drop(_graph);
-        trace!("Epoll add fd: {} interest {:?} ", fd, interest.event.events);
-        self.check_and_register_waker(&interest);
+        let published =
+            LinuxEpollInterest::new(key, interest, mode, event.user_data, control.clone());
+        let token = match state.core.add(published) {
+            Ok(token) => token,
+            Err(error) => {
+                let core_error = error.error;
+                let (_, _, _, _, returned) = error.interest.into_parts();
+                let rollback = graph.remove_interest(edge);
+                drop(state);
+                drop(graph);
+                control.deactivate();
+                drop(returned);
+                if let Err(error) = rollback {
+                    error!("epoll ADD graph rollback failed: {error:?}");
+                    self.inner.set_fault(EPOLL_FAULT_CORE_INVARIANT);
+                }
+                return Err(map_epoll_error(core_error));
+            }
+        };
+        if state.by_slot.get(token.slot()).is_none_or(Option::is_some) {
+            let retired = state.core.remove(token).ok();
+            let rollback = graph.remove_interest(edge);
+            drop(state);
+            drop(graph);
+            control.deactivate();
+            drop(retired);
+            if rollback.is_err() {
+                self.inner.set_fault(EPOLL_FAULT_CORE_INVARIANT);
+            }
+            return Err(AxError::BadState);
+        }
+        state.by_key.insert(key, token);
+        state.by_slot[token.slot()] = Some(InterestRecord {
+            key,
+            token,
+            edge,
+            control: control.clone(),
+        });
+        let publication = control.publish_token();
+        drop(state);
+        drop(graph);
+
+        if publication.target_closed {
+            self.inner.remove_closed_target(token, &control);
+            return Ok(());
+        }
+        if publication.source_woke {
+            control.registration_fired();
+            self.inner.enqueue_pending(token, &control);
+        }
+        self.inner.notify_ready(token, initial_ready)?;
         Ok(())
     }
 
     pub fn modify(&self, fd: i32, event: EpollEvent, flags: EpollFlags) -> AxResult<()> {
-        let key = EntryKey::new(fd)?;
-        let interest = self.try_new_interest(key.clone(), event, flags)?;
-
-        let mut interests = self.inner.interests.lock();
-        let old = {
-            let slot = interests.get_mut(&key).ok_or(AxError::NotFound)?;
-            let old = Arc::clone(slot);
-            old.transfer_reverse_parent_to(&interest);
-            old.deactivate();
-            *slot = Arc::clone(&interest);
-            old
+        let (key, file) = Self::target(fd)?;
+        let interest = interest_from_io(event.events)?;
+        let mode = InterestMode {
+            edge: flags.contains(EpollFlags::EDGE_TRIGGER),
+            one_shot: flags.contains(EpollFlags::ONESHOT),
+            exclusive: false,
         };
-        let mut ready_queue = self.inner.ready_queue.lock();
-        let stale_ready = ready_queue.remove(&old);
-        self.inner.refresh_rescan_hint_locked(&interests);
-        drop(ready_queue);
-        drop(interests);
-        drop(stale_ready);
-        trace!(
-            "Epoll: modify fd={}, events={:?}",
-            fd, interest.event.events
-        );
-        // reset waker
-        self.check_and_register_waker(&interest);
+        let control =
+            InterestControl::try_new(&self.inner.wake_port, file, event.events, mode.one_shot)?;
+        let initial_ready = match control.check_arm_check() {
+            Ok(ready) => ready,
+            Err(error) => {
+                control.deactivate();
+                return Err(error);
+            }
+        };
+
+        let domain = graph_domain()?;
+        let graph = domain.lock();
+        let mut state = self.inner.state.lock();
+        let Some(old_token) = state.by_key.get(&key).copied() else {
+            drop(state);
+            drop(graph);
+            control.deactivate();
+            return Err(AxError::NotFound);
+        };
+        let replacement =
+            LinuxEpollInterest::new(key, interest, mode, event.user_data, control.clone());
+        let (token, retired) = match state.core.modify(old_token, replacement) {
+            Ok(result) => result,
+            Err(error) => {
+                let core_error = error.error;
+                let (_, _, _, _, returned) = error.interest.into_parts();
+                drop(state);
+                drop(graph);
+                control.deactivate();
+                drop(returned);
+                return Err(map_epoll_error(core_error));
+            }
+        };
+        state.pending.remove(old_token);
+        let Some(old_record) = state.by_slot[old_token.slot()].take() else {
+            drop(state);
+            drop(graph);
+            control.deactivate();
+            drop(retired);
+            self.inner.set_fault(EPOLL_FAULT_CORE_INVARIANT);
+            return Err(AxError::BadState);
+        };
+        state.by_key.insert(key, token);
+        state.by_slot[token.slot()] = Some(InterestRecord {
+            key,
+            token,
+            edge: old_record.edge,
+            control: control.clone(),
+        });
+        let publication = control.publish_token();
+        drop(state);
+        drop(graph);
+
+        old_record.control.deactivate();
+        let (_, _, _, _, retired_control) = retired.into_parts();
+        drop(retired_control);
+        drop(old_record);
+        if publication.target_closed {
+            self.inner.remove_closed_target(token, &control);
+            return Ok(());
+        }
+        if publication.source_woke {
+            control.registration_fired();
+            self.inner.enqueue_pending(token, &control);
+        }
+        self.inner.notify_ready(token, initial_ready)?;
         Ok(())
     }
 
     pub fn delete(&self, fd: i32) -> AxResult<()> {
-        let key = EntryKey::new(fd)?;
-        let mut interests = self.inner.interests.lock();
-        let interest = interests.remove(&key).ok_or(AxError::NotFound)?;
-        interest.deactivate();
-        let mut ready_queue = self.inner.ready_queue.lock();
-        let stale_ready = ready_queue.remove(&interest);
-        self.inner.refresh_rescan_hint_locked(&interests);
-        drop(ready_queue);
-        drop(interests);
-        drop(stale_ready);
-        interest.release_reverse_parent();
-        trace!("Epoll: delete fd={fd}");
-        Ok(())
+        let (key, _) = Self::target(fd)?;
+        let domain = graph_domain()?;
+        let mut graph = domain.lock();
+        let mut state = self.inner.state.lock();
+        let token = state.by_key.get(&key).copied().ok_or(AxError::NotFound)?;
+        let retired = state.core.remove(token).map_err(map_epoll_error)?;
+        let Some(record) = state.by_slot[token.slot()].take() else {
+            drop(state);
+            drop(graph);
+            self.inner.set_fault(EPOLL_FAULT_CORE_INVARIANT);
+            drop(retired);
+            return Err(AxError::BadState);
+        };
+        state.by_key.remove(&key);
+        state.pending.remove(token);
+        let graph_result = graph.remove_interest(record.edge);
+        drop(state);
+        drop(graph);
+
+        record.control.deactivate();
+        let (_, _, _, _, retired_control) = retired.into_parts();
+        drop(retired_control);
+        drop(record);
+        graph_result.map_err(map_graph_error)
     }
 
-    pub fn poll_events(&self, out: &mut [epoll_event]) -> AxResult<usize> {
-        trace!("Epoll: poll_events called, out.len()={}", out.len());
-        let mut count = 0;
-        self.inner.refill_from_rescan();
-        // Scan a snapshot of the ready-list token count. LT entries rotated to
-        // the tail and callbacks arriving during this transfer belong to the
-        // next wait, matching Linux's detached transfer-list behavior instead
-        // of returning the same still-ready fd `maxevents` times.
-        let mut scan_budget = self.inner.ready_queue.lock().len();
-        if scan_budget == 0 && self.inner.rescan_needed.load(Ordering::Acquire) {
-            scan_budget = 1;
-        }
-        loop {
-            if count >= out.len() || scan_budget == 0 {
-                break;
-            }
-            scan_budget -= 1;
-
-            let (retired_weak, popped, had_queue_entry) = {
-                let mut queue = self.inner.ready_queue.lock();
-                let weak = queue.pop_front();
-                let had_queue_entry = weak.is_some();
-                let popped = weak.as_ref().and_then(Weak::upgrade).map(|interest| {
-                    let observed_wakes = interest.wake_sequence();
-                    (interest, observed_wakes)
-                });
-                (weak, popped, had_queue_entry)
-            };
-            drop(retired_weak);
-
-            let (interest, observed_wakes) = if let Some(popped) = popped {
-                popped
-            } else if had_queue_entry {
-                continue;
-            } else {
-                let Some(popped) = self.inner.take_rescan_direct() else {
-                    break;
-                };
-                popped
-            };
-
-            trace!(
-                "Epoll: consuming ready interest for fd={}, events={:?}",
-                interest.key.fd, interest.event.events
-            );
-
-            // Source wait registrations are consumed by wake(). Install the
-            // next callback before polling; the poll that follows closes the
-            // usual register-vs-readiness race without allocating a new waker.
-            self.register_waker_only(&interest);
-            match interest.consume(interest.key.get_file()) {
-                ConsumeResult::EventAndKeep(event) => {
-                    out[count] = epoll_event {
-                        events: event.events.bits(),
-                        data: event.user_data,
-                    };
-                    count += 1;
-                    if !self.inner.requeue_consumed(&interest) {
-                        // The direct fallback may have no queue capacity at
-                        // all. Return this event now; its LT readiness remains
-                        // coalesced for the next bounded rescan.
-                        break;
-                    }
-                }
-                ConsumeResult::EventAndRemove(event) => {
-                    out[count] = epoll_event {
-                        events: event.events.bits(),
-                        data: event.user_data,
-                    };
-                    count += 1;
-                    self.inner.release_consumed(&interest, observed_wakes);
-                }
-                ConsumeResult::NoEvent => {
-                    self.inner.release_consumed(&interest, observed_wakes);
-                }
-            }
-        }
-
-        if count == 0 {
-            Err(AxError::WouldBlock)
-        } else {
-            Ok(count)
-        }
+    pub fn prepare_events(&self, maximum: usize) -> AxResult<EpollBatch> {
+        self.inner.prepare_deliveries(maximum)
     }
 }
 
@@ -1232,48 +1263,55 @@ impl FileLike for Epoll {
     }
 
     fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
-        // epoll_wait's timeout controls waiting. The OFD nevertheless retains
-        // O_NONBLOCK just as Linux's generic struct file does.
         Ok(())
     }
 }
 
 impl Pollable for Epoll {
     fn poll(&self) -> IoEvents {
-        if self.inner.ready_queue.lock().is_empty()
-            && !self.inner.rescan_needed.load(Ordering::Acquire)
-        {
-            IoEvents::empty()
+        if self.inner.has_ready() {
+            IoEvents::READABLE
         } else {
-            IoEvents::IN
+            IoEvents::empty()
         }
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.contains(IoEvents::IN) {
-            self.inner.poll_ready.register(context.waker());
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+        if events.contains(IoEvents::READABLE) {
+            PollRegistration::single(&self.inner.wake_port.poll_ready, context.waker())
+        } else {
+            PollRegistration::empty()
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloc::{
-        sync::{Arc, Weak},
-        task::Wake,
-        vec::Vec,
-    };
+    use alloc::{borrow::Cow, sync::Arc, task::Wake};
     use core::{
         sync::atomic::{AtomicUsize, Ordering},
-        task::Waker,
+        task::{Context, Waker},
     };
 
-    use super::{
-        EPOLL_MAX_NESTS, EPOLL_WAITER_SLOTS, Epoll, EpollInner, EpollInterest, GraphWalkBudget,
-        ReadyQueue, ReadyWaiters,
-    };
+    use super::*;
 
     struct CountingWake(AtomicUsize);
+
+    struct CloseTestFile {
+        source: PollSet<1>,
+    }
+
+    impl CloseTestFile {
+        fn new() -> Self {
+            Self {
+                source: PollSet::new(),
+            }
+        }
+    }
 
     impl Wake for CountingWake {
         fn wake(self: Arc<Self>) {
@@ -1281,131 +1319,214 @@ mod tests {
         }
     }
 
-    fn add_parent(child: &Arc<EpollInner>, parent: &Arc<EpollInner>) {
-        let parent_id = Arc::as_ptr(parent) as usize;
-        let retired = {
-            let mut parents = child.parents.lock();
-            parents.try_admit(parent_id).unwrap();
-            parents.add_admitted(parent_id, parent).unwrap()
-        };
-        drop(retired);
-    }
+    impl Pollable for CloseTestFile {
+        fn poll(&self) -> IoEvents {
+            IoEvents::empty()
+        }
 
-    fn parent_depth(inner: &EpollInner) -> usize {
-        inner
-            .max_parent_depth(&mut Vec::new(), &mut GraphWalkBudget::new())
-            .unwrap()
-    }
-
-    #[test]
-    fn ready_admission_reserves_all_interests_and_a_spare() {
-        let mut queue = ReadyQueue::default();
-        for interest_count in 1..=64 {
-            queue.try_admit_interest(interest_count).unwrap();
-            assert!(queue.entries.capacity() > interest_count);
+        fn register<'a>(
+            &'a self,
+            context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+            PollRegistration::single(&self.source, context.waker())
         }
     }
 
-    #[test]
-    fn ready_push_reports_full_without_growing_or_panicking() {
-        let mut queue = ReadyQueue::default();
-        queue.try_admit_interest(1).unwrap();
-        let capacity = queue.entries.capacity();
-        while queue.entries.len() < capacity {
-            assert!(
-                queue
-                    .push_back_noalloc(Weak::<EpollInterest>::new())
-                    .is_ok()
-            );
+    impl FileLike for CloseTestFile {
+        fn stat(&self) -> AxResult<Kstat> {
+            Err(AxError::InvalidInput)
         }
 
-        assert!(
-            queue
-                .push_back_noalloc(Weak::<EpollInterest>::new())
-                .is_err()
+        fn path(&self) -> AxResult<Cow<'_, str>> {
+            Ok(Cow::Borrowed("epoll-close-test"))
+        }
+
+        fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+            Ok(())
+        }
+    }
+
+    fn token(core: &mut EpollCore<u64, ()>, fd: u32) -> EpollToken {
+        core.add(LinuxEpollInterest::new(
+            EpollKey {
+                ofd: thekernel_linux_fd::OfdId::new(fd as u64 + 1).unwrap(),
+                fd: FdNumber::new(fd),
+            },
+            InterestMask::IN,
+            InterestMode::default(),
+            0,
+            (),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn pending_queue_is_exactly_bounded_and_removable() {
+        let id = EpollId::new(1).unwrap();
+        let mut core = EpollCore::<u64, ()>::try_new(id, 3).unwrap();
+        let first = token(&mut core, 0);
+        let second = token(&mut core, 1);
+        let third = token(&mut core, 2);
+        let mut queue = PendingQueue::try_new(2).unwrap();
+        assert!(queue.push(first).is_ok());
+        assert!(queue.push(second).is_ok());
+        assert!(queue.push(third).is_err());
+        queue.remove(first);
+        assert_eq!(queue.pop(), Some(second));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn copied_prefix_faults_and_requeues_only_suffix() {
+        let id = EpollId::new(2).unwrap();
+        let mut core = EpollCore::<u64, ()>::try_new(id, 2).unwrap();
+        let first = token(&mut core, 0);
+        let second = token(&mut core, 1);
+        core.notify(first, ReadyMask::IN).unwrap();
+        core.notify(second, ReadyMask::IN).unwrap();
+
+        let first_delivery = core.begin_delivery().unwrap().unwrap();
+        let second_delivery = core.begin_delivery().unwrap().unwrap();
+        assert_eq!(first_delivery.delivery.interest(), first);
+        assert_eq!(second_delivery.delivery.interest(), second);
+
+        for (index, delivery) in [first_delivery, second_delivery].into_iter().enumerate() {
+            core.finish_delivery(
+                delivery.delivery,
+                delivery_outcome(index, 1, || ReadyMask::EMPTY),
+            )
+            .unwrap();
+        }
+
+        let retried = core.begin_delivery().unwrap().unwrap();
+        assert_eq!(retried.delivery.interest(), second);
+        core.finish_delivery(
+            retried.delivery,
+            DeliveryOutcome::Copied {
+                still_ready: ReadyMask::EMPTY,
+            },
+        )
+        .unwrap();
+        assert!(core.begin_delivery().unwrap().is_none());
+    }
+
+    #[test]
+    fn io_masks_do_not_depend_on_generic_bit_layout() {
+        let io = IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::HANGUP;
+        let interest = interest_from_io(io).unwrap();
+        assert_eq!(
+            interest.bits(),
+            InterestMask::IN.bits() | InterestMask::OUT.bits()
         );
-        assert_eq!(queue.entries.capacity(), capacity);
-        assert_eq!(queue.entries.len(), capacity);
+        let ready = ready_from_io(io);
+        assert_eq!(io_from_ready(ready), io);
     }
 
     #[test]
-    fn ready_waiters_coalesce_duplicate_task_registration() {
-        let waiters = ReadyWaiters::default();
+    fn ready_waiters_retain_each_owned_registration() {
+        let waiters = PollSet::<EPOLL_WAITER_SLOTS>::new();
         let counter = Arc::new(CountingWake(AtomicUsize::new(0)));
         let waker = Waker::from(Arc::clone(&counter));
-
-        waiters.register(&waker);
-        waiters.register(&waker);
-
-        assert_eq!(waiters.wake(), 1);
-        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+        let _first = waiters.register(&waker).unwrap();
+        let _second = waiters.register(&waker).unwrap();
+        assert_eq!(waiters.wake(), 2);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 2);
     }
 
     #[test]
-    fn ready_waiter_overflow_wakes_evicted_slot_without_allocating() {
-        let waiters = ReadyWaiters::default();
-        let mut counters = Vec::new();
-        for _ in 0..=EPOLL_WAITER_SLOTS {
-            let counter = Arc::new(CountingWake(AtomicUsize::new(0)));
-            waiters.register(&Waker::from(Arc::clone(&counter)));
-            counters.push(counter);
-        }
+    fn per_instance_core_storage_has_a_global_charge() {
+        let before = EPOLL_CORE_SLOTS.load(Ordering::Acquire);
+        let charge = EpollCoreCharge::try_new(7).unwrap();
+        assert_eq!(EPOLL_CORE_SLOTS.load(Ordering::Acquire), before + 7);
+        drop(charge);
+        assert_eq!(EPOLL_CORE_SLOTS.load(Ordering::Acquire), before);
+    }
 
-        assert_eq!(counters[0].0.load(Ordering::Relaxed), 1);
-        assert_eq!(waiters.wake(), EPOLL_WAITER_SLOTS);
+    #[test]
+    fn callbacks_publish_hints_for_task_context_source_and_close_work() {
+        let epoll = Epoll::new().unwrap();
+        let test_file = Arc::new(CloseTestFile::new());
+        let file = FileDescription::new(test_file.clone()).unwrap();
+        file.begin_descriptor_publication().unwrap().commit();
+        let key = EpollKey {
+            ofd: file.id().linux_id(),
+            fd: FdNumber::new(9),
+        };
+        let mode = InterestMode::default();
+        let control = InterestControl::try_new(
+            &epoll.inner.wake_port,
+            file.clone(),
+            IoEvents::READABLE,
+            false,
+        )
+        .unwrap();
+        assert!(control.check_arm_check().unwrap().is_empty());
+
+        let domain = graph_domain().unwrap();
+        let mut graph = domain.lock();
+        let mut state = epoll.inner.state.lock();
+        let edge = graph.add_interest(epoll.inner.node, None).unwrap();
+        let token = state
+            .core
+            .add(LinuxEpollInterest::new(
+                key,
+                InterestMask::IN,
+                mode,
+                0,
+                control.clone(),
+            ))
+            .unwrap();
+        state.by_key.insert(key, token);
+        state.by_slot[token.slot()] = Some(InterestRecord {
+            key,
+            token,
+            edge,
+            control: control.clone(),
+        });
+        let publication = control.publish_token();
+        assert!(!publication.source_woke);
+        assert!(!publication.target_closed);
+        drop(state);
+        drop(graph);
+
+        let state = epoll.inner.state.lock();
+        assert_eq!(test_file.source.wake(), 1);
+        assert!(state.record(token).is_some());
         assert!(
-            counters
-                .iter()
-                .all(|counter| counter.0.load(Ordering::Relaxed) == 1)
+            epoll
+                .inner
+                .wake_port
+                .callback_pending
+                .load(Ordering::Acquire)
         );
-    }
+        drop(state);
 
-    #[test]
-    fn evicted_waiter_can_re_register_before_the_real_event() {
-        let waiters = ReadyWaiters::default();
-        let mut counters = Vec::new();
-        let mut wakers = Vec::new();
-        for _ in 0..=EPOLL_WAITER_SLOTS {
-            let counter = Arc::new(CountingWake(AtomicUsize::new(0)));
-            let waker = Waker::from(Arc::clone(&counter));
-            waiters.register(&waker);
-            counters.push(counter);
-            wakers.push(waker);
-        }
+        epoll.inner.drain_callback_hints();
+        let state = epoll.inner.state.lock();
+        assert!(state.record(token).is_some());
+        assert!(!state.pending.is_empty());
+        assert!(control.pending.load(Ordering::Acquire));
+        drop(state);
 
-        assert_eq!(counters[0].0.load(Ordering::Relaxed), 1);
-        waiters.register(&wakers[0]);
-        assert_eq!(counters[1].0.load(Ordering::Relaxed), 1);
-        waiters.wake();
-        assert_eq!(counters[0].0.load(Ordering::Relaxed), 2);
-    }
+        let state = epoll.inner.state.lock();
+        file.descriptor_closed();
+        assert!(state.record(token).is_some());
+        assert!(
+            epoll
+                .inner
+                .wake_port
+                .callback_pending
+                .load(Ordering::Acquire)
+        );
+        drop(state);
 
-    #[test]
-    fn reverse_parents_reject_a_late_leaf_beyond_the_depth_limit() {
-        let mut chain = Vec::new();
-        for _ in 0..=EPOLL_MAX_NESTS {
-            chain.push(Arc::new(EpollInner::default()));
-        }
-        for index in 0..EPOLL_MAX_NESTS {
-            add_parent(&chain[index], &chain[index + 1]);
-        }
+        epoll.inner.drain_callback_hints();
 
-        assert_eq!(parent_depth(&chain[0]), EPOLL_MAX_NESTS);
-        assert!(Epoll::validate_combined_depth(EPOLL_MAX_NESTS - 1, 1).is_ok());
-        assert!(Epoll::validate_combined_depth(parent_depth(&chain[0]), 1).is_err());
-    }
-
-    #[test]
-    fn reverse_parent_refcounts_duplicate_epoll_edges() {
-        let child = Arc::new(EpollInner::default());
-        let parent = Arc::new(EpollInner::default());
-        let parent_id = Arc::as_ptr(&parent) as usize;
-        add_parent(&child, &parent);
-        add_parent(&child, &parent);
-
-        child.remove_parent(parent_id);
-        assert_eq!(parent_depth(&child), 1);
-        child.remove_parent(parent_id);
-        assert_eq!(parent_depth(&child), 0);
+        let state = epoll.inner.state.lock();
+        assert!(state.record(token).is_none());
+        assert!(!state.by_key.contains_key(&key));
+        drop(state);
+        assert!(!control.is_source_enabled());
     }
 }

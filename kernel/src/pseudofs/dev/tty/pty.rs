@@ -1,5 +1,5 @@
 use alloc::{boxed::Box, sync::Arc};
-use core::task::{Context, Waker};
+use core::task::Waker;
 
 use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet};
@@ -13,7 +13,9 @@ use super::{
     Tty,
     terminal::{
         Terminal,
-        ldisc::{ExternalRegister, ProcessMode, TtyConfig, TtyRead, TtyWrite},
+        ldisc::{
+            ExternalRegister, ExternalRegistration, ProcessMode, TtyConfig, TtyRead, TtyWrite,
+        },
     },
 };
 
@@ -148,17 +150,19 @@ impl PtyEndpoint {
         match self.side {
             // Linux reports readable plus HUP on a master whose last slave
             // closed; an empty read then reports EIO.
-            PtySide::Master => IoEvents::IN | IoEvents::HUP,
+            PtySide::Master => IoEvents::READABLE | IoEvents::HANGUP,
             // A vhangup on the slave produces EOF/EIO while poll exposes the
             // exceptional condition. Linux also reports OUT in this state.
-            PtySide::Slave => IoEvents::IN | IoEvents::OUT | IoEvents::ERR | IoEvents::HUP,
+            PtySide::Slave => {
+                IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::ERROR | IoEvents::HANGUP
+            }
         }
     }
 
-    pub(super) fn register(&self, context: &mut Context<'_>) {
+    pub(super) fn poll_source(&self) -> &PollSet {
         match self.side {
-            PtySide::Master => self.lifecycle.master_waiters.register(context.waker()),
-            PtySide::Slave => self.lifecycle.slave_waiters.register(context.waker()),
+            PtySide::Master => &self.lifecycle.master_waiters,
+            PtySide::Slave => &self.lifecycle.slave_waiters,
         }
     }
 }
@@ -252,8 +256,8 @@ impl TtyWrite for PtyWriter {
         !self.0.producer.lock().is_full()
     }
 
-    fn register_tx_waker(&self, waker: &Waker) {
-        self.0.events.tx.register(waker);
+    fn tx_poll_source(&self) -> Option<&Arc<PollSet>> {
+        Some(&self.0.events.tx)
     }
 
     fn wake_waiters(&self) {
@@ -302,9 +306,11 @@ fn create_pty_pair_with_external_reader(
     )?;
 
     let process_mode = if external_reader {
-        let register: ExternalRegister =
-            Box::try_new(move |waker: &Waker| master_to_slave_events.rx.register(waker))
-                .map_err(|_| AxError::NoMemory)?;
+        let register_source = Arc::clone(&master_to_slave_events.rx);
+        let register: ExternalRegister = Box::try_new(move |waker: &Waker| {
+            ExternalRegistration::poll(Arc::clone(&register_source), waker)
+        })
+        .map_err(|_| AxError::NoMemory)?;
         ProcessMode::External(register)
     } else {
         ProcessMode::Manual
@@ -385,7 +391,7 @@ mod tests {
 
         let wake = Arc::new(CountWake(AtomicUsize::new(0)));
         let waker = Waker::from(wake.clone());
-        writer.register_tx_waker(&waker);
+        let _token = writer.register_tx_waker(&waker).unwrap();
         let mut byte = [0];
         assert_eq!(reader.read(&mut byte), Ok(1));
         assert_eq!(wake.0.load(Ordering::Relaxed), 1);
@@ -401,7 +407,7 @@ mod tests {
         assert!(!slave.close());
         assert_eq!(
             master.hangup_events().bits(),
-            (IoEvents::IN | IoEvents::HUP).bits()
+            (IoEvents::READABLE | IoEvents::HANGUP).bits()
         );
         // A Unix98 master may buffer output while no slave is open.
         assert_eq!(writer.write(b"pending"), Ok(7));
@@ -411,7 +417,7 @@ mod tests {
         assert!(master.close());
         assert_eq!(
             slave.hangup_events().bits(),
-            (IoEvents::IN | IoEvents::OUT | IoEvents::ERR | IoEvents::HUP).bits()
+            (IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::ERROR | IoEvents::HANGUP).bits()
         );
         let mut pending = [0; 8];
         assert!(!reader.input_eof());

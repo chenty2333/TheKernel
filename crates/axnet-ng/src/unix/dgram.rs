@@ -9,7 +9,9 @@ use core::{
 use async_trait::async_trait;
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::{IoBuf, Read, Write};
-use axpoll::{IoEvents, PollSet, Pollable};
+use axpoll::{
+    IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable, PreparedPollRegistration,
+};
 use axsync::{Mutex, spin::SpinNoIrq};
 use spin::RwLock;
 
@@ -478,17 +480,24 @@ struct DgramSendPoll<'a> {
 impl Pollable for DgramSendPoll<'_> {
     fn poll(&self) -> IoEvents {
         if self.channel.writable_for(self.local_buffers, self.charge) {
-            IoEvents::OUT
+            IoEvents::WRITABLE
         } else {
             IoEvents::empty()
         }
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.contains(IoEvents::OUT) {
-            self.channel.data_tx.register_write(context.waker());
-            self.local_poll.register(context.waker());
+    fn register<'b>(
+        &'b self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'b>, PollRegistrationError> {
+        let writable = events.contains(IoEvents::WRITABLE);
+        let mut prepared = PreparedPollRegistration::try_new(if writable { 2 } else { 0 })?;
+        if writable {
+            prepared.arm_owned(self.channel.data_tx.write_poll_source(), context.waker())?;
+            prepared.arm(self.local_poll, context.waker())?;
         }
+        prepared.commit()
     }
 }
 
@@ -884,7 +893,7 @@ impl TransportOps for DgramTransport {
         let channel = Self::channel_from_slot(slot)?;
         let retired = {
             let mut guard = self.connected.write();
-            core::mem::replace(&mut *guard, Some(channel))
+            (*guard).replace(channel)
         };
         drop(retired);
         self.poll_state.wake();
@@ -1007,7 +1016,7 @@ impl Pollable for DgramTransport {
         let rx_shutdown = self.rx_shutdown.load(Ordering::Acquire);
         let tx_shutdown = self.tx_shutdown.load(Ordering::Acquire);
         events.set(
-            IoEvents::IN,
+            IoEvents::READABLE,
             rx_shutdown
                 || self
                     .data_rx
@@ -1017,34 +1026,49 @@ impl Pollable for DgramTransport {
         );
         let connected = self.connected.read().as_ref().cloned();
         events.set(
-            IoEvents::OUT,
+            IoEvents::WRITABLE,
             !tx_shutdown
                 && connected
                     .as_ref()
                     .is_none_or(|chan| chan.writable(&self.buffers)),
         );
-        events.set(IoEvents::RDHUP, rx_shutdown);
+        events.set(IoEvents::READ_HANGUP, rx_shutdown);
         self.general.add_pending_error_event(events)
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.contains(IoEvents::IN) {
-            let receiver = self.data_rx.lock().receiver().cloned();
-            if let Some(receiver) = receiver {
-                receiver.register_read(context.waker());
-            }
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+        let read_source = events
+            .contains(IoEvents::READABLE)
+            .then(|| {
+                self.data_rx
+                    .lock()
+                    .receiver()
+                    .map(Receiver::read_poll_source)
+            })
+            .flatten();
+        let write_source = events
+            .contains(IoEvents::WRITABLE)
+            .then(|| {
+                self.connected
+                    .read()
+                    .as_ref()
+                    .map(|channel| channel.data_tx.write_poll_source())
+            })
+            .flatten();
+        let maximum = 1 + usize::from(read_source.is_some()) + usize::from(write_source.is_some());
+        let mut prepared = PreparedPollRegistration::try_new(maximum)?;
+        if let Some(source) = read_source {
+            prepared.arm_owned(source, context.waker())?;
         }
-        if events.contains(IoEvents::OUT) {
-            let sender = self
-                .connected
-                .read()
-                .as_ref()
-                .map(|channel| channel.data_tx.clone());
-            if let Some(sender) = sender {
-                sender.register_write(context.waker());
-            }
+        if let Some(source) = write_source {
+            prepared.arm_owned(source, context.waker())?;
         }
-        self.poll_state.register(context.waker());
+        prepared.arm(&self.poll_state, context.waker())?;
+        prepared.commit()
     }
 }
 
@@ -1194,7 +1218,8 @@ mod tests {
                     woke: woke.clone(),
                     rechecked: rechecked.clone(),
                 }));
-                tx.register_write(&waker);
+                let mut registration =
+                    PollRegistration::single_owned(tx.write_poll_source(), &waker).unwrap();
                 ready.wait();
                 std::thread::park_timeout(Duration::from_secs(1));
 
@@ -1204,12 +1229,14 @@ mod tests {
                     // This is the lost-wake interleaving: a sender awakened by
                     // queue removal still sees the stale byte charge and
                     // registers again before that charge is decremented.
-                    tx.register_write(&waker);
+                    registration =
+                        PollRegistration::single_owned(tx.write_poll_source(), &waker).unwrap();
                 }
                 observed_free.store(was_woken && free, Ordering::Release);
                 if was_woken {
                     rechecked.wait();
                 }
+                drop(registration);
             })
         };
 
@@ -1234,7 +1261,7 @@ mod tests {
         let (left, right) = DgramTransport::new_pair(credentials).unwrap();
         left.shutdown(Shutdown::Write).unwrap();
         assert!(left.tx_shutdown.load(Ordering::Acquire));
-        assert!(!left.poll().contains(IoEvents::OUT));
+        assert!(!left.poll().contains(IoEvents::WRITABLE));
         assert_eq!(
             left.send(&b"x"[..], SendOptions::default()),
             Err(AxError::BrokenPipe)
@@ -1242,7 +1269,7 @@ mod tests {
 
         right.shutdown(Shutdown::Read).unwrap();
         assert!(right.rx_shutdown.load(Ordering::Acquire));
-        assert!(right.poll().contains(IoEvents::RDHUP));
+        assert!(right.poll().contains(IoEvents::READ_HANGUP));
     }
 
     struct DropProbe(Arc<AtomicUsize>);
@@ -1281,7 +1308,7 @@ mod tests {
         drain_all_deferred_cleanup();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         right.shutdown(Shutdown::Read).unwrap();
-        assert!(left.poll().contains(IoEvents::OUT));
+        assert!(left.poll().contains(IoEvents::WRITABLE));
         assert_eq!(
             left.send(&byte[..], SendOptions::default()).unwrap_err(),
             AxError::ConnectionRefused
@@ -1303,8 +1330,11 @@ mod tests {
         let wakes = Arc::new(AtomicUsize::new(0));
         let waker = Waker::from(Arc::new(CountingWake(wakes.clone())));
         let mut context = Context::from_waker(&waker);
-        left.register(&mut context, IoEvents::IN);
-        right.register(&mut context, IoEvents::IN);
+        let left_registration = left.register(&mut context, IoEvents::READABLE).unwrap();
+        let right_registration = right.register(&mut context, IoEvents::READABLE).unwrap();
+        // A logical waiter owns cancellation and must release it before the
+        // object supplying a borrowed local source is destroyed.
+        drop(right_registration);
         let byte = [0u8; 1];
         let packet_count = DEFERRED_CLEANUP_PACKET_BUDGET + 1;
 
@@ -1325,7 +1355,7 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         assert_eq!(wakes.load(Ordering::SeqCst), wakes_before_drop);
         assert!(has_deferred_receive_cleanup_work());
-        assert!(left.poll().contains(IoEvents::OUT));
+        assert!(left.poll().contains(IoEvents::WRITABLE));
         assert_eq!(
             left.send(&byte[..], SendOptions::default()).unwrap_err(),
             AxError::ConnectionRefused
@@ -1348,12 +1378,13 @@ mod tests {
         drain_all_deferred_cleanup();
         assert_eq!(drops.load(Ordering::SeqCst), packet_count);
         assert!(wakes.load(Ordering::SeqCst) > wakes_before_drop);
+        drop(left_registration);
         drop(left);
         drain_all_deferred_cleanup();
     }
 
     #[test]
-    fn idle_drop_wakes_registered_poll_state_in_the_worker() {
+    fn cancelled_idle_registration_is_not_woken_by_deferred_drop() {
         use core::task::Waker;
 
         let _guard = super::super::UNIX_CLEANUP_TEST_LOCK.lock();
@@ -1362,12 +1393,15 @@ mod tests {
         let wakes = Arc::new(AtomicUsize::new(0));
         let waker = Waker::from(Arc::new(CountingWake(wakes.clone())));
         let mut context = Context::from_waker(&waker);
-        transport.register(&mut context, IoEvents::IN | IoEvents::OUT);
+        let registration = transport
+            .register(&mut context, IoEvents::READABLE | IoEvents::WRITABLE)
+            .unwrap();
+        drop(registration);
 
         drop(transport);
         assert_eq!(wakes.load(Ordering::Acquire), 0);
         drain_all_deferred_cleanup();
-        assert!(wakes.load(Ordering::Acquire) > 0);
+        assert_eq!(wakes.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -1399,7 +1433,7 @@ mod tests {
         drop(right);
         // Linux reports POLLOUT for a datagram peer that will make the next
         // send fail immediately rather than blocking in poll forever.
-        assert!(left.poll().contains(IoEvents::OUT));
+        assert!(left.poll().contains(IoEvents::WRITABLE));
         assert_eq!(
             left.send(&byte[..], SendOptions::default()).unwrap_err(),
             AxError::ConnectionRefused
@@ -1473,7 +1507,7 @@ mod tests {
             })
             .unwrap();
 
-        assert!(!left.poll().contains(IoEvents::OUT));
+        assert!(!left.poll().contains(IoEvents::WRITABLE));
         let mut byte = [0u8; 1];
         assert_eq!(
             right
@@ -1487,6 +1521,6 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert!(left.poll().contains(IoEvents::OUT));
+        assert!(left.poll().contains(IoEvents::WRITABLE));
     }
 }

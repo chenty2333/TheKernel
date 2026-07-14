@@ -4,7 +4,7 @@ use core::{fmt, time::Duration};
 use axerrno::{AxError, AxResult};
 use axhal::uspace::UserContext;
 use axpoll::IoEvents;
-use axtask::future::{self, block_on, poll_io};
+use axtask::future::{self, block_on};
 use bitmaps::Bitmap;
 use linux_raw_sys::{
     general::*,
@@ -12,7 +12,7 @@ use linux_raw_sys::{
 };
 use starry_signal::SignalSet;
 
-use super::{FdPollSet, wait_io_result, wait_signal_only};
+use super::{FdPollSet, flatten_blocked_timeout, wait_io_result, wait_signal_only};
 use crate::{
     file::get_file_like,
     mm::{UserConstPtr, UserPtr, nullable},
@@ -93,22 +93,25 @@ fn do_select(
 
     let fd_bitmap = read_set.0 | write_set.0 | except_set.0;
     let fd_count = fd_bitmap.len();
-    let mut fds = Vec::with_capacity(fd_count);
-    let mut fd_indices = Vec::with_capacity(fd_count);
+    let mut fds = FdPollSet::try_with_capacity(fd_count)?;
+    let mut fd_indices = Vec::new();
+    fd_indices
+        .try_reserve_exact(fd_count)
+        .map_err(|_| AxError::NoMemory)?;
     for fd in fd_bitmap.into_iter() {
         let f = get_file_like(fd as i32)?;
         let mut events = IoEvents::empty();
-        events.set(IoEvents::IN, read_set.0.get(fd));
-        events.set(IoEvents::OUT, write_set.0.get(fd));
-        events.set(IoEvents::ERR, except_set.0.get(fd));
+        events.set(IoEvents::READABLE, read_set.0.get(fd));
+        events.set(IoEvents::WRITABLE, write_set.0.get(fd));
+        events.set(IoEvents::ERROR, except_set.0.get(fd));
         if !events.is_empty() {
-            fds.push((f, events));
+            fds.push(f, events);
             fd_indices.push(fd);
         }
     }
 
-    let fds = FdPollSet(fds);
-    if fds.0.is_empty() {
+    let fds = fds.finish();
+    if fds.is_empty() {
         return wait_signal_only(uctx, timeout, sigmask.copied());
     }
 
@@ -123,21 +126,22 @@ fn do_select(
     }
     let mut poll_once = || {
         let mut res = 0usize;
-        for ((fd, interested), index) in fds.0.iter().zip(fd_indices.iter().copied()) {
-            let events = fd.poll() & *interested;
-            if events.contains(IoEvents::IN)
+        for entry in fds.entries() {
+            let index = fd_indices[entry.output_index];
+            let events = entry.file.poll() & entry.events;
+            if events.contains(IoEvents::READABLE)
                 && let Some(set) = readfds.as_deref_mut()
             {
                 res += 1;
                 unsafe { FD_SET(index as _, set) };
             }
-            if events.contains(IoEvents::OUT)
+            if events.contains(IoEvents::WRITABLE)
                 && let Some(set) = writefds.as_deref_mut()
             {
                 res += 1;
                 unsafe { FD_SET(index as _, set) };
             }
-            if events.contains(IoEvents::ERR)
+            if events.contains(IoEvents::ERROR)
                 && let Some(set) = exceptfds.as_deref_mut()
             {
                 res += 1;
@@ -153,10 +157,18 @@ fn do_select(
 
     let deadline = timeout.map(|dur| axhal::time::wall_time().saturating_add(dur));
     let mut select_once = || {
-        block_on(future::timeout(
+        flatten_blocked_timeout(block_on(future::timeout(
             deadline.map(|end| end.saturating_sub(axhal::time::wall_time())),
-            poll_io(&fds, IoEvents::empty(), false, &mut poll_once),
-        ))
+            async {
+                crate::readiness::interruptible_poll_io(
+                    &fds,
+                    IoEvents::empty(),
+                    false,
+                    &mut poll_once,
+                )
+                .await
+            },
+        )))
     };
 
     wait_io_result(uctx, sigmask.copied(), &mut select_once)

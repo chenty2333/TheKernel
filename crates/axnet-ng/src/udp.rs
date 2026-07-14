@@ -7,7 +7,9 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError, ax_bail, ax_err_type};
 use axio::prelude::*;
-use axpoll::{IoEvents, PollSet, Pollable};
+use axpoll::{
+    IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable, PreparedPollRegistration,
+};
 use smoltcp::{
     iface::SocketHandle,
     phy::PacketMeta,
@@ -486,21 +488,29 @@ impl Pollable for UdpSocket {
         let mut events = IoEvents::empty();
         self.with_smol_socket(|socket| {
             let rx_shutdown = self.rx_shutdown.load(Ordering::Acquire);
-            events.set(IoEvents::IN, rx_shutdown || socket.can_recv());
+            events.set(IoEvents::READABLE, rx_shutdown || socket.can_recv());
             events.set(
-                IoEvents::OUT,
+                IoEvents::WRITABLE,
                 !self.tx_shutdown.load(Ordering::Acquire) && socket.can_send(),
             );
-            events.set(IoEvents::RDHUP, rx_shutdown);
+            events.set(IoEvents::READ_HANGUP, rx_shutdown);
         });
         self.general.add_pending_error_event(events)
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.intersects(IoEvents::IN | IoEvents::OUT) {
-            self.general.register_waker(&self.stack, context.waker());
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+        let network = events.intersects(IoEvents::READABLE | IoEvents::WRITABLE);
+        let mut prepared = PreparedPollRegistration::try_new(usize::from(network) + 1)?;
+        if network {
+            self.general
+                .arm_waker(&self.stack, &mut prepared, context.waker())?;
         }
-        self.poll_state.register(context.waker());
+        prepared.arm(&self.poll_state, context.waker())?;
+        prepared.commit()
     }
 }
 

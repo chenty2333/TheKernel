@@ -1,18 +1,13 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{
     ffi::c_char,
-    future::poll_fn,
     mem::{self, size_of},
-    task::Poll,
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::NodeType;
 use axhal::uspace::UserContext;
-use axtask::{
-    current,
-    future::{block_on, interruptible},
-};
+use axtask::current;
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 use memory_addr::PAGE_SIZE_4K;
 use starry_process::Pid;
@@ -28,10 +23,12 @@ use crate::{
         resolve_at_with_credentials,
     },
     mm::{copy_from_kernel, load_user_app_at, new_user_aspace_empty, vm_load_string},
+    readiness::block_on_poll_set,
     task::{
         AsThread, DacCredentialView, ProcessData, Thread, check_signals,
-        commit_exec_identity_handoff, get_task, has_pending_fatal_signal,
-        notify_ptrace_attach_stop, prepare_task_alias_admission, set_current_user_page_table_root,
+        commit_exec_identity_handoff, get_task, has_pending_fatal_signal, linux_pid_from_task_id,
+        notify_ptrace_attach_stop, prepare_task_alias_admission, process_error,
+        set_current_user_page_table_root,
     },
 };
 
@@ -69,18 +66,13 @@ fn wait_for_exec_group(
     sibling_tids: &[Pid],
 ) -> AxResult<()> {
     while proc_data.is_exec_owner(curr_tid) && !proc_data.exec_ready(curr_tid) {
-        match block_on(interruptible(poll_fn(|cx| {
+        match block_on_poll_set(&proc_data.exec_event, || {
             if !proc_data.is_exec_owner(curr_tid) || proc_data.exec_ready(curr_tid) {
-                Poll::Ready(())
+                Ok(())
             } else {
-                proc_data.exec_event.register(cx.waker());
-                if !proc_data.is_exec_owner(curr_tid) || proc_data.exec_ready(curr_tid) {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
+                Err(AxError::WouldBlock)
             }
-        }))) {
+        }) {
             Ok(()) => {}
             Err(_) => {
                 interrupt_exec_siblings(sibling_tids);
@@ -245,6 +237,8 @@ fn do_execve(
     envs: Vec<String>,
     credentials: &DacCredentialView,
 ) -> AxResult<isize> {
+    let curr = current();
+    let curr_tid = linux_pid_from_task_id(curr.id().as_u64())?;
     executable::check_not_write_open(&loc)?;
     fanotify::permission_check(
         &loc,
@@ -297,10 +291,8 @@ fn do_execve(
         Arc::try_new(args).map_err(|_| AxError::NoMemory),
     )?;
 
-    let curr = current();
     let thr = curr.as_thread();
     let proc_data = &thr.proc_data;
-    let curr_tid = curr.id().as_u64() as Pid;
     let new_task_alias = (!thr.is_thread_group_leader()).then(|| curr.clone());
     let task_alias_admission = match new_task_alias
         .as_ref()
@@ -338,12 +330,12 @@ fn do_execve(
     } else {
         None
     };
-    let cloexec_batch = match private_fd_table.as_ref() {
-        Some(table) => table.prepare_cloexec_batch(),
-        None => FD_TABLE.prepare_cloexec_batch(),
+    let cloexec = match private_fd_table.as_ref() {
+        Some(table) => table.prepare_cloexec(),
+        None => FD_TABLE.prepare_cloexec(),
     };
-    let cloexec_batch = match cloexec_batch {
-        Ok(batch) => batch,
+    let cloexec = match cloexec {
+        Ok(prepared) => prepared,
         Err(err) => {
             executable::release(executable_key);
             return Err(err);
@@ -361,12 +353,12 @@ fn do_execve(
         executable::release(executable_key);
         return Err(AxError::Interrupted);
     }
-    let mut sibling_tids = match proc_data.proc.try_threads() {
+    let mut sibling_tids = match proc_data.proc.try_threads().map_err(process_error) {
         Ok(threads) => threads,
-        Err(_) => {
+        Err(error) => {
             proc_data.end_exec(curr_tid);
             executable::release(executable_key);
-            return Err(AxError::NoMemory);
+            return Err(error);
         }
     };
     if !files_preparation_covers_thread_snapshot(private_fd_table.is_some(), &sibling_tids) {
@@ -412,10 +404,10 @@ fn do_execve(
         let previous = thr.with_mut_scope(|scope| replace_process_fd_table(scope, private));
         drop(previous);
     }
-    // The buffer was reserved before de-threading, and the selected table is
-    // either private or owned by this sole thread. Detaching all CLOEXEC slots
-    // is therefore allocation-free and cannot fail at the exec commit point.
-    drop(FD_TABLE.close_cloexec(cloexec_batch));
+    // The token owns the exact selected table plus full-capacity detach and
+    // cleanup storage. Commit covers flags/descriptors added after preparation
+    // and has no recoverable branch or runtime invariant panic.
+    cloexec.commit();
     crate::file::inotify::wait_current_close_notifications();
 
     crate::syscall::cleanup_process_aio(proc_data.proc.pid());

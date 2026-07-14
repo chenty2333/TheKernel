@@ -28,7 +28,6 @@ use crate::{
 const IPC_MODE_MASK: c_ushort = 0o777;
 const IPC_NOWAIT: i16 = 0o4000;
 const SEM_UNDO: i16 = 0x1000;
-const SEM_TIMED_WAIT_SLICE: Duration = Duration::from_millis(100);
 
 pub const SEMMSL: usize = 32000;
 pub const SEMMNI: usize = 128;
@@ -825,15 +824,14 @@ fn wait_for_sem(
         return Err(AxError::from(LinuxError::EAGAIN));
     }
     if deadline.is_none() {
-        let interrupted = with_proc_state_hint(ProcStateHint::Interruptible, || {
-            waiters
-                .wait_until_interruptible(|| {
-                    sem_wait_ready(array, sem_num, wait_zero, needed_value).unwrap_or(true)
-                        || has_pending_syscall_signal(thread)
-                })
-                .is_err()
-        });
-        if interrupted || has_pending_syscall_signal(thread) {
+        with_proc_state_hint(ProcStateHint::Interruptible, || {
+            waiters.wait_until_interruptible(|| {
+                sem_wait_ready(array, sem_num, wait_zero, needed_value).unwrap_or(true)
+                    || has_pending_syscall_signal(thread)
+            })
+        })
+        .map_err(AxError::from)?;
+        if has_pending_syscall_signal(thread) {
             return Err(AxError::Interrupted);
         }
         sem_wait_ready(array, sem_num, wait_zero, needed_value)?;
@@ -841,21 +839,23 @@ fn wait_for_sem(
     }
 
     let sleep_for = deadline
-        .map(|deadline| {
-            deadline
-                .saturating_sub(wall_time_duration())
-                .min(SEM_TIMED_WAIT_SLICE)
-        })
-        .unwrap_or(SEM_TIMED_WAIT_SLICE);
-    with_proc_state_hint(ProcStateHint::Interruptible, || {
-        waiters.wait_timeout_until(sleep_for, || {
+        .ok_or(AxError::BadState)?
+        .saturating_sub(wall_time_duration());
+    let timed_out = with_proc_state_hint(ProcStateHint::Interruptible, || {
+        waiters.wait_timeout_until_interruptible(sleep_for, || {
             sem_wait_ready(array, sem_num, wait_zero, needed_value).unwrap_or(true)
                 || has_pending_syscall_signal(thread)
-                || deadline_elapsed(deadline)
-        });
-    });
+        })
+    })
+    .map_err(AxError::from)?;
+    if has_pending_syscall_signal(thread) {
+        return Err(AxError::Interrupted);
+    }
     if sem_wait_ready(array, sem_num, wait_zero, needed_value)? {
         return Ok(());
+    }
+    if timed_out || deadline_elapsed(deadline) {
+        return Err(AxError::from(LinuxError::EAGAIN));
     }
     Ok(())
 }

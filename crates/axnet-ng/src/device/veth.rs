@@ -11,7 +11,7 @@ use smoltcp::{
 
 use crate::{
     consts::{PACKET_QUEUE_LEN, STANDARD_MTU},
-    device::{Device, DeviceStats, InterfaceKind},
+    device::{Device, DevicePollBridge, DeviceStats, InterfaceKind},
 };
 
 /// One end of a virtual ethernet pair.
@@ -27,6 +27,7 @@ pub struct VethEnd {
     peer_rx_buffer: Arc<Mutex<PacketBuffer<'static, ()>>>,
     /// Waker for this end — notified when peer sends us data.
     waker: Arc<PollSet>,
+    waker_bridge: DevicePollBridge,
     /// Waker for the peer — we notify it when we send data.
     peer_waker: Arc<PollSet>,
     stats: DeviceStats,
@@ -52,6 +53,7 @@ impl VethEnd {
             rx_buffer: buf_a.clone(),
             peer_rx_buffer: buf_b.clone(),
             waker: waker_a.clone(),
+            waker_bridge: DevicePollBridge::new(),
             peer_waker: waker_b.clone(),
             stats: DeviceStats::default(),
         };
@@ -60,6 +62,7 @@ impl VethEnd {
             rx_buffer: buf_b,
             peer_rx_buffer: buf_a,
             waker: waker_b,
+            waker_bridge: DevicePollBridge::new(),
             peer_waker: waker_a,
             stats: DeviceStats::default(),
         };
@@ -119,7 +122,13 @@ impl Device for VethEnd {
         }
     }
 
-    fn register_waker(&self, waker: &Waker) {
-        self.waker.register(waker);
+    fn register_waker(&self, waker: &Waker) -> Result<(), axpoll::PollRegistrationError> {
+        self.waker_bridge.refresh(&self.waker, waker)
+    }
+}
+
+impl Drop for VethEnd {
+    fn drop(&mut self) {
+        self.waker_bridge.cancel(&self.waker);
     }
 }

@@ -124,6 +124,32 @@ class VendorProvenanceTests(unittest.TestCase):
         fixture = Fixture(Path(temporary.name))
         return temporary, fixture
 
+    def make_linux_vfs_fixture(
+        self,
+    ) -> tuple[tempfile.TemporaryDirectory[str], Fixture]:
+        temporary = tempfile.TemporaryDirectory()
+        fixture = Fixture(Path(temporary.name) / "consumer")
+        sibling = (
+            Path(temporary.name)
+            / "thekernel-linux-abi/crates/vfs/Cargo.toml"
+        )
+        sibling.parent.mkdir(parents=True)
+        sibling.write_text(
+            '[package]\nname = "thekernel-linux-vfs"\nversion = "0.1.0"\n',
+            encoding="utf-8",
+        )
+        (fixture.root / "Cargo.toml").write_text(
+            '[workspace]\n'
+            '[workspace.dependencies]\n'
+            'linux-vfs = { package = "thekernel-linux-vfs", version = "=0.1.0" }\n'
+            '[patch.crates-io]\n'
+            'foo = { path = "vendor/foo" }\n'
+            'thekernel-linux-vfs = { path = '
+            '"../thekernel-linux-abi/crates/vfs" }\n',
+            encoding="utf-8",
+        )
+        return temporary, fixture
+
     def test_valid_archive_and_metadata_pass(self) -> None:
         temporary, fixture = self.make_fixture()
         self.addCleanup(temporary.cleanup)
@@ -155,6 +181,200 @@ class VendorProvenanceTests(unittest.TestCase):
             any("missing provenance records: bar" in error for error in selected.errors),
             selected.errors,
         )
+
+    def test_maintained_sibling_and_local_adapter_are_classified_separately(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        fixture = Fixture(Path(temporary.name) / "consumer")
+
+        sibling = (
+            Path(temporary.name)
+            / "thekernel-ax/crates/thekernel-axtask/Cargo.toml"
+        )
+        sibling.parent.mkdir(parents=True)
+        sibling.write_text(
+            '[package]\nname = "thekernel-axtask"\nversion = "0.1.0"\n',
+            encoding="utf-8",
+        )
+        adapter = fixture.root / "crates/axtask-compat/Cargo.toml"
+        adapter.parent.mkdir(parents=True)
+        adapter.write_text(
+            '[package]\nname = "axtask"\nversion = "0.3.0-preview.2"\n'
+            'publish = false\n',
+            encoding="utf-8",
+        )
+        with (fixture.root / "Cargo.toml").open("a", encoding="utf-8") as manifest:
+            manifest.write(
+                'thekernel-axtask = { path = '
+                '"../thekernel-ax/crates/thekernel-axtask" }\n'
+            )
+            manifest.write('axtask = { path = "crates/axtask-compat" }\n')
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.package_checks, 1)
+        self.assertEqual(result.maintained_checks, 1)
+        self.assertEqual(result.adapter_checks, 1)
+
+    def test_maintained_sibling_exemption_requires_the_exact_path(self) -> None:
+        temporary, fixture = self.make_fixture()
+        self.addCleanup(temporary.cleanup)
+        with (fixture.root / "Cargo.toml").open("a", encoding="utf-8") as manifest:
+            manifest.write(
+                'thekernel-axtask = { path = "vendor/not-thekernel-axtask" }\n'
+            )
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertTrue(
+            any("maintained sibling patch thekernel-axtask" in error for error in result.errors),
+            result.errors,
+        )
+        self.assertTrue(
+            any("missing provenance records: thekernel-axtask" in error for error in result.errors),
+            result.errors,
+        )
+
+    def test_linux_vfs_workspace_dependency_and_patch_are_classified(self) -> None:
+        temporary, fixture = self.make_linux_vfs_fixture()
+        self.addCleanup(temporary.cleanup)
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.maintained_checks, 1)
+
+    def test_linux_vfs_maintained_patch_rejects_wrong_path(self) -> None:
+        temporary, fixture = self.make_linux_vfs_fixture()
+        self.addCleanup(temporary.cleanup)
+        manifest = (fixture.root / "Cargo.toml").read_text(encoding="utf-8")
+        (fixture.root / "Cargo.toml").write_text(
+            manifest.replace(
+                "../thekernel-linux-abi/crates/vfs",
+                "../thekernel-linux-abi/crates/not-vfs",
+            ),
+            encoding="utf-8",
+        )
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertTrue(
+            any(
+                "maintained sibling patch thekernel-linux-vfs" in error
+                for error in result.errors
+            ),
+            result.errors,
+        )
+
+    def test_linux_vfs_workspace_dependency_requires_exact_version(self) -> None:
+        temporary, fixture = self.make_linux_vfs_fixture()
+        self.addCleanup(temporary.cleanup)
+        manifest = (fixture.root / "Cargo.toml").read_text(encoding="utf-8")
+        (fixture.root / "Cargo.toml").write_text(
+            manifest.replace('version = "=0.1.0"', 'version = "0.1.0"'),
+            encoding="utf-8",
+        )
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertTrue(
+            any(
+                "workspace dependency linux-vfs version" in error
+                for error in result.errors
+            ),
+            result.errors,
+        )
+
+    def test_linux_vfs_maintained_patch_rejects_wrong_package_version(self) -> None:
+        temporary, fixture = self.make_linux_vfs_fixture()
+        self.addCleanup(temporary.cleanup)
+        sibling_manifest = (
+            Path(temporary.name)
+            / "thekernel-linux-abi/crates/vfs/Cargo.toml"
+        )
+        sibling_manifest.write_text(
+            '[package]\nname = "thekernel-linux-vfs"\nversion = "0.1.1"\n',
+            encoding="utf-8",
+        )
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertTrue(
+            any(
+                "maintained sibling version is '0.1.1', expected '0.1.0'" in error
+                for error in result.errors
+            ),
+            result.errors,
+        )
+
+    def test_linux_vfs_workspace_dependency_requires_exact_package(self) -> None:
+        temporary, fixture = self.make_linux_vfs_fixture()
+        self.addCleanup(temporary.cleanup)
+        manifest = (fixture.root / "Cargo.toml").read_text(encoding="utf-8")
+        (fixture.root / "Cargo.toml").write_text(
+            manifest.replace(
+                'package = "thekernel-linux-vfs"',
+                'package = "lookalike-linux-vfs"',
+            ),
+            encoding="utf-8",
+        )
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertTrue(
+            any(
+                "workspace dependency linux-vfs package" in error
+                for error in result.errors
+            ),
+            result.errors,
+        )
+
+    def test_non_vendor_patch_rejects_a_fabricated_provenance_record(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        fixture = Fixture(Path(temporary.name) / "consumer")
+
+        sibling = (
+            Path(temporary.name)
+            / "thekernel-ax/crates/thekernel-axtask/Cargo.toml"
+        )
+        sibling.parent.mkdir(parents=True)
+        sibling.write_text(
+            '[package]\nname = "thekernel-axtask"\nversion = "0.1.0"\n',
+            encoding="utf-8",
+        )
+        with (fixture.root / "Cargo.toml").open("a", encoding="utf-8") as manifest:
+            manifest.write(
+                'thekernel-axtask = { path = '
+                '"../thekernel-ax/crates/thekernel-axtask" }\n'
+            )
+
+        registry_path = fixture.root / validator.REGISTRY_REL
+        registry = registry_path.read_text(encoding="utf-8")
+        duplicate_record = registry[registry.index("[[package]]") :].replace(
+            'patch = "foo"', 'patch = "thekernel-axtask"', 1
+        )
+        registry_path.write_text(
+            registry + "\n" + duplicate_record,
+            encoding="utf-8",
+        )
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertTrue(
+            any(
+                "thekernel-axtask: non-vendor patch has an unexpected provenance record"
+                in error
+                for error in result.errors
+            ),
+            result.errors,
+        )
+
+    def test_inactive_vendored_record_remains_audited(self) -> None:
+        temporary, fixture = self.make_fixture()
+        self.addCleanup(temporary.cleanup)
+        (fixture.root / "Cargo.toml").write_text(
+            "[patch.crates-io]\n", encoding="utf-8"
+        )
+
+        result = validator.validate_repository(fixture.root, archive_policy="skip")
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.package_checks, 1)
+        self.assertEqual(result.maintained_checks, 0)
+        self.assertEqual(result.adapter_checks, 0)
 
     def test_modified_original_manifest_fails(self) -> None:
         temporary, fixture = self.make_fixture()

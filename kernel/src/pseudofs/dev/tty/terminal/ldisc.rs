@@ -2,13 +2,19 @@ use alloc::{boxed::Box, collections::vec_deque::VecDeque, string::String, sync::
 use core::{
     future::poll_fn,
     ops::Range,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
     task::{Context, Poll, Waker},
 };
 
 use axerrno::{AxError, AxResult};
-use axpoll::PollSet;
-use axtask::{AxTaskRef, future::block_on};
+use axpoll::{PollSet, RegisterError, RegistrationToken, UpdateError};
+use axtask::{
+    AxTaskRef,
+    future::{
+        IrqWakerRegisterError, IrqWakerToken, IrqWakerUpdateError, block_on, cancel_irq_waker,
+        register_irq_waker, update_irq_waker,
+    },
+};
 use linux_raw_sys::general::{
     ECHOCTL, ECHOE, ECHOK, ICRNL, IGNCR, ISIG, ONLCR, OPOST, VEOF, VERASE, VKILL, VMIN, VTIME,
 };
@@ -28,7 +34,75 @@ const ECHO_BUF_SIZE: usize = 4096;
 const EXTERNAL_PROGRESS_BUDGET: usize = 64;
 
 type ReadBuf = Arc<ringbuf::StaticRb<u8, BUF_SIZE>>;
-pub type ExternalRegister = Box<dyn for<'a> Fn(&'a Waker) + Send + Sync>;
+pub type ExternalRegister = Box<
+    dyn for<'a> Fn(&'a Waker) -> Result<ExternalRegistration, ExternalRegisterError> + Send + Sync,
+>;
+
+#[derive(Debug, Clone, Copy)]
+pub enum ExternalRegisterError {
+    Poll(RegisterError),
+    Irq(IrqWakerRegisterError),
+}
+
+enum ExternalRegistrationKind {
+    Poll {
+        source: Arc<PollSet>,
+        token: RegistrationToken,
+    },
+    Irq(IrqWakerToken),
+}
+
+pub struct ExternalRegistration {
+    kind: Option<ExternalRegistrationKind>,
+}
+
+impl ExternalRegistration {
+    pub fn poll(source: Arc<PollSet>, waker: &Waker) -> Result<Self, ExternalRegisterError> {
+        let token = source
+            .register(waker)
+            .map_err(ExternalRegisterError::Poll)?;
+        Ok(Self {
+            kind: Some(ExternalRegistrationKind::Poll { source, token }),
+        })
+    }
+
+    pub fn irq(irq: usize, waker: &Waker) -> Result<Self, ExternalRegisterError> {
+        let token = register_irq_waker(irq, waker).map_err(ExternalRegisterError::Irq)?;
+        Ok(Self {
+            kind: Some(ExternalRegistrationKind::Irq(token)),
+        })
+    }
+
+    fn update(&mut self, waker: &Waker) -> Result<(), ()> {
+        match self.kind.as_ref().ok_or(())? {
+            ExternalRegistrationKind::Poll { source, token } => {
+                source.update(*token, waker).map_err(|_| ())
+            }
+            ExternalRegistrationKind::Irq(token) => {
+                update_irq_waker(*token, waker).map_err(|_error: IrqWakerUpdateError| ())
+            }
+        }
+    }
+
+    fn cancel(&mut self) {
+        if let Some(kind) = self.kind.take() {
+            match kind {
+                ExternalRegistrationKind::Poll { source, token } => {
+                    source.cancel(token);
+                }
+                ExternalRegistrationKind::Irq(token) => {
+                    cancel_irq_waker(token);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ExternalRegistration {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
 
 /// How should we process inputs?
 pub enum ProcessMode {
@@ -65,8 +139,29 @@ pub trait TtyWrite: Send + Sync + 'static {
         true
     }
 
-    fn register_tx_waker(&self, waker: &Waker) {
-        waker.wake_by_ref();
+    /// Stable bounded source used when writes transition from blocked to ready.
+    fn tx_poll_source(&self) -> Option<&Arc<PollSet>> {
+        None
+    }
+
+    fn register_tx_waker(&self, waker: &Waker) -> Result<Option<RegistrationToken>, RegisterError> {
+        if let Some(source) = self.tx_poll_source() {
+            source.register(waker).map(Some)
+        } else {
+            waker.wake_by_ref();
+            Ok(None)
+        }
+    }
+
+    fn update_tx_waker(&self, token: RegistrationToken, waker: &Waker) -> Result<(), UpdateError> {
+        self.tx_poll_source()
+            .ok_or(UpdateError::InvalidToken)?
+            .update(token, waker)
+    }
+
+    fn cancel_tx_waker(&self, token: RegistrationToken) -> bool {
+        self.tx_poll_source()
+            .is_some_and(|source| source.cancel(token))
     }
 
     fn wake_waiters(&self) {}
@@ -297,10 +392,8 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
         }
     }
 
-    fn register_echo_waker(&self, waker: &Waker) {
-        if !self.echo_buf.is_empty() {
-            self.writer.register_tx_waker(waker);
-        }
+    fn echo_waiting(&self) -> bool {
+        !self.echo_buf.is_empty()
     }
 }
 
@@ -355,21 +448,150 @@ impl<R: TtyRead> SimpleReader<R> {
 struct WorkerControl {
     cancelled: AtomicBool,
     terminated: AtomicBool,
-    wake: PollSet,
+    failure: AtomicU8,
+    wake: Arc<PollSet>,
 }
 
 impl WorkerControl {
-    const fn new() -> Self {
-        Self {
+    fn try_new() -> AxResult<Self> {
+        Ok(Self {
             cancelled: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
-            wake: PollSet::new(),
-        }
+            failure: AtomicU8::new(0),
+            wake: Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?,
+        })
     }
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.wake.wake();
+    }
+
+    fn record_failure(&self, error: AxError) {
+        let code = match error {
+            AxError::NoMemory => 1,
+            AxError::OutOfRange => 2,
+            AxError::InvalidInput => 3,
+            _ => 4,
+        };
+        let _ = self
+            .failure
+            .compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    fn failure(&self) -> Option<AxError> {
+        match self.failure.load(Ordering::Acquire) {
+            0 => None,
+            1 => Some(AxError::NoMemory),
+            2 => Some(AxError::OutOfRange),
+            3 => Some(AxError::InvalidInput),
+            _ => Some(AxError::BadState),
+        }
+    }
+}
+
+struct OwnedPollSource {
+    source: Arc<PollSet>,
+    token: Option<RegistrationToken>,
+}
+
+impl OwnedPollSource {
+    fn register(source: Arc<PollSet>, waker: &Waker) -> Result<Self, RegisterError> {
+        let token = source.register(waker)?;
+        Ok(Self {
+            source,
+            token: Some(token),
+        })
+    }
+
+    fn update(&self, waker: &Waker) -> Result<(), UpdateError> {
+        self.source
+            .update(self.token.ok_or(UpdateError::InvalidToken)?, waker)
+    }
+
+    fn cancel(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.source.cancel(token);
+        }
+    }
+}
+
+impl Drop for OwnedPollSource {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+struct WorkerRegistrations {
+    capacity: OwnedPollSource,
+    external: ExternalRegistration,
+    control: OwnedPollSource,
+    echo: Option<OwnedPollSource>,
+}
+
+impl WorkerRegistrations {
+    fn register<R: TtyRead, W: TtyWrite>(
+        reader: &InputReader<R, W>,
+        capacity: &Arc<PollSet>,
+        control: &Arc<WorkerControl>,
+        register: &ExternalRegister,
+        waker: &Waker,
+    ) -> Result<Self, AxError> {
+        let capacity = OwnedPollSource::register(Arc::clone(capacity), waker)
+            .map_err(map_poll_register_error)?;
+        let external = register(waker).map_err(map_external_register_error)?;
+        let control = OwnedPollSource::register(Arc::clone(&control.wake), waker)
+            .map_err(map_poll_register_error)?;
+        let echo = if reader.echo_waiting() {
+            reader
+                .writer
+                .tx_poll_source()
+                .map(|source| OwnedPollSource::register(Arc::clone(source), waker))
+                .transpose()
+                .map_err(map_poll_register_error)?
+        } else {
+            None
+        };
+        Ok(Self {
+            capacity,
+            external,
+            control,
+            echo,
+        })
+    }
+
+    fn update(&mut self, waker: &Waker) -> Result<(), ()> {
+        let mut failed = self.capacity.update(waker).is_err();
+        failed |= self.external.update(waker).is_err();
+        failed |= self.control.update(waker).is_err();
+        if let Some(echo) = self.echo.as_ref() {
+            failed |= echo.update(waker).is_err();
+        }
+        if failed { Err(()) } else { Ok(()) }
+    }
+
+    fn includes_echo(&self) -> bool {
+        self.echo.is_some()
+    }
+}
+
+fn map_poll_register_error(error: RegisterError) -> AxError {
+    match error {
+        RegisterError::Full => AxError::NoMemory,
+        RegisterError::Closed => AxError::BadState,
+        RegisterError::TokenSpaceExhausted => AxError::OutOfRange,
+    }
+}
+
+fn map_external_register_error(error: ExternalRegisterError) -> AxError {
+    match error {
+        ExternalRegisterError::Poll(error) => map_poll_register_error(error),
+        ExternalRegisterError::Irq(error) => match error {
+            IrqWakerRegisterError::HookUnavailable => AxError::BadState,
+            IrqWakerRegisterError::HookInstallationInProgress
+            | IrqWakerRegisterError::SourceCapacityExhausted => AxError::NoMemory,
+            IrqWakerRegisterError::Waiter(error) => map_poll_register_error(error),
+        },
     }
 }
 
@@ -384,13 +606,21 @@ impl Drop for WorkerExit {
 
 fn poll_external_input<R: TtyRead, W: TtyWrite>(
     reader: &mut InputReader<R, W>,
-    readable: &PollSet,
-    capacity: &PollSet,
-    control: &WorkerControl,
+    readable: &Arc<PollSet>,
+    capacity: &Arc<PollSet>,
+    control: &Arc<WorkerControl>,
     register: &ExternalRegister,
+    registration: &mut Option<WorkerRegistrations>,
     cx: &mut Context<'_>,
 ) -> Poll<()> {
+    if registration
+        .as_mut()
+        .is_some_and(|registration| registration.update(cx.waker()).is_err())
+    {
+        drop(registration.take());
+    }
     if control.cancelled.load(Ordering::Acquire) {
+        drop(registration.take());
         return Poll::Ready(());
     }
 
@@ -403,6 +633,7 @@ fn poll_external_input<R: TtyRead, W: TtyWrite>(
         readable.wake();
     }
     if control.cancelled.load(Ordering::Acquire) {
+        drop(registration.take());
         return Poll::Ready(());
     }
     if budget == 0 {
@@ -413,10 +644,22 @@ fn poll_external_input<R: TtyRead, W: TtyWrite>(
         return Poll::Pending;
     }
 
-    capacity.register(cx.waker());
-    register(cx.waker());
-    reader.register_echo_waker(cx.waker());
-    control.wake.register(cx.waker());
+    if registration.is_none()
+        || (reader.echo_waiting()
+            && registration
+                .as_ref()
+                .is_some_and(|registration| !registration.includes_echo()))
+    {
+        drop(registration.take());
+        match WorkerRegistrations::register(reader, capacity, control, register, cx.waker()) {
+            Ok(armed) => *registration = Some(armed),
+            Err(error) => {
+                control.record_failure(error);
+                readable.wake();
+                return Poll::Ready(());
+            }
+        }
+    }
 
     while budget != 0
         && !control.cancelled.load(Ordering::Acquire)
@@ -425,13 +668,28 @@ fn poll_external_input<R: TtyRead, W: TtyWrite>(
         budget -= 1;
         readable.wake();
     }
-    reader.register_echo_waker(cx.waker());
     if control.cancelled.load(Ordering::Acquire) {
+        drop(registration.take());
         Poll::Ready(())
     } else if budget == 0 {
         cx.waker().wake_by_ref();
         Poll::Pending
     } else {
+        if reader.echo_waiting()
+            && registration
+                .as_ref()
+                .is_some_and(|registration| !registration.includes_echo())
+        {
+            drop(registration.take());
+            match WorkerRegistrations::register(reader, capacity, control, register, cx.waker()) {
+                Ok(armed) => *registration = Some(armed),
+                Err(error) => {
+                    control.record_failure(error);
+                    readable.wake();
+                    return Poll::Ready(());
+                }
+            }
+        }
         Poll::Pending
     }
 }
@@ -447,8 +705,13 @@ impl Drop for ExternalProcessor {
     fn drop(&mut self) {
         self.control.cancel();
         if let Some(task) = self.task.take() {
-            task.join();
-            debug_assert!(self.control.terminated.load(Ordering::Acquire));
+            match task.join() {
+                Ok(_) => debug_assert!(self.control.terminated.load(Ordering::Acquire)),
+                Err(error) => {
+                    self.control.record_failure(error.into());
+                    error!("line-discipline worker join failed: {error}");
+                }
+            }
         }
     }
 }
@@ -504,7 +767,8 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             ProcessMode::Manual => Processor::Manual(reader),
             ProcessMode::External(register) => {
                 let poll_rx = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
-                let control = Arc::try_new(WorkerControl::new()).map_err(|_| AxError::NoMemory)?;
+                let control =
+                    Arc::try_new(WorkerControl::try_new()?).map_err(|_| AxError::NoMemory)?;
                 let mut name = String::new();
                 name.try_reserve_exact("tty-reader".len())
                     .map_err(|_| AxError::NoMemory)?;
@@ -516,16 +780,22 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
                 let task = axtask::try_spawn_with_name(
                     move || {
                         let _exit = WorkerExit(task_control.clone());
-                        block_on(poll_fn(|cx| {
+                        let mut registration = None;
+                        let result = block_on(poll_fn(|cx| {
                             poll_external_input(
                                 &mut reader,
                                 &task_poll_rx,
                                 &task_poll_tx,
                                 &task_control,
                                 &register,
+                                &mut registration,
                                 cx,
                             )
                         }));
+                        if let Err(error) = result {
+                            task_control.record_failure(error.into());
+                            task_poll_rx.wake();
+                        }
                     },
                     name,
                 )?;
@@ -574,18 +844,20 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
                 reader.poll()?;
             }
             Processor::None(reader, _) => reader.poll()?,
-            Processor::External(_) => {}
+            Processor::External(processor) => {
+                if let Some(error) = processor.control.failure() {
+                    return Err(error);
+                }
+            }
         }
         Ok(())
     }
 
-    pub fn register_rx_waker(&self, waker: &Waker) {
+    pub fn readiness_source(&self) -> Option<&Arc<PollSet>> {
         match &self.processor {
-            Processor::Manual(_) => {
-                waker.wake_by_ref();
-            }
-            Processor::External(processor) => processor.poll_rx.register(waker),
-            Processor::None(_, set) => set.register(waker),
+            Processor::Manual(_) => None,
+            Processor::External(processor) => Some(&processor.poll_rx),
+            Processor::None(_, set) => Some(set),
         }
     }
 
@@ -794,9 +1066,9 @@ mod tests {
 
     #[test]
     fn worker_cancel_sets_state_and_wakes_registered_task() {
-        let control = WorkerControl::new();
+        let control = WorkerControl::try_new().unwrap();
         let wake = Arc::new(CountWake(AtomicUsize::new(0)));
-        control.wake.register(&Waker::from(wake.clone()));
+        let _token = control.wake.register(&Waker::from(wake.clone())).unwrap();
 
         control.cancel();
 
@@ -826,13 +1098,19 @@ mod tests {
             empty_eof_pending: Arc::try_new(AtomicBool::new(false)).unwrap(),
             source_drained: Arc::try_new(AtomicBool::new(false)).unwrap(),
         };
-        let readable = PollSet::new();
-        let capacity = PollSet::new();
-        let control = WorkerControl::new();
-        let register: ExternalRegister = Box::try_new(|_: &Waker| {}).unwrap();
+        let readable = Arc::new(PollSet::new());
+        let capacity = Arc::new(PollSet::new());
+        let control = Arc::new(WorkerControl::try_new().unwrap());
+        let source = Arc::new(PollSet::new());
+        let register_source = Arc::clone(&source);
+        let register: ExternalRegister = Box::try_new(move |waker: &Waker| {
+            ExternalRegistration::poll(Arc::clone(&register_source), waker)
+        })
+        .unwrap();
         let wake = Arc::new(CountWake(AtomicUsize::new(0)));
         let waker = Waker::from(wake.clone());
         let mut cx = Context::from_waker(&waker);
+        let mut registration = None;
 
         assert_eq!(
             poll_external_input(
@@ -841,6 +1119,7 @@ mod tests {
                 &capacity,
                 &control,
                 &register,
+                &mut registration,
                 &mut cx,
             ),
             Poll::Pending
@@ -856,6 +1135,7 @@ mod tests {
                 &capacity,
                 &control,
                 &register,
+                &mut registration,
                 &mut cx,
             ),
             Poll::Ready(())
@@ -896,10 +1176,12 @@ mod tests {
         let poll_tx = Arc::try_new(PollSet::new()).unwrap();
         let capacity = poll_tx.clone();
         let source = Arc::try_new(PollSet::new()).unwrap();
-        let control = Arc::try_new(WorkerControl::new()).unwrap();
+        let control = Arc::try_new(WorkerControl::try_new().unwrap()).unwrap();
         let register_source = source.clone();
-        let register: ExternalRegister =
-            Box::try_new(move |waker: &Waker| register_source.register(waker)).unwrap();
+        let register: ExternalRegister = Box::try_new(move |waker: &Waker| {
+            ExternalRegistration::poll(Arc::clone(&register_source), waker)
+        })
+        .unwrap();
         let (armed_tx, armed_rx) = mpsc::channel();
         let task_readable = readable.clone();
         let task_control = control.clone();
@@ -907,6 +1189,7 @@ mod tests {
             let _exit = WorkerExit(task_control.clone());
             let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
             let mut cx = Context::from_waker(&waker);
+            let mut registration = None;
             loop {
                 match poll_external_input(
                     &mut reader,
@@ -914,6 +1197,7 @@ mod tests {
                     &poll_tx,
                     &task_control,
                     &register,
+                    &mut registration,
                     &mut cx,
                 ) {
                     Poll::Ready(()) => break,
