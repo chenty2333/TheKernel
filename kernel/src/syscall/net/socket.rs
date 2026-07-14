@@ -14,7 +14,7 @@ use axnet::{
 };
 use axtask::current;
 use linux_raw_sys::{
-    general::{CAP_NET_BIND_SERVICE, O_CLOEXEC, O_NONBLOCK},
+    general::{CAP_NET_BIND_SERVICE, O_CLOEXEC, O_NONBLOCK, O_RDWR},
     net::{
         AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, AF_UNSPEC, AF_VSOCK, IPPROTO_TCP,
         IPPROTO_UDP, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET,
@@ -26,8 +26,8 @@ use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
 use super::addr::SocketAddrExt;
 use crate::{
     file::{
-        AfAlgSocket, FileDescription, FileLike, NetlinkSocket, Socket, add_file_like, af_alg,
-        close_file_like, get_file_like, reserve_fd,
+        AfAlgSocket, FileDescription, FileLike, NetlinkSocket, Socket, add_file_like_with_flags,
+        af_alg, close_file_like, get_file_like, reserve_fd,
     },
     mm::{UserConstPtr, UserPtr},
     task::{AsThread, NetworkNamespace, ns_capable},
@@ -37,6 +37,22 @@ const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
 const SOCK_DCCP: u32 = 6;
 const SOCK_TYPE_MASK: u32 = 0xf;
 const SOCK_CLOEXEC_NONBLOCK_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
+
+const fn socket_status_flags(nonblocking: bool) -> u32 {
+    O_RDWR | if nonblocking { O_NONBLOCK } else { 0 }
+}
+
+fn add_new_socket_like<T: FileLike + 'static>(
+    socket: T,
+    nonblocking: bool,
+    cloexec: bool,
+) -> AxResult<i32> {
+    if nonblocking {
+        socket.set_nonblocking(true)?;
+    }
+    let socket = Arc::try_new(socket).map_err(|_| AxError::NoMemory)?;
+    add_file_like_with_flags(socket, cloexec, socket_status_flags(nonblocking))
+}
 
 fn current_unix_credentials() -> UnixCredentials {
     let curr = current();
@@ -127,10 +143,7 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     if domain == af_alg::AF_ALG {
         AfAlgSocket::validate_socket_type(ty, proto)?;
         let socket = AfAlgSocket::new_listener();
-        if nonblocking {
-            socket.set_nonblocking(true)?;
-        }
-        return socket.add_to_fd_table(cloexec).map(|fd| fd as isize);
+        return add_new_socket_like(socket, nonblocking, cloexec).map(|fd| fd as isize);
     }
 
     if domain == AF_PACKET {
@@ -145,7 +158,8 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
         if nonblocking {
             socket.set_nonblocking(true)?;
         }
-        return add_file_like(socket as _, cloexec).map(|fd| fd as isize);
+        return add_file_like_with_flags(socket as _, cloexec, socket_status_flags(nonblocking))
+            .map(|fd| fd as isize);
     }
 
     let net_stack = net_ns.stack().clone();
@@ -191,11 +205,7 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     };
     let socket = Socket::new(socket, net_ns);
 
-    if nonblocking {
-        socket.set_nonblocking(true)?;
-    }
-
-    socket.add_to_fd_table(cloexec).map(|fd| fd as isize)
+    add_new_socket_like(socket, nonblocking, cloexec).map(|fd| fd as isize)
 }
 
 pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult<isize> {
@@ -333,21 +343,15 @@ pub fn sys_accept4(
 
     if let Ok(socket) = AfAlgSocket::from_fd(fd) {
         let request = socket.accept_request()?;
-        if nonblocking {
-            request.set_nonblocking(true)?;
-        }
         if !addr.is_null() {
             (addrlen.address().as_usize() as *mut socklen_t).vm_write(0)?;
         }
-        return request.add_to_fd_table(cloexec).map(|fd| fd as isize);
+        return add_new_socket_like(request, nonblocking, cloexec).map(|fd| fd as isize);
     }
 
     let socket = Socket::from_fd(fd)?;
     let net_ns = socket.net_namespace().clone();
     let socket = Socket::new(socket.accept()?, net_ns);
-    if nonblocking {
-        socket.set_nonblocking(true)?;
-    }
 
     let remote_addr = socket.peer_addr()?;
     if !addr.is_null() {
@@ -357,7 +361,7 @@ pub fn sys_accept4(
         addrlen_ptr.vm_write(value)?;
     }
 
-    let fd = socket.add_to_fd_table(cloexec).map(|fd| fd as isize)?;
+    let fd = add_new_socket_like(socket, nonblocking, cloexec).map(|fd| fd as isize)?;
     debug!("sys_accept => fd: {fd}, addr: {remote_addr:?}");
 
     Ok(fd)
@@ -436,11 +440,14 @@ pub fn sys_socketpair(
     // and EFAULT leaves no partially installed socket behind.
     let reserved1 = reserve_fd(cloexec)?;
     let reserved2 = reserve_fd(cloexec)?;
-    let description1 = FileDescription::new(
-        Arc::try_new(sock1).map_err(|_| AxError::NoMemory)? as Arc<dyn FileLike>
+    let status_flags = socket_status_flags(nonblocking);
+    let description1 = FileDescription::new_with_flags(
+        Arc::try_new(sock1).map_err(|_| AxError::NoMemory)? as Arc<dyn FileLike>,
+        status_flags,
     )?;
-    let description2 = FileDescription::new(
-        Arc::try_new(sock2).map_err(|_| AxError::NoMemory)? as Arc<dyn FileLike>
+    let description2 = FileDescription::new_with_flags(
+        Arc::try_new(sock2).map_err(|_| AxError::NoMemory)? as Arc<dyn FileLike>,
+        status_flags,
     )?;
     let fd_pair = [reserved1.fd(), reserved2.fd()];
     vm_write_slice(fds.address().as_usize() as *mut i32, &fd_pair)?;
@@ -451,4 +458,15 @@ pub fn sys_socketpair(
         return Err(error);
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_creation_flags_keep_read_write_and_nonblocking_on_the_ofd() {
+        assert_eq!(socket_status_flags(false), O_RDWR);
+        assert_eq!(socket_status_flags(true), O_RDWR | O_NONBLOCK);
+    }
 }

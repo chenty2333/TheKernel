@@ -7,9 +7,9 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs::{FS_CONTEXT, FsContext};
+use axfs::{FS_CONTEXT, FsContext, WritePlacement};
 use axfs_ng_vfs::{
-    Location, Metadata, NodeFlags,
+    DirEntrySink, Location, Metadata, NodeFlags,
     path::{MAX_NAME_LEN, Path},
 };
 use axio::{Cursor, IoBuf, Seek, SeekFrom};
@@ -17,12 +17,12 @@ use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::general::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, RLIM_INFINITY, RLIMIT_FSIZE,
+    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_NONBLOCK, RLIM_INFINITY, RLIMIT_FSIZE,
 };
 use starry_signal::{SignalInfo, Signo};
 
 use super::{
-    FileHandle, FileLike, Kstat, get_file_description, get_file_like, get_typed_file,
+    FileHandle, FileLike, Kstat, OfdIoStatus, get_file_description, get_file_like, get_typed_file,
     permission::DacFsContextExt, try_owned_path,
 };
 use crate::{
@@ -257,36 +257,52 @@ impl File {
     fn is_blocking(&self) -> bool {
         self.inner.location().flags().contains(NodeFlags::BLOCKING)
     }
-}
 
-fn path_for(loc: &Location) -> AxResult<Cow<'static, str>> {
-    let path = loc.absolute_path()?;
-    Ok(Cow::Owned(try_owned_path(path.as_str())?))
-}
-
-impl FileLike for File {
-    fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
+    /// Reads using one immutable open-file-description status snapshot.
+    pub(crate) fn read_with_status(&self, status: OfdIoStatus, dst: &mut IoDst) -> AxResult<usize> {
         let inner = self.inner();
         if likely(self.is_blocking()) {
             inner.read(dst)
         } else {
-            block_on_poll_io(self, IoEvents::READABLE, self.nonblocking(), || {
+            block_on_poll_io(self, IoEvents::READABLE, status.nonblocking(), || {
                 inner.read(&mut *dst)
             })
         }
     }
 
-    fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
+    /// Writes using one immutable open-file-description status snapshot.
+    ///
+    /// Every status-sensitive decision for this operation, including append
+    /// placement and poll behavior, is derived from `status`. Backend status
+    /// mirrors are deliberately not consulted by this path.
+    pub(crate) fn write_with_status(
+        &self,
+        status: OfdIoStatus,
+        src: &mut IoSrc,
+    ) -> AxResult<usize> {
+        self.write_with_explicit_status(status.append(), status.nonblocking(), src)
+    }
+
+    fn write_with_explicit_status(
+        &self,
+        append: bool,
+        nonblocking: bool,
+        src: &mut IoSrc,
+    ) -> AxResult<usize> {
         let inner = self.inner();
+        let inode_append = append
+            && !inner
+                .location()
+                .flags()
+                .contains(NodeFlags::POSITIONED_APPEND);
+        let placement = if inode_append {
+            WritePlacement::End
+        } else {
+            WritePlacement::Current
+        };
         let len = src.remaining();
         let mut limited = None;
         if len != 0 {
-            let appending = inner.flags().contains(axfs::FileFlags::APPEND);
-            let inode_append = appending
-                && !inner
-                    .location()
-                    .flags()
-                    .contains(NodeFlags::POSITIONED_APPEND);
             let offset = if inode_append {
                 inner.location().len()?
             } else {
@@ -310,22 +326,42 @@ impl FileLike for File {
             killpriv_before_content_write(inner.location(), buf.len())?;
             let mut cursor = Cursor::new(buf.as_slice());
             if likely(self.is_blocking()) {
-                inner.write(&mut cursor)
+                inner.write_with_placement(&mut cursor, placement)
             } else {
-                block_on_poll_io(self, IoEvents::WRITABLE, self.nonblocking(), || {
-                    inner.write(&mut cursor)
+                block_on_poll_io(self, IoEvents::WRITABLE, nonblocking, || {
+                    inner.write_with_placement(&mut cursor, placement)
                 })
             }
         } else {
             killpriv_before_content_write(inner.location(), len)?;
             if likely(self.is_blocking()) {
-                inner.write(src)
+                inner.write_with_placement(src, placement)
             } else {
-                block_on_poll_io(self, IoEvents::WRITABLE, self.nonblocking(), || {
-                    inner.write(&mut *src)
+                block_on_poll_io(self, IoEvents::WRITABLE, nonblocking, || {
+                    inner.write_with_placement(&mut *src, placement)
                 })
             }
         }
+    }
+}
+
+fn path_for(loc: &Location) -> AxResult<Cow<'static, str>> {
+    let path = loc.absolute_path()?;
+    Ok(Cow::Owned(try_owned_path(path.as_str())?))
+}
+
+impl FileLike for File {
+    fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
+        self.read_with_status(
+            OfdIoStatus::new(if self.nonblocking() { O_NONBLOCK } else { 0 }),
+            dst,
+        )
+    }
+
+    fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
+        let append = self.inner().flags().contains(axfs::FileFlags::APPEND);
+        let nonblocking = self.nonblocking();
+        self.write_with_explicit_status(append, nonblocking, src)
     }
 
     fn stat(&self) -> AxResult<Kstat> {
@@ -404,6 +440,19 @@ impl Directory {
     }
 }
 
+impl FileHandle<Directory> {
+    /// Enumerates directory data through this exact open file description.
+    ///
+    /// Path walking may legitimately use an `O_PATH` directory handle, while
+    /// `getdents64` may not. Keeping enumeration on the handle preserves that
+    /// distinction without putting Linux open flags into the generic VFS
+    /// `Location`.
+    pub(crate) fn read_dir(&self, offset: u64, sink: &mut dyn DirEntrySink) -> AxResult<usize> {
+        self.check_io_access()?;
+        Ok(self.inner.read_dir(offset, sink)?)
+    }
+}
+
 impl FileLike for Directory {
     fn read(&self, _dst: &mut IoDst) -> AxResult<usize> {
         Err(AxError::IsADirectory)
@@ -455,12 +504,74 @@ impl Pollable for Directory {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
+    use alloc::{sync::Arc, vec};
 
-    use axfs_ng_vfs::{Mountpoint, NodePermission, NodeType};
+    use axfs_ng_vfs::{DirEntrySink, Mountpoint, NodePermission, NodeType};
+    use linux_raw_sys::general::{O_DIRECTORY, O_PATH};
 
     use super::*;
-    use crate::pseudofs::tmp;
+    use crate::{file::FileDescription, pseudofs::tmp};
+
+    struct RecordingDirSink {
+        called: bool,
+    }
+
+    impl DirEntrySink for RecordingDirSink {
+        fn accept(&mut self, _name: &str, _ino: u64, _node_type: NodeType, _offset: u64) -> bool {
+            self.called = true;
+            true
+        }
+    }
+
+    #[test]
+    fn search_only_opath_directory_rejects_getdents_and_data_callbacks() {
+        let fs = tmp::MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let loc = mount
+            .root_location()
+            .create(
+                "search-only-opath",
+                NodeType::Directory,
+                NodePermission::from_bits_truncate(0o111),
+            )
+            .unwrap();
+        let directory = Arc::new(Directory::new(loc));
+        let description =
+            FileDescription::new_with_flags(directory.clone(), O_PATH | O_DIRECTORY).unwrap();
+        let handle = FileHandle {
+            description,
+            file: directory,
+        };
+
+        assert!(handle.is_path_only());
+        // ioctl/FIONBIO and sync-family syscalls share this exact OFD gate.
+        assert_eq!(handle.check_io_access(), Err(AxError::BadFileDescriptor));
+        assert_eq!(handle.poll_events_for_poll(), IoEvents::INVALID);
+        // select deliberately polls the inner object and applies its separate
+        // O_PATH ready-set rule instead of inheriting poll's POLLNVAL result.
+        assert_eq!(handle.poll(), IoEvents::READABLE | IoEvents::WRITABLE);
+
+        let mut sink = RecordingDirSink { called: false };
+        let result = handle.read_dir(0, &mut sink);
+        assert_eq!(result, Err(AxError::BadFileDescriptor));
+        assert!(!sink.called);
+
+        let mut read_called = false;
+        let result = handle.with_read_credentials(|| {
+            read_called = true;
+            Ok(())
+        });
+        assert_eq!(result, Err(AxError::BadFileDescriptor));
+        assert!(!read_called);
+
+        let mut write_called = false;
+        let result = handle.with_write_credentials(|_status| {
+            write_called = true;
+            Ok(())
+        });
+        assert_eq!(result, Err(AxError::BadFileDescriptor));
+        assert!(!write_called);
+    }
 
     #[test]
     fn cached_write_hook_kills_capability_before_mutation_but_empty_write_does_not() {

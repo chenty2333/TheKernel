@@ -22,6 +22,7 @@ use linux_vfs::{
     PathLimits, ResolveFlags, TopologyEvent, WalkBudget, WalkError,
 };
 use starry_signal::Signo;
+use thekernel_linux_cred::{FileOpenAccess, FileOpenOperation};
 
 use crate::{
     file::{
@@ -35,17 +36,21 @@ use crate::{
         },
         lease, memfd,
         permission::{
-            check_create_permissions, check_open_permissions, check_pathwalk_search_permission,
+            authorize_file_open, check_create_permissions_with_security,
+            check_open_permissions_with_security, check_pathwalk_search_permission_with_security,
             check_writable_mount, initial_named_create_owner_mode,
         },
         pipe::NamedPipe,
-        prepare_file_description_with_resource, replace_process_fd_table, reserve_fd, resolve_at,
+        prepare_file_description_with_open_lease, replace_process_fd_table, reserve_fd, resolve_at,
         with_path_fs,
     },
     mm::{UserConstPtr, UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
-    syscall::fs::ctl::validate_pathname,
-    task::{AX_FILE_LIMIT, AsThread, DacCredentialView, linux_pid_from_task_id},
+    syscall::fs::{ctl::validate_pathname, io::check_mandatory_fd_truncate_lock},
+    task::{
+        AX_FILE_LIMIT, AsThread, Cred, DacCredentialView, UserNamespace, linux_pid_from_task_id,
+        ns_capable, security::initial_user_namespace,
+    },
     time::wall_time,
 };
 
@@ -60,9 +65,14 @@ fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32))
         match flags & 0b11 {
             O_RDONLY => options.read(true),
             O_WRONLY => options.write(true),
-            _ => options.read(true).write(true),
+            O_RDWR => options.read(true).write(true),
+            _ => options.no_data(true),
         };
-        if flags & O_APPEND != 0 {
+        // `OpenOptions::append(true)` also grants backend write access. Linux
+        // keeps O_APPEND visible in F_GETFL for O_RDONLY and reserved mode-3
+        // descriptions but does not turn either writable, so only project
+        // append when data writes were actually opened.
+        if flags & O_APPEND != 0 && open_has_data_write(flags) {
             options.append(true);
         }
         if flags & O_TRUNC != 0 {
@@ -90,11 +100,43 @@ fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32))
     options
 }
 
+const fn open_has_data_write(flags: u32) -> bool {
+    matches!(flags & O_ACCMODE, O_WRONLY | O_RDWR)
+}
+
 fn open_status_flags(flags: u32) -> u32 {
     let mut status = flags & O_ACCMODE;
     status |=
         flags & (O_APPEND | O_DIRECT | O_DSYNC | O_SYNC | O_NONBLOCK | FASYNC | O_NOATIME | O_PATH);
     status
+}
+
+fn file_open_operation(
+    flags: u32,
+    created: bool,
+    unnamed: bool,
+) -> AxResult<Option<FileOpenOperation>> {
+    // Linux O_PATH returns from do_dentry_open() before security_file_open.
+    // Path traversal still receives per-component inode admission, but there
+    // is no ordinary file-open hook operation to normalize here.
+    if flags & O_PATH != 0 {
+        return Ok(None);
+    };
+    let access = match flags & O_ACCMODE {
+        O_RDONLY => FileOpenAccess::Read,
+        O_WRONLY => FileOpenAccess::Write,
+        O_RDWR => FileOpenAccess::ReadWrite,
+        _ => FileOpenAccess::NoData,
+    };
+    FileOpenOperation::new(
+        access,
+        flags & O_APPEND != 0 && access.writes(),
+        flags & O_TRUNC != 0,
+        created,
+        unnamed,
+    )
+    .map(Some)
+    .ok_or(AxError::InvalidInput)
 }
 
 const FCNTL_SETFL_MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK | FASYNC;
@@ -115,8 +157,8 @@ fn validate_async_signal(sig: c_int) -> AxResult<u8> {
         .ok_or(AxError::InvalidInput)
 }
 
-fn sync_async_io_to_file(description: &FileDescription, fd: c_int) {
-    let enabled = description.status_flags() & FASYNC != 0;
+fn sync_async_io_to_file_flags(description: &FileDescription, fd: c_int, flags: u32) {
+    let enabled = flags & FASYNC != 0;
     let state = description.async_io_state();
     if let Some(pipe) = description.inner.downcast_ref::<Pipe>() {
         pipe.set_async_io(enabled, state, fd);
@@ -153,18 +195,7 @@ fn open_access_mask(flags: c_int) -> u32 {
 
 fn open_requires_writable_mount(flags: c_int) -> bool {
     let flags = flags as u32;
-    flags & O_PATH == 0 && (flags & O_ACCMODE != O_RDONLY || flags & O_TRUNC != 0)
-}
-
-fn check_executable_open_rules(loc: &Location, flags: c_int) -> AxResult<()> {
-    let flags = flags as u32;
-    if flags & O_PATH != 0 {
-        return Ok(());
-    }
-    if flags & O_TRUNC != 0 || flags & O_ACCMODE != O_RDONLY {
-        executable::check_not_active(loc)?;
-    }
-    Ok(())
+    flags & O_PATH == 0 && (open_has_data_write(flags) || flags & O_TRUNC != 0)
 }
 
 fn touch_truncated_metadata(loc: &Location) -> AxResult<()> {
@@ -182,11 +213,25 @@ fn invalid_directory_open(flags: c_int) -> bool {
     (flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC)) != 0
 }
 
-fn enforce_special_open_rules(loc: &Location, flags: c_int, uid: u32) -> AxResult {
+fn noatime_allowed(flags: u32, owner_match: bool, fowner_capable: bool) -> bool {
+    flags & O_NOATIME == 0 || owner_match || fowner_capable
+}
+
+fn enforce_special_open_rules(
+    loc: &Location,
+    flags: c_int,
+    security: &OpenPathSecurityContext,
+) -> AxResult {
     let flags = flags as u32;
     let metadata = loc.metadata()?;
 
-    if flags & O_NOATIME != 0 && uid != 0 && uid != metadata.uid {
+    let owner_match = security.credentials.uid().into_raw() == metadata.uid;
+    let fowner_capable = ns_capable(
+        &security.actor,
+        &security.filesystem_owner_user_ns,
+        CAP_FOWNER,
+    );
+    if !noatime_allowed(flags, owner_match, fowner_capable) {
         return Err(AxError::OperationNotPermitted);
     }
     if flags & O_NOFOLLOW != 0 && flags & O_PATH == 0 && metadata.node_type == NodeType::Symlink {
@@ -240,7 +285,9 @@ const OPEN_NAMESPACE_RESOLVE_FLAGS: u64 =
     (RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_NO_XDEV) as u64;
 
 const fn open_requires_namespace_operation(flags: u32, resolve: u64) -> bool {
-    flags & (O_CREAT | __O_TMPFILE | O_TRUNC) != 0 || resolve & OPEN_NAMESPACE_RESOLVE_FLAGS != 0
+    open_has_data_write(flags)
+        || flags & (O_CREAT | __O_TMPFILE | O_TRUNC) != 0
+        || resolve & OPEN_NAMESPACE_RESOLVE_FLAGS != 0
 }
 
 const MAX_FILE_HANDLE_SZ: u32 = 128;
@@ -346,9 +393,25 @@ struct Openat2PathwalkPolicy {
     budget: WalkBudget,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 struct OpenPathSecurityContext {
+    actor: Arc<Cred>,
+    credentials: DacCredentialView,
+    filesystem_owner_user_ns: Arc<UserNamespace>,
     umask: u32,
+}
+
+impl OpenPathSecurityContext {
+    fn new(actor: Arc<Cred>, umask: u32) -> Self {
+        let credentials = actor.fs_dac_credentials();
+        let filesystem_owner_user_ns = initial_user_namespace(actor.user_ns());
+        Self {
+            actor,
+            credentials,
+            filesystem_owner_user_ns,
+            umask,
+        }
+    }
 }
 
 impl Openat2PathwalkPolicy {
@@ -463,7 +526,7 @@ struct ExecutableWriteReservation {
 impl ExecutableWriteReservation {
     fn acquire(loc: &Location, flags: u32) -> AxResult<Self> {
         let needs_exclusion =
-            flags & O_PATH == 0 && (flags & O_TRUNC != 0 || flags & O_ACCMODE != O_RDONLY);
+            flags & O_PATH == 0 && (flags & O_TRUNC != 0 || open_has_data_write(flags));
         let key = if needs_exclusion {
             executable::retain_write_open(loc)?
         } else {
@@ -471,7 +534,7 @@ impl ExecutableWriteReservation {
         };
         Ok(Self {
             key,
-            persistent: flags & O_PATH == 0 && flags & O_ACCMODE != O_RDONLY,
+            persistent: flags & O_PATH == 0 && open_has_data_write(flags),
         })
     }
 
@@ -490,6 +553,7 @@ fn prepare_open_description(
     result: OpenResult,
     flags: u32,
     write_open_key: Option<executable::ExecutableKey>,
+    open_lease_admission: lease::OpenLeaseAdmission,
 ) -> AxResult<Arc<FileDescription>> {
     let mut description_resource: Option<DescriptionResource> = None;
     let f: Arc<dyn FileLike> = match result {
@@ -567,12 +631,29 @@ fn prepare_open_description(
     if flags & O_NONBLOCK != 0 {
         f.set_nonblocking(true)?;
     }
-    prepare_file_description_with_resource(
+    prepare_file_description_with_open_lease(
         f,
         open_status_flags(flags),
         write_open_key,
         description_resource,
+        open_lease_admission,
     )
+}
+
+/// Runs a fallible policy admission against the exact resolved location before
+/// the generic filesystem open can execute `O_TRUNC` or another open-time
+/// side effect. The callback remains mechanism-neutral and is also the seam a
+/// lower layer could eventually expose between filesystem open and truncate.
+fn open_loc_after_admission<R>(
+    options: &OpenOptions,
+    loc: Location,
+    admission: impl FnOnce(&Location) -> AxResult<()>,
+    prepare: impl FnOnce(&Location) -> AxResult<R>,
+) -> AxResult<(OpenResult, R)> {
+    admission(&loc)?;
+    let resource = prepare(&loc)?;
+    let result = options.open_loc_deferred_truncate(loc)?;
+    Ok((result, resource))
 }
 
 fn try_pty_name(number: u32) -> AxResult<String> {
@@ -587,8 +668,10 @@ fn publish_reserved_open(
     flags: u32,
     reservation: ReservedFd,
     write_open_key: Option<executable::ExecutableKey>,
+    open_lease_admission: lease::OpenLeaseAdmission,
 ) -> AxResult<i32> {
-    let description = prepare_open_description(result, flags, write_open_key)?;
+    let description =
+        prepare_open_description(result, flags, write_open_key, open_lease_admission)?;
     reservation.publish(description)
 }
 
@@ -664,11 +747,10 @@ fn open_in_fs(
     path: &str,
     flags: i32,
     mode: __kernel_mode_t,
-    credentials: &DacCredentialView,
-    umask: u32,
+    security: &OpenPathSecurityContext,
 ) -> AxResult<isize> {
     let mut policy = Openat2PathwalkPolicy::legacy()?;
-    open_in_fs_with_policy(fs, path, flags, mode, credentials, umask, &mut policy)
+    open_in_fs_with_policy(fs, path, flags, mode, security, &mut policy)
 }
 
 fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
@@ -676,17 +758,18 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
     path: &str,
     flags: i32,
     mode: __kernel_mode_t,
-    credentials: &DacCredentialView,
-    umask: u32,
+    security: &OpenPathSecurityContext,
     policy: &mut P,
 ) -> AxResult<isize> {
     validate_pathname(Path::new(path))?;
     debug!("sys_openat <= {path:?} {flags:#o} {mode:#o}");
 
+    let credentials = &security.credentials;
     let uid = credentials.uid().into_raw();
     let gid = credentials.gid().into_raw();
     let requested_mode = NodePermission::from_bits_truncate(mode as u16);
-    let masked_mode = NodePermission::from_bits_truncate(requested_mode.bits() & !(umask as u16));
+    let masked_mode =
+        NodePermission::from_bits_truncate(requested_mode.bits() & !(security.umask as u16));
     let resolve_options = flags_to_options(flags, requested_mode.bits() as _, (uid, gid));
     // Linux reserves a numeric slot before path lookup can create a name or
     // truncate an existing inode. The reservation is invisible until the OFD
@@ -695,17 +778,28 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
     let (loc, created) = resolve_options.resolve_location_with_policy(
         fs,
         path,
-        &mut |dir| check_pathwalk_search_permission(dir, credentials),
+        &mut |dir| {
+            check_pathwalk_search_permission_with_security(
+                dir,
+                &security.actor,
+                credentials,
+                &security.filesystem_owner_user_ns,
+            )
+        },
         &mut |dir, create_options| {
-            check_create_permissions(dir, credentials)?;
-            check_writable_mount(dir)?;
+            check_create_permissions_with_security(
+                dir,
+                &security.actor,
+                credentials,
+                &security.filesystem_owner_user_ns,
+            )?;
             let parent = dir.metadata()?;
             let (final_mode, owner) = initial_named_create_owner_mode(
                 &parent,
                 credentials,
                 create_options.node_type,
                 requested_mode,
-                umask,
+                security.umask,
             );
             create_options.permission = final_mode;
             create_options.user = Some(owner);
@@ -727,35 +821,29 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
     }
 
     let opened_existing = !created;
+    let truncates_regular = opened_existing
+        && (flags as u32) & O_TRUNC != 0
+        && loc.node_type() == NodeType::RegularFile;
     let open_result = (|| {
         enforce_trailing_slash_directory(path, &loc)?;
-        enforce_special_open_rules(&loc, flags, uid)?;
+        enforce_special_open_rules(&loc, flags, security)?;
         if loc.is_dir() && invalid_directory_open(flags) {
             return Err(AxError::IsADirectory);
         }
         if opened_existing {
-            check_open_permissions(&loc, open_access_mask(flags), credentials)?;
-            check_executable_open_rules(&loc, flags)?;
+            check_open_permissions_with_security(
+                &loc,
+                open_access_mask(flags),
+                &security.actor,
+                credentials,
+                &security.filesystem_owner_user_ns,
+            )?;
             if open_requires_writable_mount(flags) {
                 check_writable_mount(&loc)?;
             }
-            lease::wait_for_open(&loc, flags)?;
-            if (flags as u32) & O_PATH == 0 {
-                crate::file::fanotify::permission_check(
-                    &loc,
-                    &loc,
-                    crate::file::fanotify::FAN_OPEN_PERM,
-                    loc.is_dir(),
-                    false,
-                )?;
-            }
         }
 
-        // Atomically serialize exec against write access before open_loc can
-        // truncate or otherwise mutate the inode.  A read-only O_TRUNC keeps a
-        // transient reservation only through truncate; a writable OFD
-        // transfers the reference into FileDescription cleanup.
-        let mut write_open = ExecutableWriteReservation::acquire(&loc, flags as u32)?;
+        let file_open_operation = file_open_operation(flags as u32, created, false)?;
 
         let mut effective_flags = flags;
         if created {
@@ -768,31 +856,110 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
         }
 
         let options = flags_to_options(effective_flags, masked_mode.bits() as _, (uid, gid));
-        let result = options.open_loc(loc.clone())?;
-        if opened_existing && (flags as u32) & O_TRUNC != 0 {
-            // Metadata failure must not occur after fd publication and turn a
-            // returned error into a hidden live descriptor.
-            touch_truncated_metadata(&loc)?;
+        // Linux obtains persistent write access (and therefore reports
+        // ETXTBSY/ENFILE) before security_file_open. Keep the RAII token live
+        // through every later admission and transfer it into the OFD only on
+        // success. Read-only O_TRUNC instead takes a transient token after the
+        // ordinary hook/fanotify/lease sequence.
+        let mut write_open = if open_has_data_write(flags as u32) {
+            Some(ExecutableWriteReservation::acquire(&loc, flags as u32)?)
+        } else {
+            None
+        };
+        let (result, (late_write_open, lease_admission)) = open_loc_after_admission(
+            &options,
+            loc.clone(),
+            |candidate| {
+                let Some(operation) = file_open_operation else {
+                    return Ok(());
+                };
+                authorize_file_open(
+                    candidate,
+                    &security.actor,
+                    credentials,
+                    &security.filesystem_owner_user_ns,
+                    operation,
+                )
+            },
+            |candidate| {
+                // Match Linux's security_file_open -> fanotify open permission
+                // -> lease break ordering. None of these fallible operations
+                // runs after the filesystem open or truncate side effect.
+                if (flags as u32) & O_PATH == 0 {
+                    crate::file::fanotify::permission_check(
+                        candidate,
+                        candidate,
+                        crate::file::fanotify::FAN_OPEN_PERM,
+                        candidate.is_dir(),
+                        false,
+                    )?;
+                }
+                let lease_admission = lease::admit_open(candidate, flags)?;
+                let late_write_open = if write_open.is_none() {
+                    Some(ExecutableWriteReservation::acquire(
+                        candidate,
+                        flags as u32,
+                    )?)
+                } else {
+                    None
+                };
+                Ok((late_write_open, lease_admission))
+            },
+        )?;
+        if write_open.is_none() {
+            write_open = late_write_open;
         }
-        publish_reserved_open(
+        let mut write_open = write_open.ok_or(AxError::BadState)?;
+        // Construct the complete OFD and reserve its exact table publication
+        // before a destructive truncate. Once set_len(0) succeeds, only the
+        // infallible Pending -> Visible commit remains.
+        let description = prepare_open_description(
             result,
             effective_flags as _,
-            reservation,
             write_open.transfer_persistent(),
-        )
-        .map(|fd| fd as isize)
+            lease_admission,
+        )?;
+        let publication = reservation.prepare_publication(description.clone())?;
+        if truncates_regular {
+            let status = description.io_status_snapshot();
+            check_mandatory_fd_truncate_lock(
+                &loc,
+                0,
+                description.flock_owner(),
+                status.nonblocking(),
+            )?;
+            let file = description
+                .inner
+                .downcast_ref::<File>()
+                .ok_or(AxError::BadState)?;
+            file.inner().backend()?.set_len(0)?;
+            // A post-truncate metadata failure cannot be reported without
+            // lying that this destructive open left the inode untouched.
+            // Filesystems should update truncate timestamps as part of
+            // set_len; retain this compatibility update as best effort.
+            if let Err(error) = touch_truncated_metadata(&loc) {
+                warn!("open truncate metadata update failed: {error}");
+            }
+        }
+        let fd = publication.commit() as isize;
+        Ok(fd)
     })();
     let fd = open_result?;
-    if opened_existing && (flags as u32) & O_TRUNC != 0 {
+    // Notifications remain after the full transaction so a failed open has
+    // no synthetic residue. On the successful path preserve Linux's relative
+    // ordering: the open event precedes truncate mutation notifications.
+    if (flags as u32) & O_PATH == 0 {
+        if let Err(error) = notify_parent(&loc, IN_OPEN) {
+            warn!("open parent notification failed: {error}");
+        }
+        if let Err(error) = notify_exact(&loc, IN_OPEN) {
+            warn!("open notification failed: {error}");
+        }
+    }
+    if truncates_regular {
         if let Err(error) = notify_exact(&loc, IN_MODIFY | IN_ATTRIB) {
             warn!("open truncate notification failed: {error}");
         }
-    }
-    if let Err(error) = notify_parent(&loc, IN_OPEN) {
-        warn!("open parent notification failed: {error}");
-    }
-    if let Err(error) = notify_exact(&loc, IN_OPEN) {
-        warn!("open notification failed: {error}");
     }
 
     Ok(fd)
@@ -812,19 +979,15 @@ pub(crate) fn openat_inner(
 ) -> AxResult<isize> {
     let curr = current();
     let thread = curr.as_thread();
-    let credentials = thread.fs_dac_credentials();
-    let security = OpenPathSecurityContext {
-        umask: thread.proc_data.umask(),
-    };
-    openat_inner_with_credentials(dirfd, path, flags, mode, &credentials, security)
+    let security = OpenPathSecurityContext::new(thread.current_cred(), thread.proc_data.umask());
+    openat_inner_with_context(dirfd, path, flags, mode, security)
 }
 
-fn openat_inner_with_credentials(
+fn openat_inner_with_context(
     dirfd: c_int,
     path: &str,
     flags: i32,
     mode: __kernel_mode_t,
-    credentials: &DacCredentialView,
     security: OpenPathSecurityContext,
 ) -> AxResult<isize> {
     let flags = normalize_legacy_open_flags(flags)?;
@@ -836,20 +999,12 @@ fn openat_inner_with_credentials(
     if (flags as u32 & O_TMPFILE) == O_TMPFILE {
         let mut policy = Openat2PathwalkPolicy::legacy()?;
         return with_path_fs(dirfd, Path::new(path), |fs| {
-            open_tmpfile_in_fs(
-                fs,
-                path,
-                flags,
-                mode,
-                credentials,
-                security.umask,
-                &mut policy,
-            )
+            open_tmpfile_in_fs(fs, path, flags, mode, &security, &mut policy)
         });
     }
 
     with_path_fs(dirfd, Path::new(path), |fs| {
-        open_in_fs(fs, path, flags, mode, credentials, security.umask)
+        open_in_fs(fs, path, flags, mode, &security)
     })
 }
 
@@ -858,8 +1013,7 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
     path: &str,
     flags: i32,
     mode: __kernel_mode_t,
-    credentials: &DacCredentialView,
-    umask: u32,
+    security: &OpenPathSecurityContext,
     policy: &mut P,
 ) -> AxResult<isize> {
     if (flags as u32 & O_ACCMODE) == O_RDONLY {
@@ -871,23 +1025,42 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
     if path_ref.as_str().is_empty() {
         return Err(AxError::NotFound);
     }
+    let credentials = &security.credentials;
     let reservation = reserve_fd((flags as u32) & O_CLOEXEC != 0)?;
     let dir_loc = if flags as u32 & O_NOFOLLOW != 0 {
         fs.resolve_no_follow_with_policy(
             path_ref,
-            &mut |dir| check_pathwalk_search_permission(dir, credentials),
+            &mut |dir| {
+                check_pathwalk_search_permission_with_security(
+                    dir,
+                    &security.actor,
+                    credentials,
+                    &security.filesystem_owner_user_ns,
+                )
+            },
             policy,
         )
     } else {
         fs.resolve_with_policy(
             path_ref,
-            &mut |dir| check_pathwalk_search_permission(dir, credentials),
+            &mut |dir| {
+                check_pathwalk_search_permission_with_security(
+                    dir,
+                    &security.actor,
+                    credentials,
+                    &security.filesystem_owner_user_ns,
+                )
+            },
             policy,
         )
     }?;
     dir_loc.check_is_dir()?;
-    check_create_permissions(&dir_loc, credentials)?;
-    check_writable_mount(&dir_loc)?;
+    check_create_permissions_with_security(
+        &dir_loc,
+        &security.actor,
+        credentials,
+        &security.filesystem_owner_user_ns,
+    )?;
 
     let parent_meta = dir_loc.metadata()?;
     let (final_mode, owner) = initial_named_create_owner_mode(
@@ -895,7 +1068,7 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
         credentials,
         NodeType::RegularFile,
         NodePermission::from_bits_truncate(mode as u16),
-        umask,
+        security.umask,
     );
 
     let open_flags = flags as u32 & !(O_TMPFILE | O_DIRECTORY | O_EXCL);
@@ -905,15 +1078,57 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
         owner,
     );
     let loc = options.create_anonymous_location(&dir_loc, flags as u32 & O_EXCL == 0)?;
-    let mut write_open = ExecutableWriteReservation::acquire(&loc, open_flags)?;
-    let result = options.open_loc(loc)?;
-    publish_reserved_open(
+    let file_open_operation =
+        file_open_operation(open_flags, true, true)?.ok_or(AxError::InvalidInput)?;
+    let mut write_open = if open_has_data_write(open_flags) {
+        Some(ExecutableWriteReservation::acquire(&loc, open_flags)?)
+    } else {
+        None
+    };
+    let (result, (late_write_open, lease_admission)) = open_loc_after_admission(
+        &options,
+        loc.clone(),
+        |candidate| {
+            authorize_file_open(
+                candidate,
+                &security.actor,
+                credentials,
+                &security.filesystem_owner_user_ns,
+                file_open_operation,
+            )
+        },
+        |candidate| {
+            crate::file::fanotify::permission_check(
+                candidate,
+                candidate,
+                crate::file::fanotify::FAN_OPEN_PERM,
+                false,
+                false,
+            )?;
+            let lease_admission = lease::admit_open(candidate, open_flags as i32)?;
+            let late_write_open = if write_open.is_none() {
+                Some(ExecutableWriteReservation::acquire(candidate, open_flags)?)
+            } else {
+                None
+            };
+            Ok((late_write_open, lease_admission))
+        },
+    )?;
+    if write_open.is_none() {
+        write_open = late_write_open;
+    }
+    let mut write_open = write_open.ok_or(AxError::BadState)?;
+    let fd = publish_reserved_open(
         result,
         open_flags,
         reservation,
         write_open.transfer_persistent(),
-    )
-    .map(|fd| fd as isize)
+        lease_admission,
+    )?;
+    if let Err(error) = notify_exact(&loc, IN_OPEN) {
+        warn!("tmpfile open notification failed: {error}");
+    }
+    Ok(fd as isize)
 }
 
 pub fn sys_openat(
@@ -962,10 +1177,7 @@ pub fn sys_openat2(
     }
     let curr = current();
     let thread = curr.as_thread();
-    let credentials = thread.fs_dac_credentials();
-    let security = OpenPathSecurityContext {
-        umask: thread.proc_data.umask(),
-    };
+    let security = OpenPathSecurityContext::new(thread.current_cred(), thread.proc_data.umask());
     // Use one guard for both scoped pathwalk and creation. Combining the
     // predicates before acquisition avoids recursively locking the non-
     // reentrant namespace mutex when openat2 requests both.
@@ -973,12 +1185,12 @@ pub fn sys_openat2(
         .then(crate::mounts::namespace_operation);
     let mut fs = openat2_context(dirfd, path_ref, how.resolve)?;
     let context = LinuxPathContext::new(
-        credentials,
+        security,
         mount_namespace,
         fs.root_dir().clone(),
         fs.current_dir().clone(),
         how.resolve,
-        security,
+        (),
         PathLimits::LINUX_DEFAULT,
     )
     .map_err(|error| match error {
@@ -994,7 +1206,6 @@ pub fn sys_openat2(
             flags,
             how.mode as __kernel_mode_t,
             context.credentials(),
-            context.security_hooks().umask,
             &mut policy,
         )
     } else {
@@ -1004,7 +1215,6 @@ pub fn sys_openat2(
             flags,
             how.mode as __kernel_mode_t,
             context.credentials(),
-            context.security_hooks().umask,
             &mut policy,
         )
     }
@@ -1124,14 +1334,25 @@ fn validate_record_lock_access(
     lock: &flock64,
 ) -> AxResult<()> {
     let flags = description.status_flags();
-    match lock.l_type {
-        ty if ty == F_RDLCK as i16 && (flags & O_PATH != 0 || flags & O_ACCMODE == O_WRONLY) => {
-            Err(AxError::BadFileDescriptor)
+    if record_lock_access_allowed(flags, lock.l_type) {
+        Ok(())
+    } else {
+        Err(AxError::BadFileDescriptor)
+    }
+}
+
+fn record_lock_access_allowed(flags: u32, lock_type: i16) -> bool {
+    if flags & O_PATH != 0 {
+        return lock_type != F_RDLCK as i16 && lock_type != F_WRLCK as i16;
+    }
+    match lock_type {
+        ty if ty == F_RDLCK as i16 => {
+            matches!(flags & O_ACCMODE, O_RDONLY | O_RDWR)
         }
-        ty if ty == F_WRLCK as i16 && (flags & O_PATH != 0 || flags & O_ACCMODE == O_RDONLY) => {
-            Err(AxError::BadFileDescriptor)
+        ty if ty == F_WRLCK as i16 => {
+            matches!(flags & O_ACCMODE, O_WRONLY | O_RDWR)
         }
-        _ => Ok(()),
+        _ => true,
     }
 }
 
@@ -1253,11 +1474,7 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
         }
         F_SETLEASE => {
             let file = File::from_fd(fd)?;
-            lease::set_lease(
-                file.as_ref(),
-                get_file_description(fd)?.flock_owner(),
-                arg as i32,
-            )?;
+            lease::set_lease(file.as_ref(), file.open_file_description_key(), arg as i32)?;
             Ok(0)
         }
         F_GETLEASE => {
@@ -1273,7 +1490,7 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
                 AsyncIoOwner::pid(owner as _)?
             };
             description.set_async_io_owner(owner);
-            sync_async_io_to_file(&description, fd);
+            sync_async_io_to_file_flags(&description, fd, description.io_status_snapshot().raw());
             Ok(0)
         }
         F_GETOWN => {
@@ -1301,7 +1518,7 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
                 _ => return Err(AxError::InvalidInput),
             };
             description.set_async_io_owner(owner);
-            sync_async_io_to_file(&description, fd);
+            sync_async_io_to_file_flags(&description, fd, description.io_status_snapshot().raw());
             Ok(0)
         }
         F_GETOWN_EX => {
@@ -1323,7 +1540,7 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
         F_SETSIG => {
             let description = get_file_description(fd)?;
             description.set_async_io_signal(validate_async_signal(arg as c_int)?);
-            sync_async_io_to_file(&description, fd);
+            sync_async_io_to_file_flags(&description, fd, description.io_status_snapshot().raw());
             Ok(0)
         }
         F_GETSIG => {
@@ -1363,23 +1580,22 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
         }
         F_SETFL => {
             let description = get_file_description(fd)?;
-            let new_flags = (description.status_flags() & !FCNTL_SETFL_MUTABLE_FLAGS)
-                | ((arg as u32) & FCNTL_SETFL_MUTABLE_FLAGS);
-            description
-                .inner
-                .set_nonblocking(new_flags & O_NONBLOCK != 0)?;
-            description.set_status_flags(new_flags);
-            sync_async_io_to_file(&description, fd);
+            let requested = (arg as u32) & FCNTL_SETFL_MUTABLE_FLAGS;
+            description.transition_status_flags(
+                |old| (old.raw() & !FCNTL_SETFL_MUTABLE_FLAGS) | requested,
+                |old, new| {
+                    if old.nonblocking() != new.nonblocking() {
+                        description.inner.set_nonblocking(new.nonblocking())?;
+                    }
+                    sync_async_io_to_file_flags(&description, fd, new.raw());
+                    Ok(())
+                },
+            )?;
             Ok(0)
         }
         F_GETFL => {
             let description = get_file_description(fd)?;
-            let mut ret = description.status_flags();
-            if description.inner.nonblocking() {
-                ret |= O_NONBLOCK;
-            }
-
-            Ok(ret as _)
+            Ok(description.io_status_snapshot().raw() as _)
         }
         F_GETFD => {
             let cloexec = FD_TABLE.get_cloexec(fd)?;
@@ -1416,19 +1632,46 @@ pub fn sys_flock(fd: c_int, operation: c_int) -> AxResult<isize> {
     debug!("flock <= fd: {fd}, operation: {operation}");
 
     let description = get_file_description(fd)?;
+    let locks_data = flock_operation_locks_data(operation)?;
+    let flags = description.status_flags();
+    if flags & O_PATH != 0 || (locks_data && flags & O_ACCMODE == O_ACCMODE) {
+        return Err(AxError::BadFileDescriptor);
+    }
     let stat = description.inner.stat()?;
 
     crate::file::flock::do_flock((stat.dev, stat.ino), description.flock_owner(), operation)?;
     Ok(0)
 }
 
+fn flock_operation_locks_data(operation: c_int) -> AxResult<bool> {
+    const LOCK_SH: c_int = 1;
+    const LOCK_EX: c_int = 2;
+    const LOCK_NB: c_int = 4;
+    const LOCK_UN: c_int = 8;
+
+    match operation & !LOCK_NB {
+        LOCK_SH | LOCK_EX => Ok(true),
+        LOCK_UN => Ok(false),
+        _ => Err(AxError::InvalidInput),
+    }
+}
+
 #[cfg(test)]
 mod namespace_operation_tests {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use axfs_ng_vfs::{Mountpoint, NodePermission, NodeType};
+
     use super::*;
+    use crate::pseudofs::tmp::MemoryFs;
 
     #[test]
     fn creative_open_and_scoped_walk_share_one_namespace_lock_domain() {
         assert!(!open_requires_namespace_operation(O_RDONLY, 0));
+        assert!(!open_requires_namespace_operation(O_RDONLY | O_APPEND, 0));
+        assert!(!open_requires_namespace_operation(O_ACCMODE, 0));
+        assert!(open_requires_namespace_operation(O_WRONLY, 0));
+        assert!(open_requires_namespace_operation(O_RDWR, 0));
         assert!(open_requires_namespace_operation(O_CREAT | O_WRONLY, 0));
         assert!(open_requires_namespace_operation(O_TRUNC | O_WRONLY, 0));
         assert!(open_requires_namespace_operation(
@@ -1443,5 +1686,158 @@ mod namespace_operation_tests {
                 resolve as u64
             ));
         }
+    }
+
+    #[test]
+    fn normalized_file_open_operation_preserves_path_truncate_and_tmpfile_facts() {
+        assert!(file_open_operation(O_PATH, false, false).unwrap().is_none());
+
+        let truncate = file_open_operation(O_RDONLY | O_TRUNC, false, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(truncate.access(), FileOpenAccess::Read);
+        assert!(truncate.truncate());
+
+        let read_append = file_open_operation(O_RDONLY | O_APPEND, false, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_append.access(), FileOpenAccess::Read);
+        assert!(!read_append.append());
+
+        let unnamed = file_open_operation(O_WRONLY, true, true).unwrap().unwrap();
+        assert_eq!(unnamed.access(), FileOpenAccess::Write);
+        assert!(unnamed.created());
+        assert!(unnamed.unnamed());
+
+        let no_data = file_open_operation(O_ACCMODE, false, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(no_data.access(), FileOpenAccess::NoData);
+        assert!(!no_data.access().reads());
+        assert!(!no_data.access().writes());
+
+        let unnamed_no_data = file_open_operation(O_ACCMODE, true, true).unwrap().unwrap();
+        assert_eq!(unnamed_no_data.access(), FileOpenAccess::NoData);
+        assert!(unnamed_no_data.unnamed());
+    }
+
+    #[test]
+    fn noatime_requires_owner_match_or_namespace_relative_fowner() {
+        assert!(noatime_allowed(O_RDONLY, false, false));
+        assert!(noatime_allowed(O_NOATIME, true, false));
+        assert!(noatime_allowed(O_NOATIME, false, true));
+        assert!(!noatime_allowed(O_NOATIME, false, false));
+    }
+
+    #[test]
+    fn reserved_no_data_mode_cannot_acquire_record_locks() {
+        assert!(!record_lock_access_allowed(O_ACCMODE, F_RDLCK as i16));
+        assert!(!record_lock_access_allowed(O_ACCMODE, F_WRLCK as i16));
+        assert!(record_lock_access_allowed(O_ACCMODE, F_UNLCK as i16));
+
+        assert!(record_lock_access_allowed(O_RDONLY, F_RDLCK as i16));
+        assert!(!record_lock_access_allowed(O_RDONLY, F_WRLCK as i16));
+        assert!(!record_lock_access_allowed(O_WRONLY, F_RDLCK as i16));
+        assert!(record_lock_access_allowed(O_WRONLY, F_WRLCK as i16));
+        assert!(record_lock_access_allowed(O_RDWR, F_RDLCK as i16));
+        assert!(record_lock_access_allowed(O_RDWR, F_WRLCK as i16));
+    }
+
+    #[test]
+    fn whole_file_lock_access_distinguishes_no_data_from_path_only() {
+        const LOCK_SH: c_int = 1;
+        const LOCK_EX: c_int = 2;
+        const LOCK_NB: c_int = 4;
+        const LOCK_UN: c_int = 8;
+
+        assert_eq!(flock_operation_locks_data(LOCK_SH), Ok(true));
+        assert_eq!(flock_operation_locks_data(LOCK_EX | LOCK_NB), Ok(true));
+        assert_eq!(flock_operation_locks_data(LOCK_UN), Ok(false));
+        assert_eq!(flock_operation_locks_data(0), Err(AxError::InvalidInput));
+
+        let no_data = O_ACCMODE;
+        assert!(flock_operation_locks_data(LOCK_SH).unwrap());
+        assert_eq!(no_data & O_ACCMODE, O_ACCMODE);
+        assert_eq!(O_PATH & O_PATH, O_PATH);
+    }
+
+    #[test]
+    fn denied_pre_open_admission_cannot_truncate_or_prepare_a_write_lease() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let loc = mount
+            .root_location()
+            .create(
+                "deny-before-truncate",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let node = loc.entry().as_file().unwrap();
+        node.write_at(b"retained", 0).unwrap();
+
+        let options = flags_to_options(O_RDONLY as i32 | O_TRUNC as i32, 0o600, (0, 0));
+        let prepared = AtomicBool::new(false);
+        let result = open_loc_after_admission(
+            &options,
+            loc.clone(),
+            |_| Err(AxError::PermissionDenied),
+            |_| {
+                prepared.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(AxError::PermissionDenied)));
+        assert!(!prepared.load(Ordering::SeqCst));
+        assert_eq!(node.len().unwrap(), b"retained".len() as u64);
+    }
+
+    #[test]
+    fn read_only_append_stays_read_only_below_the_ofd_status_layer() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let loc = mount
+            .root_location()
+            .create(
+                "read-only-append",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+
+        let options = flags_to_options(O_RDONLY as i32 | O_APPEND as i32, 0o600, (0, 0));
+        let OpenResult::File(file) = options.open_loc(loc).unwrap() else {
+            panic!("regular file opened as a directory");
+        };
+        assert!(file.flags().contains(FileFlags::READ));
+        assert!(!file.flags().contains(FileFlags::WRITE));
+        assert!(!file.flags().contains(FileFlags::APPEND));
+        assert_ne!(open_status_flags(O_RDONLY | O_APPEND) & O_APPEND, 0);
+    }
+
+    #[test]
+    fn reserved_no_data_mode_runs_open_without_read_or_write_access() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let loc = mount
+            .root_location()
+            .create(
+                "no-data-open",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+
+        let options = flags_to_options(O_ACCMODE as i32 | O_APPEND as i32, 0o600, (0, 0));
+        let OpenResult::File(file) = options.open_loc(loc).unwrap() else {
+            panic!("regular file opened as a directory");
+        };
+        assert!(
+            !file.flags().intersects(
+                FileFlags::READ | FileFlags::WRITE | FileFlags::APPEND | FileFlags::PATH
+            )
+        );
+        assert_ne!(open_status_flags(O_ACCMODE | O_APPEND) & O_APPEND, 0);
     }
 }

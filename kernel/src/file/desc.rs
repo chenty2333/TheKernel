@@ -14,11 +14,14 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::NodeFlags;
 use axpoll::{IoEvents, PollSet, Pollable, RegisterError, RegistrationToken};
+#[cfg(not(test))]
+use axsync::Mutex as StatusTransitionMutex;
 use axtask::{WeakAxTaskRef, current, current_may_uninit};
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::{
-    POLL_ERR, POLL_HUP, POLL_IN, POLL_MSG, POLL_OUT, POLL_PRI, POLLERR, POLLHUP, POLLIN, POLLMSG,
-    POLLOUT, POLLPRI, POLLRDBAND, POLLRDNORM, POLLWRBAND, POLLWRNORM, SI_SIGIO,
+    O_APPEND, O_NONBLOCK, O_PATH, POLL_ERR, POLL_HUP, POLL_IN, POLL_MSG, POLL_OUT, POLL_PRI,
+    POLLERR, POLLHUP, POLLIN, POLLMSG, POLLOUT, POLLPRI, POLLRDBAND, POLLRDNORM, POLLWRBAND,
+    POLLWRNORM, SI_SIGIO,
 };
 use spin::Mutex;
 use starry_process::Pid;
@@ -41,6 +44,12 @@ use crate::{
         send_queued_signal_to_process_data, send_signal_thread_inner, send_signal_to_process_data,
     },
 };
+
+// Host tests do not initialize a scheduler/current task. Status transitions
+// are short and never block in the tested backend setters, so use the same
+// critical-section shape over a spin mutex in that configuration.
+#[cfg(test)]
+type StatusTransitionMutex<T> = Mutex<T>;
 
 static FILE_DESCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 static DESCRIPTION_CLEANUP_INCOMING: AtomicPtr<DescriptionCleanupWork> =
@@ -69,6 +78,7 @@ struct DescriptionCleanupWork {
     flock_done: bool,
     record_lock_done: bool,
     lease_done: bool,
+    open_lease_registration: Option<lease::OpenLeaseRegistration>,
     write_open_key: Option<ExecutableKey>,
     resource: Option<DescriptionResource>,
     account: Option<Arc<DeferredWorkAccount>>,
@@ -87,6 +97,7 @@ impl DescriptionCleanupWork {
             flock_done: false,
             record_lock_done: false,
             lease_done: false,
+            open_lease_registration: None,
             write_open_key: None,
             resource: None,
             account: None,
@@ -101,6 +112,7 @@ impl DescriptionCleanupWork {
         // Arbitrary subsystem destructors may wake tasks, release VFS objects,
         // or join a worker. They run only in the deferred policy worker, never
         // from the context which happened to drop the final FileDescription.
+        drop(self.open_lease_registration.take());
         drop(self.resource.take());
         executable::release_write_open(self.write_open_key.take());
         if !self.flock_done {
@@ -253,7 +265,8 @@ pub(crate) fn drain_deferred_description_cleanup() {
 /// flock/lease tables. This helper exercises the real intrusive publication
 /// and typed-resource handoff without pretending to validate those unrelated
 /// task-context policies. Callers must create an owner with no flock, record
-/// lock, lease, executable-write key, or deferred-work account.
+/// lock, open registration, lease, executable-write key, or deferred-work
+/// account.
 #[cfg(test)]
 pub(crate) fn drain_deferred_description_resource_only_for_test() {
     let Some(_guard) = DescriptionCleanupDrainGuard::try_enter() else {
@@ -264,6 +277,7 @@ pub(crate) fn drain_deferred_description_resource_only_for_test() {
     };
     debug_assert!(work.write_open_key.is_none());
     debug_assert!(work.account.is_none());
+    debug_assert!(work.open_lease_registration.is_none());
     drop(work.resource.take());
 }
 
@@ -761,6 +775,38 @@ pub(crate) fn send_sigio(state: &AsyncIoState, fd: i32, reason: u32) {
     }
 }
 
+/// Immutable status sampled once for a complete OFD-derived I/O operation.
+///
+/// Callers pass this value through admission, limits/seals, placement, and
+/// backend commit instead of re-reading mutable status midway through an
+/// operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OfdIoStatus {
+    raw: u32,
+}
+
+impl OfdIoStatus {
+    pub(crate) const fn new(raw: u32) -> Self {
+        Self { raw }
+    }
+
+    pub(crate) const fn raw(self) -> u32 {
+        self.raw
+    }
+
+    pub(crate) const fn append(self) -> bool {
+        self.raw & O_APPEND != 0
+    }
+
+    pub(crate) const fn nonblocking(self) -> bool {
+        self.raw & O_NONBLOCK != 0
+    }
+
+    pub(crate) const fn path_only(self) -> bool {
+        self.raw & O_PATH != 0
+    }
+}
+
 pub struct FileDescription {
     pub inner: Arc<dyn FileLike>,
     open_credentials: OpenCredentials,
@@ -771,8 +817,12 @@ pub struct FileDescription {
     /// mutate after construction.
     id: FileDescriptionId,
     ofd: Mutex<OpenFileDescriptionState<AsyncIoState, ExternalOffset>>,
+    /// Serializes only status snapshots and short backend/OFD transitions.
+    /// No user fault, wait, VFS I/O, or device operation may run under it.
+    status_transition: StatusTransitionMutex<()>,
     descriptor_lifetime: SpinNoIrq<DescriptorLifetimeState>,
     open_committed: AtomicBool,
+    open_lease_publication: Option<lease::OpenLeasePublication>,
     notification_work: Option<Box<super::inotify::CloseWork>>,
     cleanup_work: Option<Box<DescriptionCleanupWork>>,
 }
@@ -802,11 +852,11 @@ impl FileDescription {
         Self::new_with_flags(inner, 0)
     }
 
-    pub(in crate::file) fn new_with_flags(
+    pub(crate) fn new_with_flags(
         inner: Arc<dyn FileLike>,
         status_flags: u32,
     ) -> AxResult<Arc<Self>> {
-        Self::new_inner(inner, status_flags, None, None)
+        Self::new_inner(inner, status_flags, None, None, None)
     }
 
     pub(in crate::file) fn new_with_write_open_key_and_resource(
@@ -815,7 +865,23 @@ impl FileDescription {
         write_open_key: Option<ExecutableKey>,
         resource: Option<DescriptionResource>,
     ) -> AxResult<Arc<Self>> {
-        Self::new_inner(inner, status_flags, write_open_key, resource)
+        Self::new_inner(inner, status_flags, write_open_key, resource, None)
+    }
+
+    pub(in crate::file) fn new_with_open_lease_admission_and_resource(
+        inner: Arc<dyn FileLike>,
+        status_flags: u32,
+        write_open_key: Option<ExecutableKey>,
+        resource: Option<DescriptionResource>,
+        open_lease_admission: lease::OpenLeaseAdmission,
+    ) -> AxResult<Arc<Self>> {
+        Self::new_inner(
+            inner,
+            status_flags,
+            write_open_key,
+            resource,
+            Some(open_lease_admission),
+        )
     }
 
     fn new_inner(
@@ -823,14 +889,30 @@ impl FileDescription {
         status_flags: u32,
         write_open_key: Option<ExecutableKey>,
         resource: Option<DescriptionResource>,
+        open_lease_admission: Option<lease::OpenLeaseAdmission>,
     ) -> AxResult<Arc<Self>> {
         // Before a complete FileDescription exists, this guard owns rollback.
         // Once transferred into the value, ordinary FileDescription::drop owns
         // it even if Arc allocation itself fails.
         let write_open_rollback = WriteOpenRollback::new(write_open_key);
-        let notification_work = super::inotify::prepare_description_close(&inner)?;
+        // Linux O_PATH descriptions carry FMODE_NONOTIFY: neither ordinary
+        // open nor final-close notifications are emitted for the pathname
+        // handle.
+        let notification_work = if status_flags & O_PATH != 0 {
+            None
+        } else {
+            super::inotify::prepare_description_close(&inner)?
+        };
         let id = FileDescriptionId::allocate()?;
         let mut cleanup_work = DescriptionCleanupWork::try_new(id.get())?;
+        let open_lease_registration = match open_lease_admission {
+            Some(admission) => admission.into_ofd(id.get())?,
+            None => None,
+        };
+        let open_lease_publication = open_lease_registration
+            .as_ref()
+            .map(lease::OpenLeaseRegistration::publication);
+        cleanup_work.open_lease_registration = open_lease_registration;
         let write_open_key = write_open_rollback.transfer();
         cleanup_work.write_open_key = write_open_key;
         cleanup_work.resource = resource;
@@ -856,8 +938,10 @@ impl FileDescription {
                 status_flags,
                 AsyncIoState::default(),
             )),
+            status_transition: StatusTransitionMutex::new(()),
             descriptor_lifetime: SpinNoIrq::new(DescriptorLifetimeState::default()),
             open_committed: AtomicBool::new(false),
+            open_lease_publication,
             notification_work,
             cleanup_work: Some(cleanup_work),
         })
@@ -880,12 +964,60 @@ impl FileDescription {
         self.open_security_credential.clone()
     }
 
-    pub fn status_flags(&self) -> u32 {
-        self.ofd.lock().status_flags()
+    /// Samples authoritative mutable OFD status under the short transition
+    /// lock. The returned value is independent of backend mirrors and remains
+    /// stable for the caller's complete operation.
+    pub(crate) fn io_status_snapshot(&self) -> OfdIoStatus {
+        let _transition = self.status_transition.lock();
+        OfdIoStatus::new(self.ofd.lock().status_flags())
     }
 
-    pub fn set_status_flags(&self, flags: u32) {
-        self.ofd.lock().commit_status_flags(flags);
+    pub fn status_flags(&self) -> u32 {
+        self.io_status_snapshot().raw()
+    }
+
+    /// Admits an ordinary I/O operation on this description.
+    ///
+    /// `O_PATH` is an immutable open-file-description capability: the inner
+    /// VFS object may still expose data, ioctl, synchronization, or readiness
+    /// methods for ordinary opens, but an `O_PATH` description only carries
+    /// pathname capability. Keep this fact on the OFD so fast paths and typed
+    /// inner objects cannot diverge.
+    pub(crate) fn check_io_access(&self) -> AxResult<()> {
+        self.check_io_status(self.io_status_snapshot())
+    }
+
+    pub(crate) fn check_io_status(&self, status: OfdIoStatus) -> AxResult<()> {
+        if status.path_only() {
+            Err(AxError::BadFileDescriptor)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn is_path_only(&self) -> bool {
+        self.io_status_snapshot().path_only()
+    }
+
+    /// Atomically derives and commits new mutable status.
+    ///
+    /// `apply_backend` runs without the OFD state lock and must be short,
+    /// nonblocking, and failure-atomic: `Err` must leave backend state exactly
+    /// as it was. It must consume the supplied old/new snapshots rather than
+    /// recursively sampling this description. Once it succeeds, publishing
+    /// the authoritative OFD flags is infallible and occurs before the
+    /// transition lock is released.
+    pub(crate) fn transition_status_flags(
+        &self,
+        update: impl FnOnce(OfdIoStatus) -> u32,
+        apply_backend: impl FnOnce(OfdIoStatus, OfdIoStatus) -> AxResult<()>,
+    ) -> AxResult<OfdIoStatus> {
+        let _transition = self.status_transition.lock();
+        let old = OfdIoStatus::new(self.ofd.lock().status_flags());
+        let new = OfdIoStatus::new(update(old));
+        apply_backend(old, new)?;
+        self.ofd.lock().commit_status_flags(new.raw());
+        Ok(new)
     }
 
     pub fn async_io_state(&self) -> AsyncIoState {
@@ -917,6 +1049,12 @@ impl FileDescription {
     }
 
     pub(crate) fn mark_open_committed(&self) {
+        if self.open_committed.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(publication) = self.open_lease_publication.as_ref() {
+            publication.publish();
+        }
         self.open_committed.store(true, Ordering::Release);
     }
 
@@ -1061,10 +1199,12 @@ impl Drop for FileDescription {
 
 impl FileLike for FileDescription {
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
+        self.check_io_access()?;
         self.inner.read(dst)
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
+        self.check_io_access()?;
         self.inner.write(src)
     }
 
@@ -1160,8 +1300,34 @@ impl<T: ?Sized> FileHandle<T> {
         self.description.id().get()
     }
 
+    pub(crate) fn io_status_snapshot(&self) -> OfdIoStatus {
+        self.description.io_status_snapshot()
+    }
+
+    pub(crate) fn transition_status_flags(
+        &self,
+        update: impl FnOnce(OfdIoStatus) -> u32,
+        apply_backend: impl FnOnce(OfdIoStatus, OfdIoStatus) -> AxResult<()>,
+    ) -> AxResult<OfdIoStatus> {
+        self.description
+            .transition_status_flags(update, apply_backend)
+    }
+
     pub fn status_flags(&self) -> u32 {
-        self.description.status_flags()
+        self.io_status_snapshot().raw()
+    }
+
+    /// Applies the open-file-description gate shared by ordinary I/O.
+    pub(crate) fn check_io_access(&self) -> AxResult<()> {
+        self.description.check_io_access()
+    }
+
+    pub(crate) fn check_io_status(&self, status: OfdIoStatus) -> AxResult<()> {
+        self.description.check_io_status(status)
+    }
+
+    pub(crate) fn is_path_only(&self) -> bool {
+        self.description.is_path_only()
     }
 
     fn with_security_credential<R>(&self, f: impl FnOnce() -> R) -> R {
@@ -1185,11 +1351,28 @@ impl<T: ?Sized> FileHandle<T> {
         f()
     }
 
-    pub fn with_read_credentials<R>(&self, f: impl FnOnce() -> R) -> R {
+    pub fn with_read_credentials<R>(&self, f: impl FnOnce() -> AxResult<R>) -> AxResult<R> {
+        self.check_io_access()?;
         self.with_security_credential(f)
     }
 
-    pub fn with_write_credentials<R>(&self, f: impl FnOnce() -> R) -> R {
+    pub(crate) fn with_write_credentials<R>(
+        &self,
+        f: impl FnOnce(OfdIoStatus) -> AxResult<R>,
+    ) -> AxResult<R> {
+        let status = self.io_status_snapshot();
+        self.with_write_credentials_for_status(status, || f(status))
+    }
+
+    /// Reuses an operation's already captured status while installing the
+    /// same opener/security credentials for one backend chunk. Multi-chunk
+    /// copy/splice loops call this without resampling mutable OFD state.
+    pub(crate) fn with_write_credentials_for_status<R>(
+        &self,
+        status: OfdIoStatus,
+        f: impl FnOnce() -> AxResult<R>,
+    ) -> AxResult<R> {
+        self.description.check_io_status(status)?;
         let credentials = self.description.open_credentials();
         let current = current();
         let thread = current.as_thread();
@@ -1198,6 +1381,79 @@ impl<T: ?Sized> FileHandle<T> {
             let _ = thread.replace_file_write_credentials(previous);
         });
         self.with_security_credential(f)
+    }
+}
+
+impl<T: FileLike + 'static> FileHandle<T> {
+    /// Erases only the typed inner Arc while preserving this exact OFD and its
+    /// immutable description identity. Callers must use this instead of a
+    /// second numeric-fd lookup that could observe a concurrent replacement.
+    pub(crate) fn into_file_like(self) -> FileHandle<dyn FileLike> {
+        let Self { description, file } = self;
+        FileHandle { description, file }
+    }
+}
+
+impl FileHandle<dyn FileLike> {
+    /// Downcasts the inner object without repeating fd-table lookup; the
+    /// returned typed handle retains this exact description identity.
+    pub(crate) fn downcast<T: FileLike + 'static>(&self) -> AxResult<FileHandle<T>> {
+        let file = self
+            .file
+            .clone()
+            .downcast_arc()
+            .map_err(|_| AxError::InvalidInput)?;
+        Ok(FileHandle {
+            description: self.description.clone(),
+            file,
+        })
+    }
+}
+
+impl<T: FileLike + ?Sized> FileHandle<T> {
+    /// Applies an `O_NONBLOCK` update as one short OFD/backend transaction.
+    ///
+    /// `FIONBIO` uses this instead of mutating only the backend mirror.  A
+    /// failed backend update leaves the authoritative status snapshot
+    /// unchanged, while a successful update is immediately visible through
+    /// every descriptor sharing this open file description.
+    pub(crate) fn set_nonblocking_status(&self, nonblocking: bool) -> AxResult<OfdIoStatus> {
+        self.transition_status_flags(
+            |old| {
+                if nonblocking {
+                    old.raw() | O_NONBLOCK
+                } else {
+                    old.raw() & !O_NONBLOCK
+                }
+            },
+            |old, new| {
+                if old.nonblocking() != new.nonblocking() {
+                    self.file.set_nonblocking(new.nonblocking())?;
+                }
+                Ok(())
+            },
+        )
+    }
+
+    /// Reads through this exact open file description.
+    pub(crate) fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
+        self.check_io_access()?;
+        self.file.read(dst)
+    }
+
+    /// Writes through this exact open file description.
+    pub(crate) fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
+        self.check_io_access()?;
+        self.file.write(src)
+    }
+
+    /// Poll semantics differ from select for Linux `O_PATH` descriptions.
+    pub(crate) fn poll_events_for_poll(&self) -> IoEvents {
+        if self.is_path_only() {
+            IoEvents::INVALID
+        } else {
+            self.file.poll()
+        }
     }
 }
 
@@ -1210,10 +1466,222 @@ pub struct FileDescriptor {
 mod tests {
     extern crate std;
 
+    use alloc::borrow::Cow;
+    use core::{
+        sync::atomic::{AtomicBool, Ordering},
+        task::Context,
+    };
+
+    use axfs::{FileBackend, FileFlags};
+    use axfs_ng_vfs::{Mountpoint, NodePermission, NodeType};
+    use axpoll::{IoEvents, Pollable};
+    use linux_raw_sys::general::O_WRONLY;
+
     use super::*;
+    use crate::pseudofs::tmp::MemoryFs;
 
     fn kuid(raw: u32) -> Kuid {
         Kuid::from_raw(raw).unwrap()
+    }
+
+    #[test]
+    fn status_snapshot_is_authoritative_without_an_axfs_append_mirror() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let loc = mount
+            .root_location()
+            .create(
+                "mutable-append",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let file = Arc::new(File::new(axfs::File::new(
+            FileBackend::Direct(loc),
+            FileFlags::WRITE,
+        )));
+        let description = FileDescription::new_with_flags(file.clone(), O_WRONLY).unwrap();
+
+        let initial = description.io_status_snapshot();
+        assert_eq!(initial.raw(), O_WRONLY);
+        assert!(!initial.append());
+        assert!(!initial.nonblocking());
+        assert!(!file.inner().flags().contains(FileFlags::APPEND));
+
+        let updated = description
+            .transition_status_flags(
+                |old| old.raw() | O_APPEND | O_NONBLOCK,
+                |_old, new| file.set_nonblocking(new.nonblocking()),
+            )
+            .unwrap();
+        assert!(updated.append());
+        assert!(updated.nonblocking());
+        assert!(file.nonblocking());
+        assert!(!file.inner().flags().contains(FileFlags::APPEND));
+
+        let cleared = description
+            .transition_status_flags(
+                |old| old.raw() & !(O_APPEND | O_NONBLOCK),
+                |_old, new| file.set_nonblocking(new.nonblocking()),
+            )
+            .unwrap();
+        assert!(!cleared.append());
+        assert!(!cleared.nonblocking());
+        assert!(!file.nonblocking());
+        assert!(!file.inner().flags().contains(FileFlags::APPEND));
+
+        let failed = description
+            .transition_status_flags(|old| old.raw() | O_NONBLOCK, |_old, _new| Err(AxError::Io));
+        assert!(matches!(failed, Err(AxError::Io)));
+        assert_eq!(description.io_status_snapshot(), cleared);
+        assert!(!file.nonblocking());
+
+        let read_loc = mount
+            .root_location()
+            .create(
+                "read-only-append",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let read_file = Arc::new(File::new(axfs::File::new(
+            FileBackend::Direct(read_loc),
+            FileFlags::READ,
+        )));
+        let read_description =
+            FileDescription::new_with_flags(read_file.clone(), O_APPEND).unwrap();
+        assert!(read_description.io_status_snapshot().append());
+        assert!(!read_file.inner().flags().contains(FileFlags::APPEND));
+        assert!(!read_file.inner().flags().contains(FileFlags::WRITE));
+        assert!(matches!(
+            read_file.inner().access(FileFlags::APPEND),
+            Err(axfs_ng_vfs::VfsError::BadFileDescriptor)
+        ));
+    }
+
+    #[test]
+    fn fionbio_transition_keeps_regular_backend_and_f_getfl_snapshot_in_sync() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let loc = mount
+            .root_location()
+            .create(
+                "fionbio-regular",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let file = Arc::new(File::new(axfs::File::new(
+            FileBackend::Direct(loc),
+            FileFlags::WRITE,
+        )));
+        let description =
+            FileDescription::new_with_flags(file.clone(), O_WRONLY | O_APPEND).unwrap();
+        let handle = FileHandle {
+            description: description.clone(),
+            file: file.clone(),
+        };
+        let duplicate = handle.clone();
+
+        let enabled = handle.set_nonblocking_status(true).unwrap();
+        assert_eq!(enabled.raw(), O_WRONLY | O_APPEND | O_NONBLOCK);
+        // F_GETFL reads this same authoritative OFD snapshot, including
+        // updates made through another descriptor for the description.
+        assert_eq!(duplicate.status_flags(), enabled.raw());
+        assert_eq!(description.io_status_snapshot(), enabled);
+        assert!(file.nonblocking());
+
+        let disabled = duplicate.set_nonblocking_status(false).unwrap();
+        assert_eq!(disabled.raw(), O_WRONLY | O_APPEND);
+        assert_eq!(handle.status_flags(), disabled.raw());
+        assert_eq!(description.io_status_snapshot(), disabled);
+        assert!(!file.nonblocking());
+    }
+
+    struct RejectingNonblockingFile {
+        nonblocking: AtomicBool,
+        reject_next: AtomicBool,
+    }
+
+    impl Pollable for RejectingNonblockingFile {
+        fn poll(&self) -> IoEvents {
+            IoEvents::empty()
+        }
+
+        fn register<'a>(
+            &'a self,
+            _context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+            axpoll::PollRegistration::empty()
+        }
+    }
+
+    impl FileLike for RejectingNonblockingFile {
+        fn stat(&self) -> AxResult<Kstat> {
+            Err(AxError::InvalidInput)
+        }
+
+        fn path(&self) -> AxResult<Cow<'_, str>> {
+            Ok(Cow::Borrowed("rejecting-nonblocking"))
+        }
+
+        fn nonblocking(&self) -> bool {
+            self.nonblocking.load(Ordering::Acquire)
+        }
+
+        fn set_nonblocking(&self, nonblocking: bool) -> AxResult {
+            if self.reject_next.swap(false, Ordering::AcqRel) {
+                return Err(AxError::Io);
+            }
+            self.nonblocking.store(nonblocking, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fionbio_backend_failure_does_not_publish_a_new_ofd_snapshot() {
+        let file = Arc::new(RejectingNonblockingFile {
+            nonblocking: AtomicBool::new(false),
+            reject_next: AtomicBool::new(true),
+        });
+        let description =
+            FileDescription::new_with_flags(file.clone(), O_WRONLY | O_APPEND).unwrap();
+        let handle = FileHandle {
+            description: description.clone(),
+            file: file.clone(),
+        };
+        let before = description.io_status_snapshot();
+
+        assert_eq!(handle.set_nonblocking_status(true), Err(AxError::Io));
+        assert_eq!(description.io_status_snapshot(), before);
+        assert_eq!(handle.status_flags(), before.raw());
+        assert!(!file.nonblocking());
+
+        let committed = handle.set_nonblocking_status(true).unwrap();
+        assert!(committed.nonblocking());
+        assert_eq!(description.io_status_snapshot(), committed);
+        assert!(file.nonblocking());
+    }
+
+    #[test]
+    fn opath_description_does_not_prepare_close_notification() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let path_loc = mount
+            .root_location()
+            .create(
+                "path-only-no-notify",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let path_file = Arc::new(File::new(axfs::File::new(
+            FileBackend::Direct(path_loc),
+            FileFlags::PATH,
+        )));
+        let description = FileDescription::new_with_flags(path_file, O_PATH).unwrap();
+        assert!(description.notification_work.is_none());
     }
 
     #[test]

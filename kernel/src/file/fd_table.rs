@@ -413,17 +413,6 @@ impl FdTable {
         }
     }
 
-    pub(crate) fn count_descriptions(
-        &self,
-        mut predicate: impl FnMut(&FileDescription) -> bool,
-    ) -> usize {
-        self.entries
-            .read()
-            .iter()
-            .filter(|(_, entry)| predicate(entry.description()))
-            .count()
-    }
-
     pub(crate) fn get_cloexec(&self, fd: c_int) -> AxResult<bool> {
         let fd = fd_number(fd)?;
         self.entries
@@ -811,6 +800,25 @@ pub(crate) fn prepare_file_description_with_resource(
     resource: Option<DescriptionResource>,
 ) -> AxResult<Arc<FileDescription>> {
     FileDescription::new_with_write_open_key_and_resource(f, status_flags, write_open_key, resource)
+}
+
+/// Constructs an unpublished OFD which owns the exact lease-open admission
+/// acquired before filesystem open. Publication converts that pending record
+/// to visible state; final OFD drop queues its task-context release.
+pub(crate) fn prepare_file_description_with_open_lease(
+    f: Arc<dyn FileLike>,
+    status_flags: u32,
+    write_open_key: Option<ExecutableKey>,
+    resource: Option<DescriptionResource>,
+    open_lease_admission: super::lease::OpenLeaseAdmission,
+) -> AxResult<Arc<FileDescription>> {
+    FileDescription::new_with_open_lease_admission_and_resource(
+        f,
+        status_flags,
+        write_open_key,
+        resource,
+        open_lease_admission,
+    )
 }
 
 pub(crate) fn release_posix_locks_on_close(description: &FileDescription) {

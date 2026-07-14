@@ -121,7 +121,7 @@ fn validate_file_mmap_access(
 
     if (map_type == MmapFlags::SHARED || map_type == MmapFlags::SHARED_VALIDATE)
         && permission_flags.contains(MmapProt::WRITE)
-        && (!open_flags.contains(FileFlags::WRITE) || open_flags.contains(FileFlags::APPEND))
+        && !open_flags.contains(FileFlags::WRITE)
     {
         return Err(AxError::PermissionDenied);
     }
@@ -131,7 +131,7 @@ fn validate_file_mmap_access(
 
 fn may_protect_from_file_flags(open_flags: FileFlags) -> MappingFlags {
     let mut flags = MappingFlags::READ | MappingFlags::EXECUTE;
-    if open_flags.contains(FileFlags::WRITE) && !open_flags.contains(FileFlags::APPEND) {
+    if open_flags.contains(FileFlags::WRITE) {
         flags |= MappingFlags::WRITE;
     }
     flags
@@ -1187,4 +1187,15 @@ pub fn sys_munlockall() -> AxResult<isize> {
     aspace.clear_locked_mappings();
 
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_does_not_reduce_mprotect_write_capability() {
+        let open_flags = FileFlags::READ | FileFlags::WRITE | FileFlags::APPEND;
+        assert!(may_protect_from_file_flags(open_flags).contains(MappingFlags::WRITE));
+    }
 }

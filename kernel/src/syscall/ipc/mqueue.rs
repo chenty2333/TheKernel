@@ -34,7 +34,7 @@ use starry_vm::{VmMutPtr, VmPtr, vm_load, vm_write_slice};
 use crate::{
     file::{
         FileHandle, FileLike, Kstat, NetlinkSocket, PseudoInode, add_file_like_with_flags,
-        get_file_description, get_typed_file,
+        get_typed_file,
     },
     mm::vm_load_string,
     syscall::RawSigevent,
@@ -457,7 +457,7 @@ fn get_mq_fd(fd: i32) -> AxResult<crate::file::FileHandle<MqFd>> {
 }
 
 fn nonblock_flags(file: &crate::file::FileHandle<MqFd>) -> isize {
-    if file.is_nonblocking() {
+    if file.io_status_snapshot().nonblocking() {
         O_NONBLOCK as isize
     } else {
         0
@@ -905,7 +905,6 @@ pub fn sys_mq_getsetattr(
     old_attr: *mut MqAttr,
 ) -> AxResult<isize> {
     let file = get_mq_fd(fd)?;
-    let description = get_file_description(fd)?;
     let new = if new_attr.is_null() {
         None
     } else {
@@ -917,17 +916,21 @@ pub fn sys_mq_getsetattr(
     };
 
     if !old_attr.is_null() {
+        let flags = nonblock_flags(&file);
         let queue = file.queue.lock();
-        old_attr.vm_write(queue.attr(nonblock_flags(&file)))?;
+        old_attr.vm_write(queue.attr(flags))?;
     }
     if let Some(attr) = new {
         let nonblocking = attr.mq_flags & O_NONBLOCK as isize != 0;
-        file.set_nonblocking(nonblocking)?;
-        let mut flags = description.status_flags() & !O_NONBLOCK;
-        if nonblocking {
-            flags |= O_NONBLOCK;
-        }
-        description.set_status_flags(flags);
+        file.transition_status_flags(
+            |old| (old.raw() & !O_NONBLOCK) | if nonblocking { O_NONBLOCK } else { 0 },
+            |old, new| {
+                if old.nonblocking() != new.nonblocking() {
+                    file.set_nonblocking(new.nonblocking())?;
+                }
+                Ok(())
+            },
+        )?;
     }
     Ok(0)
 }

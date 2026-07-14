@@ -73,6 +73,12 @@ fn do_poll(
             continue;
         };
         match get_file_like(raw_fd) {
+            Ok(f) if f.is_path_only() => {
+                // Linux poll treats a live O_PATH description like an invalid
+                // poll source without invalidating the descriptor itself.
+                fd.revents = POLLNVAL as _;
+                invalid_count += 1;
+            }
             Ok(f) => {
                 fds.push(
                     f,
@@ -100,7 +106,7 @@ fn do_poll(
         for entry in fds.entries() {
             res += usize::from(write_poll_result(
                 &mut *revents[entry.output_index],
-                entry.file.poll(),
+                entry.file.poll_events_for_poll(),
                 entry.events,
             ));
         }

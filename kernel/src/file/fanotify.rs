@@ -26,8 +26,7 @@ use spin::Mutex;
 use crate::{
     file::{
         Directory, File, FileDescription, FileLike, IoDst, IoSrc, Kstat, PidFd, ReservedFd,
-        inotify::{WatchKey, location_for_fd},
-        reserve_fd,
+        get_file_like, inotify::WatchKey, reserve_fd,
     },
     readiness::{block_on_poll_io, block_on_poll_set},
     task::{AsThread, get_process_data},
@@ -1359,9 +1358,16 @@ pub(crate) fn permission_check(
 }
 
 pub(crate) fn permission_check_fd(fd: c_int, mask: u64) -> AxResult<()> {
-    if let Some(loc) = location_for_fd(fd) {
-        permission_check(&loc, &loc, mask, loc.is_dir(), false)?;
-    }
+    let file_like = get_file_like(fd)?;
+    file_like.check_io_access()?;
+    let loc = if let Some(file) = file_like.downcast_ref::<File>() {
+        file.inner().location().clone()
+    } else if let Some(dir) = file_like.downcast_ref::<Directory>() {
+        dir.inner().clone()
+    } else {
+        return Ok(());
+    };
+    permission_check(&loc, &loc, mask, loc.is_dir(), false)?;
     Ok(())
 }
 

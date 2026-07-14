@@ -337,15 +337,21 @@ fn path_from_root(loc: Location, root: &Location) -> AxResult<String> {
 
 /// The ioctl() system call manipulates the underlying device parameters
 /// of special files.
+const fn fionbio_enabled(value: c_int) -> bool {
+    value != 0
+}
+
 pub fn sys_ioctl(fd: i32, cmd: u32, arg: usize) -> AxResult<isize> {
     debug!("sys_ioctl <= fd: {fd}, cmd: {cmd}, arg: {arg}");
     let f = get_file_like(fd)?;
+    // O_PATH exposes pathname metadata, not the underlying object's ioctl
+    // surface. Reject before FIONBIO reads its userspace argument.
+    f.check_io_access()?;
     if cmd == FIONBIO {
-        let val = (arg as *const u8).vm_read()?;
-        if val != 0 && val != 1 {
-            return Err(AxError::InvalidInput);
-        }
-        f.set_nonblocking(val != 0)?;
+        // Linux FIONBIO consumes an `int *`; every nonzero value enables the
+        // flag. Reading the complete word also preserves cross-page EFAULT.
+        let val = (arg as *const c_int).vm_read()?;
+        f.set_nonblocking_status(fionbio_enabled(val))?;
         return Ok(0);
     }
     if let Some(file) = f.downcast_ref::<File>()
@@ -574,6 +580,10 @@ pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     debug!("sys_getdents64 <= fd: {fd}, buf: {buf:?}, len: {len}");
 
     let dir = Directory::from_fd(fd)?;
+    // Reject path-only descriptions before inode state, allocation, or the
+    // shared directory offset can affect the Linux EBADF result. `read_dir`
+    // repeats the OFD-level check so future enumeration callers stay safe.
+    dir.check_io_access()?;
     if dir.inner().metadata()?.nlink == 0 {
         return Err(AxError::NotFound);
     }
@@ -583,15 +593,14 @@ pub fn sys_getdents64(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
 
     let mut has_remaining = false;
 
-    dir.inner()
-        .read_dir(*dir_offset, &mut |name: &str, ino, node_type, offset| {
-            has_remaining = true;
-            if !buffer.write_entry(ino, offset as _, node_type, name.as_bytes()) {
-                return false;
-            }
-            *dir_offset = offset;
-            true
-        })?;
+    dir.read_dir(*dir_offset, &mut |name: &str, ino, node_type, offset| {
+        has_remaining = true;
+        if !buffer.write_entry(ino, offset as _, node_type, name.as_bytes()) {
+            return false;
+        }
+        *dir_offset = offset;
+        true
+    })?;
 
     if has_remaining && buffer.offset == 0 {
         return Err(AxError::InvalidInput);
@@ -1267,6 +1276,7 @@ pub fn sys_sync() -> AxResult<isize> {
 
 pub fn sys_syncfs(fd: i32) -> AxResult<isize> {
     let file = get_file_like(fd)?;
+    file.check_io_access()?;
     if let Some(file) = file.downcast_ref::<crate::file::File>() {
         file.inner().location().filesystem().flush()?;
         return Ok(0);
@@ -1321,6 +1331,14 @@ mod tests {
     use thekernel_linux_cred::{FsCredentialSnapshot, GroupInfo, Kgid, Kuid};
 
     use super::*;
+
+    #[test]
+    fn fionbio_uses_the_complete_int_and_treats_every_nonzero_as_enabled() {
+        assert!(!fionbio_enabled(0));
+        for value in [1, 2, 256, -1] {
+            assert!(fionbio_enabled(value));
+        }
+    }
 
     fn credentials(uid: u32, gid: u32, groups: &[u32], capabilities: &[u32]) -> DacCredentialView {
         let mut effective = [0; 2];

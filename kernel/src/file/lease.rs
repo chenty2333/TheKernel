@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::time::Duration;
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -13,11 +14,11 @@ use axtask::{
 use hashbrown::HashMap;
 use lazy_static::lazy_static;
 use linux_raw_sys::general::{
-    CAP_LEASE, F_RDLCK, F_UNLCK, F_WRLCK, O_ACCMODE, O_PATH, O_RDONLY, O_TRUNC, O_WRONLY,
+    CAP_LEASE, F_RDLCK, F_UNLCK, F_WRLCK, O_ACCMODE, O_PATH, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
 };
 use starry_signal::{SignalInfo, Signo};
 
-use super::{FD_TABLE, File};
+use super::File;
 use crate::{
     readiness::{poll_io_error, poll_set_io},
     task::{AsThread, Kuid, send_signal_to_process},
@@ -34,7 +35,7 @@ enum LeaseType {
     Write,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum ConflictType {
     ReadOpen,
     WriteAccess,
@@ -50,9 +51,79 @@ struct LeaseState {
 struct LeaseTable {
     leases: HashMap<InodeId, LeaseState>,
     owners: HashMap<LeaseOwner, InodeId>,
+    open_files: HashMap<InodeId, InodeOpenState>,
+    open_file_refs: usize,
+    next_open_token: u64,
+}
+
+#[derive(Default)]
+struct InodeOpenState {
+    records: Vec<OpenRecord>,
+}
+
+#[derive(Clone, Copy)]
+struct OpenRecord {
+    token: u64,
+    pending_conflict: ConflictType,
+    visible_conflict: Option<ConflictType>,
+    owner: Option<LeaseOwner>,
+}
+
+impl OpenRecord {
+    fn conflict(self) -> ConflictType {
+        self.owner
+            .and_then(|_| self.visible_conflict)
+            .unwrap_or(self.pending_conflict)
+    }
+}
+
+impl InodeOpenState {
+    fn has_visible_owner(&self, owner: LeaseOwner) -> bool {
+        self.records
+            .iter()
+            .any(|record| record.owner == Some(owner))
+    }
+
+    fn conflicts_with_lease(&self, lease_type: LeaseType, requester: LeaseOwner) -> bool {
+        self.records.iter().any(|record| {
+            record.owner != Some(requester) && lease_conflicts(lease_type, record.conflict())
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OpenRegistrationKey {
+    id: InodeId,
+    token: u64,
+}
+
+/// Owns one pending open/truncate admission. An ordinary open transfers this
+/// exact record into its `FileDescription`; truncate drops it after commit.
+#[must_use = "dropping an open lease admission rolls the pending operation back"]
+pub(crate) struct OpenLeaseAdmission {
+    key: Option<OpenRegistrationKey>,
+    publishable: bool,
+}
+
+/// One global open record whose lifetime is exactly one open file
+/// description. `dup`, fork, SCM_RIGHTS, and temporary `Arc` clones share the
+/// containing `FileDescription` and therefore never create another record.
+pub(crate) struct OpenLeaseRegistration {
+    key: OpenRegistrationKey,
+    owner: LeaseOwner,
+}
+
+/// Non-owning, allocation-free commit handle retained by FileDescription.
+/// The owning registration lives in deferred cleanup, so final Arc drop never
+/// takes the blocking lease-table mutex.
+#[derive(Clone, Copy)]
+pub(crate) struct OpenLeasePublication {
+    key: OpenRegistrationKey,
+    owner: LeaseOwner,
 }
 
 const MAX_LEASES: usize = 65_536;
+const MAX_OPEN_FILE_REFS: usize = 65_536;
 
 static LEASE_BREAK_TIME_SECS: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(DEFAULT_LEASE_BREAK_TIME_SECS);
@@ -61,6 +132,9 @@ lazy_static! {
     static ref LEASE_TABLE: Mutex<LeaseTable> = Mutex::new(LeaseTable {
         leases: HashMap::new(),
         owners: HashMap::new(),
+        open_files: HashMap::new(),
+        open_file_refs: 0,
+        next_open_token: 1,
     });
 }
 static LEASE_WAITERS: PollSet = PollSet::new();
@@ -73,7 +147,7 @@ fn is_regular_file(loc: &Location) -> bool {
     loc.node_type() == NodeType::RegularFile
 }
 
-fn conflict_from_open_flags(flags: i32) -> Option<ConflictType> {
+fn pending_conflict_from_open_flags(flags: i32) -> Option<ConflictType> {
     let flags = flags as u32;
     if flags & O_PATH != 0 {
         return None;
@@ -84,7 +158,24 @@ fn conflict_from_open_flags(flags: i32) -> Option<ConflictType> {
     Some(match flags & O_ACCMODE {
         O_RDONLY => ConflictType::ReadOpen,
         O_WRONLY => ConflictType::WriteAccess,
-        _ => ConflictType::WriteAccess,
+        O_RDWR => ConflictType::WriteAccess,
+        // Linux access mode 3 is an ioctl/path-capable no-data OFD. It still
+        // counts as another open for a write lease, but carries no write
+        // authority and therefore does not conflict with a read lease.
+        _ => ConflictType::ReadOpen,
+    })
+}
+
+fn visible_conflict_from_open_flags(flags: i32) -> Option<ConflictType> {
+    let flags = flags as u32;
+    if flags & O_PATH != 0 {
+        return None;
+    }
+    Some(match flags & O_ACCMODE {
+        O_RDONLY => ConflictType::ReadOpen,
+        O_WRONLY => ConflictType::WriteAccess,
+        O_RDWR => ConflictType::WriteAccess,
+        _ => ConflictType::ReadOpen,
     })
 }
 
@@ -116,18 +207,10 @@ fn current_can_set_lease(owner_uid: u32) -> bool {
 }
 
 fn file_open_has_write(file: &File) -> bool {
-    let flags = file.inner().flags();
-    flags.contains(FileFlags::WRITE) || flags.contains(FileFlags::APPEND)
-}
-
-fn count_open_fds_for_location(loc: &Location) -> usize {
-    let id = lease_id(loc);
-    FD_TABLE.count_descriptions(|description| {
-        description
-            .inner
-            .downcast_ref::<File>()
-            .is_some_and(|file| lease_id(file.inner().location()) == id)
-    })
+    // O_APPEND is mutable status, not write authority. Read-only and reserved
+    // no-data descriptions may report it through F_GETFL without conflicting
+    // with a read lease.
+    file.inner().flags().contains(FileFlags::WRITE)
 }
 
 fn update_breaking_state(state: &mut LeaseState, conflict: ConflictType) -> bool {
@@ -206,6 +289,206 @@ fn wait_for_conflict(id: InodeId, conflict: ConflictType) -> AxResult<()> {
     }
 }
 
+impl LeaseTable {
+    fn try_register_open(
+        &mut self,
+        id: InodeId,
+        pending_conflict: ConflictType,
+        visible_conflict: Option<ConflictType>,
+    ) -> AxResult<OpenRegistrationKey> {
+        if self.open_file_refs >= MAX_OPEN_FILE_REFS {
+            return Err(LinuxError::ENFILE.into());
+        }
+        if !self.open_files.contains_key(&id) {
+            let mut records = Vec::new();
+            records.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            self.open_files
+                .try_reserve(1)
+                .map_err(|_| AxError::NoMemory)?;
+            self.open_files.insert(id, InodeOpenState { records });
+        } else {
+            self.open_files
+                .get_mut(&id)
+                .ok_or(AxError::BadState)?
+                .records
+                .try_reserve(1)
+                .map_err(|_| AxError::NoMemory)?;
+        }
+        let token = self.next_open_token;
+        let next_open_token = token.checked_add(1).ok_or(LinuxError::ENFILE)?;
+        let state = self.open_files.get_mut(&id).ok_or(AxError::BadState)?;
+        state.records.push(OpenRecord {
+            token,
+            pending_conflict,
+            visible_conflict,
+            owner: None,
+        });
+        self.next_open_token = next_open_token;
+        self.open_file_refs += 1;
+        Ok(OpenRegistrationKey { id, token })
+    }
+
+    /// Performs the allocation-free Pending -> Visible handoff. Both states
+    /// live in this table, so F_SETLEASE can never observe a gap between them.
+    fn publish_open(&mut self, key: OpenRegistrationKey, owner: LeaseOwner) -> bool {
+        let Some(record) = self.open_files.get_mut(&key.id).and_then(|state| {
+            state
+                .records
+                .iter_mut()
+                .find(|record| record.token == key.token)
+        }) else {
+            return false;
+        };
+        if record.visible_conflict.is_none() {
+            return false;
+        }
+        match record.owner {
+            None => record.owner = Some(owner),
+            Some(existing) if existing == owner => {}
+            Some(_) => return false,
+        }
+        true
+    }
+
+    fn release_open(&mut self, key: OpenRegistrationKey) -> bool {
+        let mut remove_inode = false;
+        let removed = if let Some(state) = self.open_files.get_mut(&key.id) {
+            if let Some(index) = state
+                .records
+                .iter()
+                .position(|record| record.token == key.token)
+            {
+                state.records.swap_remove(index);
+                remove_inode = state.records.is_empty();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !removed {
+            return false;
+        }
+        if let Some(open_file_refs) = self.open_file_refs.checked_sub(1) {
+            self.open_file_refs = open_file_refs;
+        } else {
+            error!("lease open-file reference count underflow");
+        }
+        if remove_inode {
+            self.open_files.remove(&key.id);
+        }
+        true
+    }
+
+    fn lease_request_conflicts(
+        &self,
+        id: InodeId,
+        lease_type: LeaseType,
+        requester: LeaseOwner,
+    ) -> Option<bool> {
+        let state = self.open_files.get(&id)?;
+        state
+            .has_visible_owner(requester)
+            .then(|| state.conflicts_with_lease(lease_type, requester))
+    }
+}
+
+fn try_register_open_admission(
+    id: InodeId,
+    breaker_pid: u32,
+    pending_conflict: ConflictType,
+    visible_conflict: Option<ConflictType>,
+) -> AxResult<OpenLeaseAdmission> {
+    let mut table = LEASE_TABLE.lock();
+    if table.leases.get(&id).is_some_and(|state| {
+        state.holder_pid != breaker_pid && lease_conflicts(state.lease_type, pending_conflict)
+    }) {
+        return Err(AxError::WouldBlock);
+    }
+    let key = table.try_register_open(id, pending_conflict, visible_conflict)?;
+    Ok(OpenLeaseAdmission {
+        key: Some(key),
+        publishable: visible_conflict.is_some(),
+    })
+}
+
+fn admit_conflict(
+    loc: &Location,
+    pending_conflict: ConflictType,
+    visible_conflict: Option<ConflictType>,
+) -> AxResult<OpenLeaseAdmission> {
+    let id = lease_id(loc);
+    let breaker_pid = current_pid();
+    loop {
+        wait_for_conflict(id, pending_conflict)?;
+        match try_register_open_admission(id, breaker_pid, pending_conflict, visible_conflict) {
+            Ok(admission) => return Ok(admission),
+            Err(AxError::WouldBlock) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+impl OpenLeaseAdmission {
+    const fn none() -> Self {
+        Self {
+            key: None,
+            publishable: true,
+        }
+    }
+
+    pub(crate) fn into_ofd(mut self, owner: LeaseOwner) -> AxResult<Option<OpenLeaseRegistration>> {
+        let Some(key) = self.key else {
+            return Ok(None);
+        };
+        if !self.publishable {
+            return Err(AxError::BadState);
+        }
+        self.key = None;
+        Ok(Some(OpenLeaseRegistration { key, owner }))
+    }
+}
+
+impl Drop for OpenLeaseAdmission {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        if !LEASE_TABLE.lock().release_open(key) {
+            error!("lease open admission identity disappeared");
+        }
+    }
+}
+
+impl OpenLeaseRegistration {
+    pub(crate) const fn publication(&self) -> OpenLeasePublication {
+        OpenLeasePublication {
+            key: self.key,
+            owner: self.owner,
+        }
+    }
+}
+
+impl OpenLeasePublication {
+    /// Converts the global record to a visible OFD before fd-table visibility.
+    /// Repeated calls are harmless, which is important because descriptor
+    /// publication through dup still calls the common commit hook.
+    pub(crate) fn publish(&self) {
+        if !LEASE_TABLE.lock().publish_open(self.key, self.owner) {
+            error!("lease open registration could not become visible");
+        }
+    }
+}
+
+impl Drop for OpenLeaseRegistration {
+    fn drop(&mut self) {
+        if !LEASE_TABLE.lock().release_open(self.key) {
+            error!("lease open registration identity disappeared");
+        }
+    }
+}
+
 fn clear_breaking_if_compatible(state: &mut LeaseState) {
     if state
         .breaking
@@ -223,21 +506,22 @@ pub(crate) fn set_lease_break_time_secs(value: u32) {
     LEASE_BREAK_TIME_SECS.store(value, core::sync::atomic::Ordering::Relaxed);
 }
 
-pub(crate) fn wait_for_open(loc: &Location, flags: i32) -> AxResult<()> {
+pub(crate) fn admit_open(loc: &Location, flags: i32) -> AxResult<OpenLeaseAdmission> {
     if !is_regular_file(loc) {
-        return Ok(());
+        return Ok(OpenLeaseAdmission::none());
     }
-    let Some(conflict) = conflict_from_open_flags(flags) else {
-        return Ok(());
+    let Some(pending_conflict) = pending_conflict_from_open_flags(flags) else {
+        return Ok(OpenLeaseAdmission::none());
     };
-    wait_for_conflict(lease_id(loc), conflict)
+    let visible_conflict = visible_conflict_from_open_flags(flags).ok_or(AxError::BadState)?;
+    admit_conflict(loc, pending_conflict, Some(visible_conflict))
 }
 
-pub(crate) fn wait_for_truncate(loc: &Location) -> AxResult<()> {
+pub(crate) fn admit_truncate(loc: &Location) -> AxResult<OpenLeaseAdmission> {
     if !is_regular_file(loc) {
-        return Ok(());
+        return Ok(OpenLeaseAdmission::none());
     }
-    wait_for_conflict(lease_id(loc), ConflictType::WriteAccess)
+    admit_conflict(loc, ConflictType::WriteAccess, None)
 }
 
 pub(crate) fn set_lease(file: &File, owner: LeaseOwner, arg: i32) -> AxResult<()> {
@@ -278,11 +562,17 @@ pub(crate) fn set_lease(file: &File, owner: LeaseOwner, arg: i32) -> AxResult<()
     if matches!(lease_type, LeaseType::Read) && file_open_has_write(file) {
         return Err(AxError::WouldBlock);
     }
-    if matches!(lease_type, LeaseType::Write) && count_open_fds_for_location(loc) > 1 {
-        return Err(AxError::WouldBlock);
-    }
 
     let mut table = LEASE_TABLE.lock();
+    // Pending and visible opens share one global per-inode record set. The
+    // requester's exact OFD identity is excluded, while every other process,
+    // files table, and retained OFD owner is represented without counting dup
+    // descriptors more than once.
+    match table.lease_request_conflicts(id, lease_type, owner) {
+        Some(false) => {}
+        Some(true) => return Err(AxError::WouldBlock),
+        None => return Err(AxError::BadState),
+    }
 
     if let Some(existing) = table.leases.get(&id) {
         if existing.owner != owner {
@@ -368,4 +658,160 @@ pub(crate) fn release_owner(owner: LeaseOwner) {
 
 pub(crate) fn formatted_lease_break_time() -> alloc::string::String {
     alloc::format!("{}\n", lease_break_time_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table() -> LeaseTable {
+        LeaseTable {
+            leases: HashMap::new(),
+            owners: HashMap::new(),
+            open_files: HashMap::new(),
+            open_file_refs: 0,
+            next_open_token: 1,
+        }
+    }
+
+    #[test]
+    fn pending_open_blocks_setlease_without_a_handoff_gap() {
+        let id = (1, 2);
+        let owner = 10;
+        let mut table = table();
+        let requester = table
+            .try_register_open(id, ConflictType::ReadOpen, Some(ConflictType::ReadOpen))
+            .unwrap();
+        assert!(table.publish_open(requester, owner));
+
+        let pending_write = table
+            .try_register_open(
+                id,
+                ConflictType::WriteAccess,
+                Some(ConflictType::WriteAccess),
+            )
+            .unwrap();
+        assert_eq!(
+            table.lease_request_conflicts(id, LeaseType::Read, owner),
+            Some(true)
+        );
+        assert_eq!(
+            table.lease_request_conflicts(id, LeaseType::Write, owner),
+            Some(true)
+        );
+
+        assert!(table.release_open(pending_write));
+        assert_eq!(
+            table.lease_request_conflicts(id, LeaseType::Read, owner),
+            Some(false)
+        );
+        assert_eq!(
+            table.lease_request_conflicts(id, LeaseType::Write, owner),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn visible_other_ofd_is_global_and_requester_is_excluded() {
+        let id = (3, 4);
+        let requester = 20;
+        let other = 21;
+        let mut table = table();
+        let requester_key = table
+            .try_register_open(id, ConflictType::ReadOpen, Some(ConflictType::ReadOpen))
+            .unwrap();
+        let other_key = table
+            .try_register_open(id, ConflictType::ReadOpen, Some(ConflictType::ReadOpen))
+            .unwrap();
+        assert!(table.publish_open(requester_key, requester));
+        assert!(table.publish_open(other_key, other));
+
+        assert_eq!(
+            table.lease_request_conflicts(id, LeaseType::Read, requester),
+            Some(false)
+        );
+        assert_eq!(
+            table.lease_request_conflicts(id, LeaseType::Write, requester),
+            Some(true)
+        );
+
+        assert!(table.release_open(other_key));
+        let other_write = table
+            .try_register_open(
+                id,
+                ConflictType::WriteAccess,
+                Some(ConflictType::WriteAccess),
+            )
+            .unwrap();
+        assert!(table.publish_open(other_write, other));
+        assert_eq!(
+            table.lease_request_conflicts(id, LeaseType::Read, requester),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn duplicate_publication_does_not_duplicate_an_ofd_record() {
+        let id = (5, 6);
+        let owner = 30;
+        let mut table = table();
+        let key = table
+            .try_register_open(id, ConflictType::ReadOpen, Some(ConflictType::ReadOpen))
+            .unwrap();
+        assert!(table.publish_open(key, owner));
+        assert!(table.publish_open(key, owner));
+        assert_eq!(table.open_file_refs, 1);
+        assert_eq!(table.open_files.get(&id).unwrap().records.len(), 1);
+        assert_eq!(
+            table.lease_request_conflicts(id, LeaseType::Write, owner),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn final_ofd_lifetime_release_removes_global_visible_state() {
+        let id = (7, 8);
+        let owner = 40;
+        let mut table = table();
+        let key = table
+            .try_register_open(id, ConflictType::ReadOpen, Some(ConflictType::ReadOpen))
+            .unwrap();
+        assert!(table.publish_open(key, owner));
+        assert_eq!(
+            table.lease_request_conflicts(id, LeaseType::Write, owner),
+            Some(false)
+        );
+
+        assert!(table.release_open(key));
+        assert!(!table.open_files.contains_key(&id));
+        assert_eq!(table.open_file_refs, 0);
+    }
+
+    #[test]
+    fn truncating_read_open_becomes_a_read_only_visible_ofd() {
+        let flags = (O_RDONLY | O_TRUNC) as i32;
+        assert_eq!(
+            pending_conflict_from_open_flags(flags),
+            Some(ConflictType::WriteAccess)
+        );
+        assert_eq!(
+            visible_conflict_from_open_flags(flags),
+            Some(ConflictType::ReadOpen)
+        );
+    }
+
+    #[test]
+    fn no_data_open_counts_as_open_without_write_lease_conflict() {
+        let flags = O_ACCMODE as i32;
+        assert_eq!(
+            pending_conflict_from_open_flags(flags),
+            Some(ConflictType::ReadOpen)
+        );
+        assert_eq!(
+            visible_conflict_from_open_flags(flags),
+            Some(ConflictType::ReadOpen)
+        );
+        assert!(!lease_conflicts(LeaseType::Read, ConflictType::ReadOpen));
+        assert!(lease_conflicts(LeaseType::Write, ConflictType::ReadOpen));
+    }
 }

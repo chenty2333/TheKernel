@@ -42,6 +42,21 @@ impl fmt::Debug for FdSet {
     }
 }
 
+fn select_ready_events(
+    path_only: bool,
+    interested: IoEvents,
+    poll: impl FnOnce() -> IoEvents,
+) -> IoEvents {
+    if path_only {
+        // Linux select is intentionally unlike poll here: O_PATH reports
+        // every requested read/write/exception class ready. In particular,
+        // do not call through to the pathname handle's inner poll callback.
+        interested
+    } else {
+        poll() & interested
+    }
+}
+
 fn do_select(
     uctx: Option<&mut UserContext>,
     nfds: u32,
@@ -128,7 +143,9 @@ fn do_select(
         let mut res = 0usize;
         for entry in fds.entries() {
             let index = fd_indices[entry.output_index];
-            let events = entry.file.poll() & entry.events;
+            let events = select_ready_events(entry.file.is_path_only(), entry.events, || {
+                entry.file.poll()
+            });
             if events.contains(IoEvents::READABLE)
                 && let Some(set) = readfds.as_deref_mut()
             {
@@ -222,4 +239,34 @@ pub fn sys_pselect6(
             .transpose()?,
         sigmask,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use core::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn opath_select_keeps_all_requested_classes_ready() {
+        let interested = IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::ERROR;
+        let poll_calls = Cell::new(0);
+        assert_eq!(
+            select_ready_events(true, interested, || {
+                poll_calls.set(poll_calls.get() + 1);
+                IoEvents::empty()
+            }),
+            interested
+        );
+        assert_eq!(poll_calls.get(), 0);
+
+        assert_eq!(
+            select_ready_events(false, interested, || {
+                poll_calls.set(poll_calls.get() + 1);
+                IoEvents::READABLE | IoEvents::ERROR
+            }),
+            IoEvents::READABLE | IoEvents::ERROR
+        );
+        assert_eq!(poll_calls.get(), 1);
+    }
 }

@@ -265,7 +265,9 @@ pub(crate) fn prepare_description_close(
     if let Some(file) = inner.downcast_ref::<File>() {
         let location = file.inner().location().clone();
         let flags = file.inner().flags();
-        let mask = if flags.intersects(axfs::FileFlags::WRITE | axfs::FileFlags::APPEND) {
+        // Mutable O_APPEND does not grant write authority. A read-only
+        // O_APPEND description must still close as IN_CLOSE_NOWRITE.
+        let mask = if flags.contains(axfs::FileFlags::WRITE) {
             IN_CLOSE_WRITE
         } else {
             IN_CLOSE_NOWRITE

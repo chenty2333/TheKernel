@@ -42,6 +42,14 @@ fn checked_epoll_event_ptr(base: usize, index: usize) -> AxResult<*mut epoll_eve
         .ok_or(AxError::BadAddress)
 }
 
+fn check_epoll_target(path_only: bool) -> AxResult<()> {
+    if path_only {
+        Err(AxError::BadFileDescriptor)
+    } else {
+        Ok(())
+    }
+}
+
 pub fn sys_epoll_create1(flags: u32) -> AxResult<isize> {
     let flags = EpollCreateFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
     debug!("sys_epoll_create1 <= flags: {flags:?}");
@@ -67,6 +75,9 @@ pub fn sys_epoll_ctl(
         .downcast_arc::<Epoll>()
         .map_err(|_| AxError::InvalidInput)?;
     debug!("sys_epoll_ctl <= epfd: {epfd}, op: {op}, fd: {fd}");
+    // Linux rejects O_PATH as a non-pollable target before interpreting the
+    // control operation; ADD, MOD, DEL, and even an unknown op report EBADF.
+    check_epoll_target(target.is_path_only())?;
 
     let parse_event = || -> AxResult<(EpollEvent, EpollFlags)> {
         let event = event.get_as_ref()?;
@@ -236,5 +247,11 @@ mod tests {
             checked_epoll_event_ptr(0, usize::MAX),
             Err(AxError::BadAddress)
         );
+    }
+
+    #[test]
+    fn epoll_all_control_operations_reject_opath_targets() {
+        assert_eq!(check_epoll_target(true), Err(AxError::BadFileDescriptor));
+        assert_eq!(check_epoll_target(false), Ok(()));
     }
 }
