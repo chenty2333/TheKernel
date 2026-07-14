@@ -89,4 +89,4 @@ pub use thin::{VmMutPtr, VmPtr};
 #[cfg(feature = "alloc")]
 mod alloc;
 #[cfg(feature = "alloc")]
-pub use alloc::{vm_load, vm_load_any, vm_load_until_nul};
+pub use alloc::{vm_load, vm_load_any, vm_load_until_nul, vm_load_until_nul_bounded};

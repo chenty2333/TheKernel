@@ -5390,8 +5390,8 @@ mod tests {
             let core_operation = core.operation();
             assert_eq!(core_operation, operation);
             assert_eq!(
-                core_operation.name().map(str::as_ptr),
-                operation.name().map(str::as_ptr)
+                core_operation.name().map(<[u8]>::as_ptr),
+                operation.name().map(<[u8]>::as_ptr)
             );
             assert_eq!(
                 core_operation.value().map(<[u8]>::as_ptr),
@@ -6884,7 +6884,10 @@ mod tests {
 
     fn assert_ordered_inode_xattr(context: &InodeXattrSecurityContext<'_, '_>) {
         assert_eq!(context.target_object().mode(), 0o640);
-        assert_eq!(context.operation().name(), Some("security.capability"));
+        assert_eq!(
+            context.operation().name(),
+            Some(b"security.capability".as_slice())
+        );
         assert_eq!(
             context.operation().value(),
             Some([0xd0, 0x01, 0x02].as_slice())
@@ -8453,7 +8456,7 @@ mod tests {
         let object = InodeSecurityRef::new(&location, &metadata);
         let value = [0xd0, 0x01, 0x02];
         let operation =
-            InodeXattrOperation::set("security.capability", &value, XattrSetFlags::REPLACE)
+            InodeXattrOperation::set(b"security.capability", &value, XattrSetFlags::REPLACE)
                 .unwrap();
 
         let mut builder = test_registry_builder();
@@ -10081,7 +10084,7 @@ mod tests {
             &dac_credential,
             &owner_user_ns,
             inode_object,
-            InodeXattrOperation::set("security.capability", &xattr_value, XattrSetFlags::REPLACE)
+            InodeXattrOperation::set(b"security.capability", &xattr_value, XattrSetFlags::REPLACE)
                 .unwrap(),
         );
         let inode_setattr = InodeSetattrSecurityContext::new(

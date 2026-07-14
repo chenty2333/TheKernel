@@ -48,8 +48,12 @@ fn chunk_elements(start: usize, size: usize, remaining: usize) -> usize {
     (bytes_to_boundary / size).max(1).min(remaining)
 }
 
-/// Loads elements from the given pointer until a zero element is found.
-pub fn vm_load_until_nul<T: Pod>(ptr: *const T) -> VmResult<Vec<T>> {
+/// Loads elements until a zero element is found within `scan_elements`.
+///
+/// The scan budget includes the terminating zero element. For example, a
+/// caller accepting at most 255 nonzero bytes must pass 256. The crate-wide
+/// byte ceiling remains authoritative when the requested budget is larger.
+pub fn vm_load_until_nul_bounded<T: Pod>(ptr: *const T, scan_elements: usize) -> VmResult<Vec<T>> {
     if !ptr.is_aligned() {
         return Err(VmError::BadAddress);
     }
@@ -58,7 +62,7 @@ pub fn vm_load_until_nul<T: Pod>(ptr: *const T) -> VmResult<Vec<T>> {
     if size == 0 {
         return Err(VmError::BadAddress);
     }
-    let max_elements = MAX_BYTES / size;
+    let max_elements = scan_elements.min(MAX_BYTES / size);
     if max_elements == 0 {
         return Err(VmError::TooLong);
     }
@@ -98,6 +102,11 @@ pub fn vm_load_until_nul<T: Pod>(ptr: *const T) -> VmResult<Vec<T>> {
     Ok(result)
 }
 
+/// Loads elements from the given pointer until a zero element is found.
+pub fn vm_load_until_nul<T: Pod>(ptr: *const T) -> VmResult<Vec<T>> {
+    vm_load_until_nul_bounded(ptr, usize::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{chunk_elements, element_address};
@@ -105,7 +114,10 @@ mod tests {
 
     #[test]
     fn element_address_rejects_user_pointer_overflow() {
-        assert_eq!(element_address(usize::MAX - 3, 1, 8), Err(VmError::BadAddress));
+        assert_eq!(
+            element_address(usize::MAX - 3, 1, 8),
+            Err(VmError::BadAddress)
+        );
     }
 
     #[test]

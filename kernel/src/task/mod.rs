@@ -23,7 +23,7 @@ mod user;
 pub(crate) use thekernel_linux_cred::{
     CredError, FileCapabilities, ID_MAP_MAX_EXTENTS, IdMap, IdMapInputExtent, Kgid, Kuid,
     SECURITY_CAPABILITY_XATTR_NAME, SignalDeliveryScope, SignalNumber, SignalSecurityOperation,
-    SignalSecuritySource, UserGid, UserUid, validate_id_map_input,
+    SignalSecuritySource, UserGid, UserUid, XATTR_NAME_MAX, validate_id_map_input,
 };
 
 pub(crate) use self::{

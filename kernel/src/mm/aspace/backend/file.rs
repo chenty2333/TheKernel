@@ -1056,7 +1056,7 @@ mod tests {
 
     fn install_capability(loc: &Location) {
         loc.set_xattr(
-            "security.capability",
+            b"security.capability",
             &[1, 2, 3],
             axfs_ng_vfs::XattrSetMode::Upsert,
         )

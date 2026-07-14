@@ -647,7 +647,7 @@ mod tests {
             .unwrap();
         let node = loc.entry().as_file().unwrap();
         loc.set_xattr(
-            "security.capability",
+            b"security.capability",
             &[1, 2, 3],
             axfs_ng_vfs::XattrSetMode::Upsert,
         )
@@ -675,7 +675,7 @@ mod tests {
         );
 
         loc.set_xattr(
-            "security.capability",
+            b"security.capability",
             &[1, 2, 3],
             axfs_ng_vfs::XattrSetMode::Upsert,
         )

@@ -4122,7 +4122,7 @@ mod tests {
     }
 
     impl XattrProvider for IoContractNode {
-        fn get_xattr(&self, _name: &str) -> VfsResult<Vec<u8>> {
+        fn get_xattr(&self, _name: &[u8]) -> VfsResult<Vec<u8>> {
             Err(LinuxError::ENODATA.into())
         }
 
@@ -4130,11 +4130,11 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn set_xattr(&self, _name: &str, _value: &[u8], _mode: XattrSetMode) -> VfsResult<()> {
+        fn set_xattr(&self, _name: &[u8], _value: &[u8], _mode: XattrSetMode) -> VfsResult<()> {
             Ok(())
         }
 
-        fn remove_xattr(&self, _name: &str) -> VfsResult<()> {
+        fn remove_xattr(&self, _name: &[u8]) -> VfsResult<()> {
             self.fs.remove_xattr_calls.fetch_add(1, Ordering::AcqRel);
             if self.fs.fail_remove_xattr.load(Ordering::Acquire) {
                 Err(VfsError::Io)

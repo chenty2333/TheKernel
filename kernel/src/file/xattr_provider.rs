@@ -18,11 +18,11 @@ use crate::task::{
     },
 };
 
-const SECURITY_CAPABILITY_XATTR: &str = SECURITY_CAPABILITY_XATTR_NAME;
-const UNSUPPORTED_ACCESS_CONTROL_XATTRS: [&str; 3] = [
-    "system.posix_acl_access",
-    "system.posix_acl_default",
-    "system.richacl",
+const SECURITY_CAPABILITY_XATTR: &[u8] = SECURITY_CAPABILITY_XATTR_NAME;
+const UNSUPPORTED_ACCESS_CONTROL_XATTRS: [&[u8]; 3] = [
+    b"system.posix_acl_access",
+    b"system.posix_acl_default",
+    b"system.richacl",
 ];
 pub(crate) const XATTR_SIZE_MAX: usize = 65_536;
 
@@ -70,7 +70,7 @@ fn actor_capable_in_target_namespace(security: &VfsSecurityContext, capability: 
 fn unsupported_access_control_xattr(name: &[u8]) -> bool {
     UNSUPPORTED_ACCESS_CONTROL_XATTRS
         .iter()
-        .any(|unsupported| name == unsupported.as_bytes())
+        .any(|unsupported| name == *unsupported)
 }
 
 /// Linux permits user.* on regular files, directories, FIFOs, and sockets.
@@ -113,7 +113,7 @@ fn authorized_file_capability_mutation<T>(
 fn check_namespace_access(
     location: &Location,
     metadata: &Metadata,
-    name: &str,
+    name: &[u8],
     write: bool,
     security: &VfsSecurityContext,
 ) -> AxResult<()> {
@@ -121,41 +121,47 @@ fn check_namespace_access(
     // would claim mode synchronization, inheritance, and access enforcement
     // that this VFS does not implement. Reject every direct operation and hide
     // any record imported through lower-level filesystem tooling from lists.
-    if unsupported_access_control_xattr(name.as_bytes()) {
+    if unsupported_access_control_xattr(name) {
         return Err(LinuxError::EOPNOTSUPP.into());
     }
 
-    let (namespace, _) = name.split_once('.').ok_or(LinuxError::EOPNOTSUPP)?;
-    match namespace {
-        "trusted" if !actor_capable_in_target_namespace(security, CAP_SYS_ADMIN) => {
+    let namespace_end = name
+        .iter()
+        .position(|byte| *byte == b'.')
+        .ok_or(LinuxError::EOPNOTSUPP)?;
+    let namespace = &name[..namespace_end];
+    if namespace == b"trusted" {
+        if !actor_capable_in_target_namespace(security, CAP_SYS_ADMIN) {
             return Err(if write {
                 LinuxError::EPERM.into()
             } else {
                 LinuxError::ENODATA.into()
             });
         }
-        "trusted" | "system" => return Ok(()),
+        return Ok(());
+    }
+    if namespace == b"system" || namespace == b"security" {
         // Apart from the dedicated file-capability checks below, security.*
         // authorization belongs to the typed security-module dispatch.
-        "security" => return Ok(()),
-        "user" if !inode_supports_user_xattrs(metadata.node_type) => {
-            return Err(if write {
-                LinuxError::EPERM.into()
-            } else {
-                LinuxError::ENODATA.into()
-            });
-        }
-        "user" => {
-            if write
-                && metadata.node_type == NodeType::Directory
-                && metadata.mode.contains(NodePermission::STICKY)
-                && Kuid::from_raw(metadata.uid) != Some(security.actor().ids().fsuid)
-                && !actor_capable_in_target_namespace(security, CAP_FOWNER)
-            {
-                return Err(LinuxError::EPERM.into());
-            }
-        }
-        _ => return Err(LinuxError::EOPNOTSUPP.into()),
+        return Ok(());
+    }
+    if namespace != b"user" {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    if !inode_supports_user_xattrs(metadata.node_type) {
+        return Err(if write {
+            LinuxError::EPERM.into()
+        } else {
+            LinuxError::ENODATA.into()
+        });
+    }
+    if write
+        && metadata.node_type == NodeType::Directory
+        && metadata.mode.contains(NodePermission::STICKY)
+        && Kuid::from_raw(metadata.uid) != Some(security.actor().ids().fsuid)
+        && !actor_capable_in_target_namespace(security, CAP_FOWNER)
+    {
+        return Err(LinuxError::EPERM.into());
     }
     check_inode_permissions_with_security(
         location,
@@ -198,7 +204,7 @@ fn xattr_set_mode(flags: XattrSetFlags) -> XattrSetMode {
 pub(crate) fn set_xattr_with_security(
     security: &VfsSecurityContext,
     location: &Location,
-    name: &str,
+    name: &[u8],
     value: &[u8],
     flags: XattrSetFlags,
 ) -> AxResult<()> {
@@ -228,7 +234,7 @@ pub(crate) fn set_xattr_with_security(
 pub(crate) fn get_xattr_with_security(
     security: &VfsSecurityContext,
     location: &Location,
-    name: &str,
+    name: &[u8],
 ) -> AxResult<Vec<u8>> {
     let metadata = location.metadata()?;
     check_namespace_access(location, &metadata, name, false, security)?;
@@ -307,7 +313,7 @@ pub(crate) fn list_xattrs_with_security(
 pub(crate) fn remove_xattr_with_security(
     security: &VfsSecurityContext,
     location: &Location,
-    name: &str,
+    name: &[u8],
 ) -> AxResult<()> {
     let transaction = || {
         check_writable_mount(location)?;
@@ -439,12 +445,56 @@ mod tests {
         set_xattr_with_security(
             &security,
             &file,
-            "security.test",
+            b"security.test",
             b"module-owned",
             XattrSetFlags::NONE,
         )
         .unwrap();
-        assert_eq!(file.get_xattr("security.test").unwrap(), b"module-owned");
+        assert_eq!(file.get_xattr(b"security.test").unwrap(), b"module-owned");
+    }
+
+    #[test]
+    fn non_utf8_names_round_trip_and_do_not_alias_file_capabilities() {
+        let security = VfsSecurityContext::new(initial_root());
+        let file = memory_node(NodeType::RegularFile);
+        let user_name = b"user.\xff";
+
+        set_xattr_with_security(
+            &security,
+            &file,
+            user_name,
+            b"raw-name",
+            XattrSetFlags::NONE,
+        )
+        .unwrap();
+        assert_eq!(
+            get_xattr_with_security(&security, &file, user_name).unwrap(),
+            b"raw-name"
+        );
+        assert!(
+            list_xattrs_with_security(&security, &file)
+                .unwrap()
+                .split(|byte| *byte == 0)
+                .any(|name| name == user_name)
+        );
+
+        let near_capability_name = b"security.capabilit\xff";
+        set_xattr_with_security(
+            &security,
+            &file,
+            near_capability_name,
+            b"opaque",
+            XattrSetFlags::NONE,
+        )
+        .unwrap();
+        assert_eq!(
+            get_xattr_with_security(&security, &file, near_capability_name).unwrap(),
+            b"opaque"
+        );
+        assert_eq!(read_security_capability(&file).unwrap(), None);
+
+        remove_xattr_with_security(&security, &file, user_name).unwrap();
+        remove_xattr_with_security(&security, &file, near_capability_name).unwrap();
     }
 
     #[test]
@@ -622,20 +672,20 @@ mod tests {
             set_xattr_with_security(
                 &security,
                 &node,
-                "user.endpoint",
+                b"user.endpoint",
                 b"value",
                 XattrSetFlags::NONE,
             )
             .unwrap();
             assert_eq!(
-                get_xattr_with_security(&security, &node, "user.endpoint").unwrap(),
+                get_xattr_with_security(&security, &node, b"user.endpoint").unwrap(),
                 b"value"
             );
             assert_eq!(
                 list_xattrs_with_security(&security, &node).unwrap(),
                 b"user.endpoint\0"
             );
-            remove_xattr_with_security(&security, &node, "user.endpoint").unwrap();
+            remove_xattr_with_security(&security, &node, b"user.endpoint").unwrap();
         }
     }
 
@@ -647,14 +697,14 @@ mod tests {
             set_xattr_with_security(
                 &security,
                 &file,
-                "unknown.value",
+                b"unknown.value",
                 b"value",
                 XattrSetFlags::NONE,
             ),
             Err(LinuxError::EOPNOTSUPP.into())
         );
         assert_eq!(
-            file.get_xattr("unknown.value"),
+            file.get_xattr(b"unknown.value"),
             Err(LinuxError::ENODATA.into())
         );
     }

@@ -27,12 +27,14 @@ The checksum above was verified against the downloaded crates.io archive.
 - `d38fb1b96d108942e8c52218a7d934db1a24fe72` added bounded, fallible owned
   user-memory snapshots and checked address arithmetic.
 
-Against the extracted registry source, the current `src/` patch is 61
-insertions and 11 deletions across `src/alloc.rs` and `src/lib.rs`. It:
+Against the extracted registry source, the maintained patch across
+`src/alloc.rs` and `src/lib.rs`:
 
 - uses `try_reserve` and reports `VmError::NoMemory`;
 - rejects user-pointer arithmetic overflow;
 - bounds NUL-terminated snapshots to 128 KiB and reports `VmError::TooLong`;
+- lets callers select a smaller scan budget which includes the terminating
+  zero element, without weakening the crate-wide ceiling;
 - keeps user-memory reads behind the `VmIo` adapter.
 
 The manifest-declared `tests/test.rs` and original manifest have been restored

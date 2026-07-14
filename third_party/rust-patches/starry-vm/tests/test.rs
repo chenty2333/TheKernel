@@ -118,7 +118,7 @@ fn test_load() {
 #[test]
 #[cfg(feature = "alloc")]
 fn test_load_until_nul() {
-    use starry_vm::vm_load_until_nul;
+    use starry_vm::{vm_load_until_nul, vm_load_until_nul_bounded};
 
     let ptr = 0x4000 as *mut u8;
 
@@ -126,7 +126,21 @@ fn test_load_until_nul() {
 
     vm_write_slice(ptr, &[b'a', b'b', b'c', 0, b'd', b'e']).unwrap();
     assert_eq!(vm_load_until_nul(ptr).unwrap(), b"abc");
+    assert_eq!(vm_load_until_nul_bounded(ptr, 4).unwrap(), b"abc");
+    assert_eq!(vm_load_until_nul_bounded(ptr, 3), Err(VmError::TooLong));
 
     vm_write_slice(ptr, &[1; 0x1234]).unwrap();
     assert_eq!(vm_load_until_nul(ptr).unwrap().len(), 0x1234);
+
+    let max_name = [0xff; 255];
+    vm_write_slice(ptr, &max_name).unwrap();
+    vm_write_slice(unsafe { ptr.add(max_name.len()) }, &[0]).unwrap();
+    assert_eq!(
+        vm_load_until_nul_bounded(ptr, max_name.len() + 1).unwrap(),
+        max_name
+    );
+    assert_eq!(
+        vm_load_until_nul_bounded(ptr, max_name.len()),
+        Err(VmError::TooLong)
+    );
 }

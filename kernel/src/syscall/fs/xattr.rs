@@ -1,11 +1,11 @@
-use alloc::{string::String, vec::Vec};
+use alloc::vec::Vec;
 use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::{Location, path::Path};
 use axtask::current;
 use linux_raw_sys::general::{AT_FDCWD, AT_SYMLINK_NOFOLLOW};
-use starry_vm::vm_write_slice;
+use starry_vm::{VmError, vm_load_until_nul_bounded, vm_write_slice};
 
 use super::ctl::validate_pathname;
 use crate::{
@@ -20,12 +20,10 @@ use crate::{
         },
     },
     mm::{UserConstPtr, vm_load_string},
-    task::{AsThread, security::XattrSetFlags},
+    task::{AsThread, XATTR_NAME_MAX, security::XattrSetFlags},
 };
 
-const XATTR_NAME_MAX: usize = 255;
-
-fn validate_xattr_name(name: &str) -> AxResult<()> {
+fn validate_xattr_name(name: &[u8]) -> AxResult<()> {
     if name.is_empty() || name.len() > XATTR_NAME_MAX {
         return Err(LinuxError::ERANGE.into());
     }
@@ -36,8 +34,16 @@ fn validate_xattr_flags(flags: u32) -> AxResult<XattrSetFlags> {
     XattrSetFlags::try_from_bits(flags).ok_or(AxError::InvalidInput)
 }
 
-fn read_xattr_name(name: *const c_char) -> AxResult<String> {
-    let name = vm_load_string(name)?;
+fn map_xattr_name_load_error(error: VmError) -> AxError {
+    match error {
+        VmError::TooLong => LinuxError::ERANGE.into(),
+        other => other.into(),
+    }
+}
+
+fn read_xattr_name(name: *const c_char) -> AxResult<Vec<u8>> {
+    let name = vm_load_until_nul_bounded(name.cast::<u8>(), XATTR_NAME_MAX + 1)
+        .map_err(map_xattr_name_load_error)?;
     validate_xattr_name(&name)?;
     Ok(name)
 }
@@ -348,17 +354,26 @@ mod tests {
     }
 
     #[test]
-    fn xattr_name_import_requires_only_nonempty_bounded_utf8() {
-        assert_eq!(validate_xattr_name("user.key"), Ok(()));
-        assert_eq!(validate_xattr_name(""), Err(LinuxError::ERANGE.into()));
-        assert_eq!(validate_xattr_name("user"), Ok(()));
-        assert_eq!(validate_xattr_name(".key"), Ok(()));
-        assert_eq!(validate_xattr_name("user."), Ok(()));
-        assert_eq!(validate_xattr_name("user.\u{6d4b}\u{8bd5}"), Ok(()));
-        let oversized = alloc::string::String::from_iter(core::iter::repeat_n('a', 256));
+    fn xattr_name_import_requires_only_nonempty_bounded_bytes() {
+        assert_eq!(validate_xattr_name(b"user.key"), Ok(()));
+        assert_eq!(validate_xattr_name(b""), Err(LinuxError::ERANGE.into()));
+        assert_eq!(validate_xattr_name(b"user"), Ok(()));
+        assert_eq!(validate_xattr_name(b".key"), Ok(()));
+        assert_eq!(validate_xattr_name(b"user."), Ok(()));
+        assert_eq!(validate_xattr_name(b"user.\xff"), Ok(()));
+        assert_eq!(validate_xattr_name(&[0xff; XATTR_NAME_MAX]), Ok(()));
+        let oversized = alloc::vec![b'a'; 256];
         assert_eq!(
             validate_xattr_name(&oversized),
             Err(LinuxError::ERANGE.into())
+        );
+        assert_eq!(
+            map_xattr_name_load_error(VmError::TooLong),
+            LinuxError::ERANGE.into()
+        );
+        assert_eq!(
+            map_xattr_name_load_error(VmError::BadAddress),
+            AxError::BadAddress
         );
     }
 
