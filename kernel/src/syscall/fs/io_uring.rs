@@ -1,5 +1,7 @@
 use axerrno::{AxResult, LinuxError};
 
+mod uapi;
+
 pub fn sys_io_uring_setup(_entries: u32, _params: *mut ()) -> AxResult<isize> {
     Err(LinuxError::ENOSYS.into())
 }
