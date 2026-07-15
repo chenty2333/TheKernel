@@ -71,6 +71,7 @@ fn policy_work_pending() -> bool {
         || crate::file::dnotify::has_deferred_table_cleanup_work()
         || crate::file::fanotify::has_deferred_cleanup_work()
         || crate::file::inotify::has_deferred_notification_work()
+        || crate::file::io_uring::has_deferred_io_uring_work()
 }
 
 fn finalizer_work_pending() -> bool {
@@ -102,6 +103,7 @@ fn policy_worker() {
             crate::file::fanotify::drain_deferred_cleanup_work();
             crate::file::inotify::drain_close_notifications();
             crate::file::inotify::drain_filesystem_release_notifications();
+            crate::file::io_uring::drain_deferred_io_uring_work();
             if policy_work_pending() {
                 axtask::yield_now();
             }

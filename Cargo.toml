@@ -45,6 +45,7 @@ axtask = { package = "thekernel-axtask", version = "=0.1.0" }
 linux-vfs = { package = "thekernel-linux-vfs", version = "=0.1.0" }
 thekernel-linux-cred = { version = "=0.1.0", default-features = false }
 thekernel-linux-fd = { version = "=0.1.0" }
+thekernel-linux-io-uring = { version = "=0.1.0", default-features = false }
 thekernel-linux-mm = { version = "=0.1.0", default-features = false }
 thekernel-linux-process = { version = "=0.1.0", default-features = false }
 starry-process = { package = "thekernel-linux-process-adapter", version = "=0.1.0", path = "crates/process-adapter" }
@@ -129,6 +130,7 @@ thekernel-linux-cred = { path = "../thekernel-linux-abi/crates/cred" }
 thekernel-linux-mm = { path = "../thekernel-linux-abi/crates/mm" }
 thekernel-linux-vfs = { path = "../thekernel-linux-abi/crates/vfs" }
 thekernel-linux-fd = { path = "../thekernel-linux-abi/crates/fd" }
+thekernel-linux-io-uring = { path = "../thekernel-linux-abi/crates/io-uring" }
 thekernel-linux-process = { path = "../thekernel-linux-abi/crates/process" }
 thekernel-readiness-adapter = { path = "crates/readiness-adapter" }
 memory_set = { path = "third_party/rust-patches/memory_set" }

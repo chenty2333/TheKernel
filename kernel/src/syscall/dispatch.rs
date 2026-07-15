@@ -1074,6 +1074,7 @@ pub(super) fn dispatch_syscall(sysno: Sysno, uctx: &mut UserContext) -> AxResult
         Sysno::userfaultfd => sys_userfaultfd(uctx.arg0() as _),
         Sysno::io_uring_setup => sys_io_uring_setup(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::io_uring_enter => sys_io_uring_enter(
+            uctx,
             uctx.arg0() as _,
             uctx.arg1() as _,
             uctx.arg2() as _,

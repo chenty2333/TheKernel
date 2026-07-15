@@ -1,6 +1,12 @@
+use core::mem::size_of;
+
 use bytemuck::{Pod, Zeroable};
+use thekernel_linux_io_uring::{
+    PINNED_IORING_OP_LAST, RingLayout, SubmissionOpcodeSupport, classify_submission_opcode,
+};
 
 pub(crate) const SQE_SIZE: usize = 64;
+#[cfg(test)]
 pub(crate) const CQE_SIZE: usize = 16;
 
 #[repr(C)]
@@ -46,7 +52,42 @@ pub(crate) struct IoUringParams {
     pub cq_off: CqRingOffsets,
 }
 
+impl IoUringParams {
+    pub(crate) fn from_layout(layout: RingLayout) -> Self {
+        let sq = layout.sq_offsets();
+        let cq = layout.cq_offsets();
+        Self {
+            sq_entries: layout.sq_entries(),
+            cq_entries: layout.cq_entries(),
+            flags: layout.setup_flags().bits(),
+            features: layout.features().bits(),
+            sq_off: SqRingOffsets {
+                head: sq.head(),
+                tail: sq.tail(),
+                ring_mask: sq.ring_mask(),
+                ring_entries: sq.ring_entries(),
+                flags: sq.flags(),
+                dropped: sq.dropped(),
+                array: sq.array().unwrap_or(0),
+                ..Default::default()
+            },
+            cq_off: CqRingOffsets {
+                head: cq.head(),
+                tail: cq.tail(),
+                ring_mask: cq.ring_mask(),
+                ring_entries: cq.ring_entries(),
+                overflow: cq.overflow(),
+                cqes: cq.cqes(),
+                flags: cq.flags(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+}
+
 #[repr(C)]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable, PartialEq, Eq)]
 pub(crate) struct IoUringCqe {
     pub user_data: u64,
@@ -70,6 +111,32 @@ pub(crate) struct IoUringProbeOp {
     pub resv: u8,
     pub flags: u16,
     pub resv2: u32,
+}
+
+pub(crate) fn write_probe(output: &mut [u8], requested_operations: u32) {
+    const IORING_OP_SUPPORTED: u16 = 1;
+
+    let operations = requested_operations.min(PINNED_IORING_OP_LAST as u32) as usize;
+    let header = IoUringProbeHeader {
+        last_op: PINNED_IORING_OP_LAST - 1,
+        ops_len: operations as u8,
+        ..Default::default()
+    };
+    output.fill(0);
+    output[..size_of::<IoUringProbeHeader>()].copy_from_slice(bytemuck::bytes_of(&header));
+    for opcode in 0..operations {
+        let operation = IoUringProbeOp {
+            op: opcode as u8,
+            flags: match classify_submission_opcode(opcode as u8) {
+                SubmissionOpcodeSupport::Supported(_) => IORING_OP_SUPPORTED,
+                SubmissionOpcodeSupport::KnownUnsupported | SubmissionOpcodeSupport::Unknown => 0,
+            },
+            ..Default::default()
+        };
+        let start = size_of::<IoUringProbeHeader>() + opcode * size_of::<IoUringProbeOp>();
+        output[start..start + size_of::<IoUringProbeOp>()]
+            .copy_from_slice(bytemuck::bytes_of(&operation));
+    }
 }
 
 #[repr(transparent)]
@@ -130,7 +197,6 @@ const _: () = {
     assert!(core::mem::size_of::<SqRingOffsets>() == 40);
     assert!(core::mem::size_of::<CqRingOffsets>() == 40);
     assert!(core::mem::size_of::<IoUringParams>() == 120);
-    assert!(core::mem::size_of::<IoUringCqe>() == CQE_SIZE);
     assert!(core::mem::size_of::<IoUringProbeHeader>() == 16);
     assert!(core::mem::size_of::<IoUringProbeOp>() == 8);
     assert!(core::mem::size_of::<RawSqe>() == SQE_SIZE);
@@ -146,6 +212,10 @@ mod tests {
 
     #[test]
     fn uapi_layout_matches_linux_64_bit_abi() {
+        assert_eq!(core::mem::size_of::<IoUringCqe>(), CQE_SIZE);
+        assert_eq!(core::mem::offset_of!(IoUringCqe, user_data), 0);
+        assert_eq!(core::mem::offset_of!(IoUringCqe, res), 8);
+        assert_eq!(core::mem::offset_of!(IoUringCqe, flags), 12);
         assert_eq!(core::mem::offset_of!(IoUringParams, sq_off), 40);
         assert_eq!(core::mem::offset_of!(IoUringParams, cq_off), 80);
         assert_eq!(core::mem::offset_of!(SqRingOffsets, user_addr), 32);
@@ -189,5 +259,60 @@ mod tests {
                 pad2: 0x3839_3a3b_3c3d_3e3f,
             }
         );
+    }
+
+    #[test]
+    fn returned_params_are_derived_only_from_resolved_geometry() {
+        use thekernel_linux_io_uring::{FeatureFlags, SetupFlags, SetupRequest};
+
+        let proven = FeatureFlags::SINGLE_MMAP.union(FeatureFlags::SUBMIT_STABLE);
+        let layout = SetupRequest::new(3, 8, SetupFlags::CQSIZE)
+            .resolve(proven)
+            .unwrap();
+        let params = IoUringParams::from_layout(layout);
+        assert_eq!(params.sq_entries, 4);
+        assert_eq!(params.cq_entries, 8);
+        assert_eq!(params.flags, SetupFlags::CQSIZE.bits());
+        assert_eq!(params.features, proven.bits());
+        assert_eq!(params.features, layout.features().bits());
+        assert_eq!(params.sq_off.head, layout.sq_offsets().head());
+        assert_eq!(params.sq_off.array, layout.sq_offsets().array().unwrap());
+        assert_eq!(params.cq_off.cqes, layout.cq_offsets().cqes());
+        assert_eq!(params.resv, [0; 3]);
+    }
+
+    #[test]
+    fn probe_zeroes_unknown_records_and_marks_only_supported_operations() {
+        let operations = PINNED_IORING_OP_LAST as usize;
+        let mut output = [0_u8;
+            size_of::<IoUringProbeHeader>()
+                + PINNED_IORING_OP_LAST as usize * size_of::<IoUringProbeOp>()];
+        write_probe(&mut output, operations as u32);
+
+        let header = bytemuck::pod_read_unaligned::<IoUringProbeHeader>(
+            &output[..size_of::<IoUringProbeHeader>()],
+        );
+        assert_eq!(header.last_op, PINNED_IORING_OP_LAST - 1);
+        assert_eq!(header.ops_len, PINNED_IORING_OP_LAST);
+        assert_eq!(header.resv, 0);
+        assert_eq!(header.resv2, [0; 3]);
+
+        for opcode in 0..operations {
+            let start = size_of::<IoUringProbeHeader>() + opcode * size_of::<IoUringProbeOp>();
+            let operation = bytemuck::pod_read_unaligned::<IoUringProbeOp>(
+                &output[start..start + size_of::<IoUringProbeOp>()],
+            );
+            assert_eq!(operation.op, opcode as u8);
+            assert_eq!(
+                operation.flags,
+                match classify_submission_opcode(opcode as u8) {
+                    SubmissionOpcodeSupport::Supported(_) => 1,
+                    SubmissionOpcodeSupport::KnownUnsupported
+                    | SubmissionOpcodeSupport::Unknown => 0,
+                }
+            );
+            assert_eq!(operation.resv, 0);
+            assert_eq!(operation.resv2, 0);
+        }
     }
 }

@@ -33,3 +33,5 @@ type exists.
   (`draft`)
 - [RFC 0004: Accounted VM Pins and Generation-Safe Fault Delegation](0004-mm-pin-fault-contract.md)
   (`draft`)
+- [RFC 0005: Bounded io_uring Core and Kernel Adapter Contract](0005-io-uring-contract.md)
+  (`draft`)

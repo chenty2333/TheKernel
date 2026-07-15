@@ -10,6 +10,7 @@ pub mod flock;
 mod fs;
 pub(crate) mod inode_flags;
 pub mod inotify;
+pub(crate) mod io_uring;
 pub(crate) mod lease;
 pub(crate) mod memfd;
 pub(crate) mod namespace_mutation;

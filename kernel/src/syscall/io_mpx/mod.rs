@@ -251,7 +251,7 @@ fn flatten_blocked_timeout<T>(
     }
 }
 
-fn wait_io_result(
+pub(crate) fn wait_io_result(
     mut uctx: Option<&mut UserContext>,
     sigmask: Option<SignalSet>,
     mut wait_once: impl FnMut() -> Result<AxResult<isize>, future::Elapsed>,

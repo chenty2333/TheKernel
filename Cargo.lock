@@ -3205,6 +3205,7 @@ dependencies = [
  "thekernel-axtask",
  "thekernel-linux-cred",
  "thekernel-linux-fd",
+ "thekernel-linux-io-uring",
  "thekernel-linux-mm",
  "thekernel-linux-process-adapter",
  "thekernel-linux-vfs",
@@ -3225,6 +3226,10 @@ dependencies = [
 
 [[package]]
 name = "thekernel-linux-fd"
+version = "0.1.0"
+
+[[package]]
+name = "thekernel-linux-io-uring"
 version = "0.1.0"
 
 [[package]]
