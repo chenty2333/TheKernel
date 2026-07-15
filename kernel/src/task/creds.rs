@@ -24,7 +24,7 @@ use super::{
     process::UserNamespace,
     security::{
         CredentialMutationKind, CredentialSecurityState, CredentialStateTransition,
-        FrozenSecurityRegistry, PendingCredentialPostCommit,
+        FrozenSecurityRegistry, PendingCredentialPostCommit, capable, capable_for_setid,
     },
 };
 
@@ -168,12 +168,18 @@ impl Cred {
     }
 
     pub(crate) fn has_effective_capability(&self, capability: u32) -> bool {
-        self.core.has_effective_capability(capability)
+        self.user_ns().is_initial() && capable(self, self.user_ns(), capability)
     }
 
     pub(crate) fn has_effective_capability_in_own_user_ns(&self, capability: u32) -> bool {
-        self.core
-            .has_effective_capability_in_own_user_ns(capability)
+        capable(self, self.user_ns(), capability)
+    }
+
+    /// Set-ID-family counterpart to the ordinary own-namespace check. This is
+    /// intentionally not a generic operation-taking API: only setuid, setgid,
+    /// setgroups, and their Linux variants may select `CAP_OPT_INSETID`.
+    pub(crate) fn has_effective_capability_for_setid(&self, capability: u32) -> bool {
+        capable_for_setid(self, self.user_ns(), capability)
     }
 
     /// Returns whether both composites wrap the same immutable Linux

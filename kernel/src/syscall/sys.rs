@@ -166,7 +166,7 @@ pub fn sys_setgroups(size: usize, list: *const u32) -> AxResult<isize> {
     // user array. `set_supplementary_groups` rechecks under the writer mutex,
     // so this early check is only a cost guard, not the authorization point.
     let cred = curr.as_thread().current_cred();
-    if !cred.has_effective_capability_in_own_user_ns(linux_raw_sys::general::CAP_SETGID)
+    if !cred.has_effective_capability_for_setid(linux_raw_sys::general::CAP_SETGID)
         || !cred.user_ns().may_setgroups()
     {
         return Err(AxError::OperationNotPermitted);

@@ -24,10 +24,11 @@ use crate::{
     syscall::prepare_proc_shm_inheritance,
     task::{
         AsThread, Cred, CredentialSlot, Dumpability, InitialProcessThreadAdmission,
-        NetworkNamespace, PendingThreadPublication, ProcessAccessState, ProcessData,
-        ProcessThreadAdmission, TaskParentChoice, Thread, get_process_data, linux_pid_from_task_id,
-        lock_task_parent_publication, ns_capable, prepare_task_table_admission, process_domain,
-        send_signal_thread_inner, try_new_user_task, try_tasks, vm_write_in_aspace,
+        NetworkNamespace, PendingCredentialPublication, PendingThreadPublication,
+        ProcessAccessState, ProcessData, ProcessThreadAdmission, TaskParentChoice, Thread,
+        get_process_data, linux_pid_from_task_id, lock_task_parent_publication, ns_capable,
+        prepare_task_table_admission, process_domain, send_signal_thread_inner, try_new_user_task,
+        try_tasks, vm_write_in_aspace,
     },
 };
 
@@ -88,6 +89,32 @@ impl CloneThreadPublication {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloneCredentialPublicationKind {
+    Fork,
+    UserNamespace,
+}
+
+const fn clone_credential_publication_kind(
+    flags: CloneFlags,
+) -> Option<CloneCredentialPublicationKind> {
+    if flags.contains(CloneFlags::THREAD) {
+        None
+    } else if flags.contains(CloneFlags::NEWUSER) {
+        Some(CloneCredentialPublicationKind::UserNamespace)
+    } else {
+        Some(CloneCredentialPublicationKind::Fork)
+    }
+}
+
+/// Preserves the existing process-lifecycle protection through secondary
+/// publication, group-exit handoff, and TID stores, then releases it before an
+/// infallible security callback and runqueue publication.
+fn release_clone_lifecycle_then<P>(process_lifecycle_lock: P, notify: impl FnOnce()) {
+    drop(process_lifecycle_lock);
+    notify();
 }
 
 fn map_process_error(error: ProcessError) -> AxError {
@@ -340,6 +367,7 @@ impl CloneArgs {
         let calling_thread = curr.as_thread();
         let calling_tid = linux_pid_from_task_id(curr.id().as_u64())?;
         let old_proc_data = &calling_thread.proc_data;
+        let credential_publication_kind = clone_credential_publication_kind(flags);
         // Every branch derives from one immutable calling-task snapshot.
         // Threads share its exact composite identity; a new process gets a
         // separately prepared module-state clone in its own outer credential.
@@ -360,7 +388,7 @@ impl CloneArgs {
             )?;
             Cred::try_with_user_namespace(&parent_cred, user_ns)?
         } else if flags.contains(CloneFlags::THREAD) {
-            parent_cred
+            parent_cred.clone()
         } else {
             Cred::try_clone_for_fork(&parent_cred)?
         };
@@ -403,7 +431,7 @@ impl CloneArgs {
         }
 
         let tid = linux_pid_from_task_id(new_task.id().as_u64())?;
-        let child_credential = CredentialSlot::try_new(child_cred)?;
+        let child_credential = CredentialSlot::try_new(child_cred.clone())?;
 
         let fork_parent_data = if flags.contains(CloneFlags::THREAD) {
             None
@@ -627,6 +655,19 @@ impl CloneArgs {
         let task_publication =
             reserve_prepared_task(task.clone()).map_err(|error| error.into_ax_error())?;
         let task_table_admission = prepare_task_table_admission(&task)?;
+        let credential_publication = match credential_publication_kind {
+            None => None,
+            Some(CloneCredentialPublicationKind::Fork) => Some(
+                PendingCredentialPublication::try_fork(&parent_cred, &child_cred, task.clone())?,
+            ),
+            Some(CloneCredentialPublicationKind::UserNamespace) => {
+                Some(PendingCredentialPublication::try_user_namespace(
+                    &parent_cred,
+                    &child_cred,
+                    task.clone(),
+                )?)
+            }
+        };
 
         if let Some((publication, _)) = pending_pidfd.as_ref() {
             let fd = publication.fd();
@@ -697,11 +738,15 @@ impl CloneArgs {
         if flags.contains(CloneFlags::CHILD_SETTID) && child_tid != 0 {
             let _ = vm_write_in_aspace(&child_aspace, child_tid as *mut Pid, tid);
         }
+        release_clone_lifecycle_then(fork_lifecycle, || {
+            if let Some(publication) = credential_publication {
+                publication.notify();
+            }
+        });
         let published_task = publish_prepared_task(task_publication);
         debug_assert!(Arc::ptr_eq(&published_task, &task));
         drop(published_task);
         thread_completion.finish();
-        drop(fork_lifecycle);
         // Thread/vfork-style clones often rely on immediate child progress for
         // futex or parent/child tid handshakes. Plain fork children are seeded
         // behind the parent in CFS, so the parent can finish post-fork setup
@@ -763,14 +808,58 @@ pub fn sys_fork(uctx: &UserContext) -> AxResult<isize> {
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
+    use core::cell::Cell;
 
     use axerrno::AxError;
     use linux_raw_sys::general::{CLONE_DETACHED, CLONE_PIDFD};
 
     use super::{
-        CloneApi, CloneArgs, CloneFlags, clone_namespace_owner, clone_process_access_state,
+        CloneApi, CloneArgs, CloneCredentialPublicationKind, CloneFlags,
+        clone_credential_publication_kind, clone_namespace_owner, clone_process_access_state,
+        release_clone_lifecycle_then,
     };
     use crate::task::{Cred, Dumpability, Kgid, Kuid, ProcessAccessState, UserNamespace};
+
+    struct DropProbe<'a> {
+        state: &'a Cell<u8>,
+        bit: u8,
+    }
+
+    impl Drop for DropProbe<'_> {
+        fn drop(&mut self) {
+            self.state.set(self.state.get() | self.bit);
+        }
+    }
+
+    #[test]
+    fn credential_publication_kind_excludes_shared_thread_clones() {
+        assert_eq!(
+            clone_credential_publication_kind(CloneFlags::empty()),
+            Some(CloneCredentialPublicationKind::Fork)
+        );
+        assert_eq!(
+            clone_credential_publication_kind(CloneFlags::NEWUSER),
+            Some(CloneCredentialPublicationKind::UserNamespace)
+        );
+        assert_eq!(clone_credential_publication_kind(CloneFlags::THREAD), None);
+    }
+
+    #[test]
+    fn credential_notification_runs_after_lifecycle_release() {
+        let state = Cell::new(0_u8);
+        release_clone_lifecycle_then(
+            DropProbe {
+                state: &state,
+                bit: 1,
+            },
+            || {
+                assert_eq!(state.get(), 1);
+                state.set(1 << 1);
+            },
+        );
+        // The caller performs runqueue publication only after this boundary.
+        assert_eq!(state.get(), 1 << 1);
+    }
 
     #[test]
     fn process_access_clone_vm_shares_and_fork_copies_image_owner() {

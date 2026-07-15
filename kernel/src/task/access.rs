@@ -45,14 +45,18 @@ impl PtraceAccessMode {
     }
 }
 
-/// Compatibility adapter for the Linux-credential crate's namespace-relative
-/// capability rule.
+/// Typed commoncap plus stacked-policy adapter for an ordinary audited
+/// namespace-relative capability request.
+///
+/// The exact outer credential supplies both the immutable ABI core and its
+/// complete per-module state vector. Set-ID callers use their dedicated helper
+/// instead of relabeling general access checks.
 pub(crate) fn ns_capable(
     actor: &Cred,
     target_user_ns: &Arc<UserNamespace>,
     capability: u32,
 ) -> bool {
-    thekernel_linux_cred::ns_capable(actor.core(), target_user_ns, capability)
+    super::security::capable(actor, target_user_ns, capability)
 }
 
 fn idmap_writer_parent(opener: &Cred, target: &Arc<UserNamespace>) -> Option<Arc<UserNamespace>> {

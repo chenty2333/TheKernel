@@ -57,7 +57,7 @@ pub(crate) use self::{
         process_error, reap_process,
     },
     restart::*,
-    security::SignalTargetKind,
+    security::{PendingCredentialPublication, SignalTargetKind},
     thread::{
         ProcStateHint, TaskParentChoice, TaskParentCredentialPin, TaskParentNode,
         TaskParentPublicationGuard, lock_task_parent_publication,

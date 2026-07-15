@@ -14,19 +14,23 @@ use core::{any::Any, fmt, marker::PhantomData};
 
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{Location, Metadata, NodeType};
+use axtask::AxTaskRef;
 use spin::Once;
 use thekernel_linux_cred::{
-    AuthorizationError, authorize_signal_core as external_authorize_signal_core,
+    AuthorizationError, CapabilityNumber,
+    authorize_capability_core as external_authorize_capability_core,
+    authorize_signal_core as external_authorize_signal_core,
     commoncap_ptrace_access as external_commoncap_ptrace_access,
     commoncap_ptrace_traceme as external_commoncap_ptrace_traceme,
     commoncap_scheduler as external_commoncap_scheduler,
 };
 pub(crate) use thekernel_linux_cred::{
-    FileOpenAccess, FileOpenOperation, InodeChmodIntent, InodeCreateMode, InodeMknodKind,
-    InodeMknodOperation, InodePermissionAccess, InodeSetattrIntent, InodeSetattrMode,
-    InodeSetattrProposal, InodeXattrOperation, PtraceAccessKind, PtraceCredentialKind,
-    SchedulerSecurityOperation, SignalCoreAuthorizationReason, SignalDeliveryScope, SignalNumber,
-    SignalSecurityOperation, SignalSecuritySource, XattrSetFlags, XattrValueClass,
+    CapabilitySecurityOperation, CredentialPublicationOperation, FileOpenAccess, FileOpenOperation,
+    InodeChmodIntent, InodeCreateMode, InodeMknodKind, InodeMknodOperation, InodePermissionAccess,
+    InodeSetattrIntent, InodeSetattrMode, InodeSetattrProposal, InodeXattrOperation,
+    PtraceAccessKind, PtraceCredentialKind, SchedulerSecurityOperation,
+    SignalCoreAuthorizationReason, SignalDeliveryScope, SignalNumber, SignalSecurityOperation,
+    SignalSecuritySource, XattrSetFlags, XattrValueClass,
 };
 
 use super::{
@@ -46,6 +50,43 @@ struct ModuleKey(u64);
 struct ModuleId(u8);
 
 type CoreCred = thekernel_linux_cred::Credential<UserNamespace>;
+type CoreCapabilitySecurityContext<'a> =
+    thekernel_linux_cred::CapabilitySecurityContext<'a, UserNamespace>;
+type CoreCredentialPublicationContext<'a> = thekernel_linux_cred::CredentialPublicationContext<
+    'a,
+    UserNamespace,
+    CredentialPublicationTarget,
+>;
+
+/// Opaque identity of the exact child task whose credential became visible.
+///
+/// Modules receive only the stable object identity, never an `AxTaskRef` which
+/// could reenter scheduler or task-table operations from an atomic callback.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct CredentialPublicationTarget {
+    identity: usize,
+}
+
+impl CredentialPublicationTarget {
+    pub(in crate::task) const fn identity(self) -> usize {
+        self.identity
+    }
+}
+
+/// Retained owner of a child publication target. Production uses the exact
+/// prepared scheduler task; host tests may provide an inert owner with the
+/// same immutable projection contract.
+pub(crate) trait CredentialPublicationTargetOwner {
+    fn credential_publication_target(&self) -> CredentialPublicationTarget;
+}
+
+impl CredentialPublicationTargetOwner for AxTaskRef {
+    fn credential_publication_target(&self) -> CredentialPublicationTarget {
+        CredentialPublicationTarget {
+            identity: Arc::as_ptr(self).cast::<()>() as usize,
+        }
+    }
+}
 
 /// Field families changed by one ordinary credential publication.
 ///
@@ -1795,6 +1836,42 @@ trait SecurityModule: Send + Sync + 'static {
     ) {
     }
 
+    /// Narrows one exact commoncap-approved capability request.
+    ///
+    /// The external context can only be produced after validated-number and
+    /// namespace/effective-set authorization. Dispatch has also validated the
+    /// actor's complete composite state vector before the first module runs.
+    /// Hooks are ordered, deny-first, allocation-free, and nonblocking; they
+    /// must not call `current()` or reenter capability/security dispatch.
+    fn capable(&self, _context: &CoreCapabilitySecurityContext<'_>) -> AxResult<()> {
+        Ok(())
+    }
+
+    fn capable_with_credential_state(
+        &self,
+        context: &CoreCapabilitySecurityContext<'_>,
+        actor_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        let _ = actor_state;
+        self.capable(context)
+    }
+
+    /// Observes a separately prepared fork or user-namespace credential after
+    /// its exact child target has become visible.
+    ///
+    /// Preparation, state authorization, and complete source/published layout
+    /// validation finish before visibility. This callback is infallible and
+    /// runs in frozen registry order after task-table and parent-publication
+    /// locks are released. It must not allocate, block, fail, panic, resample
+    /// `current()`, or reenter task, credential, or security operations.
+    fn credential_published(
+        &self,
+        _context: &CoreCredentialPublicationContext<'_>,
+        _source_state: &Self::CredentialState,
+        _published_state: &Self::CredentialState,
+    ) {
+    }
+
     /// Releases one module state through the module runtime that created it.
     /// The owner wrapper invokes this directly and never consults a registry.
     ///
@@ -2186,6 +2263,17 @@ trait ErasedSecurityModule: Send + Sync {
         new_state: &dyn ErasedOwnedCredentialState,
         transition: CredentialStateTransition,
     );
+    fn capable(
+        &self,
+        context: &CoreCapabilitySecurityContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
+    fn credential_published(
+        &self,
+        context: &CoreCredentialPublicationContext<'_>,
+        source_state: &dyn ErasedOwnedCredentialState,
+        published_state: &dyn ErasedOwnedCredentialState,
+    );
     fn inode_permission(&self, context: &InodePermissionSecurityContext<'_, '_>) -> AxResult<()>;
     fn inode_permission_with_credential_state(
         &self,
@@ -2473,6 +2561,31 @@ impl<M: SecurityModule> ErasedSecurityModule for M {
                 transition,
             },
         );
+    }
+
+    fn capable(
+        &self,
+        context: &CoreCapabilitySecurityContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::capable_with_credential_state(
+            self,
+            context,
+            owned_credential_state(self, actor_state)?,
+        )
+    }
+
+    fn credential_published(
+        &self,
+        context: &CoreCredentialPublicationContext<'_>,
+        source_state: &dyn ErasedOwnedCredentialState,
+        published_state: &dyn ErasedOwnedCredentialState,
+    ) {
+        let source_state = owned_credential_state(self, source_state)
+            .expect("preflighted source credential state changed before publication callback");
+        let published_state = owned_credential_state(self, published_state)
+            .expect("preflighted child credential state changed before publication callback");
+        SecurityModule::credential_published(self, context, source_state, published_state);
     }
 
     fn inode_permission(&self, context: &InodePermissionSecurityContext<'_, '_>) -> AxResult<()> {
@@ -2923,6 +3036,39 @@ impl SecurityModule for CommoncapModule {
         );
     }
 
+    fn capable(&self, context: &CoreCapabilitySecurityContext<'_>) -> AxResult<()> {
+        // The ABI leaf has already executed commoncap and only exposes this
+        // field-private context on success. Keep the mandatory first module in
+        // the dispatch shape without repeating or weakening that decision.
+        let _ = (
+            context.actor(),
+            context.target_user_ns(),
+            context.capability(),
+            context.operation(),
+        );
+        Ok(())
+    }
+
+    fn credential_published(
+        &self,
+        context: &CoreCredentialPublicationContext<'_>,
+        source_state: &Self::CredentialState,
+        published_state: &Self::CredentialState,
+    ) {
+        #[cfg(test)]
+        assert_post_commit_callback_locks_released();
+        let _ = (
+            context.source_credential(),
+            context.published_credential(),
+            context.source_user_ns(),
+            context.target_user_ns(),
+            context.target_object(),
+            context.operation(),
+            source_state,
+            published_state,
+        );
+    }
+
     fn ptrace_access(&self, context: &PtraceAccessContext<'_>) -> AxResult<()> {
         external_commoncap_ptrace_access(context.core()).map_err(authorization_error)
     }
@@ -2968,6 +3114,18 @@ impl SecurityModule for NoopPolicyModule {
         _transition: CredentialStateTransition,
     ) -> AxResult<Self::CredentialState> {
         Ok(())
+    }
+
+    fn capable(&self, _context: &CoreCapabilitySecurityContext<'_>) -> AxResult<()> {
+        Ok(())
+    }
+
+    fn credential_published(
+        &self,
+        _context: &CoreCredentialPublicationContext<'_>,
+        _source_state: &Self::CredentialState,
+        _published_state: &Self::CredentialState,
+    ) {
     }
 }
 
@@ -3215,9 +3373,7 @@ impl PendingCredentialPostCommit {
             return Err(AxError::BadState);
         }
         let registry = old.security().registry();
-        registry
-            .registry()
-            .validate_credential_post_commit_pair(old, new)?;
+        registry.registry().validate_credential_pair(old, new)?;
         Ok(Self {
             registry,
             old: old.clone(),
@@ -3236,6 +3392,122 @@ impl PendingCredentialPostCommit {
         registry
             .registry()
             .notify_credential_committed(&old, &new, transition);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CredentialPublicationKind {
+    Fork,
+    UserNamespace,
+}
+
+/// Linear pre-publication ownership for a separately prepared child
+/// credential and its exact target object.
+///
+/// Both composite state vectors and their creating runtimes are validated
+/// before this token is returned. Dropping it while the child is still private
+/// is the ordinary rollback path and emits no callback. Once TASK_TABLE has
+/// committed and all publication locks are released, [`Self::notify`] consumes
+/// the token, constructs the external success-only context, and performs one
+/// infallible frozen-order notification pass.
+#[must_use = "an admitted child publication must either abort or notify after visibility"]
+pub(crate) struct PendingCredentialPublication<T: CredentialPublicationTargetOwner> {
+    registry: FrozenSecurityRegistry,
+    source: Arc<Cred>,
+    published: Arc<Cred>,
+    target_owner: T,
+    kind: CredentialPublicationKind,
+}
+
+impl<T: CredentialPublicationTargetOwner> PendingCredentialPublication<T> {
+    pub(crate) fn try_fork(
+        source: &Arc<Cred>,
+        published: &Arc<Cred>,
+        target_owner: T,
+    ) -> AxResult<Self> {
+        if !source.same_linux_credential(published) {
+            return Err(AxError::BadState);
+        }
+        Self::try_new(
+            source,
+            published,
+            target_owner,
+            CredentialPublicationKind::Fork,
+        )
+    }
+
+    pub(crate) fn try_user_namespace(
+        source: &Arc<Cred>,
+        published: &Arc<Cred>,
+        target_owner: T,
+    ) -> AxResult<Self> {
+        let published_parent = published.user_ns().parent();
+        if source.same_linux_credential(published)
+            || !published_parent
+                .as_ref()
+                .is_some_and(|parent| Arc::ptr_eq(parent, source.user_ns()))
+        {
+            return Err(AxError::BadState);
+        }
+        Self::try_new(
+            source,
+            published,
+            target_owner,
+            CredentialPublicationKind::UserNamespace,
+        )
+    }
+
+    fn try_new(
+        source: &Arc<Cred>,
+        published: &Arc<Cred>,
+        target_owner: T,
+        kind: CredentialPublicationKind,
+    ) -> AxResult<Self> {
+        let registry = source.security().registry();
+        registry
+            .registry()
+            .validate_credential_pair(source, published)?;
+        Ok(Self {
+            registry,
+            source: source.clone(),
+            published: published.clone(),
+            target_owner,
+            kind,
+        })
+    }
+
+    /// Delivers the successful-publication event. The caller owns the external
+    /// visibility linearization point and must invoke this only after releasing
+    /// TASK_TABLE, task-parent, and process-lifecycle publication locks.
+    pub(crate) fn notify(self) {
+        let Self {
+            registry,
+            source,
+            published,
+            target_owner,
+            kind,
+        } = self;
+        let target = target_owner.credential_publication_target();
+        let context = match kind {
+            CredentialPublicationKind::Fork => {
+                thekernel_linux_cred::CredentialPublicationContext::fork(
+                    source.core(),
+                    published.core(),
+                    &target,
+                )
+            }
+            CredentialPublicationKind::UserNamespace => {
+                thekernel_linux_cred::CredentialPublicationContext::user_namespace(
+                    source.core(),
+                    published.core(),
+                    &target,
+                )
+            }
+        };
+        registry
+            .registry()
+            .notify_credential_published(&context, &source, &published);
+        drop(target_owner);
     }
 }
 
@@ -3262,9 +3534,7 @@ impl PendingExecSecurity {
         let old = prepared.old_arc();
         let new = prepared.proposed_arc();
         let registry = old.security().registry();
-        registry
-            .registry()
-            .validate_credential_post_commit_pair(old, new)?;
+        registry.registry().validate_credential_pair(old, new)?;
         Ok(Self {
             registry,
             old: old.clone(),
@@ -3391,11 +3661,32 @@ impl SecurityRegistry {
     }
 
     /// Performs the complete fallible layout, ModuleId, erased-type, and
-    /// exact-runtime validation for both sides before publication. No module
-    /// callback has run if either (including a late) slot is malformed.
-    fn validate_credential_post_commit_pair(&self, old: &Cred, new: &Cred) -> AxResult<()> {
-        self.credential_slots(old)?;
-        self.credential_slots(new)?;
+    /// exact-runtime validation for both composites before publication. No
+    /// module callback has run if either (including a late) slot is malformed.
+    fn validate_credential_pair(&self, source: &Cred, published: &Cred) -> AxResult<()> {
+        self.credential_slots(source)?;
+        self.credential_slots(published)?;
+        Ok(())
+    }
+
+    /// Dispatches one field-private commoncap success token with the exact
+    /// actor's composite state. The complete vector is validated before the
+    /// mandatory commoncap module or any stacked policy callback runs.
+    fn dispatch_capable_with_credential_state(
+        &self,
+        actor: &Cred,
+        context: &CoreCapabilitySecurityContext<'_>,
+    ) -> AxResult<()> {
+        if !core::ptr::eq(actor.core(), context.actor()) {
+            return Err(AxError::OperationNotPermitted);
+        }
+        let actor_slots = self.credential_slots(actor)?;
+        for (registered, actor_state) in self.modules.iter().zip(actor_slots) {
+            debug_assert_eq!(registered.id, actor_state.module_id);
+            registered
+                .module
+                .capable(context, actor_state.erased.as_ref())?;
+        }
         Ok(())
     }
 
@@ -3423,6 +3714,37 @@ impl SecurityRegistry {
                 new.core(),
                 new_state.erased.as_ref(),
                 transition,
+            );
+        }
+    }
+
+    /// Delivers one already-visible child credential lifecycle event in frozen
+    /// order. `PendingCredentialPublication` completed every fallible registry,
+    /// layout, and erased-runtime check before TASK_TABLE publication.
+    fn notify_credential_published(
+        &self,
+        context: &CoreCredentialPublicationContext<'_>,
+        source: &Cred,
+        published: &Cred,
+    ) {
+        debug_assert!(core::ptr::eq(context.source_credential(), source.core()));
+        debug_assert!(core::ptr::eq(
+            context.published_credential(),
+            published.core()
+        ));
+        let source_slots = &source.security().slots;
+        let published_slots = &published.security().slots;
+        debug_assert_eq!(source_slots.len(), self.modules.len());
+        debug_assert_eq!(published_slots.len(), self.modules.len());
+        for ((registered, source_state), published_state) in
+            self.modules.iter().zip(source_slots).zip(published_slots)
+        {
+            debug_assert_eq!(registered.id, source_state.module_id);
+            debug_assert_eq!(registered.id, published_state.module_id);
+            registered.module.credential_published(
+                context,
+                source_state.erased.as_ref(),
+                published_state.erased.as_ref(),
             );
         }
     }
@@ -4401,6 +4723,61 @@ pub(crate) fn dispatch_file_open(context: &FileOpenSecurityContext<'_, '_>) -> A
         .dispatch_file_open_with_credential_state(context)
 }
 
+/// Runs Linux commoncap first, then lets the exact actor's frozen module stack
+/// narrow the successful decision in declaration order.
+///
+/// Invalid raw numbers and commoncap denials return before registry lookup or
+/// any module callback. Complete composite-state validation likewise finishes
+/// before the mandatory commoncap module and later policy modules run.
+fn authorize_capability_with_operation(
+    actor: &Cred,
+    target_user_ns: &Arc<UserNamespace>,
+    raw_capability: u32,
+    operation: CapabilitySecurityOperation,
+) -> AxResult<()> {
+    let capability = CapabilityNumber::try_new(raw_capability).ok_or(AxError::InvalidInput)?;
+    let context =
+        external_authorize_capability_core(actor.core(), target_user_ns, capability, operation)
+            .map_err(authorization_error)?;
+    actor
+        .security()
+        .registry()
+        .registry()
+        .dispatch_capable_with_credential_state(actor, &context)
+}
+
+/// Ordinary audited capability check used by every general kernel capability
+/// entry point, including `task::access::ns_capable`.
+pub(in crate::task) fn capable(
+    actor: &Cred,
+    target_user_ns: &Arc<UserNamespace>,
+    raw_capability: u32,
+) -> bool {
+    authorize_capability_with_operation(
+        actor,
+        target_user_ns,
+        raw_capability,
+        CapabilitySecurityOperation::Use,
+    )
+    .is_ok()
+}
+
+/// Set-ID-family capability check. Keeping this helper specific prevents an
+/// arbitrary caller from relabeling an ordinary check as `CAP_OPT_INSETID`.
+pub(in crate::task) fn capable_for_setid(
+    actor: &Cred,
+    target_user_ns: &Arc<UserNamespace>,
+    raw_capability: u32,
+) -> bool {
+    authorize_capability_with_operation(
+        actor,
+        target_user_ns,
+        raw_capability,
+        CapabilitySecurityOperation::SetId,
+    )
+    .is_ok()
+}
+
 /// Runs the frozen ptrace access hooks in declaration order.
 /// The first denial is returned immediately.
 pub(crate) fn dispatch_ptrace_access(context: &PtraceAccessContext<'_>) -> AxResult<()> {
@@ -5009,7 +5386,7 @@ mod tests {
     extern crate std;
 
     use alloc::vec;
-    use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
     use std::{
         sync::{Barrier, Mutex, MutexGuard},
         thread,
@@ -5027,7 +5404,7 @@ mod tests {
         pseudofs::MemoryFs,
         task::{
             CapabilityState, Cred, CredentialSlot, Credentials, ExecCommitRuntime,
-            ExecFileIdentity, ExecImageIdentity, Kgid, Kuid,
+            ExecFileIdentity, ExecImageIdentity, IdMapInputExtent, Kgid, Kuid,
             creds::{CAPABILITY_WORDS, credential_publication_lock_held},
         },
     };
@@ -5074,6 +5451,15 @@ mod tests {
     static CRED_STATE_COMMIT_MUTATION_MASK: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_COMMIT_OLD_UID: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_COMMIT_NEW_UID: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_CAPABLE_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_CAPABLE_OPERATION: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_CAPABLE_NUMBER: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_CAPABLE_DENY_KEY: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_PUBLICATION_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_PUBLICATION_OPERATION: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_PUBLICATION_SOURCE_UID: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_PUBLICATION_CHILD_UID: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_PUBLICATION_TARGET: AtomicUsize = AtomicUsize::new(0);
     static CRED_STATE_DROP_AT_COMMIT: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_DROP_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_DISPATCH_TRACE: AtomicU32 = AtomicU32::new(0);
@@ -5133,6 +5519,14 @@ mod tests {
             &CRED_STATE_COMMIT_MUTATION_MASK,
             &CRED_STATE_COMMIT_OLD_UID,
             &CRED_STATE_COMMIT_NEW_UID,
+            &CRED_STATE_CAPABLE_TRACE,
+            &CRED_STATE_CAPABLE_OPERATION,
+            &CRED_STATE_CAPABLE_NUMBER,
+            &CRED_STATE_CAPABLE_DENY_KEY,
+            &CRED_STATE_PUBLICATION_TRACE,
+            &CRED_STATE_PUBLICATION_OPERATION,
+            &CRED_STATE_PUBLICATION_SOURCE_UID,
+            &CRED_STATE_PUBLICATION_CHILD_UID,
             &CRED_STATE_DROP_AT_COMMIT,
             &CRED_STATE_DROP_TRACE,
             &CRED_STATE_DISPATCH_TRACE,
@@ -5168,6 +5562,7 @@ mod tests {
         ] {
             trace.store(0, Ordering::SeqCst);
         }
+        CRED_STATE_PUBLICATION_TARGET.store(0, Ordering::SeqCst);
         guard
     }
 
@@ -5211,6 +5606,19 @@ mod tests {
             [0; CAPABILITY_WORDS],
             true,
         )
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestCredentialPublicationTargetOwner {
+        identity: usize,
+    }
+
+    impl CredentialPublicationTargetOwner for TestCredentialPublicationTargetOwner {
+        fn credential_publication_target(&self) -> CredentialPublicationTarget {
+            CredentialPublicationTarget {
+                identity: self.identity,
+            }
+        }
     }
 
     struct ProbeCredentialState {
@@ -5290,6 +5698,73 @@ mod tests {
                 return Err(AxError::PermissionDenied);
             }
             Ok(())
+        }
+
+        fn capable_with_credential_state(
+            &self,
+            context: &CoreCapabilitySecurityContext<'_>,
+            actor_state: &Self::CredentialState,
+        ) -> AxResult<()> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(actor_state.key, key);
+            assert!(actor_state.committed.load(Ordering::SeqCst));
+            append_trace(&CRED_STATE_CAPABLE_TRACE, key);
+            if key == 2 {
+                let operation = match context.operation() {
+                    CapabilitySecurityOperation::Use => 1,
+                    CapabilitySecurityOperation::UseWithoutAudit => 1 << 1,
+                    CapabilitySecurityOperation::SetId => 1 << 2,
+                    _ => 1 << 3,
+                };
+                CRED_STATE_CAPABLE_OPERATION.store(operation, Ordering::SeqCst);
+                CRED_STATE_CAPABLE_NUMBER.store(context.capability().get(), Ordering::SeqCst);
+            }
+            if CRED_STATE_CAPABLE_DENY_KEY.load(Ordering::SeqCst) == key {
+                return Err(AxError::PermissionDenied);
+            }
+            Ok(())
+        }
+
+        fn credential_published(
+            &self,
+            context: &CoreCredentialPublicationContext<'_>,
+            source_state: &Self::CredentialState,
+            published_state: &Self::CredentialState,
+        ) {
+            assert_post_commit_callback_locks_released();
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(source_state.key, key);
+            assert_eq!(published_state.key, key);
+            assert!(source_state.committed.load(Ordering::SeqCst));
+            assert!(!published_state.committed.swap(true, Ordering::SeqCst));
+            assert_eq!(published_state.generation, source_state.generation + 1);
+            append_trace(&CRED_STATE_PUBLICATION_TRACE, key);
+            if key == 2 {
+                let operation = match context.operation() {
+                    CredentialPublicationOperation::Fork => 1,
+                    CredentialPublicationOperation::UserNamespace => 1 << 1,
+                    _ => 1 << 2,
+                };
+                CRED_STATE_PUBLICATION_OPERATION.store(operation, Ordering::SeqCst);
+                CRED_STATE_PUBLICATION_SOURCE_UID.store(
+                    context.source_credential().ids().euid.into_raw(),
+                    Ordering::SeqCst,
+                );
+                CRED_STATE_PUBLICATION_CHILD_UID.store(
+                    context.published_credential().ids().euid.into_raw(),
+                    Ordering::SeqCst,
+                );
+                CRED_STATE_PUBLICATION_TARGET
+                    .store(context.target_object().identity(), Ordering::SeqCst);
+                assert!(Arc::ptr_eq(
+                    context.source_user_ns(),
+                    context.source_credential().user_ns()
+                ));
+                assert!(Arc::ptr_eq(
+                    context.target_user_ns(),
+                    context.published_credential().user_ns()
+                ));
+            }
         }
 
         fn credential_committed(
@@ -10399,6 +10874,264 @@ mod tests {
 
         assert_eq!(CRED_STATE_EXECUTABLE_ROLE_TRACE.load(Ordering::SeqCst), 123);
         assert_eq!(CRED_STATE_EXECUTABLE_TRACE.load(Ordering::SeqCst), 232_323);
+    }
+
+    #[test]
+    fn capable_is_commoncap_first_typed_and_deny_first() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
+
+        assert!(crate::task::ns_capable(&actor, &namespace, CAP_CHOWN));
+        assert_eq!(CRED_STATE_CAPABLE_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(CRED_STATE_CAPABLE_OPERATION.load(Ordering::SeqCst), 1);
+        assert_eq!(CRED_STATE_CAPABLE_NUMBER.load(Ordering::SeqCst), CAP_CHOWN);
+
+        CRED_STATE_CAPABLE_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_CAPABLE_OPERATION.store(0, Ordering::SeqCst);
+        assert!(actor.has_effective_capability(CAP_CHOWN));
+        assert_eq!(CRED_STATE_CAPABLE_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(CRED_STATE_CAPABLE_OPERATION.load(Ordering::SeqCst), 1);
+
+        CRED_STATE_CAPABLE_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_CAPABLE_OPERATION.store(0, Ordering::SeqCst);
+        assert!(actor.has_effective_capability_for_setid(CAP_CHOWN));
+        assert_eq!(CRED_STATE_CAPABLE_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(CRED_STATE_CAPABLE_OPERATION.load(Ordering::SeqCst), 1 << 2);
+
+        CRED_STATE_CAPABLE_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_CAPABLE_DENY_KEY.store(2, Ordering::SeqCst);
+        assert_eq!(
+            authorize_capability_with_operation(
+                &actor,
+                &namespace,
+                CAP_CHOWN,
+                CapabilitySecurityOperation::Use,
+            ),
+            Err(AxError::PermissionDenied)
+        );
+        assert_eq!(CRED_STATE_CAPABLE_TRACE.load(Ordering::SeqCst), 2);
+
+        CRED_STATE_CAPABLE_DENY_KEY.store(0, Ordering::SeqCst);
+        let slot = CredentialSlot::new(actor.clone());
+        let mut update = slot.prepare();
+        update.builder.caps.effective = [0; CAPABILITY_WORDS];
+        update.builder.caps.permitted = [0; CAPABILITY_WORDS];
+        update.builder.caps.clear_ambient();
+        let restricted = update.finish().unwrap().commit();
+
+        CRED_STATE_CAPABLE_TRACE.store(0, Ordering::SeqCst);
+        assert_eq!(
+            authorize_capability_with_operation(
+                &restricted,
+                &namespace,
+                CAP_CHOWN,
+                CapabilitySecurityOperation::Use,
+            ),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_CAPABLE_TRACE.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            authorize_capability_with_operation(
+                &actor,
+                &namespace,
+                u32::MAX,
+                CapabilitySecurityOperation::Use,
+            ),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(CRED_STATE_CAPABLE_TRACE.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn malformed_capable_state_fails_before_any_module_callback() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
+        let mut malformed_security = registry.try_init_credential_state(actor.core()).unwrap();
+        malformed_security.slots[1].erased = try_own_credential_state(
+            Arc::new(CredentialStateProbeModule::<3>),
+            ProbeCredentialState {
+                key: 3,
+                generation: 0,
+                committed: AtomicBool::new(true),
+            },
+        )
+        .unwrap();
+        let malformed =
+            Cred::try_from_prepared_parts(actor.core_arc().clone(), malformed_security).unwrap();
+
+        assert_eq!(
+            authorize_capability_with_operation(
+                &malformed,
+                &namespace,
+                CAP_CHOWN,
+                CapabilitySecurityOperation::Use,
+            ),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_CAPABLE_TRACE.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn child_credential_publication_is_ordered_typed_and_success_only() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let source = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
+
+        let aborted_child = Cred::try_clone_for_fork(&source).unwrap();
+        let aborted = PendingCredentialPublication::try_fork(
+            &source,
+            &aborted_child,
+            TestCredentialPublicationTargetOwner { identity: 0x101 },
+        )
+        .unwrap();
+        drop(aborted);
+        assert_eq!(CRED_STATE_PUBLICATION_TRACE.load(Ordering::SeqCst), 0);
+
+        let fork_child = Cred::try_clone_for_fork(&source).unwrap();
+        PendingCredentialPublication::try_fork(
+            &source,
+            &fork_child,
+            TestCredentialPublicationTargetOwner { identity: 0x202 },
+        )
+        .unwrap()
+        .notify();
+        assert_eq!(CRED_STATE_PUBLICATION_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(CRED_STATE_PUBLICATION_OPERATION.load(Ordering::SeqCst), 1);
+        assert_eq!(CRED_STATE_PUBLICATION_TARGET.load(Ordering::SeqCst), 0x202);
+        assert_eq!(
+            CRED_STATE_PUBLICATION_SOURCE_UID.load(Ordering::SeqCst),
+            source.ids().euid.into_raw()
+        );
+        assert_eq!(
+            CRED_STATE_PUBLICATION_CHILD_UID.load(Ordering::SeqCst),
+            fork_child.ids().euid.into_raw()
+        );
+
+        CRED_STATE_PUBLICATION_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_PUBLICATION_OPERATION.store(0, Ordering::SeqCst);
+        let ids = source.ids();
+        let child_namespace = namespace.try_fork(ids.euid, ids.egid, true).unwrap();
+        let userns_child = Cred::try_with_user_namespace(&source, child_namespace.clone()).unwrap();
+        PendingCredentialPublication::try_user_namespace(
+            &source,
+            &userns_child,
+            TestCredentialPublicationTargetOwner { identity: 0x303 },
+        )
+        .unwrap()
+        .notify();
+        assert_eq!(CRED_STATE_PUBLICATION_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(
+            CRED_STATE_PUBLICATION_OPERATION.load(Ordering::SeqCst),
+            1 << 1
+        );
+        assert_eq!(CRED_STATE_PUBLICATION_TARGET.load(Ordering::SeqCst), 0x303);
+        assert!(Arc::ptr_eq(userns_child.user_ns(), &child_namespace));
+    }
+
+    #[test]
+    fn credential_publication_rejects_mislabeled_or_foreign_children() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let source = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
+        let fork_child = Cred::try_clone_for_fork(&source).unwrap();
+        let ids = source.ids();
+        let child_namespace = namespace.try_fork(ids.euid, ids.egid, true).unwrap();
+        let userns_child = Cred::try_with_user_namespace(&source, child_namespace.clone()).unwrap();
+
+        assert!(matches!(
+            PendingCredentialPublication::try_fork(
+                &source,
+                &userns_child,
+                TestCredentialPublicationTargetOwner { identity: 1 },
+            ),
+            Err(AxError::BadState)
+        ));
+        assert!(matches!(
+            PendingCredentialPublication::try_user_namespace(
+                &source,
+                &fork_child,
+                TestCredentialPublicationTargetOwner { identity: 2 },
+            ),
+            Err(AxError::BadState)
+        ));
+
+        child_namespace
+            .publish_uid_map(
+                child_namespace
+                    .try_build_uid_map(vec![IdMapInputExtent::new(0, ids.euid.into_raw(), 1)])
+                    .unwrap(),
+            )
+            .unwrap();
+        child_namespace
+            .publish_gid_map(
+                child_namespace
+                    .try_build_gid_map(vec![IdMapInputExtent::new(0, ids.egid.into_raw(), 1)])
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        let grandchild_namespace = child_namespace.try_fork(ids.euid, ids.egid, true).unwrap();
+        let grandchild =
+            Cred::try_with_user_namespace(&userns_child, grandchild_namespace).unwrap();
+        assert!(matches!(
+            PendingCredentialPublication::try_user_namespace(
+                &source,
+                &grandchild,
+                TestCredentialPublicationTargetOwner { identity: 3 },
+            ),
+            Err(AxError::BadState)
+        ));
+
+        let foreign_registry = probe_registry();
+        let foreign_security = foreign_registry
+            .try_init_credential_state(source.core())
+            .unwrap();
+        let foreign =
+            Cred::try_from_prepared_parts(source.core_arc().clone(), foreign_security).unwrap();
+        assert!(matches!(
+            PendingCredentialPublication::try_fork(
+                &source,
+                &foreign,
+                TestCredentialPublicationTargetOwner { identity: 4 },
+            ),
+            Err(AxError::OperationNotPermitted)
+        ));
+
+        let mut wrong_type_security = registry.try_init_credential_state(source.core()).unwrap();
+        wrong_type_security.slots[1].erased = try_own_credential_state(
+            Arc::new(CredentialStateProbeModule::<3>),
+            ProbeCredentialState {
+                key: 3,
+                generation: 0,
+                committed: AtomicBool::new(true),
+            },
+        )
+        .unwrap();
+        let wrong_type =
+            Cred::try_from_prepared_parts(source.core_arc().clone(), wrong_type_security).unwrap();
+        assert!(matches!(
+            PendingCredentialPublication::try_fork(
+                &source,
+                &wrong_type,
+                TestCredentialPublicationTargetOwner { identity: 5 },
+            ),
+            Err(AxError::OperationNotPermitted)
+        ));
+        assert_eq!(CRED_STATE_PUBLICATION_TRACE.load(Ordering::SeqCst), 0);
+
+        // This test intentionally creates more composite credentials than the
+        // decimal u32 drop-order probe can encode at once. Release them in
+        // bounded batches; drop order is covered by dedicated tests.
+        for credential in [fork_child, grandchild, foreign, wrong_type] {
+            drop(credential);
+            CRED_STATE_DROP_TRACE.store(0, Ordering::SeqCst);
+        }
     }
 
     #[test]

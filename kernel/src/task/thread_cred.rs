@@ -51,9 +51,7 @@ fn prepare_setfsuid_update<'a>(
 ) -> AxResult<(Kuid, Option<PreparedCred<'a>>)> {
     let mut update = credential.prepare();
     let root_kuid = update.old().user_ns().root_kuid();
-    let can_setuid = update
-        .old()
-        .has_effective_capability_in_own_user_ns(CAP_SETUID);
+    let can_setuid = update.old().has_effective_capability_for_setid(CAP_SETUID);
     let old_fsuid = update.builder.ids.fsuid;
     if can_setuid
         || fsuid == update.builder.ids.ruid
@@ -80,9 +78,7 @@ fn prepare_setfsgid_update<'a>(
     fsgid: Kgid,
 ) -> AxResult<(Kgid, Option<PreparedCred<'a>>)> {
     let mut update = credential.prepare();
-    let can_setgid = update
-        .old()
-        .has_effective_capability_in_own_user_ns(CAP_SETGID);
+    let can_setgid = update.old().has_effective_capability_for_setid(CAP_SETGID);
     let old_fsgid = update.builder.ids.fsgid;
     if can_setgid
         || fsgid == update.builder.ids.rgid
@@ -145,9 +141,7 @@ impl Thread {
         let groups = GroupInfo::try_new(groups).map_err(super::cred_error)?;
         let mut update = self.credential.prepare();
         if !update.old().user_ns().may_setgroups()
-            || !update
-                .old()
-                .has_effective_capability_in_own_user_ns(CAP_SETGID)
+            || !update.old().has_effective_capability_for_setid(CAP_SETGID)
         {
             return Err(AxError::OperationNotPermitted);
         }
@@ -380,9 +374,7 @@ impl Thread {
     pub(crate) fn setuid(&self, uid: Kuid) -> AxResult<()> {
         let mut update = self.credential.prepare();
         let root_kuid = update.old().user_ns().root_kuid();
-        let can_setuid = update
-            .old()
-            .has_effective_capability_in_own_user_ns(CAP_SETUID);
+        let can_setuid = update.old().has_effective_capability_for_setid(CAP_SETUID);
         let old = update.builder.ids;
         if can_setuid {
             update.builder.ids.ruid = uid;
@@ -415,9 +407,7 @@ impl Thread {
 
     pub(crate) fn setgid(&self, gid: Kgid) -> AxResult<()> {
         let mut update = self.credential.prepare();
-        let can_setgid = update
-            .old()
-            .has_effective_capability_in_own_user_ns(CAP_SETGID);
+        let can_setgid = update.old().has_effective_capability_for_setid(CAP_SETGID);
         let old = update.builder.ids;
         if can_setgid {
             update.builder.ids.rgid = gid;
@@ -439,9 +429,7 @@ impl Thread {
     pub(crate) fn setreuid(&self, ruid: Option<Kuid>, euid: Option<Kuid>) -> AxResult<()> {
         let mut update = self.credential.prepare();
         let root_kuid = update.old().user_ns().root_kuid();
-        let can_setuid = update
-            .old()
-            .has_effective_capability_in_own_user_ns(CAP_SETUID);
+        let can_setuid = update.old().has_effective_capability_for_setid(CAP_SETUID);
         let old = update.builder.ids;
         if !can_setuid {
             if let Some(id) = ruid
@@ -479,9 +467,7 @@ impl Thread {
 
     pub(crate) fn setregid(&self, rgid: Option<Kgid>, egid: Option<Kgid>) -> AxResult<()> {
         let mut update = self.credential.prepare();
-        let can_setgid = update
-            .old()
-            .has_effective_capability_in_own_user_ns(CAP_SETGID);
+        let can_setgid = update.old().has_effective_capability_for_setid(CAP_SETGID);
         let old = update.builder.ids;
         if !can_setgid {
             if let Some(id) = rgid
@@ -519,9 +505,7 @@ impl Thread {
     ) -> AxResult<()> {
         let mut update = self.credential.prepare();
         let root_kuid = update.old().user_ns().root_kuid();
-        let can_setuid = update
-            .old()
-            .has_effective_capability_in_own_user_ns(CAP_SETUID);
+        let can_setuid = update.old().has_effective_capability_for_setid(CAP_SETUID);
         let old = update.builder.ids;
         if !can_setuid {
             for id in [ruid, euid, suid].into_iter().flatten() {
@@ -558,9 +542,7 @@ impl Thread {
         sgid: Option<Kgid>,
     ) -> AxResult<()> {
         let mut update = self.credential.prepare();
-        let can_setgid = update
-            .old()
-            .has_effective_capability_in_own_user_ns(CAP_SETGID);
+        let can_setgid = update.old().has_effective_capability_for_setid(CAP_SETGID);
         let old = update.builder.ids;
         if !can_setgid {
             for id in [rgid, egid, sgid].into_iter().flatten() {
