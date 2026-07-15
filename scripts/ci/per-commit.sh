@@ -467,6 +467,14 @@ ci_run_step credential-core-check "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo check --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
     -p thekernel-linux-cred --no-default-features
+ci_run_step mm-core-tests "$STEP_TIMEOUT_SECS" \
+    env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
+    cargo test --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
+    -p thekernel-linux-mm
+ci_run_step mm-core-check "$STEP_TIMEOUT_SECS" \
+    env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
+    cargo check --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
+    -p thekernel-linux-mm --no-default-features
 ci_run_step process-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \

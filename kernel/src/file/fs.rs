@@ -1,5 +1,6 @@
-use alloc::{borrow::Cow, vec};
+use alloc::{borrow::Cow, vec::Vec};
 use core::{
+    cell::Cell,
     ffi::c_int,
     hint::likely,
     sync::atomic::{AtomicBool, Ordering},
@@ -7,23 +8,27 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs::{FS_CONTEXT, FileBackend, FsContext, WritePlacement};
+use axfs::{FS_CONTEXT, FsContext, WritePlacement};
 use axfs_ng_vfs::{
     DirEntrySink, Location, Metadata, NodeFlags,
     path::{MAX_NAME_LEN, Path},
 };
-use axio::{Cursor, IoBuf, Seek, SeekFrom};
+use axio::{IoBuf, Read};
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::general::{
-    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_NONBLOCK, RLIM_INFINITY, RLIMIT_FSIZE,
+    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_APPEND, O_NONBLOCK, RLIM_INFINITY, RLIMIT_FSIZE,
 };
 use starry_signal::{SignalInfo, Signo};
 
 use super::{
     FileHandle, FileLike, Kstat, OfdIoStatus, get_file_like, get_typed_file,
     permission::{DacFsContextExt, SecurityFsContextExt, VfsSecurityContext},
+    privilege_metadata::{
+        ContentWriteCredentialView, ContentWritePrivilegeGuard,
+        begin_conservative_content_write_privilege_cleanup, begin_content_write_privilege_cleanup,
+    },
     try_owned_path,
 };
 use crate::{
@@ -277,11 +282,105 @@ pub struct File {
     nonblock: AtomicBool,
 }
 
-fn killpriv_before_content_write(loc: &Location, requested: usize) -> AxResult<()> {
-    if requested == 0 {
-        return Ok(());
+struct ReplayableWriteSource<'a, S: ?Sized> {
+    source: &'a mut S,
+    cache: Vec<u8>,
+    requested: usize,
+    position: usize,
+    admitted: &'a Cell<Option<usize>>,
+}
+
+impl<'a, S> ReplayableWriteSource<'a, S>
+where
+    S: Read + IoBuf + ?Sized,
+{
+    fn new(source: &'a mut S, admitted: &'a Cell<Option<usize>>) -> Self {
+        Self {
+            requested: source.remaining(),
+            source,
+            cache: Vec::new(),
+            position: 0,
+            admitted,
+        }
     }
-    File::killpriv_before_file_mutation(loc)
+
+    fn begin_attempt(&mut self) {
+        self.position = 0;
+        self.admitted.set(None);
+    }
+}
+
+impl<S> Read for ReplayableWriteSource<'_, S>
+where
+    S: Read + IoBuf + ?Sized,
+{
+    fn read(&mut self, dst: &mut [u8]) -> axio::Result<usize> {
+        let limit = dst.len().min(self.remaining());
+        if limit == 0 {
+            return Ok(0);
+        }
+
+        let cached = self.cache.len().saturating_sub(self.position).min(limit);
+        if cached != 0 {
+            dst[..cached].copy_from_slice(&self.cache[self.position..self.position + cached]);
+            self.position += cached;
+            return Ok(cached);
+        }
+
+        let start = self.cache.len();
+        self.cache
+            .try_reserve_exact(limit)
+            .map_err(|_| AxError::NoMemory)?;
+        self.cache.resize(start + limit, 0);
+        let read = match self.source.read(&mut self.cache[start..]) {
+            Ok(read) if read <= limit => read,
+            Ok(_) => {
+                self.cache.truncate(start);
+                return Err(AxError::InvalidInput);
+            }
+            Err(error) => {
+                self.cache.truncate(start);
+                return Err(error);
+            }
+        };
+        self.cache.truncate(start + read);
+        dst[..read].copy_from_slice(&self.cache[start..]);
+        self.position += read;
+        Ok(read)
+    }
+}
+
+impl<S> IoBuf for ReplayableWriteSource<'_, S>
+where
+    S: Read + IoBuf + ?Sized,
+{
+    fn remaining(&self) -> usize {
+        self.admitted
+            .get()
+            .unwrap_or(self.requested)
+            .saturating_sub(self.position)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ContentWriteSecurity<'a> {
+    Exact(&'a VfsSecurityContext),
+    Conservative,
+}
+
+impl ContentWriteSecurity<'_> {
+    fn begin(self, location: &Location) -> AxResult<ContentWritePrivilegeGuard> {
+        match self {
+            Self::Exact(security) => begin_content_write_privilege_cleanup(
+                location,
+                ContentWriteCredentialView::new(
+                    security.actor(),
+                    security.filesystem_owner_user_ns(),
+                ),
+            ),
+            Self::Conservative => begin_conservative_content_write_privilege_cleanup(location),
+        }
+    }
 }
 
 impl File {
@@ -296,20 +395,14 @@ impl File {
         &self.inner
     }
 
-    pub(crate) fn killpriv_before_file_mutation(loc: &Location) -> AxResult<()> {
-        super::xattr_provider::remove_security_capability_if_present(loc)
-    }
-
-    pub(crate) fn set_len_with_killpriv(backend: &FileBackend, len: u64) -> AxResult<()> {
-        Self::killpriv_before_file_mutation(backend.location())?;
-        backend.set_len(len)
-    }
-
-    /// Revokes executable privilege metadata before a real content mutation.
-    /// The open-file-description's write admission keeps setcap excluded from
-    /// this point until the mutation has completed or the writer is closed.
-    pub(crate) fn killpriv_for_content_mutation(&self) -> AxResult<()> {
-        killpriv_before_content_write(self.inner.location(), 1)
+    /// Begins Linux privilege cleanup using the exact actor and filesystem
+    /// owner namespace frozen by the syscall. The returned guard must cover the
+    /// complete backend content mutation.
+    pub(crate) fn begin_content_write_privilege_cleanup(
+        &self,
+        security: &VfsSecurityContext,
+    ) -> AxResult<ContentWritePrivilegeGuard> {
+        ContentWriteSecurity::Exact(security).begin(self.inner.location())
     }
 
     fn is_blocking(&self) -> bool {
@@ -328,6 +421,26 @@ impl File {
         }
     }
 
+    /// Reads at a caller-frozen open-file-description position.
+    ///
+    /// The caller owns any current-position transaction; this method must not
+    /// reacquire it while providing the same blocking semantics as `read`.
+    pub(crate) fn read_at_with_status(
+        &self,
+        status: OfdIoStatus,
+        dst: &mut IoDst,
+        offset: u64,
+    ) -> AxResult<usize> {
+        let inner = self.inner();
+        if likely(self.is_blocking()) {
+            inner.read_at(dst, offset)
+        } else {
+            block_on_poll_io(self, IoEvents::READABLE, status.nonblocking(), || {
+                inner.read_at(&mut *dst, offset)
+            })
+        }
+    }
+
     /// Writes using one immutable open-file-description status snapshot.
     ///
     /// Every status-sensitive decision for this operation, including append
@@ -337,68 +450,196 @@ impl File {
         &self,
         status: OfdIoStatus,
         src: &mut IoSrc,
+        security: &VfsSecurityContext,
     ) -> AxResult<usize> {
-        self.write_with_explicit_status(status.append(), status.nonblocking(), src)
+        self.write_with_status_and_direct_validation(status, src, security, |_offset, _allowed| {
+            Ok(())
+        })
     }
 
-    fn write_with_explicit_status(
+    /// Writes using one status snapshot and validates the exact admitted
+    /// offset/prefix before the backend can mutate the inode.
+    ///
+    /// Ordinary append admission runs inside axfs-ng's inode append domain, so
+    /// Linux policy never reasons from a stale EOF. The validator is supplied
+    /// by syscall glue because user-buffer alignment is an ABI concern rather
+    /// than a VFS mechanism.
+    pub(crate) fn write_with_status_and_direct_validation(
         &self,
-        append: bool,
-        nonblocking: bool,
+        status: OfdIoStatus,
         src: &mut IoSrc,
+        security: &VfsSecurityContext,
+        mut validate_direct: impl FnMut(u64, usize) -> AxResult<()>,
+    ) -> AxResult<usize> {
+        self.write_with_status_and_direct_validation_inner(
+            status,
+            src,
+            ContentWriteSecurity::Exact(security),
+            &mut validate_direct,
+        )
+    }
+
+    fn write_with_status_and_direct_validation_inner(
+        &self,
+        status: OfdIoStatus,
+        src: &mut IoSrc,
+        security: ContentWriteSecurity<'_>,
+        validate_direct: &mut impl FnMut(u64, usize) -> AxResult<()>,
     ) -> AxResult<usize> {
         let inner = self.inner();
-        let inode_append = append
-            && !inner
-                .location()
-                .flags()
-                .contains(NodeFlags::POSITIONED_APPEND);
-        let placement = if inode_append {
+        let memfd_mutation = memfd::begin_write(inner.location(), src.remaining())?;
+        let admitted = Cell::new(None);
+        let mut replay = ReplayableWriteSource::new(src, &admitted);
+        let placement = if status.append() {
             WritePlacement::End
         } else {
             WritePlacement::Current
         };
-        let len = src.remaining();
-        let mut limited = None;
-        if len != 0 {
-            let offset = if inode_append {
-                inner.location().len()?
-            } else {
-                let mut file = inner;
-                file.seek(SeekFrom::Current(0))?
-            };
-            super::executable::check_not_active(inner.location())?;
-            let allowed = allowed_write_len(offset, len)?;
-            if allowed == 0 {
-                return Ok(0);
-            }
-            memfd::check_write(inner.location(), offset, allowed)?;
-            if allowed < len {
-                let mut buf = vec![0u8; allowed];
-                let read = src.read(&mut buf)?;
-                limited = Some(buf[..read].to_vec());
-            }
+        let inode_append = placement == WritePlacement::End
+            && inner.has_current_position()
+            && !inner
+                .location()
+                .flags()
+                .contains(NodeFlags::POSITIONED_APPEND);
+        let mut write = || {
+            replay.begin_attempt();
+            let mut privilege_guard = None;
+            let result = inner.write_with_placement_and_admission(
+                &mut replay,
+                placement,
+                |offset, requested| {
+                    let file_len = if inode_append {
+                        offset
+                    } else {
+                        inner.location().len()?
+                    };
+                    let (allowed, guard) = self.admit_content_write(
+                        offset,
+                        requested,
+                        file_len,
+                        &memfd_mutation,
+                        security,
+                        validate_direct,
+                    )?;
+                    privilege_guard = guard;
+                    admitted.set(Some(allowed));
+                    Ok(allowed)
+                },
+            );
+            drop(privilege_guard);
+            result
+        };
+        if likely(self.is_blocking()) {
+            write()
+        } else {
+            block_on_poll_io(self, IoEvents::WRITABLE, status.nonblocking(), write)
+        }
+    }
+
+    fn admit_content_write(
+        &self,
+        offset: u64,
+        requested: usize,
+        file_len: u64,
+        memfd_mutation: &memfd::MemfdMutationGuard,
+        security: ContentWriteSecurity<'_>,
+        validate_direct: &mut impl FnMut(u64, usize) -> AxResult<()>,
+    ) -> AxResult<(usize, Option<ContentWritePrivilegeGuard>)> {
+        if requested == 0 {
+            return Ok((0, None));
         }
 
-        if let Some(buf) = limited {
-            killpriv_before_content_write(inner.location(), buf.len())?;
-            let mut cursor = Cursor::new(buf.as_slice());
-            if likely(self.is_blocking()) {
-                inner.write_with_placement(&mut cursor, placement)
-            } else {
-                block_on_poll_io(self, IoEvents::WRITABLE, nonblocking, || {
-                    inner.write_with_placement(&mut cursor, placement)
-                })
-            }
+        let location = self.inner.location();
+        super::executable::check_not_active(location)?;
+        let allowed = allowed_write_len(offset, requested)?;
+        validate_direct(offset, allowed)?;
+        memfd_mutation.admit_write(location, file_len, offset, allowed)?;
+        let privilege_guard = (allowed != 0)
+            .then(|| security.begin(location))
+            .transpose()?;
+        Ok((allowed, privilege_guard))
+    }
+
+    /// Appends without changing the open-file-description position.
+    ///
+    /// This is the `pwrite*` counterpart of
+    /// [`write_with_status_and_direct_validation`](Self::write_with_status_and_direct_validation).
+    /// The exact EOF and admitted prefix are protected by the same axfs-ng
+    /// append transaction used for the lower inode operation.
+    pub(crate) fn write_at_end_with_status_and_direct_validation(
+        &self,
+        status: OfdIoStatus,
+        src: &mut IoSrc,
+        security: &VfsSecurityContext,
+        mut validate_direct: impl FnMut(u64, usize) -> AxResult<()>,
+    ) -> AxResult<usize> {
+        let inner = self.inner();
+        let memfd_mutation = memfd::begin_write(inner.location(), src.remaining())?;
+        let admitted = Cell::new(None);
+        let mut replay = ReplayableWriteSource::new(src, &admitted);
+        let mut write = || {
+            replay.begin_attempt();
+            let mut privilege_guard = None;
+            let result = inner.write_at_end_with_admission(&mut replay, |offset, requested| {
+                let (allowed, guard) = self.admit_content_write(
+                    offset,
+                    requested,
+                    offset,
+                    &memfd_mutation,
+                    ContentWriteSecurity::Exact(security),
+                    &mut validate_direct,
+                )?;
+                privilege_guard = guard;
+                admitted.set(Some(allowed));
+                Ok(allowed)
+            });
+            drop(privilege_guard);
+            result
+        };
+        if likely(self.is_blocking()) {
+            write()
         } else {
-            killpriv_before_content_write(inner.location(), len)?;
-            if likely(self.is_blocking()) {
-                inner.write_with_placement(src, placement)
-            } else {
-                block_on_poll_io(self, IoEvents::WRITABLE, nonblocking, || {
-                    inner.write_with_placement(&mut *src, placement)
-                })
-            }
+            block_on_poll_io(self, IoEvents::WRITABLE, status.nonblocking(), write)
+        }
+    }
+
+    /// Writes at a caller-frozen open-file-description position.
+    ///
+    /// RLIMIT_FSIZE and memfd-seal admission use exactly `offset`, and the
+    /// backend operation remains positioned so an outer current-position
+    /// transaction can commit the accepted prefix once without recursion.
+    pub(crate) fn write_at_with_status_and_direct_validation(
+        &self,
+        status: OfdIoStatus,
+        src: &mut IoSrc,
+        offset: u64,
+        security: &VfsSecurityContext,
+        mut validate_direct: impl FnMut(u64, usize) -> AxResult<()>,
+    ) -> AxResult<usize> {
+        let inner = self.inner();
+        let memfd_mutation = memfd::begin_write(inner.location(), src.remaining())?;
+        let admitted = Cell::new(None);
+        let mut replay = ReplayableWriteSource::new(src, &admitted);
+        let mut write = || {
+            replay.begin_attempt();
+            let requested = replay.remaining();
+            let (allowed, privilege_guard) = self.admit_content_write(
+                offset,
+                requested,
+                inner.location().len()?,
+                &memfd_mutation,
+                ContentWriteSecurity::Exact(security),
+                &mut validate_direct,
+            )?;
+            admitted.set(Some(allowed));
+            let result = inner.write_at(&mut replay, offset);
+            drop(privilege_guard);
+            result
+        };
+        if likely(self.is_blocking()) {
+            write()
+        } else {
+            block_on_poll_io(self, IoEvents::WRITABLE, status.nonblocking(), write)
         }
     }
 }
@@ -417,9 +658,21 @@ impl FileLike for File {
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
-        let append = self.inner().flags().contains(axfs::FileFlags::APPEND);
-        let nonblocking = self.nonblocking();
-        self.write_with_explicit_status(append, nonblocking, src)
+        let raw_status = if self.inner().flags().contains(axfs::FileFlags::APPEND) {
+            O_APPEND
+        } else {
+            0
+        } | if self.nonblocking() { O_NONBLOCK } else { 0 };
+        // Syscall paths downcast regular files and supply an exact
+        // VfsSecurityContext. Keep this generic trait fallback safe for
+        // inherited or kernel-internal handles without sampling current().
+        let mut validate = |_offset, _allowed| Ok(());
+        self.write_with_status_and_direct_validation_inner(
+            OfdIoStatus::new(raw_status),
+            src,
+            ContentWriteSecurity::Conservative,
+            &mut validate,
+        )
     }
 
     fn stat(&self) -> AxResult<Kstat> {
@@ -574,6 +827,28 @@ mod tests {
         called: bool,
     }
 
+    struct CountingSource {
+        bytes: Vec<u8>,
+        position: usize,
+        reads: usize,
+    }
+
+    impl Read for CountingSource {
+        fn read(&mut self, dst: &mut [u8]) -> axio::Result<usize> {
+            self.reads += 1;
+            let read = dst.len().min(self.remaining());
+            dst[..read].copy_from_slice(&self.bytes[self.position..self.position + read]);
+            self.position += read;
+            Ok(read)
+        }
+    }
+
+    impl IoBuf for CountingSource {
+        fn remaining(&self) -> usize {
+            self.bytes.len() - self.position
+        }
+    }
+
     impl DirEntrySink for RecordingDirSink {
         fn accept(&mut self, _name: &str, _ino: u64, _node_type: NodeType, _offset: u64) -> bool {
             self.called = true;
@@ -632,7 +907,42 @@ mod tests {
     }
 
     #[test]
+    fn replayable_write_source_replays_and_only_copies_admitted_growth() {
+        let mut source = CountingSource {
+            bytes: b"abcdef".to_vec(),
+            position: 0,
+            reads: 0,
+        };
+        let admitted = Cell::new(None);
+        let mut replay = ReplayableWriteSource::new(&mut source, &admitted);
+        let mut output = [0u8; 8];
+
+        replay.begin_attempt();
+        assert_eq!(replay.remaining(), 6);
+        admitted.set(Some(4));
+        assert_eq!(replay.read(&mut output), Ok(4));
+        assert_eq!(&output[..4], b"abcd");
+        assert_eq!(replay.source.reads, 1);
+
+        replay.begin_attempt();
+        admitted.set(Some(2));
+        output.fill(0);
+        assert_eq!(replay.read(&mut output), Ok(2));
+        assert_eq!(&output[..2], b"ab");
+        assert_eq!(replay.source.reads, 1);
+
+        replay.begin_attempt();
+        admitted.set(Some(6));
+        output.fill(0);
+        assert_eq!(replay.read(&mut output), Ok(4));
+        assert_eq!(replay.read(&mut output[4..]), Ok(2));
+        assert_eq!(&output[..6], b"abcdef");
+        assert_eq!(replay.source.reads, 2);
+    }
+
+    #[test]
     fn cached_write_hook_kills_capability_before_mutation_but_empty_write_does_not() {
+        super::super::executable::init().unwrap();
         let fs = tmp::MemoryFs::new().unwrap();
         let mount = Mountpoint::new_root(&fs);
         let loc = mount
@@ -664,14 +974,24 @@ mod tests {
                 .is_some()
         );
 
-        killpriv_before_content_write(&loc, 0).unwrap();
+        let namespace = crate::task::UserNamespace::try_new_root().unwrap();
+        let security = VfsSecurityContext::new(crate::task::Cred::try_root(namespace).unwrap());
+        let mut options = axfs::OpenOptions::new();
+        options.write(true);
+        let file = File::new(options.open_loc(loc.clone()).unwrap().into_file().unwrap());
+        // A zero-length operation never begins a content mutation.
         assert!(
             crate::file::xattr_provider::read_security_capability(&loc)
                 .unwrap()
                 .is_some()
         );
 
-        killpriv_before_content_write(&loc, b"attacker".len()).unwrap();
+        {
+            let _privilege_guard = file
+                .begin_content_write_privilege_cleanup(&security)
+                .unwrap();
+            node.write_at(b"attacker", 0).unwrap();
+        }
         assert_eq!(
             crate::file::xattr_provider::read_security_capability(&loc).unwrap(),
             None
@@ -683,10 +1003,12 @@ mod tests {
             axfs_ng_vfs::XattrSetMode::Upsert,
         )
         .unwrap();
-        let mut options = axfs::OpenOptions::new();
-        options.write(true);
-        let file = options.open_loc(loc.clone()).unwrap().into_file().unwrap();
-        File::set_len_with_killpriv(file.backend().unwrap(), 0).unwrap();
+        {
+            let _privilege_guard = file
+                .begin_content_write_privilege_cleanup(&security)
+                .unwrap();
+            file.inner().backend().unwrap().set_len(0).unwrap();
+        }
         assert_eq!(node.len().unwrap(), 0);
         assert_eq!(
             crate::file::xattr_provider::read_security_capability(&loc).unwrap(),

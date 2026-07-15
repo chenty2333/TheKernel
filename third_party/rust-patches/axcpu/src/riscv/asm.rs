@@ -1,8 +1,10 @@
 //! Wrapper functions for assembly instructions.
 
 use memory_addr::{PhysAddr, VirtAddr};
-use riscv::asm;
-use riscv::register::{satp, sstatus, stvec};
+use riscv::{
+    asm,
+    register::{satp, sstatus, stvec},
+};
 
 /// Allows the current CPU to respond to interrupts.
 #[inline]
@@ -102,6 +104,12 @@ pub fn flush_tlb(vaddr: Option<VirtAddr>) {
     } else {
         asm::sfence_vma_all();
     }
+}
+
+/// Synchronizes instruction fetches with earlier writes to executable memory.
+#[inline]
+pub fn flush_icache_all() {
+    riscv::asm::fence_i();
 }
 
 /// Writes the Supervisor Trap Vector Base Address register (`stvec`).

@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::{marker::PhantomData, ops::Deref};
 
 use arrayvec::ArrayVec;
@@ -336,6 +337,23 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable32Cursor
         }
     }
 
+    fn rollback_region_mappings(
+        &mut self,
+        mappings: &[(M::VirtAddr, PhysAddr, MappingFlags, PageSize)],
+    ) {
+        for &(vaddr, expected_paddr, expected_flags, expected_page_size) in mappings.iter().rev() {
+            let vaddr_usize: usize = vaddr.into();
+            let removed = self.unmap(vaddr).unwrap_or_else(|error| {
+                panic!("map_region rollback failed at {vaddr_usize:#x}: {error:?}")
+            });
+            assert_eq!(
+                removed,
+                (expected_paddr, expected_flags, expected_page_size),
+                "map_region rollback mismatch at {vaddr_usize:#x}"
+            );
+        }
+    }
+
     /// Maps a virtual page to a physical frame with the given `page_size`
     /// and mapping `flags`.
     pub fn map(
@@ -397,6 +415,8 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable32Cursor
 
     /// Maps a contiguous virtual memory region to a contiguous physical memory
     /// region with the given mapping `flags`.
+    /// If any mapping or journal allocation fails, mappings created by this
+    /// call are removed before the error is returned.
     pub fn map_region(
         &mut self,
         vaddr: M::VirtAddr,
@@ -417,7 +437,13 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable32Cursor
             vaddr_usize + size,
             flags,
         );
+        let mut mapped = Vec::new();
         while size > 0 {
+            if mapped.try_reserve(1).is_err() {
+                self.rollback_region_mappings(&mapped);
+                return Err(PagingError::NoMemory);
+            }
+
             let vaddr = vaddr_usize.into();
             let paddr = get_paddr(vaddr);
             let page_size = if allow_huge
@@ -429,9 +455,17 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable32Cursor
             } else {
                 PageSize::Size4K
             };
-            self.map(vaddr, paddr, page_size, flags).inspect_err(|e| {
-                error!("failed to map page: {vaddr_usize:#x?}({page_size:?}) -> {paddr:#x?}, {e:?}")
-            })?;
+            let represented =
+                PTE::new_page(paddr.align_down(page_size), flags, page_size.is_huge());
+            if let Err(error) = self.map(vaddr, paddr, page_size, flags) {
+                error!(
+                    "failed to map page: {vaddr_usize:#x?}({page_size:?}) -> {paddr:#x?}, \
+                     {error:?}"
+                );
+                self.rollback_region_mappings(&mapped);
+                return Err(error);
+            }
+            mapped.push((vaddr, represented.paddr(), represented.flags(), page_size));
 
             vaddr_usize += page_size as usize;
             size -= page_size as usize;

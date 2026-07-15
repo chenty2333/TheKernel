@@ -29,6 +29,10 @@ The published archive contains no `tests/` files, so there are no upstream test 
 - `05f30cc`, `3c8c09a`, and `24a36ad` hardened ext4 rename, dnotify, ioctl, and filesystem semantics.
 - `c52dc6f` introduced mapped/async block integration with synchronous fallback.
 - `96df7d9` and `d38fb1b` tightened cache freshness, fallible allocation, flush/error propagation, and resource bounds.
+- The current I/O liveness slice makes mapped async entrypoints submit-only and
+  all-or-none: only one complete mapped run is admitted, fragmented mappings
+  fall back synchronously before submission, and accepted handles are returned
+  to axfs-ng for waiting after the lwext4 filesystem lock is released.
 - Maintained delta: lwext4 C bindings, ext4 inode/file adapters, mapped-run/cache mechanisms, flush/error behavior, and build tooling.
 
 Commit IDs are navigation hints for the current rewritten history. The exact

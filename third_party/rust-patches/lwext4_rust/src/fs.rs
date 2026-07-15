@@ -14,7 +14,7 @@ use crate::{
         ENABLE_HOT_INODE_CACHE, HotInodeCache, async_mapped_read_enabled, record_async_mapped_read,
         record_async_mapped_read_cookie_reject, record_async_mapped_read_fallback,
         record_hot_inode_hit, record_hot_inode_miss, record_inode_ref_get,
-        record_mapped_overwrite_vectored_hit, record_mapped_read, record_mapped_read_vectored,
+        record_mapped_overwrite_vectored_hit, record_mapped_read_vectored,
     },
     iomap::{MappedRun, MappedRunKind},
     util::get_block_size,
@@ -759,102 +759,6 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         })
     }
 
-    fn try_read_mapped_runs_async(
-        &mut self,
-        ino: u32,
-        runs: &[MappedRun],
-        block_size: u32,
-        bufs: &mut [&mut [u8]],
-        bytes: usize,
-    ) -> Ext4Result<Option<usize>> {
-        if !async_mapped_read_enabled() {
-            return Ok(None);
-        }
-        if runs.is_empty() {
-            return Ok(Some(0));
-        }
-        let block_size = block_size as usize;
-        if block_size == 0
-            || bufs
-                .iter()
-                .any(|buf| !buf.is_empty() && buf.len() % block_size != 0)
-        {
-            return Ok(None);
-        }
-        if !self.mapped_runs_current(ino, runs)? {
-            record_async_mapped_read_cookie_reject();
-            return Ok(None);
-        }
-
-        let mut segment = 0usize;
-        let mut submit_batches = 0usize;
-        for run in runs {
-            let start = segment;
-            let mut remaining = run.bytes;
-            while remaining > 0 {
-                if segment >= bufs.len() {
-                    return Ok(None);
-                }
-                let segment_len = bufs[segment].len();
-                segment += 1;
-                if segment_len == 0 {
-                    continue;
-                }
-                if segment_len > remaining {
-                    return Ok(None);
-                }
-                remaining -= segment_len;
-            }
-            let block_id = self.bdev.direct_physical_block_id(run.pblock);
-            let Some(stats) = self
-                .bdev
-                .dev_mut()
-                .try_read_blocks_vectored_async(block_id, &mut bufs[start..segment])?
-            else {
-                return Ok(None);
-            };
-            submit_batches += stats.submit_batches;
-        }
-
-        record_async_mapped_read(runs.len(), bytes, submit_batches);
-        Ok(Some(bytes))
-    }
-
-    fn try_read_at_aligned_hot_async(
-        &mut self,
-        ino: u32,
-        buf: &mut [u8],
-        offset: u64,
-    ) -> Ext4Result<Option<usize>> {
-        if !async_mapped_read_enabled() {
-            return Ok(None);
-        }
-        let Some((to_be_read, block_size, runs)) =
-            self.mapped_aligned_read_plan(ino, offset, buf.len())?
-        else {
-            record_async_mapped_read_fallback();
-            return Ok(None);
-        };
-        if to_be_read == 0 {
-            return Ok(Some(0));
-        }
-        if !runs_align_segments(&runs, [to_be_read]) {
-            record_async_mapped_read_fallback();
-            return Ok(None);
-        }
-
-        let read_buf = &mut buf[..to_be_read];
-        let mut bufs = [read_buf];
-        let Some(read) =
-            self.try_read_mapped_runs_async(ino, &runs, block_size, &mut bufs, to_be_read)?
-        else {
-            record_async_mapped_read_fallback();
-            return Ok(None);
-        };
-        record_mapped_read(runs.len(), read);
-        Ok(Some(read))
-    }
-
     fn try_read_mapped_runs_async_submit(
         &mut self,
         ino: u32,
@@ -869,6 +773,13 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         if runs.is_empty() {
             return Ok(Some(AsyncReadSubmission::default()));
         }
+        // A submit-only call must never accept one extent and then wait while
+        // the caller still owns the filesystem lock. Fragmented mappings use
+        // the synchronous path until the API can return an owned partial
+        // submission transaction for reaping after unlock.
+        if runs.len() != 1 {
+            return Ok(None);
+        }
         let block_size = block_size as usize;
         if block_size == 0
             || bufs
@@ -882,41 +793,21 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             return Ok(None);
         }
 
-        let mut segment = 0usize;
-        let mut submission = AsyncReadSubmission {
-            bytes,
-            ..AsyncReadSubmission::default()
-        };
-        for run in runs {
-            let start = segment;
-            let mut remaining = run.bytes;
-            while remaining > 0 {
-                if segment >= bufs.len() {
-                    return Ok(None);
-                }
-                let segment_len = bufs[segment].len();
-                segment += 1;
-                if segment_len == 0 {
-                    continue;
-                }
-                if segment_len > remaining {
-                    return Ok(None);
-                }
-                remaining -= segment_len;
-            }
-            let block_id = self.bdev.direct_physical_block_id(run.pblock);
-            let Some(run_submission) = self
-                .bdev
-                .dev_mut()
-                .try_read_blocks_vectored_async_submit(block_id, &mut bufs[start..segment])?
-            else {
-                return Ok(None);
-            };
-            submission.submit_batches += run_submission.submit_batches;
-            submission.handles.extend(run_submission.handles);
+        let run = &runs[0];
+        if run.bytes != bytes {
+            return Ok(None);
         }
+        let block_id = self.bdev.direct_physical_block_id(run.pblock);
+        let Some(submission) = self
+            .bdev
+            .dev_mut()
+            .try_read_blocks_vectored_async_submit(block_id, bufs)?
+        else {
+            return Ok(None);
+        };
 
-        record_async_mapped_read(runs.len(), bytes, submission.submit_batches);
+        debug_assert!(submission.bytes <= bytes);
+        record_async_mapped_read(1, submission.bytes, submission.submit_batches);
         Ok(Some(submission))
     }
 
@@ -967,9 +858,6 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         buf: &mut [u8],
         offset: u64,
     ) -> Ext4Result<usize> {
-        if let Some(read) = self.try_read_at_aligned_hot_async(ino, buf, offset)? {
-            return Ok(read);
-        }
         self.with_cached_inode_ref(ino, |inode| inode.read_at_aligned_hot(buf, offset))
     }
     pub fn read_at_aligned_hot_vectored(
@@ -982,40 +870,24 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         if len == 0 {
             return Ok(Some(0));
         }
-        let Some((to_be_read, block_size, runs)) =
+        let Some((to_be_read, _block_size, runs)) =
             self.mapped_aligned_read_plan(ino, offset, len)?
         else {
-            if async_mapped_read_enabled() {
-                record_async_mapped_read_fallback();
-            }
             return Ok(None);
         };
         if to_be_read == 0 {
             return Ok(Some(0));
         }
         if !runs_align_segments(&runs, bufs.iter().map(|buf| buf.len())) {
-            if async_mapped_read_enabled() {
-                record_async_mapped_read_fallback();
-            }
             return Ok(None);
         }
         if !segments_are_device_block_sized(bufs.iter().map(|buf| buf.len())) {
-            if async_mapped_read_enabled() {
-                record_async_mapped_read_fallback();
-            }
             return Ok(None);
         }
 
-        if let Some(read) =
-            self.try_read_mapped_runs_async(ino, &runs, block_size, bufs, to_be_read)?
-        {
-            record_mapped_read_vectored(runs.len(), read);
-            return Ok(Some(read));
-        } else if async_mapped_read_enabled() {
-            record_async_mapped_read_fallback();
-        }
-
         let mut segment = 0usize;
+        let mut total = 0usize;
+        let mut completed_runs = 0usize;
         for run in &runs {
             let start = segment;
             let mut remaining = run.bytes;
@@ -1029,12 +901,32 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
                 remaining -= segment_len;
             }
             let block_id = self.bdev.direct_physical_block_id(run.pblock);
-            self.bdev
+            let read = match self
+                .bdev
                 .dev_mut()
-                .read_blocks_vectored(block_id, &mut bufs[start..segment])?;
+                .read_blocks_vectored(block_id, &mut bufs[start..segment])
+            {
+                Ok(read) => read,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            if read > run.bytes {
+                if total != 0 {
+                    break;
+                }
+                return Err(Ext4Error::new(
+                    EIO as _,
+                    "mapped read exceeded the planned run",
+                ));
+            }
+            total += read;
+            if read < run.bytes {
+                break;
+            }
+            completed_runs += 1;
         }
-        record_mapped_read_vectored(runs.len(), to_be_read);
-        Ok(Some(to_be_read))
+        record_mapped_read_vectored(completed_runs, total);
+        Ok(Some(total))
     }
 
     pub fn read_at_aligned_hot_vectored_async_submit(
@@ -1079,7 +971,15 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
             }
             return Ok(None);
         };
-        record_mapped_read_vectored(runs.len(), to_be_read);
+        let completed_runs = runs
+            .iter()
+            .scan(0usize, |total, run| {
+                *total = total.checked_add(run.bytes)?;
+                Some(*total)
+            })
+            .take_while(|end| *end <= submission.bytes)
+            .count();
+        record_mapped_read_vectored(completed_runs, submission.bytes);
         Ok(Some(submission))
     }
     pub fn write_at(&mut self, ino: u32, buf: &[u8], offset: u64) -> Ext4Result<usize> {
@@ -1137,6 +1037,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         }
 
         let mut segment = 0usize;
+        let mut total = 0usize;
         for run in &runs {
             let start = segment;
             let mut remaining = run.bytes;
@@ -1150,16 +1051,36 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
                 remaining -= segment_len;
             }
             let block_id = self.bdev.direct_physical_block_id(run.pblock);
-            self.bdev
+            let written = match self
+                .bdev
                 .dev_mut()
-                .write_blocks_vectored(block_id, &bufs[start..segment])?;
-            self.bdev.invalidate_logical_block_range(
-                run.pblock,
-                (run.bytes / block_size as usize) as u32,
-            );
+                .write_blocks_vectored(block_id, &bufs[start..segment])
+            {
+                Ok(written) => written,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            if written > run.bytes {
+                if total != 0 {
+                    break;
+                }
+                return Err(Ext4Error::new(
+                    EIO as _,
+                    "mapped write exceeded the planned run",
+                ));
+            }
+            let invalidated_blocks = written / block_size as usize;
+            if invalidated_blocks != 0 {
+                self.bdev
+                    .invalidate_logical_block_range(run.pblock, invalidated_blocks as u32);
+            }
+            total += written;
+            if written < run.bytes {
+                break;
+            }
         }
-        record_mapped_overwrite_vectored_hit(len);
-        Ok(Some(len))
+        record_mapped_overwrite_vectored_hit(total);
+        Ok(Some(total))
     }
 
     pub fn write_at_aligned_hot_vectored_async_submit(
@@ -1207,40 +1128,26 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
         if !segments_are_device_block_sized(bufs.iter().map(|buf| buf.len())) {
             return Ok(None);
         }
-
-        let mut segment = 0usize;
-        let mut submission = AsyncWriteSubmission {
-            bytes: len,
-            ..AsyncWriteSubmission::default()
-        };
-        for run in &runs {
-            let start = segment;
-            let mut remaining = run.bytes;
-            while remaining > 0 {
-                let segment_len = bufs[segment].len();
-                segment += 1;
-                if segment_len == 0 {
-                    continue;
-                }
-                debug_assert!(segment_len <= remaining);
-                remaining -= segment_len;
-            }
-            let block_id = self.bdev.direct_physical_block_id(run.pblock);
-            let Some(run_submission) = self
-                .bdev
-                .dev_mut()
-                .try_write_blocks_vectored_async_submit(block_id, &bufs[start..segment])?
-            else {
-                return Ok(None);
-            };
-            submission.submit_batches += run_submission.submit_batches;
-            submission.handles.extend(run_submission.handles);
-            self.bdev.invalidate_logical_block_range(
-                run.pblock,
-                (run.bytes / block_size as usize) as u32,
-            );
+        if runs.len() != 1 {
+            return Ok(None);
         }
-        record_mapped_overwrite_vectored_hit(len);
+        let run = &runs[0];
+        if run.bytes != len {
+            return Ok(None);
+        }
+        let block_id = self.bdev.direct_physical_block_id(run.pblock);
+        let Some(submission) = self
+            .bdev
+            .dev_mut()
+            .try_write_blocks_vectored_async_submit(block_id, bufs)?
+        else {
+            return Ok(None);
+        };
+        self.bdev.invalidate_logical_block_range(
+            run.pblock,
+            (submission.bytes / block_size as usize) as u32,
+        );
+        record_mapped_overwrite_vectored_hit(submission.bytes);
         Ok(Some(submission))
     }
     pub fn is_block_aligned_range(&self, offset: u64, len: usize) -> bool {

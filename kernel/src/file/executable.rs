@@ -21,6 +21,7 @@ struct ExecutableCounts {
     active: usize,
     write_open: usize,
     writable_mappings: usize,
+    content_mutations: usize,
     credential_reads: usize,
     credential_writes: usize,
 }
@@ -31,6 +32,7 @@ struct ExecutableTable {
     active_refs: usize,
     write_open_refs: usize,
     writable_mapping_refs: usize,
+    content_mutation_refs: usize,
     credential_read_refs: usize,
     credential_write_refs: usize,
 }
@@ -50,6 +52,7 @@ const PREALLOCATED_CAPACITY: usize = 2 * MAX_EXECUTABLE_IDENTITIES;
 const MAX_ACTIVE_EXECUTABLE_REFS: usize = 65_536;
 const MAX_WRITE_OPEN_REFS: usize = 65_536;
 const MAX_WRITABLE_MAPPING_REFS: usize = 65_536;
+const MAX_CONTENT_MUTATION_REFS: usize = 65_536;
 const MAX_CREDENTIAL_READ_REFS: usize = 65_536;
 const MAX_CREDENTIAL_WRITE_REFS: usize = 65_536;
 
@@ -75,6 +78,7 @@ impl ExecutableTable {
             active_refs: 0,
             write_open_refs: 0,
             writable_mapping_refs: 0,
+            content_mutation_refs: 0,
             credential_read_refs: 0,
             credential_write_refs: 0,
         })
@@ -104,6 +108,7 @@ fn retire_if_unused(
         counts.active == 0
             && counts.write_open == 0
             && counts.writable_mappings == 0
+            && counts.content_mutations == 0
             && counts.credential_reads == 0
             && counts.credential_writes == 0
     });
@@ -173,6 +178,27 @@ fn release_writable_mapping_in(table: &mut ExecutableTable, key: ExecutableKey) 
     }
     counts.writable_mappings -= 1;
     table.writable_mapping_refs -= 1;
+    ReleaseOutcome {
+        released: true,
+        retired: retire_if_unused(table, key),
+    }
+}
+
+fn release_content_mutation_in(table: &mut ExecutableTable, key: ExecutableKey) -> ReleaseOutcome {
+    let Some(counts) = table.entries.get_mut(&key) else {
+        return ReleaseOutcome {
+            released: false,
+            retired: None,
+        };
+    };
+    if counts.content_mutations == 0 {
+        return ReleaseOutcome {
+            released: false,
+            retired: None,
+        };
+    }
+    counts.content_mutations -= 1;
+    table.content_mutation_refs -= 1;
     ReleaseOutcome {
         released: true,
         retired: retire_if_unused(table, key),
@@ -335,7 +361,10 @@ fn is_active(loc: &Location) -> AxResult<bool> {
 
 fn increment_credential_read(table: &mut ExecutableTable, key: ExecutableKey) -> AxResult<()> {
     if table.entries.get(&key).is_some_and(|counts| {
-        counts.write_open != 0 || counts.writable_mappings != 0 || counts.credential_writes != 0
+        counts.write_open != 0
+            || counts.writable_mappings != 0
+            || counts.content_mutations != 0
+            || counts.credential_writes != 0
     }) {
         return Err(LinuxError::ETXTBSY.into());
     }
@@ -353,6 +382,27 @@ fn increment_credential_read(table: &mut ExecutableTable, key: ExecutableKey) ->
         .ok_or(AxError::NoMemory)?;
     table.active_refs += 1;
     table.credential_read_refs += 1;
+    Ok(())
+}
+
+fn increment_content_mutation(table: &mut ExecutableTable, key: ExecutableKey) -> AxResult<()> {
+    if table
+        .entries
+        .get(&key)
+        .is_some_and(|counts| counts.credential_reads != 0 || counts.credential_writes != 0)
+    {
+        return Err(LinuxError::ETXTBSY.into());
+    }
+    if table.content_mutation_refs >= MAX_CONTENT_MUTATION_REFS {
+        return Err(LinuxError::ENFILE.into());
+    }
+    admit_identity(table, key)?;
+    let counts = table.entries.entry(key).or_default();
+    counts.content_mutations = counts
+        .content_mutations
+        .checked_add(1)
+        .ok_or(LinuxError::ENFILE)?;
+    table.content_mutation_refs += 1;
     Ok(())
 }
 
@@ -391,16 +441,34 @@ fn finish_credential_read_in(table: &mut ExecutableTable, key: ExecutableKey) ->
     true
 }
 
+#[derive(Clone, Copy)]
+enum CredentialWriteScope {
+    Metadata,
+    SetIdMode,
+    FileCapability,
+}
+
+impl CredentialWriteScope {
+    const fn excludes_write_open(self) -> bool {
+        matches!(self, Self::FileCapability)
+    }
+
+    const fn excludes_writable_mapping(self) -> bool {
+        matches!(self, Self::SetIdMode | Self::FileCapability)
+    }
+}
+
 fn increment_credential_write(
     table: &mut ExecutableTable,
     key: ExecutableKey,
-    exclude_content_writers: bool,
+    scope: CredentialWriteScope,
 ) -> AxResult<()> {
     if table.entries.get(&key).is_some_and(|counts| {
         counts.credential_reads != 0
             || counts.credential_writes != 0
-            || (exclude_content_writers
-                && (counts.write_open != 0 || counts.writable_mappings != 0))
+            || counts.content_mutations != 0
+            || (scope.excludes_write_open() && counts.write_open != 0)
+            || (scope.excludes_writable_mapping() && counts.writable_mappings != 0)
     }) {
         return Err(LinuxError::ETXTBSY.into());
     }
@@ -506,12 +574,79 @@ pub(crate) fn with_credential_metadata_unpinned<T>(
     loc: &Location,
     operation: impl FnOnce() -> AxResult<T>,
 ) -> AxResult<T> {
-    let Some(lease) = CredentialWriteLease::acquire(loc, false)? else {
+    let Some(lease) = CredentialWriteLease::acquire(loc, CredentialWriteScope::Metadata)? else {
         return operation();
     };
     let result = operation();
     drop(lease);
     result
+}
+
+/// Runs a mode mutation which may publish set-ID bits.
+///
+/// An active shared-writable mapping has no per-page writer credential hook,
+/// so it must exclude reintroducing set-ID authority for its entire lifetime.
+/// Ordinary mode changes remain compatible with an idle mapping.
+pub(crate) fn with_setid_metadata_unpinned<T>(
+    loc: &Location,
+    publishes_setid: bool,
+    operation: impl FnOnce() -> AxResult<T>,
+) -> AxResult<T> {
+    let scope = if publishes_setid {
+        CredentialWriteScope::SetIdMode
+    } else {
+        CredentialWriteScope::Metadata
+    };
+    let Some(lease) = CredentialWriteLease::acquire(loc, scope)? else {
+        return operation();
+    };
+    let result = operation();
+    drop(lease);
+    result
+}
+
+/// Owned exclusion for a content mutation which first changes executable
+/// privilege metadata.
+///
+/// The guard carries only an accounted reference; it never holds the registry
+/// mutex across filesystem or device I/O. While it is alive, chmod/chown,
+/// setcap, and exec credential sampling cannot observe or publish an
+/// intermediate mode/xattr state for this inode.
+#[must_use = "content privilege metadata must remain excluded through data commit"]
+pub(crate) struct ContentPrivilegeMetadataMutationGuard {
+    key: Option<ExecutableKey>,
+}
+
+/// Begins one content-write privilege-metadata transaction.
+pub(crate) fn begin_content_privilege_metadata_mutation(
+    loc: &Location,
+) -> AxResult<ContentPrivilegeMetadataMutationGuard> {
+    let Some(key) = key(loc) else {
+        return Ok(ContentPrivilegeMetadataMutationGuard { key: None });
+    };
+    let mut table = executables()?.lock();
+    increment_content_mutation(&mut table, key)?;
+    Ok(ContentPrivilegeMetadataMutationGuard { key: Some(key) })
+}
+
+impl Drop for ContentPrivilegeMetadataMutationGuard {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let Some(executables) = EXECUTABLES.get() else {
+            error!("executable content-mutation release ran before registry initialization");
+            return;
+        };
+        let outcome = {
+            let mut table = executables.lock();
+            release_content_mutation_in(&mut table, key)
+        };
+        if !outcome.released {
+            error!("executable content-mutation guard lost its accounted reference");
+        }
+        drop(outcome.retired);
+    }
 }
 
 /// Runs a file-capability set/remove transaction while excluding both exec
@@ -523,7 +658,8 @@ pub(crate) fn with_file_capability_metadata_unpinned<T>(
     loc: &Location,
     operation: impl FnOnce() -> AxResult<T>,
 ) -> AxResult<T> {
-    let Some(lease) = CredentialWriteLease::acquire(loc, true)? else {
+    let Some(lease) = CredentialWriteLease::acquire(loc, CredentialWriteScope::FileCapability)?
+    else {
         return operation();
     };
     let result = operation();
@@ -540,13 +676,13 @@ struct CredentialWriteLease {
 }
 
 impl CredentialWriteLease {
-    fn acquire(loc: &Location, exclude_content_writers: bool) -> AxResult<Option<Self>> {
+    fn acquire(loc: &Location, scope: CredentialWriteScope) -> AxResult<Option<Self>> {
         let executables = executables()?;
         let Some(key) = key(loc) else {
             return Ok(None);
         };
         let mut table = executables.lock();
-        increment_credential_write(&mut table, key, exclude_content_writers)?;
+        increment_credential_write(&mut table, key, scope)?;
         Ok(Some(Self { key }))
     }
 }
@@ -674,6 +810,7 @@ mod tests {
         assert_eq!(table.active_refs, 0);
         assert_eq!(table.write_open_refs, 0);
         assert_eq!(table.writable_mapping_refs, 0);
+        assert_eq!(table.content_mutation_refs, 0);
         assert_eq!(table.credential_read_refs, 0);
         assert_eq!(table.credential_write_refs, 0);
         assert!(matches!(
@@ -745,7 +882,7 @@ mod tests {
         assert_eq!(table.active_refs, 1);
         assert_eq!(table.write_open_refs, 1);
         assert_eq!(
-            increment_credential_write(&mut table, rejected, false),
+            increment_credential_write(&mut table, rejected, CredentialWriteScope::Metadata),
             Err(LinuxError::ENFILE.into())
         );
         assert_eq!(table.entries.len(), 2);
@@ -786,11 +923,11 @@ mod tests {
         let key = test_key(7);
         let mut table = test_table(4);
 
-        increment_credential_write(&mut table, key, false).unwrap();
+        increment_credential_write(&mut table, key, CredentialWriteScope::Metadata).unwrap();
         assert_eq!(table.entries.get(&key).unwrap().credential_writes, 1);
         assert_eq!(table.credential_write_refs, 1);
         assert_eq!(
-            increment_credential_write(&mut table, key, false),
+            increment_credential_write(&mut table, key, CredentialWriteScope::Metadata),
             Err(LinuxError::ETXTBSY.into())
         );
         assert_eq!(
@@ -802,7 +939,7 @@ mod tests {
 
         increment_credential_read(&mut table, key).unwrap();
         assert_eq!(
-            increment_credential_write(&mut table, key, false),
+            increment_credential_write(&mut table, key, CredentialWriteScope::Metadata),
             Err(LinuxError::ETXTBSY.into())
         );
         assert!(finish_release(release_credential_read_in(&mut table, key)));
@@ -810,25 +947,93 @@ mod tests {
     }
 
     #[test]
-    fn file_capability_writer_excludes_old_and_new_content_writers() {
+    fn content_mutations_share_admission_and_exclude_credential_transactions() {
         let key = test_key(8);
+        let mut table = test_table(4);
+
+        increment_content_mutation(&mut table, key).unwrap();
+        increment_content_mutation(&mut table, key).unwrap();
+        assert_eq!(table.entries.get(&key).unwrap().content_mutations, 2);
+        assert_eq!(table.content_mutation_refs, 2);
+        assert_eq!(
+            increment_credential_read(&mut table, key),
+            Err(LinuxError::ETXTBSY.into())
+        );
+        assert_eq!(
+            increment_credential_write(&mut table, key, CredentialWriteScope::Metadata),
+            Err(LinuxError::ETXTBSY.into())
+        );
+
+        assert!(finish_release(release_content_mutation_in(&mut table, key)));
+        assert_eq!(table.entries.get(&key).unwrap().content_mutations, 1);
+        assert_eq!(
+            increment_credential_read(&mut table, key),
+            Err(LinuxError::ETXTBSY.into())
+        );
+        assert!(finish_release(release_content_mutation_in(&mut table, key)));
+        assert!(table.entries.is_empty());
+
+        increment_credential_read(&mut table, key).unwrap();
+        assert_eq!(
+            increment_content_mutation(&mut table, key),
+            Err(LinuxError::ETXTBSY.into())
+        );
+        assert!(finish_release(release_credential_read_in(&mut table, key)));
+
+        increment_credential_write(&mut table, key, CredentialWriteScope::Metadata).unwrap();
+        assert_eq!(
+            increment_content_mutation(&mut table, key),
+            Err(LinuxError::ETXTBSY.into())
+        );
+        assert!(finish_release(release_credential_write_in(&mut table, key)));
+        assert!(table.entries.is_empty());
+    }
+
+    #[test]
+    fn writable_mapping_blocks_setid_publication_but_not_ordinary_metadata() {
+        let key = test_key(9);
+        let mut table = test_table(4);
+
+        increment_writable_mapping(&mut table, key).unwrap();
+        increment_credential_write(&mut table, key, CredentialWriteScope::Metadata).unwrap();
+        assert!(finish_release(release_credential_write_in(&mut table, key)));
+        assert_eq!(
+            increment_credential_write(&mut table, key, CredentialWriteScope::SetIdMode),
+            Err(LinuxError::ETXTBSY.into())
+        );
+        assert!(finish_release(release_writable_mapping_in(&mut table, key)));
+
+        increment_credential_write(&mut table, key, CredentialWriteScope::SetIdMode).unwrap();
+        assert!(finish_release(release_credential_write_in(&mut table, key)));
+        assert!(table.entries.is_empty());
+
+        increment_write_open(&mut table, key).unwrap();
+        increment_credential_write(&mut table, key, CredentialWriteScope::SetIdMode).unwrap();
+        assert!(finish_release(release_credential_write_in(&mut table, key)));
+        assert!(finish_release(release_write_open_in(&mut table, key)));
+        assert!(table.entries.is_empty());
+    }
+
+    #[test]
+    fn file_capability_writer_excludes_old_and_new_content_writers() {
+        let key = test_key(9);
         let mut table = test_table(4);
 
         increment_write_open(&mut table, key).unwrap();
         assert_eq!(
-            increment_credential_write(&mut table, key, true),
+            increment_credential_write(&mut table, key, CredentialWriteScope::FileCapability),
             Err(LinuxError::ETXTBSY.into())
         );
         assert!(finish_release(release_write_open_in(&mut table, key)));
 
         increment_writable_mapping(&mut table, key).unwrap();
         assert_eq!(
-            increment_credential_write(&mut table, key, true),
+            increment_credential_write(&mut table, key, CredentialWriteScope::FileCapability),
             Err(LinuxError::ETXTBSY.into())
         );
         assert!(finish_release(release_writable_mapping_in(&mut table, key)));
 
-        increment_credential_write(&mut table, key, true).unwrap();
+        increment_credential_write(&mut table, key, CredentialWriteScope::FileCapability).unwrap();
         assert_eq!(
             increment_write_open(&mut table, key),
             Err(LinuxError::ETXTBSY.into())
@@ -843,7 +1048,7 @@ mod tests {
 
     #[test]
     fn writable_mapping_and_exec_sampling_exclude_each_other_and_refund() {
-        let key = test_key(9);
+        let key = test_key(10);
         let mut table = test_table(4);
 
         increment_writable_mapping(&mut table, key).unwrap();

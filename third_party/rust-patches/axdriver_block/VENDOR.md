@@ -27,6 +27,10 @@ The published archive contains no `tests/` files, so there are no upstream test 
 
 - `c52dc6f` added the generic async/batch block request, segment, capability, and completion contract.
 - `96df7d9` hardened queue admission, fallback, fence, flush, and IRQ-facing behavior.
+- The current I/O integration requires every accepted request prefix to carry
+  unique completion handles, requires an error return to leave no device access
+  to caller-owned buffers, and requires `wait_async_all` to reap every handle
+  even after an earlier completion-status error.
 - Maintained delta: bounded request/descriptor capability reporting with an honest synchronous fallback; no Linux ABI policy belongs here.
 
 Commit IDs are navigation hints for the current rewritten history. The exact

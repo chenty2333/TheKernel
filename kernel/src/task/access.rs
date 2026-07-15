@@ -59,6 +59,18 @@ pub(crate) fn ns_capable(
     super::security::capable(actor, target_user_ns, capability)
 }
 
+/// Set-ID-family counterpart to [`ns_capable`].
+///
+/// This is deliberately a separate adapter so callers cannot relabel an
+/// ordinary capability check with Linux's `CAP_OPT_INSETID` semantics.
+pub(crate) fn ns_capable_for_setid(
+    actor: &Cred,
+    target_user_ns: &Arc<UserNamespace>,
+    capability: u32,
+) -> bool {
+    super::security::capable_for_setid(actor, target_user_ns, capability)
+}
+
 fn idmap_writer_parent(opener: &Cred, target: &Arc<UserNamespace>) -> Option<Arc<UserNamespace>> {
     let parent = target.parent()?;
     let opener_ns = opener.user_ns();
@@ -473,7 +485,7 @@ mod tests {
     use super::*;
     use crate::task::{
         SignalSecuritySource, UtsNamespace,
-        creds::{CAPABILITY_WORDS, CredentialSlot},
+        creds::{CAPABILITY_WORDS, CredentialSlot, capability_state_for_test},
     };
 
     fn kuid(raw: u32) -> Kuid {
@@ -498,10 +510,15 @@ mod tests {
             sgid: gid,
             fsgid: gid,
         };
-        update.builder.caps.effective = [0; CAPABILITY_WORDS];
-        update.builder.caps.permitted = [0; CAPABILITY_WORDS];
-        update.builder.caps.inheritable = [0; CAPABILITY_WORDS];
-        update.builder.caps.ambient = [0; CAPABILITY_WORDS];
+        let caps = update.builder.caps;
+        update.builder.caps = capability_state_for_test(
+            [0; CAPABILITY_WORDS],
+            [0; CAPABILITY_WORDS],
+            [0; CAPABILITY_WORDS],
+            caps.bounding(),
+            [0; CAPABILITY_WORDS],
+            caps.securebits(),
+        );
         update.finish().unwrap().commit()
     }
 
@@ -557,8 +574,19 @@ mod tests {
         let (word, mask) =
             crate::task::CapabilityState::cap_mask(linux_raw_sys::general::CAP_CHOWN).unwrap();
         let mut target_gain = target_slot.prepare();
-        target_gain.builder.caps.permitted[word] |= mask;
-        target_gain.builder.caps.effective[word] |= mask;
+        let caps = target_gain.builder.caps;
+        let mut permitted = caps.permitted();
+        let mut effective = caps.effective();
+        permitted[word] |= mask;
+        effective[word] |= mask;
+        target_gain.builder.caps = capability_state_for_test(
+            effective,
+            permitted,
+            caps.inheritable(),
+            caps.bounding(),
+            caps.ambient(),
+            caps.securebits(),
+        );
         let target_with_cap = target_gain.finish().unwrap().commit();
         assert!(ptrace_core_allows(
             &actor,
@@ -688,10 +716,15 @@ mod tests {
             sgid: kgid(200),
             fsgid: kgid(200),
         };
-        target_update.builder.caps.effective = [0; CAPABILITY_WORDS];
-        target_update.builder.caps.permitted = [0; CAPABILITY_WORDS];
-        target_update.builder.caps.inheritable = [0; CAPABILITY_WORDS];
-        target_update.builder.caps.ambient = [0; CAPABILITY_WORDS];
+        let caps = target_update.builder.caps;
+        target_update.builder.caps = capability_state_for_test(
+            [0; CAPABILITY_WORDS],
+            [0; CAPABILITY_WORDS],
+            [0; CAPABILITY_WORDS],
+            caps.bounding(),
+            [0; CAPABILITY_WORDS],
+            caps.securebits(),
+        );
         let saved_uid_target = target_update.finish().unwrap().commit();
         let probe = SignalSecurityOperation::probe(
             SignalSecuritySource::Kill,

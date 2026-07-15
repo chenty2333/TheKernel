@@ -246,7 +246,7 @@ fn enforce_special_open_rules(
         }
     }
     if flags & O_TRUNC != 0 {
-        memfd::check_resize(loc, 0)?;
+        drop(memfd::begin_resize(loc, 0)?);
     }
 
     Ok(())
@@ -666,8 +666,14 @@ fn open_loc_after_admission<R>(
     Ok((result, resource))
 }
 
-fn commit_open_truncate(file: &File, loc: &Location) -> AxResult<()> {
-    File::set_len_with_killpriv(file.inner().backend()?, 0)?;
+fn commit_open_truncate(
+    file: &File,
+    loc: &Location,
+    security: &VfsSecurityContext,
+) -> AxResult<()> {
+    let _memfd_mutation = memfd::begin_resize(loc, 0)?;
+    let _privilege_guard = file.begin_content_write_privilege_cleanup(security)?;
+    file.inner().backend()?.set_len(0)?;
     // A post-truncate metadata failure cannot be reported without lying that
     // this destructive open left the inode untouched. Filesystems should
     // update truncate timestamps as part of set_len; retain this compatibility
@@ -970,7 +976,7 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
                 .inner
                 .downcast_ref::<File>()
                 .ok_or(AxError::BadState)?;
-            commit_open_truncate(file, &loc)?;
+            commit_open_truncate(file, &loc, security.vfs_security())?;
         }
         let fd = publication.commit() as isize;
         Ok(fd)
@@ -1828,6 +1834,7 @@ mod namespace_operation_tests {
 
     #[test]
     fn admitted_open_truncate_revokes_capability_before_size_commit() {
+        executable::init().unwrap();
         let fs = MemoryFs::new().unwrap();
         let mount = Mountpoint::new_root(&fs);
         let loc = mount
@@ -1850,7 +1857,9 @@ mod namespace_operation_tests {
         let options = flags_to_options(O_RDONLY as i32 | O_TRUNC as i32, 0o600, (0, 0));
         let result = options.open_loc_deferred_truncate(loc.clone()).unwrap();
         let file = File::new(result.into_file().unwrap());
-        commit_open_truncate(&file, &loc).unwrap();
+        let namespace = crate::task::UserNamespace::try_new_root().unwrap();
+        let security = VfsSecurityContext::new(Cred::try_root(namespace).unwrap());
+        commit_open_truncate(&file, &loc, &security).unwrap();
 
         assert_eq!(node.len().unwrap(), 0);
         assert_eq!(

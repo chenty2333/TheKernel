@@ -44,7 +44,9 @@ smoke_ensure_shell_kernel() {
     target=$(smoke_kernel_shell_make_target "$arch") || return 1
     kernel_path="$REPO_ROOT/$(smoke_kernel_shell_path "$arch")"
     if [ "$skip_build" -eq 0 ] || [ ! -f "$kernel_path" ]; then
-        make -C "$REPO_ROOT" "$target"
+        # This helper is consumed through command substitution below. Keep all
+        # build output away from stdout so the only captured value is the path.
+        make --no-print-directory -C "$REPO_ROOT" "$target" >&2 || return $?
     fi
     printf '%s\n' "$kernel_path"
 }
@@ -54,6 +56,6 @@ smoke_runner_artifact_args() {
     local skip_build=$2
     local kernel_path
 
-    kernel_path=$(smoke_ensure_shell_kernel "$arch" "$skip_build")
+    kernel_path=$(smoke_ensure_shell_kernel "$arch" "$skip_build") || return $?
     printf '%s\0%s\0' --kernel "$kernel_path"
 }

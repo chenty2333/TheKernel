@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use axerrno::{AxError, AxResult};
 use axfs::FileFlags;
 use axhal::paging::MappingFlags;
-use memory_addr::{MemoryAddr, VirtAddr};
+use memory_addr::VirtAddr;
 
 use crate::{
     file::{File, FileHandle},
@@ -20,19 +20,16 @@ pub(super) fn relocate_affine_origin(
     old_start: VirtAddr,
     new_start: VirtAddr,
 ) -> AxResult<(VirtAddr, usize)> {
-    if origin >= old_start {
-        let leading_gap = origin.sub_addr(old_start);
-        let origin = new_start
-            .checked_add(leading_gap)
-            .ok_or(AxError::InvalidInput)?;
-        return Ok((origin, 0));
-    }
-
-    let consumed_prefix = old_start.sub_addr(origin);
-    match new_start.checked_sub(consumed_prefix) {
-        Some(origin) => Ok((origin, 0)),
-        None => Ok((new_start, consumed_prefix)),
-    }
+    let relocation = thekernel_linux_mm::relocate_affine_origin(
+        origin.as_usize(),
+        old_start.as_usize(),
+        new_start.as_usize(),
+    )
+    .map_err(super::mm_error)?;
+    Ok((
+        VirtAddr::from(relocation.origin()),
+        relocation.backing_advance(),
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,6 +273,15 @@ mod tests {
             }
             page_table[range].fill(0);
             true
+        }
+
+        fn preflight_unmap(
+            &self,
+            start: VirtAddr,
+            size: usize,
+            page_table: &Self::PageTable,
+        ) -> bool {
+            !page_table[start.as_usize()..start.as_usize() + size].contains(&0)
         }
 
         fn protect(

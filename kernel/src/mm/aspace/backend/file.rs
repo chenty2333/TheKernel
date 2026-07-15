@@ -7,13 +7,17 @@ use alloc::{
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use axerrno::{AxError, AxResult};
-use axfs::{CachedFile, CachedFilePagePin, CachedFilePinWindow, FileFlags};
-use axhal::paging::{MappingFlags, PageSize, PageTableCursor, PagingError};
+use axfs::{
+    CachedFile, CachedFileEvictionOwner, CachedFilePagePin, CachedFilePinWindow, EvictedPage,
+    FileFlags,
+};
+use axhal::paging::{MappingFlags, PageSize, PageTable, PageTableCursor, PagingError};
 use axsync::Mutex;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, MappingStatus, PopulateCallback, page_table_flags, pages_in,
+    AddrSpace, Backend, BackendOps, MappingStatus, PopulateCallback, PopulateOutcome,
+    page_table_flags, pages_in, preflight_sparse_unmap,
 };
 use crate::file::{executable, memfd};
 
@@ -33,51 +37,173 @@ static FILE_FUTEX_HANDLES: FileFutexHandlesMutex<BTreeMap<FileFutexKey, Weak<Fil
 const REGISTERING_LISTENER: usize = usize::MAX;
 const WRITABLE_SEGMENTS_TRANSITIONING: usize = usize::MAX;
 
+#[cfg(test)]
+const DEFERRED_EVICTION_FAIL_RESERVE: u8 = 1;
+#[cfg(test)]
+const DEFERRED_EVICTION_FAIL_STATE: u8 = 2;
+#[cfg(test)]
+const DEFERRED_EVICTION_FAIL_CALLBACK: u8 = 3;
+#[cfg(test)]
+static DEFERRED_EVICTION_PREPARE_FAILPOINT: AtomicU8 = AtomicU8::new(0);
+
 struct FileFutexIdentity {
     key: FileFutexKey,
     handle: Arc<()>,
 }
 
-fn transition_writable_mapping(
-    location: &axfs_ng_vfs::Location,
+struct PreparedPopulateEvictions {
+    state: Arc<spin::Mutex<Vec<EvictedPage>>>,
+    callback: PopulateCallback,
+}
+
+impl PreparedPopulateEvictions {
+    fn try_new(inner: Arc<FileBackendInner>, page_count: usize) -> AxResult<Self> {
+        #[cfg(test)]
+        if take_deferred_eviction_prepare_failpoint(DEFERRED_EVICTION_FAIL_RESERVE) {
+            return Err(AxError::NoMemory);
+        }
+
+        let mut evictions = Vec::new();
+        evictions
+            .try_reserve_exact(page_count)
+            .map_err(|_| AxError::NoMemory)?;
+
+        #[cfg(test)]
+        if take_deferred_eviction_prepare_failpoint(DEFERRED_EVICTION_FAIL_STATE) {
+            return Err(AxError::NoMemory);
+        }
+
+        let state = Arc::try_new(spin::Mutex::new(evictions)).map_err(|_| AxError::NoMemory)?;
+        let callback_state = state.clone();
+
+        #[cfg(test)]
+        if take_deferred_eviction_prepare_failpoint(DEFERRED_EVICTION_FAIL_CALLBACK) {
+            return Err(AxError::NoMemory);
+        }
+
+        let callback: PopulateCallback = Box::try_new(move |aspace: &mut AddrSpace| {
+            loop {
+                let pn = {
+                    let evictions = callback_state.lock();
+                    evictions.last().map(EvictedPage::page_number)
+                };
+                let Some(pn) = pn else {
+                    break;
+                };
+                assert!(
+                    inner.on_evict_from_locked_aspace(pn, aspace),
+                    "failed to detach aliases for deferred cache eviction"
+                );
+                // The old cache frame remains owned until every PTE in this
+                // address space has been detached above.
+                let evicted = callback_state
+                    .lock()
+                    .pop()
+                    .expect("deferred eviction disappeared during cleanup");
+                drop(evicted);
+            }
+        })
+        .map_err(|_| AxError::NoMemory)?;
+
+        Ok(Self { state, callback })
+    }
+
+    fn push(&self, evicted: EvictedPage) {
+        let mut evictions = self.state.lock();
+        debug_assert!(
+            evictions.len() < evictions.capacity(),
+            "deferred eviction count exceeded the populated page bound"
+        );
+        // Capacity for one possible eviction per populated page was reserved
+        // before cache mutation, so this push cannot allocate.
+        evictions.push(evicted);
+    }
+
+    fn into_callback(self) -> Option<PopulateCallback> {
+        let Self { state, callback } = self;
+        let has_evictions = !state.lock().is_empty();
+        drop(state);
+        has_evictions.then_some(callback)
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.state.lock().capacity()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.state.lock().is_empty()
+    }
+}
+
+#[cfg(test)]
+fn take_deferred_eviction_prepare_failpoint(stage: u8) -> bool {
+    DEFERRED_EVICTION_PREPARE_FAILPOINT
+        .compare_exchange(stage, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+#[derive(Clone, Copy)]
+struct WritableMappingActivation {
+    memfd: bool,
+    executable: bool,
+}
+
+fn activate_writable_mapping(
     executable_mapping: Option<&executable::WritableMappingRegistration>,
     writable_mapping: Option<&Arc<memfd::WritableMappingRegistration>>,
-    active: bool,
-) -> AxResult<()> {
+) -> AxResult<WritableMappingActivation> {
     let was_memfd_mapping_active =
         writable_mapping.is_some_and(|registration| registration.is_active());
     let was_executable_mapping_active =
         executable_mapping.is_some_and(executable::WritableMappingRegistration::is_active);
-    if active && let Some(registration) = writable_mapping {
+    if let Some(registration) = writable_mapping {
         // This is the shared linearization point with F_ADD_SEALS. Reserve it
-        // before killpriv or executable admission so a sealed mapping fails
-        // without mutating file metadata.
+        // before executable admission so a sealed mapping publishes nothing.
         registration.set_active(true)?;
     }
     if let Some(registration) = executable_mapping {
-        if let Err(error) = registration.set_active(active) {
-            if active
-                && !was_memfd_mapping_active
-                && let Some(registration) = writable_mapping
-            {
+        if let Err(error) = registration.set_active(true) {
+            if !was_memfd_mapping_active && let Some(registration) = writable_mapping {
                 let _ = registration.set_active(false);
             }
             return Err(error);
         }
     }
-    if active
-        && let Err(error) =
-            crate::file::xattr_provider::remove_security_capability_if_present(location)
-    {
-        if !was_executable_mapping_active && let Some(registration) = executable_mapping {
-            let _ = registration.set_active(false);
-        }
-        if !was_memfd_mapping_active && let Some(registration) = writable_mapping {
-            let _ = registration.set_active(false);
-        }
-        return Err(error);
+
+    Ok(WritableMappingActivation {
+        memfd: writable_mapping.is_some() && !was_memfd_mapping_active,
+        executable: executable_mapping.is_some() && !was_executable_mapping_active,
+    })
+}
+
+fn deactivate_writable_mapping(
+    executable_mapping: Option<&executable::WritableMappingRegistration>,
+    writable_mapping: Option<&Arc<memfd::WritableMappingRegistration>>,
+) -> AxResult<()> {
+    if let Some(registration) = executable_mapping {
+        registration.set_active(false)?;
     }
-    if !active && let Some(registration) = writable_mapping {
+    if let Some(registration) = writable_mapping {
+        registration.set_active(false)?;
+    }
+    Ok(())
+}
+
+fn rollback_writable_mapping_activation(
+    executable_mapping: Option<&executable::WritableMappingRegistration>,
+    writable_mapping: Option<&Arc<memfd::WritableMappingRegistration>>,
+    activation: WritableMappingActivation,
+) -> AxResult<()> {
+    if activation.executable
+        && let Some(registration) = executable_mapping
+    {
+        registration.set_active(false)?;
+    }
+    if activation.memfd
+        && let Some(registration) = writable_mapping
+    {
         registration.set_active(false)?;
     }
     Ok(())
@@ -117,6 +243,7 @@ fn file_futex_handle(cache: &CachedFile) -> Arc<FileFutexIdentity> {
 fn new_file_backend_inner(
     start: VirtAddr,
     cache: CachedFile,
+    owner: CachedFileEvictionOwner,
     flags: FileFlags,
     offset_page: u32,
     file_end: Option<u64>,
@@ -129,6 +256,7 @@ fn new_file_backend_inner(
     Arc::new(FileBackendInner {
         start,
         cache,
+        owner,
         flags,
         offset_page,
         file_end,
@@ -139,6 +267,11 @@ fn new_file_backend_inner(
         writable_mapping,
         executable_mapping,
     })
+}
+
+fn eviction_owner(aspace: &Arc<Mutex<AddrSpace>>) -> CachedFileEvictionOwner {
+    CachedFileEvictionOwner::new(Arc::as_ptr(aspace) as usize)
+        .expect("address-space Arc pointers are nonzero")
 }
 
 fn advance_offset_page(offset_page: u32, backing_advance: usize) -> AxResult<u32> {
@@ -156,6 +289,7 @@ fn advance_offset_page(offset_page: u32, backing_advance: usize) -> AxResult<u32
 pub struct FileBackendInner {
     start: VirtAddr,
     cache: CachedFile,
+    owner: CachedFileEvictionOwner,
     flags: FileFlags,
     offset_page: u32,
     file_end: Option<u64>,
@@ -183,12 +317,28 @@ impl Drop for FileBackendInner {
 }
 impl FileBackendInner {
     fn transition_writable_mapping(&self, active: bool) -> AxResult<()> {
-        transition_writable_mapping(
-            self.cache.location(),
-            self.executable_mapping.as_ref(),
-            self.writable_mapping.as_ref(),
-            active,
-        )
+        if active {
+            activate_writable_mapping(
+                self.executable_mapping.as_ref(),
+                self.writable_mapping.as_ref(),
+            )?;
+            Ok(())
+        } else {
+            deactivate_writable_mapping(
+                self.executable_mapping.as_ref(),
+                self.writable_mapping.as_ref(),
+            )
+        }
+    }
+
+    fn stable_writable_segments(&self) -> usize {
+        loop {
+            let current = self.writable_segments.load(Ordering::Acquire);
+            if current != WRITABLE_SEGMENTS_TRANSITIONING {
+                return current;
+            }
+            core::hint::spin_loop();
+        }
     }
 
     fn acquire_writable_segment(&self) -> AxResult<()> {
@@ -306,6 +456,7 @@ impl FileBackendInner {
     }
 
     pub fn register_listener(self: &Arc<Self>, aspace: &Arc<Mutex<AddrSpace>>) -> AxResult {
+        debug_assert_eq!(self.owner, eviction_owner(aspace));
         if self
             .handle
             .compare_exchange(0, REGISTERING_LISTENER, Ordering::AcqRel, Ordering::Acquire)
@@ -314,47 +465,137 @@ impl FileBackendInner {
             return Err(AxError::AlreadyExists);
         }
         let aspace = Arc::downgrade(aspace);
-        let handle = self.cache.add_evict_listener({
+        let handle = self.cache.add_evict_listener(self.owner, {
             let this = Arc::downgrade(self);
             move |pn, _page| {
                 let Some(this) = this.upgrade() else {
-                    return;
+                    return true;
                 };
                 let Some(aspace) = aspace.upgrade() else {
                     // The address space has been dropped, nothing to do.
-                    return;
+                    return true;
                 };
                 let Some(mut aspace) = aspace.try_lock() else {
                     // This can happen during the populate process, when new pages
                     // are being populated and old pages are being evicted. In this
                     // case, we delegate the unmapping to the populate process.
-                    return;
+                    return false;
                 };
-                this.on_evict(pn, &mut aspace);
+                this.on_evict(pn, &mut aspace)
             }
         });
         self.handle.store(handle, Ordering::Release);
         Ok(())
     }
 
-    fn on_evict(self: &Arc<Self>, pn: u32, aspace: &mut AddrSpace) {
+    fn on_evict(self: &Arc<Self>, pn: u32, aspace: &mut AddrSpace) -> bool {
         let Some(pn) = pn.checked_sub(self.offset_page) else {
-            return;
+            return true;
         };
         let vaddr = self.start + pn as usize * PageSize::Size4K as usize;
         if !aspace.find_area(vaddr).is_some_and(
             |it| matches!(it.backend(), Backend::File(file) if Arc::ptr_eq(&file.0, self)),
         ) {
             // Ignore if the page is not controlled by this file mapping.
-            return;
+            return true;
         }
 
         let pt = aspace.page_table_mut();
         match pt.cursor().unmap(vaddr) {
-            Ok(_) | Err(PagingError::NotMapped) => {}
+            Ok(_) | Err(PagingError::NotMapped) => true,
             Err(err) => {
                 warn!("Failed to unmap page {:?}: {:?}", vaddr, err);
+                false
             }
+        }
+    }
+
+    fn on_evict_from_locked_aspace(self: &Arc<Self>, pn: u32, aspace: &mut AddrSpace) -> bool {
+        // Every listener associated with this address space failed try_lock()
+        // while populate owned the lock. Walk all mappings of the same cache,
+        // including aliases, before releasing the evicted cache page.
+        let mut cursor = aspace.base();
+        let mut detached = true;
+        loop {
+            let next = aspace
+                .areas
+                .iter()
+                .find(|area| area.end() > cursor)
+                .map(|area| {
+                    let inner = match area.backend() {
+                        Backend::File(file)
+                            if file.0.owner == self.owner && file.0.cache.ptr_eq(&self.cache) =>
+                        {
+                            Some(file.0.clone())
+                        }
+                        _ => None,
+                    };
+                    (area.end(), inner)
+                });
+            let Some((next_cursor, inner)) = next else {
+                break;
+            };
+            cursor = next_cursor;
+            if let Some(inner) = inner {
+                detached &= inner.on_evict(pn, aspace);
+            }
+        }
+        detached
+    }
+}
+
+/// Pre-commit registration for one new shared-writable VMA grant.
+///
+/// This owns only registrations which were inactive at admission. A successful
+/// VMA commit explicitly hands them to the backend's writable-segment count;
+/// failure refunds them unless a partial page-table transition must retain the
+/// exclusion fail-closed.
+#[must_use = "writable mapping admission must be completed or rolled back"]
+pub(crate) struct WritableMappingAdmission {
+    inner: Arc<FileBackendInner>,
+    activation: Option<WritableMappingActivation>,
+}
+
+impl WritableMappingAdmission {
+    fn begin(backend: &FileBackend) -> AxResult<Self> {
+        let activation = activate_writable_mapping(
+            backend.0.executable_mapping.as_ref(),
+            backend.0.writable_mapping.as_ref(),
+        )?;
+        Ok(Self {
+            inner: backend.0.clone(),
+            activation: Some(activation),
+        })
+    }
+
+    pub(crate) fn complete(mut self) -> AxResult<()> {
+        if self.inner.stable_writable_segments() == 0 {
+            return Err(AxError::BadState);
+        }
+        self.activation = None;
+        Ok(())
+    }
+}
+
+impl Drop for WritableMappingAdmission {
+    fn drop(&mut self) {
+        let Some(activation) = self.activation.take() else {
+            return;
+        };
+        if self.inner.stable_writable_segments() != 0 {
+            // A partially failed PTE transition owns the registrations now and
+            // must retain them fail-closed.
+            return;
+        }
+        if let Err(error) = rollback_writable_mapping_activation(
+            self.inner.executable_mapping.as_ref(),
+            self.inner.writable_mapping.as_ref(),
+            activation,
+        ) {
+            error!(
+                "failed to roll back writable-mapping admission: {error}; retaining exclusion \
+                 fail-closed"
+            );
         }
     }
 }
@@ -461,6 +702,14 @@ impl FileBackend {
 
     pub(super) fn mapping_status_mut(&mut self) -> &mut MappingStatus {
         &mut self.2
+    }
+
+    pub(crate) fn location(&self) -> &axfs_ng_vfs::Location {
+        self.0.cache.location()
+    }
+
+    pub(crate) fn begin_writable_mapping_admission(&self) -> AxResult<WritableMappingAdmission> {
+        WritableMappingAdmission::begin(self)
     }
 
     fn inactive(inner: Arc<FileBackendInner>) -> Self {
@@ -699,7 +948,7 @@ impl FileBackend {
         resident
     }
 
-    pub(crate) fn begin_user_io_pin_window(&self) -> CachedFilePinWindow {
+    pub(crate) fn begin_user_io_pin_window(&self) -> AxResult<CachedFilePinWindow> {
         self.0.cache.begin_user_io_pin_window()
     }
 
@@ -707,6 +956,7 @@ impl FileBackend {
         &self,
         vaddr: VirtAddr,
         paddr: PhysAddr,
+        dirty_on_release: bool,
     ) -> AxResult<CachedFilePagePin> {
         let page_start = vaddr.align_down_4k();
         if page_start < self.0.start {
@@ -717,7 +967,9 @@ impl FileBackend {
             .page_number_for(page_start)
             .map_err(|_| AxError::BadAddress)?;
 
-        self.0.cache.pin_cached_page_by_paddr(pn, paddr)
+        self.0
+            .cache
+            .pin_cached_page_by_paddr(pn, paddr, dirty_on_release)
     }
 
     fn clone_for_range_with_id(
@@ -733,6 +985,7 @@ impl FileBackend {
         let inner = new_file_backend_inner(
             start,
             self.0.cache.clone(),
+            eviction_owner(aspace),
             self.0.flags,
             offset_page,
             self.0.file_end,
@@ -769,11 +1022,13 @@ impl FileBackend {
     fn clone_map_with_registration(
         &self,
         flags: MappingFlags,
+        owner: CachedFileEvictionOwner,
         register: impl FnOnce(&Arc<FileBackendInner>) -> AxResult,
     ) -> AxResult<Backend> {
         let inner = new_file_backend_inner(
             self.0.start,
             self.0.cache.clone(),
+            owner,
             self.0.flags,
             self.0.offset_page,
             self.0.file_end,
@@ -858,14 +1113,20 @@ impl BackendOps for FileBackend {
         Ok(())
     }
 
-    fn on_protect(
+    fn preflight_unmap(&self, range: VirtAddrRange, pt: &PageTable) -> AxResult {
+        self.validate_range(range)?;
+        preflight_sparse_unmap(range, PageSize::Size4K, pt)
+    }
+
+    fn preflight_protect(
         &self,
-        _range: VirtAddrRange,
+        range: VirtAddrRange,
         new_flags: MappingFlags,
-        _pt: &mut PageTableCursor,
+        pt: &PageTable,
     ) -> AxResult {
+        self.validate_range(range)?;
         self.check_flags(new_flags)?;
-        Ok(())
+        preflight_sparse_unmap(range, PageSize::Size4K, pt)
     }
 
     fn populate(
@@ -874,70 +1135,83 @@ impl BackendOps for FileBackend {
         flags: MappingFlags,
         access_flags: MappingFlags,
         pt: &mut PageTableCursor,
-    ) -> AxResult<(usize, Option<PopulateCallback>)> {
-        self.0.cache.with_direct_io_excluded(|| {
-            let mut pages = 0;
-            let mut to_be_evicted = Vec::new();
-            let start_page = self.page_number_for(range.start)?;
-            for (i, addr) in pages_in(range, PageSize::Size4K)?.enumerate() {
-                let pn = u32::try_from(i)
-                    .ok()
-                    .and_then(|i| start_page.checked_add(i))
-                    .ok_or(AxError::InvalidInput)?;
-                match pt.query(addr) {
-                    Ok((paddr, page_flags, page_size)) => {
-                        if page_size != PageSize::Size4K {
-                            return Err(AxError::BadAddress);
-                        }
-                        if access_flags.contains(MappingFlags::WRITE)
-                            && !page_flags.contains(MappingFlags::WRITE)
-                        {
-                            self.0.cache.with_page(pn, |page| {
-                                let page = page.ok_or(AxError::BadAddress)?;
-                                if page.paddr() != paddr {
-                                    return Err(AxError::BadAddress);
-                                }
-                                page.mark_dirty();
-                                pt.remap(addr, paddr, page_table_flags(flags))?;
-                                pages += 1;
-                                AxResult::Ok(())
-                            })?;
-                        } else if page_flags.contains(access_flags) {
-                            pages += 1;
-                        }
-                    }
-                    // If the page is not mapped, try map it.
-                    Err(PagingError::NotMapped) => {
-                        let map_flags = flags - MappingFlags::WRITE;
-                        self.0.cache.with_page_or_insert(pn, |page, evicted| {
-                            let evicted = evicted;
-                            if let Some(evicted) = evicted.as_ref() {
-                                to_be_evicted.push(evicted.page_number());
-                            }
-                            pt.map(
-                                addr,
-                                page.paddr(),
-                                PageSize::Size4K,
-                                page_table_flags(map_flags),
-                            )?;
-                            pages += 1;
-                            Ok(())
-                        })?;
-                    }
-                    Err(_) => return Err(AxError::BadAddress),
-                }
-            }
-            let callback: Option<PopulateCallback> = if to_be_evicted.is_empty() {
-                None
-            } else {
-                let inner = self.0.clone();
-                Some(Box::new(move |aspace: &mut AddrSpace| {
-                    for pn in to_be_evicted {
-                        inner.on_evict(pn, aspace);
-                    }
-                }))
+    ) -> PopulateOutcome {
+        let page_count = match pages_in(range, PageSize::Size4K) {
+            Ok(pages) => pages.count(),
+            Err(error) => return PopulateOutcome::immediate(Err(error)),
+        };
+        let deferred_evictions =
+            match PreparedPopulateEvictions::try_new(self.0.clone(), page_count) {
+                Ok(evictions) => evictions,
+                Err(error) => return PopulateOutcome::immediate(Err(error)),
             };
-            Ok((pages, callback))
+
+        self.0.cache.with_direct_io_excluded(move || {
+            let owner = self.0.owner;
+            let result = (|| {
+                let mut pages = 0;
+                let start_page = self.page_number_for(range.start)?;
+                for (i, addr) in pages_in(range, PageSize::Size4K)?.enumerate() {
+                    let pn = u32::try_from(i)
+                        .ok()
+                        .and_then(|i| start_page.checked_add(i))
+                        .ok_or(AxError::InvalidInput)?;
+                    match pt.query(addr) {
+                        Ok((paddr, page_flags, page_size)) => {
+                            if page_size != PageSize::Size4K {
+                                return Err(AxError::BadAddress);
+                            }
+                            if access_flags.contains(MappingFlags::WRITE)
+                                && !page_flags.contains(MappingFlags::WRITE)
+                            {
+                                self.0.cache.with_page(pn, |page| {
+                                    let page = page.ok_or(AxError::BadAddress)?;
+                                    if page.paddr() != paddr {
+                                        return Err(AxError::BadAddress);
+                                    }
+                                    page.mark_dirty();
+                                    pt.remap(addr, paddr, page_table_flags(flags))?;
+                                    pages += 1;
+                                    AxResult::Ok(())
+                                })?;
+                            } else if page_flags.contains(access_flags) {
+                                pages += 1;
+                            }
+                        }
+                        // If the page is not mapped, try map it.
+                        Err(PagingError::NotMapped) => {
+                            let map_flags = flags - MappingFlags::WRITE;
+                            self.0.cache.with_page_or_insert_for_owner(
+                                pn,
+                                owner,
+                                |page, evicted| {
+                                    if let Some(evicted) = evicted {
+                                        if let Some(deferred_owner) = evicted.deferred_owner() {
+                                            assert_eq!(
+                                                deferred_owner, owner,
+                                                "foreign address-space owner deferred cache \
+                                                 eviction"
+                                            );
+                                            deferred_evictions.push(evicted);
+                                        }
+                                    }
+                                    pt.map(
+                                        addr,
+                                        page.paddr(),
+                                        PageSize::Size4K,
+                                        page_table_flags(map_flags),
+                                    )?;
+                                    pages += 1;
+                                    Ok(())
+                                },
+                            )?;
+                        }
+                        Err(_) => return Err(AxError::BadAddress),
+                    }
+                }
+                Ok(pages)
+            })();
+            PopulateOutcome::new(result, deferred_evictions.into_callback())
         })
     }
 
@@ -949,7 +1223,9 @@ impl BackendOps for FileBackend {
         _new_pt: &mut PageTableCursor,
         new_aspace: &Arc<Mutex<AddrSpace>>,
     ) -> AxResult<Backend> {
-        self.clone_map_with_registration(flags, |inner| inner.register_listener(new_aspace))
+        self.clone_map_with_registration(flags, eviction_owner(new_aspace), |inner| {
+            inner.register_listener(new_aspace)
+        })
     }
 }
 
@@ -968,6 +1244,7 @@ impl Backend {
         let inner = new_file_backend_inner(
             start,
             cache,
+            eviction_owner(aspace),
             flags,
             offset_page,
             file_end,
@@ -988,6 +1265,7 @@ impl Backend {
         Self::File(FileBackend::inactive(new_file_backend_inner(
             start,
             cache,
+            CachedFileEvictionOwner::new(1).unwrap(),
             flags,
             0,
             None,
@@ -1043,6 +1321,7 @@ mod tests {
         FileBackend::inactive(new_file_backend_inner(
             VirtAddr::from(0x1000),
             cache,
+            CachedFileEvictionOwner::new(1).unwrap(),
             FileFlags::READ | FileFlags::WRITE,
             0,
             None,
@@ -1069,6 +1348,53 @@ mod tests {
             MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
             FileMappingSharing::Shared,
         )
+    }
+
+    #[test]
+    fn deferred_eviction_preparation_failpoints_leave_no_callback_owner() {
+        let _context = test_context();
+        executable::init().unwrap();
+        let loc = test_location("deferred-eviction-prepare-failpoints");
+        let backend = test_backend(&loc, Arc::new(()));
+        let baseline_owners = Arc::strong_count(&backend.0);
+
+        for stage in [
+            DEFERRED_EVICTION_FAIL_RESERVE,
+            DEFERRED_EVICTION_FAIL_STATE,
+            DEFERRED_EVICTION_FAIL_CALLBACK,
+        ] {
+            DEFERRED_EVICTION_PREPARE_FAILPOINT.store(stage, Ordering::Release);
+            assert_eq!(
+                PreparedPopulateEvictions::try_new(backend.0.clone(), 4).err(),
+                Some(AxError::NoMemory)
+            );
+            assert_eq!(
+                DEFERRED_EVICTION_PREPARE_FAILPOINT.load(Ordering::Acquire),
+                0
+            );
+            assert_eq!(Arc::strong_count(&backend.0), baseline_owners);
+        }
+    }
+
+    #[test]
+    fn deferred_eviction_preparation_reserves_the_full_page_bound() {
+        let _context = test_context();
+        executable::init().unwrap();
+        let loc = test_location("deferred-eviction-page-bound");
+        let backend = test_backend(&loc, Arc::new(()));
+        let baseline_owners = Arc::strong_count(&backend.0);
+
+        assert_eq!(
+            PreparedPopulateEvictions::try_new(backend.0.clone(), usize::MAX).err(),
+            Some(AxError::NoMemory)
+        );
+        assert_eq!(Arc::strong_count(&backend.0), baseline_owners);
+
+        let prepared = PreparedPopulateEvictions::try_new(backend.0.clone(), 4).unwrap();
+        assert!(prepared.capacity() >= 4);
+        assert!(prepared.is_empty());
+        assert!(prepared.into_callback().is_none());
+        assert_eq!(Arc::strong_count(&backend.0), baseline_owners);
     }
 
     #[test]
@@ -1125,6 +1451,10 @@ mod tests {
             true
         }
 
+        fn preflight_unmap(&self, _start: VirtAddr, _size: usize, _page_table: &()) -> bool {
+            true
+        }
+
         fn protect(
             &self,
             _start: VirtAddr,
@@ -1167,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_writable_mapping_kills_caps_and_excludes_exec_and_setcap() {
+    fn shared_writable_mapping_registers_exec_and_setcap_exclusion() {
         let _context = test_context();
         executable::init().unwrap();
         let loc = test_location("mapped-capability");
@@ -1176,8 +1506,8 @@ mod tests {
         let executable_mapping =
             executable::WritableMappingRegistration::for_location(&loc).unwrap();
 
-        transition_writable_mapping(&loc, Some(&executable_mapping), None, true).unwrap();
-        assert!(!has_capability(&loc));
+        activate_writable_mapping(Some(&executable_mapping), None).unwrap();
+        assert!(has_capability(&loc));
         assert!(matches!(
             executable::CredentialReadLease::acquire(&loc),
             Err(error) if error == axerrno::LinuxError::ETXTBSY.into()
@@ -1187,8 +1517,52 @@ mod tests {
             Err(error) if error == axerrno::LinuxError::ETXTBSY.into()
         ));
 
-        transition_writable_mapping(&loc, Some(&executable_mapping), None, false).unwrap();
+        deactivate_writable_mapping(Some(&executable_mapping), None).unwrap();
         drop(executable::CredentialReadLease::acquire(&loc).unwrap());
+    }
+
+    #[test]
+    fn dropped_writable_mapping_admission_refunds_fresh_registrations() {
+        let _context = test_context();
+        executable::init().unwrap();
+        let loc = test_location("dropped-writable-admission");
+        memfd::install_memfd_state(&loc, true).unwrap();
+        let backend = test_backend(&loc, Arc::new(()));
+
+        let admission = backend.begin_writable_mapping_admission().unwrap();
+        assert!(backend.0.writable_mapping.as_ref().unwrap().is_active());
+        assert!(backend.0.executable_mapping.as_ref().unwrap().is_active());
+        assert_eq!(backend.0.writable_segments.load(Ordering::Acquire), 0);
+
+        drop(admission);
+        assert!(!backend.0.writable_mapping.as_ref().unwrap().is_active());
+        assert!(!backend.0.executable_mapping.as_ref().unwrap().is_active());
+        assert_eq!(backend.0.writable_segments.load(Ordering::Acquire), 0);
+        drop(executable::CredentialReadLease::acquire(&loc).unwrap());
+        assert_eq!(
+            memfd::add_seals(&loc, true, F_SEAL_WRITE).unwrap(),
+            F_SEAL_WRITE
+        );
+    }
+
+    #[test]
+    fn completed_writable_mapping_admission_transfers_registration_to_segment() {
+        let _context = test_context();
+        executable::init().unwrap();
+        let loc = test_location("completed-writable-admission");
+        memfd::install_memfd_state(&loc, true).unwrap();
+        let backend = test_backend(&loc, Arc::new(()));
+
+        let admission = backend.begin_writable_mapping_admission().unwrap();
+        backend.activate_writable_segment().unwrap();
+        admission.complete().unwrap();
+
+        assert_eq!(backend.0.writable_segments.load(Ordering::Acquire), 1);
+        assert!(backend.0.writable_mapping.as_ref().unwrap().is_active());
+        assert!(backend.0.executable_mapping.as_ref().unwrap().is_active());
+        backend.deactivate_writable_segment().unwrap();
+        assert!(!backend.0.writable_mapping.as_ref().unwrap().is_active());
+        assert!(!backend.0.executable_mapping.as_ref().unwrap().is_active());
     }
 
     #[test]
@@ -1201,7 +1575,7 @@ mod tests {
         let backend = test_backend(&loc, Arc::new(()));
 
         backend.activate_writable_segment().unwrap();
-        assert!(!has_capability(&loc));
+        assert!(has_capability(&loc));
         assert_eq!(backend.0.writable_segments.load(Ordering::Acquire), 1);
 
         let split = backend.clone();
@@ -1392,19 +1766,29 @@ mod tests {
     }
 
     #[test]
-    fn sealed_memfd_rejection_does_not_kill_capability_or_publish_exec_exclusion() {
+    fn sealed_memfd_admission_does_not_change_mode_or_capability() {
         let _context = test_context();
         executable::init().unwrap();
         let loc = test_location("sealed-mapping");
         memfd::install_memfd_state(&loc, true).unwrap();
         memfd::add_seals(&loc, true, F_SEAL_WRITE).unwrap();
         install_capability(&loc);
+        loc.update_metadata(axfs_ng_vfs::MetadataUpdate {
+            mode: Some(NodePermission::from_bits_truncate(0o6755)),
+            ..Default::default()
+        })
+        .unwrap();
         let backend = test_backend(&loc, Arc::new(()));
 
+        assert_eq!(
+            backend.begin_writable_mapping_admission().err(),
+            Some(AxError::OperationNotPermitted)
+        );
         assert_eq!(
             backend.activate_writable_segment(),
             Err(AxError::OperationNotPermitted)
         );
+        assert_eq!(loc.metadata().unwrap().mode.bits(), 0o6755);
         assert!(has_capability(&loc));
         assert_eq!(backend.0.writable_segments.load(Ordering::Acquire), 0);
         assert!(!backend.0.executable_mapping.as_ref().unwrap().is_active());
@@ -1431,7 +1815,7 @@ mod tests {
 
         drop(lease);
         backend.activate_writable_segment().unwrap();
-        assert!(!has_capability(&loc));
+        assert!(has_capability(&loc));
         backend.deactivate_writable_segment().unwrap();
     }
 
@@ -1448,6 +1832,7 @@ mod tests {
 
         let result = source.clone_map_with_registration(
             MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
+            CachedFileEvictionOwner::new(2).unwrap(),
             |_| {
                 registration_ran.store(true, Ordering::Release);
                 Ok(())
@@ -1477,7 +1862,11 @@ mod tests {
             .replace_file_mapping(Some(lease));
 
         let child = source
-            .clone_map_with_registration(MappingFlags::READ | MappingFlags::USER, |_| Ok(()))
+            .clone_map_with_registration(
+                MappingFlags::READ | MappingFlags::USER,
+                CachedFileEvictionOwner::new(2).unwrap(),
+                |_| Ok(()),
+            )
             .unwrap();
         let Backend::File(child) = child else {
             panic!("file fork clone changed backend kind");

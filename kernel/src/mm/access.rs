@@ -12,10 +12,9 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
-use axfs::{CachedFilePagePin, CachedFilePinWindow};
+use axfs::CachedFilePagePin;
 use axhal::{
     asm::user_copy,
-    mem::phys_to_virt,
     paging::{MappingFlags, PageSize},
     trap::{PAGE_FAULT, register_trap_handler},
 };
@@ -24,8 +23,9 @@ use axsync::Mutex;
 use axtask::{current, current_may_uninit, sleep};
 use extern_trait::extern_trait;
 use kernel_guard::IrqSave;
-use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr};
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use starry_vm::{VmError, VmIo, VmResult, vm_load_until_nul, vm_read_slice, vm_write_slice};
+use thekernel_linux_mm::{PinAccess, PinDuration, PinRequest, PinToken, PinUse, UserRange};
 
 use super::{AddrSpace, Backend, PhysicalFramePin, pin_frame};
 use crate::{
@@ -891,6 +891,33 @@ impl UserIoPinSegments {
     pub fn bytes(&self) -> usize {
         self.bytes
     }
+
+    fn physical_ranges_are_disjoint(&self) -> bool {
+        physical_pin_segments_are_disjoint(self.as_slice().iter())
+    }
+}
+
+fn physical_pin_segments_are_disjoint<'a, I>(segments: I) -> bool
+where
+    I: Iterator<Item = &'a UserIoPinSegment> + Clone,
+{
+    for (index, segment) in segments.clone().enumerate() {
+        let Some(end) = segment.paddr.checked_add(segment.len) else {
+            return false;
+        };
+        if segment.len == 0 {
+            continue;
+        }
+        for other in segments.clone().skip(index + 1) {
+            let Some(other_end) = other.paddr.checked_add(other.len) else {
+                return false;
+            };
+            if other.len != 0 && segment.paddr < other_end && other.paddr < end {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn record_user_io_pin_segments(segments: &UserIoPinSegments) {
@@ -934,19 +961,10 @@ impl Drop for UserIoPageCachePins {
     }
 }
 
-struct UserIoPinWindows {
-    _windows: Vec<CachedFilePinWindow>,
-}
-
-impl UserIoPinWindows {
-    fn new(windows: Vec<CachedFilePinWindow>) -> Self {
-        Self { _windows: windows }
-    }
-}
-
 struct UserIoRangePin {
     aspace: Arc<Mutex<AddrSpace>>,
-    token: u64,
+    token: PinToken,
+    _system_charge: super::UserIoSystemPinCharge,
 }
 
 impl Drop for UserIoRangePin {
@@ -960,7 +978,6 @@ struct PreparedUserIoPin {
     segments: UserIoPinSegments,
     frame_pins: UserIoFramePins,
     page_cache_pins: UserIoPageCachePins,
-    pin_windows: UserIoPinWindows,
     range_pin: UserIoRangePin,
 }
 
@@ -1010,108 +1027,157 @@ fn prepare_user_io_pin(
         return None;
     }
 
-    let mut pin_windows = Vec::new();
-    let mut window_cursor = page_start;
-    while window_cursor < page_end {
-        let Some(area) = aspace.find_area(window_cursor) else {
-            reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
-            return None;
-        };
-        if let Some(window) = area.backend().begin_user_io_pin_window() {
-            pin_windows.push(window);
-        }
-        window_cursor = area.end().min(page_end);
-    }
-
-    if aspace
-        .populate_area(page_start, page_len, access_flags)
-        .is_err()
-    {
-        reject_user_io_pin(&USER_IO_PIN_REJECT_POPULATE);
-        return None;
-    }
-
-    let mut segments = UserIoPinSegments::new();
-    let mut frame_pins = Vec::new();
-    let mut page_cache_pins = Vec::new();
-    let mut copied = 0usize;
-    for offset in (0..page_len).step_by(PAGE_SIZE_4K) {
-        let vaddr = page_start + offset;
-        let Ok((paddr, flags, page_size)) = aspace.page_table().query(vaddr) else {
-            reject_user_io_pin(&USER_IO_PIN_REJECT_PAGETABLE);
-            return None;
-        };
-        if page_size != PageSize::Size4K || !flags.contains(access_flags) {
-            reject_user_io_pin(&USER_IO_PIN_REJECT_PAGETABLE);
-            return None;
-        }
-        let Some(area) = aspace.find_area(vaddr) else {
-            reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
-            return None;
-        };
-        let backend = area.backend();
-        if backend.supports_user_io_frame_pin() {
-            record_user_io_pin_counter(&USER_IO_PIN_FRAME_PIN_ATTEMPTS, 1);
-            let frame_pin = match pin_frame(paddr) {
-                Ok(pin) => pin,
-                Err(_) => {
-                    record_user_io_backend_pin_reject(backend);
-                    reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
-                    return None;
-                }
-            };
-            record_user_io_backend_pin_hit(backend);
-            frame_pins.push(frame_pin);
+    record_user_io_pin_counter(&USER_IO_PIN_VM_RANGE_PIN_ATTEMPTS, 1);
+    let request = PinRequest::new(
+        UserRange::new(start, len).ok()?,
+        if access_flags.contains(MappingFlags::WRITE) {
+            PinAccess::Write
         } else {
-            record_user_io_pin_counter(&USER_IO_PIN_PAGE_CACHE_PIN_ATTEMPTS, 1);
-            match backend.pin_user_io_page_cache(vaddr, paddr) {
-                Ok(Some(pin)) => {
-                    record_user_io_backend_pin_hit(backend);
-                    page_cache_pins.push(pin);
-                }
-                Ok(None) => {
-                    record_user_io_backend_pin_reject(backend);
-                    reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
-                    return None;
-                }
+            PinAccess::Read
+        },
+        PinDuration::AsyncIo,
+        PinUse::BlockIo,
+        aspace.user_io_pin_owner(),
+    );
+    let (reservation, system_charge, expectations) = match aspace.begin_user_io_pin(request) {
+        Ok(admission) => admission,
+        Err(_) => {
+            reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+            return None;
+        }
+    };
+
+    let mechanism = (|| {
+        let mut pin_windows = Vec::new();
+        let page_count = page_len / PAGE_SIZE_4K;
+        let mut frame_pins = Vec::new();
+        let mut page_cache_pins = Vec::new();
+        // Reserve every fallible owner collection before acquiring the first
+        // backend pin. A later Vec growth failure would otherwise abort the
+        // kernel while a charged reservation and partial pin set are live.
+        if pin_windows.try_reserve_exact(expectations.len()).is_err()
+            || frame_pins.try_reserve_exact(page_count).is_err()
+            || page_cache_pins.try_reserve_exact(page_count).is_err()
+        {
+            return None;
+        }
+        let mut window_cursor = page_start;
+        while window_cursor < page_end {
+            let Some(area) = aspace.find_area(window_cursor) else {
+                reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+                return None;
+            };
+            match area.backend().begin_user_io_pin_window() {
+                Ok(Some(window)) => pin_windows.push(window),
+                Ok(None) => {}
                 Err(_) => {
-                    record_user_io_backend_pin_reject(backend);
-                    reject_user_io_pin(&USER_IO_PIN_REJECT_PAGE_CACHE_PIN);
+                    reject_user_io_pin(&USER_IO_PIN_REJECT_FILE_PIN);
                     return None;
                 }
             }
+            window_cursor = area.end().min(page_end);
         }
-        let page_offset = if offset == 0 {
-            start_addr.sub_addr(page_start)
-        } else {
-            0
-        };
-        let chunk_len = (len - copied).min(PAGE_SIZE_4K - page_offset);
-        if !segments.push_or_merge(paddr.as_usize() + page_offset, chunk_len) {
-            reject_user_io_pin(&USER_IO_PIN_REJECT_SEGMENTS);
+
+        // The 0.1 direct-I/O fast path is deliberately resident-only. Faulting
+        // file/COW pages here would hold the address-space lock across blocking
+        // cache or filesystem work. Missing or not-yet-writable pages take the
+        // existing copy path; a future fault/revalidate transaction can widen
+        // admission without weakening this bounded critical section.
+        let mut segments = UserIoPinSegments::new();
+        let mut copied = 0usize;
+        for offset in (0..page_len).step_by(PAGE_SIZE_4K) {
+            let vaddr = page_start + offset;
+            let Ok((paddr, flags, page_size)) = aspace.page_table().query(vaddr) else {
+                reject_user_io_pin(&USER_IO_PIN_REJECT_PAGETABLE);
+                return None;
+            };
+            if page_size != PageSize::Size4K || !flags.contains(access_flags) {
+                reject_user_io_pin(&USER_IO_PIN_REJECT_PAGETABLE);
+                return None;
+            }
+            let Some(area) = aspace.find_area(vaddr) else {
+                reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+                return None;
+            };
+            let backend = area.backend();
+            if backend.supports_user_io_frame_pin() {
+                record_user_io_pin_counter(&USER_IO_PIN_FRAME_PIN_ATTEMPTS, 1);
+                let frame_pin = match pin_frame(paddr) {
+                    Ok(pin) => pin,
+                    Err(_) => {
+                        record_user_io_backend_pin_reject(backend);
+                        reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
+                        return None;
+                    }
+                };
+                record_user_io_backend_pin_hit(backend);
+                frame_pins.push(frame_pin);
+            } else {
+                record_user_io_pin_counter(&USER_IO_PIN_PAGE_CACHE_PIN_ATTEMPTS, 1);
+                match backend.pin_user_io_page_cache(
+                    vaddr,
+                    paddr,
+                    access_flags.contains(MappingFlags::WRITE),
+                ) {
+                    Ok(Some(pin)) => {
+                        record_user_io_backend_pin_hit(backend);
+                        page_cache_pins.push(pin);
+                    }
+                    Ok(None) => {
+                        record_user_io_backend_pin_reject(backend);
+                        reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
+                        return None;
+                    }
+                    Err(_) => {
+                        record_user_io_backend_pin_reject(backend);
+                        reject_user_io_pin(&USER_IO_PIN_REJECT_PAGE_CACHE_PIN);
+                        return None;
+                    }
+                }
+            }
+            let page_offset = if offset == 0 {
+                start_addr.sub_addr(page_start)
+            } else {
+                0
+            };
+            let chunk_len = (len - copied).min(PAGE_SIZE_4K - page_offset);
+            if !segments.push_or_merge(paddr.as_usize() + page_offset, chunk_len) {
+                reject_user_io_pin(&USER_IO_PIN_REJECT_SEGMENTS);
+                return None;
+            }
+            copied += chunk_len;
+        }
+
+        if frame_pins.is_empty() && page_cache_pins.is_empty() {
+            reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
             return None;
         }
-        copied += chunk_len;
-    }
+        if copied != len {
+            reject_user_io_pin(&USER_IO_PIN_REJECT_PAGETABLE);
+            return None;
+        }
+        if require_contiguous && segments.len() != 1 {
+            reject_user_io_pin(&USER_IO_PIN_REJECT_NONCONTIG);
+            return None;
+        }
+        // Exact frame/page-cache pins now carry the lifetime contract. Release
+        // the conservative file-wide preparation windows before publication.
+        drop(pin_windows);
+        Some((segments, frame_pins, page_cache_pins))
+    })();
 
-    if frame_pins.is_empty() && page_cache_pins.is_empty() {
-        reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
+    let Some((segments, frame_pins, page_cache_pins)) = mechanism else {
+        aspace.cancel_user_io_pin(reservation);
+        reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
         return None;
-    }
-
-    if copied != len {
-        reject_user_io_pin(&USER_IO_PIN_REJECT_PAGETABLE);
-        return None;
-    }
-    if require_contiguous && segments.len() != 1 {
-        reject_user_io_pin(&USER_IO_PIN_REJECT_NONCONTIG);
-        return None;
-    }
-
-    record_user_io_pin_counter(&USER_IO_PIN_VM_RANGE_PIN_ATTEMPTS, 1);
-    let token = match aspace.begin_user_io_pin(page_start, page_len) {
+    };
+    let token = match aspace.publish_user_io_pin(reservation, &expectations) {
         Ok(token) => token,
         Err(_) => {
+            drop(frame_pins);
+            drop(page_cache_pins);
+            drop(aspace);
+            drop(system_charge);
             reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
             return None;
         }
@@ -1134,8 +1200,18 @@ fn prepare_user_io_pin(
     let range_pin = UserIoRangePin {
         aspace: aspace_handle.clone(),
         token,
+        _system_charge: system_charge,
     };
     drop(aspace);
+
+    // Field order keeps lower frame/page-cache pins alive until before the
+    // policy range token is released, including every early-return path below.
+    let prepared = PreparedUserIoPin {
+        segments,
+        frame_pins: UserIoFramePins::new(frame_pins),
+        page_cache_pins: UserIoPageCachePins::new(page_cache_pins),
+        range_pin,
+    };
 
     let delay_ms = user_io_pin_test_delay_ms();
     if delay_ms != 0 && user_io_pin_counters_enabled() {
@@ -1145,39 +1221,24 @@ fn prepare_user_io_pin(
         }
     }
 
-    Some(PreparedUserIoPin {
-        segments,
-        frame_pins: UserIoFramePins::new(frame_pins),
-        page_cache_pins: UserIoPageCachePins::new(page_cache_pins),
-        pin_windows: UserIoPinWindows::new(pin_windows),
-        range_pin,
-    })
+    Some(prepared)
 }
 
 /// Short-lived source slice for direct file I/O.
 ///
-/// This is intentionally stricter than normal user-copy helpers: it faults in
-/// the range and only succeeds when all covered 4 KiB pages are physically
-/// contiguous. It is a syscall-local borrow used by synchronous I/O, not a
-/// long-term DMA pin that survives remap/unmap activity.
+/// This is intentionally stricter than normal user-copy helpers: it only
+/// accepts already-resident pages and succeeds when all covered 4 KiB pages
+/// are physically contiguous. It is a syscall-local borrow used by synchronous
+/// I/O, not a long-term DMA pin that survives remap/unmap activity.
 pub struct PinnedUserSlice {
     _ptr: *const u8,
-    len: usize,
     segments: UserIoPinSegments,
     _frame_pins: UserIoFramePins,
     _page_cache_pins: UserIoPageCachePins,
-    _pin_windows: UserIoPinWindows,
     _range_pin: UserIoRangePin,
 }
 
 impl PinnedUserSlice {
-    pub fn as_slice(&self) -> &[u8] {
-        let segment = &self.segments.as_slice()[0];
-        debug_assert_eq!(segment.len, self.len);
-        let ptr = phys_to_virt(PhysAddr::from(segment.paddr)).as_ptr();
-        unsafe { slice::from_raw_parts(ptr, self.len) }
-    }
-
     pub fn segments(&self) -> &[UserIoPinSegment] {
         self.segments.as_slice()
     }
@@ -1192,22 +1253,13 @@ impl Drop for PinnedUserSlice {
 /// Short-lived destination slice for direct file I/O.
 pub struct PinnedUserSliceMut {
     _ptr: *mut u8,
-    len: usize,
     segments: UserIoPinSegments,
     _frame_pins: UserIoFramePins,
     _page_cache_pins: UserIoPageCachePins,
-    _pin_windows: UserIoPinWindows,
     _range_pin: UserIoRangePin,
 }
 
 impl PinnedUserSliceMut {
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        let segment = &self.segments.as_slice()[0];
-        debug_assert_eq!(segment.len, self.len);
-        let ptr = phys_to_virt(PhysAddr::from(segment.paddr)).as_mut_ptr();
-        unsafe { slice::from_raw_parts_mut(ptr, self.len) }
-    }
-
     pub fn segments(&self) -> &[UserIoPinSegment] {
         self.segments.as_slice()
     }
@@ -1227,11 +1279,9 @@ pub fn try_pin_user_slice_from_user(ptr: *const u8, len: usize) -> Option<Pinned
     record_user_io_pin_segments(&prepared.segments);
     Some(PinnedUserSlice {
         _ptr: ptr,
-        len,
         segments: prepared.segments,
         _frame_pins: prepared.frame_pins,
         _page_cache_pins: prepared.page_cache_pins,
-        _pin_windows: prepared.pin_windows,
         _range_pin: prepared.range_pin,
     })
 }
@@ -1244,11 +1294,9 @@ pub fn try_pin_user_slice_to_user(ptr: *mut u8, len: usize) -> Option<PinnedUser
     record_user_io_pin_segments(&prepared.segments);
     Some(PinnedUserSliceMut {
         _ptr: ptr,
-        len,
         segments: prepared.segments,
         _frame_pins: prepared.frame_pins,
         _page_cache_pins: prepared.page_cache_pins,
-        _pin_windows: prepared.pin_windows,
         _range_pin: prepared.range_pin,
     })
 }
@@ -1256,41 +1304,16 @@ pub fn try_pin_user_slice_to_user(ptr: *mut u8, len: usize) -> Option<PinnedUser
 #[allow(dead_code)]
 pub struct PinnedUserSegments {
     _ptr: *const u8,
-    len: usize,
     segments: UserIoPinSegments,
     _frame_pins: UserIoFramePins,
     _page_cache_pins: UserIoPageCachePins,
-    _pin_windows: UserIoPinWindows,
     _range_pin: UserIoRangePin,
 }
 
 #[allow(dead_code)]
 impl PinnedUserSegments {
-    pub fn as_slice(&self) -> &[u8] {
-        let segment = &self.segments.as_slice()[0];
-        debug_assert_eq!(self.segments.len(), 1);
-        debug_assert_eq!(segment.len, self.len);
-        let ptr = phys_to_virt(PhysAddr::from(segment.paddr)).as_ptr();
-        unsafe { slice::from_raw_parts(ptr, self.len) }
-    }
-
     pub fn segments(&self) -> &[UserIoPinSegment] {
         self.segments.as_slice()
-    }
-
-    pub fn segment_slice(&self, index: usize) -> &[u8] {
-        let segment = &self.segments.as_slice()[index];
-        let ptr = phys_to_virt(PhysAddr::from(segment.paddr)).as_ptr();
-        unsafe { slice::from_raw_parts(ptr, segment.len) }
-    }
-
-    pub fn with_segment_slices<R>(&self, f: impl FnOnce(&[&[u8]]) -> R) -> R {
-        let mut slices = Vec::with_capacity(self.segments.len());
-        for segment in self.segments.as_slice() {
-            let ptr = phys_to_virt(PhysAddr::from(segment.paddr)).as_ptr();
-            slices.push(unsafe { slice::from_raw_parts(ptr, segment.len) });
-        }
-        f(slices.as_slice())
     }
 }
 
@@ -1303,41 +1326,16 @@ impl Drop for PinnedUserSegments {
 #[allow(dead_code)]
 pub struct PinnedUserSegmentsMut {
     _ptr: *mut u8,
-    len: usize,
     segments: UserIoPinSegments,
     _frame_pins: UserIoFramePins,
     _page_cache_pins: UserIoPageCachePins,
-    _pin_windows: UserIoPinWindows,
     _range_pin: UserIoRangePin,
 }
 
 #[allow(dead_code)]
 impl PinnedUserSegmentsMut {
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        let segment = &self.segments.as_slice()[0];
-        debug_assert_eq!(self.segments.len(), 1);
-        debug_assert_eq!(segment.len, self.len);
-        let ptr = phys_to_virt(PhysAddr::from(segment.paddr)).as_mut_ptr();
-        unsafe { slice::from_raw_parts_mut(ptr, self.len) }
-    }
-
     pub fn segments(&self) -> &[UserIoPinSegment] {
         self.segments.as_slice()
-    }
-
-    pub fn segment_mut_slice(&mut self, index: usize) -> &mut [u8] {
-        let segment = &self.segments.as_slice()[index];
-        let ptr = phys_to_virt(PhysAddr::from(segment.paddr)).as_mut_ptr();
-        unsafe { slice::from_raw_parts_mut(ptr, segment.len) }
-    }
-
-    pub fn with_segment_mut_slices<R>(&mut self, f: impl FnOnce(&mut [&mut [u8]]) -> R) -> R {
-        let mut slices = Vec::with_capacity(self.segments.len());
-        for segment in self.segments.as_slice() {
-            let ptr = phys_to_virt(PhysAddr::from(segment.paddr)).as_mut_ptr();
-            slices.push(unsafe { slice::from_raw_parts_mut(ptr, segment.len) });
-        }
-        f(slices.as_mut_slice())
     }
 }
 
@@ -1347,52 +1345,55 @@ impl Drop for PinnedUserSegmentsMut {
     }
 }
 
-pub fn with_pinned_user_segment_slices<R>(
-    pins: &[PinnedUserSegments],
-    f: impl FnOnce(&[&[u8]]) -> R,
-) -> R {
-    let total_segments = pins.iter().map(|pin| pin.segments.len()).sum();
-    let mut slices = Vec::with_capacity(total_segments);
-    for pin in pins {
-        for segment in pin.segments.as_slice() {
-            let ptr = phys_to_virt(PhysAddr::from(segment.paddr)).as_ptr();
-            slices.push(unsafe { slice::from_raw_parts(ptr, segment.len) });
-        }
-    }
-    f(slices.as_slice())
+pub fn pinned_user_mut_segments_are_disjoint(pins: &[PinnedUserSegmentsMut]) -> bool {
+    physical_pin_segments_are_disjoint(pins.iter().flat_map(|pin| pin.segments.as_slice().iter()))
 }
 
-fn pinned_user_mut_segments_are_disjoint(pins: &[PinnedUserSegmentsMut]) -> bool {
-    let total_segments = pins.iter().map(|pin| pin.segments.len()).sum();
-    let mut ranges = Vec::with_capacity(total_segments);
-    for pin in pins {
-        for segment in pin.segments.as_slice() {
-            let Some(end) = segment.paddr.checked_add(segment.len) else {
-                return false;
-            };
-            ranges.push((segment.paddr, end));
-        }
-    }
-    ranges.sort_unstable_by_key(|(start, _)| *start);
-    ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0)
-}
+#[cfg(test)]
+mod tests {
+    use super::{UserIoPinSegment, UserIoPinSegments, physical_pin_segments_are_disjoint};
 
-pub fn try_with_pinned_user_segment_mut_slices<R>(
-    pins: &mut [PinnedUserSegmentsMut],
-    f: impl FnOnce(&mut [&mut [u8]]) -> R,
-) -> Option<R> {
-    if !pinned_user_mut_segments_are_disjoint(pins) {
-        return None;
+    #[test]
+    fn mutable_pin_segments_reject_physical_aliases() {
+        let mut aliases = UserIoPinSegments::new();
+        assert!(aliases.push_or_merge(0x1000, 0x800));
+        assert!(aliases.push_or_merge(0x1000, 0x800));
+        assert!(!aliases.physical_ranges_are_disjoint());
+
+        let mut disjoint = UserIoPinSegments::new();
+        assert!(disjoint.push_or_merge(0x1000, 0x800));
+        assert!(disjoint.push_or_merge(0x2000, 0x800));
+        assert!(disjoint.physical_ranges_are_disjoint());
     }
-    let total_segments = pins.iter().map(|pin| pin.segments.len()).sum();
-    let mut slices = Vec::with_capacity(total_segments);
-    for pin in pins {
-        for segment in pin.segments.as_slice() {
-            let ptr = phys_to_virt(PhysAddr::from(segment.paddr)).as_mut_ptr();
-            slices.push(unsafe { slice::from_raw_parts_mut(ptr, segment.len) });
-        }
+
+    #[test]
+    fn mutable_pin_range_check_handles_cross_pin_aliases_without_storage() {
+        let left = [UserIoPinSegment {
+            paddr: 0x1000,
+            len: 0x1000,
+        }];
+        let disjoint = [UserIoPinSegment {
+            paddr: 0x3000,
+            len: 0x1000,
+        }];
+        assert!(physical_pin_segments_are_disjoint(
+            left.iter().chain(disjoint.iter())
+        ));
+
+        let overlapping = [UserIoPinSegment {
+            paddr: 0x1800,
+            len: 0x1000,
+        }];
+        assert!(!physical_pin_segments_are_disjoint(
+            left.iter().chain(overlapping.iter())
+        ));
+
+        let overflowing = [UserIoPinSegment {
+            paddr: usize::MAX,
+            len: 2,
+        }];
+        assert!(!physical_pin_segments_are_disjoint(overflowing.iter()));
     }
-    Some(f(slices.as_mut_slice()))
 }
 
 #[allow(dead_code)]
@@ -1404,11 +1405,9 @@ pub fn try_pin_user_segments_from_user(ptr: *const u8, len: usize) -> Option<Pin
     record_user_io_pin_segments(&prepared.segments);
     Some(PinnedUserSegments {
         _ptr: ptr,
-        len,
         segments: prepared.segments,
         _frame_pins: prepared.frame_pins,
         _page_cache_pins: prepared.page_cache_pins,
-        _pin_windows: prepared.pin_windows,
         _range_pin: prepared.range_pin,
     })
 }
@@ -1422,11 +1421,9 @@ pub fn try_pin_user_segments_to_user(ptr: *mut u8, len: usize) -> Option<PinnedU
     record_user_io_pin_segments(&prepared.segments);
     Some(PinnedUserSegmentsMut {
         _ptr: ptr,
-        len,
         segments: prepared.segments,
         _frame_pins: prepared.frame_pins,
         _page_cache_pins: prepared.page_cache_pins,
-        _pin_windows: prepared.pin_windows,
         _range_pin: prepared.range_pin,
     })
 }

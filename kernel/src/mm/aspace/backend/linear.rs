@@ -1,11 +1,13 @@
 use alloc::sync::Arc;
 
 use axerrno::{AxError, AxResult};
-use axhal::paging::{MappingFlags, PageSize, PageTableCursor};
+use axhal::paging::{MappingFlags, PageSize, PageTable, PageTableCursor};
 use axsync::Mutex;
 use memory_addr::{PhysAddr, PhysAddrRange, VirtAddr, VirtAddrRange};
 
-use super::{AddrSpace, Backend, BackendOps, MappingStatus, page_table_flags};
+use super::{
+    AddrSpace, Backend, BackendOps, MappingStatus, page_table_flags, preflight_dense_unmap,
+};
 
 /// Linear mapping backend.
 ///
@@ -129,6 +131,11 @@ impl BackendOps for LinearBackend {
         debug!("Linear::unmap: {range:?} -> {pa_range:?}");
         pt.unmap_region(range.start, range.size())?;
         Ok(())
+    }
+
+    fn preflight_unmap(&self, range: VirtAddrRange, pt: &PageTable) -> AxResult {
+        self.check_range(range)?;
+        preflight_dense_unmap(range, PageSize::Size4K, pt)
     }
 
     fn clone_map(

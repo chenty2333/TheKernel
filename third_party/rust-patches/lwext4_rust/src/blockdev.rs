@@ -9,11 +9,6 @@ use crate::{Ext4Error, Ext4Result, error::Context, ffi::*};
 /// Device block size.
 pub const EXT4_DEV_BSIZE: usize = 512;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct AsyncReadStats {
-    pub submit_batches: usize,
-}
-
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct AsyncReadSubmission {
     pub handles: Vec<u64>,
@@ -43,9 +38,17 @@ pub trait BlockDevice {
             if buf.is_empty() {
                 continue;
             }
-            let read = self.read_blocks(cur_block, buf)?;
+            let read = match self.read_blocks(cur_block, buf) {
+                Ok(read) => read,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
             total += read;
-            cur_block += (read / EXT4_DEV_BSIZE) as u64;
+            cur_block = match cur_block.checked_add((read / EXT4_DEV_BSIZE) as u64) {
+                Some(cur_block) => cur_block,
+                None if total != 0 => break,
+                None => return Err(Ext4Error::new(EIO as _, "vectored read block overflow")),
+            };
             if read < buf.len() || read == 0 {
                 break;
             }
@@ -53,26 +56,14 @@ pub trait BlockDevice {
         Ok(total)
     }
 
-    /// Attempts to read a scatter list through an async block queue.
-    ///
-    /// Returns `Ok(None)` when the underlying device cannot accept this request
-    /// through its async queue. Callers must keep all buffers alive until this
-    /// method returns, at which point accepted requests are complete.
-    fn try_read_blocks_vectored_async(
-        &mut self,
-        block_id: u64,
-        bufs: &mut [&mut [u8]],
-    ) -> Ext4Result<Option<AsyncReadStats>> {
-        let _ = block_id;
-        let _ = bufs;
-        Ok(None)
-    }
-
     /// Attempts to submit a scatter-list read through an async block queue.
     ///
     /// Returns `Ok(None)` when the request cannot be submitted without a
-    /// lock-internal wait. Callers must keep all buffers alive until the
-    /// returned handles have completed.
+    /// lock-internal wait. This is an all-or-none submit boundary: `Some` must
+    /// cover the complete scatter list, and `None` or `Err` must leave no
+    /// request able to access the buffers. The method itself must not wait for
+    /// completion. Callers keep all buffers alive until the returned handles
+    /// have completed.
     fn try_read_blocks_vectored_async_submit(
         &mut self,
         block_id: u64,
@@ -86,8 +77,11 @@ pub trait BlockDevice {
     /// Attempts to submit a scatter-list write through an async block queue.
     ///
     /// Returns `Ok(None)` when the request cannot be submitted without a
-    /// lock-internal wait. Callers must keep all buffers alive until the
-    /// returned handles have completed.
+    /// lock-internal wait. This is an all-or-none submit boundary: `Some` must
+    /// cover the complete scatter list, and `None` or `Err` must leave no
+    /// request able to access the buffers. The method itself must not wait for
+    /// completion. Callers keep all buffers alive until the returned handles
+    /// have completed.
     fn try_write_blocks_vectored_async_submit(
         &mut self,
         block_id: u64,
@@ -114,14 +108,101 @@ pub trait BlockDevice {
             if buf.is_empty() {
                 continue;
             }
-            let written = self.write_blocks(cur_block, buf)?;
+            let written = match self.write_blocks(cur_block, buf) {
+                Ok(written) => written,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
             total += written;
-            cur_block += (written / EXT4_DEV_BSIZE) as u64;
+            cur_block = match cur_block.checked_add((written / EXT4_DEV_BSIZE) as u64) {
+                Some(cur_block) => cur_block,
+                None if total != 0 => break,
+                None => return Err(Ext4Error::new(EIO as _, "vectored write block overflow")),
+            };
             if written < buf.len() || written == 0 {
                 break;
             }
         }
         Ok(total)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FaultingBlockDevice {
+        fail_read_call: usize,
+        fail_write_call: usize,
+        read_calls: usize,
+        write_calls: usize,
+    }
+
+    impl FaultingBlockDevice {
+        fn new(fail_read_call: usize, fail_write_call: usize) -> Self {
+            Self {
+                fail_read_call,
+                fail_write_call,
+                read_calls: 0,
+                write_calls: 0,
+            }
+        }
+    }
+
+    impl BlockDevice for FaultingBlockDevice {
+        fn write_blocks(&mut self, _block_id: u64, buf: &[u8]) -> Ext4Result<usize> {
+            let call = self.write_calls;
+            self.write_calls += 1;
+            if call == self.fail_write_call {
+                Err(Ext4Error::new(EIO as _, "injected write failure"))
+            } else {
+                Ok(buf.len())
+            }
+        }
+
+        fn read_blocks(&mut self, _block_id: u64, buf: &mut [u8]) -> Ext4Result<usize> {
+            let call = self.read_calls;
+            self.read_calls += 1;
+            if call == self.fail_read_call {
+                Err(Ext4Error::new(EIO as _, "injected read failure"))
+            } else {
+                buf.fill(call as u8 + 1);
+                Ok(buf.len())
+            }
+        }
+
+        fn num_blocks(&self) -> Ext4Result<u64> {
+            Ok(u64::MAX)
+        }
+    }
+
+    #[test]
+    fn default_vectored_read_preserves_prefix_before_later_error() {
+        let mut device = FaultingBlockDevice::new(1, usize::MAX);
+        let mut first = [0u8; EXT4_DEV_BSIZE];
+        let mut second = [0u8; EXT4_DEV_BSIZE];
+        let mut bufs: [&mut [u8]; 2] = [&mut first, &mut second];
+
+        assert_eq!(
+            device.read_blocks_vectored(0, &mut bufs).unwrap(),
+            EXT4_DEV_BSIZE
+        );
+        assert!(first.iter().all(|byte| *byte == 1));
+        assert!(second.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn default_vectored_write_preserves_prefix_before_later_error() {
+        let mut device = FaultingBlockDevice::new(usize::MAX, 1);
+        let first = [1u8; EXT4_DEV_BSIZE];
+        let second = [2u8; EXT4_DEV_BSIZE];
+        let bufs: [&[u8]; 2] = [&first, &second];
+
+        assert_eq!(
+            device.write_blocks_vectored(0, &bufs).unwrap(),
+            EXT4_DEV_BSIZE
+        );
+        assert_eq!(device.write_calls, 2);
     }
 }
 

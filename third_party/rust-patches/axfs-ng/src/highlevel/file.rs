@@ -23,7 +23,9 @@ use axfs_ng_vfs::{
     FileNode, FilesystemOps, Location, Mountpoint, NodeFlags, NodePermission, NodeType, VfsError,
     VfsResult, WeakDirEntry, WritebackAnchor, path::Path,
 };
-use axhal::mem::{PhysAddr, VirtAddr, total_ram_size, virt_to_phys};
+use axhal::mem::{PhysAddr, VirtAddr, total_ram_size};
+#[cfg(target_os = "none")]
+use axhal::mem::{phys_to_virt, virt_to_phys};
 use axio::{SeekFrom, prelude::*};
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 #[cfg(target_os = "none")]
@@ -1085,6 +1087,11 @@ fn flush_and_release_closed_file_cache_candidate(candidate: ClosedFileCacheTrimC
         record_cached_file_counter(&CLOSED_FILE_CACHE_TRIM_FLUSH_ERRORS, 1);
         return false;
     }
+    if let Err(err) = discard_cached_pages(&candidate.shared) {
+        warn!("Failed to invalidate retained cached file before trim: {err:?}");
+        record_cached_file_counter(&CLOSED_FILE_CACHE_TRIM_FLUSH_ERRORS, 1);
+        return false;
+    }
 
     let released = {
         let mut registry = file_cache_registry().lock();
@@ -1179,33 +1186,93 @@ fn try_retain_closed_cached_file(location: &Location, shared: &Arc<CachedFileSha
     }
 }
 
-/// Flushes and drops cached pages before backend storage is changed out-of-band.
-pub fn sync_and_invalidate_cached_file_pages(location: &Location) -> VfsResult<()> {
-    let shared = cached_file_shared_for_location(location);
-    if let Some(shared) = shared {
-        let _writeback_guard = shared.writeback_lock.write();
-        wait_for_all_writeback_clear(&shared);
-        let file = location.entry().as_file()?;
-        loop {
-            let Some((pn, mut page)) = ({
-                let mut cache = shared.page_cache.lock();
-                pop_unpinned_lru_page(&mut cache)?
-            }) else {
-                break;
-            };
-            let _ = writeback_cached_page(&shared, file, pn, &mut page)?;
-        }
-        release_cached_file_writeback_anchor_if_clean(&shared);
-        release_closed_cached_file_retention(location);
-    }
+fn sync_and_invalidate_cached_file_pages_locked(
+    location: &Location,
+    shared: &Arc<CachedFileShared>,
+    mutation: &CachedFileMutationGuard,
+) -> VfsResult<()> {
+    let _writeback_guard = shared.writeback_lock.write();
+    wait_for_all_writeback_clear(shared);
+    let file = location.entry().as_file()?;
+    let mut invalidation = CachedPageInvalidationTransaction::new(mutation);
+    invalidation.stage_all()?;
+    invalidation.writeback(file, false)?;
+    invalidation.commit_discard();
+    release_cached_file_writeback_anchor_if_clean(shared);
+    release_closed_cached_file_retention(location);
     Ok(())
 }
 
-fn discard_cached_pages(shared: &CachedFileShared) {
-    let mut guard = shared.page_cache.lock();
-    while let Some((_pn, mut page)) = pop_unpinned_lru_page(&mut guard).unwrap_or(None) {
-        page.clear_dirty();
+fn with_cache_invalidating_file_operation<R>(
+    location: &Location,
+    operation: impl FnOnce(&Arc<CachedFileShared>, &FileNode) -> VfsResult<R>,
+) -> VfsResult<R> {
+    let shared = cached_file_shared_for_location_or_create(location);
+    let _direct_guard = shared.direct_io_lock.write();
+    let mutation = CachedFile::begin_shared_cache_invalidating_mutation(&shared)?;
+    sync_and_invalidate_cached_file_pages_locked(location, &shared, &mutation)?;
+    let file = location.entry().as_file()?;
+    let result = operation(&shared, file);
+    let post_result = sync_and_invalidate_cached_file_pages_locked(location, &shared, &mutation);
+    if let Err(error) = post_result {
+        return Err(error);
     }
+    result
+}
+
+fn with_cache_invalidating_truncate(location: &Location, len: u64) -> VfsResult<()> {
+    let shared = cached_file_shared_for_location_or_create(location);
+    let _direct_guard = shared.direct_io_lock.write();
+    let mutation = CachedFile::begin_shared_cache_invalidating_mutation(&shared)?;
+    let _writeback_guard = shared.writeback_lock.write();
+    wait_for_all_writeback_clear(&shared);
+    let file = location.entry().as_file()?;
+    let mut invalidation = CachedPageInvalidationTransaction::new(&mutation);
+    invalidation.stage_all()?;
+    invalidation.writeback(file, false)?;
+
+    let failure_is_atomic = file.set_len_failure_is_atomic();
+    if let Err(error) = file.set_len(len) {
+        if !failure_is_atomic {
+            // The lower filesystem may have published a partial truncate.
+            // Retaining pre-operation cache pages would expose stale data.
+            invalidation.commit_discard();
+            release_cached_file_writeback_anchor_if_clean(&shared);
+            release_closed_cached_file_retention(location);
+        }
+        return Err(error);
+    }
+    invalidation.commit_discard();
+    release_cached_file_writeback_anchor_if_clean(&shared);
+    release_closed_cached_file_retention(location);
+    Ok(())
+}
+
+/// Runs one out-of-band content mutation between two cache invalidations.
+///
+/// Direct-I/O exclusion and pin-mutation admission remain held through the
+/// lower operation, so no pin window can enter between invalidation and commit.
+pub fn with_sync_and_invalidate_cached_file_pages<R>(
+    location: &Location,
+    operation: impl FnOnce() -> VfsResult<R>,
+) -> VfsResult<R> {
+    with_cache_invalidating_file_operation(location, |_, _| operation())
+}
+
+/// Flushes and drops cached pages before backend storage is changed out-of-band.
+pub fn sync_and_invalidate_cached_file_pages(location: &Location) -> VfsResult<()> {
+    with_sync_and_invalidate_cached_file_pages(location, || Ok(()))
+}
+
+fn discard_cached_pages(shared: &Arc<CachedFileShared>) -> VfsResult<()> {
+    let _direct_guard = shared.direct_io_lock.write();
+    let mutation = CachedFile::begin_shared_cache_invalidating_mutation(shared)?;
+    let _writeback_guard = shared.writeback_lock.write();
+    wait_for_all_writeback_clear(shared);
+    let mut invalidation = CachedPageInvalidationTransaction::new(&mutation);
+    invalidation.stage_all()?;
+    invalidation.commit_discard();
+    Ok(())
 }
 
 fn pop_unpinned_lru_page(
@@ -1246,12 +1313,22 @@ fn pop_unused_readahead_lru_page(cache: &mut LruCache<u32, PageCache>) -> Option
     popped
 }
 
+fn restore_popped_cache_page(cache: &mut LruCache<u32, PageCache>, pn: u32, page: PageCache) {
+    assert!(
+        cache.put(pn, page).is_none(),
+        "restoring an evicted cache page replaced page {pn}"
+    );
+    cache.demote(&pn);
+}
+
 /// Marks cached pages for an inode whose final directory entry is being removed.
 pub fn mark_cached_file_unlinked(location: &Location) {
     if let Some(shared) = cached_file_shared_for_location(location) {
         shared.unlinked.store(true, Ordering::Release);
         if shared.open_handles.load(Ordering::Acquire) == 0 {
-            discard_cached_pages(&shared);
+            discard_cached_pages(&shared).unwrap_or_else(|error| {
+                panic!("failed to discard unlinked cached pages without live handles: {error:?}")
+            });
             release_cached_file_writeback_anchor_if_clean(&shared);
         }
         release_closed_cached_file_retention(location);
@@ -1299,6 +1376,224 @@ pub fn sync_cached_file_pages_for_filesystem(filesystem: &dyn FilesystemOps) -> 
     Ok(())
 }
 
+/// One physically contiguous segment held stable by the caller for an I/O.
+///
+/// This type is only a descriptor. Dereferencing it is restricted to the
+/// unsafe pinned-segment I/O methods below, whose contracts require the range
+/// to remain pinned and accessible for the complete operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PinnedPhysicalSegment {
+    paddr: usize,
+    len: usize,
+}
+
+impl PinnedPhysicalSegment {
+    pub const fn new(paddr: usize, len: usize) -> Self {
+        Self { paddr, len }
+    }
+
+    pub const fn paddr(self) -> usize {
+        self.paddr
+    }
+
+    pub const fn len(self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
+const MAX_MUTABLE_PINNED_PHYSICAL_SEGMENTS: usize = 64;
+
+#[cfg(target_os = "none")]
+fn physical_to_virtual(paddr: PhysAddr) -> VirtAddr {
+    phys_to_virt(paddr)
+}
+
+#[cfg(not(target_os = "none"))]
+fn physical_to_virtual(paddr: PhysAddr) -> VirtAddr {
+    VirtAddr::from(usize::from(paddr))
+}
+
+#[cfg(target_os = "none")]
+fn virtual_to_physical(vaddr: VirtAddr) -> PhysAddr {
+    virt_to_phys(vaddr)
+}
+
+#[cfg(not(target_os = "none"))]
+fn virtual_to_physical(vaddr: VirtAddr) -> PhysAddr {
+    PhysAddr::from(usize::from(vaddr))
+}
+
+fn validate_pinned_physical_segments(
+    segments: &[PinnedPhysicalSegment],
+    mutable: bool,
+) -> VfsResult<usize> {
+    if mutable && segments.len() > MAX_MUTABLE_PINNED_PHYSICAL_SEGMENTS {
+        return Err(VfsError::InvalidInput);
+    }
+    let mut total = 0usize;
+    let mut ranges = [(0usize, 0usize); MAX_MUTABLE_PINNED_PHYSICAL_SEGMENTS];
+    let mut ranges_len = 0usize;
+    for segment in segments.iter().copied() {
+        let end = segment
+            .paddr
+            .checked_add(segment.len)
+            .ok_or(VfsError::InvalidInput)?;
+        total = total
+            .checked_add(segment.len)
+            .ok_or(VfsError::InvalidInput)?;
+        if mutable && segment.len != 0 {
+            ranges[ranges_len] = (segment.paddr, end);
+            ranges_len += 1;
+        }
+    }
+    if mutable {
+        let ranges = &mut ranges[..ranges_len];
+        ranges.sort_unstable_by_key(|range| range.0);
+        if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(VfsError::InvalidInput);
+        }
+    }
+    Ok(total)
+}
+
+fn try_zeroed_pinned_io_bounce(len: usize) -> VfsResult<Vec<u8>> {
+    let mut bounce = Vec::new();
+    bounce
+        .try_reserve_exact(len)
+        .map_err(|_| VfsError::NoMemory)?;
+    bounce.resize(len, 0);
+    Ok(bounce)
+}
+
+struct PinnedPhysicalCursor<'a> {
+    segments: &'a [PinnedPhysicalSegment],
+    index: usize,
+    offset: usize,
+}
+
+impl<'a> PinnedPhysicalCursor<'a> {
+    fn new(segments: &'a [PinnedPhysicalSegment]) -> Self {
+        Self {
+            segments,
+            index: 0,
+            offset: 0,
+        }
+    }
+
+    fn take(&mut self, limit: usize) -> Option<(usize, usize)> {
+        while let Some(segment) = self.segments.get(self.index).copied() {
+            if self.offset == segment.len {
+                self.index += 1;
+                self.offset = 0;
+                continue;
+            }
+            let len = limit.min(segment.len - self.offset);
+            let paddr = segment.paddr + self.offset;
+            self.offset += len;
+            return Some((paddr, len));
+        }
+        None
+    }
+}
+
+unsafe fn copy_from_pinned_physical_segments(
+    cursor: &mut PinnedPhysicalCursor<'_>,
+    dst: &mut [u8],
+) -> VfsResult<()> {
+    let mut copied = 0usize;
+    while copied < dst.len() {
+        let (paddr, len) = cursor
+            .take(dst.len() - copied)
+            .ok_or(VfsError::InvalidInput)?;
+        let src = physical_to_virtual(PhysAddr::from(paddr)).as_ptr();
+        unsafe { core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr().add(copied), len) };
+        copied += len;
+    }
+    Ok(())
+}
+
+unsafe fn copy_to_pinned_physical_segments(
+    cursor: &mut PinnedPhysicalCursor<'_>,
+    src: &[u8],
+) -> VfsResult<()> {
+    let mut copied = 0usize;
+    while copied < src.len() {
+        let (paddr, len) = cursor
+            .take(src.len() - copied)
+            .ok_or(VfsError::InvalidInput)?;
+        let dst = physical_to_virtual(PhysAddr::from(paddr)).as_mut_ptr();
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr().add(copied), dst, len) };
+        copied += len;
+    }
+    Ok(())
+}
+
+unsafe fn read_file_into_pinned_bounce(
+    file: &FileNode,
+    dst: &[PinnedPhysicalSegment],
+    offset: u64,
+    len: usize,
+) -> VfsResult<usize> {
+    let mut cursor = PinnedPhysicalCursor::new(dst);
+    let mut bounce = try_zeroed_pinned_io_bounce(ALIGNED_BYPASS_CHUNK.min(len).max(1))?;
+    let mut total = 0usize;
+    while total < len {
+        let limit = (len - total).min(bounce.len());
+        let current = offset
+            .checked_add(total as u64)
+            .ok_or(VfsError::InvalidInput)?;
+        let read = match file.read_at(&mut bounce[..limit], current) {
+            Ok(read) => read,
+            Err(_) if total != 0 => break,
+            Err(error) => return Err(error),
+        };
+        if read == 0 {
+            break;
+        }
+        unsafe { copy_to_pinned_physical_segments(&mut cursor, &bounce[..read])? };
+        total += read;
+        if read < limit {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+unsafe fn write_file_from_pinned_bounce(
+    file: &FileNode,
+    src: &[PinnedPhysicalSegment],
+    offset: u64,
+    len: usize,
+) -> VfsResult<usize> {
+    let mut cursor = PinnedPhysicalCursor::new(src);
+    let mut bounce = try_zeroed_pinned_io_bounce(ALIGNED_BYPASS_CHUNK.min(len).max(1))?;
+    let mut total = 0usize;
+    while total < len {
+        let limit = (len - total).min(bounce.len());
+        unsafe { copy_from_pinned_physical_segments(&mut cursor, &mut bounce[..limit])? };
+        let current = offset
+            .checked_add(total as u64)
+            .ok_or(VfsError::InvalidInput)?;
+        let written = match file.write_at(&bounce[..limit], current) {
+            Ok(written) => written,
+            Err(_) if total != 0 => break,
+            Err(error) => return Err(error),
+        };
+        if written == 0 {
+            break;
+        }
+        total += written;
+        if written < limit {
+            break;
+        }
+    }
+    Ok(total)
+}
+
 /// A single page-sized cache entry backed by a physical page.
 #[derive(Debug)]
 pub struct PageCache {
@@ -1327,7 +1622,7 @@ impl PageCache {
 
     /// Returns the physical address of this page.
     pub fn paddr(&self) -> PhysAddr {
-        virt_to_phys(self.addr)
+        virtual_to_physical(self.addr)
     }
 
     /// Marks this page as dirty so it will be flushed on eviction.
@@ -1421,6 +1716,7 @@ impl Drop for PageCache {
 pub struct CachedFilePagePin {
     cache: CachedFile,
     pn: u32,
+    dirty_on_release: bool,
 }
 
 impl Drop for CachedFilePagePin {
@@ -1433,54 +1729,170 @@ impl Drop for CachedFilePagePin {
             );
             return;
         };
+        if self.dirty_on_release {
+            page.mark_dirty();
+        }
         page.unpin();
+        drop(guard);
+        if self.dirty_on_release {
+            retain_cached_file_writeback_anchor_if_dirty(&self.cache.inner, &self.cache.shared);
+        }
     }
 }
 
 /// A conservative preparation window for file-backed user I/O pins.
 pub struct CachedFilePinWindow {
-    shared: Arc<CachedFileShared>,
+    cache: CachedFile,
 }
 
 impl Drop for CachedFilePinWindow {
     fn drop(&mut self) {
-        self.shared
-            .user_io_pin_windows
-            .fetch_sub(1, Ordering::AcqRel);
+        let mut admission = self.cache.shared.user_io_pin_admission.lock();
+        assert!(
+            admission.pin_windows != 0,
+            "cached-file pin-window underflow"
+        );
+        admission.pin_windows -= 1;
     }
 }
 
-type EvictListenerFn = Arc<dyn Fn(u32, &PageCache) + Send + Sync>;
-
-fn evict_listeners_snapshot(shared: &CachedFileShared) -> Vec<EvictListenerFn> {
-    shared
-        .evict_listeners
-        .lock()
-        .iter()
-        .map(|listener| listener.listener.clone())
-        .collect()
+#[derive(Default)]
+struct CachedFilePinAdmission {
+    cache_users: usize,
+    pin_windows: usize,
+    invalidating: bool,
 }
 
-fn writeback_cached_page(
-    shared: &CachedFileShared,
-    file: &FileNode,
-    pn: u32,
-    page: &mut PageCache,
-) -> VfsResult<bool> {
-    let listeners = evict_listeners_snapshot(shared);
-    let had_evict_listener = !listeners.is_empty();
-    for listener in listeners {
-        listener(pn, page);
+/// Shared admission for ordinary page-cache users that may need an LRU slot.
+struct CachedFileCacheUserGuard {
+    shared: Arc<CachedFileShared>,
+}
+
+impl Drop for CachedFileCacheUserGuard {
+    fn drop(&mut self) {
+        let mut admission = self.shared.user_io_pin_admission.lock();
+        assert!(
+            admission.cache_users != 0,
+            "cached-file user-count underflow"
+        );
+        admission.cache_users -= 1;
     }
-    if page.dirty {
-        let page_start = pn as u64 * PAGE_SIZE as u64;
-        let len = (file.len()?.saturating_sub(page_start)).min(PAGE_SIZE as u64) as usize;
-        if len > 0 {
-            file.write_at(&page.data()[..len], page_start)?;
+}
+
+/// Serializes a cache-invalidating file mutation with user-I/O pin admission.
+///
+/// Existing precise page pins are checked separately before the inode mutation
+/// is committed. While this guard is alive, new preparation windows and page
+/// pins fail without observing a half-published cache transition.
+struct CachedFileMutationGuard {
+    shared: Arc<CachedFileShared>,
+}
+
+impl Drop for CachedFileMutationGuard {
+    fn drop(&mut self) {
+        let mut admission = self.shared.user_io_pin_admission.lock();
+        debug_assert!(
+            admission.invalidating,
+            "ending inactive cached-file mutation"
+        );
+        admission.invalidating = false;
+    }
+}
+
+/// Stable identity of one address space that consumes cache-eviction notices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CachedFileEvictionOwner(NonZeroUsize);
+
+impl CachedFileEvictionOwner {
+    /// Creates an owner key from a stable nonzero address-space identity.
+    pub const fn new(key: usize) -> Option<Self> {
+        match NonZeroUsize::new(key) {
+            Some(key) => Some(Self(key)),
+            None => None,
         }
-        page.clear_dirty();
     }
-    Ok(had_evict_listener)
+
+    /// Returns the underlying identity value.
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+type EvictListenerFn = Arc<dyn Fn(u32, &PageCache) -> bool + Send + Sync>;
+
+#[derive(Clone)]
+struct EvictListenerSnapshot {
+    owner: CachedFileEvictionOwner,
+    listener: EvictListenerFn,
+}
+
+fn evict_listeners_snapshot(shared: &CachedFileShared) -> VfsResult<Vec<EvictListenerSnapshot>> {
+    let listeners = shared.evict_listeners.lock();
+    let mut snapshot = Vec::new();
+    snapshot
+        .try_reserve_exact(listeners.iter().count())
+        .map_err(|_| VfsError::NoMemory)?;
+    for listener in listeners.iter() {
+        snapshot.push(EvictListenerSnapshot {
+            owner: listener.owner,
+            listener: listener.listener.clone(),
+        });
+    }
+    Ok(snapshot)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EvictionAcknowledgement {
+    had_listener: bool,
+    deferred: bool,
+}
+
+fn acknowledge_cached_page_eviction_with_listeners(
+    listeners: &[EvictListenerSnapshot],
+    pn: u32,
+    page: &PageCache,
+    allowed_deferred_owner: Option<CachedFileEvictionOwner>,
+) -> VfsResult<EvictionAcknowledgement> {
+    let mut acknowledgement = EvictionAcknowledgement {
+        had_listener: !listeners.is_empty(),
+        deferred: false,
+    };
+    for listener in listeners {
+        if (listener.listener)(pn, page) {
+            continue;
+        }
+        if Some(listener.owner) != allowed_deferred_owner {
+            return Err(VfsError::ResourceBusy);
+        }
+        acknowledgement.deferred = true;
+    }
+    Ok(acknowledgement)
+}
+
+#[cfg(test)]
+fn acknowledge_cached_page_eviction(
+    shared: &CachedFileShared,
+    pn: u32,
+    page: &PageCache,
+    allowed_deferred_owner: Option<CachedFileEvictionOwner>,
+) -> VfsResult<EvictionAcknowledgement> {
+    let listeners = evict_listeners_snapshot(shared)?;
+    acknowledge_cached_page_eviction_with_listeners(&listeners, pn, page, allowed_deferred_owner)
+}
+
+fn writeback_cached_page_data(file: &FileNode, pn: u32, page: &mut PageCache) -> VfsResult<usize> {
+    if !page.dirty {
+        return Ok(0);
+    }
+    let page_start = pn as u64 * PAGE_SIZE as u64;
+    let len = (file.len()?.saturating_sub(page_start)).min(PAGE_SIZE as u64) as usize;
+    if len == 0 {
+        return Ok(0);
+    }
+    match file.write_at(&page.data()[..len], page_start)? {
+        written if written == len => Ok(written),
+        _ => Err(VfsError::Io),
+    }
 }
 
 struct DirtyWritebackPage {
@@ -1559,8 +1971,10 @@ fn copy_dirty_writeback_run(
     guard: &mut LruCache<u32, PageCache>,
     dirty_pages: &[u32],
     file_len: u64,
-) -> Option<DirtyWritebackRun> {
-    let first_pn = *dirty_pages.first()?;
+) -> VfsResult<Option<DirtyWritebackRun>> {
+    let Some(first_pn) = dirty_pages.first().copied() else {
+        return Ok(None);
+    };
     let page_start = first_pn as u64 * PAGE_SIZE as u64;
     let max_len = file_len
         .saturating_sub(page_start)
@@ -1571,17 +1985,19 @@ fn copy_dirty_writeback_run(
                 page.clear_dirty();
             }
         }
-        return None;
+        return Ok(None);
     }
 
-    let listeners = evict_listeners_snapshot(shared);
+    let listeners = evict_listeners_snapshot(shared)?;
     let mut pages: Vec<DirtyWritebackPage> = Vec::with_capacity(dirty_pages.len());
     for (idx, pn) in dirty_pages.iter().enumerate() {
         let Some(page) = guard.get_mut(pn) else {
             continue;
         };
         for listener in &listeners {
-            listener(*pn, page);
+            if !(listener.listener)(*pn, page) {
+                return Err(VfsError::ResourceBusy);
+            }
         }
         let dst_start = idx * PAGE_SIZE;
         if dst_start >= max_len {
@@ -1593,11 +2009,11 @@ fn copy_dirty_writeback_run(
         pages.push(DirtyWritebackPage { pn: *pn, data });
     }
 
-    (!pages.is_empty()).then_some(DirtyWritebackRun {
+    Ok((!pages.is_empty()).then_some(DirtyWritebackRun {
         page_start,
         bytes: max_len,
         pages,
-    })
+    }))
 }
 
 fn begin_sg_dirty_writeback_run(
@@ -1787,10 +2203,6 @@ fn record_readahead_hit() {
     record_cached_file_counter(&READAHEAD_HITS, 1);
 }
 
-fn record_readahead_pressure_skip() {
-    record_cached_file_counter(&READAHEAD_PRESSURE_SKIPS, 1);
-}
-
 fn record_readahead_retired_unused_page() {
     record_cached_file_counter(&READAHEAD_RETIRED_UNUSED_PAGES, 1);
 }
@@ -1901,7 +2313,7 @@ fn flush_dirty_page_list_locked(
         let run = {
             let mut guard = shared.page_cache.lock();
             copy_dirty_writeback_run(shared, &mut guard, &dirty_pages[start..end], file_len)
-        };
+        }?;
         let Some(run) = run else {
             start = end;
             continue;
@@ -1960,8 +2372,10 @@ fn flush_dirty_cache_shared(shared: &CachedFileShared, file: &FileNode) -> VfsRe
 }
 
 /// A page evicted while inserting a new cached file page.
+#[must_use = "deferred eviction pages must remain owned until PTE detachment"]
 pub struct EvictedPage {
     pn: u32,
+    deferred_owner: Option<CachedFileEvictionOwner>,
     _page: Option<PageCache>,
 }
 
@@ -1969,6 +2383,11 @@ impl EvictedPage {
     /// Returns the file page number that was evicted.
     pub fn page_number(&self) -> u32 {
         self.pn
+    }
+
+    /// Returns the address-space owner whose listener deferred detachment.
+    pub fn deferred_owner(&self) -> Option<CachedFileEvictionOwner> {
+        self.deferred_owner
     }
 }
 
@@ -1992,6 +2411,7 @@ fn in_memory_page_cache_capacity() -> NonZeroUsize {
 }
 
 struct EvictListener {
+    owner: CachedFileEvictionOwner,
     listener: EvictListenerFn,
     link: LinkedListAtomicLink,
 }
@@ -2006,7 +2426,7 @@ struct CachedFileShared {
     evict_listeners: Mutex<LinkedList<EvictListenerAdapter>>,
     unlinked: AtomicBool,
     open_handles: AtomicUsize,
-    user_io_pin_windows: AtomicUsize,
+    user_io_pin_admission: Mutex<CachedFilePinAdmission>,
     /// Serializes cached page-cache users with direct-I/O cache drains.
     direct_io_lock: RwLock<()>,
     /// Serializes dirty writeback with truncate/cache length transitions.
@@ -2028,10 +2448,163 @@ impl CachedFileShared {
             evict_listeners: Mutex::new(LinkedList::default()),
             unlinked: AtomicBool::new(false),
             open_handles: AtomicUsize::new(0),
-            user_io_pin_windows: AtomicUsize::new(0),
+            user_io_pin_admission: Mutex::new(CachedFilePinAdmission::default()),
             direct_io_lock: RwLock::new(()),
             writeback_lock: RwLock::new(()),
             append_lock: RwLock::new(()),
+        }
+    }
+}
+
+struct CachedPageInvalidationTransaction {
+    shared: Arc<CachedFileShared>,
+    pages: Vec<(u32, PageCache)>,
+    committed: bool,
+}
+
+impl CachedPageInvalidationTransaction {
+    fn new(mutation: &CachedFileMutationGuard) -> Self {
+        Self {
+            shared: mutation.shared.clone(),
+            pages: Vec::new(),
+            committed: false,
+        }
+    }
+
+    fn stage_all(&mut self) -> VfsResult<()> {
+        let mut cache = self.shared.page_cache.lock();
+        if cache.iter().any(|(_, page)| page.is_pinned()) {
+            return Err(VfsError::ResourceBusy);
+        }
+        let listeners = evict_listeners_snapshot(&self.shared)?;
+        self.pages
+            .try_reserve_exact(cache.len())
+            .map_err(|_| VfsError::NoMemory)?;
+        while let Some((pn, page)) = cache.pop_lru() {
+            self.pages.push((pn, page));
+        }
+        drop(cache);
+        self.acknowledge_staged_pages(&listeners)
+    }
+
+    fn stage_range(&mut self, pages: Range<u32>) -> VfsResult<usize> {
+        let mut cache = self.shared.page_cache.lock();
+        let listeners = evict_listeners_snapshot(&self.shared)?;
+        let mut keys = Vec::new();
+        keys.try_reserve_exact(cache.len())
+            .map_err(|_| VfsError::NoMemory)?;
+        for pn in pages {
+            if cache.contains(&pn) {
+                keys.push(pn);
+            }
+        }
+        if keys
+            .iter()
+            .any(|pn| cache.get(pn).is_some_and(PageCache::is_pinned))
+        {
+            return Err(VfsError::ResourceBusy);
+        }
+        self.pages
+            .try_reserve_exact(keys.len())
+            .map_err(|_| VfsError::NoMemory)?;
+        for pn in keys {
+            if let Some(page) = cache.pop(&pn) {
+                self.pages.push((pn, page));
+            }
+        }
+        let count = self.pages.len();
+        drop(cache);
+        self.acknowledge_staged_pages(&listeners)?;
+        Ok(count)
+    }
+
+    fn stage_from(&mut self, first_page: u64) -> VfsResult<usize> {
+        let mut cache = self.shared.page_cache.lock();
+        let listeners = evict_listeners_snapshot(&self.shared)?;
+        let mut keys = Vec::new();
+        keys.try_reserve_exact(cache.len())
+            .map_err(|_| VfsError::NoMemory)?;
+        for (pn, _) in cache.iter() {
+            if u64::from(*pn) >= first_page {
+                keys.push(*pn);
+            }
+        }
+        if keys
+            .iter()
+            .any(|pn| cache.get(pn).is_some_and(PageCache::is_pinned))
+        {
+            return Err(VfsError::ResourceBusy);
+        }
+        self.pages
+            .try_reserve_exact(keys.len())
+            .map_err(|_| VfsError::NoMemory)?;
+        for pn in keys {
+            if let Some(page) = cache.pop(&pn) {
+                self.pages.push((pn, page));
+            }
+        }
+        let count = self.pages.len();
+        drop(cache);
+        self.acknowledge_staged_pages(&listeners)?;
+        Ok(count)
+    }
+
+    fn acknowledge_staged_pages(&self, listeners: &[EvictListenerSnapshot]) -> VfsResult<()> {
+        for (pn, page) in &self.pages {
+            acknowledge_cached_page_eviction_with_listeners(listeners, *pn, page, None)?;
+        }
+        Ok(())
+    }
+
+    fn writeback(&mut self, file: &FileNode, range_flush: bool) -> VfsResult<()> {
+        for (pn, page) in &mut self.pages {
+            let written = writeback_cached_page_data(file, *pn, page)?;
+            if written != 0 {
+                record_dirty_writeback(range_flush, 1, written, false);
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_staged_page(&mut self, pn: u32, update: impl FnOnce(&mut PageCache)) -> bool {
+        let Some(index) = self
+            .pages
+            .iter()
+            .position(|(staged_pn, _)| *staged_pn == pn)
+        else {
+            return false;
+        };
+        let (staged_pn, mut page) = self.pages.swap_remove(index);
+        update(&mut page);
+        let mut cache = self.shared.page_cache.lock();
+        assert!(
+            cache.put(staged_pn, page).is_none(),
+            "restoring a retained truncate page replaced page {staged_pn}"
+        );
+        cache.demote(&staged_pn);
+        true
+    }
+
+    fn commit_discard(mut self) {
+        for (_, page) in &mut self.pages {
+            page.clear_dirty();
+        }
+        self.committed = true;
+    }
+}
+
+impl Drop for CachedPageInvalidationTransaction {
+    fn drop(&mut self) {
+        if self.committed || self.pages.is_empty() {
+            return;
+        }
+        let mut cache = self.shared.page_cache.lock();
+        for (pn, page) in self.pages.drain(..).rev() {
+            assert!(
+                cache.put(pn, page).is_none(),
+                "cache invalidation rollback replaced page {pn}"
+            );
+            cache.demote(&pn);
         }
     }
 }
@@ -2183,13 +2756,19 @@ impl CachedFile {
     /// While this window is active, direct cache-draining I/O and LRU evictions
     /// are conservatively rejected for this cached file. Precise page pins take
     /// over once the caller has identified the exact cached pages.
-    pub fn begin_user_io_pin_window(&self) -> CachedFilePinWindow {
-        self.shared
-            .user_io_pin_windows
-            .fetch_add(1, Ordering::AcqRel);
-        CachedFilePinWindow {
-            shared: self.shared.clone(),
+    pub fn begin_user_io_pin_window(&self) -> VfsResult<CachedFilePinWindow> {
+        let mut admission = self.shared.user_io_pin_admission.lock();
+        if admission.invalidating || admission.cache_users != 0 {
+            return Err(VfsError::ResourceBusy);
         }
+        admission.pin_windows = admission
+            .pin_windows
+            .checked_add(1)
+            .ok_or(VfsError::NoMemory)?;
+        drop(admission);
+        Ok(CachedFilePinWindow {
+            cache: self.clone(),
+        })
     }
 
     /// Pins an already cached page if it still maps to `paddr`.
@@ -2197,8 +2776,15 @@ impl CachedFile {
         &self,
         pn: u32,
         paddr: PhysAddr,
+        dirty_on_release: bool,
     ) -> VfsResult<CachedFilePagePin> {
-        let mut guard = self.shared.page_cache.lock();
+        let admission = self.shared.user_io_pin_admission.lock();
+        if admission.invalidating || admission.cache_users != 0 {
+            return Err(VfsError::ResourceBusy);
+        }
+        let Some(mut guard) = self.shared.page_cache.try_lock() else {
+            return Err(VfsError::ResourceBusy);
+        };
         let Some(page) = guard.get_mut(&pn) else {
             return Err(VfsError::BadAddress);
         };
@@ -2209,7 +2795,59 @@ impl CachedFile {
         Ok(CachedFilePagePin {
             cache: self.clone(),
             pn,
+            dirty_on_release,
         })
+    }
+
+    fn begin_cache_invalidating_mutation(&self) -> VfsResult<CachedFileMutationGuard> {
+        Self::begin_shared_cache_invalidating_mutation(&self.shared)
+    }
+
+    fn begin_cache_user(&self) -> VfsResult<CachedFileCacheUserGuard> {
+        let mut admission = self.shared.user_io_pin_admission.lock();
+        if admission.invalidating || admission.pin_windows != 0 {
+            return Err(VfsError::ResourceBusy);
+        }
+        admission.cache_users = admission
+            .cache_users
+            .checked_add(1)
+            .ok_or(VfsError::NoMemory)?;
+        drop(admission);
+        Ok(CachedFileCacheUserGuard {
+            shared: self.shared.clone(),
+        })
+    }
+
+    fn begin_shared_cache_invalidating_mutation(
+        shared: &Arc<CachedFileShared>,
+    ) -> VfsResult<CachedFileMutationGuard> {
+        let mut admission = shared.user_io_pin_admission.lock();
+        if admission.invalidating || admission.cache_users != 0 || admission.pin_windows != 0 {
+            return Err(VfsError::ResourceBusy);
+        }
+        admission.invalidating = true;
+        drop(admission);
+        Ok(CachedFileMutationGuard {
+            shared: shared.clone(),
+        })
+    }
+
+    fn admit_truncate(&self, old_len: u64, new_len: u64) -> VfsResult<()> {
+        if new_len >= old_len {
+            return Ok(());
+        }
+        let guard = self.shared.page_cache.lock();
+        let overlaps_pinned_page = guard.iter().any(|(pn, page)| {
+            let page_end = u64::from(*pn)
+                .saturating_add(1)
+                .saturating_mul(PAGE_SIZE as u64);
+            page_end > new_len && page.is_pinned()
+        });
+        if overlaps_pinned_page {
+            Err(VfsError::ResourceBusy)
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns `true` if this file is backed by an in-memory filesystem (e.g. tmpfs).
@@ -2221,11 +2859,12 @@ impl CachedFile {
     ///
     /// Returns a handle that can later be passed to
     /// [`remove_evict_listener`](Self::remove_evict_listener).
-    pub fn add_evict_listener<F>(&self, listener: F) -> usize
+    pub fn add_evict_listener<F>(&self, owner: CachedFileEvictionOwner, listener: F) -> usize
     where
-        F: Fn(u32, &PageCache) + Send + Sync + 'static,
+        F: Fn(u32, &PageCache) -> bool + Send + Sync + 'static,
     {
         let pointer = Box::new(EvictListener {
+            owner,
             listener: Arc::new(listener),
             link: LinkedListAtomicLink::new(),
         });
@@ -2244,35 +2883,37 @@ impl CachedFile {
         cursor.remove();
     }
 
-    fn evict_cache(&self, file: &FileNode, pn: u32, page: &mut PageCache) -> VfsResult<bool> {
+    fn evict_cache(
+        &self,
+        file: &FileNode,
+        listeners: &[EvictListenerSnapshot],
+        pn: u32,
+        page: &mut PageCache,
+        allowed_deferred_owner: Option<CachedFileEvictionOwner>,
+    ) -> VfsResult<EvictionAcknowledgement> {
         if page.is_pinned() {
             return Err(VfsError::ResourceBusy);
         }
-        writeback_cached_page(&self.shared, file, pn, page)
-    }
-
-    fn pop_lru_page(&self) -> VfsResult<Option<(u32, PageCache)>> {
-        pop_unpinned_lru_page(&mut self.shared.page_cache.lock())
-    }
-
-    fn pop_cached_page(&self, pn: u32) -> VfsResult<Option<PageCache>> {
-        let mut guard = self.shared.page_cache.lock();
-        if guard.get(&pn).is_some_and(PageCache::is_pinned) {
-            return Err(VfsError::ResourceBusy);
-        }
-        Ok(guard.pop(&pn))
+        let acknowledgement = acknowledge_cached_page_eviction_with_listeners(
+            listeners,
+            pn,
+            page,
+            allowed_deferred_owner,
+        )?;
+        let _ = writeback_cached_page_data(file, pn, page)?;
+        page.clear_dirty();
+        Ok(acknowledgement)
     }
 
     fn drain_cache(&self, file: &FileNode) -> VfsResult<()> {
-        self.flush_dirty_cache(file)?;
-        while let Some((pn, mut page)) = self.pop_lru_page()? {
-            let _ = self.evict_cache(file, pn, &mut page)?;
-        }
-        Ok(())
+        let _ = file;
+        let _direct_guard = self.shared.direct_io_lock.write();
+        let mutation = self.begin_cache_invalidating_mutation()?;
+        sync_and_invalidate_cached_file_pages_locked(&self.inner, &self.shared, &mutation)
     }
 
-    fn discard_cache(&self) {
-        discard_cached_pages(&self.shared);
+    fn discard_cache(&self) -> VfsResult<()> {
+        discard_cached_pages(&self.shared)
     }
 
     fn sync_in_memory_cache(&self) {
@@ -2286,16 +2927,6 @@ impl CachedFile {
 
     fn flush_dirty_cache(&self, file: &FileNode) -> VfsResult<()> {
         flush_dirty_cache_shared(&self.shared, file)
-    }
-
-    fn flush_dirty_cache_range(&self, file: &FileNode, pages: Range<u32>) -> VfsResult<()> {
-        let dirty_pages = {
-            let mut guard = self.shared.page_cache.lock();
-            pages
-                .filter(|pn| guard.get(pn).is_some_and(PageCache::is_dirty))
-                .collect::<Vec<_>>()
-        };
-        flush_dirty_page_list(&self.shared, file, dirty_pages, true)
     }
 
     fn aligned_page_range(offset: u64, len: usize) -> Option<Range<u32>> {
@@ -2312,17 +2943,16 @@ impl CachedFile {
         pages.clone().any(|pn| guard.contains(&pn))
     }
 
-    fn invalidate_cached_range(&self, file: &FileNode, pages: Range<u32>) -> VfsResult<usize> {
-        let keys = {
-            let guard = self.shared.page_cache.lock();
-            pages.filter(|pn| guard.contains(pn)).collect::<Vec<_>>()
-        };
-        let count = keys.len();
-        for pn in keys {
-            if let Some(mut page) = self.pop_cached_page(pn)? {
-                let _ = self.evict_cache(file, pn, &mut page)?;
-            }
-        }
+    fn invalidate_cached_range(
+        &self,
+        file: &FileNode,
+        pages: Range<u32>,
+        mutation: &CachedFileMutationGuard,
+    ) -> VfsResult<usize> {
+        let mut invalidation = CachedPageInvalidationTransaction::new(mutation);
+        let count = invalidation.stage_range(pages)?;
+        invalidation.writeback(file, true)?;
+        invalidation.commit_discard();
         record_cached_file_counter(&RANGE_INVALIDATE_PAGES, count as u64);
         Ok(count)
     }
@@ -2344,6 +2974,11 @@ impl CachedFile {
         record_cached_file_counter(&READ_BYPASS_ELIGIBLE, 1);
 
         let _direct_guard = self.shared.direct_io_lock.write();
+        let _mutation = match self.begin_cache_invalidating_mutation() {
+            Ok(mutation) => mutation,
+            Err(VfsError::ResourceBusy) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         if self.range_has_cached_page(&pages) {
             record_cached_file_counter(&READ_BYPASS_REJECT_CACHED, 1);
             return Ok(None);
@@ -2357,16 +2992,28 @@ impl CachedFile {
             let limit = (len - total).min(chunk.len()).min(dst.remaining_mut());
             let async_read = {
                 let mut bufs = [&mut chunk[..limit]];
-                file.try_read_at_vectored_async(&mut bufs, current)?
+                match file.try_read_at_vectored_async(&mut bufs, current) {
+                    Ok(read) => read,
+                    Err(_) if total != 0 => break,
+                    Err(error) => return Err(error),
+                }
             };
             let read = match async_read {
                 Some(read) => read,
-                None => file.read_at(&mut chunk[..limit], current)?,
+                None => match file.read_at(&mut chunk[..limit], current) {
+                    Ok(read) => read,
+                    Err(_) if total != 0 => break,
+                    Err(error) => return Err(error),
+                },
             };
             if read == 0 {
                 break;
             }
-            let written = dst.write(&chunk[..read])?;
+            let written = match dst.write(&chunk[..read]) {
+                Ok(written) => written,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
             if written == 0 {
                 break;
             }
@@ -2401,6 +3048,11 @@ impl CachedFile {
         record_cached_file_counter(&READ_BYPASS_ELIGIBLE, 1);
 
         let _direct_guard = self.shared.direct_io_lock.write();
+        let _mutation = match self.begin_cache_invalidating_mutation() {
+            Ok(mutation) => mutation,
+            Err(VfsError::ResourceBusy) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         if self.range_has_cached_page(&pages) {
             record_cached_file_counter(&READ_BYPASS_REJECT_CACHED, 1);
             return Ok(None);
@@ -2443,6 +3095,11 @@ impl CachedFile {
         record_cached_file_counter(&READ_BYPASS_ELIGIBLE, 1);
 
         let _direct_guard = self.shared.direct_io_lock.write();
+        let _mutation = match self.begin_cache_invalidating_mutation() {
+            Ok(mutation) => mutation,
+            Err(VfsError::ResourceBusy) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         if self.range_has_cached_page(&pages) {
             record_cached_file_counter(&READ_BYPASS_REJECT_CACHED, 1);
             return Ok(None);
@@ -2453,6 +3110,51 @@ impl CachedFile {
             Some(read) => read,
             None => file.read_at_vectored(dst, offset)?,
         };
+        if read > 0 {
+            record_cached_file_counter(&READ_BYPASS_HITS, 1);
+            record_cached_file_counter(&READ_BYPASS_BYTES, read as u64);
+            record_cached_file_counter(&READ_BYPASS_SLICE_HITS, 1);
+            record_cached_file_counter(&READ_BYPASS_SLICE_BYTES, read as u64);
+        } else {
+            record_cached_file_counter(&READ_BYPASS_EOF_RACES, 1);
+        }
+        Ok(Some(read))
+    }
+
+    fn try_read_aligned_pinned_bypass(
+        &self,
+        dst: &[PinnedPhysicalSegment],
+        offset: u64,
+        len: usize,
+        _try_async: bool,
+    ) -> VfsResult<Option<usize>> {
+        if self.in_memory {
+            record_cached_file_counter(&READ_BYPASS_REJECT_IN_MEMORY, 1);
+            return Ok(None);
+        }
+        let Some(pages) = Self::aligned_page_range(offset, len) else {
+            record_cached_file_counter(&READ_BYPASS_REJECT_UNALIGNED, 1);
+            return Ok(None);
+        };
+        record_cached_file_counter(&READ_BYPASS_ELIGIBLE, 1);
+
+        // Cache invalidation and pin admission must exclude cached aliases
+        // before the raw copy into caller-pinned memory starts.
+        let _direct_guard = self.shared.direct_io_lock.write();
+        let _mutation = match self.begin_cache_invalidating_mutation() {
+            Ok(mutation) => mutation,
+            Err(VfsError::ResourceBusy) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if self.range_has_cached_page(&pages) {
+            record_cached_file_counter(&READ_BYPASS_REJECT_CACHED, 1);
+            return Ok(None);
+        }
+
+        let file = self.inner.entry().as_file()?;
+        // Pinned user pages remain concurrently accessible from userspace.
+        // Keep Rust references confined to kernel-owned bounce storage.
+        let read = unsafe { read_file_into_pinned_bounce(file, dst, offset, len) }?;
         if read > 0 {
             record_cached_file_counter(&READ_BYPASS_HITS, 1);
             record_cached_file_counter(&READ_BYPASS_BYTES, read as u64);
@@ -2481,24 +3183,41 @@ impl CachedFile {
         record_cached_file_counter(&WRITE_BYPASS_ELIGIBLE, 1);
 
         let _direct_guard = self.shared.direct_io_lock.write();
-        if self.shared.user_io_pin_windows.load(Ordering::Acquire) != 0 {
-            return Ok(None);
-        }
+        let _writeback_guard = self.shared.writeback_lock.write();
+        let mutation = match self.begin_cache_invalidating_mutation() {
+            Ok(mutation) => mutation,
+            Err(VfsError::ResourceBusy) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let _append_guard = self.shared.append_lock.read();
         let file = self.inner.entry().as_file()?;
-        self.flush_dirty_cache_range(file, pages.clone())?;
-        self.invalidate_cached_range(file, pages.clone())?;
+        match self.invalidate_cached_range(file, pages.clone(), &mutation) {
+            Ok(_) => {}
+            // A source backed by one of the target cache pages carries a
+            // precise page pin. Keep that page resident and let the cached
+            // overlap-aware path below move it through a bounce buffer.
+            Err(VfsError::ResourceBusy) => return Ok(None),
+            Err(error) => return Err(error),
+        }
 
         let mut total = 0;
         let mut current = offset;
         let mut chunk = vec![0_u8; ALIGNED_BYPASS_CHUNK.min(len).max(PAGE_SIZE)];
         while total < len && src.remaining() > 0 {
             let limit = (len - total).min(chunk.len()).min(src.remaining());
-            let read = src.read(&mut chunk[..limit])?;
+            let read = match src.read(&mut chunk[..limit]) {
+                Ok(read) => read,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
             if read == 0 {
                 break;
             }
-            let written = file.write_at(&chunk[..read], current)?;
+            let written = match file.write_at(&chunk[..read], current) {
+                Ok(written) => written,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
             if written == 0 {
                 break;
             }
@@ -2509,7 +3228,7 @@ impl CachedFile {
             }
         }
 
-        self.invalidate_cached_range(file, pages)?;
+        self.invalidate_cached_range(file, pages, &mutation)?;
         if total > 0 {
             record_cached_file_counter(&WRITE_BYPASS_HITS, 1);
             record_cached_file_counter(&WRITE_BYPASS_BYTES, total as u64);
@@ -2529,17 +3248,19 @@ impl CachedFile {
         record_cached_file_counter(&WRITE_BYPASS_ELIGIBLE, 1);
 
         let _direct_guard = self.shared.direct_io_lock.write();
-        if self.shared.user_io_pin_windows.load(Ordering::Acquire) != 0 {
-            return Ok(None);
-        }
+        let _writeback_guard = self.shared.writeback_lock.write();
+        let mutation = match self.begin_cache_invalidating_mutation() {
+            Ok(mutation) => mutation,
+            Err(VfsError::ResourceBusy) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let _append_guard = self.shared.append_lock.read();
         let file = self.inner.entry().as_file()?;
-        self.flush_dirty_cache_range(file, pages.clone())?;
-        self.invalidate_cached_range(file, pages.clone())?;
+        self.invalidate_cached_range(file, pages.clone(), &mutation)?;
 
         let written = file.write_at(src, offset)?;
 
-        self.invalidate_cached_range(file, pages)?;
+        self.invalidate_cached_range(file, pages, &mutation)?;
         if written > 0 {
             record_cached_file_counter(&WRITE_BYPASS_HITS, 1);
             record_cached_file_counter(&WRITE_BYPASS_BYTES, written as u64);
@@ -2566,20 +3287,71 @@ impl CachedFile {
         record_cached_file_counter(&WRITE_BYPASS_ELIGIBLE, 1);
 
         let _direct_guard = self.shared.direct_io_lock.write();
-        if self.shared.user_io_pin_windows.load(Ordering::Acquire) != 0 {
-            return Ok(None);
-        }
+        let _writeback_guard = self.shared.writeback_lock.write();
+        let mutation = match self.begin_cache_invalidating_mutation() {
+            Ok(mutation) => mutation,
+            Err(VfsError::ResourceBusy) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let _append_guard = self.shared.append_lock.read();
         let file = self.inner.entry().as_file()?;
-        self.flush_dirty_cache_range(file, pages.clone())?;
-        self.invalidate_cached_range(file, pages.clone())?;
+        self.invalidate_cached_range(file, pages.clone(), &mutation)?;
 
         let written = match file.try_write_at_vectored_async(src, offset)? {
             Some(written) => written,
             None => file.write_at_vectored(src, offset)?,
         };
 
-        self.invalidate_cached_range(file, pages)?;
+        self.invalidate_cached_range(file, pages, &mutation)?;
+        if written > 0 {
+            record_cached_file_counter(&WRITE_BYPASS_HITS, 1);
+            record_cached_file_counter(&WRITE_BYPASS_BYTES, written as u64);
+            record_cached_file_counter(&WRITE_BYPASS_SLICE_HITS, 1);
+            record_cached_file_counter(&WRITE_BYPASS_SLICE_BYTES, written as u64);
+        }
+        Ok(Some(written))
+    }
+
+    fn try_write_aligned_pinned_bypass(
+        &self,
+        src: &[PinnedPhysicalSegment],
+        offset: u64,
+        len: usize,
+        _try_async: bool,
+    ) -> VfsResult<Option<usize>> {
+        if self.in_memory {
+            record_cached_file_counter(&WRITE_BYPASS_REJECT_IN_MEMORY, 1);
+            return Ok(None);
+        }
+        let Some(pages) = Self::aligned_page_range(offset, len) else {
+            record_cached_file_counter(&WRITE_BYPASS_REJECT_UNALIGNED, 1);
+            return Ok(None);
+        };
+        record_cached_file_counter(&WRITE_BYPASS_ELIGIBLE, 1);
+
+        // Own the complete invalidation domain before copying from the pinned
+        // source through kernel-owned bounce storage.
+        let _direct_guard = self.shared.direct_io_lock.write();
+        let _writeback_guard = self.shared.writeback_lock.write();
+        let mutation = match self.begin_cache_invalidating_mutation() {
+            Ok(mutation) => mutation,
+            Err(VfsError::ResourceBusy) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let _append_guard = self.shared.append_lock.read();
+        let file = self.inner.entry().as_file()?;
+        match self.invalidate_cached_range(file, pages.clone(), &mutation) {
+            Ok(_) => {}
+            // The physical source may itself be a precisely pinned target
+            // cache page. Preserve it and use the overlap-aware cached path.
+            Err(VfsError::ResourceBusy) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+
+        // Pinned user pages are stable but not Rust-shared or exclusive.
+        let written = unsafe { write_file_from_pinned_bounce(file, src, offset, len) }?;
+
+        self.invalidate_cached_range(file, pages, &mutation)?;
         if written > 0 {
             record_cached_file_counter(&WRITE_BYPASS_HITS, 1);
             record_cached_file_counter(&WRITE_BYPASS_BYTES, written as u64);
@@ -2595,7 +3367,54 @@ impl CachedFile {
         cache: &mut LruCache<u32, PageCache>,
         pn: u32,
     ) -> VfsResult<Option<EvictedPage>> {
-        self.ensure_page_cached_with(file, cache, pn, true)
+        self.ensure_page_cached_with(file, cache, pn, true, true)
+    }
+
+    fn ensure_page_cached_for_owner(
+        &self,
+        file: &FileNode,
+        cache: &mut LruCache<u32, PageCache>,
+        pn: u32,
+        owner: CachedFileEvictionOwner,
+    ) -> VfsResult<Option<EvictedPage>> {
+        if let Some(page) = cache.get_mut(&pn) {
+            page.clear_prefetched();
+            return Ok(None);
+        }
+        if cache.len() < cache.cap().get() {
+            // The owner-aware path is called while an address space owns its
+            // mapping transaction. Keep population synchronous until MM can
+            // drop that lock and range-revalidate after I/O.
+            return self.ensure_page_cached_with(file, cache, pn, true, false);
+        }
+
+        // Load the replacement before touching the resident cache. Once an
+        // owner defers PTE detachment, no fallible work remains between removal
+        // of the old page and returning its ownership to the caller.
+        let mut replacement = PageCache::new()?;
+        replacement.data().fill(0);
+        let offset = u64::from(pn) * PAGE_SIZE as u64;
+        file.read_at(replacement.data(), offset)?;
+
+        let listeners = evict_listeners_snapshot(&self.shared)?;
+        let Some((evicted_pn, mut evicted_page)) = pop_unpinned_lru_page(cache)? else {
+            return Err(VfsError::ResourceBusy);
+        };
+        let acknowledgement =
+            match self.evict_cache(file, &listeners, evicted_pn, &mut evicted_page, Some(owner)) {
+                Ok(acknowledgement) => acknowledgement,
+                Err(error) => {
+                    restore_popped_cache_page(cache, evicted_pn, evicted_page);
+                    return Err(error);
+                }
+            };
+        let retained_page = acknowledgement.deferred.then_some(evicted_page);
+        cache.put(pn, replacement);
+        Ok(Some(EvictedPage {
+            pn: evicted_pn,
+            deferred_owner: acknowledgement.deferred.then_some(owner),
+            _page: retained_page,
+        }))
     }
 
     fn ensure_page_cached_with(
@@ -2604,6 +3423,7 @@ impl CachedFile {
         cache: &mut LruCache<u32, PageCache>,
         pn: u32,
         load_from_file: bool,
+        allow_async_page_fill: bool,
     ) -> VfsResult<Option<EvictedPage>> {
         if let Some(page) = cache.get_mut(&pn) {
             if load_from_file && page.clear_prefetched() {
@@ -2623,17 +3443,26 @@ impl CachedFile {
         // EvictedPage; any further evictions done for readahead below are
         // written back and dropped.
         if cache.len() >= cap {
-            if self.shared.user_io_pin_windows.load(Ordering::Acquire) != 0 {
-                return Err(VfsError::ResourceBusy);
-            }
+            let listeners = evict_listeners_snapshot(&self.shared)?;
             if let Some((epn, mut epage)) = pop_unused_readahead_lru_page(cache) {
-                let _ = self.evict_cache(file, epn, &mut epage)?;
+                if let Err(error) = self.evict_cache(file, &listeners, epn, &mut epage, None) {
+                    restore_popped_cache_page(cache, epn, epage);
+                    return Err(error);
+                }
             } else if let Some((epn, mut epage)) = pop_unpinned_lru_page(cache)? {
-                let retain_page = self.evict_cache(file, epn, &mut epage)?;
-                let page = retain_page.then_some(epage);
+                let acknowledgement =
+                    match self.evict_cache(file, &listeners, epn, &mut epage, None) {
+                        Ok(acknowledgement) => acknowledgement,
+                        Err(error) => {
+                            restore_popped_cache_page(cache, epn, epage);
+                            return Err(error);
+                        }
+                    };
+                debug_assert!(!acknowledgement.deferred);
                 evicted = Some(EvictedPage {
                     pn: epn,
-                    _page: page,
+                    deferred_owner: None,
+                    _page: None,
                 });
             }
         }
@@ -2657,7 +3486,7 @@ impl CachedFile {
             1
         };
         let base = pn as u64 * PAGE_SIZE as u64;
-        let async_page_fill = {
+        let async_page_fill = allow_async_page_fill && {
             #[cfg(feature = "ext4")]
             {
                 lwext4_rust::async_mapped_read_enabled()
@@ -2689,14 +3518,21 @@ impl CachedFile {
                     continue;
                 }
                 if cache.len() >= cap {
-                    if self.shared.user_io_pin_windows.load(Ordering::Acquire) != 0 {
-                        record_readahead_pressure_skip();
-                        break;
-                    }
+                    let listeners = evict_listeners_snapshot(&self.shared)?;
                     if let Some((epn, mut epage)) = pop_unused_readahead_lru_page(cache) {
-                        let _ = self.evict_cache(file, epn, &mut epage)?;
+                        if let Err(error) =
+                            self.evict_cache(file, &listeners, epn, &mut epage, None)
+                        {
+                            restore_popped_cache_page(cache, epn, epage);
+                            return Err(error);
+                        }
                     } else if let Some((epn, mut epage)) = pop_unpinned_lru_page(cache)? {
-                        let _ = self.evict_cache(file, epn, &mut epage)?;
+                        if let Err(error) =
+                            self.evict_cache(file, &listeners, epn, &mut epage, None)
+                        {
+                            restore_popped_cache_page(cache, epn, epage);
+                            return Err(error);
+                        }
                     }
                 }
                 let mut np = PageCache::new()?;
@@ -2724,9 +3560,13 @@ impl CachedFile {
         }
         let read = {
             let mut bufs = pages.iter_mut().map(|page| page.data()).collect::<Vec<_>>();
-            file.read_at_vectored(&mut bufs, base)?
+            match file.try_read_at_vectored_async(&mut bufs, base)? {
+                Some(read) => read,
+                None => file.read_at_vectored(&mut bufs, base)?,
+            }
         };
 
+        #[cfg(feature = "ext4")]
         let mut async_filled_pages = 0usize;
         let mut loaded_readahead_pages = 0usize;
         for (i, page) in pages.into_iter().enumerate() {
@@ -2739,16 +3579,20 @@ impl CachedFile {
                 continue;
             }
             if i > 0 && cache.len() >= cap {
-                if self.shared.user_io_pin_windows.load(Ordering::Acquire) != 0 {
-                    record_readahead_pressure_skip();
-                    break;
-                }
+                let listeners = evict_listeners_snapshot(&self.shared)?;
                 if let Some((epn, mut epage)) = pop_unused_readahead_lru_page(cache) {
-                    let _ = self.evict_cache(file, epn, &mut epage)?;
+                    if let Err(error) = self.evict_cache(file, &listeners, epn, &mut epage, None) {
+                        restore_popped_cache_page(cache, epn, epage);
+                        return Err(error);
+                    }
                 } else if let Some((epn, mut epage)) = pop_unpinned_lru_page(cache)? {
-                    let _ = self.evict_cache(file, epn, &mut epage)?;
+                    if let Err(error) = self.evict_cache(file, &listeners, epn, &mut epage, None) {
+                        restore_popped_cache_page(cache, epn, epage);
+                        return Err(error);
+                    }
                 }
             }
+            #[cfg(feature = "ext4")]
             if off < read {
                 async_filled_pages += 1;
             }
@@ -2803,10 +3647,49 @@ impl CachedFile {
         pn: u32,
         f: impl FnOnce(&mut PageCache, Option<EvictedPage>) -> VfsResult<R>,
     ) -> VfsResult<R> {
+        let _cache_user = self.begin_cache_user()?;
         let mut f = Some(f);
         loop {
             let mut guard = self.shared.page_cache.lock();
             let evicted = self.ensure_page_cached(self.inner.entry().as_file()?, &mut guard, pn)?;
+            if guard.get(&pn).is_some_and(PageCache::is_writeback) {
+                drop(evicted);
+                drop(guard);
+                wait_for_page_writeback_clear(&self.shared, pn);
+                continue;
+            }
+            let page = guard.get_mut(&pn).unwrap();
+            let result = f.take().unwrap()(page, evicted);
+            let dirty = guard.get(&pn).is_some_and(PageCache::is_dirty);
+            drop(guard);
+            if dirty {
+                retain_cached_file_writeback_anchor_if_dirty(&self.inner, &self.shared);
+            }
+            return result;
+        }
+    }
+
+    /// Owner-aware variant used while one address space already owns its lock.
+    ///
+    /// Only listeners registered for `owner` may defer detachment. The returned
+    /// [`EvictedPage`] keeps such a page alive until the caller drains all
+    /// aliases for that same owner.
+    pub fn with_page_or_insert_for_owner<R>(
+        &self,
+        pn: u32,
+        owner: CachedFileEvictionOwner,
+        f: impl FnOnce(&mut PageCache, Option<EvictedPage>) -> VfsResult<R>,
+    ) -> VfsResult<R> {
+        let _cache_user = self.begin_cache_user()?;
+        let mut f = Some(f);
+        loop {
+            let mut guard = self.shared.page_cache.lock();
+            let evicted = self.ensure_page_cached_for_owner(
+                self.inner.entry().as_file()?,
+                &mut guard,
+                pn,
+                owner,
+            )?;
             if guard.get(&pn).is_some_and(PageCache::is_writeback) {
                 drop(evicted);
                 drop(guard);
@@ -2837,7 +3720,9 @@ impl CachedFile {
         mut load_page: impl FnMut(u64, &Range<usize>) -> bool,
         mut page_each: impl FnMut(T, &mut PageCache, u64, Range<usize>) -> VfsResult<T>,
         wait_writeback: bool,
+        allow_async_page_fill: bool,
     ) -> VfsResult<T> {
+        let _cache_user = self.begin_cache_user()?;
         let file = self.inner.entry().as_file()?;
         let mut initial = page_initial(file)?;
         let start_page = (range.start / PAGE_SIZE as u64) as u32;
@@ -2850,7 +3735,13 @@ impl CachedFile {
                 let page_range =
                     page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize;
                 let load_from_file = load_page(page_start, &page_range);
-                self.ensure_page_cached_with(file, &mut guard, pn, load_from_file)?;
+                self.ensure_page_cached_with(
+                    file,
+                    &mut guard,
+                    pn,
+                    load_from_file,
+                    allow_async_page_fill,
+                )?;
                 if wait_writeback && guard.get(&pn).is_some_and(PageCache::is_writeback) {
                     drop(guard);
                     wait_for_page_writeback_clear(&self.shared, pn);
@@ -2866,30 +3757,214 @@ impl CachedFile {
         Ok(initial)
     }
 
-    /// Reads data from the file at `offset` into `dst`.
-    pub fn read_at(&self, mut dst: impl Write + IoBufMut, offset: u64) -> VfsResult<usize> {
+    fn prepare_write_page(
+        &self,
+        file: &FileNode,
+        pn: u32,
+        load_from_file: bool,
+        allow_async_page_fill: bool,
+    ) -> VfsResult<CachedFilePagePin> {
+        let _cache_user = self.begin_cache_user()?;
+        loop {
+            let mut guard = self.shared.page_cache.lock();
+            let evicted = self.ensure_page_cached_with(
+                file,
+                &mut guard,
+                pn,
+                load_from_file,
+                allow_async_page_fill,
+            )?;
+            if guard.get(&pn).is_some_and(PageCache::is_writeback) {
+                drop(evicted);
+                drop(guard);
+                wait_for_page_writeback_clear(&self.shared, pn);
+                continue;
+            }
+            guard
+                .get_mut(&pn)
+                .expect("prepared cache page disappeared while locked")
+                .pin()?;
+            drop(guard);
+            drop(evicted);
+            return Ok(CachedFilePagePin {
+                cache: self.clone(),
+                pn,
+                dirty_on_release: false,
+            });
+        }
+    }
+
+    fn commit_prepared_write(&self, pn: u32, range: Range<usize>, src: &[u8]) {
+        loop {
+            let mut guard = self.shared.page_cache.lock();
+            if guard.get(&pn).is_some_and(PageCache::is_writeback) {
+                drop(guard);
+                wait_for_page_writeback_clear(&self.shared, pn);
+                continue;
+            }
+            let page = guard
+                .get_mut(&pn)
+                .expect("pinned cache page disappeared before write commit");
+            page.data()[range].copy_from_slice(src);
+            page.mark_dirty();
+            return;
+        }
+    }
+
+    fn read_at_with_async_policy(
+        &self,
+        mut dst: impl Write + IoBufMut,
+        offset: u64,
+        allow_async: bool,
+    ) -> VfsResult<usize> {
         let len = self.inner.len()?;
-        let end = (offset + dst.remaining_mut() as u64).min(len);
+        let requested = u64::try_from(dst.remaining_mut()).map_err(|_| VfsError::InvalidInput)?;
+        let end = offset
+            .checked_add(requested)
+            .ok_or(VfsError::InvalidInput)?
+            .min(len);
         if end <= offset {
             return Ok(0);
         }
-        if let Some(read) =
-            self.try_read_aligned_bypass(&mut dst, offset, (end - offset) as usize)?
-        {
-            return Ok(read);
+        if allow_async {
+            if let Some(read) =
+                self.try_read_aligned_bypass(&mut dst, offset, (end - offset) as usize)?
+            {
+                return Ok(read);
+            }
         }
         let _direct_guard = self.shared.direct_io_lock.read();
-        self.with_pages(
-            offset..end,
-            |_| Ok(0),
-            |_, _| true,
-            |read, page, _page_start, range| {
-                let len = range.end - range.start;
-                dst.write(&page.data()[range.start..range.end])?;
-                Ok(read + len)
-            },
-            false,
-        )
+        let mut total = 0usize;
+        let mut current = offset;
+        let mut bounce = vec![0_u8; PAGE_SIZE];
+        while current < end {
+            let page_offset = (current % PAGE_SIZE as u64) as usize;
+            let chunk = usize::try_from(end - current)
+                .map_err(|_| VfsError::InvalidInput)?
+                .min(PAGE_SIZE - page_offset);
+            let next = current
+                .checked_add(chunk as u64)
+                .ok_or(VfsError::InvalidInput)?;
+            let copied = match self.with_pages(
+                current..next,
+                |_| Ok(0usize),
+                |_, _| true,
+                |_, page, _page_start, range| {
+                    let copied = range.end - range.start;
+                    bounce[..copied].copy_from_slice(&page.data()[range]);
+                    Ok(copied)
+                },
+                false,
+                allow_async,
+            ) {
+                Ok(copied) => copied,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            // The page-cache borrow and its lock have ended before an IoBufMut
+            // such as VmBytesMut performs a raw userspace copy.
+            let written = match dst.write(&bounce[..copied]) {
+                Ok(written) => written,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            if written > copied {
+                return Err(VfsError::InvalidInput);
+            }
+            total += written;
+            current += written as u64;
+            if written < copied || written == 0 {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Reads data from the file at `offset` into `dst`.
+    pub fn read_at(&self, dst: impl Write + IoBufMut, offset: u64) -> VfsResult<usize> {
+        self.read_at_with_async_policy(dst, offset, true)
+    }
+
+    /// Reads through the coherent page cache without invoking the lower
+    /// split-submit asynchronous hook. A synchronous lower call may still
+    /// submit a device request, but it completes that request before returning.
+    ///
+    /// This is intended for callers that already own a larger transaction and
+    /// therefore cannot release its transaction and suspend after publishing a
+    /// request. Ordinary reads should use [`read_at`](Self::read_at), which may
+    /// use the explicit split-submit/wait path when the filesystem supports it.
+    pub fn read_at_sync(&self, dst: impl Write + IoBufMut, offset: u64) -> VfsResult<usize> {
+        self.read_at_with_async_policy(dst, offset, false)
+    }
+
+    /// Reads into caller-pinned physical memory without exposing an aliasing
+    /// Rust slice when the destination is one of this inode's cached pages.
+    ///
+    /// # Safety
+    ///
+    /// Every nonempty destination range must remain pinned, mapped, writable,
+    /// and accessible for the complete call. Destination ranges must not
+    /// overlap each other. Concurrent userspace access is permitted; this path
+    /// creates no Rust reference to the physical ranges and copies through
+    /// kernel-owned storage. `try_async` is a hint and may be ignored.
+    pub unsafe fn read_at_pinned_segments(
+        &self,
+        dst: &[PinnedPhysicalSegment],
+        offset: u64,
+        try_async: bool,
+    ) -> VfsResult<usize> {
+        let requested = validate_pinned_physical_segments(dst, true)?;
+        let file_len = self.inner.len()?;
+        let end = offset
+            .checked_add(u64::try_from(requested).map_err(|_| VfsError::InvalidInput)?)
+            .ok_or(VfsError::InvalidInput)?
+            .min(file_len);
+        if end <= offset {
+            return Ok(0);
+        }
+        let len = usize::try_from(end - offset).map_err(|_| VfsError::InvalidInput)?;
+        if let Some(read) = self.try_read_aligned_pinned_bypass(dst, offset, len, try_async)? {
+            return Ok(read);
+        }
+
+        let _direct_guard = self.shared.direct_io_lock.read();
+        let mut cursor = PinnedPhysicalCursor::new(dst);
+        let mut bounce = try_zeroed_pinned_io_bounce(PAGE_SIZE)?;
+        let mut total = 0usize;
+        let mut current = offset;
+        while current < end {
+            let page_offset = (current % PAGE_SIZE as u64) as usize;
+            let chunk = usize::try_from(end - current)
+                .map_err(|_| VfsError::InvalidInput)?
+                .min(PAGE_SIZE - page_offset);
+            let next = current
+                .checked_add(chunk as u64)
+                .ok_or(VfsError::InvalidInput)?;
+            let copied = match self.with_pages(
+                current..next,
+                |_| Ok(0usize),
+                |_, _| true,
+                |_, page, _page_start, range| {
+                    let copied = range.end - range.start;
+                    bounce[..copied].copy_from_slice(&page.data()[range]);
+                    Ok(copied)
+                },
+                false,
+                try_async,
+            ) {
+                Ok(copied) => copied,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
+            match unsafe { copy_to_pinned_physical_segments(&mut cursor, &bounce[..copied]) } {
+                Ok(()) => {}
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            }
+            total += copied;
+            current = next;
+        }
+        Ok(total)
     }
 
     pub fn read_at_slice(&self, mut dst: &mut [u8], offset: u64) -> VfsResult<usize> {
@@ -2916,7 +3991,11 @@ impl CachedFile {
                 continue;
             }
             let requested = buf.len();
-            let read = self.read_at_slice(buf, current)?;
+            let read = match self.read_at_slice(buf, current) {
+                Ok(read) => read,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
             total += read;
             current += read as u64;
             if read < requested || read == 0 {
@@ -2927,27 +4006,140 @@ impl CachedFile {
     }
 
     fn write_at_locked(&self, mut buf: impl Read + IoBuf, offset: u64) -> VfsResult<usize> {
-        let end = offset + buf.remaining() as u64;
-        let old_len = self.inner.entry().as_file()?.len()?;
-        let written = self.with_pages(
-            offset..end,
-            |file| {
-                if end > old_len {
-                    file.set_len(end)?;
+        let requested = buf.remaining();
+        offset
+            .checked_add(u64::try_from(requested).map_err(|_| VfsError::InvalidInput)?)
+            .ok_or(VfsError::InvalidInput)?;
+        let file = self.inner.entry().as_file()?;
+        let mut committed_len = file.len()?;
+
+        let mut written = 0usize;
+        let mut current = offset;
+        let mut bounce = vec![0_u8; PAGE_SIZE];
+        while written < requested {
+            let page_offset = (current % PAGE_SIZE as u64) as usize;
+            let chunk = (requested - written).min(PAGE_SIZE - page_offset);
+            // Finish a generic source read before acquiring a cache page and
+            // creating its mutable data reference. VmBytes may point at that
+            // exact cached page through a MAP_SHARED mapping.
+            let read = match buf.read(&mut bounce[..chunk]) {
+                Ok(read) => read,
+                Err(_) if written != 0 => break,
+                Err(error) => return Err(error),
+            };
+            if read > chunk {
+                if written != 0 {
+                    break;
                 }
-                Ok(0)
-            },
-            |page_start, range| {
-                !(range.start == 0 && range.end == PAGE_SIZE) && page_start < old_len
-            },
-            |written, page, _page_start, range| {
-                let len = range.end - range.start;
-                buf.read(&mut page.data()[range.start..range.end])?;
-                page.mark_dirty();
-                Ok(written + len)
-            },
-            true,
-        )?;
+                return Err(VfsError::InvalidInput);
+            }
+            if read == 0 {
+                break;
+            }
+            let next = current
+                .checked_add(read as u64)
+                .ok_or(VfsError::InvalidInput)?;
+            let pn =
+                u32::try_from(current / PAGE_SIZE as u64).map_err(|_| VfsError::InvalidInput)?;
+            let range = page_offset..page_offset + read;
+            let load_from_file = !(range.start == 0 && range.end == PAGE_SIZE)
+                && u64::from(pn) * (PAGE_SIZE as u64) < committed_len;
+            let page_pin = match self.prepare_write_page(file, pn, load_from_file, true) {
+                Ok(page_pin) => page_pin,
+                Err(_) if written != 0 => break,
+                Err(error) => return Err(error),
+            };
+            if next > committed_len {
+                match file.set_len(next) {
+                    Ok(()) => committed_len = next,
+                    Err(_) if written != 0 => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            self.commit_prepared_write(pn, range, &bounce[..read]);
+            drop(page_pin);
+            written += read;
+            current = next;
+            if read < chunk {
+                break;
+            }
+        }
+        if written != 0 {
+            retain_cached_file_writeback_anchor_if_dirty(&self.inner, &self.shared);
+        }
+        Ok(written)
+    }
+
+    /// Writes from caller-pinned physical memory without exposing an aliasing
+    /// Rust slice when a source range is one of this inode's cached pages.
+    ///
+    /// # Safety
+    ///
+    /// Every nonempty source range must remain pinned, mapped, readable, and
+    /// accessible for the complete call. Concurrent userspace writes may race
+    /// with the raw copy, but no Rust reference is created for the physical
+    /// range. `try_async` is a hint and may be ignored.
+    pub unsafe fn write_at_pinned_segments(
+        &self,
+        src: &[PinnedPhysicalSegment],
+        offset: u64,
+        try_async: bool,
+    ) -> VfsResult<usize> {
+        let requested = validate_pinned_physical_segments(src, false)?;
+        if requested == 0 {
+            return Ok(0);
+        }
+        offset
+            .checked_add(u64::try_from(requested).map_err(|_| VfsError::InvalidInput)?)
+            .ok_or(VfsError::InvalidInput)?;
+        if let Some(written) =
+            self.try_write_aligned_pinned_bypass(src, offset, requested, try_async)?
+        {
+            return Ok(written);
+        }
+
+        let _direct_guard = self.shared.direct_io_lock.read();
+        let _append_guard = self.shared.append_lock.read();
+        let file = self.inner.entry().as_file()?;
+        let mut committed_len = file.len()?;
+
+        let mut cursor = PinnedPhysicalCursor::new(src);
+        let mut bounce = try_zeroed_pinned_io_bounce(PAGE_SIZE)?;
+        let mut written = 0usize;
+        let mut current = offset;
+        while written < requested {
+            let page_offset = (current % PAGE_SIZE as u64) as usize;
+            let chunk = (requested - written).min(PAGE_SIZE - page_offset);
+            match unsafe { copy_from_pinned_physical_segments(&mut cursor, &mut bounce[..chunk]) } {
+                Ok(()) => {}
+                Err(_) if written != 0 => break,
+                Err(error) => return Err(error),
+            }
+            let next = current
+                .checked_add(chunk as u64)
+                .ok_or(VfsError::InvalidInput)?;
+            let pn =
+                u32::try_from(current / PAGE_SIZE as u64).map_err(|_| VfsError::InvalidInput)?;
+            let range = page_offset..page_offset + chunk;
+            let load_from_file = !(range.start == 0 && range.end == PAGE_SIZE)
+                && u64::from(pn) * (PAGE_SIZE as u64) < committed_len;
+            let page_pin = match self.prepare_write_page(file, pn, load_from_file, try_async) {
+                Ok(page_pin) => page_pin,
+                Err(_) if written != 0 => break,
+                Err(error) => return Err(error),
+            };
+            if next > committed_len {
+                match file.set_len(next) {
+                    Ok(()) => committed_len = next,
+                    Err(_) if written != 0 => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            self.commit_prepared_write(pn, range, &bounce[..chunk]);
+            drop(page_pin);
+            written += chunk;
+            current = next;
+        }
         if written != 0 {
             retain_cached_file_writeback_anchor_if_dirty(&self.inner, &self.shared);
         }
@@ -2983,7 +4175,11 @@ impl CachedFile {
                 continue;
             }
             let requested = buf.len();
-            let written = self.write_at_slice(buf, current)?;
+            let written = match self.write_at_slice(buf, current) {
+                Ok(written) => written,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
             total += written;
             current += written as u64;
             if written < requested || written == 0 {
@@ -2993,14 +4189,36 @@ impl CachedFile {
         Ok(total)
     }
 
-    /// Appends `buf` to the end of the file. Returns `(bytes_written, new_end)`.
-    pub fn append(&self, buf: impl Read + IoBuf) -> VfsResult<(usize, u64)> {
+    /// Appends an admitted prefix of `buf` under one inode append transaction.
+    ///
+    /// `admit` observes the exact end offset protected by the same append
+    /// serialization domain as the lower write. It may shorten the operation,
+    /// but cannot extend it beyond the caller's remaining input.
+    pub fn append_with_admission(
+        &self,
+        mut buf: impl Read + IoBuf,
+        admit: impl FnOnce(u64, usize) -> VfsResult<usize>,
+    ) -> VfsResult<(usize, u64)> {
         let _direct_guard = self.shared.direct_io_lock.read();
         let _guard = self.shared.append_lock.write();
         let file = self.inner.entry().as_file()?;
         let len = file.len()?;
-        self.write_at_locked(buf, len)
-            .map(|written| (written, len + written as u64))
+        let requested = buf.remaining();
+        let allowed = admit(len, requested)?;
+        if allowed > requested {
+            return Err(VfsError::InvalidInput);
+        }
+        let mut admitted = (&mut buf).take(allowed as u64);
+        let written = self.write_at_locked(&mut admitted, len)?;
+        let new_end = len
+            .checked_add(written as u64)
+            .ok_or(VfsError::InvalidInput)?;
+        Ok((written, new_end))
+    }
+
+    /// Appends `buf` to the end of the file. Returns `(bytes_written, new_end)`.
+    pub fn append(&self, buf: impl Read + IoBuf) -> VfsResult<(usize, u64)> {
+        self.append_with_admission(buf, |_offset, requested| Ok(requested))
     }
 
     /// Appends one scatter list as a single inode append transaction.
@@ -3021,7 +4239,11 @@ impl CachedFile {
                 continue;
             }
             let requested = buf.len();
-            let written = self.write_at_locked(buf, end)?;
+            let written = match self.write_at_locked(buf, end) {
+                Ok(written) => written,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
             total += written;
             end += written as u64;
             if written < requested || written == 0 {
@@ -3033,18 +4255,43 @@ impl CachedFile {
 
     /// Truncates or extends the file to `len` bytes.
     pub fn set_len(&self, len: u64) -> VfsResult<()> {
-        let _direct_guard = self.shared.direct_io_lock.read();
+        let _direct_guard = self.shared.direct_io_lock.write();
         let _writeback_guard = self.shared.writeback_lock.write();
         wait_for_all_writeback_clear(&self.shared);
         let file = self.inner.entry().as_file()?;
         let old_len = file.len()?;
-        if self.in_memory && old_len > len {
-            flush_dirty_cache_shared_locked(&self.shared, file)?;
+        let mutation = (len < old_len)
+            .then(|| self.begin_cache_invalidating_mutation())
+            .transpose()?;
+        self.admit_truncate(old_len, len)?;
+        let partial_page = (old_len > len && len % PAGE_SIZE as u64 != 0)
+            .then_some((len / PAGE_SIZE as u64) as u32);
+        let mut discarded = if old_len > len {
+            let mut invalidation = CachedPageInvalidationTransaction::new(
+                mutation
+                    .as_ref()
+                    .expect("shrinking truncate owns a cache mutation"),
+            );
+            // Include the boundary page. A lower filesystem that reports a
+            // non-atomic failure may already have changed its tail; on success
+            // the retained prefix is restored below with a zeroed suffix.
+            invalidation.stage_from(len / PAGE_SIZE as u64)?;
+            invalidation.writeback(file, true)?;
+            Some(invalidation)
+        } else {
+            None
+        };
+        if let Err(error) = file.set_len(len) {
+            if let Some(invalidation) = discarded.take()
+                && !file.set_len_failure_is_atomic()
+            {
+                invalidation.commit_discard();
+                release_cached_file_writeback_anchor_if_clean(&self.shared);
+            }
+            return Err(error);
         }
-        file.set_len(len)?;
 
         let old_last_page = (old_len / PAGE_SIZE as u64) as u32;
-        let new_last_page = (len / PAGE_SIZE as u64) as u32;
         if old_len < len {
             let mut guard = self.shared.page_cache.lock();
             if let Some(page) = guard.get_mut(&old_last_page) {
@@ -3053,41 +4300,21 @@ impl CachedFile {
                 let new_page_offset = (len - page_start).min(PAGE_SIZE as u64) as usize;
                 page.data()[old_page_offset..new_page_offset].fill(0);
             }
-        } else if old_last_page > new_last_page {
-            // For truncating, we need to remove all pages that are beyond the
-            // new length
-            // TODO(mivik): can this be more efficient?
-            let keys = {
-                let mut guard = self.shared.page_cache.lock();
-                if let Some(page) = guard.get_mut(&new_last_page) {
-                    let page_start = new_last_page as u64 * PAGE_SIZE as u64;
-                    let new_page_offset =
-                        len.saturating_sub(page_start).min(PAGE_SIZE as u64) as usize;
-                    page.data()[new_page_offset..].fill(0);
-                }
-                guard
-                    .iter()
-                    .map(|(k, _)| *k)
-                    .filter(|it| *it > new_last_page)
-                    .collect::<Vec<_>>()
-            };
-            for pn in keys {
-                if let Some(mut page) = self.pop_cached_page(pn)? {
-                    // Don't write back pages since they're discarded.
-                    page.clear_dirty();
-                    let _ = self.evict_cache(file, pn, &mut page)?;
-                }
-            }
-        } else if old_len > len {
-            let mut guard = self.shared.page_cache.lock();
-            if let Some(page) = guard.get_mut(&new_last_page) {
-                let page_start = new_last_page as u64 * PAGE_SIZE as u64;
+        } else if let (Some(partial_page), Some(invalidation)) = (partial_page, discarded.as_mut())
+        {
+            invalidation.restore_staged_page(partial_page, |page| {
+                let page_start = partial_page as u64 * PAGE_SIZE as u64;
                 let new_page_offset = len.saturating_sub(page_start).min(PAGE_SIZE as u64) as usize;
                 page.data()[new_page_offset..].fill(0);
-                // Preserve dirty state for retained bytes; writeback clamps to the new length.
+                // Preserve dirty state for retained bytes; writeback clamps
+                // the final partial page to the new inode length.
                 page.mark_dirty();
-            }
+            });
         }
+        if let Some(invalidation) = discarded.take() {
+            invalidation.commit_discard();
+        }
+        release_cached_file_writeback_anchor_if_clean(&self.shared);
         retain_cached_file_writeback_anchor_if_dirty(&self.inner, &self.shared);
         Ok(())
     }
@@ -3122,7 +4349,9 @@ impl Drop for CachedFile {
             return;
         }
         if self.shared.unlinked.load(Ordering::Acquire) {
-            self.discard_cache();
+            self.discard_cache().unwrap_or_else(|error| {
+                panic!("failed to discard unlinked cached pages on last close: {error:?}")
+            });
             release_unlinked_cached_file_registry_ownership(&self.inner, &self.shared);
             return;
         }
@@ -3165,10 +4394,6 @@ impl FileBackend {
         Self::Cached(CachedFile::get_or_create(location))
     }
 
-    fn direct_io_shared(location: &Location) -> Arc<CachedFileShared> {
-        cached_file_shared_for_location_or_create(location)
-    }
-
     /// Clones this backend while selecting whether I/O bypasses the page cache.
     ///
     /// Both modes retain the same file location. Direct operations synchronize
@@ -3182,29 +4407,29 @@ impl FileBackend {
         }
     }
 
-    fn sync_direct_cache(location: &Location) -> VfsResult<()> {
-        sync_and_invalidate_cached_file_pages(location)
-    }
-
     /// Reads data from the file at `offset` into `dst`.
     pub fn read_at(&self, mut dst: impl Write + IoBufMut, mut offset: u64) -> VfsResult<usize> {
         match self {
             Self::Cached(cached) => cached.read_at(dst, offset),
-            Self::Direct(loc) => {
-                let shared = Self::direct_io_shared(loc);
-                let _guard = shared.direct_io_lock.write();
-                Self::sync_direct_cache(loc)?;
-                let file = loc.entry().as_file()?;
+            Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |_, file| {
                 let mut total = 0;
                 let mut chunk = vec![0_u8; Self::DIRECT_IO_CHUNK];
 
                 while dst.remaining_mut() > 0 {
                     let limit = dst.remaining_mut().min(chunk.len());
-                    let read = file.read_at(&mut chunk[..limit], offset)?;
+                    let read = match file.read_at(&mut chunk[..limit], offset) {
+                        Ok(read) => read,
+                        Err(_) if total != 0 => break,
+                        Err(error) => return Err(error),
+                    };
                     if read == 0 {
                         break;
                     }
-                    let written = dst.write(&chunk[..read])?;
+                    let written = match dst.write(&chunk[..read]) {
+                        Ok(written) => written,
+                        Err(_) if total != 0 => break,
+                        Err(error) => return Err(error),
+                    };
                     if written == 0 {
                         break;
                     }
@@ -3216,18 +4441,14 @@ impl FileBackend {
                 }
 
                 Ok(total)
-            }
+            }),
         }
     }
 
     pub fn read_at_slice(&self, dst: &mut [u8], offset: u64) -> VfsResult<usize> {
         match self {
             Self::Cached(cached) => cached.read_at_slice(dst, offset),
-            Self::Direct(loc) => {
-                let shared = Self::direct_io_shared(loc);
-                let _guard = shared.direct_io_lock.write();
-                Self::sync_direct_cache(loc)?;
-                let file = loc.entry().as_file()?;
+            Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |_, file| {
                 let async_read = {
                     let mut bufs = [&mut *dst];
                     file.try_read_at_vectored_async(&mut bufs, offset)?
@@ -3236,23 +4457,45 @@ impl FileBackend {
                     Some(read) => Ok(read),
                     None => file.read_at(dst, offset),
                 }
-            }
+            }),
         }
     }
 
     pub fn read_at_vectored(&self, dst: &mut [&mut [u8]], offset: u64) -> VfsResult<usize> {
         match self {
             Self::Cached(cached) => cached.read_at_vectored(dst, offset),
-            Self::Direct(loc) => {
-                let shared = Self::direct_io_shared(loc);
-                let _guard = shared.direct_io_lock.write();
-                Self::sync_direct_cache(loc)?;
-                let file = loc.entry().as_file()?;
-                match file.try_read_at_vectored_async(dst, offset)? {
-                    Some(read) => Ok(read),
-                    None => file.read_at_vectored(dst, offset),
-                }
-            }
+            Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |_, file| match file
+                .try_read_at_vectored_async(dst, offset)?
+            {
+                Some(read) => Ok(read),
+                None => file.read_at_vectored(dst, offset),
+            }),
+        }
+    }
+
+    /// Performs positioned I/O into pinned physical destination segments.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the pin, mapping, and access contract of
+    /// [`CachedFile::read_at_pinned_segments`].
+    pub unsafe fn read_at_pinned_segments(
+        &self,
+        dst: &[PinnedPhysicalSegment],
+        offset: u64,
+        _try_async: bool,
+    ) -> VfsResult<usize> {
+        validate_pinned_physical_segments(dst, true)?;
+        match self {
+            Self::Cached(cached) => unsafe { cached.read_at_pinned_segments(dst, offset, false) },
+            Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |_, file| unsafe {
+                read_file_into_pinned_bounce(
+                    file,
+                    dst,
+                    offset,
+                    validate_pinned_physical_segments(dst, true)?,
+                )
+            }),
         }
     }
 
@@ -3260,21 +4503,25 @@ impl FileBackend {
     pub fn write_at(&self, mut src: impl Read + IoBuf, mut offset: u64) -> VfsResult<usize> {
         match self {
             Self::Cached(cached) => cached.write_at(src, offset),
-            Self::Direct(loc) => {
-                let shared = Self::direct_io_shared(loc);
-                let _guard = shared.direct_io_lock.write();
-                Self::sync_direct_cache(loc)?;
-                let file = loc.entry().as_file()?;
+            Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |_, file| {
                 let mut total = 0;
                 let mut chunk = vec![0_u8; Self::DIRECT_IO_CHUNK];
 
                 while src.remaining() > 0 {
                     let limit = src.remaining().min(chunk.len());
-                    let read = src.read(&mut chunk[..limit])?;
+                    let read = match src.read(&mut chunk[..limit]) {
+                        Ok(read) => read,
+                        Err(_) if total != 0 => break,
+                        Err(error) => return Err(error),
+                    };
                     if read == 0 {
                         break;
                     }
-                    let written = file.write_at(&chunk[..read], offset)?;
+                    let written = match file.write_at(&chunk[..read], offset) {
+                        Ok(written) => written,
+                        Err(_) if total != 0 => break,
+                        Err(error) => return Err(error),
+                    };
                     if written == 0 {
                         break;
                     }
@@ -3285,11 +4532,8 @@ impl FileBackend {
                     }
                 }
 
-                if total > 0 {
-                    Self::sync_direct_cache(loc)?;
-                }
                 Ok(total)
-            }
+            }),
         }
     }
 
@@ -3297,15 +4541,7 @@ impl FileBackend {
         match self {
             Self::Cached(cached) => cached.write_at_slice(src, offset),
             Self::Direct(loc) => {
-                let shared = Self::direct_io_shared(loc);
-                let _guard = shared.direct_io_lock.write();
-                Self::sync_direct_cache(loc)?;
-                let file = loc.entry().as_file()?;
-                let written = file.write_at(src, offset)?;
-                if written > 0 {
-                    Self::sync_direct_cache(loc)?;
-                }
-                Ok(written)
+                with_cache_invalidating_file_operation(loc, |_, file| file.write_at(src, offset))
             }
         }
     }
@@ -3313,43 +4549,80 @@ impl FileBackend {
     pub fn write_at_vectored(&self, src: &[&[u8]], offset: u64) -> VfsResult<usize> {
         match self {
             Self::Cached(cached) => cached.write_at_vectored(src, offset),
-            Self::Direct(loc) => {
-                let shared = Self::direct_io_shared(loc);
-                let _guard = shared.direct_io_lock.write();
-                Self::sync_direct_cache(loc)?;
-                let file = loc.entry().as_file()?;
+            Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |_, file| {
                 let written = match file.try_write_at_vectored_async(src, offset)? {
                     Some(written) => written,
                     None => file.write_at_vectored(src, offset)?,
                 };
-                if written > 0 {
-                    Self::sync_direct_cache(loc)?;
-                }
                 Ok(written)
-            }
+            }),
         }
     }
 
-    /// Appends `src` to the end of the file. Returns `(bytes_written, new_end)`.
-    pub fn append(&self, mut src: impl Read + IoBuf) -> VfsResult<(usize, u64)> {
+    /// Performs positioned I/O from pinned physical source segments.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the pin and access contract of
+    /// [`CachedFile::write_at_pinned_segments`].
+    pub unsafe fn write_at_pinned_segments(
+        &self,
+        src: &[PinnedPhysicalSegment],
+        offset: u64,
+        _try_async: bool,
+    ) -> VfsResult<usize> {
+        validate_pinned_physical_segments(src, false)?;
         match self {
-            Self::Cached(cached) => cached.append(src),
-            Self::Direct(loc) => {
-                let shared = Self::direct_io_shared(loc);
-                let _guard = shared.direct_io_lock.write();
-                Self::sync_direct_cache(loc)?;
-                let file = loc.entry().as_file()?;
+            Self::Cached(cached) => unsafe { cached.write_at_pinned_segments(src, offset, false) },
+            Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |shared, file| {
+                let _append_guard = shared.append_lock.read();
+                unsafe {
+                    write_file_from_pinned_bounce(
+                        file,
+                        src,
+                        offset,
+                        validate_pinned_physical_segments(src, false)?,
+                    )
+                }
+            }),
+        }
+    }
+
+    /// Appends an admitted prefix of `src` under one inode append transaction.
+    pub fn append_with_admission(
+        &self,
+        mut src: impl Read + IoBuf,
+        admit: impl FnOnce(u64, usize) -> VfsResult<usize>,
+    ) -> VfsResult<(usize, u64)> {
+        match self {
+            Self::Cached(cached) => cached.append_with_admission(src, admit),
+            Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |shared, file| {
+                let _append_guard = shared.append_lock.write();
                 let mut total = 0;
                 let mut end = file.len()?;
+                let requested = src.remaining();
+                let allowed = admit(end, requested)?;
+                if allowed > requested {
+                    return Err(VfsError::InvalidInput);
+                }
+                let mut admitted = (&mut src).take(allowed as u64);
                 let mut chunk = vec![0_u8; Self::DIRECT_IO_CHUNK];
 
-                while src.remaining() > 0 {
-                    let limit = src.remaining().min(chunk.len());
-                    let read = src.read(&mut chunk[..limit])?;
+                while admitted.remaining() > 0 {
+                    let limit = admitted.remaining().min(chunk.len());
+                    let read = match admitted.read(&mut chunk[..limit]) {
+                        Ok(read) => read,
+                        Err(_) if total != 0 => break,
+                        Err(error) => return Err(error),
+                    };
                     if read == 0 {
                         break;
                     }
-                    let (written, new_end) = file.append(&chunk[..read])?;
+                    let (written, new_end) = match file.append(&chunk[..read]) {
+                        Ok(result) => result,
+                        Err(_) if total != 0 => break,
+                        Err(error) => return Err(error),
+                    };
                     if written == 0 {
                         break;
                     }
@@ -3360,12 +4633,14 @@ impl FileBackend {
                     }
                 }
 
-                if total > 0 {
-                    Self::sync_direct_cache(loc)?;
-                }
                 Ok((total, end))
-            }
+            }),
         }
+    }
+
+    /// Appends `src` to the end of the file. Returns `(bytes_written, new_end)`.
+    pub fn append(&self, src: impl Read + IoBuf) -> VfsResult<(usize, u64)> {
+        self.append_with_admission(src, |_offset, requested| Ok(requested))
     }
 
     /// Appends one scatter list without releasing the inode append domain
@@ -3373,12 +4648,8 @@ impl FileBackend {
     pub fn append_vectored(&self, src: &[&[u8]]) -> VfsResult<(usize, u64)> {
         match self {
             Self::Cached(cached) => cached.append_vectored(src),
-            Self::Direct(loc) => {
-                let shared = Self::direct_io_shared(loc);
-                let _direct_guard = shared.direct_io_lock.write();
+            Self::Direct(loc) => with_cache_invalidating_file_operation(loc, |shared, file| {
                 let _append_guard = shared.append_lock.write();
-                Self::sync_direct_cache(loc)?;
-                let file = loc.entry().as_file()?;
                 let mut total = 0usize;
                 let mut end = file.len()?;
 
@@ -3396,7 +4667,11 @@ impl FileBackend {
                     while element_written < requested {
                         let limit = (requested - element_written).min(Self::DIRECT_IO_CHUNK);
                         let chunk = &buf[element_written..element_written + limit];
-                        let (written, new_end) = file.append(chunk)?;
+                        let (written, new_end) = match file.append(chunk) {
+                            Ok(result) => result,
+                            Err(_) if total != 0 => break,
+                            Err(error) => return Err(error),
+                        };
                         total += written;
                         element_written += written;
                         end = new_end;
@@ -3409,11 +4684,8 @@ impl FileBackend {
                     }
                 }
 
-                if total > 0 {
-                    Self::sync_direct_cache(loc)?;
-                }
                 Ok((total, end))
-            }
+            }),
         }
     }
 
@@ -3431,10 +4703,7 @@ impl FileBackend {
         match self {
             Self::Cached(cached) => cached.sync(data_only),
             Self::Direct(loc) => {
-                let shared = Self::direct_io_shared(loc);
-                let _guard = shared.direct_io_lock.write();
-                Self::sync_direct_cache(loc)?;
-                loc.entry().as_file()?.sync(data_only)
+                with_cache_invalidating_file_operation(loc, |_, file| file.sync(data_only))
             }
         }
     }
@@ -3443,13 +4712,7 @@ impl FileBackend {
     pub fn set_len(&self, len: u64) -> VfsResult<()> {
         match self {
             Self::Cached(cached) => cached.set_len(len),
-            Self::Direct(loc) => {
-                let shared = Self::direct_io_shared(loc);
-                let _guard = shared.direct_io_lock.write();
-                Self::sync_direct_cache(loc)?;
-                loc.entry().as_file()?.set_len(len)?;
-                Self::sync_direct_cache(loc)
-            }
+            Self::Direct(loc) => with_cache_invalidating_truncate(loc, len),
         }
     }
 }
@@ -3565,6 +4828,32 @@ impl File {
         flags
     }
 
+    /// Whether ordinary I/O on this open file description owns a cursor.
+    pub fn has_current_position(&self) -> bool {
+        self.position.is_some()
+    }
+
+    /// Whether the node accepts explicit-offset reads.
+    pub fn supports_positioned_read(&self) -> bool {
+        !self
+            .location()
+            .flags()
+            .contains(NodeFlags::NO_POSITIONED_READ)
+    }
+
+    /// Whether the node accepts explicit-offset writes.
+    pub fn supports_positioned_write(&self) -> bool {
+        !self
+            .location()
+            .flags()
+            .contains(NodeFlags::NO_POSITIONED_WRITE)
+    }
+
+    /// Whether the node accepts seek operations.
+    pub fn supports_seek(&self) -> bool {
+        !self.location().flags().contains(NodeFlags::NO_SEEK)
+    }
+
     /// Updates append status for this open file description without changing
     /// its immutable read/write access mode.
     pub fn set_append(&self, append: bool) {
@@ -3634,6 +4923,37 @@ impl File {
         Ok(read)
     }
 
+    /// Reads at `offset` into caller-pinned physical segments.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep every destination pinned, mapped, writable, and
+    /// accessible through the call. Ranges must be mutually disjoint, but may
+    /// remain concurrently accessible to userspace because no Rust reference
+    /// is created for them.
+    pub unsafe fn read_at_pinned_segments(
+        &self,
+        dst: &[PinnedPhysicalSegment],
+        offset: u64,
+        try_async: bool,
+    ) -> VfsResult<usize> {
+        #[cfg(feature = "times")]
+        let requested = validate_pinned_physical_segments(dst, true)?;
+        let read = unsafe {
+            self.access(FileFlags::READ)?
+                .read_at_pinned_segments(dst, offset, try_async)?
+        };
+        #[cfg(feature = "times")]
+        if requested > 0
+            && !self.flags.contains(FileFlags::NOATIME)
+            && FsContext::should_update_atime(self.location())
+        {
+            self.record_time_flags(1);
+            self.flush_times();
+        }
+        Ok(read)
+    }
+
     /// Writes a number of bytes starting from a given offset.
     pub fn write_at(&self, src: impl Read + IoBuf, offset: u64) -> VfsResult<usize> {
         let written = self.access(FileFlags::WRITE)?.write_at(src, offset)?;
@@ -3667,14 +4987,49 @@ impl File {
         Ok(written)
     }
 
-    fn write_at_end_with_new_end(&self, src: impl Read + IoBuf) -> VfsResult<(usize, u64)> {
-        let result = self.access(FileFlags::WRITE)?.append(src)?;
+    /// Writes at `offset` from caller-pinned physical segments.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep every source pinned, mapped, readable, and
+    /// accessible through the call. Concurrent userspace access is permitted;
+    /// the implementation creates no Rust reference to the physical ranges.
+    pub unsafe fn write_at_pinned_segments(
+        &self,
+        src: &[PinnedPhysicalSegment],
+        offset: u64,
+        try_async: bool,
+    ) -> VfsResult<usize> {
+        let written = unsafe {
+            self.access(FileFlags::WRITE)?
+                .write_at_pinned_segments(src, offset, try_async)?
+        };
+        #[cfg(feature = "times")]
+        if written > 0 {
+            self.record_time_flags(2);
+            self.flush_times();
+        }
+        Ok(written)
+    }
+
+    fn write_at_end_with_admission_and_new_end(
+        &self,
+        src: impl Read + IoBuf,
+        admit: impl FnOnce(u64, usize) -> VfsResult<usize>,
+    ) -> VfsResult<(usize, u64)> {
+        let result = self
+            .access(FileFlags::WRITE)?
+            .append_with_admission(src, admit)?;
         #[cfg(feature = "times")]
         if result.0 > 0 {
             self.record_time_flags(2);
             self.flush_times();
         }
         Ok(result)
+    }
+
+    fn write_at_end_with_new_end(&self, src: impl Read + IoBuf) -> VfsResult<(usize, u64)> {
+        self.write_at_end_with_admission_and_new_end(src, |_offset, requested| Ok(requested))
     }
 
     fn write_vectored_at_end_with_new_end(&self, src: &[&[u8]]) -> VfsResult<(usize, Option<u64>)> {
@@ -3699,6 +5054,21 @@ impl File {
     /// [`WritePlacement::End`].
     pub fn write_at_end(&self, src: impl Read + IoBuf) -> VfsResult<usize> {
         self.write_at_end_with_new_end(src)
+            .map(|(written, _)| written)
+    }
+
+    /// Atomically appends an admitted prefix without changing this [`File`]'s
+    /// current position.
+    ///
+    /// The admission callback observes the exact inode end protected by the
+    /// append serialization domain. It must be short and must not call another
+    /// append or current-position operation on this file.
+    pub fn write_at_end_with_admission(
+        &self,
+        src: impl Read + IoBuf,
+        admit: impl FnOnce(u64, usize) -> VfsResult<usize>,
+    ) -> VfsResult<usize> {
+        self.write_at_end_with_admission_and_new_end(src, admit)
             .map(|(written, _)| written)
     }
 
@@ -3935,33 +5305,63 @@ impl File {
     /// [`NodeFlags::POSITIONED_APPEND`] retain their special ordinary-write
     /// behavior: [`WritePlacement::End`] uses and advances their current
     /// position instead of invoking the inode append operation.
-    pub fn write_with_placement(
+    pub fn write_with_placement_and_admission(
         &self,
-        src: impl Read + IoBuf,
+        mut src: impl Read + IoBuf,
         placement: WritePlacement,
+        admit: impl FnOnce(u64, usize) -> VfsResult<usize>,
     ) -> axio::Result<usize> {
         let _transaction = self.position_transaction.lock();
         if let Some(pos) = self.position.as_ref() {
-            let mut pos = pos.lock();
             if placement == WritePlacement::Current
                 || self
                     .location()
                     .flags()
                     .contains(NodeFlags::POSITIONED_APPEND)
             {
-                self.write_at(src, *pos).inspect(|n| {
-                    *pos += *n as u64;
-                })
+                let offset = *pos.lock();
+                let requested = src.remaining();
+                offset
+                    .checked_add(requested as u64)
+                    .ok_or(VfsError::InvalidInput)?;
+                let allowed = admit(offset, requested)?;
+                if allowed > requested {
+                    return Err(VfsError::InvalidInput);
+                }
+                let mut admitted = (&mut src).take(allowed as u64);
+                let written = self.write_at(&mut admitted, offset)?;
+                if written > allowed {
+                    return Err(VfsError::InvalidInput);
+                }
+                *pos.lock() = offset
+                    .checked_add(written as u64)
+                    .ok_or(VfsError::InvalidInput)?;
+                Ok(written)
             } else {
-                self.write_at_end_with_new_end(src)
+                self.write_at_end_with_admission_and_new_end(src, admit)
                     .map(|(written, new_end)| {
-                        *pos = new_end;
+                        *pos.lock() = new_end;
                         written
                     })
             }
         } else {
-            self.write_at(src, 0)
+            let requested = src.remaining();
+            let allowed = admit(0, requested)?;
+            if allowed > requested {
+                return Err(VfsError::InvalidInput);
+            }
+            let mut admitted = (&mut src).take(allowed as u64);
+            self.write_at(&mut admitted, 0)
         }
+    }
+
+    /// Writes data using an explicit placement decision.
+    pub fn write_with_placement(
+        &self,
+        src: impl Read + IoBuf,
+        placement: WritePlacement,
+    ) -> axio::Result<usize> {
+        self.write_with_placement_and_admission(src, placement, |_offset, requested| Ok(requested))
     }
 
     /// Writes a byte slice using an explicit placement decision.
@@ -4126,29 +5526,33 @@ mod tests {
     };
     use core::{
         any::Any,
-        sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
         task::Context,
         time::Duration,
     };
     use std::{
-        sync::{Barrier, Mutex as StdMutex, mpsc},
+        sync::{Barrier, Mutex as StdMutex, Once as StdOnce, mpsc},
         thread,
     };
 
     use axfs_ng_vfs::{
-        DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata, MetadataUpdate,
-        Mountpoint, NodeFlags, NodeOps, NodePermission, NodeType, Reference, StatFs, VfsError,
-        VfsResult,
+        DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, Location, Metadata,
+        MetadataUpdate, Mountpoint, NodeFlags, NodeOps, NodePermission, NodeType, Reference,
+        StatFs, VfsError, VfsResult,
     };
-    use axio::{Cursor, Seek, SeekFrom};
+    use axio::{Cursor, IoBuf, IoBufMut, Read, Seek, SeekFrom, Write};
     use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
     use axsync::Mutex;
 
     use super::{
-        CLOSED_FILE_CACHE_RETAINED_PAGES, CachedFile, CachedFileShared, File, FileBackend,
-        FileFlags, FileUserData, OpenOptions, WritePlacement, cached_file_registry_key,
-        cached_file_shared_for_location_or_create, file_cache_registry,
-        release_unlinked_cached_file_registry_ownership,
+        ALIGNED_BYPASS_CHUNK, CLOSED_FILE_CACHE_RETAINED_PAGES, CachedFile,
+        CachedFileEvictionOwner, CachedFileShared, CachedPageInvalidationTransaction, File,
+        FileBackend, FileFlags, FileUserData, MAX_MUTABLE_PINNED_PHYSICAL_SEGMENTS, OpenOptions,
+        PAGE_SIZE, PinnedPhysicalSegment, WritePlacement, acknowledge_cached_page_eviction,
+        cached_file_registry_key, cached_file_shared_for_location_or_create, discard_cached_pages,
+        file_cache_registry, physical_to_virtual, release_unlinked_cached_file_registry_ownership,
+        try_zeroed_pinned_io_bounce, validate_pinned_physical_segments,
+        with_sync_and_invalidate_cached_file_pages,
     };
 
     #[test]
@@ -4166,12 +5570,25 @@ mod tests {
     struct AppendTestState {
         read_offsets: Mutex<Vec<u64>>,
         write_offsets: Mutex<Vec<u64>>,
+        read_calls: AtomicUsize,
+        async_read_calls: AtomicUsize,
+        write_calls: AtomicUsize,
         append_calls: AtomicUsize,
         open_calls: AtomicUsize,
+        set_len_calls: AtomicUsize,
+        last_read_buf: AtomicUsize,
+        last_write_buf: AtomicUsize,
         inode_len: AtomicU64,
         append_limit: AtomicUsize,
+        fail_read_call: AtomicUsize,
+        fail_write_call: AtomicUsize,
         fail_append_call: AtomicUsize,
+        fail_set_len_call: AtomicUsize,
         yield_after_append: AtomicBool,
+        fail_set_len: AtomicBool,
+        set_len_failure_atomic: AtomicBool,
+        full_page_io: AtomicBool,
+        stored_first_byte: AtomicU8,
         append_markers: StdMutex<Vec<u8>>,
     }
 
@@ -4180,12 +5597,25 @@ mod tests {
             Arc::new(Self {
                 read_offsets: Mutex::new(Vec::new()),
                 write_offsets: Mutex::new(Vec::new()),
+                read_calls: AtomicUsize::new(0),
+                async_read_calls: AtomicUsize::new(0),
+                write_calls: AtomicUsize::new(0),
                 append_calls: AtomicUsize::new(0),
                 open_calls: AtomicUsize::new(0),
+                set_len_calls: AtomicUsize::new(0),
+                last_read_buf: AtomicUsize::new(0),
+                last_write_buf: AtomicUsize::new(0),
                 inode_len: AtomicU64::new(inode_len),
                 append_limit: AtomicUsize::new(usize::MAX),
+                fail_read_call: AtomicUsize::new(usize::MAX),
+                fail_write_call: AtomicUsize::new(usize::MAX),
                 fail_append_call: AtomicUsize::new(usize::MAX),
+                fail_set_len_call: AtomicUsize::new(usize::MAX),
                 yield_after_append: AtomicBool::new(false),
+                fail_set_len: AtomicBool::new(false),
+                set_len_failure_atomic: AtomicBool::new(true),
+                full_page_io: AtomicBool::new(false),
+                stored_first_byte: AtomicU8::new(0),
                 append_markers: StdMutex::new(Vec::new()),
             })
         }
@@ -4264,7 +5694,27 @@ mod tests {
 
     impl FileNodeOps for AppendTestFile {
         fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+            self.state
+                .last_read_buf
+                .store(buf.as_ptr() as usize, Ordering::Release);
             self.state.read_offsets.lock().push(offset);
+            let call = self.state.read_calls.fetch_add(1, Ordering::AcqRel);
+            if call == self.state.fail_read_call.load(Ordering::Acquire) {
+                return Err(VfsError::InvalidInput);
+            }
+            if self.state.full_page_io.load(Ordering::Acquire) {
+                let len = self
+                    .state
+                    .inode_len
+                    .load(Ordering::Acquire)
+                    .saturating_sub(offset)
+                    .min(buf.len() as u64) as usize;
+                buf[..len].fill(0);
+                if offset == 0 && len != 0 {
+                    buf[0] = self.state.stored_first_byte.load(Ordering::Acquire);
+                }
+                return Ok(len);
+            }
             let data = b"abcdefgh";
             let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidInput)?;
             if offset >= data.len() {
@@ -4276,11 +5726,37 @@ mod tests {
         }
 
         fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
+            self.state
+                .last_write_buf
+                .store(buf.as_ptr() as usize, Ordering::Release);
             self.state.write_offsets.lock().push(offset);
+            let call = self.state.write_calls.fetch_add(1, Ordering::AcqRel);
+            if call == self.state.fail_write_call.load(Ordering::Acquire) {
+                return Err(VfsError::InvalidInput);
+            }
+            if self.state.full_page_io.load(Ordering::Acquire) {
+                if offset == 0
+                    && let Some(first) = buf.first()
+                {
+                    self.state
+                        .stored_first_byte
+                        .store(*first, Ordering::Release);
+                }
+                return Ok(buf.len());
+            }
             if offset != 0 {
                 return Err(VfsError::InvalidInput);
             }
             Ok(buf.len().min(2))
+        }
+
+        fn try_read_at_vectored_async(
+            &self,
+            _bufs: &mut [&mut [u8]],
+            _offset: u64,
+        ) -> VfsResult<Option<usize>> {
+            self.state.async_read_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(None)
         }
 
         fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {
@@ -4305,8 +5781,21 @@ mod tests {
         }
 
         fn set_len(&self, len: u64) -> VfsResult<()> {
+            let call = self.state.set_len_calls.fetch_add(1, Ordering::AcqRel);
+            if self.state.fail_set_len.load(Ordering::Acquire)
+                || call == self.state.fail_set_len_call.load(Ordering::Acquire)
+            {
+                if !self.state.set_len_failure_atomic.load(Ordering::Acquire) {
+                    self.state.inode_len.store(len, Ordering::Release);
+                }
+                return Err(VfsError::InvalidInput);
+            }
             self.state.inode_len.store(len, Ordering::Release);
             Ok(())
+        }
+
+        fn set_len_failure_is_atomic(&self) -> bool {
+            self.state.set_len_failure_atomic.load(Ordering::Acquire)
         }
 
         fn set_symlink(&self, _target: &str) -> VfsResult<()> {
@@ -4331,6 +5820,405 @@ mod tests {
         append_test_file_with_access(flags, inode_len, FileFlags::WRITE | FileFlags::APPEND)
     }
 
+    fn init_test_page_allocator() {
+        static PAGE_ALLOCATOR_INIT: StdOnce = StdOnce::new();
+        PAGE_ALLOCATOR_INIT.call_once(|| {
+            const TEST_PAGE_MEMORY: usize = 16 * 1024 * 1024;
+            const PAGE_ALLOCATOR_BASE_ALIGN: usize = 1024 * 1024 * 1024;
+            let layout =
+                std::alloc::Layout::from_size_align(TEST_PAGE_MEMORY, PAGE_ALLOCATOR_BASE_ALIGN)
+                    .unwrap();
+            let memory = unsafe { std::alloc::alloc_zeroed(layout) };
+            assert!(!memory.is_null());
+            axalloc::global_init(memory as usize, TEST_PAGE_MEMORY);
+        });
+    }
+
+    fn cached_append_test_file(inode_len: u64) -> (CachedFile, Location, Arc<AppendTestState>) {
+        init_test_page_allocator();
+
+        let state = AppendTestState::new(inode_len);
+        let fs = Filesystem::new(RegistryTestFs::new_for_append(
+            NodeFlags::empty(),
+            state.clone(),
+        ));
+        let location = Mountpoint::new_root(&fs).root_location();
+        let cached = CachedFile::get_or_create(location.clone());
+        (cached, location, state)
+    }
+
+    fn seed_cached_page(
+        cached: &CachedFile,
+        pn: u32,
+        byte: u8,
+        dirty: bool,
+    ) -> axhal::mem::PhysAddr {
+        let mut paddr = None;
+        cached
+            .with_page_or_insert(pn, |page, evicted| {
+                assert!(evicted.is_none());
+                page.data().fill(byte);
+                if dirty {
+                    page.mark_dirty();
+                }
+                paddr = Some(page.paddr());
+                Ok(())
+            })
+            .unwrap();
+        paddr.unwrap()
+    }
+
+    struct RawPhysicalReader {
+        paddr: usize,
+        remaining: usize,
+    }
+
+    impl RawPhysicalReader {
+        fn new(paddr: usize, len: usize) -> Self {
+            Self {
+                paddr,
+                remaining: len,
+            }
+        }
+    }
+
+    impl Read for RawPhysicalReader {
+        fn read(&mut self, buf: &mut [u8]) -> axio::Result<usize> {
+            let len = self.remaining.min(buf.len());
+            let src = physical_to_virtual(axhal::mem::PhysAddr::from(self.paddr)).as_ptr();
+            unsafe { core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), len) };
+            self.paddr += len;
+            self.remaining -= len;
+            Ok(len)
+        }
+    }
+
+    impl IoBuf for RawPhysicalReader {
+        fn remaining(&self) -> usize {
+            self.remaining
+        }
+    }
+
+    struct RawPhysicalWriter {
+        paddr: usize,
+        remaining: usize,
+    }
+
+    impl RawPhysicalWriter {
+        fn new(paddr: usize, len: usize) -> Self {
+            Self {
+                paddr,
+                remaining: len,
+            }
+        }
+    }
+
+    impl Write for RawPhysicalWriter {
+        fn write(&mut self, buf: &[u8]) -> axio::Result<usize> {
+            let len = self.remaining.min(buf.len());
+            let dst = physical_to_virtual(axhal::mem::PhysAddr::from(self.paddr)).as_mut_ptr();
+            unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, len) };
+            self.paddr += len;
+            self.remaining -= len;
+            Ok(len)
+        }
+
+        fn flush(&mut self) -> axio::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl IoBufMut for RawPhysicalWriter {
+        fn remaining_mut(&self) -> usize {
+            self.remaining
+        }
+    }
+
+    struct FaultingReader {
+        bytes: Vec<u8>,
+        position: usize,
+        calls: usize,
+        fail_call: usize,
+    }
+
+    impl FaultingReader {
+        fn new(len: usize, fail_call: usize) -> Self {
+            Self {
+                bytes: vec![0x5a; len],
+                position: 0,
+                calls: 0,
+                fail_call,
+            }
+        }
+    }
+
+    impl Read for FaultingReader {
+        fn read(&mut self, dst: &mut [u8]) -> axio::Result<usize> {
+            let call = self.calls;
+            self.calls += 1;
+            if call == self.fail_call {
+                return Err(axio::Error::BadAddress);
+            }
+            let len = dst.len().min(self.remaining());
+            dst[..len].copy_from_slice(&self.bytes[self.position..self.position + len]);
+            self.position += len;
+            Ok(len)
+        }
+    }
+
+    impl IoBuf for FaultingReader {
+        fn remaining(&self) -> usize {
+            self.bytes.len() - self.position
+        }
+    }
+
+    #[test]
+    fn pinned_same_cache_page_read_and_scatter_read_use_overlap_bounce() {
+        let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        let paddr: usize = seed_cached_page(&cached, 0, 0, false).into();
+        let expected = (0..96).map(|value| value as u8).collect::<Vec<_>>();
+        cached.with_page(0, |page| {
+            page.unwrap().data()[..expected.len()].copy_from_slice(&expected);
+        });
+
+        let scalar = [PinnedPhysicalSegment::new(paddr + 512, 32)];
+        assert_eq!(
+            unsafe { cached.read_at_pinned_segments(&scalar, 0, false) },
+            Ok(32)
+        );
+        let scatter = [
+            PinnedPhysicalSegment::new(paddr + 1024, 32),
+            PinnedPhysicalSegment::new(paddr + 1536, 32),
+        ];
+        assert_eq!(
+            unsafe { cached.read_at_pinned_segments(&scatter, 32, false) },
+            Ok(64)
+        );
+
+        cached.with_page(0, |page| {
+            let data = page.unwrap().data();
+            assert_eq!(&data[512..544], &expected[..32]);
+            assert_eq!(&data[1024..1056], &expected[32..64]);
+            assert_eq!(&data[1536..1568], &expected[64..96]);
+        });
+    }
+
+    #[test]
+    fn mutable_pinned_segment_validation_is_fixed_and_bounded() {
+        let segments: [PinnedPhysicalSegment; MAX_MUTABLE_PINNED_PHYSICAL_SEGMENTS] =
+            core::array::from_fn(|index| {
+                PinnedPhysicalSegment::new(0x1000 + index * 0x1000, 0x1000)
+            });
+        assert_eq!(
+            validate_pinned_physical_segments(&segments, true),
+            Ok(MAX_MUTABLE_PINNED_PHYSICAL_SEGMENTS * 0x1000)
+        );
+
+        let overflow: [PinnedPhysicalSegment; MAX_MUTABLE_PINNED_PHYSICAL_SEGMENTS + 1] =
+            core::array::from_fn(|index| {
+                PinnedPhysicalSegment::new(0x1000 + index * 0x1000, 0x1000)
+            });
+        assert_eq!(
+            validate_pinned_physical_segments(&overflow, true),
+            Err(VfsError::InvalidInput)
+        );
+        assert_eq!(
+            validate_pinned_physical_segments(
+                &[
+                    PinnedPhysicalSegment::new(0x1000, 0x1000),
+                    PinnedPhysicalSegment::new(0x1800, 0x1000),
+                ],
+                true,
+            ),
+            Err(VfsError::InvalidInput)
+        );
+
+        let bounce = try_zeroed_pinned_io_bounce(PAGE_SIZE).unwrap();
+        assert_eq!(bounce.len(), PAGE_SIZE);
+        assert!(bounce.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn pinned_same_cache_page_write_and_scatter_write_use_overlap_bounce() {
+        let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        let paddr: usize = seed_cached_page(&cached, 0, 0, false).into();
+        cached.with_page(0, |page| {
+            let data = page.unwrap().data();
+            data[512..544].fill(0x51);
+            data[1024..1040].fill(0x61);
+            data[1536..1552].fill(0x71);
+        });
+
+        let scalar = [PinnedPhysicalSegment::new(paddr + 512, 32)];
+        assert_eq!(
+            unsafe { cached.write_at_pinned_segments(&scalar, 0, false) },
+            Ok(32)
+        );
+        let scatter = [
+            PinnedPhysicalSegment::new(paddr + 1024, 16),
+            PinnedPhysicalSegment::new(paddr + 1536, 16),
+        ];
+        assert_eq!(
+            unsafe { cached.write_at_pinned_segments(&scatter, 128, false) },
+            Ok(32)
+        );
+
+        cached.with_page(0, |page| {
+            let data = page.unwrap().data();
+            assert!(data[..32].iter().all(|byte| *byte == 0x51));
+            assert!(data[128..144].iter().all(|byte| *byte == 0x61));
+            assert!(data[144..160].iter().all(|byte| *byte == 0x71));
+        });
+    }
+
+    #[test]
+    fn aligned_same_cache_page_pin_falls_back_from_direct_bypass() {
+        let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        let paddr = seed_cached_page(&cached, 0, 0x5a, false);
+        let segment = [PinnedPhysicalSegment::new(paddr.into(), PAGE_SIZE)];
+        let pin = cached.pin_cached_page_by_paddr(0, paddr, true).unwrap();
+
+        assert_eq!(
+            unsafe { cached.read_at_pinned_segments(&segment, 0, true) },
+            Ok(PAGE_SIZE)
+        );
+        assert_eq!(
+            unsafe { cached.write_at_pinned_segments(&segment, 0, true) },
+            Ok(PAGE_SIZE)
+        );
+        drop(pin);
+        cached.with_page(0, |page| {
+            let page = page.unwrap();
+            assert!(page.is_dirty());
+            assert!(page.data().iter().all(|byte| *byte == 0x5a));
+        });
+    }
+
+    #[test]
+    fn filesystem_inode_aliases_share_pinned_overlap_policy() {
+        init_test_page_allocator();
+        let state = AppendTestState::new(PAGE_SIZE as u64);
+        let fs = Filesystem::new(RegistryTestFs::new_for_append(NodeFlags::empty(), state));
+        // Distinct locations for the same filesystem/inode model two hardlink
+        // dentries and must resolve to one cache registry owner.
+        let first = CachedFile::get_or_create(Mountpoint::new_root(&fs).root_location());
+        let alias = CachedFile::get_or_create(Mountpoint::new_root(&fs).root_location());
+        assert!(first.ptr_eq(&alias));
+
+        let paddr: usize = seed_cached_page(&first, 0, 0x2a, false).into();
+        let destination = [PinnedPhysicalSegment::new(paddr + 512, 32)];
+        assert_eq!(
+            unsafe { alias.read_at_pinned_segments(&destination, 0, false) },
+            Ok(32)
+        );
+        first.with_page(0, |page| {
+            assert!(
+                page.unwrap().data()[512..544]
+                    .iter()
+                    .all(|byte| *byte == 0x2a)
+            );
+        });
+    }
+
+    #[test]
+    fn generic_raw_physical_io_bounces_outside_page_data_borrow() {
+        let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        let paddr: usize = seed_cached_page(&cached, 0, 0, false).into();
+        cached.with_page(0, |page| {
+            let data = page.unwrap().data();
+            data[..32].fill(0x31);
+            data[1024..1056].fill(0x41);
+        });
+
+        assert_eq!(
+            cached.read_at(RawPhysicalWriter::new(paddr + 512, 32), 0),
+            Ok(32)
+        );
+        assert_eq!(
+            cached.write_at(RawPhysicalReader::new(paddr + 1024, 32), 128),
+            Ok(32)
+        );
+        cached.with_page(0, |page| {
+            let data = page.unwrap().data();
+            assert!(data[512..544].iter().all(|byte| *byte == 0x31));
+            assert!(data[128..160].iter().all(|byte| *byte == 0x41));
+        });
+    }
+
+    #[test]
+    fn transactional_sync_read_never_calls_async_lower_hook() {
+        let (cached, _location, state) = cached_append_test_file(PAGE_SIZE as u64);
+        state.full_page_io.store(true, Ordering::Release);
+        let mut output = vec![0xa5; PAGE_SIZE];
+
+        assert_eq!(cached.read_at_sync(&mut &mut output[..], 0), Ok(PAGE_SIZE));
+        assert_eq!(state.async_read_calls.load(Ordering::Acquire), 0);
+        assert_eq!(state.read_calls.load(Ordering::Acquire), 1);
+        assert!(output.iter().all(|byte| *byte == 0));
+    }
+
+    #[cfg(feature = "ext4")]
+    #[test]
+    fn pinned_fallback_policy_never_calls_async_lower_hook() {
+        struct AsyncMappedReadReset;
+
+        impl Drop for AsyncMappedReadReset {
+            fn drop(&mut self) {
+                lwext4_rust::set_async_mapped_read_enabled(false);
+            }
+        }
+
+        lwext4_rust::set_async_mapped_read_enabled(true);
+        let _reset = AsyncMappedReadReset;
+
+        let (reader, _location, read_state) = cached_append_test_file(PAGE_SIZE as u64);
+        read_state.full_page_io.store(true, Ordering::Release);
+        let reader = FileBackend::Cached(reader);
+        let (destination_cache, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        let destination_paddr = seed_cached_page(&destination_cache, 0, 0xa5, false);
+        let destination_pin = destination_cache
+            .pin_cached_page_by_paddr(0, destination_paddr, true)
+            .unwrap();
+        let destination = [PinnedPhysicalSegment::new(
+            usize::from(destination_paddr) + 128,
+            8,
+        )];
+        assert_eq!(
+            unsafe { reader.read_at_pinned_segments(&destination, 1, true) },
+            Ok(8)
+        );
+        assert_eq!(read_state.async_read_calls.load(Ordering::Acquire), 0);
+        assert_eq!(read_state.read_calls.load(Ordering::Acquire), 1);
+        destination_cache.with_page(0, |page| {
+            assert!(page.unwrap().data()[128..136].iter().all(|byte| *byte == 0));
+        });
+        drop(destination_pin);
+
+        let (writer, _location, write_state) = cached_append_test_file(PAGE_SIZE as u64);
+        write_state.full_page_io.store(true, Ordering::Release);
+        let cached_writer = writer.clone();
+        let writer = FileBackend::Cached(writer);
+        let (source_cache, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        let source_paddr = seed_cached_page(&source_cache, 0, 0x5a, false);
+        let source_pin = source_cache
+            .pin_cached_page_by_paddr(0, source_paddr, false)
+            .unwrap();
+        let source = [PinnedPhysicalSegment::new(
+            usize::from(source_paddr) + 128,
+            8,
+        )];
+        assert_eq!(
+            unsafe { writer.write_at_pinned_segments(&source, 1, true) },
+            Ok(8)
+        );
+        assert_eq!(write_state.async_read_calls.load(Ordering::Acquire), 0);
+        assert_eq!(write_state.read_calls.load(Ordering::Acquire), 1);
+        cached_writer.with_page(0, |page| {
+            assert!(page.unwrap().data()[1..9].iter().all(|byte| *byte == 0x5a));
+        });
+        drop(source_pin);
+    }
+
     #[test]
     fn deferred_open_leaves_truncate_for_the_prepared_consumer_to_commit() {
         let state = AppendTestState::new(41);
@@ -4351,6 +6239,437 @@ mod tests {
 
         file.backend().unwrap().set_len(0).unwrap();
         assert_eq!(state.inode_len.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cached_truncate_rejects_pin_preparation_before_inode_mutation() {
+        let state = AppendTestState::new(41);
+        let fs = Filesystem::new(RegistryTestFs::new_for_append(
+            NodeFlags::empty(),
+            state.clone(),
+        ));
+        let mountpoint = Mountpoint::new_root(&fs);
+        let cached = CachedFile::get_or_create(mountpoint.root_location());
+        let window = cached.begin_user_io_pin_window().unwrap();
+
+        assert!(matches!(cached.set_len(0), Err(VfsError::ResourceBusy)));
+        assert_eq!(state.inode_len.load(Ordering::Acquire), 41);
+
+        drop(window);
+        cached.set_len(0).unwrap();
+        assert_eq!(state.inode_len.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn concurrent_buffered_cache_users_share_admission() {
+        let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        let cached = Arc::new(cached);
+        let (holding_tx, holding_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let first_cached = cached.clone();
+        let first = thread::spawn(move || {
+            first_cached.with_page_or_insert(0, |_, _| {
+                holding_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        holding_rx.recv().unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let second_cached = cached.clone();
+        let second = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            second_cached.with_page_or_insert(0, |_, _| Ok(()))
+        });
+        started_rx.recv().unwrap();
+
+        let mut admitted = false;
+        for _ in 0..10_000 {
+            if cached.shared.user_io_pin_admission.lock().cache_users == 2 {
+                admitted = true;
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(admitted, "second buffered cache user was not admitted");
+
+        release_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), Ok(()));
+        assert_eq!(second.join().unwrap(), Ok(()));
+        assert_eq!(cached.shared.user_io_pin_admission.lock().cache_users, 0);
+    }
+
+    #[test]
+    fn same_owner_may_defer_cache_eviction_acknowledgement() {
+        let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x41, false);
+        let owner = CachedFileEvictionOwner::new(1).unwrap();
+        let handle = cached.add_evict_listener(owner, |_, _| false);
+
+        let acknowledgement = {
+            let mut cache = cached.shared.page_cache.lock();
+            let page = cache.get_mut(&0).unwrap();
+            acknowledge_cached_page_eviction(&cached.shared, 0, page, Some(owner)).unwrap()
+        };
+        assert!(acknowledgement.had_listener);
+        assert!(acknowledgement.deferred);
+
+        unsafe { cached.remove_evict_listener(handle) };
+    }
+
+    #[test]
+    fn repeated_shared_page_writes_rearm_listener_on_each_sync() {
+        let (cached, _location, state) = cached_append_test_file(PAGE_SIZE as u64);
+        state.full_page_io.store(true, Ordering::Release);
+        seed_cached_page(&cached, 0, b'A', true);
+        let listener_calls = Arc::new(AtomicUsize::new(0));
+        let calls = listener_calls.clone();
+        let owner = CachedFileEvictionOwner::new(3).unwrap();
+        let handle = cached.add_evict_listener(owner, move |_, _| {
+            calls.fetch_add(1, Ordering::AcqRel);
+            true
+        });
+
+        cached.sync(false).unwrap();
+        assert_eq!(listener_calls.load(Ordering::Acquire), 1);
+        assert_eq!(state.stored_first_byte.load(Ordering::Acquire), b'A');
+        cached.with_page(0, |page| assert!(!page.unwrap().is_dirty()));
+
+        cached.with_page(0, |page| {
+            let page = page.unwrap();
+            page.data()[0] = b'B';
+            page.mark_dirty();
+        });
+        cached.sync(false).unwrap();
+        assert_eq!(listener_calls.load(Ordering::Acquire), 2);
+        assert_eq!(state.stored_first_byte.load(Ordering::Acquire), b'B');
+        cached.with_page(0, |page| assert!(!page.unwrap().is_dirty()));
+
+        unsafe { cached.remove_evict_listener(handle) };
+    }
+
+    #[test]
+    fn foreign_deferred_listener_rolls_back_dirty_invalidation() {
+        let (cached, _location, state) = cached_append_test_file(PAGE_SIZE as u64);
+        let original_paddr = seed_cached_page(&cached, 0, 0x5a, true);
+        let foreign = CachedFileEvictionOwner::new(2).unwrap();
+        let handle = cached.add_evict_listener(foreign, |_, _| false);
+
+        let mutation = cached.begin_cache_invalidating_mutation().unwrap();
+        let result = {
+            let mut invalidation = CachedPageInvalidationTransaction::new(&mutation);
+            invalidation.stage_all()
+        };
+        assert_eq!(result, Err(VfsError::ResourceBusy));
+        cached.with_page(0, |page| {
+            let page = page.expect("listener contention must restore the staged page");
+            assert_eq!(page.paddr(), original_paddr);
+            assert!(page.is_dirty());
+            assert!(page.data().iter().all(|byte| *byte == 0x5a));
+        });
+        assert!(state.write_offsets.lock().is_empty());
+        assert_eq!(state.set_len_calls.load(Ordering::Acquire), 0);
+        drop(mutation);
+
+        unsafe { cached.remove_evict_listener(handle) };
+    }
+
+    #[test]
+    fn short_invalidation_writeback_restores_the_dirty_page() {
+        let (cached, location, state) = cached_append_test_file(PAGE_SIZE as u64);
+        let original_paddr = seed_cached_page(&cached, 0, 0x5a, true);
+
+        let mutation = cached.begin_cache_invalidating_mutation().unwrap();
+        let result = {
+            let mut invalidation = CachedPageInvalidationTransaction::new(&mutation);
+            invalidation.stage_all().unwrap();
+            invalidation.writeback(location.entry().as_file().unwrap(), false)
+        };
+        assert_eq!(result, Err(VfsError::Io));
+        cached.with_page(0, |page| {
+            let page = page.expect("short writeback must restore the staged page");
+            assert_eq!(page.paddr(), original_paddr);
+            assert!(page.is_dirty());
+            assert!(page.data().iter().all(|byte| *byte == 0x5a));
+        });
+        assert_eq!(state.write_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn precise_pin_blocks_cached_and_direct_truncate_before_raw_set_len() {
+        for direct in [false, true] {
+            let (cached, location, state) = cached_append_test_file((PAGE_SIZE * 2) as u64);
+            let paddr = seed_cached_page(&cached, 1, 0x33, false);
+            let pin = cached.pin_cached_page_by_paddr(1, paddr, false).unwrap();
+
+            let result = if direct {
+                FileBackend::Direct(location).set_len(0)
+            } else {
+                cached.set_len(0)
+            };
+            assert_eq!(result, Err(VfsError::ResourceBusy));
+            assert_eq!(state.set_len_calls.load(Ordering::Acquire), 0);
+            assert_eq!(
+                state.inode_len.load(Ordering::Acquire),
+                (PAGE_SIZE * 2) as u64
+            );
+            drop(pin);
+        }
+    }
+
+    #[test]
+    fn non_overlapping_precise_pin_allows_cached_shrink() {
+        let (cached, _location, state) = cached_append_test_file((PAGE_SIZE * 3) as u64);
+        let paddr = seed_cached_page(&cached, 0, 0x11, false);
+        seed_cached_page(&cached, 2, 0x22, false);
+        let pin = cached.pin_cached_page_by_paddr(0, paddr, false).unwrap();
+
+        cached.set_len((PAGE_SIZE * 2) as u64).unwrap();
+        assert_eq!(state.set_len_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            state.inode_len.load(Ordering::Acquire),
+            (PAGE_SIZE * 2) as u64
+        );
+        cached.with_page(0, |page| assert!(page.is_some()));
+        cached.with_page(2, |page| assert!(page.is_none()));
+        drop(pin);
+    }
+
+    #[test]
+    fn write_pin_marks_page_dirty_and_retains_writeback_ownership_on_release() {
+        let (cached, location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        let paddr = seed_cached_page(&cached, 0, 0x44, false);
+        let window = cached.begin_user_io_pin_window().unwrap();
+        let pin = cached.pin_cached_page_by_paddr(0, paddr, true).unwrap();
+        drop(window);
+
+        cached.with_page(0, |page| assert!(!page.unwrap().is_dirty()));
+        drop(pin);
+        cached.with_page(0, |page| assert!(page.unwrap().is_dirty()));
+        let key = cached_file_registry_key(&location);
+        assert!(
+            file_cache_registry()
+                .lock()
+                .get(&key)
+                .is_some_and(|entry| entry.writeback_anchor.is_some())
+        );
+    }
+
+    #[test]
+    fn direct_truncate_failure_restores_staged_dirty_page() {
+        let (cached, location, state) = cached_append_test_file(PAGE_SIZE as u64);
+        let original_paddr = seed_cached_page(&cached, 0, 0x6b, true);
+        state.full_page_io.store(true, Ordering::Release);
+        state.fail_set_len.store(true, Ordering::Release);
+
+        assert_eq!(
+            FileBackend::Direct(location).set_len(0),
+            Err(VfsError::InvalidInput)
+        );
+        assert_eq!(state.set_len_calls.load(Ordering::Acquire), 1);
+        assert_eq!(state.inode_len.load(Ordering::Acquire), PAGE_SIZE as u64);
+        assert_eq!(&*state.write_offsets.lock(), &[0]);
+        cached.with_page(0, |page| {
+            let page = page.expect("failed truncate must restore the staged page");
+            assert_eq!(page.paddr(), original_paddr);
+            assert!(page.is_dirty());
+            assert!(page.data().iter().all(|byte| *byte == 0x6b));
+        });
+    }
+
+    #[test]
+    fn cached_atomic_truncate_failure_restores_written_back_dirty_page() {
+        let (cached, _location, state) = cached_append_test_file(PAGE_SIZE as u64);
+        let original_paddr = seed_cached_page(&cached, 0, 0x6d, true);
+        state.full_page_io.store(true, Ordering::Release);
+        state.fail_set_len.store(true, Ordering::Release);
+
+        assert_eq!(cached.set_len(0), Err(VfsError::InvalidInput));
+        assert_eq!(state.set_len_calls.load(Ordering::Acquire), 1);
+        assert_eq!(state.inode_len.load(Ordering::Acquire), PAGE_SIZE as u64);
+        assert_eq!(&*state.write_offsets.lock(), &[0]);
+        cached.with_page(0, |page| {
+            let page = page.expect("atomic truncate failure must restore the staged page");
+            assert_eq!(page.paddr(), original_paddr);
+            assert!(page.is_dirty());
+            assert!(page.data().iter().all(|byte| *byte == 0x6d));
+        });
+    }
+
+    #[test]
+    fn non_atomic_truncate_failure_discards_potentially_stale_cache() {
+        let (cached, location, state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x71, true);
+        state.full_page_io.store(true, Ordering::Release);
+        state.fail_set_len.store(true, Ordering::Release);
+        state.set_len_failure_atomic.store(false, Ordering::Release);
+
+        assert_eq!(
+            FileBackend::Direct(location).set_len(0),
+            Err(VfsError::InvalidInput)
+        );
+        assert_eq!(state.set_len_calls.load(Ordering::Acquire), 1);
+        assert_eq!(state.inode_len.load(Ordering::Acquire), 0);
+        cached.with_page(0, |page| assert!(page.is_none()));
+    }
+
+    #[test]
+    fn cached_non_atomic_truncate_failure_writes_back_before_discard() {
+        let (cached, _location, state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x73, true);
+        state.full_page_io.store(true, Ordering::Release);
+        state.fail_set_len.store(true, Ordering::Release);
+        state.set_len_failure_atomic.store(false, Ordering::Release);
+
+        assert_eq!(cached.set_len(0), Err(VfsError::InvalidInput));
+        assert_eq!(state.set_len_calls.load(Ordering::Acquire), 1);
+        assert_eq!(state.inode_len.load(Ordering::Acquire), 0);
+        assert_eq!(&*state.write_offsets.lock(), &[0]);
+        cached.with_page(0, |page| assert!(page.is_none()));
+    }
+
+    #[test]
+    fn partial_page_truncate_zeroes_tail_and_discards_full_pages() {
+        let (cached, _location, state) = cached_append_test_file((PAGE_SIZE * 3) as u64);
+        seed_cached_page(&cached, 1, 0x7c, false);
+        seed_cached_page(&cached, 2, 0x2c, false);
+        let new_len = (PAGE_SIZE + 17) as u64;
+
+        cached.set_len(new_len).unwrap();
+        assert_eq!(state.inode_len.load(Ordering::Acquire), new_len);
+        cached.with_page(1, |page| {
+            let page = page.unwrap();
+            assert!(page.data()[..17].iter().all(|byte| *byte == 0x7c));
+            assert!(page.data()[17..].iter().all(|byte| *byte == 0));
+            assert!(page.is_dirty());
+        });
+        cached.with_page(2, |page| assert!(page.is_none()));
+    }
+
+    #[test]
+    fn direct_invalidation_holds_pin_admission_through_lower_operation() {
+        let (cached, location, _state) = cached_append_test_file(0);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let operation = thread::spawn(move || {
+            with_sync_and_invalidate_cached_file_pages(&location, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        entered_rx.recv().unwrap();
+        assert!(matches!(
+            cached.begin_user_io_pin_window(),
+            Err(VfsError::ResourceBusy)
+        ));
+        release_tx.send(()).unwrap();
+        assert_eq!(operation.join().unwrap(), Ok(()));
+        drop(cached.begin_user_io_pin_window().unwrap());
+    }
+
+    #[test]
+    fn aligned_write_bypass_waits_for_existing_writeback_reader() {
+        let (cached, _location, state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x52, true);
+        state.full_page_io.store(true, Ordering::Release);
+
+        let observer = cached.clone();
+        let writeback_reader = observer.shared.writeback_lock.read();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let new_page = vec![0x6a; PAGE_SIZE];
+        let writer = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx.send(cached.write_at_slice(&new_page, 0)).unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        let mut owns_direct_io = false;
+        for _ in 0..10_000 {
+            if observer.shared.direct_io_lock.try_read().is_none() {
+                owns_direct_io = true;
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(
+            owns_direct_io,
+            "aligned bypass did not enter its direct-I/O domain"
+        );
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        assert_eq!(state.write_calls.load(Ordering::Acquire), 0);
+        observer.with_page(0, |page| {
+            let page = page.expect("blocked bypass must not stage the dirty cache page");
+            assert!(page.is_dirty());
+            assert!(page.data().iter().all(|byte| *byte == 0x52));
+        });
+
+        drop(writeback_reader);
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Ok(PAGE_SIZE))
+        );
+        writer.join().unwrap();
+        assert_eq!(state.write_calls.load(Ordering::Acquire), 2);
+        assert_eq!(state.stored_first_byte.load(Ordering::Acquire), 0x6a);
+        observer.with_page(0, |page| assert!(page.is_none()));
+    }
+
+    #[test]
+    fn discard_waits_for_in_flight_writeback_before_staging_pages() {
+        let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x52, true);
+        let shared = cached.shared.clone();
+        let (writeback_started_tx, writeback_started_rx) = mpsc::channel();
+        let (release_writeback_tx, release_writeback_rx) = mpsc::channel();
+
+        let writeback_shared = shared.clone();
+        let writeback = thread::spawn(move || {
+            let _writeback_guard = writeback_shared.writeback_lock.read();
+            writeback_shared
+                .page_cache
+                .lock()
+                .get_mut(&0)
+                .unwrap()
+                .begin_writeback()
+                .unwrap();
+            writeback_started_tx.send(()).unwrap();
+            release_writeback_rx.recv().unwrap();
+            writeback_shared
+                .page_cache
+                .lock()
+                .get_mut(&0)
+                .unwrap()
+                .end_writeback();
+        });
+        writeback_started_rx.recv().unwrap();
+
+        let (discard_result_tx, discard_result_rx) = mpsc::channel();
+        let discard = thread::spawn(move || {
+            discard_result_tx
+                .send(discard_cached_pages(&shared))
+                .unwrap();
+        });
+        assert_eq!(
+            discard_result_rx.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+
+        release_writeback_tx.send(()).unwrap();
+        writeback.join().unwrap();
+        assert_eq!(
+            discard_result_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Ok(()))
+        );
+        discard.join().unwrap();
+        cached.with_page(0, |page| assert!(page.is_none()));
     }
 
     #[test]
@@ -4600,16 +6919,443 @@ mod tests {
     }
 
     #[test]
+    fn stream_read_and_append_status_write_use_zero_without_an_ofd_position() {
+        let (file, state) = append_test_file_with_access(
+            NodeFlags::NON_CACHEABLE | NodeFlags::STREAM,
+            8,
+            FileFlags::READ | FileFlags::WRITE | FileFlags::APPEND,
+        );
+
+        let mut bytes = [0u8; 2];
+        let mut dst = Cursor::new(&mut bytes[..]);
+        assert_eq!(file.read(&mut dst), Ok(2));
+        assert_eq!(&bytes, b"ab");
+
+        let mut src = Cursor::new(&b"xy"[..]);
+        assert_eq!(file.write(&mut src), Ok(2));
+        assert_eq!(&*state.read_offsets.lock(), &[0]);
+        assert_eq!(&*state.write_offsets.lock(), &[0]);
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 0);
+        assert!(!file.has_current_position());
+        assert!(file.supports_positioned_read());
+        assert!(file.supports_positioned_write());
+        assert!(file.supports_seek());
+        let mut handle = &file;
+        assert_eq!(handle.seek(SeekFrom::Current(0)), Ok(0));
+    }
+
+    #[test]
+    fn positioned_io_and_seek_capabilities_are_independent_of_stream_cursor() {
+        let flags = NodeFlags::NON_CACHEABLE
+            | NodeFlags::STREAM
+            | NodeFlags::NO_POSITIONED_READ
+            | NodeFlags::NO_POSITIONED_WRITE
+            | NodeFlags::NO_SEEK;
+        let (file, _state) =
+            append_test_file_with_access(flags, 8, FileFlags::READ | FileFlags::WRITE);
+
+        assert!(!file.has_current_position());
+        assert!(!file.supports_positioned_read());
+        assert!(!file.supports_positioned_write());
+        assert!(!file.supports_seek());
+    }
+
+    #[test]
+    fn direct_multichunk_errors_return_and_publish_committed_prefixes() {
+        let chunk = FileBackend::DIRECT_IO_CHUNK;
+
+        let (reader, read_state) = append_test_file_with_access(
+            NodeFlags::NON_CACHEABLE,
+            (chunk * 2) as u64,
+            FileFlags::READ,
+        );
+        read_state.full_page_io.store(true, Ordering::Release);
+        read_state.fail_read_call.store(1, Ordering::Release);
+        let mut output = vec![0u8; chunk * 2];
+        let mut dst = Cursor::new(output.as_mut_slice());
+        assert_eq!(reader.read(&mut dst), Ok(chunk));
+        let mut reader_handle = &reader;
+        assert_eq!(reader_handle.seek(SeekFrom::Current(0)), Ok(chunk as u64));
+        assert_eq!(&*read_state.read_offsets.lock(), &[0, chunk as u64]);
+
+        let (writer, write_state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 0, FileFlags::WRITE);
+        write_state.full_page_io.store(true, Ordering::Release);
+        write_state.fail_write_call.store(1, Ordering::Release);
+        let input = vec![0x5a; chunk * 2];
+        let mut src = Cursor::new(input.as_slice());
+        assert_eq!(
+            writer.write_with_placement(&mut src, WritePlacement::Current),
+            Ok(chunk)
+        );
+        let mut writer_handle = &writer;
+        assert_eq!(writer_handle.seek(SeekFrom::Current(0)), Ok(chunk as u64));
+        assert_eq!(&*write_state.write_offsets.lock(), &[0, chunk as u64]);
+    }
+
+    #[test]
+    fn cached_aligned_bypass_multichunk_errors_preserve_completed_prefixes() {
+        let chunk = ALIGNED_BYPASS_CHUNK;
+
+        let (cached, _location, read_state) = cached_append_test_file((chunk * 2) as u64);
+        read_state.full_page_io.store(true, Ordering::Release);
+        read_state.fail_read_call.store(1, Ordering::Release);
+        let reader = File::new(FileBackend::Cached(cached), FileFlags::READ);
+        let mut output = vec![0u8; chunk * 2];
+        let mut dst = Cursor::new(output.as_mut_slice());
+        assert_eq!(reader.read(&mut dst), Ok(chunk));
+        let mut reader_handle = &reader;
+        assert_eq!(reader_handle.seek(SeekFrom::Current(0)), Ok(chunk as u64));
+        assert_eq!(&*read_state.read_offsets.lock(), &[0, chunk as u64]);
+
+        let (cached, _location, source_state) = cached_append_test_file(0);
+        source_state.full_page_io.store(true, Ordering::Release);
+        let source_writer = File::new(FileBackend::Cached(cached), FileFlags::WRITE);
+        assert_eq!(
+            source_writer
+                .write_with_placement(FaultingReader::new(chunk * 2, 1), WritePlacement::Current,),
+            Ok(chunk)
+        );
+        let mut source_writer_handle = &source_writer;
+        assert_eq!(
+            source_writer_handle.seek(SeekFrom::Current(0)),
+            Ok(chunk as u64)
+        );
+        assert_eq!(&*source_state.write_offsets.lock(), &[0]);
+
+        let (cached, _location, write_state) = cached_append_test_file(0);
+        write_state.full_page_io.store(true, Ordering::Release);
+        write_state.fail_write_call.store(1, Ordering::Release);
+        let writer = File::new(FileBackend::Cached(cached), FileFlags::WRITE);
+        let input = vec![0x5a; chunk * 2];
+        let mut src = Cursor::new(input.as_slice());
+        assert_eq!(
+            writer.write_with_placement(&mut src, WritePlacement::Current),
+            Ok(chunk)
+        );
+        let mut writer_handle = &writer;
+        assert_eq!(writer_handle.seek(SeekFrom::Current(0)), Ok(chunk as u64));
+        assert_eq!(&*write_state.write_offsets.lock(), &[0, chunk as u64]);
+    }
+
+    #[test]
+    fn cached_write_fault_before_first_byte_does_not_extend_inode() {
+        let (cached, _location, state) = cached_append_test_file(0);
+        let file = File::new(FileBackend::Cached(cached), FileFlags::WRITE);
+
+        assert_eq!(
+            file.write_with_placement(
+                FaultingReader::new(PAGE_SIZE + 1, 0),
+                WritePlacement::Current,
+            ),
+            Err(axio::Error::BadAddress)
+        );
+        assert_eq!(state.inode_len.load(Ordering::Acquire), 0);
+        assert_eq!(state.set_len_calls.load(Ordering::Acquire), 0);
+        let mut handle = &file;
+        assert_eq!(handle.seek(SeekFrom::Current(0)), Ok(0));
+    }
+
+    #[test]
+    fn cached_generic_second_page_fault_returns_and_publishes_first_page() {
+        let (cached, _location, state) = cached_append_test_file(0);
+        let file = File::new(FileBackend::Cached(cached), FileFlags::WRITE);
+
+        assert_eq!(
+            file.write_with_placement(
+                FaultingReader::new(PAGE_SIZE + 1, 1),
+                WritePlacement::Current,
+            ),
+            Ok(PAGE_SIZE)
+        );
+        assert_eq!(state.inode_len.load(Ordering::Acquire), PAGE_SIZE as u64);
+        assert_eq!(state.set_len_calls.load(Ordering::Acquire), 1);
+        let mut handle = &file;
+        assert_eq!(handle.seek(SeekFrom::Current(0)), Ok(PAGE_SIZE as u64));
+    }
+
+    #[test]
+    fn cached_read_second_page_error_returns_and_publishes_first_page() {
+        let (cached, _location, state) = cached_append_test_file((PAGE_SIZE + 1) as u64);
+        state.full_page_io.store(true, Ordering::Release);
+        state.fail_read_call.store(1, Ordering::Release);
+        let file = File::new(FileBackend::Cached(cached), FileFlags::READ);
+        let mut output = vec![0u8; PAGE_SIZE + 1];
+
+        assert_eq!(file.read_slice(&mut output), Ok(PAGE_SIZE));
+        assert_eq!(&*state.read_offsets.lock(), &[0, PAGE_SIZE as u64]);
+        let mut handle = &file;
+        assert_eq!(handle.seek(SeekFrom::Current(0)), Ok(PAGE_SIZE as u64));
+    }
+
+    #[test]
+    fn cached_pinned_second_page_errors_preserve_completed_prefixes() {
+        let (reader, _location, read_state) = cached_append_test_file((PAGE_SIZE + 1) as u64);
+        read_state.full_page_io.store(true, Ordering::Release);
+        read_state.fail_read_call.store(1, Ordering::Release);
+        let mut destination = vec![0u8; PAGE_SIZE + 1];
+        let destination_segment = [PinnedPhysicalSegment::new(
+            destination.as_mut_ptr() as usize,
+            destination.len(),
+        )];
+        assert_eq!(
+            unsafe { reader.read_at_pinned_segments(&destination_segment, 0, false) },
+            Ok(PAGE_SIZE)
+        );
+
+        let (writer, _location, write_state) = cached_append_test_file(0);
+        write_state.fail_set_len_call.store(1, Ordering::Release);
+        let source = vec![0x6b; PAGE_SIZE + 1];
+        let source_segment = [PinnedPhysicalSegment::new(
+            source.as_ptr() as usize,
+            source.len(),
+        )];
+        assert_eq!(
+            unsafe { writer.write_at_pinned_segments(&source_segment, 0, false) },
+            Ok(PAGE_SIZE)
+        );
+        assert_eq!(
+            write_state.inode_len.load(Ordering::Acquire),
+            PAGE_SIZE as u64
+        );
+        assert_eq!(write_state.set_len_calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn direct_pinned_io_never_passes_user_physical_ranges_as_lower_slices() {
+        let (_cached, location, state) = cached_append_test_file(8);
+        let backend = FileBackend::Direct(location);
+
+        let mut destination = vec![0u8; 8];
+        let destination_start = destination.as_mut_ptr() as usize;
+        let destination_end = destination_start + destination.len();
+        let destination_segment = [PinnedPhysicalSegment::new(
+            destination_start,
+            destination.len(),
+        )];
+        assert_eq!(
+            unsafe { backend.read_at_pinned_segments(&destination_segment, 0, true) },
+            Ok(8)
+        );
+        let lower_read = state.last_read_buf.load(Ordering::Acquire);
+        assert!(!(destination_start..destination_end).contains(&lower_read));
+
+        let source = vec![0x4d; 8];
+        let source_start = source.as_ptr() as usize;
+        let source_end = source_start + source.len();
+        let source_segment = [PinnedPhysicalSegment::new(source_start, source.len())];
+        assert_eq!(
+            unsafe { backend.write_at_pinned_segments(&source_segment, 0, true) },
+            Ok(2)
+        );
+        let lower_write = state.last_write_buf.load(Ordering::Acquire);
+        assert!(!(source_start..source_end).contains(&lower_write));
+    }
+
+    #[test]
+    fn default_vectored_loops_preserve_progress_before_later_errors() {
+        let (reader, read_state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 2, FileFlags::READ);
+        read_state.full_page_io.store(true, Ordering::Release);
+        read_state.fail_read_call.store(1, Ordering::Release);
+        let mut left = [0u8; 1];
+        let mut right = [0u8; 1];
+        let mut dst: [&mut [u8]; 2] = [&mut left, &mut right];
+        assert_eq!(
+            reader
+                .location()
+                .entry()
+                .as_file()
+                .unwrap()
+                .read_at_vectored(&mut dst, 0),
+            Ok(1)
+        );
+
+        let (writer, write_state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 0, FileFlags::WRITE);
+        write_state.full_page_io.store(true, Ordering::Release);
+        write_state.fail_write_call.store(1, Ordering::Release);
+        let src: [&[u8]; 2] = [b"a", b"b"];
+        assert_eq!(
+            writer
+                .location()
+                .entry()
+                .as_file()
+                .unwrap()
+                .write_at_vectored(&src, 0),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn scalar_append_error_after_one_direct_chunk_publishes_the_prefix() {
+        let chunk = FileBackend::DIRECT_IO_CHUNK;
+        let (file, state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 0, FileFlags::WRITE);
+        state.fail_append_call.store(1, Ordering::Release);
+        let input = vec![0x41; chunk * 2];
+        let mut src = Cursor::new(input.as_slice());
+
+        assert_eq!(
+            file.write_with_placement(&mut src, WritePlacement::End),
+            Ok(chunk)
+        );
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 2);
+        assert_eq!(state.inode_len.load(Ordering::Acquire), chunk as u64);
+        let mut handle = &file;
+        assert_eq!(handle.seek(SeekFrom::Current(0)), Ok(chunk as u64));
+    }
+
+    #[test]
+    fn different_ofds_cannot_admit_append_against_the_same_stale_eof() {
+        let state = AppendTestState::new(0);
+        let fs = Filesystem::new(RegistryTestFs::new_for_append(
+            NodeFlags::NON_CACHEABLE,
+            state.clone(),
+        ));
+        let location = Mountpoint::new_root(&fs).root_location();
+        let left = File::new(FileBackend::Direct(location.clone()), FileFlags::WRITE);
+        let right = File::new(FileBackend::Direct(location), FileFlags::WRITE);
+        let start = Arc::new(Barrier::new(3));
+
+        let spawn = |file: File, marker: u8, start: Arc<Barrier>| {
+            thread::spawn(move || {
+                start.wait();
+                let bytes = [marker];
+                let mut src = Cursor::new(&bytes[..]);
+                file.write_with_placement_and_admission(
+                    &mut src,
+                    WritePlacement::End,
+                    |offset, requested| {
+                        if offset >= 1 {
+                            Err(VfsError::OutOfRange)
+                        } else {
+                            Ok(requested)
+                        }
+                    },
+                )
+            })
+        };
+        let left = spawn(left, b'L', start.clone());
+        let right = spawn(right, b'R', start.clone());
+        start.wait();
+        let results = [left.join().unwrap(), right.join().unwrap()];
+
+        assert_eq!(results.iter().filter(|result| **result == Ok(1)).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == Err(VfsError::OutOfRange))
+                .count(),
+            1
+        );
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 1);
+        assert_eq!(state.inode_len.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn same_ofd_append_admission_keeps_operation_order_and_cursor() {
+        let (file, state) =
+            append_test_file_with_access(NodeFlags::NON_CACHEABLE, 0, FileFlags::WRITE);
+        let file = Arc::new(file);
+        let offsets = Arc::new(StdMutex::new(Vec::new()));
+        let start = Arc::new(Barrier::new(3));
+
+        let spawn =
+            |file: Arc<File>, marker: u8, start: Arc<Barrier>, offsets: Arc<StdMutex<Vec<u64>>>| {
+                thread::spawn(move || {
+                    start.wait();
+                    let bytes = [marker];
+                    let mut src = Cursor::new(&bytes[..]);
+                    file.write_with_placement_and_admission(
+                        &mut src,
+                        WritePlacement::End,
+                        |offset, requested| {
+                            offsets.lock().unwrap().push(offset);
+                            Ok(requested)
+                        },
+                    )
+                })
+            };
+        let left = spawn(file.clone(), b'A', start.clone(), offsets.clone());
+        let right = spawn(file.clone(), b'B', start.clone(), offsets.clone());
+        start.wait();
+        assert_eq!(left.join().unwrap(), Ok(1));
+        assert_eq!(right.join().unwrap(), Ok(1));
+
+        assert_eq!(&*offsets.lock().unwrap(), &[0, 1]);
+        assert_eq!(state.inode_len.load(Ordering::Acquire), 2);
+        let mut handle = file.as_ref();
+        assert_eq!(handle.seek(SeekFrom::Current(0)), Ok(2));
+    }
+
+    #[test]
+    fn competing_unaligned_append_cannot_move_eof_after_admission() {
+        let state = AppendTestState::new(512);
+        let fs = Filesystem::new(RegistryTestFs::new_for_append(
+            NodeFlags::NON_CACHEABLE,
+            state.clone(),
+        ));
+        let location = Mountpoint::new_root(&fs).root_location();
+        let aligned = File::new(FileBackend::Direct(location.clone()), FileFlags::WRITE);
+        let unaligned = File::new(FileBackend::Direct(location), FileFlags::WRITE);
+        let (admitted_tx, admitted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let first = thread::spawn(move || {
+            let bytes = vec![b'A'; 512];
+            let mut src = Cursor::new(bytes.as_slice());
+            aligned.write_at_end_with_admission(&mut src, |offset, requested| {
+                assert_eq!(offset, 512);
+                admitted_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(requested)
+            })
+        });
+        admitted_rx.recv().unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let second = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = unaligned.write_at_end_slice(b"u");
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        assert_eq!(state.append_calls.load(Ordering::Acquire), 0);
+
+        release_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), Ok(512));
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap(), Ok(1));
+        second.join().unwrap();
+        assert_eq!(&*state.append_markers.lock().unwrap(), b"Au");
+        assert_eq!(state.inode_len.load(Ordering::Acquire), 1025);
+    }
+
+    #[test]
     fn explicit_end_ignores_non_append_default_for_all_write_forms() {
         let (file, state) =
             append_test_file_with_access(NodeFlags::NON_CACHEABLE, 41, FileFlags::WRITE);
         let mut src = Cursor::new(&b"ab"[..]);
         assert_eq!(
-            file.write_with_placement(&mut src, WritePlacement::End),
+            file.write_with_placement_and_admission(
+                &mut src,
+                WritePlacement::End,
+                |offset, requested| {
+                    assert_eq!(offset, 41);
+                    Ok(requested)
+                },
+            ),
             Ok(2)
         );
         assert_eq!(state.append_calls.load(Ordering::Acquire), 1);
         assert_eq!(state.inode_len.load(Ordering::Acquire), 43);
+        let mut handle = &file;
+        assert_eq!(handle.seek(SeekFrom::Current(0)), Ok(43));
 
         let (file, state) =
             append_test_file_with_access(NodeFlags::NON_CACHEABLE, 41, FileFlags::WRITE);
@@ -4657,15 +7403,17 @@ mod tests {
         state.fail_append_call.store(1, Ordering::Release);
         assert_eq!(
             file.write_vectored_slice_with_placement(&[b"ab", b"cd"], WritePlacement::End),
-            Err(VfsError::InvalidInput)
+            Ok(2)
         );
         assert_eq!(state.append_calls.load(Ordering::Acquire), 2);
         assert_eq!(state.inode_len.load(Ordering::Acquire), 43);
         assert_eq!(
             file.write_slice_with_placement(b"x", WritePlacement::Current),
-            Ok(1)
+            Err(VfsError::InvalidInput)
         );
-        assert_eq!(&*state.write_offsets.lock(), &[0]);
+        assert_eq!(&*state.write_offsets.lock(), &[43]);
+        let mut handle = &file;
+        assert_eq!(handle.seek(SeekFrom::Current(0)), Ok(43));
     }
 
     #[test]
@@ -4725,7 +7473,13 @@ mod tests {
         let (file, state) =
             append_test_file_with_access(NodeFlags::NON_CACHEABLE, 41, FileFlags::WRITE);
         let mut src = Cursor::new(&b"ab"[..]);
-        assert_eq!(file.write_at_end(&mut src), Ok(2));
+        assert_eq!(
+            file.write_at_end_with_admission(&mut src, |offset, requested| {
+                assert_eq!(offset, 41);
+                Ok(requested)
+            }),
+            Ok(2)
+        );
         assert_eq!(
             file.write_slice_with_placement(b"x", WritePlacement::Current),
             Ok(1)

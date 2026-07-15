@@ -28,6 +28,10 @@ The published archive contains no `tests/` files, so there are no upstream test 
 - `2aee666` repaired VirtIO device construction and LoongArch integration.
 - `c52dc6f` added async block submission/completion and interrupt-backed drain support.
 - `96df7d9` tightened ownership, queue admission, fallible allocation, and cleanup.
+- The current I/O integration validates every driver-reported accepted prefix,
+  fails stop on missing handles or lost completion state, reaps already accepted
+  requests before returning a later submission error, and continues reaping all
+  handles after the first completion-status error.
 - Maintained delta: generic VirtIO block/net/input/gpu/vsock adapters, explicit IRQ propagation, and bounded queue lifecycle.
 
 Commit IDs are navigation hints for the current rewritten history. The exact

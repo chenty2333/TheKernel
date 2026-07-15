@@ -3,7 +3,11 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::{fmt, ops::DerefMut};
+use core::{
+    fmt,
+    ops::DerefMut,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use axerrno::{AxError, AxResult, ax_bail};
 use axhal::{
@@ -12,10 +16,16 @@ use axhal::{
     trap::PageFaultFlags,
 };
 use axsync::Mutex;
+use kspin::SpinNoIrq;
 use memory_addr::{
     MemoryAddr, PAGE_SIZE_4K, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange, is_aligned_4k,
 };
 use memory_set::{MappingResult, MemoryArea, MemorySet};
+use thekernel_linux_mm::{
+    AddressSpaceId, ExpectedMapping, InvalidationRange, InvalidationReason, MappingAccess,
+    MappingGeneration, MappingId, MappingKind, MappingSnapshot, MmError, PageRange, PinBudget,
+    PinBudgetCharge, PinOwner, PinQuota, PinRegistry, PinRequest, PinReservation, PinToken,
+};
 
 use super::checked_align_up_4k;
 
@@ -32,22 +42,166 @@ pub enum PageFaultResult {
     Unhandled,
 }
 
+#[inline]
+fn synchronize_executable_publication(flags: MappingFlags) {
+    if flags.contains(MappingFlags::EXECUTE) {
+        // This publishes executable memory to the current CPU. SMP support
+        // additionally needs a HAL-level remote or generation-based sync.
+        axhal::asm::flush_icache_all();
+    }
+}
+
+fn adds_execute_permission(old_flags: MappingFlags, new_flags: MappingFlags) -> bool {
+    new_flags.contains(MappingFlags::EXECUTE) && !old_flags.contains(MappingFlags::EXECUTE)
+}
+
+const USER_IO_PIN_MAX_TOKENS: u64 = 64;
+const USER_IO_PIN_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const USER_IO_PIN_MAX_PAGES: u64 = USER_IO_PIN_MAX_BYTES / PAGE_SIZE_4K as u64;
+type UserIoPinRegistry = PinRegistry<1, { USER_IO_PIN_MAX_TOKENS as usize }>;
+type UserIoPinBudget = PinBudget<{ USER_IO_PIN_MAX_TOKENS as usize }>;
+type UserIoPolicy = (
+    AddressSpaceId,
+    MappingId,
+    MappingGeneration,
+    UserIoPinRegistry,
+);
+
+static NEXT_ADDRESS_SPACE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_TOPOLOGY_MAPPING_ID: AtomicU64 = AtomicU64::new(1);
+static USER_IO_PIN_BUDGET: SpinNoIrq<Option<UserIoPinBudget>> = SpinNoIrq::new(None);
+
+fn allocate_nonwrapping_id(sequence: &AtomicU64) -> AxResult<u64> {
+    sequence
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| AxError::ResourceBusy)
+}
+
+fn mm_error(error: MmError) -> AxError {
+    match error {
+        MmError::ZeroLength
+        | MmError::Overflow
+        | MmError::InvalidPageSize
+        | MmError::Unaligned
+        | MmError::InvalidIdentity
+        | MmError::InvalidRemap => AxError::InvalidInput,
+        MmError::RangeNotMapped | MmError::StaleGeneration => AxError::BadAddress,
+        MmError::AccessDenied => AxError::PermissionDenied,
+        MmError::QuotaExceeded
+        | MmError::CapacityExceeded
+        | MmError::OwnerBusy
+        | MmError::PinOverlap
+        | MmError::MappingPinned
+        | MmError::IdExhausted
+        | MmError::Closing
+        | MmError::TearingDown
+        | MmError::Closed
+        | MmError::Busy => AxError::ResourceBusy,
+        MmError::UnsupportedPin
+        | MmError::OwnerNotConfigured
+        | MmError::UnknownToken
+        | MmError::InvalidTokenState
+        | MmError::UnknownFault
+        | MmError::MemlockDenied => AxError::InvalidInput,
+        _ => AxError::InvalidInput,
+    }
+}
+
+fn new_user_io_policy() -> AxResult<UserIoPolicy> {
+    let address_space_id =
+        AddressSpaceId::new(allocate_nonwrapping_id(&NEXT_ADDRESS_SPACE_ID)?).map_err(mm_error)?;
+    let topology_mapping_id =
+        MappingId::new(allocate_nonwrapping_id(&NEXT_TOPOLOGY_MAPPING_ID)?).map_err(mm_error)?;
+    let topology_generation = MappingGeneration::new(1).map_err(mm_error)?;
+    let pin_quota = PinQuota::new(
+        USER_IO_PIN_MAX_PAGES,
+        USER_IO_PIN_MAX_BYTES,
+        USER_IO_PIN_MAX_TOKENS,
+    );
+    let mut user_io_pins = UserIoPinRegistry::new(PAGE_SIZE_4K, pin_quota, 1).map_err(mm_error)?;
+    user_io_pins
+        .configure_owner(
+            PinOwner::new(address_space_id.get()).map_err(mm_error)?,
+            pin_quota,
+        )
+        .map_err(mm_error)?;
+    Ok((
+        address_space_id,
+        topology_mapping_id,
+        topology_generation,
+        user_io_pins,
+    ))
+}
+
 #[derive(Clone, Copy, Debug)]
-struct UserIoPinRange {
-    start: VirtAddr,
-    end: VirtAddr,
+pub(crate) struct UserIoMappingExpectation {
+    expected: ExpectedMapping,
+    covered: PageRange,
+}
+
+/// System-wide accounting ownership held across the complete lower pin
+/// transaction. The aggregate charge is refunded only after frame/page-cache
+/// ownership has been released.
+pub(crate) struct UserIoSystemPinCharge {
+    charge: Option<PinBudgetCharge>,
+}
+
+impl UserIoSystemPinCharge {
+    fn reserve(request: PinRequest) -> AxResult<Self> {
+        let mut budget = USER_IO_PIN_BUDGET.lock();
+        if budget.is_none() {
+            *budget = Some(
+                UserIoPinBudget::new(
+                    PAGE_SIZE_4K,
+                    PinQuota::new(
+                        USER_IO_PIN_MAX_PAGES,
+                        USER_IO_PIN_MAX_BYTES,
+                        USER_IO_PIN_MAX_TOKENS,
+                    ),
+                    1,
+                )
+                .map_err(mm_error)?,
+            );
+        }
+        let charge = budget
+            .as_mut()
+            .expect("initialized system user-I/O pin budget")
+            .reserve(request)
+            .map_err(mm_error)?;
+        Ok(Self {
+            charge: Some(charge),
+        })
+    }
+}
+
+impl Drop for UserIoSystemPinCharge {
+    fn drop(&mut self) {
+        let Some(charge) = self.charge.take() else {
+            return;
+        };
+        USER_IO_PIN_BUDGET
+            .lock()
+            .as_mut()
+            .expect("initialized system user-I/O pin budget")
+            .release(charge)
+            .expect("live system user-I/O pin charge disappeared");
+    }
 }
 
 /// The virtual memory address space.
 pub struct AddrSpace {
     va_range: VirtAddrRange,
+    address_space_id: AddressSpaceId,
+    topology_mapping_id: MappingId,
+    topology_generation: MappingGeneration,
     areas: MemorySet<Backend>,
     growdown_starts: BTreeSet<VirtAddr>,
     wipe_on_fork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     dontfork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     locked_ranges: BTreeMap<VirtAddr, VirtAddr>,
-    user_io_pins: BTreeMap<u64, UserIoPinRange>,
-    next_user_io_pin: u64,
+    user_io_pins: UserIoPinRegistry,
     lock_future_mappings: bool,
     lock_future_on_fault: bool,
     pt: PageTable,
@@ -151,6 +305,9 @@ impl<'a> PreparedProtectSegment<'a> {
 pub(crate) struct PreparedProtect<'a> {
     transaction: PreparedAreaProtect<'a, Backend>,
     growdown_starts: &'a mut BTreeSet<VirtAddr>,
+    topology_generation: &'a mut MappingGeneration,
+    next_topology_generation: MappingGeneration,
+    synchronize_instruction_stream: bool,
 }
 
 impl PreparedProtect<'_> {
@@ -173,9 +330,17 @@ impl PreparedProtect<'_> {
         let Self {
             transaction,
             growdown_starts,
+            topology_generation,
+            next_topology_generation,
+            synchronize_instruction_stream,
         } = self;
-        let areas = transaction.commit()?;
+        let areas = transaction.commit();
+        if synchronize_instruction_stream {
+            synchronize_executable_publication(MappingFlags::EXECUTE);
+        }
+        let areas = areas?;
         Self::refresh_growdown_starts(areas, growdown_starts);
+        *topology_generation = next_topology_generation;
         Ok(())
     }
 
@@ -234,15 +399,19 @@ impl AddrSpace {
     /// Creates a new empty address space.
     pub fn new_empty(base: VirtAddr, size: usize) -> AxResult<Self> {
         let va_range = VirtAddrRange::try_from_start_size(base, size).ok_or(AxError::NoMemory)?;
+        let (address_space_id, topology_mapping_id, topology_generation, user_io_pins) =
+            new_user_io_policy()?;
         Ok(Self {
             va_range,
+            address_space_id,
+            topology_mapping_id,
+            topology_generation,
             areas: MemorySet::new(),
             growdown_starts: BTreeSet::new(),
             wipe_on_fork_ranges: BTreeMap::new(),
             dontfork_ranges: BTreeMap::new(),
             locked_ranges: BTreeMap::new(),
-            user_io_pins: BTreeMap::new(),
-            next_user_io_pin: 1,
+            user_io_pins,
             lock_future_mappings: false,
             lock_future_on_fault: false,
             pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,
@@ -475,49 +644,198 @@ impl AddrSpace {
         size > 0 && self.locked_bytes_in_range(start, size) == size
     }
 
-    pub fn begin_user_io_pin(&mut self, start: VirtAddr, size: usize) -> AxResult<u64> {
-        self.validate_region(start, size)?;
-        if size == 0 {
-            return Err(AxError::InvalidInput);
-        }
-        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
-        for _ in 0..u64::MAX {
-            let token = self.next_user_io_pin;
-            self.next_user_io_pin = self.next_user_io_pin.wrapping_add(1).max(1);
-            if let alloc::collections::btree_map::Entry::Vacant(entry) =
-                self.user_io_pins.entry(token)
-            {
-                entry.insert(UserIoPinRange { start, end });
-                return Ok(token);
-            }
-        }
-        Err(AxError::ResourceBusy)
+    pub(crate) fn user_io_pin_owner(&self) -> PinOwner {
+        PinOwner::new(self.address_space_id.get()).expect("address-space IDs are nonzero")
     }
 
-    pub fn end_user_io_pin(&mut self, token: u64) {
-        if self.user_io_pins.remove(&token).is_none() {
-            warn!("AddrSpace::end_user_io_pin: unknown token {token}");
+    pub(crate) fn begin_user_io_pin(
+        &mut self,
+        request: PinRequest,
+    ) -> AxResult<(
+        PinReservation,
+        UserIoSystemPinCharge,
+        Vec<UserIoMappingExpectation>,
+    )> {
+        if request.owner() != self.user_io_pin_owner() {
+            return Err(AxError::InvalidInput);
+        }
+        let system_charge = UserIoSystemPinCharge::reserve(request)?;
+        let reservation = self
+            .user_io_pins
+            .reserve(request, self.address_space_id)
+            .map_err(mm_error)?;
+        let range = self
+            .user_io_pins
+            .view(reservation.token())
+            .map_err(mm_error)?
+            .range();
+        match self.snapshot_user_io_mappings(range) {
+            Ok(expectations) => Ok((reservation, system_charge, expectations)),
+            Err(error) => {
+                self.user_io_pins
+                    .cancel_reservation(reservation)
+                    .map_err(mm_error)?;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn cancel_user_io_pin(&mut self, reservation: PinReservation) {
+        if let Err(error) = self.user_io_pins.cancel_reservation(reservation) {
+            warn!(
+                "AddrSpace::cancel_user_io_pin: token {}: {error:?}",
+                reservation.token().get()
+            );
+        }
+    }
+
+    pub(crate) fn publish_user_io_pin(
+        &mut self,
+        reservation: PinReservation,
+        expectations: &[UserIoMappingExpectation],
+    ) -> AxResult<PinToken> {
+        let publication = (|| {
+            for expectation in expectations {
+                let area = self
+                    .areas
+                    .find(VirtAddr::from(expectation.covered.start()))
+                    .ok_or(AxError::BadAddress)?;
+                let current = self.mapping_snapshot(area)?;
+                self.user_io_pins
+                    .revalidate_next(
+                        reservation,
+                        expectation.expected,
+                        current,
+                        expectation.covered,
+                    )
+                    .map_err(mm_error)?;
+            }
+            self.user_io_pins.commit(reservation).map_err(mm_error)
+        })();
+
+        if publication.is_err()
+            && let Ok(view) = self.user_io_pins.view(reservation.token())
+            && !view.is_active()
+        {
+            self.cancel_user_io_pin(reservation);
+        }
+        publication
+    }
+
+    pub(crate) fn end_user_io_pin(&mut self, token: PinToken) {
+        if let Err(error) = self.user_io_pins.release(token) {
+            warn!(
+                "AddrSpace::end_user_io_pin: token {}: {error:?}",
+                token.get()
+            );
         }
     }
 
     pub fn user_io_pin_overlaps(&self, start: VirtAddr, size: usize) -> bool {
-        if size == 0 {
-            return false;
-        }
-        let Some(end) = start.checked_add(size) else {
-            return true;
-        };
-        self.user_io_pins
-            .values()
-            .any(|range| range.start < end && range.end > start)
+        self.invalidation(start, size, InvalidationReason::Unmap)
+            .map_or(true, |invalidation| {
+                self.user_io_pins
+                    .first_mutation_blocker(invalidation)
+                    .is_some()
+            })
     }
 
-    fn check_no_user_io_pin_overlap(&self, start: VirtAddr, size: usize) -> AxResult {
-        if self.user_io_pin_overlaps(start, size) {
-            Err(AxError::ResourceBusy)
-        } else {
-            Ok(())
+    fn check_no_user_io_pin_overlap(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        reason: InvalidationReason,
+    ) -> AxResult {
+        let invalidation = self.invalidation(start, size, reason)?;
+        self.user_io_pins
+            .admit_mutation(invalidation)
+            .map_err(mm_error)
+    }
+
+    pub(crate) fn admit_remap(&self, start: VirtAddr, size: usize) -> AxResult {
+        self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Remap)
+    }
+
+    fn snapshot_user_io_mappings(
+        &self,
+        range: PageRange,
+    ) -> AxResult<Vec<UserIoMappingExpectation>> {
+        let mut cursor = VirtAddr::from(range.start());
+        let end = VirtAddr::from(range.end());
+        let mut snapshots = Vec::new();
+        while cursor < end {
+            let area = self.areas.find(cursor).ok_or(AxError::BadAddress)?;
+            if area.start() > cursor {
+                return Err(AxError::BadAddress);
+            }
+            let segment_end = area.end().min(end);
+            let covered = PageRange::new(
+                cursor.as_usize(),
+                segment_end.sub_addr(cursor),
+                PAGE_SIZE_4K,
+            )
+            .map_err(mm_error)?;
+            snapshots.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            snapshots.push(UserIoMappingExpectation {
+                expected: self.mapping_snapshot(area)?.expected(),
+                covered,
+            });
+            cursor = segment_end;
         }
+        Ok(snapshots)
+    }
+
+    fn mapping_snapshot(&self, area: &MemoryArea<Backend>) -> AxResult<MappingSnapshot> {
+        let flags = area.flags();
+        let range =
+            PageRange::new(area.start().as_usize(), area.size(), PAGE_SIZE_4K).map_err(mm_error)?;
+        Ok(MappingSnapshot::new(
+            self.address_space_id,
+            self.topology_mapping_id,
+            self.topology_generation,
+            range,
+            MappingAccess::new(
+                flags.contains(MappingFlags::READ),
+                flags.contains(MappingFlags::WRITE),
+                flags.contains(MappingFlags::EXECUTE),
+            ),
+            area.backend().linux_mapping_kind(),
+            false,
+            false,
+        ))
+    }
+
+    fn topology_snapshot(&self) -> AxResult<MappingSnapshot> {
+        let range =
+            PageRange::new(self.base().as_usize(), self.size(), PAGE_SIZE_4K).map_err(mm_error)?;
+        Ok(MappingSnapshot::new(
+            self.address_space_id,
+            self.topology_mapping_id,
+            self.topology_generation,
+            range,
+            MappingAccess::new(true, true, true),
+            MappingKind::Special,
+            false,
+            false,
+        ))
+    }
+
+    fn invalidation(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        reason: InvalidationReason,
+    ) -> AxResult<InvalidationRange> {
+        InvalidationRange::from_raw(self.topology_snapshot()?, start.as_usize(), size, reason)
+            .map_err(mm_error)
+    }
+
+    fn next_topology_generation(&self) -> AxResult<MappingGeneration> {
+        self.topology_generation.next().map_err(mm_error)
+    }
+
+    fn commit_topology_generation(&mut self, next: MappingGeneration) {
+        self.topology_generation = next;
     }
 
     pub fn current_mapping_bytes(&self) -> usize {
@@ -670,6 +988,7 @@ impl AddrSpace {
         flags: MappingFlags,
     ) -> AxResult {
         self.validate_region(start_vaddr, size)?;
+        let next_generation = self.next_topology_generation()?;
 
         if !start_paddr.is_aligned_4k() {
             ax_bail!(InvalidInput, "address is not aligned");
@@ -682,6 +1001,7 @@ impl AddrSpace {
             Backend::new_linear(start_vaddr, start_paddr, size),
         );
         self.areas.map(area, &mut self.pt, false)?;
+        self.commit_topology_generation(next_generation);
         Ok(())
     }
 
@@ -713,9 +1033,13 @@ impl AddrSpace {
         locked: bool,
     ) -> AxResult {
         self.validate_region(start, size)?;
+        let next_generation = self.next_topology_generation()?;
 
         let area = MemoryArea::new(start, size, flags, backend);
         self.areas.map(area, &mut self.pt, false)?;
+        // Population or its rollback may partially change resident state, so
+        // publish the new topology generation as soon as the VMA is visible.
+        self.commit_topology_generation(next_generation);
         if locked {
             self.insert_locked_range(start, start + size);
         }
@@ -744,12 +1068,19 @@ impl AddrSpace {
         self.validate_region(start, size)?;
         let end = start + size;
 
-        let mut modify = self.pt.cursor();
         while let Some(area) = self.areas.find(start) {
-            let range = VirtAddrRange::new(start, area.end().min(end));
-            area.backend()
-                .populate(range, area.flags(), access_flags, &mut modify)?;
-            start = area.end();
+            let area_end = area.end();
+            let range = VirtAddrRange::new(start, area_end.min(end));
+            let area_flags = area.flags();
+            let outcome =
+                area.backend()
+                    .populate(range, area_flags, access_flags, &mut self.pt.cursor());
+            let result = outcome.finish(self);
+            // A backend may have published a valid executable prefix before a
+            // later page fails, so synchronize before propagating the error.
+            synchronize_executable_publication(area_flags);
+            result?;
+            start = area_end;
             if !start.is_aligned_4k() {
                 return Err(AxError::BadAddress);
             }
@@ -768,7 +1099,12 @@ impl AddrSpace {
 
     pub fn discard_pages(&mut self, mut start: VirtAddr, size: usize) -> AxResult {
         self.validate_region(start, size)?;
-        self.check_no_user_io_pin_overlap(start, size)?;
+        self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Discard)?;
+        let next_generation = self.next_topology_generation()?;
+        // Backend discard can make partial progress before reporting a later
+        // hole or backend error. Advance first so every observable teardown of
+        // resident pages invalidates pre-operation snapshots.
+        self.commit_topology_generation(next_generation);
         let end = start + size;
 
         let mut modify = self.pt.cursor();
@@ -855,13 +1191,15 @@ impl AddrSpace {
     /// aligned.
     pub fn unmap(&mut self, start: VirtAddr, size: usize) -> AxResult {
         self.validate_region(start, size)?;
-        self.check_no_user_io_pin_overlap(start, size)?;
+        self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Unmap)?;
+        let next_generation = self.next_topology_generation()?;
 
         self.areas.unmap(start, size, &mut self.pt)?;
         self.refresh_growdown_starts();
         Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
         Self::clear_interval(&mut self.dontfork_ranges, start, size);
         self.clear_locked_range(start, size);
+        self.commit_topology_generation(next_generation);
         Ok(())
     }
 
@@ -920,9 +1258,23 @@ impl AddrSpace {
     /// * `start_vaddr` - The start virtual address to write.
     /// * `buf` - The buffer to write to the address space.
     pub fn write(&self, start: VirtAddr, buf: &[u8]) -> AxResult {
-        self.process_area_data(start, buf.len(), |dst, offset, write_size| unsafe {
+        let synchronize_instruction_stream = start.checked_add(buf.len()).is_some_and(|end| {
+            self.areas.iter().any(|area| {
+                area.start() < end
+                    && start < area.end()
+                    && area.flags().contains(MappingFlags::EXECUTE)
+            })
+        });
+        let result = self.process_area_data(start, buf.len(), |dst, offset, write_size| unsafe {
             core::ptr::copy_nonoverlapping(buf.as_ptr().add(offset), dst.as_mut_ptr(), write_size);
-        })
+        });
+        // Direct address-space writers include ptrace and process_vm_writev.
+        // Synchronize even after partial failure because a prefix may already
+        // have changed executable memory.
+        if synchronize_instruction_stream {
+            synchronize_executable_publication(MappingFlags::EXECUTE);
+        }
+        result
     }
 
     /// Updates mapping within the specified virtual address range.
@@ -936,20 +1288,29 @@ impl AddrSpace {
         flags: MappingFlags,
     ) -> AxResult<PreparedProtect<'_>> {
         self.validate_region(start, size)?;
-        self.check_no_user_io_pin_overlap(start, size)?;
+        self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Protect)?;
         self.check_protect_range(start, size, flags)?;
+        let next_topology_generation = self.next_topology_generation()?;
 
         let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
 
+        let transaction = PreparedAreaProtect {
+            areas: &mut self.areas,
+            page_table: &mut self.pt,
+            start,
+            end,
+            flags,
+        };
+        let synchronize_instruction_stream = transaction
+            .segments()
+            .any(|(area, ..)| adds_execute_permission(area.flags(), flags));
+
         Ok(PreparedProtect {
-            transaction: PreparedAreaProtect {
-                areas: &mut self.areas,
-                page_table: &mut self.pt,
-                start,
-                end,
-                flags,
-            },
+            transaction,
             growdown_starts: &mut self.growdown_starts,
+            topology_generation: &mut self.topology_generation,
+            next_topology_generation,
+            synchronize_instruction_stream,
         })
     }
 
@@ -979,22 +1340,28 @@ impl AddrSpace {
         Ok(())
     }
 
-    /// Removes all mappings in the address space.
-    pub fn clear(&mut self) {
-        if !self.user_io_pins.is_empty() {
-            warn!(
-                "AddrSpace::clear: clearing address space with {} active user I/O pins",
-                self.user_io_pins.len()
-            );
+    /// Removes all mappings and starts a fresh identity generation for exec.
+    pub fn clear(&mut self) -> AxResult {
+        if self.user_io_pins.progress().total() != 0 {
+            return Err(AxError::ResourceBusy);
         }
-        if let Err(err) = self.areas.clear(&mut self.pt) {
-            warn!("AddrSpace::clear: failed to unmap all areas: {err:?}");
-        }
+        // Reserve the replacement identity before destroying the current
+        // image. A sequence-exhaustion failure therefore leaves it untouched.
+        let new_policy = new_user_io_policy()?;
+        self.areas.clear(&mut self.pt)?;
         self.growdown_starts.clear();
         self.wipe_on_fork_ranges.clear();
         self.dontfork_ranges.clear();
         self.locked_ranges.clear();
-        self.user_io_pins.clear();
+        self.user_io_pins.begin_teardown().map_err(mm_error)?;
+        self.user_io_pins.finish_teardown().map_err(mm_error)?;
+        (
+            self.address_space_id,
+            self.topology_mapping_id,
+            self.topology_generation,
+            self.user_io_pins,
+        ) = new_policy;
+        Ok(())
     }
 
     fn try_handle_growdown_fault(
@@ -1130,17 +1497,18 @@ impl AddrSpace {
                     .end()
                     .sub_addr(start)
                     .min(fault_around.max(page_size as usize));
-                let populate_result = area.backend().populate(
+                let populate_outcome = area.backend().populate(
                     VirtAddrRange::from_start_size(start, len),
                     flags,
                     access_flags,
                     &mut self.pt.cursor(),
                 );
+                let populate_result = populate_outcome.finish(self);
+                // Synchronize even on error: a multi-page populate may have
+                // installed a valid executable prefix before the failure.
+                synchronize_executable_publication(flags);
                 return match populate_result {
-                    Ok((n, callback)) => {
-                        if let Some(cb) = callback {
-                            cb(self);
-                        }
+                    Ok(n) => {
                         if n == 0 {
                             warn!("No pages populated for {vaddr:?} ({flags:?})");
                             PageFaultResult::Unhandled
@@ -1173,11 +1541,16 @@ impl AddrSpace {
     /// size, then iterates over all memory areas in the original address
     /// space to copy or share their mappings into the new one.
     pub fn try_clone(&mut self) -> AxResult<Arc<Mutex<Self>>> {
-        if !self.user_io_pins.is_empty() {
+        if self.user_io_pins.progress().total() != 0 {
             return Err(AxError::ResourceBusy);
         }
 
         let new_aspace = Arc::new(Mutex::new(Self::new_empty(self.base(), self.size())?));
+        // Fork may COW-protect parent pages before a later allocation fails.
+        // Advance conservatively before that fallible sequence so stale
+        // snapshots can never survive partial parent-side work.
+        let next_generation = self.next_topology_generation()?;
+        self.commit_topology_generation(next_generation);
         let new_aspace_clone = new_aspace.clone();
 
         let mut guard = new_aspace.lock();
@@ -1278,7 +1651,12 @@ impl fmt::Debug for AddrSpace {
 
 impl Drop for AddrSpace {
     fn drop(&mut self) {
-        self.clear();
+        debug_assert_eq!(self.user_io_pins.progress().total(), 0);
+        if let Err(err) = self.areas.clear(&mut self.pt) {
+            warn!("AddrSpace::drop: failed to unmap all areas: {err:?}");
+        }
+        let _ = self.user_io_pins.begin_teardown();
+        let _ = self.user_io_pins.finish_teardown();
     }
 }
 
@@ -1454,5 +1832,16 @@ mod tests {
         .unwrap();
         assert_eq!(area_snapshot(&areas), vec![(0x1000, 0x4000, 1, 1)]);
         assert!(page_table[0x1000..0x4000].iter().all(|entry| *entry == 1));
+    }
+
+    #[test]
+    fn execute_publication_is_required_only_when_execute_is_added() {
+        let read_write = MappingFlags::READ | MappingFlags::WRITE;
+        let read_execute = MappingFlags::READ | MappingFlags::EXECUTE;
+
+        assert!(adds_execute_permission(read_write, read_execute));
+        assert!(!adds_execute_permission(read_execute, read_execute));
+        assert!(!adds_execute_permission(read_execute, read_write));
+        assert!(!adds_execute_permission(read_write, read_write));
     }
 }

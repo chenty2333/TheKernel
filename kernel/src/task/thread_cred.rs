@@ -1,18 +1,18 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use axerrno::{AxError, AxResult};
-use linux_raw_sys::general::{
-    CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_LINUX_IMMUTABLE,
-    CAP_MAC_OVERRIDE, CAP_MKNOD, CAP_SETGID, CAP_SETPCAP, CAP_SETUID,
+use linux_raw_sys::general::{CAP_SETGID, CAP_SETPCAP, CAP_SETUID};
+use thekernel_linux_cred::{
+    CapsetAuthority, CapsetRequest, GroupIdAuthority, GroupIdTransitionInput,
+    SECURE_ALL_UNPRIVILEGED, UserIdAuthority, UserIdTransitionInput, plan_capset,
+    plan_group_id_transition, plan_user_id_transition,
 };
 
 use super::{
     Kgid, Kuid, Thread,
     creds::{
-        CAPABILITY_WORDS, CapabilityState, Cred, CredentialSlot, CredentialSnapshotGuard,
-        Credentials, DacCredentialView, GroupInfo, PreparedCred, SECBIT_KEEP_CAPS,
-        SECBIT_KEEP_CAPS_LOCKED, SECBIT_NO_CAP_AMBIENT_RAISE, SECBIT_NO_SETUID_FIXUP,
-        SECURE_ALL_BITS, SECURE_ALL_LOCKS,
+        CapabilityState, Cred, CredentialSlot, CredentialSnapshotGuard, CredentialUpdate,
+        DacCredentialView, GroupInfo, PreparedCred, SECBIT_KEEP_CAPS,
     },
 };
 
@@ -64,53 +64,162 @@ impl SetgroupsAdmission {
     }
 }
 
-fn prepare_setfsuid_update<'a>(
-    credential: &'a CredentialSlot,
-    fsuid: Kuid,
-) -> AxResult<(Kuid, Option<PreparedCred<'a>>)> {
-    let mut update = credential.prepare();
-    let root_kuid = update.old().user_ns().root_kuid();
-    let can_setuid = update.old().has_effective_capability_for_setid(CAP_SETUID);
-    let old_fsuid = update.builder.ids.fsuid;
-    if can_setuid
-        || fsuid == update.builder.ids.ruid
-        || fsuid == update.builder.ids.euid
-        || fsuid == update.builder.ids.suid
-        || fsuid == update.builder.ids.fsuid
-    {
-        update.builder.ids.fsuid = fsuid;
+fn stage_user_id_update(
+    update: &mut CredentialUpdate<'_>,
+    input: UserIdTransitionInput,
+) -> AxResult<(Kuid, bool)> {
+    let authority = if update.old().has_effective_capability_for_setid(CAP_SETUID) {
+        UserIdAuthority::CAP_SETUID
+    } else {
+        UserIdAuthority::UNPRIVILEGED
+    };
+    let (previous_fsuid, ids, capabilities, changed) = {
+        let plan = plan_user_id_transition(update.old().core(), input, authority)
+            .map_err(super::cred_error)?;
+        (
+            plan.previous_fsuid(),
+            plan.ids(),
+            plan.capabilities(),
+            plan.changes_credential(),
+        )
+    };
+    if changed {
+        update.builder.ids = ids;
+        update.builder.caps = capabilities;
     }
-    if update.builder.ids.fsuid == old_fsuid {
-        return Ok((old_fsuid, None));
-    }
-    Thread::fixup_capabilities_for_fsuid_change(
-        root_kuid,
-        old_fsuid,
-        update.builder.ids.fsuid,
-        &mut update.builder.caps,
-    );
-    Ok((old_fsuid, Some(update.finish()?)))
+    Ok((previous_fsuid, changed))
 }
 
-fn prepare_setfsgid_update<'a>(
+fn stage_group_id_update(
+    update: &mut CredentialUpdate<'_>,
+    input: GroupIdTransitionInput,
+) -> AxResult<(Kgid, bool)> {
+    let authority = if update.old().has_effective_capability_for_setid(CAP_SETGID) {
+        GroupIdAuthority::CAP_SETGID
+    } else {
+        GroupIdAuthority::UNPRIVILEGED
+    };
+    let (previous_fsgid, ids, changed) = {
+        let plan = plan_group_id_transition(update.old().core(), input, authority)
+            .map_err(super::cred_error)?;
+        (plan.previous_fsgid(), plan.ids(), plan.changes_credential())
+    };
+    if changed {
+        update.builder.ids = ids;
+    }
+    Ok((previous_fsgid, changed))
+}
+
+pub(in crate::task) fn prepare_user_id_update<'a>(
     credential: &'a CredentialSlot,
-    fsgid: Kgid,
+    input: UserIdTransitionInput,
+) -> AxResult<(Kuid, Option<PreparedCred<'a>>)> {
+    let mut update = credential.prepare();
+    let (previous_fsuid, changed) = stage_user_id_update(&mut update, input)?;
+    if !changed {
+        return Ok((previous_fsuid, None));
+    }
+    Ok((previous_fsuid, Some(update.finish()?)))
+}
+
+pub(in crate::task) fn prepare_group_id_update<'a>(
+    credential: &'a CredentialSlot,
+    input: GroupIdTransitionInput,
 ) -> AxResult<(Kgid, Option<PreparedCred<'a>>)> {
     let mut update = credential.prepare();
-    let can_setgid = update.old().has_effective_capability_for_setid(CAP_SETGID);
-    let old_fsgid = update.builder.ids.fsgid;
-    if can_setgid
-        || fsgid == update.builder.ids.rgid
-        || fsgid == update.builder.ids.egid
-        || fsgid == update.builder.ids.sgid
-        || fsgid == update.builder.ids.fsgid
+    let (previous_fsgid, changed) = stage_group_id_update(&mut update, input)?;
+    if !changed {
+        return Ok((previous_fsgid, None));
+    }
+    Ok((previous_fsgid, Some(update.finish()?)))
+}
+
+pub(in crate::task) fn prepare_setfsuid_update(
+    credential: &CredentialSlot,
+    fsuid: Kuid,
+) -> (Kuid, Option<PreparedCred<'_>>) {
+    let mut update = credential.prepare();
+    let previous_fsuid = update.old().ids().fsuid;
+    let Ok((_, changed)) =
+        stage_user_id_update(&mut update, UserIdTransitionInput::setfsuid(fsuid))
+    else {
+        return (previous_fsuid, None);
+    };
+    if !changed {
+        return (previous_fsuid, None);
+    }
+    (previous_fsuid, update.finish().ok())
+}
+
+pub(in crate::task) fn prepare_setfsgid_update(
+    credential: &CredentialSlot,
+    fsgid: Kgid,
+) -> (Kgid, Option<PreparedCred<'_>>) {
+    let mut update = credential.prepare();
+    let previous_fsgid = update.old().ids().fsgid;
+    let Ok((_, changed)) =
+        stage_group_id_update(&mut update, GroupIdTransitionInput::setfsgid(fsgid))
+    else {
+        return (previous_fsgid, None);
+    };
+    if !changed {
+        return (previous_fsgid, None);
+    }
+    (previous_fsgid, update.finish().ok())
+}
+
+pub(in crate::task) fn prepare_capset_update(
+    credential: &CredentialSlot,
+    request: CapsetRequest,
+) -> AxResult<Option<PreparedCred<'_>>> {
+    let mut update = credential.prepare();
+    let authority = if update
+        .old()
+        .has_effective_capability_in_own_user_ns(CAP_SETPCAP)
     {
-        update.builder.ids.fsgid = fsgid;
+        CapsetAuthority::CAP_SETPCAP
+    } else {
+        CapsetAuthority::RESTRICTED
+    };
+    let (capabilities, changed) = {
+        let plan =
+            plan_capset(update.old().core(), request, authority).map_err(super::cred_error)?;
+        (plan.capabilities(), plan.changes_credential())
+    };
+    if !changed {
+        return Ok(None);
     }
-    if update.builder.ids.fsgid == old_fsgid {
-        return Ok((old_fsgid, None));
+    update.builder.caps = capabilities;
+    Ok(Some(update.finish()?))
+}
+
+pub(in crate::task) fn prepare_securebits_update(
+    credential: &CredentialSlot,
+    requested: u32,
+) -> AxResult<Option<PreparedCred<'_>>> {
+    let mut update = credential.prepare();
+    let old = update.builder.caps;
+    let mut proposed = old;
+    proposed
+        .try_set_securebits(requested)
+        .map_err(super::cred_error)?;
+
+    if !update
+        .old()
+        .has_effective_capability_in_own_user_ns(CAP_SETPCAP)
+    {
+        let changed = old.securebits() ^ requested;
+        let unprivileged_mask = SECURE_ALL_UNPRIVILEGED | (SECURE_ALL_UNPRIVILEGED << 1);
+        if changed == 0 || changed & !unprivileged_mask != 0 {
+            return Err(AxError::OperationNotPermitted);
+        }
     }
-    Ok((old_fsgid, Some(update.finish()?)))
+    if proposed == old {
+        return Ok(None);
+    }
+
+    update.builder.caps = proposed;
+    Ok(Some(update.finish()?))
 }
 
 impl Thread {
@@ -177,17 +286,10 @@ impl Thread {
         Ok(())
     }
 
-    pub(crate) fn try_update_capability_state(
-        &self,
-        update_state: impl FnOnce(CapabilityState, &mut CapabilityState) -> AxResult<()>,
-    ) -> AxResult<()> {
-        let mut update = self.credential.prepare();
-        let old = update.builder.caps;
-        update_state(old, &mut update.builder.caps)?;
-        if update.builder.caps == old {
-            return Ok(());
+    pub(crate) fn apply_capset(&self, request: CapsetRequest) -> AxResult<()> {
+        if let Some(update) = prepare_capset_update(&self.credential, request)? {
+            self.commit_credential(update);
         }
-        self.commit_credential(update.finish()?);
         Ok(())
     }
 }
@@ -217,7 +319,11 @@ impl Thread {
         {
             return Err(AxError::OperationNotPermitted);
         }
-        update.builder.caps.drop_bounding(cap)?;
+        update
+            .builder
+            .caps
+            .try_drop_bounding(cap)
+            .map_err(super::cred_error)?;
         self.commit_credential(update.finish()?);
         Ok(())
     }
@@ -230,31 +336,30 @@ impl Thread {
     }
 
     pub fn raise_ambient_capability(&self, cap: u32) -> AxResult<()> {
-        let Some((word, mask)) = CapabilityState::cap_mask(cap) else {
-            return Err(AxError::InvalidInput);
-        };
         let mut update = self.credential.prepare();
-        if update.builder.caps.securebits & SECBIT_NO_CAP_AMBIENT_RAISE != 0
-            || update.builder.caps.permitted[word] & mask == 0
-            || update.builder.caps.inheritable[word] & mask == 0
-        {
-            return Err(AxError::OperationNotPermitted);
-        }
-        update.builder.caps.raise_ambient(cap)?;
+        update
+            .builder
+            .caps
+            .try_raise_ambient(cap)
+            .map_err(super::cred_error)?;
         self.commit_credential(update.finish()?);
         Ok(())
     }
 
     pub fn lower_ambient_capability(&self, cap: u32) -> AxResult<()> {
         let mut update = self.credential.prepare();
-        update.builder.caps.lower_ambient(cap)?;
+        update
+            .builder
+            .caps
+            .try_lower_ambient(cap)
+            .map_err(super::cred_error)?;
         self.commit_credential(update.finish()?);
         Ok(())
     }
 
     pub fn clear_ambient_capabilities(&self) -> AxResult<()> {
         let mut update = self.credential.prepare();
-        if update.builder.caps.ambient == [0; CAPABILITY_WORDS] {
+        if update.builder.caps.ambient() == [0; thekernel_linux_cred::CAPABILITY_WORDS] {
             return Ok(());
         }
         update.builder.caps.clear_ambient();
@@ -267,26 +372,9 @@ impl Thread {
     }
 
     pub fn set_securebits(&self, securebits: u32) -> AxResult<()> {
-        let mut update = self.credential.prepare();
-        if !update
-            .old()
-            .has_effective_capability_in_own_user_ns(CAP_SETPCAP)
-        {
-            return Err(AxError::OperationNotPermitted);
+        if let Some(update) = prepare_securebits_update(&self.credential, securebits)? {
+            self.commit_credential(update);
         }
-        if update.builder.caps.securebits == securebits {
-            return Ok(());
-        }
-        if (((update.builder.caps.securebits & SECURE_ALL_LOCKS) >> 1)
-            & (update.builder.caps.securebits ^ securebits))
-            != 0
-            || (update.builder.caps.securebits & SECURE_ALL_LOCKS & !securebits) != 0
-            || (securebits & !(SECURE_ALL_LOCKS | SECURE_ALL_BITS)) != 0
-        {
-            return Err(AxError::OperationNotPermitted);
-        }
-        update.builder.caps.securebits = securebits;
-        self.commit_credential(update.finish()?);
         Ok(())
     }
 
@@ -296,217 +384,56 @@ impl Thread {
 
     pub fn set_keep_caps(&self, enabled: bool) -> AxResult<()> {
         let mut update = self.credential.prepare();
-        if update.builder.caps.securebits & SECBIT_KEEP_CAPS_LOCKED != 0 {
-            return Err(AxError::OperationNotPermitted);
-        }
-        if (update.builder.caps.securebits & SECBIT_KEEP_CAPS != 0) == enabled {
+        let old = update.builder.caps;
+        update
+            .builder
+            .caps
+            .try_set_keep_caps(enabled)
+            .map_err(super::cred_error)?;
+        if update.builder.caps == old {
             return Ok(());
-        }
-        if enabled {
-            update.builder.caps.securebits |= SECBIT_KEEP_CAPS;
-        } else {
-            update.builder.caps.securebits &= !SECBIT_KEEP_CAPS;
         }
         self.commit_credential(update.finish()?);
         Ok(())
     }
 
-    fn fixup_capabilities_for_uid_change(
-        root_kuid: Option<Kuid>,
-        old: Credentials,
-        new: Credentials,
-        caps: &mut CapabilityState,
-    ) {
-        if old.ruid == new.ruid && old.euid == new.euid && old.suid == new.suid {
-            return;
-        }
-
-        if caps.securebits & SECBIT_NO_SETUID_FIXUP != 0 {
-            return;
-        }
-        let old_had_root = [old.ruid, old.euid, old.suid]
-            .into_iter()
-            .any(|id| root_kuid == Some(id));
-        let new_has_root = [new.ruid, new.euid, new.suid]
-            .into_iter()
-            .any(|id| root_kuid == Some(id));
-        if old_had_root && !new_has_root {
-            if caps.securebits & SECBIT_KEEP_CAPS == 0 {
-                caps.permitted = [0; CAPABILITY_WORDS];
-                caps.effective = [0; CAPABILITY_WORDS];
-            }
-            caps.clear_ambient();
-        }
-        if root_kuid == Some(old.euid) && root_kuid != Some(new.euid) {
-            caps.effective = [0; CAPABILITY_WORDS];
-        }
-        if root_kuid != Some(old.euid) && root_kuid == Some(new.euid) {
-            caps.effective = caps.permitted;
-        }
-    }
-
-    fn fixup_capabilities_for_fsuid_change(
-        root_kuid: Option<Kuid>,
-        old_fsuid: Kuid,
-        new_fsuid: Kuid,
-        caps: &mut CapabilityState,
-    ) {
-        if old_fsuid == new_fsuid {
-            return;
-        }
-
-        const FS_CAPS: [u32; 8] = [
-            CAP_CHOWN,
-            CAP_MKNOD,
-            CAP_DAC_OVERRIDE,
-            CAP_DAC_READ_SEARCH,
-            CAP_FOWNER,
-            CAP_FSETID,
-            CAP_MAC_OVERRIDE,
-            CAP_LINUX_IMMUTABLE,
-        ];
-
-        if caps.securebits & SECBIT_NO_SETUID_FIXUP != 0 {
-            return;
-        }
-        for cap in FS_CAPS {
-            let Some((word, mask)) = CapabilityState::cap_mask(cap) else {
-                continue;
-            };
-            if root_kuid == Some(old_fsuid) && root_kuid != Some(new_fsuid) {
-                caps.effective[word] &= !mask;
-            } else if root_kuid != Some(old_fsuid)
-                && root_kuid == Some(new_fsuid)
-                && caps.permitted[word] & mask != 0
-            {
-                caps.effective[word] |= mask;
-            }
-        }
-    }
-
     pub(crate) fn setuid(&self, uid: Kuid) -> AxResult<()> {
-        let mut update = self.credential.prepare();
-        let root_kuid = update.old().user_ns().root_kuid();
-        let can_setuid = update.old().has_effective_capability_for_setid(CAP_SETUID);
-        let old = update.builder.ids;
-        if can_setuid {
-            update.builder.ids.ruid = uid;
-            update.builder.ids.euid = uid;
-            update.builder.ids.suid = uid;
-            update.builder.ids.fsuid = uid;
-            Self::fixup_capabilities_for_uid_change(
-                root_kuid,
-                old,
-                update.builder.ids,
-                &mut update.builder.caps,
-            );
-            self.commit_credential(update.finish()?);
-            return Ok(());
+        let (_, update) =
+            prepare_user_id_update(&self.credential, UserIdTransitionInput::setuid(uid))?;
+        if let Some(update) = update {
+            self.commit_credential(update);
         }
-        if uid == old.ruid || uid == old.suid {
-            update.builder.ids.euid = uid;
-            update.builder.ids.fsuid = uid;
-            Self::fixup_capabilities_for_uid_change(
-                root_kuid,
-                old,
-                update.builder.ids,
-                &mut update.builder.caps,
-            );
-            self.commit_credential(update.finish()?);
-            return Ok(());
-        }
-        Err(AxError::OperationNotPermitted)
+        Ok(())
     }
 
     pub(crate) fn setgid(&self, gid: Kgid) -> AxResult<()> {
-        let mut update = self.credential.prepare();
-        let can_setgid = update.old().has_effective_capability_for_setid(CAP_SETGID);
-        let old = update.builder.ids;
-        if can_setgid {
-            update.builder.ids.rgid = gid;
-            update.builder.ids.egid = gid;
-            update.builder.ids.sgid = gid;
-            update.builder.ids.fsgid = gid;
-            self.commit_credential(update.finish()?);
-            return Ok(());
+        let (_, update) =
+            prepare_group_id_update(&self.credential, GroupIdTransitionInput::setgid(gid))?;
+        if let Some(update) = update {
+            self.commit_credential(update);
         }
-        if gid == old.rgid || gid == old.sgid {
-            update.builder.ids.egid = gid;
-            update.builder.ids.fsgid = gid;
-            self.commit_credential(update.finish()?);
-            return Ok(());
-        }
-        Err(AxError::OperationNotPermitted)
+        Ok(())
     }
 
     pub(crate) fn setreuid(&self, ruid: Option<Kuid>, euid: Option<Kuid>) -> AxResult<()> {
-        let mut update = self.credential.prepare();
-        let root_kuid = update.old().user_ns().root_kuid();
-        let can_setuid = update.old().has_effective_capability_for_setid(CAP_SETUID);
-        let old = update.builder.ids;
-        if !can_setuid {
-            if let Some(id) = ruid
-                && id != old.ruid
-                && id != old.euid
-            {
-                return Err(AxError::OperationNotPermitted);
-            }
-            if let Some(id) = euid
-                && id != old.ruid
-                && id != old.euid
-                && id != old.suid
-            {
-                return Err(AxError::OperationNotPermitted);
-            }
+        let (_, update) = prepare_user_id_update(
+            &self.credential,
+            UserIdTransitionInput::setreuid(ruid, euid),
+        )?;
+        if let Some(update) = update {
+            self.commit_credential(update);
         }
-
-        let new_ruid = ruid.unwrap_or(old.ruid);
-        let new_euid = euid.unwrap_or(old.euid);
-        update.builder.ids.ruid = new_ruid;
-        update.builder.ids.euid = new_euid;
-        update.builder.ids.fsuid = new_euid;
-        if ruid.is_some() || euid.is_some_and(|id| id != old.ruid) {
-            update.builder.ids.suid = new_euid;
-        }
-        Self::fixup_capabilities_for_uid_change(
-            root_kuid,
-            old,
-            update.builder.ids,
-            &mut update.builder.caps,
-        );
-        self.commit_credential(update.finish()?);
         Ok(())
     }
 
     pub(crate) fn setregid(&self, rgid: Option<Kgid>, egid: Option<Kgid>) -> AxResult<()> {
-        let mut update = self.credential.prepare();
-        let can_setgid = update.old().has_effective_capability_for_setid(CAP_SETGID);
-        let old = update.builder.ids;
-        if !can_setgid {
-            if let Some(id) = rgid
-                && id != old.rgid
-                && id != old.egid
-            {
-                return Err(AxError::OperationNotPermitted);
-            }
-            if let Some(id) = egid
-                && id != old.rgid
-                && id != old.egid
-                && id != old.sgid
-            {
-                return Err(AxError::OperationNotPermitted);
-            }
+        let (_, update) = prepare_group_id_update(
+            &self.credential,
+            GroupIdTransitionInput::setregid(rgid, egid),
+        )?;
+        if let Some(update) = update {
+            self.commit_credential(update);
         }
-
-        let new_rgid = rgid.unwrap_or(old.rgid);
-        let new_egid = egid.unwrap_or(old.egid);
-        update.builder.ids.rgid = new_rgid;
-        update.builder.ids.egid = new_egid;
-        update.builder.ids.fsgid = new_egid;
-        if rgid.is_some() || egid.is_some_and(|id| id != old.rgid) {
-            update.builder.ids.sgid = new_egid;
-        }
-        self.commit_credential(update.finish()?);
         Ok(())
     }
 
@@ -516,35 +443,13 @@ impl Thread {
         euid: Option<Kuid>,
         suid: Option<Kuid>,
     ) -> AxResult<()> {
-        let mut update = self.credential.prepare();
-        let root_kuid = update.old().user_ns().root_kuid();
-        let can_setuid = update.old().has_effective_capability_for_setid(CAP_SETUID);
-        let old = update.builder.ids;
-        if !can_setuid {
-            for id in [ruid, euid, suid].into_iter().flatten() {
-                if id != old.ruid && id != old.euid && id != old.suid {
-                    return Err(AxError::OperationNotPermitted);
-                }
-            }
+        let (_, update) = prepare_user_id_update(
+            &self.credential,
+            UserIdTransitionInput::setresuid(ruid, euid, suid),
+        )?;
+        if let Some(update) = update {
+            self.commit_credential(update);
         }
-
-        if let Some(id) = ruid {
-            update.builder.ids.ruid = id;
-        }
-        if let Some(id) = euid {
-            update.builder.ids.euid = id;
-        }
-        if let Some(id) = suid {
-            update.builder.ids.suid = id;
-        }
-        update.builder.ids.fsuid = update.builder.ids.euid;
-        Self::fixup_capabilities_for_uid_change(
-            root_kuid,
-            old,
-            update.builder.ids,
-            &mut update.builder.caps,
-        );
-        self.commit_credential(update.finish()?);
         Ok(())
     }
 
@@ -554,33 +459,18 @@ impl Thread {
         egid: Option<Kgid>,
         sgid: Option<Kgid>,
     ) -> AxResult<()> {
-        let mut update = self.credential.prepare();
-        let can_setgid = update.old().has_effective_capability_for_setid(CAP_SETGID);
-        let old = update.builder.ids;
-        if !can_setgid {
-            for id in [rgid, egid, sgid].into_iter().flatten() {
-                if id != old.rgid && id != old.egid && id != old.sgid {
-                    return Err(AxError::OperationNotPermitted);
-                }
-            }
+        let (_, update) = prepare_group_id_update(
+            &self.credential,
+            GroupIdTransitionInput::setresgid(rgid, egid, sgid),
+        )?;
+        if let Some(update) = update {
+            self.commit_credential(update);
         }
-
-        if let Some(id) = rgid {
-            update.builder.ids.rgid = id;
-        }
-        if let Some(id) = egid {
-            update.builder.ids.egid = id;
-        }
-        if let Some(id) = sgid {
-            update.builder.ids.sgid = id;
-        }
-        update.builder.ids.fsgid = update.builder.ids.egid;
-        self.commit_credential(update.finish()?);
         Ok(())
     }
 
     pub(crate) fn setfsuid(&self, fsuid: Kuid) -> AxResult<Kuid> {
-        let (old_fsuid, update) = prepare_setfsuid_update(&self.credential, fsuid)?;
+        let (old_fsuid, update) = prepare_setfsuid_update(&self.credential, fsuid);
         if let Some(update) = update {
             self.commit_credential(update);
         }
@@ -588,7 +478,7 @@ impl Thread {
     }
 
     pub(crate) fn setfsgid(&self, fsgid: Kgid) -> AxResult<Kgid> {
-        let (old_fsgid, update) = prepare_setfsgid_update(&self.credential, fsgid)?;
+        let (old_fsgid, update) = prepare_setfsgid_update(&self.credential, fsgid);
         if let Some(update) = update {
             self.commit_credential(update);
         }
@@ -600,10 +490,13 @@ impl Thread {
 mod tests {
     use alloc::{sync::Arc, vec};
 
-    use linux_raw_sys::general::{CAP_CHOWN, CAP_KILL};
+    use linux_raw_sys::general::{CAP_CHOWN, CAP_KILL, CAP_SETPCAP};
 
     use super::*;
-    use crate::task::{IdMapInputExtent, UserNamespace};
+    use crate::task::{
+        Credentials, IdMapInputExtent, UserNamespace,
+        creds::{CAPABILITY_WORDS, capability_state_for_test},
+    };
 
     fn kuid(raw: u32) -> Kuid {
         Kuid::from_raw(raw).unwrap()
@@ -676,76 +569,122 @@ mod tests {
 
     #[test]
     fn child_user_namespace_uid_fixup_uses_mapped_root_not_global_zero() {
-        let root_kuid = kuid(1000);
-        let old = ids(root_kuid, kgid(100));
-        let new = ids(kuid(1001), kgid(101));
+        let (child, root_cred) = mapped_child_credential();
+        assert_eq!(child.root_kuid(), Some(kuid(1000)));
+        let slot = CredentialSlot::new(root_cred);
 
-        let mut mapped_root_caps = CapabilityState::full();
-        Thread::fixup_capabilities_for_uid_change(Some(root_kuid), old, new, &mut mapped_root_caps);
-        assert_eq!(mapped_root_caps.effective, [0; CAPABILITY_WORDS]);
-        assert_eq!(mapped_root_caps.permitted, [0; CAPABILITY_WORDS]);
+        let (_, update) =
+            prepare_user_id_update(&slot, UserIdTransitionInput::setuid(kuid(1001))).unwrap();
+        let updated = update.unwrap().commit();
 
-        let mut wrong_global_root_caps = CapabilityState::full();
-        Thread::fixup_capabilities_for_uid_change(
-            Some(Kuid::INITIAL_ROOT),
-            old,
-            new,
-            &mut wrong_global_root_caps,
-        );
-        assert_eq!(wrong_global_root_caps, CapabilityState::full());
-    }
-
-    #[test]
-    fn uid_fixup_drops_capabilities_when_any_old_id_was_namespace_root() {
-        let root = kuid(1000);
-        let user = kuid(1001);
-        let mut old = ids(user, kgid(100));
-        old.euid = root;
-        let new = ids(user, kgid(100));
-        let mut caps = CapabilityState::full();
-        caps.inheritable[0] = 1;
-        caps.ambient[0] = 1;
-
-        Thread::fixup_capabilities_for_uid_change(Some(root), old, new, &mut caps);
-
-        assert_eq!(caps.permitted, [0; CAPABILITY_WORDS]);
-        assert_eq!(caps.effective, [0; CAPABILITY_WORDS]);
-        assert_eq!(caps.ambient, [0; CAPABILITY_WORDS]);
-    }
-
-    #[test]
-    fn uid_fixup_keep_caps_still_clears_ambient_when_last_root_id_is_lost() {
-        let root = kuid(1000);
-        let user = kuid(1001);
-        let mut old = ids(user, kgid(100));
-        old.ruid = root;
-        let new = ids(user, kgid(100));
-        let mut caps = CapabilityState::full();
-        caps.securebits |= SECBIT_KEEP_CAPS;
-        caps.inheritable[0] = 1;
-        caps.ambient[0] = 1;
-        let expected_permitted = caps.permitted;
-        let expected_effective = caps.effective;
-
-        Thread::fixup_capabilities_for_uid_change(Some(root), old, new, &mut caps);
-
-        assert_eq!(caps.permitted, expected_permitted);
-        assert_eq!(caps.effective, expected_effective);
-        assert_eq!(caps.ambient, [0; CAPABILITY_WORDS]);
+        assert_eq!(updated.ids().euid, kuid(1001));
+        assert_eq!(updated.capabilities().effective(), [0; CAPABILITY_WORDS]);
+        assert_eq!(updated.capabilities().permitted(), [0; CAPABILITY_WORDS]);
     }
 
     #[test]
     fn child_user_namespace_fsuid_fixup_uses_mapped_root() {
-        let mut caps = CapabilityState::full();
-        Thread::fixup_capabilities_for_fsuid_change(
-            Some(kuid(1000)),
-            kuid(1000),
-            kuid(1001),
-            &mut caps,
-        );
+        let (_, root_cred) = mapped_child_credential();
+        let slot = CredentialSlot::new(root_cred);
+        let (old_fsuid, update) = prepare_setfsuid_update(&slot, kuid(1001));
+        let updated = update.unwrap().commit();
 
-        assert!(!caps.has_effective(CAP_CHOWN));
-        assert!(caps.has_effective(CAP_KILL));
+        assert_eq!(old_fsuid, kuid(1000));
+        assert!(!updated.capabilities().has_effective(CAP_CHOWN));
+        assert!(updated.capabilities().has_effective(CAP_KILL));
+    }
+
+    #[test]
+    fn setid_admission_uses_writer_locked_old_credential() {
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let slot = CredentialSlot::new(Cred::try_root(namespace).unwrap());
+        let stale_root = slot.current();
+        let mut lower = slot.prepare();
+        lower.builder.ids = ids(kuid(1000), kgid(100));
+        let old_caps = lower.builder.caps;
+        lower.builder.caps = capability_state_for_test(
+            [0; CAPABILITY_WORDS],
+            [0; CAPABILITY_WORDS],
+            [0; CAPABILITY_WORDS],
+            old_caps.bounding(),
+            [0; CAPABILITY_WORDS],
+            old_caps.securebits(),
+        );
+        lower.finish().unwrap().commit();
+
+        assert!(stale_root.has_effective_capability_for_setid(CAP_SETUID));
+        let before = slot.current();
+        let error = prepare_user_id_update(&slot, UserIdTransitionInput::setuid(kuid(2000)))
+            .err()
+            .unwrap();
+        assert_eq!(error, AxError::OperationNotPermitted);
+        assert!(Arc::ptr_eq(&before, &slot.current()));
+    }
+
+    #[test]
+    fn capset_with_setpcap_still_enforces_old_bounding_set() {
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let slot = CredentialSlot::new(Cred::try_root(namespace).unwrap());
+        let mut restrict = slot.prepare();
+        restrict.builder.caps.try_drop_bounding(CAP_CHOWN).unwrap();
+        restrict.finish().unwrap().commit();
+
+        let before = slot.current();
+        assert!(before.has_effective_capability_in_own_user_ns(CAP_SETPCAP));
+        let capabilities = before.capabilities();
+        let mut inheritable = capabilities.inheritable();
+        let (word, mask) = CapabilityState::cap_mask(CAP_CHOWN).unwrap();
+        inheritable[word] |= mask;
+        let request = CapsetRequest::try_new(
+            capabilities.effective(),
+            capabilities.permitted(),
+            inheritable,
+        )
+        .unwrap();
+
+        let error = prepare_capset_update(&slot, request).err().unwrap();
+        assert_eq!(error, AxError::OperationNotPermitted);
+        assert!(Arc::ptr_eq(&before, &slot.current()));
+    }
+
+    #[test]
+    fn securebits_without_setpcap_only_changes_unprivileged_bits() {
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let slot = CredentialSlot::new(Cred::try_root(namespace).unwrap());
+        let mut restrict = slot.prepare();
+        let caps = restrict.builder.caps;
+        let (word, mask) = CapabilityState::cap_mask(CAP_SETPCAP).unwrap();
+        let mut effective = caps.effective();
+        let mut permitted = caps.permitted();
+        effective[word] &= !mask;
+        permitted[word] &= !mask;
+        restrict.builder.caps = capability_state_for_test(
+            effective,
+            permitted,
+            caps.inheritable(),
+            caps.bounding(),
+            caps.ambient(),
+            caps.securebits(),
+        );
+        restrict.finish().unwrap().commit();
+
+        let requested = thekernel_linux_cred::SECBIT_EXEC_RESTRICT_FILE;
+        let update = prepare_securebits_update(&slot, requested)
+            .unwrap()
+            .unwrap();
+        let updated = update.commit();
+        assert_eq!(updated.capabilities().securebits(), requested);
+
+        let before_noop = slot.current();
+        let error = prepare_securebits_update(&slot, requested).err().unwrap();
+        assert_eq!(error, AxError::OperationNotPermitted);
+        assert!(Arc::ptr_eq(&before_noop, &slot.current()));
+
+        let error = prepare_securebits_update(&slot, requested | SECBIT_KEEP_CAPS)
+            .err()
+            .unwrap();
+        assert_eq!(error, AxError::OperationNotPermitted);
+        assert!(Arc::ptr_eq(&before_noop, &slot.current()));
     }
 
     #[test]
@@ -754,19 +693,25 @@ mod tests {
         let slot = CredentialSlot::new(Cred::try_root(namespace).unwrap());
         let mut lower = slot.prepare();
         lower.builder.ids = ids(kuid(1000), kgid(100));
-        lower.builder.caps.effective = [0; CAPABILITY_WORDS];
-        lower.builder.caps.permitted = [0; CAPABILITY_WORDS];
-        lower.builder.caps.clear_ambient();
+        let old_caps = lower.builder.caps;
+        lower.builder.caps = capability_state_for_test(
+            [0; CAPABILITY_WORDS],
+            [0; CAPABILITY_WORDS],
+            [0; CAPABILITY_WORDS],
+            old_caps.bounding(),
+            [0; CAPABILITY_WORDS],
+            old_caps.securebits(),
+        );
         lower.finish().unwrap().commit();
 
         let before_uid = slot.current();
-        let (old_uid, uid_update) = prepare_setfsuid_update(&slot, kuid(2000)).unwrap();
+        let (old_uid, uid_update) = prepare_setfsuid_update(&slot, kuid(2000));
         assert_eq!(old_uid, kuid(1000));
         assert!(uid_update.is_none());
         assert!(Arc::ptr_eq(&before_uid, &slot.current()));
 
         let before_gid = slot.current();
-        let (old_gid, gid_update) = prepare_setfsgid_update(&slot, kgid(200)).unwrap();
+        let (old_gid, gid_update) = prepare_setfsgid_update(&slot, kgid(200));
         assert_eq!(old_gid, kgid(100));
         assert!(gid_update.is_none());
         assert!(Arc::ptr_eq(&before_gid, &slot.current()));

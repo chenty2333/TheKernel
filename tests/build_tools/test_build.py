@@ -179,6 +179,86 @@ class ProductBootBoundaryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, msg=name)
             self.assertIn("--wait-policy must be hybrid or irq_first", result.stderr)
 
+    def test_smoke_kernel_path_excludes_build_stdout(self) -> None:
+        root = repo_root()
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            fake_bin = temp / "bin"
+            fake_bin.mkdir()
+            fake_make = fake_bin / "make"
+            fake_make.write_text(
+                "#!/bin/sh\n"
+                "printf 'fake make stdout\\n'\n"
+                "printf 'fake make stderr\\n' >&2\n",
+                encoding="utf-8",
+            )
+            fake_make.chmod(0o755)
+            fake_repo = temp / "repo"
+            env = dict(__import__("os").environ)
+            env["PATH"] = f"{fake_bin}:{env['PATH']}"
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'set -euo pipefail; source "$1"; REPO_ROOT="$2"; '
+                    "smoke_runner_artifact_args rv 0",
+                    "smoke-helper-test",
+                    str(root / "scripts" / "smoke" / "lib.sh"),
+                    str(fake_repo),
+                ],
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr.decode())
+            self.assertEqual(
+                result.stdout,
+                b"--kernel\0" + str(fake_repo / ".state/shell/kernel-rv").encode() + b"\0",
+            )
+            self.assertIn(b"fake make stdout", result.stderr)
+            self.assertIn(b"fake make stderr", result.stderr)
+
+    def test_smoke_kernel_build_failure_is_propagated(self) -> None:
+        root = repo_root()
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            fake_bin = temp / "bin"
+            fake_bin.mkdir()
+            fake_make = fake_bin / "make"
+            fake_make.write_text(
+                "#!/bin/sh\n"
+                "printf 'fake make stdout before failure\\n'\n"
+                "printf 'fake make stderr before failure\\n' >&2\n"
+                "exit 23\n",
+                encoding="utf-8",
+            )
+            fake_make.chmod(0o755)
+            fake_repo = temp / "repo"
+            env = dict(__import__("os").environ)
+            env["PATH"] = f"{fake_bin}:{env['PATH']}"
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'set -euo pipefail; source "$1"; REPO_ROOT="$2"; '
+                    "smoke_runner_artifact_args rv 0",
+                    "smoke-helper-test",
+                    str(root / "scripts" / "smoke" / "lib.sh"),
+                    str(fake_repo),
+                ],
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 23, msg=result.stderr.decode())
+            self.assertEqual(result.stdout, b"")
+            self.assertIn(b"fake make stdout before failure", result.stderr)
+            self.assertIn(b"fake make stderr before failure", result.stderr)
+
 
 class BuildCliTests(unittest.TestCase):
     def test_help_documents_product_commands(self) -> None:

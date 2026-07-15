@@ -270,6 +270,31 @@ impl<B: MappingBackend> MemorySet<B> {
 
         let end = range.end;
 
+        // Admission is read-only and covers every backend before the first
+        // VMA or PTE change. The mutable commit below runs under the caller's
+        // page-table/topology serialization, so a backend failure after this
+        // point is an invariant violation rather than a recoverable result.
+        let first_start = self
+            .areas
+            .range(..=start)
+            .next_back()
+            .filter(|(_, area)| area.end() > start)
+            .map(|(&area_start, _)| area_start)
+            .unwrap_or(start);
+        for area in self.areas.range(first_start..end).map(|(_, area)| area) {
+            let unmap_start = area.start().max(start);
+            let unmap_end = area.end().min(end);
+            if unmap_start < unmap_end
+                && !area.backend().preflight_unmap(
+                    unmap_start,
+                    unmap_end.sub_addr(unmap_start),
+                    page_table,
+                )
+            {
+                return Err(MappingError::BadState);
+            }
+        }
+
         // Unmap entire areas that are contained by the range.
         let fully_covered: Vec<_> = self
             .areas
@@ -280,7 +305,8 @@ impl<B: MappingBackend> MemorySet<B> {
             .collect();
         for area_start in fully_covered {
             let area = self.areas.remove(&area_start).unwrap();
-            area.unmap_area(page_table)?;
+            area.unmap_area(page_table)
+                .expect("mapping backend failed after successful unmap preflight");
         }
 
         // Shrink right if the area intersects with the left boundary.
@@ -289,11 +315,15 @@ impl<B: MappingBackend> MemorySet<B> {
             if before_end > start {
                 if before_end <= end {
                     // the unmapped area is at the end of `before`.
-                    before.shrink_right(start.sub_addr(before_start), page_table)?;
+                    before
+                        .shrink_right(start.sub_addr(before_start), page_table)
+                        .expect("mapping backend failed after successful unmap preflight");
                 } else {
                     // the unmapped area is in the middle `before`, need to split.
                     let right_part = before.split(end).unwrap();
-                    before.shrink_right(start.sub_addr(before_start), page_table)?;
+                    before
+                        .shrink_right(start.sub_addr(before_start), page_table)
+                        .expect("mapping backend failed after successful unmap preflight");
                     assert_eq!(right_part.start().into(), Into::<usize>::into(end));
                     self.areas.insert(end, right_part);
                 }
@@ -306,7 +336,9 @@ impl<B: MappingBackend> MemorySet<B> {
             if after_start < end {
                 // the unmapped area is at the start of `after`.
                 let mut new_area = self.areas.remove(&after_start).unwrap();
-                new_area.shrink_left(after_end.sub_addr(end), page_table)?;
+                new_area
+                    .shrink_left(after_end.sub_addr(end), page_table)
+                    .expect("mapping backend failed after successful unmap preflight");
                 assert_eq!(new_area.start().into(), Into::<usize>::into(end));
                 self.areas.insert(end, new_area);
             }
@@ -320,8 +352,17 @@ impl<B: MappingBackend> MemorySet<B> {
 
     /// Remove all memory areas and the underlying mappings.
     pub fn clear(&mut self, page_table: &mut B::PageTable) -> MappingResult {
+        for area in self.areas.values() {
+            if !area
+                .backend()
+                .preflight_unmap(area.start(), area.size(), page_table)
+            {
+                return Err(MappingError::BadState);
+            }
+        }
         for (_, area) in self.areas.iter() {
-            area.unmap_area(page_table)?;
+            area.unmap_area(page_table)
+                .expect("mapping backend failed after successful clear preflight");
         }
         self.areas.clear();
         Ok(())
@@ -376,6 +417,22 @@ impl<B: MappingBackend> MemorySet<B> {
             }
         }
 
+        // Complete every recoverable backend/PTE check before splitting the
+        // first VMA. Once this succeeds, commit failures are consistency bugs:
+        // restoring the old area tree cannot prove that a partially updated
+        // page table was restored as well.
+        for action in &actions {
+            let backend = self.areas.get(&action.area_start).unwrap().backend();
+            if !backend.preflight_protect(
+                action.start,
+                action.end.sub_addr(action.start),
+                action.new_flags,
+                page_table,
+            ) {
+                return Err(MappingError::BadState);
+            }
+        }
+
         // Pre-split only affected areas. Every BTreeMap insertion (and thus
         // every infallible node allocation imposed by alloc::BTreeMap) occurs
         // before the first backend/PTE mutation. The original node at
@@ -415,41 +472,17 @@ impl<B: MappingBackend> MemorySet<B> {
             }
         }
 
-        for (index, action) in actions.iter().enumerate() {
+        for action in &actions {
             let backend = self.areas.get(&action.start).unwrap().backend();
-            if !backend.protect(
-                action.start,
-                action.end.sub_addr(action.start),
-                action.new_flags,
-                page_table,
-            ) {
-                // A backend may have changed a prefix before reporting
-                // failure. Best-effort rollback includes the failing action;
-                // stateful backends can retain a fail-closed lease if their
-                // own rollback cannot prove that write access is gone.
-                for rollback in actions[..=index].iter().rev() {
-                    let backend = self.areas.get(&rollback.start).unwrap().backend();
-                    let _ = backend.protect(
-                        rollback.start,
-                        rollback.end.sub_addr(rollback.start),
-                        rollback.old_flags,
-                        page_table,
-                    );
-                }
-                for staged in actions.iter().rev() {
-                    if staged.area_start < staged.start {
-                        drop(self.areas.remove(&staged.start).unwrap());
-                    }
-                    if staged.end < staged.old_end {
-                        drop(self.areas.remove(&staged.end).unwrap());
-                    }
-                    self.areas
-                        .get_mut(&staged.area_start)
-                        .unwrap()
-                        .set_end(staged.old_end);
-                }
-                return Err(MappingError::BadState);
-            }
+            backend
+                .protect(
+                    action.start,
+                    action.end.sub_addr(action.start),
+                    action.new_flags,
+                    page_table,
+                )
+                .then_some(())
+                .expect("mapping backend failed after successful protect preflight");
         }
 
         for action in &actions {

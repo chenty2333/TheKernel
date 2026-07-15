@@ -110,6 +110,12 @@ pub fn flush_tlb(vaddr: Option<VirtAddr>) {
     }
 }
 
+/// Synchronizes instruction fetches with earlier writes to executable memory.
+#[inline]
+pub fn flush_icache_all() {
+    unsafe { asm!("dbar 0; ibar 0", options(nostack)) }
+}
+
 /// Writes the Exception Entry Base Address register (`EENTRY`).
 ///
 /// It also set the Exception Configuration register (`ECFG`) to `VS=0`.

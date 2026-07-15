@@ -1,8 +1,9 @@
 use std::{
-    alloc::{self, Layout},
-    cell::RefCell,
+    alloc::{self, GlobalAlloc, Layout, System},
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     marker::PhantomData,
+    ptr,
 };
 
 use memory_addr::{PhysAddr, VirtAddr};
@@ -29,12 +30,107 @@ const PAGE_LAYOUT: Layout = pages_layout(1, 4096);
 thread_local! {
     static ALLOCATED: RefCell<HashSet<usize>> = RefCell::default();
     static ALIGN: RefCell<HashMap<usize, usize>> = RefCell::default();
+    static FAIL_NEXT_HEAP_ALLOCATION: Cell<bool> = const { Cell::new(false) };
+    static TRACK_HEAP_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+    static HEAP_ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    static FAIL_FRAME_ALLOCATION_AT: Cell<Option<usize>> = const { Cell::new(None) };
+    static FRAME_ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    static CORRUPT_TABLE_PTR_FLAGS: Cell<bool> = const { Cell::new(false) };
+}
+
+struct TestAllocator;
+
+#[global_allocator]
+static TEST_ALLOCATOR: TestAllocator = TestAllocator;
+
+fn heap_allocation_should_fail() -> bool {
+    FAIL_NEXT_HEAP_ALLOCATION
+        .try_with(|fail| fail.replace(false))
+        .unwrap_or(false)
+}
+
+fn record_heap_allocation() {
+    let _ = TRACK_HEAP_ALLOCATIONS.try_with(|tracking| {
+        if tracking.get() {
+            HEAP_ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+        }
+    });
+}
+
+unsafe impl GlobalAlloc for TestAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if heap_allocation_should_fail() {
+            return ptr::null_mut();
+        }
+        record_heap_allocation();
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if heap_allocation_should_fail() {
+            return ptr::null_mut();
+        }
+        record_heap_allocation();
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if heap_allocation_should_fail() {
+            return ptr::null_mut();
+        }
+        record_heap_allocation();
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+fn fail_next_heap_allocation() {
+    FAIL_NEXT_HEAP_ALLOCATION.with(|fail| fail.set(true));
+}
+
+fn clear_heap_allocation_failure() {
+    FAIL_NEXT_HEAP_ALLOCATION.with(|fail| fail.set(false));
+}
+
+fn start_heap_allocation_tracking() {
+    HEAP_ALLOCATION_COUNT.with(|count| count.set(0));
+    TRACK_HEAP_ALLOCATIONS.with(|tracking| tracking.set(true));
+}
+
+fn stop_heap_allocation_tracking() -> usize {
+    TRACK_HEAP_ALLOCATIONS.with(|tracking| tracking.set(false));
+    HEAP_ALLOCATION_COUNT.with(Cell::get)
+}
+
+fn fail_frame_allocation_at(attempt: usize) {
+    FRAME_ALLOCATION_COUNT.with(|count| count.set(0));
+    FAIL_FRAME_ALLOCATION_AT.with(|fail_at| fail_at.set(Some(attempt)));
+}
+
+fn clear_frame_allocation_failure() {
+    FAIL_FRAME_ALLOCATION_AT.with(|fail_at| fail_at.set(None));
+    FRAME_ALLOCATION_COUNT.with(|count| count.set(0));
+}
+
+fn frame_allocation_should_fail() -> bool {
+    let attempt = FRAME_ALLOCATION_COUNT.with(|count| {
+        let attempt = count.get() + 1;
+        count.set(attempt);
+        attempt
+    });
+    FAIL_FRAME_ALLOCATION_AT.with(|fail_at| fail_at.get() == Some(attempt))
 }
 
 struct TrackPagingHandler<M: PagingMetaData>(PhantomData<M>);
 
 impl<M: PagingMetaData> PagingHandler for TrackPagingHandler<M> {
     fn alloc_frame() -> Option<PhysAddr> {
+        if frame_allocation_should_fail() {
+            return None;
+        }
         let ptr = unsafe { alloc::alloc(PAGE_LAYOUT) } as usize;
         assert!(
             ptr <= M::PA_MAX_ADDR,
@@ -187,7 +283,12 @@ impl GenericPTE for TablePtrPte {
     }
 
     fn flags(&self) -> MappingFlags {
-        Self::flags_from_bits(self.0)
+        let flags = Self::flags_from_bits(self.0);
+        if CORRUPT_TABLE_PTR_FLAGS.with(Cell::get) {
+            flags | MappingFlags::WRITE
+        } else {
+            flags
+        }
     }
 
     fn set_paddr(&mut self, paddr: PhysAddr) {
@@ -224,6 +325,284 @@ impl GenericPTE for TablePtrPte {
     }
 }
 
+#[test]
+fn test_map_region_rolls_back_after_late_table_allocation_failure() -> PagingResult<()> {
+    ALLOCATED.with_borrow_mut(|it| it.clear());
+    clear_frame_allocation_failure();
+
+    let start = 0x1ff000;
+    let mut table =
+        PageTable64::<TablePtrMeta, TablePtrPte, TrackPagingHandler<TablePtrMeta>>::try_new()?;
+    fail_frame_allocation_at(4);
+    let result = {
+        let mut cursor = table.cursor_no_flush();
+        cursor.map_region(
+            VirtAddr::from_usize(start),
+            |vaddr| PhysAddr::from_usize(0x1000_0000 + vaddr.as_usize() - start),
+            0x2000,
+            MappingFlags::READ | MappingFlags::WRITE,
+            false,
+        )
+    };
+    clear_frame_allocation_failure();
+
+    assert_eq!(result, Err(PagingError::NoMemory));
+    assert!(matches!(
+        table.query(VirtAddr::from_usize(start)),
+        Err(PagingError::NotMapped)
+    ));
+    assert!(matches!(
+        table.query(VirtAddr::from_usize(start + 0x1000)),
+        Err(PagingError::NotMapped)
+    ));
+
+    drop(table);
+    assert_eq!(
+        ALLOCATED.with_borrow(|it| it.len()),
+        0,
+        "Some frames were not deallocated"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_map_region_rolls_back_before_existing_conflict() -> PagingResult<()> {
+    ALLOCATED.with_borrow_mut(|it| it.clear());
+
+    let start = 0x400000;
+    let conflict_vaddr = VirtAddr::from_usize(start + 0x1000);
+    let conflict_paddr = PhysAddr::from_usize(0x3000_0000);
+    let conflict_flags = MappingFlags::READ | MappingFlags::USER;
+    let mut table =
+        PageTable64::<TablePtrMeta, TablePtrPte, TrackPagingHandler<TablePtrMeta>>::try_new()?;
+    {
+        let mut cursor = table.cursor_no_flush();
+        cursor.map(
+            conflict_vaddr,
+            conflict_paddr,
+            PageSize::Size4K,
+            conflict_flags,
+        )?;
+    }
+
+    let result = {
+        let mut cursor = table.cursor_no_flush();
+        cursor.map_region(
+            VirtAddr::from_usize(start),
+            |vaddr| PhysAddr::from_usize(0x2000_0000 + vaddr.as_usize() - start),
+            0x2000,
+            MappingFlags::READ | MappingFlags::WRITE,
+            false,
+        )
+    };
+
+    assert_eq!(result, Err(PagingError::AlreadyMapped));
+    assert!(matches!(
+        table.query(VirtAddr::from_usize(start)),
+        Err(PagingError::NotMapped)
+    ));
+    assert_eq!(
+        table.query(conflict_vaddr)?,
+        (conflict_paddr, conflict_flags, PageSize::Size4K)
+    );
+
+    drop(table);
+    assert_eq!(
+        ALLOCATED.with_borrow(|it| it.len()),
+        0,
+        "Some frames were not deallocated"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_map_region_rollback_mismatch_is_fail_stop() -> PagingResult<()> {
+    ALLOCATED.with_borrow_mut(|it| it.clear());
+    CORRUPT_TABLE_PTR_FLAGS.with(|corrupt| corrupt.set(false));
+
+    let start = 0x800000;
+    let conflict_vaddr = VirtAddr::from_usize(start + 0x1000);
+    let mut table =
+        PageTable64::<TablePtrMeta, TablePtrPte, TrackPagingHandler<TablePtrMeta>>::try_new()?;
+    {
+        let mut cursor = table.cursor_no_flush();
+        cursor.map(
+            conflict_vaddr,
+            PhysAddr::from_usize(0x5000_0000),
+            PageSize::Size4K,
+            MappingFlags::READ,
+        )?;
+    }
+
+    let rollback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut cursor = table.cursor_no_flush();
+        let _ = cursor.map_region(
+            VirtAddr::from_usize(start),
+            |vaddr| {
+                if vaddr == conflict_vaddr {
+                    CORRUPT_TABLE_PTR_FLAGS.with(|corrupt| corrupt.set(true));
+                }
+                PhysAddr::from_usize(0x4000_0000 + vaddr.as_usize() - start)
+            },
+            0x2000,
+            MappingFlags::READ,
+            false,
+        );
+    }));
+    CORRUPT_TABLE_PTR_FLAGS.with(|corrupt| corrupt.set(false));
+
+    let panic = rollback.expect_err("rollback mismatch must fail-stop");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(message.contains("map_region rollback mismatch"));
+    assert!(matches!(
+        table.query(VirtAddr::from_usize(start)),
+        Err(PagingError::NotMapped)
+    ));
+    assert_eq!(
+        table.query(conflict_vaddr)?,
+        (
+            PhysAddr::from_usize(0x5000_0000),
+            MappingFlags::READ,
+            PageSize::Size4K,
+        )
+    );
+
+    drop(table);
+    assert_eq!(
+        ALLOCATED.with_borrow(|it| it.len()),
+        0,
+        "Some frames were not deallocated"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_drain_allocation_failure_preserves_present_leaves() -> PagingResult<()> {
+    ALLOCATED.with_borrow_mut(|it| it.clear());
+    clear_heap_allocation_failure();
+
+    let mut table =
+        PageTable64::<TablePtrMeta, TablePtrPte, TrackPagingHandler<TablePtrMeta>>::try_new()?;
+    {
+        let mut cursor = table.cursor_no_flush();
+        cursor.map(
+            VirtAddr::from_usize(0x1000),
+            PhysAddr::from_usize(0x2000_0000),
+            PageSize::Size4K,
+            MappingFlags::READ | MappingFlags::WRITE,
+        )?;
+        cursor.map(
+            VirtAddr::from_usize(0x9000),
+            PhysAddr::from_usize(0x2000_1000),
+            PageSize::Size4K,
+            MappingFlags::READ,
+        )?;
+    }
+
+    fail_next_heap_allocation();
+    let result = {
+        let mut cursor = table.cursor_no_flush();
+        cursor.drain_present_leaves(VirtAddr::from_usize(0), 0x20_000)
+    };
+    clear_heap_allocation_failure();
+
+    assert_eq!(result, Err(PagingError::NoMemory));
+    assert_eq!(
+        table.query(VirtAddr::from_usize(0x1000))?,
+        (
+            PhysAddr::from_usize(0x2000_0000),
+            MappingFlags::READ | MappingFlags::WRITE,
+            PageSize::Size4K,
+        )
+    );
+    assert_eq!(
+        table.query(VirtAddr::from_usize(0x9000))?,
+        (
+            PhysAddr::from_usize(0x2000_1000),
+            MappingFlags::READ,
+            PageSize::Size4K,
+        )
+    );
+
+    drop(table);
+    assert_eq!(
+        ALLOCATED.with_borrow(|it| it.len()),
+        0,
+        "Some frames were not deallocated"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_collect_and_drain_use_one_exact_leaf_allocation() -> PagingResult<()> {
+    ALLOCATED.with_borrow_mut(|it| it.clear());
+
+    let mut table =
+        PageTable64::<TablePtrMeta, TablePtrPte, TrackPagingHandler<TablePtrMeta>>::try_new()?;
+    {
+        let mut cursor = table.cursor_no_flush();
+        cursor.map(
+            VirtAddr::from_usize(0x1000),
+            PhysAddr::from_usize(0x2000_0000),
+            PageSize::Size4K,
+            MappingFlags::READ | MappingFlags::WRITE,
+        )?;
+        cursor.map(
+            VirtAddr::from_usize(0x9000),
+            PhysAddr::from_usize(0x2000_1000),
+            PageSize::Size4K,
+            MappingFlags::READ,
+        )?;
+    }
+    let expected = [
+        (
+            VirtAddr::from_usize(0x1000),
+            PhysAddr::from_usize(0x2000_0000),
+            MappingFlags::READ | MappingFlags::WRITE,
+            PageSize::Size4K,
+        ),
+        (
+            VirtAddr::from_usize(0x9000),
+            PhysAddr::from_usize(0x2000_1000),
+            MappingFlags::READ,
+            PageSize::Size4K,
+        ),
+    ];
+
+    start_heap_allocation_tracking();
+    let collected = table.collect_present_leaves(VirtAddr::from_usize(0), 0x20_000);
+    let collect_allocations = stop_heap_allocation_tracking();
+    let collected = collected?;
+    assert_eq!(collect_allocations, 1);
+    assert_eq!(collected.as_slice(), &expected);
+    assert!(collected.capacity() >= collected.len());
+
+    start_heap_allocation_tracking();
+    let drained = {
+        let mut cursor = table.cursor_no_flush();
+        cursor.drain_present_leaves(VirtAddr::from_usize(0), 0x20_000)
+    };
+    let drain_allocations = stop_heap_allocation_tracking();
+    let drained = drained?;
+    assert_eq!(drain_allocations, 1);
+    assert_eq!(drained.as_slice(), &expected);
+    assert!(drained.capacity() >= drained.len());
+
+    drop(collected);
+    drop(drained);
+    drop(table);
+    assert_eq!(
+        ALLOCATED.with_borrow(|it| it.len()),
+        0,
+        "Some frames were not deallocated"
+    );
+    Ok(())
+}
+
 fn run_test_for<M: PagingMetaData<VirtAddr = VirtAddr>, PTE: GenericPTE>() -> PagingResult<()> {
     ALLOCATED.with_borrow_mut(|it| {
         it.clear();
@@ -236,7 +615,7 @@ fn run_test_for<M: PagingMetaData<VirtAddr = VirtAddr>, PTE: GenericPTE>() -> Pa
     let mut rng = SmallRng::seed_from_u64(1234);
 
     for _ in 0..2048 {
-        let mut cursor = table.cursor();
+        let mut cursor = table.cursor_no_flush();
         if rng.random_ratio(3, 4) || pages.is_empty() {
             // insert a mapping
             let addr = loop {
@@ -349,7 +728,7 @@ fn test_collect_present_leaves_x86() -> PagingResult<()> {
 
     let mut table = PageTable64::<Meta, Pte, TrackPagingHandler<Meta>>::try_new()?;
     {
-        let mut cursor = table.cursor();
+        let mut cursor = table.cursor_no_flush();
         cursor.map(
             VirtAddr::from_usize(0x1000),
             PhysAddr::from_usize(0x2000),
@@ -384,7 +763,7 @@ fn test_collect_present_leaves_x86() -> PagingResult<()> {
     );
 
     {
-        let mut cursor = table.cursor();
+        let mut cursor = table.cursor_no_flush();
         cursor.map(
             VirtAddr::from_usize(0x20_0000),
             PhysAddr::from_usize(0x40_0000),
@@ -415,7 +794,7 @@ fn test_collect_present_leaves_nonpresent_tables() -> PagingResult<()> {
     let mut table =
         PageTable64::<TablePtrMeta, TablePtrPte, TrackPagingHandler<TablePtrMeta>>::try_new()?;
     {
-        let mut cursor = table.cursor();
+        let mut cursor = table.cursor_no_flush();
         cursor.map(
             VirtAddr::from_usize(0x3fff_9000),
             PhysAddr::from_usize(0x2000_0000),
@@ -469,7 +848,7 @@ fn test_drain_present_leaves_x86() -> PagingResult<()> {
 
     let mut table = PageTable64::<Meta, Pte, TrackPagingHandler<Meta>>::try_new()?;
     {
-        let mut cursor = table.cursor();
+        let mut cursor = table.cursor_no_flush();
         cursor.map(
             VirtAddr::from_usize(0x1000),
             PhysAddr::from_usize(0x2000),
@@ -485,7 +864,7 @@ fn test_drain_present_leaves_x86() -> PagingResult<()> {
     }
 
     let drained = {
-        let mut cursor = table.cursor();
+        let mut cursor = table.cursor_no_flush();
         cursor.drain_present_leaves(VirtAddr::from_usize(0), 0x20_000)?
     };
     assert_eq!(
@@ -511,7 +890,7 @@ fn test_drain_present_leaves_x86() -> PagingResult<()> {
     );
 
     {
-        let mut cursor = table.cursor();
+        let mut cursor = table.cursor_no_flush();
         cursor.map(
             VirtAddr::from_usize(0x20_0000),
             PhysAddr::from_usize(0x40_0000),
@@ -521,7 +900,7 @@ fn test_drain_present_leaves_x86() -> PagingResult<()> {
     }
     assert!(matches!(
         {
-            let mut cursor = table.cursor();
+            let mut cursor = table.cursor_no_flush();
             cursor.drain_present_leaves(VirtAddr::from_usize(0x20_1000), 0x1000)
         },
         Err(PagingError::NotAligned)
@@ -537,7 +916,7 @@ fn test_drain_present_leaves_x86() -> PagingResult<()> {
     );
 
     {
-        let mut cursor = table.cursor();
+        let mut cursor = table.cursor_no_flush();
         cursor.map(
             VirtAddr::from_usize(0x10_0000),
             PhysAddr::from_usize(0x50_0000),
@@ -547,7 +926,7 @@ fn test_drain_present_leaves_x86() -> PagingResult<()> {
     }
     assert!(matches!(
         {
-            let mut cursor = table.cursor();
+            let mut cursor = table.cursor_no_flush();
             cursor.drain_present_leaves(VirtAddr::from_usize(0x10_0000), 0x101000)
         },
         Err(PagingError::NotAligned)
@@ -587,7 +966,7 @@ fn test_drain_present_leaves_nonpresent_tables() -> PagingResult<()> {
     let mut table =
         PageTable64::<TablePtrMeta, TablePtrPte, TrackPagingHandler<TablePtrMeta>>::try_new()?;
     {
-        let mut cursor = table.cursor();
+        let mut cursor = table.cursor_no_flush();
         cursor.map(
             VirtAddr::from_usize(0x3fff_9000),
             PhysAddr::from_usize(0x2000_0000),
@@ -603,7 +982,7 @@ fn test_drain_present_leaves_nonpresent_tables() -> PagingResult<()> {
     }
 
     let drained = {
-        let mut cursor = table.cursor();
+        let mut cursor = table.cursor_no_flush();
         cursor.drain_present_leaves(VirtAddr::from_usize(0x3fff_9000), 0x3000)?
     };
     assert_eq!(

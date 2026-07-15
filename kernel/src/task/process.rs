@@ -3666,6 +3666,7 @@ mod tests {
     };
     use crate::task::{
         CapabilityState, Cred, CredentialSlot, IdMap, IdMapInputExtent, Kgid, Kuid,
+        creds::capability_state_for_test,
         jobctl::{
             ExecControlState, JobControlState, PtraceControlState, PtraceRelationshipOrigin,
             PtraceSession, StopKind, StopState, VforkControlState,
@@ -3775,17 +3776,33 @@ mod tests {
         let namespace = UserNamespace::try_new_root().unwrap();
         let slot = CredentialSlot::try_new(Cred::try_root(namespace.clone()).unwrap()).unwrap();
         let mut lower = slot.prepare();
-        lower.builder.caps.effective = [0; 2];
-        lower.builder.caps.permitted = [0; 2];
-        lower.builder.caps.inheritable = [0; 2];
-        lower.builder.caps.ambient = [0; 2];
+        let caps = lower.builder.caps;
+        lower.builder.caps = capability_state_for_test(
+            [0; thekernel_linux_cred::CAPABILITY_WORDS],
+            [0; thekernel_linux_cred::CAPABILITY_WORDS],
+            [0; thekernel_linux_cred::CAPABILITY_WORDS],
+            caps.bounding(),
+            [0; thekernel_linux_cred::CAPABILITY_WORDS],
+            caps.securebits(),
+        );
         lower.finish().unwrap().commit();
         let state = ProcessAccessState::try_new(Dumpability::UserDumpable, namespace).unwrap();
         let pdeath = AtomicU32::new(12);
         let (word, mask) = CapabilityState::cap_mask(CAP_CHOWN).unwrap();
         let mut gain = slot.prepare();
-        gain.builder.caps.permitted[word] |= mask;
-        gain.builder.caps.effective[word] |= mask;
+        let caps = gain.builder.caps;
+        let mut permitted = caps.permitted();
+        let mut effective = caps.effective();
+        permitted[word] |= mask;
+        effective[word] |= mask;
+        gain.builder.caps = capability_state_for_test(
+            effective,
+            permitted,
+            caps.inheritable(),
+            caps.bounding(),
+            caps.ambient(),
+            caps.securebits(),
+        );
         let publication = state.publish_credential(gain.finish().unwrap(), &pdeath);
         let (proposed, retirement) = publication.complete_post_commit();
         drop(proposed);

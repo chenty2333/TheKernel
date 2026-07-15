@@ -411,7 +411,11 @@ impl FileNodeOps for Inode {
                 continue;
             }
             let requested = buf.len();
-            let read = fs.read_at(self.ino(), buf, offset).map_err(into_vfs_err)?;
+            let read = match fs.read_at(self.ino(), buf, offset).map_err(into_vfs_err) {
+                Ok(read) => read,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
             total += read;
             offset = offset
                 .checked_add(read as u64)
@@ -467,7 +471,11 @@ impl FileNodeOps for Inode {
                 continue;
             }
             let requested = buf.len();
-            let written = fs.write_at(self.ino(), buf, offset).map_err(into_vfs_err)?;
+            let written = match fs.write_at(self.ino(), buf, offset).map_err(into_vfs_err) {
+                Ok(written) => written,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
             total += written;
             offset = offset
                 .checked_add(written as u64)
@@ -506,6 +514,12 @@ impl FileNodeOps for Inode {
             .lock()
             .set_len(self.ino(), len)
             .map_err(into_vfs_err)
+    }
+
+    fn set_len_failure_is_atomic(&self) -> bool {
+        // ext4_fs_truncate_inode updates allocation metadata incrementally;
+        // Fs::set_len poisons metadata after a failed shrinking truncate.
+        false
     }
 
     fn set_symlink(&self, target: &str) -> VfsResult<()> {

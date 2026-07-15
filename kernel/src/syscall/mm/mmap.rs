@@ -7,12 +7,19 @@ use axhal::paging::{MappingFlags, PageSize};
 use axtask::current;
 use linux_raw_sys::general::*;
 use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange};
+use thekernel_linux_mm::{PageRange as LinuxPageRange, RemapGeometry};
 
 use crate::{
-    file::{Directory, File, FileHandle, get_file_like},
+    file::{
+        Directory, File, FileHandle, executable, get_file_like,
+        privilege_metadata::{
+            ContentWritePrivilegeGuard, begin_shared_writable_mapping_privilege_cleanup,
+        },
+    },
     mm::{
-        AddrSpace, Backend, BackendOps, FileMappingLease, FileMappingSharing, SharedPages,
-        check_memory_overcommit, checked_align_up, checked_align_up_4k,
+        AddrSpace, Backend, BackendOps, FileMappingLease, FileMappingSharing, PreparedProtect,
+        SharedPages, WritableMappingAdmission, check_memory_overcommit, checked_align_up,
+        checked_align_up_4k,
     },
     pseudofs::{Device, DeviceMmap},
     task::{
@@ -52,6 +59,121 @@ fn authorize_then_commit<P, T>(
 ) -> AxResult<T> {
     authorize(&plan)?;
     commit(plan)
+}
+
+fn push_unique_content_location(
+    locations: &mut Vec<(executable::ExecutableKey, Location)>,
+    location: &Location,
+) -> bool {
+    let Some(key) = executable::key(location) else {
+        return false;
+    };
+    if locations.iter().any(|(existing, _)| *existing == key) {
+        return false;
+    }
+    locations.push((key, location.clone()));
+    true
+}
+
+fn begin_shared_writable_protection(
+    plan: &PreparedProtect<'_>,
+    effective_protection: MappingFlags,
+) -> AxResult<(
+    Vec<WritableMappingAdmission>,
+    Vec<ContentWritePrivilegeGuard>,
+)> {
+    if !effective_protection.contains(MappingFlags::WRITE) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let segment_count = plan.segments().count();
+    let mut admissions = Vec::new();
+    let mut locations = Vec::new();
+    let mut guards = Vec::new();
+    admissions
+        .try_reserve(segment_count)
+        .map_err(|_| AxError::NoMemory)?;
+    locations
+        .try_reserve(segment_count)
+        .map_err(|_| AxError::NoMemory)?;
+    guards
+        .try_reserve(segment_count)
+        .map_err(|_| AxError::NoMemory)?;
+
+    for segment in plan.segments() {
+        if segment.flags().contains(MappingFlags::WRITE) {
+            continue;
+        }
+        let Some(mapping) = segment.file_mapping() else {
+            continue;
+        };
+        if mapping.sharing() != FileMappingSharing::Shared {
+            continue;
+        }
+        let Some(location) = segment.backend().shared_file_location() else {
+            continue;
+        };
+        let Some(admission) = segment
+            .backend()
+            .begin_shared_writable_mapping_admission()?
+        else {
+            return Err(AxError::BadState);
+        };
+        admissions.push(admission);
+
+        push_unique_content_location(&mut locations, location);
+    }
+
+    for (_, location) in &locations {
+        guards.push(begin_shared_writable_mapping_privilege_cleanup(location)?);
+    }
+    Ok((admissions, guards))
+}
+
+fn commit_shared_writable_protection(
+    plan: PreparedProtect<'_>,
+    effective_protection: MappingFlags,
+) -> AxResult<()> {
+    let (admissions, guards) = begin_shared_writable_protection(&plan, effective_protection)?;
+    if let Err(error) = plan.commit() {
+        drop(admissions);
+        drop(guards);
+        return Err(error);
+    }
+    for admission in admissions {
+        admission
+            .complete()
+            .expect("writable mapping admission vanished after mprotect commit");
+    }
+    drop(guards);
+    Ok(())
+}
+
+fn with_moving_remap_admission<S, T, E>(
+    state: &mut S,
+    source_start: VirtAddr,
+    source_size: usize,
+    admit: impl FnOnce(&S, VirtAddr, usize) -> Result<(), E>,
+    commit: impl FnOnce(&mut S) -> Result<T, E>,
+) -> Result<T, E> {
+    // The caller retains the address-space lock across admission and commit,
+    // so a new source pin cannot appear before the move is published.
+    admit(state, source_start, source_size)?;
+    commit(state)
+}
+
+fn with_rollback_on_error<S, T, E>(
+    state: &mut S,
+    operation: impl FnOnce(&mut S) -> Result<T, E>,
+    rollback: impl FnOnce(&mut S) -> Result<(), E>,
+) -> Result<T, E> {
+    match operation(state) {
+        Ok(value) => Ok(value),
+        Err(operation_error) => match rollback(state) {
+            Ok(()) => Err(operation_error),
+            Err(rollback_error) => Err(rollback_error),
+        },
+    }
 }
 
 enum PreparedFileMmapBackend {
@@ -193,29 +315,6 @@ struct RemapSegment {
     size: usize,
     flags: MappingFlags,
     backend: Backend,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RelocatedSegmentGeometry {
-    destination_start: VirtAddr,
-    backend_old_start: VirtAddr,
-    backend_new_start: VirtAddr,
-}
-
-fn relocated_segment_geometry(
-    old_start: VirtAddr,
-    new_start: VirtAddr,
-    segment_start: VirtAddr,
-) -> AxResult<RelocatedSegmentGeometry> {
-    let offset = segment_start
-        .checked_sub_addr(old_start)
-        .ok_or(AxError::InvalidInput)?;
-    let destination_start = new_start.checked_add(offset).ok_or(AxError::InvalidInput)?;
-    Ok(RelocatedSegmentGeometry {
-        destination_start,
-        backend_old_start: old_start,
-        backend_new_start: new_start,
-    })
 }
 
 fn collect_remap_segments(
@@ -405,31 +504,63 @@ fn inspect_madvise_range(
     Ok(info)
 }
 
+fn with_remap_destination_rollback<T>(
+    aspace: &mut AddrSpace,
+    proc_data: &ProcessData,
+    destination_start: VirtAddr,
+    destination_size: usize,
+    publish: impl FnOnce(&mut AddrSpace) -> AxResult<T>,
+) -> AxResult<T> {
+    with_rollback_on_error(aspace, publish, |aspace| {
+        let rollback = aspace.unmap(destination_start, destination_size);
+        proc_data.clear_mempolicy_range(destination_start.as_usize(), destination_size);
+        rollback
+    })
+}
+
 fn map_relocated_segments(
     aspace: &mut AddrSpace,
     aspace_handle: &Arc<axsync::Mutex<AddrSpace>>,
     old_start: VirtAddr,
+    old_size: usize,
     new_start: VirtAddr,
+    new_size: usize,
     segments: &[RemapSegment],
     preserve_mapping_identity: bool,
 ) -> AxResult {
+    // Segment VMAs become visible incrementally. Both callers keep this helper
+    // inside `with_remap_destination_rollback` until all later work is complete.
+    let page_size = segments
+        .first()
+        .ok_or(AxError::InvalidInput)?
+        .backend
+        .page_size() as usize;
+    let geometry = RemapGeometry::new(
+        LinuxPageRange::new(old_start.as_usize(), old_size, page_size)
+            .map_err(|_| AxError::InvalidInput)?,
+        new_start.as_usize(),
+        new_size,
+    )
+    .map_err(|_| AxError::InvalidInput)?;
     for seg in segments {
-        let geometry = relocated_segment_geometry(old_start, new_start, seg.start)?;
+        let segment = geometry
+            .segment(
+                LinuxPageRange::new(seg.start.as_usize(), seg.size, page_size)
+                    .map_err(|_| AxError::InvalidInput)?,
+            )
+            .map_err(|_| AxError::InvalidInput)?;
+        let destination_start = VirtAddr::from(segment.destination().start());
+        let backend_old_start = VirtAddr::from(segment.backend_old_start());
+        let backend_new_start = VirtAddr::from(segment.backend_new_start());
         let relocated = if preserve_mapping_identity {
-            seg.backend.relocate(
-                geometry.backend_old_start,
-                geometry.backend_new_start,
-                aspace_handle,
-            )?
+            seg.backend
+                .relocate(backend_old_start, backend_new_start, aspace_handle)?
         } else {
-            seg.backend.duplicate_mapping(
-                geometry.backend_old_start,
-                geometry.backend_new_start,
-                aspace_handle,
-            )?
+            seg.backend
+                .duplicate_mapping(backend_old_start, backend_new_start, aspace_handle)?
         };
         aspace.map_with_lock_state(
-            geometry.destination_start,
+            destination_start,
             seg.size,
             seg.flags,
             false,
@@ -438,7 +569,7 @@ fn map_relocated_segments(
         )?;
         seg.backend.migrate_present_pages(
             seg.start,
-            geometry.destination_start,
+            destination_start,
             seg.size,
             &mut aspace.page_table_mut().cursor(),
         )?;
@@ -792,6 +923,12 @@ pub fn sys_mmap(
         Some(file_mapping) => backend.with_file_mapping(file_mapping),
         None => backend,
     };
+    let shared_writable_location = (effective_protection.contains(MappingFlags::WRITE)
+        && backend
+            .file_mapping()
+            .is_some_and(|mapping| mapping.sharing() == FileMappingSharing::Shared))
+    .then(|| backend.shared_file_location().cloned())
+    .flatten();
 
     let locked_mapping = map_flags.contains(MmapFlags::LOCKED) || aspace.locks_future_mappings();
     if locked_mapping {
@@ -803,11 +940,26 @@ pub fn sys_mmap(
         || (aspace.locks_future_mappings()
             && !aspace.locks_future_mappings_on_fault()
             && !permission_flags.is_empty());
+    let mapping_admission = if shared_writable_location.is_some() {
+        backend.begin_shared_writable_mapping_admission()?
+    } else {
+        None
+    };
+    let privilege_guard = shared_writable_location
+        .as_ref()
+        .map(begin_shared_writable_mapping_privilege_cleanup)
+        .transpose()?;
     if map_flags.contains(MmapFlags::FIXED) && !map_flags.contains(MmapFlags::FIXED_NOREPLACE) {
         aspace.unmap(start, length)?;
         proc_data.clear_mempolicy_range(start.as_usize(), length);
     }
     aspace.map(start, length, effective_protection, populate, backend)?;
+    if let Some(admission) = mapping_admission {
+        admission
+            .complete()
+            .expect("writable mapping admission vanished after mmap commit");
+    }
+    drop(privilege_guard);
     if map_flags.contains(MmapFlags::LOCKED) {
         aspace.set_locked(start, length, true)?;
     }
@@ -876,7 +1028,7 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: usize) -> AxResult<isize> 
                 )
             })
         },
-        |plan| plan.commit(),
+        |plan| commit_shared_writable_protection(plan, effective_protection),
     )?;
 
     Ok(0)
@@ -952,12 +1104,18 @@ pub fn sys_mremap(
                 .ok_or(AxError::NoMemory)?
         };
 
-        if let Err(err) =
-            map_relocated_segments(&mut aspace, &aspace_handle, addr, dst, &segments, false)
-        {
-            let _ = aspace.unmap(dst, new_size);
-            return Err(err);
-        }
+        with_remap_destination_rollback(&mut aspace, proc_data, dst, new_size, |aspace| {
+            map_relocated_segments(
+                aspace,
+                &aspace_handle,
+                addr,
+                new_size,
+                dst,
+                new_size,
+                &segments,
+                false,
+            )
+        })?;
         return Ok(dst.as_usize() as isize);
     }
 
@@ -1030,58 +1188,61 @@ pub fn sys_mremap(
             .ok_or(AxError::NoMemory)?
     };
 
-    if new_size > old_size {
-        if grow_locked {
-            let reclaimed_locked = fixed
-                .then(|| aspace.locked_bytes_in_range(dst, new_size))
-                .unwrap_or(0);
-            check_mremap_locked_growth_limit(
-                proc_data,
-                has_ipc_lock,
-                &aspace,
-                grow,
-                reclaimed_locked,
-            )?;
-        }
-        primary.backend.ensure_range_covered(addr, new_size)?;
-    }
-    if fixed {
-        aspace.unmap(dst, new_size)?;
-        proc_data.clear_mempolicy_range(dst.as_usize(), new_size);
+    if new_size > old_size && grow_locked {
+        let reclaimed_locked = fixed
+            .then(|| aspace.locked_bytes_in_range(dst, new_size))
+            .unwrap_or(0);
+        check_mremap_locked_growth_limit(proc_data, has_ipc_lock, &aspace, grow, reclaimed_locked)?;
     }
 
-    if let Err(err) = map_relocated_segments(
+    with_moving_remap_admission(
         &mut aspace,
-        &aspace_handle,
         addr,
-        dst,
-        &moved_segments,
-        true,
-    ) {
-        let _ = aspace.unmap(dst, preserve_size);
-        return Err(err);
-    }
-    if new_size > old_size {
-        let tail_backend = primary.backend.relocate(addr, dst, &aspace_handle)?;
-        if let Err(err) = aspace.map_with_lock_state(
-            dst + old_size,
-            grow,
-            primary.flags,
-            grow_locked,
-            tail_backend,
-            grow_locked,
-        ) {
-            let _ = aspace.unmap(dst, new_size);
-            return Err(err);
-        }
-    }
-    if let Err(err) = aspace.unmap(addr, old_size) {
-        let _ = aspace.unmap(dst, new_size);
-        return Err(err);
-    }
+        old_size,
+        |aspace, start, size| aspace.admit_remap(start, size),
+        |aspace| {
+            if new_size > old_size {
+                primary.backend.ensure_range_covered(addr, new_size)?;
+            }
+            if fixed {
+                aspace.unmap(dst, new_size)?;
+                proc_data.clear_mempolicy_range(dst.as_usize(), new_size);
+            }
+
+            with_remap_destination_rollback(aspace, proc_data, dst, new_size, |aspace| {
+                map_relocated_segments(
+                    aspace,
+                    &aspace_handle,
+                    addr,
+                    old_size,
+                    dst,
+                    new_size,
+                    &moved_segments,
+                    true,
+                )?;
+                if new_size > old_size {
+                    let tail_backend = primary.backend.relocate(addr, dst, &aspace_handle)?;
+                    aspace.map_with_lock_state(
+                        dst + old_size,
+                        grow,
+                        primary.flags,
+                        grow_locked,
+                        tail_backend,
+                        grow_locked,
+                    )?;
+                }
+                set_relocated_locked_segments(aspace, dst, &locked_segments)?;
+                // Keep source removal as the final fallible commit. An internal
+                // backend/PTE failure during `unmap` cannot be reconstructed at
+                // this syscall layer, but no later step can invalidate a
+                // successfully removed source.
+                aspace.unmap(addr, old_size)
+            })
+        },
+    )?;
+
     proc_data.clear_mempolicy_range(addr.as_usize(), old_size);
     proc_data.clear_mempolicy_range(dst.as_usize(), new_size);
-    set_relocated_locked_segments(&mut aspace, dst, &locked_segments)?;
 
     Ok(dst.as_usize() as isize)
 }
@@ -1403,7 +1564,13 @@ mod tests {
     use core::cell::Cell;
 
     use axfs_ng_vfs::{Mountpoint, NodePermission, NodeType};
+    use memory_addr::PAGE_SIZE_4K;
     use thekernel_linux_fd::{DescriptorFlags, FdNumber, FdTable, FdTableId};
+    use thekernel_linux_mm::{
+        AddressSpaceId, InvalidationRange, InvalidationReason, MappingAccess, MappingKind,
+        MappingSnapshot, MmError, PageRange, PinAccess, PinDuration, PinOwner, PinQuota,
+        PinRegistry, PinRequest, PinUse,
+    };
 
     use super::*;
     use crate::{
@@ -1437,18 +1604,206 @@ mod tests {
     }
 
     #[test]
+    fn shared_writable_cleanup_deduplicates_one_inode_across_mount_views() {
+        let fs = MemoryFs::new().unwrap();
+        let first_mount = Mountpoint::new_root(&fs);
+        let second_mount = Mountpoint::new_root(&fs);
+        let first = first_mount
+            .root_location()
+            .create(
+                "shared-writable-dedup",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o6755),
+            )
+            .unwrap();
+        let second = second_mount
+            .root_location()
+            .lookup_no_follow("shared-writable-dedup")
+            .unwrap();
+
+        assert!(!first.ptr_eq(&second));
+        assert_eq!(executable::key(&first), executable::key(&second));
+        let mut locations = Vec::new();
+        locations.try_reserve(2).unwrap();
+        assert!(push_unique_content_location(&mut locations, &first));
+        assert!(!push_unique_content_location(&mut locations, &second));
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].1.ptr_eq(&first));
+    }
+
+    #[test]
     fn remap_fragments_share_one_backend_relocation_pair() {
         let old_start = VirtAddr::from(0x8000);
         let new_start = VirtAddr::from(0x1000);
-        let first = relocated_segment_geometry(old_start, new_start, old_start).unwrap();
-        let second = relocated_segment_geometry(old_start, new_start, old_start + 0x2000).unwrap();
+        let geometry = RemapGeometry::new(
+            LinuxPageRange::new(old_start.as_usize(), 0x4000, PAGE_SIZE_4K).unwrap(),
+            new_start.as_usize(),
+            0x4000,
+        )
+        .unwrap();
+        let first = geometry
+            .segment(LinuxPageRange::new(old_start.as_usize(), 0x2000, PAGE_SIZE_4K).unwrap())
+            .unwrap();
+        let second = geometry
+            .segment(
+                LinuxPageRange::new((old_start + 0x2000).as_usize(), 0x2000, PAGE_SIZE_4K).unwrap(),
+            )
+            .unwrap();
 
-        assert_eq!(first.destination_start, new_start);
-        assert_eq!(second.destination_start, new_start + 0x2000);
-        assert_eq!(first.backend_old_start, old_start);
-        assert_eq!(second.backend_old_start, old_start);
-        assert_eq!(first.backend_new_start, new_start);
-        assert_eq!(second.backend_new_start, new_start);
+        assert_eq!(first.destination().start(), new_start.as_usize());
+        assert_eq!(
+            second.destination().start(),
+            (new_start + 0x2000).as_usize()
+        );
+        assert_eq!(first.backend_old_start(), old_start.as_usize());
+        assert_eq!(second.backend_old_start(), old_start.as_usize());
+        assert_eq!(first.backend_new_start(), new_start.as_usize());
+        assert_eq!(second.backend_new_start(), new_start.as_usize());
+    }
+
+    #[test]
+    fn pinned_source_rejects_fixed_remap_before_destination_replacement() {
+        let source = VirtAddr::from(0x2000);
+        let source_size = 2 * PAGE_SIZE_4K;
+        let pinned_page = source + PAGE_SIZE_4K;
+        let owner = PinOwner::new(1).unwrap();
+        let quota = PinQuota::new(1, PAGE_SIZE_4K as u64, 1);
+        let mut pins = PinRegistry::<1, 1>::new(PAGE_SIZE_4K, quota, 1).unwrap();
+        pins.configure_owner(owner, quota).unwrap();
+        let mapping = MappingSnapshot::from_raw(
+            1,
+            1,
+            1,
+            source.as_usize(),
+            source_size,
+            PAGE_SIZE_4K,
+            MappingAccess::new(true, true, false).bits(),
+            MappingKind::AnonymousPrivate,
+            true,
+            false,
+        )
+        .unwrap();
+        let request = PinRequest::from_raw(
+            pinned_page.as_usize(),
+            PAGE_SIZE_4K,
+            PinAccess::Read,
+            PinDuration::AsyncIo,
+            PinUse::BlockIo,
+            owner.get(),
+        )
+        .unwrap();
+        let reservation = pins
+            .reserve(request, AddressSpaceId::new(1).unwrap())
+            .unwrap();
+        pins.revalidate_next(
+            reservation,
+            mapping.expected(),
+            mapping,
+            PageRange::new(pinned_page.as_usize(), PAGE_SIZE_4K, PAGE_SIZE_4K).unwrap(),
+        )
+        .unwrap();
+        let token = pins.commit(reservation).unwrap();
+        let destination_mapping = 0xfeed_u64;
+        let mut state = (pins, mapping, destination_mapping);
+
+        let result = with_moving_remap_admission(
+            &mut state,
+            source,
+            source_size,
+            |(pins, mapping, _), start, size| {
+                let invalidation = InvalidationRange::from_raw(
+                    *mapping,
+                    start.as_usize(),
+                    size,
+                    InvalidationReason::Remap,
+                )?;
+                pins.admit_mutation(invalidation)
+            },
+            |(_, _, destination)| {
+                *destination = 0;
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err(MmError::MappingPinned));
+        assert_eq!(state.2, destination_mapping);
+        state.0.release(token).unwrap();
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RemapRollbackTestError {
+        LateTailFailure,
+        RollbackFailure,
+    }
+
+    #[test]
+    fn late_remap_failure_rolls_back_all_destination_state_and_preserves_source() {
+        struct RemapState {
+            source_mapped: [bool; 3],
+            source_locked: [bool; 3],
+            source_policy: [bool; 3],
+            destination_mapped: [bool; 4],
+            destination_locked: [bool; 4],
+            destination_policy: [bool; 4],
+            rollback_calls: usize,
+        }
+
+        let mut state = RemapState {
+            source_mapped: [true; 3],
+            source_locked: [true, false, true],
+            source_policy: [false, true, true],
+            destination_mapped: [false; 4],
+            destination_locked: [false; 4],
+            destination_policy: [false; 4],
+            rollback_calls: 0,
+        };
+        let source_before = (
+            state.source_mapped,
+            state.source_locked,
+            state.source_policy,
+        );
+
+        let result: Result<(), RemapRollbackTestError> = with_rollback_on_error(
+            &mut state,
+            |state| {
+                for segment in 0..3 {
+                    state.destination_mapped[segment] = true;
+                    state.destination_locked[segment] = true;
+                    state.destination_policy[segment] = true;
+                }
+                Err(RemapRollbackTestError::LateTailFailure)
+            },
+            |state| {
+                state.destination_mapped.fill(false);
+                state.destination_locked.fill(false);
+                state.destination_policy.fill(false);
+                state.rollback_calls += 1;
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err(RemapRollbackTestError::LateTailFailure));
+        assert_eq!(
+            (
+                state.source_mapped,
+                state.source_locked,
+                state.source_policy,
+            ),
+            source_before
+        );
+        assert_eq!(state.destination_mapped, [false; 4]);
+        assert_eq!(state.destination_locked, [false; 4]);
+        assert_eq!(state.destination_policy, [false; 4]);
+        assert_eq!(state.rollback_calls, 1);
+
+        assert_eq!(
+            with_rollback_on_error(
+                &mut (),
+                |_| Err::<(), _>(RemapRollbackTestError::LateTailFailure),
+                |_| Err(RemapRollbackTestError::RollbackFailure),
+            ),
+            Err(RemapRollbackTestError::RollbackFailure)
+        );
     }
 
     #[test]

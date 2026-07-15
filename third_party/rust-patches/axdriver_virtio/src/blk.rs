@@ -47,17 +47,66 @@ static IRQ_FIRST_WAIT_QUEUE: WaitQueue = WaitQueue::new();
 #[cfg(feature = "irq")]
 static REGISTERED_IRQS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
+fn reap_all_async_handles<Handle: Copy>(
+    handles: &[Handle],
+    mut wait_one: impl FnMut(Handle) -> DevResult,
+) -> DevResult {
+    let mut first_error = None;
+    for handle in handles.iter().copied() {
+        if let Err(error) = wait_one(handle) {
+            first_error.get_or_insert(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn accepted_pending_handles<'a>(
+    pending: &'a [PendingBlkBatchRequest<'_>],
+    submitted: usize,
+) -> impl Iterator<Item = PendingBlkHandle> + 'a {
+    let accepted = pending.get(..submitted).unwrap_or_else(|| {
+        panic!(
+            "asynchronous block submit overreported {submitted} accepted requests for {} entries",
+            pending.len()
+        )
+    });
+    accepted.iter().map(|request| {
+        request
+            .handle
+            .expect("accepted asynchronous block request is missing its handle")
+    })
+}
+
+fn accepted_request_handles<'a>(
+    requests: &'a [BlockQueueRequest<'_>],
+    submitted: usize,
+) -> impl Iterator<Item = BlockRequestHandle> + 'a {
+    let accepted = requests.get(..submitted).unwrap_or_else(|| {
+        panic!(
+            "block submit overreported {submitted} accepted requests for {} entries",
+            requests.len()
+        )
+    });
+    accepted.iter().map(|request| {
+        request
+            .handle
+            .expect("accepted block request is missing its completion handle")
+    })
+}
+
 fn wait_error_to_dev(error: WaitError) -> DevError {
     match error {
         WaitError::Block(BlockOnError::Busy) => DevError::ResourceBusy,
-        WaitError::Block(
-            BlockOnError::GenerationExhausted | BlockOnError::StateLost,
-        ) => DevError::BadState,
+        WaitError::Block(BlockOnError::GenerationExhausted | BlockOnError::StateLost) => {
+            DevError::BadState
+        }
         WaitError::Interrupted => DevError::Again,
         WaitError::Timer(TimerRegistrationError::CapacityExhausted) => DevError::ResourceBusy,
         WaitError::Timer(
-            TimerRegistrationError::TokenSpaceExhausted
-            | TimerRegistrationError::DeadlineOverflow,
+            TimerRegistrationError::TokenSpaceExhausted | TimerRegistrationError::DeadlineOverflow,
         ) => DevError::BadState,
     }
 }
@@ -197,7 +246,9 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         let mut polls = 0u64;
         loop {
             let mut inner = self.inner.lock();
-            let drained = inner.drain_pending_completions().map_err(as_dev_err)?;
+            let drained = inner.drain_pending_completions().unwrap_or_else(|error| {
+                panic!("lost asynchronous block completion state while reaping: {error}")
+            });
             if inner.pending_request_done(handle) {
                 inner.record_external_queue_wait(polls, handle.notified());
                 Self::record_wait_hit(polls);
@@ -212,7 +263,12 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
             // the consumer phase.
             drop(inner);
             Self::notify_completion_waiters(&self.wait_queue, drained);
-            self.wait_backoff(&mut polls, |inner| Ok(inner.pending_request_done(handle)))?;
+            match self.wait_backoff(&mut polls, |inner| Ok(inner.pending_request_done(handle))) {
+                Ok(()) | Err(DevError::Again | DevError::ResourceBusy) => {}
+                Err(error) => {
+                    panic!("lost asynchronous block wait state before completion: {error}")
+                }
+            }
         }
     }
 
@@ -267,7 +323,9 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
                 core::slice::from_mut(&mut request),
             ) {
                 Ok(report) if report.submitted == 1 => {
-                    let handle = request.handle.ok_or(DevError::BadState)?;
+                    let handle = accepted_request_handles(core::slice::from_ref(&request), 1)
+                        .next()
+                        .expect("one accepted flush request lost its handle");
                     <Self as BlockDriverOps>::wait_async_all(self, &[handle])?;
                     return Ok(true);
                 }
@@ -369,9 +427,7 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         let mut wait_error = None;
         let timed_out = self
             .wait_queue
-            .wait_timeout_until(
-            Duration::from_micros(ASYNC_WAIT_TIMEOUT_US),
-            || {
+            .wait_timeout_until(Duration::from_micros(ASYNC_WAIT_TIMEOUT_US), || {
                 let mut inner = self.inner.lock();
                 let drained = match inner.drain_pending_completions() {
                     Ok(drained) => drained,
@@ -394,8 +450,7 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
                 drop(inner);
                 Self::notify_completion_waiters(&self.wait_queue, drained);
                 is_ready || wait_error.is_some()
-            },
-        )
+            })
             .map_err(wait_error_to_dev)?;
         if let Some(err) = wait_error {
             return Err(err);
@@ -597,13 +652,19 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         }
 
         let mut next = 0usize;
-        let mut handles = Vec::new();
+        let mut handles = Vec::with_capacity(requests.len());
         while next < requests.len() {
             let report = match self.submit_async_batch(&mut requests[next..]) {
                 Ok(report) => report,
-                Err(DevError::Unsupported) => return Ok(false),
-                Err(err) => return Err(err),
+                Err(DevError::Unsupported) if handles.is_empty() => return Ok(false),
+                Err(error) => {
+                    if !handles.is_empty() {
+                        self.wait_async_all(&handles)?;
+                    }
+                    return Err(error);
+                }
             };
+            let accepted = accepted_request_handles(&requests[next..], report.submitted);
             if report.submitted == 0 {
                 if handles.is_empty() {
                     return Ok(false);
@@ -613,8 +674,12 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
                 continue;
             }
 
-            for request in requests[next..next + report.submitted].iter() {
-                handles.push(request.handle.ok_or(DevError::BadState)?);
+            for handle in accepted {
+                assert!(
+                    handles.len() < handles.capacity(),
+                    "preallocated asynchronous write handle storage exhausted"
+                );
+                handles.push(handle);
             }
             next += report.submitted;
             if report.queue_full && next < requests.len() {
@@ -684,13 +749,19 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
         }
 
         let mut next = 0usize;
-        let mut handles = Vec::new();
+        let mut handles = Vec::with_capacity(requests.len());
         while next < requests.len() {
             let report = match self.submit_async_batch(&mut requests[next..]) {
                 Ok(report) => report,
-                Err(DevError::Unsupported) => return Ok(false),
-                Err(err) => return Err(err),
+                Err(DevError::Unsupported) if handles.is_empty() => return Ok(false),
+                Err(error) => {
+                    if !handles.is_empty() {
+                        self.wait_async_all(&handles)?;
+                    }
+                    return Err(error);
+                }
             };
+            let accepted = accepted_request_handles(&requests[next..], report.submitted);
             if report.submitted == 0 {
                 if handles.is_empty() {
                     return Ok(false);
@@ -700,8 +771,12 @@ impl<H: Hal, T: Transport> VirtIoBlkDev<H, T> {
                 continue;
             }
 
-            for request in requests[next..next + report.submitted].iter() {
-                handles.push(request.handle.ok_or(DevError::BadState)?);
+            for handle in accepted {
+                assert!(
+                    handles.len() < handles.capacity(),
+                    "preallocated asynchronous read handle storage exhausted"
+                );
+                handles.push(handle);
             }
             next += report.submitted;
             if report.queue_full && next < requests.len() {
@@ -848,6 +923,7 @@ impl<H: Hal, T: Transport + Send> BlockDriverOps for VirtIoBlkDev<H, T> {
         }
 
         let limit = requests.len().min(depth_available);
+        let mut accepted_handles = Vec::with_capacity(limit);
         let mut pending = Self::build_pending_batch(requests, limit, block_size)?;
         let report = {
             let mut inner = self.inner.lock();
@@ -857,15 +933,17 @@ impl<H: Hal, T: Transport + Send> BlockDriverOps for VirtIoBlkDev<H, T> {
             unsafe { inner.submit_pending_batch(pending.as_mut_slice()) }.map_err(as_dev_err)?
         };
         let submitted = report.submitted;
-        let handles = pending
-            .iter()
-            .take(submitted)
-            .map(|request| request.handle.map(PendingBlkHandle::into_raw))
-            .collect::<Vec<_>>();
+        for handle in accepted_pending_handles(&pending, submitted) {
+            assert!(
+                accepted_handles.len() < accepted_handles.capacity(),
+                "preallocated accepted-handle storage exhausted"
+            );
+            accepted_handles.push(handle.into_raw());
+        }
         drop(pending);
 
-        for (request, handle) in requests.iter_mut().zip(handles.into_iter()) {
-            request.handle = handle.map(|raw| BlockRequestHandle { raw });
+        for (request, raw) in requests.iter_mut().zip(accepted_handles) {
+            request.handle = Some(BlockRequestHandle { raw });
         }
 
         Ok(BlockSubmitReport {
@@ -887,10 +965,9 @@ impl<H: Hal, T: Transport + Send> BlockDriverOps for VirtIoBlkDev<H, T> {
     }
 
     fn wait_async_all(&mut self, handles: &[BlockRequestHandle]) -> DevResult {
-        for handle in handles {
-            self.wait_for_pending_done(PendingBlkHandle::from_raw(handle.raw))?;
-        }
-        Ok(())
+        reap_all_async_handles(handles, |handle| {
+            self.wait_for_pending_done(PendingBlkHandle::from_raw(handle.raw))
+        })
     }
 
     fn enable_irq(&mut self) -> DevResult {
@@ -913,5 +990,105 @@ impl<H: Hal, T: Transport + Send> BlockDriverOps for VirtIoBlkDev<H, T> {
 
     fn fence_async(&mut self) -> DevResult {
         self.fence_pending_data()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reap_all_keeps_waiting_after_completed_request_errors() {
+        let mut attempts = [0usize; 4];
+        let result = reap_all_async_handles(&[0usize, 1, 2, 3], |handle| {
+            attempts[handle] += 1;
+            match handle {
+                0 => Err(DevError::Io),
+                1 => Err(DevError::Again),
+                2 => Err(DevError::Unsupported),
+                _ => Ok(()),
+            }
+        });
+
+        assert!(matches!(result, Err(DevError::Io)));
+        assert_eq!(attempts, [1, 1, 1, 1]);
+    }
+
+    fn pending_request(handle: Option<u64>) -> PendingBlkBatchRequest<'static> {
+        PendingBlkBatchRequest {
+            block_id: 0,
+            buffer: PendingBlkBatchBuffer::Flush,
+            handle: handle.map(PendingBlkHandle::from_raw),
+        }
+    }
+
+    #[test]
+    fn accepted_pending_handles_preserve_the_reported_prefix() {
+        let pending = [
+            pending_request(Some(11)),
+            pending_request(Some(12)),
+            pending_request(None),
+        ];
+
+        let handles = accepted_pending_handles(&pending, 2);
+        assert_eq!(
+            handles
+                .into_iter()
+                .map(PendingBlkHandle::into_raw)
+                .collect::<Vec<_>>(),
+            [11, 12]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "missing its handle")]
+    fn accepted_pending_handles_fail_closed_on_a_missing_handle() {
+        let pending = [pending_request(None)];
+        let _ = accepted_pending_handles(&pending, 1).next();
+    }
+
+    #[test]
+    #[should_panic(expected = "overreported")]
+    fn accepted_pending_handles_fail_closed_on_an_overreported_count() {
+        let pending = [pending_request(Some(11))];
+        let _ = accepted_pending_handles(&pending, 2);
+    }
+
+    static NO_SEGMENTS: [BlockSegment; 0] = [];
+
+    fn request(handle: Option<u64>) -> BlockQueueRequest<'static> {
+        BlockQueueRequest {
+            op: BlockAsyncOp::Read,
+            block_id: 0,
+            segments: &NO_SEGMENTS,
+            handle: handle.map(|raw| BlockRequestHandle { raw }),
+        }
+    }
+
+    #[test]
+    fn accepted_request_handles_preserve_the_reported_prefix() {
+        let requests = [request(Some(31)), request(Some(32)), request(None)];
+        let handles = accepted_request_handles(&requests, 2);
+        assert_eq!(
+            handles
+                .into_iter()
+                .map(|handle| handle.raw)
+                .collect::<Vec<_>>(),
+            [31, 32]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "missing its completion handle")]
+    fn accepted_request_handles_fail_closed_on_a_missing_handle() {
+        let requests = [request(None)];
+        let _ = accepted_request_handles(&requests, 1).next();
+    }
+
+    #[test]
+    #[should_panic(expected = "overreported")]
+    fn accepted_request_handles_fail_closed_on_an_overreported_count() {
+        let requests = [request(Some(31))];
+        let _ = accepted_request_handles(&requests, 2);
     }
 }

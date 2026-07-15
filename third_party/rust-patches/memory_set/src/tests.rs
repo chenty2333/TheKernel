@@ -20,9 +20,23 @@ struct MergeBackend;
 
 #[derive(Clone)]
 struct FailingProtectBackend {
-    calls: Arc<AtomicUsize>,
-    fail_at: usize,
+    preflight_calls: Arc<AtomicUsize>,
+    protect_calls: Arc<AtomicUsize>,
+    reject_start: usize,
 }
+
+#[derive(Clone)]
+struct RejectingUnmapBackend {
+    preflight_calls: Arc<AtomicUsize>,
+    unmap_calls: Arc<AtomicUsize>,
+    reject_start: usize,
+}
+
+#[derive(Clone)]
+struct FailingCommitBackend;
+
+#[derive(Clone)]
+struct FailingProtectCommitBackend;
 
 type MockMemorySet = MemorySet<MockBackend>;
 type MergeMemorySet = MemorySet<MergeBackend>;
@@ -40,6 +54,13 @@ impl MappingBackend for MockBackend {
             *entry = flags;
         }
         true
+    }
+
+    fn preflight_unmap(&self, start: VirtAddr, size: usize, pt: &MockPageTable) -> bool {
+        pt.iter()
+            .skip(start.as_usize())
+            .take(size)
+            .all(|entry| *entry != 0)
     }
 
     fn unmap(&self, start: VirtAddr, size: usize, pt: &mut MockPageTable) -> bool {
@@ -78,6 +99,10 @@ impl MappingBackend for MergeBackend {
         MockBackend.map(start, size, flags, pt)
     }
 
+    fn preflight_unmap(&self, start: VirtAddr, size: usize, pt: &MockPageTable) -> bool {
+        MockBackend.preflight_unmap(start, size, pt)
+    }
+
     fn unmap(&self, start: VirtAddr, size: usize, pt: &mut MockPageTable) -> bool {
         MockBackend.unmap(start, size, pt)
     }
@@ -106,7 +131,59 @@ impl MappingBackend for FailingProtectBackend {
         MockBackend.map(start, size, flags, pt)
     }
 
+    fn preflight_unmap(&self, start: VirtAddr, size: usize, pt: &MockPageTable) -> bool {
+        MockBackend.preflight_unmap(start, size, pt)
+    }
+
     fn unmap(&self, start: VirtAddr, size: usize, pt: &mut MockPageTable) -> bool {
+        MockBackend.unmap(start, size, pt)
+    }
+
+    fn preflight_protect(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        new_flags: MockFlags,
+        pt: &MockPageTable,
+    ) -> bool {
+        self.preflight_calls.fetch_add(1, Ordering::Relaxed);
+        start.as_usize() != self.reject_start
+            && new_flags != 0
+            && pt
+                .iter()
+                .skip(start.as_usize())
+                .take(size)
+                .all(|entry| *entry != 0)
+    }
+
+    fn protect(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        new_flags: MockFlags,
+        pt: &mut MockPageTable,
+    ) -> bool {
+        self.protect_calls.fetch_add(1, Ordering::Relaxed);
+        MockBackend.protect(start, size, new_flags, pt)
+    }
+}
+
+impl MappingBackend for RejectingUnmapBackend {
+    type Addr = VirtAddr;
+    type Flags = MockFlags;
+    type PageTable = MockPageTable;
+
+    fn map(&self, start: VirtAddr, size: usize, flags: MockFlags, pt: &mut MockPageTable) -> bool {
+        MockBackend.map(start, size, flags, pt)
+    }
+
+    fn preflight_unmap(&self, start: VirtAddr, size: usize, pt: &MockPageTable) -> bool {
+        self.preflight_calls.fetch_add(1, Ordering::Relaxed);
+        start.as_usize() != self.reject_start && MockBackend.preflight_unmap(start, size, pt)
+    }
+
+    fn unmap(&self, start: VirtAddr, size: usize, pt: &mut MockPageTable) -> bool {
+        self.unmap_calls.fetch_add(1, Ordering::Relaxed);
         MockBackend.unmap(start, size, pt)
     }
 
@@ -117,11 +194,65 @@ impl MappingBackend for FailingProtectBackend {
         new_flags: MockFlags,
         pt: &mut MockPageTable,
     ) -> bool {
-        let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
-        if call == self.fail_at {
-            return false;
-        }
         MockBackend.protect(start, size, new_flags, pt)
+    }
+}
+
+impl MappingBackend for FailingCommitBackend {
+    type Addr = VirtAddr;
+    type Flags = MockFlags;
+    type PageTable = MockPageTable;
+
+    fn map(&self, start: VirtAddr, size: usize, flags: MockFlags, pt: &mut MockPageTable) -> bool {
+        MockBackend.map(start, size, flags, pt)
+    }
+
+    fn unmap(&self, _start: VirtAddr, _size: usize, _pt: &mut MockPageTable) -> bool {
+        false
+    }
+
+    fn protect(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        new_flags: MockFlags,
+        pt: &mut MockPageTable,
+    ) -> bool {
+        MockBackend.protect(start, size, new_flags, pt)
+    }
+}
+
+impl MappingBackend for FailingProtectCommitBackend {
+    type Addr = VirtAddr;
+    type Flags = MockFlags;
+    type PageTable = MockPageTable;
+
+    fn map(&self, start: VirtAddr, size: usize, flags: MockFlags, pt: &mut MockPageTable) -> bool {
+        MockBackend.map(start, size, flags, pt)
+    }
+
+    fn unmap(&self, start: VirtAddr, size: usize, pt: &mut MockPageTable) -> bool {
+        MockBackend.unmap(start, size, pt)
+    }
+
+    fn preflight_protect(
+        &self,
+        _start: VirtAddr,
+        _size: usize,
+        _new_flags: MockFlags,
+        _pt: &MockPageTable,
+    ) -> bool {
+        true
+    }
+
+    fn protect(
+        &self,
+        _start: VirtAddr,
+        _size: usize,
+        _new_flags: MockFlags,
+        _pt: &mut MockPageTable,
+    ) -> bool {
+        false
     }
 }
 
@@ -301,6 +432,87 @@ fn test_unmap_split() {
 }
 
 #[test]
+fn unmap_preflights_every_backend_before_mutating_any_area_or_pte() {
+    let preflight_calls = Arc::new(AtomicUsize::new(0));
+    let unmap_calls = Arc::new(AtomicUsize::new(0));
+    let backend = RejectingUnmapBackend {
+        preflight_calls: preflight_calls.clone(),
+        unmap_calls: unmap_calls.clone(),
+        reject_start: 0x3000,
+    };
+    let mut set = MemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    assert_ok!(set.map(
+        MemoryArea::new(0x1000.into(), 0x1000, 1, backend.clone()),
+        &mut pt,
+        false,
+    ));
+    assert_ok!(set.map(
+        MemoryArea::new(0x3000.into(), 0x1000, 2, backend),
+        &mut pt,
+        false,
+    ));
+    let pt_before = pt;
+
+    assert_err!(set.unmap(0x1000.into(), 0x3000, &mut pt), BadState);
+
+    assert_eq!(preflight_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(unmap_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(set.len(), 2);
+    assert_eq!(set.find(0x1000.into()).unwrap().flags(), 1);
+    assert_eq!(set.find(0x3000.into()).unwrap().flags(), 2);
+    assert_eq!(pt, pt_before);
+}
+
+#[test]
+fn clear_preflights_every_backend_before_mutating_any_pte() {
+    let preflight_calls = Arc::new(AtomicUsize::new(0));
+    let unmap_calls = Arc::new(AtomicUsize::new(0));
+    let backend = RejectingUnmapBackend {
+        preflight_calls: preflight_calls.clone(),
+        unmap_calls: unmap_calls.clone(),
+        reject_start: 0x3000,
+    };
+    let mut set = MemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    assert_ok!(set.map(
+        MemoryArea::new(0x1000.into(), 0x1000, 1, backend.clone()),
+        &mut pt,
+        false,
+    ));
+    assert_ok!(set.map(
+        MemoryArea::new(0x3000.into(), 0x1000, 2, backend),
+        &mut pt,
+        false,
+    ));
+    let pt_before = pt;
+
+    assert_err!(set.clear(&mut pt), BadState);
+
+    assert_eq!(preflight_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(unmap_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(set.len(), 2);
+    assert_eq!(pt, pt_before);
+}
+
+#[test]
+fn backend_failure_after_successful_preflight_is_fail_stop() {
+    let mut set = MemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    assert_ok!(set.map(
+        MemoryArea::new(0x1000.into(), 0x1000, 1, FailingCommitBackend),
+        &mut pt,
+        false,
+    ));
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = set.unmap(0x1000.into(), 0x1000, &mut pt);
+    }));
+
+    assert!(outcome.is_err());
+}
+
+#[test]
 fn test_protect() {
     let mut set = MockMemorySet::new();
     let mut pt = [0; MAX_ADDR];
@@ -395,11 +607,13 @@ fn test_protect() {
 }
 
 #[test]
-fn protect_failure_rolls_back_page_table_and_preserves_area_tree() {
-    let calls = Arc::new(AtomicUsize::new(0));
+fn protect_preflights_every_backend_before_splitting_or_mutating_pte() {
+    let preflight_calls = Arc::new(AtomicUsize::new(0));
+    let protect_calls = Arc::new(AtomicUsize::new(0));
     let backend = FailingProtectBackend {
-        calls: calls.clone(),
-        fail_at: 2,
+        preflight_calls: preflight_calls.clone(),
+        protect_calls: protect_calls.clone(),
+        reject_start: 0x3000,
     };
     let mut set = MemorySet::new();
     let mut pt = [0; MAX_ADDR];
@@ -433,7 +647,25 @@ fn protect_failure_rolls_back_page_table_and_preserves_area_tree() {
     );
     assert!(pt[0x1000..0x2000].iter().all(|&flags| flags == 1));
     assert!(pt[0x3000..0x4000].iter().all(|&flags| flags == 2));
-    assert_eq!(calls.load(Ordering::Relaxed), 4);
+    assert_eq!(preflight_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(protect_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn protect_backend_failure_after_successful_preflight_is_fail_stop() {
+    let mut set = MemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+    assert_ok!(set.map(
+        MemoryArea::new(0x1000.into(), 0x1000, 1, FailingProtectCommitBackend),
+        &mut pt,
+        false,
+    ));
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = set.protect(0x1800.into(), 0x400, |_| Some(7), &mut pt);
+    }));
+
+    assert!(outcome.is_err());
 }
 
 #[test]

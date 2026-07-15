@@ -18,7 +18,11 @@ pub trait FileNodeOps: NodeOps + Pollable {
                 continue;
             }
             let requested = buf.len();
-            let read = self.read_at(buf, offset)?;
+            let read = match self.read_at(buf, offset) {
+                Ok(read) => read,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
             total += read;
             offset = offset
                 .checked_add(read as u64)
@@ -58,7 +62,11 @@ pub trait FileNodeOps: NodeOps + Pollable {
                 continue;
             }
             let requested = buf.len();
-            let written = self.write_at(buf, offset)?;
+            let written = match self.write_at(buf, offset) {
+                Ok(written) => written,
+                Err(_) if total != 0 => break,
+                Err(error) => return Err(error),
+            };
             total += written;
             offset = offset
                 .checked_add(written as u64)
@@ -90,7 +98,22 @@ pub trait FileNodeOps: NodeOps + Pollable {
     fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)>;
 
     /// Sets the size of the file.
+    ///
+    /// Unless [`set_len_failure_is_atomic`](Self::set_len_failure_is_atomic)
+    /// returns `true`, an error may be reported after the implementation has
+    /// changed file data, allocation metadata, or the visible length. Cache
+    /// users must therefore invalidate any pages that could have become stale.
     fn set_len(&self, len: u64) -> VfsResult<()>;
+
+    /// Whether a failed [`set_len`](Self::set_len) leaves all file data,
+    /// allocation metadata, and the visible length unchanged.
+    ///
+    /// Implementations must return `true` only when this is a stable guarantee
+    /// for every error path. Callers may retain and restore pre-operation cache
+    /// pages based on this contract. The conservative default is `false`.
+    fn set_len_failure_is_atomic(&self) -> bool {
+        false
+    }
 
     /// Sets the file's symlink target.
     fn set_symlink(&self, target: &str) -> VfsResult<()>;

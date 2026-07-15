@@ -1,5 +1,6 @@
 //! Memory mapping backends.
 use alloc::{boxed::Box, sync::Arc};
+use core::mem::ManuallyDrop;
 
 use axalloc::{UsageKind, global_allocator};
 use axerrno::{AxError, AxResult};
@@ -12,6 +13,7 @@ use axsync::Mutex;
 use enum_dispatch::enum_dispatch;
 use memory_addr::{DynPageIter, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 use memory_set::MappingBackend;
+use thekernel_linux_mm::MappingKind;
 
 mod cow;
 mod file;
@@ -19,8 +21,11 @@ mod linear;
 mod phys_pin;
 mod shared;
 
-pub(crate) use self::phys_pin::{PhysicalFramePin, pin_frame};
 pub use self::shared::SharedPages;
+pub(crate) use self::{
+    file::WritableMappingAdmission,
+    phys_pin::{PhysicalFramePin, pin_frame},
+};
 use super::{
     AddrSpace,
     mapping::{FileMappingLease, MappingStatus, relocate_affine_origin},
@@ -72,6 +77,27 @@ fn pages_in(range: VirtAddrRange, align: PageSize) -> AxResult<DynPageIter<VirtA
     DynPageIter::new(range.start, range.end, align as usize).ok_or(AxError::InvalidInput)
 }
 
+fn preflight_sparse_unmap(range: VirtAddrRange, page_size: PageSize, pt: &PageTable) -> AxResult {
+    pages_in(range, page_size)?;
+    for (_, _, _, mapped_size) in pt.collect_present_leaves(range.start, range.size())? {
+        if mapped_size != page_size {
+            return Err(AxError::BadAddress);
+        }
+    }
+    Ok(())
+}
+
+fn preflight_dense_unmap(range: VirtAddrRange, page_size: PageSize, pt: &PageTable) -> AxResult {
+    preflight_sparse_unmap(range, page_size, pt)?;
+    for address in pages_in(range, page_size)? {
+        let (_, _, mapped_size) = pt.query(address)?;
+        if mapped_size != page_size {
+            return Err(AxError::BadAddress);
+        }
+    }
+    Ok(())
+}
+
 fn page_table_flags(flags: MappingFlags) -> MappingFlags {
     // RISC-V and LoongArch PTEs cannot represent writable-without-readable.
     // Keep VMA flags exact for /proc/maps and mprotect, but normalize the
@@ -83,7 +109,51 @@ fn page_table_flags(flags: MappingFlags) -> MappingFlags {
     }
 }
 
-type PopulateCallback = Box<dyn FnOnce(&mut AddrSpace)>;
+type PopulateCallback<T = AddrSpace> = Box<dyn FnMut(&mut T)>;
+
+/// Result of populating page-table entries plus cleanup deferred by a backend.
+///
+/// File-cache eviction listeners cannot re-lock an address space while its
+/// populate path already owns that lock. Keep the deferred work attached to
+/// the result so callers run it before observing either success or failure.
+#[must_use = "deferred population cleanup must be completed"]
+pub(crate) struct PopulateOutcome<T = AddrSpace> {
+    result: AxResult<usize>,
+    callback: Option<ManuallyDrop<PopulateCallback<T>>>,
+}
+
+impl<T> PopulateOutcome<T> {
+    fn new(result: AxResult<usize>, callback: Option<PopulateCallback<T>>) -> Self {
+        Self {
+            result,
+            callback: callback.map(ManuallyDrop::new),
+        }
+    }
+
+    fn immediate(result: AxResult<usize>) -> Self {
+        Self::new(result, None)
+    }
+
+    pub(super) fn finish(mut self, target: &mut T) -> AxResult<usize> {
+        if let Some(mut callback) = self.callback.take() {
+            // Invoke through a borrow so an unwind leaves the callback and its
+            // deferred ownership inside ManuallyDrop. A successful callback is
+            // the only path that releases those captures.
+            callback(target);
+            drop(ManuallyDrop::into_inner(callback));
+        }
+        self.result
+    }
+}
+
+impl<T> Drop for PopulateOutcome<T> {
+    fn drop(&mut self) {
+        assert!(
+            self.callback.is_none(),
+            "PopulateOutcome with deferred cleanup dropped before finish"
+        );
+    }
+}
 
 #[enum_dispatch]
 pub trait BackendOps {
@@ -96,14 +166,19 @@ pub trait BackendOps {
     /// Unmap a memory region.
     fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult;
 
-    /// Called before a memory region is protected.
-    fn on_protect(
+    /// Validates every recoverable unmap condition without changing PTEs or
+    /// backend-owned resources.
+    fn preflight_unmap(&self, range: VirtAddrRange, pt: &PageTable) -> AxResult;
+
+    /// Validates every recoverable protection condition without changing PTEs
+    /// or backend-owned resources.
+    fn preflight_protect(
         &self,
-        _range: VirtAddrRange,
+        range: VirtAddrRange,
         _new_flags: MappingFlags,
-        _pt: &mut PageTableCursor,
+        pt: &PageTable,
     ) -> AxResult {
-        Ok(())
+        preflight_sparse_unmap(range, self.page_size(), pt)
     }
 
     /// Populate a memory region and return how many pages now satisfy
@@ -117,8 +192,8 @@ pub trait BackendOps {
         _flags: MappingFlags,
         _access_flags: MappingFlags,
         _pt: &mut PageTableCursor,
-    ) -> AxResult<(usize, Option<PopulateCallback>)> {
-        Ok((0, None))
+    ) -> PopulateOutcome {
+        PopulateOutcome::immediate(Ok(0))
     }
 
     /// Duplicates this mapping for use in a different page table.
@@ -176,6 +251,36 @@ impl MappingBackend for Backend {
         }
     }
 
+    fn preflight_unmap(&self, start: VirtAddr, size: usize, pt: &PageTable) -> bool {
+        let Some(range) = VirtAddrRange::try_from_start_size(start, size) else {
+            return false;
+        };
+        if let Err(err) = BackendOps::preflight_unmap(self, range, pt) {
+            warn!("Failed to preflight area unmap: {:?}", err);
+            false
+        } else {
+            true
+        }
+    }
+
+    fn preflight_protect(
+        &self,
+        start: Self::Addr,
+        size: usize,
+        new_flags: Self::Flags,
+        pt: &Self::PageTable,
+    ) -> bool {
+        let Some(range) = VirtAddrRange::try_from_start_size(start, size) else {
+            return false;
+        };
+        if let Err(err) = BackendOps::preflight_protect(self, range, new_flags, pt) {
+            warn!("Failed to preflight area protection: {:?}", err);
+            false
+        } else {
+            true
+        }
+    }
+
     fn protect(
         &self,
         start: Self::Addr,
@@ -194,10 +299,6 @@ impl MappingBackend for Backend {
             }
             return true;
         }
-        if let Err(err) = BackendOps::on_protect(self, range, new_flags, &mut cursor) {
-            warn!("Failed to protect area: {:?}", err);
-            return false;
-        }
         cursor
             .protect_region(start, size, page_table_flags(new_flags))
             .is_ok()
@@ -209,6 +310,17 @@ impl MappingBackend for Backend {
 }
 
 impl Backend {
+    pub(crate) fn linux_mapping_kind(&self) -> MappingKind {
+        match self {
+            Backend::Cow(_) if self.file_mapping().is_some() => MappingKind::FilePrivate,
+            Backend::Cow(_) => MappingKind::AnonymousPrivate,
+            Backend::Shared(_) if self.file_mapping().is_some() => MappingKind::FileShared,
+            Backend::Shared(_) => MappingKind::AnonymousShared,
+            Backend::File(_) => MappingKind::FileShared,
+            Backend::Linear(_) => MappingKind::Device,
+        }
+    }
+
     pub fn is_shareable(&self) -> bool {
         matches!(
             self,
@@ -267,6 +379,22 @@ impl Backend {
         self.mapping_status().file_mapping()
     }
 
+    pub(crate) fn shared_file_location(&self) -> Option<&axfs_ng_vfs::Location> {
+        match self {
+            Self::File(backend) => Some(backend.location()),
+            Self::Linear(_) | Self::Cow(_) | Self::Shared(_) => None,
+        }
+    }
+
+    pub(crate) fn begin_shared_writable_mapping_admission(
+        &self,
+    ) -> AxResult<Option<file::WritableMappingAdmission>> {
+        match self {
+            Self::File(backend) => backend.begin_writable_mapping_admission().map(Some),
+            Self::Linear(_) | Self::Cow(_) | Self::Shared(_) => Ok(None),
+        }
+    }
+
     pub(crate) fn replace_file_mapping(&mut self, file: Option<FileMappingLease>) {
         self.mapping_status_mut().replace_file_mapping(file);
     }
@@ -280,10 +408,10 @@ impl Backend {
         matches!(self, Backend::Cow(_) | Backend::Shared(_))
     }
 
-    pub fn begin_user_io_pin_window(&self) -> Option<CachedFilePinWindow> {
+    pub fn begin_user_io_pin_window(&self) -> AxResult<Option<CachedFilePinWindow>> {
         match self {
-            Backend::File(backend) => Some(backend.begin_user_io_pin_window()),
-            Backend::Linear(_) | Backend::Cow(_) | Backend::Shared(_) => None,
+            Backend::File(backend) => backend.begin_user_io_pin_window().map(Some),
+            Backend::Linear(_) | Backend::Cow(_) | Backend::Shared(_) => Ok(None),
         }
     }
 
@@ -291,9 +419,14 @@ impl Backend {
         &self,
         vaddr: VirtAddr,
         paddr: PhysAddr,
+        dirty_on_release: bool,
     ) -> AxResult<Option<CachedFilePagePin>> {
         match self {
-            Backend::File(backend) => Ok(Some(backend.pin_user_io_page(vaddr, paddr)?)),
+            Backend::File(backend) => Ok(Some(backend.pin_user_io_page(
+                vaddr,
+                paddr,
+                dirty_on_release,
+            )?)),
             Backend::Linear(_) | Backend::Cow(_) | Backend::Shared(_) => Ok(None),
         }
     }
@@ -428,6 +561,69 @@ mod tests {
         pseudofs::tmp::MemoryFs,
         task::UserNamespace,
     };
+
+    #[test]
+    fn populate_outcome_runs_deferred_cleanup_on_error() {
+        let mut cleanup_calls = 0;
+        let outcome = PopulateOutcome::<usize>::new(
+            Err(AxError::BadAddress),
+            Some(Box::new(|calls| *calls += 1)),
+        );
+
+        assert_eq!(outcome.finish(&mut cleanup_calls), Err(AxError::BadAddress));
+        assert_eq!(cleanup_calls, 1);
+    }
+
+    #[test]
+    fn populate_outcome_fails_stop_without_dropping_deferred_ownership() {
+        struct DropProbe(Arc<core::sync::atomic::AtomicUsize>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+            }
+        }
+
+        let drops = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let probe = DropProbe(drops.clone());
+        let outcome = PopulateOutcome::<usize>::new(
+            Ok(0),
+            Some(Box::new(move |_| {
+                let _ = &probe;
+            })),
+        );
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(outcome)));
+        assert!(panic.is_err());
+        assert_eq!(drops.load(core::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn populate_outcome_fails_stop_if_deferred_cleanup_unwinds() {
+        struct DropProbe(Arc<core::sync::atomic::AtomicUsize>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+            }
+        }
+
+        let drops = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let probe = DropProbe(drops.clone());
+        let outcome = PopulateOutcome::<usize>::new(
+            Ok(0),
+            Some(Box::new(move |_| {
+                let _ = &probe;
+                panic!("deferred cleanup failed");
+            })),
+        );
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = outcome.finish(&mut 0);
+        }));
+        assert!(panic.is_err());
+        assert_eq!(drops.load(core::sync::atomic::Ordering::Acquire), 0);
+    }
 
     #[test]
     fn every_file_origin_backend_retains_one_mapping_status() {

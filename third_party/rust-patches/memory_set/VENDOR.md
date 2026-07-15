@@ -28,6 +28,10 @@ The published archive contains no `tests/` files, so there are no upstream test 
 - `80620f4` coalesced adjacent anonymous VM areas and reduced fault churn.
 - `b6c0b4c` added append-biased kernel-area placement.
 - `b4cdb5a` completed memory-backed file mapping behavior needed by memfd.
+- The current MM integration adds read-only unmap/clear/protect preflight across
+  every affected backend before the first VMA or PTE mutation, followed by a
+  commit that fails stop if a backend violates its successful preflight. This
+  prevents recoverable partial VMA/PTE removal or permission divergence.
 - Maintained delta: generic memory-area placement/coalescing and backend mechanics; Linux mmap/COW policy remains above this crate.
 
 Commit IDs are navigation hints for the current rewritten history. The exact

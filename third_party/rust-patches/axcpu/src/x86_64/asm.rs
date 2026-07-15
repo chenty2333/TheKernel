@@ -120,6 +120,13 @@ pub fn flush_tlb(vaddr: Option<VirtAddr>) {
     }
 }
 
+/// Synchronizes instruction fetches with earlier writes to executable memory.
+///
+/// x86 keeps its instruction and data caches coherent, so no instruction is
+/// required at this publication boundary.
+#[inline]
+pub fn flush_icache_all() {}
+
 /// Reads the thread pointer of the current CPU (`FS_BASE`).
 ///
 /// It is used to implement TLS (Thread Local Storage).

@@ -61,6 +61,18 @@ impl MappingBackend for MockBackend {
         true
     }
 
+    fn preflight_unmap(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        pt: &MockPageTable,
+    ) -> bool {
+        pt.iter()
+            .skip(start.as_usize())
+            .take(size)
+            .all(|entry| *entry != 0)
+    }
+
     fn unmap(&self, start: VirtAddr, size: usize, pt: &mut MockPageTable) -> bool {
         for entry in pt.iter_mut().skip(start.as_usize()).take(size) {
             if *entry == 0 {
@@ -69,6 +81,19 @@ impl MappingBackend for MockBackend {
             *entry = 0;
         }
         true
+    }
+
+    fn preflight_protect(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        _new_flags: MockFlags,
+        pt: &MockPageTable,
+    ) -> bool {
+        pt.iter()
+            .skip(start.as_usize())
+            .take(size)
+            .all(|entry| *entry != 0)
     }
 
     fn protect(

@@ -28,7 +28,13 @@ The published archive contains no `tests/` files, so there are no upstream test 
 - `7f198eb` repaired and optimized the LoongArch user-copy path.
 - `2aee666` corrected the LoongArch docs.rs target triple.
 - `5641ef3` retained architecture-level copy/alignment improvements.
-- Maintained delta: LoongArch user-copy assembly, unaligned access handling, and architecture initialization only; Linux user-copy policy remains above this crate.
+- The current MM integration adds a current-CPU executable-publication
+  primitive: LoongArch issues `dbar` plus `ibar`, RISC-V issues `fence.i`, and
+  x86 records its coherent-cache no-op. This is not a remote-CPU shootdown
+  contract.
+- Maintained delta: LoongArch user-copy assembly, unaligned access handling,
+  architecture initialization, and current-CPU instruction-cache publication
+  primitives only; Linux user-copy policy remains above this crate.
 
 Commit IDs are navigation hints for the current rewritten history. The exact
 rebase baseline is the archive checksum above; the live patch is the diff

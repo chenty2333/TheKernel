@@ -16,7 +16,7 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{
     prune_dead_cached_file_registry_entries_for_inode, remove_cached_file_registry_entry,
-    sync_and_invalidate_cached_file_pages,
+    with_sync_and_invalidate_cached_file_pages,
 };
 use axfs_ng_vfs::{
     AnonymousOptions, CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode,
@@ -656,23 +656,22 @@ pub fn reserve_fallocate_range(
 ) -> Option<AxResult<()>> {
     let (fs, inode) = file_content_for(loc)?;
     let file = inode.as_file().ok()?;
-    if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
-        return Some(Err(err));
-    }
-    if extend {
-        let Some(end) = offset.checked_add(len) else {
-            return Some(Err(AxError::InvalidInput));
-        };
-        let extend_to = (end > *file.length.lock()).then_some(end);
-        let result = file.reserve_range(&fs, offset, len);
-        if result.is_ok()
-            && let Some(end) = extend_to
-        {
-            file.set_len(&fs, end);
+    Some(with_sync_and_invalidate_cached_file_pages(loc, || {
+        if extend {
+            let Some(end) = offset.checked_add(len) else {
+                return Err(AxError::InvalidInput);
+            };
+            let extend_to = (end > *file.length.lock()).then_some(end);
+            let result = file.reserve_range(&fs, offset, len);
+            if result.is_ok()
+                && let Some(end) = extend_to
+            {
+                file.set_len(&fs, end);
+            }
+            return result;
         }
-        return Some(result);
-    }
-    Some(file.reserve_range(&fs, offset, len))
+        file.reserve_range(&fs, offset, len)
+    }))
 }
 
 pub fn punch_hole_fallocate_range(
@@ -682,11 +681,10 @@ pub fn punch_hole_fallocate_range(
 ) -> Option<AxResult<()>> {
     let (fs, inode) = file_content_for(loc)?;
     let file = inode.as_file().ok()?;
-    if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
-        return Some(Err(err));
-    }
-    file.punch_hole(&fs, offset, len);
-    Some(Ok(()))
+    Some(with_sync_and_invalidate_cached_file_pages(loc, || {
+        file.punch_hole(&fs, offset, len);
+        Ok(())
+    }))
 }
 
 pub fn collapse_fallocate_range(
@@ -696,10 +694,9 @@ pub fn collapse_fallocate_range(
 ) -> Option<AxResult<()>> {
     let (fs, inode) = file_content_for(loc)?;
     let file = inode.as_file().ok()?;
-    if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
-        return Some(Err(err));
-    }
-    Some(file.collapse_range(&fs, offset, len))
+    Some(with_sync_and_invalidate_cached_file_pages(loc, || {
+        file.collapse_range(&fs, offset, len)
+    }))
 }
 
 pub fn insert_fallocate_range(
@@ -709,10 +706,9 @@ pub fn insert_fallocate_range(
 ) -> Option<AxResult<()>> {
     let (_, inode) = file_content_for(loc)?;
     let file = inode.as_file().ok()?;
-    if let Err(err) = sync_and_invalidate_cached_file_pages(loc) {
-        return Some(Err(err));
-    }
-    Some(file.insert_range(offset, len))
+    Some(with_sync_and_invalidate_cached_file_pages(loc, || {
+        file.insert_range(offset, len)
+    }))
 }
 
 pub fn seek_data_or_hole(
@@ -1219,6 +1215,11 @@ impl FileNodeOps for MemoryNode {
         let file = self.inode.as_file()?;
         file.set_len(&self.fs, len);
         Ok(())
+    }
+
+    fn set_len_failure_is_atomic(&self) -> bool {
+        // The only fallible step is the file-kind check above, before mutation.
+        true
     }
 
     fn set_symlink(&self, target: &str) -> VfsResult<()> {

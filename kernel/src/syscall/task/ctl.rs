@@ -8,15 +8,17 @@ use axtask::{AxTaskRef, current};
 use linux_raw_sys::{
     general::{
         __user_cap_data_struct, __user_cap_header_struct, _LINUX_CAPABILITY_VERSION_1,
-        _LINUX_CAPABILITY_VERSION_2, _LINUX_CAPABILITY_VERSION_3, CAP_SETPCAP, CAP_SYS_ADMIN,
-        CAP_SYS_NICE, CLONE_FILES, CLONE_FS, CLONE_NEWCGROUP, CLONE_NEWIPC, CLONE_NEWNET,
-        CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS, CLONE_SYSVSEM,
+        _LINUX_CAPABILITY_VERSION_2, _LINUX_CAPABILITY_VERSION_3, CAP_SYS_ADMIN, CAP_SYS_NICE,
+        CLONE_FILES, CLONE_FS, CLONE_NEWCGROUP, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS,
+        CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS, CLONE_SYSVSEM,
     },
     mempolicy::*,
 };
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
-use thekernel_linux_cred::CapabilitySets;
+use thekernel_linux_cred::{
+    CAPABILITY_VALID_MASK, CAPABILITY_WORDS, CapabilitySets, CapsetRequest,
+};
 
 use crate::{
     file::{FD_TABLE, File, FileDescription, FileLike, replace_process_fd_table},
@@ -26,8 +28,8 @@ use crate::{
         namespace_target_from_proc_file,
     },
     task::{
-        AsThread, CapabilityState, Cred, Dumpability, Mempolicy, ProcessData, PtraceAccessMode,
-        check_current_process_ptrace_access, get_process_data, get_visible_task,
+        AsThread, Cred, Dumpability, Mempolicy, ProcessData, PtraceAccessMode,
+        check_current_process_ptrace_access, cred_error, get_process_data, get_visible_task,
         linux_pid_from_task_id, ns_capable,
     },
 };
@@ -593,14 +595,6 @@ fn cap_data_words(version: u32) -> usize {
     }
 }
 
-fn cap_set_subset(lhs: [u32; 2], rhs: [u32; 2]) -> bool {
-    lhs.iter().zip(rhs.iter()).all(|(lhs, rhs)| lhs & !rhs == 0)
-}
-
-fn cap_set_union(lhs: [u32; 2], rhs: [u32; 2]) -> [u32; 2] {
-    [lhs[0] | rhs[0], lhs[1] | rhs[1]]
-}
-
 fn validate_cap_version(
     header_ptr: *mut __user_cap_header_struct,
 ) -> AxResult<__user_cap_header_struct> {
@@ -654,25 +648,20 @@ fn write_cap_data(
     Ok(())
 }
 
-fn read_cap_data(data: *mut __user_cap_data_struct, version: u32) -> AxResult<CapabilityState> {
-    let mut state = CapabilityState {
-        effective: [0; 2],
-        permitted: [0; 2],
-        inheritable: [0; 2],
-        bounding: [0; 2],
-        ambient: [0; 2],
-        securebits: 0,
-    };
+fn read_cap_data(data: *mut __user_cap_data_struct, version: u32) -> AxResult<CapsetRequest> {
+    let mut effective = [0; CAPABILITY_WORDS];
+    let mut permitted = [0; CAPABILITY_WORDS];
+    let mut inheritable = [0; CAPABILITY_WORDS];
 
     for index in 0..cap_data_words(version) {
         let entry: __user_cap_data_struct =
             unsafe { data.wrapping_add(index).vm_read_uninit()?.assume_init() };
-        let valid = CapabilityState::valid_mask(index);
-        state.effective[index] = entry.effective & valid;
-        state.permitted[index] = entry.permitted & valid;
-        state.inheritable[index] = entry.inheritable & valid;
+        let valid = CAPABILITY_VALID_MASK[index];
+        effective[index] = entry.effective & valid;
+        permitted[index] = entry.permitted & valid;
+        inheritable[index] = entry.inheritable & valid;
     }
-    Ok(state)
+    CapsetRequest::try_new(effective, permitted, inheritable).map_err(cred_error)
 }
 
 pub fn sys_capget(
@@ -705,30 +694,8 @@ pub fn sys_capset(
         return Err(AxError::OperationNotPermitted);
     }
 
-    let new_state = read_cap_data(data, header.version)?;
-    task.as_thread()
-        .try_update_capability_state(|old_state, proposed| {
-            if !cap_set_subset(new_state.effective, new_state.permitted)
-                || !cap_set_subset(new_state.permitted, old_state.permitted)
-            {
-                return Err(AxError::OperationNotPermitted);
-            }
-
-            let allowed_inheritable = if old_state.has_effective(CAP_SETPCAP) {
-                cap_set_union(old_state.inheritable, old_state.bounding)
-            } else {
-                cap_set_union(old_state.inheritable, old_state.permitted)
-            };
-            if !cap_set_subset(new_state.inheritable, allowed_inheritable) {
-                return Err(AxError::OperationNotPermitted);
-            }
-
-            proposed.effective = new_state.effective;
-            proposed.permitted = new_state.permitted;
-            proposed.inheritable = new_state.inheritable;
-            proposed.reconcile_ambient();
-            Ok(())
-        })?;
+    let request = read_cap_data(data, header.version)?;
+    task.as_thread().apply_capset(request)?;
 
     Ok(0)
 }

@@ -323,7 +323,8 @@ fn map_elf<'a>(
             backend,
         )?;
 
-        // TDOO: flush the I-cache
+        // Executable pages are populated lazily; AddrSpace synchronizes the
+        // instruction stream when those pages or execute permissions publish.
     }
 
     Ok(elf_parser)
@@ -414,7 +415,7 @@ impl ExecLoadTarget<'_> {
     fn reset_image(&mut self) -> AxResult {
         match self {
             Self::Mapped(uspace) => {
-                uspace.clear();
+                uspace.clear()?;
                 map_trampoline(uspace)
             }
             #[cfg(test)]

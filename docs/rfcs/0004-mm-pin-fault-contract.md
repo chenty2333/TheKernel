@@ -112,7 +112,7 @@ pins. Read and write intent are separate. Every successful result owns:
 - the address-space and mapping generation lease;
 - exact physical-frame and/or page-cache pins;
 - scatter/gather segments;
-- owner and global accounting tokens;
+- owner/address-space accounting tokens plus one system-wide budget charge;
 - dirty-on-release state for writable pins;
 - invalidation/cancellation linkage when the use permits revocation.
 
@@ -124,7 +124,7 @@ construction rolls back every frame, page-cache, range, and accounting token.
 Pinning follows a check-fault-revalidate sequence:
 
 1. validate arithmetic, userspace bounds, alignment, and requested access;
-2. reserve per-owner/global pages and bytes;
+2. reserve system-wide and per-owner/address-space pages, bytes, and tokens;
 3. snapshot mapping identities and generations;
 4. fault pages in without holding the VMA index or page-table lock across
    blocking work;
@@ -243,6 +243,59 @@ Unsafe code is confined to page-table/HAL operations and raw user-memory
 adapters. Public MM policy uses owned ranges, frames, and initialized buffers;
 user-triggerable alignment/range errors return errors rather than panicking.
 
+## 0.1 implementation checkpoint
+
+As of 2026-07-15, the extracted 0.1 boundary is deliberately narrower than
+the complete design in this RFC. `thekernel-linux-mm` now exists as a `no_std`,
+`unsafe`-free policy crate. It owns:
+
+- checked user/page ranges and page-size arithmetic;
+- typed address-space and mapping identities, generations, snapshots, and
+  invalidation reasons;
+- bounded per-owner/address-space pin quotas plus a fixed-capacity system-wide
+  budget, reservation/publication, mutation admission, release, and teardown
+  accounting;
+- remap geometry, affine relocation, page-covering, and memlock planners;
+- typed fault admission and stale-completion validation seams.
+
+TheKernel consumes the packaged crate without moving generic frame, page-table,
+or page-cache mechanisms into syscall code. The current consumer checkpoint:
+
+- admits direct-I/O pins only for already-resident 4 KiB pages with the
+  requested hardware access; missing pages and unresolved writable COW return
+  to the ordinary copy/fault path;
+- obtains exact RAII frame or page-cache pins, releases conservative file-wide
+  preparation windows before publication, revalidates the mapping generation,
+  and keeps both the policy range token and aggregate system charge until all
+  lower pins are released;
+- uses a fallibly preallocated, system-bounded physical-frame pin table so the
+  IRQ-disabled lookup/update path performs no allocation and cannot grow past
+  the aggregate pin-page limit;
+- marks writable page-cache pins dirty on release and rejects overlapping
+  truncate/remap/protect/unmap mutations while a pin is active;
+- uses transactional COW clone and moving-`mremap` rollback for destination
+  PTEs, frame references, source flags, locks, and topology publication;
+- uses owner-acknowledged page-cache invalidation in `axfs-ng`: pages are
+  staged before lower mutation, every address-space listener must acknowledge
+  detachment, foreign-owner contention restores the staged cache state, and
+  only the populating owner may defer its own detach until `PopulateOutcome`
+  completion.
+
+This checkpoint does not implement fault-in pinning, long-term/DMA pins,
+revocation or an MMU-notifier equivalent. It also does not provide broker
+queues, a userfaultfd FD adapter, userfaultfd commands, or teardown/event
+semantics. `userfaultfd` therefore remains unsupported and this RFC remains
+`draft`.
+
+The correctness checkpoint is not a claim that the direct-I/O pin path is
+performance-complete. Physical-frame accounting still takes one shared lock
+per page, preparation still holds the address-space lock while walking PTEs and
+backend pin counters, and mapping snapshots still use one address-space
+topology generation, so an unrelated VMA mutation can force conservative
+revalidation. The pinned async direct path also remains default-off. These are
+measurement and redesign targets for a later MM performance phase, not reasons
+to weaken the bounded ownership contract in 0.1.
+
 ## Rejected alternatives
 
 - Equating an `Arc<Frame>` with a pin: it does not freeze mapping/COW or account
@@ -292,8 +345,12 @@ user-triggerable alignment/range errors return errors rather than panicking.
 
 ## 0.1 extraction gate
 
-`thekernel-linux-mm` 0.1.0 may be published after mmap/COW/pin ownership,
-generation/invalidation, fault execution, and teardown pass the gates above
-without implicit current-task/address-space access. The fault broker seam may
-be present without claiming userfaultfd support. TheKernel must consume the
-packaged usercopy/MM artifacts on both architectures before tags are cut.
+The 0.1 package boundary is the bounded policy core described by the
+implementation checkpoint above. It may be tagged or published only after its
+public-contract, package/extract, and TheKernel consumer gates pass, including
+RISC-V and LoongArch consumption of the packaged artifact.
+
+That package checkpoint does not close the broader RFC. Fault-in and long-term
+pinning, revocation, fault execution, broker queues, and userfaultfd remain
+subject to the full semantic, teardown, pressure, and dual-architecture gates
+above. A fault-policy seam must never be presented as userfaultfd support.

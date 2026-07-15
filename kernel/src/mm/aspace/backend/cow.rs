@@ -1,4 +1,4 @@
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::{
     slice,
     sync::atomic::{AtomicBool, Ordering},
@@ -9,15 +9,15 @@ use axfs::CachedFile;
 use axfs_ng_vfs::Location;
 use axhal::{
     mem::phys_to_virt,
-    paging::{MappingFlags, PageSize, PageTableCursor, PagingError},
+    paging::{MappingFlags, PageSize, PageTable, PageTableCursor, PagingError},
 };
 use axsync::Mutex;
 use kspin::SpinNoIrq;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, MappingStatus, PopulateCallback, alloc_frame, dealloc_frame,
-    page_table_flags, pages_in,
+    AddrSpace, Backend, BackendOps, MappingStatus, PopulateOutcome, alloc_frame, dealloc_frame,
+    page_table_flags, pages_in, preflight_sparse_unmap,
 };
 
 struct FrameRefCnt(u32);
@@ -73,6 +73,261 @@ impl FrameTableRefCount {
 }
 
 static FRAME_TABLE: SpinNoIrq<FrameTableRefCount> = SpinNoIrq::new(FrameTableRefCount::new());
+
+#[derive(Clone, Copy)]
+struct CowClonePage {
+    source_vaddr: VirtAddr,
+    destination_vaddr: VirtAddr,
+    paddr: PhysAddr,
+    source_flags: MappingFlags,
+    destination_flags: MappingFlags,
+    page_size: PageSize,
+    protect_source: bool,
+}
+
+trait CowClonePageTableOps {
+    fn protect_source(
+        &mut self,
+        vaddr: VirtAddr,
+        flags: MappingFlags,
+    ) -> Result<PageSize, PagingError>;
+
+    fn map_destination(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        page_size: PageSize,
+        flags: MappingFlags,
+    ) -> Result<(), PagingError>;
+
+    fn unmap_destination(
+        &mut self,
+        vaddr: VirtAddr,
+    ) -> Result<(PhysAddr, MappingFlags, PageSize), PagingError>;
+}
+
+struct CursorCowCloneOps<'a, 'old, 'new> {
+    old_pt: &'a mut PageTableCursor<'old>,
+    new_pt: &'a mut PageTableCursor<'new>,
+}
+
+struct SingleCursorCowCloneOps<'a, 'pt> {
+    pt: &'a mut PageTableCursor<'pt>,
+}
+
+impl CowClonePageTableOps for CursorCowCloneOps<'_, '_, '_> {
+    fn protect_source(
+        &mut self,
+        vaddr: VirtAddr,
+        flags: MappingFlags,
+    ) -> Result<PageSize, PagingError> {
+        self.old_pt.protect(vaddr, flags)
+    }
+
+    fn map_destination(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        page_size: PageSize,
+        flags: MappingFlags,
+    ) -> Result<(), PagingError> {
+        self.new_pt.map(vaddr, paddr, page_size, flags)
+    }
+
+    fn unmap_destination(
+        &mut self,
+        vaddr: VirtAddr,
+    ) -> Result<(PhysAddr, MappingFlags, PageSize), PagingError> {
+        self.new_pt.unmap(vaddr)
+    }
+}
+
+impl CowClonePageTableOps for SingleCursorCowCloneOps<'_, '_> {
+    fn protect_source(
+        &mut self,
+        vaddr: VirtAddr,
+        flags: MappingFlags,
+    ) -> Result<PageSize, PagingError> {
+        self.pt.protect(vaddr, flags)
+    }
+
+    fn map_destination(
+        &mut self,
+        vaddr: VirtAddr,
+        paddr: PhysAddr,
+        page_size: PageSize,
+        flags: MappingFlags,
+    ) -> Result<(), PagingError> {
+        self.pt.map(vaddr, paddr, page_size, flags)
+    }
+
+    fn unmap_destination(
+        &mut self,
+        vaddr: VirtAddr,
+    ) -> Result<(PhysAddr, MappingFlags, PageSize), PagingError> {
+        self.pt.unmap(vaddr)
+    }
+}
+
+struct CowCloneJournalEntry {
+    source_vaddr: VirtAddr,
+    destination_vaddr: VirtAddr,
+    paddr: PhysAddr,
+    source_flags: MappingFlags,
+    page_size: PageSize,
+    frame_ref: Arc<SpinNoIrq<FrameRefCnt>>,
+    frame_retained: bool,
+    source_protected: bool,
+    destination_mapped: bool,
+}
+
+// The transaction owns only the extra destination PTE and frame reference.
+// The source mapping remains caller-owned throughout fork and remap migration.
+struct CowCloneTransaction<'a, Ops: CowClonePageTableOps> {
+    ops: &'a mut Ops,
+    journal: Vec<CowCloneJournalEntry>,
+    committed: bool,
+}
+
+impl<'a, Ops: CowClonePageTableOps> CowCloneTransaction<'a, Ops> {
+    fn try_new(ops: &'a mut Ops, page_count: usize) -> AxResult<Self> {
+        let mut journal = Vec::new();
+        journal
+            .try_reserve(page_count)
+            .map_err(|_| AxError::NoMemory)?;
+        Ok(Self {
+            ops,
+            journal,
+            committed: false,
+        })
+    }
+
+    fn share_page(
+        &mut self,
+        page: CowClonePage,
+        frame_ref: Arc<SpinNoIrq<FrameRefCnt>>,
+    ) -> AxResult {
+        self.journal.push(CowCloneJournalEntry {
+            source_vaddr: page.source_vaddr,
+            destination_vaddr: page.destination_vaddr,
+            paddr: page.paddr,
+            source_flags: page.source_flags,
+            page_size: page.page_size,
+            frame_ref,
+            frame_retained: false,
+            source_protected: false,
+            destination_mapped: false,
+        });
+        let entry = self.journal.last_mut().unwrap();
+
+        {
+            let mut frame = entry.frame_ref.lock();
+            assert!(frame.0 > 0, "referencing unreferenced frame");
+            let Some(next_refcnt) = frame.0.checked_add(1) else {
+                warn!("frame reference count overflow");
+                return Err(AxError::BadAddress);
+            };
+            frame.0 = next_refcnt;
+            entry.frame_retained = true;
+        }
+
+        if page.protect_source {
+            let protected_size = self
+                .ops
+                .protect_source(page.source_vaddr, page.destination_flags)?;
+            entry.source_protected = true;
+            if protected_size != page.page_size {
+                return Err(AxError::BadAddress);
+            }
+        }
+
+        self.ops.map_destination(
+            page.destination_vaddr,
+            page.paddr,
+            page.page_size,
+            page.destination_flags,
+        )?;
+        entry.destination_mapped = true;
+        Ok(())
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl<Ops: CowClonePageTableOps> Drop for CowCloneTransaction<'_, Ops> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+
+        // A rollback mismatch means PTE ownership and frame accounting have
+        // diverged. Continuing after that point could free a still-mapped frame.
+        for entry in self.journal.iter().rev() {
+            if entry.destination_mapped {
+                let (paddr, _flags, page_size) = self
+                    .ops
+                    .unmap_destination(entry.destination_vaddr)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "failed to roll back COW destination mapping at {:?}: {:?}",
+                            entry.destination_vaddr, err
+                        )
+                    });
+                assert_eq!(paddr, entry.paddr, "COW rollback unmapped another frame");
+                assert_eq!(
+                    page_size, entry.page_size,
+                    "COW rollback changed the destination leaf size"
+                );
+            }
+
+            if entry.frame_retained {
+                let mut frame = entry.frame_ref.lock();
+                assert!(frame.0 > 1, "COW rollback lost the source frame reference");
+                frame.drop_frame(entry.paddr, entry.page_size);
+            }
+
+            if entry.source_protected {
+                let page_size = self
+                    .ops
+                    .protect_source(entry.source_vaddr, entry.source_flags)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "failed to restore COW source mapping at {:?}: {:?}",
+                            entry.source_vaddr, err
+                        )
+                    });
+                assert_eq!(
+                    page_size, entry.page_size,
+                    "COW rollback changed the source leaf size"
+                );
+            }
+        }
+    }
+}
+
+fn clone_pages_transactionally<Ops, Pages, FrameRef>(
+    pages: Pages,
+    expected_page_size: PageSize,
+    ops: &mut Ops,
+    mut frame_ref: FrameRef,
+) -> AxResult
+where
+    Ops: CowClonePageTableOps,
+    Pages: ExactSizeIterator<Item = CowClonePage>,
+    FrameRef: FnMut(PhysAddr) -> Arc<SpinNoIrq<FrameRefCnt>>,
+{
+    let mut transaction = CowCloneTransaction::try_new(ops, pages.len())?;
+    for page in pages {
+        if page.page_size != expected_page_size {
+            return Err(AxError::BadAddress);
+        }
+        transaction.share_page(page, frame_ref(page.paddr))?;
+    }
+    transaction.commit();
+    Ok(())
+}
 
 fn advance_file_start(file_start: u64, backing_advance: usize) -> AxResult<u64> {
     let backing_advance = u64::try_from(backing_advance).map_err(|_| AxError::InvalidInput)?;
@@ -165,7 +420,12 @@ impl CowBackend {
             if start > 0 {
                 unsafe { core::ptr::write_bytes(buf.as_mut_ptr(), 0, start) };
             }
-            let read = match file.read_at(&mut &mut buf[start..start + max_read], file_start) {
+            let destination = &mut &mut buf[start..start + max_read];
+            // Page-fault and fork population both run inside the owning
+            // address-space transaction. Until MM can snapshot, drop the lock,
+            // and range-revalidate, it must not suspend after an async submit.
+            let read_result = file.read_at_sync(destination, file_start);
+            let read = match read_result {
                 Ok(read) if read <= max_read => read,
                 Ok(_) => {
                     dealloc_frame(frame, self.size);
@@ -390,26 +650,24 @@ impl CowBackend {
         if !materialized.is_empty() {
             self.mark_materialized();
         }
-        for (old_addr, paddr, flags, page_size) in materialized {
-            if page_size != self.size {
-                return Err(AxError::BadAddress);
-            }
-            let new_addr = new_start + old_addr.sub_addr(old_start);
-            let frame = self.get_or_track_frame_ref(paddr);
-            let mut frame = frame.lock();
-            let Some(next_refcnt) = frame.0.checked_add(1) else {
-                return Err(AxError::BadAddress);
-            };
-            frame.0 = next_refcnt;
-            drop(frame);
-            if let Err(err) = pt.map(new_addr, paddr, self.size, page_table_flags(flags)) {
-                let frame = self.get_or_track_frame_ref(paddr);
-                let mut frame = frame.lock();
-                frame.drop_frame(paddr, self.size);
-                return Err(err.into());
-            }
-        }
-        Ok(())
+        let pages =
+            materialized
+                .into_iter()
+                .map(
+                    |(source_vaddr, paddr, source_flags, page_size)| CowClonePage {
+                        source_vaddr,
+                        destination_vaddr: new_start + source_vaddr.sub_addr(old_start),
+                        paddr,
+                        source_flags,
+                        destination_flags: page_table_flags(source_flags),
+                        page_size,
+                        protect_source: false,
+                    },
+                );
+        let mut ops = SingleCursorCowCloneOps { pt };
+        clone_pages_transactionally(pages, self.size, &mut ops, |paddr| {
+            self.get_or_track_frame_ref(paddr)
+        })
     }
 
     pub(crate) fn is_private_anonymous(&self) -> bool {
@@ -419,7 +677,121 @@ impl CowBackend {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
+
+    struct MockCowCloneOps {
+        parents: BTreeMap<VirtAddr, (MappingFlags, PageSize)>,
+        children: BTreeMap<VirtAddr, (PhysAddr, MappingFlags, PageSize)>,
+        fail_map_call: usize,
+        map_calls: usize,
+        unmapped: Vec<(VirtAddr, PhysAddr, PageSize)>,
+    }
+
+    impl CowClonePageTableOps for MockCowCloneOps {
+        fn protect_source(
+            &mut self,
+            vaddr: VirtAddr,
+            flags: MappingFlags,
+        ) -> Result<PageSize, PagingError> {
+            let Some((parent_flags, page_size)) = self.parents.get_mut(&vaddr) else {
+                return Err(PagingError::NotMapped);
+            };
+            *parent_flags = flags;
+            Ok(*page_size)
+        }
+
+        fn map_destination(
+            &mut self,
+            vaddr: VirtAddr,
+            paddr: PhysAddr,
+            page_size: PageSize,
+            flags: MappingFlags,
+        ) -> Result<(), PagingError> {
+            self.map_calls += 1;
+            if self.map_calls == self.fail_map_call {
+                return Err(PagingError::NoMemory);
+            }
+            if self
+                .children
+                .insert(vaddr, (paddr, flags, page_size))
+                .is_some()
+            {
+                return Err(PagingError::AlreadyMapped);
+            }
+            Ok(())
+        }
+
+        fn unmap_destination(
+            &mut self,
+            vaddr: VirtAddr,
+        ) -> Result<(PhysAddr, MappingFlags, PageSize), PagingError> {
+            let Some((paddr, flags, page_size)) = self.children.remove(&vaddr) else {
+                return Err(PagingError::NotMapped);
+            };
+            self.unmapped.push((vaddr, paddr, page_size));
+            Ok((paddr, flags, page_size))
+        }
+    }
+
+    fn tracked_frames(pages: &[CowClonePage]) -> BTreeMap<PhysAddr, Arc<SpinNoIrq<FrameRefCnt>>> {
+        pages
+            .iter()
+            .map(|page| {
+                (
+                    page.paddr,
+                    Arc::new(SpinNoIrq::new(FrameRefCnt(FrameTableRefCount::INITIAL_CNT))),
+                )
+            })
+            .collect()
+    }
+
+    fn mock_clone_ops(pages: &[CowClonePage], fail_map_call: usize) -> MockCowCloneOps {
+        MockCowCloneOps {
+            parents: pages
+                .iter()
+                .map(|page| (page.source_vaddr, (page.source_flags, page.page_size)))
+                .collect(),
+            children: BTreeMap::new(),
+            fail_map_call,
+            map_calls: 0,
+            unmapped: Vec::new(),
+        }
+    }
+
+    fn migrate_test_pages() -> [CowClonePage; 3] {
+        let page_size = PageSize::Size4K;
+        [
+            CowClonePage {
+                source_vaddr: VirtAddr::from(0x4000),
+                destination_vaddr: VirtAddr::from(0x14_000),
+                paddr: PhysAddr::from(0x2000_0000),
+                source_flags: MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                destination_flags: MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                page_size,
+                protect_source: false,
+            },
+            CowClonePage {
+                source_vaddr: VirtAddr::from(0x5000),
+                destination_vaddr: VirtAddr::from(0x15_000),
+                paddr: PhysAddr::from(0x2000_1000),
+                source_flags: MappingFlags::USER | MappingFlags::READ,
+                destination_flags: MappingFlags::USER | MappingFlags::READ,
+                page_size,
+                protect_source: false,
+            },
+            CowClonePage {
+                source_vaddr: VirtAddr::from(0x6000),
+                destination_vaddr: VirtAddr::from(0x16_000),
+                paddr: PhysAddr::from(0x2000_2000),
+                source_flags: MappingFlags::USER | MappingFlags::READ | MappingFlags::EXECUTE,
+                destination_flags: MappingFlags::USER | MappingFlags::READ | MappingFlags::EXECUTE,
+                page_size,
+                protect_source: false,
+            },
+        ]
+    }
 
     #[test]
     fn low_address_cow_suffix_advances_the_file_cursor() {
@@ -436,6 +808,144 @@ mod tests {
         assert_eq!(
             advance_file_start(u64::MAX - 0x1000, backing_advance),
             Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn late_child_map_failure_rolls_back_huge_cow_clone_transaction() {
+        let page_size = PageSize::Size2M;
+        let original_flags = [
+            MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+            MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
+            MappingFlags::READ | MappingFlags::WRITE,
+        ];
+        let pages = [
+            CowClonePage {
+                source_vaddr: VirtAddr::from(0x20_0000),
+                destination_vaddr: VirtAddr::from(0x20_0000),
+                paddr: PhysAddr::from(0x1000_0000),
+                source_flags: original_flags[0],
+                destination_flags: MappingFlags::USER | MappingFlags::READ,
+                page_size,
+                protect_source: true,
+            },
+            CowClonePage {
+                source_vaddr: VirtAddr::from(0x40_0000),
+                destination_vaddr: VirtAddr::from(0x40_0000),
+                paddr: PhysAddr::from(0x1020_0000),
+                source_flags: original_flags[1],
+                destination_flags: MappingFlags::USER | MappingFlags::READ,
+                page_size,
+                protect_source: true,
+            },
+            CowClonePage {
+                source_vaddr: VirtAddr::from(0x60_0000),
+                destination_vaddr: VirtAddr::from(0x60_0000),
+                paddr: PhysAddr::from(0x1040_0000),
+                source_flags: original_flags[2],
+                destination_flags: MappingFlags::READ,
+                page_size,
+                protect_source: true,
+            },
+        ];
+        let frame_refs = tracked_frames(&pages);
+        let mut ops = mock_clone_ops(&pages, 3);
+        assert_eq!(
+            clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr| {
+                frame_refs.get(&paddr).unwrap().clone()
+            }),
+            Err(AxError::NoMemory)
+        );
+
+        assert!(ops.children.is_empty());
+        for (index, page) in pages.iter().enumerate() {
+            assert_eq!(
+                ops.parents[&page.source_vaddr],
+                (original_flags[index], page_size)
+            );
+            assert_eq!(
+                frame_refs[&page.paddr].lock().0,
+                FrameTableRefCount::INITIAL_CNT
+            );
+        }
+        assert_eq!(
+            ops.unmapped,
+            vec![
+                (pages[1].destination_vaddr, pages[1].paddr, page_size),
+                (pages[0].destination_vaddr, pages[0].paddr, page_size),
+            ]
+        );
+    }
+
+    #[test]
+    fn late_migrate_map_failure_unmaps_destinations_without_touching_sources() {
+        let page_size = PageSize::Size4K;
+        let pages = migrate_test_pages();
+        let frame_refs = tracked_frames(&pages);
+        let source_snapshot: BTreeMap<_, _> = pages
+            .iter()
+            .map(|page| (page.source_vaddr, (page.source_flags, page.page_size)))
+            .collect();
+        let mut ops = mock_clone_ops(&pages, 3);
+
+        assert_eq!(
+            clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr| {
+                frame_refs.get(&paddr).unwrap().clone()
+            }),
+            Err(AxError::NoMemory)
+        );
+
+        assert_eq!(ops.parents, source_snapshot);
+        assert!(ops.children.is_empty());
+        for page in pages {
+            assert_eq!(
+                frame_refs[&page.paddr].lock().0,
+                FrameTableRefCount::INITIAL_CNT
+            );
+        }
+        assert_eq!(
+            ops.unmapped,
+            vec![
+                (pages[1].destination_vaddr, pages[1].paddr, page_size),
+                (pages[0].destination_vaddr, pages[0].paddr, page_size),
+            ]
+        );
+    }
+
+    #[test]
+    fn late_migrate_refcount_overflow_rolls_back_published_destinations() {
+        let page_size = PageSize::Size4K;
+        let pages = migrate_test_pages();
+        let frame_refs = tracked_frames(&pages);
+        frame_refs[&pages[2].paddr].lock().0 = u32::MAX;
+        let mut ops = mock_clone_ops(&pages, usize::MAX);
+        let source_snapshot = ops.parents.clone();
+
+        assert_eq!(
+            clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr| {
+                frame_refs.get(&paddr).unwrap().clone()
+            }),
+            Err(AxError::BadAddress)
+        );
+
+        assert_eq!(ops.map_calls, 2);
+        assert_eq!(ops.parents, source_snapshot);
+        assert!(ops.children.is_empty());
+        assert_eq!(
+            frame_refs[&pages[0].paddr].lock().0,
+            FrameTableRefCount::INITIAL_CNT
+        );
+        assert_eq!(
+            frame_refs[&pages[1].paddr].lock().0,
+            FrameTableRefCount::INITIAL_CNT
+        );
+        assert_eq!(frame_refs[&pages[2].paddr].lock().0, u32::MAX);
+        assert_eq!(
+            ops.unmapped,
+            vec![
+                (pages[1].destination_vaddr, pages[1].paddr, page_size),
+                (pages[0].destination_vaddr, pages[0].paddr, page_size),
+            ]
         );
     }
 }
@@ -475,38 +985,44 @@ impl BackendOps for CowBackend {
         Ok(())
     }
 
+    fn preflight_unmap(&self, range: VirtAddrRange, pt: &PageTable) -> AxResult {
+        preflight_sparse_unmap(range, self.size, pt)
+    }
+
     fn populate(
         &self,
         range: VirtAddrRange,
         flags: MappingFlags,
         access_flags: MappingFlags,
         pt: &mut PageTableCursor,
-    ) -> AxResult<(usize, Option<PopulateCallback>)> {
-        let mut pages = 0;
-        for addr in pages_in(range, self.size)? {
-            match pt.query(addr) {
-                Ok((paddr, page_flags, page_size)) => {
-                    if self.size != page_size {
-                        return Err(AxError::BadAddress);
+    ) -> PopulateOutcome {
+        PopulateOutcome::immediate((|| {
+            let mut pages = 0;
+            for addr in pages_in(range, self.size)? {
+                match pt.query(addr) {
+                    Ok((paddr, page_flags, page_size)) => {
+                        if self.size != page_size {
+                            return Err(AxError::BadAddress);
+                        }
+                        if access_flags.contains(MappingFlags::WRITE)
+                            && !page_flags.contains(MappingFlags::WRITE)
+                        {
+                            self.handle_cow_fault(addr, paddr, flags, pt)?;
+                            pages += 1;
+                        } else if page_flags.contains(access_flags) {
+                            pages += 1;
+                        }
                     }
-                    if access_flags.contains(MappingFlags::WRITE)
-                        && !page_flags.contains(MappingFlags::WRITE)
-                    {
-                        self.handle_cow_fault(addr, paddr, flags, pt)?;
-                        pages += 1;
-                    } else if page_flags.contains(access_flags) {
+                    // If the page is not mapped, try map it.
+                    Err(PagingError::NotMapped) => {
+                        self.alloc_new_at(addr, flags, pt)?;
                         pages += 1;
                     }
+                    Err(_) => return Err(AxError::BadAddress),
                 }
-                // If the page is not mapped, try map it.
-                Err(PagingError::NotMapped) => {
-                    self.alloc_new_at(addr, flags, pt)?;
-                    pages += 1;
-                }
-                Err(_) => return Err(AxError::BadAddress),
             }
-        }
-        Ok((pages, None))
+            Ok(pages)
+        })())
     }
 
     fn clone_map(
@@ -533,42 +1049,21 @@ impl BackendOps for CowBackend {
         if !materialized.is_empty() {
             self.mark_materialized();
         }
-        for (vaddr, paddr, page_flags, page_size) in materialized {
-            if page_size != self.size {
-                return Err(AxError::BadAddress);
-            }
-            // If the page is mapped in the old page table:
-            // - Update its permissions in the old page table using `flags`.
-            // - Map the same physical page into the new page table at the same
-            // virtual address, with the same page size and `flags`.
-            let frame = self.get_or_track_frame_ref(paddr);
-            let mut frame = frame.lock();
-            let Some(next_refcnt) = frame.0.checked_add(1) else {
-                warn!("frame reference count overflow");
-                return Err(AxError::BadAddress);
-            };
-            assert!(frame.0 > 0, "referencing unreferenced frame");
-            frame.0 = next_refcnt;
-            drop(frame);
-            let protected_parent = page_flags.contains(MappingFlags::WRITE);
-            if protected_parent {
-                if let Err(err) = old_pt.protect(vaddr, cow_flags) {
-                    let frame = self.get_or_track_frame_ref(paddr);
-                    let mut frame = frame.lock();
-                    frame.drop_frame(paddr, self.size);
-                    return Err(err.into());
-                }
-            }
-            if let Err(err) = new_pt.map(vaddr, paddr, self.size, cow_flags) {
-                if protected_parent {
-                    let _ = old_pt.protect(vaddr, page_table_flags(flags));
-                }
-                let frame = self.get_or_track_frame_ref(paddr);
-                let mut frame = frame.lock();
-                frame.drop_frame(paddr, self.size);
-                return Err(err.into());
-            }
-        }
+        let pages = materialized
+            .into_iter()
+            .map(|(vaddr, paddr, source_flags, page_size)| CowClonePage {
+                source_vaddr: vaddr,
+                destination_vaddr: vaddr,
+                paddr,
+                source_flags,
+                destination_flags: cow_flags,
+                page_size,
+                protect_source: source_flags.contains(MappingFlags::WRITE),
+            });
+        let mut ops = CursorCowCloneOps { old_pt, new_pt };
+        clone_pages_transactionally(pages, self.size, &mut ops, |paddr| {
+            self.get_or_track_frame_ref(paddr)
+        })?;
 
         Ok(Backend::Cow(self.clone()))
     }

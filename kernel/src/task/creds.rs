@@ -8,11 +8,11 @@ extern crate std;
 
 use axerrno::{AxError, AxResult};
 use axsync::spin::SpinNoIrq;
+#[cfg(test)]
+pub(crate) use thekernel_linux_cred::CAPABILITY_VALID_MASK;
 pub(crate) use thekernel_linux_cred::{
-    CAPABILITY_VALID_MASK, CAPABILITY_WORDS, CredentialIds as Credentials,
-    FsCredentialSnapshot as DacCredentialView, GroupInfo, SECBIT_KEEP_CAPS,
-    SECBIT_KEEP_CAPS_LOCKED, SECBIT_NO_CAP_AMBIENT_RAISE, SECBIT_NO_SETUID_FIXUP, SECURE_ALL_BITS,
-    SECURE_ALL_LOCKS,
+    CAPABILITY_WORDS, CredentialIds as Credentials, FsCredentialSnapshot as DacCredentialView,
+    GroupInfo, SECBIT_KEEP_CAPS, SECBIT_NO_SETUID_FIXUP,
 };
 use thekernel_linux_cred::{CapabilitySets, Credential, CredentialTransitionEffects};
 
@@ -295,101 +295,29 @@ pub(in crate::task) fn credential_publication_lock_held() -> bool {
     CREDENTIAL_PUBLICATION_LOCK_DEPTH.with(|depth| depth.get() != 0)
 }
 
-/// Kernel-local mutable capability draft used only while a credential writer
-/// owns the sleepable update transaction. Committed capability state is always
-/// the validated, field-private [`CapabilitySets`] value from the ABI crate.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) struct CapabilityDraft {
-    pub(crate) effective: [u32; CAPABILITY_WORDS],
-    pub(crate) permitted: [u32; CAPABILITY_WORDS],
-    pub(crate) inheritable: [u32; CAPABILITY_WORDS],
-    pub(crate) bounding: [u32; CAPABILITY_WORDS],
-    pub(crate) ambient: [u32; CAPABILITY_WORDS],
-    pub(crate) securebits: u32,
-}
+/// Kernel compatibility name for the field-private capability value owned by
+/// the reusable credential crate. The kernel does not keep a second mutable
+/// representation or capability-policy implementation.
+pub(crate) type CapabilityState = CapabilitySets;
 
-pub(crate) type CapabilityState = CapabilityDraft;
-
-impl CapabilityDraft {
-    pub(in crate::task) const fn full() -> Self {
-        Self {
-            effective: CAPABILITY_VALID_MASK,
-            permitted: CAPABILITY_VALID_MASK,
-            inheritable: [0; CAPABILITY_WORDS],
-            bounding: CAPABILITY_VALID_MASK,
-            ambient: [0; CAPABILITY_WORDS],
-            securebits: 0,
-        }
-    }
-
-    pub(in crate::task) fn cap_mask(cap: u32) -> Option<(usize, u32)> {
-        CapabilitySets::cap_mask(cap)
-    }
-
-    pub(crate) fn valid_mask(word: usize) -> u32 {
-        CAPABILITY_VALID_MASK[word]
-    }
-
-    pub(crate) fn has_effective(self, cap: u32) -> bool {
-        Self::cap_mask(cap).is_some_and(|(word, mask)| self.effective[word] & mask != 0)
-    }
-
-    pub(crate) fn raise_ambient(&mut self, cap: u32) -> AxResult<()> {
-        let Some((word, mask)) = Self::cap_mask(cap) else {
-            return Err(AxError::InvalidInput);
-        };
-        self.ambient[word] |= mask;
-        Ok(())
-    }
-
-    pub(crate) fn lower_ambient(&mut self, cap: u32) -> AxResult<()> {
-        let Some((word, mask)) = Self::cap_mask(cap) else {
-            return Err(AxError::InvalidInput);
-        };
-        self.ambient[word] &= !mask;
-        Ok(())
-    }
-
-    pub(crate) fn clear_ambient(&mut self) {
-        self.ambient = [0; CAPABILITY_WORDS];
-    }
-
-    pub(crate) fn reconcile_ambient(&mut self) {
-        for word in 0..CAPABILITY_WORDS {
-            self.ambient[word] &= self.permitted[word] & self.inheritable[word];
-        }
-    }
-
-    pub(crate) fn drop_bounding(&mut self, cap: u32) -> AxResult<()> {
-        let Some((word, mask)) = Self::cap_mask(cap) else {
-            return Err(AxError::InvalidInput);
-        };
-        self.bounding[word] &= !mask;
-        Ok(())
-    }
-
-    pub(in crate::task) fn from_committed(caps: CapabilitySets) -> Self {
-        Self {
-            effective: caps.effective(),
-            permitted: caps.permitted(),
-            inheritable: caps.inheritable(),
-            bounding: caps.bounding(),
-            ambient: caps.ambient(),
-            securebits: caps.securebits(),
-        }
-    }
-
-    fn try_into_committed(self) -> AxResult<CapabilitySets> {
-        CapabilitySets::try_new(
-            self.effective,
-            self.permitted,
-            self.inheritable,
-            self.bounding,
-            self.ambient,
-            self.securebits,
-        )
-        .map_err(cred_error)
-    }
+#[cfg(test)]
+pub(in crate::task) fn capability_state_for_test(
+    effective: [u32; CAPABILITY_WORDS],
+    permitted: [u32; CAPABILITY_WORDS],
+    inheritable: [u32; CAPABILITY_WORDS],
+    bounding: [u32; CAPABILITY_WORDS],
+    ambient: [u32; CAPABILITY_WORDS],
+    securebits: u32,
+) -> CapabilityState {
+    CapabilitySets::try_new(
+        effective,
+        permitted,
+        inheritable,
+        bounding,
+        ambient,
+        securebits,
+    )
+    .expect("test capability state must satisfy credential invariants")
 }
 
 /// Mutable, unpublished copy of a credential transaction.
@@ -405,7 +333,7 @@ impl CredBuilder {
         Self {
             ids: cred.ids(),
             groups: cred.groups().clone(),
-            caps: CapabilityDraft::from_committed(cred.capabilities()),
+            caps: cred.capabilities(),
             no_new_privs: cred.no_new_privs(),
         }
     }
@@ -418,12 +346,11 @@ impl CredBuilder {
         CredentialTransitionEffects,
         CredentialStateTransition,
     )> {
-        let caps = self.caps.try_into_committed()?;
         let prepared_core = CoreCred::try_prepare_transition(
             old.core_arc(),
             self.ids,
             self.groups,
-            caps,
+            self.caps,
             self.no_new_privs,
         )
         .map_err(cred_error)?;
@@ -553,16 +480,23 @@ impl CredentialSlot {
         }
 
         let mut update = self.prepare();
-        update.builder.caps.permitted = [0; CAPABILITY_WORDS];
-        update.builder.caps.effective = [0; CAPABILITY_WORDS];
-        update.builder.caps.inheritable = [0; CAPABILITY_WORDS];
-        update.builder.caps.ambient = [0; CAPABILITY_WORDS];
+        let old = update.builder.caps;
+        let mut permitted_set = [0; CAPABILITY_WORDS];
+        let mut effective_set = [0; CAPABILITY_WORDS];
         for &capability in permitted {
-            insert_capability(&mut update.builder.caps.permitted, capability)?;
+            insert_capability(&mut permitted_set, capability)?;
         }
         for &capability in effective {
-            insert_capability(&mut update.builder.caps.effective, capability)?;
+            insert_capability(&mut effective_set, capability)?;
         }
+        update.builder.caps = capability_state_for_test(
+            effective_set,
+            permitted_set,
+            [0; CAPABILITY_WORDS],
+            old.bounding(),
+            [0; CAPABILITY_WORDS],
+            old.securebits(),
+        );
         Ok(update.finish()?.commit())
     }
 }
@@ -815,9 +749,15 @@ mod tests {
         update.builder.ids.suid = kernel_uid;
         update.builder.ids.fsuid = kernel_uid;
         if uid != 0 {
-            update.builder.caps.effective = [0; CAPABILITY_WORDS];
-            update.builder.caps.permitted = [0; CAPABILITY_WORDS];
-            update.builder.caps.clear_ambient();
+            let caps = update.builder.caps;
+            update.builder.caps = capability_state_for_test(
+                [0; CAPABILITY_WORDS],
+                [0; CAPABILITY_WORDS],
+                caps.inheritable(),
+                caps.bounding(),
+                [0; CAPABILITY_WORDS],
+                caps.securebits(),
+            );
         }
         update.finish().unwrap().commit();
     }
@@ -853,8 +793,19 @@ mod tests {
         let (word, mask) = CapabilityState::cap_mask(CAP_CHOWN).unwrap();
 
         let mut update = first.prepare();
-        update.builder.caps.effective[word] &= !mask;
-        update.builder.caps.permitted[word] &= !mask;
+        let caps = update.builder.caps;
+        let mut effective = caps.effective();
+        let mut permitted = caps.permitted();
+        effective[word] &= !mask;
+        permitted[word] &= !mask;
+        update.builder.caps = capability_state_for_test(
+            effective,
+            permitted,
+            caps.inheritable(),
+            caps.bounding(),
+            caps.ambient(),
+            caps.securebits(),
+        );
         update.finish().unwrap().commit();
 
         assert!(!first.current().has_effective_capability(CAP_CHOWN));
@@ -902,7 +853,11 @@ mod tests {
         publish_raw_setuid(&leader, 2000);
 
         let mut enable_keep_caps = executor.prepare();
-        enable_keep_caps.builder.caps.securebits |= SECBIT_KEEP_CAPS;
+        enable_keep_caps
+            .builder
+            .caps
+            .try_set_keep_caps(true)
+            .unwrap();
         enable_keep_caps.finish().unwrap().commit();
 
         let exec = executor.prepare();
@@ -1039,14 +994,14 @@ mod tests {
                 fsgid: group,
             };
             update.builder.groups = GroupInfo::try_new(vec![group]).unwrap();
-            update.builder.caps = CapabilityState {
-                effective: [1 << cap, 0],
-                permitted: [1 << cap, 0],
-                inheritable: [0; CAPABILITY_WORDS],
-                bounding: CAPABILITY_VALID_MASK,
-                ambient: [0; CAPABILITY_WORDS],
+            update.builder.caps = capability_state_for_test(
+                [1 << cap, 0],
+                [1 << cap, 0],
+                [0; CAPABILITY_WORDS],
+                CAPABILITY_VALID_MASK,
+                [0; CAPABILITY_WORDS],
                 securebits,
-            };
+            );
             update.finish().unwrap().commit();
         };
         publish(&slot, true);

@@ -86,6 +86,16 @@ bitflags! {
         /// controls with a legacy `.write` operation have this shape: lseek
         /// and pread may work, while pwrite must fail with `ESPIPE`.
         const NO_POSITIONED_WRITE = 0x0080;
+
+        /// Explicit-offset reads are not supported. This is independent of
+        /// [`STREAM`](Self::STREAM): stream nodes such as `/dev/zero` may omit
+        /// an OFD cursor while still accepting `pread`.
+        const NO_POSITIONED_READ = 0x0100;
+
+        /// Seeking is not supported. This is independent of whether the node
+        /// maintains an OFD cursor; Linux devices such as `/dev/null` accept
+        /// lseek while TTYs reject it.
+        const NO_SEEK = 0x0200;
     }
 }
 

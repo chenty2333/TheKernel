@@ -202,6 +202,10 @@ pub trait BlockDriverOps: BaseDriverOps {
     }
 
     /// Submits a batch of async block requests.
+    ///
+    /// On success, `submitted` must not exceed `requests.len()`, and every
+    /// request in `requests[..submitted]` must contain a unique handle. On
+    /// error, no request may remain able to access caller-owned buffers.
     fn submit_async_batch(
         &mut self,
         requests: &mut [BlockQueueRequest<'_>],
@@ -216,7 +220,14 @@ pub trait BlockDriverOps: BaseDriverOps {
         Err(DevError::Unsupported)
     }
 
-    /// Waits for all listed async block requests to complete.
+    /// Waits for all listed async block requests to complete and releases their
+    /// access to the submitted buffers.
+    ///
+    /// Implementations must reap every listed request before returning, even
+    /// when one completed request reports a completion-status error. Transient
+    /// wait errors must be retried. An implementation that loses the ability to
+    /// prove that a request is quiescent must fail closed instead of returning
+    /// while the device may still access caller-owned memory.
     fn wait_async_all(&mut self, handles: &[BlockRequestHandle]) -> DevResult {
         let _ = handles;
         Err(DevError::Unsupported)

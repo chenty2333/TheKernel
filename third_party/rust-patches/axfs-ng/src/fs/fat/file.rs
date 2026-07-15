@@ -202,6 +202,12 @@ impl FileNodeOps for FatFileNode {
         }
     }
 
+    fn set_len_failure_is_atomic(&self) -> bool {
+        // FAT chain growth/truncation can fail after updating allocation
+        // metadata, so callers must discard potentially stale cache pages.
+        false
+    }
+
     fn set_symlink(&self, _target: &str) -> VfsResult<()> {
         Err(VfsError::PermissionDenied)
     }

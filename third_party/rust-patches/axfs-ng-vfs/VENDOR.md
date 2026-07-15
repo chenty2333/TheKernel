@@ -33,6 +33,9 @@ The published archive contains no `tests/` files, so there are no upstream test 
 - The current path-snapshot slice makes component retention, capacity
   arithmetic, and final `PathBuf` construction fallible before Linux-ABI or
   procfs consumers render the result.
+- The current file-contract slice preserves a completed vectored-I/O prefix
+  across a later element error, exposes whether failed truncate is atomic, and
+  separates stream, positioned-read, positioned-write, and seek capabilities.
 - Maintained delta: generic dentries, mounts, pathwalk hooks, metadata, and node contracts; Linux DAC decisions are injected from the ABI layer.
 
 Commit IDs are navigation hints for the current rewritten history. The exact

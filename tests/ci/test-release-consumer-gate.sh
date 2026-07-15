@@ -21,6 +21,7 @@ members = []
 [workspace.dependencies]
 one = { path = "../source/one" }
 thekernel-linux-cred = { path = "../thekernel-linux-abi/crates/cred" }
+thekernel-linux-mm = { path = "../thekernel-linux-abi/crates/mm" }
 
 [patch.crates-io]
 two = { path = "../source/two" }
@@ -30,12 +31,15 @@ python3 "$CI_DIR/rewrite-release-consumer.py" \
     --replace '../source/one=../artifacts/one-0.1.0' \
     --replace '../source/two=../artifacts/two-0.1.0' \
     --replace '../thekernel-linux-abi/crates/cred=../artifacts/thekernel-linux-cred-0.1.0' \
+    --replace '../thekernel-linux-abi/crates/mm=../artifacts/thekernel-linux-mm-0.1.0' \
     --forbid-text '../source/' \
     --forbid-text '../thekernel-linux-abi/' \
     --record "$tmp/rewrite/record.tsv" >/dev/null
 grep -Fq 'path = "../artifacts/one-0.1.0"' "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/two-0.1.0"' "$tmp/rewrite/Cargo.toml"
 grep -Fq 'path = "../artifacts/thekernel-linux-cred-0.1.0"' \
+    "$tmp/rewrite/Cargo.toml"
+grep -Fq 'path = "../artifacts/thekernel-linux-mm-0.1.0"' \
     "$tmp/rewrite/Cargo.toml"
 grep -q $'^before_sha256\t[0-9a-f]\{64\}$' "$tmp/rewrite/record.tsv"
 if python3 "$CI_DIR/rewrite-release-consumer.py" \
@@ -230,6 +234,7 @@ mkdir -p \
     "$tmp/artifacts/thekernel-axpoll-0.1.0" \
     "$tmp/artifacts/thekernel-axtask-0.1.0" \
     "$tmp/artifacts/thekernel-linux-cred-0.1.0" \
+    "$tmp/artifacts/thekernel-linux-mm-0.1.0" \
     "$tmp/artifacts/thekernel-linux-process-0.1.0" \
     "$tmp/artifacts/thekernel-linux-vfs-0.1.0" \
     "$tmp/artifacts/thekernel-linux-fd-0.1.0" \
@@ -246,6 +251,7 @@ release_names = [
     "thekernel-axpoll",
     "thekernel-axtask",
     "thekernel-linux-cred",
+    "thekernel-linux-mm",
     "thekernel-linux-process",
     "thekernel-linux-vfs",
     "thekernel-linux-fd",
@@ -336,7 +342,7 @@ graph_args=(
 )
 for package in \
     thekernel-axsched thekernel-axpoll thekernel-axtask \
-    thekernel-linux-cred thekernel-linux-process \
+    thekernel-linux-cred thekernel-linux-mm thekernel-linux-process \
     thekernel-linux-vfs thekernel-linux-fd; do
     graph_args+=(--expect "$package=$tmp/artifacts/$package-0.1.0")
 done

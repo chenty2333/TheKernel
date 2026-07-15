@@ -52,6 +52,12 @@ struct readv_task {
 
 static volatile sig_atomic_t signal_hits;
 
+static void announce_async_stage(const char *stage)
+{
+    printf("USER_DIRECT_ASYNC_STAGE_%s\n", stage);
+    fflush(stdout);
+}
+
 static void signal_handler(int signo)
 {
     if (signo == SIGUSR1) {
@@ -1350,6 +1356,7 @@ static int test_async_direct_contig(void)
     long long write_base;
     long long write_after;
 
+    announce_async_stage("CONTIG_CREATE");
     if (create_pattern_file(src_path, ASYNC_DIRECT_IOV_SIZE, test_file_pattern) != 0
         || create_pattern_file(out_path, TEST_PAGE_SIZE, test_file_pattern) != 0) {
         printf("USER_DIRECT_ASYNC_FAIL contig create errno=%d\n", errno);
@@ -1365,17 +1372,18 @@ static int test_async_direct_contig(void)
         goto fail;
     }
 
+    announce_async_stage("CONTIG_READ");
     fd = open_direct(src_path, O_RDONLY);
     if (fd < 0) {
         printf("USER_DIRECT_ASYNC_FAIL contig open_read errno=%d\n", errno);
         fflush(stdout);
         goto fail;
     }
-    read_base = read_io_counter("user_pin.async_direct_read_hits");
+    read_base = read_io_counter("user_pin.async_submit_fallbacks");
     errno = 0;
     n = pread(fd, read_buf, TEST_PAGE_SIZE, 0);
     saved_errno = errno;
-    read_after = read_io_counter("user_pin.async_direct_read_hits");
+    read_after = read_io_counter("user_pin.async_submit_fallbacks");
     close(fd);
     fd = -1;
     if (n != TEST_PAGE_SIZE
@@ -1389,6 +1397,7 @@ static int test_async_direct_contig(void)
     printf("USER_DIRECT_ASYNC_CONTIG_READ_OK\n");
     fflush(stdout);
 
+    announce_async_stage("CONTIG_WRITE");
     fill_pattern((unsigned char *)write_buf, TEST_PAGE_SIZE, sg_write_pattern);
     out_fd = open_direct(out_path, O_RDWR);
     if (out_fd < 0) {
@@ -1396,11 +1405,11 @@ static int test_async_direct_contig(void)
         fflush(stdout);
         goto fail;
     }
-    write_base = read_io_counter("user_pin.async_direct_write_hits");
+    write_base = read_io_counter("user_pin.async_submit_fallbacks");
     errno = 0;
     n = pwrite(out_fd, write_buf, TEST_PAGE_SIZE, 0);
     saved_errno = errno;
-    write_after = read_io_counter("user_pin.async_direct_write_hits");
+    write_after = read_io_counter("user_pin.async_submit_fallbacks");
     close(out_fd);
     out_fd = -1;
     if (n != TEST_PAGE_SIZE || write_after <= write_base
@@ -1483,11 +1492,11 @@ static int test_async_direct_iov(void)
         fflush(stdout);
         goto fail;
     }
-    read_base = read_io_counter("user_pin.async_direct_read_hits");
+    read_base = read_io_counter("user_pin.async_submit_fallbacks");
     errno = 0;
     n = preadv(fd, iov, ASYNC_DIRECT_IOV_SEGMENTS, 0);
     saved_errno = errno;
-    read_after = read_io_counter("user_pin.async_direct_read_hits");
+    read_after = read_io_counter("user_pin.async_submit_fallbacks");
     close(fd);
     fd = -1;
     if (n != ASYNC_DIRECT_IOV_SIZE
@@ -1510,11 +1519,11 @@ static int test_async_direct_iov(void)
         fflush(stdout);
         goto fail;
     }
-    write_base = read_io_counter("user_pin.async_direct_write_hits");
+    write_base = read_io_counter("user_pin.async_submit_fallbacks");
     errno = 0;
     n = pwritev(out_fd, iov, ASYNC_DIRECT_IOV_SEGMENTS, 0);
     saved_errno = errno;
-    write_after = read_io_counter("user_pin.async_direct_write_hits");
+    write_after = read_io_counter("user_pin.async_submit_fallbacks");
     close(out_fd);
     out_fd = -1;
     if (n != ASYNC_DIRECT_IOV_SIZE || write_after <= write_base
@@ -1589,6 +1598,8 @@ static int test_async_direct_file_mmap(void)
         fflush(stdout);
         goto fail;
     }
+    /* The 0.1 pin fast path admits resident, writable pages only. */
+    ((volatile unsigned char *)mapped)[0] = 0;
 
     fd = open_direct(src_path, O_RDONLY);
     if (fd < 0) {
@@ -1596,11 +1607,11 @@ static int test_async_direct_file_mmap(void)
         fflush(stdout);
         goto fail;
     }
-    read_base = read_io_counter("user_pin.async_direct_read_hits");
+    read_base = read_io_counter("user_pin.async_submit_fallbacks");
     errno = 0;
     n = pread(fd, mapped, TEST_PAGE_SIZE, 0);
     saved_errno = errno;
-    read_after = read_io_counter("user_pin.async_direct_read_hits");
+    read_after = read_io_counter("user_pin.async_submit_fallbacks");
     close(fd);
     fd = -1;
     if (n != TEST_PAGE_SIZE
@@ -1621,11 +1632,11 @@ static int test_async_direct_file_mmap(void)
         fflush(stdout);
         goto fail;
     }
-    write_base = read_io_counter("user_pin.async_direct_write_hits");
+    write_base = read_io_counter("user_pin.async_submit_fallbacks");
     errno = 0;
     n = pwrite(out_fd, mapped, TEST_PAGE_SIZE, 0);
     saved_errno = errno;
-    write_after = read_io_counter("user_pin.async_direct_write_hits");
+    write_after = read_io_counter("user_pin.async_submit_fallbacks");
     close(out_fd);
     out_fd = -1;
     if (n != TEST_PAGE_SIZE || write_after <= write_base
@@ -1896,6 +1907,7 @@ static int run_async_direct_tests(int include_signal_after_submit)
 {
     int ok = 1;
 
+    announce_async_stage("SETUP");
     if (write_io_stats_command("pin_delay_ms=0\n") != 0) {
         printf("USER_DIRECT_ASYNC_FAIL disable_delay errno=%d\n", errno);
         fflush(stdout);
@@ -1904,15 +1916,19 @@ static int run_async_direct_tests(int include_signal_after_submit)
     if (test_async_direct_contig() != 0) {
         ok = 0;
     }
+    announce_async_stage("IOV");
     if (test_async_direct_iov() != 0) {
         ok = 0;
     }
+    announce_async_stage("FILE_MMAP");
     if (test_async_direct_file_mmap() != 0) {
         ok = 0;
     }
+    announce_async_stage("UNALIGNED");
     if (test_async_direct_unaligned_fallback() != 0) {
         ok = 0;
     }
+    announce_async_stage("MANY_SEGMENTS");
     if (test_async_direct_many_segments_fallback() != 0) {
         ok = 0;
     }
@@ -1940,7 +1956,7 @@ int main(int argc, char **argv)
     int ok = 1;
 
     if (argc == 2 && strcmp(argv[1], "--async-direct") == 0) {
-        return run_async_direct_tests(1);
+        return run_async_direct_tests(0);
     }
     if (argc == 2 && strcmp(argv[1], "--async-direct-no-signal") == 0) {
         return run_async_direct_tests(0);

@@ -28,6 +28,11 @@ All published test paths are present but adapted to the maintained fork: `tests/
 - `aa610a0` skipped sparse COW leaf scans.
 - `a749c80` batched COW unmaps through page-table drain.
 - `b5f7a54` and `a4ec274` avoided invalid/redundant TLB work for inactive or freshly mapped tables.
+- The current MM integration makes multi-page map failure-atomic with a
+  fallible rollback journal, and validates/counts present leaves before one
+  exact fallible allocation and any destructive drain. A post-preflight commit
+  or rollback mismatch fails stop instead of returning a partially changed
+  page table.
 - Maintained delta: multi-architecture page-table traversal, drain, and TLB primitives with focused allocation tests.
 
 Commit IDs are navigation hints for the current rewritten history. The exact

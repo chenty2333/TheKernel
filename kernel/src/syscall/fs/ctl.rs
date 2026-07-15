@@ -1196,7 +1196,9 @@ fn do_fchmodat(
     let _metadata_writer_fallback = mounts::namespace_operation();
     let loc = resolve_metadata_target(dirfd, path, flags, source, &security)?;
     check_writable_mount(&loc)?;
-    executable::with_credential_metadata_unpinned(&loc, || {
+    let publishes_setid =
+        mode & (NodePermission::SET_UID | NodePermission::SET_GID).bits() as u32 != 0;
+    executable::with_setid_metadata_unpinned(&loc, publishes_setid, || {
         let policy = ChmodSetattrPolicy::new(&loc, mode, &security)?;
         if policy.metadata().node_type == NodeType::Symlink {
             return Err(LinuxError::EOPNOTSUPP.into());
@@ -2477,7 +2479,7 @@ mod tests {
     }
 
     #[test]
-    fn conservative_chown_killpriv_is_not_rolled_back_after_backend_failure() {
+    fn conservative_chown_privilege_cleanup_is_not_rolled_back_after_backend_failure() {
         let fs = crate::pseudofs::tmp::MemoryFs::new().unwrap();
         let mount = Mountpoint::new_root(&fs);
         let file = mount

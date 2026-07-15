@@ -115,17 +115,34 @@ impl IoVectorBuf {
             .ok_or(AxError::InvalidInput)
     }
 
-    pub fn is_aligned(&self, align: usize) -> AxResult<bool> {
+    /// Returns the longest leading byte count whose contributing iovecs all
+    /// satisfy `align`. Any aligned prefix no longer than this value is valid.
+    pub fn aligned_prefix_len(&self, align: usize) -> AxResult<usize> {
+        if align == 0 {
+            return Err(AxError::InvalidInput);
+        }
+
+        let mut remaining = self.len;
+        let mut aligned = 0usize;
         for iov in self.iovs.as_slice() {
-            let len = iov.iov_len as usize;
-            if len == 0 {
+            if remaining == 0 {
+                break;
+            }
+            let chunk = (iov.iov_len as usize).min(remaining);
+            if chunk == 0 {
                 continue;
             }
-            if !(iov.iov_base as usize).is_multiple_of(align) || !len.is_multiple_of(align) {
-                return Ok(false);
+            if !(iov.iov_base as usize).is_multiple_of(align) {
+                break;
             }
+            let aligned_chunk = chunk - chunk % align;
+            aligned += aligned_chunk;
+            if aligned_chunk != chunk {
+                break;
+            }
+            remaining -= chunk;
         }
-        Ok(true)
+        Ok(aligned)
     }
 
     pub fn check_readable(&self) -> AxResult<()> {
@@ -166,10 +183,6 @@ pub struct IoVectorBufIo {
 }
 
 impl IoVectorBufIo {
-    pub fn limit_remaining(&mut self, len: usize) {
-        self.inner.len = self.inner.len.min(len);
-    }
-
     fn skip_empty(&mut self) -> AxResult<()> {
         while self.start < self.inner.iovs.as_slice().len() {
             let iov = self.inner.iovs.as_slice()[self.start];
@@ -255,5 +268,75 @@ impl IoBuf for IoVectorBufIo {
 impl IoBufMut for IoVectorBufIo {
     fn remaining_mut(&self) -> usize {
         self.inner.len
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(align(512))]
+    struct Aligned([u8; 2048]);
+
+    fn imported_iov(entries: &[IoVec], len: usize) -> IoVectorBuf {
+        let mut imported = ImportedIoVecs::with_capacity(entries.len()).unwrap();
+        for entry in entries {
+            imported.push(*entry);
+        }
+        IoVectorBuf {
+            iovs: imported,
+            len,
+        }
+    }
+
+    #[test]
+    fn aligned_prefix_stops_before_a_bad_base_or_partial_sector() {
+        let storage = Aligned([0; 2048]);
+        let base = storage.0.as_ptr().cast_mut();
+
+        let bad_base = imported_iov(
+            &[
+                IoVec {
+                    iov_base: base,
+                    iov_len: 512,
+                },
+                IoVec {
+                    iov_base: base.wrapping_add(513),
+                    iov_len: 512,
+                },
+            ],
+            1024,
+        );
+        assert_eq!(bad_base.aligned_prefix_len(512), Ok(512));
+
+        let partial_sector = imported_iov(
+            &[
+                IoVec {
+                    iov_base: base,
+                    iov_len: 768,
+                },
+                IoVec {
+                    iov_base: base.wrapping_add(1024),
+                    iov_len: 512,
+                },
+            ],
+            1280,
+        );
+        assert_eq!(partial_sector.aligned_prefix_len(512), Ok(512));
+
+        let aligned = imported_iov(
+            &[
+                IoVec {
+                    iov_base: base,
+                    iov_len: 512,
+                },
+                IoVec {
+                    iov_base: base.wrapping_add(1024),
+                    iov_len: 512,
+                },
+            ],
+            1024,
+        );
+        assert_eq!(aligned.aligned_prefix_len(512), Ok(1024));
     }
 }

@@ -29,6 +29,13 @@ The published archive contains no `tests/` files, so there are no upstream test 
 - `af59bd2`, `94d35dd`, and `5017136` added tracked page-cache writeback, sync, coherence, clean-page LRU, and bounded budget work.
 - `887e9ce`, `a6899bb`, and `bbe3747` repaired truncate, mmap/COW, dirty-state, and reclamation interactions.
 - `f66f1ff`, `ba0a4aa`, and `d38fb1b` hardened mount ownership, pathname admission hooks, fallible allocation, and lifecycle boundaries.
+- The current MM integration binds deferrable cache-eviction acknowledgement to
+  one stable address-space owner, rolls back on foreign or incomplete
+  acknowledgement, and keeps address-space-owned page fills synchronous so no
+  lower async request is published while the caller owns its MM transaction.
+- The current ext4 adapter admits only complete single-request async scatters
+  and waits for accepted handles after releasing the lwext4 filesystem lock;
+  larger scatters fall back synchronously before any request is submitted.
 - Maintained delta: generic filesystem/page-cache mechanisms, tmpfs/disk adapters, coherence/writeback, resource accounting, and VFS integration.
 
 Commit IDs are navigation hints for the current rewritten history. The exact

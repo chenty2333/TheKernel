@@ -20,6 +20,8 @@ mod timer;
 mod user;
 
 // Re-exports from split sub-modules — keep the old `crate::task::*` paths unchanged.
+#[cfg(test)]
+pub(crate) use creds::CapabilityState;
 pub(crate) use thekernel_linux_cred::{
     CredError, FileCapabilities, ID_MAP_MAX_EXTENTS, IdMap, IdMapInputExtent, Kgid, Kuid,
     SECURITY_CAPABILITY_XATTR_NAME, SignalDeliveryScope, SignalNumber, SignalSecurityOperation,
@@ -34,9 +36,9 @@ pub(crate) use self::{
         check_current_ptrace_image_snapshot, check_current_thread_ptrace_image_access,
         check_current_zombie_signal_access, check_thread_ptrace_image_access_with_actor,
         may_begin_gid_map_write, may_begin_uid_map_write, may_update_setgroups_policy,
-        may_write_gid_map, may_write_uid_map, ns_capable,
+        may_write_gid_map, may_write_uid_map, ns_capable, ns_capable_for_setid,
     },
-    creds::{CapabilityState, Cred, CredentialSlot, Credentials, DacCredentialView},
+    creds::{Cred, CredentialSlot, Credentials, DacCredentialView},
     exec_cred::{
         CommittingExecCredential, ExecAuxIdentity, ExecCommitRuntime, ExecCredentialInput,
         ExecCredentialSecurityContext, ExecExecutableRole, ExecFileIdentity, ExecFileOwner,

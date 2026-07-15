@@ -5952,10 +5952,15 @@ pub(crate) fn rename_security_test_unprivileged_credential(
         sgid: gid,
         fsgid: gid,
     };
-    update.builder.caps.permitted = [0; super::creds::CAPABILITY_WORDS];
-    update.builder.caps.effective = [0; super::creds::CAPABILITY_WORDS];
-    update.builder.caps.inheritable = [0; super::creds::CAPABILITY_WORDS];
-    update.builder.caps.ambient = [0; super::creds::CAPABILITY_WORDS];
+    let caps = update.builder.caps;
+    update.builder.caps = super::creds::capability_state_for_test(
+        [0; super::creds::CAPABILITY_WORDS],
+        [0; super::creds::CAPABILITY_WORDS],
+        [0; super::creds::CAPABILITY_WORDS],
+        caps.bounding(),
+        [0; super::creds::CAPABILITY_WORDS],
+        caps.securebits(),
+    );
     update
         .finish()
         .expect("rename test unprivileged credential preparation failed")
@@ -6252,10 +6257,15 @@ pub(crate) fn named_create_security_test_unprivileged_credential(
         sgid: gid,
         fsgid: gid,
     };
-    update.builder.caps.permitted = [0; super::creds::CAPABILITY_WORDS];
-    update.builder.caps.effective = [0; super::creds::CAPABILITY_WORDS];
-    update.builder.caps.inheritable = [0; super::creds::CAPABILITY_WORDS];
-    update.builder.caps.ambient = [0; super::creds::CAPABILITY_WORDS];
+    let caps = update.builder.caps;
+    update.builder.caps = super::creds::capability_state_for_test(
+        [0; super::creds::CAPABILITY_WORDS],
+        [0; super::creds::CAPABILITY_WORDS],
+        [0; super::creds::CAPABILITY_WORDS],
+        caps.bounding(),
+        [0; super::creds::CAPABILITY_WORDS],
+        caps.securebits(),
+    );
     update
         .finish()
         .expect("named-create test unprivileged credential preparation failed")
@@ -6276,8 +6286,8 @@ mod tests {
     use axfs_ng_vfs::{MetadataUpdate, Mountpoint, NodePermission};
     use axhal::paging::PageSize;
     use linux_raw_sys::general::{
-        CAP_CHOWN, CAP_SETGID, CAP_SYS_ADMIN, CAP_SYS_NICE, CAP_SYS_PTRACE, MAP_ANONYMOUS,
-        MAP_PRIVATE,
+        CAP_CHOWN, CAP_SETGID, CAP_SETUID, CAP_SYS_ADMIN, CAP_SYS_NICE, CAP_SYS_PTRACE,
+        MAP_ANONYMOUS, MAP_PRIVATE,
     };
     use memory_addr::VirtAddrRange;
     use memory_set::MemoryArea;
@@ -6293,8 +6303,13 @@ mod tests {
         task::{
             CapabilityState, Cred, CredentialSlot, Credentials, ExecCommitRuntime,
             ExecFileIdentity, ExecImageIdentity, IdMapInputExtent, Kgid, Kuid,
-            creds::{CAPABILITY_WORDS, credential_publication_lock_held},
-            thread_cred::SetgroupsAdmission,
+            creds::{
+                CAPABILITY_WORDS, capability_state_for_test, credential_publication_lock_held,
+            },
+            thread_cred::{
+                SetgroupsAdmission, prepare_setfsgid_update, prepare_setfsuid_update,
+                prepare_user_id_update,
+            },
         },
     };
 
@@ -8314,10 +8329,15 @@ mod tests {
     fn credential_with_caps(base: &Arc<Cred>, permitted: &[u32], effective: &[u32]) -> Arc<Cred> {
         let slot = CredentialSlot::new(base.clone());
         let mut update = slot.prepare();
-        update.builder.caps.permitted = capability_set(permitted);
-        update.builder.caps.effective = capability_set(effective);
-        update.builder.caps.inheritable = [0; CAPABILITY_WORDS];
-        update.builder.caps.ambient = [0; CAPABILITY_WORDS];
+        let caps = update.builder.caps;
+        update.builder.caps = capability_state_for_test(
+            capability_set(effective),
+            capability_set(permitted),
+            [0; CAPABILITY_WORDS],
+            caps.bounding(),
+            [0; CAPABILITY_WORDS],
+            caps.securebits(),
+        );
         update.finish().unwrap().commit()
     }
 
@@ -8341,10 +8361,15 @@ mod tests {
             sgid: gid,
             fsgid: gid,
         };
-        update.builder.caps.permitted = capability_set(permitted);
-        update.builder.caps.effective = capability_set(effective);
-        update.builder.caps.inheritable = [0; CAPABILITY_WORDS];
-        update.builder.caps.ambient = [0; CAPABILITY_WORDS];
+        let caps = update.builder.caps;
+        update.builder.caps = capability_state_for_test(
+            capability_set(effective),
+            capability_set(permitted),
+            [0; CAPABILITY_WORDS],
+            caps.bounding(),
+            [0; CAPABILITY_WORDS],
+            caps.securebits(),
+        );
         update.finish().unwrap().commit()
     }
 
@@ -11304,8 +11329,15 @@ mod tests {
         );
 
         let mut actor_update = actor_slot.prepare();
-        actor_update.builder.caps.permitted = capability_set(&[CAP_SYS_NICE]);
-        actor_update.builder.caps.effective = capability_set(&[CAP_SYS_NICE]);
+        let caps = actor_update.builder.caps;
+        actor_update.builder.caps = capability_state_for_test(
+            capability_set(&[CAP_SYS_NICE]),
+            capability_set(&[CAP_SYS_NICE]),
+            caps.inheritable(),
+            caps.bounding(),
+            caps.ambient(),
+            caps.securebits(),
+        );
         actor_update.finish().unwrap().commit();
 
         let mut target_update = target_slot.prepare();
@@ -12113,9 +12145,15 @@ mod tests {
         CRED_STATE_CAPABLE_DENY_KEY.store(0, Ordering::SeqCst);
         let slot = CredentialSlot::new(actor.clone());
         let mut update = slot.prepare();
-        update.builder.caps.effective = [0; CAPABILITY_WORDS];
-        update.builder.caps.permitted = [0; CAPABILITY_WORDS];
-        update.builder.caps.clear_ambient();
+        let caps = update.builder.caps;
+        update.builder.caps = capability_state_for_test(
+            [0; CAPABILITY_WORDS],
+            [0; CAPABILITY_WORDS],
+            caps.inheritable(),
+            caps.bounding(),
+            [0; CAPABILITY_WORDS],
+            caps.securebits(),
+        );
         let restricted = update.finish().unwrap().commit();
 
         CRED_STATE_CAPABLE_TRACE.store(0, Ordering::SeqCst);
@@ -12139,6 +12177,56 @@ mod tests {
             Err(AxError::InvalidInput)
         );
         assert_eq!(CRED_STATE_CAPABLE_TRACE.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn setid_planner_honors_typed_capability_hook_denial_without_publication() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root_with_registry(registry, namespace).unwrap();
+        let slot = CredentialSlot::new(actor);
+        let before = slot.current();
+
+        CRED_STATE_CAPABLE_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_CAPABLE_OPERATION.store(0, Ordering::SeqCst);
+        CRED_STATE_CAPABLE_NUMBER.store(0, Ordering::SeqCst);
+        CRED_STATE_CAPABLE_DENY_KEY.store(2, Ordering::SeqCst);
+        let error = prepare_user_id_update(
+            &slot,
+            thekernel_linux_cred::UserIdTransitionInput::setuid(Kuid::from_raw(1000).unwrap()),
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(error, AxError::OperationNotPermitted);
+        assert_eq!(CRED_STATE_CAPABLE_TRACE.load(Ordering::SeqCst), 2);
+        assert_eq!(CRED_STATE_CAPABLE_OPERATION.load(Ordering::SeqCst), 1 << 2);
+        assert_eq!(CRED_STATE_CAPABLE_NUMBER.load(Ordering::SeqCst), CAP_SETUID);
+        assert!(Arc::ptr_eq(&before, &slot.current()));
+    }
+
+    #[test]
+    fn setfsid_prepare_and_security_failures_return_old_without_publication() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root_with_registry(registry, namespace).unwrap();
+        let slot = CredentialSlot::new(actor);
+        let before = slot.current();
+
+        CRED_STATE_FAIL_PREPARE_KEY.store(2, Ordering::SeqCst);
+        let (old_fsuid, uid_update) = prepare_setfsuid_update(&slot, Kuid::from_raw(1000).unwrap());
+        assert_eq!(old_fsuid, Kuid::INITIAL_ROOT);
+        assert!(uid_update.is_none());
+        assert!(Arc::ptr_eq(&before, &slot.current()));
+
+        CRED_STATE_FAIL_PREPARE_KEY.store(0, Ordering::SeqCst);
+        CRED_STATE_DENY_KEY.store(2, Ordering::SeqCst);
+        let (old_fsgid, gid_update) = prepare_setfsgid_update(&slot, Kgid::from_raw(100).unwrap());
+        assert_eq!(old_fsgid, Kgid::INITIAL_ROOT);
+        assert!(gid_update.is_none());
+        assert!(Arc::ptr_eq(&before, &slot.current()));
     }
 
     #[test]
@@ -12925,8 +13013,17 @@ mod tests {
             Kgid::from_raw(200).unwrap(),
         ])
         .unwrap();
-        update.builder.caps.inheritable[0] = 1;
-        update.builder.caps.securebits |= thekernel_linux_cred::SECBIT_KEEP_CAPS;
+        let caps = update.builder.caps;
+        let mut inheritable = caps.inheritable();
+        inheritable[0] = 1;
+        update.builder.caps = capability_state_for_test(
+            caps.effective(),
+            caps.permitted(),
+            inheritable,
+            caps.bounding(),
+            caps.ambient(),
+            caps.securebits() | thekernel_linux_cred::SECBIT_KEEP_CAPS,
+        );
         update.builder.no_new_privs = true;
 
         let prepared = update.finish().unwrap();

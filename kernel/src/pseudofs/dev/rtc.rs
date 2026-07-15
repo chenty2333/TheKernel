@@ -62,6 +62,10 @@ impl DeviceOps for Rtc {
     }
 
     fn flags(&self) -> NodeFlags {
-        NodeFlags::NON_CACHEABLE | NodeFlags::STREAM
+        NodeFlags::NON_CACHEABLE
+            | NodeFlags::STREAM
+            | NodeFlags::NO_POSITIONED_READ
+            | NodeFlags::NO_POSITIONED_WRITE
+            | NodeFlags::NO_SEEK
     }
 }

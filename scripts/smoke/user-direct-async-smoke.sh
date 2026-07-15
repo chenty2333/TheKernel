@@ -22,10 +22,9 @@ Usage: $(basename "$0") [--arch {rv|la}] [--workdir DIR] [--rootfs IMG]
                          [--timeout SECS] [--boot-wait SECS] [--line-delay SECS]
                          [--wait-policy {hybrid|irq_first}] [--build-kernel]
 
-Runs a targeted user-direct async I/O smoke. The smoke enables the async block
-queue plus user_direct_async, then runs the thekernel-io-pin-safety --async-direct
-guest tool to cover aligned pinned read/write, readv/writev, fallback cases,
-and advisory signal-after-submit accounting in irq-first mode.
+Runs a targeted user-direct I/O safety smoke with the async block queue enabled.
+Pinned user ranges must use the synchronous kernel-bounce fallback, while the
+independent lwext4 mapped-read path still exercises the async block queue.
 
 EOF
 }
@@ -137,11 +136,7 @@ echo USER_DIRECT_ASYNC_SMOKE_DONE
 exit
 EOF
 sed -i "s/__WAIT_POLICY__/$WAIT_POLICY/g" "$COMMANDS_FILE"
-if [ "$WAIT_POLICY" = irq_first ]; then
-    sed -i "s/__ASYNC_DIRECT_ARG__/--async-direct/g" "$COMMANDS_FILE"
-else
-    sed -i "s/__ASYNC_DIRECT_ARG__/--async-direct-no-signal/g" "$COMMANDS_FILE"
-fi
+sed -i "s/__ASYNC_DIRECT_ARG__/--async-direct-no-signal/g" "$COMMANDS_FILE"
 
 readarray -d '' -t kernel_args < <(smoke_runner_artifact_args "$ARCH" "$SKIP_KERNEL_BUILD")
 (
@@ -178,13 +173,8 @@ for marker in \
 do
     grep -Eq "^${marker}([[:space:]].*)?$" "$LOG" || die "missing marker: $marker"
 done
-if [ "$WAIT_POLICY" = irq_first ]; then
-    grep -Eq '^USER_DIRECT_ASYNC_SIGNAL_AFTER_SUBMIT_(OK|MISSED)([[:space:]].*)?$' "$LOG" \
-        || die "missing signal-after-submit advisory marker"
-else
-    grep -Eq '^USER_DIRECT_ASYNC_SIGNAL_AFTER_SUBMIT_SKIPPED([[:space:]].*)?$' "$LOG" \
-        || die "missing marker: USER_DIRECT_ASYNC_SIGNAL_AFTER_SUBMIT_SKIPPED"
-fi
+grep -Eq '^USER_DIRECT_ASYNC_SIGNAL_AFTER_SUBMIT_SKIPPED([[:space:]].*)?$' "$LOG" \
+    || die "missing marker: USER_DIRECT_ASYNC_SIGNAL_AFTER_SUBMIT_SKIPPED"
 
 if grep -Eq '^[[:space:]]*(USER_DIRECT_ASYNC_FAIL|USER_DIRECT_ASYNC_TOOL_FAIL)([[:space:]].*)?$|Kernel panic|panic|BUG:' "$LOG"; then
     die "failure marker or panic found in $LOG"
@@ -220,14 +210,14 @@ assert_counter_eq_zero() {
 
 printf 'user-direct-async-smoke: markers OK\n'
 assert_counter_ge user_pin.async_direct_enabled 1
-assert_counter_ge user_pin.async_direct_read_hits 2
-assert_counter_ge user_pin.async_direct_read_bytes 36864
-assert_counter_ge user_pin.async_direct_read_segments 9
-assert_counter_ge user_pin.async_direct_write_hits 2
-assert_counter_ge user_pin.async_direct_write_bytes 36864
-assert_counter_ge user_pin.async_direct_write_segments 9
-assert_counter_ge user_pin.async_submit_fallbacks 2
-assert_counter_ge user_pin.async_resource_unpins 4
+assert_counter_eq_zero user_pin.async_direct_read_hits
+assert_counter_eq_zero user_pin.async_direct_read_bytes
+assert_counter_eq_zero user_pin.async_direct_read_segments
+assert_counter_eq_zero user_pin.async_direct_write_hits
+assert_counter_eq_zero user_pin.async_direct_write_bytes
+assert_counter_eq_zero user_pin.async_direct_write_segments
+assert_counter_ge user_pin.async_submit_fallbacks 8
+assert_counter_eq_zero user_pin.async_resource_unpins
 assert_counter_ge user_pin.direct_read_hits 2
 assert_counter_ge user_pin.direct_write_hits 2
 assert_counter_ge user_pin.page_cache_pin_hits 1
@@ -243,11 +233,7 @@ assert_counter_ge ext4.async_mapped_read_bytes 4096
 assert_counter_ge ext4.async_mapped_read_submit_batches 1
 assert_counter_ge ext4.mapped_read_vectored_runs 1
 assert_counter_eq_zero ext4.async_mapped_read_cookie_rejects
-if [ "$ARCH" = rv ]; then
-    assert_counter_ge virtio.blk_async_max_depth 2
-else
-    assert_counter_ge virtio.blk_async_max_depth 1
-fi
+assert_counter_ge virtio.blk_async_max_depth 1
 if [ "$WAIT_POLICY" = irq_first ]; then
     assert_counter_eq virtio.blk_async_wait_policy 2
     assert_counter_ge virtio.blk_async_irq_first_arms 1

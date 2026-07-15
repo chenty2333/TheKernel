@@ -3205,6 +3205,7 @@ dependencies = [
  "thekernel-axtask",
  "thekernel-linux-cred",
  "thekernel-linux-fd",
+ "thekernel-linux-mm",
  "thekernel-linux-process-adapter",
  "thekernel-linux-vfs",
  "thekernel-readiness-adapter",
@@ -3224,6 +3225,10 @@ dependencies = [
 
 [[package]]
 name = "thekernel-linux-fd"
+version = "0.1.0"
+
+[[package]]
+name = "thekernel-linux-mm"
 version = "0.1.0"
 
 [[package]]

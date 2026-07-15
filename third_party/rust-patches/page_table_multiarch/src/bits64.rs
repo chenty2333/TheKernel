@@ -91,7 +91,17 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
             return Err(PagingError::NotAligned);
         }
 
+        let leaf_count = self.validate_and_count_present_leaves_recursive(
+            self.table_of(self.root_paddr()),
+            0,
+            0,
+            start_usize,
+            end_usize,
+        )?;
         let mut leaves = Vec::new();
+        leaves
+            .try_reserve_exact(leaf_count)
+            .map_err(|_| PagingError::NoMemory)?;
         self.collect_present_leaves_recursive(
             self.table_of(self.root_paddr()),
             0,
@@ -100,6 +110,7 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
             end_usize,
             &mut leaves,
         )?;
+        debug_assert_eq!(leaves.len(), leaf_count);
         Ok(leaves)
     }
 
@@ -374,22 +385,27 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
                 return Err(PagingError::NotAligned);
             }
 
+            assert!(
+                out.len() < out.capacity(),
+                "preallocated present-leaf buffer exhausted"
+            );
             out.push((entry_start.into(), entry.paddr(), entry.flags(), page_size));
         }
 
         Ok(())
     }
 
-    fn validate_drain_range_recursive(
+    fn validate_and_count_present_leaves_recursive(
         &self,
         table: &[PTE],
         level: usize,
         table_start: usize,
         range_start: usize,
         range_end: usize,
-    ) -> PagingResult {
+    ) -> PagingResult<usize> {
         let shift = 12 + (M::LEVELS - 1 - level) * 9;
         let span = 1usize << shift;
+        let mut count = 0usize;
 
         for (index, entry) in table.iter().enumerate() {
             let is_leaf = level == M::LEVELS - 1 || entry.is_huge();
@@ -409,20 +425,24 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
                 if range_start > entry_start || range_end < entry_end {
                     return Err(PagingError::NotAligned);
                 }
+                count = count.checked_add(1).ok_or(PagingError::NoMemory)?;
                 continue;
             }
 
             let child = self.next_table(entry)?;
-            self.validate_drain_range_recursive(
+            let child_count = self.validate_and_count_present_leaves_recursive(
                 child,
                 level + 1,
                 entry_start,
                 range_start,
                 range_end,
             )?;
+            count = count
+                .checked_add(child_count)
+                .ok_or(PagingError::NoMemory)?;
         }
 
-        Ok(())
+        Ok(count)
     }
 
     fn dealloc_tree(&self, table_paddr: PhysAddr, level: usize) {
@@ -505,6 +525,23 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
         }
     }
 
+    fn rollback_region_mappings(
+        &mut self,
+        mappings: &[(M::VirtAddr, PhysAddr, MappingFlags, PageSize)],
+    ) {
+        for &(vaddr, expected_paddr, expected_flags, expected_page_size) in mappings.iter().rev() {
+            let vaddr_usize: usize = vaddr.into();
+            let removed = self.unmap(vaddr).unwrap_or_else(|error| {
+                panic!("map_region rollback failed at {vaddr_usize:#x}: {error:?}")
+            });
+            assert_eq!(
+                removed,
+                (expected_paddr, expected_flags, expected_page_size),
+                "map_region rollback mismatch at {vaddr_usize:#x}"
+            );
+        }
+    }
+
     fn drain_present_leaves_recursive(
         &mut self,
         table_paddr: PhysAddr,
@@ -550,6 +587,10 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
                             x if x == PageSize::Size1M as usize => PageSize::Size1M,
                             _ => return Err(PagingError::NotAligned),
                         };
+                        assert!(
+                            out.len() < out.capacity(),
+                            "preallocated drain journal exhausted"
+                        );
                         let leaf = DrainStep::Leaf(entry.paddr(), entry.flags(), page_size);
                         entry.clear();
                         leaf
@@ -683,6 +724,8 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
     ///
     /// When `allow_huge` is true, it will try to map the region with huge pages
     /// if possible. Otherwise, it will map the region with 4K pages.
+    /// If any mapping or journal allocation fails, mappings created by this
+    /// call are removed before the error is returned.
     ///
     /// [`Err(PagingError::NotAligned)`]: PagingError::NotAligned
     pub fn map_region(
@@ -705,7 +748,13 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
             vaddr_usize + size,
             flags,
         );
+        let mut mapped = Vec::new();
         while size > 0 {
+            if mapped.try_reserve(1).is_err() {
+                self.rollback_region_mappings(&mapped);
+                return Err(PagingError::NoMemory);
+            }
+
             let vaddr = vaddr_usize.into();
             let paddr = get_paddr(vaddr);
             let page_size = if allow_huge {
@@ -725,9 +774,17 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
             } else {
                 PageSize::Size4K
             };
-            self.map(vaddr, paddr, page_size, flags).inspect_err(|e| {
-                error!("failed to map page: {vaddr_usize:#x?}({page_size:?}) -> {paddr:#x?}, {e:?}")
-            })?;
+            let represented =
+                PTE::new_page(paddr.align_down(page_size), flags, page_size.is_huge());
+            if let Err(error) = self.map(vaddr, paddr, page_size, flags) {
+                error!(
+                    "failed to map page: {vaddr_usize:#x?}({page_size:?}) -> {paddr:#x?}, \
+                     {error:?}"
+                );
+                self.rollback_region_mappings(&mapped);
+                return Err(error);
+            }
+            mapped.push((vaddr, represented.paddr(), represented.flags(), page_size));
 
             vaddr_usize += page_size as usize;
             size -= page_size as usize;
@@ -782,19 +839,31 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
             return Err(PagingError::NotAligned);
         }
 
-        let root = self.inner.table_of(self.inner.root_paddr());
-        self.inner
-            .validate_drain_range_recursive(root, 0, 0, start_usize, end_usize)?;
-
+        let leaf_count = {
+            let root = self.inner.table_of(self.inner.root_paddr());
+            self.inner.validate_and_count_present_leaves_recursive(
+                root,
+                0,
+                0,
+                start_usize,
+                end_usize,
+            )?
+        };
         let mut leaves = Vec::new();
-        self.drain_present_leaves_recursive(
+        leaves
+            .try_reserve_exact(leaf_count)
+            .map_err(|_| PagingError::NoMemory)?;
+        if let Err(error) = self.drain_present_leaves_recursive(
             self.inner.root_paddr(),
             0,
             0,
             start_usize,
             end_usize,
             &mut leaves,
-        )?;
+        ) {
+            panic!("validated present-leaf drain failed: {error:?}");
+        }
+        debug_assert_eq!(leaves.len(), leaf_count);
         Ok(leaves)
     }
 

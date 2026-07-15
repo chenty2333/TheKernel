@@ -304,10 +304,8 @@ assert_counter_eq_zero cached.readahead_hits
 assert_counter_eq_zero cached.readahead_retired_unused_pages
 assert_counter_gt_zero ext4.mapped_read_runs
 assert_counter_gt_zero ext4.mapped_overwrite_hits
-assert_counter_gt_zero ext4.mapped_read_vectored_runs
-assert_counter_gt_zero ext4.mapped_read_vectored_bytes
-assert_counter_gt_zero ext4.mapped_overwrite_vectored_hits
-assert_counter_gt_zero ext4.mapped_overwrite_vectored_bytes
+# Pinned bypass deliberately uses kernel-owned bounce storage and scalar lower
+# I/O. Dedicated async smokes cover the mapped vectored read/write paths.
 assert_counter_eq_zero ext4.async_mapped_read_enabled
 assert_counter_gt_zero user_pin.to_user_hits
 assert_counter_gt_zero user_pin.from_user_hits

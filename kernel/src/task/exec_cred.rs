@@ -442,7 +442,7 @@ mod tests {
     use super::*;
     use crate::task::{
         CredentialSlot, Credentials, Kgid, Kuid,
-        creds::CapabilityState,
+        creds::capability_state_for_test,
         security::{commoncap_post_commit_probe, reset_commoncap_post_commit_probe},
     };
 
@@ -464,14 +464,14 @@ mod tests {
             fsgid: gid,
         };
         update.builder.groups = GroupInfo::try_new(vec![gid]).unwrap();
-        update.builder.caps = CapabilityState {
-            effective: [0; CAPABILITY_WORDS],
-            permitted: [0; CAPABILITY_WORDS],
-            inheritable: [0; CAPABILITY_WORDS],
-            bounding: thekernel_linux_cred::CAPABILITY_VALID_MASK,
-            ambient: [0; CAPABILITY_WORDS],
-            securebits: 0,
-        };
+        update.builder.caps = capability_state_for_test(
+            [0; CAPABILITY_WORDS],
+            [0; CAPABILITY_WORDS],
+            [0; CAPABILITY_WORDS],
+            thekernel_linux_cred::CAPABILITY_VALID_MASK,
+            [0; CAPABILITY_WORDS],
+            0,
+        );
         update.finish().unwrap().commit();
         slot
     }

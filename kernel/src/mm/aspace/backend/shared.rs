@@ -1,13 +1,13 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use axerrno::{AxError, AxResult};
-use axhal::paging::{MappingFlags, PageSize, PageTableCursor, PagingError};
+use axhal::paging::{MappingFlags, PageSize, PageTable, PageTableCursor, PagingError};
 use axsync::Mutex;
 use memory_addr::{PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, MappingStatus, PopulateCallback, alloc_frame, dealloc_frame,
-    divide_page, page_table_flags, pages_in,
+    AddrSpace, Backend, BackendOps, MappingStatus, PopulateOutcome, alloc_frame, dealloc_frame,
+    divide_page, page_table_flags, pages_in, preflight_sparse_unmap,
 };
 
 pub struct SharedPages {
@@ -290,13 +290,14 @@ impl BackendOps for SharedBackend {
         Ok(())
     }
 
-    fn on_protect(
+    fn preflight_protect(
         &self,
-        _range: VirtAddrRange,
+        range: VirtAddrRange,
         new_flags: MappingFlags,
-        _pt: &mut PageTableCursor,
+        pt: &PageTable,
     ) -> AxResult {
-        self.check_protect_flags(new_flags)
+        self.check_protect_flags(new_flags)?;
+        preflight_sparse_unmap(range, self.pages.size, pt)
     }
 
     fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult {
@@ -310,50 +311,55 @@ impl BackendOps for SharedBackend {
         Ok(())
     }
 
+    fn preflight_unmap(&self, range: VirtAddrRange, pt: &PageTable) -> AxResult {
+        preflight_sparse_unmap(range, self.pages.size, pt)
+    }
+
     fn populate(
         &self,
         range: VirtAddrRange,
         flags: MappingFlags,
         access_flags: MappingFlags,
         pt: &mut PageTableCursor,
-    ) -> AxResult<(usize, Option<PopulateCallback>)> {
-        let offset = range
-            .start
-            .as_usize()
-            .checked_sub(self.start.as_usize())
-            .ok_or(AxError::InvalidInput)?;
-        let start_index = self
-            .page_offset
-            .checked_add(divide_page(offset, self.pages.size)?)
-            .ok_or(AxError::InvalidInput)?;
-        let count = divide_page(range.size(), self.pages.size)?;
-        let pages = self.pages.pages_range(start_index, count)?;
-        let mut populated = 0;
+    ) -> PopulateOutcome {
+        PopulateOutcome::immediate((|| {
+            let offset = range
+                .start
+                .as_usize()
+                .checked_sub(self.start.as_usize())
+                .ok_or(AxError::InvalidInput)?;
+            let start_index = self
+                .page_offset
+                .checked_add(divide_page(offset, self.pages.size)?)
+                .ok_or(AxError::InvalidInput)?;
+            let count = divide_page(range.size(), self.pages.size)?;
+            let pages = self.pages.pages_range(start_index, count)?;
+            let mut populated = 0;
 
-        for (vaddr, paddr) in pages_in(range, self.pages.size)?.zip(pages.into_iter()) {
-            match pt.query(vaddr) {
-                Ok((mapped_paddr, page_flags, page_size)) => {
-                    if page_size != self.pages.size || mapped_paddr != paddr {
-                        return Err(AxError::BadAddress);
+            for (vaddr, paddr) in pages_in(range, self.pages.size)?.zip(pages.into_iter()) {
+                match pt.query(vaddr) {
+                    Ok((mapped_paddr, page_flags, page_size)) => {
+                        if page_size != self.pages.size || mapped_paddr != paddr {
+                            return Err(AxError::BadAddress);
+                        }
+                        if access_flags.contains(MappingFlags::WRITE)
+                            && !page_flags.contains(MappingFlags::WRITE)
+                        {
+                            pt.remap(vaddr, paddr, page_table_flags(flags))?;
+                            populated += 1;
+                        } else if page_flags.contains(access_flags) {
+                            populated += 1;
+                        }
                     }
-                    if access_flags.contains(MappingFlags::WRITE)
-                        && !page_flags.contains(MappingFlags::WRITE)
-                    {
-                        pt.remap(vaddr, paddr, page_table_flags(flags))?;
-                        populated += 1;
-                    } else if page_flags.contains(access_flags) {
+                    Err(PagingError::NotMapped) => {
+                        pt.map(vaddr, paddr, self.pages.size, page_table_flags(flags))?;
                         populated += 1;
                     }
+                    Err(_) => return Err(AxError::BadAddress),
                 }
-                Err(PagingError::NotMapped) => {
-                    pt.map(vaddr, paddr, self.pages.size, page_table_flags(flags))?;
-                    populated += 1;
-                }
-                Err(_) => return Err(AxError::BadAddress),
             }
-        }
-
-        Ok((populated, None))
+            Ok(populated)
+        })())
     }
 
     fn clone_map(
