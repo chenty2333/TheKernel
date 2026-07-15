@@ -1079,6 +1079,7 @@ pub(super) fn dispatch_syscall(sysno: Sysno, uctx: &mut UserContext) -> AxResult
             uctx.arg2() as _,
             uctx.arg3() as _,
             uctx.arg4() as _,
+            uctx.arg5() as _,
         ),
         Sysno::io_uring_register => sys_io_uring_register(
             uctx.arg0() as _,

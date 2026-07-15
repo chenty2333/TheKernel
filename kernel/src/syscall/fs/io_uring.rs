@@ -19,6 +19,7 @@ pub fn sys_io_uring_enter(
     _min_complete: u32,
     _flags: u32,
     _sig: usize,
+    _argsz: usize,
 ) -> AxResult<isize> {
     Err(LinuxError::ENOSYS.into())
 }
