@@ -34,7 +34,7 @@ use super::{
     flock,
     fs::File,
     lease,
-    types::{FileLike, IoDst, IoSrc, Kstat},
+    types::{FileLike, FileMmapRequest, IoDst, IoSrc, Kstat, PreparedFileMmap},
 };
 use crate::{
     deferred_work::DeferredWorkAccount,
@@ -56,6 +56,8 @@ static DESCRIPTION_CLEANUP_INCOMING: AtomicPtr<DescriptionCleanupWork> =
     AtomicPtr::new(ptr::null_mut());
 static DESCRIPTION_CLEANUP_PENDING: AtomicPtr<DescriptionCleanupWork> =
     AtomicPtr::new(ptr::null_mut());
+static DEFERRED_FILE_LEASES: AtomicPtr<DeferredFileLeaseInner> = AtomicPtr::new(ptr::null_mut());
+static DEFERRED_FILE_LEASE_CREDITS: AtomicUsize = AtomicUsize::new(0);
 static DESCRIPTION_CLEANUP_DRAINING: AtomicBool = AtomicBool::new(false);
 static DESCRIPTION_CLEANUP_CREDITS: AtomicUsize = AtomicUsize::new(0);
 
@@ -63,11 +65,179 @@ const FLOCK_RELEASE_BUDGET: usize = 16;
 const RECORD_LOCK_RELEASE_BUDGET: usize = 16;
 const MAX_LIVE_DESCRIPTION_CLEANUPS: usize = 65_536;
 const DESCRIPTION_CLOSE_WAITER_SLOTS: usize = 64;
+const MAX_LIVE_DEFERRED_FILE_LEASES: usize = 65_536;
 
 /// A fallibly allocated resource whose lifetime is exactly one open file
 /// description. Subsystems use this for state which must survive `dup` but be
 /// released on the final OFD close.
 pub(crate) type DescriptionResource = Box<dyn Any + Send + Sync>;
+
+/// Preallocated ownership retained by a mapping after fd close or reuse.
+///
+/// VMA split/fork operations clone this intrusive reference without allocating.
+/// The final release only publishes the node; the exact FileHandle, retained
+/// backing, and node allocation are destroyed by the policy worker.
+struct DeferredFileLeaseInner {
+    next: AtomicPtr<Self>,
+    references: AtomicUsize,
+    handle: FileHandle<dyn FileLike>,
+    retained: Arc<dyn Any + Send + Sync>,
+    _credit: DeferredFileLeaseCredit,
+}
+
+struct DeferredFileLeaseCredit;
+
+impl Drop for DeferredFileLeaseCredit {
+    fn drop(&mut self) {
+        DEFERRED_FILE_LEASE_CREDITS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) struct DeferredFileLease {
+    inner: ptr::NonNull<DeferredFileLeaseInner>,
+}
+
+// The allocation is immutable after construction except for its atomic
+// reference count and publication link. The retained values are Send + Sync.
+unsafe impl Send for DeferredFileLease {}
+unsafe impl Sync for DeferredFileLease {}
+
+impl DeferredFileLease {
+    pub(crate) fn try_new(
+        handle: FileHandle<dyn FileLike>,
+        retained: Arc<dyn Any + Send + Sync>,
+    ) -> AxResult<Self> {
+        DEFERRED_FILE_LEASE_CREDITS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                (live < MAX_LIVE_DEFERRED_FILE_LEASES).then_some(live + 1)
+            })
+            .map_err(|_| AxError::NoMemory)?;
+        let inner = Box::try_new(DeferredFileLeaseInner {
+            next: AtomicPtr::new(ptr::null_mut()),
+            references: AtomicUsize::new(1),
+            handle,
+            retained,
+            _credit: DeferredFileLeaseCredit,
+        })
+        .map_err(|_| AxError::NoMemory)?;
+        Ok(Self {
+            inner: ptr::NonNull::from(Box::leak(inner)),
+        })
+    }
+
+    pub(crate) fn identity(&self) -> usize {
+        self.inner.as_ptr() as usize
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_reference_counts(&self) -> (usize, usize) {
+        // SAFETY: a live lease owns one reference to this immutable node.
+        let inner = unsafe { self.inner.as_ref() };
+        (
+            Arc::strong_count(&inner.handle.description),
+            Arc::strong_count(&inner.retained),
+        )
+    }
+}
+
+impl Clone for DeferredFileLease {
+    fn clone(&self) -> Self {
+        // SAFETY: this live lease prevents the node from reaching zero while
+        // the increment is performed.
+        let inner = unsafe { self.inner.as_ref() };
+        retain_deferred_file_lease(&inner.references);
+        Self { inner: self.inner }
+    }
+}
+
+impl Drop for DeferredFileLease {
+    fn drop(&mut self) {
+        // SAFETY: every clone owns exactly one counted reference.
+        let inner = unsafe { self.inner.as_ref() };
+        if !release_deferred_file_lease(&inner.references) {
+            return;
+        }
+
+        let node = self.inner.as_ptr();
+        let mut head = DEFERRED_FILE_LEASES.load(Ordering::Acquire);
+        loop {
+            // SAFETY: the final reference owns the unpublished node until the
+            // successful release-store below.
+            unsafe { (*node).next.store(head, Ordering::Relaxed) };
+            match DEFERRED_FILE_LEASES.compare_exchange_weak(
+                head,
+                node,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => head = observed,
+            }
+        }
+    }
+}
+
+fn retain_deferred_file_lease(references: &AtomicUsize) {
+    let mut current = references.load(Ordering::Relaxed);
+    loop {
+        if current == usize::MAX {
+            return;
+        }
+        // User-reachable clones are bounded by live VMA/backend values in one
+        // addressable machine. If internal code leaks clones and nevertheless
+        // reaches the sentinel, leaking the node is safer than a
+        // user-triggerable panic or premature free.
+        let next = current.checked_add(1).unwrap_or(usize::MAX);
+        match references.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn release_deferred_file_lease(references: &AtomicUsize) -> bool {
+    let mut current = references.load(Ordering::Acquire);
+    loop {
+        if current == usize::MAX || current == 0 {
+            return false;
+        }
+        match references.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return current == 1,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn pop_deferred_file_lease() -> Option<Box<DeferredFileLeaseInner>> {
+    let mut head = DEFERRED_FILE_LEASES.load(Ordering::Acquire);
+    loop {
+        if head.is_null() {
+            return None;
+        }
+        // SAFETY: published nodes remain allocated until the only consumer
+        // removes one successfully.
+        let next = unsafe { (*head).next.load(Ordering::Relaxed) };
+        match DEFERRED_FILE_LEASES.compare_exchange_weak(
+            head,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // SAFETY: successful removal transfers unique ownership back
+                // to this task-context consumer.
+                return Some(unsafe { Box::from_raw(head) });
+            }
+            Err(observed) => head = observed,
+        }
+    }
+}
 
 /// Preallocated final-OFD policy work.  The final Arc drop only publishes this
 /// intrusive node; lock-table scans, destructors, and waiter callbacks run in
@@ -236,6 +406,7 @@ pub(crate) fn has_deferred_description_cleanup_work() -> bool {
         || !DESCRIPTION_CLEANUP_PENDING
             .load(Ordering::Acquire)
             .is_null()
+        || !DEFERRED_FILE_LEASES.load(Ordering::Acquire).is_null()
 }
 
 /// Runs one bounded final-OFD cleanup batch.  An unfinished node is
@@ -245,18 +416,18 @@ pub(crate) fn drain_deferred_description_cleanup() {
     let Some(_guard) = DescriptionCleanupDrainGuard::try_enter() else {
         return;
     };
-    let Some(mut work) = pop_description_cleanup() else {
-        return;
-    };
-    if work.run_batch() {
-        if let Some(account) = work.account.take() {
-            account.complete();
+    if let Some(mut work) = pop_description_cleanup() {
+        if work.run_batch() {
+            if let Some(account) = work.account.take() {
+                account.complete();
+            }
+        } else {
+            // This is the same logical item and retains its original actor credit;
+            // republishing must not increment the account again.
+            publish_description_cleanup(work);
         }
-    } else {
-        // This is the same logical item and retains its original actor credit;
-        // republishing must not increment the account again.
-        publish_description_cleanup(work);
     }
+    drop(pop_deferred_file_lease());
 }
 
 /// Host-test adapter for a description which owns only a typed resource.
@@ -279,6 +450,18 @@ pub(crate) fn drain_deferred_description_resource_only_for_test() {
     debug_assert!(work.account.is_none());
     debug_assert!(work.open_lease_registration.is_none());
     drop(work.resource.take());
+}
+
+#[cfg(test)]
+pub(crate) fn drain_deferred_file_lease_for_test() -> bool {
+    let Some(_guard) = DescriptionCleanupDrainGuard::try_enter() else {
+        return false;
+    };
+    let Some(work) = pop_deferred_file_lease() else {
+        return false;
+    };
+    drop(work);
+    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1245,6 +1428,11 @@ impl FileLike for FileDescription {
         self.inner.ioctl(cmd, arg)
     }
 
+    fn prepare_mmap(&self, request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {
+        self.check_io_access()?;
+        self.inner.prepare_mmap(request)
+    }
+
     fn nonblocking(&self) -> bool {
         self.inner.nonblocking()
     }
@@ -1441,6 +1629,17 @@ impl FileHandle<dyn FileLike> {
 }
 
 impl<T: FileLike + ?Sized> FileHandle<T> {
+    /// Runs mmap preparation against this exact OFD and inner object. This is
+    /// intentionally an inherent method so deref dispatch cannot bypass O_PATH
+    /// admission on the retained description.
+    pub(crate) fn prepare_mmap(
+        &self,
+        request: FileMmapRequest,
+    ) -> AxResult<Option<PreparedFileMmap>> {
+        self.description.check_io_access()?;
+        self.file.prepare_mmap(request)
+    }
+
     /// Applies an `O_NONBLOCK` update as one short OFD/backend transaction.
     ///
     /// `FIONBIO` uses this instead of mutating only the backend mirror.  A
@@ -1498,7 +1697,7 @@ mod tests {
 
     use alloc::borrow::Cow;
     use core::{
-        sync::atomic::{AtomicBool, Ordering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         task::Context,
     };
 
@@ -1512,6 +1711,23 @@ mod tests {
 
     fn kuid(raw: u32) -> Kuid {
         Kuid::from_raw(raw).unwrap()
+    }
+
+    #[test]
+    fn deferred_file_lease_reference_saturation_is_non_panicking_and_fail_closed() {
+        let ordinary = AtomicUsize::new(1);
+        retain_deferred_file_lease(&ordinary);
+        assert_eq!(ordinary.load(Ordering::Relaxed), 2);
+        assert!(!release_deferred_file_lease(&ordinary));
+        assert!(release_deferred_file_lease(&ordinary));
+
+        let saturated = AtomicUsize::new(usize::MAX - 1);
+        retain_deferred_file_lease(&saturated);
+        assert_eq!(saturated.load(Ordering::Relaxed), usize::MAX);
+        retain_deferred_file_lease(&saturated);
+        assert_eq!(saturated.load(Ordering::Relaxed), usize::MAX);
+        assert!(!release_deferred_file_lease(&saturated));
+        assert_eq!(saturated.load(Ordering::Relaxed), usize::MAX);
     }
 
     #[test]

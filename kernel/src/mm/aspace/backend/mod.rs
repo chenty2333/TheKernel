@@ -21,14 +21,15 @@ mod linear;
 mod phys_pin;
 mod shared;
 
-pub use self::shared::SharedPages;
+pub use self::shared::{SharedAtomicU32, SharedPages};
 pub(crate) use self::{
     file::WritableMappingAdmission,
     phys_pin::{PhysicalFramePin, pin_frame},
+    shared::PreparedFixedSharedMapping,
 };
 use super::{
     AddrSpace,
-    mapping::{FileMappingLease, MappingStatus, relocate_affine_origin},
+    mapping::{FileLikeMappingLease, FileMappingLease, MappingStatus, relocate_affine_origin},
 };
 
 fn divide_page(size: usize, page_size: PageSize) -> AxResult<usize> {
@@ -314,7 +315,9 @@ impl Backend {
         match self {
             Backend::Cow(_) if self.file_mapping().is_some() => MappingKind::FilePrivate,
             Backend::Cow(_) => MappingKind::AnonymousPrivate,
-            Backend::Shared(_) if self.file_mapping().is_some() => MappingKind::FileShared,
+            Backend::Shared(_) if self.mapping_status().has_mapping_owner() => {
+                MappingKind::FileShared
+            }
             Backend::Shared(_) => MappingKind::AnonymousShared,
             Backend::File(_) => MappingKind::FileShared,
             Backend::Linear(_) => MappingKind::Device,
@@ -353,7 +356,7 @@ impl Backend {
     }
 
     pub fn is_private_anonymous(&self) -> bool {
-        self.file_mapping().is_none()
+        !self.mapping_status().has_mapping_owner()
             && matches!(self, Backend::Cow(backend) if backend.is_private_anonymous())
     }
 
@@ -379,6 +382,10 @@ impl Backend {
         self.mapping_status().file_mapping()
     }
 
+    pub(crate) fn file_like_mapping(&self) -> Option<&FileLikeMappingLease> {
+        self.mapping_status().file_like_mapping()
+    }
+
     pub(crate) fn shared_file_location(&self) -> Option<&axfs_ng_vfs::Location> {
         match self {
             Self::File(backend) => Some(backend.location()),
@@ -401,6 +408,12 @@ impl Backend {
 
     pub(crate) fn with_file_mapping(mut self, file: FileMappingLease) -> Self {
         self.replace_file_mapping(Some(file));
+        self
+    }
+
+    pub(crate) fn with_file_like_mapping(mut self, file: FileLikeMappingLease) -> Self {
+        self.mapping_status_mut()
+            .replace_file_like_mapping(Some(file));
         self
     }
 
@@ -436,6 +449,9 @@ impl Backend {
         if self
             .file_mapping()
             .is_some_and(|mapping| !mapping.may_protect().contains(requested))
+            || self
+                .file_like_mapping()
+                .is_some_and(|mapping| !mapping.may_protect().contains(requested))
         {
             return Err(AxError::PermissionDenied);
         }

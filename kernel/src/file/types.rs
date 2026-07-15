@@ -12,6 +12,7 @@ use linux_raw_sys::general::{
 };
 
 use super::{FileHandle, add_file_like, get_typed_file};
+pub use crate::mm::SharedPages;
 
 // Match Linux's regular-file O_DIRECT floor: logical sector alignment, not
 // the filesystem's preferred st_blksize.
@@ -148,6 +149,194 @@ pub trait ReadBuf: Read + IoBuf {}
 impl<T: Read + IoBuf> ReadBuf for T {}
 pub type IoSrc<'a> = dyn ReadBuf + 'a;
 
+bitflags::bitflags! {
+    /// Access requested for one file-owned mapping.
+    ///
+    /// This intentionally carries only the portable read/write/execute facts.
+    /// Linux UAPI parsing remains in the syscall layer and architecture page
+    /// table flags remain in the MM layer.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FileMmapProtection: u8 {
+        const READ = 1 << 0;
+        const WRITE = 1 << 1;
+        const EXECUTE = 1 << 2;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileMmapSharing {
+    Shared,
+    Private,
+}
+
+/// Normalized, copied mmap input presented to a file-like object.
+///
+/// Construction proves that the byte geometry is nonempty, page aligned, and
+/// cannot overflow. A returned plan therefore never has to reinterpret raw
+/// userspace arguments while an address-space or page-table lock is held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileMmapRequest {
+    offset: u64,
+    length: usize,
+    page_size: usize,
+    protection: FileMmapProtection,
+    sharing: FileMmapSharing,
+}
+
+impl FileMmapRequest {
+    pub fn try_new(
+        offset: u64,
+        length: usize,
+        page_size: usize,
+        protection: FileMmapProtection,
+        sharing: FileMmapSharing,
+    ) -> AxResult<Self> {
+        if length == 0
+            || page_size == 0
+            || !page_size.is_power_of_two()
+            || !length.is_multiple_of(page_size)
+            || !offset.is_multiple_of(page_size as u64)
+        {
+            return Err(AxError::InvalidInput);
+        }
+        offset
+            .checked_add(u64::try_from(length).map_err(|_| AxError::InvalidInput)?)
+            .ok_or(AxError::InvalidInput)?;
+        Ok(Self {
+            offset,
+            length,
+            page_size,
+            protection,
+            sharing,
+        })
+    }
+
+    pub const fn offset(self) -> u64 {
+        self.offset
+    }
+
+    pub const fn length(self) -> usize {
+        self.length
+    }
+
+    pub const fn page_size(self) -> usize {
+        self.page_size
+    }
+
+    pub const fn protection(self) -> FileMmapProtection {
+        self.protection
+    }
+}
+
+/// One exact fixed-size region exported by a file-like object.
+///
+/// Regions are deliberately non-executable and cannot be resized. A file with
+/// multiple disjoint regions keeps one value per accepted file offset and
+/// returns the first matching prepared plan from [`Self::prepare`].
+#[derive(Clone)]
+pub struct FixedSharedMmapRegion {
+    file_offset: u64,
+    pages: Arc<SharedPages>,
+    may_protect: FileMmapProtection,
+}
+
+impl FixedSharedMmapRegion {
+    pub fn try_new(
+        file_offset: u64,
+        pages: Arc<SharedPages>,
+        may_protect: FileMmapProtection,
+    ) -> AxResult<Self> {
+        let length = pages.total_bytes();
+        let page_size = pages.page_size() as usize;
+        if !pages.is_fixed()
+            || length == 0
+            || !file_offset.is_multiple_of(page_size as u64)
+            || may_protect.contains(FileMmapProtection::EXECUTE)
+        {
+            return Err(AxError::InvalidInput);
+        }
+        file_offset
+            .checked_add(u64::try_from(length).map_err(|_| AxError::InvalidInput)?)
+            .ok_or(AxError::InvalidInput)?;
+        Ok(Self {
+            file_offset,
+            pages,
+            may_protect,
+        })
+    }
+
+    /// Validates one request and freezes every mapping fact into an owned plan.
+    /// A different offset is not an error so an object can probe several
+    /// disjoint regions without weakening validation for the selected region.
+    pub fn prepare(&self, request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {
+        if request.offset != self.file_offset {
+            return Ok(None);
+        }
+        validate_fixed_shared_request(
+            self.file_offset,
+            self.pages.total_bytes(),
+            self.pages.page_size() as usize,
+            self.may_protect,
+            request,
+        )?;
+        Ok(Some(PreparedFileMmap {
+            request,
+            pages: self.pages.clone(),
+            may_protect: self.may_protect,
+        }))
+    }
+}
+
+fn validate_fixed_shared_request(
+    expected_offset: u64,
+    expected_length: usize,
+    expected_page_size: usize,
+    may_protect: FileMmapProtection,
+    request: FileMmapRequest,
+) -> AxResult {
+    if request.offset != expected_offset
+        || request.length != expected_length
+        || request.page_size != expected_page_size
+        || request.sharing != FileMmapSharing::Shared
+    {
+        return Err(AxError::InvalidInput);
+    }
+    if request.protection.contains(FileMmapProtection::EXECUTE)
+        || !may_protect.contains(request.protection)
+    {
+        return Err(AxError::PermissionDenied);
+    }
+    Ok(())
+}
+
+/// Fully validated and allocation-free-to-bind file mapping plan.
+///
+/// Its fields are private to prevent a syscall adapter from changing geometry
+/// or permissions after the owning [`FileLike`] accepted the request.
+pub struct PreparedFileMmap {
+    request: FileMmapRequest,
+    pages: Arc<SharedPages>,
+    may_protect: FileMmapProtection,
+}
+
+impl PreparedFileMmap {
+    pub(crate) const fn request(&self) -> FileMmapRequest {
+        self.request
+    }
+
+    pub(crate) const fn pages(&self) -> &Arc<SharedPages> {
+        &self.pages
+    }
+
+    pub(crate) const fn may_protect(&self) -> FileMmapProtection {
+        self.may_protect
+    }
+
+    pub(crate) fn into_pages(self) -> Arc<SharedPages> {
+        self.pages
+    }
+}
+
 #[allow(dead_code)]
 pub trait FileLike: Pollable + DowncastSync {
     fn read(&self, _dst: &mut IoDst) -> AxResult<usize> {
@@ -169,6 +358,13 @@ pub trait FileLike: Pollable + DowncastSync {
 
     fn ioctl(&self, _cmd: u32, _arg: usize) -> AxResult<usize> {
         Err(AxError::NotATty)
+    }
+
+    /// Prepares an object-owned mapping without holding address-space or page
+    /// table locks. Implementations must return a plan only after every
+    /// fallible allocation and all object-specific validation have completed.
+    fn prepare_mmap(&self, _request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {
+        Ok(None)
     }
 
     fn nonblocking(&self) -> bool {
@@ -286,6 +482,15 @@ impl FileLikeKind {
 mod tests {
     use super::*;
 
+    fn mmap_request(
+        offset: u64,
+        length: usize,
+        protection: FileMmapProtection,
+        sharing: FileMmapSharing,
+    ) -> FileMmapRequest {
+        FileMmapRequest::try_new(offset, length, 0x1000, protection, sharing).unwrap()
+    }
+
     #[test]
     fn pseudo_inode_paths_cover_decimal_boundaries_without_formatting() {
         assert_eq!(try_pseudo_inode_path("socket", 0).unwrap(), "socket:[0]");
@@ -304,6 +509,126 @@ mod tests {
         assert_eq!(
             try_path_into_owned(Cow::Owned(try_owned_path("/tmp/file").unwrap())).unwrap(),
             "/tmp/file"
+        );
+    }
+
+    #[test]
+    fn file_mmap_request_rejects_unaligned_and_overflowing_geometry() {
+        assert_eq!(
+            FileMmapRequest::try_new(
+                1,
+                0x1000,
+                0x1000,
+                FileMmapProtection::READ,
+                FileMmapSharing::Shared,
+            ),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            FileMmapRequest::try_new(
+                0,
+                0x1001,
+                0x1000,
+                FileMmapProtection::READ,
+                FileMmapSharing::Shared,
+            ),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            FileMmapRequest::try_new(
+                u64::MAX - 0xfff,
+                0x2000,
+                0x1000,
+                FileMmapProtection::READ,
+                FileMmapSharing::Shared,
+            ),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn fixed_shared_plan_rejects_private_exec_and_nonexact_requests() {
+        let allowed = FileMmapProtection::READ | FileMmapProtection::WRITE;
+        let accepted = mmap_request(
+            0x20_000,
+            0x3000,
+            FileMmapProtection::READ | FileMmapProtection::WRITE,
+            FileMmapSharing::Shared,
+        );
+        validate_fixed_shared_request(0x20_000, 0x3000, 0x1000, allowed, accepted).unwrap();
+
+        let private = mmap_request(
+            0x20_000,
+            0x3000,
+            FileMmapProtection::READ,
+            FileMmapSharing::Private,
+        );
+        assert_eq!(
+            validate_fixed_shared_request(0x20_000, 0x3000, 0x1000, allowed, private),
+            Err(AxError::InvalidInput)
+        );
+
+        let executable = mmap_request(
+            0x20_000,
+            0x3000,
+            FileMmapProtection::READ | FileMmapProtection::EXECUTE,
+            FileMmapSharing::Shared,
+        );
+        assert_eq!(
+            validate_fixed_shared_request(0x20_000, 0x3000, 0x1000, allowed, executable),
+            Err(AxError::PermissionDenied)
+        );
+
+        let short = mmap_request(
+            0x20_000,
+            0x2000,
+            FileMmapProtection::READ,
+            FileMmapSharing::Shared,
+        );
+        assert_eq!(
+            validate_fixed_shared_request(0x20_000, 0x3000, 0x1000, allowed, short),
+            Err(AxError::InvalidInput)
+        );
+
+        let wrong_offset = mmap_request(
+            0x21_000,
+            0x3000,
+            FileMmapProtection::READ,
+            FileMmapSharing::Shared,
+        );
+        assert_eq!(
+            validate_fixed_shared_request(0x20_000, 0x3000, 0x1000, allowed, wrong_offset),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn fixed_shared_plan_accepts_the_page_rounded_backing_length() {
+        let structure_end = 0x2345usize;
+        let backing_length = structure_end.next_multiple_of(0x1000);
+        let request = mmap_request(
+            0,
+            backing_length,
+            FileMmapProtection::READ | FileMmapProtection::WRITE,
+            FileMmapSharing::Shared,
+        );
+        validate_fixed_shared_request(
+            0,
+            backing_length,
+            0x1000,
+            FileMmapProtection::READ | FileMmapProtection::WRITE,
+            request,
+        )
+        .unwrap();
+        assert_eq!(
+            FileMmapRequest::try_new(
+                0,
+                structure_end,
+                0x1000,
+                FileMmapProtection::READ,
+                FileMmapSharing::Shared,
+            ),
+            Err(AxError::InvalidInput)
         );
     }
 }

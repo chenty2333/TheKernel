@@ -6,7 +6,7 @@ use axhal::paging::MappingFlags;
 use memory_addr::VirtAddr;
 
 use crate::{
-    file::{File, FileHandle},
+    file::{DeferredFileLease, File, FileHandle},
     task::UserNamespace,
 };
 
@@ -188,10 +188,94 @@ impl FileMappingLease {
     }
 }
 
+/// Immutable ownership and permission facts for a non-VFS file-like mapping.
+///
+/// `owner` is an intrusive deferred lease: VMA cloning is allocation-free and
+/// dropping the final fragment only publishes task-context cleanup work.
+#[derive(Clone)]
+pub(crate) struct FileLikeMappingLease {
+    owner: DeferredFileLease,
+    ofd_key: u64,
+    initial_flags: MappingFlags,
+    may_protect: MappingFlags,
+    sharing: FileMappingSharing,
+    mapping_start: VirtAddr,
+    object_offset: u64,
+}
+
+#[allow(dead_code)]
+impl FileLikeMappingLease {
+    pub(crate) fn new(
+        owner: DeferredFileLease,
+        ofd_key: u64,
+        mapping_start: VirtAddr,
+        object_offset: u64,
+        initial_flags: MappingFlags,
+        may_protect: MappingFlags,
+        sharing: FileMappingSharing,
+    ) -> Self {
+        Self {
+            owner,
+            ofd_key,
+            initial_flags,
+            may_protect,
+            sharing,
+            mapping_start,
+            object_offset,
+        }
+    }
+
+    pub(crate) const fn ofd_key(&self) -> u64 {
+        self.ofd_key
+    }
+
+    pub(crate) const fn initial_flags(&self) -> MappingFlags {
+        self.initial_flags
+    }
+
+    pub(crate) const fn may_protect(&self) -> MappingFlags {
+        self.may_protect
+    }
+
+    pub(crate) const fn sharing(&self) -> FileMappingSharing {
+        self.sharing
+    }
+
+    pub(crate) fn object_offset_at(&self, address: VirtAddr) -> Option<u64> {
+        let delta = address
+            .as_usize()
+            .checked_sub(self.mapping_start.as_usize())?;
+        self.object_offset.checked_add(delta as u64)
+    }
+
+    fn relocated(&self, old_start: VirtAddr, new_start: VirtAddr) -> AxResult<Self> {
+        let (mapping_start, backing_advance) =
+            relocate_affine_origin(self.mapping_start, old_start, new_start)?;
+        let mut relocated = self.clone();
+        relocated.mapping_start = mapping_start;
+        relocated.object_offset = self
+            .object_offset
+            .checked_add(u64::try_from(backing_advance).map_err(|_| AxError::InvalidInput)?)
+            .ok_or(AxError::InvalidInput)?;
+        Ok(relocated)
+    }
+
+    fn compatible_with(&self, other: &Self) -> bool {
+        self.owner.identity() == other.owner.identity()
+            && self.ofd_key == other.ofd_key
+            && self.initial_flags == other.initial_flags
+            && self.may_protect == other.may_protect
+            && self.sharing == other.sharing
+            && self.object_offset as u128 + other.mapping_start.as_usize() as u128
+                == other.object_offset as u128 + self.mapping_start.as_usize() as u128
+    }
+}
+
 /// Backend-independent sidecar for Linux-visible VMA ownership.
 #[derive(Clone, Default)]
 pub(super) struct MappingStatus {
     file: Option<FileMappingLease>,
+    file_like: Option<FileLikeMappingLease>,
 }
 
 impl MappingStatus {
@@ -203,6 +287,18 @@ impl MappingStatus {
         self.file = file;
     }
 
+    pub(super) const fn file_like_mapping(&self) -> Option<&FileLikeMappingLease> {
+        self.file_like.as_ref()
+    }
+
+    pub(super) fn replace_file_like_mapping(&mut self, file: Option<FileLikeMappingLease>) {
+        self.file_like = file;
+    }
+
+    pub(super) const fn has_mapping_owner(&self) -> bool {
+        self.file.is_some() || self.file_like.is_some()
+    }
+
     pub(super) fn relocated(&self, old_start: VirtAddr, new_start: VirtAddr) -> AxResult<Self> {
         Ok(Self {
             file: self
@@ -210,15 +306,26 @@ impl MappingStatus {
                 .as_ref()
                 .map(|file| file.relocated(old_start, new_start))
                 .transpose()?,
+            file_like: self
+                .file_like
+                .as_ref()
+                .map(|file| file.relocated(old_start, new_start))
+                .transpose()?,
         })
     }
 
     pub(super) fn compatible_with(&self, other: &Self) -> bool {
-        match (&self.file, &other.file) {
+        let file_compatible = match (&self.file, &other.file) {
             (None, None) => true,
             (Some(lhs), Some(rhs)) => lhs.compatible_with(rhs),
             (None, Some(_)) | (Some(_), None) => false,
-        }
+        };
+        let file_like_compatible = match (&self.file_like, &other.file_like) {
+            (None, None) => true,
+            (Some(lhs), Some(rhs)) => lhs.compatible_with(rhs),
+            (None, Some(_)) | (Some(_), None) => false,
+        };
+        file_compatible && file_like_compatible
     }
 }
 
@@ -227,18 +334,64 @@ mod tests {
     extern crate std;
 
     use alloc::{sync::Arc, vec, vec::Vec};
+    use core::{
+        sync::atomic::{AtomicUsize, Ordering},
+        task::Context,
+    };
 
     use axfs::{FileBackend, FileFlags};
     use axfs_ng_vfs::{Location, Mountpoint, NodePermission, NodeType};
     use axhal::paging::MappingFlags;
+    use axpoll::{IoEvents, Pollable};
     use memory_addr::{MemoryAddr, VirtAddr};
     use memory_set::{MappingBackend, MemoryArea, MemorySet};
 
     use super::{super::PreparedAreaProtect, *};
     use crate::{
-        file::{FileDescription, FileLike},
+        file::{
+            FileDescription, FileLike, drain_deferred_description_resource_only_for_test,
+            drain_deferred_file_lease_for_test,
+        },
         pseudofs::tmp::MemoryFs,
     };
+
+    struct DropCountingMappingOwner {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DropCountingMappingOwner {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl Pollable for DropCountingMappingOwner {
+        fn poll(&self) -> IoEvents {
+            IoEvents::empty()
+        }
+
+        fn register<'a>(
+            &'a self,
+            _context: &mut Context<'_>,
+            _events: IoEvents,
+        ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+            axpoll::PollRegistration::empty()
+        }
+    }
+
+    impl FileLike for DropCountingMappingOwner {
+        fn stat(&self) -> AxResult<crate::file::Kstat> {
+            Err(AxError::InvalidInput)
+        }
+
+        fn path(&self) -> AxResult<alloc::borrow::Cow<'_, str>> {
+            Ok(alloc::borrow::Cow::Borrowed("fixed-mapping-owner"))
+        }
+
+        fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+            Ok(())
+        }
+    }
 
     #[derive(Clone)]
     struct LeaseTestBackend {
@@ -484,5 +637,42 @@ mod tests {
                 .file_offset_at(VirtAddr::from(0x11_000)),
             Some(0x21_000)
         );
+    }
+
+    #[test]
+    fn final_file_like_mapping_release_defers_owner_destruction() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let inner = Arc::new(DropCountingMappingOwner {
+            drops: drops.clone(),
+        });
+        let description = FileDescription::new(inner.clone()).unwrap();
+        let ofd_key = description.id().get();
+        let handle = FileHandle::<dyn FileLike>::from_description_for_test(description.clone());
+        let retained: Arc<dyn core::any::Any + Send + Sync> = Arc::new(());
+        let owner = DeferredFileLease::try_new(handle, retained).unwrap();
+        assert_eq!(owner.retained_reference_counts(), (2, 1));
+        let mapping = FileLikeMappingLease::new(
+            owner,
+            ofd_key,
+            VirtAddr::from(0x4000),
+            0,
+            MappingFlags::USER | MappingFlags::READ,
+            MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+            FileMappingSharing::Shared,
+        );
+        let fragment = mapping.clone();
+
+        drop(inner);
+        drop(description);
+        drop(mapping);
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+
+        // The last VMA-side reference only publishes its preallocated node.
+        drop(fragment);
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+
+        assert!(drain_deferred_file_lease_for_test());
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        drain_deferred_description_resource_only_for_test();
     }
 }

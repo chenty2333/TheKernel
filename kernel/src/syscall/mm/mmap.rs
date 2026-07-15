@@ -11,15 +11,16 @@ use thekernel_linux_mm::{PageRange as LinuxPageRange, RemapGeometry};
 
 use crate::{
     file::{
-        Directory, File, FileHandle, executable, get_file_like,
+        Directory, File, FileHandle, FileMmapProtection, FileMmapRequest, FileMmapSharing,
+        executable, get_file_like,
         privilege_metadata::{
             ContentWritePrivilegeGuard, begin_shared_writable_mapping_privilege_cleanup,
         },
     },
     mm::{
-        AddrSpace, Backend, BackendOps, FileMappingLease, FileMappingSharing, PreparedProtect,
-        SharedPages, WritableMappingAdmission, check_memory_overcommit, checked_align_up,
-        checked_align_up_4k,
+        AddrSpace, Backend, BackendOps, FileMappingLease, FileMappingSharing,
+        PreparedFixedSharedMapping, PreparedProtect, SharedPages, WritableMappingAdmission,
+        check_memory_overcommit, checked_align_up, checked_align_up_4k,
     },
     pseudofs::{Device, DeviceMmap},
     task::{
@@ -32,6 +33,7 @@ fn lookup_mmap_fd_once<T>(fd: i32, lookup: impl FnOnce(i32) -> AxResult<T>) -> A
     lookup(fd).map_err(|_| AxError::BadFileDescriptor)
 }
 
+#[cfg(test)]
 fn authorize_mmap_candidate<T>(
     authorize_file: impl FnOnce() -> AxResult<()>,
     authorize_address: impl FnOnce() -> AxResult<()>,
@@ -764,6 +766,57 @@ pub fn sys_mmap(
         return Err(AxError::InvalidInput);
     }
 
+    let normalized_start = addr.align_down(page_size);
+    let normalized_end = addr
+        .checked_add(length)
+        .and_then(|end| checked_align_up(end, page_size as usize))
+        .ok_or(AxError::NoMemory)?;
+    let mut length = normalized_end - normalized_start;
+    let requested_protection: MappingFlags = permission_flags.into();
+    let file_mmap_protection = {
+        let mut protection = FileMmapProtection::empty();
+        if permission_flags.contains(MmapProt::READ) {
+            protection |= FileMmapProtection::READ;
+        }
+        if permission_flags.contains(MmapProt::WRITE) {
+            protection |= FileMmapProtection::WRITE;
+        }
+        if permission_flags.contains(MmapProt::EXEC) {
+            protection |= FileMmapProtection::EXECUTE;
+        }
+        protection
+    };
+    let file_mmap_sharing = if map_type == MmapFlags::PRIVATE {
+        FileMmapSharing::Private
+    } else {
+        FileMmapSharing::Shared
+    };
+    let file_mmap_request = (!is_anonymous_mapping)
+        .then(|| {
+            FileMmapRequest::try_new(
+                offset as u64,
+                length,
+                page_size as usize,
+                file_mmap_protection,
+                file_mmap_sharing,
+            )
+        })
+        .transpose()?;
+
+    let mut pinned_fd = pinned_fd;
+    let prepared_file_like_plan = match (pinned_fd.as_ref(), file_mmap_request) {
+        (Some(handle), Some(request)) => handle.prepare_mmap(request)?,
+        (None, None) => None,
+        _ => return Err(AxError::BadState),
+    };
+    let prepared_fixed_mapping = match prepared_file_like_plan {
+        Some(plan) => Some(PreparedFixedSharedMapping::try_new(
+            pinned_fd.take().ok_or(AxError::BadState)?,
+            plan,
+        )?),
+        None => None,
+    };
+
     let curr = current();
     let thread = curr.as_thread();
     let proc_data = &thread.proc_data;
@@ -771,35 +824,10 @@ pub fn sys_mmap(
     let actor = authorized_image.credential();
     let has_ipc_lock = actor.has_effective_capability(CAP_IPC_LOCK);
     let aspace_handle = authorized_image.aspace().clone();
-    let mut aspace = aspace_handle.lock();
-    let start = addr.align_down(page_size);
-    let end = addr
-        .checked_add(length)
-        .and_then(|end| checked_align_up(end, page_size as usize))
-        .ok_or(AxError::NoMemory)?;
-    let mut length = end - start;
 
     if is_anonymous_mapping && permission_flags.contains(MmapProt::WRITE) {
         check_memory_overcommit(length)?;
     }
-
-    let start = if map_flags.intersects(MmapFlags::FIXED | MmapFlags::FIXED_NOREPLACE) {
-        let dst_addr = VirtAddr::from(start);
-        if !aspace.contains_range(dst_addr, length) {
-            return Err(AxError::NoMemory);
-        }
-        dst_addr
-    } else {
-        let align = page_size as usize;
-        aspace
-            .find_kernel_area(
-                VirtAddr::from(start),
-                length,
-                VirtAddrRange::new(aspace.base(), aspace.end()),
-                align,
-            )
-            .ok_or(AxError::NoMemory)?
-    };
 
     // Keep type errors at the historical backend-construction point, but
     // classify the exact OFD pinned above instead of looking up `fd` again.
@@ -830,8 +858,53 @@ pub fn sys_mmap(
             )
         })
         .transpose()?;
-    let requested_protection: MappingFlags = permission_flags.into();
+    if length == 0 {
+        return Err(AxError::InvalidInput);
+    }
     let effective_protection = requested_protection;
+    mmap_file(
+        actor,
+        file.as_ref().map(|file| {
+            (
+                filesystem_owner_user_ns
+                    .as_ref()
+                    .expect("file mappings freeze a filesystem owner"),
+                file,
+            )
+        }),
+        requested_protection,
+        effective_protection,
+        flags,
+    )?;
+
+    // All file/object-specific validation, VFS access, backing allocation, and
+    // deferred-owner allocation has completed. From this point through VMA
+    // publication, the fixed shared path only moves prepared resources.
+    let mut aspace = aspace_handle.lock();
+    let start = if map_flags.intersects(MmapFlags::FIXED | MmapFlags::FIXED_NOREPLACE) {
+        let dst_addr = VirtAddr::from(normalized_start);
+        if !aspace.contains_range(dst_addr, length) {
+            return Err(AxError::NoMemory);
+        }
+        dst_addr
+    } else {
+        let align = page_size as usize;
+        aspace
+            .find_kernel_area(
+                VirtAddr::from(normalized_start),
+                length,
+                VirtAddrRange::new(aspace.base(), aspace.end()),
+                align,
+            )
+            .ok_or(AxError::NoMemory)?
+    };
+    mmap_addr(
+        actor,
+        authorized_image.owner_user_ns(),
+        &aspace_handle,
+        start,
+    )?;
+
     let file_mapping = file.map(|file| {
         let sharing = if map_type == MmapFlags::PRIVATE {
             FileMappingSharing::Private
@@ -854,68 +927,49 @@ pub fn sys_mmap(
             sharing,
         )
     });
-    let backend = authorize_mmap_candidate(
-        || {
-            mmap_file(
-                actor,
-                file_mapping
-                    .as_ref()
-                    .map(|mapping| (mapping.filesystem_owner_user_ns(), mapping.file())),
-                requested_protection,
-                effective_protection,
+    let backend = if let Some(prepared) = prepared_fixed_mapping {
+        prepared.into_backend(start)
+    } else {
+        match prepared_file_backend {
+            Some(PreparedFileMmapBackend::SharedFile {
+                cache,
                 flags,
-            )
-        },
-        || {
-            mmap_addr(
-                actor,
-                authorized_image.owner_user_ns(),
-                &aspace_handle,
-                start,
-            )
-        },
-        || {
-            Ok(match prepared_file_backend {
-                Some(PreparedFileMmapBackend::SharedFile {
-                    cache,
-                    flags,
-                    file_end,
-                }) => {
-                    // TODO(mivik): file mmap page size
-                    Backend::new_file(start, cache, flags, offset, Some(file_end), &aspace_handle)?
-                }
-                Some(PreparedFileMmapBackend::SharedAnonymous { may_protect }) => {
-                    Backend::new_shared_with_may_protect(
-                        start,
-                        Arc::new(SharedPages::new(length, PageSize::Size4K)?),
-                        may_protect,
-                    )
-                }
-                Some(PreparedFileMmapBackend::Cow {
-                    location,
-                    file_end,
-                    sigbus_on_eof,
-                }) => Backend::new_cow(
+                file_end,
+            }) => {
+                // TODO(mivik): file mmap page size
+                Backend::new_file(start, cache, flags, offset, Some(file_end), &aspace_handle)?
+            }
+            Some(PreparedFileMmapBackend::SharedAnonymous { may_protect }) => {
+                Backend::new_shared_with_may_protect(
                     start,
-                    page_size,
-                    location,
-                    offset as u64,
-                    file_end,
-                    sigbus_on_eof,
-                ),
-                Some(PreparedFileMmapBackend::AnonymousCow) => Backend::new_alloc(start, page_size),
-                Some(PreparedFileMmapBackend::Linear {
-                    physical_start,
-                    max_size,
-                }) => Backend::new_linear(start, physical_start, max_size),
-                None if matches!(map_type, MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE) => {
-                    Backend::new_shared(start, Arc::new(SharedPages::new(length, page_size)?))
-                }
-                None if map_type == MmapFlags::PRIVATE => Backend::new_alloc(start, page_size),
-                None => return Err(AxError::InvalidInput),
-            })
-        },
-    )?;
+                    Arc::new(SharedPages::new(length, PageSize::Size4K)?),
+                    may_protect,
+                )
+            }
+            Some(PreparedFileMmapBackend::Cow {
+                location,
+                file_end,
+                sigbus_on_eof,
+            }) => Backend::new_cow(
+                start,
+                page_size,
+                location,
+                offset as u64,
+                file_end,
+                sigbus_on_eof,
+            ),
+            Some(PreparedFileMmapBackend::AnonymousCow) => Backend::new_alloc(start, page_size),
+            Some(PreparedFileMmapBackend::Linear {
+                physical_start,
+                max_size,
+            }) => Backend::new_linear(start, physical_start, max_size),
+            None if matches!(map_type, MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE) => {
+                Backend::new_shared(start, Arc::new(SharedPages::new(length, page_size)?))
+            }
+            None if map_type == MmapFlags::PRIVATE => Backend::new_alloc(start, page_size),
+            None => return Err(AxError::InvalidInput),
+        }
+    };
     let growdown_private_anon = map_flags.contains(MmapFlags::GROWDOWN)
         && map_type == MmapFlags::PRIVATE
         && is_anonymous_mapping;

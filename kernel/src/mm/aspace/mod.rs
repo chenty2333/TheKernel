@@ -33,7 +33,7 @@ mod backend;
 mod mapping;
 
 pub use self::backend::*;
-pub(crate) use self::mapping::{FileMappingLease, FileMappingSharing};
+pub(crate) use self::mapping::{FileLikeMappingLease, FileMappingLease, FileMappingSharing};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PageFaultResult {
