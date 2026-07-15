@@ -21,7 +21,7 @@ env:
   THEKERNEL_AX_REPOSITORY: https://github.com/chenty2333/thekernel-ax.git
   THEKERNEL_AX_REF: aa746a3898fdf3f85ed1270e460a41b9cbd5e6cf
   THEKERNEL_LINUX_ABI_REPOSITORY: https://github.com/chenty2333/thekernel-linux-abi.git
-  THEKERNEL_LINUX_ABI_REF: 73a5661574297dbc005b9e990318e1b3203e8dbf
+  THEKERNEL_LINUX_ABI_REF: bdb1100befe34f132a79c35cd23124ee0a39995b
 
 jobs:
   per-commit:

@@ -190,6 +190,25 @@ static int test_process_pipe_and_exec(void) {
     return 0;
 }
 
+static int test_io_uring(void) {
+    pid_t child = fork();
+    if (child < 0) {
+        return fail("io-uring-fork");
+    }
+    if (child == 0) {
+        execl("/opt/thekernel-tests/bin/thekernel-io-uring-smoke",
+              "thekernel-io-uring-smoke", (char *)NULL);
+        fprintf(stderr, "THEKERNEL_SYSTEM_TEST_FAIL io-uring-exec errno=%d (%s)\n",
+                errno, strerror(errno));
+        _exit(127);
+    }
+    if (wait_for_success(child, "io-uring-child") != 0) {
+        return 1;
+    }
+    puts("THEKERNEL_SYSTEM_TEST_IO_URING_OK");
+    return 0;
+}
+
 static int require_init_identity(const char *stage) {
     pid_t pid = getpid();
     pid_t tid = (pid_t)syscall(SYS_gettid);
@@ -235,7 +254,7 @@ int main(int argc, char **argv) {
     puts("THEKERNEL_SYSTEM_TEST_START");
 
     if (verify_core_filesystems() || test_rootfs() || test_tmpfs() || test_procfs() ||
-        test_process_pipe_and_exec()) {
+        test_process_pipe_and_exec() || test_io_uring()) {
         return 1;
     }
 

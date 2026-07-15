@@ -35,6 +35,7 @@ MAINTAINED_SIBLING_PATCHES = {
     "thekernel-linux-process": ("../thekernel-linux-abi/crates/process", "0.1.0"),
     "thekernel-linux-cred": ("../thekernel-linux-abi/crates/cred", "0.1.0"),
     "thekernel-linux-mm": ("../thekernel-linux-abi/crates/mm", "0.1.0"),
+    "thekernel-linux-io-uring": ("../thekernel-linux-abi/crates/io-uring", "0.1.0"),
 }
 MAINTAINED_SIBLING_REPO_PATHS = {
     "thekernel-axsched": ("ax", Path("crates/thekernel-axsched")),
@@ -45,11 +46,13 @@ MAINTAINED_SIBLING_REPO_PATHS = {
     "thekernel-linux-process": ("linux-abi", Path("crates/process")),
     "thekernel-linux-cred": ("linux-abi", Path("crates/cred")),
     "thekernel-linux-mm": ("linux-abi", Path("crates/mm")),
+    "thekernel-linux-io-uring": ("linux-abi", Path("crates/io-uring")),
 }
 MAINTAINED_WORKSPACE_DEPENDENCIES = {
     "linux-vfs": ("thekernel-linux-vfs", "=0.1.0"),
     "thekernel-linux-cred": ("thekernel-linux-cred", "=0.1.0"),
     "thekernel-linux-mm": ("thekernel-linux-mm", "=0.1.0"),
+    "thekernel-linux-io-uring": ("thekernel-linux-io-uring", "=0.1.0"),
 }
 LOCAL_ADAPTER_PATCHES = {
     "axtask": ("crates/axtask-compat", "0.3.0-preview.2"),

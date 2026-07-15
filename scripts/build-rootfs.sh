@@ -149,6 +149,7 @@ build_guest_tool() {
 
 build_guest_tool hackstress.c thekernel-hackstress -pthread
 build_guest_tool exec-smoke.c thekernel-exec-smoke
+build_guest_tool io-uring-smoke.c thekernel-io-uring-smoke
 build_guest_tool io-pin-safety.c thekernel-io-pin-safety -pthread
 build_guest_tool oom-admission.c thekernel-oom-admission
 build_guest_tool signal-mask-alias.c thekernel-signal-mask-alias

@@ -10,6 +10,7 @@ LOG_DIR="$REPO_ROOT/.state/ci/pr"
 BUILD_TIMEOUT_SECS=${THEKERNEL_CI_BUILD_TIMEOUT_SECS:-3600}
 RELEASE_CONSUMER_TIMEOUT_SECS=${THEKERNEL_CI_RELEASE_CONSUMER_TIMEOUT_SECS:-$BUILD_TIMEOUT_SECS}
 BOOT_GATE_TIMEOUT_SECS=${THEKERNEL_CI_BOOT_GATE_TIMEOUT_SECS:-900}
+SYSTEM_GATE_TIMEOUT_SECS=${THEKERNEL_CI_SYSTEM_TIMEOUT_SECS:-300}
 SKIP_BUILD=0
 
 usage() {
@@ -18,7 +19,8 @@ Usage: scripts/ci/pr-gate.sh [--log-dir DIR] [--skip-build]
 
 Validates the exact maintained-sibling release artifacts, builds both
 release-mode kernels, both boot-shell kernels, and the repository-built rootfs
-fixtures, then runs the strict dual-architecture boot-shell marker gate.
+fixtures, then runs the strict dual-architecture boot-shell and semantic
+system-test gates.
 
 The normal build path requires THEKERNEL_AX_REF and THEKERNEL_LINUX_ABI_REF to
 be the exact 40-hex commits provisioned by CI. --skip-build reuses existing
@@ -38,6 +40,7 @@ done
 
 ci_require_positive_int build_timeout "$BUILD_TIMEOUT_SECS"
 ci_require_positive_int boot_gate_timeout "$BOOT_GATE_TIMEOUT_SECS"
+ci_require_positive_int system_gate_timeout "$SYSTEM_GATE_TIMEOUT_SECS"
 case "$LOG_DIR" in
     /*) ;;
     *) LOG_DIR="$REPO_ROOT/$LOG_DIR" ;;
@@ -79,6 +82,15 @@ fi
 ci_run_step dual-arch-boot "$BOOT_GATE_TIMEOUT_SECS" \
     "$SCRIPT_DIR/boot-shell-gate.sh" \
     --arch both --skip-build --log-dir "$LOG_DIR/boot"
+
+ci_run_step system-rv "$((SYSTEM_GATE_TIMEOUT_SECS + 90))" \
+    "$REPO_ROOT/scripts/system-test.sh" \
+    --arch rv --skip-build --timeout "$SYSTEM_GATE_TIMEOUT_SECS" \
+    --workdir "$LOG_DIR/system/rv"
+ci_run_step system-la "$((SYSTEM_GATE_TIMEOUT_SECS + 90))" \
+    "$REPO_ROOT/scripts/system-test.sh" \
+    --arch la --skip-build --timeout "$SYSTEM_GATE_TIMEOUT_SECS" \
+    --workdir "$LOG_DIR/system/la"
 
 printf 'PR gate: PASS\n'
 printf 'logs: %s\n' "$LOG_DIR"

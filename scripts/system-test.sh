@@ -19,8 +19,9 @@ Options:
   --skip-build    Reuse existing kernel and rootfs artifacts
 
 Boots TheKernel with its repository-built semantic rootfs and requires the init
-program to complete rootfs, tmpfs, procfs, process, and pipe checks before a
-clean shutdown.
+program to complete rootfs, tmpfs, procfs, process, pipe, and raw io_uring ABI
+checks. QEMU stops after the final success marker; platform shutdown is tested
+separately from this semantic gate.
 EOF
 }
 
@@ -59,13 +60,21 @@ fi
 
 rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR"
+set +e
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     python3 -m tools.qemu_runner run \
         --arch "$ARCH" \
         --kernel "$KERNEL" \
         --rootfs "$ROOTFS" \
         --workdir "$WORKDIR" \
-        --timeout "$TIMEOUT_SECS"
+        --timeout "$TIMEOUT_SECS" \
+        --stop-after-marker THEKERNEL_SYSTEM_TEST_PASS
+runner_status=$?
+set -e
+case "$runner_status" in
+    0|75) ;;
+    *) exit "$runner_status" ;;
+esac
 
 LOG="$WORKDIR/console.log"
 [ -s "$LOG" ] || { printf 'system-test: missing console log: %s\n' "$LOG" >&2; exit 1; }
@@ -86,6 +95,8 @@ for marker in \
     THEKERNEL_SYSTEM_TEST_PROCESS_OK \
     THEKERNEL_EXEC_SMOKE_OK \
     THEKERNEL_SYSTEM_TEST_EXEC_OK \
+    THEKERNEL_IO_URING_OK \
+    THEKERNEL_SYSTEM_TEST_IO_URING_OK \
     THEKERNEL_SYSTEM_TEST_PASS
 do
     log_has_exact_line "$marker" || {
@@ -94,7 +105,7 @@ do
     }
 done
 
-if grep -Eq 'THEKERNEL_SYSTEM_TEST_FAIL|Kernel panic|panicked at|BUG:|Oops:' "$LOG"; then
+if grep -Eq 'THEKERNEL_SYSTEM_TEST_FAIL|THEKERNEL_IO_URING_FAIL|Kernel panic|panicked at|BUG:|Oops:' "$LOG"; then
     printf 'system-test: failure marker found in %s\n' "$LOG" >&2
     exit 1
 fi

@@ -161,6 +161,11 @@ cat >"$pr_fixture/scripts/ci/boot-shell-gate.sh" <<'EOF'
 set -euo pipefail
 printf 'boot %s\n' "$*" >>"$PR_FIXTURE_TRACE"
 EOF
+cat >"$pr_fixture/scripts/system-test.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'system %s\n' "$*" >>"$PR_FIXTURE_TRACE"
+EOF
 cat >"$pr_fixture/fake-bin/make" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -179,6 +184,7 @@ EOF
 chmod +x \
     "$pr_fixture/scripts/ci/release-consumer-gate.sh" \
     "$pr_fixture/scripts/ci/boot-shell-gate.sh" \
+    "$pr_fixture/scripts/system-test.sh" \
     "$pr_fixture/fake-bin/make"
 
 pr_trace="$tmp/pr-gate.trace"
@@ -197,6 +203,13 @@ grep -Fxq \
     "release-consumer --arch both --ax-head $ax_exact --linux-abi-head $linux_abi_exact --output-release-set $tmp/pr-gate-logs/release-consumer/release-set.tsv" ]
 [ "$(sed -n '2p' "$pr_trace")" = 'make kernels' ]
 [ "$(sed -n '3p' "$pr_trace")" = 'make kernel-rv-shell kernel-la-shell rootfs' ]
+grep -Fq 'boot --arch both --skip-build' "$pr_trace"
+grep -Fq \
+    "system --arch rv --skip-build --timeout 300 --workdir $tmp/pr-gate-logs/system/rv" \
+    "$pr_trace"
+grep -Fq \
+    "system --arch la --skip-build --timeout 300 --workdir $tmp/pr-gate-logs/system/la" \
+    "$pr_trace"
 [ -s "$tmp/pr-gate-logs/release-consumer/release-set.tsv" ]
 grep -q $'^release-consumer\tpass\t0\t' "$tmp/pr-gate-logs/status.tsv"
 
@@ -217,12 +230,77 @@ env -u THEKERNEL_AX_REF -u THEKERNEL_LINUX_ABI_REF \
     PR_FIXTURE_TRACE="$pr_trace" \
     "$pr_fixture/scripts/ci/pr-gate.sh" \
     --skip-build --log-dir "$tmp/pr-gate-skip-logs" >/dev/null
-[ "$(wc -l <"$pr_trace")" -eq 1 ]
+[ "$(wc -l <"$pr_trace")" -eq 3 ]
 grep -Fq 'boot --arch both --skip-build' "$pr_trace"
+grep -Fq 'system --arch rv --skip-build' "$pr_trace"
+grep -Fq 'system --arch la --skip-build' "$pr_trace"
 if grep -Eq '^(release-consumer|make) ' "$pr_trace"; then
     printf 'test-ci-scripts: --skip-build ran release or source build\n' >&2
     exit 1
 fi
+
+# The semantic system gate accepts the runner's intentional-stop status only
+# after the exact final marker is written, then validates the complete marker
+# sequence from the captured console log.
+system_fixture="$tmp/system-fixture"
+mkdir -p \
+    "$system_fixture/scripts" \
+    "$system_fixture/fake-bin" \
+    "$system_fixture/.state/rootfs"
+cp "$REPO_ROOT/scripts/system-test.sh" "$system_fixture/scripts/"
+printf fixture >"$system_fixture/kernel-rv"
+printf fixture >"$system_fixture/.state/rootfs/rootfs-rv.img"
+cat >"$system_fixture/fake-bin/python3" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" >"$FAKE_SYSTEM_RUNNER_ARGS"
+workdir=
+while (($#)); do
+    case "$1" in
+        --workdir) workdir=${2:-}; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[ -n "$workdir" ]
+mkdir -p "$workdir"
+cat >"$workdir/console.log" <<'MARKERS'
+THEKERNEL_SYSTEM_TEST_INIT_EXEC_1_OK
+THEKERNEL_SYSTEM_TEST_INIT_EXEC_2_OK
+THEKERNEL_SYSTEM_TEST_START
+THEKERNEL_SYSTEM_TEST_MOUNTS_OK
+THEKERNEL_SYSTEM_TEST_ROOTFS_OK
+THEKERNEL_SYSTEM_TEST_TMPFS_OK
+THEKERNEL_SYSTEM_TEST_PROCFS_OK
+THEKERNEL_SYSTEM_TEST_PROCESS_OK
+THEKERNEL_EXEC_SMOKE_OK
+THEKERNEL_SYSTEM_TEST_EXEC_OK
+THEKERNEL_IO_URING_OK
+THEKERNEL_SYSTEM_TEST_IO_URING_OK
+THEKERNEL_SYSTEM_TEST_PASS
+MARKERS
+exit "${FAKE_SYSTEM_RUNNER_STATUS:-0}"
+EOF
+chmod +x "$system_fixture/fake-bin/python3"
+system_args="$tmp/system-runner.args"
+env PATH="$system_fixture/fake-bin:$PATH" \
+    FAKE_SYSTEM_RUNNER_ARGS="$system_args" \
+    FAKE_SYSTEM_RUNNER_STATUS=75 \
+    "$system_fixture/scripts/system-test.sh" \
+    --arch rv --skip-build --workdir "$tmp/system-run" >/dev/null
+grep -Fxq -- '--stop-after-marker' "$system_args"
+grep -Fxq -- 'THEKERNEL_SYSTEM_TEST_PASS' "$system_args"
+set +e
+env PATH="$system_fixture/fake-bin:$PATH" \
+    FAKE_SYSTEM_RUNNER_ARGS="$system_args" \
+    FAKE_SYSTEM_RUNNER_STATUS=23 \
+    "$system_fixture/scripts/system-test.sh" \
+    --arch rv --skip-build --workdir "$tmp/system-run-fail" >/dev/null
+status=$?
+set -e
+[ "$status" -eq 23 ] || {
+    printf 'test-ci-scripts: system gate returned %s, expected 23\n' "$status" >&2
+    exit 1
+}
 
 cat >"$tmp/pass.log" <<'EOF'
 CI_BOOT_GATE_START

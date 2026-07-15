@@ -475,6 +475,14 @@ ci_run_step mm-core-check "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo check --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
     -p thekernel-linux-mm --no-default-features
+ci_run_step io-uring-core-tests "$STEP_TIMEOUT_SECS" \
+    env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
+    cargo test --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
+    -p thekernel-linux-io-uring
+ci_run_step io-uring-core-check "$STEP_TIMEOUT_SECS" \
+    env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
+    cargo check --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
+    -p thekernel-linux-io-uring --no-default-features
 ci_run_step process-core-tests "$STEP_TIMEOUT_SECS" \
     env CARGO_TARGET_DIR="$SIBLING_TARGET_DIR" \
     cargo test --locked --manifest-path "$LINUX_ABI_REPO/Cargo.toml" \
