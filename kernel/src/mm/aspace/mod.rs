@@ -15,7 +15,7 @@ use axsync::Mutex;
 use memory_addr::{
     MemoryAddr, PAGE_SIZE_4K, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange, is_aligned_4k,
 };
-use memory_set::{MemoryArea, MemorySet};
+use memory_set::{MappingResult, MemoryArea, MemorySet};
 
 use super::checked_align_up_4k;
 
@@ -49,6 +49,129 @@ pub struct AddrSpace {
     lock_future_mappings: bool,
     lock_future_on_fault: bool,
     pt: PageTable,
+}
+
+/// The generic, testable core of one linear protection transaction.
+///
+/// This value owns the only mutable access to both the area tree and its page
+/// table until it is either committed or dropped.
+struct PreparedAreaProtect<'a, B: memory_set::MappingBackend> {
+    areas: &'a mut MemorySet<B>,
+    page_table: &'a mut B::PageTable,
+    start: B::Addr,
+    end: B::Addr,
+    flags: B::Flags,
+}
+
+impl<'a, B: memory_set::MappingBackend> PreparedAreaProtect<'a, B> {
+    fn segments(&self) -> impl Iterator<Item = (&MemoryArea<B>, B::Addr, B::Addr)> + '_ {
+        let start = self.start;
+        let end = self.end;
+        self.areas.iter().filter_map(move |area| {
+            let affected_start = area.start().max(start);
+            let affected_end = area.end().min(end);
+            (affected_start < affected_end).then_some((area, affected_start, affected_end))
+        })
+    }
+
+    fn commit(self) -> MappingResult<&'a mut MemorySet<B>> {
+        let Self {
+            areas,
+            page_table,
+            start,
+            end,
+            flags,
+        } = self;
+        areas.protect(start, end.sub_addr(start), |_| Some(flags), page_table)?;
+        Ok(areas)
+    }
+}
+
+/// One immutable, pre-change VMA view in a prepared protection transaction.
+///
+/// The full area bounds identify the VMA that future policy hooks must inspect;
+/// the affected bounds identify the subrange this transaction will change.
+/// Neither the view nor its backend reference permits mutation.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) struct PreparedProtectSegment<'a> {
+    area: &'a MemoryArea<Backend>,
+    affected: VirtAddrRange,
+}
+
+#[allow(dead_code)]
+impl<'a> PreparedProtectSegment<'a> {
+    pub(crate) const fn area_start(self) -> VirtAddr {
+        self.area.start()
+    }
+
+    pub(crate) const fn area_end(self) -> VirtAddr {
+        self.area.end()
+    }
+
+    pub(crate) const fn affected(self) -> VirtAddrRange {
+        self.affected
+    }
+
+    pub(crate) const fn flags(self) -> MappingFlags {
+        self.area.flags()
+    }
+
+    pub(crate) const fn backend(self) -> &'a Backend {
+        self.area.backend()
+    }
+}
+
+/// Linear admission for one fully preflighted `mprotect` transaction.
+///
+/// Construction validates every target VMA without changing the area tree,
+/// page table, pin state, or backend state. Dropping the value aborts with no
+/// side effects; only [`Self::commit`] starts the existing transactional
+/// split/protect/merge path.
+#[must_use = "a prepared protection must be committed explicitly or dropped to abort"]
+pub(crate) struct PreparedProtect<'a> {
+    transaction: PreparedAreaProtect<'a, Backend>,
+    growdown_starts: &'a mut BTreeSet<VirtAddr>,
+}
+
+impl PreparedProtect<'_> {
+    /// Iterates the exact pre-change VMAs in increasing virtual-address order.
+    #[allow(dead_code)]
+    pub(crate) fn segments(&self) -> impl Iterator<Item = PreparedProtectSegment<'_>> + '_ {
+        self.transaction
+            .segments()
+            .map(
+                |(area, affected_start, affected_end)| PreparedProtectSegment {
+                    area,
+                    affected: VirtAddrRange::new(affected_start, affected_end),
+                },
+            )
+    }
+
+    /// Commits the already-preflighted request through MemorySet's staged
+    /// split/protect/rollback/merge transaction.
+    pub(crate) fn commit(self) -> AxResult {
+        let Self {
+            transaction,
+            growdown_starts,
+        } = self;
+        let areas = transaction.commit()?;
+        Self::refresh_growdown_starts(areas, growdown_starts);
+        Ok(())
+    }
+
+    fn refresh_growdown_starts(
+        areas: &MemorySet<Backend>,
+        growdown_starts: &mut BTreeSet<VirtAddr>,
+    ) {
+        let starts: Vec<_> = growdown_starts.iter().copied().collect();
+        growdown_starts.clear();
+        for start in starts {
+            if areas.find(start).is_some_and(|area| area.start() == start) {
+                growdown_starts.insert(start);
+            }
+        }
+    }
 }
 
 impl AddrSpace {
@@ -108,17 +231,7 @@ impl AddrSpace {
     }
 
     fn refresh_growdown_starts(&mut self) {
-        let starts: Vec<_> = self.growdown_starts.iter().copied().collect();
-        self.growdown_starts.clear();
-        for start in starts {
-            if self
-                .areas
-                .find(start)
-                .is_some_and(|area| area.start() == start)
-            {
-                self.growdown_starts.insert(start);
-            }
-        }
+        PreparedProtect::refresh_growdown_starts(&self.areas, &mut self.growdown_starts);
     }
 
     pub fn mark_growdown(&mut self, start: VirtAddr) {
@@ -797,16 +910,32 @@ impl AddrSpace {
     ///
     /// Returns an error if the address range is out of the address space or not
     /// aligned.
-    pub fn protect(&mut self, start: VirtAddr, size: usize, flags: MappingFlags) -> AxResult {
+    pub(crate) fn prepare_protect(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+        flags: MappingFlags,
+    ) -> AxResult<PreparedProtect<'_>> {
         self.validate_region(start, size)?;
         self.check_no_user_io_pin_overlap(start, size)?;
         self.check_protect_range(start, size, flags)?;
 
-        self.areas
-            .protect(start, size, |_| Some(flags), &mut self.pt)?;
-        self.refresh_growdown_starts();
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
 
-        Ok(())
+        Ok(PreparedProtect {
+            transaction: PreparedAreaProtect {
+                areas: &mut self.areas,
+                page_table: &mut self.pt,
+                start,
+                end,
+                flags,
+            },
+            growdown_starts: &mut self.growdown_starts,
+        })
+    }
+
+    pub fn protect(&mut self, start: VirtAddr, size: usize, flags: MappingFlags) -> AxResult {
+        self.prepare_protect(start, size, flags)?.commit()
     }
 
     fn check_protect_range(
@@ -1130,5 +1259,180 @@ impl fmt::Debug for AddrSpace {
 impl Drop for AddrSpace {
     fn drop(&mut self) {
         self.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::*;
+
+    const TEST_SPACE_SIZE: usize = 0x6000;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct MockBackend(u8);
+
+    impl memory_set::MappingBackend for MockBackend {
+        type Addr = VirtAddr;
+        type Flags = u8;
+        type PageTable = Vec<u8>;
+
+        fn map(
+            &self,
+            start: VirtAddr,
+            size: usize,
+            flags: u8,
+            page_table: &mut Self::PageTable,
+        ) -> bool {
+            let range = start.as_usize()..start.as_usize() + size;
+            if page_table[range.clone()].iter().any(|entry| *entry != 0) {
+                return false;
+            }
+            page_table[range].fill(flags);
+            true
+        }
+
+        fn unmap(&self, start: VirtAddr, size: usize, page_table: &mut Self::PageTable) -> bool {
+            let range = start.as_usize()..start.as_usize() + size;
+            if page_table[range.clone()].contains(&0) {
+                return false;
+            }
+            page_table[range].fill(0);
+            true
+        }
+
+        fn protect(
+            &self,
+            start: VirtAddr,
+            size: usize,
+            new_flags: u8,
+            page_table: &mut Self::PageTable,
+        ) -> bool {
+            let range = start.as_usize()..start.as_usize() + size;
+            if page_table[range.clone()].contains(&0) {
+                return false;
+            }
+            page_table[range].fill(new_flags);
+            true
+        }
+
+        fn can_merge(&self, other: &Self) -> bool {
+            self == other
+        }
+    }
+
+    fn area_snapshot(set: &MemorySet<MockBackend>) -> Vec<(usize, usize, u8, u8)> {
+        set.iter()
+            .map(|area| {
+                (
+                    area.start().as_usize(),
+                    area.end().as_usize(),
+                    area.flags(),
+                    area.backend().0,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prepared_protect_exposes_all_segments_and_drop_aborts() {
+        let mut areas = MemorySet::new();
+        let mut page_table = vec![0; TEST_SPACE_SIZE];
+        areas
+            .map(
+                MemoryArea::new(VirtAddr::from(0x1000), 0x1000, 1, MockBackend(1)),
+                &mut page_table,
+                false,
+            )
+            .unwrap();
+        areas
+            .map(
+                MemoryArea::new(VirtAddr::from(0x2000), 0x1000, 3, MockBackend(2)),
+                &mut page_table,
+                false,
+            )
+            .unwrap();
+        let before_areas = area_snapshot(&areas);
+        let before_page_table = page_table.clone();
+
+        let plan = PreparedAreaProtect {
+            areas: &mut areas,
+            page_table: &mut page_table,
+            start: VirtAddr::from(0x1800),
+            end: VirtAddr::from(0x2800),
+            flags: 5,
+        };
+        let segments: Vec<_> = plan
+            .segments()
+            .map(|(area, affected_start, affected_end)| {
+                (
+                    area.start().as_usize(),
+                    area.end().as_usize(),
+                    affected_start.as_usize(),
+                    affected_end.as_usize(),
+                    area.flags(),
+                    area.backend().0,
+                )
+            })
+            .collect();
+        assert_eq!(
+            segments,
+            vec![
+                (0x1000, 0x2000, 0x1800, 0x2000, 1, 1),
+                (0x2000, 0x3000, 0x2000, 0x2800, 3, 2),
+            ]
+        );
+
+        // A future policy hook may reject after inspecting every segment.
+        drop(plan);
+        assert_eq!(area_snapshot(&areas), before_areas);
+        assert_eq!(page_table, before_page_table);
+    }
+
+    #[test]
+    fn prepared_protect_commit_splits_and_remerges_areas() {
+        let mut areas = MemorySet::new();
+        let mut page_table = vec![0; TEST_SPACE_SIZE];
+        areas
+            .map(
+                MemoryArea::new(VirtAddr::from(0x1000), 0x3000, 1, MockBackend(1)),
+                &mut page_table,
+                false,
+            )
+            .unwrap();
+
+        PreparedAreaProtect {
+            areas: &mut areas,
+            page_table: &mut page_table,
+            start: VirtAddr::from(0x2000),
+            end: VirtAddr::from(0x3000),
+            flags: 3,
+        }
+        .commit()
+        .unwrap();
+        assert_eq!(
+            area_snapshot(&areas),
+            vec![
+                (0x1000, 0x2000, 1, 1),
+                (0x2000, 0x3000, 3, 1),
+                (0x3000, 0x4000, 1, 1),
+            ]
+        );
+        assert!(page_table[0x1000..0x2000].iter().all(|entry| *entry == 1));
+        assert!(page_table[0x2000..0x3000].iter().all(|entry| *entry == 3));
+        assert!(page_table[0x3000..0x4000].iter().all(|entry| *entry == 1));
+
+        PreparedAreaProtect {
+            areas: &mut areas,
+            page_table: &mut page_table,
+            start: VirtAddr::from(0x2000),
+            end: VirtAddr::from(0x3000),
+            flags: 1,
+        }
+        .commit()
+        .unwrap();
+        assert_eq!(area_snapshot(&areas), vec![(0x1000, 0x4000, 1, 1)]);
+        assert!(page_table[0x1000..0x4000].iter().all(|entry| *entry == 1));
     }
 }

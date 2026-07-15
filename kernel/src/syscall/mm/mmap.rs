@@ -8,7 +8,7 @@ use linux_raw_sys::general::*;
 use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange};
 
 use crate::{
-    file::{File, FileLike, get_file_description},
+    file::{Directory, File, get_file_like},
     mm::{
         AddrSpace, Backend, BackendOps, SharedPages, check_memory_overcommit, checked_align_up,
         checked_align_up_4k,
@@ -16,6 +16,10 @@ use crate::{
     pseudofs::{Device, DeviceMmap},
     task::{AsThread, ProcessData},
 };
+
+fn lookup_mmap_fd_once<T>(fd: i32, lookup: impl FnOnce(i32) -> AxResult<T>) -> AxResult<T> {
+    lookup(fd).map_err(|_| AxError::BadFileDescriptor)
+}
 
 bitflags::bitflags! {
     /// `PROT_*` flags for use with [`sys_mmap`].
@@ -404,12 +408,14 @@ pub fn sys_mmap(
     if is_anonymous_mapping && offset != 0 {
         return Err(AxError::InvalidInput);
     }
-    if !is_anonymous_mapping {
+    let pinned_fd = if !is_anonymous_mapping {
         if fd < 0 {
             return Err(AxError::BadFileDescriptor);
         }
-        get_file_description(fd).map_err(|_| AxError::BadFileDescriptor)?;
-    }
+        Some(lookup_mmap_fd_once(fd, get_file_like)?)
+    } else {
+        None
+    };
     if length == 0 {
         return Err(AxError::InvalidInput);
     }
@@ -474,18 +480,26 @@ pub fn sys_mmap(
             .ok_or(AxError::NoMemory)?
     };
 
-    let file = if !is_anonymous_mapping {
-        Some(File::from_fd(fd)?)
-    } else {
-        None
-    };
+    // Keep type errors at the historical backend-construction point, but
+    // classify the exact OFD pinned above instead of looking up `fd` again.
+    let file = pinned_fd
+        .map(|handle| {
+            handle.downcast::<File>().map_err(|_| {
+                if handle.as_ref().downcast_ref::<Directory>().is_some() {
+                    AxError::IsADirectory
+                } else {
+                    AxError::BrokenPipe
+                }
+            })
+        })
+        .transpose()?;
     let growdown_private_anon = map_flags.contains(MmapFlags::GROWDOWN)
         && map_type == MmapFlags::PRIVATE
         && is_anonymous_mapping;
 
     let backend = match map_type {
         MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE => {
-            if let Some(file) = file {
+            if let Some(file) = file.as_ref() {
                 let file = file.inner();
                 let backend = file.backend()?.clone();
                 validate_file_mmap_access(file, &backend, map_type, permission_flags)?;
@@ -553,8 +567,9 @@ pub fn sys_mmap(
             }
         }
         MmapFlags::PRIVATE => {
-            if let Some(file) = file {
+            if let Some(file) = file.as_ref() {
                 // Private mapping from a file
+                let file = file.as_ref();
                 let backend = file.inner().backend()?.clone();
                 validate_file_mmap_access(file.inner(), &backend, map_type, permission_flags)?;
                 match backend {
@@ -669,7 +684,8 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> AxResult<isize> {
     let mut aspace = aspace_handle.lock();
     let length = checked_align_up_4k(length).ok_or(AxError::NoMemory)?;
     let start_addr = VirtAddr::from(addr);
-    aspace.protect(start_addr, length, permission_flags.into())?;
+    let plan = aspace.prepare_protect(start_addr, length, permission_flags.into())?;
+    plan.commit()?;
 
     Ok(0)
 }
@@ -1191,11 +1207,79 @@ pub fn sys_munlockall() -> AxResult<isize> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
+    use core::cell::Cell;
+
+    use axfs_ng_vfs::{Mountpoint, NodePermission, NodeType};
+    use thekernel_linux_fd::{DescriptorFlags, FdNumber, FdTable, FdTableId};
+
     use super::*;
+    use crate::{file::FileDescription, pseudofs::tmp::MemoryFs};
+
+    fn mmap_description(name: &str) -> Arc<FileDescription> {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let location = mount
+            .root_location()
+            .create(
+                name,
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        FileDescription::new(Arc::new(File::new(axfs::File::new(
+            FileBackend::Direct(location),
+            FileFlags::READ,
+        ))))
+        .unwrap()
+    }
 
     #[test]
     fn append_does_not_reduce_mprotect_write_capability() {
         let open_flags = FileFlags::READ | FileFlags::WRITE | FileFlags::APPEND;
         assert!(may_protect_from_file_flags(open_flags).contains(MappingFlags::WRITE));
+    }
+
+    #[test]
+    fn mmap_lookup_once_survives_fd_close_and_number_reuse() {
+        let first_description = mmap_description("first-mmap-pin");
+        let first_id = first_description.id().get();
+        let second_description = mmap_description("second-mmap-pin");
+        let second_id = second_description.id().get();
+        assert_ne!(first_id, second_id);
+
+        let mut table =
+            FdTable::<Arc<FileDescription>, 8>::try_new(FdTableId::new(1).unwrap()).unwrap();
+        let reservation = table.reserve(3, 4, DescriptorFlags::EMPTY).unwrap();
+        let fd = reservation.fd().get() as i32;
+        assert!(table.publish(reservation, first_description).is_ok());
+
+        let lookups = Cell::new(0);
+        let pinned = lookup_mmap_fd_once(fd, |fd| {
+            lookups.set(lookups.get() + 1);
+            table
+                .get(FdNumber::new(fd as u32))
+                .map(|entry| entry.description().clone())
+                .map_err(|_| AxError::BadFileDescriptor)
+        })
+        .unwrap();
+        assert_eq!(lookups.get(), 1);
+
+        drop(table.close(FdNumber::new(fd as u32)).unwrap());
+        let replacement = table.reserve(3, 4, DescriptorFlags::EMPTY).unwrap();
+        assert_eq!(replacement.fd(), FdNumber::new(fd as u32));
+        assert!(table.publish(replacement, second_description).is_ok());
+
+        assert_eq!(pinned.id().get(), first_id);
+        assert_eq!(
+            table
+                .get(FdNumber::new(fd as u32))
+                .unwrap()
+                .description()
+                .id()
+                .get(),
+            second_id
+        );
+        assert_eq!(lookups.get(), 1);
     }
 }
