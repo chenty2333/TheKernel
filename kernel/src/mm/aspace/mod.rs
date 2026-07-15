@@ -20,8 +20,10 @@ use memory_set::{MappingResult, MemoryArea, MemorySet};
 use super::checked_align_up_4k;
 
 mod backend;
+mod mapping;
 
 pub use self::backend::*;
+pub(crate) use self::mapping::{FileMappingLease, FileMappingSharing};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PageFaultResult {
@@ -101,6 +103,11 @@ pub(crate) struct PreparedProtectSegment<'a> {
 
 #[allow(dead_code)]
 impl<'a> PreparedProtectSegment<'a> {
+    #[cfg(test)]
+    pub(crate) const fn for_test(area: &'a MemoryArea<Backend>, affected: VirtAddrRange) -> Self {
+        Self { area, affected }
+    }
+
     pub(crate) const fn area_start(self) -> VirtAddr {
         self.area.start()
     }
@@ -119,6 +126,18 @@ impl<'a> PreparedProtectSegment<'a> {
 
     pub(crate) const fn backend(self) -> &'a Backend {
         self.area.backend()
+    }
+
+    pub(crate) fn file_mapping(self) -> Option<&'a FileMappingLease> {
+        self.area.backend().file_mapping()
+    }
+
+    pub(crate) fn area_file_offset(self) -> Option<u64> {
+        self.file_mapping()?.file_offset_at(self.area.start())
+    }
+
+    pub(crate) fn affected_file_offset(self) -> Option<u64> {
+        self.file_mapping()?.file_offset_at(self.affected.start)
     }
 }
 
@@ -1217,8 +1236,9 @@ impl AddrSpace {
                             &new_aspace_clone,
                         )?
                     };
-                    let new_backend =
-                        new_backend.relocate(area.start(), cursor, &new_aspace_clone)?;
+                    // Fork keeps the segment at the same virtual address. In
+                    // particular, a suffix after MADV_DONTFORK must retain the
+                    // original backend origin and file-offset relation.
                     let new_area = MemoryArea::new(cursor, segment_size, area.flags(), new_backend);
                     let aspace = guard.deref_mut();
                     aspace.areas.map(new_area, &mut aspace.pt, false)?;

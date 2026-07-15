@@ -16,7 +16,7 @@ use super::permission::{
     check_create_permissions_with_frozen_metadata,
     check_cross_parent_rename_source_permissions_with_security,
     check_remove_permissions_with_security, check_rename_parent_permissions_with_security,
-    check_writable_mount, initial_named_create_owner_mode,
+    check_writable_mount, initial_named_create_owner_mode_with_security,
 };
 use crate::mounts::NamespaceOperationGuard;
 
@@ -183,7 +183,7 @@ fn check_named_create_capability(
     security: &VfsSecurityContext,
 ) -> AxResult<()> {
     if matches!(node_type, NodeType::CharacterDevice | NodeType::BlockDevice)
-        && !security.credentials().has_capability(CAP_MKNOD)
+        && !security.has_capability(CAP_MKNOD)
     {
         return Err(AxError::OperationNotPermitted);
     }
@@ -233,9 +233,9 @@ impl KernelMutationRequest for CreateRequest<'_> {
         )?;
         check_named_create_capability(reservation.node_type, &reservation.security)?;
         check_named_create_mechanism(&reservation.name.parent, reservation.node_type)?;
-        let (permission, owner) = initial_named_create_owner_mode(
+        let (permission, owner) = initial_named_create_owner_mode_with_security(
             &parent_metadata,
-            reservation.security.credentials(),
+            &reservation.security,
             reservation.node_type,
             reservation.requested_mode,
             reservation.umask,
@@ -931,7 +931,7 @@ mod tests {
         RenameRequest as VfsRenameRequest, StatFs, UnlinkRequest as VfsUnlinkRequest, VfsError,
         VfsResult,
     };
-    use linux_raw_sys::general::{CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_MKNOD};
+    use linux_raw_sys::general::{CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_MKNOD, CAP_SYS_ADMIN};
     use thekernel_linux_cred::{InodeMknodKind, Kgid, Kuid};
 
     use super::*;
@@ -2918,6 +2918,35 @@ mod tests {
             new_parent.lookup_no_follow_in_mount("malformed-target"),
             Err(AxError::NotFound)
         ));
+    }
+
+    #[test]
+    fn malformed_module_state_denies_pinned_capability_consumers() {
+        let root = memory_root();
+        let source = create_file(&root, "capable-source");
+        let expectation = RenameSecurityTestExpectation::new(
+            &root,
+            &source,
+            "capable-source",
+            &root,
+            None,
+            "capable-target",
+        )
+        .unwrap();
+        let probe = RenameSecurityTestProbe::new(expectation, false);
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let malformed = malformed_rename_security_test_credential(namespace, probe.clone());
+        let security = VfsSecurityContext::new(malformed);
+
+        for capability in [CAP_MKNOD, CAP_SYS_ADMIN, CAP_FOWNER] {
+            assert!(security.credentials().has_capability(capability));
+            assert!(!security.has_capability(capability));
+        }
+        assert_eq!(
+            check_named_create_capability(NodeType::CharacterDevice, &security),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(probe.calls(), 0);
     }
 
     #[test]

@@ -9,13 +9,13 @@ use linux_raw_sys::general::{AT_FDCWD, IN_CREATE, W_OK};
 
 use super::{
     permission::{
-        DacFsContextExt, NamedCreateTerminalType, SecurityFsContextExt, VfsSecurityContext,
+        NamedCreateTerminalType, SecurityFsContextExt, VfsSecurityContext,
         authorize_named_inode_create, check_create_permissions_with_frozen_metadata,
-        check_open_permissions, initial_named_create_owner_mode,
+        check_open_permissions_with_security, initial_named_create_owner_mode_with_security,
     },
     validate_pathname, with_path_fs,
 };
-use crate::{mounts, task::DacCredentialView, time::wall_time};
+use crate::{mounts, time::wall_time};
 
 fn try_owned_name(name: &str) -> AxResult<String> {
     let mut owned = String::new();
@@ -86,9 +86,9 @@ pub(crate) fn bind_path(
         if !parent.supports_named_create(NodeType::Socket) {
             return Err(AxError::OperationNotPermitted);
         }
-        let (mode, owner) = initial_named_create_owner_mode(
+        let (mode, owner) = initial_named_create_owner_mode_with_security(
             &parent_metadata,
-            security.credentials(),
+            security,
             NodeType::Socket,
             requested_mode,
             umask,
@@ -152,14 +152,20 @@ pub(crate) fn bind_path(
 pub(crate) fn bind_precreated_path(
     socket: &UnixSocket,
     path: Arc<String>,
-    credentials: &DacCredentialView,
+    security: &VfsSecurityContext,
 ) -> AxResult<()> {
     let path_ref = Path::new(path.as_ref());
     validate_pathname(path_ref)?;
     let location = with_path_fs(AT_FDCWD, path_ref, |fs| {
-        fs.resolve_no_follow_dac(path_ref, credentials)
+        fs.resolve_no_follow_security(path_ref, security)
     })?;
-    check_open_permissions(&location, W_OK, credentials)?;
+    check_open_permissions_with_security(
+        &location,
+        W_OK,
+        security.actor(),
+        security.credentials(),
+        security.filesystem_owner_user_ns(),
+    )?;
     if location.metadata()?.node_type != NodeType::Socket {
         return Err(AxError::AddrInUse);
     }
@@ -178,14 +184,20 @@ pub(crate) fn bind_precreated_path(
 /// inode write permission using one frozen credential view.
 pub(crate) fn resolve_peer(
     path: Arc<String>,
-    credentials: &DacCredentialView,
+    security: &VfsSecurityContext,
 ) -> AxResult<UnixSocketTarget> {
     let path_ref = Path::new(path.as_ref());
     validate_pathname(path_ref)?;
     let location = with_path_fs(AT_FDCWD, path_ref, |fs| {
-        fs.resolve_dac(path_ref, credentials)
+        fs.resolve_security(path_ref, security)
     })?;
-    check_open_permissions(&location, W_OK, credentials)?;
+    check_open_permissions_with_security(
+        &location,
+        W_OK,
+        security.actor(),
+        security.credentials(),
+        security.filesystem_owner_user_ns(),
+    )?;
     if location.metadata()?.node_type != NodeType::Socket {
         return Err(AxError::ConnectionRefused);
     }

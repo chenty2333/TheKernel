@@ -16,33 +16,52 @@ use super::{
     },
 };
 
-fn access_dac_credentials_for(cred: &Cred, effective: bool) -> DacCredentialView {
-    let credentials = cred.ids();
-    let capabilities = cred.capabilities();
-    let root_kuid = cred.user_ns().root_kuid();
-    let (uid, gid, capability_set) = if effective {
-        (
-            credentials.fsuid,
-            credentials.fsgid,
-            capabilities.effective(),
-        )
-    } else {
-        let capability_set = if capabilities.securebits() & SECBIT_NO_SETUID_FIXUP != 0 {
-            capabilities.effective()
-        } else if root_kuid == Some(credentials.ruid) {
-            capabilities.permitted()
-        } else {
-            [0; CAPABILITY_WORDS]
-        };
-        (credentials.ruid, credentials.rgid, capability_set)
-    };
-    DacCredentialView::new(
-        uid,
-        gid,
-        cred.groups().clone(),
-        capability_set,
-        cred.user_ns().is_initial(),
-    )
+/// One-shot proof that the exact credential currently installed in one slot
+/// passed the typed setgroups capability hook before userspace input was read.
+/// Publication revalidates immutable core authority and namespace policy, but
+/// never dispatches the stacked hook a second time.
+#[must_use = "setgroups admission must be consumed by the matching credential slot"]
+pub(crate) struct SetgroupsAdmission {
+    slot: Arc<CredentialSlot>,
+    credential: Arc<Cred>,
+}
+
+impl SetgroupsAdmission {
+    pub(in crate::task) fn try_new(slot: Arc<CredentialSlot>) -> AxResult<Self> {
+        let credential = slot.current();
+        if !credential.has_effective_capability_for_setid(CAP_SETGID)
+            || !credential.user_ns().may_setgroups()
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+        Ok(Self { slot, credential })
+    }
+
+    fn validate(&self, slot: &Arc<CredentialSlot>, current: &Arc<Cred>) -> AxResult<()> {
+        if !Arc::ptr_eq(&self.slot, slot)
+            || !Arc::ptr_eq(&self.credential, current)
+            || !current
+                .core()
+                .has_effective_capability_in_own_user_ns(CAP_SETGID)
+            || !current.user_ns().may_setgroups()
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn credential(&self) -> &Cred {
+        &self.credential
+    }
+
+    #[cfg(test)]
+    pub(in crate::task) fn validate_fixture(
+        &self,
+        slot: &Arc<CredentialSlot>,
+        current: &Arc<Cred>,
+    ) -> AxResult<()> {
+        self.validate(slot, current)
+    }
 }
 
 fn prepare_setfsuid_update<'a>(
@@ -135,16 +154,21 @@ impl Thread {
             .publish_credential(prepared, self.pdeath_signal_state())
     }
 
-    pub(crate) fn set_supplementary_groups(&self, groups: Vec<Kgid>) -> AxResult<()> {
+    pub(crate) fn admit_setgroups(&self) -> AxResult<SetgroupsAdmission> {
+        SetgroupsAdmission::try_new(self.credential_slot())
+    }
+
+    pub(crate) fn set_supplementary_groups(
+        &self,
+        admission: SetgroupsAdmission,
+        groups: Vec<Kgid>,
+    ) -> AxResult<()> {
         // Sort, deduplicate, validate the bound, and allocate the shared group
         // owner before entering the credential writer transaction.
         let groups = GroupInfo::try_new(groups).map_err(super::cred_error)?;
-        let mut update = self.credential.prepare();
-        if !update.old().user_ns().may_setgroups()
-            || !update.old().has_effective_capability_for_setid(CAP_SETGID)
-        {
-            return Err(AxError::OperationNotPermitted);
-        }
+        let slot = self.credential_slot();
+        let mut update = slot.prepare();
+        admission.validate(&slot, update.old_arc())?;
         if update.old().groups().as_slice() == groups.as_slice() {
             return Ok(());
         }
@@ -172,17 +196,6 @@ impl Thread {
     /// Snapshot the filesystem identity and effective capabilities used by DAC.
     pub(crate) fn fs_dac_credentials(&self) -> DacCredentialView {
         self.current_cred().fs_dac_credentials()
-    }
-
-    /// Snapshot the credentials used by access(2)/faccessat2(2).
-    ///
-    /// Without AT_EACCESS Linux uses real IDs. Unless setuid fixups are
-    /// disabled, a non-root real UID gets no capabilities while real UID 0
-    /// checks with the permitted set. AT_EACCESS keeps the current filesystem
-    /// IDs and effective capability set, matching Linux's normal VFS view.
-    pub(crate) fn access_dac_credentials(&self, effective: bool) -> DacCredentialView {
-        let cred = self.current_cred();
-        access_dac_credentials_for(&cred, effective)
     }
 
     pub fn has_effective_capability(&self, cap: u32) -> bool {
@@ -650,14 +663,14 @@ mod tests {
         assert_eq!(child.root_kuid(), Some(kuid(1000)));
         assert_eq!(child.root_kgid(), Some(kgid(100)));
 
-        let root_view = access_dac_credentials_for(&root_cred, false);
+        let root_view = root_cred.real_id_access_dac_credentials();
         assert!(root_view.selected_capability(CAP_CHOWN));
 
         let slot = CredentialSlot::new(root_cred);
         let mut update = slot.prepare();
         update.builder.ids.ruid = kuid(1001);
         let nonroot_cred = update.finish().unwrap().commit();
-        let nonroot_view = access_dac_credentials_for(&nonroot_cred, false);
+        let nonroot_view = nonroot_cred.real_id_access_dac_credentials();
         assert!(!nonroot_view.selected_capability(CAP_CHOWN));
     }
 

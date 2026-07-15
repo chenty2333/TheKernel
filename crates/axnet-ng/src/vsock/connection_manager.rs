@@ -1,4 +1,7 @@
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+};
 
 use axerrno::{AxError, AxResult, ax_bail};
 use axpoll::PollSet;
@@ -202,35 +205,74 @@ impl Connection {
 
 /// A fixed-size accept queue
 pub struct AcceptQueue {
-    producer: ringbuf::HeapProd<VsockConnId>,
-    consumer: ringbuf::HeapCons<VsockConnId>,
+    items: VecDeque<VsockConnId>,
+    reserved: Option<VsockConnId>,
 }
 
 impl AcceptQueue {
     pub fn try_new() -> AxResult<Self> {
-        let rb = HeapRb::<VsockConnId>::try_new(VSOCK_ACCEPT_QUEUE_SIZE)
+        let mut items = VecDeque::new();
+        items
+            .try_reserve_exact(VSOCK_ACCEPT_QUEUE_SIZE)
             .map_err(|_| AxError::NoMemory)?;
-        let (producer, consumer) = rb.split();
-        Ok(Self { producer, consumer })
+        Ok(Self {
+            items,
+            reserved: None,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.consumer.is_empty()
+        self.reserved.is_some() || self.items.is_empty()
     }
 
     pub fn push(&mut self, conn_id: VsockConnId, backlog: usize) -> AxResult<()> {
-        if self.consumer.occupied_len() >= backlog {
+        if self.items.len() + usize::from(self.reserved.is_some()) >= backlog {
             ax_bail!(ResourceBusy, "accept queue full");
         }
-        match self.producer.try_push(conn_id) {
-            Ok(_) => Ok(()),
-            Err(_) => ax_bail!(ResourceBusy, "accept queue full"),
-        }
+        self.items.push_back(conn_id);
+        Ok(())
     }
 
-    pub fn pop(&mut self) -> Option<VsockConnId> {
-        self.consumer.try_pop()
+    pub fn reserve(&mut self) -> Option<VsockConnId> {
+        if self.reserved.is_some() {
+            return None;
+        }
+        let conn_id = self.items.pop_front()?;
+        self.reserved = Some(conn_id);
+        Some(conn_id)
     }
+
+    pub fn commit(&mut self, expected: VsockConnId) -> bool {
+        if self.reserved != Some(expected) {
+            return false;
+        }
+        self.reserved = None;
+        true
+    }
+
+    pub fn restore(&mut self, expected: VsockConnId) -> bool {
+        if self.reserved != Some(expected) {
+            return false;
+        }
+        self.reserved = None;
+        self.items.push_front(expected);
+        true
+    }
+
+    pub fn discard(&mut self, expected: VsockConnId) -> bool {
+        if self.reserved != Some(expected) {
+            return false;
+        }
+        self.reserved = None;
+        true
+    }
+}
+
+pub(super) struct PreparedVsockAccept {
+    pub(super) queue: Arc<Mutex<ListenQueue>>,
+    pub(super) conn_id: VsockConnId,
+    pub(super) connection: Arc<Mutex<Connection>>,
+    pub(super) peer_addr: VsockAddr,
 }
 
 /// listen queue
@@ -337,17 +379,56 @@ impl VsockConnectionManager {
     }
 
     /// accept a connection
-    pub fn accept(&mut self, port: u32) -> AxResult<(VsockConnId, VsockAddr)> {
+    pub(super) fn prepare_accept(&mut self, port: u32) -> AxResult<PreparedVsockAccept> {
         let queue = self.listen_queues.get(&port).ok_or(AxError::InvalidInput)?;
+        let queue = queue.clone();
+        let conn_id = queue
+            .lock()
+            .accept_queue
+            .reserve()
+            .ok_or(AxError::WouldBlock)?;
+        let Some(connection) = self.connections.get(&conn_id).cloned() else {
+            queue.lock().accept_queue.discard(conn_id);
+            return Err(AxError::NotFound);
+        };
+        let Some(peer_addr) = connection.lock().peer_addr else {
+            queue.lock().accept_queue.discard(conn_id);
+            return Err(AxError::NotFound);
+        };
+        Ok(PreparedVsockAccept {
+            queue,
+            conn_id,
+            connection,
+            peer_addr,
+        })
+    }
 
-        let conn_id = queue.lock().accept_queue.pop().ok_or(AxError::WouldBlock)?;
+    pub(super) fn commit_accept(&mut self, prepared: &PreparedVsockAccept) -> bool {
+        let current = self.listen_queues.get(&prepared.conn_id.local_port);
+        if current.is_some_and(|queue| Arc::ptr_eq(queue, &prepared.queue))
+            && prepared.queue.lock().accept_queue.commit(prepared.conn_id)
+        {
+            debug!(
+                "Accepted connection: {:?} from {:?}",
+                prepared.conn_id, prepared.peer_addr
+            );
+            return true;
+        }
+        prepared.queue.lock().accept_queue.discard(prepared.conn_id);
+        self.remove_connection(prepared.conn_id);
+        false
+    }
 
-        let conn = self.connections.get(&conn_id).ok_or(AxError::NotFound)?;
-
-        let peer_addr = conn.lock().peer_addr.ok_or(AxError::NotFound)?;
-
-        debug!("Accepted connection: {conn_id:?} from {peer_addr:?}");
-        Ok((conn_id, peer_addr))
+    pub(super) fn restore_accept(&mut self, prepared: &PreparedVsockAccept) {
+        let current = self.listen_queues.get(&prepared.conn_id.local_port);
+        if current.is_some_and(|queue| Arc::ptr_eq(queue, &prepared.queue))
+            && prepared.queue.lock().accept_queue.restore(prepared.conn_id)
+        {
+            prepared.queue.lock().wake();
+            return;
+        }
+        prepared.queue.lock().accept_queue.discard(prepared.conn_id);
+        self.remove_connection(prepared.conn_id);
     }
 
     /// create a new connection
@@ -541,4 +622,40 @@ pub static VSOCK_CONN_MANAGER: Mutex<VsockConnectionManager> =
 #[allow(dead_code)]
 pub fn get_vsock_stats() -> VsockStats {
     VSOCK_CONN_MANAGER.lock().get_stats()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connection(local_port: u32, peer_port: u32) -> VsockConnId {
+        VsockConnId {
+            local_port,
+            peer_addr: VsockAddr {
+                cid: 3,
+                port: peer_port,
+            },
+        }
+    }
+
+    #[test]
+    fn accept_queue_reservation_preserves_capacity_and_order() {
+        let mut queue = AcceptQueue::try_new().unwrap();
+        let first = connection(1000, 2000);
+        let second = connection(1000, 2001);
+        queue.push(first, 2).unwrap();
+        queue.push(second, 2).unwrap();
+
+        assert_eq!(queue.reserve(), Some(first));
+        assert!(queue.is_empty());
+        assert_eq!(queue.reserve(), None);
+        assert!(matches!(
+            queue.push(connection(1000, 2002), 2),
+            Err(AxError::ResourceBusy)
+        ));
+        assert!(queue.restore(first));
+        assert_eq!(queue.reserve(), Some(first));
+        assert!(queue.commit(first));
+        assert_eq!(queue.reserve(), Some(second));
+    }
 }

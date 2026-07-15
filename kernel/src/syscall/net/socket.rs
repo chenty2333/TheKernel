@@ -6,32 +6,33 @@ use axfs_ng_vfs::NodePermission;
 #[cfg(feature = "vsock")]
 use axnet::vsock::{VsockSocket, VsockStreamTransport};
 use axnet::{
-    Shutdown, Socket as SocketInner, SocketAddrEx, SocketOps,
-    options::UnixCredentials,
+    MAX_LISTEN_BACKLOG, Shutdown, Socket as SocketInner, SocketAddrEx, SocketOps,
     tcp::TcpSocket,
     udp::UdpSocket,
     unix::{DgramTransport, StreamTransport, UnixSocket, UnixSocketAddr},
 };
-use axtask::current;
 use linux_raw_sys::{
     general::{CAP_NET_BIND_SERVICE, O_CLOEXEC, O_NONBLOCK, O_RDWR},
     net::{
-        AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, AF_UNSPEC, AF_VSOCK, IPPROTO_TCP,
-        IPPROTO_UDP, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET,
-        SOCK_STREAM, sockaddr, socklen_t,
+        AF_INET, AF_INET6, AF_MAX, AF_NETLINK, AF_PACKET, AF_UNIX, AF_UNSPEC, AF_VSOCK,
+        IPPROTO_TCP, IPPROTO_UDP, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW,
+        SOCK_SEQPACKET, SOCK_STREAM, sockaddr, socklen_t,
     },
 };
 use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
 
-use super::addr::SocketAddrExt;
+use super::{SocketSyscallSnapshot, addr::SocketAddrExt};
 use crate::{
     file::{
-        AfAlgSocket, FileDescription, FileLike, NetlinkSocket, PinnedSocketDescription, Socket,
-        SocketBackendKind, add_file_like_with_flags, af_alg, close_file_like,
-        permission::VfsSecurityContext, reserve_fd,
+        AcceptedSocketSecurityRef, AfAlgSocket, FileDescription, FileLike, NetlinkSocket,
+        PendingSocketSecurityRef, PinnedSocketDescription, PreparedSocketAddress, Socket,
+        SocketBackendKind, af_alg, close_file_like, permission::VfsSecurityContext, reserve_fd,
     },
     mm::{UserConstPtr, UserPtr},
-    task::{AsThread, NetworkNamespace, ns_capable},
+    task::{
+        NetworkNamespace, ns_capable,
+        security::{SocketCreateSpec, SocketListenBacklog, SocketSecurityContext, dispatch_socket},
+    },
 };
 
 const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
@@ -43,38 +44,59 @@ const fn socket_status_flags(nonblocking: bool) -> u32 {
     O_RDWR | if nonblocking { O_NONBLOCK } else { 0 }
 }
 
-fn add_new_socket_like<T: FileLike + 'static>(
+fn prepare_new_socket_like<T: FileLike + 'static>(
     socket: T,
     nonblocking: bool,
-    cloexec: bool,
-) -> AxResult<i32> {
-    if nonblocking {
-        socket.set_nonblocking(true)?;
-    }
-    let socket = Arc::try_new(socket).map_err(|_| AxError::NoMemory)?;
-    add_file_like_with_flags(socket, cloexec, socket_status_flags(nonblocking))
-}
-
-fn current_unix_credentials() -> UnixCredentials {
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let ids = curr.as_thread().current_cred().ids();
-    UnixCredentials::new(
-        proc_data.proc.pid(),
-        ids.euid.into_raw(),
-        ids.egid.into_raw(),
+) -> AxResult<PinnedSocketDescription> {
+    prepare_new_socket_arc(
+        Arc::try_new(socket).map_err(|_| AxError::NoMemory)?,
+        nonblocking,
     )
 }
 
-fn require_bind_permissions(addr: &SocketAddrEx, net_ns: &NetworkNamespace) -> AxResult<()> {
+fn prepare_new_socket_arc(
+    socket: Arc<dyn FileLike>,
+    nonblocking: bool,
+) -> AxResult<PinnedSocketDescription> {
+    if nonblocking {
+        socket.set_nonblocking(true)?;
+    }
+    let description = FileDescription::new_with_flags(socket, socket_status_flags(nonblocking))?;
+    PinnedSocketDescription::from_description(description)
+}
+
+fn publish_new_socket_like(socket: PinnedSocketDescription, cloexec: bool) -> AxResult<i32> {
+    reserve_fd(cloexec)?.publish(socket.into_description())
+}
+
+fn dispatch_socket_post_create(
+    actor: &crate::task::Cred,
+    socket: &PinnedSocketDescription,
+    spec: SocketCreateSpec,
+) -> AxResult<()> {
+    let socket_ref = socket.security_ref()?;
+    dispatch_socket(&SocketSecurityContext::post_create(
+        actor,
+        &socket_ref,
+        spec,
+    ))
+}
+
+fn clamp_listen_backlog(backlog: i32) -> usize {
+    (backlog as u32 as usize).min(MAX_LISTEN_BACKLOG)
+}
+
+fn require_bind_permissions(
+    addr: &SocketAddrEx,
+    net_ns: &NetworkNamespace,
+    actor: &crate::task::Cred,
+) -> AxResult<()> {
     let SocketAddrEx::Ip(ip_addr) = addr else {
         return Ok(());
     };
 
     if ip_addr.port() != 0 && ip_addr.port() < FIRST_UNPRIVILEGED_PORT {
-        let current = current();
-        let cred = current.as_thread().current_cred();
-        if !ns_capable(&cred, net_ns.owner_user_ns(), CAP_NET_BIND_SERVICE) {
+        if !ns_capable(actor, net_ns.owner_user_ns(), CAP_NET_BIND_SERVICE) {
             return Err(AxError::from(LinuxError::EACCES));
         }
     }
@@ -105,6 +127,14 @@ fn parse_accept4_flags(flags: u32) -> AxResult<(bool, bool)> {
     }
 
     Ok((flags & O_NONBLOCK != 0, flags & O_CLOEXEC != 0))
+}
+
+fn validate_pre_create_domain(domain: u32) -> AxResult<()> {
+    if domain == AF_PACKET || domain >= AF_MAX {
+        Err(LinuxError::EAFNOSUPPORT.into())
+    } else {
+        Ok(())
+    }
 }
 
 fn supported_stream_protocol(proto: u32) -> bool {
@@ -140,27 +170,28 @@ fn inet_socketpair_error(ty: u32, proto: u32) -> AxError {
 pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     debug!("sys_socket <= domain: {domain}, ty: {raw_ty}, proto: {proto}");
     let (ty, nonblocking, cloexec) = parse_socket_type(raw_ty)?;
+    validate_pre_create_domain(domain)?;
+    let snapshot = SocketSyscallSnapshot::capture();
+    let spec = SocketCreateSpec::try_new(domain as i32, ty as i32, proto as i32, false)
+        .ok_or(AxError::InvalidInput)?;
+    let actor = snapshot.actor();
+    dispatch_socket(&SocketSecurityContext::create(&actor, spec))?;
 
     if domain == af_alg::AF_ALG {
         AfAlgSocket::validate_socket_type(ty, proto)?;
-        let socket = AfAlgSocket::new_listener();
-        return add_new_socket_like(socket, nonblocking, cloexec).map(|fd| fd as isize);
+        let socket = prepare_new_socket_like(AfAlgSocket::new_listener(), nonblocking)?;
+        dispatch_socket_post_create(&actor, &socket, spec)?;
+        return publish_new_socket_like(socket, cloexec).map(|fd| fd as isize);
     }
 
-    if domain == AF_PACKET {
-        return Err(LinuxError::EAFNOSUPPORT.into());
-    }
-
-    let net_ns = current().as_thread().proc_data.net_ns.clone();
+    let net_ns = snapshot.net_namespace().clone();
 
     if domain == AF_NETLINK {
         NetlinkSocket::validate_socket_type(ty, proto)?;
         let socket = NetlinkSocket::try_new(proto, net_ns)?;
-        if nonblocking {
-            socket.set_nonblocking(true)?;
-        }
-        return add_file_like_with_flags(socket as _, cloexec, socket_status_flags(nonblocking))
-            .map(|fd| fd as isize);
+        let socket = prepare_new_socket_arc(socket, nonblocking)?;
+        dispatch_socket_post_create(&actor, &socket, spec)?;
+        return publish_new_socket_like(socket, cloexec).map(|fd| fd as isize);
     }
 
     let net_stack = net_ns.stack().clone();
@@ -205,16 +236,30 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
         }
     };
     let socket = Socket::new(socket, net_ns);
-
-    add_new_socket_like(socket, nonblocking, cloexec).map(|fd| fd as isize)
+    let socket = prepare_new_socket_like(socket, nonblocking)?;
+    dispatch_socket_post_create(&actor, &socket, spec)?;
+    publish_new_socket_like(socket, cloexec).map(|fd| fd as isize)
 }
 
 pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult<isize> {
+    let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
+    let actor = snapshot.actor();
+    let socket_ref = pinned.security_ref()?;
     match pinned.backend()? {
         SocketBackendKind::AfAlg => {
             let addr = af_alg::SockAddrAlg::read_from_user(addr, addrlen)?;
             debug!("sys_bind <= fd: {fd}, af_alg: {addr:?}");
+            let prepared = PreparedSocketAddress::AfAlg(addr);
+            dispatch_socket(&SocketSecurityContext::bind(
+                &actor,
+                &socket_ref,
+                &prepared,
+                addrlen as usize,
+            ))?;
+            let PreparedSocketAddress::AfAlg(addr) = prepared else {
+                unreachable!();
+            };
             pinned.af_alg()?.bind(addr)?;
         }
         SocketBackendKind::Netlink => {
@@ -233,32 +278,47 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
                 return Err(AxError::from(LinuxError::EAFNOSUPPORT));
             }
             let port_id = if addr.nl_pid == 0 {
-                current().as_thread().proc_data.proc.pid() as u32
+                snapshot.pid()
             } else {
                 addr.nl_pid
             };
+            let prepared = PreparedSocketAddress::Netlink(addr);
+            dispatch_socket(&SocketSecurityContext::bind(
+                &actor,
+                &socket_ref,
+                &prepared,
+                addrlen as usize,
+            ))?;
             pinned.netlink()?.bind(port_id, addr.nl_groups)?;
         }
         SocketBackendKind::Network => {
             let socket = pinned.network()?;
             let addr = SocketAddrEx::read_from_user(addr, addrlen)?;
             debug!("sys_bind <= fd: {fd}, addr: {addr:?}");
+            let prepared = PreparedSocketAddress::Network(addr);
+            dispatch_socket(&SocketSecurityContext::bind(
+                &actor,
+                &socket_ref,
+                &prepared,
+                addrlen as usize,
+            ))?;
+            let PreparedSocketAddress::Network(addr) = prepared else {
+                unreachable!();
+            };
 
             if let (SocketInner::Unix(unix), SocketAddrEx::Unix(UnixSocketAddr::Path(path))) =
                 (&socket.inner, &addr)
             {
-                let curr = current();
-                let proc_data = &curr.as_thread().proc_data;
-                let security = VfsSecurityContext::new(curr.as_thread().current_cred());
+                let security = VfsSecurityContext::new(actor.clone());
                 crate::file::unix_socket::bind_path(
                     unix,
                     path.clone(),
                     &security,
                     NodePermission::from_bits_truncate(0o777),
-                    proc_data.umask(),
+                    snapshot.umask(),
                 )?;
             } else {
-                require_bind_permissions(&addr, socket.net_namespace())?;
+                require_bind_permissions(&addr, socket.net_namespace(), actor)?;
                 socket.bind(addr)?;
             }
         }
@@ -268,6 +328,7 @@ pub fn sys_bind(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult
 }
 
 pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxResult<isize> {
+    let snapshot = SocketSyscallSnapshot::capture();
     // Pin the open file description once. Address decoding intentionally
     // remains before the ENOTSOCK downcast for the ordinary connect path, but
     // a sibling sharing the fd table can no longer redirect the operation by
@@ -278,7 +339,17 @@ pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxRes
         && super::addr::read_family(addr, addrlen)? as u32 == AF_UNSPEC
     {
         debug!("sys_connect <= fd: {fd}, addr: AF_UNSPEC");
-        pinned.network()?.disconnect()?;
+        let socket = pinned.network()?;
+        let actor = snapshot.actor();
+        let socket_ref = pinned.security_ref()?;
+        let prepared = PreparedSocketAddress::Unspecified;
+        dispatch_socket(&SocketSecurityContext::connect(
+            &actor,
+            &socket_ref,
+            &prepared,
+            addrlen as usize,
+        ))?;
+        socket.disconnect()?;
         return Ok(0);
     }
 
@@ -286,15 +357,70 @@ pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxRes
     debug!("sys_connect <= fd: {fd}, addr: {addr:?}");
 
     let socket = pinned.network()?;
+    let actor = snapshot.actor();
+    let socket_ref = pinned.security_ref()?;
+    let prepared = PreparedSocketAddress::Network(addr);
+    dispatch_socket(&SocketSecurityContext::connect(
+        &actor,
+        &socket_ref,
+        &prepared,
+        addrlen as usize,
+    ))?;
+    let PreparedSocketAddress::Network(addr) = prepared else {
+        unreachable!();
+    };
     let result = match (&socket.inner, &addr) {
         (SocketInner::Unix(unix), SocketAddrEx::Unix(UnixSocketAddr::Path(path))) => {
-            let curr = current();
-            let credentials = curr.as_thread().fs_dac_credentials();
-            let target = crate::file::unix_socket::resolve_peer(path.clone(), &credentials)?;
-            unix.connect_resolved_as(target, current_unix_credentials())
+            let security = VfsSecurityContext::new(actor.clone());
+            let target = crate::file::unix_socket::resolve_peer(path.clone(), &security)?;
+            if unix.is_datagram() {
+                unix.connect_resolved_as(target, snapshot.unix_credentials())
+            } else {
+                let reservation =
+                    unix.prepare_stream_connect_resolved_as(target, snapshot.unix_credentials())?;
+                let listening = crate::file::UnixEndpointSecurityRef::new(
+                    reservation.listening_identity(),
+                    socket.net_namespace(),
+                    &reservation,
+                );
+                let accepted = crate::file::UnixEndpointSecurityRef::new(
+                    reservation.accepted_identity(),
+                    socket.net_namespace(),
+                    &reservation,
+                );
+                dispatch_socket(&SocketSecurityContext::unix_stream_connect(
+                    &actor,
+                    &socket_ref,
+                    &listening,
+                    &accepted,
+                ))?;
+                reservation.commit()
+            }
         }
         (SocketInner::Unix(unix), SocketAddrEx::Unix(_)) => {
-            unix.connect_as(addr.clone(), current_unix_credentials())
+            if unix.is_datagram() {
+                unix.connect_as(addr.clone(), snapshot.unix_credentials())
+            } else {
+                let reservation =
+                    unix.prepare_stream_connect_as(addr.clone(), snapshot.unix_credentials())?;
+                let listening = crate::file::UnixEndpointSecurityRef::new(
+                    reservation.listening_identity(),
+                    socket.net_namespace(),
+                    &reservation,
+                );
+                let accepted = crate::file::UnixEndpointSecurityRef::new(
+                    reservation.accepted_identity(),
+                    socket.net_namespace(),
+                    &reservation,
+                );
+                dispatch_socket(&SocketSecurityContext::unix_stream_connect(
+                    &actor,
+                    &socket_ref,
+                    &listening,
+                    &accepted,
+                ))?;
+                reservation.commit()
+            }
         }
         _ => socket.connect(addr.clone()),
     };
@@ -312,13 +438,23 @@ pub fn sys_connect(fd: i32, addr: UserConstPtr<sockaddr>, addrlen: u32) -> AxRes
 pub fn sys_listen(fd: i32, backlog: i32) -> AxResult<isize> {
     debug!("sys_listen <= fd: {fd}, backlog: {backlog}");
 
-    // Linux treats a negative backlog as zero. The transport applies its own
-    // finite queue cap, analogous to net.core.somaxconn.
+    let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
     let socket = pinned.network()?;
-    let backlog = backlog.max(0) as usize;
+    // Linux compares `(unsigned int)backlog` with somaxconn. Negative values
+    // therefore clamp to the namespace maximum rather than to zero.
+    let backlog = clamp_listen_backlog(backlog);
+    let actor = snapshot.actor();
+    let socket_ref = pinned.security_ref()?;
+    let prepared_backlog =
+        SocketListenBacklog::try_from_clamped(backlog as i32).ok_or(AxError::InvalidInput)?;
+    dispatch_socket(&SocketSecurityContext::listen(
+        &actor,
+        &socket_ref,
+        prepared_backlog,
+    ))?;
     if let SocketInner::Unix(unix) = &socket.inner {
-        unix.listen_as(backlog, current_unix_credentials())?;
+        unix.listen_as(backlog, snapshot.unix_credentials())?;
     } else {
         socket.listen(backlog)?;
     }
@@ -343,19 +479,38 @@ pub fn sys_accept4(
     debug!("sys_accept <= fd: {fd}, flags: {flags}");
 
     let (nonblocking, cloexec) = parse_accept4_flags(flags)?;
+    let snapshot = SocketSyscallSnapshot::capture();
 
     let pinned = PinnedSocketDescription::from_fd(fd)?;
+    let actor = snapshot.actor();
+    let listening_ref = pinned.security_ref()?;
     if pinned.backend()? == SocketBackendKind::AfAlg {
         let request = pinned.af_alg()?.accept_request()?;
+        let request = prepare_new_socket_like(request, nonblocking)?;
+        let accepted_ref = request.security_ref()?;
+        let accepted_ref = AcceptedSocketSecurityRef::Description(accepted_ref);
+        dispatch_socket(&SocketSecurityContext::accept(
+            &actor,
+            &listening_ref,
+            &accepted_ref,
+        ))?;
         if !addr.is_null() {
             (addrlen.address().as_usize() as *mut socklen_t).vm_write(0)?;
         }
-        return add_new_socket_like(request, nonblocking, cloexec).map(|fd| fd as isize);
+        return publish_new_socket_like(request, cloexec).map(|fd| fd as isize);
     }
 
     let socket = pinned.network()?;
     let net_ns = socket.net_namespace().clone();
-    let socket = Socket::new(socket.accept()?, net_ns);
+    let reservation = socket.prepare_accept()?;
+    let pending_ref = PendingSocketSecurityRef::new(&reservation, &net_ns);
+    let accepted_ref = AcceptedSocketSecurityRef::Pending(pending_ref);
+    dispatch_socket(&SocketSecurityContext::accept(
+        &actor,
+        &listening_ref,
+        &accepted_ref,
+    ))?;
+    let socket = Socket::new(reservation.commit()?, net_ns);
 
     let remote_addr = socket.peer_addr()?;
     if !addr.is_null() {
@@ -365,7 +520,8 @@ pub fn sys_accept4(
         addrlen_ptr.vm_write(value)?;
     }
 
-    let fd = add_new_socket_like(socket, nonblocking, cloexec).map(|fd| fd as isize)?;
+    let socket = prepare_new_socket_like(socket, nonblocking)?;
+    let fd = publish_new_socket_like(socket, cloexec).map(|fd| fd as isize)?;
     debug!("sys_accept => fd: {fd}, addr: {remote_addr:?}");
 
     Ok(fd)
@@ -374,8 +530,16 @@ pub fn sys_accept4(
 pub fn sys_shutdown(fd: i32, how: u32) -> AxResult<isize> {
     debug!("sys_shutdown <= fd: {fd}, how: {how:?}");
 
+    let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
     let socket = pinned.network()?;
+    let actor = snapshot.actor();
+    let socket_ref = pinned.security_ref()?;
+    dispatch_socket(&SocketSecurityContext::shutdown(
+        &actor,
+        &socket_ref,
+        how as i32,
+    ))?;
     let how = match how {
         SHUT_RD => Shutdown::Read,
         SHUT_WR => Shutdown::Write,
@@ -402,8 +566,15 @@ pub fn sys_socketpair(
         return Err(AxError::from(LinuxError::EAFNOSUPPORT));
     }
 
-    let credentials = current_unix_credentials();
-    let net_ns = current().as_thread().proc_data.net_ns.clone();
+    let snapshot = SocketSyscallSnapshot::capture();
+    let spec = SocketCreateSpec::try_new(domain as i32, ty as i32, proto as i32, false)
+        .ok_or(AxError::InvalidInput)?;
+    let actor = snapshot.actor();
+    dispatch_socket(&SocketSecurityContext::create(&actor, spec))?;
+    dispatch_socket(&SocketSecurityContext::create(&actor, spec))?;
+
+    let credentials = snapshot.unix_credentials();
+    let net_ns = snapshot.net_namespace().clone();
     let unix_namespace = net_ns.stack().unix_namespace();
     let (sock1, sock2) = match ty {
         SOCK_STREAM => {
@@ -439,12 +610,6 @@ pub fn sys_socketpair(
         sock2.set_nonblocking(true)?;
     }
 
-    // Reserve both numbers before exposing either descriptor. The user copy
-    // operates on a kernel-owned array and completes before fd publication,
-    // so a concurrent unmap/remap cannot invalidate a retained Rust reference
-    // and EFAULT leaves no partially installed socket behind.
-    let reserved1 = reserve_fd(cloexec)?;
-    let reserved2 = reserve_fd(cloexec)?;
     let status_flags = socket_status_flags(nonblocking);
     let description1 = FileDescription::new_with_flags(
         Arc::try_new(sock1).map_err(|_| AxError::NoMemory)? as Arc<dyn FileLike>,
@@ -454,11 +619,29 @@ pub fn sys_socketpair(
         Arc::try_new(sock2).map_err(|_| AxError::NoMemory)? as Arc<dyn FileLike>,
         status_flags,
     )?;
+    let socket1 = PinnedSocketDescription::from_description(description1)?;
+    let socket2 = PinnedSocketDescription::from_description(description2)?;
+    dispatch_socket_post_create(&actor, &socket1, spec)?;
+    dispatch_socket_post_create(&actor, &socket2, spec)?;
+    {
+        let socket1_ref = socket1.security_ref()?;
+        let socket2_ref = socket2.security_ref()?;
+        dispatch_socket(&SocketSecurityContext::pair(
+            &actor,
+            &socket1_ref,
+            &socket2_ref,
+        ))?;
+    }
+
+    // No descriptor number or userspace output exists before every create,
+    // post-create, and pair hook has admitted both private endpoints.
+    let reserved1 = reserve_fd(cloexec)?;
+    let reserved2 = reserve_fd(cloexec)?;
     let fd_pair = [reserved1.fd(), reserved2.fd()];
     vm_write_slice(fds.address().as_usize() as *mut i32, &fd_pair)?;
 
-    let fd1 = reserved1.publish(description1)?;
-    if let Err(error) = reserved2.publish(description2) {
+    let fd1 = reserved1.publish(socket1.into_description())?;
+    if let Err(error) = reserved2.publish(socket2.into_description()) {
         let _ = close_file_like(fd1);
         return Err(error);
     }
@@ -473,5 +656,18 @@ mod tests {
     fn socket_creation_flags_keep_read_write_and_nonblocking_on_the_ofd() {
         assert_eq!(socket_status_flags(false), O_RDWR);
         assert_eq!(socket_status_flags(true), O_RDWR | O_NONBLOCK);
+    }
+
+    #[test]
+    fn unsupported_packet_and_out_of_range_families_fail_before_create_policy() {
+        assert_eq!(
+            validate_pre_create_domain(AF_PACKET),
+            Err(LinuxError::EAFNOSUPPORT.into())
+        );
+        assert_eq!(
+            validate_pre_create_domain(AF_MAX),
+            Err(LinuxError::EAFNOSUPPORT.into())
+        );
+        assert!(validate_pre_create_domain(AF_INET).is_ok());
     }
 }

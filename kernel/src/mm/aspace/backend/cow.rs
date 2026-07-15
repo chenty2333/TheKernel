@@ -16,8 +16,8 @@ use kspin::SpinNoIrq;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, PopulateCallback, alloc_frame, dealloc_frame, page_table_flags,
-    pages_in,
+    AddrSpace, Backend, BackendOps, MappingStatus, PopulateCallback, alloc_frame, dealloc_frame,
+    page_table_flags, pages_in,
 };
 
 struct FrameRefCnt(u32);
@@ -74,16 +74,11 @@ impl FrameTableRefCount {
 
 static FRAME_TABLE: SpinNoIrq<FrameTableRefCount> = SpinNoIrq::new(FrameTableRefCount::new());
 
-fn relocate_backend_start(
-    backend_start: VirtAddr,
-    old_start: VirtAddr,
-    new_start: VirtAddr,
-) -> VirtAddr {
-    if backend_start >= old_start {
-        new_start + backend_start.sub_addr(old_start)
-    } else {
-        new_start.sub(old_start.sub_addr(backend_start))
-    }
+fn advance_file_start(file_start: u64, backing_advance: usize) -> AxResult<u64> {
+    let backing_advance = u64::try_from(backing_advance).map_err(|_| AxError::InvalidInput)?;
+    file_start
+        .checked_add(backing_advance)
+        .ok_or(AxError::InvalidInput)
 }
 
 /// Copy-on-write mapping backend.
@@ -96,10 +91,19 @@ pub struct CowBackend {
     file: Option<(CachedFile, u64, Option<u64>, bool)>,
     map_id: Arc<()>,
     materialized: Arc<AtomicBool>,
+    status: MappingStatus,
 }
 
 impl CowBackend {
     const ANON_FAULT_AROUND_PAGES: usize = 4;
+
+    pub(super) const fn mapping_status(&self) -> &MappingStatus {
+        &self.status
+    }
+
+    pub(super) fn mapping_status_mut(&mut self) -> &mut MappingStatus {
+        &mut self.status
+    }
 
     fn alloc_new_frame(&self, zeroed: bool) -> AxResult<PhysAddr> {
         alloc_frame(zeroed, self.size)
@@ -240,14 +244,31 @@ impl CowBackend {
         old_start: VirtAddr,
         new_start: VirtAddr,
         map_id: Arc<()>,
-    ) -> Self {
-        Self {
-            start: relocate_backend_start(self.start, old_start, new_start),
+    ) -> AxResult<Self> {
+        let (start, backing_advance) =
+            super::relocate_affine_origin(self.start, old_start, new_start)?;
+        let file = self
+            .file
+            .as_ref()
+            .map(
+                |(file, file_start, file_end, sigbus_on_eof)| -> AxResult<_> {
+                    Ok((
+                        file.clone(),
+                        advance_file_start(*file_start, backing_advance)?,
+                        *file_end,
+                        *sigbus_on_eof,
+                    ))
+                },
+            )
+            .transpose()?;
+        Ok(Self {
+            start,
             size: self.size,
-            file: self.file.clone(),
+            file,
             map_id,
             materialized: self.materialized.clone(),
-        }
+            status: self.status.relocated(old_start, new_start)?,
+        })
     }
 
     pub(crate) fn faults_with_sigbus(&self, vaddr: VirtAddr) -> bool {
@@ -287,11 +308,19 @@ impl CowBackend {
         resident
     }
 
-    pub(crate) fn clone_for_range(&self, old_start: VirtAddr, new_start: VirtAddr) -> Self {
+    pub(crate) fn clone_for_range(
+        &self,
+        old_start: VirtAddr,
+        new_start: VirtAddr,
+    ) -> AxResult<Self> {
         self.clone_for_range_with_id(old_start, new_start, self.map_id.clone())
     }
 
-    pub(crate) fn duplicate_mapping(&self, old_start: VirtAddr, new_start: VirtAddr) -> Self {
+    pub(crate) fn duplicate_mapping(
+        &self,
+        old_start: VirtAddr,
+        new_start: VirtAddr,
+    ) -> AxResult<Self> {
         self.clone_for_range_with_id(old_start, new_start, Arc::new(()))
     }
 
@@ -385,6 +414,29 @@ impl CowBackend {
 
     pub(crate) fn is_private_anonymous(&self) -> bool {
         self.file.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn low_address_cow_suffix_advances_the_file_cursor() {
+        let (start, backing_advance) = super::super::relocate_affine_origin(
+            VirtAddr::from(0x4000),
+            VirtAddr::from(0x8000),
+            VirtAddr::from(0x1000),
+        )
+        .unwrap();
+
+        assert_eq!(start, VirtAddr::from(0x1000));
+        assert_eq!(backing_advance, 0x4000);
+        assert_eq!(advance_file_start(0x20_000, backing_advance), Ok(0x24_000));
+        assert_eq!(
+            advance_file_start(u64::MAX - 0x1000, backing_advance),
+            Err(AxError::InvalidInput)
+        );
     }
 }
 
@@ -542,6 +594,7 @@ impl Backend {
             )),
             map_id: Arc::new(()),
             materialized: Arc::new(AtomicBool::new(false)),
+            status: MappingStatus::default(),
         })
     }
 
@@ -552,6 +605,7 @@ impl Backend {
             file: None,
             map_id: Arc::new(()),
             materialized: Arc::new(AtomicBool::new(false)),
+            status: MappingStatus::default(),
         })
     }
 }

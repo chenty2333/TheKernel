@@ -5,7 +5,7 @@ use axhal::paging::{MappingFlags, PageSize, PageTableCursor};
 use axsync::Mutex;
 use memory_addr::{PhysAddr, PhysAddrRange, VirtAddr, VirtAddrRange};
 
-use super::{AddrSpace, Backend, BackendOps, page_table_flags};
+use super::{AddrSpace, Backend, BackendOps, MappingStatus, page_table_flags};
 
 /// Linear mapping backend.
 ///
@@ -16,9 +16,18 @@ pub struct LinearBackend {
     phys_start: PhysAddr,
     max_size: usize,
     map_id: Arc<()>,
+    status: MappingStatus,
 }
 
 impl LinearBackend {
+    pub(super) const fn mapping_status(&self) -> &MappingStatus {
+        &self.status
+    }
+
+    pub(super) fn mapping_status_mut(&mut self) -> &mut MappingStatus {
+        &mut self.status
+    }
+
     fn check_range(&self, range: VirtAddrRange) -> AxResult {
         let offset = range
             .start
@@ -49,24 +58,27 @@ impl LinearBackend {
         new_start: VirtAddr,
         map_id: Arc<()>,
     ) -> AxResult<Backend> {
-        let prefix = old_start
-            .as_usize()
-            .checked_sub(self.start.as_usize())
-            .ok_or(AxError::InvalidInput)?;
-        let start = VirtAddr::from(
-            new_start
+        let (start, backing_advance) =
+            super::relocate_affine_origin(self.start, old_start, new_start)?;
+        let phys_start = PhysAddr::from(
+            self.phys_start
                 .as_usize()
-                .checked_sub(prefix)
+                .checked_add(backing_advance)
                 .ok_or(AxError::InvalidInput)?,
         );
+        let max_size = self
+            .max_size
+            .checked_sub(backing_advance)
+            .ok_or(AxError::InvalidInput)?;
         Ok(Backend::Linear(Self {
             start,
-            phys_start: self.phys_start,
-            max_size: self
-                .max_size
-                .checked_sub(prefix)
-                .ok_or(AxError::InvalidInput)?,
+            phys_start,
+            // `start` remains the relocated origin of the complete physical
+            // window when representable. A low-address suffix rebase advances
+            // the physical cursor and drops only the unreachable prefix.
+            max_size,
             map_id,
+            status: self.status.relocated(old_start, new_start)?,
         }))
     }
 
@@ -138,6 +150,81 @@ impl Backend {
             phys_start,
             max_size,
             map_id: Arc::new(()),
+            status: MappingStatus::default(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relocating_a_linear_suffix_preserves_coverage_and_merge_identity() {
+        let origin = VirtAddr::from(0x4000);
+        let relocated_origin = VirtAddr::from(0x10_000);
+        let map_id = Arc::new(());
+        let backend = LinearBackend {
+            start: origin,
+            phys_start: PhysAddr::from(0x80_000),
+            max_size: 0x4000,
+            map_id: map_id.clone(),
+            status: MappingStatus::default(),
+        };
+
+        let Backend::Linear(first) = backend
+            .clone_for_range(origin, relocated_origin, map_id.clone())
+            .unwrap()
+        else {
+            unreachable!();
+        };
+        let Backend::Linear(suffix) = backend
+            .clone_for_range(origin + 0x2000, relocated_origin + 0x2000, map_id)
+            .unwrap()
+        else {
+            unreachable!();
+        };
+
+        suffix
+            .ensure_range_covered(relocated_origin + 0x2000, 0x2000)
+            .unwrap();
+        assert!(first.compatible_with(&suffix));
+    }
+
+    #[test]
+    fn low_address_linear_suffix_rebases_the_physical_window() {
+        let origin = VirtAddr::from(0x4000);
+        let source = VirtAddr::from(0x8000);
+        let destination = VirtAddr::from(0x1000);
+        let phys_origin = PhysAddr::from(0x80_000);
+        let map_id = Arc::new(());
+        let backend = LinearBackend {
+            start: origin,
+            phys_start: phys_origin,
+            max_size: 0x8000,
+            map_id: map_id.clone(),
+            status: MappingStatus::default(),
+        };
+
+        let Backend::Linear(first) = backend
+            .clone_for_range(source, destination, map_id.clone())
+            .unwrap()
+        else {
+            unreachable!();
+        };
+        let Backend::Linear(second_fragment) = backend
+            .clone_for_range(source, destination, map_id)
+            .unwrap()
+        else {
+            unreachable!();
+        };
+
+        assert_eq!(first.start, destination);
+        assert_eq!(first.phys_start, phys_origin + 0x4000);
+        assert_eq!(first.max_size, 0x4000);
+        assert_eq!(first.pa(destination), backend.pa(source));
+        assert_eq!(first.pa(destination + 0x1000), backend.pa(source + 0x1000));
+        first.ensure_range_covered(destination, 0x4000).unwrap();
+        assert!(first.compatible_with(&second_fragment));
     }
 }

@@ -21,7 +21,10 @@ mod shared;
 
 pub(crate) use self::phys_pin::{PhysicalFramePin, pin_frame};
 pub use self::shared::SharedPages;
-use super::AddrSpace;
+use super::{
+    AddrSpace,
+    mapping::{FileMappingLease, MappingStatus, relocate_affine_origin},
+};
 
 fn divide_page(size: usize, page_size: PageSize) -> AxResult<usize> {
     if !page_size.is_aligned(size) {
@@ -238,7 +241,39 @@ impl Backend {
     }
 
     pub fn is_private_anonymous(&self) -> bool {
-        matches!(self, Backend::Cow(backend) if backend.is_private_anonymous())
+        self.file_mapping().is_none()
+            && matches!(self, Backend::Cow(backend) if backend.is_private_anonymous())
+    }
+
+    fn mapping_status(&self) -> &MappingStatus {
+        match self {
+            Backend::Linear(backend) => backend.mapping_status(),
+            Backend::Cow(backend) => backend.mapping_status(),
+            Backend::Shared(backend) => backend.mapping_status(),
+            Backend::File(backend) => backend.mapping_status(),
+        }
+    }
+
+    fn mapping_status_mut(&mut self) -> &mut MappingStatus {
+        match self {
+            Backend::Linear(backend) => backend.mapping_status_mut(),
+            Backend::Cow(backend) => backend.mapping_status_mut(),
+            Backend::Shared(backend) => backend.mapping_status_mut(),
+            Backend::File(backend) => backend.mapping_status_mut(),
+        }
+    }
+
+    pub(crate) fn file_mapping(&self) -> Option<&FileMappingLease> {
+        self.mapping_status().file_mapping()
+    }
+
+    pub(crate) fn replace_file_mapping(&mut self, file: Option<FileMappingLease>) {
+        self.mapping_status_mut().replace_file_mapping(file);
+    }
+
+    pub(crate) fn with_file_mapping(mut self, file: FileMappingLease) -> Self {
+        self.replace_file_mapping(Some(file));
+        self
     }
 
     pub fn supports_user_io_frame_pin(&self) -> bool {
@@ -264,6 +299,13 @@ impl Backend {
     }
 
     pub fn check_protect_flags(&self, flags: MappingFlags) -> AxResult {
+        let requested = flags & (MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE);
+        if self
+            .file_mapping()
+            .is_some_and(|mapping| !mapping.may_protect().contains(requested))
+        {
+            return Err(AxError::PermissionDenied);
+        }
         match self {
             Backend::File(backend) => backend.check_flags(flags),
             Backend::Shared(backend) => backend.check_protect_flags(flags),
@@ -279,12 +321,12 @@ impl Backend {
     ) -> AxResult<Self> {
         match self {
             Backend::Linear(backend) => backend.relocate(old_start, new_start),
-            Backend::Cow(backend) => {
-                Ok(Backend::Cow(backend.clone_for_range(old_start, new_start)))
-            }
-            Backend::Shared(backend) => Ok(Backend::Shared(
-                backend.clone_for_range(old_start, new_start),
-            )),
+            Backend::Cow(backend) => backend
+                .clone_for_range(old_start, new_start)
+                .map(Backend::Cow),
+            Backend::Shared(backend) => backend
+                .clone_for_range(old_start, new_start)
+                .map(Backend::Shared),
             Backend::File(backend) => backend
                 .clone_for_range(old_start, new_start, aspace)
                 .map(Backend::File),
@@ -299,12 +341,12 @@ impl Backend {
     ) -> AxResult<Self> {
         match self {
             Backend::Linear(backend) => backend.duplicate_mapping(old_start, new_start),
-            Backend::Cow(backend) => Ok(Backend::Cow(
-                backend.duplicate_mapping(old_start, new_start),
-            )),
-            Backend::Shared(backend) => Ok(Backend::Shared(
-                backend.duplicate_mapping(old_start, new_start),
-            )),
+            Backend::Cow(backend) => backend
+                .duplicate_mapping(old_start, new_start)
+                .map(Backend::Cow),
+            Backend::Shared(backend) => backend
+                .duplicate_mapping(old_start, new_start)
+                .map(Backend::Shared),
             Backend::File(backend) => backend
                 .duplicate_mapping(old_start, new_start, aspace)
                 .map(Backend::File),
@@ -330,23 +372,31 @@ impl Backend {
     }
 
     pub fn compatible_with(&self, other: &Self) -> bool {
-        match (self, other) {
+        let backend_compatible = match (self, other) {
             (Backend::Linear(lhs), Backend::Linear(rhs)) => lhs.compatible_with(rhs),
             (Backend::Cow(lhs), Backend::Cow(rhs)) => lhs.compatible_with(rhs),
             (Backend::Shared(lhs), Backend::Shared(rhs)) => lhs.compatible_with(rhs),
             (Backend::File(lhs), Backend::File(rhs)) => lhs.compatible_with(rhs),
             _ => false,
-        }
+        };
+        backend_compatible
+            && self
+                .mapping_status()
+                .compatible_with(other.mapping_status())
     }
 
     pub fn mergeable_with(&self, other: &Self) -> bool {
-        match (self, other) {
+        let backend_mergeable = match (self, other) {
             (Backend::Linear(lhs), Backend::Linear(rhs)) => lhs.compatible_with(rhs),
             (Backend::Cow(lhs), Backend::Cow(rhs)) => lhs.mergeable_with(rhs),
             (Backend::Shared(lhs), Backend::Shared(rhs)) => lhs.compatible_with(rhs),
             (Backend::File(lhs), Backend::File(rhs)) => lhs.compatible_with(rhs),
             _ => false,
-        }
+        };
+        backend_mergeable
+            && self
+                .mapping_status()
+                .compatible_with(other.mapping_status())
     }
 
     pub fn fault_around_size(&self, access_flags: MappingFlags) -> usize {
@@ -361,5 +411,165 @@ impl Backend {
             Backend::File(backend) => backend.sync(data_only),
             Backend::Linear(_) | Backend::Cow(_) | Backend::Shared(_) => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use axfs::{CachedFile, FileBackend, FileFlags};
+    use axfs_ng_vfs::{Mountpoint, NodePermission, NodeType};
+
+    use super::*;
+    use crate::{
+        file::{File, FileDescription, FileHandle, FileLike},
+        mm::{FileMappingLease, FileMappingSharing},
+        pseudofs::tmp::MemoryFs,
+        task::UserNamespace,
+    };
+
+    #[test]
+    fn every_file_origin_backend_retains_one_mapping_status() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let location = mount
+            .root_location()
+            .create(
+                "mapping-status-backends",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let flags = FileFlags::READ | FileFlags::WRITE;
+        let description = FileDescription::new(Arc::new(File::new(axfs::File::new(
+            FileBackend::Direct(location.clone()),
+            flags,
+        ))))
+        .unwrap();
+        let handle = FileHandle::<dyn FileLike>::from_description_for_test(description)
+            .downcast::<File>()
+            .unwrap();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let lease = FileMappingLease::new(
+            handle,
+            namespace.clone(),
+            VirtAddr::from(0x4000),
+            0,
+            MappingFlags::USER | MappingFlags::READ,
+            MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
+            FileMappingSharing::Private,
+        );
+        let ofd_key = lease.ofd_key();
+        let file = Backend::new_file_for_mapping_status_test(
+            VirtAddr::from(0x4000),
+            CachedFile::get_or_create(location.clone()),
+            flags,
+        );
+        let shared_pages = Arc::new(SharedPages::new(0, PageSize::Size4K).unwrap());
+        let backends = [
+            Backend::new_alloc(VirtAddr::from(0x4000), PageSize::Size4K),
+            Backend::new_shared(VirtAddr::from(0x4000), shared_pages.clone()),
+            Backend::new_linear(VirtAddr::from(0x4000), PhysAddr::from(0x8000), PAGE_SIZE_4K),
+            file,
+        ];
+        // SharedPages uses the kernel mutex in Drop; host unit tests have no
+        // current task to acquire it even though this zero-page fixture owns no
+        // frames.
+        core::mem::forget(shared_pages);
+
+        assert!(backends[0].is_private_anonymous());
+        for backend in backends {
+            let backend = backend.with_file_mapping(lease.clone());
+            assert_eq!(backend.file_mapping().unwrap().ofd_key(), ofd_key);
+            assert!(!backend.is_private_anonymous());
+
+            let cloned = backend.clone();
+            assert_eq!(cloned.file_mapping().unwrap().ofd_key(), ofd_key);
+            assert!(backend.mergeable_with(&cloned));
+        }
+
+        let second_description = FileDescription::new(Arc::new(File::new(axfs::File::new(
+            FileBackend::Direct(location),
+            flags,
+        ))))
+        .unwrap();
+        let second_handle =
+            FileHandle::<dyn FileLike>::from_description_for_test(second_description)
+                .downcast::<File>()
+                .unwrap();
+        let second_lease = FileMappingLease::new(
+            second_handle,
+            namespace,
+            VirtAddr::from(0x4000),
+            0,
+            MappingFlags::USER | MappingFlags::READ,
+            MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
+            FileMappingSharing::Private,
+        );
+        let first =
+            Backend::new_alloc(VirtAddr::from(0x4000), PageSize::Size4K).with_file_mapping(lease);
+        let second = first.clone().with_file_mapping(second_lease);
+        assert!(!first.mergeable_with(&second));
+    }
+
+    #[test]
+    fn file_mapping_lease_enforces_vm_may_flags_for_cow_and_linear_backends() {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let location = mount
+            .root_location()
+            .create(
+                "mapping-protect-lease",
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let description = FileDescription::new(Arc::new(File::new(axfs::File::new(
+            FileBackend::Direct(location),
+            FileFlags::READ,
+        ))))
+        .unwrap();
+        let handle = FileHandle::<dyn FileLike>::from_description_for_test(description)
+            .downcast::<File>()
+            .unwrap();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let start = VirtAddr::from(0x4000);
+        let initial = MappingFlags::USER | MappingFlags::READ;
+        let shared_read_only = FileMappingLease::new(
+            handle.clone(),
+            namespace.clone(),
+            start,
+            0,
+            initial,
+            MappingFlags::READ,
+            FileMappingSharing::Shared,
+        );
+
+        for backend in [
+            Backend::new_alloc(start, PageSize::Size4K).with_file_mapping(shared_read_only.clone()),
+            Backend::new_linear(start, PhysAddr::from(0x8000), PAGE_SIZE_4K)
+                .with_file_mapping(shared_read_only),
+        ] {
+            assert_eq!(
+                backend.check_protect_flags(MappingFlags::USER | MappingFlags::WRITE),
+                Err(AxError::PermissionDenied)
+            );
+        }
+
+        let private_cow = FileMappingLease::new(
+            handle,
+            namespace,
+            start,
+            0,
+            initial,
+            MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
+            FileMappingSharing::Private,
+        );
+        let private_cow =
+            Backend::new_alloc(start, PageSize::Size4K).with_file_mapping(private_cow);
+        private_cow
+            .check_protect_flags(MappingFlags::USER | MappingFlags::WRITE)
+            .unwrap();
     }
 }

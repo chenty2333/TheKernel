@@ -17,8 +17,11 @@ use super::ctl::validate_pathname;
 use crate::{
     file::{
         Directory, File, FileLike, Pipe, Socket, get_file_like,
-        permission::{DacFsContextExt, check_dac_permissions},
-        resolve_at, resolve_at_with_credentials, with_path_fs,
+        permission::{
+            SecurityFsContextExt, VfsSecurityContext, check_dac_permissions,
+            check_dac_permissions_with_security, check_inode_permissions_with_security,
+        },
+        resolve_at, resolve_at_with_security, resolve_at_with_synthetic_credentials, with_path_fs,
     },
     mm::vm_load_string,
     mounts,
@@ -276,11 +279,16 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
     }
 
     let curr = current();
-    let credentials = curr
-        .as_thread()
-        .access_dac_credentials(flags & AT_EACCESS as u32 != 0);
-
-    let file = resolve_at_with_credentials(dirfd, path.as_deref(), flags, &credentials)?;
+    let actor = curr.as_thread().current_cred();
+    let effective = flags & AT_EACCESS as u32 != 0;
+    let security = effective.then(|| VfsSecurityContext::new(actor.clone()));
+    let synthetic = (!effective).then(|| actor.real_id_access_dac_credentials());
+    let file = if let Some(security) = security.as_ref() {
+        resolve_at_with_security(dirfd, path.as_deref(), flags, security)?
+    } else {
+        let credentials = synthetic.as_ref().ok_or(AxError::BadState)?;
+        resolve_at_with_synthetic_credentials(dirfd, path.as_deref(), flags, credentials)?
+    };
     let stat = file.stat()?;
     let perm = stat.mode & NodePermission::all().bits() as u32;
     let node_type = node_type_from_mode(stat.mode);
@@ -301,7 +309,19 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
         return Ok(0);
     }
 
-    check_dac_permissions(perm, stat.uid, stat.gid, node_type, mode, &credentials)?;
+    if let Some(security) = security.as_ref() {
+        if let Some(loc) = loc {
+            let metadata = loc.metadata()?;
+            check_inode_permissions_with_security(loc, &metadata, mode, security)?;
+        } else {
+            check_dac_permissions_with_security(
+                perm, stat.uid, stat.gid, node_type, mode, security,
+            )?;
+        }
+    } else {
+        let credentials = synthetic.as_ref().ok_or(AxError::BadState)?;
+        check_dac_permissions(perm, stat.uid, stat.gid, node_type, mode, credentials)?;
+    }
     if mode & W_OK != 0
         && readonly_access_check_applies(node_type)
         && let Some(loc) = loc
@@ -365,9 +385,9 @@ pub fn sys_statfs(path: *const c_char, buf: *mut statfs) -> AxResult<isize> {
     validate_pathname(path_ref)?;
 
     let curr = current();
-    let credentials = curr.as_thread().fs_dac_credentials();
+    let security = VfsSecurityContext::new(curr.as_thread().current_cred());
     let loc = with_path_fs(AT_FDCWD, path_ref, |fs| {
-        fs.resolve_dac(path_ref, &credentials)
+        fs.resolve_security(path_ref, &security)
     })?;
 
     buf.vm_write(statfs(&loc.mountpoint().root_location())?)?;

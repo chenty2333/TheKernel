@@ -149,11 +149,14 @@ impl ResolveAtResult {
 
 pub fn resolve_at(dirfd: c_int, path: Option<&str>, flags: u32) -> AxResult<ResolveAtResult> {
     let current = current();
-    let credentials = current.as_thread().fs_dac_credentials();
-    resolve_at_with_credentials(dirfd, path, flags, &credentials)
+    let security = VfsSecurityContext::new(current.as_thread().current_cred());
+    resolve_at_with_security(dirfd, path, flags, &security)
 }
 
-pub fn resolve_at_with_credentials(
+/// Resolves with an explicit synthetic DAC projection. This exists for the
+/// non-AT_EACCESS access(2) real-ID/permitted-capability view, which cannot be
+/// rebound to the live effective actor's typed security state.
+pub(crate) fn resolve_at_with_synthetic_credentials(
     dirfd: c_int,
     path: Option<&str>,
     flags: u32,

@@ -94,7 +94,7 @@ impl Cred {
         Self::try_root_with_registry(test_frozen_registry(), user_ns)
     }
 
-    pub(crate) fn try_clone_for_fork(old: &Arc<Self>) -> AxResult<Arc<Self>> {
+    pub(crate) fn try_prepare_clone_for_fork(old: &Arc<Self>) -> AxResult<Arc<Self>> {
         let registry = old.security.registry();
         let security = registry.try_prepare_credential_state(
             old.core(),
@@ -105,12 +105,29 @@ impl Cred {
         Self::try_from_parts(old.core.clone(), security)
     }
 
-    pub(crate) fn try_with_user_namespace(
+    pub(crate) fn try_prepare_with_user_namespace(
         old: &Arc<Self>,
         user_ns: Arc<UserNamespace>,
     ) -> AxResult<Arc<Self>> {
         let core = CoreCred::try_with_user_namespace(old.core(), user_ns).map_err(cred_error)?;
         Self::try_from_core_transition(old, core, CredentialStateTransition::UserNamespace)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_clone_for_fork(old: &Arc<Self>) -> AxResult<Arc<Self>> {
+        let credential = Self::try_prepare_clone_for_fork(old)?;
+        credential.security.activate_fixture();
+        Ok(credential)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_with_user_namespace(
+        old: &Arc<Self>,
+        user_ns: Arc<UserNamespace>,
+    ) -> AxResult<Arc<Self>> {
+        let credential = Self::try_prepare_with_user_namespace(old, user_ns)?;
+        credential.security.activate_fixture();
+        Ok(credential)
     }
 
     fn try_from_core_transition(
@@ -165,6 +182,28 @@ impl Cred {
 
     pub(crate) fn fs_dac_credentials(&self) -> DacCredentialView {
         self.core.fs_credential_snapshot()
+    }
+
+    /// Builds the access(2) DAC projection from this exact pinned composite.
+    /// AT_EACCESS callers should use `fs_dac_credentials()` and the live typed
+    /// actor path; this helper preserves Linux's synthetic real-ID view.
+    pub(crate) fn real_id_access_dac_credentials(&self) -> DacCredentialView {
+        let credentials = self.ids();
+        let capabilities = self.capabilities();
+        let capability_set = if capabilities.securebits() & SECBIT_NO_SETUID_FIXUP != 0 {
+            capabilities.effective()
+        } else if self.user_ns().root_kuid() == Some(credentials.ruid) {
+            capabilities.permitted()
+        } else {
+            [0; CAPABILITY_WORDS]
+        };
+        DacCredentialView::new(
+            credentials.ruid,
+            credentials.rgid,
+            self.groups().clone(),
+            capability_set,
+            self.user_ns().is_initial(),
+        )
     }
 
     pub(crate) fn has_effective_capability(&self, capability: u32) -> bool {
@@ -704,6 +743,7 @@ impl<'a> PreparedCred<'a> {
             post_commit,
             requires_dumpability_drop: _,
         } = self;
+        post_commit.activate();
         let published = {
             let mut current = slot.current.lock();
             #[cfg(test)]

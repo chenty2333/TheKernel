@@ -1408,6 +1408,14 @@ impl<T: FileLike + 'static> FileHandle<T> {
 }
 
 impl FileHandle<dyn FileLike> {
+    #[cfg(test)]
+    pub(crate) fn from_description_for_test(description: Arc<FileDescription>) -> Self {
+        Self {
+            file: description.inner.clone(),
+            description,
+        }
+    }
+
     /// Downcasts the inner object without repeating fd-table lookup; the
     /// returned typed handle retains this exact description identity.
     pub(crate) fn downcast<T: FileLike + 'static>(&self) -> AxResult<FileHandle<T>> {

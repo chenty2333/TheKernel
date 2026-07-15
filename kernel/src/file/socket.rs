@@ -1,6 +1,10 @@
 use alloc::sync::Arc;
+use core::marker::PhantomData;
 
 use axerrno::{AxError, AxResult};
+use axnet::{
+    SocketAcceptIdentity, SocketAcceptReservation, SocketAddrEx, unix::UnixEndpointIdentity,
+};
 
 use super::{
     af_alg::AfAlgSocket,
@@ -10,6 +14,7 @@ use super::{
     net::Socket,
     netlink::NetlinkSocket,
 };
+use crate::task::NetworkNamespace;
 
 /// Concrete socket backend retained by one pinned open file description.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -17,6 +22,153 @@ pub(crate) enum SocketBackendKind {
     Network,
     Netlink,
     AfAlg,
+}
+
+/// Validated, kernel-owned socket address passed to policy. The original byte
+/// length remains in the external typed context, so no userspace pointer is
+/// retained here.
+#[derive(Clone, Debug)]
+pub(crate) enum PreparedSocketAddress {
+    Network(SocketAddrEx),
+    Netlink(super::netlink::SockaddrNl),
+    AfAlg(super::af_alg::SockAddrAlg),
+    Unspecified,
+}
+
+/// Copied message-layout facts shared by send and receive policy leaves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedSocketMessage {
+    flags: u32,
+    iov_count: usize,
+    name_length: usize,
+    control_length: usize,
+    ancillary_items: usize,
+}
+
+impl PreparedSocketMessage {
+    pub(crate) const fn new(
+        flags: u32,
+        iov_count: usize,
+        name_length: usize,
+        control_length: usize,
+        ancillary_items: usize,
+    ) -> Self {
+        Self {
+            flags,
+            iov_count,
+            name_length,
+            control_length,
+            ancillary_items,
+        }
+    }
+
+    pub(crate) const fn flags(&self) -> u32 {
+        self.flags
+    }
+
+    pub(crate) const fn iov_count(&self) -> usize {
+        self.iov_count
+    }
+
+    pub(crate) const fn name_length(&self) -> usize {
+        self.name_length
+    }
+
+    pub(crate) const fn control_length(&self) -> usize {
+        self.control_length
+    }
+
+    pub(crate) const fn ancillary_items(&self) -> usize {
+        self.ancillary_items
+    }
+}
+
+/// Frozen policy projection of one exact retained open file description.
+#[derive(Clone, Copy)]
+pub(crate) struct SocketSecurityRef<'a> {
+    description: &'a Arc<FileDescription>,
+    backend: SocketBackendKind,
+    net_namespace: Option<&'a Arc<NetworkNamespace>>,
+}
+
+impl SocketSecurityRef<'_> {
+    pub(crate) fn ofd_identity(&self) -> u64 {
+        self.description.id().get()
+    }
+
+    pub(crate) const fn backend(&self) -> SocketBackendKind {
+        self.backend
+    }
+
+    pub(crate) const fn net_namespace(&self) -> Option<&Arc<NetworkNamespace>> {
+        self.net_namespace
+    }
+}
+
+/// Exact backend object reserved for accept before queue mutation is committed.
+#[derive(Clone, Copy)]
+pub(crate) struct PendingSocketSecurityRef<'a> {
+    identity: SocketAcceptIdentity,
+    net_namespace: &'a Arc<NetworkNamespace>,
+    _reservation: PhantomData<&'a ()>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum AcceptedSocketSecurityRef<'a> {
+    Description(SocketSecurityRef<'a>),
+    Pending(PendingSocketSecurityRef<'a>),
+}
+
+impl<'a> PendingSocketSecurityRef<'a> {
+    pub(crate) fn new(
+        reservation: &'a SocketAcceptReservation<'_>,
+        net_namespace: &'a Arc<NetworkNamespace>,
+    ) -> Self {
+        Self {
+            identity: reservation.identity(),
+            net_namespace,
+            _reservation: PhantomData,
+        }
+    }
+
+    pub(crate) const fn identity(&self) -> SocketAcceptIdentity {
+        self.identity
+    }
+
+    pub(crate) const fn net_namespace(&self) -> &Arc<NetworkNamespace> {
+        self.net_namespace
+    }
+}
+
+/// Exact Unix listener, pending server endpoint, or datagram peer retained by
+/// a Layer 1 reservation for the duration of one policy call.
+#[derive(Clone, Copy)]
+pub(crate) struct UnixEndpointSecurityRef<'a> {
+    identity: UnixEndpointIdentity,
+    net_namespace: &'a Arc<NetworkNamespace>,
+    _reservation: PhantomData<&'a ()>,
+}
+
+impl<'a> UnixEndpointSecurityRef<'a> {
+    pub(crate) fn new<T: ?Sized>(
+        identity: UnixEndpointIdentity,
+        net_namespace: &'a Arc<NetworkNamespace>,
+        _reservation: &'a T,
+    ) -> Self {
+        Self {
+            identity,
+            net_namespace,
+            _reservation: PhantomData,
+        }
+    }
+
+    pub(crate) const fn identity(&self) -> UnixEndpointIdentity {
+        self.identity
+    }
+
+    pub(crate) const fn net_namespace(&self) -> &Arc<NetworkNamespace> {
+        self.net_namespace
+    }
 }
 
 /// One stable open file description for a complete socket operation.
@@ -44,6 +196,11 @@ impl PinnedSocketDescription {
     /// this exact description and never performs a second fd-table lookup.
     pub(crate) fn pin_fd(fd: i32) -> AxResult<Self> {
         Self::pin_with(|| get_file_description(fd))
+    }
+
+    /// Stabilizes an already allocated but unpublished socket description.
+    pub(crate) fn from_description(description: Arc<FileDescription>) -> AxResult<Self> {
+        Self::from_lookup(|| Ok(description))
     }
 
     fn from_lookup(lookup: impl FnOnce() -> AxResult<Arc<FileDescription>>) -> AxResult<Self> {
@@ -125,6 +282,24 @@ impl PinnedSocketDescription {
             .inner
             .downcast_ref::<AfAlgSocket>()
             .ok_or(AxError::BadState)
+    }
+
+    pub(crate) fn security_ref(&self) -> AxResult<SocketSecurityRef<'_>> {
+        let backend = self.backend()?;
+        let net_namespace = match backend {
+            SocketBackendKind::Network => Some(self.network()?.net_namespace()),
+            SocketBackendKind::Netlink => Some(self.netlink()?.net_namespace()),
+            SocketBackendKind::AfAlg => None,
+        };
+        Ok(SocketSecurityRef {
+            description: &self.description,
+            backend,
+            net_namespace,
+        })
+    }
+
+    pub(crate) fn into_description(self) -> Arc<FileDescription> {
+        self.description
     }
 }
 

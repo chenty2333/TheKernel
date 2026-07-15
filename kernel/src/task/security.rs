@@ -10,15 +10,30 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 extern crate std;
 #[cfg(test)]
 use core::cell::Cell;
-use core::{any::Any, fmt, marker::PhantomData};
+use core::{
+    any::Any,
+    fmt,
+    marker::PhantomData,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{Location, Metadata, NodeType};
+use axhal::paging::MappingFlags;
+use axsync::Mutex;
 use axtask::AxTaskRef;
+use memory_addr::VirtAddr;
 use spin::Once;
 use thekernel_linux_cred::{
-    AuthorizationError, CapabilityNumber,
+    AuthorizationError, CapabilityNumber, FileMprotectContext, MemoryProtection,
+    MmapAddressContext, MmapFileContext, MmapFileFlags, MmapFileOperation, MmapFileSecurityRef,
+    MmapFileTarget, SocketAcceptContext, SocketBindContext, SocketConnectContext,
+    SocketCreateContext, SocketGetOptionContext, SocketGetPeerNameContext,
+    SocketGetSockNameContext, SocketListenContext, SocketPairContext, SocketPostCreateContext,
+    SocketReceiveMessageContext, SocketSendMessageContext, SocketSetOptionContext,
+    SocketShutdownContext, UnixMaySendContext, UnixStreamConnectContext,
     authorize_capability_core as external_authorize_capability_core,
+    authorize_prepared_credential_capability_core as external_authorize_prepared_credential_capability_core,
     authorize_signal_core as external_authorize_signal_core,
     commoncap_ptrace_access as external_commoncap_ptrace_access,
     commoncap_ptrace_traceme as external_commoncap_ptrace_traceme,
@@ -28,15 +43,23 @@ pub(crate) use thekernel_linux_cred::{
     CapabilitySecurityOperation, CredentialPublicationOperation, FileOpenAccess, FileOpenOperation,
     InodeChmodIntent, InodeCreateMode, InodeMknodKind, InodeMknodOperation, InodePermissionAccess,
     InodeSetattrIntent, InodeSetattrMode, InodeSetattrProposal, InodeXattrOperation,
-    PtraceAccessKind, PtraceCredentialKind, SchedulerSecurityOperation,
-    SignalCoreAuthorizationReason, SignalDeliveryScope, SignalNumber, SignalSecurityOperation,
-    SignalSecuritySource, XattrSetFlags, XattrValueClass,
+    PreparedCredentialCapabilityOperation, PtraceAccessKind, PtraceCredentialKind,
+    SchedulerSecurityOperation, SignalCoreAuthorizationReason, SignalDeliveryScope, SignalNumber,
+    SignalSecurityOperation, SignalSecuritySource, SocketCreateSpec, SocketListenBacklog,
+    SocketOption, XattrSetFlags, XattrValueClass,
 };
 
 use super::{
     ExecCommitRuntime, ExecCredentialSecurityContext, ExecFileSecurityObject, UserNamespace,
     creds::{Cred, DacCredentialView, PreparedCred},
     exec_cred::{ExecCredentialEffects, authorize_commoncap_exec},
+};
+use crate::{
+    file::{
+        AcceptedSocketSecurityRef, File, FileHandle, PreparedSocketAddress, PreparedSocketMessage,
+        SocketSecurityRef, UnixEndpointSecurityRef,
+    },
+    mm::{AddrSpace, PreparedProtectSegment},
 };
 
 const SECURITY_MODULE_LIMIT: usize = 8;
@@ -52,11 +75,39 @@ struct ModuleId(u8);
 type CoreCred = thekernel_linux_cred::Credential<UserNamespace>;
 type CoreCapabilitySecurityContext<'a> =
     thekernel_linux_cred::CapabilitySecurityContext<'a, UserNamespace>;
+type CorePreparedCredentialCapabilityContext<'a> =
+    thekernel_linux_cred::PreparedCredentialCapabilityContext<'a, UserNamespace>;
 type CoreCredentialPublicationContext<'a> = thekernel_linux_cred::CredentialPublicationContext<
     'a,
     UserNamespace,
     CredentialPublicationTarget,
 >;
+type CoreMmapFileContext<'a> = MmapFileContext<'a, UserNamespace, FileHandle<File>>;
+type CoreMmapAddressContext<'a> = MmapAddressContext<'a, UserNamespace, MmapImageSecurityRef>;
+type CoreFileMprotectContext<'context, 'segment> =
+    FileMprotectContext<'context, UserNamespace, PreparedProtectSegment<'segment>>;
+
+/// Opaque identity of the exact retained address-space image selected by mmap.
+///
+/// Security modules can compare this stable identity without receiving an
+/// address-space lock or mutable MM internals. The syscall constructs and
+/// dispatches this projection while retaining the source `Arc`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct MmapImageSecurityRef {
+    identity: usize,
+}
+
+impl MmapImageSecurityRef {
+    fn from_arc<T>(image: &Arc<T>) -> Self {
+        Self {
+            identity: Arc::as_ptr(image).cast::<()>() as usize,
+        }
+    }
+
+    pub(in crate::task) const fn identity(self) -> usize {
+        self.identity
+    }
+}
 
 /// Opaque identity of the exact child task whose credential became visible.
 ///
@@ -1658,6 +1709,302 @@ impl<'context, 'location> FileOpenSecurityContext<'context, 'location> {
     }
 }
 
+/// Leaf-typed socket policy operation over copied, lookup-free kernel facts.
+pub(crate) enum SocketSecurityOperation<'a> {
+    Create(SocketCreateContext<'a, UserNamespace>),
+    PostCreate(SocketPostCreateContext<'a, UserNamespace, SocketSecurityRef<'a>>),
+    Pair(SocketPairContext<'a, UserNamespace, SocketSecurityRef<'a>, SocketSecurityRef<'a>>),
+    Bind(SocketBindContext<'a, UserNamespace, SocketSecurityRef<'a>, PreparedSocketAddress>),
+    Connect(SocketConnectContext<'a, UserNamespace, SocketSecurityRef<'a>, PreparedSocketAddress>),
+    Listen(SocketListenContext<'a, UserNamespace, SocketSecurityRef<'a>>),
+    Accept(
+        SocketAcceptContext<
+            'a,
+            UserNamespace,
+            SocketSecurityRef<'a>,
+            AcceptedSocketSecurityRef<'a>,
+        >,
+    ),
+    SendMessage(
+        SocketSendMessageContext<'a, UserNamespace, SocketSecurityRef<'a>, PreparedSocketMessage>,
+    ),
+    ReceiveMessage(
+        SocketReceiveMessageContext<
+            'a,
+            UserNamespace,
+            SocketSecurityRef<'a>,
+            PreparedSocketMessage,
+        >,
+    ),
+    GetSockName(SocketGetSockNameContext<'a, UserNamespace, SocketSecurityRef<'a>>),
+    GetPeerName(SocketGetPeerNameContext<'a, UserNamespace, SocketSecurityRef<'a>>),
+    GetOption(SocketGetOptionContext<'a, UserNamespace, SocketSecurityRef<'a>>),
+    SetOption(SocketSetOptionContext<'a, UserNamespace, SocketSecurityRef<'a>>),
+    Shutdown(SocketShutdownContext<'a, UserNamespace, SocketSecurityRef<'a>>),
+    UnixStreamConnect(
+        UnixStreamConnectContext<
+            'a,
+            UserNamespace,
+            SocketSecurityRef<'a>,
+            UnixEndpointSecurityRef<'a>,
+            UnixEndpointSecurityRef<'a>,
+        >,
+    ),
+    UnixMaySend(
+        UnixMaySendContext<'a, UserNamespace, SocketSecurityRef<'a>, UnixEndpointSecurityRef<'a>>,
+    ),
+}
+
+/// Kernel wrapper retaining the complete composite actor state around one
+/// external typed socket context.
+pub(crate) struct SocketSecurityContext<'a> {
+    actor: &'a Cred,
+    operation: SocketSecurityOperation<'a>,
+}
+
+impl<'a> SocketSecurityContext<'a> {
+    pub(crate) fn create(actor: &'a Cred, spec: SocketCreateSpec) -> Self {
+        Self {
+            actor,
+            operation: SocketSecurityOperation::Create(SocketCreateContext::new(
+                actor.core(),
+                spec,
+            )),
+        }
+    }
+
+    pub(crate) fn post_create(
+        actor: &'a Cred,
+        socket: &'a SocketSecurityRef<'a>,
+        spec: SocketCreateSpec,
+    ) -> Self {
+        Self {
+            actor,
+            operation: SocketSecurityOperation::PostCreate(SocketPostCreateContext::new(
+                actor.core(),
+                socket,
+                spec,
+            )),
+        }
+    }
+
+    pub(crate) fn pair(
+        actor: &'a Cred,
+        first: &'a SocketSecurityRef<'a>,
+        second: &'a SocketSecurityRef<'a>,
+    ) -> Self {
+        Self {
+            actor,
+            operation: SocketSecurityOperation::Pair(SocketPairContext::new(
+                actor.core(),
+                first,
+                second,
+            )),
+        }
+    }
+
+    pub(crate) fn bind(
+        actor: &'a Cred,
+        socket: &'a SocketSecurityRef<'a>,
+        address: &'a PreparedSocketAddress,
+        address_length: usize,
+    ) -> Self {
+        Self {
+            actor,
+            operation: SocketSecurityOperation::Bind(SocketBindContext::new(
+                actor.core(),
+                socket,
+                address,
+                address_length,
+            )),
+        }
+    }
+
+    pub(crate) fn connect(
+        actor: &'a Cred,
+        socket: &'a SocketSecurityRef<'a>,
+        address: &'a PreparedSocketAddress,
+        address_length: usize,
+    ) -> Self {
+        Self {
+            actor,
+            operation: SocketSecurityOperation::Connect(SocketConnectContext::new(
+                actor.core(),
+                socket,
+                address,
+                address_length,
+            )),
+        }
+    }
+
+    pub(crate) fn listen(
+        actor: &'a Cred,
+        socket: &'a SocketSecurityRef<'a>,
+        backlog: SocketListenBacklog,
+    ) -> Self {
+        Self {
+            actor,
+            operation: SocketSecurityOperation::Listen(SocketListenContext::new(
+                actor.core(),
+                socket,
+                backlog,
+            )),
+        }
+    }
+
+    pub(crate) fn accept(
+        actor: &'a Cred,
+        listening: &'a SocketSecurityRef<'a>,
+        accepted: &'a AcceptedSocketSecurityRef<'a>,
+    ) -> Self {
+        Self {
+            actor,
+            operation: SocketSecurityOperation::Accept(SocketAcceptContext::new(
+                actor.core(),
+                listening,
+                accepted,
+            )),
+        }
+    }
+
+    pub(crate) fn send_message(
+        actor: &'a Cred,
+        socket: &'a SocketSecurityRef<'a>,
+        message: &'a PreparedSocketMessage,
+        size: usize,
+    ) -> Self {
+        Self {
+            actor,
+            operation: SocketSecurityOperation::SendMessage(SocketSendMessageContext::new(
+                actor.core(),
+                socket,
+                message,
+                size,
+            )),
+        }
+    }
+
+    pub(crate) fn receive_message(
+        actor: &'a Cred,
+        socket: &'a SocketSecurityRef<'a>,
+        message: &'a PreparedSocketMessage,
+        size: usize,
+        flags: i32,
+    ) -> Self {
+        Self {
+            actor,
+            operation: SocketSecurityOperation::ReceiveMessage(SocketReceiveMessageContext::new(
+                actor.core(),
+                socket,
+                message,
+                size,
+                flags,
+            )),
+        }
+    }
+
+    pub(crate) fn get_sock_name(actor: &'a Cred, socket: &'a SocketSecurityRef<'a>) -> Self {
+        Self {
+            actor,
+            operation: SocketSecurityOperation::GetSockName(SocketGetSockNameContext::new(
+                actor.core(),
+                socket,
+            )),
+        }
+    }
+
+    pub(crate) fn get_peer_name(actor: &'a Cred, socket: &'a SocketSecurityRef<'a>) -> Self {
+        Self {
+            actor,
+            operation: SocketSecurityOperation::GetPeerName(SocketGetPeerNameContext::new(
+                actor.core(),
+                socket,
+            )),
+        }
+    }
+
+    pub(crate) fn get_option(
+        actor: &'a Cred,
+        socket: &'a SocketSecurityRef<'a>,
+        option: SocketOption,
+    ) -> Self {
+        Self {
+            actor,
+            operation: SocketSecurityOperation::GetOption(SocketGetOptionContext::new(
+                actor.core(),
+                socket,
+                option,
+            )),
+        }
+    }
+
+    pub(crate) fn set_option(
+        actor: &'a Cred,
+        socket: &'a SocketSecurityRef<'a>,
+        option: SocketOption,
+    ) -> Self {
+        Self {
+            actor,
+            operation: SocketSecurityOperation::SetOption(SocketSetOptionContext::new(
+                actor.core(),
+                socket,
+                option,
+            )),
+        }
+    }
+
+    pub(crate) fn shutdown(actor: &'a Cred, socket: &'a SocketSecurityRef<'a>, how: i32) -> Self {
+        Self {
+            actor,
+            operation: SocketSecurityOperation::Shutdown(SocketShutdownContext::new(
+                actor.core(),
+                socket,
+                how,
+            )),
+        }
+    }
+
+    pub(crate) fn unix_stream_connect(
+        actor: &'a Cred,
+        connecting: &'a SocketSecurityRef<'a>,
+        listening: &'a UnixEndpointSecurityRef<'a>,
+        accepted: &'a UnixEndpointSecurityRef<'a>,
+    ) -> Self {
+        Self {
+            actor,
+            operation: SocketSecurityOperation::UnixStreamConnect(UnixStreamConnectContext::new(
+                actor.core(),
+                connecting,
+                listening,
+                accepted,
+            )),
+        }
+    }
+
+    pub(crate) fn unix_may_send(
+        actor: &'a Cred,
+        sending: &'a SocketSecurityRef<'a>,
+        receiving: &'a UnixEndpointSecurityRef<'a>,
+    ) -> Self {
+        Self {
+            actor,
+            operation: SocketSecurityOperation::UnixMaySend(UnixMaySendContext::new(
+                actor.core(),
+                sending,
+                receiving,
+            )),
+        }
+    }
+
+    pub(crate) const fn actor(&self) -> &'a Cred {
+        self.actor
+    }
+
+    pub(crate) const fn operation(&self) -> &SocketSecurityOperation<'a> {
+        &self.operation
+    }
+}
+
 /// One already-resolved executable component checked during binary-handler
 /// discovery. The exact immutable actor credential and stable object facts are
 /// supplied by the loader; hooks cannot resample `current()` or repeat lookup.
@@ -1854,6 +2201,25 @@ trait SecurityModule: Send + Sync + 'static {
     ) -> AxResult<()> {
         let _ = actor_state;
         self.capable(context)
+    }
+
+    /// Narrows commoncap authority derived from a fully prepared credential
+    /// without treating that credential as an already-live actor.
+    fn prepared_credential_capable(
+        &self,
+        _context: &CorePreparedCredentialCapabilityContext<'_>,
+    ) -> AxResult<()> {
+        Ok(())
+    }
+
+    fn prepared_credential_capable_with_state(
+        &self,
+        context: &CorePreparedCredentialCapabilityContext<'_>,
+        source_state: &Self::CredentialState,
+        proposed_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        let _ = (source_state, proposed_state);
+        self.prepared_credential_capable(context)
     }
 
     /// Observes a separately prepared fork or user-namespace credential after
@@ -2117,6 +2483,61 @@ trait SecurityModule: Send + Sync + 'static {
         self.file_open(context)
     }
 
+    /// Authorizes one already prepared socket leaf. Every variant borrows only
+    /// immutable kernel-owned facts and dispatch runs before backend mutation.
+    fn socket(&self, _context: &SocketSecurityContext<'_>) -> AxResult<()> {
+        Ok(())
+    }
+
+    fn socket_with_credential_state(
+        &self,
+        context: &SocketSecurityContext<'_>,
+        _actor_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        self.socket(context)
+    }
+
+    /// Authorizes one normalized file/anonymous mmap request after local ABI
+    /// and backend validation, before address policy or backend construction.
+    fn mmap_file(&self, _context: &CoreMmapFileContext<'_>) -> AxResult<()> {
+        Ok(())
+    }
+
+    fn mmap_file_with_credential_state(
+        &self,
+        context: &CoreMmapFileContext<'_>,
+        _actor_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        self.mmap_file(context)
+    }
+
+    /// Authorizes the final selected address in one exact retained image.
+    fn mmap_addr(&self, _context: &CoreMmapAddressContext<'_>) -> AxResult<()> {
+        Ok(())
+    }
+
+    fn mmap_addr_with_credential_state(
+        &self,
+        context: &CoreMmapAddressContext<'_>,
+        _actor_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        self.mmap_addr(context)
+    }
+
+    /// Authorizes one exact pre-change VMA segment while the prepared
+    /// protection transaction can still be dropped without side effects.
+    fn file_mprotect(&self, _context: &CoreFileMprotectContext<'_, '_>) -> AxResult<()> {
+        Ok(())
+    }
+
+    fn file_mprotect_with_credential_state(
+        &self,
+        context: &CoreFileMprotectContext<'_, '_>,
+        _actor_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        self.file_mprotect(context)
+    }
+
     fn ptrace_access(&self, _context: &PtraceAccessContext<'_>) -> AxResult<()> {
         Ok(())
     }
@@ -2268,6 +2689,12 @@ trait ErasedSecurityModule: Send + Sync {
         context: &CoreCapabilitySecurityContext<'_>,
         actor_state: &dyn ErasedOwnedCredentialState,
     ) -> AxResult<()>;
+    fn prepared_credential_capable(
+        &self,
+        context: &CorePreparedCredentialCapabilityContext<'_>,
+        source_state: &dyn ErasedOwnedCredentialState,
+        proposed_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
     fn credential_published(
         &self,
         context: &CoreCredentialPublicationContext<'_>,
@@ -2356,6 +2783,26 @@ trait ErasedSecurityModule: Send + Sync {
     fn file_open_with_credential_state(
         &self,
         context: &FileOpenSecurityContext<'_, '_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
+    fn socket_with_credential_state(
+        &self,
+        context: &SocketSecurityContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
+    fn mmap_file_with_credential_state(
+        &self,
+        context: &CoreMmapFileContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
+    fn mmap_addr_with_credential_state(
+        &self,
+        context: &CoreMmapAddressContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
+    fn file_mprotect_with_credential_state(
+        &self,
+        context: &CoreFileMprotectContext<'_, '_>,
         actor_state: &dyn ErasedOwnedCredentialState,
     ) -> AxResult<()>;
     fn ptrace_access(&self, context: &PtraceAccessContext<'_>) -> AxResult<()>;
@@ -2572,6 +3019,20 @@ impl<M: SecurityModule> ErasedSecurityModule for M {
             self,
             context,
             owned_credential_state(self, actor_state)?,
+        )
+    }
+
+    fn prepared_credential_capable(
+        &self,
+        context: &CorePreparedCredentialCapabilityContext<'_>,
+        source_state: &dyn ErasedOwnedCredentialState,
+        proposed_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::prepared_credential_capable_with_state(
+            self,
+            context,
+            owned_credential_state(self, source_state)?,
+            owned_credential_state(self, proposed_state)?,
         )
     }
 
@@ -2808,6 +3269,54 @@ impl<M: SecurityModule> ErasedSecurityModule for M {
         actor_state: &dyn ErasedOwnedCredentialState,
     ) -> AxResult<()> {
         SecurityModule::file_open_with_credential_state(
+            self,
+            context,
+            owned_credential_state(self, actor_state)?,
+        )
+    }
+
+    fn socket_with_credential_state(
+        &self,
+        context: &SocketSecurityContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::socket_with_credential_state(
+            self,
+            context,
+            owned_credential_state(self, actor_state)?,
+        )
+    }
+
+    fn mmap_file_with_credential_state(
+        &self,
+        context: &CoreMmapFileContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::mmap_file_with_credential_state(
+            self,
+            context,
+            owned_credential_state(self, actor_state)?,
+        )
+    }
+
+    fn mmap_addr_with_credential_state(
+        &self,
+        context: &CoreMmapAddressContext<'_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::mmap_addr_with_credential_state(
+            self,
+            context,
+            owned_credential_state(self, actor_state)?,
+        )
+    }
+
+    fn file_mprotect_with_credential_state(
+        &self,
+        context: &CoreFileMprotectContext<'_, '_>,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::file_mprotect_with_credential_state(
             self,
             context,
             owned_credential_state(self, actor_state)?,
@@ -3311,12 +3820,27 @@ struct OwnedModuleCredState {
     erased: Box<dyn ErasedOwnedCredentialState>,
 }
 
+struct CredentialStateIdentity {
+    publication_claimed: AtomicBool,
+    live: AtomicBool,
+}
+
+enum CredentialStateDerivation {
+    Initial,
+    Prepared {
+        source: Arc<CredentialStateIdentity>,
+        transition: CredentialStateTransition,
+    },
+}
+
 /// Complete immutable per-module state carried by one composite credential.
 /// The layout identity and dense ModuleId order are checked before every
 /// prepare/authorize pass, so a foreign or malformed state fails closed.
 pub(in crate::task) struct CredentialSecurityState {
     registry: FrozenSecurityRegistry,
     slots: Vec<OwnedModuleCredState>,
+    identity: Arc<CredentialStateIdentity>,
+    derivation: CredentialStateDerivation,
 }
 
 impl CredentialSecurityState {
@@ -3338,6 +3862,67 @@ impl CredentialSecurityState {
             }
         }
         Ok(())
+    }
+
+    fn validate_live(&self) -> AxResult<()> {
+        if self.identity.live.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(AxError::OperationNotPermitted)
+        }
+    }
+
+    fn prepared_transition_from(
+        &self,
+        source: &CredentialSecurityState,
+    ) -> AxResult<CredentialStateTransition> {
+        let CredentialStateDerivation::Prepared {
+            source: expected_source,
+            transition: expected_transition,
+        } = &self.derivation
+        else {
+            return Err(AxError::BadState);
+        };
+        if !Arc::ptr_eq(expected_source, &source.identity)
+            || Arc::ptr_eq(&self.identity, &source.identity)
+        {
+            return Err(AxError::BadState);
+        }
+        Ok(*expected_transition)
+    }
+
+    fn claim_transition_from(
+        &self,
+        source: &CredentialSecurityState,
+        transition: CredentialStateTransition,
+    ) -> AxResult<()> {
+        if self.prepared_transition_from(source)? != transition {
+            return Err(AxError::BadState);
+        }
+        self.identity
+            .publication_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| AxError::BadState)
+    }
+
+    fn activate_claimed(&self) {
+        assert!(
+            self.identity.publication_claimed.load(Ordering::Acquire),
+            "credential state activated without a publication claim"
+        );
+        self.identity
+            .live
+            .compare_exchange(false, true, Ordering::Release, Ordering::Acquire)
+            .expect("credential state activated more than once");
+    }
+
+    #[cfg(test)]
+    pub(in crate::task) fn activate_fixture(&self) {
+        self.identity
+            .publication_claimed
+            .store(true, Ordering::Release);
+        self.identity.live.store(true, Ordering::Release);
     }
 }
 
@@ -3374,12 +3959,18 @@ impl PendingCredentialPostCommit {
         }
         let registry = old.security().registry();
         registry.registry().validate_credential_pair(old, new)?;
+        new.security()
+            .claim_transition_from(old.security(), transition)?;
         Ok(Self {
             registry,
             old: old.clone(),
             new: new.clone(),
             transition,
         })
+    }
+
+    pub(in crate::task) fn activate(&self) {
+        self.new.security().activate_claimed();
     }
 
     pub(in crate::task) fn notify(self) {
@@ -3389,6 +3980,7 @@ impl PendingCredentialPostCommit {
             new,
             transition,
         } = self;
+        debug_assert!(new.security().validate_live().is_ok());
         registry
             .registry()
             .notify_credential_committed(&old, &new, transition);
@@ -3467,6 +4059,13 @@ impl<T: CredentialPublicationTargetOwner> PendingCredentialPublication<T> {
         registry
             .registry()
             .validate_credential_pair(source, published)?;
+        let transition = match kind {
+            CredentialPublicationKind::Fork => CredentialStateTransition::Fork,
+            CredentialPublicationKind::UserNamespace => CredentialStateTransition::UserNamespace,
+        };
+        published
+            .security()
+            .claim_transition_from(source.security(), transition)?;
         Ok(Self {
             registry,
             source: source.clone(),
@@ -3474,6 +4073,12 @@ impl<T: CredentialPublicationTargetOwner> PendingCredentialPublication<T> {
             target_owner,
             kind,
         })
+    }
+
+    /// Makes the fully prepared state usable immediately before the first
+    /// externally visible child-identity publication.
+    pub(crate) fn activate(&self) {
+        self.published.security().activate_claimed();
     }
 
     /// Delivers the successful-publication event. The caller owns the external
@@ -3487,6 +4092,7 @@ impl<T: CredentialPublicationTargetOwner> PendingCredentialPublication<T> {
             target_owner,
             kind,
         } = self;
+        debug_assert!(published.security().validate_live().is_ok());
         let target = target_owner.credential_publication_target();
         let context = match kind {
             CredentialPublicationKind::Fork => {
@@ -3657,6 +4263,7 @@ impl SecurityRegistry {
     }
 
     fn credential_slots<'a>(&self, credential: &'a Cred) -> AxResult<&'a [OwnedModuleCredState]> {
+        credential.security().validate_live()?;
         self.security_slots(credential.security())
     }
 
@@ -3665,7 +4272,7 @@ impl SecurityRegistry {
     /// module callback has run if either (including a late) slot is malformed.
     fn validate_credential_pair(&self, source: &Cred, published: &Cred) -> AxResult<()> {
         self.credential_slots(source)?;
-        self.credential_slots(published)?;
+        self.security_slots(published.security())?;
         Ok(())
     }
 
@@ -3686,6 +4293,35 @@ impl SecurityRegistry {
             registered
                 .module
                 .capable(context, actor_state.erased.as_ref())?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_prepared_credential_capable(
+        &self,
+        source: &Cred,
+        proposed: &Cred,
+        context: &CorePreparedCredentialCapabilityContext<'_>,
+    ) -> AxResult<()> {
+        if !core::ptr::eq(source.core(), context.source_credential())
+            || !core::ptr::eq(proposed.core(), context.proposed_credential())
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+        let source_slots = self.credential_slots(source)?;
+        let proposed_slots = self.security_slots(proposed.security())?;
+        for ((registered, source_state), proposed_state) in
+            self.modules.iter().zip(source_slots).zip(proposed_slots)
+        {
+            if registered.id != source_state.module_id || registered.id != proposed_state.module_id
+            {
+                return Err(AxError::OperationNotPermitted);
+            }
+            registered.module.prepared_credential_capable(
+                context,
+                source_state.erased.as_ref(),
+                proposed_state.erased.as_ref(),
+            )?;
         }
         Ok(())
     }
@@ -3752,14 +4388,16 @@ impl SecurityRegistry {
     fn try_empty_credential_state(
         &'static self,
         registry: FrozenSecurityRegistry,
+        derivation: CredentialStateDerivation,
     ) -> AxResult<CredentialSecurityState> {
-        self.try_empty_credential_state_with_reservation(registry, self.modules.len())
+        self.try_empty_credential_state_with_reservation(registry, self.modules.len(), derivation)
     }
 
     fn try_empty_credential_state_with_reservation(
         &'static self,
         registry: FrozenSecurityRegistry,
         reservation: usize,
+        derivation: CredentialStateDerivation,
     ) -> AxResult<CredentialSecurityState> {
         if !core::ptr::eq(self, registry.registry()) {
             return Err(AxError::OperationNotPermitted);
@@ -3768,7 +4406,18 @@ impl SecurityRegistry {
         slots
             .try_reserve_exact(reservation)
             .map_err(|_| AxError::NoMemory)?;
-        Ok(CredentialSecurityState { registry, slots })
+        let initial = matches!(&derivation, CredentialStateDerivation::Initial);
+        let identity = Arc::try_new(CredentialStateIdentity {
+            publication_claimed: AtomicBool::new(initial),
+            live: AtomicBool::new(initial),
+        })
+        .map_err(|_| AxError::NoMemory)?;
+        Ok(CredentialSecurityState {
+            registry,
+            slots,
+            identity,
+            derivation,
+        })
     }
 
     fn try_init_credential_state(
@@ -3776,7 +4425,8 @@ impl SecurityRegistry {
         registry: FrozenSecurityRegistry,
         credential: &CoreCred,
     ) -> AxResult<CredentialSecurityState> {
-        let mut candidate = self.try_empty_credential_state(registry)?;
+        let mut candidate =
+            self.try_empty_credential_state(registry, CredentialStateDerivation::Initial)?;
         for registered in &self.modules {
             let erased = registered.module.clone().try_init_credential(credential)?;
             candidate.slots.push(OwnedModuleCredState {
@@ -3798,8 +4448,15 @@ impl SecurityRegistry {
         transition: CredentialStateTransition,
     ) -> AxResult<CredentialSecurityState> {
         old_state.validate_for(registry)?;
+        old_state.validate_live()?;
         self.validate_erased_slots(&old_state.slots)?;
-        let mut candidate = self.try_empty_credential_state(registry)?;
+        let mut candidate = self.try_empty_credential_state(
+            registry,
+            CredentialStateDerivation::Prepared {
+                source: old_state.identity.clone(),
+                transition,
+            },
+        )?;
         for (registered, old_slot) in self.modules.iter().zip(&old_state.slots) {
             if registered.id != old_slot.module_id {
                 return Err(AxError::OperationNotPermitted);
@@ -4203,6 +4860,84 @@ impl SecurityRegistry {
             registered
                 .module
                 .file_open_with_credential_state(context, actor_state.erased.as_ref())?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_socket_with_credential_state(
+        &self,
+        context: &SocketSecurityContext<'_>,
+    ) -> AxResult<()> {
+        // Validate the complete vector before the first callback so a malformed
+        // late slot cannot produce a partial policy trace.
+        let actor = self.credential_slots(context.actor())?;
+        for (registered, actor_state) in self.modules.iter().zip(actor) {
+            if registered.id != actor_state.module_id {
+                return Err(AxError::OperationNotPermitted);
+            }
+            registered
+                .module
+                .socket_with_credential_state(context, actor_state.erased.as_ref())?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_mmap_file_with_credential_state(
+        &self,
+        actor: &Cred,
+        context: &CoreMmapFileContext<'_>,
+    ) -> AxResult<()> {
+        if !core::ptr::eq(actor.core(), context.actor()) {
+            return Err(AxError::OperationNotPermitted);
+        }
+        let actor_slots = self.credential_slots(actor)?;
+        for (registered, actor_state) in self.modules.iter().zip(actor_slots) {
+            if registered.id != actor_state.module_id {
+                return Err(AxError::OperationNotPermitted);
+            }
+            registered
+                .module
+                .mmap_file_with_credential_state(context, actor_state.erased.as_ref())?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_mmap_addr_with_credential_state(
+        &self,
+        actor: &Cred,
+        context: &CoreMmapAddressContext<'_>,
+    ) -> AxResult<()> {
+        if !core::ptr::eq(actor.core(), context.actor()) {
+            return Err(AxError::OperationNotPermitted);
+        }
+        let actor_slots = self.credential_slots(actor)?;
+        for (registered, actor_state) in self.modules.iter().zip(actor_slots) {
+            if registered.id != actor_state.module_id {
+                return Err(AxError::OperationNotPermitted);
+            }
+            registered
+                .module
+                .mmap_addr_with_credential_state(context, actor_state.erased.as_ref())?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_file_mprotect_with_credential_state(
+        &self,
+        actor: &Cred,
+        context: &CoreFileMprotectContext<'_, '_>,
+    ) -> AxResult<()> {
+        if !core::ptr::eq(actor.core(), context.actor()) {
+            return Err(AxError::OperationNotPermitted);
+        }
+        let actor_slots = self.credential_slots(actor)?;
+        for (registered, actor_state) in self.modules.iter().zip(actor_slots) {
+            if registered.id != actor_state.module_id {
+                return Err(AxError::OperationNotPermitted);
+            }
+            registered
+                .module
+                .file_mprotect_with_credential_state(context, actor_state.erased.as_ref())?;
         }
         Ok(())
     }
@@ -4723,6 +5458,114 @@ pub(crate) fn dispatch_file_open(context: &FileOpenSecurityContext<'_, '_>) -> A
         .dispatch_file_open_with_credential_state(context)
 }
 
+/// Runs one typed socket hook stack in declaration order after the caller has
+/// completed required usercopy and before backend mutation or publication.
+pub(crate) fn dispatch_socket(context: &SocketSecurityContext<'_>) -> AxResult<()> {
+    context
+        .actor()
+        .security()
+        .registry()
+        .registry()
+        .dispatch_socket_with_credential_state(context)
+}
+
+fn mmap_memory_protection(flags: MappingFlags) -> MemoryProtection {
+    let mut bits = 0;
+    if flags.contains(MappingFlags::READ) {
+        bits |= MemoryProtection::READ.bits();
+    }
+    if flags.contains(MappingFlags::WRITE) {
+        bits |= MemoryProtection::WRITE.bits();
+    }
+    if flags.contains(MappingFlags::EXECUTE) {
+        bits |= MemoryProtection::EXECUTE.bits();
+    }
+    MemoryProtection::try_from_bits(bits).expect("adapter emits only PROT_READ/WRITE/EXEC bits")
+}
+
+/// Runs the typed `mmap_file` stack over either an anonymous target or the
+/// exact retained file/OFD selected by the syscall adapter.
+pub(crate) fn mmap_file(
+    actor: &Cred,
+    target: Option<(&Arc<UserNamespace>, &FileHandle<File>)>,
+    requested: MappingFlags,
+    effective: MappingFlags,
+    raw_flags: usize,
+) -> AxResult<()> {
+    let target = match target {
+        Some((filesystem_owner_user_ns, file)) => {
+            MmapFileTarget::File(MmapFileSecurityRef::new(filesystem_owner_user_ns, file))
+        }
+        None => MmapFileTarget::Anonymous,
+    };
+    let operation = MmapFileOperation::new(
+        mmap_memory_protection(requested),
+        mmap_memory_protection(effective),
+        MmapFileFlags::from_raw(raw_flags),
+    );
+    let context = MmapFileContext::new(actor.core(), target, operation);
+    actor
+        .security()
+        .registry()
+        .registry()
+        .dispatch_mmap_file_with_credential_state(actor, &context)
+}
+
+/// Runs the typed `mmap_addr` stack over the final candidate in one exact
+/// retained address-space image.
+pub(crate) fn mmap_addr(
+    actor: &Cred,
+    image_owner_user_ns: &Arc<UserNamespace>,
+    image: &Arc<Mutex<AddrSpace>>,
+    final_address: VirtAddr,
+) -> AxResult<()> {
+    let image = MmapImageSecurityRef::from_arc(image);
+    dispatch_mmap_addr(actor, image_owner_user_ns, &image, final_address)
+}
+
+fn dispatch_mmap_addr(
+    actor: &Cred,
+    image_owner_user_ns: &Arc<UserNamespace>,
+    image: &MmapImageSecurityRef,
+    final_address: VirtAddr,
+) -> AxResult<()> {
+    let context = MmapAddressContext::new(
+        actor.core(),
+        image_owner_user_ns,
+        image,
+        final_address.as_usize(),
+    );
+    actor
+        .security()
+        .registry()
+        .registry()
+        .dispatch_mmap_addr_with_credential_state(actor, &context)
+}
+
+/// Runs the typed `file_mprotect` stack for one exact pre-change VMA segment.
+/// The caller owns the prepared transaction and commits only after every
+/// segment has passed this dispatch.
+pub(crate) fn file_mprotect<'segment>(
+    actor: &Cred,
+    image_owner_user_ns: &Arc<UserNamespace>,
+    segment: PreparedProtectSegment<'segment>,
+    requested: MappingFlags,
+    effective: MappingFlags,
+) -> AxResult<()> {
+    let context = FileMprotectContext::new(
+        actor.core(),
+        image_owner_user_ns,
+        &segment,
+        mmap_memory_protection(requested),
+        mmap_memory_protection(effective),
+    );
+    actor
+        .security()
+        .registry()
+        .registry()
+        .dispatch_file_mprotect_with_credential_state(actor, &context)
+}
+
 /// Runs Linux commoncap first, then lets the exact actor's frozen module stack
 /// narrow the successful decision in declaration order.
 ///
@@ -4776,6 +5619,44 @@ pub(in crate::task) fn capable_for_setid(
         CapabilitySecurityOperation::SetId,
     )
     .is_ok()
+}
+
+/// Checks namespace-creation authority carried by one exact prepared child.
+/// Commoncap evaluates the proposed credential, while stacked modules receive
+/// both the live source state and the still-private proposed state.
+pub(crate) fn prepared_credential_namespace_capable(
+    source: &Cred,
+    proposed: &Cred,
+    target_user_ns: &Arc<UserNamespace>,
+    raw_capability: u32,
+) -> bool {
+    let authorize = || -> AxResult<()> {
+        let registry = source.security().registry();
+        registry
+            .registry()
+            .validate_credential_pair(source, proposed)?;
+        if !matches!(
+            proposed
+                .security()
+                .prepared_transition_from(source.security())?,
+            CredentialStateTransition::Fork | CredentialStateTransition::UserNamespace
+        ) {
+            return Err(AxError::BadState);
+        }
+        let capability = CapabilityNumber::try_new(raw_capability).ok_or(AxError::InvalidInput)?;
+        let context = external_authorize_prepared_credential_capability_core(
+            source.core(),
+            proposed.core(),
+            target_user_ns,
+            capability,
+            PreparedCredentialCapabilityOperation::NamespaceCreate,
+        )
+        .map_err(authorization_error)?;
+        registry
+            .registry()
+            .dispatch_prepared_credential_capable(source, proposed, &context)
+    };
+    authorize().is_ok()
 }
 
 /// Runs the frozen ptrace access hooks in declaration order.
@@ -5393,7 +6274,13 @@ mod tests {
     };
 
     use axfs_ng_vfs::{MetadataUpdate, Mountpoint, NodePermission};
-    use linux_raw_sys::general::{CAP_CHOWN, CAP_SYS_NICE, CAP_SYS_PTRACE};
+    use axhal::paging::PageSize;
+    use linux_raw_sys::general::{
+        CAP_CHOWN, CAP_SETGID, CAP_SYS_ADMIN, CAP_SYS_NICE, CAP_SYS_PTRACE, MAP_ANONYMOUS,
+        MAP_PRIVATE,
+    };
+    use memory_addr::VirtAddrRange;
+    use memory_set::MemoryArea;
 
     use super::*;
     use crate::{
@@ -5401,11 +6288,13 @@ mod tests {
             namespace_mutation,
             permission::{SecurityFsContextExt, VfsSecurityContext},
         },
+        mm::Backend,
         pseudofs::MemoryFs,
         task::{
             CapabilityState, Cred, CredentialSlot, Credentials, ExecCommitRuntime,
             ExecFileIdentity, ExecImageIdentity, IdMapInputExtent, Kgid, Kuid,
             creds::{CAPABILITY_WORDS, credential_publication_lock_held},
+            thread_cred::SetgroupsAdmission,
         },
     };
 
@@ -5455,6 +6344,9 @@ mod tests {
     static CRED_STATE_CAPABLE_OPERATION: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_CAPABLE_NUMBER: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_CAPABLE_DENY_KEY: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_PREPARED_CAPABLE_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_PREPARED_CAPABLE_NUMBER: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_PREPARED_CAPABLE_DENY_KEY: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_PUBLICATION_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_PUBLICATION_OPERATION: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_PUBLICATION_SOURCE_UID: AtomicU32 = AtomicU32::new(0);
@@ -5477,6 +6369,11 @@ mod tests {
     static CRED_STATE_INODE_RMDIR_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_INODE_RENAME_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_FILE_OPEN_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_SOCKET_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_MMAP_FILE_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_MMAP_ADDR_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_MPROTECT_TRACE: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_MMAP_IMAGE_IDENTITY: AtomicUsize = AtomicUsize::new(0);
     static CRED_STATE_EXEC_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_EXECUTABLE_TRACE: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_EXECUTABLE_ROLE_TRACE: AtomicU32 = AtomicU32::new(0);
@@ -5492,6 +6389,8 @@ mod tests {
     static CRED_STATE_RENAME_DENY_KEY: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_EXEC_DENY_KEY: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_EXECUTABLE_DENY_KEY: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_SOCKET_DENY_KEY: AtomicU32 = AtomicU32::new(0);
+    static CRED_STATE_MMAP_DENY_KEY: AtomicU32 = AtomicU32::new(0);
     static CRED_STATE_TEST_SERIAL: Mutex<()> = Mutex::new(());
     static HARDLINK_VERTICAL_TEST_SERIAL: Mutex<()> = Mutex::new(());
     static REMOVAL_VERTICAL_TEST_SERIAL: Mutex<()> = Mutex::new(());
@@ -5523,6 +6422,9 @@ mod tests {
             &CRED_STATE_CAPABLE_OPERATION,
             &CRED_STATE_CAPABLE_NUMBER,
             &CRED_STATE_CAPABLE_DENY_KEY,
+            &CRED_STATE_PREPARED_CAPABLE_TRACE,
+            &CRED_STATE_PREPARED_CAPABLE_NUMBER,
+            &CRED_STATE_PREPARED_CAPABLE_DENY_KEY,
             &CRED_STATE_PUBLICATION_TRACE,
             &CRED_STATE_PUBLICATION_OPERATION,
             &CRED_STATE_PUBLICATION_SOURCE_UID,
@@ -5544,6 +6446,10 @@ mod tests {
             &CRED_STATE_INODE_RMDIR_TRACE,
             &CRED_STATE_INODE_RENAME_TRACE,
             &CRED_STATE_FILE_OPEN_TRACE,
+            &CRED_STATE_SOCKET_TRACE,
+            &CRED_STATE_MMAP_FILE_TRACE,
+            &CRED_STATE_MMAP_ADDR_TRACE,
+            &CRED_STATE_MPROTECT_TRACE,
             &CRED_STATE_EXEC_TRACE,
             &CRED_STATE_EXECUTABLE_TRACE,
             &CRED_STATE_EXECUTABLE_ROLE_TRACE,
@@ -5559,10 +6465,13 @@ mod tests {
             &CRED_STATE_RENAME_DENY_KEY,
             &CRED_STATE_EXEC_DENY_KEY,
             &CRED_STATE_EXECUTABLE_DENY_KEY,
+            &CRED_STATE_SOCKET_DENY_KEY,
+            &CRED_STATE_MMAP_DENY_KEY,
         ] {
             trace.store(0, Ordering::SeqCst);
         }
         CRED_STATE_PUBLICATION_TARGET.store(0, Ordering::SeqCst);
+        CRED_STATE_MMAP_IMAGE_IDENTITY.store(0, Ordering::SeqCst);
         guard
     }
 
@@ -5677,7 +6586,10 @@ mod tests {
             Ok(ProbeCredentialState {
                 key,
                 generation: old_state.generation + 1,
-                committed: AtomicBool::new(false),
+                // Prepared module state is already usable; the framework keeps
+                // it unreachable from live dispatch until publication activates
+                // the composite state.
+                committed: AtomicBool::new(true),
             })
         }
 
@@ -5725,6 +6637,33 @@ mod tests {
             Ok(())
         }
 
+        fn prepared_credential_capable_with_state(
+            &self,
+            context: &CorePreparedCredentialCapabilityContext<'_>,
+            source_state: &Self::CredentialState,
+            proposed_state: &Self::CredentialState,
+        ) -> AxResult<()> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(source_state.key, key);
+            assert_eq!(proposed_state.key, key);
+            assert!(source_state.committed.load(Ordering::SeqCst));
+            assert!(proposed_state.committed.load(Ordering::SeqCst));
+            assert_eq!(proposed_state.generation, source_state.generation + 1);
+            assert_eq!(
+                context.operation(),
+                PreparedCredentialCapabilityOperation::NamespaceCreate
+            );
+            append_trace(&CRED_STATE_PREPARED_CAPABLE_TRACE, key);
+            if key == 2 {
+                CRED_STATE_PREPARED_CAPABLE_NUMBER
+                    .store(context.capability().get(), Ordering::SeqCst);
+            }
+            if CRED_STATE_PREPARED_CAPABLE_DENY_KEY.load(Ordering::SeqCst) == key {
+                return Err(AxError::PermissionDenied);
+            }
+            Ok(())
+        }
+
         fn credential_published(
             &self,
             context: &CoreCredentialPublicationContext<'_>,
@@ -5736,7 +6675,7 @@ mod tests {
             assert_eq!(source_state.key, key);
             assert_eq!(published_state.key, key);
             assert!(source_state.committed.load(Ordering::SeqCst));
-            assert!(!published_state.committed.swap(true, Ordering::SeqCst));
+            assert!(published_state.committed.load(Ordering::SeqCst));
             assert_eq!(published_state.generation, source_state.generation + 1);
             append_trace(&CRED_STATE_PUBLICATION_TRACE, key);
             if key == 2 {
@@ -5776,7 +6715,7 @@ mod tests {
             assert_eq!(context.old_state().key, key);
             assert_eq!(context.new_state().key, key);
             assert!(context.old_state().committed.load(Ordering::SeqCst));
-            assert!(!context.new_state().committed.swap(true, Ordering::SeqCst));
+            assert!(context.new_state().committed.load(Ordering::SeqCst));
             assert_eq!(
                 context.new_state().generation,
                 context.old_state().generation + 1
@@ -6231,6 +7170,103 @@ mod tests {
             Ok(())
         }
 
+        fn socket_with_credential_state(
+            &self,
+            context: &SocketSecurityContext<'_>,
+            actor_state: &Self::CredentialState,
+        ) -> AxResult<()> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(actor_state.key, key);
+            assert!(actor_state.committed.load(Ordering::SeqCst));
+            let operation_actor = match context.operation() {
+                SocketSecurityOperation::Create(operation) => operation.actor(),
+                _ => panic!("socket registry probe expects create context"),
+            };
+            assert!(core::ptr::eq(context.actor().core(), operation_actor));
+            append_trace(&CRED_STATE_SOCKET_TRACE, key);
+            if CRED_STATE_SOCKET_DENY_KEY.load(Ordering::SeqCst) == key {
+                return Err(AxError::PermissionDenied);
+            }
+            Ok(())
+        }
+
+        fn mmap_file_with_credential_state(
+            &self,
+            context: &CoreMmapFileContext<'_>,
+            actor_state: &Self::CredentialState,
+        ) -> AxResult<()> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(actor_state.key, key);
+            assert!(actor_state.committed.load(Ordering::SeqCst));
+            if key == 2 {
+                assert!(context.target().is_anonymous());
+                assert_eq!(context.operation().requested(), MemoryProtection::NONE);
+                assert_eq!(
+                    context.operation().effective(),
+                    MemoryProtection::READ | MemoryProtection::EXECUTE
+                );
+                assert_ne!(
+                    context.operation().flags().raw() & (1usize << (usize::BITS - 1)),
+                    0
+                );
+            }
+            append_trace(&CRED_STATE_MMAP_FILE_TRACE, key);
+            if CRED_STATE_MMAP_DENY_KEY.load(Ordering::SeqCst) == key {
+                return Err(AxError::PermissionDenied);
+            }
+            Ok(())
+        }
+
+        fn mmap_addr_with_credential_state(
+            &self,
+            context: &CoreMmapAddressContext<'_>,
+            actor_state: &Self::CredentialState,
+        ) -> AxResult<()> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(actor_state.key, key);
+            assert!(actor_state.committed.load(Ordering::SeqCst));
+            if key == 2 {
+                assert_eq!(context.final_address(), 0x8000);
+                assert!(Arc::ptr_eq(
+                    context.image_owner_user_ns(),
+                    context.actor().user_ns()
+                ));
+                assert_eq!(
+                    context.image().identity(),
+                    CRED_STATE_MMAP_IMAGE_IDENTITY.load(Ordering::SeqCst)
+                );
+            }
+            append_trace(&CRED_STATE_MMAP_ADDR_TRACE, key);
+            if CRED_STATE_MMAP_DENY_KEY.load(Ordering::SeqCst) == key {
+                return Err(AxError::PermissionDenied);
+            }
+            Ok(())
+        }
+
+        fn file_mprotect_with_credential_state(
+            &self,
+            context: &CoreFileMprotectContext<'_, '_>,
+            actor_state: &Self::CredentialState,
+        ) -> AxResult<()> {
+            let key = u32::try_from(KEY).expect("probe key fits u32");
+            assert_eq!(actor_state.key, key);
+            assert!(actor_state.committed.load(Ordering::SeqCst));
+            if key == 2 {
+                assert_eq!(context.pre_change_vma().area_start().as_usize(), 0x8000);
+                assert_eq!(context.pre_change_vma().affected().start.as_usize(), 0x8000);
+                assert_eq!(context.requested(), MemoryProtection::WRITE);
+                assert_eq!(
+                    context.effective(),
+                    MemoryProtection::READ | MemoryProtection::WRITE
+                );
+            }
+            append_trace(&CRED_STATE_MPROTECT_TRACE, key);
+            if CRED_STATE_MMAP_DENY_KEY.load(Ordering::SeqCst) == key {
+                return Err(AxError::PermissionDenied);
+            }
+            Ok(())
+        }
+
         fn ptrace_access_with_credential_state(
             &self,
             context: &PtraceAccessContext<'_>,
@@ -6331,7 +7367,7 @@ mod tests {
             assert_eq!(old_state.key, key);
             assert_eq!(new_state.key, key);
             assert!(old_state.committed.load(Ordering::SeqCst));
-            assert!(!new_state.committed.load(Ordering::SeqCst));
+            assert!(new_state.committed.load(Ordering::SeqCst));
             assert_eq!(context.source().identity(), ExecFileIdentity::new(17, 23));
             assert_eq!(context.runtime().process_id(), 41);
             assert_eq!(context.runtime().executing_tid(), 43);
@@ -6405,9 +7441,9 @@ mod tests {
 
         fn free_credential(&self, state: Self::CredentialState) {
             assert!(!credential_publication_lock_held());
-            if state.committed.load(Ordering::SeqCst) {
-                assert_post_commit_callback_locks_released();
-            }
+            // Prepared state is fully usable but may still be rolled back while
+            // the sleepable writer lock is held. Post-publication callback lock
+            // ordering is asserted in the observer hooks above.
             append_trace(&CRED_STATE_DROP_TRACE, state.key);
         }
     }
@@ -10407,6 +11443,163 @@ mod tests {
     }
 
     #[test]
+    fn socket_dispatch_is_ordered_short_circuited_and_fully_preflighted() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root_with_registry(registry, namespace).unwrap();
+        let spec = SocketCreateSpec::try_new(2, 1, 0, false).unwrap();
+
+        let context = SocketSecurityContext::create(&actor, spec);
+        dispatch_socket(&context).unwrap();
+        assert_eq!(CRED_STATE_SOCKET_TRACE.load(Ordering::SeqCst), 23);
+
+        CRED_STATE_SOCKET_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_SOCKET_DENY_KEY.store(2, Ordering::SeqCst);
+        assert_eq!(dispatch_socket(&context), Err(AxError::PermissionDenied));
+        assert_eq!(CRED_STATE_SOCKET_TRACE.load(Ordering::SeqCst), 2);
+        CRED_STATE_SOCKET_DENY_KEY.store(0, Ordering::SeqCst);
+
+        let core = actor.core_arc().clone();
+        let mut malformed_security = registry.try_init_credential_state(&core).unwrap();
+        malformed_security.slots[2].module_id = ModuleId(7);
+        let malformed = Cred::try_from_prepared_parts(core, malformed_security).unwrap();
+        let malformed_context = SocketSecurityContext::create(&malformed, spec);
+        CRED_STATE_SOCKET_TRACE.store(0, Ordering::SeqCst);
+        assert_eq!(
+            dispatch_socket(&malformed_context),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_SOCKET_TRACE.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn mmap_hook_families_are_state_aware_ordered_and_deny_first() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
+        let raw_flags =
+            (1usize << (usize::BITS - 1)) | MAP_PRIVATE as usize | MAP_ANONYMOUS as usize;
+        let requested_file = MappingFlags::USER;
+        let effective_file = MappingFlags::USER | MappingFlags::READ | MappingFlags::EXECUTE;
+
+        mmap_file(&actor, None, requested_file, effective_file, raw_flags).unwrap();
+        assert_eq!(CRED_STATE_MMAP_FILE_TRACE.load(Ordering::SeqCst), 23);
+
+        let start = VirtAddr::from(0x8000);
+        let image = Arc::new(());
+        let image_ref = MmapImageSecurityRef::from_arc(&image);
+        CRED_STATE_MMAP_IMAGE_IDENTITY.store(image_ref.identity(), Ordering::SeqCst);
+        dispatch_mmap_addr(&actor, &namespace, &image_ref, start).unwrap();
+        assert_eq!(CRED_STATE_MMAP_ADDR_TRACE.load(Ordering::SeqCst), 23);
+
+        let initial = MappingFlags::USER | MappingFlags::READ;
+        let requested_protect = MappingFlags::USER | MappingFlags::WRITE;
+        let effective_protect = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+        let area = MemoryArea::new(
+            start,
+            0x1000,
+            initial,
+            Backend::new_alloc(start, PageSize::Size4K),
+        );
+        let segment =
+            PreparedProtectSegment::for_test(&area, VirtAddrRange::new(start, start + 0x1000));
+        file_mprotect(
+            &actor,
+            &namespace,
+            segment,
+            requested_protect,
+            effective_protect,
+        )
+        .unwrap();
+        assert_eq!(CRED_STATE_MPROTECT_TRACE.load(Ordering::SeqCst), 23);
+
+        CRED_STATE_MMAP_DENY_KEY.store(2, Ordering::SeqCst);
+        CRED_STATE_MMAP_FILE_TRACE.store(0, Ordering::SeqCst);
+        assert_eq!(
+            mmap_file(&actor, None, requested_file, effective_file, raw_flags,),
+            Err(AxError::PermissionDenied)
+        );
+        assert_eq!(CRED_STATE_MMAP_FILE_TRACE.load(Ordering::SeqCst), 2);
+
+        CRED_STATE_MMAP_ADDR_TRACE.store(0, Ordering::SeqCst);
+        assert_eq!(
+            dispatch_mmap_addr(&actor, &namespace, &image_ref, start),
+            Err(AxError::PermissionDenied)
+        );
+        assert_eq!(CRED_STATE_MMAP_ADDR_TRACE.load(Ordering::SeqCst), 2);
+
+        CRED_STATE_MPROTECT_TRACE.store(0, Ordering::SeqCst);
+        assert_eq!(
+            file_mprotect(
+                &actor,
+                &namespace,
+                segment,
+                requested_protect,
+                effective_protect,
+            ),
+            Err(AxError::PermissionDenied)
+        );
+        assert_eq!(CRED_STATE_MPROTECT_TRACE.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn mmap_hook_families_fully_preflight_malformed_credential_state() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
+        let core = actor.core_arc().clone();
+        let mut malformed_security = registry.try_init_credential_state(&core).unwrap();
+        malformed_security.slots[2].module_id = ModuleId(7);
+        let malformed = Cred::try_from_prepared_parts(core, malformed_security).unwrap();
+
+        let raw_flags = MAP_PRIVATE as usize | MAP_ANONYMOUS as usize;
+        assert_eq!(
+            mmap_file(
+                &malformed,
+                None,
+                MappingFlags::USER,
+                MappingFlags::USER | MappingFlags::READ,
+                raw_flags,
+            ),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_MMAP_FILE_TRACE.load(Ordering::SeqCst), 0);
+
+        let start = VirtAddr::from(0x8000);
+        let image = Arc::new(());
+        let image_ref = MmapImageSecurityRef::from_arc(&image);
+        CRED_STATE_MMAP_IMAGE_IDENTITY.store(image_ref.identity(), Ordering::SeqCst);
+        assert_eq!(
+            dispatch_mmap_addr(&malformed, &namespace, &image_ref, start),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_MMAP_ADDR_TRACE.load(Ordering::SeqCst), 0);
+
+        let area = MemoryArea::new(
+            start,
+            0x1000,
+            MappingFlags::USER | MappingFlags::READ,
+            Backend::new_alloc(start, PageSize::Size4K),
+        );
+        let segment =
+            PreparedProtectSegment::for_test(&area, VirtAddrRange::new(start, start + 0x1000));
+        assert_eq!(
+            file_mprotect(
+                &malformed,
+                &namespace,
+                segment,
+                MappingFlags::USER | MappingFlags::WRITE,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+            ),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_MPROTECT_TRACE.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn initial_state_failure_reverse_rolls_back_without_a_credential() {
         let _probe_guard = reset_credential_state_probes();
         let registry = probe_registry();
@@ -10429,7 +11622,11 @@ mod tests {
         assert!(matches!(
             registry
                 .registry()
-                .try_empty_credential_state_with_reservation(registry, usize::MAX),
+                .try_empty_credential_state_with_reservation(
+                    registry,
+                    usize::MAX,
+                    CredentialStateDerivation::Initial,
+                ),
             Err(AxError::NoMemory)
         ));
         assert_eq!(CRED_STATE_INIT_TRACE.load(Ordering::SeqCst), 0);
@@ -10945,6 +12142,131 @@ mod tests {
     }
 
     #[test]
+    fn setgroups_admission_is_typed_once_and_bound_to_exact_slot_credential() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root_with_registry(registry, namespace).unwrap();
+        let slot = CredentialSlot::try_new(actor.clone()).unwrap();
+
+        CRED_STATE_CAPABLE_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_CAPABLE_OPERATION.store(0, Ordering::SeqCst);
+        CRED_STATE_CAPABLE_NUMBER.store(0, Ordering::SeqCst);
+        let admission = SetgroupsAdmission::try_new(slot.clone()).unwrap();
+        assert_eq!(CRED_STATE_CAPABLE_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(CRED_STATE_CAPABLE_OPERATION.load(Ordering::SeqCst), 1 << 2);
+        assert_eq!(CRED_STATE_CAPABLE_NUMBER.load(Ordering::SeqCst), CAP_SETGID);
+
+        admission.validate_fixture(&slot, &slot.current()).unwrap();
+        assert_eq!(CRED_STATE_CAPABLE_TRACE.load(Ordering::SeqCst), 23);
+
+        let other_slot = CredentialSlot::try_new(actor.clone()).unwrap();
+        assert_eq!(
+            admission.validate_fixture(&other_slot, &actor),
+            Err(AxError::OperationNotPermitted)
+        );
+
+        let mut replacement = slot.prepare();
+        replacement.builder.no_new_privs = true;
+        let replacement = replacement.finish().unwrap().commit();
+        assert_eq!(
+            admission.validate_fixture(&slot, &replacement),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_CAPABLE_TRACE.load(Ordering::SeqCst), 23);
+
+        CRED_STATE_CAPABLE_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_CAPABLE_DENY_KEY.store(2, Ordering::SeqCst);
+        assert_eq!(
+            SetgroupsAdmission::try_new(CredentialSlot::try_new(actor).unwrap()).err(),
+            Some(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_CAPABLE_TRACE.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn prepared_namespace_capability_never_dispatches_live_capable_on_child() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let source = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
+        let ids = source.ids();
+        let child_namespace = namespace.try_fork(ids.euid, ids.egid, true).unwrap();
+        let child =
+            Cred::try_prepare_with_user_namespace(&source, child_namespace.clone()).unwrap();
+
+        assert_eq!(
+            authorize_capability_with_operation(
+                &child,
+                &child_namespace,
+                CAP_SYS_ADMIN,
+                CapabilitySecurityOperation::Use,
+            ),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(CRED_STATE_CAPABLE_TRACE.load(Ordering::SeqCst), 0);
+
+        assert!(prepared_credential_namespace_capable(
+            &source,
+            &child,
+            &child_namespace,
+            CAP_SYS_ADMIN,
+        ));
+        assert_eq!(CRED_STATE_PREPARED_CAPABLE_TRACE.load(Ordering::SeqCst), 23);
+        assert_eq!(
+            CRED_STATE_PREPARED_CAPABLE_NUMBER.load(Ordering::SeqCst),
+            CAP_SYS_ADMIN
+        );
+
+        CRED_STATE_PREPARED_CAPABLE_TRACE.store(0, Ordering::SeqCst);
+        CRED_STATE_PREPARED_CAPABLE_DENY_KEY.store(2, Ordering::SeqCst);
+        assert!(!prepared_credential_namespace_capable(
+            &source,
+            &child,
+            &child_namespace,
+            CAP_SYS_ADMIN,
+        ));
+        assert_eq!(CRED_STATE_PREPARED_CAPABLE_TRACE.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn unpublished_credential_cannot_seed_another_transition() {
+        let _probe_guard = reset_credential_state_probes();
+        let registry = probe_registry();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let source = Cred::try_root_with_registry(registry, namespace).unwrap();
+        let child = Cred::try_prepare_clone_for_fork(&source).unwrap();
+
+        assert_eq!(
+            Cred::try_prepare_clone_for_fork(&child).err(),
+            Some(AxError::OperationNotPermitted)
+        );
+        let child_slot = CredentialSlot::new(child.clone());
+        let mut unpublished_update = child_slot.prepare();
+        unpublished_update.builder.ids.ruid = Kuid::from_raw(1000).unwrap();
+        assert_eq!(
+            unpublished_update.finish().err(),
+            Some(AxError::OperationNotPermitted)
+        );
+
+        let publication = PendingCredentialPublication::try_fork(
+            &source,
+            &child,
+            TestCredentialPublicationTargetOwner { identity: 0x404 },
+        )
+        .unwrap();
+        publication.activate();
+        publication.notify();
+
+        let grandchild = Cred::try_prepare_clone_for_fork(&child).unwrap();
+        let mut published_update = child_slot.prepare();
+        published_update.builder.ids.ruid = Kuid::from_raw(1000).unwrap();
+        let prepared = published_update.finish().unwrap();
+        drop(prepared);
+        drop(grandchild);
+    }
+
+    #[test]
     fn malformed_capable_state_fails_before_any_module_callback() {
         let _probe_guard = reset_credential_state_probes();
         let registry = probe_registry();
@@ -10982,7 +12304,7 @@ mod tests {
         let namespace = UserNamespace::try_new_root().unwrap();
         let source = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
 
-        let aborted_child = Cred::try_clone_for_fork(&source).unwrap();
+        let aborted_child = Cred::try_prepare_clone_for_fork(&source).unwrap();
         let aborted = PendingCredentialPublication::try_fork(
             &source,
             &aborted_child,
@@ -10992,14 +12314,15 @@ mod tests {
         drop(aborted);
         assert_eq!(CRED_STATE_PUBLICATION_TRACE.load(Ordering::SeqCst), 0);
 
-        let fork_child = Cred::try_clone_for_fork(&source).unwrap();
-        PendingCredentialPublication::try_fork(
+        let fork_child = Cred::try_prepare_clone_for_fork(&source).unwrap();
+        let fork_publication = PendingCredentialPublication::try_fork(
             &source,
             &fork_child,
             TestCredentialPublicationTargetOwner { identity: 0x202 },
         )
-        .unwrap()
-        .notify();
+        .unwrap();
+        fork_publication.activate();
+        fork_publication.notify();
         assert_eq!(CRED_STATE_PUBLICATION_TRACE.load(Ordering::SeqCst), 23);
         assert_eq!(CRED_STATE_PUBLICATION_OPERATION.load(Ordering::SeqCst), 1);
         assert_eq!(CRED_STATE_PUBLICATION_TARGET.load(Ordering::SeqCst), 0x202);
@@ -11016,14 +12339,16 @@ mod tests {
         CRED_STATE_PUBLICATION_OPERATION.store(0, Ordering::SeqCst);
         let ids = source.ids();
         let child_namespace = namespace.try_fork(ids.euid, ids.egid, true).unwrap();
-        let userns_child = Cred::try_with_user_namespace(&source, child_namespace.clone()).unwrap();
-        PendingCredentialPublication::try_user_namespace(
+        let userns_child =
+            Cred::try_prepare_with_user_namespace(&source, child_namespace.clone()).unwrap();
+        let userns_publication = PendingCredentialPublication::try_user_namespace(
             &source,
             &userns_child,
             TestCredentialPublicationTargetOwner { identity: 0x303 },
         )
-        .unwrap()
-        .notify();
+        .unwrap();
+        userns_publication.activate();
+        userns_publication.notify();
         assert_eq!(CRED_STATE_PUBLICATION_TRACE.load(Ordering::SeqCst), 23);
         assert_eq!(
             CRED_STATE_PUBLICATION_OPERATION.load(Ordering::SeqCst),
@@ -11039,10 +12364,30 @@ mod tests {
         let registry = probe_registry();
         let namespace = UserNamespace::try_new_root().unwrap();
         let source = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
-        let fork_child = Cred::try_clone_for_fork(&source).unwrap();
+        assert!(matches!(
+            PendingCredentialPublication::try_fork(
+                &source,
+                &source,
+                TestCredentialPublicationTargetOwner { identity: 0 },
+            ),
+            Err(AxError::BadState)
+        ));
+        let fresh_security = registry.try_init_credential_state(source.core()).unwrap();
+        let fresh =
+            Cred::try_from_prepared_parts(source.core_arc().clone(), fresh_security).unwrap();
+        assert!(matches!(
+            PendingCredentialPublication::try_fork(
+                &source,
+                &fresh,
+                TestCredentialPublicationTargetOwner { identity: 0 },
+            ),
+            Err(AxError::BadState)
+        ));
+        let fork_child = Cred::try_prepare_clone_for_fork(&source).unwrap();
         let ids = source.ids();
         let child_namespace = namespace.try_fork(ids.euid, ids.egid, true).unwrap();
-        let userns_child = Cred::try_with_user_namespace(&source, child_namespace.clone()).unwrap();
+        let userns_child =
+            Cred::try_prepare_with_user_namespace(&source, child_namespace.clone()).unwrap();
 
         assert!(matches!(
             PendingCredentialPublication::try_fork(
@@ -11061,6 +12406,16 @@ mod tests {
             Err(AxError::BadState)
         ));
 
+        let userns_publication = PendingCredentialPublication::try_user_namespace(
+            &source,
+            &userns_child,
+            TestCredentialPublicationTargetOwner { identity: 0x304 },
+        )
+        .unwrap();
+        userns_publication.activate();
+        userns_publication.notify();
+        CRED_STATE_PUBLICATION_TRACE.store(0, Ordering::SeqCst);
+
         child_namespace
             .publish_uid_map(
                 child_namespace
@@ -11078,7 +12433,7 @@ mod tests {
             .unwrap();
         let grandchild_namespace = child_namespace.try_fork(ids.euid, ids.egid, true).unwrap();
         let grandchild =
-            Cred::try_with_user_namespace(&userns_child, grandchild_namespace).unwrap();
+            Cred::try_prepare_with_user_namespace(&userns_child, grandchild_namespace).unwrap();
         assert!(matches!(
             PendingCredentialPublication::try_user_namespace(
                 &source,
@@ -11128,7 +12483,7 @@ mod tests {
         // This test intentionally creates more composite credentials than the
         // decimal u32 drop-order probe can encode at once. Release them in
         // bounded batches; drop order is covered by dedicated tests.
-        for credential in [fork_child, grandchild, foreign, wrong_type] {
+        for credential in [fresh, fork_child, grandchild, foreign, wrong_type] {
             drop(credential);
             CRED_STATE_DROP_TRACE.store(0, Ordering::SeqCst);
         }

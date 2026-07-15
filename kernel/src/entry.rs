@@ -71,11 +71,11 @@ pub fn init(args: &[String], envs: &[String]) {
     let user_ns = UserNamespace::try_new_root().expect("Failed to allocate init user namespace");
     let root_cred = Cred::try_root_with_registry(security_registry, user_ns.clone())
         .expect("Failed to allocate init credential");
-    let boot_credentials = root_cred.fs_dac_credentials();
+    let boot_security = crate::file::permission::VfsSecurityContext::new(root_cred.clone());
     let credential =
         CredentialSlot::try_new(root_cred).expect("Failed to allocate init credential slot");
     let init_net_stack = axnet::default_stack().clone();
-    pseudofs::mount_all(&boot_credentials, init_net_stack.unix_namespace())
+    pseudofs::mount_all(&boot_security, init_net_stack.unix_namespace())
         .expect("Failed to mount pseudofs");
     let init_net_ns = NetworkNamespace::try_new(init_net_stack, user_ns.clone())
         .expect("Failed to allocate init network namespace");

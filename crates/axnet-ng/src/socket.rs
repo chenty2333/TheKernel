@@ -15,12 +15,12 @@ use bitflags::bitflags;
 use enum_dispatch::enum_dispatch;
 
 #[cfg(feature = "vsock")]
-use crate::vsock::VsockSocket;
+use crate::vsock::{VsockSocket, VsockSocketAcceptReservation};
 use crate::{
     options::{Configurable, GetSocketOption, SetSocketOption},
-    tcp::TcpSocket,
+    tcp::{TcpAcceptReservation, TcpSocket},
     udp::UdpSocket,
-    unix::{UnixSocket, UnixSocketAddr},
+    unix::{UnixAcceptReservation, UnixSocket, UnixSocketAddr},
 };
 
 pub trait SocketFilter: Send + Sync {
@@ -272,6 +272,46 @@ pub enum Socket {
     Vsock(VsockSocket),
 }
 
+/// Exact backend object retained before an accept operation mutates its listen
+/// queue. Dropping a reservation restores availability when the same listener
+/// is still live.
+pub enum SocketAcceptReservation<'a> {
+    Tcp(TcpAcceptReservation),
+    Unix(UnixAcceptReservation<'a>),
+    #[cfg(feature = "vsock")]
+    Vsock(VsockSocketAcceptReservation),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SocketAcceptIdentity {
+    Tcp(crate::tcp::TcpAcceptIdentity),
+    Unix(crate::unix::UnixEndpointIdentity),
+    #[cfg(feature = "vsock")]
+    Vsock(crate::vsock::VsockConnId),
+}
+
+impl SocketAcceptReservation<'_> {
+    pub fn identity(&self) -> SocketAcceptIdentity {
+        match self {
+            Self::Tcp(reservation) => SocketAcceptIdentity::Tcp(reservation.identity()),
+            Self::Unix(reservation) => SocketAcceptIdentity::Unix(reservation.accepted_identity()),
+            #[cfg(feature = "vsock")]
+            Self::Vsock(reservation) => {
+                SocketAcceptIdentity::Vsock(reservation.connection_identity())
+            }
+        }
+    }
+
+    pub fn commit(self) -> AxResult<Socket> {
+        match self {
+            Self::Tcp(reservation) => reservation.commit(),
+            Self::Unix(reservation) => reservation.commit(),
+            #[cfg(feature = "vsock")]
+            Self::Vsock(reservation) => reservation.commit(),
+        }
+    }
+}
+
 impl Pollable for Socket {
     fn poll(&self) -> IoEvents {
         match self {
@@ -299,6 +339,19 @@ impl Pollable for Socket {
 }
 
 impl Socket {
+    /// Retains the exact next accepted transport before queue mutation becomes
+    /// visible. Policy can inspect this opaque reservation and then either drop
+    /// it or commit the same backend object.
+    pub fn prepare_accept(&self) -> AxResult<SocketAcceptReservation<'_>> {
+        match self {
+            Self::Tcp(tcp) => tcp.prepare_accept().map(SocketAcceptReservation::Tcp),
+            Self::Unix(unix) => unix.prepare_accept().map(SocketAcceptReservation::Unix),
+            Self::Udp(_) => Err(AxError::OperationNotSupported),
+            #[cfg(feature = "vsock")]
+            Self::Vsock(vsock) => vsock.prepare_accept().map(SocketAcceptReservation::Vsock),
+        }
+    }
+
     /// Runs a composite transfer attempt under this socket's directional
     /// blocking, timeout, pending-error, and readiness policy.
     ///

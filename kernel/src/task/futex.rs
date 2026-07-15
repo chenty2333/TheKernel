@@ -700,10 +700,12 @@ impl FutexKey {
         if let Some(area) = aspace.find_area(VirtAddr::from_usize(address)) {
             match area.backend() {
                 Backend::Shared(backend) => {
-                    return Self::Shared {
-                        offset: address - area.start().as_usize(),
-                        region: Ok(Arc::downgrade(backend.pages())),
-                    };
+                    if let Some(offset) = backend.backing_offset(address) {
+                        return Self::Shared {
+                            offset,
+                            region: Ok(Arc::downgrade(backend.pages())),
+                        };
+                    }
                 }
                 Backend::File(file) => {
                     let (handle, offset) = file.futex_key(address);

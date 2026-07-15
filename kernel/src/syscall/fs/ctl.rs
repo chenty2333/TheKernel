@@ -31,13 +31,12 @@ use crate::{
         inotify::location_for_fd,
         namespace_mutation,
         permission::{
-            ChmodSetattrPolicy, ChownSetattrPolicy, DacFsContextExt, NamedCreateTerminalType,
-            SecurityFsContextExt, VfsSecurityContext, check_open_permissions,
-            check_search_permissions, check_writable_mount,
+            ChmodSetattrPolicy, ChownSetattrPolicy, NamedCreateTerminalType, SecurityFsContextExt,
+            VfsSecurityContext, check_open_permissions_with_security,
+            check_search_permissions_with_security, check_writable_mount,
         },
         privilege_metadata::probe_inode_setattr_privilege_cleanup,
-        resolve_at_with_credentials, resolve_at_with_security, validate_symlink_target, with_fs,
-        with_path_fs,
+        resolve_at_with_security, validate_symlink_target, with_fs, with_path_fs,
     },
     mm::vm_load_string,
     mounts,
@@ -452,13 +451,13 @@ pub fn sys_chdir(path: *const c_char) -> AxResult<isize> {
     debug!("sys_chdir <= path: {path}");
 
     let curr = current();
-    let credentials = curr.as_thread().fs_dac_credentials();
+    let security = VfsSecurityContext::new(curr.as_thread().current_cred());
     let mut fs = FS_CONTEXT.lock();
-    let entry = fs.resolve_dac(path, &credentials)?;
+    let entry = fs.resolve_security(path, &security)?;
     if entry.node_type() != NodeType::Directory {
         return Err(AxError::NotADirectory);
     }
-    check_search_permissions(&entry, &credentials)?;
+    check_search_permissions_with_security(&entry, &security)?;
     fs.set_current_dir(entry)?;
     Ok(0)
 }
@@ -468,11 +467,11 @@ pub fn sys_fchdir(dirfd: i32) -> AxResult<isize> {
 
     let entry = with_fs(dirfd, |fs| Ok(fs.current_dir().clone()))?;
     let curr = current();
-    let credentials = curr.as_thread().fs_dac_credentials();
+    let security = VfsSecurityContext::new(curr.as_thread().current_cred());
     if entry.node_type() != NodeType::Directory {
         return Err(AxError::NotADirectory);
     }
-    check_search_permissions(&entry, &credentials)?;
+    check_search_permissions_with_security(&entry, &security)?;
     FS_CONTEXT.lock().set_current_dir(entry)?;
     Ok(0)
 }
@@ -487,14 +486,14 @@ pub fn sys_chroot(path: *const c_char) -> AxResult<isize> {
     debug!("sys_chroot <= path: {path}");
 
     let curr = current();
-    let credentials = curr.as_thread().fs_dac_credentials();
+    let security = VfsSecurityContext::new(curr.as_thread().current_cred());
     let mut fs = FS_CONTEXT.lock();
-    let loc = fs.resolve_dac(path, &credentials)?;
+    let loc = fs.resolve_security(path, &security)?;
     if loc.node_type() != NodeType::Directory {
         return Err(AxError::NotADirectory);
     }
-    check_search_permissions(&loc, &credentials)?;
-    if !current_has_capability(CAP_SYS_CHROOT) {
+    check_search_permissions_with_security(&loc, &security)?;
+    if !security.has_capability(CAP_SYS_CHROOT) {
         return Err(AxError::OperationNotPermitted);
     }
     fs.set_root_dir(loc)?;
@@ -1032,10 +1031,10 @@ pub fn sys_readlinkat(
     validate_pathname(Path::new(&path))?;
 
     let curr = current();
-    let credentials = curr.as_thread().fs_dac_credentials();
+    let security = VfsSecurityContext::new(curr.as_thread().current_cred());
 
     with_path_fs(dirfd, Path::new(&path), |fs| {
-        let entry = fs.resolve_no_follow_dac(path.as_str(), &credentials)?;
+        let entry = fs.resolve_no_follow_security(path.as_str(), &security)?;
         write_readlink_result(&entry, buf, size)
     })
 }
@@ -1117,12 +1116,7 @@ fn do_fchownat(
     check_writable_mount(&loc)?;
     let (requested_user, requested_group) = requested_chown_ids(security.actor(), uid, gid)?;
     executable::with_credential_metadata_unpinned(&loc, || {
-        let policy = ChownSetattrPolicy::new(
-            &loc,
-            requested_user,
-            requested_group,
-            security.credentials(),
-        )?;
+        let policy = ChownSetattrPolicy::new(&loc, requested_user, requested_group, &security)?;
         let privilege_cleanup = probe_inode_setattr_privilege_cleanup(&loc, policy.metadata())?;
 
         // notify_change() validates the target filesystem mapping before the
@@ -1203,7 +1197,7 @@ fn do_fchmodat(
     let loc = resolve_metadata_target(dirfd, path, flags, source, &security)?;
     check_writable_mount(&loc)?;
     executable::with_credential_metadata_unpinned(&loc, || {
-        let policy = ChmodSetattrPolicy::new(&loc, mode, security.credentials())?;
+        let policy = ChmodSetattrPolicy::new(&loc, mode, &security)?;
         if policy.metadata().node_type == NodeType::Symlink {
             return Err(LinuxError::EOPNOTSUPP.into());
         }
@@ -1235,8 +1229,9 @@ fn update_times(
 ) -> AxResult<()> {
     let path = path.nullable().map(vm_load_string).transpose()?;
     let curr = current();
-    let credentials = curr.as_thread().fs_dac_credentials();
-    let loc = resolve_at_with_credentials(dirfd, path.as_deref(), flags, &credentials)?
+    let security = VfsSecurityContext::new(curr.as_thread().current_cred());
+    let credentials = security.credentials();
+    let loc = resolve_at_with_security(dirfd, path.as_deref(), flags, &security)?
         .into_file()
         .ok_or(AxError::BadFileDescriptor)?;
     if atime_intent == TimeUpdate::Omit && mtime_intent == TimeUpdate::Omit {
@@ -1244,13 +1239,17 @@ fn update_times(
     }
 
     let meta = loc.metadata()?;
-    if Kuid::from_raw(meta.uid) != Some(credentials.uid())
-        && !credentials.has_capability(CAP_FOWNER)
-    {
+    if Kuid::from_raw(meta.uid) != Some(credentials.uid()) && !security.has_capability(CAP_FOWNER) {
         if (atime_intent, mtime_intent) != (TimeUpdate::Now, TimeUpdate::Now) {
             return Err(AxError::OperationNotPermitted);
         }
-        check_open_permissions(&loc, W_OK, &credentials)?;
+        check_open_permissions_with_security(
+            &loc,
+            W_OK,
+            security.actor(),
+            credentials,
+            security.filesystem_owner_user_ns(),
+        )?;
     }
     check_writable_mount(&loc)?;
     loc.update_metadata(MetadataUpdate {
@@ -2459,13 +2458,8 @@ mod tests {
                 .unwrap();
             let requested_user = (uid != -1).then_some(Kuid::INITIAL_ROOT);
             let requested_group = (gid != -1).then_some(Kgid::INITIAL_ROOT);
-            let policy = ChownSetattrPolicy::new(
-                &file,
-                requested_user,
-                requested_group,
-                security.credentials(),
-            )
-            .unwrap();
+            let policy =
+                ChownSetattrPolicy::new(&file, requested_user, requested_group, &security).unwrap();
             let cleanup = probe_inode_setattr_privilege_cleanup(&file, policy.metadata()).unwrap();
             let published = policy
                 .admit(&security, cleanup)

@@ -27,6 +27,49 @@ pub struct VsockStreamTransport {
     poll_state: PollSet,
 }
 
+/// Exact vsock connection retained outside its listener queue until accept
+/// policy either commits or restores it.
+pub struct VsockAcceptReservation {
+    prepared: Option<PreparedVsockAccept>,
+}
+
+impl VsockAcceptReservation {
+    pub fn connection_identity(&self) -> VsockConnId {
+        self.prepared
+            .as_ref()
+            .expect("active vsock accept reservation")
+            .conn_id
+    }
+
+    pub fn commit(mut self) -> AxResult<(VsockTransport, VsockAddr)> {
+        let prepared = self
+            .prepared
+            .take()
+            .expect("active vsock accept reservation");
+        if !VSOCK_CONN_MANAGER.lock().commit_accept(&prepared) {
+            return Err(AxError::InvalidInput);
+        }
+        let peer_addr = prepared.peer_addr;
+        let new_transport = VsockStreamTransport {
+            conn_id: Mutex::new(Some(prepared.conn_id)),
+            connection: Mutex::new(Some(prepared.connection)),
+            state: StateLock::new(State::Connected),
+            general: GeneralOptions::default(),
+            poll_state: PollSet::new(),
+        };
+        Ok((VsockTransport::Stream(new_transport), peer_addr))
+    }
+}
+
+impl Drop for VsockAcceptReservation {
+    fn drop(&mut self) {
+        let Some(prepared) = self.prepared.take() else {
+            return;
+        };
+        VSOCK_CONN_MANAGER.lock().restore_accept(&prepared);
+    }
+}
+
 impl VsockStreamTransport {
     /// Create a new idle vsock stream transport.
     pub fn new() -> Self {
@@ -51,6 +94,21 @@ impl VsockStreamTransport {
 
     fn get_connection(&self) -> AxResult<Arc<Mutex<Connection>>> {
         self.connection.lock().clone().ok_or(AxError::NotConnected)
+    }
+
+    pub fn prepare_accept(&self) -> AxResult<VsockAcceptReservation> {
+        if self.state.get() != State::Listening {
+            ax_bail!(InvalidInput, "not listening");
+        }
+
+        let connection = self.get_connection()?;
+        let local_port = connection.lock().local_addr().port;
+        self.general.recv_poller(self, || {
+            let prepared = VSOCK_CONN_MANAGER.lock().prepare_accept(local_port)?;
+            Ok(VsockAcceptReservation {
+                prepared: Some(prepared),
+            })
+        })
     }
 }
 
@@ -124,35 +182,7 @@ impl VsockTransportOps for VsockStreamTransport {
     }
 
     fn accept(&self) -> AxResult<(VsockTransport, VsockAddr)> {
-        if self.state.get() != State::Listening {
-            ax_bail!(InvalidInput, "not listening");
-        }
-
-        let conn = self.get_connection()?;
-        let local_port = conn.lock().local_addr().port;
-
-        // wait for connection
-        self.general.recv_poller(self, || {
-            let mut manager = VSOCK_CONN_MANAGER.lock();
-
-            if !manager.can_accept(local_port) {
-                return Err(AxError::WouldBlock);
-            }
-
-            let (conn_id, peer_addr) = manager.accept(local_port)?;
-            let conn = manager.get_connection(conn_id).ok_or(AxError::NotFound)?;
-
-            // create new VsockStreamTransport
-            let new_transport = VsockStreamTransport {
-                conn_id: Mutex::new(Some(conn_id)),
-                connection: Mutex::new(Some(conn)),
-                state: StateLock::new(State::Connected),
-                general: GeneralOptions::default(),
-                poll_state: PollSet::new(),
-            };
-
-            Ok((VsockTransport::Stream(new_transport), peer_addr))
-        })
+        self.prepare_accept()?.commit()
     }
 
     fn connect(&self, peer_addr: VsockAddr) -> AxResult<()> {

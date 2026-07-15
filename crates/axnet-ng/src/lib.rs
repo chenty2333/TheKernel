@@ -67,6 +67,9 @@ pub use self::{
     socket::*,
 };
 
+/// Maximum pending connection count implemented by the bounded listen queues.
+pub const MAX_LISTEN_BACKLOG: usize = consts::LISTEN_QUEUE_SIZE;
+
 static DEFAULT_STACK: Once<Arc<NetStack>> = Once::new();
 
 /// Returns a reference to the default (init) network stack.

@@ -25,6 +25,18 @@ use crate::{
     options::{Configurable, GetSocketOption, SetSocketOption, UnixCredentials},
 };
 
+/// Stable identity derived from the exact retained Unix transport object used
+/// by a prepare/commit operation. It is meaningful only while the reservation
+/// that returned it remains alive.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct UnixEndpointIdentity(usize);
+
+impl UnixEndpointIdentity {
+    const fn from_raw(identity: usize) -> Self {
+        Self(identity)
+    }
+}
+
 /// Address for a Unix domain socket.
 #[derive(Default, Clone, Debug)]
 pub enum UnixSocketAddr {
@@ -449,6 +461,120 @@ pub struct UnixBindReservation<'a> {
     committed: bool,
 }
 
+/// Prepared Unix stream connection whose listener queue and both channel
+/// endpoints remain private until `commit`.
+pub struct UnixStreamConnectReservation<'a> {
+    socket: &'a UnixSocket,
+    target: UnixSocketTarget,
+    inner: Option<stream::StreamConnectReservation<'a>>,
+    committed: bool,
+}
+
+impl UnixStreamConnectReservation<'_> {
+    pub fn listening_identity(&self) -> UnixEndpointIdentity {
+        UnixEndpointIdentity::from_raw(
+            self.inner
+                .as_ref()
+                .expect("active Unix stream-connect reservation")
+                .listener_identity(),
+        )
+    }
+
+    pub fn accepted_identity(&self) -> UnixEndpointIdentity {
+        UnixEndpointIdentity::from_raw(
+            self.inner
+                .as_ref()
+                .expect("active Unix stream-connect reservation")
+                .accepted_identity(),
+        )
+    }
+
+    pub fn commit(mut self) -> AxResult<()> {
+        self.inner
+            .take()
+            .expect("active Unix stream-connect reservation")
+            .commit()?;
+        *self.socket.remote_addr.lock() = self.target.address.clone();
+        self.socket
+            .connect_state
+            .store(ENDPOINT_BOUND, Ordering::Release);
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for UnixStreamConnectReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.socket
+                .connect_state
+                .store(ENDPOINT_UNBOUND, Ordering::Release);
+        }
+    }
+}
+
+/// Prepared Unix accept retaining the exact front connection request. Dropping
+/// it restores that request when the listener remains live.
+pub struct UnixAcceptReservation<'a> {
+    listener: &'a UnixSocket,
+    inner: Option<stream::StreamAcceptReservation>,
+    local_address: UnixSocketAddr,
+}
+
+/// Exact Unix datagram peer channel retained across policy dispatch.
+pub struct UnixMaySendReservation<'a> {
+    inner: Option<dgram::DgramSendReservation<'a>>,
+}
+
+impl UnixMaySendReservation<'_> {
+    pub fn receiving_identity(&self) -> UnixEndpointIdentity {
+        UnixEndpointIdentity::from_raw(
+            self.inner
+                .as_ref()
+                .expect("active Unix datagram-send reservation")
+                .peer_identity(),
+        )
+    }
+
+    pub fn commit(mut self, src: impl Read + IoBuf) -> AxResult<usize> {
+        self.inner
+            .take()
+            .expect("active Unix datagram-send reservation")
+            .commit(src)
+    }
+}
+
+impl UnixAcceptReservation<'_> {
+    pub fn accepted_identity(&self) -> UnixEndpointIdentity {
+        UnixEndpointIdentity::from_raw(
+            self.inner
+                .as_ref()
+                .expect("active Unix accept reservation")
+                .accepted_identity(),
+        )
+    }
+
+    pub fn commit(mut self) -> AxResult<Socket> {
+        let (transport, peer_addr) = self
+            .inner
+            .take()
+            .expect("active Unix accept reservation")
+            .commit()?;
+        Ok(Socket::Unix(UnixSocket {
+            transport,
+            namespace: self.listener.namespace.clone(),
+            local: Mutex::new(LocalEndpoint {
+                address: self.local_address.clone(),
+                slot: None,
+                cleanup: None,
+            }),
+            remote_addr: Mutex::new(peer_addr),
+            bind_state: AtomicU8::new(ENDPOINT_BOUND),
+            connect_state: AtomicU8::new(ENDPOINT_BOUND),
+        }))
+    }
+}
+
 impl UnixBindReservation<'_> {
     fn commit_inner(mut self, owns_abstract: bool) {
         let mut cleanup = self.cleanup.take();
@@ -580,6 +706,50 @@ impl UnixSocket {
         })
     }
 
+    fn prepare_stream_connect_target(
+        &self,
+        target: UnixSocketTarget,
+        credentials: UnixCredentials,
+    ) -> AxResult<UnixStreamConnectReservation<'_>> {
+        if !matches!(&self.transport, Transport::Stream(_)) {
+            return Err(AxError::InvalidInput);
+        }
+        if self
+            .connect_state
+            .compare_exchange(
+                ENDPOINT_UNBOUND,
+                ENDPOINT_RESERVED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(AxError::AlreadyConnected);
+        }
+
+        let result = (|| {
+            if !target.slot.is_active() {
+                return Err(AxError::ConnectionRefused);
+            }
+            let local_addr = self.local.lock().address.clone();
+            let Transport::Stream(stream) = &self.transport else {
+                unreachable!();
+            };
+            let inner = stream.prepare_connect(target.slot(), &local_addr, credentials)?;
+            Ok(UnixStreamConnectReservation {
+                socket: self,
+                target,
+                inner: Some(inner),
+                committed: false,
+            })
+        })();
+        if result.is_err() {
+            self.connect_state
+                .store(ENDPOINT_UNBOUND, Ordering::Release);
+        }
+        result
+    }
+
     fn connect_target(&self, target: UnixSocketTarget, credentials: UnixCredentials) -> AxResult {
         if matches!(&self.transport, Transport::Dgram(_)) {
             // SOCK_DGRAM connect is an atomic peer replacement. Serialize the
@@ -596,36 +766,8 @@ impl UnixSocket {
             self.connect_state.store(ENDPOINT_BOUND, Ordering::Release);
             return Ok(());
         }
-
-        if self
-            .connect_state
-            .compare_exchange(
-                ENDPOINT_UNBOUND,
-                ENDPOINT_RESERVED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return Err(AxError::AlreadyConnected);
-        }
-        if !target.slot.is_active() {
-            self.connect_state
-                .store(ENDPOINT_UNBOUND, Ordering::Release);
-            return Err(AxError::ConnectionRefused);
-        }
-        let local_addr = self.local.lock().address.clone();
-        if let Err(error) = self
-            .transport
-            .connect(target.slot(), &local_addr, credentials)
-        {
-            self.connect_state
-                .store(ENDPOINT_UNBOUND, Ordering::Release);
-            return Err(error);
-        }
-        *self.remote_addr.lock() = target.address;
-        self.connect_state.store(ENDPOINT_BOUND, Ordering::Release);
-        Ok(())
+        self.prepare_stream_connect_target(target, credentials)?
+            .commit()
     }
 
     /// Disconnects a Unix datagram socket using connect(AF_UNSPEC) semantics.
@@ -660,6 +802,19 @@ impl UnixSocket {
         self.connect_target(target, credentials)
     }
 
+    /// Prepares a pathname Unix stream connection without publishing either
+    /// channel endpoint or consuming its listener queue permit.
+    pub fn prepare_stream_connect_resolved_as(
+        &self,
+        target: UnixSocketTarget,
+        credentials: UnixCredentials,
+    ) -> AxResult<UnixStreamConnectReservation<'_>> {
+        if !matches!(target.address(), UnixSocketAddr::Path(_)) {
+            return Err(AxError::InvalidInput);
+        }
+        self.prepare_stream_connect_target(target, credentials)
+    }
+
     /// Connects an abstract Unix socket using an operation-time credential
     /// snapshot supplied by the OS personality layer.
     pub fn connect_as(&self, remote_addr: SocketAddrEx, credentials: UnixCredentials) -> AxResult {
@@ -672,6 +827,38 @@ impl UnixSocket {
                 self.connect_target(UnixSocketTarget::from_bound(slot)?, credentials)
             }
         }
+    }
+
+    /// Prepares an abstract-namespace Unix stream connection while retaining
+    /// the exact resolved listener slot through policy dispatch.
+    pub fn prepare_stream_connect_as(
+        &self,
+        remote_addr: SocketAddrEx,
+        credentials: UnixCredentials,
+    ) -> AxResult<UnixStreamConnectReservation<'_>> {
+        let remote_addr = remote_addr.into_unix()?;
+        match &remote_addr {
+            UnixSocketAddr::Unnamed => Err(AxError::InvalidInput),
+            UnixSocketAddr::Path(_) => Err(AxError::OperationNotSupported),
+            UnixSocketAddr::Abstract(name) => {
+                let slot = self.namespace.abstract_slot(name)?;
+                self.prepare_stream_connect_target(UnixSocketTarget::from_bound(slot)?, credentials)
+            }
+        }
+    }
+
+    /// Reserves the exact next Unix stream connection while leaving it
+    /// logically queued until the caller commits the operation.
+    pub fn prepare_accept(&self) -> AxResult<UnixAcceptReservation<'_>> {
+        let Transport::Stream(stream) = &self.transport else {
+            return Err(AxError::InvalidInput);
+        };
+        let inner = block_on(interruptible(stream.prepare_accept()))???;
+        Ok(UnixAcceptReservation {
+            listener: self,
+            inner: Some(inner),
+            local_address: self.local.lock().address.clone(),
+        })
     }
 
     /// Starts listening with the identity captured at listen(2).
@@ -695,13 +882,45 @@ impl UnixSocket {
         if !matches!(target.address(), UnixSocketAddr::Path(_)) {
             return Err(AxError::InvalidInput);
         }
+        self.prepare_send_to_resolved(options, target)?.commit(src)
+    }
+
+    /// Retains the exact pathname datagram peer selected by the caller. The
+    /// returned reservation sends through that same channel after policy.
+    pub fn prepare_send_to_resolved(
+        &self,
+        options: SendOptions,
+        target: UnixSocketTarget,
+    ) -> AxResult<UnixMaySendReservation<'_>> {
+        if !matches!(target.address(), UnixSocketAddr::Path(_)) {
+            return Err(AxError::InvalidInput);
+        }
         match &self.transport {
-            Transport::Dgram(dgram) if target.slot.is_active() => {
-                dgram.send_to_slot(src, options, target.slot())
-            }
+            Transport::Dgram(dgram) if target.slot.is_active() => Ok(UnixMaySendReservation {
+                inner: Some(dgram.prepare_send_to_slot(options, target.slot())?),
+            }),
             Transport::Dgram(_) => Err(AxError::ConnectionRefused),
             Transport::Stream(_) => Err(AxError::InvalidInput),
         }
+    }
+
+    /// Retains the exact connected or abstract-namespace datagram peer without
+    /// repeating peer lookup after policy dispatch.
+    pub fn prepare_may_send(&self, options: SendOptions) -> AxResult<UnixMaySendReservation<'_>> {
+        let Transport::Dgram(dgram) = &self.transport else {
+            return Err(AxError::InvalidInput);
+        };
+        let inner = match options.to.as_ref() {
+            Some(SocketAddrEx::Unix(UnixSocketAddr::Abstract(name))) => {
+                let slot = self.namespace.abstract_slot(name)?;
+                if !slot.is_active() {
+                    return Err(AxError::ConnectionRefused);
+                }
+                dgram.prepare_send_to_slot(options, &slot)?
+            }
+            _ => dgram.prepare_send(options)?,
+        };
+        Ok(UnixMaySendReservation { inner: Some(inner) })
     }
 
     pub fn set_filter(&self, filter: Option<Arc<dyn SocketFilter>>) -> AxResult<()> {
@@ -769,27 +988,12 @@ impl SocketOps for UnixSocket {
     }
 
     fn accept(&self) -> AxResult<Socket> {
-        let (transport, peer_addr) = block_on(interruptible(self.transport.accept()))???;
-        Ok(Socket::Unix(Self {
-            transport,
-            namespace: self.namespace.clone(),
-            local: Mutex::new(LocalEndpoint {
-                address: self.local.lock().address.clone(),
-                slot: None,
-                cleanup: None,
-            }),
-            remote_addr: Mutex::new(peer_addr),
-            bind_state: AtomicU8::new(ENDPOINT_BOUND),
-            connect_state: AtomicU8::new(ENDPOINT_BOUND),
-        }))
+        self.prepare_accept()?.commit()
     }
 
     fn send(&self, src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {
-        if let (Transport::Dgram(dgram), Some(SocketAddrEx::Unix(UnixSocketAddr::Abstract(name)))) =
-            (&self.transport, options.to.as_ref())
-        {
-            let slot = self.namespace.abstract_slot(name)?;
-            return dgram.send_to_slot(src, options, &slot);
+        if matches!(&self.transport, Transport::Dgram(_)) {
+            return self.prepare_may_send(options)?.commit(src);
         }
         self.transport.send(src, options)
     }

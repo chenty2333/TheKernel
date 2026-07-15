@@ -181,6 +181,10 @@ pub struct NetlinkSocket {
 }
 
 impl NetlinkSocket {
+    pub(crate) fn net_namespace(&self) -> &Arc<NetworkNamespace> {
+        &self.net_ns
+    }
+
     pub fn validate_socket_type(ty: u32, protocol: u32) -> AxResult {
         if !matches!(ty, SOCK_RAW | SOCK_DGRAM) {
             return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
@@ -319,21 +323,6 @@ impl NetlinkSocket {
                 })
             },
         )
-    }
-
-    pub(crate) fn recv_from_with_nonblocking(
-        &self,
-        dst: &mut IoDst,
-        flags: RecvFlags,
-        addr: UserPtr<sockaddr>,
-        addrlen: Option<&mut socklen_t>,
-        nonblocking: bool,
-    ) -> AxResult<usize> {
-        let recv = self.recv_with_nonblocking(dst, flags, nonblocking)?;
-        if let Some(addrlen) = addrlen {
-            write_netlink_kernel_addr(addr, addrlen)?;
-        }
-        Ok(recv)
     }
 
     fn handle_write(&self, data: &[u8]) -> AxResult {
@@ -626,29 +615,6 @@ fn link_message(request: &NlMsgHdr, port_id: u32, entry: &LinkEntry) -> Vec<u8> 
         push_attr(&mut payload, IFLA_ADDRESS, &entry.hwaddr);
     }
     netlink_message(request, port_id, RTM_NEWLINK, payload)
-}
-
-fn write_netlink_kernel_addr(addr: UserPtr<sockaddr>, addrlen: &mut socklen_t) -> AxResult {
-    let nl = SockaddrNl {
-        nl_family: AF_NETLINK as _,
-        nl_pad: 0,
-        nl_pid: 0,
-        nl_groups: 0,
-    };
-    let bytes = unsafe {
-        core::slice::from_raw_parts(
-            (&nl as *const SockaddrNl).cast::<u8>(),
-            size_of::<SockaddrNl>(),
-        )
-    };
-    let copy_len = (*addrlen as usize).min(bytes.len());
-    if copy_len != 0 {
-        addr.cast::<u8>()
-            .get_as_mut_slice(copy_len)?
-            .copy_from_slice(&bytes[..copy_len]);
-    }
-    *addrlen = bytes.len() as _;
-    Ok(())
 }
 
 fn ip_address_bytes(address: IpAddress) -> Vec<u8> {

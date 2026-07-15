@@ -39,7 +39,7 @@ use crate::{
             VfsSecurityContext, authorize_file_open, authorize_named_inode_create,
             check_create_permissions_with_security, check_open_permissions_with_security,
             check_pathwalk_search_permission_with_security, check_writable_mount,
-            initial_named_create_owner_mode,
+            initial_named_create_owner_mode_with_security,
         },
         pipe::NamedPipe,
         prepare_file_description_with_open_lease, replace_process_fd_table, reserve_fd, resolve_at,
@@ -822,9 +822,9 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
                 security.filesystem_owner_user_ns(),
             )?;
             let parent = dir.metadata()?;
-            let (final_mode, owner) = initial_named_create_owner_mode(
+            let (final_mode, owner) = initial_named_create_owner_mode_with_security(
                 &parent,
-                credentials,
+                security.vfs_security(),
                 create_options.node_type,
                 requested_mode,
                 security.umask,
@@ -1095,9 +1095,9 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
     )?;
 
     let parent_meta = dir_loc.metadata()?;
-    let (final_mode, owner) = initial_named_create_owner_mode(
+    let (final_mode, owner) = initial_named_create_owner_mode_with_security(
         &parent_meta,
-        credentials,
+        security.vfs_security(),
         NodeType::RegularFile,
         NodePermission::from_bits_truncate(mode as u16),
         security.umask,

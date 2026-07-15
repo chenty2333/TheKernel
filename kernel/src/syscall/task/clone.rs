@@ -26,7 +26,7 @@ use crate::{
         AsThread, Cred, CredentialSlot, Dumpability, InitialProcessThreadAdmission,
         NetworkNamespace, PendingCredentialPublication, PendingThreadPublication,
         ProcessAccessState, ProcessData, ProcessThreadAdmission, TaskParentChoice, Thread,
-        get_process_data, linux_pid_from_task_id, lock_task_parent_publication, ns_capable,
+        get_process_data, linux_pid_from_task_id, lock_task_parent_publication,
         prepare_task_table_admission, process_domain, send_signal_thread_inner, try_new_user_task,
         try_tasks, vm_write_in_aspace,
     },
@@ -45,13 +45,18 @@ fn should_yield_after_clone(flags: CloneFlags) -> bool {
 
 fn clone_namespace_owner(
     flags: CloneFlags,
+    parent_cred: &Cred,
     child_cred: &Cred,
 ) -> AxResult<Arc<crate::task::UserNamespace>> {
     let owner = child_cred.user_ns().clone();
     if flags.intersects(
         CloneFlags::NEWCGROUP | CloneFlags::NEWUTS | CloneFlags::NEWPID | CloneFlags::NEWNET,
-    ) && !ns_capable(child_cred, &owner, CAP_SYS_ADMIN)
-    {
+    ) && !crate::task::security::prepared_credential_namespace_capable(
+        parent_cred,
+        child_cred,
+        &owner,
+        CAP_SYS_ADMIN,
+    ) {
         return Err(AxError::OperationNotPermitted);
     }
     Ok(owner)
@@ -386,13 +391,13 @@ impl CloneArgs {
                 ids.egid,
                 parent_cred.has_effective_capability_in_own_user_ns(CAP_SETFCAP),
             )?;
-            Cred::try_with_user_namespace(&parent_cred, user_ns)?
+            Cred::try_prepare_with_user_namespace(&parent_cred, user_ns)?
         } else if flags.contains(CloneFlags::THREAD) {
             parent_cred.clone()
         } else {
-            Cred::try_clone_for_fork(&parent_cred)?
+            Cred::try_prepare_clone_for_fork(&parent_cred)?
         };
-        let namespace_owner = clone_namespace_owner(flags, &child_cred)?;
+        let namespace_owner = clone_namespace_owner(flags, &parent_cred, &child_cred)?;
         if old_proc_data.exec_in_progress() {
             return Err(AxError::Interrupted);
         }
@@ -676,6 +681,10 @@ impl CloneArgs {
 
         if flags.contains(CloneFlags::VFORK) {
             new_proc_data.begin_vfork(calling_tid);
+        }
+
+        if let Some(publication) = credential_publication.as_ref() {
+            publication.activate();
         }
 
         // Exact real-parent publication linearizes against parent-task exit.
@@ -1024,11 +1033,12 @@ mod tests {
             | CloneFlags::NEWPID
             | CloneFlags::NEWNET;
 
-        let owner = clone_namespace_owner(flags, &child_cred).unwrap();
+        let owner = clone_namespace_owner(flags, &parent_cred, &child_cred).unwrap();
         assert!(Arc::ptr_eq(&owner, &child));
         assert!(!Arc::ptr_eq(&owner, &root));
 
-        let inherited_owner = clone_namespace_owner(CloneFlags::NEWUTS, &child_cred).unwrap();
+        let inherited_owner =
+            clone_namespace_owner(CloneFlags::NEWUTS, &parent_cred, &child_cred).unwrap();
         assert!(Arc::ptr_eq(&inherited_owner, &child));
     }
 }

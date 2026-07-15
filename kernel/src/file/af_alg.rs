@@ -14,13 +14,13 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::prelude::*;
 use axpoll::{IoEvents, Pollable};
-use linux_raw_sys::net::{SOCK_SEQPACKET, cmsghdr, msghdr, sockaddr, socklen_t};
+use linux_raw_sys::net::{SOCK_SEQPACKET, cmsghdr, sockaddr, socklen_t};
 use spin::Mutex;
 
 use super::{FileLike, Kstat, PseudoInode, try_pseudo_inode_path};
 use crate::{
     file::{FileHandle, get_typed_file},
-    mm::{IoVec, IoVectorBuf, UserConstPtr},
+    mm::UserConstPtr,
 };
 
 pub const AF_ALG: u32 = 38;
@@ -131,6 +131,38 @@ struct RequestState {
     output_finalized: bool,
 }
 
+pub(crate) struct AfAlgSendRequest {
+    payload: Vec<u8>,
+    params: SendParams,
+    ancillary_items: usize,
+    has_name: bool,
+}
+
+impl AfAlgSendRequest {
+    pub(crate) fn prepare(payload: Vec<u8>, control: &[u8], has_name: bool) -> AxResult<Self> {
+        let (params, ancillary_items) = parse_send_params(control)?;
+        Ok(Self {
+            payload,
+            params,
+            ancillary_items,
+            has_name,
+        })
+    }
+
+    pub(crate) fn payload_len(&self) -> usize {
+        self.payload.len()
+    }
+
+    pub(crate) fn ancillary_items(&self) -> usize {
+        self.ancillary_items
+    }
+
+    #[cfg(test)]
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
 enum SocketKind {
     Listener(Mutex<ListenerState>),
     Request(Mutex<RequestState>),
@@ -215,22 +247,20 @@ impl AfAlgSocket {
         Ok(())
     }
 
-    pub fn sendmsg(&self, msg: &msghdr) -> AxResult<usize> {
-        if !msg.msg_name.is_null() || msg.msg_namelen != 0 {
+    pub(crate) fn send_prepared(&self, request: AfAlgSendRequest) -> AxResult<usize> {
+        if request.has_name {
             return Err(AxError::InvalidInput);
         }
 
-        let params = parse_send_params(msg)?;
-        let mut payload = Vec::new();
-        if !msg.msg_iov.is_null() && msg.msg_iovlen != 0 {
-            let mut io = IoVectorBuf::new(msg.msg_iov as *const IoVec, msg.msg_iovlen)?.into_io();
-            payload.resize(io.remaining(), 0);
-            let read = io.read(&mut payload)?;
-            payload.truncate(read);
-        }
-
+        let AfAlgSendRequest {
+            payload,
+            params,
+            ancillary_items: _,
+            has_name: _,
+        } = request;
+        let payload_len = payload.len();
         self.push_request_input(&payload, params)?;
-        Ok(payload.len())
+        Ok(payload_len)
     }
 
     fn push_request_input(&self, data: &[u8], params: SendParams) -> AxResult<()> {
@@ -363,22 +393,30 @@ struct SendParams {
     assoclen: Option<u32>,
 }
 
-fn parse_send_params(msg: &msghdr) -> AxResult<SendParams> {
+fn parse_send_params(control: &[u8]) -> AxResult<(SendParams, usize)> {
     let mut params = SendParams::default();
-    if msg.msg_control.is_null() || msg.msg_controllen == 0 {
-        return Ok(params);
-    }
-
-    let mut ptr = msg.msg_control as usize;
-    let end = ptr + msg.msg_controllen;
-    while ptr + size_of::<cmsghdr>() <= end {
-        let hdr = UserConstPtr::<cmsghdr>::from(ptr).get_as_ref()?;
-        if hdr.cmsg_len < size_of::<cmsghdr>() || ptr + hdr.cmsg_len > end {
+    let mut ancillary_items = 0usize;
+    let mut offset = 0usize;
+    while control.len().saturating_sub(offset) >= size_of::<cmsghdr>() {
+        let hdr = unsafe {
+            control
+                .as_ptr()
+                .add(offset)
+                .cast::<cmsghdr>()
+                .read_unaligned()
+        };
+        if hdr.cmsg_len < size_of::<cmsghdr>() {
             return Err(AxError::InvalidInput);
         }
+        let data_start = offset
+            .checked_add(size_of::<cmsghdr>())
+            .ok_or(AxError::InvalidInput)?;
+        let data_end = offset
+            .checked_add(hdr.cmsg_len)
+            .filter(|end| *end <= control.len())
+            .ok_or(AxError::InvalidInput)?;
 
-        let data_len = hdr.cmsg_len - size_of::<cmsghdr>();
-        let data = UserConstPtr::<u8>::from(ptr + size_of::<cmsghdr>()).get_as_slice(data_len)?;
+        let data = &control[data_start..data_end];
         if hdr.cmsg_level as u32 != SOL_ALG {
             return Err(AxError::InvalidInput);
         }
@@ -415,15 +453,20 @@ fn parse_send_params(msg: &msghdr) -> AxResult<SendParams> {
             _ => return Err(AxError::InvalidInput),
         }
 
-        ptr += cmsg_align(hdr.cmsg_len);
+        ancillary_items = ancillary_items
+            .checked_add(1)
+            .ok_or(AxError::InvalidInput)?;
+        offset = offset
+            .checked_add(cmsg_align(hdr.cmsg_len).ok_or(AxError::InvalidInput)?)
+            .ok_or(AxError::InvalidInput)?;
     }
 
-    Ok(params)
+    Ok((params, ancillary_items))
 }
 
-fn cmsg_align(len: usize) -> usize {
+fn cmsg_align(len: usize) -> Option<usize> {
     let align = size_of::<usize>();
-    (len + align - 1) & !(align - 1)
+    len.checked_add(align - 1).map(|len| len & !(align - 1))
 }
 
 fn parse_c_string_field(bytes: &[u8]) -> AxResult<String> {

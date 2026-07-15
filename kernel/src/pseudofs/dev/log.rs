@@ -7,17 +7,17 @@ use axnet::{
     unix::{DgramTransport, UnixNamespace, UnixSocket},
 };
 
-use crate::task::DacCredentialView;
+use crate::file::permission::VfsSecurityContext;
 
 pub fn bind_dev_log(
-    credentials: &DacCredentialView,
+    security: &VfsSecurityContext,
     unix_namespace: Arc<UnixNamespace>,
 ) -> LinuxResult<()> {
     let server = UnixSocket::new(DgramTransport::new()?, unix_namespace);
     crate::file::unix_socket::bind_precreated_path(
         &server,
         crate::file::unix_socket::try_path("/dev/log")?,
-        credentials,
+        security,
     )?;
     axtask::spawn_with_name(
         move || {

@@ -37,10 +37,7 @@ pub use self::{
     af_alg::AfAlgSocket,
     desc::*,
     fd_table::*,
-    fs::{
-        Directory, File, ResolveAtResult, resolve_at, resolve_at_with_credentials, with_fs,
-        with_path_fs,
-    },
+    fs::{Directory, File, ResolveAtResult, resolve_at, with_fs, with_path_fs},
     net::Socket,
     netlink::NetlinkSocket,
     pidfd::PidFd,
@@ -50,9 +47,13 @@ pub use self::{
 };
 pub(crate) use self::{
     fs::{
-        allowed_write_len, check_resize_limit, resolve_at_with_security, validate_pathname,
-        validate_symlink_target,
+        allowed_write_len, check_resize_limit, resolve_at_with_security,
+        resolve_at_with_synthetic_credentials, validate_pathname, validate_symlink_target,
     },
     metadata::{PseudoInode, anon_inode_stat},
-    socket::{PinnedSocketDescription, SocketBackendKind},
+    socket::{
+        AcceptedSocketSecurityRef, PendingSocketSecurityRef, PinnedSocketDescription,
+        PreparedSocketAddress, PreparedSocketMessage, SocketBackendKind, SocketSecurityRef,
+        UnixEndpointSecurityRef,
+    },
 };

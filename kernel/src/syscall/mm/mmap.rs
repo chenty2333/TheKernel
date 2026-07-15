@@ -1,24 +1,171 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs::{FileBackend, FileFlags};
+use axfs::{CachedFile, FileBackend, FileFlags};
+use axfs_ng_vfs::Location;
 use axhal::paging::{MappingFlags, PageSize};
 use axtask::current;
 use linux_raw_sys::general::*;
 use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange};
 
 use crate::{
-    file::{Directory, File, get_file_like},
+    file::{Directory, File, FileHandle, get_file_like},
     mm::{
-        AddrSpace, Backend, BackendOps, SharedPages, check_memory_overcommit, checked_align_up,
-        checked_align_up_4k,
+        AddrSpace, Backend, BackendOps, FileMappingLease, FileMappingSharing, SharedPages,
+        check_memory_overcommit, checked_align_up, checked_align_up_4k,
     },
     pseudofs::{Device, DeviceMmap},
-    task::{AsThread, ProcessData},
+    task::{
+        AsThread, ProcessData,
+        security::{file_mprotect, initial_user_namespace, mmap_addr, mmap_file},
+    },
 };
 
 fn lookup_mmap_fd_once<T>(fd: i32, lookup: impl FnOnce(i32) -> AxResult<T>) -> AxResult<T> {
     lookup(fd).map_err(|_| AxError::BadFileDescriptor)
+}
+
+fn authorize_mmap_candidate<T>(
+    authorize_file: impl FnOnce() -> AxResult<()>,
+    authorize_address: impl FnOnce() -> AxResult<()>,
+    commit: impl FnOnce() -> AxResult<T>,
+) -> AxResult<T> {
+    authorize_file()?;
+    authorize_address()?;
+    commit()
+}
+
+fn authorize_all<T>(
+    segments: impl IntoIterator<Item = T>,
+    mut authorize: impl FnMut(T) -> AxResult<()>,
+) -> AxResult<()> {
+    for segment in segments {
+        authorize(segment)?;
+    }
+    Ok(())
+}
+
+fn authorize_then_commit<P, T>(
+    plan: P,
+    authorize: impl FnOnce(&P) -> AxResult<()>,
+    commit: impl FnOnce(P) -> AxResult<T>,
+) -> AxResult<T> {
+    authorize(&plan)?;
+    commit(plan)
+}
+
+enum PreparedFileMmapBackend {
+    SharedFile {
+        cache: CachedFile,
+        flags: FileFlags,
+        file_end: u64,
+    },
+    SharedAnonymous {
+        may_protect: MappingFlags,
+    },
+    Cow {
+        location: Location,
+        file_end: Option<u64>,
+        sigbus_on_eof: bool,
+    },
+    AnonymousCow,
+    Linear {
+        physical_start: memory_addr::PhysAddr,
+        max_size: usize,
+    },
+}
+
+fn prepare_file_mmap_backend(
+    file: &FileHandle<File>,
+    map_type: MmapFlags,
+    permission_flags: MmapProt,
+    offset: usize,
+    page_size: PageSize,
+    length: &mut usize,
+) -> AxResult<PreparedFileMmapBackend> {
+    let inner = file.inner();
+    let file_backend = inner.backend()?.clone();
+    validate_file_mmap_access(inner, &file_backend, map_type, permission_flags)?;
+
+    match (map_type, file_backend) {
+        (MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE, FileBackend::Cached(cache)) => {
+            Ok(PreparedFileMmapBackend::SharedFile {
+                cache,
+                flags: inner.flags(),
+                file_end: inner.location().len()?,
+            })
+        }
+        (MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE, FileBackend::Direct(location)) => {
+            let device = location
+                .entry()
+                .downcast::<Device>()
+                .map_err(|_| AxError::NoSuchDevice)?;
+            match device.mmap() {
+                DeviceMmap::None => Err(AxError::NoSuchDevice),
+                DeviceMmap::Anonymous => Ok(PreparedFileMmapBackend::SharedAnonymous {
+                    may_protect: may_protect_from_file_flags(inner.flags()),
+                }),
+                DeviceMmap::ReadOnly => Ok(PreparedFileMmapBackend::Cow {
+                    location,
+                    file_end: None,
+                    sigbus_on_eof: false,
+                }),
+                DeviceMmap::Physical(mut range) => {
+                    range.start += offset;
+                    if range.is_empty() {
+                        return Err(AxError::InvalidInput);
+                    }
+                    let max_size = range.size().align_down(page_size);
+                    *length = (*length).min(max_size);
+                    Ok(PreparedFileMmapBackend::Linear {
+                        physical_start: range.start,
+                        max_size,
+                    })
+                }
+                DeviceMmap::Cache(cache) => Ok(PreparedFileMmapBackend::SharedFile {
+                    cache,
+                    flags: inner.flags(),
+                    file_end: inner.location().len()?,
+                }),
+            }
+        }
+        (MmapFlags::PRIVATE, FileBackend::Direct(location)) => {
+            match location
+                .entry()
+                .downcast::<Device>()
+                .ok()
+                .map(|device| device.mmap())
+            {
+                Some(DeviceMmap::None) => Err(AxError::NoSuchDevice),
+                Some(DeviceMmap::Anonymous) => Ok(PreparedFileMmapBackend::AnonymousCow),
+                Some(DeviceMmap::Physical(mut range)) => {
+                    range.start += offset;
+                    if range.is_empty() {
+                        return Err(AxError::InvalidInput);
+                    }
+                    let max_size = range.size().align_down(page_size);
+                    *length = (*length).min(max_size);
+                    Ok(PreparedFileMmapBackend::Linear {
+                        physical_start: range.start,
+                        max_size,
+                    })
+                }
+                Some(DeviceMmap::ReadOnly | DeviceMmap::Cache(_)) | None => {
+                    Ok(PreparedFileMmapBackend::Cow {
+                        file_end: Some(inner.location().len()?),
+                        location,
+                        sigbus_on_eof: true,
+                    })
+                }
+            }
+        }
+        (MmapFlags::PRIVATE, FileBackend::Cached(_)) => Ok(PreparedFileMmapBackend::Cow {
+            location: inner.location().clone(),
+            file_end: Some(inner.location().len()?),
+            sigbus_on_eof: true,
+        }),
+        _ => Err(AxError::InvalidInput),
+    }
 }
 
 bitflags::bitflags! {
@@ -26,17 +173,17 @@ bitflags::bitflags! {
     ///
     /// For `PROT_NONE`, use `ProtFlags::empty()`.
     #[derive(Debug, Clone, Copy)]
-    struct MmapProt: u32 {
+    struct MmapProt: usize {
         /// Page can be read.
-        const READ = PROT_READ;
+        const READ = PROT_READ as usize;
         /// Page can be written.
-        const WRITE = PROT_WRITE;
+        const WRITE = PROT_WRITE as usize;
         /// Page can be executed.
-        const EXEC = PROT_EXEC;
+        const EXEC = PROT_EXEC as usize;
         /// Extend change to start of growsdown vma (mprotect only).
-        const GROWDOWN = PROT_GROWSDOWN;
+        const GROWDOWN = PROT_GROWSDOWN as usize;
         /// Extend change to start of growsup vma (mprotect only).
-        const GROWSUP = PROT_GROWSUP;
+        const GROWSUP = PROT_GROWSUP as usize;
     }
 }
 
@@ -46,6 +193,29 @@ struct RemapSegment {
     size: usize,
     flags: MappingFlags,
     backend: Backend,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RelocatedSegmentGeometry {
+    destination_start: VirtAddr,
+    backend_old_start: VirtAddr,
+    backend_new_start: VirtAddr,
+}
+
+fn relocated_segment_geometry(
+    old_start: VirtAddr,
+    new_start: VirtAddr,
+    segment_start: VirtAddr,
+) -> AxResult<RelocatedSegmentGeometry> {
+    let offset = segment_start
+        .checked_sub_addr(old_start)
+        .ok_or(AxError::InvalidInput)?;
+    let destination_start = new_start.checked_add(offset).ok_or(AxError::InvalidInput)?;
+    Ok(RelocatedSegmentGeometry {
+        destination_start,
+        backend_old_start: old_start,
+        backend_new_start: new_start,
+    })
 }
 
 fn collect_remap_segments(
@@ -195,6 +365,16 @@ struct MadviseRangeInfo {
     has_shared_mapping: bool,
 }
 
+fn classify_madvise_backend(backend: &Backend) -> MadviseRangeInfo {
+    MadviseRangeInfo {
+        all_private_anonymous: backend.is_private_anonymous(),
+        has_shared_mapping: matches!(
+            backend,
+            Backend::Linear(_) | Backend::Shared(_) | Backend::File(_)
+        ),
+    }
+}
+
 fn inspect_madvise_range(
     aspace: &AddrSpace,
     start: VirtAddr,
@@ -215,15 +395,9 @@ fn inspect_madvise_range(
             return Err(AxError::NoMemory);
         }
 
-        match area.backend() {
-            Backend::Cow(backend) => {
-                info.all_private_anonymous &= backend.is_private_anonymous();
-            }
-            Backend::Linear(_) | Backend::Shared(_) | Backend::File(_) => {
-                info.all_private_anonymous = false;
-                info.has_shared_mapping = true;
-            }
-        }
+        let area_info = classify_madvise_backend(area.backend());
+        info.all_private_anonymous &= area_info.all_private_anonymous;
+        info.has_shared_mapping |= area_info.has_shared_mapping;
 
         cursor = area.end().min(end);
     }
@@ -240,17 +414,31 @@ fn map_relocated_segments(
     preserve_mapping_identity: bool,
 ) -> AxResult {
     for seg in segments {
-        let seg_start = new_start + seg.start.sub_addr(old_start);
+        let geometry = relocated_segment_geometry(old_start, new_start, seg.start)?;
         let relocated = if preserve_mapping_identity {
-            seg.backend.relocate(seg.start, seg_start, aspace_handle)?
+            seg.backend.relocate(
+                geometry.backend_old_start,
+                geometry.backend_new_start,
+                aspace_handle,
+            )?
         } else {
-            seg.backend
-                .duplicate_mapping(seg.start, seg_start, aspace_handle)?
+            seg.backend.duplicate_mapping(
+                geometry.backend_old_start,
+                geometry.backend_new_start,
+                aspace_handle,
+            )?
         };
-        aspace.map_with_lock_state(seg_start, seg.size, seg.flags, false, relocated, false)?;
+        aspace.map_with_lock_state(
+            geometry.destination_start,
+            seg.size,
+            seg.flags,
+            false,
+            relocated,
+            false,
+        )?;
         seg.backend.migrate_present_pages(
             seg.start,
-            seg_start,
+            geometry.destination_start,
             seg.size,
             &mut aspace.page_table_mut().cursor(),
         )?;
@@ -327,49 +515,49 @@ bitflags::bitflags! {
     ///
     /// See <https://github.com/bminor/glibc/blob/master/bits/mman.h>
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-    struct MmapFlags: u32 {
+    struct MmapFlags: usize {
         /// Share changes
-        const SHARED = MAP_SHARED;
+        const SHARED = MAP_SHARED as usize;
         /// Share changes, but fail if mapping flags contain unknown
-        const SHARED_VALIDATE = MAP_SHARED_VALIDATE;
+        const SHARED_VALIDATE = MAP_SHARED_VALIDATE as usize;
         /// Changes private; copy pages on write.
-        const PRIVATE = MAP_PRIVATE;
+        const PRIVATE = MAP_PRIVATE as usize;
         /// Stack-like mapping that may expand downward on demand.
-        const GROWDOWN = MAP_GROWSDOWN;
+        const GROWDOWN = MAP_GROWSDOWN as usize;
         /// Map address must be exactly as requested, no matter whether it is available.
-        const FIXED = MAP_FIXED;
+        const FIXED = MAP_FIXED as usize;
         /// Same as `FIXED`, but if the requested address overlaps an existing
         /// mapping, the call fails instead of replacing the existing mapping.
-        const FIXED_NOREPLACE = MAP_FIXED_NOREPLACE;
+        const FIXED_NOREPLACE = MAP_FIXED_NOREPLACE as usize;
         /// Don't use a file.
-        const ANONYMOUS = MAP_ANONYMOUS;
+        const ANONYMOUS = MAP_ANONYMOUS as usize;
         /// Populate the mapping.
-        const POPULATE = MAP_POPULATE;
+        const POPULATE = MAP_POPULATE as usize;
         /// Lock the mapped pages, as with mlock(2).
-        const LOCKED = MAP_LOCKED;
+        const LOCKED = MAP_LOCKED as usize;
         /// Don't check for reservations.
-        const NORESERVE = MAP_NORESERVE;
+        const NORESERVE = MAP_NORESERVE as usize;
         /// Allocation is for a stack.
-        const STACK = MAP_STACK;
+        const STACK = MAP_STACK as usize;
         /// Huge page
-        const HUGE = MAP_HUGETLB;
+        const HUGE = MAP_HUGETLB as usize;
         /// Explicit 2 MiB huge-page size.
-        const HUGE_2MB = MAP_HUGE_2MB;
+        const HUGE_2MB = MAP_HUGE_2MB as usize;
         /// Huge page 1g size
-        const HUGE_1GB = MAP_HUGETLB | MAP_HUGE_1GB;
+        const HUGE_1GB = (MAP_HUGETLB | MAP_HUGE_1GB) as usize;
         /// Deprecated flag
-        const DENYWRITE = MAP_DENYWRITE;
+        const DENYWRITE = MAP_DENYWRITE as usize;
 
         /// Mask for type of mapping
-        const TYPE = MAP_TYPE;
+        const TYPE = MAP_TYPE as usize;
     }
 }
 
 pub fn sys_mmap(
     addr: usize,
     length: usize,
-    prot: u32,
-    flags: u32,
+    prot: usize,
+    flags: usize,
     fd: i32,
     offset: isize,
 ) -> AxResult<isize> {
@@ -429,7 +617,7 @@ pub fn sys_mmap(
          {map_flags:?}, fd: {fd:?}, offset: {offset:?}"
     );
 
-    let huge_page_order = (flags >> MAP_HUGE_SHIFT) & MAP_HUGE_MASK;
+    let huge_page_order = (flags >> MAP_HUGE_SHIFT) & MAP_HUGE_MASK as usize;
     let page_size = if map_flags.contains(MmapFlags::HUGE) {
         match huge_page_order {
             0 | 21 => PageSize::Size2M,
@@ -448,8 +636,10 @@ pub fn sys_mmap(
     let curr = current();
     let thread = curr.as_thread();
     let proc_data = &thread.proc_data;
-    let has_ipc_lock = thread.has_effective_capability(CAP_IPC_LOCK);
-    let aspace_handle = curr.as_thread().proc_data.aspace();
+    let authorized_image = proc_data.thread_image_access_snapshot(thread)?;
+    let actor = authorized_image.credential();
+    let has_ipc_lock = actor.has_effective_capability(CAP_IPC_LOCK);
+    let aspace_handle = authorized_image.aspace().clone();
     let mut aspace = aspace_handle.lock();
     let start = addr.align_down(page_size);
     let end = addr
@@ -493,130 +683,114 @@ pub fn sys_mmap(
             })
         })
         .transpose()?;
+    let filesystem_owner_user_ns = file
+        .as_ref()
+        .map(|_| initial_user_namespace(actor.user_ns()));
+    let prepared_file_backend = file
+        .as_ref()
+        .map(|file| {
+            prepare_file_mmap_backend(
+                file,
+                map_type,
+                permission_flags,
+                offset,
+                page_size,
+                &mut length,
+            )
+        })
+        .transpose()?;
+    let requested_protection: MappingFlags = permission_flags.into();
+    let effective_protection = requested_protection;
+    let file_mapping = file.map(|file| {
+        let sharing = if map_type == MmapFlags::PRIVATE {
+            FileMappingSharing::Private
+        } else {
+            FileMappingSharing::Shared
+        };
+        let may_protect = match sharing {
+            FileMappingSharing::Shared => may_protect_from_file_flags(file.inner().flags()),
+            FileMappingSharing::Private => {
+                MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE
+            }
+        };
+        FileMappingLease::new(
+            file,
+            filesystem_owner_user_ns.expect("file mappings freeze a filesystem owner"),
+            start,
+            offset as u64,
+            effective_protection,
+            may_protect,
+            sharing,
+        )
+    });
+    let backend = authorize_mmap_candidate(
+        || {
+            mmap_file(
+                actor,
+                file_mapping
+                    .as_ref()
+                    .map(|mapping| (mapping.filesystem_owner_user_ns(), mapping.file())),
+                requested_protection,
+                effective_protection,
+                flags,
+            )
+        },
+        || {
+            mmap_addr(
+                actor,
+                authorized_image.owner_user_ns(),
+                &aspace_handle,
+                start,
+            )
+        },
+        || {
+            Ok(match prepared_file_backend {
+                Some(PreparedFileMmapBackend::SharedFile {
+                    cache,
+                    flags,
+                    file_end,
+                }) => {
+                    // TODO(mivik): file mmap page size
+                    Backend::new_file(start, cache, flags, offset, Some(file_end), &aspace_handle)?
+                }
+                Some(PreparedFileMmapBackend::SharedAnonymous { may_protect }) => {
+                    Backend::new_shared_with_may_protect(
+                        start,
+                        Arc::new(SharedPages::new(length, PageSize::Size4K)?),
+                        may_protect,
+                    )
+                }
+                Some(PreparedFileMmapBackend::Cow {
+                    location,
+                    file_end,
+                    sigbus_on_eof,
+                }) => Backend::new_cow(
+                    start,
+                    page_size,
+                    location,
+                    offset as u64,
+                    file_end,
+                    sigbus_on_eof,
+                ),
+                Some(PreparedFileMmapBackend::AnonymousCow) => Backend::new_alloc(start, page_size),
+                Some(PreparedFileMmapBackend::Linear {
+                    physical_start,
+                    max_size,
+                }) => Backend::new_linear(start, physical_start, max_size),
+                None if matches!(map_type, MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE) => {
+                    Backend::new_shared(start, Arc::new(SharedPages::new(length, page_size)?))
+                }
+                None if map_type == MmapFlags::PRIVATE => Backend::new_alloc(start, page_size),
+                None => return Err(AxError::InvalidInput),
+            })
+        },
+    )?;
     let growdown_private_anon = map_flags.contains(MmapFlags::GROWDOWN)
         && map_type == MmapFlags::PRIVATE
         && is_anonymous_mapping;
-
-    let backend = match map_type {
-        MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE => {
-            if let Some(file) = file.as_ref() {
-                let file = file.inner();
-                let backend = file.backend()?.clone();
-                validate_file_mmap_access(file, &backend, map_type, permission_flags)?;
-                match file.backend()?.clone() {
-                    FileBackend::Cached(cache) => {
-                        let file_end = file.location().len()?;
-                        // TODO(mivik): file mmap page size
-                        Backend::new_file(
-                            start,
-                            cache,
-                            file.flags(),
-                            offset,
-                            Some(file_end),
-                            &aspace_handle,
-                        )?
-                    }
-                    FileBackend::Direct(loc) => {
-                        let device = loc
-                            .entry()
-                            .downcast::<Device>()
-                            .map_err(|_| AxError::NoSuchDevice)?;
-
-                        match device.mmap() {
-                            DeviceMmap::None => {
-                                return Err(AxError::NoSuchDevice);
-                            }
-                            DeviceMmap::Anonymous => Backend::new_shared_with_may_protect(
-                                start,
-                                Arc::new(SharedPages::new(length, PageSize::Size4K)?),
-                                may_protect_from_file_flags(file.flags()),
-                            ),
-                            DeviceMmap::ReadOnly => Backend::new_cow(
-                                start,
-                                page_size,
-                                loc.clone(),
-                                offset as u64,
-                                None,
-                                false,
-                            ),
-                            DeviceMmap::Physical(mut range) => {
-                                range.start += offset;
-                                if range.is_empty() {
-                                    return Err(AxError::InvalidInput);
-                                }
-                                let max_size = range.size().align_down(page_size);
-                                length = length.min(max_size);
-                                Backend::new_linear(start, range.start, max_size)
-                            }
-                            DeviceMmap::Cache(cache) => {
-                                let file_end = file.location().len()?;
-                                Backend::new_file(
-                                    start,
-                                    cache,
-                                    file.flags(),
-                                    offset,
-                                    Some(file_end),
-                                    &aspace_handle,
-                                )?
-                            }
-                        }
-                    }
-                }
-            } else {
-                Backend::new_shared(start, Arc::new(SharedPages::new(length, page_size)?))
-            }
-        }
-        MmapFlags::PRIVATE => {
-            if let Some(file) = file.as_ref() {
-                // Private mapping from a file
-                let file = file.as_ref();
-                let backend = file.inner().backend()?.clone();
-                validate_file_mmap_access(file.inner(), &backend, map_type, permission_flags)?;
-                match backend {
-                    FileBackend::Direct(loc) => {
-                        let device_mmap = loc.entry().downcast::<Device>().ok().map(|it| it.mmap());
-                        match device_mmap {
-                            Some(DeviceMmap::None) => return Err(AxError::NoSuchDevice),
-                            Some(DeviceMmap::Anonymous) => Backend::new_alloc(start, page_size),
-                            Some(DeviceMmap::Physical(mut range)) => {
-                                range.start += offset;
-                                if range.is_empty() {
-                                    return Err(AxError::InvalidInput);
-                                }
-                                let max_size = range.size().align_down(page_size);
-                                length = length.min(max_size);
-                                Backend::new_linear(start, range.start, max_size)
-                            }
-                            Some(DeviceMmap::ReadOnly | DeviceMmap::Cache(_)) | None => {
-                                let file_end = file.inner().location().len()?;
-                                Backend::new_cow(
-                                    start,
-                                    page_size,
-                                    file.inner().location().clone(),
-                                    offset as u64,
-                                    Some(file_end),
-                                    true,
-                                )
-                            }
-                        }
-                    }
-                    FileBackend::Cached(_) => {
-                        let file_end = file.inner().location().len()?;
-                        Backend::new_cow(
-                            start,
-                            page_size,
-                            file.inner().location().clone(),
-                            offset as u64,
-                            Some(file_end),
-                            true,
-                        )
-                    }
-                }
-            } else {
-                Backend::new_alloc(start, page_size)
-            }
-        }
-        _ => return Err(AxError::InvalidInput),
+    let backend = match file_mapping {
+        Some(file_mapping) => backend.with_file_mapping(file_mapping),
+        None => backend,
     };
 
     let locked_mapping = map_flags.contains(MmapFlags::LOCKED) || aspace.locks_future_mappings();
@@ -633,7 +807,7 @@ pub fn sys_mmap(
         aspace.unmap(start, length)?;
         proc_data.clear_mempolicy_range(start.as_usize(), length);
     }
-    aspace.map(start, length, permission_flags.into(), populate, backend)?;
+    aspace.map(start, length, effective_protection, populate, backend)?;
     if map_flags.contains(MmapFlags::LOCKED) {
         aspace.set_locked(start, length, true)?;
     }
@@ -668,7 +842,7 @@ pub fn sys_munmap(addr: usize, length: usize) -> AxResult<isize> {
     Ok(0)
 }
 
-pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> AxResult<isize> {
+pub fn sys_mprotect(addr: usize, length: usize, prot: usize) -> AxResult<isize> {
     // TODO: implement PROT_GROWSUP & PROT_GROWSDOWN
     let Some(permission_flags) = MmapProt::from_bits(prot) else {
         return Err(AxError::InvalidInput);
@@ -680,12 +854,30 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> AxResult<isize> {
     }
 
     let curr = current();
-    let aspace_handle = curr.as_thread().proc_data.aspace();
+    let thread = curr.as_thread();
+    let authorized_image = thread.proc_data.thread_image_access_snapshot(thread)?;
+    let aspace_handle = authorized_image.aspace().clone();
     let mut aspace = aspace_handle.lock();
     let length = checked_align_up_4k(length).ok_or(AxError::NoMemory)?;
     let start_addr = VirtAddr::from(addr);
-    let plan = aspace.prepare_protect(start_addr, length, permission_flags.into())?;
-    plan.commit()?;
+    let requested_protection: MappingFlags = permission_flags.into();
+    let effective_protection = requested_protection;
+    let plan = aspace.prepare_protect(start_addr, length, effective_protection)?;
+    authorize_then_commit(
+        plan,
+        |plan| {
+            authorize_all(plan.segments(), |segment| {
+                file_mprotect(
+                    authorized_image.credential(),
+                    authorized_image.owner_user_ns(),
+                    segment,
+                    requested_protection,
+                    effective_protection,
+                )
+            })
+        },
+        |plan| plan.commit(),
+    )?;
 
     Ok(0)
 }
@@ -1214,7 +1406,11 @@ mod tests {
     use thekernel_linux_fd::{DescriptorFlags, FdNumber, FdTable, FdTableId};
 
     use super::*;
-    use crate::{file::FileDescription, pseudofs::tmp::MemoryFs};
+    use crate::{
+        file::{FileDescription, FileHandle, FileLike},
+        pseudofs::tmp::MemoryFs,
+        task::UserNamespace,
+    };
 
     fn mmap_description(name: &str) -> Arc<FileDescription> {
         let fs = MemoryFs::new().unwrap();
@@ -1241,6 +1437,134 @@ mod tests {
     }
 
     #[test]
+    fn remap_fragments_share_one_backend_relocation_pair() {
+        let old_start = VirtAddr::from(0x8000);
+        let new_start = VirtAddr::from(0x1000);
+        let first = relocated_segment_geometry(old_start, new_start, old_start).unwrap();
+        let second = relocated_segment_geometry(old_start, new_start, old_start + 0x2000).unwrap();
+
+        assert_eq!(first.destination_start, new_start);
+        assert_eq!(second.destination_start, new_start + 0x2000);
+        assert_eq!(first.backend_old_start, old_start);
+        assert_eq!(second.backend_old_start, old_start);
+        assert_eq!(first.backend_new_start, new_start);
+        assert_eq!(second.backend_new_start, new_start);
+    }
+
+    #[test]
+    fn mmap_hooks_run_file_then_address_and_stop_on_denial() {
+        let trace = Cell::new(0_u32);
+        let effects = Cell::new(0_u32);
+        authorize_mmap_candidate(
+            || {
+                trace.set(trace.get() * 10 + 1);
+                Ok(())
+            },
+            || {
+                trace.set(trace.get() * 10 + 2);
+                Ok(())
+            },
+            || {
+                effects.set(effects.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(trace.get(), 12);
+        assert_eq!(effects.get(), 1);
+
+        trace.set(0);
+        effects.set(0);
+        assert_eq!(
+            authorize_mmap_candidate(
+                || {
+                    trace.set(trace.get() * 10 + 1);
+                    Err(AxError::PermissionDenied)
+                },
+                || {
+                    trace.set(trace.get() * 10 + 2);
+                    Ok(())
+                },
+                || {
+                    effects.set(effects.get() + 1);
+                    Ok(())
+                },
+            ),
+            Err(AxError::PermissionDenied)
+        );
+        assert_eq!(trace.get(), 1);
+        assert_eq!(effects.get(), 0);
+
+        trace.set(0);
+        effects.set(0);
+        assert_eq!(
+            authorize_mmap_candidate(
+                || {
+                    trace.set(trace.get() * 10 + 1);
+                    Ok(())
+                },
+                || {
+                    trace.set(trace.get() * 10 + 2);
+                    Err(AxError::PermissionDenied)
+                },
+                || {
+                    effects.set(effects.get() + 1);
+                    Ok(())
+                },
+            ),
+            Err(AxError::PermissionDenied)
+        );
+        assert_eq!(trace.get(), 12);
+        assert_eq!(effects.get(), 0);
+    }
+
+    #[test]
+    fn mprotect_authorizes_every_segment_before_one_commit() {
+        let trace = Cell::new(0_u32);
+        let commits = Cell::new(0_u32);
+        authorize_then_commit(
+            (),
+            |_| {
+                authorize_all([1, 2, 3], |segment| {
+                    trace.set(trace.get() * 10 + segment);
+                    Ok(())
+                })
+            },
+            |_| {
+                commits.set(commits.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(trace.get(), 123);
+        assert_eq!(commits.get(), 1);
+
+        trace.set(0);
+        commits.set(0);
+        assert_eq!(
+            authorize_then_commit(
+                (),
+                |_| {
+                    authorize_all([1, 2, 3], |segment| {
+                        trace.set(trace.get() * 10 + segment);
+                        if segment == 2 {
+                            return Err(AxError::PermissionDenied);
+                        }
+                        Ok(())
+                    })
+                },
+                |_| {
+                    commits.set(commits.get() + 1);
+                    Ok(())
+                },
+            ),
+            Err(AxError::PermissionDenied)
+        );
+        assert_eq!(trace.get(), 12);
+        assert_eq!(commits.get(), 0);
+    }
+
+    #[test]
     fn mmap_lookup_once_survives_fd_close_and_number_reuse() {
         let first_description = mmap_description("first-mmap-pin");
         let first_id = first_description.id().get();
@@ -1259,7 +1583,11 @@ mod tests {
             lookups.set(lookups.get() + 1);
             table
                 .get(FdNumber::new(fd as u32))
-                .map(|entry| entry.description().clone())
+                .map(|entry| {
+                    FileHandle::<dyn FileLike>::from_description_for_test(
+                        entry.description().clone(),
+                    )
+                })
                 .map_err(|_| AxError::BadFileDescriptor)
         })
         .unwrap();
@@ -1270,7 +1598,18 @@ mod tests {
         assert_eq!(replacement.fd(), FdNumber::new(fd as u32));
         assert!(table.publish(replacement, second_description).is_ok());
 
-        assert_eq!(pinned.id().get(), first_id);
+        let lease = FileMappingLease::new(
+            pinned.downcast::<File>().unwrap(),
+            UserNamespace::try_new_root().unwrap(),
+            VirtAddr::from(0x4000),
+            0,
+            MappingFlags::USER | MappingFlags::READ,
+            MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
+            FileMappingSharing::Private,
+        );
+        drop(pinned);
+        assert_eq!(lease.ofd_key(), first_id);
+        assert_eq!(lease.file().open_file_description_key(), first_id);
         assert_eq!(
             table
                 .get(FdNumber::new(fd as u32))
@@ -1281,5 +1620,29 @@ mod tests {
             second_id
         );
         assert_eq!(lookups.get(), 1);
+    }
+
+    #[test]
+    fn madvise_does_not_treat_a_file_leased_anonymous_cow_as_anonymous() {
+        let description = mmap_description("device-anonymous-lease");
+        let handle = FileHandle::<dyn FileLike>::from_description_for_test(description)
+            .downcast::<File>()
+            .unwrap();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let start = VirtAddr::from(0x4000);
+        let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+        let lease = FileMappingLease::new(
+            handle,
+            namespace,
+            start,
+            0,
+            flags,
+            MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
+            FileMappingSharing::Private,
+        );
+        let backend = Backend::new_alloc(start, PageSize::Size4K).with_file_mapping(lease);
+        let info = classify_madvise_backend(&backend);
+        assert!(!info.all_private_anonymous);
+        assert!(!info.has_shared_mapping);
     }
 }

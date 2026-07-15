@@ -12,7 +12,9 @@ use axhal::paging::{MappingFlags, PageSize, PageTableCursor, PagingError};
 use axsync::Mutex;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
-use super::{AddrSpace, Backend, BackendOps, PopulateCallback, page_table_flags, pages_in};
+use super::{
+    AddrSpace, Backend, BackendOps, MappingStatus, PopulateCallback, page_table_flags, pages_in,
+};
 use crate::file::{executable, memfd};
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -139,16 +141,15 @@ fn new_file_backend_inner(
     })
 }
 
-fn relocate_backend_start(
-    backend_start: VirtAddr,
-    old_start: VirtAddr,
-    new_start: VirtAddr,
-) -> VirtAddr {
-    if backend_start >= old_start {
-        new_start + backend_start.sub_addr(old_start)
-    } else {
-        new_start.sub(old_start.sub_addr(backend_start))
+fn advance_offset_page(offset_page: u32, backing_advance: usize) -> AxResult<u32> {
+    if !backing_advance.is_multiple_of(PAGE_SIZE_4K) {
+        return Err(AxError::InvalidInput);
     }
+    let backing_pages =
+        u32::try_from(backing_advance / PAGE_SIZE_4K).map_err(|_| AxError::InvalidInput)?;
+    offset_page
+        .checked_add(backing_pages)
+        .ok_or(AxError::InvalidInput)
 }
 
 #[doc(hidden)]
@@ -364,19 +365,27 @@ const SEGMENT_TRANSITIONING: u8 = 1;
 const SEGMENT_ACTIVE: u8 = 2;
 const SEGMENT_FAIL_CLOSED: u8 = 3;
 
-pub struct FileBackend(Arc<FileBackendInner>, AtomicU8);
+pub struct FileBackend(Arc<FileBackendInner>, AtomicU8, MappingStatus);
 
 impl Clone for FileBackend {
     fn clone(&self) -> Self {
         loop {
             match self.1.load(Ordering::Acquire) {
                 SEGMENT_INACTIVE => {
-                    return Self(self.0.clone(), AtomicU8::new(SEGMENT_INACTIVE));
+                    return Self(
+                        self.0.clone(),
+                        AtomicU8::new(SEGMENT_INACTIVE),
+                        self.2.clone(),
+                    );
                 }
                 SEGMENT_TRANSITIONING => core::hint::spin_loop(),
                 SEGMENT_ACTIVE => {
                     if self.0.retain_writable_segment() {
-                        return Self(self.0.clone(), AtomicU8::new(SEGMENT_ACTIVE));
+                        return Self(
+                            self.0.clone(),
+                            AtomicU8::new(SEGMENT_ACTIVE),
+                            self.2.clone(),
+                        );
                     }
                     // A concurrent deactivation may have completed after the
                     // state load but before the retain. Re-read the handle and
@@ -388,7 +397,11 @@ impl Clone for FileBackend {
                         self.0.retain_writable_segment(),
                         "fail-closed file segment lost its inner ownership"
                     );
-                    return Self(self.0.clone(), AtomicU8::new(SEGMENT_ACTIVE));
+                    return Self(
+                        self.0.clone(),
+                        AtomicU8::new(SEGMENT_ACTIVE),
+                        self.2.clone(),
+                    );
                 }
                 _ => panic!("invalid file writable-segment state"),
             }
@@ -442,8 +455,20 @@ impl Drop for FileBackend {
 }
 
 impl FileBackend {
+    pub(super) const fn mapping_status(&self) -> &MappingStatus {
+        &self.2
+    }
+
+    pub(super) fn mapping_status_mut(&mut self) -> &mut MappingStatus {
+        &mut self.2
+    }
+
     fn inactive(inner: Arc<FileBackendInner>) -> Self {
-        Self(inner, AtomicU8::new(SEGMENT_INACTIVE))
+        Self::inactive_with_status(inner, MappingStatus::default())
+    }
+
+    fn inactive_with_status(inner: Arc<FileBackendInner>, status: MappingStatus) -> Self {
+        Self(inner, AtomicU8::new(SEGMENT_INACTIVE), status)
     }
 
     fn writable_segment_active(&self) -> bool {
@@ -702,18 +727,21 @@ impl FileBackend {
         aspace: &Arc<Mutex<AddrSpace>>,
         map_id: Arc<()>,
     ) -> AxResult<Self> {
-        let start = relocate_backend_start(self.0.start, old_start, new_start);
+        let (start, backing_advance) =
+            super::relocate_affine_origin(self.0.start, old_start, new_start)?;
+        let offset_page = advance_offset_page(self.0.offset_page, backing_advance)?;
         let inner = new_file_backend_inner(
             start,
             self.0.cache.clone(),
             self.0.flags,
-            self.0.offset_page,
+            offset_page,
             self.0.file_end,
             map_id,
             self.0.futex_handle.clone(),
         );
         inner.register_listener(aspace)?;
-        let backend = Self::inactive(inner);
+        let status = self.2.relocated(old_start, new_start)?;
+        let backend = Self::inactive_with_status(inner, status);
         if self.writable_segment_active() {
             backend.activate_writable_segment()?;
         }
@@ -753,7 +781,7 @@ impl FileBackend {
             self.0.futex_handle.clone(),
         );
         register(&inner)?;
-        let backend = FileBackend::inactive(inner);
+        let backend = FileBackend::inactive_with_status(inner, self.2.clone());
         if flags.contains(MappingFlags::WRITE) {
             backend.activate_writable_segment()?;
         }
@@ -949,6 +977,24 @@ impl Backend {
         inner.register_listener(aspace)?;
         Ok(Self::File(FileBackend::inactive(inner)))
     }
+
+    #[cfg(test)]
+    pub(super) fn new_file_for_mapping_status_test(
+        start: VirtAddr,
+        cache: CachedFile,
+        flags: FileFlags,
+    ) -> Self {
+        let futex_handle = file_futex_handle(&cache);
+        Self::File(FileBackend::inactive(new_file_backend_inner(
+            start,
+            cache,
+            flags,
+            0,
+            None,
+            Arc::new(()),
+            futex_handle,
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -963,7 +1009,12 @@ mod tests {
     use memory_set::{MappingBackend, MemoryArea, MemorySet};
 
     use super::*;
-    use crate::pseudofs::tmp::MemoryFs;
+    use crate::{
+        file::{File as KernelFile, FileDescription, FileHandle, FileLike},
+        mm::{FileMappingLease, FileMappingSharing},
+        pseudofs::tmp::MemoryFs,
+        task::UserNamespace,
+    };
 
     static TEST_SERIAL: StdMutex<()> = StdMutex::new(());
 
@@ -998,6 +1049,48 @@ mod tests {
             map_id,
             futex_handle,
         ))
+    }
+
+    fn test_mapping_lease(loc: &Location) -> FileMappingLease {
+        let description = FileDescription::new(Arc::new(KernelFile::new(axfs::File::new(
+            axfs::FileBackend::Direct(loc.clone()),
+            FileFlags::READ | FileFlags::WRITE,
+        ))))
+        .unwrap();
+        let handle = FileHandle::<dyn FileLike>::from_description_for_test(description)
+            .downcast::<KernelFile>()
+            .unwrap();
+        FileMappingLease::new(
+            handle,
+            UserNamespace::try_new_root().unwrap(),
+            VirtAddr::from(0x1000),
+            0,
+            MappingFlags::USER | MappingFlags::READ,
+            MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
+            FileMappingSharing::Shared,
+        )
+    }
+
+    #[test]
+    fn low_address_file_suffix_advances_the_page_cursor() {
+        let (start, backing_advance) = super::super::relocate_affine_origin(
+            VirtAddr::from(0x4000),
+            VirtAddr::from(0x8000),
+            VirtAddr::from(0x1000),
+        )
+        .unwrap();
+
+        assert_eq!(start, VirtAddr::from(0x1000));
+        assert_eq!(backing_advance, 0x4000);
+        assert_eq!(advance_offset_page(7, backing_advance), Ok(11));
+        assert_eq!(
+            advance_offset_page(7, backing_advance + 1),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            advance_offset_page(u32::MAX - 1, backing_advance),
+            Err(AxError::InvalidInput)
+        );
     }
 
     #[derive(Clone)]
@@ -1051,6 +1144,10 @@ mod tests {
 
         fn can_merge(&self, other: &Self) -> bool {
             self.0.compatible_with(&other.0)
+                && self
+                    .0
+                    .mapping_status()
+                    .compatible_with(other.0.mapping_status())
         }
     }
 
@@ -1141,7 +1238,13 @@ mod tests {
         let loc = test_location("real-memory-set-split");
         memfd::install_memfd_state(&loc, true).unwrap();
         let base = VirtAddr::from(0x2000_0000);
-        let backend = TestFileMappingBackend(test_backend(&loc, Arc::new(())));
+        let mut file_backend = test_backend(&loc, Arc::new(()));
+        let lease = test_mapping_lease(&loc);
+        let expected_ofd = lease.ofd_key();
+        file_backend
+            .mapping_status_mut()
+            .replace_file_mapping(Some(lease));
+        let backend = TestFileMappingBackend(file_backend);
         let writable = MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER;
         let readonly = MappingFlags::READ | MappingFlags::USER;
         let mut set = MemorySet::new();
@@ -1179,6 +1282,18 @@ mod tests {
             let left = &areas[0].backend().0;
             let middle = &areas[1].backend().0;
             let right = &areas[2].backend().0;
+            assert_eq!(
+                left.mapping_status().file_mapping().unwrap().ofd_key(),
+                expected_ofd
+            );
+            assert_eq!(
+                middle.mapping_status().file_mapping().unwrap().ofd_key(),
+                expected_ofd
+            );
+            assert_eq!(
+                right.mapping_status().file_mapping().unwrap().ofd_key(),
+                expected_ofd
+            );
             assert!(left.writable_segment_active());
             assert!(!middle.writable_segment_active());
             assert!(right.writable_segment_active());
@@ -1208,6 +1323,10 @@ mod tests {
             let areas = set.iter().collect::<Vec<_>>();
             assert_eq!(areas.len(), 1);
             let file = &areas[0].backend().0;
+            assert_eq!(
+                file.mapping_status().file_mapping().unwrap().ofd_key(),
+                expected_ofd
+            );
             assert!(file.writable_segment_active());
             assert_eq!(file.0.writable_segments.load(Ordering::Acquire), 1);
         }
@@ -1343,6 +1462,41 @@ mod tests {
         assert!(!source.0.writable_mapping.as_ref().unwrap().is_active());
         assert!(has_capability(&loc));
         drop(executable::CredentialReadLease::acquire(&loc).unwrap());
+    }
+
+    #[test]
+    fn fork_clone_preserves_exact_file_mapping_lease() {
+        let _context = test_context();
+        executable::init().unwrap();
+        let loc = test_location("fork-file-mapping-lease");
+        let mut source = test_backend(&loc, Arc::new(()));
+        let lease = test_mapping_lease(&loc);
+        let expected_ofd = lease.ofd_key();
+        source
+            .mapping_status_mut()
+            .replace_file_mapping(Some(lease));
+
+        let child = source
+            .clone_map_with_registration(MappingFlags::READ | MappingFlags::USER, |_| Ok(()))
+            .unwrap();
+        let Backend::File(child) = child else {
+            panic!("file fork clone changed backend kind");
+        };
+
+        assert!(!Arc::ptr_eq(&source.0, &child.0));
+        assert_eq!(
+            source.mapping_status().file_mapping().unwrap().ofd_key(),
+            expected_ofd
+        );
+        assert_eq!(
+            child.mapping_status().file_mapping().unwrap().ofd_key(),
+            expected_ofd
+        );
+        assert!(
+            source
+                .mapping_status()
+                .compatible_with(child.mapping_status())
+        );
     }
 
     #[test]

@@ -24,7 +24,7 @@ pub(crate) use self::proc::{
     process_data_from_proc_dir,
 };
 pub use self::{device::*, dir::*, file::*, fs::*};
-use crate::{mounts, task::DacCredentialView};
+use crate::mounts;
 
 /// A callback that builds a `Arc<dyn DirNodeOps>` for a given
 /// `WeakDirEntry`.
@@ -72,12 +72,12 @@ fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> LinuxResult<()>
 
 /// Mount all filesystems
 pub fn mount_all(
-    boot_credentials: &DacCredentialView,
+    boot_security: &crate::file::permission::VfsSecurityContext,
     unix_namespace: Arc<UnixNamespace>,
 ) -> LinuxResult<()> {
     info!("Initialize pseudofs...");
     #[cfg(not(feature = "dev-log"))]
-    let _ = (boot_credentials, unix_namespace);
+    let _ = (boot_security, unix_namespace);
 
     let fs = FS_CONTEXT.lock();
     mount_at(&fs, "/dev", dev::new_devfs())?;
@@ -109,7 +109,7 @@ pub fn mount_all(
     drop(fs);
 
     #[cfg(feature = "dev-log")]
-    dev::bind_dev_log(boot_credentials, unix_namespace).expect("Failed to bind /dev/log");
+    dev::bind_dev_log(boot_security, unix_namespace).expect("Failed to bind /dev/log");
 
     Ok(())
 }

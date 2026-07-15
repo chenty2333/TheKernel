@@ -1,6 +1,5 @@
 use axerrno::{AxError, AxResult, LinuxError};
 use axnet::options::{Configurable, GetSocketOption, SetSocketOption};
-use axtask::current;
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::{
     general::CAP_NET_ADMIN,
@@ -10,10 +9,14 @@ use linux_raw_sys::{
     },
 };
 
+use super::{SocketSyscallSnapshot, import_socket_output_after_policy};
 use crate::{
     file::{FileLike, PinnedSocketDescription, SocketBackendKind, af_alg},
     mm::{UserConstPtr, UserPtr},
-    task::{AsThread, ns_capable},
+    task::{
+        ns_capable,
+        security::{SocketOption, SocketSecurityContext, dispatch_socket},
+    },
 };
 
 const PROTO_TCP: u32 = linux_raw_sys::net::IPPROTO_TCP as u32;
@@ -317,7 +320,19 @@ pub fn sys_getsockopt(
     optval: UserPtr<u8>,
     optlen: UserPtr<socklen_t>,
 ) -> AxResult<isize> {
-    let optlen = optlen.get_as_mut()?;
+    let snapshot = SocketSyscallSnapshot::capture();
+    let pinned = PinnedSocketDescription::from_fd(fd)?;
+    let socket_ref = pinned.security_ref()?;
+    let optlen = import_socket_output_after_policy(
+        || {
+            dispatch_socket(&SocketSecurityContext::get_option(
+                snapshot.actor(),
+                &socket_ref,
+                SocketOption::new(level as i32, optname as i32),
+            ))
+        },
+        || optlen.get_as_mut(),
+    )?;
     debug!(
         "sys_getsockopt <= fd: {}, level: {}, optname: {}, optval: {:?}, optlen: {}",
         fd,
@@ -338,7 +353,6 @@ pub fn sys_getsockopt(
         val.cast().get_as_mut()
     }
 
-    let pinned = PinnedSocketDescription::from_fd(fd)?;
     if pinned.backend()? == SocketBackendKind::Netlink {
         if level != SOL_NETLINK {
             return Err(AxError::from(LinuxError::ENOPROTOOPT));
@@ -375,6 +389,7 @@ pub fn sys_setsockopt(
     optval: UserConstPtr<u8>,
     optlen: socklen_t,
 ) -> AxResult<isize> {
+    let snapshot = SocketSyscallSnapshot::capture();
     debug!(
         "sys_setsockopt <= fd: {}, level: {}, optname: {}, optval: {:?}, optlen: {}",
         fd,
@@ -392,6 +407,12 @@ pub fn sys_setsockopt(
     }
 
     let pinned = PinnedSocketDescription::from_fd(fd)?;
+    let socket_ref = pinned.security_ref()?;
+    dispatch_socket(&SocketSecurityContext::set_option(
+        snapshot.actor(),
+        &socket_ref,
+        SocketOption::new(level as i32, optname as i32),
+    ))?;
     if pinned.backend()? == SocketBackendKind::AfAlg {
         if level != af_alg::SOL_ALG {
             return Err(AxError::from(LinuxError::ENOPROTOOPT));
@@ -428,8 +449,11 @@ pub fn sys_setsockopt(
     if level == SOL_SOCKET {
         match optname {
             SO_SNDBUFFORCE => {
-                let cred = current().as_thread().current_cred();
-                if !ns_capable(&cred, socket.net_namespace().owner_user_ns(), CAP_NET_ADMIN) {
+                if !ns_capable(
+                    snapshot.actor(),
+                    socket.net_namespace().owner_user_ns(),
+                    CAP_NET_ADMIN,
+                ) {
                     return Err(LinuxError::EPERM.into());
                 }
                 let size = (*get::<u32>(optval, optlen)? as usize).min(i32::MAX as usize);
@@ -437,8 +461,11 @@ pub fn sys_setsockopt(
                 return Ok(0);
             }
             SO_RCVBUFFORCE => {
-                let cred = current().as_thread().current_cred();
-                if !ns_capable(&cred, socket.net_namespace().owner_user_ns(), CAP_NET_ADMIN) {
+                if !ns_capable(
+                    snapshot.actor(),
+                    socket.net_namespace().owner_user_ns(),
+                    CAP_NET_ADMIN,
+                ) {
                     return Err(LinuxError::EPERM.into());
                 }
                 let size = (*get::<u32>(optval, optlen)? as usize).min(i32::MAX as usize);

@@ -12,26 +12,31 @@ use axnet::{
     options::{Configurable, GetSocketOption},
     unix::UnixSocketAddr,
 };
-use axtask::current;
 use linux_raw_sys::{
     general::timespec,
     net::{
-        MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_NOSIGNAL, MSG_OOB, MSG_PEEK,
-        MSG_TRUNC, MSG_WAITALL, cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t,
+        AF_NETLINK, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_NOSIGNAL,
+        MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t,
     },
 };
 use starry_signal::{SignalInfo, Signo};
 use starry_vm::{vm_read_slice, vm_write_slice};
 
-use super::addr::SocketAddrExt;
+use super::{SocketSyscallSnapshot, addr::SocketAddrExt};
 use crate::{
-    file::{FileLike, PinnedSocketDescription, SocketBackendKind},
+    file::{
+        FileLike, PinnedSocketDescription, PreparedSocketMessage, SocketBackendKind,
+        af_alg::AfAlgSendRequest, netlink::SockaddrNl, permission::VfsSecurityContext,
+    },
     mm::{
         IoVec, IoVectorBuf, UserConstPtr, UserPtr, VmBytes, VmBytesMut, check_user_readable,
         check_user_writable,
     },
     syscall::net::{CMsg, CMsgBuilder, SCM_MAX_FD},
-    task::{AsThread, send_signal_to_process},
+    task::{
+        security::{SocketSecurityContext, dispatch_socket},
+        send_signal_to_process,
+    },
 };
 
 const MAX_RECVMSG_IOVCNT: usize = 1024;
@@ -102,6 +107,45 @@ fn read_user_copy<T: Copy>(ptr: UserConstPtr<T>) -> AxResult<T> {
     Ok(unsafe { value.assume_init() })
 }
 
+fn snapshot_user_bytes(ptr: *const u8, len: usize, limit: usize) -> AxResult<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err(AxError::BadAddress);
+    }
+    if len > limit {
+        return Err(AxError::from(LinuxError::ENOBUFS));
+    }
+
+    let mut snapshot = Vec::new();
+    snapshot
+        .try_reserve_exact(len)
+        .map_err(|_| AxError::NoMemory)?;
+    snapshot.resize(len, 0);
+    vm_read_slice(ptr, unsafe {
+        core::slice::from_raw_parts_mut(
+            snapshot.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+            snapshot.len(),
+        )
+    })?;
+    Ok(snapshot)
+}
+
+fn snapshot_iov_payload(iov: IoVectorBuf) -> AxResult<Vec<u8>> {
+    let len = iov.len();
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(len)
+        .map_err(|_| AxError::NoMemory)?;
+    payload.resize(len, 0);
+    let read = iov.into_io().read(&mut payload)?;
+    if read != len {
+        return Err(AxError::BadState);
+    }
+    Ok(payload)
+}
+
 fn write_user_copy<T: Copy>(ptr: UserPtr<T>, value: T) -> AxResult {
     Ok(vm_write_slice(
         ptr.address().as_usize() as *mut u8,
@@ -163,8 +207,7 @@ fn validate_recvmsg_iovlen(iovlen: usize) -> AxResult {
     }
 }
 
-fn raise_sigpipe() {
-    let process = current().as_thread().proc_data.proc.pid();
+fn raise_sigpipe(process: u32) {
     let _ = send_signal_to_process(process, Some(SignalInfo::new_kernel(Signo::SIGPIPE)));
 }
 
@@ -250,17 +293,49 @@ fn should_raise_sigpipe(error: AxError, flags: u32) -> bool {
     error == AxError::BrokenPipe && flags & MSG_NOSIGNAL == 0
 }
 
+const fn effective_message_flags(flags: u32, nonblocking: bool) -> u32 {
+    if nonblocking {
+        flags | MSG_DONTWAIT
+    } else {
+        flags
+    }
+}
+
 fn send_impl(
     socket: &PinnedSocketDescription,
+    snapshot: &SocketSyscallSnapshot,
     fd: i32,
     mut src: impl Read + IoBuf,
     flags: u32,
     addr: UserConstPtr<sockaddr>,
     addrlen: socklen_t,
     cmsg: Vec<CMsgData>,
+    iov_count: usize,
+    control_length: usize,
 ) -> AxResult<isize> {
     let send_flags = validate_sendmsg_flags(flags)?;
-    if socket.backend()? == SocketBackendKind::Netlink {
+    let backend = socket.backend()?;
+    let addr = if backend == SocketBackendKind::Network && !addr.is_null() && addrlen != 0 {
+        Some(SocketAddrEx::read_from_user(addr, addrlen)?)
+    } else {
+        None
+    };
+    let message = PreparedSocketMessage::new(
+        flags,
+        iov_count,
+        if addr.is_some() { addrlen as usize } else { 0 },
+        control_length,
+        cmsg.len(),
+    );
+    let socket_ref = socket.security_ref()?;
+    dispatch_socket(&SocketSecurityContext::send_message(
+        snapshot.actor(),
+        &socket_ref,
+        &message,
+        src.remaining(),
+    ))?;
+
+    if backend == SocketBackendKind::Netlink {
         let socket = socket.netlink()?;
         debug!("sys_send <= fd: {fd}, flags: {flags}, netlink");
         if !cmsg.is_empty() {
@@ -269,43 +344,47 @@ fn send_impl(
         return socket.write(&mut src).map(|sent| sent as isize);
     }
 
-    let addr = if addr.is_null() || addrlen == 0 {
-        None
-    } else {
-        Some(SocketAddrEx::read_from_user(addr, addrlen)?)
-    };
-
     debug!("sys_send <= fd: {fd}, flags: {flags}, addr: {addr:?}");
 
-    if socket.backend()? != SocketBackendKind::Network {
+    if backend != SocketBackendKind::Network {
         return Err(AxError::NotASocket);
     }
     let nonblocking = socket.nonblocking();
     let socket = socket.network()?;
-    let pathname = match (&socket.inner, &addr) {
-        (AxSocket::Unix(_), Some(SocketAddrEx::Unix(UnixSocketAddr::Path(path)))) => {
-            Some(path.clone())
-        }
-        _ => None,
-    };
     let options = SendOptions {
         to: addr,
         flags: send_flags,
         cmsg,
         nonblocking_override: Some(nonblocking),
     };
-    let sent = if let (AxSocket::Unix(unix), Some(path)) = (&socket.inner, pathname) {
-        let curr = current();
-        let credentials = curr.as_thread().fs_dac_credentials();
-        let target = crate::file::unix_socket::resolve_peer(path, &credentials)?;
-        unix.send_to_resolved(&mut src, options, target)
-    } else {
-        socket.send(&mut src, options)
+    let sent = match &socket.inner {
+        AxSocket::Unix(unix) if unix.is_datagram() => {
+            let reservation = match options.to.as_ref() {
+                Some(SocketAddrEx::Unix(UnixSocketAddr::Path(path))) => {
+                    let security = VfsSecurityContext::new(snapshot.actor().clone());
+                    let target = crate::file::unix_socket::resolve_peer(path.clone(), &security)?;
+                    unix.prepare_send_to_resolved(options, target)?
+                }
+                _ => unix.prepare_may_send(options)?,
+            };
+            let receiving = crate::file::UnixEndpointSecurityRef::new(
+                reservation.receiving_identity(),
+                socket.net_namespace(),
+                &reservation,
+            );
+            dispatch_socket(&SocketSecurityContext::unix_may_send(
+                snapshot.actor(),
+                &socket_ref,
+                &receiving,
+            ))?;
+            reservation.commit(&mut src)
+        }
+        _ => socket.send(&mut src, options),
     };
     let sent = match sent {
         Err(error) => {
             if should_raise_sigpipe(error, flags) {
-                raise_sigpipe();
+                raise_sigpipe(snapshot.pid());
             }
             return Err(error);
         }
@@ -323,35 +402,107 @@ pub fn sys_sendto(
     addr: UserConstPtr<sockaddr>,
     addrlen: socklen_t,
 ) -> AxResult<isize> {
+    let snapshot = SocketSyscallSnapshot::capture();
     if len != 0 {
         check_user_readable(buf as usize, len)?;
     }
     let socket = PinnedSocketDescription::from_fd(fd)?;
+    let flags = effective_message_flags(flags, socket.nonblocking());
     send_impl(
         &socket,
+        &snapshot,
         fd,
         VmBytes::new(buf, len),
         flags,
         addr,
         addrlen,
         Vec::new(),
+        1,
+        0,
     )
+}
+
+struct ImportedAfAlgSend {
+    request: AfAlgSendRequest,
+    message: PreparedSocketMessage,
+}
+
+impl ImportedAfAlgSend {
+    fn import(msg: &msghdr, flags: u32) -> AxResult<Self> {
+        let send_iov = IoVectorBuf::new(msg.msg_iov.cast::<IoVec>(), msg.msg_iovlen)?;
+        send_iov.check_readable()?;
+        let iov_count = send_iov.iovcnt();
+        let control = snapshot_user_bytes(
+            msg.msg_control.cast::<u8>(),
+            msg.msg_controllen,
+            MAX_SENDMSG_CONTROL_LEN,
+        )?;
+        let payload = snapshot_iov_payload(send_iov)?;
+        let request = AfAlgSendRequest::prepare(
+            payload,
+            &control,
+            !msg.msg_name.is_null() || msg.msg_namelen != 0,
+        )?;
+        let message = PreparedSocketMessage::new(
+            flags,
+            iov_count,
+            if msg.msg_name.is_null() {
+                0
+            } else {
+                msg.msg_namelen as usize
+            },
+            msg.msg_controllen,
+            request.ancillary_items(),
+        );
+        Ok(Self { request, message })
+    }
+
+    fn payload_len(&self) -> usize {
+        self.request.payload_len()
+    }
+}
+
+fn import_send_after_socket_hook<I, O>(
+    import: impl FnOnce() -> AxResult<I>,
+    authorize: impl FnOnce(&I) -> AxResult<()>,
+    send: impl FnOnce(I) -> AxResult<O>,
+) -> AxResult<O> {
+    let imported = import()?;
+    authorize(&imported)?;
+    send(imported)
 }
 
 fn sendmsg_with_socket(
     socket: &PinnedSocketDescription,
+    snapshot: &SocketSyscallSnapshot,
     fd: i32,
     msg: UserConstPtr<msghdr>,
     flags: u32,
 ) -> AxResult<isize> {
     let msg = read_user_copy(msg)?;
     if socket.backend()? == SocketBackendKind::AfAlg {
-        let socket = socket.af_alg()?;
+        let af_alg = socket.af_alg()?;
         debug!("sys_sendmsg <= fd: {fd}, flags: {flags}, af_alg");
-        if flags != 0 {
+        if flags & !MSG_DONTWAIT != 0 {
             return Err(AxError::OperationNotSupported);
         }
-        return socket.sendmsg(&msg).map(|sent| sent as isize);
+        let policy_socket = socket.security_ref()?;
+        return import_send_after_socket_hook(
+            || ImportedAfAlgSend::import(&msg, flags),
+            |imported| {
+                dispatch_socket(&SocketSecurityContext::send_message(
+                    snapshot.actor(),
+                    &policy_socket,
+                    &imported.message,
+                    imported.payload_len(),
+                ))
+            },
+            |imported| {
+                af_alg
+                    .send_prepared(imported.request)
+                    .map(|sent| sent as isize)
+            },
+        );
     }
 
     let send_iov = IoVectorBuf::new(msg.msg_iov.cast::<IoVec>(), msg.msg_iovlen)?;
@@ -360,18 +511,56 @@ fn sendmsg_with_socket(
 
     send_impl(
         socket,
+        snapshot,
         fd,
         send_iov.into_io(),
         flags,
         UserConstPtr::from(msg.msg_name as usize),
         msg.msg_namelen as socklen_t,
         cmsg,
+        msg.msg_iovlen,
+        msg.msg_controllen,
     )
 }
 
 pub fn sys_sendmsg(fd: i32, msg: UserConstPtr<msghdr>, flags: u32) -> AxResult<isize> {
+    let snapshot = SocketSyscallSnapshot::capture();
     let socket = PinnedSocketDescription::from_fd(fd)?;
-    sendmsg_with_socket(&socket, fd, msg, flags)
+    let flags = effective_message_flags(flags, socket.nonblocking());
+    sendmsg_with_socket(&socket, &snapshot, fd, msg, flags)
+}
+
+enum ReceivedSocketAddress {
+    Network(SocketAddrEx),
+    NetlinkKernel,
+}
+
+impl ReceivedSocketAddress {
+    fn write_to_user(self, addr: UserPtr<sockaddr>, addrlen: &mut socklen_t) -> AxResult<()> {
+        match self {
+            Self::Network(addr_value) => addr_value.write_to_user(addr, addrlen),
+            Self::NetlinkKernel => {
+                let addr_value = SockaddrNl {
+                    nl_family: AF_NETLINK as _,
+                    nl_pad: 0,
+                    nl_pid: 0,
+                    nl_groups: 0,
+                };
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        (&addr_value as *const SockaddrNl).cast::<u8>(),
+                        size_of::<SockaddrNl>(),
+                    )
+                };
+                let copy_len = (*addrlen as usize).min(bytes.len());
+                if copy_len != 0 {
+                    vm_write_slice(addr.address().as_usize() as *mut u8, &bytes[..copy_len])?;
+                }
+                *addrlen = bytes.len() as _;
+                Ok(())
+            }
+        }
+    }
 }
 
 fn recv_impl(
@@ -379,20 +568,22 @@ fn recv_impl(
     fd: i32,
     mut dst: impl Write + IoBufMut,
     recv_flags: RecvFlags,
-    addr: UserPtr<sockaddr>,
-    addrlen: Option<&mut socklen_t>,
+    want_address: bool,
     cmsg_builder: Option<CMsgBuilder>,
     cloexec_rights: bool,
-) -> AxResult<(isize, bool)> {
+) -> AxResult<(isize, bool, Option<ReceivedSocketAddress>)> {
     debug!("sys_recv <= fd: {fd}, flags: {recv_flags:?}");
 
     if socket.backend()? == SocketBackendKind::Netlink {
         let nonblocking = socket.nonblocking();
         let netlink = socket.netlink()?;
-        let recv =
-            netlink.recv_from_with_nonblocking(&mut dst, recv_flags, addr, addrlen, nonblocking)?;
+        let recv = netlink.recv_with_nonblocking(&mut dst, recv_flags, nonblocking)?;
         debug!("sys_recv => fd: {fd}, netlink recv: {recv}");
-        return Ok((recv as isize, false));
+        return Ok((
+            recv as isize,
+            false,
+            want_address.then_some(ReceivedSocketAddress::NetlinkKernel),
+        ));
     }
 
     if socket.backend()? != SocketBackendKind::Network {
@@ -402,8 +593,7 @@ fn recv_impl(
     let socket = socket.network()?;
     let mut cmsg = Vec::new();
 
-    let mut remote_addr =
-        (!addr.is_null()).then(|| SocketAddrEx::Ip((Ipv4Addr::UNSPECIFIED, 0).into()));
+    let mut remote_addr = want_address.then(|| SocketAddrEx::Ip((Ipv4Addr::UNSPECIFIED, 0).into()));
     let recv = socket.recv(
         &mut dst,
         RecvOptions {
@@ -435,15 +625,63 @@ fn recv_impl(
         }
     }
 
-    // Ancillary fd numbers are a Linux publication point. Process the cmsg
-    // first so an invalid msg_name still consumes the message and preserves
-    // already exposed descriptors.
-    if let (Some(remote_addr), Some(addrlen)) = (remote_addr, addrlen) {
-        remote_addr.write_to_user(addr, addrlen)?;
-    }
-
     debug!("sys_recv => fd: {fd}, recv: {recv}");
-    Ok((recv as isize, control_truncated))
+    Ok((
+        recv as isize,
+        control_truncated,
+        remote_addr.map(ReceivedSocketAddress::Network),
+    ))
+}
+
+fn dispatch_receive_message(
+    socket: &PinnedSocketDescription,
+    snapshot: &SocketSyscallSnapshot,
+    message: &PreparedSocketMessage,
+    size: usize,
+    flags: u32,
+) -> AxResult<()> {
+    let socket_ref = socket.security_ref()?;
+    dispatch_socket(&SocketSecurityContext::receive_message(
+        snapshot.actor(),
+        &socket_ref,
+        message,
+        size,
+        flags as i32,
+    ))
+}
+
+fn receive_after_socket_hook<I, O>(
+    imported: I,
+    authorize: impl FnOnce(&I) -> AxResult<()>,
+    receive: impl FnOnce(I) -> AxResult<O>,
+) -> AxResult<O> {
+    authorize(&imported)?;
+    receive(imported)
+}
+
+fn receive_socket_output_after_policy<T, O>(
+    authorize: impl FnOnce() -> AxResult<()>,
+    receive: impl FnOnce() -> AxResult<T>,
+    export_output: impl FnOnce(T) -> AxResult<O>,
+) -> AxResult<O> {
+    authorize()?;
+    export_output(receive()?)
+}
+
+fn recvfrom_security_message(flags: u32) -> PreparedSocketMessage {
+    // Linux builds recvfrom's kernel msghdr with only msg_name initialized.
+    // The output capacity is not imported until move_addr_to_user after recv.
+    PreparedSocketMessage::new(flags, 1, 0, 0, 0)
+}
+
+fn recvmsg_security_message(
+    flags: u32,
+    iov_count: usize,
+    control_length: usize,
+) -> PreparedSocketMessage {
+    // Linux imports the user msghdr but resets msg_namelen before the receive
+    // hook. The original capacity remains syscall copyout state, not policy.
+    PreparedSocketMessage::new(flags, iov_count, 0, control_length, 0)
 }
 
 pub fn sys_recvfrom(
@@ -454,50 +692,92 @@ pub fn sys_recvfrom(
     addr: UserPtr<sockaddr>,
     addrlen: UserPtr<socklen_t>,
 ) -> AxResult<isize> {
+    let snapshot = SocketSyscallSnapshot::capture();
     if len != 0 {
         check_user_writable(buf as usize, len)?;
     }
-    let recv_flags = validate_recvmsg_flags(flags)?;
-    let addrlen_ptr = addrlen;
-    let mut user_addrlen = if addr.is_null() {
-        None
-    } else {
-        Some(read_user_copy(UserConstPtr::<socklen_t>::from(
-            addrlen_ptr.address().as_usize(),
-        ))?)
-    };
     let socket = PinnedSocketDescription::from_fd(fd)?;
-    let (recv, _control_truncated) = recv_impl(
-        &socket,
-        fd,
-        VmBytesMut::new(buf, len),
-        recv_flags,
-        addr,
-        user_addrlen.as_mut(),
-        None,
-        flags & MSG_CMSG_CLOEXEC != 0,
-    )?;
-    if let Some(new_addrlen) = user_addrlen {
-        write_user_copy(addrlen_ptr, new_addrlen)?;
-    }
-    Ok(recv)
+    let flags = effective_message_flags(flags, socket.nonblocking());
+    let recv_flags = validate_recvmsg_flags(flags)?;
+    let message = recvfrom_security_message(flags);
+    receive_socket_output_after_policy(
+        || dispatch_receive_message(&socket, &snapshot, &message, len, flags),
+        || {
+            recv_impl(
+                &socket,
+                fd,
+                VmBytesMut::new(buf, len),
+                recv_flags,
+                !addr.is_null(),
+                None,
+                flags & MSG_CMSG_CLOEXEC != 0,
+            )
+        },
+        |(recv, _control_truncated, remote_addr)| {
+            if let Some(remote_addr) = remote_addr {
+                let mut user_addrlen = read_user_copy(UserConstPtr::<socklen_t>::from(
+                    addrlen.address().as_usize(),
+                ))?;
+                remote_addr.write_to_user(addr, &mut user_addrlen)?;
+                write_user_copy(addrlen, user_addrlen)?;
+            }
+            Ok(recv)
+        },
+    )
 }
 
-fn recvmsg_with_socket(
+struct ImportedRecvMessage {
+    user: UserPtr<msghdr>,
+    header: msghdr,
+    iov: IoVectorBuf,
+}
+
+impl ImportedRecvMessage {
+    fn import(user: UserPtr<msghdr>) -> AxResult<Self> {
+        let msg_hdr = read_user_copy(UserConstPtr::<msghdr>::from(user.address().as_usize()))?;
+        if (msg_hdr.msg_namelen as i32) < 0 || (msg_hdr.msg_controllen as isize) < 0 {
+            return Err(AxError::InvalidInput);
+        }
+        validate_recvmsg_iovlen(msg_hdr.msg_iovlen)?;
+
+        let recv_iov = IoVectorBuf::new(msg_hdr.msg_iov.cast::<IoVec>(), msg_hdr.msg_iovlen)?;
+        recv_iov.check_writable()?;
+        Ok(Self {
+            user,
+            header: msg_hdr,
+            iov: recv_iov,
+        })
+    }
+
+    fn security_message(&self, flags: u32) -> PreparedSocketMessage {
+        recvmsg_security_message(
+            flags,
+            self.iov.iovcnt(),
+            if self.header.msg_control.is_null() {
+                0
+            } else {
+                self.header.msg_controllen
+            },
+        )
+    }
+
+    fn payload_capacity(&self) -> usize {
+        self.iov.len()
+    }
+}
+
+fn recvmsg_imported(
     socket: &PinnedSocketDescription,
     fd: i32,
-    msg: UserPtr<msghdr>,
+    imported: ImportedRecvMessage,
     flags: u32,
     recv_flags: RecvFlags,
 ) -> AxResult<isize> {
-    let mut msg_hdr = read_user_copy(UserConstPtr::<msghdr>::from(msg.address().as_usize()))?;
-    if (msg_hdr.msg_namelen as i32) < 0 || (msg_hdr.msg_controllen as isize) < 0 {
-        return Err(AxError::InvalidInput);
-    }
-    validate_recvmsg_iovlen(msg_hdr.msg_iovlen)?;
-
-    let recv_iov = IoVectorBuf::new(msg_hdr.msg_iov.cast::<IoVec>(), msg_hdr.msg_iovlen)?;
-    recv_iov.check_writable()?;
+    let ImportedRecvMessage {
+        user: msg,
+        header: mut msg_hdr,
+        iov: recv_iov,
+    } = imported;
 
     let mut name_len = msg_hdr.msg_namelen as socklen_t;
     msg_hdr.msg_flags = 0;
@@ -510,16 +790,20 @@ fn recvmsg_with_socket(
             &mut msg_hdr.msg_controllen,
         ))
     };
-    let (recv, control_truncated) = recv_impl(
+    let (recv, control_truncated, remote_addr) = recv_impl(
         socket,
         fd,
         recv_iov.into_io(),
         recv_flags,
-        UserPtr::from(msg_hdr.msg_name as usize),
-        (!msg_hdr.msg_name.is_null()).then_some(&mut name_len),
+        !msg_hdr.msg_name.is_null(),
         control,
         flags & MSG_CMSG_CLOEXEC != 0,
     )?;
+    // Ancillary fd numbers are a Linux publication point. `recv_impl` handles
+    // those first, so an invalid msg_name preserves already exposed fds.
+    if let Some(remote_addr) = remote_addr {
+        remote_addr.write_to_user(UserPtr::from(msg_hdr.msg_name as usize), &mut name_len)?;
+    }
     if control_truncated {
         msg_hdr.msg_flags |= MSG_CTRUNC;
     }
@@ -547,15 +831,33 @@ fn recvmsg_with_socket(
 }
 
 pub fn sys_recvmsg(fd: i32, msg: UserPtr<msghdr>, flags: u32) -> AxResult<isize> {
-    let recv_flags = validate_recvmsg_flags(flags)?;
+    let snapshot = SocketSyscallSnapshot::capture();
     let socket = PinnedSocketDescription::from_fd(fd)?;
-    recvmsg_with_socket(&socket, fd, msg, flags, recv_flags)
+    let flags = effective_message_flags(flags, socket.nonblocking());
+    let recv_flags = validate_recvmsg_flags(flags)?;
+    let imported = ImportedRecvMessage::import(msg)?;
+    receive_after_socket_hook(
+        imported,
+        |imported| {
+            let message = imported.security_message(flags);
+            dispatch_receive_message(
+                &socket,
+                &snapshot,
+                &message,
+                imported.payload_capacity(),
+                flags,
+            )
+        },
+        |imported| recvmsg_imported(&socket, fd, imported, flags, recv_flags),
+    )
 }
 
 pub fn sys_sendmmsg(fd: i32, msgvec: UserPtr<mmsghdr>, vlen: u32, flags: u32) -> AxResult<isize> {
     // Linux validates and pins the socket even when there are no elements; a
     // zero vlen only suppresses access to msgvec itself.
+    let snapshot = SocketSyscallSnapshot::capture();
     let socket = PinnedSocketDescription::from_fd(fd)?;
+    let flags = effective_message_flags(flags, socket.nonblocking());
     let Some(vlen) = admitted_sendmmsg_vlen(vlen) else {
         return Ok(0);
     };
@@ -568,7 +870,7 @@ pub fn sys_sendmmsg(fd: i32, msgvec: UserPtr<mmsghdr>, vlen: u32, flags: u32) ->
             Err(err) => return Err(err),
         };
         let msg = UserConstPtr::<mmsghdr>::from(ptr).cast::<msghdr>();
-        match sendmsg_with_socket(&socket, fd, msg, flags) {
+        match sendmsg_with_socket(&socket, &snapshot, fd, msg, flags) {
             Ok(len) => {
                 if let Err(err) =
                     write_user_field(ptr, core::mem::offset_of!(mmsghdr, msg_len), len as u32)
@@ -605,18 +907,17 @@ pub fn sys_recvmmsg(
     flags: u32,
     timeout: UserConstPtr<timespec>,
 ) -> AxResult<isize> {
+    let snapshot = SocketSyscallSnapshot::capture();
     // The timeout object is imported before Linux enters do_recvmmsg(), even
     // for vlen zero. Pin the endpoint next, then skip only msgvec processing.
     let has_timeout = recvmmsg_has_timeout(timeout)?;
     let socket = PinnedSocketDescription::from_fd(fd)?;
-    // do_recvmmsg() consumes sk_err before checking vlen, so a zero-length
-    // batch still reports (and clears) a deferred error from an earlier batch.
-    // MSG_ERRQUEUE is the exception: it reads the error queue rather than
-    // consuming the ordinary one-shot socket error.
-    if recvmmsg_consumes_pending_error(flags) {
-        take_pending_socket_error(&socket)?;
-    }
     let Some(vlen) = admitted_recvmmsg_vlen(vlen) else {
+        // A zero-length batch has no receive attempt and therefore no receive
+        // security hook. Preserve the existing one-shot socket-error behavior.
+        if recvmmsg_consumes_pending_error(flags) {
+            take_pending_socket_error(&socket)?;
+        }
         return Ok(0);
     };
     // A per-call recvmmsg deadline cannot be represented by the socket's
@@ -627,10 +928,28 @@ pub fn sys_recvmmsg(
         return Err(AxError::OperationNotSupported);
     }
     let wait_for_one = flags & MSG_WAITFORONE != 0;
-    let mut active_flags = flags & !MSG_WAITFORONE;
+    let mut active_flags = effective_message_flags(flags & !MSG_WAITFORONE, socket.nonblocking());
     let mut recv_flags = validate_recvmsg_flags(active_flags)?;
     let mut received = 0usize;
     let base = msgvec.address().as_usize();
+    let first_ptr = mmsg_address(base, 0)?;
+    let first_msg = UserPtr::<mmsghdr>::from(first_ptr).cast::<msghdr>();
+    let first_imported = ImportedRecvMessage::import(first_msg)?;
+    let message = first_imported.security_message(active_flags);
+    dispatch_receive_message(
+        &socket,
+        &snapshot,
+        &message,
+        first_imported.payload_capacity(),
+        active_flags,
+    )?;
+    // The security hook observes the first concrete receive attempt before a
+    // transport reports and clears its deferred error. A denial therefore
+    // leaves that error available to a later admitted call.
+    if recvmmsg_consumes_pending_error(flags) {
+        take_pending_socket_error(&socket)?;
+    }
+    let mut first_imported = Some(first_imported);
     for idx in 0..vlen {
         let ptr = match mmsg_address(base, idx) {
             Ok(ptr) => ptr,
@@ -640,8 +959,40 @@ pub fn sys_recvmmsg(
             }
             Err(err) => return Err(err),
         };
-        let msg = UserPtr::<mmsghdr>::from(ptr).cast::<msghdr>();
-        match recvmsg_with_socket(&socket, fd, msg, active_flags, recv_flags) {
+        let imported = if idx == 0 {
+            first_imported
+                .take()
+                .expect("first recvmmsg element was imported before dispatch")
+        } else {
+            let msg = UserPtr::<mmsghdr>::from(ptr).cast::<msghdr>();
+            match ImportedRecvMessage::import(msg) {
+                Ok(imported) => imported,
+                Err(err) if received != 0 => {
+                    remember_recvmmsg_error(&socket, err);
+                    return Ok(received as isize);
+                }
+                Err(err) => return Err(err),
+            }
+        };
+        let receive = if idx == 0 {
+            recvmsg_imported(&socket, fd, imported, active_flags, recv_flags)
+        } else {
+            receive_after_socket_hook(
+                imported,
+                |imported| {
+                    let message = imported.security_message(active_flags);
+                    dispatch_receive_message(
+                        &socket,
+                        &snapshot,
+                        &message,
+                        imported.payload_capacity(),
+                        active_flags,
+                    )
+                },
+                |imported| recvmsg_imported(&socket, fd, imported, active_flags, recv_flags),
+            )
+        };
+        match receive {
             Ok(len) => {
                 if let Err(err) =
                     write_user_field(ptr, core::mem::offset_of!(mmsghdr, msg_len), len as u32)
@@ -690,6 +1041,67 @@ mod tests {
     }
 
     #[test]
+    fn nonblocking_ofd_adds_dontwait_to_the_hook_and_backend_view() {
+        assert_eq!(
+            effective_message_flags(MSG_PEEK, true),
+            MSG_PEEK | MSG_DONTWAIT
+        );
+    }
+
+    #[test]
+    fn explicit_dontwait_is_preserved_without_duplication() {
+        assert_eq!(
+            effective_message_flags(MSG_PEEK | MSG_DONTWAIT, false),
+            MSG_PEEK | MSG_DONTWAIT
+        );
+        assert_eq!(
+            effective_message_flags(MSG_PEEK | MSG_DONTWAIT, true),
+            MSG_PEEK | MSG_DONTWAIT
+        );
+    }
+
+    #[test]
+    fn bad_af_alg_control_copy_precedes_policy_denial() {
+        use core::cell::Cell;
+
+        let hook_calls = Cell::new(0);
+        let result = import_send_after_socket_hook(
+            || Err::<AfAlgSendRequest, _>(AxError::BadAddress),
+            |_: &AfAlgSendRequest| {
+                hook_calls.set(hook_calls.get() + 1);
+                Err(AxError::PermissionDenied)
+            },
+            |request| Ok(request.payload_len()),
+        );
+
+        assert_eq!(result, Err(AxError::BadAddress));
+        assert_eq!(hook_calls.get(), 0);
+    }
+
+    #[test]
+    fn af_alg_hook_and_commit_share_one_owned_payload() {
+        use core::cell::{Cell, RefCell};
+
+        let source = RefCell::new(alloc::vec![1_u8, 2, 3, 4]);
+        let hook_size = Cell::new(0);
+        let result = import_send_after_socket_hook(
+            || AfAlgSendRequest::prepare(source.borrow().clone(), &[], false),
+            |request| {
+                hook_size.set(request.payload_len());
+                source.borrow_mut().fill(9);
+                Ok(())
+            },
+            |request| {
+                assert_eq!(request.payload(), &[1, 2, 3, 4]);
+                Ok(request.payload_len())
+            },
+        );
+
+        assert_eq!(hook_size.get(), 4);
+        assert_eq!(result, Ok(4));
+    }
+
+    #[test]
     fn recvmmsg_errqueue_does_not_consume_the_ordinary_pending_error() {
         assert!(recvmmsg_consumes_pending_error(0));
         assert!(!recvmmsg_consumes_pending_error(MSG_ERRQUEUE));
@@ -703,6 +1115,104 @@ mod tests {
         assert!(!recvmmsg_defers_error(AxError::WouldBlock));
         assert!(recvmmsg_defers_error(AxError::TimedOut));
         assert!(recvmmsg_defers_error(AxError::ConnectionReset));
+    }
+
+    #[test]
+    fn batch_receive_denial_stops_before_the_denied_element_is_consumed() {
+        use core::cell::Cell;
+
+        let hook_calls = Cell::new(0);
+        let consumed = Cell::new(0);
+        for element in 0..3 {
+            let result = receive_after_socket_hook(
+                element,
+                |element| {
+                    hook_calls.set(hook_calls.get() + 1);
+                    if *element == 1 {
+                        Err(AxError::PermissionDenied)
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| {
+                    consumed.set(consumed.get() + 1);
+                    Ok(())
+                },
+            );
+            if result.is_err() {
+                break;
+            }
+        }
+
+        assert_eq!(hook_calls.get(), 2);
+        assert_eq!(consumed.get(), 1);
+    }
+
+    #[test]
+    fn denied_recvfrom_policy_does_not_consume_or_import_a_bad_output_length() {
+        use core::cell::Cell;
+
+        let consumed = Cell::new(0);
+        let output_imports = Cell::new(0);
+        let result = receive_socket_output_after_policy(
+            || Err(AxError::PermissionDenied),
+            || {
+                consumed.set(consumed.get() + 1);
+                Ok(())
+            },
+            |_| {
+                output_imports.set(output_imports.get() + 1);
+                Err::<(), _>(AxError::BadAddress)
+            },
+        );
+
+        assert_eq!(result, Err(AxError::PermissionDenied));
+        assert_eq!(consumed.get(), 0);
+        assert_eq!(output_imports.get(), 0);
+    }
+
+    #[test]
+    fn admitted_recvfrom_consumes_before_output_import_and_writeback() {
+        use core::cell::Cell;
+
+        let stage = Cell::new(0);
+        let result = receive_socket_output_after_policy(
+            || {
+                assert_eq!(stage.replace(1), 0);
+                Ok(())
+            },
+            || {
+                assert_eq!(stage.replace(2), 1);
+                Ok(17usize)
+            },
+            |received| {
+                assert_eq!(stage.replace(3), 2); // Import output capacity.
+                assert_eq!(stage.replace(4), 3); // Write address and true length.
+                Ok(received)
+            },
+        );
+
+        assert_eq!(result, Ok(17));
+        assert_eq!(stage.get(), 4);
+    }
+
+    #[test]
+    fn recvfrom_policy_does_not_observe_the_unimported_output_capacity() {
+        let message = recvfrom_security_message(MSG_DONTWAIT);
+
+        assert_eq!(message.flags(), MSG_DONTWAIT);
+        assert_eq!(message.iov_count(), 1);
+        assert_eq!(message.name_length(), 0);
+    }
+
+    #[test]
+    fn recvmsg_policy_does_not_observe_the_copyout_name_capacity() {
+        let message = recvmsg_security_message(MSG_PEEK, 3, 128);
+
+        assert_eq!(message.flags(), MSG_PEEK);
+        assert_eq!(message.iov_count(), 3);
+        assert_eq!(message.name_length(), 0);
+        assert_eq!(message.control_length(), 128);
     }
 
     #[test]

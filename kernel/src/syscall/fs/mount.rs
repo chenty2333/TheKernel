@@ -21,8 +21,9 @@ use starry_vm::VmPtr;
 
 use crate::{
     file::{
-        FileLike, Kstat, get_file_like, permission::DacFsContextExt, resolve_at_with_credentials,
-        with_path_fs,
+        FileLike, Kstat, get_file_like,
+        permission::{SecurityFsContextExt, VfsSecurityContext},
+        resolve_at_with_security, with_path_fs,
     },
     mm::vm_load_string,
     mounts,
@@ -485,13 +486,13 @@ fn do_bind_mount(
     source: &str,
     target: &axfs_ng_vfs::Location,
     flags: u32,
-    credentials: &DacCredentialView,
+    security: &VfsSecurityContext,
 ) -> AxResult<()> {
     if source.is_empty() {
         return Err(AxError::InvalidInput);
     }
 
-    let source_loc = FS_CONTEXT.lock().resolve_dac(source, credentials)?;
+    let source_loc = FS_CONTEXT.lock().resolve_security(source, security)?;
     if source_loc.is_dir() != target.is_dir() {
         return Err(AxError::InvalidInput);
     }
@@ -528,13 +529,13 @@ fn do_bind_mount(
 fn do_move_mount_old(
     source: &str,
     target: &axfs_ng_vfs::Location,
-    credentials: &DacCredentialView,
+    security: &VfsSecurityContext,
 ) -> AxResult<()> {
     if source.is_empty() {
         return Err(AxError::InvalidInput);
     }
 
-    let old = FS_CONTEXT.lock().resolve_dac(source, credentials)?;
+    let old = FS_CONTEXT.lock().resolve_security(source, security)?;
     if !old.is_root_of_mount() || old.is_root() || old.is_dir() != target.is_dir() {
         return Err(AxError::InvalidInput);
     }
@@ -777,8 +778,8 @@ pub fn sys_open_tree(dirfd: i32, pathname: *const c_char, flags: u32) -> AxResul
         return Err(AxError::InvalidInput);
     }
     let curr = current();
-    let credentials = curr.as_thread().fs_dac_credentials();
-    if !credentials.has_capability(CAP_SYS_ADMIN) {
+    let security = VfsSecurityContext::new(curr.as_thread().current_cred());
+    if !security.has_capability(CAP_SYS_ADMIN) {
         return Err(LinuxError::EPERM.into());
     }
     if flags & AT_RECURSIVE != 0 {
@@ -786,7 +787,7 @@ pub fn sys_open_tree(dirfd: i32, pathname: *const c_char, flags: u32) -> AxResul
     }
 
     let _mount_operation = mounts::namespace_operation();
-    let loc = resolve_at_with_credentials(dirfd, Some(&path), flags, &credentials)?
+    let loc = resolve_at_with_security(dirfd, Some(&path), flags, &security)?
         .into_file()
         .ok_or(AxError::InvalidInput)?;
     loc.check_is_dir()?;
@@ -822,8 +823,8 @@ pub fn sys_mount_setattr(
         return Err(AxError::InvalidInput);
     }
     let curr = current();
-    let credentials = curr.as_thread().fs_dac_credentials();
-    if !credentials.has_capability(CAP_SYS_ADMIN) {
+    let security = VfsSecurityContext::new(curr.as_thread().current_cred());
+    if !security.has_capability(CAP_SYS_ADMIN) {
         return Err(LinuxError::EPERM.into());
     }
 
@@ -855,7 +856,7 @@ pub fn sys_mount_setattr(
         }
     }
 
-    let loc = resolve_at_with_credentials(dirfd, Some(&path), flags, &credentials)?
+    let loc = resolve_at_with_security(dirfd, Some(&path), flags, &security)?
         .into_file()
         .ok_or(AxError::InvalidInput)?;
     if !loc.is_root_of_mount() {
@@ -889,8 +890,8 @@ pub fn sys_move_mount(
         return Err(AxError::InvalidInput);
     }
     let curr = current();
-    let credentials = curr.as_thread().fs_dac_credentials();
-    if !credentials.has_capability(CAP_SYS_ADMIN) {
+    let security = VfsSecurityContext::new(curr.as_thread().current_cred());
+    if !security.has_capability(CAP_SYS_ADMIN) {
         return Err(LinuxError::EPERM.into());
     }
     if !from_path.is_empty() {
@@ -910,15 +911,15 @@ pub fn sys_move_mount(
         if flags & MOVE_MOUNT_T_EMPTY_PATH == 0 {
             return Err(AxError::NotFound);
         }
-        resolve_at_with_credentials(to_dirfd, Some(""), AT_EMPTY_PATH, &credentials)?
+        resolve_at_with_security(to_dirfd, Some(""), AT_EMPTY_PATH, &security)?
             .into_file()
             .ok_or(AxError::InvalidInput)?
     } else {
         with_path_fs(to_dirfd, axfs_ng_vfs::path::Path::new(&to_path), |fs| {
             if flags & MOVE_MOUNT_T_SYMLINKS != 0 {
-                fs.resolve_dac(&to_path, &credentials)
+                fs.resolve_security(&to_path, &security)
             } else {
-                fs.resolve_no_follow_dac(&to_path, &credentials)
+                fs.resolve_no_follow_security(&to_path, &security)
             }
         })?
     };
@@ -952,14 +953,15 @@ pub fn sys_mount(
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
-    let credentials = curr.as_thread().fs_dac_credentials();
+    let security = VfsSecurityContext::new(curr.as_thread().current_cred());
+    let credentials = security.credentials();
     let umask = proc_data.umask() as u16;
-    if !credentials.has_capability(CAP_SYS_ADMIN) {
+    if !security.has_capability(CAP_SYS_ADMIN) {
         return Err(AxError::from(LinuxError::EPERM));
     }
     let flags_u32 = validate_mount_flags(flags)?;
     let _mount_operation = mounts::namespace_operation();
-    let target = FS_CONTEXT.lock().resolve_dac(&target, &credentials)?;
+    let target = FS_CONTEXT.lock().resolve_security(&target, &security)?;
     let normalized_fs = if fs_type.starts_with("vfat") {
         "vfat"
     } else {
@@ -1018,7 +1020,7 @@ pub fn sys_mount(
     }
 
     if flags_u32 & MS_BIND != 0 {
-        do_bind_mount(&source, &target, flags_u32, &credentials)?;
+        do_bind_mount(&source, &target, flags_u32, &security)?;
         return Ok(0);
     }
 
@@ -1031,7 +1033,7 @@ pub fn sys_mount(
     }
 
     if flags_u32 & MS_MOVE != 0 {
-        do_move_mount_old(&source, &target, &credentials)?;
+        do_move_mount_old(&source, &target, &security)?;
         return Ok(0);
     }
 
@@ -1043,7 +1045,7 @@ pub fn sys_mount(
     let (fs, linux_device) = if let Some(fs) = pseudo_fs_for_mount(&source, normalized_fs, &data)? {
         (fs, None)
     } else {
-        let source_loc = FS_CONTEXT.lock().resolve_dac(&source, &credentials)?;
+        let source_loc = FS_CONTEXT.lock().resolve_security(&source, &security)?;
         let metadata = source_loc.metadata()?;
         if metadata.node_type != NodeType::BlockDevice {
             return Err(AxError::from(LinuxError::ENOTBLK));
@@ -1067,7 +1069,7 @@ pub fn sys_mount(
                     new_block_filesystem_with_fat_options(
                         normalized_fs,
                         dev,
-                        parse_fat_mount_options(&data, &credentials, umask)?,
+                        parse_fat_mount_options(&data, credentials, umask)?,
                     )?
                 } else {
                     if !data.is_empty() {
@@ -1118,8 +1120,8 @@ pub fn sys_umount2(target: *const c_char, flags: i32) -> AxResult<isize> {
     let target = vm_load_string(target)?;
     debug!("sys_umount2 <= target: {target:?}, flags: {flags:#x}");
     let curr = current();
-    let credentials = curr.as_thread().fs_dac_credentials();
-    if !credentials.has_capability(CAP_SYS_ADMIN) {
+    let security = VfsSecurityContext::new(curr.as_thread().current_cred());
+    if !security.has_capability(CAP_SYS_ADMIN) {
         return Err(AxError::from(LinuxError::EPERM));
     }
     if flags & MNT_EXPIRE != 0 && flags & (MNT_FORCE | MNT_DETACH) != 0 {
@@ -1133,11 +1135,11 @@ pub fn sys_umount2(target: *const c_char, flags: i32) -> AxResult<isize> {
     let target = if flags & UMOUNT_NOFOLLOW != 0 {
         FS_CONTEXT
             .lock()
-            .resolve_no_follow_dac_unobserved(&target, &credentials)?
+            .resolve_no_follow_security_unobserved(&target, &security)?
     } else {
         FS_CONTEXT
             .lock()
-            .resolve_dac_unobserved(&target, &credentials)?
+            .resolve_security_unobserved(&target, &security)?
     };
     if !target.is_root_of_mount() {
         return Err(AxError::InvalidInput);

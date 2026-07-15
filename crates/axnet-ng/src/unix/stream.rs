@@ -26,7 +26,10 @@ use crate::{
     socket::SocketFilter,
     unix::{
         Transport, TransportOps, UnixSocketAddr,
-        queue::{PermitSendError, Receiver, SendPermit, Sender, TryRecvError, try_bounded},
+        queue::{
+            PermitSendError, Receiver, RecvReservation, SendPermit, Sender, TryRecvError,
+            try_bounded,
+        },
     },
 };
 
@@ -187,6 +190,10 @@ impl Bind {
             .map_err(|_| AxError::ConnectionRefused)
     }
 
+    fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0).cast::<()>() as usize
+    }
+
     fn start_listening(&self, backlog: usize, credentials: UnixCredentials) -> AxResult<()> {
         if self.0.conn_tx.is_closed() {
             return Err(AxError::InvalidInput);
@@ -206,6 +213,119 @@ impl Bind {
 struct ConnRequest {
     channel: Channel,
     addr: UnixSocketAddr,
+}
+
+impl ConnRequest {
+    fn identity(&self) -> usize {
+        Arc::as_ptr(&self.channel.poll_update).cast::<()>() as usize
+    }
+}
+
+pub(super) struct StreamConnectReservation<'a> {
+    transport: &'a StreamTransport,
+    listener: Bind,
+    permit: Option<SendPermit<ConnRequest>>,
+    client_channel: Option<Channel>,
+    request: Option<ConnRequest>,
+    committed: bool,
+}
+
+impl StreamConnectReservation<'_> {
+    pub(super) fn listener_identity(&self) -> usize {
+        self.listener.identity()
+    }
+
+    pub(super) fn accepted_identity(&self) -> usize {
+        self.request
+            .as_ref()
+            .expect("active stream-connect reservation")
+            .identity()
+    }
+
+    pub(super) fn commit(mut self) -> AxResult<()> {
+        let permit = self
+            .permit
+            .take()
+            .expect("active stream-connect queue permit");
+        let request = self.request.take().expect("active stream-connect request");
+        if let Err(PermitSendError::Closed(request)) = permit.send(request) {
+            drop(request);
+            drop(self.client_channel.take());
+            return Err(AxError::ConnectionRefused);
+        }
+
+        *self.transport.channel.lock() = self.client_channel.take();
+        self.transport
+            .connect_state
+            .store(CONNECT_CONNECTED, Ordering::Release);
+        self.transport.poll_state.wake();
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for StreamConnectReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.transport
+                .connect_state
+                .store(CONNECT_UNCONNECTED, Ordering::Release);
+        }
+    }
+}
+
+pub(super) struct StreamAcceptReservation {
+    request: Option<RecvReservation<ConnRequest>>,
+    drop_cleanup: Option<Box<DeferredStreamCleanup>>,
+}
+
+impl StreamAcceptReservation {
+    pub(super) fn accepted_identity(&self) -> usize {
+        self.request
+            .as_ref()
+            .expect("active stream-accept reservation")
+            .item()
+            .identity()
+    }
+
+    pub(super) fn commit(mut self) -> AxResult<(Transport, UnixSocketAddr)> {
+        let reservation = self
+            .request
+            .take()
+            .expect("active stream-accept reservation");
+        let ConnRequest {
+            channel,
+            addr: peer_addr,
+        } = match reservation.commit() {
+            Ok(request) => request,
+            Err(request) => {
+                request.channel.reset_and_wake();
+                return Err(AxError::ConnectionReset);
+            }
+        };
+        let cleanup = self
+            .drop_cleanup
+            .take()
+            .expect("prepared stream-accept cleanup");
+        Ok((
+            Transport::Stream(StreamTransport::new_channel_with_cleanup(
+                Some(channel),
+                cleanup,
+            )),
+            peer_addr,
+        ))
+    }
+}
+
+impl Drop for StreamAcceptReservation {
+    fn drop(&mut self) {
+        let Some(reservation) = self.request.take() else {
+            return;
+        };
+        if let Some(request) = reservation.cancel() {
+            request.channel.reset_and_wake();
+        }
+    }
 }
 
 const UNIX_STREAM_CLEANUP_SLOTS: usize = 16_384;
@@ -481,6 +601,69 @@ impl StreamTransport {
         drop(retired_receiver);
         self.poll_state.wake();
     }
+
+    pub(super) fn prepare_connect<'a>(
+        &'a self,
+        slot: &super::BindSlot,
+        local_addr: &UnixSocketAddr,
+        credentials: UnixCredentials,
+    ) -> AxResult<StreamConnectReservation<'a>> {
+        if self
+            .connect_state
+            .compare_exchange(
+                CONNECT_UNCONNECTED,
+                CONNECT_RESERVED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(AxError::AlreadyConnected);
+        }
+
+        let result = (|| {
+            let bind = slot.stream.lock().as_ref().cloned();
+            let bind = if let Some(bind) = bind {
+                bind
+            } else if slot.dgram.lock().is_some() {
+                return Err(LinuxError::EPROTOTYPE.into());
+            } else {
+                return Err(AxError::ConnectionRefused);
+            };
+            let permit = bind.reserve()?;
+            let listener_credentials = *bind.0.credentials.lock();
+            let (client_channel, server_channel) = new_channels(credentials, listener_credentials)?;
+            Ok(StreamConnectReservation {
+                transport: self,
+                listener: bind,
+                permit: Some(permit),
+                client_channel: Some(client_channel),
+                request: Some(ConnRequest {
+                    channel: server_channel,
+                    addr: local_addr.clone(),
+                }),
+                committed: false,
+            })
+        })();
+
+        if result.is_err() {
+            self.connect_state
+                .store(CONNECT_UNCONNECTED, Ordering::Release);
+        }
+        result
+    }
+
+    pub(super) async fn prepare_accept(&self) -> AxResult<StreamAcceptReservation> {
+        let drop_cleanup = DeferredStreamCleanup::try_new()?;
+        let Some(rx) = self.conn_rx.lock().clone() else {
+            return Err(AxError::NotConnected);
+        };
+        let request = rx.reserve().await?;
+        Ok(StreamAcceptReservation {
+            request: Some(request),
+            drop_cleanup: Some(drop_cleanup),
+        })
+    }
 }
 
 impl Configurable for StreamTransport {
@@ -583,82 +766,12 @@ impl TransportOps for StreamTransport {
         local_addr: &UnixSocketAddr,
         credentials: UnixCredentials,
     ) -> AxResult<()> {
-        if self
-            .connect_state
-            .compare_exchange(
-                CONNECT_UNCONNECTED,
-                CONNECT_RESERVED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return Err(AxError::AlreadyConnected);
-        }
-
-        let result = (|| {
-            // Clone only the stable listener handle under the slot lock. Queue
-            // admission, ring allocation and publication all happen after it
-            // is released.
-            let bind = slot.stream.lock().as_ref().cloned();
-            let bind = if let Some(bind) = bind {
-                bind
-            } else if slot.dgram.lock().is_some() {
-                return Err(LinuxError::EPROTOTYPE.into());
-            } else {
-                return Err(AxError::ConnectionRefused);
-            };
-            let permit = bind.reserve()?;
-            let listener_credentials = *bind.0.credentials.lock();
-            let (client_channel, server_channel) = new_channels(credentials, listener_credentials)?;
-            let request = ConnRequest {
-                channel: server_channel,
-                addr: local_addr.clone(),
-            };
-            if let Err(PermitSendError::Closed(request)) = permit.send(request) {
-                // Channel endpoints can own wake state and ring buffers; keep
-                // their destruction outside every endpoint/queue lock.
-                drop(request);
-                drop(client_channel);
-                return Err(AxError::ConnectionRefused);
-            }
-            // The CAS above is the sole transition into CONNECT_RESERVED, and
-            // no other operation can install a channel in that state. This is
-            // therefore an infallible ownership move after listener enqueue.
-            *self.channel.lock() = Some(client_channel);
-            self.connect_state
-                .store(CONNECT_CONNECTED, Ordering::Release);
-            self.poll_state.wake();
-            Ok(())
-        })();
-
-        if result.is_err() {
-            self.connect_state
-                .store(CONNECT_UNCONNECTED, Ordering::Release);
-        }
-        result
+        self.prepare_connect(slot, local_addr, credentials)?
+            .commit()
     }
 
     async fn accept(&self) -> AxResult<(Transport, UnixSocketAddr)> {
-        // Admission must precede dequeue. Once a client-visible connection is
-        // removed from the listen queue, construction is an infallible move;
-        // otherwise ENOMEM here could drop the server endpoint without waking
-        // the already connected client.
-        let drop_cleanup = DeferredStreamCleanup::try_new()?;
-        let Some(rx) = self.conn_rx.lock().clone() else {
-            return Err(AxError::NotConnected);
-        };
-        let ConnRequest {
-            channel,
-            addr: peer_addr,
-        } = rx.recv().await?;
-        Ok((
-            Transport::Stream(StreamTransport::new_channel_with_cleanup(
-                Some(channel),
-                drop_cleanup,
-            )),
-            peer_addr,
-        ))
+        self.prepare_accept().await?.commit()
     }
 
     fn send(&self, mut src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {
@@ -1255,6 +1368,103 @@ mod tests {
             .unwrap();
         let accepted = StreamTransport::new_channel(Some(request.channel)).unwrap();
         assert_eq!(peer_credentials(&accepted), connect_credentials);
+    }
+
+    #[test]
+    fn stream_connect_reservation_is_private_and_retryable_after_drop() {
+        let credentials = UnixCredentials::new(1, 2, 3);
+        let listener = StreamTransport::new().unwrap();
+        let slot = super::super::BindSlot::default();
+        let address = UnixSocketAddr::Path(Arc::new(alloc::string::String::from(
+            "/tmp/axnet-stream-connect-reservation",
+        )));
+        listener.bind(&slot, &address).unwrap();
+        listener.listen(&slot, 1, credentials).unwrap();
+        let client = StreamTransport::new().unwrap();
+
+        let reservation = client
+            .prepare_connect(&slot, &UnixSocketAddr::Unnamed, credentials)
+            .unwrap();
+        assert_ne!(reservation.listener_identity(), 0);
+        assert_ne!(reservation.accepted_identity(), 0);
+        assert!(!client.is_connected());
+        assert_eq!(listener.pending_connections(), 0);
+        drop(reservation);
+        assert!(!client.is_connected());
+        assert_eq!(listener.pending_connections(), 0);
+
+        client
+            .prepare_connect(&slot, &UnixSocketAddr::Unnamed, credentials)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert!(client.is_connected());
+        assert_eq!(listener.pending_connections(), 1);
+    }
+
+    #[test]
+    fn stream_accept_reservation_drop_restores_the_exact_request() {
+        let credentials = UnixCredentials::new(1, 2, 3);
+        let listener = StreamTransport::new().unwrap();
+        let slot = super::super::BindSlot::default();
+        let address = UnixSocketAddr::Path(Arc::new(alloc::string::String::from(
+            "/tmp/axnet-stream-accept-reservation",
+        )));
+        listener.bind(&slot, &address).unwrap();
+        listener.listen(&slot, 1, credentials).unwrap();
+        let client = StreamTransport::new().unwrap();
+        client
+            .connect(&slot, &UnixSocketAddr::Unnamed, credentials)
+            .unwrap();
+
+        let receiver = listener.conn_rx.lock().as_ref().unwrap().clone();
+        let request = receiver.try_reserve_inner().unwrap();
+        let identity = request.item().identity();
+        let reservation = StreamAcceptReservation {
+            request: Some(request),
+            drop_cleanup: Some(DeferredStreamCleanup::try_new().unwrap()),
+        };
+        assert_eq!(reservation.accepted_identity(), identity);
+        assert_eq!(listener.pending_connections(), 0);
+        drop(reservation);
+        assert_eq!(listener.pending_connections(), 1);
+
+        let restored = receiver.try_recv().unwrap();
+        assert_eq!(restored.identity(), identity);
+    }
+
+    #[test]
+    fn listener_close_during_accept_reservation_resets_client() {
+        let _guard = super::super::UNIX_CLEANUP_TEST_LOCK.lock();
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+        let credentials = UnixCredentials::new(1, 2, 3);
+        let listener = StreamTransport::new().unwrap();
+        let slot = super::super::BindSlot::default();
+        let address = UnixSocketAddr::Path(Arc::new(alloc::string::String::from(
+            "/tmp/axnet-stream-accept-close",
+        )));
+        listener.bind(&slot, &address).unwrap();
+        listener.listen(&slot, 1, credentials).unwrap();
+        let client = StreamTransport::new().unwrap();
+        client
+            .connect(&slot, &UnixSocketAddr::Unnamed, credentials)
+            .unwrap();
+
+        let receiver = listener.conn_rx.lock().as_ref().unwrap().clone();
+        let reservation = StreamAcceptReservation {
+            request: Some(receiver.try_reserve_inner().unwrap()),
+            drop_cleanup: Some(DeferredStreamCleanup::try_new().unwrap()),
+        };
+        drop(listener);
+        drop(reservation);
+        assert!(client.poll().contains(IoEvents::ERROR));
+        assert_eq!(socket_error(&client), LinuxError::ECONNRESET.code());
+        drop(client);
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
     }
 
     #[test]

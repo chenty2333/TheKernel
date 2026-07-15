@@ -162,15 +162,11 @@ pub fn sys_getgroups(size: usize, list: *mut u32) -> AxResult<isize> {
 
 pub fn sys_setgroups(size: usize, list: *const u32) -> AxResult<isize> {
     let curr = current();
-    // Reject the common unauthorized case before copying/sorting a bounded
-    // user array. `set_supplementary_groups` rechecks under the writer mutex,
-    // so this early check is only a cost guard, not the authorization point.
-    let cred = curr.as_thread().current_cred();
-    if !cred.has_effective_capability_for_setid(linux_raw_sys::general::CAP_SETGID)
-        || !cred.user_ns().may_setgroups()
-    {
-        return Err(AxError::OperationNotPermitted);
-    }
+    let thread = curr.as_thread();
+    // Linux rejects missing CAP_SETGID before validating or reading the user
+    // array. The admission pins that one typed decision to this exact slot and
+    // credential so publication can revalidate without auditing twice.
+    let admission = thread.admit_setgroups()?;
     if size > NGROUPS_MAX as usize {
         return Err(AxError::InvalidInput);
     }
@@ -184,9 +180,15 @@ pub fn sys_setgroups(size: usize, list: *const u32) -> AxResult<isize> {
         .try_reserve_exact(raw_groups.len())
         .map_err(|_| AxError::NoMemory)?;
     for gid in raw_groups {
-        groups.push(cred.user_ns().make_kgid(gid).ok_or(AxError::InvalidInput)?);
+        groups.push(
+            admission
+                .credential()
+                .user_ns()
+                .make_kgid(gid)
+                .ok_or(AxError::InvalidInput)?,
+        );
     }
-    curr.as_thread().set_supplementary_groups(groups)?;
+    thread.set_supplementary_groups(admission, groups)?;
     Ok(0)
 }
 

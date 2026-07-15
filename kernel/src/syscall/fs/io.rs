@@ -22,7 +22,10 @@ use crate::{
         get_typed_file, inode_flags,
         inotify::{notify_exact, notify_parent, notify_read, notify_write},
         lease, memfd,
-        permission::{DacFsContextExt, check_open_permissions, check_writable_mount},
+        permission::{
+            SecurityFsContextExt, VfsSecurityContext, check_open_permissions_with_security,
+            check_writable_mount,
+        },
         pipe::{NamedPipe, PipeEndpoint},
     },
     mm::{
@@ -1835,9 +1838,15 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
     }
     let curr = axtask::current();
     let proc_data = &curr.as_thread().proc_data;
-    let credentials = curr.as_thread().fs_dac_credentials();
-    let loc = FS_CONTEXT.lock().resolve_dac(path, &credentials)?;
-    check_open_permissions(&loc, W_OK as u32, &credentials)?;
+    let security = VfsSecurityContext::new(curr.as_thread().current_cred());
+    let loc = FS_CONTEXT.lock().resolve_security(path, &security)?;
+    check_open_permissions_with_security(
+        &loc,
+        W_OK as u32,
+        security.actor(),
+        security.credentials(),
+        security.filesystem_owner_user_ns(),
+    )?;
     check_writable_mount(&loc)?;
     check_resize_limit(length as u64)?;
     // Unlike fd-backed mutations, path truncate has no persistent open-file

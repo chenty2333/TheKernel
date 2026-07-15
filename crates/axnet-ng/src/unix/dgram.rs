@@ -345,6 +345,10 @@ struct Channel {
 }
 
 impl Channel {
+    fn identity(&self) -> usize {
+        Arc::as_ptr(&self.peer_closed).cast::<()>() as usize
+    }
+
     fn capacity(&self, local_buffers: &SocketBufferLimits) -> usize {
         local_buffers.send().min(self.peer_buffers.recv()).max(1)
     }
@@ -429,6 +433,24 @@ impl Channel {
             return Err(AxError::ConnectionRefused);
         }
         Ok(admission)
+    }
+}
+
+pub(super) struct DgramSendReservation<'a> {
+    transport: &'a DgramTransport,
+    effective_nonblocking: bool,
+    cmsg: Vec<CMsgData>,
+    channel: Channel,
+}
+
+impl DgramSendReservation<'_> {
+    pub(super) fn peer_identity(&self) -> usize {
+        self.channel.identity()
+    }
+
+    pub(super) fn commit(self, src: impl Read + IoBuf) -> AxResult<usize> {
+        self.transport
+            .send_via_channel(src, self.effective_nonblocking, self.cmsg, self.channel)
     }
 }
 
@@ -669,6 +691,56 @@ impl DgramTransport {
         }
     }
 
+    fn prepare_with_channel(
+        &self,
+        options: SendOptions,
+        channel: Channel,
+    ) -> DgramSendReservation<'_> {
+        let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
+        DgramSendReservation {
+            transport: self,
+            effective_nonblocking,
+            cmsg: options.cmsg,
+            channel,
+        }
+    }
+
+    pub(super) fn prepare_send_to_slot(
+        &self,
+        options: SendOptions,
+        slot: &BindSlot,
+    ) -> AxResult<DgramSendReservation<'_>> {
+        if !matches!(
+            options.to,
+            Some(SocketAddrEx::Unix(UnixSocketAddr::Path(_)))
+                | Some(SocketAddrEx::Unix(UnixSocketAddr::Abstract(_)))
+        ) {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(self.prepare_with_channel(options, Self::channel_from_slot(slot)?))
+    }
+
+    pub(super) fn prepare_send(&self, options: SendOptions) -> AxResult<DgramSendReservation<'_>> {
+        if let Some(addr) = options.to.as_ref() {
+            match addr {
+                SocketAddrEx::Unix(UnixSocketAddr::Unnamed) => {
+                    return Err(AxError::InvalidInput);
+                }
+                SocketAddrEx::Unix(UnixSocketAddr::Path(_) | UnixSocketAddr::Abstract(_)) => {
+                    return Err(AxError::OperationNotSupported);
+                }
+                _ => return Err(AxError::InvalidInput),
+            }
+        }
+        let channel = self
+            .connected
+            .read()
+            .as_ref()
+            .cloned()
+            .ok_or(AxError::NotConnected)?;
+        Ok(self.prepare_with_channel(options, channel))
+    }
+
     fn send_via_channel(
         &self,
         mut src: impl Read + IoBuf,
@@ -734,25 +806,6 @@ impl DgramTransport {
         }
         admission.publish(packet)?;
         Ok(len)
-    }
-
-    pub(super) fn send_to_slot(
-        &self,
-        src: impl Read + IoBuf,
-        options: SendOptions,
-        slot: &BindSlot,
-    ) -> AxResult<usize> {
-        let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
-        let SendOptions { to, cmsg, .. } = options;
-        if !matches!(to, Some(SocketAddrEx::Unix(UnixSocketAddr::Path(_)))) {
-            return Err(AxError::InvalidInput);
-        }
-        self.send_via_channel(
-            src,
-            effective_nonblocking,
-            cmsg,
-            Self::channel_from_slot(slot)?,
-        )
     }
 
     pub fn set_filter(&self, filter: Option<Arc<dyn SocketFilter>>) -> AxResult<()> {
@@ -921,23 +974,7 @@ impl TransportOps for DgramTransport {
     }
 
     fn send(&self, src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {
-        let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
-        let SendOptions { to, cmsg, .. } = options;
-        let channel = if let Some(addr) = to {
-            let addr = addr.into_unix()?;
-            match addr {
-                UnixSocketAddr::Unnamed => return Err(AxError::InvalidInput),
-                UnixSocketAddr::Path(_) => return Err(AxError::OperationNotSupported),
-                UnixSocketAddr::Abstract(_) => return Err(AxError::OperationNotSupported),
-            }
-        } else {
-            self.connected
-                .read()
-                .as_ref()
-                .cloned()
-                .ok_or(AxError::NotConnected)?
-        };
-        self.send_via_channel(src, effective_nonblocking, cmsg, channel)
+        self.prepare_send(options)?.commit(src)
     }
 
     fn recv(&self, mut dst: impl Write, mut options: RecvOptions) -> AxResult<usize> {
@@ -1210,6 +1247,45 @@ mod tests {
         assert_eq!(
             bind.connect().unwrap().peer_credentials,
             UnixCredentials::UNKNOWN
+        );
+    }
+
+    #[test]
+    fn prepared_datagram_send_cannot_be_redirected_by_peer_replacement() {
+        let credentials = UnixCredentials::new(11, 12, 13);
+        let (sender, original_receiver) = DgramTransport::new_pair(credentials).unwrap();
+        let (alternate_sender, alternate_receiver) = DgramTransport::new_pair(credentials).unwrap();
+
+        let reservation = sender.prepare_send(SendOptions::default()).unwrap();
+        let original_identity = reservation.peer_identity();
+        let replacement = alternate_sender.connected.read().as_ref().unwrap().clone();
+        assert_ne!(original_identity, replacement.identity());
+        *sender.connected.write() = Some(replacement);
+
+        assert_eq!(reservation.commit(&b"x"[..]), Ok(1));
+        let mut original = [0u8; 1];
+        assert_eq!(
+            original_receiver.recv(
+                &mut original[..],
+                RecvOptions {
+                    flags: RecvFlags::DONT_WAIT,
+                    ..RecvOptions::default()
+                }
+            ),
+            Ok(1)
+        );
+        assert_eq!(&original, b"x");
+
+        let mut alternate = [0u8; 1];
+        assert_eq!(
+            alternate_receiver.recv(
+                &mut alternate[..],
+                RecvOptions {
+                    flags: RecvFlags::DONT_WAIT,
+                    ..RecvOptions::default()
+                }
+            ),
+            Err(AxError::WouldBlock)
         );
     }
 

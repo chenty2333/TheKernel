@@ -84,6 +84,16 @@ impl VfsSecurityContext {
         &self.credentials
     }
 
+    /// Tests one initial-user-namespace capability against the exact actor and
+    /// DAC projection frozen for this VFS operation. The snapshot check keeps
+    /// synthetic or future non-effective projections from being silently
+    /// rebound to the actor's effective set; the actor check performs commoncap
+    /// plus ordered stacked-policy dispatch.
+    pub(crate) fn has_capability(&self, capability: u32) -> bool {
+        self.credentials.has_capability(capability)
+            && self.actor.has_effective_capability(capability)
+    }
+
     pub(crate) const fn filesystem_owner_user_ns(&self) -> &Arc<UserNamespace> {
         &self.filesystem_owner_user_ns
     }
@@ -207,6 +217,8 @@ pub(crate) struct ChmodSetattrPolicy<'a> {
     location: &'a Location,
     metadata: Metadata,
     ctime: core::time::Duration,
+    actor: &'a Cred,
+    credentials: &'a DacCredentialView,
     plan: LinuxChmodSetattrPlan<'static, KernelDacCredentials<'a>>,
 }
 
@@ -214,17 +226,25 @@ impl<'a> ChmodSetattrPolicy<'a> {
     pub(crate) fn new(
         location: &'a Location,
         requested_mode: u32,
-        credentials: &'a DacCredentialView,
+        security: &'a VfsSecurityContext,
     ) -> AxResult<Self> {
         let metadata = location.metadata()?;
         let ctime = wall_time();
         let node = linux_metadata_snapshot(&metadata);
         let request = LinuxChmodRequest::new(requested_mode as u16);
+        let actor = security.actor();
+        let credentials = security.credentials();
         Ok(Self {
             location,
             metadata,
             ctime,
-            plan: linux_plan_chmod(&node, request, KernelDacCredentials(credentials)),
+            actor,
+            credentials,
+            plan: linux_plan_chmod(
+                &node,
+                request,
+                KernelDacCredentials::actor_bound(actor, credentials),
+            ),
         })
     }
 
@@ -248,6 +268,11 @@ impl<'a> ChmodSetattrPolicy<'a> {
         self,
         security: &'context VfsSecurityContext,
     ) -> AxResult<AdmittedChmodSetattr<'a, 'context, 'a>> {
+        if !core::ptr::eq(self.actor, security.actor())
+            || !core::ptr::eq(self.credentials, security.credentials())
+        {
+            return Err(AxError::BadState);
+        }
         self.validate_owner_mapping(security.filesystem_owner_user_ns())?;
         let location = self.location;
         let (proposal, after_hook) = self.into_hook_proposal()?;
@@ -301,6 +326,8 @@ pub(crate) struct ChownSetattrPolicy<'a> {
     ctime: core::time::Duration,
     requested_user: Option<Kuid>,
     requested_group: Option<Kgid>,
+    actor: &'a Cred,
+    credentials: &'a DacCredentialView,
     plan: LinuxChownSetattrPlan<'static, KernelDacCredentials<'a>>,
 }
 
@@ -309,7 +336,7 @@ impl<'a> ChownSetattrPolicy<'a> {
         location: &'a Location,
         requested_user: Option<Kuid>,
         requested_group: Option<Kgid>,
-        credentials: &'a DacCredentialView,
+        security: &'a VfsSecurityContext,
     ) -> AxResult<Self> {
         let metadata = location.metadata()?;
         let ctime = wall_time();
@@ -318,13 +345,21 @@ impl<'a> ChownSetattrPolicy<'a> {
             requested_user.map(Kuid::into_raw),
             requested_group.map(Kgid::into_raw),
         );
+        let actor = security.actor();
+        let credentials = security.credentials();
         Ok(Self {
             location,
             metadata,
             ctime,
             requested_user,
             requested_group,
-            plan: linux_plan_chown(&node, request, KernelDacCredentials(credentials)),
+            actor,
+            credentials,
+            plan: linux_plan_chown(
+                &node,
+                request,
+                KernelDacCredentials::actor_bound(actor, credentials),
+            ),
         })
     }
 
@@ -365,6 +400,11 @@ impl<'a> ChownSetattrPolicy<'a> {
         security: &'context VfsSecurityContext,
         privilege_cleanup: InodePrivilegeCleanup<'a>,
     ) -> AxResult<AdmittedChownSetattr<'a, 'context, 'a>> {
+        if !core::ptr::eq(self.actor, security.actor())
+            || !core::ptr::eq(self.credentials, security.credentials())
+        {
+            return Err(AxError::BadState);
+        }
         privilege_cleanup.validate_location(self.location)?;
         self.validate_owner_mapping(security.filesystem_owner_user_ns())?;
         let location = self.location;
@@ -444,7 +484,7 @@ fn chown_plan_for_test<'a>(
         requested_user.map(Kuid::into_raw),
         requested_group.map(Kgid::into_raw),
     );
-    linux_plan_chown(&node, request, KernelDacCredentials(credentials))
+    linux_plan_chown(&node, request, KernelDacCredentials::snapshot(credentials))
 }
 
 #[cfg(test)]
@@ -480,7 +520,7 @@ pub(crate) fn prepare_chmod_metadata_setattr_for_test(
 ) -> AxResult<PreparedMetadataSetattr> {
     let node = linux_metadata_snapshot(metadata);
     let request = LinuxChmodRequest::new(requested_mode as u16);
-    let prepared = linux_plan_chmod(&node, request, KernelDacCredentials(credentials))
+    let prepared = linux_plan_chmod(&node, request, KernelDacCredentials::snapshot(credentials))
         .prepare()
         .map_err(map_setattr_error)?;
     Ok(prepare_metadata_setattr(metadata, prepared, ctime))
@@ -530,7 +570,47 @@ fn prepare_metadata_setattr(
     PreparedMetadataSetattr { update, committed }
 }
 
-struct KernelDacCredentials<'a>(&'a DacCredentialView);
+#[derive(Clone, Copy)]
+enum DacCapabilityDispatch<'a> {
+    /// Pure Linux-DAC projection used by `access(2)` real-ID credentials and
+    /// policy-arithmetic tests. It must never be rebound to a live actor whose
+    /// effective set can differ from this snapshot.
+    SnapshotOnly,
+    /// Normal live VFS operation over one exact pinned composite actor.
+    Actor(&'a Cred),
+}
+
+#[derive(Clone, Copy)]
+struct KernelDacCredentials<'a> {
+    credentials: &'a DacCredentialView,
+    capability_dispatch: DacCapabilityDispatch<'a>,
+}
+
+impl<'a> KernelDacCredentials<'a> {
+    const fn snapshot(credentials: &'a DacCredentialView) -> Self {
+        Self {
+            credentials,
+            capability_dispatch: DacCapabilityDispatch::SnapshotOnly,
+        }
+    }
+
+    const fn actor_bound(actor: &'a Cred, credentials: &'a DacCredentialView) -> Self {
+        Self {
+            credentials,
+            capability_dispatch: DacCapabilityDispatch::Actor(actor),
+        }
+    }
+
+    fn has_raw_capability(&self, capability: u32) -> bool {
+        if !self.credentials.has_capability(capability) {
+            return false;
+        }
+        match self.capability_dispatch {
+            DacCapabilityDispatch::SnapshotOnly => true,
+            DacCapabilityDispatch::Actor(actor) => actor.has_effective_capability(capability),
+        }
+    }
+}
 
 impl DacCredentials for KernelDacCredentials<'_> {
     type UserId = u32;
@@ -538,19 +618,20 @@ impl DacCredentials for KernelDacCredentials<'_> {
     type UserNamespace = ();
 
     fn fs_user_id(&self) -> Self::UserId {
-        self.0.uid().into_raw()
+        self.credentials.uid().into_raw()
     }
 
     fn fs_group_id(&self) -> Self::GroupId {
-        self.0.gid().into_raw()
+        self.credentials.gid().into_raw()
     }
 
     fn is_in_group(&self, group: Self::GroupId) -> bool {
-        Kgid::from_raw(group).is_some_and(|group| self.0.supplementary_groups().contains(&group))
+        Kgid::from_raw(group)
+            .is_some_and(|group| self.credentials.supplementary_groups().contains(&group))
     }
 
     fn has_capability(&self, _owner: &Self::UserNamespace, capability: DacCapability) -> bool {
-        self.0.has_capability(match capability {
+        self.has_raw_capability(match capability {
             DacCapability::Override => CAP_DAC_OVERRIDE,
             DacCapability::ReadSearch => CAP_DAC_READ_SEARCH,
             DacCapability::Fowner => CAP_FOWNER,
@@ -584,7 +665,8 @@ impl DacCredentials for KernelHardlinkCredentials<'_> {
     }
 
     fn has_capability(&self, _owner: &Self::UserNamespace, capability: DacCapability) -> bool {
-        self.dac.has_capability(match capability {
+        KernelDacCredentials::actor_bound(self.actor, self.dac).has_raw_capability(match capability
+        {
             DacCapability::Override => CAP_DAC_OVERRIDE,
             DacCapability::ReadSearch => CAP_DAC_READ_SEARCH,
             DacCapability::Fowner => CAP_FOWNER,
@@ -681,6 +763,22 @@ pub(crate) fn check_writable_mount(dir: &Location) -> AxResult {
     }
 }
 
+fn dac_access_allowed_with(
+    perm: u32,
+    owner_uid: u32,
+    owner_gid: u32,
+    node_type: NodeType,
+    requested: u32,
+    credentials: KernelDacCredentials<'_>,
+) -> bool {
+    check_linux_dac(
+        &linux_node_metadata(perm, owner_uid, owner_gid, node_type),
+        linux_access(requested),
+        &credentials,
+    )
+    .is_ok()
+}
+
 fn dac_access_allowed(
     perm: u32,
     owner_uid: u32,
@@ -689,12 +787,14 @@ fn dac_access_allowed(
     requested: u32,
     credentials: &DacCredentialView,
 ) -> bool {
-    check_linux_dac(
-        &linux_node_metadata(perm, owner_uid, owner_gid, node_type),
-        linux_access(requested),
-        &KernelDacCredentials(credentials),
+    dac_access_allowed_with(
+        perm,
+        owner_uid,
+        owner_gid,
+        node_type,
+        requested,
+        KernelDacCredentials::snapshot(credentials),
     )
-    .is_ok()
 }
 
 pub(crate) fn check_dac_permissions(
@@ -717,6 +817,48 @@ pub(crate) fn check_dac_permissions(
     } else {
         Err(AxError::PermissionDenied)
     }
+}
+
+fn check_dac_permissions_with_actor(
+    perm: u32,
+    owner_uid: u32,
+    owner_gid: u32,
+    node_type: NodeType,
+    requested: u32,
+    actor: &Cred,
+    credentials: &DacCredentialView,
+) -> AxResult {
+    if dac_access_allowed_with(
+        perm,
+        owner_uid,
+        owner_gid,
+        node_type,
+        requested,
+        KernelDacCredentials::actor_bound(actor, credentials),
+    ) {
+        Ok(())
+    } else {
+        Err(AxError::PermissionDenied)
+    }
+}
+
+pub(crate) fn check_dac_permissions_with_security(
+    perm: u32,
+    owner_uid: u32,
+    owner_gid: u32,
+    node_type: NodeType,
+    requested: u32,
+    security: &VfsSecurityContext,
+) -> AxResult {
+    check_dac_permissions_with_actor(
+        perm,
+        owner_uid,
+        owner_gid,
+        node_type,
+        requested,
+        security.actor(),
+        security.credentials(),
+    )
 }
 
 fn inode_permission_access(requested: u32) -> AxResult<Option<InodePermissionAccess>> {
@@ -742,9 +884,11 @@ fn inode_permission_access(requested: u32) -> AxResult<Option<InodePermissionAcc
 }
 
 /// Runs Linux DAC and the frozen typed inode hook against one metadata
-/// snapshot. The outer composite actor is kept separate from the exact DAC
-/// view so real-ID access checks can eventually use the same hook contract
-/// without fabricating a replacement module-state vector.
+/// snapshot. Callers must supply the effective filesystem projection derived
+/// from this exact actor. Real-ID `access(2)` projections deliberately stay on
+/// the snapshot-only path until the ABI layer has a distinct typed context for
+/// synthetic credentials; binding them here would apply the wrong effective
+/// set to commoncap and stacked policy.
 pub(crate) fn check_inode_permissions(
     loc: &Location,
     requested: u32,
@@ -802,12 +946,13 @@ fn check_inode_permissions_with_metadata(
     credentials: &DacCredentialView,
     filesystem_owner_user_ns: &Arc<UserNamespace>,
 ) -> AxResult {
-    check_dac_permissions(
+    check_dac_permissions_with_actor(
         metadata.mode.bits() as u32,
         metadata.uid,
         metadata.gid,
         metadata.node_type,
         requested,
+        actor,
         credentials,
     )?;
     let object = InodeSecurityRef::new(loc, &metadata);
@@ -1183,19 +1328,7 @@ pub(crate) trait DacFsContextExt {
         path: impl AsRef<Path>,
         credentials: &DacCredentialView,
     ) -> AxResult<Location>;
-    fn resolve_dac_unobserved(
-        &self,
-        path: impl AsRef<Path>,
-        credentials: &DacCredentialView,
-    ) -> AxResult<Location>;
-
     fn resolve_no_follow_dac(
-        &self,
-        path: impl AsRef<Path>,
-        credentials: &DacCredentialView,
-    ) -> AxResult<Location>;
-
-    fn resolve_no_follow_dac_unobserved(
         &self,
         path: impl AsRef<Path>,
         credentials: &DacCredentialView,
@@ -1213,32 +1346,12 @@ impl DacFsContextExt for FsContext {
         })
     }
 
-    fn resolve_dac_unobserved(
-        &self,
-        path: impl AsRef<Path>,
-        credentials: &DacCredentialView,
-    ) -> AxResult<Location> {
-        self.resolve_with_admission_unobserved(path, &mut |dir| {
-            check_pathwalk_search_permission(dir, credentials)
-        })
-    }
-
     fn resolve_no_follow_dac(
         &self,
         path: impl AsRef<Path>,
         credentials: &DacCredentialView,
     ) -> AxResult<Location> {
         self.resolve_no_follow_with_admission(path, &mut |dir| {
-            check_pathwalk_search_permission(dir, credentials)
-        })
-    }
-
-    fn resolve_no_follow_dac_unobserved(
-        &self,
-        path: impl AsRef<Path>,
-        credentials: &DacCredentialView,
-    ) -> AxResult<Location> {
-        self.resolve_no_follow_with_admission_unobserved(path, &mut |dir| {
             check_pathwalk_search_permission(dir, credentials)
         })
     }
@@ -1259,6 +1372,18 @@ pub(crate) trait SecurityFsContextExt {
     ) -> AxResult<Location>;
 
     fn resolve_no_follow_security(
+        &self,
+        path: impl AsRef<Path>,
+        security: &VfsSecurityContext,
+    ) -> AxResult<Location>;
+
+    fn resolve_security_unobserved(
+        &self,
+        path: impl AsRef<Path>,
+        security: &VfsSecurityContext,
+    ) -> AxResult<Location>;
+
+    fn resolve_no_follow_security_unobserved(
         &self,
         path: impl AsRef<Path>,
         security: &VfsSecurityContext,
@@ -1320,6 +1445,36 @@ impl SecurityFsContextExt for FsContext {
         })
     }
 
+    fn resolve_security_unobserved(
+        &self,
+        path: impl AsRef<Path>,
+        security: &VfsSecurityContext,
+    ) -> AxResult<Location> {
+        self.resolve_with_admission_unobserved(path, &mut |dir| {
+            check_pathwalk_search_permission_with_security(
+                dir,
+                security.actor(),
+                security.credentials(),
+                security.filesystem_owner_user_ns(),
+            )
+        })
+    }
+
+    fn resolve_no_follow_security_unobserved(
+        &self,
+        path: impl AsRef<Path>,
+        security: &VfsSecurityContext,
+    ) -> AxResult<Location> {
+        self.resolve_no_follow_with_admission_unobserved(path, &mut |dir| {
+            check_pathwalk_search_permission_with_security(
+                dir,
+                security.actor(),
+                security.credentials(),
+                security.filesystem_owner_user_ns(),
+            )
+        })
+    }
+
     fn resolve_named_create_security<'a>(
         &self,
         path: &'a Path,
@@ -1369,11 +1524,16 @@ impl SecurityFsContextExt for FsContext {
     }
 }
 
-pub(crate) fn check_search_permissions(
+pub(crate) fn check_search_permissions_with_security(
     loc: &Location,
-    credentials: &DacCredentialView,
+    security: &VfsSecurityContext,
 ) -> AxResult {
-    check_pathwalk_search_permission(loc, credentials)
+    check_pathwalk_search_permission_with_security(
+        loc,
+        security.actor(),
+        security.credentials(),
+        security.filesystem_owner_user_ns(),
+    )
 }
 
 /// Computes Linux `vfs_prepare_mode()` plus `inode_init_owner()` attributes
@@ -1390,6 +1550,38 @@ pub(crate) fn initial_named_create_owner_mode(
     requested_mode: NodePermission,
     umask: u32,
 ) -> (NodePermission, (u32, u32)) {
+    initial_named_create_owner_mode_with(
+        parent,
+        KernelDacCredentials::snapshot(credentials),
+        node_type,
+        requested_mode,
+        umask,
+    )
+}
+
+pub(crate) fn initial_named_create_owner_mode_with_security(
+    parent: &Metadata,
+    security: &VfsSecurityContext,
+    node_type: NodeType,
+    requested_mode: NodePermission,
+    umask: u32,
+) -> (NodePermission, (u32, u32)) {
+    initial_named_create_owner_mode_with(
+        parent,
+        KernelDacCredentials::actor_bound(security.actor(), security.credentials()),
+        node_type,
+        requested_mode,
+        umask,
+    )
+}
+
+fn initial_named_create_owner_mode_with(
+    parent: &Metadata,
+    credentials: KernelDacCredentials<'_>,
+    node_type: NodeType,
+    requested_mode: NodePermission,
+    umask: u32,
+) -> (NodePermission, (u32, u32)) {
     let attributes = linux_initial_create_attributes(
         &linux_node_metadata(
             parent.mode.bits() as u32,
@@ -1400,7 +1592,7 @@ pub(crate) fn initial_named_create_owner_mode(
         linux_node_kind(node_type),
         requested_mode.bits(),
         umask as u16,
-        &KernelDacCredentials(credentials),
+        &credentials,
     );
     (
         NodePermission::from_bits_truncate(attributes.mode),
@@ -1411,7 +1603,7 @@ pub(crate) fn initial_named_create_owner_mode(
 fn check_sticky_delete_permissions_with_metadata(
     dir_stat: &Metadata,
     target_stat: &Metadata,
-    credentials: &DacCredentialView,
+    security: &VfsSecurityContext,
 ) -> AxResult {
     check_linux_sticky_mutation(
         &linux_node_metadata(
@@ -1426,7 +1618,7 @@ fn check_sticky_delete_permissions_with_metadata(
             target_stat.gid,
             target_stat.node_type,
         ),
-        &KernelDacCredentials(credentials),
+        &KernelDacCredentials::actor_bound(security.actor(), security.credentials()),
     )
     .map_err(map_dac_error)
 }
@@ -1452,11 +1644,7 @@ pub(crate) fn check_remove_permissions_with_security(
         security.credentials(),
         security.filesystem_owner_user_ns(),
     )?;
-    check_sticky_delete_permissions_with_metadata(
-        dir_metadata,
-        target_metadata,
-        security.credentials(),
-    )
+    check_sticky_delete_permissions_with_metadata(dir_metadata, target_metadata, security)
 }
 
 /// Applies the old and new parent portions of Linux `vfs_rename()` admission
@@ -1552,6 +1740,7 @@ mod tests {
     use thekernel_linux_cred::{FsCredentialSnapshot, GroupInfo, Kgid, Kuid};
 
     use super::*;
+    use crate::task::{Cred, UserNamespace};
 
     fn credentials(uid: u32, gid: u32, groups: &[u32], capabilities: &[u32]) -> DacCredentialView {
         let mut effective = [0; 2];
@@ -1698,6 +1887,25 @@ mod tests {
             X_OK,
             &credentials,
         ));
+    }
+
+    #[test]
+    fn synthetic_dac_projection_is_not_rebound_to_live_actor_effective_state() {
+        let root_namespace = UserNamespace::try_new_root().unwrap();
+        let root = Cred::try_root(root_namespace.clone()).unwrap();
+        let child_namespace = root_namespace
+            .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
+            .unwrap();
+        let child = Cred::try_with_user_namespace(&root, child_namespace).unwrap();
+        let synthetic = credentials(0, 0, &[], &[CAP_DAC_OVERRIDE]);
+
+        assert!(
+            KernelDacCredentials::snapshot(&synthetic).has_capability(&(), DacCapability::Override)
+        );
+        assert!(
+            !KernelDacCredentials::actor_bound(&child, &synthetic)
+                .has_capability(&(), DacCapability::Override)
+        );
     }
 
     #[test]

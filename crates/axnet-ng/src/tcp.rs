@@ -61,6 +61,58 @@ pub struct TcpSocket {
     poll_rx_closed: PollSet,
 }
 
+/// Exact connected TCP handle retained outside the listen queue until an
+/// accept caller either commits it or restores it to the same listener
+/// generation.
+pub struct TcpAcceptReservation {
+    stack: Arc<NetStack>,
+    port: u16,
+    generation: u64,
+    handle: Option<SocketHandle>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TcpAcceptIdentity(SocketHandle);
+
+impl TcpAcceptReservation {
+    pub fn identity(&self) -> TcpAcceptIdentity {
+        TcpAcceptIdentity(*self.handle.as_ref().expect("active TCP accept reservation"))
+    }
+
+    pub fn commit(mut self) -> AxResult<Socket> {
+        let handle = self.handle.take().expect("active TCP accept reservation");
+        if !self
+            .stack
+            .listen_table
+            .commit_accept(self.port, self.generation)
+        {
+            self.stack.socket_set.remove(handle);
+            self.stack.poll_interfaces();
+            return Err(AxError::InvalidInput);
+        }
+        Ok(Socket::Tcp(TcpSocket::new_connected(
+            self.stack.clone(),
+            handle,
+        )))
+    }
+}
+
+impl Drop for TcpAcceptReservation {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        if !self
+            .stack
+            .listen_table
+            .restore_accept(self.port, self.generation, handle)
+        {
+            self.stack.socket_set.remove(handle);
+        }
+        self.stack.poll_interfaces();
+    }
+}
+
 // SAFETY: All access to the underlying smoltcp socket goes through
 // `SocketSetWrapper`'s mutex, so shared references to `TcpSocket` do not allow
 // concurrent unsynchronized access to the socket state.
@@ -112,6 +164,29 @@ impl TcpSocket {
         let device_mask = result.stack.get_service().device_mask_for(&bound_endpoint);
         result.general.set_device_mask(device_mask);
         result
+    }
+
+    /// Retains one exact connected SYN-queue entry without publishing a new
+    /// socket or releasing the listener's bounded queue capacity.
+    pub fn prepare_accept(&self) -> AxResult<TcpAcceptReservation> {
+        if !self.is_listening() {
+            ax_bail!(InvalidInput, "not listening");
+        }
+
+        let port = self.bound_endpoint()?.port;
+        self.general.recv_poller(self, || {
+            self.stack.poll_interfaces();
+            let (handle, generation) = self
+                .stack
+                .listen_table
+                .reserve_accept(port, &self.stack.socket_set)?;
+            Ok(TcpAcceptReservation {
+                stack: self.stack.clone(),
+                port,
+                generation,
+                handle: Some(handle),
+            })
+        })
     }
 }
 
@@ -525,28 +600,16 @@ impl SocketOps for TcpSocket {
     }
 
     fn accept(&self) -> AxResult<Socket> {
-        if !self.is_listening() {
-            ax_bail!(InvalidInput, "not listening");
+        let accepted = self.prepare_accept()?.commit()?;
+        if let Socket::Tcp(socket) = &accepted {
+            debug!(
+                "accepted connection from {}",
+                socket
+                    .with_smol_socket(|socket| socket.remote_endpoint())
+                    .map_or_else(|| "unknown".into(), |remote| remote.to_string())
+            );
         }
-
-        let bound_port = self.bound_endpoint()?.port;
-        self.general.recv_poller(self, || {
-            self.stack.poll_interfaces();
-            self.stack
-                .listen_table
-                .accept(bound_port, &self.stack.socket_set)
-                .map(|handle| {
-                    let socket = TcpSocket::new_connected(self.stack.clone(), handle);
-                    debug!(
-                        "accepted connection from {}, {}",
-                        handle,
-                        socket
-                            .with_smol_socket(|socket| socket.remote_endpoint())
-                            .map_or_else(|| "unknown".into(), |remote| remote.to_string())
-                    );
-                    Socket::Tcp(socket)
-                })
-        })
+        Ok(accepted)
     }
 
     fn send(&self, mut src: impl Read, options: SendOptions) -> AxResult<usize> {

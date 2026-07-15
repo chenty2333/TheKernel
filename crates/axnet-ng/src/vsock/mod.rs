@@ -91,6 +91,24 @@ pub struct VsockSocket {
     transport: VsockTransport,
 }
 
+/// Prepared accept on a vsock socket.
+pub struct VsockSocketAcceptReservation {
+    inner: stream::VsockAcceptReservation,
+}
+
+impl VsockSocketAcceptReservation {
+    pub fn connection_identity(&self) -> VsockConnId {
+        self.inner.connection_identity()
+    }
+
+    pub fn commit(self) -> AxResult<Socket> {
+        self.inner.commit().map(|(transport, _)| {
+            let socket = VsockSocket::new(transport);
+            Socket::Vsock(socket)
+        })
+    }
+}
+
 impl VsockSocket {
     /// Create a new vsock socket with the given transport.
     pub fn new(transport: impl Into<VsockTransport>) -> Self {
@@ -101,6 +119,13 @@ impl VsockSocket {
 
     pub fn set_filter(&self, _filter: Option<Arc<dyn crate::SocketFilter>>) -> AxResult<()> {
         Err(AxError::Unsupported)
+    }
+
+    pub fn prepare_accept(&self) -> AxResult<VsockSocketAcceptReservation> {
+        let inner = match &self.transport {
+            VsockTransport::Stream(stream) => stream.prepare_accept()?,
+        };
+        Ok(VsockSocketAcceptReservation { inner })
     }
 
     pub(crate) fn set_pending_error(&self, error: LinuxError) {

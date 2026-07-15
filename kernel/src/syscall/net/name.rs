@@ -3,10 +3,11 @@ use axnet::SocketOps;
 use linux_raw_sys::net::{sockaddr, socklen_t};
 use starry_vm::{VmMutPtr, VmPtr};
 
-use super::addr::SocketAddrExt;
+use super::{SocketSyscallSnapshot, addr::SocketAddrExt, import_socket_output_after_policy};
 use crate::{
     file::{PinnedSocketDescription, SocketBackendKind},
     mm::UserPtr,
+    task::security::{SocketSecurityContext, dispatch_socket},
 };
 
 fn read_socklen(addrlen: UserPtr<socklen_t>) -> AxResult<socklen_t> {
@@ -28,8 +29,18 @@ pub fn sys_getsockname(
     addr: UserPtr<sockaddr>,
     addrlen: UserPtr<socklen_t>,
 ) -> AxResult<isize> {
-    let mut length = read_socklen(addrlen)?;
+    let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
+    let socket_ref = pinned.security_ref()?;
+    let mut length = import_socket_output_after_policy(
+        || {
+            dispatch_socket(&SocketSecurityContext::get_sock_name(
+                snapshot.actor(),
+                &socket_ref,
+            ))
+        },
+        || read_socklen(addrlen),
+    )?;
     if pinned.backend()? == SocketBackendKind::Netlink {
         pinned.netlink()?.write_local_addr(addr, &mut length)?;
         write_socklen(addrlen, length)?;
@@ -50,8 +61,18 @@ pub fn sys_getpeername(
     addr: UserPtr<sockaddr>,
     addrlen: UserPtr<socklen_t>,
 ) -> AxResult<isize> {
-    let mut length = read_socklen(addrlen)?;
+    let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
+    let socket_ref = pinned.security_ref()?;
+    let mut length = import_socket_output_after_policy(
+        || {
+            dispatch_socket(&SocketSecurityContext::get_peer_name(
+                snapshot.actor(),
+                &socket_ref,
+            ))
+        },
+        || read_socklen(addrlen),
+    )?;
     let socket = pinned.network()?;
     let peer_addr = socket.peer_addr()?;
     debug!("sys_getpeername <= fd: {fd}, addr: {peer_addr:?}");

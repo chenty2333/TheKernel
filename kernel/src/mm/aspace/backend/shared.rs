@@ -3,11 +3,11 @@ use alloc::{sync::Arc, vec::Vec};
 use axerrno::{AxError, AxResult};
 use axhal::paging::{MappingFlags, PageSize, PageTableCursor, PagingError};
 use axsync::Mutex;
-use memory_addr::{MemoryAddr, PhysAddr, VirtAddr, VirtAddrRange};
+use memory_addr::{PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, PopulateCallback, alloc_frame, dealloc_frame, divide_page,
-    page_table_flags, pages_in,
+    AddrSpace, Backend, BackendOps, MappingStatus, PopulateCallback, alloc_frame, dealloc_frame,
+    divide_page, page_table_flags, pages_in,
 };
 
 pub struct SharedPages {
@@ -175,18 +175,36 @@ impl Drop for SharedPages {
 #[derive(Clone)]
 pub struct SharedBackend {
     start: VirtAddr,
+    page_offset: usize,
     pages: Arc<SharedPages>,
     may_protect: MappingFlags,
     map_id: Arc<()>,
+    status: MappingStatus,
 }
 impl SharedBackend {
+    pub(super) const fn mapping_status(&self) -> &MappingStatus {
+        &self.status
+    }
+
+    pub(super) fn mapping_status_mut(&mut self) -> &mut MappingStatus {
+        &mut self.status
+    }
+
     pub fn pages(&self) -> &Arc<SharedPages> {
         &self.pages
+    }
+
+    pub(crate) fn backing_offset(&self, address: usize) -> Option<usize> {
+        let relative = address.checked_sub(self.start.as_usize())?;
+        self.page_offset
+            .checked_mul(self.pages.size as usize)?
+            .checked_add(relative)
     }
 
     pub(crate) fn compatible_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.map_id, &other.map_id)
             && self.start == other.start
+            && self.page_offset == other.page_offset
             && Arc::ptr_eq(&self.pages, &other.pages)
     }
 
@@ -195,21 +213,37 @@ impl SharedBackend {
         old_start: VirtAddr,
         new_start: VirtAddr,
         map_id: Arc<()>,
-    ) -> Self {
-        let delta = old_start.sub_addr(self.start);
-        Self {
-            start: new_start.sub(delta),
+    ) -> AxResult<Self> {
+        let (start, backing_advance) =
+            super::relocate_affine_origin(self.start, old_start, new_start)?;
+        let backing_pages = divide_page(backing_advance, self.pages.size)?;
+        let page_offset = self
+            .page_offset
+            .checked_add(backing_pages)
+            .ok_or(AxError::InvalidInput)?;
+        Ok(Self {
+            start,
+            page_offset,
             pages: self.pages.clone(),
             may_protect: self.may_protect,
             map_id,
-        }
+            status: self.status.relocated(old_start, new_start)?,
+        })
     }
 
-    pub(crate) fn clone_for_range(&self, old_start: VirtAddr, new_start: VirtAddr) -> Self {
+    pub(crate) fn clone_for_range(
+        &self,
+        old_start: VirtAddr,
+        new_start: VirtAddr,
+    ) -> AxResult<Self> {
         self.clone_for_range_with_id(old_start, new_start, self.map_id.clone())
     }
 
-    pub(crate) fn duplicate_mapping(&self, old_start: VirtAddr, new_start: VirtAddr) -> Self {
+    pub(crate) fn duplicate_mapping(
+        &self,
+        old_start: VirtAddr,
+        new_start: VirtAddr,
+    ) -> AxResult<Self> {
         self.clone_for_range_with_id(old_start, new_start, Arc::new(()))
     }
 
@@ -218,7 +252,10 @@ impl SharedBackend {
             .as_usize()
             .checked_sub(self.start.as_usize())
             .ok_or(AxError::InvalidInput)?;
-        let start_index = divide_page(offset, self.pages.size)?;
+        let start_index = self
+            .page_offset
+            .checked_add(divide_page(offset, self.pages.size)?)
+            .ok_or(AxError::InvalidInput)?;
         let count = divide_page(size, self.pages.size)?;
         self.pages.ensure_len(
             start_index
@@ -285,7 +322,10 @@ impl BackendOps for SharedBackend {
             .as_usize()
             .checked_sub(self.start.as_usize())
             .ok_or(AxError::InvalidInput)?;
-        let start_index = divide_page(offset, self.pages.size)?;
+        let start_index = self
+            .page_offset
+            .checked_add(divide_page(offset, self.pages.size)?)
+            .ok_or(AxError::InvalidInput)?;
         let count = divide_page(range.size(), self.pages.size)?;
         let pages = self.pages.pages_range(start_index, count)?;
         let mut populated = 0;
@@ -345,9 +385,11 @@ impl Backend {
         let map_id = Arc::try_new(()).map_err(|_| AxError::NoMemory)?;
         Ok(Self::Shared(SharedBackend {
             start,
+            page_offset: 0,
             pages,
             may_protect: may_protect & access_flags(),
             map_id,
+            status: MappingStatus::default(),
         }))
     }
 
@@ -358,13 +400,56 @@ impl Backend {
     ) -> Self {
         Self::Shared(SharedBackend {
             start,
+            page_offset: 0,
             pages,
             may_protect: may_protect & access_flags(),
             map_id: Arc::new(()),
+            status: MappingStatus::default(),
         })
     }
 }
 
 fn access_flags() -> MappingFlags {
     MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn low_address_shared_suffix_preserves_page_and_futex_cursors() {
+        let origin = VirtAddr::from(0x4000);
+        let source = VirtAddr::from(0x8000);
+        let destination = VirtAddr::from(0x1000);
+        let pages = Arc::new(SharedPages::new(0, PageSize::Size4K).unwrap());
+        let map_id = Arc::new(());
+        let backend = SharedBackend {
+            start: origin,
+            page_offset: 0,
+            pages: pages.clone(),
+            may_protect: access_flags(),
+            map_id: map_id.clone(),
+            status: MappingStatus::default(),
+        };
+        // Keep one zero-page owner alive: dropping the final kernel mutex has
+        // no current task in host tests.
+        core::mem::forget(pages);
+
+        let first = backend
+            .clone_for_range_with_id(source, destination, map_id.clone())
+            .unwrap();
+        let second_fragment = backend
+            .clone_for_range_with_id(source, destination, map_id)
+            .unwrap();
+
+        assert_eq!(first.start, destination);
+        assert_eq!(first.page_offset, 4);
+        assert_eq!(first.backing_offset(destination.as_usize()), Some(0x4000));
+        assert_eq!(
+            first.backing_offset((destination + 0x1000).as_usize()),
+            Some(0x5000)
+        );
+        assert!(first.compatible_with(&second_fragment));
+    }
 }
