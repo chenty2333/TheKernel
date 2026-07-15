@@ -1265,18 +1265,26 @@ pub(crate) fn notify_dnotify_rename(old_parent: &Location, new_parent: &Location
 
 pub(crate) fn notify_read(fd: i32) {
     if let Ok(file) = File::from_fd(fd) {
-        let loc = file.inner().location().clone();
-        let _ = notify_exact(&loc, IN_ACCESS);
-        let _ = notify_parent(&loc, IN_ACCESS);
+        notify_read_file(file.as_ref());
     }
 }
 
 pub(crate) fn notify_write(fd: i32) {
     if let Ok(file) = File::from_fd(fd) {
-        let loc = file.inner().location().clone();
-        let _ = notify_exact(&loc, IN_MODIFY);
-        let _ = notify_parent(&loc, IN_MODIFY);
+        notify_write_file(file.as_ref());
     }
+}
+
+pub(crate) fn notify_read_file(file: &File) {
+    let loc = file.inner().location().clone();
+    let _ = notify_exact(&loc, IN_ACCESS);
+    let _ = notify_parent(&loc, IN_ACCESS);
+}
+
+pub(crate) fn notify_write_file(file: &File) {
+    let loc = file.inner().location().clone();
+    let _ = notify_exact(&loc, IN_MODIFY);
+    let _ = notify_parent(&loc, IN_MODIFY);
 }
 
 pub(crate) fn location_for_fd(fd: i32) -> Option<Location> {

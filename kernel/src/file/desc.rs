@@ -977,6 +977,18 @@ impl FileDescription {
         self.vfs_open_credential.clone()
     }
 
+    /// Pins this exact open file description and erases only its inner type.
+    ///
+    /// Long-lived kernel operations use this after descriptor lookup or fixed
+    /// resource registration. Re-looking up the numeric fd could observe a
+    /// concurrent close-and-reuse and silently switch open-file descriptions.
+    pub(crate) fn file_handle(self: &Arc<Self>) -> FileHandle<dyn FileLike> {
+        FileHandle {
+            description: self.clone(),
+            file: self.inner.clone(),
+        }
+    }
+
     /// Samples authoritative mutable OFD status under the short transition
     /// lock. The returned value is independent of backend mirrors and remains
     /// stable for the caller's complete operation.
@@ -1410,10 +1422,7 @@ impl<T: FileLike + 'static> FileHandle<T> {
 impl FileHandle<dyn FileLike> {
     #[cfg(test)]
     pub(crate) fn from_description_for_test(description: Arc<FileDescription>) -> Self {
-        Self {
-            file: description.inner.clone(),
-            description,
-        }
+        description.file_handle()
     }
 
     /// Downcasts the inner object without repeating fd-table lookup; the

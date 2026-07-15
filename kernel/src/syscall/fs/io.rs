@@ -1,4 +1,4 @@
-use alloc::{vec, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -17,10 +17,13 @@ use syscalls::Sysno;
 
 use crate::{
     file::{
-        Directory, File, FileHandle, FileLike, FileLikeKind, IoDst, IoSrc, OfdIoStatus, PidFd,
-        Pipe, Socket, allowed_write_len, check_resize_limit, executable, flock, get_file_like,
-        get_typed_file, inode_flags,
-        inotify::{notify_exact, notify_parent, notify_read, notify_write},
+        Directory, File, FileDescription, FileHandle, FileLike, FileLikeKind, IoDst, IoSrc,
+        OfdIoStatus, PidFd, Pipe, Socket, allowed_write_len, check_resize_limit, executable, flock,
+        get_file_like, get_typed_file, inode_flags,
+        inotify::{
+            notify_exact, notify_parent, notify_read, notify_read_file, notify_write,
+            notify_write_file,
+        },
         lease, memfd,
         permission::{
             SecurityFsContextExt, VfsSecurityContext, check_open_permissions_with_security,
@@ -1402,8 +1405,10 @@ pub fn sys_readahead(fd: c_int, offset: __kernel_off_t, count: usize) -> AxResul
     }
 }
 
-fn positioned_file(fd: c_int, access: FileFlags) -> AxResult<FileHandle<File>> {
-    let file_like = get_file_like(fd)?;
+fn positioned_file_handle(
+    file_like: FileHandle<dyn FileLike>,
+    access: FileFlags,
+) -> AxResult<FileHandle<File>> {
     match FileLikeKind::from_file_like(file_like.as_ref()) {
         FileLikeKind::Directory => return Err(AxError::IsADirectory),
         FileLikeKind::Fifo | FileLikeKind::Socket => return Err(AxError::from(LinuxError::ESPIPE)),
@@ -1415,6 +1420,10 @@ fn positioned_file(fd: c_int, access: FileFlags) -> AxResult<FileHandle<File>> {
     let file = file_like.downcast::<File>()?;
     file.inner().access(access)?;
     Ok(file)
+}
+
+fn positioned_file(fd: c_int, access: FileFlags) -> AxResult<FileHandle<File>> {
+    positioned_file_handle(get_file_like(fd)?, access)
 }
 
 fn write_file(fd: c_int) -> AxResult<FileHandle<File>> {
@@ -1446,8 +1455,24 @@ fn positioned_read_file(fd: c_int) -> AxResult<FileHandle<File>> {
     Ok(file)
 }
 
+fn positioned_read_file_handle(file_like: FileHandle<dyn FileLike>) -> AxResult<FileHandle<File>> {
+    let file = positioned_file_handle(file_like, FileFlags::READ)?;
+    check_positioned_read_flags(file.inner().location().flags())?;
+    Ok(file)
+}
+
 fn positioned_write_file(fd: c_int) -> AxResult<FileHandle<File>> {
     let file = write_file(fd)?;
+    if !file.inner().supports_positioned_write() {
+        return Err(LinuxError::ESPIPE.into());
+    }
+    Ok(file)
+}
+
+fn positioned_write_file_handle(file_like: FileHandle<dyn FileLike>) -> AxResult<FileHandle<File>> {
+    let file = positioned_file_handle(file_like, FileFlags::WRITE)?;
+    check_writable_mount(file.inner().location())?;
+    executable::check_not_active(file.inner().location())?;
     if !file.inner().supports_positioned_write() {
         return Err(LinuxError::ESPIPE.into());
     }
@@ -2321,31 +2346,47 @@ pub fn sys_pread64(fd: c_int, buf: *mut u8, len: usize, offset: __kernel_off_t) 
         return Err(AxError::InvalidInput);
     }
     let f = positioned_read_file(fd)?;
-    validate_direct_io(f.as_ref(), buf as usize, len, offset as u64)?;
+    pread64_file(&f, buf, len, offset as u64)
+}
+
+fn pread64_file(f: &FileHandle<File>, buf: *mut u8, len: usize, offset: u64) -> AxResult<isize> {
+    validate_direct_io(f.as_ref(), buf as usize, len, offset)?;
     if len != 0 {
-        crate::file::fanotify::permission_check_fd(fd, crate::file::fanotify::FAN_ACCESS_PERM)?;
+        crate::file::fanotify::permission_check_file_like(
+            &f.clone().into_file_like(),
+            crate::file::fanotify::FAN_ACCESS_PERM,
+        )?;
     }
     f.with_read_credentials(|| {
-        let fast_read =
-            match try_regular_file_pread_user_slice(f.as_ref(), buf, len, offset as u64)? {
-                Some(read) => Some(read),
-                None => try_regular_file_pread_user_segments(f.as_ref(), buf, len, offset as u64)?,
-            };
+        let fast_read = match try_regular_file_pread_user_slice(f.as_ref(), buf, len, offset)? {
+            Some(read) => Some(read),
+            None => try_regular_file_pread_user_segments(f.as_ref(), buf, len, offset)?,
+        };
         if let Some(read) = fast_read {
             if read > 0 {
-                notify_read(fd);
+                notify_read_file(f.as_ref());
             }
             return Ok(read as _);
         }
         if len >= USER_COPY_PREFAULT_MIN {
-            prefault_regular_file_read_fallback(f.as_ref(), buf, len, offset as u64)?;
+            prefault_regular_file_read_fallback(f.as_ref(), buf, len, offset)?;
         }
         let read = f.inner().read_at(VmBytesMut::new(buf, len), offset as _)?;
         if read > 0 {
-            notify_read(fd);
+            notify_read_file(f.as_ref());
         }
         Ok(read as _)
     })
+}
+
+pub(crate) fn io_uring_pread64(
+    description: &Arc<FileDescription>,
+    buf: *mut u8,
+    len: usize,
+    offset: u64,
+) -> AxResult<isize> {
+    let file = positioned_read_file_handle(description.file_handle())?;
+    pread64_file(&file, buf, len, offset)
 }
 
 pub fn sys_pwrite64(
@@ -2361,6 +2402,10 @@ pub fn sys_pwrite64(
     // for a zero-length request. Proc id-map controls return ESPIPE here
     // rather than a silent zero-byte success.
     let f = positioned_write_file(fd)?;
+    pwrite64_file(&f, buf, len, offset as u64)
+}
+
+fn pwrite64_file(f: &FileHandle<File>, buf: *const u8, len: usize, offset: u64) -> AxResult<isize> {
     if len == 0 {
         return Ok(0);
     }
@@ -2376,14 +2421,14 @@ pub fn sys_pwrite64(
                 },
             )
         } else {
-            let allowed = allowed_write_len(offset as u64, len)?;
+            let allowed = allowed_write_len(offset, len)?;
             let fast_written = match try_regular_file_pwrite_user_slice(
                 f.as_ref(),
                 status,
                 &security,
                 buf,
                 len,
-                offset as u64,
+                offset,
             )? {
                 Some(written) => Some(written),
                 None => try_regular_file_pwrite_user_segments(
@@ -2392,7 +2437,7 @@ pub fn sys_pwrite64(
                     &security,
                     buf,
                     len,
-                    offset as u64,
+                    offset,
                 )?,
             };
             if let Some(written) = fast_written {
@@ -2414,10 +2459,20 @@ pub fn sys_pwrite64(
         Ok((written, status))
     })?;
     if write > 0 {
-        sync_file_after_status_write(status, &f)?;
-        notify_write(fd);
+        sync_file_after_status_write(status, f)?;
+        notify_write_file(f.as_ref());
     }
     Ok(write as _)
+}
+
+pub(crate) fn io_uring_pwrite64(
+    description: &Arc<FileDescription>,
+    buf: *const u8,
+    len: usize,
+    offset: u64,
+) -> AxResult<isize> {
+    let file = positioned_write_file_handle(description.file_handle())?;
+    pwrite64_file(&file, buf, len, offset)
 }
 
 pub fn sys_preadv(
