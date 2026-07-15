@@ -1,4 +1,6 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
+#[cfg(feature = "test-io-control")]
+use core::time::Duration;
 use core::{
     alloc::Layout,
     cmp::min,
@@ -8,7 +10,6 @@ use core::{
     ptr::{self, NonNull},
     slice, str,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    time::Duration,
 };
 
 use axerrno::{AxError, AxResult};
@@ -20,7 +21,9 @@ use axhal::{
 };
 use axio::prelude::*;
 use axsync::Mutex;
-use axtask::{current, current_may_uninit, sleep};
+#[cfg(feature = "test-io-control")]
+use axtask::sleep;
+use axtask::{current, current_may_uninit};
 use extern_trait::extern_trait;
 use kernel_guard::IrqSave;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
@@ -70,16 +73,6 @@ static USER_IO_PIN_DIRECT_WRITE_HITS: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PIN_DIRECT_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PIN_DIRECT_WRITE_SEGMENTS: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PIN_DIRECT_WRITE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-static USER_IO_ASYNC_DIRECT_ENABLED: AtomicBool = AtomicBool::new(false);
-static USER_IO_PIN_ASYNC_DIRECT_READ_HITS: AtomicU64 = AtomicU64::new(0);
-static USER_IO_PIN_ASYNC_DIRECT_READ_BYTES: AtomicU64 = AtomicU64::new(0);
-static USER_IO_PIN_ASYNC_DIRECT_READ_SEGMENTS: AtomicU64 = AtomicU64::new(0);
-static USER_IO_PIN_ASYNC_DIRECT_WRITE_HITS: AtomicU64 = AtomicU64::new(0);
-static USER_IO_PIN_ASYNC_DIRECT_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
-static USER_IO_PIN_ASYNC_DIRECT_WRITE_SEGMENTS: AtomicU64 = AtomicU64::new(0);
-static USER_IO_PIN_ASYNC_SUBMIT_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-static USER_IO_PIN_ASYNC_SIGNAL_AFTER_SUBMIT: AtomicU64 = AtomicU64::new(0);
-static USER_IO_PIN_ASYNC_RESOURCE_UNPINS: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PREFAULT_TO_USER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PREFAULT_TO_USER_HITS: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PREFAULT_TO_USER_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -107,9 +100,11 @@ static USER_IO_PIN_VM_RANGE_PIN_BYTES: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PIN_VM_RANGE_PIN_REJECTS: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PIN_VM_RANGE_PIN_UNPINS: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PIN_UNPINS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "test-io-control")]
 static USER_IO_PIN_TEST_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
 const MAX_USER_IO_PIN_SEGMENTS: usize = 32;
+#[cfg(feature = "test-io-control")]
 pub const USER_IO_PIN_TEST_DELAY_MS_MAX: u64 = 1_000;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -145,16 +140,6 @@ pub struct UserIoPinCounters {
     pub direct_write_bytes: u64,
     pub direct_write_segments: u64,
     pub direct_write_fallbacks: u64,
-    pub async_direct_enabled: u64,
-    pub async_direct_read_hits: u64,
-    pub async_direct_read_bytes: u64,
-    pub async_direct_read_segments: u64,
-    pub async_direct_write_hits: u64,
-    pub async_direct_write_bytes: u64,
-    pub async_direct_write_segments: u64,
-    pub async_submit_fallbacks: u64,
-    pub async_signal_after_submit: u64,
-    pub async_resource_unpins: u64,
     pub prefault_to_user_attempts: u64,
     pub prefault_to_user_hits: u64,
     pub prefault_to_user_bytes: u64,
@@ -182,7 +167,6 @@ pub struct UserIoPinCounters {
     pub vm_range_pin_rejects: u64,
     pub vm_range_pin_unpins: u64,
     pub unpins: u64,
-    pub test_delay_ms: u64,
 }
 
 pub fn set_user_io_pin_counters_enabled(enabled: bool) {
@@ -222,15 +206,6 @@ pub fn reset_user_io_pin_counters() {
         &USER_IO_PIN_DIRECT_WRITE_BYTES,
         &USER_IO_PIN_DIRECT_WRITE_SEGMENTS,
         &USER_IO_PIN_DIRECT_WRITE_FALLBACKS,
-        &USER_IO_PIN_ASYNC_DIRECT_READ_HITS,
-        &USER_IO_PIN_ASYNC_DIRECT_READ_BYTES,
-        &USER_IO_PIN_ASYNC_DIRECT_READ_SEGMENTS,
-        &USER_IO_PIN_ASYNC_DIRECT_WRITE_HITS,
-        &USER_IO_PIN_ASYNC_DIRECT_WRITE_BYTES,
-        &USER_IO_PIN_ASYNC_DIRECT_WRITE_SEGMENTS,
-        &USER_IO_PIN_ASYNC_SUBMIT_FALLBACKS,
-        &USER_IO_PIN_ASYNC_SIGNAL_AFTER_SUBMIT,
-        &USER_IO_PIN_ASYNC_RESOURCE_UNPINS,
         &USER_IO_PREFAULT_TO_USER_ATTEMPTS,
         &USER_IO_PREFAULT_TO_USER_HITS,
         &USER_IO_PREFAULT_TO_USER_BYTES,
@@ -263,15 +238,7 @@ pub fn reset_user_io_pin_counters() {
     }
 }
 
-pub fn set_user_io_async_direct_enabled(enabled: bool) {
-    USER_IO_ASYNC_DIRECT_ENABLED.store(enabled, Ordering::Relaxed);
-}
-
-#[inline(always)]
-pub fn user_io_async_direct_enabled() -> bool {
-    USER_IO_ASYNC_DIRECT_ENABLED.load(Ordering::Relaxed)
-}
-
+#[cfg(feature = "test-io-control")]
 pub fn set_user_io_pin_test_delay_ms(delay_ms: u64) -> AxResult {
     if delay_ms > USER_IO_PIN_TEST_DELAY_MS_MAX {
         return Err(AxError::InvalidInput);
@@ -280,6 +247,7 @@ pub fn set_user_io_pin_test_delay_ms(delay_ms: u64) -> AxResult {
     Ok(())
 }
 
+#[cfg(feature = "test-io-control")]
 fn user_io_pin_test_delay_ms() -> u64 {
     USER_IO_PIN_TEST_DELAY_MS.load(Ordering::Relaxed)
 }
@@ -317,17 +285,6 @@ pub fn user_io_pin_counters_snapshot() -> UserIoPinCounters {
         direct_write_bytes: USER_IO_PIN_DIRECT_WRITE_BYTES.load(Ordering::Relaxed),
         direct_write_segments: USER_IO_PIN_DIRECT_WRITE_SEGMENTS.load(Ordering::Relaxed),
         direct_write_fallbacks: USER_IO_PIN_DIRECT_WRITE_FALLBACKS.load(Ordering::Relaxed),
-        async_direct_enabled: user_io_async_direct_enabled() as u64,
-        async_direct_read_hits: USER_IO_PIN_ASYNC_DIRECT_READ_HITS.load(Ordering::Relaxed),
-        async_direct_read_bytes: USER_IO_PIN_ASYNC_DIRECT_READ_BYTES.load(Ordering::Relaxed),
-        async_direct_read_segments: USER_IO_PIN_ASYNC_DIRECT_READ_SEGMENTS.load(Ordering::Relaxed),
-        async_direct_write_hits: USER_IO_PIN_ASYNC_DIRECT_WRITE_HITS.load(Ordering::Relaxed),
-        async_direct_write_bytes: USER_IO_PIN_ASYNC_DIRECT_WRITE_BYTES.load(Ordering::Relaxed),
-        async_direct_write_segments: USER_IO_PIN_ASYNC_DIRECT_WRITE_SEGMENTS
-            .load(Ordering::Relaxed),
-        async_submit_fallbacks: USER_IO_PIN_ASYNC_SUBMIT_FALLBACKS.load(Ordering::Relaxed),
-        async_signal_after_submit: USER_IO_PIN_ASYNC_SIGNAL_AFTER_SUBMIT.load(Ordering::Relaxed),
-        async_resource_unpins: USER_IO_PIN_ASYNC_RESOURCE_UNPINS.load(Ordering::Relaxed),
         prefault_to_user_attempts: USER_IO_PREFAULT_TO_USER_ATTEMPTS.load(Ordering::Relaxed),
         prefault_to_user_hits: USER_IO_PREFAULT_TO_USER_HITS.load(Ordering::Relaxed),
         prefault_to_user_bytes: USER_IO_PREFAULT_TO_USER_BYTES.load(Ordering::Relaxed),
@@ -355,7 +312,6 @@ pub fn user_io_pin_counters_snapshot() -> UserIoPinCounters {
         vm_range_pin_rejects: USER_IO_PIN_VM_RANGE_PIN_REJECTS.load(Ordering::Relaxed),
         vm_range_pin_unpins: USER_IO_PIN_VM_RANGE_PIN_UNPINS.load(Ordering::Relaxed),
         unpins: USER_IO_PIN_UNPINS.load(Ordering::Relaxed),
-        test_delay_ms: user_io_pin_test_delay_ms(),
     }
 }
 
@@ -399,41 +355,6 @@ pub fn record_user_io_direct_write(bytes: usize, segments: usize) {
 #[inline(always)]
 pub fn record_user_io_direct_write_fallback() {
     record_user_io_pin_counter(&USER_IO_PIN_DIRECT_WRITE_FALLBACKS, 1);
-}
-
-#[inline(always)]
-pub fn record_user_io_async_direct_read(bytes: usize, segments: usize) {
-    if bytes == 0 {
-        return;
-    }
-    record_user_io_pin_counter(&USER_IO_PIN_ASYNC_DIRECT_READ_HITS, 1);
-    record_user_io_pin_counter(&USER_IO_PIN_ASYNC_DIRECT_READ_BYTES, bytes as u64);
-    record_user_io_pin_counter(&USER_IO_PIN_ASYNC_DIRECT_READ_SEGMENTS, segments as u64);
-}
-
-#[inline(always)]
-pub fn record_user_io_async_direct_write(bytes: usize, segments: usize) {
-    if bytes == 0 {
-        return;
-    }
-    record_user_io_pin_counter(&USER_IO_PIN_ASYNC_DIRECT_WRITE_HITS, 1);
-    record_user_io_pin_counter(&USER_IO_PIN_ASYNC_DIRECT_WRITE_BYTES, bytes as u64);
-    record_user_io_pin_counter(&USER_IO_PIN_ASYNC_DIRECT_WRITE_SEGMENTS, segments as u64);
-}
-
-#[inline(always)]
-pub fn record_user_io_async_submit_fallback() {
-    record_user_io_pin_counter(&USER_IO_PIN_ASYNC_SUBMIT_FALLBACKS, 1);
-}
-
-#[inline(always)]
-pub fn record_user_io_async_signal_after_submit() {
-    record_user_io_pin_counter(&USER_IO_PIN_ASYNC_SIGNAL_AFTER_SUBMIT, 1);
-}
-
-#[inline(always)]
-pub fn record_user_io_async_resource_unpins(count: usize) {
-    record_user_io_pin_counter(&USER_IO_PIN_ASYNC_RESOURCE_UNPINS, count as u64);
 }
 
 #[inline(always)]
@@ -1213,11 +1134,14 @@ fn prepare_user_io_pin(
         range_pin,
     };
 
-    let delay_ms = user_io_pin_test_delay_ms();
-    if delay_ms != 0 && user_io_pin_counters_enabled() {
-        if sleep(Duration::from_millis(delay_ms)).is_err() {
-            reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
-            return None;
+    #[cfg(feature = "test-io-control")]
+    {
+        let delay_ms = user_io_pin_test_delay_ms();
+        if delay_ms != 0 && user_io_pin_counters_enabled() {
+            if sleep(Duration::from_millis(delay_ms)).is_err() {
+                reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+                return None;
+            }
         }
     }
 

@@ -13,6 +13,7 @@ from tools.build import (
     hash_params,
     kernel_params,
     KernelRequest,
+    make_kernel_request,
     rootfs_params,
 )
 from tools.project_paths import repo_root
@@ -114,8 +115,42 @@ class BuildKernelParamTests(unittest.TestCase):
             with patch.dict("os.environ", {"SOURCE_DATE_EPOCH": "123456789"}):
                 self.assertEqual(rootfs_params(request)["source_date_epoch"], "123456789")
 
+    def test_io_test_control_is_absent_from_product_kernel_profiles(self) -> None:
+        root = repo_root()
+        for mode in ("release", "shell"):
+            request = make_kernel_request(mode, "rv", root)
+            self.assertNotIn("test-io-control", request.app_features.split())
+
+        test_request = make_kernel_request("io-test-shell", "rv", root)
+        self.assertIn("test-io-control", test_request.app_features.split())
+        self.assertNotEqual(
+            test_request.name, make_kernel_request("shell", "rv", root).name
+        )
+
 
 class ProductBootBoundaryTests(unittest.TestCase):
+    def test_proc_io_stats_is_read_only_and_test_controls_are_feature_gated(self) -> None:
+        root = repo_root()
+        proc_source = (root / "kernel" / "src" / "pseudofs" / "proc.rs").read_text(
+            encoding="utf-8"
+        )
+        io_stats = proc_source.index('"io_stats"')
+        io_test = proc_source.index('"io_test_control"')
+        self.assertIn("new_regular_with_permission", proc_source[io_stats:io_test])
+        self.assertIn("0o444", proc_source[io_stats:io_test])
+        self.assertNotIn("SimpleFileOperation::Write", proc_source[io_stats:io_test])
+        self.assertIn(
+            '#[cfg(feature = "test-io-control")]\n    root.add(',
+            proc_source[io_stats:io_test],
+        )
+
+        control_source = (
+            root / "kernel" / "src" / "pseudofs" / "io_test_control.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("0o600", control_source)
+        self.assertIn("async_block_selftest_rw_scratch", control_source)
+        self.assertNotIn('"user_direct_async=on" =>', control_source)
+
     def test_release_and_shell_kernels_have_distinct_init_processes(self) -> None:
         root = repo_root()
         source = (root / "src" / "main.rs").read_text(encoding="utf-8")
@@ -166,7 +201,7 @@ class ProductBootBoundaryTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, msg=script.name)
                 self.assertIn(error, result.stderr, msg=script.name)
 
-        for name in ("lwext4-async-read-smoke.sh", "user-direct-async-smoke.sh"):
+        for name in ("lwext4-async-read-smoke.sh",):
             script = root / "scripts" / "smoke" / name
             result = subprocess.run(
                 [str(script), "--wait-policy", "invalid"],
@@ -215,7 +250,9 @@ class ProductBootBoundaryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, msg=result.stderr.decode())
             self.assertEqual(
                 result.stdout,
-                b"--kernel\0" + str(fake_repo / ".state/shell/kernel-rv").encode() + b"\0",
+                b"--kernel\0"
+                + str(fake_repo / ".state/io-test-shell/kernel-rv").encode()
+                + b"\0",
             )
             self.assertIn(b"fake make stdout", result.stderr)
             self.assertIn(b"fake make stderr", result.stderr)

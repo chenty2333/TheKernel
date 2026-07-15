@@ -38,13 +38,10 @@ use crate::{
     mm::{
         IoVec, IoVectorBuf, PinnedUserSegments, PinnedUserSegmentsMut, UserConstPtr,
         UserIoPinSegment, VmBytes, VmBytesMut, pinned_user_mut_segments_are_disjoint,
-        prefault_user_io_from_user, prefault_user_io_to_user, record_user_io_async_direct_read,
-        record_user_io_async_direct_write, record_user_io_async_resource_unpins,
-        record_user_io_async_signal_after_submit, record_user_io_async_submit_fallback,
-        record_user_io_direct_read, record_user_io_direct_read_fallback,
-        record_user_io_direct_write, record_user_io_direct_write_fallback,
-        try_pin_user_segments_from_user, try_pin_user_segments_to_user,
-        try_pin_user_slice_from_user, try_pin_user_slice_to_user, user_io_async_direct_enabled,
+        prefault_user_io_from_user, prefault_user_io_to_user, record_user_io_direct_read,
+        record_user_io_direct_read_fallback, record_user_io_direct_write,
+        record_user_io_direct_write_fallback, try_pin_user_segments_from_user,
+        try_pin_user_segments_to_user, try_pin_user_slice_from_user, try_pin_user_slice_to_user,
     },
     mounts,
     pseudofs::tmp,
@@ -77,11 +74,6 @@ const DIRECT_IO_ALIGNMENT: usize = 512;
 const USER_SLICE_FAST_MIN: usize = 4096;
 const USER_IOV_FAST_MAX_SEGMENTS: usize = 64;
 const USER_COPY_PREFAULT_MIN: usize = 16 * 1024;
-const USER_DIRECT_ASYNC_ALIGNMENT: usize = 4096;
-// Pinned user pages remain concurrently accessible and therefore require a
-// kernel-owned bounce before lower I/O. Re-enable async accounting only when
-// axfs reports that the bounce itself used the asynchronous lower path.
-const PINNED_USER_DIRECT_ASYNC_ENABLED: bool = false;
 const TRANSFER_ATTEMPT_LOCK_COUNT: usize = 64;
 
 static TRANSFER_ATTEMPT_LOCKS: Lazy<[Mutex<()>; TRANSFER_ATTEMPT_LOCK_COUNT]> =
@@ -389,44 +381,6 @@ fn prefault_regular_file_write_fallback(file: &File, buf: *const u8, len: usize)
     Ok(())
 }
 
-fn user_direct_async_base_enabled() -> bool {
-    user_io_async_direct_enabled() && axdriver::virtio_async_block_enabled()
-}
-
-fn user_direct_async_candidate(offset: u64, len: usize) -> bool {
-    user_direct_async_base_enabled()
-        && len >= USER_SLICE_FAST_MIN
-        && len.is_multiple_of(USER_DIRECT_ASYNC_ALIGNMENT)
-        && (offset as usize).is_multiple_of(USER_DIRECT_ASYNC_ALIGNMENT)
-}
-
-fn user_direct_async_segments_candidate(offset: u64, len: usize, segments: usize) -> bool {
-    user_direct_async_candidate(offset, len) && segments != 0
-}
-
-fn user_direct_async_reject_if_enabled() {
-    if user_direct_async_base_enabled() {
-        record_user_io_async_submit_fallback();
-    }
-}
-
-fn run_user_direct_async_io<T, E>(op: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
-    let was_interrupted = axtask::current_may_uninit().is_some_and(|task| task.is_interrupted());
-    let result = op();
-    if !was_interrupted && axtask::current_may_uninit().is_some_and(|task| task.is_interrupted()) {
-        record_user_io_async_signal_after_submit();
-    }
-    result
-}
-
-fn user_direct_async_segments_ok(segments: impl IntoIterator<Item = (usize, usize)>) -> bool {
-    segments.into_iter().all(|(paddr, len)| {
-        len != 0
-            && len.is_multiple_of(USER_DIRECT_ASYNC_ALIGNMENT)
-            && paddr.is_multiple_of(USER_DIRECT_ASYNC_ALIGNMENT)
-    })
-}
-
 struct AxfsPinnedSegments {
     entries: [PinnedPhysicalSegment; USER_IOV_FAST_MAX_SEGMENTS],
     len: usize,
@@ -469,19 +423,13 @@ fn read_at_pinned_user_segments(
     file: &File,
     segments: &[PinnedPhysicalSegment],
     offset: u64,
-    try_async: bool,
 ) -> AxResult<usize> {
-    let operation = || unsafe {
+    unsafe {
         // The MM pin owners outlive this call and axfs validates mutable
         // segment disjointness before materializing any destination slice.
         Ok(file
             .inner()
-            .read_at_pinned_segments(segments, offset, try_async)?)
-    };
-    if try_async {
-        run_user_direct_async_io(operation)
-    } else {
-        operation()
+            .read_at_pinned_segments(segments, offset, false)?)
     }
 }
 
@@ -489,19 +437,13 @@ fn write_at_pinned_user_segments(
     file: &File,
     segments: &[PinnedPhysicalSegment],
     offset: u64,
-    try_async: bool,
 ) -> AxResult<usize> {
-    let operation = || unsafe {
+    unsafe {
         // Pinned source ownership is held by the caller; cache alias policy
         // remains entirely inside axfs-ng.
         Ok(file
             .inner()
-            .write_at_pinned_segments(segments, offset, try_async)?)
-    };
-    if try_async {
-        run_user_direct_async_io(operation)
-    } else {
-        operation()
+            .write_at_pinned_segments(segments, offset, false)?)
     }
 }
 
@@ -527,27 +469,12 @@ fn try_regular_file_read_user_slice(
     }
     let Some(pinned) = try_pin_user_slice_to_user(buf, len) else {
         record_user_io_direct_read_fallback();
-        user_direct_async_reject_if_enabled();
         return Ok(None);
     };
     debug_assert_eq!(pinned.segments().len(), 1);
     let segments = pinned.segments().len();
-    let async_direct = PINNED_USER_DIRECT_ASYNC_ENABLED
-        && user_direct_async_segments_candidate(offset, len, segments)
-        && user_direct_async_segments_ok(
-            pinned
-                .segments()
-                .iter()
-                .map(|segment| (segment.paddr, segment.len)),
-        );
     let physical = axfs_pinned_segments(pinned.segments())?;
-    let read = read_at_pinned_user_segments(file, physical.as_slice(), offset, async_direct)?;
-    if async_direct {
-        record_user_io_async_direct_read(read, segments);
-        record_user_io_async_resource_unpins(1);
-    } else {
-        user_direct_async_reject_if_enabled();
-    }
+    let read = read_at_pinned_user_segments(file, physical.as_slice(), offset)?;
     record_user_io_direct_read(read, segments);
     Ok(Some(read))
 }
@@ -563,32 +490,16 @@ fn try_regular_file_read_user_segments(
     }
     let Some(pinned) = try_pin_user_segments_to_user(buf, len) else {
         record_user_io_direct_read_fallback();
-        user_direct_async_reject_if_enabled();
         return Ok(None);
     };
 
     let segments = pinned.segments().len();
-    let async_direct = PINNED_USER_DIRECT_ASYNC_ENABLED
-        && user_direct_async_segments_candidate(offset, len, segments)
-        && user_direct_async_segments_ok(
-            pinned
-                .segments()
-                .iter()
-                .map(|segment| (segment.paddr, segment.len)),
-        );
     if !pinned_user_mut_segments_are_disjoint(core::slice::from_ref(&pinned)) {
         record_user_io_direct_read_fallback();
-        user_direct_async_reject_if_enabled();
         return Ok(None);
     }
     let physical = axfs_pinned_segments(pinned.segments())?;
-    let read = read_at_pinned_user_segments(file, physical.as_slice(), offset, async_direct)?;
-    if async_direct {
-        record_user_io_async_direct_read(read, segments);
-        record_user_io_async_resource_unpins(1);
-    } else {
-        user_direct_async_reject_if_enabled();
-    }
+    let read = read_at_pinned_user_segments(file, physical.as_slice(), offset)?;
     record_user_io_direct_read(read, segments);
     Ok(Some(read))
 }
@@ -604,27 +515,12 @@ fn try_regular_file_pread_user_slice(
     }
     let Some(pinned) = try_pin_user_slice_to_user(buf, len) else {
         record_user_io_direct_read_fallback();
-        user_direct_async_reject_if_enabled();
         return Ok(None);
     };
     debug_assert_eq!(pinned.segments().len(), 1);
     let segments = pinned.segments().len();
-    let async_direct = PINNED_USER_DIRECT_ASYNC_ENABLED
-        && user_direct_async_segments_candidate(offset, len, segments)
-        && user_direct_async_segments_ok(
-            pinned
-                .segments()
-                .iter()
-                .map(|segment| (segment.paddr, segment.len)),
-        );
     let physical = axfs_pinned_segments(pinned.segments())?;
-    let read = read_at_pinned_user_segments(file, physical.as_slice(), offset, async_direct)?;
-    if async_direct {
-        record_user_io_async_direct_read(read, segments);
-        record_user_io_async_resource_unpins(1);
-    } else {
-        user_direct_async_reject_if_enabled();
-    }
+    let read = read_at_pinned_user_segments(file, physical.as_slice(), offset)?;
     record_user_io_direct_read(read, segments);
     Ok(Some(read))
 }
@@ -640,32 +536,16 @@ fn try_regular_file_pread_user_segments(
     }
     let Some(pinned) = try_pin_user_segments_to_user(buf, len) else {
         record_user_io_direct_read_fallback();
-        user_direct_async_reject_if_enabled();
         return Ok(None);
     };
 
     let segments = pinned.segments().len();
-    let async_direct = PINNED_USER_DIRECT_ASYNC_ENABLED
-        && user_direct_async_segments_candidate(offset, len, segments)
-        && user_direct_async_segments_ok(
-            pinned
-                .segments()
-                .iter()
-                .map(|segment| (segment.paddr, segment.len)),
-        );
     if !pinned_user_mut_segments_are_disjoint(core::slice::from_ref(&pinned)) {
         record_user_io_direct_read_fallback();
-        user_direct_async_reject_if_enabled();
         return Ok(None);
     }
     let physical = axfs_pinned_segments(pinned.segments())?;
-    let read = read_at_pinned_user_segments(file, physical.as_slice(), offset, async_direct)?;
-    if async_direct {
-        record_user_io_async_direct_read(read, segments);
-        record_user_io_async_resource_unpins(1);
-    } else {
-        user_direct_async_reject_if_enabled();
-    }
+    let read = read_at_pinned_user_segments(file, physical.as_slice(), offset)?;
     record_user_io_direct_read(read, segments);
     Ok(Some(read))
 }
@@ -698,28 +578,13 @@ fn try_regular_file_write_user_slice(
 
     let Some(pinned) = try_pin_user_slice_from_user(buf, allowed) else {
         record_user_io_direct_write_fallback();
-        user_direct_async_reject_if_enabled();
         return Ok(None);
     };
     debug_assert_eq!(pinned.segments().len(), 1);
     let segments = pinned.segments().len();
-    let async_direct = PINNED_USER_DIRECT_ASYNC_ENABLED
-        && user_direct_async_segments_candidate(offset, allowed, segments)
-        && user_direct_async_segments_ok(
-            pinned
-                .segments()
-                .iter()
-                .map(|segment| (segment.paddr, segment.len)),
-        );
     let physical = axfs_pinned_segments(pinned.segments())?;
     let _privilege_guard = file.begin_content_write_privilege_cleanup(security)?;
-    let written = write_at_pinned_user_segments(file, physical.as_slice(), offset, async_direct)?;
-    if async_direct {
-        record_user_io_async_direct_write(written, segments);
-        record_user_io_async_resource_unpins(1);
-    } else {
-        user_direct_async_reject_if_enabled();
-    }
+    let written = write_at_pinned_user_segments(file, physical.as_slice(), offset)?;
     record_user_io_direct_write(written, segments);
     Ok(Some(written))
 }
@@ -752,28 +617,13 @@ fn try_regular_file_write_user_segments(
 
     let Some(pinned) = try_pin_user_segments_from_user(buf, allowed) else {
         record_user_io_direct_write_fallback();
-        user_direct_async_reject_if_enabled();
         return Ok(None);
     };
 
     let segments = pinned.segments().len();
-    let async_direct = PINNED_USER_DIRECT_ASYNC_ENABLED
-        && user_direct_async_segments_candidate(offset, allowed, segments)
-        && user_direct_async_segments_ok(
-            pinned
-                .segments()
-                .iter()
-                .map(|segment| (segment.paddr, segment.len)),
-        );
     let physical = axfs_pinned_segments(pinned.segments())?;
     let _privilege_guard = file.begin_content_write_privilege_cleanup(security)?;
-    let written = write_at_pinned_user_segments(file, physical.as_slice(), offset, async_direct)?;
-    if async_direct {
-        record_user_io_async_direct_write(written, segments);
-        record_user_io_async_resource_unpins(1);
-    } else {
-        user_direct_async_reject_if_enabled();
-    }
+    let written = write_at_pinned_user_segments(file, physical.as_slice(), offset)?;
     record_user_io_direct_write(written, segments);
     Ok(Some(written))
 }
@@ -806,28 +656,13 @@ fn try_regular_file_pwrite_user_slice(
 
     let Some(pinned) = try_pin_user_slice_from_user(buf, allowed) else {
         record_user_io_direct_write_fallback();
-        user_direct_async_reject_if_enabled();
         return Ok(None);
     };
     debug_assert_eq!(pinned.segments().len(), 1);
     let segments = pinned.segments().len();
-    let async_direct = PINNED_USER_DIRECT_ASYNC_ENABLED
-        && user_direct_async_segments_candidate(offset, allowed, segments)
-        && user_direct_async_segments_ok(
-            pinned
-                .segments()
-                .iter()
-                .map(|segment| (segment.paddr, segment.len)),
-        );
     let physical = axfs_pinned_segments(pinned.segments())?;
     let _privilege_guard = file.begin_content_write_privilege_cleanup(security)?;
-    let written = write_at_pinned_user_segments(file, physical.as_slice(), offset, async_direct)?;
-    if async_direct {
-        record_user_io_async_direct_write(written, segments);
-        record_user_io_async_resource_unpins(1);
-    } else {
-        user_direct_async_reject_if_enabled();
-    }
+    let written = write_at_pinned_user_segments(file, physical.as_slice(), offset)?;
     record_user_io_direct_write(written, segments);
     Ok(Some(written))
 }
@@ -860,28 +695,13 @@ fn try_regular_file_pwrite_user_segments(
 
     let Some(pinned) = try_pin_user_segments_from_user(buf, allowed) else {
         record_user_io_direct_write_fallback();
-        user_direct_async_reject_if_enabled();
         return Ok(None);
     };
 
     let segments = pinned.segments().len();
-    let async_direct = PINNED_USER_DIRECT_ASYNC_ENABLED
-        && user_direct_async_segments_candidate(offset, allowed, segments)
-        && user_direct_async_segments_ok(
-            pinned
-                .segments()
-                .iter()
-                .map(|segment| (segment.paddr, segment.len)),
-        );
     let physical = axfs_pinned_segments(pinned.segments())?;
     let _privilege_guard = file.begin_content_write_privilege_cleanup(security)?;
-    let written = write_at_pinned_user_segments(file, physical.as_slice(), offset, async_direct)?;
-    if async_direct {
-        record_user_io_async_direct_write(written, segments);
-        record_user_io_async_resource_unpins(1);
-    } else {
-        user_direct_async_reject_if_enabled();
-    }
+    let written = write_at_pinned_user_segments(file, physical.as_slice(), offset)?;
     record_user_io_direct_write(written, segments);
     Ok(Some(written))
 }
@@ -968,33 +788,18 @@ fn try_regular_file_readv_user_segments(
     }
     let Some(pinned) = try_pin_iov_to_user(iov, iov.len())? else {
         record_user_io_direct_read_fallback();
-        user_direct_async_reject_if_enabled();
         return Ok(None);
     };
     if pinned.is_empty() {
         return Ok(Some(0));
     }
     let segments = pinned.iter().map(|pin| pin.segments().len()).sum();
-    let async_direct = PINNED_USER_DIRECT_ASYNC_ENABLED
-        && user_direct_async_segments_candidate(offset, iov.len(), segments)
-        && user_direct_async_segments_ok(pinned.iter().flat_map(|pin| {
-            pin.segments()
-                .iter()
-                .map(|segment| (segment.paddr, segment.len))
-        }));
     if !pinned_user_mut_segments_are_disjoint(&pinned) {
         record_user_io_direct_read_fallback();
-        user_direct_async_reject_if_enabled();
         return Ok(None);
     }
     let physical = axfs_pinned_segments(pinned.iter().flat_map(|pin| pin.segments()))?;
-    let read = read_at_pinned_user_segments(file, physical.as_slice(), offset, async_direct)?;
-    if async_direct {
-        record_user_io_async_direct_read(read, segments);
-        record_user_io_async_resource_unpins(pinned.len());
-    } else {
-        user_direct_async_reject_if_enabled();
-    }
+    let read = read_at_pinned_user_segments(file, physical.as_slice(), offset)?;
     record_user_io_direct_read(read, segments);
     Ok(Some(read))
 }
@@ -1009,33 +814,18 @@ fn try_regular_file_preadv_user_segments(
     }
     let Some(pinned) = try_pin_iov_to_user(iov, iov.len())? else {
         record_user_io_direct_read_fallback();
-        user_direct_async_reject_if_enabled();
         return Ok(None);
     };
     if pinned.is_empty() {
         return Ok(Some(0));
     }
     let segments = pinned.iter().map(|pin| pin.segments().len()).sum();
-    let async_direct = PINNED_USER_DIRECT_ASYNC_ENABLED
-        && user_direct_async_segments_candidate(offset, iov.len(), segments)
-        && user_direct_async_segments_ok(pinned.iter().flat_map(|pin| {
-            pin.segments()
-                .iter()
-                .map(|segment| (segment.paddr, segment.len))
-        }));
     if !pinned_user_mut_segments_are_disjoint(&pinned) {
         record_user_io_direct_read_fallback();
-        user_direct_async_reject_if_enabled();
         return Ok(None);
     }
     let physical = axfs_pinned_segments(pinned.iter().flat_map(|pin| pin.segments()))?;
-    let read = read_at_pinned_user_segments(file, physical.as_slice(), offset, async_direct)?;
-    if async_direct {
-        record_user_io_async_direct_read(read, segments);
-        record_user_io_async_resource_unpins(pinned.len());
-    } else {
-        user_direct_async_reject_if_enabled();
-    }
+    let read = read_at_pinned_user_segments(file, physical.as_slice(), offset)?;
     record_user_io_direct_read(read, segments);
     Ok(Some(read))
 }
@@ -1067,29 +857,15 @@ fn try_regular_file_writev_user_segments(
 
     let Some(pinned) = try_pin_iov_from_user(iov, allowed)? else {
         record_user_io_direct_write_fallback();
-        user_direct_async_reject_if_enabled();
         return Ok(None);
     };
     if pinned.is_empty() {
         return Ok(Some(0));
     }
     let segments = pinned.iter().map(|pin| pin.segments().len()).sum();
-    let async_direct = PINNED_USER_DIRECT_ASYNC_ENABLED
-        && user_direct_async_segments_candidate(offset, allowed, segments)
-        && user_direct_async_segments_ok(pinned.iter().flat_map(|pin| {
-            pin.segments()
-                .iter()
-                .map(|segment| (segment.paddr, segment.len))
-        }));
     let physical = axfs_pinned_segments(pinned.iter().flat_map(|pin| pin.segments()))?;
     let _privilege_guard = file.begin_content_write_privilege_cleanup(security)?;
-    let written = write_at_pinned_user_segments(file, physical.as_slice(), offset, async_direct)?;
-    if async_direct {
-        record_user_io_async_direct_write(written, segments);
-        record_user_io_async_resource_unpins(pinned.len());
-    } else {
-        user_direct_async_reject_if_enabled();
-    }
+    let written = write_at_pinned_user_segments(file, physical.as_slice(), offset)?;
     record_user_io_direct_write(written, segments);
     Ok(Some(written))
 }
@@ -1121,29 +897,15 @@ fn try_regular_file_pwritev_user_segments(
 
     let Some(pinned) = try_pin_iov_from_user(iov, allowed)? else {
         record_user_io_direct_write_fallback();
-        user_direct_async_reject_if_enabled();
         return Ok(None);
     };
     if pinned.is_empty() {
         return Ok(Some(0));
     }
     let segments = pinned.iter().map(|pin| pin.segments().len()).sum();
-    let async_direct = PINNED_USER_DIRECT_ASYNC_ENABLED
-        && user_direct_async_segments_candidate(offset, allowed, segments)
-        && user_direct_async_segments_ok(pinned.iter().flat_map(|pin| {
-            pin.segments()
-                .iter()
-                .map(|segment| (segment.paddr, segment.len))
-        }));
     let physical = axfs_pinned_segments(pinned.iter().flat_map(|pin| pin.segments()))?;
     let _privilege_guard = file.begin_content_write_privilege_cleanup(security)?;
-    let written = write_at_pinned_user_segments(file, physical.as_slice(), offset, async_direct)?;
-    if async_direct {
-        record_user_io_async_direct_write(written, segments);
-        record_user_io_async_resource_unpins(pinned.len());
-    } else {
-        user_direct_async_reject_if_enabled();
-    }
+    let written = write_at_pinned_user_segments(file, physical.as_slice(), offset)?;
     record_user_io_direct_write(written, segments);
     Ok(Some(written))
 }

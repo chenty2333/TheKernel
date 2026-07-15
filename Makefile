@@ -22,6 +22,7 @@ CLEAN_DIRS ?= \
 	$(ROOT_DIR)/.tmp \
 	$(STATE_DIR)/ci \
 	$(STATE_DIR)/empty-rootfs \
+	$(STATE_DIR)/io-test-shell \
 	$(STATE_DIR)/qemu-runner \
 	$(STATE_DIR)/rootfs \
 	$(STATE_DIR)/rootfs-build \
@@ -85,6 +86,12 @@ kernel-rv-shell:
 
 kernel-la-shell:
 	@$(BUILD_TOOL) shell la
+
+kernel-rv-io-test:
+	@$(BUILD_TOOL) io-test-shell rv
+
+kernel-la-io-test:
+	@$(BUILD_TOOL) io-test-shell la
 
 rootfs-rv:
 	@$(BUILD_TOOL) rootfs rv --output "$(ROOTFS_RV)"

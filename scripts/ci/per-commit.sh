@@ -110,6 +110,13 @@ ci_run_step kernel-host-check "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" cargo check --locked --manifest-path kernel/Cargo.toml \
     --tests --features bpf --target x86_64-unknown-linux-gnu
 
+ci_run_step kernel-io-test-control-tests "$STEP_TIMEOUT_SECS" \
+    "${host_tool_env[@]}" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \
+    cargo test --locked --manifest-path kernel/Cargo.toml \
+    --tests --features bpf,test-io-control --target x86_64-unknown-linux-gnu \
+    pseudofs::io_test_control::tests -- --test-threads=1
+
 ci_run_step kernel-raw-sigevent-tests "$STEP_TIMEOUT_SECS" \
     "${host_tool_env[@]}" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$SCRIPT_DIR/host-test-linker.sh" \

@@ -65,6 +65,7 @@ repository.workspace = true
 [features]
 default = []
 boot-shell = []
+test-io-control = ["thekernel-kernel/test-io-control"]
 qemu = [
     "axfeat/defplat",
     "axfeat/bus-pci",

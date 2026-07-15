@@ -6,16 +6,16 @@ SMOKE_RUN_TIMEOUT_SECS=240
 
 smoke_kernel_shell_make_target() {
     case "$1" in
-        rv) printf '%s\n' kernel-rv-shell ;;
-        la) printf '%s\n' kernel-la-shell ;;
+        rv) printf '%s\n' kernel-rv-io-test ;;
+        la) printf '%s\n' kernel-la-io-test ;;
         *) return 1 ;;
     esac
 }
 
 smoke_kernel_shell_path() {
     case "$1" in
-        rv) printf '%s\n' .state/shell/kernel-rv ;;
-        la) printf '%s\n' .state/shell/kernel-la ;;
+        rv) printf '%s\n' .state/io-test-shell/kernel-rv ;;
+        la) printf '%s\n' .state/io-test-shell/kernel-la ;;
         *) return 1 ;;
     esac
 }

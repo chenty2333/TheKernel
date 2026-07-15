@@ -106,13 +106,14 @@ COMMANDS_FILE=$(mktemp "$REPO_ROOT/.state/async-flush-fence-current/smoke-$ARCH.
 trap 'rm -f "$COMMANDS_FILE"' EXIT
 cat >"$COMMANDS_FILE" <<'EOF'
 echo ASYNC_FLUSH_FENCE_SMOKE_START
-echo on > /proc/io_stats
-echo virtio_on > /proc/io_stats
-echo async_block_on > /proc/io_stats
-echo async_block_depth=4 > /proc/io_stats
-echo async_block_la_depth=2 > /proc/io_stats
-echo async_block_wait=hybrid > /proc/io_stats
-echo reset > /proc/io_stats
+echo test_policy=reset > /proc/io_test_control
+echo counters=on > /proc/io_test_control
+echo virtio_counters=on > /proc/io_test_control
+echo async_block=on > /proc/io_test_control
+echo async_block_depth=4 > /proc/io_test_control
+echo async_block_la_depth=2 > /proc/io_test_control
+echo async_block_wait=hybrid > /proc/io_test_control
+echo counters=reset > /proc/io_test_control
 rm -f /async_flush_fence
 if /opt/thekernel-tests/bin/thekernel-sync-fence /async_flush_fence; then
     echo ASYNC_FLUSH_FENCE_TOOL_OK
@@ -121,7 +122,7 @@ else
 fi
 # HOST_SLEEP 3
 cat /proc/io_stats
-echo off > /proc/io_stats
+echo test_policy=reset > /proc/io_test_control
 echo ASYNC_FLUSH_FENCE_SMOKE_DONE
 exit
 EOF

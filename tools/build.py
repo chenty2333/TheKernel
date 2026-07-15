@@ -392,14 +392,19 @@ def kernel_input_specs(req: KernelRequest) -> list[InputSpec]:
     ]
 
 
-def make_kernel_request(mode: Literal["release", "shell"], arch: str, root: Path) -> KernelRequest:
+def make_kernel_request(
+    mode: Literal["release", "shell", "io-test-shell"], arch: str, root: Path
+) -> KernelRequest:
     arch_alias = normalize_short_arch(arch)
     full_arch: Literal["riscv64", "loongarch64"] = "riscv64" if arch_alias == "rv" else "loongarch64"
     name = "kernel-rv" if arch_alias == "rv" else "kernel-la"
     features = "qemu"
-    if mode == "shell":
+    if mode in ("shell", "io-test-shell"):
         name = f"{name}-shell"
         features = "qemu boot-shell"
+    if mode == "io-test-shell":
+        name = f"{name}-io-test"
+        features = f"{features} test-io-control"
     return KernelRequest(
         name=name,
         arch=full_arch,
@@ -464,7 +469,7 @@ def kernel_build_env(req: KernelRequest) -> dict[str, str]:
 
 def ensure_kernel(
     *,
-    mode: Literal["release", "shell"],
+    mode: Literal["release", "shell", "io-test-shell"],
     arch: str,
     root: Path | None = None,
     output: Path | None = None,
@@ -486,8 +491,12 @@ def ensure_kernel(
     if output is None:
         if mode == "release":
             output = root / ("kernel-rv" if arch_alias == "rv" else "kernel-la")
-        else:
+        elif mode == "shell":
             output = root / ".state" / "shell" / ("kernel-rv" if arch_alias == "rv" else "kernel-la")
+        else:
+            output = root / ".state" / "io-test-shell" / (
+                "kernel-rv" if arch_alias == "rv" else "kernel-la"
+            )
     materialize_file(result.cache_path, output, prefer_hardlink=True, root=root)
     return BuildResult(result.kind, result.name, result.cache_path, output, result.identity, result.hit)
 
@@ -686,6 +695,15 @@ def build_parser() -> argparse.ArgumentParser:
     shell.add_argument("--verbose", action="store_true")
     shell.set_defaults(func=shell_cmd)
 
+    io_test_shell = sub.add_parser(
+        "io-test-shell", help="build/reuse a test-only I/O control shell kernel"
+    )
+    io_test_shell.add_argument(
+        "arch", choices=("rv", "la", "riscv64", "loongarch64")
+    )
+    io_test_shell.add_argument("--verbose", action="store_true")
+    io_test_shell.set_defaults(func=io_test_shell_cmd)
+
     rootfs = sub.add_parser(
         "rootfs", help="build or reuse a project test root filesystem"
     )
@@ -706,6 +724,13 @@ def kernel_cmd(args: argparse.Namespace) -> int:
 
 def shell_cmd(args: argparse.Namespace) -> int:
     result = ensure_kernel(mode="shell", arch=args.arch, verbose=args.verbose)
+    if args.verbose:
+        print(result.output_path)
+    return 0
+
+
+def io_test_shell_cmd(args: argparse.Namespace) -> int:
+    result = ensure_kernel(mode="io-test-shell", arch=args.arch, verbose=args.verbose)
     if args.verbose:
         print(result.output_path)
     return 0

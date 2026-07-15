@@ -120,25 +120,26 @@ COMMANDS_FILE=$(mktemp "$REPO_ROOT/.state/async-irq-first-current/smoke-$ARCH.co
 trap 'rm -f "$COMMANDS_FILE"' EXIT
 cat >"$COMMANDS_FILE" <<'EOF'
 echo ASYNC_IRQ_FIRST_SMOKE_START
-echo on > /proc/io_stats
-echo virtio_on > /proc/io_stats
-echo async_block_on > /proc/io_stats
-echo async_block_depth=4 > /proc/io_stats
-echo async_block_la_depth=2 > /proc/io_stats
-echo async_block_wait=irq_first > /proc/io_stats
-echo async_dirty_flush_sg_on > /proc/io_stats
+echo test_policy=reset > /proc/io_test_control
+echo counters=on > /proc/io_test_control
+echo virtio_counters=on > /proc/io_test_control
+echo async_block=on > /proc/io_test_control
+echo async_block_depth=4 > /proc/io_test_control
+echo async_block_la_depth=2 > /proc/io_test_control
+echo async_block_wait=irq_first > /proc/io_test_control
+echo async_dirty_flush_sg=on > /proc/io_test_control
 rm -f /async_irq_first_dirty /async_irq_first_copy /async_irq_first_expected
 dd if=/dev/zero of=/async_irq_first_dirty bs=4096 count=128
 sync
-echo reset > /proc/io_stats
-if echo async_block_selftest_irq_first > /proc/io_stats; then echo ASYNC_IRQ_FIRST_WAIT_OK; else echo ASYNC_IRQ_FIRST_WAIT_BAD; fi
+echo counters=reset > /proc/io_test_control
+if echo async_block_selftest_irq_first_scratch=vdb > /proc/io_test_control; then echo ASYNC_IRQ_FIRST_WAIT_OK; else echo ASYNC_IRQ_FIRST_WAIT_BAD; fi
 dd if=/bin/busybox of=/async_irq_first_dirty bs=1024 count=512 conv=notrunc
 sync
 dd if=/async_irq_first_dirty of=/async_irq_first_copy bs=4096 count=128
 dd if=/bin/busybox of=/async_irq_first_expected bs=1024 count=512
 cmp /async_irq_first_copy /async_irq_first_expected && echo ASYNC_IRQ_FIRST_DIRTY_OK || echo ASYNC_IRQ_FIRST_DIRTY_BAD
 cat /proc/io_stats
-echo off > /proc/io_stats
+echo test_policy=reset > /proc/io_test_control
 echo ASYNC_IRQ_FIRST_SMOKE_DONE
 exit
 EOF

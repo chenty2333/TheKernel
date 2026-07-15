@@ -106,18 +106,19 @@ COMMANDS_FILE=$(mktemp "$REPO_ROOT/.state/page-cache-readahead-current/smoke-$AR
 trap 'rm -f "$COMMANDS_FILE"' EXIT
 cat >"$COMMANDS_FILE" <<'EOF'
 echo PAGECACHE_READAHEAD_SMOKE_START
-echo on > /proc/io_stats
-echo virtio_on > /proc/io_stats
+echo test_policy=reset > /proc/io_test_control
+echo counters=on > /proc/io_test_control
+echo virtio_counters=on > /proc/io_test_control
 rm -f /ra_pressure /ra_small
 dd if=/dev/zero of=/ra_pressure bs=4096 count=2304
 sync
-echo cached_readahead_on > /proc/io_stats
-echo reset > /proc/io_stats
+echo cached_readahead=on > /proc/io_test_control
+echo counters=reset > /proc/io_test_control
 dd if=/ra_pressure of=/dev/null bs=1000 count=1 && echo PAGECACHE_READAHEAD_PRIME_OK || echo PAGECACHE_READAHEAD_PRIME_BAD
 dd if=/ra_pressure of=/dev/null bs=1000 skip=300 count=9000 && echo PAGECACHE_READAHEAD_PRESSURE_OK || echo PAGECACHE_READAHEAD_PRESSURE_BAD
 # HOST_SLEEP 5
 cat /proc/io_stats
-echo off > /proc/io_stats
+echo test_policy=reset > /proc/io_test_control
 echo PAGECACHE_READAHEAD_SMOKE_DONE
 exit
 EOF

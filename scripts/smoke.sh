@@ -21,7 +21,6 @@ Smoke names:
   lwext4-async-read
   lwext4-io-boost
   page-cache-readahead
-  user-direct-async
 EOF
 }
 
@@ -33,7 +32,6 @@ script_for() {
         lwext4-async-read) printf '%s\n' "$SMOKE_DIR/lwext4-async-read-smoke.sh" ;;
         lwext4-io-boost) printf '%s\n' "$SMOKE_DIR/lwext4-io-boost-smoke.sh" ;;
         page-cache-readahead) printf '%s\n' "$SMOKE_DIR/page-cache-readahead-smoke.sh" ;;
-        user-direct-async) printf '%s\n' "$SMOKE_DIR/user-direct-async-smoke.sh" ;;
         *) return 1 ;;
     esac
 }

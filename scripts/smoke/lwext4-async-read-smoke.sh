@@ -120,14 +120,15 @@ COMMANDS_FILE=$(mktemp "$REPO_ROOT/.state/lwext4-async-read-current/smoke-$ARCH.
 trap 'rm -f "$COMMANDS_FILE"' EXIT
 cat >"$COMMANDS_FILE" <<'EOF'
 echo LWEXT4_ASYNC_READ_SMOKE_START
-echo on > /proc/io_stats
-echo virtio_on > /proc/io_stats
-echo async_block_on > /proc/io_stats
-echo async_block_depth=4 > /proc/io_stats
-echo async_block_la_depth=2 > /proc/io_stats
-echo async_block_wait=__WAIT_POLICY__ > /proc/io_stats
-echo lwext4_async_read_on > /proc/io_stats
-echo reset > /proc/io_stats
+echo test_policy=reset > /proc/io_test_control
+echo counters=on > /proc/io_test_control
+echo virtio_counters=on > /proc/io_test_control
+echo async_block=on > /proc/io_test_control
+echo async_block_depth=4 > /proc/io_test_control
+echo async_block_la_depth=2 > /proc/io_test_control
+echo async_block_wait=__WAIT_POLICY__ > /proc/io_test_control
+echo lwext4_async_read=on > /proc/io_test_control
+echo counters=reset > /proc/io_test_control
 rm -f /ar_src /ar_copy /ar_pagefill /ar_pagefill_expected
 rm -f /ar_multi /ar_multi_read /ar_zero /ar_trunc /ar_trunc_tail
 rm -f /ar_sparse /ar_sparse_first /ar_frag /ar_gap /ar_frag_read
@@ -162,7 +163,7 @@ dd if=/ar_frag of=/ar_frag_read bs=4096 count=2
 bytes=$(wc -c < /ar_frag_read)
 test "$bytes" = 8192 && echo ASYNC_FRAGMENTED_FALLBACK_OK || echo ASYNC_FRAGMENTED_FALLBACK_BAD
 cat /proc/io_stats
-echo off > /proc/io_stats
+echo test_policy=reset > /proc/io_test_control
 echo LWEXT4_ASYNC_READ_SMOKE_DONE
 exit
 EOF

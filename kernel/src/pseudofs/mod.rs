@@ -6,6 +6,8 @@ mod device;
 mod dir;
 mod file;
 mod fs;
+#[cfg(feature = "test-io-control")]
+mod io_test_control;
 mod proc;
 mod sys;
 pub(crate) mod tmp;

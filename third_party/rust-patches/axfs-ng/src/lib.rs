@@ -26,8 +26,8 @@ use spin::Once;
 
 mod fs;
 pub use fs::{
-    FatMountOptions, drain_deferred_filesystem_finalizers,
-    has_deferred_filesystem_finalizer_work, set_deferred_filesystem_finalizer_waker,
+    FatMountOptions, drain_deferred_filesystem_finalizers, has_deferred_filesystem_finalizer_work,
+    set_deferred_filesystem_finalizer_waker,
 };
 
 mod highlevel;
@@ -553,8 +553,7 @@ pub fn set_block_device_read_only(name: &str, read_only: bool) -> Result<(), Ope
         .iter()
         .find(|entry| entry.name == name)
         .ok_or(OpenBlockDeviceError::NotFound)?;
-    if entry.read_only.load(Ordering::Acquire) != read_only
-        && entry.mounted.load(Ordering::Acquire)
+    if entry.read_only.load(Ordering::Acquire) != read_only && entry.mounted.load(Ordering::Acquire)
     {
         return Err(OpenBlockDeviceError::Busy);
     }
@@ -642,345 +641,334 @@ pub fn with_block_device_mut<R>(
     Ok(f(&mut device))
 }
 
+#[cfg(feature = "test-io-control")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AsyncBlockQueueSelftestError {
     NoBlockDevice,
+    UnsafeScratchDevice,
+    Busy,
     Unsupported,
     Io,
 }
 
-pub fn async_block_queue_read_write_selftest() -> Result<(), AsyncBlockQueueSelftestError> {
-    let names = block_device_names();
-    for name in names {
-        let result = with_block_device_mut(&name, |dev| {
-            let caps = dev
-                .async_queue_caps()
-                .ok_or(AsyncBlockQueueSelftestError::Unsupported)?;
-            if caps.max_requests < 2 || caps.max_descriptors < 6 {
-                return Err(AsyncBlockQueueSelftestError::Unsupported);
-            }
-
-            let block_size = dev.block_size();
-            let request_bytes = block_size
-                .checked_mul(2)
-                .ok_or(AsyncBlockQueueSelftestError::Io)?;
-            let blocks_per_request = request_bytes / block_size;
-            let first_block = 16u64;
-            let second_block = 32u64;
-            if dev.num_blocks() <= second_block + blocks_per_request as u64 {
-                return Err(AsyncBlockQueueSelftestError::Unsupported);
-            }
-
-            let write_a = Vec::from_iter(
-                (0..request_bytes)
-                    .map(|idx| (idx.wrapping_mul(37).wrapping_add(0x51) & 0xff) as u8),
-            );
-            let write_b = Vec::from_iter(
-                (0..request_bytes)
-                    .map(|idx| (idx.wrapping_mul(53).wrapping_add(0xa7) & 0xff) as u8),
-            );
-
-            let write_seg_a = [BlockSegment::from_write_buf(&write_a)];
-            let write_seg_b = [BlockSegment::from_write_buf(&write_b)];
-            let mut write_requests = [
-                BlockQueueRequest {
-                    op: BlockAsyncOp::Write,
-                    block_id: first_block,
-                    segments: &write_seg_a,
-                    handle: None,
-                },
-                BlockQueueRequest {
-                    op: BlockAsyncOp::Write,
-                    block_id: second_block,
-                    segments: &write_seg_b,
-                    handle: None,
-                },
-            ];
-
-            let write_report = dev
-                .submit_async_batch(&mut write_requests)
-                .map_err(|_| AsyncBlockQueueSelftestError::Unsupported)?;
-            if write_report.submitted < 2 {
-                return Err(AsyncBlockQueueSelftestError::Unsupported);
-            }
-            let write_handles = [
-                write_requests[0]
-                    .handle
-                    .ok_or(AsyncBlockQueueSelftestError::Io)?,
-                write_requests[1]
-                    .handle
-                    .ok_or(AsyncBlockQueueSelftestError::Io)?,
-            ];
-            dev.wait_async_all(&write_handles)
-                .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
-
-            let mut read_a = Vec::from_iter(core::iter::repeat(0).take(request_bytes));
-            let mut read_b = Vec::from_iter(core::iter::repeat(0).take(request_bytes));
-            let read_seg_a = [BlockSegment::from_read_buf(&mut read_a)];
-            let read_seg_b = [BlockSegment::from_read_buf(&mut read_b)];
-            let mut read_requests = [
-                BlockQueueRequest {
-                    op: BlockAsyncOp::Read,
-                    block_id: first_block,
-                    segments: &read_seg_a,
-                    handle: None,
-                },
-                BlockQueueRequest {
-                    op: BlockAsyncOp::Read,
-                    block_id: second_block,
-                    segments: &read_seg_b,
-                    handle: None,
-                },
-            ];
-
-            let read_report = dev
-                .submit_async_batch(&mut read_requests)
-                .map_err(|_| AsyncBlockQueueSelftestError::Unsupported)?;
-            if read_report.submitted < 2 {
-                return Err(AsyncBlockQueueSelftestError::Unsupported);
-            }
-            let read_handles = [
-                read_requests[0]
-                    .handle
-                    .ok_or(AsyncBlockQueueSelftestError::Io)?,
-                read_requests[1]
-                    .handle
-                    .ok_or(AsyncBlockQueueSelftestError::Io)?,
-            ];
-            dev.wait_async_all(&read_handles)
-                .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
-
-            if read_a != write_a || read_b != write_b {
-                return Err(AsyncBlockQueueSelftestError::Io);
-            }
-            Ok(())
-        });
-
-        match result {
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(AsyncBlockQueueSelftestError::Unsupported))
-            | Err(OpenBlockDeviceError::Busy) => {
-                continue;
-            }
-            Ok(Err(err)) => return Err(err),
-            Err(OpenBlockDeviceError::NotFound) => continue,
-        }
+#[cfg(feature = "test-io-control")]
+fn with_explicit_scratch_block_device(
+    scratch_device: &str,
+    test: impl FnOnce(&mut AxBlockDevice) -> Result<(), AsyncBlockQueueSelftestError>,
+) -> Result<(), AsyncBlockQueueSelftestError> {
+    if scratch_device.is_empty() || scratch_device == ROOT_BLOCK_DEVICE_NAME {
+        return Err(AsyncBlockQueueSelftestError::UnsafeScratchDevice);
     }
-    Err(AsyncBlockQueueSelftestError::NoBlockDevice)
+    if !block_device_names()
+        .iter()
+        .any(|name| name == scratch_device)
+    {
+        return Err(AsyncBlockQueueSelftestError::NoBlockDevice);
+    }
+    match with_block_device_mut(scratch_device, test) {
+        Ok(result) => result,
+        Err(OpenBlockDeviceError::Busy) => Err(AsyncBlockQueueSelftestError::Busy),
+        Err(OpenBlockDeviceError::NotFound) => Err(AsyncBlockQueueSelftestError::NoBlockDevice),
+    }
 }
 
-pub fn async_block_queue_interrupt_selftest() -> Result<(), AsyncBlockQueueSelftestError> {
-    let names = block_device_names();
-    for name in names {
-        let result = with_block_device_mut(&name, |dev| {
-            let caps = dev
-                .async_queue_caps()
-                .ok_or(AsyncBlockQueueSelftestError::Unsupported)?;
-            if caps.max_requests < 1 || caps.max_descriptors < 3 {
-                return Err(AsyncBlockQueueSelftestError::Unsupported);
-            }
+#[cfg(feature = "test-io-control")]
+pub fn async_block_queue_read_write_selftest(
+    scratch_device: &str,
+) -> Result<(), AsyncBlockQueueSelftestError> {
+    with_explicit_scratch_block_device(scratch_device, |dev| {
+        let caps = dev
+            .async_queue_caps()
+            .ok_or(AsyncBlockQueueSelftestError::Unsupported)?;
+        if caps.max_requests < 2 || caps.max_descriptors < 6 {
+            return Err(AsyncBlockQueueSelftestError::Unsupported);
+        }
 
-            let block_size = dev.block_size();
-            if block_size == 0 {
-                return Err(AsyncBlockQueueSelftestError::Unsupported);
-            }
-            let first_block = 48u64;
-            if dev.num_blocks() <= first_block + 1 {
-                return Err(AsyncBlockQueueSelftestError::Unsupported);
-            }
+        let block_size = dev.block_size();
+        let request_bytes = block_size
+            .checked_mul(2)
+            .ok_or(AsyncBlockQueueSelftestError::Io)?;
+        let blocks_per_request = request_bytes / block_size;
+        let first_block = 16u64;
+        let second_block = 32u64;
+        if dev.num_blocks() <= second_block + blocks_per_request as u64 {
+            return Err(AsyncBlockQueueSelftestError::Unsupported);
+        }
 
-            let write_data = Vec::from_iter(
-                (0..block_size).map(|idx| (idx.wrapping_mul(29).wrapping_add(0x3d) & 0xff) as u8),
-            );
-            let write_seg = [BlockSegment::from_write_buf(&write_data)];
-            let mut write_requests = [BlockQueueRequest {
+        let write_a = Vec::from_iter(
+            (0..request_bytes).map(|idx| (idx.wrapping_mul(37).wrapping_add(0x51) & 0xff) as u8),
+        );
+        let write_b = Vec::from_iter(
+            (0..request_bytes).map(|idx| (idx.wrapping_mul(53).wrapping_add(0xa7) & 0xff) as u8),
+        );
+
+        let write_seg_a = [BlockSegment::from_write_buf(&write_a)];
+        let write_seg_b = [BlockSegment::from_write_buf(&write_b)];
+        let mut write_requests = [
+            BlockQueueRequest {
                 op: BlockAsyncOp::Write,
                 block_id: first_block,
-                segments: &write_seg,
+                segments: &write_seg_a,
                 handle: None,
-            }];
-
-            dev.enable_irq()
-                .map_err(|_| AsyncBlockQueueSelftestError::Unsupported)?;
-            let write_report = dev
-                .submit_async_batch(&mut write_requests)
-                .map_err(|_| AsyncBlockQueueSelftestError::Unsupported)?;
-            if write_report.submitted < 1 {
-                let _ = dev.disable_irq();
-                return Err(AsyncBlockQueueSelftestError::Unsupported);
-            }
-            let write_handle = write_requests[0]
-                .handle
-                .ok_or(AsyncBlockQueueSelftestError::Io)?;
-            let mut drained = 0usize;
-            for _ in 0..4096 {
-                drained = drained.saturating_add(
-                    dev.handle_irq()
-                        .map_err(|_| AsyncBlockQueueSelftestError::Io)?,
-                );
-                if drained >= 1 {
-                    break;
-                }
-                core::hint::spin_loop();
-            }
-            if drained == 0 {
-                let _ = dev.disable_irq();
-                return Err(AsyncBlockQueueSelftestError::Io);
-            }
-            dev.wait_async_all(&[write_handle])
-                .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
-
-            let mut read_data = Vec::from_iter(core::iter::repeat(0).take(block_size));
-            let read_seg = [BlockSegment::from_read_buf(&mut read_data)];
-            let mut read_requests = [BlockQueueRequest {
-                op: BlockAsyncOp::Read,
-                block_id: first_block,
-                segments: &read_seg,
-                handle: None,
-            }];
-            let read_report = dev
-                .submit_async_batch(&mut read_requests)
-                .map_err(|_| AsyncBlockQueueSelftestError::Unsupported)?;
-            if read_report.submitted < 1 {
-                let _ = dev.disable_irq();
-                return Err(AsyncBlockQueueSelftestError::Unsupported);
-            }
-            let read_handle = read_requests[0]
-                .handle
-                .ok_or(AsyncBlockQueueSelftestError::Io)?;
-            let mut drained = 0usize;
-            for _ in 0..4096 {
-                drained = drained.saturating_add(
-                    dev.handle_irq()
-                        .map_err(|_| AsyncBlockQueueSelftestError::Io)?,
-                );
-                if drained >= 1 {
-                    break;
-                }
-                core::hint::spin_loop();
-            }
-            if drained == 0 {
-                let _ = dev.disable_irq();
-                return Err(AsyncBlockQueueSelftestError::Io);
-            }
-            dev.wait_async_all(&[read_handle])
-                .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
-            dev.disable_irq()
-                .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
-
-            if read_data != write_data {
-                return Err(AsyncBlockQueueSelftestError::Io);
-            }
-            Ok(())
-        });
-
-        match result {
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(AsyncBlockQueueSelftestError::Unsupported))
-            | Err(OpenBlockDeviceError::Busy) => {
-                continue;
-            }
-            Ok(Err(err)) => return Err(err),
-            Err(OpenBlockDeviceError::NotFound) => continue,
-        }
-    }
-
-    Err(AsyncBlockQueueSelftestError::NoBlockDevice)
-}
-
-pub fn async_block_queue_irq_first_wait_selftest() -> Result<(), AsyncBlockQueueSelftestError> {
-    let names = block_device_names();
-    for name in names {
-        let result = with_block_device_mut(&name, |dev| {
-            let caps = dev
-                .async_queue_caps()
-                .ok_or(AsyncBlockQueueSelftestError::Unsupported)?;
-            if caps.max_requests < 1 || caps.max_descriptors < 3 {
-                return Err(AsyncBlockQueueSelftestError::Unsupported);
-            }
-
-            let block_size = dev.block_size();
-            let request_blocks = 4096usize;
-            let request_bytes = block_size
-                .checked_mul(request_blocks)
-                .ok_or(AsyncBlockQueueSelftestError::Io)?;
-            let first_block = 128u64;
-            if block_size == 0 || dev.num_blocks() <= first_block + request_blocks as u64 {
-                return Err(AsyncBlockQueueSelftestError::Unsupported);
-            }
-
-            let write_data = Vec::from_iter(
-                (0..request_bytes)
-                    .map(|idx| (idx.wrapping_mul(41).wrapping_add(0x9b) & 0xff) as u8),
-            );
-            let write_seg = [BlockSegment::from_write_buf(&write_data)];
-            let mut write_requests = [BlockQueueRequest {
+            },
+            BlockQueueRequest {
                 op: BlockAsyncOp::Write,
-                block_id: first_block,
-                segments: &write_seg,
+                block_id: second_block,
+                segments: &write_seg_b,
                 handle: None,
-            }];
+            },
+        ];
 
-            dev.enable_irq()
-                .map_err(|_| AsyncBlockQueueSelftestError::Unsupported)?;
-            let write_report = dev
-                .submit_async_batch(&mut write_requests)
-                .map_err(|_| AsyncBlockQueueSelftestError::Unsupported)?;
-            if write_report.submitted < 1 {
-                let _ = dev.disable_irq();
-                return Err(AsyncBlockQueueSelftestError::Unsupported);
-            }
-            let write_handle = write_requests[0]
+        let write_report = dev
+            .submit_async_batch(&mut write_requests)
+            .map_err(|_| AsyncBlockQueueSelftestError::Unsupported)?;
+        if write_report.submitted < 2 {
+            return Err(AsyncBlockQueueSelftestError::Unsupported);
+        }
+        let write_handles = [
+            write_requests[0]
                 .handle
-                .ok_or(AsyncBlockQueueSelftestError::Io)?;
-            dev.wait_async_all(&[write_handle])
-                .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
+                .ok_or(AsyncBlockQueueSelftestError::Io)?,
+            write_requests[1]
+                .handle
+                .ok_or(AsyncBlockQueueSelftestError::Io)?,
+        ];
+        dev.wait_async_all(&write_handles)
+            .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
 
-            let mut read_data = Vec::from_iter(core::iter::repeat(0).take(request_bytes));
-            let read_seg = [BlockSegment::from_read_buf(&mut read_data)];
-            let mut read_requests = [BlockQueueRequest {
+        let mut read_a = Vec::from_iter(core::iter::repeat(0).take(request_bytes));
+        let mut read_b = Vec::from_iter(core::iter::repeat(0).take(request_bytes));
+        let read_seg_a = [BlockSegment::from_read_buf(&mut read_a)];
+        let read_seg_b = [BlockSegment::from_read_buf(&mut read_b)];
+        let mut read_requests = [
+            BlockQueueRequest {
                 op: BlockAsyncOp::Read,
                 block_id: first_block,
-                segments: &read_seg,
+                segments: &read_seg_a,
                 handle: None,
-            }];
-            let read_report = dev
-                .submit_async_batch(&mut read_requests)
-                .map_err(|_| AsyncBlockQueueSelftestError::Unsupported)?;
-            if read_report.submitted < 1 {
-                let _ = dev.disable_irq();
-                return Err(AsyncBlockQueueSelftestError::Unsupported);
-            }
-            let read_handle = read_requests[0]
-                .handle
-                .ok_or(AsyncBlockQueueSelftestError::Io)?;
-            dev.wait_async_all(&[read_handle])
-                .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
-            dev.disable_irq()
-                .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
+            },
+            BlockQueueRequest {
+                op: BlockAsyncOp::Read,
+                block_id: second_block,
+                segments: &read_seg_b,
+                handle: None,
+            },
+        ];
 
-            if read_data != write_data {
-                return Err(AsyncBlockQueueSelftestError::Io);
-            }
-            Ok(())
-        });
-
-        match result {
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(AsyncBlockQueueSelftestError::Unsupported))
-            | Err(OpenBlockDeviceError::Busy) => {
-                continue;
-            }
-            Ok(Err(err)) => return Err(err),
-            Err(OpenBlockDeviceError::NotFound) => continue,
+        let read_report = dev
+            .submit_async_batch(&mut read_requests)
+            .map_err(|_| AsyncBlockQueueSelftestError::Unsupported)?;
+        if read_report.submitted < 2 {
+            return Err(AsyncBlockQueueSelftestError::Unsupported);
         }
-    }
+        let read_handles = [
+            read_requests[0]
+                .handle
+                .ok_or(AsyncBlockQueueSelftestError::Io)?,
+            read_requests[1]
+                .handle
+                .ok_or(AsyncBlockQueueSelftestError::Io)?,
+        ];
+        dev.wait_async_all(&read_handles)
+            .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
 
-    Err(AsyncBlockQueueSelftestError::NoBlockDevice)
+        if read_a != write_a || read_b != write_b {
+            return Err(AsyncBlockQueueSelftestError::Io);
+        }
+        Ok(())
+    })
 }
 
-pub fn async_block_queue_read_selftest() -> Result<(), AsyncBlockQueueSelftestError> {
-    async_block_queue_read_write_selftest()
+#[cfg(feature = "test-io-control")]
+pub fn async_block_queue_interrupt_selftest(
+    scratch_device: &str,
+) -> Result<(), AsyncBlockQueueSelftestError> {
+    with_explicit_scratch_block_device(scratch_device, |dev| {
+        let caps = dev
+            .async_queue_caps()
+            .ok_or(AsyncBlockQueueSelftestError::Unsupported)?;
+        if caps.max_requests < 1 || caps.max_descriptors < 3 {
+            return Err(AsyncBlockQueueSelftestError::Unsupported);
+        }
+
+        let block_size = dev.block_size();
+        if block_size == 0 {
+            return Err(AsyncBlockQueueSelftestError::Unsupported);
+        }
+        let first_block = 48u64;
+        if dev.num_blocks() <= first_block + 1 {
+            return Err(AsyncBlockQueueSelftestError::Unsupported);
+        }
+
+        let write_data = Vec::from_iter(
+            (0..block_size).map(|idx| (idx.wrapping_mul(29).wrapping_add(0x3d) & 0xff) as u8),
+        );
+        let write_seg = [BlockSegment::from_write_buf(&write_data)];
+        let mut write_requests = [BlockQueueRequest {
+            op: BlockAsyncOp::Write,
+            block_id: first_block,
+            segments: &write_seg,
+            handle: None,
+        }];
+
+        dev.enable_irq()
+            .map_err(|_| AsyncBlockQueueSelftestError::Unsupported)?;
+        let write_report = dev
+            .submit_async_batch(&mut write_requests)
+            .map_err(|_| AsyncBlockQueueSelftestError::Unsupported)?;
+        if write_report.submitted < 1 {
+            let _ = dev.disable_irq();
+            return Err(AsyncBlockQueueSelftestError::Unsupported);
+        }
+        let write_handle = write_requests[0]
+            .handle
+            .ok_or(AsyncBlockQueueSelftestError::Io)?;
+        let mut drained = 0usize;
+        for _ in 0..4096 {
+            drained = drained.saturating_add(
+                dev.handle_irq()
+                    .map_err(|_| AsyncBlockQueueSelftestError::Io)?,
+            );
+            if drained >= 1 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if drained == 0 {
+            let _ = dev.disable_irq();
+            return Err(AsyncBlockQueueSelftestError::Io);
+        }
+        dev.wait_async_all(&[write_handle])
+            .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
+
+        let mut read_data = Vec::from_iter(core::iter::repeat(0).take(block_size));
+        let read_seg = [BlockSegment::from_read_buf(&mut read_data)];
+        let mut read_requests = [BlockQueueRequest {
+            op: BlockAsyncOp::Read,
+            block_id: first_block,
+            segments: &read_seg,
+            handle: None,
+        }];
+        let read_report = dev
+            .submit_async_batch(&mut read_requests)
+            .map_err(|_| AsyncBlockQueueSelftestError::Unsupported)?;
+        if read_report.submitted < 1 {
+            let _ = dev.disable_irq();
+            return Err(AsyncBlockQueueSelftestError::Unsupported);
+        }
+        let read_handle = read_requests[0]
+            .handle
+            .ok_or(AsyncBlockQueueSelftestError::Io)?;
+        let mut drained = 0usize;
+        for _ in 0..4096 {
+            drained = drained.saturating_add(
+                dev.handle_irq()
+                    .map_err(|_| AsyncBlockQueueSelftestError::Io)?,
+            );
+            if drained >= 1 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if drained == 0 {
+            let _ = dev.disable_irq();
+            return Err(AsyncBlockQueueSelftestError::Io);
+        }
+        dev.wait_async_all(&[read_handle])
+            .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
+        dev.disable_irq()
+            .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
+
+        if read_data != write_data {
+            return Err(AsyncBlockQueueSelftestError::Io);
+        }
+        Ok(())
+    })
+}
+
+#[cfg(feature = "test-io-control")]
+pub fn async_block_queue_irq_first_wait_selftest(
+    scratch_device: &str,
+) -> Result<(), AsyncBlockQueueSelftestError> {
+    with_explicit_scratch_block_device(scratch_device, |dev| {
+        let caps = dev
+            .async_queue_caps()
+            .ok_or(AsyncBlockQueueSelftestError::Unsupported)?;
+        if caps.max_requests < 1 || caps.max_descriptors < 3 {
+            return Err(AsyncBlockQueueSelftestError::Unsupported);
+        }
+
+        let block_size = dev.block_size();
+        let request_blocks = 4096usize;
+        let request_bytes = block_size
+            .checked_mul(request_blocks)
+            .ok_or(AsyncBlockQueueSelftestError::Io)?;
+        let first_block = 128u64;
+        if block_size == 0 || dev.num_blocks() <= first_block + request_blocks as u64 {
+            return Err(AsyncBlockQueueSelftestError::Unsupported);
+        }
+
+        let write_data = Vec::from_iter(
+            (0..request_bytes).map(|idx| (idx.wrapping_mul(41).wrapping_add(0x9b) & 0xff) as u8),
+        );
+        let write_seg = [BlockSegment::from_write_buf(&write_data)];
+        let mut write_requests = [BlockQueueRequest {
+            op: BlockAsyncOp::Write,
+            block_id: first_block,
+            segments: &write_seg,
+            handle: None,
+        }];
+
+        dev.enable_irq()
+            .map_err(|_| AsyncBlockQueueSelftestError::Unsupported)?;
+        let write_report = dev
+            .submit_async_batch(&mut write_requests)
+            .map_err(|_| AsyncBlockQueueSelftestError::Unsupported)?;
+        if write_report.submitted < 1 {
+            let _ = dev.disable_irq();
+            return Err(AsyncBlockQueueSelftestError::Unsupported);
+        }
+        let write_handle = write_requests[0]
+            .handle
+            .ok_or(AsyncBlockQueueSelftestError::Io)?;
+        dev.wait_async_all(&[write_handle])
+            .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
+
+        let mut read_data = Vec::from_iter(core::iter::repeat(0).take(request_bytes));
+        let read_seg = [BlockSegment::from_read_buf(&mut read_data)];
+        let mut read_requests = [BlockQueueRequest {
+            op: BlockAsyncOp::Read,
+            block_id: first_block,
+            segments: &read_seg,
+            handle: None,
+        }];
+        let read_report = dev
+            .submit_async_batch(&mut read_requests)
+            .map_err(|_| AsyncBlockQueueSelftestError::Unsupported)?;
+        if read_report.submitted < 1 {
+            let _ = dev.disable_irq();
+            return Err(AsyncBlockQueueSelftestError::Unsupported);
+        }
+        let read_handle = read_requests[0]
+            .handle
+            .ok_or(AsyncBlockQueueSelftestError::Io)?;
+        dev.wait_async_all(&[read_handle])
+            .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
+        dev.disable_irq()
+            .map_err(|_| AsyncBlockQueueSelftestError::Io)?;
+
+        if read_data != write_data {
+            return Err(AsyncBlockQueueSelftestError::Io);
+        }
+        Ok(())
+    })
+}
+
+#[cfg(feature = "test-io-control")]
+pub fn async_block_queue_read_selftest(
+    scratch_device: &str,
+) -> Result<(), AsyncBlockQueueSelftestError> {
+    async_block_queue_read_write_selftest(scratch_device)
 }
 
 pub fn new_block_filesystem(

@@ -116,9 +116,10 @@ COMMANDS_FILE=$(mktemp "$REPO_ROOT/.state/lwext4-io-boost-current/smoke-$ARCH.co
 trap 'rm -f "$COMMANDS_FILE"' EXIT
 cat >"$COMMANDS_FILE" <<'EOF'
 echo LWEXT4_IO_BOOST_SMOKE_START
-echo on > /proc/io_stats
-echo virtio_on > /proc/io_stats
-echo reset > /proc/io_stats
+echo test_policy=reset > /proc/io_test_control
+echo counters=on > /proc/io_test_control
+echo virtio_counters=on > /proc/io_test_control
+echo counters=reset > /proc/io_test_control
 rm -f /io_src_auto /io_copy_auto /io_dirty_auto
 rm -f /io_readback_auto /io_trunc_auto /io_first_auto
 rm -f /io_unaligned_auto /io_unaligned_copy_auto
@@ -175,13 +176,13 @@ done
 # HOST_SLEEP 8
 first=$(dd if=/io_trim_0 bs=1 count=1 2>/dev/null)
 test "$first" = T && echo CLOSE_RETAIN_TRIM_DATA_OK || echo CLOSE_RETAIN_TRIM_DATA_FAIL
-echo pin_delay_ms=100 > /proc/io_stats
+echo pin_delay_ms=100 > /proc/io_test_control
 /opt/thekernel-tests/bin/thekernel-io-pin-safety
 # HOST_SLEEP 8
 pin_rc=$?
-echo pin_delay_ms=0 > /proc/io_stats
+echo pin_delay_ms=0 > /proc/io_test_control
 cat /proc/io_stats
-echo off > /proc/io_stats
+echo test_policy=reset > /proc/io_test_control
 if [ $pin_rc -eq 0 ]; then echo PIN_SAFETY_TOOL_OK; fi
 if [ $pin_rc -ne 0 ]; then echo PIN_SAFETY_TOOL_FAIL; fi
 echo LWEXT4_IO_BOOST_SMOKE_DONE

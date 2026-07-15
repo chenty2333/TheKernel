@@ -120,21 +120,22 @@ COMMANDS_FILE=$(mktemp "$REPO_ROOT/.state/async-block-queue-current/smoke-$ARCH.
 trap 'rm -f "$COMMANDS_FILE"' EXIT
 cat >"$COMMANDS_FILE" <<'EOF'
 echo ASYNC_BLOCK_QUEUE_SMOKE_START
-echo on > /proc/io_stats
-echo virtio_on > /proc/io_stats
-echo async_block_on > /proc/io_stats
-echo async_block_depth=4 > /proc/io_stats
-echo async_block_la_depth=2 > /proc/io_stats
-echo async_block_wait=hybrid > /proc/io_stats
-echo async_dirty_flush_sg_on > /proc/io_stats
-echo reset > /proc/io_stats
-if echo async_block_selftest_rw > /proc/io_stats; then
+echo test_policy=reset > /proc/io_test_control
+echo counters=on > /proc/io_test_control
+echo virtio_counters=on > /proc/io_test_control
+echo async_block=on > /proc/io_test_control
+echo async_block_depth=4 > /proc/io_test_control
+echo async_block_la_depth=2 > /proc/io_test_control
+echo async_block_wait=hybrid > /proc/io_test_control
+echo async_dirty_flush_sg=on > /proc/io_test_control
+echo counters=reset > /proc/io_test_control
+if echo async_block_selftest_rw_scratch=vdb > /proc/io_test_control; then
     echo ASYNC_BLOCK_BATCH_RW_OK
 else
     echo ASYNC_BLOCK_QUEUE_BAD
 fi
-echo async_block_adaptive_on > /proc/io_stats
-echo async_block_merge_write_on > /proc/io_stats
+echo async_block_adaptive=on > /proc/io_test_control
+echo async_block_merge_write=on > /proc/io_test_control
 rm -f /async_dirty /async_dirty_copy
 rm -f /async_rewrite /async_rewrite_copy /async_rewrite_expected
 rm -f /async_trunc /async_trunc_expected
@@ -145,7 +146,7 @@ while [ $i -lt 18 ]; do
 done
 dd if=/dev/zero of=/async_dirty bs=4096 count=128
 sync
-echo reset > /proc/io_stats
+echo counters=reset > /proc/io_test_control
 dd if=/dev/zero of=/async_dirty bs=1024 count=512 conv=notrunc
 sync
 dd if=/async_dirty of=/async_dirty_copy bs=4096 count=128
@@ -175,13 +176,13 @@ rm -f /async_trim_first /async_trim_expected
 dd if=/async_trim_0 of=/async_trim_first bs=4096 count=1
 dd if=/bin/busybox of=/async_trim_expected bs=4096 count=1
 cmp /async_trim_first /async_trim_expected && echo ASYNC_DIRTY_FLUSH_RETAINED_TRIM_OK || echo ASYNC_DIRTY_FLUSH_RETAINED_TRIM_BAD
-if echo async_block_selftest_irq > /proc/io_stats; then
+if echo async_block_selftest_irq_scratch=vdb > /proc/io_test_control; then
     echo ASYNC_BLOCK_IRQ_DRAIN_OK
 else
     echo ASYNC_BLOCK_IRQ_DRAIN_BAD
 fi
 cat /proc/io_stats
-echo off > /proc/io_stats
+echo test_policy=reset > /proc/io_test_control
 echo ASYNC_BLOCK_QUEUE_DONE
 exit
 EOF

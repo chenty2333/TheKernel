@@ -7,21 +7,9 @@ use alloc::{
 };
 use core::{any::Any, ffi::CStr, fmt::Write as _, iter, str, task::Context};
 
-use axdriver::{
-    AsyncBlockWaitPolicy, reset_virtio_async_block_adaptive_depth, reset_virtio_io_counters,
-    set_virtio_async_block_adaptive_enabled, set_virtio_async_block_depth,
-    set_virtio_async_block_enabled, set_virtio_async_block_la_depth,
-    set_virtio_async_block_merge_write_enabled, set_virtio_async_block_wait_policy,
-    set_virtio_io_counters_enabled, virtio_io_counters_snapshot,
-};
+use axdriver::virtio_io_counters_snapshot;
 use axerrno::{AxError, LinuxError};
-use axfs::{
-    async_block_queue_interrupt_selftest, async_block_queue_irq_first_wait_selftest,
-    async_block_queue_read_selftest, async_block_queue_read_write_selftest,
-    render_io_stats_counters, reset_io_stats_counters, set_async_dirty_flush_sg_enabled,
-    set_cached_readahead_enabled, set_io_stats_counters_enabled,
-    set_lwext4_async_mapped_read_enabled,
-};
+use axfs::render_io_stats_counters;
 use axfs_ng_vfs::{
     DeviceId, DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, Location, Metadata,
     MetadataUpdate, NodeFlags, NodeOps, NodePermission, NodeType, Reference, VfsError, VfsResult,
@@ -50,11 +38,9 @@ use crate::{
         fanotify::FanotifyFile, inotify::InotifyFile, lease, pipe, try_path_into_bytes,
     },
     mm::{
-        AddrSpace, Backend, BackendOps, USER_IO_PIN_TEST_DELAY_MS_MAX, commit_limit_bytes,
-        committed_as_bytes, overcommit_memory_policy, overcommit_ratio, reset_user_io_pin_counters,
-        set_overcommit_memory_policy, set_overcommit_ratio, set_user_io_async_direct_enabled,
-        set_user_io_pin_counters_enabled, set_user_io_pin_test_delay_ms, system_memory_stats,
-        user_io_pin_counters_snapshot,
+        AddrSpace, Backend, BackendOps, commit_limit_bytes, committed_as_bytes,
+        overcommit_memory_policy, overcommit_ratio, set_overcommit_memory_policy,
+        set_overcommit_ratio, system_memory_stats, user_io_pin_counters_snapshot,
     },
     mounts,
     pseudofs::{
@@ -168,56 +154,6 @@ fn render_proc_io_stats() -> Vec<u8> {
     );
     let _ = writeln!(
         out,
-        "user_pin.async_direct_enabled {}",
-        pin.async_direct_enabled
-    );
-    let _ = writeln!(
-        out,
-        "user_pin.async_direct_read_hits {}",
-        pin.async_direct_read_hits
-    );
-    let _ = writeln!(
-        out,
-        "user_pin.async_direct_read_bytes {}",
-        pin.async_direct_read_bytes
-    );
-    let _ = writeln!(
-        out,
-        "user_pin.async_direct_read_segments {}",
-        pin.async_direct_read_segments
-    );
-    let _ = writeln!(
-        out,
-        "user_pin.async_direct_write_hits {}",
-        pin.async_direct_write_hits
-    );
-    let _ = writeln!(
-        out,
-        "user_pin.async_direct_write_bytes {}",
-        pin.async_direct_write_bytes
-    );
-    let _ = writeln!(
-        out,
-        "user_pin.async_direct_write_segments {}",
-        pin.async_direct_write_segments
-    );
-    let _ = writeln!(
-        out,
-        "user_pin.async_submit_fallbacks {}",
-        pin.async_submit_fallbacks
-    );
-    let _ = writeln!(
-        out,
-        "user_pin.async_signal_after_submit {}",
-        pin.async_signal_after_submit
-    );
-    let _ = writeln!(
-        out,
-        "user_pin.async_resource_unpins {}",
-        pin.async_resource_unpins
-    );
-    let _ = writeln!(
-        out,
         "user_prefault.to_user_attempts {}",
         pin.prefault_to_user_attempts
     );
@@ -315,7 +251,6 @@ fn render_proc_io_stats() -> Vec<u8> {
         pin.vm_range_pin_unpins
     );
     let _ = writeln!(out, "user_pin.unpins {}", pin.unpins);
-    let _ = writeln!(out, "user_pin.test_delay_ms {}", pin.test_delay_ms);
     let virtio = virtio_io_counters_snapshot();
     let _ = writeln!(out, "virtio.queue_sync_waits {}", virtio.queue_sync_waits);
     let _ = writeln!(
@@ -643,25 +578,6 @@ fn render_proc_io_stats() -> Vec<u8> {
     out.into_bytes()
 }
 
-fn parse_proc_io_stats_pin_delay_ms(text: &str) -> Option<u64> {
-    let value = text
-        .strip_prefix("pin_delay_ms=")
-        .or_else(|| text.strip_prefix("pin_delay_ms "))
-        .or_else(|| text.strip_prefix("pin_delay_ms\t"))?;
-    value.trim().parse::<u64>().ok()
-}
-
-fn parse_proc_io_stats_u64_command<'a>(text: &'a str, names: &[&str]) -> Option<u64> {
-    for name in names {
-        if let Some(value) = text
-            .strip_prefix(*name)
-            .and_then(|tail| tail.strip_prefix('=').or_else(|| tail.strip_prefix(' ')))
-        {
-            return value.trim().parse::<u64>().ok();
-        }
-    }
-    None
-}
 const PROC_PAGEMAP_ENTRY_BYTES: u64 = 8;
 const PROC_NUMA_NODEMASK: usize = 0b1;
 const PROC_LIMIT_NAMES: [(&str, Option<&str>); RLIM_NLIMITS as usize] = [
@@ -2723,168 +2639,16 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     );
     root.add(
         "io_stats",
-        SimpleFile::new_regular(
+        SimpleFile::new_regular_with_permission(
             fs.clone(),
-            RwFile::new(move |req| match req {
-                SimpleFileOperation::Read => Ok(Some(render_proc_io_stats())),
-                SimpleFileOperation::Write(data) => {
-                    if is_proc_truncate_write(data) {
-                        return Ok(None);
-                    }
-                    let Some(command) = str::from_utf8(data).ok().map(str::trim) else {
-                        return Err(VfsError::InvalidInput);
-                    };
-                    if let Some(delay_ms) = parse_proc_io_stats_pin_delay_ms(command) {
-                        if delay_ms > USER_IO_PIN_TEST_DELAY_MS_MAX {
-                            return Err(VfsError::InvalidInput);
-                        }
-                        set_user_io_pin_test_delay_ms(delay_ms)
-                            .map_err(|_| VfsError::InvalidInput)?;
-                    } else if let Some(depth) =
-                        parse_proc_io_stats_u64_command(command, &["async_block_depth"])
-                    {
-                        set_virtio_async_block_depth(depth);
-                    } else if let Some(depth) =
-                        parse_proc_io_stats_u64_command(command, &["async_block_la_depth"])
-                    {
-                        set_virtio_async_block_la_depth(depth);
-                    } else {
-                        match command {
-                            "on" | "1" => {
-                                set_io_stats_counters_enabled(true);
-                                set_user_io_pin_counters_enabled(true);
-                            }
-                            "virtio_on" | "virtio=on" | "virtio 1" => {
-                                set_virtio_io_counters_enabled(true);
-                            }
-                            "virtio_off" | "virtio=off" | "virtio 0" => {
-                                set_virtio_io_counters_enabled(false);
-                            }
-                            "async_block_on" | "async_block=on" | "async_block 1" => {
-                                set_virtio_async_block_enabled(true);
-                            }
-                            "async_block_off" | "async_block=off" | "async_block 0" => {
-                                set_virtio_async_block_enabled(false);
-                            }
-                            "async_dirty_flush_sg_on"
-                            | "async_dirty_flush_sg=on"
-                            | "async_dirty_flush_sg 1" => {
-                                set_async_dirty_flush_sg_enabled(true);
-                            }
-                            "async_dirty_flush_sg_off"
-                            | "async_dirty_flush_sg=off"
-                            | "async_dirty_flush_sg 0" => {
-                                set_async_dirty_flush_sg_enabled(false);
-                            }
-                            "cached_readahead_on"
-                            | "cached_readahead=on"
-                            | "cached_readahead 1" => {
-                                set_cached_readahead_enabled(true);
-                            }
-                            "cached_readahead_off"
-                            | "cached_readahead=off"
-                            | "cached_readahead 0" => {
-                                set_cached_readahead_enabled(false);
-                            }
-                            "user_direct_async_on"
-                            | "user_direct_async=on"
-                            | "user_direct_async 1" => {
-                                set_user_io_async_direct_enabled(true);
-                            }
-                            "user_direct_async_off"
-                            | "user_direct_async=off"
-                            | "user_direct_async 0" => {
-                                set_user_io_async_direct_enabled(false);
-                            }
-                            "lwext4_async_read_on"
-                            | "lwext4_async_read=on"
-                            | "lwext4_async_read 1" => {
-                                set_lwext4_async_mapped_read_enabled(true);
-                            }
-                            "lwext4_async_read_off"
-                            | "lwext4_async_read=off"
-                            | "lwext4_async_read 0" => {
-                                set_lwext4_async_mapped_read_enabled(false);
-                            }
-                            "async_block_wait=hybrid" | "async_block_wait hybrid" => {
-                                set_virtio_async_block_wait_policy(AsyncBlockWaitPolicy::Hybrid);
-                            }
-                            "async_block_wait=sync" | "async_block_wait sync" => {
-                                set_virtio_async_block_wait_policy(AsyncBlockWaitPolicy::Sync);
-                            }
-                            "async_block_wait=irq_first"
-                            | "async_block_wait irq_first"
-                            | "async_block_wait=interrupt_first"
-                            | "async_block_wait interrupt_first" => {
-                                set_virtio_async_block_wait_policy(
-                                    AsyncBlockWaitPolicy::InterruptFirst,
-                                );
-                            }
-                            "async_block_adaptive_on"
-                            | "async_block_adaptive=on"
-                            | "async_block_adaptive 1" => {
-                                set_virtio_async_block_adaptive_enabled(true);
-                            }
-                            "async_block_adaptive_off"
-                            | "async_block_adaptive=off"
-                            | "async_block_adaptive 0" => {
-                                set_virtio_async_block_adaptive_enabled(false);
-                            }
-                            "async_block_adaptive_reset" => {
-                                reset_virtio_async_block_adaptive_depth();
-                            }
-                            "async_block_merge_write_on"
-                            | "async_block_merge_write=on"
-                            | "async_block_merge_write 1" => {
-                                set_virtio_async_block_merge_write_enabled(true);
-                            }
-                            "async_block_merge_write_off"
-                            | "async_block_merge_write=off"
-                            | "async_block_merge_write 0" => {
-                                set_virtio_async_block_merge_write_enabled(false);
-                            }
-                            "async_block_selftest_read" => {
-                                async_block_queue_read_selftest()
-                                    .map_err(|_| VfsError::InvalidInput)?;
-                            }
-                            "async_block_selftest_rw" => {
-                                async_block_queue_read_write_selftest()
-                                    .map_err(|_| VfsError::InvalidInput)?;
-                            }
-                            "async_block_selftest_irq" => {
-                                async_block_queue_interrupt_selftest()
-                                    .map_err(|_| VfsError::InvalidInput)?;
-                            }
-                            "async_block_selftest_irq_first" => {
-                                async_block_queue_irq_first_wait_selftest()
-                                    .map_err(|_| VfsError::InvalidInput)?;
-                            }
-                            "off" | "0" => {
-                                set_io_stats_counters_enabled(false);
-                                set_user_io_pin_counters_enabled(false);
-                                set_virtio_io_counters_enabled(false);
-                                set_virtio_async_block_enabled(false);
-                                set_virtio_async_block_adaptive_enabled(false);
-                                set_virtio_async_block_merge_write_enabled(false);
-                                set_async_dirty_flush_sg_enabled(false);
-                                set_cached_readahead_enabled(false);
-                                set_user_io_async_direct_enabled(false);
-                                set_lwext4_async_mapped_read_enabled(false);
-                                set_user_io_pin_test_delay_ms(0)
-                                    .map_err(|_| VfsError::InvalidInput)?;
-                            }
-                            "reset" => {
-                                reset_io_stats_counters();
-                                reset_user_io_pin_counters();
-                                reset_virtio_io_counters();
-                            }
-                            _ => return Err(VfsError::InvalidInput),
-                        }
-                    }
-                    Ok(None)
-                }
-            }),
+            NodePermission::from_bits_truncate(0o444),
+            || -> VfsResult<Vec<u8>> { Ok(render_proc_io_stats()) },
         ),
+    );
+    #[cfg(feature = "test-io-control")]
+    root.add(
+        "io_test_control",
+        super::io_test_control::new_file(fs.clone()),
     );
     #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
     root.add(
