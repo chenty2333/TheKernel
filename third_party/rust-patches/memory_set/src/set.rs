@@ -381,23 +381,7 @@ impl<B: MappingBackend> MemorySet<B> {
         page_table: &mut B::PageTable,
         max_areas: usize,
     ) -> MappingResult {
-        self.unmap_with_limit_inner(start, size, page_table, max_areas, true)
-    }
-
-    /// Commits an unmap whose backend admission has already succeeded while
-    /// the caller kept the page table and area topology serialized.
-    ///
-    /// Fragment-cap arithmetic and fallible side-vector staging are repeated
-    /// before mutation. Only backend [`MappingBackend::preflight_unmap`] calls
-    /// are skipped.
-    pub fn commit_preflighted_unmap_with_limit(
-        &mut self,
-        start: B::Addr,
-        size: usize,
-        page_table: &mut B::PageTable,
-        max_areas: usize,
-    ) -> MappingResult {
-        self.unmap_with_limit_inner(start, size, page_table, max_areas, false)
+        self.unmap_with_limit_inner(start, size, page_table, max_areas)
     }
 
     fn unmap_with_limit_inner(
@@ -406,7 +390,6 @@ impl<B: MappingBackend> MemorySet<B> {
         size: usize,
         page_table: &mut B::PageTable,
         max_areas: usize,
-        run_backend_preflight: bool,
     ) -> MappingResult {
         let range =
             AddrRange::try_from_start_size(start, size).ok_or(MappingError::InvalidParam)?;
@@ -433,9 +416,7 @@ impl<B: MappingBackend> MemorySet<B> {
                     area.va_range().contained_in(range).then_some(area_start)
                 }),
         );
-        if run_backend_preflight {
-            self.preflight_unmap(start, size, page_table)?;
-        }
+        self.preflight_unmap(start, size, page_table)?;
 
         let end = range.end;
 

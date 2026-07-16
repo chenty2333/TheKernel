@@ -558,7 +558,6 @@ fn check_mremap_locked_growth_limit(
     has_ipc_lock: bool,
     aspace: &AddrSpace,
     grow: usize,
-    reclaimed_locked: usize,
 ) -> AxResult {
     if grow == 0 || has_ipc_lock {
         return Ok(());
@@ -566,7 +565,7 @@ fn check_mremap_locked_growth_limit(
 
     let limit_error = AxError::from(LinuxError::EAGAIN);
     let limit = proc_data.rlim.read()[RLIMIT_MEMLOCK].current;
-    if !mremap_locked_growth_allowed(aspace.locked_bytes(), grow, reclaimed_locked, limit) {
+    if !mremap_locked_growth_allowed(aspace.locked_bytes(), grow, limit) {
         return Err(limit_error);
     }
 
@@ -576,11 +575,9 @@ fn check_mremap_locked_growth_limit(
 fn mremap_locked_growth_allowed(
     current_locked: usize,
     additional_locked: usize,
-    reclaimed_locked: usize,
     limit: u64,
 ) -> bool {
     current_locked
-        .saturating_sub(reclaimed_locked)
         .checked_add(additional_locked)
         .is_some_and(|total| (total as u128) <= u128::from(limit))
 }
@@ -1116,16 +1113,7 @@ pub fn sys_mremap(
 
         let duplicated_locked = aspace.locked_bytes_in_range(addr, new_size);
         if duplicated_locked != 0 {
-            let reclaimed_locked = fixed
-                .then(|| aspace.locked_bytes_in_range(dst, new_size))
-                .unwrap_or(0);
-            check_mremap_locked_growth_limit(
-                proc_data,
-                has_ipc_lock,
-                &aspace,
-                duplicated_locked,
-                reclaimed_locked,
-            )?;
+            check_mremap_locked_growth_limit(proc_data, has_ipc_lock, &aspace, duplicated_locked)?;
         }
 
         let duplicate = if fixed {
@@ -1218,7 +1206,7 @@ pub fn sys_mremap(
         !fixed && new_size > old_size && range_is_free(&aspace, after, grow, page_size as usize);
     if can_grow_inplace {
         if grow_locked {
-            check_mremap_locked_growth_limit(proc_data, has_ipc_lock, &aspace, grow, 0)?;
+            check_mremap_locked_growth_limit(proc_data, has_ipc_lock, &aspace, grow)?;
         }
         primary.backend.ensure_range_covered(addr, new_size)?;
         let tail_backend = primary.backend.relocate(addr, addr, &aspace_handle)?;
@@ -1256,10 +1244,7 @@ pub fn sys_mremap(
     };
 
     if new_size > old_size && grow_locked {
-        let reclaimed_locked = fixed
-            .then(|| aspace.locked_bytes_in_range(dst, new_size))
-            .unwrap_or(0);
-        check_mremap_locked_growth_limit(proc_data, has_ipc_lock, &aspace, grow, reclaimed_locked)?;
+        check_mremap_locked_growth_limit(proc_data, has_ipc_lock, &aspace, grow)?;
     }
 
     if new_size > old_size {
@@ -1763,28 +1748,27 @@ mod tests {
     }
 
     #[test]
-    fn mremap_locked_growth_accounts_for_fixed_replacement_and_overflow() {
+    fn mremap_locked_growth_uses_linux_pre_replacement_accounting() {
         let page = PAGE_SIZE_4K;
 
         assert!(mremap_locked_growth_allowed(
             2 * page,
             page,
-            0,
             (3 * page) as u64
         ));
         assert!(!mremap_locked_growth_allowed(
             2 * page,
             page,
-            0,
             (2 * page) as u64
         ));
-        assert!(mremap_locked_growth_allowed(
+        // MREMAP_FIXED checks mlock growth before unmapping its destination;
+        // locked bytes there cannot be reclaimed to satisfy the admission.
+        assert!(!mremap_locked_growth_allowed(
             2 * page,
-            page,
             page,
             (2 * page) as u64,
         ));
-        assert!(!mremap_locked_growth_allowed(usize::MAX, 1, 0, u64::MAX,));
+        assert!(!mremap_locked_growth_allowed(usize::MAX, 1, u64::MAX,));
     }
 
     #[test]

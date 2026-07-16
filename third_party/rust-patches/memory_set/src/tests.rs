@@ -482,35 +482,6 @@ fn unmap_preflights_every_backend_before_mutating_any_area_or_pte() {
 }
 
 #[test]
-fn preflighted_unmap_commit_skips_only_the_already_completed_backend_admission() {
-    let preflight_calls = Arc::new(AtomicUsize::new(0));
-    let unmap_calls = Arc::new(AtomicUsize::new(0));
-    let backend = RejectingUnmapBackend {
-        preflight_calls: preflight_calls.clone(),
-        unmap_calls: unmap_calls.clone(),
-        reject_start: 0x3000,
-    };
-    let mut set = MemorySet::new();
-    let mut pt = [0; MAX_ADDR];
-    assert_ok!(set.map(
-        tracked_area(0x1000.into(), 0x1000, 1, backend),
-        &mut pt,
-        false,
-    ));
-    assert_ok!(set.preflight_unmap(0x1000.into(), 0x1000, &pt));
-    let calls_after_external_preflight = preflight_calls.load(Ordering::Relaxed);
-
-    assert_ok!(set.commit_preflighted_unmap_with_limit(0x1000.into(), 0x1000, &mut pt, 1,));
-
-    assert_eq!(
-        preflight_calls.load(Ordering::Relaxed),
-        calls_after_external_preflight
-    );
-    assert_eq!(unmap_calls.load(Ordering::Relaxed), 1);
-    assert!(set.is_empty());
-}
-
-#[test]
 fn bounded_map_rejects_before_mapping_or_growing_the_area_tree() {
     let mut set = MockMemorySet::new();
     let mut pt = [0; MAX_ADDR];

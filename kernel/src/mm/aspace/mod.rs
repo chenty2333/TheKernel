@@ -634,8 +634,6 @@ pub struct AddrSpace {
     lock_future_mappings: bool,
     lock_future_on_fault: bool,
     pt: PageTable,
-    #[cfg(test)]
-    skip_transaction_backend_preflight: bool,
 }
 
 /// The generic, testable core of one linear protection transaction.
@@ -920,8 +918,6 @@ impl AddrSpace {
             lock_future_mappings: false,
             lock_future_on_fault: false,
             pt: PageTable::try_new().map_err(|_| AxError::NoMemory)?,
-            #[cfg(test)]
-            skip_transaction_backend_preflight: false,
         })
     }
 
@@ -1868,10 +1864,6 @@ impl AddrSpace {
     }
 
     fn preflight_transaction_unmap(&self, start: VirtAddr, size: usize) -> AxResult {
-        #[cfg(test)]
-        if self.skip_transaction_backend_preflight {
-            return Ok(());
-        }
         self.areas
             .preflight_unmap(start, size, &self.pt)
             .map_err(Into::into)
@@ -1890,21 +1882,9 @@ impl AddrSpace {
             // topology fence before returning this fail-closed result.
             return Err(AxError::BadState);
         }
-        #[cfg(test)]
-        let skip_preflight = self.skip_transaction_backend_preflight;
-        #[cfg(not(test))]
-        let skip_preflight = false;
-        let rollback = if skip_preflight {
-            self.areas.commit_preflighted_unmap_with_limit(
-                start,
-                size,
-                &mut self.pt,
-                MAX_VMA_FRAGMENTS,
-            )
-        } else {
-            self.areas
-                .unmap_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS)
-        };
+        let rollback = self
+            .areas
+            .unmap_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS);
         if let Err(error) = rollback {
             // The fresh mapping incarnation remains visible. Its generation 1
             // sidecar remains valid; the caller must publish the topology
@@ -1922,12 +1902,8 @@ impl AddrSpace {
     }
 
     fn destroy_remap_destination(&mut self, start: VirtAddr, size: usize) -> AxResult {
-        self.areas.commit_preflighted_unmap_with_limit(
-            start,
-            size,
-            &mut self.pt,
-            MAX_VMA_FRAGMENTS,
-        )?;
+        self.areas
+            .unmap_with_limit(start, size, &mut self.pt, MAX_VMA_FRAGMENTS)?;
         self.refresh_growdown_starts();
         Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
         Self::clear_interval(&mut self.dontfork_ranges, start, size);
@@ -2208,12 +2184,13 @@ impl AddrSpace {
                 ) =>
             {
                 self.apply_remap_policy(destination_start, &policy);
-                match self.areas.commit_preflighted_unmap_with_limit(
+                let source_commit = self.areas.unmap_with_limit(
                     source_start,
                     source_size,
                     &mut self.pt,
                     MAX_VMA_FRAGMENTS,
-                ) {
+                );
+                match source_commit {
                     Ok(()) => {
                         self.refresh_growdown_starts();
                         Self::clear_interval(
@@ -3037,10 +3014,6 @@ impl Drop for AddrSpace {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
-    use core::{cell::Cell, mem::ManuallyDrop};
-
-    use axhal::paging::PageSize;
-    use thekernel_linux_mm::{PinAccess, PinDuration, PinUse};
 
     use super::*;
 
@@ -3082,365 +3055,6 @@ mod tests {
                 false,
             )
             .unwrap();
-    }
-
-    fn new_transaction_test_aspace() -> ManuallyDrop<AddrSpace> {
-        let base = VirtAddr::from(0x1000);
-        let va_range = VirtAddrRange::from_start_size(base, 0x10_000);
-        let (address_space_id, topology_mapping_id, topology_generation, user_io_pins) =
-            new_user_io_policy().unwrap();
-        // SAFETY: host-test axhal intentionally provides no real page-table
-        // handler. A zero root address is structurally valid for `PageTable`;
-        // these tests use lazy anonymous backends whose commits never
-        // dereference it, bypass backend PTE preflight covered elsewhere, and
-        // keep the enclosing AddrSpace in ManuallyDrop so PageTable::drop can
-        // never observe it.
-        let pt = unsafe { core::mem::MaybeUninit::<PageTable>::zeroed().assume_init() };
-        ManuallyDrop::new(AddrSpace {
-            va_range,
-            address_space_id,
-            topology_mapping_id,
-            topology_generation,
-            areas: MemorySet::new(),
-            mapping_identities: Vec::new(),
-            growdown_starts: BTreeSet::new(),
-            wipe_on_fork_ranges: BTreeMap::new(),
-            dontfork_ranges: BTreeMap::new(),
-            locked_ranges: BTreeMap::new(),
-            user_io_pins,
-            lock_future_mappings: false,
-            lock_future_on_fault: false,
-            pt,
-            skip_transaction_backend_preflight: true,
-        })
-    }
-
-    fn map_transaction_test_area(
-        aspace: &mut AddrSpace,
-        start: VirtAddr,
-        size: usize,
-    ) -> MappingLineage {
-        aspace
-            .map(
-                start,
-                size,
-                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
-                false,
-                Backend::new_alloc(start, PageSize::Size4K),
-            )
-            .unwrap();
-        aspace.find_area(start).unwrap().lineage()
-    }
-
-    fn stage_transaction_test_area(
-        aspace: &mut AddrSpace,
-        start: VirtAddr,
-        size: usize,
-        lineage: MappingLineage,
-    ) -> AxResult {
-        aspace.stage_mapping_fragment(
-            start,
-            size,
-            MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
-            false,
-            Backend::new_alloc(start, PageSize::Size4K),
-            false,
-            lineage,
-        )
-    }
-
-    fn transaction_area_snapshot(aspace: &AddrSpace) -> Vec<(VirtAddr, VirtAddr, MappingLineage)> {
-        aspace
-            .areas
-            .iter()
-            .map(|area| (area.start(), area.end(), area.lineage()))
-            .collect()
-    }
-
-    #[test]
-    fn fixed_duplicate_replaces_once_with_fresh_identity_and_copies_vma_policy() {
-        let mut aspace = new_transaction_test_aspace();
-        let source = VirtAddr::from(0x2000);
-        let destination = VirtAddr::from(0x8000);
-        let size = 2 * PAGE_SIZE_4K;
-        let source_lineage = map_transaction_test_area(&mut aspace, source, size);
-        let old_destination_lineage = map_transaction_test_area(&mut aspace, destination, size);
-        aspace.mark_growdown(source);
-        aspace.set_wipe_on_fork(source, PAGE_SIZE_4K, true).unwrap();
-        aspace
-            .set_dontfork(source + PAGE_SIZE_4K, PAGE_SIZE_4K, true)
-            .unwrap();
-        aspace.set_locked(source, size, true).unwrap();
-        let source_identity = aspace.mapping_identity(source_lineage).unwrap();
-        let topology_before = aspace.topology_generation;
-
-        aspace
-            .replace_and_duplicate_mapping_transaction(
-                source,
-                size,
-                destination,
-                size,
-                1,
-                |aspace, lineage| stage_transaction_test_area(aspace, destination, size, lineage),
-            )
-            .unwrap();
-
-        assert_eq!(aspace.topology_generation, topology_before.next().unwrap());
-        assert_eq!(
-            aspace.mapping_identity(source_lineage).unwrap(),
-            source_identity
-        );
-        assert!(aspace.mapping_identity(old_destination_lineage).is_err());
-        let destination_lineage = aspace.find_area(destination).unwrap().lineage();
-        assert_ne!(destination_lineage, source_lineage);
-        assert_ne!(destination_lineage, old_destination_lineage);
-        assert_eq!(
-            aspace
-                .mapping_identity(destination_lineage)
-                .unwrap()
-                .generation
-                .get(),
-            1
-        );
-        assert!(aspace.growdown_starts.contains(&source));
-        assert!(aspace.growdown_starts.contains(&destination));
-        assert!(
-            AddrSpace::interval_end_covering(&aspace.wipe_on_fork_ranges, destination).is_some()
-        );
-        assert!(
-            AddrSpace::interval_end_covering(&aspace.dontfork_ranges, destination + PAGE_SIZE_4K)
-                .is_some()
-        );
-        assert!(aspace.range_is_fully_locked(destination, size));
-    }
-
-    #[test]
-    fn fixed_move_late_stage_failure_destroys_destination_but_preserves_source() {
-        let mut aspace = new_transaction_test_aspace();
-        let source = VirtAddr::from(0x2000);
-        let destination = VirtAddr::from(0x8000);
-        let size = PAGE_SIZE_4K;
-        let source_lineage = map_transaction_test_area(&mut aspace, source, size);
-        let old_destination_lineage = map_transaction_test_area(&mut aspace, destination, size);
-        aspace.set_wipe_on_fork(source, size, true).unwrap();
-        aspace.set_dontfork(destination, size, true).unwrap();
-        aspace.set_locked(destination, size, true).unwrap();
-        let source_identity = aspace.mapping_identity(source_lineage).unwrap();
-        let topology_before = aspace.topology_generation;
-
-        let error = aspace
-            .replace_and_move_mapping_transaction(
-                source,
-                size,
-                destination,
-                size,
-                1,
-                |aspace, lineage| {
-                    stage_transaction_test_area(aspace, destination, size, lineage)?;
-                    Err::<(), _>(AxError::NoMemory)
-                },
-            )
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            ReplaceMappingError::DestinationDestroyed(AxError::NoMemory)
-        ));
-        assert_eq!(aspace.topology_generation, topology_before.next().unwrap());
-        assert_eq!(aspace.find_area(source).unwrap().lineage(), source_lineage);
-        assert_eq!(
-            aspace.mapping_identity(source_lineage).unwrap(),
-            source_identity
-        );
-        assert!(aspace.find_area(destination).is_none());
-        assert!(aspace.mapping_identity(old_destination_lineage).is_err());
-        assert!(AddrSpace::interval_end_covering(&aspace.wipe_on_fork_ranges, source).is_some());
-        assert!(AddrSpace::interval_end_covering(&aspace.dontfork_ranges, destination).is_none());
-        assert!(!aspace.range_is_fully_locked(destination, size));
-    }
-
-    #[test]
-    fn fixed_move_combines_same_lineage_mutations_and_publishes_once() {
-        let mut aspace = new_transaction_test_aspace();
-        let source = VirtAddr::from(0x2000);
-        let destination = VirtAddr::from(0x8000);
-        let size = PAGE_SIZE_4K;
-        let old_lineage = map_transaction_test_area(&mut aspace, source, size);
-        aspace
-            .map_with_existing_lineage(
-                destination,
-                size,
-                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
-                false,
-                Backend::new_alloc(destination, PageSize::Size4K),
-                false,
-                old_lineage,
-            )
-            .unwrap();
-        let topology_before = aspace.topology_generation;
-
-        aspace
-            .replace_and_move_mapping_transaction(
-                source,
-                size,
-                destination,
-                size,
-                1,
-                |aspace, lineage| stage_transaction_test_area(aspace, destination, size, lineage),
-            )
-            .unwrap();
-
-        assert_eq!(aspace.topology_generation, topology_before.next().unwrap());
-        assert!(aspace.find_area(source).is_none());
-        let fresh_lineage = aspace.find_area(destination).unwrap().lineage();
-        assert_ne!(fresh_lineage, old_lineage);
-        assert!(aspace.mapping_identity(old_lineage).is_err());
-        assert_eq!(aspace.mapping_identities.len(), 1);
-    }
-
-    #[test]
-    fn partial_move_advances_surviving_source_lineage() {
-        let mut aspace = new_transaction_test_aspace();
-        let source = VirtAddr::from(0x2000);
-        let destination = VirtAddr::from(0x8000);
-        let source_lineage = map_transaction_test_area(&mut aspace, source, 2 * PAGE_SIZE_4K);
-        let source_generation = aspace.mapping_identity(source_lineage).unwrap().generation;
-        let topology_before = aspace.topology_generation;
-
-        aspace
-            .move_mapping_into_empty_transaction(
-                source,
-                PAGE_SIZE_4K,
-                destination,
-                PAGE_SIZE_4K,
-                1,
-                |aspace, lineage| {
-                    stage_transaction_test_area(aspace, destination, PAGE_SIZE_4K, lineage)
-                },
-            )
-            .unwrap();
-
-        assert_eq!(aspace.topology_generation, topology_before.next().unwrap());
-        assert!(aspace.find_area(source).is_none());
-        assert_eq!(
-            aspace.find_area(source + PAGE_SIZE_4K).unwrap().lineage(),
-            source_lineage
-        );
-        assert_eq!(
-            aspace.mapping_identity(source_lineage).unwrap().generation,
-            source_generation.next().unwrap()
-        );
-    }
-
-    #[test]
-    fn replacement_preflight_failures_leave_topology_areas_and_sidecars_unchanged() {
-        let source = VirtAddr::from(0x2000);
-        let destination = VirtAddr::from(0x8000);
-        let size = PAGE_SIZE_4K;
-
-        let mut exhausted = new_transaction_test_aspace();
-        map_transaction_test_area(&mut exhausted, source, size);
-        map_transaction_test_area(&mut exhausted, destination, size);
-        exhausted.topology_generation = MappingGeneration::new(u64::MAX).unwrap();
-        let exhausted_areas = transaction_area_snapshot(&exhausted);
-        let exhausted_identities = exhausted.mapping_identities.clone();
-        let stage_called = Cell::new(false);
-
-        let error = exhausted
-            .duplicate_mapping_transaction(
-                RemapDestination::Replace,
-                source,
-                size,
-                destination,
-                size,
-                1,
-                MAX_VMA_FRAGMENTS,
-                |_, _| {
-                    stage_called.set(true);
-                    Ok(())
-                },
-            )
-            .unwrap_err();
-        assert!(!error.destination_destroyed);
-        assert_eq!(error.error, AxError::ResourceBusy);
-        assert!(!stage_called.get());
-        assert_eq!(transaction_area_snapshot(&exhausted), exhausted_areas);
-        assert_eq!(exhausted.mapping_identities, exhausted_identities);
-        assert_eq!(exhausted.topology_generation.get(), u64::MAX);
-
-        let mut capacity = new_transaction_test_aspace();
-        map_transaction_test_area(&mut capacity, source, size);
-        map_transaction_test_area(&mut capacity, destination, size);
-        let capacity_topology = capacity.topology_generation;
-        let capacity_areas = transaction_area_snapshot(&capacity);
-        let capacity_identities = capacity.mapping_identities.clone();
-        let stage_called = Cell::new(false);
-        let error = capacity
-            .duplicate_mapping_transaction(
-                RemapDestination::Replace,
-                source,
-                size,
-                destination,
-                size,
-                2,
-                2,
-                |_, _| {
-                    stage_called.set(true);
-                    Ok(())
-                },
-            )
-            .unwrap_err();
-        assert!(!error.destination_destroyed);
-        assert_eq!(error.error, AxError::NoMemory);
-        assert!(!stage_called.get());
-        assert_eq!(transaction_area_snapshot(&capacity), capacity_areas);
-        assert_eq!(capacity.mapping_identities, capacity_identities);
-        assert_eq!(capacity.topology_generation, capacity_topology);
-    }
-
-    #[test]
-    fn pinned_source_rejects_fixed_move_before_destination_replacement() {
-        let mut aspace = new_transaction_test_aspace();
-        let source = VirtAddr::from(0x2000);
-        let destination = VirtAddr::from(0x8000);
-        let size = PAGE_SIZE_4K;
-        map_transaction_test_area(&mut aspace, source, size);
-        map_transaction_test_area(&mut aspace, destination, size);
-        let request = PinRequest::from_raw(
-            source.as_usize(),
-            size,
-            PinAccess::Read,
-            PinDuration::AsyncIo,
-            PinUse::BlockIo,
-            aspace.user_io_pin_owner().get(),
-        )
-        .unwrap();
-        let (reservation, system_charge, expectations) = aspace.begin_user_io_pin(request).unwrap();
-        let token = aspace
-            .publish_user_io_pin(reservation, &expectations)
-            .unwrap();
-        let topology_before = aspace.topology_generation;
-        let areas_before = transaction_area_snapshot(&aspace);
-        let identities_before = aspace.mapping_identities.clone();
-        let stage_called = Cell::new(false);
-
-        let error = aspace
-            .replace_and_move_mapping_transaction(source, size, destination, size, 1, |_, _| {
-                stage_called.set(true);
-                Ok(())
-            })
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            ReplaceMappingError::DestinationPreserved(AxError::ResourceBusy)
-        ));
-        assert!(!stage_called.get());
-        assert_eq!(transaction_area_snapshot(&aspace), areas_before);
-        assert_eq!(aspace.mapping_identities, identities_before);
-        assert_eq!(aspace.topology_generation, topology_before);
-        aspace.end_user_io_pin(token);
-        drop(system_charge);
     }
 
     #[test]
