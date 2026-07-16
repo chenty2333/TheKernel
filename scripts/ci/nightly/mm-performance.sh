@@ -52,8 +52,21 @@ repo_commit=$(git -C "$REPO_ROOT" rev-parse --verify HEAD) \
 if [ -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)" ]; then
     nightly_fail 'exact-HEAD MM evidence requires a clean TheKernel worktree'
 fi
-ax_repo=${THEKERNEL_AX_REPO:-$REPO_ROOT/../thekernel-ax}
-linux_abi_repo=${THEKERNEL_LINUX_ABI_REPO:-$REPO_ROOT/../thekernel-linux-abi}
+cargo_ax_repo=$(cd -- "$REPO_ROOT/../thekernel-ax" && pwd -P) \
+    || nightly_fail 'missing Cargo path dependency: ../thekernel-ax'
+cargo_linux_abi_repo=$(cd -- "$REPO_ROOT/../thekernel-linux-abi" && pwd -P) \
+    || nightly_fail 'missing Cargo path dependency: ../thekernel-linux-abi'
+ax_repo=${THEKERNEL_AX_REPO:-$cargo_ax_repo}
+linux_abi_repo=${THEKERNEL_LINUX_ABI_REPO:-$cargo_linux_abi_repo}
+ax_repo=$(cd -- "$ax_repo" && pwd -P) \
+    || nightly_fail "missing maintained dependency: $ax_repo"
+linux_abi_repo=$(cd -- "$linux_abi_repo" && pwd -P) \
+    || nightly_fail "missing maintained dependency: $linux_abi_repo"
+[ "$ax_repo" = "$cargo_ax_repo" ] \
+    || nightly_fail 'THEKERNEL_AX_REPO does not match the Cargo path dependency'
+[ "$linux_abi_repo" = "$cargo_linux_abi_repo" ] \
+    || nightly_fail \
+        'THEKERNEL_LINUX_ABI_REPO does not match the Cargo path dependency'
 for dependency in "$ax_repo" "$linux_abi_repo"; do
     [ -d "$dependency" ] || nightly_fail "missing maintained dependency: $dependency"
     if [ -n "$(git -C "$dependency" status --porcelain --untracked-files=all)" ]; then
@@ -64,11 +77,13 @@ ax_commit=$(git -C "$ax_repo" rev-parse --verify HEAD) \
     || nightly_fail 'cannot resolve thekernel-ax HEAD'
 linux_abi_commit=$(git -C "$linux_abi_repo" rev-parse --verify HEAD) \
     || nightly_fail 'cannot resolve thekernel-linux-abi HEAD'
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     thekernel_commit thekernel_ax_commit thekernel_linux_abi_commit \
-    arch requested_cpus online_cpus kernel_sha256 rootfs_sha256 \
-    qemu_binary qemu_version metrics_artifact qemu_log >"$manifest"
+    arch requested_cpus online_cpus iterations live_vmas pin_iterations \
+    pin_workers kernel_sha256 rootfs_sha256 qemu_binary qemu_version \
+    kernel_artifact metrics_artifact commands qemu_log >"$manifest"
 
+run_count=0
 while IFS= read -r arch; do
     for cpus in "${cpu_counts[@]}"; do
         run_name="${arch}-${cpus}cpu"
@@ -89,6 +104,10 @@ while IFS= read -r arch; do
             export THEKERNEL_KERNEL_CPUS=$cpus
             export SMP=$cpus
             export THEKERNEL_NIGHTLY_REBUILD_KERNELS=1
+            # The helper binary is part of the evidence contract. Re-enter the
+            # content-addressed rootfs builder instead of trusting a materialized
+            # image left by an older checkout.
+            export THEKERNEL_NIGHTLY_REBUILD_ROOTFS=1
             nightly_run_guest "$arch" "$commands" "$run_dir"
         )
         nightly_validate_guest_log \
@@ -97,6 +116,9 @@ while IFS= read -r arch; do
             'MM_PERF_DONE status=ok'
         python3 "$CI_SCRIPT_DIR/parse-mm-performance.py" \
             "$run_dir/qemu.log" --arch "$arch" --cpus "$cpus" \
+            --iterations "$MM_PERF_ITERATIONS" \
+            --pin-iterations "$MM_PERF_PIN_ITERATIONS" \
+            --pin-workers "$cpus" \
             --output "$artifact"
 
         if [ "$first_artifact" -eq 1 ]; then
@@ -112,18 +134,23 @@ while IFS= read -r arch; do
             || nightly_fail "invalid architecture after run: $arch"
         qemu=$(nightly_qemu_binary "$arch") \
             || nightly_fail "invalid QEMU architecture after run: $arch"
+        kernel_artifact="$run_dir/kernel"
+        cp -- "$kernel" "$kernel_artifact"
         online_cpus=$(awk -F '\t' 'NR == 2 { print $3 }' "$artifact")
         [ "$online_cpus" = "$cpus" ] \
             || nightly_fail "parsed topology drift for $run_name: $online_cpus"
-        kernel_sha256=$(sha256sum "$kernel" | awk '{ print $1 }')
+        kernel_sha256=$(sha256sum "$kernel_artifact" | awk '{ print $1 }')
         rootfs_sha256=$(sha256sum "$rootfs" | awk '{ print $1 }')
         qemu_version=$("$qemu" --version | sed -n '1{s/[[:space:]]\+/ /g;p;}')
         qemu_version=${qemu_version//$'\t'/ }
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$repo_commit" "$ax_commit" "$linux_abi_commit" \
-            "$arch" "$cpus" "$online_cpus" "$kernel_sha256" \
-            "$rootfs_sha256" "$(command -v "$qemu")" "$qemu_version" \
-            "$artifact" "$run_dir/qemu.log" >>"$manifest"
+            "$arch" "$cpus" "$online_cpus" "$MM_PERF_ITERATIONS" \
+            "$MM_PERF_VMAS" "$MM_PERF_PIN_ITERATIONS" "$cpus" \
+            "$kernel_sha256" "$rootfs_sha256" "$(command -v "$qemu")" \
+            "$qemu_version" "$kernel_artifact" "$artifact" "$commands" \
+            "$run_dir/qemu.log" >>"$manifest"
+        run_count=$((run_count + 1))
     done
 done <<<"$selected_arches"
 
@@ -132,5 +159,24 @@ missing_count=$(
         'NR > 1 && $5 == "missing" { count += 1 } END { print count + 0 }' \
         "$matrix"
 )
+[ "$missing_count" -eq 0 ] \
+    || nightly_fail "MM performance evidence contains $missing_count missing metrics"
+metric_rows=$(awk 'END { print NR - 1 }' "$matrix")
+manifest_rows=$(awk 'END { print NR - 1 }' "$manifest")
+[ "$metric_rows" -eq $((run_count * 5)) ] \
+    || nightly_fail "MM performance matrix row-count drift: $metric_rows"
+[ "$manifest_rows" -eq "$run_count" ] \
+    || nightly_fail "MM performance manifest row-count drift: $manifest_rows"
+
+for state in \
+    "$REPO_ROOT:$repo_commit:TheKernel" \
+    "$ax_repo:$ax_commit:thekernel-ax" \
+    "$linux_abi_repo:$linux_abi_commit:thekernel-linux-abi"; do
+    IFS=: read -r dependency expected_commit label <<<"$state"
+    [ "$(git -C "$dependency" rev-parse --verify HEAD)" = "$expected_commit" ] \
+        || nightly_fail "$label HEAD changed during MM evidence capture"
+    [ -z "$(git -C "$dependency" status --porcelain --untracked-files=all)" ] \
+        || nightly_fail "$label worktree changed during MM evidence capture"
+done
 printf 'nightly MM performance evidence: COMPLETE matrix=%s manifest=%s explicit_missing=%s\n' \
     "$matrix" "$manifest" "$missing_count"

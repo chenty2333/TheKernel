@@ -126,6 +126,35 @@ def parse_topology(fields: dict[str, str], requested_cpus: int) -> int:
     return online_cpus
 
 
+def parse_affinity(fields: dict[str, str], online_cpus: int) -> None:
+    context = "MM_PERF_AFFINITY"
+    require_keys(
+        fields,
+        {"status", "bytes", "allowed_cpus"},
+        {"status", "bytes", "allowed_cpus"},
+        context,
+    )
+    if fields["status"] != "ok":
+        raise EvidenceError(f"affinity has invalid status: {fields['status']!r}")
+    returned_bytes = parse_positive_int(fields["bytes"], "bytes", context)
+    allowed_cpus = parse_positive_int(
+        fields["allowed_cpus"], "allowed_cpus", context
+    )
+    if returned_bytes % 8 != 0:
+        raise EvidenceError(
+            f"affinity byte count is not 64-bit word aligned: {returned_bytes}"
+        )
+    if returned_bytes * 8 < online_cpus:
+        raise EvidenceError(
+            f"affinity mask is too short: bytes={returned_bytes} cpus={online_cpus}"
+        )
+    if allowed_cpus != online_cpus:
+        raise EvidenceError(
+            "affinity/topology mismatch: "
+            f"allowed={allowed_cpus} online={online_cpus}"
+        )
+
+
 def parse_metric(fields: dict[str, str]) -> Metric:
     common = {"metric", "status", "count", "p50_ns", "p99_ns", "p999_ns"}
     name = fields.get("metric", "")
@@ -177,8 +206,14 @@ def parse_metric(fields: dict[str, str]) -> Metric:
     raise EvidenceError(f"{context} has invalid status: {status!r}")
 
 
-def parse_evidence(log: Path, arch: str, requested_cpus: int) -> Evidence:
+def parse_evidence(
+    log: Path,
+    arch: str,
+    requested_cpus: int,
+    expected_counts: dict[str, int] | None = None,
+) -> Evidence:
     topology_fields: dict[str, str] | None = None
+    affinity_fields: dict[str, str] | None = None
     metrics: dict[str, Metric] = {}
     done_count = 0
     semantics_count = 0
@@ -193,6 +228,10 @@ def parse_evidence(log: Path, arch: str, requested_cpus: int) -> Evidence:
             if topology_fields is not None:
                 raise EvidenceError("duplicate MM_PERF_TOPOLOGY record")
             topology_fields = parse_fields(line, "MM_PERF_TOPOLOGY ")
+        elif line.startswith("MM_PERF_AFFINITY "):
+            if affinity_fields is not None:
+                raise EvidenceError("duplicate MM_PERF_AFFINITY record")
+            affinity_fields = parse_fields(line, "MM_PERF_AFFINITY ")
         elif line.startswith("MM_PERF "):
             metric = parse_metric(parse_fields(line, "MM_PERF "))
             if metric.name in metrics:
@@ -218,6 +257,9 @@ def parse_evidence(log: Path, arch: str, requested_cpus: int) -> Evidence:
     if topology_fields is None:
         raise EvidenceError("missing MM_PERF_TOPOLOGY record")
     online_cpus = parse_topology(topology_fields, requested_cpus)
+    if affinity_fields is None:
+        raise EvidenceError("missing MM_PERF_AFFINITY record")
+    parse_affinity(affinity_fields, online_cpus)
     if semantics_count != 1:
         raise EvidenceError(
             f"expected one MM_PERF_SEMANTICS record, found {semantics_count}"
@@ -229,6 +271,14 @@ def parse_evidence(log: Path, arch: str, requested_cpus: int) -> Evidence:
         raise EvidenceError(
             "missing required metric records: " + ", ".join(missing_metrics)
         )
+    if expected_counts is not None:
+        for name in EXPECTED_METRICS:
+            metric = metrics[name]
+            if metric.status == "ok" and metric.count != expected_counts[name]:
+                raise EvidenceError(
+                    f"{name} count mismatch: "
+                    f"expected={expected_counts[name]} actual={metric.count}"
+                )
     return Evidence(
         arch=arch,
         requested_cpus=requested_cpus,
@@ -309,14 +359,36 @@ def main() -> int:
     parser.add_argument("log", type=Path)
     parser.add_argument("--arch", required=True, choices=("rv", "la", "host"))
     parser.add_argument("--cpus", required=True, type=int)
+    parser.add_argument("--iterations", type=int)
+    parser.add_argument("--pin-iterations", type=int)
+    parser.add_argument("--pin-workers", type=int)
     parser.add_argument("--format", choices=("tsv", "json"), default="tsv")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.cpus <= 0:
         parser.error("--cpus must be positive")
+    count_arguments = (args.iterations, args.pin_iterations, args.pin_workers)
+    if any(value is not None for value in count_arguments) and not all(
+        value is not None and value > 0 for value in count_arguments
+    ):
+        parser.error(
+            "--iterations, --pin-iterations, and --pin-workers must be "
+            "positive and supplied together"
+        )
+    expected_counts = None
+    if args.iterations is not None:
+        expected_counts = {
+            "vma_scale": args.iterations,
+            "mremap_latency": args.iterations * 2,
+            "protect_touch_latency": args.iterations,
+            "pin_throughput": args.pin_iterations,
+            "pin_contention": args.pin_iterations * args.pin_workers,
+        }
 
     try:
-        evidence = parse_evidence(args.log, args.arch, args.cpus)
+        evidence = parse_evidence(
+            args.log, args.arch, args.cpus, expected_counts=expected_counts
+        )
         if args.output is None:
             output = sys.stdout
             close_output = False

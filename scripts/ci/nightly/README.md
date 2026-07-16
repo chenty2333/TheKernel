@@ -25,7 +25,8 @@ The repository-owned adapters cover:
   records VMA-scale mapping latency, `mremap` latency, an `mprotect` plus touch
   TLB-sensitive proxy, and regular-file direct-I/O pin latency, throughput, and
   concurrent contention. Every metric contains count/p50/p99/p999; unavailable
-  paths remain explicit `missing` records with a reason and errno.
+  paths remain explicit `missing` records with a reason and errno, and make the
+  mandatory matrix fail instead of being reported as a completed baseline.
 
 These gates deliberately do not overclaim. The OOM adapter does not substitute
 for a future kernel-allocator failpoint framework or OOM-victim policy test.
@@ -37,9 +38,9 @@ The MM adapter verifies that the guest actually brought the requested CPU count
 online and rejects a topology mismatch. Its protect-and-touch metric is a
 user-visible TLB-sensitive proxy, not a hardware TLB-shootdown event counter.
 Likewise, concurrent direct I/O is an end-to-end proxy that reaches the pin
-path; it does not isolate time spent in one particular spinlock.
-Explicitly missing metrics make an evidence capture complete, but do not prove
-that the missing capability is implemented.
+path; it does not isolate time spent in one particular spinlock. The standalone
+parser can still normalize an explicit `missing` record for diagnostic use,
+but the nightly adapter requires all five metrics to be present.
 
 `THEKERNEL_NIGHTLY_ARCHES` accepts `rv`, `la`, or `both` (the default). Missing
 QEMU binaries, cross compilers, rootfs build tools, or filesystem tools cause
@@ -48,13 +49,17 @@ hardware-only testing; its exit `78` retains the same unsupported meaning.
 
 The MM matrix defaults to `THEKERNEL_MM_PERF_CPUS="4 8"`. Kernel build cache
 identities include the CPU count from `THEKERNEL_KERNEL_CPUS` (or make's
-`SMP`), while `THEKERNEL_QEMU_CPUS` controls the runner topology; the adapter
+`SMP`) and the complete maintained source trees used through Cargo path
+dependencies. `THEKERNEL_QEMU_CPUS` controls the runner topology; the adapter
 sets the product variables to the same value and the guest record provides the
-third, runtime check.
+third, runtime check. The rootfs is rematerialized through its content-addressed
+builder so the guest helper cannot silently predate the checked-out source.
 
 `mm-performance.sh` refuses to label a dirty checkout as exact-HEAD evidence.
 Its manifest records the full TheKernel, `thekernel-ax`, and
-`thekernel-linux-abi` commits; guest online topology; kernel and rootfs SHA-256;
-QEMU path/version; and the per-run metrics/log paths. The guest also completes
-fixed-destination replacement, shared `old_size == 0` alias/coherence, and
-grow/shrink prefix-integrity checks before emitting the semantic-pass marker.
+`thekernel-linux-abi` commits; workload parameters; guest online topology;
+kernel and rootfs SHA-256; QEMU path/version; and the immutable per-run kernel,
+command, metrics, and log paths. It rechecks all three clean HEADs after the
+matrix. The guest also completes fixed-destination replacement, shared
+`old_size == 0` alias/coherence, and grow/shrink prefix-integrity checks before
+emitting the semantic-pass marker.

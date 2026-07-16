@@ -26,7 +26,7 @@ if str(REPO_FOR_IMPORTS) not in sys.path:
 from tools.project_paths import repo_root as find_repo_root  # noqa: E402
 
 
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 LOCK_STALE_SECS = 30 * 60
 LOCK_POLL_SECS = 0.2
 IGNORE_DIR_NAMES = frozenset({"__pycache__", ".git"})
@@ -225,8 +225,12 @@ def fingerprint_inputs(
                     entries.append((f"absent:{relpath(root, abs_path, spec.path)}", "ABSENT"))
                     continue
                 raise FileNotFoundError(f"required input tree missing: {spec.path}")
+            tree_key = relpath(root, abs_path, spec.path).rstrip("/")
             for file_path in iter_tree_files(abs_path):
-                entries.append((relpath(root, file_path, spec.path), digests.digest_file(file_path)))
+                relative_file = file_path.relative_to(abs_path).as_posix()
+                entries.append(
+                    (f"{tree_key}/{relative_file}", digests.digest_file(file_path))
+                )
             continue
         raise ValueError(f"unknown input kind: {spec.kind}")
 
@@ -389,6 +393,18 @@ def kernel_input_specs(req: KernelRequest) -> list[InputSpec]:
         InputSpec("tree", "crates"),
         InputSpec("tree", "third_party/rust-patches"),
         InputSpec("tree", "make"),
+        # These are real Cargo path dependencies, not merely repositories
+        # mentioned by release tooling.  Their source must therefore be part
+        # of the content-addressed kernel identity; otherwise a sibling update
+        # can incorrectly reuse a kernel compiled from older code.
+        InputSpec("file", "../thekernel-ax/Cargo.toml"),
+        InputSpec("file", "../thekernel-ax/Cargo.lock"),
+        InputSpec("file", "../thekernel-ax/rust-toolchain.toml"),
+        InputSpec("tree", "../thekernel-ax/crates"),
+        InputSpec("file", "../thekernel-linux-abi/Cargo.toml"),
+        InputSpec("file", "../thekernel-linux-abi/Cargo.lock"),
+        InputSpec("file", "../thekernel-linux-abi/rust-toolchain.toml"),
+        InputSpec("tree", "../thekernel-linux-abi/crates"),
     ]
 
 

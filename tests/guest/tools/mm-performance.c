@@ -798,6 +798,46 @@ static int parse_arguments(int argc, char **argv, struct config *config)
     return 0;
 }
 
+static int raw_affinity_snapshot(size_t *returned_bytes,
+                                 size_t *allowed_cpus,
+                                 int *failure_errno)
+{
+#ifdef SYS_sched_getaffinity
+    unsigned char mask[sizeof(cpu_set_t)];
+    long result;
+    size_t count = 0;
+    size_t index;
+
+    memset(mask, 0, sizeof(mask));
+    result = syscall(SYS_sched_getaffinity, 0, sizeof(mask), mask);
+    if (result <= 0 || (unsigned long)result > sizeof(mask) ||
+        (size_t)result % sizeof(unsigned long) != 0) {
+        *failure_errno = result < 0 ? errno : EPROTO;
+        return -1;
+    }
+    for (index = 0; index < (size_t)result; ++index) {
+        unsigned char byte = mask[index];
+
+        while (byte != 0) {
+            count += byte & 1U;
+            byte >>= 1U;
+        }
+    }
+    if (count == 0) {
+        *failure_errno = EIO;
+        return -1;
+    }
+    *returned_bytes = (size_t)result;
+    *allowed_cpus = count;
+    return 0;
+#else
+    (void)returned_bytes;
+    (void)allowed_cpus;
+    *failure_errno = ENOSYS;
+    return -1;
+#endif
+}
+
 int main(int argc, char **argv)
 {
     struct config config = {
@@ -808,6 +848,9 @@ int main(int argc, char **argv)
     };
     const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
     const long system_page_size = sysconf(_SC_PAGESIZE);
+    size_t affinity_bytes = 0;
+    size_t affinity_cpus = 0;
+    int affinity_errno = 0;
     size_t page_size;
     struct metric_result result;
     const char *failed_semantic_test = "unknown";
@@ -824,8 +867,19 @@ int main(int argc, char **argv)
         printf("MM_PERF_TOPOLOGY status=missing online_cpus=missing"
                " reason=sysconf_failed errno=%d\n",
                errno);
+    } else if (raw_affinity_snapshot(&affinity_bytes, &affinity_cpus,
+                                     &affinity_errno) != 0) {
+        printf("MM_PERF_TOPOLOGY status=missing online_cpus=missing"
+               " reason=affinity_abi_invalid errno=%d\n",
+               affinity_errno);
+    } else if ((size_t)online_cpus != affinity_cpus) {
+        printf("MM_PERF_TOPOLOGY status=missing online_cpus=missing"
+               " reason=topology_affinity_mismatch errno=%d\n",
+               EIO);
     } else {
         printf("MM_PERF_TOPOLOGY status=ok online_cpus=%ld\n", online_cpus);
+        printf("MM_PERF_AFFINITY status=ok bytes=%zu allowed_cpus=%zu\n",
+               affinity_bytes, affinity_cpus);
     }
     if (config.pin_workers == 0) {
         config.pin_workers = online_cpus > 0 ? (size_t)online_cpus : 1U;

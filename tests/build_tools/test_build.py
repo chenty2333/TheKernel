@@ -9,11 +9,14 @@ from unittest.mock import patch
 from tools.build import (
     BuildError,
     FileDigestStore,
+    InputSpec,
+    KernelRequest,
     RootfsRequest,
     ensure_rootfs,
+    fingerprint_inputs,
     hash_params,
+    kernel_input_specs,
     kernel_params,
-    KernelRequest,
     make_kernel_request,
     rootfs_params,
 )
@@ -21,6 +24,26 @@ from tools.project_paths import repo_root
 
 
 class BuildCacheTests(unittest.TestCase):
+    def test_external_tree_fingerprint_includes_relative_file_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            root = parent / "TheKernel"
+            external = parent / "thekernel-ax" / "crates"
+            root.mkdir()
+            external.mkdir(parents=True)
+            source = external / "old.rs"
+            source.write_text("pub const VALUE: usize = 1;\n", encoding="utf-8")
+            store = FileDigestStore(parent / "digests.sqlite")
+            spec = [InputSpec("tree", "../thekernel-ax/crates")]
+            try:
+                before = fingerprint_inputs(spec, root=root, digests=store)
+                source.rename(external / "new.rs")
+                after = fingerprint_inputs(spec, root=root, digests=store)
+            finally:
+                store.close()
+
+            self.assertNotEqual(before, after)
+
     def test_file_digest_store_reuses_hash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -89,6 +112,27 @@ class BuildCacheTests(unittest.TestCase):
 
 
 class BuildKernelParamTests(unittest.TestCase):
+    def test_kernel_identity_includes_maintained_path_dependency_sources(self) -> None:
+        request = KernelRequest(
+            name="kernel-rv",
+            arch="riscv64",
+            make_args=("BUS=mmio",),
+            app_features="qemu",
+            patch_script="scripts/patch-riscv-kernel-elf.py",
+            root=repo_root(),
+        )
+        specs = set(kernel_input_specs(request))
+        self.assertTrue(
+            {
+                InputSpec("file", "../thekernel-ax/Cargo.toml"),
+                InputSpec("file", "../thekernel-ax/Cargo.lock"),
+                InputSpec("tree", "../thekernel-ax/crates"),
+                InputSpec("file", "../thekernel-linux-abi/Cargo.toml"),
+                InputSpec("file", "../thekernel-linux-abi/Cargo.lock"),
+                InputSpec("tree", "../thekernel-linux-abi/crates"),
+            }.issubset(specs)
+        )
+
     def test_kernel_params_include_fixed_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

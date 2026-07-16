@@ -16,6 +16,7 @@ PARSER = REPO_ROOT / "scripts" / "ci" / "parse-mm-performance.py"
 
 def complete_log(*, topology: int = 4, missing_pin: bool = False) -> str:
     records = [f"MM_PERF_TOPOLOGY status=ok online_cpus={topology}"]
+    records.append(f"MM_PERF_AFFINITY status=ok bytes=8 allowed_cpus={topology}")
     records.append("MM_PERF_SEMANTICS status=ok")
     for metric in ("vma_scale", "mremap_latency", "protect_touch_latency"):
         records.append(
@@ -155,6 +156,16 @@ class MmPerformanceParserTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("guest CPU topology unavailable", result.stderr)
 
+    def test_rejects_compact_non_linux_affinity_length(self) -> None:
+        log = complete_log().replace(
+            "MM_PERF_AFFINITY status=ok bytes=8 allowed_cpus=4",
+            "MM_PERF_AFFINITY status=ok bytes=1 allowed_cpus=4",
+        )
+        result = self.run_parser(log)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not 64-bit word aligned: 1", result.stderr)
+
     def test_rejects_missing_semantic_preflight(self) -> None:
         result = self.run_parser(
             complete_log().replace("MM_PERF_SEMANTICS status=ok\n", "")
@@ -162,6 +173,23 @@ class MmPerformanceParserTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("expected one MM_PERF_SEMANTICS record", result.stderr)
+
+    def test_rejects_metric_count_drift_from_requested_workload(self) -> None:
+        result = self.run_parser(
+            complete_log(),
+            "--iterations",
+            "100",
+            "--pin-iterations",
+            "100",
+            "--pin-workers",
+            "1",
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "mremap_latency count mismatch: expected=200 actual=100",
+            result.stderr,
+        )
 
 
 if __name__ == "__main__":
