@@ -41,20 +41,27 @@ impl<B: MappingBackend> MemorySet<B> {
     /// separately. This makes the result suitable for capacity admission: it
     /// can reject early, but it can never undercount a live tree node.
     fn fragment_count_after_unmap(&self, range: AddrRange<B::Addr>) -> MappingResult<usize> {
-        let mut count = 0usize;
-        for area in self.areas.values() {
-            if !area.va_range().overlaps(range) {
-                count = count.checked_add(1).ok_or(MappingError::NoMemory)?;
-                continue;
-            }
+        let mut overlapping = 0usize;
+        let mut fragments = 0usize;
+        for area in self.iter_overlapping(range) {
+            // The iterator yields distinct entries from `areas`, so this
+            // cannot exceed `self.len()` or overflow.
+            overlapping += 1;
             if area.start() < range.start {
-                count = count.checked_add(1).ok_or(MappingError::NoMemory)?;
+                fragments = fragments.checked_add(1).ok_or(MappingError::NoMemory)?;
             }
             if area.end() > range.end {
-                count = count.checked_add(1).ok_or(MappingError::NoMemory)?;
+                fragments = fragments.checked_add(1).ok_or(MappingError::NoMemory)?;
             }
         }
-        Ok(count)
+
+        // Only the overlapping entries need inspection. All other live tree
+        // nodes survive unchanged, while every residual side of an overlap is
+        // conservatively counted as a separate fragment.
+        let unaffected = self.len() - overlapping;
+        unaffected
+            .checked_add(fragments)
+            .ok_or(MappingError::NoMemory)
     }
 
     /// Creates a new memory set.

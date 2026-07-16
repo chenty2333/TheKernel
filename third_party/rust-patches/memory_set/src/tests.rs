@@ -555,6 +555,51 @@ fn bounded_unmap_rejects_middle_split_before_area_or_pte_mutation() {
 }
 
 #[test]
+fn bounded_local_unmap_preserves_a_large_vma_prefix_and_split_peak() {
+    let mut set = MockMemorySet::new();
+    let mut pt = [0; MAX_ADDR];
+
+    // Keep a large, unrelated prefix below the locally modified VMA. The
+    // fragment admission path should only inspect the target overlap, while
+    // the total prefix still contributes to the conservative peak count.
+    for start in (0x100..0x8100).step_by(0x100) {
+        assert_ok!(set.map(
+            tracked_area(start.into(), 0x80, 1, MockBackend),
+            &mut pt,
+            false,
+        ));
+    }
+    assert_ok!(set.map(
+        tracked_area(0xe000.into(), 0x1000, 2, MockBackend),
+        &mut pt,
+        false,
+    ));
+    assert_ok!(set.map(
+        tracked_area(0xf800.into(), 0x100, 3, MockBackend),
+        &mut pt,
+        false,
+    ));
+    let original_len = set.len();
+    assert_eq!(original_len, 130);
+    let pt_before = pt;
+
+    assert_err!(
+        set.unmap_with_limit(0xe400.into(), 0x400, &mut pt, original_len),
+        NoMemory
+    );
+    assert_eq!(set.len(), original_len);
+    assert_eq!(pt, pt_before);
+
+    assert_ok!(set.unmap_with_limit(0xe400.into(), 0x400, &mut pt, original_len + 1,));
+    assert_eq!(set.len(), original_len + 1);
+    assert_eq!(set.find(0x100.into()).unwrap().flags(), 1);
+    assert_eq!(set.find(0xe100.into()).unwrap().end(), 0xe400.into());
+    assert_eq!(set.find(0xe900.into()).unwrap().start(), 0xe800.into());
+    assert_eq!(set.find(0xf800.into()).unwrap().flags(), 3);
+    assert!(pt[0xe400..0xe800].iter().all(|&flags| flags == 0));
+}
+
+#[test]
 fn clear_preflights_every_backend_before_mutating_any_pte() {
     let preflight_calls = Arc::new(AtomicUsize::new(0));
     let unmap_calls = Arc::new(AtomicUsize::new(0));
