@@ -390,7 +390,8 @@ impl SharedBackend {
         if self.pages.is_fixed() {
             return Err(AxError::OperationNotSupported);
         }
-        self.clone_for_range_with_id(old_start, new_start, SharedMapId::Dynamic(Arc::new(())))
+        let map_id = Arc::try_new(()).map_err(|_| AxError::NoMemory)?;
+        self.clone_for_range_with_id(old_start, new_start, SharedMapId::Dynamic(map_id))
     }
 
     pub(crate) fn ensure_range_covered(&self, start: VirtAddr, size: usize) -> AxResult {

@@ -1016,7 +1016,8 @@ impl FileBackend {
         new_start: VirtAddr,
         aspace: &Arc<Mutex<AddrSpace>>,
     ) -> AxResult<Self> {
-        self.clone_for_range_with_id(old_start, new_start, aspace, Arc::new(()))
+        let map_id = Arc::try_new(()).map_err(|_| AxError::NoMemory)?;
+        self.clone_for_range_with_id(old_start, new_start, aspace, map_id)
     }
 
     fn clone_map_with_registration(

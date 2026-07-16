@@ -4,8 +4,10 @@ mod access;
 mod aspace;
 mod io;
 mod loader;
+mod remap;
 mod stats;
 
+pub(crate) use self::remap::remap_user_mapping;
 pub use self::{access::*, aspace::*, io::*, loader::*, stats::*};
 
 pub(crate) fn checked_align_up(value: usize, align: usize) -> Option<usize> {

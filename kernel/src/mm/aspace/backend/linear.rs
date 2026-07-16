@@ -93,7 +93,8 @@ impl LinearBackend {
         old_start: VirtAddr,
         new_start: VirtAddr,
     ) -> AxResult<Backend> {
-        self.clone_for_range(old_start, new_start, Arc::new(()))
+        let map_id = Arc::try_new(()).map_err(|_| AxError::NoMemory)?;
+        self.clone_for_range(old_start, new_start, map_id)
     }
 
     pub(crate) fn compatible_with(&self, other: &Self) -> bool {

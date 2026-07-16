@@ -7,8 +7,6 @@ use axhal::paging::{MappingFlags, PageSize};
 use axtask::current;
 use linux_raw_sys::general::*;
 use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange};
-use memory_set::MappingLineage;
-use thekernel_linux_mm::{PageRange as LinuxPageRange, RemapGeometry};
 
 use crate::{
     file::{
@@ -19,9 +17,9 @@ use crate::{
         },
     },
     mm::{
-        AddrSpace, Backend, BackendOps, FileMappingLease, FileMappingSharing,
-        PreparedFixedSharedMapping, PreparedProtect, SharedPages, WritableMappingAdmission,
-        check_memory_overcommit, checked_align_up, checked_align_up_4k,
+        AddrSpace, Backend, FileMappingLease, FileMappingSharing, PreparedFixedSharedMapping,
+        PreparedProtect, SharedPages, WritableMappingAdmission, check_memory_overcommit,
+        checked_align_up, checked_align_up_4k, remap_user_mapping,
     },
     pseudofs::{Device, DeviceMmap},
     task::{
@@ -285,63 +283,6 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Clone)]
-struct RemapSegment {
-    start: VirtAddr,
-    size: usize,
-    flags: MappingFlags,
-    backend: Backend,
-    lineage: MappingLineage,
-}
-
-fn collect_remap_segments(
-    aspace: &AddrSpace,
-    start: VirtAddr,
-    size: usize,
-) -> AxResult<Vec<RemapSegment>> {
-    let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
-    let mut cursor = start;
-    let mut segments: Vec<RemapSegment> = Vec::new();
-
-    while cursor < end {
-        let area = aspace.find_area(cursor).ok_or(AxError::BadAddress)?;
-        if area.start() > cursor {
-            return Err(AxError::BadAddress);
-        }
-
-        let page_size = area.backend().page_size();
-        if !cursor.is_aligned(page_size) {
-            return Err(AxError::InvalidInput);
-        }
-
-        let seg_end = area.end().min(end);
-        let seg_size = seg_end.sub_addr(cursor);
-        if !page_size.is_aligned(seg_size) {
-            return Err(AxError::InvalidInput);
-        }
-
-        if let Some(first) = segments.first()
-            && (area.lineage() != first.lineage
-                || area.flags() != first.flags
-                || !area.backend().compatible_with(&first.backend))
-        {
-            return Err(AxError::BadAddress);
-        }
-
-        segments.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-        segments.push(RemapSegment {
-            start: cursor,
-            size: seg_size,
-            flags: area.flags(),
-            backend: area.backend().clone(),
-            lineage: area.lineage(),
-        });
-        cursor = seg_end;
-    }
-
-    Ok(segments)
-}
-
 fn validate_page_aligned_range(addr: usize, length: usize) -> AxResult<(VirtAddr, usize)> {
     let start = VirtAddr::from(addr).align_down_4k();
     if length == 0 {
@@ -391,58 +332,6 @@ fn may_protect_from_file_flags(open_flags: FileFlags) -> MappingFlags {
     flags
 }
 
-fn prefix_segments(segments: &[RemapSegment], size: usize) -> AxResult<Vec<RemapSegment>> {
-    let mut remaining = size;
-    let mut prefix = Vec::new();
-    prefix
-        .try_reserve(segments.len())
-        .map_err(|_| AxError::NoMemory)?;
-
-    for seg in segments {
-        if remaining == 0 {
-            break;
-        }
-        let take = seg.size.min(remaining);
-        prefix.push(RemapSegment {
-            start: seg.start,
-            size: take,
-            flags: seg.flags,
-            backend: seg.backend.clone(),
-            lineage: seg.lineage,
-        });
-        remaining -= take;
-    }
-
-    Ok(prefix)
-}
-
-fn range_is_free(aspace: &AddrSpace, start: VirtAddr, size: usize, align: usize) -> bool {
-    let Some(limit) = VirtAddrRange::try_from_start_size(start, size) else {
-        return false;
-    };
-    aspace.find_free_area(start, size, limit, align) == Some(start)
-}
-
-fn validate_fixed_remap_dst(
-    aspace: &AddrSpace,
-    src: VirtAddr,
-    src_size: usize,
-    dst: VirtAddr,
-    dst_size: usize,
-) -> AxResult<()> {
-    let src_range =
-        VirtAddrRange::try_from_start_size(src, src_size).ok_or(AxError::InvalidInput)?;
-    let dst_range =
-        VirtAddrRange::try_from_start_size(dst, dst_size).ok_or(AxError::InvalidInput)?;
-    if src_range.overlaps(dst_range) {
-        return Err(AxError::InvalidInput);
-    }
-    if !aspace.contains_range(dst, dst_size) {
-        return Err(AxError::NoMemory);
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct MadviseRangeInfo {
     all_private_anonymous: bool,
@@ -487,99 +376,6 @@ fn inspect_madvise_range(
     }
 
     Ok(info)
-}
-
-fn map_relocated_segments(
-    aspace: &mut AddrSpace,
-    aspace_handle: &Arc<axsync::Mutex<AddrSpace>>,
-    old_start: VirtAddr,
-    old_size: usize,
-    new_start: VirtAddr,
-    new_size: usize,
-    segments: &[RemapSegment],
-    destination_lineage: MappingLineage,
-    preserve_backend_identity: bool,
-) -> AxResult {
-    // Segment VMAs are staged incrementally inside AddrSpace's transaction;
-    // topology and identity publication happens once after all later work.
-    // One fresh Linux-MM lineage is shared by every destination fragment; a
-    // moving remap is a new mapping incarnation until EVENT_REMAP semantics
-    // exist, even when the backing object's relocation identity is preserved.
-    let page_size = segments
-        .first()
-        .ok_or(AxError::InvalidInput)?
-        .backend
-        .page_size() as usize;
-    let geometry = RemapGeometry::new(
-        LinuxPageRange::new(old_start.as_usize(), old_size, page_size)
-            .map_err(|_| AxError::InvalidInput)?,
-        new_start.as_usize(),
-        new_size,
-    )
-    .map_err(|_| AxError::InvalidInput)?;
-    for seg in segments {
-        let segment = geometry
-            .segment(
-                LinuxPageRange::new(seg.start.as_usize(), seg.size, page_size)
-                    .map_err(|_| AxError::InvalidInput)?,
-            )
-            .map_err(|_| AxError::InvalidInput)?;
-        let destination_start = VirtAddr::from(segment.destination().start());
-        let backend_old_start = VirtAddr::from(segment.backend_old_start());
-        let backend_new_start = VirtAddr::from(segment.backend_new_start());
-        let relocated = if preserve_backend_identity {
-            seg.backend
-                .relocate(backend_old_start, backend_new_start, aspace_handle)?
-        } else {
-            seg.backend
-                .duplicate_mapping(backend_old_start, backend_new_start, aspace_handle)?
-        };
-        aspace.stage_mapping_fragment(
-            destination_start,
-            seg.size,
-            seg.flags,
-            false,
-            relocated,
-            false,
-            destination_lineage,
-        )?;
-        seg.backend.migrate_present_pages(
-            seg.start,
-            destination_start,
-            seg.size,
-            &mut aspace.page_table_mut().cursor(),
-        )?;
-    }
-    Ok(())
-}
-
-fn check_mremap_locked_growth_limit(
-    proc_data: &ProcessData,
-    has_ipc_lock: bool,
-    aspace: &AddrSpace,
-    grow: usize,
-) -> AxResult {
-    if grow == 0 || has_ipc_lock {
-        return Ok(());
-    }
-
-    let limit_error = AxError::from(LinuxError::EAGAIN);
-    let limit = proc_data.rlim.read()[RLIMIT_MEMLOCK].current;
-    if !mremap_locked_growth_allowed(aspace.locked_bytes(), grow, limit) {
-        return Err(limit_error);
-    }
-
-    Ok(())
-}
-
-fn mremap_locked_growth_allowed(
-    current_locked: usize,
-    additional_locked: usize,
-    limit: u64,
-) -> bool {
-    current_locked
-        .checked_add(additional_locked)
-        .is_some_and(|total| (total as u128) <= u128::from(limit))
 }
 
 impl From<MmapProt> for MappingFlags {
@@ -1056,7 +852,6 @@ pub fn sys_mremap(
     );
 
     const SUPPORTED_FLAGS: u32 = MREMAP_MAYMOVE | MREMAP_FIXED;
-
     if !addr.is_multiple_of(PageSize::Size4K as usize) || new_size == 0 {
         return Err(AxError::InvalidInput);
     }
@@ -1066,278 +861,25 @@ pub fn sys_mremap(
 
     let may_move = flags & MREMAP_MAYMOVE != 0;
     let fixed = flags & MREMAP_FIXED != 0;
-
-    // MREMAP_FIXED requires MREMAP_MAYMOVE.
     if fixed && !may_move {
         return Err(AxError::InvalidInput);
     }
 
-    let addr = VirtAddr::from(addr);
-    let old_size = checked_align_up_4k(old_size).ok_or(AxError::InvalidInput)?;
-    let new_size = checked_align_up_4k(new_size).ok_or(AxError::InvalidInput)?;
     let curr = current();
     let thread = curr.as_thread();
     let proc_data = &thread.proc_data;
     let has_ipc_lock = thread.has_effective_capability(CAP_IPC_LOCK);
-    let aspace_handle = proc_data.aspace();
-    let mut aspace = aspace_handle.lock();
-
-    if old_size == 0 {
-        if !may_move {
-            return Err(AxError::InvalidInput);
-        }
-
-        let segments = collect_remap_segments(&aspace, addr, new_size)?;
-        if !segments.iter().all(|seg| seg.backend.is_shareable()) {
-            return Err(AxError::InvalidInput);
-        }
-
-        let page_size = segments[0].backend.page_size();
-        let dst = if fixed {
-            let dst = VirtAddr::from(new_addr);
-            if !dst.is_aligned(page_size) {
-                return Err(AxError::InvalidInput);
-            }
-            validate_fixed_remap_dst(&aspace, addr, new_size, dst, new_size)?;
-            dst
-        } else {
-            aspace
-                .find_kernel_area(
-                    addr,
-                    new_size,
-                    VirtAddrRange::new(aspace.base(), aspace.end()),
-                    page_size as usize,
-                )
-                .ok_or(AxError::NoMemory)?
-        };
-
-        let duplicated_locked = aspace.locked_bytes_in_range(addr, new_size);
-        if duplicated_locked != 0 {
-            check_mremap_locked_growth_limit(proc_data, has_ipc_lock, &aspace, duplicated_locked)?;
-        }
-
-        let duplicate = if fixed {
-            aspace
-                .replace_and_duplicate_mapping_transaction(
-                    addr,
-                    new_size,
-                    dst,
-                    new_size,
-                    segments.len(),
-                    |aspace, destination_lineage| {
-                        map_relocated_segments(
-                            aspace,
-                            &aspace_handle,
-                            addr,
-                            new_size,
-                            dst,
-                            new_size,
-                            &segments,
-                            destination_lineage,
-                            false,
-                        )
-                    },
-                )
-                .map_err(|error| {
-                    if error.destination_destroyed() {
-                        proc_data.clear_mempolicy_range(dst.as_usize(), new_size);
-                    }
-                    error.into_error()
-                })
-        } else {
-            aspace.duplicate_mapping_into_empty_transaction(
-                addr,
-                new_size,
-                dst,
-                new_size,
-                segments.len(),
-                |aspace, destination_lineage| {
-                    map_relocated_segments(
-                        aspace,
-                        &aspace_handle,
-                        addr,
-                        new_size,
-                        dst,
-                        new_size,
-                        &segments,
-                        destination_lineage,
-                        false,
-                    )
-                },
-            )
-        };
-        if let Err(error) = duplicate {
-            return Err(error);
-        }
-        if fixed {
-            proc_data.clear_mempolicy_range(dst.as_usize(), new_size);
-        }
-        return Ok(dst.as_usize() as isize);
-    }
-
-    let segments = collect_remap_segments(&aspace, addr, old_size)?;
-    let page_size = segments[0].backend.page_size();
-    if !page_size.is_aligned(old_size) || !page_size.is_aligned(new_size) {
-        return Err(AxError::InvalidInput);
-    }
-    if fixed && !VirtAddr::from(new_addr).is_aligned(page_size) {
-        return Err(AxError::InvalidInput);
-    }
-
-    if !fixed && new_size == old_size {
-        return Ok(addr.as_usize() as isize);
-    }
-
-    if !fixed && new_size < old_size {
-        aspace.unmap(addr + new_size, old_size - new_size)?;
-        proc_data.clear_mempolicy_range((addr + new_size).as_usize(), old_size - new_size);
-        return Ok(addr.as_usize() as isize);
-    }
-
-    let preserve_size = old_size.min(new_size);
-    let moved_segments = prefix_segments(&segments, preserve_size)?;
-    let grow = new_size.saturating_sub(old_size);
-    let primary = &segments[0];
-    let grow_locked = new_size > old_size && aspace.range_is_fully_locked(addr, old_size);
-
-    // Try to grow in-place first.
-    let after = addr + old_size;
-    let can_grow_inplace =
-        !fixed && new_size > old_size && range_is_free(&aspace, after, grow, page_size as usize);
-    if can_grow_inplace {
-        if grow_locked {
-            check_mremap_locked_growth_limit(proc_data, has_ipc_lock, &aspace, grow)?;
-        }
-        primary.backend.ensure_range_covered(addr, new_size)?;
-        let tail_backend = primary.backend.relocate(addr, addr, &aspace_handle)?;
-        if let Err(err) = aspace.map_with_existing_lineage(
-            after,
-            grow,
-            primary.flags,
-            grow_locked,
-            tail_backend,
-            grow_locked,
-            primary.lineage,
-        ) {
-            return Err(err);
-        }
-        return Ok(addr.as_usize() as isize);
-    }
-
-    if !may_move {
-        return Err(AxError::NoMemory);
-    }
-
-    let dst = if fixed {
-        let dst = VirtAddr::from(new_addr);
-        validate_fixed_remap_dst(&aspace, addr, old_size, dst, new_size)?;
-        dst
-    } else {
-        aspace
-            .find_kernel_area(
-                addr,
-                new_size,
-                VirtAddrRange::new(aspace.base(), aspace.end()),
-                page_size as usize,
-            )
-            .ok_or(AxError::NoMemory)?
-    };
-
-    if new_size > old_size && grow_locked {
-        check_mremap_locked_growth_limit(proc_data, has_ipc_lock, &aspace, grow)?;
-    }
-
-    if new_size > old_size {
-        primary.backend.ensure_range_covered(addr, new_size)?;
-    }
-    let staged_fragments = moved_segments
-        .len()
-        .checked_add(usize::from(new_size > old_size))
-        .ok_or(AxError::NoMemory)?;
-    let moved = if fixed {
-        aspace
-            .replace_and_move_mapping_transaction(
-                addr,
-                old_size,
-                dst,
-                new_size,
-                staged_fragments,
-                |aspace, destination_lineage| {
-                    map_relocated_segments(
-                        aspace,
-                        &aspace_handle,
-                        addr,
-                        old_size,
-                        dst,
-                        new_size,
-                        &moved_segments,
-                        destination_lineage,
-                        true,
-                    )?;
-                    if new_size > old_size {
-                        let tail_backend = primary.backend.relocate(addr, dst, &aspace_handle)?;
-                        aspace.stage_mapping_fragment(
-                            dst + old_size,
-                            grow,
-                            primary.flags,
-                            grow_locked,
-                            tail_backend,
-                            false,
-                            destination_lineage,
-                        )?;
-                    }
-                    Ok(())
-                },
-            )
-            .map_err(|error| {
-                if error.destination_destroyed() {
-                    proc_data.clear_mempolicy_range(dst.as_usize(), new_size);
-                }
-                error.into_error()
-            })
-    } else {
-        aspace.move_mapping_into_empty_transaction(
-            addr,
-            old_size,
-            dst,
-            new_size,
-            staged_fragments,
-            |aspace, destination_lineage| {
-                map_relocated_segments(
-                    aspace,
-                    &aspace_handle,
-                    addr,
-                    old_size,
-                    dst,
-                    new_size,
-                    &moved_segments,
-                    destination_lineage,
-                    true,
-                )?;
-                if new_size > old_size {
-                    let tail_backend = primary.backend.relocate(addr, dst, &aspace_handle)?;
-                    aspace.stage_mapping_fragment(
-                        dst + old_size,
-                        grow,
-                        primary.flags,
-                        grow_locked,
-                        tail_backend,
-                        false,
-                        destination_lineage,
-                    )?;
-                }
-                Ok(())
-            },
-        )
-    };
-    moved?;
-
-    proc_data.clear_mempolicy_range(addr.as_usize(), old_size);
-    proc_data.clear_mempolicy_range(dst.as_usize(), new_size);
-
-    Ok(dst.as_usize() as isize)
+    remap_user_mapping(
+        proc_data,
+        has_ipc_lock,
+        VirtAddr::from(addr),
+        checked_align_up_4k(old_size).ok_or(AxError::InvalidInput)?,
+        checked_align_up_4k(new_size).ok_or(AxError::InvalidInput)?,
+        may_move,
+        fixed,
+        VirtAddr::from(new_addr),
+    )
 }
-
 pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
     debug!("sys_madvise <= addr: {addr:#x}, length: {length:x}, advice: {advice:#x}");
 
@@ -1655,7 +1197,6 @@ mod tests {
     use core::cell::Cell;
 
     use axfs_ng_vfs::{Mountpoint, NodePermission, NodeType};
-    use memory_addr::PAGE_SIZE_4K;
     use thekernel_linux_fd::{DescriptorFlags, FdNumber, FdTable, FdTableId};
 
     use super::*;
@@ -1715,60 +1256,6 @@ mod tests {
         assert!(!push_unique_content_location(&mut locations, &second));
         assert_eq!(locations.len(), 1);
         assert!(locations[0].1.ptr_eq(&first));
-    }
-
-    #[test]
-    fn remap_fragments_share_one_backend_relocation_pair() {
-        let old_start = VirtAddr::from(0x8000);
-        let new_start = VirtAddr::from(0x1000);
-        let geometry = RemapGeometry::new(
-            LinuxPageRange::new(old_start.as_usize(), 0x4000, PAGE_SIZE_4K).unwrap(),
-            new_start.as_usize(),
-            0x4000,
-        )
-        .unwrap();
-        let first = geometry
-            .segment(LinuxPageRange::new(old_start.as_usize(), 0x2000, PAGE_SIZE_4K).unwrap())
-            .unwrap();
-        let second = geometry
-            .segment(
-                LinuxPageRange::new((old_start + 0x2000).as_usize(), 0x2000, PAGE_SIZE_4K).unwrap(),
-            )
-            .unwrap();
-
-        assert_eq!(first.destination().start(), new_start.as_usize());
-        assert_eq!(
-            second.destination().start(),
-            (new_start + 0x2000).as_usize()
-        );
-        assert_eq!(first.backend_old_start(), old_start.as_usize());
-        assert_eq!(second.backend_old_start(), old_start.as_usize());
-        assert_eq!(first.backend_new_start(), new_start.as_usize());
-        assert_eq!(second.backend_new_start(), new_start.as_usize());
-    }
-
-    #[test]
-    fn mremap_locked_growth_uses_linux_pre_replacement_accounting() {
-        let page = PAGE_SIZE_4K;
-
-        assert!(mremap_locked_growth_allowed(
-            2 * page,
-            page,
-            (3 * page) as u64
-        ));
-        assert!(!mremap_locked_growth_allowed(
-            2 * page,
-            page,
-            (2 * page) as u64
-        ));
-        // MREMAP_FIXED checks mlock growth before unmapping its destination;
-        // locked bytes there cannot be reclaimed to satisfy the admission.
-        assert!(!mremap_locked_growth_allowed(
-            2 * page,
-            page,
-            (2 * page) as u64,
-        ));
-        assert!(!mremap_locked_growth_allowed(usize::MAX, 1, u64::MAX,));
     }
 
     #[test]

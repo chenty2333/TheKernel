@@ -3056,6 +3056,15 @@ impl AddrSpace {
     pub fn areas(&self) -> impl Iterator<Item = &MemoryArea<Backend>> {
         self.areas.iter()
     }
+
+    /// Returns only VMAs intersecting `range`, starting from the crossing
+    /// predecessor instead of walking the complete address-space prefix.
+    pub(crate) fn areas_overlapping(
+        &self,
+        range: VirtAddrRange,
+    ) -> impl Iterator<Item = &MemoryArea<Backend>> {
+        self.areas.iter_overlapping(range)
+    }
 }
 
 impl fmt::Debug for AddrSpace {
