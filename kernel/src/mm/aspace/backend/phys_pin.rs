@@ -39,11 +39,68 @@ struct PinnedFrameTable {
     slots: Vec<PinnedFrameSlot>,
     free_head: Option<usize>,
     live: usize,
+    #[cfg(test)]
+    batch_metrics: PinBatchMetrics,
 }
 
-static PINNED_FRAMES: SpinNoIrq<Option<PinnedFrameTable>> = SpinNoIrq::new(None);
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PinBatchMetrics {
+    pin_batches: usize,
+    pin_pages_requested: usize,
+    pin_pages_committed: usize,
+    rollback_batches: usize,
+    rollback_pages: usize,
+    unpin_batches: usize,
+    unpin_pages_requested: usize,
+    unpin_pages_completed: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct UnpinBatchReport {
+    missing: usize,
+    first_missing: Option<PhysAddr>,
+}
+
+impl UnpinBatchReport {
+    fn merge(&mut self, other: Self) {
+        self.missing = self
+            .missing
+            .checked_add(other.missing)
+            .expect("physical-pin missing-entry count overflow");
+        if self.first_missing.is_none() {
+            self.first_missing = other.first_missing;
+        }
+    }
+}
 
 const MAX_PINNED_FRAMES: usize = super::super::USER_IO_PIN_MAX_PAGES as usize;
+const PIN_TABLE_SHARDS: usize = 64;
+const PIN_METADATA_SLOTS: usize = MAX_PINNED_FRAMES * 2;
+/// Bounds one IRQ-disabled registry transaction independently of the 64 MiB
+/// policy quota. Larger logical batches remain all-or-none at the public API.
+const PIN_TABLE_LOCK_CHUNK_PAGES: usize = 64;
+const _: () = assert!(PIN_TABLE_SHARDS.is_power_of_two());
+const _: () = assert!(MAX_PINNED_FRAMES >= PIN_TABLE_SHARDS);
+const _: () = assert!(PIN_METADATA_SLOTS.is_multiple_of(PIN_TABLE_SHARDS));
+
+static PINNED_FRAME_SHARDS: [SpinNoIrq<Option<PinnedFrameTable>>; PIN_TABLE_SHARDS] =
+    [const { SpinNoIrq::new(None) }; PIN_TABLE_SHARDS];
+
+fn physical_page_hash(paddr: PhysAddr) -> usize {
+    let mut page = paddr.as_usize() >> 12;
+    page ^= page >> 16;
+    page = page.wrapping_mul(0x9e37_79b1);
+    page ^ (page >> 13)
+}
+
+fn pin_shard_index(paddr: PhysAddr) -> usize {
+    physical_page_hash(paddr) & (PIN_TABLE_SHARDS - 1)
+}
+
+const fn pin_shard_capacity(_: usize) -> usize {
+    PIN_METADATA_SLOTS / PIN_TABLE_SHARDS
+}
 
 impl PinnedFrameTable {
     fn try_new(limit: usize) -> AxResult<Self> {
@@ -72,15 +129,15 @@ impl PinnedFrameTable {
             slots,
             free_head: Some(0),
             live: 0,
+            #[cfg(test)]
+            batch_metrics: PinBatchMetrics::default(),
         })
     }
 
     fn bucket_index(&self, paddr: PhysAddr) -> usize {
-        let mut page = paddr.as_usize() >> 12;
-        page ^= page >> 16;
-        page = page.wrapping_mul(0x9e37_79b1);
-        page ^= page >> 13;
-        page % self.buckets.len()
+        // The low hash bits select a registry shard. Consume the remaining
+        // bits here so one shard can still use its complete bucket array.
+        (physical_page_hash(paddr) / PIN_TABLE_SHARDS) % self.buckets.len()
     }
 
     fn find_node(&self, paddr: PhysAddr) -> Option<(Option<usize>, usize)> {
@@ -132,6 +189,46 @@ impl PinnedFrameTable {
         Ok(())
     }
 
+    /// Pins one already-owned physical-frame batch as an all-or-none table
+    /// transaction.
+    ///
+    /// The caller owns the table lock for this complete operation. Every
+    /// successful prefix is rolled back before an error is returned, so a
+    /// finite-table or refcount failure never leaks a partial batch.
+    fn pin_batch(&mut self, paddrs: &[PhysAddr]) -> AxResult<()> {
+        #[cfg(test)]
+        {
+            self.batch_metrics.pin_batches += 1;
+            self.batch_metrics.pin_pages_requested += paddrs.len();
+        }
+
+        for (pinned, &paddr) in paddrs.iter().enumerate() {
+            if let Err(error) = self.pin_preallocated(paddr) {
+                for &rollback in paddrs[..pinned].iter().rev() {
+                    let pending_free = self
+                        .unpin(rollback)
+                        .expect("physical-pin batch rollback lost its pinned prefix");
+                    assert!(
+                        pending_free.is_none(),
+                        "physical-pin batch rollback released a pre-existing deferred free"
+                    );
+                }
+                #[cfg(test)]
+                {
+                    self.batch_metrics.rollback_batches += 1;
+                    self.batch_metrics.rollback_pages += pinned;
+                }
+                return Err(error);
+            }
+        }
+
+        #[cfg(test)]
+        {
+            self.batch_metrics.pin_pages_committed += paddrs.len();
+        }
+        Ok(())
+    }
+
     fn unpin(&mut self, paddr: PhysAddr) -> AxResult<Option<PageSize>> {
         let (previous, index) = self.find_node(paddr).ok_or(AxError::BadState)?;
         let (next, pending_free) = {
@@ -172,6 +269,40 @@ impl PinnedFrameTable {
         Ok(pending_free)
     }
 
+    /// Releases a complete RAII batch while the caller owns the table lock.
+    /// Deferred frees are appended to caller-preallocated storage and therefore
+    /// never allocate inside the IRQ-disabled critical section.
+    fn unpin_batch(
+        &mut self,
+        paddrs: &[PhysAddr],
+        deferred_frees: &mut Vec<(PhysAddr, PageSize)>,
+    ) -> UnpinBatchReport {
+        debug_assert!(deferred_frees.capacity() - deferred_frees.len() >= paddrs.len());
+        #[cfg(test)]
+        {
+            self.batch_metrics.unpin_batches += 1;
+            self.batch_metrics.unpin_pages_requested += paddrs.len();
+        }
+
+        let mut report = UnpinBatchReport::default();
+        for &paddr in paddrs {
+            match self.unpin(paddr) {
+                Ok(Some(page_size)) => deferred_frees.push((paddr, page_size)),
+                Ok(None) => {}
+                Err(_) => {
+                    report.missing += 1;
+                    report.first_missing.get_or_insert(paddr);
+                    continue;
+                }
+            }
+            #[cfg(test)]
+            {
+                self.batch_metrics.unpin_pages_completed += 1;
+            }
+        }
+        report
+    }
+
     fn defer_deallocation(&mut self, paddr: PhysAddr, page_size: PageSize) -> bool {
         let Some((_, index)) = self.find_node(paddr) else {
             return false;
@@ -188,62 +319,286 @@ impl PinnedFrameTable {
     }
 }
 
-fn ensure_pin_table_capacity() -> AxResult<()> {
-    if PINNED_FRAMES.lock().is_some() {
-        return Ok(());
+/// Installs one fully allocated shard table with only the pointer/owner move
+/// performed under the IRQ-safe shard lock. A racing loser's complete table is
+/// returned to the caller so its large vectors are always dropped after the
+/// lock guard has gone away.
+fn install_prepared_pin_shard(
+    shard_index: usize,
+    prepared: PinnedFrameTable,
+) -> Option<PinnedFrameTable> {
+    let mut shard = PINNED_FRAME_SHARDS[shard_index].lock();
+    if shard.is_none() {
+        *shard = Some(prepared);
+        None
+    } else {
+        Some(prepared)
     }
+}
 
-    // Allocate outside the IRQ-disabled table lock. Competing first users may
-    // prepare redundant storage, but only one installs it and no live entry is
-    // ever moved through a fallible allocation path.
-    let prepared = PinnedFrameTable::try_new(MAX_PINNED_FRAMES)?;
-    let mut table = PINNED_FRAMES.lock();
-    if table.is_none() {
-        *table = Some(prepared);
+fn prepare_physical_pin_registry_with(
+    mut allocate: impl FnMut(usize) -> AxResult<PinnedFrameTable>,
+) -> AxResult<()> {
+    for shard_index in 0..PIN_TABLE_SHARDS {
+        if PINNED_FRAME_SHARDS[shard_index].lock().is_some() {
+            continue;
+        }
+
+        // Allocation and complete table initialization happen with no shard
+        // lock held. Successfully installed earlier shards deliberately remain
+        // live if this allocation fails, making the bounded prefix retryable.
+        let prepared = allocate(shard_index)?;
+        let racing_loser = install_prepared_pin_shard(shard_index, prepared);
+        // `install_prepared_pin_shard` has already released IRQ exclusion.
+        drop(racing_loser);
     }
     Ok(())
 }
 
-pub(crate) struct PhysicalFramePin {
-    paddr: PhysAddr,
+/// Prepares every fixed physical-pin registry shard outside the address-space
+/// critical section.
+///
+/// The operation is bounded to [`PIN_TABLE_SHARDS`] fixed tables. Allocation
+/// failure preserves the already initialized prefix, and a later call safely
+/// resumes at the first missing shard. Concurrent callers may allocate a
+/// redundant table, but the racing loser is returned and freed outside the
+/// shard lock.
+pub(crate) fn prepare_physical_pin_registry() -> AxResult<()> {
+    prepare_physical_pin_registry_with(|shard_index| {
+        PinnedFrameTable::try_new(pin_shard_capacity(shard_index))
+    })
 }
 
-impl Drop for PhysicalFramePin {
-    fn drop(&mut self) {
-        let pending_free = {
-            let mut table = PINNED_FRAMES.lock();
-            let Some(table) = table.as_mut() else {
-                warn!("PhysicalFramePin::drop: pin table is uninitialized");
-                return;
-            };
-            let Ok(pending_free) = table.unpin(self.paddr) else {
-                warn!(
-                    "PhysicalFramePin::drop: missing pinned frame entry for {:?}",
-                    self.paddr
-                );
-                return;
-            };
-            pending_free
-        };
+/// Preallocated owner for one all-or-none physical-frame publication.
+///
+/// Call [`prepare_physical_pin_registry`] once for the operation and
+/// [`Self::try_new`] for each batch before taking the address-space lock.
+/// Afterwards, [`Self::push`] cannot allocate, and [`Self::publish`] either
+/// transfers both vectors into [`PhysicalFramePins`] with `mem::take` or leaves
+/// them owned by this value for the caller to drop after releasing its lock.
+pub(crate) struct PreparedPhysicalFramePins {
+    paddrs: Vec<PhysAddr>,
+    deferred_frees: Vec<(PhysAddr, PageSize)>,
+    max_pages: usize,
+    publication_failed: bool,
+}
 
-        if let Some(page_size) = pending_free {
-            dealloc_frame_now(self.paddr, page_size);
+impl PreparedPhysicalFramePins {
+    pub(crate) fn try_new(max_pages: usize) -> AxResult<Self> {
+        if max_pages > MAX_PINNED_FRAMES {
+            return Err(AxError::InvalidInput);
+        }
+
+        let mut paddrs = Vec::new();
+        paddrs
+            .try_reserve_exact(max_pages)
+            .map_err(|_| AxError::NoMemory)?;
+        let mut deferred_frees = Vec::new();
+        deferred_frees
+            .try_reserve_exact(max_pages)
+            .map_err(|_| AxError::NoMemory)?;
+        Ok(Self {
+            paddrs,
+            deferred_frees,
+            max_pages,
+            publication_failed: false,
+        })
+    }
+
+    /// Appends one frame without allocating. `false` is a bounded admission
+    /// failure and leaves the preparation unchanged.
+    pub(crate) fn push(&mut self, paddr: PhysAddr) -> bool {
+        if self.publication_failed || self.paddrs.len() >= self.max_pages {
+            return false;
+        }
+        debug_assert!(self.paddrs.len() < self.paddrs.capacity());
+        self.paddrs.push(paddr);
+        true
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.paddrs.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.paddrs.len()
+    }
+
+    /// Publishes only while the caller holds the system-wide logical page
+    /// charge. No allocation or large owner destruction occurs in this call.
+    /// The charge is the exact aggregate bound; the fixed 2x shard metadata is
+    /// a second, mechanism-level admission. Pathological single-shard pressure
+    /// therefore fails atomically and lets the adapter preserve semantics with
+    /// its copy fallback instead of growing metadata in an IRQ-off path.
+    pub(crate) fn publish(
+        &mut self,
+        _system_charge: &super::super::UserIoSystemPinCharge,
+    ) -> AxResult<PhysicalFramePins> {
+        self.publish_admitted()
+    }
+
+    fn publish_admitted(&mut self) -> AxResult<PhysicalFramePins> {
+        debug_assert!(self.paddrs.len() <= self.max_pages);
+        if self.publication_failed {
+            return Err(AxError::BadState);
+        }
+        debug_assert!(self.deferred_frees.is_empty());
+        if self.paddrs.is_empty() {
+            return Ok(self.take_published());
+        }
+
+        // Group equal shards in place. Physical address order is not part of
+        // the RAII contract; exact duplicate multiplicity is.
+        self.paddrs
+            .sort_unstable_by_key(|&paddr| pin_shard_index(paddr));
+        let mut pinned = 0usize;
+        while pinned < self.paddrs.len() {
+            let shard_index = pin_shard_index(self.paddrs[pinned]);
+            let mut shard_end = pinned + 1;
+            while shard_end < self.paddrs.len()
+                && pin_shard_index(self.paddrs[shard_end]) == shard_index
+            {
+                shard_end += 1;
+            }
+            while pinned < shard_end {
+                let end = shard_end.min(pinned.saturating_add(PIN_TABLE_LOCK_CHUNK_PAGES));
+                if let Err(error) = pin_shard_chunk(shard_index, &self.paddrs[pinned..end]) {
+                    let report =
+                        unpin_frame_chunks(&self.paddrs[..pinned], &mut self.deferred_frees)
+                            .expect("prepared physical-pin registry lost an initialized shard");
+                    assert_eq!(
+                        report,
+                        UnpinBatchReport::default(),
+                        "physical-pin batch rollback lost a committed chunk"
+                    );
+                    // Retain deferred frees and both large vectors in this
+                    // preparation. The caller still owns `&mut self`, exits its
+                    // AddrSpace guard, and only then drops the failed batch.
+                    self.publication_failed = true;
+                    return Err(error);
+                }
+                pinned = end;
+            }
+        }
+
+        Ok(self.take_published())
+    }
+
+    fn take_published(&mut self) -> PhysicalFramePins {
+        self.max_pages = 0;
+        PhysicalFramePins {
+            paddrs: core::mem::take(&mut self.paddrs),
+            deferred_frees: core::mem::take(&mut self.deferred_frees),
         }
     }
 }
 
-pub(crate) fn pin_frame(paddr: PhysAddr) -> AxResult<PhysicalFramePin> {
-    ensure_pin_table_capacity()?;
-    let mut table = PINNED_FRAMES.lock();
-    table
-        .as_mut()
-        .expect("initialized physical pin table")
-        .pin_preallocated(paddr)?;
-    Ok(PhysicalFramePin { paddr })
+impl Drop for PreparedPhysicalFramePins {
+    fn drop(&mut self) {
+        for (paddr, page_size) in self.deferred_frees.drain(..) {
+            dealloc_frame_now(paddr, page_size);
+        }
+    }
+}
+
+/// One all-or-none physical-frame pin batch.
+///
+/// Publication and final release acquire the registry once per bounded chunk,
+/// so a large policy-level batch cannot turn into an unbounded IRQ-disabled
+/// critical section. The second vector reserves enough storage before
+/// publication to carry every possible deferred free out of those sections.
+pub(crate) struct PhysicalFramePins {
+    paddrs: Vec<PhysAddr>,
+    deferred_frees: Vec<(PhysAddr, PageSize)>,
+}
+
+impl PhysicalFramePins {
+    pub(crate) fn len(&self) -> usize {
+        self.paddrs.len()
+    }
+}
+
+impl Drop for PhysicalFramePins {
+    fn drop(&mut self) {
+        if self.paddrs.is_empty() {
+            return;
+        }
+
+        let Some(report) = unpin_frame_chunks(&self.paddrs, &mut self.deferred_frees) else {
+            warn!("PhysicalFramePins::drop: a pin registry shard is uninitialized");
+            return;
+        };
+        if report.missing != 0 {
+            warn!(
+                "PhysicalFramePins::drop: {} missing pinned frame entries; first={:?}",
+                report.missing, report.first_missing
+            );
+        }
+        for (paddr, page_size) in self.deferred_frees.drain(..) {
+            dealloc_frame_now(paddr, page_size);
+        }
+    }
+}
+
+fn unpin_frame_chunks(
+    paddrs: &[PhysAddr],
+    deferred_frees: &mut Vec<(PhysAddr, PageSize)>,
+) -> Option<UnpinBatchReport> {
+    let mut report = UnpinBatchReport::default();
+    let mut shard_end = paddrs.len();
+    while shard_end != 0 {
+        let shard_index = pin_shard_index(paddrs[shard_end - 1]);
+        let mut shard_start = shard_end - 1;
+        while shard_start != 0 && pin_shard_index(paddrs[shard_start - 1]) == shard_index {
+            shard_start -= 1;
+        }
+
+        for chunk in paddrs[shard_start..shard_end].rchunks(PIN_TABLE_LOCK_CHUNK_PAGES) {
+            let chunk_report = {
+                let mut table = PINNED_FRAME_SHARDS[shard_index].lock();
+                let table = table.as_mut()?;
+                table.unpin_batch(chunk, deferred_frees)
+            };
+            report.merge(chunk_report);
+        }
+        shard_end = shard_start;
+    }
+    Some(report)
+}
+
+fn pin_shard_chunk(shard_index: usize, paddrs: &[PhysAddr]) -> AxResult<()> {
+    debug_assert!(!paddrs.is_empty());
+    debug_assert!(paddrs.len() <= PIN_TABLE_LOCK_CHUNK_PAGES);
+    debug_assert!(
+        paddrs
+            .iter()
+            .all(|&paddr| pin_shard_index(paddr) == shard_index)
+    );
+
+    let mut table = PINNED_FRAME_SHARDS[shard_index].lock();
+    table.as_mut().ok_or(AxError::BadState)?.pin_batch(paddrs)
+}
+
+fn prepare_batch_from_paddrs(paddrs: Vec<PhysAddr>) -> AxResult<PreparedPhysicalFramePins> {
+    prepare_physical_pin_registry()?;
+    let mut prepared = PreparedPhysicalFramePins::try_new(paddrs.len())?;
+    for paddr in paddrs {
+        assert!(
+            prepared.push(paddr),
+            "sized physical-pin preparation rejected its own input"
+        );
+    }
+    Ok(prepared)
+}
+
+#[cfg(test)]
+fn pin_frames_admitted(paddrs: Vec<PhysAddr>) -> AxResult<PhysicalFramePins> {
+    let mut prepared = prepare_batch_from_paddrs(paddrs)?;
+    prepared.publish_admitted()
 }
 
 pub(crate) fn defer_frame_dealloc_if_pinned(paddr: PhysAddr, page_size: PageSize) -> bool {
-    PINNED_FRAMES
+    PINNED_FRAME_SHARDS[pin_shard_index(paddr)]
         .lock()
         .as_mut()
         .is_some_and(|table| table.defer_deallocation(paddr, page_size))
@@ -251,10 +606,39 @@ pub(crate) fn defer_frame_dealloc_if_pinned(paddr: PhysAddr, page_size: PageSize
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
+    use std::sync::Mutex as StdMutex;
+
     use super::*;
+
+    static GLOBAL_REGISTRY_TEST_SERIAL: StdMutex<()> = StdMutex::new(());
 
     fn table_with_capacity(capacity: usize) -> PinnedFrameTable {
         PinnedFrameTable::try_new(capacity).unwrap()
+    }
+
+    fn reset_pin_registry() {
+        for shard in &PINNED_FRAME_SHARDS {
+            let table = { shard.lock().take() };
+            // Keep test teardown faithful to the production ownership rule:
+            // the table's large vectors are released after the shard unlocks.
+            drop(table);
+        }
+    }
+
+    fn paddrs_for_shard(shard_index: usize, count: usize, first_page: usize) -> Vec<PhysAddr> {
+        let mut paddrs = Vec::new();
+        paddrs.try_reserve_exact(count).unwrap();
+        let mut page = first_page;
+        while paddrs.len() < count {
+            let paddr = PhysAddr::from(page.checked_mul(0x1000).unwrap());
+            if pin_shard_index(paddr) == shard_index {
+                paddrs.push(paddr);
+            }
+            page = page.checked_add(1).unwrap();
+        }
+        paddrs
     }
 
     fn assert_table_invariants(table: &PinnedFrameTable) {
@@ -290,6 +674,96 @@ mod tests {
     }
 
     #[test]
+    fn registry_prepare_failure_preserves_prefix_and_retry_skips_it() {
+        let _serial = GLOBAL_REGISTRY_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        const FAILING_SHARD: usize = 17;
+        reset_pin_registry();
+
+        let mut first_attempt = Vec::new();
+        let result = prepare_physical_pin_registry_with(|shard_index| {
+            // The allocation factory is the structural boundary: the target
+            // shard is demonstrably unlocked whenever a table is built.
+            assert!(PINNED_FRAME_SHARDS[shard_index].try_lock().is_some());
+            first_attempt.push(shard_index);
+            if shard_index == FAILING_SHARD {
+                return Err(AxError::NoMemory);
+            }
+            PinnedFrameTable::try_new(pin_shard_capacity(shard_index))
+        });
+        assert_eq!(result, Err(AxError::NoMemory));
+        assert_eq!(first_attempt, (0..=FAILING_SHARD).collect::<Vec<_>>());
+        for (index, shard) in PINNED_FRAME_SHARDS.iter().enumerate() {
+            assert_eq!(shard.lock().is_some(), index < FAILING_SHARD);
+        }
+
+        let mut retry = Vec::new();
+        prepare_physical_pin_registry_with(|shard_index| {
+            assert!(PINNED_FRAME_SHARDS[shard_index].try_lock().is_some());
+            retry.push(shard_index);
+            PinnedFrameTable::try_new(pin_shard_capacity(shard_index))
+        })
+        .unwrap();
+        assert_eq!(retry, (FAILING_SHARD..PIN_TABLE_SHARDS).collect::<Vec<_>>());
+        assert!(
+            PINNED_FRAME_SHARDS
+                .iter()
+                .all(|shard| shard.lock().is_some())
+        );
+        reset_pin_registry();
+    }
+
+    #[test]
+    fn racing_registry_loser_is_returned_after_the_shard_unlocks() {
+        let _serial = GLOBAL_REGISTRY_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        const SHARD: usize = 29;
+        reset_pin_registry();
+
+        assert!(install_prepared_pin_shard(SHARD, table_with_capacity(1)).is_none());
+        let loser = install_prepared_pin_shard(SHARD, table_with_capacity(1))
+            .expect("second registry initializer must retain its redundant owner");
+        assert!(PINNED_FRAME_SHARDS[SHARD].try_lock().is_some());
+        drop(loser);
+        reset_pin_registry();
+    }
+
+    #[test]
+    fn prepared_batch_push_is_bounded_and_publish_transfers_both_vectors() {
+        let _serial = GLOBAL_REGISTRY_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        reset_pin_registry();
+        prepare_physical_pin_registry().unwrap();
+        let mut prepared = PreparedPhysicalFramePins::try_new(3).unwrap();
+        let paddr_ptr = prepared.paddrs.as_ptr();
+        let paddr_capacity = prepared.paddrs.capacity();
+        let deferred_ptr = prepared.deferred_frees.as_ptr();
+        let deferred_capacity = prepared.deferred_frees.capacity();
+
+        assert!(prepared.push(PhysAddr::from(0x10_0000)));
+        assert!(prepared.push(PhysAddr::from(0x20_0000)));
+        assert!(prepared.push(PhysAddr::from(0x30_0000)));
+        assert!(!prepared.push(PhysAddr::from(0x40_0000)));
+        assert_eq!(prepared.paddrs.as_ptr(), paddr_ptr);
+        assert_eq!(prepared.paddrs.capacity(), paddr_capacity);
+
+        let pins = prepared.publish_admitted().unwrap();
+        assert_eq!(pins.paddrs.as_ptr(), paddr_ptr);
+        assert_eq!(pins.paddrs.capacity(), paddr_capacity);
+        assert_eq!(pins.deferred_frees.as_ptr(), deferred_ptr);
+        assert_eq!(pins.deferred_frees.capacity(), deferred_capacity);
+        assert_eq!(prepared.max_pages, 0);
+        assert_eq!(prepared.paddrs.capacity(), 0);
+        assert_eq!(prepared.deferred_frees.capacity(), 0);
+
+        drop(pins);
+        reset_pin_registry();
+    }
+
+    #[test]
     fn preallocated_table_is_bounded_and_duplicate_pins_share_one_slot() {
         let first = PhysAddr::from(0x1000);
         let second = PhysAddr::from(0x2000);
@@ -313,6 +787,277 @@ mod tests {
         table.pin_preallocated(address).unwrap();
         assert!(table.defer_deallocation(address, PageSize::Size4K));
         assert_eq!(table.unpin(address), Ok(Some(PageSize::Size4K)));
+        assert_table_invariants(&table);
+    }
+
+    #[test]
+    fn multi_page_batch_uses_one_pin_and_one_unpin_transaction() {
+        const PAGES: usize = 8;
+        let paddrs = (0..PAGES)
+            .map(|index| PhysAddr::from(0x10_0000 + index * 0x1000))
+            .collect::<Vec<_>>();
+        let mut table = table_with_capacity(PAGES);
+
+        table.pin_batch(&paddrs).unwrap();
+        assert_eq!(table.live, PAGES);
+        assert_eq!(
+            table.batch_metrics,
+            PinBatchMetrics {
+                pin_batches: 1,
+                pin_pages_requested: PAGES,
+                pin_pages_committed: PAGES,
+                ..PinBatchMetrics::default()
+            }
+        );
+
+        let mut deferred = Vec::new();
+        deferred.try_reserve_exact(PAGES).unwrap();
+        assert_eq!(
+            table.unpin_batch(&paddrs, &mut deferred),
+            UnpinBatchReport::default()
+        );
+        assert!(deferred.is_empty());
+        assert_eq!(table.live, 0);
+        assert_eq!(table.batch_metrics.pin_batches, 1);
+        assert_eq!(table.batch_metrics.unpin_batches, 1);
+        assert_eq!(table.batch_metrics.unpin_pages_requested, PAGES);
+        assert_eq!(table.batch_metrics.unpin_pages_completed, PAGES);
+        assert_table_invariants(&table);
+    }
+
+    #[test]
+    fn large_public_batch_is_split_into_bounded_registry_transactions() {
+        let _serial = GLOBAL_REGISTRY_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        const PAGES: usize = PIN_TABLE_LOCK_CHUNK_PAGES * 2 + 1;
+        const SHARD: usize = 7;
+        reset_pin_registry();
+        let paddrs = paddrs_for_shard(SHARD, PAGES, 0x180);
+
+        let pins = pin_frames_admitted(paddrs).unwrap();
+        {
+            let table = PINNED_FRAME_SHARDS[SHARD].lock();
+            let table = table.as_ref().unwrap();
+            assert_eq!(table.live, PAGES);
+            assert_eq!(table.batch_metrics.pin_batches, 3);
+            assert_eq!(table.batch_metrics.pin_pages_requested, PAGES);
+            assert_eq!(table.batch_metrics.pin_pages_committed, PAGES);
+        }
+
+        drop(pins);
+        {
+            let mut table = PINNED_FRAME_SHARDS[SHARD].lock();
+            let table = table.as_mut().unwrap();
+            assert_eq!(table.live, 0);
+            assert_eq!(table.batch_metrics.unpin_batches, 3);
+            assert_eq!(table.batch_metrics.unpin_pages_requested, PAGES);
+            assert_eq!(table.batch_metrics.unpin_pages_completed, PAGES);
+            assert_table_invariants(table);
+        }
+        reset_pin_registry();
+    }
+
+    #[test]
+    fn failed_later_chunk_rolls_back_every_committed_chunk() {
+        let _serial = GLOBAL_REGISTRY_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        const PAGES: usize = PIN_TABLE_LOCK_CHUNK_PAGES + 2;
+        const SHARD: usize = 11;
+        reset_pin_registry();
+        let paddrs = paddrs_for_shard(SHARD, PAGES, 0x280);
+        *PINNED_FRAME_SHARDS[SHARD].lock() = Some(table_with_capacity(PAGES - 1));
+
+        assert_eq!(pin_frames_admitted(paddrs).err(), Some(AxError::NoMemory));
+        {
+            let table = PINNED_FRAME_SHARDS[SHARD].lock();
+            let table = table.as_ref().unwrap();
+            assert_eq!(table.live, 0);
+            assert_eq!(table.batch_metrics.pin_batches, 2);
+            assert_eq!(table.batch_metrics.rollback_batches, 1);
+            assert_eq!(table.batch_metrics.rollback_pages, 1);
+            assert_eq!(table.batch_metrics.unpin_batches, 1);
+            assert_eq!(
+                table.batch_metrics.unpin_pages_requested,
+                PIN_TABLE_LOCK_CHUNK_PAGES
+            );
+            assert_eq!(
+                table.batch_metrics.unpin_pages_completed,
+                PIN_TABLE_LOCK_CHUNK_PAGES
+            );
+            assert_table_invariants(table);
+        }
+        reset_pin_registry();
+    }
+
+    #[test]
+    fn shard_capacities_preserve_the_exact_metadata_reserve() {
+        let total = (0..PIN_TABLE_SHARDS).map(pin_shard_capacity).sum::<usize>();
+        assert_eq!(total, PIN_METADATA_SLOTS);
+        assert!((0..PIN_TABLE_SHARDS).all(|index| pin_shard_capacity(index) != 0));
+    }
+
+    #[test]
+    fn exact_system_limit_contiguous_batch_survives_shard_skew() {
+        let _serial = GLOBAL_REGISTRY_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        reset_pin_registry();
+        let paddrs = (0..MAX_PINNED_FRAMES)
+            .map(|page| PhysAddr::from((page + 1) * 0x1000))
+            .collect::<Vec<_>>();
+
+        let pins = pin_frames_admitted(paddrs).unwrap();
+        let mut total_live = 0usize;
+        for (index, shard) in PINNED_FRAME_SHARDS.iter().enumerate() {
+            let table = shard.lock();
+            let table = table.as_ref().unwrap();
+            assert!(table.live <= pin_shard_capacity(index));
+            total_live += table.live;
+        }
+        assert_eq!(total_live, MAX_PINNED_FRAMES);
+
+        drop(pins);
+        assert!(PINNED_FRAME_SHARDS.iter().all(|shard| {
+            let table = shard.lock();
+            table.as_ref().is_some_and(|table| table.live == 0)
+        }));
+        reset_pin_registry();
+    }
+
+    #[test]
+    fn pathological_single_shard_pressure_fails_atomically_at_its_bound() {
+        let _serial = GLOBAL_REGISTRY_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        const SHARD: usize = 23;
+        reset_pin_registry();
+        let paddrs = paddrs_for_shard(SHARD, pin_shard_capacity(SHARD) + 1, 0x580);
+        let mut prepared = prepare_batch_from_paddrs(paddrs).unwrap();
+        let paddr_ptr = prepared.paddrs.as_ptr();
+        let paddr_capacity = prepared.paddrs.capacity();
+        let deferred_ptr = prepared.deferred_frees.as_ptr();
+        let deferred_capacity = prepared.deferred_frees.capacity();
+
+        // Pathological skew is a bounded mechanism rejection. Publication
+        // rolls back atomically and retains both large owners so the adapter
+        // can unlock AddrSpace, drop this preparation, and use its copy path.
+        assert_eq!(prepared.publish_admitted().err(), Some(AxError::NoMemory));
+        assert_eq!(prepared.paddrs.as_ptr(), paddr_ptr);
+        assert_eq!(prepared.paddrs.capacity(), paddr_capacity);
+        assert_eq!(prepared.deferred_frees.as_ptr(), deferred_ptr);
+        assert_eq!(prepared.deferred_frees.capacity(), deferred_capacity);
+        assert!(prepared.publication_failed);
+        assert_eq!(prepared.publish_admitted().err(), Some(AxError::BadState));
+        {
+            let table = PINNED_FRAME_SHARDS[SHARD].lock();
+            let table = table.as_ref().unwrap();
+            assert_eq!(table.live, 0);
+            assert_table_invariants(table);
+        }
+        drop(prepared);
+        reset_pin_registry();
+    }
+
+    #[test]
+    fn distinct_shards_have_independent_irq_safe_locks() {
+        let _serial = GLOBAL_REGISTRY_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        const FIRST: usize = 5;
+        const SECOND: usize = 37;
+        reset_pin_registry();
+        *PINNED_FRAME_SHARDS[FIRST].lock() = Some(table_with_capacity(1));
+        *PINNED_FRAME_SHARDS[SECOND].lock() = Some(table_with_capacity(1));
+
+        let first = PINNED_FRAME_SHARDS[FIRST].lock();
+        assert!(PINNED_FRAME_SHARDS[SECOND].try_lock().is_some());
+        drop(first);
+        reset_pin_registry();
+    }
+
+    #[test]
+    fn failed_shard_rolls_back_every_previously_committed_shard() {
+        let _serial = GLOBAL_REGISTRY_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        const FIRST: usize = 3;
+        const FAILING: usize = 19;
+        const FIRST_PAGES: usize = 5;
+        reset_pin_registry();
+        let mut paddrs = paddrs_for_shard(FIRST, FIRST_PAGES, 0x380);
+        paddrs.extend(paddrs_for_shard(FAILING, 2, 0x480));
+        *PINNED_FRAME_SHARDS[FAILING].lock() = Some(table_with_capacity(1));
+
+        assert_eq!(pin_frames_admitted(paddrs).err(), Some(AxError::NoMemory));
+        {
+            let table = PINNED_FRAME_SHARDS[FIRST].lock();
+            let table = table.as_ref().unwrap();
+            assert_eq!(table.live, 0);
+            assert_eq!(table.batch_metrics.pin_batches, 1);
+            assert_eq!(table.batch_metrics.unpin_batches, 1);
+            assert_eq!(table.batch_metrics.unpin_pages_completed, FIRST_PAGES);
+            assert_table_invariants(table);
+        }
+        {
+            let table = PINNED_FRAME_SHARDS[FAILING].lock();
+            let table = table.as_ref().unwrap();
+            assert_eq!(table.live, 0);
+            assert_eq!(table.batch_metrics.pin_batches, 1);
+            assert_eq!(table.batch_metrics.rollback_batches, 1);
+            assert_eq!(table.batch_metrics.rollback_pages, 1);
+            assert_eq!(table.batch_metrics.unpin_batches, 0);
+            assert_table_invariants(table);
+        }
+        reset_pin_registry();
+    }
+
+    #[test]
+    fn failed_batch_rolls_back_its_complete_pinned_prefix() {
+        let paddrs = [
+            PhysAddr::from(0x20_0000),
+            PhysAddr::from(0x21_0000),
+            PhysAddr::from(0x22_0000),
+        ];
+        let mut table = table_with_capacity(2);
+
+        assert_eq!(table.pin_batch(&paddrs), Err(AxError::NoMemory));
+        assert_eq!(table.live, 0);
+        assert_eq!(table.batch_metrics.pin_batches, 1);
+        assert_eq!(table.batch_metrics.pin_pages_requested, paddrs.len());
+        assert_eq!(table.batch_metrics.pin_pages_committed, 0);
+        assert_eq!(table.batch_metrics.rollback_batches, 1);
+        assert_eq!(table.batch_metrics.rollback_pages, 2);
+        assert_table_invariants(&table);
+
+        table.pin_batch(&paddrs[..2]).unwrap();
+        assert_eq!(table.live, 2);
+        assert_table_invariants(&table);
+    }
+
+    #[test]
+    fn batch_release_preserves_duplicate_refcounts_and_defers_each_frame_once() {
+        let first = PhysAddr::from(0x30_0000);
+        let second = PhysAddr::from(0x31_0000);
+        let paddrs = [first, first, second];
+        let mut table = table_with_capacity(2);
+        table.pin_batch(&paddrs).unwrap();
+        assert_eq!(table.live, 2);
+        assert!(table.defer_deallocation(first, PageSize::Size4K));
+        assert!(table.defer_deallocation(second, PageSize::Size2M));
+
+        let mut deferred = Vec::new();
+        deferred.try_reserve_exact(paddrs.len()).unwrap();
+        assert_eq!(
+            table.unpin_batch(&paddrs, &mut deferred),
+            UnpinBatchReport::default()
+        );
+        assert_eq!(
+            deferred,
+            alloc::vec![(first, PageSize::Size4K), (second, PageSize::Size2M)]
+        );
+        assert_eq!(table.live, 0);
         assert_table_invariants(&table);
     }
 

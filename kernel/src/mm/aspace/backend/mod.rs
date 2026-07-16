@@ -24,7 +24,7 @@ mod shared;
 pub use self::shared::{SharedAtomicU32, SharedPages};
 pub(crate) use self::{
     file::WritableMappingAdmission,
-    phys_pin::{PhysicalFramePin, pin_frame},
+    phys_pin::{PhysicalFramePins, PreparedPhysicalFramePins, prepare_physical_pin_registry},
     shared::PreparedFixedSharedMapping,
 };
 use super::{

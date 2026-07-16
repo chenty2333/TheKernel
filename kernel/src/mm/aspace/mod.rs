@@ -653,6 +653,13 @@ fn allocate_mapping_identity() -> AxResult<(MappingLineage, MappingIdentityState
 pub(crate) struct UserIoMappingExpectation {
     expected: ExpectedMapping,
     covered: PageRange,
+    needs_frame_registry: bool,
+}
+
+impl UserIoMappingExpectation {
+    pub(crate) const fn needs_frame_registry(&self) -> bool {
+        self.needs_frame_registry
+    }
 }
 
 /// System-wide accounting ownership held across the complete lower pin
@@ -1412,11 +1419,7 @@ impl AddrSpace {
     pub(crate) fn begin_user_io_pin(
         &mut self,
         request: PinRequest,
-    ) -> AxResult<(
-        PinReservation,
-        UserIoSystemPinCharge,
-        Vec<UserIoMappingExpectation>,
-    )> {
+    ) -> AxResult<(PinReservation, UserIoSystemPinCharge)> {
         if request.owner() != self.user_io_pin_owner() {
             return Err(AxError::InvalidInput);
         }
@@ -1425,23 +1428,16 @@ impl AddrSpace {
             .user_io_pins
             .reserve(request, self.address_space_id)
             .map_err(mm_error)?;
-        let range = self
-            .user_io_pins
-            .view(reservation.token())
-            .map_err(mm_error)?
-            .range();
-        match self.snapshot_user_io_mappings(range) {
-            Ok(expectations) => Ok((reservation, system_charge, expectations)),
-            Err(error) => {
-                self.user_io_pins
-                    .cancel_reservation(reservation)
-                    .map_err(mm_error)?;
-                Err(error)
-            }
-        }
+        Ok((reservation, system_charge))
     }
 
     pub(crate) fn cancel_user_io_pin(&mut self, reservation: PinReservation) {
+        // `revalidate_next` removes a stale reservation itself. Treat that
+        // already-rolled-back state as successful cancellation so adapter RAII
+        // can use one cleanup path for every preparation failure.
+        if self.user_io_pins.view(reservation.token()).is_err() {
+            return;
+        }
         if let Err(error) = self.user_io_pins.cancel_reservation(reservation) {
             warn!(
                 "AddrSpace::cancel_user_io_pin: token {}: {error:?}",
@@ -1450,37 +1446,30 @@ impl AddrSpace {
         }
     }
 
+    /// Revalidates every frozen VMA expectation and publishes the lower pin in
+    /// one topology-serialization scope, as required by the linux-mm core
+    /// contract.
     pub(crate) fn publish_user_io_pin(
         &mut self,
         reservation: PinReservation,
         expectations: &[UserIoMappingExpectation],
     ) -> AxResult<PinToken> {
-        let publication = (|| {
-            for expectation in expectations {
-                let area = self
-                    .areas
-                    .find(VirtAddr::from(expectation.covered.start()))
-                    .ok_or(AxError::BadAddress)?;
-                let current = self.mapping_snapshot(area)?;
-                self.user_io_pins
-                    .revalidate_next(
-                        reservation,
-                        expectation.expected,
-                        current,
-                        expectation.covered,
-                    )
-                    .map_err(mm_error)?;
-            }
-            self.user_io_pins.commit(reservation).map_err(mm_error)
-        })();
-
-        if publication.is_err()
-            && let Ok(view) = self.user_io_pins.view(reservation.token())
-            && !view.is_active()
-        {
-            self.cancel_user_io_pin(reservation);
+        for expectation in expectations {
+            let area = self
+                .areas
+                .find(VirtAddr::from(expectation.covered.start()))
+                .ok_or(AxError::BadAddress)?;
+            let current = self.mapping_snapshot(area)?;
+            self.user_io_pins
+                .revalidate_next(
+                    reservation,
+                    expectation.expected,
+                    current,
+                    expectation.covered,
+                )
+                .map_err(mm_error)?;
         }
-        publication
+        self.user_io_pins.commit(reservation).map_err(mm_error)
     }
 
     pub(crate) fn end_user_io_pin(&mut self, token: PinToken) {
@@ -1513,16 +1502,34 @@ impl AddrSpace {
             .map_err(mm_error)
     }
 
-    fn snapshot_user_io_mappings(
+    /// Appends mapping expectations for one caller-bounded scan window.
+    ///
+    /// `snapshots` must reserve at least one slot per covered page before the
+    /// caller takes the address-space lock. VMAs are page-aligned, so this
+    /// method can then split a VMA at the window boundary and push without any
+    /// allocation. Partial output on error remains owned by unpublished-pin
+    /// RAII and must be dropped only after the caller releases the lock.
+    pub(crate) fn append_user_io_mapping_expectations(
         &self,
-        range: PageRange,
-    ) -> AxResult<Vec<UserIoMappingExpectation>> {
-        let mut cursor = VirtAddr::from(range.start());
-        let end = VirtAddr::from(range.end());
-        let mut snapshots = Vec::new();
+        start: VirtAddr,
+        size: usize,
+        access_flags: MappingFlags,
+        snapshots: &mut Vec<UserIoMappingExpectation>,
+    ) -> AxResult {
+        self.validate_region(start, size)?;
+        if size == 0 {
+            return Err(AxError::InvalidInput);
+        }
+        let page_count = size / PAGE_SIZE_4K;
+        if snapshots.capacity().saturating_sub(snapshots.len()) < page_count {
+            return Err(AxError::NoMemory);
+        }
+
+        let mut cursor = start;
+        let end = start + size;
         while cursor < end {
             let area = self.areas.find(cursor).ok_or(AxError::BadAddress)?;
-            if area.start() > cursor {
+            if area.start() > cursor || !area.flags().contains(access_flags) {
                 return Err(AxError::BadAddress);
             }
             let segment_end = area.end().min(end);
@@ -1532,14 +1539,14 @@ impl AddrSpace {
                 PAGE_SIZE_4K,
             )
             .map_err(mm_error)?;
-            snapshots.try_reserve(1).map_err(|_| AxError::NoMemory)?;
             snapshots.push(UserIoMappingExpectation {
                 expected: self.mapping_snapshot(area)?.expected(),
                 covered,
+                needs_frame_registry: area.backend().supports_user_io_frame_pin(),
             });
             cursor = segment_end;
         }
-        Ok(snapshots)
+        Ok(())
     }
 
     fn mapping_snapshot(&self, area: &MemoryArea<Backend>) -> AxResult<MappingSnapshot> {

@@ -30,7 +30,10 @@ use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use starry_vm::{VmError, VmIo, VmResult, vm_load_until_nul, vm_read_slice, vm_write_slice};
 use thekernel_linux_mm::{PinAccess, PinDuration, PinRequest, PinToken, PinUse, UserRange};
 
-use super::{AddrSpace, Backend, PhysicalFramePin, pin_frame};
+use super::{
+    AddrSpace, Backend, PhysicalFramePins, PreparedPhysicalFramePins, UserIoMappingExpectation,
+    prepare_physical_pin_registry,
+};
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
     task::{AsThread, Thread},
@@ -104,8 +107,17 @@ static USER_IO_PIN_UNPINS: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PIN_TEST_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
 const MAX_USER_IO_PIN_SEGMENTS: usize = 32;
+/// Bounds one address-space critical section while collecting mapping
+/// expectations or acquiring exact lower-level owners for resident user pages.
+const USER_IO_PIN_SCAN_CHUNK_PAGES: usize = 64;
 #[cfg(feature = "test-io-control")]
 pub const USER_IO_PIN_TEST_DELAY_MS_MAX: u64 = 1_000;
+
+fn user_io_pin_scan_chunk_end(cursor: VirtAddr, end: VirtAddr) -> VirtAddr {
+    debug_assert!(cursor < end);
+    debug_assert!(cursor.is_aligned_4k() && end.is_aligned_4k());
+    cursor + (end - cursor).min(USER_IO_PIN_SCAN_CHUNK_PAGES * PAGE_SIZE_4K)
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UserIoPinCounters {
@@ -851,18 +863,20 @@ fn record_user_io_pin_segments(segments: &UserIoPinSegments) {
 }
 
 struct UserIoFramePins {
-    pins: Vec<PhysicalFramePin>,
+    _pins: Vec<PhysicalFramePins>,
+    pages: usize,
 }
 
 impl UserIoFramePins {
-    fn new(pins: Vec<PhysicalFramePin>) -> Self {
-        Self { pins }
+    fn new(pins: Vec<PhysicalFramePins>) -> Self {
+        let pages = pins.iter().map(PhysicalFramePins::len).sum();
+        Self { _pins: pins, pages }
     }
 }
 
 impl Drop for UserIoFramePins {
     fn drop(&mut self) {
-        record_user_io_pin_counter(&USER_IO_PIN_FRAME_PIN_UNPINS, self.pins.len() as u64);
+        record_user_io_pin_counter(&USER_IO_PIN_FRAME_PIN_UNPINS, self.pages as u64);
     }
 }
 
@@ -892,6 +906,117 @@ impl Drop for UserIoRangePin {
     fn drop(&mut self) {
         self.aspace.lock().end_user_io_pin(self.token);
         record_user_io_pin_counter(&USER_IO_PIN_VM_RANGE_PIN_UNPINS, 1);
+    }
+}
+
+/// Owns every unpublished resource in the user-I/O pin transaction.
+///
+/// Failure cleanup releases exact frame/page-cache owners before cancelling
+/// the VM reservation and finally refunding the system-wide charge. This keeps
+/// the same ordering on allocation failure, mapping rejection, stale
+/// revalidation, and successful-call construction failures.
+struct UnpublishedUserIoPin {
+    aspace: Arc<Mutex<AddrSpace>>,
+    reservation: Option<thekernel_linux_mm::PinReservation>,
+    system_charge: Option<super::UserIoSystemPinCharge>,
+    expectations: Vec<UserIoMappingExpectation>,
+    frame_pins: Vec<PhysicalFramePins>,
+    page_cache_pins: Vec<CachedFilePagePin>,
+    charged_pages: usize,
+    frame_pages_admitted: usize,
+}
+
+impl UnpublishedUserIoPin {
+    fn try_new(
+        aspace: Arc<Mutex<AddrSpace>>,
+        reservation: thekernel_linux_mm::PinReservation,
+        system_charge: super::UserIoSystemPinCharge,
+        page_count: usize,
+    ) -> Option<Self> {
+        let mut preparation = Self {
+            aspace,
+            reservation: Some(reservation),
+            system_charge: Some(system_charge),
+            expectations: Vec::new(),
+            frame_pins: Vec::new(),
+            page_cache_pins: Vec::new(),
+            charged_pages: page_count,
+            frame_pages_admitted: 0,
+        };
+        let frame_batches = page_count.div_ceil(USER_IO_PIN_SCAN_CHUNK_PAGES);
+        if preparation
+            .expectations
+            .try_reserve_exact(page_count)
+            .is_err()
+            || preparation
+                .frame_pins
+                .try_reserve_exact(frame_batches)
+                .is_err()
+            || preparation
+                .page_cache_pins
+                .try_reserve_exact(page_count)
+                .is_err()
+        {
+            return None;
+        }
+        Some(preparation)
+    }
+
+    fn reservation(&self) -> thekernel_linux_mm::PinReservation {
+        self.reservation.expect("active user-I/O pin preparation")
+    }
+
+    fn admit_frame_pages(&mut self, pages: usize) -> AxResult<&super::UserIoSystemPinCharge> {
+        let admitted = self
+            .frame_pages_admitted
+            .checked_add(pages)
+            .ok_or(AxError::NoMemory)?;
+        if admitted > self.charged_pages {
+            return Err(AxError::ResourceBusy);
+        }
+        self.frame_pages_admitted = admitted;
+        Ok(self
+            .system_charge
+            .as_ref()
+            .expect("active user-I/O system charge"))
+    }
+
+    fn expectations(&self) -> &[UserIoMappingExpectation] {
+        &self.expectations
+    }
+
+    fn finish(mut self, segments: UserIoPinSegments, token: PinToken) -> PreparedUserIoPin {
+        self.reservation = None;
+        let system_charge = self
+            .system_charge
+            .take()
+            .expect("published user-I/O pin lost its system charge");
+        let frame_pins = UserIoFramePins::new(core::mem::take(&mut self.frame_pins));
+        let page_cache_pins = UserIoPageCachePins::new(core::mem::take(&mut self.page_cache_pins));
+        let range_pin = UserIoRangePin {
+            aspace: self.aspace.clone(),
+            token,
+            _system_charge: system_charge,
+        };
+        PreparedUserIoPin {
+            segments,
+            frame_pins,
+            page_cache_pins,
+            range_pin,
+        }
+    }
+}
+
+impl Drop for UnpublishedUserIoPin {
+    fn drop(&mut self) {
+        // Vec::clear performs no allocation. Deferred physical-frame frees and
+        // cached-page unpins run without the address-space lock held.
+        self.frame_pins.clear();
+        self.page_cache_pins.clear();
+        if let Some(reservation) = self.reservation.take() {
+            self.aspace.lock().cancel_user_io_pin(reservation);
+        }
+        drop(self.system_charge.take());
     }
 }
 
@@ -942,197 +1067,304 @@ fn prepare_user_io_pin(
     };
     let page_len = page_end - page_start;
     let aspace_handle = thr.proc_data.aspace();
-    let mut aspace = aspace_handle.lock();
-    if !aspace.can_access_range(start_addr, len, access_flags) {
-        reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
-        return None;
-    }
-
-    record_user_io_pin_counter(&USER_IO_PIN_VM_RANGE_PIN_ATTEMPTS, 1);
-    let request = PinRequest::new(
-        UserRange::new(start, len).ok()?,
-        if access_flags.contains(MappingFlags::WRITE) {
-            PinAccess::Write
-        } else {
-            PinAccess::Read
-        },
-        PinDuration::AsyncIo,
-        PinUse::BlockIo,
-        aspace.user_io_pin_owner(),
-    );
-    let (reservation, system_charge, expectations) = match aspace.begin_user_io_pin(request) {
+    let admission = {
+        let mut aspace = aspace_handle.lock();
+        record_user_io_pin_counter(&USER_IO_PIN_VM_RANGE_PIN_ATTEMPTS, 1);
+        let request = PinRequest::new(
+            UserRange::new(start, len).ok()?,
+            if access_flags.contains(MappingFlags::WRITE) {
+                PinAccess::Write
+            } else {
+                PinAccess::Read
+            },
+            PinDuration::AsyncIo,
+            PinUse::BlockIo,
+            aspace.user_io_pin_owner(),
+        );
+        aspace.begin_user_io_pin(request)
+    };
+    let (reservation, system_charge) = match admission {
         Ok(admission) => admission,
         Err(_) => {
             reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
             return None;
         }
     };
+    let page_count = page_len / PAGE_SIZE_4K;
+    let Some(mut preparation) = UnpublishedUserIoPin::try_new(
+        aspace_handle.clone(),
+        reservation,
+        system_charge,
+        page_count,
+    ) else {
+        reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+        return None;
+    };
 
-    let mechanism = (|| {
-        let mut pin_windows = Vec::new();
-        let page_count = page_len / PAGE_SIZE_4K;
-        let mut frame_pins = Vec::new();
-        let mut page_cache_pins = Vec::new();
-        // Reserve every fallible owner collection before acquiring the first
-        // backend pin. A later Vec growth failure would otherwise abort the
-        // kernel while a charged reservation and partial pin set are live.
-        if pin_windows.try_reserve_exact(expectations.len()).is_err()
-            || frame_pins.try_reserve_exact(page_count).is_err()
-            || page_cache_pins.try_reserve_exact(page_count).is_err()
-        {
+    // The initial lock scope only installs the full-range Reserved barrier and
+    // its system charge. Build mapping expectations afterwards in bounded
+    // windows, using storage reserved outside every address-space lock. The
+    // Reserved record blocks overlapping topology/access mutations across the
+    // gaps between windows.
+    let mut expectation_cursor = page_start;
+    while expectation_cursor < page_end {
+        let chunk_end = user_io_pin_scan_chunk_end(expectation_cursor, page_end);
+        let expectation_result = {
+            let aspace = aspace_handle.lock();
+            aspace.append_user_io_mapping_expectations(
+                expectation_cursor,
+                chunk_end - expectation_cursor,
+                access_flags,
+                &mut preparation.expectations,
+            )
+        };
+        if expectation_result.is_err() {
+            reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+            reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
             return None;
         }
-        let mut window_cursor = page_start;
-        while window_cursor < page_end {
-            let Some(area) = aspace.find_area(window_cursor) else {
-                reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
-                return None;
-            };
-            match area.backend().begin_user_io_pin_window() {
-                Ok(Some(window)) => pin_windows.push(window),
-                Ok(None) => {}
-                Err(_) => {
-                    reject_user_io_pin(&USER_IO_PIN_REJECT_FILE_PIN);
-                    return None;
-                }
-            }
-            window_cursor = area.end().min(page_end);
-        }
+        expectation_cursor = chunk_end;
+    }
+    let needs_frame_registry = preparation
+        .expectations()
+        .iter()
+        .any(UserIoMappingExpectation::needs_frame_registry);
+    if needs_frame_registry && prepare_physical_pin_registry().is_err() {
+        reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
+        reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+        return None;
+    }
 
-        // The 0.1 direct-I/O fast path is deliberately resident-only. Faulting
-        // file/COW pages here would hold the address-space lock across blocking
-        // cache or filesystem work. Missing or not-yet-writable pages take the
-        // existing copy path; a future fault/revalidate transaction can widen
-        // admission without weakening this bounded critical section.
-        let mut segments = UserIoPinSegments::new();
-        let mut copied = 0usize;
-        for offset in (0..page_len).step_by(PAGE_SIZE_4K) {
-            let vaddr = page_start + offset;
-            let Ok((paddr, flags, page_size)) = aspace.page_table().query(vaddr) else {
-                reject_user_io_pin(&USER_IO_PIN_REJECT_PAGETABLE);
-                return None;
-            };
-            if page_size != PageSize::Size4K || !flags.contains(access_flags) {
-                reject_user_io_pin(&USER_IO_PIN_REJECT_PAGETABLE);
+    // Reuse one preallocated window owner list. At most one distinct VMA can
+    // begin per scanned page, so this bound makes every push infallible while
+    // the address-space lock is held.
+    let mut pin_windows = Vec::new();
+    if pin_windows
+        .try_reserve_exact(USER_IO_PIN_SCAN_CHUNK_PAGES)
+        .is_err()
+    {
+        reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+        return None;
+    }
+
+    // This direct-I/O path remains resident-only. Each critical section first
+    // identifies at most 64 mapped pages and acquires their exact lower owners
+    // before releasing the address-space lock. In particular, COW frames are
+    // never queried, unlocked, and only then pinned: a concurrent write fault
+    // could otherwise replace and free the observed frame in that gap.
+    let mut segments = UserIoPinSegments::new();
+    let mut copied = 0usize;
+    let mut cow_frame_pages = 0usize;
+    let mut shared_frame_pages = 0usize;
+    let mut frame_pin_attempted = false;
+    let mut scan_cursor = page_start;
+    while scan_cursor < page_end {
+        let chunk_end = user_io_pin_scan_chunk_end(scan_cursor, page_end);
+        let chunk_pages = (chunk_end - scan_cursor) / PAGE_SIZE_4K;
+        // Both address and deferred-free owners are allocated before taking
+        // AddrSpace. File-only requests use a zero-capacity preparation and do
+        // not pay for physical-registry batch storage.
+        let frame_capacity = if needs_frame_registry { chunk_pages } else { 0 };
+        let mut frame_preparation = match PreparedPhysicalFramePins::try_new(frame_capacity) {
+            Ok(preparation) => preparation,
+            Err(_) => {
+                reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
                 return None;
             }
-            let Some(area) = aspace.find_area(vaddr) else {
-                reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
-                return None;
-            };
-            let backend = area.backend();
-            if backend.supports_user_io_frame_pin() {
-                record_user_io_pin_counter(&USER_IO_PIN_FRAME_PIN_ATTEMPTS, 1);
-                let frame_pin = match pin_frame(paddr) {
-                    Ok(pin) => pin,
+        };
+
+        let chunk_pin = {
+            let aspace = aspace_handle.lock();
+            (|| {
+                let mut window_cursor = scan_cursor;
+                while window_cursor < chunk_end {
+                    let Some(area) = aspace.find_area(window_cursor) else {
+                        reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+                        return None;
+                    };
+                    if area.start() > window_cursor {
+                        reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+                        return None;
+                    }
+                    match area.backend().begin_user_io_pin_window() {
+                        Ok(Some(window)) => pin_windows.push(window),
+                        Ok(None) => {}
+                        Err(_) => {
+                            reject_user_io_pin(&USER_IO_PIN_REJECT_FILE_PIN);
+                            return None;
+                        }
+                    }
+                    window_cursor = area.end().min(chunk_end);
+                }
+
+                let mut vaddr = scan_cursor;
+                while vaddr < chunk_end {
+                    let Ok((paddr, flags, page_size)) = aspace.page_table().query(vaddr) else {
+                        reject_user_io_pin(&USER_IO_PIN_REJECT_PAGETABLE);
+                        return None;
+                    };
+                    if page_size != PageSize::Size4K || !flags.contains(access_flags) {
+                        reject_user_io_pin(&USER_IO_PIN_REJECT_PAGETABLE);
+                        return None;
+                    }
+                    let Some(area) = aspace.find_area(vaddr) else {
+                        reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+                        return None;
+                    };
+                    let backend = area.backend();
+                    if backend.supports_user_io_frame_pin() {
+                        match backend {
+                            Backend::Cow(_) => cow_frame_pages += 1,
+                            Backend::Shared(_) => shared_frame_pages += 1,
+                            Backend::Linear(_) | Backend::File(_) => unreachable!(),
+                        }
+                        if !frame_preparation.push(paddr) {
+                            reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
+                            return None;
+                        }
+                    } else {
+                        record_user_io_pin_counter(&USER_IO_PIN_PAGE_CACHE_PIN_ATTEMPTS, 1);
+                        match backend.pin_user_io_page_cache(
+                            vaddr,
+                            paddr,
+                            access_flags.contains(MappingFlags::WRITE),
+                        ) {
+                            Ok(Some(pin)) => {
+                                record_user_io_backend_pin_hit(backend);
+                                preparation.page_cache_pins.push(pin);
+                            }
+                            Ok(None) => {
+                                record_user_io_backend_pin_reject(backend);
+                                reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
+                                return None;
+                            }
+                            Err(_) => {
+                                record_user_io_backend_pin_reject(backend);
+                                reject_user_io_pin(&USER_IO_PIN_REJECT_PAGE_CACHE_PIN);
+                                return None;
+                            }
+                        }
+                    }
+
+                    let page_offset = if vaddr == page_start {
+                        start_addr.sub_addr(page_start)
+                    } else {
+                        0
+                    };
+                    let chunk_len = (len - copied).min(PAGE_SIZE_4K - page_offset);
+                    if !segments.push_or_merge(paddr.as_usize() + page_offset, chunk_len) {
+                        reject_user_io_pin(&USER_IO_PIN_REJECT_SEGMENTS);
+                        return None;
+                    }
+                    copied += chunk_len;
+                    vaddr += PAGE_SIZE_4K;
+                }
+
+                if frame_preparation.is_empty() {
+                    return Some(None);
+                }
+                if !frame_pin_attempted {
+                    record_user_io_pin_counter(&USER_IO_PIN_FRAME_PIN_ATTEMPTS, 1);
+                    frame_pin_attempted = true;
+                }
+                let system_charge = match preparation.admit_frame_pages(frame_preparation.len()) {
+                    Ok(charge) => charge,
                     Err(_) => {
-                        record_user_io_backend_pin_reject(backend);
                         reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
                         return None;
                     }
                 };
-                record_user_io_backend_pin_hit(backend);
-                frame_pins.push(frame_pin);
-            } else {
-                record_user_io_pin_counter(&USER_IO_PIN_PAGE_CACHE_PIN_ATTEMPTS, 1);
-                match backend.pin_user_io_page_cache(
-                    vaddr,
-                    paddr,
-                    access_flags.contains(MappingFlags::WRITE),
-                ) {
-                    Ok(Some(pin)) => {
-                        record_user_io_backend_pin_hit(backend);
-                        page_cache_pins.push(pin);
-                    }
-                    Ok(None) => {
-                        record_user_io_backend_pin_reject(backend);
-                        reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
-                        return None;
-                    }
+                match frame_preparation.publish(system_charge) {
+                    Ok(pins) => Some(Some(pins)),
                     Err(_) => {
-                        record_user_io_backend_pin_reject(backend);
-                        reject_user_io_pin(&USER_IO_PIN_REJECT_PAGE_CACHE_PIN);
-                        return None;
+                        if cow_frame_pages != 0 {
+                            reject_user_io_pin(&USER_IO_PIN_REJECT_COW_PIN);
+                        }
+                        if shared_frame_pages != 0 {
+                            reject_user_io_pin(&USER_IO_PIN_REJECT_SHARED_PIN);
+                        }
+                        reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
+                        None
                     }
                 }
-            }
-            let page_offset = if offset == 0 {
-                start_addr.sub_addr(page_start)
-            } else {
-                0
-            };
-            let chunk_len = (len - copied).min(PAGE_SIZE_4K - page_offset);
-            if !segments.push_or_merge(paddr.as_usize() + page_offset, chunk_len) {
-                reject_user_io_pin(&USER_IO_PIN_REJECT_SEGMENTS);
-                return None;
-            }
-            copied += chunk_len;
-        }
+            })()
+        };
 
-        if frame_pins.is_empty() && page_cache_pins.is_empty() {
-            reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
+        // Exact page pins now replace these conservative file-wide windows.
+        // Drop them without holding the address-space lock.
+        pin_windows.clear();
+        let Some(chunk_pin) = chunk_pin else {
+            reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
             return None;
+        };
+        if let Some(chunk_pin) = chunk_pin {
+            preparation.frame_pins.push(chunk_pin);
         }
-        if copied != len {
-            reject_user_io_pin(&USER_IO_PIN_REJECT_PAGETABLE);
-            return None;
-        }
-        if require_contiguous && segments.len() != 1 {
-            reject_user_io_pin(&USER_IO_PIN_REJECT_NONCONTIG);
-            return None;
-        }
-        // Exact frame/page-cache pins now carry the lifetime contract. Release
-        // the conservative file-wide preparation windows before publication.
-        drop(pin_windows);
-        Some((segments, frame_pins, page_cache_pins))
-    })();
+        scan_cursor = chunk_end;
+    }
 
-    let Some((segments, frame_pins, page_cache_pins)) = mechanism else {
-        aspace.cancel_user_io_pin(reservation);
+    if preparation.frame_pins.is_empty() && preparation.page_cache_pins.is_empty() {
+        reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
         reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
         return None;
+    }
+    if copied != len {
+        reject_user_io_pin(&USER_IO_PIN_REJECT_PAGETABLE);
+        reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+        return None;
+    }
+    if require_contiguous && segments.len() != 1 {
+        reject_user_io_pin(&USER_IO_PIN_REJECT_NONCONTIG);
+        reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+        return None;
+    }
+    debug_assert_eq!(frame_pin_attempted, needs_frame_registry);
+    record_user_io_pin_counter(&USER_IO_PIN_COW_PIN_PAGES, cow_frame_pages as u64);
+    record_user_io_pin_counter(&USER_IO_PIN_SHARED_PIN_PAGES, shared_frame_pages as u64);
+    let frame_pin_pages = preparation
+        .frame_pins
+        .iter()
+        .map(PhysicalFramePins::len)
+        .sum::<usize>();
+    let page_cache_pin_pages = preparation.page_cache_pins.len();
+    debug_assert_eq!(frame_pin_pages + page_cache_pin_pages, page_count);
+
+    // The linux-mm core currently requires one topology-serialization scope
+    // across the complete expectation sequence and commit. Keep this final
+    // publication lock intact; only the per-page lower-pin scan is chunked.
+    // Keep the lock guard in an explicit scope. A temporary guard used as the
+    // `match` scrutinee would live through its selected arm; an error return
+    // could then drop unpublished owners and recursively cancel the reservation
+    // while the same AddrSpace mutex was still held.
+    let publication = {
+        let mut aspace = aspace_handle.lock();
+        aspace.publish_user_io_pin(preparation.reservation(), preparation.expectations())
     };
-    let token = match aspace.publish_user_io_pin(reservation, &expectations) {
+    let token = match publication {
         Ok(token) => token,
         Err(_) => {
-            drop(frame_pins);
-            drop(page_cache_pins);
-            drop(aspace);
-            drop(system_charge);
             reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
             return None;
         }
     };
+    // Disarm unpublished cleanup immediately after the core state transition;
+    // everything below is infallible bookkeeping over the published RAII pin.
+    let prepared = preparation.finish(segments, token);
     record_user_io_pin_counter(&USER_IO_PIN_VM_RANGE_PIN_HITS, 1);
     record_user_io_pin_counter(&USER_IO_PIN_VM_RANGE_PIN_BYTES, page_len as u64);
-    if !frame_pins.is_empty() {
+    if frame_pin_pages != 0 {
         record_user_io_pin_counter(&USER_IO_PIN_FRAME_PIN_HITS, 1);
-        record_user_io_pin_counter(&USER_IO_PIN_FRAME_PIN_PAGES, frame_pins.len() as u64);
+        record_user_io_pin_counter(&USER_IO_PIN_FRAME_PIN_PAGES, frame_pin_pages as u64);
         record_user_io_pin_counter(&USER_IO_PIN_FRAME_PIN_BYTES, page_len as u64);
     }
-    if !page_cache_pins.is_empty() {
+    if page_cache_pin_pages != 0 {
         record_user_io_pin_counter(&USER_IO_PIN_PAGE_CACHE_PIN_HITS, 1);
         record_user_io_pin_counter(
             &USER_IO_PIN_PAGE_CACHE_PIN_PAGES,
-            page_cache_pins.len() as u64,
+            page_cache_pin_pages as u64,
         );
         record_user_io_pin_counter(&USER_IO_PIN_PAGE_CACHE_PIN_BYTES, page_len as u64);
     }
-    let range_pin = UserIoRangePin {
-        aspace: aspace_handle.clone(),
-        token,
-        _system_charge: system_charge,
-    };
-    drop(aspace);
-
-    // Field order keeps lower frame/page-cache pins alive until before the
-    // policy range token is released, including every early-return path below.
-    let prepared = PreparedUserIoPin {
-        segments,
-        frame_pins: UserIoFramePins::new(frame_pins),
-        page_cache_pins: UserIoPageCachePins::new(page_cache_pins),
-        range_pin,
-    };
 
     #[cfg(feature = "test-io-control")]
     {
@@ -1275,7 +1507,27 @@ pub fn pinned_user_mut_segments_are_disjoint(pins: &[PinnedUserSegmentsMut]) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{UserIoPinSegment, UserIoPinSegments, physical_pin_segments_are_disjoint};
+    use memory_addr::{PAGE_SIZE_4K, VirtAddr};
+
+    use super::{
+        USER_IO_PIN_SCAN_CHUNK_PAGES, UserIoPinSegment, UserIoPinSegments,
+        physical_pin_segments_are_disjoint, user_io_pin_scan_chunk_end,
+    };
+
+    #[test]
+    fn user_io_pin_scan_windows_never_exceed_the_page_bound() {
+        let start = VirtAddr::from(0x1000);
+        let end = start + (USER_IO_PIN_SCAN_CHUNK_PAGES * 2 + 1) * PAGE_SIZE_4K;
+
+        let first = user_io_pin_scan_chunk_end(start, end);
+        let second = user_io_pin_scan_chunk_end(first, end);
+        let third = user_io_pin_scan_chunk_end(second, end);
+
+        assert_eq!(first - start, USER_IO_PIN_SCAN_CHUNK_PAGES * PAGE_SIZE_4K);
+        assert_eq!(second - first, USER_IO_PIN_SCAN_CHUNK_PAGES * PAGE_SIZE_4K);
+        assert_eq!(third - second, PAGE_SIZE_4K);
+        assert_eq!(third, end);
+    }
 
     #[test]
     fn mutable_pin_segments_reject_physical_aliases() {
