@@ -1,29 +1,24 @@
 {
-  "schema": "thekernel-mm-performance-regression-policy-v1",
+  "schema": "thekernel-mm-performance-regression-policy-v2",
   "metrics": {
     "vma_scale": {
       "p99_max_regression_percent": 20,
-      "p999_max_regression_percent": null,
       "throughput_min_retained_percent": null
     },
     "mremap_latency": {
       "p99_max_regression_percent": 20,
-      "p999_max_regression_percent": null,
       "throughput_min_retained_percent": null
     },
     "protect_touch_latency": {
       "p99_max_regression_percent": 20,
-      "p999_max_regression_percent": null,
       "throughput_min_retained_percent": null
     },
     "pin_throughput": {
       "p99_max_regression_percent": 20,
-      "p999_max_regression_percent": null,
       "throughput_min_retained_percent": 90
     },
     "pin_contention": {
       "p99_max_regression_percent": 20,
-      "p999_max_regression_percent": null,
       "throughput_min_retained_percent": 90
     }
   }

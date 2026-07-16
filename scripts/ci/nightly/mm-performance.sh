@@ -11,19 +11,7 @@ MM_PERF_CPUS=${THEKERNEL_MM_PERF_CPUS:-"4 8"}
 MM_PERF_ITERATIONS=${THEKERNEL_MM_PERF_ITERATIONS:-256}
 MM_PERF_VMAS=${THEKERNEL_MM_PERF_VMAS:-512}
 MM_PERF_PIN_ITERATIONS=${THEKERNEL_MM_PERF_PIN_ITERATIONS:-64}
-MM_PERF_BASELINE_BUNDLE=${THEKERNEL_MM_PERF_BASELINE_BUNDLE:-}
-MM_PERF_POLICY=${THEKERNEL_MM_PERF_POLICY:-$SCRIPT_DIR/mm-performance-regression-policy.json}
-MM_PERF_REQUIRE_BASELINE=${THEKERNEL_MM_PERF_REQUIRE_BASELINE:-0}
-
-case "$MM_PERF_REQUIRE_BASELINE" in
-    1|y|Y|yes|YES|true|TRUE|on|ON) MM_PERF_REQUIRE_BASELINE=1 ;;
-    0|n|N|no|NO|false|FALSE|off|OFF) MM_PERF_REQUIRE_BASELINE=0 ;;
-    *) nightly_fail \
-        "THEKERNEL_MM_PERF_REQUIRE_BASELINE must be a boolean: $MM_PERF_REQUIRE_BASELINE" ;;
-esac
-[ "$MM_PERF_REQUIRE_BASELINE" -eq 0 ] || [ -n "$MM_PERF_BASELINE_BUNDLE" ] \
-    || nightly_fail \
-        'THEKERNEL_MM_PERF_REQUIRE_BASELINE is set but no baseline bundle was provided'
+MM_PERF_HOST_CPUS=${THEKERNEL_MM_PERF_HOST_CPUS:-}
 
 ci_require_positive_int mm_perf_iterations "$MM_PERF_ITERATIONS"
 ci_require_positive_int mm_perf_vmas "$MM_PERF_VMAS"
@@ -55,20 +43,45 @@ done
 mkdir -p "$NIGHTLY_LOG_DIR"
 matrix="$NIGHTLY_LOG_DIR/mm-performance.tsv"
 manifest="$NIGHTLY_LOG_DIR/mm-performance-manifest.tsv"
-regression_report="$NIGHTLY_LOG_DIR/mm-performance-regression.tsv"
+host_cpu_matrix="$NIGHTLY_LOG_DIR/mm-performance-host-cpus.tsv"
 rm -f "$matrix"
 rm -f "$manifest"
-rm -f "$regression_report"
+rm -f "$host_cpu_matrix"
 selected_arches=$(nightly_selected_arches) || exit $?
 first_artifact=1
+
+command -v taskset >/dev/null 2>&1 \
+    || nightly_unsupported 'missing taskset for inherited host CPU affinity'
+selector_args=(--counts "${cpu_counts[@]}" --output "$host_cpu_matrix")
+if [ -n "$MM_PERF_HOST_CPUS" ]; then
+    selector_args+=(--explicit "$MM_PERF_HOST_CPUS")
+fi
+set +e
+python3 "$CI_SCRIPT_DIR/select-mm-performance-cpus.py" "${selector_args[@]}"
+selector_status=$?
+set -e
+case "$selector_status" in
+    0) ;;
+    78) nightly_unsupported 'no homogeneous host CPU class can hold the MM matrix' ;;
+    *) nightly_fail 'invalid MM host CPU affinity selection' ;;
+esac
 
 runner_contract_sha256=$(
     {
         printf '%s\n' \
             scripts/ci/boot-shell-runner.sh \
             scripts/ci/nightly/mm-performance.sh \
+            scripts/ci/mm_performance_host.py \
             scripts/ci/mm_performance_schema.py \
+            scripts/ci/capture-mm-performance-host.py \
+            scripts/ci/compare-mm-performance.py \
+            scripts/ci/nightly/lib.sh \
             scripts/ci/parse-mm-performance.py \
+            scripts/ci/select-mm-performance-cpus.py \
+            scripts/ci/nightly/mm-performance-regression-policy.json \
+            scripts/ci/nightly/mm-performance-stability-policy.json \
+            scripts/build-rootfs.sh \
+            scripts/create-rootfs-image.sh \
             tests/guest/tools/mm-performance.c
         find "$REPO_ROOT/tools/qemu_runner" -maxdepth 1 -type f -name '*.py' \
             -printf 'tools/qemu_runner/%f\n'
@@ -127,31 +140,6 @@ else
     runner_fingerprint="auto-sha256:$runner_host_sha256"
 fi
 
-if [ -n "$MM_PERF_BASELINE_BUNDLE" ]; then
-    [ -d "$MM_PERF_BASELINE_BUNDLE" ] \
-        || nightly_fail "MM baseline bundle is not a directory: $MM_PERF_BASELINE_BUNDLE"
-    [ -f "$MM_PERF_POLICY" ] \
-        || nightly_fail "MM regression policy is missing: $MM_PERF_POLICY"
-    baseline_root=$(cd -- "$MM_PERF_BASELINE_BUNDLE" && pwd -P)
-    candidate_root=$(cd -- "$NIGHTLY_LOG_DIR" && pwd -P)
-    [ "$baseline_root" != "$candidate_root" ] \
-        || nightly_fail 'MM baseline bundle and candidate output directory must differ'
-    baseline_validation=$(mktemp "$NIGHTLY_LOG_DIR/.mm-performance-baseline.XXXXXX")
-    set +e
-    python3 "$CI_SCRIPT_DIR/compare-mm-performance.py" \
-        --baseline "$baseline_root" \
-        --candidate "$baseline_root" \
-        --policy "$MM_PERF_POLICY" \
-        --output "$baseline_validation" >/dev/null
-    baseline_status=$?
-    set -e
-    rm -f "$baseline_validation"
-    case "$baseline_status" in
-        0|1) ;;
-        *) nightly_fail 'MM baseline bundle or regression policy is invalid' ;;
-    esac
-fi
-
 repo_commit=$(git -C "$REPO_ROOT" rev-parse --verify HEAD) \
     || nightly_fail 'cannot resolve TheKernel HEAD'
 if [ -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)" ]; then
@@ -202,6 +190,9 @@ manifest_columns=(
     qemu_sha256
     runner_fingerprint
     runner_contract_sha256
+    host_cpu_set
+    host_cpu_selection
+    host_cpu_class
     kernel_artifact
     metrics_artifact
     metrics_sha256
@@ -212,6 +203,12 @@ manifest_columns=(
     qemu_log
     qemu_log_sha256
     qemu_log_size_bytes
+    host_diagnostics_pre
+    host_diagnostics_pre_sha256
+    host_diagnostics_pre_size_bytes
+    host_diagnostics_post
+    host_diagnostics_post_sha256
+    host_diagnostics_post_size_bytes
 )
 (IFS=$'\t'; printf '%s\n' "${manifest_columns[*]}") >"$manifest"
 
@@ -226,6 +223,18 @@ while IFS= read -r arch; do
         metrics_relative="$run_name/mm-performance.tsv"
         commands_relative="$run_name.commands"
         qemu_log_relative="$run_name/qemu.log"
+        host_pre_relative="$run_name/host-pre.tsv"
+        host_post_relative="$run_name/host-post.tsv"
+        selection_row=$(awk -F '\t' -v requested="$cpus" \
+            'NR > 1 && $1 == requested { print; count += 1 } END { exit count != 1 }' \
+            "$host_cpu_matrix") \
+            || nightly_fail "missing unique host CPU selection for $cpus CPUs"
+        IFS=$'\t' read -r selected_count host_cpu_set \
+            host_cpu_selection host_cpu_class <<<"$selection_row"
+        [ "$selected_count" = "$cpus" ] \
+            || nightly_fail "host CPU selection count drift for $run_name"
+        host_pre_temporary="$NIGHTLY_LOG_DIR/.$run_name.host-pre.tsv"
+        rm -f "$host_pre_temporary"
 
         printf '%s %s %s %s %s %s %s %s %s; exit\n' \
             /opt/thekernel-tests/bin/thekernel-mm-performance \
@@ -236,6 +245,12 @@ while IFS= read -r arch; do
             >"$commands"
 
         (
+            taskset --pid --cpu-list "$host_cpu_set" "$BASHPID" >/dev/null \
+                || nightly_fail "cannot apply host CPU affinity $host_cpu_set"
+            python3 "$CI_SCRIPT_DIR/capture-mm-performance-host.py" \
+                --phase pre --cpuset "$host_cpu_set" \
+                --selection "$host_cpu_selection" --cpu-class "$host_cpu_class" \
+                --output "$host_pre_temporary"
             export THEKERNEL_QEMU_CPUS=$cpus
             export THEKERNEL_KERNEL_CPUS=$cpus
             export SMP=$cpus
@@ -245,6 +260,11 @@ while IFS= read -r arch; do
             # image left by an older checkout.
             export THEKERNEL_NIGHTLY_REBUILD_ROOTFS=1
             nightly_run_guest "$arch" "$commands" "$run_dir"
+            mv -f "$host_pre_temporary" "$run_dir/host-pre.tsv"
+            python3 "$CI_SCRIPT_DIR/capture-mm-performance-host.py" \
+                --phase post --cpuset "$host_cpu_set" \
+                --selection "$host_cpu_selection" --cpu-class "$host_cpu_class" \
+                --output "$run_dir/host-post.tsv"
         )
         nightly_validate_guest_log \
             "$run_dir/qemu.log" clean \
@@ -289,8 +309,12 @@ while IFS= read -r arch; do
         commands_size_bytes=$(stat -c '%s' "$commands")
         qemu_log_sha256=$(sha256sum "$run_dir/qemu.log" | awk '{ print $1 }')
         qemu_log_size_bytes=$(stat -c '%s' "$run_dir/qemu.log")
+        host_pre_sha256=$(sha256sum "$run_dir/host-pre.tsv" | awk '{ print $1 }')
+        host_pre_size_bytes=$(stat -c '%s' "$run_dir/host-pre.tsv")
+        host_post_sha256=$(sha256sum "$run_dir/host-post.tsv" | awk '{ print $1 }')
+        host_post_size_bytes=$(stat -c '%s' "$run_dir/host-post.tsv")
         manifest_row=(
-            thekernel-mm-performance-bundle-v2
+            thekernel-mm-performance-bundle-v3
             "$repo_commit"
             "$ax_commit"
             "$linux_abi_commit"
@@ -309,6 +333,9 @@ while IFS= read -r arch; do
             "$qemu_sha256"
             "$runner_fingerprint"
             "$runner_contract_sha256"
+            "$host_cpu_set"
+            "$host_cpu_selection"
+            "$host_cpu_class"
             "$kernel_relative"
             "$metrics_relative"
             "$metrics_sha256"
@@ -319,6 +346,12 @@ while IFS= read -r arch; do
             "$qemu_log_relative"
             "$qemu_log_sha256"
             "$qemu_log_size_bytes"
+            "$host_pre_relative"
+            "$host_pre_sha256"
+            "$host_pre_size_bytes"
+            "$host_post_relative"
+            "$host_post_sha256"
+            "$host_post_size_bytes"
         )
         (IFS=$'\t'; printf '%s\n' "${manifest_row[*]}") >>"$manifest"
         run_count=$((run_count + 1))
@@ -350,27 +383,6 @@ for state in \
         || nightly_fail "$label worktree changed during MM evidence capture"
 done
 
-regression_result=not-compared
-regression_report_display=-
-if [ -n "$MM_PERF_BASELINE_BUNDLE" ]; then
-    set +e
-    python3 "$CI_SCRIPT_DIR/compare-mm-performance.py" \
-        --baseline "$baseline_root" \
-        --candidate "$NIGHTLY_LOG_DIR" \
-        --policy "$MM_PERF_POLICY" \
-        --output "$regression_report"
-    regression_status=$?
-    set -e
-    case "$regression_status" in
-        0)
-            regression_result=pass
-            regression_report_display=$regression_report
-            ;;
-        1) nightly_fail \
-            "MM performance regression exceeded policy; report=$regression_report" ;;
-        *) nightly_fail 'MM performance baseline and candidate are not comparable' ;;
-    esac
-fi
 printf '%s\n' \
     "nightly MM performance evidence: COMPLETE matrix=$matrix manifest=$manifest" \
-    "explicit_missing=$missing_count regression=$regression_result report=$regression_report_display"
+    "explicit_missing=$missing_count host_cpu_matrix=$host_cpu_matrix"

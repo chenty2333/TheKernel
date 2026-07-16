@@ -1,0 +1,6 @@
+{
+  "schema": "thekernel-mm-performance-stability-policy-v1",
+  "minimum_pairs": 3,
+  "maximum_pairs": 9,
+  "maximum_pair_ratio_spread_percent": 20
+}

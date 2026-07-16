@@ -24,6 +24,13 @@ DEFAULT_POLICY = (
     / "nightly"
     / "mm-performance-regression-policy.json"
 )
+DEFAULT_STABILITY_POLICY = (
+    REPO_ROOT
+    / "scripts"
+    / "ci"
+    / "nightly"
+    / "mm-performance-stability-policy.json"
+)
 MANIFEST_COLUMNS = (
     "bundle_schema",
     "thekernel_commit",
@@ -44,6 +51,9 @@ MANIFEST_COLUMNS = (
     "qemu_sha256",
     "runner_fingerprint",
     "runner_contract_sha256",
+    "host_cpu_set",
+    "host_cpu_selection",
+    "host_cpu_class",
     "kernel_artifact",
     "metrics_artifact",
     "metrics_sha256",
@@ -54,6 +64,12 @@ MANIFEST_COLUMNS = (
     "qemu_log",
     "qemu_log_sha256",
     "qemu_log_size_bytes",
+    "host_diagnostics_pre",
+    "host_diagnostics_pre_sha256",
+    "host_diagnostics_pre_size_bytes",
+    "host_diagnostics_post",
+    "host_diagnostics_post_sha256",
+    "host_diagnostics_post_size_bytes",
 )
 METRIC_COLUMNS = (
     "arch",
@@ -119,7 +135,7 @@ def make_bundle(
     run = root / "rv-4cpu"
     run.mkdir()
     values = {
-        "bundle_schema": "thekernel-mm-performance-bundle-v2",
+        "bundle_schema": "thekernel-mm-performance-bundle-v3",
         "thekernel_commit": "1" * 40,
         "thekernel_ax_commit": "2" * 40,
         "thekernel_linux_abi_commit": "3" * 40,
@@ -136,10 +152,15 @@ def make_bundle(
         "qemu_sha256": "5" * 64,
         "runner_fingerprint": f"auto-sha256:{'6' * 64}",
         "runner_contract_sha256": "7" * 64,
+        "host_cpu_set": "0-3",
+        "host_cpu_selection": "auto-homogeneous-v1",
+        "host_cpu_class": "package:0,max_freq_khz:3700000",
         "kernel_artifact": "rv-4cpu/kernel",
         "metrics_artifact": "rv-4cpu/mm-performance.tsv",
         "commands": "rv-4cpu.commands",
         "qemu_log": "rv-4cpu/qemu.log",
+        "host_diagnostics_pre": "rv-4cpu/host-pre.tsv",
+        "host_diagnostics_post": "rv-4cpu/host-post.tsv",
     }
     if manifest_overrides:
         values.update(manifest_overrides)
@@ -167,6 +188,42 @@ def make_bundle(
     qemu_log.write_text("fixture guest log\nSystem is shutting down\n", encoding="utf-8")
     values["qemu_log_sha256"] = sha256(qemu_log)
     values["qemu_log_size_bytes"] = str(qemu_log.stat().st_size)
+
+    for phase in ("pre", "post"):
+        diagnostics = run / f"host-{phase}.tsv"
+        write_tsv(
+            diagnostics,
+            ("key", "value"),
+            [
+                {"key": "schema", "value": "thekernel-mm-performance-host-diagnostics-v1"},
+                {"key": "phase", "value": phase},
+                {"key": "timestamp_utc", "value": "2026-01-01T00:00:00+00:00"},
+                {"key": "selected_cpu_set", "value": values["host_cpu_set"]},
+                {
+                    "key": "host_cpu_selection",
+                    "value": values["host_cpu_selection"],
+                },
+                {"key": "host_cpu_class", "value": values["host_cpu_class"]},
+                {"key": "online_cpu_set", "value": "0-3"},
+                {"key": "loadavg", "value": "0.00 0.00 0.00 1/1 1"},
+                {"key": "psi.cpu", "value": "missing"},
+                {"key": "cgroup.cpu_stat", "value": "missing"},
+                *[
+                    {"key": f"cpu.{cpu}.{field}", "value": value}
+                    for cpu in range(int(values["requested_cpus"]))
+                    for field, value in (
+                        ("online", "1"),
+                        ("package", "0"),
+                        ("max_freq_khz", "3700000"),
+                        ("current_freq_khz", "missing"),
+                    )
+                ],
+            ],
+        )
+        values[f"host_diagnostics_{phase}_sha256"] = sha256(diagnostics)
+        values[f"host_diagnostics_{phase}_size_bytes"] = str(
+            diagnostics.stat().st_size
+        )
 
     metric_rows: list[dict[str, str]] = []
     for metric in EXPECTED_METRICS:
@@ -241,6 +298,8 @@ class CompareMmPerformanceTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.policy = self.root / "policy.json"
         shutil.copy2(DEFAULT_POLICY, self.policy)
+        self.stability_policy = self.root / "stability-policy.json"
+        shutil.copy2(DEFAULT_STABILITY_POLICY, self.stability_policy)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -251,23 +310,46 @@ class CompareMmPerformanceTests(unittest.TestCase):
         return path
 
     def compare(
-        self, baseline: Path, candidate: Path, *, policy: Path | None = None
+        self,
+        baseline: Path,
+        candidate: Path,
+        *,
+        policy: Path | None = None,
+        repetitions: int = 3,
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        return self.compare_series(
+            [baseline] * repetitions,
+            [candidate] * repetitions,
+            policy=policy,
+        )
+
+    def compare_series(
+        self,
+        baselines: list[Path],
+        candidates: list[Path],
+        *,
+        policy: Path | None = None,
+        stability_policy: Path | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         report = self.root / "report.tsv"
         report.unlink(missing_ok=True)
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(COMPARATOR),
-                "--baseline",
-                str(baseline),
-                "--candidate",
-                str(candidate),
+        arguments = [sys.executable, str(COMPARATOR)]
+        for baseline in baselines:
+            arguments.extend(("--baseline", str(baseline)))
+        for candidate in candidates:
+            arguments.extend(("--candidate", str(candidate)))
+        arguments.extend(
+            (
                 "--policy",
                 str(policy or self.policy),
+                "--stability-policy",
+                str(stability_policy or self.stability_policy),
                 "--output",
                 str(report),
-            ],
+            )
+        )
+        result = subprocess.run(
+            arguments,
             cwd=REPO_ROOT,
             check=False,
             capture_output=True,
@@ -350,20 +432,16 @@ class CompareMmPerformanceTests(unittest.TestCase):
         self.assertEqual(row["mode"], "report_only")
         self.assertEqual(row["result"], "REPORT_ONLY")
 
-    def test_policy_can_enable_p999_hard_gate(self) -> None:
+    def test_policy_cannot_enable_p999_hard_gate(self) -> None:
         payload = json.loads(self.policy.read_text(encoding="utf-8"))
         payload["metrics"]["vma_scale"]["p999_max_regression_percent"] = 20
         self.policy.write_text(json.dumps(payload), encoding="utf-8")
         baseline = self.bundle("baseline")
         candidate = self.bundle("candidate")
-        set_metric(candidate, "vma_scale", p999_ns=240)
-
-        result, _ = self.compare(baseline, candidate)
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-        set_metric(candidate, "vma_scale", p999_ns=241)
-        result, _ = self.compare(baseline, candidate)
-        self.assertEqual(result.returncode, 1, result.stderr)
+        result, report = self.compare(baseline, candidate)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("must contain exactly", result.stderr)
+        self.assertFalse(report.exists())
 
     def test_large_integer_boundary_does_not_round_through_float(self) -> None:
         baseline = self.bundle("baseline")
@@ -428,6 +506,7 @@ class CompareMmPerformanceTests(unittest.TestCase):
                 "requested_cpus": "8",
                 "online_cpus": "8",
                 "pin_workers": "8",
+                "host_cpu_set": "0-7",
             },
         )
         result, _ = self.compare(baseline, topology)
@@ -531,6 +610,133 @@ class CompareMmPerformanceTests(unittest.TestCase):
         result, _ = self.compare(baseline, candidate)
 
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_series_requires_at_least_three_and_an_odd_pair_count(self) -> None:
+        baseline = self.bundle("baseline")
+        candidate = self.bundle("candidate")
+
+        result, _ = self.compare(baseline, candidate, repetitions=1)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("outside stability policy", result.stderr)
+
+        result, _ = self.compare(baseline, candidate, repetitions=2)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("odd pair count", result.stderr)
+
+    def test_exact_ratio_median_uses_three_distinct_pairs(self) -> None:
+        baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
+        candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
+        for candidate, value in zip(candidates, (100, 119, 120), strict=True):
+            set_metric(candidate, "vma_scale", p99_ns=value)
+
+        result, report = self.compare_series(baselines, candidates)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = next(
+            row
+            for row in self.report_rows(report)
+            if row["metric"] == "vma_scale" and row["statistic"] == "p99_ns"
+        )
+        self.assertEqual(row["pair_count"], "3")
+        self.assertEqual(row["median_pair"], "2")
+        self.assertEqual(row["candidate_ratio_ppm"], "1190000")
+        self.assertEqual(row["pair_ratio_min_ppm"], "1000000")
+        self.assertEqual(row["pair_ratio_max_ppm"], "1200000")
+
+    def test_stable_median_regression_returns_one(self) -> None:
+        baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
+        candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
+        for candidate, value in zip(candidates, (120, 121, 121), strict=True):
+            set_metric(candidate, "vma_scale", p99_ns=value)
+
+        result, report = self.compare_series(baselines, candidates)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        row = next(
+            row
+            for row in self.report_rows(report)
+            if row["metric"] == "vma_scale" and row["statistic"] == "p99_ns"
+        )
+        self.assertEqual(row["result"], "FAIL")
+        self.assertEqual(row["candidate_ratio_ppm"], "1210000")
+
+    def test_noisy_pair_ratios_return_two_without_a_report(self) -> None:
+        baselines = [self.bundle(f"baseline-{index}") for index in range(3)]
+        candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
+        for candidate, value in zip(candidates, (90, 100, 120), strict=True):
+            set_metric(candidate, "vma_scale", p99_ns=value)
+
+        result, report = self.compare_series(baselines, candidates)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unstable paired series", result.stderr)
+        self.assertFalse(report.exists())
+
+    def test_each_side_requires_one_commit_and_kernel_hash(self) -> None:
+        baselines = [
+            self.bundle("baseline-0"),
+            self.bundle(
+                "baseline-1", manifest_overrides={"thekernel_commit": "8" * 40}
+            ),
+            self.bundle("baseline-2"),
+        ]
+        candidates = [self.bundle(f"candidate-{index}") for index in range(3)]
+
+        result, _ = self.compare_series(baselines, candidates)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("baseline series changes thekernel_commit", result.stderr)
+
+        baselines = [
+            self.bundle("kernel-baseline-0"),
+            self.bundle("kernel-baseline-1", kernel_content=b"other-kernel\n"),
+            self.bundle("kernel-baseline-2"),
+        ]
+        result, _ = self.compare_series(baselines, candidates)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("baseline series changes kernel_sha256", result.stderr)
+
+    def test_policy_cannot_weaken_hard_regression_limits(self) -> None:
+        baseline = self.bundle("baseline")
+        candidate = self.bundle("candidate")
+        payload = json.loads(self.policy.read_text(encoding="utf-8"))
+        payload["metrics"]["vma_scale"]["p99_max_regression_percent"] = 21
+        self.policy.write_text(json.dumps(payload), encoding="utf-8")
+        result, _ = self.compare(baseline, candidate)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("20 percent P99 ceiling", result.stderr)
+
+        shutil.copy2(DEFAULT_POLICY, self.policy)
+        payload = json.loads(self.policy.read_text(encoding="utf-8"))
+        payload["metrics"]["pin_throughput"][
+            "throughput_min_retained_percent"
+        ] = 89
+        self.policy.write_text(json.dumps(payload), encoding="utf-8")
+        result, _ = self.compare(baseline, candidate)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("90 percent throughput retention", result.stderr)
+
+    def test_host_diagnostics_reject_unsafe_fields(self) -> None:
+        baseline = self.bundle("baseline")
+        candidate = self.bundle("candidate")
+        diagnostics = candidate / "rv-4cpu" / "host-pre.tsv"
+        columns, rows = read_tsv(diagnostics)
+        rows.append({"key": "hostname", "value": "private-host"})
+        write_tsv(diagnostics, columns, rows)
+        mutate_manifest(
+            candidate,
+            lambda row: row.update(
+                {
+                    "host_diagnostics_pre_sha256": sha256(diagnostics),
+                    "host_diagnostics_pre_size_bytes": str(diagnostics.stat().st_size),
+                }
+            ),
+        )
+
+        result, report = self.compare(baseline, candidate)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("contains unsafe key", result.stderr)
+        self.assertFalse(report.exists())
 
     def test_v1_absolute_path_manifest_is_not_silently_upgraded(self) -> None:
         baseline = self.bundle("baseline")

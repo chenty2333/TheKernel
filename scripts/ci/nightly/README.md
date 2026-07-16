@@ -80,47 +80,76 @@ sets the product variables to the same value and the guest record provides the
 third, runtime check. The rootfs is rematerialized through its content-addressed
 builder so the guest helper cannot silently predate the checked-out source.
 
+Before the matrix starts, the adapter intersects the runner's allowed affinity
+with sysfs topology and groups CPUs by physical package and maximum frequency.
+It selects one group large enough for the largest matrix entry and uses nested
+subsets for smaller entries. If no such group exists, the adapter returns `78`
+instead of mixing unlike cores. `THEKERNEL_MM_PERF_HOST_CPUS` may specify an
+explicit pool, but that pool is still checked for one package/frequency class
+and must be within the runner's inherited affinity. Each per-run shell applies
+the selected affinity before entering both the kernel/rootfs build path and
+QEMU, so every child inherits the same host CPU set.
+
 `mm-performance.sh` refuses to label a dirty checkout as exact-HEAD evidence.
 Its manifest records the full TheKernel, `thekernel-ax`, and
 `thekernel-linux-abi` commits; workload parameters; guest online topology;
 kernel and rootfs SHA-256; QEMU version and binary SHA-256; a runner and runner
-contract fingerprint; and the immutable per-run kernel, command, metrics, and
-log artifacts. It rechecks all three clean HEADs after the matrix. The guest
+contract fingerprint; the host CPU set, selection method, and class; and the
+immutable per-run kernel, command, metrics, log, and pre/post host-diagnostic
+artifacts. Host diagnostics are bounded to 64 KiB and contain only selected CPU
+topology/frequency, load, CPU pressure, and cgroup CPU accounting; process names,
+command lines, hostnames, and user identifiers are not captured. It rechecks
+all three clean HEADs after the matrix. The guest
 also completes fixed-destination replacement, shared `old_size == 0`
 alias/coherence, and grow/shrink prefix-integrity checks before emitting the
 semantic-pass marker.
 
-The MM output is a `thekernel-mm-performance-bundle-v2` directory. Manifest
+The MM output is a `thekernel-mm-performance-bundle-v3` directory. Manifest
 artifact paths are normalized POSIX paths relative to the bundle root; every
 referenced artifact carries a SHA-256 and byte size. The comparator rejects
 absolute paths, `..`, symlink escapes, missing files, and digest or size drift.
 The top-level metric matrix must also equal the union of the hashed per-run
 metric files. Copy the complete directory, not individual files. Old v1
-manifests containing `/workspace/...` paths are intentionally rejected rather
-than guessed into a new provenance claim.
+manifests containing `/workspace/...` paths and single-sample v2 bundles are
+intentionally rejected rather than guessed into a new provenance claim.
 
-By default the adapter only captures a candidate bundle. An explicit baseline
-turns it into a baseline-vs-candidate regression gate:
+One adapter invocation captures one bundle and never labels a single sample as
+a regression result. Capture alternating baseline/candidate bundles on the same
+quiet runner, then pass at least three pairs, in pair order, to the comparator:
 
 ```sh
-THEKERNEL_MM_PERF_BASELINE_BUNDLE=/evidence/mm-baseline \
-THEKERNEL_MM_PERF_REQUIRE_BASELINE=1 \
-scripts/ci/nightly/mm-performance.sh
+scripts/ci/compare-mm-performance.py \
+  --baseline /evidence/baseline-1 --candidate /evidence/candidate-1 \
+  --baseline /evidence/baseline-2 --candidate /evidence/candidate-2 \
+  --baseline /evidence/baseline-3 --candidate /evidence/candidate-3 \
+  --policy scripts/ci/nightly/mm-performance-regression-policy.json \
+  --stability-policy scripts/ci/nightly/mm-performance-stability-policy.json \
+  --output /evidence/mm-regression.tsv
 ```
 
-`THEKERNEL_MM_PERF_POLICY` may select another versioned JSON policy. The
-repository policy gates every metric's P99 at no more than 20 percent latency
-regression and requires both pin metrics to retain at least 90 percent of
-baseline throughput. These are relative comparisons, not machine-specific
-absolute nanosecond or bytes-per-second thresholds. The report is written to
-`mm-performance-regression.tsv`.
+The pair count must be odd and within the independent, versioned stability
+policy (three through nine by default). Every bundle is validated before use;
+every pair must have matching workload, dependency, rootfs, QEMU, runner, host
+CPU, and command provenance; and every bundle on one side must retain the same
+TheKernel commit and per-run kernel hash. The comparator orders candidate over
+baseline ratios using integer cross multiplication and gates their exact median,
+without floating-point rounding.
 
-Every P999 value is compared and reported, but the default policy marks it
-`REPORT_ONLY`, which is not a pass. A single run currently gives only 64 pin
-samples and at most 512 samples for the other default metric shapes; its P999
+The repository regression policy gates every metric's median P99 at no more
+than 20 percent latency regression and requires both pin metrics to retain at
+least 90 percent of baseline throughput. A custom policy may be stricter, but
+the validator rejects any policy that weakens either limit. The independent
+stability policy rejects a gated statistic when its maximum paired ratio is
+more than 20 percent above its minimum paired ratio. That is noisy evidence,
+so the comparator returns `2`; it does not convert uncertainty into a pass or a
+regression.
+
+Every P999 value is compared and reported as `REPORT_ONLY`, which is not a pass
+and cannot be enabled as a hard gate by policy. A single run currently gives
+only 64 pin samples and at most 512 samples for the other default metric shapes; its P999
 is too close to a maximum sample to serve as a stable hard gate under QEMU.
-Set a metric's `p999_max_regression_percent` only after collecting enough
-paired repeats or aggregate samples to justify it.
+Future hard P999 gating requires a new evidence and policy schema after enough
+paired samples justify it.
 
 The comparator refuses a conclusion unless baseline and candidate have the
 same run-key set, online CPU topology, workload and sample counts, maintained
@@ -132,20 +161,23 @@ set `THEKERNEL_MM_PERF_RUNNER_ID` to a durable declared identity, but doing so
 is an operator assertion that the underlying performance environment remains
 equivalent, not a general bypass for comparing unrelated machines.
 
-The standalone interface is:
+It returns `0` when every enabled gate passes, `1` for a measured regression,
+and `2` when an input is invalid or not comparable, or when the paired series
+is noisy. This is a repeatable QEMU
+regression-triage contract, not a production latency SLO or proof of one
+internal lock's isolated cost.
+
+Rootfs byte reproducibility is checked separately with two fresh source caches,
+compiler work directories, staging trees, and output paths per architecture:
 
 ```sh
-scripts/ci/compare-mm-performance.py \
-  --baseline /evidence/mm-baseline \
-  --candidate /evidence/mm-candidate \
-  --policy scripts/ci/nightly/mm-performance-regression-policy.json \
-  --output /evidence/mm-regression.tsv
+scripts/ci/check-rootfs-reproducibility.sh \
+  --arch both --workdir .state/ci/rootfs-reproducibility
 ```
 
-It returns `0` when every enabled gate passes, `1` for a measured regression,
-and `2` when a bundle, policy, provenance, topology, or workload is invalid or
-not comparable. This is a repeatable QEMU regression-triage contract, not a
-production latency SLO or proof of one internal lock's isolated cost.
+The image helper normalizes every staged inode mtime, fixes UUID/hash seed and
+lazy initialization, and uses `E2FSPROGS_FAKE_TIME` for ext4 creation clocks.
+The gate requires equal full-image sizes, SHA-256 digests, and byte content.
 
 `smp-tlb-shootdown.sh` applies the same clean-source rule to TheKernel,
 `thekernel-ax`, and `thekernel-linux-abi`, forces a topology-specific kernel and

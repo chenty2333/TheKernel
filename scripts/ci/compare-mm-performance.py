@@ -12,22 +12,28 @@ import re
 import sys
 import tempfile
 from dataclasses import dataclass
+from functools import cmp_to_key
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
+from mm_performance_host import CpuSelectionError, format_cpu_list, parse_cpu_list
 from mm_performance_schema import (
     BUNDLE_SCHEMA,
     EXPECTED_METRICS,
+    HOST_DIAGNOSTIC_SCHEMA,
     MANIFEST_COLUMNS,
     METRIC_COLUMNS,
     PIN_METRICS,
     POLICY_SCHEMA,
     REPORT_COLUMNS,
+    STABILITY_POLICY_SCHEMA,
 )
 
 HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 FINGERPRINT_RE = re.compile(r"^(?:auto|declared)-sha256:[0-9a-f]{64}$")
+CPU_CLASS_RE = re.compile(r"^package:[0-9]+,max_freq_khz:[1-9][0-9]*$")
+HOST_DIAGNOSTIC_MAX_BYTES = 64 * 1024
 
 
 class EvidenceError(ValueError):
@@ -67,8 +73,21 @@ class Bundle:
 @dataclass(frozen=True)
 class MetricPolicy:
     p99_max_regression_percent: int
-    p999_max_regression_percent: int | None
     throughput_min_retained_percent: int | None
+
+
+@dataclass(frozen=True)
+class StabilityPolicy:
+    minimum_pairs: int
+    maximum_pairs: int
+    maximum_pair_ratio_spread_percent: int
+
+
+@dataclass(frozen=True)
+class RatioSample:
+    pair: int
+    baseline: int
+    candidate: int
 
 
 @dataclass(frozen=True)
@@ -78,12 +97,16 @@ class ReportRow:
     metric: str
     statistic: str
     mode: str
+    pair_count: int
+    median_pair: int
     baseline: int
     candidate: int
     threshold_percent: int
     comparator: str
     result: str
     candidate_ratio_ppm: str
+    pair_ratio_min_ppm: str
+    pair_ratio_max_ppm: str
 
 
 def parse_nonnegative_int(text: str, field: str, context: str) -> int:
@@ -192,6 +215,114 @@ def validate_artifact(
     return path
 
 
+def validate_host_diagnostics(
+    root: Path,
+    values: dict[str, str],
+    phase: str,
+    context: str,
+) -> None:
+    path = validate_artifact(
+        root,
+        values,
+        f"host_diagnostics_{phase}",
+        f"host_diagnostics_{phase}_sha256",
+        f"host_diagnostics_{phase}_size_bytes",
+        context,
+    )
+    if path.stat().st_size > HOST_DIAGNOSTIC_MAX_BYTES:
+        raise EvidenceError(
+            f"{context} host diagnostics exceed {HOST_DIAGNOSTIC_MAX_BYTES} bytes"
+        )
+    rows = read_tsv(path, ("key", "value"), f"{context} host diagnostics {phase}")
+    diagnostics: dict[str, str] = {}
+    allowed_fixed = {
+        "schema",
+        "phase",
+        "timestamp_utc",
+        "selected_cpu_set",
+        "host_cpu_selection",
+        "host_cpu_class",
+        "online_cpu_set",
+        "loadavg",
+        "psi.cpu",
+        "cgroup.cpu_stat",
+    }
+    allowed_dynamic = re.compile(
+        r"^(?:psi\.cpu\.[A-Za-z0-9_.-]+|"
+        r"cgroup\.cpu_stat\.[A-Za-z0-9_.-]+|"
+        r"cpu\.[0-9]+\.(?:online|package|max_freq_khz|current_freq_khz))$"
+    )
+    for line_number, row in enumerate(rows, start=2):
+        key = row["key"]
+        value = row["value"]
+        if key in diagnostics:
+            raise EvidenceError(
+                f"{context} host diagnostics {phase} duplicate key at row "
+                f"{line_number}: {key!r}"
+            )
+        if key not in allowed_fixed and not allowed_dynamic.fullmatch(key):
+            raise EvidenceError(
+                f"{context} host diagnostics {phase} contains unsafe key: {key!r}"
+            )
+        if not value or any(character in value for character in "\t\r\n"):
+            raise EvidenceError(
+                f"{context} host diagnostics {phase} has invalid value for {key!r}"
+            )
+        diagnostics[key] = value
+    required = {
+        "schema",
+        "phase",
+        "timestamp_utc",
+        "selected_cpu_set",
+        "host_cpu_selection",
+        "host_cpu_class",
+        "online_cpu_set",
+        "loadavg",
+    }
+    missing = sorted(required - diagnostics.keys())
+    if missing:
+        raise EvidenceError(
+            f"{context} host diagnostics {phase} is missing keys: {missing!r}"
+        )
+    if not any(key == "psi.cpu" or key.startswith("psi.cpu.") for key in diagnostics):
+        raise EvidenceError(f"{context} host diagnostics {phase} lacks CPU pressure")
+    if not any(key.startswith("cgroup.cpu_stat") for key in diagnostics):
+        raise EvidenceError(f"{context} host diagnostics {phase} lacks cgroup CPU stats")
+    expected = {
+        "schema": HOST_DIAGNOSTIC_SCHEMA,
+        "phase": phase,
+        "selected_cpu_set": values["host_cpu_set"],
+        "host_cpu_selection": values["host_cpu_selection"],
+        "host_cpu_class": values["host_cpu_class"],
+    }
+    for key, value in expected.items():
+        if diagnostics.get(key) != value:
+            raise EvidenceError(
+                f"{context} host diagnostics {phase} {key} mismatch: "
+                f"expected={value!r} actual={diagnostics.get(key)!r}"
+            )
+    class_fields = dict(
+        field.split(":", 1) for field in values["host_cpu_class"].split(",")
+    )
+    for cpu in parse_cpu_list(values["host_cpu_set"]):
+        expected_cpu = {
+            f"cpu.{cpu}.online": "1",
+            f"cpu.{cpu}.package": class_fields["package"],
+            f"cpu.{cpu}.max_freq_khz": class_fields["max_freq_khz"],
+        }
+        for key, value in expected_cpu.items():
+            if diagnostics.get(key) != value:
+                raise EvidenceError(
+                    f"{context} host diagnostics {phase} {key} mismatch: "
+                    f"expected={value!r} actual={diagnostics.get(key)!r}"
+                )
+        current_key = f"cpu.{cpu}.current_freq_khz"
+        if current_key not in diagnostics:
+            raise EvidenceError(
+                f"{context} host diagnostics {phase} lacks {current_key}"
+            )
+
+
 def validate_manifest_row(
     root: Path, row: dict[str, str], line_number: int
 ) -> tuple[ManifestRecord, Path]:
@@ -225,7 +356,7 @@ def validate_manifest_row(
     )
     pin_workers = parse_positive_int(row["pin_workers"], "pin_workers", context)
     if iterations > 100000 or live_vmas > 16384 or pin_iterations > 10000:
-        raise EvidenceError(f"{context} workload exceeds the bundle-v2 limits")
+        raise EvidenceError(f"{context} workload exceeds the bundle-v3 limits")
     if pin_workers != requested_cpus:
         raise EvidenceError(
             f"{context} pin worker topology mismatch: "
@@ -254,6 +385,27 @@ def validate_manifest_row(
     if not FINGERPRINT_RE.fullmatch(row["runner_fingerprint"]):
         raise EvidenceError(
             f"{context} has invalid runner_fingerprint: {row['runner_fingerprint']!r}"
+        )
+    try:
+        host_cpus = parse_cpu_list(row["host_cpu_set"])
+    except CpuSelectionError as error:
+        raise EvidenceError(f"{context} has invalid host_cpu_set: {error}") from error
+    if len(host_cpus) != requested_cpus:
+        raise EvidenceError(
+            f"{context} host CPU topology mismatch: "
+            f"guest={requested_cpus} host_set={format_cpu_list(host_cpus)}"
+        )
+    if row["host_cpu_selection"] not in {
+        "auto-homogeneous-v1",
+        "explicit-homogeneous-v1",
+    }:
+        raise EvidenceError(
+            f"{context} has invalid host_cpu_selection: "
+            f"{row['host_cpu_selection']!r}"
+        )
+    if not CPU_CLASS_RE.fullmatch(row["host_cpu_class"]):
+        raise EvidenceError(
+            f"{context} has invalid host_cpu_class: {row['host_cpu_class']!r}"
         )
 
     kernel_path = safe_bundle_file(root, row["kernel_artifact"], f"{context} kernel_artifact")
@@ -295,6 +447,8 @@ def validate_manifest_row(
         "qemu_log_size_bytes",
         context,
     )
+    validate_host_diagnostics(root, row, "pre", context)
+    validate_host_diagnostics(root, row, "post", context)
     expected_command = (
         "/opt/thekernel-tests/bin/thekernel-mm-performance "
         f"--iterations {row['iterations']} --vmas {row['live_vmas']} "
@@ -441,6 +595,8 @@ def load_bundle(path: Path) -> Bundle:
         "pin_iterations",
         "runner_fingerprint",
         "runner_contract_sha256",
+        "host_cpu_selection",
+        "host_cpu_class",
     )
     first = next(iter(manifest.values())).values
     for key, record in manifest.items():
@@ -463,6 +619,24 @@ def load_bundle(path: Path) -> Bundle:
                 raise EvidenceError(
                     f"bundle manifest field {field} is not uniform for arch={key[0]}"
                 )
+
+    host_reference: dict[int, dict[str, str]] = {}
+    for key, record in manifest.items():
+        reference = host_reference.setdefault(key[1], record.values)
+        if record.values["host_cpu_set"] != reference["host_cpu_set"]:
+            raise EvidenceError(
+                "bundle host CPU set is not uniform for requested_cpus="
+                f"{key[1]}"
+            )
+    previous: set[int] = set()
+    for count in sorted(host_reference):
+        current = set(parse_cpu_list(host_reference[count]["host_cpu_set"]))
+        if not previous.issubset(current):
+            raise EvidenceError(
+                "bundle host CPU sets are not nested at requested_cpus="
+                f"{count}"
+            )
+        previous = current
 
     matrix_path = safe_bundle_file(root, "mm-performance.tsv", "bundle metric matrix")
     matrix_rows = read_tsv(matrix_path, METRIC_COLUMNS, "bundle metric matrix")
@@ -534,7 +708,6 @@ def load_policy(path: Path) -> dict[str, MetricPolicy]:
     result: dict[str, MetricPolicy] = {}
     expected_fields = {
         "p99_max_regression_percent",
-        "p999_max_regression_percent",
         "throughput_min_retained_percent",
     }
     for metric in EXPECTED_METRICS:
@@ -548,12 +721,6 @@ def load_policy(path: Path) -> dict[str, MetricPolicy]:
             "p99_max_regression_percent",
             metric,
             nullable=False,
-        )
-        p999 = policy_percent(
-            entry["p999_max_regression_percent"],
-            "p999_max_regression_percent",
-            metric,
-            nullable=True,
         )
         throughput = policy_percent(
             entry["throughput_min_retained_percent"],
@@ -574,8 +741,61 @@ def load_policy(path: Path) -> dict[str, MetricPolicy]:
                 f"policy metric={metric} must not gate unavailable throughput"
             )
         assert p99 is not None
-        result[metric] = MetricPolicy(p99, p999, throughput)
+        if p99 > 20:
+            raise EvidenceError(
+                f"policy metric={metric} may not weaken the 20 percent P99 ceiling"
+            )
+        if throughput is not None and throughput < 90:
+            raise EvidenceError(
+                f"policy metric={metric} may not weaken 90 percent throughput retention"
+            )
+        result[metric] = MetricPolicy(p99, throughput)
     return result
+
+
+def load_stability_policy(path: Path) -> StabilityPolicy:
+    try:
+        with path.open("r", encoding="utf-8") as source:
+            payload = json.load(source)
+    except (OSError, json.JSONDecodeError) as error:
+        raise EvidenceError(f"cannot read stability policy {path}: {error}") from error
+    expected = {
+        "schema",
+        "minimum_pairs",
+        "maximum_pairs",
+        "maximum_pair_ratio_spread_percent",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected:
+        raise EvidenceError(
+            f"stability policy must contain exactly {sorted(expected)!r}"
+        )
+    if payload["schema"] != STABILITY_POLICY_SCHEMA:
+        raise EvidenceError(
+            f"unsupported stability policy schema: {payload['schema']!r}"
+        )
+    values: dict[str, int] = {}
+    for field in expected - {"schema"}:
+        value = payload[field]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise EvidenceError(
+                f"stability policy has invalid {field}: {value!r}"
+            )
+        values[field] = value
+    minimum = values["minimum_pairs"]
+    maximum = values["maximum_pairs"]
+    spread = values["maximum_pair_ratio_spread_percent"]
+    if minimum < 3 or minimum % 2 == 0:
+        raise EvidenceError("stability policy minimum_pairs must be odd and at least 3")
+    if maximum < minimum or maximum > 101 or maximum % 2 == 0:
+        raise EvidenceError(
+            "stability policy maximum_pairs must be odd, at least minimum_pairs, "
+            "and at most 101"
+        )
+    if spread < 0 or spread > 100:
+        raise EvidenceError(
+            "stability policy maximum_pair_ratio_spread_percent must be in 0..100"
+        )
+    return StabilityPolicy(minimum, maximum, spread)
 
 
 def compare_provenance(baseline: Bundle, candidate: Bundle) -> None:
@@ -604,6 +824,9 @@ def compare_provenance(baseline: Bundle, candidate: Bundle) -> None:
         "qemu_sha256",
         "runner_fingerprint",
         "runner_contract_sha256",
+        "host_cpu_set",
+        "host_cpu_selection",
+        "host_cpu_class",
         "commands_sha256",
     )
     for key in sorted(baseline_keys):
@@ -628,117 +851,217 @@ def compare_provenance(baseline: Bundle, candidate: Bundle) -> None:
             )
 
 
-def ratio_ppm(baseline: int, candidate: int) -> str:
-    if baseline == 0:
-        return "-"
-    return str(candidate * 1_000_000 // baseline)
+def validate_side_identity(label: str, bundles: list[Bundle]) -> None:
+    reference = bundles[0]
+    reference_commit = next(iter(reference.manifest.values())).values[
+        "thekernel_commit"
+    ]
+    for index, bundle in enumerate(bundles[1:], start=2):
+        compare_provenance(reference, bundle)
+        commit = next(iter(bundle.manifest.values())).values["thekernel_commit"]
+        if commit != reference_commit:
+            raise EvidenceError(
+                f"{label} series changes thekernel_commit at pair {index}: "
+                f"expected={reference_commit!r} actual={commit!r}"
+            )
+        for key in sorted(reference.manifest):
+            before = reference.manifest[key].values
+            after = bundle.manifest[key].values
+            for field in ("kernel_sha256", "kernel_size_bytes"):
+                if before[field] != after[field]:
+                    raise EvidenceError(
+                        f"{label} series changes {field} at pair {index} "
+                        f"run={key!r}: expected={before[field]!r} "
+                        f"actual={after[field]!r}"
+                    )
 
 
-def latency_row(
-    metric: MetricRecord,
-    baseline_value: int,
-    candidate_value: int,
-    statistic: str,
-    max_regression_percent: int | None,
-) -> ReportRow:
-    if max_regression_percent is None:
-        return ReportRow(
-            metric.arch,
-            metric.requested_cpus,
-            metric.metric,
-            statistic,
-            "report_only",
-            baseline_value,
-            candidate_value,
-            0,
-            "-",
-            "REPORT_ONLY",
-            ratio_ppm(baseline_value, candidate_value),
+def ratio_compare(left: RatioSample, right: RatioSample) -> int:
+    before = left.candidate * right.baseline
+    after = right.candidate * left.baseline
+    if before < after:
+        return -1
+    if before > after:
+        return 1
+    return (left.pair > right.pair) - (left.pair < right.pair)
+
+
+def ratio_ppm(sample: RatioSample) -> str:
+    return str(sample.candidate * 1_000_000 // sample.baseline)
+
+
+def summarize_ratios(
+    samples: list[RatioSample],
+    *,
+    context: str,
+    stability: StabilityPolicy,
+    check_stability: bool,
+) -> tuple[RatioSample, RatioSample, RatioSample]:
+    if any(sample.baseline <= 0 for sample in samples):
+        raise EvidenceError(f"{context} has a zero baseline and no defined ratio")
+    ordered = sorted(samples, key=cmp_to_key(ratio_compare))
+    minimum = ordered[0]
+    median = ordered[len(ordered) // 2]
+    maximum = ordered[-1]
+    if check_stability:
+        spread_limit = 100 + stability.maximum_pair_ratio_spread_percent
+        stable = (
+            maximum.candidate * minimum.baseline * 100
+            <= minimum.candidate * maximum.baseline * spread_limit
         )
-    threshold_percent = 100 + max_regression_percent
-    passed = candidate_value * 100 <= baseline_value * threshold_percent
+        if not stable:
+            raise EvidenceError(
+                f"unstable paired series for {context}: "
+                f"min_pair={minimum.pair} min_ratio_ppm={ratio_ppm(minimum)} "
+                f"max_pair={maximum.pair} max_ratio_ppm={ratio_ppm(maximum)} "
+                f"spread_limit_percent={stability.maximum_pair_ratio_spread_percent}"
+            )
+    return minimum, median, maximum
+
+
+def paired_row(
+    metric: MetricRecord,
+    statistic: str,
+    samples: list[RatioSample],
+    *,
+    threshold_percent: int | None,
+    comparator: str,
+    stability: StabilityPolicy,
+) -> ReportRow:
+    report_only = threshold_percent is None
+    minimum, median, maximum = summarize_ratios(
+        samples,
+        context=f"{metric.key!r} {statistic}",
+        stability=stability,
+        check_stability=not report_only,
+    )
+    if report_only:
+        result = "REPORT_ONLY"
+    elif comparator == "<=":
+        result = (
+            "PASS"
+            if median.candidate * 100 <= median.baseline * threshold_percent
+            else "FAIL"
+        )
+    elif comparator == ">=":
+        result = (
+            "PASS"
+            if median.candidate * 100 >= median.baseline * threshold_percent
+            else "FAIL"
+        )
+    else:
+        raise AssertionError(f"unsupported comparator: {comparator}")
     return ReportRow(
         metric.arch,
         metric.requested_cpus,
         metric.metric,
         statistic,
-        "gate",
-        baseline_value,
-        candidate_value,
-        threshold_percent,
-        "<=",
-        "PASS" if passed else "FAIL",
-        ratio_ppm(baseline_value, candidate_value),
+        "report_only" if report_only else "gate",
+        len(samples),
+        median.pair,
+        median.baseline,
+        median.candidate,
+        0 if threshold_percent is None else threshold_percent,
+        "-" if report_only else comparator,
+        result,
+        ratio_ppm(median),
+        ratio_ppm(minimum),
+        ratio_ppm(maximum),
     )
 
 
-def throughput_row(
-    metric: MetricRecord,
-    baseline_value: int,
-    candidate_value: int,
-    retained_percent: int,
-) -> ReportRow:
-    passed = candidate_value * 100 >= baseline_value * retained_percent
-    return ReportRow(
-        metric.arch,
-        metric.requested_cpus,
-        metric.metric,
-        "throughput_bytes_per_sec",
-        "gate",
-        baseline_value,
-        candidate_value,
-        retained_percent,
-        ">=",
-        "PASS" if passed else "FAIL",
-        ratio_ppm(baseline_value, candidate_value),
-    )
-
-
-def compare_bundles(
-    baseline: Bundle,
-    candidate: Bundle,
+def compare_series(
+    baselines: list[Bundle],
+    candidates: list[Bundle],
     policy: dict[str, MetricPolicy],
+    stability: StabilityPolicy,
 ) -> list[ReportRow]:
-    compare_provenance(baseline, candidate)
+    pair_count = len(baselines)
+    if pair_count != len(candidates):
+        raise EvidenceError(
+            f"paired series length mismatch: baseline={pair_count} "
+            f"candidate={len(candidates)}"
+        )
+    if pair_count % 2 == 0:
+        raise EvidenceError(f"paired series requires an odd pair count: {pair_count}")
+    if pair_count < stability.minimum_pairs or pair_count > stability.maximum_pairs:
+        raise EvidenceError(
+            f"paired series count {pair_count} is outside stability policy "
+            f"{stability.minimum_pairs}..{stability.maximum_pairs}"
+        )
+    validate_side_identity("baseline", baselines)
+    validate_side_identity("candidate", candidates)
+    for index, (baseline, candidate) in enumerate(
+        zip(baselines, candidates, strict=True), start=1
+    ):
+        try:
+            compare_provenance(baseline, candidate)
+        except EvidenceError as error:
+            raise EvidenceError(f"pair {index} provenance mismatch: {error}") from error
+
     rows: list[ReportRow] = []
     arch_order = {"rv": 0, "la": 1}
     metric_order = {metric: index for index, metric in enumerate(EXPECTED_METRICS)}
     keys = sorted(
-        baseline.metrics,
+        baselines[0].metrics,
         key=lambda key: (arch_order[key[0]], key[1], metric_order[key[2]]),
     )
     for key in keys:
-        before = baseline.metrics[key]
-        after = candidate.metrics[key]
-        metric_policy = policy[before.metric]
+        metric = baselines[0].metrics[key]
+        metric_policy = policy[metric.metric]
+        p99_samples = [
+            RatioSample(index, before.metrics[key].p99_ns, after.metrics[key].p99_ns)
+            for index, (before, after) in enumerate(
+                zip(baselines, candidates, strict=True), start=1
+            )
+        ]
         rows.append(
-            latency_row(
-                before,
-                before.p99_ns,
-                after.p99_ns,
+            paired_row(
+                metric,
                 "p99_ns",
-                metric_policy.p99_max_regression_percent,
+                p99_samples,
+                threshold_percent=100 + metric_policy.p99_max_regression_percent,
+                comparator="<=",
+                stability=stability,
             )
         )
+        p999_samples = [
+            RatioSample(index, before.metrics[key].p999_ns, after.metrics[key].p999_ns)
+            for index, (before, after) in enumerate(
+                zip(baselines, candidates, strict=True), start=1
+            )
+        ]
         rows.append(
-            latency_row(
-                before,
-                before.p999_ns,
-                after.p999_ns,
+            paired_row(
+                metric,
                 "p999_ns",
-                metric_policy.p999_max_regression_percent,
+                p999_samples,
+                threshold_percent=None,
+                comparator="-",
+                stability=stability,
             )
         )
-        if before.metric in PIN_METRICS:
-            assert before.throughput_bytes_per_sec is not None
-            assert after.throughput_bytes_per_sec is not None
-            assert metric_policy.throughput_min_retained_percent is not None
+        if metric.metric in PIN_METRICS:
+            retained = metric_policy.throughput_min_retained_percent
+            assert retained is not None
+            throughput_samples: list[RatioSample] = []
+            for index, (before, after) in enumerate(
+                zip(baselines, candidates, strict=True), start=1
+            ):
+                baseline_value = before.metrics[key].throughput_bytes_per_sec
+                candidate_value = after.metrics[key].throughput_bytes_per_sec
+                assert baseline_value is not None and candidate_value is not None
+                throughput_samples.append(
+                    RatioSample(index, baseline_value, candidate_value)
+                )
             rows.append(
-                throughput_row(
-                    before,
-                    before.throughput_bytes_per_sec,
-                    after.throughput_bytes_per_sec,
-                    metric_policy.throughput_min_retained_percent,
+                paired_row(
+                    metric,
+                    "throughput_bytes_per_sec",
+                    throughput_samples,
+                    threshold_percent=retained,
+                    comparator=">=",
+                    stability=stability,
                 )
             )
     return rows
@@ -765,12 +1088,16 @@ def write_report(path: Path, rows: Iterable[ReportRow]) -> None:
                         row.metric,
                         row.statistic,
                         row.mode,
+                        row.pair_count,
+                        row.median_pair,
                         row.baseline,
                         row.candidate,
                         row.threshold_percent if row.mode == "gate" else "-",
                         row.comparator,
                         row.result,
                         row.candidate_ratio_ppm,
+                        row.pair_ratio_min_ppm,
+                        row.pair_ratio_max_ppm,
                     )
                 )
         os.replace(temporary, destination)
@@ -785,11 +1112,12 @@ def write_report(path: Path, rows: Iterable[ReportRow]) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="compare two portable TheKernel MM performance evidence bundles"
+        description="compare an odd paired series of TheKernel MM evidence bundles"
     )
-    parser.add_argument("--baseline", type=Path, required=True)
-    parser.add_argument("--candidate", type=Path, required=True)
+    parser.add_argument("--baseline", type=Path, action="append", required=True)
+    parser.add_argument("--candidate", type=Path, action="append", required=True)
     parser.add_argument("--policy", type=Path, required=True)
+    parser.add_argument("--stability-policy", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -797,10 +1125,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        baseline = load_bundle(args.baseline)
-        candidate = load_bundle(args.candidate)
+        baselines = [load_bundle(path) for path in args.baseline]
+        candidates = [load_bundle(path) for path in args.candidate]
         policy = load_policy(args.policy)
-        rows = compare_bundles(baseline, candidate, policy)
+        stability = load_stability_policy(args.stability_policy)
+        rows = compare_series(baselines, candidates, policy, stability)
         write_report(args.output, rows)
     except EvidenceError as error:
         try:
@@ -814,6 +1143,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "compare-mm-performance: "
         f"{'REGRESSION' if failures else 'PASS'} "
+        f"pairs={len(args.baseline)} "
         f"gates={len(rows) - report_only} failures={failures} "
         f"report_only={report_only} report={args.output}"
     )
