@@ -18,6 +18,7 @@ bash -n "$0"
 
 python3 "$REPO_ROOT/tests/ci/test_vendor_provenance.py"
 python3 "$REPO_ROOT/tests/ci/test_mm_performance_parser.py"
+python3 "$REPO_ROOT/tests/ci/test_compare_mm_performance.py"
 "$SCRIPT_DIR/test-release-consumer-gate.sh"
 
 # The developer container must see maintained sibling checkouts at the exact
@@ -392,6 +393,17 @@ for category in pressure oom-failpoint fs-powercut nonloopback-network \
     smp-tlb-shootdown mm-performance; do
     "$CI_DIR/nightly-gate.sh" --list | grep -q "^${category}"
 done
+
+if env \
+    THEKERNEL_MM_PERF_REQUIRE_BASELINE=1 \
+    THEKERNEL_MM_PERF_BASELINE_BUNDLE= \
+    "$CI_DIR/nightly/mm-performance.sh" >"$tmp/mm-baseline-required.log" 2>&1; then
+    printf 'test-ci-scripts: MM adapter accepted a missing required baseline\n' >&2
+    exit 1
+fi
+grep -Fq \
+    'THEKERNEL_MM_PERF_REQUIRE_BASELINE is set but no baseline bundle was provided' \
+    "$tmp/mm-baseline-required.log"
 
 # The host-test linker must add -no-pie only to executables. Shared objects
 # include proc macros and would fail to link if the C runtime expected main.

@@ -12,15 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
+from mm_performance_schema import EXPECTED_METRICS, PIN_METRICS
 
-EXPECTED_METRICS = (
-    "vma_scale",
-    "mremap_latency",
-    "protect_touch_latency",
-    "pin_throughput",
-    "pin_contention",
-)
-PIN_METRICS = frozenset({"pin_throughput", "pin_contention"})
 REASON_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 
 

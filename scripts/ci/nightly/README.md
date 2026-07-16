@@ -83,11 +83,69 @@ builder so the guest helper cannot silently predate the checked-out source.
 `mm-performance.sh` refuses to label a dirty checkout as exact-HEAD evidence.
 Its manifest records the full TheKernel, `thekernel-ax`, and
 `thekernel-linux-abi` commits; workload parameters; guest online topology;
-kernel and rootfs SHA-256; QEMU path/version; and the immutable per-run kernel,
-command, metrics, and log paths. It rechecks all three clean HEADs after the
-matrix. The guest also completes fixed-destination replacement, shared
-`old_size == 0` alias/coherence, and grow/shrink prefix-integrity checks before
-emitting the semantic-pass marker.
+kernel and rootfs SHA-256; QEMU version and binary SHA-256; a runner and runner
+contract fingerprint; and the immutable per-run kernel, command, metrics, and
+log artifacts. It rechecks all three clean HEADs after the matrix. The guest
+also completes fixed-destination replacement, shared `old_size == 0`
+alias/coherence, and grow/shrink prefix-integrity checks before emitting the
+semantic-pass marker.
+
+The MM output is a `thekernel-mm-performance-bundle-v2` directory. Manifest
+artifact paths are normalized POSIX paths relative to the bundle root; every
+referenced artifact carries a SHA-256 and byte size. The comparator rejects
+absolute paths, `..`, symlink escapes, missing files, and digest or size drift.
+The top-level metric matrix must also equal the union of the hashed per-run
+metric files. Copy the complete directory, not individual files. Old v1
+manifests containing `/workspace/...` paths are intentionally rejected rather
+than guessed into a new provenance claim.
+
+By default the adapter only captures a candidate bundle. An explicit baseline
+turns it into a baseline-vs-candidate regression gate:
+
+```sh
+THEKERNEL_MM_PERF_BASELINE_BUNDLE=/evidence/mm-baseline \
+THEKERNEL_MM_PERF_REQUIRE_BASELINE=1 \
+scripts/ci/nightly/mm-performance.sh
+```
+
+`THEKERNEL_MM_PERF_POLICY` may select another versioned JSON policy. The
+repository policy gates every metric's P99 at no more than 20 percent latency
+regression and requires both pin metrics to retain at least 90 percent of
+baseline throughput. These are relative comparisons, not machine-specific
+absolute nanosecond or bytes-per-second thresholds. The report is written to
+`mm-performance-regression.tsv`.
+
+Every P999 value is compared and reported, but the default policy marks it
+`REPORT_ONLY`, which is not a pass. A single run currently gives only 64 pin
+samples and at most 512 samples for the other default metric shapes; its P999
+is too close to a maximum sample to serve as a stable hard gate under QEMU.
+Set a metric's `p999_max_regression_percent` only after collecting enough
+paired repeats or aggregate samples to justify it.
+
+The comparator refuses a conclusion unless baseline and candidate have the
+same run-key set, online CPU topology, workload and sample counts, maintained
+dependency commits, rootfs, guest command, QEMU binary/version, runner
+fingerprint, and runner contract. TheKernel commit and kernel artifact hashes
+may differ: those are the product under comparison. Automatic runner identity
+includes stable host/CPU and cgroup allocation facts. A controlled runner can
+set `THEKERNEL_MM_PERF_RUNNER_ID` to a durable declared identity, but doing so
+is an operator assertion that the underlying performance environment remains
+equivalent, not a general bypass for comparing unrelated machines.
+
+The standalone interface is:
+
+```sh
+scripts/ci/compare-mm-performance.py \
+  --baseline /evidence/mm-baseline \
+  --candidate /evidence/mm-candidate \
+  --policy scripts/ci/nightly/mm-performance-regression-policy.json \
+  --output /evidence/mm-regression.tsv
+```
+
+It returns `0` when every enabled gate passes, `1` for a measured regression,
+and `2` when a bundle, policy, provenance, topology, or workload is invalid or
+not comparable. This is a repeatable QEMU regression-triage contract, not a
+production latency SLO or proof of one internal lock's isolated cost.
 
 `smp-tlb-shootdown.sh` applies the same clean-source rule to TheKernel,
 `thekernel-ax`, and `thekernel-linux-abi`, forces a topology-specific kernel and
