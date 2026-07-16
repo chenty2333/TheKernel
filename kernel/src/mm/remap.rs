@@ -7,7 +7,7 @@ use axhal::paging::MappingFlags;
 use linux_raw_sys::general::RLIMIT_MEMLOCK;
 use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange};
 use memory_set::MappingLineage;
-use thekernel_linux_mm::{PageRange as LinuxPageRange, RemapGeometry};
+use thekernel_linux_mm::{MemlockLimit, MemlockPlan, PageRange as LinuxPageRange, RemapGeometry};
 
 use crate::{
     mm::{AddrSpace, Backend, BackendOps},
@@ -353,9 +353,19 @@ fn mremap_locked_growth_allowed(
     additional_locked: usize,
     limit: u64,
 ) -> bool {
-    current_locked
-        .checked_add(additional_locked)
-        .is_some_and(|total| (total as u128) <= u128::from(limit))
+    let Ok(current_locked) = u64::try_from(current_locked) else {
+        return false;
+    };
+    let Ok(additional_locked) = u64::try_from(additional_locked) else {
+        return false;
+    };
+    MemlockPlan::new(
+        current_locked,
+        0,
+        additional_locked,
+        MemlockLimit::Limited(limit),
+    )
+    .is_ok()
 }
 
 #[derive(Clone, Copy)]

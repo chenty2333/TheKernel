@@ -245,7 +245,7 @@ user-triggerable alignment/range errors return errors rather than panicking.
 
 ## 0.1 implementation checkpoint
 
-As of 2026-07-15, the extracted 0.1 boundary is deliberately narrower than
+As of 2026-07-16, the extracted 0.1 boundary is deliberately narrower than
 the complete design in this RFC. `thekernel-linux-mm` now exists as a `no_std`,
 `unsafe`-free policy crate. It owns:
 
@@ -269,8 +269,16 @@ or page-cache mechanisms into syscall code. The current consumer checkpoint:
   and keeps both the policy range token and aggregate system charge until all
   lower pins are released;
 - uses a fallibly preallocated, system-bounded physical-frame pin table so the
-  IRQ-disabled lookup/update path performs no allocation and cannot grow past
-  the aggregate pin-page limit;
+  IRQ-disabled lookup/update path performs no allocation; the table has 64
+  independent shards and each transaction covers at most 64 pages, rather than
+  taking one system-wide lock once per page;
+- reserves the complete user range before lower pinning, then captures mapping
+  expectations, scans PTEs, and publishes lower pins in windows of at most 64
+  pages; allocation and deferred owner destruction stay outside both the
+  address-space lock and physical-registry shard locks;
+- indexes logical mapping identity by lineage and invalidates sorted, coalesced
+  ranges with one forward sweep, so unrelated VMA changes no longer invalidate
+  every mapping through one address-space topology generation;
 - marks writable page-cache pins dirty on release and rejects overlapping
   truncate/remap/protect/unmap mutations while a pin is active;
 - uses transactional COW clone and moving-`mremap` rollback for destination
@@ -281,6 +289,14 @@ or page-cache mechanisms into syscall code. The current consumer checkpoint:
   only the populating owner may defer its own detach until `PopulateOutcome`
   completion.
 
+The current address-space consumer also has two independent, per-address-space
+resource ceilings: 65,536 live logical mapping lineages and 65,536 live VMA
+fragments. A protection split consumes a fragment but not another lineage.
+Admission fails with `ENOMEM` before publication when either ceiling would be
+exceeded. These are fixed TheKernel bounds, not a claim to implement Linux's
+runtime-tunable `vm.max_map_count`; exposing a compatible control requires a
+separate policy and accounting decision.
+
 This checkpoint does not implement fault-in pinning, long-term/DMA pins,
 revocation or an MMU-notifier equivalent. It also does not provide broker
 queues, a userfaultfd FD adapter, userfaultfd commands, or teardown/event
@@ -288,13 +304,23 @@ semantics. `userfaultfd` therefore remains unsupported and this RFC remains
 `draft`.
 
 The correctness checkpoint is not a claim that the direct-I/O pin path is
-performance-complete. Physical-frame accounting still takes one shared lock
-per page, preparation still holds the address-space lock while walking PTEs and
-backend pin counters, and mapping snapshots still use one address-space
-topology generation, so an unrelated VMA mutation can force conservative
-revalidation. The pinned async direct path also remains default-off. These are
-measurement and redesign targets for a later MM performance phase, not reasons
-to weaken the bounded ownership contract in 0.1.
+performance-complete. The final full-range expectation revalidation and token
+publication still share one address-space topology serialization scope. Each
+64-page lower-pin window still performs bounded PTE, page-cache, and physical
+registry work while holding the address-space lock, and a pathological physical
+address distribution can exhaust one fixed shard before the aggregate logical
+pin budget, forcing the semantics-preserving copied fallback. Shared-mapping
+growth and file-registration paths also retain serialized preparation. The
+pinned async direct path remains default-off.
+
+The repository-owned RISC-V/LoongArch 4/8-CPU matrix records VMA-scale,
+`mremap`, protect-and-touch, direct-pin throughput, and concurrent direct-pin
+P50/P99/P999 baselines with exact source and artifact identities. Those are
+user-visible proxies and regression checkpoints: protect-and-touch is not a
+hardware TLB event counter, and direct-I/O latency does not isolate a single
+registry lock. A first clean baseline therefore closes the missing evidence
+checkpoint without justifying CortenMM-style RCU page tables, production tail
+latency claims, or removing the remaining serialized transaction boundary.
 
 ## Rejected alternatives
 
