@@ -19,11 +19,24 @@ line_delay_secs=$8
 extra_block_image=${9:-}
 stop_marker=${10:-}
 ready_marker=THEKERNEL_SHELL_READY
+cpus=${THEKERNEL_QEMU_CPUS:-1}
+
+case "$cpus" in
+    ''|*[!0-9]*)
+        printf 'THEKERNEL_QEMU_CPUS must be a positive integer: %s\n' "$cpus" >&2
+        exit 2
+        ;;
+esac
+[ "$cpus" -gt 0 ] || {
+    printf 'THEKERNEL_QEMU_CPUS must be a positive integer: %s\n' "$cpus" >&2
+    exit 2
+}
 
 runner_args=(
     --arch "$arch"
     --kernel "$kernel"
     --rootfs "$rootfs"
+    --cpus "$cpus"
     --timeout "$timeout_secs"
     --workdir "$workdir"
     --log "$workdir/qemu.log"

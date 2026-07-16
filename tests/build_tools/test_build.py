@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tools.build import (
+    BuildError,
     FileDigestStore,
     RootfsRequest,
     ensure_rootfs,
@@ -126,6 +127,38 @@ class BuildKernelParamTests(unittest.TestCase):
         self.assertNotEqual(
             test_request.name, make_kernel_request("shell", "rv", root).name
         )
+
+    def test_requested_kernel_cpu_count_is_part_of_build_identity(self) -> None:
+        root = repo_root()
+        with patch.dict(
+            "os.environ", {"THEKERNEL_KERNEL_CPUS": "8"}, clear=True
+        ):
+            request = make_kernel_request("shell", "rv", root)
+        self.assertIn("SMP=8", request.make_args)
+        self.assertIn("SMP=8", kernel_params(request)["make_args"])
+
+        with patch.dict("os.environ", {"SMP": "4"}, clear=True):
+            make_request = make_kernel_request("shell", "la", root)
+        self.assertIn("SMP=4", make_request.make_args)
+
+    def test_conflicting_kernel_cpu_inputs_are_rejected(self) -> None:
+        root = repo_root()
+        with patch.dict(
+            "os.environ",
+            {"THEKERNEL_KERNEL_CPUS": "8", "SMP": "4"},
+            clear=True,
+        ):
+            with self.assertRaises(BuildError):
+                make_kernel_request("shell", "rv", root)
+
+    def test_requested_kernel_cpu_count_is_strictly_validated(self) -> None:
+        root = repo_root()
+        for value in ("0", "-1", "eight", "4097"):
+            with self.subTest(value=value), patch.dict(
+                "os.environ", {"THEKERNEL_KERNEL_CPUS": value}, clear=True
+            ):
+                with self.assertRaises(BuildError):
+                    make_kernel_request("shell", "rv", root)
 
 
 class ProductBootBoundaryTests(unittest.TestCase):

@@ -392,6 +392,32 @@ def kernel_input_specs(req: KernelRequest) -> list[InputSpec]:
     ]
 
 
+def _parse_kernel_cpu_count(value: str, variable: str) -> int | None:
+    if not value:
+        return None
+    if (
+        not value.isascii()
+        or not value.isdecimal()
+        or int(value, 10) <= 0
+        or int(value, 10) > 4096
+    ):
+        raise BuildError(f"{variable} must be an integer between 1 and 4096")
+    return int(value, 10)
+
+
+def requested_kernel_cpu_count() -> int | None:
+    product_value = _parse_kernel_cpu_count(
+        os.environ.get("THEKERNEL_KERNEL_CPUS", ""), "THEKERNEL_KERNEL_CPUS"
+    )
+    make_value = _parse_kernel_cpu_count(os.environ.get("SMP", ""), "SMP")
+    if product_value is not None and make_value is not None:
+        if product_value != make_value:
+            raise BuildError(
+                "THEKERNEL_KERNEL_CPUS and SMP request different CPU counts"
+            )
+    return product_value if product_value is not None else make_value
+
+
 def make_kernel_request(
     mode: Literal["release", "shell", "io-test-shell"], arch: str, root: Path
 ) -> KernelRequest:
@@ -405,10 +431,14 @@ def make_kernel_request(
     if mode == "io-test-shell":
         name = f"{name}-io-test"
         features = f"{features} test-io-control"
+    make_args = ["BUS=mmio"] if arch_alias == "rv" else []
+    requested_cpus = requested_kernel_cpu_count()
+    if requested_cpus is not None:
+        make_args.append(f"SMP={requested_cpus}")
     return KernelRequest(
         name=name,
         arch=full_arch,
-        make_args=("BUS=mmio",) if arch_alias == "rv" else (),
+        make_args=tuple(make_args),
         app_features=features,
         patch_script=(
             "scripts/patch-riscv-kernel-elf.py"

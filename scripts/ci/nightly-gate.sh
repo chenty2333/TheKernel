@@ -18,6 +18,7 @@ Nightly categories and optional command overrides:
   oom-failpoint       THEKERNEL_NIGHTLY_OOM_FAILPOINT_COMMAND
   fs-powercut         THEKERNEL_NIGHTLY_FS_POWERCUT_COMMAND
   nonloopback-network THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_COMMAND
+  mm-performance      THEKERNEL_NIGHTLY_MM_PERFORMANCE_COMMAND
 
 Each category is enabled by default and has a repository-owned adapter. A
 *_COMMAND value replaces that adapter for runner-specific hardware. Set the
@@ -34,6 +35,7 @@ pressure	dual-architecture mixed task, memory, and filesystem pressure
 oom-failpoint	deterministic ENOMEM admission and recovery replay
 fs-powercut	two-boot writable-ext4 crash recovery replay
 nonloopback-network	dual-architecture QEMU NIC to host-peer exchange
+mm-performance	RV/LA 4/8-CPU MM latency, pin, and topology evidence matrix
 EOF
 }
 
@@ -165,6 +167,9 @@ run_adapter_case fs-powercut \
 run_adapter_case nonloopback-network \
     THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_COMMAND THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_ENABLED \
     "$SCRIPT_DIR/nightly/nonloopback-network.sh"
+run_adapter_case mm-performance \
+    THEKERNEL_NIGHTLY_MM_PERFORMANCE_COMMAND THEKERNEL_NIGHTLY_MM_PERFORMANCE_ENABLED \
+    "$SCRIPT_DIR/nightly/mm-performance.sh"
 
 printf 'nightly summary: failures=%s unsupported=%s results=%s\n' \
     "$failures" "$unsupported" "$RESULTS"

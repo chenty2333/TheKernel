@@ -17,6 +17,7 @@ done
 bash -n "$0"
 
 python3 "$REPO_ROOT/tests/ci/test_vendor_provenance.py"
+python3 "$REPO_ROOT/tests/ci/test_mm_performance_parser.py"
 "$SCRIPT_DIR/test-release-consumer-gate.sh"
 
 # The developer container must see maintained sibling checkouts at the exact
@@ -335,7 +336,7 @@ if "$CI_DIR/validate-boot-log.sh" rv "$tmp/missing.log" >/dev/null 2>&1; then
     exit 1
 fi
 
-for category in pressure oom-failpoint fs-powercut nonloopback-network; do
+for category in pressure oom-failpoint fs-powercut nonloopback-network mm-performance; do
     "$CI_DIR/nightly-gate.sh" --list | grep -q "^${category}"
 done
 
@@ -361,9 +362,10 @@ env \
     THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED=0 \
     THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED=0 \
     THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_ENABLED=0 \
+    THEKERNEL_NIGHTLY_MM_PERFORMANCE_ENABLED=0 \
     "$CI_DIR/nightly-gate.sh" --log-dir "$tmp/nightly" >/dev/null
 
-[ "$(awk -F '\t' '$2 == "skip" { count += 1 } END { print count + 0 }' "$tmp/nightly/nightly-status.tsv")" -eq 4 ]
+[ "$(awk -F '\t' '$2 == "skip" { count += 1 } END { print count + 0 }' "$tmp/nightly/nightly-status.tsv")" -eq 5 ]
 
 # Configured adapters retain the same three-state contract as repository
 # adapters. In particular, exit 78 must remain unsupported and make the whole
@@ -374,6 +376,7 @@ env \
     THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED=0 \
     THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED=0 \
     THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_ENABLED=0 \
+    THEKERNEL_NIGHTLY_MM_PERFORMANCE_ENABLED=0 \
     "$CI_DIR/nightly-gate.sh" --log-dir "$tmp/nightly-unsupported" >/dev/null
 status=$?
 set -e
@@ -389,6 +392,7 @@ env \
     THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED=0 \
     THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED=0 \
     THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_ENABLED=0 \
+    THEKERNEL_NIGHTLY_MM_PERFORMANCE_ENABLED=0 \
     "$CI_DIR/nightly-gate.sh" --log-dir "$tmp/nightly-fail" >/dev/null
 status=$?
 set -e
@@ -403,6 +407,7 @@ env \
     THEKERNEL_NIGHTLY_OOM_FAILPOINT_ENABLED=0 \
     THEKERNEL_NIGHTLY_FS_POWERCUT_ENABLED=0 \
     THEKERNEL_NIGHTLY_NONLOOPBACK_NETWORK_ENABLED=0 \
+    THEKERNEL_NIGHTLY_MM_PERFORMANCE_ENABLED=0 \
     "$CI_DIR/nightly-gate.sh" --log-dir "$tmp/nightly-pass" >/dev/null
 grep -q $'^pressure\tpass\t' "$tmp/nightly-pass/nightly-status.tsv"
 
@@ -472,11 +477,19 @@ fi
 printf 'exit\n' >"$tmp/short-commands"
 env PATH="$tmp/fake-bin:$PATH" FAKE_QEMU_RUNNER_STATUS=75 \
     FAKE_QEMU_RUNNER_ARGS="$tmp/qemu-runner.args" \
+    THEKERNEL_QEMU_CPUS=8 \
     "$CI_DIR/boot-shell-runner.sh" rv kernel image "$tmp/fake-work" \
     "$tmp/short-commands" 1 1 0 extra.img STOP_MARKER || status=$?
 [ "${status:-75}" -eq 75 ]
 grep -Fxq -- '--input-after-marker' "$tmp/qemu-runner.args"
 grep -Fxq -- 'THEKERNEL_SHELL_READY' "$tmp/qemu-runner.args"
+awk '
+    $0 == "--cpus" {
+        getline
+        found = ($0 == "8")
+    }
+    END { exit !found }
+' "$tmp/qemu-runner.args"
 awk '
     $0 == "--ready-timeout" {
         getline
@@ -488,6 +501,12 @@ grep -Fxq -- '--extra-block' "$tmp/qemu-runner.args"
 grep -Fxq -- 'extra.img' "$tmp/qemu-runner.args"
 grep -Fxq -- '--stop-after-marker' "$tmp/qemu-runner.args"
 grep -Fxq -- 'STOP_MARKER' "$tmp/qemu-runner.args"
+if env PATH="$tmp/fake-bin:$PATH" THEKERNEL_QEMU_CPUS=0 \
+    "$CI_DIR/boot-shell-runner.sh" rv kernel image "$tmp/fake-work" \
+    "$tmp/short-commands" 1 1 0 >/dev/null 2>&1; then
+    printf '%s\n' 'test-ci-scripts: runner accepted zero QEMU CPUs' >&2
+    exit 1
+fi
 
 # The one-shot host peer rejects unauthenticated traffic and returns the nonce
 # only after receiving the exact guest probe.
@@ -515,6 +534,9 @@ grep -Fq 'network-peer: validated guest request' "$tmp/peer.log"
 
 # Compile both project guest-helper modes on the host. The guest gate supplies the
 # strict overcommit policy that makes its finite request fail deterministically.
+cc -O2 -std=c11 -Wall -Wextra -Werror -pthread \
+    "$REPO_ROOT/tests/guest/tools/mm-performance.c" \
+    -o "$tmp/mm-performance"
 cc -O2 -std=c11 "$REPO_ROOT/tests/guest/tools/oom-admission.c" \
     -o "$tmp/nightly-oom-admission"
 "$tmp/nightly-oom-admission" --expect-success 4096 >/dev/null
